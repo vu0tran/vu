@@ -13,7 +13,10 @@ is in `SPEC.md`; `README.md` introduces it, and history and measurements are in 
    and refreshes `vuc_seed.c`; on any failure the old compiler stays. Commit the new seed with
    the change.
 2. A feature the compiler's own source wants to use: add it first, rebuild, then use it in
-   `compiler/*.vu` and rebuild again (the installed compiler must understand the source).
+   `compiler/*.vu` and rebuild again (the installed compiler must understand the source). When a
+   batch both adds built-ins and uses them in the compiler (the build fails on "unknown function"),
+   build in two steps: first with the new uses stubbed out (a shim function, or that part cut),
+   then with the real source once the seed knows them.
 3. Try a program: `tests/try.sh FILE.vu [ARGS]` (check, quick run, ASan/UBSan/LSan run with the
    same output, and the C audited with the gate's warning flags).
 4. `tests/run_quick.sh PATTERN...` rebuilds the compiler and runs the targeted tests whose names
@@ -22,14 +25,14 @@ is in `SPEC.md`; `README.md` introduces it, and history and measurements are in 
    one finds nothing. Report every round's findings honestly, and don't count your own test
    mistakes as findings. Audit new C in each round (`try.sh` does): the gate fails on any warning,
    and newer gcc turns some (incompatible pointer types) into errors.
-6. Run the **full gate** (about 30 minutes, in the background) once per batch of features, before
+6. Run the **full gate** (about an hour, in the background) once per batch of features, before
    syncing or packaging, not after each one: `tests/gate.sh`. It must print GATE PASSED. Nothing
    CPU-heavy runs while it does: several checks measure time and fail on a starved machine.
 
 ## Speed rules
 
 - Check, don't build: `./vu check FILE` (milliseconds; every compile error comes from the
-  front end). For the compiler's own source: `compiler/vuc check compiler/vuc.vu` (0.15 s).
+  front end). For the compiler's own source: `compiler/vuc check compiler/vuc.vu` (0.4 s).
 - **Never edit the repo while a gate runs.** The suites read `compiler/vuc` and the test files
   mid-run; edits make the results meaningless. Work in a copy (`cp -r` into the scratchpad) or a
   worktree, and copy back after.
@@ -56,14 +59,16 @@ is in `SPEC.md`; `README.md` introduces it, and history and measurements are in 
 | `c3b_calls.vu` | `call_user`, `fs_call`, `os_call`, built-ins, `str_method`, JSON |
 | `c4_stmt.vu` | `stmts`, `hoist_tries`, `s_*`, `if_chain`, `last_use`, `stmt_value` |
 | `c5_build.vu` | `gen_fn`, `gen_consts`, `build`, `load_program`, module resolution (`res_*`), `main` |
+| `c6_pkg.vu` | packages: `vu.pkg`, `vu get`, `vu.lock`, capability grants; `native_flag` |
+| `c7_fmt.vu` | `vu fmt`, `vu test`, `vu lsp` |
 | `rt/*.c`, `rt/help.txt` | the C runtime, templates, and the help text |
 
 ## Writing Vu (including the compiler's own source)
 
 - Every string interpolates: literal braces are doubled, even inside nested strings
   (`"{id("}}")}"`). Strings may appear inside `{...}`.
-- `else` (a fallback for a call that can fail) is statement-level only: `let x = f() else 0`,
-  never inside an argument, an interpolation or a condition.
+- `else` (a fallback for a call that can fail, or for a nil optional) binds loosest: inside a
+  larger expression, put it in parentheses: `print((f() else "?") + "!")`. Not in a condition.
 - `match` works on enums (and calls that can fail), not on Int or Str.
 - Moving: `let y = x` moves lists, structs and enums. `let y = s.field` of a non-Str value is
   a read-only view that freezes `s` until the block ends (so `s.push`/`s = ...` fail). Copy
@@ -74,6 +79,8 @@ is in `SPEC.md`; `README.md` introduces it, and history and measurements are in 
   (use a separate statement).
 - Locals may shadow functions and built-ins, but then those functions can't be called in that
   scope.
+- Not allowed as names: `type`, `throws`, `by` (keywords). Consts are numbers or Bools only.
+  Code after `while true:` (with no break) is unreachable, and that's an error.
 
 ## Writing tests
 
@@ -96,6 +103,15 @@ is in `SPEC.md`; `README.md` introduces it, and history and measurements are in 
   (`tests/json/typed.vu`) against a Python model of the same types (`typed_model.py`). Run fuzz
   builds with the suites' options (`LSAN_OPTIONS=use_poisoned=1` for pool builds; TSan with
   `CC=clang` and Archer, as `run_targeted.sh` does), or they report false leaks and races.
+
+- Protocols: `run_ws.py` (WebSockets, against Python's `websockets` asyncio client: its threaded
+  client loses handshakes over TLS on its own), `run_h2.py` (HTTP/2 with hand-built frames and the
+  known attacks), `run_pg.sh` (a throwaway PostgreSQL cluster), `run_pkg.sh` (git repositories as
+  package sources), `run_tools.py` (vu test, vu lsp).
+- Other machines: `run_arm64.sh` (qemu-user; it can't report a failed exec from posix_spawn, so
+  one test is skipped there) and `run_macos.sh` (builds only, with zig).
+- A test server's stderr goes to a pipe read only at its exit: logging a lot from one fills the
+  pipe (64 KB) and blocks the server, which looks like a hang. Send it to a file when debugging.
 
 - Tasks run on several threads: `tests/run_mt.sh` repeats every task program under
   ThreadSanitizer (`CC=clang ./vu build --tsan`). A sanitizer run that can't start (a wrong

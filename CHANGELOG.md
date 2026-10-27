@@ -963,6 +963,123 @@ hung (a task that never waits keeps its thread, as SPEC.md says); and, worse, a 
 GATE PASSED. One `run_debug.sh` check failed once in that run, while my hung test was using both
 cores; it passed in 3 reruns. The gate now fails on any suite's failure again.
 
+## Round 9: what was missing for real services
+
+The list after round 8, in order: the slowdowns, interfaces, Unicode text, packages, a PostgreSQL
+client; then ARM64 and macOS, `vu fmt`/`vu test`/`vu lsp`, tasks that move between threads, hashing,
+regular expressions, paths, argument parsing, WebSockets and HTTP/2.
+
+### Language
+
+- **Interfaces** (`interface Shape:` / `impl Shape for Circle:`): calls are resolved at compile time
+  when the type is known, through a table of functions when it isn't (`[Shape]`), and generic
+  bounds (`[T: Shape]`) check that a type implements one.
+- **Text as UTF-8**: `upper`/`lower` with Python's full case mapping (Unicode 15.1 tables),
+  `chars`, `char_count`, `ord`, `chr`, `find`, `count`, `replace`, `sub in s`, `is_utf8`, each
+  checked against Python on random text.
+- **`opt else default`** reads an optional the way `else` already handled a failing call, with the
+  same ways to leave (`else return`, `continue`, `fail`, `panic`); and `else` now works inside
+  arguments, parentheses, list and map literals and interpolations. I added it because I kept
+  writing it while building the standard library in this round (four times before it existed),
+  which is the best evidence I have that an agent will too.
+- **`x in xs`** for lists of numbers, Bools and strings.
+- **`const` parameters**: the argument must be text written in the program. `pg.query` takes its
+  SQL this way, so SQL built from input doesn't compile.
+- Hashing and encoding built-ins (SHA-256, SHA-1, HMAC, PBKDF2, random bytes, base64, hex), `fs.list`,
+  `mkdir`, `exists`, `remove`, `rename`, `os.output`, `os.read_stdin`, and `assert`.
+
+### Tools and packages
+
+- **Packages**: `vu.pkg` lists sources (any git URL or a folder) and versions; `vu get` fetches them
+  and writes `vu.lock` with each package's commit and a SHA-256 of its files, which every build
+  checks. A package only gets the capabilities its line grants (`fs net os ffi`), and an `extern`
+  block needs `ffi`, so a dependency that starts reading files stops the build until you allow it.
+- **`vu fmt`**, **`vu test`** (each `fn test_...` in its own process), **`vu lsp`** (diagnostics
+  and formatting for editors).
+- **Machines**: Linux on ARM64 (the whole targeted suite under qemu) and macOS on ARM64 and x86-64
+  (built with zig's cross compiler, linked except for TLS; not run on a Mac yet).
+
+### Standard library
+
+`pg` (PostgreSQL: SCRAM sign-in, parameters only), `re` (Python's syntax and results in linear
+time), `path`, `cli`, `ws` (WebSockets), and HTTP/2 in `http` (prior knowledge, and ALPN over TLS).
+
+### Tasks that move
+
+A thread with nothing to do now takes new tasks (ones that haven't started) from a busy thread.
+Measured with 200 short tasks queued behind one that computes for 0.9 s on a 2-core VM: they all
+finish after 0.28 s with this, and after 1.03 s without (`tests/mt/steal.vu`, which checks the
+order in `run_mt.sh`). Only tasks that haven't started move: a C compiler may keep the address of a
+thread-local variable in a register across a call, so a task stopped partway through a function
+must resume on its own thread. ARM64 showed this; x86-64 had hidden it.
+
+### The slowdowns
+
+`bench/compare.sh` again, same 2-vCPU VM (about 10% slower than in round 8 for every language), median
+of 5, seconds:
+
+| | binary-trees 20 | n-body 50M | fannkuch-redux 11 | nsieve 13 | mandelbrot 8000 (2 threads) | spectral-norm 8000 (2 threads) |
+|---|---|---|---|---|---|---|
+| C | 12.32 s, 130 MB | 3.47 s | 2.90 s | 4.95 s | 2.90 s | 2.38 s |
+| C++ | 12.62 s, 132 MB | 4.89 s | 3.52 s | 2.06 s | 2.87 s | 2.04 s |
+| Rust | 13.84 s, 130 MB | 2.78 s | 3.30 s | 4.92 s | 2.89 s | 2.53 s |
+| Go | 24.94 s, 223 MB | 5.48 s | 3.28 s | 4.80 s | 2.94 s | 3.46 s |
+| Vu | 4.06 s, 66 MB | 4.84 s | 3.50 s | 4.75 s | 2.84 s | 3.69 s |
+
+Against C, n-body went from 1.73x to 1.39x, fannkuch-redux from 1.35x to 1.21x and spectral-norm
+from 1.77x to 1.55x: a list index check had grown from one unsigned comparison into two, and gcc
+couldn't tell that lengths are far below 2^63 (now it's told). What's left, measured by building
+Vu's generated C with one thing taken out (3 runs each):
+
+| | as built | without | C |
+|---|---|---|---|
+| spectral-norm, without overflow checks | 3.29 s | 2.30 s | 2.38 s |
+| fannkuch-redux, without bounds checks | 3.50 s | 2.86 s | 2.90 s |
+| n-body, with fused multiply-add | 4.6–4.8 s | 3.9 s | 3.47 s (4.49 s without) |
+
+So each remaining gap is one of Vu's choices: checked integers (they keep gcc from vectorizing
+spectral-norm's inner loop; round 3's measurement of their cost didn't include spectral-norm),
+checked indexing, and no fused multiply-add, so a program gives the same results on every machine.
+Taking the overflow checks out of fannkuch-redux saves 3%, and neither check matters to n-body.
+A way to keep the checks and still vectorize would be to check a loop's arithmetic once at its end
+when the loop has no other effects (the program stops either way); that's not done yet.
+
+### What the attack rounds found
+
+My own mistakes in tests aren't counted here; these are bugs in Vu.
+
+1. **`std/h2` didn't compile, so no HTTP program did** in the working copy, from when HTTP/2 was
+   added until the first build of this batch (an unreachable `return`). The gate would have caught
+   it; nothing shipped with it.
+2. **ARM64 task switching was broken**: GCC ignores the `naked` attribute on ARM64 (with a warning
+   that `-w` hid), so the switch function got a prologue that corrupted the stack. Every program
+   that spawned a task crashed there. Now it's a plain assembly function, and `run_arm64.sh`
+   compiles the runtime with ignored attributes as errors.
+3. **Moving started tasks between threads was unsafe** (above): five multi-threaded tests crashed
+   on ARM64 (a double free among them).
+4. **Work stealing missed most of the work**: tasks spawned from another thread wait in the busy
+   thread's inbox, which it never reads while busy, and the stealing code skipped a thread whose own
+   queue was empty. Measured before the fix: no difference at all with and without stealing.
+5. **Every `vu build` and `vu run` left a folder in `/tmp`** with the generated C (and, for `run`,
+   the binary), since the first version: about 97,000 of them on the test machine. Now removed on
+   every way out. (`vu test` left one too.)
+6. **HPACK bomb**: a 16 KB HTTP/2 header block of references to one 4 KB header would have decoded
+   to 64 MB before the size check; now decoding stops at 64 KB.
+7. **HTTP/2 request bodies**: 100 open streams could each buffer 10 MB (1 GB per connection); now
+   20 MB in all. Also: stream window overflows weren't errors, request trailers closed the
+   connection, empty CONTINUATION frames could arrive forever, and a response with a line break in
+   a header closed the whole connection instead of resetting its stream.
+8. **The ALPN list of a TLS listener leaked** (14 bytes per listener, and on error paths).
+9. **macOS didn't compile**, though SPEC said it did: a Linux-only call, a `pipe2` that newer SDKs
+   declare, and a weak OpenMP symbol Mach-O can't leave undefined.
+10. **`re`**: a pattern starting with `\b` gave up after the first position; loops whose body can
+    match nothing gave different groups from Python (now the same on 10,000 random patterns);
+    `a{1,2}{3}` was accepted (Python refuses it) and possessive repeats were read as nested ones.
+11. **The WebSocket test's "server hangs"** turned out to be the Python client: `websockets`'
+    threaded client loses its handshake over TLS now and then, against its own server too. The Vu
+    server handled 6,000 TLS upgrades in a row with the asyncio client. Not a Vu bug, but it took
+    a while to show that, and my extra logging created a second, fake hang (a full stderr pipe).
+
 ## Memory safety evidence
 
 - `tests/reject/`: 21 programs, each containing a bug Vu must refuse: use after move, a
@@ -1122,10 +1239,10 @@ CC=clang python3 vu.py build examples/mandelbrot.vu --tsan -o mb && ./mb 500
 
 ## Limits of v0
 
-- No methods. Strings are byte strings. Linux only (epoll; the task switch is hand-written for
-  x86-64, with `ucontext` elsewhere).
-- Tasks don't move between threads, so a thread whose tasks never wait keeps them to itself,
-  and a thread with nothing to do doesn't take work from a busy one.
+- No methods. Strings are bytes, read as UTF-8 by the text functions. Linux on x86-64 and ARM64;
+  macOS builds but hasn't been run on a Mac.
+- Only new tasks move between threads: a task that has started stays on its thread, so two tasks
+  that never wait on the same thread still take turns only when one waits.
 - The safety rules are deliberately conservative. For example, a `var` argument blocks
   every other use of the same variable in that call, even of a different field.
 - Not yet tested: whether an LLM actually writes correct Vu more often than Rust when

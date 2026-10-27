@@ -134,7 +134,11 @@ fn static_type_uncached(var g: G, e: Node) -> Str:
       return g.variants[e.name] + ""
     if e.name in g.consts: return g.consts[e.name] + ""
     return ""
-  if k == "try" or k == "orelse": return static_type(&g, e.kids[0])
+  if k == "try": return static_type(&g, e.kids[0])
+  if k == "orelse":
+    let st = static_type(&g, e.kids[0])
+    if st != "" and tkind(g, st) == "opt": return inner_of(st)
+    return st
   if k == "un":
     if e.op == "not": return "Bool"
     return static_type(&g, e.kids[0])
@@ -186,7 +190,7 @@ fn static_type_uncached(var g: G, e: Node) -> Str:
       if f.name == "str": return "Str"
       if f.name == "sqrt" or f.name == "float": return "Float"
       if f.name == "int" or f.name == "arg" or f.name == "ord": return "Int"
-      if f.name == "chr": return "Str"
+      if f.name == "chr" or (is_crypto_builtin(f.name) and lookup(g, f.name) < 0): return "Str"
       if f.name == "byte": return "Byte"
       return ""
     if f.k == "field" and f.name == "read": return "Str"
@@ -399,6 +403,8 @@ fn str_build(var g: G, e: Node) -> CT:
 fn str_op(var g: G, e: Node) -> CT:
   let bl = bw_begin(&g, e.kids[0], "")
   let br = bw_begin(&g, e.kids[1], "")
+  if br.ty == "Str?" or bl.ty == "Str?":
+    err(g, e.line, "can't use '" + e.op + "' on " + tn(bl.ty) + " and " + tn(br.ty) + ": a Str? may be nil; give a default for nil in parentheses, (x else \"\"), or unwrap it first: if x = ...:")
   if br.ty != "Str":
     err(g, e.line, "can't use '" + e.op + "' on Str and " + tn(br.ty) + "; put values in a string with \"{{x}}\"")
   var rc = ""
@@ -489,7 +495,26 @@ fn g_bin(var g: G, e: Node, expect: Str) -> CT:
       if sb.ty != "Str": err(g, e.line, "'in' on a Str checks for a Str inside it, not " + tn(sb.ty))
       let si = bw_end(&g, e.kids[0], sb, "(vu_str_find(&(" + bm.code + "), &(" + sb.code + ")) >= 0)", "Bool")
       return bw_end(&g, e.kids[1], bm, si.code, si.ty)
-    if tkind(g, bm.ty) != "map": err(g, e.line, "'in' checks whether a key is in a map, or a Str inside a Str; this is " + tn(bm.ty))
+    if tkind(g, bm.ty) == "list":
+      # x in xs: whether some element equals x (a scan), for numbers, Bool and Str
+      let et = inner_of(bm.ty)
+      if not (et == "Int" or et == "Float" or et == "Byte" or et == "Bool" or et == "Str"):
+        err(g, e.line, "'in' on a list compares with ==, so it works on lists of Int, Float, Byte, Bool or Str, not " + tn(bm.ty) + "; write a loop")
+      let xb = bw_begin(&g, e.kids[0], et)
+      if xb.ty != et: err(g, e.line, "'in' looks for " + a_an(tn(et)) + " in this " + tn(bm.ty) + ", not " + a_an(tn(xb.ty)))
+      let lv = tmp(&g)
+      let xv = tmp(&g)
+      let fv = tmp(&g)
+      let iv = tmp(&g)
+      var test = lv + "->data[" + iv + "] == " + xv
+      var xdecl = ct(g, et) + " " + xv + " = " + xb.code + ";"
+      if et == "Str":
+        test = "vu_str_eq(&" + lv + "->data[" + iv + "], " + xv + ")"
+        xdecl = "const vu_str *" + xv + " = &(" + xb.code + ");"
+      let scan = "({{ const " + ct(g, bm.ty) + " *" + lv + " = &(" + bm.code + "); " + xdecl + " bool " + fv + " = false; for (int64_t " + iv + " = 0; " + iv + " < " + lv + "->len; " + iv + "++) if (" + test + ") {{ " + fv + " = true; break; }} " + fv + "; }})"
+      let li = bw_end(&g, e.kids[0], xb, scan, "Bool")
+      return bw_end(&g, e.kids[1], bm, li.code, li.ty)
+    if tkind(g, bm.ty) != "map": err(g, e.line, "'in' checks whether a key is in a map, an element in a list, or a Str inside a Str; this is " + tn(bm.ty))
     let key = map_key(bm.ty)
     let kb = key_begin(&g, e.kids[0], key)
     let inner = bw_end(&g, e.kids[0], kb, "vu_mhas_" + mg(g, bm.ty) + "(&" + bm.code + ", " + key_ptr(g, kb, key) + ")", "Bool")
@@ -701,10 +726,17 @@ fn map_method(var g: G, e: Node) -> CT:
   let mt = bm.ty
   if tkind(g, mt) != "map": err(g, e.line, ".get(key, default) works on maps, not " + tn(mt))
   let val = map_val(mt)
-  if not is_copy(g, val): err(g, e.line, "m.get(key, default) needs plain values; for " + tn(val) + " values use 'if k in m' and m[k]")
+  if not is_copy(g, val) and val != "Str": err(g, e.line, "m.get(key, default) needs plain values or Str; for " + tn(val) + " values use 'if k in m' and m[k]")
   let key = map_key(mt)
   let kb = key_begin(&g, e.kids[1].kids[0], key)
   let d = value(&g, e.kids[2].kids[0], val)
+  if val == "Str":
+    # a copy of the value (the map keeps its own), or the default
+    let dv = tmp(&g)
+    let ev = tmp(&g)
+    let sc = "({{ vu_str " + dv + " = " + d.code + "; int64_t " + ev + " = vu_mfind_" + mg(g, mt) + "(&" + bm.code + ", " + key_ptr(g, kb, key) + "); if (" + ev + " >= 0) {{ drop_Str(&" + dv + "); " + dv + " = vu_str_dup(&(" + bm.code + ").ents[" + ev + "].val); }} " + dv + "; }})"
+    let sinner = bw_end(&g, e.kids[1].kids[0], kb, sc, "Str")
+    return bw_end(&g, e.kids[0].kids[0], bm, sinner.code, sinner.ty)
   let inner = bw_end(&g, e.kids[1].kids[0], kb, "vu_mgetor_" + mg(g, mt) + "(&" + bm.code + ", " + key_ptr(g, kb, key) + ", " + d.code + ")", val)
   return bw_end(&g, e.kids[0].kids[0], bm, inner.code, inner.ty)
 
@@ -757,11 +789,11 @@ fn throwing_call(var g: G, e: Node) -> Bool:
     if vt != "": return fn_parts(vt).fails
   if e.k == "call" and e.kids[0].k == "field":
     let n = e.kids[0].name
-    if n == "read" or n == "write" or n == "temp_dir": return probe_type(&g, e.kids[0].kids[0]) == "Fs"
-    if n == "run": return probe_type(&g, e.kids[0].kids[0]) == "Os"
+    if n == "read" or n == "write" or n == "temp_dir" or n == "list" or n == "mkdir" or n == "remove" or n == "rename": return probe_type(&g, e.kids[0].kids[0]) == "Fs"
+    if n == "run" or n == "output" or n == "read_stdin": return probe_type(&g, e.kids[0].kids[0]) == "Os"
     if net_fails(n) and probe_type(&g, e.kids[0].kids[0]) == "Net": return true
     if n == "recv" and is_chan_expr(&g, e.kids[0].kids[0]): return true
-  if parse_call(&g, e) or from_json_call(g, e): return true
+  if parse_call(&g, e) or from_json_call(g, e) or decode_call(g, e): return true
   if e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.gfn_nodes: return g.gfn_nodes[e.kids[0].name].flag
   if e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.ifns and lookup(g, e.kids[0].name) < 0: return g.ifns[e.kids[0].name].fails
   return e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.fns and g.fns[e.kids[0].name].fails
@@ -769,11 +801,12 @@ fn throwing_call(var g: G, e: Node) -> Bool:
 # Code for a call that can fail, as a result value (R_T) whose .bad says whether it failed.
 fn throw_code(var g: G, call: Node, expect: Str) -> CT:
   if fn_value_type(&g, call) != "": return call_value(&g, call, true)
-  if call.kids[0].k == "field" and call.kids[0].name == "run": return os_call(&g, call, true)
+  if call.kids[0].k == "field" and (call.kids[0].name == "run" or call.kids[0].name == "output" or call.kids[0].name == "read_stdin"): return os_call(&g, call, true)
   if call.kids[0].k == "field" and net_fails(call.kids[0].name) and probe_type(&g, call.kids[0].kids[0]) == "Net": return net_call(&g, call, true)
   if call.kids[0].k == "field" and call.kids[0].name == "recv" and is_chan_expr(&g, call.kids[0].kids[0]): return chan_method(&g, call, true)
   if call.kids[0].k == "field": return fs_call(&g, call, true)
   if from_json_call(g, call): return b_from_json(&g, call, true)
+  if decode_call(g, call): return b_decode(&g, call)
   if parse_call(&g, call):
     var t = "Int"
     if call.kids[0].name == "float":
@@ -802,10 +835,56 @@ fn throw_code(var g: G, call: Node, expect: Str) -> CT:
 fn diverging_call(e: Node) -> Bool:
   return e.k == "call" and e.kids[0].k == "name" and (e.kids[0].name == "panic" or e.kids[0].name == "exit")
 
+# opt else d: the value inside an optional (T?), or d when it's nil; opt else return/break/continue/fail
+# leaves instead. A place (a variable or field) whose value isn't copied is moved out, as `let` would.
+fn g_opt_else(var g: G, e: Node, expect: Str) -> CT:
+  let r = gen(&g, e.kids[0], "")
+  if tkind(g, r.ty) != "opt":
+    return die_ct(g, e.line, "'else' handles the error of a call to a function marked throws, or a nil optional (T?); this is a " + tn(r.ty) + ", which is neither")
+  let bt = inner_of(r.ty)
+  let cb = ct(g, bt)
+  var oc = r.code + ""
+  let pv = tmp(&g)
+  let tv = tmp(&g)
+  var free = ""
+  var take = "*" + pv
+  if r.p.ok and is_copy(g, bt): oc = r.code + ""
+  elif r.p.ok and bt == "Str": take = "vu_str_dup(" + pv + ")"   # a variable or field keeps its text; this is a copy
+  elif r.p.ok and r.p.is_name:
+    oc = move_place(&g, r.p, e.line)   # a whole local variable: moved out, as let would
+    free = "vu_release_" + box_name(g, bt) + "(" + pv + ");"
+  elif r.p.ok:
+    return die_ct(g, e.line, "'else' would have to move this " + tn(r.ty) + " out of where it's kept; unwrap it there instead: if x = ...:")
+  else: free = "vu_release_" + box_name(g, bt) + "(" + pv + ");"
+  let snap = snapshot(g)
+  if e.flag:
+    var saved: [Str] = []
+    swap(&saved, &g.lines)
+    let saved_ind = g.ind
+    g.ind = 0
+    stmt(&g, e.kids[1])
+    var parts: [Str] = []
+    for l in g.lines:
+      let s = l.strip()
+      if not s.startswith("#line"): parts.push(s)
+    swap(&saved, &g.lines)
+    g.ind = saved_ind
+    restore(&g, snap)
+    return CT("({{ " + cb + " *" + pv + " = " + oc + "; if (!" + pv + ") {{ " + join(parts, " ") + " }} " + cb + " " + tv + " = " + take + "; " + free + " " + tv + "; }})", bt)
+  let d = e.kids[1]
+  if diverging_call(d):
+    let dr = gen(&g, d, "")
+    let now0 = snapshot(g)
+    merge2(&g, snap, now0)
+    return CT("({{ " + cb + " *" + pv + " = " + oc + "; if (!" + pv + ") {{ " + dr.code + "; }} " + cb + " " + tv + " = " + take + "; " + free + " " + tv + "; }})", bt)
+  let dc = value(&g, d, bt).code
+  let now = snapshot(g)
+  merge2(&g, snap, now)
+  return CT("({{ " + cb + " *" + pv + " = " + oc + "; " + cb + " " + tv + "; if (" + pv + ") {{ " + tv + " = " + take + "; " + free + " }} else " + tv + " = " + dc + "; " + tv + "; }})", bt)
+
 fn g_orelse(var g: G, e: Node, expect: Str) -> CT:
   let call = e.kids[0]
-  if not throwing_call(&g, call):
-    err(g, e.line, "'else' after a value handles the error of a call to a function marked throws, and this isn't one")
+  if not throwing_call(&g, call): return g_opt_else(&g, e, expect)
   let cr = throw_code(&g, call, expect)
   let rt = cr.ty
   let t = inner_of(rt)
@@ -872,14 +951,15 @@ fn g_call(var g: G, e: Node, expect: Str) -> CT:
       if nargs_of(e) != 0: err(g, e.line, ".share() takes no arguments")
       let sb = bw_begin(&g, f.kids[0], "")
       return bw_end(&g, f.kids[0], sb, "VU_SHUP(" + sb.code + ")", sb.ty)
-    if fname == "run" or fname == "env" or fname == "clock" or fname == "time" or fname == "sleep" or fname == "signals": return os_call(&g, e, false)
+    if fname == "run" or fname == "env" or fname == "clock" or fname == "time" or fname == "sleep" or fname == "signals" or ((fname == "output" or fname == "read_stdin") and probe_type(&g, f.kids[0]) == "Os"): return os_call(&g, e, false)
     if is_net_method(fname) and probe_type(&g, f.kids[0]) == "Net": return net_call(&g, e, false)
     if is_chan_method(fname) and is_chan_expr(&g, f.kids[0]): return chan_method(&g, e, false)
     if fname == "temp_dir": return fs_call(&g, e, false)
     if fname == "get" or fname == "remove": return map_method(&g, e)
     if fname == "read" or fname == "write": return fs_call(&g, e, false)
+    if (fname == "list" or fname == "mkdir" or fname == "exists" or fname == "remove" or fname == "rename") and probe_type(&g, f.kids[0]) == "Fs": return fs_call(&g, e, false)
     let rt = probe_type(&g, f.kids[0])
-    if rt == "Str": err(g, e.line, "Str has no ." + fname + "(); its methods are .split(), .join(items), .strip(), .lstrip(), .rstrip(), .startswith(prefix) and .endswith(suffix), and it has .len")
+    if rt == "Str": err(g, e.line, "Str has no ." + fname + "(); its methods are .split(), .join(items), .strip(), .lstrip(), .rstrip(), .startswith(prefix), .endswith(suffix), .upper(), .lower(), .find(sub), .count(sub), .replace(old, new), .chars(), .char_count(), .is_utf8() and .hex(), and it has .len")
     if tkind(g, rt) == "list": err(g, e.line, "lists have .push(x), .pop(), .sort(), .reserve(n) and .len; there is no ." + fname + "()")
     if tkind(g, rt) == "map": err(g, e.line, "maps have .get(key, default), .remove(key) and .len; there is no ." + fname + "()")
     if tkind(g, rt) == "struct":
@@ -942,7 +1022,7 @@ fn iface_call(var g: G, e: Node, allow_throw: Bool) -> CT:
   if rt != iname:
     let key = iname + "|" + rt
     if not (key in g.impls):
-      if tkind(g, rt) == "opt": err(g, e.line, "this value is a " + tn(rt) + " and may be nil; unwrap it first: if x = ...:")
+      if tkind(g, rt) == "opt": err(g, e.line, "this value is a " + tn(rt) + " and may be nil; unwrap it first (if x = ...:) or give a default for nil: (x else default)")
       err(g, e.line, tn(rt) + " doesn't implement " + disp(iname) + ", so there is no " + d + "() for it (add impl " + disp(iname) + " for " + tn(rt) + ":)")
     let target = g.impls[key][idx] + ""
     return call_user(&g, e, target, allow_throw)
@@ -1179,6 +1259,7 @@ fn fn_value(var g: G, e: Node, expect: Str) -> CT:
   let fails = g.fns[name].fails
   var ps: [Str] = []
   for pa in params:
+    if pa.is_const: err(g, e.line, d + "() has a const parameter ('" + pa.name + "'), so it can't be used as a value: a call through a value couldn't check that its argument is written into the program")
     if pa.is_var or pa.is_own:
       var word = "own"
       if pa.is_var: word = "var"
@@ -1226,7 +1307,7 @@ fn call_value(var g: G, e: Node, allow_throw: Bool) -> CT:
   let n = nargs_of(e)
   if n != ft.params.len: err(g, e.line, what + " takes {ft.params.len} argument(s) but got {n}")
   var params: [Param] = []
-  for i in 0..ft.params.len: params.push(Param("#{i + 1}", ft.params[i] + "", false, e.line, false))
+  for i in 0..ft.params.len: params.push(Param("#{i + 1}", ft.params[i] + "", false, e.line, false, false))
   var croot = -1
   if r.p.ok: croot = r.p.root
   var a = call_args(&g, e, params, croot, f.line)

@@ -12,7 +12,7 @@ cd "$(dirname "$0")" || exit 1
 export VU_STD="$(cd .. && pwd)/std"
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 ./vuc run ../tools/gen_runtime.vu || exit 1
-cat c1_front.vu c2_types.vu c3_expr.vu c3b_calls.vu c4_stmt.vu c5_build.vu runtime_gen.vu > vuc.vu
+cat c1_front.vu c2_types.vu c3_expr.vu c3b_calls.vu c4_stmt.vu c5_build.vu c6_pkg.vu c7_fmt.vu runtime_gen.vu > vuc.vu
 ./vuc build vuc.vu --debug -o "$work/s1" || { echo "FAIL: the current compiler can't build vuc.vu"; exit 1; }
 "$work/s1" build vuc.vu -o "$work/s2" --emit-c "$work/2.c" || { echo "FAIL: stage 1 can't build vuc.vu"; exit 1; }
 "$work/s2" build vuc.vu --debug -o "$work/s3" --emit-c "$work/3.c" || { echo "FAIL: stage 2 can't build vuc.vu"; exit 1; }

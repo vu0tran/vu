@@ -46,7 +46,7 @@ fn main():
 | `Byte` | 0..255, one byte in memory. Literals: `65`, `0x41` or `'A'`. Overflow stops the program. |
 | `Str` | an owned string of bytes: `s.len`, `s[i]` (a Byte), `s[a..b]` (a new Str), `+`, `+=`, `== <`, `s.reserve(n)` |
 | `[T]` | growable list: `xs.len`, `xs.push(v)`, `xs.pop()` (removes and returns the last element; stops the program if empty), `xs[i]` (bounds-checked), `xs.reserve(n)` |
-| `T?` | optional: either a `T` or `nil` (`Int?`, `Str?`, `[T]?`, a struct or enum...; not a capability or another optional). Recursive types must use it (or a list or map). |
+| `T?` | optional: either a `T` or `nil` (`Int?`, `Str?`, `[T]?`, a struct or enum...; not a capability or another optional). Recursive types must use it (or a list or map). Read it with `if x = opt:` or `opt else default` (see Errors). |
 | `{K: V}` | map from Int, Byte, Bool or Str keys to any value (see Maps) |
 | `type Name:` | a struct, fields listed below it (`x, y: Float` declares two fields) |
 | `type Name:` with variants | an enum (see Enums) |
@@ -64,8 +64,8 @@ String literals are `Str` values and can interpolate: `let msg = "{n} items"`. E
 any expression, including other strings, as in Python 3.12: `"{m["k"]} {", ".join(xs)}"`. Every
 Vu string interpolates, so a literal brace is always doubled, inside nested strings too (`{{`).
 Strings are
-immutable byte strings (no Unicode handling in v0). `bytes(s)` copies one into a `[Byte]` list,
-and `str(bs)` copies back.
+immutable byte strings; the text functions in Built-ins read them as UTF-8. `bytes(s)` copies one
+into a `[Byte]` list, and `str(bs)` copies back.
 
 ## Variables and functions
 
@@ -95,6 +95,18 @@ and `str(bs)` copies back.
   `consume(items, items.len)` works; borrowing the same variable in another argument is an
   error. `own` is only special before a parameter name. `swap(&a, &b)` exchanges two owned
   values of the same type without copying either.
+- **Const parameters.** A `Str` parameter declared `const` takes only text written into the
+  program: a string literal (without `{...}`), literals joined with `+`, or the caller's own
+  `const` parameter. Text built at run time doesn't compile there, so an API can make injection
+  impossible: `pg.query(net, &db, "select * from users where id = $1", [id])` takes values only as
+  parameters. A function with a `const` parameter can't be used as a value.
+
+  ```
+  fn run_sql(var db: Db, const sql: Str, args: [Str]) ...
+  run_sql(&db, "delete from t where id = $1", [id])       # fine
+  run_sql(&db, "delete from t where id = " + id, [])       # error: built at run time
+  ```
+
 - **Locals may shadow** a function, a constant or a built-in: `let text = ...` and
   `let max = 10` are fine. Calling the shadowed function in that scope is an error that says
   so. Type and variant names stay reserved.
@@ -299,6 +311,20 @@ match parse_digit(b):                # inspect it
   to standard error and exits with code 1. (`panic` exits with 101.)
 - File operations and reading numbers from text can fail the same way (see Built-ins).
 
+`else` also reads an optional (`T?`): the value inside, or the fallback when it's `nil`, with the
+same ways to leave:
+
+```
+let name = user.nickname else "anon"          # a Str? field: the text is copied, the field stays
+let port = find_port(cfg) else 8080           # a call returning Int?
+let row = first_row(rows) else return         # or else break / continue / fail "..." / panic(...)
+print((lookup(k) else "?") + "!")             # else binds loosest: parentheses inside a larger expression
+```
+
+- An optional held in a field or list element whose value isn't plain data or a `Str` (a list, a
+  struct) can't be taken out by `else` (that would move it out of its owner): unwrap it in place
+  with `if x = ...:`. A whole local variable is moved out, as `let` would.
+
 ### Typed errors
 
 `throws E`, with `E` an enum, makes a function fail with values of `E` instead of messages, so
@@ -369,7 +395,7 @@ let counts = from_json(text, {Str: [Int]}) else {}
 ```
 var counts: {Str: Int} = {}
 counts["the"] = 1                    # insert or replace
-counts[w] = counts.get(w, 0) + 1     # .get(key, default) for plain-data values
+counts[w] = counts.get(w, 0) + 1     # .get(key, default) for plain-data and Str values
 if "the" in counts: ...
 let n = counts["the"]                # a missing key stops the program; check with 'in' first
 counts.remove("the")                 # returns true if the key was there
@@ -444,7 +470,10 @@ fn main(fs: Fs) throws:
 ```
 
 `fs.read` and `fs.write` can fail (missing file, no permission, a zero byte in the path), so
-they are handled like calls to a `throws` function: with `?`, `else` or `match`.
+they are handled like calls to a `throws` function: with `?`, `else` or `match`. So can
+`fs.list(dir)` (the names in a folder, sorted, each folder's ending in `/`), `fs.mkdir(path)` (with
+any missing parents), `fs.remove(path)` (a file or an empty folder) and `fs.rename(from, to)`;
+`fs.exists(path)` returns a Bool.
 
 An `Fs` can't be created anywhere else, so a function that isn't handed one has no way to
 read or write files, and its signature shows that. `main` may only take capabilities as
@@ -459,6 +488,10 @@ covers the rest of the outside world:
   waits, and returns its exit code (128 + the signal number if a signal killed it). Output
   goes to the program's own standard output and error. It fails if the list is empty, an
   argument contains a zero byte, or the program can't be started.
+- `os.output(["git", "rev-parse", "HEAD"])` runs a program the same way and returns what it wrote
+  to standard output and standard error together, whatever its exit code.
+- `os.read_stdin(n)` reads up to n bytes of standard input as they arrive (`""` at its end); it
+  can fail. (`print` and `write` need no capability; reading input does.)
 - `os.env("CC")` returns an environment variable, or `""` when it isn't set.
 - `os.clock()` returns seconds from a monotonic clock, as a Float, for timing.
 - `os.time()` returns the wall-clock time: seconds since 1970-01-01 00:00 UTC, as a Float (see
@@ -560,8 +593,10 @@ fn main() throws:
 - If every task is waiting on a channel and nothing (a connection, a timer) can wake any of
   them, the program stops with "deadlock".
 - Each task has its own stack (8 MB of address space, used as it grows), so a stack overflow in a
-  task is reported like one in `main`. A task that never waits keeps the other tasks on its thread
-  from running (tasks on other threads carry on).
+  task is reported like one in `main`. A thread with nothing to do takes new tasks (ones that
+  haven't started) from a busy thread's queue, so a task that never waits doesn't hold up the new
+  tasks queued behind it. A task that has started stays on its thread, and main always stays on
+  the first thread.
 - Lines printed by tasks on different threads never mix: each `print` and `eprint` writes its line
   in one piece. The order of lines from different tasks is whatever order they ran in.
 - A connection or listener can move to a task on another thread (through a channel or `spawn`);
@@ -713,6 +748,7 @@ let t = s.strip()                       # also s.lstrip(), s.rstrip(); s.strip("
 let ys = sorted(xs)                     # a sorted copy; sorted(xs, reverse: true)
 xs.sort()                               # in place; xs.sort(reverse: true)
 let lo = min(xs)                        # min/max of a list, or of two or more numbers: max(a, b, c)
+if 3 in xs: ...                         # whether an element == 3 (lists of Int, Float, Byte, Bool, Str)
 ```
 
 Text: strings are bytes, and these read them as UTF-8 characters, with Python's names and results:
@@ -740,6 +776,20 @@ s.is_utf8()                # whether s is valid UTF-8
 - `find`, `count` and `replace` with `""` work as in Python: `find` gives 0, `count` one more than
   the number of characters, and `replace` puts the new text between every two characters.
 
+Hashing and encoding, on bytes (a `Str`); no capability needed:
+
+```
+sha256(data)                       # the 32-byte digest; sha256(data).hex() for hex text
+hmac_sha256(key, data)             # HMAC-SHA256
+pbkdf2_sha256(password, salt, n)   # PBKDF2-HMAC-SHA256 with n iterations, 32 bytes
+random_bytes(16)                   # from the kernel's generator (for keys and nonces)
+b64encode(data)                    # standard base64 with padding
+let raw = b64decode(text)?         # fails on text that isn't base64 (like Python's validate=True)
+let k = from_hex("00ff")?          # fails on anything but hex digits in pairs; s.hex() makes them
+```
+
+`tests/run_crypto.sh` checks each against Python's `hashlib`, `hmac` and `base64`.
+
 - Whitespace means ASCII whitespace (space, tab, newline, carriage return, vertical tab, form
   feed). `strip(chars)` removes bytes, which is the same as Python's characters for ASCII.
 - `s.split(sep)` with an empty `sep` stops the program, as Python raises an error.
@@ -764,7 +814,28 @@ vu build file.vu [-o out]   # optimized native binary
              OMP_TOOL_LIBRARIES=.../libarcher.so; see CHANGELOG.md)
   --emit-c F write the generated C to F
   --time     report front-end and C compiler time
+vu fmt file.vu... [--check] # rewrite spacing the one way (--check: list files it would change)
+vu test file.vu...          # run each fn test_... in its own process; report which pass
+vu get [file.vu]            # fetch the packages in vu.pkg, write vu.lock (see Packages)
+vu lsp                      # a language server for editors (diagnostics, formatting)
 ```
+
+- **`vu fmt`**: blocks indented 2 spaces per level, one space around binary operators and after
+  commas and colons, none inside brackets or before a call's `(`, and runs of blank lines down to
+  one. Comments and the spacing before a comment at the end of a line are kept, and strings are
+  never touched. Formatting doesn't change what a program does: `tests/run_fmt.sh` checks that every
+  `.vu` file here compiles to the same C before and after, and that formatting twice changes
+  nothing more.
+- **`vu test`**: a test is a top-level function named `test_...` that takes nothing but
+  capabilities (`fn test_save(fs: Fs) throws:`). Each runs in its own process, so a panic or a
+  failed `assert` fails that test only. `assert(cond)` stops the program (exit 101) naming the
+  assertion's text; `assert(cond, message)` gives the message instead.
+- **`vu lsp`** speaks the Language Server Protocol on standard input and output: the compiler's
+  error for each open file (re-checked on every change), and formatting with `vu fmt`.
+- **Other machines**: Vu runs on Linux on x86-64 and ARM64 (`tests/run_arm64.sh` runs the test
+  programs under qemu); `CC=aarch64-linux-gnu-gcc VU_MARCH= vu build ...` cross-compiles. The runtime
+  also has a macOS port (kqueue in place of epoll) that compiles and links for macOS on x86-64 and
+  ARM64 but hasn't been run on a Mac; `par` loops there need clang with libomp.
 
 Every compile error comes from Vu's own front end, before the C compiler runs, so `vu check`
 gives the same errors as a build. For an edit-and-fix loop, `check` while fixing errors and
@@ -840,6 +911,34 @@ fn main():
 - When there is no `geo.vu` next to the importing file, `import geo` looks in the standard
   library: the folder named by the environment variable `VU_STD`, or else `std/` next to the
   compiler (one level up from `compiler/vuc`).
+
+### Packages
+
+Code from other repositories comes in as packages, listed in `vu.pkg` next to the main file (or in
+a folder above it):
+
+```
+need github.com/vu0tran/pg v0.2.0 net            # source, version (a git tag), what it may receive
+need git+file:///srv/git/util.git v1.0.0          # any git URL
+need ../shared                                    # a local folder (no version)
+need github.com/someone/log v1.1.0 as slog        # imported as slog instead of log
+```
+
+- `vu get` fetches every package (with git) into the cache (`$VU_PKG_DIR`, else `~/.cache/vu/pkg`),
+  then the packages those need (from each package's own `vu.pkg`), picking the highest version
+  anyone asks for, and writes `vu.lock`: each package's version, commit, and the SHA-256 of its
+  files. Every `build`, `run` and `check` hashes the packages again and stops if one changed since
+  `vu.lock` was written (in the cache, or a tag that moved); `vu get` accepts the change.
+- `import pg` finds the package's `pg.vu` (the last part of its source; `as` changes the import
+  name, not the file). A file next to the importing one comes first, then the packages, then `std`.
+  Inside a package, imports see its own files and the packages its `vu.pkg` lists.
+- **A package receives only the capabilities its line grants** (`fs`, `net`, `os`, `ffi`): one of
+  its functions taking a capability it wasn't granted (directly, or inside a struct, list or
+  optional), or an `extern` block without `ffi`, is a compile error naming the package. A package
+  can pass on only what it was granted itself. So a dependency that starts reading files or calling
+  C in a new version stops the build until someone edits `vu.pkg` to allow it.
+- Two different modules can't have the same name (a package and a local file, say); import a
+  package under another name with `as`.
 
 ## The standard library
 
@@ -931,6 +1030,90 @@ fn main(net: Net) throws:
   connection and reads bodies by length, chunked, or until the connection closes (up to 64 MB).
   It returns redirects instead of following them.
 
+**`re`**: regular expressions with Python's syntax and results (`re.compile`, `re.search`,
+`re.prefix` for Python's `re.match`, `re.fullmatch`, `re.findall`, `re.finditer`, `re.sub`,
+`re.split`, `re.group`), run by a Pike VM as RE2 does: time linear in the text whatever the
+pattern, so no pattern can be made to take exponential time. Backreferences and lookaround aren't
+supported (they can't run in linear time); `\d \w \s` are ASCII. Offsets are byte offsets.
+`tests/run_re.sh` compares it with Python's `re` on thousands of random patterns.
+
+```
+import re
+let r = re.compile("(\\w+)@(\\w+)\\.com")?
+if m = re.search(r, text): print(re.group(m, text, 2) else "")   # nil if group 2 didn't take part
+let parts = re.split(re.compile(",\\s*")?, line)
+```
+
+Loops whose body can match nothing (`(a*)*`) give the groups Python gives. Possessive repeats
+(`a*+`) are refused like backreferences: they need backtracking.
+
+**`path`**: file paths as text, as Python's `os.path` gives them on Linux and macOS (`tests/run_path.py`
+compares them): `path.join(a, b)`, `join_all(parts)`, `dir`, `base`, `ext` (".gz" of "a.tar.gz"),
+`stem`, `without_ext`, `clean` (normpath), `is_abs`, `parts`, `rel(target, start)`, and
+`within(folder, p)`, which says whether a path stays inside a folder once `..` is resolved (for names
+from outside, like a URL's path: `path.within(root, path.join(root, name))`). Text only: symbolic
+links aren't followed.
+
+**`cli`**: command-line arguments (named `cli`, since `args()` is the built-in that gives them):
+
+```
+import cli
+var p = cli.parser("serve", "Serves a folder over HTTP.")
+cli.flag(&p, "verbose", "v", "print each request")
+cli.option(&p, "port", "p", "8080", "the port to listen on")    # a default
+cli.required(&p, "root", "r", "where the files are")             # must be given
+cli.positional(&p, "mode", "dev or prod")
+cli.rest(&p, "files", "files to preload")                        # zero or more
+let a = cli.parse(p, args())?          # a mistake fails with the message and the usage
+if a.help: print(cli.usage(p))         # -h or --help
+let port = int(cli.get(a, "port"))?    # cli.has(a, "verbose"), cli.all(a, "files")
+```
+
+It takes `--name value`, `--name=value`, `-n value`, `-nvalue`, `-abc` (short flags together) and
+`--` (the rest is positional); an option given twice keeps both (`cli.all`; `get` gives the last).
+
+**`ws`**: WebSockets (RFC 6455), server (`ws.accept(net, c)` on a connection from `net.accept`) and
+client (`ws.connect(net, "ws://..." or "wss://...")`); `ws.recv` returns whole messages (`Text`,
+`Binary` or `Closed`), answering pings and closes itself; `ws.send_text`, `ws.send_binary`,
+`ws.ping`, `ws.close`. Text is checked to be UTF-8; messages are limited to 16 MB. `ws.connect_ca`
+checks a `wss://` server against given certificates instead of the system's. Over TLS, give
+`ws.accept` connections from a `net.tls_listen` listener. `tests/run_ws.py` tests it against
+Python's `websockets` and against broken frames.
+
+**HTTP/2**: `http.serve` also speaks HTTP/2 to clients that open with its preface (prior
+knowledge, as `curl --http2-prior-knowledge`), and `http.serve_tls(net, os, port, cert, key,
+handler, grace)` offers it to browsers through ALPN; the same handler answers both versions. The
+`h2` module does it (HPACK, flow control, the frame types, request trailers); requests on one
+connection are answered in turn. `net.tls_listen(..., alpn: "h2,http/1.1")` offers protocols for
+other uses. Against clients that try to use up the server: a header list decodes to at most 64 KB
+however it's compressed (no "HPACK bomb"), a header block comes in at most 32 frames, 100 streams at
+once, 10 MB per request body and 20 MB of unfinished bodies per connection, and since requests are
+answered in turn, cancelling streams ("rapid reset") starts no more work than sending requests
+would. `tests/run_h2.py` runs these attacks, and checks against `httpx`.
+
+**`pg`**: a PostgreSQL client over `Net`: SCRAM-SHA-256 or plain-password sign-in, parameterized
+queries, text results.
+
+```
+import pg
+var db = pg.connect(net, pg.config("localhost", 5432, "app", password, "appdb"))?   # fails with a message
+let rows = pg.query(net, &db, "select id, name from users where age > $1", ["30"])?
+let name = pg.text(rows, 0, "name") else ""       # row 0's name, nil for NULL
+let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows affected
+```
+
+- The SQL is a `const` parameter, so values reach the server only as parameters (`$1`...), as text
+  (`nil` is NULL); the server converts them to each column's type. `pg.get_int`, `get_float` and
+  `get_bool` read a column as a number or Bool. For typed rows, have the server make JSON
+  (`select row_to_json(u)::text from users u`) and read it with `from_json`.
+- `query` and `exec` fail with a `pg.Error`: `Server(code, message, detail)` (code is the SQLSTATE,
+  such as `23505` for a unique violation), `Network`, `Auth` or `Protocol`; `pg.describe(e)` makes
+  a message. After a server error the connection is still usable; after a network error it isn't.
+- One query at a time per connection: for several tasks, keep connections in a `Chan[pg.Db]` and
+  take one for each query. Not yet: TLS to the server, `COPY`, `LISTEN`/`NOTIFY`, MD5 passwords.
+  `tests/run_pg.sh` runs it against a real PostgreSQL.
+
 ## Not in v0
 
-Methods, and Unicode-aware strings.
+Methods (functions take the value they work on first), Unicode normalization and character
+classes, generic interfaces, TLS to PostgreSQL.

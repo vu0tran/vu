@@ -23,11 +23,12 @@ fn main():
   print("nodes: {check(make(arg(1, 10)))}")
 ```
 
-Vu is an experiment, and v0 runs on Linux only. The compiler is written in Vu.
+Vu is an experiment. v0 runs on Linux (x86-64 and ARM64); macOS builds but hasn't been run on a
+Mac yet. The compiler is written in Vu.
 
 ## Getting started
 
-You need gcc (or clang, with `CC=clang`) on Linux. Clone the repository and run `./vu`. The first
+You need gcc (or clang, with `CC=clang`) on Linux, and git for packages. Clone the repository and run `./vu`. The first
 run builds the compiler from `compiler/vuc_seed.c`, the C the compiler produces from itself, so no
 other tools are needed.
 
@@ -36,8 +37,12 @@ other tools are needed.
 ./vu check examples/json.vu              # type and ownership errors only, in milliseconds
 ./vu build examples/nbody.vu -o nbody    # optimized binary (-O3 -march=native)
 ./vu build app.vu --san                  # with AddressSanitizer, UBSan and LeakSanitizer
+./vu fmt app.vu                          # format in place
+./vu test app_test.vu                    # run each fn test_... in its own process
 ./vu help                                # every command and flag
 ```
+
+`vu lsp` gives editors the compiler's errors as you type, and formatting.
 
 The language is described in [SPEC.md](SPEC.md), which is short and starts with examples. How the
 language was built, and every measurement along the way, is in [CHANGELOG.md](CHANGELOG.md).
@@ -78,6 +83,8 @@ let d = parse_digit(b) else 0        # or use a fallback
 match parse_digit(b):                # or inspect it
   ok(d): print("{d}")
   err(msg): print(msg)
+
+let name = user.nickname else "anon" # an optional (Str?) works the same way
 ```
 
 A call that can fail must be handled, or the program doesn't compile. `throws E` with an enum `E`
@@ -165,7 +172,7 @@ fn main() throws:
 ```
 
 `spawn` starts a lightweight task. Tasks run on one thread per core, and each thread has its own
-scheduler and epoll loop. Network calls and channel operations suspend only the task that makes
+scheduler and epoll loop; a thread with nothing to do takes new tasks from a busy one. Network calls and channel operations suspend only the task that makes
 them. Tasks share nothing but channels and `Shared[T]` values. A `Shared[T]` is read-only, so any
 number of threads can read it without locks. If every task is waiting and nothing can wake them,
 the program reports a deadlock instead of hanging. For data parallelism, `par for` splits a loop
@@ -200,13 +207,43 @@ extern "sqlite_glue.c":
 
 C handles are owned like any other value and freed exactly once, by their drop function.
 
+### SQL that can't be injected
+
+```
+import pg
+var db = pg.connect(net, pg.config("localhost", 5432, "app", password, "appdb"))?
+let rows = pg.query(net, &db, "select name from users where id = $1", [id])?
+pg.query(net, &db, "select name from users where id = " + id, [])?   # compile error
+```
+
+The SQL parameter is `const`: its argument must be text written in the program, so values can
+only travel as parameters.
+
+### Packages that can't do more than you allow
+
+```
+# vu.pkg
+need github.com/someone/pg-pool v1.2.0 net
+need github.com/someone/slugify v0.3.1
+```
+
+`vu get` fetches packages with git and records each one's commit and a hash of its files in
+`vu.lock`, which every build checks. A package gets only the capabilities its line grants: if a
+new version of `slugify` starts reading files or calling C, the build stops until you allow it.
+
 ## The standard library
 
-Built in: strings (with Unicode case, characters and search), lists, maps, files (`Fs`), processes, environment and signals (`Os`), TCP, TLS
-(OpenSSL) and DNS (`Net`), channels and timers, JSON, and formatting with Python's names
-(`split`, `join`, `strip`, `"{x:.3f}"`). Written in Vu, in `std/`:
+Built in: strings (with Unicode case, characters and search), lists, maps, files (`Fs`), processes,
+environment and signals (`Os`), TCP, TLS (OpenSSL) and DNS (`Net`), channels and timers, JSON,
+hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (`split`, `join`,
+`strip`, `"{x:.3f}"`). Written in Vu, in `std/`:
 
-- `http`: an HTTP/1.1 server and client, over TCP or TLS;
+- `http`: an HTTP/1.1 and HTTP/2 server (HTTP/2 by prior knowledge or ALPN over TLS) and an HTTP/1.1
+  client;
+- `ws`: WebSockets, server and client;
+- `pg`: a PostgreSQL client (SCRAM-SHA-256, parameters only);
+- `re`: regular expressions with Python's syntax, in time linear in the text;
+- `path` and `cli`: file paths as Python's `os.path` gives them, and command-line arguments;
 - `time`: UTC dates, ISO 8601 and HTTP dates, RFC 3339 parsing;
 - `log`: timestamped or JSON log lines.
 
@@ -217,17 +254,20 @@ program's output checked against Vu's before it's timed. Seconds, lower is bette
 
 | | binary-trees 20 | n-body 50M | fannkuch-redux 11 | nsieve 13 | mandelbrot 8000 (2 threads) | spectral-norm 8000 (2 threads) |
 |---|---|---|---|---|---|---|
-| C | 11.24 s, 130 MB | 3.08 s | **2.71 s** | 4.53 s | **2.82 s** | 2.13 s |
-| C++ | 11.67 s, 132 MB | 4.47 s | 3.35 s | **1.58 s** | 2.91 s | **1.79 s** |
-| Rust | 13.13 s, 130 MB | **2.59 s** | 3.09 s | 4.37 s | 2.95 s | 1.89 s |
-| Go | 23.51 s, 191 MB | 4.82 s | 3.23 s | 4.28 s | 2.97 s | 2.69 s |
-| **Vu** | **3.63 s, 66 MB** | 5.33 s | 3.66 s | 4.17 s | 2.93 s | 3.77 s |
+| C | 12.32 s, 130 MB | 3.47 s | **2.90 s** | 4.95 s | 2.90 s | 2.38 s |
+| C++ | 12.62 s, 132 MB | 4.89 s | 3.52 s | **2.06 s** | 2.87 s | **2.04 s** |
+| Rust | 13.84 s, 130 MB | **2.78 s** | 3.30 s | 4.92 s | 2.89 s | 2.53 s |
+| Go | 24.94 s, 223 MB | 5.48 s | 3.28 s | 4.80 s | 2.94 s | 3.46 s |
+| **Vu** | **4.06 s, 66 MB** | 4.84 s | 3.50 s | 4.75 s | **2.84 s** | 3.69 s |
 
 - **binary-trees:** Vu is about 3x faster than C in half the memory. The compiler knows when each
   node dies, so freed nodes go onto a per-type free list and are reused with no runtime checks.
-- **Behind on n-body, fannkuch-redux and spectral-norm.** Earlier builds matched C on all three
-  (CHANGELOG.md), so this is a slowdown that crept in, not a limit of the design. It's being fixed;
-  these numbers will change.
+- **Behind on n-body, fannkuch-redux and spectral-norm**, by 1.2–1.6x C's time, and each gap is
+  one of Vu's guarantees, measured by building the same C without it: spectral-norm without overflow
+  checks takes 2.30 s (C 2.38 s), since the checks keep gcc from vectorizing its inner loop;
+  fannkuch-redux without bounds checks takes 2.86 s (C 2.90 s); and C's n-body uses fused
+  multiply-add, which Vu leaves out so results are the same on every machine (C without it: 4.49 s).
+  Rust's release builds don't check overflow.
 - nsieve's C++ version is fast because `vector<bool>` packs the sieve into bits; the others use a
   byte per number.
 - On HTTP, a Vu server on one core handled 121k requests/s for a minimal reply and 25.5k for a
@@ -244,17 +284,20 @@ Most of Vu's design follows from being written by an LLM:
   methods or inheritance, and there is no global mutable state.
 - **Errors a model can act on.** Compile errors name the variable and both places involved, and
   say what to write instead. A panic prints a backtrace with Vu file and line numbers. `vu check`
-  runs only the front end, so a mistake is reported in milliseconds (0.14 s for the 6,500-line
-  compiler).
+  runs only the front end, so a mistake is reported in milliseconds (0.4 s for the compiler itself,
+  14,700 lines).
 - **Checks in one command.** `tests/try.sh file.vu` checks a program, runs it, runs it again under
   the sanitizers and compares the output, and audits the generated C.
 
 ## How it's tested
 
-`tests/gate.sh` runs every suite: about 500 targeted programs that each try to break one rule,
+`tests/gate.sh` runs every suite: about 600 targeted programs that each try to break one rule,
 21 programs the compiler must refuse, every program built five ways (gcc and clang, optimized or
-not, two allocators) that must print the same, JSON tests, memory tests, and network, TLS and HTTP
-tests against Python and curl. Each runs under
+not, two allocators) that must print the same, JSON tests, memory tests, and network, TLS, HTTP,
+HTTP/2 and WebSocket tests against Python's libraries and hand-made hostile input (including the
+known HTTP/2 attacks), a real PostgreSQL server and a fake hostile one, text, regular expressions,
+paths and hashing compared with Python on random input, the targeted programs again on ARM64 under
+qemu, and macOS builds. Each runs under
 AddressSanitizer, UBSan and LeakSanitizer, and the threaded programs also run under
 ThreadSanitizer. The compiler compiles itself, and every rebuild must reach a fixed point (stages
 2 and 3 produce identical C) before it's installed. Each new feature went through rounds of
@@ -262,13 +305,14 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 
 ## Limits
 
-- Linux only (epoll; the task switch is hand-written for x86-64, with `ucontext` elsewhere).
+- Linux on x86-64 and ARM64. macOS (kqueue) builds for ARM64 and x86-64 but hasn't been run on a
+  Mac.
 - Strings are bytes. Text functions (`chars()`, `upper()`, `ord`...) read them as UTF-8; there is
   no Unicode normalization and no character classes (`isalpha`).
 - No methods: functions take the value they work on as their first argument (`area(c)`).
-- Tasks don't move between threads, so an idle thread doesn't take work from a busy one, and a
-  task that never waits keeps the other tasks on its thread from running.
-- No package manager. Modules are files, found next to the importing file or in `std/`.
+- Only new tasks move between threads: two tasks that have started on the same thread and never
+  wait take turns only when one of them waits.
+- No package registry: packages are git repositories, named by URL.
 - The safety rules are conservative, and some correct programs need rewriting to pass.
 - Not yet tested: whether an LLM given only SPEC.md writes correct Vu more often than Rust.
 

@@ -1,0 +1,344 @@
+# ============================================================================ packages
+# A program's packages are listed in vu.pkg, next to its main file or in a folder above it:
+#   need github.com/vu0tran/pg v0.2.0 net          # source, version (a git tag), the capabilities it may get
+#   need git+file:///srv/git/util.git v1.0.0        # any git URL
+#   need ../shared                                  # a folder (no version)
+#   need github.com/someone/log v1.1.0 as slog      # imported as slog
+# `vu get` fetches them (with git) into the package cache ($VU_PKG_DIR, or ~/.cache/vu/pkg), along with the
+# packages they need (each package's own vu.pkg), and writes vu.lock: each package's version, commit and
+# a SHA-256 of its files. Every build checks the files against vu.lock, so a package that changed
+# since (in the cache, or a tag moved) stops the build. `import pg` then finds the package's pg.vu
+# (a file named after the package, or after the name it's imported as).
+# A package can only receive the capabilities its vu.pkg line grants (fs, net, os, ffi): a function
+# in it taking a capability it wasn't granted, or an extern block without ffi, is a compile error. So
+# a dependency that starts reading files in a new version stops the build until vu.pkg says it may.
+
+type Need:
+  source, version, name: Str
+  caps: [Str]
+  line: Int
+
+type Manifest:
+  path: Str
+  needs: [Need]
+
+type Locked:
+  source, version, commit, hash: Str
+
+# One package of the program: where its files are, what it may receive, and the packages it needs
+# (import name -> index in the list; index -1 is the main program).
+type Pkg:
+  name, source, version, dir: Str
+  caps: [Str]
+  deps: {Str: Int}
+  local: Bool
+
+fn is_cap_word(w: Str) -> Bool:
+  return w == "fs" or w == "net" or w == "os" or w == "ffi"
+
+fn is_local_source(s: Str) -> Bool:
+  return s.startswith("./") or s.startswith("../") or s.startswith("/") or s == "." or s == ".."
+
+fn last_segment(s: Str) -> Str:
+  var t = s + ""
+  while t.endswith("/"): t = t[0..t.len - 1]
+  let i = find_last(t, "/") + 1
+  var n = t[i..t.len]
+  if n.endswith(".git"): n = n[0..n.len - 4]
+  return n
+
+# A git tag like v1.2.0 or v2.0.0-rc.1: v, then digits and dots, then optionally - and letters,
+# digits and dots. (It names a folder in the cache, so nothing else: no '/', no "..".)
+fn is_version(w: Str) -> Bool:
+  if w.len < 2 or w.len > 64 or w[0] != 'v' or not is_digit(w[1]): return false
+  var suffix = false
+  for i in 1..w.len:
+    let c = w[i]
+    if c == '-' and not suffix:
+      suffix = true
+      continue
+    if is_digit(c) or c == '.': continue
+    if suffix and ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')): continue
+    return false
+  return find_sub(w, "..", 0) < 0
+
+fn read_manifest(fs: Fs, path: Str) -> Manifest throws:
+  let text = fs.read(path)?
+  var needs: [Need] = []
+  var ln = 0
+  for raw in text.split("\n"):
+    ln += 1
+    var line = raw + ""
+    let hash = find_byte(line, '#', 0)
+    if hash >= 0: line = line[0..hash]
+    let words = line.split()
+    if words.len == 0: continue
+    if words[0] != "need": fail path + ":{ln}: each line is 'need SOURCE VERSION [fs net os ffi] [as NAME]', not '" + words[0] + "'"
+    if words.len < 2: fail path + ":{ln}: 'need' names a package source"
+    let source = words[1] + ""
+    var version = ""
+    var caps: [Str] = []
+    var name = last_segment(source)
+    var i = 2
+    if not is_local_source(source):
+      if words.len < 3 or not is_version(words[2]): fail path + ":{ln}: " + source + " needs a version, a git tag like v1.2.0"
+      check_source(source) else fail path + ":{ln}: '" + source + "' isn't a package source: a folder, host/path, or an https, http, ssh, git or file URL"
+      version = words[2] + ""
+      i = 3
+    while i < words.len:
+      let w = words[i]
+      if w == "as":
+        if i + 1 >= words.len: fail path + ":{ln}: 'as' is followed by the name to import the package as"
+        name = words[i + 1] + ""
+        i += 2
+        continue
+      if not is_cap_word(w): fail path + ":{ln}: unknown word '" + w + "' (the capabilities a package may get are fs, net, os and ffi; 'as NAME' renames it)"
+      if not has_str(caps, w): caps.push(w + "")
+      i += 1
+    if name.len == 0 or not is_name_start(name[0]) or has_dunder(name):
+      fail path + ":{ln}: '" + name + "' can't be a module name; add 'as NAME'"
+    for j in 0..name.len:
+      if not is_name_char(name[j]): fail path + ":{ln}: '" + name + "' can't be a module name; add 'as NAME'"
+    for n in needs:
+      if n.name == name: fail path + ":{ln}: two packages are named '" + name + "'; rename one with 'as NAME'"
+    needs.push(Need(source, version, name, caps, ln))
+  return Manifest(path + "", needs)
+
+fn read_lock(fs: Fs, path: Str) -> [Locked]:
+  var out: [Locked] = []
+  let text = fs.read(path) else ""
+  for line in text.split("\n"):
+    let w = line.split()
+    # (a line whose version isn't one is skipped: the package then reads as not in vu.lock)
+    if w.len == 4 and is_version(w[1]): out.push(Locked(w[0] + "", w[1] + "", w[2] + "", w[3] + ""))
+  return out
+
+# Where a fetched package lives in the cache.
+fn cache_dir(os: Os) -> Str:
+  let env = os.env("VU_PKG_DIR")
+  if env != "": return env
+  return os.env("HOME") + "/.cache/vu/pkg"
+
+fn pkg_path(cache: Str, source: Str, version: Str) -> Str:
+  var s = source + ""
+  if s.startswith("git+"): s = s[4..s.len]
+  s = replace_all(s, "://", "/")
+  var clean = ""
+  for i in 0..s.len:
+    let c = s[i]
+    if is_name_char(c) or c == '.' or c == '-' or c == '/': clean += s[i..i + 1]
+    else: clean += "_"
+  clean = replace_all(clean, "..", "_")
+  return cache + "/" + clean + "@" + version
+
+fn git_url(source: Str) -> Str:
+  if source.startswith("git+"): return source[4..source.len]
+  if find_sub(source, "://", 0) >= 0: return source + ""
+  return "https://" + source
+
+# A source git may fetch: one of these URL schemes, and nothing git could read as an option or as
+# its ext:: transport (which runs a command). A dependency's own vu.pkg is text from outside.
+fn check_source(source: Str) throws:
+  let u = git_url(source)
+  let ok = u.startswith("https://") or u.startswith("http://") or u.startswith("ssh://") or u.startswith("git://") or u.startswith("file://")
+  if not ok or source.startswith("-"): fail "'" + source + "' isn't a package source: a folder, host/path, or an https, http, ssh, git or file URL"
+
+# v1.10.2 > v1.9.0: numbers compared as numbers.
+fn version_less(a: Str, b: Str) -> Bool:
+  let pa = a[1..a.len].split(".")
+  let pb = b[1..b.len].split(".")
+  for i in 0..max(pa.len, pb.len):
+    var x = 0
+    var y = 0
+    if i < pa.len: x = int(pa[i]) else 0
+    if i < pb.len: y = int(pb[i]) else 0
+    if x != y: return x < y
+  return a < b
+
+# The SHA-256 of a package's files (every file under dir but .git, by path and content), as hex.
+fn tree_hash(fs: Fs, dir: Str) -> Str throws:
+  var lines: [Str] = []
+  hash_walk(fs, dir, "", 0, &lines)?
+  return sha256("\n".join(lines)).hex()
+
+fn hash_walk(fs: Fs, dir: Str, rel: Str, depth: Int, var lines: [Str]) throws:
+  if depth > 64: fail dir + " has folders more than 64 deep (a link back to a folder above?)"
+  for name in fs.list(dir + "/" + rel)?:
+    if rel == "" and name == ".git/": continue
+    if name.endswith("/"):
+      hash_walk(fs, dir, rel + name, depth + 1, &lines)?
+    else:
+      let data = fs.read(dir + "/" + rel + name)?
+      lines.push(rel + name + " " + sha256(data).hex())
+
+# The folder of the file at path, absolute.
+fn abs_dir(os: Os, path: Str) -> Str:
+  var d = dir_of(path)
+  if d == "": d = "."
+  if d[0] != '/': d = os.env("PWD") + "/" + d
+  return norm_path(d)
+
+# vu.pkg in the main file's folder or the nearest folder above it, or "".
+fn find_manifest(fs: Fs, os: Os, main_path: Str) -> Str:
+  var d = abs_dir(os, main_path)
+  while true:
+    if fs.exists(d + "/vu.pkg"): return d + "/vu.pkg"
+    if d == "/" or d == "": return ""
+    d = norm_path(d + "/..")
+
+# vu get: fetches every package the program needs (and the ones they need), choosing the highest
+# version anyone asks for, and writes vu.lock beside vu.pkg.
+fn pkg_get(fs: Fs, os: Os, manifest: Str) throws:
+  let cache = cache_dir(os)
+  fs.mkdir(cache)?
+  let root = dir_of(manifest)
+  var want: {Str: Str} = {}      # source -> highest version asked for
+  var fetched: {Str: Str} = {}   # source -> the version fetched
+  var order: [Str] = []
+  var queue: [Str] = [manifest + ""]
+  var qi = 0
+  var changed = true
+  while changed:
+    changed = false
+    queue = [manifest + ""]
+    qi = 0
+    var seen: {Str: Bool} = {}
+    while qi < queue.len:
+      let mpath = queue[qi] + ""
+      qi += 1
+      if mpath in seen: continue
+      seen[mpath] = true
+      let m = read_manifest(fs, mpath)?
+      for n in m.needs:
+        if n.version == "":
+          var ldir = n.source + ""
+          if ldir[0] != '/': ldir = dir_of(mpath) + "/" + ldir
+          if fs.exists(ldir + "/vu.pkg"): queue.push(ldir + "/vu.pkg")
+          continue
+        if not (n.source in want) or version_less(want[n.source], n.version):
+          want[n.source] = n.version + ""
+          if not has_str(order, n.source): order.push(n.source + "")
+        let v = want[n.source] + ""
+        let dir = pkg_path(cache, n.source, v)
+        if not fs.exists(dir):
+          eprint("vu: fetching " + n.source + " " + v)
+          let tmpd = dir + ".tmp"
+          if fs.exists(tmpd):
+            let _ = os.run(["rm", "-rf", tmpd + ""]) else 0
+          check_source(n.source)?
+          let rc = os.run(["git", "-c", "protocol.ext.allow=never", "clone", "--quiet", "--depth", "1", "--branch", v + "", "--", git_url(n.source), tmpd + ""])?
+          if rc != 0: fail "can't fetch " + n.source + " " + v + " (git exited with {rc})"
+          # no symbolic links: one could lead the build (and the hash) to files outside the package
+          let links = os.output(["find", tmpd + "", "-path", tmpd + "/.git", "-prune", "-o", "-type", "l", "-print"]) else "?"
+          if links != "":
+            let _ = os.run(["rm", "-rf", tmpd + ""]) else 0
+            fail n.source + " " + v + " contains symbolic links, which packages can't: " + links.strip().split("\n")[0]
+          fs.mkdir(dir_of(dir))?
+          fs.rename(tmpd, dir)?
+        fetched[n.source] = v
+        if fs.exists(dir + "/vu.pkg"): queue.push(dir + "/vu.pkg")
+    for src, v in want:
+      if not (src in fetched) or fetched[src] != v: changed = true
+  var out = "# vu.lock: written by vu get. Each package: source, version, commit, SHA-256 of its files.\n"
+  for src in order:
+    let v = want[src] + ""
+    let dir = pkg_path(cache, src, v)
+    let head = fs.read(dir + "/.git/HEAD") else "-"
+    var commit = head.strip()
+    if commit == "" or find_byte(commit, ' ', 0) >= 0: commit = "-"
+    out += src + " " + v + " " + commit + " " + tree_hash(fs, dir)? + "\n"
+  fs.write(root_file(root, "vu.lock"), out)?
+  eprint("vu: wrote " + root_file(root, "vu.lock") + " ({order.len} packages)")
+
+fn root_file(root: Str, name: Str) -> Str:
+  if root == "": return name + ""
+  return root + "/" + name
+
+# The program's packages, from vu.pkg and vu.lock, each checked against its hash. Index 0.. are the
+# packages; the main program's own needs are returned in main_deps.
+fn load_pkgs(fs: Fs, os: Os, manifest: Str, var main_deps: {Str: Int}) -> [Pkg] throws:
+  var pkgs: [Pkg] = []
+  if manifest == "": return pkgs
+  let cache = cache_dir(os)
+  let lockp = root_file(dir_of(manifest), "vu.lock")
+  let lock = read_lock(fs, lockp)
+  var by_key: {Str: Int} = {}
+  # breadth first from the main program; each package once (one version per source)
+  var mq: [Str] = [manifest + ""]
+  var owner: [Int] = [-1]
+  var e_from: [Int] = []
+  var e_to: [Int] = []
+  var e_caps: [[Str]] = []
+  var qi = 0
+  while qi < mq.len:
+    let mpath = mq[qi] + ""
+    let who = owner[qi]
+    qi += 1
+    let m = read_manifest(fs, mpath)?
+    for n in m.needs:
+      var dir = ""
+      var key = ""
+      var local = false
+      var version = n.version + ""
+      if n.version == "":
+        dir = n.source + ""
+        if dir[0] != '/': dir = abs_dir(os, mpath) + "/" + dir
+        dir = norm_path(dir)
+        key = "dir:" + dir
+        local = true
+      else:
+        var lk = -1
+        for i in 0..lock.len:
+          if lock[i].source == n.source: lk = i
+        if lk < 0: fail lockp + ": " + n.source + " isn't in vu.lock; run vu get"
+        version = lock[lk].version + ""
+        dir = pkg_path(cache, n.source, version)
+        key = n.source + ""
+        if not (key in by_key):
+          if not fs.exists(dir): fail n.source + " " + version + " isn't fetched; run vu get"
+          let h = tree_hash(fs, dir)?
+          if h != lock[lk].hash: fail n.source + " " + version + " has changed since vu.lock was written (its files hash to " + h[0..12] + "..., not " + lock[lk].hash[0..min(12, lock[lk].hash.len)] + "...); check what changed, then run vu get to accept it"
+      var idx = -1
+      if key in by_key: idx = by_key[key]
+      else:
+        idx = pkgs.len
+        by_key[key] = idx
+        pkgs.push(Pkg(last_segment(n.source), n.source + "", version + "", dir + "", [], {}, local))
+        if fs.exists(dir + "/vu.pkg"):
+          mq.push(dir + "/vu.pkg")
+          owner.push(idx)
+      if who < 0: main_deps[n.name] = idx
+      else: pkgs[who].deps[n.name] = idx
+      e_from.push(who)
+      e_to.push(idx)
+      e_caps.push(copy_strs(n.caps))
+  # what each package may receive: what each package needing it grants, but no more than that one has
+  var grants: [[Str]] = []
+  for p in pkgs: grants.push([])
+  var changed = true
+  while changed:
+    changed = false
+    for k in 0..e_from.len:
+      let from = e_from[k]
+      let to = e_to[k]
+      for c in e_caps[k]:
+        if (from < 0 or has_str(grants[from], c)) and not has_str(grants[to], c):
+          grants[to].push(c + "")
+          changed = true
+  for i in 0..pkgs.len: pkgs[i].caps = copy_strs(grants[i])
+  return pkgs
+
+fn copy_pkgs(ps: [Pkg]) -> [Pkg]:
+  var out: [Pkg] = []
+  for p in ps:
+    var deps: {Str: Int} = {}
+    for k, v in p.deps: deps[k] = v
+    out.push(Pkg(p.name + "", p.source + "", p.version + "", p.dir + "", copy_strs(p.caps), deps, p.local))
+  return out
+
+# -march=X, except on macOS with Apple's ARM chips, where clang takes -mcpu=native instead.
+fn native_flag(os: Os, march: Str) -> Str:
+  if march == "native":
+    let sys = os.output(["uname", "-sm"]) else ""
+    if sys.strip() == "Darwin arm64": return "-mcpu=native"
+  return "-march=" + march

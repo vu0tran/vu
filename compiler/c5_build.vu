@@ -124,6 +124,7 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
   if g.fns[name].fails: g.rett = res_of(g, name, ret)
   else: g.rett = ret + ""
   var cps: [Str] = []
+  g.const_vars = {}
   for pa in params:
     let cn = "v_" + pa.name
     var ptr = false
@@ -144,6 +145,7 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
       ptr = true
     let v = new_var(&g, pa.name, pa.ty, cn, "param", pa.is_var, ptr, pa.line)
     declare(&g, v)
+    if pa.is_const: g.const_vars[lookup(g, pa.name)] = true
   var sig = ""
   if g.is_main:
     sig = "static int vu_main(void)"
@@ -332,10 +334,12 @@ fn build(var g: G, items: [Node]) -> Str:
       g.note = ""
       swap(&saved, &g.tenv)
     else: gen_fn(&g, items, name)
+  check_grants(g, items)
   var out: [Str] = []
   if g.uses_tasks: out.push("#define VU_MT 1   /* tasks run on several threads */")
   out.push(rt_runtime())
   if g.uses_case: out.push(rt_case())
+  if g.uses_crypto: out.push(rt_crypto())
   if g.uses_float_parse:
     out.push(rt_pow10())
     out.push(rt_float())
@@ -834,10 +838,13 @@ fn norm_path(p: Str) -> Str:
   if body == "": return "."
   return body
 
-fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Node]:
+fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str, pkgs: [Pkg], main_deps: {Str: Int}, var file_caps: [Str]) -> [Node]:
   var items: [[Node]] = []
   var mod_names = [""]
-  var index: {Str: Int} = {}
+  var index: {Str: Int} = {}      # a module's path -> its index
+  var prefix_of: {Str: Str} = {}  # a module name -> the path of the module that has it
+  var imp_map: [{Str: Int}] = [{}]   # each file: the modules its imports name
+  var owners = [-1]                  # each file: the package it's in (-1 the program, -2 std)
   files.push(Ctx(ctx.path, copy_strs(ctx.lines), ctx.json))
   let toks = lex(ctx, src, 0, 0)
   var p0 = Parser(Ctx(ctx.path, copy_strs(ctx.lines), ctx.json), toks, 0, 0, 0)
@@ -846,29 +853,51 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Nod
   var fi = 0
   while fi < items.len:
     for ii in 0..items[fi].len:
-      if items[fi][ii].k != "import" or items[fi][ii].name in index: continue
+      if items[fi][ii].k != "import" or items[fi][ii].name in imp_map[fi]: continue
       let iname = items[fi][ii].name + ""
       let iline = items[fi][ii].line
       let fctx = Ctx(files[fi].path, copy_strs(files[fi].lines), files[fi].json)
       let c0 = iname[0]
       if not ((c0 >= 'a' and c0 <= 'z') or (c0 >= 'A' and c0 <= 'Z')): report(fctx, iline, "a module's name starts with a letter, so '" + iname + "' can't be imported")
-      if iname == main_name: report(fctx, iline, "'" + iname + "' is the main file, which other files can't import")
-      let k = files.len
-      if k > 127: report(fctx, iline, "a program can have at most 127 modules")
+      if iname == main_name and owners[fi] == -1: report(fctx, iline, "'" + iname + "' is the main file, which other files can't import")
+      # next to the importing file; else one of its packages (vu.pkg); else the standard library
       let d = dir_of(files[fi].path)
       var mpath = iname + ".vu"
       if d != "": mpath = join_path(d, iname + ".vu")
+      var mowner = owners[fi]
+      if not fs.exists(mpath):
+        var pi = -1
+        if owners[fi] == -1 and iname in main_deps: pi = main_deps[iname]
+        if owners[fi] >= 0 and iname in pkgs[owners[fi]].deps: pi = pkgs[owners[fi]].deps[iname]
+        if pi >= 0:
+          # the package's file is named after it (pg.vu in .../pg), or after the name it's imported as
+          mpath = join_path(pkgs[pi].dir, pkgs[pi].name + ".vu")
+          if not fs.exists(mpath) and iname != pkgs[pi].name: mpath = join_path(pkgs[pi].dir, iname + ".vu")
+          mowner = pi
+          if not fs.exists(mpath):
+            var names = pkgs[pi].name + ".vu"
+            if iname != pkgs[pi].name: names += " or " + iname + ".vu"
+            report(fctx, iline, "package '" + iname + "' (" + pkgs[pi].source + ") has no " + names + " at its top")
+        else:
+          let spath = join_path(stdd, iname + ".vu")
+          if fs.exists(spath):
+            mpath = spath
+            mowner = -2
+          else:
+            match fs.read(mpath):
+              ok(t): report(fctx, iline, "module '" + iname + "' can't be read")
+              err(e): report(fctx, iline, "module '" + iname + "': " + e)
+      if mpath in index:
+        imp_map[fi][iname] = index[mpath]
+        continue
+      if iname in prefix_of and prefix_of[iname] != mpath:
+        report(fctx, iline, "two different modules are named '" + iname + "' (" + prefix_of[iname] + " and " + mpath + "); rename one, or import a package under another name ('as' in vu.pkg)")
+      let k = files.len
+      if k > 127: report(fctx, iline, "a program can have at most 127 modules")
       var msrc = ""
       match fs.read(mpath):
         ok(text): msrc = text
-        err(e):
-          # not next to the importing file: the standard library
-          let spath = join_path(stdd, iname + ".vu")
-          match fs.read(spath):
-            ok(text):
-              msrc = text
-              mpath = spath
-            err(e2): report(fctx, iline, "module '" + iname + "': " + e)
+        err(e): report(fctx, iline, "module '" + iname + "': " + e)
       let bad = utf8_error(msrc)
       if bad >= 0:
         var bl = 1
@@ -878,7 +907,11 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Nod
       msrc = replace_all(msrc, "\r\n", "\n")
       if msrc.len >= 3 and msrc[0] == 0xEF and msrc[1] == 0xBB and msrc[2] == 0xBF: msrc = msrc[3..msrc.len]
       if too_many_lines(msrc): report(fctx, iline, "module '" + iname + "' has more than 16,777,215 lines")
-      index[iname] = k
+      index[mpath] = k
+      prefix_of[iname] = mpath + ""
+      imp_map[fi][iname] = k
+      imp_map.push({})
+      owners.push(mowner)
       let mctx = Ctx(mpath, split_lines(msrc), ctx.json)
       files.push(Ctx(mctx.path, copy_strs(mctx.lines), mctx.json))
       mod_names.push(iname + "")
@@ -887,6 +920,10 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Nod
       var pm = Parser(Ctx(mctx.path, copy_strs(mctx.lines), mctx.json), mtoks, 0, k << 32, 0)
       items.push(parse_program(&pm))
     fi += 1
+  # what each file may receive: everything for the program and std, the vu.pkg grant for a package
+  for o in owners:
+    if o < 0: file_caps.push("*")
+    else: file_caps.push(pkgs[o].name + ":" + ",".join(pkgs[o].caps))
   var own: [{Str: Str}] = []
   for k in 0..items.len:
     var prefix = ""
@@ -919,7 +956,7 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Nod
     for imp in items[k]:
       if imp.k != "import": continue
       var m = k
-      if imp.name in index: m = index[imp.name]
+      if imp.name in imp_map[k]: m = imp_map[k][imp.name]
       if not imp.flag:
         if imp.name in own[k]: report(fctx, imp.line, "'" + imp.name + "' is both an imported module and a name defined in this file")
         alias[imp.name] = m
@@ -930,7 +967,7 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Nod
         if a in frm and frm[a] != own[m][a]: report(fctx, imp.line, "'" + a + "' is imported from two modules")
         frm[a] = own[m][a] + ""
     var mods: {Str: Int} = {}
-    for mk, mv in index: mods[mk] = mv
+    for mk, mv in prefix_of: mods[mk] = index[mv]
     var r = Res({}, copy_names(own[k]), alias, frm, [], mods)
     res_items(&r, own, fctx, &items[k])
     if k > 0:
@@ -948,7 +985,7 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Nod
     var ds: [Int] = []
     for it in items[k]:
       if it.k == "import":
-        if it.name in index: ds.push(index[it.name])
+        if it.name in imp_map[k]: ds.push(imp_map[k][it.name])
         else: ds.push(k)
     deps.push(ds)
   var seen = [false] * items.len
@@ -975,15 +1012,17 @@ fn copy_names(m: {Str: Str}) -> {Str: Str}:
   return out
 
 # links: the libraries extern blocks need; has_ext: whether the program has extern blocks at all.
-fn compile_source(fs: Fs, ctx: Ctx, src: Str, var uses_par: Bool, var links: [Str], var has_ext: Bool, stdd: Str) -> Str:
+fn compile_source(fs: Fs, ctx: Ctx, src: Str, var uses_par: Bool, var links: [Str], var has_ext: Bool, stdd: Str, pkgs: [Pkg], main_deps: {Str: Int}) -> Str:
   # Panic locations pack the line into 24 bits (the file into the rest).
   # (a final newline doesn't start another line)
   var nlines = ctx.lines.len
   if ctx.lines[nlines - 1] == "": nlines -= 1
   if nlines > 16777215: report(ctx, 16777216, "a source file can have at most 16,777,215 lines")
   var files: [Ctx] = []
-  let items = load_program(fs, ctx, src, &files, stdd)
+  var file_caps: [Str] = []
+  let items = load_program(fs, ctx, src, &files, stdd, pkgs, main_deps, &file_caps)
   var g = new_gen(ctx, &files)
+  swap(&g.file_caps, &file_caps)
   collect(&g, items)
   let csrc = build(&g, items)
   uses_par = g.uses_par
@@ -1052,6 +1091,51 @@ fn fail_early(path: Str, json: Bool, line: Int, msg: Str):
 
 fn main(fs: Fs, os: Os):
   let argv = args()
+  if argv.len >= 2 and argv[1] == "lsp": exit(lsp_main(fs, os, argv[0]))
+  if argv.len >= 2 and argv[1] == "test":
+    if argv.len < 3:
+      eprint("vu test FILE.vu...: runs each fn test_... in its own process")
+      exit(2)
+    var tpaths: [Str] = []
+    for k in 3..argv.len + 1: tpaths.push(argv[k - 1])
+    exit(run_tests_cmd(fs, os, argv[0], tpaths))
+  if argv.len >= 2 and argv[1] == "fmt":
+    # vu fmt FILE.vu...: rewrite each file's spacing (see c7_fmt.vu); --check only lists the files it would change
+    var check = false
+    var any = false
+    var changed = 0
+    for k in 2..argv.len:
+      if argv[k] == "--check":
+        check = true
+        continue
+      any = true
+      let text = fs.read(argv[k]) else ""
+      if text == "" and not fs.exists(argv[k]):
+        eprint("vu: can't read " + argv[k])
+        exit(2)
+      let neat = fmt_source(replace_all(text, "\r\n", "\n"))
+      if neat != text:
+        changed += 1
+        if check: print(argv[k])
+        else: fs.write(argv[k], neat) else exit(3)
+    if not any:
+      eprint("vu fmt FILE.vu... [--check]")
+      exit(2)
+    if check and changed > 0: exit(1)
+    exit(0)
+  if argv.len >= 2 and argv[1] == "get":
+    # vu get [FILE.vu]: fetch the packages in vu.pkg (beside FILE, or here) and write vu.lock
+    var from = "main.vu"
+    if argv.len >= 3: from = argv[2]
+    let mf = find_manifest(fs, os, from)
+    if mf == "":
+      eprint("vu: no vu.pkg here or in a folder above; it lists the packages, one per line: need SOURCE VERSION [fs net os ffi]")
+      exit(1)
+    match pkg_get(fs, os, mf):
+      ok: exit(0)
+      err(e):
+        eprint("vu: " + e)
+        exit(1)
   if argv.len < 2 or (argv[1] != "build" and argv[1] != "run" and argv[1] != "check"):
     print(rt_help())
     if argv.len >= 2 and (argv[1] == "-h" or argv[1] == "--help"): exit(0)
@@ -1126,7 +1210,16 @@ fn main(fs: Fs, os: Os):
   var uses_par = false
   var links: [Str] = []
   var has_ext = false
-  var csrc = compile_source(fs, ctx, src, &uses_par, &links, &has_ext, std_dir(os))
+  var main_deps: {Str: Int} = {}
+  var pkgs: [Pkg] = []
+  let mf = find_manifest(fs, os, path)
+  if mf != "":
+    match load_pkgs(fs, os, mf, &main_deps):
+      ok(ps): pkgs = copy_pkgs(ps)
+      err(e):
+        fail_early(path, json, 0, e)
+        exit(1)
+  var csrc = compile_source(fs, ctx, src, &uses_par, &links, &has_ext, std_dir(os), pkgs, main_deps)
   let t1 = os.clock()
   if cmd == "check":
     # Every error comes from the front end, so stopping here gives the full answer without gcc.
@@ -1135,19 +1228,28 @@ fn main(fs: Fs, os: Os):
       eprint("vu: front end {fe:.1} ms")
     exit(0)
   if tsan: csrc = replace_all(csrc, "schedule(dynamic)", "schedule(static)")
-  let work = fs.temp_dir() else "/tmp"
+  let work = fs.temp_dir() else ""
+  if work == "":
+    eprint("vu: can't make a temporary folder for the C compiler's input")
+    exit(3)
   var cfile = emit_c + ""
   if cfile == "": cfile = work + "/out.c"
-  var wrote = false
-  match fs.write(cfile, csrc):
-    ok: wrote = true
-    err(e):
-      eprint("vu: " + e)
-      exit(3)
   var out = o + ""
   if out == "":
     if cmd == "build": out = without_ext(path)
     else: out = work + "/prog"
+  # what's left in the temporary folder (the C, a binary for run) goes on every way out
+  var temps: [Str] = []
+  if emit_c == "": temps.push(cfile + "")
+  if out.startswith(work + "/"): temps.push(out + "")
+  var write_err = ""
+  match fs.write(cfile, csrc):
+    ok: write_err = ""
+    err(e): write_err = e + ""
+  if write_err != "":
+    eprint("vu: " + write_err)
+    clean_up(fs, work, temps)
+    exit(3)
   var cc = os.env("CC")
   if cc == "": cc = "cc"
   var argl = [cc, "-std=gnu11", "-fwrapv", "-fno-math-errno", "-fno-trapping-math", "-ffp-contract=off", "-w"]
@@ -1161,9 +1263,14 @@ fn main(fs: Fs, os: Os):
     argl.push("-DVU_TRACE")
   else:
     argl.push("-O3")
-    argl.push("-march=native")
+    # VU_MARCH picks the CPU to optimize for (default native); empty for a cross compiler (CC=aarch64-linux-gnu-gcc)
+    var march = "native"
+    if os.env("VU_MARCH") != "" or os.env("CC").endswith("-gcc"): march = os.env("VU_MARCH")
+    if march != "": argl.push(native_flag(os, march))
   if json: argl.push("-DVU_JSON_PANIC")
-  if uses_par: argl.push("-fopenmp")
+  if uses_par:
+    argl.push("-fopenmp")
+    argl.push("-DVU_PAR")
   if has_ext:
     # extern C files are named relative to the current directory
     argl.push("-iquote")
@@ -1185,6 +1292,7 @@ fn main(fs: Fs, os: Os):
   let rc = os.run(argl) else 127
   let t2 = os.clock()
   if rc != 0:
+    clean_up(fs, work, temps)
     if has_ext:
       eprint("vu: the C compiler rejected the program; errors in an extern C file are shown above")
       exit(1)
@@ -1198,5 +1306,12 @@ fn main(fs: Fs, os: Os):
     var run_args = [out]
     for pa in prog_args: run_args.push(pa)
     let code = os.run(run_args) else 127
+    clean_up(fs, work, temps)
     exit(code)
+  clean_up(fs, work, temps)
   exit(0)
+
+fn clean_up(fs: Fs, work: Str, files: [Str]):
+  for f in files:
+    if f != "": fs.remove(f) else 0
+  fs.remove(work) else 0

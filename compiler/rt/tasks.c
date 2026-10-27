@@ -1,6 +1,7 @@
-/* Tasks (spawn): lightweight threads, run on one thread per core. Each task stays on the thread it
-   was started on (new tasks go to the threads in turn) and runs until it waits for the network, a
-   channel or a timer; then a task that is ready on that thread runs. Each task has its own stack
+/* Tasks (spawn): lightweight threads, run on one thread per core. New tasks go to the threads in
+   turn (an idle thread may take one that hasn't started from a busy thread); once a task has run,
+   it stays on that thread. It runs until it waits for the network, a channel or a timer; then a
+   task that is ready on that thread runs. Each task has its own stack
    (VU_TASK_STACK of address space, used as it grows) and its own call stack for backtraces.
    Values move into a task and through channels, and Vu has no globals, so tasks share nothing but
    channels, which are locked. */
@@ -8,9 +9,94 @@
 #include <sched.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#ifdef __APPLE__
+/* macOS: kqueue stands in for the parts of epoll used here (read and write interest, edge-triggered
+   or not), a pipe for an eventfd, and fcntl for the flags Linux sets when a socket is made. */
+#include <sys/event.h>
+#define EPOLLIN 0x001u
+#define EPOLLOUT 0x004u
+#define EPOLLERR 0x008u
+#define EPOLLHUP 0x010u
+#define EPOLLRDHUP 0x2000u
+#define EPOLLET (1u << 31)
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CLOEXEC 0
+#define SOCK_NONBLOCK 0
+#define SOCK_CLOEXEC 0
+#define MSG_NOSIGNAL 0
+#define EFD_NONBLOCK 0
+#define EFD_CLOEXEC 0
+typedef union { void *ptr; int fd; uint64_t u64; } epoll_data_t;
+struct epoll_event { uint32_t events; epoll_data_t data; };
+static int epoll_create1(int flags) { (void)flags; int k = kqueue(); if (k >= 0) fcntl(k, F_SETFD, FD_CLOEXEC); return k; }
+static int epoll_ctl(int ep, int op, int fd, struct epoll_event *ev) {
+    struct kevent k[2];
+    if (op == EPOLL_CTL_DEL) {
+        EV_SET(&k[0], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        kevent(ep, k, 1, NULL, 0, NULL);
+        EV_SET(&k[0], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        kevent(ep, k, 1, NULL, 0, NULL);   /* (deleting a filter that wasn't added fails: fine) */
+        return 0;
+    }
+    int n = 0;
+    unsigned short fl = EV_ADD | ((ev->events & EPOLLET) ? EV_CLEAR : 0);
+    if (ev->events & EPOLLIN) { EV_SET(&k[n], fd, EVFILT_READ, fl, 0, 0, ev->data.ptr); n++; }
+    if (ev->events & EPOLLOUT) { EV_SET(&k[n], fd, EVFILT_WRITE, fl, 0, 0, ev->data.ptr); n++; }
+    return kevent(ep, k, n, NULL, 0, NULL) < 0 ? -1 : 0;
+}
+static int epoll_wait(int ep, struct epoll_event *out, int max, int timeout_ms) {
+    struct kevent k[256];
+    if (max > 256) max = 256;
+    struct timespec ts, *tp = NULL;
+    if (timeout_ms >= 0) { ts.tv_sec = timeout_ms / 1000; ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000; tp = &ts; }
+    int n = kevent(ep, NULL, 0, k, max, tp);
+    for (int i = 0; i < n; i++) {
+        uint32_t e = k[i].filter == EVFILT_READ ? EPOLLIN : EPOLLOUT;
+        if (k[i].flags & EV_EOF) e |= k[i].filter == EVFILT_READ ? EPOLLRDHUP : EPOLLHUP;
+        if (k[i].flags & EV_ERROR) e |= EPOLLERR;
+        out[i].events = e;
+        out[i].data.ptr = k[i].udata;
+    }
+    return n;
+}
+static int vu_efd_w[65536];   /* an eventfd's stand-in: the write end of the pipe whose read end it is */
+static void vu_fd_flags(int fd) {
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+static int eventfd(unsigned v, int flags) {
+    (void)v; (void)flags;
+    int p[2];
+    if (pipe(p) != 0) return -1;
+    if (p[0] >= 65536) { close(p[0]); close(p[1]); errno = EMFILE; return -1; }
+    vu_fd_flags(p[0]);
+    vu_fd_flags(p[1]);
+    vu_efd_w[p[0]] = p[1];
+    return p[0];
+}
+static void vu_efd_signal(int efd) { uint8_t one = 1; if (write(vu_efd_w[efd], &one, 1) < 0) { /* full: already signalled */ } }
+static void vu_efd_drain(int efd) { uint8_t b[64]; while (read(efd, b, sizeof b) > 0) {} }
+static void vu_efd_close(int efd) { close(vu_efd_w[efd]); close(efd); }
+static void vu_sock_flags(int fd) { vu_fd_flags(fd); int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one); }
+static int accept4(int fd, struct sockaddr *a, socklen_t *n, int flags) { (void)flags; int c = accept(fd, a, n); if (c >= 0) vu_sock_flags(c); return c; }
+static int vu_pipe2(int p[2], int flags) { (void)flags; if (pipe(p) != 0) return -1; fcntl(p[0], F_SETFD, FD_CLOEXEC); fcntl(p[1], F_SETFD, FD_CLOEXEC); return 0; }
+#define pipe2 vu_pipe2   /* (newer SDKs declare a pipe2 of their own) */
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+#ifndef MAP_STACK
+#define MAP_STACK 0
+#endif
+#else
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
-#include <sys/socket.h>
+static void vu_efd_signal(int efd) { uint64_t one = 1; if (write(efd, &one, 8) < 0) { /* already signalled */ } }
+static void vu_efd_drain(int efd) { uint64_t x; if (read(efd, &x, 8) < 0) { /* nothing to read */ } }
+static void vu_efd_close(int efd) { close(efd); }
+static void vu_sock_flags(int fd) { (void)fd; }
+#endif
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -40,10 +126,18 @@ const char *__asan_default_options(void) { return "detect_stack_use_after_return
 #ifdef VU_TSAN_FIBERS
 #include <sanitizer/tsan_interface.h>
 #endif
-#ifndef __x86_64__
+#if defined(__x86_64__) || defined(__aarch64__)
+#define VU_ASM_SWITCH 1   /* a hand-written switch (below); ucontext elsewhere */
+#else
 #include <ucontext.h>
 #endif
-extern int omp_in_parallel(void) __attribute__((weak));
+/* Inside a par loop? Only programs with par loops are built with OpenMP (VU_PAR is defined then). */
+#ifdef VU_PAR
+#include <omp.h>
+#define vu_in_par() omp_in_parallel()
+#else
+#define vu_in_par() 0
+#endif
 #define VU_TASK_STACK ((size_t)8 << 20)
 #define VU_TASK_GUARD ((size_t)64 << 10)
 #define VU_MAX_LOOPS 256
@@ -51,8 +145,8 @@ enum { VU_W_NONE, VU_W_FD, VU_W_CHAN, VU_W_SLEEP };
 typedef struct vu_task vu_task;
 typedef struct vu_loop vu_loop;
 struct vu_task {
-    void *sp;                     /* saved stack pointer while switched out (x86-64) */
-#ifndef __x86_64__
+    void *sp;                     /* saved stack pointer while switched out (x86-64, ARM64) */
+#ifndef VU_ASM_SWITCH
     ucontext_t uc;
 #endif
     char *mem;                    /* the mapping: guard, then the stack; NULL for a thread's own context */
@@ -69,6 +163,8 @@ struct vu_task {
     void *wait_obj;               /* the socket, or the channel wait list, it waits on */
     void *wait_chan;              /* the channel it waits on */
     bool timed_out, writing;
+    bool started;                 /* has run: then it stays on its thread (see vu_steal); read by other
+                                     threads, so only through vu_has_started */
     bool uncounted;               /* waiting on a channel with no deadline: not counted in vu_nactive */
     void *fake_stack;             /* AddressSanitizer's per-fiber state */
     void *tsan_fiber;
@@ -83,15 +179,21 @@ typedef struct vu_sock {
     int rpend, wpend;             /* readiness that arrived while no task was waiting */
     vu_loop *loop;
 } vu_sock;
-/* A scheduler: one per thread that runs tasks. Each task stays on the thread it was started on, so
-   a task's thread-local state (its call stack, free lists) never moves between threads. */
+/* A scheduler: one per thread that runs tasks. A task runs on its loop's thread; a thread with
+   nothing to do takes new tasks from another's queue (see vu_steal), so one task that never waits
+   can't hold up the new tasks queued behind it. Only tasks that haven't started move, and never a
+   thread's own context (main's). */
 struct vu_loop {
     int ep, efd;                  /* the poller, and an eventfd that wakes it */
     pthread_mutex_t lock;
     vu_task *rhead, *rtail;       /* made ready by other threads */
     int sleeping;                 /* in epoll_wait, so a remote wake must signal efd */
     int64_t epoch;                /* batches of events handled (see vu_retire) */
+    pthread_mutex_t qlock;        /* the ready queue, which other threads may steal from */
+    vu_task *qhead, *qtail;
+    int64_t nready;
 };
+static int vu_nsleeping;          /* loops asleep in epoll_wait (that could take work)*/
 static vu_loop vu_loops[VU_MAX_LOOPS];
 static int vu_nloops;             /* 1 + the worker threads, once tasks are in use */
 static bool vu_workers_started;
@@ -100,7 +202,7 @@ static int64_t vu_nactive;        /* tasks that can still run: every task not wa
 static int vu_last_wait_line;
 static __thread vu_loop *vu_my;
 static __thread vu_task vu_base_task;   /* the thread's own context */
-static __thread vu_task *vu_cur_task, *vu_ready_head, *vu_ready_tail, *vu_dead;
+static __thread vu_task *vu_cur_task, *vu_dead;
 static __thread vu_task **vu_heap;
 static __thread int64_t vu_nheap, vu_capheap, vu_polls;
 static __thread char *vu_stack_pool[16];
@@ -121,6 +223,7 @@ static void vu_loop_init(vu_loop *L) {
         vu_panic(0, m, sizeof m - 1);
     }
     pthread_mutex_init(&L->lock, NULL);
+    pthread_mutex_init(&L->qlock, NULL);
 }
 /* This thread runs loop L's tasks, starting from its own context. */
 static void vu_thread_tasks(vu_loop *L) {
@@ -145,7 +248,7 @@ static void vu_tasks_init(void) {
 }
 /* Every task operation: tasks run on the task threads, so par loop threads can't use them. */
 static void vu_task_here(const char *what, int line) {
-    if (omp_in_parallel && omp_in_parallel()) {
+    if (vu_in_par()) {
         char m[200];
         int n = snprintf(m, sizeof m, "%s can't be used inside a par loop", what);
         vu_panic(line, m, n);
@@ -195,20 +298,94 @@ static void vu_heap_remove(vu_task *t) {
     vu_heap_up(i);
 }
 /* -- ready queues */
+static inline bool vu_has_started(vu_task *t) { return __atomic_load_n(&t->started, __ATOMIC_RELAXED); }
+/* Wakes one sleeping thread other than busy, so it can take new tasks queued on busy (vu_steal). */
+static void vu_wake_idle(vu_loop *busy) {
+    if (__atomic_load_n(&vu_nsleeping, __ATOMIC_RELAXED) <= 0) return;
+    int nl = __atomic_load_n(&vu_nloops, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < nl; i++)
+        if (&vu_loops[i] != busy && __atomic_load_n(&vu_loops[i].sleeping, __ATOMIC_RELAXED)) {
+            vu_efd_signal(vu_loops[i].efd);
+            return;
+        }
+}
 static void vu_ready(vu_task *t) {
+    vu_loop *L = vu_my;
+    /* (read before t is queued: once it is, another thread may take it, run it and free it) */
+    bool fresh = t->mem && !vu_has_started(t);
     t->next = NULL;
-    if (vu_ready_tail) vu_ready_tail->next = t;
-    else vu_ready_head = t;
-    vu_ready_tail = t;
+    pthread_mutex_lock(&L->qlock);
+    if (L->qtail) __atomic_store_n(&L->qtail->next, t, __ATOMIC_RELAXED);
+    else __atomic_store_n(&L->qhead, t, __ATOMIC_RELAXED);   /* (other threads peek at qhead without the lock) */
+    L->qtail = t;
+    int64_t n = ++L->nready;
+    pthread_mutex_unlock(&L->qlock);
+    /* new work is queuing up here while another thread sleeps: wake one to take some */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (n >= 2 && fresh) vu_wake_idle(L);
 }
 static vu_task *vu_ready_pop(void) {
-    vu_task *t = vu_ready_head;
+    vu_loop *L = vu_my;
+    if (!__atomic_load_n(&L->qhead, __ATOMIC_RELAXED)) return NULL;
+    pthread_mutex_lock(&L->qlock);
+    vu_task *t = L->qhead;
     if (t) {
-        vu_ready_head = t->next;
-        if (!vu_ready_head) vu_ready_tail = NULL;
+        __atomic_store_n(&L->qhead, t->next, __ATOMIC_RELAXED);
+        if (!t->next) L->qtail = NULL;
+        L->nready--;
         t->next = NULL;
     }
+    pthread_mutex_unlock(&L->qlock);
     return t;
+}
+/* Takes a ready task from another thread's queue, to run here (it moves here for good). Only a task
+   that hasn't started moves: C compilers may keep the address of a thread-local variable (the
+   allocator's free lists, the call stack for backtraces) in a register across a call, so a task that
+   stopped partway through a function must resume on the thread it stopped on. */
+static bool vu_steal(void) {
+    vu_loop *me = vu_my;
+    int nl = __atomic_load_n(&vu_nloops, __ATOMIC_ACQUIRE);
+    if (nl < 2) return false;
+    int start = (int)(me - vu_loops);
+    for (int k = 1; k < nl; k++) {
+        vu_loop *V = &vu_loops[(start + k) % nl];
+        vu_task *t = NULL;
+        if (__atomic_load_n(&V->qhead, __ATOMIC_RELAXED)) {
+            pthread_mutex_lock(&V->qlock);
+            /* the first task that may move (a thread's own context stays) */
+            vu_task **q = &V->qhead, *prev = NULL;
+            while (*q) {
+                if ((*q)->mem && !vu_has_started(*q)) { t = *q; __atomic_store_n(q, t->next, __ATOMIC_RELAXED); if (V->qtail == t) V->qtail = prev; V->nready--; break; }
+                prev = *q;
+                q = &(*q)->next;
+            }
+            pthread_mutex_unlock(&V->qlock);
+        }
+        /* or one sent to V from another thread (spawned there) that V, busy, hasn't taken in yet */
+        if (!t && __atomic_load_n(&V->rhead, __ATOMIC_RELAXED)) {
+            pthread_mutex_lock(&V->lock);
+            vu_task **r = &V->rhead, *rprev = NULL;
+            while (*r) {
+                if ((*r)->mem && !vu_has_started(*r)) {
+                    t = *r;
+                    __atomic_store_n(r, t->next, __ATOMIC_RELAXED);
+                    if (V->rtail == t) V->rtail = rprev;
+                    break;
+                }
+                rprev = *r;
+                r = &(*r)->next;
+            }
+            pthread_mutex_unlock(&V->lock);
+        }
+        if (t) {
+            t->next = NULL;
+            t->loop = me;
+            t->wait_kind = VU_W_NONE;
+            vu_ready(t);
+            return true;
+        }
+    }
+    return false;
 }
 /* Makes t ready to run on its own thread: here directly, or through its thread's remote queue. */
 static void vu_wake(vu_task *t) {
@@ -219,6 +396,7 @@ static void vu_wake(vu_task *t) {
         vu_ready(t);
         return;
     }
+    bool fresh = t->mem && !vu_has_started(t);   /* (before L can take t, run it and free it) */
     pthread_mutex_lock(&L->lock);
     t->next = NULL;
     if (L->rtail) L->rtail->next = t;
@@ -226,9 +404,11 @@ static void vu_wake(vu_task *t) {
     L->rtail = t;
     int sleeping = __atomic_load_n(&L->sleeping, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&L->lock);
-    if (sleeping) {
-        uint64_t one = 1;
-        if (write(L->efd, &one, 8) < 0) { /* already signalled */ }
+    if (sleeping) vu_efd_signal(L->efd);
+    else if (fresh) {
+        /* L is busy: a sleeping thread may take this new task instead */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        vu_wake_idle(L);
     }
 }
 /* Takes the tasks other threads made ready. */
@@ -260,6 +440,32 @@ __attribute__((naked, noinline)) static void vu_ctx_switch(void **from, void *to
         "ldmxcsr (%rsp)\n\tfldcw 4(%rsp)\n\taddq $8, %rsp\n\t"
         "popq %r15\n\tpopq %r14\n\tpopq %r13\n\tpopq %r12\n\tpopq %rbx\n\tpopq %rbp\n\tret\n\t");
 }
+#elif defined(__aarch64__)
+/* The same on ARM64: x19-x30 (x29 the frame pointer, x30 the return address), d8-d15 and FPCR in a
+   176-byte frame on the current stack; then sp moves to the other task's frame, which is unpacked.
+   A top-level asm function, since GCC ignores the naked attribute on ARM64. */
+#ifdef __APPLE__
+#define VU_SW_SYM "_vu_ctx_switch_a64"
+#define VU_SW_HEAD ".private_extern " VU_SW_SYM "\n"
+#else
+#define VU_SW_SYM "vu_ctx_switch_a64"
+#define VU_SW_HEAD ".hidden " VU_SW_SYM "\n.type " VU_SW_SYM ", %function\n"
+#endif
+void vu_ctx_switch_a64(void **from, void *to);
+__asm__(
+    ".text\n.p2align 4\n.globl " VU_SW_SYM "\n" VU_SW_HEAD VU_SW_SYM ":\n"
+    "sub sp, sp, #176\n"
+    "stp x19, x20, [sp, #0]\nstp x21, x22, [sp, #16]\nstp x23, x24, [sp, #32]\n"
+    "stp x25, x26, [sp, #48]\nstp x27, x28, [sp, #64]\nstp x29, x30, [sp, #80]\n"
+    "stp d8, d9, [sp, #96]\nstp d10, d11, [sp, #112]\nstp d12, d13, [sp, #128]\nstp d14, d15, [sp, #144]\n"
+    "mrs x9, fpcr\nstr x9, [sp, #160]\n"
+    "mov x9, sp\nstr x9, [x0]\nmov sp, x1\n"
+    "ldr x9, [sp, #160]\nmsr fpcr, x9\n"
+    "ldp x19, x20, [sp, #0]\nldp x21, x22, [sp, #16]\nldp x23, x24, [sp, #32]\n"
+    "ldp x25, x26, [sp, #48]\nldp x27, x28, [sp, #64]\nldp x29, x30, [sp, #80]\n"
+    "ldp d8, d9, [sp, #96]\nldp d10, d11, [sp, #112]\nldp d12, d13, [sp, #128]\nldp d14, d15, [sp, #144]\n"
+    "add sp, sp, #176\nret\n");
+#define vu_ctx_switch vu_ctx_switch_a64
 #endif
 static void vu_task_boot(void);
 static void vu_reap(void) {
@@ -281,6 +487,7 @@ static void vu_reap(void) {
 static void vu_switch_to(vu_task *t) {
     vu_task *from = vu_cur_task;
     if (t == from) return;
+    if (!vu_has_started(t)) __atomic_store_n(&t->started, true, __ATOMIC_RELAXED);
     bool dying = from == vu_dead;
     from->top = vu_top;
     vu_top = t->top;
@@ -293,7 +500,7 @@ static void vu_switch_to(vu_task *t) {
 #ifdef VU_TSAN_FIBERS
     __tsan_switch_to_fiber(t->tsan_fiber, 0);
 #endif
-#ifdef __x86_64__
+#ifdef VU_ASM_SWITCH
     vu_ctx_switch(&from->sp, t->sp);
 #else
     swapcontext(&from->uc, &t->uc);
@@ -327,10 +534,7 @@ static void vu_retire(void *p) {
     __atomic_add_fetch(&vu_nretired, 1, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&vu_retire_lock);
     for (int i = 0; i < n; i++)   /* a sleeping poller finishes a batch when woken */
-        if (&vu_loops[i] != vu_my && __atomic_load_n(&vu_loops[i].sleeping, __ATOMIC_RELAXED)) {
-            uint64_t one = 1;
-            if (write(vu_loops[i].efd, &one, 8) < 0) { /* already signalled */ }
-        }
+        if (&vu_loops[i] != vu_my && __atomic_load_n(&vu_loops[i].sleeping, __ATOMIC_RELAXED)) vu_efd_signal(vu_loops[i].efd);
 }
 static void vu_reclaim(void) {
     if (!__atomic_load_n(&vu_nretired, __ATOMIC_RELAXED)) return;
@@ -361,7 +565,8 @@ static void vu_poll(void) {
     vu_loop *L = vu_my;
     vu_drain();
     vu_reclaim();
-    if (vu_ready_head) return;
+    if (__atomic_load_n(&L->qhead, __ATOMIC_RELAXED)) return;
+    if (vu_steal()) return;
 #ifndef VU_MALLOC
     /* values made on one thread and freed on another would pile up on the freeing thread's free lists */
     if ((++vu_polls & 255) == 0 && __atomic_load_n(&vu_nloops, __ATOMIC_RELAXED) > 1) vu_share_free();
@@ -373,18 +578,26 @@ static void vu_poll(void) {
     }
     pthread_mutex_lock(&L->lock);
     bool queued = L->rhead != NULL;
-    if (!queued) __atomic_store_n(&L->sleeping, 1, __ATOMIC_RELAXED);
+    if (!queued) __atomic_store_n(&L->sleeping, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_unlock(&L->lock);
     if (queued) { vu_drain(); return; }
+    __atomic_add_fetch(&vu_nsleeping, 1, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    /* (a task queued elsewhere just before we went to sleep: take it instead) */
+    if (vu_steal()) {
+        __atomic_sub_fetch(&vu_nsleeping, 1, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&L->sleeping, 0, __ATOMIC_SEQ_CST);
+        return;
+    }
     struct epoll_event ev[256];
     int n = epoll_wait(L->ep, ev, 256, timeout);
+    __atomic_sub_fetch(&vu_nsleeping, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&L->sleeping, 0, __ATOMIC_RELAXED);
     for (int i = 0; i < n; i++) {
         vu_sock *s = (vu_sock *)ev[i].data.ptr;
         uint32_t e = ev[i].events;
         if (!s) {
-            uint64_t x;
-            if (read(L->efd, &x, 8) < 0) { /* nothing to read */ }
+            vu_efd_drain(L->efd);
             continue;
         }
         if (e & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) vu_fd_ready(&s->reader, &s->rpend);
@@ -511,8 +724,10 @@ static void vu_start_workers(void) {
     vu_workers_started = true;
     const char *e = getenv("VU_THREADS");
     long n = e ? strtol(e, NULL, 10) : 0;
+#ifdef __linux__
     cpu_set_t cs;
     if (n <= 0 && sched_getaffinity(0, sizeof cs, &cs) == 0) n = CPU_COUNT(&cs);   /* the cores it may use (taskset) */
+#endif
     if (n <= 0) n = sysconf(_SC_NPROCESSORS_ONLN);
     if (n < 1) n = 1;
     if (n > VU_MAX_LOOPS) n = VU_MAX_LOOPS;
@@ -524,7 +739,7 @@ static void vu_start_workers(void) {
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
         int rc = pthread_create(&th, &at, vu_worker, &vu_loops[i]);
         pthread_attr_destroy(&at);
-        if (rc != 0) { close(vu_loops[i].ep); close(vu_loops[i].efd); break; }
+        if (rc != 0) { close(vu_loops[i].ep); vu_efd_close(vu_loops[i].efd); break; }
         __atomic_store_n(&vu_nloops, i + 1, __ATOMIC_RELEASE);
     }
 }
@@ -563,6 +778,12 @@ static void vu_task_spawn(void (*entry)(void *), void *arg, int line) {
     uint32_t cw[2] = {0x1F80, 0x037F};  /* the default MXCSR and x87 control word */
     sp--;
     memcpy(sp, cw, 8);
+    t->sp = sp;
+#elif defined(__aarch64__)
+    /* a frame as vu_ctx_switch leaves it, with x30 (where ret goes) = vu_task_boot */
+    uintptr_t *sp = (uintptr_t *)(t->hi - 176);
+    memset(sp, 0, 176);
+    sp[11] = (uintptr_t)vu_task_boot;
     t->sp = sp;
 #else
     getcontext(&t->uc);
@@ -793,6 +1014,7 @@ static bool vu_net_listen(vu_cap net, int64_t port, void **out, vu_str *err, int
     if (port < 0 || port > 65535) { *err = vu_errf("port %lld is not in 0..65535", (long long)port); return false; }
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0) { *err = vu_errf("can't listen on port %lld: %s", (long long)port, strerror(errno)); return false; }
+    vu_sock_flags(fd);
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     struct sockaddr_in a;
@@ -918,7 +1140,7 @@ typedef struct vu_dns {
 } vu_dns;
 static void vu_dns_free(vu_dns *d) {
     if (d->res) freeaddrinfo(d->res);
-    close(d->efd);
+    vu_efd_close(d->efd);
     free(d->host);
     free(d);
 }
@@ -931,7 +1153,8 @@ static void *vu_dns_thread(void *p) {
     d->rc = getaddrinfo(d->host, d->port, &hints, &d->res);
     __atomic_store_n(&d->done, 1, __ATOMIC_RELEASE);
     uint64_t one = 1;
-    if (write(d->efd, &one, 8) < 0) { /* the eventfd can't be full */ }
+    (void)one;
+    vu_efd_signal(d->efd);
     if (__atomic_sub_fetch(&d->refs, 1, __ATOMIC_ACQ_REL) == 0) vu_dns_free(d);   /* the task gave up */
     return NULL;
 }
@@ -999,6 +1222,7 @@ static bool vu_connect_to(const char *h, int64_t port, int64_t deadline, void **
     for (struct addrinfo *a = res; a; a = a->ai_next) {
         int fd = socket(a->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) { last = errno; continue; }
+        vu_sock_flags(fd);
         vu_str e2 = {0};
         if (connect(fd, a->ai_addr, a->ai_addrlen) < 0 && errno != EINPROGRESS) { last = errno; close(fd); continue; }
         vu_sock *s = vu_sock_new(fd, &e2);
@@ -1084,6 +1308,11 @@ static int vu_bio_create(BIO *b) { BIO_set_init(b, 1); return 1; }
 static BIO_METHOD *vu_bio_method;
 static SSL_CTX *vu_tls_system;   /* clients that trust the system's certificates share one context */
 static pthread_once_t vu_tls_once = PTHREAD_ONCE_INIT;
+static int vu_alpn_index = -1;   /* a context's ALPN list (ex_data), freed with the context */
+static void vu_alpn_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp) {
+    (void)parent; (void)ad; (void)idx; (void)argl; (void)argp;
+    free(ptr);
+}
 static pthread_mutex_t vu_tls_lock = PTHREAD_MUTEX_INITIALIZER;
 static void vu_tls_init(void) {
     /* no cleanup at exit: other task threads may still be using TLS when main returns */
@@ -1093,6 +1322,7 @@ static void vu_tls_init(void) {
     BIO_meth_set_read(vu_bio_method, vu_bio_read);
     BIO_meth_set_ctrl(vu_bio_method, vu_bio_ctrl);
     BIO_meth_set_create(vu_bio_method, vu_bio_create);
+    vu_alpn_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, vu_alpn_free);
 }
 static bool vu_tls_attach(vu_sock *s, SSL_CTX *ctx, vu_str *err) {
     pthread_once(&vu_tls_once, vu_tls_init);
@@ -1229,12 +1459,47 @@ static bool vu_tls_send(vu_sock *c, const uint8_t *data, int64_t len, int64_t de
 }
 /* net.tls_listen(port, cert: pem, key: pem): the certificate (then any intermediate certificates) and
    its private key, as PEM text. */
+/* ALPN: the server picks the first of its protocols (alpn: "h2,http/1.1") that the client offers. */
+static int vu_alpn_pick(SSL *ssl, const unsigned char **out, unsigned char *outlen, const unsigned char *in, unsigned inlen, void *arg) {
+    (void)ssl;
+    const unsigned char *ours = (const unsigned char *)arg;
+    unsigned char *o;
+    if (SSL_select_next_proto(&o, outlen, ours + 1, ours[0], in, inlen) != OPENSSL_NPN_NEGOTIATED) return SSL_TLSEXT_ERR_NOACK;
+    *out = o;
+    return SSL_TLSEXT_ERR_OK;
+}
+static bool vu_net_tls_listen_alpn(vu_cap net, int64_t port, const vu_str *cert, const vu_str *key, const vu_str *alpn,
+                                   void **out, vu_str *err, int line);
 static bool vu_net_tls_listen(vu_cap net, int64_t port, const vu_str *cert, const vu_str *key, void **out, vu_str *err,
                               int line) {
+    return vu_net_tls_listen_alpn(net, port, cert, key, NULL, out, err, line);
+}
+static bool vu_net_tls_listen_alpn(vu_cap net, int64_t port, const vu_str *cert, const vu_str *key, const vu_str *alpn,
+                                   void **out, vu_str *err, int line) {
     vu_task_here("net.tls_listen()", line);
+    unsigned char *wire = NULL;
+    if (alpn) {
+        /* "h2,http/1.1" -> a length byte, then the wire form: 2 h2 8 http/1.1 */
+        wire = (unsigned char *)vu_malloc((size_t)alpn->len + 3);
+        size_t w = 1, start = 0;
+        for (size_t i = 0; i <= (size_t)alpn->len; i++) {
+            if (i < (size_t)alpn->len && alpn->data[i] != ',') continue;
+            size_t n = i - start;
+            if (n == 0 || n > 255) { free(wire); *err = vu_errf("alpn: a comma-separated list of protocol names, like \"h2,http/1.1\""); return false; }
+            wire[w++] = (unsigned char)n;
+            memcpy(wire + w, alpn->data + start, n);
+            w += n;
+            start = i + 1;
+        }
+        if (w - 1 > 255) { free(wire); *err = vu_errf("alpn: the list is too long"); return false; }
+        wire[0] = (unsigned char)(w - 1);
+    }
     if (cert->len > (1 << 24) || key->len > (1 << 24)) { *err = vu_errf("the certificate or key is too long"); return false; }
     ERR_clear_error();
     SSL_CTX *ctx = vu_tls_ctx(true);
+    /* the ALPN list lives as long as the context (connections accepted from this listener hold it
+       too), and is freed with it on every path */
+    if (wire) SSL_CTX_set_ex_data(ctx, vu_alpn_index, wire);
     BIO *b = vu_pem_bio(cert);
     X509 *x = b ? PEM_read_bio_X509(b, NULL, vu_no_password, NULL) : NULL;
     if (!x || SSL_CTX_use_certificate(ctx, x) != 1) {
@@ -1268,6 +1533,7 @@ static bool vu_net_tls_listen(vu_cap net, int64_t port, const vu_str *cert, cons
         return false;
     }
     if (!vu_net_listen(net, port, out, err, line)) { SSL_CTX_free(ctx); return false; }
+    if (wire) SSL_CTX_set_alpn_select_cb(ctx, vu_alpn_pick, wire);
     ((vu_sock *)*out)->tls_ctx = ctx;
     return true;
 }

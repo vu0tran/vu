@@ -1,0 +1,340 @@
+# pg: a PostgreSQL client, written in Vu over Net (protocol version 3).
+#
+#   import pg
+#   var db = pg.connect(net, pg.config("localhost", 5432, "app", password, "appdb"))?
+#   let rows = pg.query(net, &db, "select id, name from users where age > $1", ["30"])?
+#   for i in 0..rows.rows.len:
+#     print(pg.text(rows, i, "name") else "")
+#   let n = pg.exec(net, &db, "update users set seen = now() where id = $1", ["{id}"])?
+#
+# The SQL text is a const parameter: it must be written into the program (a string literal), so a
+# value from outside can only arrive as a parameter ($1, $2, ...) and SQL injection doesn't compile.
+# Parameters are text (nil is NULL) and the server converts them to the column's type; results come
+# back as text too. For typed rows, let the server make JSON and read it with from_json:
+#   let rows = pg.query(net, &db, "select row_to_json(u)::text from users u where id = $1", ["{id}"])?
+#   let u = from_json(pg.text(rows, 0, "row_to_json") else "", User)?
+#
+# Sign-in: SCRAM-SHA-256 (the default since PostgreSQL 14) or a plain password; MD5 isn't supported.
+# One query at a time per connection; for several tasks, keep connections in a Chan[pg.Db] as a pool.
+# Not yet: TLS to the server, COPY, LISTEN/NOTIFY, binary formats.
+
+type Config:
+  host: Str
+  port: Int
+  user: Str
+  password: Str
+  database: Str
+  timeout: Float   # seconds to wait for the server each time it's waited for
+  allow_plain: Bool  # send the password as it is if the server asks for that (off: refused)
+
+type Db:
+  conn: Conn
+  buf: Str
+  at: Int
+  timeout: Float
+  broken: Bool     # the connection failed or the protocol went wrong: it can't be used again
+
+type Rows:
+  columns: [Str]
+  rows: [[Str?]]
+  affected: Int    # rows inserted, updated, deleted or returned (from the server's command tag)
+
+type Error:
+  Network(why: Str)                              # connecting, sending or receiving failed
+  Auth(why: Str)                                 # the server refused the user or password
+  Server(code: Str, message: Str, detail: Str)   # the server reported an error (code: its SQLSTATE)
+  Protocol(why: Str)                             # an unexpected message, or a value that can't be sent
+
+const MAX_MESSAGE = 268435456
+
+fn config(host: Str, port: Int, user: Str, password: Str, database: Str) -> Config:
+  return Config(host, port, user, password, database, 30.0, false)
+
+# ---- encoding
+
+fn be32(n: Int) -> Str:
+  return str([byte((n >> 24) & 255), byte((n >> 16) & 255), byte((n >> 8) & 255), byte(n & 255)])
+
+fn be16(n: Int) -> Str:
+  return str([byte((n >> 8) & 255), byte(n & 255)])
+
+fn rd32(s: Str, i: Int) -> Int:
+  let v = (int(s[i]) << 24) | (int(s[i + 1]) << 16) | (int(s[i + 2]) << 8) | int(s[i + 3])
+  if v >= 2147483648: return v - 4294967296
+  return v
+
+fn rd16(s: Str, i: Int) -> Int:
+  return (int(s[i]) << 8) | int(s[i + 1])
+
+# A message: its type byte, then its length (counting itself) and body.
+fn msg(kind: Byte, body: Str) -> Str:
+  return str([kind]) + be32(body.len + 4) + body
+
+# The NUL-terminated string at i in s, and where the next field starts.
+type CStr:
+  text: Str
+  next: Int
+
+fn cstr_at(s: Str, i0: Int) -> CStr:
+  let i = min(i0, s.len)
+  var j = i
+  while j < s.len and s[j] != 0: j += 1
+  return CStr(s[i..j], min(j + 1, s.len))
+
+fn has_nul(s: Str) -> Bool:
+  for i in 0..s.len:
+    if s[i] == 0: return true
+  return false
+
+# ---- the connection
+
+fn send_all(net: Net, var db: Db, data: Str) throws Error:
+  match net.send(db.conn, data, timeout: db.timeout):
+    ok: return
+    err(e):
+      db.broken = true
+      fail Network(e)
+
+# One message from the server: its type and body.
+type Msg:
+  kind: Byte
+  body: Str
+
+fn next_msg(net: Net, var db: Db) -> Msg throws Error:
+  while true:
+    let avail = db.buf.len - db.at
+    if avail >= 5:
+      let n = rd32(db.buf, db.at + 1)
+      if n < 4 or n > MAX_MESSAGE:
+        db.broken = true
+        fail Protocol("a message from the server says it's {n} bytes long")
+      if avail >= n + 1:
+        let kind = db.buf[db.at]
+        let body = db.buf[db.at + 5..db.at + 1 + n]
+        db.at += n + 1
+        if db.at == db.buf.len:
+          db.buf = ""
+          db.at = 0
+        return Msg(kind, body)
+    if db.at > 0:
+      db.buf = db.buf[db.at..db.buf.len]
+      db.at = 0
+    match net.recv(db.conn, timeout: db.timeout):
+      ok(data):
+        if data.len == 0:
+          db.broken = true
+          fail Network("the server closed the connection")
+        db.buf += data
+      err(e):
+        db.broken = true
+        fail Network(e)
+
+# An ErrorResponse's fields: S severity, C code (SQLSTATE), M message, D detail...
+fn server_error(body: Str) -> Error:
+  var code = ""
+  var message = ""
+  var detail = ""
+  var i = 0
+  while i < body.len and body[i] != 0:
+    let f = body[i]
+    let v = cstr_at(body, i + 1)
+    if f == 'C': code = v.text
+    elif f == 'M': message = v.text
+    elif f == 'D': detail = v.text
+    i = v.next
+  return Server(code, message, detail)
+
+# An Error as a message: what connect fails with, and a handy way to print one.
+fn describe(e: Error) -> Str:
+  match e:
+    Network(why): return "network: " + why
+    Auth(why): return "sign-in: " + why
+    Server(code, message, detail):
+      if detail != "": return "server: " + message + " (" + detail + ", SQLSTATE " + code + ")"
+      return "server: " + message + " (SQLSTATE " + code + ")"
+    Protocol(why): return "protocol: " + why
+
+# Connects and signs in. It fails with a message (see describe).
+fn connect(net: Net, cfg: Config) -> Db throws:
+  if has_nul(cfg.user) or has_nul(cfg.database) or has_nul(cfg.password): fail "the user, password and database can't contain a zero byte"
+  var db = Db(net.connect(cfg.host, cfg.port, timeout: cfg.timeout)?, "", 0, cfg.timeout, false)
+  match start(net, &db, cfg):
+    ok: return db
+    err(e): fail describe(e)
+
+fn start(net: Net, var db: Db, cfg: Config) throws Error:
+  var body = be32(196608) + "user\0" + cfg.user + "\0client_encoding\0UTF8\0"
+  if cfg.database != "": body += "database\0" + cfg.database + "\0"
+  body += "\0"
+  send_all(net, &db, be32(body.len + 4) + body)?
+  var nonce = ""
+  var bare = ""
+  var auth_msg = ""
+  var salted = ""
+  var verified = false
+  while true:
+    let m = next_msg(net, &db)?
+    if m.kind == 'E': fail server_error(m.body)
+    if m.kind == 'Z': return
+    if m.kind != 'R': continue   # ParameterStatus, BackendKeyData, notices
+    if m.body.len < 4: fail Protocol("a short authentication message")
+    let code = rd32(m.body, 0)
+    if code == 0:
+      # once SCRAM has started, the server must prove it knows the password before it says yes
+      if salted != "" and not verified: fail Auth("the server accepted us without proving it knows the password (is this the right server?)")
+      continue
+    if code == 3:
+      if not cfg.allow_plain: fail Auth("the server asks for the password in clear text; pg sends it only with allow_plain set in the config (use SCRAM-SHA-256 on the server instead)")
+      send_all(net, &db, msg('p', cfg.password + "\0"))?
+    elif code == 5:
+      fail Auth("the server asks for an MD5 password, which pg doesn't support; use SCRAM-SHA-256 (password_encryption = 'scram-sha-256')")
+    elif code == 10:
+      var mechs: [Str] = []
+      var i = 4
+      while i < m.body.len and m.body[i] != 0:
+        let c = cstr_at(m.body, i)
+        mechs.push(c.text)
+        i = c.next
+      var have = false
+      for x in mechs:
+        if x == "SCRAM-SHA-256": have = true
+      if not have: fail Auth("the server offers " + ", ".join(mechs) + "; pg speaks SCRAM-SHA-256")
+      nonce = b64encode(random_bytes(18))
+      bare = "n=,r=" + nonce
+      let first = "n,," + bare
+      send_all(net, &db, msg('p', "SCRAM-SHA-256\0" + be32(first.len) + first))?
+    elif code == 11:
+      let server_first = m.body[4..m.body.len]
+      var r = ""
+      var salt = ""
+      var iters = 0
+      for part in server_first.split(","):
+        if part.startswith("r="): r = part[2..part.len]
+        elif part.startswith("s="): salt = part[2..part.len]
+        elif part.startswith("i="): iters = int(part[2..part.len]) else 0
+      if not r.startswith(nonce) or r.len <= nonce.len: fail Auth("the server's SCRAM nonce doesn't continue ours")
+      if iters < 1 or iters > 10000000: fail Auth("the server asks for {iters} SCRAM iterations")
+      let salt_bytes = b64decode(salt) else ""
+      if salt_bytes == "": fail Auth("the server's SCRAM salt isn't base64")
+      salted = pbkdf2_sha256(cfg.password, salt_bytes, iters)
+      let final_bare = "c=biws,r=" + r
+      auth_msg = bare + "," + server_first + "," + final_bare
+      let client_key = hmac_sha256(salted, "Client Key")
+      let sig = hmac_sha256(sha256(client_key), auth_msg)
+      send_all(net, &db, msg('p', final_bare + ",p=" + b64encode(xor(client_key, sig))))?
+    elif code == 12:
+      let server_final = m.body[4..m.body.len]
+      let want = "v=" + b64encode(hmac_sha256(hmac_sha256(salted, "Server Key"), auth_msg))
+      if salted == "" or server_final != want: fail Auth("the server's SCRAM signature is wrong: it may not know the password (is this the right server?)")
+      verified = true
+    else:
+      fail Auth("the server asks for authentication method {code}, which pg doesn't support")
+
+fn xor(a: Str, b: Str) -> Str:
+  var out = bytes(a)
+  for i in 0..out.len: out[i] = out[i] ^ b[i]
+  return str(out)
+
+# ---- queries
+
+# Runs sql with params ($1 is params[0]; nil is NULL) and returns every row it produces.
+fn query(net: Net, var db: Db, const sql: Str, params: [Str?]) -> Rows throws Error:
+  if db.broken: fail Protocol("this connection failed earlier; connect again")
+  if has_nul(sql): fail Protocol("the SQL text contains a zero byte")
+  if params.len > 65535: fail Protocol("{params.len} parameters (the protocol allows 65,535)")
+  var bind = "\0\0" + be16(0) + be16(params.len)
+  for p in params:
+    if v = p:
+      if has_nul(v): fail Protocol("a parameter contains a zero byte, which PostgreSQL text can't hold")
+      bind += be32(v.len) + v
+    else:
+      bind += be32(-1)
+  bind += be16(0)
+  let out = msg('P', "\0" + sql + "\0" + be16(0)) + msg('B', bind) + msg('D', "P\0") + msg('E', "\0" + be32(0)) + msg('S', "")
+  send_all(net, &db, out)?
+  var rows = Rows([], [], 0)
+  var failed = false
+  var ferr = Protocol("")
+  while true:
+    let m = next_msg(net, &db)?
+    if m.kind == 'Z':
+      if failed: fail ferr
+      return rows
+    if failed: continue
+    if m.kind == 'E':
+      failed = true
+      ferr = server_error(m.body)
+    elif m.kind == 'T':
+      if m.body.len < 2: bad_protocol(&db, "a short row description")?
+      let n = rd16(m.body, 0)
+      var i = 2
+      for k in 0..n:
+        if i >= m.body.len: bad_protocol(&db, "a short row description")?
+        let c = cstr_at(m.body, i)
+        rows.columns.push(c.text)
+        i = c.next + 18
+    elif m.kind == 'D':
+      if m.body.len < 2: bad_protocol(&db, "a short data row")?
+      let n = rd16(m.body, 0)
+      if n != rows.columns.len: bad_protocol(&db, "a data row with {n} columns, after a description of {rows.columns.len}")?
+      var i = 2
+      var row: [Str?] = []
+      for k in 0..n:
+        if i + 4 > m.body.len: bad_protocol(&db, "a short data row")?
+        let len = rd32(m.body, i)
+        i += 4
+        if len < 0: row.push(nil)
+        else:
+          if i + len > m.body.len: bad_protocol(&db, "a short data row")?
+          row.push(m.body[i..i + len])
+          i += len
+      rows.rows.push(row)
+    elif m.kind == 'C':
+      let tag = cstr_at(m.body, 0).text
+      let parts = tag.split(" ")
+      rows.affected = int(parts[parts.len - 1]) else 0
+
+# The server sent something that doesn't fit the protocol: what's left of its answer can't be told
+# apart from the next one's, so the connection can't be used again.
+fn bad_protocol(var db: Db, why: Str) throws Error:
+  db.broken = true
+  fail Protocol(why)
+
+# Runs sql (an insert, update, delete or other statement) and returns how many rows it affected.
+fn exec(net: Net, var db: Db, const sql: Str, params: [Str?]) -> Int throws Error:
+  let r = query(net, &db, sql, params)?
+  return r.affected
+
+# Ends the session politely (dropping a Db just closes the connection).
+fn close(net: Net, var db: Db):
+  if not db.broken: net.send(db.conn, msg('X', ""), timeout: db.timeout) else return
+  db.broken = true
+
+# ---- reading results
+
+fn column(r: Rows, name: Str) -> Int:
+  for i in 0..r.columns.len:
+    if r.columns[i] == name: return i
+  return -1
+
+# Row i's value in the named column, or nil if it's NULL (or there's no such column).
+fn text(r: Rows, i: Int, name: Str) -> Str?:
+  let c = column(r, name)
+  if c < 0 or i < 0 or i >= r.rows.len: return nil
+  if v = r.rows[i][c]: return v + ""
+  return nil
+
+fn get_int(r: Rows, i: Int, name: Str) -> Int throws:
+  if v = text(r, i, name): return int(v)?
+  fail "no value in column '" + name + "' of row {i}"
+
+fn get_float(r: Rows, i: Int, name: Str) -> Float throws:
+  if v = text(r, i, name): return float(v)?
+  fail "no value in column '" + name + "' of row {i}"
+
+fn get_bool(r: Rows, i: Int, name: Str) -> Bool throws:
+  if v = text(r, i, name):
+    if v == "t": return true
+    if v == "f": return false
+    fail "'" + v + "' in column '" + name + "' isn't a Bool"
+  fail "no value in column '" + name + "' of row {i}"

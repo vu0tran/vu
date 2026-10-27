@@ -1,0 +1,664 @@
+# h2: HTTP/2 (RFC 9113) for http.serve. A connection that opens with the HTTP/2 preface ("PRI *
+# HTTP/2.0", what clients send with prior knowledge, as curl --http2-prior-knowledge does) is served
+# here, with the same handler as HTTP/1.1. Requests on a connection are answered one at a time, in
+# the order they complete; their responses may interleave with the reading of later requests.
+#
+# Over TLS, http.serve_tls offers h2 through ALPN, and clients that choose it are served here too.
+#
+# Covered: HPACK (Huffman, the dynamic table, size updates), flow control both ways, SETTINGS, PING,
+# WINDOW_UPDATE, RST_STREAM, GOAWAY, CONTINUATION, padding and request trailers (read, then ignored).
+# Not covered: server push (never needed) and priorities (ignored, as RFC 9113 allows).
+#
+# Limits, against a client that tries to use up the server: a header list decodes to at most 64 KB
+# (however small its HPACK encoding: no "HPACK bomb"); a header block arrives in at most 32 frames;
+# 100 streams at once; a request body of 10 MB, and 20 MB of unfinished request bodies on one
+# connection; requests are answered one at a time, so resetting streams (the "rapid reset" attack)
+# can't start more work than sending whole requests would.
+import http
+
+const DATA = 0
+const HEADERS = 1
+const PRIORITY = 2
+const RST_STREAM = 3
+const SETTINGS = 4
+const PUSH_PROMISE = 5
+const PING = 6
+const GOAWAY = 7
+const WINDOW_UPDATE = 8
+const CONTINUATION = 9
+const END_STREAM = 1
+const ACK = 1
+const END_HEADERS = 4
+const PADDED = 8
+const PRIO = 32
+const PROTOCOL_ERROR = 1
+const FLOW_CONTROL_ERROR = 3
+const FRAME_SIZE_ERROR = 6
+const REFUSED_STREAM = 7
+const COMPRESSION_ERROR = 9
+const MAX_STREAMS = 100
+const MAX_HEADER_LIST = 65536
+const MAX_BODY = 10485760
+const MAX_BUFFERED = 20971520   # unfinished request bodies on one connection
+const MAX_CONT = 32             # frames in one header block
+
+type Frame:
+  kind, flags, stream: Int
+  payload: Str
+
+type Stream:
+  id: Int
+  block: Str             # the header block, until END_HEADERS
+  req: http.Request
+  ended: Bool            # END_STREAM arrived: the request is complete
+  send_window: Int
+
+type Conn2:
+  buf: Str
+  at: Int
+  streams: [Stream]
+  ready: [Int]           # complete requests, by stream id, in order
+  last_id: Int
+  conn_window: Int       # how much we may still send on the connection
+  init_window: Int       # each new stream's send window (the client's SETTINGS_INITIAL_WINDOW_SIZE)
+  max_frame: Int         # the largest frame the client accepts
+  hp: Hpack
+  goaway: Bool
+  cont_stream: Int       # a header block in progress on this stream (CONTINUATION expected), or 0
+  cont_frames: Int       # frames in that header block so far
+
+type Hpack:
+  names: [Str]           # the dynamic table, newest first
+  values: [Str]
+  size: Int
+  max_size: Int
+  codes: [Int]           # Huffman: each symbol's code and length, sorted by (length, code)
+  lens: [Int]
+  syms: [Int]
+  snames: [Str]          # the static table
+  svalues: [Str]
+
+# What an HTTP/2 client sends first.
+fn preface() -> Str:
+  return "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+fn be32(n: Int) -> Str:
+  return str([byte((n >> 24) & 255), byte((n >> 16) & 255), byte((n >> 8) & 255), byte(n & 255)])
+
+fn rd24(s: Str, i: Int) -> Int:
+  return (int(s[i]) << 16) | (int(s[i + 1]) << 8) | int(s[i + 2])
+
+fn rd32(s: Str, i: Int) -> Int:
+  return (int(s[i]) << 24) | (int(s[i + 1]) << 16) | (int(s[i + 2]) << 8) | int(s[i + 3])
+
+fn frame(kind: Int, flags: Int, stream: Int, payload: Str) -> Str:
+  let n = payload.len
+  return str([byte((n >> 16) & 255), byte((n >> 8) & 255), byte(n & 255), byte(kind), byte(flags)]) + be32(stream & 2147483647) + payload
+
+fn new_conn() -> Conn2:
+  return Conn2("", 0, [], [], 0, 65535, 65535, 16384, new_hpack(), false, 0, 0)
+
+fn new_hpack() -> Hpack:
+  # canonical decoding: symbols ordered by (length, code)
+  let codes = huff_codes()
+  let lens = huff_lens()
+  var syms: [Int] = []
+  for l in 5..31:
+    for sym in 0..257:
+      if lens[sym] == l: syms.push(sym)
+  var sc: [Int] = []
+  var sl: [Int] = []
+  for sym in syms:
+    sc.push(codes[sym])
+    sl.push(lens[sym])
+  return Hpack([], [], 0, 4096, sc, sl, syms, static_names(), static_values())
+
+# ---- serving
+
+# Serves an HTTP/2 connection that began with the preface (already in first). Returns when the client
+# goes away, on a protocol error (after sending GOAWAY), or when stopping closes.
+fn serve_conn(net: Net, c: Conn, h: Shared[fn(http.Request) -> http.Response], stopping: Chan[Int], first: Str):
+  var k = new_conn()
+  k.buf = first
+  if k.buf.len < 24 or k.buf[0..24] != preface(): return
+  k.at = 24
+  # our settings: at most 100 streams at once; header lists up to 64 KB
+  let ours = str([0, 3]) + be32(MAX_STREAMS) + str([0, 6]) + be32(MAX_HEADER_LIST)
+  net.send(c, frame(SETTINGS, 0, 0, ours), timeout: 10.0) else return
+  var idle = 0
+  while true:
+    # answer what's complete, in order
+    while k.ready.len > 0:
+      let id = k.ready[0]
+      var rest: [Int] = []
+      for i in 1..k.ready.len: rest.push(k.ready[i])
+      k.ready = rest
+      let si = find_stream(k, id)
+      if si < 0: continue
+      let resp = h.value(k.streams[si].req)
+      respond(net, c, &k, id, resp) else return
+      drop_stream(&k, id)
+    if k.goaway or stopping.closed():
+      if k.streams.len == 0:
+        net.send(c, frame(GOAWAY, 0, 0, be32(k.last_id) + be32(0)), timeout: 5.0) else return
+        return
+    match read_frame(net, c, &k, 1.0):
+      ok(f):
+        idle = 0
+        let err_code = handle(net, c, &k, f)
+        if err_code > 0:
+          net.send(c, frame(GOAWAY, 0, 0, be32(k.last_id) + be32(err_code)), timeout: 5.0) else return
+          return
+      err(e):
+        if e != "timed out": return
+        idle += 1
+        if idle >= 60 or (stopping.closed() and k.streams.len == 0): return
+
+fn find_stream(k: Conn2, id: Int) -> Int:
+  for i in 0..k.streams.len:
+    if k.streams[i].id == id: return i
+  return -1
+
+fn drop_stream(var k: Conn2, id: Int):
+  var keep: [Stream] = []
+  for i in 0..k.streams.len:
+    if k.streams[i].id != id:
+      var s = blank_stream(0)
+      swap(&s, &k.streams[i])
+      keep.push(s)
+  k.streams = keep
+
+fn blank_stream(id: Int) -> Stream:
+  return Stream(id, "", http.Request("", "", "", "HTTP/2", [], ""), false, 0)
+
+# The next frame (waiting up to timeout seconds for bytes).
+fn read_frame(net: Net, c: Conn, var k: Conn2, timeout: Float) -> Frame throws:
+  while true:
+    if k.buf.len - k.at >= 9:
+      let n = rd24(k.buf, k.at)
+      if n > 16384 + 256: fail "a frame larger than we allow"
+      if k.buf.len - k.at >= 9 + n:
+        let f = Frame(int(k.buf[k.at + 3]), int(k.buf[k.at + 4]), rd32(k.buf, k.at + 5) & 2147483647, k.buf[k.at + 9..k.at + 9 + n])
+        k.at += 9 + n
+        if k.at > 65536:
+          k.buf = k.buf[k.at..k.buf.len]
+          k.at = 0
+        return f
+    let more = net.recv(c, timeout: timeout)?
+    if more.len == 0: fail "closed"
+    k.buf += more
+
+# Handles one frame; returns 0, or the error code to close the connection with.
+fn handle(net: Net, c: Conn, var k: Conn2, f: Frame) -> Int:
+  if k.cont_stream != 0 and (f.kind != CONTINUATION or f.stream != k.cont_stream): return PROTOCOL_ERROR
+  if f.kind == SETTINGS:
+    if f.stream != 0: return PROTOCOL_ERROR
+    if (f.flags & ACK) != 0:
+      if f.payload.len != 0: return FRAME_SIZE_ERROR
+      return 0
+    if f.payload.len % 6 != 0: return FRAME_SIZE_ERROR
+    var i = 0
+    while i < f.payload.len:
+      let id = (int(f.payload[i]) << 8) | int(f.payload[i + 1])
+      let v = rd32(f.payload, i + 2)
+      if id == 4:
+        if v > 2147483647: return FLOW_CONTROL_ERROR
+        for j in 0..k.streams.len:
+          k.streams[j].send_window += v - k.init_window
+          if k.streams[j].send_window > 2147483647: return FLOW_CONTROL_ERROR
+        k.init_window = v
+      elif id == 5:
+        if v < 16384 or v > 16777215: return PROTOCOL_ERROR
+        k.max_frame = v
+      elif id == 2 and v > 1: return PROTOCOL_ERROR
+      i += 6
+    net.send(c, frame(SETTINGS, ACK, 0, ""), timeout: 10.0) else return PROTOCOL_ERROR
+    return 0
+  if f.kind == PING:
+    if f.stream != 0: return PROTOCOL_ERROR
+    if f.payload.len != 8: return FRAME_SIZE_ERROR
+    if (f.flags & ACK) == 0: net.send(c, frame(PING, ACK, 0, f.payload), timeout: 10.0) else return PROTOCOL_ERROR
+    return 0
+  if f.kind == WINDOW_UPDATE:
+    if f.payload.len != 4: return FRAME_SIZE_ERROR
+    let inc = rd32(f.payload, 0) & 2147483647
+    if inc == 0:
+      if f.stream == 0: return PROTOCOL_ERROR
+      net.send(c, frame(RST_STREAM, 0, f.stream, be32(PROTOCOL_ERROR)), timeout: 10.0) else return PROTOCOL_ERROR
+      drop_stream(&k, f.stream)
+      return 0
+    if f.stream == 0:
+      k.conn_window += inc
+      if k.conn_window > 2147483647: return FLOW_CONTROL_ERROR
+    else:
+      let si = find_stream(k, f.stream)
+      if si >= 0:
+        k.streams[si].send_window += inc
+        if k.streams[si].send_window > 2147483647:
+          net.send(c, frame(RST_STREAM, 0, f.stream, be32(FLOW_CONTROL_ERROR)), timeout: 10.0) else return PROTOCOL_ERROR
+          drop_stream(&k, f.stream)
+    return 0
+  if f.kind == GOAWAY:
+    k.goaway = true
+    return 0
+  if f.kind == RST_STREAM:
+    if f.stream == 0: return PROTOCOL_ERROR
+    if f.payload.len != 4: return FRAME_SIZE_ERROR
+    drop_stream(&k, f.stream)
+    return 0
+  if f.kind == PRIORITY:
+    if f.stream == 0: return PROTOCOL_ERROR
+    if f.payload.len != 5: return FRAME_SIZE_ERROR
+    return 0
+  if f.kind == PUSH_PROMISE: return PROTOCOL_ERROR
+  if f.kind == HEADERS:
+    if f.stream == 0 or f.stream % 2 == 0: return PROTOCOL_ERROR
+    var p = f.payload
+    var pad = 0
+    var off = 0
+    if (f.flags & PADDED) != 0:
+      if p.len < 1: return PROTOCOL_ERROR
+      pad = int(p[0])
+      off = 1
+    if (f.flags & PRIO) != 0: off += 5
+    if off + pad > p.len: return PROTOCOL_ERROR
+    let frag = p[off..p.len - pad]
+    var si = find_stream(k, f.stream)
+    if si < 0:
+      if f.stream <= k.last_id: return PROTOCOL_ERROR
+      k.last_id = f.stream
+      if k.streams.len >= MAX_STREAMS or k.goaway:
+        net.send(c, frame(RST_STREAM, 0, f.stream, be32(REFUSED_STREAM)), timeout: 10.0) else return PROTOCOL_ERROR
+        return 0
+      var s = blank_stream(f.stream)
+      s.send_window = k.init_window
+      k.streams.push(s)
+      si = k.streams.len - 1
+    elif k.streams[si].ended: return PROTOCOL_ERROR
+    elif k.streams[si].req.method != "":
+      # trailers, after the body: they must end the stream
+      if (f.flags & END_STREAM) == 0: return PROTOCOL_ERROR
+    k.streams[si].block += frag
+    if (f.flags & END_STREAM) != 0: k.streams[si].ended = true
+    if (f.flags & END_HEADERS) == 0:
+      k.cont_stream = f.stream
+      k.cont_frames = 1
+      return 0
+    return headers_done(&k, si)
+  if f.kind == CONTINUATION:
+    if f.stream == 0 or f.stream != k.cont_stream: return PROTOCOL_ERROR
+    let si = find_stream(k, f.stream)
+    if si < 0: return PROTOCOL_ERROR
+    if k.streams[si].block.len + f.payload.len > MAX_HEADER_LIST: return PROTOCOL_ERROR
+    k.cont_frames += 1
+    if k.cont_frames > MAX_CONT: return PROTOCOL_ERROR
+    k.streams[si].block += f.payload
+    if (f.flags & END_HEADERS) == 0: return 0
+    k.cont_stream = 0
+    return headers_done(&k, si)
+  if f.kind == DATA:
+    if f.stream == 0: return PROTOCOL_ERROR
+    var p = f.payload
+    var pad = 0
+    var off = 0
+    if (f.flags & PADDED) != 0:
+      if p.len < 1: return PROTOCOL_ERROR
+      pad = int(p[0])
+      off = 1
+    if off + pad > p.len: return PROTOCOL_ERROR
+    # what the client sent counts against the windows we gave it: give it back
+    if f.payload.len > 0:
+      net.send(c, frame(WINDOW_UPDATE, 0, 0, be32(f.payload.len)), timeout: 10.0) else return PROTOCOL_ERROR
+    let si = find_stream(k, f.stream)
+    if si < 0:
+      if f.stream > k.last_id: return PROTOCOL_ERROR
+      return 0   # a stream already reset or answered
+    if k.streams[si].ended or k.streams[si].block.len > 0: return PROTOCOL_ERROR
+    var buffered = 0
+    for st in k.streams:
+      if not st.ended: buffered += st.req.body.len
+    if k.streams[si].req.body.len + (p.len - off - pad) > MAX_BODY or buffered + (p.len - off - pad) > MAX_BUFFERED:
+      net.send(c, frame(RST_STREAM, 0, f.stream, be32(REFUSED_STREAM)), timeout: 10.0) else return PROTOCOL_ERROR
+      drop_stream(&k, f.stream)
+      return 0
+    k.streams[si].req.body += p[off..p.len - pad]
+    if (f.flags & END_STREAM) != 0:
+      k.streams[si].ended = true
+      k.ready.push(f.stream)
+    elif f.payload.len > 0:
+      net.send(c, frame(WINDOW_UPDATE, 0, f.stream, be32(f.payload.len)), timeout: 10.0) else return PROTOCOL_ERROR
+    return 0
+  return 0   # unknown frame types are ignored
+
+# A stream's header block is complete: decode it into the request.
+fn headers_done(var k: Conn2, si: Int) -> Int:
+  var block = ""
+  swap(&block, &k.streams[si].block)
+  var names: [Str] = []
+  var values: [Str] = []
+  if not decode_block(&k.hp, block, &names, &values): return COMPRESSION_ERROR
+  if k.streams[si].req.method != "":
+    # trailers: decoded (the HPACK table must stay in step), then dropped; the request is complete
+    for n in names:
+      if n.startswith(":"): return PROTOCOL_ERROR
+    k.ready.push(k.streams[si].id)
+    return 0
+  var method = ""
+  var path = ""
+  var authority = ""
+  var headers: [http.Header] = []
+  var regular = false
+  var size = 0
+  for i in 0..names.len:
+    let n = names[i]
+    size += n.len + values[i].len + 32
+    if size > MAX_HEADER_LIST: return PROTOCOL_ERROR
+    if n.startswith(":"):
+      if regular: return PROTOCOL_ERROR
+      if n == ":method": method = values[i] + ""
+      elif n == ":path": path = values[i] + ""
+      elif n == ":authority": authority = values[i] + ""
+      elif n != ":scheme": return PROTOCOL_ERROR
+      continue
+    regular = true
+    for j in 0..n.len:
+      if n[j] >= 'A' and n[j] <= 'Z': return PROTOCOL_ERROR
+    if n == "connection" or n == "transfer-encoding" or n == "keep-alive" or n == "upgrade": return PROTOCOL_ERROR
+    headers.push(http.Header(n + "", values[i] + ""))
+  if method == "" or (path == "" and method != "CONNECT"): return PROTOCOL_ERROR
+  if authority != "" and http.find_header(headers, "host") < 0: headers.push(http.Header("host", authority))
+  var p = path + ""
+  var q = ""
+  let qm = path.find("?")
+  if qm >= 0:
+    p = path[0..qm]
+    q = path[qm + 1..path.len]
+  var body = ""
+  swap(&body, &k.streams[si].req.body)
+  k.streams[si].req = http.Request(method, p, q, "HTTP/2", headers, body)
+  if k.streams[si].ended: k.ready.push(k.streams[si].id)
+  return 0
+
+# Sends resp on stream id: HEADERS, then DATA in frames the client accepts, waiting for window updates
+# (and handling whatever else arrives meanwhile) when its windows are used up.
+fn respond(net: Net, c: Conn, var k: Conn2, id: Int, resp: http.Response) throws:
+  # a response that can't be sent (a line break in a header value, a status that isn't 200..999)
+  # resets its stream only (INTERNAL_ERROR); the connection's other streams go on
+  var bad = resp.status < 200 or resp.status > 999
+  for hd in resp.headers:
+    match http.check_header(hd):
+      ok: continue
+      err(e): bad = true
+  if bad:
+    net.send(c, frame(RST_STREAM, 0, id, be32(2)), timeout: 30.0)?
+    return
+  var block = ""
+  if resp.status == 200: block += str([byte(0x88)])
+  elif resp.status == 204: block += str([byte(0x89)])
+  elif resp.status == 404: block += str([byte(0x8d)])
+  elif resp.status == 500: block += str([byte(0x8e)])
+  else: block += str([byte(0x08)]) + hp_str("{resp.status}")
+  for hd in resp.headers:
+    let n = hd.name.lower()
+    if n == "content-length" or n == "connection" or n == "transfer-encoding" or n == "keep-alive": continue
+    block += str([byte(0)]) + hp_str(n) + hp_str(hd.value)
+  block += str([byte(0)]) + hp_str("content-length") + hp_str("{resp.body.len}")
+  let si0 = find_stream(k, id)
+  let head = si0 >= 0 and k.streams[si0].req.method == "HEAD"
+  var flags = END_HEADERS
+  if resp.body.len == 0 or head: flags += END_STREAM
+  # (a header block over the client's frame size goes in HEADERS and CONTINUATION frames)
+  var pos = 0
+  var first = true
+  while true:
+    let take = min(k.max_frame, block.len - pos)
+    let last = pos + take == block.len
+    var fl = 0
+    if first:
+      fl = flags & END_STREAM
+      if last: fl += END_HEADERS
+      net.send(c, frame(HEADERS, fl, id, block[pos..pos + take]), timeout: 30.0)?
+    else:
+      if last: fl = END_HEADERS
+      net.send(c, frame(CONTINUATION, fl, id, block[pos..pos + take]), timeout: 30.0)?
+    first = false
+    pos += take
+    if last: break
+  if resp.body.len == 0 or head: return
+  var at = 0
+  while at < resp.body.len:
+    let si = find_stream(k, id)
+    if si < 0: return   # reset by the client meanwhile
+    let room = min(min(k.conn_window, k.streams[si].send_window), k.max_frame)
+    if room <= 0:
+      # wait for WINDOW_UPDATE (other frames are handled as they come)
+      let f = read_frame(net, c, &k, 30.0)?
+      if handle(net, c, &k, f) > 0: fail "protocol error"
+      continue
+    let n = min(room, resp.body.len - at)
+    var fl = 0
+    if at + n == resp.body.len: fl = END_STREAM
+    net.send(c, frame(DATA, fl, id, resp.body[at..at + n]), timeout: 30.0)?
+    k.conn_window -= n
+    k.streams[si].send_window -= n
+    at += n
+
+# An HPACK string literal, not Huffman-coded.
+fn hp_str(s: Str) -> Str:
+  return hp_int(s.len, 7, 0) + s
+
+fn hp_int(n: Int, prefix: Int, first_bits: Int) -> Str:
+  let max_p = (1 << prefix) - 1
+  if n < max_p: return str([byte(first_bits | n)])
+  var out: [Byte] = [byte(first_bits | max_p)]
+  var v = n - max_p
+  while v >= 128:
+    out.push(byte((v & 127) | 128))
+    v = v >> 7
+  out.push(byte(v))
+  return str(out)
+
+# ---- HPACK decoding
+
+type Cursor:
+  s: Str
+  i: Int
+  ok: Bool
+
+fn rd_int(var c: Cursor, prefix: Int) -> Int:
+  if c.i >= c.s.len:
+    c.ok = false
+    return 0
+  let max_p = (1 << prefix) - 1
+  var v = int(c.s[c.i]) & max_p
+  c.i += 1
+  if v < max_p: return v
+  var shift = 0
+  while true:
+    if c.i >= c.s.len or shift > 28:
+      c.ok = false
+      return 0
+    let b = int(c.s[c.i])
+    c.i += 1
+    v += (b & 127) << shift
+    shift += 7
+    if b < 128: return v
+
+fn rd_str(var h: Hpack, var c: Cursor) -> Str:
+  if c.i >= c.s.len:
+    c.ok = false
+    return ""
+  let huff = (int(c.s[c.i]) & 128) != 0
+  let n = rd_int(&c, 7)
+  if not c.ok or c.i + n > c.s.len or n > MAX_HEADER_LIST:
+    c.ok = false
+    return ""
+  let raw = c.s[c.i..c.i + n]
+  c.i += n
+  if not huff: return raw
+  return huff_decode(h, raw, &c)
+
+# Canonical Huffman decoding, bit by bit (codes of each length are consecutive numbers).
+fn huff_decode(h: Hpack, s: Str, var c: Cursor) -> Str:
+  var out: [Byte] = []
+  var code = 0
+  var len = 0
+  var bits_since = 0
+  for i in 0..s.len:
+    let b = int(s[i])
+    var k = 7
+    while k >= 0:
+      code = (code << 1) | ((b >> k) & 1)
+      len += 1
+      bits_since += 1
+      k -= 1
+      if len >= 5:
+        let sym = huff_lookup(h, code, len)
+        if sym == 256:
+          c.ok = false
+          return ""
+        if sym >= 0:
+          out.push(byte(sym))
+          code = 0
+          len = 0
+          bits_since = 0
+      if len > 30:
+        c.ok = false
+        return ""
+  # the rest must be padding: fewer than 8 bits, all ones (a prefix of EOS)
+  if len >= 8 or code != (1 << len) - 1: c.ok = false
+  return str(out)
+
+fn huff_lookup(h: Hpack, code: Int, len: Int) -> Int:
+  # binary search among the codes of this length
+  var lo = 0
+  var hi = h.lens.len - 1
+  while lo <= hi:
+    let mid = (lo + hi) / 2
+    if h.lens[mid] < len or (h.lens[mid] == len and h.codes[mid] < code): lo = mid + 1
+    elif h.lens[mid] == len and h.codes[mid] == code: return h.syms[mid]
+    else: hi = mid - 1
+  return -1
+
+fn table_entry(h: Hpack, idx: Int, var name: Str, var value: Str) -> Bool:
+  if idx <= 0: return false
+  if idx <= 61:
+    name = h.snames[idx - 1] + ""
+    value = h.svalues[idx - 1] + ""
+    return true
+  let d = idx - 62
+  if d >= h.names.len: return false
+  name = h.names[d] + ""
+  value = h.values[d] + ""
+  return true
+
+fn table_add(var h: Hpack, name: Str, value: Str):
+  let sz = name.len + value.len + 32
+  if sz > h.max_size:
+    h.names = []
+    h.values = []
+    h.size = 0
+    return
+  var names = [name + ""]
+  var values = [value + ""]
+  for i in 0..h.names.len:
+    names.push(h.names[i])
+    values.push(h.values[i])
+  h.names = names
+  h.values = values
+  h.size += sz
+  evict(&h)
+
+fn evict(var h: Hpack):
+  while h.size > h.max_size and h.names.len > 0:
+    let last = h.names.len - 1
+    h.size -= h.names[last].len + h.values[last].len + 32
+    h.names.pop()
+    h.values.pop()
+
+# Decodes a header block; false if it's malformed, or decodes to more than MAX_HEADER_LIST (counted as
+# RFC 9113 counts: each field's name and value, plus 32), however few bytes encode it.
+fn decode_block(var h: Hpack, block: Str, var names: [Str], var values: [Str]) -> Bool:
+  var c = Cursor(block, 0, true)
+  var first = true   # (size updates come before any field)
+  var size = 0
+  while c.i < c.s.len and c.ok:
+    if names.len > 0:
+      size += names[names.len - 1].len + values[values.len - 1].len + 32
+      if size > MAX_HEADER_LIST: return false
+    let b = int(c.s[c.i])
+    if b >= 128:
+      # an indexed field
+      let idx = rd_int(&c, 7)
+      var n = ""
+      var v = ""
+      if not c.ok or not table_entry(h, idx, &n, &v): return false
+      if size + n.len + v.len + 32 > MAX_HEADER_LIST: return false
+      names.push(n)
+      values.push(v)
+    elif b >= 64 or b < 32:
+      # a literal: with indexing (01), without (0000) or never indexed (0001)
+      var prefix = 4
+      if b >= 64: prefix = 6
+      let idx = rd_int(&c, prefix)
+      var n = ""
+      var v = ""
+      if idx > 0:
+        if not table_entry(h, idx, &n, &v): return false
+      else: n = rd_str(&h, &c)
+      let val = rd_str(&h, &c)
+      if not c.ok: return false
+      if b >= 64: table_add(&h, n, val)
+      names.push(n)
+      values.push(val)
+    else:
+      # a dynamic table size update (only at the start of a block)
+      if not first: return false
+      let sz = rd_int(&c, 5)
+      if not c.ok or sz > 4096: return false
+      h.max_size = sz
+      evict(&h)
+      continue
+    first = false
+  return c.ok
+# ---- tables from RFC 7541 (generated from Python's hpack package)
+
+# The Huffman code of each byte value (and 256, end of string), and its length in bits.
+fn huff_codes() -> [Int]:
+  return [
+    8184, 8388568, 268435426, 268435427, 268435428, 268435429, 268435430, 268435431, 268435432, 16777194, 1073741820, 268435433, 268435434, 1073741821, 268435435, 268435436,
+    268435437, 268435438, 268435439, 268435440, 268435441, 268435442, 1073741822, 268435443, 268435444, 268435445, 268435446, 268435447, 268435448, 268435449, 268435450, 268435451,
+    20, 1016, 1017, 4090, 8185, 21, 248, 2042, 1018, 1019, 249, 2043, 250, 22, 23, 24,
+    0, 1, 2, 25, 26, 27, 28, 29, 30, 31, 92, 251, 32764, 32, 4091, 1020,
+    8186, 33, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106,
+    107, 108, 109, 110, 111, 112, 113, 114, 252, 115, 253, 8187, 524272, 8188, 16380, 34,
+    32765, 3, 35, 4, 36, 5, 37, 38, 39, 6, 116, 117, 40, 41, 42, 7,
+    43, 118, 44, 8, 9, 45, 119, 120, 121, 122, 123, 32766, 2044, 16381, 8189, 268435452,
+    1048550, 4194258, 1048551, 1048552, 4194259, 4194260, 4194261, 8388569, 4194262, 8388570, 8388571, 8388572, 8388573, 8388574, 16777195, 8388575,
+    16777196, 16777197, 4194263, 8388576, 16777198, 8388577, 8388578, 8388579, 8388580, 2097116, 4194264, 8388581, 4194265, 8388582, 8388583, 16777199,
+    4194266, 2097117, 1048553, 4194267, 4194268, 8388584, 8388585, 2097118, 8388586, 4194269, 4194270, 16777200, 2097119, 4194271, 8388587, 8388588,
+    2097120, 2097121, 4194272, 2097122, 8388589, 4194273, 8388590, 8388591, 1048554, 4194274, 4194275, 4194276, 8388592, 4194277, 4194278, 8388593,
+    67108832, 67108833, 1048555, 524273, 4194279, 8388594, 4194280, 33554412, 67108834, 67108835, 67108836, 134217694, 134217695, 67108837, 16777201, 33554413,
+    524274, 2097123, 67108838, 134217696, 134217697, 67108839, 134217698, 16777202, 2097124, 2097125, 67108840, 67108841, 268435453, 134217699, 134217700, 134217701,
+    1048556, 16777203, 1048557, 2097126, 4194281, 2097127, 2097128, 8388595, 4194282, 4194283, 33554414, 33554415, 16777204, 16777205, 67108842, 8388596,
+    67108843, 134217702, 67108844, 67108845, 134217703, 134217704, 134217705, 134217706, 134217707, 268435454, 134217708, 134217709, 134217710, 134217711, 134217712, 67108846,
+    1073741823]
+
+fn huff_lens() -> [Int]:
+  return [
+    13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
+    13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
+    15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5, 6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
+    20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23, 24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
+    22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23, 21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
+    26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25, 19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
+    20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23, 26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
+    30]
+
+# The static table (index 1 is entries[0]).
+fn static_names() -> [Str]:
+  return [":authority", ":method", ":method", ":path", ":path", ":scheme", ":scheme", ":status", ":status", ":status", ":status", ":status", ":status", ":status", "accept-charset", "accept-encoding", "accept-language", "accept-ranges", "accept", "access-control-allow-origin", "age", "allow", "authorization", "cache-control", "content-disposition", "content-encoding", "content-language", "content-length", "content-location", "content-range", "content-type", "cookie", "date", "etag", "expect", "expires", "from", "host", "if-match", "if-modified-since", "if-none-match", "if-range", "if-unmodified-since", "last-modified", "link", "location", "max-forwards", "proxy-authenticate", "proxy-authorization", "range", "referer", "refresh", "retry-after", "server", "set-cookie", "strict-transport-security", "transfer-encoding", "user-agent", "vary", "via", "www-authenticate"]
+
+fn static_values() -> [Str]:
+  return ["", "GET", "POST", "/", "/index.html", "http", "https", "200", "204", "206", "304", "400", "404", "500", "", "gzip, deflate", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]

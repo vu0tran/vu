@@ -42,5 +42,11 @@ bad = [l for l in ls if not re.fullmatch(r'line \d \d+ abcdefghijklmnopqrstuvwxy
 print(len(ls), len(bad))")
   check "print_lines run $i: 16000 whole lines" $([ "$r" = "16000 0" ] && echo 0 || echo 1) "$r"
 done
+# idle threads take new tasks from a busy thread (two cores or more needed to see it)
+if [ "$(nproc)" -ge 2 ]; then
+  $VU build mt/steal.vu -o "$work/steal" >/dev/null 2>&1
+  r=$("$work/steal")
+  check "new tasks queued behind a task that never waits are taken by an idle thread" $([ "$r" = "short tasks first" ] && echo 0 || echo 1) "$r"
+fi
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

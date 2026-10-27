@@ -1,0 +1,248 @@
+# ws: WebSockets (RFC 6455), server and client, over TCP or TLS.
+#
+#   import ws
+#   fn handle(net: Net, own c: Conn):
+#     var s = ws.accept(net, c) else return       # the HTTP upgrade, on a connection from net.accept
+#     while true:
+#       match ws.recv(net, &s):
+#         ok(m):
+#           match m:
+#             ws.Text(t): ws.send_text(net, &s, "echo: " + t) else return
+#             ws.Binary(b): ws.send_binary(net, &s, b) else return
+#             ws.Closed(code, why): return
+#         err(e): return
+#
+#   var c = ws.connect(net, "ws://localhost:8080/chat")?     # or wss:// (TLS)
+#   ws.send_text(net, &c, "hi")?
+#
+# Messages arrive whole (fragments are joined); pings are answered and pongs skipped by recv; a close
+# from the other side is answered and comes back as Closed. Text must be UTF-8 (else the connection is
+# closed with 1007). Messages over 16 MB close the connection (1009). The server's accept handles a
+# plain connection from net.accept; to serve HTTP and WebSockets on one port, route in your own
+# accept loop.
+
+type Socket:
+  conn: Conn?      # nil once closed
+  buf: Str
+  at: Int
+  client: Bool     # this side is the client: its frames are masked
+  closed: Bool
+  timeout: Float
+
+type Msg:
+  Text(text: Str)
+  Binary(data: Str)
+  Closed(code: Int, reason: Str)
+
+const MAX_MESSAGE = 16777216
+
+fn accept_of(key: Str) -> Str:
+  return b64encode(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+
+fn header_value(head: Str, name: Str) -> Str:
+  for line in head.split("\r\n"):
+    let colon = line.find(":")
+    if colon > 0 and line[0..colon].strip().lower() == name: return line[colon + 1..line.len].strip()
+  return ""
+
+# Reads up to the end of the HTTP header section; what comes after stays in rest.
+fn read_head(net: Net, c: Conn, var rest: Str, timeout: Float) -> Str throws:
+  var buf = ""
+  while true:
+    let end = buf.find("\r\n\r\n")
+    if end >= 0:
+      rest = buf[end + 4..buf.len]
+      return buf[0..end]
+    if buf.len > 65536: fail "the HTTP header section is over 64 KB"
+    let more = net.recv(c, timeout: timeout)?
+    if more.len == 0: fail "the connection closed during the handshake"
+    buf += more
+
+# The server's side of the opening handshake, on a connection from net.accept.
+fn accept(net: Net, own c: Conn) -> Socket throws:
+  var rest = ""
+  let head = read_head(net, c, &rest, 30.0)?
+  let first = head[0..max(0, head.find("\r\n"))]
+  var ok = first.startswith("GET ") and first.endswith(" HTTP/1.1")
+  let key = header_value(head, "sec-websocket-key")
+  if header_value(head, "upgrade").lower() != "websocket" or not ("upgrade" in header_value(head, "connection").lower()) or header_value(head, "sec-websocket-version") != "13" or key == "": ok = false
+  let raw = b64decode(key) else ""
+  if raw.len != 16: ok = false
+  if not ok:
+    net.send(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") else 0
+    fail "not a WebSocket handshake"
+  let accept_key = accept_of(key)
+  net.send(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept_key + "\r\n\r\n")?
+  return Socket(c, rest, 0, false, false, 300.0)
+
+# The client's side: ws://host[:port]/path or wss://host[:port]/path (checked against the system's
+# certificates).
+fn connect(net: Net, url: Str) -> Socket throws:
+  return connect_ca(net, url, "")?
+
+# connect, with wss:// checked against the certificates in ca (PEM text) instead of the system's.
+fn connect_ca(net: Net, url: Str, ca: Str) -> Socket throws:
+  var tls = false
+  var rest = ""
+  if url.startswith("ws://"): rest = url[5..url.len]
+  elif url.startswith("wss://"):
+    rest = url[6..url.len]
+    tls = true
+  else: fail "a WebSocket URL starts with ws:// or wss://, not '" + url + "'"
+  var slash = rest.find("/")
+  if slash < 0: slash = rest.len
+  let hostport = rest[0..slash]
+  var path = rest[slash..rest.len]
+  if path == "": path = "/"
+  var host = hostport + ""
+  var port = 80
+  if tls: port = 443
+  let colon = hostport.find(":")
+  if colon >= 0:
+    host = hostport[0..colon]
+    port = int(hostport[colon + 1..hostport.len])?
+  var conn: Conn? = nil
+  if tls and ca != "": conn = net.tls_connect(host, port, ca: ca, timeout: 30.0)?
+  elif tls: conn = net.tls_connect(host, port, timeout: 30.0)?
+  else: conn = net.connect(host, port, timeout: 30.0)?
+  let key = b64encode(random_bytes(16))
+  let req = "GET " + path + " HTTP/1.1\r\nHost: " + hostport + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"
+  var extra = ""
+  if c = conn:
+    net.send(c, req, timeout: 30.0)?
+    let head = read_head(net, c, &extra, 30.0)?
+    if not head.startswith("HTTP/1.1 101"): fail "the server didn't switch to WebSocket: " + head[0..max(0, head.find("\r\n"))]
+    if header_value(head, "sec-websocket-accept") != accept_of(key): fail "the server's Sec-WebSocket-Accept is wrong"
+  return Socket(conn, extra, 0, true, false, 300.0)
+
+# ---- frames
+
+fn frame(client: Bool, opcode: Int, payload: Str) -> Str:
+  var h: [Byte] = [byte(128 + opcode)]
+  var mask_bit = 0
+  if client: mask_bit = 128
+  let n = payload.len
+  if n < 126: h.push(byte(mask_bit + n))
+  elif n < 65536:
+    h.push(byte(mask_bit + 126))
+    h.push(byte(n >> 8))
+    h.push(byte(n & 255))
+  else:
+    h.push(byte(mask_bit + 127))
+    for k in 0..8: h.push(byte((n >> (56 - 8 * k)) & 255))
+  if not client: return str(h) + payload
+  let key = random_bytes(4)
+  var body = bytes(payload)
+  for k in 0..body.len: body[k] = body[k] ^ key[k % 4]
+  return str(h) + key + str(body)
+
+fn send_frame(net: Net, var s: Socket, opcode: Int, payload: Str) throws:
+  if s.closed: fail "the WebSocket is closed"
+  if c = s.conn: net.send(c, frame(s.client, opcode, payload), timeout: s.timeout)?
+  else: fail "the WebSocket is closed"
+
+fn send_text(net: Net, var s: Socket, text: Str) throws:
+  if not text.is_utf8(): fail "WebSocket text must be UTF-8 (send bytes with send_binary)"
+  send_frame(net, &s, 1, text)?
+
+fn send_binary(net: Net, var s: Socket, data: Str) throws:
+  send_frame(net, &s, 2, data)?
+
+fn ping(net: Net, var s: Socket, data: Str) throws:
+  if data.len > 125: fail "a ping carries at most 125 bytes"
+  send_frame(net, &s, 9, data)?
+
+# Starts the closing handshake (code 1000 is a normal close); recv then returns Closed when it ends.
+fn close(net: Net, var s: Socket, code: Int, reason: Str) throws:
+  if s.closed: return
+  send_frame(net, &s, 8, str([byte((code >> 8) & 255), byte(code & 255)]) + reason)?
+  s.closed = true
+
+# Fails the connection with a close code, as the RFC asks for a protocol error.
+fn fail_with(net: Net, var s: Socket, code: Int, why: Str) -> Msg:
+  if not s.closed:
+    if c = s.conn: net.send(c, frame(s.client, 8, str([byte(code >> 8), byte(code & 255)])), timeout: 5.0) else 0
+  s.closed = true
+  s.conn = nil
+  return Closed(code, why)
+
+# Bytes from the connection until at least n are buffered after s.at.
+fn need(net: Net, var s: Socket, n: Int) throws:
+  while s.buf.len - s.at < n:
+    if s.at > 0:
+      s.buf = s.buf[s.at..s.buf.len]
+      s.at = 0
+    var more = ""
+    if c = s.conn: more = net.recv(c, timeout: s.timeout)?
+    else: fail "the WebSocket is closed"
+    if more.len == 0: fail "the connection closed"
+    s.buf += more
+
+# The next whole message. Control frames in between are handled here.
+fn recv(net: Net, var s: Socket) -> Msg throws:
+  var msg = ""
+  var msg_op = 0
+  while true:
+    if s.conn == nil: return Closed(1006, "the connection is closed")
+    need(net, &s, 2)?
+    let b0 = int(s.buf[s.at])
+    let b1 = int(s.buf[s.at + 1])
+    let fin = (b0 & 128) != 0
+    let op = b0 & 15
+    let masked = (b1 & 128) != 0
+    if (b0 & 112) != 0: return fail_with(net, &s, 1002, "reserved bits set")
+    if masked == s.client: return fail_with(net, &s, 1002, "frames from a client must be masked, and from a server not")
+    var len = b1 & 127
+    var hdr = 2
+    if len == 126:
+      need(net, &s, 4)?
+      len = (int(s.buf[s.at + 2]) << 8) | int(s.buf[s.at + 3])
+      hdr = 4
+    elif len == 127:
+      need(net, &s, 10)?
+      len = 0
+      for k in 2..10:
+        if k == 2 and int(s.buf[s.at + 2]) >= 128: return fail_with(net, &s, 1002, "a frame length over 2^63")
+        len = (len << 8) | int(s.buf[s.at + k])
+      hdr = 10
+    if op >= 8 and (len > 125 or not fin): return fail_with(net, &s, 1002, "a control frame over 125 bytes, or fragmented")
+    if len > MAX_MESSAGE or msg.len + len > MAX_MESSAGE: return fail_with(net, &s, 1009, "a message over 16 MB")
+    var mk = 0
+    if masked: mk = 4
+    need(net, &s, hdr + mk + len)?
+    var payload = s.buf[s.at + hdr + mk..s.at + hdr + mk + len]
+    if masked:
+      let key = s.buf[s.at + hdr..s.at + hdr + 4]
+      var pb = bytes(payload)
+      for k in 0..pb.len: pb[k] = pb[k] ^ key[k % 4]
+      payload = str(pb)
+    s.at += hdr + mk + len
+    if op == 8:
+      var code = 1005
+      var reason = ""
+      if payload.len >= 2:
+        code = (int(payload[0]) << 8) | int(payload[1])
+        reason = payload[2..payload.len]
+      if not s.closed:
+        if c = s.conn: net.send(c, frame(s.client, 8, payload[0..min(2, payload.len)]), timeout: 5.0) else 0
+      s.closed = true
+      s.conn = nil
+      return Closed(code, reason)
+    if op == 9:
+      if not s.closed:
+        if c = s.conn: net.send(c, frame(s.client, 10, payload), timeout: s.timeout)?
+      continue
+    if op == 10: continue
+    if op == 0:
+      if msg_op == 0: return fail_with(net, &s, 1002, "a continuation frame with nothing to continue")
+    elif op == 1 or op == 2:
+      if msg_op != 0: return fail_with(net, &s, 1002, "a new message before the last one ended")
+      msg_op = op
+    else:
+      return fail_with(net, &s, 1002, "unknown opcode {op}")
+    msg += payload
+    if fin:
+      if msg_op == 1:
+        if not msg.is_utf8(): return fail_with(net, &s, 1007, "text that isn't UTF-8")
+        return Text(msg)
+      return Binary(msg)

@@ -1,0 +1,759 @@
+# re: regular expressions, with Python's syntax and results, in time linear in the text.
+#
+#   import re
+#   let r = re.compile("(\\w+)@(\\w+)\\.com")?
+#   if m = re.search(r, text):
+#     if g = re.group(m, text, 1): print(g)        # the first group, nil if it didn't take part
+#     print(re.group_text(m, text, 2))             # or "" when it didn't
+#   let words = re.findall(re.compile("[a-z]+")?, text)
+#   let clean = re.sub(re.compile("\\s+")?, text, " ")
+#
+# Matching runs a Pike VM (as RE2 does): every possible match advances together, one character at a
+# time, so a pattern can't take exponential time on any input (no "ReDoS"). The price: backreferences
+# (\1 in a pattern) and lookaround ((?=...), (?<=...)) aren't supported, and say so when compiled.
+# Supported: literals, ., [...] classes (ranges, negation, \d \w \s inside), \d \D \w \W \s \S \b \B,
+# ^ $ \A \Z, groups (...) and (?:...), |, * + ? {m} {m,} {m,n} and their lazy forms (*? +? ?? {m,n}?).
+# Characters are UTF-8 characters, as in Python's str; offsets (Match.start, .end) are byte offsets, for
+# slicing (s[m.start..m.end]). \d \w \s mean ASCII digits, word characters and whitespace (Python's
+# re.ASCII); flags like (?i) aren't supported yet.
+
+type Regex:
+  prog: [Inst]
+  classes: [Cls]
+  ngroups: Int     # capturing groups, not counting the whole match
+  pattern: Str
+  nslots: Int      # capture slots, then one per loop that can match empty (where its iteration began)
+  enc: [[Int]]     # per instruction: the slots of the (up to 6 innermost) such loops around it
+  width: Int       # 2 ^ the most of those around any instruction: a state is (pc, which marks are here)
+  first: [Bool]    # the bytes a match can start at (all 256 when that can't be narrowed)
+
+type Match:
+  start, end: Int
+  groups: [Int]    # for group k (from 1): groups[2k - 2], groups[2k - 1], or -1, -1
+
+# One instruction. op: CHAR (a = the code point), ANY (not \n), CLASS (a = index in classes), SPLIT (a, b:
+# try a first), JMP (a), SAVE (a = slot), MATCH, BOL (\A or ^), EOL ($: the end, or before a final \n),
+# EOT (\Z), WORDB (\b), NWORDB (\B), MARK (a = slot: note where a loop's iteration begins), CHKE (a = slot,
+# b = the loop's exit: an iteration that matched nothing leaves the loop, as Python's does)
+type Inst:
+  op, a, b: Int
+
+type Cls:
+  ranges: [Int]    # lo, hi pairs of code points
+  neg: Bool
+
+const CHAR = 1
+const ANY = 2
+const CLASS = 3
+const SPLIT = 4
+const JMP = 5
+const SAVE = 6
+const MATCH = 7
+const BOL = 8
+const EOL = 9
+const EOT = 10
+const WORDB = 11
+const NWORDB = 12
+const MARK = 13
+const CHKE = 14
+const MAX_PROG = 20000
+
+# ---- parsing: a recursive-descent parser building a small tree, then code from the tree
+
+type Node:
+  k: Str           # lit, any, cls, cat, alt, rep, group, assert, empty
+  cp: Int          # lit: the code point; group: its number (0: not capturing); assert: the op
+  cls: Int         # cls: index in the regex's classes
+  min, max: Int    # rep: counts (max -1: no limit)
+  greedy: Bool
+  kids: [Node]
+
+type Emit:
+  nslots: Int
+  loops: [Int]     # slot, first pc, last pc of each loop body that can match nothing
+
+type P:
+  src: Str
+  i: Int
+  ngroups: Int
+  classes: [Cls]
+  depth: Int
+
+fn node(k: Str) -> Node:
+  return Node(k, 0, 0, 0, 0, true, [])
+
+fn compile(pattern: Str) -> Regex throws:
+  var p = P(pattern + "", 0, 0, [], 0)
+  let tree = parse_alt(&p)?
+  if p.i < p.src.len:
+    if p.src[p.i] == ')': fail "unbalanced parenthesis at position {p.i}"
+    fail "unexpected '" + p.src[p.i..p.i + 1] + "' at position {p.i}"
+  var prog: [Inst] = [Inst(SAVE, 0, 0)]
+  var em = Emit(2 * p.ngroups + 2, [])
+  emit(&prog, tree, &em)?
+  prog.push(Inst(SAVE, 1, 0))
+  prog.push(Inst(MATCH, 0, 0))
+  var classes: [Cls] = []
+  swap(&classes, &p.classes)
+  # loops are listed inner ones first (an inner body is emitted, and listed, before its loop ends)
+  var enc: [[Int]] = []
+  var most = 0
+  for pc in 0..prog.len:
+    var e: [Int] = []
+    var k = 0
+    while k < em.loops.len:
+      if pc >= em.loops[k + 1] and pc <= em.loops[k + 2] and e.len < 6: e.push(em.loops[k])
+      k += 3
+    most = max(most, e.len)
+    enc.push(e)
+  var r = Regex(prog, classes, p.ngroups, pattern + "", em.nslots, enc, 1 << most, [])
+  r.first = first_bytes(r)
+  return r
+
+# The bytes a match can start at: the first bytes of what the first consuming instructions accept.
+# Anything that can match without consuming (an assertion, an empty match) allows every byte. Only
+# ASCII bytes and UTF-8 lead bytes are ever listed (never continuation bytes), unless it's all 256.
+fn first_bytes(r: Regex) -> [Bool]:
+  var out = [false] * 256
+  var all = false
+  var seen = [false] * r.prog.len
+  var stack = [0]
+  while stack.len > 0 and not all:
+    let pc = stack.pop()
+    if seen[pc]: continue
+    seen[pc] = true
+    let ins = r.prog[pc]
+    if ins.op == JMP: stack.push(ins.a)
+    elif ins.op == SPLIT:
+      stack.push(ins.a)
+      stack.push(ins.b)
+    elif ins.op == SAVE or ins.op == MARK: stack.push(pc + 1)
+    elif ins.op == CHKE:
+      stack.push(pc + 1)
+      stack.push(ins.b)
+    elif ins.op == CHAR:
+      let c = ins.a
+      if c < 128: out[c] = true
+      elif c < 0x800: out[0xC0 | (c >> 6)] = true
+      elif c < 0x10000: out[0xE0 | (c >> 12)] = true
+      else: out[0xF0 | (c >> 18)] = true
+    elif ins.op == CLASS:
+      let cl = r.classes[ins.a]
+      if cl.neg: all = true
+      else:
+        var k = 0
+        while k < cl.ranges.len:
+          let lo = cl.ranges[k]
+          let hi = cl.ranges[k + 1]
+          for b in max(lo, 0)..min(hi, 127) + 1: out[b] = true
+          if hi >= 128:
+            for b in 0xC2..0xF5: out[b] = true   # (any lead byte: narrowing these isn't worth it)
+          k += 2
+    else: all = true   # ANY (matches bytes that aren't UTF-8 too), MATCH, and the assertions
+  if all: return [true] * 256
+  return out
+
+fn parse_alt(var p: P) -> Node throws:
+  p.depth += 1
+  if p.depth > 500: fail "the pattern nests too deeply"
+  var alts: [Node] = [parse_cat(&p)?]
+  while p.i < p.src.len and p.src[p.i] == '|':
+    p.i += 1
+    alts.push(parse_cat(&p)?)
+  p.depth -= 1
+  if alts.len == 1: return alts.pop()
+  var n = node("alt")
+  swap(&n.kids, &alts)
+  return n
+
+fn parse_cat(var p: P) -> Node throws:
+  var items: [Node] = []
+  while p.i < p.src.len and p.src[p.i] != '|' and p.src[p.i] != ')':
+    var atom = parse_atom(&p)?
+    atom = parse_rep(&p, atom)?
+    items.push(atom)
+  if items.len == 0: return node("empty")
+  if items.len == 1: return items.pop()
+  var n = node("cat")
+  swap(&n.kids, &items)
+  return n
+
+fn parse_rep(var p: P, own atom: Node) -> Node throws:
+  var a = atom
+  while p.i < p.src.len:
+    let c = p.src[p.i]
+    var lo = -1
+    var hi = -1
+    if c == '*':
+      lo = 0
+      p.i += 1
+    elif c == '+':
+      lo = 1
+      p.i += 1
+    elif c == '?':
+      lo = 0
+      hi = 1
+      p.i += 1
+    elif c == '{':
+      let save = p.i
+      let br = parse_braces(&p)
+      if br.len == 0:
+        p.i = save
+        return a
+      lo = br[0]
+      hi = br[1]
+    else: return a
+    if a.k == "assert" or a.k == "empty": fail "nothing to repeat at position {p.i - 1}"
+    if hi != -1 and hi < lo: fail "min repeat greater than max repeat at position {p.i}"
+    if lo > 1000 or hi > 1000: fail "repeat counts above 1000 aren't supported"
+    var greedy = true
+    if p.i < p.src.len and p.src[p.i] == '+':
+      fail "possessive repeats (*+ ++ ?+ {{m,n}}+) aren't supported, at position {p.i}: they need backtracking"
+    if p.i < p.src.len and p.src[p.i] == '?':
+      greedy = false
+      p.i += 1
+    if p.i < p.src.len and (p.src[p.i] == '*' or p.src[p.i] == '+' or (p.src[p.i] == '?')):
+      fail "multiple repeat at position {p.i}"
+    if p.i < p.src.len and p.src[p.i] == '{':
+      let save2 = p.i
+      let br2 = parse_braces(&p)
+      p.i = save2
+      if br2.len > 0: fail "multiple repeat at position {p.i}"
+    var r = Node("rep", 0, 0, lo, hi, greedy, [])
+    r.kids.push(a)
+    a = r
+  return a
+
+# {m}, {m,}, {m,n} -> [m, n] (n -1 for none); [] if it isn't one (then '{' is a literal, as in Python).
+fn parse_braces(var p: P) -> [Int]:
+  var j = p.i + 1
+  var m = ""
+  while j < p.src.len and p.src[j] >= '0' and p.src[j] <= '9':
+    m += p.src[j..j + 1]
+    j += 1
+  var n = ""
+  var comma = false
+  if j < p.src.len and p.src[j] == ',':
+    comma = true
+    j += 1
+    while j < p.src.len and p.src[j] >= '0' and p.src[j] <= '9':
+      n += p.src[j..j + 1]
+      j += 1
+  if j >= p.src.len or p.src[j] != '}': return []
+  if m == "" and not comma: return []
+  if m.len > 6 or n.len > 6: return [1000000, 1000000]
+  var lo = 0
+  if m != "": lo = int(m) else 0
+  var hi = lo
+  if comma:
+    hi = -1
+    if n != "": hi = int(n) else 0
+  p.i = j + 1
+  return [lo, hi]
+
+fn parse_atom(var p: P) -> Node throws:
+  let c = p.src[p.i]
+  if c == '(':
+    p.i += 1
+    var num = 0
+    if p.i < p.src.len and p.src[p.i] == '?':
+      if p.i + 1 < p.src.len and p.src[p.i + 1] == ':': p.i += 2
+      else:
+        var what = "this group form"
+        if p.i + 1 < p.src.len and (p.src[p.i + 1] == '=' or p.src[p.i + 1] == '!' or p.src[p.i + 1] == '<'): what = "lookaround"
+        if p.i + 1 < p.src.len and p.src[p.i + 1] == 'P': what = "named groups"
+        if p.i + 1 < p.src.len and p.src[p.i + 1] >= 'a' and p.src[p.i + 1] <= 'z': what = "inline flags"
+        fail what + " (position {p.i - 1}) isn't supported"
+    else:
+      p.ngroups += 1
+      num = p.ngroups
+    let inner = parse_alt(&p)?
+    if p.i >= p.src.len or p.src[p.i] != ')': fail "missing ), unterminated subpattern at position {p.i}"
+    p.i += 1
+    var g = Node("group", num, 0, 0, 0, true, [])
+    g.kids.push(inner)
+    return g
+  if c == '[': return parse_class(&p)?
+  if c == '.':
+    p.i += 1
+    return node("any")
+  if c == '^':
+    p.i += 1
+    return Node("assert", BOL, 0, 0, 0, true, [])
+  if c == '$':
+    p.i += 1
+    return Node("assert", EOL, 0, 0, 0, true, [])
+  if c == '*' or c == '+' or c == '?': fail "nothing to repeat at position {p.i}"
+  if c == '\\': return parse_escape(&p, false)?
+  # a literal character (UTF-8)
+  let cp = decode_at(p.src, p.i)
+  p.i += char_len_at(p.src, p.i)
+  return Node("lit", cp, 0, 0, 0, true, [])
+
+fn class_node(var p: P, ranges: [Int], neg: Bool) -> Node:
+  p.classes.push(Cls(copy_ints(ranges), neg))
+  return Node("cls", 0, p.classes.len - 1, 0, 0, true, [])
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var out: [Int] = []
+  for x in xs: out.push(x)
+  return out
+
+fn word_ranges() -> [Int]:
+  return [48, 57, 65, 90, 95, 95, 97, 122]
+fn space_ranges() -> [Int]:
+  return [9, 13, 32, 32]
+
+# After a backslash: an escape outside a class (in_class false) or inside one.
+fn parse_escape(var p: P, in_class: Bool) -> Node throws:
+  if p.i + 1 >= p.src.len: fail "bad escape (end of pattern) at position {p.i}"
+  let c = p.src[p.i + 1]
+  p.i += 2
+  if c == 'd': return class_node(&p, [48, 57], false)
+  if c == 'D': return class_node(&p, [48, 57], true)
+  if c == 'w': return class_node(&p, word_ranges(), false)
+  if c == 'W': return class_node(&p, word_ranges(), true)
+  if c == 's': return class_node(&p, space_ranges(), false)
+  if c == 'S': return class_node(&p, space_ranges(), true)
+  if not in_class:
+    if c == 'b': return Node("assert", WORDB, 0, 0, 0, true, [])
+    if c == 'B': return Node("assert", NWORDB, 0, 0, 0, true, [])
+    if c == 'A': return Node("assert", BOL, 0, 0, 0, true, [])
+    if c == 'Z': return Node("assert", EOT, 0, 0, 0, true, [])
+    if c >= '1' and c <= '9': fail "backreferences (\\\\" + str([c]) + " at position {p.i - 2}) aren't supported: they can't run in linear time"
+  if c == 'n': return Node("lit", 10, 0, 0, 0, true, [])
+  if c == 't': return Node("lit", 9, 0, 0, 0, true, [])
+  if c == 'r': return Node("lit", 13, 0, 0, 0, true, [])
+  if c == 'f': return Node("lit", 12, 0, 0, 0, true, [])
+  if c == 'v': return Node("lit", 11, 0, 0, 0, true, [])
+  if c == '0': return Node("lit", 0, 0, 0, 0, true, [])
+  if in_class and c == 'b': return Node("lit", 8, 0, 0, 0, true, [])
+  if c == 'x':
+    if p.i + 2 > p.src.len: fail "incomplete escape \\\\x at position {p.i - 2}"
+    let v = hexval(p.src[p.i..p.i + 2])
+    if v < 0: fail "incomplete escape \\\\x at position {p.i - 2}"
+    p.i += 2
+    return Node("lit", v, 0, 0, 0, true, [])
+  if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9'):
+    fail "bad escape \\\\" + str([c]) + " at position {p.i - 2}"
+  # an escaped punctuation character (or a UTF-8 one) stands for itself
+  p.i -= 1
+  let cp = decode_at(p.src, p.i)
+  p.i += char_len_at(p.src, p.i)
+  return Node("lit", cp, 0, 0, 0, true, [])
+
+fn hexval(h: Str) -> Int:
+  var v = 0
+  for k in 0..h.len:
+    let c = h[k]
+    var d = -1
+    if c >= '0' and c <= '9': d = int(c) - 48
+    elif c >= 'a' and c <= 'f': d = int(c) - 87
+    elif c >= 'A' and c <= 'F': d = int(c) - 55
+    if d < 0: return -1
+    v = v * 16 + d
+  return v
+
+fn parse_class(var p: P) -> Node throws:
+  let start = p.i
+  p.i += 1
+  var neg = false
+  if p.i < p.src.len and p.src[p.i] == '^':
+    neg = true
+    p.i += 1
+  var ranges: [Int] = []
+  var first = true
+  while true:
+    if p.i >= p.src.len: fail "unterminated character set at position {start}"
+    let c = p.src[p.i]
+    if c == ']' and not first:
+      p.i += 1
+      break
+    first = false
+    var lo = -1
+    if c == '\\':
+      let e = parse_escape(&p, true)?
+      if e.k == "cls":
+        # \d \w \s (or their negations) inside a class
+        let cl = p.classes[e.cls]
+        if cl.neg:
+          var comp = complement(cl.ranges)
+          for x in comp: ranges.push(x)
+        else:
+          for x in cl.ranges: ranges.push(x)
+        continue
+      lo = e.cp
+    else:
+      lo = decode_at(p.src, p.i)
+      p.i += char_len_at(p.src, p.i)
+    var hi = lo
+    if p.i + 1 < p.src.len and p.src[p.i] == '-' and p.src[p.i + 1] != ']':
+      p.i += 1
+      if p.src[p.i] == '\\':
+        let e2 = parse_escape(&p, true)?
+        if e2.k != "lit": fail "bad character range at position {p.i}"
+        hi = e2.cp
+      else:
+        hi = decode_at(p.src, p.i)
+        p.i += char_len_at(p.src, p.i)
+      if hi < lo: fail "bad character range at position {p.i}"
+    ranges.push(lo)
+    ranges.push(hi)
+  return class_node(&p, ranges, neg)
+
+# The code points not in ranges (lo, hi pairs).
+fn complement(ranges: [Int]) -> [Int]:
+  var out: [Int] = []
+  var at = 0
+  var sorted_lo: [Int] = []
+  for k in 0..ranges.len / 2: sorted_lo.push(ranges[2 * k])
+  # (the ranges from \d \w \s are already sorted and separate)
+  for k in 0..ranges.len / 2:
+    if ranges[2 * k] > at:
+      out.push(at)
+      out.push(ranges[2 * k] - 1)
+    at = ranges[2 * k + 1] + 1
+  out.push(at)
+  out.push(1114111)
+  return out
+
+# ---- code
+
+# Whether n can match without consuming a character.
+fn can_empty(n: Node) -> Bool:
+  if n.k == "lit" or n.k == "any" or n.k == "cls": return false
+  if n.k == "cat":
+    for k in n.kids:
+      if not can_empty(k): return false
+    return true
+  if n.k == "alt":
+    for k in n.kids:
+      if can_empty(k): return true
+    return false
+  if n.k == "group": return can_empty(n.kids[0])
+  if n.k == "rep": return n.min == 0 or can_empty(n.kids[0])
+  return true
+
+# One optional iteration of a loop: x, or (for an x that can match nothing) MARK x CHKE, where an
+# iteration that matched nothing goes to the loop's exit (patched in later through exits).
+fn emit_iter(var prog: [Inst], x: Node, var em: Emit, var exits: [Int]) throws:
+  if not can_empty(x):
+    emit(&prog, x, &em)?
+    return
+  let slot = em.nslots
+  em.nslots += 1
+  let first = prog.len
+  prog.push(Inst(MARK, slot, 0))
+  emit(&prog, x, &em)?
+  exits.push(prog.len)
+  prog.push(Inst(CHKE, slot, 0))
+  em.loops.push(slot)
+  em.loops.push(first + 1)
+  em.loops.push(prog.len - 1)
+
+fn emit(var prog: [Inst], n: Node, var em: Emit) throws:
+  if prog.len > MAX_PROG: fail "the pattern is too big (more than {MAX_PROG} steps once repeats are expanded)"
+  if n.k == "lit": prog.push(Inst(CHAR, n.cp, 0))
+  elif n.k == "any": prog.push(Inst(ANY, 0, 0))
+  elif n.k == "cls": prog.push(Inst(CLASS, n.cls, 0))
+  elif n.k == "assert": prog.push(Inst(n.cp, 0, 0))
+  elif n.k == "empty": return
+  elif n.k == "cat":
+    for k in n.kids: emit(&prog, k, &em)?
+  elif n.k == "group":
+    if n.cp > 0: prog.push(Inst(SAVE, 2 * n.cp, 0))
+    emit(&prog, n.kids[0], &em)?
+    if n.cp > 0: prog.push(Inst(SAVE, 2 * n.cp + 1, 0))
+  elif n.k == "alt":
+    # SPLIT L1, L2; L1: first; JMP end; L2: SPLIT ... ; last
+    var jumps: [Int] = []
+    for k in 0..n.kids.len:
+      if k < n.kids.len - 1:
+        let sp = prog.len
+        prog.push(Inst(SPLIT, sp + 1, 0))
+        emit(&prog, n.kids[k], &em)?
+        jumps.push(prog.len)
+        prog.push(Inst(JMP, 0, 0))
+        prog[sp].b = prog.len
+      else: emit(&prog, n.kids[k], &em)?
+    for j in jumps: prog[j].a = prog.len
+  elif n.k == "rep":
+    let x = n.kids[0]
+    for k in 0..n.min: emit(&prog, x, &em)?
+    var exits: [Int] = []
+    if n.max == -1:
+      # x*: L: SPLIT body, end; body: x; JMP L
+      let l = prog.len
+      prog.push(Inst(SPLIT, 0, 0))
+      emit_iter(&prog, x, &em, &exits)?
+      prog.push(Inst(JMP, l, 0))
+      set_split(&prog, l, l + 1, prog.len, n.greedy)
+    else:
+      # (x(x(x)?)?)? for the optional ones
+      var splits: [Int] = []
+      for k in n.min..n.max:
+        splits.push(prog.len)
+        prog.push(Inst(SPLIT, 0, 0))
+        emit_iter(&prog, x, &em, &exits)?
+      for sp in splits: set_split(&prog, sp, sp + 1, prog.len, n.greedy)
+    for e in exits: prog[e].b = prog.len
+
+fn set_split(var prog: [Inst], at: Int, body: Int, out: Int, greedy: Bool):
+  if greedy:
+    prog[at].a = body
+    prog[at].b = out
+  else:
+    prog[at].a = out
+    prog[at].b = body
+
+# ---- UTF-8 (a byte that isn't UTF-8 is one character, matched only by . and negated classes)
+
+fn char_len_at(s: Str, i: Int) -> Int:
+  let b = s[i]
+  var n = 1
+  if b >= 0xF0 and b <= 0xF4: n = 4
+  elif b >= 0xE0: n = 3
+  elif b >= 0xC2 and b < 0xE0: n = 2
+  if i + n > s.len: return 1
+  for k in 1..n:
+    if s[i + k] < 0x80 or s[i + k] > 0xBF: return 1
+  return n
+
+fn decode_at(s: Str, i: Int) -> Int:
+  let n = char_len_at(s, i)
+  let b = int(s[i])
+  if n == 1:
+    if b >= 0x80: return -1
+    return b
+  if n == 2: return ((b & 31) << 6) | (int(s[i + 1]) & 63)
+  if n == 3: return ((b & 15) << 12) | ((int(s[i + 1]) & 63) << 6) | (int(s[i + 2]) & 63)
+  return ((b & 7) << 18) | ((int(s[i + 1]) & 63) << 12) | ((int(s[i + 2]) & 63) << 6) | (int(s[i + 3]) & 63)
+
+fn is_word(s: Str, i: Int) -> Bool:
+  if i < 0 or i >= s.len: return false
+  let c = s[i]
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+
+fn in_class(c: Cls, cp: Int) -> Bool:
+  var hit = false
+  if cp >= 0:
+    var k = 0
+    while k < c.ranges.len:
+      if cp >= c.ranges[k] and cp <= c.ranges[k + 1]:
+        hit = true
+        break
+      k += 2
+  return hit != c.neg
+
+# ---- the Pike VM
+
+type Thread:
+  pc: Int
+  caps: [Int]
+
+# Adds the thread at pc (following jumps, splits, saves and assertions at position i) to list, in
+# priority order; seen marks the pcs already added at this position.
+fn add(r: Regex, var list: [Thread], var seen: [Int], gen: Int, pc: Int, own caps: [Int], s: Str, i: Int):
+  var key = pc
+  if r.width > 1:
+    let e = r.enc[pc]
+    var mask = 0
+    for k in 0..e.len:
+      if caps[e[k]] == i: mask |= 1 << k
+    key = pc * r.width + mask
+  if seen[key] == gen: return
+  seen[key] = gen
+  let ins = r.prog[pc]
+  let op = ins.op
+  if op == JMP:
+    add(r, &list, &seen, gen, ins.a, caps, s, i)
+  elif op == SPLIT:
+    add(r, &list, &seen, gen, ins.a, copy_ints(caps), s, i)
+    add(r, &list, &seen, gen, ins.b, caps, s, i)
+  elif op == SAVE or op == MARK:
+    var c2 = caps
+    c2[ins.a] = i
+    add(r, &list, &seen, gen, pc + 1, c2, s, i)
+  elif op == CHKE:
+    if caps[ins.a] == i: add(r, &list, &seen, gen, ins.b, caps, s, i)
+    else: add(r, &list, &seen, gen, pc + 1, caps, s, i)
+  elif op == BOL:
+    if i == 0: add(r, &list, &seen, gen, pc + 1, caps, s, i)
+  elif op == EOL:
+    if i == s.len or (i == s.len - 1 and s[i] == '\n'): add(r, &list, &seen, gen, pc + 1, caps, s, i)
+  elif op == EOT:
+    if i == s.len: add(r, &list, &seen, gen, pc + 1, caps, s, i)
+  elif op == WORDB or op == NWORDB:
+    let at = is_word(s, i - 1) != is_word(s, i)
+    if at == (op == WORDB): add(r, &list, &seen, gen, pc + 1, caps, s, i)
+  else:
+    list.push(Thread(pc, caps))
+
+# The first match (leftmost, then by the pattern's priorities, as Python finds it) starting at or after
+# from; when no_empty_at >= 0, an empty match there doesn't count (findall and sub need that).
+fn search_from(r: Regex, s: Str, from: Int, no_empty_at: Int, anchored: Bool, full: Bool) -> Match?:
+  let nslots = 2 * r.ngroups + 2
+  var seen = [-1] * (r.prog.len * r.width)
+  var seen2 = [-1] * (r.prog.len * r.width)   # for each new start, with its own generations
+  var gen = 0
+  var gen2 = 0
+  var clist: [Thread] = []
+  var found: [Int] = []
+  var i = from
+  while true:
+    if found.len == 0 and clist.len == 0 and not anchored:
+      # nothing in progress: skip to the next byte a match can start at
+      while i < s.len and not r.first[int(s[i])]: i += 1
+    if found.len == 0 and (not anchored or i == from):
+      gen += 1
+      gen2 += 1
+      # a new thread starting here, at the lowest priority
+      var tmp: [Thread] = []
+      add(r, &tmp, &seen2, gen2, 0, [-1] * r.nslots, s, i)
+      for t in tmp:
+        clist.push(Thread(t.pc, copy_ints(t.caps)))
+    if clist.len == 0 and (found.len > 0 or anchored or i >= s.len): break
+    gen += 1
+    var nlist: [Thread] = []
+    var cp = -2
+    var clen = 0
+    if i < s.len:
+      cp = decode_at(s, i)
+      clen = char_len_at(s, i)
+    for k in 0..clist.len:
+      let pc = clist[k].pc
+      let ins = r.prog[pc]
+      if ins.op == MATCH:
+        let st = clist[k].caps[0]
+        let en = clist[k].caps[1]
+        if (no_empty_at >= 0 and st == en and st == no_empty_at) or (full and en != s.len): continue
+        found = copy_ints(clist[k].caps)
+        break   # lower-priority threads are cut off
+      if i >= s.len: continue
+      var ok = false
+      if ins.op == CHAR: ok = cp == ins.a
+      elif ins.op == ANY: ok = cp != 10
+      elif ins.op == CLASS: ok = in_class(r.classes[ins.a], cp)
+      if ok:
+        var caps: [Int] = []
+        swap(&caps, &clist[k].caps)   # (this list is done with: no copy)
+        add(r, &nlist, &seen, gen, pc + 1, caps, s, i + clen)
+    swap(&clist, &nlist)
+    if i >= s.len: break
+    i += clen
+  if found.len == 0: return nil
+  var groups: [Int] = []
+  for k in 2..nslots: groups.push(found[k])
+  return Match(found[0], found[1], groups)
+
+# The first match anywhere in s (Python's re.search).
+fn search(r: Regex, s: Str) -> Match?:
+  return search_from(r, s, 0, -1, false, false)
+
+# A match that starts at the beginning of s (Python's re.match; match is a Vu keyword).
+fn prefix(r: Regex, s: Str) -> Match?:
+  return search_from(r, s, 0, -1, true, false)
+
+# A match of all of s (Python's re.fullmatch).
+fn fullmatch(r: Regex, s: Str) -> Match?:
+  return search_from(r, s, 0, -1, true, true)
+
+# Group k of m (0: the whole match) as text, or nil if it didn't take part.
+fn group(m: Match, s: Str, k: Int) -> Str?:
+  if k == 0: return s[m.start..m.end]
+  if k < 1 or 2 * k > m.groups.len: return nil
+  let a = m.groups[2 * k - 2]
+  let b = m.groups[2 * k - 1]
+  if a < 0 or b < 0: return nil
+  return s[a..b]
+
+# A group's text, or "" when it didn't take part in the match.
+fn group_text(m: Match, s: Str, k: Int) -> Str:
+  if g = group(m, s, k): return g + ""
+  return ""
+
+# Every match, left to right, not overlapping (Python's re.finditer).
+fn finditer(r: Regex, s: Str) -> [Match]:
+  var out: [Match] = []
+  var pos = 0
+  var no_empty = -1
+  while pos <= s.len:
+    let mm = search_from(r, s, pos, no_empty, false, false)
+    if m = mm:
+      no_empty = -1
+      if m.end == m.start: no_empty = m.end
+      pos = m.end
+      out.push(Match(m.start, m.end, copy_ints(m.groups)))
+    else: break
+  return out
+
+# Python's re.findall: each match's text, or with exactly one group that group's text, or with more
+# groups their texts joined... (Python gives tuples; here each match's groups are joined with a tab).
+fn findall(r: Regex, s: Str) -> [Str]:
+  var out: [Str] = []
+  for m in finditer(r, s):
+    if r.ngroups == 0: out.push(s[m.start..m.end])
+    elif r.ngroups == 1: out.push(group_text(m, s, 1))
+    else:
+      var parts: [Str] = []
+      for k in 1..r.ngroups + 1: parts.push(group_text(m, s, k))
+      out.push("\t".join(parts))
+  return out
+
+# Python's re.sub: every match replaced by repl, where \1..\9 and \g<n> stand for groups (\\ for a
+# backslash, \n \t for a newline and a tab).
+fn sub(r: Regex, s: Str, repl: Str) -> Str:
+  var out = ""
+  var last = 0
+  for m in finditer(r, s):
+    out += s[last..m.start] + expand(m, s, repl)
+    last = m.end
+  return out + s[last..s.len]
+
+fn expand(m: Match, s: Str, repl: Str) -> Str:
+  var out = ""
+  var i = 0
+  while i < repl.len:
+    let c = repl[i]
+    if c != '\\' or i + 1 >= repl.len:
+      out += repl[i..i + 1]
+      i += 1
+      continue
+    let d = repl[i + 1]
+    if d >= '0' and d <= '9':
+      out += group_text(m, s, int(d) - 48)
+      i += 2
+    elif d == 'g' and i + 2 < repl.len and repl[i + 2] == '<':
+      let close = find_close(repl, i + 3)
+      let k = int(repl[i + 3..close]) else -1
+      out += group_text(m, s, k)
+      i = close + 1
+    elif d == 'n':
+      out += "\n"
+      i += 2
+    elif d == 't':
+      out += "\t"
+      i += 2
+    elif d == '\\':
+      out += "\\"
+      i += 2
+    else:
+      out += repl[i..i + 2]
+      i += 2
+  return out
+
+fn find_close(s: Str, from: Int) -> Int:
+  var j = from
+  while j < s.len and s[j] != '>': j += 1
+  return j
+
+# Python's re.split: the text between matches (and each match's groups, as Python includes them).
+fn split(r: Regex, s: Str) -> [Str]:
+  var out: [Str] = []
+  var last = 0
+  for m in finditer(r, s):
+    out.push(s[last..m.start])
+    for k in 1..r.ngroups + 1: out.push(group_text(m, s, k))
+    last = m.end
+  out.push(s[last..s.len])
+  return out

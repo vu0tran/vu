@@ -12,12 +12,23 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/random.h>
+#ifdef __APPLE__
+#define fwrite_unlocked fwrite
+/* macOS has getentropy (at most 256 bytes a call) instead of getrandom */
+static ssize_t getrandom(void *buf, size_t n, unsigned flags) {
+    (void)flags;
+    for (size_t at = 0; at < n; at += 256) if (getentropy((char *)buf + at, n - at < 256 ? n - at : 256) != 0) return -1;
+    return (ssize_t)n;
+}
+#endif
 #include <signal.h>
 #include <unistd.h>
 #include <sys/resource.h>
 #include <pthread.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#include <dirent.h>
+#include <sys/stat.h>
 extern char **environ;
 static int vu_argc;
 static char **vu_argv;
@@ -777,10 +788,18 @@ __attribute__((cold, noinline)) static void vu_thread_guard_slow(void) {
     pthread_attr_t at;
     void *addr;
     size_t sz;
+#ifdef __APPLE__
+    /* macOS gives the top of the stack and its size */
+    (void)at; (void)addr;
+    sz = pthread_get_stacksize_np(pthread_self());
+    vu_t_hi = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+    vu_t_lo = vu_t_hi - sz;
+#else
     if (pthread_getattr_np(pthread_self(), &at) == 0) {
         if (pthread_attr_getstack(&at, &addr, &sz) == 0) { vu_t_lo = (uintptr_t)addr; vu_t_hi = vu_t_lo + sz; }
         pthread_attr_destroy(&at);
     }
+#endif
     stack_t cur;
     if (sigaltstack(NULL, &cur) == 0 && !(cur.ss_flags & SS_DISABLE)) return;   /* main thread: has one */
     vu_t_alt = malloc(1 << 16);
@@ -999,6 +1018,92 @@ static bool vu_fs_temp_dir(vu_cap fs, vu_str *out, vu_str *err) {
     *out = vu_str_from_c(buf);
     return true;
 }
+/* fs.list(dir): the names in a directory, sorted by bytes, each directory's with "/" after it. */
+static int vu_cmp_str(const void *a, const void *b) {
+    const vu_str *x = (const vu_str *)a, *y = (const vu_str *)b;
+    int64_t n = x->len < y->len ? x->len : y->len;
+    int c = n ? memcmp(x->data, y->data, (size_t)n) : 0;
+    return c ? c : (x->len < y->len ? -1 : x->len > y->len);
+}
+static bool vu_fs_list(vu_cap fs, const vu_str *path, vu_str **out, int64_t *count, vu_str *err) {
+    (void)fs;
+    char *p = vu_cpath(path, err);
+    if (!p) return false;
+    DIR *d = opendir(p);
+    if (!d) { *err = vu_errf("can't list '%.1000s': %s", p, strerror(errno)); free(p); return false; }
+    int64_t n = 0, cap = 16;
+    vu_str *items = (vu_str *)vu_malloc((size_t)cap * sizeof(vu_str));
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        bool dir = ent->d_type == DT_DIR;
+        if (ent->d_type == DT_UNKNOWN || ent->d_type == DT_LNK) {
+            struct stat st;
+            char *full = (char *)vu_malloc(strlen(p) + strlen(ent->d_name) + 2);
+            sprintf(full, "%s/%s", p, ent->d_name);
+            dir = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+            free(full);
+        }
+        if (n == cap) { cap *= 2; vu_str *m = (vu_str *)vu_malloc((size_t)cap * sizeof(vu_str)); memcpy(m, items, (size_t)n * sizeof(vu_str)); free(items); items = m; }
+        items[n] = vu_str_from_c(ent->d_name);
+        if (dir) vu_str_cat_bytes(&items[n], (const uint8_t *)"/", 1);
+        n++;
+    }
+    closedir(d);
+    free(p);
+    qsort(items, (size_t)n, sizeof(vu_str), vu_cmp_str);
+    *out = items;
+    *count = n;
+    return true;
+}
+/* fs.mkdir(path): makes the directory and any missing parents; one that exists already is fine. */
+static bool vu_fs_mkdir(vu_cap fs, const vu_str *path, vu_str *err) {
+    (void)fs;
+    char *p = vu_cpath(path, err);
+    if (!p) return false;
+    size_t n = strlen(p);
+    for (size_t i = 1; i <= n; i++) {
+        if (p[i] != '/' && p[i] != 0) continue;
+        char c = p[i];
+        p[i] = 0;
+        if (mkdir(p, 0777) != 0 && errno != EEXIST) { *err = vu_errf("can't make the directory '%.1000s': %s", p, strerror(errno)); free(p); return false; }
+        p[i] = c;
+    }
+    struct stat st;
+    if (stat(p, &st) != 0 || !S_ISDIR(st.st_mode)) { *err = vu_errf("'%.1000s' exists and isn't a directory", p); free(p); return false; }
+    free(p);
+    return true;
+}
+static bool vu_fs_exists(vu_cap fs, const vu_str *path) {
+    (void)fs;
+    vu_str err = {0};
+    char *p = vu_cpath(path, &err);
+    if (!p) { drop_Str(&err); return false; }
+    struct stat st;
+    bool ok = stat(p, &st) == 0;
+    free(p);
+    return ok;
+}
+/* fs.remove(path): a file, or an empty directory. */
+static bool vu_fs_remove(vu_cap fs, const vu_str *path, vu_str *err) {
+    (void)fs;
+    char *p = vu_cpath(path, err);
+    if (!p) return false;
+    if (remove(p) != 0) { *err = vu_errf("can't remove '%.1000s': %s", p, strerror(errno)); free(p); return false; }
+    free(p);
+    return true;
+}
+static bool vu_fs_rename(vu_cap fs, const vu_str *from, const vu_str *to, vu_str *err) {
+    (void)fs;
+    char *a = vu_cpath(from, err);
+    if (!a) return false;
+    char *b = vu_cpath(to, err);
+    if (!b) { free(a); return false; }
+    if (rename(a, b) != 0) { *err = vu_errf("can't rename '%.1000s' to '%.1000s': %s", a, b, strerror(errno)); free(a); free(b); return false; }
+    free(a);
+    free(b);
+    return true;
+}
 /* The operating-system capability: running programs, reading environment variables, the clock. */
 static double vu_os_clock(vu_cap os) {
     (void)os;
@@ -1024,6 +1129,72 @@ static vu_str vu_os_env(vu_cap os, const vu_str *name) {
 }
 /* Runs a program (found on PATH) with the given arguments and waits for it. The result is its exit
    code, or 128 + the signal number if a signal stopped it. */
+/* os.output(args): runs a program like os.run and returns what it wrote to standard output and
+   standard error (together, in order), whatever its exit code. */
+static bool vu_os_output(vu_cap os, const vu_str *items, int64_t n, vu_str *out, vu_str *err) {
+    (void)os;
+    if (n <= 0) { *err = vu_errf("os.output() needs at least the program to run"); return false; }
+    char **argv = (char **)vu_malloc(((size_t)n + 1) * sizeof(char *));
+    for (int64_t i = 0; i < n; i++) {
+        argv[i] = vu_cpath(&items[i], err);
+        if (!argv[i]) {
+            for (int64_t j = 0; j < i; j++) free(argv[j]);
+            free(argv);
+            drop_Str(err);
+            *err = vu_errf("argument %lld contains a zero byte", (long long)i);
+            return false;
+        }
+    }
+    argv[n] = NULL;
+    int fds[2];
+    if (pipe(fds) != 0) { *err = vu_errf("can't make a pipe: %s", strerror(errno)); for (int64_t i = 0; i < n; i++) free(argv[i]); free(argv); return false; }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    posix_spawn_file_actions_addclose(&fa, fds[1]);
+    fflush(stdout);
+    fflush(stderr);
+    pid_t pid;
+    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    bool ok = rc == 0;
+    if (!ok) *err = vu_errf("can't run '%.1000s': %s", argv[0], strerror(rc));
+    for (int64_t i = 0; i < n; i++) free(argv[i]);
+    free(argv);
+    if (!ok) { close(fds[0]); return false; }
+    vu_str s = {0};
+    uint8_t buf[65536];
+    for (;;) {
+        ssize_t k = read(fds[0], buf, sizeof buf);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        vu_str_cat_bytes(&s, buf, k);
+    }
+    close(fds[0]);
+    int status;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    *out = s;
+    return true;
+}
+/* os.read_stdin(n): up to n bytes from standard input, as they arrive; "" at its end. */
+static bool vu_os_read_stdin(vu_cap os, int64_t n, vu_str *out, vu_str *err) {
+    (void)os;
+    if (n < 1 || n > (1 << 26)) { *err = vu_errf("os.read_stdin(%lld): it reads 1 to 67,108,864 bytes", (long long)n); return false; }
+    vu_str s = {0};
+    vu_str_reserve(&s, n);
+    for (;;) {
+        ssize_t k = read(0, s.data, (size_t)n);
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0) { drop_Str(&s); *err = vu_errf("can't read standard input: %s", strerror(errno)); return false; }
+        s.len = k;
+        break;
+    }
+    *out = s;
+    return true;
+}
 static bool vu_os_run(vu_cap os, const vu_str *items, int64_t n, int64_t *out, vu_str *err) {
     (void)os;
     if (n <= 0) { *err = vu_errf("os.run() needs at least the program to run"); return false; }
