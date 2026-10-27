@@ -1,0 +1,1559 @@
+# vuc: the Vu compiler, written in Vu. It translates .vu source to C and builds it with the C compiler,
+# bootstrapped from vuc_seed.c (its own C output; see build.sh).
+#   vuc run FILE.vu [ARGS...]
+#   vuc build FILE.vu [-o OUT] [--debug] [--malloc] [--san] [--san-pool] [--tsan] [--emit-c FILE] [--time]
+
+# ============================================================================ data
+
+type Ctx:
+  path: Str
+  lines: [Str]
+  json: Bool   # report errors as JSON (--json)
+
+type Tok:
+  k, v: Str
+  line: Int
+
+# One node type for the whole syntax tree. What each field means depends on k (see parse_* below);
+# children are always in kids, so walking the tree is uniform.
+type Node:
+  k: Str
+  line, id: Int
+  name, name2, op, v, ty, ret: Str
+  ival, prec: Int
+  big, flag, flag2, elif_, is_par: Bool
+  kids: [Node]
+  names: [Str]
+
+type Parser:
+  ctx: Ctx
+  toks: [Tok]
+  i, nid, depth: Int
+
+# ============================================================================ errors
+
+# A JSON string: quotes, backslashes and control characters escaped, everything else as is.
+fn json_str(s: Str) -> Str:
+  var out = "\""
+  let hex = "0123456789abcdef"
+  for c in bytes(s):
+    if c == '"' or c == '\\':
+      out += "\\"
+      out += str([c])
+    elif c < 32:
+      out += "\\u00" + hex[int(c) / 16..int(c) / 16 + 1] + hex[int(c) % 16..int(c) % 16 + 1]
+    else: out += str([c])
+  return out + "\""
+
+# A line number also says which file it is in: (file index << 24) | line, the main file being 0.
+fn lnum(line: Int) -> Int:
+  return line & 16777215
+
+# A name as it's written in the program: geo__area is geo.area.
+# Only names from modules start with a letter and contain '__', and the first '__' ends the module's
+# name (geo.__helper).
+fn disp(name: Str) -> Str:
+  let i = find_sub(name, "__", 0)
+  if i <= 0: return name
+  let c = name[0]
+  if not ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')): return name
+  let inst = inst_disp(name, i)
+  if inst != "": return inst
+  return name[0..i] + "." + disp(name[i + 2..name.len])
+
+# geo__ for geo__area (a name from module geo), "" for a name from the main file.
+fn module_prefix(name: Str) -> Str:
+  let i = find_sub(name, "__", 0)
+  if i > 0:
+    let c = name[0]
+    if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')) and inst_disp(name, i) == "": return name[0..i + 2]
+  return ""
+
+fn is_digit_b(b: Byte) -> Bool:
+  return b >= '0' and b <= '9'
+
+# A type's name in C identifiers (see mg) back as it's written: L_Int is [Int]; "" if it isn't one.
+fn demangle(m: Str) -> Str:
+  if m == "Int" or m == "Float" or m == "Bool" or m == "Byte" or m == "Str": return m + ""
+  if m.startswith("L_"):
+    let d = demangle(m[2..m.len])
+    if d == "": return ""
+    return "[" + d + "]"
+  if m.startswith("O_"):
+    let d = demangle(m[2..m.len])
+    if d == "": return ""
+    return d + "?"
+  if m.startswith("C_"):
+    let d = demangle(m[2..m.len])
+    if d == "": return ""
+    return "Chan[" + d + "]"
+  if m.startswith("H_"):
+    let d = demangle(m[2..m.len])
+    if d == "": return ""
+    return "Shared[" + d + "]"
+  if (m.startswith("S_") or m.startswith("E_") or m.startswith("X_")) and m.len > 2: return disp(m[2..m.len])
+  if m.startswith("M"):
+    var j = 1
+    while j < m.len and is_digit_b(m[j]): j += 1
+    if j > 1 and j < m.len and m[j] == '_' and j <= 7:
+      var n = 0
+      for q in 1..j: n = n * 10 + int(m[q]) - 48
+      let mid = min(j + 1 + n, m.len)
+      let a = demangle(m[j + 1..mid])
+      let b = demangle(m[mid..m.len])
+      if a != "" and b != "" and n > 0: return "{{" + a + ": " + b + "}}"
+  if m.startswith("FP") or m.startswith("FE"):
+    # a function type: FP<count>_ then each parameter as <length>_<name>, then the return type
+    var j = 2
+    var n = 0
+    while j < m.len and is_digit_b(m[j]) and j < 8:
+      n = n * 10 + int(m[j]) - 48
+      j += 1
+    if j == 2 or j >= m.len or m[j] != '_': return ""
+    j += 1
+    var ps: [Str] = []
+    for q in 0..n:
+      var k = j
+      var len = 0
+      while k < m.len and is_digit_b(m[k]) and k < j + 7:
+        len = len * 10 + int(m[k]) - 48
+        k += 1
+      if k == j or k >= m.len or m[k] != '_' or k + 1 + len > m.len or len == 0: return ""
+      let d = demangle(m[k + 1..k + 1 + len])
+      if d == "": return ""
+      ps.push(d)
+      j = k + 1 + len
+    var out = "fn(" + join(ps, ", ") + ")"
+    let rest = m[j..m.len]
+    if rest != "Void":
+      let r = demangle(rest)
+      if r == "": return ""
+      out += " -> " + r
+    if m[1] == 'E': out += " throws"
+    return out
+  return ""
+
+# Pair[Int, Str] for the generic instance Pair__G3_Int3_Str (its "__" at i), or "" if it isn't one.
+fn inst_disp(name: Str, i: Int) -> Str:
+  let rest = name[i + 2..name.len]
+  if not rest.startswith("G"): return ""
+  var j = 1
+  var targs: [Str] = []
+  while j < rest.len:
+    var k = j
+    while k < rest.len and is_digit_b(rest[k]): k += 1
+    if k == j or k >= rest.len or rest[k] != '_' or k - j > 6: return ""
+    var n = 0
+    for q in j..k: n = n * 10 + int(rest[q]) - 48
+    if n == 0 or k + 1 + n > rest.len: return ""
+    let d = demangle(rest[k + 1..k + 1 + n])
+    if d == "": return ""
+    targs.push(d)
+    j = k + 1 + n
+  if targs.len == 0: return ""
+  return disp(name[0..i]) + "[" + join(targs, ", ") + "]"
+
+fn report(ctx: Ctx, where: Int, msg: Str):
+  let line = lnum(where)
+  if line == 0 and not ctx.json:
+    eprint(ctx.path + ": error: " + msg)
+    exit(1)
+  if ctx.json:
+    var source = ""
+    if line >= 1 and line <= ctx.lines.len: source = rstrip(ctx.lines[line - 1])
+    eprint("{{\"type\": \"error\", \"file\": " + json_str(ctx.path) + ", \"line\": {line}, \"message\": " + json_str(msg) + ", \"source\": " + json_str(source) + "}}")
+    exit(1)
+  eprint(ctx.path + ":{line}: error: " + msg)
+  if line >= 1 and line <= ctx.lines.len:
+    eprint("  {line} | " + rstrip(ctx.lines[line - 1]))
+  exit(1)
+
+fn too_deep(ctx: Ctx):
+  let msg = "the program is nested too deeply to compile (simplify the deepest expression or block)"
+  if ctx.json: eprint("{{\"type\": \"error\", \"file\": " + json_str(ctx.path) + ", \"line\": 0, \"message\": " + json_str(msg) + ", \"source\": \"\"}}")
+  else: eprint(ctx.path + ": error: " + msg)
+  exit(1)
+
+# ============================================================================ strings
+
+# Source text is ASCII: only these count as whitespace (a non-breaking space is an unexpected character).
+fn is_space(c: Byte) -> Bool:
+  return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12
+
+fn rstrip(s: Str) -> Str:
+  var n = s.len
+  while n > 0 and is_space(s[n - 1]): n -= 1
+  return s[0..n]
+
+fn strip(s: Str) -> Str:
+  var a = 0
+  var b = s.len
+  while a < b and is_space(s[a]): a += 1
+  while b > a and is_space(s[b - 1]): b -= 1
+  return s[a..b]
+
+fn starts_with(s: Str, pre: Str) -> Bool:
+  return s.len >= pre.len and s[0..pre.len] == pre
+
+fn ends_with(s: Str, suf: Str) -> Bool:
+  return s.len >= suf.len and s[s.len - suf.len..s.len] == suf
+
+fn find_byte(s: Str, b: Byte, from: Int) -> Int:
+  var i = from
+  while i < s.len:
+    if s[i] == b: return i
+    i += 1
+  return -1
+
+fn contains(s: Str, sub: Str) -> Bool:
+  if sub.len == 0: return true
+  var i = 0
+  while i + sub.len <= s.len:
+    if s[i] == sub[0] and s[i..i + sub.len] == sub: return true
+    i += 1
+  return false
+
+fn replace_all(s: Str, old: Str, new_text: Str) -> Str:
+  var out = ""
+  var i = 0
+  var start = 0
+  while i + old.len <= s.len:
+    if s[i] == old[0] and s[i..i + old.len] == old:
+      out += s[start..i]
+      out += new_text
+      i += old.len
+      start = i
+    else:
+      i += 1
+  out += s[start..s.len]
+  return out
+
+fn join(xs: [Str], sep: Str) -> Str:
+  var out = ""
+  for i in 0..xs.len:
+    if i > 0: out += sep
+    out += xs[i]
+  return out
+
+fn split_lines(s: Str) -> [Str]:
+  var out: [Str] = []
+  var start = 0
+  for i in 0..s.len:
+    if s[i] == '\n':
+      out.push(s[start..i])
+      start = i + 1
+  out.push(s[start..s.len])
+  return out
+
+fn utf8_len(b: Byte) -> Int:
+  if b < 0x80: return 1
+  if b >= 0xF0: return 4
+  if b >= 0xE0: return 3
+  if b >= 0xC0: return 2
+  return 1
+
+fn hex2(b: Byte) -> Str:
+  let digits = "0123456789abcdef"
+  return digits[int(b >> 4)..int(b >> 4) + 1] + digits[int(b & 15)..int(b & 15) + 1]
+
+# Python's repr() of a string, for messages that quote source text.
+fn py_repr(s: Str) -> Str:
+  var q: Byte = '\''
+  if contains(s, "'") and not contains(s, "\""): q = '"'
+  var out = str([q])
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if c == q or c == '\\': out += "\\" + str([c])
+    elif c == '\n': out += "\\n"
+    elif c == '\t': out += "\\t"
+    elif c == '\r': out += "\\r"
+    elif c < 32 or c == 127: out += "\\x" + hex2(c)
+    else: out += str([c])
+    i += 1
+  out += str([q])
+  return out
+
+# A C string literal for text: printable ASCII as is, the rest as octal escapes of its bytes.
+fn cstr(text: Str) -> Str:
+  var out = "\""
+  out.reserve(text.len + 2)
+  for i in 0..text.len:
+    let c = text[i]
+    if c == '\\': out += "\\\\"
+    elif c == '"': out += "\\\""
+    elif c == '\n': out += "\\n"
+    elif c == '\t': out += "\\t"
+    elif c >= ' ' and c <= '~': out += str([c])
+    else:
+      let n = int(c)
+      out += "\\" + str([byte(48 + n / 64), byte(48 + n / 8 % 8), byte(48 + n % 8)])
+  out += "\""
+  return out
+
+fn copy_strs(xs: [Str]) -> [Str]:
+  var out: [Str] = []
+  for x in xs: out.push(x + "")
+  return out
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var out: [Int] = []
+  for x in xs: out.push(x)
+  return out
+
+# ============================================================================ lexer
+
+fn is_keyword(s: Str) -> Bool:
+  return s == "fn" or s == "type" or s == "let" or s == "var" or s == "const" or s == "if" or s == "elif" or s == "else" or s == "while" or s == "for" or s == "in" or s == "by" or s == "return" or s == "break" or s == "continue" or s == "and" or s == "or" or s == "not" or s == "true" or s == "false" or s == "nil" or s == "par" or s == "match" or s == "fail" or s == "throws"
+
+fn is_digit(c: Byte) -> Bool:
+  return c >= '0' and c <= '9'
+
+fn is_hex(c: Byte) -> Bool:
+  return is_digit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+
+fn is_name_start(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'
+
+fn is_name_char(c: Byte) -> Bool:
+  return is_name_start(c) or is_digit(c)
+
+# The length of a number token starting at pos, following the regex alternatives of vu.py in order:
+# float (\d[\d_]*\.\d[\d_]*([eE][+-]?\d+)? or \d[\d_]*[eE][+-]?\d+), then int (hex or \d[\d_]*).
+# Returns (kind, end).
+fn digits_run(s: Str, from: Int) -> Int:
+  var i = from
+  while i < s.len and (is_digit(s[i]) or s[i] == '_'): i += 1
+  return i
+
+fn exp_end(s: Str, from: Int) -> Int:
+  # [eE][+-]?\d+ at from; -1 if absent
+  if from >= s.len or (s[from] != 'e' and s[from] != 'E'): return -1
+  var i = from + 1
+  if i < s.len and (s[i] == '+' or s[i] == '-'): i += 1
+  let d0 = i
+  while i < s.len and is_digit(s[i]): i += 1
+  if i == d0: return -1
+  return i
+
+# Printable ASCII as Python would quote it; anything else (invisible, non-ASCII) by code point.
+fn char_desc(s: Str) -> Str:
+  if s.len == 1 and s[0] >= '!' and s[0] <= '~': return py_repr(s)
+  var cp = int(s[0])
+  if s.len == 2: cp = (int(s[0]) & 0x1F) * 64 + (int(s[1]) & 0x3F)
+  elif s.len == 3: cp = ((int(s[0]) & 0x0F) * 64 + (int(s[1]) & 0x3F)) * 64 + (int(s[2]) & 0x3F)
+  elif s.len == 4: cp = (((int(s[0]) & 0x07) * 64 + (int(s[1]) & 0x3F)) * 64 + (int(s[2]) & 0x3F)) * 64 + (int(s[3]) & 0x3F)
+  return "U+" + upper_hex(cp)
+
+fn upper_hex(n: Int) -> Str:
+  let digits = "0123456789ABCDEF"
+  var out = ""
+  var v = n
+  while v > 0:
+    out = digits[v % 16..v % 16 + 1] + out
+    v = v / 16
+  while out.len < 4: out = "0" + out
+  return out
+
+# at_line > 0: lexing an interpolation inside a string on that line; errors point there.
+fn hex_start(s: Str, from: Int) -> Bool:
+  var i = from
+  while i < s.len and s[i] == '_': i += 1
+  return i < s.len and is_hex(s[i])
+
+# Names from modules are module__name, and a module's name starts with a letter, so only a '__'
+# after leading underscores could clash.
+fn has_dunder(s: Str) -> Bool:
+  var i = 0
+  while i < s.len and s[i] == '_': i += 1
+  return find_sub(s, "__", i) >= 0
+
+fn find_last(s: Str, sub: Str) -> Int:
+  var i = s.len - sub.len
+  while i >= 0:
+    if s[i..i + sub.len] == sub: return i
+    i -= 1
+  return -1
+
+fn find_sub(s: Str, sub: Str, from: Int) -> Int:
+  var i = from
+  while i + sub.len <= s.len:
+    if s[i..i + sub.len] == sub: return i
+    i += 1
+  return -1
+
+# base: the file's index << 24, added to every line (0 for the main file).
+fn lex(ctx: Ctx, src: Str, at_line: Int, base: Int) -> [Tok]:
+  var toks: [Tok] = []
+  var indents = [0]
+  var depth = 0
+  let lines = split_lines(src)
+  for li in 0..lines.len:
+    var ln = li + 1 + base
+    if at_line > 0: ln = at_line
+    let line = rstrip(lines[li])
+    var b0 = 0
+    while b0 < line.len and (line[b0] == ' ' or line[b0] == '\t'): b0 += 1
+    if depth == 0:
+      if b0 == line.len or line[b0] == '#': continue
+      if find_byte(line[0..b0], '\t', 0) >= 0: report(ctx, ln, "indent with spaces, not tabs")
+      let ind = b0
+      if ind > indents[indents.len - 1]:
+        indents.push(ind)
+        toks.push(Tok("INDENT", "", ln))
+      else:
+        while ind < indents[indents.len - 1]:
+          indents.pop()
+          toks.push(Tok("DEDENT", "", ln))
+        if ind != indents[indents.len - 1]: report(ctx, ln, "indentation does not line up with any enclosing block")
+    var pos = b0
+    while pos < line.len:
+      let c = line[pos]
+      var kind = ""
+      var end = pos
+      if c == ' ' or c == '\t':
+        end = pos
+        while end < line.len and (line[end] == ' ' or line[end] == '\t'): end += 1
+        kind = "ws"
+      elif c == '#':
+        end = line.len
+        kind = "comment"
+      elif is_digit(c):
+        let d1 = digits_run(line, pos)
+        var fend = -1
+        if d1 < line.len and line[d1] == '.' and d1 + 1 < line.len and is_digit(line[d1 + 1]):
+          let d2 = digits_run(line, d1 + 1)
+          let x = exp_end(line, d2)
+          fend = d2
+          if x >= 0: fend = x
+        else:
+          fend = exp_end(line, d1)
+        if fend >= 0:
+          kind = "float"
+          end = fend
+        elif c == '0' and pos + 1 < line.len and (line[pos + 1] == 'x' or line[pos + 1] == 'X') and hex_start(line, pos + 2):
+          # 0[xX]_*[0-9a-fA-F][0-9a-fA-F_]*
+          end = pos + 2
+          while end < line.len and (is_hex(line[end]) or line[end] == '_'): end += 1
+          kind = "int"
+        else:
+          kind = "int"
+          end = d1
+      elif is_name_start(c):
+        end = pos
+        while end < line.len and is_name_char(line[end]): end += 1
+        kind = "name"
+      elif c == '"' and scan_string(line, pos) > 0:
+        kind = "str"
+        end = scan_string(line, pos)
+      elif c == '"':
+        # (not closed even letting interpolations hold strings: the plain rule reports what's wrong)
+        var j = pos + 1
+        var closed = false
+        while j < line.len:
+          if line[j] == '"':
+            closed = true
+            break
+          if line[j] == '\\':
+            if j + 1 >= line.len: break
+            j += utf8_len(line[j + 1]) + 1
+          else:
+            j += 1
+        if closed:
+          kind = "str"
+          end = j + 1
+      elif c == '\'':
+        # '(?:[^'\\]|\\.)' over characters (a multi-byte character counts as one)
+        var j = pos + 1
+        if j < line.len and line[j] != '\'' and line[j] != '\\':
+          j += utf8_len(line[j])
+        elif j + 1 < line.len and line[j] == '\\':
+          j += 1 + utf8_len(line[j + 1])
+        else:
+          j = -1
+        if j > 0 and j < line.len and line[j] == '\'':
+          kind = "char"
+          end = j + 1
+      if kind == "":
+        let three = line[pos..min(pos + 3, line.len)]
+        let two = line[pos..min(pos + 2, line.len)]
+        if three == "..=":
+          end = pos + 3
+          kind = "op"
+        elif two == ".." or two == "->" or two == "=>" or two == "<<" or two == ">>" or two == "==" or two == "!=" or two == "<=" or two == ">=" or two == "+=" or two == "-=" or two == "*=" or two == "/=" or two == "%=" or two == "|=" or two == "&=" or two == "^=":
+          end = pos + 2
+          kind = "op"
+        elif find_byte("-+*/%<>=()[]{{}},:.?&|^", c, 0) >= 0:
+          end = pos + 1
+          kind = "op"
+      if kind == "":
+        report(ctx, ln, "unexpected character " + char_desc(line[pos..min(pos + utf8_len(c), line.len)]))
+      let text = line[pos..end]
+      pos = end
+      if kind == "ws" or kind == "comment": continue
+      if kind == "name" and has_dunder(text): report(ctx, ln, "'" + text + "': names can't contain '__' (Vu uses it to name things from modules)")
+      if kind == "name" and is_keyword(text): kind = "kw"
+      if kind == "op" and (text == "(" or text == "[" or text == "{{"):
+        depth += 1
+      elif kind == "op" and (text == ")" or text == "]" or text == "}}"):
+        depth = max(0, depth - 1)
+      toks.push(Tok(kind, text, ln))
+    if depth == 0 and toks.len > 0:
+      let lk = toks[toks.len - 1].k
+      if lk != "NL" and lk != "INDENT" and lk != "DEDENT": toks.push(Tok("NL", "", ln))
+  var last_line = base + lines.len
+  if at_line > 0: last_line = at_line
+  if toks.len > 0:
+    let lk = toks[toks.len - 1].k
+    if lk != "NL" and lk != "INDENT" and lk != "DEDENT": toks.push(Tok("NL", "", last_line))
+  while indents.len > 1:
+    indents.pop()
+    toks.push(Tok("DEDENT", "", last_line))
+  toks.push(Tok("EOF", "", last_line))
+  return toks
+
+fn desc(t: Tok) -> Str:
+  if t.k == "NL": return "end of line"
+  if t.k == "INDENT": return "an indented block"
+  if t.k == "DEDENT": return "end of block"
+  if t.k == "EOF": return "end of file"
+  return py_repr(t.v)
+
+# ============================================================================ parser
+
+fn new_node(var p: Parser, k: Str, line: Int) -> Node:
+  p.nid += 1
+  return Node(k, line, p.nid, "", "", "", "", "", "", 0, -1, false, false, false, false, false, [], [])
+
+fn peek(p: Parser, o: Int) -> Tok:
+  let j = min(p.i + o, p.toks.len - 1)
+  return Tok(p.toks[j].k + "", p.toks[j].v + "", p.toks[j].line)
+
+fn peek_k(p: Parser, o: Int) -> Str:
+  return p.toks[min(p.i + o, p.toks.len - 1)].k + ""
+
+fn peek_v(p: Parser, o: Int) -> Str:
+  return p.toks[min(p.i + o, p.toks.len - 1)].v + ""
+
+fn at(p: Parser, k: Str) -> Bool:
+  return p.toks[p.i].k == k
+
+fn at_op(p: Parser, v: Str) -> Bool:
+  return p.toks[p.i].k == "op" and p.toks[p.i].v == v
+
+fn at_kw(p: Parser, v: Str) -> Bool:
+  return p.toks[p.i].k == "kw" and p.toks[p.i].v == v
+
+fn cur_line(p: Parser) -> Int:
+  return p.toks[p.i].line
+
+fn advance(var p: Parser) -> Tok:
+  let t = peek(p, 0)
+  p.i += 1
+  return t
+
+fn expect_tok(var p: Parser, k: Str, v: Str, what: Str) -> Tok:
+  let t = peek(p, 0)
+  if t.k != k or (v != "" and t.v != v):
+    var want = what
+    if want == "":
+      if v != "": want = py_repr(v)
+      elif k == "NL": want = "end of line"
+      elif k == "name": want = "a name"
+      else: want = k + ""
+    report(p.ctx, t.line, "expected " + want + ", found " + desc(t))
+  p.i += 1
+  return t
+
+fn accept_op(var p: Parser, v: Str) -> Bool:
+  if at_op(p, v):
+    p.i += 1
+    return true
+  return false
+
+fn parse_program(var p: Parser) -> [Node]:
+  var items: [Node] = []
+  while not at(p, "EOF"):
+    if at_kw(p, "fn"):
+      let it = parse_fn(&p)
+      items.push(it)
+    elif at_kw(p, "type"):
+      let it = parse_type_decl(&p)
+      items.push(it)
+    elif at_kw(p, "const"):
+      let it = parse_const(&p)
+      items.push(it)
+    elif at(p, "name") and p.toks[p.i].v == "extern" and peek_k(p, 1) == "str":
+      var ext = parse_extern(&p)
+      move_nodes(&ext, &items)
+    elif at(p, "name") and p.toks[p.i].v == "import" and peek_k(p, 1) == "name":
+      let iln = advance(&p).line
+      var im = new_node(&p, "import", iln)
+      im.name = expect_tok(&p, "name", "", "").v
+      expect_tok(&p, "NL", "", "")
+      items.push(im)
+    elif at(p, "name") and p.toks[p.i].v == "from" and peek_k(p, 1) == "name" and peek_k(p, 2) == "name" and peek_v(p, 2) == "import":
+      # from geo import area, Point (flag: names given)
+      let fln = advance(&p).line
+      var im = new_node(&p, "import", fln)
+      im.name = expect_tok(&p, "name", "", "").v
+      advance(&p)
+      im.flag = true
+      im.names.push(expect_tok(&p, "name", "", "").v)
+      while accept_op(&p, ","): im.names.push(expect_tok(&p, "name", "", "").v)
+      expect_tok(&p, "NL", "", "")
+      items.push(im)
+    else:
+      report(p.ctx, cur_line(p), "expected 'fn', 'type', 'const', 'import' or 'extern' at top level")
+  return items
+
+fn lib_char(c: Byte) -> Bool:
+  return is_name_char(c) or c == '+' or c == '-' or c == '.'
+
+# extern "glue.c": a C file compiled into the program, the libraries it needs, and the handle types and
+# functions it provides. -> the extern node (v: path, names: libraries), then exttype nodes (name, v: the
+# C function that frees one) and fn nodes with no body (op "extern", v: the C name).
+fn parse_extern(var p: Parser) -> [Node]:
+  let ln = advance(&p).line
+  let t = advance(&p)
+  let path = t.v[1..t.v.len - 1]
+  var plain = path.len > 0
+  for i in 0..path.len:
+    if path[i] == '{' or path[i] == '}' or path[i] == '\\' or path[i] == '"': plain = false
+  if not plain: report(p.ctx, t.line, "an extern file name is a plain string, like \"glue.c\"")
+  expect_tok(&p, "op", ":", "")
+  expect_tok(&p, "NL", "", "")
+  expect_tok(&p, "INDENT", "", "an indented list of 'link', 'type' and 'fn' lines")
+  var out: [Node] = []
+  var ex = new_node(&p, "extern", ln)
+  ex.v = path
+  out.push(ex)
+  while not at(p, "DEDENT"):
+    if at(p, "name") and p.toks[p.i].v == "link" and peek_k(p, 1) == "str":
+      advance(&p)
+      let lt = advance(&p)
+      let lib = lt.v[1..lt.v.len - 1]
+      var ok = lib.len > 0
+      for i in 0..lib.len:
+        if not lib_char(lib[i]): ok = false
+      if not ok: report(p.ctx, lt.line, "a library is named like \"sqlite3\" (it is linked with -lsqlite3)")
+      out[0].names.push(lib)
+      expect_tok(&p, "NL", "", "")
+    elif at_kw(p, "type"):
+      let tl = advance(&p).line
+      var xt = new_node(&p, "exttype", tl)
+      xt.name = expect_tok(&p, "name", "", "").v
+      if not (at(p, "name") and p.toks[p.i].v == "drop" and peek_k(p, 1) == "name"):
+        report(p.ctx, tl, "an extern type names the C function that frees it: type " + xt.name + " drop " + ascii_lower(xt.name) + "_free")
+      advance(&p)
+      xt.v = advance(&p).v
+      expect_tok(&p, "NL", "", "")
+      out.push(xt)
+    elif at_kw(p, "fn"):
+      let fl = advance(&p).line
+      var f = new_node(&p, "fn", fl)
+      f.name = expect_tok(&p, "name", "", "").v
+      f.v = f.name + ""
+      f.op = "extern"
+      expect_tok(&p, "op", "(", "")
+      var ps = new_node(&p, "params", fl)
+      ps.kids = typed_names(&p, true, "op", ")", "param")
+      expect_tok(&p, "op", ")", "")
+      f.ret = "~void"
+      if accept_op(&p, "->"): f.ret = parse_type(&p)
+      if at_kw(p, "throws"):
+        advance(&p)
+        f.flag = true
+        if at(p, "name"): report(p.ctx, fl, "an extern function fails with a message; it can't name an error type")
+      if at_op(p, ":"): report(p.ctx, fl, "an extern function has no body here: its code is in the C file")
+      expect_tok(&p, "NL", "", "")
+      f.kids.push(ps)
+      out.push(f)
+    else:
+      report(p.ctx, cur_line(p), "an extern block holds 'link \"lib\"', 'type Name drop free_fn' and 'fn' lines")
+  advance(&p)
+  return out
+
+fn ascii_lower(s: Str) -> Str:
+  var out = ""
+  for i in 0..s.len:
+    let c = s[i]
+    if c >= 'A' and c <= 'Z': out += str([c + 32])
+    else: out += str([c])
+  return out
+
+fn parse_const(var p: Parser) -> Node:
+  let ln = advance(&p).line
+  var n = new_node(&p, "const", ln)
+  n.name = expect_tok(&p, "name", "", "").v
+  expect_tok(&p, "op", "=", "")
+  let e = parse_expr(&p)
+  n.kids.push(e)
+  expect_tok(&p, "NL", "", "")
+  return n
+
+# `a, b: T, var c: U` -> nodes of kind kind (name, ty, flag = var, line); parameters (allow_var) can
+# also be `own d: V` (flag2), taking ownership of the argument. 'own' is only special there, before a name.
+fn typed_names(var p: Parser, allow_var: Bool, close_k: Str, close_v: Str, kind: Str) -> [Node]:
+  var items: [Node] = []
+  var pending: [Node] = []
+  while not (at(p, close_k) and (close_v == "" or p.toks[p.i].v == close_v)):
+    var is_var = false
+    var is_own = false
+    if allow_var and at_kw(p, "var"):
+      advance(&p)
+      is_var = true
+    elif allow_var and at(p, "name") and p.toks[p.i].v == "own" and peek_k(p, 1) == "name":
+      advance(&p)
+      is_own = true
+    let nt = expect_tok(&p, "name", "", "")
+    var item = new_node(&p, kind, nt.line)
+    item.name = nt.v
+    item.flag = is_var
+    item.flag2 = is_own
+    pending.push(item)
+    if accept_op(&p, ":"):
+      let ty = parse_type(&p)
+      for var q in pending: q.ty = ty + ""
+      move_nodes(&pending, &items)
+    if not accept_op(&p, ","): break
+  if pending.len > 0:
+    let last = pending.len - 1
+    report(p.ctx, pending[last].line, "missing type for '" + pending[last].name + "' (write '" + pending[last].name + ": Type')")
+  return items
+
+fn blank_node() -> Node:
+  return Node("", 0, 0, "", "", "", "", "", "", 0, -1, false, false, false, false, false, [], [])
+
+# Moves every node of src (in order) onto the end of dst, leaving src empty.
+fn move_nodes(var src: [Node], var dst: [Node]):
+  for k in 0..src.len:
+    var x = blank_node()
+    swap(&src[k], &x)
+    dst.push(x)
+  src = []
+
+fn parse_type_decl(var p: Parser) -> Node:
+  let ln = advance(&p).line
+  let name = expect_tok(&p, "name", "", "").v
+  let tparams = parse_type_params(&p)
+  expect_tok(&p, "op", ":", "")
+  expect_tok(&p, "NL", "", "")
+  expect_tok(&p, "INDENT", "", "an indented list of fields")
+  if at(p, "name") and (peek_k(p, 1) == "NL" or (peek_k(p, 1) == "op" and peek_v(p, 1) == "(")):
+    var en = new_node(&p, "enum", ln)
+    en.name = name
+    en.names = copy_strs(tparams)
+    while not at(p, "DEDENT"):
+      let vt = expect_tok(&p, "name", "", "a variant name")
+      var vn = new_node(&p, "variant", vt.line)
+      vn.name = vt.v
+      if accept_op(&p, "("):
+        vn.kids = typed_names(&p, false, "op", ")", "field")
+        expect_tok(&p, "op", ")", "")
+      expect_tok(&p, "NL", "", "")
+      en.kids.push(vn)
+    advance(&p)
+    return en
+  var st = new_node(&p, "type", ln)
+  st.name = name
+  st.names = copy_strs(tparams)
+  while not at(p, "DEDENT"):
+    var fs = typed_names(&p, false, "NL", "", "field")
+    move_nodes(&fs, &st.kids)
+    expect_tok(&p, "NL", "", "")
+  advance(&p)
+  return st
+
+# Types are canonical strings: Int Float Bool Byte Str Fs Net Os, [T], {K: V}, T?, user names, and
+# function types <(A, B)R> (<!(A)R> if it throws; R is left out for one that returns nothing).
+fn parse_type(var p: Parser) -> Str:
+  var ty = ""
+  if at_kw(p, "fn"):
+    # a function type: fn(Int, Str) -> Bool, fn(Str) -> Int throws, fn() (returns nothing)
+    let ln = advance(&p).line
+    expect_tok(&p, "op", "(", "")
+    var ps: [Str] = []
+    while not at_op(p, ")"):
+      ps.push(parse_type(&p))
+      if not accept_op(&p, ","): break
+    expect_tok(&p, "op", ")", "")
+    var ret = ""
+    if accept_op(&p, "->"): ret = parse_type(&p)
+    var th = ""
+    if at_kw(p, "throws"):
+      advance(&p)
+      th = "!"
+      if at(p, "name"): report(p.ctx, ln, "a function type fails with a message (throws); typed errors (throws E) are only for named functions")
+    return "<" + th + "(" + join(ps, ", ") + ")" + ret + ">"
+  if accept_op(&p, "("):
+    ty = parse_type(&p)   # (fn(Int) -> Int)? : parentheses group a type
+    expect_tok(&p, "op", ")", "")
+  elif accept_op(&p, "["):
+    let inner = parse_type(&p)
+    expect_tok(&p, "op", "]", "")
+    ty = "[" + inner + "]"
+  elif accept_op(&p, "{{"):
+    let k = parse_type(&p)
+    expect_tok(&p, "op", ":", "")
+    let v = parse_type(&p)
+    expect_tok(&p, "op", "}}", "")
+    ty = "{{" + k + ": " + v + "}}"
+  else:
+    ty = expect_tok(&p, "name", "", "a type").v
+    if (ty == "Chan" or ty == "Shared") and at_op(p, "["):
+      advance(&p)
+      let inner = parse_type(&p)
+      expect_tok(&p, "op", "]", "")
+      ty = ty + "[" + inner + "]"
+      if accept_op(&p, "?"): ty += "?"
+      return ty
+    if at_op(p, ".") and peek_k(p, 1) == "name":
+      advance(&p)
+      ty += "." + advance(&p).v   # a type from a module: geo.Point
+    if at_op(p, "["):
+      # a generic type with its type arguments: Pair[Int, Str]
+      advance(&p)
+      var targs: [Str] = [parse_type(&p)]
+      while accept_op(&p, ","): targs.push(parse_type(&p))
+      expect_tok(&p, "op", "]", "")
+      ty += "[" + join(targs, ", ") + "]"
+  if accept_op(&p, "?"): ty += "?"
+  return ty
+
+# [T, U] after a function's or a type's name: its type parameters.
+fn parse_type_params(var p: Parser) -> [Str]:
+  var ps: [Str] = []
+  if accept_op(&p, "["):
+    while true:
+      let tk = expect_tok(&p, "name", "", "a type parameter name")
+      for x in ps:
+        if x == tk.v: report(p.ctx, tk.line, "type parameter '" + tk.v + "' is listed twice")
+      ps.push(tk.v + "")
+      if not accept_op(&p, ","): break
+    expect_tok(&p, "op", "]", "")
+  return ps
+
+fn parse_fn(var p: Parser) -> Node:
+  let ln = advance(&p).line
+  var f = new_node(&p, "fn", ln)
+  f.name = expect_tok(&p, "name", "", "").v
+  f.names = parse_type_params(&p)
+  expect_tok(&p, "op", "(", "")
+  var ps = new_node(&p, "params", ln)
+  ps.kids = typed_names(&p, true, "op", ")", "param")
+  expect_tok(&p, "op", ")", "")
+  f.ret = "~void"
+  if accept_op(&p, "->"): f.ret = parse_type(&p)
+  if at_kw(p, "throws"):
+    advance(&p)
+    f.flag = true
+    if at(p, "name"): f.name2 = parse_type(&p)   # throws ParseError: fails with values of that enum
+  f.kids.push(ps)
+  let body = parse_block(&p)
+  f.kids.push(body)
+  return f
+
+# After 'fn' (or 'own fn'): a closure. As an expression, fn(x: Int) -> Int => x * k (parameter and
+# return types can be left out when the context says them); as a statement (named), a nested function
+# with a block body: fn name(x: Int) -> Int: ... The node: name, ret ("" if not written), flag (throws),
+# flag2 (own), is_par (has a block); kids: the params (each with name and ty, "" if not written), then
+# the body expression or block.
+fn parse_closure(var p: Parser, own: Bool, named: Bool) -> Node:
+  let ln = advance(&p).line
+  var n = new_node(&p, "lambda", ln)
+  if named: n.name = expect_tok(&p, "name", "", "").v
+  expect_tok(&p, "op", "(", "")
+  var ps = new_node(&p, "params", ln)
+  while not at_op(p, ")"):
+    if at_kw(p, "var") or (at(p, "name") and p.toks[p.i].v == "own" and peek_k(p, 1) == "name"):
+      report(p.ctx, cur_line(p), "a closure's parameters are read-only: they can't be 'var' or 'own'")
+    let nt = expect_tok(&p, "name", "", "a parameter name")
+    var pn = new_node(&p, "param", nt.line)
+    pn.name = nt.v
+    if accept_op(&p, ":"): pn.ty = parse_type(&p)
+    elif named: report(p.ctx, nt.line, "missing type for '" + nt.v + "' (write '" + nt.v + ": Type')")
+    ps.kids.push(pn)
+    if not accept_op(&p, ","): break
+  expect_tok(&p, "op", ")", "")
+  n.kids.push(ps)
+  if accept_op(&p, "->"): n.ret = parse_type(&p)
+  if at_kw(p, "throws"):
+    advance(&p)
+    n.flag = true
+    if at(p, "name"): report(p.ctx, ln, "a closure fails with a message (throws); typed errors (throws E) are only for top-level functions")
+  n.flag2 = own
+  if named:
+    if n.ret == "": n.ret = "~void"
+    n.is_par = true
+    let b = parse_block(&p)
+    n.kids.push(b)
+    return n
+  expect_tok(&p, "op", "=>", "'=>' and the closure's value (fn(x) => x + 1)")
+  var body = parse_expr(&p)
+  parse_handled(&p, &body)
+  n.kids.push(body)
+  return n
+
+fn parse_block(var p: Parser) -> Node:
+  expect_tok(&p, "op", ":", "")
+  var b = new_node(&p, "block", cur_line(p))
+  p.depth += 1
+  if p.depth > 4000: too_deep(p.ctx)
+  if at(p, "NL"):
+    advance(&p)
+    expect_tok(&p, "INDENT", "", "an indented block")
+    while not at(p, "DEDENT"):
+      let st = parse_stmt(&p)
+      b.kids.push(st)
+    advance(&p)
+    p.depth -= 1
+    return b
+  let st = parse_simple(&p)
+  b.kids.push(st)
+  expect_tok(&p, "NL", "", "")
+  p.depth -= 1
+  return b
+
+fn parse_stmt(var p: Parser) -> Node:
+  let t = peek(p, 0)
+  if t.k == "kw" and t.v == "if": return parse_if(&p)
+  if t.k == "kw" and t.v == "while":
+    advance(&p)
+    var w = new_node(&p, "while", t.line)
+    let cond = parse_expr(&p)
+    w.kids.push(cond)
+    let body = parse_block(&p)
+    w.kids.push(body)
+    return w
+  if t.k == "kw" and t.v == "for": return parse_for(&p)
+  if t.k == "kw" and t.v == "match": return parse_match(&p)
+  if t.k == "kw" and t.v == "fn" and peek_k(p, 1) == "name":
+    var fs = new_node(&p, "fnstmt", t.line)
+    let lam = parse_closure(&p, false, true)
+    fs.kids.push(lam)
+    return fs
+  if t.k == "name" and t.v == "own" and peek_k(p, 1) == "kw" and peek_v(p, 1) == "fn" and peek_k(p, 2) == "name":
+    advance(&p)
+    var fs = new_node(&p, "fnstmt", t.line)
+    let lam = parse_closure(&p, true, true)
+    fs.kids.push(lam)
+    return fs
+  if t.k == "kw" and t.v == "par":
+    advance(&p)
+    if not at_kw(p, "for"): report(p.ctx, t.line, "'par' must be followed by a range loop: par for i in 0..n:")
+    var node = parse_for(&p)
+    if node.k != "range": report(p.ctx, t.line, "par loops run over a range of indexes: par for i in 0..xs.len:")
+    node.is_par = true
+    return node
+  let st = parse_simple(&p)
+  expect_tok(&p, "NL", "", "")
+  return st
+
+fn parse_if(var p: Parser) -> Node:
+  let t = advance(&p)
+  var n = new_node(&p, "if", t.line)
+  var mut = false
+  if at_kw(p, "var") and peek_k(p, 1) == "name" and peek_k(p, 2) == "op" and peek_v(p, 2) == "=":
+    advance(&p)
+    mut = true
+  if at(p, "name") and peek_k(p, 1) == "op" and peek_v(p, 1) == "=":
+    n.name = advance(&p).v
+    n.flag2 = true
+    advance(&p)
+  elif mut:
+    report(p.ctx, t.line, "expected 'if var name = optional:'")
+  n.flag = mut
+  let cond = parse_expr(&p)
+  n.kids.push(cond)
+  let body = parse_block(&p)
+  n.kids.push(body)
+  if at_kw(p, "elif"):
+    var inner = parse_if(&p)
+    inner.elif_ = true
+    var eb = new_node(&p, "block", inner.line)
+    eb.kids.push(inner)
+    n.kids.push(eb)
+  elif at_kw(p, "else"):
+    advance(&p)
+    let eb = parse_block(&p)
+    n.kids.push(eb)
+  return n
+
+fn parse_match(var p: Parser) -> Node:
+  let t = advance(&p)
+  var n = new_node(&p, "match", t.line)
+  if at_kw(p, "var"):
+    advance(&p)
+    n.flag = true
+  let subj = parse_expr(&p)
+  n.kids.push(subj)
+  expect_tok(&p, "op", ":", "")
+  expect_tok(&p, "NL", "", "")
+  expect_tok(&p, "INDENT", "", "indented match arms, like  Num(v): ...")
+  while not at(p, "DEDENT"):
+    let pt = expect_tok(&p, "name", "", "a pattern like Num(v) or _")
+    var arm = new_node(&p, "arm", pt.line)
+    arm.name = pt.v
+    if at_op(p, ".") and peek_k(p, 1) == "name":
+      advance(&p)
+      arm.name += "." + advance(&p).v   # a variant of an enum from a module: geo.Circle(r)
+    if accept_op(&p, "("):
+      arm.flag = true
+      while not at_op(p, ")"):
+        arm.names.push(expect_tok(&p, "name", "", "").v)
+        if not accept_op(&p, ","): break
+      expect_tok(&p, "op", ")", "")
+    let body = parse_block(&p)
+    arm.kids.push(body)
+    n.kids.push(arm)
+  advance(&p)
+  return n
+
+# `f(x) else default`: a statement-level fallback for a call that can fail. Replaces e with
+# orelse(e, default) when `else` follows. (Parameters are borrowed, so e is swapped, not moved.)
+fn parse_handled(var p: Parser, var e: Node):
+  if at_kw(p, "else"):
+    let ln = advance(&p).line
+    var o = new_node(&p, "orelse", ln)
+    var inner = blank_node()
+    swap(&inner, &e)
+    o.kids.push(inner)
+    let j = peek(p, 0)
+    if j.k == "kw" and (j.v == "return" or j.v == "break" or j.v == "continue" or j.v == "fail"):
+      # else return [value] / break / continue / fail value (flag): on failure, leave
+      advance(&p)
+      var jn = new_node(&p, j.v, j.line)
+      if (j.v == "return" and not at(p, "NL")) or j.v == "fail":
+        let rv = parse_expr(&p)
+        jn.kids.push(rv)
+      o.kids.push(jn)
+      o.flag = true
+    else:
+      let d = parse_expr(&p)
+      o.kids.push(d)
+    swap(&e, &o)
+
+fn parse_for(var p: Parser) -> Node:
+  let t = advance(&p)
+  var mut = false
+  if at_kw(p, "var"):
+    advance(&p)
+    mut = true
+  let name = expect_tok(&p, "name", "", "").v
+  var name2 = ""
+  if accept_op(&p, ","):
+    if mut: report(p.ctx, t.line, "a map's keys can't be changed in a loop; to change the values write: for k, var v in m")
+    if at_kw(p, "var"):
+      advance(&p)
+      mut = true
+    name2 = expect_tok(&p, "name", "", "").v
+  expect_tok(&p, "kw", "in", "")
+  let a = parse_expr(&p)
+  if at_op(p, "..") or at_op(p, "..="):
+    if name2 != "": report(p.ctx, t.line, "a range loop has one counter: for i in a..b")
+    var r = new_node(&p, "range", t.line)
+    r.name = name
+    r.flag = advance(&p).v == "..="
+    r.kids.push(a)
+    let b = parse_expr(&p)
+    r.kids.push(b)
+    if at_kw(p, "by"):
+      advance(&p)
+      r.flag2 = true
+      let step = parse_expr(&p)
+      r.kids.push(step)
+    if mut: report(p.ctx, t.line, "a range loop counter can't be 'var'")
+    let body = parse_block(&p)
+    r.kids.push(body)
+    return r
+  var n = new_node(&p, "each", t.line)
+  n.name = name
+  n.name2 = name2
+  n.flag = mut
+  n.kids.push(a)
+  let body = parse_block(&p)
+  n.kids.push(body)
+  return n
+
+fn is_assign_op(v: Str) -> Bool:
+  return v == "=" or v == "+=" or v == "-=" or v == "*=" or v == "/=" or v == "%=" or v == "&=" or v == "|=" or v == "^="
+
+fn parse_simple(var p: Parser) -> Node:
+  let t = peek(p, 0)
+  if t.k == "kw" and (t.v == "let" or t.v == "var"):
+    advance(&p)
+    var n = new_node(&p, "let", t.line)
+    n.name = expect_tok(&p, "name", "", "").v
+    if accept_op(&p, ":"): n.ty = parse_type(&p)
+    expect_tok(&p, "op", "=", "'=' (variables must be given a value)")
+    n.flag = t.v == "var"
+    var e = parse_expr(&p)
+    parse_handled(&p, &e)
+    n.kids.push(e)
+    return n
+  if t.k == "kw" and t.v == "return":
+    advance(&p)
+    var n = new_node(&p, "return", t.line)
+    if not at(p, "NL"):
+      var e = parse_expr(&p)
+      parse_handled(&p, &e)
+      n.kids.push(e)
+    return n
+  if t.k == "kw" and t.v == "fail":
+    advance(&p)
+    var n = new_node(&p, "fail", t.line)
+    let e = parse_expr(&p)
+    n.kids.push(e)
+    return n
+  if t.k == "kw" and (t.v == "break" or t.v == "continue"):
+    advance(&p)
+    return new_node(&p, t.v, t.line)
+  if t.k == "name" and t.v == "spawn" and peek_k(p, 1) == "name":
+    advance(&p)
+    var n = new_node(&p, "spawn", t.line)
+    var e = parse_expr(&p)
+    parse_handled(&p, &e)
+    n.kids.push(e)
+    return n
+  if t.k == "kw" and (t.v == "if" or t.v == "while" or t.v == "for" or t.v == "elif" or t.v == "else" or t.v == "match" or t.v == "par"):
+    report(p.ctx, t.line, "'" + t.v + "' must start its own line")
+  var e = parse_expr(&p)
+  if peek_k(p, 0) == "op" and is_assign_op(peek_v(p, 0)):
+    var n = new_node(&p, "assign", t.line)
+    n.op = advance(&p).v
+    n.kids.push(e)
+    var rhs = parse_expr(&p)
+    parse_handled(&p, &rhs)
+    n.kids.push(rhs)
+    return n
+  var n = new_node(&p, "exprstmt", t.line)
+  parse_handled(&p, &e)
+  n.kids.push(e)
+  return n
+
+# ---- expressions, lowest to highest precedence
+
+fn parse_expr(var p: Parser) -> Node:
+  p.depth += 1
+  if p.depth > 4000: too_deep(p.ctx)
+  let e = parse_or(&p)
+  p.depth -= 1
+  return e
+
+fn parse_or(var p: Parser) -> Node:
+  var left = parse_and(&p)
+  while at_kw(p, "or"):
+    let ln = advance(&p).line
+    let r = parse_and(&p)
+    var nb = new_node(&p, "bin", ln)
+    nb.op = "or"
+    nb.kids.push(left)
+    nb.kids.push(r)
+    left = nb
+  return left
+
+fn parse_and(var p: Parser) -> Node:
+  var left = parse_not(&p)
+  while at_kw(p, "and"):
+    let ln = advance(&p).line
+    let r = parse_not(&p)
+    var nb = new_node(&p, "bin", ln)
+    nb.op = "and"
+    nb.kids.push(left)
+    nb.kids.push(r)
+    left = nb
+  return left
+
+fn parse_not(var p: Parser) -> Node:
+  if at_kw(p, "not"):
+    let ln = advance(&p).line
+    var n = new_node(&p, "un", ln)
+    n.op = "not"
+    p.depth += 1
+    if p.depth > 4000: too_deep(p.ctx)
+    let e = parse_not(&p)
+    p.depth -= 1
+    n.kids.push(e)
+    return n
+  return parse_cmp(&p)
+
+fn at_compare(p: Parser) -> Bool:
+  if peek_k(p, 0) == "op":
+    let v = peek_v(p, 0)
+    return v == "==" or v == "!=" or v == "<" or v == ">" or v == "<=" or v == ">="
+  return at_kw(p, "in")
+
+fn parse_cmp(var p: Parser) -> Node:
+  var left = parse_binary(&p, 0)
+  if at_compare(p):
+    let t = advance(&p)
+    let r = parse_binary(&p, 0)
+    var nb = new_node(&p, "bin", t.line)
+    nb.op = t.v
+    nb.kids.push(left)
+    nb.kids.push(r)
+    left = nb
+    if at_compare(p): report(p.ctx, t.line, "comparisons can't be chained; use 'and'")
+  return left
+
+fn level_has(level: Int, v: Str) -> Bool:
+  if level == 0: return v == "|"
+  if level == 1: return v == "^"
+  if level == 2: return v == "&"
+  if level == 3: return v == "<<" or v == ">>"
+  if level == 4: return v == "+" or v == "-"
+  return v == "*" or v == "/" or v == "%"
+
+fn parse_binary(var p: Parser, level: Int) -> Node:
+  if level == 6: return parse_unary(&p)
+  var left = parse_binary(&p, level + 1)
+  while peek_k(p, 0) == "op" and level_has(level, peek_v(p, 0)):
+    let t = advance(&p)
+    let r = parse_binary(&p, level + 1)
+    var nb = new_node(&p, "bin", t.line)
+    nb.op = t.v
+    nb.kids.push(left)
+    nb.kids.push(r)
+    left = nb
+  return left
+
+fn parse_unary(var p: Parser) -> Node:
+  if at_op(p, "-") or at_op(p, "&"):
+    let t = advance(&p)
+    var n = new_node(&p, "un", t.line)
+    if t.v == "&": n.k = "ref"
+    n.op = t.v
+    p.depth += 1
+    if p.depth > 4000: too_deep(p.ctx)
+    let e = parse_unary(&p)
+    p.depth -= 1
+    n.kids.push(e)
+    return n
+  return parse_postfix(&p)
+
+fn parse_postfix(var p: Parser) -> Node:
+  var e = parse_primary(&p)
+  while true:
+    if at_op(p, "("):
+      let ln = advance(&p).line
+      var c = new_node(&p, "call", ln)
+      c.kids.push(e)
+      while not at_op(p, ")"):
+        var an = new_node(&p, "arg", cur_line(p))
+        if at(p, "name") and peek_k(p, 1) == "op" and peek_v(p, 1) == ":":
+          an.name = advance(&p).v
+          an.flag = true
+          advance(&p)
+        if c.kids.len == 2 and c.kids[0].k == "name" and c.kids[0].name == "from_json":
+          # from_json(text, Type): the second argument is a type, like [Order] or Int?
+          var ta = new_node(&p, "typearg", cur_line(p))
+          ta.ty = parse_type(&p)
+          an.line = ta.line
+          an.kids.push(ta)
+        else:
+          let x = parse_expr(&p)
+          an.line = x.line
+          an.kids.push(x)
+        c.kids.push(an)
+        if not accept_op(&p, ","): break
+      expect_tok(&p, "op", ")", "")
+      e = c
+    elif at_op(p, "."):
+      let ln = advance(&p).line
+      var f = new_node(&p, "field", ln)
+      f.name = expect_tok(&p, "name", "", "").v
+      f.kids.push(e)
+      e = f
+    elif at_op(p, "["):
+      let ln = advance(&p).line
+      let i = parse_expr(&p)
+      if at_op(p, ".."):
+        advance(&p)
+        let hi = parse_expr(&p)
+        expect_tok(&p, "op", "]", "")
+        var s = new_node(&p, "slice", ln)
+        s.kids.push(e)
+        s.kids.push(i)
+        s.kids.push(hi)
+        e = s
+        continue
+      expect_tok(&p, "op", "]", "")
+      var x = new_node(&p, "index", ln)
+      x.kids.push(e)
+      x.kids.push(i)
+      e = x
+    elif at_op(p, "?"):
+      let ln = advance(&p).line
+      var t = new_node(&p, "try", ln)
+      t.kids.push(e)
+      e = t
+    else:
+      return e
+
+# The value of an int literal; big = true when it doesn't fit in an Int (an error later).
+fn int_literal(text: Str, var n: Node):
+  var s = replace_all(text, "_", "")
+  var v = 0
+  var big = false
+  if s.len > 2 and (s[0..2] == "0x" or s[0..2] == "0X"):
+    for i in 2..s.len:
+      let c = s[i]
+      var d = 0
+      if is_digit(c): d = int(c) - 48
+      elif c >= 'a' and c <= 'f': d = int(c) - 87
+      else: d = int(c) - 55
+      if v > (9223372036854775807 - d) / 16: big = true
+      else: v = v * 16 + d
+  else:
+    for i in 0..s.len:
+      let d = int(s[i]) - 48
+      if v > (9223372036854775807 - d) / 10: big = true
+      else: v = v * 10 + d
+  n.ival = v
+  n.big = big
+
+fn parse_primary(var p: Parser) -> Node:
+  let t = advance(&p)
+  if t.k == "int":
+    var n = new_node(&p, "int", t.line)
+    int_literal(t.v, &n)
+    return n
+  if t.k == "float":
+    var n = new_node(&p, "float", t.line)
+    n.v = replace_all(t.v, "_", "")
+    return n
+  if t.k == "str":
+    var n = new_node(&p, "str", t.line)
+    parse_interp(&p, t.v[1..t.v.len - 1], t.line, &n)
+    return n
+  if t.k == "char":
+    let body = t.v[1..t.v.len - 1]
+    var ch = -1
+    if body.len > 0 and body[0] == '\\':
+      let rest = body[1..body.len]
+      if rest == "n": ch = 10
+      elif rest == "t": ch = 9
+      elif rest == "r": ch = 13
+      elif rest == "\\": ch = 92
+      elif rest == "'": ch = 39
+      elif rest == "0": ch = 0
+    elif body.len == 1 and body[0] < 128:
+      ch = int(body[0])
+    if ch < 0: report(p.ctx, t.line, t.v + " isn't a single ASCII character (Byte literals are like 'a', '\\n', '\\'')")
+    var n = new_node(&p, "char", t.line)
+    n.ival = ch
+    return n
+  if t.k == "kw" and t.v == "fn":
+    p.i -= 1
+    return parse_closure(&p, false, false)
+  if t.k == "name" and t.v == "own" and at_kw(p, "fn"): return parse_closure(&p, true, false)
+  if t.k == "name":
+    var n = new_node(&p, "name", t.line)
+    n.name = t.v
+    return n
+  if t.k == "kw" and (t.v == "true" or t.v == "false"):
+    var n = new_node(&p, "bool", t.line)
+    n.flag = t.v == "true"
+    return n
+  if t.k == "kw" and t.v == "nil": return new_node(&p, "nil", t.line)
+  if t.k == "op" and t.v == "(":
+    let e = parse_expr(&p)
+    expect_tok(&p, "op", ")", "")
+    return e
+  if t.k == "op" and t.v == "[":
+    var n = new_node(&p, "list", t.line)
+    while not at_op(p, "]"):
+      let x = parse_expr(&p)
+      n.kids.push(x)
+      if not accept_op(&p, ","): break
+    expect_tok(&p, "op", "]", "")
+    return n
+  if t.k == "op" and t.v == "{{":
+    var n = new_node(&p, "map", t.line)
+    while not at_op(p, "}}"):
+      var pair = new_node(&p, "pair", cur_line(p))
+      let k = parse_expr(&p)
+      pair.kids.push(k)
+      expect_tok(&p, "op", ":", "")
+      let v = parse_expr(&p)
+      pair.kids.push(v)
+      n.kids.push(pair)
+      if not accept_op(&p, ","): break
+    expect_tok(&p, "op", "}}", "")
+    return n
+  report(p.ctx, t.line, "expected an expression, found " + desc(t))
+  return new_node(&p, "nil", t.line)
+
+fn escape_char(c: Byte) -> Int:
+  if c == 'n': return 10
+  if c == 't': return 9
+  if c == 'r': return 13
+  if c == '\\': return 92
+  if c == '"': return 34
+  if c == '0': return 0
+  return -1
+
+# Splits a string literal body into text pieces and {expression:spec} pieces (kids of n).
+# One past the closing quote of the string literal starting at s[i], or -1 if it isn't closed on this
+# line. An interpolation may contain strings of its own, as in Python 3.12: "{m["k"]}".
+fn scan_string(s: Str, i: Int) -> Int:
+  var j = i + 1
+  while j < s.len:
+    let c = s[j]
+    if c == '\\':
+      if j + 1 < s.len: j += 1 + utf8_len(s[j + 1])
+      else: j += 2
+    elif c == '"': return j + 1
+    elif c == '{' and j + 1 < s.len and s[j + 1] == '{': j += 2
+    elif c == '{':
+      j = scan_interp(s, j + 1)
+      if j < 0: return -1
+    else: j += 1
+  return -1
+
+# From just after an interpolation's '{' to just after its '}', skipping the strings, Byte literals
+# and braces inside it; -1 if it doesn't close.
+fn scan_interp(s: Str, from: Int) -> Int:
+  var depth = 0
+  var j = from
+  while j < s.len:
+    let c = s[j]
+    if c == '"':
+      j = scan_string(s, j)
+      if j < 0: return -1
+      continue
+    if c == '\'':
+      j += 1
+      if j < s.len and s[j] == '\\':
+        if j + 1 < s.len: j += 1 + utf8_len(s[j + 1])
+        else: j += 2
+      elif j < s.len: j += utf8_len(s[j])
+      else: j += 1
+      if j < s.len and s[j] == '\'': j += 1
+      continue
+    if c == '{': depth += 1
+    elif c == '}':
+      if depth == 0: return j + 1
+      depth -= 1
+    j += 1
+  return -1
+
+fn parse_interp(var p: Parser, raw: Str, line: Int, var n: Node):
+  var buf: [Byte] = []
+  var i = 0
+  while i < raw.len:
+    let c = raw[i]
+    if c == '\\':
+      var nxt = -1
+      if i + 1 < raw.len: nxt = escape_char(raw[i + 1])
+      if nxt < 0:
+        var shown = ""
+        if i + 1 < raw.len: shown = raw[i + 1..min(i + 1 + utf8_len(raw[i + 1]), raw.len)]
+        report(p.ctx, line, "unknown escape '\\" + shown + "' in string")
+      buf.push(byte(nxt))
+      i += 2
+    elif c == '{':
+      if i + 1 < raw.len and raw[i + 1] == '{':
+        buf.push('{')
+        i += 2
+        continue
+      let j = scan_interp(raw, i + 1) - 1   # the matching '}'
+      if j < 0: report(p.ctx, line, "unclosed '{{' in string (write '{{{{' for a literal brace)")
+      var inner = strip(raw[i + 1..j])
+      var zero = ""
+      var width = ""
+      var prec = -1
+      var hexa = ""
+      # Python-style format spec after the last ':': 0?\d*(\.\d+)?x?
+      let colon = last_colon(inner)
+      if colon >= 0:
+        let spec = inner[colon + 1..inner.len]
+        var k = 0
+        var z = ""
+        if k < spec.len and spec[k] == '0':
+          z = "0"
+          k += 1
+        let w0 = k
+        while k < spec.len and is_digit(spec[k]): k += 1
+        let w = spec[w0..k]
+        var pr = -2
+        var prs = ""
+        var okp = true
+        if k < spec.len and spec[k] == '.':
+          let p0 = k + 1
+          k += 1
+          while k < spec.len and is_digit(spec[k]): k += 1
+          if k == p0: okp = false
+          else:
+            prs = spec[p0..k]
+            pr = 0
+        var hx = ""
+        if okp and k < spec.len and spec[k] == 'x':
+          hx = "x"
+          k += 1
+        if okp and k == spec.len and (z != "" or w != "" or pr != -2 or hx != ""):
+          inner = strip(inner[0..colon])
+          zero = z
+          width = w
+          hexa = hx
+          if pr != -2: prec = small_number(prs)
+          if width != "" and small_number(width) > 1000:
+            report(p.ctx, line, "format width " + width + " is too large (at most 1000)")
+          if prec > 100: report(p.ctx, line, "format precision " + strip_zeros(prs) + " is too large (at most 100)")
+      if inner.len == 0: report(p.ctx, line, "empty '{{}}' in string")
+      if buf.len > 0:
+        var tx = new_node(&p, "text", line)
+        tx.v = str(buf)
+        n.kids.push(tx)
+        buf = []
+      var toks = lex(p.ctx, inner, line, 0)
+      for var tk in toks: tk.line = line
+      let save_i = p.i
+      swap(&p.toks, &toks)
+      p.i = 0
+      let e = parse_expr(&p)
+      expect_tok(&p, "NL", "", "'}}'")
+      swap(&p.toks, &toks)
+      p.i = save_i
+      var part = new_node(&p, "part", line)
+      part.kids.push(e)
+      part.name = zero
+      part.name2 = width
+      part.prec = prec
+      part.op = hexa
+      n.kids.push(part)
+      i = j + 1
+    elif c == '}':
+      if i + 1 < raw.len and raw[i + 1] == '}':
+        buf.push('}')
+        i += 2
+        continue
+      report(p.ctx, line, "single '}}' in string (write '}}}}' for a literal brace)")
+    else:
+      buf.push(c)
+      i += 1
+  if buf.len > 0:
+    var tx = new_node(&p, "text", line)
+    tx.v = str(buf)
+    n.kids.push(tx)
+
+fn last_colon(s: Str) -> Int:
+  var i = s.len - 1
+  while i >= 0:
+    if s[i] == ':': return i
+    i -= 1
+  return -1
+
+fn strip_zeros(s: Str) -> Str:
+  var i = 0
+  while i < s.len - 1 and s[i] == '0': i += 1
+  return s[i..s.len]
+
+# A digit string's value, saturating at a large number (only compared against small limits).
+fn small_number(s: Str) -> Int:
+  var v = 0
+  for i in 0..s.len:
+    v = v * 10 + int(s[i]) - 48
+    if v > 1000000: return 1000000
+  return v

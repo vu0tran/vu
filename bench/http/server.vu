@@ -1,0 +1,166 @@
+# The HTTP benchmark server (HTTP/1.1, keep-alive, pipelining, requests split across reads):
+#   GET  /       -> "Hello, World!"
+#   POST /order  -> reads the order (JSON, with from_json), totals it, and replies with a JSON summary
+#                   (see gen_order.py for the computation and the reply every server must send)
+# Bodies are read by Content-Length (chunked bodies aren't supported).
+#   vu build --release server.vu -o server && ./server 8080
+const MAX_BODY = 1048576
+
+# The index just past the first blank line ("\r\n\r\n") at or after from, or -1 if there is none yet.
+fn head_end(buf: Str, from: Int) -> Int:
+  var i = from
+  while i + 3 < buf.len:
+    if buf[i + 3] != '\n':
+      i += 1
+    elif buf[i] == '\r' and buf[i + 1] == '\n' and buf[i + 2] == '\r':
+      return i + 4
+    else:
+      i += 1
+  return -1
+
+fn lower(b: Byte) -> Byte:
+  if b >= 'A' and b <= 'Z': return b + 32
+  return b
+
+# The Content-Length header of the request head buf[a..b]: 0 if there is none, -1 if it's malformed.
+fn content_length(buf: Str, a: Int, b: Int) -> Int:
+  let name = "\r\ncontent-length:"
+  var i = a
+  while i + name.len <= b:
+    var j = 0
+    while j < name.len and lower(buf[i + j]) == name[j]:
+      j += 1
+    if j == name.len:
+      var k = i + j
+      while k < b and buf[k] == ' ':
+        k += 1
+      var n = 0
+      var digits = 0
+      while k < b and buf[k] >= '0' and buf[k] <= '9' and digits < 10:
+        n = n * 10 + int(buf[k]) - 48
+        k += 1
+        digits += 1
+      if digits == 0: return -1
+      while k < b and buf[k] == ' ':
+        k += 1
+      if k >= b or buf[k] != '\r': return -1
+      return n
+    i += 1
+  return 0
+
+# Whether buf[a..b] starts with p.
+fn starts(buf: Str, a: Int, b: Int, p: Str) -> Bool:
+  if b - a < p.len: return false
+  for i in 0..p.len:
+    if buf[a + i] != p[i]: return false
+  return true
+
+fn respond(var out: Str, status: Str, kind: Str, body: Str):
+  out += "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {body.len}\r\n\r\n"
+  out += body
+
+# ---- the JSON endpoint: the order's shape as types; from_json checks it and ignores other fields
+
+type Customer:
+  name: Str
+
+type Item:
+  sku: Str
+  qty: Int
+  price_cents: Int
+  gift: Bool?
+
+type Order:
+  id: Str
+  customer: Customer
+  coupon: Str?
+  items: [Item]
+
+type Summary:
+  id: Str
+  customer: Str
+  items, quantity, subtotal, discount, total, gifts: Int
+  bulk: [Str]
+
+type Problem:
+  error: Str
+
+fn order(text: Str) -> Str throws:
+  let o = from_json(text, Order)?
+  var quantity = 0
+  var subtotal = 0
+  var gifts = 0
+  var bulk: [Str] = []
+  for it in o.items:
+    quantity += it.qty
+    subtotal += it.qty * it.price_cents
+    if g = it.gift:
+      if g: gifts += 1
+    if it.qty >= 5: bulk.push(it.sku + "")
+  var discount = 0
+  if c = o.coupon:
+    if c == "SAVE10": discount = subtotal / 10
+  return to_json(Summary(o.id + "", o.customer.name + "", o.items.len, quantity, subtotal, discount,
+                         subtotal - discount, gifts, bulk))
+
+# Answers one request (method and path from the request line in buf[a..]) into out.
+fn handle(buf: Str, a: Int, body_at: Int, body_end: Int, var out: Str):
+  if starts(buf, a, body_at, "GET / "):
+    respond(&out, "200 OK", "text/plain", "Hello, World!")
+  elif starts(buf, a, body_at, "POST /order "):
+    match order(buf[body_at..body_end]):
+      ok(reply): respond(&out, "200 OK", "application/json", reply)
+      err(e): respond(&out, "400 Bad Request", "application/json", to_json(Problem(e)))
+  else:
+    respond(&out, "404 Not Found", "text/plain", "not found")
+
+# One task per connection: it reads requests, answers each, and ends when the client closes or is idle
+# for a minute.
+fn serve(net: Net, own c: Conn):
+  var buf = ""
+  while true:
+    let data = net.recv(c, timeout: 60.0) else ""
+    if data.len == 0: return
+    if buf.len == 0:
+      buf = data
+    else:
+      buf += data
+    var out = ""
+    var at = 0
+    var broken = false
+    while true:
+      let end = head_end(buf, at)
+      if end < 0: break
+      let n = content_length(buf, at, end)
+      if n < 0 or n > MAX_BODY:
+        respond(&out, "400 Bad Request", "text/plain", "bad Content-Length")
+        broken = true
+        break
+      if end + n > buf.len: break
+      handle(buf, at, end, end + n, &out)
+      at = end + n
+    if out.len > 0:
+      net.send(c, out, timeout: 60.0) else return
+    if broken: return
+    if at == buf.len:
+      buf = ""
+    elif at > 0:
+      buf = buf[at..buf.len]
+
+# ./server PORT serves HTTP; ./server PORT CERT KEY serves HTTPS with that certificate and key (PEM files).
+fn main(net: Net, fs: Fs) throws:
+  let cert_file = arg(2, "")
+  var l: Listener? = nil
+  if cert_file == "":
+    l = net.listen(arg(1, 8080))?
+  else:
+    let cert = fs.read(cert_file)?
+    let key = fs.read(arg(3, ""))?
+    l = net.tls_listen(arg(1, 8080), cert: cert, key: key)?
+  if listener = l:
+    serve_all(net, listener)
+
+fn serve_all(net: Net, l: Listener):
+  while true:
+    let c = net.accept(l) else continue
+    spawn serve(net, c)

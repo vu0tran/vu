@@ -1,0 +1,1231 @@
+# ============================================================================ expressions
+
+fn all_text(e: Node) -> Bool:
+  for k in e.kids:
+    if k.k != "text": return false
+  return true
+
+fn text_of(e: Node) -> Str:
+  var s = ""
+  for k in e.kids: s += k.v
+  return s
+
+fn has_frozen(g: G, v: Int, mode: Str) -> Bool:
+  for f in g.vars[v].frozen:
+    if f.mode == mode: return true
+  return false
+
+fn place(var g: G, e: Node) -> Place:
+  if e.k == "try" and e.id in g.hoisted:
+    let hv = lookup(g, g.hoisted[e.id])
+    return Place(true, hv, var_lv(g, hv), g.vars[hv].ty + "", true, false)
+  if e.k == "name":
+    let v = lookup(g, e.name)
+    if v >= 0: return Place(true, v, var_lv(g, v), g.vars[v].ty + "", true, false)
+    return no_place()
+  if e.k == "field":
+    let b = place(&g, e.kids[0])
+    if not b.ok: return no_place()
+    let bk = tkind(g, b.ty)
+    if ((bk == "list" or bk == "map") and e.name == "len") or b.ty == "Str": return no_place()
+    let ft = field_type(g, b.ty, e.name, e.line)
+    if bk == "shared": return Place(true, b.root, "(" + b.code + ")->v", ft, false, true)   # read-only, from any thread
+    return Place(true, b.root, b.code + "." + cf(e.name), ft, false, b.ro)
+  if e.k == "index":
+    if g.par_on and e.kids[0].k == "name" and e.kids[1].k == "name" and e.kids[1].name == g.par_var:
+      let v = lookup(g, e.kids[0].name)
+      if v >= 0 and has_frozen(g, v, "part"): return par_elem(&g, v, e)
+    pure_index(&g, e.kids[1])
+    let b = place(&g, e.kids[0])
+    if not b.ok or b.ty == "Str": return no_place()
+    if tkind(g, b.ty) == "map":
+      let kr = key_ref(&g, e.kids[1], map_key(b.ty), e.line)
+      if kr == "": return no_place()
+      return Place(true, b.root, "(*vu_mget_" + mg(g, b.ty) + "(&" + b.code + ", " + kr + ", {e.line}))", map_val(b.ty), false, b.ro)
+    if tkind(g, b.ty) != "list":
+      err(g, e.line, "can't index a " + tn(b.ty) + "; only lists, strings and maps can be indexed")
+    let i = value(&g, e.kids[1], "Int")
+    return Place(true, b.root, "(*vu_at_" + mg(g, b.ty) + "(&" + b.code + ", " + i.code + ", {e.line}))", inner_of(b.ty), false, b.ro)
+  return no_place()
+
+# A pointer to a map key, written inline (inside m[k], no temporaries can be made); "" if impossible.
+fn key_ref(var g: G, e: Node, key: Str, line: Int) -> Str:
+  if key == "Str":
+    let p = place(&g, e)
+    if p.ok:
+      read_check(g, p, line)
+      if p.ty != "Str": err(g, line, "this map has Str keys, not " + tn(p.ty))
+      return "&" + p.code
+    if e.k == "str" and all_text(e):
+      let text = text_of(e)
+      return "&(vu_str){{(uint8_t *)" + cstr(text) + ", {text.len}, 0}}"
+    return ""
+  let c = value(&g, e, key)
+  return "&(" + ct(g, key) + "){{" + c.code + "}}"
+
+fn key_begin(var g: G, e: Node, key: Str) -> Bw:
+  let b = bw_begin(&g, e, key)
+  if b.ty != key: err(g, e.line, "this map has " + tn(key) + " keys, not " + tn(b.ty))
+  return b
+
+fn key_ptr(g: G, b: Bw, key: Str) -> Str:
+  if b.p.ok or key == "Str": return "&" + b.code
+  return "&(" + ct(g, key) + "){{" + b.code + "}}"
+
+# Is e (or the place it is part of) m[k] with a computed Str key? Those can be read but not changed.
+fn computed_key(var g: G, e: Node) -> Bool:
+  if e.k != "field" and e.k != "index": return false
+  if e.k == "index":
+    let mt = probe_type(&g, e.kids[0])
+    if mt != "" and tkind(g, mt) == "map" and map_key(mt) == "Str":
+      if place(&g, e.kids[0]).ok:
+        if not place(&g, e).ok: return true
+  return computed_key(&g, e.kids[0])
+
+# xs[i] inside `par for i`: iteration i owns this element, so it may read and write it.
+fn par_elem(var g: G, v: Int, e: Node) -> Place:
+  let vty = g.vars[v].ty
+  if tkind(g, vty) != "list": err(g, e.line, "can't index a " + tn(vty) + "; only lists can be indexed")
+  var pv = -1
+  if v in g.par_elems: pv = g.par_elems[v]
+  if pv < 0:
+    pv = new_var(&g, g.vars[v].name + "[" + g.par_var + "]", inner_of(vty), "", "elem", g.vars[v].mutable, false, e.line)
+    g.vars[pv].base = v
+    var fz: [Frz] = []
+    for f in g.vars[v].frozen:
+      if f.mode != "par" and f.mode != "part": fz.push(Frz(f.mode, f.line))
+    g.vars[pv].frozen = fz
+    g.vars[pv].state = g.vars[v].state + ""
+    g.vars[pv].moved_line = g.vars[v].moved_line
+    g.par_elems[v] = pv
+  let i = lookup(g, g.par_var)
+  return Place(true, pv, "(*vu_at_" + mg(g, vty) + "(&" + var_lv(g, v) + ", " + g.vars[i].cname + ", {e.line}))", inner_of(vty), false, false)
+
+# The type of e, without keeping any ownership effects of generating it.
+fn probe_type(var g: G, e: Node) -> Str:
+  var t = ""
+  if e.id in g.tcache: t = g.tcache[e.id] + ""
+  if t == "": t = static_type(&g, e)
+  if t != "": return t
+  let snap = snapshot(g)
+  let r = gen(&g, e, "")
+  restore(&g, snap)
+  return r.ty
+
+fn static_type(var g: G, e: Node) -> Str:
+  if not (e.id in g.scache):
+    let t = static_type_uncached(&g, e)
+    g.scache[e.id] = t
+  return g.scache[e.id] + ""
+
+fn static_type_uncached(var g: G, e: Node) -> Str:
+  let k = e.k
+  if k == "int": return "Int"
+  if k == "float": return "Float"
+  if k == "bool": return "Bool"
+  if k == "char": return "Byte"
+  if k == "str" or k == "slice": return "Str"
+  if k == "nil": return "~nil"
+  if k == "name":
+    let v = lookup(g, e.name)
+    if v >= 0: return g.vars[v].ty + ""
+    if e.name in g.variants:
+      if g.variants[e.name] in g.gtype_nodes: return ""
+      return g.variants[e.name] + ""
+    if e.name in g.consts: return g.consts[e.name] + ""
+    return ""
+  if k == "try" or k == "orelse": return static_type(&g, e.kids[0])
+  if k == "un":
+    if e.op == "not": return "Bool"
+    return static_type(&g, e.kids[0])
+  if k == "bin":
+    let op = e.op
+    if op == "and" or op == "or" or op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=" or op == "in": return "Bool"
+    if op == "*" and e.kids[0].k == "list": return ""
+    if is_lit(e.kids[0]):
+      var rt = "Int"
+      if not is_lit(e.kids[1]): rt = static_type(&g, e.kids[1])
+      if rt == "": return ""
+      if rt == "Float" or rt == "Byte": return rt
+      return "Int"
+    return static_type(&g, e.kids[0])
+  if k == "field":
+    let bt = static_type(&g, e.kids[0])
+    if bt == "": return ""
+    let bk = tkind(g, bt)
+    if (bk == "list" or bk == "map" or bt == "Str") and e.name == "len": return "Int"
+    if bk == "struct": return struct_field(g, bt, e.name)
+    if bk == "shared" and e.name == "value": return inner_of(bt)
+    return ""
+  if k == "index":
+    let bt = static_type(&g, e.kids[0])
+    if bt == "Str": return "Byte"
+    if bt != "" and tkind(g, bt) == "map": return map_val(bt)
+    if bt != "" and tkind(g, bt) == "list": return inner_of(bt)
+    return ""
+  if k == "call":
+    let f = e.kids[0]
+    if f.k == "name" and lookup(g, f.name) >= 0:
+      let v = lookup(g, f.name)
+      let vk = tkind(g, g.vars[v].ty)
+      if vk == "fn" or vk == "lfn": return fn_parts(g.vars[v].ty).ret
+      return ""
+    if f.k == "field" or f.k == "index" or f.k == "call":
+      let ft = static_type(&g, f)
+      if ft != "" and (tkind(g, ft) == "fn" or tkind(g, ft) == "lfn"): return fn_parts(ft).ret
+    if f.k == "name":
+      if f.name in g.fns: return g.fns[f.name].ret + ""
+      if f.name in g.gfn_nodes:
+        if e.id in g.gcache: return g.fns[g.gcache[e.id]].ret + ""
+        return ""
+      if f.name in g.structs: return f.name + ""
+      if f.name in g.variants:
+        if g.variants[f.name] in g.gtype_nodes: return ""
+        return g.variants[f.name] + ""
+      if f.name == "str": return "Str"
+      if f.name == "sqrt" or f.name == "float": return "Float"
+      if f.name == "int" or f.name == "arg": return "Int"
+      if f.name == "byte": return "Byte"
+      return ""
+    if f.k == "field" and f.name == "read": return "Str"
+    if f.k == "field" and f.name == "remove": return "Bool"
+    if f.k == "field" and f.name == "get":
+      let mt = static_type(&g, f.kids[0])
+      if mt != "" and tkind(g, mt) == "map": return map_val(mt)
+      return ""
+  return ""
+
+fn gen(var g: G, e: Node, expect: Str) -> GR:
+  let p = place(&g, e)
+  if p.ok:
+    read_check(g, p, e.line)
+    g.tcache[e.id] = p.ty + ""
+    return GR(p.code, p.ty, p)
+  let r = gen_kind(&g, e, expect)
+  if expect == "": g.tcache[e.id] = r.ty + ""
+  return GR(r.code, r.ty, no_place())
+
+fn gen_kind(var g: G, e: Node, expect: Str) -> CT:
+  let k = e.k
+  if k == "int": return g_int(&g, e, expect)
+  if k == "char": return CT("((uint8_t){e.ival})", "Byte")
+  if k == "float": return g_float(&g, e)
+  if k == "bool":
+    if e.flag: return CT("true", "Bool")
+    return CT("false", "Bool")
+  if k == "nil": return CT("NULL", "~nil")
+  if k == "name": return g_name(&g, e, expect)
+  if k == "str": return str_build(&g, e)
+  if k == "ref": return die_ct(g, e.line, "'&' marks an argument for a 'var' parameter; it can only appear directly in a call")
+  if k == "un": return g_un(&g, e, expect)
+  if k == "bin": return g_bin(&g, e, expect)
+  if k == "field": return g_field(&g, e)
+  if k == "index": return g_index(&g, e)
+  if k == "slice": return g_slice(&g, e)
+  if k == "list": return g_list(&g, e, expect)
+  if k == "map": return g_map(&g, e, expect)
+  if k == "try": return die_ct(g, e.line, "'?' must be applied to a whole value on its own: let v = f(x)?, x = f(x)?, return f(x)?, or f(x)? on its own line")
+  if k == "orelse": return g_orelse(&g, e, expect)
+  if k == "call": return g_call(&g, e, expect)
+  if k == "lambda": return g_lambda(&g, e, expect)
+  return die_ct(g, e.line, "internal error: can't generate " + k)
+
+fn value(var g: G, e: Node, expect: Str) -> CT:
+  let r = gen(&g, e, expect)
+  if r.ty == "~void": err(g, e.line, "this call doesn't produce a value")
+  var code = r.code + ""
+  if r.p.ok and not is_copy(g, r.ty): code = move_place(&g, r.p, e.line)
+  return coerce(g, code, r.ty, expect, e.line)
+
+fn conv_hint(a: Str, b: Str) -> Str:
+  if (a == "Int" and b == "Float") or (a == "Float" and b == "Int"): return "; convert with float(x) or int(x)"
+  if (a == "Int" and b == "Byte") or (a == "Byte" and b == "Int"): return "; convert with byte(x) or int(x)"
+  return ""
+
+fn coerce(g: G, code: Str, t: Str, expect: Str, line: Int) -> CT:
+  if expect == "" or t == expect: return CT(code, t)
+  if tkind(g, t) == "lfn": lfn_escape(g, line)
+  if tkind(g, expect) == "opt":
+    if t == "~nil": return CT("NULL", expect)
+    if t == inner_of(expect): return CT("vu_box_" + box_name(g, t) + "(" + code + ")", expect)
+  return die_ct(g, line, "expected " + tn(expect) + ", found " + tn(t) + conv_hint(t, expect))
+
+# Read e without taking ownership (the first half of with_borrow).
+fn bw_begin(var g: G, e: Node, expect: Str) -> Bw:
+  let r = gen(&g, e, expect)
+  if r.p.ok and effects(&g, e):
+    let pv = tmp(&g)
+    return Bw(1, "(*" + pv + ")", r.ty, r.code, pv, copy_place(r.p))
+  if r.p.ok or is_copy(g, r.ty):
+    return Bw(2, r.code, r.ty, r.code, "", copy_place(r.p))
+  let tv = tmp(&g)
+  return Bw(3, tv + "", r.ty, r.code, tv, copy_place(r.p))
+
+fn bw_end(var g: G, e: Node, b: Bw, rc: Str, rt: Str) -> CT:
+  if b.mode == 1:
+    if g.vars[b.p.root].state != "no":
+      err(g, e.line, "'" + g.vars[b.p.root].name + "' is used here and moved by another part of the same expression")
+    if rt == "~void": return CT("({{ " + ct(g, b.ty) + " *" + b.tv + " = &" + b.gcode + "; " + rc + "; }})", "~void")
+    let rv = tmp(&g)
+    return CT("({{ " + ct(g, b.ty) + " *" + b.tv + " = &" + b.gcode + "; " + ct(g, rt) + " " + rv + " = " + rc + "; " + rv + "; }})", rt)
+  if b.mode == 2:
+    if b.p.ok and g.vars[b.p.root].state != "no":
+      err(g, e.line, "'" + g.vars[b.p.root].name + "' is used here and moved by another part of the same expression")
+    return CT(rc, rt)
+  let dr = drop_code(g, b.ty, b.tv)
+  if rt == "~void": return CT("({{ " + ct(g, b.ty) + " " + b.tv + " = " + b.gcode + "; " + rc + "; " + dr + " }})", "~void")
+  let rv = tmp(&g)
+  return CT("({{ " + ct(g, b.ty) + " " + b.tv + " = " + b.gcode + "; " + ct(g, rt) + " " + rv + " = " + rc + "; " + dr + " " + rv + "; }})", rt)
+
+fn wrap(var g: G, pre: [Str], expr: Str, post: [Str], ret: Str) -> CT:
+  if pre.len == 0 and post.len == 0: return CT(expr, ret)
+  let body = join(pre, " ")
+  if ret == "~void": return CT("({{ " + body + " " + expr + "; " + join(post, " ") + " }})", "~void")
+  let rv = tmp(&g)
+  return CT("({{ " + body + " " + ct(g, ret) + " " + rv + " = " + expr + "; " + join(post, " ") + " " + rv + "; }})", ret)
+
+# True if evaluating e could change state (calls, moves), so evaluation order matters.
+fn effects(var g: G, e: Node) -> Bool:
+  if e.k == "try" and e.id in g.hoisted: return false   # already evaluated, into its hidden variable
+  if e.id in g.ecache: return g.ecache[e.id]
+  let r = effects_uncached(&g, e)
+  g.ecache[e.id] = r
+  return r
+
+fn effects_uncached(var g: G, e: Node) -> Bool:
+  let k = e.k
+  if k == "int" or k == "float" or k == "bool" or k == "nil" or k == "char": return false
+  if k == "str":
+    for part in e.kids:
+      if part.k == "part":
+        if effects(&g, part.kids[0]): return true
+    return false
+  if k == "slice":
+    return (e.kids[0].k != "name" and effects(&g, e.kids[0])) or effects(&g, e.kids[1]) or effects(&g, e.kids[2])
+  if k == "name":
+    let v = lookup(g, e.name)
+    return v >= 0 and not is_copy(g, g.vars[v].ty)
+  if k == "call":
+    if e.kids[0].k == "name" and is_pure_builtin(e.kids[0].name):
+      for i in 1..e.kids.len:
+        if effects(&g, e.kids[i].kids[0]): return true
+      return false
+    return true
+  if k == "field" or k == "ref": return e.kids[0].k != "name" and effects(&g, e.kids[0])
+  if k == "index": return (e.kids[0].k != "name" and effects(&g, e.kids[0])) or effects(&g, e.kids[1])
+  if k == "un": return effects(&g, e.kids[0])
+  if k == "bin": return effects(&g, e.kids[0]) or effects(&g, e.kids[1])
+  return true
+
+fn is_lit(e: Node) -> Bool:
+  return e.k == "int" or (e.k == "un" and e.op == "-" and e.kids[0].k == "int")
+
+fn g_int(var g: G, e: Node, expect: Str) -> CT:
+  if e.big: err(g, e.line, "integer literal is too large for Int")
+  if expect == "Float": return CT("{e.ival}.0", "Float")
+  if expect == "Byte":
+    if e.ival > 255: err(g, e.line, "{e.ival} does not fit in a Byte (0..255)")
+    return CT("((uint8_t){e.ival})", "Byte")
+  if e.ival < 2147483648: return CT("{e.ival}", "Int")
+  return CT("INT64_C({e.ival})", "Int")
+
+fn g_float(var g: G, e: Node) -> CT:
+  let f = float(e.v) else 0.0
+  if f > 1.7976931348623157e308: err(g, e.line, e.v + " is too large for a Float")
+  return CT(e.v + "", "Float")
+
+fn g_name(var g: G, e: Node, expect: Str) -> CT:
+  if e.name in g.variants:
+    var en = g.variants[e.name] + ""
+    if en in g.gtype_nodes:
+      let known = expect_of(g, expect, en)
+      if known == "":
+        for vn in g.gtype_nodes[en].kids:
+          if vn.name == e.name and vn.kids.len > 0: err(g, e.line, disp(e.name) + " holds values; create it with " + disp(e.name) + "(...)")
+        err(g, e.line, "can't tell which " + disp(en) + " this " + disp(e.name) + " is; give it a type, like: let x: " + disp(en) + "[" + join(g.gtype_nodes[en].names, ", ") + "] = " + disp(e.name) + " (with real types)")
+      en = known
+    let k = variant_index(g, en, e.name)
+    if g.enums[en].variants[k].fields.len > 0:
+      err(g, e.line, disp(e.name) + " holds values; create it with " + disp(e.name) + "(...)")
+    return CT("((T_" + en + "){{.tag = {k}}})", en)
+  if e.name in g.enums or (e.name in g.gtype_nodes and g.gtype_nodes[e.name].k == "enum"): err(g, e.line, "'" + disp(e.name) + "' is an enum type; use one of its variants")
+  if e.name in g.consts: return CT("C_" + e.name, g.consts[e.name])
+  if e.name in g.fns or e.name in g.gfn_nodes: return fn_value(&g, e, expect)
+  if e.name in g.structs: err(g, e.line, "'" + disp(e.name) + "' is a type; create one with " + disp(e.name) + "(...)")
+  return die_ct(g, e.line, "unknown name '" + disp(e.name) + "'")
+
+# A string literal, with any {interpolations}, as an owned Str value.
+fn str_build(var g: G, e: Node) -> CT:
+  if all_text(e):
+    let text = text_of(e)
+    return CT("vu_str_lit(" + cstr(text) + ", {text.len})", "Str")
+  let tv = tmp(&g)
+  var sl: [Str] = []
+  sl.push("vu_str " + tv + " = {{0}};")
+  for part in e.kids:
+    if part.k == "text":
+      sl.push("vu_str_cat_bytes(&" + tv + ", (const uint8_t *)" + cstr(part.v) + ", {part.v.len});")
+      continue
+    let x = part.kids[0]
+    if probe_type(&g, x) == "Str":
+      if part.name != "" or part.name2 != "" or part.op != "" or part.prec != -1:
+        err(g, x.line, "format specs like :8 apply to numbers, not strings")
+      let b = bw_begin(&g, x, "")
+      let r = bw_end(&g, x, b, "vu_str_cat(&" + tv + ", &" + b.code + ")", "~void")
+      sl.push(r.code + ";")
+    else:
+      let fo = fmt_one(&g, x, part)
+      if fo.code == "%lld":
+        # a plain {n}: digits without printf
+        sl.push("vu_str_cat_int(&" + tv + ", " + fo.ty + ");")
+      else:
+        sl.push("vu_str_catf(&" + tv + ", " + cstr(fo.code) + ", " + fo.ty + ");")
+  return CT("({{ " + join(sl, " ") + " " + tv + "; }})", "Str")
+
+# Str + Str (a new string) and string comparisons, without taking ownership of either side.
+fn str_op(var g: G, e: Node) -> CT:
+  let bl = bw_begin(&g, e.kids[0], "")
+  let br = bw_begin(&g, e.kids[1], "")
+  if br.ty != "Str":
+    err(g, e.line, "can't use '" + e.op + "' on Str and " + tn(br.ty) + "; put values in a string with \"{{x}}\"")
+  var rc = ""
+  var rt = "Bool"
+  if e.op == "+":
+    rc = "vu_str_concat(&" + bl.code + ", &" + br.code + ")"
+    rt = "Str"
+  elif e.op == "==": rc = "(vu_str_eq(&" + bl.code + ", &" + br.code + "))"
+  elif e.op == "!=": rc = "(!vu_str_eq(&" + bl.code + ", &" + br.code + "))"
+  else: rc = "(vu_str_cmp(&" + bl.code + ", &" + br.code + ") " + e.op + " 0)"
+  let inner = bw_end(&g, e.kids[1], br, rc, rt)
+  return bw_end(&g, e.kids[0], bl, inner.code, inner.ty)
+
+fn g_un(var g: G, e: Node, expect: Str) -> CT:
+  if e.op == "-":
+    var ex = ""
+    if expect == "Int" or expect == "Float": ex = expect + ""
+    let c = value(&g, e.kids[0], ex)
+    if c.ty != "Int" and c.ty != "Float": err(g, e.line, "can't negate a " + tn(c.ty))
+    if c.ty == "Int": return CT("vu_neg(" + c.code + ", {e.line})", c.ty)
+    return CT("(-" + c.code + ")", c.ty)
+  let c = value(&g, e.kids[0], "Bool")
+  return CT("(!" + c.code + ")", "Bool")
+
+type Ops:
+  l, lt, r, rt: Str
+
+# Generate both operands; an Int literal next to a Float becomes a Float.
+fn operands(var g: G, left: Node, right: Node, expect: Str) -> Ops:
+  if is_lit(left) and not is_lit(right):
+    let r = value(&g, right, "")
+    var ex = ""
+    if r.ty == "Float" or r.ty == "Byte": ex = r.ty + ""
+    let l = value(&g, left, ex)
+    return Ops(l.code, l.ty, r.code, r.ty)
+  let both = is_lit(left) and is_lit(right)
+  var ex = ""
+  if (expect == "Float" or expect == "Byte") and both: ex = expect + ""
+  let l = value(&g, left, ex)
+  var ex2 = ""
+  if (l.ty == "Float" or l.ty == "Byte") and is_lit(right): ex2 = l.ty + ""
+  let r = value(&g, right, ex2)
+  return Ops(l.code, l.ty, r.code, r.ty)
+
+fn int_op(op: Str) -> Str:
+  if op == "+": return "vu_add"
+  if op == "-": return "vu_sub"
+  if op == "*": return "vu_mul"
+  if op == "/": return "vu_div"
+  if op == "%": return "vu_mod"
+  if op == "<<": return "vu_shl"
+  if op == ">>": return "vu_shr"
+  return ""
+
+fn byte_op(op: Str) -> Str:
+  if op == "+": return "vu_badd"
+  if op == "-": return "vu_bsub"
+  if op == "*": return "vu_bmul"
+  if op == "/": return "vu_bdiv"
+  if op == "%": return "vu_bmod"
+  if op == "<<": return "vu_bshl"
+  if op == ">>": return "vu_bshr"
+  return ""
+
+fn g_bin(var g: G, e: Node, expect: Str) -> CT:
+  let op = e.op
+  if op == "and" or op == "or":
+    let l = value(&g, e.kids[0], "Bool")
+    let snap = snapshot(g)
+    let r = value(&g, e.kids[1], "Bool")
+    let now = snapshot(g)
+    merge2(&g, snap, now)
+    var cop = "&&"
+    if op == "or": cop = "||"
+    return CT("(" + l.code + " " + cop + " " + r.code + ")", "Bool")
+  if (op == "==" or op == "!=") and (e.kids[0].k == "nil" or e.kids[1].k == "nil"):
+    var oi = 0
+    if e.kids[0].k == "nil": oi = 1
+    let b = bw_begin(&g, e.kids[oi], "")
+    if tkind(g, b.ty) != "opt": err(g, e.line, "only optional values can be compared with nil (this is " + tn(b.ty) + ")")
+    return bw_end(&g, e.kids[oi], b, "(" + b.code + " " + op + " NULL)", "Bool")
+  if op == "*" and e.kids[0].k == "list": return repeat(&g, e, expect)
+  if op == "in":
+    let bm = bw_begin(&g, e.kids[1], "")
+    if tkind(g, bm.ty) != "map": err(g, e.line, "'in' checks whether a key is in a map; this is " + tn(bm.ty))
+    let key = map_key(bm.ty)
+    let kb = key_begin(&g, e.kids[0], key)
+    let inner = bw_end(&g, e.kids[0], kb, "vu_mhas_" + mg(g, bm.ty) + "(&" + bm.code + ", " + key_ptr(g, kb, key) + ")", "Bool")
+    return bw_end(&g, e.kids[1], bm, inner.code, inner.ty)
+  if op == "+" or op == "==" or op == "!=" or op == "<" or op == ">" or op == "<=" or op == ">=":
+    if probe_type(&g, e.kids[0]) == "Str": return str_op(&g, e)
+  let o = operands(&g, e.kids[0], e.kids[1], expect)
+  var l = o.l + ""
+  var r = o.r + ""
+  let lt = o.lt
+  let rt = o.rt
+  let conv = conv_hint(lt, rt)
+  if (op == "==" or op == "!=") and lt == rt and tkind(g, lt) == "enum":
+    if not enum_plain(g, lt): err(g, e.line, lt + " variants hold values, so compare them with match instead of '" + op + "'")
+    return CT("(" + l + ".tag " + op + " " + r + ".tag)", "Bool")
+  var res = ""
+  if op == "==" or op == "!=":
+    if lt != rt or not is_scalar(lt): err(g, e.line, "can't compare " + tn(lt) + " with " + tn(rt) + " using '" + op + "'" + conv)
+    res = "Bool"
+  elif op == "<" or op == ">" or op == "<=" or op == ">=":
+    if lt != rt or not (lt == "Int" or lt == "Float" or lt == "Byte"):
+      err(g, e.line, "can't compare " + tn(lt) + " with " + tn(rt) + " using '" + op + "'" + conv)
+    res = "Bool"
+  elif op == "<<" or op == ">>":
+    if not is_integer(lt) or not is_integer(rt):
+      err(g, e.line, "'" + op + "' needs an Int or Byte on the left and a shift amount on the right")
+    res = lt + ""
+  elif op == "&" or op == "|" or op == "^":
+    if lt != rt or not is_integer(lt):
+      var hint = conv + ""
+      if lt == "Bool" or rt == "Bool": hint = " (use 'and' / 'or' for Bool)"
+      err(g, e.line, "'" + op + "' needs two Ints or two Bytes" + hint)
+    res = lt + ""
+  else:
+    if lt != rt or not (lt == "Int" or lt == "Float" or lt == "Byte"):
+      err(g, e.line, "can't apply '" + op + "' to " + tn(lt) + " and " + tn(rt) + conv)
+    if op == "%" and lt == "Float": err(g, e.line, "'%' needs Int operands")
+    res = lt + ""
+  var pre: [Str] = []
+  if effects(&g, e.kids[0]) or effects(&g, e.kids[1]):
+    let a = tmp(&g)
+    let b = tmp(&g)
+    pre.push(ct(g, lt) + " " + a + " = " + l + ";")
+    pre.push(ct(g, rt) + " " + b + " = " + r + ";")
+    l = a
+    r = b
+  var fname = ""
+  if lt == "Int" and res == "Int": fname = int_op(op)
+  elif lt == "Byte" and res == "Byte": fname = byte_op(op)
+  var x = ""
+  if fname != "": x = fname + "(" + l + ", " + r + ", {e.line})"
+  elif res == "Byte": x = "((uint8_t)(" + l + " " + op + " " + r + "))"
+  else: x = "(" + l + " " + op + " " + r + ")"
+  if pre.len > 0: x = "({{ " + join(pre, " ") + " " + x + "; }})"
+  return CT(x, res)
+
+# [a, b] * n -> a new list holding n copies of the elements (plain-data elements only).
+fn repeat(var g: G, e: Node, expect: Str) -> CT:
+  let lc = g_list(&g, e.kids[0], expect)
+  if not is_copy(g, inner_of(lc.ty)):
+    err(g, e.line, "only lists of plain values (Int, Float, Bool, plain structs) can be repeated with '*', not " + tn(lc.ty))
+  let n = value(&g, e.kids[1], "Int")
+  let tv = tmp(&g)
+  return CT("({{ " + ct(g, lc.ty) + " " + tv + " = " + lc.code + "; vu_rep_" + mg(g, lc.ty) + "(" + tv + ", " + n.code + ", {e.line}); }})", lc.ty)
+
+fn g_field(var g: G, e: Node) -> CT:
+  if e.name == "len" and e.kids[0].k == "name":
+    let v = lookup(g, e.kids[0].name)
+    if v >= 0 and tkind(g, g.vars[v].ty) == "list" and has_frozen(g, v, "part"):
+      return CT("(" + var_lv(g, v) + ").len", "Int")
+  let b = bw_begin(&g, e.kids[0], "")
+  let t = b.ty
+  let k = tkind(g, t)
+  var rc = ""
+  var rt = ""
+  if k == "shared":
+    field_type(g, t, e.name, e.line)
+    err(g, e.line, "read .value through a variable or field holding the Shared value (let s = ... first), so the value stays alive while it's read")
+  if t == "Str" or k == "list":
+    if e.name != "len": field_type(g, t, e.name, e.line)
+    rc = "(" + b.code + ").len"
+    rt = "Int"
+  elif k == "map":
+    if e.name != "len": field_type(g, t, e.name, e.line)
+    rc = "(" + b.code + ").live"
+    rt = "Int"
+  else:
+    let ft = field_type(g, t, e.name, e.line)
+    if not b.p.ok and not is_copy(g, t) and ft == "Str":
+      rc = "vu_str_dup(&(" + b.code + ")." + cf(e.name) + ")"
+    else:
+      if not b.p.ok and not is_copy(g, t) and not is_copy(g, ft):
+        err(g, e.line, "can't take field '" + e.name + "' out of a temporary " + tn(t) + "; store it in a variable first")
+      rc = "(" + b.code + ")." + cf(e.name)
+    rt = ft
+  return bw_end(&g, e.kids[0], b, rc, rt)
+
+fn g_index(var g: G, e: Node) -> CT:
+  let b = bw_begin(&g, e.kids[0], "")
+  pure_index(&g, e.kids[1])
+  let t = b.ty
+  let k = tkind(g, t)
+  if t == "Str":
+    let i = value(&g, e.kids[1], "Int")
+    return bw_end(&g, e.kids[0], b, "vu_str_at(&" + b.code + ", " + i.code + ", {e.line})", "Byte")
+  if k == "map":
+    let key = map_key(t)
+    let val = map_val(t)
+    if not b.p.ok and val == "Str":
+      let kb = key_begin(&g, e.kids[1], key)
+      let inner = bw_end(&g, e.kids[1], kb, "vu_str_dup(vu_mget_" + mg(g, t) + "(&" + b.code + ", " + key_ptr(g, kb, key) + ", {e.line}))", "Str")
+      return bw_end(&g, e.kids[0], b, inner.code, inner.ty)
+    if not b.p.ok and not is_copy(g, val):
+      err(g, e.line, "can't take a value out of a temporary map; store the map in a variable first")
+    if not is_copy(g, val) and key == "Str":
+      if key_ref(&g, e.kids[1], "Str", e.line) == "":
+        err(g, e.line, "to use a " + tn(val) + " stored in a map, put the key in a variable first: let k = ...; then m[k]")
+    let kb = key_begin(&g, e.kids[1], key)
+    let inner = bw_end(&g, e.kids[1], kb, "(*vu_mget_" + mg(g, t) + "(&" + b.code + ", " + key_ptr(g, kb, key) + ", {e.line}))", val)
+    return bw_end(&g, e.kids[0], b, inner.code, inner.ty)
+  if k != "list": err(g, e.line, "can't index a " + tn(t) + "; only lists and strings can be indexed")
+  let et = inner_of(t)
+  if not b.p.ok and et == "Str":
+    let i = value(&g, e.kids[1], "Int")
+    return bw_end(&g, e.kids[0], b, "vu_str_dup(vu_at_" + mg(g, t) + "(&" + b.code + ", " + i.code + ", {e.line}))", "Str")
+  if not b.p.ok and not is_copy(g, et):
+    err(g, e.line, "can't take an element out of a temporary list; store the list in a variable first")
+  let i = value(&g, e.kids[1], "Int")
+  return bw_end(&g, e.kids[0], b, "(*vu_at_" + mg(g, t) + "(&" + b.code + ", " + i.code + ", {e.line}))", et)
+
+fn g_slice(var g: G, e: Node) -> CT:
+  let b = bw_begin(&g, e.kids[0], "")
+  if b.ty != "Str": err(g, e.line, "slices like s[a..b] work on strings in v0, not " + tn(b.ty))
+  pure_index(&g, e.kids[1])
+  pure_index(&g, e.kids[2])
+  let lo = value(&g, e.kids[1], "Int")
+  let hi = value(&g, e.kids[2], "Int")
+  return bw_end(&g, e.kids[0], b, "vu_str_slice(&" + b.code + ", " + lo.code + ", " + hi.code + ", {e.line})", "Str")
+
+fn g_list(var g: G, e: Node, expect0: Str) -> CT:
+  var expect = expect0 + ""
+  if expect != "" and tkind(g, expect) == "opt": expect = inner_of(expect)   # built as a list, then boxed
+  var et = ""
+  if expect != "" and tkind(g, expect) == "list": et = inner_of(expect)
+  if e.kids.len == 0 and et == "": err(g, e.line, "can't tell the type of an empty list; write it like: let xs: [Int] = []")
+  var codes: [Str] = []
+  for it in e.kids:
+    let c = value(&g, it, et)
+    if et == "":
+      if c.ty == "~nil": err(g, it.line, "can't tell the type of nil here; give the list a type: let xs: [T?] = [...]")
+      et = c.ty + ""
+      if tkind(g, et) == "lfn": lfn_escape(g, it.line)
+    codes.push(c.code)
+  let lt = reg(&g, "[" + et + "]")
+  let tv = tmp(&g)
+  let m = mg(g, lt)
+  var pushes: [Str] = []
+  for c in codes: pushes.push("vu_push_" + m + "(&" + tv + ", " + c + ");")
+  return CT("({{ " + ct(g, lt) + " " + tv + " = {{0}}; " + join(pushes, " ") + " " + tv + "; }})", lt)
+
+fn g_map(var g: G, e: Node, expect0: Str) -> CT:
+  var expect = expect0 + ""
+  if expect != "" and tkind(g, expect) == "opt": expect = inner_of(expect)
+  var key = ""
+  var val = ""
+  if expect != "" and tkind(g, expect) == "map":
+    key = map_key(expect)
+    val = map_val(expect)
+  elif e.kids.len == 0:
+    err(g, e.line, "can't tell the type of an empty map; write it like: let m: {{Str: Int}} = {{}}")
+  else:
+    key = probe_type(&g, e.kids[0].kids[0])
+    val = probe_type(&g, e.kids[0].kids[1])
+    if tkind(g, val) == "lfn": lfn_escape(g, e.kids[0].kids[1].line)
+    if not is_map_key(key): err(g, e.line, "map keys can be Int, Byte, Bool or Str, not " + tn(key))
+  let mt = reg(&g, "{{" + key + ": " + val + "}}")
+  let tv = tmp(&g)
+  let m = mg(g, mt)
+  var sl: [Str] = []
+  for pair in e.kids:
+    let vc = value(&g, pair.kids[1], val)
+    let vt = tmp(&g)
+    let kb = key_begin(&g, pair.kids[0], key)
+    let put = bw_end(&g, pair.kids[0], kb, "vu_mset_" + m + "(&" + tv + ", " + key_ptr(g, kb, key) + ", " + vt + ", {e.line})", "~void")
+    sl.push("{{ " + ct(g, val) + " " + vt + " = " + vc.code + "; " + put.code + "; }}")
+  return CT("({{ " + m + " " + tv + " = {{0}}; " + join(sl, " ") + " " + tv + "; }})", mt)
+
+fn any_named(e: Node) -> Bool:
+  for i in 1..e.kids.len:
+    if e.kids[i].flag: return true
+  return false
+
+fn nargs_of(e: Node) -> Int:
+  return e.kids.len - 1
+
+fn map_method(var g: G, e: Node) -> CT:
+  let name = e.kids[0].name
+  if any_named(e): err(g, e.line, "." + name + "() takes positional arguments")
+  if name == "remove":
+    if nargs_of(e) != 1: err(g, e.line, "m.remove(key) takes one key")
+    let p = place(&g, e.kids[0].kids[0])
+    if not p.ok or tkind(g, p.ty) != "map": err(g, e.line, ".remove(key) works on a map stored in a variable")
+    write_check(g, p, e.line, false)
+    let key = map_key(p.ty)
+    let kb = key_begin(&g, e.kids[1].kids[0], key)
+    return bw_end(&g, e.kids[1].kids[0], kb, "vu_mremove_" + mg(g, p.ty) + "(&" + p.code + ", " + key_ptr(g, kb, key) + ")", "Bool")
+  if nargs_of(e) != 2: err(g, e.line, "m.get(key, default) takes a key and a default value")
+  let bm = bw_begin(&g, e.kids[0].kids[0], "")
+  let mt = bm.ty
+  if tkind(g, mt) != "map": err(g, e.line, ".get(key, default) works on maps, not " + tn(mt))
+  let val = map_val(mt)
+  if not is_copy(g, val): err(g, e.line, "m.get(key, default) needs plain values; for " + tn(val) + " values use 'if k in m' and m[k]")
+  let key = map_key(mt)
+  let kb = key_begin(&g, e.kids[1].kids[0], key)
+  let d = value(&g, e.kids[2].kids[0], val)
+  let inner = bw_end(&g, e.kids[1].kids[0], kb, "vu_mgetor_" + mg(g, mt) + "(&" + bm.code + ", " + key_ptr(g, kb, key) + ", " + d.code + ")", val)
+  return bw_end(&g, e.kids[0].kids[0], bm, inner.code, inner.ty)
+
+fn construct_variant(var g: G, e: Node, vname: Str, expect: Str) -> CT:
+  var en = g.variants[vname] + ""
+  if en in g.gtype_nodes:
+    var vf: [Fld] = []
+    for vn in g.gtype_nodes[en].kids:
+      if vn.name == vname:
+        for fl in vn.kids: vf.push(Fld(fl.name, fl.ty))
+    en = ginfer(&g, e, en, vf, disp(vname) + "(...)", expect)
+  let k = variant_index(g, en, vname)
+  var fields: [Fld] = []
+  for f in g.enums[en].variants[k].fields: fields.push(Fld(f.name, f.ty))
+  if fields.len == 0: err(g, e.line, vname + " holds no values; write it without parentheses")
+  let fi = field_inits(&g, e, vname, fields)
+  var lit = ""
+  if boxed_key(en, k) in g.boxed:
+    lit = "((T_" + en + "){{.tag = {k}, .u.b{k} = vu_box_{k}_" + en + "((T_{k}_" + en + "){{" + join(fi.inits, ", ") + "}})}})"
+  else:
+    lit = "((T_" + en + "){{.tag = {k}, .u.v{k} = {{" + join(fi.inits, ", ") + "}}}})"
+  if fi.pre.len > 0: lit = "({{ " + join(fi.pre, " ") + " " + lit + "; }})"
+  return CT(lit, en)
+
+# float(s) / int(s) on a Str: reading a number from text, which can fail.
+fn parse_call(var g: G, e: Node) -> Bool:
+  if e.k != "call" or e.kids[0].k != "name": return false
+  let n = e.kids[0].name
+  if n != "float" and n != "int": return false
+  if e.kids.len != 2: return false
+  if lookup(g, n) >= 0: return false
+  return probe_type(&g, e.kids[1].kids[0]) == "Str"
+
+# Calling a function whose name a local variable has taken in this scope.
+fn not_shadowed(g: G, e: Node):
+  if e.k == "call" and e.kids[0].k == "name":
+    let fname = e.kids[0].name
+    let v = lookup(g, fname)
+    if v >= 0 and tkind(g, g.vars[v].ty) != "fn" and tkind(g, g.vars[v].ty) != "lfn" and (is_builtin(fname) or fname in g.fns or fname in g.gfn_nodes):
+      err(g, e.line, "'" + fname + "' is a variable here (line {lnum(g.vars[v].line)}), so the function " + disp(fname) + "() can't be called in this scope; rename the variable")
+
+fn is_chan_expr(var g: G, e: Node) -> Bool:
+  let t = probe_type(&g, e)
+  return tkind(g, t) == "chan"
+
+fn throwing_call(var g: G, e: Node) -> Bool:
+  not_shadowed(g, e)
+  if e.k == "call":
+    let vt = fn_value_type(&g, e)
+    if vt != "": return fn_parts(vt).fails
+  if e.k == "call" and e.kids[0].k == "field":
+    let n = e.kids[0].name
+    if n == "read" or n == "write" or n == "temp_dir": return probe_type(&g, e.kids[0].kids[0]) == "Fs"
+    if n == "run": return probe_type(&g, e.kids[0].kids[0]) == "Os"
+    if net_fails(n) and probe_type(&g, e.kids[0].kids[0]) == "Net": return true
+    if n == "recv" and is_chan_expr(&g, e.kids[0].kids[0]): return true
+  if parse_call(&g, e) or from_json_call(g, e): return true
+  if e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.gfn_nodes: return g.gfn_nodes[e.kids[0].name].flag
+  return e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.fns and g.fns[e.kids[0].name].fails
+
+# Code for a call that can fail, as a result value (R_T) whose .bad says whether it failed.
+fn throw_code(var g: G, call: Node, expect: Str) -> CT:
+  if fn_value_type(&g, call) != "": return call_value(&g, call, true)
+  if call.kids[0].k == "field" and call.kids[0].name == "run": return os_call(&g, call, true)
+  if call.kids[0].k == "field" and net_fails(call.kids[0].name) and probe_type(&g, call.kids[0].kids[0]) == "Net": return net_call(&g, call, true)
+  if call.kids[0].k == "field" and call.kids[0].name == "recv" and is_chan_expr(&g, call.kids[0].kids[0]): return chan_method(&g, call, true)
+  if call.kids[0].k == "field": return fs_call(&g, call, true)
+  if from_json_call(g, call): return b_from_json(&g, call, true)
+  if parse_call(&g, call):
+    var t = "Int"
+    if call.kids[0].name == "float":
+      t = "Float"
+      g.uses_float_parse = true
+    let rt = reg(&g, "!" + t)
+    let r = tmp(&g)
+    let a = call.kids[1].kids[0]
+    if a.k == "slice" and probe_type(&g, a.kids[0]) == "Str":
+      let b = bw_begin(&g, a.kids[0], "")
+      pure_index(&g, a.kids[1])
+      pure_index(&g, a.kids[2])
+      let lo = value(&g, a.kids[1], "Int")
+      let hi = value(&g, a.kids[2], "Int")
+      let code = "({{ " + ct(g, rt) + " " + r + " = {{0}}; " + r + ".bad = !vu_parse_" + call.kids[0].name + "_at(&" + b.code + ", " + lo.code + ", " + hi.code + ", &" + r + ".val, &" + r + ".err, {call.line}); " + r + "; }})"
+      return bw_end(&g, a.kids[0], b, code, rt)
+    let b = bw_begin(&g, a, "")
+    let code = "({{ " + ct(g, rt) + " " + r + " = {{0}}; " + r + ".bad = !vu_parse_" + call.kids[0].name + "(&" + b.code + ", &" + r + ".val, &" + r + ".err); " + r + "; }})"
+    return bw_end(&g, a, b, code, rt)
+  if call.kids[0].name in g.gfn_nodes:
+    let inst = gcall(&g, call, expect)
+    return call_user(&g, call, inst, true)
+  return call_user(&g, call, call.kids[0].name, true)
+
+fn diverging_call(e: Node) -> Bool:
+  return e.k == "call" and e.kids[0].k == "name" and (e.kids[0].name == "panic" or e.kids[0].name == "exit")
+
+fn g_orelse(var g: G, e: Node, expect: Str) -> CT:
+  let call = e.kids[0]
+  if not throwing_call(&g, call):
+    err(g, e.line, "'else' after a value handles the error of a call to a function marked throws, and this isn't one")
+  let cr = throw_code(&g, call, expect)
+  let rt = cr.ty
+  let t = inner_of(rt)
+  let rv = tmp(&g)
+  let snap = snapshot(g)
+  if e.flag:
+    # else return / break / continue / fail: on failure, free what's live and leave
+    var saved: [Str] = []
+    swap(&saved, &g.lines)
+    let saved_ind = g.ind
+    g.ind = 0
+    stmt(&g, e.kids[1])
+    var parts: [Str] = []
+    for l in g.lines:
+      let s = l.strip()
+      if not s.startswith("#line"): parts.push(s)
+    swap(&saved, &g.lines)
+    g.ind = saved_ind
+    restore(&g, snap)
+    let body = join(parts, " ")
+    if t == "~void":
+      return CT("({{ " + ct(g, rt) + " " + rv + " = " + cr.code + "; if (" + rv + ".bad) {{ " + drop_err(g, rt, rv) + " " + body + " }} }})", "~void")
+    return CT("({{ " + ct(g, rt) + " " + rv + " = " + cr.code + "; if (" + rv + ".bad) {{ " + drop_err(g, rt, rv) + " " + body + " }} " + rv + ".val; }})", t)
+  let d = e.kids[1]
+  if t == "~void" or diverging_call(d):
+    let dr = gen(&g, d, "")
+    var dstmt = ""
+    if dr.ty == "~void": dstmt = dr.code + ";"
+    elif is_copy(g, dr.ty): dstmt = "(void)" + dr.code + ";"
+    else:
+      let dv = tmp(&g)
+      dstmt = "{{ " + ct(g, dr.ty) + " " + dv + " = " + dr.code + "; " + drop_code(g, dr.ty, dv) + " }}"
+    let now = snapshot(g)
+    merge2(&g, snap, now)
+    if t == "~void":
+      return CT("({{ " + ct(g, rt) + " " + rv + " = " + cr.code + "; if (" + rv + ".bad) {{ " + drop_err(g, rt, rv) + " " + dstmt + " }} }})", "~void")
+    return CT("({{ " + ct(g, rt) + " " + rv + " = " + cr.code + "; if (" + rv + ".bad) {{ " + drop_err(g, rt, rv) + " " + dstmt + " }} " + rv + ".val; }})", t)
+  let dc = value(&g, d, t)
+  let now = snapshot(g)
+  merge2(&g, snap, now)
+  let tv = tmp(&g)
+  return CT("({{ " + ct(g, rt) + " " + rv + " = " + cr.code + "; " + ct(g, t) + " " + tv + "; if (" + rv + ".bad) {{ " + drop_err(g, rt, rv) + " " + tv + " = " + dc.code + "; }} else " + tv + " = " + rv + ".val; " + tv + "; }})", t)
+
+fn builtin_type_msg(n: Str) -> Str:
+  if n == "Byte": return "convert with byte(x)"
+  if n == "Int": return "convert with int(x)"
+  if n == "Float": return "convert with float(x)"
+  if n == "Str": return "make strings with \"...\" or str(bytes)"
+  return "use true or false"
+
+fn g_call(var g: G, e: Node, expect: Str) -> CT:
+  let f = e.kids[0]
+  if fn_value_type(&g, e) != "": return call_value(&g, e, false)
+  if f.k == "field":
+    let fname = f.name
+    if fname == "push": return push(&g, e)
+    if fname == "reserve": return reserve(&g, e)
+    if fname == "pop": return pop_call(&g, e)
+    if is_str_method(fname): return str_method(&g, e)
+    if fname == "sort": return sort_method(&g, e)
+    var recv_ty = ""
+    if fname == "share": recv_ty = probe_type(&g, f.kids[0])
+    if fname == "share" and tkind(g, recv_ty) == "shared":
+      if nargs_of(e) != 0: err(g, e.line, ".share() takes no arguments")
+      let sb = bw_begin(&g, f.kids[0], "")
+      return bw_end(&g, f.kids[0], sb, "VU_SHUP(" + sb.code + ")", sb.ty)
+    if fname == "run" or fname == "env" or fname == "clock" or fname == "time" or fname == "sleep" or fname == "signals": return os_call(&g, e, false)
+    if is_net_method(fname) and probe_type(&g, f.kids[0]) == "Net": return net_call(&g, e, false)
+    if is_chan_method(fname) and is_chan_expr(&g, f.kids[0]): return chan_method(&g, e, false)
+    if fname == "temp_dir": return fs_call(&g, e, false)
+    if fname == "get" or fname == "remove": return map_method(&g, e)
+    if fname == "read" or fname == "write": return fs_call(&g, e, false)
+    let rt = probe_type(&g, f.kids[0])
+    if rt == "Str": err(g, e.line, "Str has no ." + fname + "(); its methods are .split(), .join(items), .strip(), .lstrip(), .rstrip(), .startswith(prefix) and .endswith(suffix), and it has .len")
+    if tkind(g, rt) == "list": err(g, e.line, "lists have .push(x), .pop(), .sort(), .reserve(n) and .len; there is no ." + fname + "()")
+    if tkind(g, rt) == "map": err(g, e.line, "maps have .get(key, default), .remove(key) and .len; there is no ." + fname + "()")
+    if tkind(g, rt) == "struct":
+      let sft = struct_field(g, rt, fname)
+      if sft != "" and tkind(g, sft) == "fn": return call_value(&g, e, false)
+    return die_ct(g, e.line, tn(rt) + " has no ." + fname + "(): Vu has functions, not methods, so write " + fname + "(x, ...)")
+  if f.k != "name": return die_ct(g, e.line, "only named functions can be called")
+  let n = f.name
+  if is_builtin_type(n):
+    if n == "Fs" or n == "Net" or n == "Os" or n == "Ffi":
+      err(g, e.line, "a " + n + " can't be created: main receives it (fn main(fs: Fs, os: Os)) and passes it only to the functions that need it")
+    return die_ct(g, e.line, builtin_type_msg(n))
+  if n in g.structs: return construct(&g, e, n)
+  if n in g.gtype_nodes and g.gtype_nodes[n].k == "type":
+    var tf: [Fld] = []
+    for fl in g.gtype_nodes[n].kids: tf.push(Fld(fl.name, fl.ty))
+    let inst = ginfer(&g, e, n, tf, disp(n) + "(...)", expect)
+    return construct(&g, e, inst)
+  if n in g.gtype_nodes: err(g, e.line, "'" + disp(n) + "' is an enum type; use one of its variants")
+  if n in g.exttypes: err(g, e.line, "a " + disp(n) + " is a C handle: only the extern functions that return one can make it")
+  if n in g.variants: return construct_variant(&g, e, n, expect)
+  not_shadowed(g, e)
+  if lookup(g, n) >= 0: err(g, e.line, "'" + n + "' is a variable, not a function")
+  if n == "sorted": return b_sorted(&g, e)
+  if is_builtin(n):
+    if any_named(e): err(g, e.line, n + "() doesn't take named arguments")
+    return builtin(&g, e, n, expect)
+  if has_str(g.lam_names, n): err(g, e.line, "'" + n + "' can't call itself: a nested function isn't visible inside its own body; make it a top-level function to recurse")
+  if n in g.gfn_nodes:
+    let inst = gcall(&g, e, expect)
+    return call_user(&g, e, inst, false)
+  if n in g.fns: return call_user(&g, e, n, false)
+  if lookup(g, n) >= 0: err(g, e.line, "'" + n + "' is a variable, not a function")
+  return die_ct(g, e.line, "unknown function '" + disp(n) + "'")
+
+# ---- closures and function values
+
+fn lfn_escape(g: G, line: Int):
+  err(g, line, "this closure borrows local variables, so it can only be called, bound with let, or passed to a function (it can't be stored, returned or sent); write 'own fn' to give it its own copies of them")
+
+# Every name the closure's body mentions.
+fn collect_names(e: Node, var out: {Str: Bool}):
+  if e.k == "name": out[e.name] = true
+  for k in e.kids: collect_names(k, &out)
+
+fn g_lambda(var g: G, e: Node, expect: Str) -> CT:
+  return lambda_code(&g, e, expect, [], false, false)
+
+# A closure: its body becomes the C function vu_lam<n>, and its value a vu_fn holding it with the
+# variables it captures. A closure that captures nothing is a plain fn value; one that captures and is
+# 'own' copies (or moves) what it captures into a heap env and is a fn value too; otherwise it points at
+# the variables (a stack env) and is a borrowing closure (an lfn), which can't outlive them. While a
+# generic call's types are worked out, use_hint gives the parameter types instead of expect.
+fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Bool, use_hint: Bool) -> CT:
+  var expect = expect0 + ""
+  if expect != "" and tkind(g, expect) == "opt": expect = inner_of(expect)   # (boxed by coerce)
+  var has_exp = false
+  var ef = FnT(false, false, [], "~void")
+  if expect != "":
+    let ek = tkind(g, expect)
+    if ek == "fn" or ek == "lfn":
+      has_exp = true
+      ef = fn_parts(expect)
+      expect = owned_fn(expect)
+  var what = "this closure"
+  if e.name != "": what = "'" + e.name + "'"
+  let np = e.kids[0].kids.len
+  if has_exp and ef.params.len != np: err(g, e.line, what + " takes {np} parameter(s), but a " + tn(expect) + " takes {ef.params.len}")
+  var ptys: [Str] = []
+  for i in 0..np:
+    let pname = e.kids[0].kids[i].name + ""
+    let pline = e.kids[0].kids[i].line
+    var t = ""
+    if e.kids[0].kids[i].ty != "":
+      t = resolve(&g, e.kids[0].kids[i].ty, pline)
+      if has_exp and t != ef.params[i]: err(g, pline, "parameter '" + pname + "' is a " + tn(t) + ", but a " + tn(expect) + " passes a " + tn(ef.params[i]))
+    elif has_exp: t = ef.params[i] + ""
+    elif use_hint: t = hint_ps[i] + ""
+    else: err(g, pline, "give parameter '" + pname + "' a type, like fn(" + pname + ": Int) => ...; nothing here says what it is")
+    ptys.push(t)
+  var ret = ""
+  if e.ret != "": ret = resolve(&g, e.ret, e.line)
+  elif has_exp: ret = ef.ret + ""
+  if e.ret != "" and has_exp and ret != ef.ret: err(g, e.line, what + " returns " + tn(ret) + ", but a " + tn(expect) + " returns " + tn(ef.ret))
+  if e.flag and has_exp and not ef.fails: err(g, e.line, what + " is marked throws, but a " + tn(expect) + " can't fail")
+  let lfails = e.flag or (has_exp and ef.fails) or (use_hint and hint_throws)
+  if not (e.id in g.lam_ids): g.lam_ids[e.id] = g.lam_ids.len + 1
+  let num = g.lam_ids[e.id]
+  # What it captures: every variable visible here that its body names (a name inside can't mean
+  # anything else, since a local can't reuse a visible name), in name order. Inside, each is a
+  # read-only variable in the env (a pointer to the variable, if the closure borrows).
+  var nameset: {Str: Bool} = {}
+  collect_names(e.kids[1], &nameset)
+  var names: [Str] = []
+  for k, v in nameset: names.push(k + "")
+  var caps: [Int] = []
+  for nm in sorted(names):
+    let ov = lookup(g, nm)
+    if ov >= 0: caps.push(ov)
+  # generate the body as a function of its own
+  var s_lines: [Str] = []
+  swap(&s_lines, &g.lines)
+  var s_scopes: [Scope] = []
+  swap(&s_scopes, &g.scopes)
+  var s_loops: [Loop] = []
+  swap(&s_loops, &g.loops)
+  var s_rest: [Rest] = []
+  swap(&s_rest, &g.rest)
+  let s_ind = g.ind
+  let s_par = g.par_on
+  let s_fails = g.fails
+  let s_ret = g.ret + ""
+  let s_rett = g.rett + ""
+  let s_main = g.is_main
+  let s_src = g.src_line
+  g.ind = 1
+  g.par_on = false
+  g.fails = lfails
+  g.is_main = false
+  g.src_line = e.line
+  g.lam_names.push(e.name + "")
+  push_scope(&g, false)
+  for i in 0..caps.len:
+    let cname = g.vars[caps[i]].name + ""
+    let cty = g.vars[caps[i]].ty + ""
+    let cline = g.vars[caps[i]].line
+    let iv = new_var(&g, cname, cty, "env->c{i}", "capture", false, not e.flag2, cline)
+    declare(&g, iv)
+  push_scope(&g, false)
+  var cps = ""
+  for i in 0..np:
+    let pname = e.kids[0].kids[i].name + ""
+    let t = ptys[i]
+    cps += ", " + pdecl(g, t, "v_" + pname)
+    let pv = new_var(&g, pname, t, "v_" + pname, "param", false, not by_value(g, t), e.kids[0].kids[i].line)
+    declare(&g, pv)
+  var body = synth_node(&g, "block", e.line)
+  if not e.is_par:
+    if ret == "":
+      if e.kids[1].k == "try": ret = probe_type(&g, e.kids[1].kids[0])
+      else: ret = probe_type(&g, e.kids[1])
+      if ret == "~nil": err(g, e.line, "can't tell the type of nil; give " + what + " a return type: fn(...) -> Type? => ...")
+      if tkind(g, ret) == "lfn": lfn_escape(g, e.kids[1].line)
+    var st = synth_node(&g, "return", e.line)
+    if ret == "~void":
+      let bk = e.kids[1].k
+      if bk != "call" and bk != "try" and bk != "orelse": err(g, e.kids[1].line, what + " returns nothing, so its body must be a call (like print(...)), not a value")
+      st.k = "exprstmt"
+    st.kids.push(copy_node(e.kids[1]))
+    body.kids.push(st)
+  g.ret = ret + ""
+  if lfails: g.rett = reg(&g, "!" + ret)
+  else: g.rett = ret + ""
+  var fname = "closure"
+  if e.name != "": fname = e.name + ""
+  emit(&g, "VU_ENTER(" + cstr(fname) + ");")
+  var div = false
+  if e.is_par: div = stmts(&g, e.kids[1])
+  else: div = stmts(&g, body)
+  if not div:
+    if ret != "~void": err(g, e.line, what + " must end with a return (it returns " + tn(ret) + ")")
+    emit_drops_from(&g, 0)
+    if lfails: emit(&g, "return (" + ct(g, g.rett) + "){{0}};")
+  let rett = g.rett + ""
+  var lines: [Str] = []
+  swap(&lines, &g.lines)
+  swap(&s_lines, &g.lines)
+  swap(&s_scopes, &g.scopes)
+  swap(&s_loops, &g.loops)
+  swap(&s_rest, &g.rest)
+  g.ind = s_ind
+  g.par_on = s_par
+  g.fails = s_fails
+  g.ret = s_ret
+  g.rett = s_rett
+  g.is_main = s_main
+  g.src_line = s_src
+  g.lam_names.pop()
+  var head = "    (void)vu_envp;"
+  if caps.len > 0: head = "    vu_env{num} *env = (vu_env{num} *)vu_envp;"
+  g.lam_sigs[num] = "static " + ct(g, rett) + " vu_lam{num}(void *vu_envp" + cps + ")"
+  g.lam_bodies[num] = head + "\n" + join(lines, "\n")
+  let ft = fn_type(&g, ptys, ret, lfails)
+  let fnp = "(void (*)(void))vu_lam{num}"
+  g.lam_caps[e.id] = []
+  if caps.len == 0:
+    g.lam_envs[num] = ""
+    return CT("((vu_fn){{" + fnp + ", NULL, NULL}})", ft)
+  var fields: [Str] = []
+  var inits: [Str] = []
+  for i in 0..caps.len:
+    let ov = caps[i]
+    let oty = g.vars[ov].ty + ""
+    let p = Place(true, ov, var_lv(g, ov), oty + "", true, false)
+    read_check(g, p, e.line)
+    if e.flag2:
+      if tkind(g, oty) == "lfn": err(g, e.line, "'" + g.vars[ov].name + "' is a closure that borrows local variables, so an own closure can't keep it")
+      fields.push(ct(g, oty) + " c{i};")
+      if is_copy(g, oty): inits.push(var_lv(g, ov))
+      else: inits.push(move_place(&g, p, e.line))
+    else:
+      fields.push(ct(g, oty) + " *c{i};")
+      if g.vars[ov].ptr: inits.push(g.vars[ov].cname + "")
+      else: inits.push("&" + g.vars[ov].cname)
+  g.lam_envs[num] = "typedef struct {{ " + join(fields, " ") + " }} vu_env{num};"
+  if e.flag2:
+    var drops = ""
+    for i in 0..caps.len:
+      let oty = g.vars[caps[i]].ty + ""
+      if not is_copy(g, oty): drops += drop_code(g, oty, "e->c{i}") + " "
+    g.lam_drops[num] = "static void vu_envdrop{num}(void *p) {{ vu_env{num} *e = (vu_env{num} *)p; " + drops + "free(e); }}"
+    let tv = tmp(&g)
+    var sets: [Str] = []
+    for i in 0..inits.len: sets.push(tv + "->c{i} = " + inits[i] + ";")
+    return CT("({{ vu_env{num} *" + tv + " = (vu_env{num} *)vu_malloc(sizeof *" + tv + "); " + join(sets, " ") + " (vu_fn){{" + fnp + ", " + tv + ", vu_envdrop{num}}}; }})", ft)
+  g.lam_caps[e.id] = copy_ints(caps)
+  return CT("((vu_fn){{" + fnp + ", &(vu_env{num}){{" + join(inits, ", ") + "}}, NULL}})", "<@" + ft[1..ft.len])
+
+# A named function used as a value (handlers.push(on_get)): a vu_fn of its thunk, vu_th_<name>.
+fn fn_value(var g: G, e: Node, expect: Str) -> CT:
+  var name = e.name + ""
+  var has_exp = false
+  var ef = FnT(false, false, [], "~void")
+  if expect != "":
+    let ek = tkind(g, expect)
+    if ek == "fn" or ek == "lfn":
+      has_exp = true
+      ef = fn_parts(expect)
+  if name in g.gfn_nodes:
+    let it = copy_node(g.gfn_nodes[name])
+    var b: {Str: Str} = {}
+    if has_exp and ef.params.len == it.kids[0].kids.len:
+      for i in 0..ef.params.len: unify(g, it.kids[0].kids[i].ty, ef.params[i], it.names, &b)
+      unify(g, it.ret, ef.ret, it.names, &b)
+    var targs: [Str] = []
+    for tp in it.names:
+      if not (tp in b): err(g, e.line, "'" + disp(name) + "' is a generic function; to use it as a value, say which instance, with a type: let f: fn(...) -> ... = " + disp(name))
+      targs.push(b[tp] + "")
+    name = instantiate_fn(&g, name, targs, e.line)
+  let d = disp(e.name)
+  if name == "main": err(g, e.line, "main can't be used as a value")
+  if name in g.extern_fns: err(g, e.line, d + "() is an extern function, so it can't be used as a value; wrap it in a closure: fn(...) => " + d + "(...)")
+  let params = copy_params(g.fns[name].params)
+  let ret = g.fns[name].ret + ""
+  let fails = g.fns[name].fails
+  var ps: [Str] = []
+  for pa in params:
+    if pa.is_var or pa.is_own:
+      var word = "own"
+      if pa.is_var: word = "var"
+      err(g, e.line, d + "() has a '" + word + "' parameter ('" + pa.name + "'), so it can't be used as a value (a function value's parameters are read-only); wrap it in a closure: fn(...) => " + d + "(...)")
+    ps.push(pa.ty + "")
+  if name in g.fn_err: err(g, e.line, d + "() fails with " + tn(g.fn_err[name]) + " values, and a function value fails with a message; wrap it in a closure that turns the error into a message")
+  if not has_str(g.thunks, name): g.thunks.push(name + "")
+  let ft = fn_type(&g, ps, ret, fails)
+  return CT("((vu_fn){{(void (*)(void))vu_th_" + name + ", NULL, NULL}})", ft)
+
+# The function type of what call e calls, when that's a function value (a variable, a field, an element
+# or a call's result), else "".
+fn fn_value_type(var g: G, e: Node) -> Str:
+  let f = e.kids[0]
+  if f.k == "name":
+    let v = lookup(g, f.name)
+    if v >= 0:
+      let k = tkind(g, g.vars[v].ty)
+      if k == "fn" or k == "lfn": return g.vars[v].ty + ""
+    return ""
+  if f.k == "lambda":
+    if f.flag: return "<!()>"
+    return "<()>"
+  if f.k == "field" or f.k == "index" or f.k == "call":
+    let t = static_type(&g, f)
+    if t != "":
+      let k = tkind(g, t)
+      if k == "fn" or k == "lfn": return t
+  return ""
+
+# A call through a function value: vu_call_<type>(f, args...).
+fn call_value(var g: G, e: Node, allow_throw: Bool) -> CT:
+  let f = e.kids[0]
+  let r = gen(&g, f, "")
+  let fk = tkind(g, r.ty)
+  if fk != "fn" and fk != "lfn": err(g, e.line, "a " + tn(r.ty) + " can't be called")
+  let ft = fn_parts(r.ty)
+  var what = "this function value"
+  if f.k == "name": what = "'" + f.name + "'"
+  var rt = ft.ret + ""
+  if ft.fails:
+    if not allow_throw: err(g, e.line, what + " can fail, so handle its error: (...)? passes it on, (...) else <default> replaces it, or match with ok(v) and err(e) arms")
+    rt = reg(&g, "!" + ft.ret)
+  if any_named(e): err(g, e.line, "named arguments are only used when creating a struct")
+  let n = nargs_of(e)
+  if n != ft.params.len: err(g, e.line, what + " takes {ft.params.len} argument(s) but got {n}")
+  var params: [Param] = []
+  for i in 0..ft.params.len: params.push(Param("#{i + 1}", ft.params[i] + "", false, e.line, false))
+  var croot = -1
+  if r.p.ok: croot = r.p.root
+  var a = call_args(&g, e, params, croot, f.line)
+  var code = r.code + ""
+  if not r.p.ok:
+    # a temporary (make_adder(2)(3)): kept while the call runs, then freed
+    let tv = tmp(&g)
+    var pre2 = ["vu_fn " + tv + " = " + code + ";"]
+    for x in a.pre: pre2.push(x + "")
+    swap(&pre2, &a.pre)
+    if fk == "fn": a.post.push("vu_fn_drop(&" + tv + ");")
+    code = tv
+  var all = [code]
+  for c in a.codes: all.push(c + "")
+  return wrap(&g, a.pre, "vu_call_" + mg(g, owned_fn(r.ty)) + "(" + join(all, ", ") + ")", a.post, rt)
+
+fn construct(var g: G, e: Node, name: Str) -> CT:
+  var fields: [Fld] = []
+  for f in g.structs[name].fields: fields.push(Fld(f.name, f.ty))
+  let fi = field_inits(&g, e, name, fields)
+  var lit = "((T_" + name + "){{" + join(fi.inits, ", ") + "}})"
+  if fi.pre.len > 0: lit = "({{ " + join(fi.pre, " ") + " " + lit + "; }})"
+  return CT(lit, name)
+
+type Inits:
+  pre, inits: [Str]
+
+fn field_inits(var g: G, e: Node, name: Str, fields: [Fld]) -> Inits:
+  var names: [Str] = []
+  var ftypes: {Str: Str} = {}
+  for f in fields:
+    names.push(f.name)
+    ftypes[f.name] = f.ty
+  # ordered: (field name, index of the arg node in e.kids)
+  var onames: [Str] = []
+  var oidx: [Int] = []
+  if any_named(e):
+    for i in 1..e.kids.len:
+      if not e.kids[i].flag: err(g, e.line, "use either all named or all positional arguments")
+    var given: {Str: Bool} = {}
+    for i in 1..e.kids.len:
+      let a = e.kids[i]
+      if not (a.name in ftypes): err(g, a.line, name + " has no field '" + a.name + "'")
+      if a.name in given: err(g, a.line, "field '" + a.name + "' is given twice")
+      given[a.name] = true
+    var missing: [Str] = []
+    for f in names:
+      if not (f in given): missing.push(f)
+    if missing.len > 0: err(g, e.line, "missing field(s) for " + name + ": " + join(missing, ", "))
+    for i in 1..e.kids.len:
+      onames.push(e.kids[i].name)
+      oidx.push(i)
+  else:
+    if nargs_of(e) != names.len:
+      err(g, e.line, name + " has {names.len} field(s) (" + join(names, ", ") + ") but got {nargs_of(e)} value(s)")
+    for i in 0..names.len:
+      onames.push(names[i])
+      oidx.push(i + 1)
+  var hoist = false
+  if oidx.len > 1:
+    for i in oidx:
+      if effects(&g, e.kids[i].kids[0]):
+        hoist = true
+        break
+  var res = Inits([], [])
+  for j in 0..oidx.len:
+    let fname = onames[j]
+    let c = value(&g, e.kids[oidx[j]].kids[0], ftypes[fname])
+    var code = c.code + ""
+    if hoist:
+      let tv = tmp(&g)
+      res.pre.push(ct(g, ftypes[fname]) + " " + tv + " = " + code + ";")
+      code = tv
+    res.inits.push("." + cf(fname) + " = " + code)
+  return res

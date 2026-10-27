@@ -1,0 +1,822 @@
+# HTTP/1.1 servers and clients, over plain TCP or TLS.
+#
+# The simplest server passes a handler to http.serve, which runs one task per connection on every
+# core and stops gracefully on SIGTERM or SIGINT (it finishes the requests in progress, up to grace
+# seconds, then returns):
+#
+#   import http
+#
+#   fn route(req: http.Request) -> http.Response:
+#     if req.method == "GET" and req.path == "/": return http.text(200, "hello")
+#     return http.text(404, "not found")
+#
+#   fn main(net: Net, os: Os) throws:
+#     http.serve(net, os, 8080, route, 10.0)?
+#
+# A server can also keep its own accept loop and one task per connection; http.next reads one
+# request at a time from the connection:
+#
+#   fn handle(net: Net, own c: Conn):
+#     var r = http.reader()
+#     while true:
+#       let req = http.next(net, c, &r, 60.0) else return   # closed, idle, or a bad request (answered)
+#       var resp = http.text(404, "not found")
+#       if req.method == "GET" and req.path == "/": resp = http.text(200, "hello")
+#       http.reply(net, c, req, resp) else return
+#       if not http.keep_alive(req): return
+#
+#   fn main(net: Net) throws:
+#     let l = net.listen(8080)?
+#     while true:
+#       let c = net.accept(l) else continue
+#       spawn handle(net, c)
+#
+# A client makes one request per connection:
+#
+#   let resp = http.get(net, "https://example.com/")?
+#   print("{resp.status} {resp.body.len} bytes")
+#   let r2 = http.post(net, "http://localhost:8080/order", "application/json", body)?
+#   let r3 = http.send(net, http.ClientRequest("PUT", url, [http.Header("X-Key", k)], body, 10.0, ""))?
+#
+# Requests are read strictly: a body by Content-Length or chunked transfer coding (not both), header
+# sections up to 64 KB, bodies up to 10 MB, and anything malformed is answered with a 4xx status.
+
+type Header:
+  name, value: Str
+
+type Request:
+  method: Str
+  path: Str          # the target before any '?', still percent-encoded
+  query: Str         # after the '?' ("" if none); read values with http.query(req, key)
+  version: Str       # "HTTP/1.1" or "HTTP/1.0"
+  headers: [Header]  # names in lowercase, values without surrounding spaces
+  body: Str
+
+type Response:
+  status: Int
+  headers: [Header]  # from a client: names in lowercase
+  body: Str
+
+# The bytes received on one connection and not used yet (requests can arrive in pieces, or several at once).
+type Reader:
+  buf: Str
+  at: Int
+  rs: Resume
+  quiet: Bool   # the last read failed because nothing arrived in time (the connection may still be open)
+
+# How far reading the current message got, so that each new piece of input is looked at once (a client
+# sending a request a byte at a time must not make the server rescan everything each time).
+type Resume:
+  head_from: Int   # no header section ends before this index of the buffer
+  chunk_at: Int    # in a chunked body: where its next chunk starts (0: not there yet)
+  body: Str        # that body, decoded so far
+  continued: Bool  # "100 Continue" has been sent for this request
+
+type Error:
+  Closed                      # the other side closed the connection, stayed idle past the timeout, or the network failed
+  Bad(status: Int, why: Str)  # a malformed or too large request; next() has sent the error response
+
+const MAX_HEAD = 65536
+const MAX_HEADERS = 100
+const MAX_BODY = 10485760
+const MAX_CLIENT_BODY = 67108864
+
+fn reader() -> Reader:
+  return Reader("", 0, Resume(0, 0, "", false), false)
+
+# ---- reading messages (shared by the server and the client)
+
+fn lower(b: Byte) -> Byte:
+  if b >= 'A' and b <= 'Z': return b + 32
+  return b
+
+fn lower_str(s: Str) -> Str:
+  var upper = false
+  for i in 0..s.len:
+    if s[i] >= 'A' and s[i] <= 'Z':
+      upper = true
+      break
+  if not upper: return s + ""
+  var bs = bytes(s)
+  for i in 0..bs.len:
+    bs[i] = lower(bs[i])
+  return str(bs)
+
+# Whether s equals lower (already lowercase) ignoring ASCII case, without making a new string.
+fn eq_ci(s: Str, lower_text: Str) -> Bool:
+  if s.len != lower_text.len: return false
+  for i in 0..s.len:
+    if lower(s[i]) != lower_text[i]: return false
+  return true
+
+fn is_space(b: Byte) -> Bool:
+  return b == ' ' or b == '\t'
+
+# A header name's bytes (RFC 9110 token characters).
+fn is_tchar(b: Byte) -> Bool:
+  if (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9'): return true
+  return (b == '!' or b == '#' or b == '$' or b == '%' or b == '&' or b == '\'' or b == '*' or b == '+' or
+          b == '-' or b == '.' or b == '^' or b == '_' or b == '`' or b == '|' or b == '~')
+
+# The index just past the first blank line ("\r\n\r\n") at or after from, or -1 if there is none yet.
+fn head_end(buf: Str, from: Int) -> Int:
+  var i = from
+  while i + 3 < buf.len:
+    if buf[i + 3] != '\n':
+      i += 1
+    elif buf[i] == '\r' and buf[i + 1] == '\n' and buf[i + 2] == '\r':
+      return i + 4
+    else:
+      i += 1
+  return -1
+
+# The end of the line that starts at i (the index of its '\r'), or -1.
+fn line_end(buf: Str, i: Int, stop: Int) -> Int:
+  var j = i
+  while j + 1 < stop:
+    if buf[j] == '\r' and buf[j + 1] == '\n': return j
+    j += 1
+  return -1
+
+# What reading a message from buf[at..] found: a whole message (DONE), not enough bytes yet (MORE), or
+# a malformed one (INVALID). The caller takes headers and body out with swap.
+type Scan:
+  state: Int          # MORE, DONE or INVALID
+  need: Int           # MORE: buf needs at least this many bytes in all
+  status: Int         # INVALID: the status to answer with
+  why: Str            # INVALID: what is wrong
+  start: Str          # DONE: the first line
+  headers: [Header]
+  body: Str
+  used: Int           # DONE: the index just past the message
+  resume: Int         # MORE in a chunked body: where to continue
+
+const MORE = 0
+const DONE = 1
+const INVALID = 2
+
+fn more(var s: Scan, need: Int):
+  s.state = MORE
+  s.need = need
+
+fn invalid(var s: Scan, status: Int, why: Str):
+  s.state = INVALID
+  s.status = status
+  s.why = why + ""
+
+# The header lines buf[a..b] (each ending in \r\n) into s.headers, or s becomes INVALID.
+fn read_headers(buf: Str, a: Int, b: Int, var s: Scan):
+  var i = a
+  while i < b:
+    let e = line_end(buf, i, b + 2)
+    if e < 0 or e > b:
+      invalid(&s, 400, "a header line doesn't end in CRLF")
+      return
+    if is_space(buf[i]):
+      invalid(&s, 400, "a header line starts with a space (line folding isn't allowed)")
+      return
+    var colon = -1
+    for j in i..e:
+      if buf[j] == ':':
+        colon = j
+        break
+    if colon <= i:
+      invalid(&s, 400, "a header line has no name and ':'")
+      return
+    for j in i..colon:
+      if not is_tchar(buf[j]):
+        invalid(&s, 400, "a header name contains a character that isn't allowed")
+        return
+    var vs = colon + 1
+    var ve = e
+    while vs < ve and is_space(buf[vs]):
+      vs += 1
+    while ve > vs and is_space(buf[ve - 1]):
+      ve -= 1
+    for j in vs..ve:
+      if buf[j] == 0 or buf[j] == '\r' or buf[j] == '\n':
+        invalid(&s, 400, "a header value contains a control character")
+        return
+    if s.headers.len == MAX_HEADERS:
+      invalid(&s, 431, "too many header lines")
+      return
+    var name = buf[i..colon]
+    for j in 0..name.len:
+      if name[j] >= 'A' and name[j] <= 'Z':
+        name = lower_str(name)
+        break
+    s.headers.push(Header(name, buf[vs..ve]))
+    i = e + 2
+
+fn find_header(hs: [Header], name: Str) -> Int:
+  for i in 0..hs.len:
+    if hs[i].name == name: return i
+  return -1
+
+fn hexval(b: Byte) -> Int:
+  if b >= '0' and b <= '9': return int(b) - 48
+  if b >= 'a' and b <= 'f': return int(b) - 87
+  if b >= 'A' and b <= 'F': return int(b) - 55
+  return -1
+
+# A chunked body starting at buf[p0..], appended to s.body (s becomes DONE), or MORE (s.resume says
+# which chunk to continue from), or INVALID.
+fn read_chunked(buf: Str, p0: Int, limit: Int, var s: Scan):
+  var p = p0
+  while true:
+    s.resume = p
+    let e = line_end(buf, p, buf.len)
+    if e < 0:
+      if buf.len - p > 1024:
+        invalid(&s, 400, "a chunk size line is too long")
+        return
+      more(&s, buf.len + 1)
+      return
+    var size = 0
+    var digits = 0
+    var q = p
+    while q < e and hexval(buf[q]) >= 0:
+      size = size * 16 + hexval(buf[q])
+      digits += 1
+      q += 1
+      if size > limit:
+        invalid(&s, 413, "the body is too large")
+        return
+    if digits == 0:
+      invalid(&s, 400, "a chunk doesn't start with its size in hex")
+      return
+    if q < e and buf[q] != ';' and not is_space(buf[q]):
+      invalid(&s, 400, "a chunk size line is malformed")
+      return
+    p = e + 2
+    if size == 0:
+      # trailer lines (ignored) until a blank line
+      while true:
+        let te = line_end(buf, p, buf.len)
+        if te < 0:
+          if buf.len - p > MAX_HEAD:
+            invalid(&s, 431, "the trailer section is too large")
+            return
+          more(&s, buf.len + 1)
+          return
+        if te == p:
+          s.state = DONE
+          s.used = te + 2
+          return
+        p = te + 2
+    if s.body.len + size > limit:
+      invalid(&s, 413, "the body is too large")
+      return
+    if p + size + 2 > buf.len:
+      more(&s, p + size + 2)
+      return
+    s.body += buf[p..p + size]
+    if buf[p + size] != '\r' or buf[p + size + 1] != '\n':
+      invalid(&s, 400, "a chunk's data isn't followed by CRLF")
+      return
+    p += size + 2
+
+# One message from buf[at..]: a request, or (response true) a response, which has no body when it
+# answers a HEAD request (head) or has status 1xx, 204 or 304, and without a length is read until the
+# connection closes (closed says it has). rs carries what earlier calls for this message found.
+fn read_message(buf: Str, at: Int, limit: Int, head: Bool, response: Bool, closed: Bool, var rs: Resume) -> Scan:
+  var s = Scan(MORE, 0, 0, "", "", [], "", 0, 0)
+  let end = head_end(buf, max(at, rs.head_from))
+  if end < 0:
+    rs.head_from = max(at, buf.len - 3)
+    if buf.len - at > MAX_HEAD:
+      invalid(&s, 431, "the header section is too large")
+    elif closed:
+      invalid(&s, 400, "the connection closed in the middle of the header section")
+    else:
+      more(&s, buf.len + 1)
+    return s
+  if end - at > MAX_HEAD:
+    invalid(&s, 431, "the header section is too large")
+    return s
+  let le = line_end(buf, at, end)
+  s.start = buf[at..le]
+  read_headers(buf, le + 2, end - 2, &s)
+  if s.state == INVALID: return s
+  s.state = DONE
+  s.used = end
+  var no_body = head
+  if response:
+    # "HTTP/1.1 204 ..."
+    var code = 0
+    if s.start.len >= 12:
+      for i in 9..12:
+        if s.start[i] >= '0' and s.start[i] <= '9': code = code * 10 + int(s.start[i]) - 48
+    if (code >= 100 and code < 200) or code == 204 or code == 304: no_body = true
+  if no_body: return s
+  var te = -1
+  for i in 0..s.headers.len:
+    if s.headers[i].name == "transfer-encoding":
+      if te >= 0:
+        invalid(&s, 400, "more than one Transfer-Encoding header")
+        return s
+      te = i
+  var cl = -1
+  var bad = ""
+  for h in s.headers:
+    if h.name == "content-length":
+      var n = 0
+      if h.value.len == 0 or h.value.len > 18: bad = "Content-Length isn't a number"
+      for i in 0..h.value.len:
+        let d = h.value[i]
+        if d < '0' or d > '9':
+          bad = "Content-Length isn't a number"
+          break
+        n = n * 10 + int(d) - 48
+      if bad == "" and cl >= 0 and n != cl: bad = "two different Content-Length headers"
+      if bad != "": break
+      cl = n
+  if bad != "":
+    invalid(&s, 400, bad)
+    return s
+  if te >= 0:
+    if cl >= 0:
+      invalid(&s, 400, "both Transfer-Encoding and Content-Length")
+    elif lower_str(s.headers[te].value) != "chunked":
+      invalid(&s, 501, "only the chunked transfer coding is supported")
+    else:
+      var from = end
+      if rs.chunk_at > 0:
+        from = rs.chunk_at
+        swap(&s.body, &rs.body)
+      read_chunked(buf, from, limit, &s)
+      if s.state == MORE:
+        rs.chunk_at = s.resume
+        swap(&s.body, &rs.body)
+    return s
+  if cl < 0:
+    if not response: return s
+    if not closed:
+      more(&s, buf.len + 1)
+    elif buf.len - end > limit:
+      invalid(&s, 413, "the body is too large")
+    else:
+      s.body = buf[end..buf.len]
+      s.used = buf.len
+    return s
+  if cl > limit:
+    invalid(&s, 413, "the body is too large")
+  elif end + cl > buf.len:
+    if closed:
+      invalid(&s, 400, "the connection closed before the whole body arrived")
+    else:
+      more(&s, end + cl)
+  else:
+    s.body = buf[end..end + cl]
+    s.used = end + cl
+  return s
+
+# ---- the server
+
+fn status_text(status: Int) -> Str:
+  if status == 200: return "OK"
+  if status == 201: return "Created"
+  if status == 202: return "Accepted"
+  if status == 204: return "No Content"
+  if status == 301: return "Moved Permanently"
+  if status == 302: return "Found"
+  if status == 304: return "Not Modified"
+  if status == 400: return "Bad Request"
+  if status == 401: return "Unauthorized"
+  if status == 403: return "Forbidden"
+  if status == 404: return "Not Found"
+  if status == 405: return "Method Not Allowed"
+  if status == 408: return "Request Timeout"
+  if status == 409: return "Conflict"
+  if status == 413: return "Content Too Large"
+  if status == 415: return "Unsupported Media Type"
+  if status == 422: return "Unprocessable Content"
+  if status == 429: return "Too Many Requests"
+  if status == 431: return "Request Header Fields Too Large"
+  if status == 500: return "Internal Server Error"
+  if status == 501: return "Not Implemented"
+  if status == 502: return "Bad Gateway"
+  if status == 503: return "Service Unavailable"
+  if status == 504: return "Gateway Timeout"
+  if status == 505: return "HTTP Version Not Supported"
+  return "Status"
+
+# Answers a bad request (and closes, since the rest of the connection can't be trusted), then fails.
+fn reject(net: Net, c: Conn, status: Int, why: Str) throws Error:
+  let body = why + "\n"
+  let msg = "HTTP/1.1 {status} {status_text(status)}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {body.len}\r\nConnection: close\r\n\r\n" + body
+  net.send(c, msg, timeout: 5.0) else fail Bad(status, why + "")
+  fail Bad(status, why + "")
+
+# Reads more of the connection into r; fails with Closed when there is nothing more.
+fn fill(net: Net, c: Conn, var r: Reader, timeout: Float) throws Error:
+  r.quiet = false
+  var d = ""
+  match net.recv(c, timeout: timeout):
+    ok(got): d = got + ""   # (copied: a match binding can't be moved out)
+    err(e):
+      r.quiet = e == "timed out"
+      fail Closed
+  if d.len == 0: fail Closed
+  if r.at == r.buf.len:
+    r.buf = d
+    r.at = 0
+    r.rs = Resume(0, 0, "", false)
+  elif r.at > 0 and r.at >= r.buf.len / 2:
+    r.buf = r.buf[r.at..r.buf.len] + d
+    r.rs.head_from = max(0, r.rs.head_from - r.at)
+    if r.rs.chunk_at > 0: r.rs.chunk_at -= r.at
+    r.at = 0
+  else:
+    r.buf += d
+
+# The next request on the connection. It waits up to timeout seconds for each piece to arrive, and
+# fails with Closed (the client left, or went quiet) or Bad (malformed; the 4xx reply has been sent).
+fn next(net: Net, c: Conn, var r: Reader, timeout: Float) -> Request throws Error:
+  while true:
+    if r.at < r.buf.len:
+      var rs = Resume(0, 0, "", false)
+      swap(&rs, &r.rs)   # a var argument needs the whole of r otherwise
+      var s = read_message(r.buf, r.at, MAX_BODY, false, false, false, &rs)
+      swap(&rs, &r.rs)
+      if s.state == MORE and s.start != "" and not r.rs.continued:
+        # the header section is complete and the body isn't: a client that sent "Expect: 100-continue"
+        # waits for this before sending the body
+        if e = find_expect(s.headers):
+          net.send(c, "HTTP/1.1 100 Continue\r\n\r\n", timeout: timeout) else fail Closed
+          r.rs.continued = true
+      if s.state == DONE:
+        r.at = s.used
+        r.rs = Resume(0, 0, "", false)
+        if r.at == r.buf.len and r.buf.len > 65536:
+          # all used: don't keep a big buffer while the connection waits for its next request
+          r.buf = ""
+          r.at = 0
+        return request_of(net, c, &s)?
+      if s.state == INVALID: reject(net, c, s.status, s.why)?
+      # need counts from the start of the buffer, which fill may move: wait for that many bytes after r.at
+      let want = s.need - r.at
+      while r.buf.len - r.at < want:
+        fill(net, c, &r, timeout)?
+      continue
+    fill(net, c, &r, timeout)?
+
+fn find_expect(hs: [Header]) -> Str?:
+  for h in hs:
+    if h.name == "expect" and eq_ci(h.value, "100-continue"): return h.value + ""
+  return nil
+
+fn request_of(net: Net, c: Conn, var s: Scan) -> Request throws Error:
+  let line = s.start + ""
+  var sp1 = -1
+  var sp2 = -1
+  for i in 0..line.len:
+    if line[i] == ' ':
+      if sp1 < 0:
+        sp1 = i
+      elif sp2 < 0:
+        sp2 = i
+      else:
+        reject(net, c, 400, "the request line is malformed")?
+  if sp1 <= 0 or sp2 < 0 or sp2 == sp1 + 1: reject(net, c, 400, "the request line is malformed")?
+  let method = line[0..sp1]
+  for i in 0..method.len:
+    if not is_tchar(method[i]): reject(net, c, 400, "the method isn't a token")?
+  let target = line[sp1 + 1..sp2]
+  let version = line[sp2 + 1..line.len]
+  if version != "HTTP/1.1" and version != "HTTP/1.0":
+    if version.startswith("HTTP/"): reject(net, c, 505, "only HTTP/1.0 and HTTP/1.1 are supported")?
+    reject(net, c, 400, "the request line is malformed")?
+  if target[0] != '/' and not (target == "*" and method == "OPTIONS"):
+    reject(net, c, 400, "the target must start with '/'")?
+  for i in 0..target.len:
+    if target[i] <= ' ' or target[i] == 127: reject(net, c, 400, "the target contains a control character")?
+  var hosts = 0
+  for h in s.headers:
+    if h.name == "host": hosts += 1
+  if hosts > 1: reject(net, c, 400, "more than one Host header")?
+  if version == "HTTP/1.1" and hosts == 0:
+    reject(net, c, 400, "an HTTP/1.1 request needs a Host header")?
+  var path = target + ""
+  var query = ""
+  for i in 0..target.len:
+    if target[i] == '?':
+      path = target[0..i]
+      query = target[i + 1..target.len]
+      break
+  var headers: [Header] = []
+  swap(&headers, &s.headers)
+  var body = ""
+  swap(&body, &s.body)
+  return Request(method, path, query, version, headers, body)
+
+# Whether the connection stays open after answering req (HTTP/1.1 unless "Connection: close";
+# HTTP/1.0 only with "Connection: keep-alive").
+fn keep_alive(req: Request) -> Bool:
+  var close = req.version == "HTTP/1.0"
+  for h in req.headers:
+    if h.name == "connection":
+      let v = lower_str(h.value)
+      for part in v.split(","):
+        let p = part.strip()
+        if p == "close": return false
+        if p == "keep-alive": close = false
+  return not close
+
+# Writes the response to req: the status line, its headers, Content-Length, and the body (none for a
+# HEAD request). It says "Connection: close" when keep_alive(req) is false (close the connection after
+# it), and "Connection: keep-alive" to an HTTP/1.0 client that asked for it. A header name or value
+# with a line break or zero byte is an error, so request data can't smuggle in headers.
+fn reply(net: Net, c: Conn, req: Request, resp: Response) throws:
+  var conn = ""
+  if not keep_alive(req):
+    conn = "close"
+  elif req.version == "HTTP/1.0":
+    conn = "keep-alive"
+  net.send(c, encode_response(resp, req.method == "HEAD", conn)?, timeout: 60.0)?
+
+fn check_header(h: Header) throws:
+  if h.name.len == 0: fail "a header has an empty name"
+  for i in 0..h.name.len:
+    if not is_tchar(h.name[i]): fail "the header name '{h.name}' contains a character that isn't allowed"
+  for i in 0..h.value.len:
+    let b = h.value[i]
+    if b == '\r' or b == '\n' or b == 0: fail "the value of header '{h.name}' contains a line break or zero byte"
+
+fn encode_response(resp: Response, head: Bool, conn: Str) -> Str throws:
+  if resp.status < 100 or resp.status > 999: fail "status {resp.status} is not a 3-digit number"
+  var out = "HTTP/1.1 {resp.status} "
+  out.reserve(resp.body.len + 160)
+  out += status_text(resp.status)
+  out += "\r\n"
+  for h in resp.headers:
+    check_header(h)?
+    if not eq_ci(h.name, "content-length") and not eq_ci(h.name, "connection") and not eq_ci(h.name, "transfer-encoding"):
+      out += h.name
+      out += ": "
+      out += h.value
+      out += "\r\n"
+  if conn != "":
+    out += "Connection: "
+    out += conn
+    out += "\r\n"
+  out += "Content-Length: {resp.body.len}\r\n\r\n"
+  if not head: out += resp.body
+  return out
+
+fn response(status: Int, content_type: Str, body: Str) -> Response:
+  return Response(status, [Header("Content-Type", content_type + "")], body + "")
+
+fn text(status: Int, body: Str) -> Response:
+  return response(status, "text/plain; charset=utf-8", body)
+
+fn json(status: Int, body: Str) -> Response:
+  return response(status, "application/json", body)
+
+# A request header's value (the name in any case), or nil.
+fn header(req: Request, name: Str) -> Str?:
+  let i = find_header(req.headers, lower_str(name))
+  if i < 0: return nil
+  return req.headers[i].value + ""
+
+# %XX escapes decoded (and '+' as a space when plus is true); a malformed escape stays as it is.
+fn decode(s: Str, plus: Bool) -> Str:
+  var out = ""
+  var i = 0
+  while i < s.len:
+    let b = s[i]
+    if b == '%' and i + 2 < s.len + 0 and hexval(s[i + 1]) >= 0 and hexval(s[i + 2]) >= 0:
+      out += str([byte(hexval(s[i + 1]) * 16 + hexval(s[i + 2]))])
+      i += 3
+    elif b == '+' and plus:
+      out += " "
+      i += 1
+    else:
+      out += str([b])
+      i += 1
+  return out
+
+# The value of key in the query string (?a=1&b=two), decoded, or nil. The first one wins.
+fn query(req: Request, key: Str) -> Str?:
+  for part in req.query.split("&"):
+    var k = part + ""
+    var v = ""
+    for i in 0..part.len:
+      if part[i] == '=':
+        k = part[0..i]
+        v = part[i + 1..part.len]
+        break
+    if decode(k, true) == key: return decode(v, true)
+  return nil
+
+# ---- the client
+
+type Url:
+  tls: Bool
+  host: Str
+  port: Int
+  target: Str     # path and query, at least "/"
+
+# http://host[:port]/path?query or https://...; a host can be an IPv6 address in brackets.
+fn parse_url(url: Str) -> Url throws:
+  var rest = ""
+  var tls = false
+  var port = 80
+  if url.startswith("http://"):
+    rest = url[7..url.len]
+  elif url.startswith("https://"):
+    rest = url[8..url.len]
+    tls = true
+    port = 443
+  else:
+    fail "the URL must start with http:// or https://"
+  var slash = rest.len
+  for i in 0..rest.len:
+    if rest[i] == '/' or rest[i] == '?' or rest[i] == '#':
+      slash = i
+      break
+  let authority = rest[0..slash]
+  var target = rest[slash..rest.len]
+  for i in 0..target.len:
+    if target[i] == '#':
+      target = target[0..i]
+      break
+  if target == "" or target[0] != '/': target = "/" + target
+  for i in 0..target.len:
+    if target[i] <= ' ' or target[i] == 127: fail "the URL contains a space or control character"
+  for i in 0..authority.len:
+    if authority[i] == '@': fail "user names and passwords in URLs aren't supported"
+  var host = authority + ""
+  var port_text = ""
+  if authority.startswith("["):
+    var close = -1
+    for i in 0..authority.len:
+      if authority[i] == ']':
+        close = i
+        break
+    if close < 0: fail "an IPv6 address in a URL must end with ']'"
+    host = authority[1..close]
+    if close + 1 < authority.len:
+      if authority[close + 1] != ':': fail "expected ':' after the IPv6 address"
+      port_text = authority[close + 2..authority.len]
+  else:
+    for i in 0..authority.len:
+      if authority[i] == ':':
+        host = authority[0..i]
+        port_text = authority[i + 1..authority.len]
+        break
+  if host == "": fail "the URL has no host"
+  if port_text != "":
+    port = int(port_text) else 0
+    if port < 1 or port > 65535: fail "the port '{port_text}' is not 1..65535"
+  return Url(tls, host, port, target)
+
+type ClientRequest:
+  method, url: Str
+  headers: [Header]
+  body: Str
+  timeout: Float   # seconds for connecting and for each read and write
+  ca: Str          # PEM certificates to trust for https instead of the system's ("" for the system's)
+
+fn get(net: Net, url: Str) -> Response throws:
+  return send(net, ClientRequest("GET", url + "", [], "", 30.0, ""))?
+
+fn post(net: Net, url: Str, content_type: Str, body: Str) -> Response throws:
+  return send(net, ClientRequest("POST", url + "", [Header("Content-Type", content_type + "")], body + "", 30.0, ""))?
+
+# Sends the request on a new connection ("Connection: close") and reads the whole response.
+fn send(net: Net, req: ClientRequest) -> Response throws:
+  let u = parse_url(req.url)?
+  for i in 0..req.method.len:
+    if not is_tchar(req.method[i]): fail "the method '{req.method}' isn't a token"
+  var hostport = u.host + ""
+  for i in 0..u.host.len:
+    if u.host[i] == ':': hostport = "[" + u.host + "]"
+  if (u.tls and u.port != 443) or (not u.tls and u.port != 80): hostport += ":{u.port}"
+  var out = req.method + " " + u.target + " HTTP/1.1\r\nHost: " + hostport + "\r\n"
+  var has_ua = false
+  for h in req.headers:
+    check_header(h)?
+    let n = lower_str(h.name)
+    if n == "host" or n == "content-length" or n == "connection" or n == "transfer-encoding":
+      fail "the header '{h.name}' is set by http.send"
+    if n == "user-agent": has_ua = true
+    out += h.name + ": " + h.value + "\r\n"
+  if not has_ua: out += "User-Agent: vu-http\r\n"
+  if req.body.len > 0 or req.method == "POST" or req.method == "PUT" or req.method == "PATCH":
+    out += "Content-Length: {req.body.len}\r\n"
+  out += "Connection: close\r\n\r\n"
+  out += req.body
+  var conn: Conn? = nil
+  if u.tls and req.ca != "":
+    conn = net.tls_connect(u.host, u.port, ca: req.ca, timeout: req.timeout)?
+  elif u.tls:
+    conn = net.tls_connect(u.host, u.port, timeout: req.timeout)?
+  else:
+    conn = net.connect(u.host, u.port, timeout: req.timeout)?
+  if c = conn:
+    net.send(c, out, timeout: req.timeout)?
+    return read_response(net, c, req.method == "HEAD", req.timeout)?
+  fail "not connected"
+
+fn read_response(net: Net, c: Conn, head: Bool, timeout: Float) -> Response throws:
+  var buf = ""
+  var at = 0
+  var closed = false
+  var rs = Resume(0, 0, "", false)
+  while true:
+    if buf.len > at or closed:
+      var s = read_message(buf, at, MAX_CLIENT_BODY, head, true, closed, &rs)
+      if s.state == INVALID: fail "bad response: {s.why}"
+      if s.state == MORE and closed: fail "the connection closed in the middle of the response"
+      if s.state == DONE:
+        let status = status_of(s.start)?
+        if status >= 100 and status < 200:
+          # 1xx responses (100 Continue...) come before the real one; skip them
+          at = s.used
+          rs = Resume(0, 0, "", false)
+          continue
+        var headers: [Header] = []
+        swap(&headers, &s.headers)
+        var body = ""
+        swap(&body, &s.body)
+        return Response(status, headers, body)
+    if buf.len - at > MAX_HEAD + MAX_CLIENT_BODY: fail "the response is too large"
+    let d = net.recv(c, timeout: timeout)?
+    if d.len == 0:
+      if closed or buf.len == 0: fail "the connection closed before a response arrived"
+      closed = true
+    else:
+      buf += d
+
+fn status_of(line: Str) -> Int throws:
+  # "HTTP/1.1 200 OK"
+  if not line.startswith("HTTP/1.") or line.len < 12 or line[8] != ' ': fail "bad response: no HTTP status line"
+  var n = 0
+  for i in 9..12:
+    if line[i] < '0' or line[i] > '9': fail "bad response: the status isn't 3 digits"
+    n = n * 10 + int(line[i]) - 48
+  return n
+
+# ---- serving with a handler
+
+# Serves HTTP on port until the program gets SIGTERM or SIGINT: one task per connection, every request
+# answered by handler. On the signal it stops accepting, lets the requests in progress finish (a
+# connection closes after its current request, an idle one at once), and returns when every connection
+# is done or grace seconds have passed.
+fn serve(net: Net, os: Os, port: Int, own handler: fn(Request) -> Response, grace: Float) throws:
+  let l = net.listen(port)?
+  let stop = os.signals()
+  let stopping: Chan[Int] = chan(1)   # closed when the server stops: every task sees it
+  let counts: Chan[Int] = chan(1)     # the accept loop's last word: how many connections are open
+  let done: Chan[Int] = chan(4096)    # each connection's task sends 1 when it ends
+  spawn accept_loop(net, l, share(handler), stopping, done, counts)
+  let sig = stop.recv()?
+  stopping.close()
+  var open = counts.recv()?
+  let until = os.clock() + grace
+  while open > 0:
+    let left = until - os.clock()
+    if left <= 0.0: return
+    let d = done.recv(timeout: left) else return
+    open -= d
+
+fn accept_loop(net: Net, own l: Listener, own h: Shared[fn(Request) -> Response], own stopping: Chan[Int],
+               own done: Chan[Int], own counts: Chan[Int]):
+  var open = 0
+  while not stopping.closed():
+    while true:   # count the connections that have finished
+      let d = done.recv(timeout: 0.0) else break
+      open -= d
+    let c = net.accept(l, timeout: 0.25) else continue
+    open += 1
+    spawn connection(net, c, h, stopping, done)
+  while true:
+    let d = done.recv(timeout: 0.0) else break
+    open -= d
+  counts.send(open)
+
+fn connection(net: Net, own c: Conn, own h: Shared[fn(Request) -> Response], own stopping: Chan[Int],
+              own done: Chan[Int]):
+  answer(net, c, h, stopping)
+  done.send(1)
+
+fn answer(net: Net, c: Conn, h: Shared[fn(Request) -> Response], stopping: Chan[Int]):
+  var r = reader()
+  var quiet = 0
+  while true:
+    if r.at == r.buf.len and stopping.closed(): return   # between requests, and stopping
+    match next(net, c, &r, 1.0):
+      ok(req):
+        quiet = 0
+        let resp = h.value(req)
+        reply(net, c, req, resp) else return
+        if not keep_alive(req): return
+      err(e):
+        match e:
+          Closed:
+            # a second with nothing new: keep waiting, up to a minute in all (and not once stopping)
+            if not r.quiet: return
+            quiet += 1
+            if quiet >= 60: return
+          Bad(status, why): return

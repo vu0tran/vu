@@ -1,0 +1,181 @@
+# The HTTP benchmark server, reading JSON as a tree with the json module (server.vu uses from_json) (HTTP/1.1, keep-alive, pipelining, requests split across reads):
+#   GET  /       -> "Hello, World!"
+#   POST /order  -> parses the order (JSON), totals it, and replies with a JSON summary
+#                   (see gen_order.py for the computation and the reply every server must send)
+# Bodies are read by Content-Length (chunked bodies aren't supported).
+#   vu build --release server.vu -o server && ./server 8080
+import json
+
+const MAX_BODY = 1048576
+
+# The index just past the first blank line ("\r\n\r\n") at or after from, or -1 if there is none yet.
+fn head_end(buf: Str, from: Int) -> Int:
+  var i = from
+  while i + 3 < buf.len:
+    if buf[i + 3] != '\n':
+      i += 1
+    elif buf[i] == '\r' and buf[i + 1] == '\n' and buf[i + 2] == '\r':
+      return i + 4
+    else:
+      i += 1
+  return -1
+
+fn lower(b: Byte) -> Byte:
+  if b >= 'A' and b <= 'Z': return b + 32
+  return b
+
+# The Content-Length header of the request head buf[a..b]: 0 if there is none, -1 if it's malformed.
+fn content_length(buf: Str, a: Int, b: Int) -> Int:
+  let name = "\r\ncontent-length:"
+  var i = a
+  while i + name.len <= b:
+    var j = 0
+    while j < name.len and lower(buf[i + j]) == name[j]:
+      j += 1
+    if j == name.len:
+      var k = i + j
+      while k < b and buf[k] == ' ':
+        k += 1
+      var n = 0
+      var digits = 0
+      while k < b and buf[k] >= '0' and buf[k] <= '9' and digits < 10:
+        n = n * 10 + int(buf[k]) - 48
+        k += 1
+        digits += 1
+      if digits == 0: return -1
+      while k < b and buf[k] == ' ':
+        k += 1
+      if k >= b or buf[k] != '\r': return -1
+      return n
+    i += 1
+  return 0
+
+# Whether buf[a..b] starts with p.
+fn starts(buf: Str, a: Int, b: Int, p: Str) -> Bool:
+  if b - a < p.len: return false
+  for i in 0..p.len:
+    if buf[a + i] != p[i]: return false
+  return true
+
+fn respond(var out: Str, status: Str, kind: Str, body: Str):
+  out += "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {body.len}\r\n\r\n"
+  out += body
+
+# ---- the JSON endpoint
+
+fn int_of(v: json.Json, what: Str) -> Int throws:
+  match v:
+    json.Whole(n): return n
+    _: fail "{what} must be an integer"
+
+fn text_of(v: json.Json, what: Str) -> Str throws:
+  match v:
+    json.Text(s): return s
+    _: fail "{what} must be a string"
+
+fn field(o: {Str: json.Json}, k: Str) -> Str throws:
+  if not (k in o): fail "missing field '{k}'"
+  return k
+
+fn order(own body: Str) -> Str throws:
+  let doc = json.parse(body)?
+  var out = ""
+  match doc:
+    json.Obj(o):
+      let id = text_of(o[field(o, "id")?], "id")?
+      var name = ""
+      match o[field(o, "customer")?]:
+        json.Obj(c): name = text_of(c[field(c, "name")?], "customer.name")?
+        _: fail "customer must be an object"
+      var coupon = ""
+      if "coupon" in o:
+        coupon = text_of(o["coupon"], "coupon")?
+      var count = 0
+      var quantity = 0
+      var subtotal = 0
+      var gifts = 0
+      var bulk = "["
+      match o[field(o, "items")?]:
+        json.Arr(items):
+          for it in items:
+            match it:
+              json.Obj(f):
+                let qty = int_of(f[field(f, "qty")?], "qty")?
+                subtotal += qty * int_of(f[field(f, "price_cents")?], "price_cents")?
+                quantity += qty
+                count += 1
+                if "gift" in f:
+                  match f["gift"]:
+                    json.Flag(g):
+                      if g: gifts += 1
+                    _: fail "gift must be true or false"
+                if qty >= 5:
+                  if bulk.len > 1: bulk += ","
+                  json.quote(text_of(f[field(f, "sku")?], "sku")?, &bulk)
+              _: fail "every item must be an object"
+        _: fail "items must be a list"
+      bulk += "]"
+      var discount = 0
+      if coupon == "SAVE10": discount = subtotal / 10
+      out += "{{\"id\":"
+      json.quote(id, &out)
+      out += ",\"customer\":"
+      json.quote(name, &out)
+      out += ",\"items\":{count},\"quantity\":{quantity},\"subtotal\":{subtotal},\"discount\":{discount}"
+      out += ",\"total\":{subtotal - discount},\"gifts\":{gifts},\"bulk\":{bulk}}}"
+    _: fail "an order must be a JSON object"
+  return out
+
+# Answers one request (method and path from the request line in buf[a..]) into out.
+fn handle(buf: Str, a: Int, body_at: Int, body_end: Int, var out: Str):
+  if starts(buf, a, body_at, "GET / "):
+    respond(&out, "200 OK", "text/plain", "Hello, World!")
+  elif starts(buf, a, body_at, "POST /order "):
+    match order(buf[body_at..body_end]):
+      ok(reply): respond(&out, "200 OK", "application/json", reply)
+      err(e):
+        var msg = "{{\"error\":"
+        json.quote(e, &msg)
+        msg += "}}"
+        respond(&out, "400 Bad Request", "application/json", msg)
+  else:
+    respond(&out, "404 Not Found", "text/plain", "not found")
+
+# One task per connection: it reads requests, answers each, and ends when the client closes or is idle
+# for a minute.
+fn serve(net: Net, own c: Conn):
+  var buf = ""
+  while true:
+    let data = net.recv(c, timeout: 60.0) else ""
+    if data.len == 0: return
+    if buf.len == 0:
+      buf = data
+    else:
+      buf += data
+    var out = ""
+    var at = 0
+    var broken = false
+    while true:
+      let end = head_end(buf, at)
+      if end < 0: break
+      let n = content_length(buf, at, end)
+      if n < 0 or n > MAX_BODY:
+        respond(&out, "400 Bad Request", "text/plain", "bad Content-Length")
+        broken = true
+        break
+      if end + n > buf.len: break
+      handle(buf, at, end, end + n, &out)
+      at = end + n
+    if out.len > 0:
+      net.send(c, out, timeout: 60.0) else return
+    if broken: return
+    if at == buf.len:
+      buf = ""
+    elif at > 0:
+      buf = buf[at..buf.len]
+
+fn main(net: Net) throws:
+  let l = net.listen(arg(1, 8080))?
+  while true:
+    let c = net.accept(l) else continue
+    spawn serve(net, c)

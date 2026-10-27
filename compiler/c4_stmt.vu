@@ -1,0 +1,925 @@
+# ============================================================================ statements
+# (each returns true if control never falls through)
+
+# Runs a block whose scope the caller has already pushed (after declaring any bindings in it).
+fn run_block(var g: G, b: Node) -> Bool:
+  let div = stmts(&g, b)
+  if not div:
+    let si = g.scopes.len - 1
+    let order = copy_ints(g.scopes[si].order)
+    var j = order.len - 1
+    while j >= 0:
+      let v = order[j]
+      if g.vars[v].kind == "local" and not is_copy(g, g.vars[v].ty) and g.vars[v].state != "yes":
+        emit(&g, drop_code(g, g.vars[v].ty, g.vars[v].cname))
+      j -= 1
+  let sc = g.scopes.pop()
+  var u = sc.unfreeze.len - 1
+  while u >= 0:
+    g.vars[sc.unfreeze[u]].frozen.pop()
+    u -= 1
+  return div
+
+fn block(var g: G, b: Node, loop: Bool) -> Bool:
+  push_scope(&g, loop)
+  return run_block(&g, b)
+
+fn last_names(e: Node, i: Int, var last: {Str: Int}):
+  if e.k == "name": last[e.name] = i
+  for k in e.kids: last_names(k, i, &last)
+
+fn count_names(e: Node, var counts: {Str: Int}):
+  if e.k == "name": counts[e.name] = counts.get(e.name, 0) + 1
+  for k in e.kids: count_names(k, &counts)
+
+type Hoist:
+  found: [Node]
+  effect: Bool
+
+fn hoist_refuse(g: G, e: Node, where: Str):
+  if e.k == "try": err(g, e.line, "'?' can't be used " + where)
+  for k in e.kids: hoist_refuse(g, k, where)
+
+fn hoist_walk(var g: G, e: Node, top: Bool, var h: Hoist):
+  if e.k == "lambda": return   # its ? run when it's called, inside its own function
+  if e.k == "try":
+    # what its call evaluates first: the receiver and the arguments (not the call itself)
+    let c = e.kids[0]
+    if c.k == "call":
+      for i in 0..c.kids.len: hoist_walk(&g, c.kids[i], false, &h)
+    else: hoist_walk(&g, c, false, &h)
+    if top: return
+    if h.effect: err(g, e.line, "this '?' is inside an expression that already did something before it (a call to its left); move that part to its own statement first")
+    h.found.push(copy_node(e))   # (all of them are moved first, in order, so they don't block each other)
+    return
+  if e.k == "bin" and (e.op == "and" or e.op == "or"):
+    hoist_walk(&g, e.kids[0], false, &h)
+    hoist_refuse(g, e.kids[1], "on the right of '" + e.op + "' (it would run even when '" + e.op + "' skips that side); use an if instead")
+    return
+  if e.k == "orelse":
+    hoist_walk(&g, e.kids[0], top, &h)
+    if not e.flag: hoist_refuse(g, e.kids[1], "in an 'else' fallback (it would run even when the fallback isn't needed)")
+    elif (e.kids[1].k == "return" or e.kids[1].k == "fail") and e.kids[1].kids.len > 0:
+      hoist_refuse(g, e.kids[1].kids[0], "in an 'else " + e.kids[1].k + "' value (it would run even when the call succeeds)")
+    return
+  if e.k == "call":
+    for i in 0..e.kids.len: hoist_walk(&g, e.kids[i], false, &h)
+    if not (e.kids[0].k == "name" and is_pure_builtin(e.kids[0].name)): h.effect = true
+    return
+  for k in e.kids: hoist_walk(&g, k, false, &h)
+
+# `?` inside an expression (items.push(value(&p)?)): each one becomes a hidden `let` just before the
+# statement, in the order they're written, and the expression uses that variable. Nothing the
+# statement evaluates before a ? may change anything, or moving the ? first would reorder it.
+fn hoist_tries(var g: G, st: Node):
+  var h = Hoist([], false)
+  let k = st.k
+  if k == "let" or k == "exprstmt" or k == "return" or k == "fail" or k == "spawn":
+    if st.kids.len > 0: hoist_walk(&g, st.kids[0], true, &h)
+  elif k == "assign":
+    hoist_walk(&g, st.kids[1], true, &h)   # the value is computed before the target's index
+    hoist_walk(&g, st.kids[0], false, &h)
+  elif k == "if": hoist_walk(&g, st.kids[0], false, &h)
+  elif k == "while": hoist_refuse(g, st.kids[0], "in a while condition, which runs again on every pass; write 'while true:', then 'let c = ...?' and 'if not c: break' inside")
+  elif k == "range":
+    hoist_walk(&g, st.kids[0], false, &h)
+    hoist_walk(&g, st.kids[1], false, &h)
+    if st.flag2: hoist_walk(&g, st.kids[2], false, &h)
+  elif k == "each" or k == "match": hoist_walk(&g, st.kids[0], false, &h)
+  # Inner ones come first (an outer ?'s call then reads the inner one's variable).
+  for t in h.found:
+    g.ntry += 1
+    let name = "$t{g.ntry}"
+    var hl = synth_node(&g, "let", t.line)
+    hl.name = name + ""
+    hl.kids.push(copy_node(t))
+    s_let(&g, hl)
+    g.hoisted[t.id] = name
+
+fn stmts(var g: G, b: Node) -> Bool:
+  var div = false
+  var need = false
+  # (vu.py works this out lazily; computing it for more blocks gives the same answers)
+  if g.own_str: need = true
+  for st in b.kids:
+    if st.k == "assign" and st.op == "=" and st.kids[0].k == "index": need = true
+  var r = Rest(0, {}, {})
+  if need:
+    for i in 0..b.kids.len: last_names(b.kids[i], i, &r.last)
+  g.rest.push(r)
+  for i in 0..b.kids.len:
+    let st = b.kids[i]
+    if div: err(g, st.line, "unreachable code (the code before it always returns, breaks, or continues)")
+    g.rest[g.rest.len - 1].idx = i
+    if need:
+      var counts: {Str: Int} = {}
+      count_names(st, &counts)
+      g.rest[g.rest.len - 1].cur = counts
+    # VU_AT records the line for panic backtraces (quick builds only; nothing in optimized builds).
+    # A par loop body runs on several threads at once, so it doesn't write the frame.
+    let outer = g.src_line
+    g.src_line = st.line
+    if not g.par_on: emit(&g, "VU_AT({st.line});")
+    hoist_tries(&g, st)
+    div = stmt(&g, st)
+    g.src_line = outer
+  g.rest.pop()
+  return div
+
+fn stmt(var g: G, n: Node) -> Bool:
+  let k = n.k
+  if k == "let": return s_let(&g, n)
+  if k == "exprstmt": return s_exprstmt(&g, n)
+  if k == "spawn": return s_spawn(&g, n)
+  if k == "assign": return s_assign(&g, n)
+  if k == "return": return s_return(&g, n)
+  if k == "fail": return s_fail(&g, n)
+  if k == "break" or k == "continue": return loop_exit(&g, n, k)
+  if k == "if": return s_if(&g, n)
+  if k == "while": return s_while(&g, n)
+  if k == "range": return s_range(&g, n)
+  if k == "each": return s_each(&g, n)
+  if k == "match": return s_match(&g, n)
+  if k == "fnstmt": return s_fnstmt(&g, n)
+  err(g, n.line, "internal error: unknown statement " + k)
+  return false
+
+# Is e a Str variable owned by this block and never mentioned again in it? Then it can be moved
+# instead of copied. If this is ever wrong, the variable is marked moved, so a later use is a compile
+# error, never a memory error.
+fn last_use(var g: G, e: Node) -> Int:
+  if e.k != "name" or g.rest.len == 0: return -1
+  let v = lookup(g, e.name)
+  if v < 0: return -1
+  if g.vars[v].kind != "local" or g.vars[v].ty != "Str" or g.vars[v].state != "no" or g.vars[v].frozen.len > 0: return -1
+  let si = g.scopes.len - 1
+  if g.scopes[si].vars.get(e.name, -1) != v: return -1
+  let ri = g.rest.len - 1
+  if g.rest[ri].last.get(e.name, -1) > g.rest[ri].idx: return -1
+  return v
+
+# The value of a whole statement right-hand side. Handles f(x)?: if the call fails, every live value
+# is freed and the error is returned to this function's caller.
+fn stmt_value(var g: G, e: Node, expect: Str) -> CT:
+  if e.k != "try": return value(&g, e, expect)
+  let call = e.kids[0]
+  if not throwing_call(&g, call):
+    err(g, e.line, "'?' passes on the error of a call to a function marked throws, and this isn't one")
+  if not g.fails and g.lam_names.len > 0:
+    err(g, e.line, "'?' can only be used inside a closure that can fail: mark it (fn(x: T) -> R throws => ...) or pass it where a function that throws is expected; or handle the error with 'else'")
+  if not g.fails:
+    err(g, e.line, "'?' can only be used inside a function marked throws; here, handle the error with 'else' or with match ... ok(v): / err(e):")
+  if g.par_on:
+    err(g, e.line, "'?' would leave the par loop on line {lnum(g.par_line)} early; handle the error with 'else' or match instead")
+  let cr = throw_code(&g, call, expect)
+  let mine = err_of(g.rett)
+  let theirs = err_of(cr.ty)
+  if mine != "" and theirs != mine:
+    var what = "a message"
+    if theirs != "": what = tn(theirs) + " values"
+    err(g, e.line, "this call fails with " + what + ", but this function fails with " + tn(mine) + " values; handle its error with else or match (and fail with a " + tn(mine) + ")")
+  let rv = tmp(&g)
+  emit(&g, ct(g, cr.ty) + " " + rv + " = " + cr.code + ";")
+  open(&g, "if (" + rv + ".bad) {{")
+  emit_drops_from(&g, 0)
+  if mine != "":
+    emit(&g, "return (" + ct(g, g.rett) + "){{.bad = 1, .err = " + rv + ".err, .eval = " + rv + ".eval}};")
+  else:
+    if theirs != "" and not is_copy(g, theirs): emit(&g, drop_code(g, theirs, rv + ".eval"))   # passed on as its message only
+    emit(&g, "return (" + ct(g, g.rett) + "){{.bad = 1, .err = " + rv + ".err}};")
+  close(&g)
+  if inner_of(cr.ty) == "~void": return CT("", "~void")
+  return coerce(g, rv + ".val", inner_of(cr.ty), expect, e.line)
+
+fn s_fail(var g: G, n: Node) -> Bool:
+  if not g.fails: err(g, n.line, "only a function marked throws can fail; mark it (fn f() -> T throws:) or use panic(...)")
+  if g.par_on: err(g, n.line, "'fail' can't leave the par loop on line {lnum(g.par_line)} early")
+  let et = err_of(g.rett)
+  if et != "":
+    if probe_type(&g, n.kids[0]) == "Str":
+      var hint = g.enums[et].variants[0].name + ""
+      if g.enums[et].variants[0].fields.len > 0: hint += "(...)"
+      err(g, n.line, "this function fails with " + tn(et) + " values (throws " + tn(et) + "), so fail with one, like: fail " + hint)
+    let ec = value(&g, n.kids[0], et)
+    let eev = tmp(&g)
+    open(&g, "{{")
+    emit(&g, ct(g, et) + " " + eev + " = " + ec.code + ";")
+    emit_drops_from(&g, 0)
+    emit(&g, "return (" + ct(g, g.rett) + "){{.bad = 1, .err = vu_etext_" + et + "(&" + eev + "), .eval = " + eev + "}};")
+    close(&g)
+    return true
+  let pt = probe_type(&g, n.kids[0])
+  if tkind(g, pt) == "enum":
+    err(g, n.line, "to fail with " + tn(pt) + " values, declare the function 'throws " + tn(pt) + "'; a plain 'throws' fails with a message (Str)")
+  let c = value(&g, n.kids[0], "Str")
+  let ev = tmp(&g)
+  open(&g, "{{")
+  emit(&g, "vu_str " + ev + " = " + c.code + ";")
+  emit_drops_from(&g, 0)
+  emit(&g, "return (" + ct(g, g.rett) + "){{.bad = 1, .err = " + ev + "}};")
+  close(&g)
+  return true
+
+fn add_hidden(var g: G, t: Str, line: Int) -> Str:
+  let cname = tmp(&g)
+  let hv = new_var(&g, "$", t, cname, "local", false, false, line)
+  return cname
+
+fn order_push(var g: G, v: Int):
+  let si = g.scopes.len - 1
+  g.scopes[si].order.push(v)
+
+fn finish_ends(var g: G, ends: [Snap]) -> Bool:
+  if ends.len == 0: return true
+  merge(&g, ends)
+  return false
+
+fn s_match(var g: G, n: Node) -> Bool:
+  if throwing_call(&g, n.kids[0]): return match_result(&g, n)
+  open(&g, "{{")
+  push_scope(&g, false)
+  let r = gen(&g, n.kids[0], "")
+  let t = r.ty
+  if tkind(g, t) != "enum": err(g, n.line, "match works on enum values and on calls that can fail, not on " + tn(t))
+  let sp = tmp(&g)
+  if not r.p.ok:
+    let cname = tmp(&g)
+    let hv = new_var(&g, "$", t, cname, "local", false, false, n.line)
+    emit(&g, ct(g, t) + " " + cname + " = " + r.code + ";")
+    order_push(&g, hv)
+    emit(&g, ct(g, t) + " *" + sp + " = &" + cname + ";")
+  else:
+    if n.flag: write_check(g, r.p, n.line, false)
+    emit(&g, ct(g, t) + " *" + sp + " = &" + r.p.code + ";")
+  # An arm names a variant of the matched enum, so in another module's enum (geo__Shape) the arm
+  # Circle means geo__Circle.
+  let prefix = module_prefix(template_of(g, t))
+  var seen: {Str: Int} = {}
+  var dflt = -1
+  var dline = 0
+  var vnames: [Str] = []
+  for v in g.enums[t].variants: vnames.push(v.name[prefix.len..v.name.len])
+  for ai in 1..n.kids.len:
+    let arm = n.kids[ai]
+    # A qualified arm (geo.Circle) names the module itself.
+    var pname = arm.name + ""
+    if pname != "_":
+      if find_sub(pname, ".", 0) >= 0: pname = replace_all(pname, ".", "__")
+      else: pname = prefix + arm.name
+    if pname == "_":
+      if arm.flag: err(g, arm.line, "'_' matches anything and takes no names")
+      if dflt >= 0: err(g, arm.line, "'_' is already used on line {lnum(dline)}")
+      dflt = ai
+      dline = arm.line
+      continue
+    if not (pname in g.variants and g.variants[pname] == template_of(g, t)):
+      err(g, arm.line, arm.name + " is not a variant of " + disp(t) + " (its variants are: " + join(vnames, ", ") + ")")
+    if pname in seen: err(g, arm.line, arm.name + " is matched twice (also on line {lnum(seen[pname])})")
+    seen[pname] = arm.line
+    let nf = g.enums[t].variants[variant_index(g, t, pname)].fields.len
+    if arm.flag and arm.names.len != nf:
+      err(g, arm.line, arm.name + " holds {nf} value(s), so write " + arm.name + "(...) with {nf} name(s) (use _ for one you don't need)")
+  var missing: [Str] = []
+  for vn in vnames:
+    if not (prefix + vn in seen): missing.push(vn)
+  if missing.len > 0 and dflt < 0:
+    err(g, n.line, "match doesn't handle " + join(missing, ", ") + "; add an arm for each, or a '_' arm")
+  if dflt >= 0 and missing.len == 0: err(g, dline, "every variant already has an arm, so '_' would never run")
+  if r.p.ok:
+    var mode = "read"
+    if n.flag: mode = "lock"
+    g.vars[r.p.root].frozen.push(Frz(mode, n.line))
+  let snap = snapshot(g)
+  var ends: [Snap] = []
+  var arms: [Int] = []
+  for ai in 1..n.kids.len:
+    if n.kids[ai].name != "_": arms.push(ai)
+  for idx in 0..arms.len:
+    let arm = n.kids[arms[idx]]
+    var akey = prefix + arm.name
+    if find_sub(arm.name, ".", 0) >= 0: akey = replace_all(arm.name, ".", "__")
+    let k = variant_index(g, t, akey)
+    let last = idx == arms.len - 1 and dflt < 0
+    if idx == 0:
+      if last: open(&g, "{{")
+      else: open(&g, "if (" + sp + "->tag == {k}) {{")
+    else:
+      if last: open(&g, "else {{")
+      else: open(&g, "else if (" + sp + "->tag == {k}) {{")
+    push_scope(&g, false)
+    let fields = copy_flds(g.enums[t].variants[k].fields)
+    var bi = 0
+    while bi < arm.names.len and bi < fields.len:
+      let b = arm.names[bi]
+      if b != "_":
+        let cname = var_cname(&g, b)
+        let v = new_var(&g, b, fields[bi].ty, cname, "ref", n.flag, true, arm.line)
+        declare(&g, v)
+        emit(&g, ct(g, fields[bi].ty) + " *" + cname + " = &" + payload(g, t, k, sp) + cf(fields[bi].name) + ";")
+      bi += 1
+    if not run_block(&g, arm.kids[0]): ends.push(snapshot(g))
+    restore(&g, snap)
+    close(&g)
+  if dflt >= 0:
+    if arms.len > 0: open(&g, "else {{")
+    else: open(&g, "{{")
+    if not block(&g, n.kids[dflt].kids[0], false): ends.push(snapshot(g))
+    restore(&g, snap)
+    close(&g)
+  if r.p.ok: g.vars[r.p.root].frozen.pop()
+  let sc = g.scopes.pop()
+  emit_drops_scope(&g, sc)
+  close(&g)
+  return finish_ends(&g, ends)
+
+# match f(x): with ok(v) and err(e) arms, for a call to a function that can fail.
+fn match_result(var g: G, n: Node) -> Bool:
+  let call = n.kids[0]
+  open(&g, "{{")
+  push_scope(&g, false)
+  let cr = throw_code(&g, call, "")
+  let rt = cr.ty
+  let cname = tmp(&g)
+  let hv = new_var(&g, "$", rt, cname, "local", false, false, n.line)
+  emit(&g, ct(g, rt) + " " + cname + " = " + cr.code + ";")
+  order_push(&g, hv)
+  let t = inner_of(rt)
+  var arms: {Str: Int} = {}
+  for ai in 1..n.kids.len:
+    let arm = n.kids[ai]
+    let pname = arm.name
+    if pname != "ok" and pname != "err" and pname != "_":
+      err(g, arm.line, "a call that can fail is matched with ok(value) and err(message) arms, not " + pname)
+    if pname in arms: err(g, arm.line, "'" + pname + "' is matched twice")
+    var want = 1
+    if pname == "_" or (pname == "ok" and t == "~void"): want = 0
+    if arm.names.len > want: err(g, arm.line, "'" + pname + "' takes {want} name(s)")
+    arms[pname] = ai
+  if "_" in arms and "ok" in arms and "err" in arms:
+    err(g, n.kids[arms["_"]].line, "ok and err are both handled, so '_' would never run")
+  if not ("_" in arms) and not ("ok" in arms and "err" in arms):
+    err(g, n.line, "handle both ok(value) and err(message), or add a '_' arm")
+  let snap = snapshot(g)
+  var ends: [Snap] = []
+  for wi in 0..2:
+    var which = "ok"
+    if wi == 1: which = "err"
+    var ai = arms.get(which, -1)
+    if ai < 0: ai = arms["_"]
+    let arm = n.kids[ai]
+    if wi == 0: open(&g, "if (!" + cname + ".bad) {{")
+    else: open(&g, "else {{")
+    push_scope(&g, false)
+    for b in arm.names:
+      if b == "_": continue
+      var ty = t + ""
+      var field = "val"
+      if wi == 1 and err_of(rt) != "":
+        ty = err_of(rt)   # throws E: the error value itself
+        field = "eval"
+      elif wi == 1:
+        ty = "Str"
+        field = "err"
+      let vc = var_cname(&g, b)
+      let v = new_var(&g, b, ty, vc, "ref", false, true, arm.line)
+      declare(&g, v)
+      emit(&g, ct(g, ty) + " *" + vc + " = &" + cname + "." + field + ";")
+    if not run_block(&g, arm.kids[0]): ends.push(snapshot(g))
+    restore(&g, snap)
+    close(&g)
+  let sc = g.scopes.pop()
+  emit_drops_scope(&g, sc)
+  close(&g)
+  return finish_ends(&g, ends)
+
+# A borrowing closure bound to a name points at what it captures until its block ends, so those
+# variables can be read meanwhile but not changed or moved.
+fn freeze_caps(var g: G, lam: Node, line: Int):
+  if not (lam.id in g.lam_caps): return
+  let caps = copy_ints(g.lam_caps[lam.id])
+  let si = g.scopes.len - 1
+  for v in caps:
+    g.vars[v].frozen.push(Frz("read", line))
+    g.scopes[si].unfreeze.push(v)
+
+# fn name(...): ... inside a function: a closure bound to name, like a let.
+fn s_fnstmt(var g: G, n: Node) -> Bool:
+  let lam = n.kids[0]
+  let c = g_lambda(&g, lam, "")
+  let cname = var_cname(&g, lam.name)
+  let v = new_var(&g, lam.name, c.ty, cname, "local", false, false, n.line)
+  declare(&g, v)
+  emit(&g, "vu_fn " + cname + " = " + c.code + ";")
+  freeze_caps(&g, lam, n.line)
+  return false
+
+fn s_let(var g: G, n: Node) -> Bool:
+  var ty = ""
+  if n.ty != "": ty = resolve(&g, n.ty, n.line)
+  let e = n.kids[0]
+  if e.k == "lambda":
+    var lc = g_lambda(&g, e, ty)
+    if tkind(g, lc.ty) == "lfn":
+      if n.flag: err(g, n.line, "a closure that borrows local variables can't be a 'var' (it would be stored); use let, or 'own fn' to give it its own copies of them")
+      if ty != "" and ty != owned_fn(lc.ty):
+        if tkind(g, ty) == "opt" and inner_of(ty) == owned_fn(lc.ty): lfn_escape(g, e.line)
+        err(g, n.line, "expected " + tn(ty) + ", found " + tn(lc.ty))
+    else: lc = coerce(g, lc.code, lc.ty, ty, n.line)
+    let lname = var_cname(&g, n.name)
+    let lv = new_var(&g, n.name, lc.ty, lname, "local", n.flag, false, n.line)
+    declare(&g, lv)
+    emit(&g, ct(g, lc.ty) + " " + lname + " = " + lc.code + ";")
+    freeze_caps(&g, e, n.line)
+    return false
+  var c = CT("", "")
+  if not n.flag and (e.k == "name" or e.k == "field" or e.k == "index"):
+    let r = gen(&g, e, ty)
+    if r.p.ok and not is_copy(g, r.ty) and r.ty != "Str" and (not r.p.is_name or g.vars[r.p.root].kind != "local" or g.vars[r.p.root].frozen.len > 0):
+      # The value can't be moved (it's part of something, or borrowed), so `let` names it instead:
+      # a read-only view. What it's part of is frozen for reading until the view's block ends.
+      if ty != "" and ty != r.ty: err(g, n.line, "expected " + tn(ty) + ", found " + tn(r.ty))
+      let vc = var_cname(&g, n.name)
+      let v = new_var(&g, n.name, r.ty, vc, "view", false, true, n.line)
+      declare(&g, v)
+      emit(&g, ct(g, r.ty) + " *" + vc + " = &" + r.p.code + ";")
+      g.vars[r.p.root].frozen.push(Frz("read", n.line))
+      let si = g.scopes.len - 1
+      g.scopes[si].unfreeze.push(r.p.root)
+      return false
+    var code = r.code + ""
+    if r.p.ok and not is_copy(g, r.ty): code = move_place(&g, r.p, e.line)
+    c = coerce(g, code, r.ty, ty, e.line)
+  else:
+    c = stmt_value(&g, e, ty)
+  if c.ty == "~void": err(g, n.line, "this call doesn't produce a value")
+  if c.ty == "~nil": err(g, n.line, "can't tell the type of nil; write: let " + n.name + ": Type? = nil")
+  if n.flag and tkind(g, c.ty) == "lfn": err(g, n.line, "a closure that borrows local variables can't be a 'var' (it would be stored); use let, or 'own fn' to give it its own copies of them")
+  let cname = var_cname(&g, n.name)
+  let v = new_var(&g, n.name, c.ty, cname, "local", n.flag, false, n.line)
+  declare(&g, v)
+  emit(&g, ct(g, c.ty) + " " + cname + " = " + c.code + ";")
+  return false
+
+# spawn f(args): run f as a new task. The arguments move into it, so every parameter that isn't plain
+# data or a capability is 'own'; f can't fail and returns nothing.
+fn s_spawn(var g: G, n: Node) -> Bool:
+  let e = n.kids[0]
+  if e.k == "call" and e.kids[0].k == "name": not_shadowed(g, e)
+  if e.k == "call" and e.kids[0].k == "name" and lookup(g, e.kids[0].name) >= 0:
+    err(g, n.line, "spawn runs a named function as a new task, and '" + e.kids[0].name + "' is a variable here; to run a closure in a task, pass it to a function that calls it: spawn run(own f) with fn run(own f: fn())")
+  var gen_name = ""
+  if e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.gfn_nodes and lookup(g, e.kids[0].name) < 0: gen_name = gcall(&g, e, "")
+  if gen_name == "" and (e.k != "call" or e.kids[0].k != "name" or not (e.kids[0].name in g.fns)):
+    err(g, n.line, "spawn runs a function call as a new task, like: spawn handle(net, conn)")
+  var name = e.kids[0].name + ""
+  if gen_name != "": name = gen_name
+  let d = disp(name)
+  if name == "main": err(g, n.line, "main can't be spawned")
+  if name in g.extern_fns: err(g, n.line, d + "() is C code; spawn runs a Vu function")
+  if g.fns[name].fails:
+    err(g, n.line, "spawn " + d + "(): a task's function can't fail, since no caller receives its error; handle errors inside it (or send them on a channel)")
+  if g.fns[name].ret != "~void":
+    err(g, n.line, "spawn " + d + "(): a task's function returns nothing, since no caller receives its result; send results on a channel")
+  for pa in g.fns[name].params:
+    if pa.is_var: err(g, n.line, "spawn " + d + "(): parameter '" + pa.name + "' is 'var', but a task can't change its spawner's variables")
+    if not pa.is_own and not is_scalar(pa.ty) and tkind(g, pa.ty) != "cap":
+      err(g, n.line, "spawn " + d + "(): the task takes its arguments with it, so parameter '" + pa.name + "' must be 'own' (own " + pa.name + ": " + tn(pa.ty) + ")")
+  if g.par_on: err(g, n.line, "spawn can't be used inside a par loop")
+  g.uses_tasks = true
+  var seen = false
+  for s in g.spawned:
+    if s == name: seen = true
+  if not seen: g.spawned.push(name + "")
+  let c = call_user_or_spawn(&g, e, name, false, n.line)
+  emit(&g, c.code + ";")
+  return false
+
+fn s_exprstmt(var g: G, n: Node) -> Bool:
+  let e = n.kids[0]
+  if e.k != "call" and e.k != "try" and e.k != "orelse":
+    err(g, n.line, "this line computes a value but does nothing with it; assign it with 'let x = ...'")
+  var code = ""
+  var t = ""
+  if e.k == "try":
+    let c = stmt_value(&g, e, "")
+    if c.ty == "~void": return false
+    code = c.code
+    t = c.ty
+  else:
+    let r = gen(&g, e, "")
+    code = r.code
+    t = r.ty
+  if t == "~void": emit(&g, code + ";")
+  elif is_copy(g, t): emit(&g, "(void)" + code + ";")
+  else:
+    let tv = tmp(&g)
+    emit(&g, "{{ " + ct(g, t) + " " + tv + " = " + code + "; " + drop_code(g, t, tv) + " }}")
+  return diverging_call(e)
+
+fn s_assign(var g: G, n: Node) -> Bool:
+  let target = n.kids[0]
+  let rhs = n.kids[1]
+  if target.k != "name" and target.k != "field" and target.k != "index":
+    err(g, n.line, "can only assign to a variable, field, or list element")
+  if target.k == "index" and n.op == "=":
+    let mt = probe_type(&g, target.kids[0])
+    if mt != "" and tkind(g, mt) == "map": return map_insert(&g, n, mt)
+  let p = place(&g, target)
+  if not p.ok:
+    if target.k == "index" and probe_type(&g, target.kids[0]) == "Str":
+      err(g, n.line, "strings can't be changed in place; build a new one, or use a [Byte] list")
+    if computed_key(&g, target):
+      err(g, n.line, "to change part of a map value, put the key in a variable first: let k = ...; m[k].x = ...")
+    err(g, n.line, "can't assign to this (constants can't change)")
+  write_check(g, p, n.line, n.op == "=")
+  let ty = ct(g, p.ty)
+  let tv = tmp(&g)
+  let pp = tmp(&g)
+  if n.op == "=":
+    let c = stmt_value(&g, rhs, p.ty)
+    if not p.is_name: read_check(g, p, n.line)
+    if not is_copy(g, p.ty):
+      emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + ty + " *" + pp + " = &" + p.code + "; drop_" + mg(g, p.ty) + "(" + pp + "); *" + pp + " = " + tv + "; }}")
+    elif p.is_name or not effects(&g, rhs):
+      emit(&g, p.code + " = " + c.code + ";")
+    else:
+      emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + p.code + " = " + tv + "; }}")
+    if p.is_name:
+      g.vars[p.root].state = "no"
+      g.vars[p.root].moved_line = 0
+    return false
+  if p.ty == "Str":
+    if n.op != "+=": err(g, n.line, "strings support '+=' (append), not '" + n.op + "'")
+    if rhs.k == "slice" and probe_type(&g, rhs.kids[0]) == "Str":
+      let b = bw_begin(&g, rhs.kids[0], "")
+      pure_index(&g, rhs.kids[1])
+      pure_index(&g, rhs.kids[2])
+      let lo = value(&g, rhs.kids[1], "Int")
+      let hi = value(&g, rhs.kids[2], "Int")
+      let r = bw_end(&g, rhs.kids[0], b, "vu_str_cat_slice(&" + p.code + ", &" + b.code + ", " + lo.code + ", " + hi.code + ", {n.line})", "~void")
+      emit(&g, r.code + ";")
+      return false
+    let b = bw_begin(&g, rhs, "")
+    if b.ty != "Str": err(g, n.line, "can only append a Str to a string; to add a " + tn(b.ty) + " x, write s += \"{{x}}\"")
+    let r = bw_end(&g, rhs, b, "vu_str_cat(&" + p.code + ", &" + b.code + ")", "~void")
+    emit(&g, r.code + ";")
+    return false
+  if p.ty != "Int" and p.ty != "Float" and p.ty != "Byte":
+    err(g, n.line, "'" + n.op + "' needs a number on the left, not " + tn(p.ty))
+  let c = stmt_value(&g, rhs, p.ty)
+  let op = n.op[0..1]
+  if p.ty == "Float" and (op == "%" or op == "&" or op == "|" or op == "^"):
+    err(g, n.line, "'" + n.op + "' needs an Int or Byte")
+  var fname = ""
+  if p.ty == "Int": fname = int_op(op)
+  elif p.ty == "Byte": fname = byte_op(op)
+  if fname != "":
+    emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + ty + " *" + pp + " = &" + p.code + "; *" + pp + " = " + fname + "(*" + pp + ", " + tv + ", {n.line}); }}")
+  elif effects(&g, rhs):
+    emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + p.code + " " + n.op + " " + tv + "; }}")
+  else:
+    emit(&g, p.code + " " + n.op + " " + c.code + ";")
+  return false
+
+# m[k] = v: insert or replace. The map keeps its own copy of the key.
+fn map_insert(var g: G, n: Node, mt: Str) -> Bool:
+  let target = n.kids[0]
+  let mp = place(&g, target.kids[0])
+  if not mp.ok: err(g, n.line, "can only insert into a map stored in a variable")
+  write_check(g, mp, n.line, false)
+  let c = stmt_value(&g, n.kids[1], map_val(mt))
+  read_check(g, mp, n.line)
+  pure_index(&g, target.kids[1])
+  let tv = tmp(&g)
+  let ke = target.kids[1]
+  let key = map_key(mt)
+  let val = map_val(mt)
+  if key == "Str" and not place(&g, ke).ok and not (ke.k == "str" and all_text(ke)):
+    let kc = value(&g, ke, "Str")
+    let kv = tmp(&g)
+    emit(&g, "{{ " + ct(g, val) + " " + tv + " = " + c.code + "; vu_str " + kv + " = " + kc.code + "; vu_mtake_" + mg(g, mt) + "(&" + mp.code + ", &" + kv + ", " + tv + ", {n.line}); }}")
+    return false
+  if key == "Str":
+    let kvar = last_use(&g, ke)
+    if kvar >= 0:
+      let kp = place(&g, ke)
+      let kc = move_place(&g, kp, n.line)
+      let kv = tmp(&g)
+      emit(&g, "{{ " + ct(g, val) + " " + tv + " = " + c.code + "; vu_str " + kv + " = " + kc + "; vu_mtake_" + mg(g, mt) + "(&" + mp.code + ", &" + kv + ", " + tv + ", {n.line}); }}")
+      return false
+  let kr = key_ref(&g, ke, key, n.line)
+  emit(&g, "{{ " + ct(g, val) + " " + tv + " = " + c.code + "; vu_mset_" + mg(g, mt) + "(&" + mp.code + ", " + kr + ", " + tv + ", {n.line}); }}")
+  return false
+
+fn s_return(var g: G, n: Node) -> Bool:
+  if g.par_on: err(g, n.line, "'return' can't leave the par loop on line {lnum(g.par_line)} early; every iteration runs")
+  if n.kids.len == 0:
+    if g.ret != "~void": err(g, n.line, "this function must return a " + tn(g.ret))
+    emit_drops_from(&g, 0)
+    if g.fails: emit(&g, "return (" + ct(g, g.rett) + "){{0}};")
+    elif g.is_main: emit(&g, "return 0;")
+    else: emit(&g, "return;")
+    return true
+  if g.ret == "~void": err(g, n.line, "this function doesn't return a value (add '-> Type' to its signature)")
+  let ret = g.ret + ""
+  let c = stmt_value(&g, n.kids[0], ret)
+  let rv = tmp(&g)
+  open(&g, "{{")
+  emit(&g, ct(g, ret) + " " + rv + " = " + c.code + ";")
+  emit_drops_from(&g, 0)
+  if g.fails: emit(&g, "return (" + ct(g, g.rett) + "){{.bad = 0, .val = " + rv + "}};")
+  else: emit(&g, "return " + rv + ";")
+  close(&g)
+  return true
+
+fn loop_exit(var g: G, n: Node, word: Str) -> Bool:
+  if g.loops.len == 0: err(g, n.line, "'" + word + "' outside a loop")
+  let li = g.loops.len - 1
+  if word == "break" and g.loops[li].in_par:
+    err(g, n.line, "'break' can't stop a par loop early; every iteration runs (use 'continue' to skip one)")
+  let s = snapshot(g)
+  if word == "break": g.loops[li].brk.push(s)
+  else: g.loops[li].cont.push(s)
+  var idx = 0
+  for i in 0..g.scopes.len:
+    if g.scopes[i].loop: idx = i
+  emit_drops_from(&g, idx)
+  emit(&g, word + ";")
+  return true
+
+fn s_if(var g: G, n: Node) -> Bool:
+  var ends: [Snap] = []
+  if_chain(&g, n, &ends)
+  return finish_ends(&g, ends)
+
+fn if_chain(var g: G, n: Node, var ends: [Snap]):
+  if not n.flag2:
+    let c = value(&g, n.kids[0], "Bool")
+    let snap = snapshot(g)
+    open(&g, "if (" + c.code + ") {{")
+    let div = block(&g, n.kids[1], false)
+    if not div: ends.push(snapshot(g))
+    restore(&g, snap)
+    close(&g)
+    else_part(&g, n, &ends)
+    return
+  open(&g, "{{")
+  push_scope(&g, false)
+  let r = gen(&g, n.kids[0], "")
+  let t = r.ty
+  if tkind(g, t) != "opt": err(g, n.line, "'if " + n.name + " = ...' needs an optional value (T?), but this is " + tn(t))
+  var subj = ""
+  if not r.p.ok:
+    let cname = tmp(&g)
+    let hv = new_var(&g, "$", t, cname, "local", false, false, n.line)
+    emit(&g, ct(g, t) + " " + cname + " = " + r.code + ";")
+    order_push(&g, hv)
+    subj = cname
+  else:
+    if n.flag: write_check(g, r.p, n.line, false)
+    subj = tmp(&g)
+    emit(&g, ct(g, t) + " " + subj + " = " + r.p.code + ";")
+  let bt = inner_of(t)
+  let snap = snapshot(g)
+  open(&g, "if (" + subj + ") {{")
+  if r.p.ok:
+    var mode = "read"
+    if n.flag: mode = "lock"
+    g.vars[r.p.root].frozen.push(Frz(mode, n.line))
+  push_scope(&g, false)
+  let vc = var_cname(&g, n.name)
+  let v = new_var(&g, n.name, bt, vc, "ref", n.flag, true, n.line)
+  declare(&g, v)
+  emit(&g, ct(g, bt) + " *" + vc + " = " + subj + ";")
+  let div = run_block(&g, n.kids[1])
+  if r.p.ok: g.vars[r.p.root].frozen.pop()
+  if not div: ends.push(snapshot(g))
+  restore(&g, snap)
+  close(&g)
+  else_part(&g, n, &ends)
+  let sc = g.scopes.pop()
+  emit_drops_scope(&g, sc)
+  close(&g)
+
+fn else_part(var g: G, n: Node, var ends: [Snap]):
+  if n.kids.len < 3:
+    ends.push(snapshot(g))
+    return
+  open(&g, "else {{")
+  let els = n.kids[2]
+  # An elif whose condition has a ? is an if statement in an else block, so the ? is moved to just
+  # before it, inside the else (it runs only when the earlier conditions were false).
+  if els.kids.len == 1 and els.kids[0].elif_ and not has_try(els.kids[0].kids[0]):
+    if_chain(&g, els.kids[0], &ends)
+  else:
+    let div = block(&g, els, false)
+    if not div: ends.push(snapshot(g))
+  close(&g)
+
+fn has_try(e: Node) -> Bool:
+  if e.k == "try": return true
+  for k in e.kids:
+    if has_try(k): return true
+  return false
+
+fn loop_check(var g: G, before: Snap, ends: [Snap]):
+  for v in before.ids:
+    if before.st[v] != "no": continue
+    for sn in ends:
+      if v in sn.st and sn.st[v] != "no":
+        err(g, sn.ml[v], "'" + g.vars[v].name + "' is moved inside a loop, so the next pass would use a moved value; move it after the loop, or give it a new value before the loop repeats")
+
+fn ends_of(g: G, div: Bool, cont: [Snap]) -> [Snap]:
+  var out: [Snap] = []
+  if not div: out.push(snapshot(g))
+  for s in cont: out.push(snap_copy(s))
+  return out
+
+fn s_while(var g: G, n: Node) -> Bool:
+  let before = snapshot(g)
+  let forever = n.kids[0].k == "bool" and n.kids[0].flag
+  let c = value(&g, n.kids[0], "Bool")
+  open(&g, "while (" + c.code + ") {{")
+  g.loops.push(Loop([], [], false))
+  let div = block(&g, n.kids[1], true)
+  let lp = g.loops.pop()
+  close(&g)
+  let ends = ends_of(g, div, lp.cont)
+  loop_check(&g, before, ends)
+  if forever and lp.brk.len == 0: return true
+  var ms: [Snap] = []
+  if not forever: ms.push(snap_copy(before))
+  for s in lp.brk: ms.push(snap_copy(s))
+  merge(&g, ms)
+  return false
+
+fn s_range(var g: G, n: Node) -> Bool:
+  let a = value(&g, n.kids[0], "Int")
+  let b = value(&g, n.kids[1], "Int")
+  open(&g, "{{")
+  let ta = tmp(&g)
+  let tb = tmp(&g)
+  emit(&g, "int64_t " + ta + " = " + a.code + "; int64_t " + tb + " = " + b.code + ";")
+  var step = "1"
+  let body = n.kids[n.kids.len - 1]
+  if n.flag2:
+    let se = n.kids[2]
+    let sc = value(&g, se, "Int")
+    if is_lit(se):
+      var val = 0
+      if se.k == "int": val = se.ival
+      else: val = 0 - se.kids[0].ival
+      if val <= 0: err(g, n.line, "the 'by' step must be positive")
+      step = "{val}"
+    else:
+      step = tmp(&g)
+      emit(&g, "int64_t " + step + " = " + sc.code + ";")
+      emit(&g, "if (" + step + " <= 0) vu_fail({n.line}, \"loop step must be positive, got %lld\", (long long)" + step + ");")
+  let cn = var_cname(&g, n.name)
+  let before = snapshot(g)
+  var frozen: [Int] = []
+  if n.is_par:
+    if g.par_on: err(g, n.line, "par loops can't be nested (the outer one is on line {lnum(g.par_line)})")
+    var split: {Str: Bool} = {}
+    par_split(g, body, n.name, &split)
+    for si in 0..g.scopes.len:
+      let order = copy_ints(g.scopes[si].order)
+      for v in order:
+        var mode = "par"
+        if g.vars[v].name in split: mode = "part"
+        g.vars[v].frozen.push(Frz(mode, n.line))
+        frozen.push(v)
+    g.par_on = true
+    g.par_var = n.name + ""
+    g.par_line = n.line
+    g.par_elems = {}
+    g.uses_par = true
+  var decl_in_body = ""
+  if n.is_par:
+    let cnt = tmp(&g)
+    let k = tmp(&g)
+    var cmp = ">="
+    var sub = "1"
+    if n.flag:
+      cmp = ">"
+      sub = "0"
+    emit(&g, "uint64_t " + cnt + " = " + ta + " " + cmp + " " + tb + " ? 0 : ((uint64_t)" + tb + " - (uint64_t)" + ta + " - " + sub + ") / (uint64_t)" + step + " + 1;")
+    if n.flag: emit(&g, "if (" + cnt + " == 0 && " + ta + " <= " + tb + ") " + cnt + " = UINT64_MAX;  /* the full Int range */")
+    # Each thread sets up its stack-overflow guard once, outside the loop body, and links its
+    # backtrace to the frame of the function running the loop.
+    let top = tmp(&g)
+    emit(&g, "VU_PAR_TOP(" + top + ");")
+    emit(&g, "#pragma omp parallel")
+    open(&g, "{{")
+    emit(&g, "vu_thread_guard();")
+    emit(&g, "VU_PAR_JOIN(" + top + ");")
+    emit(&g, "#pragma omp for schedule(dynamic)")
+    open(&g, "for (uint64_t " + k + " = 0; " + k + " < " + cnt + "; " + k + "++) {{")
+    decl_in_body = "int64_t " + cn + " = (int64_t)((uint64_t)" + ta + " + " + k + " * (uint64_t)" + step + ");"
+  elif not n.flag and step == "1":
+    open(&g, "for (int64_t " + cn + " = " + ta + "; " + cn + " < " + tb + "; " + cn + "++) {{")
+  else:
+    let ok = tmp(&g)
+    var cmp = "<"
+    if n.flag: cmp = "<="
+    open(&g, "for (int64_t " + cn + " = " + ta + ", " + ok + " = 1; " + ok + " && " + cn + " " + cmp + " " + tb + "; " + ok + " = !__builtin_add_overflow(" + cn + ", " + step + ", &" + cn + ")) {{")
+  g.loops.push(Loop([], [], n.is_par))
+  push_scope(&g, true)
+  let lv_id = new_var(&g, n.name, "Int", cn, "loop", false, false, n.line)
+  declare(&g, lv_id)
+  if decl_in_body != "": emit(&g, decl_in_body)
+  let div = run_block(&g, body)
+  let lp = g.loops.pop()
+  for v in frozen: g.vars[v].frozen.pop()
+  if n.is_par: g.par_on = false
+  close(&g)
+  if n.is_par: close(&g)
+  close(&g)
+  let ends = ends_of(g, div, lp.cont)
+  loop_check(&g, before, ends)
+  var ms: [Snap] = []
+  ms.push(snap_copy(before))
+  for s in lp.brk: ms.push(snap_copy(s))
+  merge(&g, ms)
+  return false
+
+# Lists indexed by the loop counter inside a par loop are split between threads.
+fn par_split(g: G, e: Node, counter: Str, var split: {Str: Bool}):
+  if e.k == "index" and e.kids[0].k == "name" and e.kids[1].k == "name" and e.kids[1].name == counter:
+    let v = lookup(g, e.kids[0].name)
+    if v >= 0 and tkind(g, g.vars[v].ty) == "list": split[e.kids[0].name] = true
+  for k in e.kids: par_split(g, k, counter, &split)
+
+fn s_each(var g: G, n: Node) -> Bool:
+  let r = gen(&g, n.kids[0], "")
+  let t = r.ty
+  let tk = tkind(g, t)
+  if tk != "list" and tk != "map":
+    err(g, n.line, "'for " + n.name + " in ...' needs a list, a map or a range like 0..n, but this is " + tn(t))
+  if n.name2 != "" and tk != "map":
+    err(g, n.line, "'for " + n.name + ", " + n.name2 + " in ...' goes through a map's keys and values; this is " + tn(t))
+  if tk == "map" and n.flag and n.name2 == "":
+    err(g, n.line, "map keys can't be changed in a loop; to change the values write: for k, var v in m")
+  open(&g, "{{")
+  push_scope(&g, false)
+  var root = -1
+  var lst = ""
+  if not r.p.ok:
+    let cname = tmp(&g)
+    let hv = new_var(&g, "$", t, cname, "local", true, false, n.line)
+    emit(&g, ct(g, t) + " " + cname + " = " + r.code + ";")
+    order_push(&g, hv)
+    lst = cname
+  else:
+    if n.flag: write_check(g, r.p, n.line, false)
+    lst = r.p.code + ""
+    root = r.p.root
+  let lp = tmp(&g)
+  let ln = tmp(&g)
+  let ix = tmp(&g)
+  let is_map = tk == "map"
+  var cnt = "len"
+  if is_map: cnt = "nents"
+  emit(&g, ct(g, t) + " *" + lp + " = &" + lst + "; int64_t " + ln + " = " + lp + "->" + cnt + ";")
+  let before = snapshot(g)
+  open(&g, "for (int64_t " + ix + " = 0; " + ix + " < " + ln + "; " + ix + "++) {{")
+  if is_map: emit(&g, "if (!" + lp + "->ents[" + ix + "].live) continue;   /* removed entry */")
+  if root >= 0:
+    var mode = "read"
+    if n.flag: mode = "lock"
+    g.vars[root].frozen.push(Frz(mode, n.line))
+  var et = ""
+  if is_map: et = map_key(t)
+  else: et = inner_of(t)
+  g.loops.push(Loop([], [], false))
+  push_scope(&g, true)
+  if n.name2 != "":
+    let kc = var_cname(&g, n.name)
+    let kv = new_var(&g, n.name, et, kc, "ref", false, true, n.line)
+    declare(&g, kv)
+    emit(&g, ct(g, et) + " *" + kc + " = &" + lp + "->ents[" + ix + "].key;")
+    let val = map_val(t)
+    let vc = var_cname(&g, n.name2)
+    let vv = new_var(&g, n.name2, val, vc, "ref", n.flag, true, n.line)
+    declare(&g, vv)
+    emit(&g, ct(g, val) + " *" + vc + " = &" + lp + "->ents[" + ix + "].val;")
+  else:
+    let vc = var_cname(&g, n.name)
+    let vv = new_var(&g, n.name, et, vc, "ref", n.flag, true, n.line)
+    declare(&g, vv)
+    if is_map: emit(&g, ct(g, et) + " *" + vc + " = &" + lp + "->ents[" + ix + "].key;")
+    else: emit(&g, ct(g, et) + " *" + vc + " = &" + lp + "->data[" + ix + "];")
+  let div = run_block(&g, n.kids[1])
+  let lpi = g.loops.pop()
+  if root >= 0: g.vars[root].frozen.pop()
+  close(&g)
+  let sc = g.scopes.pop()
+  emit_drops_scope(&g, sc)
+  close(&g)
+  let ends = ends_of(g, div, lpi.cont)
+  loop_check(&g, before, ends)
+  var ms: [Snap] = []
+  ms.push(snap_copy(before))
+  for s in lpi.brk: ms.push(snap_copy(s))
+  merge(&g, ms)
+  return false

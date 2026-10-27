@@ -1,0 +1,1107 @@
+# ============================================================================ functions and program
+
+# The C function behind an extern declaration, wrapped in Vu's calling convention: the Ffi argument is
+# dropped, a borrowed Str is passed as const vu_str *, a borrowed handle as its pointer, and a failing
+# call reports through (args..., T *out, vu_str *err) -> bool.
+fn gen_extern(var g: G, items: [Node], name: Str):
+  let ii = g.fns[name].item
+  let params = copy_params(g.fns[name].params)
+  let ret = g.fns[name].ret
+  let cn = items[ii].v + ""
+  var cps: [Str] = []
+  var args: [Str] = []
+  for pa in params:
+    let v = "v_" + pa.name
+    if tkind(g, pa.ty) == "cap": cps.push("vu_cap " + v)
+    elif pa.is_own or is_scalar(pa.ty):
+      cps.push(ct(g, pa.ty) + " " + v)
+      args.push(v)
+    elif pa.ty == "Str":
+      cps.push("vu_str *restrict " + v)
+      args.push(v)
+    else:
+      cps.push("void **restrict " + v)
+      args.push("*" + v)
+  var rett = ret + ""
+  if g.fns[name].fails: rett = "!" + ret
+  g.sigs.push("static " + ct(g, rett) + " fn_" + name + "(" + join(cps, ", ") + ")")
+  let where = cstr(cn) + ", {items[ii].line}"
+  var lines = ["    vu_ffi_here(" + where + ");"]
+  let is_ext = tkind(g, ret) == "ext"
+  if g.fns[name].fails:
+    var all = copy_strs(args)
+    if ret != "~void": all.push("&r.val")
+    all.push("&r.err")
+    lines.push("    " + ct(g, rett) + " r = {{0}};")
+    lines.push("    r.bad = !" + cn + "(" + join(all, ", ") + ");")
+    lines.push("    if (r.bad && !r.err.len) {{ drop_Str(&r.err); r.err = vu_errf(\"%s failed\", " + cstr(cn) + "); }}")
+    if is_ext: lines.push("    if (!r.bad && !r.val) vu_ffi_null(" + where + ");")
+    lines.push("    return r;")
+  elif ret == "~void":
+    lines.push("    " + cn + "(" + join(args, ", ") + ");")
+  else:
+    lines.push("    " + ct(g, ret) + " r = " + cn + "(" + join(args, ", ") + ");")
+    if is_ext: lines.push("    if (!r) vu_ffi_null(" + where + ");")
+    lines.push("    return r;")
+  g.bodies.push(join(lines, "\n"))
+
+fn ffi_ct(g: G, t: Str, param: Bool) -> Str:
+  if t == "Str":
+    if param: return "const vu_str *"
+    return "vu_str"
+  if tkind(g, t) == "ext": return "void *"
+  return ct(g, t)
+
+fn extern_proto(g: G, fi: FnInfo, cname: Str) -> Str:
+  var ps: [Str] = []
+  for i in 1..fi.params.len: ps.push(ffi_ct(g, fi.params[i].ty, true))
+  var r = ""
+  if fi.fails:
+    if fi.ret != "~void": ps.push(ffi_ct(g, fi.ret, false) + " *out")
+    ps.push("vu_str *err")
+    r = "bool"
+  else: r = ffi_ct(g, fi.ret, false)
+  var plist = join(ps, ", ")
+  if plist == "": plist = "void"
+  return "static " + r + " " + cname + "(" + plist + ");"
+
+fn cat_lit(text: Str) -> Str:
+  return "vu_str_cat_bytes(&s, (const uint8_t *)" + cstr(text) + ", {text.len});"
+
+# vu_etext_E(v): the message of an error value: its variant, with its plain fields in parentheses.
+fn etext(g: G, n: Str) -> Str:
+  var cases: [Str] = []
+  for k in 0..g.enums[n].variants.len:
+    let vn = disp(g.enums[n].variants[k].name)
+    var parts = [cat_lit(vn)]
+    let fs = copy_flds(g.enums[n].variants[k].fields)
+    for i in 0..fs.len:
+      var sep = ", "
+      if i == 0: sep = "("
+      parts.push("vu_str_cat_bytes(&s, (const uint8_t *)\"" + sep + "\", {sep.len});")
+      let fv = payload(g, n, k, "v") + cf(fs[i].name)
+      let ft = fs[i].ty
+      if ft == "Str": parts.push("vu_str_cat_bytes(&s, " + fv + ".data, " + fv + ".len);")
+      elif ft == "Int" or ft == "Byte": parts.push("{{ char b[32]; int m = snprintf(b, sizeof b, \"%lld\", (long long)" + fv + "); vu_str_cat_bytes(&s, (const uint8_t *)b, m); }}")
+      elif ft == "Float": parts.push("{{ char b[40]; const char *q = vu_shortest(" + fv + ", b); vu_str_cat_bytes(&s, (const uint8_t *)q, (int64_t)strlen(q)); }}")
+      elif ft == "Bool": parts.push("vu_str_cat_bytes(&s, (const uint8_t *)(" + fv + " ? \"true\" : \"false\"), " + fv + " ? 4 : 5);")
+      else: parts.push("vu_str_cat_bytes(&s, (const uint8_t *)\"...\", 3);")
+    if fs.len > 0: parts.push("vu_str_cat_bytes(&s, (const uint8_t *)\")\", 1);")
+    cases.push("case {k}: " + join(parts, " ") + " break;")
+  return "static vu_str vu_etext_" + n + "(const T_" + n + " *v) {{ vu_str s = {{0}}; switch (v->tag) {{ " + join(cases, " ") + " default: break; }} return s; }}"
+
+fn gen_fn(var g: G, items: [Node], name: Str):
+  let ii = g.fns[name].item
+  if ii < 0:
+    # a generic instance: its body is kept in g.inst_nodes
+    let k = -ii - 1
+    var node = blank_node()
+    swap(&node, &g.inst_nodes[k])
+    gen_fn_node(&g, node, name)
+    swap(&node, &g.inst_nodes[k])
+    return
+  if items[ii].op == "extern":
+    gen_extern(&g, items, name)
+    return
+  gen_fn_node(&g, items[ii], name)
+
+fn gen_fn_node(var g: G, node: Node, name: Str):
+  let params = copy_params(g.fns[name].params)
+  let ret = g.fns[name].ret
+  g.lines = []
+  g.ind = 1
+  g.src_line = node.line   # the function's own setup and cleanup belong to its 'fn' line
+  # its module's prefix (geo__ for geo__area): a local named like one of the module's types is rejected
+  g.prefix = module_prefix(name)
+  g.scopes = []
+  push_scope(&g, false)
+  g.loops = []
+  g.par_on = false
+  g.rest = []
+  g.fails = g.fns[name].fails
+  g.ret = ret + ""
+  g.is_main = name == "main" and not g.fns[name].fails
+  if g.fns[name].fails: g.rett = res_of(g, name, ret)
+  else: g.rett = ret + ""
+  var cps: [Str] = []
+  for pa in params:
+    let cn = "v_" + pa.name
+    var ptr = false
+    if pa.is_own:
+      # owned: a local the function may change, move or return, freed at its end
+      cps.push(ct(g, pa.ty) + " " + cn)
+      let ov = new_var(&g, pa.name, pa.ty, cn, "local", true, false, pa.line)
+      declare(&g, ov)
+      continue
+    if pa.is_var:
+      cps.push(ct(g, pa.ty) + " *restrict " + cn)
+      ptr = true
+    elif by_value(g, pa.ty):
+      cps.push(ct(g, pa.ty) + " " + cn)
+      ptr = false
+    else:
+      cps.push(ct(g, pa.ty) + " *restrict " + cn)
+      ptr = true
+    let v = new_var(&g, pa.name, pa.ty, cn, "param", pa.is_var, ptr, pa.line)
+    declare(&g, v)
+  var sig = ""
+  if g.is_main:
+    sig = "static int vu_main(void)"
+    for pa in params: emit(&g, "vu_cap v_" + pa.name + " = {{0}};")
+  else:
+    var plist = join(cps, ", ")
+    if plist == "": plist = "void"
+    sig = "static " + ct(g, g.rett) + " fn_" + name + "(" + plist + ")"
+  emit(&g, "VU_ENTER(" + cstr(disp(name)) + ");")
+  let div = stmts(&g, node.kids[1])
+  if not div:
+    if ret != "~void": err(g, node.line, "function '" + disp(name) + "' must end with a return (it returns " + tn(ret) + ")")
+    emit_drops_from(&g, 0)
+    if g.is_main: emit(&g, "return 0;")
+    elif g.fails: emit(&g, "return (" + ct(g, g.rett) + "){{0}};")
+  g.src_line = 0
+  g.sigs.push(sig)
+  var body: [Str] = []
+  swap(&body, &g.lines)
+  g.bodies.push(join(body, "\n"))
+
+fn has_call(e: Node) -> Bool:
+  if e.k == "call" or e.k == "list" or e.k == "str" or e.k == "lambda": return true
+  let k = e.k
+  if k == "bin": return has_call(e.kids[0]) or has_call(e.kids[1])
+  if k == "un" or k == "ref" or k == "field" or k == "index" or k == "slice" or k == "try" or k == "orelse":
+    return has_call(e.kids[0])
+  return false
+
+fn gen_consts(var g: G, items: [Node]) -> [Str]:
+  var out: [Str] = []
+  g.scopes = []
+  push_scope(&g, false)
+  g.loops = []
+  g.lines = []
+  g.ind = 0
+  g.fails = false
+  g.par_on = false
+  g.rest = []
+  var by_name: {Str: Int} = {}
+  for i in 0..items.len:
+    if items[i].k == "const": by_name[items[i].name] = i
+  var state: {Int: Int} = {}
+  var order: [Int] = []
+  for i in 0..items.len:
+    if items[i].k == "const": visit_const(&g, items, i, by_name, &state, &order)
+  for oi in order:
+    let it = items[oi]
+    if has_call(it.kids[0]): err(g, it.line, "a const must be a number, true/false, or arithmetic on other consts")
+    let c = value(&g, it.kids[0], "")
+    g.consts[it.name] = c.ty + ""
+    out.push("#define C_" + it.name + " (" + c.code + ")")
+  return out
+
+fn const_refs(e: Node, consts: {Str: Int}, var out: [Int]):
+  if e.k == "name" and e.name in consts: out.push(consts[e.name])
+  for k in e.kids: const_refs(k, consts, &out)
+
+# A constant comes after the constants it uses, wherever (and in whichever module) they are.
+fn visit_const(var g: G, items: [Node], idx: Int, consts: {Str: Int}, var state: {Int: Int}, var order: [Int]):
+  let st = state.get(idx, 0)
+  if st == 2: return
+  if st == 1: err(g, items[idx].line, "constant '" + disp(items[idx].name) + "' depends on itself")
+  state[idx] = 1
+  var refs: [Int] = []
+  const_refs(items[idx].kids[0], consts, &refs)
+  for r in refs: visit_const(&g, items, r, consts, &state, &order)
+  state[idx] = 2
+  order.push(idx)
+
+fn field_decls(g: G, fs: [Fld]) -> Str:
+  var parts: [Str] = []
+  for f in fs: parts.push(ct(g, f.ty) + " " + cf(f.name) + ";")
+  return join(parts, " ")
+
+# The boxed variants, sorted by (enum name, variant index) like Python's sorted() of the pairs.
+fn sorted_boxed(g: G) -> [Str]:
+  var keys: [Str] = []
+  for key, on in g.boxed:
+    let hash_at = last_hash(key)
+    let k = int(key[hash_at + 1..key.len]) else 0
+    keys.push(key[0..hash_at] + "\0" + "{k:06}")
+  var i = 1
+  while i < keys.len:
+    var j = i
+    while j > 0 and keys[j] < keys[j - 1]:
+      var a = keys[j]
+      var b = keys[j - 1]
+      swap(&a, &b)
+      keys[j] = a
+      keys[j - 1] = b
+      j -= 1
+    i += 1
+  return keys
+
+fn last_hash(s: Str) -> Int:
+  var i = s.len - 1
+  while i >= 0:
+    if s[i] == '#': return i
+    i -= 1
+  return -1
+
+fn sk_name(key: Str) -> Str:
+  return key[0..find_byte(key, 0, 0)]
+
+fn sk_index(key: Str) -> Int:
+  let z = find_byte(key, 0, 0)
+  return int(key[z + 1..key.len]) else 0
+
+fn build(var g: G, items: [Node]) -> Str:
+  let consts = gen_consts(&g, items)
+  var qi = 0
+  while qi < g.fn_queue.len:   # registers types as it goes, and generic instances as they're used
+    let name = g.fn_queue[qi] + ""
+    qi += 1
+    if name in g.fn_inst:
+      var saved: {Str: Str} = {}
+      swap(&saved, &g.tenv)
+      let tmpl = g.fn_inst[name].tmpl + ""
+      let fargs = copy_strs(g.fn_inst[name].args)
+      let tps = copy_strs(g.gfn_nodes[tmpl].names)
+      for i in 0..tps.len: g.tenv[tps[i]] = fargs[i] + ""
+      var d = disp(name)
+      if d.len > 120: d = d[0..120] + "..."
+      g.note = " (in " + d + ", used on line {lnum(g.inst_line[name])})"
+      gen_fn(&g, items, name)
+      g.note = ""
+      swap(&saved, &g.tenv)
+    else: gen_fn(&g, items, name)
+  var out: [Str] = []
+  if g.uses_tasks: out.push("#define VU_MT 1   /* tasks run on several threads */")
+  out.push(rt_runtime())
+  if g.uses_float_parse:
+    out.push(rt_pow10())
+    out.push(rt_float())
+  if g.uses_tls:
+    out.push("#define VU_TLS 1")
+    for lib in ["ssl", "crypto"]:
+      var have = false
+      for l in g.links:
+        if l == lib: have = true
+      if not have: g.links.push(lib + "")
+  if g.uses_tasks: out.push(rt_tasks())
+  if g.jtypes.len > 0: out.push(rt_json())
+  if g.has_extern:
+    out.push(rt_ffi())
+    # The C signatures the glue must have, declared before it: a definition that doesn't match is a C
+    # compile error, instead of a call through the wrong types.
+    for n, d in g.exttypes: out.push("static void " + d + "(void *p);")
+    for fname, fi in g.fns:
+      if fi.item >= 0 and items[fi.item].op == "extern": out.push(extern_proto(g, fi, items[fi.item].v))
+    for p in g.ext_paths: out.push("#include " + cstr(p))
+    for n, d in g.exttypes: out.push("static void drop_X_" + n + "(void **p) {{ if (*p) {{ " + d + "(*p); *p = NULL; }} }}")
+  for c in consts: out.push(c)
+  for n in g.struct_order: out.push("typedef struct T_" + n + " T_" + n + ";")
+  let boxed = sorted_boxed(g)
+  for key in boxed:
+    let n = sk_name(key)
+    let k = sk_index(key)
+    out.push("typedef struct T_{k}_" + n + " T_{k}_" + n + ";")
+  for t in g.types:
+    let tk = tkind(g, t)
+    if tk == "list":
+      out.push("typedef struct {{ " + ct(g, inner_of(t)) + " *data; int64_t len, cap; }} " + ct(g, t) + ";")
+    elif tk == "shared":
+      let sm = mg(g, inner_of(t))
+      out.push("typedef struct vu_sh_" + sm + " vu_sh_" + sm + ";")
+    elif tk == "map":
+      let m = mg(g, t)
+      out.push("typedef struct ME_" + m + " ME_" + m + "; typedef struct {{ ME_" + m + " *ents; int64_t nents, cap, live; int64_t *idx; int64_t nidx; }} " + m + ";")
+  for n in g.struct_order:
+    if n in g.structs:
+      out.push("struct T_" + n + " {{ " + field_decls(g, g.structs[n].fields) + " }};")
+    else:
+      let nv = g.enums[n].variants.len
+      for k in 0..nv:
+        if boxed_key(n, k) in g.boxed:
+          out.push("struct T_{k}_" + n + " {{ " + field_decls(g, g.enums[n].variants[k].fields) + " }};")
+      var parts: [Str] = []
+      for k in 0..nv:
+        if g.enums[n].variants[k].fields.len == 0: continue
+        if boxed_key(n, k) in g.boxed: parts.push("T_{k}_" + n + " *b{k};")
+        else: parts.push("struct {{ " + field_decls(g, g.enums[n].variants[k].fields) + " }} v{k};")
+      var u = ""
+      if parts.len > 0: u = "union {{ " + join(parts, " ") + " }} u; "
+      out.push("struct T_" + n + " {{ int32_t tag; " + u + "}};")
+  for t in g.types:
+    if tkind(g, t) == "shared":
+      # a Shared value: its reference count, then the value, which no one changes until the last handle goes
+      let si = inner_of(t)
+      let sm = mg(g, si)
+      let sc = ct(g, si)
+      out.push("struct vu_sh_" + sm + " {{ int64_t refs; " + sc + " v; }};")
+      out.push("static vu_sh_" + sm + " *vu_shnew_" + sm + "(" + sc + " v) {{ vu_sh_" + sm + " *p = (vu_sh_" + sm + " *)vu_malloc(sizeof *p); p->refs = 1; p->v = v; return p; }}")
+  for t in g.types:
+    if tkind(g, t) == "res":
+      var val = ""
+      if inner_of(t) != "~void": val = " " + ct(g, inner_of(t)) + " val;"
+      var ev = ""
+      if err_of(t) != "": ev = " " + ct(g, err_of(t)) + " eval;"
+      out.push("typedef struct {{ bool bad; vu_str err;" + val + ev + " }} " + ct(g, t) + ";")
+  var owned: [Str] = []
+  var owned_enums: [Str] = []
+  for n in g.struct_order:
+    if n in g.structs:
+      if not g.structs[n].copy: owned.push(n)
+    elif not g.enums[n].copy: owned_enums.push(n)
+  for n in owned: out.push("static void drop_S_" + n + "(T_" + n + " *p);")
+  for n in owned_enums: out.push("static void drop_E_" + n + "(T_" + n + " *p);")
+  for t in g.types: out.push("static void drop_" + mg(g, t) + "(" + ct(g, t) + " *p);")
+  for t in g.types:
+    if tkind(g, t) == "fn":
+      # a call through a function value of this type: the C function cast back to its real type
+      let f = fn_parts(t)
+      var r = ct(g, f.ret)
+      if f.fails: r = ct(g, "!" + f.ret)
+      var ps = ""
+      var decl = ""
+      var cargs = ""
+      for i in 0..f.params.len:
+        ps += ", " + pdecl(g, f.params[i], "").rstrip()
+        decl += ", " + pdecl(g, f.params[i], "a{i}")
+        cargs += ", a{i}"
+      var rk = "return "
+      if r == "void": rk = ""
+      out.push("static inline " + r + " vu_call_" + mg(g, t) + "(vu_fn f" + decl + ") {{ " + rk + "((" + r + " (*)(void *" + ps + "))f.fn)(f.env" + cargs + "); }}")
+  let nlam = g.lam_ids.len
+  for k in 1..nlam + 1:
+    if k in g.lam_envs and g.lam_envs[k] != "": out.push(g.lam_envs[k] + "")
+  for k in 1..nlam + 1:
+    if k in g.lam_drops: out.push(g.lam_drops[k] + "")
+  for sig in g.sigs:
+    if starts_with(sig, "static") and sig != "static int vu_main(void)": out.push(sig + ";")
+  for k in 1..nlam + 1:
+    if k in g.lam_sigs: out.push(g.lam_sigs[k] + ";")
+  for tname in g.thunks:
+    let tps = copy_params(g.fns[tname].params)
+    var r = ct(g, g.fns[tname].ret)
+    if g.fns[tname].fails: r = ct(g, res_of(g, tname, g.fns[tname].ret))
+    var decl = ""
+    var targs: [Str] = []
+    for i in 0..tps.len:
+      decl += ", " + pdecl(g, tps[i].ty, "a{i}")
+      targs.push("a{i}")
+    var rk = "return "
+    if r == "void": rk = ""
+    out.push("static " + r + " vu_th_" + tname + "(void *e" + decl + ") {{ (void)e; " + rk + "fn_" + tname + "(" + join(targs, ", ") + "); }}")
+  out.push("static int vu_main(void);")
+  for sname in g.spawned:
+    # spawn name(...): the arguments travel to the new task in a block it frees
+    let ps = copy_params(g.fns[sname].params)
+    var fields: [Str] = []
+    var calls: [Str] = []
+    var decl = ""
+    var sets: [Str] = []
+    for i in 0..ps.len:
+      fields.push(ct(g, ps[i].ty) + " a{i};")
+      calls.push("a.a{i}")
+      decl += ", " + ct(g, ps[i].ty) + " a{i}"
+      sets.push("p->a{i} = a{i};")
+    var fl = join(fields, " ")
+    if fl == "": fl = "char unused;"
+    out.push("typedef struct {{ " + fl + " }} vu_sa_" + sname + ";")
+    out.push("static void vu_se_" + sname + "(void *p) {{ vu_sa_" + sname + " a = *(vu_sa_" + sname + " *)p; free(p); (void)a; fn_" + sname + "(" + join(calls, ", ") + "); }}")
+    out.push("static void vu_spawn_" + sname + "(int line" + decl + ") {{ vu_sa_" + sname + " *p = (vu_sa_" + sname + " *)vu_malloc(sizeof *p); " + join(sets, " ") + " vu_task_spawn(vu_se_" + sname + ", p, line); }}")
+  for key in boxed:
+    let bx = "{sk_index(key)}_" + sk_name(key)
+    out.push(box_code(bx, "T_" + bx))
+  for t in g.types:
+    let tk = tkind(g, t)
+    if tk == "opt": out.push(box_code(box_name(g, inner_of(t)), ct(g, inner_of(t))))
+    elif tk == "list": out.push(list_code(mg(g, t), ct(g, t), ct(g, inner_of(t))))
+    elif tk == "map":
+      let key = map_key(t)
+      let val = map_val(t)
+      out.push(map_code(mg(g, t), ct(g, key), ct(g, val), mg(g, val), key == "Str", is_copy(g, val)))
+  for n in owned:
+    var parts: [Str] = []
+    for f in g.structs[n].fields:
+      if not is_copy(g, f.ty): parts.push(drop_code(g, f.ty, "p->" + cf(f.name)))
+    out.push("static void drop_S_" + n + "(T_" + n + " *p) {{ " + join(parts, " ") + " }}")
+  for n in owned_enums:
+    let fs_all = g.enums[n].variants.len
+    var cases: [Str] = []
+    for k in 0..fs_all:
+      let bx = boxed_key(n, k) in g.boxed
+      var any_owned = false
+      for f in g.enums[n].variants[k].fields:
+        if not is_copy(g, f.ty): any_owned = true
+      if not (bx or any_owned): continue
+      var parts: [Str] = []
+      for f in g.enums[n].variants[k].fields:
+        if not is_copy(g, f.ty): parts.push(drop_code(g, f.ty, payload(g, n, k, "p") + cf(f.name)))
+      let body = join(parts, " ")
+      if bx: cases.push("case {k}: if (p->u.b{k}) {{ " + body + " vu_release_{k}_" + n + "(p->u.b{k}); }} break;")
+      else: cases.push("case {k}: " + body + " break;")
+    out.push("static void drop_E_" + n + "(T_" + n + " *p) {{ switch (p->tag) {{ " + join(cases, " ") + " default: break; }} }}")
+  for t in g.types:
+    let m = mg(g, t)
+    let tk = tkind(g, t)
+    if tk == "res":
+      var val = ""
+      let it = inner_of(t)
+      if it != "~void" and not is_copy(g, it): val = " else {{ " + drop_code(g, it, "p->val") + " }}"
+      out.push("static void drop_" + m + "(" + m + " *p) {{ if (p->bad) {{ " + drop_err(g, t, "(*p)") + " }}" + val + " }}")
+      continue
+    if tk == "map": continue
+    if tk == "fn":
+      out.push("static void drop_" + m + "(vu_fn *p) {{ vu_fn_drop(p); }}")
+      continue
+    if tk == "shared":
+      let si = inner_of(t)
+      let sm = mg(g, si)
+      var inner = ""
+      if not is_copy(g, si): inner = drop_code(g, si, "q->v") + " "
+      out.push("static void drop_" + m + "(vu_sh_" + sm + " **p) {{ vu_sh_" + sm + " *q = *p; if (!q) return; *p = NULL; if (__atomic_sub_fetch(&q->refs, 1, __ATOMIC_ACQ_REL) == 0) {{ " + inner + "free(q); }} }}")
+      continue
+    if tk == "chan":
+      let ci = inner_of(t)
+      if not is_copy(g, ci): out.push("static void vu_cdrop_" + m + "(void *e) {{ " + drop_code(g, ci, "*(" + ct(g, ci) + " *)e") + " }}")
+      out.push("static void drop_" + m + "(vu_chan **p) {{ vu_chan_release(p); }}")
+      continue
+    if tk == "opt":
+      let it = inner_of(t)
+      let x = box_name(g, it)
+      let tx = ct(g, it)
+      var inner = ""
+      if not is_copy(g, it): inner = "drop_" + mg(g, it) + "(q); "
+      out.push("static void vu_freenode_" + m + "(void *v, int64_t n) {{ (void)n; " + tx + " *q = (" + tx + " *)v; " + inner + "vu_release_" + x + "(q); }}")
+      out.push("static void drop_" + m + "(" + tx + " **p) {{ " + tx + " *q = *p; if (!q) return; if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) {{ vu_drop_depth++; " + inner + "vu_release_" + x + "(q); vu_drop_depth--; }} else vu_defer(vu_freenode_" + m + ", q, 0); }}")
+    else:
+      let et = inner_of(t)
+      if is_copy(g, et):
+        out.push("static void drop_" + m + "(" + ct(g, t) + " *p) {{ free(p->data); }}")
+        continue
+      let ec = ct(g, et)
+      out.push("static void vu_freeitems_" + m + "(void *v, int64_t n) {{ " + ec + " *d = (" + ec + " *)v; for (int64_t i = 0; i < n; i++) " + drop_code(g, et, "d[i]") + " free(d); }}")
+      out.push("static void drop_" + m + "(" + ct(g, t) + " *p) {{ if (!p->data) return; if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) {{ vu_drop_depth++; vu_freeitems_" + m + "(p->data, p->len); vu_drop_depth--; }} else vu_defer(vu_freeitems_" + m + ", p->data, p->len); }}")
+  for en in g.err_enums: out.push(etext(g, en))
+  for jc in json_code(&g): out.push(jc)
+  # Everything after the entry points is user code under #line directives, so they come first.
+  out.push("static const char *const vu_file_names[] = {{" + join(g.cpaths, ", ") + "}};")
+  if g.fns["main"].fails:
+    var decls: [Str] = []
+    var names: [Str] = []
+    for pa in g.fns["main"].params:
+      decls.push("vu_cap v_" + pa.name + " = {{0}};")
+      names.push("v_" + pa.name)
+    var w = "static int vu_main(void) {{\n"
+    w += "    " + join(decls, " ") + "\n"
+    let mrt = res_of(g, "main", "~void")
+    w += "    " + ct(g, mrt) + " r = fn_main(" + join(names, ", ") + ");\n"
+    w += "    if (r.bad) {{\n"
+    w += "        int rc = vu_uncaught((const char *)r.err.data, (size_t)(r.err.len > 1000000 ? 1000000 : r.err.len));\n"
+    w += "        " + drop_err(g, mrt, "r") + "\n"
+    w += "        return rc;\n"
+    w += "    }}\n"
+    w += "    return 0;\n}}"
+    out.push(w)
+  out.push("int main(int argc, char **argv) {{ return vu_start(argc, argv, vu_main, vu_file_names); }}")
+  for i in 0..g.sigs.len:
+    out.push(g.sigs[i] + " {{")
+    if g.bodies[i] != "": out.push(g.bodies[i])
+    out.push("}}")
+  for k in 1..nlam + 1:
+    if k in g.lam_sigs:
+      out.push(g.lam_sigs[k] + " {{")
+      out.push(g.lam_bodies[k] + "")
+      out.push("}}")
+  return join(out, "\n") + "\n"
+
+# ============================================================================ driver
+
+# ============================================================================ modules
+# `import geo` reads geo.vu next to the importing file; each module is read once, and cycles are fine.
+# A name defined in module geo becomes geo__name everywhere, so the rest of the compiler sees one
+# program with no clashes. A line number carries its file's index in the bits above 24 (see ln).
+
+# os.path.dirname
+fn dir_of(path: Str) -> Str:
+  let i = find_last(path, "/") + 1
+  var head = path[0..i]
+  var all_slash = true
+  for c in bytes(head):
+    if c != '/': all_slash = false
+  if head.len > 0 and not all_slash:
+    while head.len > 0 and head[head.len - 1] == '/': head = head[0..head.len - 1]
+  return head
+
+# os.path.join for one more part
+fn join_path(d: Str, name: Str) -> Str:
+  if d == "" or d[d.len - 1] == '/': return d + name
+  return d + "/" + name
+
+# os.path.splitext(os.path.basename(path))[0]
+fn stem_of(path: Str) -> Str:
+  let base = path[find_last(path, "/") + 1..path.len]
+  let dot = find_last(base, ".")
+  var fi = 0
+  while fi < dot:
+    if base[fi] != '.': return base[0..dot]
+    fi += 1
+  return base
+
+fn too_many_lines(src: Str) -> Bool:
+  let ls = split_lines(src)
+  var n = ls.len
+  if ls[n - 1] == "": n -= 1
+  return n > 16777215
+
+type Res:
+  tps: {Str: Bool}   # the type parameters of the item being resolved
+  own: {Str: Str}
+  alias: {Str: Int}
+  frm: {Str: Str}
+  scopes: [{Str: Bool}]
+  modules: {Str: Int}   # every module in the program, imported here or not
+
+fn res_local(r: Res, name: Str) -> Bool:
+  for s in r.scopes:
+    if name in s: return true
+  return false
+
+fn res_key(r: Res, name: Str) -> Str:
+  if name in r.own: return r.own[name] + ""
+  if name in r.frm: return r.frm[name] + ""
+  return ""
+
+fn is_type_char(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.'
+
+fn is_builtin_type_name(n: Str) -> Bool:
+  return n == "Int" or n == "Float" or n == "Bool" or n == "Byte" or n == "Str" or n == "Fs" or n == "Net" or n == "Os" or n == "Ffi" or n == "Conn" or n == "Listener" or n == "Chan"
+
+# The names in a type (a string like {Str: [geo.Point]}) renamed for this file.
+fn res_ty(r: Res, all_own: [{Str: Str}], ctx: Ctx, t: Str, line: Int) -> Str:
+  if t == "" or t[0] == '~': return t
+  var out = ""
+  var i = 0
+  while i < t.len:
+    if not is_type_char(t[i]):
+      out += t[i..i + 1]
+      i += 1
+      continue
+    var j = i
+    while j < t.len and is_type_char(t[j]): j += 1
+    let n = t[i..j]
+    i = j
+    let dot = find_sub(n, ".", 0)
+    if dot >= 0:
+      let mod = n[0..dot]
+      let nm = n[dot + 1..n.len]
+      if not (mod in r.alias): report(ctx, line, "unknown module '" + mod + "' (write 'import " + mod + "' at the top of the file)")
+      let mi = r.alias[mod]
+      if not (nm in all_own[mi]): report(ctx, line, "module '" + mod + "' has no '" + nm + "'")
+      out += all_own[mi][nm]
+    elif is_builtin_type_name(n) or n in r.tps: out += n
+    else:
+      let k = res_key(r, n)
+      if k != "": out += k
+      else: out += n
+  return out
+
+fn res_declare(var r: Res, ctx: Ctx, name: Str, line: Int):
+  if name in r.alias: report(ctx, line, "'" + name + "' is the name of an imported module; use a different name")
+  r.scopes[r.scopes.len - 1][name] = true
+
+fn res_block(var r: Res, all_own: [{Str: Str}], ctx: Ctx, var b: Node):
+  r.scopes.push({})
+  for i in 0..b.kids.len: res_stmt(&r, all_own, ctx, &b.kids[i])
+  r.scopes.pop()
+
+fn res_stmt(var r: Res, all_own: [{Str: Str}], ctx: Ctx, var st: Node):
+  let k = st.k
+  if k == "let":
+    st.ty = res_ty(r, all_own, ctx, st.ty, st.line)
+    res_expr(&r, all_own, ctx, &st.kids[0])
+    res_declare(&r, ctx, st.name, st.line)
+  elif k == "exprstmt" or k == "return" or k == "fail" or k == "spawn":
+    for i in 0..st.kids.len: res_expr(&r, all_own, ctx, &st.kids[i])
+  elif k == "fnstmt":
+    res_expr(&r, all_own, ctx, &st.kids[0])
+    res_declare(&r, ctx, st.kids[0].name, st.line)
+  elif k == "assign":
+    res_expr(&r, all_own, ctx, &st.kids[0])
+    res_expr(&r, all_own, ctx, &st.kids[1])
+  elif k == "if":
+    res_expr(&r, all_own, ctx, &st.kids[0])
+    r.scopes.push({})
+    if st.flag2: res_declare(&r, ctx, st.name, st.line)
+    res_block(&r, all_own, ctx, &st.kids[1])
+    r.scopes.pop()
+    if st.kids.len > 2: res_block(&r, all_own, ctx, &st.kids[2])
+  elif k == "while":
+    res_expr(&r, all_own, ctx, &st.kids[0])
+    res_block(&r, all_own, ctx, &st.kids[1])
+  elif k == "range":
+    res_expr(&r, all_own, ctx, &st.kids[0])
+    res_expr(&r, all_own, ctx, &st.kids[1])
+    if st.flag2: res_expr(&r, all_own, ctx, &st.kids[2])
+    r.scopes.push({})
+    res_declare(&r, ctx, st.name, st.line)
+    res_block(&r, all_own, ctx, &st.kids[st.kids.len - 1])
+    r.scopes.pop()
+  elif k == "each":
+    res_expr(&r, all_own, ctx, &st.kids[0])
+    r.scopes.push({})
+    res_declare(&r, ctx, st.name, st.line)
+    if st.name2 != "": res_declare(&r, ctx, st.name2, st.line)
+    res_block(&r, all_own, ctx, &st.kids[1])
+    r.scopes.pop()
+  elif k == "match":
+    res_expr(&r, all_own, ctx, &st.kids[0])
+    for ai in 1..st.kids.len:
+      r.scopes.push({})
+      for b in st.kids[ai].names: res_declare(&r, ctx, b, st.kids[ai].line)
+      res_block(&r, all_own, ctx, &st.kids[ai].kids[0])
+      r.scopes.pop()
+
+fn res_expr(var r: Res, all_own: [{Str: Str}], ctx: Ctx, var e: Node):
+  if e.k == "name":
+    if not res_local(r, e.name):
+      let k = res_key(r, e.name)
+      if k != "": e.name = k
+    return
+  if e.k == "typearg":
+    e.ty = res_ty(r, all_own, ctx, e.ty, e.line)
+    return
+  if e.k == "lambda":
+    for pi in 0..e.kids[0].kids.len:
+      e.kids[0].kids[pi].ty = res_ty(r, all_own, ctx, e.kids[0].kids[pi].ty, e.kids[0].kids[pi].line)
+    e.ret = res_ty(r, all_own, ctx, e.ret, e.line)
+    r.scopes.push({})
+    for pn in e.kids[0].kids: res_declare(&r, ctx, pn.name, pn.line)
+    if e.is_par: res_block(&r, all_own, ctx, &e.kids[1])
+    else: res_expr(&r, all_own, ctx, &e.kids[1])
+    r.scopes.pop()
+    return
+  if e.k == "field" and e.kids[0].k == "name" and e.kids[0].name in r.alias and not res_local(r, e.kids[0].name):
+    let base = e.kids[0].name + ""
+    let mi = r.alias[base]
+    if not (e.name in all_own[mi]): report(ctx, e.line, "module '" + base + "' has no '" + e.name + "'")
+    e.k = "name"
+    e.name = all_own[mi][e.name] + ""
+    e.kids = []
+    return
+  if e.k == "field" and e.kids[0].k == "name" and e.kids[0].name in r.modules and not res_local(r, e.kids[0].name) and res_key(r, e.kids[0].name) == "":
+    report(ctx, e.line, "module '" + e.kids[0].name + "' isn't imported in this file; add 'import " + e.kids[0].name + "' at the top")
+  for i in 0..e.kids.len: res_expr(&r, all_own, ctx, &e.kids[i])
+
+fn res_items(var r: Res, all_own: [{Str: Str}], ctx: Ctx, var its: [Node]):
+  for ii in 0..its.len:
+    let k = its[ii].k
+    r.tps = {}
+    for tp in its[ii].names:
+      if k == "fn" or k == "type" or k == "enum": r.tps[tp] = true
+    if k == "fn":
+      for pi in 0..its[ii].kids[0].kids.len:
+        its[ii].kids[0].kids[pi].ty = res_ty(r, all_own, ctx, its[ii].kids[0].kids[pi].ty, its[ii].kids[0].kids[pi].line)
+      its[ii].ret = res_ty(r, all_own, ctx, its[ii].ret, its[ii].line)
+      if its[ii].name2 != "": its[ii].name2 = res_ty(r, all_own, ctx, its[ii].name2, its[ii].line)
+      if its[ii].op == "extern": continue   # an extern function: its body is C
+      r.scopes = [{}]
+      for pn in its[ii].kids[0].kids: res_declare(&r, ctx, pn.name, pn.line)
+      res_block(&r, all_own, ctx, &its[ii].kids[1])
+      r.scopes = []
+    elif k == "type":
+      for fi in 0..its[ii].kids.len: its[ii].kids[fi].ty = res_ty(r, all_own, ctx, its[ii].kids[fi].ty, its[ii].kids[fi].line)
+    elif k == "enum":
+      for vi in 0..its[ii].kids.len:
+        for fi in 0..its[ii].kids[vi].kids.len:
+          its[ii].kids[vi].kids[fi].ty = res_ty(r, all_own, ctx, its[ii].kids[vi].kids[fi].ty, its[ii].kids[vi].kids[fi].line)
+    elif k == "const": res_expr(&r, all_own, ctx, &its[ii].kids[0])
+
+# Parse the main file and every module it imports, resolve module names, and return all items.
+# Where `import http` looks when there is no http.vu next to the importing file: $VU_STD, or the std
+# folder next to the folder this compiler is in (vuc is in compiler/, std/ beside it).
+fn std_dir(os: Os) -> Str:
+  let env = os.env("VU_STD")
+  if env != "": return env
+  var exe = args()[0] + ""
+  if exe.len == 0 or exe[0] != '/': exe = os.env("PWD") + "/" + exe
+  return norm_path(dir_of(exe) + "/../std")
+
+# A path with "." and ".." parts and repeated slashes taken out, as Python's os.path.normpath does.
+fn norm_path(p: Str) -> Str:
+  var parts: [Str] = []
+  for s in p.split("/"):
+    if s == "" or s == ".": continue
+    if s == "..":
+      if parts.len > 0 and parts[parts.len - 1] != "..":
+        let _ = parts.pop()
+      elif p.len == 0 or p[0] != '/': parts.push("..")
+      continue
+    parts.push(s + "")
+  let body = "/".join(parts)
+  if p.len > 0 and p[0] == '/': return "/" + body
+  if body == "": return "."
+  return body
+
+fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Node]:
+  var items: [[Node]] = []
+  var mod_names = [""]
+  var index: {Str: Int} = {}
+  files.push(Ctx(ctx.path, copy_strs(ctx.lines), ctx.json))
+  let toks = lex(ctx, src, 0, 0)
+  var p0 = Parser(Ctx(ctx.path, copy_strs(ctx.lines), ctx.json), toks, 0, 0, 0)
+  items.push(parse_program(&p0))
+  let main_name = stem_of(ctx.path)
+  var fi = 0
+  while fi < items.len:
+    for ii in 0..items[fi].len:
+      if items[fi][ii].k != "import" or items[fi][ii].name in index: continue
+      let iname = items[fi][ii].name + ""
+      let iline = items[fi][ii].line
+      let fctx = Ctx(files[fi].path, copy_strs(files[fi].lines), files[fi].json)
+      let c0 = iname[0]
+      if not ((c0 >= 'a' and c0 <= 'z') or (c0 >= 'A' and c0 <= 'Z')): report(fctx, iline, "a module's name starts with a letter, so '" + iname + "' can't be imported")
+      if iname == main_name: report(fctx, iline, "'" + iname + "' is the main file, which other files can't import")
+      let k = files.len
+      if k > 127: report(fctx, iline, "a program can have at most 127 modules")
+      let d = dir_of(files[fi].path)
+      var mpath = iname + ".vu"
+      if d != "": mpath = join_path(d, iname + ".vu")
+      var msrc = ""
+      match fs.read(mpath):
+        ok(text): msrc = text
+        err(e):
+          # not next to the importing file: the standard library
+          let spath = join_path(stdd, iname + ".vu")
+          match fs.read(spath):
+            ok(text):
+              msrc = text
+              mpath = spath
+            err(e2): report(fctx, iline, "module '" + iname + "': " + e)
+      let bad = utf8_error(msrc)
+      if bad >= 0:
+        var bl = 1
+        for bi in 0..bad:
+          if msrc[bi] == '\n': bl += 1
+        report(fctx, iline, "module '" + iname + "' (" + mpath + ") isn't valid UTF-8 text (byte 0x" + hex2(msrc[bad]) + " on line {bl}); save it as UTF-8")
+      msrc = replace_all(msrc, "\r\n", "\n")
+      if msrc.len >= 3 and msrc[0] == 0xEF and msrc[1] == 0xBB and msrc[2] == 0xBF: msrc = msrc[3..msrc.len]
+      if too_many_lines(msrc): report(fctx, iline, "module '" + iname + "' has more than 16,777,215 lines")
+      index[iname] = k
+      let mctx = Ctx(mpath, split_lines(msrc), ctx.json)
+      files.push(Ctx(mctx.path, copy_strs(mctx.lines), mctx.json))
+      mod_names.push(iname + "")
+      let mtoks = lex(mctx, msrc, 0, k << 24)
+      # node ids must be unique across files: the caches are keyed by them
+      var pm = Parser(Ctx(mctx.path, copy_strs(mctx.lines), mctx.json), mtoks, 0, k << 32, 0)
+      items.push(parse_program(&pm))
+    fi += 1
+  var own: [{Str: Str}] = []
+  for k in 0..items.len:
+    var prefix = ""
+    if k > 0: prefix = mod_names[k] + "__"
+    var table: {Str: Str} = {}
+    for ii in 0..items[k].len:
+      let ik = items[k][ii].k + ""
+      if ik == "fn" or ik == "type" or ik == "enum" or ik == "const" or ik == "exttype":
+        let nm = items[k][ii].name + ""
+        if not (nm in table): table[nm] = prefix + nm
+      if ik == "extern":
+        # the C file is next to the Vu file that names it
+        let d = dir_of(files[k].path)
+        if d != "" and items[k][ii].v[0] != '/': items[k][ii].v = join_path(d, items[k][ii].v)
+        let cpath = items[k][ii].v + ""
+        match fs.read(cpath):
+          ok(_): continue
+          err(e): report(Ctx(files[k].path, copy_strs(files[k].lines), files[k].json), items[k][ii].line, "extern: " + e)
+      if ik == "enum":
+        for vn in items[k][ii].kids:
+          if not (vn.name in table): table[vn.name] = prefix + vn.name
+    own.push(table)
+  for k in 0..items.len:
+    let fctx = Ctx(files[k].path, copy_strs(files[k].lines), files[k].json)
+    var alias: {Str: Int} = {}
+    var frm: {Str: Str} = {}
+    for imp in items[k]:
+      if imp.k != "import": continue
+      var m = k
+      if imp.name in index: m = index[imp.name]
+      if not imp.flag:
+        if imp.name in own[k]: report(fctx, imp.line, "'" + imp.name + "' is both an imported module and a name defined in this file")
+        alias[imp.name] = m
+        continue
+      for a in imp.names:
+        if not (a in own[m]): report(fctx, imp.line, "module '" + imp.name + "' has no '" + a + "'")
+        if a in own[k]: report(fctx, imp.line, "'" + a + "' is already defined in this file")
+        if a in frm and frm[a] != own[m][a]: report(fctx, imp.line, "'" + a + "' is imported from two modules")
+        frm[a] = own[m][a] + ""
+    var mods: {Str: Int} = {}
+    for mk, mv in index: mods[mk] = mv
+    var r = Res({}, copy_names(own[k]), alias, frm, [], mods)
+    res_items(&r, own, fctx, &items[k])
+    if k > 0:
+      for ii in 0..items[k].len:
+        let ik = items[k][ii].k
+        if ik == "fn" or ik == "type" or ik == "enum" or ik == "const" or ik == "exttype": items[k][ii].name = own[k][items[k][ii].name] + ""
+        if ik == "enum":
+          for vi in 0..items[k][ii].kids.len: items[k][ii].kids[vi].name = own[k][items[k][ii].kids[vi].name] + ""
+  # Each file after the files it imports (depth first from the main file), so a constant or type from
+  # a module is known by the time the code importing it is checked.
+  var deps: [[Int]] = []
+  for k in 0..items.len:
+    var ds: [Int] = []
+    for it in items[k]:
+      if it.k == "import":
+        if it.name in index: ds.push(index[it.name])
+        else: ds.push(k)
+    deps.push(ds)
+  var seen = [false] * items.len
+  var order: [Int] = []
+  visit_file(deps, 0, &seen, &order)
+  var all: [Node] = []
+  for k in order:
+    for ii in 0..items[k].len:
+      if items[k][ii].k != "import":
+        var x = blank_node()
+        swap(&items[k][ii], &x)
+        all.push(x)
+  return all
+
+fn visit_file(deps: [[Int]], k: Int, var seen: [Bool], var order: [Int]):
+  if seen[k]: return
+  seen[k] = true
+  for d in deps[k]: visit_file(deps, d, &seen, &order)
+  order.push(k)
+
+fn copy_names(m: {Str: Str}) -> {Str: Str}:
+  var out: {Str: Str} = {}
+  for k, v in m: out[k] = v
+  return out
+
+# links: the libraries extern blocks need; has_ext: whether the program has extern blocks at all.
+fn compile_source(fs: Fs, ctx: Ctx, src: Str, var uses_par: Bool, var links: [Str], var has_ext: Bool, stdd: Str) -> Str:
+  # Panic locations pack the line into 24 bits (the file into the rest).
+  # (a final newline doesn't start another line)
+  var nlines = ctx.lines.len
+  if ctx.lines[nlines - 1] == "": nlines -= 1
+  if nlines > 16777215: report(ctx, 16777216, "a source file can have at most 16,777,215 lines")
+  var files: [Ctx] = []
+  let items = load_program(fs, ctx, src, &files, stdd)
+  var g = new_gen(ctx, &files)
+  collect(&g, items)
+  let csrc = build(&g, items)
+  uses_par = g.uses_par
+  links = copy_strs(g.links)
+  has_ext = g.has_extern
+  return csrc
+
+fn without_ext(path: Str) -> Str:
+  var slash = -1
+  var dot = -1
+  for i in 0..path.len:
+    if path[i] == '/':
+      slash = i
+      dot = -1
+    elif path[i] == '.': dot = i
+  if dot < 0: return path + ""
+  # a name that only starts with dots (like .vu or ..vu) has no extension
+  var all_dots = true
+  for i in slash + 1..dot:
+    if path[i] != '.': all_dots = false
+  if all_dots: return path + ""
+  return path[0..dot]
+
+# Where the first byte of an invalid UTF-8 sequence is, or -1. The same rules as Python's strict
+# decoder (Unicode table 3-7): no overlong forms, no surrogates, nothing above U+10FFFF.
+fn utf8_error(s: Str) -> Int:
+  var i = 0
+  while i < s.len:
+    let b = s[i]
+    var n = 0
+    var lo: Byte = 0x80
+    var hi: Byte = 0xBF
+    if b < 0x80:
+      i += 1
+      continue
+    elif b >= 0xC2 and b <= 0xDF: n = 1
+    elif b == 0xE0:
+      n = 2
+      lo = 0xA0
+    elif b == 0xED:
+      n = 2
+      hi = 0x9F
+    elif b >= 0xE1 and b <= 0xEF: n = 2
+    elif b == 0xF0:
+      n = 3
+      lo = 0x90
+    elif b == 0xF4:
+      n = 3
+      hi = 0x8F
+    elif b >= 0xF1 and b <= 0xF3: n = 3
+    else: return i
+    for k in 1..n + 1:
+      if i + k >= s.len: return i
+      let c = s[i + k]
+      if k == 1:
+        if c < lo or c > hi: return i
+      elif c < 0x80 or c > 0xBF: return i
+    i += n + 1
+  return -1
+
+# An error found before compiling: reported like any other, but without a source line.
+fn fail_early(path: Str, json: Bool, line: Int, msg: Str):
+  if json: eprint("{{\"type\": \"error\", \"file\": " + json_str(path) + ", \"line\": {line}, \"message\": " + json_str(msg) + ", \"source\": \"\"}}")
+  elif line > 0: eprint(path + ":{line}: error: " + msg)
+  else: eprint("vu: " + msg)
+
+fn main(fs: Fs, os: Os):
+  let argv = args()
+  if argv.len < 2 or (argv[1] != "build" and argv[1] != "run" and argv[1] != "check"):
+    print(rt_help())
+    if argv.len >= 2 and (argv[1] == "-h" or argv[1] == "--help"): exit(0)
+    exit(2)
+  let cmd = argv[1]
+  var o = ""
+  var emit_c = ""
+  var debug = false
+  var release = false
+  var json = false
+  var malloc = false
+  var san = false
+  var san_pool = false
+  var tsan = false
+  var timing = false
+  var path = ""
+  var prog_args: [Str] = []
+  var i = 2
+  while i < argv.len:
+    let a = argv[i]
+    if cmd == "run" and path != "":
+      while i < argv.len:
+        prog_args.push(argv[i])
+        i += 1
+      break
+    if a == "-o" or a == "--emit-c":
+      if i + 1 >= argv.len:
+        eprint("vu: " + a + " needs a value")
+        exit(2)
+      if a == "-o": o = argv[i + 1]
+      else: emit_c = argv[i + 1]
+      i += 2
+    elif a == "--debug" or a == "--release" or a == "--json" or a == "--malloc" or a == "--san" or a == "--san-pool" or a == "--tsan" or a == "--time":
+      if a == "--debug": debug = true
+      elif a == "--release": release = true
+      elif a == "--json": json = true
+      elif a == "--malloc": malloc = true
+      elif a == "--san": san = true
+      elif a == "--san-pool": san_pool = true
+      elif a == "--tsan": tsan = true
+      else: timing = true
+      i += 1
+    elif starts_with(a, "-"):
+      eprint("vu: unknown option " + a)
+      exit(2)
+    else:
+      path = a
+      i += 1
+  if path == "":
+    eprint("vu: no input file")
+    exit(2)
+  var src = ""
+  match fs.read(path):
+    ok(text): src = text
+    err(e):
+      fail_early(path, json, 0, e)
+      exit(2)
+  let bad = utf8_error(src)
+  if bad >= 0:
+    var line = 1
+    for bi in 0..bad:
+      if src[bi] == '\n': line += 1
+    let hex = "0123456789abcdef"
+    let b = int(src[bad])
+    fail_early(path, json, line, "this file isn't valid UTF-8 text (byte 0x" + hex[b / 16..b / 16 + 1] + hex[b % 16..b % 16 + 1] + "); save it as UTF-8")
+    exit(1)
+  # Windows line endings: \r\n ends a line like \n. A lone \r is an ordinary character.
+  src = replace_all(src, "\r\n", "\n")
+  if src.len >= 3 and src[0] == 0xEF and src[1] == 0xBB and src[2] == 0xBF: src = src[3..src.len]   # a byte-order mark some editors put at the start
+  let ctx = Ctx(path + "", split_lines(src), json)
+  let t0 = os.clock()
+  var uses_par = false
+  var links: [Str] = []
+  var has_ext = false
+  var csrc = compile_source(fs, ctx, src, &uses_par, &links, &has_ext, std_dir(os))
+  let t1 = os.clock()
+  if cmd == "check":
+    # Every error comes from the front end, so stopping here gives the full answer without gcc.
+    if timing:
+      let fe = 1000.0 * (t1 - t0)
+      eprint("vu: front end {fe:.1} ms")
+    exit(0)
+  if tsan: csrc = replace_all(csrc, "schedule(dynamic)", "schedule(static)")
+  let work = fs.temp_dir() else "/tmp"
+  var cfile = emit_c + ""
+  if cfile == "": cfile = work + "/out.c"
+  var wrote = false
+  match fs.write(cfile, csrc):
+    ok: wrote = true
+    err(e):
+      eprint("vu: " + e)
+      exit(3)
+  var out = o + ""
+  if out == "":
+    if cmd == "build": out = without_ext(path)
+    else: out = work + "/prog"
+  var cc = os.env("CC")
+  if cc == "": cc = "cc"
+  var argl = [cc, "-std=gnu11", "-fwrapv", "-fno-math-errno", "-fno-trapping-math", "-ffp-contract=off", "-w"]
+  # `run` is the edit-and-test loop, so it builds unoptimized (several times faster to compile)
+  # unless asked for --release; `build` makes the optimized binary unless asked for --debug.
+  let quick = debug or (cmd == "run" and not release)
+  # Quick builds also keep the shadow call stack that gives panics a backtrace.
+  if quick:
+    argl.push("-O0")
+    argl.push("-g")
+    argl.push("-DVU_TRACE")
+  else:
+    argl.push("-O3")
+    argl.push("-march=native")
+  if json: argl.push("-DVU_JSON_PANIC")
+  if uses_par: argl.push("-fopenmp")
+  if has_ext:
+    # extern C files are named relative to the current directory
+    argl.push("-iquote")
+    argl.push(".")
+  if malloc or san: argl.push("-DVU_MALLOC")
+  if san or san_pool:
+    argl.push("-fsanitize=address,undefined")
+    argl.push("-fno-sanitize-recover=undefined")
+    argl.push("-fno-omit-frame-pointer")
+    argl.push("-g")
+  if tsan:
+    argl.push("-fsanitize=thread")
+    argl.push("-g")
+  argl.push(cfile + "")
+  argl.push("-o")
+  argl.push(out + "")
+  argl.push("-lm")
+  for l in links: argl.push("-l" + l)
+  let rc = os.run(argl) else 127
+  let t2 = os.clock()
+  if rc != 0:
+    if has_ext:
+      eprint("vu: the C compiler rejected the program; errors in an extern C file are shown above")
+      exit(1)
+    eprint("vu: internal error: the C compiler rejected the generated code")
+    exit(3)
+  if timing:
+    let fe = 1000.0 * (t1 - t0)
+    let cct = 1000.0 * (t2 - t1)
+    eprint("vu: front end {fe:.1} ms, C compiler {cct:.1} ms")
+  if cmd == "run":
+    var run_args = [out]
+    for pa in prog_args: run_args.push(pa)
+    let code = os.run(run_args) else 127
+    exit(code)
+  exit(0)

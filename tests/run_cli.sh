@@ -1,0 +1,59 @@
+#!/bin/bash
+# Command-line behavior: `check` never calls the C compiler, `run` builds unoptimized unless --release,
+# `build` builds optimized unless --debug, and arguments after the file go to the program.
+# A stand-in C compiler records the flags it was given, then hands off to the real one.
+cd "$(dirname "$0")"
+VU=${VU:-"$PWD/../vu"}
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+real_cc=${CC:-cc}
+cat > "$work/cc" <<EOF
+#!/bin/sh
+echo "\$*" >> "$work/cc.log"
+exec $real_cc "\$@"
+EOF
+chmod +x "$work/cc"
+export CC="$work/cc"
+pass=0; fail=0
+check() {  # name, condition result (0 = ok), detail
+  if [ "$2" -eq 0 ]; then pass=$((pass+1)); echo "ok    $1"; else fail=$((fail+1)); echo "FAIL  $1: $3"; fi
+}
+printf 'fn main():\n  print("{arg(1, 7) * 6}")\n' > "$work/ok.vu"
+printf 'fn main():\n  var xs = [1]\n  for x in xs:\n    xs.push(x)\n' > "$work/bad.vu"
+
+: > "$work/cc.log"; out=$($VU check "$work/ok.vu" 2>&1); rc=$?
+[ $rc -eq 0 ] && [ -z "$out" ] && [ ! -s "$work/cc.log" ]; check "check: a correct file prints nothing, exits 0, no C compiler" $? "rc=$rc out=[$out] cc=$(cat "$work/cc.log")"
+
+out=$($VU check "$work/bad.vu" 2>&1); rc=$?
+want=$($VU build "$work/bad.vu" -o "$work/x" 2>&1)
+[ $rc -eq 1 ] && [ "$out" = "$want" ]; check "check: an error exits 1 with the same message as build" $? "rc=$rc out=[$out]"
+
+out=$($VU check "$work/ok.vu" --time 2>&1)
+case "$out" in "vu: front end "*" ms") r=0 ;; *) r=1 ;; esac; check "check --time reports the front-end time" $r "[$out]"
+
+: > "$work/cc.log"; out=$($VU run "$work/ok.vu" 2>&1)
+[ "$out" = "42" ] && grep -q -- '-O0' "$work/cc.log" && ! grep -q -- '-O3' "$work/cc.log"; check "run: builds with -O0 by default" $? "out=[$out] cc=$(cat "$work/cc.log")"
+
+: > "$work/cc.log"; out=$($VU run --release "$work/ok.vu" 2 2>&1)
+[ "$out" = "12" ] && grep -q -- '-O3' "$work/cc.log"; check "run --release: builds with -O3" $? "out=[$out] cc=$(cat "$work/cc.log")"
+
+out=$($VU run "$work/ok.vu" 5 2>&1)
+[ "$out" = "30" ]; check "run: arguments after the file go to the program" $? "out=[$out]"
+
+: > "$work/cc.log"; $VU build "$work/ok.vu" -o "$work/b" >/dev/null 2>&1
+grep -q -- '-O3' "$work/cc.log"; check "build: builds with -O3 by default" $? "cc=$(cat "$work/cc.log")"
+
+: > "$work/cc.log"; $VU build "$work/ok.vu" --debug -o "$work/b" >/dev/null 2>&1
+grep -q -- '-O0' "$work/cc.log" && ! grep -q -- '-O3' "$work/cc.log"; check "build --debug: builds with -O0" $? "cc=$(cat "$work/cc.log")"
+
+out=$($VU check "$work/missing.vu" 2>&1); rc=$?
+[ $rc -eq 2 ] && [ "$out" = "vu: can't read '$work/missing.vu': No such file or directory" ]; check "a missing file: a clear message and exit 2" $? "rc=$rc out=[$out]"
+
+out=$($VU check --json "$work" 2>&1); rc=$?
+[ $rc -eq 2 ] && [ "$out" = "{\"type\": \"error\", \"file\": \"$work\", \"line\": 0, \"message\": \"can't read '$work': Is a directory\", \"source\": \"\"}" ]; check "a directory, with --json: one JSON error" $? "rc=$rc out=[$out]"
+
+printf 'type Cfg:\n  Missing(key: Str)\n\nfn need(k: Str) -> Int throws Cfg:\n  fail Missing(k + "")\n\nfn main() throws Cfg:\n  let v = need("port")?\n  print("{v}")\n' > "$work/typed.vu"
+out=$($VU run "$work/typed.vu" 2>&1); rc=$?
+[ $rc -eq 1 ] && [ "$out" = "error: Missing(port)" ]; check "main fails with an enum value: its message, exit 1" $? "rc=$rc out=[$out]"
+
+echo "$pass passed, $fail failed"
+[ $fail -eq 0 ]
