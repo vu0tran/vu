@@ -1159,6 +1159,86 @@ could finish agreed; on 3, Python's backtracking ran past 2 seconds), and the ne
 results as the VM-only version on 5,260 cases over text that isn't UTF-8. `finditer` now also refuses a match that doesn't move on,
 so a disagreement can't turn into a loop again.
 
+## Round 11: the checks stay, the loops get fast
+
+Vu checks every list index and every Int operation, and those checks were what kept three
+benchmarks 1.2–1.6x behind C (README.md, before this round): spectral-norm's overflow checks kept gcc
+from vectorizing its inner loop, fannkuch-redux paid for bounds checks, and C's n-body used fused
+multiply-add, which Vu leaves out. This round keeps every check and makes them cheap where it matters:
+
+- **Hoisted index checks.** When a range loop's counter indexes a list the loop can't resize
+  (`xs[i]`, `ys[i + 1]`), or any loop uses a constant index (`xs[0]`) or the two sides of
+  `while lo < hi` that only move toward each other by one, one comparison before the loop checks
+  every such index for every pass (in 128 bits, so bounds near the largest Int are exact). If it
+  holds, a copy of the loop runs with those elements read and written directly; if not, the checked
+  copy runs and stops where it always did.
+- **Tried loops.** A range loop that only computes numbers (it assigns scalar variables, reads
+  lists, and calls only functions that do the same) first runs as a copy whose checks record
+  failures in a flag instead of stopping (`vu_vf_add` and the rest in the runtime): they don't
+  branch, so gcc vectorizes the loop. If the flag is set at the end, the variables the loop assigned
+  are put back and the checked copy runs from the start, so the program stops at the same check with
+  the same message and line. A product of two operands over 2^31 counts as a failure in the tried
+  copy (vectorized code can't check it exactly), so the checked rerun decides; a loop whose try
+  failed once isn't tried again. Functions such loops call get tried copies too (`fn_a__vf`), never
+  for recursion. A tried copy whose C does anything but the deferred checks, math and other tried
+  copies is thrown away when it's generated, and an inner loop doesn't start once the flag is set,
+  so a wrapped value can't make it run for ages.
+- **`fma(a, b, c)`**: `a * b + c` rounded once, the same on every machine. Float math is still never
+  fused unless a program asks; the n-body example now asks where C's compiler fuses by itself.
+- `VU_NO_VERSIONING=1` turns the copies off, and `tests/run_loops.sh` uses it: 300 random programs
+  (loops with overflowing arithmetic, out-of-range offsets, division by zero, shifts, calls,
+  two-pointer loops, break and continue), built both ways, must print the same and stop the same
+  way. It's in the gate.
+
+The same programs, the build before this round against this one, run back to back (median of 5):
+
+| | before | after | C (`bench/compare.sh`) |
+|---|---|---|---|
+| spectral-norm 8000, 2 threads | 3.23–3.30 s | 2.39–2.45 s | 2.45 s |
+| n-body 50M | 4.47–4.58 s | 3.55–3.69 s | 3.16 s |
+| fannkuch-redux 11 | 3.40–3.43 s | 3.10–3.26 s | 2.85 s |
+
+mandelbrot's hot function compiles to the same C as before (2.91 s before and 2.93–2.97 s after,
+which is noise), and binary-trees and nsieve have no loops these apply to. The compiler's own C grew
+from 88,327 to 95,913 lines, and its release build takes 67.8 s instead of 64.0 s (one run each);
+`vu check` didn't change measurably (0.42–0.48 s both).
+
+What's left: fannkuch-redux's flips index the list by values read from it (`perm[0]`), which no check
+before the loop can cover. Unchecked by hand, the flip loop with that read gives 2.75–2.9 s, but a
+precheck before each flip costs as much as it saves (flips are a few swaps each). Rust (3.26 s) pays
+the same. n-body's remaining gap to C (3.56 s against 3.16 s in the comparison) wasn't investigated.
+
+Attack rounds, each against the compiler before this round (same output, stderr and exit status) or
+against this one with `VU_NO_VERSIONING=1`:
+
+1. 15 programs aimed at the tried copies (overflow, a false failure that must not double a total,
+   division by zero, an index the counter doesn't bound, a negative offset, a list resized in the
+   loop, bounds near the largest Int, break, a wrapped inner-loop bound, calls, var parameters,
+   int() of NaN, shifts by 64, par loops): all the same. Found: a tried copy using an `INT64_C`
+   literal was thrown away (a missed speedup, not a wrong result). My own mistake: an inner loop
+   bound of 2^62 that doesn't overflow (it would take as long without the change).
+2. 15 more (views, lists passed to functions, nested lists, Str and struct elements, maps, par loops
+   with split lists, four nested loops, continue, `..=` and `by`, mutual recursion, early returns,
+   big bodies, generics and `?`, Bytes, NaN): all the same. Found: a list indexed by anything other
+   than the counter wasn't hoisted at all (a missed speedup). My own mistakes: a `swap` the checker
+   refuses, and two expected values.
+3. 400 random programs against the old compiler, with about 2.4 tried and 1.5 hoisted loops each:
+   all the same.
+4. Modules, nested functions, a generic function, tasks on several threads, and clang's warnings on
+   the new C: nothing found.
+5. 420 random programs, versioning on against off: nothing found.
+6. Two-pointer loops added to the generator: 103 of them hoisted in 150 programs, the same as the
+   old compiler on the 129 it can build (the others use `fma`), and 600 more versioning on against
+   off: nothing found.
+
+The full gate then found two more. In my code: the tried-read helper declared its zero element as
+`const T *`, which for a list of pointers made the pointed-to values const instead of the element, a
+C warning in 11 programs (gcc -Wall). Not in this change: a task's panic could end the program with
+status 0 when `main` returned at the same moment, because `main` returning didn't wait for a panic
+report in progress the way `exit()` does (test 347 failed once, under load). Both fixed.
+
+Targeted tests 610–628 keep these cases.
+
 ## Memory safety evidence
 
 - `tests/reject/`: 21 programs, each containing a bug Vu must refuse: use after move, a

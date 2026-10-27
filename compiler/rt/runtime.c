@@ -293,6 +293,66 @@ static inline int64_t vu_imin(int64_t a, int64_t b) { return a < b ? a : b; }
 static inline int64_t vu_imax(int64_t a, int64_t b) { return a > b ? a : b; }
 static inline double vu_fmin(double a, double b) { return a < b ? a : b; }
 static inline double vu_fmax(double a, double b) { return a > b ? a : b; }
+/* A loop tried with its checks deferred (s_range in the compiler): each operation records a failure
+   in *f instead of stopping, and gives some value without undefined behavior; nothing branches, so
+   the C compiler can vectorize the loop. When *f is set afterwards, the loop's variables are put back
+   and it runs again with the ordinary checks, which stop at the first failure as always. A check may
+   fail when the ordinary one wouldn't (vu_vf_mul with operands over 2^31): that only costs the rerun. */
+static inline int64_t vu_vf_add(int64_t a, int64_t b, uint64_t *f) {
+    int64_t r = (int64_t)((uint64_t)a + (uint64_t)b);
+    *f |= (uint64_t)((a ^ r) & (b ^ r)) >> 63;
+    return r;
+}
+static inline int64_t vu_vf_sub(int64_t a, int64_t b, uint64_t *f) {
+    int64_t r = (int64_t)((uint64_t)a - (uint64_t)b);
+    *f |= (uint64_t)((a ^ b) & (a ^ r)) >> 63;
+    return r;
+}
+static inline int64_t vu_vf_mul(int64_t a, int64_t b, uint64_t *f) {
+    if (__builtin_constant_p(b) && b >= -1 && b <= 1) {
+        *f |= (uint64_t)(b == -1 && a == INT64_MIN);
+    } else if (__builtin_constant_p(b)) {
+        /* |a| <= INT64_MAX / |b| can't overflow (one comparison) */
+        uint64_t k = (uint64_t)(INT64_MAX / (b < 0 ? -b : b));
+        *f |= (uint64_t)((uint64_t)a + k > 2 * k);
+    } else {
+        /* both within 32 bits can't overflow; wider ones count as failures (the checked rerun then
+           decides, and the loop isn't tried again: see vu_vfbad in s_range) */
+        *f |= (((uint64_t)a + 0x80000000u) | ((uint64_t)b + 0x80000000u)) >> 32;
+    }
+    return (int64_t)((uint64_t)a * (uint64_t)b);
+}
+static inline int64_t vu_vf_neg(int64_t a, uint64_t *f) {
+    *f |= (uint64_t)(a == INT64_MIN);
+    return (int64_t)(0 - (uint64_t)a);
+}
+static inline int64_t vu_vf_div(int64_t a, int64_t b, uint64_t *f) {
+    *f |= (uint64_t)(b == 0) | (uint64_t)(b == -1 && a == INT64_MIN);
+    if (b == -1) return (int64_t)(0 - (uint64_t)a);
+    return a / (b == 0 ? 1 : b);
+}
+static inline int64_t vu_vf_mod(int64_t a, int64_t b, uint64_t *f) {
+    *f |= (uint64_t)(b == 0) | (uint64_t)(b == -1 && a == INT64_MIN);
+    if (b == -1 || b == 0) return 0;
+    return a % b;
+}
+static inline int64_t vu_vf_shl(int64_t a, int64_t b, uint64_t *f) {
+    *f |= (uint64_t)((uint64_t)b > 63);
+    return (int64_t)((uint64_t)a << (b & 63));
+}
+static inline int64_t vu_vf_shr(int64_t a, int64_t b, uint64_t *f) {
+    *f |= (uint64_t)((uint64_t)b > 63);
+    return a >> (b & 63);
+}
+static inline int64_t vu_vf_ftoi(double x, uint64_t *f) {
+    int in = x >= -9223372036854775808.0 && x < 9223372036854775808.0;
+    *f |= (uint64_t)!in;
+    return in ? (int64_t)x : 0;
+}
+static inline int64_t vu_vf_iabs(int64_t a, uint64_t *f) {
+    *f |= (uint64_t)(a == INT64_MIN);
+    return a < 0 ? (int64_t)(0 - (uint64_t)a) : a;
+}
 static int64_t vu_arg(int64_t i, int64_t d, int line) {
     if (i < 0 || i >= vu_argc) return d;
     char *end;
@@ -866,7 +926,9 @@ static int vu_main_rc;
 static void vu_thread_guard(void);
 /* The main thread exits the process itself, while it's still alive: its thread-local free lists then
    still count as reachable for LeakSanitizer. */
-static void *vu_main_thread(void *arg) { (void)arg; vu_thread_guard(); vu_main_rc = vu_main_fn(); fflush(stdout); exit(vu_main_rc); }
+/* (main returning takes the report lock first, as exit() does: a task that is panicking meanwhile
+   then ends the program with its panic and 101, not 0) */
+static void *vu_main_thread(void *arg) { (void)arg; vu_thread_guard(); vu_main_rc = vu_main_fn(); vu_report_lock(); fflush(stdout); exit(vu_main_rc); }
 static void vu_seed_init(void);
 static void vu_guard_init(void *top);
 static int vu_start(int argc, char **argv, int (*fn)(void), const char *const *files) {
@@ -889,7 +951,9 @@ static int vu_start(int argc, char **argv, int (*fn)(void), const char *const *f
         pthread_join(t, NULL);
         return vu_main_rc;
     }
-    return fn();   /* no thread available: run on the normal stack */
+    int rc = fn();   /* no thread available: run on the normal stack */
+    vu_report_lock();
+    return rc;
 }
 static void vu_seed_init(void) {
     uint64_t k[2];

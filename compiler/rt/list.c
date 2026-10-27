@@ -3,6 +3,14 @@ static inline @@E@@ *vu_at_@@M@@(@@L@@ *l, int64_t i, int line) {
     if (__builtin_expect((uint64_t)i >= (uint64_t)l->len, 0)) vu_oob(i, l->len, line);
     return &l->data[i];
 }
+/* A read in a tried loop (vu_vf_add in the runtime): out of range records a failure and reads a zero. */
+/* (const after the element type: for a list of pointers, the pointers are what's const) */
+static inline @@E@@ const *vu_vfat_@@M@@(const @@L@@ *l, int64_t i, uint64_t *f) {
+    static @@E@@ const zero;
+    int in = (uint64_t)i < (uint64_t)l->len;
+    *f |= (uint64_t)!in;
+    return in ? &l->data[i] : &zero;
+}
 static void vu_grow_@@M@@(@@L@@ *l) {
     if (l->cap > (int64_t)(PTRDIFF_MAX / sizeof(@@E@@) / 2)) vu_oom();
     int64_t c = l->cap ? l->cap * 2 : 4;

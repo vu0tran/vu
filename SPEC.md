@@ -443,7 +443,11 @@ to annotate. The compiler enforces five rules:
 
 At runtime, indexing and slicing are bounds-checked, and integer arithmetic checks for
 overflow and division by zero. A failed check stops the program with a message and exit
-code 101. It never reads or writes memory it shouldn't. Recursion too deep for the stack
+code 101. It never reads or writes memory it shouldn't. In hot loops the checks are cheap: a
+loop whose counter indexes a list checks those indexes once before it starts, and a loop that
+only computes numbers runs first with its checks recorded instead of stopping it (so the C
+compiler can vectorize it), then again checked if any failed. Either way the program stops at the
+same check, with the same message, as when each operation is checked in order. Recursion too deep for the stack
 (on the main thread or a `par` worker) also stops with `panic: stack overflow` and exit
 code 101, as in Rust, instead of crashing with a signal.
 
@@ -715,7 +719,9 @@ break / continue / return
 Operators: `+ - * / %` (Int `/` truncates), `<< >> & | ^` (Int and Byte), `== != < > <= >=`,
 `and or not`, and `+` to join strings.
 Int literals can be hex (`0xFF`). `[v] * n` makes a list of n copies of plain values.
-Float math is strict IEEE: never fused, so results are identical on every machine.
+Float math is strict IEEE: never fused, so results are identical on every machine. To fuse,
+ask for it: `fma(a, b, c)` is `a * b + c` rounded once (one instruction on most CPUs, and the same
+result on every machine).
 Comparisons can't be chained.
 
 ## Built-ins
@@ -728,7 +734,7 @@ reads back as exactly the same number (`0.1`, `1e+21`, `0.30000000000000004`).
 to standard error. `exit(code)` ends the program at once with that exit code, flushing
 output first; like `panic`, it never returns, so a function may end with it. `args()`
 returns all command-line arguments as a `[Str]` (index 0 is the program).
-`swap(&a, &b)` exchanges two values of the same type. Also: `panic("...")`, `sqrt`, `abs`,
+`swap(&a, &b)` exchanges two values of the same type. Also: `panic("...")`, `sqrt`, `fma`, `abs`,
 `min`, `max` (of two or more numbers, or of a list), `float`, `int`, `byte`, `str`, `bytes`.
 A NaN always prints as `nan`, as in Python. `arg(i, 10)` reads command-line
 argument i as an Int and `arg(i, "default")` as a Str, falling back to the default when it's

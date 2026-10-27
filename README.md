@@ -255,20 +255,25 @@ program's output checked against Vu's before it's timed. Seconds, lower is bette
 
 | | binary-trees 20 | n-body 50M | fannkuch-redux 11 | nsieve 13 | mandelbrot 8000 (2 threads) | spectral-norm 8000 (2 threads) |
 |---|---|---|---|---|---|---|
-| C | 12.32 s, 130 MB | 3.47 s | **2.90 s** | 4.95 s | 2.90 s | 2.38 s |
-| C++ | 12.62 s, 132 MB | 4.89 s | 3.52 s | **2.06 s** | 2.87 s | **2.04 s** |
-| Rust | 13.84 s, 130 MB | **2.78 s** | 3.30 s | 4.92 s | 2.89 s | 2.53 s |
-| Go | 24.94 s, 223 MB | 5.48 s | 3.28 s | 4.80 s | 2.94 s | 3.46 s |
-| **Vu** | **4.06 s, 66 MB** | 4.84 s | 3.50 s | 4.75 s | **2.84 s** | 3.69 s |
+| C | 11.31 s, 130 MB | 3.16 s | **2.85 s** | 5.10 s | **2.84 s** | 2.45 s |
+| C++ | 11.61 s, 132 MB | 4.62 s | 3.53 s | **2.55 s** | **2.84 s** | **1.82 s** |
+| Rust | 13.11 s, 130 MB | **2.81 s** | 3.26 s | 4.84 s | 2.93 s | 2.00 s |
+| Go | 25.10 s, 191 MB | 5.19 s | 3.21 s | 4.73 s | 2.93 s | 3.06 s |
+| **Vu** | **4.39 s, 66 MB** | 3.56 s | 3.14 s | 4.70 s | 3.00 s | 2.55 s |
 
-- **binary-trees:** Vu is about 3x faster than C in half the memory. The compiler knows when each
+- **binary-trees:** Vu is about 2.6x faster than C in half the memory. The compiler knows when each
   node dies, so freed nodes go onto a per-type free list and are reused with no runtime checks.
-- **Behind on n-body, fannkuch-redux and spectral-norm**, by 1.2–1.6x C's time, and each gap is
-  one of Vu's guarantees, measured by building the same C without it: spectral-norm without overflow
-  checks takes 2.30 s (C 2.38 s), since the checks keep gcc from vectorizing its inner loop;
-  fannkuch-redux without bounds checks takes 2.86 s (C 2.90 s); and C's n-body uses fused
-  multiply-add, which Vu leaves out so results are the same on every machine (C without it: 4.49 s).
-  Rust's release builds don't check overflow.
+- **Every check stays on, and the rest are within 1.04–1.13x of C** (fannkuch-redux ahead of Rust
+  and Go). Vu checks every index and every Int operation, and in hot loops it makes those checks
+  cheap instead of dropping them: a loop's indexes that the loop bounds (`xs[i]`, `xs[i + 1]`,
+  `xs[0]`) are checked once before it starts, and a loop that only computes numbers runs first with
+  its checks recorded instead of stopping it, which lets the C compiler vectorize it, and again
+  checked only if one failed (details in CHANGELOG.md, round 11). That took spectral-norm from
+  3.3 s to 2.4–2.5 s, and fannkuch-redux from 3.4 s to 3.1–3.2 s. n-body asks for fused
+  multiply-add, as C's compiler does by itself: `fma(a, b, c)` gives the same result on every
+  machine, which leaving the choice to the C compiler doesn't (4.5 s to 3.6 s).
+- What's left: fannkuch-redux's flips index the list by values read from it, which no check before
+  the loop can cover (Rust pays the same). The rest of n-body's gap to C hasn't been investigated.
 - nsieve's C++ version is fast because `vector<bool>` packs the sieve into bits; the others use a
   byte per number.
 - On HTTP, a Vu server on one core handled 121k requests/s for a minimal reply and 25.5k for a
