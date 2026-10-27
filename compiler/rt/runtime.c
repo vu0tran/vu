@@ -293,6 +293,9 @@ static inline int64_t vu_imin(int64_t a, int64_t b) { return a < b ? a : b; }
 static inline int64_t vu_imax(int64_t a, int64_t b) { return a > b ? a : b; }
 static inline double vu_fmin(double a, double b) { return a < b ? a : b; }
 static inline double vu_fmax(double a, double b) { return a > b ? a : b; }
+/* For the checks before a loop (vaccum in the compiler): the negative part of x, or the positive. */
+static inline __int128 vu_min0(__int128 x) { return x < 0 ? x : 0; }
+static inline __int128 vu_max0(__int128 x) { return x > 0 ? x : 0; }
 /* A loop tried with its checks deferred (s_range in the compiler): each operation records a failure
    in *f instead of stopping, and gives some value without undefined behavior; nothing branches, so
    the C compiler can vectorize the loop. When *f is set afterwards, the loop's variables are put back
@@ -533,6 +536,12 @@ static int vu_str_cmp(const vu_str *a, const vu_str *b) {
     int64_t n = a->len < b->len ? a->len : b->len;
     int c = n ? memcmp(a->data, b->data, (size_t)n) : 0;
     return c ? c : (a->len > b->len) - (a->len < b->len);
+}
+/* A string read in a tried loop (vu_vf_add above): out of range records a failure and reads 0. */
+static inline uint8_t vu_vf_str_at(const vu_str *s, int64_t i, uint64_t *f) {
+    int in = (uint64_t)i < (uint64_t)s->len;
+    *f |= (uint64_t)!in;
+    return in ? s->data[i] : 0;
 }
 static inline uint8_t vu_str_at(const vu_str *s, int64_t i, int line) {
     /* Two signed comparisons rather than one unsigned: a loop condition like i < s.len then

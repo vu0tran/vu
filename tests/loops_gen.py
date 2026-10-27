@@ -19,10 +19,12 @@ def iexpr(r, names, d=0, fn=False):
     if k < 0.65: return f"({a} * {b})"
     if k < 0.72: return f"({a} / {b})"
     if k < 0.78: return f"({a} % {b})"
-    if k < 0.82: return f"({a} << {r.choice(['1', '3', '63', '64', names[0]])})"
-    if k < 0.86: return f"({a} >> {r.choice(['1', '2', names[0]])})"
+    if k < 0.82: return f"({a} << {r.choice(['1', '3', '63', '64', names[0], '(' + b + ' & 7)', '(' + b + ' & 63)'])})"
+    if k < 0.86: return f"({a} >> {r.choice(['1', '2', names[0], '(' + b + ' & 63)'])})"
     if k < 0.90: return f"f{r.randrange(3)}({a})"
-    if k < 0.95: return f"xs[{r.choice(names)}{r.choice([' + 0', ' + 1', ' - 1', ' + 2', '', '', ' * 2'])}]"
+    if k < 0.91: return f"xs[{r.choice(names)}{r.choice([' + 0', ' + 1', ' - 1', ' + 2', '', '', ' * 2', ' + kofs', ' - kofs + 1'])}]"
+    if k < 0.93: return f"xs[({a}) & {r.choice(['1', '3', '7', '15'])}]"
+    if k < 0.95: return f"int(st[{r.choice([r.choice(names), r.choice(names) + ' + kofs', '(' + a + ') & 7', r.choice(names) + ' - 1'])}])"
     return f"abs({a})"
 
 def fexpr(r, names):
@@ -33,8 +35,13 @@ def body(r, names, depth, ind):
     out = []
     for _ in range(r.randint(1, 3)):
         k = r.random()
-        if k < 0.45:
+        if k < 0.30:
             out.append(f"{ind}s{r.randrange(2)} += {iexpr(r, names)}")
+        elif k < 0.45:
+            # accumulator shapes whose range is known before the loop
+            acc = r.choice(['s0', 's1'])
+            term = r.choice([f"int(st[{names[0]}])", f"int(st[{names[0]} + kofs])", names[0], f"({iexpr(r, names)} & 255)", "s0", "s1", str(r.choice([1, 7, 4611686018427387904 if r.random() < 0.1 else 3])), f"{names[0]} + kofs"])
+            out.append(f"{ind}{acc} {r.choice(['+=', '+=', '-='])} {term}")
         elif k < 0.55:
             out.append(f"{ind}fl += {fexpr(r, names)}")
         elif k < 0.65:
@@ -70,7 +77,7 @@ def body(r, names, depth, ind):
             v = f"i{depth + 1}"
             lo = r.choice(["0", "1", names[0], "-1"])
             hi = r.choice(["n", "n - 1", "n + 1", "3", names[0]])
-            out.append(f"{ind}for {v} in {lo}..{hi}:")
+            out.append(f"{ind}for {v} in {lo}{r.choice(['..', '..', '..', '..='])}{hi}{r.choice(['', '', '', ' by 2', ' by 3'])}:")
             out.extend(body(r, [v] + names, depth + 1, ind + "  "))
         else:
             out.append(f"{ind}s1 -= {iexpr(r, names)}")
@@ -85,7 +92,8 @@ def program(seed):
     n = r.choice([3, 5, 8])
     lines = [f"  let n = {n}", f"  let xs = [{', '.join(str(r.randint(-5, 9)) for _ in range(n))}]",
              f"  let ys = [{', '.join(str(r.randint(-5, 9)) + '.25' for _ in range(n))}]",
-             f"  var zs = [0] * {n + 1}", "  var s0 = 0", "  var s1 = 0", "  var fl = 0.0"]
+             f"  var zs = [0] * {n + 1}", f"  let kofs = {r.choice([-1, 0, 1, 2, 5])}",
+             f"  let st = \"{''.join(r.choice('abcdefgh0123') for _ in range(r.choice([3, 8, 12])))}\"", "  var s0 = 0", "  var s1 = 0", "  var fl = 0.0"]
     for _ in range(r.randint(1, 3)):
         lines.append(f"  for i0 in {r.choice(['0', '1'])}..{r.choice(['n', 'n - 1', 'n + 1'])}:")
         lines.extend(body(r, ["i0"], 0, "    "))

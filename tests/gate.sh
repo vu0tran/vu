@@ -8,7 +8,7 @@ echo "$r" | tail -1 | grep -q PASS || fail=1
 for s in run_tests.sh run_cli.sh run_targeted.sh run_json.sh run_differential.sh run_debug.sh run_modules.sh \
          run_text.sh run_net.sh run_memory.sh run_ffi.sh run_tls.sh run_http.sh run_mt.sh \
          run_crypto.sh run_re.sh run_path.sh run_cli_std.sh run_fmt.sh run_tools.sh run_pkg.sh run_pg.sh run_pg_hostile.sh \
-         run_ws.sh run_h2.sh run_loops.sh run_arm64.sh run_macos.sh; do
+         run_ws.sh run_h2.sh run_loops.sh run_zlib.sh run_arm64.sh run_macos.sh; do
   r=$(./$s 2>&1 | tr -d "\0"; exit ${PIPESTATUS[0]}); rc=$?
   echo "$s: $(echo "$r" | grep -a -E '^[0-9]+ (passed|identical)' | tr '\n' ' ') (exit $rc)"
   [ $rc -eq 0 ] || { fail=1; echo "$r" | grep -a -A3 '^FAIL' | head -20; }

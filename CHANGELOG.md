@@ -1239,6 +1239,84 @@ report in progress the way `exit()` does (test 347 failed once, under load). Bot
 
 Targeted tests 610–628 keep these cases.
 
+## Round 12: zlib, and what it taught the compiler
+
+`std/zlib` decompresses DEFLATE in the zlib and gzip formats or raw, with `crc32` and `adler32`:
+about 436 lines of Vu (536 with comments). It's a showcase on purpose: almost everything reads compressed data, the input
+is whoever sent it, and decompressors written in C have a long record of memory bugs (zlib itself:
+CVE-2022-37434, a heap overflow in inflate). In Vu, damaged or hostile data can only make it fail. It
+takes no capability, so the compiler guarantees it can't open a file, use the network or run a
+command, whatever it's given (a compression library that did, in 2024, was xz). `gunzip_max(data, n)`
+and the other `_max` forms stop at a size limit before using the memory: a 200 MB zip bomb (204 KB of
+gzip) fails in 0.08 s in 13 MB.
+
+**Correctness**: `tests/run_zlib.py` makes random data (text, random bytes, runs, repeated patterns,
+mixtures; up to 400 KB), compresses it with Python's zlib at every level and strategy, every window
+size and with flushes in the middle, into the zlib, gzip (with every optional header field, header
+CRC included) and raw formats, damages 40% of it (bits flipped, cut short, header bytes changed, junk
+appended, plain junk), and requires std/zlib to succeed exactly when `zlib.decompress` does, with the
+same bytes. In the gate's run, 2,400 cases, and 800 more under ASan and UBSan, all agreed (and about
+4,600 more while it was written), and every error message was zlib's (cases with a size limit aside: there std/zlib stops at the limit, before the damage zlib
+reports).
+
+**Speed**, `bench/zlib/compare.sh`: zlib-format decompression of 40 MB of Python source (text),
+40 MB of /usr/bin (binary) and 8 MB of random bytes, median of 5 runs, each result checked:
+
+| | C zlib | Rust (flate2, pure Rust) | Go | **Vu** | Vu, versioning off | Python (C zlib) |
+|---|---|---|---|---|---|---|
+| text, 5 times | 0.76 s, 51 MB | 1.08 s, 84 MB | 1.94 s, 133 MB | **1.60 s, 219 MB** | 2.04 s | 1.03 s |
+| binary, 2 times | 0.51 s, 58 MB | 0.66 s, 91 MB | 1.11 s, 161 MB | **0.88 s, 154 MB** | 1.07 s | 0.54 s |
+| random, 5 times | 0.04 s | 0.04 s | 0.17 s | **0.11 s** | 0.25 s | 0.09 s |
+
+Vu takes 1.7–2.1x C zlib's time on data that compresses, and is ahead of Go on all three; C zlib
+writes into a buffer of exactly the right size (its best case), the others grow theirs. Vu uses the
+most memory: the result is built in a `[Byte]` that doubles, then copied into a `Str`.
+
+**What the library needed from the compiler.** The first version took 2.3x C's time on text. Profiled
+(callgrind), the time went to checks that the code shows can't fail, so the compiler learned to see
+them (each version checked once before the loop, as in round 11):
+
+- `t[x & 1023]`: an index masked by a constant is in range once the list has that many elements (the
+  Huffman tables, CRC tables). The decoder pads its 29- and 30-entry tables to 32 and masks with 31.
+- `out[k - d]` with `d` fixed in the loop (LZ77's copy): an index that is the counter plus or minus a
+  variable is bounded by the first and last pass.
+- `Str` indexes, like list indexes; loops with a `by` step or `..=` (with the last value the counter
+  really reaches: the first version used the bound, which made `data[i + 7]` in a `by 8` loop look out
+  of range, so it was never hoisted).
+- Accumulators: when an Int changes only by `s += e`, with `e` of known range (a Byte, `x & c`, a
+  literal, the counter, a fixed variable, another accumulator), one 128-bit check that
+  `s0 + passes * (most per pass)` stays an Int lets the loop add without checks. adler32's
+  `a += int(b); b += a` went from about 10 instructions a byte to 3.
+- Shifts by `x & c` (c < 64) need no check of the amount.
+- `xs.truncate(n)`, new: keeping the first n elements was a loop of `pop()`.
+- Tried loops (round 11) now read `[Byte]` and `Str` elements, but aren't made when the loop carries an
+  Int from pass to pass: those deferred checks can't be vectorized (the flag depends on every partial
+  sum), and unvectorized they cost more than checks that stop. adler32 was 5 instructions per add
+  slower that way.
+
+All of it together: 2.04 s to 1.60 s on text, 0.25 s to 0.11 s on random (the "versioning off" column).
+The library also does its part: CRC-32 eight bytes at a time.
+
+Attack rounds:
+
+1. std/zlib against Python, 600 cases, then 1,200 with sanitizers: all agreed. Found: nothing in the
+   library. My mistakes: the data generator recursed forever on mixtures, and the message count
+   included cases with a limit.
+2. The compiler's new forms: the loop generator (`tests/loops_gen.py`) now writes `xs[i + k]`,
+   `xs[e & c]`, `Str` reads, stepped and `..=` loops, accumulators and masked shifts (in 40 programs,
+   53 accumulators, 44 masked or constant indexes, 16 offsets by a variable, 14 `Str` indexes): 600
+   programs versioning on against off, and 179 against the compiler before this round (the other 21
+   use `fma`): all the same.
+3. Targeted tests 629–637: accumulators near both ends of Int and a chain that overflows, more than
+   2^31 passes (never bounded, since the 128-bit products could overflow), a mask wider than the list,
+   offsets by a variable that's negative or changes in the loop, a stepped loop near the largest Int,
+   `truncate` (frees Str and list elements; refuses -1 and past the end), masked shifts of negative
+   and wrapping values: all as the compiler before this round, which agrees on the seven that don't
+   use `truncate`. My mistakes: two tests' own expected values.
+4. Test 363 (a par loop in a task) failed once under TSan: a "thread leak", libomp's worker threads
+   not joined at exit. The compiler before this round does the same (2 runs in 40; this one 1 in 40):
+   not a Vu thread, so it's suppressed now (0 in 60).
+
 ## Memory safety evidence
 
 - `tests/reject/`: 21 programs, each containing a bug Vu must refuse: use after move, a

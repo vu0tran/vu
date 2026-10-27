@@ -3644,7 +3644,10 @@ fn int_call(g: G, fname: Str, l: Str, r: Str, line: Int) -> Str:
 # A pointer to element i of list b (C code; mt is the list's type): checked, or unchecked when the loop
 # around it checked the index first (g.plain_idx), or the tried form in a tried loop.
 fn elem_ptr(g: G, e: Node, mt: Str, b: Str, i: Str) -> Str:
-  if e.id in g.plain_idx: return "(&(" + b + ").data[" + g.plain_idx[e.id] + "])"
+  if e.id in g.plain_idx:
+    let pi = g.plain_idx[e.id]
+    if pi == "*": return "(&(" + b + ").data[" + i + "])"
+    return "(&(" + b + ").data[" + pi + "])"
   if g.spec: return "vu_vfat_" + mg(g, mt) + "(&" + b + ", " + i + ", " + g.spec_flag + ")"
   return "vu_at_" + mg(g, mt) + "(&" + b + ", " + i + ", {e.line})"
 
@@ -3753,6 +3756,14 @@ fn g_bin(var g: G, e: Node, expect: Str) -> CT:
   var fname = ""
   if lt == "Int" and res == "Int": fname = int_op(op)
   elif lt == "Byte" and res == "Byte": fname = byte_op(op)
+  # a shift by x & c (c < 64) can't be out of range: no check
+  let sm = mask_of(e.kids[1])
+  if lt == "Int" and sm >= 0 and sm < 64:
+    if op == ">>": fname = ""
+    elif op == "<<":
+      fname = ""
+      l = "(int64_t)((uint64_t)" + l
+      r = r + ")"
   var x = ""
   if fname != "": x = int_call(g, fname, l, r, e.line)
   elif res == "Byte": x = "((uint8_t)(" + l + " " + op + " " + r + "))"
@@ -3808,7 +3819,13 @@ fn g_index(var g: G, e: Node) -> CT:
   let k = tkind(g, t)
   if t == "Str":
     let i = value(&g, e.kids[1], "Int")
-    return bw_end(&g, e.kids[0], b, "vu_str_at(&" + b.code + ", " + i.code + ", {e.line})", "Byte")
+    var sc = "vu_str_at(&" + b.code + ", " + i.code + ", {e.line})"
+    if e.id in g.plain_idx:   # (checked before the loop: see "loop versioning")
+      var at = g.plain_idx[e.id] + ""
+      if at == "*": at = i.code + ""
+      sc = "((" + b.code + ").data[" + at + "])"
+    elif g.spec: sc = "vu_vf_str_at(&" + b.code + ", " + i.code + ", " + g.spec_flag + ")"
+    return bw_end(&g, e.kids[0], b, sc, "Byte")
   if k == "map":
     let key = map_key(t)
     let val = map_val(t)
@@ -4132,6 +4149,7 @@ fn g_call(var g: G, e: Node, expect: Str) -> CT:
     if fname == "push": return push(&g, e)
     if fname == "reserve": return reserve(&g, e)
     if fname == "pop": return pop_call(&g, e)
+    if fname == "truncate": return truncate_call(&g, e)
     if is_str_method(fname): return str_method(&g, e)
     if fname == "sort": return sort_method(&g, e)
     var recv_ty = ""
@@ -4149,7 +4167,7 @@ fn g_call(var g: G, e: Node, expect: Str) -> CT:
     if (fname == "list" or fname == "mkdir" or fname == "exists" or fname == "remove" or fname == "rename") and probe_type(&g, f.kids[0]) == "Fs": return fs_call(&g, e, false)
     let rt = probe_type(&g, f.kids[0])
     if rt == "Str": err(g, e.line, "Str has no ." + fname + "(); its methods are .split(), .join(items), .strip(), .lstrip(), .rstrip(), .startswith(prefix), .endswith(suffix), .upper(), .lower(), .find(sub), .count(sub), .replace(old, new), .chars(), .char_count(), .is_utf8() and .hex(), and it has .len")
-    if tkind(g, rt) == "list": err(g, e.line, "lists have .push(x), .pop(), .sort(), .reserve(n) and .len; there is no ." + fname + "()")
+    if tkind(g, rt) == "list": err(g, e.line, "lists have .push(x), .pop(), .truncate(n), .sort(), .reserve(n) and .len; there is no ." + fname + "()")
     if tkind(g, rt) == "map": err(g, e.line, "maps have .get(key, default), .remove(key) and .len; there is no ." + fname + "()")
     if tkind(g, rt) == "struct":
       let sft = struct_field(g, rt, fname)
@@ -4896,6 +4914,23 @@ fn pop_call(var g: G, e: Node) -> CT:
   write_check(g, p, e.line, false)
   return CT("vu_pop_" + mg(g, p.ty) + "(&" + p.code + ", {e.line})", inner_of(p.ty))
 
+# xs.truncate(n): keeps the first n elements (0 <= n <= xs.len), freeing the rest.
+fn truncate_call(var g: G, e: Node) -> CT:
+  if nargs_of(e) != 1 or e.kids[1].flag: err(g, e.line, ".truncate takes one Int: how many elements to keep")
+  let p = place(&g, e.kids[0].kids[0])
+  if not p.ok or tkind(g, p.ty) != "list": err(g, e.line, ".truncate() works on a list stored in a variable")
+  write_check(g, p, e.line, false)
+  let c = value(&g, e.kids[1].kids[0], "Int")
+  if c.ty != "Int": err(g, e.line, ".truncate takes an Int, not " + tn(c.ty))
+  let lp = tmp(&g)
+  let nv = tmp(&g)
+  let et = inner_of(p.ty)
+  var drops = ""
+  if not is_copy(g, et):
+    let ev = tmp(&g)
+    drops = "while (" + lp + "->len > " + nv + ") {{ " + ct(g, et) + " " + ev + " = " + lp + "->data[--" + lp + "->len]; " + drop_code(g, et, ev) + " }} "
+  return CT("({{ " + ct(g, p.ty) + " *" + lp + " = &" + p.code + "; int64_t " + nv + " = " + c.code + "; if (" + nv + " < 0 || " + nv + " > " + lp + "->len) vu_fail({e.line}, \"truncate(%lld) on a list of length %lld\", (long long)" + nv + ", (long long)" + lp + "->len); " + drops + lp + "->len = " + nv + "; }})", "~void")
+
 fn push(var g: G, e: Node) -> CT:
   if nargs_of(e) != 1 or e.kids[1].flag: err(g, e.line, ".push takes one value")
   let p = place(&g, e.kids[0].kids[0])
@@ -4930,7 +4965,7 @@ fn mutated_roots(g: G, e: Node, var out: {Int: Bool}):
     target = root_name_node(e.kids[0])
   elif e.k == "call" and e.kids[0].k == "field":
     let m = e.kids[0].name
-    if m == "push" or m == "remove" or m == "reserve" or m == "pop" or m == "sort": target = root_name_node(e.kids[0].kids[0])
+    if m == "push" or m == "remove" or m == "reserve" or m == "pop" or m == "truncate" or m == "sort": target = root_name_node(e.kids[0].kids[0])
   if target != "":
     let v = lookup(g, target)
     if v >= 0: out[v] = true
@@ -6656,7 +6691,10 @@ fn s_assign(var g: G, n: Node) -> Bool:
   var fname = ""
   if p.ty == "Int": fname = int_op(op)
   elif p.ty == "Byte": fname = byte_op(op)
-  if fname != "":
+  if fname != "" and p.ty == "Int" and n.id in g.plain_idx and (op == "+" or op == "-"):
+    # an accumulator the loop around it checked once (see vaccum)
+    emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + ty + " *" + pp + " = &" + p.code + "; *" + pp + " = *" + pp + " " + op + " " + tv + "; }}")
+  elif fname != "":
     emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + ty + " *" + pp + " = &" + p.code + "; *" + pp + " = " + int_call(g, fname, "*" + pp, tv, n.line) + "; }}")
   elif effects(&g, rhs):
     emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + p.code + " " + n.op + " " + tv + "; }}")
@@ -6978,21 +7016,21 @@ fn loop_copy(var g: G, n: Node, header: Str, cn: Str, decl: Str, var lp: Loop) -
 # Nothing else may differ between the copies: a tried copy whose C calls anything but the deferred
 # checks, math and other tried copies is thrown away (spec_clean).
 
-const VMAX_NODES = 400          # bodies larger than this aren't copied
+const VMAX_NODES = 800          # bodies larger than this aren't copied
 const VMAX_DEPTH = 3            # versioned loops nested deeper than this aren't (copies double per level)
 const VMAX_OFF = 1099511627776  # xs[i + c] is hoisted for |c| up to 2^40
-const NO_OFF = 4611686018427387904
 
 type VIdx:
   id: Int
   list: Str
-  kind: Int   # 0: xs[lv + off], 1: xs[off] (a constant), 2: xs[name]
+  kind: Int   # 0: xs[lv + off] (+ or - name, when name is set), 1: xs[off], 2: xs[name], 3: xs[e & off]
   off: Int
   name: Str
+  sign: Int
 
 type VScan:
   count: Int
-  bad: Bool            # something never generated twice (closures, ?, spawn, match, par loops)
+  bad: Bool            # something never generated twice (closures, nested functions, spawn, match, par loops)
   decl: {Str: Bool}    # names declared in the body
   other: {Str: Bool}   # names used other than as xs[...], xs.len or for x in xs
   callees: [Str]
@@ -7000,18 +7038,56 @@ type VScan:
   inc: {Str: Int}      # how many `x += 1` statements there are for x (outside inner loops)
   dec: {Str: Int}      # and `x -= 1`
   changed: {Str: Bool} # names assigned otherwise, passed with &, or stepped inside an inner loop
+  accs: [VAcc]         # every assignment to a name
+  refd: {Str: Bool}    # names passed with &
 
-# e is lv + c (or c + lv, lv - c, lv) for an Int literal c: c, or NO_OFF.
-fn lv_off(e: Node, lv: Str) -> Int:
-  if e.k == "name" and e.name == lv: return 0
-  if e.k == "bin" and (e.op == "+" or e.op == "-") and e.kids.len == 2:
-    let a = e.kids[0]
-    let b = e.kids[1]
-    if a.k == "name" and a.name == lv and b.k == "int" and not b.big and b.ival <= VMAX_OFF:
-      if e.op == "+": return b.ival
-      return 0 - b.ival
-    if e.op == "+" and b.k == "name" and b.name == lv and a.k == "int" and not a.big and a.ival <= VMAX_OFF: return a.ival
-  return NO_OFF
+type VAcc:
+  id: Int
+  name, op: Str
+  depth: Int
+  rhs: Node
+
+# An index as a sum: the counter once, at most one other name (added or taken away), and Int literals.
+type VSum:
+  lvs, terms: Int
+  name: Str
+  sign, off: Int
+  ok: Bool
+
+fn lv_sum(e: Node, lv: Str, sign: Int, var t: VSum):
+  t.terms += 1
+  if not t.ok or t.terms > 8:
+    t.ok = false
+    return
+  if e.k == "name":
+    if e.name == lv: t.lvs += sign
+    elif t.name == "":
+      t.name = e.name + ""
+      t.sign = sign
+    else: t.ok = false
+  elif e.k == "int" and not e.big and e.ival <= VMAX_OFF: t.off += sign * e.ival
+  elif e.k == "bin" and e.kids.len == 2 and (e.op == "+" or e.op == "-"):
+    lv_sum(e.kids[0], lv, sign, &t)
+    var s2 = sign
+    if e.op == "-": s2 = 0 - sign
+    lv_sum(e.kids[1], lv, s2, &t)
+  else: t.ok = false
+
+# The C for a name that stays the same through the loop scanned into s (an Int variable or constant), or "".
+fn steady_int(g: G, s: VScan, name: Str) -> Str:
+  if name in s.changed or name in s.inc or name in s.dec or name in s.decl: return ""
+  let v = lookup(g, name)
+  if v >= 0:
+    if g.vars[v].ty == "Int": return var_lv(g, v)
+    return ""
+  if name in g.consts and g.consts[name] == "Int": return "C_" + name
+  return ""
+
+fn mask_of(e: Node) -> Int:
+  if e.k != "bin" or e.op != "&" or e.kids.len != 2: return -1
+  for c in e.kids:
+    if c.k == "int" and not c.big and c.ival <= VMAX_OFF: return c.ival
+  return -1
 
 fn vscan(e: Node, lv: Str, depth: Int, var s: VScan):
   s.count += 1
@@ -7023,8 +7099,13 @@ fn vscan(e: Node, lv: Str, depth: Int, var s: VScan):
     if one and e.op == "+=": s.inc[x] = s.inc.get(x, 0) + 1
     elif one and e.op == "-=": s.dec[x] = s.dec.get(x, 0) + 1
     else: s.changed[x] = true
-  if k == "ref" and e.kids.len == 1 and e.kids[0].k == "name": s.changed[e.kids[0].name] = true
-  if k == "lambda" or k == "fnstmt" or k == "try" or k == "spawn" or k == "match" or k == "orelse" or k == "fail" or (k == "range" and e.is_par):
+    s.accs.push(VAcc(e.id, x + "", e.op + "", depth, copy_node(e.kids[1])))
+  if k == "ref" and e.kids.len == 1 and e.kids[0].k == "name":
+    s.changed[e.kids[0].name] = true
+    s.refd[e.kids[0].name] = true
+  # (?, else and fail are fine: a copy is generated like any code, and the tried copies refuse them in
+  # vf_stmt anyway)
+  if k == "lambda" or k == "fnstmt" or k == "spawn" or k == "match" or (k == "range" and e.is_par):
     s.bad = true
     return
   if k == "let" or k == "range" or k == "each" or (k == "if" and e.flag2): s.decl[e.name] = true
@@ -7032,11 +7113,13 @@ fn vscan(e: Node, lv: Str, depth: Int, var s: VScan):
   if k == "call" and e.kids[0].k == "name": s.callees.push(e.kids[0].name + "")
   if k == "index" and e.kids.len == 2 and e.kids[0].k == "name":
     let ix = e.kids[1]
-    var off = NO_OFF
-    if lv != "": off = lv_off(ix, lv)
-    if off != NO_OFF: s.idx.push(VIdx(e.id, e.kids[0].name + "", 0, off, ""))
-    elif ix.k == "int" and not ix.big and ix.ival <= VMAX_OFF: s.idx.push(VIdx(e.id, e.kids[0].name + "", 1, ix.ival, ""))
-    elif ix.k == "name": s.idx.push(VIdx(e.id, e.kids[0].name + "", 2, 0, ix.name + ""))
+    var t = VSum(0, 0, "", 0, 0, lv != "")
+    if lv != "": lv_sum(ix, lv, 1, &t)
+    let m = mask_of(ix)
+    if t.ok and t.lvs == 1: s.idx.push(VIdx(e.id, e.kids[0].name + "", 0, t.off, t.name + "", t.sign))
+    elif ix.k == "int" and not ix.big and ix.ival <= VMAX_OFF: s.idx.push(VIdx(e.id, e.kids[0].name + "", 1, ix.ival, "", 0))
+    elif ix.k == "name": s.idx.push(VIdx(e.id, e.kids[0].name + "", 2, 0, ix.name + "", 0))
+    elif m >= 0: s.idx.push(VIdx(e.id, e.kids[0].name + "", 3, m, "", 0))
     # (other indexes stay checked)
     vscan(ix, lv, depth, &s)
     return
@@ -7057,40 +7140,172 @@ type VPlan:
 fn stable_list(g: G, s: VScan, name: Str) -> Bool:
   if name in s.other or name in s.decl: return false
   let v = lookup(g, name)
-  return v >= 0 and tkind(g, g.vars[v].ty) == "list" and not has_frozen(g, v, "part")
+  return v >= 0 and (tkind(g, g.vars[v].ty) == "list" or g.vars[v].ty == "Str") and not has_frozen(g, v, "part")
 
-# For a range loop: xs[lv + c] (in range on every pass when the first and last are) and xs[c].
-fn vhoist(var g: G, n: Node, cn: Str, ta: Str, tb: Str, s: VScan) -> VPlan:
+# For a range loop: xs[lv + c] (in range on every pass when the first and largest counter values are:
+# ta, and tb - 1, or tb for a..=b; a `by` step only skips values) and xs[c].
+fn vhoist(var g: G, n: Node, cn: Str, ta: Str, tb: Str, step: Str, s: VScan) -> VPlan:
   var plan = VPlan("", {})
   if n.name in s.decl: return plan
+  # xs[lv + c] and xs[lv + k + c] (k the same on every pass), grouped by list and k: the first pass's
+  # smallest index and the last pass's largest must be in range
   var lo: {Str: Int} = {}
   var hi: {Str: Int} = {}
+  var sym: {Str: Str} = {}
+  var lists: {Str: Str} = {}
   var order: [Str] = []
   var consts: [Str] = []
   for x in s.idx:
     if x.kind == 2 or not stable_list(g, s, x.list): continue
-    if x.kind == 1:
-      plan.ids[x.id] = "{x.off}"
-      consts.push("{x.off} < (" + var_lv(g, lookup(g, x.list)) + ").len")
+    let llv = var_lv(g, lookup(g, x.list))
+    if x.kind == 1 or x.kind == 3:
+      if x.kind == 1: plan.ids[x.id] = "{x.off}"
+      else: plan.ids[x.id] = "*"   # (the index is computed as written; only its range check goes)
+      consts.push("{x.off} < (" + llv + ").len")
       continue
-    if not (x.list in lo):
-      lo[x.list] = x.off
-      hi[x.list] = x.off
-      order.push(x.list + "")
-    if x.off < lo[x.list]: lo[x.list] = x.off
-    if x.off > hi[x.list]: hi[x.list] = x.off
-    if x.off == 0: plan.ids[x.id] = cn + ""
-    else: plan.ids[x.id] = "(" + cn + " + ({x.off}))"
+    var sc = ""
+    if x.name != "":
+      let c = steady_int(g, s, x.name)
+      if c == "": continue
+      if x.sign > 0: sc = " + " + c
+      else: sc = " - " + c
+    let key = x.list + "|" + sc
+    if not (key in lo):
+      lo[key] = x.off
+      hi[key] = x.off
+      sym[key] = sc + ""
+      lists[key] = llv
+      order.push(key + "")
+    if x.off < lo[key]: lo[key] = x.off
+    if x.off > hi[key]: hi[key] = x.off
+    if x.off == 0 and sc == "": plan.ids[x.id] = cn + ""
+    else: plan.ids[x.id] = "(" + cn + sc + " + ({x.off}))"
   var conds: [Str] = []
-  for name in order:
-    let v = lookup(g, name)
-    conds.push("(__int128)" + ta + " + ({lo[name]}) >= 0 && (__int128)" + tb + " - 1 + ({hi[name]}) < (__int128)(" + var_lv(g, v) + ").len")
-  if conds.len > 0: plan.pre = "(" + ta + " >= " + tb + " || (" + join(conds, " && ") + "))"
+  for key in order:
+    let w = replace_all(sym[key], " + ", " + (__int128)")
+    let w2 = replace_all(w, " - ", " - (__int128)")
+    # the counter's last value: b - 1 (b for a..=b), or with a step, the last one it reaches
+    var last = "(__int128)" + tb + " - 1"
+    if n.flag: last = "(__int128)" + tb
+    if step != "1": last = "((__int128)" + ta + " + (" + last + " - " + ta + ") / " + step + " * " + step + ")"
+    conds.push("(__int128)" + ta + w2 + " + ({lo[key]}) >= 0 && " + last + w2 + " + ({hi[key]}) < (__int128)(" + lists[key] + ").len")
+  var empty = ta + " >= " + tb
+  if n.flag: empty = ta + " > " + tb
+  if conds.len > 0: plan.pre = "(" + empty + " || (" + join(conds, " && ") + "))"
   if consts.len > 0:
     let c = join(dedup(consts), " && ")
     if plan.pre == "": plan.pre = c
     else: plan.pre = plan.pre + " && " + c
   return plan
+
+# Accumulators: when a range loop changes an Int x only by `x += e` / `x -= e` (once or more a pass,
+# not in an inner loop), and each e has a range known at the loop's start (an Int literal, int() of a
+# Byte, `y & c`, the counter, a variable the loop doesn't change, another accumulator, sums of these),
+# then x stays within x0 + passes * (the most it can move a pass) either way. If that range fits in an
+# Int (checked once, in 128 bits, for at most 2^31 passes), the hoisted copy adds without checks.
+# (sum += int(data[i]), adler32's b += a)
+type VRange:
+  ok, pending: Bool
+  lo, hi: Str
+
+fn vr_fail() -> VRange:
+  return VRange(false, false, "", "")
+
+fn vaccum(g: G, n: Node, ta: Str, tb: Str, s: VScan, var plan: VPlan):
+  var bad: {Str: Bool} = {}
+  var names: [Str] = []
+  for a in s.accs:
+    if not (a.name in bad) and not has_str(names, a.name): names.push(a.name + "")
+    if (a.op != "+=" and a.op != "-=") or a.depth != 0 or a.name in s.refd or a.name in s.decl or a.name == n.name: bad[a.name] = true
+  var cands: {Str: Bool} = {}
+  for x in names:
+    if x in bad: continue
+    let v = lookup(g, x)
+    if v < 0 or g.vars[v].ty != "Int" or not g.vars[v].mutable: continue
+    if g.vars[v].kind != "local" and g.vars[v].kind != "param": continue
+    cands[x] = true
+  if cands.len == 0: return
+  var trips = "(" + ta + " < " + tb + " ? (__int128)" + tb + " - " + ta + " : (__int128)0)"
+  if n.flag: trips = "(" + ta + " <= " + tb + " ? (__int128)" + tb + " - " + ta + " + 1 : (__int128)0)"
+  var ranges: {Str: VRange} = {}
+  var conds: [Str] = []
+  var order: [Str] = []
+  for _ in 0..8:
+    var progress = false
+    for x, _ in cands:
+      if x in ranges: continue
+      var pos: [Str] = []
+      var neg: [Str] = []
+      var ok = true
+      var pending = false
+      for a in s.accs:
+        if a.name != x: continue
+        let r = vrange(g, n, ta, tb, s, cands, ranges, a.rhs, 0)
+        if r.pending: pending = true
+        if not r.ok: ok = false
+        elif a.op == "+=":
+          pos.push("vu_max0(" + r.hi + ")")
+          neg.push("vu_min0(" + r.lo + ")")
+        else:
+          pos.push("vu_max0(-(" + r.lo + "))")
+          neg.push("vu_min0(-(" + r.hi + "))")
+      if not ok or pending: continue
+      let x0 = "(__int128)" + var_lv(g, lookup(g, x))
+      let lo = "(" + x0 + " + " + trips + " * (" + join(neg, " + ") + "))"
+      let hi = "(" + x0 + " + " + trips + " * (" + join(pos, " + ") + "))"
+      conds.push(lo + " >= INT64_MIN && " + hi + " <= INT64_MAX")
+      ranges[x] = VRange(true, false, lo, hi)
+      order.push(x + "")
+      progress = true
+    if not progress: break
+  if conds.len == 0: return
+  for a in s.accs:
+    if a.name in ranges: plan.ids[a.id] = "+"   # (s_assign: add without a check)
+  var c = trips + " <= 2147483648 && " + join(conds, " && ")
+  if plan.pre == "": plan.pre = c
+  else: plan.pre = plan.pre + " && " + c
+
+# The range of e at any point of the loop, as two C expressions (128-bit), or not ok; pending: it
+# needs an accumulator whose range isn't known yet.
+fn vrange(g: G, n: Node, ta: Str, tb: Str, s: VScan, cands: {Str: Bool}, ranges: {Str: VRange}, e: Node, depth: Int) -> VRange:
+  if depth > 6: return vr_fail()
+  if e.k == "int":
+    if e.big or e.ival > VMAX_OFF: return vr_fail()
+    return VRange(true, false, "(__int128){e.ival}", "(__int128){e.ival}")
+  if e.k == "name":
+    if e.name in ranges: return VRange(true, false, ranges[e.name].lo + "", ranges[e.name].hi + "")
+    if e.name in cands: return VRange(false, true, "", "")
+    if e.name == n.name:
+      var last = "(__int128)" + tb + " - 1"
+      if n.flag: last = "(__int128)" + tb
+      return VRange(true, false, "(__int128)" + ta, last)
+    let c = steady_int(g, s, e.name)
+    if c == "": return vr_fail()
+    return VRange(true, false, "(__int128)" + c, "(__int128)" + c)
+  if e.k == "call" and e.kids.len == 2 and e.kids[0].k == "name" and e.kids[0].name == "int" and lookup(g, "int") < 0:
+    if is_byte_read(g, e.kids[1].kids[0]): return VRange(true, false, "(__int128)0", "(__int128)255")
+    return vr_fail()
+  if e.k == "bin" and e.kids.len == 2:
+    let m = mask_of(e)
+    if m >= 0: return VRange(true, false, "(__int128)0", "(__int128){m}")
+    if e.op == "+" or e.op == "-":
+      let a = vrange(g, n, ta, tb, s, cands, ranges, e.kids[0], depth + 1)
+      let b = vrange(g, n, ta, tb, s, cands, ranges, e.kids[1], depth + 1)
+      if a.pending or b.pending: return VRange(false, true, "", "")
+      if not a.ok or not b.ok: return vr_fail()
+      if e.op == "+": return VRange(true, false, "(" + a.lo + " + " + b.lo + ")", "(" + a.hi + " + " + b.hi + ")")
+      return VRange(true, false, "(" + a.lo + " - " + b.hi + ")", "(" + a.hi + " - " + b.lo + ")")
+  return vr_fail()
+
+# Whether e is a Byte: s[i] of a Str or an element of a [Byte] list, or a Byte variable.
+fn is_byte_read(g: G, e: Node) -> Bool:
+  if e.k == "index" and e.kids.len == 2 and e.kids[0].k == "name":
+    let v = lookup(g, e.kids[0].name)
+    return v >= 0 and (g.vars[v].ty == "Str" or g.vars[v].ty == "[Byte]")
+  if e.k == "name":
+    let v = lookup(g, e.name)
+    return v >= 0 and g.vars[v].ty == "Byte"
+  return false
 
 fn dedup(xs: [Str]) -> [Str]:
   var seen: {Str: Bool} = {}
@@ -7107,7 +7322,7 @@ fn dedup(xs: [Str]) -> [Str]:
 fn while_hoist(var g: G, n: Node) -> VPlan:
   var plan = VPlan("", {})
   if g.vdepth >= VMAX_DEPTH or g.spec: return plan
-  var s = VScan(0, false, {}, {}, [], [], {}, {}, {})
+  var s = VScan(0, false, {}, {}, [], [], {}, {}, {}, [], {})
   vscan(n.kids[0], "", 0, &s)
   for c in n.kids[1].kids: vscan(c, "", 0, &s)
   var local_call = false
@@ -7133,8 +7348,9 @@ fn while_hoist(var g: G, n: Node) -> VPlan:
   for x in s.idx:
     if not stable_list(g, s, x.list): continue
     let lv = var_lv(g, lookup(g, x.list))
-    if x.kind == 1:
-      plan.ids[x.id] = "{x.off}"
+    if x.kind == 1 or x.kind == 3:
+      if x.kind == 1: plan.ids[x.id] = "{x.off}"
+      else: plan.ids[x.id] = "*"
       conds.push("{x.off} < (" + lv + ").len")
     elif x.kind == 2 and a != "" and (x.name == a or x.name == b):
       plan.ids[x.id] = var_lv(g, lookup(g, x.name))
@@ -7155,7 +7371,7 @@ fn plain_off(var g: G, plan: VPlan):
 
 # Generates the range loop n (its bounds already in ta and tb), in as many copies as help (see above).
 fn versioned(var g: G, n: Node, header: Str, cn: Str, ta: Str, tb: Str, step: Str, before: Snap, var lp: Loop) -> Bool:
-  var s = VScan(0, false, {}, {}, [], [], {}, {}, {})
+  var s = VScan(0, false, {}, {}, [], [], {}, {}, {}, [], {})
   for c in n.kids[n.kids.len - 1].kids: vscan(c, n.name, 0, &s)
   var local_call = false
   for c in s.callees:
@@ -7163,7 +7379,8 @@ fn versioned(var g: G, n: Node, header: Str, cn: Str, ta: Str, tb: Str, step: St
   if s.bad or s.count > VMAX_NODES or local_call or (g.vdepth >= VMAX_DEPTH and not g.spec):
     return loop_copy(&g, n, header, cn, "", &lp)
   var plan = VPlan("", {})
-  if not n.flag and step == "1": plan = vhoist(&g, n, cn, ta, tb, s)
+  plan = vhoist(&g, n, cn, ta, tb, step, s)
+  if not g.spec: vaccum(g, n, ta, tb, s, &plan)
   if g.spec:
     # part of a tried copy: a failed hoisting check is a failure like any other, and so is one
     # recorded before the loop (its bounds may be garbage then)
@@ -7178,6 +7395,11 @@ fn versioned(var g: G, n: Node, header: Str, cn: Str, ta: Str, tb: Str, step: St
   var env: {Str: Str} = {}
   env[n.name] = "Int"
   var spec = vf_body(g, n.kids[n.kids.len - 1], &env, &sets, "", true)
+  # Deferred checks on an Int carried from pass to pass (s += x) can't be vectorized (the flag depends
+  # on each partial sum), and unvectorized they cost more than checks that stop: such loops aren't tried.
+  for name, _ in sets:
+    let v = lookup(g, name)
+    if v >= 0 and g.vars[v].ty == "Int": spec = false
   if not spec and plan.pre == "": return loop_copy(&g, n, header, cn, "", &lp)
   g.vdepth += 1
   if spec:
@@ -7378,11 +7600,15 @@ fn vf_ty(g: G, e: Node, env: {Str: Str}, scoped: Bool) -> Str:
     if (op == "%" or op == "<<" or op == ">>" or op == "&" or op == "|" or op == "^") and t == "Int": return t
     return ""
   if k == "index":
+    # (a Byte read is only usable through int(): Byte arithmetic has no deferred form)
     if not scoped or e.kids.len != 2 or e.kids[0].k != "name" or e.kids[0].name in env: return ""
     let v = lookup(g, e.kids[0].name)
-    if v < 0 or tkind(g, g.vars[v].ty) != "list": return ""
-    let et = inner_of(g.vars[v].ty)
-    if not vf_scalar(et) or vf_ty(g, e.kids[1], env, scoped) != "Int": return ""
+    if v < 0: return ""
+    var et = "Byte"
+    if g.vars[v].ty != "Str":
+      if tkind(g, g.vars[v].ty) != "list": return ""
+      et = inner_of(g.vars[v].ty)
+    if not (vf_scalar(et) or et == "Byte") or vf_ty(g, e.kids[1], env, scoped) != "Int": return ""
     return et
   if k == "field":
     if scoped and e.name == "len" and e.kids.len == 1 and e.kids[0].k == "name" and not (e.kids[0].name in env):
@@ -7416,7 +7642,7 @@ fn vf_call(g: G, e: Node, env: {Str: Str}, scoped: Bool) -> Str:
     if na == 1 and ts[0] == "Int": return "Float"
     return ""
   if f == "int":
-    if na == 1 and (ts[0] == "Int" or ts[0] == "Float"): return "Int"
+    if na == 1 and (ts[0] == "Int" or ts[0] == "Float" or ts[0] == "Byte"): return "Int"
     return ""
   if f == "abs":
     if na == 1 and (ts[0] == "Int" or ts[0] == "Float"): return ts[0] + ""
@@ -9938,6 +10164,9 @@ fn rt_runtime() -> Str:
   s += "static inline int64_t vu_imax(int64_t a, int64_t b) {{ return a > b ? a : b; }}\n"
   s += "static inline double vu_fmin(double a, double b) {{ return a < b ? a : b; }}\n"
   s += "static inline double vu_fmax(double a, double b) {{ return a > b ? a : b; }}\n"
+  s += "/* For the checks before a loop (vaccum in the compiler): the negative part of x, or the positive. */\n"
+  s += "static inline __int128 vu_min0(__int128 x) {{ return x < 0 ? x : 0; }}\n"
+  s += "static inline __int128 vu_max0(__int128 x) {{ return x > 0 ? x : 0; }}\n"
   s += "/* A loop tried with its checks deferred (s_range in the compiler): each operation records a failure\n"
   s += "   in *f instead of stopping, and gives some value without undefined behavior; nothing branches, so\n"
   s += "   the C compiler can vectorize the loop. When *f is set afterwards, the loop's variables are put back\n"
@@ -10178,6 +10407,12 @@ fn rt_runtime() -> Str:
   s += "    int64_t n = a->len < b->len ? a->len : b->len;\n"
   s += "    int c = n ? memcmp(a->data, b->data, (size_t)n) : 0;\n"
   s += "    return c ? c : (a->len > b->len) - (a->len < b->len);\n"
+  s += "}}\n"
+  s += "/* A string read in a tried loop (vu_vf_add above): out of range records a failure and reads 0. */\n"
+  s += "static inline uint8_t vu_vf_str_at(const vu_str *s, int64_t i, uint64_t *f) {{\n"
+  s += "    int in = (uint64_t)i < (uint64_t)s->len;\n"
+  s += "    *f |= (uint64_t)!in;\n"
+  s += "    return in ? s->data[i] : 0;\n"
   s += "}}\n"
   s += "static inline uint8_t vu_str_at(const vu_str *s, int64_t i, int line) {{\n"
   s += "    /* Two signed comparisons rather than one unsigned: a loop condition like i < s.len then\n"

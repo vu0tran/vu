@@ -45,7 +45,7 @@ fn main():
 | `Bool` | `true` / `false` |
 | `Byte` | 0..255, one byte in memory. Literals: `65`, `0x41` or `'A'`. Overflow stops the program. |
 | `Str` | an owned string of bytes: `s.len`, `s[i]` (a Byte), `s[a..b]` (a new Str), `+`, `+=`, `== <`, `s.reserve(n)` |
-| `[T]` | growable list: `xs.len`, `xs.push(v)`, `xs.pop()` (removes and returns the last element; stops the program if empty), `xs[i]` (bounds-checked), `xs.reserve(n)` |
+| `[T]` | growable list: `xs.len`, `xs.push(v)`, `xs.pop()` (removes and returns the last element; stops the program if empty), `xs.truncate(n)` (keeps the first n), `xs[i]` (bounds-checked), `xs.reserve(n)` |
 | `T?` | optional: either a `T` or `nil` (`Int?`, `Str?`, `[T]?`, a struct or enum...; not a capability or another optional). Recursive types must use it (or a list or map). Read it with `if x = opt:` or `opt else default` (see Errors). |
 | `{K: V}` | map from Int, Byte, Bool or Str keys to any value (see Maps) |
 | `type Name:` | a struct, fields listed below it (`x, y: Float` declares two fields) |
@@ -443,10 +443,11 @@ to annotate. The compiler enforces five rules:
 
 At runtime, indexing and slicing are bounds-checked, and integer arithmetic checks for
 overflow and division by zero. A failed check stops the program with a message and exit
-code 101. It never reads or writes memory it shouldn't. In hot loops the checks are cheap: a
-loop whose counter indexes a list checks those indexes once before it starts, and a loop that
-only computes numbers runs first with its checks recorded instead of stopping it (so the C
-compiler can vectorize it), then again checked if any failed. Either way the program stops at the
+code 101. It never reads or writes memory it shouldn't. In hot loops the checks are cheap: indexes
+whose range the loop shows (`xs[i + k]` with `i` the counter, `xs[0]`, `t[x & 255]`, the two
+ends of `while lo < hi`) are checked once before it starts, and so are sums that can only grow
+so much (`s += int(b)`); a loop that only computes numbers runs first with its checks recorded
+instead of stopping it (so the C compiler can vectorize it), then again checked if any failed. Either way the program stops at the
 same check, with the same message, as when each operation is checked in order. Recursion too deep for the stack
 (on the main thread or a `par` worker) also stops with `panic: stack overflow` and exit
 code 101, as in Rust, instead of crashing with a signal.
@@ -1055,6 +1056,20 @@ let parts = re.split(re.compile(",\\s*")?, line)
 
 Loops whose body can match nothing (`(a*)*`) give the groups Python gives. Possessive repeats
 (`a*+`) are refused like backreferences: they need backtracking.
+
+**`zlib`**: decompression of DEFLATE data in the zlib and gzip formats or raw, and `crc32` and
+`adler32`. It answers what Python's `zlib.decompress` answers for the same bytes (data after the
+stream is ignored, as there) and fails with zlib's messages on anything else; `tests/run_zlib.py`
+compares the two, damaged data included. It takes no capability, so whatever it is given, it can't
+touch a file or the network. The `_max` forms fail once the result would pass a size, before using
+the memory for it (a zip bomb).
+
+```
+import zlib
+let page = zlib.gunzip_max(body, 50 << 20)?   # Content-Encoding: gzip, at most 50 MB
+let text = zlib.decompress(data)?             # zlib.compress's format; zlib.inflate(raw) for raw DEFLATE
+print("{zlib.crc32(text)}")
+```
 
 **`path`**: file paths as text, as Python's `os.path` gives them on Linux and macOS (`tests/run_path.py`
 compares them): `path.join(a, b)`, `join_all(parts)`, `dir`, `base`, `ext` (".gz" of "a.tar.gz"),

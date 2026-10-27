@@ -244,6 +244,9 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
 - `pg`: a PostgreSQL client (SCRAM-SHA-256, parameters only);
 - `re`: regular expressions with Python's syntax, in time linear in the text, and as fast as
   Python's on most patterns (faster on many: CHANGELOG.md, round 10);
+- `zlib`: zlib, gzip and raw DEFLATE decompression, the same results as Python's `zlib` (and zlib's
+  error messages), 1.7–2.1x C zlib's time on compressible data and ahead of Go's, with no
+  capability at all and a size limit for zip bombs (CHANGELOG.md, round 12);
 - `path` and `cli`: file paths as Python's `os.path` gives them, and command-line arguments;
 - `time`: UTC dates, ISO 8601 and HTTP dates, RFC 3339 parsing;
 - `log`: timestamped or JSON log lines.
