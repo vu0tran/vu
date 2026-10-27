@@ -1079,6 +1079,27 @@ My own mistakes in tests aren't counted here; these are bugs in Vu.
     threaded client loses its handshake over TLS now and then, against its own server too. The Vu
     server handled 6,000 TLS upgrades in a row with the asyncio client. Not a Vu bug, but it took
     a while to show that, and my extra logging created a second, fake hang (a full stderr pipe).
+12. **Two races in the new scheduler code** (ThreadSanitizer, in the gate): the `started` flag was
+    read by other threads without atomics, and after handing a task to another thread, the waker
+    read the task's fields, by which time that thread could have run it and freed it.
+13. **`vu get` would have run commands from a dependency**: a source like `git+--upload-pack=...`
+    in any package's `vu.pkg` reached `git clone` as an option. Now only https, http, ssh, git and
+    file URLs are accepted, after `--`, with git's `ext::` transport off.
+14. **A version could lead outside the package cache**: `v1/../../somewhere` passed the version
+    check and named the folder `vu get` cloned into, deleted (`rm -rf`) and renamed onto. Versions
+    are now `v` with digits and dots and an optional `-suffix`, also when read back from vu.lock.
+15. **Symbolic links in a package** made the hash walk recurse forever (a link to its own folder)
+    or read files outside it; `vu get` now refuses packages that contain any.
+16. **`pg` against a hostile server**: a short data or row-description message crashed the client
+    program (an index out of range) instead of failing the query; after a protocol error the
+    connection stayed usable, so the next query could read the previous one's leftovers as its
+    results; a server could skip proving it knows the password once SCRAM had started; and any
+    server could ask for the password in clear text and get it (now only with `allow_plain`).
+    `tests/run_pg_hostile.py` is a fake server that tries each.
+
+The last round (optional elements of lists and maps, `else` in `par` loops, `const` through
+interfaces, generics and interpolation, `re` patterns that match nothing, compared before and
+after its speed-up on text that isn't UTF-8) found nothing.
 
 ## Memory safety evidence
 
