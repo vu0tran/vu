@@ -1003,6 +1003,9 @@ regular expressions, paths, argument parsing, WebSockets and HTTP/2.
 
 `pg` (PostgreSQL: SCRAM sign-in, parameters only), `re` (Python's syntax and results in linear
 time), `path`, `cli`, `ws` (WebSockets), and HTTP/2 in `http` (prior knowledge, and ALPN over TLS).
+`re` is slower than Python's C engine on ordinary patterns: `findall` over 870 KB of text took
+0.18 s for `[a-z]+` (Python 0.07 s) and 0.20 s for `\w+@\w+\.com` (0.055 s), and 0.028 s for
+`(\d+)` (0.051 s); skipping to bytes a match can start with made it 1.4–8x faster than it first was.
 
 ### Tasks that move
 
