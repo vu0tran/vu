@@ -83,7 +83,7 @@ match parse_digit(b):                # or inspect it
 A call that can fail must be handled, or the program doesn't compile. `throws E` with an enum `E`
 gives typed errors that callers can match on.
 
-### Enums, generics and closures
+### Enums, generics, interfaces and closures
 
 ```
 type Shape:
@@ -100,6 +100,18 @@ fn largest[T](xs: [T], better: fn(T, T) -> Bool) -> T?: ...
 let k = 3
 let scaled = map_all(xs, fn(x) => x * k)    # borrows k; can't outlive it
 let add_n = own fn(x) => x + n              # owns a copy of n, an ordinary value
+```
+
+```
+interface Shape:
+  fn area(s: Self) -> Float
+
+impl Shape for Rect:
+  fn area(r: Rect) -> Float:
+    return r.w * r.h
+
+fn total[T: Shape](xs: [T]) -> Float: ...      # statically dispatched, like a direct call
+let shapes: [Shape] = [Circle(1), Rect(2, 3)]  # interface values: dispatched through a table
 ```
 
 `match` must cover every variant. Generic functions and types are specialized for each use and
@@ -190,7 +202,7 @@ C handles are owned like any other value and freed exactly once, by their drop f
 
 ## The standard library
 
-Built in: strings, lists, maps, files (`Fs`), processes, environment and signals (`Os`), TCP, TLS
+Built in: strings (with Unicode case, characters and search), lists, maps, files (`Fs`), processes, environment and signals (`Os`), TCP, TLS
 (OpenSSL) and DNS (`Net`), channels and timers, JSON, and formatting with Python's names
 (`split`, `join`, `strip`, `"{x:.3f}"`). Written in Vu, in `std/`:
 
@@ -251,8 +263,9 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 ## Limits
 
 - Linux only (epoll; the task switch is hand-written for x86-64, with `ucontext` elsewhere).
-- Strings are byte strings, with no Unicode handling beyond UTF-8 checks in JSON.
-- No methods, traits or interfaces. Generics are constrained only by how they're used.
+- Strings are bytes. Text functions (`chars()`, `upper()`, `ord`...) read them as UTF-8; there is
+  no Unicode normalization and no character classes (`isalpha`).
+- No methods: functions take the value they work on as their first argument (`area(c)`).
 - Tasks don't move between threads, so an idle thread doesn't take work from a busy one, and a
   task that never waits keeps the other tasks on its thread from running.
 - No package manager. Modules are files, found next to the importing file or in `std/`.

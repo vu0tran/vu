@@ -10,7 +10,7 @@ VU=${VU:-"$PWD/../vu"}
 pass=0; fail=0; work=$(mktemp -d)
 ARCHER=${ARCHER:-/usr/lib/llvm-18/lib/libarcher.so}
 supp="$PWD/tsan.supp"   # (an absolute path: the programs run in $work)
-for f in targeted/*.vu; do
+for f in targeted/${ONLY:-*}.vu; do   # ONLY=5[12]*_iface* runs some
   attack=$(sed -n '1s/^# attack: //p' "$f")
   kind=$(sed -n '2s/^# expect: \([a-z]*\) .*/\1/p' "$f")
   want=$(sed -n '2s/^# expect: [a-z]* //p' "$f")

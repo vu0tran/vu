@@ -165,6 +165,65 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
   swap(&body, &g.lines)
   g.bodies.push(join(body, "\n"))
 
+# The C type of a parameter as a function receives it.
+fn param_c(g: G, pa: Param, name: Str) -> Str:
+  if pa.is_own: return ct(g, pa.ty) + " " + name
+  if pa.is_var: return ct(g, pa.ty) + " *" + name
+  return pdecl(g, pa.ty, name)
+
+# Interface i's table type, the table of each type implementing it (with a small function per entry that
+# calls the implementing function), and the function that frees an interface value.
+fn iface_code(g: G, i: Str) -> [Str]:
+  var out: [Str] = []
+  let im = mg(g, i)
+  let sigs = copy_strs(g.ifaces[i])
+  var fields = ["void (*drop)(void *);"]
+  for k in 0..sigs.len:
+    let f = g.ifns[sigs[k]]
+    var r = ct(g, f.ret)
+    if f.fails:
+      var rt = "!" + f.ret
+      if f.err != "": rt += "#" + f.err
+      r = ct(g, rt)
+    var ps = ""
+    for j in 1..f.params.len: ps += ", " + param_c(g, f.params[j], "").rstrip()
+    fields.push(r + " (*f{k})(void *" + ps + ");")
+  out.push("typedef struct {{ " + join(fields, " ") + " }} VT_" + im + ";")
+  var tys: [Str] = []
+  if i in g.impl_types: tys = copy_strs(g.impl_types[i])
+  for t in tys:
+    let vn = vt_name(g, i, t)
+    let tc = ct(g, t)
+    var dbody = "(void)p;"
+    if not is_copy(g, t): dbody = drop_code(g, t, "(*(" + tc + " *)p)")
+    out.push("static void " + vn + "_drop(void *p) {{ " + dbody + " }}")
+    var entries = [vn + "_drop"]
+    let ikey = i + "|" + t
+    let fnames = copy_strs(g.impls[ikey])
+    for k in 0..sigs.len:
+      let f = g.ifns[sigs[k]]
+      var r = ct(g, f.ret)
+      if f.fails:
+        var rt = "!" + f.ret
+        if f.err != "": rt += "#" + f.err
+        r = ct(g, rt)
+      var decl = ""
+      var cargs: [Str] = []
+      if f.params[0].is_var or not by_value(g, t): cargs.push("(" + tc + " *)self")
+      else: cargs.push("*(" + tc + " *)self")
+      for j in 1..f.params.len:
+        decl += ", " + param_c(g, f.params[j], "a{j}")
+        cargs.push("a{j}")
+      var rk = "return "
+      if r == "void": rk = ""
+      out.push("__attribute__((unused)) static " + r + " " + vn + "_f{k}(void *self" + decl + ") {{ " + rk + "fn_" + fnames[k] + "(" + join(cargs, ", ") + "); }}")
+      entries.push(vn + "_f{k}")
+    out.push("__attribute__((unused)) static const VT_" + im + " " + vn + " = {{ " + join(entries, ", ") + " }};")
+  # (past a depth, through the runtime's to-do list, so a long chain of them can't overflow the stack)
+  out.push("static void vu_freedyn_" + im + "(void *v, int64_t vt) {{ ((const VT_" + im + " *)(intptr_t)vt)->drop(v); free(v); }}")
+  out.push("static void drop_" + im + "(" + im + " *p) {{ void *v = p->p; if (!v) return; p->p = NULL; int64_t vt = (int64_t)(intptr_t)p->vt; if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) {{ vu_drop_depth++; vu_freedyn_" + im + "(v, vt); vu_drop_depth--; }} else vu_defer(vu_freedyn_" + im + ", v, vt); }}")
+  return out
+
 fn has_call(e: Node) -> Bool:
   if e.k == "call" or e.k == "list" or e.k == "str" or e.k == "lambda": return true
   let k = e.k
@@ -276,6 +335,7 @@ fn build(var g: G, items: [Node]) -> Str:
   var out: [Str] = []
   if g.uses_tasks: out.push("#define VU_MT 1   /* tasks run on several threads */")
   out.push(rt_runtime())
+  if g.uses_case: out.push(rt_case())
   if g.uses_float_parse:
     out.push(rt_pow10())
     out.push(rt_float())
@@ -299,6 +359,9 @@ fn build(var g: G, items: [Node]) -> Str:
     for n, d in g.exttypes: out.push("static void drop_X_" + n + "(void **p) {{ if (*p) {{ " + d + "(*p); *p = NULL; }} }}")
   for c in consts: out.push(c)
   for n in g.struct_order: out.push("typedef struct T_" + n + " T_" + n + ";")
+  for t in g.types:
+    # an interface value: the value (on the heap, or lent) and its type's table of functions
+    if tkind(g, t) == "iface": out.push("typedef struct {{ void *p; const void *vt; }} " + mg(g, t) + ";")
   let boxed = sorted_boxed(g)
   for key in boxed:
     let n = sk_name(key)
@@ -391,6 +454,9 @@ fn build(var g: G, items: [Node]) -> Str:
     var rk = "return "
     if r == "void": rk = ""
     out.push("static " + r + " vu_th_" + tname + "(void *e" + decl + ") {{ (void)e; " + rk + "fn_" + tname + "(" + join(targs, ", ") + "); }}")
+  for t in g.types:
+    if tkind(g, t) == "iface":
+      for line in iface_code(g, t): out.push(line)
   out.push("static int vu_main(void);")
   for sname in g.spawned:
     # spawn name(...): the arguments travel to the new task in a block it frees
@@ -450,7 +516,7 @@ fn build(var g: G, items: [Node]) -> Str:
       if it != "~void" and not is_copy(g, it): val = " else {{ " + drop_code(g, it, "p->val") + " }}"
       out.push("static void drop_" + m + "(" + m + " *p) {{ if (p->bad) {{ " + drop_err(g, t, "(*p)") + " }}" + val + " }}")
       continue
-    if tk == "map": continue
+    if tk == "map" or tk == "iface": continue
     if tk == "fn":
       out.push("static void drop_" + m + "(vu_fn *p) {{ vu_fn_drop(p); }}")
       continue
@@ -694,22 +760,46 @@ fn res_expr(var r: Res, all_own: [{Str: Str}], ctx: Ctx, var e: Node):
     report(ctx, e.line, "module '" + e.kids[0].name + "' isn't imported in this file; add 'import " + e.kids[0].name + "' at the top")
   for i in 0..e.kids.len: res_expr(&r, all_own, ctx, &e.kids[i])
 
+# A function's types and body (an interface's signatures have no body; nor do extern functions).
+fn res_fn(var r: Res, all_own: [{Str: Str}], ctx: Ctx, var f: Node):
+  for pi in 0..f.kids[0].kids.len:
+    f.kids[0].kids[pi].ty = res_ty(r, all_own, ctx, f.kids[0].kids[pi].ty, f.kids[0].kids[pi].line)
+  f.ret = res_ty(r, all_own, ctx, f.ret, f.line)
+  if f.name2 != "": f.name2 = res_ty(r, all_own, ctx, f.name2, f.line)
+  if f.op == "extern" or f.op == "sig": return
+  r.scopes = [{}]
+  for pn in f.kids[0].kids: res_declare(&r, ctx, pn.name, pn.line)
+  res_block(&r, all_own, ctx, &f.kids[1])
+  r.scopes = []
+
+# The bounds on an item's type parameters ("T=Shape;U=geo.Show"), with the interfaces renamed.
+fn res_bounds(r: Res, all_own: [{Str: Str}], ctx: Ctx, bounds: Str, line: Int) -> Str:
+  if bounds == "": return ""
+  var out: [Str] = []
+  for part in bounds.split(";"):
+    let eq = find_byte(part, '=', 0)
+    out.push(part[0..eq + 1] + res_ty(r, all_own, ctx, part[eq + 1..part.len], line))
+  return join(out, ";")
+
 fn res_items(var r: Res, all_own: [{Str: Str}], ctx: Ctx, var its: [Node]):
   for ii in 0..its.len:
     let k = its[ii].k
     r.tps = {}
     for tp in its[ii].names:
       if k == "fn" or k == "type" or k == "enum": r.tps[tp] = true
+    if (k == "fn" or k == "type" or k == "enum") and its[ii].names.len > 0:
+      its[ii].ty = res_bounds(r, all_own, ctx, its[ii].ty, its[ii].line)
     if k == "fn":
-      for pi in 0..its[ii].kids[0].kids.len:
-        its[ii].kids[0].kids[pi].ty = res_ty(r, all_own, ctx, its[ii].kids[0].kids[pi].ty, its[ii].kids[0].kids[pi].line)
-      its[ii].ret = res_ty(r, all_own, ctx, its[ii].ret, its[ii].line)
-      if its[ii].name2 != "": its[ii].name2 = res_ty(r, all_own, ctx, its[ii].name2, its[ii].line)
-      if its[ii].op == "extern": continue   # an extern function: its body is C
-      r.scopes = [{}]
-      for pn in its[ii].kids[0].kids: res_declare(&r, ctx, pn.name, pn.line)
-      res_block(&r, all_own, ctx, &its[ii].kids[1])
-      r.scopes = []
+      res_fn(&r, all_own, ctx, &its[ii])
+    elif k == "iface":
+      r.tps["Self"] = true
+      for fi in 0..its[ii].kids.len: res_fn(&r, all_own, ctx, &its[ii].kids[fi])
+    elif k == "impl":
+      its[ii].name = res_ty(r, all_own, ctx, its[ii].name, its[ii].line)
+      its[ii].ty = res_ty(r, all_own, ctx, its[ii].ty, its[ii].line)
+      for fi in 0..its[ii].kids.len:
+        r.tps = {}
+        res_fn(&r, all_own, ctx, &its[ii].kids[fi])
     elif k == "type":
       for fi in 0..its[ii].kids.len: its[ii].kids[fi].ty = res_ty(r, all_own, ctx, its[ii].kids[fi].ty, its[ii].kids[fi].line)
     elif k == "enum":
@@ -804,9 +894,12 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Nod
     var table: {Str: Str} = {}
     for ii in 0..items[k].len:
       let ik = items[k][ii].k + ""
-      if ik == "fn" or ik == "type" or ik == "enum" or ik == "const" or ik == "exttype":
+      if ik == "fn" or ik == "type" or ik == "enum" or ik == "const" or ik == "exttype" or ik == "iface":
         let nm = items[k][ii].name + ""
         if not (nm in table): table[nm] = prefix + nm
+      if ik == "iface":
+        for sg in items[k][ii].kids:
+          if not (sg.name in table): table[sg.name] = prefix + sg.name
       if ik == "extern":
         # the C file is next to the Vu file that names it
         let d = dir_of(files[k].path)
@@ -843,7 +936,9 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str) -> [Nod
     if k > 0:
       for ii in 0..items[k].len:
         let ik = items[k][ii].k
-        if ik == "fn" or ik == "type" or ik == "enum" or ik == "const" or ik == "exttype": items[k][ii].name = own[k][items[k][ii].name] + ""
+        if ik == "fn" or ik == "type" or ik == "enum" or ik == "const" or ik == "exttype" or ik == "iface": items[k][ii].name = own[k][items[k][ii].name] + ""
+        if ik == "iface":
+          for si in 0..items[k][ii].kids.len: items[k][ii].kids[si].name = own[k][items[k][ii].kids[si].name] + ""
         if ik == "enum":
           for vi in 0..items[k][ii].kids.len: items[k][ii].kids[vi].name = own[k][items[k][ii].kids[vi].name] + ""
   # Each file after the files it imports (depth first from the main file), so a constant or type from

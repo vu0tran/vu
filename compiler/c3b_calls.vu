@@ -390,8 +390,15 @@ fn call_args(var g: G, e: Node, params: [Param], croot: Int, cline: Int) -> Args
         let r = gen(&g, a, pt)
         if tkind(g, r.ty) == "lfn": lfn_escape(g, a.line)
         if r.p.ok:
-          if r.ty != pt: err(g, a.line, "expected " + tn(pt) + ", found " + tn(r.ty))
-          if tkind(g, pt) == "chan": c = "vu_chan_share(" + r.p.code + ")"   # both keep using the channel
+          let to_iface = tkind(g, pt) == "iface" and r.ty != pt and implements(g, r.ty, pt)
+          if r.ty != pt and not to_iface: err(g, a.line, "expected " + tn(pt) + ", found " + tn(r.ty))
+          if to_iface:
+            # moved like any owned argument, then put in an interface value
+            var mc = ""
+            if is_copy(g, r.ty): mc = r.p.code + ""
+            else: mc = move_place(&g, r.p, a.line)
+            c = box_iface(g, mc, r.ty, pt)
+          elif tkind(g, pt) == "chan": c = "vu_chan_share(" + r.p.code + ")"   # both keep using the channel
           elif tkind(g, pt) == "shared": c = "VU_SHUP(" + r.p.code + ")"   # another handle to the same value
           elif pt == "Str" and keep < 0: c = "vu_str_dup(&" + r.p.code + ")"
           else:
@@ -429,6 +436,23 @@ fn call_args(var g: G, e: Node, params: [Param], croot: Int, cline: Int) -> Args
       let r = gen(&g, a, pt)
       # a borrowing closure can be passed where a function value is borrowed
       let lent = tkind(g, r.ty) == "lfn" and owned_fn(r.ty) == pt
+      if tkind(g, pt) == "iface" and r.ty != pt and implements(g, r.ty, pt):
+        # lent as an interface value that points at the argument (and is never freed through)
+        let dvt = tmp(&g)
+        if r.p.ok:
+          root_v.push(r.p.root)
+          root_mut.push(false)
+          root_line.push(a.line)
+          ref_v.push(base_of(g, r.p.root))
+          ref_arg.push(j)
+          pre.push(mg(g, pt) + " " + dvt + " = {{(void *)&" + r.p.code + ", &" + vt_name(g, pt, r.ty) + "}};")
+        else:
+          let tv0 = tmp(&g)
+          pre.push(ct(g, r.ty) + " " + tv0 + " = " + r.code + ";")
+          if not is_copy(g, r.ty): post.push(drop_code(g, r.ty, tv0))
+          pre.push(mg(g, pt) + " " + dvt + " = {{(void *)&" + tv0 + ", &" + vt_name(g, pt, r.ty) + "}};")
+        codes.push("&" + dvt)
+        continue
       if r.p.ok:
         if r.ty != pt and not lent: err(g, a.line, "expected " + tn(pt) + ", found " + tn(r.ty))
         root_v.push(r.p.root)
@@ -624,6 +648,17 @@ fn builtin(var g: G, e: Node, n: Str, expect: Str) -> CT:
     if b.ty != "Str" and b.ty != "[Byte]": err(g, e.line, "write() outputs a Str or [Byte] exactly as is, not " + tn(b.ty))
     return bw_end(&g, a, b, "vu_write((" + b.code + ").data, (" + b.code + ").len)", "~void")
   if n == "panic": return b_panic(&g, e)
+  if n == "ord":
+    nargs(g, e, 1, "ord")
+    let a = e.kids[1].kids[0]
+    let b = bw_begin(&g, a, "")
+    if b.ty != "Str": err(g, e.line, "ord() takes a one-character Str (ord(\"A\") is 65); a Byte converts with int(b)")
+    return bw_end(&g, a, b, "vu_ord(&(" + b.code + "), {e.line})", "Int")
+  if n == "chr":
+    nargs(g, e, 1, "chr")
+    let c = value(&g, e.kids[1].kids[0], "Int")
+    if c.ty != "Int": err(g, e.line, "chr() takes an Int code point, not " + tn(c.ty))
+    return CT("vu_chr(" + c.code + ", {e.line})", "Str")
   if n == "str":
     nargs(g, e, 1, "str")
     let a = e.kids[1].kids[0]
@@ -865,7 +900,61 @@ fn b_sorted(var g: G, e: Node) -> CT:
   return bw_end(&g, a, b, code, t)
 
 fn is_str_method(n: Str) -> Bool:
-  return n == "split" or n == "join" or n == "strip" or n == "lstrip" or n == "rstrip" or n == "startswith" or n == "endswith"
+  return n == "split" or n == "join" or n == "strip" or n == "lstrip" or n == "rstrip" or n == "startswith" or n == "endswith" or is_text_method(n)
+
+# Methods that read a Str as text: case, characters, searching.
+fn is_text_method(n: Str) -> Bool:
+  return n == "upper" or n == "lower" or n == "chars" or n == "char_count" or n == "is_utf8" or n == "find" or n == "count" or n == "replace"
+
+fn text_method(var g: G, e: Node) -> CT:
+  let name = e.kids[0].name
+  if any_named(e): err(g, e.line, "." + name + "() takes positional arguments")
+  let na = nargs_of(e)
+  var want = 0
+  if name == "find" or name == "count": want = 1
+  if name == "replace": want = 2
+  if na != want:
+    if want == 0: err(g, e.line, "s." + name + "() takes no arguments")
+    if want == 1: err(g, e.line, "s." + name + "(sub) takes one Str")
+    err(g, e.line, "s.replace(old, new) takes two Str values")
+  let recv = e.kids[0].kids[0]
+  let b = bw_begin(&g, recv, "")
+  if b.ty != "Str": err(g, e.line, "." + name + "() is a Str method; this is " + tn(b.ty))
+  let rc = b.code
+  if want == 0:
+    var code = ""
+    var ty = "Str"
+    if name == "upper" or name == "lower":
+      g.uses_case = true
+      var up = "1"
+      if name == "lower": up = "0"
+      code = "vu_case(&(" + rc + "), " + up + ")"
+    elif name == "char_count":
+      code = "vu_char_count(&(" + rc + "))"
+      ty = "Int"
+    elif name == "is_utf8":
+      code = "vu_is_utf8(&(" + rc + "))"
+      ty = "Bool"
+    else:
+      let lt = reg(&g, "[Str]")
+      let r = tmp(&g)
+      let pos = tmp(&g)
+      let piece = tmp(&g)
+      code = "({{ " + ct(g, lt) + " " + r + " = {{0}}; int64_t " + pos + " = 0; vu_str " + piece + "; while (vu_char_next(&(" + rc + "), &" + pos + ", &" + piece + ")) vu_push_" + mg(g, lt) + "(&" + r + ", " + piece + "); " + r + "; }})"
+      ty = lt
+    return bw_end(&g, recv, b, code, ty)
+  let a1 = e.kids[1].kids[0]
+  let ab = bw_begin(&g, a1, "")
+  if ab.ty != "Str": err(g, e.line, "s." + name + "() takes Str arguments, not " + tn(ab.ty))
+  if want == 1:
+    let inner = bw_end(&g, a1, ab, "vu_str_" + name + "(&(" + rc + "), &(" + ab.code + "))", "Int")
+    return bw_end(&g, recv, b, inner.code, inner.ty)
+  let a2 = e.kids[2].kids[0]
+  let ab2 = bw_begin(&g, a2, "")
+  if ab2.ty != "Str": err(g, e.line, "s.replace(old, new) takes Str arguments, not " + tn(ab2.ty))
+  let inner2 = bw_end(&g, a2, ab2, "vu_str_replace(&(" + rc + "), &(" + ab.code + "), &(" + ab2.code + "))", "Str")
+  let inner1 = bw_end(&g, a1, ab, inner2.code, inner2.ty)
+  return bw_end(&g, recv, b, inner1.code, inner1.ty)
 
 fn split_code(var g: G, rc: Str, sep: Str, line: Int) -> CT:
   let lt = reg(&g, "[Str]")
@@ -885,6 +974,7 @@ fn strip_code(name: Str, rc: Str, chars: Str) -> Str:
 # lstrip, rstrip, s.startswith(p), s.endswith(p).
 fn str_method(var g: G, e: Node) -> CT:
   let name = e.kids[0].name
+  if is_text_method(name): return text_method(&g, e)
   if any_named(e): err(g, e.line, "." + name + "() takes positional arguments")
   var usage = ""
   if name == "split": usage = "s.split() splits on whitespace; s.split(sep) splits on a Str separator"

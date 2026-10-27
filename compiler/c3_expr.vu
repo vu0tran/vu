@@ -175,6 +175,7 @@ fn static_type_uncached(var g: G, e: Node) -> Str:
       if ft != "" and (tkind(g, ft) == "fn" or tkind(g, ft) == "lfn"): return fn_parts(ft).ret
     if f.k == "name":
       if f.name in g.fns: return g.fns[f.name].ret + ""
+      if f.name in g.ifns: return g.ifns[f.name].ret + ""
       if f.name in g.gfn_nodes:
         if e.id in g.gcache: return g.fns[g.gcache[e.id]].ret + ""
         return ""
@@ -184,7 +185,8 @@ fn static_type_uncached(var g: G, e: Node) -> Str:
         return g.variants[f.name] + ""
       if f.name == "str": return "Str"
       if f.name == "sqrt" or f.name == "float": return "Float"
-      if f.name == "int" or f.name == "arg": return "Int"
+      if f.name == "int" or f.name == "arg" or f.name == "ord": return "Int"
+      if f.name == "chr": return "Str"
       if f.name == "byte": return "Byte"
       return ""
     if f.k == "field" and f.name == "read": return "Str"
@@ -245,10 +247,19 @@ fn conv_hint(a: Str, b: Str) -> Str:
 fn coerce(g: G, code: Str, t: Str, expect: Str, line: Int) -> CT:
   if expect == "" or t == expect: return CT(code, t)
   if tkind(g, t) == "lfn": lfn_escape(g, line)
+  # a value of a type that implements an interface becomes a value of the interface's type
+  if tkind(g, expect) == "iface" and implements(g, t, expect): return CT(box_iface(g, code, t, expect), expect)
   if tkind(g, expect) == "opt":
     if t == "~nil": return CT("NULL", expect)
     if t == inner_of(expect): return CT("vu_box_" + box_name(g, t) + "(" + code + ")", expect)
+    let ie = inner_of(expect)
+    if tkind(g, ie) == "iface" and implements(g, t, ie): return CT("vu_box_" + box_name(g, ie) + "(" + box_iface(g, code, t, ie) + ")", expect)
   return die_ct(g, line, "expected " + tn(expect) + ", found " + tn(t) + conv_hint(t, expect))
+
+# An owned value (code, of type t) moved to the heap as a value of interface i.
+fn box_iface(g: G, code: Str, t: Str, i: Str) -> Str:
+  let c = ct(g, t)
+  return "({{ " + c + " *_vb = (" + c + " *)vu_malloc(sizeof(" + c + ")); *_vb = " + code + "; (" + mg(g, i) + "){{(void *)_vb, &" + vt_name(g, i, t) + "}}; }})"
 
 # Read e without taking ownership (the first half of with_borrow).
 fn bw_begin(var g: G, e: Node, expect: Str) -> Bw:
@@ -352,6 +363,8 @@ fn g_name(var g: G, e: Node, expect: Str) -> CT:
   if e.name in g.consts: return CT("C_" + e.name, g.consts[e.name])
   if e.name in g.fns or e.name in g.gfn_nodes: return fn_value(&g, e, expect)
   if e.name in g.structs: err(g, e.line, "'" + disp(e.name) + "' is a type; create one with " + disp(e.name) + "(...)")
+  if e.name in g.ifns: err(g, e.line, disp(e.name) + "() is an interface function, which means a different function for each type, so it isn't a value; wrap it in a closure: fn(x: Circle) => " + disp(e.name) + "(x)")
+  if e.name in g.ifaces: err(g, e.line, disp(e.name) + " is an interface, not a value")
   return die_ct(g, e.line, "unknown name '" + disp(e.name) + "'")
 
 # A string literal, with any {interpolations}, as an owned Str value.
@@ -470,7 +483,13 @@ fn g_bin(var g: G, e: Node, expect: Str) -> CT:
   if op == "*" and e.kids[0].k == "list": return repeat(&g, e, expect)
   if op == "in":
     let bm = bw_begin(&g, e.kids[1], "")
-    if tkind(g, bm.ty) != "map": err(g, e.line, "'in' checks whether a key is in a map; this is " + tn(bm.ty))
+    if bm.ty == "Str":
+      # sub in s: whether s contains sub
+      let sb = bw_begin(&g, e.kids[0], "")
+      if sb.ty != "Str": err(g, e.line, "'in' on a Str checks for a Str inside it, not " + tn(sb.ty))
+      let si = bw_end(&g, e.kids[0], sb, "(vu_str_find(&(" + bm.code + "), &(" + sb.code + ")) >= 0)", "Bool")
+      return bw_end(&g, e.kids[1], bm, si.code, si.ty)
+    if tkind(g, bm.ty) != "map": err(g, e.line, "'in' checks whether a key is in a map, or a Str inside a Str; this is " + tn(bm.ty))
     let key = map_key(bm.ty)
     let kb = key_begin(&g, e.kids[0], key)
     let inner = bw_end(&g, e.kids[0], kb, "vu_mhas_" + mg(g, bm.ty) + "(&" + bm.code + ", " + key_ptr(g, kb, key) + ")", "Bool")
@@ -540,7 +559,7 @@ fn g_field(var g: G, e: Node) -> CT:
   if e.name == "len" and e.kids[0].k == "name":
     let v = lookup(g, e.kids[0].name)
     if v >= 0 and tkind(g, g.vars[v].ty) == "list" and has_frozen(g, v, "part"):
-      return CT("(" + var_lv(g, v) + ").len", "Int")
+      return CT("vu_len((" + var_lv(g, v) + ").len)", "Int")
   let b = bw_begin(&g, e.kids[0], "")
   let t = b.ty
   let k = tkind(g, t)
@@ -551,7 +570,7 @@ fn g_field(var g: G, e: Node) -> CT:
     err(g, e.line, "read .value through a variable or field holding the Shared value (let s = ... first), so the value stays alive while it's read")
   if t == "Str" or k == "list":
     if e.name != "len": field_type(g, t, e.name, e.line)
-    rc = "(" + b.code + ").len"
+    rc = "vu_len((" + b.code + ").len)"
     rt = "Int"
   elif k == "map":
     if e.name != "len": field_type(g, t, e.name, e.line)
@@ -744,6 +763,7 @@ fn throwing_call(var g: G, e: Node) -> Bool:
     if n == "recv" and is_chan_expr(&g, e.kids[0].kids[0]): return true
   if parse_call(&g, e) or from_json_call(g, e): return true
   if e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.gfn_nodes: return g.gfn_nodes[e.kids[0].name].flag
+  if e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.ifns and lookup(g, e.kids[0].name) < 0: return g.ifns[e.kids[0].name].fails
   return e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.fns and g.fns[e.kids[0].name].fails
 
 # Code for a call that can fail, as a result value (R_T) whose .bad says whether it failed.
@@ -776,6 +796,7 @@ fn throw_code(var g: G, call: Node, expect: Str) -> CT:
   if call.kids[0].name in g.gfn_nodes:
     let inst = gcall(&g, call, expect)
     return call_user(&g, call, inst, true)
+  if call.kids[0].name in g.ifns: return iface_call(&g, call, true)
   return call_user(&g, call, call.kids[0].name, true)
 
 fn diverging_call(e: Node) -> Bool:
@@ -891,8 +912,60 @@ fn g_call(var g: G, e: Node, expect: Str) -> CT:
     let inst = gcall(&g, e, expect)
     return call_user(&g, e, inst, false)
   if n in g.fns: return call_user(&g, e, n, false)
+  if n in g.ifns: return iface_call(&g, e, false)
+  if n in g.ifaces: err(g, e.line, disp(n) + " is an interface: make a value of a type that implements it, and use it where a " + disp(n) + " is expected")
   if lookup(g, n) >= 0: err(g, e.line, "'" + n + "' is a variable, not a function")
   return die_ct(g, e.line, "unknown function '" + disp(n) + "'")
+
+# A call to interface function n: to the implementing function of the first argument's type, or through
+# the table of functions of an interface value.
+fn iface_call(var g: G, e: Node, allow_throw: Bool) -> CT:
+  let n = e.kids[0].name + ""
+  let iname = g.ifns[n].iface + ""
+  let idx = g.ifns[n].idx
+  let fails = g.ifns[n].fails
+  var params = copy_params(g.ifns[n].params)
+  let d = disp(n)
+  if any_named(e): err(g, e.line, "named arguments are only used when creating a struct")
+  let na = nargs_of(e)
+  if na != params.len:
+    var pl: [Str] = []
+    for pa in params: pl.push(pa.name)
+    err(g, e.line, d + "() takes {params.len} argument(s) (" + join(pl, ", ") + ") but got {na}")
+  if fails and not allow_throw:
+    err(g, e.line, d + "() can fail, so handle its error: " + d + "(...)? passes it on, " + d + "(...) else <default> replaces it, or match " + d + "(...): with ok(v) and err(e) arms")
+  let a = e.kids[1].kids[0]
+  var rt = ""
+  if a.k == "ref": rt = probe_type(&g, a.kids[0])
+  else: rt = arg_type(&g, a)
+  if rt == "": err(g, e.line, "can't tell which type's " + d + "() this is: give the first argument a type")
+  if rt != iname:
+    let key = iname + "|" + rt
+    if not (key in g.impls):
+      if tkind(g, rt) == "opt": err(g, e.line, "this value is a " + tn(rt) + " and may be nil; unwrap it first: if x = ...:")
+      err(g, e.line, tn(rt) + " doesn't implement " + disp(iname) + ", so there is no " + d + "() for it (add impl " + disp(iname) + " for " + tn(rt) + ":)")
+    let target = g.impls[key][idx] + ""
+    return call_user(&g, e, target, allow_throw)
+  # through the interface value's table
+  params[0].ty = iname + ""
+  var ret = g.ifns[n].ret + ""
+  if fails:
+    ret = "!" + ret
+    if g.ifns[n].err != "": ret += "#" + g.ifns[n].err
+    reg(&g, ret)
+  var args = call_args(&g, e, params, -1, 0)
+  var pre: [Str] = []
+  var post: [Str] = []
+  var codes: [Str] = []
+  swap(&pre, &args.pre)
+  swap(&post, &args.post)
+  swap(&codes, &args.codes)
+  let dv = tmp(&g)
+  var rest = ""
+  for i in 1..codes.len: rest += ", " + codes[i]
+  let im = mg(g, iname)
+  let call = "((const VT_" + im + " *)" + dv + "->vt)->f{idx}(" + dv + "->p" + rest + ")"
+  return wrap(&g, pre, "({{ " + im + " *" + dv + " = " + codes[0] + "; " + call + "; }})", post, ret)
 
 # ---- closures and function values
 

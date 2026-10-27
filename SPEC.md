@@ -34,7 +34,7 @@ fn main():
   carriage return, vertical tab and form feed count as whitespace, so a non-breaking space
   pasted from a web page is reported (`unexpected character U+00A0`) rather than silently
   accepted. Blocks and expressions can nest at most 4000 levels deep.
-- Top level holds only `fn`, `type`, and `const`. There is no global mutable state.
+- Top level holds only `fn`, `type`, `const`, `interface` and `impl`. There is no global mutable state.
 
 ## Types
 
@@ -174,6 +174,45 @@ let xs: [Int] = empty()                         # fn empty[T]() -> [T]: T from t
 - Type arguments can be any type except capabilities, nothing, and borrowing closures. Type
   arguments nest at most 32 deep, and a program has at most 2,000 copies, so a function that
   calls itself with ever bigger types (`f[[T]]` from `f[T]`) is an error, not a hang.
+
+## Interfaces
+
+An interface names functions that several types provide. Each type gives its own in an `impl` block:
+
+```
+interface Shape:
+  fn area(s: Self) -> Float
+  fn grow(var s: Self, amount: Float)
+
+impl Shape for Circle:
+  fn area(c: Circle) -> Float:
+    return 3.14159 * c.r * c.r
+  fn grow(var c: Circle, amount: Float):
+    c.r += amount
+
+area(c)                                   # Circle's area: chosen by the type, at compile time
+fn total[T: Shape](xs: [T]) -> Float: ... # a bound: T must implement Shape
+let shapes: [Shape] = [Circle(1), Rect(2, 3)]   # values of any type that implements Shape
+for s in shapes: print("{area(s)}")      # each calls its own type's area
+```
+
+- An interface function's first parameter is the value it works on, of type `Self` (borrowed, or `var`
+  to change it). `Self` appears nowhere else: not in other parameters, not in the result.
+- An `impl` gives every function of the interface, each with exactly the interface's signature
+  (with the type in place of `Self`). Interfaces can be implemented for structs, enums (including
+  generic instances like `Pair[Int, Str]`), `Int`, `Float`, `Bool`, `Byte` and `Str`, once per type.
+- A call `area(x)` goes to the function for `x`'s type. In generic code, that's the type argument's
+  function, so it costs what a direct call does. A bound (`[T: Shape]`) makes a type argument that
+  doesn't implement the interface an error at the call, naming both.
+- The interface's name is also a type: a `Shape` value holds a value of any type that implements it
+  (on the heap) and calls that type's functions through a table, as Go's interface values and Rust's
+  `Box<dyn Shape>` do. A value becomes one where a `Shape` is expected (`let`, a list, a field, an
+  `own` parameter, `return`) and is moved in. Passed to a borrowed `Shape` parameter, it's lent:
+  nothing is moved, copied or allocated.
+- Interface functions can fail (`throws`, `throws E`) and take `var` and `own` parameters. An interface
+  function isn't a value (wrap it: `fn(c: Circle) => area(c)`). Interface values can't be compared
+  with `==`, matched, written as JSON, used as map keys, or put in a `Shared` value (the type behind
+  one could hold a connection); they can go through channels.
 
 ## Closures and function values
 
@@ -675,6 +714,31 @@ let ys = sorted(xs)                     # a sorted copy; sorted(xs, reverse: tru
 xs.sort()                               # in place; xs.sort(reverse: true)
 let lo = min(xs)                        # min/max of a list, or of two or more numbers: max(a, b, c)
 ```
+
+Text: strings are bytes, and these read them as UTF-8 characters, with Python's names and results:
+
+```
+"straße".upper()          # "STRASSE": Python's full Unicode case mapping (also s.lower())
+"aé中😀".char_count()     # 4 (s.len is 10: bytes)
+for c in s.chars(): ...    # each character as a Str
+ord("é")                   # 233; chr(233) is "é"
+s.find("é")                # the byte index of the first "é" (for s[a..b]), or -1
+s.count("ab")              # how many times, not overlapping
+s.replace("a", "b")        # every "a" replaced
+if "ab" in s: ...          # whether s contains "ab"
+s.is_utf8()                # whether s is valid UTF-8
+```
+
+- Bytes that aren't UTF-8 are read as Python's `decode(errors="replace")` reads them: each bad
+  stretch is one character, U+FFFD in `chars()`, counted once by `char_count()`; `upper()` and
+  `lower()` leave them as they are. `ord` of such a string, of `""` or of more than one character
+  stops the program, and so does `chr` of a number that isn't a code point (0 to 0x10FFFF, not a
+  surrogate).
+- `upper()` and `lower()` match Python's, from tables of Unicode 15.1 (Python 3.13), except that
+  `lower()` always turns `Σ` into `σ` (Python uses `ς` at the end of a word). `tests/run_text.sh`
+  checks every function here against Python on random text.
+- `find`, `count` and `replace` with `""` work as in Python: `find` gives 0, `count` one more than
+  the number of characters, and `replace` puts the new text between every two characters.
 
 - Whitespace means ASCII whitespace (space, tab, newline, carriage return, vertical tab, form
   feed). `strip(chars)` removes bytes, which is the same as Python's characters for ASCII.

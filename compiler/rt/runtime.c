@@ -206,6 +206,13 @@ __attribute__((noreturn, cold, noinline)) static void vu_oob(int64_t i, int64_t 
     vu_fail(line, "index %lld out of bounds for a list of length %lld", (long long)i, (long long)n);
 }
 __attribute__((noreturn, cold, noinline)) static void vu_oom(void) { fputs("out of memory\n", stderr); exit(102); }
+/* A string's or list's length, read by the program. Lengths are kept by the runtime and can't
+   exceed what memory holds, so telling the C compiler so lets it drop overflow checks on index
+   arithmetic like i + j or i + 1 (spectral-norm: 18% faster). */
+static inline int64_t vu_len(int64_t n) {
+    if (n < 0 || n > ((int64_t)1 << 56)) __builtin_unreachable();
+    return n;
+}
 /* Integer arithmetic is checked: overflow stops the program instead of silently wrapping. */
 __attribute__((noreturn, cold, noinline)) static void vu_overflow(int line) { vu_fail(line, "integer overflow"); }
 static inline int64_t vu_add(int64_t a, int64_t b, int line) {
@@ -518,6 +525,133 @@ __attribute__((noinline, cold)) static void vu_defer(void (*fn)(void *, int64_t)
 }
 
 static vu_str vu_str_dup(const vu_str *s) { vu_str r = {0}; vu_str_cat_bytes(&r, s->data, s->len); return r; }
+/* ---- Unicode. Strings are bytes; where characters matter (s.chars(), ord, chr, s.upper()) they're
+   read as UTF-8, as Python's decode(errors="replace") reads them: a byte that can't start a character,
+   or the cut-off start of one, is one unit, shown as U+FFFD. */
+/* The character at s (its code point in *cp, or -1 for an invalid unit) and how many bytes it takes. */
+static size_t vu_utf8_next(const unsigned char *s, size_t n, int32_t *cp) {
+    size_t k = vu_utf8_len(s, n);
+    unsigned char b = s[0];
+    if (k) {
+        if (k == 1) *cp = b;
+        else if (k == 2) *cp = ((b & 0x1F) << 6) | (s[1] & 0x3F);
+        else if (k == 3) *cp = ((b & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        else *cp = ((b & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        return k;
+    }
+    *cp = -1;
+    unsigned char lo = 0x80, hi = 0xBF;
+    size_t need;
+    if (b >= 0xC2 && b <= 0xDF) need = 1;
+    else if (b == 0xE0) { need = 2; lo = 0xA0; }
+    else if (b == 0xED) { need = 2; hi = 0x9F; }
+    else if (b >= 0xE1 && b <= 0xEF) need = 2;
+    else if (b == 0xF0) { need = 3; lo = 0x90; }
+    else if (b == 0xF4) { need = 3; hi = 0x8F; }
+    else if (b >= 0xF1 && b <= 0xF3) need = 3;
+    else return 1;
+    size_t i = 1;
+    if (i < n && s[i] >= lo && s[i] <= hi) {
+        i++;
+        while (i <= need && i < n && s[i] >= 0x80 && s[i] <= 0xBF) i++;
+    }
+    return i;
+}
+/* s.chars(): the next character from *pos, as its own string. */
+static bool vu_char_next(const vu_str *s, int64_t *pos, vu_str *out) {
+    if (*pos >= s->len) return false;
+    int32_t cp;
+    size_t k = vu_utf8_next(s->data + *pos, (size_t)(s->len - *pos), &cp);
+    *out = (vu_str){0};
+    if (cp < 0) vu_str_cat_bytes(out, (const uint8_t *)"\xEF\xBF\xBD", 3);
+    else vu_str_cat_bytes(out, s->data + *pos, (int64_t)k);
+    *pos += (int64_t)k;
+    return true;
+}
+static int64_t vu_char_count(const vu_str *s) {
+    int64_t n = 0;
+    for (int64_t i = 0; i < s->len; n++) {
+        if (s->data[i] < 0x80) { i++; continue; }
+        int32_t cp;
+        i += (int64_t)vu_utf8_next(s->data + i, (size_t)(s->len - i), &cp);
+    }
+    return n;
+}
+static bool vu_is_utf8(const vu_str *s) {
+    for (int64_t i = 0; i < s->len;) {
+        size_t k = vu_utf8_len(s->data + i, (size_t)(s->len - i));
+        if (!k) return false;
+        i += (int64_t)k;
+    }
+    return true;
+}
+static int64_t vu_ord(const vu_str *s, int line) {
+    int32_t cp = -1;
+    size_t k = s->len > 0 ? vu_utf8_next(s->data, (size_t)s->len, &cp) : 0;
+    if (s->len == 0 || (int64_t)k != s->len) vu_fail(line, "ord() takes a string of exactly one character, not %lld", (long long)vu_char_count(s));
+    if (cp < 0) vu_fail(line, "ord(): the string isn't UTF-8 (byte 0x%02X)", s->data[0]);
+    return cp;
+}
+static vu_str vu_chr(int64_t n, int line) {
+    if (n < 0 || n > 0x10FFFF || (n >= 0xD800 && n <= 0xDFFF))
+        vu_fail(line, "chr(%lld): not a Unicode code point (0 to 0x10FFFF, except the surrogates 0xD800 to 0xDFFF)", (long long)n);
+    uint8_t b[4];
+    int k;
+    if (n < 0x80) { b[0] = (uint8_t)n; k = 1; }
+    else if (n < 0x800) { b[0] = (uint8_t)(0xC0 | (n >> 6)); b[1] = (uint8_t)(0x80 | (n & 0x3F)); k = 2; }
+    else if (n < 0x10000) { b[0] = (uint8_t)(0xE0 | (n >> 12)); b[1] = (uint8_t)(0x80 | ((n >> 6) & 0x3F)); b[2] = (uint8_t)(0x80 | (n & 0x3F)); k = 3; }
+    else { b[0] = (uint8_t)(0xF0 | (n >> 18)); b[1] = (uint8_t)(0x80 | ((n >> 12) & 0x3F)); b[2] = (uint8_t)(0x80 | ((n >> 6) & 0x3F)); b[3] = (uint8_t)(0x80 | (n & 0x3F)); k = 4; }
+    vu_str r = {0};
+    vu_str_cat_bytes(&r, b, k);
+    return r;
+}
+/* s.find(sub): the byte index of the first sub in s, or -1 (sub "" is at 0). */
+static int64_t vu_str_find(const vu_str *s, const vu_str *sub) {
+    if (sub->len == 0) return 0;
+    if (sub->len > s->len) return -1;
+    const void *p = memmem(s->data, (size_t)s->len, sub->data, (size_t)sub->len);
+    return p ? (int64_t)((const uint8_t *)p - s->data) : -1;
+}
+/* s.count(sub): how many times sub appears, not overlapping; for "" one more than the characters,
+   as in Python. */
+static int64_t vu_str_count(const vu_str *s, const vu_str *sub) {
+    if (sub->len == 0) return vu_char_count(s) + 1;
+    int64_t n = 0;
+    for (int64_t i = 0; i + sub->len <= s->len;) {
+        const void *p = memmem(s->data + i, (size_t)(s->len - i), sub->data, (size_t)sub->len);
+        if (!p) break;
+        n++;
+        i = (int64_t)((const uint8_t *)p - s->data) + sub->len;
+    }
+    return n;
+}
+/* s.replace(old, new): every old (not overlapping, from the left) replaced; old "" puts new between
+   the characters and at both ends, as in Python. */
+static vu_str vu_str_replace(const vu_str *s, const vu_str *old, const vu_str *nw) {
+    vu_str r = {0};
+    if (old->len == 0) {
+        vu_str_cat_bytes(&r, nw->data, nw->len);
+        for (int64_t i = 0; i < s->len;) {
+            int32_t cp;
+            size_t k = s->data[i] < 0x80 ? 1 : vu_utf8_next(s->data + i, (size_t)(s->len - i), &cp);
+            vu_str_cat_bytes(&r, s->data + i, (int64_t)k);
+            vu_str_cat_bytes(&r, nw->data, nw->len);
+            i += (int64_t)k;
+        }
+        return r;
+    }
+    int64_t i = 0;
+    while (i < s->len) {
+        const void *p = i + old->len <= s->len ? memmem(s->data + i, (size_t)(s->len - i), old->data, (size_t)old->len) : NULL;
+        if (!p) break;
+        int64_t at = (int64_t)((const uint8_t *)p - s->data);
+        vu_str_cat_bytes(&r, s->data + i, at - i);
+        vu_str_cat_bytes(&r, nw->data, nw->len);
+        i = at + old->len;
+    }
+    vu_str_cat_bytes(&r, s->data ? s->data + i : NULL, s->len - i);
+    return r;
+}
 /* ---- Python's string methods. Strings are bytes; whitespace is ASCII (space \t \n \r \v \f). */
 static inline bool vu_is_ws(uint8_t c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
 static bool vu_in_set(uint8_t c, const vu_str *chars) {
