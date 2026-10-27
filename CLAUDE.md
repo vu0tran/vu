@@ -3,7 +3,7 @@
 Vu is a language that compiles to C. There is one compiler, `compiler/vuc`, written in Vu
 (`compiler/*.vu`). It's bootstrapped from `compiler/vuc_seed.c`, its own C output, so building it
 needs only a C compiler. `./vu` runs it (and builds it from the seed the first time). The language
-is in `SPEC.md`; results and history are in `README.md`. The retired Python compiler is in
+is in `SPEC.md`; `README.md` introduces it, and history and measurements are in `CHANGELOG.md`. The retired Python compiler is in
 `attic/vu.py`, for reference only: don't change it or test against it.
 
 ## The loop
@@ -104,6 +104,8 @@ is in `SPEC.md`; results and history are in `README.md`. The retired Python comp
 
 ## Docs
 
-After a feature: `SPEC.md` (the language, short, examples first) and `README.md` (what
-changed, measured numbers, the attack rounds with what each found). Claims must be measured
+After a feature: `SPEC.md` (the language, short, examples first) and `CHANGELOG.md` (what
+changed, measured numbers, the attack rounds with what each found). `README.md` is an
+introduction, not a history: update it only when what it says about the language stops being true
+(a feature, a limit, a current benchmark number). Claims must be measured
 or checked. Say so when something wasn't.

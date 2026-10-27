@@ -697,7 +697,7 @@ vu build file.vu [-o out]   # optimized native binary
   --san      build with AddressSanitizer + UBSan (implies --malloc)
   --san-pool same sanitizers with Vu's own node allocator (freed nodes are poisoned)
   --tsan     build with ThreadSanitizer (use CC=clang and run with
-             OMP_TOOL_LIBRARIES=.../libarcher.so; see README)
+             OMP_TOOL_LIBRARIES=.../libarcher.so; see CHANGELOG.md)
   --emit-c F write the generated C to F
   --time     report front-end and C compiler time
 ```
