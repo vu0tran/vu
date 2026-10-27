@@ -759,6 +759,7 @@ Text: strings are bytes, and these read them as UTF-8 characters, with Python's 
 for c in s.chars(): ...    # each character as a Str
 ord("é")                   # 233; chr(233) is "é"
 s.find("é")                # the byte index of the first "é" (for s[a..b]), or -1
+s.find("é", 10)            # the first at or after byte 10 (a negative start counts from the end)
 s.count("ab")              # how many times, not overlapping
 s.replace("a", "b")        # every "a" replaced
 if "ab" in s: ...          # whether s contains "ab"
@@ -1032,8 +1033,10 @@ fn main(net: Net) throws:
 
 **`re`**: regular expressions with Python's syntax and results (`re.compile`, `re.search`,
 `re.prefix` for Python's `re.match`, `re.fullmatch`, `re.findall`, `re.finditer`, `re.sub`,
-`re.split`, `re.group`), run by a Pike VM as RE2 does: time linear in the text whatever the
-pattern, so no pattern can be made to take exponential time. Backreferences and lookaround aren't
+`re.split`, `re.group`), run as RE2 does: time linear in the text whatever the pattern, so no
+pattern can be made to take exponential time. A DFA built when the pattern is compiled finds where
+each match ends, another run backwards finds where it starts, and only groups need more work; patterns
+the DFAs can't express (loops whose body can match nothing), or would make too big, run on a Pike VM. Backreferences and lookaround aren't
 supported (they can't run in linear time); `\d \w \s` are ASCII. Offsets are byte offsets.
 `tests/run_re.sh` compares it with Python's `re` on thousands of random patterns.
 

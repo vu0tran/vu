@@ -623,6 +623,15 @@ static int64_t vu_str_find(const vu_str *s, const vu_str *sub) {
     const void *p = memmem(s->data, (size_t)s->len, sub->data, (size_t)sub->len);
     return p ? (int64_t)((const uint8_t *)p - s->data) : -1;
 }
+/* s.find(sub, start): Python's str.find with a start. */
+static int64_t vu_str_find_from(const vu_str *s, const vu_str *sub, int64_t start) {
+    if (start < 0) { start += s->len; if (start < 0) start = 0; }
+    if (start > s->len) return -1;
+    if (sub->len == 0) return start;
+    if (sub->len > s->len - start) return -1;
+    const void *p = memmem(s->data + start, (size_t)(s->len - start), sub->data, (size_t)sub->len);
+    return p ? (int64_t)((const uint8_t *)p - s->data) : -1;
+}
 /* s.count(sub): how many times sub appears, not overlapping; for "" one more than the characters,
    as in Python. */
 static int64_t vu_str_count(const vu_str *s, const vu_str *sub) {

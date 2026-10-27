@@ -26,6 +26,33 @@ type Regex:
   enc: [[Int]]     # per instruction: the slots of the (up to 6 innermost) such loops around it
   width: Int       # 2 ^ the most of those around any instruction: a state is (pc, which marks are here)
   first: [Bool]    # the bytes a match can start at (all 256 when that can't be narrowed)
+  # DFAs (see "the DFAs" below), when the pattern allows them: where each match ends (search, and
+  # anchored for prefix), and where it starts (run backwards from the end)
+  dfa: Bool
+  points: [Int]    # the alphabet: code points where the instructions' answers can change
+  ascii: [Int]     # the class of each ASCII code point
+  nclass: Int      # classes: between points, plus one for a byte that isn't UTF-8 (the last)
+  whole: Bool      # every group is the whole pattern, as in (\d+): its span is the match's
+  fixed: [Int]     # when the pattern has a fixed length in characters and its groups aren't inside
+                   # | or a repeat: each group's start and end, in characters from the match's start
+  lead: Str        # text every match starts with ("" if none is known): searched for with memmem
+  asserts: Bool    # the pattern has assertions (\b ^ $...): the DFAs' states then carry a context
+  bol_only: Bool   # every match starts with ^ (or \A): one can only start at the beginning
+  fwd, anch, rev: Dfa
+
+# A DFA whose states stand for the VM's ordered thread lists, together with what's on the side of the
+# position already read (for assertions: the start of the text, a word character or not; reading
+# backwards, the end of the text or a final newline). It reads symbols: each class, then NL_LAST (a
+# newline that is the text's last character: $ matches before it) and the END of the text (the start,
+# reading backwards), which isn't consumed. trans[state * nsym + symbol] is the next state;
+# accept[state * nsym + symbol]: the VM would find a match here, the next symbol being that one.
+type Dfa:
+  trans: [Int]
+  accept: [Bool]
+  dead, idle: [Bool]   # nothing can match any more; nothing in progress yet (the search may skip ahead)
+  init: [Int]          # the first state, for each context the search starts in
+  first_uncut: [Int]   # anchored: the first step's transitions when a match there doesn't count
+                       # (it then doesn't cut off the threads after it either)
 
 type Match:
   start, end: Int
@@ -106,8 +133,19 @@ fn compile(pattern: Str) -> Regex throws:
       k += 3
     most = max(most, e.len)
     enc.push(e)
-  var r = Regex(prog, classes, p.ngroups, pattern + "", em.nslots, enc, 1 << most, [])
+  var r = Regex(prog, classes, p.ngroups, pattern + "", em.nslots, enc, 1 << most, [], false, [], [], 0, false, [], "", false, false, no_dfa(), no_dfa(), no_dfa())
   r.first = first_bytes(r)
+  # groups wrapped around the whole pattern, and none inside: (x), ((x))
+  let g = wrapping_groups(tree)
+  r.whole = g > 0 and g == p.ngroups
+  var lead = ""
+  leading_text(tree, &lead)
+  r.lead = lead
+  if p.ngroups > 0 and not r.whole and fixed_width(tree) >= 0:
+    var offs = [-1] * (2 * p.ngroups)
+    var at = 0
+    if group_offsets(tree, &at, &offs): r.fixed = offs
+  build_dfas(&r, tree)?
   return r
 
 # The bytes a match can start at: the first bytes of what the first consuming instructions accept.
@@ -592,6 +630,52 @@ fn add(r: Regex, var list: [Thread], var seen: [Int], gen: Int, pc: Int, own cap
 # The first match (leftmost, then by the pattern's priorities, as Python finds it) starting at or after
 # from; when no_empty_at >= 0, an empty match there doesn't count (findall and sub need that).
 fn search_from(r: Regex, s: Str, from: Int, no_empty_at: Int, anchored: Bool, full: Bool) -> Match?:
+  if r.dfa and not full:
+    if r.bol_only and from > 0: return nil
+    var end = -1
+    var start = from
+    if anchored: end = dfa_end(r, r.anch, s, from, no_empty_at == from)
+    elif no_empty_at == from:
+      # after an empty match at from: a match starting here must not be empty (the anchored DFA, its
+      # first position not counting); with none, the leftmost match from the next character on
+      end = dfa_end(r, r.anch, s, from, true)
+      if end < 0:
+        if from >= s.len: return nil
+        let next = from + char_len_at(s, from)
+        end = dfa_end(r, r.fwd, s, next, false)
+        if end < 0: return nil
+        start = dfa_start(r, s, next, end)
+    else:
+      end = dfa_end(r, r.fwd, s, from, false)
+      if end >= 0: start = dfa_start(r, s, from, end)
+    if end < 0: return nil
+    if start < 0: return vm_search(r, s, from, no_empty_at, anchored, full)   # (never expected)
+    if r.ngroups == 0: return Match(start, end, [])
+    if r.fixed.len > 0:
+      # the groups' places in characters from the start, turned into byte offsets
+      var at: [Int] = [start]
+      var q = start
+      while q < end:
+        q += char_len_at(s, q)
+        at.push(q)
+      var gs: [Int] = []
+      for k in r.fixed:
+        if k >= at.len: return groups_of(r, s, start, end, -1)   # (never expected)
+        gs.push(at[k])
+      return Match(start, end, gs)
+    if r.whole:
+      var gs: [Int] = []
+      for k in 0..r.ngroups:
+        gs.push(start)
+        gs.push(end)
+      return Match(start, end, gs)
+    var ne = -1
+    if no_empty_at == start: ne = start
+    return groups_of(r, s, start, end, ne)
+  return vm_search(r, s, from, no_empty_at, anchored, full)
+
+# The Pike VM.
+fn vm_search(r: Regex, s: Str, from: Int, no_empty_at: Int, anchored: Bool, full: Bool) -> Match?:
   let nslots = 2 * r.ngroups + 2
   var seen = [-1] * (r.prog.len * r.width)
   var seen2 = [-1] * (r.prog.len * r.width)   # for each new start, with its own generations
@@ -678,13 +762,13 @@ fn finditer(r: Regex, s: Str) -> [Match]:
   var pos = 0
   var no_empty = -1
   while pos <= s.len:
-    let mm = search_from(r, s, pos, no_empty, false, false)
-    if m = mm:
-      no_empty = -1
-      if m.end == m.start: no_empty = m.end
-      pos = m.end
-      out.push(Match(m.start, m.end, copy_ints(m.groups)))
-    else: break
+    let m = search_from(r, s, pos, no_empty, false, false) else break
+    # (a match that doesn't move on would repeat forever: never expected, but never loop)
+    if m.end < pos or (m.start == m.end and m.end == no_empty): break
+    no_empty = -1
+    if m.end == m.start: no_empty = m.end
+    pos = m.end
+    out.push(m)
   return out
 
 # Python's re.findall: each match's text, or with exactly one group that group's text, or with more
@@ -757,3 +841,518 @@ fn split(r: Regex, s: Str) -> [Str]:
     last = m.end
   out.push(s[last..s.len])
   return out
+
+# ---- the DFAs
+#
+# For a pattern without assertions and without loops whose body can match nothing, a match is found in
+# three passes, each linear in the text: a forward DFA finds
+# where the leftmost-first match ends (its states are the VM's ordered thread lists, so it ends where
+# the VM's would); a DFA of the reversed pattern, run backwards from there, finds the leftmost
+# position the match can start at (which is where it starts: a match starting further left would be
+# the leftmost one); and only for groups does the VM run, over the match alone. As RE2 does. Other
+# patterns, and patterns whose DFAs would be too big, use the VM throughout.
+
+const MAX_DFA_CELLS = 50000
+
+fn no_dfa() -> Dfa:
+  return Dfa([], [], [], [], [], [])
+
+fn has_assert(n: Node) -> Bool:
+  if n.k == "assert": return true
+  for k in n.kids:
+    if has_assert(k): return true
+  return false
+
+fn build_dfas(var r: Regex, tree: Node) throws:
+  for ins in r.prog:
+    if ins.op == MARK: return
+  r.asserts = has_assert(tree)
+  # a match can only start at the beginning when every way from the start meets ^ (or \A) first
+  var front: [Int] = []
+  var seen = [false] * r.prog.len
+  closure(r.prog, 0, &front, &seen)
+  var all_bol = front.len > 0
+  for pc in front:
+    if r.prog[pc].op != BOL: all_bol = false
+  r.bol_only = all_bol
+  var rprog: [Inst] = []
+  emit_rev(&rprog, tree)?
+  rprog.push(Inst(MATCH, 0, 0))
+  # the alphabet: every code point where some instruction's answer can change, and where word
+  # characters (for \b) begin and end
+  var pts: [Int] = [10, 11, 48, 58, 65, 91, 95, 96, 97, 123]
+  for ins in r.prog:
+    if ins.op == CHAR:
+      pts.push(ins.a)
+      pts.push(ins.a + 1)
+    elif ins.op == CLASS:
+      let rs = r.classes[ins.a].ranges
+      var k = 0
+      while k < rs.len:
+        pts.push(rs[k])
+        pts.push(rs[k + 1] + 1)
+        k += 2
+  pts.sort()
+  var points: [Int] = []
+  for x in pts:
+    if x > 0 and (points.len == 0 or points[points.len - 1] != x): points.push(x)
+  var reps = [0]
+  for x in points: reps.push(x)
+  reps.push(-1)   # a byte that isn't UTF-8
+  r.nclass = points.len + 2
+  r.points = points
+  var ascii: [Int] = []
+  for c in 0..128: ascii.push(class_of(r, c))
+  r.ascii = ascii
+  let fwd = build_dfa(r, r.prog, reps, true, false) else return
+  let anch = build_dfa(r, r.prog, reps, true, true) else return
+  let rev = build_dfa(r, rprog, reps, false, false) else return
+  r.fwd = fwd
+  r.anch = anch
+  r.rev = rev
+  r.dfa = true
+
+# The class of a code point (-1: a byte that isn't UTF-8).
+fn class_of(r: Regex, cp: Int) -> Int:
+  if cp < 0: return r.nclass - 1
+  var lo = 0
+  var hi = r.points.len
+  while lo < hi:
+    let mid = (lo + hi) / 2
+    if r.points[mid] <= cp: lo = mid + 1
+    else: hi = mid
+  return lo
+
+# The pattern backwards (no groups: it's only used to find where a match starts).
+fn emit_rev(var prog: [Inst], n: Node) throws:
+  if prog.len > MAX_PROG: fail "the pattern is too big (more than {MAX_PROG} steps once repeats are expanded)"
+  if n.k == "lit": prog.push(Inst(CHAR, n.cp, 0))
+  elif n.k == "any": prog.push(Inst(ANY, 0, 0))
+  elif n.k == "cls": prog.push(Inst(CLASS, n.cls, 0))
+  elif n.k == "assert": prog.push(Inst(n.cp, 0, 0))   # (read the other way round by holds)
+  elif n.k == "empty": return
+  elif n.k == "cat":
+    var k = n.kids.len - 1
+    while k >= 0:
+      emit_rev(&prog, n.kids[k])?
+      k -= 1
+  elif n.k == "group": emit_rev(&prog, n.kids[0])?
+  elif n.k == "alt":
+    var jumps: [Int] = []
+    for k in 0..n.kids.len:
+      if k < n.kids.len - 1:
+        let sp = prog.len
+        prog.push(Inst(SPLIT, sp + 1, 0))
+        emit_rev(&prog, n.kids[k])?
+        jumps.push(prog.len)
+        prog.push(Inst(JMP, 0, 0))
+        prog[sp].b = prog.len
+      else: emit_rev(&prog, n.kids[k])?
+    for j in jumps: prog[j].a = prog.len
+  elif n.k == "rep":
+    let x = n.kids[0]
+    for k in 0..n.min: emit_rev(&prog, x)?
+    if n.max == -1:
+      let l = prog.len
+      prog.push(Inst(SPLIT, 0, 0))
+      emit_rev(&prog, x)?
+      prog.push(Inst(JMP, l, 0))
+      set_split(&prog, l, l + 1, prog.len, true)
+    else:
+      var splits: [Int] = []
+      for k in n.min..n.max:
+        splits.push(prog.len)
+        prog.push(Inst(SPLIT, 0, 0))
+        emit_rev(&prog, x)?
+      for sp in splits: set_split(&prog, sp, sp + 1, prog.len, true)
+
+# The consuming instructions, assertions and MATCH reached from pc, in the VM's priority order.
+fn closure(prog: [Inst], pc: Int, var out: [Int], var seen: [Bool]):
+  if seen[pc]: return
+  seen[pc] = true
+  let ins = prog[pc]
+  if ins.op == JMP: closure(prog, ins.a, &out, &seen)
+  elif ins.op == SPLIT:
+    closure(prog, ins.a, &out, &seen)
+    closure(prog, ins.b, &out, &seen)
+  elif ins.op == SAVE: closure(prog, pc + 1, &out, &seen)
+  else: out.push(pc)
+
+fn accepts(r: Regex, ins: Inst, cp: Int) -> Bool:
+  if ins.op == CHAR: return cp == ins.a
+  if ins.op == ANY: return cp != 10
+  if ins.op == CLASS: return in_class(r.classes[ins.a], cp)
+  return false
+
+fn is_word_cp(cp: Int) -> Bool:
+  return (cp >= 97 and cp <= 122) or (cp >= 65 and cp <= 90) or (cp >= 48 and cp <= 57) or cp == 95
+
+# Contexts: reading forward, what's before the position (C_BEGIN: the start of the text); backwards,
+# what's after it (C_END: the end; C_NLEND: just before a newline that ends the text).
+const C_BEGIN = 0
+const C_END = 0
+const C_WORD = 1
+const C_OTHER = 2
+const C_NLEND = 3
+
+# closure, with seen marked by a generation number instead of a fresh array each time.
+type Marks:
+  seen: [Int]
+  gen: Int
+
+fn new_marks(n: Int) -> Marks:
+  return Marks([0] * n, 0)
+
+fn closure2(prog: [Inst], pc: Int, var out: [Int], var m: Marks):
+  if m.seen[pc] == m.gen: return
+  m.seen[pc] = m.gen
+  let ins = prog[pc]
+  if ins.op == JMP: closure2(prog, ins.a, &out, &m)
+  elif ins.op == SPLIT:
+    closure2(prog, ins.a, &out, &m)
+    closure2(prog, ins.b, &out, &m)
+  elif ins.op == SAVE: closure2(prog, pc + 1, &out, &m)
+  else: out.push(pc)
+
+# Whether assertion op holds at a position with context ctx and next symbol sym.
+fn holds(op: Int, forward: Bool, ctx: Int, sym: Int, word_sym: Bool, nl: Int, end: Int) -> Bool:
+  if forward:
+    if op == BOL: return ctx == C_BEGIN
+    if op == EOT: return sym == end
+    if op == EOL: return sym == end or sym == nl
+    let wl = ctx == C_WORD
+    if op == WORDB: return wl != word_sym
+    return wl == word_sym
+  if op == BOL: return sym == end
+  if op == EOT: return ctx == C_END
+  if op == EOL: return ctx == C_END or ctx == C_NLEND
+  let wr = ctx == C_WORD
+  if op == WORDB: return word_sym != wr
+  return word_sym == wr
+
+# The threads at a position: each of list in order, assertions decided (with ctx and the next symbol),
+# into out, without repeats.
+fn resolve(prog: [Inst], list: [Int], forward: Bool, ctx: Int, sym: Int, word_sym: Bool, nl: Int, end: Int, var out: [Int], var seen: Marks, var cl: Marks):
+  for pc in list:
+    if seen.seen[pc] == seen.gen: continue
+    seen.seen[pc] = seen.gen
+    let op = prog[pc].op
+    if op == BOL or op == EOL or op == EOT or op == WORDB or op == NWORDB:
+      if holds(op, forward, ctx, sym, word_sym, nl, end):
+        var more: [Int] = []
+        cl.gen += 1
+        closure2(prog, pc + 1, &more, &cl)
+        resolve(prog, more, forward, ctx, sym, word_sym, nl, end, &out, &seen, &cl)
+    else: out.push(pc)
+
+# Builds a DFA by following every state reachable from the start states (one per context). forward:
+# a state is an ordered thread list, the context, and whether a new thread still starts at each
+# position (until a match is found, or after the first position when anchored); a match cuts the
+# threads after it, as in the VM. Not forward (the reversed pattern, run from a match's end): nothing
+# is cut, and the search keeps the last position where it accepts. Fails if it would be too big.
+fn build_dfa(r: Regex, prog: [Inst], reps: [Int], forward: Bool, anchored: Bool) -> Dfa throws:
+  let nc = reps.len
+  let nl = nc         # the symbols: the classes, then NL_LAST, then END
+  let end = nc + 1
+  let nsym = nc + 2
+  var nctx = 1
+  if r.asserts:
+    nctx = 3
+    if not forward: nctx = 4
+  var lists: [[Int]] = []
+  var starting: [Bool] = []
+  var ctxs: [Int] = []
+  var ids: {Str: Int} = {}
+  var d = no_dfa()
+  var first: [Int] = []
+  var seen = [false] * prog.len
+  closure(prog, 0, &first, &seen)
+  for c in 0..nctx:
+    var l: [Int] = []
+    if not forward: l = copy_ints(first)
+    let key = state_key(l, forward, c)
+    ids[key] = lists.len
+    d.init.push(lists.len)
+    lists.push(l)
+    starting.push(forward)
+    ctxs.push(c)
+  var rmarks = new_marks(prog.len)
+  var cmarks = new_marks(prog.len)
+  var q = 0
+  while q < lists.len:
+    if (q + 1) * nsym > MAX_DFA_CELLS: fail "too big"
+    d.dead.push(lists[q].len == 0 and not starting[q])
+    d.idle.push(forward and not anchored and lists[q].len == 0 and starting[q])
+    var rounds = 1
+    if forward and anchored and q < nctx: rounds = 2   # (the first position, with nothing cut off)
+    var uncut_row: [Int] = []
+    for round in 0..rounds:
+      for sym in 0..nsym:
+        var rep_cp = 10
+        if sym < nc: rep_cp = reps[sym]
+        let word_sym = sym < nc and is_word_cp(rep_cp)
+        # this position's threads: those carried, then (while starting) a new one at the lowest priority
+        var here: [Int] = []
+        rmarks.gen += 1
+        resolve(prog, lists[q], forward, ctxs[q], sym, word_sym, nl, end, &here, &rmarks, &cmarks)
+        if starting[q]: resolve(prog, first, forward, ctxs[q], sym, word_sym, nl, end, &here, &rmarks, &cmarks)
+        var acc = false
+        var live: [Int] = []
+        for pc in here:
+          if prog[pc].op == MATCH:
+            acc = true
+            if forward and round == 0: break   # lower-priority threads are cut off
+          else: live.push(pc)
+        if round == 0: d.accept.push(acc)
+        if sym == end:
+          if round == 0: d.trans.push(-1)
+          else: uncut_row.push(-1)
+          continue
+        var next: [Int] = []
+        cmarks.gen += 1
+        for pc in live:
+          if accepts(r, prog[pc], rep_cp): closure2(prog, pc + 1, &next, &cmarks)
+        if not forward: next.sort()   # a set: the order doesn't matter
+        var nctx2 = 0
+        if r.asserts:
+          if not forward and ctxs[q] == C_END and rep_cp == 10: nctx2 = C_NLEND
+          elif word_sym: nctx2 = C_WORD
+          else: nctx2 = C_OTHER
+        let next_start = forward and not anchored and starting[q] and not acc
+        var key = state_key(next, next_start, nctx2)
+        if not (key in ids):
+          ids[key] = lists.len
+          lists.push(next)
+          starting.push(next_start)
+          ctxs.push(nctx2)
+        if round == 0: d.trans.push(ids[key])
+        else: uncut_row.push(ids[key])
+    if q == 0: d.first_uncut = uncut_row
+    elif uncut_row.len > 0:
+      for x in uncut_row: d.first_uncut.push(x)
+    q += 1
+  return d
+
+fn state_key(l: [Int], start: Bool, ctx: Int) -> Str:
+  var key = "{ctx}"
+  if start: key += "s:"
+  else: key += ":"
+  return key + ",".join(int_strs(l))
+
+fn int_strs(xs: [Int]) -> [Str]:
+  var out: [Str] = []
+  for x in xs: out.push("{x}")
+  return out
+
+# Where the match the VM would find ends (forward DFA from `from`), or -1 if there's none.
+# skip_first: a match that would end at from (an empty one) doesn't count.
+fn dfa_end(r: Regex, d: Dfa, s: Str, from: Int, skip_first: Bool) -> Int:
+  var c0 = 0
+  if r.asserts and from > 0:
+    if is_word(s, from - 1): c0 = C_WORD
+    else: c0 = C_OTHER
+  var st = d.init[c0]
+  let ctx_row = c0   # (which row of first_uncut)
+  var i = from
+  var last = -1
+  let nsym = r.nclass + 2
+  let nl = r.nclass
+  let end = r.nclass + 1
+  while true:
+    if d.idle[st]:
+      # nothing in progress: on to the next place a match can start
+      if r.lead != "":
+        i = s.find(r.lead, i)
+        if i < 0: return last
+        if r.asserts:
+          # (the context at the new position)
+          if i == 0: st = d.init[C_BEGIN]
+          elif is_word(s, i - 1): st = d.init[C_WORD]
+          else: st = d.init[C_OTHER]
+      else:
+        while i < s.len and not r.first[int(s[i])]: i += 1
+    var sym = end
+    var clen = 1
+    if i < s.len:
+      let b = int(s[i])
+      if b < 128:
+        sym = r.ascii[b]
+        if b == 10 and i == s.len - 1: sym = nl
+      else:
+        sym = class_of(r, decode_at(s, i))
+        clen = char_len_at(s, i)
+    let skip = skip_first and i == from
+    if d.accept[st * nsym + sym] and not skip: last = i
+    if sym == end or d.dead[st]: break
+    if skip: st = d.first_uncut[ctx_row * nsym + sym]
+    else: st = d.trans[st * nsym + sym]
+    i += clen
+  return last
+
+# Where a character ending at j starts (j > 0): the same boundaries as reading forward, where a byte
+# that isn't part of a valid UTF-8 character is a character of its own.
+fn char_start_before(s: Str, j: Int) -> Int:
+  var p = j - 1
+  while p > 0 and p > j - 4 and s[p] >= 0x80 and s[p] <= 0xBF: p -= 1
+  if p < j - 1 and char_len_at(s, p) == j - p: return p
+  return j - 1
+
+# Where the match ending at end starts: the leftmost position (not before from) from which the
+# pattern matches up to end, found by running the reversed pattern backwards.
+fn dfa_start(r: Regex, s: Str, from: Int, end: Int) -> Int:
+  let d = r.rev
+  var c0 = C_END
+  if r.asserts and end < s.len:
+    if end == s.len - 1 and s[end] == '\n': c0 = C_NLEND
+    elif is_word(s, end): c0 = C_WORD
+    else: c0 = C_OTHER
+  var st = d.init[c0]
+  var j = end
+  var best = -1
+  let nsym = r.nclass + 2
+  let begin = r.nclass + 1
+  while true:
+    var sym = begin
+    var p = j
+    if j > 0:
+      let b = int(s[j - 1])
+      if b < 128:
+        sym = r.ascii[b]
+        p = j - 1
+      else:
+        p = char_start_before(s, j)
+        sym = class_of(r, decode_at(s, p))
+    if d.accept[st * nsym + sym]: best = j
+    if j <= from or d.dead[st]: break
+    st = d.trans[st * nsym + sym]
+    j = p
+  return best
+
+# The groups of the match from start to end. Over a short match, a backtracking search in the VM's
+# priority order that never visits the same (instruction, position) twice (RE2's "bit state"): the
+# first way through it finds is the VM's, and it's linear in prog.len * the match's length. Over a
+# long one, the VM.
+# no_empty_at: as for vm_search (the VM run over a long match must find the same one).
+fn groups_of(r: Regex, s: Str, start: Int, end: Int, no_empty_at: Int) -> Match?:
+  let span = end - start + 1
+  if r.prog.len * span > 262144: return vm_search(r, s, start, no_empty_at, true, false)
+  var visited = [false] * (r.prog.len * span)
+  var caps = [-1] * r.nslots
+  # jobs: (pc, pos) to try, or (-1 - slot, old value) to put a capture back when backtracking
+  var job_a: [Int] = [0]
+  var job_b: [Int] = [start]
+  while job_a.len > 0:
+    var pc = job_a.pop()
+    var pos = job_b.pop()
+    if pc < 0:
+      caps[-1 - pc] = pos
+      continue
+    while true:
+      let v = pc * span + pos - start
+      if visited[v]: break
+      visited[v] = true
+      let ins = r.prog[pc]
+      let op = ins.op
+      if op == MATCH:
+        if pos != end: break
+        var groups: [Int] = []
+        for k in 2..2 * r.ngroups + 2: groups.push(caps[k])
+        return Match(start, end, groups)
+      if op == JMP: pc = ins.a
+      elif op == SPLIT:
+        job_a.push(ins.b)
+        job_b.push(pos)
+        pc = ins.a
+      elif op == SAVE:
+        job_a.push(-1 - ins.a)
+        job_b.push(caps[ins.a])
+        caps[ins.a] = pos
+        pc += 1
+      elif op == CHAR or op == ANY or op == CLASS:
+        if pos >= end: break
+        if not accepts(r, ins, decode_at(s, pos)): break
+        pos += char_len_at(s, pos)
+        pc += 1
+      elif op == BOL:
+        if pos != 0: break
+        pc += 1
+      elif op == EOT:
+        if pos != s.len: break
+        pc += 1
+      elif op == EOL:
+        if not (pos == s.len or (pos == s.len - 1 and s[pos] == '\n')): break
+        pc += 1
+      elif op == WORDB or op == NWORDB:
+        if (is_word(s, pos - 1) != is_word(s, pos)) != (op == WORDB): break
+        pc += 1
+      else: break   # (patterns with MARK don't come here)
+  return vm_search(r, s, start, no_empty_at, true, false)
+
+# How many capturing groups wrap the whole pattern, one inside the other: 2 for ((x)).
+fn wrapping_groups(n: Node) -> Int:
+  if n.k == "group" and n.cp > 0: return 1 + wrapping_groups(n.kids[0])
+  return 0
+
+# The length of what n matches, in characters, if it's always the same; else -1.
+fn fixed_width(n: Node) -> Int:
+  if n.k == "lit" or n.k == "any" or n.k == "cls": return 1
+  if n.k == "empty" or n.k == "assert": return 0
+  if n.k == "group": return fixed_width(n.kids[0])
+  if n.k == "cat":
+    var w = 0
+    for k in n.kids:
+      let x = fixed_width(k)
+      if x < 0: return -1
+      w += x
+    return w
+  if n.k == "alt":
+    let w = fixed_width(n.kids[0])
+    for k in n.kids:
+      if fixed_width(k) != w: return -1
+    return w
+  if n.k == "rep" and n.min == n.max:
+    let x = fixed_width(n.kids[0])
+    if x < 0: return -1
+    return x * n.min
+  return -1
+
+fn has_group(n: Node) -> Bool:
+  if n.k == "group" and n.cp > 0: return true
+  for k in n.kids:
+    if has_group(k): return true
+  return false
+
+# Each group's start and end (in characters from the match's start) into offs; false if a group is
+# inside | or a repeat (which iteration or branch set it can vary).
+fn group_offsets(n: Node, var at: Int, var offs: [Int]) -> Bool:
+  if n.k == "group":
+    let a = at
+    if not group_offsets(n.kids[0], &at, &offs): return false
+    if n.cp > 0:
+      offs[2 * n.cp - 2] = a
+      offs[2 * n.cp - 1] = at
+    return true
+  if n.k == "cat":
+    for k in n.kids:
+      if not group_offsets(k, &at, &offs): return false
+    return true
+  if (n.k == "alt" or n.k == "rep") and has_group(n): return false
+  at += fixed_width(n)
+  return true
+
+# The text every match of n starts with, added to out; true if n is nothing but that text (so what
+# follows it continues the text). Assertions match no text and are passed over.
+fn leading_text(n: Node, var out: Str) -> Bool:
+  if n.k == "lit":
+    out += chr(n.cp)
+    return true
+  if n.k == "assert" or n.k == "empty": return true
+  if n.k == "group": return leading_text(n.kids[0], &out)
+  if n.k == "cat":
+    for k in n.kids:
+      if not leading_text(k, &out): return false
+    return true
+  if n.k == "rep" and n.min >= 1:
+    let _ = leading_text(n.kids[0], &out)
+    return false
+  return false

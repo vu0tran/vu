@@ -1,5 +1,5 @@
 """Vu's text functions against Python's on random strings: s.upper(), s.lower(), s.chars(),
-s.char_count(), s.is_utf8(), s.find(a), s.count(a), s.replace(a, b), ord, chr and `a in s`.
+s.char_count(), s.is_utf8(), s.find(a), s.find(a, start), s.count(a), s.replace(a, b), ord, chr and `a in s`.
 Strings mix ASCII, Latin, Greek, Cyrillic, CJK, emoji, combining marks and characters whose case
 changes length (ß, ŉ, ǰ), and some aren't UTF-8 at all (Vu reads those as Python's
 decode(errors="replace") does). Run under the sanitizers too."""
@@ -97,6 +97,9 @@ def main():
         if f[8] != ','.join(map(str, ords)): problems.append(f'ord {f[8]} != {ords}')
         if bytes.fromhex(f[9]) != rt: problems.append(f'chr {bytes.fromhex(f[9])!r} != {rt!r}')
         if (f[10] == '1') != has: problems.append(f'in {f[10]} != {has}')
+        starts = [-3, -1, 0, 1, len(s) // 2, len(s) - 1, len(s), len(s) + 2]
+        want_finds = ','.join(str(s.find(a, st)) for st in starts)   # (bytes.find: byte offsets, as Vu's)
+        if f[11] != want_finds: problems.append(f'find with a start {f[11]} != {want_finds}')
         if problems:
             bad += 1
             if bad <= 8: print(f'FAIL  s={s!r} a={a!r} b={b!r}: ' + '; '.join(problems))

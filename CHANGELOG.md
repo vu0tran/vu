@@ -1104,6 +1104,61 @@ The last round (optional elements of lists and maps, `else` in `par` loops, `con
 interfaces, generics and interpolation, `re` patterns that match nothing, compared before and
 after its speed-up on text that isn't UTF-8) found nothing.
 
+## Round 10: regular expressions as fast as Python's
+
+`std/re` was 2.6 to 7 times slower than Python's `re` on ordinary patterns. Python's is a
+backtracking engine in C; Vu's ran every match through a Pike VM written in Vu, which is what keeps
+matching linear in the text (a pattern like `(a|a)*b` takes Python exponential time, and Vu 0.03 s on
+30,000 characters). Now it works as RE2 does, still linear:
+
+- **Two DFAs and a reverse one, built by `re.compile`.** The forward DFA's states are the VM's
+  ordered thread lists, so it finds where the leftmost-first match ends, as the VM would; the
+  reversed pattern, run backwards from there, finds the leftmost position the match can start at,
+  which is where it starts. Assertions (`^ $ \b \B \A \Z`) are part of the states: each carries
+  what's on the side already read (the text's start, a word character or not; backwards, the text's
+  end or a final newline), and the next symbol includes "a newline that ends the text" for `$`. After
+  an empty match, Python's rule (no second empty match there, and the threads after it not cut off)
+  has its own transitions for the first step.
+- **Groups**: none (`\w+`) or groups around the whole pattern (`(\d+)`): nothing more to do;
+  groups at fixed places (`(\d{3})-(\d{4})`): counted off in characters; others: a backtracking
+  search over the match alone that never visits an (instruction, position) twice (RE2's bit state).
+- **Skipping ahead**: to the next place the text every match starts with occurs (`memmem`, through a
+  new `s.find(sub, start)`), or else the next byte a match can start with.
+- Loops whose body can match nothing (`(a*)*`), and patterns whose DFAs would pass 50,000 table cells
+  (`(a|b)*a(a|b){12}`), keep the VM. Building the DFAs takes up to about 50 ms (that worst case:
+  when the limit is reached); ordinary patterns compile in 0–5 ms.
+
+Same 870 KB of text, best of 3, seconds (Python 3.13, `re.ASCII`):
+
+| | `findall` Vu | Python | | `search`, no match in 3.5 MB | Vu | Python |
+|---|---|---|---|---|---|---|
+| `[a-z]+` | 0.038 | 0.040 | | `qqq` | 0.0016 | 0.0018 |
+| `\w+@\w+\.com` | 0.009 | 0.027 | | `\d{5}` | 0.0095 | 0.0709 |
+| `(\d+)` | 0.008 | 0.048 | | `x\w+y` | 0.0029 | 0.0042 |
+| `(\w+)@(\w+)\.com` | 0.029 | 0.043 | | `(alpha\|beta)\s+zz` | 0.0214 | 0.0447 |
+| `\b\w+\b` | 0.025 | 0.038 | | `\bzeta\b` | 0.0025 | 0.0501 |
+| `[a-z]*` | 0.066 | 0.077 | | `[A-Z]{3}` | 0.0054 | 0.0663 |
+| `\d{1,3}` | 0.006 | 0.021 | | `é` | 0.0037 | 0.0011 |
+| `(?:alpha\|beta\|gamma)\w*` | 0.011 | 0.016 | | | | |
+| `[^ \n]+` | 0.021 | 0.030 | | | | |
+| `.` | 0.117 | 0.079 | | | | |
+| `(a)(l)(p)(h)(a)` | 0.014 | 0.007 | | | | |
+| `^\w+`, `a$`, `e-?mail`, `x1\|delta` | 0.000–0.006 | 0.000–0.008 | | | | |
+
+Before: `[a-z]+` 0.18 s, `\w+@\w+\.com` 0.20 s. Vu is behind on `.` and `(a)(l)(p)(h)(a)`, where
+each match is one or a few characters and CPython hands back the same cached string objects for
+one-character strings while Vu makes new ones, and on the two-byte literal `é`.
+
+What the testing found, in my new code: the backward search started without knowing it was just
+before a final newline, so `$` there failed and `(.)*$` found no start; the capture pass's fallback
+didn't apply the after-an-empty-match rule, which made `finditer` loop forever on `\b(\.*?)`; and the
+first version's transitions always cut threads at a match, wrong right after an empty one (72 random
+patterns disagreed with Python). All three were caught by the comparison with Python, which now
+agrees on all 17,507 random patterns and texts of 7 seeds (on two more seeds, the 4,997 cases Python
+could finish agreed; on 3, Python's backtracking ran past 2 seconds), and the new code gives the same
+results as the VM-only version on 5,260 cases over text that isn't UTF-8. `finditer` now also refuses a match that doesn't move on,
+so a disagreement can't turn into a loop again.
+
 ## Memory safety evidence
 
 - `tests/reject/`: 21 programs, each containing a bug Vu must refuse: use after move, a
