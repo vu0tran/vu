@@ -1,0 +1,307 @@
+# robots.txt, read as the reference server reads it: with Protego 0.7 (the parser it uses), rule for
+# rule: its tolerant directive reading (misspellings, "User agent foo"), its grouping of user agents,
+# its choice of the group for a user agent (the longest name found in it at a word boundary, else *),
+# its normalization of percent-encoding, and its matching (the longest pattern wins, allow on a tie;
+# * and a trailing $).
+import pystr
+
+type Rule:
+  allow: Bool
+  pattern: Str      # normalized
+  star: Bool
+  dollar: Bool
+
+type Group:
+  agent: Str
+  rules: [Rule]
+
+type Robots:
+  groups: [Group]
+
+fn is_disallow(f: Str) -> Bool:
+  return f == "disallow" or f == "dissallow" or f == "dissalow" or f == "disalow" or f == "diasllow" or f == "disallaw"
+
+fn is_agent(f: Str) -> Bool:
+  return f == "user-agent" or f == "useragent" or f == "user agent"
+
+fn site_wide(f: Str) -> Bool:
+  return f == "sitemap" or f == "sitemaps" or f == "site-map" or f == "host"
+
+fn known(f: Str) -> Bool:
+  return is_disallow(f) or f == "allow" or is_agent(f) or site_wide(f) or f == "crawl-delay" or f == "crawl delay" or f == "request-rate" or f == "request rate" or f == "visit-time" or f == "visit time"
+
+type Directive:
+  ok: Bool
+  field: Str
+  value: Str
+
+# Protego's _extract_directive.
+fn directive(line: Str) -> Directive:
+  var field = ""
+  var has_field = false
+  var value = ""
+  let colon = line.find(":")
+  if colon >= 0:
+    field = pystr.strip(line[0..colon]).lower()
+    has_field = true
+    let raw = line[colon + 1..line.len]
+    value = pystr.strip(raw)
+    if known(field): return Directive(true, field, value)
+    if raw == "": return Directive(true, field, value)
+    var first = ""
+    for c in raw.chars():
+      first = c
+      break
+    if pystr.is_space(first): return Directive(true, field, value)
+  let words = pystr.split_ws(line)
+  for n in 1..3:
+    var cand: [Str] = []
+    for i in 0..n:
+      if i < words.len: cand.push(words[i] + "")
+    let c = " ".join(cand).lower()
+    if known(c):
+      var rest: [Str] = []
+      for i in n..words.len: rest.push(words[i] + "")
+      return Directive(true, c, " ".join(rest))
+  if not has_field: return Directive(false, "", "")
+  return Directive(true, field, value)
+
+fn find_group(r: Robots, agent: Str) -> Int:
+  for i in 0..r.groups.len:
+    if r.groups[i].agent == agent: return i
+  return -1
+
+fn parse(content: Str) -> Robots:
+  var r = Robots([])
+  var current: [Int] = []
+  var prev = ""
+  var has_prev = false
+  for raw in pystr.splitlines(content):
+    var line = raw + ""
+    let h = line.find("#")
+    if h >= 0: line = pystr.strip(line[0..h])
+    line = pystr.strip(line)
+    if line == "": continue
+    let d = directive(line)
+    if not d.ok: continue
+    if is_agent(d.field) and has_prev and not is_agent(prev): current = []
+    if not site_wide(d.field):
+      prev = d.field + ""
+      has_prev = true
+    if d.value == "": continue
+    if current.len == 0 and not is_agent(d.field) and not site_wide(d.field): continue
+    if is_agent(d.field):
+      let ua = pystr.strip(d.value).lower()
+      var names = [ua + ""]
+      if ua != "*" and ua.find("*") >= 0: names.push(ua.replace("*", ""))
+      for name in names:
+        if name == "": continue
+        let gi = find_group(r, name)
+        if gi >= 0:
+          if not (gi in current): current.push(gi)
+        else:
+          r.groups.push(Group(name + "", []))
+          current.push(r.groups.len - 1)
+    elif d.field == "allow" or is_disallow(d.field):
+      for gi in current: add(&r.groups[gi], d.field == "allow", d.value)
+  # the longest pattern first, allow before disallow on a tie (a stable sort, as Python's)
+  for gi in 0..r.groups.len:
+    r.groups[gi].rules.sort(by: fn(a, b) => a.pattern.len > b.pattern.len or (a.pattern.len == b.pattern.len and a.allow and not b.allow))
+  return r
+
+fn make_rule(allow: Bool, quoted: Str) -> Rule:
+  return Rule(allow, quoted + "", quoted.find("*") >= 0, quoted.endswith("$"))
+
+fn add(var g: Group, allow: Bool, pattern: Str):
+  if pattern.find("$") >= 0: add(&g, allow, pattern.replace("$", "%24"))
+  let q = quote_pattern(pattern)
+  if q == "": return
+  g.rules.push(make_rule(allow, q))
+  if allow and q.endswith("/index.html"):
+    g.rules.push(make_rule(true, q[0..q.len - 10] + "$"))
+
+# ---- Protego's normalization of percent-encoding
+
+fn hexval(b: Byte) -> Int:
+  if b >= '0' and b <= '9': return int(b) - 48
+  if b >= 'a' and b <= 'f': return int(b) - 87
+  if b >= 'A' and b <= 'F': return int(b) - 55
+  return -1
+
+const HEXU = "0123456789ABCDEF"
+
+# _unquote: %xy escapes decoded, except those of the bytes in keep (whose hex is made uppercase);
+# then read as UTF-8 with errors="replace".
+fn unquote(s: Str, keep: Str) -> Str:
+  if s.find("%") < 0: return s + ""
+  var out: [Byte] = []
+  var i = 0
+  while i < s.len:
+    if s[i] == '%' and i + 2 < s.len + 0 and hexval(s[i + 1]) >= 0 and hexval(s[i + 2]) >= 0:
+      let v = hexval(s[i + 1]) * 16 + hexval(s[i + 2])
+      var kept = false
+      for j in 0..keep.len:
+        if int(keep[j]) == v: kept = true
+      if kept:
+        out.push('%')
+        out.push(HEXU[v >> 4])
+        out.push(HEXU[v & 15])
+      else: out.push(byte(v))
+      i += 3
+    else:
+      out.push(s[i])
+      i += 1
+  let raw = str(out)
+  if raw.is_utf8(): return raw
+  var fixed = ""
+  for c in raw.chars(): fixed += c
+  return fixed
+
+# urllib.parse.quote(s, safe)
+fn quote(s: Str, safe: Str) -> Str:
+  var out = ""
+  for i in 0..s.len:
+    let b = s[i]
+    var keep = (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_' or b == '.' or b == '-' or b == '~'
+    if not keep:
+      for j in 0..safe.len:
+        if safe[j] == b: keep = true
+    if keep: out += s[i..i + 1]
+    else:
+      let v = int(b)
+      out += "%" + HEXU[v >> 4..(v >> 4) + 1] + HEXU[v & 15..(v & 15) + 1]
+  return out
+
+fn plain_char(b: Byte, star: Bool) -> Bool:
+  return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_' or b == '.' or b == '~' or b == '/' or b == '=' or b == '-' or (star and b == '*')
+
+fn quote_pattern(p: Str) -> Str:
+  # [A-Za-z0-9_.~/=*-]+\$? stays as it is
+  var n = p.len
+  if n > 0 and p.endswith("$"): n -= 1
+  var plain = n > 0
+  for i in 0..n:
+    if not plain_char(p[i], true): plain = false
+  if plain: return p + ""
+  var pat = p + ""
+  if pat.startswith("https://") or pat.startswith("http://"): pat = "/" + pat
+  var anchor = ""
+  if pat.endswith("$"):
+    anchor = "$"
+    pat = pat[0..pat.len - 1]
+  return quote(unquote(pat, "/%*"), "/%*=") + anchor
+
+fn is_alpha(b: Byte) -> Bool:
+  return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z')
+
+# _quote_path: the path and query of a URL, normalized.
+fn quote_path(url: Str) -> Str:
+  # the fast path: (scheme://authority)?/path made of plain characters
+  var i = 0
+  if url.len > 0 and is_alpha(url[0]):
+    var j = 1
+    while j < url.len and (is_alpha(url[j]) or (url[j] >= '0' and url[j] <= '9') or url[j] == '+' or url[j] == '.' or url[j] == '-'): j += 1
+    if url[j..url.len].startswith("://"):
+      var k = j + 3
+      while k < url.len and url[k] != '/' and url[k] != '?' and url[k] != '#': k += 1
+      i = k
+  if i < url.len and url[i] == '/' and not (i + 1 < url.len and url[i + 1] == '/'):
+    var ok = true
+    for k in i..url.len:
+      if not plain_char(url[k], false): ok = false
+    if ok: return url[i..url.len]
+  # urlsplit's path (and query, when there's a "?")
+  var u = url + ""
+  let h = u.find("#")
+  if h >= 0: u = u[0..h]
+  var p = split_path(u)
+  let q = u.find("?")
+  if q >= 0: p += "?" + u[q + 1..u.len]
+  p = quote(unquote(p, "/%"), "/%=")
+  if p.startswith("/"): return p
+  return "/" + p
+
+# urlsplit(u).path for a URL without its fragment.
+fn split_path(u: Str) -> Str:
+  var rest = u + ""
+  # a scheme: letters, digits, + - . after a letter, then ':'
+  let c = rest.find(":")
+  if c > 0 and is_alpha(rest[0]):
+    var ok = true
+    for k in 0..c:
+      let b = rest[k]
+      if not (is_alpha(b) or (b >= '0' and b <= '9') or b == '+' or b == '-' or b == '.'): ok = false
+    if ok: rest = rest[c + 1..rest.len]
+  if rest.startswith("//"):
+    var k = 2
+    while k < rest.len and rest[k] != '/' and rest[k] != '?' and rest[k] != '#': k += 1
+    rest = rest[k..rest.len]
+  let q = rest.find("?")
+  if q >= 0: rest = rest[0..q]
+  return rest
+
+fn matches(r: Rule, url: Str) -> Bool:
+  if not r.star:
+    if not r.dollar: return url.startswith(r.pattern)
+    return url == r.pattern[0..r.pattern.len - 1]
+  let before = r.pattern[0..r.pattern.find("*")]
+  if not url.startswith(before): return false
+  var pat = r.pattern + ""
+  if r.dollar: pat = pat[0..pat.len - 1]
+  while pat.find("**") >= 0: pat = pat.replace("**", "*")
+  let parts = pat.split("*")
+  var pos = parts[0].len
+  for k in 1..parts.len - 1:
+    let idx = url.find(parts[k], pos)
+    if idx < 0: return false
+    pos = idx + parts[k].len
+  let last = parts[parts.len - 1]
+  if r.dollar:
+    let end = url.len - last.len
+    return end >= pos and url[end..url.len] == last
+  if last == "": return true
+  return url.find(last, pos) >= 0
+
+# How well a group's name matches a user agent: its length when found at a word boundary, 1 for *.
+fn score(agent: Str, robot: Str) -> Int:
+  if agent == "*": return 1
+  var i = robot.find(agent)
+  while i >= 0:
+    if i == 0: return pystr.length(agent)
+    # the character before it
+    var prev = ""
+    for c in robot[0..i].chars(): prev = c
+    if not (pystr.alnum(prev) or prev == "-" or prev == "_"): return pystr.length(agent)
+    i = robot.find(agent, i + 1)
+  return 0
+
+fn url_path(url: Str) -> Str:
+  # urlparse(url).path: urlsplit's path without ";params" of the last segment
+  var u = url + ""
+  let h = u.find("#")
+  if h >= 0: u = u[0..h]
+  return split_path(u)
+
+fn can_fetch(r: Robots, url: Str, user_agent: Str) -> Bool:
+  if url.find("/robots.txt") >= 0:
+    var p = url_path(url)
+    var last = 0
+    for k in 0..p.len:
+      if p[k] == '/': last = k
+    let semi = p.find(";", last)
+    if semi >= 0: p = p[0..semi]
+    if p == "/robots.txt": return true
+  if r.groups.len == 0: return true
+  let robot = pystr.strip(user_agent).lower()
+  var best = -1
+  var best_score = 0
+  for gi in 0..r.groups.len:
+    let s = score(r.groups[gi].agent, robot)
+    if s > best_score:
+      best = gi
+      best_score = s
+  if best < 0: return true
+  let q = quote_path(url)
+  for rule in r.groups[best].rules:
+    if matches(rule, q): return rule.allow
+  return true

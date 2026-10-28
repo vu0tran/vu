@@ -184,6 +184,23 @@ reference server on Node 22 (`mcp/filesystem/README.md` has the details):
 protocol eras, random edits, names and glob patterns) and checks every answer is the same JSON:
 12,600 answers on nine seeds, plain and under AddressSanitizer.
 
+Two more of the reference servers are rewritten the same way, each checked against its Python
+original (`mcp-server-time` and `mcp-server-fetch` 2026.10.28) and measured the same way:
+
+| | Vu | Python reference |
+|---|---|---|
+| `mcp/time`: start / memory / `convert_time` calls per second | 1.8 ms / 1.9 MB / 12,212 | 683 ms / 69 MB / 773 |
+| `mcp/fetch`: start / memory | 3.6 ms / 5.0 MB | 730 ms / 83 MB |
+| `mcp/fetch`: an HTML page, local server | 107 calls/s | 8 calls/s (pure Python), 881 ms a call (Readability.js) |
+
+The fetch server answers as the reference does down to its argument errors (pydantic's messages),
+its URL rewriting, its robots.txt reading (Protego), its refusal of private addresses, its
+redirects and its text decoding; each of those parts is compared with the library the reference
+uses on thousands of generated inputs. The Markdown of an HTML page is its own: on the 130 pages of
+Readability's test suite its words agree with the reference's at a median F1 of 0.98. Its `main`
+takes only `Net`, so it can't touch a file, and it connects to the addresses it checked (the
+reference looks names up twice). `mcp/fetch/README.md` lists every difference.
+
 ### Tasks on every core
 
 ```
@@ -413,7 +430,7 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 | `compiler/build.sh` | rebuilds the compiler and checks the fixed point |
 | `std/` | the standard library modules written in Vu |
 | `examples/` | the benchmark programs and a JSON parser |
-| `mcp/filesystem/` | the MCP filesystem server |
+| `mcp/filesystem/`, `mcp/time/`, `mcp/fetch/` | MCP servers: filesystem, time, fetch |
 | `tests/` | the test suites; `tests/gate.sh` runs them all |
 | `bench/` | benchmark programs in C, C++, Rust and Go, and the scripts that time them |
 | `SPEC.md` | the language |

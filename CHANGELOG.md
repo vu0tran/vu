@@ -2098,3 +2098,66 @@ What the rounds found:
 Not done this round: an attack suite against `Dir` itself. Its guarantee rests on `openat2`'s
 `RESOLVE_BENEATH` (and the walk elsewhere); the tests here check that it behaves as the reference
 does on ordinary trees, including symlinks that stay inside.
+
+## Round 26: the time and fetch servers, three platforms in CI
+
+Two more of the reference MCP servers, both Python, rewritten in Vu and checked against them:
+`mcp/time` (`mcp-server-time`) and `mcp/fetch` (`mcp-server-fetch` 2026.10.28). For them:
+
+- `net.resolve(host) -> [Str]`: a name's addresses as text, looked up off the task's thread, in the
+  order `connect` tries them (`tests/targeted/715`, `716`). The fetch server checks those
+  addresses and connects to the same ones.
+- `mcp` serves prompts (`set_prompts`, `PromptGet`, `prompt_result`, `error_reply`).
+
+The fetch server is built from parts that each answer as a library the reference uses, each with a
+generator and a comparison (`tests/mcp_fetch/parts.py`): URLs as pydantic's `AnyUrl` rewrites them
+(the WHATWG parser of the Rust url crate, with a UTS #46 table made by asking pydantic about every
+code point: `tools/gen_idna.py`), robots.txt as Protego reads it, the address guard as the
+reference's `_is_public_address`, HTML tokens as Python's `html.parser` makes them, text as httpx and
+the reference's `decode_page` decode it (Python's codec names and single-byte tables:
+`tools/gen_fetch_tables.py`). Measured (2-vCPU VM, local HTTP server): 3.6 ms to start against 730,
+5 MB against 83, 1,020 fetches of a text file a second against 49, 107 of an HTML page against 8
+(pure Python) or one every 881 ms (Readability.js under Node). The time server: 1.8 ms against 683,
+1.9 MB against 69, 12,212 `convert_time` calls a second against 773.
+
+What the rounds found:
+
+- **URLs against pydantic** (5,000 generated URLs a round): round one, 71 differed: a combining
+  mark can't start a label, a punycode label must decode to something valid, the host is checked
+  before the port, an empty URL has its own message, `file:` drops extra slashes. Round two, 22:
+  combining marks were dropped instead of kept (the table's probe composed them with the letter
+  beside them; it now probes beside `q`, which composes with nothing), and Windows drive letters
+  in `file:` hosts. Round three, 2, both quirks of the crate (it never pops a drive-letter segment
+  with `..`, in any scheme; it takes `foo://:@` with nothing after it). Then 40,000 the same.
+- **robots.txt against Protego**: none differed from the first run (20,000 cases; the generator was
+  then biased so about 13% are refusals).
+- **The guard against `_is_public_address`**: none differed (40,000 addresses, half near the edges
+  of the special ranges).
+- **The tokenizer against `html.parser`**: round one, 187 of 3,000: `<plaintext>` makes the rest of
+  the input text. Round two, 79: `html.parser` holds back trailing text that might end in a cut-off
+  reference. Then 12,000 the same.
+- **Decoding against `decode_page`**: RFC 2231 charsets (`charset*=utf-8''latin1`) are read by
+  Python's email parser; and in Python 3.13 a UTF-16 or UTF-32 charset in the header with no byte
+  order mark raises instead of decoding, so the reference fails on such a page (matched). Then
+  about 9,000 the same.
+- **The whole server against the reference** (requests to a local server: pages, charsets, gzip,
+  chunked, redirects, robots files and statuses, hang-ups, cut-off bodies, bad arguments, the
+  prompt, the guard): the prompt's URL is httpx's, not pydantic's, so `0x7f.1` and
+  `[::ffff:127.0.0.1]` stay as written in its messages; a body cut short reports the bytes received
+  and expected; a redirect to `mailto:` makes the reference fail with an exception its SDK shows as
+  "Error executing tool fetch" and nothing more. Then eight seeds, about 2,500 answers, the same
+  (the Markdown of HTML pages compared by words: median F1 0.98–0.99).
+- **A difference kept on purpose**: the reference resolves a name to check it and again to
+  connect, so a name can answer differently the second time; this server connects to what it
+  checked. Bodies are limited to 64 MB, gzip included.
+
+CI now runs on Linux x86-64 and ARM64 and on macOS ARM64. What macOS found: there is no
+LeakSanitizer there (the scripts now ask for leak checking only where it exists); Apple's clang has
+no OpenMP (par loops use Homebrew's libomp when installed, and otherwise run on one thread) and
+OpenSSL isn't where the compiler looked (it now looks in Homebrew's); and one targeted test of
+unbounded recursion ran until its counter overflowed, because clang turned the tail call into a loop
+(the test now recurses without a tail call). The time server's comparison found that the reference's
+answers depend on the Python it runs on: on 3.12, `strptime` doesn't take `" 9:59"`, and with the
+`tzdata` package installed a folder name fails with that package's path in the message; CI now uses
+Python 3.13, and the test skips those names when `tzdata` is installed. On ARM64 two targeted tests
+(a million-piece split and map churn) ran past the 20-second limit; why is being measured in CI.

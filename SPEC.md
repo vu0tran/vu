@@ -1541,11 +1541,16 @@ while true:
   match mcp.handle(s, line):
     mcp.Reply(text): mcp.send(text)
     mcp.ToolCall(c): mcp.send(mcp.result(s, c, mcp.text("done")))   # or mcp.tool_error(msg)
+    mcp.PromptGet(_): continue                  # (only for a server with prompts)
     mcp.Quiet: continue
 ```
 
+A server with prompts gives them as JSON too (`mcp.set_prompts(&s, PROMPTS)?`) and gets
+`mcp.PromptGet(c)` for each `prompts/get`, answered with `mcp.prompt_result(s, c, description,
+text)` or `mcp.error_reply(c, code, message)`.
+
 `mcp/filesystem/main.vu` is a whole server on it: the reference MCP filesystem server's 14 tools,
-reaching only the folders it was started with.
+reaching only the folders it was started with; `mcp/time` and `mcp/fetch` are two more.
 
 The standard library's own C (`dir`, `stdio`) is part of Vu, like the runtime: its modules may make the
 `Ffi` they pass to their extern functions (`Ffi()`), which no program or package can.

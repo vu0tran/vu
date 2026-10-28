@@ -1,0 +1,473 @@
+# mcp-fetch: the MCP fetch server (a `fetch` tool and a `fetch` prompt that get a URL and give a model
+# its text, web pages as Markdown) as one Vu program, answering as the reference server
+# (mcp-server-fetch, Python) does: the same tool and prompt, arguments checked with the same messages,
+# robots.txt read as it reads it, the same refusal of private addresses, the same redirects, text
+# decoding, pagination and errors. The Markdown of an HTML page is this server's own (see README.md).
+#
+#   vu build mcp/fetch/main.vu -o mcp-fetch
+#   mcp-fetch [--user-agent UA] [--ignore-robots-txt] [--allow-private-ips]
+#
+# What it can reach: main has Net and nothing else: no files, no programs, no environment.
+import charset
+import entities
+import guard
+import html2md
+import http
+import json
+import mcp
+import pyrepr
+import pystr
+import robots
+import stdio
+import tools
+import whatwg
+import zlib
+
+const UA_AUTONOMOUS = "ModelContextProtocol/1.0 (Autonomous; +https://github.com/modelcontextprotocol/servers)"
+const UA_MANUAL = "ModelContextProtocol/1.0 (User-Specified; +https://github.com/modelcontextprotocol/servers)"
+const MAX_BODY = 67108864
+const PYDANTIC = "https://errors.pydantic.dev/2.14/v/"
+
+type Env:
+  net: Net
+  ua_auto: Str
+  ua_manual: Str
+  ignore_robots: Bool
+  allow_private: Bool
+  codecs: charset.Codecs
+  refs: entities.Refs
+
+# How a step fails: a ToolError the reference raises (its message is what the model sees), an httpx
+# HTTPError (its repr, which the callers put in their own messages), or another exception.
+type Oops:
+  Tool(msg: Str)
+  Http(repr: Str)
+  Crash(msg: Str)
+
+fn exc(cls: Str, msg: Str) -> Str:
+  return cls + "(" + pyrepr.str_repr(msg) + ")"
+
+type Resp:
+  status: Int
+  headers: [http.Header]
+  body: Str          # with its Content-Encoding undone
+  url: Str           # where it came from (after redirects)
+
+fn header(r: Resp, name: Str) -> Str?:
+  # httpx joins a header given more than once with ", "
+  var vals: [Str] = []
+  for h in r.headers:
+    if h.name == name: vals.push(h.value + "")
+  if vals.len == 0: return nil
+  return ", ".join(vals)
+
+# ---- one request
+
+# The host as the guard and the connection see it: brackets off an IPv6 address.
+fn bare_host(u: whatwg.Url) -> Str:
+  if u.host.startswith("[") and u.host.endswith("]"): return u.host[1..u.host.len - 1]
+  return u.host + ""
+
+# The private-address guard (a request hook in the reference): every address the host resolves to
+# must be public. A name that doesn't resolve passes (the connection then fails on its own). The
+# addresses it checked are the ones the request connects to: the reference looks the name up again
+# to connect, so a name that answers differently the second time gets past its check; here it can't.
+fn check_destination(e: Env, u: whatwg.Url) -> [Str] throws Oops:
+  if e.allow_private: return []
+  let host = bare_host(u)
+  if host == "": return []
+  let addrs = e.net.resolve(host, timeout: 30.0) else return []
+  for a in addrs:
+    if not guard.public(a):
+      fail Tool("Refused to fetch " + whatwg.href(u) + ": " + host + " resolves to " + a + ", which is not a public address. Start the server with --allow-private-ips to allow private, loopback and link-local addresses.")
+  return addrs
+
+fn port_of(u: whatwg.Url) -> Int:
+  if u.port >= 0: return u.port
+  return whatwg.default_port(u.scheme)
+
+fn host_header(u: whatwg.Url) -> Str:
+  if u.port >= 0: return u.host + ":{u.port}"
+  return u.host + ""
+
+# httpx's ConnectError text for a name that doesn't resolve, from the lookup's message.
+fn dns_repr(msg: Str) -> Str:
+  if msg.find("Name or service not known") >= 0: return exc("ConnectError", "[Errno -2] Name or service not known")
+  if msg.find("Temporary failure") >= 0: return exc("ConnectError", "[Errno -3] Temporary failure in name resolution")
+  if msg.find("No address") >= 0: return exc("ConnectError", "[Errno -5] No address associated with hostname")
+  if msg.find("timed out") >= 0: return exc("ConnectTimeout", "")
+  return exc("ConnectError", msg)
+
+fn connect(e: Env, u: whatwg.Url, checked: [Str], timeout: Float) -> Conn throws Oops:
+  let host = bare_host(u)
+  var addrs: [Str] = []
+  for a in checked: addrs.push(a + "")
+  if addrs.len == 0:
+    match e.net.resolve(host, timeout: timeout):
+      ok(xs):
+        for a in xs: addrs.push(a + "")
+      err(m): fail Http(dns_repr(m))
+  var last = exc("ConnectError", "All connection attempts failed")
+  for a in addrs:
+    match e.net.connect(a, port_of(u), timeout: timeout):
+      ok(c):
+        var conn = c
+        if u.scheme == "https":
+          match e.net.start_tls(&conn, host, timeout: timeout):
+            ok: return conn
+            err(m): fail Http(exc("ConnectError", m))
+        return conn
+      err(m):
+        if m.startswith("timed out"): last = exc("ConnectTimeout", "")
+  fail Http(last)
+
+fn decode_body(r: Resp, body: Str) -> Str throws Oops:
+  let enc = header(r, "content-encoding") else return body + ""
+  var out = body + ""
+  # applied in reverse order of listing
+  var codings: [Str] = []
+  for x in enc.split(","): codings.push(x.strip().lower())
+  var i = codings.len - 1
+  while i >= 0:
+    let c = codings[i]
+    # (at most 64 MB out: a small body can't unpack into gigabytes here, as it can in the reference)
+    if c == "gzip" or c == "x-gzip": out = zlib.gunzip_max(out, MAX_BODY) else fail Http(exc("DecodingError", "Error -3 while decompressing data: incorrect header check"))
+    elif c == "deflate":
+      # zlib format, or raw DEFLATE as some servers send it
+      match zlib.decompress_max(out, MAX_BODY):
+        ok(x): out = x
+        err(_): out = zlib.inflate_max(out, MAX_BODY) else fail Http(exc("DecodingError", "Error -3 while decompressing data: invalid stored block lengths"))
+    i -= 1
+  return out
+
+fn send_one(e: Env, u: whatwg.Url, ua: Str, timeout: Float, checked: [Str]) -> Resp throws Oops:
+  if u.scheme != "http" and u.scheme != "https":
+    fail Http(exc("UnsupportedProtocol", "Request URL has an unsupported protocol '" + u.scheme + "://'."))
+  if u.host == "": fail Http(exc("UnsupportedProtocol", "Request URL is missing an 'http://' or 'https://' protocol."))
+  let c = connect(e, u, checked, timeout)?
+  var target = u.path + ""
+  if target == "": target = "/"
+  if u.has_query: target += "?" + u.query
+  let req = "GET " + target + " HTTP/1.1\r\nHost: " + host_header(u) + "\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\nConnection: keep-alive\r\nUser-Agent: " + ua + "\r\n\r\n"
+  match e.net.send(c, req, timeout: timeout):
+    ok: ok_sent()
+    err(m): fail Http(exc("WriteError", m))
+  var r = read_resp(e, c, timeout)?
+  r.url = whatwg.href(u)
+  r.body = decode_body(r, r.body)?
+  return r
+
+# One response from the connection, failing as httpx (h11) fails when it isn't all there.
+fn read_resp(e: Env, c: Conn, timeout: Float) -> Resp throws Oops:
+  var buf = ""
+  var closed = false
+  var rs = http.Resume(0, 0, "", false)
+  var at = 0
+  while true:
+    if buf.len > at or closed:
+      var s = http.read_message(buf, at, 67108864, false, true, closed, &rs)
+      if s.state == http.DONE:
+        let status = int(s.start.split(" ")[1]) else 0
+        if status >= 100 and status < 200:
+          at = s.used
+          rs = http.Resume(0, 0, "", false)
+          continue
+        var r = Resp(status, [], "", "")
+        for h in s.headers: r.headers.push(http.Header(h.name + "", h.value + ""))
+        r.body = s.body + ""
+        return r
+      if s.state == http.INVALID and not closed: fail Http(exc("RemoteProtocolError", s.why))
+      if closed:
+        if buf.len == 0: fail Http(exc("RemoteProtocolError", "Server disconnected without sending a response."))
+        fail Http(cut_off(buf))
+    let d = e.net.recv(c, timeout: timeout) else fail Http(exc("ReadTimeout", ""))
+    if d.len == 0: closed = true
+    else: buf += d
+  fail Crash("unreachable")
+
+# h11's error for a response that stopped short: its body's length, or a chunked body.
+fn cut_off(buf: Str) -> Str:
+  let he = buf.find("\r\n\r\n")
+  if he < 0: return exc("RemoteProtocolError", "peer closed connection without sending complete message body (incomplete chunked read)")
+  let head = buf[0..he].lower()
+  if head.find("transfer-encoding:") >= 0 and head.find("chunked") >= 0: return exc("RemoteProtocolError", "peer closed connection without sending complete message body (incomplete chunked read)")
+  let cl = head.find("content-length:")
+  if cl >= 0:
+    var k = cl + 15
+    while k < head.len and head[k] == ' ': k += 1
+    var n = 0
+    while k < head.len and head[k] >= '0' and head[k] <= '9':
+      n = n * 10 + int(head[k]) - 48
+      k += 1
+    return exc("RemoteProtocolError", "peer closed connection without sending complete message body (received {buf.len - he - 4} bytes, expected {n})")
+  return exc("RemoteProtocolError", "Server disconnected without sending a response.")
+
+fn ok_sent():
+  return
+
+fn is_redirect(r: Resp) -> Bool:
+  let s = r.status
+  if not (s == 301 or s == 302 or s == 303 or s == 307 or s == 308): return false
+  if l = header(r, "location"): return true
+  return false
+
+# Where a Location header sends the request (httpx's _redirect_url): a URL with a scheme but no host
+# ("http:/x") gets the request's host (not its port), and one that can't take a host ("mailto:x")
+# fails as httpx's InvalidURL does (an exception the reference doesn't catch).
+fn redirect_url(u: whatwg.Url, loc: Str) -> whatwg.Url throws Oops:
+  let l = loc.strip()
+  var colon = -1
+  if l.len > 0 and ((l[0] >= 'a' and l[0] <= 'z') or (l[0] >= 'A' and l[0] <= 'Z')):
+    for i in 1..l.len:
+      let b = l[i]
+      if b == ':':
+        colon = i
+        break
+      if not ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '+' or b == '-' or b == '.'): break
+  if colon > 0 and not l[colon + 1..l.len].startswith("//"):
+    let rest = l[colon + 1..l.len]
+    if rest != "" and not rest.startswith("/") and not rest.startswith("?") and not rest.startswith("#"):
+      fail Crash("For absolute URLs, path must be empty or begin with '/'")
+    return whatwg.parse(l[0..colon] + "://" + u.host + rest) else fail Http(exc("RemoteProtocolError", "Invalid URL in location header: " + loc + "."))
+  return whatwg.join(u, loc) else fail Http(exc("RemoteProtocolError", "Invalid URL in location header: " + loc + "."))
+
+# client.get(url, follow_redirects=True): each request (redirect hops too) first passes the guard and,
+# for the hops after the first when robots apply, the robots.txt of its own origin.
+fn get(e: Env, start: whatwg.Url, ua: Str, timeout: Float, robots_hops: Bool) -> Resp throws Oops:
+  var u = whatwg.copy(start)
+  var history = 0
+  while true:
+    if history > 20: fail Http(exc("TooManyRedirects", "Exceeded maximum allowed redirects."))
+    let checked = check_destination(e, u)?
+    if robots_hops and history > 0: may_fetch(e, whatwg.href(u), ua)?
+    let r = send_one(e, u, ua, timeout, checked)?
+    if not is_redirect(r): return r
+    let loc = header(r, "location") else ""
+    var next = redirect_url(u, loc)?
+    if u.has_fragment and not next.has_fragment:
+      next.has_fragment = true
+      next.fragment = u.fragment + ""
+    u = next
+    history += 1
+  fail Crash("unreachable")
+
+# ---- robots.txt
+
+# urlunparse((scheme, netloc, "/robots.txt", "", "", "")) of urlparse(url)
+fn robots_url(url: Str) -> Str:
+  let colon = url.find(":")
+  var scheme = ""
+  var rest = url + ""
+  if colon > 0:
+    scheme = url[0..colon].lower()
+    rest = url[colon + 1..url.len]
+  var netloc = ""
+  var has_netloc = false
+  if rest.startswith("//"):
+    var k = 2
+    while k < rest.len and rest[k] != '/' and rest[k] != '?' and rest[k] != '#': k += 1
+    netloc = rest[2..k]
+    has_netloc = true
+  let uses = ["", "ftp", "http", "gopher", "nntp", "telnet", "imap", "wais", "file", "mms", "https", "shttp", "snews", "prospero", "rtsp", "rtsps", "rtspu", "rsync", "svn", "svn+ssh", "sftp", "nfs", "git", "git+ssh", "ws", "wss", "itms-services"]
+  var path = "/robots.txt"
+  if netloc != "" or (scheme != "" and scheme in uses): path = "//" + netloc + path
+  if scheme != "": return scheme + ":" + path
+  return path
+
+fn may_fetch(e: Env, url: Str, ua: Str) throws Oops:
+  let rurl = robots_url(url)
+  let ru = whatwg.parse(rurl) else fail Tool("Failed to fetch robots.txt " + rurl + " due to a connection issue")
+  var resp = Resp(0, [], "", "")
+  match get(e, ru, ua, 5.0, false):
+    ok(r): resp = r
+    err(o):
+      match o:
+        Http(_): fail Tool("Failed to fetch robots.txt " + rurl + " due to a connection issue")
+        Tool(m): fail Tool(m)
+        Crash(m): fail Crash(m)
+  let s = resp.status
+  if s == 401 or s == 403 or s >= 500:
+    fail Tool("When fetching robots.txt ({rurl}), received status {s} so assuming that autonomous fetching is not allowed, the user can try manually fetching by using the fetch prompt")
+  if s >= 400: return
+  let txt = charset.text(e.codecs, resp.body, header(resp, "content-type")) else fail Crash("'utf-16' codec can't decode bytes in position 0-1: Stream does not start with BOM")
+  var kept: [Str] = []
+  for line in pystr.splitlines(txt):
+    if not pystr.strip(line).startswith("#"): kept.push(line)
+  let rules = robots.parse("\n".join(kept))
+  if not robots.can_fetch(rules, url, ua):
+    fail Tool("The sites robots.txt (" + rurl + "), specifies that autonomous fetching of this page is not allowed, <useragent>" + ua + "</useragent>\n<url>" + url + "</url><robots>\n" + txt + "\n</robots>\nThe assistant must let the user know that it failed to view the page. The assistant may provide further guidance based on the above information.\nThe assistant can tell the user that they can try manually fetching the page by using the fetch prompt within their UI.")
+
+# ---- the page
+
+type Page:
+  content: Str
+  prefix: Str
+
+fn looks_html(raw: Str) -> Bool:
+  var s = raw + ""
+  while s.startswith(chr(0xFEFF)): s = s[3..s.len]
+  let t = pystr.strip(s)
+  let head = pystr.take(t, 20).lower()
+  return head.startswith("<!doctype html") or head.startswith("<html")
+
+fn fetch_url(e: Env, url: Str, ua: Str, force_raw: Bool, check_robots: Bool) -> Page throws Oops:
+  let u = whatwg.parse_httpx(url) else fail Http(exc("UnsupportedProtocol", "Request URL is missing an 'http://' or 'https://' protocol."))
+  var resp = Resp(0, [], "", "")
+  match get(e, u, ua, 30.0, check_robots):
+    ok(r): resp = r
+    err(o):
+      match o:
+        Http(rep): fail Tool("Failed to fetch " + url + ": " + rep)
+        Tool(m): fail Tool(m)
+        Crash(m): fail Crash(m)
+  if resp.status >= 400: fail Tool("Failed to fetch {url} - status code {resp.status}")
+  let ct_opt = header(resp, "content-type")
+  let page_raw = charset.page(e.codecs, e.refs, resp.body, ct_opt) else fail Crash("'utf-16' codec can't decode bytes in position 0-1: Stream does not start with BOM")
+  let ct = ct_opt else ""
+  let lct = ct.lower()
+  let html = pystr.take(page_raw, 100).find("<html") >= 0 or lct.find("text/html") >= 0 or lct.find("application/xhtml+xml") >= 0 or (ct == "" and looks_html(page_raw))
+  if html and not force_raw:
+    let md = html2md.markdown(e.refs, page_raw)
+    if pystr.strip(md) == "": return Page("<error>Page failed to be simplified from HTML</error>", "")
+    return Page(md, "")
+  var declared = ct + ""
+  if declared == "": declared = "(not declared)"
+  return Page(page_raw, "Content type " + declared + " cannot be simplified to markdown, but here is the raw content:\n")
+
+# ---- the tool's arguments, checked as pydantic checks them (strictly)
+
+type Args:
+  url: Str
+  max_length: Int
+  start_index: Int
+  raw: Bool
+
+fn problem(field: Str, msg: Str, kind: Str, v: json.Value) -> Str:
+  return field + "\n  " + msg + " [type=" + kind + ", input_value=" + pyrepr.shown(v) + ", input_type=" + pyrepr.type_name(v) + "]\n    For further information visit " + PYDANTIC + kind
+
+fn int_field(args: json.Value, name: Str, dflt: Int, lo: Int, hi: Int, var errs: [Str]) -> Int:
+  let v = json.at(args, name) else return dflt
+  match v:
+    json.Whole(n):
+      if n < lo:
+        errs.push(problem(name, "Input should be greater than or equal to {lo}", "greater_than_equal", v))
+        return dflt
+      if hi >= 0 and n > hi:
+        errs.push(problem(name, "Input should be less than or equal to {hi}", "less_than_equal", v))
+        return dflt
+      return n
+    _:
+      errs.push(problem(name, "Input should be a valid integer", "int_type", v))
+      return dflt
+
+fn check_args(args: json.Value) -> Args throws:
+  var errs: [Str] = []
+  var a = Args("", 5000, 0, false)
+  if not json.has(args, "url"): errs.push(problem("url", "Field required", "missing", args))
+  if v = json.at(args, "url"):
+    match v:
+      json.Text(t):
+        match whatwg.parse(t):
+          ok(u): a.url = whatwg.href(u)
+          err(m): errs.push(problem("url", "Input should be a valid URL, " + m, "url_parsing", v))
+      _: errs.push(problem("url", "URL input should be a string or URL", "url_type", v))
+  a.max_length = int_field(args, "max_length", 5000, 1, 999999, &errs)
+  a.start_index = int_field(args, "start_index", 0, 0, -1, &errs)
+  if v = json.at(args, "raw"):
+    match v:
+      json.Flag(b): a.raw = b
+      _: errs.push(problem("raw", "Input should be a valid boolean", "bool_type", v))
+  if errs.len > 0:
+    var head = "{errs.len} validation errors for fetchArguments"
+    if errs.len == 1: head = "1 validation error for fetchArguments"
+    fail head + "\n" + "\n".join(errs)
+  return a
+
+# ---- the tool and the prompt
+
+fn fetch_tool(e: Env, args: json.Value) -> Str throws Oops:
+  let a = check_args(args) else fail Tool("")
+  if not e.ignore_robots: may_fetch(e, a.url, e.ua_auto)?
+  let p = fetch_url(e, a.url, e.ua_auto, a.raw, not e.ignore_robots)?
+  var content = p.content + ""
+  let total = pystr.length(content)
+  if a.start_index >= total: content = "<error>No more content available.</error>"
+  else:
+    let piece = pystr.slice(content, a.start_index, a.start_index + a.max_length)
+    let got = pystr.length(piece)
+    let remaining = total - (a.start_index + got)
+    content = piece
+    if got == a.max_length and remaining > 0:
+      content += "\n\n<error>Content truncated. Call the fetch tool with a start_index of {a.start_index + got} to get more content.</error>"
+  return p.prefix + "Contents of " + a.url + ":\n" + content
+
+fn tool(e: Env, args: json.Value) -> mcp.Outcome:
+  match check_args(args):
+    ok(_): ok_sent()
+    err(msg): return mcp.tool_error("Error executing tool fetch: " + msg)
+  match fetch_tool(e, args):
+    ok(t): return mcp.Outcome("[{{\"type\":\"text\",\"text\":" + json.quote(t) + "}}]", "", false)
+    err(o):
+      match o:
+        Tool(m): return mcp.tool_error("Error executing tool fetch: " + m)
+        Http(r): return mcp.tool_error("Error executing tool fetch: " + r)
+        Crash(_): return mcp.tool_error("Error executing tool fetch")    # (the SDK shows no more of other exceptions)
+
+fn prompt(e: Env, s: mcp.Server, c: mcp.Call) -> Str:
+  let desc = "Fetch a URL and extract its contents as markdown"
+  let v = json.at(c.args, "url") else return mcp.error_reply(c, -32602, "URL is required")
+  var url = ""
+  match v:
+    json.Text(t): url = t + ""
+    _: return mcp.error_reply(c, -32602, "Invalid params: url must be a string")
+  match fetch_url(e, url, e.ua_manual, false, false):
+    ok(p): return mcp.prompt_result(s, c, desc, p.prefix + p.content)
+    err(o):
+      match o:
+        Tool(m): return mcp.prompt_result(s, c, desc, m)
+        Http(r): return mcp.prompt_result(s, c, desc, "Failed to fetch " + url + ": " + r)
+        Crash(_): return mcp.error_reply(c, 0, "Error rendering prompt fetch")
+
+fn main(net: Net):
+  let argv = args()
+  var ua = ""
+  var ignore = false
+  var allow = false
+  var i = 1
+  while i < argv.len:
+    let a = argv[i]
+    if a == "--user-agent" and i + 1 < argv.len:
+      ua = argv[i + 1] + ""
+      i += 1
+    elif a.startswith("--user-agent="): ua = a[13..a.len]
+    elif a == "--ignore-robots-txt": ignore = true
+    elif a == "--allow-private-ips": allow = true
+    elif a == "--no-readability-js": ignore = ignore     # accepted: this server never starts Node
+    elif a == "--proxy-url" or a.startswith("--proxy-url="):
+      eprint("mcp-fetch: --proxy-url isn't supported (it connects directly; see mcp/fetch/README.md)")
+      exit(2)
+    else:
+      eprint("usage: mcp-fetch [--user-agent UA] [--ignore-robots-txt] [--allow-private-ips]")
+      exit(2)
+    i += 1
+  var ua_auto = UA_AUTONOMOUS
+  var ua_manual = UA_MANUAL
+  if ua != "":
+    ua_auto = ua + ""
+    ua_manual = ua + ""
+  let e = Env(net, ua_auto, ua_manual, ignore, allow, charset.load(), entities.refs())
+  serve(e)
+
+fn serve(e: Env):
+  var s = mcp.server("mcp-fetch", tools.VERSION, tools.TOOLS) else panic("the tool list isn't valid JSON")
+  mcp.set_prompts(&s, tools.PROMPTS) else panic("the prompt list isn't valid JSON")
+  s.caps = "{{\"prompts\":{{\"listChanged\":false}},\"resources\":{{\"listChanged\":false,\"subscribe\":false}},\"tools\":{{\"listChanged\":false}}}}"
+  s.unknown_tool = "Unknown tool: %s"
+  s.says_ok = true
+  while true:
+    let line = stdio.line() else break
+    match mcp.handle(s, line):
+      mcp.Reply(text): mcp.send(text)
+      mcp.ToolCall(c): mcp.send(mcp.result(s, c, tool(e, c.args)))
+      mcp.PromptGet(c): mcp.send(prompt(e, s, c))
+      mcp.Quiet: continue

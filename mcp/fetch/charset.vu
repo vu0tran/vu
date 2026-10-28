@@ -1,0 +1,342 @@
+# A fetched body as text, decoded as the reference server decodes it: httpx's response.text (the
+# Content-Type header's charset when Python knows it, else UTF-8, with errors="replace"), and its
+# decode_page, which also honors a <meta> charset in the first 1024 bytes of an HTML page.
+import entities
+import htmltok
+import pystr
+import tables
+
+type Codec:
+  name: Str      # Python's name for it ("utf-8", "cp1252"), "" when codecs.lookup() fails
+  kind: Byte     # 'B' decoded here, 'T' a byte table, 'U' a text codec this can't decode, 'N' not text
+  ascii: Bool    # it reads ASCII bytes as ASCII
+  bad: Bool      # codecs.lookup() raises ValueError rather than LookupError (a name with a NUL)
+
+type Codecs:
+  aliases: {Str: Int}     # encodings.aliases keys -> index into the rows
+  modules: {Str: Int}     # codec module names -> index
+  names: [Str]
+  kinds: [Byte]
+  ascii: [Bool]
+  tables: {Str: [Int]}    # a single-byte codec's characters for bytes 0-255 (-1: can't decode)
+
+fn load() -> Codecs:
+  var c = Codecs({}, {}, [], [], [], {})
+  for line in tables.CODECS.split("\n"):
+    let f = line.split(" ")
+    if f.len < 5: continue
+    let i = c.names.len
+    c.names.push(f[2] + "")
+    c.kinds.push(f[3][0])
+    c.ascii.push(f[4] == "1")
+    if f[0] == "a": c.aliases[f[1]] = i
+    else: c.modules[f[1]] = i
+  for line in tables.BYTES.split("\n"):
+    let f = line.split(" ")
+    if f.len < 257: continue
+    var cells: [Int] = []
+    for k in 1..257:
+      if f[k] == "-": cells.push(-1)
+      else: cells.push(entities.hexnum(f[k]))
+    c.tables[f[0]] = cells
+  return c
+
+fn alnum(b: Byte) -> Bool:
+  return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9')
+
+# codecs.lookup(label): CPython lowercases the name and turns each run of other bytes (of its UTF-8)
+# into one "_", then looks the result up among the aliases and the codec modules.
+fn lookup(c: Codecs, label: Str) -> Codec:
+  if label.find(chr(0)) >= 0: return Codec("", 'N', false, true)
+  var norm: [Byte] = []
+  var punct = false
+  for i in 0..label.len:
+    let b = label[i]
+    if alnum(b) or b == '.':
+      if punct and norm.len > 0: norm.push('_')
+      punct = false
+      if b >= 'A' and b <= 'Z': norm.push(byte(int(b) + 32))
+      else: norm.push(b)
+    else: punct = true
+  let n = str(norm)
+  var idx = -1
+  if n in c.aliases: idx = c.aliases[n]
+  elif n.replace(".", "_") in c.aliases: idx = c.aliases[n.replace(".", "_")]
+  elif n.find(".") < 0 and n in c.modules: idx = c.modules[n]
+  if idx < 0: return Codec("", 'N', false, false)
+  return Codec(c.names[idx] + "", c.kinds[idx], c.ascii[idx], false)
+
+fn known(c: Codec) -> Bool:
+  return c.name != ""
+
+fn put(var out: Str, cp: Int):
+  if cp < 0 or cp > 0x10FFFF or (cp >= 0xD800 and cp < 0xE000): out += chr(0xFFFD)
+  else: out += chr(cp)
+
+fn bom8(d: Str) -> Bool:
+  return d.len >= 3 and d[0] == 0xEF and d[1] == 0xBB and d[2] == 0xBF
+
+fn utf8(data: Str) -> Str:
+  if data.is_utf8(): return data + ""
+  var out = ""
+  for ch in data.chars(): out += ch
+  return out
+
+fn utf16(data: Str, little0: Bool, bom: Bool) -> Str:
+  var little = little0
+  var i = 0
+  if bom and data.len >= 2:
+    if data[0] == 0xFF and data[1] == 0xFE:
+      little = true
+      i = 2
+    elif data[0] == 0xFE and data[1] == 0xFF:
+      little = false
+      i = 2
+  var out = ""
+  while i + 1 < data.len:
+    var u = 0
+    if little: u = int(data[i]) | (int(data[i + 1]) << 8)
+    else: u = (int(data[i]) << 8) | int(data[i + 1])
+    i += 2
+    if u >= 0xD800 and u < 0xDC00:
+      if i + 1 < data.len:
+        var v = 0
+        if little: v = int(data[i]) | (int(data[i + 1]) << 8)
+        else: v = (int(data[i]) << 8) | int(data[i + 1])
+        if v >= 0xDC00 and v < 0xE000:
+          i += 2
+          out += chr(0x10000 + ((u - 0xD800) << 10) + (v - 0xDC00))
+          continue
+        out += chr(0xFFFD)
+        continue
+      # a high surrogate cut off at the end: it and what's left are one replacement
+      out += chr(0xFFFD)
+      return out
+    if u >= 0xDC00 and u < 0xE000:
+      out += chr(0xFFFD)
+      continue
+    out += chr(u)
+  if i < data.len: out += chr(0xFFFD)
+  return out
+
+fn utf32(data: Str, little0: Bool, bom: Bool) -> Str:
+  var little = little0
+  var i = 0
+  if bom and data.len >= 4:
+    if data[0] == 0xFF and data[1] == 0xFE and data[2] == 0 and data[3] == 0:
+      little = true
+      i = 4
+    elif data[0] == 0 and data[1] == 0 and data[2] == 0xFE and data[3] == 0xFF:
+      little = false
+      i = 4
+  var out = ""
+  while i + 3 < data.len:
+    var u = 0
+    if little: u = int(data[i]) | (int(data[i + 1]) << 8) | (int(data[i + 2]) << 16) | (int(data[i + 3]) << 24)
+    else: u = (int(data[i]) << 24) | (int(data[i + 1]) << 16) | (int(data[i + 2]) << 8) | int(data[i + 3])
+    i += 4
+    put(&out, u)
+  if i < data.len: out += chr(0xFFFD)
+  return out
+
+# bytes.decode(codec, errors="replace"); a codec this can't decode reads as UTF-8 (see README).
+fn decode(c: Codecs, codec: Codec, data: Str) -> Str:
+  let n = codec.name
+  if n == "ascii":
+    var out = ""
+    for i in 0..data.len:
+      if data[i] < 128: out += data[i..i + 1]
+      else: out += chr(0xFFFD)
+    return out
+  if n == "iso8859-1":
+    var out = ""
+    for i in 0..data.len: out += chr(int(data[i]))
+    return out
+  if n == "utf-8-sig":
+    if bom8(data): return utf8(data[3..data.len])
+    return utf8(data)
+  if n == "utf-16": return utf16(data, true, true)
+  if n == "utf-16-le": return utf16(data, true, false)
+  if n == "utf-16-be": return utf16(data, false, false)
+  if n == "utf-32": return utf32(data, true, true)
+  if n == "utf-32-le": return utf32(data, true, false)
+  if n == "utf-32-be": return utf32(data, false, false)
+  if codec.kind == 'T' and n in c.tables:
+    let t = c.tables[n]
+    var out = ""
+    for i in 0..data.len:
+      let cp = t[int(data[i])]
+      if cp < 0: out += chr(0xFFFD)
+      else: out += chr(cp)
+    return out
+  return utf8(data)
+
+# email.message's get_content_charset() of a Content-Type value (httpx's charset_encoding), or nil.
+fn content_charset(ct: Str) -> Str?:
+  # _parseparam: split at ";" outside quotes
+  var params: [Str] = []
+  var s = ct + ""
+  var first = true
+  while first or s.startswith(";"):
+    if not first: s = s[1..s.len]
+    first = false
+    var end = s.find(";")
+    while end > 0 and (quotes_before(s, end) % 2) == 1: end = s.find(";", end + 1)
+    if end < 0: end = s.len
+    var f = s[0..end]
+    let eq = f.find("=")
+    if eq >= 0: f = pystr.strip(f[0..eq]).lower() + "=" + pystr.strip(f[eq + 1..f.len])
+    params.push(pystr.strip(f))
+    s = s[end..s.len]
+  for p in params:
+    var name = ""
+    var val = ""
+    let eq = p.find("=")
+    if eq >= 0:
+      name = pystr.strip(p[0..eq])
+      val = pystr.strip(p[eq + 1..p.len])
+    else: name = pystr.strip(p)
+    if name.lower() == "charset":
+      # (decode_params unquotes, quotes again, and get_param unquotes: unquoted once in all)
+      let v = unquote(val)
+      for i in 0..v.len:
+        if v[i] >= 128: return nil
+      return v.lower()
+  # RFC 2231's charset*=utf-8''latin1 (email puts these after the others): the text after the second '
+  for p in params:
+    let eq = p.find("=")
+    if eq < 0 or pystr.strip(p[0..eq]).lower() != "charset*": continue
+    var v = pct_latin1(unquote(pystr.strip(p[eq + 1..p.len])))
+    let parts = v.split("'")
+    if parts.len >= 3:
+      let a = parts[0].len + 1 + parts[1].len + 1
+      v = v[a..v.len]
+    for i in 0..v.len:
+      if v[i] >= 128: return nil
+    return v.lower()
+  return nil
+
+# urllib.parse.unquote(s, encoding="latin-1"), as UTF-8 text
+fn pct_latin1(s: Str) -> Str:
+  var out = ""
+  var i = 0
+  while i < s.len:
+    if s[i] == '%' and i + 2 < s.len + 0 and hexd(s[i + 1]) >= 0 and hexd(s[i + 2]) >= 0:
+      out += chr(hexd(s[i + 1]) * 16 + hexd(s[i + 2]))
+      i += 3
+    else:
+      out += s[i..i + 1]
+      i += 1
+  return out
+
+fn hexd(b: Byte) -> Int:
+  if b >= '0' and b <= '9': return int(b) - 48
+  if b >= 'a' and b <= 'f': return int(b) - 87
+  if b >= 'A' and b <= 'F': return int(b) - 55
+  return -1
+
+fn quotes_before(s: Str, end: Int) -> Int:
+  return s[0..end].count("\"") - s[0..end].count("\\\"")
+
+# email.utils.unquote
+fn unquote(s: Str) -> Str:
+  if s.len > 1:
+    if s.startswith("\"") and s.endswith("\""): return s[1..s.len - 1].replace("\\\\", "\\").replace("\\\"", "\"")
+    if s.startswith("<") and s.endswith(">"): return s[1..s.len - 1]
+  return s + ""
+
+# httpx's response.text. It fails where Python's incremental decoder does: UTF-16 or UTF-32 named in
+# the header, and the body doesn't start with a byte order mark.
+fn text(c: Codecs, body: Str, content_type: Str?) -> Str throws:
+  if body == "": return ""
+  var codec = Codec("utf-8", 'B', true, false)
+  if ct = content_type:
+    if cs = content_charset(ct):
+      let k = lookup(c, cs)
+      if known(k): codec = k
+  if codec.name == "utf-16" and body.len >= 2 and not ((body[0] == 0xFF and body[1] == 0xFE) or (body[0] == 0xFE and body[1] == 0xFF)):
+    fail "'utf-16' codec can't decode bytes in position 0-1: Stream does not start with BOM"
+  if codec.name == "utf-32" and body.len >= 4 and not ((body[0] == 0xFF and body[1] == 0xFE and body[2] == 0 and body[3] == 0) or (body[0] == 0 and body[1] == 0 and body[2] == 0xFE and body[3] == 0xFF)):
+    fail "'utf-32' codec can't decode bytes in position 0-3: Stream does not start with BOM"
+  return decode(c, codec, body)
+
+# decode_page: response.text, unless the page is HTML (or untyped), has no charset in its header and
+# no byte order mark, and declares one in a <meta> tag of its first 1024 bytes that Python knows.
+fn page(c: Codecs, r: entities.Refs, body: Str, content_type: Str?) -> Str throws:
+  var media = ""
+  var has_charset = false
+  if ct = content_type:
+    let semi = ct.find(";")
+    var m = ct + ""
+    if semi >= 0: m = ct[0..semi]
+    media = pystr.strip(m).lower()
+    if cs = content_charset(ct): has_charset = true
+  if has_charset or not (media == "" or media == "text/html" or media == "application/xhtml+xml") or bom8(body) or (body.len >= 2 and ((body[0] == 0xFF and body[1] == 0xFE) or (body[0] == 0xFE and body[1] == 0xFF))):
+    return text(c, body, content_type)?
+  var head = body + ""
+  if head.len > 1024: head = head[0..1024]
+  var latin = ""
+  for i in 0..head.len: latin += chr(int(head[i]))
+  var declared = ""
+  var found = false
+  if d = meta_charset(r, latin):
+    declared = d
+    found = true
+  if not found: return text(c, body, content_type)?
+  let k = lookup(c, declared)
+  if not known(k) or k.kind == 'N': return text(c, body, content_type)?
+  var name = k.name + ""
+  if name.startswith("utf-16") or name.startswith("utf-32"): name = "utf-8"
+  if name == "idna" or name == "punycode" or name == "unicode-escape" or name == "raw-unicode-escape": return text(c, body, content_type)?
+  var use = lookup(c, name)
+  if not use.ascii: return text(c, body, content_type)?
+  return decode(c, use, body)
+
+# The first <meta> that declares a charset, as the reference's MetaCharset parser finds it.
+fn meta_charset(r: entities.Refs, html: Str) -> Str?:
+  for t in htmltok.tokens(r, html, false):
+    if t.kind != 's' or t.name != "meta": continue
+    # a dict of the attributes: the last of a name wins
+    var vals: {Str: Str} = {}
+    for a in t.attrs: vals[a.name] = pystr.strip(a.value)
+    if "charset" in vals and vals["charset"] != "": return vals["charset"] + ""
+    var he = ""
+    if "http-equiv" in vals: he = vals["http-equiv"].lower()
+    if he == "content-type":
+      var content = ""
+      if "content" in vals: content = vals["content"] + ""
+      if found = charset_in(content): return found
+  return nil
+
+fn re_space(c: Str) -> Bool:
+  return pystr.is_space(c)
+
+# re.search(r"""charset\s*=\s*["']?\s*([^\s"';]+)""", content, re.IGNORECASE)
+fn charset_in(content: Str) -> Str?:
+  let cs = pystr.chars(content)
+  for start in 0..cs.len:
+    if start + 7 > cs.len: break
+    var word = ""
+    for k in start..start + 7: word += cs[k]
+    if word.lower() != "charset": continue
+    var k = start + 7
+    while k < cs.len and re_space(cs[k]): k += 1
+    if k >= cs.len or cs[k] != "=": continue
+    k += 1
+    while k < cs.len and re_space(cs[k]): k += 1
+    if k < cs.len and (cs[k] == "\"" or cs[k] == "'"):
+      # ["']? then \s*: try with the quote taken, then (on failure) without
+      var k2 = k + 1
+      while k2 < cs.len and re_space(cs[k2]): k2 += 1
+      var v = ""
+      while k2 < cs.len and not re_space(cs[k2]) and cs[k2] != "\"" and cs[k2] != "'" and cs[k2] != ";":
+        v += cs[k2]
+        k2 += 1
+      if v != "": return v
+      continue
+    var v = ""
+    while k < cs.len and not re_space(cs[k]) and cs[k] != "\"" and cs[k] != "'" and cs[k] != ";":
+      v += cs[k]
+      k += 1
+    if v != "": return v
+  return nil

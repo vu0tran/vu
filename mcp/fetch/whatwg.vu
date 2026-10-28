@@ -1,0 +1,808 @@
+# URLs as the reference server reads them: its fetch tool checks the url argument with pydantic's
+# AnyUrl, which parses and rewrites it as the WHATWG URL Standard says (through the Rust url crate),
+# and fetches what that gives. So this is that parser, for the URLs a model sends: it fails with the
+# crate's words ("empty host", "invalid port number"...), and href() is the text pydantic's str() gives.
+import idna_table
+
+type Url:
+  scheme: Str
+  user, pass: Str
+  has_host: Bool
+  host: Str          # as serialized: lowercase, punycode, "[::1]", "127.0.0.1"
+  port: Int          # -1 when none (or the scheme's default)
+  path: Str          # as serialized ("/a/b"; an opaque path like "x@y" for mailto:x@y)
+  has_query: Bool
+  query: Str
+  has_fragment: Bool
+  fragment: Str
+
+fn copy(u: Url) -> Url:
+  return Url(u.scheme + "", u.user + "", u.pass + "", u.has_host, u.host + "", u.port, u.path + "", u.has_query, u.query + "", u.has_fragment, u.fragment + "")
+
+fn special(scheme: Str) -> Bool:
+  return scheme == "http" or scheme == "https" or scheme == "ws" or scheme == "wss" or scheme == "ftp" or scheme == "file"
+
+fn default_port(scheme: Str) -> Int:
+  if scheme == "http" or scheme == "ws": return 80
+  if scheme == "https" or scheme == "wss": return 443
+  if scheme == "ftp": return 21
+  return -1
+
+fn href(u: Url) -> Str:
+  var out = u.scheme + ":"
+  if u.has_host:
+    out += "//"
+    if u.user != "" or u.pass != "":
+      out += u.user
+      if u.pass != "": out += ":" + u.pass
+      out += "@"
+    out += u.host
+    if u.port >= 0: out += ":{u.port}"
+  elif not u.has_host and u.path.startswith("//"):
+    out += "/."
+  out += u.path
+  if u.has_query: out += "?" + u.query
+  if u.has_fragment: out += "#" + u.fragment
+  return out
+
+# ---- percent-encoding, by the standard's sets
+
+const HEX = "0123456789ABCDEF"
+
+fn c0(b: Byte) -> Bool:
+  return b < 32 or b > 126
+
+fn in_set(b: Byte, set: Int) -> Bool:
+  # 0 C0 control, 1 fragment, 2 query, 3 special-query, 4 path, 5 userinfo
+  if c0(b): return true
+  if set == 0: return false
+  if b == ' ' or b == '"' or b == '<' or b == '>': return true
+  if set == 1: return b == '`'
+  if b == '#': return true
+  if set == 2: return false
+  if set == 3: return b == '\''
+  if b == '?' or b == '`' or b == '{' or b == '}': return true
+  if set == 4: return false
+  return b == '/' or b == ':' or b == ';' or b == '=' or b == '@' or b == '[' or b == '\\' or b == ']' or b == '^' or b == '|'
+
+fn encode(s: Str, set: Int) -> Str:
+  var plain = true
+  for i in 0..s.len:
+    if in_set(s[i], set):
+      plain = false
+      break
+  if plain: return s + ""
+  var out = ""
+  for i in 0..s.len:
+    let b = s[i]
+    if in_set(b, set):
+      let v = int(b)
+      out += "%" + HEX[v >> 4..(v >> 4) + 1] + HEX[v & 15..(v & 15) + 1]
+    else: out += s[i..i + 1]
+  return out
+
+fn hexval(b: Byte) -> Int:
+  if b >= '0' and b <= '9': return int(b) - 48
+  if b >= 'a' and b <= 'f': return int(b) - 87
+  if b >= 'A' and b <= 'F': return int(b) - 55
+  return -1
+
+fn decode(s: Str) -> Str:
+  if s.find("%") < 0: return s + ""
+  var out: [Byte] = []
+  var i = 0
+  while i < s.len:
+    if s[i] == '%' and i + 2 < s.len + 0 and hexval(s[i + 1]) >= 0 and hexval(s[i + 2]) >= 0:
+      out.push(byte(hexval(s[i + 1]) * 16 + hexval(s[i + 2])))
+      i += 3
+    else:
+      out.push(s[i])
+      i += 1
+  return str(out)
+
+# ---- parsing
+
+# The byte index of the last sub in s, or -1.
+fn rfind(s: Str, sub: Str) -> Int:
+  var i = s.len - sub.len
+  while i >= 0:
+    if s[i..i + sub.len] == sub: return i
+    i -= 1
+  return -1
+
+fn is_alpha(b: Byte) -> Bool:
+  return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z')
+
+fn is_digit(b: Byte) -> Bool:
+  return b >= '0' and b <= '9'
+
+fn lower_ascii(s: Str) -> Str:
+  var out: [Byte] = []
+  for i in 0..s.len:
+    let b = s[i]
+    if b >= 'A' and b <= 'Z': out.push(byte(int(b) + 32))
+    else: out.push(b)
+  return str(out)
+
+# The input as the parser sees it: C0 controls and spaces trimmed from both ends, tabs and line
+# breaks removed everywhere.
+fn clean(input: Str) -> Str:
+  var a = 0
+  var b = input.len
+  while a < b and input[a] <= ' ': a += 1
+  while b > a and input[b - 1] <= ' ': b -= 1
+  var out: [Byte] = []
+  for i in a..b:
+    let c = input[i]
+    if c != '\t' and c != '\n' and c != '\r': out.push(c)
+  return str(out)
+
+fn parse(input: Str) -> Url throws:
+  if input == "": fail "input is empty"
+  let s = clean(input)
+  # the scheme
+  var colon = -1
+  if s.len > 0 and is_alpha(s[0]):
+    for i in 1..s.len:
+      let b = s[i]
+      if b == ':':
+        colon = i
+        break
+      if not (is_alpha(b) or is_digit(b) or b == '+' or b == '-' or b == '.'): break
+  if colon < 0: fail "relative URL without a base"
+  let scheme = lower_ascii(s[0..colon])
+  let rest = s[colon + 1..s.len]
+  var u = Url(scheme, "", "", false, "", -1, "", false, "", false, "")
+  # the fragment and the query come off the end first
+  var body = rest + ""
+  let hash = body.find("#")
+  if hash >= 0:
+    u.has_fragment = true
+    u.fragment = encode(body[hash + 1..body.len], 1)
+    body = body[0..hash]
+  let sp = special(scheme)
+  if scheme == "file":
+    parse_file(&u, body)?
+  elif sp:
+    # any number of slashes or backslashes, then the authority
+    var i = 0
+    while i < body.len and (body[i] == '/' or body[i] == '\\'): i += 1
+    var end = body.len
+    for j in i..body.len:
+      if body[j] == '/' or body[j] == '\\' or body[j] == '?':
+        end = j
+        break
+    var after = ""
+    authority(&u, body[i..end], true, &after, body[end..body.len])?
+    path_and_query(&u, after + body[end..body.len], true)
+  elif body.startswith("//"):
+    var end = body.len
+    for j in 2..body.len:
+      if body[j] == '/' or body[j] == '?':
+        end = j
+        break
+    var after = ""
+    authority(&u, body[2..end], false, &after, body[end..body.len])?
+    var rest2 = after + body[end..body.len]
+    if after != "": rest2 = "/" + rest2
+    path_and_query(&u, rest2, false)
+  elif body.startswith("/"):
+    path_and_query(&u, body, false)
+  else:
+    # an opaque path (mailto:x@y, data:..., javascript:...)
+    var q = body.find("?")
+    if q < 0: q = body.len
+    u.path = encode(body[0..q], 0)
+    if q < body.len:
+      u.has_query = true
+      u.query = encode(body[q + 1..body.len], 2)
+  return u
+
+fn parse_file(var u: Url, body: Str) throws:
+  u.has_host = true
+  if body.len >= 2 and (body[0] == '/' or body[0] == '\\') and (body[1] == '/' or body[1] == '\\'):
+    var end = body.len
+    for j in 2..body.len:
+      if body[j] == '/' or body[j] == '\\' or body[j] == '?':
+        end = j
+        break
+    let h = body[2..end]
+    if h.len == 2 and is_alpha(h[0]) and (h[1] == ':' or h[1] == '|'):
+      # a Windows drive letter: no host, and the letter starts the path
+      path_and_query(&u, "/" + h[0..1] + ":" + body[end..body.len], true)
+      return
+    if h != "":
+      let host = parse_host(h, true)?
+      if host != "localhost": u.host = host
+    # the crate drops the slashes after the host but one
+    var p = end
+    while p + 1 < body.len and (body[p] == '/' or body[p] == '\\') and (body[p + 1] == '/' or body[p + 1] == '\\'): p += 1
+    path_and_query(&u, body[p..body.len], true)
+  else:
+    path_and_query(&u, body, true)
+
+fn authority(var u: Url, a: Str, sp: Bool, var after: Str, rest: Str) throws:
+  u.has_host = true
+  var hp = a + ""
+  let at = rfind(a, "@")
+  if at >= 0:
+    let info = a[0..at]
+    hp = a[at + 1..a.len]
+    let c = info.find(":")
+    if c >= 0:
+      u.user = encode(info[0..c], 5)
+      u.pass = encode(info[c + 1..info.len], 5)
+    else: u.user = encode(info, 5)
+  # host and port: the port's colon is the first one outside brackets
+  var colon = -1
+  var inside = false
+  for i in 0..hp.len:
+    if hp[i] == '[': inside = true
+    elif hp[i] == ']': inside = false
+    elif hp[i] == ':' and not inside:
+      colon = i
+      break
+  var host = hp + ""
+  if colon >= 0: host = hp[0..colon]
+  if host == "":
+    # the crate takes an empty user and password before nothing ("foo://:@", "foo://:@?q"), not before a path
+    let bare = not sp and colon < 0 and a == ":@" and not rest.startswith("/")
+    if not bare and (sp or colon >= 0 or at >= 0): fail "empty host"
+    if bare:
+      u.user = ""
+      u.pass = ""
+  if sp: u.host = parse_host(host, true)?
+  else: u.host = opaque_host(host)?
+  if colon >= 0:
+    let pt = hp[colon + 1..hp.len]
+    var n = 0
+    var i = 0
+    while i < pt.len and is_digit(pt[i]):
+      n = n * 10 + int(pt[i]) - 48
+      if n > 65535: fail "invalid port number"
+      i += 1
+    # the port ends at a backslash too (the crate's way), and what follows is the path
+    if i < pt.len and pt[i] != '\\': fail "invalid port number"
+    after = pt[i..pt.len]
+    if i > 0 and n != default_port(u.scheme): u.port = n
+
+fn opaque_host(h: Str) -> Str throws:
+  if h.startswith("["):
+    if not h.endswith("]"): fail "invalid IPv6 address"
+    return "[" + ipv6(h[1..h.len - 1])? + "]"
+  for i in 0..h.len:
+    let b = h[i]
+    if b == 0 or b == ' ' or b == '#' or b == '/' or b == ':' or b == '<' or b == '>' or b == '?' or b == '@' or b == '[' or b == '\\' or b == ']' or b == '^' or b == '|':
+      fail "invalid domain character"
+  return encode(h, 0)
+
+fn path_and_query(var u: Url, s: Str, sp: Bool):
+  var q = s.find("?")
+  if q < 0: q = s.len
+  u.path = path(s[0..q], sp)
+  if q < s.len:
+    u.has_query = true
+    var set = 2
+    if sp: set = 3
+    u.query = encode(s[q + 1..s.len], set)
+
+fn dot(seg: Str) -> Bool:
+  return seg == "." or lower_ascii(seg) == "%2e"
+
+fn dotdot(seg: Str) -> Bool:
+  let l = lower_ascii(seg)
+  return l == ".." or l == ".%2e" or l == "%2e." or l == "%2e%2e"
+
+fn drive(seg: Str) -> Bool:
+  return seg.len == 2 and is_alpha(seg[0]) and (seg[1] == ':' or seg[1] == '|')
+
+fn path(s: Str, sp: Bool) -> Str:
+  if s == "":
+    if sp: return "/"
+    return ""
+  var segs: [Str] = []
+  # the path starts with its separator; each segment follows one
+  var start = 1
+  if not (s[0] == '/' or (sp and s[0] == '\\')): start = 0
+  var i = start
+  var seg_start = start
+  while i <= s.len:
+    let at_end = i == s.len
+    var sep = false
+    if not at_end: sep = s[i] == '/' or (sp and s[i] == '\\')
+    if at_end or sep:
+      let seg = s[seg_start..i]
+      if dotdot(seg):
+        # the crate never pops a drive letter ("c:", "c|")
+        if segs.len > 0 and not drive(segs[segs.len - 1]): segs.pop()
+        if at_end: segs.push("")
+      elif dot(seg):
+        if at_end: segs.push("")
+      else: segs.push(encode(seg, 4))
+      seg_start = i + 1
+    i += 1
+  var out = ""
+  for x in segs: out += "/" + x
+  return out
+
+# ---- hosts
+
+fn parse_host(h: Str, sp: Bool) -> Str throws:
+  if h.startswith("["):
+    if not h.endswith("]"): fail "invalid IPv6 address"
+    return "[" + ipv6(h[1..h.len - 1])? + "]"
+  let domain = decode(h)
+  let ascii = to_ascii(domain)?
+  if ends_in_number(ascii): return ipv4(ascii)?
+  return ascii
+
+fn forbidden_ascii(b: Byte) -> Bool:
+  return b < 32 or b == 127 or b == ' ' or b == '#' or b == '%' or b == '/' or b == ':' or b == '<' or b == '>' or b == '?' or b == '@' or b == '[' or b == '\\' or b == ']' or b == '^' or b == '|'
+
+# UTS #46 processing as the crate does it for a URL: each code point mapped (from the table), then
+# NFC, then each label that isn't ASCII written as punycode.
+fn to_ascii(domain: Str) -> Str throws:
+  let bad = "invalid international domain name"
+  var ascii = true
+  for i in 0..domain.len:
+    if domain[i] >= 128: ascii = false
+    elif forbidden_ascii(domain[i]): fail bad
+  if ascii: return checked_labels(lower_ascii(domain))?
+  if not domain.is_utf8(): fail bad
+  let t = table()
+  var mapped = ""
+  for c in domain.chars():
+    let cp = ord(c)
+    if cp < 128:
+      if forbidden_ascii(c[0]): fail bad
+      mapped += lower_ascii(c)
+    else:
+      let m = idna_map(t, cp)
+      if m.kind == 'X': fail bad
+      if m.kind == 'V' or m.kind == 'W': mapped += c
+      elif m.kind == 'M': mapped += chr(cp + m.delta)
+      elif m.kind == 'S': mapped += m.text
+  let norm = mapped.normalize("NFC")
+  var out: [Str] = []
+  for label in norm.split("."):
+    var la = true
+    for i in 0..label.len:
+      if label[i] >= 128: la = false
+    if la: out.push(label + "")
+    else:
+      # a label can't start with a combining mark
+      for c in label.chars():
+        if idna_map(t, ord(c)).kind == 'W': fail bad
+        break
+      out.push("xn--" + punycode(label))
+  return checked_labels(".".join(out))?
+
+# A label written as punycode must decode to a valid label that isn't all ASCII, as the crate checks.
+fn checked_labels(d: Str) -> Str throws:
+  let bad = "invalid international domain name"
+  if d.find("xn--") < 0: return d
+  let t = table()
+  for label in d.split("."):
+    if label.startswith("xn--"):
+      let back = unpunycode(label[4..label.len]) else fail bad
+      var ascii = true
+      var first = true
+      for c in back.chars():
+        let cp = ord(c)
+        if cp >= 128:
+          ascii = false
+          let k = idna_map(t, cp).kind
+          if k != 'V' and k != 'W': fail bad
+          if first and k == 'W': fail bad
+        elif (c[0] >= 'A' and c[0] <= 'Z') or forbidden_ascii(c[0]) or c[0] == '.': fail bad
+        first = false
+      if ascii: fail bad
+      if back.normalize("NFC") != back: fail bad
+  return d
+
+# ---- the table, read once
+
+type Mapping:
+  kind: Byte
+  delta: Int
+  text: Str
+
+type Table:
+  starts: [Int]
+  ends: [Int]
+  kinds: [Byte]
+  deltas: [Int]
+  texts: [Str]
+
+fn table() -> Table:
+  var t = Table([], [], [], [], [])
+  for line in idna_table.IDNA.split("\n"):
+    let f = line.split(" ")
+    if f.len < 3: continue
+    t.starts.push(hexnum(f[0]))
+    t.ends.push(hexnum(f[1]))
+    t.kinds.push(f[2][0])
+    var d = 0
+    var txt = ""
+    if f[2] == "M": d = int(f[3]) else 0
+    if f[2] == "S":
+      for h in f[3].split("+"): txt += chr(hexnum(h))
+    t.deltas.push(d)
+    t.texts.push(txt)
+  return t
+
+fn hexnum(s: Str) -> Int:
+  var n = 0
+  for i in 0..s.len: n = n * 16 + hexval(s[i])
+  return n
+
+fn idna_map(t: Table, cp: Int) -> Mapping:
+  var lo = 0
+  var hi = t.starts.len - 1
+  while lo <= hi:
+    let mid = (lo + hi) / 2
+    if cp < t.starts[mid]: hi = mid - 1
+    elif cp > t.ends[mid]: lo = mid + 1
+    else: return Mapping(t.kinds[mid], t.deltas[mid], t.texts[mid] + "")
+  return Mapping('V', 0, "")
+
+# ---- punycode (RFC 3492)
+
+const BASE = 36
+const TMIN = 1
+const TMAX = 26
+const SKEW = 38
+const DAMP = 700
+
+fn adapt(delta0: Int, n: Int, first: Bool) -> Int:
+  var delta = delta0 / 2
+  if first: delta = delta0 / DAMP
+  delta += delta / n
+  var k = 0
+  while delta > ((BASE - TMIN) * TMAX) / 2:
+    delta = delta / (BASE - TMIN)
+    k += BASE
+  return k + ((BASE - TMIN + 1) * delta) / (delta + SKEW)
+
+fn digit_char(d: Int) -> Str:
+  return "abcdefghijklmnopqrstuvwxyz0123456789"[d..d + 1]
+
+fn punycode(label: Str) -> Str:
+  var cps: [Int] = []
+  for c in label.chars(): cps.push(ord(c))
+  var out = ""
+  for cp in cps:
+    if cp < 128: out += chr(cp)
+  let b = out.len
+  var h = b
+  if b > 0: out += "-"
+  var n = 128
+  var delta = 0
+  var bias = 72
+  while h < cps.len:
+    var m = 0x10FFFF + 1
+    for cp in cps:
+      if cp >= n and cp < m: m = cp
+    delta += (m - n) * (h + 1)
+    n = m
+    for cp in cps:
+      if cp < n: delta += 1
+      if cp == n:
+        var q = delta
+        var k = BASE
+        while true:
+          var t = k - bias
+          if t < TMIN: t = TMIN
+          if t > TMAX: t = TMAX
+          if q < t: break
+          out += digit_char(t + (q - t) % (BASE - t))
+          q = (q - t) / (BASE - t)
+          k += BASE
+        out += digit_char(q)
+        bias = adapt(delta, h + 1, h == b)
+        delta = 0
+        h += 1
+    delta += 1
+    n += 1
+  return out
+
+fn unpunycode(s: Str) -> Str throws:
+  var out: [Int] = []
+  var at = rfind(s, "-")
+  var i0 = 0
+  if at > 0:
+    for j in 0..at:
+      if s[j] >= 128: fail "not ASCII"
+      out.push(int(s[j]))
+    i0 = at + 1
+  elif at == 0: i0 = 1
+  var n = 128
+  var i = 0
+  var bias = 72
+  var p = i0
+  while p < s.len:
+    let oldi = i
+    var w = 1
+    var k = BASE
+    while true:
+      if p >= s.len: fail "cut off"
+      let c = s[p]
+      p += 1
+      var d = -1
+      if c >= 'a' and c <= 'z': d = int(c) - 97
+      elif c >= 'A' and c <= 'Z': d = int(c) - 65
+      elif c >= '0' and c <= '9': d = int(c) - 22
+      if d < 0: fail "bad digit"
+      i += d * w
+      if i > 0x7FFFFFFF: fail "overflow"
+      var t = k - bias
+      if t < TMIN: t = TMIN
+      if t > TMAX: t = TMAX
+      if d < t: break
+      w = w * (BASE - t)
+      if w > 0x7FFFFFFF: fail "overflow"
+      k += BASE
+    bias = adapt(i - oldi, out.len + 1, oldi == 0)
+    n += i / (out.len + 1)
+    i = i % (out.len + 1)
+    if n > 0x10FFFF or (n >= 0xD800 and n < 0xE000): fail "not a code point"
+    out.push(0)
+    var j = out.len - 1
+    while j > i:
+      out[j] = out[j - 1]
+      j -= 1
+    out[i] = n
+    i += 1
+  var r = ""
+  for cp in out: r += chr(cp)
+  return r
+
+# ---- IPv4: the standard's "ends in a number", then its parser (0x hex, leading-0 octal)
+
+fn ends_in_number(d: Str) -> Bool:
+  var parts = d.split(".")
+  if parts.len > 0 and parts[parts.len - 1] == "":
+    if parts.len == 1: return false
+    parts.pop()
+  let last = parts[parts.len - 1]
+  if last == "": return false
+  var digits = true
+  for i in 0..last.len:
+    if not is_digit(last[i]): digits = false
+  if digits: return true
+  if last.len >= 2 and last[0] == '0' and (last[1] == 'x' or last[1] == 'X'):
+    for i in 2..last.len:
+      if hexval(last[i]) < 0: return false
+    return true
+  return false
+
+fn ipv4_part(p: Str) -> Int throws:
+  let bad = "invalid IPv4 address"
+  if p == "": fail bad
+  var radix = 10
+  var s = p + ""
+  if s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X'):
+    radix = 16
+    s = s[2..s.len]
+  elif s.len >= 2 and s[0] == '0':
+    radix = 8
+    s = s[1..s.len]
+  if s == "": return 0
+  var n = 0
+  for i in 0..s.len:
+    let d = hexval(s[i])
+    if d < 0 or d >= radix: fail bad
+    n = n * radix + d
+    if n > 0xFFFFFFFF: fail bad
+  return n
+
+fn ipv4(d: Str) -> Str throws:
+  let bad = "invalid IPv4 address"
+  var parts = d.split(".")
+  if parts[parts.len - 1] == "" and parts.len > 1: parts.pop()
+  if parts.len > 4: fail bad
+  var nums: [Int] = []
+  for p in parts: nums.push(ipv4_part(p)?)
+  for i in 0..nums.len - 1:
+    if nums[i] > 255: fail bad
+  let last = nums[nums.len - 1]
+  if last >= 1 << (8 * (5 - nums.len)): fail bad
+  var v = last
+  for i in 0..nums.len - 1: v += nums[i] << (8 * (3 - i))
+  return "{(v >> 24) & 255}.{(v >> 16) & 255}.{(v >> 8) & 255}.{v & 255}"
+
+# ---- IPv6: the standard's parser and serializer
+
+fn ipv6(s: Str) -> Str throws:
+  let pieces = ipv6_pieces(s)?
+  return ipv6_text(pieces)
+
+fn ipv6_pieces(s: Str) -> [Int] throws:
+  let bad = "invalid IPv6 address"
+  var a = [0, 0, 0, 0, 0, 0, 0, 0]
+  var pi = 0
+  var compress = -1
+  var p = 0
+  if s.len > 0 and s[0] == ':':
+    if s.len < 2 or s[1] != ':': fail bad
+    p = 2
+    pi = 1
+    compress = 1
+  while p < s.len:
+    if pi == 8: fail bad
+    if s[p] == ':':
+      if compress >= 0: fail bad
+      p += 1
+      pi += 1
+      compress = pi
+      continue
+    var v = 0
+    var len = 0
+    while len < 4 and p < s.len and hexval(s[p]) >= 0:
+      v = v * 16 + hexval(s[p])
+      p += 1
+      len += 1
+    if p < s.len and s[p] == '.':
+      if len == 0: fail bad
+      p -= len
+      if pi > 6: fail bad
+      var seen = 0
+      while p < s.len:
+        var val = -1
+        if seen > 0:
+          if s[p] == '.' and seen < 4: p += 1
+          else: fail bad
+        if p >= s.len or not is_digit(s[p]): fail bad
+        while p < s.len and is_digit(s[p]):
+          let n = int(s[p]) - 48
+          if val < 0: val = n
+          elif val == 0: fail bad
+          else: val = val * 10 + n
+          if val > 255: fail bad
+          p += 1
+        a[pi] = a[pi] * 256 + val
+        seen += 1
+        if seen == 2 or seen == 4: pi += 1
+      if seen != 4: fail bad
+      break
+    elif p < s.len and s[p] == ':':
+      p += 1
+      if p >= s.len: fail bad
+    elif p < s.len: fail bad
+    a[pi] = v
+    pi += 1
+  if compress >= 0:
+    var swaps = pi - compress
+    pi = 7
+    while pi != 0 and swaps > 0:
+      a.swap(pi, compress + swaps - 1)
+      pi -= 1
+      swaps -= 1
+  elif pi != 8: fail bad
+  return a
+
+fn ipv6_text(a: [Int]) -> Str:
+  # the longest run of two or more zero pieces (the first of equal ones) becomes "::"
+  var best = -1
+  var best_len = 1
+  var i = 0
+  while i < 8:
+    if a[i] == 0:
+      var j = i
+      while j < 8 and a[j] == 0: j += 1
+      if j - i > best_len:
+        best = i
+        best_len = j - i
+      i = j
+    else: i += 1
+  var out = ""
+  var k = 0
+  var ignore0 = false
+  while k < 8:
+    if ignore0 and a[k] == 0:
+      k += 1
+      continue
+    ignore0 = false
+    if best == k:
+      if k == 0: out += "::"
+      else: out += ":"
+      ignore0 = true
+      k += 1
+      continue
+    out += hex_lower(a[k])
+    if k != 7: out += ":"
+    k += 1
+  return out
+
+fn hex_lower(v: Int) -> Str:
+  if v == 0: return "0"
+  var s = ""
+  var x = v
+  while x > 0:
+    s = "0123456789abcdef"[x & 15..(x & 15) + 1] + s
+    x = x >> 4
+  return s
+
+# ---- resolving a reference (a redirect's Location) against a URL
+
+fn join(base: Url, ref: Str) -> Url throws:
+  let r = clean(ref)
+  # an absolute URL
+  var colon = -1
+  if r.len > 0 and is_alpha(r[0]):
+    for i in 1..r.len:
+      let b = r[i]
+      if b == ':':
+        colon = i
+        break
+      if not (is_alpha(b) or is_digit(b) or b == '+' or b == '-' or b == '.'): break
+  if colon >= 0:
+    let sch = lower_ascii(r[0..colon])
+    # "http:path" relative to an http URL is relative (the standard's special-relative case)
+    if not (sch == base.scheme and special(sch) and not (r.len > colon + 1 and (r[colon + 1] == '/' or r[colon + 1] == '\\'))):
+      return parse(r)?
+    return join(base, r[colon + 1..r.len])?
+  let sp = special(base.scheme)
+  if r.startswith("//") or (sp and r.len >= 2 and (r[0] == '/' or r[0] == '\\') and (r[1] == '/' or r[1] == '\\')):
+    return parse(base.scheme + ":" + r)?
+  var u = copy(base)
+  u.has_fragment = false
+  u.fragment = ""
+  var body = r + ""
+  let hash = body.find("#")
+  if hash >= 0:
+    u.has_fragment = true
+    u.fragment = encode(body[hash + 1..body.len], 1)
+    body = body[0..hash]
+  if body == "": return u
+  if body.startswith("?"):
+    u.has_query = true
+    var set = 2
+    if sp: set = 3
+    u.query = encode(body[1..body.len], set)
+    return u
+  u.has_query = false
+  u.query = ""
+  var q = body.find("?")
+  if q < 0: q = body.len
+  var p = body[0..q]
+  if not (p.startswith("/") or (sp and p.startswith("\\"))):
+    # relative to the base's directory
+    let dir_end = rfind(u.path, "/")
+    var d = ""
+    if dir_end >= 0: d = u.path[0..dir_end + 1]
+    else: d = "/"
+    p = d + p
+  u.path = path(p, sp)
+  if q < body.len:
+    u.has_query = true
+    var set = 2
+    if sp: set = 3
+    u.query = encode(body[q + 1..body.len], set)
+  return u
+
+# A URL as httpx reads one given as text (the fetch prompt's URL, which pydantic doesn't rewrite):
+# parsed as above, but the host kept as written (lowercased), so 0x7f.1 stays 0x7f.1.
+fn parse_httpx(input: Str) -> Url throws:
+  var u = parse(input)?
+  let s = clean(input)
+  let i = s.find("://")
+  if i < 0 or not special(u.scheme): return u
+  var end = s.len
+  for j in i + 3..s.len:
+    if s[j] == '/' or s[j] == '?' or s[j] == '#' or s[j] == '\\':
+      end = j
+      break
+  var hp = s[i + 3..end]
+  let at = rfind(hp, "@")
+  if at >= 0: hp = hp[at + 1..hp.len]
+  if hp.startswith("["):
+    let close = hp.find("]")
+    if close > 0: u.host = lower_ascii(hp[0..close + 1])
+    return u
+  let colon = hp.find(":")
+  if colon >= 0: hp = hp[0..colon]
+  for k in 0..hp.len:
+    if hp[k] >= 128 or hp[k] == '%': return u
+  if hp != "": u.host = lower_ascii(hp)
+  return u
