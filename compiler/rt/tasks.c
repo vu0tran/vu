@@ -100,6 +100,7 @@ static void vu_sock_flags(int fd) { (void)fd; }
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <limits.h>
 #if defined(__SANITIZE_ADDRESS__)
 #define VU_ASAN_FIBERS 1
@@ -1317,6 +1318,40 @@ static bool vu_net_connect(vu_cap net, const vu_str *host, int64_t port, double 
     bool ok = vu_connect_to(h, port, deadline, out, err, line);
     free(h);
     return ok;
+}
+/* net.resolve(host): the addresses a name stands for, as text ("93.184.215.14", "2606:2800::1"), in the
+   order connect would try them, each once. An address resolves to itself. */
+static bool vu_net_resolve(vu_cap net, const vu_str *host, double timeout, bool has, vu_str **out, int64_t *count,
+                           vu_str *err, int line) {
+    (void)net;
+    vu_task_here("net.resolve()", line);
+    char *h = vu_cpath(host, err);
+    if (!h) { drop_Str(err); *err = vu_errf("a host name can't contain a zero byte"); return false; }
+    if (!*h) { free(h); *err = vu_errf("can't look up an empty host name"); return false; }
+    int64_t deadline = vu_deadline(timeout, has, line);
+    struct addrinfo *res = NULL;
+    bool ok = vu_resolve(h, 80, deadline, &res, err, line);
+    free(h);
+    if (!ok) return false;
+    int64_t n = 0, cap = 4;
+    vu_str *items = (vu_str *)vu_malloc((size_t)cap * sizeof(vu_str));
+    for (struct addrinfo *a = res; a; a = a->ai_next) {
+        char buf[INET6_ADDRSTRLEN + 1];
+        const void *src = NULL;
+        if (a->ai_family == AF_INET) src = &((struct sockaddr_in *)a->ai_addr)->sin_addr;
+        else if (a->ai_family == AF_INET6) src = &((struct sockaddr_in6 *)a->ai_addr)->sin6_addr;
+        if (!src || !inet_ntop(a->ai_family, src, buf, sizeof buf)) continue;
+        bool seen = false;
+        for (int64_t i = 0; i < n && !seen; i++)
+            seen = items[i].len == (int64_t)strlen(buf) && memcmp(items[i].data, buf, (size_t)items[i].len) == 0;
+        if (seen) continue;
+        if (n == cap) { cap *= 2; vu_str *m = (vu_str *)vu_malloc((size_t)cap * sizeof(vu_str)); memcpy(m, items, (size_t)n * sizeof(vu_str)); free(items); items = m; }
+        items[n++] = vu_str_from_c(buf);
+    }
+    freeaddrinfo(res);
+    *out = items;
+    *count = n;
+    return true;
 }
 #ifndef VU_TLS
 static int vu_tls_pending(vu_sock *s) { (void)s; return 0; }

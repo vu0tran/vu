@@ -620,6 +620,11 @@ fn main(net: Net) throws:
   other tasks run. It never kills the program when the other side has gone away.
 - `connect` looks names up on a helper thread (other tasks keep running) and tries each
   address the name has.
+- `net.resolve(host) -> [Str]` (it can fail; takes `timeout:`) gives the addresses a name stands
+  for, as text (`"127.0.0.1"`, `"::1"`), in the order `connect` tries them. An address resolves to
+  itself, and the C library's older spellings of one are read as it reads them (`"0x7f.1"` is
+  `127.0.0.1`), so check the addresses it returns, not the text. A program that must refuse some addresses (a fetcher that stays off the local network)
+  resolves first, checks, then connects to the address it checked.
 - When the process runs out of file descriptors, `accept` waits and tries again until a
   connection is closed.
 
