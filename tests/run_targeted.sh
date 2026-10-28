@@ -4,6 +4,8 @@
 #   output TEXT  the program prints exactly TEXT, with no AddressSanitizer/LeakSanitizer/UBSan report
 #   panic MSG    the program stops with exit code 101 and MSG, instead of corrupting memory
 #   compile MS   Vu's front end (not the C compiler) finishes within MS milliseconds
+# leak checking (LeakSanitizer) where the platform has it: not on macOS
+leaks=detect_leaks=1; [ "$(uname)" = Darwin ] && leaks=detect_leaks=0
 cd "$(dirname "$0")"
 # The compiler under test: ../vu (compiler/vuc) by default, or another build of it (VU=/path/to/vuc).
 VU=${VU:-"$PWD/../vu"}
@@ -38,7 +40,7 @@ for f in targeted/${ONLY:-*}.vu; do   # ONLY=5[12]*_iface* runs some
   else
     if [ $code -ne 0 ]; then ok=0; why="failed to compile: $out"
     else
-      got=$(cd "$work" && ASAN_OPTIONS=detect_leaks=1 timeout 20 ./prog $args 2>"$work/err"); rc=$?
+      got=$(cd "$work" && ASAN_OPTIONS=$leaks timeout 20 ./prog $args 2>"$work/err"); rc=$?
       reports=$(grep -c 'ERROR\|runtime error' "$work/err")
       if [ $rc -eq 124 ]; then ok=0; why="HUNG (killed after 20 s)"
       elif [ "$got" = "$want" ] && [ $rc -eq 0 ] && [ "$reports" -eq 0 ]; then ok=1; why="ran correctly, sanitizers clean"

@@ -3,6 +3,8 @@
 # against the reference Node server on three seeds (tests/run_mcp.py). The reference is installed with
 # npm into tests/.mcp_ref the first time (or point MCP_REF at its dist/index.js); without node or npm the
 # comparison is skipped and only a smoke test runs.
+# leak checking (LeakSanitizer) where the platform has it: not on macOS
+leaks=detect_leaks=1; [ "$(uname)" = Darwin ] && leaks=detect_leaks=0
 d="$(cd "$(dirname "$0")" && pwd)"
 top="$d/.."
 work=$(mktemp -d)
@@ -16,7 +18,7 @@ fi
 if [ -f "$ref" ] && command -v node >/dev/null 2>&1; then
   for b in plain san; do
     for s in 1 2 3; do
-      ASAN_OPTIONS=detect_leaks=1 python3 "$d/run_mcp.py" "$work/$b" "$ref" --seed $s --rounds 300 || exit 1
+      ASAN_OPTIONS=$leaks python3 "$d/run_mcp.py" "$work/$b" "$ref" --seed $s --rounds 300 || exit 1
     done
   done
 else
