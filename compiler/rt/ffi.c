@@ -1,7 +1,8 @@
 /* The C side of extern blocks (SPEC.md, Calling C). A glue file can use these, vu_str, and
    vu_errf(fmt, ...) to build error messages. */
-/* Inside a par loop? Only programs with par loops are built with OpenMP (VU_PAR is defined then). */
-#ifdef VU_PAR
+/* Inside a par loop? Only programs with par loops are built with OpenMP (VU_PAR is defined then;
+   without an OpenMP compiler, as Apple's clang without libomp, par loops run on one thread). */
+#if defined(VU_PAR) && defined(_OPENMP)
 #include <omp.h>
 #define vu_in_par() omp_in_parallel()
 #else

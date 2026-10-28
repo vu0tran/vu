@@ -132,8 +132,9 @@ const char *__asan_default_options(void) { return "detect_stack_use_after_return
 #else
 #include <ucontext.h>
 #endif
-/* Inside a par loop? Only programs with par loops are built with OpenMP (VU_PAR is defined then). */
-#ifdef VU_PAR
+/* Inside a par loop? Only programs with par loops are built with OpenMP (VU_PAR is defined then;
+   without an OpenMP compiler, as Apple's clang without libomp, par loops run on one thread). */
+#if defined(VU_PAR) && defined(_OPENMP)
 #include <omp.h>
 #define vu_in_par() omp_in_parallel()
 #else
