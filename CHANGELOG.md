@@ -1561,6 +1561,30 @@ export OMP_TOOL_LIBRARIES=/usr/lib/llvm-18/lib/libarcher.so TSAN_OPTIONS=suppres
 CC=clang python3 vu.py build examples/mandelbrot.vu --tsan -o mb && ./mb 500
 ```
 
+## Round 15: the compiler in a browser
+
+The compiler builds to WebAssembly, so vulang.org can check and format Vu as you type, with nothing
+installed and nothing sent anywhere.
+
+- `tools/wasm.sh` compiles `vuc_seed.c` with zig for `wasm32-wasi`. The runtime needed a WASI case in a
+  few places (`#ifdef __wasi__`, so native builds are unchanged): no stack-overflow handler (no signals),
+  no thread for `main` (it runs on the wasm stack, 64 MB), `flockfile` as a no-op (one thread),
+  `getentropy` for random bytes (as on macOS), and `fs.temp_dir`, `os.output` and `os.run` fail with
+  "not available in WebAssembly". So `vuc check` and `vuc fmt` work, and `build` and `run` stop at
+  the temporary folder they can't make.
+- Size: 1.9 MB with `-Os` (12.5 MB at `-O2` with symbols), 477 KB gzipped. Checking a small program in
+  Chrome takes 2 to 60 ms after the first load; `import http` (which reads std/http.vu and h2.vu) 0.5 s.
+- `tests/run_wasm.sh` (in the gate, skipped without zig and Python's `wasmtime`) runs `check` and `fmt`
+  under wasmtime on all 637 targeted programs and the examples and compares exit status, messages and
+  the formatted file with the native compiler: 1,288 of 1,288 the same.
+- The one difference it found: the compiler recurses as deep as the program nests, and a wasm stack is
+  small (wasmtime's at most 2 MB, a browser's about 1 MB), so 52_deep_nesting traps instead of reporting
+  "nested too deeply". The suite counts that trap as the error; the playground reports it as "nested too
+  deeply to check in the browser". In Chrome that happens past about 500 levels of nested parentheses
+  (native: 4,000).
+- Node 22's built-in `wasi` module crashed (a segmentation fault in node) when the compiler exited with
+  status 1; wasmtime and browser_wasi_shim (what the playground uses) don't. Not chased further.
+
 ## Limits of v0
 
 - No methods. Strings are bytes, read as UTF-8 by the text functions. Linux on x86-64 and ARM64;

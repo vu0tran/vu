@@ -12,8 +12,10 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/random.h>
+#if defined(__APPLE__) || defined(__wasi__)
 #ifdef __APPLE__
 #define fwrite_unlocked fwrite
+#endif
 /* macOS has getentropy (at most 256 bytes a call) instead of getrandom */
 static ssize_t getrandom(void *buf, size_t n, unsigned flags) {
     (void)flags;
@@ -23,10 +25,19 @@ static ssize_t getrandom(void *buf, size_t n, unsigned flags) {
 #endif
 #include <signal.h>
 #include <unistd.h>
-#include <sys/resource.h>
 #include <pthread.h>
+#ifdef __wasi__
+/* WebAssembly (WASI): one thread, no processes, no signals. The checker and formatter run there
+   (the playground); what needs the rest reports an error. */
+#define VU_WASI 1
+#define flockfile(f) ((void)(f))
+#define funlockfile(f) ((void)(f))
+#define pause() _Exit(101)
+#else
+#include <sys/resource.h>
 #include <spawn.h>
 #include <sys/wait.h>
+#endif
 #include <dirent.h>
 #include <sys/stat.h>
 extern char **environ;
@@ -906,6 +917,7 @@ static __thread void *vu_t_alt;
 static __thread bool vu_t_guarded;
 __attribute__((cold, noinline)) static void vu_thread_guard_slow(void) {
     vu_t_guarded = true;
+#ifndef VU_WASI
     pthread_attr_t at;
     void *addr;
     size_t sz;
@@ -927,6 +939,7 @@ __attribute__((cold, noinline)) static void vu_thread_guard_slow(void) {
     if (!vu_t_alt) return;
     stack_t ss = {.ss_sp = vu_t_alt, .ss_size = 1 << 16, .ss_flags = 0};
     sigaltstack(&ss, NULL);
+#endif
 }
 /* Each type of tree node has a free list per thread. Nodes built on one thread and freed on another
    (par loops) would pile up on the freeing thread's list while the building thread carves new ones,
@@ -943,6 +956,9 @@ static inline void vu_thread_guard(void) {
     vu_share_free();
 #endif
 }
+#ifdef VU_WASI
+static void vu_guard_init(void *top) { vu_stack_top = (uintptr_t)top; }
+#else
 static void vu_segv(int sig, siginfo_t *si, void *ctx) {
     (void)sig; (void)ctx;
     uintptr_t a = (uintptr_t)si->si_addr;
@@ -969,6 +985,7 @@ static void vu_guard_init(void *top) {
     sigemptyset(&sa.sa_mask);
     if (sigaltstack(&ss, NULL) == 0) { sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); }
 }
+#endif
 #define VU_SMALL_MAP 16
 /* main runs on a thread with a 256 MB stack (reserved, not committed), so deeply recursive code such
    as parsers and compilers works; recursion past that still stops cleanly with "stack overflow". */
@@ -996,6 +1013,7 @@ static int vu_start(int argc, char **argv, int (*fn)(void), const char *const *f
     vu_seed_init();
     vu_guard_init(__builtin_frame_address(0));
     vu_main_fn = fn;
+#ifndef VU_WASI
     pthread_attr_t at;
     pthread_t t;
     if (pthread_attr_init(&at) == 0 && pthread_attr_setstacksize(&at, VU_MAIN_STACK) == 0 &&
@@ -1003,6 +1021,7 @@ static int vu_start(int argc, char **argv, int (*fn)(void), const char *const *f
         pthread_join(t, NULL);
         return vu_main_rc;
     }
+#endif
     int rc = fn();   /* no thread available: run on the normal stack */
     vu_report_lock();
     return rc;
@@ -1139,7 +1158,11 @@ static bool vu_fs_temp_dir(vu_cap fs, vu_str *out, vu_str *err) {
     if (!base || !*base) base = "/tmp";
     char buf[4096];
     if (snprintf(buf, sizeof buf, "%s/vu-XXXXXX", base) >= (int)sizeof buf) { *err = vu_errf("TMPDIR is too long"); return false; }
+#ifdef VU_WASI
+    *err = vu_errf("fs.temp_dir: not available in WebAssembly"); return false;
+#else
     if (!mkdtemp(buf)) { *err = vu_errf("can't make a temporary directory in '%.1000s': %s", base, strerror(errno)); return false; }
+#endif
     *out = vu_str_from_c(buf);
     return true;
 }
@@ -1271,6 +1294,12 @@ static bool vu_os_output(vu_cap os, const vu_str *items, int64_t n, vu_str *out,
         }
     }
     argv[n] = NULL;
+#ifdef VU_WASI
+    *err = vu_errf("can't run '%.1000s': not available in WebAssembly", argv[0]);
+    for (int64_t i = 0; i < n; i++) free(argv[i]);
+    free(argv);
+    return false;
+#else
     int fds[2];
     if (pipe(fds) != 0) { *err = vu_errf("can't make a pipe: %s", strerror(errno)); for (int64_t i = 0; i < n; i++) free(argv[i]); free(argv); return false; }
     posix_spawn_file_actions_t fa;
@@ -1303,6 +1332,7 @@ static bool vu_os_output(vu_cap os, const vu_str *items, int64_t n, vu_str *out,
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
     *out = s;
     return true;
+#endif
 }
 /* os.read_stdin(n): up to n bytes from standard input, as they arrive; "" at its end. */
 static bool vu_os_read_stdin(vu_cap os, int64_t n, vu_str *out, vu_str *err) {
@@ -1335,6 +1365,13 @@ static bool vu_os_run(vu_cap os, const vu_str *items, int64_t n, int64_t *out, v
         }
     }
     argv[n] = NULL;
+#ifdef VU_WASI
+    *err = vu_errf("can't run '%.1000s': not available in WebAssembly", argv[0]);
+    for (int64_t i = 0; i < n; i++) free(argv[i]);
+    free(argv);
+    (void)out;
+    return false;
+#else
     fflush(stdout);
     fflush(stderr);
     pid_t pid;
@@ -1350,6 +1387,7 @@ static bool vu_os_run(vu_cap os, const vu_str *items, int64_t n, int64_t *out, v
     }
     *out = WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
     return true;
+#endif
 }
 static bool vu_fs_write(vu_cap fs, const vu_str *path, const uint8_t *data, int64_t n, vu_str *err) {
     (void)fs;

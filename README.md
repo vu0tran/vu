@@ -313,7 +313,8 @@ not, two allocators) that must print the same, JSON tests, memory tests, and net
 HTTP/2 and WebSocket tests against Python's libraries and hand-made hostile input (including the
 known HTTP/2 attacks), a real PostgreSQL server and a fake hostile one, text, regular expressions,
 paths and hashing compared with Python on random input, the targeted programs again on ARM64 under
-qemu, and macOS builds (12 minutes on a 2-core machine when little has changed, 26 when everything
+qemu, macOS builds, and the compiler built to WebAssembly checked against the native one on all
+1,288 checks and formats of the targeted programs (12 minutes on a 2-core machine when little has changed, 26 when everything
 is rebuilt; CHANGELOG.md, round 14). Each runs under
 AddressSanitizer, UBSan and LeakSanitizer, and the threaded programs also run under
 ThreadSanitizer. The compiler compiles itself, and every rebuild must reach a fixed point (stages
@@ -322,7 +323,9 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 
 ## Limits
 
-- Linux on x86-64 and ARM64. macOS (kqueue) builds for ARM64 and x86-64 but hasn't been run on a
+- Linux on x86-64 and ARM64. The compiler also builds to WebAssembly (`tools/wasm.sh`), where it
+  checks and formats but can't build or run programs: that's the playground on vulang.org.
+- macOS (kqueue) builds for ARM64 and x86-64 but hasn't been run on a
   Mac.
 - Strings are bytes. Text functions (`chars()`, `upper()`, `ord`...) read them as UTF-8; there is
   no Unicode normalization and no character classes (`isalpha`).

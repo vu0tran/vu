@@ -848,6 +848,12 @@ vu lsp                      # a language server for editors (diagnostics, format
   programs under qemu); `CC=aarch64-linux-gnu-gcc VU_MARCH= vu build ...` cross-compiles. The runtime
   also has a macOS port (kqueue in place of epoll) that compiles and links for macOS on x86-64 and
   ARM64 but hasn't been run on a Mac; `par` loops there need clang with libomp.
+- **WebAssembly**: `tools/wasm.sh` builds the compiler itself for WASI (with zig): `vuc.wasm` runs
+  `check` and `fmt` in a browser or any WASI runtime, with the standard library given as `/std`
+  (`VU_STD=/std`). It's what the playground on vulang.org runs. `tests/run_wasm.sh` checks that it
+  gives the same errors and formatting as the native compiler on every targeted test. Building and
+  running programs there isn't possible (no processes, no C compiler), and a program nested more
+  than a few hundred levels deep runs out of a browser's stack.
 
 Every compile error comes from Vu's own front end, before the C compiler runs, so `vu check`
 gives the same errors as a build. For an edit-and-fix loop, `check` while fixing errors and
