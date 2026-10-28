@@ -45,7 +45,7 @@ fn main():
 | `Bool` | `true` / `false` |
 | `Byte` | 0..255, one byte in memory. Literals: `65`, `0x41` or `'A'`. Overflow stops the program. |
 | `Str` | an owned string of bytes: `s.len`, `s[i]` (a Byte), `s[a..b]` (a new Str), `+`, `+=`, `== <`, `s.reserve(n)` |
-| `[T]` | growable list: `xs.len`, `xs.push(v)`, `xs.pop()` (removes and returns the last element; stops the program if empty), `xs.truncate(n)` (keeps the first n), `xs[i]` (bounds-checked), `xs.reserve(n)` |
+| `[T]` | growable list: `xs.len`, `xs.push(v)`, `xs.pop()` (removes and returns the last element; stops the program if empty), `xs.truncate(n)` (keeps the first n), `xs.copy_within(to, from, n)` (as memmove; plain values only), `xs[i]` (bounds-checked), `xs.reserve(n)` |
 | `T?` | optional: either a `T` or `nil` (`Int?`, `Str?`, `[T]?`, a struct or enum...; not a capability or another optional). Recursive types must use it (or a list or map). Read it with `if x = opt:` or `opt else default` (see Errors). |
 | `{K: V}` | map from Int, Byte, Bool or Str keys to any value (see Maps) |
 | `type Name:` | a struct, fields listed below it (`x, y: Float` declares two fields) |
@@ -56,6 +56,10 @@ Structs are built with positional or named arguments: `Body(1, 2)` or `Body(x: 1
 `s.reserve(n)` and `xs.reserve(n)` make room for `n` more bytes or elements up front, so a
 string or list built in a loop of known length grows without reallocating (a negative `n`
 stops the program).
+Bytes in bulk, each checked once: `s.read_le(at, n)` and `s.read_be(at, n)` read n bytes (1 to 8) of a
+`Str` or `[Byte]` as an Int, least or most significant first (8 bytes give all 64 bits, so the Int
+may be negative), and `bs.take_str()` turns a `[Byte]` list into a `Str` without copying it,
+leaving the list empty.
 Integer literals become a Float or Byte where one is expected. Other conversions are explicit:
 `float(i)`, `int(f)`, `int(b)`, `byte(i)` (stops the program if i isn't 0..255).
 

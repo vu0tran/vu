@@ -226,29 +226,30 @@ static inline int64_t vu_len(int64_t n) {
 }
 /* Integer arithmetic is checked: overflow stops the program instead of silently wrapping. */
 __attribute__((noreturn, cold, noinline)) static void vu_overflow(int line) { vu_fail(line, "integer overflow"); }
-static inline int64_t vu_add(int64_t a, int64_t b, int line) {
+/* (always inline: in a big function gcc may call it instead) */
+static inline __attribute__((always_inline)) int64_t vu_add(int64_t a, int64_t b, int line) {
     /* With a constant step (i += 1) the check is a plain comparison, which the C compiler can prove
        false from a loop condition like i < n and remove. */
     if (__builtin_constant_p(b) && b >= 0) { if (__builtin_expect(a > INT64_MAX - b, 0)) vu_overflow(line); return a + b; }
     if (__builtin_constant_p(b) && b < 0) { if (__builtin_expect(a < INT64_MIN - b, 0)) vu_overflow(line); return a + b; }
     int64_t r; if (__builtin_expect(__builtin_add_overflow(a, b, &r), 0)) vu_overflow(line); return r;
 }
-static inline int64_t vu_sub(int64_t a, int64_t b, int line) {
+static inline __attribute__((always_inline)) int64_t vu_sub(int64_t a, int64_t b, int line) {
     int64_t r; if (__builtin_expect(__builtin_sub_overflow(a, b, &r), 0)) vu_overflow(line); return r;
 }
-static inline int64_t vu_mul(int64_t a, int64_t b, int line) {
+static inline __attribute__((always_inline)) int64_t vu_mul(int64_t a, int64_t b, int line) {
     int64_t r; if (__builtin_expect(__builtin_mul_overflow(a, b, &r), 0)) vu_overflow(line); return r;
 }
-static inline int64_t vu_neg(int64_t a, int line) {
+static inline __attribute__((always_inline)) int64_t vu_neg(int64_t a, int line) {
     if (__builtin_expect(a == INT64_MIN, 0)) vu_overflow(line);
     return -a;
 }
-static inline int64_t vu_div(int64_t a, int64_t b, int line) {
+static inline __attribute__((always_inline)) int64_t vu_div(int64_t a, int64_t b, int line) {
     if (__builtin_expect(b == 0, 0)) vu_fail(line, "division by zero");
     if (__builtin_expect(b == -1 && a == INT64_MIN, 0)) vu_overflow(line);
     return a / b;
 }
-static inline int64_t vu_mod(int64_t a, int64_t b, int line) {
+static inline __attribute__((always_inline)) int64_t vu_mod(int64_t a, int64_t b, int line) {
     if (__builtin_expect(b == 0, 0)) vu_fail(line, "division by zero");
     if (__builtin_expect(b == -1 && a == INT64_MIN, 0)) vu_overflow(line);
     return b == -1 ? 0 : a % b;
@@ -276,11 +277,11 @@ static inline uint8_t vu_bshr(uint8_t a, int64_t b, int line) {
     if (__builtin_expect((uint64_t)b > 7, 0)) vu_fail(line, "Byte shift by %lld", (long long)b);
     return (uint8_t)(a >> b);
 }
-static inline int64_t vu_shl(int64_t a, int64_t b, int line) {
+static inline __attribute__((always_inline)) int64_t vu_shl(int64_t a, int64_t b, int line) {
     if (__builtin_expect((uint64_t)b > 63, 0)) vu_fail(line, "shift by %lld", (long long)b);
     return (int64_t)((uint64_t)a << b);
 }
-static inline int64_t vu_shr(int64_t a, int64_t b, int line) {
+static inline __attribute__((always_inline)) int64_t vu_shr(int64_t a, int64_t b, int line) {
     if (__builtin_expect((uint64_t)b > 63, 0)) vu_fail(line, "shift by %lld", (long long)b);
     return a >> b;
 }
@@ -536,6 +537,48 @@ static int vu_str_cmp(const vu_str *a, const vu_str *b) {
     int64_t n = a->len < b->len ? a->len : b->len;
     int c = n ? memcmp(a->data, b->data, (size_t)n) : 0;
     return c ? c : (a->len > b->len) - (a->len < b->len);
+}
+/* s.read_le(at, n) / s.read_be(at, n): n bytes (1..8) at at as an Int, checked once. */
+static inline int64_t vu_read_int(const uint8_t *p, int64_t len, int64_t at, int64_t n, int big, int line) {
+    if (__builtin_expect(n < 1 || n > 8 || at < 0 || at > len - n, 0))
+        vu_fail(line, "%s(%lld, %lld) on %lld bytes", big ? "read_be" : "read_le", (long long)at, (long long)n, (long long)len);
+    uint64_t v = 0;
+    if (n == 8) {
+        memcpy(&v, p + at, 8);
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        if (!big) v = __builtin_bswap64(v);
+#else
+        if (big) v = __builtin_bswap64(v);
+#endif
+    } else if (big) {
+        for (int64_t k = 0; k < n; k++) v = v << 8 | p[at + k];
+    } else {
+        for (int64_t k = 0; k < n; k++) v |= (uint64_t)p[at + k] << (8 * k);
+    }
+    return (int64_t)v;
+}
+/* A [Byte] list's bytes as a Str (bs.take_str()), leaving the list empty: a buffer over 256 bytes is
+   handed over as it is (the Str allocator frees those with free(), as lists do); smaller ones are
+   copied, since short Str buffers live in size classes. */
+static vu_str vu_take_str(uint8_t **data, int64_t *len, int64_t *cap) {
+    vu_str s;
+    if (*cap > 256 && *len > 256) {
+        s.data = *data; s.len = *len; s.cap = *cap;
+        if (*cap - *len > *len / 16) {   /* (a list that grew by doubling: give the unused end back) */
+            uint8_t *d = (uint8_t *)realloc(s.data, (size_t)*len);
+            if (d) { s.data = d; s.cap = *len; }
+        }
+    } else if (*len == 0) {
+        s = vu_str_lit("", 0);
+        free(*data);
+    } else {
+        int64_t c = *len;
+        s.data = vu_salloc(&c); s.len = *len; s.cap = c;
+        memcpy(s.data, *data, (size_t)*len);
+        free(*data);
+    }
+    *data = NULL; *len = 0; *cap = 0;
+    return s;
 }
 /* A string read in a tried loop (vu_vf_add above): out of range records a failure and reads 0. */
 static inline uint8_t vu_vf_str_at(const vu_str *s, int64_t i, uint64_t *f) {

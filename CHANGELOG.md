@@ -1317,6 +1317,45 @@ Attack rounds:
    not joined at exit. The compiler before this round does the same (2 runs in 40; this one 1 in 40):
    not a Vu thread, so it's suppressed now (0 in 60).
 
+## Round 13: bytes in bulk
+
+std/zlib was 1.7–2.1x C zlib's time, and Rust's pure-Rust decoder (flate2 with miniz_oxide, memory-safe
+like Vu) 1.4x. The difference was things Rust can say and Vu couldn't: read 8 bytes at once, copy a
+range, and keep a buffer as the result. Three built-ins, each one checked operation:
+
+- `s.read_le(at, n)` and `s.read_be(at, n)`, on a `Str` or `[Byte]`: n bytes (1 to 8) as an Int. The
+  decoder refills its bit buffer from one 8-byte read instead of one byte at a time.
+- `xs.copy_within(to, from, n)`: memmove, after one check that both ranges are in the list (plain
+  values only). The decoder copies a long match in blocks, and a short one as a fixed 16 bytes, which
+  gcc turns into two moves (the output keeps 16 bytes to spare; what lands past the match is
+  overwritten later).
+- `bs.take_str()`: a `[Byte]` list's bytes as a `Str`, the list left empty. A buffer over 256 bytes is
+  handed over as it is (with its unused end given back with realloc); smaller ones are copied, since
+  short `Str` buffers live in the allocator's size classes and need buffers of their size. The result
+  isn't copied any more.
+
+The decoder also unrolls adler32 by 8 (every add still checked once before the loop), and the Int
+helpers (`vu_add` and the rest) are now always inlined: in the decoder's big function gcc had been
+calling `vu_add`.
+
+`bench/zlib/compare.sh`, same inputs as round 12 (this run's C is a little faster than then):
+
+| | C zlib | Rust (flate2, pure Rust) | Go | **Vu** | Vu, versioning off | Python (C zlib) |
+|---|---|---|---|---|---|---|
+| text, 5 times | 0.69 s, 51 MB | 0.76 s, 84 MB | 1.65 s, 133 MB | **0.84 s, 147 MB** | 1.04 s | 0.83 s, 140 MB |
+| binary, 2 times | 0.42 s, 58 MB | 0.40 s, 91 MB | 0.93 s, 167 MB | **0.53 s, 154 MB** | 0.62 s | 0.45 s, 148 MB |
+| random, 5 times | 0.04 s | 0.02 s | 0.09 s | **0.06 s** | 0.13 s | 0.07 s |
+
+Vu is now 1.22–1.26x C zlib on data that compresses (from 2.1x), level with Python (which is C zlib
+under a thin wrapper) and twice as fast as Go; Rust is still ahead, at 0.95–1.1x. Memory is about what
+Python and Go use, still about 3x C's: the output grows by doubling, and while the benchmark
+decompresses again, the previous result is still alive.
+
+Testing: targeted tests 638–642 (read_le/read_be ending exactly at the end, one byte past, counts of 0 or 9;
+copy_within overlapping both ways, n = 0, past the end, owned elements refused; take_str of big,
+small and empty lists, the list usable after, LSan clean), and `tests/run_zlib.py`'s 3,201 cases
+(800 with sanitizers, which watch the 16-byte copies): all as expected, nothing found.
+
 ## Memory safety evidence
 
 - `tests/reject/`: 21 programs, each containing a bug Vu must refuse: use after move, a
