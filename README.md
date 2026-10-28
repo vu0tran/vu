@@ -432,7 +432,7 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 | `compiler/build.sh` | rebuilds the compiler and checks the fixed point |
 | `std/` | the standard library modules written in Vu |
 | `examples/` | the benchmark programs and a JSON parser |
-| `mcp/filesystem/`, `mcp/time/`, `mcp/fetch/` | MCP servers: filesystem, time, fetch |
+| `mcp/filesystem/`, `mcp/time/`, `mcp/fetch/`, `mcp/vu/` | MCP servers: filesystem, time, fetch, and Vu's checker for models |
 | `tests/` | the test suites; `tests/gate.sh` runs them all |
 | `bench/` | benchmark programs in C, C++, Rust and Go, and the scripts that time them |
 | `SPEC.md` | the language |

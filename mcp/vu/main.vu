@@ -1,0 +1,113 @@
+# mcp-vu: Vu's checker for a model writing Vu, as an MCP server. Two tools:
+#   vu_check  the type and ownership checker on a program (one file, or several by name): its error,
+#             with the line and what to write instead, in milliseconds, without building anything
+#   vu_docs   the language in brief (llms.txt), for a model that hasn't seen Vu
+#
+#   vu build mcp/vu/main.vu -o mcp-vu
+#   mcp-vu [--vu PATH_TO_VU]       (default: the vu on PATH; llms.txt is read from beside it)
+#
+# What it can reach: main has Fs and Os. Each check writes the files into a new private temporary
+# folder and runs `vu check --json` on them; checking runs no part of the program.
+import json
+import mcp
+import path
+import stdio
+
+const VERSION = "0.2.0"
+
+const TOOLS = """
+  [{{"name":"vu_check","description":"Check a Vu program without building it: types, ownership, capabilities and every other compile error, in milliseconds. Returns the first error (file, line, message, the source line) or says the program is clean. Give either `source` (one file, main.vu) or `files` (file names to contents, for a program of several modules; the one with fn main is the program).","inputSchema":{{"type":"object","properties":{{"source":{{"type":"string","description":"The program, one file"}},"files":{{"type":"object","additionalProperties":{{"type":"string"}},"description":"File name (like main.vu or geo.vu) to its contents"}},"main":{{"type":"string","description":"Which of `files` is the program (default main.vu)"}}}}}},"annotations":{{"readOnlyHint":true,"openWorldHint":false}}}},
+   {{"name":"vu_docs","description":"Vu, the language, in brief: syntax, ownership, errors, capabilities, the standard library, and the mistakes models make most. Read it before writing Vu.","inputSchema":{{"type":"object","properties":{{}}}},"annotations":{{"readOnlyHint":true,"openWorldHint":false}}}}]
+  """
+
+type Env:
+  fs: Fs
+  os: Os
+  vu: Str
+  docs: Str
+
+fn safe_name(n: Str) -> Bool:
+  if not n.endswith(".vu") or n.len < 4 or n.len > 100: return false
+  for i in 0..n.len - 3:
+    let b = n[i]
+    if not ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_'): return false
+  return true
+
+fn check(e: Env, args: json.Value) -> mcp.Outcome:
+  var names: [Str] = []
+  var texts: [Str] = []
+  var main = json.str_at(args, "main") else "main.vu"
+  if src = json.str_at(args, "source"):
+    names.push("main.vu")
+    texts.push(src)
+    main = "main.vu"
+  elif files = json.at(args, "files"):
+    match files:
+      json.Obj(fields):
+        for k, v in fields:
+          match v:
+            json.Text(t):
+              names.push(k + "")
+              texts.push(t + "")
+            _: return mcp.tool_error("files: the contents of " + k + " must be a string")
+      _: return mcp.tool_error("files must be an object of file names to contents")
+  else: return mcp.tool_error("give the program as source (one file) or files (several)")
+  for n in names:
+    if not safe_name(n): return mcp.tool_error("file names are letters, digits and _ ending in .vu (not " + json.quote(n) + ")")
+  if not (main in names): return mcp.tool_error("main: " + main + " isn't one of the files")
+  let dirp = e.fs.temp_dir() else return mcp.tool_error("can't make a temporary folder")
+  for i in 0..names.len:
+    e.fs.write(dirp + "/" + names[i], texts[i]) else return mcp.tool_error("can't write " + names[i])
+  let out = e.os.output([e.vu + "", "check", "--json", dirp + "/" + main]) else "{{\"type\":\"error\",\"message\":\"can't run vu\"}}"
+  for n in names: e.fs.remove(dirp + "/" + n) else 0
+  e.fs.remove(dirp) else 0
+  var errors: [Str] = []
+  var text = ""
+  for line in out.split("\n"):
+    if line.strip() == "": continue
+    let v = json.parse(line) else continue
+    let file = path.base(json.str_at(v, "file") else main)
+    let ln = json.int_at(v, "line") else 0
+    let msg = json.str_at(v, "message") else line
+    let srcl = json.str_at(v, "source") else ""
+    errors.push("{{\"file\":" + json.quote(file) + ",\"line\":{ln},\"message\":" + json.quote(msg) + ",\"source\":" + json.quote(srcl) + "}}")
+    text += file + ":{ln}: error: " + msg + "\n"
+    if srcl != "": text += "  {ln} | " + srcl.strip() + "\n"
+  if errors.len == 0:
+    if out.strip() != "": return mcp.tool_error(out.strip())
+    let s = "{{\"ok\":true,\"errors\":[]}}"
+    return mcp.Outcome("[{{\"type\":\"text\",\"text\":\"No errors: the program checks.\"}}]", s, false)
+  let s = "{{\"ok\":false,\"errors\":[" + ",".join(errors) + "]}}"
+  return mcp.Outcome("[{{\"type\":\"text\",\"text\":" + json.quote(text.rstrip()) + "}}]", s, false)
+
+fn main(fs: Fs, os: Os):
+  let argv = args()
+  var vu = os.env("VU")
+  var i = 1
+  while i < argv.len:
+    if argv[i] == "--vu" and i + 1 < argv.len:
+      vu = argv[i + 1] + ""
+      i += 1
+    i += 1
+  if vu == "": vu = "vu"
+  # llms.txt beside the vu found (the repository or an unpacked release)
+  var docs = ""
+  var where = vu + ""
+  if not where.startswith("/"):
+    let p = os.output(["sh", "-c", "command -v " + vu]) else ""
+    where = p.strip()
+  if where != "":
+    let real = os.output(["realpath", where]) else where
+    docs = fs.read(path.dir(real.strip()) + "/llms.txt") else ""
+  if docs == "": docs = "llms.txt wasn't found beside " + vu + ": see https://vulang.org/llms.txt"
+  let e = Env(fs, os, vu, docs)
+  let s = mcp.server("mcp-vu", VERSION, TOOLS) else panic("the tool list isn't valid JSON")
+  while true:
+    let line = stdio.line() else break
+    match mcp.handle(s, line):
+      mcp.Reply(t): mcp.send(t)
+      mcp.ToolCall(c):
+        if c.name == "vu_check": mcp.send(mcp.result(s, c, check(e, c.args)))
+        else: mcp.send(mcp.result(s, c, mcp.text(e.docs)))
+      mcp.PromptGet(_): continue
+      mcp.Quiet: continue

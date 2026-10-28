@@ -2161,3 +2161,7 @@ answers depend on the Python it runs on: on 3.12, `strptime` doesn't take `" 9:5
 `tzdata` package installed a folder name fails with that package's path in the message; CI now uses
 Python 3.13, and the test skips those names when `tzdata` is installed. On ARM64 two targeted tests
 (a million-piece split and map churn) ran past the 20-second limit; why is being measured in CI.
+
+Also this round: `mcp/vu`, Vu's checker as an MCP server for a model writing Vu (`vu_check` on one
+file or several, `vu_docs` with `llms.txt`); `tests/run_mcp_vu.sh`. Releases now carry `llms.txt`
+and the time, fetch and vu servers.
