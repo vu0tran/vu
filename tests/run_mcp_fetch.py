@@ -20,7 +20,7 @@ class S:
     def ask(self, m):
         self.p.stdin.write((json.dumps(m) + "\n").encode()); self.p.stdin.flush()
         l = self.p.stdout.readline()
-        if not l: sys.exit("FAIL: a server closed its output")
+        if not l: sys.exit("FAIL: a server closed its output after " + json.dumps(m)[:500])
         return json.loads(l)
     def call(self, name, args):
         self.n += 1

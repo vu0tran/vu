@@ -28,7 +28,7 @@ for f in targeted/${ONLY:-*}.vu; do   # ONLY=5[12]*_iface* runs some
   if [ "$kind" = panic ]; then
     if [ $code -ne 0 ]; then ok=0; why="failed to compile: $out"
     else
-      got=$(cd "$work" && timeout 20 ./prog $args 2>&1); rc=$?
+      got=$(cd "$work" && timeout ${VU_TARGETED_TIMEOUT:-20} ./prog $args 2>&1); rc=$?
       if [ $rc -eq 101 ] && printf '%s' "$got" | grep -qF "$want"; then ok=1; why="stopped safely: $(printf '%s' "$got" | grep -m1 panic)"
       elif [ $rc -eq 0 ]; then ok=0; why="RAN TO COMPLETION (should have stopped): $(printf '%s' "$got" | head -1)"
       else ok=0; why="exit $rc: $(printf '%s' "$got" | grep -m1 'ERROR\|panic\|runtime error' | cut -c1-150)"; fi
@@ -40,9 +40,9 @@ for f in targeted/${ONLY:-*}.vu; do   # ONLY=5[12]*_iface* runs some
   else
     if [ $code -ne 0 ]; then ok=0; why="failed to compile: $out"
     else
-      got=$(cd "$work" && ASAN_OPTIONS=$leaks timeout 20 ./prog $args 2>"$work/err"); rc=$?
+      got=$(cd "$work" && ASAN_OPTIONS=$leaks timeout ${VU_TARGETED_TIMEOUT:-20} ./prog $args 2>"$work/err"); rc=$?
       reports=$(grep -c 'ERROR\|runtime error' "$work/err")
-      if [ $rc -eq 124 ]; then ok=0; why="HUNG (killed after 20 s)"
+      if [ $rc -eq 124 ]; then ok=0; why="HUNG (killed after ${VU_TARGETED_TIMEOUT:-20} s)"
       elif [ "$got" = "$want" ] && [ $rc -eq 0 ] && [ "$reports" -eq 0 ]; then ok=1; why="ran correctly, sanitizers clean"
         # again with Vu's own node allocator (freed nodes poisoned), which --san replaces with malloc
         if $VU build "$f" --san-pool -o "$work/pprog" >/dev/null 2>&1; then
