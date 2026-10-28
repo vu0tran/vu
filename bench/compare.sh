@@ -43,7 +43,10 @@ for b in "${names[@]}"; do
   want=$("$d/vu" $arg | md5sum)
   echo "== $b $arg ($threads thread$([ $threads = 1 ] || echo s))"
   if [ $threads = 1 ]; then export OMP_NUM_THREADS=1 GOMAXPROCS=1; else export OMP_NUM_THREADS=$threads GOMAXPROCS=$threads; fi
-  for l in c cpp rs go vu; do
+  langs="c cpp rs go vu"
+  # binary-trees also as C with Vu's allocator (a free list and big chunks): what's left is the language
+  if [ "$b" = binarytrees ]; then gcc $cflags bt_pool.c -o "$d/c_pool" || exit 1; langs="c c_pool cpp rs go vu"; fi
+  for l in $langs; do
     if [ "$("$d/$l" $arg | md5sum)" != "$want" ]; then echo "$l: output differs from Vu's"; continue; fi
     python3 timeit.py "$l" "$d/$l" $arg
   done

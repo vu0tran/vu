@@ -320,14 +320,19 @@ program's output checked against Vu's before it's timed. Seconds, lower is bette
 
 | | binary-trees 20 | n-body 50M | fannkuch-redux 11 | nsieve 13 | mandelbrot 8000 (2 threads) | spectral-norm 8000 (2 threads) |
 |---|---|---|---|---|---|---|
-| C | 11.31 s, 130 MB | 3.16 s | **2.85 s** | 5.10 s | **2.84 s** | 2.45 s |
-| C++ | 11.61 s, 132 MB | 4.62 s | 3.53 s | **2.55 s** | **2.84 s** | **1.82 s** |
-| Rust | 13.11 s, 130 MB | **2.81 s** | 3.26 s | 4.84 s | 2.93 s | 2.00 s |
-| Go | 25.10 s, 191 MB | 5.19 s | 3.21 s | 4.73 s | 2.93 s | 3.06 s |
-| **Vu** | **4.39 s, 66 MB** | 3.56 s | 3.14 s | 4.70 s | 3.00 s | 2.55 s |
+| C | 6.89 s, 130 MB | 3.16 s | **2.85 s** | 5.10 s | **2.84 s** | 2.45 s |
+| C, Vu's allocator | 2.73 s, 66 MB | | | | | |
+| C++ | 8.66 s, 132 MB | 4.62 s | 3.53 s | **2.55 s** | **2.84 s** | **1.82 s** |
+| Rust | 8.60 s, 130 MB | **2.81 s** | 3.26 s | 4.84 s | 2.93 s | 2.00 s |
+| Go | 18.97 s, 240 MB | 5.19 s | 3.21 s | 4.73 s | 2.93 s | 3.06 s |
+| **Vu** | **2.62 s, 66 MB** | 3.56 s | 3.14 s | 4.70 s | 3.00 s | 2.55 s |
 
-- **binary-trees:** Vu is about 2.6x faster than C in half the memory. The compiler knows when each
-  node dies, so freed nodes go onto a per-type free list and are reused with no runtime checks.
+- **binary-trees is an allocator result.** Vu is 2.6x faster than C that calls `malloc` and `free`
+  per node, in half the memory, because the compiler knows when each node dies: freed nodes go on a
+  free list for their type and new ones are carved from big chunks, with no runtime checks. C written
+  with that same allocator (`bench/bt_pool.c`) ties it: 2.73 s against 2.62 s. So the win is that Vu
+  does it for you, safely; it isn't faster code than C can be. (This column is from one run on
+  2026-10-28, with the pooled C added; the others are from round 11.)
 - **Every check stays on, and the rest are within 1.04–1.13x of C** (fannkuch-redux ahead of Rust
   and Go). Vu checks every index and every Int operation, and in hot loops it makes those checks
   cheap instead of dropping them: a loop's indexes that the loop bounds (`xs[i]`, `xs[i + 1]`,
