@@ -65,8 +65,9 @@ def fixture(root):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", newline="") as f: f.write(text)
     os.makedirs(os.path.join(root, "emptydir"))
-    os.symlink("sub", os.path.join(root, "link_to_sub"))
-    os.symlink("a.txt", os.path.join(root, "link_to_a"))
+    if sys.platform.startswith("linux"):   # elsewhere the server refuses symlinks on a path (documented)
+        os.symlink("sub", os.path.join(root, "link_to_sub"))
+        os.symlink("a.txt", os.path.join(root, "link_to_a"))
     os.chmod(os.path.join(root, "a.txt"), 0o640)
 
 def norm(x, roots):
@@ -117,7 +118,9 @@ def main():
         same(mv.ask(m), mr.ask(m), roots, "modern %s" % json.dumps(m)[:200])
     mv.close(); mr.close()
     # every tool, the plain cases and the errors
-    for p in ["a.txt", "b.md", "empty.txt", "no_newline.txt", "sub/c.txt", "link_to_a", "link_to_sub/c.txt",
+    # without openat2 (macOS) the server refuses every symlink on a path: a documented difference
+    links = ["link_to_a", "link_to_sub/c.txt"] if sys.platform.startswith("linux") else []
+    for p in ["a.txt", "b.md", "empty.txt", "no_newline.txt", "sub/c.txt"] + links + [
               "unicode-\u00e9.txt", "spaces in name.txt", "nope.txt", "sub", "/etc/hostname", rv + "/a.txt"]:
         a = {"path": p}
         if p.startswith(rv):
@@ -134,7 +137,7 @@ def main():
     for f in ["image.png", "song.mp3", "data.bin", "spaces in name.txt"]:
         both("read_media_file", {"path": f})
     both("read_multiple_files", {"paths": ["a.txt", "nope", "sub/c.txt"]})
-    for d in [".", "sub", "emptydir", "link_to_sub", "a.txt", "nope"]:
+    for d in [".", "sub", "emptydir", "a.txt", "nope"] + (["link_to_sub"] if links else []):
         both("list_directory", {"path": d})
         both("list_directory_with_sizes", {"path": d})
         both("list_directory_with_sizes", {"path": d, "sortBy": "size"})
