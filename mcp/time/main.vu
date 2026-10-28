@@ -1,0 +1,213 @@
+# mcp-time: the MCP time server (get_current_time, convert_time over IANA time zones), as one Vu
+# program, answering as the reference server (mcp-server-time, Python) does.
+#
+#   vu build mcp/time/main.vu -o mcp-time
+#   mcp-time [--local-timezone America/New_York]
+#
+# What it can reach: main has Fs and Os, and uses them at startup only, to open the tz database
+# (/usr/share/zoneinfo, or $TZDIR) as a dir.Dir, to find the local zone, and to make a closure that
+# reads the clock. The tools get those three things and nothing else: no other file, no network, no
+# way to start a program or read the environment.
+import dir
+import json
+import mcp
+import path
+import stdio
+import time
+import tools
+
+const VERSION = "2026.10.28"
+
+type Env:
+  zones: dir.Dir
+  now: fn() -> Float
+  local: Str
+
+const DAYS = "Monday Tuesday Wednesday Thursday Friday Saturday Sunday"
+
+fn day_name(d: time.Date) -> Str:
+  return DAYS.split(" ")[d.weekday] + ""
+
+fn pad(n: Int, w: Int) -> Str:
+  var s = "{n}"
+  while s.len < w: s = "0" + s
+  return s
+
+# Python's datetime.isoformat(timespec="seconds") of a local time: 2026-10-28T16:30:00-04:00.
+fn iso(l: time.Local) -> Str:
+  let d = l.date
+  return pad(d.year, 4) + "-" + pad(d.month, 2) + "-" + pad(d.day, 2) + "T" + pad(d.hour, 2) + ":" + pad(d.minute, 2) + ":" + pad(d.second, 2) + time.offset_text(l.offset)
+
+fn result_json(zone: Str, l: time.Local) -> json.Value:
+  var f: {Str: json.Value} = {}
+  f["timezone"] = json.Text(zone + "")
+  f["datetime"] = json.Text(iso(l))
+  f["day_of_week"] = json.Text(day_name(l.date))
+  f["is_dst"] = json.Flag(l.dst)
+  return json.Obj(f)
+
+# A zone by its exact IANA name, read from the tz database folder, as zoneinfo.ZoneInfo checks it.
+fn zone(e: Env, name: Str) -> time.Zone throws:
+  # zoneinfo's own checks on a key, in its order and words
+  if name.startswith("/"): fail "Invalid timezone: ZoneInfo keys may not be absolute paths, got: " + name
+  let clean = path.clean(name)
+  if clean.len != name.len: fail "Invalid timezone: ZoneInfo keys must be normalized relative paths, got: " + name
+  if clean == ".." or clean.startswith("../"): fail "Invalid timezone: ZoneInfo keys must refer to subdirectories of TZPATH, got: " + name
+  let bad = "Invalid timezone: 'No time zone found with key " + name + "'"
+  if name == "posixrules" or name.startswith("posix/") or name.startswith("right/"): fail bad
+  let data = e.zones.read(name) else fail bad
+  if not data.startswith("TZif"): fail "Invalid timezone: Invalid TZif file: magic not found"
+  return time.parse_tzif(name, data) else fail bad
+
+# Python's pretty JSON of a result model (indent 2), and the same as structured content.
+fn pretty(v: json.Value, indent: Int, var out: Str):
+  let pad_s = repeat("  ", indent)
+  match v:
+    json.Obj(fields):
+      out += "{{\n"
+      var i = 0
+      for k, x in fields:
+        out += pad_s + "  " + json.quote(k) + ": "
+        pretty(x, indent + 1, &out)
+        i += 1
+        if i < fields.len: out += ","
+        out += "\n"
+      out += pad_s + "}}"
+    _: out += json.stringify(v)
+
+fn repeat(s: Str, n: Int) -> Str:
+  var o = ""
+  for i in 0..n: o += s
+  return o
+
+fn outcome(v: json.Value) -> mcp.Outcome:
+  var text = ""
+  pretty(v, 0, &text)
+  let content = "[{{\"type\":\"text\",\"text\":" + json.quote(text) + "}}]"
+  return mcp.Outcome(content, json.stringify(v), false)
+
+fn current(e: Env, args: json.Value) -> mcp.Outcome throws:
+  let name = json.str_at(args, "timezone") else ""
+  if name == "": fail "Missing required argument: timezone"
+  let z = zone(e, name)?
+  let l = time.local(z, e.now())
+  return outcome(result_json(name, l))
+
+# "+9.0h", "-5.5h", "+5.75h" as the reference writes the hours between two offsets.
+fn hours_text(diff: Int) -> Str:
+  var sign = "+"
+  var a = diff
+  if diff < 0:
+    sign = "-"
+    a = -diff
+  if a % 3600 == 0: return sign + "{a / 3600}.0h"
+  # two decimals, then trailing zeros dropped: 5.50 -> 5.5, 9.75 -> 9.75
+  let hundredths = (a * 100 + 1800) / 3600
+  var frac = pad(hundredths % 100, 2)
+  if frac.endswith("0"): frac = frac[0..1]
+  return sign + "{hundredths / 100}." + frac + "h"
+
+fn digit(c: Byte) -> Bool:
+  return c >= '0' and c <= '9'
+
+# Hours and minutes as datetime.strptime(s, "%H:%M") reads them, as minutes since midnight, or -1.
+# Its hour is 20-23, 00-19, one digit, or a space and one digit; its minute 00-59 or one digit.
+fn parse_hm(s: Str) -> Int:
+  let colon = s.find(":")
+  if colon < 0: return -1
+  let hs = s[0..colon]
+  let ms = s[colon + 1..s.len]
+  var h = -1
+  if hs.len == 2 and hs[0] == ' ' and digit(hs[1]): h = int(hs[1]) - 48
+  elif hs.len == 2 and digit(hs[0]) and digit(hs[1]) and (hs[0] <= '1' or (hs[0] == '2' and hs[1] <= '3')): h = (int(hs[0]) - 48) * 10 + int(hs[1]) - 48
+  elif hs.len == 1 and digit(hs[0]): h = int(hs[0]) - 48
+  var m = -1
+  if ms.len == 2 and digit(ms[0]) and digit(ms[1]) and ms[0] <= '5': m = (int(ms[0]) - 48) * 10 + int(ms[1]) - 48
+  elif ms.len == 1 and digit(ms[0]): m = int(ms[0]) - 48
+  if h < 0 or m < 0: return -1
+  return h * 60 + m
+
+fn convert(e: Env, args: json.Value) -> mcp.Outcome throws:
+  let src = json.str_at(args, "source_timezone") else ""
+  let dst = json.str_at(args, "target_timezone") else ""
+  if src == "": fail "Missing required argument: source_timezone"
+  if dst == "": fail "Missing required argument: target_timezone"
+  let zs = zone(e, src)?
+  let zt = zone(e, dst)?
+  let hm = json.str_at(args, "time") else ""
+  let bad = "Invalid time format. Expected HH:MM [24-hour format]"
+  let hmv = parse_hm(hm)
+  if hmv < 0: fail bad
+  let h = hmv / 60
+  let m = hmv % 60
+  let today = time.local(zs, e.now()).date
+  let wall = time.Date(today.year, today.month, today.day, h, m, 0, 0, 0)
+  let t = time.from_local(zs, wall)
+  let back = time.local(zs, t).date
+  if back.hour != h or back.minute != m or back.day != today.day:
+    fail "Invalid time: " + hm + " does not exist in " + src + " on " + pad(today.year, 4) + "-" + pad(today.month, 2) + "-" + pad(today.day, 2) + " (skipped by a clock change)"
+  let ls = time.local(zs, t)
+  let lt = time.local(zt, t)
+  var f: {Str: json.Value} = {}
+  f["source"] = result_json(src, ls)
+  f["target"] = result_json(dst, lt)
+  f["time_difference"] = json.Text(hours_text(lt.offset - ls.offset))
+  return outcome(json.Obj(f))
+
+fn zone_ok(e: Env, name: Str) -> Bool:
+  match zone(e, name):
+    ok(_): return true
+    err(_): return false
+
+fn call(e: Env, name: Str, args: json.Value) -> mcp.Outcome:
+  var r = mcp.text("")
+  if name == "get_current_time":
+    match current(e, args):
+      ok(o): r = o
+      err(msg): r = mcp.tool_error("Error executing tool get_current_time: " + msg)
+  else:
+    match convert(e, args):
+      ok(o): r = o
+      err(msg): r = mcp.tool_error("Error executing tool convert_time: " + msg)
+  return r
+
+fn main(fs: Fs, os: Os):
+  let argv = args()
+  var local = ""
+  for i in 1..argv.len:
+    if argv[i] == "--local-timezone" and i + 1 < argv.len: local = argv[i + 1] + ""
+    elif argv[i].startswith("--local-timezone="): local = argv[i][17..argv[i].len]
+  var tzdir = os.env("TZDIR")
+  if tzdir == "": tzdir = "/usr/share/zoneinfo"
+  let zones = dir.open(fs, tzdir) else panic("can't open the tz database at " + tzdir)
+  if local == "":
+    # as tzlocal finds it: $TZ, else where /etc/localtime points into the database
+    local = os.env("TZ")
+    if local.startswith(":"): local = local[1..local.len]
+    if local == "":
+      match dir.open(fs, "/"):
+        ok(root):
+          let real = root.real("etc/localtime") else ""
+          if real.startswith(zones.path + "/"): local = real[zones.path.len + 1..real.len]
+        err(_): local = ""
+    if local == "": local = "UTC"
+  let clock = own fn() => os.time()
+  let e = Env(zones, clock, local)
+  let known = zone_ok(e, local)
+  if not known:
+      eprint("Error: invalid --local-timezone '" + local + "': not a known IANA timezone name")
+      exit(1)
+  serve(e)
+
+# From here on: the tz database folder, the clock and the local zone's name, nothing else.
+fn serve(e: Env):
+  var s = mcp.server("mcp-time", VERSION, tools.TOOLS.replace("%LOCAL%", e.local)) else panic("the tool list isn't valid JSON")
+  s.caps = "{{\"prompts\":{{\"listChanged\":false}},\"resources\":{{\"listChanged\":false,\"subscribe\":false}},\"tools\":{{\"listChanged\":false}}}}"
+  s.unknown_tool = "Unknown tool: %s"
+  s.says_ok = true
+  while true:
+    let line = stdio.line() else break
+    match mcp.handle(s, line):
+      mcp.Reply(text): mcp.send(text)
+      mcp.ToolCall(c): mcp.send(mcp.result(s, c, call(e, c.name, c.args)))
+      mcp.Quiet: continue
