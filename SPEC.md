@@ -45,12 +45,16 @@ fn main():
 | `Bool` | `true` / `false` |
 | `Byte` | 0..255, one byte in memory. Literals: `65`, `0x41` or `'A'`. Overflow stops the program. |
 | `Str` | an owned string of bytes: `s.len`, `s[i]` (a Byte), `s[a..b]` (a new Str), `+`, `+=`, `== <`, `s.reserve(n)` |
-| `[T]` | growable list: `xs.len`, `xs.push(v)`, `xs.pop()` (removes and returns the last element; stops the program if empty), `xs.truncate(n)` (keeps the first n), `xs.copy_within(to, from, n)` (as memmove; plain values only), `xs[i]` (bounds-checked), `xs.reserve(n)` |
+| `[T]` | growable list: `xs.len`, `xs.push(v)`, `xs.pop()` (removes and returns the last element; stops the program if empty), `xs.truncate(n)` (keeps the first n), `xs.copy_within(to, from, n)` (as memmove; plain values only), `xs[i]` (bounds-checked), `xs[a..b]` (a slice, below), `xs.reserve(n)` |
 | `T?` | optional: either a `T` or `nil` (`Int?`, `Str?`, `[T]?`, a struct or enum...; not a capability or another optional). Recursive types must use it (or a list or map). Read it with `if x = opt:` or `opt else default` (see Errors). |
 | `{K: V}` | map from Int, Byte, Bool or Str keys to any value (see Maps) |
 | `type Name:` | a struct, fields listed below it (`x, y: Float` declares two fields) |
 | `type Name:` with variants | an enum (see Enums) |
 | `Fs` | the capability to read and write files (see Capabilities) |
+
+A list slice `xs[a..b]` (bounds-checked) reads part of a list without copying it: `let v = xs[1..4]`
+is a read-only view (the list can't change while it lives, as with `let` of a field), and
+`for x in xs[2..n]` loops over the range. `var v = xs[1..4]` makes a copy that's yours to change.
 
 Structs are built with positional or named arguments: `Body(1, 2)` or `Body(x: 1, y: 2)`.
 `s.reserve(n)` and `xs.reserve(n)` make room for `n` more bytes or elements up front, so a
@@ -70,6 +74,24 @@ Vu string interpolates, so a literal brace is always doubled, inside nested stri
 Strings are
 immutable byte strings; the text functions in Built-ins read them as UTF-8. `bytes(s)` copies one
 into a `[Byte]` list, and `str(bs)` copies back.
+
+Text over several lines goes in a `"""` string. Its text starts on the line after the opening `"""`
+and ends before the closing one, which stands on a line of its own; the closing `"""`'s indentation
+is removed from every line (a line indented less is an error), and so is the last line break. Quotes
+need no escaping; escapes, interpolation and `{{ }}` work as in any string (an interpolation closes on
+the line it opens).
+
+```
+let page = """
+  <h1 class="title">{title}</h1>
+  <p>{n} items</p>
+  """                                  # "<h1 class=\"title\">...</h1>\n<p>... items</p>"
+```
+
+Constants are numbers, `true`/`false`, or text: `const MAX = 64`, `const SCALE = 2.5 * MAX`,
+`const GREETING = "hello"`, `const PAGE = """...""" + FOOTER`. A text constant can't interpolate, and
+using it is the same as writing its text, so it can be passed to a `const` parameter (a SQL query, a
+template). Constants are evaluated in the order they use each other, across modules (`geo.ORIGIN`).
 
 ## Variables and functions
 
@@ -114,9 +136,11 @@ into a `[Byte]` list, and `str(bs)` copies back.
 - **Locals may shadow** a function, a constant or a built-in: `let text = ...` and
   `let max = 10` are fine. Calling the shadowed function in that scope is an error that says
   so. Type and variant names stay reserved.
-- **Strings that can't be moved are copied.** Taking a `Str` from a field, a list element, a
-  parameter, a loop binding, or a frozen variable copies it (`let name = p.name`). Other
-  owned values (lists, structs, enums) are never copied implicitly.
+- **Strings are copied unless moving is free.** Taking a `Str` from a field, a list element, a
+  parameter, a loop binding, or a frozen variable copies it (`let name = p.name`). A `Str` variable
+  given away (`xs.push(s)`, `m[k] = s`, a struct field, `let t = s`) is moved only when that's its
+  last use in the block that declared it; anywhere else it's copied, so using it again is always
+  fine. Other owned values (lists, structs, enums) are never copied implicitly.
 - **`let` of a part is a view.** `let items = bag.items`, where the value is a list, struct
   or enum that can't be moved (it's a field or element, or something borrowed), gives a
   read-only view instead of a move. Until the view's block ends, the variable it comes from
@@ -279,6 +303,32 @@ fn main():
   indirect C call; a closure's captured variables live in an env (on the stack for a borrowing
   closure, on the heap for an own one).
 
+## Methods
+
+`x.f(args)` is another way to write `f(x, args)`: any function whose first parameter takes `x`
+can be called on it.
+
+```
+fn dist(a: Point, b: Point) -> Float: ...
+fn grow(var s: Stack, v: Int): ...
+
+a.dist(b)                 # dist(a, b)
+st.grow(3)                # grow(&st, 3): a var first parameter changes the receiver, as xs.push does
+"hi".shout().len          # chains; works on Int, Str, lists, enums, interface values too
+xs.largest(fn(a, b) => a > b)   # generic functions infer from the receiver
+```
+
+- The function is looked up where the call is written (its own functions and `from` imports), then
+  in the module that defines the receiver's type, so `p.norm()` works for a `geo.Point` without
+  importing `norm` by name. Locals never hide a method.
+- Built-in methods come first (`s.split()`, `xs.push(v)`, `m.get(k, d)`), and a struct field holding
+  a function is called by `h.handler(x)` as before. Capabilities, channels, optionals and function
+  values have only their built-in methods.
+- The receiver is passed exactly as the first argument would be: borrowed, `&x` for a `var`
+  parameter (so it must be a variable, field or list element, and every rule about `&` applies:
+  not while it's borrowed, not twice in one call, not inside an index), or moved for `own`.
+  A failing method is handled like any failing call (`x.f()?`, `else`, `match`).
+
 ## Errors
 
 A function marked `throws` can stop with an error message instead of returning:
@@ -403,6 +453,7 @@ counts[w] = counts.get(w, 0) + 1     # .get(key, default) for plain-data and Str
 if "the" in counts: ...
 let n = counts["the"]                # a missing key stops the program; check with 'in' first
 counts.remove("the")                 # returns true if the key was there
+print("{counts.len}")                # how many keys
 for k in counts: print(k + " {counts[k]}")
 for k, n in counts: print(k + " {n}")        # keys and values together, no second lookup
 for k, var n in counts: n += 1               # change values in place
@@ -499,6 +550,7 @@ covers the rest of the outside world:
   argument contains a zero byte, or the program can't be started.
 - `os.output(["git", "rev-parse", "HEAD"])` runs a program the same way and returns what it wrote
   to standard output and standard error together, whatever its exit code.
+- `os.read_stdin()` reads all of standard input, to its end (it can fail, so `?` or `else`).
 - `os.read_stdin(n)` reads up to n bytes of standard input as they arrive (`""` at its end); it
   can fail. (`print` and `write` need no capability; reading input does.)
 - `os.env("CC")` returns an environment variable, or `""` when it isn't set.
@@ -699,7 +751,8 @@ The C side. The glue file is included after Vu's runtime, so it can use these:
 `vu_cstr(s)` makes a NUL-terminated copy (free it with `free`), or returns NULL when the string
 contains a zero byte. The compiler declares each function's expected C signature before
 including the file, so a definition that doesn't match is a compile error. C names can't be C
-keywords or start with `vu_`, `fn_` or `drop_`.
+keywords or start with `vu_`, `fn_` or `drop_`. (`par` is a keyword only right before `for`;
+elsewhere it's an ordinary name.)
 
 C code is outside Vu's checks: the glue must not keep a borrowed `vu_str` pointer after the call,
 free a borrowed handle, or return a handle that is still owned elsewhere.
@@ -722,7 +775,11 @@ break / continue / return
 ```
 
 Operators: `+ - * / %` (Int `/` truncates), `<< >> & | ^` (Int and Byte), `== != < > <= >=`,
-`and or not`, and `+` to join strings.
+`and or not` (`and` and `or` stop as soon as the answer is known, so `i < xs.len and xs[i] > 0` is
+safe), and `+` to join strings. Arithmetic stops the program on overflow; for hashes, checksums and
+random number generators, `+% -% *%` wrap around at 64 bits instead (and `+%= -%= *%=`), and `>>>`
+shifts right filling with zeros (`>>` keeps the sign). A shift by less than 0 or more than 63 stops
+the program. A Byte literal holds one character, any character: `'{'` is a brace, not an interpolation.
 Int literals can be hex (`0xFF`). `[v] * n` makes a list of n copies of plain values.
 Float math is strict IEEE: never fused, so results are identical on every machine. To fuse,
 ask for it: `fma(a, b, c)` is `a * b + c` rounded once (one instruction on most CPUs, and the same
@@ -758,6 +815,8 @@ if name.startswith("vu_"): ...          # also s.endswith(suffix)
 let t = s.strip()                       # also s.lstrip(), s.rstrip(); s.strip("xy") strips those bytes
 let ys = sorted(xs)                     # a sorted copy; sorted(xs, reverse: true)
 xs.sort()                               # in place; xs.sort(reverse: true)
+xs.sort(by: fn(a, b) => a.n > b.n)     # any element type: by says whether a goes first (stable)
+xs.swap(i, j)                           # exchange two elements in place
 let lo = min(xs)                        # min/max of a list, or of two or more numbers: max(a, b, c)
 if 3 in xs: ...                         # whether an element == 3 (lists of Int, Float, Byte, Bool, Str)
 ```
@@ -814,6 +873,8 @@ let k = from_hex("00ff")?          # fails on anything but hex digits in pairs; 
 
 ```
 vu check file.vu            # errors only: no binary, no C compiler (milliseconds)
+vu check --checks file.vu   # also: the index and overflow checks each loop still makes on every pass
+vu check --index file.vu    # also: what the language server knows (items, fields, variables' types), as JSON lines
 vu run file.vu [args]       # quick -O0 build, then run with args
 vu run --release file.vu    # optimized build, then run (options go before the file;
                             #   everything after it goes to the program)
@@ -833,7 +894,7 @@ vu test file.vu...          # run each fn test_... in its own process; report wh
 vu get [file.vu]            # fetch the packages in vu.pkg, write vu.lock (see Packages)
 vu version                  # the release: vu 0.1.0
 vu new web NAME             # a folder NAME with a web app: main.vu, public/, Dockerfile, fly.toml
-vu lsp                      # a language server for editors (diagnostics, formatting)
+vu lsp                      # a language server for editors (diagnostics, formatting, hover, definition, completion)
 ```
 
 - **`vu fmt`**: blocks indented 2 spaces per level, one space around binary operators and after
@@ -976,6 +1037,16 @@ let d = time.utc(t)                       # d.year, d.month, d.day, d.hour, d.mi
 let t = time.parse_iso("2026-10-26T21:30:05+02:00")?    # RFC 3339 -> seconds; can fail
 ```
 
+**`heap`**: a priority queue kept in a list, ordered by a function that says whether a comes first.
+
+```
+import heap
+let first = fn(a: Job, b: Job) -> Bool => a.due < b.due
+heap.push(&q, Job(3, "c"), first)       # q[0] is always the first
+let next = heap.pop(&q, first)          # removes and returns it (stops the program if q is empty)
+heap.heapify(&xs, first)                # a list made into a heap in place
+```
+
 **`log`**: lines on standard error with the time and a level; `log.json` writes one JSON
 object per line for machines.
 
@@ -1096,7 +1167,13 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   `Str` as HTML except through `trust`. (Escaping is for text and quoted attributes: a URL in an
   `href` still needs checking.)
 - Forms: `web.form(req)` gives the fields of an `application/x-www-form-urlencoded` body as a map (the
-  first of a name wins), `web.field(req, name)` one of them. Not yet: multipart (file uploads).
+  first of a name wins), `web.field(req, name)` one of them.
+- File uploads: `web.parts(req)?` reads a `multipart/form-data` body (a form with
+  `enctype="multipart/form-data"`) into `web.Part`s (`name`, `filename`, `content_type`, `data`), and
+  fails on a malformed one (at most 1,000 parts). `web.file(parts, name)` is the first file of that
+  name, `web.part_value(parts, name)` a plain field. The browser's `filename` is never safe as a path:
+  `web.safe_filename(p.filename)` keeps its last part without control characters, quotes or leading
+  dots.
 - Cookies: `web.get_cookie(req, name)`; `web.set_cookie(&resp, web.cookie(name, value))`, whose
   defaults are `Path=/`, `HttpOnly`, `Secure` and `SameSite=Lax` (a `web.Cookie`'s fields change
   them: `max_age`, `same_site`...); `web.clear_cookie(&resp, name)`. Values are percent-encoded, so
@@ -1143,6 +1220,27 @@ import zlib
 let page = zlib.gunzip_max(body, 50 << 20)?   # Content-Encoding: gzip, at most 50 MB
 let text = zlib.decompress(data)?             # zlib.compress's format; zlib.inflate(raw) for raw DEFLATE
 print("{zlib.crc32(text)}")
+```
+
+Compression, as zlib does it (hash chains over a 32 KB window, lazy matching from level 4, each block
+written with its own Huffman codes, the fixed ones or none, whichever is smallest): the output is
+within a few percent of C zlib's size at the same level, and Python's `zlib` and `gzip` read it back
+(`tests/run_zlib_compress.py`).
+
+```
+let z = zlib.compress(text)            # zlib format, level 6; compress_level(text, 0..9)
+let gz = zlib.gzip(body)               # Content-Encoding: gzip; gzip_level(body, n)
+let raw = zlib.deflate(data)           # raw DEFLATE; deflate_level(data, n)
+```
+
+Data that arrives in pieces (a download, a socket) decompresses as it comes, in at most 32 KB plus the
+piece's output of memory:
+
+```
+var z = zlib.stream("gzip", 0)?        # "zlib", "gzip" or "raw"; a size limit, 0 for none
+let part = zlib.feed(&z, piece)?       # the output so far (fails on bad data)
+let rest = zlib.finish(&z)?            # after the last piece (fails if the stream stopped short)
+zlib.unused(z)                         # input after the end of the stream
 ```
 
 **`path`**: file paths as text, as Python's `os.path` gives them on Linux and macOS (`tests/run_path.py`
@@ -1213,5 +1311,4 @@ let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows
 
 ## Not in v0
 
-Methods (functions take the value they work on first), Unicode normalization and character
-classes, generic interfaces, TLS to PostgreSQL.
+Unicode normalization and character classes, generic interfaces, TLS to PostgreSQL.

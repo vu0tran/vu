@@ -11,6 +11,14 @@
 #   let small = zlib.gunzip_max(body, 1 << 20)?   # at most 1 MB out, or it fails (zip bombs)
 #   zlib.crc32(data)   zlib.adler32(data)
 #
+# In pieces, as they arrive (a download, a large file), keeping only the last 32 KB of output:
+#
+#   var z = zlib.stream("gzip", 0)?            # "zlib", "gzip" or "raw"; a size limit, or 0
+#   while ...:
+#     out += zlib.feed(&z, piece)?             # what this piece decodes to
+#   out += zlib.finish(&z)?                    # fails if the stream stopped short
+#   zlib.unused(z)                             # input after the end of the stream
+#
 # Data and results are Str (Vu strings are bytes); bytes(s) and str(bs) convert to and from [Byte].
 
 # Bits looked up at once in a code's table (longer codes take a slower path). The decoding loop masks
@@ -32,6 +40,7 @@ type Code:
 # them, the next one lowest).
 type Bits:
   pos, bitbuf, bitcnt: Int
+  wait: Bool   # (streaming) decoding stopped for more input, before a symbol
 
 const FIXED = 0
 const DYNAMIC = 1
@@ -48,25 +57,38 @@ fn inflate(data: Str) -> Str throws:
 # zlib format: a two-byte header, DEFLATE data, then the Adler-32 of what it holds. max: fail when the
 # result would be longer than this many bytes (0: no limit).
 fn decompress_max(data: Str, max: Int) -> Str throws:
-  if data.len < 2: fail "incomplete or truncated stream"
-  let cmf = int(data[0])
-  let flg = int(data[1])
-  if (cmf * 256 + flg) % 31 != 0: fail "incorrect header check"
-  if cmf & 15 != 8: fail "unknown compression method"
-  if cmf >> 4 > 7: fail "invalid window size"
-  if flg & 32 != 0: fail "need dictionary"
-  var b = Bits(2, 0, 0)
+  zlib_header(data)?
+  var b = Bits(2, 0, 0, false)
   var out: [Byte] = [0] * 1024
   let n = inflate_into(data, &b, &out, max)?
   let at = b.pos - b.bitcnt / 8   # (whole bytes read ahead go back)
   if at + 4 > data.len: fail "incomplete or truncated stream"
   let want = int(data[at]) << 24 | int(data[at + 1]) << 16 | int(data[at + 2]) << 8 | int(data[at + 3])
   if adler32_of(out, n) != want: fail "incorrect data check"
-  return finish(&out, n)
+  return to_str(&out, n)
 
 # gzip format: a header (with an optional name, comment and extra field), DEFLATE data, then the
 # CRC-32 and length of what it holds. Only the first member is read, as zlib.decompress does.
 fn gunzip_max(data: Str, max: Int) -> Str throws:
+  let at = gzip_header(data)?
+  var b = Bits(at, 0, 0, false)
+  var out: [Byte] = [0] * 1024
+  let n = inflate_into(data, &b, &out, max)?
+  let end = b.pos - b.bitcnt / 8
+  if end + 8 > data.len: fail "incomplete or truncated stream"
+  if crc32_of(out, n) != le32(data, end): fail "incorrect data check"
+  if n & 4294967295 != le32(data, end + 4): fail "incorrect length check"
+  return to_str(&out, n)
+
+# Raw DEFLATE, no header or checksum.
+fn inflate_max(data: Str, max: Int) -> Str throws:
+  var b = Bits(0, 0, 0, false)
+  var out: [Byte] = [0] * 1024
+  let n = inflate_into(data, &b, &out, max)?
+  return to_str(&out, n)
+
+# The gzip header at the start of data: its length.
+fn gzip_header(data: Str) -> Int throws:
   if data.len < 10: fail "incomplete or truncated stream"
   if int(data[0]) != 31 or int(data[1]) != 139: fail "incorrect header check"
   if int(data[2]) != 8: fail "unknown compression method"
@@ -84,21 +106,17 @@ fn gunzip_max(data: Str, max: Int) -> Str throws:
     if crc32(data[0..at]) & 65535 != want: fail "header crc mismatch"
     at += 2
   if at > data.len: fail "incomplete or truncated stream"
-  var b = Bits(at, 0, 0)
-  var out: [Byte] = [0] * 1024
-  let n = inflate_into(data, &b, &out, max)?
-  let end = b.pos - b.bitcnt / 8
-  if end + 8 > data.len: fail "incomplete or truncated stream"
-  if crc32_of(out, n) != le32(data, end): fail "incorrect data check"
-  if n & 4294967295 != le32(data, end + 4): fail "incorrect length check"
-  return finish(&out, n)
+  return at
 
-# Raw DEFLATE, no header or checksum.
-fn inflate_max(data: Str, max: Int) -> Str throws:
-  var b = Bits(0, 0, 0)
-  var out: [Byte] = [0] * 1024
-  let n = inflate_into(data, &b, &out, max)?
-  return finish(&out, n)
+# The zlib header's two bytes, checked.
+fn zlib_header(data: Str) throws:
+  if data.len < 2: fail "incomplete or truncated stream"
+  let cmf = int(data[0])
+  let flg = int(data[1])
+  if (cmf * 256 + flg) % 31 != 0: fail "incorrect header check"
+  if cmf & 15 != 8: fail "unknown compression method"
+  if cmf >> 4 > 7: fail "invalid window size"
+  if flg & 32 != 0: fail "need dictionary"
 
 fn past_zero(data: Str, from: Int) -> Int throws:
   var i = from
@@ -111,7 +129,7 @@ fn le32(s: Str, at: Int) -> Int:
   return int(s[at]) | int(s[at + 1]) << 8 | int(s[at + 2]) << 16 | int(s[at + 3]) << 24
 
 # The first n bytes of out as a Str (out's own buffer: no copy).
-fn finish(var out: [Byte], n: Int) -> Str:
+fn to_str(var out: [Byte], n: Int) -> Str:
   out.truncate(n)
   return out.take_str()
 
@@ -165,6 +183,10 @@ fn crc32(data: Str) -> Int:
   return c ^ 4294967295
 
 fn crc32_of(out: [Byte], n: Int) -> Int:
+  return crc_more(0, out, 0, n)
+
+# The CRC-32 of what crc covers followed by out[from..to] (crc 0 to start).
+fn crc_more(crc: Int, out: [Byte], from: Int, to: Int) -> Int:
   let ts = crc_tables()
   let t0 = ts[0]
   let t1 = ts[1]
@@ -174,13 +196,13 @@ fn crc32_of(out: [Byte], n: Int) -> Int:
   let t5 = ts[5]
   let t6 = ts[6]
   let t7 = ts[7]
-  var c = 4294967295
-  let whole = n / 8 * 8
-  for i in 0..whole by 8:
+  var c = crc ^ 4294967295
+  let whole = from + (to - from) / 8 * 8
+  for i in from..whole by 8:
     let lo = c ^ (int(out[i]) | int(out[i + 1]) << 8 | int(out[i + 2]) << 16 | int(out[i + 3]) << 24)
     let hi = int(out[i + 4]) | int(out[i + 5]) << 8 | int(out[i + 6]) << 16 | int(out[i + 7]) << 24
     c = t7[lo & 255] ^ t6[(lo >> 8) & 255] ^ t5[(lo >> 16) & 255] ^ t4[(lo >> 24) & 255] ^ t3[hi & 255] ^ t2[(hi >> 8) & 255] ^ t1[(hi >> 16) & 255] ^ t0[(hi >> 24) & 255]
-  for i in whole..n: c = t0[(c ^ int(out[i])) & 255] ^ (c >> 8)
+  for i in whole..to: c = t0[(c ^ int(out[i])) & 255] ^ (c >> 8)
   return c ^ 4294967295
 
 # Adler-32 (as zlib.adler32).
@@ -200,11 +222,15 @@ fn adler32(data: Str) -> Int:
   return b << 16 | a
 
 fn adler32_of(out: [Byte], n: Int) -> Int:
-  var a = 1
-  var b = 0
-  var i = 0
-  while i < n:
-    let end = min(i + 5552, n)
+  return adler_more(1, out, 0, n)
+
+# The Adler-32 of what adler covers followed by out[from..to] (adler 1 to start).
+fn adler_more(adler: Int, out: [Byte], from: Int, to: Int) -> Int:
+  var a = adler & 65535
+  var b = adler >> 16
+  var i = from
+  while i < to:
+    let end = min(i + 5552, to)
     # 8 bytes a pass, then the rest (every add here is checked once, before the loop)
     let whole = i + (end - i) / 8 * 8
     for k in i..whole by 8:
@@ -248,12 +274,12 @@ fn inflate_into(data: Str, var b: Bits, var out: [Byte], max: Int) -> Int throws
     elif kind == 1:
       let lit = fixed_lit()
       let dist = fixed_dist()
-      n = codes(data, &b, lit, dist, &out, n, max)?
+      n = codes(data, &b, lit, dist, &out, n, max, false)?
     elif kind == 2:
       var lit = no_code()
       var dist = no_code()
       dynamic_codes(data, &b, &lit, &dist)?
-      n = codes(data, &b, lit, dist, &out, n, max)?
+      n = codes(data, &b, lit, dist, &out, n, max, false)?
     else: fail "invalid block type"
   return n
 
@@ -321,7 +347,9 @@ fn dist_extra() -> [Int]:
 
 
 # The literal/length and distance symbols of a compressed block, into out from n on.
-fn codes(data: Str, var b: Bits, lit: Code, dist: Code, var out: [Byte], n0: Int, max: Int) -> Int throws:
+# stream: more input may follow, so stop (b.wait) rather than start a symbol that might not be all
+# there: one literal/length and distance pair uses at most 48 bits.
+fn codes(data: Str, var b: Bits, lit: Code, dist: Code, var out: [Byte], n0: Int, max: Int, stream: Bool) -> Int throws:
   let lt = lit.table
   let dt = dist.table
   let lbase = len_base()
@@ -348,6 +376,12 @@ fn codes(data: Str, var b: Bits, lit: Code, dist: Code, var out: [Byte], n0: Int
           buf = buf | int(data[pos]) << (cnt & 63)   # (cnt <= 48 here; the mask says so)
           pos += 1
           cnt += 8
+        if stream and cnt < 48:
+          b.pos = pos
+          b.bitbuf = buf
+          b.bitcnt = cnt
+          b.wait = true
+          return n
     var e = lt[buf & 1023]
     var sym = 0
     if e & 15 != 0 and e & 15 <= cnt:
@@ -579,3 +613,717 @@ fn need_some(data: Str, var b: Bits, k: Int):
     b.bitbuf = b.bitbuf | int(data[b.pos]) << b.bitcnt
     b.pos += 1
     b.bitcnt += 8
+
+# ============================================================================ compression
+#
+#   let z = zlib.compress(text)              # zlib format: zlib.decompress (and Python's) reads it back
+#   let gz = zlib.gzip(body)                 # gzip format (Content-Encoding: gzip, .gz files)
+#   let raw = zlib.deflate(data)             # raw DEFLATE
+#   let fast = zlib.compress_level(text, 1)  # 0 (stored, no compression) to 9 (smallest); 6 by default
+#
+# As zlib does it: repeated strings found through hash chains over a 32 KB window (with lazy
+# matching from level 4 up), then each block of symbols written with whichever costs fewest bits of
+# its own Huffman codes, the fixed codes, or no compression.
+
+fn compress(data: Str) -> Str:
+  return compress_level(data, 6)
+
+fn gzip(data: Str) -> Str:
+  return gzip_level(data, 6)
+
+fn deflate(data: Str) -> Str:
+  return deflate_level(data, 6)
+
+fn compress_level(data: Str, level: Int) -> Str:
+  var w = Writer([], 0, 0)
+  w.out.push(0x78)
+  if level <= 1: w.out.push(0x01)
+  elif level <= 5: w.out.push(0x5E)
+  elif level == 6: w.out.push(0x9C)
+  else: w.out.push(0xDA)
+  deflate_into(data, level, &w)
+  let a = adler32(data)
+  for k in 0..4: w.out.push(byte((a >> (24 - 8 * k)) & 255))
+  return w.out.take_str()
+
+fn gzip_level(data: Str, level: Int) -> Str:
+  var w = Writer([0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 3], 0, 0)
+  if level >= 9: w.out[8] = 2
+  elif level <= 1: w.out[8] = 4
+  deflate_into(data, level, &w)
+  let c = crc32(data)
+  for k in 0..4: w.out.push(byte((c >> (8 * k)) & 255))
+  let n = data.len & 0xFFFFFFFF
+  for k in 0..4: w.out.push(byte((n >> (8 * k)) & 255))
+  return w.out.take_str()
+
+fn deflate_level(data: Str, level: Int) -> Str:
+  var w = Writer([], 0, 0)
+  deflate_into(data, level, &w)
+  return w.out.take_str()
+
+# Bits are written lowest first, as DEFLATE packs them.
+type Writer:
+  out: [Byte]
+  buf: Int     # bits not yet written out (fewer than 8 between calls)
+  n: Int
+
+fn put(var w: Writer, v: Int, n: Int):
+  w.buf = w.buf | (v << w.n)
+  w.n += n
+  while w.n >= 8:
+    w.out.push(byte(w.buf & 255))
+    w.buf = w.buf >> 8
+    w.n -= 8
+
+fn flush_byte(var w: Writer):
+  if w.n > 0:
+    w.out.push(byte(w.buf & 255))
+    w.buf = 0
+    w.n = 0
+
+# Search effort by level: how long a match is good enough to stop looking (nice), how many chain links
+# to follow (chain), and below which length to try the next position too (lazy; 0: no lazy matching).
+type Effort:
+  nice, chain, lazy: Int
+
+fn effort(level: Int) -> Effort:
+  if level <= 1: return Effort(8, 4, 0)
+  if level == 2: return Effort(16, 8, 0)
+  if level == 3: return Effort(32, 32, 0)
+  if level == 4: return Effort(16, 16, 4)
+  if level == 5: return Effort(32, 32, 16)
+  if level == 6: return Effort(128, 128, 16)
+  if level == 7: return Effort(128, 256, 32)
+  if level == 8: return Effort(258, 1024, 128)
+  return Effort(258, 4096, 258)
+
+const WSIZE = 32768
+const HSIZE = 32768
+const BLOCK = 16384   # symbols per block
+
+# The symbols of the block being collected: a literal byte (dist 0), or a match of length 3..258 at
+# distance 1..32768.
+type Syms:
+  lens: [Int]
+  dists: [Int]
+  start: Int   # where the block's bytes start in the input (for a stored block)
+
+fn deflate_into(data: Str, level: Int, var w: Writer):
+  let n = data.len
+  if n == 0 and level > 0:
+    put(&w, 1, 1)
+    put(&w, 1, 2)
+    put(&w, 0, 7)
+    flush_byte(&w)
+    return
+  if level <= 0:
+    stored_blocks(data, 0, n, true, &w)
+    flush_byte(&w)
+    return
+  let ef = effort(level)
+  let tb = tables()
+  var head = [-1] * HSIZE
+  var prev = [-1] * WSIZE
+  var s = Syms([], [], 0)
+  s.lens.reserve(BLOCK)
+  s.dists.reserve(BLOCK)
+  var i = 0
+  # a match found at the previous position, held to see whether this one has a longer one (lazy)
+  var held_len = 0
+  var held_dist = 0
+  while i < n:
+    var best = 0
+    var bdist = 0
+    if i + 2 < n:
+      let h = ((int(data[i]) << 10) ^ (int(data[i + 1]) << 5) ^ int(data[i + 2])) & (HSIZE - 1)
+      var cand = head[h]
+      prev[i & (WSIZE - 1)] = cand
+      head[h] = i
+      var chain = ef.chain
+      if held_len >= ef.nice: chain = 0
+      let lim = min(258, n - i)
+      while cand >= 0 and i - cand <= WSIZE and chain > 0:
+        if best == 0 or (best < lim and data[cand + best] == data[i + best]):
+          var k = 0
+          while k < lim and data[cand + k] == data[i + k]: k += 1
+          if k > best:
+            best = k
+            bdist = i - cand
+            if k >= ef.nice: break
+        cand = prev[cand & (WSIZE - 1)]
+        chain -= 1
+      if best < 3: best = 0
+    if held_len > 0:
+      if best > held_len:
+        # the match here is longer: the held one's first byte goes as a literal
+        lit_sym(&s, int(data[i - 1]))
+        if best >= ef.lazy or best >= ef.nice:
+          match_sym(&s, best, bdist)
+          skip(data, i, best, &head, &prev)
+          i += best
+          held_len = 0
+        else:
+          held_len = best
+          held_dist = bdist
+          i += 1
+      else:
+        match_sym(&s, held_len, held_dist)
+        # (position i - 1 started the match, and i is already in the chains)
+        skip(data, i, held_len - 1, &head, &prev)
+        i += held_len - 1
+        held_len = 0
+    elif best > 0 and ef.lazy > 0 and best < ef.lazy and i + 1 < n:
+      held_len = best
+      held_dist = bdist
+      i += 1
+    elif best > 0:
+      match_sym(&s, best, bdist)
+      skip(data, i, best, &head, &prev)
+      i += best
+    else:
+      lit_sym(&s, int(data[i]))
+      i += 1
+    if s.lens.len >= BLOCK and held_len == 0:
+      write_block(data, &s, i, false, tb, &w)
+  if held_len > 0: match_sym(&s, held_len, held_dist)
+  write_block(data, &s, n, true, tb, &w)
+  flush_byte(&w)
+
+fn lit_sym(var s: Syms, b: Int):
+  s.lens.push(b)
+  s.dists.push(0)
+
+fn match_sym(var s: Syms, len: Int, dist: Int):
+  s.lens.push(len)
+  s.dists.push(dist)
+
+# Positions i+1 .. i+count-1 go into the hash chains (i is already there).
+fn skip(data: Str, i: Int, count: Int, var head: [Int], var prev: [Int]):
+  let n = data.len
+  var j = i + 1
+  let end = min(i + count, n - 2)
+  while j < end:
+    let h = ((int(data[j]) << 10) ^ (int(data[j + 1]) << 5) ^ int(data[j + 2])) & (HSIZE - 1)
+    prev[j & (WSIZE - 1)] = head[h]
+    head[h] = j
+    j += 1
+
+# Codes looked up instead of searched for: lcode[len] for lengths 0..258, and the distance code of d
+# from dlow[d - 1] (d <= 256) or dhigh[(d - 1) >> 7].
+type Tables:
+  lcode, dlow, dhigh: [Int]
+  lextra, dextra, lbase, dbase: [Int]
+
+fn tables() -> Tables:
+  var lc = [0] * 259
+  for len in 3..259: lc[len] = len_code(len)
+  var dl = [0] * 256
+  for d in 1..257: dl[d - 1] = dist_code(d)
+  var dh = [0] * 256
+  for q in 2..256: dh[q] = dist_code((q << 7) + 1)
+  return Tables(lc, dl, dh, len_extra(), dist_extra(), len_base(), dist_base())
+
+fn dcode(t: Tables, d: Int) -> Int:
+  if d <= 256: return t.dlow[(d - 1) & 255]
+  return t.dhigh[((d - 1) >> 7) & 255]
+
+# The length code (257..285) of a match length, and the distance code (0..29) of a distance.
+fn len_code(len: Int) -> Int:
+  let base = len_base()
+  var c = 28
+  while c > 0 and base[c] > len: c -= 1
+  return 257 + c
+
+fn dist_code(d: Int) -> Int:
+  let base = dist_base()
+  var c = 29
+  while c > 0 and base[c] > d: c -= 1
+  return c
+
+# Writes the collected symbols as one block (bytes up to `end` of the input), then empties them.
+fn write_block(data: Str, var s: Syms, end: Int, last: Bool, tb: Tables, var w: Writer):
+  var lf = [0] * 286
+  var df = [0] * 30
+  var lcodes: [Int] = []
+  var dcodes: [Int] = []
+  lcodes.reserve(s.lens.len)
+  dcodes.reserve(s.lens.len)
+  for k in 0..s.lens.len:
+    if s.dists[k] == 0:
+      lf[s.lens[k]] += 1
+      lcodes.push(s.lens[k])
+      dcodes.push(-1)
+    else:
+      let lc = tb.lcode[s.lens[k] & 511]
+      let dc = dcode(tb, s.dists[k])
+      lf[lc] += 1
+      df[dc] += 1
+      lcodes.push(lc)
+      dcodes.push(dc)
+  lf[256] = 1
+  # every code needs two symbols at least (zlib refuses an incomplete code otherwise)
+  ensure_two(&lf)
+  ensure_two(&df)
+  let ll = huff_lengths(lf, 15)
+  let dl = huff_lengths(df, 15)
+  # the extra bits are the same whichever codes are used
+  var extra = 0
+  for k in 0..s.lens.len:
+    if dcodes[k] >= 0: extra += tb.lextra[(lcodes[k] - 257) & 31] + tb.dextra[dcodes[k] & 31]
+  var hlit = 286
+  while hlit > 257 and ll[hlit - 1] == 0: hlit -= 1
+  var hdist = 30
+  while hdist > 1 and dl[hdist - 1] == 0: hdist -= 1
+  var seq: [Int] = []
+  for k in 0..hlit: seq.push(ll[k])
+  for k in 0..hdist: seq.push(dl[k])
+  let rle = run_lengths(seq)
+  var cf = [0] * 19
+  var k = 0
+  while k < rle.len:
+    cf[rle[k]] += 1
+    k += 2
+  ensure_two(&cf)
+  let cl = huff_lengths(cf, 7)
+  let ord = order()
+  var hclen = 19
+  while hclen > 4 and cl[ord[hclen - 1]] == 0: hclen -= 1
+  var dyn_bits = 3 + 14 + 3 * hclen
+  k = 0
+  while k < rle.len:
+    let sym = rle[k]
+    dyn_bits += cl[sym]
+    if sym == 16: dyn_bits += 2
+    elif sym == 17: dyn_bits += 3
+    elif sym == 18: dyn_bits += 7
+    k += 2
+  var fix_bits = 3
+  for j in 0..286:
+    dyn_bits += lf[j] * ll[j]
+    fix_bits += lf[j] * fixed_len(j)
+  for j in 0..30:
+    dyn_bits += df[j] * dl[j]
+    fix_bits += df[j] * 5
+  # (the two forced symbols aren't in the data: take them out again)
+  dyn_bits += extra
+  fix_bits += extra
+  let raw = end - s.start
+  let stored_bits = (raw + 5 * ((raw + 65534) / 65535 + 1)) * 8 + 16
+  if stored_bits <= dyn_bits and stored_bits <= fix_bits:
+    stored_blocks(data, s.start, end, last, &w)
+  elif fix_bits <= dyn_bits:
+    var fl = [8] * 288
+    for j in 144..256: fl[j] = 9
+    for j in 256..280: fl[j] = 7
+    put(&w, if_int(last), 1)
+    put(&w, 1, 2)
+    write_syms(&w, s, lcodes, dcodes, canonical(fl), fl, canonical([5] * 30), [5] * 30, tb)
+  else:
+    put(&w, if_int(last), 1)
+    put(&w, 2, 2)
+    put(&w, hlit - 257, 5)
+    put(&w, hdist - 1, 5)
+    put(&w, hclen - 4, 4)
+    for j in 0..hclen: put(&w, cl[ord[j]], 3)
+    let cc = canonical(cl)
+    k = 0
+    while k < rle.len:
+      let sym = rle[k]
+      put(&w, cc[sym], cl[sym])
+      if sym == 16: put(&w, rle[k + 1], 2)
+      elif sym == 17: put(&w, rle[k + 1], 3)
+      elif sym == 18: put(&w, rle[k + 1], 7)
+      k += 2
+    write_syms(&w, s, lcodes, dcodes, canonical(ll), ll, canonical(dl), dl, tb)
+  s.lens.truncate(0)
+  s.dists.truncate(0)
+  s.start = end
+
+fn if_int(b: Bool) -> Int:
+  if b: return 1
+  return 0
+
+fn fixed_len(sym: Int) -> Int:
+  if sym < 144: return 8
+  if sym < 256: return 9
+  if sym < 280: return 7
+  return 8
+
+fn write_syms(var w: Writer, s: Syms, lcodes: [Int], dcodes: [Int], lc: [Int], ll: [Int], dc: [Int], dl: [Int], tb: Tables):
+  let lb = tb.lbase
+  let le = tb.lextra
+  let db = tb.dbase
+  let de = tb.dextra
+  for k in 0..lcodes.len:
+    let c = lcodes[k]
+    put(&w, lc[c], ll[c])
+    if dcodes[k] >= 0:
+      let x = c - 257
+      if le[x & 31] > 0: put(&w, s.lens[k] - lb[x & 31], le[x & 31])
+      let d = dcodes[k]
+      put(&w, dc[d], dl[d])
+      if de[d & 31] > 0: put(&w, s.dists[k] - db[d & 31], de[d & 31])
+  put(&w, lc[256], ll[256])
+
+fn stored_blocks(data: Str, from: Int, end: Int, last: Bool, var w: Writer):
+  var at = from
+  while true:
+    let len = min(65535, end - at)
+    let fin = last and at + len >= end
+    put(&w, if_int(fin), 1)
+    put(&w, 0, 2)
+    flush_byte(&w)
+    w.out.push(byte(len & 255))
+    w.out.push(byte(len >> 8))
+    w.out.push(byte((len & 255) ^ 255))
+    w.out.push(byte((len >> 8) ^ 255))
+    for j in at..at + len: w.out.push(data[j])
+    at += len
+    if at >= end: break
+
+# Code lengths, run-length coded as DEFLATE's header does: pairs (symbol, extra-bits value), 16 repeating
+# the previous length 3-6 times, 17 and 18 runs of zeros (3-10, 11-138).
+fn run_lengths(seq: [Int]) -> [Int]:
+  var out: [Int] = []
+  var i = 0
+  while i < seq.len:
+    let v = seq[i]
+    var run = 1
+    while i + run < seq.len and seq[i + run] == v: run += 1
+    if v == 0 and run >= 3:
+      var left = run
+      while left >= 11:
+        let t = min(left, 138)
+        out.push(18)
+        out.push(t - 11)
+        left -= t
+      if left >= 3:
+        out.push(17)
+        out.push(left - 3)
+        left = 0
+      for q in 0..left:
+        out.push(0)
+        out.push(0)
+    elif v != 0 and run >= 4:
+      out.push(v)
+      out.push(0)
+      var left = run - 1
+      while left >= 3:
+        let t = min(left, 6)
+        out.push(16)
+        out.push(t - 3)
+        left -= t
+      for q in 0..left:
+        out.push(v)
+        out.push(0)
+    else:
+      for q in 0..run:
+        out.push(v)
+        out.push(0)
+    i += run
+  return out
+
+fn ensure_two(var f: [Int]):
+  var used = 0
+  for x in f:
+    if x > 0: used += 1
+  var j = 0
+  while used < 2 and j < f.len:
+    if f[j] == 0:
+      f[j] = 1
+      used += 1
+    j += 1
+
+# Huffman code lengths for these frequencies, none longer than limit: a Huffman tree built from the
+# two lightest nodes each time, with the frequencies halved and tried again while it's too deep.
+fn huff_lengths(freq: [Int], limit: Int) -> [Int]:
+  let n = freq.len
+  var f: [Int] = []
+  for x in freq: f.push(x)
+  while true:
+    let lens = huff_try(f)
+    var deepest = 0
+    for x in lens: deepest = max(deepest, x)
+    if deepest <= limit: return lens
+    for j in 0..n:
+      if f[j] > 0: f[j] = max(1, f[j] / 2)
+
+fn huff_try(f: [Int]) -> [Int]:
+  let n = f.len
+  var leaves: [Int] = []   # weight << 16 | symbol, sorted
+  for j in 0..n:
+    if f[j] > 0: leaves.push((f[j] << 16) | j)
+  leaves.sort()
+  var lens = [0] * n
+  if leaves.len == 1:
+    lens[leaves[0] & 0xFFFF] = 1
+    return lens
+  # nodes: leaves 0..m-1, then internal ones in the order they're made (their weights never decrease)
+  let m = leaves.len
+  var weight: [Int] = []
+  for x in leaves: weight.push(x >> 16)
+  var parent = [-1] * (2 * m)
+  var li = 0
+  var ni = m
+  var made = m
+  while made < 2 * m - 1:
+    var pick = [0, 0]
+    for q in 0..2:
+      if li < m and (ni >= made or weight[li] <= weight[ni]):
+        pick[q] = li
+        li += 1
+      else:
+        pick[q] = ni
+        ni += 1
+    weight.push(weight[pick[0]] + weight[pick[1]])
+    parent[pick[0]] = made
+    parent[pick[1]] = made
+    made += 1
+  var depth = [0] * (2 * m)
+  var k = 2 * m - 3
+  while k >= 0:
+    depth[k] = depth[parent[k]] + 1
+    k -= 1
+  for q in 0..m: lens[leaves[q] & 0xFFFF] = depth[q]
+  return lens
+
+# Canonical codes for code lengths, bit-reversed (DEFLATE sends a code's highest bit first, and put
+# writes the lowest bit first).
+fn canonical(lens: [Int]) -> [Int]:
+  var count = [0] * 16
+  for l in lens: count[l & 15] += 1
+  count[0] = 0
+  var next = [0] * 16
+  var code = 0
+  for b in 1..16:
+    code = (code + count[b - 1]) << 1
+    next[b] = code
+  var out = [0] * lens.len
+  for j in 0..lens.len:
+    let l = lens[j]
+    if l > 0:
+      var c = next[l & 15]
+      next[l & 15] += 1
+      var r = 0
+      for q in 0..l:
+        r = (r << 1) | (c & 1)
+        c = c >> 1
+      out[j] = r
+  return out
+
+# ---- streaming: input in pieces, output as it's decoded
+
+const P_HEAD = 0
+const P_BLOCK = 1
+const P_STORED = 2
+const P_CODES = 3
+const P_TRAIL = 4
+const P_DONE = 5
+const TRUNC = "incomplete or truncated stream"
+
+type Stream:
+  format: Int      # 0 zlib, 1 gzip, 2 raw
+  max: Int
+  pending: Str     # input not used yet, from b.pos on
+  b: Bits
+  phase: Int
+  last: Bool       # the current block is the last one
+  left: Int        # bytes left in a stored block
+  lit, dist: Code
+  out: [Byte]      # recent output: what a distance can reach back to (32 KB), and what isn't returned yet
+  n: Int           # bytes in out
+  given: Int       # out[0..given) has been returned
+  summed: Int      # and is in check
+  dropped: Int     # bytes dropped from the front of out: the result so far is dropped + n long
+  check: Int       # Adler-32 (zlib) or CRC-32 (gzip) of the result so far
+  unused: Str      # input after the end of the stream
+
+# A decoder for format "zlib", "gzip" or "raw" (max: fail once the result would pass this many bytes;
+# 0 for no limit). After it fails, it can't be used again.
+fn stream(format: Str, max: Int) -> Stream throws:
+  var f = 0
+  if format == "gzip": f = 1
+  elif format == "raw": f = 2
+  elif format != "zlib": fail "zlib.stream's format is \"zlib\", \"gzip\" or \"raw\", not \"" + format + "\""
+  var check = 0
+  if f == 0: check = 1
+  var phase = P_HEAD
+  if f == 2: phase = P_BLOCK
+  var out: [Byte] = [0] * 98304
+  return Stream(f, max, "", Bits(0, 0, 0, false), phase, false, 0, no_code(), no_code(), out, 0, 0, 0, 0, check, "")
+
+# The output that piece (and the pieces before it) decode to, as far as they go.
+fn feed(var z: Stream, piece: Str) -> Str throws:
+  if z.phase == P_DONE:
+    z.unused += piece
+    return ""
+  # keep the whole bytes the bit buffer read ahead: the trailer is read from them if the stream ends there
+  let keep = max(0, z.b.pos - z.b.bitcnt / 8)
+  z.pending = z.pending[keep..z.pending.len] + piece
+  z.b.pos -= keep
+  run(&z, false)?
+  return output(&z)
+
+# The rest of the output, once all the input has been fed; fails if the stream stopped short.
+fn finish(var z: Stream) -> Str throws:
+  if z.phase != P_DONE:
+    let keep = max(0, z.b.pos - z.b.bitcnt / 8)
+    z.pending = z.pending[keep..z.pending.len]
+    z.b.pos -= keep
+    run(&z, true)?
+    if z.phase != P_DONE: fail TRUNC
+  return output(&z)
+
+# Whether the end of the stream has been reached.
+fn done(z: Stream) -> Bool:
+  return z.phase == P_DONE
+
+# The input that came after the end of the stream.
+fn unused(z: Stream) -> Str:
+  return z.unused + ""
+
+fn sum_up(var z: Stream):
+  if z.summed < z.n:
+    if z.format == 0: z.check = adler_more(z.check, z.out, z.summed, z.n)
+    elif z.format == 1: z.check = crc_more(z.check, z.out, z.summed, z.n)
+    z.summed = z.n
+
+# What's been decoded since the last call, then the window cut to its last 32 KB.
+fn output(var z: Stream) -> Str:
+  sum_up(&z)
+  let r = range_str(z.out, z.given, z.n)
+  z.given = z.n
+  if z.n > 65536:
+    z.out.copy_within(0, z.n - 32768, 32768)
+    z.dropped += z.n - 32768
+    z.n = 32768
+    z.given = 32768
+    z.summed = 32768
+  return r
+
+fn range_str(out: [Byte], from: Int, to: Int) -> Str:
+  let part = out[from..to]
+  return str(part)
+
+# The size limit for out, which starts dropped bytes into the result (0: none).
+fn limit(z: Stream) -> Int:
+  if z.max == 0: return 0
+  return z.max - z.dropped
+
+# Decodes as much of z.pending as there is (all of it, when final: then too little input is an error).
+fn run(var z: Stream, final: Bool) throws:
+  while true:
+    let ph = z.phase
+    if ph == P_HEAD:
+      if z.format == 0:
+        if z.pending.len < 2 and not final: return
+        zlib_header(z.pending)?
+        z.b.pos = 2
+      else:
+        match gzip_header(z.pending):
+          ok(at): z.b.pos = at
+          err(e):
+            if e == TRUNC and not final: return
+            fail e
+      z.phase = P_BLOCK
+    elif ph == P_BLOCK:
+      if z.last:
+        z.phase = P_TRAIL
+        continue
+      let save = Bits(z.b.pos, z.b.bitbuf, z.b.bitcnt, false)
+      match block_head(&z):
+        ok: continue
+        err(e):
+          if e == TRUNC and not final:
+            z.b = save
+            return
+          fail e
+    elif ph == P_STORED:
+      let k = min(z.left, z.pending.len - z.b.pos)
+      if k > 0:
+        let lim = limit(z)
+        if lim > 0 and z.n + k > lim: fail "the result is longer than {z.max} bytes"
+        if z.n + k + 16 > z.out.len: room(&z.out, z.n + k + 16, 0)?
+        var src = ""
+        swap(&src, &z.pending)
+        let p = z.b.pos
+        let at = z.n
+        for i in 0..k: z.out[at + i] = src[p + i]
+        swap(&src, &z.pending)
+        z.left -= k
+        z.b.pos += k
+        z.n += k
+      if z.left > 0:
+        if final: fail TRUNC
+        return
+      z.phase = P_BLOCK
+    elif ph == P_CODES:
+      var data = ""
+      swap(&data, &z.pending)
+      var out: [Byte] = []
+      swap(&out, &z.out)
+      var b = Bits(z.b.pos, z.b.bitbuf, z.b.bitcnt, false)
+      let lim = limit(z)
+      let n = codes(data, &b, z.lit, z.dist, &out, z.n, lim, not final)?
+      swap(&data, &z.pending)
+      swap(&out, &z.out)
+      z.b = b
+      z.n = n
+      if b.wait:
+        z.b.wait = false
+        return
+      z.phase = P_BLOCK
+    elif ph == P_TRAIL:
+      let at = z.b.pos - z.b.bitcnt / 8   # (whole bytes read ahead go back)
+      var size = 0
+      if z.format == 0: size = 4
+      elif z.format == 1: size = 8
+      if at + size > z.pending.len:
+        if final: fail TRUNC
+        return
+      sum_up(&z)
+      if z.format == 0:
+        let want = int(z.pending[at]) << 24 | int(z.pending[at + 1]) << 16 | int(z.pending[at + 2]) << 8 | int(z.pending[at + 3])
+        if z.check != want: fail "incorrect data check"
+      elif z.format == 1:
+        if z.check != le32(z.pending, at): fail "incorrect data check"
+        if (z.dropped + z.n) & 4294967295 != le32(z.pending, at + 4): fail "incorrect length check"
+      z.unused = z.pending[at + size..z.pending.len]
+      z.pending = ""
+      z.b = Bits(0, 0, 0, false)
+      z.phase = P_DONE
+      return
+    else: return
+
+# A block's header (and its codes): phase P_STORED or P_CODES. Changes nothing in z if it fails.
+fn block_head(var z: Stream) throws:
+  var b = Bits(z.b.pos, z.b.bitbuf, z.b.bitcnt, false)
+  need(z.pending, &b, 3)?
+  let last = b.bitbuf & 1 == 1
+  let kind = b.bitbuf >> 1 & 3
+  drop(&b, 3)
+  if kind == 0:
+    drop(&b, b.bitcnt & 7)
+    let len = take(z.pending, &b, 16)?
+    let nlen = take(z.pending, &b, 16)?
+    if len != nlen ^ 65535: fail "invalid stored block lengths"
+    b.pos -= b.bitcnt / 8
+    b.bitbuf = 0
+    b.bitcnt = 0
+    z.left = len
+    z.phase = P_STORED
+  elif kind == 1:
+    z.lit = fixed_lit()
+    z.dist = fixed_dist()
+    z.phase = P_CODES
+  elif kind == 2:
+    var lit = no_code()
+    var dist = no_code()
+    dynamic_codes(z.pending, &b, &lit, &dist)?
+    swap(&lit, &z.lit)
+    swap(&dist, &z.dist)
+    z.phase = P_CODES
+  else: fail "invalid block type"
+  z.b = b
+  z.last = last

@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 VU = os.environ.get('VU', f'{HERE}/../vu').split()
 seeds = int(sys.argv[1]) if len(sys.argv) > 1 else 6
 per = int(sys.argv[2]) if len(sys.argv) > 2 else 400
-WBITS = {0: 15, 1: 31, 2: -15}
+WBITS = {0: 15, 1: 31, 2: -15, 4: 15, 5: 31, 6: -15}
 
 
 def sample(r, depth=0):
@@ -110,6 +110,10 @@ def python(mode, blob, limit):
         return 'err', str(e).split(': ', 1)[-1]
     if limit and len(out) > limit:
         return 'err', 'the result is longer than'
+    if mode >= 4:   # streamed: also the input after the end of the stream
+        d = zlib.decompressobj(WBITS[mode])
+        d.decompress(blob)
+        return 'ok', f'{len(out)} {zlib.crc32(out)} {len(d.unused_data)}'
     return 'ok', f'{len(out)} {zlib.crc32(out)}'
 
 
@@ -130,29 +134,31 @@ def main():
             r = random.Random(seed * 7919 + (name == 'sanitizers'))
             cases = []
             for _ in range(per):
-                mode = r.randrange(4)
+                mode = r.choice([0, 1, 2, 3, 4, 5, 6, 4, 5, 6])
                 data = sample(r)
                 if mode == 3:
-                    cases.append((3, 0, data, ('crc', f'{zlib.crc32(data)} {zlib.adler32(data)}')))
+                    cases.append((3, 0, data, ('crc', f'{zlib.crc32(data)} {zlib.adler32(data)}'), 0))
                     continue
-                blob = compress(r, data, mode)
+                blob = compress(r, data, mode if mode < 4 else mode - 4)
                 if r.random() < 0.4:
                     blob = damage(r, blob)
                 limit = 0
                 if r.random() < 0.1:
                     limit = r.randint(1, max(1, len(data) * 2))
-                cases.append((mode, limit, blob, python(mode, blob, limit)))
+                piece = r.choice([1, 2, 7, 100, 4096, 65536, 1 << 20])
+                if mode >= 4 and piece < 7 and len(blob) > 20000: piece = 13   # (a byte at a time is slow in Python's harness, not in Vu)
+                cases.append((mode, limit, blob, python(mode, blob, limit), piece))
             path = os.path.join(work, 'cases')
             with open(path, 'wb') as f:
-                for mode, limit, blob, _ in cases:
-                    f.write(bytes([mode]) + struct.pack('<II', limit, len(blob)) + blob)
+                for mode, limit, blob, _, piece in cases:
+                    f.write(bytes([mode]) + struct.pack('<III', limit, piece, len(blob)) + blob)
             p = subprocess.run([exe, path], capture_output=True, timeout=600)
             lines = p.stdout.decode('latin-1').split('\n')
             if p.returncode != 0 or len(lines) < len(cases):
                 failed += 1
                 print(f'FAIL  {name} seed {seed}: exit {p.returncode}, {len(lines) - 1} of {len(cases)} answers\n      {p.stderr.decode("latin-1")[-600:]}')
                 continue
-            for i, (mode, limit, blob, want) in enumerate(cases):
+            for i, (mode, limit, blob, want, piece) in enumerate(cases):
                 kind, _, rest = lines[i].partition(' ')
                 ok = kind == want[0] and (kind == 'err' or rest == want[1])
                 if kind == 'err' and want[0] == 'err' and not limit:   # (with a limit, Vu may stop before the damage)
@@ -173,7 +179,7 @@ def main():
     bomb = gzip.compress(b'\0' * (200 << 20), 9)
     path = os.path.join(work, 'bomb')
     with open(path, 'wb') as f:
-        f.write(bytes([1]) + struct.pack('<II', 1 << 20, len(bomb)) + bomb)
+        f.write(bytes([5]) + struct.pack('<III', 1 << 20, 4096, len(bomb)) + bomb)
     b = subprocess.run(VU + ['build', f'{HERE}/zlib/driver.vu', '-o', exe], capture_output=True, text=True)
     t = time.perf_counter()
     # (started from a small helper: a process's peak memory survives fork and exec, and this one is big)

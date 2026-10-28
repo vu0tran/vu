@@ -153,6 +153,73 @@ bad = [(c, w, g) for c, w, g in zip(cases, want, got) if w != g]
 check(f'unit: {len(cases)} random cases (routes, forms, escaping, cookies, templates) match the model',
       r.returncode == 0 and len(got) == len(cases) and not bad, (r.returncode, r.stderr[-300:], len(got), bad[:3]))
 
+# ---- 1b. multipart bodies
+mp_exe = build(os.path.join(WEB, 'multipart.vu'))
+exe = mp_exe
+rng = random.Random(9)
+def q(s):  # quoted-string with \" and \\ escaped
+    return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+def safe(name):
+    start = 0
+    for i, c in enumerate(name):
+        if c in '/\\': start = i + 1
+    out = ''
+    for c in name[start:]:
+        if ord(c) < 32 or ord(c) == 127 or c in '":*?<>|': continue
+        if out == '' and c in '. ': continue
+        out += c
+    out = out[:200]
+    return out or 'upload'
+def run(ct, body):
+    p = subprocess.run([exe], input=(ct + '\n').encode() + body, capture_output=True)
+    return p.stdout.decode()
+bad = 0; n = 0
+msgs = []
+for trial in range(400):
+    b = ''.join(rng.choice('abcXYZ0123-_') for _ in range(rng.randint(1, 70)))
+    parts = []
+    for _ in range(rng.randint(0, 5)):
+        name = ''.join(rng.choice('ab;= "\\é') for _ in range(rng.randint(0, 6)))
+        fname = ''.join(rng.choice('a./\\ "..x:') for _ in range(rng.randint(0, 8))) if rng.random() < 0.5 else None
+        data = bytes(rng.choice(b'ab\r\n-' + b.encode()[:3]) for _ in range(rng.randint(0, 40)))
+        if rng.random() < 0.2: data += b'\r\n--' + b.encode()[:-1]   # a near-boundary inside the data
+        ctype = rng.choice([None, 'image/png', 'text/plain; charset=utf-8'])
+        parts.append((name, fname, ctype, data))
+    body = b''
+    if rng.random() < 0.3: body += b'preamble text\r\n'
+    for name, fname, ctype, data in parts:
+        body += b'--' + b.encode() + (b'  ' if rng.random() < 0.2 else b'') + b'\r\n'
+        cd = 'form-data; name=' + q(name) + ('' if fname is None else '; filename=' + q(fname))
+        body += b'Content-Disposition: ' + cd.encode() + b'\r\n'
+        if ctype: body += b'Content-Type: ' + ctype.encode() + b'\r\n'
+        body += b'\r\n' + data + b'\r\n'
+    body += b'--' + b.encode() + b'--\r\n'
+    if rng.random() < 0.3: body += b'epilogue'
+    if not parts: body = b'--' + b.encode() + b'--\r\n'
+    ct = 'multipart/form-data; boundary=' + (q(b) if rng.random() < 0.5 else b)
+    want = ''.join(f"{n_.encode().hex()} {(f or '').encode().hex()} {(c or 'text/plain').encode().hex()} {d.hex()} {safe(f or '').encode().hex()}\n" for n_, f, c, d in parts)
+    got = run(ct, body); n += 1
+    if got != want:
+        bad += 1
+        msgs.append((ct, body[:200], got[:200], want[:200]))
+# hostile
+hostile = [
+  ('multipart/form-data; boundary=x', b'--x\r\nContent-Disposition: form-data; name="a"\r\n\r\nno end', 'error'),
+  ('multipart/form-data; boundary=x', b'--x\r\nContent-Disposition: form-data\r\n\r\nv\r\n--x--', 'error'),
+  ('multipart/form-data; boundary=x', b'--x\r\nX: ' + b'a' * 9000 + b'\r\n\r\nv\r\n--x--', 'error'),
+  ('multipart/form-data; boundary=x', b''.join(b'--x\r\nContent-Disposition: form-data; name="a"\r\n\r\nv\r\n' for _ in range(1001)) + b'--x--', 'error'),
+  ('multipart/form-data', b'--x--', 'error'),
+  ('text/plain', b'--x--', 'error'),
+  ('multipart/form-data; boundary=x', b'garbage', 'error'),
+  ('multipart/form-data; boundary=x', b'--xjunk\r\nContent-Disposition: form-data; name="a"\r\n\r\nv\r\n--x--', 'error'),
+  ('multipart/form-data; boundary=x', b'--x\r\nContent-Disposition: attachment; name="a"\r\n\r\nv\r\n--x--', 'error'),
+]
+for ct, body, want in hostile:
+    got = run(ct, body); n += 1
+    if not got.startswith('error'):
+        bad += 1; msgs.append(('HOSTILE accepted', ct, body[:60], got[:100]))
+check(f'multipart: {n - len(hostile)} random forms (quoted names, files, near-boundaries in the data, preamble, padding) and {len(hostile)} broken ones', bad == 0, msgs[:3])
+
 # ---- 2. the app over HTTP
 
 app = build(os.path.join(WEB, 'app.vu'))

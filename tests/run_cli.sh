@@ -82,5 +82,14 @@ out=$($VU version 2>&1); rc=$?
 [ $rc -eq 0 ] && [ "$out" = "vu 0.1.0" ]
 check "version: prints the release" $? "rc=$rc out=[$out]"
 
+printf 'fn f(xs: [Int]) -> Int:\n  var t = 0\n  for i in 0..xs.len: t += xs[i]\n  return t\nfn main():\n  print("{f([1, 2])}")\n' > "$work/ck.vu"
+: > "$work/cc.log"; out=$($VU check --checks "$work/ck.vu" 2>&1); rc=$?
+[ $rc -eq 0 ] && echo "$out" | grep -q "for i: 1 check on each pass" && echo "$out" | grep -q "'+' overflow" && [ ! -s "$work/cc.log" ]
+check "check --checks: lists the checks each loop makes on every pass, without the C compiler" $? "rc=$rc out=[$out]"
+
+printf 'fn main(os: Os) throws:\n  let s = os.read_stdin()?\n  print("{s.len}")\n' > "$work/rd.vu"
+out=$(head -c 200000 /dev/zero | $VU run "$work/rd.vu" 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "200000" ]; check "os.read_stdin(): all of standard input" $? "rc=$rc out=[$out]"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

@@ -1647,13 +1647,223 @@ were run by hand, including `VU_MARCH=x86-64-v2`), and nothing was deployed to F
 yet: multipart forms (file uploads), sessions stored on the server, and a CSRF token (SameSite
 cookies and `same_origin` cover browsers from the last several years).
 
+## Round 17: methods
+
+`x.f(args)` now calls `f(x, args)` for any function `f` whose first parameter takes `x`, so a model
+(or a person) can write `a.dist(b)`, `st.grow(3)` and `"hi".shout().len` the way most languages read.
+It's only another way to write the call: the checker sees `f(x, args)`, with `&x` when the first
+parameter is `var` and a move when it's `own`, so every ownership and borrowing rule applies unchanged.
+
+- Lookup: the function visible where the call is written, else the one in the module that defines the
+  receiver's type (so `p.norm()` works on a `geo.Point` with only `import geo`). Built-in methods come
+  first, then a struct field holding a function, then a function; capabilities, channels, optionals and
+  function values keep only their built-in methods. A local variable of the same name doesn't hide a
+  method.
+- The places that look at a call's shape before checking it (whether it can fail, hoisting `?`, which
+  variables an index may change) see through method calls too.
+
+Attack rounds:
+
+1. Tests 650 to 659: structs, enums, Int, Str, lists, generic and interface functions, chained calls;
+   a var receiver inside an index (refused), on a computed value (refused, with a message that doesn't
+   mention the `&` nobody wrote), an own receiver used again (refused), a failing method unhandled
+   (refused) and with `?`, `else` and `match`; built-in Str and list methods not taken over by functions
+   of the same name; a field holding a function winning over a function. One real bug found while
+   writing them: the loop optimizer (round 7) learns that a variable changes from the `&` in `f(&k)`, and
+   `k.bump()` has no `&` to see, so `xs[i + k]` in a loop that bumps `k` that way would have been checked
+   once before the loop instead of on every pass. A method call's receiver is now treated as changed, and
+   test 654 shows the out-of-range read stopped at the right index. (Checked: a compiler built without
+   the fix runs test 654 to the end and prints 66381, a sum that includes memory past the list's end.)
+2. Modules, `par` loops (a receiver changed through `pts[i]` is fine, through `pts[0]` refused), interface
+   values with var methods, `for var`, read-only views, `st.merge(st)` with a var first parameter
+   (refused as two uses of `&st`): nothing new; the exclusive-access message now says that `x.f()` passes
+   `&x`. Test 246 expected the old "Vu has functions, not methods" message and was updated.
+
+## Round 18: """ strings and text constants
+
+Writing the web starter in round 16 showed two gaps: an HTML page had to be a chain of
+`"...\n" +` pieces inside parentheses (a `+` can't end a line), and `const SECRET = "..."` didn't
+compile (constants were numbers only).
+
+- `"""` strings: the text on the lines between an opening `"""` (ending its line) and a closing one (on
+  a line of its own); the closing `"""`'s indentation is removed from every line, and the last line
+  break goes, as in Swift. Quotes need no escaping. They're turned into ordinary strings before lexing,
+  on their first line, with the lines they took left blank, so every later line keeps its number and
+  every string rule (escapes, interpolation, `{{ }}`) applies unchanged. `vu fmt` moves the string's
+  lines with its statement and changes nothing inside them.
+- Text constants: `const NAME = "text"`, or literals and text constants joined with `+`. Using one is
+  using its literal (it's inlined), so it's text written into the program: `web.render(LAYOUT, ...)` and
+  `pg.query(net, &db, QUERY, args)` accept it, as they accept a literal. An interpolating one is refused.
+- The `vu new web` starter now keeps its page and form in `"""` constants.
+
+Attack round (tests 660 to 668): the indentation rule, quotes, `{{ }}`, escapes, blank lines and the last
+line break; a `"""` string as an argument with the call going on after the closing `"""`, and as a const
+template; unclosed, under-indented, text after the opening, an interpolation over two lines (all refused
+at the right line); `"""` inside an ordinary string, beside a `'"'` Byte literal and in a comment (not an
+opening); text constants joined with `+` and passed to a const parameter; an interpolating constant
+(refused). `vu fmt` on a file whose statement moves from 4 to 2 spaces: the string's lines move with it,
+the program prints the same, and formatting again changes nothing. Nothing found in the compiler; two of
+my tests were wrong (one expected `\t` as two characters, one put a `"""` string inside an interpolation,
+which isn't supported: an interpolation is one line).
+
+## Round 19: compression and file uploads
+
+- `zlib.compress`, `zlib.gzip` and `zlib.deflate` (and `_level` forms, 0 to 9): DEFLATE as zlib makes
+  it. Strings repeated within 32 KB are found through hash chains (with lazy matching from level 4:
+  a match is held one byte to see whether the next position has a longer one), and each block of up to
+  16,384 symbols is written with whichever costs fewest bits: Huffman codes built for the block
+  (lengths capped at 15, or 7 for the code-length code, by halving the frequencies until the tree is
+  shallow enough), the fixed codes, or stored as is. About 400 lines of Vu in std/zlib.vu.
+- On 3 MB of C (the compiler's seed), best of 5, one core:
+
+  | level | Vu size | C zlib 1.3.2 size | Vu time | C zlib time |
+  |---|---|---|---|---|
+  | 1 | 622,801 | 682,887 | 33.5 ms | 19.3 ms |
+  | 6 | 530,605 | 531,273 | 118.7 ms | 72.4 ms |
+  | 9 | 513,231 | 512,523 | 401.4 ms | 248.0 ms |
+
+  (Level 1 is smaller than zlib's because zlib's level 1 uses a faster matcher than the one here.)
+- `web.parts(req)` reads `multipart/form-data` bodies (file uploads), `web.file` and `web.part_value`
+  pick from them, and `web.safe_filename` makes a browser's file name safe to store under.
+
+Attack rounds:
+
+1. `tests/run_zlib_compress.py`: every level and format on empty input, one and two bytes, 100 KB of
+   zeros, random bytes, words, a run-heavy pattern, source code, 3 MB of C and mostly-two-letter data;
+   Python's zlib and gzip must give back exactly the input. The first run failed 87 of 141: the last
+   partial byte was never written (a stream ending mid-byte lost its end-of-block code), and the match
+   search read one byte past the input when a match already reached its end (a bounds-check panic,
+   not a wrong read). Both fixed; 141 of 141. Making the length and distance codes table lookups
+   (they were searched, and their tables rebuilt for every symbol) took level 1 on 3 MB from 219 to
+   50 ms.
+2. Multipart: 400 random forms (names with `;`, `=`, quotes and backslashes, files with paths in their
+   names, data holding CR, LF, dashes and almost-the-boundary, a preamble, padding after a boundary)
+   compared with what made them, and 9 broken bodies (no closing boundary, a part without a name,
+   headers over 8 KB, 1,001 parts, no boundary parameter, another content type, a boundary run into
+   the next text, a part that isn't form-data): all right the first time.
+
+## Round 20: a model writes Vu
+
+The claim the site leads with, that a model writes correct Vu from the spec alone, had never been
+tested. Ten tasks (word frequencies, bracket matching, Dijkstra, an LRU cache, an expression
+calculator, Life on a torus, a binary search tree with deletion, topological order, Roman numerals,
+CSV with quoted fields), each reading standard input, with a Python reference and 4 to 7 test inputs
+(edge cases and large ones). For each of three models (Claude Opus 5.5, Sonnet 5.5, Haiku 5.5), one
+agent wrote all ten in Vu with only SPEC.md, and another wrote all ten in Rust; neither could run a
+compiler or anything else (one attempt each). `vu build` and `rustc -O`, then every test.
+
+| model | Vu: compiles | Vu: passes every test | Rust: compiles | Rust: passes every test |
+|---|---|---|---|---|
+| Opus | 10/10 | 10/10 | 10/10 | 10/10 |
+| Sonnet | 9/10 | 9/10 | 10/10 | 10/10 |
+| Haiku | 8/10 | 8/10 | 10/10 | 10/10 |
+
+All three failures were the compiler's fault rather than the programs', and are fixed:
+
+- Two programs named a variable `par` (a tree node's parent), which was a keyword for `par for`. It's
+  now a keyword only right before `for`.
+- One program pushed a string onto a list inside an `if`, then used it after the `if`: "'region' may
+  have been moved". The spec said a `Str` used again is copied, but only own parameters did that. Now
+  every place that takes a `Str` variable (push, a map value, a field, `let`) moves it only at its last
+  use in the block that declared it and copies it otherwise. Test 91, which expected `m[s] = s` to be
+  refused, now expects it to work (s is copied; the sanitizers find nothing wrong).
+
+With those fixes the same 30 programs all compile and pass. Every program was correct; no test failed
+on a program that compiled.
+
+Tokens (GPT-4o tokenizer, comments stripped, formatted): Vu took 5% more than Rust for Opus' programs,
+16% more for Sonnet's, 2% more for Haiku's. That's not the 21-42% fewer of the benchmark programs, and
+the differences show why: Vu's standard library has no priority queue (Dijkstra and topological order
+were 200-350 tokens longer, with heaps written by hand) and no sort by key (word frequencies), and
+every program spent ~30 tokens on a loop reading standard input. The agents also listed what the spec
+left them unsure of: whether `and`/`or` short-circuit, whether maps have `.len`, whether a Byte literal
+`'{'` interpolates.
+
+What this shows and doesn't: on tasks of this size, models write working Vu from the spec as reliably
+as Rust they've seen millions of examples of, once two sharp edges were gone. It's one run per model,
+10 tasks, written blind; it doesn't measure larger programs, or repair with compiler feedback, which is
+where Vu's error messages are meant to help.
+
+## Round 21: wrapping arithmetic, list slices, `vu check --checks`, streaming zlib
+
+Four pieces written after round 13 and left unbuilt, now built, tested and finished.
+
+- `+% -% *%` (and `+%= -%= *%=`) wrap at 64 bits, and `>>>` (and `>>>=`) shifts right filling with
+  zeros: what hashes (FNV, xxHash), checksums and random number generators need, while `+ - *` keep
+  stopping on overflow. A shift amount outside 0..63 stops the program.
+- `xs[a..b]` on lists: `let v = xs[a..b]` is a read-only view (no copy; the list is frozen while it
+  lives), `for x in xs[a..b]` loops over the range, `var v = xs[a..b]` copies.
+- `vu check --checks FILE` lists, for each loop, the checks it still makes on every pass (the ones the
+  optimizer couldn't move before the loop): where to look when a hot loop is slower than C.
+- `zlib.stream`, `feed`, `finish`: decompression of data that arrives in pieces, with the same results
+  and errors as the whole-buffer functions.
+
+Attack rounds:
+
+1. Building it: the code had never been compiled. Three errors the checker caught (a borrowed `g`
+   passed with `&g` in the same call, twice; a parameter named like the function `report`), and two
+   uses of `x += f()?` in the streaming test driver (not allowed: `?` takes a whole value).
+2. `tests/run_zlib.py`'s streamed modes (every test stream fed in random-sized pieces, with and
+   without a size limit, then the input after its end): all 400 answers of every seed failed with a
+   panic. When a piece arrived, the input already read was dropped, including whole bytes the bit
+   buffer had read ahead, so a trailer (the checksum after the last block) that started in those bytes
+   was read at a negative index. A bounds-check panic, not a wrong read. `feed` and `finish` now keep
+   those bytes; 3,201 of 3,201.
+3. Tests 671 to 676 (wrapping against Python's results, a plain `+` still checked next to `+%`, a shift
+   by 70, a view freezing its list, a copy growing on its own, a slice past the end) and a `--checks`
+   CLI test: nothing found.
+
+## Round 22: what the experiment asked for
+
+Round 20 left a list: programs spent tokens on things the standard library didn't have, and the agents
+named what the spec didn't say. This round adds those, plus the language server's missing half.
+
+- `os.read_stdin()` with no argument reads all of standard input.
+- `xs.sort(by: fn(a, b) => ...)`: a stable sort of any element type by a comparison (whether a goes
+  first), with `reverse:` too. The comparison runs while the list is rearranged, so it can't use the
+  list (refused, by name or through a closure that borrows it).
+- `xs.swap(i, j)`, and `std/heap.vu`: `heap.push`, `heap.pop`, `heap.heapify` on a list, ordered by
+  a comparison.
+- The spec now says what the agents had to guess: `and`/`or` short-circuit, maps have `.len`, a Byte
+  literal `'{'` is a brace, and `'\"'` is a Byte (the spec listed `\"` as an escape for Bytes, but the
+  compiler refused it: fixed).
+- A last `return` (or `fail`, `break`, `continue`) that can't be reached, as after a `while true:`
+  that returns from inside, is now left out instead of being an error ("unreachable code").
+- `vu lsp`: hover (a function's signature and the comment above it, a variable's type, a field),
+  go to definition (in the file or a module), and completion (a module's items after `mod.`, a
+  variable's fields and methods after `x.`, otherwise what's in scope), from `vu check --index`, kept
+  from the last version that compiled while the buffer has errors.
+
+The experiment again, with this spec, new agents, the same tasks and the same Rust programs:
+
+| model | Vu passes every test (round 20 → now) | Vu tokens vs Rust (round 20 → now) |
+|---|---|---|
+| Opus | 10/10 → 10/10 | +5% → +1% |
+| Sonnet | 9/10 → 7/10 | +16% → 0% |
+| Haiku | 8/10 → 10/10 | +2% → -4% |
+
+Sonnet's three failures were again the compiler's: two `return` statements after a `while true:` loop
+that returned from inside (now allowed), and a `'\"'` Byte literal (now accepted). With this round's
+compiler, all 30 programs pass every test. Tokens moved from 5-16% more than Rust to between 4% fewer
+and 1% more: still not the 21-42% fewer measured on the benchmark programs, which are
+computation-heavy; here most of the difference left is in Dijkstra and topological order, where the
+agents still packed (distance, node) pairs into one Int instead of using a struct with `heap`.
+
+Attack rounds:
+
+1. Tests 677 to 680: sort by comparison against Python's sorted (stable both ways), a comparison that
+   reads the list (refused), the heap against Python's heapq over 2,000 random operations, swap of
+   elements that own memory and out of range; `os.read_stdin()` in run_cli: nothing found.
+2. `tests/run_tools.py` drives the language server: hover on a method, a variable, a module's function
+   and a field, definition into a module file and within the file, completion after `x.` and `mod.`,
+   all on a buffer edited to have an error after its last good version: all right the first time.
+
 ## Limits of v0
 
-- No methods. Strings are bytes, read as UTF-8 by the text functions. Linux on x86-64 and ARM64;
+- Strings are bytes, read as UTF-8 by the text functions. Linux on x86-64 and ARM64;
   macOS builds but hasn't been run on a Mac.
 - Only new tasks move between threads: a task that has started stays on its thread, so two tasks
   that never wait on the same thread still take turns only when one waits.
 - The safety rules are deliberately conservative. For example, a `var` argument blocks
   every other use of the same variable in that call, even of a different field.
-- Not yet tested: whether an LLM actually writes correct Vu more often than Rust when
-  given only `SPEC.md`. That's the natural next experiment.
+- Tested once (round 20) on 10 small tasks: models wrote correct Vu from `SPEC.md` as often as Rust.

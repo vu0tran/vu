@@ -11,6 +11,26 @@ static inline @@E@@ const *vu_vfat_@@M@@(const @@L@@ *l, int64_t i, uint64_t *f)
     *f |= (uint64_t)!in;
     return in ? &l->data[i] : &zero;
 }
+/* xs[a..b] (let part = xs[a..b]): the elements in place, read-only and never freed; the list it's
+   part of is frozen while the view lives. */
+static inline @@L@@ vu_view_@@M@@(const @@L@@ *l, int64_t a, int64_t b, int line) {
+    if (a < 0 || b < a || b > l->len)
+        vu_fail(line, "slice %lld..%lld out of bounds for a list of length %lld", (long long)a, (long long)b, (long long)l->len);
+    @@L@@ r = { .data = l->data ? l->data + a : NULL, .len = b - a, .cap = 0 };   /* (NULL + 0 is undefined) */
+    return r;
+}
+/* var part = xs[a..b]: a copy (plain values only, checked by the compiler). */
+static @@L@@ vu_sub_@@M@@(const @@L@@ *l, int64_t a, int64_t b, int line) {
+    if (a < 0 || b < a || b > l->len)
+        vu_fail(line, "slice %lld..%lld out of bounds for a list of length %lld", (long long)a, (long long)b, (long long)l->len);
+    @@L@@ r = {0};
+    if (b > a) {
+        r.data = (@@E@@ *)vu_malloc((size_t)(b - a) * sizeof(@@E@@));
+        memcpy(r.data, l->data + a, (size_t)(b - a) * sizeof(@@E@@));
+        r.len = r.cap = b - a;
+    }
+    return r;
+}
 static void vu_grow_@@M@@(@@L@@ *l) {
     if (l->cap > (int64_t)(PTRDIFF_MAX / sizeof(@@E@@) / 2)) vu_oom();
     int64_t c = l->cap ? l->cap * 2 : 4;

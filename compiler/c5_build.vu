@@ -274,11 +274,24 @@ fn gen_consts(var g: G, items: [Node]) -> [Str]:
     if items[i].k == "const": visit_const(&g, items, i, by_name, &state, &order)
   for oi in order:
     let it = items[oi]
-    if has_call(it.kids[0]): err(g, it.line, "a const must be a number, true/false, or arithmetic on other consts")
+    if str_const_expr(g, it.kids[0]):
+      # text: each use is the literal itself (so it's also text written into the program, for const parameters)
+      g.consts[it.name] = "Str"
+      g.str_consts[it.name] = copy_node(it.kids[0])
+      continue
+    if it.kids[0].k == "str": err(g, it.line, "a const string can't interpolate: its text is fixed when the program is written ({{{{ for a literal brace)")
+    if has_call(it.kids[0]): err(g, it.line, "a const must be a number, true/false, text (a string literal, or literals and other text consts joined with +), or arithmetic on other consts")
     let c = value(&g, it.kids[0], "")
     g.consts[it.name] = c.ty + ""
     out.push("#define C_" + it.name + " (" + c.code + ")")
   return out
+
+# A string literal without interpolation, or such literals and text consts joined with +.
+fn str_const_expr(g: G, e: Node) -> Bool:
+  if e.k == "str": return all_text(e)
+  if e.k == "bin" and e.op == "+": return str_const_expr(g, e.kids[0]) and str_const_expr(g, e.kids[1])
+  if e.k == "name": return e.name in g.str_consts
+  return false
 
 fn const_refs(e: Node, consts: {Str: Int}, var out: [Int]):
   if e.k == "name" and e.name in consts: out.push(consts[e.name])
@@ -465,6 +478,15 @@ fn build(var g: G, items: [Node]) -> Str:
       var rk = "return "
       if r == "void": rk = ""
       out.push("static inline " + r + " vu_call_" + mg(g, t) + "(vu_fn f" + decl + ") {{ " + rk + "((" + r + " (*)(void *" + ps + "))f.fn)(f.env" + cargs + "); }}")
+      # (a comparison, fn(T, T) -> Bool, as xs.sort(by: ...) calls it)
+      if f.params.len == 2 and f.params[0] == f.params[1] and f.ret == "Bool" and not f.fails:
+        let pt = f.params[0]
+        var x = "(" + ct(g, pt) + " *)x"
+        var y = "(" + ct(g, pt) + " *)y"
+        if by_value(g, pt):
+          x = "*(const " + ct(g, pt) + " *)x"
+          y = "*(const " + ct(g, pt) + " *)y"
+        out.push("static inline bool vu_less_" + mg(g, t) + "(void *ctx, const void *x, const void *y) {{ return vu_call_" + mg(g, t) + "(*(vu_fn *)ctx, " + x + ", " + y + "); }}")
   let nlam = g.lam_ids.len
   for k in 1..nlam + 1:
     if k in g.lam_envs and g.lam_envs[k] != "": out.push(g.lam_envs[k] + "")
@@ -780,6 +802,9 @@ fn res_expr(var r: Res, all_own: [{Str: Str}], ctx: Ctx, var e: Node):
     else: res_expr(&r, all_own, ctx, &e.kids[1])
     r.scopes.pop()
     return
+  # x.f(...): the function f this file sees, for when f turns out to be a method (see method_call)
+  if e.k == "call" and e.kids[0].k == "field" and not (e.kids[0].kids[0].k == "name" and e.kids[0].kids[0].name in r.alias and not res_local(r, e.kids[0].kids[0].name)):
+    e.kids[0].name2 = res_key(r, e.kids[0].name)
   if e.k == "field" and e.kids[0].k == "name" and e.kids[0].name in r.alias and not res_local(r, e.kids[0].name):
     let base = e.kids[0].name + ""
     let mi = r.alias[base]
@@ -1042,7 +1067,7 @@ fn copy_names(m: {Str: Str}) -> {Str: Str}:
 # links: the libraries extern blocks need; has_ext: whether the program has extern blocks at all.
 # versions: loops may be generated in several copies (see "loop versioning" in c4_stmt.vu); off
 # with VU_NO_VERSIONING=1, which tests use to compare the two.
-fn compile_source(fs: Fs, ctx: Ctx, src: Str, var uses_par: Bool, var links: [Str], var has_ext: Bool, stdd: Str, pkgs: [Pkg], main_deps: {Str: Int}, versions: Bool) -> Str:
+fn compile_source(fs: Fs, ctx: Ctx, src: Str, var uses_par: Bool, var links: [Str], var has_ext: Bool, stdd: Str, pkgs: [Pkg], main_deps: {Str: Int}, versions: Bool, var check_report: Str) -> Str:
   # Panic locations pack the line into 24 bits (the file into the rest).
   # (a final newline doesn't start another line)
   var nlines = ctx.lines.len
@@ -1054,12 +1079,63 @@ fn compile_source(fs: Fs, ctx: Ctx, src: Str, var uses_par: Bool, var links: [St
   var g = new_gen(ctx, &files)
   swap(&g.file_caps, &file_caps)
   if not versions: g.vdepth = 1000   # (versioned() then makes one copy)
+  g.rep_on = check_report == "on"
+  g.index_on = check_report == "index"
   collect(&g, items)
   let csrc = build(&g, items)
+  if g.rep_on: check_report = rep_text(g, stdd)
+  if g.index_on: check_report = index_text(g, items)
   uses_par = g.uses_par
   links = copy_strs(g.links)
   has_ext = g.has_extern
   return csrc
+
+# vu check --index: one JSON object per line, for the language server (completion, hover, definition).
+fn index_text(g: G, items: [Node]) -> Str:
+  var out: [Str] = []
+  for it in items:
+    var k = it.k
+    if k != "fn" and k != "type" and k != "enum" and k != "const" and k != "iface": continue
+    let fi = it.line >> 24
+    if fi >= g.files.len: continue
+    let lines = g.files[fi].lines
+    let ln = lnum(it.line)
+    var sig = ""
+    if ln >= 1 and ln <= lines.len: sig = lines[ln - 1].strip()
+    if sig.endswith(":"): sig = sig[0..sig.len - 1]
+    var doc: [Str] = []
+    var dl = ln - 1
+    while dl >= 1 and lines[dl - 1].strip().startswith("#"):
+      doc.push(lines[dl - 1].strip()[1..lines[dl - 1].strip().len].strip())
+      dl -= 1
+    var docs: [Str] = []
+    var di = doc.len - 1
+    while di >= 0:
+      docs.push(doc[di] + "")
+      di -= 1
+    var mod = ""
+    if fi > 0: mod = stem_of(g.files[fi].path)
+    let name = bare_name(it.name)
+    var fields: [Str] = []
+    if k == "type" and it.name in g.structs:
+      for f in g.structs[it.name].fields: fields.push(f.name + ": " + tn(f.ty))
+    if k == "enum" and it.name in g.enums:
+      for vr in g.enums[it.name].variants:
+        var ps: [Str] = []
+        for f in vr.fields: ps.push(f.name + ": " + tn(f.ty))
+        var vs = bare_name(vr.name)
+        if ps.len > 0: vs += "(" + join(ps, ", ") + ")"
+        fields.push(vs)
+    if k == "enum" or k == "type": k = "type"
+    out.push(to_json(IndexEntry(k, name, mod, g.files[fi].path + "", ln, ln + max_line(it) - lnum(it.line), sig, "\n".join(docs), fields)))
+  for e in g.index: out.push(to_json(e))
+  return "\n".join(out) + "\n"
+
+# The largest line number (within its file) in a node.
+fn max_line(n: Node) -> Int:
+  var m = lnum(n.line)
+  for k in n.kids: m = max(m, max_line(k))
+  return m
 
 fn without_ext(path: Str) -> Str:
   var slash = -1
@@ -1224,6 +1300,8 @@ fn main(fs: Fs, os: Os):
   var tsan = false
   var timing = false
   var static = false
+  var checks = false
+  var index = false
   var path = ""
   var prog_args: [Str] = []
   var i = 2
@@ -1241,6 +1319,12 @@ fn main(fs: Fs, os: Os):
       if a == "-o": o = argv[i + 1]
       else: emit_c = argv[i + 1]
       i += 2
+    elif a == "--checks" and cmd == "check":
+      checks = true
+      i += 1
+    elif a == "--index" and cmd == "check":
+      index = true
+      i += 1
     elif a == "--debug" or a == "--release" or a == "--json" or a == "--malloc" or a == "--san" or a == "--san-pool" or a == "--tsan" or a == "--time" or a == "--static":
       if a == "--debug": debug = true
       elif a == "--static": static = true
@@ -1293,10 +1377,14 @@ fn main(fs: Fs, os: Os):
       err(e):
         fail_early(path, json, 0, e)
         exit(1)
-  var csrc = compile_source(fs, ctx, src, &uses_par, &links, &has_ext, std_dir(os), pkgs, main_deps, os.env("VU_NO_VERSIONING") != "1")
+  var report = ""
+  if checks: report = "on"
+  if index: report = "index"
+  var csrc = compile_source(fs, ctx, src, &uses_par, &links, &has_ext, std_dir(os), pkgs, main_deps, os.env("VU_NO_VERSIONING") != "1", &report)
   let t1 = os.clock()
   if cmd == "check":
     # Every error comes from the front end, so stopping here gives the full answer without gcc.
+    if checks or index: write(report)
     if timing:
       let fe = 1000.0 * (t1 - t0)
       eprint("vu: front end {fe:.1} ms")

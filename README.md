@@ -263,7 +263,7 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
 
 - `http`: an HTTP/1.1 and HTTP/2 server (HTTP/2 by prior knowledge or ALPN over TLS) and an HTTP/1.1
   client;
-- `web`: routes, middleware, forms, cookies, static files and escaping HTML templates, on `http`;
+- `web`: routes, middleware, forms, file uploads, cookies, static files and escaping HTML templates, on `http`;
 - `ws`: WebSockets, server and client;
 - `pg`: a PostgreSQL client (SCRAM-SHA-256, parameters only);
 - `re`: regular expressions with Python's syntax, in time linear in the text, and as fast as
@@ -271,10 +271,12 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
 - `zlib`: zlib, gzip and raw DEFLATE decompression, the same results as Python's `zlib` (and zlib's
   error messages), 1.2–1.3x C zlib's time on compressible data (as fast as Python's, which is C zlib,
   and twice as fast as Go's), with no capability at all and a size limit for zip bombs
-  (CHANGELOG.md, rounds 12 and 13);
+  (CHANGELOG.md, rounds 12 and 13); and compression to the same formats, within 1% of C zlib's
+  size at levels 6 and 9 in 1.6x its time (round 19);
 - `path` and `cli`: file paths as Python's `os.path` gives them, and command-line arguments;
 - `time`: UTC dates, ISO 8601 and HTTP dates, RFC 3339 parsing;
-- `log`: timestamped or JSON log lines.
+- `log`: timestamped or JSON log lines;
+- `heap`: a priority queue in a list, ordered by any comparison.
 
 ## Performance
 
@@ -320,8 +322,8 @@ Most of Vu's design follows from being written by an LLM:
 
 - **Few tokens.** On the benchmark programs, Vu needs 21–42% fewer tokens than C, C++, Rust or Go
   (counted with the GPT-4o tokenizer, comments stripped, each formatted with its standard tool).
-- **One way to write things.** The syntax is indentation-based, names are ASCII only, there are no
-  methods or inheritance, and there is no global mutable state.
+- **One way to write things.** The syntax is indentation-based, names are ASCII only, there is no
+  inheritance (`x.f(y)` is just `f(x, y)`), and there is no global mutable state.
 - **Errors a model can act on.** Compile errors name the variable and both places involved, and
   say what to write instead. A panic prints a backtrace with Vu file and line numbers. `vu check`
   runs only the front end, so a mistake is reported in milliseconds (0.4 s for the compiler itself,
@@ -353,12 +355,12 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
   Mac.
 - Strings are bytes. Text functions (`chars()`, `upper()`, `ord`...) read them as UTF-8; there is
   no Unicode normalization and no character classes (`isalpha`).
-- No methods: functions take the value they work on as their first argument (`area(c)`).
 - Only new tasks move between threads: two tasks that have started on the same thread and never
   wait take turns only when one of them waits.
 - No package registry: packages are git repositories, named by URL.
 - The safety rules are conservative, and some correct programs need rewriting to pass.
-- Not yet tested: whether an LLM given only SPEC.md writes correct Vu more often than Rust.
+- Tested on 10 small tasks only (CHANGELOG.md, round 20): three models wrote Vu from SPEC.md alone that
+  passed every test as often as their Rust (30 of 30 each, after two compiler fixes the test found).
 
 ## Repository
 

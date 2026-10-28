@@ -292,6 +292,10 @@ static inline __attribute__((always_inline)) int64_t vu_shl(int64_t a, int64_t b
     if (__builtin_expect((uint64_t)b > 63, 0)) vu_fail(line, "shift by %lld", (long long)b);
     return (int64_t)((uint64_t)a << b);
 }
+static inline __attribute__((always_inline)) int64_t vu_shru(int64_t a, int64_t b, int line) {
+    if (__builtin_expect((uint64_t)b > 63, 0)) vu_fail(line, "shift by %lld", (long long)b);
+    return (int64_t)((uint64_t)a >> b);
+}
 static inline __attribute__((always_inline)) int64_t vu_shr(int64_t a, int64_t b, int line) {
     if (__builtin_expect((uint64_t)b > 63, 0)) vu_fail(line, "shift by %lld", (long long)b);
     return a >> b;
@@ -354,6 +358,10 @@ static inline int64_t vu_vf_mod(int64_t a, int64_t b, uint64_t *f) {
 static inline int64_t vu_vf_shl(int64_t a, int64_t b, uint64_t *f) {
     *f |= (uint64_t)((uint64_t)b > 63);
     return (int64_t)((uint64_t)a << (b & 63));
+}
+static inline int64_t vu_vf_shru(int64_t a, int64_t b, uint64_t *f) {
+    *f |= (uint64_t)((uint64_t)b > 63);
+    return (int64_t)((uint64_t)a >> (b & 63));
 }
 static inline int64_t vu_vf_shr(int64_t a, int64_t b, uint64_t *f) {
     *f |= (uint64_t)((uint64_t)b > 63);
@@ -663,7 +671,9 @@ static vu_str vu_str_dup(const vu_str *s) { vu_str r = {0}; vu_str_cat_bytes(&r,
    read as UTF-8, as Python's decode(errors="replace") reads them: a byte that can't start a character,
    or the cut-off start of one, is one unit, shown as U+FFFD. */
 /* The character at s (its code point in *cp, or -1 for an invalid unit) and how many bytes it takes. */
-static size_t vu_utf8_next(const unsigned char *s, size_t n, int32_t *cp) {
+/* (not inlined: inlined into a call on a short literal, gcc can't see that vu_utf8_len kept k below n,
+   and warns that s[3] may be past the literal's end) */
+__attribute__((noinline)) static size_t vu_utf8_next(const unsigned char *s, size_t n, int32_t *cp) {
     size_t k = vu_utf8_len(s, n);
     unsigned char b = s[0];
     if (k) {
@@ -893,6 +903,29 @@ VU_SORT_FN(vu_sort_u8, uint8_t, VU_LT_NUM)
 VU_SORT_FN(vu_sort_bool, bool, VU_LT_NUM)
 VU_SORT_FN(vu_sort_f64, double, VU_LT_F64)
 VU_SORT_FN(vu_sort_str, vu_str, VU_LT_STR)
+/* xs.sort(by: before): the same merge sort, elements of size sz compared by a function value through
+   less(ctx, x, y), which says whether x goes before y. Elements are moved as bytes (Vu values don't
+   point into themselves), so any element type sorts. */
+static void vu_sort_by(void *base, int64_t n, size_t sz, bool (*less)(void *, const void *, const void *), void *ctx, bool rev) {
+    if (n < 2) return;
+    if (n > (int64_t)(PTRDIFF_MAX / (int64_t)sz)) vu_oom();
+    char *a = (char *)base;
+    char *buf = (char *)vu_malloc((size_t)n * sz);
+    for (int64_t w = 1; w < n; w = w > n / 2 ? n : w * 2) {
+        for (int64_t lo = 0; lo < n - w; lo += 2 * w) {
+            int64_t mid = lo + w, hi = mid + w < n ? mid + w : n, i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) {
+                bool take_right = rev ? less(ctx, a + i * sz, a + j * sz) : less(ctx, a + j * sz, a + i * sz);
+                if (take_right) memcpy(buf + (k++) * sz, a + (j++) * sz, sz);
+                else memcpy(buf + (k++) * sz, a + (i++) * sz, sz);
+            }
+            if (i < mid) { memcpy(buf + k * sz, a + i * sz, (size_t)(mid - i) * sz); k += mid - i; }
+            if (j < hi) { memcpy(buf + k * sz, a + j * sz, (size_t)(hi - j) * sz); k += hi - j; }
+            memcpy(a + lo * sz, buf + lo * sz, (size_t)(hi - lo) * sz);
+        }
+    }
+    free(buf);
+}
 /* min(xs) / max(xs): the first smallest (largest) element, in the same order as sorting. */
 #define VU_PICK_FN(NAME, T, LT) \
 static int64_t NAME(const T *a, int64_t n, bool want_max, int line) { \
@@ -1335,6 +1368,21 @@ static bool vu_os_output(vu_cap os, const vu_str *items, int64_t n, vu_str *out,
 #endif
 }
 /* os.read_stdin(n): up to n bytes from standard input, as they arrive; "" at its end. */
+/* os.read_stdin(): everything until the end of standard input. */
+static bool vu_os_read_stdin_all(vu_cap os, vu_str *out, vu_str *err) {
+    (void)os;
+    vu_str s = {0};
+    uint8_t buf[65536];
+    for (;;) {
+        ssize_t k = read(0, buf, sizeof buf);
+        if (k < 0 && errno == EINTR) continue;
+        if (k < 0) { drop_Str(&s); *err = vu_errf("can't read standard input: %s", strerror(errno)); return false; }
+        if (k == 0) break;
+        vu_str_cat_bytes(&s, buf, k);
+    }
+    *out = s;
+    return true;
+}
 static bool vu_os_read_stdin(vu_cap os, int64_t n, vu_str *out, vu_str *err) {
     (void)os;
     if (n < 1 || n > (1 << 26)) { *err = vu_errf("os.read_stdin(%lld): it reads 1 to 67,108,864 bytes", (long long)n); return false; }

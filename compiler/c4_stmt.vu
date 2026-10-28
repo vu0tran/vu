@@ -98,18 +98,21 @@ fn hoist_tries(var g: G, st: Node):
 
 fn stmts(var g: G, b: Node) -> Bool:
   var div = false
-  var need = false
-  # (vu.py works this out lazily; computing it for more blocks gives the same answers)
-  if g.own_str: need = true
-  for st in b.kids:
-    if st.k == "assign" and st.op == "=" and st.kids[0].k == "index": need = true
+  # (each name's last statement in the block, and its mentions in the current one: whether a Str
+  # variable can be moved rather than copied)
+  let need = true
   var r = Rest(0, {}, {})
   if need:
     for i in 0..b.kids.len: last_names(b.kids[i], i, &r.last)
   g.rest.push(r)
   for i in 0..b.kids.len:
     let st = b.kids[i]
-    if div: err(g, st.line, "unreachable code (the code before it always returns, breaks, or continues)")
+    if div:
+      # a last return (or fail, break, continue) that can't be reached, as after a `while true:` that
+      # returns from inside, is a harmless habit: it's left out
+      let tail = i == b.kids.len - 1 and (st.k == "return" or st.k == "fail" or st.k == "break" or st.k == "continue")
+      if tail: break
+      err(g, st.line, "unreachable code (the code before it always returns, breaks, or continues)")
     g.rest[g.rest.len - 1].idx = i
     if need:
       var counts: {Str: Int} = {}
@@ -136,7 +139,11 @@ fn stmt(var g: G, n: Node) -> Bool:
   if k == "fail": return s_fail(&g, n)
   if k == "break" or k == "continue": return loop_exit(&g, n, k)
   if k == "if": return s_if(&g, n)
-  if k == "while": return s_while(&g, n)
+  if k == "while":
+    let pushed = rep_enter(&g, n.line, "while")   # (its condition runs on every pass too)
+    let d = s_while(&g, n)
+    rep_leave(&g, pushed)
+    return d
   if k == "range": return s_range(&g, n)
   if k == "each": return s_each(&g, n)
   if k == "match": return s_match(&g, n)
@@ -431,6 +438,9 @@ fn s_let(var g: G, n: Node) -> Bool:
     emit(&g, ct(g, lc.ty) + " " + lname + " = " + lc.code + ";")
     freeze_caps(&g, e, n.line)
     return false
+  if e.k == "slice":
+    let st0 = probe_type(&g, e.kids[0])
+    if tkind(g, st0) == "list": return slice_let(&g, n)
   var c = CT("", "")
   if not n.flag and (e.k == "name" or e.k == "field" or e.k == "index"):
     let r = gen(&g, e, ty)
@@ -458,6 +468,50 @@ fn s_let(var g: G, n: Node) -> Bool:
   let v = new_var(&g, n.name, c.ty, cname, "local", n.flag, false, n.line)
   declare(&g, v)
   emit(&g, ct(g, c.ty) + " " + cname + " = " + c.code + ";")
+  return false
+
+# The view (or copy) of list slice e = xs[a..b]: the list's place, and C for an L_T value.
+type SliceV:
+  p: Place
+  code: Str
+
+fn slice_view(var g: G, e: Node, copy: Bool) -> SliceV:
+  let b = place(&g, e.kids[0])
+  if not b.ok: err(g, e.line, "xs[a..b] needs the list in a variable (or a field), so the view has something to point into")
+  read_check(g, b, e.line)
+  pure_index(&g, e.kids[1])
+  pure_index(&g, e.kids[2])
+  let lo = value(&g, e.kids[1], "Int")
+  let hi = value(&g, e.kids[2], "Int")
+  if lo.ty != "Int" or hi.ty != "Int": err(g, e.line, "a slice's bounds are Ints")
+  var f = "vu_view_"
+  if copy: f = "vu_sub_"
+  return SliceV(copy_place(b), f + mg(g, b.ty) + "(&" + b.code + ", " + lo.code + ", " + hi.code + ", {e.line})")
+
+# let part = xs[a..b]: a read-only view (nothing copied; xs is frozen while it lives), and
+# var part = xs[a..b]: a copy, for lists of plain values.
+fn slice_let(var g: G, n: Node) -> Bool:
+  let e = n.kids[0]
+  let sv = slice_view(&g, e, n.flag)
+  let ty = sv.p.ty + ""
+  if n.ty != "":
+    let want = resolve(&g, n.ty, n.line)
+    if want != ty: err(g, n.line, "expected " + tn(want) + ", found " + tn(ty))
+  let vc = var_cname(&g, n.name)
+  if n.flag:
+    if not is_copy(g, inner_of(ty)): err(g, n.line, "var part = xs[a..b] copies the elements, so it works on lists of plain values, not " + tn(ty) + "; let part = xs[a..b] is a view that copies nothing")
+    let v = new_var(&g, n.name, ty, vc, "local", true, false, n.line)
+    declare(&g, v)
+    emit(&g, ct(g, ty) + " " + vc + " = " + sv.code + ";")
+    return false
+  let hv = tmp(&g)
+  emit(&g, ct(g, ty) + " " + hv + " = " + sv.code + ";")
+  let v = new_var(&g, n.name, ty, vc, "view", false, true, n.line)
+  declare(&g, v)
+  emit(&g, ct(g, ty) + " *" + vc + " = &" + hv + ";")
+  g.vars[sv.p.root].frozen.push(Frz("read", n.line))
+  let si = g.scopes.len - 1
+  g.scopes[si].unfreeze.push(sv.p.root)
   return false
 
 # spawn f(args): run f as a new task. The arguments move into it, so every parameter that isn't plain
@@ -567,9 +621,19 @@ fn s_assign(var g: G, n: Node) -> Bool:
   if p.ty != "Int" and p.ty != "Float" and p.ty != "Byte":
     err(g, n.line, "'" + n.op + "' needs a number on the left, not " + tn(p.ty))
   let c = stmt_value(&g, rhs, p.ty)
-  let op = n.op[0..1]
-  if p.ty == "Float" and (op == "%" or op == "&" or op == "|" or op == "^"):
+  let op = n.op[0..n.op.len - 1]
+  if p.ty == "Float" and (op == "%" or op == "&" or op == "|" or op == "^" or op == "+%" or op == "-%" or op == "*%" or op == ">>>"):
     err(g, n.line, "'" + n.op + "' needs an Int or Byte")
+  if op == ">>>" and p.ty != "Int": err(g, n.line, "'>>>=' needs an Int")
+  if op == "+%" or op == "-%" or op == "*%" or op == ">>>":
+    if c.ty != p.ty and not (op == ">>>" and c.ty == "Int"): err(g, n.line, "'" + n.op + "' needs " + a_an(tn(p.ty)) + " on the right, not " + a_an(tn(c.ty)))
+    var w = ""
+    if p.ty == "Int": w = "(int64_t)((uint64_t)*" + pp + " " + op[0..1] + " (uint64_t)" + tv + ")"
+    else: w = "(uint8_t)(*" + pp + " " + op[0..1] + " " + tv + ")"
+    if op == ">>>":
+      emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + ty + " *" + pp + " = &" + p.code + "; if ((uint64_t)" + tv + " > 63) vu_fail({n.line}, \"shift by %lld\", (long long)" + tv + "); *" + pp + " = (int64_t)((uint64_t)*" + pp + " >> " + tv + "); }}")
+    else: emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + ty + " *" + pp + " = &" + p.code + "; *" + pp + " = " + w + "; }}")
+    return false
   var fname = ""
   if p.ty == "Int": fname = int_op(op)
   elif p.ty == "Byte": fname = byte_op(op)
@@ -577,7 +641,8 @@ fn s_assign(var g: G, n: Node) -> Bool:
     # an accumulator the loop around it checked once (see vaccum)
     emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + ty + " *" + pp + " = &" + p.code + "; *" + pp + " = *" + pp + " " + op + " " + tv + "; }}")
   elif fname != "":
-    emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + ty + " *" + pp + " = &" + p.code + "; *" + pp + " = " + int_call(g, fname, "*" + pp, tv, n.line) + "; }}")
+    let ic = int_call(&g, fname, "*" + pp, tv, n.line)
+    emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + ty + " *" + pp + " = &" + p.code + "; *" + pp + " = " + ic + "; }}")
   elif effects(&g, rhs):
     emit(&g, "{{ " + ty + " " + tv + " = " + c.code + "; " + p.code + " " + n.op + " " + tv + "; }}")
   else:
@@ -750,6 +815,7 @@ fn s_while(var g: G, n: Node) -> Bool:
     # (see "loop versioning" below)
     let mid = snapshot(g)
     g.vdepth += 1
+    rep_note(&g, "indexes it can show are in range are checked once before it")
     open(&g, "if (" + plan.pre + ") {{")
     plain_on(&g, plan)
     while_copy(&g, n, c.code, &lp)
@@ -757,7 +823,9 @@ fn s_while(var g: G, n: Node) -> Bool:
     close(&g)
     restore(&g, mid)
     open(&g, "else {{")
+    g.rep_mute += 1
     div = while_copy(&g, n, c.code, &lp)
+    g.rep_mute -= 1
     close(&g)
     g.vdepth -= 1
   let ends = ends_of(g, div, lp.cont)
@@ -776,6 +844,7 @@ fn s_range(var g: G, n: Node) -> Bool:
   let ta = tmp(&g)
   let tb = tmp(&g)
   emit(&g, "int64_t " + ta + " = " + a.code + "; int64_t " + tb + " = " + b.code + ";")
+  let pushed = rep_enter(&g, n.line, "for " + n.name)
   var step = "1"
   let body = n.kids[n.kids.len - 1]
   if n.flag2:
@@ -859,6 +928,7 @@ fn s_range(var g: G, n: Node) -> Bool:
   ms.push(snap_copy(before))
   for s in lp.brk: ms.push(snap_copy(s))
   merge(&g, ms)
+  rep_leave(&g, pushed)
   return false
 
 fn while_copy(var g: G, n: Node, cond: Str, var lp: Loop) -> Bool:
@@ -868,6 +938,51 @@ fn while_copy(var g: G, n: Node, cond: Str, var lp: Loop) -> Bool:
   lp = g.loops.pop()
   close(&g)
   return div
+
+# ---- vu check --checks: for each loop, the checks its usual copy makes on every pass
+
+fn rep_enter(var g: G, line: Int, what: Str) -> Bool:
+  if not g.rep_on or g.rep_mute > 0: return false
+  g.rep_stack.push(RepLoop(line, what + "", [], [], []))
+  return true
+
+fn rep_leave(var g: G, pushed: Bool):
+  if pushed: g.reports.push(g.rep_stack.pop())
+
+fn rep_check(var g: G, line: Int, what: Str):
+  if not g.rep_on or g.rep_mute > 0 or g.rep_stack.len == 0: return
+  let k = g.rep_stack.len - 1
+  for i in 0..g.rep_stack[k].checks.len:
+    if g.rep_stack[k].lines[i] == line and g.rep_stack[k].checks[i] == what: return
+  g.rep_stack[k].checks.push(what + "")
+  g.rep_stack[k].lines.push(line)
+
+fn rep_note(var g: G, note: Str):
+  if not g.rep_on or g.rep_mute > 0 or g.rep_stack.len == 0: return
+  let k = g.rep_stack.len - 1
+  if not has_str(g.rep_stack[k].notes, note): g.rep_stack[k].notes.push(note + "")
+
+# The report as text: loops in order of where they are, each with its checks (files under skip, the
+# standard library, left out).
+fn rep_text(g: G, skip: Str) -> Str:
+  var keys: [Str] = []
+  var texts: {Str: Str} = {}
+  for r in g.reports:
+    let path = file_of(g, r.line).path
+    if skip != "" and path.startswith(skip): continue
+    var t = path + ":{lnum(r.line)}: " + r.what + ": "
+    if r.checks.len == 0: t += "no checks on each pass"
+    elif r.checks.len == 1: t += "1 check on each pass"
+    else: t += "{r.checks.len} checks on each pass"
+    for nt in r.notes: t += "\n    (" + nt + ")"
+    for i in 0..r.checks.len: t += "\n  line {lnum(r.lines[i])}: " + r.checks[i]
+    var key = "{r.line}"
+    while key.len < 20: key = "0" + key
+    keys.push(key + "")
+    texts[key] = t
+  var out = ""
+  for k in sorted(keys): out += texts[k] + "\n"
+  return out
 
 # One copy of a range loop: the for line, the counter, the body.
 fn loop_copy(var g: G, n: Node, header: Str, cn: Str, decl: Str, var lp: Loop) -> Bool:
@@ -993,6 +1108,12 @@ fn vscan(e: Node, lv: Str, depth: Int, var s: VScan):
   if k == "let" or k == "range" or k == "each" or (k == "if" and e.flag2): s.decl[e.name] = true
   if k == "each" and e.name2 != "": s.decl[e.name2] = true
   if k == "call" and e.kids[0].k == "name": s.callees.push(e.kids[0].name + "")
+  # x.f(...) may be a method whose first parameter is var: then it changes x
+  if k == "call" and e.kids[0].k == "field":
+    let rn = root_name_node(e.kids[0].kids[0])
+    if rn != "":
+      s.changed[rn] = true
+      s.refd[rn] = true
   if k == "index" and e.kids.len == 2 and e.kids[0].k == "name":
     let ix = e.kids[1]
     var t = VSum(0, 0, "", 0, 0, lv != "")
@@ -1323,7 +1444,12 @@ fn versioned(var g: G, n: Node, header: Str, cn: Str, ta: Str, tb: Str, step: St
       while g.lines.len > start: g.lines.pop()
       spec = false
   var div = false
+  # (vu check --checks describes the copy that normally runs: the tried one, else the hoisted one)
+  if spec:
+    rep_note(&g, "runs first with its checks deferred (never stopping, so it can be vectorized); the checks are made only if one failed")
+    g.rep_mute += 1
   if plan.pre != "":
+    rep_note(&g, "indexes or sums it can show are in range are checked once before it")
     open(&g, "if (" + plan.pre + ") {{")
     plain_on(&g, plan)
     loop_copy(&g, n, header, cn, "", &lp)
@@ -1331,10 +1457,14 @@ fn versioned(var g: G, n: Node, header: Str, cn: Str, ta: Str, tb: Str, step: St
     close(&g)
     restore(&g, before)
     open(&g, "else {{")
+    g.rep_mute += 1
     div = loop_copy(&g, n, header, cn, "", &lp)
+    g.rep_mute -= 1
     close(&g)
   else: div = loop_copy(&g, n, header, cn, "", &lp)
-  if spec: close(&g)
+  if spec:
+    g.rep_mute -= 1
+    close(&g)
   g.vdepth -= 1
   return div
 
@@ -1479,7 +1609,7 @@ fn vf_ty(g: G, e: Node, env: {Str: Str}, scoped: Bool) -> Str:
     if t == "Bool": return ""
     if op == "<" or op == ">" or op == "<=" or op == ">=": return "Bool"
     if op == "+" or op == "-" or op == "*" or op == "/": return t
-    if (op == "%" or op == "<<" or op == ">>" or op == "&" or op == "|" or op == "^") and t == "Int": return t
+    if (op == "%" or op == "<<" or op == ">>" or op == ">>>" or op == "&" or op == "|" or op == "^" or op == "+%" or op == "-%" or op == "*%") and t == "Int": return t
     return ""
   if k == "index":
     # (a Byte read is only usable through int(): Byte arithmetic has no deferred form)
@@ -1567,6 +1697,45 @@ fn vf_prepare(var g: G, items: [Node]):
         g.vf_state[name] = 1
         changed = true
 
+# for x in xs[a..b]: over a view of the elements (read-only; xs is frozen during the loop).
+fn each_slice(var g: G, n: Node) -> Bool:
+  if n.flag: err(g, n.line, "for var x in xs[a..b] would change elements through a view; loop over the indexes instead: for i in a..b: xs[i] = ...")
+  if n.name2 != "": err(g, n.line, "'for " + n.name + ", " + n.name2 + " in ...' goes through a map's keys and values, not a list slice")
+  open(&g, "{{")
+  let sv = slice_view(&g, n.kids[0], false)
+  let t = sv.p.ty + ""
+  let hv = tmp(&g)
+  emit(&g, ct(g, t) + " " + hv + " = " + sv.code + ";")
+  let lp = tmp(&g)
+  let ln = tmp(&g)
+  let ix = tmp(&g)
+  emit(&g, ct(g, t) + " *" + lp + " = &" + hv + "; int64_t " + ln + " = " + lp + "->len;")
+  let pushed = rep_enter(&g, n.line, "for " + n.name + " in ...")
+  let before = snapshot(g)
+  open(&g, "for (int64_t " + ix + " = 0; " + ix + " < " + ln + "; " + ix + "++) {{")
+  let root = sv.p.root
+  g.vars[root].frozen.push(Frz("read", n.line))
+  let et = inner_of(t)
+  g.loops.push(Loop([], [], false))
+  push_scope(&g, true)
+  let vc = var_cname(&g, n.name)
+  let vv = new_var(&g, n.name, et, vc, "ref", false, true, n.line)
+  declare(&g, vv)
+  emit(&g, ct(g, et) + " *" + vc + " = &" + lp + "->data[" + ix + "];")
+  let div = run_block(&g, n.kids[1])
+  let lpi = g.loops.pop()
+  g.vars[root].frozen.pop()
+  close(&g)
+  close(&g)
+  let ends = ends_of(g, div, lpi.cont)
+  loop_check(&g, before, ends)
+  var ms: [Snap] = []
+  ms.push(snap_copy(before))
+  for s in lpi.brk: ms.push(snap_copy(s))
+  merge(&g, ms)
+  rep_leave(&g, pushed)
+  return false
+
 # Lists indexed by the loop counter inside a par loop are split between threads.
 fn par_split(g: G, e: Node, counter: Str, var split: {Str: Bool}):
   if e.k == "index" and e.kids[0].k == "name" and e.kids[1].k == "name" and e.kids[1].name == counter:
@@ -1575,6 +1744,9 @@ fn par_split(g: G, e: Node, counter: Str, var split: {Str: Bool}):
   for k in e.kids: par_split(g, k, counter, &split)
 
 fn s_each(var g: G, n: Node) -> Bool:
+  if n.kids[0].k == "slice":
+    let st0 = probe_type(&g, n.kids[0].kids[0])
+    if tkind(g, st0) == "list": return each_slice(&g, n)
   let r = gen(&g, n.kids[0], "")
   let t = r.ty
   let tk = tkind(g, t)
@@ -1584,6 +1756,7 @@ fn s_each(var g: G, n: Node) -> Bool:
     err(g, n.line, "'for " + n.name + ", " + n.name2 + " in ...' goes through a map's keys and values; this is " + tn(t))
   if tk == "map" and n.flag and n.name2 == "":
     err(g, n.line, "map keys can't be changed in a loop; to change the values write: for k, var v in m")
+  let pushed = rep_enter(&g, n.line, "for " + n.name + " in ...")
   open(&g, "{{")
   push_scope(&g, false)
   var root = -1
@@ -1646,4 +1819,5 @@ fn s_each(var g: G, n: Node) -> Bool:
   ms.push(snap_copy(before))
   for s in lpi.brk: ms.push(snap_copy(s))
   merge(&g, ms)
+  rep_leave(&g, pushed)
   return false
