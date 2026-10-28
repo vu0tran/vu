@@ -78,5 +78,9 @@ phoff, = struct.unpack_from("<Q", d, 32); size, n = struct.unpack_from("<HH", d,
 sys.exit(any(struct.unpack_from("<I", d, phoff + i * size)[0] == 3 for i in range(n)))' "$work/st"
 check "build --static: linked with -static, runs, has no PT_INTERP (no dynamic loader)" $? "out=[$out] cc=$(cat "$work/cc.log")"
 
+out=$($VU version 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "vu 0.1.0" ]
+check "version: prints the release" $? "rc=$rc out=[$out]"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

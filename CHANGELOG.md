@@ -7,6 +7,16 @@ for the language itself, [SPEC.md](SPEC.md).
 
 The first sections (Results through LLM tokens) are the comparison from rounds 1 and 2.
 
+## Releases
+
+**0.1.0** (2026-10-28), the first tagged release: everything through round 16. The language
+(ownership without annotations, enums, generics, interfaces, closures, typed errors, capabilities,
+tasks and `par` loops, JSON, C calls), the compiler (self-hosted, compiling to C; `check`, `run`,
+`build`, `fmt`, `test`, `get`, `lsp`, `new web`, and a WebAssembly build for the browser), and the
+standard library (`http` with HTTP/2 and TLS, `web`, `ws`, `pg`, `re`, `zlib`, `path`, `cli`, `time`,
+`log`). Linux on x86-64 and ARM64. Versions below 1.0 may change the language incompatibly; the
+changelog says when they do. `vu version` prints the release.
+
 ## Rounds 1–2: results
 
 All runs: Linux cloud VM, 2 vCPUs, single-threaded, median of 5, `-O3 -march=native`.

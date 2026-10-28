@@ -1,4 +1,4 @@
-# Vu v0
+# Vu 0.1
 
 A small systems language aiming at four things at once: few tokens for an LLM to read and
 write, fast compiles, no memory bugs, and C/Rust-level speed. The compiler translates Vu
@@ -831,6 +831,7 @@ vu build file.vu [-o out]   # optimized native binary
 vu fmt file.vu... [--check] # rewrite spacing the one way (--check: list files it would change)
 vu test file.vu...          # run each fn test_... in its own process; report which pass
 vu get [file.vu]            # fetch the packages in vu.pkg, write vu.lock (see Packages)
+vu version                  # the release: vu 0.1.0
 vu new web NAME             # a folder NAME with a web app: main.vu, public/, Dockerfile, fly.toml
 vu lsp                      # a language server for editors (diagnostics, formatting)
 ```
