@@ -375,7 +375,9 @@ program's output checked against Vu's before it's timed. Seconds, lower is bette
 
 ## Built for the model that writes it
 
-Most of Vu's design follows from being written by an LLM:
+Vu's compiler, runtime, standard library, tests and these documents were written by an AI model
+(Anthropic's Claude), working in rounds that its author directed and reviewed; the changelog
+records each round. Most of Vu's design follows from that:
 
 - **Few tokens.** On the benchmark programs, Vu needs 21–42% fewer tokens than C, C++, Rust or Go
   (counted with the GPT-4o tokenizer, comments stripped, each formatted with its standard tool).
