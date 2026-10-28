@@ -1,0 +1,364 @@
+# Glob patterns as minimatch (10, with dot: true, as the reference server calls it) reads them, for
+# search_files and excludePatterns: * and ? (never across '/'), ** for any number of folders,
+# [abc] [a-z] [!x] [^x] and [[:alpha:]] classes, {a,b} and {1..3} braces, \ to escape, and a leading
+# ! to negate the whole pattern. Not here: minimatch's extglobs (+(a|b), @(..), !(..), ?(..), *(..)),
+# whose characters match themselves. Differences are found by tests/run_mcp.py against minimatch.
+
+type Tok:
+  kind: Int        # 0 a byte, 1 ? (one character), 2 * (any run), 3 a class
+  b: Byte
+  set: [Byte]      # a class: pairs lo, hi (inclusive), over bytes
+  neg: Bool
+
+const T_LIT = 0
+const T_ONE = 1
+const T_STAR = 2
+const T_CLASS = 3
+
+# ---- braces
+
+fn find_close(p: Str, open: Int) -> Int:
+  var depth = 0
+  var i = open
+  while i < p.len:
+    let c = p[i]
+    if c == '\\':
+      i += 2
+      continue
+    if c == '{': depth += 1
+    elif c == '}':
+      depth -= 1
+      if depth == 0: return i
+    i += 1
+  return -1
+
+# The parts of a brace body split at its top-level commas.
+fn split_commas(body: Str) -> [Str]:
+  var out: [Str] = []
+  var depth = 0
+  var start = 0
+  var i = 0
+  while i < body.len:
+    let c = body[i]
+    if c == '\\':
+      i += 2
+      continue
+    if c == '{': depth += 1
+    elif c == '}': depth -= 1
+    elif c == ',' and depth == 0:
+      out.push(body[start..i])
+      start = i + 1
+    i += 1
+  out.push(body[start..body.len])
+  return out
+
+fn is_int_text(s: Str) -> Bool:
+  if s.len == 0: return false
+  var i = 0
+  if s[0] == '-' or s[0] == '+': i = 1
+  if i >= s.len: return false
+  for k in i..s.len:
+    if s[k] < '0' or s[k] > '9': return false
+  return true
+
+# {1..5}, {a..e}, {1..10..2}: the items, or nil when the body isn't a sequence.
+fn sequence(body: Str) -> [Str]?:
+  let parts = body.split("..")
+  if parts.len != 2 and parts.len != 3: return nil
+  var step = 1
+  if parts.len == 3:
+    if not is_int_text(parts[2]): return nil
+    step = abs(int(parts[2]) else 1)
+    if step == 0: step = 1
+  var out: [Str] = []
+  if is_int_text(parts[0]) and is_int_text(parts[1]):
+    let a = int(parts[0]) else 0
+    let b = int(parts[1]) else 0
+    # zero padding when either end is written with a leading zero
+    var width = 0
+    for s in [parts[0], parts[1]]:
+      var t = s
+      if t.startswith("-") or t.startswith("+"): t = t[1..t.len]
+      if t.len > 1 and t[0] == '0' and s.len > width: width = s.len
+    var x = a
+    var n = 0
+    while (a <= b and x <= b) or (a > b and x >= b):
+      var t = "{abs(x)}"
+      var neg = x < 0
+      while width > 0 and t.len + (if_neg(neg)) < width: t = "0" + t
+      if neg: t = "-" + t
+      out.push(t)
+      if a <= b: x += step
+      else: x -= step
+      n += 1
+      if n > 100000: break
+    return out
+  if parts[0].len == 1 and parts[1].len == 1:
+    let a = int(parts[0][0])
+    let b = int(parts[1][0])
+    var x = a
+    while (a <= b and x <= b) or (a > b and x >= b):
+      out.push(str([byte(x)]))
+      if a <= b: x += step
+      else: x -= step
+    return out
+  return nil
+
+fn if_neg(n: Bool) -> Int:
+  if n: return 1
+  return 0
+
+# Every pattern the braces in p stand for (p itself when it has none).
+fn expand(p: Str) -> [Str]:
+  var i = 0
+  while i < p.len:
+    let c = p[i]
+    if c == '\\':
+      i += 2
+      continue
+    if c == '{':
+      let close = find_close(p, i)
+      if close < 0: return [p + ""]
+      let body = p[i + 1..close]
+      let pre = p[0..i]
+      let post = p[close + 1..p.len]
+      var alts: [Str] = []
+      let parts = split_commas(body)
+      if parts.len > 1:
+        for x in parts:
+          for y in expand(x): alts.push(y)
+      elif seq = sequence(body):
+        for y in seq: alts.push(y)
+      else:
+        # not a brace expression: the '{' is literal; look for one further on
+        var rest = expand(p[i + 1..p.len])
+        var out: [Str] = []
+        for r in rest: out.push(p[0..i + 1] + r)
+        return out
+      var out: [Str] = []
+      let tails = expand(post)
+      for a in alts:
+        for t in tails: out.push(pre + a + t)
+      return out
+    i += 1
+  return [p + ""]
+
+# ---- one segment (between '/'s)
+
+fn class_named(name: Str, var set: [Byte]) -> Bool:
+  if name == "alpha" or name == "alnum" or name == "upper" or name == "word":
+    set.push('A')
+    set.push('Z')
+  if name == "alpha" or name == "alnum" or name == "lower" or name == "word":
+    set.push('a')
+    set.push('z')
+  if name == "digit" or name == "alnum" or name == "word" or name == "xdigit":
+    set.push('0')
+    set.push('9')
+  if name == "xdigit":
+    for r in ["af", "AF"]:
+      set.push(r[0])
+      set.push(r[1])
+  if name == "word":
+    set.push('_')
+    set.push('_')
+  if name == "space":
+    for c in [' ', '\t', '\n', '\r', 11, 12]:
+      set.push(c)
+      set.push(c)
+  if name == "blank":
+    for c in [' ', '\t']:
+      set.push(c)
+      set.push(c)
+  if name == "punct":
+    for r in ["!/", ":@", "[`", "{{~"]:
+      set.push(r[0])
+      set.push(r[1])
+  if name == "cntrl":
+    set.push(0)
+    set.push(31)
+    set.push(127)
+    set.push(127)
+  if name == "print" or name == "graph":
+    if name == "print": set.push(32)
+    else: set.push(33)
+    set.push(126)
+  return name == "alpha" or name == "alnum" or name == "upper" or name == "lower" or name == "digit" or name == "xdigit" or name == "word" or name == "space" or name == "blank" or name == "punct" or name == "cntrl" or name == "print" or name == "graph"
+
+# A class starting at p[i] == '['. Returns the index after its ']', or -1 when it doesn't close (then
+# the '[' is literal).
+fn parse_class(p: Str, i: Int, var t: Tok) -> Int:
+  var k = i + 1
+  if k < p.len and (p[k] == '!' or p[k] == '^'):
+    t.neg = true
+    k += 1
+  var first = true
+  while k < p.len:
+    let c = p[k]
+    if c == ']' and not first: return k + 1
+    first = false
+    if c == '[' and k + 1 < p.len and p[k + 1] == ':':
+      let end = p.find(":]", k + 2)
+      if end > 0:
+        if class_named(p[k + 2..end], &t.set):
+          k = end + 2
+          continue
+    var lo = c
+    if c == '\\' and k + 1 < p.len:
+      k += 1
+      lo = p[k]
+    var hi = lo
+    if k + 2 < p.len and p[k + 1] == '-' and p[k + 2] != ']':
+      hi = p[k + 2]
+      k += 2
+      if hi == '\\' and k + 1 < p.len:
+        k += 1
+        hi = p[k]
+    t.set.push(lo)
+    t.set.push(hi)
+    k += 1
+  return -1
+
+fn compile(seg: Str) -> [Tok]:
+  var out: [Tok] = []
+  var i = 0
+  while i < seg.len:
+    let c = seg[i]
+    if c == '\\' and i + 1 < seg.len:
+      out.push(Tok(T_LIT, seg[i + 1], [], false))
+      i += 2
+    elif c == '*':
+      if out.len == 0 or out[out.len - 1].kind != T_STAR: out.push(Tok(T_STAR, 0, [], false))
+      i += 1
+    elif c == '?':
+      out.push(Tok(T_ONE, 0, [], false))
+      i += 1
+    elif c == '[':
+      var t = Tok(T_CLASS, 0, [], false)
+      let next = parse_class(seg, i, &t)
+      if next < 0:
+        out.push(Tok(T_LIT, '[', [], false))
+        i += 1
+      else:
+        out.push(t)
+        i = next
+    else:
+      out.push(Tok(T_LIT, c, [], false))
+      i += 1
+  return out
+
+# How many bytes the UTF-8 character at s[i] takes (1 for a byte that doesn't start one).
+fn char_len(s: Str, i: Int) -> Int:
+  let c = s[i]
+  var n = 1
+  if c >= 0xF0: n = 4
+  elif c >= 0xE0: n = 3
+  elif c >= 0xC0: n = 2
+  if i + n > s.len: return 1
+  return n
+
+fn in_class(t: Tok, s: Str, i: Int) -> Bool:
+  let c = s[i]
+  var hit = false
+  var k = 0
+  while k + 1 < t.set.len:
+    if c >= t.set[k] and c <= t.set[k + 1]: hit = true
+    k += 2
+  return hit != t.neg
+
+fn match_toks(ts: [Tok], s: Str, ti: Int, si: Int) -> Bool:
+  var t = ti
+  var i = si
+  while t < ts.len:
+    let k = ts[t].kind
+    if k == T_STAR:
+      if t + 1 == ts.len: return true
+      var j = i
+      while j <= s.len:
+        if match_toks(ts, s, t + 1, j): return true
+        if j == s.len: break
+        j += char_len(s, j)
+      return false
+    if i >= s.len: return false
+    if k == T_LIT:
+      if s[i] != ts[t].b: return false
+      i += 1
+    elif k == T_ONE:
+      i += char_len(s, i)
+    else:
+      if not in_class(ts[t], s, i): return false
+      i += char_len(s, i)
+    t += 1
+  return i == s.len
+
+fn match_segment(pat: Str, name: Str) -> Bool:
+  # with dot: true, a wildcard matches a leading '.' too, but never the names "." and ".."
+  if name == "." or name == "..": return pat == name
+  if name == "": return pat == ""
+  let ts = compile(pat)
+  # a segment of only '*' needs at least one character, as minimatch's [^/]+? does
+  return match_toks(ts, name, 0, 0)
+
+fn match_parts(ps: [Str], pi: Int, fs: [Str], fi: Int) -> Bool:
+  if pi == ps.len: return fi == fs.len
+  if ps[pi] == "**":
+    # any number of segments (none of them "." or ".."), but minimatch wants the path not to have
+    # ended already when it reaches one: "a/**" doesn't match "a"
+    if fi == fs.len: return false
+    if pi + 1 == ps.len:
+      for k in fi..fs.len:
+        if fs[k] == "." or fs[k] == "..": return false
+      return true
+    var k = fi
+    while k <= fs.len:
+      if match_parts(ps, pi + 1, fs, k): return true
+      if k < fs.len and (fs[k] == "." or fs[k] == ".."): return false
+      k += 1
+    return false
+  if fi == fs.len: return false
+  if not match_segment(ps[pi], fs[fi]): return false
+  return match_parts(ps, pi + 1, fs, fi + 1)
+
+fn split_pattern(p: Str) -> [Str]:
+  # split at runs of '/' (as p.split(/\/+/)), then minimatch's level-one optimization: a run of ** is
+  # one **, and "x/.." goes away when x is a real segment (not "", ".", ".." or **)
+  var parts: [Str] = []
+  var start = 0
+  var i = 0
+  while i <= p.len:
+    if i == p.len or p[i] == '/':
+      parts.push(p[start..i])
+      while i < p.len and p[i] == '/': i += 1
+      start = i
+      if i == p.len:
+        if p.len > 0 and p[p.len - 1] == '/': parts.push("")
+        break
+      continue
+    i += 1
+  var out: [Str] = []
+  for x in parts:
+    if out.len > 0:
+      let prev = out[out.len - 1]
+      if x == "**" and prev == "**": continue
+      if x == ".." and prev != "" and prev != ".." and prev != "." and prev != "**":
+        out.pop()
+        continue
+    out.push(x + "")
+  if out.len == 0: out.push("")
+  return out
+
+# Whether path (relative, '/' between folders) matches pattern, as minimatch(path, pattern, {dot: true}).
+fn matches(path: Str, pattern: Str) -> Bool:
+  if pattern.startswith("#"): return false   # a comment pattern matches nothing
+  var p = pattern
+  var negate = false
+  while p.startswith("!"):
+    negate = not negate
+    p = p[1..p.len]
+  let fs = path.split("/")
+  var hit = false
+  for alt in expand(p):
+    if match_parts(split_pattern(alt), 0, fs, 0):
+      hit = true
+      break
+  return hit != negate

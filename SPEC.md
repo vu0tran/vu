@@ -71,6 +71,9 @@ String literals are `Str` values and can interpolate: `let msg = "{n} items"`. E
 `\n \t \r \0 \\ \"`, and Byte literals take the same ones (`'\r'`). An interpolation can hold
 any expression, including other strings, as in Python 3.12: `"{m["k"]} {", ".join(xs)}"`. Every
 Vu string interpolates, so a literal brace is always doubled, inside nested strings too (`{{`).
+A string that is nothing but one interpolation of a string literal (`"{"x"}"`) is an error: it's
+almost always a brace meant literally (`s.startswith("{") and s.endswith("}")` is one string), and
+the message says to double it. With other text around it (`"a{"\0"}b"`) it's fine.
 Strings are
 immutable byte strings; the text functions in Built-ins read them as UTF-8. `bytes(s)` copies one
 into a `[Byte]` list, and `str(bs)` copies back.
@@ -559,7 +562,9 @@ any missing parents), `fs.remove(path)` (a file or an empty folder) and `fs.rena
 `fs.exists(path)` returns a Bool.
 
 An `Fs` can't be created anywhere else, so a function that isn't handed one has no way to
-read or write files, and its signature shows that. `main` may only take capabilities as
+read or write files, and its signature shows that. To hand out less than all of it,
+`dir.open(fs, path)` (the `dir` module) opens one folder as a `Dir`, which reaches only what's inside
+it: code given a `Dir` and no `Fs` can't touch any other file. `main` may only take capabilities as
 parameters (`Fs`, `Os`, `Net` and `Ffi`, see Calling C). Printing to standard
 output needs no capability. `fs.temp_dir()` creates a new private directory under `$TMPDIR`
 (or `/tmp`) and returns its path; it can fail.
@@ -574,6 +579,8 @@ covers the rest of the outside world:
 - `os.output(["git", "rev-parse", "HEAD"])` runs a program the same way and returns what it wrote
   to standard output and standard error together, whatever its exit code.
 - `os.read_stdin()` reads all of standard input, to its end (it can fail, so `?` or `else`).
+  Reading it a line at a time with the `stdio` module needs no capability: standard input and
+  output are the program's own streams.
 - `os.read_stdin(n)` reads up to n bytes of standard input as they arrive (`""` at its end); it
   can fail. (`print` and `write` need no capability; reading input does.)
 - `os.env("CC")` returns an environment variable, or `""` when it isn't set.
@@ -1474,6 +1481,69 @@ for r in 0..rows.count:
 - As with `pg`, the SQL is a `const` parameter and values go as parameters (`?`), as text (`nil`
   is NULL); `get_int` and `get_float` read a column as a number. One statement per call; errors
   are SQLite's message. `tests/run_sqlite.sh` checks it against Python's sqlite3 module.
+
+**`dir`**: a folder as a capability. `dir.open(fs, path)` needs `Fs`; the `Dir` it returns resolves
+every path inside the folder, in the kernel, so "..", symlinks that lead out (or absolute ones) and
+folders swapped during an operation can't reach anything outside.
+
+```
+import dir
+let d = dir.open(fs, "/srv/data")?
+let text = d.read("notes/today.txt")?      # paths are relative to the folder
+d.save("out/report.txt", text)?            # creates or replaces in place; never through a symlink
+for e in d.list("notes")?: print(e.kind + " " + e.name)    # sorted; kind "dir", "file", "link", "other"
+let i = d.info("notes/today.txt")?         # kind, size, mode, modified, accessed, changed, created
+d.mkdir("a/b/c")?                          # with any missing parents
+d.rename("a.txt", d, "b.txt")?             # fails if b.txt exists: never replaces it
+d.remove("b.txt")?
+let p = d.real("notes")?                   # the absolute path, symlinks resolved (inside the folder)
+```
+
+- Linux uses `openat2` with `RESOLVE_BENEATH` (5.6 and later). Elsewhere, or with `VU_DIR_WALK=1`
+  (for tests), each name is opened in turn and any symlink or `..` is refused.
+- Only regular files are read or written: a FIFO or a device is refused. `link_info` describes a
+  symlink itself; `info` follows it (inside the folder only). Errors read like Node's:
+  `ENOENT: no such file or directory`.
+
+**`stdio`**: `stdio.line()` is the next line of standard input (without its `"\n"`), or `nil` once
+it has ended; `stdio.flush()` writes out what `print` and `write` have buffered. No capability.
+
+**`json`**: JSON whose shape isn't known ahead, as a tree (`from_json(text, Type)` reads into a declared
+type, and is faster).
+
+```
+import json
+let v = json.parse(text)?                  # a json.Value: Null, Flag, Whole, Num, Text, Arr or Obj
+let id = json.int_at(v, "id") else 0       # also str_at, num_at, bool_at, strs_at, at (a copy), has, keys
+print(json.kind(v) + " " + json.stringify(v))
+```
+
+- `stringify` writes what JavaScript's `JSON.stringify` writes: keys in their order, numbers as
+  JavaScript prints them (`1e+21`, `1.5e-7`, `100000000000000000000`), the same escapes, and invalid
+  UTF-8 as U+FFFD. A key given twice keeps its first place and its last value, as `JSON.parse` does.
+  Nesting deeper than 1000 levels is an error.
+
+**`mcp`**: a Model Context Protocol server over stdio. It answers the protocol itself (the 2026-07-28
+revision, with the version in each request's `_meta`, and the earlier ones that start with
+`initialize`) and hands the program each tool call:
+
+```
+import mcp
+import stdio
+let s = mcp.server("my-server", "1.0.0", TOOLS)?    # TOOLS: the tools/list array as JSON text
+while true:
+  let line = stdio.line() else break
+  match mcp.handle(s, line):
+    mcp.Reply(text): mcp.send(text)
+    mcp.ToolCall(c): mcp.send(mcp.result(s, c, mcp.text("done")))   # or mcp.tool_error(msg)
+    mcp.Quiet: continue
+```
+
+`mcp/filesystem/main.vu` is a whole server on it: the reference MCP filesystem server's 14 tools,
+reaching only the folders it was started with.
+
+The standard library's own C (`dir`, `stdio`) is part of Vu, like the runtime: its modules may make the
+`Ffi` they pass to their extern functions (`Ffi()`), which no program or package can.
 
 ## Not in v0
 

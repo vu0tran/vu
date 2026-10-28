@@ -156,7 +156,31 @@ fn main(fs: Fs, net: Net) throws:
 
 A function that isn't handed `Fs` can't read a file, and its signature shows it. The other
 capabilities are `Os` (processes, environment, time, signals), `Net` (TCP, TLS, DNS) and `Ffi`
-(calling C).
+(calling C). A capability can also be narrowed: `dir.open(fs, path)` gives a `Dir` that reaches only
+what's inside one folder, enforced by the kernel, so code handed a `Dir` can't touch any other file.
+
+### An MCP server in Vu
+
+`mcp/filesystem` is the Model Context Protocol filesystem server as one Vu program: the same 14 tools,
+arguments, results and messages as the reference server (`@modelcontextprotocol/server-filesystem`
+2.0.1, in Node), for clients of the 2026-07-28 protocol and the earlier ones.
+
+What it's for is trust. `main` opens each allowed folder as a `Dir` and passes on nothing else, so
+the compiler guarantees the tools can't open a socket, start a program or read a file outside those
+folders, and the kernel enforces the folder boundary. The Node server's safety rests on its own
+path checks and on its dependencies. And it's small: measured on a 2-vCPU Linux VM against the
+reference server on Node 22 (`mcp/filesystem/README.md` has the details):
+
+| | Vu | Node reference |
+|---|---|---|
+| install | one 352 KB binary (libc only) | Node (125 MB) + 25 MB of node_modules |
+| memory (RSS) idle, per server | 2.1 MB | 72 MB |
+| start to the `initialize` answer | 1.7 ms | 203 ms |
+| `search_files` over 2,000 files | 2.6 ms | 149 ms |
+
+`tests/run_mcp.sh` sends both servers the same requests (every tool, errors, bad arguments, both
+protocol eras, random edits, names and glob patterns) and checks every answer is the same JSON:
+12,600 answers on nine seeds, plain and under AddressSanitizer.
 
 ### Tasks on every core
 
@@ -282,7 +306,10 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
 - `time`: UTC dates, ISO 8601 and HTTP dates, RFC 3339 parsing, and time zones from the system's tz
   database (the same answers as Python's zoneinfo for all 498 zones, 1800 to 2200);
 - `log`: timestamped or JSON log lines;
-- `heap`: a priority queue in a list, ordered by any comparison.
+- `heap`: a priority queue in a list, ordered by any comparison;
+- `dir`: a folder as a capability (paths resolved inside it by the kernel); `stdio`: standard input
+  by lines; `json`: JSON of any shape as a tree of values, written as JavaScript writes it; `mcp`: a
+  Model Context Protocol server over stdio.
 
 ## Performance
 
@@ -379,6 +406,7 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 | `compiler/build.sh` | rebuilds the compiler and checks the fixed point |
 | `std/` | the standard library modules written in Vu |
 | `examples/` | the benchmark programs and a JSON parser |
+| `mcp/filesystem/` | the MCP filesystem server |
 | `tests/` | the test suites; `tests/gate.sh` runs them all |
 | `bench/` | benchmark programs in C, C++, Rust and Go, and the scripts that time them |
 | `SPEC.md` | the language |

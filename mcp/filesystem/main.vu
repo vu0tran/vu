@@ -1,0 +1,927 @@
+# mcp-filesystem: the MCP filesystem server, as one Vu program. It speaks for the reference server
+# (@modelcontextprotocol/server-filesystem 2.0.1): the same 14 tools with the same names, arguments,
+# results and messages, over stdio, for clients of the 2026-07-28 revision and the earlier ones.
+#
+#   vu build mcp/filesystem/main.vu -o mcp-filesystem
+#   mcp-filesystem /path/to/project [/another/folder ...]
+#
+# What it can touch is decided before it reads a request. main is the only function that has Fs, and
+# it uses it once: to open each allowed folder as a dir.Dir. Every tool takes only those Dirs, and the
+# kernel resolves every path inside one of them (openat2 with RESOLVE_BENEATH on Linux), so no
+# request, "..", symlink or race can reach a file outside them. The program has no Net and no Os: it
+# can't open a socket, start a program or read the environment, and the compiler would refuse code
+# that tried. See mcp/filesystem/README.md for what differs from the reference server.
+import dir
+import json
+import mcp
+import path
+import stdio
+import time
+import tools
+import glob
+import diff
+
+const VERSION = "2.0.1"
+
+type Allowed:
+  dirs: [dir.Dir]
+  names: [Str]       # the allowed folders as the reference lists them: as given, then resolved if different
+  owner: [Int]       # names[i] is the folder dirs[owner[i]]
+
+# Where a request's path goes: dirs[di], rel inside it, and the absolute path the messages show (the
+# real one, symlinks resolved, where it exists).
+type Target:
+  di: Int
+  rel: Str
+  abs: Str
+
+# ---- paths, as Node's path module reads them
+
+# path.resolve for an absolute path: "." and ".." resolved, slashes squeezed, no trailing slash.
+fn resolve_abs(p: Str) -> Str:
+  var out: [Str] = []
+  for seg in p.split("/"):
+    if seg == "" or seg == ".": continue
+    if seg == "..":
+      if out.len > 0: out.pop()
+      continue
+    out.push(seg + "")
+  return "/" + "/".join(out)
+
+fn within_one(p: Str, d: Str) -> Bool:
+  if p == d: return true
+  if d == "/": return p.startswith("/")
+  if d.endswith("/"): return p.startswith(d)
+  return p.startswith(d + "/")
+
+fn within(a: Allowed, p: Str) -> Bool:
+  if p.len == 0 or p.find("\0") >= 0: return false
+  let n = resolve_abs(p)
+  for d in a.names:
+    if d.len > 0 and d.find("\0") < 0 and within_one(n, resolve_abs(d)): return true
+  return false
+
+fn names_text(a: Allowed) -> Str:
+  return ", ".join(a.names)
+
+fn dirname(p: Str) -> Str:
+  let i = p.find("/", 0)
+  var last = -1
+  for k in 0..p.len:
+    if p[k] == '/': last = k
+  if last <= 0:
+    if i == 0: return "/"
+    return "."
+  return p[0..last]
+
+# The error code at the start of a dir error ("ENOENT" from "ENOENT: no such file or directory").
+fn code_of(e: Str) -> Str:
+  let c = e.find(":")
+  if c < 0: return ""
+  return e[0..c]
+
+# A request's path, checked and resolved as the reference's validatePath does it.
+fn resolve(a: Allowed, requested: Str) -> Target throws:
+  if requested == "~" or requested.startswith("~/"):
+    fail "Access denied - this server doesn't expand '~' (it can't read your home folder's location): use the full path: " + requested
+  if requested.len >= 2 and ((requested[0] >= 'A' and requested[0] <= 'Z') or (requested[0] >= 'a' and requested[0] <= 'z')) and requested[1] == ':':
+    if requested.len == 2 or requested[2] == '/' or requested[2] == '\\':
+      fail "Access denied - Windows-style path received on a POSIX host: " + requested
+  var abs = ""
+  if requested.startswith("/"): abs = resolve_abs(requested)
+  else:
+    var found = false
+    for d in a.names:
+      let cand = resolve_abs(d + "/" + requested)
+      if within(a, cand):
+        abs = cand
+        found = true
+        break
+    if not found: abs = resolve_abs(a.names[0] + "/" + requested)
+  if not within(a, abs) or requested.find("\0") >= 0:
+    fail "Access denied - path outside allowed directories: " + abs + " not in " + names_text(a)
+  # the allowed folder it's in (the longest name that holds it), and the rest of the path
+  var best = -1
+  for i in 0..a.names.len:
+    let d = resolve_abs(a.names[i])
+    if within_one(abs, d) and (best < 0 or d.len > resolve_abs(a.names[best]).len): best = i
+  let di = a.owner[best]
+  let base = resolve_abs(a.names[best])
+  var rel = ""
+  if abs.len > base.len:
+    if base == "/": rel = abs[1..abs.len]
+    else: rel = abs[base.len + 1..abs.len]
+  let d = a.dirs[di]
+  # where it really is: every symlink resolved inside the folder (the kernel refuses one that leads out)
+  match d.real(rel):
+    ok(real): return Target(di, strip_base(d.path, real), real)
+    err(e):
+      let code = code_of(e)
+      if code == "EXDEV": fail "Access denied - symlink target outside allowed directories: " + abs + " not in " + names_text(a)
+      if code != "ENOENT": fail e + ", realpath '" + abs + "'"
+  # it doesn't exist (yet): the real path of the part that does, then the rest as given
+  let parts = rel.split("/")
+  var k = parts.len - 1
+  while k > 0:
+    let pre_parts = parts[0..k]
+    let pre = "/".join(pre_parts)
+    match d.real(pre):
+      ok(real):
+        let tail_parts = parts[k..parts.len]
+        let tail = "/".join(tail_parts)
+        var whole = real + "/" + tail
+        if real == "/": whole = "/" + tail
+        return Target(di, strip_base(d.path, whole), whole)
+      err(e):
+        let code = code_of(e)
+        if code == "EXDEV": fail "Access denied - symlink target outside allowed directories: " + abs + " not in " + names_text(a)
+        if code != "ENOENT": fail "Parent directory does not exist: " + dirname(abs)
+    k -= 1
+  var whole = d.path + "/" + rel
+  if d.path == "/": whole = "/" + rel
+  if rel == "": whole = d.path + ""
+  return Target(di, rel, whole)
+
+# rel of p inside the folder at base ("" for the folder itself).
+fn strip_base(base: Str, p: Str) -> Str:
+  if p == base: return ""
+  if base == "/": return p[1..p.len]
+  return p[base.len + 1..p.len]
+
+# A dir error as Node words it: "ENOENT: no such file or directory, open '/a/b'".
+fn fs_error(e: Str, call: Str, p: Str) -> Str:
+  if code_of(e) == "EISDIR" and call == "open": return "EISDIR: illegal operation on a directory, read"
+  if code_of(e) == "" : return e
+  return e + ", " + call + " '" + p + "'"
+
+# ---- arguments, checked as the reference's zod schemas check them
+
+# How zod names what it got.
+fn received(v: json.Value) -> Str:
+  match v:
+    json.Null: return "null"
+    json.Flag(_): return "boolean"
+    json.Whole(_): return "number"
+    json.Num(_): return "number"
+    json.Text(_): return "string"
+    json.Arr(_): return "array"
+    json.Obj(_): return "object"
+
+fn got(args: json.Value, key: Str) -> Str:
+  if a = json.at(args, key): return received(a)
+  return "undefined"
+
+fn need(args: json.Value, key: Str, kind: Str, required: Bool, var issues: [Str]):
+  let g = got(args, key)
+  if g == "undefined" and not required: return
+  if g != kind: issues.push(key + ": Invalid input: expected " + kind + ", received " + g)
+
+fn need_strs(args: json.Value, key: Str, required: Bool, min1: Bool, var issues: [Str]):
+  let g = got(args, key)
+  if g == "undefined" and not required: return
+  if g != "array":
+    issues.push(key + ": Invalid input: expected array, received " + g)
+    return
+  if v = json.at(args, key):
+    match v:
+      json.Arr(items):
+        if min1 and items.len == 0: issues.push(key + ": Too small: expected array to have >=1 items")
+        for i in 0..items.len:
+          let r = received(items[i])
+          if r != "string": issues.push(key + ".{i}: Invalid input: expected string, received " + r)
+      _: return
+
+fn need_edits(args: json.Value, var issues: [Str]):
+  let g = got(args, "edits")
+  if g != "array":
+    issues.push("edits: Invalid input: expected array, received " + g)
+    return
+  if v = json.at(args, "edits"):
+    match v:
+      json.Arr(items):
+        for i in 0..items.len:
+          let r = received(items[i])
+          if r != "object":
+            issues.push("edits.{i}: Invalid input: expected object, received " + r)
+            continue
+          for k in ["oldText", "newText"]:
+            let kg = got(items[i], k)
+            if kg != "string": issues.push("edits.{i}." + k + ": Invalid input: expected string, received " + kg)
+      _: return
+
+# "" when the arguments fit the tool's schema, else the message the reference gives.
+fn check_args(name: Str, args: json.Value) -> Str:
+  var issues: [Str] = []
+  if name == "read_file" or name == "read_text_file":
+    need(args, "path", "string", true, &issues)
+    need(args, "tail", "number", false, &issues)
+    need(args, "head", "number", false, &issues)
+  elif name == "read_multiple_files":
+    need_strs(args, "paths", true, true, &issues)
+  elif name == "write_file":
+    need(args, "path", "string", true, &issues)
+    need(args, "content", "string", true, &issues)
+  elif name == "edit_file":
+    need(args, "path", "string", true, &issues)
+    need_edits(args, &issues)
+    need(args, "dryRun", "boolean", false, &issues)
+  elif name == "list_directory_with_sizes":
+    need(args, "path", "string", true, &issues)
+    if got(args, "sortBy") != "undefined":
+      let s = json.str_at(args, "sortBy") else ""
+      if s != "name" and s != "size": issues.push("sortBy: Invalid option: expected one of \"name\"|\"size\"")
+  elif name == "directory_tree":
+    need(args, "path", "string", true, &issues)
+    need_strs(args, "excludePatterns", false, false, &issues)
+  elif name == "move_file":
+    need(args, "source", "string", true, &issues)
+    need(args, "destination", "string", true, &issues)
+  elif name == "search_files":
+    need(args, "path", "string", true, &issues)
+    need(args, "pattern", "string", true, &issues)
+    need_strs(args, "excludePatterns", false, false, &issues)
+  elif name != "list_allowed_directories":
+    need(args, "path", "string", true, &issues)
+  if issues.len == 0: return ""
+  return "Input validation error: Invalid arguments for tool " + name + ": " + ", ".join(issues)
+
+# ---- text, as JavaScript measures and orders it
+
+# The length in UTF-16 code units (what JavaScript's .length counts).
+fn js_len(s: Str) -> Int:
+  var n = 0
+  for c in s.chars():
+    if c.len == 4: n += 2
+    else: n += 1
+  return n
+
+fn pad_end(s: Str, w: Int) -> Str:
+  var out = s + ""
+  var n = js_len(s)
+  while n < w:
+    out += " "
+    n += 1
+  return out
+
+fn pad_start(s: Str, w: Int) -> Str:
+  var pre = ""
+  var n = js_len(s)
+  while n < w:
+    pre += " "
+    n += 1
+  return pre + s
+
+# ICU's root collation for ASCII (what localeCompare uses): its primary order for each byte (letters
+# without case), with control characters ignored; anything else after, by code point.
+const COLLATION = " _-,;:!?.'\"()[]{{}}@*/\\&#%`^+<=>|~$0123456789aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ"
+
+fn rank_table() -> [Int]:
+  var r = [-1] * 256
+  var next = 10
+  # \t \n \v \f \r are white space, before the space itself
+  for c in [9, 10, 11, 12, 13]:
+    r[c] = next
+    next += 1
+  var i = 0
+  while i < COLLATION.len:
+    let c = int(COLLATION[i])
+    if c >= 97 and c <= 122:
+      r[c] = next
+      r[c - 32] = next
+      next += 1
+      i += 2
+      continue
+    r[c] = next
+    next += 1
+    i += 1
+  return r
+
+type Weights:
+  prim: [Int]
+  tert: [Int]
+
+fn weigh(s: Str, ranks: [Int]) -> Weights:
+  var w = Weights([], [])
+  var i = 0
+  while i < s.len:
+    let c = int(s[i])
+    if c < 128:
+      if ranks[c] >= 0:
+        w.prim.push(ranks[c])
+        if c >= 65 and c <= 90: w.tert.push(1)
+        else: w.tert.push(0)
+      i += 1
+    else:
+      # beyond ASCII: by code point, after everything above
+      var n = 2
+      if c >= 0xF0: n = 4
+      elif c >= 0xE0: n = 3
+      var cp = 0
+      for k in i..min(i + n, s.len): cp = cp * 256 + int(s[k])
+      w.prim.push(1000 + cp)
+      w.tert.push(0)
+      i += n
+  return w
+
+fn cmp_ints(a: [Int], b: [Int]) -> Int:
+  for i in 0..min(a.len, b.len):
+    if a[i] < b[i]: return -1
+    if a[i] > b[i]: return 1
+  if a.len < b.len: return -1
+  if a.len > b.len: return 1
+  return 0
+
+# a.localeCompare(b) < 0
+fn locale_less(a: Str, b: Str, ranks: [Int]) -> Bool:
+  let wa = weigh(a, ranks)
+  let wb = weigh(b, ranks)
+  let p = cmp_ints(wa.prim, wb.prim)
+  if p != 0: return p < 0
+  return cmp_ints(wa.tert, wb.tert) < 0
+
+# JavaScript's whitespace (what trim() removes): ASCII white space, NBSP, the Unicode spaces, the line
+# and paragraph separators and the BOM.
+fn is_js_space(c: Str) -> Bool:
+  if c.len == 1:
+    let b = c[0]
+    return b == ' ' or b == '\t' or b == '\n' or b == '\r' or b == 11 or b == 12
+  let cp = ord(c)
+  return cp == 0xA0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200A) or cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F or cp == 0x3000 or cp == 0xFEFF
+
+fn js_chars(s: Str) -> [Str]:
+  var out: [Str] = []
+  for c in s.chars(): out.push(c)
+  return out
+
+fn join_chars(cs: [Str], a: Int, b: Int) -> Str:
+  var out = ""
+  for i in a..b: out += cs[i]
+  return out
+
+# The leading whitespace of a line, as characters.
+fn lead_ws(line: Str) -> [Str]:
+  var out: [Str] = []
+  for c in line.chars():
+    if not is_js_space(c): break
+    out.push(c)
+  return out
+
+fn js_trim(s: Str) -> Str:
+  let cs = js_chars(s)
+  var a = 0
+  var b = cs.len
+  while a < b and is_js_space(cs[a]): a += 1
+  while b > a and is_js_space(cs[b - 1]): b -= 1
+  return join_chars(cs, a, b)
+
+fn trim_start(s: Str) -> Str:
+  let cs = js_chars(s)
+  var a = 0
+  while a < cs.len and is_js_space(cs[a]): a += 1
+  return join_chars(cs, a, cs.len)
+
+# ---- sizes, dates, URLs
+
+fn pow1024(k: Int) -> Int:
+  var x = 1
+  for i in 0..k: x *= 1024
+  return x
+
+# JavaScript's x.toFixed(2) of bytes / 1024^k: the exact value rounded half up.
+fn fixed2(bytes: Int, k: Int) -> Str:
+  let d = pow1024(k)
+  if bytes < 40000000000000:
+    let scaled = (bytes * 200 + d) / (2 * d)
+    return "{scaled / 100}.{scaled % 100:02}"
+  return "{float(bytes) / float(d):.2}"
+
+fn format_size(bytes: Int) -> Str:
+  let units = ["B", "KB", "MB", "GB", "TB"]
+  if bytes <= 0: return "0 B"
+  var i = 0
+  while i < 4 and bytes >= pow1024(i + 1): i += 1
+  if i == 0: return "{bytes} B"
+  return fixed2(bytes, i) + " " + units[i]
+
+# A Date as JavaScript's String(date) writes it, in UTC (as Node does with TZ=UTC).
+fn js_date(t: Float) -> Str:
+  let d = time.utc(t)
+  return time.day_name(d.weekday) + " " + time.month_name(d.month) + " {d.day:02} {d.year:04} {d.hour:02}:{d.minute:02}:{d.second:02} GMT+0000 (Coordinated Universal Time)"
+
+fn hex_digit(n: Int) -> Str:
+  return "0123456789ABCDEF"[n..n + 1]
+
+# pathToFileURL(p).href: file:// and the path, with what a URL path can't hold percent-encoded.
+fn file_url(p: Str) -> Str:
+  var out = "file://"
+  for i in 0..p.len:
+    let c = p[i]
+    if c <= 32 or c >= 127 or c == '"' or c == '#' or c == '%' or c == '<' or c == '>' or c == '?' or c == '`' or c == '{' or c == '}' or c == '\\' or c == '^' or c == '|' or c == '[' or c == ']':
+      out += "%" + hex_digit(int(c) >> 4) + hex_digit(int(c) & 15)
+    else: out += p[i..i + 1]
+  return out
+
+fn octal3(mode: Int) -> Str:
+  var s = ""
+  var m = mode
+  for i in 0..3:
+    s = "{m % 8}" + s
+    m = m / 8
+  return s
+
+# ---- reading files as text
+
+# Lines split at "\n", as text.split("\n").
+fn split_nl(s: Str) -> [Str]:
+  var out: [Str] = []
+  var start = 0
+  for i in 0..s.len:
+    if s[i] == '\n':
+      out.push(s[start..i])
+      start = i + 1
+  out.push(s[start..s.len])
+  return out
+
+fn crlf_to_lf(s: Str) -> Str:
+  return s.replace("\r\n", "\n")
+
+# The last n lines (n as JavaScript truncates it), as the reference's tailFile gives them.
+fn tail_lines(text: Str, n: Float) -> Str:
+  if text.len == 0 or n <= 0.0: return ""
+  let k = int(n)
+  let lines = split_nl(crlf_to_lf(text))
+  var start = lines.len - k
+  if k == 0: start = 0
+  if start < 0: start = 0
+  let kept = lines[start..lines.len]
+  return "\n".join(kept)
+
+# The first n lines (n rounded up, as headFile's loop counts), as headFile gives them.
+fn head_lines(text: Str, n: Float) -> Str:
+  if n <= 0.0: return ""
+  var k = int(n)
+  if float(k) < n: k += 1
+  var lines: [Str] = []
+  var start = 0
+  for i in 0..text.len:
+    if lines.len >= k: break
+    if text[i] == '\n':
+      lines.push(text[start..i])
+      start = i + 1
+  if lines.len < k and start < text.len: lines.push(text[start..text.len])
+  return "\n".join(lines)
+
+# ---- the tools
+
+fn ok_text(t: Str) -> mcp.Outcome:
+  return mcp.text(t)
+
+fn read_file_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let p = json.str_at(args, "path") else ""
+  let t = resolve(a, p)?
+  let head = json.num_at(args, "head") else 0.0
+  let tail = json.num_at(args, "tail") else 0.0
+  if head != 0.0 and tail != 0.0: fail "Cannot specify both head and tail parameters simultaneously"
+  match a.dirs[t.di].read(t.rel):
+    ok(text):
+      if tail != 0.0: return ok_text(tail_lines(text, tail))
+      if head != 0.0: return ok_text(head_lines(text, head))
+      return ok_text(text)
+    err(e): fail fs_error(e, "open", t.abs)
+
+fn mime_of(p: Str) -> Str:
+  let e = path.ext(p).lower()
+  if e == ".png": return "image/png"
+  if e == ".jpg" or e == ".jpeg": return "image/jpeg"
+  if e == ".gif": return "image/gif"
+  if e == ".webp": return "image/webp"
+  if e == ".bmp": return "image/bmp"
+  if e == ".svg": return "image/svg+xml"
+  if e == ".mp3": return "audio/mpeg"
+  if e == ".wav": return "audio/wav"
+  if e == ".ogg": return "audio/ogg"
+  if e == ".flac": return "audio/flac"
+  return "application/octet-stream"
+
+fn read_media_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let t = resolve(a, json.str_at(args, "path") else "")?
+  let mime = mime_of(t.abs)
+  match a.dirs[t.di].read(t.rel):
+    ok(data):
+      let b = b64encode(data)
+      var item = ""
+      if mime.startswith("image/"): item = "{{\"type\":\"image\",\"data\":\"" + b + "\",\"mimeType\":\"" + mime + "\"}}"
+      elif mime.startswith("audio/"): item = "{{\"type\":\"audio\",\"data\":\"" + b + "\",\"mimeType\":\"" + mime + "\"}}"
+      else: item = "{{\"type\":\"resource\",\"resource\":{{\"uri\":" + json.quote(file_url(t.abs)) + ",\"mimeType\":\"" + mime + "\",\"blob\":\"" + b + "\"}}}}"
+      return mcp.Outcome("[" + item + "]", "{{\"content\":[" + item + "]}}", false)
+    err(e): fail fs_error(e, "open", t.abs)
+
+fn read_multiple_tool(a: Allowed, args: json.Value) -> mcp.Outcome:
+  let paths = json.strs_at(args, "paths") else []
+  var parts: [Str] = []
+  for p in paths:
+    match resolve(a, p):
+      ok(t):
+        match a.dirs[t.di].read(t.rel):
+          ok(text): parts.push(p + ":\n" + text + "\n")
+          err(e): parts.push(p + ": Error - " + fs_error(e, "open", t.abs))
+      err(e): parts.push(p + ": Error - " + e)
+  return ok_text("\n---\n".join(parts))
+
+# Writes text to t as the reference does: in place, and never through a symlink or into anything but
+# a regular file.
+fn write_target(a: Allowed, t: Target, text: Str) throws:
+  match a.dirs[t.di].save(t.rel, text):
+    ok: return
+    err(e):
+      let c = code_of(e)
+      if c == "ELOOP" or e.startswith("EINVAL: not a regular"): fail "Refusing to write: not a regular file: " + t.abs
+      if c == "EISDIR": fail "EISDIR: illegal operation on a directory, open '" + t.abs + "'"
+      fail fs_error(e, "open", t.abs)
+
+fn write_file_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let p = json.str_at(args, "path") else ""
+  let t = resolve(a, p)?
+  write_target(a, t, json.str_at(args, "content") else "")?
+  return ok_text("Successfully wrote to " + p)
+
+# The narrowest indentation among some lines: a tab when any indented line starts with one.
+fn indent_unit(lines: [Str]) -> [Str]:
+  var narrow = -1
+  for line in lines:
+    let ind = lead_ws(line)
+    if ind.len == 0 or js_trim(line) == "": continue
+    for c in ind:
+      if c == "\t": return ["\t"]
+    if narrow < 0 or ind.len < narrow: narrow = ind.len
+  var out: [Str] = []
+  for i in 0..max(narrow, 0): out.push(" ")
+  return out
+
+fn repeat(u: [Str], n: Int) -> Str:
+  var out = ""
+  for i in 0..n:
+    for c in u: out += c
+  return out
+
+fn reindent(line: Str, file_line: Str, old_line: Str, edit_unit: [Str], file_unit: [Str]) -> Str:
+  let body = trim_start(line)
+  if body == "": return line + ""
+  let fi = lead_ws(file_line)
+  let ni = lead_ws(line)
+  let delta = ni.len - lead_ws(old_line).len
+  let et = edit_unit.len == 1 and edit_unit[0] == "\t"
+  let ft = file_unit.len == 1 and file_unit[0] == "\t"
+  if edit_unit.len > 0 and file_unit.len > 0 and et != ft:
+    # JavaScript's Math.trunc(delta / unit)
+    var levels = delta / edit_unit.len
+    if levels >= 0: return join_chars(fi, 0, fi.len) + repeat(file_unit, levels) + body
+    return join_chars(fi, 0, max(0, fi.len + levels * file_unit.len)) + body
+  if delta >= 0: return join_chars(fi, 0, fi.len) + join_chars(ni, ni.len - delta, ni.len) + body
+  return join_chars(fi, 0, max(0, fi.len + delta)) + body
+
+fn edit_file_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let t = resolve(a, json.str_at(args, "path") else "")?
+  let dry = json.bool_at(args, "dryRun") else false
+  var raw = ""
+  match a.dirs[t.di].read(t.rel):
+    ok(r): raw = r
+    err(e): fail fs_error(e, "open", t.abs)
+  let crlf = raw.count("\r\n")
+  let lf = raw.count("\n") - crlf
+  let content = crlf_to_lf(raw)
+  var modified = content + ""
+  var edits: [json.Value] = []
+  if ev = json.at(args, "edits"):
+    match ev:
+      json.Arr(items):
+        for x in items: edits.push(json.copy(x))
+      _: edits = []
+  for ed in edits:
+    let old_text = json.str_at(ed, "oldText") else ""
+    let old_n = crlf_to_lf(old_text)
+    let new_n = crlf_to_lf(json.str_at(ed, "newText") else "")
+    let at = modified.find(old_n)
+    if at >= 0:
+      modified = modified[0..at] + new_n + modified[at + old_n.len..modified.len]
+      continue
+    # line by line, with whitespace at either end ignored
+    let old_lines = split_nl(old_n)
+    var lines = split_nl(modified)
+    var found = false
+    var i = 0
+    while i <= lines.len - old_lines.len:
+      var same = true
+      for j in 0..old_lines.len:
+        if js_trim(old_lines[j]) != js_trim(lines[i + j]):
+          same = false
+          break
+      if same:
+        var units = copy_strs(old_lines)
+        for l in split_nl(new_n): units.push(l)
+        let edit_unit = indent_unit(units)
+        let file_unit = indent_unit(lines)
+        let new_lines = split_nl(new_n)
+        var repl: [Str] = []
+        for j in 0..new_lines.len:
+          let k = min(j, old_lines.len - 1)
+          repl.push(reindent(new_lines[j], lines[i + k], old_lines[k], edit_unit, file_unit))
+        var out: [Str] = []
+        for x in 0..i: out.push(lines[x] + "")
+        for r in repl: out.push(r)
+        for x in i + old_lines.len..lines.len: out.push(lines[x] + "")
+        modified = "\n".join(out)
+        found = true
+        break
+      i += 1
+    if not found: fail "Could not find exact match for edit:\n" + old_text
+  let d = diff.patch(t.abs, content, modified)
+  var ticks = 3
+  while d.find(repeat_str("`", ticks)) >= 0: ticks += 1
+  let fence = repeat_str("`", ticks)
+  let shown = fence + "diff\n" + d + fence + "\n\n"
+  if not dry:
+    var final = modified
+    if crlf > lf: final = modified.replace("\n", "\r\n")
+    write_existing(a, t, final)?
+  return ok_text(shown)
+
+fn copy_strs(xs: [Str]) -> [Str]:
+  var out: [Str] = []
+  for x in xs: out.push(x + "")
+  return out
+
+fn repeat_str(s: Str, n: Int) -> Str:
+  var out = ""
+  for i in 0..n: out += s
+  return out
+
+# Replaces an existing regular file's contents (the reference's overwriteInPlace).
+fn write_existing(a: Allowed, t: Target, text: Str) throws:
+  let i = a.dirs[t.di].link_info(t.rel) else fail "Refusing to write: not a regular file: " + t.abs
+  if i.kind != "file": fail "Refusing to write: not a regular file: " + t.abs
+  write_target(a, t, text)?
+
+fn create_dir_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let p = json.str_at(args, "path") else ""
+  let t = resolve(a, p)?
+  match a.dirs[t.di].mkdir(t.rel):
+    ok: return ok_text("Successfully created directory " + p)
+    err(e): fail fs_error(e, "mkdir", t.abs)
+
+fn join_rel(rel: Str, name: Str) -> Str:
+  if rel == "": return name + ""
+  return rel + "/" + name
+
+fn join_abs(p: Str, name: Str) -> Str:
+  if p == "/": return "/" + name
+  return p + "/" + name
+
+fn list_dir_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let t = resolve(a, json.str_at(args, "path") else "")?
+  var es: [dir.Entry] = []
+  match a.dirs[t.di].list(t.rel):
+    ok(x): es = x
+    err(e): fail fs_error(e, "scandir", t.abs)
+  var lines: [Str] = []
+  for e in es:
+    if e.kind == "dir": lines.push("[DIR] " + e.name)
+    else: lines.push("[FILE] " + e.name)
+  return ok_text("\n".join(lines))
+
+type Sized:
+  name: Str
+  is_dir: Bool
+  size: Int
+
+# The size of an entry as the reference finds it: its own (following a symlink that stays inside),
+# or 0 when it can't be checked.
+fn entry_size(a: Allowed, di: Int, rel: Str) -> Int:
+  match a.dirs[di].info(rel):
+    ok(i): return i.size
+    err(_): return 0
+
+fn list_sizes_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let t = resolve(a, json.str_at(args, "path") else "")?
+  let by_size = (json.str_at(args, "sortBy") else "name") == "size"
+  var es: [dir.Entry] = []
+  match a.dirs[t.di].list(t.rel):
+    ok(x): es = x
+    err(e): fail fs_error(e, "scandir", t.abs)
+  var items: [Sized] = []
+  for e in es: items.push(Sized(e.name + "", e.kind == "dir", entry_size(a, t.di, join_rel(t.rel, e.name))))
+  var files = 0
+  var dirs = 0
+  var total = 0
+  for x in items:
+    if x.is_dir: dirs += 1
+    else:
+      files += 1
+      total += x.size
+  let ranks = rank_table()
+  if by_size: items.sort(by: fn(x, y) => x.size > y.size)
+  else: items.sort(by: fn(x, y) => locale_less(x.name, y.name, ranks))
+  var lines: [Str] = []
+  for x in items:
+    var tag = "[FILE]"
+    var sz = pad_start(format_size(x.size), 10)
+    if x.is_dir:
+      tag = "[DIR]"
+      sz = ""
+    lines.push(tag + " " + pad_end(x.name, 30) + " " + sz)
+  lines.push("")
+  lines.push("Total: {files} files, {dirs} directories")
+  lines.push("Combined size: " + format_size(total))
+  return ok_text("\n".join(lines))
+
+fn excluded_tree(rel: Str, pats: [Str]) -> Bool:
+  for p in pats:
+    if p.find("*") >= 0:
+      if glob.matches(rel, p): return true
+    elif glob.matches(rel, p) or glob.matches(rel, "**/" + p) or glob.matches(rel, "**/" + p + "/**"): return true
+  return false
+
+# The tree under rel as pretty JSON lines (JSON.stringify(tree, null, 2)), indent levels deep.
+fn tree_json(a: Allowed, di: Int, rel: Str, root_rel: Str, pats: [Str], indent: Int, var out: Str) throws:
+  let es = a.dirs[di].list(rel)?
+  var kept: [dir.Entry] = []
+  for e in es:
+    let r = strip_rel(join_rel(rel, e.name), root_rel)
+    if excluded_tree(r, pats): continue
+    kept.push(dir.Entry(e.name + "", e.kind + ""))
+  if kept.len == 0:
+    out += "[]"
+    return
+  let pad = repeat_str("  ", indent)
+  out += "[\n"
+  for i in 0..kept.len:
+    let e = kept[i]
+    out += pad + "  {{\n" + pad + "    \"name\": " + json.quote(e.name) + ",\n" + pad + "    \"type\": "
+    if e.kind == "dir":
+      out += "\"directory\",\n" + pad + "    \"children\": "
+      tree_json(a, di, join_rel(rel, e.name), root_rel, pats, indent + 2, &out)?
+      out += "\n"
+    else: out += "\"file\"\n"
+    out += pad + "  }}"
+    if i + 1 < kept.len: out += ","
+    out += "\n"
+  out += pad + "]"
+
+# path.relative(root, p) for p under root (both relative to the same folder).
+fn strip_rel(p: Str, root: Str) -> Str:
+  if root == "": return p + ""
+  if p == root: return ""
+  return p[root.len + 1..p.len]
+
+fn tree_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let t = resolve(a, json.str_at(args, "path") else "")?
+  let pats = json.strs_at(args, "excludePatterns") else []
+  var out = ""
+  match tree_json(a, t.di, t.rel, t.rel, pats, 0, &out):
+    ok: return ok_text(out)
+    err(e): fail fs_error(e, "scandir", t.abs)
+
+fn move_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let src = json.str_at(args, "source") else ""
+  let dst = json.str_at(args, "destination") else ""
+  let s = resolve(a, src)?
+  let d = resolve(a, dst)?
+  if exists(a.dirs[d.di], d.rel): fail "Destination already exists: " + d.abs
+  match a.dirs[s.di].rename(s.rel, a.dirs[d.di], d.rel):
+    ok: return ok_text("Successfully moved " + src + " to " + dst)
+    err(e):
+      if code_of(e) == "EEXIST": fail "Destination already exists: " + d.abs
+      fail e + ", rename '" + s.abs + "' -> '" + d.abs + "'"
+
+# Whether something (a symlink too, even a dangling one) is at rel.
+fn exists(d: dir.Dir, rel: Str) -> Bool:
+  match d.link_info(rel):
+    ok(_): return true
+    err(_): return false
+
+# Adds what matches under rel to found; the error of listing rel itself, or "".
+fn search(a: Allowed, di: Int, rel: Str, root_rel: Str, abs: Str, pattern: Str, pats: [Str], var found: [Str]) -> Str:
+  var es: [dir.Entry] = []
+  match a.dirs[di].list(rel):
+    ok(x): es = x
+    err(e): return e
+  for e in es:
+    let r = join_rel(rel, e.name)
+    let full = join_abs(abs, e.name)
+    # a symlink is checked as the reference checks every entry: it must lead somewhere inside
+    if e.kind == "link":
+      let leads_in = a.dirs[di].real(r) else ""
+      if leads_in == "": continue
+    let relp = strip_rel(r, root_rel)
+    var skip = false
+    for p in pats:
+      if glob.matches(relp, p): skip = true
+    if skip: continue
+    if glob.matches(relp, pattern): found.push(full)
+    # a folder that can't be listed is skipped, as the reference's try around each entry skips it
+    if e.kind == "dir": search(a, di, r, root_rel, full, pattern, pats, &found)
+  return ""
+
+fn search_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let t = resolve(a, json.str_at(args, "path") else "")?
+  let pattern = json.str_at(args, "pattern") else ""
+  let pats = json.strs_at(args, "excludePatterns") else []
+  var found: [Str] = []
+  let problem = search(a, t.di, t.rel, t.rel, t.abs, pattern, pats, &found)
+  if problem != "": fail fs_error(problem, "scandir", t.abs)
+  if found.len == 0: return ok_text("No matches found")
+  return ok_text("\n".join(found))
+
+fn info_tool(a: Allowed, args: json.Value) -> mcp.Outcome throws:
+  let t = resolve(a, json.str_at(args, "path") else "")?
+  match a.dirs[t.di].info(t.rel):
+    ok(i):
+      var created = i.created
+      if created < 0.0: created = 0.0
+      var lines = ["size: {i.size}", "created: " + js_date(created), "modified: " + js_date(i.modified), "accessed: " + js_date(i.accessed)]
+      lines.push("isDirectory: {i.kind == "dir"}")
+      lines.push("isFile: {i.kind == "file"}")
+      lines.push("permissions: " + octal3(i.mode))
+      return ok_text("\n".join(lines))
+    err(e): fail fs_error(e, "stat", t.abs)
+
+fn run_tool(a: Allowed, name: Str, args: json.Value) -> mcp.Outcome throws:
+  if name == "read_file" or name == "read_text_file": return read_file_tool(a, args)?
+  if name == "read_media_file": return read_media_tool(a, args)?
+  if name == "read_multiple_files": return read_multiple_tool(a, args)
+  if name == "write_file": return write_file_tool(a, args)?
+  if name == "edit_file": return edit_file_tool(a, args)?
+  if name == "create_directory": return create_dir_tool(a, args)?
+  if name == "list_directory": return list_dir_tool(a, args)?
+  if name == "list_directory_with_sizes": return list_sizes_tool(a, args)?
+  if name == "directory_tree": return tree_tool(a, args)?
+  if name == "move_file": return move_tool(a, args)?
+  if name == "search_files": return search_tool(a, args)?
+  if name == "get_file_info": return info_tool(a, args)?
+  return ok_text("Allowed directories:\n" + "\n".join(a.names))
+
+fn call(a: Allowed, name: Str, args: json.Value) -> mcp.Outcome:
+  let bad = check_args(name, args)
+  if bad != "": return mcp.tool_error(bad)
+  match run_tool(a, name, args):
+    ok(o): return o
+    err(e): return mcp.tool_error(e)
+
+# ---- startup
+
+# The folder as the reference stores it: quotes and spaces around it removed, slashes squeezed.
+fn normalize_arg(s: Str) -> Str:
+  var t = s.strip()
+  if t.startswith("\"") or t.startswith("'"): t = t[1..t.len]
+  if t.endswith("\"") or t.endswith("'"): t = t[0..t.len - 1]
+  return t
+
+fn squeeze(p: Str) -> Str:
+  var out = ""
+  for i in 0..p.len:
+    if p[i] == '/' and out.endswith("/"): continue
+    out += p[i..i + 1]
+  if out.len > 1 and out.endswith("/"): out = out[0..out.len - 1]
+  return out
+
+fn main(fs: Fs):
+  let argv = args()
+  if argv.len < 2:
+    eprint("Usage: mcp-server-filesystem [allowed-directory] [additional-directories...]")
+    eprint("At least one directory must be given (this server doesn't take MCP roots from the client).")
+    exit(1)
+  var a = Allowed([], [], [])
+  var cwd = ""
+  match dir.open(fs, "."):
+    ok(here): cwd = here.path + ""
+    err(_): cwd = "/"
+  for i in 1..argv.len:
+    let given = normalize_arg(argv[i])
+    var absolute = given
+    if not given.startswith("/"): absolute = resolve_abs(cwd + "/" + given)
+    let original = squeeze(resolve_abs(absolute))
+    match dir.open(fs, original):
+      ok(d):
+        let real = d.path + ""
+        a.dirs.push(d)
+        if original != real:
+          a.names.push(original)
+          a.owner.push(a.dirs.len - 1)
+        a.names.push(real)
+        a.owner.push(a.dirs.len - 1)
+      err(e): eprint("Warning: Cannot access directory " + original + ", skipping")
+  if a.dirs.len == 0:
+    eprint("Error: None of the specified directories are accessible")
+    exit(1)
+  serve(a)
+
+# From here on, nothing has Fs: only the Dirs in a.
+fn serve(a: Allowed):
+  let s = mcp.server("secure-filesystem-server", VERSION, tools.TOOLS) else panic("the tool list isn't valid JSON")
+  eprint("Secure MCP Filesystem Server running on stdio")
+  while true:
+    let line = stdio.line() else break
+    match mcp.handle(s, line):
+      mcp.Reply(text): mcp.send(text)
+      mcp.ToolCall(c): mcp.send(mcp.result(s, c, call(a, c.name, c.args)))
+      mcp.Quiet: continue

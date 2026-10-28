@@ -2045,3 +2045,56 @@ Attack rounds:
 - The safety rules are deliberately conservative. For example, a `var` argument blocks
   every other use of the same variable in that call, even of a different field.
 - Tested once (round 20) on 10 small tasks: models wrote correct Vu from `SPEC.md` as often as Rust.
+
+## Round 25: an MCP server, folders as capabilities
+
+The question: can a Vu program stand in for a tool people already run? The Model Context Protocol's
+filesystem server (`@modelcontextprotocol/server-filesystem` 2.0.1, Node) was rewritten as
+`mcp/filesystem`, with what it needed added to the standard library:
+
+- `dir`: `dir.open(fs, path)` gives a `Dir` that reaches only what's inside one folder. Paths are
+  resolved by the kernel (`openat2` with `RESOLVE_BENEATH` on Linux; elsewhere each name is opened
+  with `O_NOFOLLOW` and symlinks and `..` are refused). Only regular files are read or written.
+  The server's `main` opens its folders and passes on only the Dirs, so its tools can't reach
+  anything else, and have no `Net` or `Os` at all.
+- `stdio` (standard input by lines, no capability), `json` (JSON of any shape, written as
+  `JSON.stringify` writes it) and `mcp` (the protocol, in both of its eras).
+- The compiler lets the standard library's own modules make the `Ffi` their C needs (programs and
+  packages still can't).
+
+Measured against the reference on Node 22 (2-vCPU VM, `mcp/filesystem/bench.py`): one 352 KB binary
+against Node plus 25 MB of packages; 1.7 ms from start to the `initialize` answer against 203 ms;
+2.1 MB of memory idle against 72 MB; 8.7x the `read_text_file` calls per second; `search_files`
+over 2,000 files in 2.6 ms against 149 ms.
+
+What the rounds found:
+
+- **Glob matching against minimatch** (random paths and patterns): round one, 2 of 3,013 differed
+  (`a/**` doesn't match `a` in minimatch); round two, 1 in 20,000 (minimatch drops `x/..` from a
+  pattern); round three, adding `.`, `..` and `//` to the patterns, about 9 in 5,000 (minimatch
+  squeezes runs of `/` and keeps `.`). After reading minimatch's preprocessing and matching it:
+  40,000 cases, no differences.
+- **The server against the reference** (every tool, errors, argument errors, both protocol eras,
+  random edits, names and globs, each server on its own copy of the files): the first run failed on
+  modern requests on a connection that had sent `initialize`: the reference picks one era per
+  connection, this server answers each request by its own `_meta`. That's kept (the 2026-07-28
+  revision is stateless) and documented; the test uses a connection per era. The next failure was
+  the test's (random file sizes drawn separately for the two copies). Then nine seeds, about 12,600
+  answers, all the same, plain and under AddressSanitizer.
+- **A compiler bug**: `to_json` of a lone `Str` or `Float`, in a program with no struct to encode,
+  didn't link (the JSON runtime was included only for types with codecs of their own). Fixed;
+  `tests/targeted/710`.
+- **The brace footgun from round 24**: `"{"` silently starts an interpolation, so
+  `s.startswith("{") and s.endswith("}")` is one string. A string that is nothing but one
+  interpolation of a string literal is now an error that says to double the brace (`708`, `709`).
+  It caught one in this round's own code (`"{~"` in the glob classes). The first version refused
+  any interpolated string literal, and the full gate failed on two older tests that use one on
+  purpose (`[{"lit"}]` in `302`, `"é{"\0"}x"` in the C tests): narrowed to the whole-string case.
+- The gate also failed once in the MCP comparison: `get_file_info`'s `accessed` time differed by a
+  second, because the other server's read had moved it. It's no longer compared.
+- Not found by a test, but met while writing: there's no statement that does nothing (an arm that
+  needs none had to be restructured), and `write` and `fail` can't name functions even in a module.
+
+Not done this round: an attack suite against `Dir` itself. Its guarantee rests on `openat2`'s
+`RESOLVE_BENEATH` (and the walk elsewhere); the tests here check that it behaves as the reference
+does on ordinary trees, including symlinks that stay inside.

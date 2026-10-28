@@ -1,0 +1,448 @@
+# json: JSON whose shape isn't known ahead, as a tree of values (from_json(text, Type) reads into a
+# type you declare, and is faster; this is for messages that can hold anything, like JSON-RPC).
+#
+#   import json
+#   let v = json.parse("{{\"id\": 7, \"tags\": [\"a\", \"b\"]}}")?
+#   let id = json.int_at(v, "id") else 0            # 7; nil when missing or not a whole number
+#   let tags = json.strs_at(v, "tags") else []       # ["a", "b"]; nil unless every item is a string
+#   if t = json.at(v, "tags"): print(json.kind(t))   # "array": a copy of the value at a key
+#   print(json.stringify(v))                        # {"id":7,"tags":["a","b"]}
+#
+# stringify() gives what JavaScript's JSON.stringify gives: keys in the order they came, numbers as
+# JavaScript prints them (1e21, 1.5e-7, 100000000000000000000), strings escaped the same way, with
+# invalid UTF-8 read as U+FFFD (as Node decodes it). A key that appears twice keeps its first place
+# and its last value, as JSON.parse does. Nesting deeper than 1000 levels is an error.
+
+type Value:
+  Null
+  Flag(b: Bool)
+  Whole(n: Int)
+  Num(f: Float)
+  Text(s: Str)
+  Arr(items: [Value])
+  Obj(fields: {Str: Value})
+
+type Reader:
+  src: Str
+  pos: Int
+
+const MAX_DEPTH = 1000
+
+fn peek(p: Reader) -> Byte:
+  if p.pos < p.src.len: return p.src[p.pos]
+  return 0
+
+fn skip_ws(var p: Reader):
+  var i = p.pos
+  let n = p.src.len
+  while i < n:
+    let c = p.src[i]
+    if c != ' ' and c != '\n' and c != '\t' and c != '\r': break
+    i += 1
+  p.pos = i
+
+fn word(var p: Reader, w: Str) throws:
+  if p.pos + w.len > p.src.len or p.src[p.pos..p.pos + w.len] != w: fail "invalid literal at byte {p.pos}"
+  p.pos += w.len
+
+fn value(var p: Reader, depth: Int) -> Value throws:
+  if depth > MAX_DEPTH: fail "nested deeper than {MAX_DEPTH} levels at byte {p.pos}"
+  skip_ws(&p)
+  let c = peek(p)
+  if c == '{':
+    p.pos += 1
+    var fields: {Str: Value} = {}
+    skip_ws(&p)
+    if peek(p) == '}':
+      p.pos += 1
+      return Obj(fields)
+    while true:
+      skip_ws(&p)
+      if peek(p) != '"': fail "expected a string key at byte {p.pos}"
+      let key = text(&p)?
+      skip_ws(&p)
+      if peek(p) != ':': fail "expected ':' at byte {p.pos}"
+      p.pos += 1
+      let v = value(&p, depth + 1)?
+      fields[key] = v
+      skip_ws(&p)
+      let d = peek(p)
+      p.pos += 1
+      if d == '}': return Obj(fields)
+      if d != ',': fail "expected ',' or '}}' at byte {p.pos - 1}"
+  if c == '[':
+    p.pos += 1
+    var items: [Value] = []
+    skip_ws(&p)
+    if peek(p) == ']':
+      p.pos += 1
+      return Arr(items)
+    while true:
+      let item = value(&p, depth + 1)?
+      items.push(item)
+      skip_ws(&p)
+      let d = peek(p)
+      p.pos += 1
+      if d == ']': return Arr(items)
+      if d != ',': fail "expected ',' or ']' at byte {p.pos - 1}"
+  if c == '"':
+    let s = text(&p)?
+    return Text(s)
+  if c == 't':
+    word(&p, "true")?
+    return Flag(true)
+  if c == 'f':
+    word(&p, "false")?
+    return Flag(false)
+  if c == 'n':
+    word(&p, "null")?
+    return Null
+  if c == '-' or (c >= '0' and c <= '9'): return number(&p)?
+  if p.pos >= p.src.len: fail "unexpected end of input"
+  fail "unexpected character at byte {p.pos}"
+
+fn hex4(var p: Reader) -> Int throws:
+  var v = 0
+  for i in 0..4:
+    let c = peek(p)
+    var d = 0
+    if c >= '0' and c <= '9': d = int(c) - 48
+    elif c >= 'a' and c <= 'f': d = int(c) - 87
+    elif c >= 'A' and c <= 'F': d = int(c) - 55
+    else: fail "bad \\u escape at byte {p.pos}"
+    v = v * 16 + d
+    p.pos += 1
+  return v
+
+fn utf8(var out: Str, cp: Int):
+  if cp < 0x80:
+    out += str([byte(cp)])
+  elif cp < 0x800:
+    out += str([byte(0xC0 | (cp >> 6)), byte(0x80 | (cp & 0x3F))])
+  elif cp < 0x10000:
+    out += str([byte(0xE0 | (cp >> 12)), byte(0x80 | ((cp >> 6) & 0x3F)), byte(0x80 | (cp & 0x3F))])
+  else:
+    out += str([byte(0xF0 | (cp >> 18)), byte(0x80 | ((cp >> 12) & 0x3F)), byte(0x80 | ((cp >> 6) & 0x3F)), byte(0x80 | (cp & 0x3F))])
+
+# A string from its opening quote. A lone surrogate escape (\ud800 alone) becomes U+FFFD, as
+# Node does when it turns such a string into UTF-8.
+fn text(var p: Reader) -> Str throws:
+  p.pos += 1
+  var out = ""
+  var start = p.pos
+  let n = p.src.len
+  while true:
+    var i = p.pos
+    while i < n:
+      let b = p.src[i]
+      if b == '"' or b == '\\' or b < 32: break
+      i += 1
+    p.pos = i
+    if p.pos >= n: fail "unterminated string"
+    let c = p.src[p.pos]
+    if c == '"':
+      out += p.src[start..p.pos]
+      p.pos += 1
+      return out
+    if c < 32: fail "control character in string at byte {p.pos}"
+    out += p.src[start..p.pos]
+    p.pos += 1
+    let e = peek(p)
+    p.pos += 1
+    if e == '"': out += "\""
+    elif e == '\\': out += "\\"
+    elif e == '/': out += "/"
+    elif e == 'n': out += "\n"
+    elif e == 't': out += "\t"
+    elif e == 'r': out += "\r"
+    elif e == 'b': out += str([8])
+    elif e == 'f': out += str([12])
+    elif e == 'u':
+      var cp = hex4(&p)?
+      if cp >= 0xD800 and cp < 0xDC00:
+        # a pair 😀, or a lone high surrogate
+        if p.pos + 6 <= n and p.src[p.pos] == '\\' and p.src[p.pos + 1] == 'u':
+          let save = p.pos
+          p.pos += 2
+          let lo = hex4(&p)?
+          if lo >= 0xDC00 and lo < 0xE000: cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+          else:
+            p.pos = save
+            cp = 0xFFFD
+        else: cp = 0xFFFD
+      elif cp >= 0xDC00 and cp < 0xE000: cp = 0xFFFD
+      utf8(&out, cp)
+    else:
+      fail "bad escape at byte {p.pos - 1}"
+    start = p.pos
+
+fn digits(var p: Reader) throws:
+  let start = p.pos
+  var i = start
+  let n = p.src.len
+  while i < n:
+    let c = p.src[i]
+    if c < '0' or c > '9': break
+    i += 1
+  if i == start: fail "expected a digit at byte {i}"
+  p.pos = i
+
+fn number(var p: Reader) -> Value throws:
+  let start = p.pos
+  if peek(p) == '-': p.pos += 1
+  if peek(p) == '0':
+    p.pos += 1
+  else:
+    digits(&p)?
+  var whole = true
+  if peek(p) == '.':
+    p.pos += 1
+    digits(&p)?
+    whole = false
+  if peek(p) == 'e' or peek(p) == 'E':
+    p.pos += 1
+    if peek(p) == '+' or peek(p) == '-': p.pos += 1
+    digits(&p)?
+    whole = false
+  let t = p.src[start..p.pos]
+  if whole:
+    match int(t):
+      ok(n): return Whole(n)
+      err(_): whole = false     # too big for an Int: a Float, as JavaScript reads it
+  let v = float(t) else 0.0
+  return Num(v)
+
+# The JSON text as a value; fails on anything that isn't one JSON value (surrounding spaces allowed).
+fn parse(src: Str) -> Value throws:
+  var p = Reader(src, 0)
+  let v = value(&p, 0)?
+  skip_ws(&p)
+  if p.pos != p.src.len: fail "extra data after the value at byte {p.pos}"
+  return v
+
+# ---- writing
+
+# s as a JSON string, as JSON.stringify writes it.
+fn quote(s: Str) -> Str:
+  var out = ""
+  quote_to(s, &out)
+  return out
+
+fn quote_to(s: Str, var out: Str):
+  if not s.is_utf8():
+    # each invalid stretch becomes U+FFFD, as Node's UTF-8 decoder (and Python's) reads it
+    var fixed = ""
+    for c in s.chars(): fixed += c
+    quote_to(fixed, &out)
+    return
+  out += "\""
+  var start = 0
+  for i in 0..s.len:
+    let c = s[i]
+    if c == '"' or c == '\\' or c < 32:
+      out += s[start..i]
+      if c == '"': out += "\\\""
+      elif c == '\\': out += "\\\\"
+      elif c == '\n': out += "\\n"
+      elif c == '\t': out += "\\t"
+      elif c == '\r': out += "\\r"
+      elif c == 8: out += "\\b"
+      elif c == 12: out += "\\f"
+      else: out += "\\u{int(c):04x}"
+      start = i + 1
+  out += s[start..s.len]
+  out += "\""
+
+fn zeros(n: Int) -> Str:
+  var out = ""
+  for i in 0..n: out += "0"
+  return out
+
+# x as JavaScript's Number.prototype.toString prints it (JSON.stringify writes null for NaN and the
+# infinities): the shortest digits that read back exactly, in plain notation from 1e-7 up to 1e21.
+fn number_text(x: Float) -> Str:
+  if x != x or x > 1.7976931348623157e308 or x < -1.7976931348623157e308: return "null"
+  if x == 0.0: return "0"
+  var neg = x < 0.0
+  var a = x
+  if neg: a = -x
+  # Vu prints the shortest digits too; split them into digits and a decimal exponent
+  let t = "{a}"
+  var mant = t
+  var e = 0
+  let ei = t.find("e")
+  if ei >= 0:
+    mant = t[0..ei]
+    e = int(t[ei + 1..t.len]) else 0
+  var ds = ""
+  var point = mant.len
+  for i in 0..mant.len:
+    if mant[i] == '.': point = i
+    else: ds += mant[i..i + 1]
+  # ds * 10^(point + e - ds.len): normalize to digits without leading/trailing zeros
+  var k = point + e        # where the decimal point goes, counted from the left of ds
+  while ds.len > 1 and ds[0] == '0':
+    ds = ds[1..ds.len]
+    k -= 1
+  while ds.len > 1 and ds[ds.len - 1] == '0': ds = ds[0..ds.len - 1]
+  let n = ds.len
+  var out = ""
+  if neg: out = "-"
+  if k >= n and k <= 21:
+    out += ds + zeros(k - n)
+  elif k > 0 and k <= 21:
+    out += ds[0..k] + "." + ds[k..n]
+  elif k > -6 and k <= 0:
+    out += "0." + zeros(-k) + ds
+  else:
+    var ex = k - 1
+    var sign = "+"
+    if ex < 0:
+      sign = "-"
+      ex = -ex
+    if n == 1: out += ds + "e" + sign + "{ex}"
+    else: out += ds[0..1] + "." + ds[1..n] + "e" + sign + "{ex}"
+  return out
+
+fn write_to(v: Value, var out: Str):
+  match v:
+    Null: out += "null"
+    Flag(b): out += "{b}"
+    Whole(n): out += "{n}"
+    Num(f): out += number_text(f)
+    Text(s): quote_to(s, &out)
+    Arr(items):
+      out += "["
+      for i in 0..items.len:
+        if i > 0: out += ","
+        write_to(items[i], &out)
+      out += "]"
+    Obj(fields):
+      out += "{{"
+      var first = true
+      for k, x in fields:
+        if not first: out += ","
+        first = false
+        quote_to(k, &out)
+        out += ":"
+        write_to(x, &out)
+      out += "}}"
+
+# v as compact JSON text, as JSON.stringify(v) writes it.
+fn stringify(v: Value) -> Str:
+  var out = ""
+  write_to(v, &out)
+  return out
+
+# ---- reading parts
+
+# "null", "bool", "number", "string", "array" or "object"
+fn kind(v: Value) -> Str:
+  match v:
+    Null: return "null"
+    Flag(_): return "bool"
+    Whole(_): return "number"
+    Num(_): return "number"
+    Text(_): return "string"
+    Arr(_): return "array"
+    Obj(_): return "object"
+
+fn copy(v: Value) -> Value:
+  match v:
+    Null: return Null
+    Flag(b): return Flag(b)
+    Whole(n): return Whole(n)
+    Num(f): return Num(f)
+    Text(s): return Text(s + "")
+    Arr(items):
+      var out: [Value] = []
+      for x in items: out.push(copy(x))
+      return Arr(out)
+    Obj(fields):
+      var out: {Str: Value} = {}
+      for k, x in fields: out[k] = copy(x)
+      return Obj(out)
+
+# Whether v is an object with key in it.
+fn has(v: Value, key: Str) -> Bool:
+  match v:
+    Obj(fields): return key in fields
+    _: return false
+
+# A copy of the value at key, or nil when v isn't an object or doesn't have it.
+fn at(v: Value, key: Str) -> Value?:
+  match v:
+    Obj(fields):
+      if key in fields: return copy(fields[key])
+      return nil
+    _: return nil
+
+# The string at key, or nil when it's missing or not a string.
+fn str_at(v: Value, key: Str) -> Str?:
+  match v:
+    Obj(fields):
+      if key in fields:
+        match fields[key]:
+          Text(s): return s + ""
+          _: return nil
+      return nil
+    _: return nil
+
+# The number at key as a Float, or nil.
+fn num_at(v: Value, key: Str) -> Float?:
+  match v:
+    Obj(fields):
+      if key in fields:
+        match fields[key]:
+          Whole(n): return float(n)
+          Num(f): return f
+          _: return nil
+      return nil
+    _: return nil
+
+# The whole number at key, or nil (a fraction, or a number too large for an Int, is nil).
+fn int_at(v: Value, key: Str) -> Int?:
+  match v:
+    Obj(fields):
+      if key in fields:
+        match fields[key]:
+          Whole(n): return n
+          _: return nil
+      return nil
+    _: return nil
+
+fn bool_at(v: Value, key: Str) -> Bool?:
+  match v:
+    Obj(fields):
+      if key in fields:
+        match fields[key]:
+          Flag(b): return b
+          _: return nil
+      return nil
+    _: return nil
+
+# The array of strings at key, or nil when it's missing, not an array, or holds anything but strings.
+fn strs_at(v: Value, key: Str) -> [Str]?:
+  match v:
+    Obj(fields):
+      if key in fields:
+        match fields[key]:
+          Arr(items):
+            var out: [Str] = []
+            for x in items:
+              match x:
+                Text(s): out.push(s + "")
+                _: return nil
+            return out
+          _: return nil
+      return nil
+    _: return nil
+
+# The keys of an object, in order ([] for anything else).
+fn keys(v: Value) -> [Str]:
+  var out: [Str] = []
+  match v:
+    Obj(fields):
+      for k, _ in fields: out.push(k + "")
+    _: return out
+  return out

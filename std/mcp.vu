@@ -1,0 +1,158 @@
+# mcp: a Model Context Protocol server over stdio (JSON-RPC 2.0, one message per line). It answers the
+# protocol itself (the 2026-07-28 revision, where each request carries its version in _meta, and the
+# earlier ones that open with initialize), and hands each tool call to the program:
+#
+#   import mcp
+#   import stdio
+#   let s = mcp.server("my-server", "1.0.0", TOOLS)?    # TOOLS: the tools/list array, as JSON text
+#   while true:
+#     let line = stdio.line() else break              # stdin closed: the client is done
+#     match mcp.handle(s, line):
+#       Reply(text): mcp.send(text)
+#       ToolCall(c): mcp.send(mcp.result(s, c, answer(c)))
+#       Quiet: continue
+#
+# A tool's answer is an Outcome: mcp.text(t) for text content, mcp.tool_error(t) for an error the model
+# should see (isError), or mcp.Outcome(content_json, structured_json, is_error) for anything else.
+# Requests are answered in order; notifications (and lines that aren't JSON-RPC) get no answer.
+import json
+import stdio
+
+const MODERN = "2026-07-28"
+const LEGACY = "2025-11-25"
+
+type Server:
+  name: Str
+  version: Str
+  tools: Str             # the JSON array tools/list returns
+  names: [Str]           # the tools' names, in order
+  instructions: Str      # "" for none
+
+# A tool call to answer: id is the request's id as JSON text.
+type Call:
+  id: Str
+  name: Str
+  args: json.Value       # the arguments object ({} when the client sent none)
+  modern: Bool           # a 2026-07-28 request (its result says so, and names the server)
+
+type Step:
+  Reply(text: Str)       # an answer the server made itself: send it
+  ToolCall(call: Call)   # run the tool, then send mcp.result(...)
+  Quiet                  # nothing to send
+
+type Outcome:
+  content: Str           # the JSON array of content blocks
+  structured: Str        # the structuredContent object as JSON, or "" for none
+  is_error: Bool
+
+# A server with these tools (a JSON array of tool objects, each with a "name").
+fn server(name: Str, version: Str, tools: Str) -> Server throws:
+  let v = json.parse(tools)?
+  var names: [Str] = []
+  match v:
+    json.Arr(items):
+      for t in items:
+        let n = json.str_at(t, "name") else ""
+        if n == "": fail "every tool needs a name"
+        names.push(n)
+    _: fail "the tools are a JSON array"
+  return Server(name + "", version + "", tools + "", names, "")
+
+fn send(text: Str):
+  write(text + "\n")
+  stdio.flush()
+
+fn info_json(s: Server) -> Str:
+  return "{{\"name\":" + json.quote(s.name) + ",\"version\":" + json.quote(s.version) + "}}"
+
+fn meta_json(s: Server) -> Str:
+  return "\"_meta\":{{\"io.modelcontextprotocol/serverInfo\":" + info_json(s) + "}}"
+
+fn answer(id: Str, result: Str) -> Str:
+  return "{{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}}"
+
+fn error(id: Str, code: Int, msg: Str) -> Str:
+  return "{{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{{\"code\":{code},\"message\":" + json.quote(msg) + "}}}}"
+
+# A result's fields, with the 2026-07-28 ones (resultType, the server's name) when modern.
+fn wrap(s: Server, fields: Str, modern: Bool, cache: Bool) -> Str:
+  var out = "{{" + fields
+  if modern:
+    if fields != "": out += ","
+    out += "\"resultType\":\"complete\""
+    if cache: out += ",\"ttlMs\":0,\"cacheScope\":\"private\""
+    out += "," + meta_json(s)
+  return out + "}}"
+
+fn text(t: Str) -> Outcome:
+  let c = "[{{\"type\":\"text\",\"text\":" + json.quote(t) + "}}]"
+  return Outcome(c, "{{\"content\":" + json.quote(t) + "}}", false)
+
+fn tool_error(t: Str) -> Outcome:
+  return Outcome("[{{\"type\":\"text\",\"text\":" + json.quote(t) + "}}]", "", true)
+
+# The answer to a tool call.
+fn result(s: Server, c: Call, o: Outcome) -> Str:
+  var f = "\"content\":" + o.content
+  if o.structured != "": f += ",\"structuredContent\":" + o.structured
+  if o.is_error: f += ",\"isError\":true"
+  return answer(c.id, wrap(s, f, c.modern, false))
+
+fn known(s: Server, name: Str) -> Bool:
+  for n in s.names:
+    if n == name: return true
+  return false
+
+fn caps_json() -> Str:
+  return "{{\"tools\":{{\"listChanged\":true}}}}"
+
+fn legacy_version(v: Str) -> Str:
+  for k in ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"]:
+    if v == k: return k
+  return LEGACY
+
+# Reads one line from the client and says what to do with it.
+fn handle(s: Server, line: Str) -> Step:
+  if line.strip() == "": return Quiet
+  let msg = json.parse(line) else return Quiet          # not JSON: nothing can be answered
+  if json.kind(msg) != "object": return Quiet           # a batch or a bare value (no batches in MCP)
+  let method = json.str_at(msg, "method") else return Quiet   # a response, which a server never asks for
+  if not json.has(msg, "id"): return Quiet               # a notification: never answered
+  var id = "null"
+  if i = json.at(msg, "id"):
+    let k = json.kind(i)
+    if k != "string" and k != "number": return Reply(error("null", -32600, "Invalid Request: the id must be a string or a number"))
+    id = json.stringify(i)
+  let params = json.at(msg, "params") else json.Obj({})
+  if json.kind(params) != "object": return Reply(error(id, -32602, "Invalid params: params must be an object"))
+  # the 2026-07-28 revision: the version (and the client's capabilities) in every request's _meta
+  var modern = false
+  if m = json.at(params, "_meta"):
+    if json.has(m, "io.modelcontextprotocol/protocolVersion"):
+      modern = true
+      let v = json.str_at(m, "io.modelcontextprotocol/protocolVersion") else ""
+      if v != MODERN:
+        let data = "{{\"supported\":[\"" + MODERN + "\",\"" + LEGACY + "\"],\"requested\":" + json.quote(v) + "}}"
+        return Reply("{{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{{\"code\":-32022,\"message\":\"Unsupported protocol version\",\"data\":" + data + "}}}}")
+      if not json.has(m, "io.modelcontextprotocol/clientCapabilities"):
+        return Reply(error(id, -32602, "Invalid _meta envelope for protocol revision 2026-07-28: io.modelcontextprotocol/clientCapabilities is required"))
+  if method == "initialize":
+    let v = legacy_version(json.str_at(params, "protocolVersion") else "")
+    var r = "{{\"protocolVersion\":\"" + v + "\",\"capabilities\":" + caps_json() + ",\"serverInfo\":" + info_json(s)
+    if s.instructions != "": r += ",\"instructions\":" + json.quote(s.instructions)
+    return Reply(answer(id, r + "}}"))
+  if method == "server/discover":
+    if not modern: return Reply(error(id, -32601, "Method not found"))
+    var f = "\"supportedVersions\":[\"" + MODERN + "\"],\"capabilities\":" + caps_json()
+    if s.instructions != "": f += ",\"instructions\":" + json.quote(s.instructions)
+    return Reply(answer(id, wrap(s, f, true, true)))
+  if method == "ping": return Reply(answer(id, wrap(s, "", modern, false)))
+  if method == "tools/list": return Reply(answer(id, wrap(s, "\"tools\":" + s.tools, modern, true)))
+  if method == "tools/call":
+    let name = json.str_at(params, "name") else return Reply(error(id, -32602, "Invalid params: tools/call needs the tool's name"))
+    if not known(s, name): return Reply(error(id, -32602, "Tool " + name + " not found"))
+    var args = json.at(params, "arguments") else json.Obj({})
+    if json.kind(args) == "null": args = json.Obj({})
+    if json.kind(args) != "object": return Reply(error(id, -32602, "Invalid params: arguments must be an object"))
+    return ToolCall(Call(id, name, args, modern))
+  return Reply(error(id, -32601, "Method not found"))
