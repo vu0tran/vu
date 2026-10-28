@@ -146,3 +146,376 @@ fn parse_iso(s: Str) -> Float throws:
   if at != s.len: fail "unexpected text after the time at byte {at}"
   let days = days_from_civil(year, month, day)
   return float(days * 86400 + hour * 3600 + minute * 60 + second - offset) + frac
+
+# ---- Time zones, from the tz database's compiled files (TZif, RFC 8536) ----
+#   let ny = time.zone(fs, "America/New_York")?    # /usr/share/zoneinfo/America/New_York
+#   let l = time.local(ny, now)                     # l.date (a Date), l.offset (seconds east of UTC), l.abbrev, l.dst
+#   print(time.iso_in(ny, now))                     # 2026-10-26T17:30:05.123-04:00
+#   let t = time.from_local(ny, time.Date(2026, 11, 1, 1, 30, 0, 0, 0))   # a wall-clock time -> seconds
+# A wall-clock time that happens twice (when clocks go back) is the first of the two; one that never
+# happens (when clocks go forward) is read with the offset from before the change, as Python's
+# zoneinfo does with fold=0. Leap-second records in the file are skipped (Unix time has none).
+
+# A day of the year in a POSIX TZ rule: kind 0 is Jn (1..365, Feb 29 never counted), 1 is n (0..365),
+# 2 is Mm.w.d (weekday d, 0 Sunday, of week w, 5 the last, of month m); at is the local time of day.
+type DayRule:
+  kind, a, b, c: Int
+  at: Int
+
+type Zone:
+  name: Str
+  trans: [Int]        # instants (seconds since 1970) when the offset changes, ascending
+  kinds: [Int]        # the local time type from each one on
+  offs: [Int]         # per type: seconds east of UTC
+  dsts: [Bool]
+  abbrs: [Str]
+  has_rule: Bool      # the file's POSIX TZ rule, for instants after the last transition
+  std_off: Int
+  std_abbr: Str
+  has_dst: Bool
+  dst_off: Int
+  dst_abbr: Str
+  rise: DayRule       # when daylight saving time starts (local standard time)
+  fall: DayRule       # and ends (local daylight time)
+
+# The local time at an instant.
+type Local:
+  date: Date
+  offset: Int         # seconds east of UTC (New York in summer: -14400)
+  abbrev: Str         # EST, CEST, +03
+  dst: Bool
+
+fn no_day() -> DayRule:
+  return DayRule(0, 0, 0, 0, 0)
+
+fn utc_zone() -> Zone:
+  return fixed(0, "UTC")
+
+# A zone that's always offset seconds east of UTC.
+fn fixed(offset: Int, abbrev: Str) -> Zone:
+  return Zone(abbrev, [], [], [offset], [false], [abbrev], false, 0, "", false, 0, "", no_day(), no_day())
+
+fn zone_name_ok(name: Str) -> Bool:
+  if name == "" or name.len > 255 or name[0] == '/' or name.find("..", 0) >= 0: return false
+  for i in 0..name.len:
+    let b = name[i]
+    if not ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '/' or b == '_' or b == '-' or b == '+'): return false
+  return true
+
+# The zone named name (America/New_York, Europe/Paris, UTC) from the system's tz database.
+fn zone(fs: Fs, name: Str) -> Zone throws:
+  if not zone_name_ok(name): fail "'{name}' is not a time zone name"
+  let data = fs.read("/usr/share/zoneinfo/" + name) else fail "no time zone named '{name}'"
+  return parse_tzif(name, data)?
+
+# The system's own zone (/etc/localtime).
+fn local_zone(fs: Fs) -> Zone throws:
+  let data = fs.read("/etc/localtime")?
+  return parse_tzif("localtime", data)?
+
+# A big-endian signed number of n (4 or 8) bytes at s[at].
+fn be_int(s: Str, at: Int, n: Int) -> Int:
+  var v = 0
+  for i in at..at + n: v = (v << 8) +% int(s[i])
+  if n == 4 and v >= 1 << 31: v -= 1 << 32
+  return v
+
+fn abbr_at(chars: Str, i: Int) -> Str:
+  var j = i
+  while j < chars.len and chars[j] != '\0': j += 1
+  return chars[i..j]
+
+# Reads a TZif file (RFC 8536, versions 1 to 4). name is only kept for messages.
+fn parse_tzif(name: Str, data: Str) -> Zone throws:
+  let bad = "'{name}' is not a valid time zone file"
+  if data.len < 44 or data[0..4] != "TZif": fail bad
+  let ver = data[4]
+  var at = 0
+  var tsize = 4
+  if ver != '\0':
+    if ver < '2' or ver > '4': fail bad + " (version {int(ver) - 48})"
+    # skip the version 1 block: the 64-bit one follows it
+    let n1 = [be_int(data, 20, 4), be_int(data, 24, 4), be_int(data, 28, 4), be_int(data, 32, 4), be_int(data, 36, 4), be_int(data, 40, 4)]
+    for c in n1:
+      if c < 0 or c > 1 << 20: fail bad
+    at = 44 + n1[3] * 5 + n1[4] * 6 + n1[5] + n1[2] * 8 + n1[1] + n1[0]
+    if at + 44 > data.len or data[at..at + 4] != "TZif": fail bad
+    tsize = 8
+  let isut = be_int(data, at + 20, 4)
+  let isstd = be_int(data, at + 24, 4)
+  let leaps = be_int(data, at + 28, 4)
+  let timecnt = be_int(data, at + 32, 4)
+  let typecnt = be_int(data, at + 36, 4)
+  let charcnt = be_int(data, at + 40, 4)
+  for c in [isut, isstd, leaps, timecnt, typecnt, charcnt]:
+    if c < 0 or c > 1 << 20: fail bad
+  if typecnt == 0 or charcnt == 0: fail bad
+  if (isut != 0 and isut != typecnt) or (isstd != 0 and isstd != typecnt): fail bad
+  at += 44
+  let size = timecnt * tsize + timecnt + typecnt * 6 + charcnt + leaps * (tsize + 4) + isstd + isut
+  if at + size > data.len: fail bad + " (cut short)"
+  var trans: [Int] = []
+  for i in 0..timecnt:
+    let t = be_int(data, at + i * tsize, tsize)
+    if i > 0 and t <= trans[i - 1]: fail bad + " (transitions out of order)"
+    trans.push(t)
+  at += timecnt * tsize
+  var kinds: [Int] = []
+  for i in 0..timecnt:
+    let k = int(data[at + i])
+    if k >= typecnt: fail bad
+    kinds.push(k)
+  at += timecnt
+  let chars = data[at + typecnt * 6..at + typecnt * 6 + charcnt]
+  var offs: [Int] = []
+  var dsts: [Bool] = []
+  var abbrs: [Str] = []
+  for i in 0..typecnt:
+    let off = be_int(data, at + i * 6, 4)
+    if off < -89999 or off > 93599: fail bad + " (an offset of {off} seconds)"
+    let d = data[at + i * 6 + 4]
+    if int(d) > 1: fail bad
+    let ai = int(data[at + i * 6 + 5])
+    if ai >= charcnt: fail bad
+    offs.push(off)
+    dsts.push(int(d) == 1)
+    abbrs.push(abbr_at(chars, ai))
+  at += size - timecnt * tsize - timecnt
+  var z = Zone(name, trans, kinds, offs, dsts, abbrs, false, 0, "", false, 0, "", no_day(), no_day())
+  if tsize == 8:
+    if at >= data.len or data[at] != '\n': fail bad + " (no footer)"
+    let close = data.find("\n", at + 1)
+    if close < 0: fail bad + " (no footer)"
+    let rule = data[at + 1..close]
+    if rule != "": parse_rule(&z, rule) else fail bad + " (the rule '{rule}' isn't a POSIX TZ string)"
+  return z
+
+# ---- POSIX TZ strings: EST5EDT,M3.2.0,M11.1.0 or <+0330>-3:30 ----
+
+type Cursor:
+  s: Str
+  at: Int
+
+fn tz_abbr(var c: Cursor) -> Str throws:
+  let start = c.at
+  if c.at < c.s.len and c.s[c.at] == '<':
+    c.at += 1
+    while c.at < c.s.len and c.s[c.at] != '>': c.at += 1
+    if c.at >= c.s.len: fail "an unclosed <"
+    c.at += 1
+    let inner = c.s[start + 1..c.at - 1]
+    if inner.len < 3: fail "a short name"
+    return inner
+  while c.at < c.s.len and ((c.s[c.at] >= 'a' and c.s[c.at] <= 'z') or (c.s[c.at] >= 'A' and c.s[c.at] <= 'Z')): c.at += 1
+  if c.at - start < 3: fail "a short name"
+  return c.s[start..c.at]
+
+fn tz_num(var c: Cursor, most: Int) -> Int throws:
+  let start = c.at
+  var v = 0
+  while c.at < c.s.len and c.s[c.at] >= '0' and c.s[c.at] <= '9' and c.at - start < 3:
+    v = v * 10 + int(c.s[c.at]) - 48
+    c.at += 1
+  if c.at == start or v > most: fail "a bad number"
+  return v
+
+# [+-]hh[:mm[:ss]] in seconds; hours up to most
+fn tz_time(var c: Cursor, most: Int) -> Int throws:
+  var sign = 1
+  if c.at < c.s.len and (c.s[c.at] == '+' or c.s[c.at] == '-'):
+    if c.s[c.at] == '-': sign = -1
+    c.at += 1
+  var v = tz_num(&c, most)? * 3600
+  if c.at < c.s.len and c.s[c.at] == ':':
+    c.at += 1
+    v += tz_num(&c, 59)? * 60
+    if c.at < c.s.len and c.s[c.at] == ':':
+      c.at += 1
+      v += tz_num(&c, 59)?
+  return sign * v
+
+fn tz_day(var c: Cursor) -> DayRule throws:
+  var r = no_day()
+  if c.at < c.s.len and c.s[c.at] == 'J':
+    c.at += 1
+    r.a = tz_num(&c, 365)?
+    if r.a < 1: fail "J0"
+  elif c.at < c.s.len and c.s[c.at] == 'M':
+    c.at += 1
+    r.kind = 2
+    r.a = tz_num(&c, 12)?
+    if r.a < 1 or c.at >= c.s.len or c.s[c.at] != '.': fail "a bad M rule"
+    c.at += 1
+    r.b = tz_num(&c, 5)?
+    if r.b < 1 or c.at >= c.s.len or c.s[c.at] != '.': fail "a bad M rule"
+    c.at += 1
+    r.c = tz_num(&c, 6)?
+  else:
+    r.kind = 1
+    r.a = tz_num(&c, 365)?
+  r.at = 7200
+  if c.at < c.s.len and c.s[c.at] == '/':
+    c.at += 1
+    r.at = tz_time(&c, 167)?
+  return r
+
+fn parse_rule(var z: Zone, rule: Str) throws:
+  var c = Cursor(rule, 0)
+  z.std_abbr = tz_abbr(&c)?
+  z.std_off = -tz_time(&c, 24)?
+  z.has_rule = true
+  if c.at == rule.len: return
+  z.has_dst = true
+  z.dst_abbr = tz_abbr(&c)?
+  z.dst_off = z.std_off + 3600
+  if c.at < rule.len and c.s[c.at] != ',': z.dst_off = -tz_time(&c, 24)?
+  if c.at == rule.len:
+    # no rule given: the US one (POSIX leaves it to the implementation)
+    z.rise = DayRule(2, 3, 2, 0, 7200)
+    z.fall = DayRule(2, 11, 1, 0, 7200)
+    return
+  if c.s[c.at] != ',': fail "expected ','"
+  c.at += 1
+  z.rise = tz_day(&c)?
+  if c.at >= rule.len or c.s[c.at] != ',': fail "expected ','"
+  c.at += 1
+  z.fall = tz_day(&c)?
+  if c.at != rule.len: fail "text after the rule"
+
+fn leap_year(y: Int) -> Bool:
+  return (y % 4 == 0 and y % 100 != 0) or y % 400 == 0
+
+# Local seconds since 1970 (as if UTC) when a rule's day and time come in year y.
+fn rule_local(r: DayRule, y: Int) -> Int:
+  let jan1 = days_from_civil(y, 1, 1)
+  var day = 0
+  if r.kind == 0:
+    day = jan1 + r.a - 1
+    if leap_year(y) and r.a >= 60: day += 1
+  elif r.kind == 1:
+    day = jan1 + r.a
+  else:
+    let first = days_from_civil(y, r.a, 1)
+    let wd = fmod(first + 4, 7)        # 0 Sunday (1970-01-01 was a Thursday)
+    var d = 1 + fmod(r.c - wd, 7) + (r.b - 1) * 7
+    while d > days_in_month(y, r.a): d -= 7
+    day = first + d - 1
+  return day * 86400 + r.at
+
+# Under the rule at instant t: whether DST is on, and when that last changed.
+type RuleState:
+  dst: Bool
+  since: Int
+
+fn rule_state(z: Zone, t: Int) -> RuleState:
+  if not z.has_dst: return RuleState(false, -(1 << 62))
+  let y = utc(float(t + z.std_off)).year
+  var best = RuleState(false, -(1 << 62))
+  var found = false
+  for yy in y - 1..y + 2:
+    let s = rule_local(z.rise, yy) - z.std_off
+    let e = rule_local(z.fall, yy) - z.dst_off
+    # at the same instant, the end comes first (a rule with DST all year ends and starts again)
+    if e <= t and (not found or e >= best.since):
+      best = RuleState(false, e)
+      found = true
+    if s <= t and (not found or s > best.since or (s == best.since and not best.dst)):
+      best = RuleState(true, s)
+      found = true
+  return best
+
+fn floor_secs(t: Float) -> Int:
+  var s = int(t)
+  if float(s) > t: s -= 1
+  return s
+
+# The local time type at instant t: >= 0 a type of the file, -1 the rule's standard time, -2 its DST.
+fn kind_at(z: Zone, t: Int) -> Int:
+  let n = z.trans.len
+  if z.has_rule and (n == 0 or t >= z.trans[n - 1]):
+    if rule_state(z, t).dst: return -2
+    return -1
+  if n == 0 or t < z.trans[0]: return 0
+  var lo = 0
+  var hi = n - 1     # trans[lo] <= t < trans[hi + 1]
+  while lo < hi:
+    let mid = (lo + hi + 1) / 2
+    if z.trans[mid] <= t: lo = mid
+    else: hi = mid - 1
+  return z.kinds[lo]
+
+fn kind_off(z: Zone, k: Int) -> Int:
+  if k == -1: return z.std_off
+  if k == -2: return z.dst_off
+  return z.offs[k]
+
+# Seconds east of UTC at instant t.
+fn offset(z: Zone, t: Float) -> Int:
+  return kind_off(z, kind_at(z, floor_secs(t)))
+
+# The local date and time at instant t (seconds since 1970).
+fn local(z: Zone, t: Float) -> Local:
+  let k = kind_at(z, floor_secs(t))
+  let off = kind_off(z, k)
+  if k == -1: return Local(utc(t + float(off)), off, z.std_abbr + "", false)
+  if k == -2: return Local(utc(t + float(off)), off, z.dst_abbr + "", true)
+  return Local(utc(t + float(off)), off, z.abbrs[k] + "", z.dsts[k])
+
+# The latest change of offset at or before instant t (-(2^62) if none).
+fn change_before(z: Zone, t: Int) -> Int:
+  let n = z.trans.len
+  if z.has_rule and (n == 0 or t >= z.trans[n - 1]):
+    let since = rule_state(z, t).since
+    if n == 0 or since >= z.trans[n - 1]: return since
+    return z.trans[n - 1]
+  if n == 0 or t < z.trans[0]: return -(1 << 62)
+  var lo = 0
+  var hi = n - 1
+  while lo < hi:
+    let mid = (lo + hi + 1) / 2
+    if z.trans[mid] <= t: lo = mid
+    else: hi = mid - 1
+  return z.trans[lo]
+
+# The instant (seconds since 1970) of a wall-clock time d in zone z (d.weekday is ignored).
+fn from_local(z: Zone, d: Date) -> Float:
+  let wall = seconds(d)
+  let l = floor_secs(wall)
+  let frac = wall - float(l)
+  var offs: [Int] = []
+  for o in z.offs: offs.push(o)
+  if z.has_rule:
+    offs.push(z.std_off)
+    if z.has_dst: offs.push(z.dst_off)
+  var best = 0
+  var found = false
+  var least = offs[0]
+  for o in offs:
+    if o < least: least = o
+    let c = l - o
+    if kind_off(z, kind_at(z, c)) == o and (not found or c < best):
+      best = c
+      found = true
+  if not found:
+    # in a gap: read it with the offset from just before the change
+    let ch = change_before(z, l - least)
+    best = l - kind_off(z, kind_at(z, ch - 1))
+  return float(best) + frac
+
+fn offset_text(off: Int) -> Str:
+  var sign = "+"
+  var a = off
+  if off < 0:
+    sign = "-"
+    a = -off
+  var s = sign + pad(a / 3600, 2) + ":" + pad(a / 60 % 60, 2)
+  if a % 60 != 0: s += ":" + pad(a % 60, 2)
+  return s
+
+# ISO 8601 / RFC 3339 in zone z with milliseconds: 2026-10-26T17:30:05.123-04:00 (an offset with
+# seconds, as some zones had before 1900, prints as -04:56:02, as Python does)
+fn iso_in(z: Zone, t: Float) -> Str:
+  let l = local(z, t)
+  let d = l.date
+  return (pad(d.year, 4) + "-" + pad(d.month, 2) + "-" + pad(d.day, 2) + "T" + pad(d.hour, 2) + ":" +
+          pad(d.minute, 2) + ":" + pad(d.second, 2) + "." + pad(d.ms, 3) + offset_text(l.offset))

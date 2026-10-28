@@ -1,0 +1,102 @@
+# A web app with WebSocket routes, for run_web_sockets.py: sockets PORT [DIR] (DIR: server.pem and
+# server.key for TLS).
+#   GET /             -> "page"
+#   ws /echo          -> each message back ("echo: " before text)
+#   ws /room/:name    -> "hello NAME from USER" (USER set by the middleware from x-user), then closes
+#   ws /chat          -> every text message goes to every socket on /chat
+# The middleware answers 401 to a request with ?deny, before any route.
+import http
+import web
+import ws
+
+type Event:
+  Join(id: Int, inbox: Chan[Str])
+  Say(text: Str)
+  Leave(id: Int)
+
+fn hub(own events: Chan[Event]):
+  var ids: [Int] = []
+  var boxes: [Chan[Str]] = []
+  while true:
+    let e = events.recv() else return
+    match e:
+      Join(id, inbox):
+        ids.push(id)
+        boxes.push(inbox.share())
+      Say(t):
+        for b in boxes: b.send(t + "")
+      Leave(id):
+        var ki: [Int] = []
+        var kb: [Chan[Str]] = []
+        for i in 0..ids.len:
+          if ids[i] != id:
+            ki.push(ids[i])
+            kb.push(boxes[i].share())
+        ids = ki
+        boxes = kb
+
+fn auth(req: http.Request, c: web.Ctx, next: fn(http.Request, web.Ctx) -> http.Response) -> http.Response:
+  if "deny" in req.query: return http.text(401, "no")
+  return next(req, web.with(c, "user", http.header(req, "x-user") else "nobody"))
+
+fn echo(net: Net, own s: ws.Socket, req: http.Request, c: web.Ctx):
+  var sock = s
+  while true:
+    let m = ws.recv(net, &sock) else return
+    match m:
+      ws.Text(t): ws.send_text(net, &sock, "echo: " + t) else return
+      ws.Binary(b): ws.send_binary(net, &sock, b) else return
+      ws.Closed(code, why): return
+
+fn room(net: Net, own s: ws.Socket, req: http.Request, c: web.Ctx):
+  var sock = s
+  ws.send_text(net, &sock, "hello " + web.param(c, "name") + " from " + (web.val(c, "user") else "?")) else return
+  ws.close(net, &sock, 1000, "bye") else return
+
+fn chat(net: Net, own events: Chan[Event], own s: ws.Socket, req: http.Request, c: web.Ctx):
+  var sock = s
+  let inbox: Chan[Str] = chan(1024)
+  let id = random_bytes(8).read_le(0, 7)
+  events.send(Join(id, inbox.share()))
+  ws.send_text(net, &sock, "joined") else return
+  while true:
+    var gone = false
+    match ws.poll(net, &sock, 0.02):
+      ok(m):
+        if msg = m:
+          match msg:
+            ws.Text(t): events.send(Say(t + ""))
+            ws.Binary(b): gone = false
+            ws.Closed(code, why): gone = true
+      err(e): gone = true
+    if gone:
+      events.send(Leave(id))
+      return
+    while true:
+      let t = inbox.recv(timeout: 0.0) else break
+      match ws.send_text(net, &sock, t):
+        ok: gone = false
+        err(e): gone = true
+      if gone: break
+    if gone:
+      events.send(Leave(id))
+      return
+
+fn main(net: Net, os: Os, fs: Fs) throws:
+  let events: Chan[Event] = chan(1024)
+  spawn hub(events)
+  var a = web.app()
+  a.use(auth)
+  a.get("/", fn(req, c) => http.text(200, "page"))
+  a.websocket("/echo", own fn(own s, req, c) => echo(net, s, req, c))
+  a.websocket("/room/:name", own fn(own s, req, c) => room(net, s, req, c))
+  let ev = events.share()
+  a.websocket("/chat", own fn(own s, req, c) => chat(net, ev, s, req, c))
+  a.allow_origin("https://friend.example")
+  let dir = arg(2, "")
+  if dir == "":
+    web.serve(net, os, a, arg(1, 8080))?
+  else:
+    let cert = fs.read(dir + "/server.pem")?
+    let key = fs.read(dir + "/server.key")?
+    web.serve_tls(net, os, a, arg(1, 8080), cert, key)?

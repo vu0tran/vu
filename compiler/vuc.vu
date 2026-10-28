@@ -981,7 +981,12 @@ fn parse_type(var p: Parser) -> Str:
     expect_tok(&p, "op", "(", "")
     var ps: [Str] = []
     while not at_op(p, ")"):
-      ps.push(parse_type(&p))
+      # fn(own T): the function takes ownership of that argument (^T in the type text)
+      if at(p, "name") and p.toks[p.i].v == "own" and not (peek_k(p, 1) == "op" and (peek_v(p, 1) == "," or peek_v(p, 1) == ")")):
+        advance(&p)
+        ps.push("^" + parse_type(&p))
+      else:
+        ps.push(parse_type(&p))
       if not accept_op(&p, ","): break
     expect_tok(&p, "op", ")", "")
     var ret = ""
@@ -1083,11 +1088,16 @@ fn parse_closure(var p: Parser, own: Bool, named: Bool) -> Node:
   expect_tok(&p, "op", "(", "")
   var ps = new_node(&p, "params", ln)
   while not at_op(p, ")"):
-    if at_kw(p, "var") or (at(p, "name") and p.toks[p.i].v == "own" and peek_k(p, 1) == "name"):
-      report(p.ctx, cur_line(p), "a closure's parameters are read-only: they can't be 'var' or 'own'")
+    if at_kw(p, "var"):
+      report(p.ctx, cur_line(p), "a closure's parameters can't be 'var' (a function value can't change its caller's variables); return the new value instead")
+    var own_p = false
+    if at(p, "name") and p.toks[p.i].v == "own" and peek_k(p, 1) == "name":
+      advance(&p)
+      own_p = true
     let nt = expect_tok(&p, "name", "", "a parameter name")
     var pn = new_node(&p, "param", nt.line)
     pn.name = nt.v
+    pn.flag2 = own_p
     if accept_op(&p, ":"): pn.ty = parse_type(&p)
     elif named: report(p.ctx, nt.line, "missing type for '" + nt.v + "' (write '" + nt.v + ": Type')")
     ps.kids.push(pn)
@@ -2182,6 +2192,7 @@ fn tn(t: Str) -> Str:
   if t == "~nil": return "nil"
   if t.len == 0: return t
   if t[0] == '!': return tn(t[1..t.len])
+  if t[0] == '^': return "own " + tn(t[1..t.len])
   if t[t.len - 1] == '?':
     let inner = t[0..t.len - 1]
     if inner.len > 0 and inner[0] == '<': return "(" + tn(inner) + ")?"
@@ -2231,6 +2242,7 @@ fn ct(g: G, t: Str) -> Str:
   return ct(g, inner_of(t)) + "*"
 
 fn mg(g: G, t: Str) -> Str:
+  if t.len > 0 and t[0] == '^': return "W_" + mg(g, t[1..t.len])   # an own parameter of a function type
   let k = tkind(g, t)
   if k == "int" or k == "float" or k == "bool" or k == "byte" or k == "str": return t
   if k == "cap": return "Cap"
@@ -2331,11 +2343,13 @@ fn by_value(g: G, t: Str) -> Bool:
   return k == "opt" or k == "cap" or k == "fn" or k == "lfn"
 
 fn pdecl(g: G, t: Str, name: Str) -> Str:
+  if t.len > 0 and t[0] == '^': return ct(g, t[1..t.len]) + " " + name   # own: passed by value, freed by the callee
   if by_value(g, t): return ct(g, t) + " " + name
   return ct(g, t) + " *" + name
 
 fn resolve(var g: G, t: Str, line: Int) -> Str:
   if t in g.tenv: return g.tenv[t] + ""
+  if t.len > 0 and t[0] == '^': return "^" + resolve(&g, t[1..t.len], line)
   if t in g.gtype_nodes: err(g, line, disp(t) + " takes type arguments: " + disp(t) + "[" + join(g.gtype_nodes[t].names, ", ") + "]")
   let k = tkind(g, t)
   if k == "gapp":
@@ -3011,6 +3025,9 @@ fn has_str(xs: [Str], s: Str) -> Bool:
 # Binds the type parameters (tps) in type syntax syn to the parts of type actual that they stand for.
 fn unify(g: G, syn: Str, actual: Str, tps: [Str], var b: {Str: Str}):
   if actual == "" or actual == "~nil": return
+  if syn.len > 0 and syn[0] == '^' and actual.len > 0 and actual[0] == '^':
+    unify(g, syn[1..syn.len], actual[1..actual.len], tps, &b)
+    return
   if has_str(tps, syn):
     if not (syn in b): b[syn] = owned_fn(actual)
     return
@@ -3534,6 +3551,7 @@ fn static_type_uncached(var g: G, e: Node) -> Str:
         return g.variants[f.name] + ""
       if f.name == "str": return "Str"
       if f.name == "sqrt" or f.name == "fma" or f.name == "float": return "Float"
+      if f.name == "arg" and e.kids.len == 3 and probe_type(&g, e.kids[2].kids[0]) == "Str": return "Str"
       if f.name == "int" or f.name == "arg" or f.name == "ord": return "Int"
       if f.name == "chr" or (is_crypto_builtin(f.name) and lookup(g, f.name) < 0): return "Str"
       if f.name == "byte": return "Byte"
@@ -4585,16 +4603,25 @@ fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Boo
   if e.name != "": what = "'" + e.name + "'"
   let np = e.kids[0].kids.len
   if has_exp and ef.params.len != np: err(g, e.line, what + " takes {np} parameter(s), but a " + tn(expect) + " takes {ef.params.len}")
-  var ptys: [Str] = []
+  var ptys: [Str] = []   # an own parameter's type is ^T
   for i in 0..np:
     let pname = e.kids[0].kids[i].name + ""
     let pline = e.kids[0].kids[i].line
+    let wrote_own = e.kids[0].kids[i].flag2
     var t = ""
     if e.kids[0].kids[i].ty != "":
       t = resolve(&g, e.kids[0].kids[i].ty, pline)
-      if has_exp and t != ef.params[i]: err(g, pline, "parameter '" + pname + "' is a " + tn(t) + ", but a " + tn(expect) + " passes a " + tn(ef.params[i]))
-    elif has_exp: t = ef.params[i] + ""
-    elif use_hint: t = hint_ps[i] + ""
+      if wrote_own: t = "^" + t
+      if has_exp and t != ef.params[i]:
+        if ef.params[i] == "^" + t: err(g, pline, "a " + tn(expect) + " gives its parameter " + pname + " to the function to own: write 'own " + pname + "'")
+        if t == "^" + ef.params[i]: err(g, pline, "a " + tn(expect) + " lends parameter " + pname + " (it isn't 'own')")
+        err(g, pline, "parameter '" + pname + "' is a " + tn(t) + ", but a " + tn(expect) + " passes a " + tn(ef.params[i]))
+    elif has_exp:
+      t = ef.params[i] + ""
+      if wrote_own and t[0] != '^': err(g, pline, "a " + tn(expect) + " lends parameter " + pname + " (it isn't 'own')")
+    elif use_hint:
+      t = hint_ps[i] + ""
+      if wrote_own and (t.len == 0 or t[0] != '^'): t = "^" + t
     else: err(g, pline, "give parameter '" + pname + "' a type, like fn(" + pname + ": Int) => ...; nothing here says what it is")
     ptys.push(t)
   var ret = ""
@@ -4651,6 +4678,11 @@ fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Boo
     let pname = e.kids[0].kids[i].name + ""
     let t = ptys[i]
     cps += ", " + pdecl(g, t, "v_" + pname)
+    if t.len > 0 and t[0] == '^':
+      # owned: a local the closure may change, move or return, freed at its end
+      let ov = new_var(&g, pname, t[1..t.len], "v_" + pname, "local", true, false, e.kids[0].kids[i].line)
+      declare(&g, ov)
+      continue
     let pv = new_var(&g, pname, t, "v_" + pname, "param", false, not by_value(g, t), e.kids[0].kids[i].line)
     declare(&g, pv)
   var body = synth_node(&g, "block", e.line)
@@ -4765,11 +4797,10 @@ fn fn_value(var g: G, e: Node, expect: Str) -> CT:
   var ps: [Str] = []
   for pa in params:
     if pa.is_const: err(g, e.line, d + "() has a const parameter ('" + pa.name + "'), so it can't be used as a value: a call through a value couldn't check that its argument is written into the program")
-    if pa.is_var or pa.is_own:
-      var word = "own"
-      if pa.is_var: word = "var"
-      err(g, e.line, d + "() has a '" + word + "' parameter ('" + pa.name + "'), so it can't be used as a value (a function value's parameters are read-only); wrap it in a closure: fn(...) => " + d + "(...)")
-    ps.push(pa.ty + "")
+    if pa.is_var:
+      err(g, e.line, d + "() has a 'var' parameter ('" + pa.name + "'), so it can't be used as a value (a function value can't change its caller's variables); wrap it in a closure: fn(...) => " + d + "(...)")
+    if pa.is_own: ps.push("^" + pa.ty)
+    else: ps.push(pa.ty + "")
   if name in g.fn_err: err(g, e.line, d + "() fails with " + tn(g.fn_err[name]) + " values, and a function value fails with a message; wrap it in a closure that turns the error into a message")
   if not has_str(g.thunks, name): g.thunks.push(name + "")
   let ft = fn_type(&g, ps, ret, fails)
@@ -4813,7 +4844,10 @@ fn call_value(var g: G, e: Node, allow_throw: Bool) -> CT:
   let n = nargs_of(e)
   if n != ft.params.len: err(g, e.line, what + " takes {ft.params.len} argument(s) but got {n}")
   var params: [Param] = []
-  for i in 0..ft.params.len: params.push(Param("#{i + 1}", ft.params[i] + "", false, e.line, false, false))
+  for i in 0..ft.params.len:
+    let pt = ft.params[i]
+    if pt.len > 0 and pt[0] == '^': params.push(Param("#{i + 1}", pt[1..pt.len], false, e.line, true, false))
+    else: params.push(Param("#{i + 1}", pt + "", false, e.line, false, false))
   var croot = -1
   if r.p.ok: croot = r.p.root
   var a = call_args(&g, e, params, croot, f.line)
@@ -5005,10 +5039,10 @@ fn os_call(var g: G, e: Node, handled: Bool) -> CT:
   return bw_end(&g, a, b, "({{ " + ct(g, rt) + " " + r + " = {{0}}; " + r + ".bad = !vu_os_run(" + code + ", (" + b.code + ").data, (" + b.code + ").len, &" + r + ".val, &" + r + ".err); " + r + "; }})", rt)
 
 fn is_net_method(n: Str) -> Bool:
-  return n == "listen" or n == "accept" or n == "connect" or n == "recv" or n == "send" or n == "port" or n == "tls_connect" or n == "tls_listen"
+  return n == "listen" or n == "accept" or n == "connect" or n == "recv" or n == "send" or n == "port" or n == "tls_connect" or n == "tls_listen" or n == "start_tls" or n == "protocol"
 
 fn net_fails(n: Str) -> Bool:
-  return n == "listen" or n == "accept" or n == "connect" or n == "recv" or n == "send" or n == "tls_connect" or n == "tls_listen"
+  return n == "listen" or n == "accept" or n == "connect" or n == "recv" or n == "send" or n == "tls_connect" or n == "tls_listen" or n == "start_tls"
 
 fn is_chan_method(n: Str) -> Bool:
   return n == "send" or n == "recv" or n == "close" or n == "share" or n == "closed"
@@ -5046,6 +5080,16 @@ fn net_call(var g: G, e: Node, handled: Bool) -> CT:
     err(g, e.line, "net." + name + "() can fail, so handle its error: net." + name + "(...)? passes it on, net." + name + "(...) else <default> replaces it, or match net." + name + "(...): with ok(v) and err(e) arms")
   let code = gen(&g, e.kids[0].kids[0], "").code
   if name == "tls_connect" or name == "tls_listen": return tls_call(&g, e, name, code)
+  if name == "start_tls": return start_tls_call(&g, e, code)
+  if name == "protocol":
+    # net.protocol(conn): what ALPN chose on a TLS connection ("h2", "http/1.1"), or ""
+    if nargs_of(e) != 1 or any_named(e): err(g, e.line, "net.protocol(conn) takes one connection")
+    let pe = e.kids[1].kids[0]
+    let bp = bw_begin(&g, pe, "Conn")
+    if bp.ty != "Conn": err(g, e.line, "net.protocol() takes a Conn, not " + tn(bp.ty))
+    g.uses_tasks = true
+    g.uses_tls = true
+    return bw_end(&g, pe, bp, "vu_net_protocol(" + code + ", " + bp.code + ")", "Str")
   let ta = split_timeout(g, e, name == "accept" or name == "connect" or name == "recv" or name == "send", "net." + name + "()")
   var want = 1
   if name == "connect" or name == "send": want = 2
@@ -5097,9 +5141,43 @@ fn net_call(var g: G, e: Node, handled: Bool) -> CT:
 
 # net.tls_connect(host, port, ca: pem, timeout: s) -> Conn and net.tls_listen(port, cert: pem, key: pem)
 # -> Listener: TLS connections, used with recv and send like plain ones. Certificates are PEM text.
+# net.start_tls(&conn, host, ca: pem, timeout: s): TLS over a connection already open. A failure
+# closes the connection.
+fn start_tls_call(var g: G, e: Node, code: Str) -> CT:
+  let usage = "net.start_tls(&conn, host) takes the connection (with '&': it changes) and the host name its certificate must be for, and optionally ca: (PEM text of the certificates to trust) and timeout: seconds"
+  var args: [Int] = []
+  var named: {Str: Int} = {}
+  for i in 1..e.kids.len:
+    let a = e.kids[i]
+    if not a.flag: args.push(i)
+    else:
+      if (a.name != "ca" and a.name != "timeout") or a.name in named: err(g, a.kids[0].line, usage)
+      named[a.name] = i
+  if args.len != 2 or e.kids[args[0]].kids[0].k != "ref": err(g, e.line, usage)
+  g.uses_tasks = true
+  g.uses_tls = true
+  let cp = place(&g, e.kids[args[0]].kids[0].kids[0])
+  if not cp.ok or cp.ty != "Conn": err(g, e.line, usage)
+  write_check(g, cp, e.line, false)
+  let he = e.kids[args[1]].kids[0]
+  let bh = bw_begin(&g, he, "")
+  if bh.ty != "Str": err(g, e.line, "net.start_tls(&conn, host): the host is a Str, not " + tn(bh.ty))
+  var ti = -1
+  if "timeout" in named: ti = named["timeout"]
+  let tc = timeout_code(&g, e, ti)
+  let rt = reg(&g, "!~void")
+  let r = tmp(&g)
+  if not ("ca" in named):
+    return bw_end(&g, he, bh, "({{ " + ct(g, rt) + " " + r + " = {{0}}; " + r + ".bad = !vu_net_start_tls(" + code + ", &" + cp.code + ", &" + bh.code + ", NULL, " + tc + ", &" + r + ".err, {e.line}); " + r + "; }})", rt)
+  let cae = e.kids[named["ca"]].kids[0]
+  let bca = bw_begin(&g, cae, "")
+  if bca.ty != "Str": err(g, e.line, "net.start_tls(): ca is PEM text (a Str), not " + tn(bca.ty))
+  let inner = bw_end(&g, cae, bca, "({{ " + ct(g, rt) + " " + r + " = {{0}}; " + r + ".bad = !vu_net_start_tls(" + code + ", &" + cp.code + ", &" + bh.code + ", &" + bca.code + ", " + tc + ", &" + r + ".err, {e.line}); " + r + "; }})", rt)
+  return bw_end(&g, he, bh, inner.code, inner.ty)
+
 fn tls_call(var g: G, e: Node, name: Str, code: Str) -> CT:
   var usage = "net.tls_listen(port, cert: pem, key: pem) takes a port and the server's certificate and private key as PEM text"
-  if name == "tls_connect": usage = "net.tls_connect(host, port) takes a host name and a port, and optionally ca: (PEM text of the certificates to trust instead of the system's) and timeout: seconds"
+  if name == "tls_connect": usage = "net.tls_connect(host, port) takes a host name and a port, and optionally ca: (PEM text of the certificates to trust instead of the system's), alpn: (the protocols to offer, like \"h2,http/1.1\") and timeout: seconds"
   var args: [Int] = []
   var named: {Str: Int} = {}
   for i in 1..e.kids.len:
@@ -5109,7 +5187,7 @@ fn tls_call(var g: G, e: Node, name: Str, code: Str) -> CT:
       args.push(i)
     else:
       var ok = a.name == "cert" or a.name == "key" or a.name == "alpn"
-      if name == "tls_connect": ok = a.name == "ca" or a.name == "timeout"
+      if name == "tls_connect": ok = a.name == "ca" or a.name == "timeout" or a.name == "alpn"
       if not ok or a.name in named: err(g, a.kids[0].line, usage)
       named[a.name] = i
   var want = 1
@@ -5142,19 +5220,31 @@ fn tls_call(var g: G, e: Node, name: Str, code: Str) -> CT:
   let pc = value(&g, e.kids[args[1]].kids[0], "Int").code
   var ti = -1
   if "timeout" in named: ti = named["timeout"]
-  if not ("ca" in named):
-    let rt = reg(&g, "!Conn")
-    let r = tmp(&g)
-    let tc = timeout_code(&g, e, ti)
-    return bw_end(&g, he, bh, "({{ " + ct(g, rt) + " " + r + " = {{0}}; " + r + ".bad = !vu_net_tls_connect(" + code + ", &" + bh.code + ", " + pc + ", NULL, " + tc + ", &" + r + ".val, &" + r + ".err, {e.line}); " + r + "; }})", rt)
-  let cae = e.kids[named["ca"]].kids[0]
-  let bca = bw_begin(&g, cae, "")
-  if bca.ty != "Str": err(g, e.line, "net.tls_connect(): ca is PEM text (a Str), not " + tn(bca.ty))
+  # ca: and alpn: are Strs borrowed for the call (NULL when not given)
+  var opt_code: [Str] = []
+  var opt_at: [Int] = []
+  var opt_b: [Bw] = []
+  for which in ["ca", "alpn"]:
+    if which in named:
+      let oe = e.kids[named[which]].kids[0]
+      let bo = bw_begin(&g, oe, "")
+      if bo.ty != "Str":
+        if which == "ca": err(g, e.line, "net.tls_connect(): ca is PEM text (a Str), not " + tn(bo.ty))
+        err(g, e.line, "net.tls_connect(): alpn is a Str like \"h2,http/1.1\", not " + tn(bo.ty))
+      opt_code.push("&" + bo.code)
+      opt_at.push(named[which])
+      opt_b.push(bo)
+    else:
+      opt_code.push("NULL")
   let rt = reg(&g, "!Conn")
   let r = tmp(&g)
   let tc = timeout_code(&g, e, ti)
-  let inner = bw_end(&g, cae, bca, "({{ " + ct(g, rt) + " " + r + " = {{0}}; " + r + ".bad = !vu_net_tls_connect(" + code + ", &" + bh.code + ", " + pc + ", &" + bca.code + ", " + tc + ", &" + r + ".val, &" + r + ".err, {e.line}); " + r + "; }})", rt)
-  return bw_end(&g, he, bh, inner.code, inner.ty)
+  var out = CT("({{ " + ct(g, rt) + " " + r + " = {{0}}; " + r + ".bad = !vu_net_tls_connect(" + code + ", &" + bh.code + ", " + pc + ", " + opt_code[0] + ", " + opt_code[1] + ", " + tc + ", &" + r + ".val, &" + r + ".err, {e.line}); " + r + "; }})", rt)
+  var k = opt_at.len - 1
+  while k >= 0:
+    out = bw_end(&g, e.kids[opt_at[k]].kids[0], opt_b[k], out.code, out.ty)
+    k -= 1
+  return bw_end(&g, he, bh, out.code, out.ty)
 
 # ch.send(v) (moves v in; waits while the channel is full), ch.recv() -> T (can fail: closed, or timeout:
 # seconds passed), ch.close(), ch.share() -> another handle to the same channel.
@@ -6917,9 +7007,11 @@ fn match_result(var g: G, n: Node) -> Bool:
         ty = "Str"
         field = "err"
       let vc = var_cname(&g, b)
-      let v = new_var(&g, b, ty, vc, "ref", false, true, arm.line)
+      # the arm owns what it binds (the result is a temporary): it's moved out, so it can be moved on
+      let v = new_var(&g, b, ty, vc, "local", false, false, arm.line)
       declare(&g, v)
-      emit(&g, ct(g, ty) + " *" + vc + " = &" + cname + "." + field + ";")
+      if is_copy(g, ty): emit(&g, ct(g, ty) + " " + vc + " = " + cname + "." + field + ";")
+      else: emit(&g, ct(g, ty) + " " + vc + " = VU_MV(" + cname + "." + field + ");")
     if not run_block(&g, arm.kids[0]): ends.push(snapshot(g))
     restore(&g, snap)
     close(&g)
@@ -8831,7 +8923,7 @@ fn build(var g: G, items: [Node]) -> Str:
       if r == "void": rk = ""
       out.push("static inline " + r + " vu_call_" + mg(g, t) + "(vu_fn f" + decl + ") {{ " + rk + "((" + r + " (*)(void *" + ps + "))f.fn)(f.env" + cargs + "); }}")
       # (a comparison, fn(T, T) -> Bool, as xs.sort(by: ...) calls it)
-      if f.params.len == 2 and f.params[0] == f.params[1] and f.ret == "Bool" and not f.fails:
+      if f.params.len == 2 and f.params[0] == f.params[1] and f.params[0][0] != '^' and f.ret == "Bool" and not f.fails:
         let pt = f.params[0]
         var x = "(" + ct(g, pt) + " *)x"
         var y = "(" + ct(g, pt) + " *)y"
@@ -8855,7 +8947,7 @@ fn build(var g: G, items: [Node]) -> Str:
     var decl = ""
     var targs: [Str] = []
     for i in 0..tps.len:
-      decl += ", " + pdecl(g, tps[i].ty, "a{i}")
+      decl += ", " + param_c(g, tps[i], "a{i}")
       targs.push("a{i}")
     var rk = "return "
     if r == "void": rk = ""
@@ -9542,6 +9634,16 @@ fn utf8_error(s: Str) -> Int:
     i += n + 1
   return -1
 
+# The C compiler for --wasm: VU_WASM_CC (split at spaces), else zig cc, else python3 -m ziglang cc.
+fn wasm_cc(os: Os) -> [Str]:
+  let env = os.env("VU_WASM_CC")
+  if env != "": return env.split()
+  let z = os.output(["zig", "version"]) else ""
+  if z != "": return ["zig", "cc"]
+  let pz = os.output(["python3", "-m", "ziglang", "version"]) else ""
+  if pz != "" and not ("No module" in pz): return ["python3", "-m", "ziglang", "cc"]
+  return []
+
 # The release: tagged v0.1.0 in git. Change it with the tag.
 fn vu_version() -> Str:
   return "0.1.0"
@@ -9623,6 +9725,41 @@ fn main(fs: Fs, os: Os):
   if argv.len >= 2 and (argv[1] == "version" or argv[1] == "--version"):
     print("vu " + vu_version())
     exit(0)
+  if argv.len >= 2 and argv[1] == "search":
+    var words: [Str] = []
+    for i in 2..argv.len: words.push(argv[i] + "")
+    match reg_search(os, words):
+      ok(n): exit(0)
+      err(e):
+        eprint("vu: " + e)
+        exit(1)
+  if argv.len >= 2 and argv[1] == "add":
+    # vu add NAME [VERSION]: a package from the registry, into vu.pkg, then vu get
+    if argv.len < 3 or argv.len > 4:
+      eprint("vu add NAME [VERSION]: adds a package from the registry to vu.pkg (vu search lists them)")
+      exit(2)
+    var version = ""
+    if argv.len == 4: version = argv[3] + ""
+    match reg_add(fs, os, argv[2], version):
+      ok: exit(0)
+      err(e):
+        eprint("vu: " + e)
+        exit(1)
+  if argv.len >= 2 and argv[1] == "publish":
+    # vu publish NAME VERSION [DIR] [fs net os ffi]: the registry's lines for a tagged package
+    if argv.len < 4:
+      eprint("vu publish NAME VERSION [DIR] [fs net os ffi]: prints the lines that add a package's tagged version to the registry")
+      exit(2)
+    var dir = "."
+    var caps: [Str] = []
+    for i in 4..argv.len:
+      if is_cap_word(argv[i]): caps.push(argv[i] + "")
+      else: dir = argv[i] + ""
+    match reg_publish(fs, os, argv[2], argv[3], dir, caps):
+      ok: exit(0)
+      err(e):
+        eprint("vu: " + e)
+        exit(1)
   if argv.len >= 2 and argv[1] == "get":
     # vu get [FILE.vu]: fetch the packages in vu.pkg (beside FILE, or here) and write vu.lock
     var from = "main.vu"
@@ -9652,6 +9789,8 @@ fn main(fs: Fs, os: Os):
   var tsan = false
   var timing = false
   var static = false
+  var wasm = false
+  var profile = false
   var checks = false
   var index = false
   var path = ""
@@ -9677,9 +9816,11 @@ fn main(fs: Fs, os: Os):
     elif a == "--index" and cmd == "check":
       index = true
       i += 1
-    elif a == "--debug" or a == "--release" or a == "--json" or a == "--malloc" or a == "--san" or a == "--san-pool" or a == "--tsan" or a == "--time" or a == "--static":
+    elif a == "--debug" or a == "--release" or a == "--json" or a == "--malloc" or a == "--san" or a == "--san-pool" or a == "--tsan" or a == "--time" or a == "--static" or a == "--wasm" or a == "--profile":
       if a == "--debug": debug = true
+      elif a == "--profile": profile = true
       elif a == "--static": static = true
+      elif a == "--wasm": wasm = true
       elif a == "--release": release = true
       elif a == "--json": json = true
       elif a == "--malloc": malloc = true
@@ -9752,6 +9893,7 @@ fn main(fs: Fs, os: Os):
   if out == "":
     if cmd == "build": out = without_ext(path)
     else: out = work + "/prog"
+    if wasm: out += ".wasm"
   # what's left in the temporary folder (the C, a binary for run) goes on every way out
   var temps: [Str] = []
   if emit_c == "": temps.push(cfile + "")
@@ -9767,11 +9909,51 @@ fn main(fs: Fs, os: Os):
   var cc = os.env("CC")
   if cc == "": cc = "cc"
   var argl = [cc, "-std=gnu11", "-fwrapv", "-fno-math-errno", "-fno-trapping-math", "-ffp-contract=off", "-w"]
+  if wasm:
+    # WebAssembly (WASI), with zig's C compiler: one thread, no processes, no sockets
+    var why = ""
+    if cmd != "build": why = "--wasm builds a .wasm file (vu build --wasm FILE.vu); run it with a WASI runtime such as wasmtime"
+    elif profile: why = "--profile samples with a timer signal, which WebAssembly (WASI) doesn't have"
+    elif csrc.find("#define VU_MT 1", 0) >= 0: why = "this program uses tasks, channels, the network or os.signals, which need threads and sockets: WebAssembly (WASI) has neither"
+    elif has_ext: why = "extern C files aren't built for WebAssembly"
+    elif links.len > 0: why = "this program uses TLS (through OpenSSL) or C libraries, which aren't built for WebAssembly"
+    var zcc: [Str] = []
+    if why == "":
+      zcc = wasm_cc(os)
+      if zcc.len == 0: why = "--wasm needs zig's C compiler (pip install ziglang, or zig on PATH; VU_WASM_CC to name another)"
+    if why != "":
+      eprint("vu: " + why)
+      clean_up(fs, work, temps)
+      exit(2)
+    argl = zcc
+    for f in ["-target", "wasm32-wasi", "-std=gnu11", "-fwrapv", "-fno-math-errno", "-fno-trapping-math", "-ffp-contract=off", "-w", "-O2"]: argl.push(f)
+    for d in ["SIGNAL", "PROCESS_CLOCKS", "GETPID", "MMAN"]: argl.push("-D_WASI_EMULATED_" + d)
+    if json: argl.push("-DVU_JSON_PANIC")
+    if malloc: argl.push("-DVU_MALLOC")
+    argl.push(cfile + "")
+    argl.push("-o")
+    argl.push(out + "")
+    for d in ["signal", "process-clocks", "getpid", "mman"]: argl.push("-lwasi-emulated-" + d)
+    argl.push("-Wl,-z,stack-size=16777216")
+    let wrc = os.run(argl) else 127
+    clean_up(fs, work, temps)
+    if wrc != 0:
+      eprint("vu: the WebAssembly build failed (exit {wrc})")
+      exit(3)
+    exit(0)
   # `run` is the edit-and-test loop, so it builds unoptimized (several times faster to compile)
   # unless asked for --release; `build` makes the optimized binary unless asked for --debug.
-  let quick = debug or (cmd == "run" and not release)
+  let quick = (debug or (cmd == "run" and not release)) and not profile
   # Quick builds also keep the shadow call stack that gives panics a backtrace.
-  if quick:
+  if profile:
+    # optimized, with the shadow call stack, which the profiler samples
+    argl.push("-O2")
+    argl.push("-DVU_TRACE")
+    argl.push("-DVU_PROF")
+    var march = "native"
+    if os.env("VU_MARCH") != "" or os.env("CC").endswith("-gcc"): march = os.env("VU_MARCH")
+    if march != "": argl.push(native_flag(os, march))
+  elif quick:
     argl.push("-O0")
     argl.push("-g")
     argl.push("-DVU_TRACE")
@@ -9927,6 +10109,9 @@ fn is_version(w: Str) -> Bool:
 
 fn read_manifest(fs: Fs, path: Str) -> Manifest throws:
   let text = fs.read(path)?
+  return read_manifest_text(text, path)?
+
+fn read_manifest_text(text: Str, path: Str) -> Manifest throws:
   var needs: [Need] = []
   var ln = 0
   for raw in text.split("\n"):
@@ -9945,7 +10130,8 @@ fn read_manifest(fs: Fs, path: Str) -> Manifest throws:
     var i = 2
     if not is_local_source(source):
       if words.len < 3 or not is_version(words[2]): fail path + ":{ln}: " + source + " needs a version, a git tag like v1.2.0"
-      check_source(source) else fail path + ":{ln}: '" + source + "' isn't a package source: a folder, host/path, or an https, http, ssh, git or file URL"
+      if not is_registry_name(source):
+        check_source(source) else fail path + ":{ln}: '" + source + "' isn't a package source: a folder, host/path, an https, http, ssh, git or file URL, or a name in the registry"
       version = words[2] + ""
       i = 3
     while i < words.len:
@@ -10006,6 +10192,176 @@ fn check_source(source: Str) throws:
   let ok = u.startswith("https://") or u.startswith("http://") or u.startswith("ssh://") or u.startswith("git://") or u.startswith("file://")
   if not ok or source.startswith("-"): fail "'" + source + "' isn't a package source: a folder, host/path, or an https, http, ssh, git or file URL"
 
+# ---- the registry: names for packages, with the commit and hash of each version
+# The index is text (VU_REGISTRY, else https://vulang.org/registry/index.txt), fetched with curl:
+#   package NAME SOURCE
+#   about NAME one line saying what it is
+#   version NAME vX.Y.Z COMMIT SHA256 [fs net os ffi]
+# `need NAME vX.Y.Z` in vu.pkg means that package; vu get fetches it from its source and refuses it
+# unless the commit and the hash of its files are the ones the registry recorded.
+
+type RegVersion:
+  version, commit, hash: Str
+  caps: [Str]
+
+type RegPkg:
+  name, source, about: Str
+  versions: [RegVersion]
+
+# A registry name: a lowercase letter, then lowercase letters, digits and '_' (it's also the module name).
+fn is_registry_name(s: Str) -> Bool:
+  if s.len == 0 or s.len > 64 or s[0] < 'a' or s[0] > 'z': return false
+  for i in 0..s.len:
+    let c = s[i]
+    if not ((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_'): return false
+  return true
+
+fn registry_url(os: Os) -> Str:
+  let env = os.env("VU_REGISTRY")
+  if env != "": return env
+  return "https://vulang.org/registry/index.txt"
+
+fn read_registry(os: Os) -> [RegPkg] throws:
+  let url = registry_url(os)
+  if not (url.startswith("https://") or url.startswith("file://")): fail "VU_REGISTRY must be an https:// or file:// URL"
+  let text = os.output(["curl", "-fsSL", "--proto", "=https,file", "--max-filesize", "33554432", "--", url + ""]) else fail "can't read the registry at " + url + " (with curl)"
+  return parse_registry(text, url)?
+
+fn parse_registry(text: Str, url: Str) -> [RegPkg] throws:
+  var out: [RegPkg] = []
+  var ln = 0
+  for raw in text.split("\n"):
+    ln += 1
+    let w = raw.split()
+    if w.len == 0 or w[0].startswith("#"): continue
+    let bad = url + ":{ln}: "
+    if w.len < 2 or not is_registry_name(w[1]): fail bad + "a line names a package: package NAME SOURCE, about NAME ..., or version NAME vX COMMIT HASH [caps]"
+    var at = -1
+    for i in 0..out.len:
+      if out[i].name == w[1]: at = i
+    if w[0] == "package":
+      if w.len != 3 or at >= 0: fail bad + "package NAME SOURCE, once for each name"
+      check_source(w[2]) else fail bad + "'" + w[2] + "' isn't a source git can fetch"
+      out.push(RegPkg(w[1] + "", w[2] + "", "", []))
+      continue
+    if at < 0: fail bad + "'" + w[1] + "' comes before its package line"
+    if w[0] == "about":
+      let i = raw.find(w[1]) + w[1].len
+      out[at].about = raw[i..raw.len].strip()
+    elif w[0] == "version":
+      if w.len < 5 or not is_version(w[2]) or w[3].len != 40 or w[4].len != 64: fail bad + "version NAME vX.Y.Z COMMIT (40 hex digits) SHA256 (64) [fs net os ffi]"
+      var caps: [Str] = []
+      for i in 5..w.len:
+        if not is_cap_word(w[i]): fail bad + "unknown capability '" + w[i] + "'"
+        caps.push(w[i] + "")
+      out[at].versions.push(RegVersion(w[2] + "", w[3] + "", w[4] + "", caps))
+    else:
+      fail bad + "unknown line '" + w[0] + "'"
+  return out
+
+fn reg_find(reg: [RegPkg], name: Str) -> Int:
+  for i in 0..reg.len:
+    if reg[i].name == name: return i
+  return -1
+
+fn reg_version(p: RegPkg, version: Str) -> Int:
+  for i in 0..p.versions.len:
+    if p.versions[i].version == version: return i
+  return -1
+
+fn reg_latest(p: RegPkg) -> Int:
+  var best = -1
+  for i in 0..p.versions.len:
+    if p.versions[i].version.find("-") >= 0: continue   # v2.0.0-rc.1: only when asked for
+    if best < 0 or version_less(p.versions[best].version, p.versions[i].version): best = i
+  return best
+
+# vu search [WORDS]: the registry's packages whose name or description has every word.
+fn reg_search(os: Os, words: [Str]) -> Int throws:
+  let reg = read_registry(os)?
+  var shown = 0
+  for p in reg:
+    let text = (p.name + " " + p.about).lower()
+    var all = true
+    for w in words:
+      if text.find(w.lower()) < 0: all = false
+    if not all: continue
+    let li = reg_latest(p)
+    var v = "-"
+    var caps = ""
+    if li >= 0:
+      v = p.versions[li].version + ""
+      caps = " ".join(p.versions[li].caps)
+    if caps == "": caps = "(no capabilities)"
+    print(p.name + " " + v + "  " + caps + "  " + p.about)
+    shown += 1
+  if shown == 0: eprint("vu: no package in the registry matches")
+  return 0
+
+# vu add NAME [VERSION]: a line in vu.pkg (here; made if there's none) for that package, granting the
+# capabilities the registry says it takes, then vu get.
+fn reg_add(fs: Fs, os: Os, name: Str, version: Str) throws:
+  if not is_registry_name(name): fail "'" + name + "' isn't a registry name (lowercase letters, digits and _)"
+  let reg = read_registry(os)?
+  let pi = reg_find(reg, name)
+  if pi < 0: fail "no package named '" + name + "' in the registry (vu search lists them)"
+  var vi = -1
+  if version == "": vi = reg_latest(reg[pi])
+  else: vi = reg_version(reg[pi], version)
+  if vi < 0: fail "the registry has no version " + version + " of " + name
+  let rv = reg[pi].versions[vi]
+  var mf = find_manifest(fs, os, "main.vu")
+  if mf == "": mf = "vu.pkg"
+  var text = fs.read(mf) else ""
+  let m = read_manifest_text(text, mf)?
+  for n in m.needs:
+    if n.name == name or n.source == name: fail mf + " already has " + name + " (line {n.line}); change its version there"
+  if text != "" and not text.endswith("\n"): text += "\n"
+  var line = "need " + name + " " + rv.version
+  for c in rv.caps: line += " " + c
+  text += line + "\n"
+  fs.write(mf, text)?
+  var gets = "nothing"
+  if rv.caps.len > 0: gets = " ".join(rv.caps)
+  eprint("vu: added '" + line + "' to " + mf + " (" + name + " receives " + gets + ")")
+  pkg_get(fs, os, mf)?
+
+# vu publish NAME VERSION [DIR]: the lines for the registry's index for the package in the git
+# repository DIR (here) at tag VERSION: its source (the repository's origin), the commit, the hash of
+# what vu get will fetch, and the capabilities it takes (caps: what the publisher says).
+fn reg_publish(fs: Fs, os: Os, name: Str, version: Str, dir: Str, caps: [Str]) throws:
+  if not is_registry_name(name): fail "'" + name + "' isn't a registry name (lowercase letters, digits and _)"
+  if not is_version(version): fail "'" + version + "' isn't a version (a git tag like v1.2.0)"
+  for c in caps:
+    if not is_cap_word(c): fail "unknown capability '" + c + "' (fs, net, os, ffi)"
+  var origin = os.output(["git", "-C", dir + "", "remote", "get-url", "origin"]) else ""
+  origin = origin.strip()
+  if origin.startswith("https://github.com/") or origin.startswith("https://gitlab.com/"):
+    origin = origin[8..origin.len]   # github.com/you/pkg, as vu.pkg writes it
+    if origin.endswith(".git"): origin = origin[0..origin.len - 4]
+  if origin == "": fail "the repository in " + dir + " has no origin to fetch it from (git remote add origin URL)"
+  check_source(origin)?
+  let commit = os.output(["git", "-C", dir + "", "rev-parse", "--verify", "--quiet", version + "^{{commit}}"]) else ""
+  if commit.strip().len != 40: fail "no tag " + version + " in " + dir + " (git tag " + version + ", then push it)"
+  # hash what vu get will see: a fresh clone of that tag
+  let tmpd = os.output(["mktemp", "-d"])?.strip()
+  let rc = os.run(["git", "-c", "protocol.ext.allow=never", "clone", "--quiet", "--depth", "1", "--branch", version + "", "--", "file://" + abs_path(os, dir), tmpd + "/p"])?
+  if rc != 0: fail "can't clone " + dir + " at " + version
+  let h = tree_hash(fs, tmpd + "/p")?
+  let head = os.output(["git", "-C", tmpd + "/p", "rev-parse", "HEAD"])?.strip()
+  let _ = os.run(["rm", "-rf", tmpd + ""]) else 0
+  print("package " + name + " " + origin)
+  print("about " + name + " (one line: what it does)")
+  var line = "version " + name + " " + version + " " + head + " " + h
+  for c in caps: line += " " + c
+  print(line)
+  eprint("vu: these lines go in the registry's index (registry/index.txt in github.com/vu0tran/vulang-web, by pull request); a new version needs only its version line")
+
+fn abs_path(os: Os, p: Str) -> Str:
+  let r = os.output(["realpath", "--", p + ""]) else ""
+  if r.strip() != "": return r.strip()
+  return p + ""
+
 # v1.10.2 > v1.9.0: numbers compared as numbers.
 fn version_less(a: Str, b: Str) -> Bool:
   let pa = a[1..a.len].split(".")
@@ -10054,6 +10410,8 @@ fn find_manifest(fs: Fs, os: Os, main_path: Str) -> Str:
 fn pkg_get(fs: Fs, os: Os, manifest: Str) throws:
   let cache = cache_dir(os)
   fs.mkdir(cache)?
+  var reg: [RegPkg] = []
+  var reg_read = false
   let root = dir_of(manifest)
   var want: {Str: Str} = {}      # source -> highest version asked for
   var fetched: {Str: Str} = {}   # source -> the version fetched
@@ -10088,9 +10446,32 @@ fn pkg_get(fs: Fs, os: Os, manifest: Str) throws:
           let tmpd = dir + ".tmp"
           if fs.exists(tmpd):
             let _ = os.run(["rm", "-rf", tmpd + ""]) else 0
-          check_source(n.source)?
-          let rc = os.run(["git", "-c", "protocol.ext.allow=never", "clone", "--quiet", "--depth", "1", "--branch", v + "", "--", git_url(n.source), tmpd + ""])?
+          var url = ""
+          var want_commit = ""
+          var want_hash = ""
+          if is_registry_name(n.source):
+            if not reg_read:
+              reg = read_registry(os)?
+              reg_read = true
+            let pi = reg_find(reg, n.source)
+            if pi < 0: fail "no package named '" + n.source + "' in the registry"
+            let vi = reg_version(reg[pi], v)
+            if vi < 0: fail "the registry has no version " + v + " of " + n.source
+            url = git_url(reg[pi].source)
+            want_commit = reg[pi].versions[vi].commit + ""
+            want_hash = reg[pi].versions[vi].hash + ""
+          else:
+            check_source(n.source)?
+            url = git_url(n.source)
+          let rc = os.run(["git", "-c", "protocol.ext.allow=never", "clone", "--quiet", "--depth", "1", "--branch", v + "", "--", url, tmpd + ""])?
           if rc != 0: fail "can't fetch " + n.source + " " + v + " (git exited with {rc})"
+          if want_commit != "":
+            # what the registry recorded when it was published: the same commit, the same files
+            let got_commit = (os.output(["git", "-C", tmpd + "", "rev-parse", "HEAD"]) else "").strip()
+            let got_hash = tree_hash(fs, tmpd)?
+            if got_commit != want_commit or got_hash != want_hash:
+              let _ = os.run(["rm", "-rf", tmpd + ""]) else 0
+              fail n.source + " " + v + " isn't what the registry recorded (commit " + got_commit + ", files " + got_hash[0..12] + "...; the registry has " + want_commit + ", " + want_hash[0..12] + "...): the tag moved, or the source changed it"
           # no symbolic links: one could lead the build (and the hash) to files outside the package
           let links = os.output(["find", tmpd + "", "-path", tmpd + "/.git", "-prune", "-o", "-type", "l", "-print"]) else "?"
           if links != "":
@@ -10919,7 +11300,15 @@ fn rt_runtime() -> Str:
   s += "typedef struct vu_frame {{ const char *name; int loc; struct vu_frame *prev; }} vu_frame;\n"
   s += "static __thread vu_frame *vu_top;\n"
   s += "static inline void vu_leave(vu_frame *f) {{ vu_top = f->prev; }}\n"
-  s += "#ifdef VU_TRACE\n"
+  s += "#if defined(VU_TRACE) && defined(VU_PROF)\n"
+  s += "/* (the profiler's signal handler reads the frames: each must be complete before vu_top points at it,\n"
+  s += "   and the optimizer must keep the stores to vu_top, which no code it can see reads) */\n"
+  s += "static inline void vu_leave_prof(vu_frame *f) {{ __asm__ volatile(\"\" ::: \"memory\"); vu_top = f->prev; }}\n"
+  s += "#define VU_ENTER(n) vu_frame vu_fr __attribute__((cleanup(vu_leave_prof))) = {{n, 0, vu_top}}; __asm__ volatile(\"\" ::: \"memory\"); vu_top = &vu_fr; __asm__ volatile(\"\" ::: \"memory\")\n"
+  s += "#define VU_AT(l) (*(volatile int *)&vu_fr.loc = (l))   /* (a store the optimizer keeps: the signal reads it) */\n"
+  s += "#define VU_PAR_TOP(t) vu_frame *const t = vu_top\n"
+  s += "#define VU_PAR_JOIN(t) (vu_top = (t))\n"
+  s += "#elif defined(VU_TRACE)\n"
   s += "#define VU_ENTER(n) vu_frame vu_fr __attribute__((cleanup(vu_leave))) = {{n, 0, vu_top}}; vu_top = &vu_fr\n"
   s += "#define VU_AT(l) (vu_fr.loc = (l))\n"
   s += "/* par loop worker threads chain their calls to the frame of the function running the loop */\n"
@@ -11897,6 +12286,159 @@ fn rt_runtime() -> Str:
   s += "   still count as reachable for LeakSanitizer. */\n"
   s += "/* (main returning takes the report lock first, as exit() does: a task that is panicking meanwhile\n"
   s += "   then ends the program with its panic and 101, not 0) */\n"
+  s += "#ifdef VU_PROF\n"
+  s += "/* vu build --profile: every 1 ms of CPU time (any thread), SIGPROF records the running thread's shadow\n"
+  s += "   call stack (the VU_TRACE frames: function names and the line each is at). At exit the samples are\n"
+  s += "   counted by function (self: the innermost frame; total: anywhere in the stack) and by line, summed\n"
+  s += "   up on stderr, and written out in full to vu-profile.txt and, one stack per line, to\n"
+  s += "   vu-profile.folded (for flamegraph.pl or speedscope). */\n"
+  s += "#include <sys/time.h>\n"
+  s += "#define VU_PROF_DEPTH 40\n"
+  s += "#define VU_PROF_MAX 65536\n"
+  s += "typedef struct {{ const char *name; int loc; }} vu_pf;\n"
+  s += "static vu_pf *vu_prof_rows;\n"
+  s += "static unsigned char *vu_prof_depth;\n"
+  s += "static int vu_prof_taken;\n"
+  s += "static int vu_prof_hz = 1000;\n"
+  s += "static void vu_prof_tick(int sig) {{\n"
+  s += "    (void)sig;\n"
+  s += "    int saved = errno;\n"
+  s += "    int i = __atomic_fetch_add(&vu_prof_taken, 1, __ATOMIC_RELAXED);\n"
+  s += "    if (i < VU_PROF_MAX) {{\n"
+  s += "        vu_pf *row = vu_prof_rows + (size_t)i * VU_PROF_DEPTH;\n"
+  s += "        int d = 0;\n"
+  s += "        for (vu_frame *f = vu_top; f && d < VU_PROF_DEPTH; f = f->prev) {{ row[d].name = f->name; row[d].loc = f->loc; d++; }}\n"
+  s += "        vu_prof_depth[i] = (unsigned char)d;\n"
+  s += "    }}\n"
+  s += "    errno = saved;\n"
+  s += "}}\n"
+  s += "typedef struct {{ const char *name; int loc; int64_t self, total; int seen; }} vu_pent;\n"
+  s += "/* open addressing on (name, loc); loc -1 for a whole function */\n"
+  s += "static vu_pent *vu_prof_slot(vu_pent *t, size_t cap, const char *name, int loc) {{\n"
+  s += "    size_t h = ((size_t)(uintptr_t)name * 0x9E3779B97F4A7C15ull) ^ ((size_t)(uint32_t)loc * 0xC2B2AE3D27D4EB4Full);\n"
+  s += "    for (size_t k = 0; k < cap; k++) {{\n"
+  s += "        vu_pent *e = &t[(h + k) & (cap - 1)];\n"
+  s += "        if (!e->name) {{ e->name = name; e->loc = loc; e->seen = -1; return e; }}\n"
+  s += "        if (e->name == name && e->loc == loc) return e;\n"
+  s += "    }}\n"
+  s += "    return NULL;\n"
+  s += "}}\n"
+  s += "static void vu_prof_where(char *out, size_t n, int loc) {{\n"
+  s += "    int fi = (loc >> 24) & 255, line = loc & 0xFFFFFF;\n"
+  s += "    const char *file = vu_files && vu_files[fi] ? vu_files[fi] : \"?\";\n"
+  s += "    const char *slash = strrchr(file, '/');\n"
+  s += "    snprintf(out, n, \"%s:%d\", slash ? slash + 1 : file, line);\n"
+  s += "}}\n"
+  s += "static int vu_prof_cmp(const void *a, const void *b) {{\n"
+  s += "    int64_t x = ((const vu_pent *)a)->self, y = ((const vu_pent *)b)->self;\n"
+  s += "    if (x != y) return x < y ? 1 : -1;\n"
+  s += "    return 0;\n"
+  s += "}}\n"
+  s += "static int vu_prof_cmp_total(const void *a, const void *b) {{\n"
+  s += "    int64_t x = ((const vu_pent *)a)->total, y = ((const vu_pent *)b)->total;\n"
+  s += "    if (x != y) return x < y ? 1 : -1;\n"
+  s += "    return vu_prof_cmp(a, b);\n"
+  s += "}}\n"
+  s += "static void vu_prof_report(void) {{\n"
+  s += "    struct itimerval off = {{{{0, 0}}, {{0, 0}}}};\n"
+  s += "    setitimer(ITIMER_PROF, &off, NULL);\n"
+  s += "    signal(SIGPROF, SIG_IGN);\n"
+  s += "    int taken = __atomic_load_n(&vu_prof_taken, __ATOMIC_RELAXED);\n"
+  s += "    int n = taken < VU_PROF_MAX ? taken : VU_PROF_MAX;\n"
+  s += "    size_t cap = 1 << 16;\n"
+  s += "    vu_pent *fns = (vu_pent *)calloc(cap, sizeof *fns), *lines = (vu_pent *)calloc(cap, sizeof *lines);\n"
+  s += "    if (!fns || !lines) return;\n"
+  s += "    int64_t outside = 0;\n"
+  s += "    for (int i = 0; i < n; i++) {{\n"
+  s += "        vu_pf *row = vu_prof_rows + (size_t)i * VU_PROF_DEPTH;\n"
+  s += "        int d = vu_prof_depth[i];\n"
+  s += "        if (d == 0) {{ outside++; continue; }}\n"
+  s += "        vu_pent *f = vu_prof_slot(fns, cap, row[0].name, -1);\n"
+  s += "        vu_pent *l = vu_prof_slot(lines, cap, row[0].name, row[0].loc);\n"
+  s += "        if (f) f->self++;\n"
+  s += "        if (l) l->self++;\n"
+  s += "        for (int k = 0; k < d; k++) {{\n"
+  s += "            vu_pent *e = vu_prof_slot(fns, cap, row[k].name, -1);\n"
+  s += "            if (e && e->seen != i) {{ e->seen = i; e->total++; }}   /* (once per sample, even in recursion) */\n"
+  s += "        }}\n"
+  s += "    }}\n"
+  s += "    size_t nf = 0, nl = 0;\n"
+  s += "    for (size_t k = 0; k < cap; k++) if (fns[k].name) fns[nf++] = fns[k];\n"
+  s += "    for (size_t k = 0; k < cap; k++) if (lines[k].name) lines[nl++] = lines[k];\n"
+  s += "    qsort(fns, nf, sizeof *fns, vu_prof_cmp_total);\n"
+  s += "    qsort(lines, nl, sizeof *lines, vu_prof_cmp);\n"
+  s += "    const char *pre = getenv(\"VU_PROF_OUT\");\n"
+  s += "    if (!pre || !*pre) pre = \"vu-profile\";\n"
+  s += "    char path[4096], where[512];\n"
+  s += "    snprintf(path, sizeof path, \"%s.txt\", pre);\n"
+  s += "    FILE *o = fopen(path, \"w\");\n"
+  s += "    struct timespec cpu;\n"
+  s += "    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);\n"
+  s += "    double secs = (double)cpu.tv_sec + cpu.tv_nsec / 1e9;\n"
+  s += "    fflush(stdout);\n"
+  s += "    fprintf(stderr, \"\\nvu profile: %d samples of %.2f s of CPU time%s\\n\", n, secs,\n"
+  s += "            taken > n ? \" (the samples after the first 65536 were dropped)\" : \"\");\n"
+  s += "    if (n == 0) {{\n"
+  s += "        fprintf(stderr, \"  (too little CPU time to sample)\\n\");\n"
+  s += "        free(fns);\n"
+  s += "        free(lines);\n"
+  s += "        return;\n"
+  s += "    }}\n"
+  s += "    for (int pass = 0; pass < 2; pass++) {{\n"
+  s += "        FILE *w = pass == 0 ? stderr : o;\n"
+  s += "        if (!w) continue;\n"
+  s += "        size_t fmax = pass == 0 ? 12 : nf, lmax = pass == 0 ? 12 : nl;\n"
+  s += "        if (pass == 1) fprintf(w, \"vu profile: %d samples of %.2f s of CPU time\\n\", n, secs);\n"
+  s += "        fprintf(w, \"  total%%   self%%  function\\n\");\n"
+  s += "        for (size_t k = 0; k < nf && k < fmax; k++)\n"
+  s += "            fprintf(w, \"  %5.1f  %5.1f   %s\\n\", 100.0 * fns[k].total / n, 100.0 * fns[k].self / n, fns[k].name);\n"
+  s += "        if (outside && pass == 1) fprintf(w, \"  %5.1f  %5.1f   (outside Vu functions: the runtime)\\n\", 100.0 * outside / n, 100.0 * outside / n);\n"
+  s += "        fprintf(w, \"   self%%  line\\n\");\n"
+  s += "        for (size_t k = 0; k < nl && k < lmax; k++) {{\n"
+  s += "            vu_prof_where(where, sizeof where, lines[k].loc);\n"
+  s += "            fprintf(w, \"  %5.1f   %s in %s\\n\", 100.0 * lines[k].self / n, where, lines[k].name);\n"
+  s += "        }}\n"
+  s += "    }}\n"
+  s += "    if (o) fclose(o);\n"
+  s += "    char fpath[4096];\n"
+  s += "    snprintf(fpath, sizeof fpath, \"%s.folded\", pre);\n"
+  s += "    FILE *fo = fopen(fpath, \"w\");\n"
+  s += "    if (fo) {{\n"
+  s += "        for (int i = 0; i < n; i++) {{\n"
+  s += "            vu_pf *row = vu_prof_rows + (size_t)i * VU_PROF_DEPTH;\n"
+  s += "            int d = vu_prof_depth[i];\n"
+  s += "            if (d == 0) {{ fputs(\"(runtime) 1\\n\", fo); continue; }}\n"
+  s += "            for (int k = d - 1; k >= 0; k--) {{\n"
+  s += "                fputs(row[k].name, fo);\n"
+  s += "                if (k == 0) {{ vu_prof_where(where, sizeof where, row[k].loc); fprintf(fo, \" %s\", where); }}\n"
+  s += "                fputc(k ? ';' : ' ', fo);\n"
+  s += "            }}\n"
+  s += "            fputs(\"1\\n\", fo);\n"
+  s += "        }}\n"
+  s += "        fclose(fo);\n"
+  s += "    }}\n"
+  s += "    fprintf(stderr, \"  all of it: %s; stacks for flamegraph.pl or speedscope: %s\\n\", path, fpath);\n"
+  s += "    free(fns);\n"
+  s += "    free(lines);\n"
+  s += "}}\n"
+  s += "static void vu_prof_start(void) {{\n"
+  s += "    const char *hz = getenv(\"VU_PROF_HZ\");\n"
+  s += "    if (hz) {{ int h = atoi(hz); if (h >= 10 && h <= 10000) vu_prof_hz = h; }}\n"
+  s += "    vu_prof_rows = (vu_pf *)calloc((size_t)VU_PROF_MAX * VU_PROF_DEPTH, sizeof(vu_pf));\n"
+  s += "    vu_prof_depth = (unsigned char *)calloc(VU_PROF_MAX, 1);\n"
+  s += "    if (!vu_prof_rows || !vu_prof_depth) return;\n"
+  s += "    struct sigaction sa;\n"
+  s += "    memset(&sa, 0, sizeof sa);\n"
+  s += "    sa.sa_handler = vu_prof_tick;\n"
+  s += "    sa.sa_flags = SA_RESTART;\n"
+  s += "    sigemptyset(&sa.sa_mask);\n"
+  s += "    sigaction(SIGPROF, &sa, NULL);\n"
+  s += "    atexit(vu_prof_report);\n"
+  s += "    long us = 1000000 / vu_prof_hz;\n"
+  s += "    struct itimerval it = {{{{us / 1000000, us % 1000000}}, {{us / 1000000, us % 1000000}}}};\n"
+  s += "    setitimer(ITIMER_PROF, &it, NULL);\n"
+  s += "}}\n"
+  s += "#endif\n"
   s += "static void *vu_main_thread(void *arg) {{ (void)arg; vu_thread_guard(); vu_main_rc = vu_main_fn(); vu_report_lock(); fflush(stdout); exit(vu_main_rc); }}\n"
   s += "static void vu_seed_init(void);\n"
   s += "static void vu_guard_init(void *top);\n"
@@ -11913,6 +12455,9 @@ fn rt_runtime() -> Str:
   s += "    vu_seed_init();\n"
   s += "    vu_guard_init(__builtin_frame_address(0));\n"
   s += "    vu_main_fn = fn;\n"
+  s += "#ifdef VU_PROF\n"
+  s += "    vu_prof_start();\n"
+  s += "#endif\n"
   s += "#ifndef VU_WASI\n"
   s += "    pthread_attr_t at;\n"
   s += "    pthread_t t;\n"
@@ -15703,6 +16248,23 @@ fn rt_tasks() -> Str:
   s += "}}\n"
   s += "/* net.tls_listen(port, cert: pem, key: pem): the certificate (then any intermediate certificates) and\n"
   s += "   its private key, as PEM text. */\n"
+  s += "/* \"h2,http/1.1\" -> a length byte, then the wire form: 2 h2 8 http/1.1 (NULL and *err if it's malformed) */\n"
+  s += "static unsigned char *vu_alpn_wire(const vu_str *alpn, vu_str *err) {{\n"
+  s += "    unsigned char *wire = (unsigned char *)vu_malloc((size_t)alpn->len + 3);\n"
+  s += "    size_t w = 1, start = 0;\n"
+  s += "    for (size_t i = 0; i <= (size_t)alpn->len; i++) {{\n"
+  s += "        if (i < (size_t)alpn->len && alpn->data[i] != ',') continue;\n"
+  s += "        size_t n = i - start;\n"
+  s += "        if (n == 0 || n > 255) {{ free(wire); *err = vu_errf(\"alpn: a comma-separated list of protocol names, like \\\"h2,http/1.1\\\"\"); return NULL; }}\n"
+  s += "        wire[w++] = (unsigned char)n;\n"
+  s += "        memcpy(wire + w, alpn->data + start, n);\n"
+  s += "        w += n;\n"
+  s += "        start = i + 1;\n"
+  s += "    }}\n"
+  s += "    if (w - 1 > 255) {{ free(wire); *err = vu_errf(\"alpn: the list is too long\"); return NULL; }}\n"
+  s += "    wire[0] = (unsigned char)(w - 1);\n"
+  s += "    return wire;\n"
+  s += "}}\n"
   s += "/* ALPN: the server picks the first of its protocols (alpn: \"h2,http/1.1\") that the client offers. */\n"
   s += "static int vu_alpn_pick(SSL *ssl, const unsigned char **out, unsigned char *outlen, const unsigned char *in, unsigned inlen, void *arg) {{\n"
   s += "    (void)ssl;\n"
@@ -15722,22 +16284,7 @@ fn rt_tasks() -> Str:
   s += "                                   void **out, vu_str *err, int line) {{\n"
   s += "    vu_task_here(\"net.tls_listen()\", line);\n"
   s += "    unsigned char *wire = NULL;\n"
-  s += "    if (alpn) {{\n"
-  s += "        /* \"h2,http/1.1\" -> a length byte, then the wire form: 2 h2 8 http/1.1 */\n"
-  s += "        wire = (unsigned char *)vu_malloc((size_t)alpn->len + 3);\n"
-  s += "        size_t w = 1, start = 0;\n"
-  s += "        for (size_t i = 0; i <= (size_t)alpn->len; i++) {{\n"
-  s += "            if (i < (size_t)alpn->len && alpn->data[i] != ',') continue;\n"
-  s += "            size_t n = i - start;\n"
-  s += "            if (n == 0 || n > 255) {{ free(wire); *err = vu_errf(\"alpn: a comma-separated list of protocol names, like \\\"h2,http/1.1\\\"\"); return false; }}\n"
-  s += "            wire[w++] = (unsigned char)n;\n"
-  s += "            memcpy(wire + w, alpn->data + start, n);\n"
-  s += "            w += n;\n"
-  s += "            start = i + 1;\n"
-  s += "        }}\n"
-  s += "        if (w - 1 > 255) {{ free(wire); *err = vu_errf(\"alpn: the list is too long\"); return false; }}\n"
-  s += "        wire[0] = (unsigned char)(w - 1);\n"
-  s += "    }}\n"
+  s += "    if (alpn && !(wire = vu_alpn_wire(alpn, err))) return false;\n"
   s += "    if (cert->len > (1 << 24) || key->len > (1 << 24)) {{ *err = vu_errf(\"the certificate or key is too long\"); return false; }}\n"
   s += "    ERR_clear_error();\n"
   s += "    SSL_CTX *ctx = vu_tls_ctx(true);\n"
@@ -15783,11 +16330,76 @@ fn rt_tasks() -> Str:
   s += "}}\n"
   s += "/* net.tls_connect(host, port, ca: pem, timeout: s): checks the server's certificate against the system's\n"
   s += "   certificates (or only the ones in ca) and that it is for host. */\n"
-  s += "static bool vu_net_tls_connect(vu_cap net, const vu_str *host, int64_t port, const vu_str *ca, double timeout, bool has,\n"
-  s += "                               void **out, vu_str *err, int line) {{\n"
+  s += "static bool vu_net_tls_connect(vu_cap net, const vu_str *host, int64_t port, const vu_str *ca, const vu_str *alpn, double timeout,\n"
+  s += "                               bool has, void **out, vu_str *err, int line) {{\n"
   s += "    (void)net;\n"
   s += "    vu_task_here(\"net.tls_connect()\", line);\n"
   s += "    if (port < 1 || port > 65535) {{ *err = vu_errf(\"port %lld is not in 1..65535\", (long long)port); return false; }}\n"
+  s += "    unsigned char *wire = NULL;\n"
+  s += "    if (alpn && !(wire = vu_alpn_wire(alpn, err))) return false;\n"
+  s += "    char *h = vu_cpath(host, err);\n"
+  s += "    if (!h) {{ free(wire); drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }}\n"
+  s += "    int64_t deadline = vu_deadline(timeout, has, line);\n"
+  s += "    ERR_clear_error();\n"
+  s += "    SSL_CTX *ctx;\n"
+  s += "    if (ca) {{\n"
+  s += "        if (ca->len > (1 << 24)) {{ free(wire); free(h); *err = vu_errf(\"ca: the PEM text is too long\"); return false; }}\n"
+  s += "        ctx = vu_tls_ctx(false);\n"
+  s += "        X509_STORE *st = SSL_CTX_get_cert_store(ctx);\n"
+  s += "        BIO *b = vu_pem_bio(ca);\n"
+  s += "        int n = 0;\n"
+  s += "        X509 *x;\n"
+  s += "        while (b && (x = PEM_read_bio_X509(b, NULL, vu_no_password, NULL))) {{ X509_STORE_add_cert(st, x); X509_free(x); n++; }}\n"
+  s += "        if (b) BIO_free(b);\n"
+  s += "        ERR_clear_error();\n"
+  s += "        if (!n) {{ free(wire); SSL_CTX_free(ctx); free(h); *err = vu_errf(\"ca: no certificate found in the PEM text\"); return false; }}\n"
+  s += "    }} else {{\n"
+  s += "        pthread_mutex_lock(&vu_tls_lock);\n"
+  s += "        if (!vu_tls_system) {{\n"
+  s += "            SSL_CTX *sys = vu_tls_ctx(false);\n"
+  s += "            SSL_CTX_set_default_verify_paths(sys);\n"
+  s += "            ERR_clear_error();\n"
+  s += "            vu_tls_system = sys;\n"
+  s += "        }}\n"
+  s += "        ctx = vu_tls_system;\n"
+  s += "        SSL_CTX_up_ref(ctx);\n"
+  s += "        pthread_mutex_unlock(&vu_tls_lock);\n"
+  s += "    }}\n"
+  s += "    void *sp = NULL;\n"
+  s += "    if (!vu_connect_to(h, port, deadline, &sp, err, line)) {{ free(wire); SSL_CTX_free(ctx); free(h); return false; }}\n"
+  s += "    vu_sock *s = (vu_sock *)sp;\n"
+  s += "    bool ok = vu_tls_attach(s, ctx, err);\n"
+  s += "    SSL_CTX_free(ctx);   /* the SSL object keeps its own reference */\n"
+  s += "    if (ok) {{\n"
+  s += "        SSL *ssl = (SSL *)s->ssl;\n"
+  s += "        unsigned char ip[16];\n"
+  s += "        bool is_ip = inet_pton(AF_INET, h, ip) == 1 || inet_pton(AF_INET6, h, ip) == 1;\n"
+  s += "        if (is_ip) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), h);\n"
+  s += "        else {{ SSL_set_tlsext_host_name(ssl, h); SSL_set1_host(ssl, h); }}\n"
+  s += "        if (wire) SSL_set_alpn_protos(ssl, wire + 1, wire[0]);\n"
+  s += "        SSL_set_connect_state(ssl);\n"
+  s += "        ok = vu_tls_handshake(s, deadline, err, line);\n"
+  s += "        if (!ok) {{\n"
+  s += "            vu_str e = *err;\n"
+  s += "            *err = vu_errf(\"%.200s:%lld: %.*s\", h, (long long)port, (int)e.len, (const char *)e.data);\n"
+  s += "            drop_Str(&e);\n"
+  s += "        }}\n"
+  s += "    }}\n"
+  s += "    free(h);\n"
+  s += "    free(wire);\n"
+  s += "    if (!ok) {{ vu_sock_drop(s); return false; }}\n"
+  s += "    *out = s;\n"
+  s += "    return true;\n"
+  s += "}}\n"
+  s += "/* net.start_tls(&conn, host, ca:, timeout:): TLS on a connection that's already open (STARTTLS, as\n"
+  s += "   PostgreSQL and SMTP do it), with the same checks as tls_connect. */\n"
+  s += "static bool vu_net_start_tls(vu_cap net, void **conn, const vu_str *host, const vu_str *ca, double timeout, bool has,\n"
+  s += "                             vu_str *err, int line) {{\n"
+  s += "    (void)net;\n"
+  s += "    vu_task_here(\"net.start_tls()\", line);\n"
+  s += "    vu_sock *s = (vu_sock *)*conn;\n"
+  s += "    if (!s) {{ *err = vu_errf(\"net.start_tls(): the connection is closed\"); return false; }}\n"
+  s += "    if (s->ssl) {{ *err = vu_errf(\"net.start_tls(): the connection already uses TLS\"); return false; }}\n"
   s += "    char *h = vu_cpath(host, err);\n"
   s += "    if (!h) {{ drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }}\n"
   s += "    int64_t deadline = vu_deadline(timeout, has, line);\n"
@@ -15816,11 +16428,8 @@ fn rt_tasks() -> Str:
   s += "        SSL_CTX_up_ref(ctx);\n"
   s += "        pthread_mutex_unlock(&vu_tls_lock);\n"
   s += "    }}\n"
-  s += "    void *sp = NULL;\n"
-  s += "    if (!vu_connect_to(h, port, deadline, &sp, err, line)) {{ SSL_CTX_free(ctx); free(h); return false; }}\n"
-  s += "    vu_sock *s = (vu_sock *)sp;\n"
   s += "    bool ok = vu_tls_attach(s, ctx, err);\n"
-  s += "    SSL_CTX_free(ctx);   /* the SSL object keeps its own reference */\n"
+  s += "    SSL_CTX_free(ctx);\n"
   s += "    if (ok) {{\n"
   s += "        SSL *ssl = (SSL *)s->ssl;\n"
   s += "        unsigned char ip[16];\n"
@@ -15831,14 +16440,24 @@ fn rt_tasks() -> Str:
   s += "        ok = vu_tls_handshake(s, deadline, err, line);\n"
   s += "        if (!ok) {{\n"
   s += "            vu_str e = *err;\n"
-  s += "            *err = vu_errf(\"%.200s:%lld: %.*s\", h, (long long)port, (int)e.len, (const char *)e.data);\n"
+  s += "            *err = vu_errf(\"%.200s: %.*s\", h, (int)e.len, (const char *)e.data);\n"
   s += "            drop_Str(&e);\n"
   s += "        }}\n"
   s += "    }}\n"
   s += "    free(h);\n"
-  s += "    if (!ok) {{ vu_sock_drop(s); return false; }}\n"
-  s += "    *out = s;\n"
+  s += "    if (!ok) {{ vu_sock_drop(s); *conn = NULL; return false; }}\n"
   s += "    return true;\n"
+  s += "}}\n"
+  s += "/* net.protocol(conn): the protocol chosen by ALPN on a TLS connection (\"h2\"), else \"\" */\n"
+  s += "static vu_str vu_net_protocol(vu_cap net, void *c) {{\n"
+  s += "    (void)net;\n"
+  s += "    vu_sock *s = (vu_sock *)c;\n"
+  s += "    const unsigned char *p = NULL;\n"
+  s += "    unsigned n = 0;\n"
+  s += "    if (s && s->ssl) SSL_get0_alpn_selected((SSL *)s->ssl, &p, &n);\n"
+  s += "    vu_str r = {{0}};\n"
+  s += "    if (n) vu_str_cat_bytes(&r, p, (int64_t)n);\n"
+  s += "    return r;\n"
   s += "}}\n"
   s += "#endif\n"
   s += "static void drop_X_Conn(void **p) {{ if (*p) {{ vu_sock_drop(*p); *p = NULL; }} }}\n"
@@ -16199,11 +16818,21 @@ fn rt_help() -> Str:
   s += "  vu run [--release] [--json] FILE.vu [ARGS...]\n"
   s += "      quick unoptimized build (-O0), then run it with ARGS; --release builds optimized first.\n"
   s += "      A panic prints the chain of calls that led to it (in quick builds).\n"
-  s += "  vu build FILE.vu [-o OUT] [--debug] [--malloc] [--san] [--san-pool] [--tsan] [--emit-c FILE] [--time] [--static]\n"
+  s += "  vu build FILE.vu [-o OUT] [--debug] [--malloc] [--san] [--san-pool] [--tsan] [--emit-c FILE] [--time] [--static] [--wasm] [--profile]\n"
   s += "      optimized binary (-O3); --debug builds quickly instead. With VU_CACHE=DIR set, each binary is\n"
   s += "      kept in DIR under a hash of its C, the C compiler's command, version and CPU, and the same\n"
   s += "      build again is a copy (not for programs with extern C files). --static links every library in\n"
-  s += "      (the binary runs anywhere with the same CPU and kernel; with glibc, host name lookups need glibc there)\n"
+  s += "      (the binary runs anywhere with the same CPU and kernel; with glibc, host name lookups need glibc there).\n"
+  s += "      --wasm: a WebAssembly (WASI) module, with zig's C compiler (no tasks, sockets or processes)\n"
+  s += "      --profile (build or run): optimized, and at exit the program reports where its CPU time went\n"
+  s += "      (by function and line, on stderr; all of it in vu-profile.txt, stacks in vu-profile.folded)\n"
+  s += "  vu get [FILE.vu]\n"
+  s += "      fetch the packages in vu.pkg (and the ones they need) and write vu.lock\n"
+  s += "  vu search [WORDS...] / vu add NAME [VERSION]\n"
+  s += "      the registry (VU_REGISTRY, else https://vulang.org/registry/index.txt): list packages, or add\n"
+  s += "      one to vu.pkg with the capabilities it takes, then fetch it (checked against the registry)\n"
+  s += "  vu publish NAME VERSION [DIR] [fs net os ffi]\n"
+  s += "      print the registry's lines for a git tag of a package (they go in by pull request)\n"
   s += "  vu version\n"
   s += "      prints the release (vu 0.1.0)\n"
   s += "  vu new web NAME\n"

@@ -1858,6 +1858,119 @@ Attack rounds:
    and a field, definition into a module file and within the file, completion after `x.` and `mod.`,
    all on a buffer edited to have an error after its last good version: all right the first time.
 
+## Round 23: SQLite, PostgreSQL over TLS, programs built to WebAssembly, time zones, an HTTP client that keeps connections, WebSocket routes, a package registry, a profiler
+
+- `std/sqlite.vu`: SQLite through the sqlite3 C library (`extern` glue in `std/sqlite_glue.c`), with
+  the same rule as `pg`: the SQL is a `const` parameter and values go only as parameters.
+- `pg` speaks TLS: `cfg.tls = true` asks the server for it (an SSLRequest) and then checks its
+  certificate like `sslmode=verify-full`, against the system's certificates or `cfg.ca`. The new
+  `net.start_tls(&conn, host, ca:, timeout:)` turns an open connection into a TLS one.
+- `vu build --wasm` builds a program to a WASI module with zig's C compiler. What WASI can't do
+  (threads, sockets, processes, OpenSSL, C files) is refused at build time with the reason.
+- Time zones in `std/time.vu`: `time.zone(fs, "Europe/Paris")` reads the tz database's TZif file
+  (versions 1 to 4, with the POSIX rule at the end for times after the table), and `local`,
+  `offset`, `iso_in` and `from_local` work in it. All in Vu: about 370 lines.
+- `http.Client`: `client.fetch(net, req)` keeps connections open between requests (HTTP/1.1
+  keep-alive) and speaks HTTP/2 to https servers that choose it through ALPN (`std/h2.vu` gained a
+  client half: HPACK both ways, flow control both ways, SETTINGS, PING, GOAWAY, RST_STREAM,
+  CONTINUATION, padding, 1xx responses and trailers). For it, `net.tls_connect` takes `alpn:` and
+  `net.protocol(conn)` says what was chosen.
+- Fixed: `arg(i, "text")` compared with `==` or `!=` was refused ("can't compare Str with Str"):
+  the checker's quick type guess said Int for every `arg`. Found writing the client's test driver.
+- `own` parameters in function types: `fn(own ws.Socket, http.Request)` takes ownership of its
+  first argument (a call moves it in), a closure says `fn(own s) => ...`, and a named function with
+  `own` parameters is now a value. Before, a function value could only borrow, so nothing could hand
+  a connection to a stored handler.
+- WebSocket routes in `web`: `app.websocket("/rooms/:room", handler)`; the handshake goes through the
+  middleware, the handler owns the socket, and cross-origin pages are refused unless
+  `allow_origin` names them. Underneath, `http.Site` lets a handler's 101 hand the connection to a
+  function (`http.serve_site`); `ws.accept_request` does the handshake for a request already read,
+  and `ws.poll` waits for a message for a given time, so a handler can also send what other tasks
+  queue for it. `web.serve_tls` serves an app over TLS.
+- What `ok(v)` and `err(e)` bind in a `match` on a failing call now belongs to the arm, so it can be
+  moved (`ok(c): spawn serve(net, c)`); before, it was a view into the result, which the error
+  said to take out with `else`. Test 357 expected that refusal and now checks the move works.
+- A package registry: `need clock v1.2.0 os` names a package by its registry name; the index
+  (`https://vulang.org/registry/index.txt`, a text file served with the site, or `VU_REGISTRY`)
+  records each version's commit and file hash, and `vu get` refuses anything else. `vu search`,
+  `vu add`, `vu publish`. The index starts empty: publishing is a pull request to it.
+- `vu build --profile`: a sampling CPU profiler (SIGPROF on the kernel's CPU timer, reading the
+  shadow call stack the quick builds keep for backtraces), reporting by function and line at exit,
+  with stacks for flame graphs.
+
+Attack rounds:
+
+1. `tests/run_sqlite.py` against Python's sqlite3: random inserts, updates, deletes and selects with
+   quotes, semicolons and NULLs, a bad statement, a reopened file, SQL that isn't const. Found one bug:
+   an empty Str has no buffer, so it was bound as NULL instead of `''` (fixed in the glue).
+2. `tests/run_pg_tls.py`, a fake server: the test CA, the system's CAs (which don't include it), a
+   certificate for another host, a self-signed one, `N`, an `S` followed by bytes (the buffer
+   stuffing of CVE-2021-23222: they must not be read as if they came over TLS), an error message
+   instead of an answer, a server that ignores the request, and one that hangs up. Found one thing:
+   a server that hung up was reported as "an unexpected answer"; it now says the server closed the
+   connection. Certificate errors now start with `network: tls:`.
+3. `tests/wasm_programs.py` builds all 7 examples and every targeted output and panic test (371
+   programs) with `--wasm`, runs them under wasmtime and compares with the expected (or native)
+   output: 318 the same (313 when this round started), 56 refused at build time as they should be (tasks, the network), and 3
+   known differences: `os.run` can't start programs in WASI, WASI reports an empty path as "Bad file
+   descriptor", and clang turns test 465's endless recursion into a loop, so it ends with an integer
+   overflow instead of a stack overflow. A too-deep recursion stops with wasmtime's trap ("call stack
+   exhausted"), not the panic. One mistake of mine on the way: the first comparison didn't drop NUL
+   bytes from the output as the shell's does, so test 44 looked different.
+4. `tests/run_time_zones.py` against Python's zoneinfo (its own reader of the same files), over all
+   498 zones: 45,688 local times (random instants from 1800 to 2200, and the second before, at and
+   after changes found by bisection) and 23,061 wall-clock times around changes for `from_local`
+   (gaps and repeated hours, fold=0), and the same with three more seeds; then 21 broken files (bad magic, cut short,
+   counts past the end, transitions out of order, indexes out of range, an offset of a week, bad
+   POSIX rules), 4 unusual valid ones (a `<+0330>` name, a rule without dates, DST all year, a
+   version 1 file), and 300 randomly corrupted files, plain and under ASan/UBSan. All agreed the
+   first time. Not covered: the `right/` zones' leap seconds are skipped, as Unix time has none.
+5. `tests/run_http_client.py`, 34 checks: keep-alive against Python's http.server (20 GETs on one
+   connection, as the server counted; mixed methods, chunked and HEAD; `Connection: close`; a body
+   read to the close; a server that hangs up after answering); HTTP/2 against Vu's own server (GETs
+   up to 3 MB, POSTs up to 1 MB through its 64 KB window, HTTP/1.1 over TLS with `http2` off, an
+   untrusted certificate) and against the h2 package with a 16-byte window, GOAWAY after every
+   three requests, REFUSED_STREAM and a 103 before the 200; then 22 hand-built servers: push,
+   DATA before HEADERS, a stream never opened, undecodable HPACK, a 20,000-byte frame, a short
+   body, 33 CONTINUATION frames, bad or misplaced `:status`, uppercase names, bad padding, bad
+   SETTINGS, a window past 2^31-1, RST_STREAM, a close mid-body, 65 MB, an HPACK bomb (a 4 KB
+   entry referenced 100 times), GOAWAY before answering (sent again on a new connection, then
+   given up), silence (the timeout), and PING, trailers and padding that must work. Found one bug:
+   a GOAWAY that arrived just after a response left the connection in the pool, and the next
+   request (a POST, not repeatable) failed on it; kept HTTP/2 connections now read what arrived
+   before they're used. Two mistakes of mine in the test: the "refuse once" flag was per
+   connection, and the HPACK bomb's length prefix was wrong (it failed for the wrong reason).
+6. Tests 682 to 689 on `own` in function types: named functions, closures, a list of them, a field,
+   a generic parameter, one that fails (LeakSanitizer checks the argument is freed), use after the
+   move, the same variable twice, `fn(Box)` and `fn(own Box)` mixed up both ways, and a borrowing
+   closure: nothing found.
+7. `tests/run_web_sockets.py`, 24 checks with the websockets package over TCP and TLS: echo up to
+   1.2 MB, route parameters and middleware values, middleware that refuses, origins (another
+   refused, an allowed one and the app's own accepted), a WebSocket request to a plain route and to
+   no route, a chat of 5 sockets fed by a hub task while one drops out without closing, a frame in
+   the same packet as the handshake, four broken handshakes, plain requests meanwhile, and a clean
+   stop: nothing found. What got in the way, three times while writing this: a value bound by
+   `match` on a call's result couldn't be moved out (`ok(m): x = m`). Now it can: the arm owns it
+   (test 690: into a variable, a list and a struct, in a loop, under the sanitizers).
+8. The registry, in `tests/run_pkg.sh` (25 checks): publish from a clone (origin, commit, hash), an
+   unknown tag, search, add (latest version, the capabilities granted, vu.pkg and vu.lock, run),
+   add twice, an unknown name, version or a name that isn't one, an older version by
+   `need NAME`, a tag moved to another commit after publishing (refused, and nothing kept), files
+   whose hash differs, six broken index lines (an option as a source, a name in capitals, a short
+   commit, lines before their package, unknown lines, a name twice) and an http:// index. Found:
+   `vu publish` dropped `.git` from every origin, which broke `file://` sources (git found the
+   folder anyway, so `vu add` had passed); now only from github.com and gitlab.com URLs. And my
+   test expected `ext::sh` to be refused as a source, but it can't reach git's ext transport:
+   it's read as https://ext::sh.
+9. `tests/run_profile.py` (11 checks): a program with a hot, a warm and a cold function (shares
+   about 85/15/0, as built), the lines named, the two files, and a program with tasks on every
+   thread, a par loop, a sleep and a loopback connection run 21 times while sampled. Found two
+   things, both the optimizer's: the per-line stores were sunk out of loops (every sample said
+   line 0), and with the small functions inlined their frame pushes were removed as dead stores
+   (all time went to main). The profiled build now keeps both with volatile stores and compiler
+   barriers. Measured cost, best of 3: binarytrees 0.58 -> 1.00 s, spectralnorm 0.12 -> 0.30 s,
+   nbody 1.08 -> 1.51 s, fannkuch and mandelbrot (par loops, no line stores) about the same.
+
 ## Limits of v0
 
 - Strings are bytes, read as UTF-8 by the text functions. Linux on x86-64 and ARM64;

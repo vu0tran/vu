@@ -14,6 +14,7 @@
 import http
 import log
 import path
+import ws
 
 type Ctx:
   params: {Str: Str}   # the route's :name and *name parts, percent-decoded
@@ -24,12 +25,28 @@ type Route:
   segs: [Str]          # the pattern split at '/': literal text, ":name" or "*name" (last only)
   handler: fn(http.Request, Ctx) -> http.Response
 
+type WsRoute:
+  segs: [Str]
+  handler: fn(own ws.Socket, http.Request, Ctx)
+
 type App:
   routes: [Route]
   mws: [fn(http.Request, Ctx, fn(http.Request, Ctx) -> http.Response) -> http.Response]
+  ws_routes: [WsRoute]
+  origins: [Str]       # pages on other origins that may open this app's WebSockets ("https://x.com")
 
 fn app() -> App:
-  return App([], [])
+  return App([], [], [], [])
+
+# A WebSocket route: a GET with the WebSocket handshake to p (the same patterns as get) passes the
+# middleware like any request, then h gets the open socket, the request and the context, and owns
+# the connection until it returns. A browser page from another origin is refused (403: anyone's page
+# could otherwise open a socket with the user's cookies) unless allow_origin names it.
+fn websocket(var a: App, p: Str, own h: fn(own ws.Socket, http.Request, Ctx)):
+  a.ws_routes.push(WsRoute(pattern(p), h))
+
+fn allow_origin(var a: App, origin: Str):
+  a.origins.push(origin + "")
 
 # ---- routes
 
@@ -107,6 +124,16 @@ fn dispatch(a: App, req: http.Request, c: Ctx) -> http.Response:
   if not req.path.startswith("/"): return http.text(404, "not found")
   # each part is decoded on its own, after splitting, so an encoded '/' (%2F) stays inside its part
   let parts = req.path[1..req.path.len].split("/")
+  if req.method == "GET" and (http.header(req, "upgrade") else "").lower() == "websocket":
+    for i in 0..a.ws_routes.len:
+      if ps = match_route(a.ws_routes[i].segs, parts):
+        if not origin_ok(a, req): return http.text(403, "cross-site WebSocket refused")
+        # 101: http gives the connection to ws_take, with this response: which route, and the context
+        var hs = [http.Header(":route", "{i}")]
+        for k, v in ps: hs.push(http.Header(":param:" + k, v + ""))
+        for k, v in c.params: hs.push(http.Header(":param:" + k, v + ""))
+        for k, v in c.vals: hs.push(http.Header(":val:" + k, v + ""))
+        return http.Response(101, hs, "")
   var allowed: [Str] = []
   for r in a.routes:
     if ps = match_route(r.segs, parts):
@@ -134,7 +161,41 @@ fn handle(a: App, req: http.Request) -> http.Response:
 # Serves the app on a port until SIGTERM or SIGINT (see http.serve), giving requests in progress
 # 10 seconds to finish.
 fn serve(net: Net, os: Os, own a: App, port: Int) throws:
-  http.serve(net, os, port, own fn(req: http.Request) -> http.Response => handle(a, req), 10.0)?
+  http.serve_site(net, os, port, site(net, a), 10.0)?
+
+# serve over TLS (HTTP/2 for browsers that offer it; WebSockets over HTTP/1.1), with the server's
+# certificate and key as PEM text.
+fn serve_tls(net: Net, os: Os, own a: App, port: Int, cert: Str, key: Str) throws:
+  http.serve_tls_site(net, os, port, cert, key, site(net, a), 10.0)?
+
+# The app as an http.Site: its routes and middleware, and its WebSocket routes.
+fn site(net: Net, own a: App) -> http.Site:
+  let takes = a.ws_routes.len > 0
+  let sa = share(a)
+  let sb = sa.share()
+  return http.Site(own fn(req: http.Request) -> http.Response => handle(sa.value, req), takes,
+                   own fn(own c: Conn, req: http.Request, resp: http.Response, rest: Str) => ws_take(net, sb, c, req, resp, rest))
+
+fn ws_take(net: Net, a: Shared[App], own c: Conn, req: http.Request, resp: http.Response, rest: Str):
+  var route = -1
+  var ctx = Ctx({}, {})
+  for h in resp.headers:
+    if h.name == ":route": route = int(h.value) else -1
+    elif h.name.startswith(":param:"): ctx.params[h.name[7..h.name.len]] = h.value + ""
+    elif h.name.startswith(":val:"): ctx.vals[h.name[5..h.name.len]] = h.value + ""
+  if route < 0 or route >= a.value.ws_routes.len: return
+  let s = ws.accept_request(net, c, req, rest) else return
+  a.value.ws_routes[route].handler(s, req, ctx)
+
+# Whether a WebSocket request's page may open it: no Origin (not a browser), the app's own origin,
+# or one named with allow_origin.
+fn origin_ok(a: App, req: http.Request) -> Bool:
+  let origin = http.header(req, "origin") else return true
+  let host = http.header(req, "host") else ""
+  if origin == "http://" + host or origin == "https://" + host: return true
+  for o in a.origins:
+    if o == origin or o == "*": return true
+  return false
 
 # ---- the context
 

@@ -276,11 +276,15 @@ fn main():
 ```
 
 - **Function types** are `fn(A, B) -> R`, `fn(Str) -> Int throws` (it fails with a message), and
-  `fn(T)` for one that returns nothing. `(fn(Int) -> Int)?` is an optional one.
+  `fn(T)` for one that returns nothing. `(fn(Int) -> Int)?` is an optional one. `fn(own Conn)`
+  takes ownership of that argument: a call moves it in, as for an `own` parameter, and a closure of
+  that type names it `own` (`fn(own c) => serve(c)`), or gets that from where it goes. A named
+  function with `own` parameters is a value of such a type.
 - **Closures**: `fn(x: Int) -> Int => x * k` is an expression. Parameter and return types can be
   left out when the context gives them (an argument, a typed `let`, a field). `fn name(...): ...`
   inside a function is a nested function with a block body, bound to `name`; it can't call
-  itself (make it top-level to recurse). Closure parameters are read-only (no `var` or `own`).
+  itself (make it top-level to recurse). Closure parameters are read-only, except `own` ones
+  (there is no `var`).
 - **What a closure can see.** It reads the variables it names from where it's written, and
   can't change them. A plain closure **borrows** them: it can be called, bound with `let`, or
   passed to a function, but not stored, returned, sent or put in a `var`, so it can never
@@ -294,8 +298,8 @@ fn main():
 - **Calling**: `f(x)`, `h.handler(req)`, `routes[path](req)`, `make()(x)`. A function value that
   throws is handled like any call that can fail: `f(x)?`, `f(x) else d`, `match f(x):`.
 - **Named functions as values**: `let f = double`, `apply(double, 3)`, `util.parse`. A function
-  with `var` or `own` parameters, or one that fails with typed errors (`throws E`), can't be a
-  value; wrap it in a closure. A generic function becomes a value given a type:
+  with `var` parameters, or one that fails with typed errors (`throws E`), can't be a value; wrap
+  it in a closure. A generic function becomes a value given a type:
   `let f: fn(Int) -> Int = identity`.
 - A closure that captures a capability (`os`, `net`) carries it: whoever holds the closure can
   use that capability through it.
@@ -361,6 +365,8 @@ match parse_digit(b):                # inspect it
 - When an error passes up with `?` or `fail`, every value the function owns is freed first.
 - `?` and `fail` aren't allowed inside `par` loops, since every iteration must run; use
   `else` or `match` there.
+- In `match f(x):`, what `ok(v)` and `err(e)` bind is the arm's own: it can be moved on
+  (`ok(c): spawn serve(c)`, `ok(v): result = v`).
 - If `main` is marked `throws` and an error reaches it, the program prints `error: <message>`
   to standard error and exits with code 1. (`panic` exits with 101.)
 - File operations and reading numbers from text can fail the same way (see Built-ins).
@@ -879,6 +885,7 @@ vu run file.vu [args]       # quick -O0 build, then run with args
 vu run --release file.vu    # optimized build, then run (options go before the file;
                             #   everything after it goes to the program)
 vu build file.vu [-o out]   # optimized native binary
+  --profile  report where the CPU time went, at exit (also for run)
   --debug    -O0 build for fast iteration
   --malloc   use malloc/free instead of the node free list
   --san      build with AddressSanitizer + UBSan (implies --malloc)
@@ -889,9 +896,11 @@ vu build file.vu [-o out]   # optimized native binary
   --time     report front-end and C compiler time
   --static   link every library in (no shared libraries needed where it runs; with glibc,
              host name lookups still need glibc's libraries there)
+  --wasm     a WebAssembly (WASI) module, out.wasm, with zig's C compiler (see WebAssembly)
 vu fmt file.vu... [--check] # rewrite spacing the one way (--check: list files it would change)
 vu test file.vu...          # run each fn test_... in its own process; report which pass
 vu get [file.vu]            # fetch the packages in vu.pkg, write vu.lock (see Packages)
+vu search WORDS / vu add NAME  # the package registry (see Packages); vu publish NAME VERSION
 vu version                  # the release: vu 0.1.0
 vu new web NAME             # a folder NAME with a web app: main.vu, public/, Dockerfile, fly.toml
 vu lsp                      # a language server for editors (diagnostics, formatting, hover, definition, completion)
@@ -907,6 +916,14 @@ vu lsp                      # a language server for editors (diagnostics, format
   capabilities (`fn test_save(fs: Fs) throws:`). Each runs in its own process, so a panic or a
   failed `assert` fails that test only. `assert(cond)` stops the program (exit 101) naming the
   assertion's text; `assert(cond, message)` gives the message instead.
+- **`vu build --profile`** (or `vu run --profile`): an optimized build that, at exit, prints where the
+  CPU time went: by function (self, and total with what it calls) and by line, from a sample of each
+  thread's call stack at every tick of the kernel's CPU timer (often 250 a second, across all
+  threads). `vu-profile.txt` has all of it, and `vu-profile.folded` one stack per sample for
+  `flamegraph.pl` or speedscope (`VU_PROF_OUT=prefix` moves them). The profiled program keeps every
+  call's frame and the line it's at, which made the benchmarks 1.0x (`par` loops) to 2.5x
+  (spectralnorm) slower, and the optimizer moves work between neighbouring lines, so shares by line
+  are approximate; by function they're the program's.
 - **`vu lsp`** speaks the Language Server Protocol on standard input and output: the compiler's
   error for each open file (re-checked on every change), and formatting with `vu fmt`.
 - **Other machines**: Vu runs on Linux on x86-64 and ARM64 (`tests/run_arm64.sh` runs the test
@@ -916,9 +933,16 @@ vu lsp                      # a language server for editors (diagnostics, format
 - **WebAssembly**: `tools/wasm.sh` builds the compiler itself for WASI (with zig): `vuc.wasm` runs
   `check` and `fmt` in a browser or any WASI runtime, with the standard library given as `/std`
   (`VU_STD=/std`). It's what the playground on vulang.org runs. `tests/run_wasm.sh` checks that it
-  gives the same errors and formatting as the native compiler on every targeted test. Building and
-  running programs there isn't possible (no processes, no C compiler), and a program nested more
-  than a few hundred levels deep runs out of a browser's stack.
+  gives the same errors and formatting as the native compiler on every targeted test. Building
+  programs there isn't possible (no C compiler), and a program nested more than a few hundred
+  levels deep runs out of a browser's stack.
+  `vu build --wasm app.vu` makes `app.wasm` for WASI (run it with `wasmtime app.wasm ARGS`, with
+  `--dir .` for files). It needs zig's C compiler (`pip install ziglang`, or `zig` on the PATH;
+  `VU_WASM_CC` names another). WASI has one thread and no sockets or processes, so a program that
+  uses tasks, channels, `Net`, `os.signals`, TLS or C files is refused (exit 2, with the reason);
+  `os.run` fails with "not available in WebAssembly", and too-deep recursion stops with the
+  runtime's trap instead of the "stack overflow" panic. `tests/run_wasm.sh` builds every example
+  and targeted output and panic test this way and checks they print what the native builds do.
 
 Every compile error comes from Vu's own front end, before the C compiler runs, so `vu check`
 gives the same errors as a build. For an edit-and-fix loop, `check` while fixing errors and
@@ -1022,12 +1046,20 @@ need github.com/someone/log v1.1.0 as slog        # imported as slog instead of 
   C in a new version stops the build until someone edits `vu.pkg` to allow it.
 - Two different modules can't have the same name (a package and a local file, say); import a
   package under another name with `as`.
+- **The registry** names packages: `need clock v1.2.0 os` (a name instead of a source) is the
+  package the registry lists as `clock`. Its index (`https://vulang.org/registry/index.txt`, or
+  `VU_REGISTRY`) records each version's commit and the SHA-256 of its files when it was published,
+  and `vu get` refuses a fetch that differs from them (a tag moved, or the host changed the files),
+  as Go's checksum database does. `vu search WORDS` lists packages; `vu add NAME [VERSION]` adds the
+  line to `vu.pkg`, granting the capabilities the registry says the package takes (it prints them),
+  then fetches it. `vu publish NAME VERSION [DIR] [fs net os ffi]`, in a package's repository, prints
+  the index lines for a tag; they go in by pull request to the index (github.com/vu0tran/vulang-web).
 
 ## The standard library
 
 Modules in `std/`, written in Vu, imported like any other module.
 
-**`time`**: dates in UTC from `os.time()` seconds.
+**`time`**: dates from `os.time()` seconds, in UTC and in time zones.
 
 ```
 import time
@@ -1035,7 +1067,21 @@ print(time.iso(os.time()))                # 2026-10-26T21:30:05.123Z
 print(time.http_date(os.time()))          # Mon, 26 Oct 2026 21:30:05 GMT
 let d = time.utc(t)                       # d.year, d.month, d.day, d.hour, d.minute, d.second, d.ms, d.weekday
 let t = time.parse_iso("2026-10-26T21:30:05+02:00")?    # RFC 3339 -> seconds; can fail
+let ny = time.zone(fs, "America/New_York")?             # from /usr/share/zoneinfo; can fail
+let l = time.local(ny, t)                 # l.date (a Date), l.offset (-14400), l.abbrev ("EDT"), l.dst
+print(time.iso_in(ny, t))                 # 2026-10-26T15:30:05.000-04:00
+let u = time.from_local(ny, time.Date(2026, 11, 1, 1, 30, 0, 0, 0))   # wall clock -> seconds
 ```
+
+- Zones come from the system's tz database files (TZif): `time.zone(fs, name)`, `time.local_zone(fs)`
+  for `/etc/localtime`, or `time.parse_tzif(name, bytes)` for a file you have (no capability).
+  `time.fixed(seconds, "ABC")` and `time.utc_zone()` need no file. After a file's last change
+  (usually 2037) its POSIX rule (`EST5EDT,M3.2.0,M11.1.0`) gives the changes.
+- `from_local` reads a wall-clock time that happens twice (clocks going back) as the first one, and
+  one that never happens (clocks going forward) with the offset from before the change: Python's
+  `fold=0`. Fields out of range roll over (month 13 is January of the next year).
+- `tests/run_time_zones.py` checks every zone against Python's `zoneinfo` around every change from
+  1800 to 2200, and broken files (refused with "is not a valid time zone file").
 
 **`heap`**: a priority queue kept in a list, ordered by a function that says whether a comes first.
 
@@ -1122,6 +1168,25 @@ fn main(net: Net) throws:
   (`ca`: PEM certificates to trust for https, `""` for the system's). It sends one request per
   connection and reads bodies by length, chunked, or until the connection closes (up to 64 MB).
   It returns redirects instead of following them.
+- A `Client` keeps connections open between requests and speaks HTTP/2 to https servers that
+  offer it (ALPN), else HTTP/1.1 with keep-alive:
+
+  ```
+  var client = http.client()
+  let r = client.fetch(net, http.req("GET", "https://api.example.com/items"))?
+  var post = http.req("POST", "https://api.example.com/items")
+  post.body = to_json(item)
+  post.headers.push(http.Header("Content-Type", "application/json"))
+  let r2 = client.fetch(net, post)?        # on the same connection
+  ```
+
+  It keeps up to `client.max_idle` open connections (8; the least recently used is closed first);
+  `client.http2 = false` turns HTTP/2 off, and `client.opened` and `client.reused` count. A kept
+  connection the server has closed or is closing (GOAWAY) is noticed before use; a request that
+  still fails because of it, or that an HTTP/2 server refused, goes once more on a new connection
+  if it's safe to repeat (GET, HEAD, OPTIONS, TRACE, PUT, DELETE, or with an `Idempotency-Key`
+  header). One request at a time per client (several tasks: one client each).
+  `net.tls_connect(..., alpn: "h2,http/1.1")` and `net.protocol(conn)` are what it uses.
 
 **`web`**: an app on top of `http`: routes, middleware, forms, cookies, static files and HTML
 templates.
@@ -1185,6 +1250,26 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   folder (`..`, encoded or not), hidden files (a part starting with `.`), a NUL or a backslash get 404;
   a name ending in `/` gets its `index.html`. Each file has a `Content-Type` by its extension, `nosniff`,
   and an ETag, and `If-None-Match` gets 304. Symbolic links inside the folder are followed.
+- WebSockets: `web.websocket(&app, path, handler)` (the same patterns as `get`). The handshake passes
+  the middleware like any request (which can refuse it: 401...), then the handler gets the open
+  socket to own, with the request and the context, and has the connection until it returns:
+
+  ```
+  fn chat(net: Net, own s: ws.Socket, req: http.Request, c: web.Ctx):
+    var sock = s
+    ws.send_text(net, &sock, "hello " + web.param(c, "room")) else return
+    while true:
+      let m = ws.poll(net, &sock, 0.05) else return     # nil if nothing came in 50 ms
+      # ... handle m, then send what other tasks queued for this socket on a channel
+  app.websocket("/rooms/:room", own fn(own s, req, c) => chat(net, s, req, c))
+  app.allow_origin("https://other.example")    # pages there may open these sockets too
+  ```
+
+  A browser page from another origin is refused (403), since any site's page could otherwise
+  open a socket that carries the user's cookies; requests with no `Origin` (not from a browser)
+  are let in. `web.serve_tls` serves an app over TLS (HTTP/2 for browsers that offer it;
+  WebSockets use HTTP/1.1). `http.Site` is what makes this work: a handler, and a function that
+  takes over the connection when the handler answers 101 (`http.serve_site`).
 - `tests/run_web.sh` checks routes, forms, escaping and cookies against a Python model on random
   input, and an app against hostile requests (including 400 random paths that try to leave the
   static folder), under the sanitizers and ThreadSanitizer.
@@ -1271,7 +1356,9 @@ It takes `--name value`, `--name=value`, `-n value`, `-nvalue`, `-abc` (short fl
 **`ws`**: WebSockets (RFC 6455), server (`ws.accept(net, c)` on a connection from `net.accept`) and
 client (`ws.connect(net, "ws://..." or "wss://...")`); `ws.recv` returns whole messages (`Text`,
 `Binary` or `Closed`), answering pings and closes itself; `ws.send_text`, `ws.send_binary`,
-`ws.ping`, `ws.close`. Text is checked to be UTF-8; messages are limited to 16 MB. `ws.connect_ca`
+`ws.ping`, `ws.close`; `ws.poll(net, &s, seconds)` is `recv` that gives nil if no message starts
+arriving in that time, so a handler can do other work in between (`ws.accept_request` does the
+handshake for a request http already read). Text is checked to be UTF-8; messages are limited to 16 MB. `ws.connect_ca`
 checks a `wss://` server against given certificates instead of the system's. Over TLS, give
 `ws.accept` connections from a `net.tls_listen` listener. `tests/run_ws.py` tests it against
 Python's `websockets` and against broken frames.
@@ -1287,8 +1374,8 @@ once, 10 MB per request body and 20 MB of unfinished bodies per connection, and 
 answered in turn, cancelling streams ("rapid reset") starts no more work than sending requests
 would. `tests/run_h2.py` runs these attacks, and checks against `httpx`.
 
-**`pg`**: a PostgreSQL client over `Net`: SCRAM-SHA-256 or plain-password sign-in, parameterized
-queries, text results.
+**`pg`**: a PostgreSQL client over `Net`: SCRAM-SHA-256 or plain-password sign-in, TLS,
+parameterized queries, text results.
 
 ```
 import pg
@@ -1305,10 +1392,34 @@ let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows
 - `query` and `exec` fail with a `pg.Error`: `Server(code, message, detail)` (code is the SQLSTATE,
   such as `23505` for a unique violation), `Network`, `Auth` or `Protocol`; `pg.describe(e)` makes
   a message. After a server error the connection is still usable; after a network error it isn't.
+- TLS: set `cfg.tls = true` (as `sslmode=verify-full`: the server's certificate must be valid and
+  for `cfg.host`), and `cfg.ca` to PEM text to trust instead of the system's certificates
+  (`cfg.ca = fs.read("server-ca.pem")?`). A server that says it doesn't do TLS is refused, and so
+  are bytes it sends before the handshake (they'd be read as if they came over TLS). `tests/run_pg_tls.py`
+  runs a fake server with a test CA, a certificate for another host, a self-signed one, and these.
+  `net.start_tls(&conn, host, ca:, timeout:)` is what it uses: TLS on a connection already open.
 - One query at a time per connection: for several tasks, keep connections in a `Chan[pg.Db]` and
-  take one for each query. Not yet: TLS to the server, `COPY`, `LISTEN`/`NOTIFY`, MD5 passwords.
+  take one for each query. Not yet: `COPY`, `LISTEN`/`NOTIFY`, MD5 passwords.
   `tests/run_pg.sh` runs it against a real PostgreSQL.
+
+**`sqlite`**: SQLite databases (a file, or `":memory:"`) through the sqlite3 C library, so it takes
+the `Ffi` capability, and libsqlite3 where the program is built.
+
+```
+import sqlite
+var db = sqlite.open(ffi, "app.db")?
+sqlite.exec(ffi, &db, "create table if not exists users (id integer primary key, name text)", [])?
+let n = sqlite.exec(ffi, &db, "insert into users (name) values (?)", ["ada"])?   # rows changed
+let id = sqlite.last_id(ffi, db)
+let rows = sqlite.query(ffi, &db, "select id, name from users where id > ?", ["0"])?
+for r in 0..rows.count:
+  print(sqlite.text(rows, r, "name") else "")     # nil for NULL
+```
+
+- As with `pg`, the SQL is a `const` parameter and values go as parameters (`?`), as text (`nil`
+  is NULL); `get_int` and `get_float` read a column as a number. One statement per call; errors
+  are SQLite's message. `tests/run_sqlite.sh` checks it against Python's sqlite3 module.
 
 ## Not in v0
 
-Unicode normalization and character classes, generic interfaces, TLS to PostgreSQL.
+Unicode normalization and character classes, generic interfaces.

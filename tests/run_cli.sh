@@ -91,5 +91,14 @@ printf 'fn main(os: Os) throws:\n  let s = os.read_stdin()?\n  print("{s.len}")\
 out=$(head -c 200000 /dev/zero | $VU run "$work/rd.vu" 2>&1); rc=$?
 [ $rc -eq 0 ] && [ "$out" = "200000" ]; check "os.read_stdin(): all of standard input" $? "rc=$rc out=[$out]"
 
+# --wasm refuses what WebAssembly (WASI) can't do, before any C compiler runs
+printf 'fn main(net: Net) throws:\n  let c = net.connect("x", 1)?\n' > "$work/wn.vu"
+: > "$work/cc.log"; out=$($VU build --wasm "$work/wn.vu" -o "$work/wn.wasm" 2>&1); rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q "need threads and sockets" && [ ! -e "$work/wn.wasm" ]
+check "build --wasm: a program using the network is refused (exit 2)" $? "rc=$rc out=[$out]"
+out=$($VU run --wasm "$work/ok.vu" 2>&1); rc=$?
+[ $rc -eq 2 ] && echo "$out" | grep -q "builds a .wasm file"
+check "run --wasm: refused, with how to run a .wasm file" $? "rc=$rc out=[$out]"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

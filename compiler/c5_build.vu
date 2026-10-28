@@ -479,7 +479,7 @@ fn build(var g: G, items: [Node]) -> Str:
       if r == "void": rk = ""
       out.push("static inline " + r + " vu_call_" + mg(g, t) + "(vu_fn f" + decl + ") {{ " + rk + "((" + r + " (*)(void *" + ps + "))f.fn)(f.env" + cargs + "); }}")
       # (a comparison, fn(T, T) -> Bool, as xs.sort(by: ...) calls it)
-      if f.params.len == 2 and f.params[0] == f.params[1] and f.ret == "Bool" and not f.fails:
+      if f.params.len == 2 and f.params[0] == f.params[1] and f.params[0][0] != '^' and f.ret == "Bool" and not f.fails:
         let pt = f.params[0]
         var x = "(" + ct(g, pt) + " *)x"
         var y = "(" + ct(g, pt) + " *)y"
@@ -503,7 +503,7 @@ fn build(var g: G, items: [Node]) -> Str:
     var decl = ""
     var targs: [Str] = []
     for i in 0..tps.len:
-      decl += ", " + pdecl(g, tps[i].ty, "a{i}")
+      decl += ", " + param_c(g, tps[i], "a{i}")
       targs.push("a{i}")
     var rk = "return "
     if r == "void": rk = ""
@@ -1190,6 +1190,16 @@ fn utf8_error(s: Str) -> Int:
     i += n + 1
   return -1
 
+# The C compiler for --wasm: VU_WASM_CC (split at spaces), else zig cc, else python3 -m ziglang cc.
+fn wasm_cc(os: Os) -> [Str]:
+  let env = os.env("VU_WASM_CC")
+  if env != "": return env.split()
+  let z = os.output(["zig", "version"]) else ""
+  if z != "": return ["zig", "cc"]
+  let pz = os.output(["python3", "-m", "ziglang", "version"]) else ""
+  if pz != "" and not ("No module" in pz): return ["python3", "-m", "ziglang", "cc"]
+  return []
+
 # The release: tagged v0.1.0 in git. Change it with the tag.
 fn vu_version() -> Str:
   return "0.1.0"
@@ -1271,6 +1281,41 @@ fn main(fs: Fs, os: Os):
   if argv.len >= 2 and (argv[1] == "version" or argv[1] == "--version"):
     print("vu " + vu_version())
     exit(0)
+  if argv.len >= 2 and argv[1] == "search":
+    var words: [Str] = []
+    for i in 2..argv.len: words.push(argv[i] + "")
+    match reg_search(os, words):
+      ok(n): exit(0)
+      err(e):
+        eprint("vu: " + e)
+        exit(1)
+  if argv.len >= 2 and argv[1] == "add":
+    # vu add NAME [VERSION]: a package from the registry, into vu.pkg, then vu get
+    if argv.len < 3 or argv.len > 4:
+      eprint("vu add NAME [VERSION]: adds a package from the registry to vu.pkg (vu search lists them)")
+      exit(2)
+    var version = ""
+    if argv.len == 4: version = argv[3] + ""
+    match reg_add(fs, os, argv[2], version):
+      ok: exit(0)
+      err(e):
+        eprint("vu: " + e)
+        exit(1)
+  if argv.len >= 2 and argv[1] == "publish":
+    # vu publish NAME VERSION [DIR] [fs net os ffi]: the registry's lines for a tagged package
+    if argv.len < 4:
+      eprint("vu publish NAME VERSION [DIR] [fs net os ffi]: prints the lines that add a package's tagged version to the registry")
+      exit(2)
+    var dir = "."
+    var caps: [Str] = []
+    for i in 4..argv.len:
+      if is_cap_word(argv[i]): caps.push(argv[i] + "")
+      else: dir = argv[i] + ""
+    match reg_publish(fs, os, argv[2], argv[3], dir, caps):
+      ok: exit(0)
+      err(e):
+        eprint("vu: " + e)
+        exit(1)
   if argv.len >= 2 and argv[1] == "get":
     # vu get [FILE.vu]: fetch the packages in vu.pkg (beside FILE, or here) and write vu.lock
     var from = "main.vu"
@@ -1300,6 +1345,8 @@ fn main(fs: Fs, os: Os):
   var tsan = false
   var timing = false
   var static = false
+  var wasm = false
+  var profile = false
   var checks = false
   var index = false
   var path = ""
@@ -1325,9 +1372,11 @@ fn main(fs: Fs, os: Os):
     elif a == "--index" and cmd == "check":
       index = true
       i += 1
-    elif a == "--debug" or a == "--release" or a == "--json" or a == "--malloc" or a == "--san" or a == "--san-pool" or a == "--tsan" or a == "--time" or a == "--static":
+    elif a == "--debug" or a == "--release" or a == "--json" or a == "--malloc" or a == "--san" or a == "--san-pool" or a == "--tsan" or a == "--time" or a == "--static" or a == "--wasm" or a == "--profile":
       if a == "--debug": debug = true
+      elif a == "--profile": profile = true
       elif a == "--static": static = true
+      elif a == "--wasm": wasm = true
       elif a == "--release": release = true
       elif a == "--json": json = true
       elif a == "--malloc": malloc = true
@@ -1400,6 +1449,7 @@ fn main(fs: Fs, os: Os):
   if out == "":
     if cmd == "build": out = without_ext(path)
     else: out = work + "/prog"
+    if wasm: out += ".wasm"
   # what's left in the temporary folder (the C, a binary for run) goes on every way out
   var temps: [Str] = []
   if emit_c == "": temps.push(cfile + "")
@@ -1415,11 +1465,51 @@ fn main(fs: Fs, os: Os):
   var cc = os.env("CC")
   if cc == "": cc = "cc"
   var argl = [cc, "-std=gnu11", "-fwrapv", "-fno-math-errno", "-fno-trapping-math", "-ffp-contract=off", "-w"]
+  if wasm:
+    # WebAssembly (WASI), with zig's C compiler: one thread, no processes, no sockets
+    var why = ""
+    if cmd != "build": why = "--wasm builds a .wasm file (vu build --wasm FILE.vu); run it with a WASI runtime such as wasmtime"
+    elif profile: why = "--profile samples with a timer signal, which WebAssembly (WASI) doesn't have"
+    elif csrc.find("#define VU_MT 1", 0) >= 0: why = "this program uses tasks, channels, the network or os.signals, which need threads and sockets: WebAssembly (WASI) has neither"
+    elif has_ext: why = "extern C files aren't built for WebAssembly"
+    elif links.len > 0: why = "this program uses TLS (through OpenSSL) or C libraries, which aren't built for WebAssembly"
+    var zcc: [Str] = []
+    if why == "":
+      zcc = wasm_cc(os)
+      if zcc.len == 0: why = "--wasm needs zig's C compiler (pip install ziglang, or zig on PATH; VU_WASM_CC to name another)"
+    if why != "":
+      eprint("vu: " + why)
+      clean_up(fs, work, temps)
+      exit(2)
+    argl = zcc
+    for f in ["-target", "wasm32-wasi", "-std=gnu11", "-fwrapv", "-fno-math-errno", "-fno-trapping-math", "-ffp-contract=off", "-w", "-O2"]: argl.push(f)
+    for d in ["SIGNAL", "PROCESS_CLOCKS", "GETPID", "MMAN"]: argl.push("-D_WASI_EMULATED_" + d)
+    if json: argl.push("-DVU_JSON_PANIC")
+    if malloc: argl.push("-DVU_MALLOC")
+    argl.push(cfile + "")
+    argl.push("-o")
+    argl.push(out + "")
+    for d in ["signal", "process-clocks", "getpid", "mman"]: argl.push("-lwasi-emulated-" + d)
+    argl.push("-Wl,-z,stack-size=16777216")
+    let wrc = os.run(argl) else 127
+    clean_up(fs, work, temps)
+    if wrc != 0:
+      eprint("vu: the WebAssembly build failed (exit {wrc})")
+      exit(3)
+    exit(0)
   # `run` is the edit-and-test loop, so it builds unoptimized (several times faster to compile)
   # unless asked for --release; `build` makes the optimized binary unless asked for --debug.
-  let quick = debug or (cmd == "run" and not release)
+  let quick = (debug or (cmd == "run" and not release)) and not profile
   # Quick builds also keep the shadow call stack that gives panics a backtrace.
-  if quick:
+  if profile:
+    # optimized, with the shadow call stack, which the profiler samples
+    argl.push("-O2")
+    argl.push("-DVU_TRACE")
+    argl.push("-DVU_PROF")
+    var march = "native"
+    if os.env("VU_MARCH") != "" or os.env("CC").endswith("-gcc"): march = os.env("VU_MARCH")
+    if march != "": argl.push(native_flag(os, march))
+  elif quick:
     argl.push("-O0")
     argl.push("-g")
     argl.push("-DVU_TRACE")

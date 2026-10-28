@@ -115,5 +115,55 @@ if [ -e "$work/pwned" ] || [ -e "$work/pwned2" ]; then fail=$((fail+1)); echo "F
 mkdir -p "$work/src/linky.git" && (cd "$work/src/linky.git" && $G init -q && printf 'fn f() -> Int:\n  return 1\n' > linky.vu && ln -s /etc/passwd secret.vu && ln -s . loop && $G add -A && $G commit -qm l && $G tag v1.0.0)
 printf 'need git+file://%s/src/linky.git v1.0.0\n' "$work" > vu.pkg
 check "a package with symbolic links refused" "contains symbolic links" $VU get main.vu
+# ---- the registry: vu publish, search, add; vu get checks commit and files against it
+repo clock v1.0.0 clock.vu 'fn now(os: Os) -> Float:
+  return os.clock()
+fn label() -> Str:
+  return "one"'
+repo clock v1.1.0 clock.vu 'fn now(os: Os) -> Float:
+  return os.clock()
+fn label() -> Str:
+  return "one.one"'
+dev="$work/clockdev"; git clone -q "file://$work/src/clock.git" "$dev"
+pub=$($VU publish clock v1.0.0 "$dev" os 2>/dev/null)
+pub2=$($VU publish clock v1.1.0 "$dev" os 2>/dev/null)
+check "publish: the package line, from the origin" "package clock file://$work/src/clock.git" printf '%s' "$pub"
+check "publish: a version line with commit and hash" "version clock v1.0.0 $(git -C "$dev" rev-parse v1.0.0) " printf '%s' "$pub"
+check "publish: an unknown tag" "no tag v3.0.0" $VU publish clock v3.0.0 "$dev"
+reg="$work/index.txt"
+{ echo "# test registry"; printf '%s\n' "$pub" | sed 's/^about clock .*/about clock Clocks, and a label/'; printf '%s\n' "$pub2" | grep '^version'; } > "$reg"
+export VU_REGISTRY="file://$reg"
+check "search: by a word of the description" "clock v1.1.0  os  Clocks, and a label" $VU search label
+check "search: nothing" "no package in the registry matches" $VU search zebra
+app2="$work/app2"; mkdir -p "$app2"; cd "$app2"
+printf 'import clock\nfn main(os: Os):\n  print(clock.label() + " {clock.now(os) >= 0.0}")\n' > main.vu
+check "add: the latest version, with the capabilities it takes" "added 'need clock v1.1.0 os'" $VU add clock
+check "add: vu.pkg has the line" "need clock v1.1.0 os" cat vu.pkg
+check "add: vu.lock has it" "clock v1.1.0 $(git -C "$dev" rev-parse v1.1.0)" cat vu.lock
+check "add: it runs" "one.one true" $VU run main.vu
+check "add: twice" "already has clock" $VU add clock
+check "add: no such package" "no package named 'nope'" $VU add nope
+check "add: no such version" "no version v9.9.9" $VU add clock v9.9.9
+check "add: not a registry name" "isn't a registry name" $VU add Clock
+printf 'need clock v1.0.0 os\n' > vu.pkg
+check "need NAME VERSION: an older version" "wrote" $VU get main.vu
+check "...which runs" "one true" $VU run main.vu
+# the tag moves to another commit: what's fetched isn't what the registry recorded
+(cd "$work/src/clock.git" && printf 'fn now(os: Os) -> Float:\n  return 0.0\nfn label() -> Str:\n  return "evil"\n' > clock.vu && $G commit -qam evil && $G tag -f v1.0.0 >/dev/null 2>&1)
+rm -rf "$VU_PKG_DIR"/clock@*
+check "a moved tag is refused" "isn't what the registry recorded" $VU get main.vu
+[ ! -e "$VU_PKG_DIR/clock@v1.0.0" ] && { pass=$((pass+1)); echo "ok    ...and nothing of it is kept"; } || { fail=$((fail+1)); echo "FAIL  the refused package stayed in the cache"; }
+sed 's/^\(version clock v1.1.0 [0-9a-f]*\) [0-9a-f]*/\1 0000000000000000000000000000000000000000000000000000000000000000/' "$reg" > "$work/badhash.txt"
+printf 'need clock v1.1.0 os\n' > vu.pkg
+rm -rf "$VU_PKG_DIR"/clock@*
+check "files that don't match the recorded hash are refused" "isn't what the registry recorded" env VU_REGISTRY="file://$work/badhash.txt" $VU get main.vu
+for bad in 'package clock --upload-pack=x' 'package Clock file:///x' 'version clock v1.0.0 abc def' 'about nope hi' 'frob clock' "package clock file:///x
+package clock file:///y"; do
+  printf '%s\n' "$bad" > "$work/bad.txt"
+  check "a broken registry line refused: $(printf '%s' "$bad" | head -1)" "bad.txt:" env VU_REGISTRY="file://$work/bad.txt" $VU search
+done
+check "a registry URL that isn't https or file" "must be an https:// or file:// URL" env VU_REGISTRY="http://example.com/i" $VU search
+unset VU_REGISTRY
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

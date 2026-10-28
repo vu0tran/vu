@@ -21,13 +21,17 @@
 # plain connection from net.accept; to serve HTTP and WebSockets on one port, route in your own
 # accept loop.
 
+import http
+
 type Socket:
   conn: Conn?      # nil once closed
   buf: Str
   at: Int
   client: Bool     # this side is the client: its frames are masked
   closed: Bool
-  timeout: Float
+  timeout: Float   # seconds recv waits for each piece (300)
+  part: Str        # a fragmented message so far (kept across a poll that timed out)
+  part_op: Int     # its opcode (0: none in progress)
 
 type Msg:
   Text(text: Str)
@@ -73,7 +77,24 @@ fn accept(net: Net, own c: Conn) -> Socket throws:
     fail "not a WebSocket handshake"
   let accept_key = accept_of(key)
   net.send(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept_key + "\r\n\r\n")?
-  return Socket(c, rest, 0, false, false, 300.0)
+  return Socket(c, rest, 0, false, false, 300.0, "", 0)
+
+# The server's side of the handshake for a request that http has already read (web's ws routes use
+# it): rest is what arrived after the request. A request that isn't a WebSocket handshake is answered
+# with 400 and fails.
+fn accept_request(net: Net, own c: Conn, req: http.Request, rest: Str) -> Socket throws:
+  let key = http.header(req, "sec-websocket-key") else ""
+  let up = http.header(req, "upgrade") else ""
+  let conn_h = http.header(req, "connection") else ""
+  var ok = req.method == "GET" and req.version == "HTTP/1.1" and up.lower() == "websocket" and "upgrade" in conn_h.lower()
+  if (http.header(req, "sec-websocket-version") else "") != "13": ok = false
+  let raw = b64decode(key) else ""
+  if raw.len != 16: ok = false
+  if not ok:
+    net.send(c, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", timeout: 10.0) else 0
+    fail "not a WebSocket handshake"
+  net.send(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept_of(key) + "\r\n\r\n", timeout: 30.0)?
+  return Socket(c, rest + "", 0, false, false, 300.0, "", 0)
 
 # The client's side: ws://host[:port]/path or wss://host[:port]/path (checked against the system's
 # certificates).
@@ -113,7 +134,7 @@ fn connect_ca(net: Net, url: Str, ca: Str) -> Socket throws:
     let head = read_head(net, c, &extra, 30.0)?
     if not head.startswith("HTTP/1.1 101"): fail "the server didn't switch to WebSocket: " + head[0..max(0, head.find("\r\n"))]
     if header_value(head, "sec-websocket-accept") != accept_of(key): fail "the server's Sec-WebSocket-Accept is wrong"
-  return Socket(conn, extra, 0, true, false, 300.0)
+  return Socket(conn, extra, 0, true, false, 300.0, "", 0)
 
 # ---- frames
 
@@ -180,8 +201,6 @@ fn need(net: Net, var s: Socket, n: Int) throws:
 
 # The next whole message. Control frames in between are handled here.
 fn recv(net: Net, var s: Socket) -> Msg throws:
-  var msg = ""
-  var msg_op = 0
   while true:
     if s.conn == nil: return Closed(1006, "the connection is closed")
     need(net, &s, 2)?
@@ -206,7 +225,7 @@ fn recv(net: Net, var s: Socket) -> Msg throws:
         len = (len << 8) | int(s.buf[s.at + k])
       hdr = 10
     if op >= 8 and (len > 125 or not fin): return fail_with(net, &s, 1002, "a control frame over 125 bytes, or fragmented")
-    if len > MAX_MESSAGE or msg.len + len > MAX_MESSAGE: return fail_with(net, &s, 1009, "a message over 16 MB")
+    if len > MAX_MESSAGE or s.part.len + len > MAX_MESSAGE: return fail_with(net, &s, 1009, "a message over 16 MB")
     var mk = 0
     if masked: mk = 4
     need(net, &s, hdr + mk + len)?
@@ -234,15 +253,38 @@ fn recv(net: Net, var s: Socket) -> Msg throws:
       continue
     if op == 10: continue
     if op == 0:
-      if msg_op == 0: return fail_with(net, &s, 1002, "a continuation frame with nothing to continue")
+      if s.part_op == 0: return fail_with(net, &s, 1002, "a continuation frame with nothing to continue")
     elif op == 1 or op == 2:
-      if msg_op != 0: return fail_with(net, &s, 1002, "a new message before the last one ended")
-      msg_op = op
+      if s.part_op != 0: return fail_with(net, &s, 1002, "a new message before the last one ended")
+      s.part_op = op
     else:
       return fail_with(net, &s, 1002, "unknown opcode {op}")
-    msg += payload
+    s.part += payload
     if fin:
-      if msg_op == 1:
+      var msg = ""
+      swap(&msg, &s.part)
+      let mop = s.part_op
+      s.part_op = 0
+      if mop == 1:
         if not msg.is_utf8(): return fail_with(net, &s, 1007, "text that isn't UTF-8")
         return Text(msg)
       return Binary(msg)
+
+# recv, if a message starts arriving within seconds: nil if nothing came in that time. Between polls a
+# handler can do other work, such as sending what other tasks queued for this socket on a channel.
+# (Once a frame has begun, the rest is waited for as recv waits, up to s.timeout for each piece.)
+fn poll(net: Net, var s: Socket, seconds: Float) -> Msg? throws:
+  if s.buf.len == s.at:
+    if s.conn == nil: return Closed(1006, "the connection is closed")
+    var more = ""
+    var why = ""
+    if c = s.conn:
+      match net.recv(c, timeout: seconds):
+        ok(d): more = d + ""
+        err(e): why = e
+    if why == "timed out": return nil
+    if why != "": fail why
+    if more.len == 0: fail "the connection closed"
+    s.buf += more
+  let m = recv(net, &s)?
+  return m

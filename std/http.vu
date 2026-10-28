@@ -31,7 +31,7 @@
 #       let c = net.accept(l) else continue
 #       spawn handle(net, c)
 #
-# A client makes one request per connection:
+# A client: http.get, post and send make one request per connection; a Client keeps them open:
 #
 #   let resp = http.get(net, "https://example.com/")?
 #   print("{resp.status} {resp.body.len} bytes")
@@ -686,46 +686,67 @@ fn get(net: Net, url: Str) -> Response throws:
 fn post(net: Net, url: Str, content_type: Str, body: Str) -> Response throws:
   return send(net, ClientRequest("POST", url + "", [Header("Content-Type", content_type + "")], body + "", 30.0, ""))?
 
-# Sends the request on a new connection ("Connection: close") and reads the whole response.
-fn send(net: Net, req: ClientRequest) -> Response throws:
-  let u = parse_url(req.url)?
+# The request line and headers for req to u (keep: no "Connection: close").
+fn request_head(u: Url, req: ClientRequest, keep: Bool) -> Str throws:
   for i in 0..req.method.len:
     if not is_tchar(req.method[i]): fail "the method '{req.method}' isn't a token"
-  var hostport = u.host + ""
-  for i in 0..u.host.len:
-    if u.host[i] == ':': hostport = "[" + u.host + "]"
-  if (u.tls and u.port != 443) or (not u.tls and u.port != 80): hostport += ":{u.port}"
-  var out = req.method + " " + u.target + " HTTP/1.1\r\nHost: " + hostport + "\r\n"
+  if req.method == "": fail "the method is empty"
+  var out = req.method + " " + u.target + " HTTP/1.1\r\nHost: " + host_port(u) + "\r\n"
   var has_ua = false
   for h in req.headers:
     check_header(h)?
     let n = lower_str(h.name)
-    if n == "host" or n == "content-length" or n == "connection" or n == "transfer-encoding":
-      fail "the header '{h.name}' is set by http.send"
+    if n == "host" or n == "content-length" or n == "connection" or n == "transfer-encoding" or n == "keep-alive" or n == "upgrade" or n == "te":
+      fail "the header '{h.name}' is set by the client"
     if n == "user-agent": has_ua = true
     out += h.name + ": " + h.value + "\r\n"
   if not has_ua: out += "User-Agent: vu-http\r\n"
   if req.body.len > 0 or req.method == "POST" or req.method == "PUT" or req.method == "PATCH":
     out += "Content-Length: {req.body.len}\r\n"
-  out += "Connection: close\r\n\r\n"
-  out += req.body
-  var conn: Conn? = nil
-  if u.tls and req.ca != "":
-    conn = net.tls_connect(u.host, u.port, ca: req.ca, timeout: req.timeout)?
-  elif u.tls:
-    conn = net.tls_connect(u.host, u.port, timeout: req.timeout)?
-  else:
-    conn = net.connect(u.host, u.port, timeout: req.timeout)?
-  if c = conn:
-    net.send(c, out, timeout: req.timeout)?
-    return read_response(net, c, req.method == "HEAD", req.timeout)?
-  fail "not connected"
+  if not keep: out += "Connection: close\r\n"
+  return out + "\r\n"
+
+# The Host header's value: the host, in brackets if it's an IPv6 address, and the port if not the default.
+fn host_port(u: Url) -> Str:
+  var hostport = u.host + ""
+  for i in 0..u.host.len:
+    if u.host[i] == ':': hostport = "[" + u.host + "]"
+  if (u.tls and u.port != 443) or (not u.tls and u.port != 80): hostport += ":{u.port}"
+  return hostport
+
+fn open_conn(net: Net, u: Url, ca: Str, alpn: Str, timeout: Float) -> Conn throws:
+  if u.tls and ca != "" and alpn != "": return net.tls_connect(u.host, u.port, ca: ca, alpn: alpn, timeout: timeout)?
+  if u.tls and ca != "": return net.tls_connect(u.host, u.port, ca: ca, timeout: timeout)?
+  if u.tls and alpn != "": return net.tls_connect(u.host, u.port, alpn: alpn, timeout: timeout)?
+  if u.tls: return net.tls_connect(u.host, u.port, timeout: timeout)?
+  return net.connect(u.host, u.port, timeout: timeout)?
+
+# Sends the request on a new connection ("Connection: close") and reads the whole response. To keep
+# connections open between requests, and for HTTP/2, use a Client.
+fn send(net: Net, req: ClientRequest) -> Response throws:
+  let u = parse_url(req.url)?
+  let out = request_head(u, req, false)? + req.body
+  let c = open_conn(net, u, req.ca, "", req.timeout)?
+  net.send(c, out, timeout: req.timeout)?
+  var keep = false
+  var got = false
+  return read_response_keep(net, c, req.method == "HEAD", req.timeout, &keep, &got)?
 
 fn read_response(net: Net, c: Conn, head: Bool, timeout: Float) -> Response throws:
+  var keep = false
+  var got = false
+  return read_response_keep(net, c, head, timeout, &keep, &got)?
+
+# Reads one response. keep says whether the connection can carry another request: HTTP/1.1, no
+# "Connection: close", the body's end known without the connection closing, nothing more after it.
+# got says whether any byte of a response arrived (if not, a request can be retried elsewhere).
+fn read_response_keep(net: Net, c: Conn, head: Bool, timeout: Float, var keep: Bool, var got: Bool) -> Response throws:
   var buf = ""
   var at = 0
   var closed = false
   var rs = Resume(0, 0, "", false)
+  keep = false
+  got = false
   while true:
     if buf.len > at or closed:
       var s = read_message(buf, at, MAX_CLIENT_BODY, head, true, closed, &rs)
@@ -742,6 +763,9 @@ fn read_response(net: Net, c: Conn, head: Bool, timeout: Float) -> Response thro
         swap(&headers, &s.headers)
         var body = ""
         swap(&body, &s.body)
+        keep = not closed and s.used == buf.len and s.start.startswith("HTTP/1.1 ")
+        for h in headers:
+          if h.name == "connection" and h.value.lower().find("close", 0) >= 0: keep = false
         return Response(status, headers, body)
     if buf.len - at > MAX_HEAD + MAX_CLIENT_BODY: fail "the response is too large"
     let d = net.recv(c, timeout: timeout)?
@@ -749,7 +773,166 @@ fn read_response(net: Net, c: Conn, head: Bool, timeout: Float) -> Response thro
       if closed or buf.len == 0: fail "the connection closed before a response arrived"
       closed = true
     else:
+      got = true
       buf += d
+
+# ---- a client that keeps connections open
+#   var client = http.client()
+#   let r = client.fetch(net, http.req("GET", "https://example.com/a"))?
+#   let r2 = client.fetch(net, http.req("GET", "https://example.com/b"))?   # the same connection
+# Connections stay open between requests (keep-alive), up to max_idle of them, and an https server
+# that offers HTTP/2 (ALPN) gets it. A request that fails because a kept connection had gone stale
+# (the server closed it, or went away) is sent again on a new one if it's safe to repeat: GET, HEAD,
+# OPTIONS, TRACE, PUT and DELETE, or a request with an Idempotency-Key header.
+
+type Client:
+  idle: [Idle]       # open connections, the most recently used last
+  max_idle: Int      # how many to keep open (8)
+  http2: Bool        # offer HTTP/2 to https servers (true)
+  opened: Int        # connections opened so far
+  reused: Int        # requests sent on a connection that was already open
+
+type Idle:
+  key: Str           # scheme, host, port and the CA it was checked against
+  conn: Conn?
+  h2: Bool
+  k: h2.Client2
+
+fn copy_response(r: Response) -> Response:
+  var hs: [Header] = []
+  for h in r.headers: hs.push(Header(h.name + "", h.value + ""))
+  return Response(r.status, hs, r.body + "")
+
+fn client() -> Client:
+  return Client([], 8, true, 0, 0)
+
+# A request with no headers or body, a 30 second timeout and the system's certificates.
+fn req(method: Str, url: Str) -> ClientRequest:
+  return ClientRequest(method + "", url + "", [], "", 30.0, "")
+
+fn repeatable(req: ClientRequest) -> Bool:
+  let m = req.method
+  if m == "GET" or m == "HEAD" or m == "OPTIONS" or m == "TRACE" or m == "PUT" or m == "DELETE": return true
+  return find_header_ci(req.headers, "idempotency-key") >= 0
+
+fn find_header_ci(hs: [Header], name: Str) -> Int:
+  for i in 0..hs.len:
+    if lower_str(hs[i].name) == name: return i
+  return -1
+
+# The most recently used open connection for key (its conn is nil if there's none).
+fn take_idle(var cl: Client, key: Str) -> Idle:
+  var out = Idle("", nil, false, h2.unused_client())
+  var i = cl.idle.len - 1
+  while i >= 0:
+    if cl.idle[i].key == key:
+      swap(&out, &cl.idle[i])
+      var keep: [Idle] = []
+      for j in 0..cl.idle.len:
+        if j != i:
+          var x = Idle("", nil, false, h2.unused_client())
+          swap(&x, &cl.idle[j])
+          keep.push(x)
+      cl.idle = keep
+      return out
+    i -= 1
+  return out
+
+fn put_idle(var cl: Client, own it: Idle):
+  if cl.max_idle <= 0: return
+  if cl.idle.len >= cl.max_idle:
+    var keep: [Idle] = []
+    for j in 1..cl.idle.len:
+      var x = Idle("", nil, false, h2.unused_client())
+      swap(&x, &cl.idle[j])
+      keep.push(x)
+    cl.idle = keep
+  cl.idle.push(it)
+
+# Closes every open connection.
+fn close_all(var cl: Client):
+  cl.idle = []
+
+# Whether a kept connection still looks usable: nothing has arrived on it (a close, or bytes no request asked for).
+fn still_open(net: Net, c: Conn) -> Bool:
+  match net.recv(c, timeout: 0.0):
+    ok(d): return false
+    err(e): return e == "timed out"
+
+# Sends the request, on an open connection to the same server if there is one, and reads the response.
+fn fetch(var cl: Client, net: Net, req: ClientRequest) -> Response throws:
+  let u = parse_url(req.url)?
+  let head = request_head(u, req, true)?
+  var scheme = "http"
+  if u.tls: scheme = "https"
+  let key = scheme + "://" + u.host + ":{u.port} " + req.ca
+  var tries = 0
+  while true:
+    tries += 1
+    var it = take_idle(&cl, key)
+    var cn: Conn? = nil
+    swap(&cn, &it.conn)
+    var reused = false
+    if c = cn:
+      if it.h2: reused = h2.client_ready(net, c, &it.k)
+      else: reused = still_open(net, c)
+    if not reused:
+      var alpn = ""
+      if u.tls and cl.http2: alpn = "h2,http/1.1"
+      let c = open_conn(net, u, req.ca, alpn, req.timeout)?
+      cl.opened += 1
+      var is_h2 = false
+      if alpn != "": is_h2 = net.protocol(c) == "h2"
+      var k = h2.unused_client()
+      if is_h2: k = h2.client_start(net, c, req.timeout)?
+      it = Idle(key + "", nil, is_h2, k)
+      cn = c
+    else:
+      cl.reused += 1
+    if it.h2:
+      var hs: [Header] = []
+      for h in req.headers:
+        let n = lower_str(h.name)
+        if n != "host": hs.push(Header(n, h.value + ""))
+      if find_header_ci(hs, "user-agent") < 0: hs.push(Header("user-agent", "vu-http"))
+      var why = ""
+      var retry = false
+      var resp = Response(0, [], "")
+      if c = cn:
+        match h2.request(net, c, &it.k, req.method, scheme, host_port(u), u.target, hs, req.body, req.timeout):
+          ok(r): resp = r
+          err(f):
+            match f:
+              Again(w):
+                why = w + ""
+                retry = true
+              Stop(w): why = w + ""
+      if why == "":
+        if not it.k.dead and not it.k.goaway:
+          swap(&cn, &it.conn)
+          put_idle(&cl, it)
+        return resp
+      if tries == 1 and (retry or (reused and repeatable(req))): continue
+      fail why
+    var why = ""
+    var keep = false
+    var got = false
+    var resp = Response(0, [], "")
+    if c = cn:
+      match net.send(c, head + req.body, timeout: req.timeout):
+        ok: why = ""
+        err(e): why = e
+      if why == "":
+        match read_response_keep(net, c, req.method == "HEAD", req.timeout, &keep, &got):
+          ok(r): resp = r
+          err(e): why = e
+    if why == "":
+      if keep:
+        swap(&cn, &it.conn)
+        put_idle(&cl, it)
+      return resp
+    if tries == 1 and reused and not got and repeatable(req): continue
+    fail why
 
 fn status_of(line: Str) -> Int throws:
   # "HTTP/1.1 200 OK"
@@ -768,14 +951,40 @@ fn status_of(line: Str) -> Int throws:
 # is done or grace seconds have passed.
 fn serve(net: Net, os: Os, port: Int, own handler: fn(Request) -> Response, grace: Float) throws:
   let l = net.listen(port)?
-  run_server(net, os, l, handler, grace)?
+  run_server(net, os, l, plain_site(handler), grace)?
 
-fn run_server(net: Net, os: Os, own l: Listener, own handler: fn(Request) -> Response, grace: Float) throws:
+# What a server does with requests: handle answers each one; when it answers with status 101
+# (Switching Protocols) and takes is true, the connection is given to take instead, with the request,
+# that response (which isn't sent: take answers) and the bytes that came after the request (a
+# WebSocket, say: web's ws routes work this way). HTTP/2 connections can't be taken over: a 101
+# there resets the stream.
+type Site:
+  handle: fn(Request) -> Response
+  takes: Bool
+  take: fn(own Conn, Request, Response, Str)
+
+fn plain_site(own handler: fn(Request) -> Response) -> Site:
+  return Site(handler, false, fn(own c: Conn, req: Request, resp: Response, rest: Str) => drop_conn(c))
+
+fn drop_conn(own c: Conn):
+  return
+
+# serve, with a Site (see Site).
+fn serve_site(net: Net, os: Os, port: Int, own site: Site, grace: Float) throws:
+  let l = net.listen(port)?
+  run_server(net, os, l, site, grace)?
+
+# serve_tls, with a Site.
+fn serve_tls_site(net: Net, os: Os, port: Int, cert: Str, key: Str, own site: Site, grace: Float) throws:
+  let l = net.tls_listen(port, cert: cert, key: key, alpn: "h2,http/1.1")?
+  run_server(net, os, l, site, grace)?
+
+fn run_server(net: Net, os: Os, own l: Listener, own site: Site, grace: Float) throws:
   let stop = os.signals()
   let stopping: Chan[Int] = chan(1)   # closed when the server stops: every task sees it
   let counts: Chan[Int] = chan(1)     # the accept loop's last word: how many connections are open
   let done: Chan[Int] = chan(4096)    # each connection's task sends 1 when it ends
-  spawn accept_loop(net, l, share(handler), stopping, done, counts)
+  spawn accept_loop(net, l, share(site), stopping, done, counts)
   let sig = stop.recv()?
   stopping.close()
   var open = counts.recv()?
@@ -790,9 +999,9 @@ fn run_server(net: Net, os: Os, own l: Listener, own handler: fn(Request) -> Res
 # speak HTTP/2 choose it through ALPN and are served by h2; the rest get HTTP/1.1.
 fn serve_tls(net: Net, os: Os, port: Int, cert: Str, key: Str, own handler: fn(Request) -> Response, grace: Float) throws:
   let l = net.tls_listen(port, cert: cert, key: key, alpn: "h2,http/1.1")?
-  run_server(net, os, l, handler, grace)?
+  run_server(net, os, l, plain_site(handler), grace)?
 
-fn accept_loop(net: Net, own l: Listener, own h: Shared[fn(Request) -> Response], own stopping: Chan[Int],
+fn accept_loop(net: Net, own l: Listener, own h: Shared[Site], own stopping: Chan[Int],
                own done: Chan[Int], own counts: Chan[Int]):
   var open = 0
   while not stopping.closed():
@@ -807,12 +1016,12 @@ fn accept_loop(net: Net, own l: Listener, own h: Shared[fn(Request) -> Response]
     open -= d
   counts.send(open)
 
-fn connection(net: Net, own c: Conn, own h: Shared[fn(Request) -> Response], own stopping: Chan[Int],
+fn connection(net: Net, own c: Conn, own h: Shared[Site], own stopping: Chan[Int],
               own done: Chan[Int]):
   answer(net, c, h, stopping)
   done.send(1)
 
-fn answer(net: Net, c: Conn, h: Shared[fn(Request) -> Response], stopping: Chan[Int]):
+fn answer(net: Net, own c: Conn, h: Shared[Site], stopping: Chan[Int]):
   var r = reader()
   # a client speaking HTTP/2 with prior knowledge starts with its preface: h2 serves it
   let pre = h2.preface()
@@ -827,7 +1036,11 @@ fn answer(net: Net, c: Conn, h: Shared[fn(Request) -> Response], stopping: Chan[
     match next(net, c, &r, 1.0):
       ok(req):
         quiet = 0
-        let resp = h.value(req)
+        let resp = h.value.handle(req)
+        if resp.status == 101 and h.value.takes:
+          let rest = r.buf[r.at..r.buf.len]
+          h.value.take(c, req, resp, rest)
+          return
         reply(net, c, req, resp) else return
         if not keep_alive(req): return
       err(e):

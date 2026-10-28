@@ -39,10 +39,13 @@ other tools are needed.
 ./vu build app.vu --san                  # with AddressSanitizer, UBSan and LeakSanitizer
 ./vu fmt app.vu                          # format in place
 ./vu test app_test.vu                    # run each fn test_... in its own process
+./vu run --profile app.vu                # optimized, then where the CPU time went
+./vu build --wasm app.vu                 # a WebAssembly (WASI) module, with zig
 ./vu help                                # every command and flag
 ```
 
-`vu lsp` gives editors the compiler's errors as you type, and formatting.
+`vu lsp` gives editors the compiler's errors as you type, formatting, hover, go to definition and
+completion.
 
 The language is described in [SPEC.md](SPEC.md), which is short and starts with examples. How the
 language was built, and every measurement along the way, is in [CHANGELOG.md](CHANGELOG.md).
@@ -253,6 +256,8 @@ need github.com/someone/slugify v0.3.1
 `vu get` fetches packages with git and records each one's commit and a hash of its files in
 `vu.lock`, which every build checks. A package gets only the capabilities its line grants: if a
 new version of `slugify` starts reading files or calling C, the build stops until you allow it.
+Packages in the registry go by name (`vu add clock` writes `need clock v1.2.0 os`), and `vu get`
+refuses one whose commit or files aren't what was published.
 
 ## The standard library
 
@@ -261,11 +266,11 @@ environment and signals (`Os`), TCP, TLS (OpenSSL) and DNS (`Net`), channels and
 hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (`split`, `join`,
 `strip`, `"{x:.3f}"`). Written in Vu, in `std/`:
 
-- `http`: an HTTP/1.1 and HTTP/2 server (HTTP/2 by prior knowledge or ALPN over TLS) and an HTTP/1.1
-  client;
+- `http`: an HTTP/1.1 and HTTP/2 server (HTTP/2 by prior knowledge or ALPN over TLS) and a client that
+  keeps connections open and speaks HTTP/2 to servers that offer it;
 - `web`: routes, middleware, forms, file uploads, cookies, static files and escaping HTML templates, on `http`;
-- `ws`: WebSockets, server and client;
-- `pg`: a PostgreSQL client (SCRAM-SHA-256, parameters only);
+- `ws`: WebSockets, server and client (and WebSocket routes in `web`);
+- `pg`: a PostgreSQL client (SCRAM-SHA-256, TLS, parameters only), and `sqlite` (through libsqlite3);
 - `re`: regular expressions with Python's syntax, in time linear in the text, and as fast as
   Python's on most patterns (faster on many: CHANGELOG.md, round 10);
 - `zlib`: zlib, gzip and raw DEFLATE decompression, the same results as Python's `zlib` (and zlib's
@@ -274,7 +279,8 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
   (CHANGELOG.md, rounds 12 and 13); and compression to the same formats, within 1% of C zlib's
   size at levels 6 and 9 in 1.6x its time (round 19);
 - `path` and `cli`: file paths as Python's `os.path` gives them, and command-line arguments;
-- `time`: UTC dates, ISO 8601 and HTTP dates, RFC 3339 parsing;
+- `time`: UTC dates, ISO 8601 and HTTP dates, RFC 3339 parsing, and time zones from the system's tz
+  database (the same answers as Python's zoneinfo for all 498 zones, 1800 to 2200);
 - `log`: timestamped or JSON log lines;
 - `heap`: a priority queue in a list, ordered by any comparison.
 
@@ -350,7 +356,8 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 ## Limits
 
 - Linux on x86-64 and ARM64. The compiler also builds to WebAssembly (`tools/wasm.sh`), where it
-  checks and formats but can't build or run programs: that's the playground on vulang.org.
+  checks and formats but can't build programs: that's the playground on vulang.org. Programs build
+  to WebAssembly (WASI) with `vu build --wasm` if they use no tasks, sockets, processes or C.
 - macOS (kqueue) builds for ARM64 and x86-64 but hasn't been run on a
   Mac.
 - Strings are bytes. Text functions (`chars()`, `upper()`, `ord`...) read them as UTF-8; there is

@@ -52,7 +52,15 @@ static bool vu_json;   /* report panics as JSON (vu run --json, or VU_PANIC=json
 typedef struct vu_frame { const char *name; int loc; struct vu_frame *prev; } vu_frame;
 static __thread vu_frame *vu_top;
 static inline void vu_leave(vu_frame *f) { vu_top = f->prev; }
-#ifdef VU_TRACE
+#if defined(VU_TRACE) && defined(VU_PROF)
+/* (the profiler's signal handler reads the frames: each must be complete before vu_top points at it,
+   and the optimizer must keep the stores to vu_top, which no code it can see reads) */
+static inline void vu_leave_prof(vu_frame *f) { __asm__ volatile("" ::: "memory"); vu_top = f->prev; }
+#define VU_ENTER(n) vu_frame vu_fr __attribute__((cleanup(vu_leave_prof))) = {n, 0, vu_top}; __asm__ volatile("" ::: "memory"); vu_top = &vu_fr; __asm__ volatile("" ::: "memory")
+#define VU_AT(l) (*(volatile int *)&vu_fr.loc = (l))   /* (a store the optimizer keeps: the signal reads it) */
+#define VU_PAR_TOP(t) vu_frame *const t = vu_top
+#define VU_PAR_JOIN(t) (vu_top = (t))
+#elif defined(VU_TRACE)
 #define VU_ENTER(n) vu_frame vu_fr __attribute__((cleanup(vu_leave))) = {n, 0, vu_top}; vu_top = &vu_fr
 #define VU_AT(l) (vu_fr.loc = (l))
 /* par loop worker threads chain their calls to the frame of the function running the loop */
@@ -1030,6 +1038,159 @@ static void vu_thread_guard(void);
    still count as reachable for LeakSanitizer. */
 /* (main returning takes the report lock first, as exit() does: a task that is panicking meanwhile
    then ends the program with its panic and 101, not 0) */
+#ifdef VU_PROF
+/* vu build --profile: every 1 ms of CPU time (any thread), SIGPROF records the running thread's shadow
+   call stack (the VU_TRACE frames: function names and the line each is at). At exit the samples are
+   counted by function (self: the innermost frame; total: anywhere in the stack) and by line, summed
+   up on stderr, and written out in full to vu-profile.txt and, one stack per line, to
+   vu-profile.folded (for flamegraph.pl or speedscope). */
+#include <sys/time.h>
+#define VU_PROF_DEPTH 40
+#define VU_PROF_MAX 65536
+typedef struct { const char *name; int loc; } vu_pf;
+static vu_pf *vu_prof_rows;
+static unsigned char *vu_prof_depth;
+static int vu_prof_taken;
+static int vu_prof_hz = 1000;
+static void vu_prof_tick(int sig) {
+    (void)sig;
+    int saved = errno;
+    int i = __atomic_fetch_add(&vu_prof_taken, 1, __ATOMIC_RELAXED);
+    if (i < VU_PROF_MAX) {
+        vu_pf *row = vu_prof_rows + (size_t)i * VU_PROF_DEPTH;
+        int d = 0;
+        for (vu_frame *f = vu_top; f && d < VU_PROF_DEPTH; f = f->prev) { row[d].name = f->name; row[d].loc = f->loc; d++; }
+        vu_prof_depth[i] = (unsigned char)d;
+    }
+    errno = saved;
+}
+typedef struct { const char *name; int loc; int64_t self, total; int seen; } vu_pent;
+/* open addressing on (name, loc); loc -1 for a whole function */
+static vu_pent *vu_prof_slot(vu_pent *t, size_t cap, const char *name, int loc) {
+    size_t h = ((size_t)(uintptr_t)name * 0x9E3779B97F4A7C15ull) ^ ((size_t)(uint32_t)loc * 0xC2B2AE3D27D4EB4Full);
+    for (size_t k = 0; k < cap; k++) {
+        vu_pent *e = &t[(h + k) & (cap - 1)];
+        if (!e->name) { e->name = name; e->loc = loc; e->seen = -1; return e; }
+        if (e->name == name && e->loc == loc) return e;
+    }
+    return NULL;
+}
+static void vu_prof_where(char *out, size_t n, int loc) {
+    int fi = (loc >> 24) & 255, line = loc & 0xFFFFFF;
+    const char *file = vu_files && vu_files[fi] ? vu_files[fi] : "?";
+    const char *slash = strrchr(file, '/');
+    snprintf(out, n, "%s:%d", slash ? slash + 1 : file, line);
+}
+static int vu_prof_cmp(const void *a, const void *b) {
+    int64_t x = ((const vu_pent *)a)->self, y = ((const vu_pent *)b)->self;
+    if (x != y) return x < y ? 1 : -1;
+    return 0;
+}
+static int vu_prof_cmp_total(const void *a, const void *b) {
+    int64_t x = ((const vu_pent *)a)->total, y = ((const vu_pent *)b)->total;
+    if (x != y) return x < y ? 1 : -1;
+    return vu_prof_cmp(a, b);
+}
+static void vu_prof_report(void) {
+    struct itimerval off = {{0, 0}, {0, 0}};
+    setitimer(ITIMER_PROF, &off, NULL);
+    signal(SIGPROF, SIG_IGN);
+    int taken = __atomic_load_n(&vu_prof_taken, __ATOMIC_RELAXED);
+    int n = taken < VU_PROF_MAX ? taken : VU_PROF_MAX;
+    size_t cap = 1 << 16;
+    vu_pent *fns = (vu_pent *)calloc(cap, sizeof *fns), *lines = (vu_pent *)calloc(cap, sizeof *lines);
+    if (!fns || !lines) return;
+    int64_t outside = 0;
+    for (int i = 0; i < n; i++) {
+        vu_pf *row = vu_prof_rows + (size_t)i * VU_PROF_DEPTH;
+        int d = vu_prof_depth[i];
+        if (d == 0) { outside++; continue; }
+        vu_pent *f = vu_prof_slot(fns, cap, row[0].name, -1);
+        vu_pent *l = vu_prof_slot(lines, cap, row[0].name, row[0].loc);
+        if (f) f->self++;
+        if (l) l->self++;
+        for (int k = 0; k < d; k++) {
+            vu_pent *e = vu_prof_slot(fns, cap, row[k].name, -1);
+            if (e && e->seen != i) { e->seen = i; e->total++; }   /* (once per sample, even in recursion) */
+        }
+    }
+    size_t nf = 0, nl = 0;
+    for (size_t k = 0; k < cap; k++) if (fns[k].name) fns[nf++] = fns[k];
+    for (size_t k = 0; k < cap; k++) if (lines[k].name) lines[nl++] = lines[k];
+    qsort(fns, nf, sizeof *fns, vu_prof_cmp_total);
+    qsort(lines, nl, sizeof *lines, vu_prof_cmp);
+    const char *pre = getenv("VU_PROF_OUT");
+    if (!pre || !*pre) pre = "vu-profile";
+    char path[4096], where[512];
+    snprintf(path, sizeof path, "%s.txt", pre);
+    FILE *o = fopen(path, "w");
+    struct timespec cpu;
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
+    double secs = (double)cpu.tv_sec + cpu.tv_nsec / 1e9;
+    fflush(stdout);
+    fprintf(stderr, "\nvu profile: %d samples of %.2f s of CPU time%s\n", n, secs,
+            taken > n ? " (the samples after the first 65536 were dropped)" : "");
+    if (n == 0) {
+        fprintf(stderr, "  (too little CPU time to sample)\n");
+        free(fns);
+        free(lines);
+        return;
+    }
+    for (int pass = 0; pass < 2; pass++) {
+        FILE *w = pass == 0 ? stderr : o;
+        if (!w) continue;
+        size_t fmax = pass == 0 ? 12 : nf, lmax = pass == 0 ? 12 : nl;
+        if (pass == 1) fprintf(w, "vu profile: %d samples of %.2f s of CPU time\n", n, secs);
+        fprintf(w, "  total%%   self%%  function\n");
+        for (size_t k = 0; k < nf && k < fmax; k++)
+            fprintf(w, "  %5.1f  %5.1f   %s\n", 100.0 * fns[k].total / n, 100.0 * fns[k].self / n, fns[k].name);
+        if (outside && pass == 1) fprintf(w, "  %5.1f  %5.1f   (outside Vu functions: the runtime)\n", 100.0 * outside / n, 100.0 * outside / n);
+        fprintf(w, "   self%%  line\n");
+        for (size_t k = 0; k < nl && k < lmax; k++) {
+            vu_prof_where(where, sizeof where, lines[k].loc);
+            fprintf(w, "  %5.1f   %s in %s\n", 100.0 * lines[k].self / n, where, lines[k].name);
+        }
+    }
+    if (o) fclose(o);
+    char fpath[4096];
+    snprintf(fpath, sizeof fpath, "%s.folded", pre);
+    FILE *fo = fopen(fpath, "w");
+    if (fo) {
+        for (int i = 0; i < n; i++) {
+            vu_pf *row = vu_prof_rows + (size_t)i * VU_PROF_DEPTH;
+            int d = vu_prof_depth[i];
+            if (d == 0) { fputs("(runtime) 1\n", fo); continue; }
+            for (int k = d - 1; k >= 0; k--) {
+                fputs(row[k].name, fo);
+                if (k == 0) { vu_prof_where(where, sizeof where, row[k].loc); fprintf(fo, " %s", where); }
+                fputc(k ? ';' : ' ', fo);
+            }
+            fputs("1\n", fo);
+        }
+        fclose(fo);
+    }
+    fprintf(stderr, "  all of it: %s; stacks for flamegraph.pl or speedscope: %s\n", path, fpath);
+    free(fns);
+    free(lines);
+}
+static void vu_prof_start(void) {
+    const char *hz = getenv("VU_PROF_HZ");
+    if (hz) { int h = atoi(hz); if (h >= 10 && h <= 10000) vu_prof_hz = h; }
+    vu_prof_rows = (vu_pf *)calloc((size_t)VU_PROF_MAX * VU_PROF_DEPTH, sizeof(vu_pf));
+    vu_prof_depth = (unsigned char *)calloc(VU_PROF_MAX, 1);
+    if (!vu_prof_rows || !vu_prof_depth) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = vu_prof_tick;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGPROF, &sa, NULL);
+    atexit(vu_prof_report);
+    long us = 1000000 / vu_prof_hz;
+    struct itimerval it = {{us / 1000000, us % 1000000}, {us / 1000000, us % 1000000}};
+    setitimer(ITIMER_PROF, &it, NULL);
+}
+#endif
 static void *vu_main_thread(void *arg) { (void)arg; vu_thread_guard(); vu_main_rc = vu_main_fn(); vu_report_lock(); fflush(stdout); exit(vu_main_rc); }
 static void vu_seed_init(void);
 static void vu_guard_init(void *top);
@@ -1046,6 +1207,9 @@ static int vu_start(int argc, char **argv, int (*fn)(void), const char *const *f
     vu_seed_init();
     vu_guard_init(__builtin_frame_address(0));
     vu_main_fn = fn;
+#ifdef VU_PROF
+    vu_prof_start();
+#endif
 #ifndef VU_WASI
     pthread_attr_t at;
     pthread_t t;

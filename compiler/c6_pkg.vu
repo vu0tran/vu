@@ -64,6 +64,9 @@ fn is_version(w: Str) -> Bool:
 
 fn read_manifest(fs: Fs, path: Str) -> Manifest throws:
   let text = fs.read(path)?
+  return read_manifest_text(text, path)?
+
+fn read_manifest_text(text: Str, path: Str) -> Manifest throws:
   var needs: [Need] = []
   var ln = 0
   for raw in text.split("\n"):
@@ -82,7 +85,8 @@ fn read_manifest(fs: Fs, path: Str) -> Manifest throws:
     var i = 2
     if not is_local_source(source):
       if words.len < 3 or not is_version(words[2]): fail path + ":{ln}: " + source + " needs a version, a git tag like v1.2.0"
-      check_source(source) else fail path + ":{ln}: '" + source + "' isn't a package source: a folder, host/path, or an https, http, ssh, git or file URL"
+      if not is_registry_name(source):
+        check_source(source) else fail path + ":{ln}: '" + source + "' isn't a package source: a folder, host/path, an https, http, ssh, git or file URL, or a name in the registry"
       version = words[2] + ""
       i = 3
     while i < words.len:
@@ -143,6 +147,176 @@ fn check_source(source: Str) throws:
   let ok = u.startswith("https://") or u.startswith("http://") or u.startswith("ssh://") or u.startswith("git://") or u.startswith("file://")
   if not ok or source.startswith("-"): fail "'" + source + "' isn't a package source: a folder, host/path, or an https, http, ssh, git or file URL"
 
+# ---- the registry: names for packages, with the commit and hash of each version
+# The index is text (VU_REGISTRY, else https://vulang.org/registry/index.txt), fetched with curl:
+#   package NAME SOURCE
+#   about NAME one line saying what it is
+#   version NAME vX.Y.Z COMMIT SHA256 [fs net os ffi]
+# `need NAME vX.Y.Z` in vu.pkg means that package; vu get fetches it from its source and refuses it
+# unless the commit and the hash of its files are the ones the registry recorded.
+
+type RegVersion:
+  version, commit, hash: Str
+  caps: [Str]
+
+type RegPkg:
+  name, source, about: Str
+  versions: [RegVersion]
+
+# A registry name: a lowercase letter, then lowercase letters, digits and '_' (it's also the module name).
+fn is_registry_name(s: Str) -> Bool:
+  if s.len == 0 or s.len > 64 or s[0] < 'a' or s[0] > 'z': return false
+  for i in 0..s.len:
+    let c = s[i]
+    if not ((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_'): return false
+  return true
+
+fn registry_url(os: Os) -> Str:
+  let env = os.env("VU_REGISTRY")
+  if env != "": return env
+  return "https://vulang.org/registry/index.txt"
+
+fn read_registry(os: Os) -> [RegPkg] throws:
+  let url = registry_url(os)
+  if not (url.startswith("https://") or url.startswith("file://")): fail "VU_REGISTRY must be an https:// or file:// URL"
+  let text = os.output(["curl", "-fsSL", "--proto", "=https,file", "--max-filesize", "33554432", "--", url + ""]) else fail "can't read the registry at " + url + " (with curl)"
+  return parse_registry(text, url)?
+
+fn parse_registry(text: Str, url: Str) -> [RegPkg] throws:
+  var out: [RegPkg] = []
+  var ln = 0
+  for raw in text.split("\n"):
+    ln += 1
+    let w = raw.split()
+    if w.len == 0 or w[0].startswith("#"): continue
+    let bad = url + ":{ln}: "
+    if w.len < 2 or not is_registry_name(w[1]): fail bad + "a line names a package: package NAME SOURCE, about NAME ..., or version NAME vX COMMIT HASH [caps]"
+    var at = -1
+    for i in 0..out.len:
+      if out[i].name == w[1]: at = i
+    if w[0] == "package":
+      if w.len != 3 or at >= 0: fail bad + "package NAME SOURCE, once for each name"
+      check_source(w[2]) else fail bad + "'" + w[2] + "' isn't a source git can fetch"
+      out.push(RegPkg(w[1] + "", w[2] + "", "", []))
+      continue
+    if at < 0: fail bad + "'" + w[1] + "' comes before its package line"
+    if w[0] == "about":
+      let i = raw.find(w[1]) + w[1].len
+      out[at].about = raw[i..raw.len].strip()
+    elif w[0] == "version":
+      if w.len < 5 or not is_version(w[2]) or w[3].len != 40 or w[4].len != 64: fail bad + "version NAME vX.Y.Z COMMIT (40 hex digits) SHA256 (64) [fs net os ffi]"
+      var caps: [Str] = []
+      for i in 5..w.len:
+        if not is_cap_word(w[i]): fail bad + "unknown capability '" + w[i] + "'"
+        caps.push(w[i] + "")
+      out[at].versions.push(RegVersion(w[2] + "", w[3] + "", w[4] + "", caps))
+    else:
+      fail bad + "unknown line '" + w[0] + "'"
+  return out
+
+fn reg_find(reg: [RegPkg], name: Str) -> Int:
+  for i in 0..reg.len:
+    if reg[i].name == name: return i
+  return -1
+
+fn reg_version(p: RegPkg, version: Str) -> Int:
+  for i in 0..p.versions.len:
+    if p.versions[i].version == version: return i
+  return -1
+
+fn reg_latest(p: RegPkg) -> Int:
+  var best = -1
+  for i in 0..p.versions.len:
+    if p.versions[i].version.find("-") >= 0: continue   # v2.0.0-rc.1: only when asked for
+    if best < 0 or version_less(p.versions[best].version, p.versions[i].version): best = i
+  return best
+
+# vu search [WORDS]: the registry's packages whose name or description has every word.
+fn reg_search(os: Os, words: [Str]) -> Int throws:
+  let reg = read_registry(os)?
+  var shown = 0
+  for p in reg:
+    let text = (p.name + " " + p.about).lower()
+    var all = true
+    for w in words:
+      if text.find(w.lower()) < 0: all = false
+    if not all: continue
+    let li = reg_latest(p)
+    var v = "-"
+    var caps = ""
+    if li >= 0:
+      v = p.versions[li].version + ""
+      caps = " ".join(p.versions[li].caps)
+    if caps == "": caps = "(no capabilities)"
+    print(p.name + " " + v + "  " + caps + "  " + p.about)
+    shown += 1
+  if shown == 0: eprint("vu: no package in the registry matches")
+  return 0
+
+# vu add NAME [VERSION]: a line in vu.pkg (here; made if there's none) for that package, granting the
+# capabilities the registry says it takes, then vu get.
+fn reg_add(fs: Fs, os: Os, name: Str, version: Str) throws:
+  if not is_registry_name(name): fail "'" + name + "' isn't a registry name (lowercase letters, digits and _)"
+  let reg = read_registry(os)?
+  let pi = reg_find(reg, name)
+  if pi < 0: fail "no package named '" + name + "' in the registry (vu search lists them)"
+  var vi = -1
+  if version == "": vi = reg_latest(reg[pi])
+  else: vi = reg_version(reg[pi], version)
+  if vi < 0: fail "the registry has no version " + version + " of " + name
+  let rv = reg[pi].versions[vi]
+  var mf = find_manifest(fs, os, "main.vu")
+  if mf == "": mf = "vu.pkg"
+  var text = fs.read(mf) else ""
+  let m = read_manifest_text(text, mf)?
+  for n in m.needs:
+    if n.name == name or n.source == name: fail mf + " already has " + name + " (line {n.line}); change its version there"
+  if text != "" and not text.endswith("\n"): text += "\n"
+  var line = "need " + name + " " + rv.version
+  for c in rv.caps: line += " " + c
+  text += line + "\n"
+  fs.write(mf, text)?
+  var gets = "nothing"
+  if rv.caps.len > 0: gets = " ".join(rv.caps)
+  eprint("vu: added '" + line + "' to " + mf + " (" + name + " receives " + gets + ")")
+  pkg_get(fs, os, mf)?
+
+# vu publish NAME VERSION [DIR]: the lines for the registry's index for the package in the git
+# repository DIR (here) at tag VERSION: its source (the repository's origin), the commit, the hash of
+# what vu get will fetch, and the capabilities it takes (caps: what the publisher says).
+fn reg_publish(fs: Fs, os: Os, name: Str, version: Str, dir: Str, caps: [Str]) throws:
+  if not is_registry_name(name): fail "'" + name + "' isn't a registry name (lowercase letters, digits and _)"
+  if not is_version(version): fail "'" + version + "' isn't a version (a git tag like v1.2.0)"
+  for c in caps:
+    if not is_cap_word(c): fail "unknown capability '" + c + "' (fs, net, os, ffi)"
+  var origin = os.output(["git", "-C", dir + "", "remote", "get-url", "origin"]) else ""
+  origin = origin.strip()
+  if origin.startswith("https://github.com/") or origin.startswith("https://gitlab.com/"):
+    origin = origin[8..origin.len]   # github.com/you/pkg, as vu.pkg writes it
+    if origin.endswith(".git"): origin = origin[0..origin.len - 4]
+  if origin == "": fail "the repository in " + dir + " has no origin to fetch it from (git remote add origin URL)"
+  check_source(origin)?
+  let commit = os.output(["git", "-C", dir + "", "rev-parse", "--verify", "--quiet", version + "^{{commit}}"]) else ""
+  if commit.strip().len != 40: fail "no tag " + version + " in " + dir + " (git tag " + version + ", then push it)"
+  # hash what vu get will see: a fresh clone of that tag
+  let tmpd = os.output(["mktemp", "-d"])?.strip()
+  let rc = os.run(["git", "-c", "protocol.ext.allow=never", "clone", "--quiet", "--depth", "1", "--branch", version + "", "--", "file://" + abs_path(os, dir), tmpd + "/p"])?
+  if rc != 0: fail "can't clone " + dir + " at " + version
+  let h = tree_hash(fs, tmpd + "/p")?
+  let head = os.output(["git", "-C", tmpd + "/p", "rev-parse", "HEAD"])?.strip()
+  let _ = os.run(["rm", "-rf", tmpd + ""]) else 0
+  print("package " + name + " " + origin)
+  print("about " + name + " (one line: what it does)")
+  var line = "version " + name + " " + version + " " + head + " " + h
+  for c in caps: line += " " + c
+  print(line)
+  eprint("vu: these lines go in the registry's index (registry/index.txt in github.com/vu0tran/vulang-web, by pull request); a new version needs only its version line")
+
+fn abs_path(os: Os, p: Str) -> Str:
+  let r = os.output(["realpath", "--", p + ""]) else ""
+  if r.strip() != "": return r.strip()
+  return p + ""
+
 # v1.10.2 > v1.9.0: numbers compared as numbers.
 fn version_less(a: Str, b: Str) -> Bool:
   let pa = a[1..a.len].split(".")
@@ -191,6 +365,8 @@ fn find_manifest(fs: Fs, os: Os, main_path: Str) -> Str:
 fn pkg_get(fs: Fs, os: Os, manifest: Str) throws:
   let cache = cache_dir(os)
   fs.mkdir(cache)?
+  var reg: [RegPkg] = []
+  var reg_read = false
   let root = dir_of(manifest)
   var want: {Str: Str} = {}      # source -> highest version asked for
   var fetched: {Str: Str} = {}   # source -> the version fetched
@@ -225,9 +401,32 @@ fn pkg_get(fs: Fs, os: Os, manifest: Str) throws:
           let tmpd = dir + ".tmp"
           if fs.exists(tmpd):
             let _ = os.run(["rm", "-rf", tmpd + ""]) else 0
-          check_source(n.source)?
-          let rc = os.run(["git", "-c", "protocol.ext.allow=never", "clone", "--quiet", "--depth", "1", "--branch", v + "", "--", git_url(n.source), tmpd + ""])?
+          var url = ""
+          var want_commit = ""
+          var want_hash = ""
+          if is_registry_name(n.source):
+            if not reg_read:
+              reg = read_registry(os)?
+              reg_read = true
+            let pi = reg_find(reg, n.source)
+            if pi < 0: fail "no package named '" + n.source + "' in the registry"
+            let vi = reg_version(reg[pi], v)
+            if vi < 0: fail "the registry has no version " + v + " of " + n.source
+            url = git_url(reg[pi].source)
+            want_commit = reg[pi].versions[vi].commit + ""
+            want_hash = reg[pi].versions[vi].hash + ""
+          else:
+            check_source(n.source)?
+            url = git_url(n.source)
+          let rc = os.run(["git", "-c", "protocol.ext.allow=never", "clone", "--quiet", "--depth", "1", "--branch", v + "", "--", url, tmpd + ""])?
           if rc != 0: fail "can't fetch " + n.source + " " + v + " (git exited with {rc})"
+          if want_commit != "":
+            # what the registry recorded when it was published: the same commit, the same files
+            let got_commit = (os.output(["git", "-C", tmpd + "", "rev-parse", "HEAD"]) else "").strip()
+            let got_hash = tree_hash(fs, tmpd)?
+            if got_commit != want_commit or got_hash != want_hash:
+              let _ = os.run(["rm", "-rf", tmpd + ""]) else 0
+              fail n.source + " " + v + " isn't what the registry recorded (commit " + got_commit + ", files " + got_hash[0..12] + "...; the registry has " + want_commit + ", " + want_hash[0..12] + "...): the tag moved, or the source changed it"
           # no symbolic links: one could lead the build (and the hash) to files outside the package
           let links = os.output(["find", tmpd + "", "-path", tmpd + "/.git", "-prune", "-o", "-type", "l", "-print"]) else "?"
           if links != "":

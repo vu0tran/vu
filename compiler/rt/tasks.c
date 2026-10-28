@@ -1459,6 +1459,23 @@ static bool vu_tls_send(vu_sock *c, const uint8_t *data, int64_t len, int64_t de
 }
 /* net.tls_listen(port, cert: pem, key: pem): the certificate (then any intermediate certificates) and
    its private key, as PEM text. */
+/* "h2,http/1.1" -> a length byte, then the wire form: 2 h2 8 http/1.1 (NULL and *err if it's malformed) */
+static unsigned char *vu_alpn_wire(const vu_str *alpn, vu_str *err) {
+    unsigned char *wire = (unsigned char *)vu_malloc((size_t)alpn->len + 3);
+    size_t w = 1, start = 0;
+    for (size_t i = 0; i <= (size_t)alpn->len; i++) {
+        if (i < (size_t)alpn->len && alpn->data[i] != ',') continue;
+        size_t n = i - start;
+        if (n == 0 || n > 255) { free(wire); *err = vu_errf("alpn: a comma-separated list of protocol names, like \"h2,http/1.1\""); return NULL; }
+        wire[w++] = (unsigned char)n;
+        memcpy(wire + w, alpn->data + start, n);
+        w += n;
+        start = i + 1;
+    }
+    if (w - 1 > 255) { free(wire); *err = vu_errf("alpn: the list is too long"); return NULL; }
+    wire[0] = (unsigned char)(w - 1);
+    return wire;
+}
 /* ALPN: the server picks the first of its protocols (alpn: "h2,http/1.1") that the client offers. */
 static int vu_alpn_pick(SSL *ssl, const unsigned char **out, unsigned char *outlen, const unsigned char *in, unsigned inlen, void *arg) {
     (void)ssl;
@@ -1478,22 +1495,7 @@ static bool vu_net_tls_listen_alpn(vu_cap net, int64_t port, const vu_str *cert,
                                    void **out, vu_str *err, int line) {
     vu_task_here("net.tls_listen()", line);
     unsigned char *wire = NULL;
-    if (alpn) {
-        /* "h2,http/1.1" -> a length byte, then the wire form: 2 h2 8 http/1.1 */
-        wire = (unsigned char *)vu_malloc((size_t)alpn->len + 3);
-        size_t w = 1, start = 0;
-        for (size_t i = 0; i <= (size_t)alpn->len; i++) {
-            if (i < (size_t)alpn->len && alpn->data[i] != ',') continue;
-            size_t n = i - start;
-            if (n == 0 || n > 255) { free(wire); *err = vu_errf("alpn: a comma-separated list of protocol names, like \"h2,http/1.1\""); return false; }
-            wire[w++] = (unsigned char)n;
-            memcpy(wire + w, alpn->data + start, n);
-            w += n;
-            start = i + 1;
-        }
-        if (w - 1 > 255) { free(wire); *err = vu_errf("alpn: the list is too long"); return false; }
-        wire[0] = (unsigned char)(w - 1);
-    }
+    if (alpn && !(wire = vu_alpn_wire(alpn, err))) return false;
     if (cert->len > (1 << 24) || key->len > (1 << 24)) { *err = vu_errf("the certificate or key is too long"); return false; }
     ERR_clear_error();
     SSL_CTX *ctx = vu_tls_ctx(true);
@@ -1539,11 +1541,76 @@ static bool vu_net_tls_listen_alpn(vu_cap net, int64_t port, const vu_str *cert,
 }
 /* net.tls_connect(host, port, ca: pem, timeout: s): checks the server's certificate against the system's
    certificates (or only the ones in ca) and that it is for host. */
-static bool vu_net_tls_connect(vu_cap net, const vu_str *host, int64_t port, const vu_str *ca, double timeout, bool has,
-                               void **out, vu_str *err, int line) {
+static bool vu_net_tls_connect(vu_cap net, const vu_str *host, int64_t port, const vu_str *ca, const vu_str *alpn, double timeout,
+                               bool has, void **out, vu_str *err, int line) {
     (void)net;
     vu_task_here("net.tls_connect()", line);
     if (port < 1 || port > 65535) { *err = vu_errf("port %lld is not in 1..65535", (long long)port); return false; }
+    unsigned char *wire = NULL;
+    if (alpn && !(wire = vu_alpn_wire(alpn, err))) return false;
+    char *h = vu_cpath(host, err);
+    if (!h) { free(wire); drop_Str(err); *err = vu_errf("a host name can't contain a zero byte"); return false; }
+    int64_t deadline = vu_deadline(timeout, has, line);
+    ERR_clear_error();
+    SSL_CTX *ctx;
+    if (ca) {
+        if (ca->len > (1 << 24)) { free(wire); free(h); *err = vu_errf("ca: the PEM text is too long"); return false; }
+        ctx = vu_tls_ctx(false);
+        X509_STORE *st = SSL_CTX_get_cert_store(ctx);
+        BIO *b = vu_pem_bio(ca);
+        int n = 0;
+        X509 *x;
+        while (b && (x = PEM_read_bio_X509(b, NULL, vu_no_password, NULL))) { X509_STORE_add_cert(st, x); X509_free(x); n++; }
+        if (b) BIO_free(b);
+        ERR_clear_error();
+        if (!n) { free(wire); SSL_CTX_free(ctx); free(h); *err = vu_errf("ca: no certificate found in the PEM text"); return false; }
+    } else {
+        pthread_mutex_lock(&vu_tls_lock);
+        if (!vu_tls_system) {
+            SSL_CTX *sys = vu_tls_ctx(false);
+            SSL_CTX_set_default_verify_paths(sys);
+            ERR_clear_error();
+            vu_tls_system = sys;
+        }
+        ctx = vu_tls_system;
+        SSL_CTX_up_ref(ctx);
+        pthread_mutex_unlock(&vu_tls_lock);
+    }
+    void *sp = NULL;
+    if (!vu_connect_to(h, port, deadline, &sp, err, line)) { free(wire); SSL_CTX_free(ctx); free(h); return false; }
+    vu_sock *s = (vu_sock *)sp;
+    bool ok = vu_tls_attach(s, ctx, err);
+    SSL_CTX_free(ctx);   /* the SSL object keeps its own reference */
+    if (ok) {
+        SSL *ssl = (SSL *)s->ssl;
+        unsigned char ip[16];
+        bool is_ip = inet_pton(AF_INET, h, ip) == 1 || inet_pton(AF_INET6, h, ip) == 1;
+        if (is_ip) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), h);
+        else { SSL_set_tlsext_host_name(ssl, h); SSL_set1_host(ssl, h); }
+        if (wire) SSL_set_alpn_protos(ssl, wire + 1, wire[0]);
+        SSL_set_connect_state(ssl);
+        ok = vu_tls_handshake(s, deadline, err, line);
+        if (!ok) {
+            vu_str e = *err;
+            *err = vu_errf("%.200s:%lld: %.*s", h, (long long)port, (int)e.len, (const char *)e.data);
+            drop_Str(&e);
+        }
+    }
+    free(h);
+    free(wire);
+    if (!ok) { vu_sock_drop(s); return false; }
+    *out = s;
+    return true;
+}
+/* net.start_tls(&conn, host, ca:, timeout:): TLS on a connection that's already open (STARTTLS, as
+   PostgreSQL and SMTP do it), with the same checks as tls_connect. */
+static bool vu_net_start_tls(vu_cap net, void **conn, const vu_str *host, const vu_str *ca, double timeout, bool has,
+                             vu_str *err, int line) {
+    (void)net;
+    vu_task_here("net.start_tls()", line);
+    vu_sock *s = (vu_sock *)*conn;
+    if (!s) { *err = vu_errf("net.start_tls(): the connection is closed"); return false; }
+    if (s->ssl) { *err = vu_errf("net.start_tls(): the connection already uses TLS"); return false; }
     char *h = vu_cpath(host, err);
     if (!h) { drop_Str(err); *err = vu_errf("a host name can't contain a zero byte"); return false; }
     int64_t deadline = vu_deadline(timeout, has, line);
@@ -1572,11 +1639,8 @@ static bool vu_net_tls_connect(vu_cap net, const vu_str *host, int64_t port, con
         SSL_CTX_up_ref(ctx);
         pthread_mutex_unlock(&vu_tls_lock);
     }
-    void *sp = NULL;
-    if (!vu_connect_to(h, port, deadline, &sp, err, line)) { SSL_CTX_free(ctx); free(h); return false; }
-    vu_sock *s = (vu_sock *)sp;
     bool ok = vu_tls_attach(s, ctx, err);
-    SSL_CTX_free(ctx);   /* the SSL object keeps its own reference */
+    SSL_CTX_free(ctx);
     if (ok) {
         SSL *ssl = (SSL *)s->ssl;
         unsigned char ip[16];
@@ -1587,14 +1651,24 @@ static bool vu_net_tls_connect(vu_cap net, const vu_str *host, int64_t port, con
         ok = vu_tls_handshake(s, deadline, err, line);
         if (!ok) {
             vu_str e = *err;
-            *err = vu_errf("%.200s:%lld: %.*s", h, (long long)port, (int)e.len, (const char *)e.data);
+            *err = vu_errf("%.200s: %.*s", h, (int)e.len, (const char *)e.data);
             drop_Str(&e);
         }
     }
     free(h);
-    if (!ok) { vu_sock_drop(s); return false; }
-    *out = s;
+    if (!ok) { vu_sock_drop(s); *conn = NULL; return false; }
     return true;
+}
+/* net.protocol(conn): the protocol chosen by ALPN on a TLS connection ("h2"), else "" */
+static vu_str vu_net_protocol(vu_cap net, void *c) {
+    (void)net;
+    vu_sock *s = (vu_sock *)c;
+    const unsigned char *p = NULL;
+    unsigned n = 0;
+    if (s && s->ssl) SSL_get0_alpn_selected((SSL *)s->ssl, &p, &n);
+    vu_str r = {0};
+    if (n) vu_str_cat_bytes(&r, p, (int64_t)n);
+    return r;
 }
 #endif
 static void drop_X_Conn(void **p) { if (*p) { vu_sock_drop(*p); *p = NULL; } }

@@ -117,7 +117,7 @@ fn new_hpack() -> Hpack:
 
 # Serves an HTTP/2 connection that began with the preface (already in first). Returns when the client
 # goes away, on a protocol error (after sending GOAWAY), or when stopping closes.
-fn serve_conn(net: Net, c: Conn, h: Shared[fn(http.Request) -> http.Response], stopping: Chan[Int], first: Str):
+fn serve_conn(net: Net, c: Conn, h: Shared[http.Site], stopping: Chan[Int], first: Str):
   var k = new_conn()
   k.buf = first
   if k.buf.len < 24 or k.buf[0..24] != preface(): return
@@ -135,7 +135,7 @@ fn serve_conn(net: Net, c: Conn, h: Shared[fn(http.Request) -> http.Response], s
       k.ready = rest
       let si = find_stream(k, id)
       if si < 0: continue
-      let resp = h.value(k.streams[si].req)
+      let resp = h.value.handle(k.streams[si].req)
       respond(net, c, &k, id, resp) else return
       drop_stream(&k, id)
     if k.goaway or stopping.closed():
@@ -662,3 +662,342 @@ fn static_names() -> [Str]:
 
 fn static_values() -> [Str]:
   return ["", "GET", "POST", "/", "/index.html", "http", "https", "200", "204", "206", "304", "400", "404", "500", "", "gzip, deflate", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""]
+
+# ---- the client (http.Client uses it for https servers that choose h2 through ALPN)
+# One request at a time on a connection, so a stream's state lives in request(); the connection
+# keeps what outlives a request: the server's settings, our HPACK table for its header blocks, and
+# the windows.
+
+type Client2:
+  buf: Str
+  at: Int
+  hp: Hpack
+  next_id: Int          # the next stream: 1, 3, 5...
+  conn_window: Int      # what we may still send on the connection
+  init_window: Int      # each new stream's send window (the server's SETTINGS_INITIAL_WINDOW_SIZE)
+  max_frame: Int        # the largest frame the server accepts
+  goaway: Bool          # the server is going away: no new streams
+  dead: Bool            # a protocol or network error: close it
+
+const MAX_RESPONSE = 67108864   # 64 MB, as for HTTP/1.1 responses
+
+# Starts HTTP/2 on c (TLS, ALPN chose "h2"): the preface and our settings (no server push, header
+# lists up to 64 KB, a 16 MB window so big responses don't wait for window updates).
+fn client_start(net: Net, c: Conn, timeout: Float) -> Client2 throws:
+  let ours = str([0, 2]) + be32(0) + str([0, 6]) + be32(MAX_HEADER_LIST) + str([0, 4]) + be32(16777216)
+  net.send(c, preface() + frame(SETTINGS, 0, 0, ours) + frame(WINDOW_UPDATE, 0, 0, be32(16777216 - 65535)), timeout: timeout)?
+  return Client2("", 0, new_hpack(), 1, 65535, 65535, 16384, false, false)
+
+# Why a request failed, and whether it can be sent again on another connection (the server didn't
+# take it: GOAWAY with a lower stream id, or REFUSED_STREAM).
+type Failed:
+  Again(why: Str)   # the server didn't take it: it can go on another connection
+  Stop(why: Str)
+
+fn client_frame(net: Net, c: Conn, var k: Client2, timeout: Float) -> Frame throws:
+  while true:
+    if k.buf.len - k.at >= 9:
+      let n = rd24(k.buf, k.at)
+      if n > 16384: fail "a frame larger than we allow"
+      if k.buf.len - k.at >= 9 + n:
+        let f = Frame(int(k.buf[k.at + 3]), int(k.buf[k.at + 4]), rd32(k.buf, k.at + 5) & 2147483647, k.buf[k.at + 9..k.at + 9 + n])
+        k.at += 9 + n
+        if k.at > 65536:
+          k.buf = k.buf[k.at..k.buf.len]
+          k.at = 0
+        return f
+    let more = net.recv(c, timeout: timeout)?
+    if more.len == 0: fail "the server closed the connection"
+    k.buf += more
+
+# A frame's payload without its padding ("" and false if the padding is longer than the frame).
+fn unpad(f: Frame, prio: Bool, var ok: Bool) -> Str:
+  var off = 0
+  var pad = 0
+  ok = true
+  if (f.flags & PADDED) != 0:
+    if f.payload.len < 1:
+      ok = false
+      return ""
+    pad = int(f.payload[0])
+    off = 1
+  if prio and (f.flags & PRIO) != 0: off += 5
+  if off + pad > f.payload.len:
+    ok = false
+    return ""
+  return f.payload[off..f.payload.len - pad]
+
+# Sends a request on a new stream and reads its response. headers: lowercase names, without the
+# connection-specific ones (http.Client checks them).
+fn request(net: Net, c: Conn, var k: Client2, method: Str, scheme: Str, authority: Str, path: Str,
+           headers: [http.Header], body: Str, timeout: Float) -> http.Response throws Failed:
+  if k.goaway or k.dead or k.next_id > 2147483647: fail Again("the connection can't take more requests")
+  let id = k.next_id
+  k.next_id += 2
+  var block = str([0]) + hp_str(":method") + hp_str(method) + str([0]) + hp_str(":scheme") + hp_str(scheme)
+  block += str([0]) + hp_str(":authority") + hp_str(authority) + str([0]) + hp_str(":path") + hp_str(path)
+  for h in headers: block += str([0]) + hp_str(h.name) + hp_str(h.value)
+  if body.len > 0 or method == "POST" or method == "PUT" or method == "PATCH":
+    block += str([0]) + hp_str("content-length") + hp_str("{body.len}")
+  # the header block: HEADERS, then CONTINUATION frames if it's larger than a frame
+  var pos = 0
+  var first = true
+  var out = ""
+  while true:
+    let take = min(k.max_frame, block.len - pos)
+    let last = pos + take == block.len
+    var fl = 0
+    if last: fl = END_HEADERS
+    if first:
+      if body.len == 0: fl += END_STREAM
+      out += frame(HEADERS, fl, id, block[pos..pos + take])
+    else:
+      out += frame(CONTINUATION, fl, id, block[pos..pos + take])
+    first = false
+    pos += take
+    if last: break
+  match net.send(c, out, timeout: timeout):
+    ok: out = ""
+    err(e):
+      k.dead = true
+      fail Stop(e)
+  var send_window = k.init_window
+  var sent = 0                  # bytes of the body sent
+  var status = 0                # the response's (0: its headers haven't come)
+  var resp_headers: [http.Header] = []
+  var resp_body = ""
+  var hblock = ""               # a header block in progress (CONTINUATION expected)
+  var in_block = false
+  var block_end = false         # that block ends the stream
+  var block_frames = 0
+  var done = false              # the response is complete
+  while not done:
+    # send what the windows allow of the body
+    while sent < body.len and status == 0:
+      let room = min(min(k.conn_window, send_window), k.max_frame)
+      if room <= 0: break
+      let n = min(room, body.len - sent)
+      var fl = 0
+      if sent + n == body.len: fl = END_STREAM
+      match net.send(c, frame(DATA, fl, id, body[sent..sent + n]), timeout: timeout):
+        ok: sent += n
+        err(e):
+          k.dead = true
+          fail Stop(e)
+      k.conn_window -= n
+      send_window -= n
+    var why = ""
+    var f = Frame(0, 0, 0, "")
+    match client_frame(net, c, &k, timeout):
+      ok(fr): f = Frame(fr.kind, fr.flags, fr.stream, fr.payload + "")
+      err(e): why = e
+    if why != "":
+      k.dead = true
+      fail Stop(why)
+    if in_block and (f.kind != CONTINUATION or f.stream != id):
+      k.dead = true
+      fail Stop("protocol: a header block interrupted")
+    var code = 0              # a connection error to send GOAWAY with
+    var problem = ""
+    if f.kind == SETTINGS:
+      if f.stream != 0: code = PROTOCOL_ERROR
+      elif (f.flags & ACK) == 0:
+        if f.payload.len % 6 != 0: code = FRAME_SIZE_ERROR
+        var i = 0
+        while code == 0 and i < f.payload.len:
+          let sid = (int(f.payload[i]) << 8) | int(f.payload[i + 1])
+          let v = rd32(f.payload, i + 2)
+          if sid == 4:
+            if v > 2147483647: code = FLOW_CONTROL_ERROR
+            else:
+              send_window += v - k.init_window
+              k.init_window = v
+          elif sid == 5:
+            if v < 16384 or v > 16777215: code = PROTOCOL_ERROR
+            else: k.max_frame = v
+          elif sid == 1 and v > 4096:
+            # the server may use a bigger HPACK table than 4 KB only if we said so: we didn't
+            code = 0
+          i += 6
+        if code == 0:
+          match net.send(c, frame(SETTINGS, ACK, 0, ""), timeout: timeout):
+            ok: code = 0
+            err(e): problem = e
+    elif f.kind == PING:
+      if f.stream != 0 or f.payload.len != 8: code = PROTOCOL_ERROR
+      elif (f.flags & ACK) == 0:
+        match net.send(c, frame(PING, ACK, 0, f.payload), timeout: timeout):
+          ok: code = 0
+          err(e): problem = e
+    elif f.kind == WINDOW_UPDATE:
+      if f.payload.len != 4: code = FRAME_SIZE_ERROR
+      else:
+        let inc = rd32(f.payload, 0) & 2147483647
+        if inc == 0: code = PROTOCOL_ERROR
+        elif f.stream == 0:
+          k.conn_window += inc
+          if k.conn_window > 2147483647: code = FLOW_CONTROL_ERROR
+        elif f.stream == id:
+          send_window += inc
+          if send_window > 2147483647: code = FLOW_CONTROL_ERROR
+    elif f.kind == GOAWAY:
+      if f.payload.len < 8: code = FRAME_SIZE_ERROR
+      else:
+        k.goaway = true
+        let last = rd32(f.payload, 0) & 2147483647
+        if last < id: fail Again("the server is going away")
+    elif f.kind == RST_STREAM:
+      if f.stream == 0 or f.payload.len != 4: code = PROTOCOL_ERROR
+      elif f.stream == id:
+        let rc = rd32(f.payload, 0)
+        if rc == 0 and status >= 200 and done: return http.Response(status, resp_headers, resp_body)
+        if rc == REFUSED_STREAM: fail Again("the server refused the request")
+        fail Stop("the server reset the request (error {rc})")
+    elif f.kind == PUSH_PROMISE:
+      code = PROTOCOL_ERROR     # we turned push off
+    elif f.kind == HEADERS or f.kind == CONTINUATION:
+      if f.stream != id: code = PROTOCOL_ERROR   # one stream at a time: no other stream is open
+      elif f.kind == HEADERS:
+        if in_block: code = PROTOCOL_ERROR
+        var ok = true
+        let frag = unpad(f, true, &ok)
+        if not ok: code = PROTOCOL_ERROR
+        else:
+          hblock = frag + ""
+          in_block = (f.flags & END_HEADERS) == 0
+          block_end = (f.flags & END_STREAM) != 0
+          block_frames = 1
+      else:
+        if not in_block: code = PROTOCOL_ERROR
+        else:
+          block_frames += 1
+          if block_frames > MAX_CONT or hblock.len + f.payload.len > MAX_HEADER_LIST: code = PROTOCOL_ERROR
+          else:
+            hblock += f.payload
+            in_block = (f.flags & END_HEADERS) == 0
+      if code == 0 and not in_block and (f.kind == HEADERS or f.kind == CONTINUATION):
+        var names: [Str] = []
+        var values: [Str] = []
+        if not decode_block(&k.hp, hblock, &names, &values): code = COMPRESSION_ERROR
+        elif status >= 200:
+          # trailers: they must end the stream; decoded to keep the table in step, then dropped
+          if not block_end: code = PROTOCOL_ERROR
+          else: done = true
+        else:
+          var st = -1
+          var bad = false
+          var hs: [http.Header] = []
+          var regular = false
+          for i in 0..names.len:
+            let n = names[i]
+            if n == ":status":
+              if regular or st >= 0 or values[i].len != 3: bad = true
+              else: st = int(values[i]) else -1
+            elif n.startswith(":"): bad = true
+            else:
+              regular = true
+              for j in 0..n.len:
+                if n[j] >= 'A' and n[j] <= 'Z': bad = true
+              hs.push(http.Header(n + "", values[i] + ""))
+          if bad or st < 100 or st > 999: code = PROTOCOL_ERROR
+          elif st < 200:
+            # an informational response (100 Continue...): the real one follows
+            if block_end: code = PROTOCOL_ERROR
+          else:
+            status = st
+            resp_headers = hs
+            if block_end: done = true
+    elif f.kind == DATA:
+      var ok = true
+      let data = unpad(f, false, &ok)
+      if not ok: code = PROTOCOL_ERROR
+      elif f.stream != id or status < 200: code = PROTOCOL_ERROR
+      else:
+        if resp_body.len + data.len > MAX_RESPONSE:
+          k.dead = true
+          fail Stop("the response is too large")
+        resp_body += data
+        # give the windows back as we read (the stream's only if more is coming)
+        if f.payload.len > 0:
+          var wu = frame(WINDOW_UPDATE, 0, 0, be32(f.payload.len))
+          if (f.flags & END_STREAM) == 0: wu += frame(WINDOW_UPDATE, 0, id, be32(f.payload.len))
+          match net.send(c, wu, timeout: timeout):
+            ok: wu = ""
+            err(e): problem = e
+        if (f.flags & END_STREAM) != 0: done = true
+    if problem != "":
+      k.dead = true
+      fail Stop(problem)
+    if code != 0:
+      k.dead = true
+      net.send(c, frame(GOAWAY, 0, 0, be32(0) + be32(code)), timeout: 5.0) else 0
+      fail Stop("protocol: the server broke HTTP/2 (error {code})")
+  if sent < body.len:
+    # the server answered before taking the whole body: we stop sending it (RFC 9113, 8.1)
+    net.send(c, frame(RST_STREAM, 0, id, be32(0)), timeout: timeout) else 0
+  let cl = http.find_header(resp_headers, "content-length")
+  if cl >= 0 and method != "HEAD" and status != 204 and status != 304:
+    let n = int(resp_headers[cl].value) else -1
+    if n != resp_body.len:
+      k.dead = true
+      fail Stop("protocol: the body's length isn't its content-length")
+  return http.Response(status, resp_headers, resp_body)
+
+# A Client2 for a connection that doesn't speak HTTP/2 (http.Client keeps one beside every connection).
+fn unused_client() -> Client2:
+  return Client2("", 0, Hpack([], [], 0, 4096, [], [], [], [], []), 1, 0, 0, 0, true, true)
+
+# Before a kept connection takes another request: reads what arrived since the last one (SETTINGS,
+# PING, WINDOW_UPDATE, GOAWAY) without waiting, and says whether it can still take a request.
+fn client_ready(net: Net, c: Conn, var k: Client2) -> Bool:
+  if k.dead or k.goaway: return false
+  while true:
+    var more = ""
+    var closed = false
+    match net.recv(c, timeout: 0.0):
+      ok(d):
+        if d.len == 0: closed = true
+        more = d
+      err(e):
+        if e != "timed out": closed = true
+        if not closed: break
+    if closed:
+      k.dead = true
+      return false
+    k.buf += more
+  while k.buf.len - k.at >= 9:
+    let n = rd24(k.buf, k.at)
+    if n > 16384:
+      k.dead = true
+      return false
+    if k.buf.len - k.at < 9 + n: break
+    let kind = int(k.buf[k.at + 3])
+    let flags = int(k.buf[k.at + 4])
+    let sid = rd32(k.buf, k.at + 5) & 2147483647
+    let p = k.buf[k.at + 9..k.at + 9 + n]
+    k.at += 9 + n
+    if kind == GOAWAY: k.goaway = true
+    elif kind == SETTINGS and sid == 0 and (flags & ACK) == 0:
+      if p.len % 6 != 0:
+        k.dead = true
+        return false
+      var i = 0
+      while i < p.len:
+        let id = (int(p[i]) << 8) | int(p[i + 1])
+        let v = rd32(p, i + 2)
+        if id == 4 and v <= 2147483647: k.init_window = v
+        elif id == 5 and v >= 16384 and v <= 16777215: k.max_frame = v
+        i += 6
+      net.send(c, frame(SETTINGS, ACK, 0, ""), timeout: 5.0) else return false
+    elif kind == PING and (flags & ACK) == 0 and p.len == 8:
+      net.send(c, frame(PING, ACK, 0, p), timeout: 5.0) else return false
+    elif kind == WINDOW_UPDATE and sid == 0 and p.len == 4:
+      k.conn_window += rd32(p, 0) & 2147483647
+    elif kind == HEADERS or kind == DATA or kind == CONTINUATION or kind == PUSH_PROMISE:
+      # nothing is open: a frame for a stream now is the server's mistake
+      k.dead = true
+      return false
+  if k.at > 65536:
+    k.buf = k.buf[k.at..k.buf.len]
+    k.at = 0
+  return not k.goaway
