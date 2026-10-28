@@ -165,18 +165,20 @@ what's inside one folder, enforced by the kernel, so code handed a `Dir` can't t
 arguments, results and messages as the reference server (`@modelcontextprotocol/server-filesystem`
 2.0.1, in Node), for clients of the 2026-07-28 protocol and the earlier ones.
 
-What it's for is trust. `main` opens each allowed folder as a `Dir` and passes on nothing else, so
-the compiler guarantees the tools can't open a socket, start a program or read a file outside those
-folders, and the kernel enforces the folder boundary. The Node server's safety rests on its own
-path checks and on its dependencies. And it's small: measured on a 2-vCPU Linux VM against the
+It starts in 1.7 ms instead of 203, uses 2 MB instead of 72, and searches 2,000 files in 2.6 ms
+instead of 149. And `main` opens each allowed folder as a `Dir` and passes on nothing else, so the
+compiler guarantees the tools can't open a socket, start a program or read a file outside those
+folders, and the kernel enforces the folder boundary. Measured on a 2-vCPU Linux VM against the
 reference server on Node 22 (`mcp/filesystem/README.md` has the details):
 
 | | Vu | Node reference |
 |---|---|---|
 | install | one 352 KB binary (libc only) | Node (125 MB) + 25 MB of node_modules |
-| memory (RSS) idle, per server | 2.1 MB | 72 MB |
 | start to the `initialize` answer | 1.7 ms | 203 ms |
+| memory (RSS), idle / after the runs below | 2.1 / 4.5 MB | 72 / 113 MB |
+| `read_text_file`, calls per second | 15,740 | 1,811 |
 | `search_files` over 2,000 files | 2.6 ms | 149 ms |
+| `directory_tree` of 2,000 files | 4.2 ms | 16.2 ms |
 
 `tests/run_mcp.sh` sends both servers the same requests (every tool, errors, bad arguments, both
 protocol eras, random edits, names and glob patterns) and checks every answer is the same JSON:

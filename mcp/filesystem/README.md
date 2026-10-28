@@ -31,8 +31,6 @@ compile (`unknown name 'net'`).
 
 ## Measured
 
-The point is what it can reach (above) and its size, since clients keep several servers running.
-Speed per call hardly matters: a model waits seconds on itself between calls.
 
 Linux VM, 2 vCPUs, Node 22, `mcp/filesystem/bench.py` (median of 15 starts; then 2,000 reads of a
 600-byte file, and 20 runs each of `search_files` and `directory_tree` over 40 folders of 50 files):
