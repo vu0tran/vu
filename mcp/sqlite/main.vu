@@ -1,0 +1,249 @@
+# mcp-sqlite: the MCP SQLite server (read_query, write_query, create_table, list_tables,
+# describe_table, append_insight; an mcp-demo prompt; a memo://insights resource) as one Vu program,
+# answering as the reference (mcp-server-sqlite 2025.4.25, Python) does: the same tools, results
+# (rows written as Python writes a list of dicts), messages and transactions.
+#
+#   vu build mcp/sqlite/main.vu -o mcp-sqlite
+#   mcp-sqlite [--db-path ./sqlite_mcp_server.db]
+#
+# What it can reach: main has Fs and Os at startup only (to find the database's path and make its
+# folder); the tools get Ffi (SQLite's C library) and the path, and nothing else: no network, no
+# other file, no program.
+import json
+import mcp
+import path
+import pyrepr
+import sqlite
+import stdio
+import tools
+
+type Env:
+  ffi: Ffi
+  db_path: Str
+
+# ---- Python's str.strip() and str.upper().startswith(), as the reference tests the SQL
+
+fn py_space(c: Str) -> Bool:
+  if c.len == 1:
+    let b = c[0]
+    return b == ' ' or (b >= 9 and b <= 13) or (b >= 0x1C and b <= 0x1F)
+  if not c.is_utf8(): return false
+  let cp = ord(c)
+  return cp == 0x85 or cp == 0xA0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200A) or cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F or cp == 0x3000
+
+fn py_strip(s: Str) -> Str:
+  var cs: [Str] = []
+  for c in s.chars(): cs.push(c)
+  var a = 0
+  var b = cs.len
+  while a < b and py_space(cs[a]): a += 1
+  while b > a and py_space(cs[b - 1]): b -= 1
+  var out = ""
+  for i in a..b: out += cs[i]
+  return out
+
+fn starts(sql: Str, words: [Str]) -> Bool:
+  let u = py_strip(sql).upper()
+  for w in words:
+    if u.startswith(w): return true
+  return false
+
+# Python's sqlite3 (in its default, legacy transaction mode) opens a transaction before a statement
+# whose first word, after spaces, tabs, line breaks, form feeds and comments, is INSERT, UPDATE,
+# DELETE or REPLACE.
+fn is_dml(sql: Str) -> Bool:
+  var i = 0
+  while i < sql.len:
+    let b = sql[i]
+    if b == ' ' or b == '\t' or b == 12 or b == '\n' or b == '\r': i += 1
+    elif b == '-' and i + 1 < sql.len and sql[i + 1] == '-':
+      while i < sql.len and sql[i] != '\n': i += 1
+    elif b == '/' and i + 1 < sql.len and sql[i + 1] == '*':
+      let e = sql.find("*/", i + 2)
+      if e < 0: return false
+      i = e + 2
+    else: break
+  let rest = sql[i..min(i + 7, sql.len)].lower()
+  return rest.startswith("insert") or rest.startswith("update") or rest.startswith("delete") or rest.startswith("replace")
+
+# ---- the reference's _execute_query: a connection per query; a write commits and reports
+# affected_rows, anything else returns its rows as dicts
+
+fn value_repr(v: sqlite.Value) -> Str:
+  match v:
+    sqlite.Null: return "None"
+    sqlite.Integer(n): return "{n}"
+    sqlite.Real(x): return pyrepr.float_repr(x)
+    sqlite.Text(s):
+      if s.is_utf8(): return pyrepr.str_repr(s)
+      var fixed = ""
+      for c in s.chars(): fixed += c
+      return pyrepr.str_repr(fixed)
+    sqlite.Blob(b): return pyrepr.bytes_repr(b)
+
+fn rows_repr(r: sqlite.Result) -> Str:
+  let nc = r.columns.len
+  # dict(row): a name given twice keeps its first place and its last value
+  var names: [Str] = []
+  var where: [Int] = []
+  for i in 0..nc:
+    var k = -1
+    for j in 0..names.len:
+      if names[j] == r.columns[i]: k = j
+    if k < 0:
+      names.push(r.columns[i] + "")
+      where.push(i)
+    else: where[k] = i
+  var rows: [Str] = []
+  for row in 0..r.count:
+    var parts: [Str] = []
+    for j in 0..names.len: parts.push(pyrepr.str_repr(names[j]) + ": " + value_repr(r.values[row * nc + where[j]]))
+    rows.push("{{" + ", ".join(parts) + "}}")
+  return "[" + ", ".join(rows) + "]"
+
+fn bad_text(r: sqlite.Result) -> Str:
+  let nc = r.columns.len
+  for row in 0..r.count:
+    for i in 0..nc:
+      match r.values[row * nc + i]:
+        sqlite.Text(s):
+          if not s.is_utf8(): return "Could not decode to UTF-8 column '" + r.columns[i] + "' with text '" + s + "'"
+        _: continue
+  return ""
+
+fn execute(e: Env, sql: Str) -> Str throws:
+  var db = sqlite.open(e.ffi, e.db_path)?
+  if is_dml(sql) and not sqlite.in_transaction(e.ffi, db): sqlite.run_sql(e.ffi, &db, "BEGIN ")?
+  let r = sqlite.run_sql(e.ffi, &db, sql)?
+  if starts(sql, ["INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER"]):
+    if sqlite.in_transaction(e.ffi, db): sqlite.run_sql(e.ffi, &db, "COMMIT")?
+    var n = -1
+    if is_dml(sql): n = r.changes
+    return "[{{'affected_rows': {n}}}]"
+  let bad = bad_text(r)
+  if bad != "": fail bad
+  # (the connection closes without a commit: a transaction it opened is rolled back)
+  return rows_repr(r)
+
+# ---- the tools
+
+type Memo:
+  insights: [Str]
+
+fn memo_text(m: Memo) -> Str:
+  if m.insights.len == 0: return "No business insights have been discovered yet."
+  var lines: [Str] = []
+  for x in m.insights: lines.push("- " + x)
+  var out = "📊 Business Intelligence Memo 📊\n\nKey Insights Discovered:\n\n" + "\n".join(lines)
+  if m.insights.len > 1:
+    out += "\nSummary:\nAnalysis has revealed {m.insights.len} key business insights that suggest opportunities for strategic optimization and growth."
+  return out
+
+fn text(t: Str) -> mcp.Outcome:
+  return mcp.Outcome("[{{\"type\":\"text\",\"text\":" + json.quote(t) + "}}]", "", false)
+
+# The SDK checks the arguments against the tool's input schema first (jsonschema's messages).
+fn schema_error(name: Str, args: json.Value) -> Str:
+  var field = ""
+  if name == "read_query" or name == "write_query" or name == "create_table": field = "query"
+  elif name == "describe_table": field = "table_name"
+  elif name == "append_insight": field = "insight"
+  if field == "": return ""
+  let v = json.at(args, field) else return "'" + field + "' is a required property"
+  match v:
+    json.Text(_): return ""
+    _: return pyrepr.repr(v) + " is not of type 'string'"
+
+fn tool(e: Env, var memo: Memo, name: Str, args: json.Value) -> mcp.Outcome:
+  let known = name == "read_query" or name == "write_query" or name == "create_table" or name == "list_tables" or name == "describe_table" or name == "append_insight"
+  if known:
+    let se = schema_error(name, args)
+    if se != "": return mcp.tool_error("Input validation error: " + se)
+  match run_tool(e, &memo, name, args):
+    ok(t): return text(t)
+    err(m):
+      # the reference tells sqlite3's errors from its own
+      if m.startswith("!"): return text("Error: " + m[1..m.len])
+      return text("Database error: " + m)
+
+fn run_tool(e: Env, var memo: Memo, name: Str, args: json.Value) -> Str throws:
+  if name == "list_tables": return execute(e, "SELECT name FROM sqlite_master WHERE type='table'")?
+  if name == "describe_table":
+    let t = json.str_at(args, "table_name") else ""
+    return execute(e, "PRAGMA table_info(" + t + ")")?
+  if name == "append_insight":
+    memo.insights.push(json.str_at(args, "insight") else "")
+    mcp.notify("notifications/resources/updated", "{{\"uri\":\"memo://insights\"}}")
+    return "Insight added to memo"
+  if json.keys(args).len == 0: fail "!Missing arguments"
+  let q = json.str_at(args, "query") else ""
+  if name == "read_query":
+    if not starts(q, ["SELECT"]): fail "!Only SELECT queries are allowed for read_query"
+    return execute(e, q)?
+  if name == "write_query":
+    if starts(q, ["SELECT"]): fail "!SELECT queries are not allowed for write_query"
+    return execute(e, q)?
+  if name == "create_table":
+    if not starts(q, ["CREATE TABLE"]): fail "!Only CREATE TABLE statements are allowed"
+    execute(e, q)?
+    return "Table created successfully"
+  fail "!Unknown tool: " + name
+
+# ---- the prompt and the resource
+
+fn request(s: mcp.Server, c: mcp.Call, method: Str, memo: Memo) -> Str:
+  if method == "prompts/list": return mcp.reply(s, c, "\"prompts\":" + tools.PROMPTS)
+  if method == "resources/list": return mcp.reply(s, c, "\"resources\":" + tools.RESOURCES)
+  # (the SDK's answer to a request without the params it needs)
+  let invalid = "{{\"jsonrpc\":\"2.0\",\"id\":" + c.id + ",\"error\":{{\"code\":-32602,\"message\":\"Invalid request parameters\",\"data\":\"\"}}}}"
+  if method == "prompts/get":
+    let name = json.str_at(c.args, "name") else return invalid
+    if name != "mcp-demo": return mcp.error_reply(c, 0, "Unknown prompt: " + name)
+    let topic = json.str_at(json.at(c.args, "arguments") else json.Obj({}), "topic") else return mcp.error_reply(c, 0, "Missing required argument: topic")
+    let body = tools.DEMO.replace("%TOPIC%", topic)
+    let f = "\"description\":" + json.quote("Demo template for " + topic) + ",\"messages\":[{{\"role\":\"user\",\"content\":{{\"type\":\"text\",\"text\":" + json.quote(body.strip()) + "}}}}]"
+    return mcp.reply(s, c, f)
+  # resources/read
+  let uri = json.str_at(c.args, "uri") else return invalid
+  let colon = uri.find(":")
+  var scheme = ""
+  if colon > 0: scheme = uri[0..colon].lower()
+  if scheme != "memo": return mcp.error_reply(c, 0, "Unsupported URI scheme: " + scheme)
+  let p = uri.replace("memo://", "")
+  if p != "insights": return mcp.error_reply(c, 0, "Unknown resource path: " + p)
+  return mcp.reply(s, c, "\"contents\":[{{\"uri\":" + json.quote(uri) + ",\"mimeType\":\"text/plain\",\"text\":" + json.quote(memo_text(memo)) + "}}]")
+
+fn main(fs: Fs, os: Os, ffi: Ffi):
+  let argv = args()
+  var db = "./sqlite_mcp_server.db"
+  var i = 1
+  while i < argv.len:
+    if argv[i] == "--db-path" and i + 1 < argv.len:
+      db = argv[i + 1] + ""
+      i += 1
+    elif argv[i].startswith("--db-path="): db = argv[i][10..argv[i].len]
+    i += 1
+  # Path(db_path).expanduser(), and its folder made
+  if db == "~" or db.startswith("~/"): db = os.env("HOME") + db[1..db.len]
+  let parent = path.dir(db)
+  if parent != "" and parent != ".": fs.mkdir(parent) else 0
+  let e = Env(ffi, db)
+  # (the reference opens the database once at startup, which creates the file)
+  sqlite.open(ffi, db) else panic("can't open the database at " + db)
+  serve(e)
+
+fn serve(e: Env):
+  var s = mcp.server(tools.NAME, tools.VERSION, tools.TOOLS) else panic("the tool list isn't valid JSON")
+  s.caps = tools.CAPS
+  s.unknown_tool = ""
+  s.says_ok = true
+  s.extra = ["prompts/list", "prompts/get", "resources/list", "resources/read"]
+  var memo = Memo([])
+  while true:
+    let line = stdio.line() else break
+    match mcp.handle(s, line):
+      mcp.Reply(t): mcp.send(t)
+      mcp.ToolCall(c): mcp.send(mcp.result(s, c, tool(e, &memo, c.name, c.args)))
+      mcp.PromptGet(_): continue
+      mcp.Request(c, method): mcp.send(request(s, c, method, memo))
+      mcp.Quiet: continue

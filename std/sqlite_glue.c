@@ -86,3 +86,55 @@ static vu_str sq_text(void *st, int64_t i) {
 
 static int64_t sq_changes(void *db) { return sqlite3_changes64((sqlite3 *)db); }
 static int64_t sq_last_id(void *db) { return sqlite3_last_insert_rowid((sqlite3 *)db); }
+
+/* For SQL from outside the program (sqlite.run_sql): one statement as given, refused (with Python's
+   sqlite3 words) when anything but spaces and comments follows it. (sq_is_blank first: SQL of only
+   spaces and comments has no statement to return.) */
+static bool sq_prepare_any(void *db, const vu_str *sql, void **out, vu_str *err) {
+    for (int64_t i = 0; i < sql->len; i++)
+        if (sql->data[i] == 0) { *err = vu_errf("the query contains a null character"); return false; }
+    if (sql->len > 1000000000) { *err = vu_errf("query string is too large"); return false; }
+    sqlite3_stmt *st = NULL;
+    const char *tail = NULL;
+    int rc = sqlite3_prepare_v2((sqlite3 *)db, (const char *)sql->data, (int)sql->len, &st, &tail);
+    if (rc != SQLITE_OK) { *err = vu_errf("%s", sqlite3_errmsg((sqlite3 *)db)); return false; }
+    if (tail) {
+        const char *c = tail, *end = (const char *)sql->data + sql->len;
+        while (c < end) {
+            if (*c == ' ' || *c == '\t' || *c == '\f' || *c == '\n' || *c == '\r') { c++; continue; }
+            if (c + 1 < end && c[0] == '-' && c[1] == '-') { while (c < end && *c != '\n') c++; continue; }
+            if (c + 1 < end && c[0] == '/' && c[1] == '*') {
+                c += 2;
+                while (c + 1 < end && !(c[0] == '*' && c[1] == '/')) c++;
+                if (c + 1 >= end) break;   /* an unclosed comment: the rest is comment */
+                c += 2;
+                continue;
+            }
+            if (st) sqlite3_finalize(st);
+            *err = vu_errf("You can only execute one statement at a time.");
+            return false;
+        }
+    }
+    if (!st) { *err = vu_errf("the SQL holds no statement"); return false; }
+    *out = st;
+    return true;
+}
+
+/* Whether the SQL holds no statement at all (only spaces and comments). */
+static bool sq_is_blank(void *db, const vu_str *sql) {
+    sqlite3_stmt *st = NULL;
+    for (int64_t i = 0; i < sql->len; i++) if (sql->data[i] == 0) return false;
+    if (sqlite3_prepare_v2((sqlite3 *)db, (const char *)sql->data, (int)sql->len, &st, NULL) != SQLITE_OK) return false;
+    if (st) { sqlite3_finalize(st); return false; }
+    return true;
+}
+/* 1 integer, 2 float, 3 text, 4 blob, 5 NULL (sqlite3_column_type) */
+static int64_t sq_kind(void *st, int64_t i) { return sqlite3_column_type((sqlite3_stmt *)st, (int)i); }
+static int64_t sq_int(void *st, int64_t i) { return sqlite3_column_int64((sqlite3_stmt *)st, (int)i); }
+static double sq_real(void *st, int64_t i) { return sqlite3_column_double((sqlite3_stmt *)st, (int)i); }
+static vu_str sq_blob(void *st, int64_t i) {
+    const void *b = sqlite3_column_blob((sqlite3_stmt *)st, (int)i);
+    int n = sqlite3_column_bytes((sqlite3_stmt *)st, (int)i);
+    return vu_str_from(b ? (const uint8_t *)b : (const uint8_t *)"", b ? n : 0);
+}
+static bool sq_in_txn(void *db) { return !sqlite3_get_autocommit((sqlite3 *)db); }

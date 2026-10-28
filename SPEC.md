@@ -1486,6 +1486,11 @@ for r in 0..rows.count:
 - As with `pg`, the SQL is a `const` parameter and values go as parameters (`?`), as text (`nil`
   is NULL); `get_int` and `get_float` read a column as a number. One statement per call; errors
   are SQLite's message. `tests/run_sqlite.sh` checks it against Python's sqlite3 module.
+- `sqlite.run_sql(ffi, &db, sql)` is for SQL that can't be written in the program (a console, a tool
+  a model calls): one statement as given, with no parameters, and a `Result` of columns and typed
+  values (`sqlite.Null`, `Integer(n)`, `Real(x)`, `Text(s)`, `Blob(b)`) and the rows changed. It
+  refuses more than one statement, as Python's sqlite3 does ("You can only execute one statement
+  at a time."). `sqlite.in_transaction(ffi, db)` says whether one is open. `mcp/sqlite` uses both.
 
 **`dir`**: a folder as a capability. `dir.open(fs, path)` needs `Fs`; the `Dir` it returns resolves
 every path inside the folder, in the kernel, so "..", symlinks that lead out (or absolute ones) and
@@ -1545,12 +1550,17 @@ while true:
     mcp.Quiet: continue
 ```
 
+A program can answer other methods itself (resources, say): it names them in `s.extra` and gets
+`mcp.Request(c, method)` with the request's params in `c.args`, answered with `mcp.reply(s, c,
+fields)`; `mcp.notify(method, params)` sends a notification. With `s.unknown_tool = ""`, a call to a
+tool that isn't listed comes to the program too.
+
 A server with prompts gives them as JSON too (`mcp.set_prompts(&s, PROMPTS)?`) and gets
 `mcp.PromptGet(c)` for each `prompts/get`, answered with `mcp.prompt_result(s, c, description,
 text)` or `mcp.error_reply(c, code, message)`.
 
 `mcp/filesystem/main.vu` is a whole server on it: the reference MCP filesystem server's 14 tools,
-reaching only the folders it was started with; `mcp/time` and `mcp/fetch` are two more.
+reaching only the folders it was started with; `mcp/time`, `mcp/fetch` and `mcp/sqlite` are more.
 
 The standard library's own C (`dir`, `stdio`) is part of Vu, like the runtime: its modules may make the
 `Ffi` they pass to their extern functions (`Ffi()`), which no program or package can.

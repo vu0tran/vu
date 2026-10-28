@@ -2165,3 +2165,17 @@ Python 3.13, and the test skips those names when `tzdata` is installed. On ARM64
 Also this round: `mcp/vu`, Vu's checker as an MCP server for a model writing Vu (`vu_check` on one
 file or several, `vu_docs` with `llms.txt`); `tests/run_mcp_vu.sh`. Releases now carry `llms.txt`
 and the time, fetch and vu servers.
+
+And `mcp/sqlite` (`mcp-server-sqlite` 2025.4.25): 2.1 ms to start against 443, 3.4 MB against 57,
+15,683 `read_query` calls a second against 457. The reference is archived and no longer starts with
+the current Python MCP SDK (2.x); it's compared on `mcp<2`. For it: `sqlite.run_sql` (SQL given as
+text, values with their types; it refuses several statements in Python's words) and
+`sqlite.in_transaction`; `mcp` lets a program answer other methods (`s.extra`, `Request`, `reply`,
+`notify`) and unknown tools itself; `pyrepr` became a local package shared by the fetch and SQLite
+servers (`need ../pyrepr`). What the comparison found (random sessions of tool calls, about 450
+answers a seed): Python's sqlite3 opens a transaction before an INSERT, UPDATE, DELETE or REPLACE
+even after a comment, so `/* c */ INSERT ...` through `write_query` (which commits only SQL that
+starts with INSERT) is rolled back there, and here too now; the SDK answers a request without the
+params it needs with its own -32602; and the two SQLite libraries (Python's bundled 3.53, the
+system's) report different errors first for a statement that is wrong twice over, which the test
+now avoids. Then six seeds, about 2,700 answers, the same, plain and with AddressSanitizer.
