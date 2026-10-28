@@ -39,7 +39,7 @@ export -f suite; export out
 # side by side, longest first (times from a gate on 2 cores)
 together=(run_differential.sh run_targeted.sh run_arm64.sh run_fmt.sh run_loops.sh run_selfhost.sh run_macos.sh run_json.sh
           run_zlib.sh run_debug.sh run_re.sh run_modules.sh run_tests.sh run_ffi.sh run_crypto.sh run_text.sh run_path.sh
-          run_cli_std.sh run_pkg.sh run_cli.sh run_tools.sh run_wasm.sh run_sqlite.sh run_time_zones.sh run_profile.sh)
+          run_cli_std.sh run_pkg.sh run_cli.sh run_tools.sh run_wasm.sh run_sqlite.sh run_time_zones.sh run_profile.sh run_norm.sh)
 # alone: servers and clients over real sockets, threads, memory and timing measurements
 alone=(run_net.sh run_tls.sh run_http.sh run_web.sh run_h2.sh run_ws.sh run_pg.sh run_pg_hostile.sh run_pg_tls.sh run_http_client.sh run_web_sockets.sh run_mt.sh run_memory.sh)
 printf '%s\n' "${together[@]}" | xargs -P "$jobs" -I{} bash -c 'suite {}'
@@ -49,7 +49,7 @@ fail=0
 for s in run_selfhost.sh run_tests.sh run_cli.sh run_targeted.sh run_json.sh run_differential.sh run_debug.sh run_modules.sh \
          run_text.sh run_net.sh run_memory.sh run_ffi.sh run_tls.sh run_http.sh run_web.sh run_mt.sh \
          run_crypto.sh run_re.sh run_path.sh run_cli_std.sh run_fmt.sh run_tools.sh run_pkg.sh run_pg.sh run_pg_hostile.sh run_pg_tls.sh run_http_client.sh run_web_sockets.sh \
-         run_ws.sh run_h2.sh run_loops.sh run_zlib.sh run_arm64.sh run_macos.sh run_wasm.sh run_sqlite.sh run_time_zones.sh run_profile.sh; do
+         run_ws.sh run_h2.sh run_loops.sh run_zlib.sh run_arm64.sh run_macos.sh run_wasm.sh run_sqlite.sh run_time_zones.sh run_profile.sh run_norm.sh; do
   r=$(tr -d '\0' < "$out/$s.log" 2>/dev/null); rc=$(cat "$out/$s.rc" 2>/dev/null || echo 1); t=$(cat "$out/$s.t" 2>/dev/null)
   if [ $s = run_selfhost.sh ]; then
     echo "$s: $(echo "$r" | tail -1) [$t s]"; echo "$r" | grep -a '^FAIL'

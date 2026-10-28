@@ -853,6 +853,111 @@ fn put_idle(var cl: Client, own it: Idle):
 fn close_all(var cl: Client):
   cl.idle = []
 
+# What fetch_all gives for each request: the response (ok), or why it failed.
+type Fetched:
+  ok: Bool
+  resp: Response
+  error: Str
+
+# Sends all the requests and returns what came of each, in order. Requests to an https server that
+# speaks HTTP/2 go at once, on one connection (as many streams as it allows), and their responses
+# arrive interleaved; the rest go one after another on kept connections, as fetch sends them.
+fn fetch_all(var cl: Client, net: Net, reqs: [ClientRequest]) -> [Fetched]:
+  var out: [Fetched] = []
+  var keys: [Str] = []
+  for r in reqs:
+    out.push(Fetched(false, Response(0, [], ""), "not sent"))
+    var key = ""
+    match parse_url(r.url):
+      ok(u):
+        if u.tls and cl.http2: key = "https://" + u.host + ":{u.port} " + r.ca
+      err(e): key = ""
+    keys.push(key)
+  var done: [Bool] = [false] * reqs.len
+  for i in 0..reqs.len:
+    if done[i] or keys[i] == "": continue
+    # everything for this server: try HTTP/2, all at once
+    var group: [Int] = []
+    for j in i..reqs.len:
+      if not done[j] and keys[j] == keys[i]: group.push(j)
+    if group.len < 2: continue
+    let u = parse_url(reqs[i].url) else continue
+    var it = take_idle(&cl, keys[i] + "")
+    var cn: Conn? = nil
+    swap(&cn, &it.conn)
+    var usable = false
+    if c = cn:
+      if it.h2: usable = h2.client_ready(net, c, &it.k)
+    if not usable:
+      cn = nil
+      let c2 = open_conn(net, u, reqs[i].ca, "h2,http/1.1", reqs[i].timeout) else continue
+      cl.opened += 1
+      if net.protocol(c2) != "h2":
+        # not HTTP/2: keep the connection for fetch, which sends these one by one
+        put_idle(&cl, Idle(keys[i] + "", c2, false, h2.unused_client()))
+        continue
+      let k = h2.client_start(net, c2, reqs[i].timeout) else continue
+      it = Idle(keys[i] + "", nil, true, k)
+      cn = c2
+    else:
+      cl.reused += 1
+    var batch: [h2.Req2] = []
+    for j in group:
+      let r = reqs[j]
+      let uj = parse_url(r.url) else continue
+      var hs: [Header] = []
+      var bad = ""
+      for h in r.headers:
+        match check_header(h):
+          ok: bad = bad
+          err(e): bad = e
+        let n = lower_str(h.name)
+        if n == "host" or n == "content-length" or n == "connection" or n == "transfer-encoding" or n == "keep-alive" or n == "upgrade" or n == "te": bad = "the header '" + h.name + "' is set by the client"
+        hs.push(Header(n, h.value + ""))
+      if find_header_ci(hs, "user-agent") < 0: hs.push(Header("user-agent", "vu-http"))
+      for b in 0..r.method.len:
+        if not is_tchar(r.method[b]): bad = "the method '" + r.method + "' isn't a token"
+      if bad != "":
+        out[j] = Fetched(false, Response(0, [], ""), bad)
+        done[j] = true
+        hs = []
+      batch.push(h2.Req2(r.method + "", "https", host_port(uj), uj.target + "", hs, r.body + ""))
+    var sent: [Int] = []
+    var real: [h2.Req2] = []
+    for bi in 0..group.len:
+      let j = group[bi]
+      if not done[j]:
+        sent.push(j)
+        var x = h2.Req2("", "", "", "", [], "")
+        swap(&x, &batch[bi])
+        real.push(x)
+    var timeout = 30.0
+    if sent.len > 0: timeout = reqs[sent[0]].timeout
+    if c = cn:
+      var st = h2.requests(net, c, &it.k, real, timeout)
+      for si in 0..st.len:
+        let j = sent[si]
+        if st[si].why == "":
+          var rh: [Header] = []
+          swap(&rh, &st[si].headers)
+          var rb = ""
+          swap(&rb, &st[si].body)
+          out[j] = Fetched(true, Response(st[si].status, rh, rb), "")
+          done[j] = true
+        elif not st[si].again:
+          out[j] = Fetched(false, Response(0, [], ""), st[si].why + "")
+          done[j] = true
+    if not it.k.dead and not it.k.goaway:
+      swap(&cn, &it.conn)
+      put_idle(&cl, it)
+  # the rest (HTTP/1.1, single requests, and those an HTTP/2 server didn't take): one by one
+  for i in 0..reqs.len:
+    if done[i]: continue
+    match fetch(&cl, net, reqs[i]):
+      ok(r): out[i] = Fetched(true, r, "")
+      err(e): out[i] = Fetched(false, Response(0, [], ""), e)
+  return out
+
 # Whether a kept connection still looks usable: nothing has arrived on it (a close, or bytes no request asked for).
 fn still_open(net: Net, c: Conn) -> Bool:
   match net.recv(c, timeout: 0.0):

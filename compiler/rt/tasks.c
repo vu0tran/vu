@@ -141,7 +141,7 @@ const char *__asan_default_options(void) { return "detect_stack_use_after_return
 #define VU_TASK_STACK ((size_t)8 << 20)
 #define VU_TASK_GUARD ((size_t)64 << 10)
 #define VU_MAX_LOOPS 256
-enum { VU_W_NONE, VU_W_FD, VU_W_CHAN, VU_W_SLEEP };
+enum { VU_W_NONE, VU_W_FD, VU_W_CHAN, VU_W_SLEEP, VU_W_SEL };
 typedef struct vu_task vu_task;
 typedef struct vu_loop vu_loop;
 struct vu_task {
@@ -166,6 +166,7 @@ struct vu_task {
     bool started;                 /* has run: then it stays on its thread (see vu_steal); read by other
                                      threads, so only through vu_has_started */
     bool uncounted;               /* waiting on a channel with no deadline: not counted in vu_nactive */
+    int sel_state;                /* a select waiting on channels only: 1 while waiting, 2 once woken */
     void *fake_stack;             /* AddressSanitizer's per-fiber state */
     void *tsan_fiber;
 };
@@ -623,6 +624,9 @@ static void vu_poll(void) {
             if (found) *q = t->next;
             pthread_mutex_unlock(cl);
             if (!found) continue;   /* a sender or receiver woke it meanwhile */
+        } else if (t->wait_kind == VU_W_SEL) {
+            int one = 1;
+            if (!__atomic_compare_exchange_n(&t->sel_state, &one, 2, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) continue;
         }
         t->timed_out = true;
         t->wait_kind = VU_W_NONE;
@@ -818,8 +822,26 @@ typedef struct vu_chan {
     char *buf;
     bool closed;
     vu_task *rq, *sq;             /* tasks waiting to receive / to send */
+    struct vu_watch *watch;       /* selects waiting for it to change */
     void (*drop)(void *);         /* frees a value left in the channel */
 } vu_chan;
+/* A select waiting on a channel: woken when anything changes there (a value in or out, a close). With a
+   socket among its arms it waits on that socket's reader slot (sock), and is woken by taking it from the
+   slot, as the timer and the poller do; otherwise through sel_state. */
+typedef struct vu_watch { vu_task *t; vu_sock *sock; struct vu_watch *next; } vu_watch;
+/* With c locked */
+static void vu_chan_notify(vu_chan *c) {
+    for (vu_watch *w = c->watch; w; w = w->next) {
+        vu_task *t = w->t;
+        if (w->sock) {
+            vu_task *expected = t;
+            if (__atomic_compare_exchange_n(&w->sock->reader, &expected, NULL, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) vu_wake(t);
+        } else {
+            int one = 1;
+            if (__atomic_compare_exchange_n(&t->sel_state, &one, 2, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) vu_wake(t);
+        }
+    }
+}
 static vu_chan *vu_chan_new(int64_t cap, size_t esz, void (*drop)(void *), int line) {
     if (cap < 1 || cap > ((int64_t)1 << 40) / (int64_t)(esz ? esz : 1))
         vu_fail(line, "chan(%lld): a channel holds 1 or more values", (long long)cap);
@@ -887,7 +909,31 @@ static void vu_chan_send(vu_chan *c, const void *v, int line) {
     memcpy(c->buf + (size_t)((c->head + c->len) % c->cap) * c->esz, v, c->esz);
     c->len++;
     vu_chan_wake(&c->rq);
+    vu_chan_notify(c);
     pthread_mutex_unlock(&c->lock);
+}
+/* ch.send(v, timeout: s): fails if the channel stays full that long, or is closed (v is then freed). */
+static bool vu_chan_send_t(vu_chan *c, void *v, double timeout, bool has, vu_str *err, int line) {
+    vu_task_here("send() on a channel", line);
+    int64_t deadline = vu_deadline(timeout, has, line);
+    pthread_mutex_lock(&c->lock);
+    while (!c->closed && c->len == c->cap) {
+        if (deadline >= 0 && vu_now_ns() >= deadline) break;
+        vu_chan_wait(c, &c->sq, deadline, line);
+    }
+    if (c->closed || c->len == c->cap) {
+        bool closed = c->closed;
+        pthread_mutex_unlock(&c->lock);
+        if (c->drop) c->drop(v);
+        *err = vu_errf(closed ? "the channel is closed" : "timed out");
+        return false;
+    }
+    memcpy(c->buf + (size_t)((c->head + c->len) % c->cap) * c->esz, v, c->esz);
+    c->len++;
+    vu_chan_wake(&c->rq);
+    vu_chan_notify(c);
+    pthread_mutex_unlock(&c->lock);
+    return true;
 }
 static bool vu_chan_recv(vu_chan *c, void *out, double timeout, bool has, vu_str *err, int line) {
     vu_task_here("recv() on a channel", line);
@@ -903,6 +949,7 @@ static bool vu_chan_recv(vu_chan *c, void *out, double timeout, bool has, vu_str
     c->len--;
     vu_chan_wake(&c->sq);
     if (c->len > 0) vu_chan_wake(&c->rq);   /* another receiver can take the next value */
+    vu_chan_notify(c);
     pthread_mutex_unlock(&c->lock);
     return true;
 }
@@ -912,6 +959,7 @@ static void vu_chan_close(vu_chan *c, int line) {
     c->closed = true;
     while (c->rq) vu_chan_wake(&c->rq);
     while (c->sq) vu_chan_wake(&c->sq);
+    vu_chan_notify(c);
     pthread_mutex_unlock(&c->lock);
 }
 /* ch.closed(): whether close() was called (a closed channel is how one task tells many to stop) */
@@ -928,6 +976,7 @@ static void vu_chan_offer(vu_chan *c, const void *v) {
         memcpy(c->buf + (size_t)((c->head + c->len) % c->cap) * c->esz, v, c->esz);
         c->len++;
         vu_chan_wake(&c->rq);
+        vu_chan_notify(c);
     }
     pthread_mutex_unlock(&c->lock);
 }
@@ -1270,6 +1319,7 @@ static bool vu_net_connect(vu_cap net, const vu_str *host, int64_t port, double 
     return ok;
 }
 #ifndef VU_TLS
+static int vu_tls_pending(vu_sock *s) { (void)s; return 0; }
 static void vu_tls_free(vu_sock *s) { (void)s; }
 static bool vu_tls_accepted(vu_sock *l, vu_sock *s, vu_str *err) { (void)l; (void)s; (void)err; return true; }
 static bool vu_tls_recv(vu_sock *c, int64_t deadline, vu_str *out, vu_str *err, int line) {
@@ -1287,6 +1337,7 @@ static bool vu_tls_send(vu_sock *c, const uint8_t *data, int64_t len, int64_t de
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
 #include <arpa/inet.h>
+static int vu_tls_pending(vu_sock *s) { return s->ssl ? SSL_pending((SSL *)s->ssl) : 0; }
 /* A socket BIO that sends with MSG_NOSIGNAL: a write to a closed connection is an error, never SIGPIPE. */
 static int vu_bio_write(BIO *b, const char *d, int n) {
     BIO_clear_retry_flags(b);
@@ -1671,5 +1722,122 @@ static vu_str vu_net_protocol(vu_cap net, void *c) {
     return r;
 }
 #endif
+/* -- select: waits until one of its arms can go ahead, then does it. Arms: take a value from a channel
+   (or see it closed), put one in, see a channel closed, see data on a connection (or its end). */
+#include <poll.h>
+enum { VU_SEL_RECV, VU_SEL_SEND, VU_SEL_CLOSED, VU_SEL_READABLE, VU_SEL_OFF };
+static __thread uint64_t vu_sel_rng;
+static uint64_t vu_rand_u64(void) {
+    uint64_t x = vu_sel_rng ? vu_sel_rng : (uint64_t)(uintptr_t)&vu_sel_rng ^ (uint64_t)vu_now_ns();
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    vu_sel_rng = x;
+    return x;
+}
+typedef struct { int kind; vu_chan *ch; void *buf; vu_sock *sock; } vu_sel;
+/* Whether arm a can go ahead now; a recv or send arm does its part if so. */
+static bool vu_sel_try(vu_sel *a) {
+    if (a->kind == VU_SEL_OFF) return false;
+    if (a->kind == VU_SEL_READABLE) {
+        if (vu_tls_pending(a->sock) > 0) return true;
+        struct pollfd p = {.fd = a->sock->fd, .events = POLLIN};
+        return poll(&p, 1, 0) > 0;
+    }
+    vu_chan *c = a->ch;
+    bool ok = false;
+    pthread_mutex_lock(&c->lock);
+    if (a->kind == VU_SEL_CLOSED) ok = c->closed && c->len == 0;   /* (closed, and nothing left to take) */
+    else if (a->kind == VU_SEL_RECV && c->len > 0) {
+        memcpy(a->buf, c->buf + (size_t)c->head * c->esz, c->esz);
+        c->head = (c->head + 1) % c->cap;
+        c->len--;
+        vu_chan_wake(&c->sq);
+        if (c->len > 0) vu_chan_wake(&c->rq);
+        vu_chan_notify(c);
+        ok = true;
+    } else if (a->kind == VU_SEL_SEND && !c->closed && c->len < c->cap) {
+        memcpy(c->buf + (size_t)((c->head + c->len) % c->cap) * c->esz, a->buf, c->esz);
+        c->len++;
+        vu_chan_wake(&c->rq);
+        vu_chan_notify(c);
+        ok = true;
+    }
+    pthread_mutex_unlock(&c->lock);
+    return ok;
+}
+static void vu_watch_drop(vu_chan *c, vu_watch *w) {
+    pthread_mutex_lock(&c->lock);
+    vu_watch **q = &c->watch;
+    while (*q && *q != w) q = &(*q)->next;
+    if (*q) *q = w->next;
+    pthread_mutex_unlock(&c->lock);
+}
+/* The arm that went ahead (its index), or n when the deadline came first. Arms are tried from a
+   random one on, so a busy one can't keep the others waiting forever. */
+static int vu_select(vu_sel *a, int n, double timeout, bool has, int line) {
+    vu_task_here("select", line);
+    int64_t deadline = vu_deadline(timeout, has, line);
+    vu_task *t = vu_cur_task;
+    vu_sock *sock = NULL;
+    int live = 0;
+    for (int i = 0; i < n; i++) {
+        if (a[i].kind == VU_SEL_READABLE) sock = a[i].sock;
+        if (a[i].kind != VU_SEL_OFF) live++;
+    }
+    if (!live && !has) vu_fail(line, "select: every arm's condition is false, and there's no timeout: it would wait forever");
+    vu_watch ws[64];
+    if (n > 64) vu_fail(line, "a select has at most 64 arms");
+    int start = n ? (int)(vu_rand_u64() % (uint64_t)n) : 0;
+    for (;;) {
+        for (int k = 0; k < n; k++) {
+            int i = (start + k) % n;
+            if (vu_sel_try(&a[i])) return i;
+        }
+        if (deadline >= 0 && vu_now_ns() >= deadline) return n;
+        /* wait: watch every channel, then look once more (what changed meanwhile has woken this task) */
+        if (sock) vu_sock_watch(sock, line);
+        else __atomic_store_n(&t->sel_state, 1, __ATOMIC_SEQ_CST);
+        t->wait_kind = sock ? VU_W_FD : VU_W_SEL;
+        t->wait_obj = sock;
+        t->writing = false;
+        t->wait_line = line;
+        t->timed_out = false;
+        if (sock) __atomic_store_n(&sock->reader, t, __ATOMIC_SEQ_CST);
+        for (int i = 0; i < n; i++) {
+            ws[i].t = t;
+            ws[i].sock = sock;
+            ws[i].next = NULL;
+            if (a[i].kind == VU_SEL_READABLE || a[i].kind == VU_SEL_OFF) continue;
+            pthread_mutex_lock(&a[i].ch->lock);
+            ws[i].next = a[i].ch->watch;
+            a[i].ch->watch = &ws[i];
+            pthread_mutex_unlock(&a[i].ch->lock);
+        }
+        int got = -1;
+        for (int k = 0; k < n && got < 0; k++) {
+            int i = (start + k) % n;
+            if (vu_sel_try(&a[i])) got = i;
+        }
+        bool woken = false;   /* someone has woken (or is waking) this task: that wake must be taken */
+        if (got >= 0 || (sock && __atomic_exchange_n(&sock->rpend, 0, __ATOMIC_SEQ_CST))) {
+            if (sock) {
+                vu_task *expected = t;
+                woken = !__atomic_compare_exchange_n(&sock->reader, &expected, NULL, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            } else {
+                int one = 1;
+                woken = !__atomic_compare_exchange_n(&t->sel_state, &one, 0, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+            }
+            if (woken) vu_block();
+        } else {
+            vu_wait_until(deadline);
+            vu_block();
+        }
+        vu_heap_remove(t);
+        t->wait_kind = VU_W_NONE;
+        __atomic_store_n(&t->sel_state, 0, __ATOMIC_SEQ_CST);
+        for (int i = 0; i < n; i++) if (a[i].kind != VU_SEL_READABLE && a[i].kind != VU_SEL_OFF) vu_watch_drop(a[i].ch, &ws[i]);
+        if (got >= 0) return got;
+        start = (start + 1) % (n ? n : 1);
+    }
+}
 static void drop_X_Conn(void **p) { if (*p) { vu_sock_drop(*p); *p = NULL; } }
 static void drop_X_Listener(void **p) { if (*p) { vu_sock_drop(*p); *p = NULL; } }

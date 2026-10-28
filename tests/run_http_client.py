@@ -291,6 +291,55 @@ expect('h2 package server: a 16-byte window, GOAWAY after every 3 requests (new 
        lines, want, lambda t: t.startswith('opened 5 '), CA)
 srv.close()
 
+# ---- fetch_all: many requests at once on one HTTP/2 connection
+vs = Server(vu_server, D)
+vb = f'https://localhost:{vs.port}'
+sizes = [i * 7919 % 300000 for i in range(30)]
+expect('fetch_all: 30 GETs and 2 POSTs to Vu\'s server on one connection, answered in order',
+       [f'GET {vb}/big?n={n} 0' for n in sizes] + [f'POST {vb}/echo 70000', f'POST {vb}/echo 3'],
+       [f'200 {n} {h(abc(n))}' for n in sizes] + ['200 70000 ' + h(b'b' * 70000), '200 3 ' + h(b'bbb')], 'opened 1 reused 0', CA, 'h2', 'all')
+expect('fetch_all: two servers and a bad URL mixed', [f'GET {vb}/big?n=5 0', f'GET {base}/?6 0', 'GET nope://x 0', f'GET {vb}/big?n=7 0', f'GET {base}/?8 0'],
+       ['200 5 ' + h(abc(5)), '200 6 ' + h(abc(6)), "error: the URL must start with http:// or https://", '200 7 ' + h(abc(7)), '200 8 ' + h(abc(8))],
+       lambda t: t.startswith('opened 2 '), CA, 'h2', 'all')
+vs.p.terminate()
+vs.finish()
+# the h2 package server, holding every response until 8 requests are open at once: only multiplexing gets through
+held = {'max': 0}
+
+
+def hold_conn(s):
+    cfg = h2.config.H2Configuration(client_side=False, header_encoding=None)
+    c = h2.connection.H2Connection(config=cfg)
+    c.initiate_connection()
+    c.update_settings({h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 8})
+    s.sendall(c.data_to_send())
+    waiting = []
+    while True:
+        data = s.recv(65536)
+        if not data:
+            return
+        for ev in c.receive_data(data):
+            if isinstance(ev, h2.events.RequestReceived):
+                path = dict(ev.headers)[b':path'].decode()
+                waiting.append((ev.stream_id, int(path.split('?')[1])))
+        held['max'] = max(held['max'], len(waiting))
+        if len(waiting) >= 8 or (waiting and waiting[-1][1] < 0):
+            for sid, n in waiting:
+                body = abc(max(n, 0))
+                c.send_headers(sid, [(':status', '200'), ('content-length', str(len(body)))])
+                c.send_data(sid, body, end_stream=True)
+            waiting = []
+        s.sendall(c.data_to_send())
+
+
+srv, port = tls_server(hold_conn)
+pb = f'https://localhost:{port}'
+ns = list(range(1, 17))
+expect('fetch_all: 16 requests to a server that answers only once 8 are open (its limit): two batches of 8 at once',
+       [f'GET {pb}/?{n} 0' for n in ns], [f'200 {n} {h(abc(n))}' for n in ns], 'opened 1 reused 0', CA, 'h2', 'all')
+check('...the server saw 8 open at once', held['max'] == 8, held)
+srv.close()
+
 # ---- servers that break HTTP/2 (hand-built frames): each must end in an error, never a crash or a hang
 
 

@@ -253,6 +253,23 @@ for s in shapes: print("{area(s)}")      # each calls its own type's area
   function isn't a value (wrap it: `fn(c: Circle) => area(c)`). Interface values can't be compared
   with `==`, matched, written as JSON, used as map keys, or put in a `Shared` value (the type behind
   one could hold a connection); they can go through channels.
+- **Generic interfaces** take type parameters, used in their functions' other parameters and
+  results:
+
+  ```
+  interface Store[T]:
+    fn get(s: Self, i: Int) -> T
+    fn put(var s: Self, x: T)
+
+  impl Store[Int] for Ints: ...           # each instance is implemented like an interface
+  fn total[S: Store[Int]](s: S) -> Int: ...
+  fn first[S: Store[T], T](s: S) -> T:    # T comes from the instance S implements
+    return get(s, 0)
+  let all: [Store[Str]] = [Words(["a"])]  # values of an instance
+  ```
+
+  A type implements one instance of a generic interface (`Store[Int]` or `Store[Str]`, not both),
+  so `get(x, 0)` always knows which.
 
 ## Closures and function values
 
@@ -650,11 +667,35 @@ fn main() throws:
 ```
 
 - `ch.recv()` fails when the channel is closed and empty, or when its `timeout: seconds` passes.
-  `ch.send(v)` on a closed channel stops the program. `ch.close()` wakes every task waiting on it.
+  `ch.send(v)` on a closed channel stops the program; `ch.send(v, timeout: s)` instead fails (the
+  channel stayed full that long, or is closed: `v` is then freed), so it's handled like `recv`.
+  `ch.close()` wakes every task waiting on it.
 - Passing a channel to an `own` parameter shares it (both sides keep using it); `ch.share()`
   makes another handle to store in a struct or list. The channel is freed, with any values still
   in it, when its last handle goes.
 - `os.sleep(seconds)` waits without blocking other tasks.
+- **`select`** waits for whichever of several things happens first, then runs that arm:
+
+  ```
+  select:
+    let job = jobs.recv():          # a value from jobs
+      run(job)
+    results.send(r):                # room in results: r goes in (a variable moves only if this arm runs)
+      sent += 1
+    net.readable(conn):             # data (or the other side's close) on a connection; a nil Conn? sits out
+      let d = net.recv(conn)?
+    stop.closed():                  # stop is closed and empty
+      return
+    timeout 5.0:                    # nothing else within 5 seconds
+      print("idle")
+  ```
+
+  An arm followed by `if condition` takes part only when that's true (`jobs.closed() if not
+  jobs_done:`), which is how a loop stops waiting on a channel it has seen closed; a closed channel's
+  arm would otherwise be ready on every pass. When several arms are ready, one is picked at random,
+  so a busy channel can't keep the others waiting. A select waits on one connection at most, and its
+  channels must be variables or fields. A select with no timeout waiting on channels nothing will
+  feed isn't reported as a deadlock: it waits.
 - `ch.closed()` says whether the channel was closed: closing one channel is how one task tells
   many to stop (each checks `closed()` between the things it waits for).
 - If every task is waiting on a channel and nothing (a connection, a timer) can wake any of
@@ -822,6 +863,7 @@ let t = s.strip()                       # also s.lstrip(), s.rstrip(); s.strip("
 let ys = sorted(xs)                     # a sorted copy; sorted(xs, reverse: true)
 xs.sort()                               # in place; xs.sort(reverse: true)
 xs.sort(by: fn(a, b) => a.n > b.n)     # any element type: by says whether a goes first (stable)
+xs.sort(key: fn(p) => p.age)            # by what the function gives for each (Int, Float, Byte, Bool or Str)
 xs.swap(i, j)                           # exchange two elements in place
 let lo = min(xs)                        # min/max of a list, or of two or more numbers: max(a, b, c)
 if 3 in xs: ...                         # whether an element == 3 (lists of Int, Float, Byte, Bool, Str)
@@ -833,6 +875,8 @@ Text: strings are bytes, and these read them as UTF-8 characters, with Python's 
 "straße".upper()          # "STRASSE": Python's full Unicode case mapping (also s.lower())
 "aé中😀".char_count()     # 4 (s.len is 10: bytes)
 for c in s.chars(): ...    # each character as a Str
+s.normalize("NFC")          # Unicode normalization: "NFC", "NFD", "NFKC" or "NFKD", as Python's
+s.is_alpha()                # and is_digit, is_space, is_alnum, is_upper, is_lower, is_decimal: Python's isalpha()...
 ord("é")                   # 233; chr(233) is "é"
 s.find("é")                # the byte index of the first "é" (for s[a..b]), or -1
 s.find("é", 10)            # the first at or after byte 10 (a negative start counts from the end)
@@ -901,7 +945,7 @@ vu fmt file.vu... [--check] # rewrite spacing the one way (--check: list files i
 vu test file.vu...          # run each fn test_... in its own process; report which pass
 vu get [file.vu]            # fetch the packages in vu.pkg, write vu.lock (see Packages)
 vu search WORDS / vu add NAME  # the package registry (see Packages); vu publish NAME VERSION
-vu version                  # the release: vu 0.1.0
+vu version                  # the release: vu 0.2.0
 vu new web NAME             # a folder NAME with a web app: main.vu, public/, Dockerfile, fly.toml
 vu lsp                      # a language server for editors (diagnostics, formatting, hover, definition, completion)
 ```
@@ -1168,6 +1212,9 @@ fn main(net: Net) throws:
   (`ca`: PEM certificates to trust for https, `""` for the system's). It sends one request per
   connection and reads bodies by length, chunked, or until the connection closes (up to 64 MB).
   It returns redirects instead of following them.
+- `client.fetch_all(net, requests)` sends a list of requests and gives an `http.Fetched` for each
+  (`ok`, `resp`, `error`), in order: those to an HTTP/2 server go out at once on one connection, as
+  many streams as the server allows, and their answers come back interleaved.
 - A `Client` keeps connections open between requests and speaks HTTP/2 to https servers that
   offer it (ALPN), else HTTP/1.1 with keep-alive:
 
@@ -1255,13 +1302,21 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   socket to own, with the request and the context, and has the connection until it returns:
 
   ```
-  fn chat(net: Net, own s: ws.Socket, req: http.Request, c: web.Ctx):
+  fn chat(net: Net, own inbox: Chan[Str], own s: ws.Socket, req: http.Request, c: web.Ctx):
     var sock = s
     ws.send_text(net, &sock, "hello " + web.param(c, "room")) else return
     while true:
-      let m = ws.poll(net, &sock, 0.05) else return     # nil if nothing came in 50 ms
-      # ... handle m, then send what other tasks queued for this socket on a channel
-  app.websocket("/rooms/:room", own fn(own s, req, c) => chat(net, s, req, c))
+      var incoming = ws.buffered(sock)            # part of the next message read already
+      if not incoming:
+        select:
+          let t = inbox.recv():                   # from other tasks: send it on
+            ws.send_text(net, &sock, t) else return
+          net.readable(sock.conn):
+            incoming = true
+      if incoming:
+        let m = ws.recv(net, &sock) else return
+        # ... handle m
+  app.websocket("/rooms/:room", own fn(own s, req, c) => chat(net, inbox.share(), s, req, c))
   app.allow_origin("https://other.example")    # pages there may open these sockets too
   ```
 
@@ -1422,4 +1477,4 @@ for r in 0..rows.count:
 
 ## Not in v0
 
-Unicode normalization and character classes, generic interfaces.
+A `\w` that's Unicode in `re` (it's ASCII).

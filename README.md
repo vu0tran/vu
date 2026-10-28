@@ -360,11 +360,10 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
   to WebAssembly (WASI) with `vu build --wasm` if they use no tasks, sockets, processes or C.
 - macOS (kqueue) builds for ARM64 and x86-64 but hasn't been run on a
   Mac.
-- Strings are bytes. Text functions (`chars()`, `upper()`, `ord`...) read them as UTF-8; there is
-  no Unicode normalization and no character classes (`isalpha`).
+- Strings are bytes. Text functions (`chars()`, `upper()`, `normalize()`, `is_alpha()`...) read them
+  as UTF-8, with Python's Unicode tables (15.1); `\w` in `re` is ASCII.
 - Only new tasks move between threads: two tasks that have started on the same thread and never
   wait take turns only when one of them waits.
-- No package registry: packages are git repositories, named by URL.
 - The safety rules are conservative, and some correct programs need rewriting to pass.
 - Tested on 10 small tasks only (CHANGELOG.md, round 20): three models wrote Vu from SPEC.md alone that
   passed every test as often as their Rust (30 of 30 each, after two compiler fixes the test found).

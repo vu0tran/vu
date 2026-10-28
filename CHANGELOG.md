@@ -9,6 +9,18 @@ The first sections (Results through LLM tokens) are the comparison from rounds 1
 
 ## Releases
 
+**0.2.0** (2026-10-28): rounds 17 to 24. The language gained methods (`x.f()`), `"""` strings and
+text constants, wrapping operators and list slices, `own` parameters in function types, moving what
+a `match` on a call binds, `select` over channels and a connection, and generic interfaces. The
+standard library: `sqlite`, PostgreSQL over TLS, time zones, an HTTP client that keeps connections
+and speaks HTTP/2 (with requests multiplexed by `fetch_all`), WebSocket routes in `web`, zlib
+compression, file uploads, `heap`, `sort(by:)` and `sort(key:)`, Unicode normalization and character
+classes. Tools: `vu build --wasm`, `vu build --profile`, a package registry (`vu search`, `vu add`,
+`vu publish`), and hover, definition and completion in `vu lsp`. Changes that can break 0.1.0 code:
+`h2.serve_conn` takes an `http.Site` (`http.serve` and `web.serve` are unchanged); `ws.Socket` and
+`web.App` have more fields (made with `ws.accept`/`ws.connect` and `web.app()`, as before, they're
+unaffected); a `match` on a call that binds a value now owns it (code that compiled still does).
+
 **0.1.0** (2026-10-28), the first tagged release: everything through round 16. The language
 (ownership without annotations, enums, generics, interfaces, closures, typed errors, capabilities,
 tasks and `par` loops, JSON, C calls), the compiler (self-hosted, compiling to C; `check`, `run`,
@@ -1970,6 +1982,59 @@ Attack rounds:
    (all time went to main). The profiled build now keeps both with volatile stores and compiler
    barriers. Measured cost, best of 3: binarytrees 0.58 -> 1.00 s, spectralnorm 0.12 -> 0.30 s,
    nbody 1.08 -> 1.51 s, fannkuch and mandelbrot (par loops, no line stores) about the same.
+
+## Round 24: select, generic interfaces, Unicode text, sort by key, multiplexed HTTP/2
+
+- `select` waits for the first of several things: a value from a channel (`let v = ch.recv():`), room
+  in one (`ch.send(x):`, moving `x` only if that arm runs), a channel closed and empty
+  (`ch.closed():`), data on a connection (`net.readable(conn):`), or a timeout. Any arm can carry
+  `if condition`. In the runtime, a select registers on each channel's list of watchers (and, with a
+  connection, waits on the socket's reader slot, so the poller, the timer and the channels hand off
+  the one wake-up the way they already did for a timed read); when several arms are ready one is
+  picked at random. `ch.send(v, timeout:)` fails instead of waiting forever, and on a closed channel
+  it fails instead of stopping the program. The WebSocket chat in `tests/web/sockets.vu` now waits on
+  its socket and its inbox at once instead of polling every 20 ms.
+- Generic interfaces: `interface Store[T]`, `impl Store[Int] for Ints`, bounds `[S: Store[T], T]` (T
+  found from the instance S implements), and values of an instance (`[Store[Str]]`). One instance
+  per type, so a call needs no annotation.
+- `xs.sort(key: fn(x) => x.age)`.
+- `s.normalize("NFC" / "NFD" / "NFKC" / "NFKD")`, and `is_alpha`, `is_digit`, `is_space`,
+  `is_alnum`, `is_upper`, `is_lower`, `is_decimal`, with tables generated from Python's unicodedata
+  (`tools/gen_norm.py`, Unicode 15.1).
+- `client.fetch_all(net, requests)`: every request to an HTTP/2 server goes out at once on one
+  connection, up to the server's stream limit, and the responses are read as they interleave
+  (`h2.requests`, which `h2.request` now calls with one).
+
+Attack rounds:
+
+1. Tests 691 to 698 on `select`: two producers and closed arms that sit out once seen, a send arm on
+   a full channel (the list stays) and its use after (refused: may have been moved), send timeouts
+   (full, then closed, the value freed), a connection with nothing and then data, a closed
+   connection, a nil `Conn?`, two connections in one select, a recv arm without `let`, every arm off
+   with no timeout (stops the program), 8 producers and 4 consumers across threads passing 16,000
+   numbers through three channels (each arrives exactly once; also under ThreadSanitizer), and two
+   tasks bouncing a number 20,000 times through selects with no timeout (a lost wake-up would hang;
+   30 runs). Found while writing them: a closed channel's arm was ready on every pass, so a loop
+   over it spun and starved the producer on the same thread; that's what the `if` guard is for, and
+   `closed()` now means closed and empty (it fired with a value still in the channel, which was then
+   lost to the loop). The modules pass didn't resolve names inside select arms (`ws.send_text` was
+   "unknown"): fixed.
+2. Tests 699 to 705 and module test 47 on generic interfaces: two instances, static and method
+   calls, interface values, both kinds of bound, a type of the wrong instance (refused), one type
+   implementing two instances (refused), a wrong signature for the instance, an unmet bound, a
+   generic interface named without arguments, two type parameters implemented by generic struct
+   instances, and an interface from a module implemented in main. Found: a bound's type argument
+   couldn't be worked out from the instance (`first_of[S: Store[T], T]`); now it is.
+3. `tests/run_norm.py`: every assigned code point (in lines of 64) and 30,000 random mixes in all four
+   forms, against `unicodedata.normalize` on four seeds, plain and under ASan/UBSan; bytes that
+   aren't UTF-8 kept; and the seven class tests on 1,142,065 lines (every code point alone, and the
+   mixes) against Python's `str` methods. All agreed the first time, apart from my test splitting
+   on tabs that were in its input, and counting the empty line after the input's last newline.
+4. Tests 706 and 707 on `sort(key:)` against Python (`reverse=True` keeps equal keys in order, as
+   Python does) and a key that can't be ordered. In `tests/run_http_client.py`, 4 more checks: 30
+   GETs and 2 POSTs at once on one connection to Vu's server, two servers and a bad URL mixed, and a
+   server (the h2 package) that answers nothing until 8 requests are open at once, which it saw:
+   nothing found.
 
 ## Limits of v0
 

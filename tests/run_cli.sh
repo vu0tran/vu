@@ -79,7 +79,7 @@ sys.exit(any(struct.unpack_from("<I", d, phoff + i * size)[0] == 3 for i in rang
 check "build --static: linked with -static, runs, has no PT_INTERP (no dynamic loader)" $? "out=[$out] cc=$(cat "$work/cc.log")"
 
 out=$($VU version 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$out" = "vu 0.1.0" ]
+[ $rc -eq 0 ] && [ "$out" = "vu 0.2.0" ]
 check "version: prints the release" $? "rc=$rc out=[$out]"
 
 printf 'fn f(xs: [Int]) -> Int:\n  var t = 0\n  for i in 0..xs.len: t += xs[i]\n  return t\nfn main():\n  print("{f([1, 2])}")\n' > "$work/ck.vu"

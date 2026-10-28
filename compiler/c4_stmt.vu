@@ -147,6 +147,7 @@ fn stmt(var g: G, n: Node) -> Bool:
   if k == "range": return s_range(&g, n)
   if k == "each": return s_each(&g, n)
   if k == "match": return s_match(&g, n)
+  if k == "select": return s_select(&g, n)
   if k == "fnstmt": return s_fnstmt(&g, n)
   err(g, n.line, "internal error: unknown statement " + k)
   return false
@@ -395,6 +396,155 @@ fn match_result(var g: G, n: Node) -> Bool:
       else: emit(&g, ct(g, ty) + " " + vc + " = VU_MV(" + cname + "." + field + ");")
     if not run_block(&g, arm.kids[0]): ends.push(snapshot(g))
     restore(&g, snap)
+    close(&g)
+  let sc = g.scopes.pop()
+  emit_drops_scope(&g, sc)
+  close(&g)
+  return finish_ends(&g, ends)
+
+# select: waits until one arm can go ahead (vu_select in the runtime picks it and does its channel
+# part), then runs that arm's block. A send arm's value moves only if that arm runs: a variable stays
+# in the others; any other expression is computed first and freed if it isn't sent.
+fn s_select(var g: G, n: Node) -> Bool:
+  let usage = "a select arm is  let v = ch.recv():  ch.send(value):  ch.closed():  net.readable(conn):  or  timeout seconds:"
+  if n.kids.len == 0: err(g, n.line, "a select needs at least one arm: " + usage)
+  g.uses_tasks = true
+  open(&g, "{{")
+  push_scope(&g, false)
+  let arr = tmp(&g)
+  let which = tmp(&g)
+  var nsel = 0
+  var timeout_code = "0.0, false"
+  var timeout_arm = -1
+  var readable = 0
+  var kinds: [Str] = []        # per arm: recv, send, closed, readable, timeout
+  var slot: [Int] = []         # its index in the C array (-1 for timeout)
+  var bufs: [Str] = []         # recv: the buffer; send: the value's C lvalue
+  var btys: [Str] = []         # the value's type
+  var send_var: [Int] = []     # send of a variable: the variable (moved in that arm only), else -1
+  var inits: [Str] = []
+  var guards: [Str] = []
+  for ai in 0..n.kids.len:
+    let arm = n.kids[ai]
+    let e = arm.kids[0]
+    var gc = ""
+    if arm.flag:
+      let gv = value(&g, arm.kids[2], "Bool")
+      gc = tmp(&g)
+      emit(&g, "bool " + gc + " = " + gv.code + ";")
+    guards.push(gc + "")
+    var kind = ""
+    var buf = ""
+    var bty = ""
+    var sv = -1
+    if arm.op == "timeout":
+      if timeout_arm >= 0: err(g, arm.line, "a select has one timeout arm")
+      timeout_arm = ai
+      let tc = value(&g, e, "Float")
+      timeout_code = tc.code + ", true"
+      if gc != "": timeout_code = "(" + gc + " ? (" + tc.code + ") : 0.0), " + gc
+      kind = "timeout"
+    else:
+      if e.k != "call" or e.kids[0].k != "field": err(g, arm.line, usage)
+      let m = e.kids[0].name
+      let recv_e = e.kids[0].kids[0]
+      if arm.op == "recv" and m != "recv": err(g, arm.line, "'let " + arm.name + " = ...' in a select takes a value from a channel: let " + arm.name + " = ch.recv():")
+      if arm.op != "recv" and m == "recv": err(g, arm.line, "a recv arm names the value: let v = ch.recv():")
+      if m == "readable":
+        if probe_type(&g, recv_e) != "Net": err(g, arm.line, "readable is net.readable(conn): data (or the end) has arrived on conn")
+        if nargs_of(e) != 1 or any_named(e): err(g, arm.line, "net.readable(conn) takes one connection")
+        readable += 1
+        if readable > 1: err(g, arm.line, "a select waits on one connection at most (net.readable)")
+        let cp = place(&g, e.kids[1].kids[0])
+        if not cp.ok or (cp.ty != "Conn" and cp.ty != "Conn?"): err(g, arm.line, "net.readable(conn) takes a Conn (or Conn?: nil sits out) stored in a variable or field")
+        read_check(g, cp, arm.line)
+        if cp.ty == "Conn":
+          inits.push(arr + "[{nsel}] = (vu_sel){{VU_SEL_READABLE, NULL, NULL, (vu_sock *)" + cp.code + "}};")
+        else:
+          inits.push(arr + "[{nsel}] = (vu_sel){{VU_SEL_READABLE, NULL, NULL, " + cp.code + " ? (vu_sock *)*(" + cp.code + ") : NULL}}; if (!" + arr + "[{nsel}].sock) " + arr + "[{nsel}].kind = VU_SEL_OFF;")
+        kind = "readable"
+      else:
+        if m != "recv" and m != "send" and m != "closed": err(g, arm.line, usage)
+        let cp = place(&g, recv_e)
+        if not cp.ok or tkind(g, cp.ty) != "chan": err(g, arm.line, "a select arm's channel is a Chan stored in a variable or field (ch." + m + "(...))")
+        read_check(g, cp, arm.line)
+        let et = inner_of(cp.ty)
+        var want = 0
+        if m == "send": want = 1
+        if nargs_of(e) != want or any_named(e):
+          if m == "send": err(g, arm.line, "ch.send(value) in a select takes one value (and no timeout: add a timeout arm)")
+          err(g, arm.line, "ch." + m + "() in a select takes no arguments")
+        if m == "recv":
+          buf = tmp(&g)
+          bty = et + ""
+          emit(&g, ct(g, et) + " " + buf + ";")
+          inits.push(arr + "[{nsel}] = (vu_sel){{VU_SEL_RECV, " + cp.code + ", &" + buf + ", NULL}};")
+          kind = "recv"
+        elif m == "closed":
+          inits.push(arr + "[{nsel}] = (vu_sel){{VU_SEL_CLOSED, " + cp.code + ", NULL, NULL}};")
+          kind = "closed"
+        else:
+          let ve = e.kids[1].kids[0]
+          bty = et + ""
+          if ve.k == "name" and not is_copy(g, et) and et != "Str" and lookup(g, ve.name) >= 0:
+            let vp = place(&g, ve)
+            if vp.ty != et: err(g, arm.line, "this channel carries " + a_an(tn(et)) + ", not " + a_an(tn(vp.ty)))
+            read_check(g, vp, arm.line)
+            sv = vp.root
+            buf = vp.code + ""
+          else:
+            let vc = value(&g, ve, et)
+            buf = tmp(&g)
+            emit(&g, ct(g, et) + " " + buf + " = " + vc.code + ";")
+          inits.push(arr + "[{nsel}] = (vu_sel){{VU_SEL_SEND, " + cp.code + ", &" + buf + ", NULL}};")
+          kind = "send"
+    kinds.push(kind + "")
+    if kind == "timeout": slot.push(-1)
+    else:
+      slot.push(nsel)
+      nsel += 1
+    bufs.push(buf + "")
+    btys.push(bty + "")
+    send_var.push(sv)
+  # (a select whose only arm is a timeout is a sleep)
+  emit(&g, "vu_sel " + arr + "[{max(nsel, 1)}];")
+  for x in inits: emit(&g, x)
+  # an arm whose condition is false sits out
+  for ai in 0..n.kids.len:
+    if guards[ai] != "" and slot[ai] >= 0: emit(&g, "if (!" + guards[ai] + ") " + arr + "[{slot[ai]}].kind = VU_SEL_OFF;")
+  emit(&g, "int " + which + " = vu_select(" + arr + ", {nsel}, " + timeout_code + ", {n.line});")
+  let snap = snapshot(g)
+  var ends: [Snap] = []
+  for ai in 0..n.kids.len:
+    let arm = n.kids[ai]
+    var cond = which + " == {slot[ai]}"
+    if kinds[ai] == "timeout": cond = which + " == {nsel}"
+    if ai == 0: open(&g, "if (" + cond + ") {{")
+    else: open(&g, "else if (" + cond + ") {{")
+    push_scope(&g, false)
+    # values for the other arms' sends that didn't go: freed (a variable just stays where it is)
+    for bi in 0..n.kids.len:
+      if bi != ai and kinds[bi] == "send" and send_var[bi] < 0 and not is_copy(g, btys[bi]): emit(&g, drop_code(g, btys[bi], bufs[bi]))
+    if kinds[ai] == "send" and send_var[ai] >= 0:
+      # it went into the channel: the variable is moved (and zeroed, so nothing frees it twice)
+      let vp = place(&g, arm.kids[0].kids[1].kids[0])
+      let mc = move_place(&g, vp, arm.line)
+      emit(&g, "(void)" + mc + ";")
+    if kinds[ai] == "recv":
+      let bty = btys[ai]
+      if arm.name == "_":
+        if not is_copy(g, bty): emit(&g, drop_code(g, bty, bufs[ai]))
+      else:
+        let vc = var_cname(&g, arm.name)
+        let v = new_var(&g, arm.name, bty, vc, "local", false, false, arm.line)
+        declare(&g, v)
+        emit(&g, ct(g, bty) + " " + vc + " = " + bufs[ai] + ";")
+    if not run_block(&g, arm.kids[1]): ends.push(snapshot(g))
+    restore(&g, snap)
+    close(&g)
+  if timeout_arm < 0:
+    open(&g, "else {{")
+    emit(&g, "vu_fail({n.line}, \"select: no arm went ahead\");")
     close(&g)
   let sc = g.scopes.pop()
   emit_drops_scope(&g, sc)
@@ -1104,7 +1254,7 @@ fn vscan(e: Node, lv: Str, depth: Int, var s: VScan):
     s.refd[e.kids[0].name] = true
   # (?, else and fail are fine: a copy is generated like any code, and the tried copies refuse them in
   # vf_stmt anyway)
-  if k == "lambda" or k == "fnstmt" or k == "spawn" or k == "match" or (k == "range" and e.is_par):
+  if k == "lambda" or k == "fnstmt" or k == "spawn" or k == "match" or k == "select" or (k == "range" and e.is_par):
     s.bad = true
     return
   if k == "let" or k == "range" or k == "each" or (k == "if" and e.flag2): s.decl[e.name] = true

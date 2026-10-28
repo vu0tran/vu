@@ -327,7 +327,9 @@ fn chan_method(var g: G, e: Node, handled: Bool) -> CT:
   let name = e.kids[0].name
   if not handled and name == "recv":
     err(g, e.line, "recv() can fail (the channel is closed, or the timeout passed), so handle its error: ch.recv()? passes it on, ch.recv() else <default> replaces it, or match ch.recv(): with ok(v) and err(e) arms")
-  let ta = split_timeout(g, e, name == "recv", "." + name + "()")
+  let ta = split_timeout(g, e, name == "recv" or name == "send", "." + name + "()")
+  if not handled and name == "send" and ta.timeout >= 0:
+    err(g, e.line, "send(v, timeout: s) can fail (the channel stayed full that long, or is closed), so handle its error: ?, else, or match")
   var want = 0
   if name == "send": want = 1
   if ta.args.len != want:
@@ -343,6 +345,11 @@ fn chan_method(var g: G, e: Node, handled: Bool) -> CT:
   if name == "send":
     let vc = value(&g, e.kids[ta.args[0]].kids[0], inner).code
     let tv = tmp(&g)
+    if ta.timeout >= 0:
+      let rt = reg(&g, "!~void")
+      let r = tmp(&g)
+      let tc = timeout_code(&g, e, ta.timeout)
+      return bw_end(&g, ce, b, "({{ " + ct(g, rt) + " " + r + " = {{0}}; " + ct(g, inner) + " " + tv + " = " + vc + "; " + r + ".bad = !vu_chan_send_t(" + b.code + ", &" + tv + ", " + tc + ", &" + r + ".err, {e.line}); " + r + "; }})", rt)
     return bw_end(&g, ce, b, "({{ " + ct(g, inner) + " " + tv + " = " + vc + "; vu_chan_send(" + b.code + ", &" + tv + ", {e.line}); }})", "~void")
   if name == "close": return bw_end(&g, ce, b, "vu_chan_close(" + b.code + ", {e.line})", "~void")
   if name == "closed": return bw_end(&g, ce, b, "vu_chan_closed(" + b.code + ")", "Bool")
@@ -1163,9 +1170,13 @@ fn sort_method(var g: G, e: Node) -> CT:
   let p = place(&g, e.kids[0].kids[0])
   if not p.ok or tkind(g, p.ty) != "list": err(g, e.line, ".sort() works on a list stored in a variable; sorted(xs) returns a sorted copy of any list")
   var by_at = -1
+  var key_at = -1
   for i in 1..e.kids.len:
     if e.kids[i].flag and e.kids[i].name == "by": by_at = i
+    if e.kids[i].flag and e.kids[i].name == "key": key_at = i
+  if by_at >= 0 and key_at >= 0: err(g, e.line, ".sort() takes by: (a comparison) or key: (what to sort by), not both")
   if by_at >= 0: return sort_by(&g, e, p, by_at)
+  if key_at >= 0: return sort_key(&g, e, p, key_at)
   let sf = sort_fn(inner_of(p.ty))
   if sf == "": err(g, e.line, ".sort() works on lists of Int, Float, Byte, Bool or Str, not " + tn(p.ty))
   if nargs_of(e) > 1 or (nargs_of(e) == 1 and e.kids[1].name != "reverse"): err(g, e.line, "sort() takes no arguments, or reverse: true")
@@ -1198,6 +1209,48 @@ fn sort_by(var g: G, e: Node, p: Place, by_at: Int) -> CT:
   var drop = ""
   if not r.p.ok and tkind(g, r.ty) == "fn": drop = " vu_fn_drop(&" + fv + ");"
   return CT("({{ vu_fn " + fv + " = " + r.code + "; vu_sort_by((" + p.code + ").data, (" + p.code + ").len, sizeof(" + ct(g, et) + "), vu_less_" + mg(g, ft) + ", &" + fv + ", " + rev + ");" + drop + " }})", "~void")
+
+# xs.sort(key: fn(x) => x.age): sorted by what the function gives for each element (an Int, Float,
+# Byte, Bool or Str), stable, any element type; reverse: true as well. The key is computed for each
+# comparison (twice): keep it cheap.
+fn sort_key(var g: G, e: Node, p: Place, key_at: Int) -> CT:
+  var rev = "0"
+  for i in 1..e.kids.len:
+    if not e.kids[i].flag or (e.kids[i].name != "key" and e.kids[i].name != "reverse"):
+      err(g, e.line, ".sort() takes key: fn(x) -> Int (or Float, Byte, Bool, Str) and reverse: true, both named")
+  write_check(g, p, e.line, false)
+  let et = inner_of(p.ty)
+  let fe = e.kids[key_at].kids[0]
+  let root = root_name_node(e.kids[0].kids[0])
+  if root != "" and mentions_name(fe, root): err(g, fe.line, "the key given to " + root + ".sort(key: ...) can't use " + root + " itself: it's being rearranged while the key runs")
+  var code = ""
+  var ty = ""
+  var temp = false
+  if fe.k == "lambda":
+    let lc = lambda_code(&g, fe, "", [et], false, true)
+    code = lc.code + ""
+    ty = lc.ty + ""
+  else:
+    let r = gen(&g, fe, "")
+    code = r.code + ""
+    ty = r.ty + ""
+    temp = not r.p.ok
+  let k = tkind(g, ty)
+  if k != "fn" and k != "lfn": err(g, fe.line, "key: takes a function from the element to what to sort by, like key: fn(x) => x.age")
+  let ft = owned_fn(ty)
+  let f = fn_parts(ft)
+  if f.params.len != 1 or f.params[0] != et or f.fails: err(g, fe.line, "key: takes a fn(" + tn(et) + ") -> Int (or Float, Byte, Bool, Str) that can't fail, not " + tn(ft))
+  if sort_fn(f.ret) == "": err(g, fe.line, "a sort key is an Int, Float, Byte, Bool or Str (for several, sort by: a comparison), not " + tn(f.ret))
+  reg(&g, ft)
+  for i in 1..e.kids.len:
+    if e.kids[i].name == "reverse":
+      let c = value(&g, e.kids[i].kids[0], "Bool")
+      if c.ty != "Bool": err(g, e.line, "reverse: takes a Bool, not " + tn(c.ty))
+      rev = c.code
+  let fv = tmp(&g)
+  var drop = ""
+  if temp and k == "fn": drop = " vu_fn_drop(&" + fv + ");"
+  return CT("({{ vu_fn " + fv + " = " + code + "; vu_sort_by((" + p.code + ").data, (" + p.code + ").len, sizeof(" + ct(g, et) + "), vu_keyless_" + mg(g, ft) + ", &" + fv + ", " + rev + ");" + drop + " }})", "~void")
 
 fn mentions_name(e: Node, name: Str) -> Bool:
   if e.k == "name" and e.name == name: return true
@@ -1242,21 +1295,35 @@ fn find_from(var g: G, e: Node) -> CT:
   let inner = bw_end(&g, a1, ab, "vu_str_find_from(&(" + b.code + "), &(" + ab.code + "), " + st.code + ")", "Int")
   return bw_end(&g, recv, b, inner.code, inner.ty)
 
+# s.is_alpha() and the rest: Unicode character classes, as Python's str methods have them.
+fn is_class_method(n: Str) -> Bool:
+  return n == "is_alpha" or n == "is_digit" or n == "is_space" or n == "is_alnum" or n == "is_upper" or n == "is_lower" or n == "is_decimal"
+
+fn class_bit(n: Str) -> Int:
+  if n == "is_alpha": return 1
+  if n == "is_digit": return 2
+  if n == "is_space": return 4
+  if n == "is_alnum": return 8
+  if n == "is_upper": return 16
+  if n == "is_lower": return 32
+  return 128
+
 # Methods that read a Str as text: case, characters, searching.
 fn is_text_method(n: Str) -> Bool:
-  return n == "upper" or n == "lower" or n == "chars" or n == "char_count" or n == "is_utf8" or n == "find" or n == "count" or n == "replace" or n == "hex"
+  return n == "upper" or n == "lower" or n == "chars" or n == "char_count" or n == "is_utf8" or n == "find" or n == "count" or n == "replace" or n == "hex" or n == "normalize" or is_class_method(n)
 
 fn text_method(var g: G, e: Node) -> CT:
   let name = e.kids[0].name
   if any_named(e): err(g, e.line, "." + name + "() takes positional arguments")
   let na = nargs_of(e)
   var want = 0
-  if name == "find" or name == "count": want = 1
+  if name == "find" or name == "count" or name == "normalize": want = 1
   if name == "replace": want = 2
   if name == "find" and na == 2: return find_from(&g, e)
   if na != want:
     if want == 0: err(g, e.line, "s." + name + "() takes no arguments")
     if want == 1 and name == "find": err(g, e.line, "s.find(sub) takes a Str, and optionally where to start: s.find(sub, start)")
+    if name == "normalize": err(g, e.line, "s.normalize(form) takes the form: \"NFC\", \"NFD\", \"NFKC\" or \"NFKD\"")
     if want == 1: err(g, e.line, "s." + name + "(sub) takes one Str")
     err(g, e.line, "s.replace(old, new) takes two Str values")
   let recv = e.kids[0].kids[0]
@@ -1274,6 +1341,10 @@ fn text_method(var g: G, e: Node) -> CT:
     elif name == "char_count":
       code = "vu_char_count(&(" + rc + "))"
       ty = "Int"
+    elif is_class_method(name):
+      g.uses_norm = true
+      code = "vu_str_is(&(" + rc + "), {class_bit(name)})"
+      ty = "Bool"
     elif name == "is_utf8":
       code = "vu_is_utf8(&(" + rc + "))"
       ty = "Bool"
@@ -1291,6 +1362,11 @@ fn text_method(var g: G, e: Node) -> CT:
   let a1 = e.kids[1].kids[0]
   let ab = bw_begin(&g, a1, "")
   if ab.ty != "Str": err(g, e.line, "s." + name + "() takes Str arguments, not " + tn(ab.ty))
+  if name == "normalize":
+    # Unicode normalization, with the tables in rt/norm.c (Python's unicodedata)
+    g.uses_norm = true
+    let inner = bw_end(&g, a1, ab, "vu_str_normalize(&(" + rc + "), &(" + ab.code + "), {e.line})", "Str")
+    return bw_end(&g, recv, b, inner.code, inner.ty)
   if want == 1:
     let inner = bw_end(&g, a1, ab, "vu_str_" + name + "(&(" + rc + "), &(" + ab.code + "))", "Int")
     return bw_end(&g, recv, b, inner.code, inner.ty)
@@ -1586,6 +1662,25 @@ fn arg_type(var g: G, a: Node) -> Str:
   if a.k == "nil" or ((a.k == "list" or a.k == "map") and a.kids.len == 0): return ""
   return probe_type(&g, a)
 
+# Bounds that name a generic interface with type parameters ([S: Store[T], T]): once S is known, the
+# instance it implements tells T.
+fn bound_unify(g: G, bounds: Str, tps: [Str], var b: {Str: Str}):
+  if bounds == "": return
+  for part in bounds.split(";"):
+    let eq = find_byte(part, '=', 0)
+    let tp = part[0..eq]
+    let bt = part[eq + 1..part.len]
+    let br = find_byte(bt, '[', 0)
+    if br <= 0 or not (tp in b) or not (bt[0..br] in g.giface_nodes): continue
+    let actual = b[tp] + ""
+    let tmpl = bt[0..br]
+    for inst in g.giface_insts[tmpl]:
+      if (inst + "|" + actual) in g.impls or inst == actual:
+        let parts = split_targs(bt[br + 1..bt.len - 1])
+        let args = g.inst_of[inst].args
+        if parts.len == args.len:
+          for i in 0..parts.len: unify(g, parts[i], args[i], tps, &b)
+
 # A call to generic function e.kids[0].name: works out the type arguments from the arguments (and the
 # expected result) and makes that instance, once per call.
 fn gcall(var g: G, e: Node, expect: Str) -> Str:
@@ -1636,6 +1731,7 @@ fn gcall(var g: G, e: Node, expect: Str) -> Str:
           let lt = lambda_code(&g, a, "", ptys, sf.fails, true)
           restore(&g, snap)
           unify(g, sf.ret, fn_parts(lt.ty).ret, it.names, &b)
+  bound_unify(g, it.ty, it.names, &b)
   var targs: [Str] = []
   for tp in it.names:
     if not (tp in b): err(g, e.line, "can't tell what " + tp + " is in this call to " + disp(name) + "(); the arguments don't say, so give the result a type (let x: [Int] = " + disp(name) + "(...)) or pass a typed value")
