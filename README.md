@@ -195,6 +195,29 @@ fn main(net: Net, os: Os) throws:
 lets requests already in progress finish (giving up after the 5-second grace period), closes idle
 connections and returns.
 
+For an app, the `web` module adds routes with parameters, middleware, forms, cookies (signed ones
+too), static files and HTML templates that escape whatever they insert:
+
+```
+import http
+import web
+
+fn user(req: http.Request, c: web.Ctx) -> http.Response:
+  return web.html(200, web.render("<h1>{{name}}</h1>", [web.v("name", web.param(c, "name"))]))
+
+fn main(net: Net, os: Os, fs: Fs) throws:
+  var app = web.app()
+  web.use(&app, web.logger(os))
+  web.use(&app, web.same_origin)                          # refuses cross-site form posts
+  web.get(&app, "/users/:name", user)
+  web.get(&app, "/static/*file", web.files(fs, "public"))
+  web.serve(net, os, app, 8080)?
+```
+
+A template is a `const` parameter, like SQL for `pg`: text from a request can be a value, never
+markup. `vu new web NAME` writes a starter app with a Dockerfile, a `fly.toml` and a README that
+says how to deploy it; `vu build --static` makes a binary that needs no shared libraries.
+
 ### Calling C
 
 ```
@@ -240,6 +263,7 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
 
 - `http`: an HTTP/1.1 and HTTP/2 server (HTTP/2 by prior knowledge or ALPN over TLS) and an HTTP/1.1
   client;
+- `web`: routes, middleware, forms, cookies, static files and escaping HTML templates, on `http`;
 - `ws`: WebSockets, server and client;
 - `pg`: a PostgreSQL client (SCRAM-SHA-256, parameters only);
 - `re`: regular expressions with Python's syntax, in time linear in the text, and as fast as

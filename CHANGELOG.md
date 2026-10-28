@@ -1585,6 +1585,58 @@ installed and nothing sent anywhere.
 - Node 22's built-in `wasi` module crashed (a segmentation fault in node) when the compiler exited with
   status 1; wasmtime and browser_wasi_shim (what the playground uses) don't. Not chased further.
 
+## Round 16: web basics
+
+What it takes to write and ship a web app, on top of `http`:
+
+- `std/web.vu` (about 470 lines of Vu): routes with `:name` and `*rest` parameters, 404 and 405
+  (with `Allow`), HEAD answered by GET routes; middleware that wraps what follows and can pass values
+  on (`web.with`, `web.val`); `web.logger` and `web.same_origin` (refuses cross-site requests that
+  change things, by `Sec-Fetch-Site` or `Origin`); forms; cookies with safe defaults (HttpOnly,
+  Secure, SameSite=Lax), percent-encoded values, and signing (HMAC-SHA256, constant-time check);
+  redirects that can't leave the site; static files; and HTML templates.
+- Templates take a `const` template, the same idea as `pg`'s SQL: the markup is written in the
+  program, so text from a request can only ever be a value, and values are always escaped unless
+  they're `web.Html` (made by `render`, `join` or an explicit `trust`). `web.html` takes only a
+  `web.Html`, so a `Str` can't be sent as a page by mistake (a compile error).
+- `vu new web NAME` writes a starter (main.vu, public/style.css, a Dockerfile, .dockerignore, fly.toml,
+  README.md); the files live in `compiler/rt/new_web/` and are carried in the compiler like the runtime.
+  `vu build --static` passes `-static` (OpenSSL included; glibc warns that name lookups in a static
+  binary need its libraries at run time, which the help and README repeat).
+
+Attack rounds (`tests/run_web.sh`, plus targeted tests 643 to 649):
+
+1. Reading the code before testing it: `web.redirect` set its target to `/` inside a loop over the
+   target's bytes when it found a control character, so the loop went on indexing the shortened
+   string and would have panicked on the next byte. Fixed before any test ran (it marks the target
+   and replaces it after the loop). Then the tests: 7,500 random cases of routes, forms, escaping,
+   cookies and templates against a Python model (urllib.parse, the HTML escapes), and an app against
+   30 hostile requests (escaping in text and attributes, tampered signatures, redirects to
+   `//host`, `https://`, `/\`, a CRLF; cross-site posts; 16 ways out of the static folder), plain,
+   under ASan/UBSan and under TSan: nothing found in web.vu. My own test mistakes: the harness read
+   HEAD responses as having a body (twice), one targeted test interpolated `{b}` by accident, one
+   expected the wrong wording.
+2. 400 random static paths built from `..`, `%2e%2e`, `%2f`, `%5c`, `%00`, hidden names and real
+   files, each checked against a model of what may be served; 8 clients at once, 320 requests, each
+   checking its own parameter and signed-in user: nothing.
+3. Size: a 9 MB form value decodes in 0.09 s, a body of 2 million fields parses in 0.36 s, 6 MB of
+   text escapes in 0.11 s, a 60 KB path against 101 routes routes in 5.4 ms (release build): nothing
+   quadratic.
+4. The starter: built and run as its README says (GET, a form post with its 303 and cookie, the page
+   it leads to with the name escaped, the cookie remembered, /health, CSS, a cross-site post refused,
+   SIGTERM). Building it showed the binary links OpenSSL dynamically (`libssl.so.3`), which the
+   Dockerfile's runtime image didn't install: it does now.
+
+5. The full gate: every suite passed except the ARM64 one, on targeted test 646, which imports `web`.
+   That suite cross-compiles with no OpenSSL headers for ARM64 and already skipped programs calling
+   `tls_` functions; `web` reaches TLS through `http`. It now also skips programs importing `http`,
+   `web`, `ws`, `h2` or `pg` (551 passed, 0 failed after). Gate: 1,152 s.
+
+Not done here: the Dockerfile was never built (no Docker daemon on this machine; its build commands
+were run by hand, including `VU_MARCH=x86-64-v2`), and nothing was deployed to Fly.io. Not in `web`
+yet: multipart forms (file uploads), sessions stored on the server, and a CSRF token (SameSite
+cookies and `same_origin` cover browsers from the last several years).
+
 ## Limits of v0
 
 - No methods. Strings are bytes, read as UTF-8 by the text functions. Linux on x86-64 and ARM64;

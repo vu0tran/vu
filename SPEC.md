@@ -826,9 +826,12 @@ vu build file.vu [-o out]   # optimized native binary
              OMP_TOOL_LIBRARIES=.../libarcher.so; see CHANGELOG.md)
   --emit-c F write the generated C to F
   --time     report front-end and C compiler time
+  --static   link every library in (no shared libraries needed where it runs; with glibc,
+             host name lookups still need glibc's libraries there)
 vu fmt file.vu... [--check] # rewrite spacing the one way (--check: list files it would change)
 vu test file.vu...          # run each fn test_... in its own process; report which pass
 vu get [file.vu]            # fetch the packages in vu.pkg, write vu.lock (see Packages)
+vu new web NAME             # a folder NAME with a web app: main.vu, public/, Dockerfile, fly.toml
 vu lsp                      # a language server for editors (diagnostics, formatting)
 ```
 
@@ -1047,6 +1050,66 @@ fn main(net: Net) throws:
   (`ca`: PEM certificates to trust for https, `""` for the system's). It sends one request per
   connection and reads bodies by length, chunked, or until the connection closes (up to 64 MB).
   It returns redirects instead of following them.
+
+**`web`**: an app on top of `http`: routes, middleware, forms, cookies, static files and HTML
+templates.
+
+```
+import http
+import web
+
+fn show(req: http.Request, c: web.Ctx) -> http.Response:
+  let who = web.val(c, "user") else "nobody"
+  return web.html(200, web.render("<h1>{{id}}</h1><p>for {{who}}</p>", [web.v("id", web.param(c, "id")), web.v("who", who)]))
+
+fn auth(req: http.Request, c: web.Ctx, next: fn(http.Request, web.Ctx) -> http.Response) -> http.Response:
+  if s = web.get_cookie(req, "sid"):
+    if u = web.verify("a secret: 32 random bytes", s): return next(req, web.with(c, "user", u))  # signed
+  return next(req, c)
+
+fn main(net: Net, os: Os, fs: Fs) throws:
+  var app = web.app()
+  web.use(&app, web.logger(os))          # middleware runs in the order added, around what follows
+  web.use(&app, web.same_origin)
+  web.use(&app, auth)
+  web.get(&app, "/items/:id", show)      # also post, put, patch, delete, and web.route(&app, METHOD, ...)
+  web.get(&app, "/static/*file", web.files(fs, "public"))
+  web.serve(net, os, app, 8080)?         # http.serve with the app; stops on SIGTERM / SIGINT
+```
+
+- A handler is a `fn(http.Request, web.Ctx) -> http.Response`. The first route that matches the
+  method and path answers (HEAD runs a GET route); a path that matches only other methods' routes
+  gets 405 with `Allow`, any other 404. `:name` matches one non-empty part of the path, `*name` the
+  rest (last only); `web.param(c, name)` gives it percent-decoded. A bad pattern panics when it's
+  added.
+- Middleware is a `fn(http.Request, web.Ctx, next) -> http.Response`: it can answer itself, call
+  `next`, or call it with `web.with(c, name, value)` for handlers to read with `web.val`.
+  `web.logger(os)` logs each request; `web.same_origin` refuses requests that change things (not GET,
+  HEAD or OPTIONS) that a browser marks as coming from another site (`Sec-Fetch-Site`, else `Origin`).
+- **Templates escape.** `web.render(template, values)` replaces each `{name}` (written `{{name}}` in a
+  Vu string) with a value: `web.v(name, text)` is escaped (`& < > " '`), `web.h(name, html)` is a
+  `web.Html` inserted as it is (made by `render`, `web.join(list)`, or `web.trust(text)`, which says
+  the text is HTML already). The template is a `const` parameter, so it's written in the program;
+  values are never read as templates, and a `{name}` with no value panics. `web.html(status, h)`
+  sends it with `nosniff`, `X-Frame-Options: DENY` and a referrer policy; there is no way to send a
+  `Str` as HTML except through `trust`. (Escaping is for text and quoted attributes: a URL in an
+  `href` still needs checking.)
+- Forms: `web.form(req)` gives the fields of an `application/x-www-form-urlencoded` body as a map (the
+  first of a name wins), `web.field(req, name)` one of them. Not yet: multipart (file uploads).
+- Cookies: `web.get_cookie(req, name)`; `web.set_cookie(&resp, web.cookie(name, value))`, whose
+  defaults are `Path=/`, `HttpOnly`, `Secure` and `SameSite=Lax` (a `web.Cookie`'s fields change
+  them: `max_age`, `same_site`...); `web.clear_cookie(&resp, name)`. Values are percent-encoded, so
+  any text is safe in one. `web.sign(secret, value)` and `web.verify(secret, signed)` (HMAC-SHA256,
+  compared in constant time) make a cookie the client can read but not change.
+- `web.redirect(status, to)` goes only to a path on the same site: anything else (`//host`, a
+  scheme, a backslash, a control character) goes to `/`.
+- Static files: `web.files(fs, folder)` is a handler for a `*name` route. Names that would leave the
+  folder (`..`, encoded or not), hidden files (a part starting with `.`), a NUL or a backslash get 404;
+  a name ending in `/` gets its `index.html`. Each file has a `Content-Type` by its extension, `nosniff`,
+  and an ETag, and `If-None-Match` gets 304. Symbolic links inside the folder are followed.
+- `tests/run_web.sh` checks routes, forms, escaping and cookies against a Python model on random
+  input, and an app against hostile requests (including 400 random paths that try to leave the
+  static folder), under the sanitizers and ThreadSanitizer.
 
 **`re`**: regular expressions with Python's syntax and results (`re.compile`, `re.search`,
 `re.prefix` for Python's `re.match`, `re.fullmatch`, `re.findall`, `re.finditer`, `re.sub`,

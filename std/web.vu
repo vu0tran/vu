@@ -1,0 +1,479 @@
+# web: what a web app needs on top of http. Routes with parameters, middleware, cookies, forms,
+# static files, and HTML templates that escape what they insert.
+#
+#   var app = web.app()
+#   web.get(&app, "/", home)
+#   web.get(&app, "/users/:id", show_user)          # web.param(c, "id")
+#   web.get(&app, "/assets/*file", web.files(fs, "public"))
+#   web.use(&app, web.logger(os))
+#   web.serve(net, os, app, 8080)?
+#
+# A handler is a fn(http.Request, web.Ctx) -> http.Response: the request, and what the router found
+# (the route's parameters, and values middleware added). Middleware gets the handler to call next.
+
+import http
+import log
+import path
+
+type Ctx:
+  params: {Str: Str}   # the route's :name and *name parts, percent-decoded
+  vals: {Str: Str}     # set by middleware with web.with()
+
+type Route:
+  method: Str
+  segs: [Str]          # the pattern split at '/': literal text, ":name" or "*name" (last only)
+  handler: fn(http.Request, Ctx) -> http.Response
+
+type App:
+  routes: [Route]
+  mws: [fn(http.Request, Ctx, fn(http.Request, Ctx) -> http.Response) -> http.Response]
+
+fn app() -> App:
+  return App([], [])
+
+# ---- routes
+
+fn is_name(s: Str) -> Bool:
+  if s.len == 0: return false
+  for i in 0..s.len:
+    let b = s[i]
+    let ok = (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or b == '_' or (i > 0 and b >= '0' and b <= '9')
+    if not ok: return false
+  return true
+
+# The pattern's parts, or a panic naming what's wrong with it: a pattern is written in the program,
+# so a bad one is a mistake to fix, found when the app is set up.
+fn pattern(p: Str) -> [Str]:
+  if not p.startswith("/"): panic("web: route '{p}' must start with '/'")
+  let parts = p[1..p.len].split("/")
+  var seen: [Str] = []
+  for i in 0..parts.len:
+    let s = parts[i]
+    if s.startswith(":") or s.startswith("*"):
+      let name = s[1..s.len]
+      if not is_name(name): panic("web: route '{p}': '{s}' needs a name of letters, digits and _")
+      if name in seen: panic("web: route '{p}' names '{name}' twice")
+      if s.startswith("*") and i != parts.len - 1: panic("web: route '{p}': '{s}' must be the last part")
+      seen.push(name)
+  return parts
+
+# Adds a route. The first route that matches a request answers it, so add specific ones first.
+fn route(var a: App, method: Str, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
+  a.routes.push(Route(method + "", pattern(p), h))
+
+fn get(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "GET", p, h)
+
+fn post(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "POST", p, h)
+
+fn put(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "PUT", p, h)
+
+fn patch(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "PATCH", p, h)
+
+fn delete(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "DELETE", p, h)
+
+# Adds middleware. Each runs in the order added, around everything added after it, for every request
+# (unmatched ones too, which get 404 or 405 at the end of the chain).
+fn use(var a: App, own m: fn(http.Request, Ctx, fn(http.Request, Ctx) -> http.Response) -> http.Response):
+  a.mws.push(m)
+
+# The route's parameters for this path, or nil if the route doesn't match it.
+fn match_route(segs: [Str], parts: [Str]) -> {Str: Str}?:
+  var ps: {Str: Str} = {}
+  for i in 0..segs.len:
+    let s = segs[i]
+    if s.startswith("*"):
+      if i >= parts.len: return nil
+      var rest: [Str] = []
+      for j in i..parts.len: rest.push(parts[j] + "")
+      let k = s[1..s.len]
+      ps[k] = http.decode("/".join(rest), false)
+      return ps
+    if i >= parts.len: return nil
+    if s.startswith(":"):
+      if parts[i] == "": return nil
+      let k = s[1..s.len]
+      ps[k] = http.decode(parts[i], false)
+    elif s != parts[i]:
+      return nil
+  if parts.len != segs.len: return nil
+  return ps
+
+fn dispatch(a: App, req: http.Request, c: Ctx) -> http.Response:
+  if not req.path.startswith("/"): return http.text(404, "not found")
+  # each part is decoded on its own, after splitting, so an encoded '/' (%2F) stays inside its part
+  let parts = req.path[1..req.path.len].split("/")
+  var allowed: [Str] = []
+  for r in a.routes:
+    if ps = match_route(r.segs, parts):
+      let same = r.method == req.method or (req.method == "HEAD" and r.method == "GET")
+      if same:
+        var c2 = copy_ctx(c)
+        for k, v in ps: c2.params[k] = v + ""
+        return r.handler(req, c2)
+      if not (r.method in allowed): allowed.push(r.method + "")
+      if r.method == "GET" and not ("HEAD" in allowed): allowed.push("HEAD")
+  if allowed.len == 0: return http.text(404, "not found")
+  var resp = http.text(405, "method not allowed")
+  resp.headers.push(http.Header("Allow", ", ".join(allowed)))
+  return resp
+
+fn chain(a: App, i: Int, req: http.Request, c: Ctx) -> http.Response:
+  if i < a.mws.len:
+    return a.mws[i](req, c, fn(r, c2) => chain(a, i + 1, r, c2))
+  return dispatch(a, req, c)
+
+# Answers one request: the middleware, then the first route that matches.
+fn handle(a: App, req: http.Request) -> http.Response:
+  return chain(a, 0, req, Ctx({}, {}))
+
+# Serves the app on a port until SIGTERM or SIGINT (see http.serve), giving requests in progress
+# 10 seconds to finish.
+fn serve(net: Net, os: Os, own a: App, port: Int) throws:
+  http.serve(net, os, port, own fn(req: http.Request) -> http.Response => handle(a, req), 10.0)?
+
+# ---- the context
+
+fn copy_ctx(c: Ctx) -> Ctx:
+  var out = Ctx({}, {})
+  for k, v in c.params: out.params[k] = v + ""
+  for k, v in c.vals: out.vals[k] = v + ""
+  return out
+
+# A route parameter ("" if the route has none of that name).
+fn param(c: Ctx, name: Str) -> Str:
+  return c.params.get(name, "")
+
+# A copy of the context with a value added: middleware passes it on to what runs next, and
+# handlers read it with web.val.
+fn with(c: Ctx, name: Str, value: Str) -> Ctx:
+  var out = copy_ctx(c)
+  out.vals[name] = value + ""
+  return out
+
+fn val(c: Ctx, name: Str) -> Str?:
+  if name in c.vals: return c.vals[name] + ""
+  return nil
+
+# ---- middleware
+
+# Logs each request: method, path, status and milliseconds, with the log module.
+fn logger(os: Os) -> fn(http.Request, Ctx, fn(http.Request, Ctx) -> http.Response) -> http.Response:
+  return own fn(req: http.Request, c: Ctx, next: fn(http.Request, Ctx) -> http.Response) -> http.Response => log_one(os, req, c, next)
+
+fn log_one(os: Os, req: http.Request, c: Ctx, next: fn(http.Request, Ctx) -> http.Response) -> http.Response:
+  let t = os.clock()
+  let resp = next(req, c)
+  let ms = (os.clock() - t) * 1000.0
+  log.info(os, "{req.method} {req.path} {resp.status} {ms:.1}ms")
+  return resp
+
+# Refuses requests that change things (anything but GET, HEAD and OPTIONS) when the browser says they
+# come from another site: a form on evil.example posting to your app (cross-site request forgery).
+# Browsers send Sec-Fetch-Site; older ones send Origin, which must then name the request's Host.
+fn same_origin(req: http.Request, c: Ctx, next: fn(http.Request, Ctx) -> http.Response) -> http.Response:
+  if req.method == "GET" or req.method == "HEAD" or req.method == "OPTIONS": return next(req, c)
+  if site = http.header(req, "Sec-Fetch-Site"):
+    if site == "same-origin" or site == "none": return next(req, c)
+    return http.text(403, "cross-site request refused")
+  if origin = http.header(req, "Origin"):
+    let host = http.header(req, "Host") else ""
+    if origin == "http://" + host or origin == "https://" + host: return next(req, c)
+    return http.text(403, "cross-site request refused")
+  return next(req, c)
+
+# ---- responses
+
+# An HTML response, with headers that stop browsers from guessing another type or framing the page.
+fn html(status: Int, own h: Html) -> http.Response:
+  var resp = http.Response(status, [], h.text)
+  resp.headers.push(http.Header("Content-Type", "text/html; charset=utf-8"))
+  resp.headers.push(http.Header("X-Content-Type-Options", "nosniff"))
+  resp.headers.push(http.Header("X-Frame-Options", "DENY"))
+  resp.headers.push(http.Header("Referrer-Policy", "strict-origin-when-cross-origin"))
+  return resp
+
+# A redirect (303 after a form post, 302 or 301 otherwise). Only a path on this site (starting with
+# one '/') is allowed, so a "next" parameter can't send users to another site.
+fn redirect(status: Int, to: Str) -> http.Response:
+  var where = to + ""
+  if not where.startswith("/") or where.startswith("//") or where.startswith("/\\"): where = "/"
+  var ctl = false
+  for i in 0..where.len:
+    if where[i] < 32 or where[i] == 127: ctl = true
+  if ctl: where = "/"
+  var resp = http.Response(status, [], "")
+  resp.headers.push(http.Header("Location", where))
+  return resp
+
+# ---- forms
+
+# The fields of a form post (application/x-www-form-urlencoded), decoded; the first of a name wins.
+# Empty for any other content type.
+fn form(req: http.Request) -> {Str: Str}:
+  var out: {Str: Str} = {}
+  let ct = (http.header(req, "Content-Type") else "").lower()
+  if not ct.startswith("application/x-www-form-urlencoded"): return out
+  if req.body == "": return out
+  for part in req.body.split("&"):
+    if part == "": continue
+    let eq = part.find("=")
+    var k = ""
+    var v = ""
+    if eq < 0:
+      k = http.decode(part, true)
+    else:
+      k = http.decode(part[0..eq], true)
+      v = http.decode(part[eq + 1..part.len], true)
+    if not (k in out): out[k] = v
+  return out
+
+# One field of a form post, or nil.
+fn field(req: http.Request, name: Str) -> Str?:
+  let f = form(req)
+  if name in f: return f[name] + ""
+  return nil
+
+# ---- cookies
+
+type Cookie:
+  name: Str
+  value: Str
+  path: Str
+  max_age: Int        # seconds; 0 deletes it; -1 for a cookie that ends with the browser session
+  http_only: Bool     # scripts on the page can't read it
+  secure: Bool        # sent over HTTPS only (browsers make an exception for localhost)
+  same_site: Str      # "Lax", "Strict" or "None"
+
+# A cookie with safe settings: the whole site, HttpOnly, Secure, SameSite=Lax, for this session.
+fn cookie(name: Str, value: Str) -> Cookie:
+  return Cookie(name + "", value + "", "/", -1, true, true, "Lax")
+
+fn cookie_octet(b: Byte) -> Bool:
+  return b == 0x21 or (b >= 0x23 and b <= 0x2B) or (b >= 0x2D and b <= 0x3A) or (b >= 0x3C and b <= 0x5B) or (b >= 0x5D and b <= 0x7E)
+
+fn is_token(s: Str) -> Bool:
+  if s.len == 0: return false
+  for i in 0..s.len:
+    let b = s[i]
+    if b <= 32 or b >= 127 or b == '"' or b == '(' or b == ')' or b == ',' or b == '/' or b == ':' or b == ';' or b == '<' or b == '=' or b == '>' or b == '?' or b == '@' or b == '[' or b == '\\' or b == ']' or b == '{' or b == '}':
+      return false
+  return true
+
+# The value with every byte a cookie can't hold (and '%') written as %XX; web.get_cookie decodes it.
+fn cookie_encode(s: Str) -> Str:
+  let hex = "0123456789ABCDEF"
+  var out = ""
+  for i in 0..s.len:
+    let b = s[i]
+    if cookie_octet(b) and b != '%':
+      out += str([b])
+    else:
+      out += "%" + str([hex[int(b) >> 4], hex[int(b) & 15]])
+  return out
+
+# Adds a Set-Cookie header. The name must be a token (it's written in the program: a bad one panics);
+# the value can be anything, encoded so it can't break out of the header.
+fn set_cookie(var resp: http.Response, c: Cookie):
+  if not is_token(c.name): panic("web: '{c.name}' can't be a cookie name")
+  var s = c.name + "=" + cookie_encode(c.value)
+  if c.path != "":
+    var ok = true
+    for i in 0..c.path.len:
+      if c.path[i] < 32 or c.path[i] >= 127 or c.path[i] == ';': ok = false
+    if not ok: panic("web: a cookie's path can't contain ';' or control bytes")
+    s += "; Path=" + c.path
+  if c.max_age >= 0: s += "; Max-Age={c.max_age}"
+  if c.http_only: s += "; HttpOnly"
+  if c.secure or c.same_site == "None": s += "; Secure"
+  if c.same_site == "Lax" or c.same_site == "Strict" or c.same_site == "None": s += "; SameSite=" + c.same_site
+  elif c.same_site != "": panic("web: SameSite is Lax, Strict or None, not '{c.same_site}'")
+  resp.headers.push(http.Header("Set-Cookie", s))
+
+# Tells the browser to forget a cookie (set with the default path).
+fn clear_cookie(var resp: http.Response, name: Str):
+  var c = cookie(name, "")
+  c.max_age = 0
+  set_cookie(&resp, c)
+
+# A cookie the request sent, decoded, or nil. The first one of that name wins.
+fn get_cookie(req: http.Request, name: Str) -> Str?:
+  for h in req.headers:
+    if h.name != "cookie": continue
+    for part in h.value.split(";"):
+      let p = part.strip()
+      let eq = p.find("=")
+      if eq <= 0: continue
+      if p[0..eq] == name:
+        var v = p[eq + 1..p.len]
+        if v.len >= 2 and v.startswith("\"") and v.endswith("\""): v = v[1..v.len - 1]
+        return http.decode(v, false)
+  return nil
+
+# A value signed with a secret (HMAC-SHA256), for a cookie the client mustn't be able to change:
+# "VALUE.SIGNATURE". web.verify gives the value back only if the signature is right.
+fn sign(secret: Str, value: Str) -> Str:
+  return value + "." + b64encode(hmac_sha256(secret, value))
+
+fn verify(secret: Str, signed: Str) -> Str?:
+  var dot = -1
+  for i in 0..signed.len:
+    if signed[i] == '.': dot = i
+  if dot < 0: return nil
+  let value = signed[0..dot]
+  let want = b64encode(hmac_sha256(secret, value))
+  let got = signed[dot + 1..signed.len]
+  if got.len != want.len: return nil
+  # compare every byte, so the time taken doesn't say how much of a forged signature was right
+  var diff = 0
+  for i in 0..got.len: diff = diff | (int(got[i]) ^ int(want[i]))
+  if diff != 0: return nil
+  return value
+
+# ---- static files
+
+# A handler for a route ending in *name (web.get(&app, "/assets/*file", web.files(fs, "public"))): the
+# file of that name under the folder. Names that would leave the folder, hidden files (a part starting
+# with '.') and anything that isn't a readable file get 404. Each response has an ETag, and a request
+# that already has the file (If-None-Match) gets 304 without the body.
+fn files(fs: Fs, root: Str) -> fn(http.Request, Ctx) -> http.Response:
+  return own fn(req: http.Request, c: Ctx) -> http.Response => serve_file(fs, root, req, c)
+
+fn serve_file(fs: Fs, root: Str, req: http.Request, c: Ctx) -> http.Response:
+  var name = ""
+  for k, v in c.params:
+    name = v + ""   # the route's one parameter (the last, if it has several)
+  if name == "" or name.endswith("/"): name += "index.html"
+  for part in name.split("/"):
+    if part == "" or part.startswith("."): return http.text(404, "not found")
+  for i in 0..name.len:
+    if name[i] == 0 or name[i] == '\\': return http.text(404, "not found")
+  let p = path.join(root, name)
+  if not path.within(root, p): return http.text(404, "not found")
+  let body = fs.read(p) else return http.text(404, "not found")
+  let tag = "\"" + sha256(body).hex()[0..32] + "\""
+  var resp = http.Response(200, [], "")
+  resp.headers.push(http.Header("ETag", tag + ""))
+  resp.headers.push(http.Header("Cache-Control", "no-cache"))
+  resp.headers.push(http.Header("X-Content-Type-Options", "nosniff"))
+  if inm = http.header(req, "If-None-Match"):
+    if inm == tag or inm == "*" or tag in inm.split(", "):
+      resp.status = 304
+      return resp
+  resp.headers.push(http.Header("Content-Type", content_type(name)))
+  resp.body = body
+  return resp
+
+# The Content-Type for a file name, by its extension.
+fn content_type(name: Str) -> Str:
+  let e = path.ext(name).lower()
+  if e == ".html" or e == ".htm": return "text/html; charset=utf-8"
+  if e == ".css": return "text/css; charset=utf-8"
+  if e == ".js" or e == ".mjs": return "text/javascript; charset=utf-8"
+  if e == ".json": return "application/json"
+  if e == ".txt" or e == ".md": return "text/plain; charset=utf-8"
+  if e == ".svg": return "image/svg+xml"
+  if e == ".png": return "image/png"
+  if e == ".jpg" or e == ".jpeg": return "image/jpeg"
+  if e == ".gif": return "image/gif"
+  if e == ".webp": return "image/webp"
+  if e == ".avif": return "image/avif"
+  if e == ".ico": return "image/x-icon"
+  if e == ".woff2": return "font/woff2"
+  if e == ".woff": return "font/woff"
+  if e == ".wasm": return "application/wasm"
+  if e == ".pdf": return "application/pdf"
+  if e == ".xml": return "application/xml"
+  if e == ".mp4": return "video/mp4"
+  if e == ".webm": return "video/webm"
+  return "application/octet-stream"
+
+# ---- HTML
+
+# HTML that is safe to send: made by web.render (which escapes every value it inserts), web.join, or
+# web.trust (which says "this text is HTML already", so it must never hold text from a user).
+type Html:
+  text: Str
+
+type Val:
+  Text(name: Str, value: Str)   # inserted escaped
+  Markup(name: Str, h: Html)     # inserted as it is: HTML made by render, join or trust
+
+# A value to insert as text: escaped.
+fn v(name: Str, value: Str) -> Val:
+  return Text(name + "", value + "")
+
+# A value to insert as HTML: a render's result, or a join of several.
+fn h(name: Str, own x: Html) -> Val:
+  return Markup(name + "", x)
+
+fn trust(text: Str) -> Html:
+  return Html(text + "")
+
+# Text with & < > " ' written as entities, safe inside an element or a quoted attribute.
+fn esc(s: Str) -> Str:
+  var plain = true
+  for i in 0..s.len:
+    let b = s[i]
+    if b == '&' or b == '<' or b == '>' or b == '"' or b == '\'': plain = false
+  if plain: return s + ""
+  var out = ""
+  out.reserve(s.len + 16)
+  for i in 0..s.len:
+    let b = s[i]
+    if b == '&': out += "&amp;"
+    elif b == '<': out += "&lt;"
+    elif b == '>': out += "&gt;"
+    elif b == '"': out += "&quot;"
+    elif b == '\'': out += "&#39;"
+    else: out += str([b])
+  return out
+
+# Fills a template: each {name} is replaced by the value of that name, escaped unless it was given
+# with web.h. The template is a const parameter, so it's written in the program (a string literal)
+# and text from a request can never become markup. In Vu source a literal brace is doubled, so
+# "<p>{{name}}</p>" is the template <p>{name}</p>. A '{' that doesn't start a {name} stays as it is
+# (CSS, a script). A {name} with no value panics: the template and its values are both in the program.
+fn render(const t: Str, vals: [Val]) -> Html:
+  var out = ""
+  out.reserve(t.len)
+  var i = 0
+  var lit = 0
+  while i < t.len:
+    if t[i] == '{':
+      var j = i + 1
+      while j < t.len and is_name_byte(t[j], j == i + 1): j += 1
+      if j > i + 1 and j < t.len and t[j] == '}':
+        out += t[lit..i]
+        let name = t[i + 1..j]
+        var found = false
+        for x in vals:
+          match x:
+            Text(n, value):
+              if n == name and not found:
+                out += esc(value)
+                found = true
+            Markup(n, hx):
+              if n == name and not found:
+                out += hx.text
+                found = true
+        if not found: panic("web.render: the template has {{{name}}} but no value named '{name}'")
+        i = j + 1
+        lit = i
+        continue
+    i += 1
+  out += t[lit..t.len]
+  return Html(out)
+
+fn is_name_byte(b: Byte, first: Bool) -> Bool:
+  return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or b == '_' or (not first and b >= '0' and b <= '9')
+
+# Several pieces of HTML one after another (the rows of a list, say).
+fn join(parts: [Html]) -> Html:
+  var out = ""
+  for p in parts: out += p.text
+  return Html(out)

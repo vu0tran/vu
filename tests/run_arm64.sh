@@ -10,7 +10,8 @@ export CC=aarch64-linux-gnu-gcc VU_MARCH= QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
 pass=0; fail=0
 for f in targeted/*.vu; do
   sed -n '2p' "$f" | grep -q '^# expect: output ' || continue
-  grep -q 'tls_\|extern "' "$f" && continue
+  # (no OpenSSL for ARM64 here: skip programs that use TLS, directly or through http/web/ws/pg)
+  grep -q 'tls_\|extern "\|^import \(http\|web\|ws\|h2\|pg\)$' "$f" && continue
   # qemu-user runs posix_spawn's child as a plain fork, so a program that can't be started shows up
   # as exit status 127 instead of an error (a qemu limitation, not ARM64's)
   [ "$f" = targeted/180_os_run_bad_args.vu ] && continue

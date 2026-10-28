@@ -56,5 +56,27 @@ printf 'type Cfg:\n  Missing(key: Str)\n\nfn need(k: Str) -> Int throws Cfg:\n  
 out=$($VU run "$work/typed.vu" 2>&1); rc=$?
 [ $rc -eq 1 ] && [ "$out" = "error: Missing(port)" ]; check "main fails with an enum value: its message, exit 1" $? "rc=$rc out=[$out]"
 
+# vu new web NAME: the files, a starter that checks, and refusals that write nothing
+out=$(cd "$work" && $VU new web demo-app 2>&1); rc=$?
+[ $rc -eq 0 ] && for f in main.vu public/style.css Dockerfile .dockerignore .gitignore fly.toml README.md; do [ -s "$work/demo-app/$f" ] || exit 1; done \
+  && grep -q 'app = "demo-app"' "$work/demo-app/fly.toml" && ! grep -q '@@' "$work/demo-app/README.md" "$work/demo-app/Dockerfile"
+check "new web: writes the starter, with the name filled in" $? "rc=$rc out=[$out] $(ls -A "$work/demo-app" 2>&1)"
+out=$($VU check "$work/demo-app/main.vu" 2>&1); check "new web: its main.vu checks" $? "$out"
+before=$(ls -A "$work/demo-app" | wc -l); out=$(cd "$work" && $VU new web demo-app 2>&1); rc=$?
+[ $rc -eq 1 ] && [ "$(ls -A "$work/demo-app" | wc -l)" = "$before" ]; check "new web: an existing folder is left alone (exit 1)" $? "rc=$rc out=[$out]"
+for bad in "Demo" "1app" "a/b" "../x" "a b" ""; do
+  out=$(cd "$work" && $VU new web "$bad" 2>&1); rc=$?; [ $rc -eq 2 ] || break
+done
+[ $rc -eq 2 ] && [ ! -e "$work/x" ]; check "new web: names that aren't lowercase letters, digits and '-' are refused" $? "bad=[$bad] rc=$rc out=[$out]"
+
+# --static: no dynamic loader needed
+: > "$work/cc.log"; $VU build "$work/ok.vu" --static -o "$work/st" >/dev/null 2>&1
+grep -q -- '-static' "$work/cc.log" && out=$("$work/st" 2>&1) && [ "$out" = "42" ] && python3 -c '
+import struct, sys
+d = open(sys.argv[1], "rb").read()
+phoff, = struct.unpack_from("<Q", d, 32); size, n = struct.unpack_from("<HH", d, 54)
+sys.exit(any(struct.unpack_from("<I", d, phoff + i * size)[0] == 3 for i in range(n)))' "$work/st"
+check "build --static: linked with -static, runs, has no PT_INTERP (no dynamic loader)" $? "out=[$out] cc=$(cat "$work/cc.log")"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]
