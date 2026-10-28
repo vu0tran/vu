@@ -280,6 +280,12 @@ program's output checked against Vu's before it's timed. Seconds, lower is bette
   the loop can cover (Rust pays the same). The rest of n-body's gap to C hasn't been investigated.
 - nsieve's C++ version is fast because `vector<bool>` packs the sieve into bits; the others use a
   byte per number.
+- Against Python 3.13 and JavaScript on Node 22 (`bench/dyn/compare.sh`: every language pinned to one
+  core, the same size for all, median of 3, outputs checked): Vu is 4.3–140x faster than Python
+  (binary-trees 15x, n-body 81x, spectral-norm 140x, nsieve 4.3x, fannkuch-redux 31x, mandelbrot 32x)
+  and 1.1–5.2x faster than Node (binary-trees 5.2x, the rest 1.1–1.9x). Sizes are smaller than the
+  table above's for n-body (5M steps), spectral-norm (2000) and mandelbrot (4000), where Python would
+  take minutes per run.
 - On HTTP, a Vu server on one core handled 121k requests/s for a minimal reply and 25.5k for a
   5.8 KB JSON order parsed and answered, against 112k and 9.5k for a raw-TCP Go server (details and
   memory in CHANGELOG.md, round 7).
