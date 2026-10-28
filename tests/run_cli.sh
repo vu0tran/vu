@@ -5,6 +5,7 @@
 cd "$(dirname "$0")"
 VU=${VU:-"$PWD/../vu"}
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+unset VU_CACHE   # (these checks watch the C compiler being called)
 real_cc=${CC:-cc}
 cat > "$work/cc" <<EOF
 #!/bin/sh

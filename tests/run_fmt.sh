@@ -17,8 +17,9 @@ done
 # the same C: programs that compile (their imports formatted too, in the same folders)
 progs="compiler/vuc.vu $(ls examples/*.vu tests/valid/*.vu) $(grep -l '^# expect: output' tests/targeted/*.vu)"
 for p in $progs; do
-  ( cd "$(dirname "$p")" && $VU build "$(basename "$p")" --debug --emit-c "$work/a.c" -o "$work/a" ) >/dev/null 2>&1 || continue
-  ( cd "$work/$(dirname "$p")" && $VU build "$(basename "$p")" --debug --emit-c "$work/b.c" -o "$work/b" ) >/dev/null 2>"$work/err"
+  # (only the C is compared: CC=true writes it and skips compiling it)
+  ( cd "$(dirname "$p")" && CC=true $VU build "$(basename "$p")" --debug --emit-c "$work/a.c" -o "$work/a" ) >/dev/null 2>&1 || continue
+  ( cd "$work/$(dirname "$p")" && CC=true $VU build "$(basename "$p")" --debug --emit-c "$work/b.c" -o "$work/b" ) >/dev/null 2>"$work/err"
   # (when formatting removed blank lines, line numbers in the C shift too: compare with numbers masked)
   mask=cat
   [ "$(wc -l < "$p")" = "$(wc -l < "$work/$p")" ] || mask="sed -E s/[0-9]+/N/g"

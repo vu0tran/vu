@@ -10,8 +10,8 @@ work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 python3 loops_gen.py "$first" $((first + count)) "$work" || exit 1
 pass=0; fail=0
 for s in $(seq "$first" $((first + count - 1))); do
-  f="$work/p$s.vu"
-  if ! "$VU" build "$f" -o "$work/v" >"$work/err" 2>&1 || ! VU_NO_VERSIONING=1 "$VU" build "$f" -o "$work/n" >>"$work/err" 2>&1; then
+  f="p$s.vu"   # (built by its name in $work, so the binary is the same as prebuild.sh's)
+  if ! (cd "$work" && "$VU" build "$f" -o "$work/v" >"$work/err" 2>&1) || ! (cd "$work" && VU_NO_VERSIONING=1 "$VU" build "$f" -o "$work/n" >>"$work/err" 2>&1); then
     fail=$((fail+1)); echo "FAIL  seed $s doesn't build: $(head -3 "$work/err")"; continue
   fi
   a=$(cd "$work" && timeout 30 ./v 2>&1; echo "exit $?")

@@ -307,7 +307,8 @@ not, two allocators) that must print the same, JSON tests, memory tests, and net
 HTTP/2 and WebSocket tests against Python's libraries and hand-made hostile input (including the
 known HTTP/2 attacks), a real PostgreSQL server and a fake hostile one, text, regular expressions,
 paths and hashing compared with Python on random input, the targeted programs again on ARM64 under
-qemu, and macOS builds. Each runs under
+qemu, and macOS builds (12 minutes on a 2-core machine when little has changed, 26 when everything
+is rebuilt; CHANGELOG.md, round 14). Each runs under
 AddressSanitizer, UBSan and LeakSanitizer, and the threaded programs also run under
 ThreadSanitizer. The compiler compiles itself, and every rebuild must reach a fixed point (stages
 2 and 3 produce identical C) before it's installed. Each new feature went through rounds of

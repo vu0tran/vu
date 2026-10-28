@@ -25,9 +25,12 @@ is in `SPEC.md`; `README.md` introduces it, and history and measurements are in 
    one finds nothing. Report every round's findings honestly, and don't count your own test
    mistakes as findings. Audit new C in each round (`try.sh` does): the gate fails on any warning,
    and newer gcc turns some (incompatible pointer types) into errors.
-6. Run the **full gate** (about an hour, in the background) once per batch of features, before
-   syncing or packaging, not after each one: `tests/gate.sh`. It must print GATE PASSED. Nothing
-   CPU-heavy runs while it does: several checks measure time and fail on a starved machine.
+6. Run the **full gate** (in the background) once per batch of features, before syncing or
+   packaging, not after each one: `tests/gate.sh`. It must print GATE PASSED. It takes about 12
+   minutes when most programs' C hasn't changed since the last gate (binaries are cached in
+   `~/.cache/vu-gate` by what they're made from) and about 26 when everything is rebuilt, as after a
+   runtime change. Nothing CPU-heavy runs while it does: it already uses every core, and several
+   checks measure time and fail on a starved machine.
 
 ## Speed rules
 

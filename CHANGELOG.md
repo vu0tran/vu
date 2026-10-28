@@ -1356,6 +1356,54 @@ copy_within overlapping both ways, n = 0, past the end, owned elements refused; 
 small and empty lists, the list usable after, LSan clean), and `tests/run_zlib.py`'s 3,201 cases
 (800 with sanitizers, which watch the 16-byte copies): all as expected, nothing found.
 
+## Round 14: the gate in 12 minutes
+
+The full gate took 49 minutes (2,959 s on the 2-core VM), every suite one after another, and most of
+it was building: about 4,600 programs, each built with gcc from scratch every time, one at a time,
+though a small program's C is mostly the runtime and changes only when the compiler does.
+
+- `vu build` keeps binaries when `VU_CACHE=DIR` is set: under the SHA-256 of the C, the C compiler's
+  arguments (minus file names), its `--version`, and the CPU's model and flags when building for the
+  native CPU. The same build again is a copy: 18 ms instead of 534 for a targeted test under the
+  sanitizers, the same bytes. Programs with extern C files aren't cached (their C includes files the
+  hash doesn't see), and the gate empties the cache when the system's packages change (headers and
+  libraries aren't in the hash either).
+- The gate runs every suite with `VU` set to `tests/vu_record.sh`, which notes each build (its folder,
+  the settings that change the binary, its arguments). The next gate's `tests/prebuild.sh` replays that
+  list on every core first, so the suites' own builds are copies. Builds in folders a suite made for
+  itself can't be replayed; run_loops' generated programs are generated again for the purpose.
+- Suites that don't run servers, threads or timing checks run side by side, one per core, longest
+  first; the network, TLS, HTTP, HTTP/2, WebSocket, PostgreSQL, thread and memory suites then run alone
+  as before.
+- run_fmt compares the C a program makes before and after formatting and never used the binaries: it
+  now builds with `CC=true`, which writes the C and compiles nothing (the compiler's own source was two
+  full builds of 99,000 lines of C).
+- run_cli turns the cache off: its checks watch the C compiler being called.
+
+| | before | first gate (empty cache) | next gate |
+|---|---|---|---|
+| prebuild | | 79 s (600 builds) | 58 s (4,663 builds, mostly copies) |
+| run_targeted | 663 s | 608 s | 122 s |
+| run_differential | 728 s | 559 s | 161 s |
+| run_arm64 | 272 s | 277 s | 66 s |
+| run_fmt | 226 s | 143 s | 41 s |
+| run_loops | 155 s | 14 s | 14 s |
+| run_selfhost | 135 s | 107 s | 24 s |
+| the suites that run alone | 587 s | 551 s | 418 s |
+| **total** | **2,959 s** | **1,571 s** | **733 s** |
+
+(The first gate's run_fmt was before the `CC=true` change; the next one's is after it.) Every suite
+passed in all three. The next gate is the usual case: a change to the compiler leaves most programs'
+C as it was, and those are copies. A change to the runtime changes every program's C, which makes the
+gate a first gate again.
+
+What's left is mostly the suites that run alone (418 s, which includes real waiting on sockets and
+threads) and running the targeted programs under the sanitizers. Not done: compiling the runtime once
+as its own object. It's about 80% of compiling a small program (a hello-world takes 176 ms of gcc at
+-O3, a typical targeted test 212 ms), so it would make first gates and every `vu run` faster, but the
+runtime changes with each program's flags and features, and its small functions must stay inlinable;
+that's a change to the compiler, not the gate.
+
 ## Memory safety evidence
 
 - `tests/reject/`: 21 programs, each containing a bug Vu must refuse: use after move, a
