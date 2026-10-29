@@ -1,0 +1,140 @@
+# A URL shortener backed by PostgreSQL, the Vu side of bench/railway (node/ is the same app in
+# Express). Routes:
+#   POST /links  {"url": "https://..."}  -> 201 {"code": "...", "url": "..."}
+#   GET  /:code                          -> 302 to the URL (and counts the visit)
+#   GET  /links/:code                    -> 200 {"code", "url", "hits"}
+#   GET  /health                         -> 200 {"ok": true}
+# Configuration from the environment, as Railway gives it: PORT, and DATABASE_URL
+# (postgresql://user:password@host:port/database).
+import http
+import json
+import pg
+import web
+
+const POOL = 10
+const ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+type NewLink:
+  url: Str
+
+# postgresql://user:password@host:port/database, with %-escapes in the user and password
+fn db_config(u: Str) -> pg.Config throws:
+  var rest = u
+  if rest.startswith("postgresql://"): rest = rest[13..rest.len]
+  elif rest.startswith("postgres://"): rest = rest[11..rest.len]
+  else: fail "DATABASE_URL must start with postgresql://"
+  let at = rest.find("@")
+  if at < 0: fail "DATABASE_URL has no user"
+  let cred = rest[0..at]
+  let hostpart = rest[at + 1..rest.len]
+  let colon = cred.find(":")
+  var user = cred + ""
+  var password = ""
+  if colon >= 0:
+    user = cred[0..colon]
+    password = cred[colon + 1..cred.len]
+  let slash = hostpart.find("/")
+  if slash < 0: fail "DATABASE_URL has no database"
+  var hp = hostpart[0..slash]
+  var database = hostpart[slash + 1..hostpart.len]
+  let q = database.find("?")
+  if q >= 0: database = database[0..q]
+  var host = hp + ""
+  var port = 5432
+  let pc = hp.find(":", 0)
+  if pc >= 0 and not hp.startswith("["):
+    host = hp[0..pc]
+    port = int(hp[pc + 1..hp.len]) else fail "DATABASE_URL has a bad port"
+  return pg.config(host, port, unescape(user), unescape(password), database)
+
+fn unescape(s: Str) -> Str:
+  var out: [Byte] = []
+  var i = 0
+  while i < s.len:
+    if s[i] == '%' and i + 2 < s.len + 1 and hex(s[i + 1]) >= 0 and hex(s[i + 2]) >= 0:
+      out.push(byte(hex(s[i + 1]) * 16 + hex(s[i + 2])))
+      i += 3
+      continue
+    out.push(s[i])
+    i += 1
+  return str(out)
+
+fn hex(b: Byte) -> Int:
+  if b >= '0' and b <= '9': return int(b) - 48
+  if b >= 'a' and b <= 'f': return int(b) - 87
+  if b >= 'A' and b <= 'F': return int(b) - 55
+  return -1
+
+fn new_code() -> Str:
+  var out = ""
+  for b in bytes(random_bytes(7)): out += ALPHABET[int(b) % 62..int(b) % 62 + 1]
+  return out
+
+fn create(net: Net, pool: Chan[pg.Db], req: http.Request) -> http.Response:
+  let body = from_json(req.body, NewLink) else return http.json(400, "{{\"error\": \"expected {{\\\"url\\\": ...}}\"}}")
+  let url = body.url + ""
+  if not (url.startswith("http://") or url.startswith("https://")) or url.len > 2048:
+    return http.json(400, "{{\"error\": \"url must be http(s) and at most 2048 bytes\"}}")
+  var db = pool.recv() else return http.json(503, "{{\"error\": \"no database connection\"}}")
+  var tries = 0
+  var resp = http.json(500, "{{\"error\": \"couldn't make a code\"}}")
+  while tries < 5:
+    let code = new_code()
+    match pg.exec(net, &db, "insert into links (code, url) values ($1, $2) on conflict do nothing", [code, url]):
+      ok(n):
+        if n == 1:
+          resp = http.json(201, "{{\"code\": " + json.quote(code) + ", \"url\": " + json.quote(url) + "}}")
+          break
+      err(e):
+        resp = http.json(500, "{{\"error\": " + json.quote(pg.describe(e)) + "}}")
+        break
+    tries += 1
+  pool.send(db)
+  return resp
+
+fn follow(net: Net, pool: Chan[pg.Db], code: Str) -> http.Response:
+  var db = pool.recv() else return http.json(503, "{{\"error\": \"no database connection\"}}")
+  var resp = http.json(404, "{{\"error\": \"no such link\"}}")
+  match pg.query(net, &db, "update links set hits = hits + 1 where code = $1 returning url", [code]):
+    ok(rows):
+      if rows.rows.len == 1:
+        let url = pg.text(rows, 0, "url") else ""
+        resp = web.redirect(302, url)
+    err(e): resp = http.json(500, "{{\"error\": " + json.quote(pg.describe(e)) + "}}")
+  pool.send(db)
+  return resp
+
+fn stats(net: Net, pool: Chan[pg.Db], code: Str) -> http.Response:
+  var db = pool.recv() else return http.json(503, "{{\"error\": \"no database connection\"}}")
+  var resp = http.json(404, "{{\"error\": \"no such link\"}}")
+  match pg.query(net, &db, "select url, hits from links where code = $1", [code]):
+    ok(rows):
+      if rows.rows.len == 1:
+        let url = pg.text(rows, 0, "url") else ""
+        let hits = pg.text(rows, 0, "hits") else "0"
+        resp = http.json(200, "{{\"code\": " + json.quote(code) + ", \"url\": " + json.quote(url) + ", \"hits\": " + hits + "}}")
+    err(e): resp = http.json(500, "{{\"error\": " + json.quote(pg.describe(e)) + "}}")
+  pool.send(db)
+  return resp
+
+fn health(req: http.Request, c: web.Ctx) -> http.Response:
+  return http.json(200, "{{\"ok\": true}}")
+
+fn main(net: Net, os: Os) throws:
+  let port = int(os.env("PORT")) else 8080
+  let cfg = db_config(os.env("DATABASE_URL"))?
+  let pool: Chan[pg.Db] = chan(POOL)
+  for i in 0..POOL:
+    var db = pg.connect(net, cfg)?
+    if i == 0: pg.exec(net, &db, "create table if not exists links (code text primary key, url text not null, hits bigint not null default 0, created_at timestamptz not null default now())", [])?
+    pool.send(db)
+  var app = web.app()
+  let p1 = pool.share()
+  let p2 = pool.share()
+  let p3 = pool.share()
+  web.get(&app, "/health", health)
+  web.post(&app, "/links", own fn(req: http.Request, c: web.Ctx) => create(net, p1, req))
+  web.get(&app, "/links/:code", own fn(req: http.Request, c: web.Ctx) => stats(net, p2, web.param(c, "code")))
+  web.get(&app, "/:code", own fn(req: http.Request, c: web.Ctx) => follow(net, p3, web.param(c, "code")))
+  print("listening on port {port}")
+  web.serve(net, os, app, port)?

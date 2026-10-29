@@ -2420,3 +2420,18 @@ What's left is the measured gap: gcc does 1.8 times the CPU work on Vu's C that 
 Rust (42 s of CPU against 24 s, measured with `time`). Vu checks every Int operation and Rust's release builds don't,
 which is about a fifth of gcc's time on arithmetic-heavy functions (19% on the program's typical
 function when the checks are taken out).
+
+### A benchmark on Railway
+
+Railway is where people who build with AI deploy their backends, so the next measurement is there.
+`bench/railway` has the same URL shortener on PostgreSQL twice: in Vu (`web`, `pg`) and in Node
+(Express and node-postgres, the stack an agent usually picks). A load generator runs inside the
+Railway project, and a workflow (`bench-railway`, run by hand) deploys all three and reports
+requests/s, latency, memory, CPU and the monthly cost at Railway's prices. It needs the project's
+token as the `RAILWAY_TOKEN` secret. On this machine first (`local.sh`, 2 cores shared with
+PostgreSQL and wrk), Vu answered 7,093 requests/s in 5 MB and Node 3,689 in 138 MB, with Node using
+3.4 times the CPU.
+
+Building it found one gap: `net.listen` took IPv4 only, and Railway's private network reaches a
+service over IPv6. A listener now takes both on one socket where the system has IPv6, and IPv4
+alone where it doesn't. The http, net, web and WebSocket suites pass.

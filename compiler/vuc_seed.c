@@ -126194,1575 +126194,1575 @@ VU_FN vu_str fn_rt_tasks(void) {
     #line 20203 "vuc.vu"
     VU_AT(20203);
     #line 20203 "vuc.vu"
-    ({ vu_str _t3204 = vu_str_lit("    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);\n", 77); vu_str_cat(&v_s, &_t3204); drop_Str(&_t3204); });
+    ({ vu_str _t3204 = vu_str_lit("    /* IPv6 and IPv4 on one socket where the system has IPv6 (some hosts' private networks, such as\n", 100); vu_str_cat(&v_s, &_t3204); drop_Str(&_t3204); });
     #line 20204 "vuc.vu"
     VU_AT(20204);
     #line 20204 "vuc.vu"
-    ({ vu_str _t3207 = vu_str_lit("    if (fd < 0) { *err = vu_errf(\"can't listen on port %lld: %s\", (long long)port, strerror(errno)); return false; }\n", 117); vu_str_cat(&v_s, &_t3207); drop_Str(&_t3207); });
+    ({ vu_str _t3207 = vu_str_lit("       Railway's, reach a service only over IPv6); IPv4 alone where it doesn't */\n", 82); vu_str_cat(&v_s, &_t3207); drop_Str(&_t3207); });
     #line 20205 "vuc.vu"
     VU_AT(20205);
     #line 20205 "vuc.vu"
-    ({ vu_str _t3210 = vu_str_lit("    vu_sock_flags(fd);\n", 23); vu_str_cat(&v_s, &_t3210); drop_Str(&_t3210); });
+    ({ vu_str _t3210 = vu_str_lit("    int one = 1, zero = 0;\n", 27); vu_str_cat(&v_s, &_t3210); drop_Str(&_t3210); });
     #line 20206 "vuc.vu"
     VU_AT(20206);
     #line 20206 "vuc.vu"
-    ({ vu_str _t3213 = vu_str_lit("    int one = 1;\n", 17); vu_str_cat(&v_s, &_t3213); drop_Str(&_t3213); });
+    ({ vu_str _t3213 = vu_str_lit("    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);\n", 78); vu_str_cat(&v_s, &_t3213); drop_Str(&_t3213); });
     #line 20207 "vuc.vu"
     VU_AT(20207);
     #line 20207 "vuc.vu"
-    ({ vu_str _t3216 = vu_str_lit("    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);\n", 64); vu_str_cat(&v_s, &_t3216); drop_Str(&_t3216); });
+    ({ vu_str _t3216 = vu_str_lit("    if (fd >= 0) {\n", 19); vu_str_cat(&v_s, &_t3216); drop_Str(&_t3216); });
     #line 20208 "vuc.vu"
     VU_AT(20208);
     #line 20208 "vuc.vu"
-    ({ vu_str _t3219 = vu_str_lit("    struct sockaddr_in a;\n", 26); vu_str_cat(&v_s, &_t3219); drop_Str(&_t3219); });
+    ({ vu_str _t3219 = vu_str_lit("        vu_sock_flags(fd);\n", 27); vu_str_cat(&v_s, &_t3219); drop_Str(&_t3219); });
     #line 20209 "vuc.vu"
     VU_AT(20209);
     #line 20209 "vuc.vu"
-    ({ vu_str _t3222 = vu_str_lit("    memset(&a, 0, sizeof a);\n", 29); vu_str_cat(&v_s, &_t3222); drop_Str(&_t3222); });
+    ({ vu_str _t3222 = vu_str_lit("        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);\n", 68); vu_str_cat(&v_s, &_t3222); drop_Str(&_t3222); });
     #line 20210 "vuc.vu"
     VU_AT(20210);
     #line 20210 "vuc.vu"
-    ({ vu_str _t3225 = vu_str_lit("    a.sin_family = AF_INET;\n", 28); vu_str_cat(&v_s, &_t3225); drop_Str(&_t3225); });
+    ({ vu_str _t3225 = vu_str_lit("        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);\n", 71); vu_str_cat(&v_s, &_t3225); drop_Str(&_t3225); });
     #line 20211 "vuc.vu"
     VU_AT(20211);
     #line 20211 "vuc.vu"
-    ({ vu_str _t3228 = vu_str_lit("    a.sin_addr.s_addr = htonl(INADDR_ANY);\n", 43); vu_str_cat(&v_s, &_t3228); drop_Str(&_t3228); });
+    ({ vu_str _t3228 = vu_str_lit("        struct sockaddr_in6 a6;\n", 32); vu_str_cat(&v_s, &_t3228); drop_Str(&_t3228); });
     #line 20212 "vuc.vu"
     VU_AT(20212);
     #line 20212 "vuc.vu"
-    ({ vu_str _t3231 = vu_str_lit("    a.sin_port = htons((uint16_t)port);\n", 40); vu_str_cat(&v_s, &_t3231); drop_Str(&_t3231); });
+    ({ vu_str _t3231 = vu_str_lit("        memset(&a6, 0, sizeof a6);\n", 35); vu_str_cat(&v_s, &_t3231); drop_Str(&_t3231); });
     #line 20213 "vuc.vu"
     VU_AT(20213);
     #line 20213 "vuc.vu"
-    ({ vu_str _t3234 = vu_str_lit("    if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0 || listen(fd, SOMAXCONN) < 0) {\n", 86); vu_str_cat(&v_s, &_t3234); drop_Str(&_t3234); });
+    ({ vu_str _t3234 = vu_str_lit("        a6.sin6_family = AF_INET6;\n", 35); vu_str_cat(&v_s, &_t3234); drop_Str(&_t3234); });
     #line 20214 "vuc.vu"
     VU_AT(20214);
     #line 20214 "vuc.vu"
-    ({ vu_str _t3237 = vu_str_lit("        int e = errno;\n", 23); vu_str_cat(&v_s, &_t3237); drop_Str(&_t3237); });
+    ({ vu_str _t3237 = vu_str_lit("        a6.sin6_addr = in6addr_any;\n", 36); vu_str_cat(&v_s, &_t3237); drop_Str(&_t3237); });
     #line 20215 "vuc.vu"
     VU_AT(20215);
     #line 20215 "vuc.vu"
-    ({ vu_str _t3240 = vu_str_lit("        close(fd);\n", 19); vu_str_cat(&v_s, &_t3240); drop_Str(&_t3240); });
+    ({ vu_str _t3240 = vu_str_lit("        a6.sin6_port = htons((uint16_t)port);\n", 46); vu_str_cat(&v_s, &_t3240); drop_Str(&_t3240); });
     #line 20216 "vuc.vu"
     VU_AT(20216);
     #line 20216 "vuc.vu"
-    ({ vu_str _t3243 = vu_str_lit("        *err = vu_errf(\"can't listen on port %lld: %s\", (long long)port, strerror(e));\n", 87); vu_str_cat(&v_s, &_t3243); drop_Str(&_t3243); });
+    ({ vu_str _t3243 = vu_str_lit("        if (bind(fd, (struct sockaddr *)&a6, sizeof a6) < 0) {\n", 63); vu_str_cat(&v_s, &_t3243); drop_Str(&_t3243); });
     #line 20217 "vuc.vu"
     VU_AT(20217);
     #line 20217 "vuc.vu"
-    ({ vu_str _t3246 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3246); drop_Str(&_t3246); });
+    ({ vu_str _t3246 = vu_str_lit("            int e = errno;\n", 27); vu_str_cat(&v_s, &_t3246); drop_Str(&_t3246); });
     #line 20218 "vuc.vu"
     VU_AT(20218);
     #line 20218 "vuc.vu"
-    ({ vu_str _t3249 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3249); drop_Str(&_t3249); });
+    ({ vu_str _t3249 = vu_str_lit("            close(fd);\n", 23); vu_str_cat(&v_s, &_t3249); drop_Str(&_t3249); });
     #line 20219 "vuc.vu"
     VU_AT(20219);
     #line 20219 "vuc.vu"
-    ({ vu_str _t3252 = vu_str_lit("    vu_sock *s = vu_sock_new(fd, err);\n", 39); vu_str_cat(&v_s, &_t3252); drop_Str(&_t3252); });
+    ({ vu_str _t3252 = vu_str_lit("            fd = -1;\n", 21); vu_str_cat(&v_s, &_t3252); drop_Str(&_t3252); });
     #line 20220 "vuc.vu"
     VU_AT(20220);
     #line 20220 "vuc.vu"
-    ({ vu_str _t3255 = vu_str_lit("    if (!s) return false;\n", 26); vu_str_cat(&v_s, &_t3255); drop_Str(&_t3255); });
+    ({ vu_str _t3255 = vu_str_lit("            if (e == EADDRINUSE || e == EACCES) {   /* the port's problem, not IPv6's */\n", 89); vu_str_cat(&v_s, &_t3255); drop_Str(&_t3255); });
     #line 20221 "vuc.vu"
     VU_AT(20221);
     #line 20221 "vuc.vu"
-    ({ vu_str _t3258 = vu_str_lit("    *out = s;\n", 14); vu_str_cat(&v_s, &_t3258); drop_Str(&_t3258); });
+    ({ vu_str _t3258 = vu_str_lit("                *err = vu_errf(\"can't listen on port %lld: %s\", (long long)port, strerror(e));\n", 95); vu_str_cat(&v_s, &_t3258); drop_Str(&_t3258); });
     #line 20222 "vuc.vu"
     VU_AT(20222);
     #line 20222 "vuc.vu"
-    ({ vu_str _t3261 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t3261); drop_Str(&_t3261); });
+    ({ vu_str _t3261 = vu_str_lit("                return false;\n", 30); vu_str_cat(&v_s, &_t3261); drop_Str(&_t3261); });
     #line 20223 "vuc.vu"
     VU_AT(20223);
     #line 20223 "vuc.vu"
-    ({ vu_str _t3264 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3264); drop_Str(&_t3264); });
+    ({ vu_str _t3264 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t3264); drop_Str(&_t3264); });
     #line 20224 "vuc.vu"
     VU_AT(20224);
     #line 20224 "vuc.vu"
-    ({ vu_str _t3267 = vu_str_lit("/* The port a listener is on (useful after listening on port 0, which picks a free one). */\n", 92); vu_str_cat(&v_s, &_t3267); drop_Str(&_t3267); });
+    ({ vu_str _t3267 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3267); drop_Str(&_t3267); });
     #line 20225 "vuc.vu"
     VU_AT(20225);
     #line 20225 "vuc.vu"
-    ({ vu_str _t3270 = vu_str_lit("static int64_t vu_net_port(vu_cap net, void *l) {\n", 50); vu_str_cat(&v_s, &_t3270); drop_Str(&_t3270); });
+    ({ vu_str _t3270 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3270); drop_Str(&_t3270); });
     #line 20226 "vuc.vu"
     VU_AT(20226);
     #line 20226 "vuc.vu"
-    ({ vu_str _t3273 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3273); drop_Str(&_t3273); });
+    ({ vu_str _t3273 = vu_str_lit("    if (fd < 0) {\n", 18); vu_str_cat(&v_s, &_t3273); drop_Str(&_t3273); });
     #line 20227 "vuc.vu"
     VU_AT(20227);
     #line 20227 "vuc.vu"
-    ({ vu_str _t3276 = vu_str_lit("    struct sockaddr_in a;\n", 26); vu_str_cat(&v_s, &_t3276); drop_Str(&_t3276); });
+    ({ vu_str _t3276 = vu_str_lit("        fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);\n", 77); vu_str_cat(&v_s, &_t3276); drop_Str(&_t3276); });
     #line 20228 "vuc.vu"
     VU_AT(20228);
     #line 20228 "vuc.vu"
-    ({ vu_str _t3279 = vu_str_lit("    socklen_t n = sizeof a;\n", 28); vu_str_cat(&v_s, &_t3279); drop_Str(&_t3279); });
+    ({ vu_str _t3279 = vu_str_lit("        if (fd < 0) { *err = vu_errf(\"can't listen on port %lld: %s\", (long long)port, strerror(errno)); return false; }\n", 121); vu_str_cat(&v_s, &_t3279); drop_Str(&_t3279); });
     #line 20229 "vuc.vu"
     VU_AT(20229);
     #line 20229 "vuc.vu"
-    ({ vu_str _t3282 = vu_str_lit("    if (getsockname(((vu_sock *)l)->fd, (struct sockaddr *)&a, &n) < 0) return 0;\n", 82); vu_str_cat(&v_s, &_t3282); drop_Str(&_t3282); });
+    ({ vu_str _t3282 = vu_str_lit("        vu_sock_flags(fd);\n", 27); vu_str_cat(&v_s, &_t3282); drop_Str(&_t3282); });
     #line 20230 "vuc.vu"
     VU_AT(20230);
     #line 20230 "vuc.vu"
-    ({ vu_str _t3285 = vu_str_lit("    return ntohs(a.sin_port);\n", 30); vu_str_cat(&v_s, &_t3285); drop_Str(&_t3285); });
+    ({ vu_str _t3285 = vu_str_lit("        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);\n", 68); vu_str_cat(&v_s, &_t3285); drop_Str(&_t3285); });
     #line 20231 "vuc.vu"
     VU_AT(20231);
     #line 20231 "vuc.vu"
-    ({ vu_str _t3288 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3288); drop_Str(&_t3288); });
+    ({ vu_str _t3288 = vu_str_lit("        struct sockaddr_in a;\n", 30); vu_str_cat(&v_s, &_t3288); drop_Str(&_t3288); });
     #line 20232 "vuc.vu"
     VU_AT(20232);
     #line 20232 "vuc.vu"
-    ({ vu_str _t3291 = vu_str_lit("static bool vu_net_accept(vu_cap net, void *lp, double timeout, bool has, void **out, vu_str *err, int line) {\n", 111); vu_str_cat(&v_s, &_t3291); drop_Str(&_t3291); });
+    ({ vu_str _t3291 = vu_str_lit("        memset(&a, 0, sizeof a);\n", 33); vu_str_cat(&v_s, &_t3291); drop_Str(&_t3291); });
     #line 20233 "vuc.vu"
     VU_AT(20233);
     #line 20233 "vuc.vu"
-    ({ vu_str _t3294 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3294); drop_Str(&_t3294); });
+    ({ vu_str _t3294 = vu_str_lit("        a.sin_family = AF_INET;\n", 32); vu_str_cat(&v_s, &_t3294); drop_Str(&_t3294); });
     #line 20234 "vuc.vu"
     VU_AT(20234);
     #line 20234 "vuc.vu"
-    ({ vu_str _t3297 = vu_str_lit("    vu_task_here(\"net.accept()\", line);\n", 40); vu_str_cat(&v_s, &_t3297); drop_Str(&_t3297); });
+    ({ vu_str _t3297 = vu_str_lit("        a.sin_addr.s_addr = htonl(INADDR_ANY);\n", 47); vu_str_cat(&v_s, &_t3297); drop_Str(&_t3297); });
     #line 20235 "vuc.vu"
     VU_AT(20235);
     #line 20235 "vuc.vu"
-    ({ vu_str _t3300 = vu_str_lit("    vu_sock *l = (vu_sock *)lp;\n", 32); vu_str_cat(&v_s, &_t3300); drop_Str(&_t3300); });
+    ({ vu_str _t3300 = vu_str_lit("        a.sin_port = htons((uint16_t)port);\n", 44); vu_str_cat(&v_s, &_t3300); drop_Str(&_t3300); });
     #line 20236 "vuc.vu"
     VU_AT(20236);
     #line 20236 "vuc.vu"
-    ({ vu_str _t3303 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t3303); drop_Str(&_t3303); });
+    ({ vu_str _t3303 = vu_str_lit("        if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) {\n", 61); vu_str_cat(&v_s, &_t3303); drop_Str(&_t3303); });
     #line 20237 "vuc.vu"
     VU_AT(20237);
     #line 20237 "vuc.vu"
-    ({ vu_str _t3306 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t3306); drop_Str(&_t3306); });
+    ({ vu_str _t3306 = vu_str_lit("            int e = errno;\n", 27); vu_str_cat(&v_s, &_t3306); drop_Str(&_t3306); });
     #line 20238 "vuc.vu"
     VU_AT(20238);
     #line 20238 "vuc.vu"
-    ({ vu_str _t3309 = vu_str_lit("        int c = accept4(l->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);\n", 74); vu_str_cat(&v_s, &_t3309); drop_Str(&_t3309); });
+    ({ vu_str _t3309 = vu_str_lit("            close(fd);\n", 23); vu_str_cat(&v_s, &_t3309); drop_Str(&_t3309); });
     #line 20239 "vuc.vu"
     VU_AT(20239);
     #line 20239 "vuc.vu"
-    ({ vu_str _t3312 = vu_str_lit("        if (c >= 0) {\n", 22); vu_str_cat(&v_s, &_t3312); drop_Str(&_t3312); });
+    ({ vu_str _t3312 = vu_str_lit("            *err = vu_errf(\"can't listen on port %lld: %s\", (long long)port, strerror(e));\n", 91); vu_str_cat(&v_s, &_t3312); drop_Str(&_t3312); });
     #line 20240 "vuc.vu"
     VU_AT(20240);
     #line 20240 "vuc.vu"
-    ({ vu_str _t3315 = vu_str_lit("            int one = 1;\n", 25); vu_str_cat(&v_s, &_t3315); drop_Str(&_t3315); });
+    ({ vu_str _t3315 = vu_str_lit("            return false;\n", 26); vu_str_cat(&v_s, &_t3315); drop_Str(&_t3315); });
     #line 20241 "vuc.vu"
     VU_AT(20241);
     #line 20241 "vuc.vu"
-    ({ vu_str _t3318 = vu_str_lit("            setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);\n", 71); vu_str_cat(&v_s, &_t3318); drop_Str(&_t3318); });
+    ({ vu_str _t3318 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3318); drop_Str(&_t3318); });
     #line 20242 "vuc.vu"
     VU_AT(20242);
     #line 20242 "vuc.vu"
-    ({ vu_str _t3321 = vu_str_lit("            vu_sock *s = vu_sock_new(c, err);\n", 46); vu_str_cat(&v_s, &_t3321); drop_Str(&_t3321); });
+    ({ vu_str _t3321 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3321); drop_Str(&_t3321); });
     #line 20243 "vuc.vu"
     VU_AT(20243);
     #line 20243 "vuc.vu"
-    ({ vu_str _t3324 = vu_str_lit("            if (!s) return false;\n", 34); vu_str_cat(&v_s, &_t3324); drop_Str(&_t3324); });
+    ({ vu_str _t3324 = vu_str_lit("    if (listen(fd, SOMAXCONN) < 0) {\n", 37); vu_str_cat(&v_s, &_t3324); drop_Str(&_t3324); });
     #line 20244 "vuc.vu"
     VU_AT(20244);
     #line 20244 "vuc.vu"
-    ({ vu_str _t3327 = vu_str_lit("            if (l->tls_ctx && !vu_tls_accepted(l, s, err)) { vu_sock_drop(s); return false; }\n", 94); vu_str_cat(&v_s, &_t3327); drop_Str(&_t3327); });
+    ({ vu_str _t3327 = vu_str_lit("        int e = errno;\n", 23); vu_str_cat(&v_s, &_t3327); drop_Str(&_t3327); });
     #line 20245 "vuc.vu"
     VU_AT(20245);
     #line 20245 "vuc.vu"
-    ({ vu_str _t3330 = vu_str_lit("            *out = s;\n", 22); vu_str_cat(&v_s, &_t3330); drop_Str(&_t3330); });
+    ({ vu_str _t3330 = vu_str_lit("        close(fd);\n", 19); vu_str_cat(&v_s, &_t3330); drop_Str(&_t3330); });
     #line 20246 "vuc.vu"
     VU_AT(20246);
     #line 20246 "vuc.vu"
-    ({ vu_str _t3333 = vu_str_lit("            return true;\n", 25); vu_str_cat(&v_s, &_t3333); drop_Str(&_t3333); });
+    ({ vu_str _t3333 = vu_str_lit("        *err = vu_errf(\"can't listen on port %lld: %s\", (long long)port, strerror(e));\n", 87); vu_str_cat(&v_s, &_t3333); drop_Str(&_t3333); });
     #line 20247 "vuc.vu"
     VU_AT(20247);
     #line 20247 "vuc.vu"
-    ({ vu_str _t3336 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3336); drop_Str(&_t3336); });
+    ({ vu_str _t3336 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3336); drop_Str(&_t3336); });
     #line 20248 "vuc.vu"
     VU_AT(20248);
     #line 20248 "vuc.vu"
-    ({ vu_str _t3339 = vu_str_lit("        if (errno == EINTR || errno == ECONNABORTED) continue;\n", 63); vu_str_cat(&v_s, &_t3339); drop_Str(&_t3339); });
+    ({ vu_str _t3339 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3339); drop_Str(&_t3339); });
     #line 20249 "vuc.vu"
     VU_AT(20249);
     #line 20249 "vuc.vu"
-    ({ vu_str _t3342 = vu_str_lit("        if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {\n", 89); vu_str_cat(&v_s, &_t3342); drop_Str(&_t3342); });
+    ({ vu_str _t3342 = vu_str_lit("    vu_sock *s = vu_sock_new(fd, err);\n", 39); vu_str_cat(&v_s, &_t3342); drop_Str(&_t3342); });
     #line 20250 "vuc.vu"
     VU_AT(20250);
     #line 20250 "vuc.vu"
-    ({ vu_str _t3345 = vu_str_lit("            /* out of file descriptors: try again shortly (closing connections frees some) */\n", 94); vu_str_cat(&v_s, &_t3345); drop_Str(&_t3345); });
+    ({ vu_str _t3345 = vu_str_lit("    if (!s) return false;\n", 26); vu_str_cat(&v_s, &_t3345); drop_Str(&_t3345); });
     #line 20251 "vuc.vu"
     VU_AT(20251);
     #line 20251 "vuc.vu"
-    ({ vu_str _t3348 = vu_str_lit("            vu_task *t = vu_cur_task;\n", 38); vu_str_cat(&v_s, &_t3348); drop_Str(&_t3348); });
+    ({ vu_str _t3348 = vu_str_lit("    *out = s;\n", 14); vu_str_cat(&v_s, &_t3348); drop_Str(&_t3348); });
     #line 20252 "vuc.vu"
     VU_AT(20252);
     #line 20252 "vuc.vu"
-    ({ vu_str _t3351 = vu_str_lit("            t->wait_kind = VU_W_SLEEP;\n", 39); vu_str_cat(&v_s, &_t3351); drop_Str(&_t3351); });
+    ({ vu_str _t3351 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t3351); drop_Str(&_t3351); });
     #line 20253 "vuc.vu"
     VU_AT(20253);
     #line 20253 "vuc.vu"
-    ({ vu_str _t3354 = vu_str_lit("            t->wait_line = line;\n", 33); vu_str_cat(&v_s, &_t3354); drop_Str(&_t3354); });
+    ({ vu_str _t3354 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3354); drop_Str(&_t3354); });
     #line 20254 "vuc.vu"
     VU_AT(20254);
     #line 20254 "vuc.vu"
-    ({ vu_str _t3357 = vu_str_lit("            int64_t soon = vu_now_ns() + 10000000;\n", 51); vu_str_cat(&v_s, &_t3357); drop_Str(&_t3357); });
+    ({ vu_str _t3357 = vu_str_lit("/* The port a listener is on (useful after listening on port 0, which picks a free one). */\n", 92); vu_str_cat(&v_s, &_t3357); drop_Str(&_t3357); });
     #line 20255 "vuc.vu"
     VU_AT(20255);
     #line 20255 "vuc.vu"
-    ({ vu_str _t3360 = vu_str_lit("            vu_wait_until(deadline >= 0 && deadline < soon ? deadline : soon);\n", 79); vu_str_cat(&v_s, &_t3360); drop_Str(&_t3360); });
+    ({ vu_str _t3360 = vu_str_lit("static int64_t vu_net_port(vu_cap net, void *l) {\n", 50); vu_str_cat(&v_s, &_t3360); drop_Str(&_t3360); });
     #line 20256 "vuc.vu"
     VU_AT(20256);
     #line 20256 "vuc.vu"
-    ({ vu_str _t3363 = vu_str_lit("            vu_block();\n", 24); vu_str_cat(&v_s, &_t3363); drop_Str(&_t3363); });
+    ({ vu_str _t3363 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3363); drop_Str(&_t3363); });
     #line 20257 "vuc.vu"
     VU_AT(20257);
     #line 20257 "vuc.vu"
-    ({ vu_str _t3366 = vu_str_lit("            if (deadline >= 0 && vu_now_ns() >= deadline) { *err = vu_errf(\"timed out\"); return false; }\n", 105); vu_str_cat(&v_s, &_t3366); drop_Str(&_t3366); });
+    ({ vu_str _t3366 = vu_str_lit("    struct sockaddr_storage a;\n", 31); vu_str_cat(&v_s, &_t3366); drop_Str(&_t3366); });
     #line 20258 "vuc.vu"
     VU_AT(20258);
     #line 20258 "vuc.vu"
-    ({ vu_str _t3369 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t3369); drop_Str(&_t3369); });
+    ({ vu_str _t3369 = vu_str_lit("    socklen_t n = sizeof a;\n", 28); vu_str_cat(&v_s, &_t3369); drop_Str(&_t3369); });
     #line 20259 "vuc.vu"
     VU_AT(20259);
     #line 20259 "vuc.vu"
-    ({ vu_str _t3372 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3372); drop_Str(&_t3372); });
+    ({ vu_str _t3372 = vu_str_lit("    if (getsockname(((vu_sock *)l)->fd, (struct sockaddr *)&a, &n) < 0) return 0;\n", 82); vu_str_cat(&v_s, &_t3372); drop_Str(&_t3372); });
     #line 20260 "vuc.vu"
     VU_AT(20260);
     #line 20260 "vuc.vu"
-    ({ vu_str _t3375 = vu_str_lit("        if (errno != EAGAIN && errno != EWOULDBLOCK) { *err = vu_errf(\"accept failed: %s\", strerror(errno)); return false; }\n", 125); vu_str_cat(&v_s, &_t3375); drop_Str(&_t3375); });
+    ({ vu_str _t3375 = vu_str_lit("    if (a.ss_family == AF_INET6) return ntohs(((struct sockaddr_in6 *)&a)->sin6_port);\n", 87); vu_str_cat(&v_s, &_t3375); drop_Str(&_t3375); });
     #line 20261 "vuc.vu"
     VU_AT(20261);
     #line 20261 "vuc.vu"
-    ({ vu_str _t3378 = vu_str_lit("        if (deadline >= 0 && vu_now_ns() >= deadline) { *err = vu_errf(\"timed out\"); return false; }\n", 101); vu_str_cat(&v_s, &_t3378); drop_Str(&_t3378); });
+    ({ vu_str _t3378 = vu_str_lit("    return ntohs(((struct sockaddr_in *)&a)->sin_port);\n", 56); vu_str_cat(&v_s, &_t3378); drop_Str(&_t3378); });
     #line 20262 "vuc.vu"
     VU_AT(20262);
     #line 20262 "vuc.vu"
-    ({ vu_str _t3381 = vu_str_lit("        if (!vu_wait_fd(l, false, deadline, line)) { *err = vu_errf(\"timed out\"); return false; }\n", 98); vu_str_cat(&v_s, &_t3381); drop_Str(&_t3381); });
+    ({ vu_str _t3381 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3381); drop_Str(&_t3381); });
     #line 20263 "vuc.vu"
     VU_AT(20263);
     #line 20263 "vuc.vu"
-    ({ vu_str _t3384 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3384); drop_Str(&_t3384); });
+    ({ vu_str _t3384 = vu_str_lit("static bool vu_net_accept(vu_cap net, void *lp, double timeout, bool has, void **out, vu_str *err, int line) {\n", 111); vu_str_cat(&v_s, &_t3384); drop_Str(&_t3384); });
     #line 20264 "vuc.vu"
     VU_AT(20264);
     #line 20264 "vuc.vu"
-    ({ vu_str _t3387 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3387); drop_Str(&_t3387); });
+    ({ vu_str _t3387 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3387); drop_Str(&_t3387); });
     #line 20265 "vuc.vu"
     VU_AT(20265);
     #line 20265 "vuc.vu"
-    ({ vu_str _t3390 = vu_str_lit("/* The bytes that have arrived (at least one, at most about 1 MB), or \"\" once the other side has\n", 97); vu_str_cat(&v_s, &_t3390); drop_Str(&_t3390); });
+    ({ vu_str _t3390 = vu_str_lit("    vu_task_here(\"net.accept()\", line);\n", 40); vu_str_cat(&v_s, &_t3390); drop_Str(&_t3390); });
     #line 20266 "vuc.vu"
     VU_AT(20266);
     #line 20266 "vuc.vu"
-    ({ vu_str _t3393 = vu_str_lit("   closed the connection. */\n", 29); vu_str_cat(&v_s, &_t3393); drop_Str(&_t3393); });
+    ({ vu_str _t3393 = vu_str_lit("    vu_sock *l = (vu_sock *)lp;\n", 32); vu_str_cat(&v_s, &_t3393); drop_Str(&_t3393); });
     #line 20267 "vuc.vu"
     VU_AT(20267);
     #line 20267 "vuc.vu"
-    ({ vu_str _t3396 = vu_str_lit("static bool vu_net_recv(vu_cap net, void *cp, double timeout, bool has, vu_str *out, vu_str *err, int line) {\n", 110); vu_str_cat(&v_s, &_t3396); drop_Str(&_t3396); });
+    ({ vu_str _t3396 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t3396); drop_Str(&_t3396); });
     #line 20268 "vuc.vu"
     VU_AT(20268);
     #line 20268 "vuc.vu"
-    ({ vu_str _t3399 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3399); drop_Str(&_t3399); });
+    ({ vu_str _t3399 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t3399); drop_Str(&_t3399); });
     #line 20269 "vuc.vu"
     VU_AT(20269);
     #line 20269 "vuc.vu"
-    ({ vu_str _t3402 = vu_str_lit("    vu_task_here(\"net.recv()\", line);\n", 38); vu_str_cat(&v_s, &_t3402); drop_Str(&_t3402); });
+    ({ vu_str _t3402 = vu_str_lit("        int c = accept4(l->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);\n", 74); vu_str_cat(&v_s, &_t3402); drop_Str(&_t3402); });
     #line 20270 "vuc.vu"
     VU_AT(20270);
     #line 20270 "vuc.vu"
-    ({ vu_str _t3405 = vu_str_lit("    vu_sock *c = (vu_sock *)cp;\n", 32); vu_str_cat(&v_s, &_t3405); drop_Str(&_t3405); });
+    ({ vu_str _t3405 = vu_str_lit("        if (c >= 0) {\n", 22); vu_str_cat(&v_s, &_t3405); drop_Str(&_t3405); });
     #line 20271 "vuc.vu"
     VU_AT(20271);
     #line 20271 "vuc.vu"
-    ({ vu_str _t3408 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t3408); drop_Str(&_t3408); });
+    ({ vu_str _t3408 = vu_str_lit("            int one = 1;\n", 25); vu_str_cat(&v_s, &_t3408); drop_Str(&_t3408); });
     #line 20272 "vuc.vu"
     VU_AT(20272);
     #line 20272 "vuc.vu"
-    ({ vu_str _t3411 = vu_str_lit("    if (c->ssl) return vu_tls_recv(c, deadline, out, err, line);\n", 65); vu_str_cat(&v_s, &_t3411); drop_Str(&_t3411); });
+    ({ vu_str _t3411 = vu_str_lit("            setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);\n", 71); vu_str_cat(&v_s, &_t3411); drop_Str(&_t3411); });
     #line 20273 "vuc.vu"
     VU_AT(20273);
     #line 20273 "vuc.vu"
-    ({ vu_str _t3414 = vu_str_lit("    vu_str s = {0};\n", 20); vu_str_cat(&v_s, &_t3414); drop_Str(&_t3414); });
+    ({ vu_str _t3414 = vu_str_lit("            vu_sock *s = vu_sock_new(c, err);\n", 46); vu_str_cat(&v_s, &_t3414); drop_Str(&_t3414); });
     #line 20274 "vuc.vu"
     VU_AT(20274);
     #line 20274 "vuc.vu"
-    ({ vu_str _t3417 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t3417); drop_Str(&_t3417); });
+    ({ vu_str _t3417 = vu_str_lit("            if (!s) return false;\n", 34); vu_str_cat(&v_s, &_t3417); drop_Str(&_t3417); });
     #line 20275 "vuc.vu"
     VU_AT(20275);
     #line 20275 "vuc.vu"
-    ({ vu_str _t3420 = vu_str_lit("        ssize_t n = read(c->fd, vu_iobuf, sizeof vu_iobuf);\n", 60); vu_str_cat(&v_s, &_t3420); drop_Str(&_t3420); });
+    ({ vu_str _t3420 = vu_str_lit("            if (l->tls_ctx && !vu_tls_accepted(l, s, err)) { vu_sock_drop(s); return false; }\n", 94); vu_str_cat(&v_s, &_t3420); drop_Str(&_t3420); });
     #line 20276 "vuc.vu"
     VU_AT(20276);
     #line 20276 "vuc.vu"
-    ({ vu_str _t3423 = vu_str_lit("        if (n > 0) {\n", 21); vu_str_cat(&v_s, &_t3423); drop_Str(&_t3423); });
+    ({ vu_str _t3423 = vu_str_lit("            *out = s;\n", 22); vu_str_cat(&v_s, &_t3423); drop_Str(&_t3423); });
     #line 20277 "vuc.vu"
     VU_AT(20277);
     #line 20277 "vuc.vu"
-    ({ vu_str _t3426 = vu_str_lit("            vu_str_cat_bytes(&s, vu_iobuf, (int64_t)n);\n", 56); vu_str_cat(&v_s, &_t3426); drop_Str(&_t3426); });
+    ({ vu_str _t3426 = vu_str_lit("            return true;\n", 25); vu_str_cat(&v_s, &_t3426); drop_Str(&_t3426); });
     #line 20278 "vuc.vu"
     VU_AT(20278);
     #line 20278 "vuc.vu"
-    ({ vu_str _t3429 = vu_str_lit("            if ((size_t)n < sizeof vu_iobuf || s.len >= (1 << 20)) break;\n", 74); vu_str_cat(&v_s, &_t3429); drop_Str(&_t3429); });
+    ({ vu_str _t3429 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3429); drop_Str(&_t3429); });
     #line 20279 "vuc.vu"
     VU_AT(20279);
     #line 20279 "vuc.vu"
-    ({ vu_str _t3432 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t3432); drop_Str(&_t3432); });
+    ({ vu_str _t3432 = vu_str_lit("        if (errno == EINTR || errno == ECONNABORTED) continue;\n", 63); vu_str_cat(&v_s, &_t3432); drop_Str(&_t3432); });
     #line 20280 "vuc.vu"
     VU_AT(20280);
     #line 20280 "vuc.vu"
-    ({ vu_str _t3435 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3435); drop_Str(&_t3435); });
+    ({ vu_str _t3435 = vu_str_lit("        if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {\n", 89); vu_str_cat(&v_s, &_t3435); drop_Str(&_t3435); });
     #line 20281 "vuc.vu"
     VU_AT(20281);
     #line 20281 "vuc.vu"
-    ({ vu_str _t3438 = vu_str_lit("        if (n == 0) break;\n", 27); vu_str_cat(&v_s, &_t3438); drop_Str(&_t3438); });
+    ({ vu_str _t3438 = vu_str_lit("            /* out of file descriptors: try again shortly (closing connections frees some) */\n", 94); vu_str_cat(&v_s, &_t3438); drop_Str(&_t3438); });
     #line 20282 "vuc.vu"
     VU_AT(20282);
     #line 20282 "vuc.vu"
-    ({ vu_str _t3441 = vu_str_lit("        if (errno == EINTR) continue;\n", 38); vu_str_cat(&v_s, &_t3441); drop_Str(&_t3441); });
+    ({ vu_str _t3441 = vu_str_lit("            vu_task *t = vu_cur_task;\n", 38); vu_str_cat(&v_s, &_t3441); drop_Str(&_t3441); });
     #line 20283 "vuc.vu"
     VU_AT(20283);
     #line 20283 "vuc.vu"
-    ({ vu_str _t3444 = vu_str_lit("        if (errno == EAGAIN || errno == EWOULDBLOCK) {\n", 55); vu_str_cat(&v_s, &_t3444); drop_Str(&_t3444); });
+    ({ vu_str _t3444 = vu_str_lit("            t->wait_kind = VU_W_SLEEP;\n", 39); vu_str_cat(&v_s, &_t3444); drop_Str(&_t3444); });
     #line 20284 "vuc.vu"
     VU_AT(20284);
     #line 20284 "vuc.vu"
-    ({ vu_str _t3447 = vu_str_lit("            if (s.len) break;\n", 30); vu_str_cat(&v_s, &_t3447); drop_Str(&_t3447); });
+    ({ vu_str _t3447 = vu_str_lit("            t->wait_line = line;\n", 33); vu_str_cat(&v_s, &_t3447); drop_Str(&_t3447); });
     #line 20285 "vuc.vu"
     VU_AT(20285);
     #line 20285 "vuc.vu"
-    ({ vu_str _t3450 = vu_str_lit("            if (deadline >= 0 && vu_now_ns() >= deadline) { *err = vu_errf(\"timed out\"); return false; }\n", 105); vu_str_cat(&v_s, &_t3450); drop_Str(&_t3450); });
+    ({ vu_str _t3450 = vu_str_lit("            int64_t soon = vu_now_ns() + 10000000;\n", 51); vu_str_cat(&v_s, &_t3450); drop_Str(&_t3450); });
     #line 20286 "vuc.vu"
     VU_AT(20286);
     #line 20286 "vuc.vu"
-    ({ vu_str _t3453 = vu_str_lit("            if (!vu_wait_fd(c, false, deadline, line)) { *err = vu_errf(\"timed out\"); return false; }\n", 102); vu_str_cat(&v_s, &_t3453); drop_Str(&_t3453); });
+    ({ vu_str _t3453 = vu_str_lit("            vu_wait_until(deadline >= 0 && deadline < soon ? deadline : soon);\n", 79); vu_str_cat(&v_s, &_t3453); drop_Str(&_t3453); });
     #line 20287 "vuc.vu"
     VU_AT(20287);
     #line 20287 "vuc.vu"
-    ({ vu_str _t3456 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t3456); drop_Str(&_t3456); });
+    ({ vu_str _t3456 = vu_str_lit("            vu_block();\n", 24); vu_str_cat(&v_s, &_t3456); drop_Str(&_t3456); });
     #line 20288 "vuc.vu"
     VU_AT(20288);
     #line 20288 "vuc.vu"
-    ({ vu_str _t3459 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3459); drop_Str(&_t3459); });
+    ({ vu_str _t3459 = vu_str_lit("            if (deadline >= 0 && vu_now_ns() >= deadline) { *err = vu_errf(\"timed out\"); return false; }\n", 105); vu_str_cat(&v_s, &_t3459); drop_Str(&_t3459); });
     #line 20289 "vuc.vu"
     VU_AT(20289);
     #line 20289 "vuc.vu"
-    ({ vu_str _t3462 = vu_str_lit("        if (s.len) break;   /* report the error on the next call */\n", 68); vu_str_cat(&v_s, &_t3462); drop_Str(&_t3462); });
+    ({ vu_str _t3462 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t3462); drop_Str(&_t3462); });
     #line 20290 "vuc.vu"
     VU_AT(20290);
     #line 20290 "vuc.vu"
-    ({ vu_str _t3465 = vu_str_lit("        if (errno == ECONNRESET) break;   /* the other side is gone: like a close */\n", 85); vu_str_cat(&v_s, &_t3465); drop_Str(&_t3465); });
+    ({ vu_str _t3465 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3465); drop_Str(&_t3465); });
     #line 20291 "vuc.vu"
     VU_AT(20291);
     #line 20291 "vuc.vu"
-    ({ vu_str _t3468 = vu_str_lit("        *err = vu_errf(\"recv failed: %s\", strerror(errno));\n", 60); vu_str_cat(&v_s, &_t3468); drop_Str(&_t3468); });
+    ({ vu_str _t3468 = vu_str_lit("        if (errno != EAGAIN && errno != EWOULDBLOCK) { *err = vu_errf(\"accept failed: %s\", strerror(errno)); return false; }\n", 125); vu_str_cat(&v_s, &_t3468); drop_Str(&_t3468); });
     #line 20292 "vuc.vu"
     VU_AT(20292);
     #line 20292 "vuc.vu"
-    ({ vu_str _t3471 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3471); drop_Str(&_t3471); });
+    ({ vu_str _t3471 = vu_str_lit("        if (deadline >= 0 && vu_now_ns() >= deadline) { *err = vu_errf(\"timed out\"); return false; }\n", 101); vu_str_cat(&v_s, &_t3471); drop_Str(&_t3471); });
     #line 20293 "vuc.vu"
     VU_AT(20293);
     #line 20293 "vuc.vu"
-    ({ vu_str _t3474 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3474); drop_Str(&_t3474); });
+    ({ vu_str _t3474 = vu_str_lit("        if (!vu_wait_fd(l, false, deadline, line)) { *err = vu_errf(\"timed out\"); return false; }\n", 98); vu_str_cat(&v_s, &_t3474); drop_Str(&_t3474); });
     #line 20294 "vuc.vu"
     VU_AT(20294);
     #line 20294 "vuc.vu"
-    ({ vu_str _t3477 = vu_str_lit("    *out = s;\n", 14); vu_str_cat(&v_s, &_t3477); drop_Str(&_t3477); });
+    ({ vu_str _t3477 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3477); drop_Str(&_t3477); });
     #line 20295 "vuc.vu"
     VU_AT(20295);
     #line 20295 "vuc.vu"
-    ({ vu_str _t3480 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t3480); drop_Str(&_t3480); });
+    ({ vu_str _t3480 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3480); drop_Str(&_t3480); });
     #line 20296 "vuc.vu"
     VU_AT(20296);
     #line 20296 "vuc.vu"
-    ({ vu_str _t3483 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3483); drop_Str(&_t3483); });
+    ({ vu_str _t3483 = vu_str_lit("/* The bytes that have arrived (at least one, at most about 1 MB), or \"\" once the other side has\n", 97); vu_str_cat(&v_s, &_t3483); drop_Str(&_t3483); });
     #line 20297 "vuc.vu"
     VU_AT(20297);
     #line 20297 "vuc.vu"
-    ({ vu_str _t3486 = vu_str_lit("/* Sends all of data; other tasks run while the connection is full. */\n", 71); vu_str_cat(&v_s, &_t3486); drop_Str(&_t3486); });
+    ({ vu_str _t3486 = vu_str_lit("   closed the connection. */\n", 29); vu_str_cat(&v_s, &_t3486); drop_Str(&_t3486); });
     #line 20298 "vuc.vu"
     VU_AT(20298);
     #line 20298 "vuc.vu"
-    ({ vu_str _t3489 = vu_str_lit("static bool vu_net_send(vu_cap net, void *cp, const uint8_t *data, int64_t len, double timeout, bool has,\n", 106); vu_str_cat(&v_s, &_t3489); drop_Str(&_t3489); });
+    ({ vu_str _t3489 = vu_str_lit("static bool vu_net_recv(vu_cap net, void *cp, double timeout, bool has, vu_str *out, vu_str *err, int line) {\n", 110); vu_str_cat(&v_s, &_t3489); drop_Str(&_t3489); });
     #line 20299 "vuc.vu"
     VU_AT(20299);
     #line 20299 "vuc.vu"
-    ({ vu_str _t3492 = vu_str_lit("                        vu_str *err, int line) {\n", 49); vu_str_cat(&v_s, &_t3492); drop_Str(&_t3492); });
+    ({ vu_str _t3492 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3492); drop_Str(&_t3492); });
     #line 20300 "vuc.vu"
     VU_AT(20300);
     #line 20300 "vuc.vu"
-    ({ vu_str _t3495 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3495); drop_Str(&_t3495); });
+    ({ vu_str _t3495 = vu_str_lit("    vu_task_here(\"net.recv()\", line);\n", 38); vu_str_cat(&v_s, &_t3495); drop_Str(&_t3495); });
     #line 20301 "vuc.vu"
     VU_AT(20301);
     #line 20301 "vuc.vu"
-    ({ vu_str _t3498 = vu_str_lit("    vu_task_here(\"net.send()\", line);\n", 38); vu_str_cat(&v_s, &_t3498); drop_Str(&_t3498); });
+    ({ vu_str _t3498 = vu_str_lit("    vu_sock *c = (vu_sock *)cp;\n", 32); vu_str_cat(&v_s, &_t3498); drop_Str(&_t3498); });
     #line 20302 "vuc.vu"
     VU_AT(20302);
     #line 20302 "vuc.vu"
-    ({ vu_str _t3501 = vu_str_lit("    vu_sock *c = (vu_sock *)cp;\n", 32); vu_str_cat(&v_s, &_t3501); drop_Str(&_t3501); });
+    ({ vu_str _t3501 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t3501); drop_Str(&_t3501); });
     #line 20303 "vuc.vu"
     VU_AT(20303);
     #line 20303 "vuc.vu"
-    ({ vu_str _t3504 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t3504); drop_Str(&_t3504); });
+    ({ vu_str _t3504 = vu_str_lit("    if (c->ssl) return vu_tls_recv(c, deadline, out, err, line);\n", 65); vu_str_cat(&v_s, &_t3504); drop_Str(&_t3504); });
     #line 20304 "vuc.vu"
     VU_AT(20304);
     #line 20304 "vuc.vu"
-    ({ vu_str _t3507 = vu_str_lit("    if (c->ssl) return vu_tls_send(c, data, len, deadline, err, line);\n", 71); vu_str_cat(&v_s, &_t3507); drop_Str(&_t3507); });
+    ({ vu_str _t3507 = vu_str_lit("    vu_str s = {0};\n", 20); vu_str_cat(&v_s, &_t3507); drop_Str(&_t3507); });
     #line 20305 "vuc.vu"
     VU_AT(20305);
     #line 20305 "vuc.vu"
-    ({ vu_str _t3510 = vu_str_lit("    while (len > 0) {\n", 22); vu_str_cat(&v_s, &_t3510); drop_Str(&_t3510); });
+    ({ vu_str _t3510 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t3510); drop_Str(&_t3510); });
     #line 20306 "vuc.vu"
     VU_AT(20306);
     #line 20306 "vuc.vu"
-    ({ vu_str _t3513 = vu_str_lit("        ssize_t n = send(c->fd, data, (size_t)len, MSG_NOSIGNAL);\n", 66); vu_str_cat(&v_s, &_t3513); drop_Str(&_t3513); });
+    ({ vu_str _t3513 = vu_str_lit("        ssize_t n = read(c->fd, vu_iobuf, sizeof vu_iobuf);\n", 60); vu_str_cat(&v_s, &_t3513); drop_Str(&_t3513); });
     #line 20307 "vuc.vu"
     VU_AT(20307);
     #line 20307 "vuc.vu"
-    ({ vu_str _t3516 = vu_str_lit("        if (n > 0) { data += n; len -= n; continue; }\n", 54); vu_str_cat(&v_s, &_t3516); drop_Str(&_t3516); });
+    ({ vu_str _t3516 = vu_str_lit("        if (n > 0) {\n", 21); vu_str_cat(&v_s, &_t3516); drop_Str(&_t3516); });
     #line 20308 "vuc.vu"
     VU_AT(20308);
     #line 20308 "vuc.vu"
-    ({ vu_str _t3519 = vu_str_lit("        if (n < 0 && errno == EINTR) continue;\n", 47); vu_str_cat(&v_s, &_t3519); drop_Str(&_t3519); });
+    ({ vu_str _t3519 = vu_str_lit("            vu_str_cat_bytes(&s, vu_iobuf, (int64_t)n);\n", 56); vu_str_cat(&v_s, &_t3519); drop_Str(&_t3519); });
     #line 20309 "vuc.vu"
     VU_AT(20309);
     #line 20309 "vuc.vu"
-    ({ vu_str _t3522 = vu_str_lit("        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {\n", 66); vu_str_cat(&v_s, &_t3522); drop_Str(&_t3522); });
+    ({ vu_str _t3522 = vu_str_lit("            if ((size_t)n < sizeof vu_iobuf || s.len >= (1 << 20)) break;\n", 74); vu_str_cat(&v_s, &_t3522); drop_Str(&_t3522); });
     #line 20310 "vuc.vu"
     VU_AT(20310);
     #line 20310 "vuc.vu"
-    ({ vu_str _t3525 = vu_str_lit("            if (deadline >= 0 && vu_now_ns() >= deadline) { *err = vu_errf(\"timed out\"); return false; }\n", 105); vu_str_cat(&v_s, &_t3525); drop_Str(&_t3525); });
+    ({ vu_str _t3525 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t3525); drop_Str(&_t3525); });
     #line 20311 "vuc.vu"
     VU_AT(20311);
     #line 20311 "vuc.vu"
-    ({ vu_str _t3528 = vu_str_lit("            if (!vu_wait_fd(c, true, deadline, line)) { *err = vu_errf(\"timed out\"); return false; }\n", 101); vu_str_cat(&v_s, &_t3528); drop_Str(&_t3528); });
+    ({ vu_str _t3528 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3528); drop_Str(&_t3528); });
     #line 20312 "vuc.vu"
     VU_AT(20312);
     #line 20312 "vuc.vu"
-    ({ vu_str _t3531 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t3531); drop_Str(&_t3531); });
+    ({ vu_str _t3531 = vu_str_lit("        if (n == 0) break;\n", 27); vu_str_cat(&v_s, &_t3531); drop_Str(&_t3531); });
     #line 20313 "vuc.vu"
     VU_AT(20313);
     #line 20313 "vuc.vu"
-    ({ vu_str _t3534 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3534); drop_Str(&_t3534); });
+    ({ vu_str _t3534 = vu_str_lit("        if (errno == EINTR) continue;\n", 38); vu_str_cat(&v_s, &_t3534); drop_Str(&_t3534); });
     #line 20314 "vuc.vu"
     VU_AT(20314);
     #line 20314 "vuc.vu"
-    ({ vu_str _t3537 = vu_str_lit("        *err = errno == EPIPE || errno == ECONNRESET ? vu_errf(\"the connection is closed\")\n", 91); vu_str_cat(&v_s, &_t3537); drop_Str(&_t3537); });
+    ({ vu_str _t3537 = vu_str_lit("        if (errno == EAGAIN || errno == EWOULDBLOCK) {\n", 55); vu_str_cat(&v_s, &_t3537); drop_Str(&_t3537); });
     #line 20315 "vuc.vu"
     VU_AT(20315);
     #line 20315 "vuc.vu"
-    ({ vu_str _t3540 = vu_str_lit("                                                     : vu_errf(\"send failed: %s\", strerror(errno));\n", 100); vu_str_cat(&v_s, &_t3540); drop_Str(&_t3540); });
+    ({ vu_str _t3540 = vu_str_lit("            if (s.len) break;\n", 30); vu_str_cat(&v_s, &_t3540); drop_Str(&_t3540); });
     #line 20316 "vuc.vu"
     VU_AT(20316);
     #line 20316 "vuc.vu"
-    ({ vu_str _t3543 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3543); drop_Str(&_t3543); });
+    ({ vu_str _t3543 = vu_str_lit("            if (deadline >= 0 && vu_now_ns() >= deadline) { *err = vu_errf(\"timed out\"); return false; }\n", 105); vu_str_cat(&v_s, &_t3543); drop_Str(&_t3543); });
     #line 20317 "vuc.vu"
     VU_AT(20317);
     #line 20317 "vuc.vu"
-    ({ vu_str _t3546 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3546); drop_Str(&_t3546); });
+    ({ vu_str _t3546 = vu_str_lit("            if (!vu_wait_fd(c, false, deadline, line)) { *err = vu_errf(\"timed out\"); return false; }\n", 102); vu_str_cat(&v_s, &_t3546); drop_Str(&_t3546); });
     #line 20318 "vuc.vu"
     VU_AT(20318);
     #line 20318 "vuc.vu"
-    ({ vu_str _t3549 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t3549); drop_Str(&_t3549); });
+    ({ vu_str _t3549 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t3549); drop_Str(&_t3549); });
     #line 20319 "vuc.vu"
     VU_AT(20319);
     #line 20319 "vuc.vu"
-    ({ vu_str _t3552 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3552); drop_Str(&_t3552); });
+    ({ vu_str _t3552 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3552); drop_Str(&_t3552); });
     #line 20320 "vuc.vu"
     VU_AT(20320);
     #line 20320 "vuc.vu"
-    ({ vu_str _t3555 = vu_str_lit("/* -- connecting out. Names are looked up on a helper thread, so other tasks keep running. */\n", 94); vu_str_cat(&v_s, &_t3555); drop_Str(&_t3555); });
+    ({ vu_str _t3555 = vu_str_lit("        if (s.len) break;   /* report the error on the next call */\n", 68); vu_str_cat(&v_s, &_t3555); drop_Str(&_t3555); });
     #line 20321 "vuc.vu"
     VU_AT(20321);
     #line 20321 "vuc.vu"
-    ({ vu_str _t3558 = vu_str_lit("typedef struct vu_dns {\n", 24); vu_str_cat(&v_s, &_t3558); drop_Str(&_t3558); });
+    ({ vu_str _t3558 = vu_str_lit("        if (errno == ECONNRESET) break;   /* the other side is gone: like a close */\n", 85); vu_str_cat(&v_s, &_t3558); drop_Str(&_t3558); });
     #line 20322 "vuc.vu"
     VU_AT(20322);
     #line 20322 "vuc.vu"
-    ({ vu_str _t3561 = vu_str_lit("    char *host;\n", 16); vu_str_cat(&v_s, &_t3561); drop_Str(&_t3561); });
+    ({ vu_str _t3561 = vu_str_lit("        *err = vu_errf(\"recv failed: %s\", strerror(errno));\n", 60); vu_str_cat(&v_s, &_t3561); drop_Str(&_t3561); });
     #line 20323 "vuc.vu"
     VU_AT(20323);
     #line 20323 "vuc.vu"
-    ({ vu_str _t3564 = vu_str_lit("    char port[8];\n", 18); vu_str_cat(&v_s, &_t3564); drop_Str(&_t3564); });
+    ({ vu_str _t3564 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3564); drop_Str(&_t3564); });
     #line 20324 "vuc.vu"
     VU_AT(20324);
     #line 20324 "vuc.vu"
-    ({ vu_str _t3567 = vu_str_lit("    struct addrinfo *res;\n", 26); vu_str_cat(&v_s, &_t3567); drop_Str(&_t3567); });
+    ({ vu_str _t3567 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3567); drop_Str(&_t3567); });
     #line 20325 "vuc.vu"
     VU_AT(20325);
     #line 20325 "vuc.vu"
-    ({ vu_str _t3570 = vu_str_lit("    int rc, efd;\n", 17); vu_str_cat(&v_s, &_t3570); drop_Str(&_t3570); });
+    ({ vu_str _t3570 = vu_str_lit("    *out = s;\n", 14); vu_str_cat(&v_s, &_t3570); drop_Str(&_t3570); });
     #line 20326 "vuc.vu"
     VU_AT(20326);
     #line 20326 "vuc.vu"
-    ({ vu_str _t3573 = vu_str_lit("    int done;    /* the lookup finished (rc and res are set) */\n", 64); vu_str_cat(&v_s, &_t3573); drop_Str(&_t3573); });
+    ({ vu_str _t3573 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t3573); drop_Str(&_t3573); });
     #line 20327 "vuc.vu"
     VU_AT(20327);
     #line 20327 "vuc.vu"
-    ({ vu_str _t3576 = vu_str_lit("    int refs;    /* the task and the thread: whichever lets go last frees it */\n", 80); vu_str_cat(&v_s, &_t3576); drop_Str(&_t3576); });
+    ({ vu_str _t3576 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3576); drop_Str(&_t3576); });
     #line 20328 "vuc.vu"
     VU_AT(20328);
     #line 20328 "vuc.vu"
-    ({ vu_str _t3579 = vu_str_lit("} vu_dns;\n", 10); vu_str_cat(&v_s, &_t3579); drop_Str(&_t3579); });
+    ({ vu_str _t3579 = vu_str_lit("/* Sends all of data; other tasks run while the connection is full. */\n", 71); vu_str_cat(&v_s, &_t3579); drop_Str(&_t3579); });
     #line 20329 "vuc.vu"
     VU_AT(20329);
     #line 20329 "vuc.vu"
-    ({ vu_str _t3582 = vu_str_lit("static void vu_dns_free(vu_dns *d) {\n", 37); vu_str_cat(&v_s, &_t3582); drop_Str(&_t3582); });
+    ({ vu_str _t3582 = vu_str_lit("static bool vu_net_send(vu_cap net, void *cp, const uint8_t *data, int64_t len, double timeout, bool has,\n", 106); vu_str_cat(&v_s, &_t3582); drop_Str(&_t3582); });
     #line 20330 "vuc.vu"
     VU_AT(20330);
     #line 20330 "vuc.vu"
-    ({ vu_str _t3585 = vu_str_lit("    if (d->res) freeaddrinfo(d->res);\n", 38); vu_str_cat(&v_s, &_t3585); drop_Str(&_t3585); });
+    ({ vu_str _t3585 = vu_str_lit("                        vu_str *err, int line) {\n", 49); vu_str_cat(&v_s, &_t3585); drop_Str(&_t3585); });
     #line 20331 "vuc.vu"
     VU_AT(20331);
     #line 20331 "vuc.vu"
-    ({ vu_str _t3588 = vu_str_lit("    vu_efd_close(d->efd);\n", 26); vu_str_cat(&v_s, &_t3588); drop_Str(&_t3588); });
+    ({ vu_str _t3588 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3588); drop_Str(&_t3588); });
     #line 20332 "vuc.vu"
     VU_AT(20332);
     #line 20332 "vuc.vu"
-    ({ vu_str _t3591 = vu_str_lit("    free(d->host);\n", 19); vu_str_cat(&v_s, &_t3591); drop_Str(&_t3591); });
+    ({ vu_str _t3591 = vu_str_lit("    vu_task_here(\"net.send()\", line);\n", 38); vu_str_cat(&v_s, &_t3591); drop_Str(&_t3591); });
     #line 20333 "vuc.vu"
     VU_AT(20333);
     #line 20333 "vuc.vu"
-    ({ vu_str _t3594 = vu_str_lit("    free(d);\n", 13); vu_str_cat(&v_s, &_t3594); drop_Str(&_t3594); });
+    ({ vu_str _t3594 = vu_str_lit("    vu_sock *c = (vu_sock *)cp;\n", 32); vu_str_cat(&v_s, &_t3594); drop_Str(&_t3594); });
     #line 20334 "vuc.vu"
     VU_AT(20334);
     #line 20334 "vuc.vu"
-    ({ vu_str _t3597 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3597); drop_Str(&_t3597); });
+    ({ vu_str _t3597 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t3597); drop_Str(&_t3597); });
     #line 20335 "vuc.vu"
     VU_AT(20335);
     #line 20335 "vuc.vu"
-    ({ vu_str _t3600 = vu_str_lit("static void *vu_dns_thread(void *p) {\n", 38); vu_str_cat(&v_s, &_t3600); drop_Str(&_t3600); });
+    ({ vu_str _t3600 = vu_str_lit("    if (c->ssl) return vu_tls_send(c, data, len, deadline, err, line);\n", 71); vu_str_cat(&v_s, &_t3600); drop_Str(&_t3600); });
     #line 20336 "vuc.vu"
     VU_AT(20336);
     #line 20336 "vuc.vu"
-    ({ vu_str _t3603 = vu_str_lit("    vu_dns *d = (vu_dns *)p;\n", 29); vu_str_cat(&v_s, &_t3603); drop_Str(&_t3603); });
+    ({ vu_str _t3603 = vu_str_lit("    while (len > 0) {\n", 22); vu_str_cat(&v_s, &_t3603); drop_Str(&_t3603); });
     #line 20337 "vuc.vu"
     VU_AT(20337);
     #line 20337 "vuc.vu"
-    ({ vu_str _t3606 = vu_str_lit("    struct addrinfo hints;\n", 27); vu_str_cat(&v_s, &_t3606); drop_Str(&_t3606); });
+    ({ vu_str _t3606 = vu_str_lit("        ssize_t n = send(c->fd, data, (size_t)len, MSG_NOSIGNAL);\n", 66); vu_str_cat(&v_s, &_t3606); drop_Str(&_t3606); });
     #line 20338 "vuc.vu"
     VU_AT(20338);
     #line 20338 "vuc.vu"
-    ({ vu_str _t3609 = vu_str_lit("    memset(&hints, 0, sizeof hints);\n", 37); vu_str_cat(&v_s, &_t3609); drop_Str(&_t3609); });
+    ({ vu_str _t3609 = vu_str_lit("        if (n > 0) { data += n; len -= n; continue; }\n", 54); vu_str_cat(&v_s, &_t3609); drop_Str(&_t3609); });
     #line 20339 "vuc.vu"
     VU_AT(20339);
     #line 20339 "vuc.vu"
-    ({ vu_str _t3612 = vu_str_lit("    hints.ai_family = AF_UNSPEC;\n", 33); vu_str_cat(&v_s, &_t3612); drop_Str(&_t3612); });
+    ({ vu_str _t3612 = vu_str_lit("        if (n < 0 && errno == EINTR) continue;\n", 47); vu_str_cat(&v_s, &_t3612); drop_Str(&_t3612); });
     #line 20340 "vuc.vu"
     VU_AT(20340);
     #line 20340 "vuc.vu"
-    ({ vu_str _t3615 = vu_str_lit("    hints.ai_socktype = SOCK_STREAM;\n", 37); vu_str_cat(&v_s, &_t3615); drop_Str(&_t3615); });
+    ({ vu_str _t3615 = vu_str_lit("        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {\n", 66); vu_str_cat(&v_s, &_t3615); drop_Str(&_t3615); });
     #line 20341 "vuc.vu"
     VU_AT(20341);
     #line 20341 "vuc.vu"
-    ({ vu_str _t3618 = vu_str_lit("    d->rc = getaddrinfo(d->host, d->port, &hints, &d->res);\n", 60); vu_str_cat(&v_s, &_t3618); drop_Str(&_t3618); });
+    ({ vu_str _t3618 = vu_str_lit("            if (deadline >= 0 && vu_now_ns() >= deadline) { *err = vu_errf(\"timed out\"); return false; }\n", 105); vu_str_cat(&v_s, &_t3618); drop_Str(&_t3618); });
     #line 20342 "vuc.vu"
     VU_AT(20342);
     #line 20342 "vuc.vu"
-    ({ vu_str _t3621 = vu_str_lit("    __atomic_store_n(&d->done, 1, __ATOMIC_RELEASE);\n", 53); vu_str_cat(&v_s, &_t3621); drop_Str(&_t3621); });
+    ({ vu_str _t3621 = vu_str_lit("            if (!vu_wait_fd(c, true, deadline, line)) { *err = vu_errf(\"timed out\"); return false; }\n", 101); vu_str_cat(&v_s, &_t3621); drop_Str(&_t3621); });
     #line 20343 "vuc.vu"
     VU_AT(20343);
     #line 20343 "vuc.vu"
-    ({ vu_str _t3624 = vu_str_lit("    uint64_t one = 1;\n", 22); vu_str_cat(&v_s, &_t3624); drop_Str(&_t3624); });
+    ({ vu_str _t3624 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t3624); drop_Str(&_t3624); });
     #line 20344 "vuc.vu"
     VU_AT(20344);
     #line 20344 "vuc.vu"
-    ({ vu_str _t3627 = vu_str_lit("    (void)one;\n", 15); vu_str_cat(&v_s, &_t3627); drop_Str(&_t3627); });
+    ({ vu_str _t3627 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3627); drop_Str(&_t3627); });
     #line 20345 "vuc.vu"
     VU_AT(20345);
     #line 20345 "vuc.vu"
-    ({ vu_str _t3630 = vu_str_lit("    vu_efd_signal(d->efd);\n", 27); vu_str_cat(&v_s, &_t3630); drop_Str(&_t3630); });
+    ({ vu_str _t3630 = vu_str_lit("        *err = errno == EPIPE || errno == ECONNRESET ? vu_errf(\"the connection is closed\")\n", 91); vu_str_cat(&v_s, &_t3630); drop_Str(&_t3630); });
     #line 20346 "vuc.vu"
     VU_AT(20346);
     #line 20346 "vuc.vu"
-    ({ vu_str _t3633 = vu_str_lit("    if (__atomic_sub_fetch(&d->refs, 1, __ATOMIC_ACQ_REL) == 0) vu_dns_free(d);   /* the task gave up */\n", 105); vu_str_cat(&v_s, &_t3633); drop_Str(&_t3633); });
+    ({ vu_str _t3633 = vu_str_lit("                                                     : vu_errf(\"send failed: %s\", strerror(errno));\n", 100); vu_str_cat(&v_s, &_t3633); drop_Str(&_t3633); });
     #line 20347 "vuc.vu"
     VU_AT(20347);
     #line 20347 "vuc.vu"
-    ({ vu_str _t3636 = vu_str_lit("    return NULL;\n", 17); vu_str_cat(&v_s, &_t3636); drop_Str(&_t3636); });
+    ({ vu_str _t3636 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3636); drop_Str(&_t3636); });
     #line 20348 "vuc.vu"
     VU_AT(20348);
     #line 20348 "vuc.vu"
-    ({ vu_str _t3639 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3639); drop_Str(&_t3639); });
+    ({ vu_str _t3639 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3639); drop_Str(&_t3639); });
     #line 20349 "vuc.vu"
     VU_AT(20349);
     #line 20349 "vuc.vu"
-    ({ vu_str _t3642 = vu_str_lit("static bool vu_resolve(const char *host, int64_t port, int64_t deadline, struct addrinfo **res, vu_str *err, int line) {\n", 121); vu_str_cat(&v_s, &_t3642); drop_Str(&_t3642); });
+    ({ vu_str _t3642 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t3642); drop_Str(&_t3642); });
     #line 20350 "vuc.vu"
     VU_AT(20350);
     #line 20350 "vuc.vu"
-    ({ vu_str _t3645 = vu_str_lit("    struct addrinfo hints;\n", 27); vu_str_cat(&v_s, &_t3645); drop_Str(&_t3645); });
+    ({ vu_str _t3645 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3645); drop_Str(&_t3645); });
     #line 20351 "vuc.vu"
     VU_AT(20351);
     #line 20351 "vuc.vu"
-    ({ vu_str _t3648 = vu_str_lit("    memset(&hints, 0, sizeof hints);\n", 37); vu_str_cat(&v_s, &_t3648); drop_Str(&_t3648); });
+    ({ vu_str _t3648 = vu_str_lit("/* -- connecting out. Names are looked up on a helper thread, so other tasks keep running. */\n", 94); vu_str_cat(&v_s, &_t3648); drop_Str(&_t3648); });
     #line 20352 "vuc.vu"
     VU_AT(20352);
     #line 20352 "vuc.vu"
-    ({ vu_str _t3651 = vu_str_lit("    hints.ai_family = AF_UNSPEC;\n", 33); vu_str_cat(&v_s, &_t3651); drop_Str(&_t3651); });
+    ({ vu_str _t3651 = vu_str_lit("typedef struct vu_dns {\n", 24); vu_str_cat(&v_s, &_t3651); drop_Str(&_t3651); });
     #line 20353 "vuc.vu"
     VU_AT(20353);
     #line 20353 "vuc.vu"
-    ({ vu_str _t3654 = vu_str_lit("    hints.ai_socktype = SOCK_STREAM;\n", 37); vu_str_cat(&v_s, &_t3654); drop_Str(&_t3654); });
+    ({ vu_str _t3654 = vu_str_lit("    char *host;\n", 16); vu_str_cat(&v_s, &_t3654); drop_Str(&_t3654); });
     #line 20354 "vuc.vu"
     VU_AT(20354);
     #line 20354 "vuc.vu"
-    ({ vu_str _t3657 = vu_str_lit("    hints.ai_flags = AI_NUMERICHOST;\n", 37); vu_str_cat(&v_s, &_t3657); drop_Str(&_t3657); });
+    ({ vu_str _t3657 = vu_str_lit("    char port[8];\n", 18); vu_str_cat(&v_s, &_t3657); drop_Str(&_t3657); });
     #line 20355 "vuc.vu"
     VU_AT(20355);
     #line 20355 "vuc.vu"
-    ({ vu_str _t3660 = vu_str_lit("    char ps[8];\n", 16); vu_str_cat(&v_s, &_t3660); drop_Str(&_t3660); });
+    ({ vu_str _t3660 = vu_str_lit("    struct addrinfo *res;\n", 26); vu_str_cat(&v_s, &_t3660); drop_Str(&_t3660); });
     #line 20356 "vuc.vu"
     VU_AT(20356);
     #line 20356 "vuc.vu"
-    ({ vu_str _t3663 = vu_str_lit("    snprintf(ps, sizeof ps, \"%lld\", (long long)port);\n", 54); vu_str_cat(&v_s, &_t3663); drop_Str(&_t3663); });
+    ({ vu_str _t3663 = vu_str_lit("    int rc, efd;\n", 17); vu_str_cat(&v_s, &_t3663); drop_Str(&_t3663); });
     #line 20357 "vuc.vu"
     VU_AT(20357);
     #line 20357 "vuc.vu"
-    ({ vu_str _t3666 = vu_str_lit("    if (getaddrinfo(host, ps, &hints, res) == 0) return true;   /* an address, no lookup needed */\n", 99); vu_str_cat(&v_s, &_t3666); drop_Str(&_t3666); });
+    ({ vu_str _t3666 = vu_str_lit("    int done;    /* the lookup finished (rc and res are set) */\n", 64); vu_str_cat(&v_s, &_t3666); drop_Str(&_t3666); });
     #line 20358 "vuc.vu"
     VU_AT(20358);
     #line 20358 "vuc.vu"
-    ({ vu_str _t3669 = vu_str_lit("    vu_dns *d = (vu_dns *)calloc(1, sizeof *d);\n", 48); vu_str_cat(&v_s, &_t3669); drop_Str(&_t3669); });
+    ({ vu_str _t3669 = vu_str_lit("    int refs;    /* the task and the thread: whichever lets go last frees it */\n", 80); vu_str_cat(&v_s, &_t3669); drop_Str(&_t3669); });
     #line 20359 "vuc.vu"
     VU_AT(20359);
     #line 20359 "vuc.vu"
-    ({ vu_str _t3672 = vu_str_lit("    if (!d) vu_oom();\n", 22); vu_str_cat(&v_s, &_t3672); drop_Str(&_t3672); });
+    ({ vu_str _t3672 = vu_str_lit("} vu_dns;\n", 10); vu_str_cat(&v_s, &_t3672); drop_Str(&_t3672); });
     #line 20360 "vuc.vu"
     VU_AT(20360);
     #line 20360 "vuc.vu"
-    ({ vu_str _t3675 = vu_str_lit("    d->host = strdup(host);\n", 28); vu_str_cat(&v_s, &_t3675); drop_Str(&_t3675); });
+    ({ vu_str _t3675 = vu_str_lit("static void vu_dns_free(vu_dns *d) {\n", 37); vu_str_cat(&v_s, &_t3675); drop_Str(&_t3675); });
     #line 20361 "vuc.vu"
     VU_AT(20361);
     #line 20361 "vuc.vu"
-    ({ vu_str _t3678 = vu_str_lit("    memcpy(d->port, ps, sizeof ps);\n", 36); vu_str_cat(&v_s, &_t3678); drop_Str(&_t3678); });
+    ({ vu_str _t3678 = vu_str_lit("    if (d->res) freeaddrinfo(d->res);\n", 38); vu_str_cat(&v_s, &_t3678); drop_Str(&_t3678); });
     #line 20362 "vuc.vu"
     VU_AT(20362);
     #line 20362 "vuc.vu"
-    ({ vu_str _t3681 = vu_str_lit("    d->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);\n", 53); vu_str_cat(&v_s, &_t3681); drop_Str(&_t3681); });
+    ({ vu_str _t3681 = vu_str_lit("    vu_efd_close(d->efd);\n", 26); vu_str_cat(&v_s, &_t3681); drop_Str(&_t3681); });
     #line 20363 "vuc.vu"
     VU_AT(20363);
     #line 20363 "vuc.vu"
-    ({ vu_str _t3684 = vu_str_lit("    d->refs = 2;\n", 17); vu_str_cat(&v_s, &_t3684); drop_Str(&_t3684); });
+    ({ vu_str _t3684 = vu_str_lit("    free(d->host);\n", 19); vu_str_cat(&v_s, &_t3684); drop_Str(&_t3684); });
     #line 20364 "vuc.vu"
     VU_AT(20364);
     #line 20364 "vuc.vu"
-    ({ vu_str _t3687 = vu_str_lit("    if (d->efd < 0 || !d->host) { *err = vu_errf(\"can't look up '%.200s': %s\", host, strerror(errno)); free(d->host); free(d); return false; }\n", 143); vu_str_cat(&v_s, &_t3687); drop_Str(&_t3687); });
+    ({ vu_str _t3687 = vu_str_lit("    free(d);\n", 13); vu_str_cat(&v_s, &_t3687); drop_Str(&_t3687); });
     #line 20365 "vuc.vu"
     VU_AT(20365);
     #line 20365 "vuc.vu"
-    ({ vu_str _t3690 = vu_str_lit("    vu_str e2 = {0};\n", 21); vu_str_cat(&v_s, &_t3690); drop_Str(&_t3690); });
+    ({ vu_str _t3690 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3690); drop_Str(&_t3690); });
     #line 20366 "vuc.vu"
     VU_AT(20366);
     #line 20366 "vuc.vu"
-    ({ vu_str _t3693 = vu_str_lit("    vu_sock *w = vu_sock_new(dup(d->efd), &e2);\n", 48); vu_str_cat(&v_s, &_t3693); drop_Str(&_t3693); });
+    ({ vu_str _t3693 = vu_str_lit("static void *vu_dns_thread(void *p) {\n", 38); vu_str_cat(&v_s, &_t3693); drop_Str(&_t3693); });
     #line 20367 "vuc.vu"
     VU_AT(20367);
     #line 20367 "vuc.vu"
-    ({ vu_str _t3696 = vu_str_lit("    if (!w) { *err = e2; vu_dns_free(d); return false; }\n", 57); vu_str_cat(&v_s, &_t3696); drop_Str(&_t3696); });
+    ({ vu_str _t3696 = vu_str_lit("    vu_dns *d = (vu_dns *)p;\n", 29); vu_str_cat(&v_s, &_t3696); drop_Str(&_t3696); });
     #line 20368 "vuc.vu"
     VU_AT(20368);
     #line 20368 "vuc.vu"
-    ({ vu_str _t3699 = vu_str_lit("    pthread_t th;\n", 18); vu_str_cat(&v_s, &_t3699); drop_Str(&_t3699); });
+    ({ vu_str _t3699 = vu_str_lit("    struct addrinfo hints;\n", 27); vu_str_cat(&v_s, &_t3699); drop_Str(&_t3699); });
     #line 20369 "vuc.vu"
     VU_AT(20369);
     #line 20369 "vuc.vu"
-    ({ vu_str _t3702 = vu_str_lit("    pthread_attr_t at;\n", 23); vu_str_cat(&v_s, &_t3702); drop_Str(&_t3702); });
+    ({ vu_str _t3702 = vu_str_lit("    memset(&hints, 0, sizeof hints);\n", 37); vu_str_cat(&v_s, &_t3702); drop_Str(&_t3702); });
     #line 20370 "vuc.vu"
     VU_AT(20370);
     #line 20370 "vuc.vu"
-    ({ vu_str _t3705 = vu_str_lit("    pthread_attr_init(&at);\n", 28); vu_str_cat(&v_s, &_t3705); drop_Str(&_t3705); });
+    ({ vu_str _t3705 = vu_str_lit("    hints.ai_family = AF_UNSPEC;\n", 33); vu_str_cat(&v_s, &_t3705); drop_Str(&_t3705); });
     #line 20371 "vuc.vu"
     VU_AT(20371);
     #line 20371 "vuc.vu"
-    ({ vu_str _t3708 = vu_str_lit("    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);\n", 63); vu_str_cat(&v_s, &_t3708); drop_Str(&_t3708); });
+    ({ vu_str _t3708 = vu_str_lit("    hints.ai_socktype = SOCK_STREAM;\n", 37); vu_str_cat(&v_s, &_t3708); drop_Str(&_t3708); });
     #line 20372 "vuc.vu"
     VU_AT(20372);
     #line 20372 "vuc.vu"
-    ({ vu_str _t3711 = vu_str_lit("    if (pthread_create(&th, &at, vu_dns_thread, d) != 0) {\n", 59); vu_str_cat(&v_s, &_t3711); drop_Str(&_t3711); });
+    ({ vu_str _t3711 = vu_str_lit("    d->rc = getaddrinfo(d->host, d->port, &hints, &d->res);\n", 60); vu_str_cat(&v_s, &_t3711); drop_Str(&_t3711); });
     #line 20373 "vuc.vu"
     VU_AT(20373);
     #line 20373 "vuc.vu"
-    ({ vu_str _t3714 = vu_str_lit("        pthread_attr_destroy(&at);\n", 35); vu_str_cat(&v_s, &_t3714); drop_Str(&_t3714); });
+    ({ vu_str _t3714 = vu_str_lit("    __atomic_store_n(&d->done, 1, __ATOMIC_RELEASE);\n", 53); vu_str_cat(&v_s, &_t3714); drop_Str(&_t3714); });
     #line 20374 "vuc.vu"
     VU_AT(20374);
     #line 20374 "vuc.vu"
-    ({ vu_str _t3717 = vu_str_lit("        vu_sock_drop(w);\n", 25); vu_str_cat(&v_s, &_t3717); drop_Str(&_t3717); });
+    ({ vu_str _t3717 = vu_str_lit("    uint64_t one = 1;\n", 22); vu_str_cat(&v_s, &_t3717); drop_Str(&_t3717); });
     #line 20375 "vuc.vu"
     VU_AT(20375);
     #line 20375 "vuc.vu"
-    ({ vu_str _t3720 = vu_str_lit("        vu_dns_free(d);\n", 24); vu_str_cat(&v_s, &_t3720); drop_Str(&_t3720); });
+    ({ vu_str _t3720 = vu_str_lit("    (void)one;\n", 15); vu_str_cat(&v_s, &_t3720); drop_Str(&_t3720); });
     #line 20376 "vuc.vu"
     VU_AT(20376);
     #line 20376 "vuc.vu"
-    ({ vu_str _t3723 = vu_str_lit("        *err = vu_errf(\"can't look up '%.200s': no thread available\", host);\n", 77); vu_str_cat(&v_s, &_t3723); drop_Str(&_t3723); });
+    ({ vu_str _t3723 = vu_str_lit("    vu_efd_signal(d->efd);\n", 27); vu_str_cat(&v_s, &_t3723); drop_Str(&_t3723); });
     #line 20377 "vuc.vu"
     VU_AT(20377);
     #line 20377 "vuc.vu"
-    ({ vu_str _t3726 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3726); drop_Str(&_t3726); });
+    ({ vu_str _t3726 = vu_str_lit("    if (__atomic_sub_fetch(&d->refs, 1, __ATOMIC_ACQ_REL) == 0) vu_dns_free(d);   /* the task gave up */\n", 105); vu_str_cat(&v_s, &_t3726); drop_Str(&_t3726); });
     #line 20378 "vuc.vu"
     VU_AT(20378);
     #line 20378 "vuc.vu"
-    ({ vu_str _t3729 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3729); drop_Str(&_t3729); });
+    ({ vu_str _t3729 = vu_str_lit("    return NULL;\n", 17); vu_str_cat(&v_s, &_t3729); drop_Str(&_t3729); });
     #line 20379 "vuc.vu"
     VU_AT(20379);
     #line 20379 "vuc.vu"
-    ({ vu_str _t3732 = vu_str_lit("    pthread_attr_destroy(&at);\n", 31); vu_str_cat(&v_s, &_t3732); drop_Str(&_t3732); });
+    ({ vu_str _t3732 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3732); drop_Str(&_t3732); });
     #line 20380 "vuc.vu"
     VU_AT(20380);
     #line 20380 "vuc.vu"
-    ({ vu_str _t3735 = vu_str_lit("    while (!__atomic_load_n(&d->done, __ATOMIC_ACQUIRE)) {\n", 59); vu_str_cat(&v_s, &_t3735); drop_Str(&_t3735); });
+    ({ vu_str _t3735 = vu_str_lit("static bool vu_resolve(const char *host, int64_t port, int64_t deadline, struct addrinfo **res, vu_str *err, int line) {\n", 121); vu_str_cat(&v_s, &_t3735); drop_Str(&_t3735); });
     #line 20381 "vuc.vu"
     VU_AT(20381);
     #line 20381 "vuc.vu"
-    ({ vu_str _t3738 = vu_str_lit("        if ((deadline >= 0 && vu_now_ns() >= deadline) || !vu_wait_fd(w, false, deadline, line)) {\n", 99); vu_str_cat(&v_s, &_t3738); drop_Str(&_t3738); });
+    ({ vu_str _t3738 = vu_str_lit("    struct addrinfo hints;\n", 27); vu_str_cat(&v_s, &_t3738); drop_Str(&_t3738); });
     #line 20382 "vuc.vu"
     VU_AT(20382);
     #line 20382 "vuc.vu"
-    ({ vu_str _t3741 = vu_str_lit("            if (__atomic_sub_fetch(&d->refs, 1, __ATOMIC_ACQ_REL) == 0) vu_dns_free(d);   /* finished just now */\n", 114); vu_str_cat(&v_s, &_t3741); drop_Str(&_t3741); });
+    ({ vu_str _t3741 = vu_str_lit("    memset(&hints, 0, sizeof hints);\n", 37); vu_str_cat(&v_s, &_t3741); drop_Str(&_t3741); });
     #line 20383 "vuc.vu"
     VU_AT(20383);
     #line 20383 "vuc.vu"
-    ({ vu_str _t3744 = vu_str_lit("            vu_sock_drop(w);\n", 29); vu_str_cat(&v_s, &_t3744); drop_Str(&_t3744); });
+    ({ vu_str _t3744 = vu_str_lit("    hints.ai_family = AF_UNSPEC;\n", 33); vu_str_cat(&v_s, &_t3744); drop_Str(&_t3744); });
     #line 20384 "vuc.vu"
     VU_AT(20384);
     #line 20384 "vuc.vu"
-    ({ vu_str _t3747 = vu_str_lit("            *err = vu_errf(\"timed out looking up '%.200s'\", host);\n", 67); vu_str_cat(&v_s, &_t3747); drop_Str(&_t3747); });
+    ({ vu_str _t3747 = vu_str_lit("    hints.ai_socktype = SOCK_STREAM;\n", 37); vu_str_cat(&v_s, &_t3747); drop_Str(&_t3747); });
     #line 20385 "vuc.vu"
     VU_AT(20385);
     #line 20385 "vuc.vu"
-    ({ vu_str _t3750 = vu_str_lit("            return false;\n", 26); vu_str_cat(&v_s, &_t3750); drop_Str(&_t3750); });
+    ({ vu_str _t3750 = vu_str_lit("    hints.ai_flags = AI_NUMERICHOST;\n", 37); vu_str_cat(&v_s, &_t3750); drop_Str(&_t3750); });
     #line 20386 "vuc.vu"
     VU_AT(20386);
     #line 20386 "vuc.vu"
-    ({ vu_str _t3753 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3753); drop_Str(&_t3753); });
+    ({ vu_str _t3753 = vu_str_lit("    char ps[8];\n", 16); vu_str_cat(&v_s, &_t3753); drop_Str(&_t3753); });
     #line 20387 "vuc.vu"
     VU_AT(20387);
     #line 20387 "vuc.vu"
-    ({ vu_str _t3756 = vu_str_lit("        /* read the count, so that a wake before the lookup finished leaves the next write a new edge */\n", 105); vu_str_cat(&v_s, &_t3756); drop_Str(&_t3756); });
+    ({ vu_str _t3756 = vu_str_lit("    snprintf(ps, sizeof ps, \"%lld\", (long long)port);\n", 54); vu_str_cat(&v_s, &_t3756); drop_Str(&_t3756); });
     #line 20388 "vuc.vu"
     VU_AT(20388);
     #line 20388 "vuc.vu"
-    ({ vu_str _t3759 = vu_str_lit("        uint64_t x;\n", 20); vu_str_cat(&v_s, &_t3759); drop_Str(&_t3759); });
+    ({ vu_str _t3759 = vu_str_lit("    if (getaddrinfo(host, ps, &hints, res) == 0) return true;   /* an address, no lookup needed */\n", 99); vu_str_cat(&v_s, &_t3759); drop_Str(&_t3759); });
     #line 20389 "vuc.vu"
     VU_AT(20389);
     #line 20389 "vuc.vu"
-    ({ vu_str _t3762 = vu_str_lit("        if (read(w->fd, &x, 8) < 0) { /* not written yet */ }\n", 62); vu_str_cat(&v_s, &_t3762); drop_Str(&_t3762); });
+    ({ vu_str _t3762 = vu_str_lit("    vu_dns *d = (vu_dns *)calloc(1, sizeof *d);\n", 48); vu_str_cat(&v_s, &_t3762); drop_Str(&_t3762); });
     #line 20390 "vuc.vu"
     VU_AT(20390);
     #line 20390 "vuc.vu"
-    ({ vu_str _t3765 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3765); drop_Str(&_t3765); });
+    ({ vu_str _t3765 = vu_str_lit("    if (!d) vu_oom();\n", 22); vu_str_cat(&v_s, &_t3765); drop_Str(&_t3765); });
     #line 20391 "vuc.vu"
     VU_AT(20391);
     #line 20391 "vuc.vu"
-    ({ vu_str _t3768 = vu_str_lit("    vu_sock_drop(w);\n", 21); vu_str_cat(&v_s, &_t3768); drop_Str(&_t3768); });
+    ({ vu_str _t3768 = vu_str_lit("    d->host = strdup(host);\n", 28); vu_str_cat(&v_s, &_t3768); drop_Str(&_t3768); });
     #line 20392 "vuc.vu"
     VU_AT(20392);
     #line 20392 "vuc.vu"
-    ({ vu_str _t3771 = vu_str_lit("    int rc = d->rc;\n", 20); vu_str_cat(&v_s, &_t3771); drop_Str(&_t3771); });
+    ({ vu_str _t3771 = vu_str_lit("    memcpy(d->port, ps, sizeof ps);\n", 36); vu_str_cat(&v_s, &_t3771); drop_Str(&_t3771); });
     #line 20393 "vuc.vu"
     VU_AT(20393);
     #line 20393 "vuc.vu"
-    ({ vu_str _t3774 = vu_str_lit("    struct addrinfo *got = d->res;\n", 35); vu_str_cat(&v_s, &_t3774); drop_Str(&_t3774); });
+    ({ vu_str _t3774 = vu_str_lit("    d->efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);\n", 53); vu_str_cat(&v_s, &_t3774); drop_Str(&_t3774); });
     #line 20394 "vuc.vu"
     VU_AT(20394);
     #line 20394 "vuc.vu"
-    ({ vu_str _t3777 = vu_str_lit("    d->res = NULL;\n", 19); vu_str_cat(&v_s, &_t3777); drop_Str(&_t3777); });
+    ({ vu_str _t3777 = vu_str_lit("    d->refs = 2;\n", 17); vu_str_cat(&v_s, &_t3777); drop_Str(&_t3777); });
     #line 20395 "vuc.vu"
     VU_AT(20395);
     #line 20395 "vuc.vu"
-    ({ vu_str _t3780 = vu_str_lit("    /* the thread may still be finishing its write: whichever of the two lets go last frees d */\n", 97); vu_str_cat(&v_s, &_t3780); drop_Str(&_t3780); });
+    ({ vu_str _t3780 = vu_str_lit("    if (d->efd < 0 || !d->host) { *err = vu_errf(\"can't look up '%.200s': %s\", host, strerror(errno)); free(d->host); free(d); return false; }\n", 143); vu_str_cat(&v_s, &_t3780); drop_Str(&_t3780); });
     #line 20396 "vuc.vu"
     VU_AT(20396);
     #line 20396 "vuc.vu"
-    ({ vu_str _t3783 = vu_str_lit("    if (__atomic_sub_fetch(&d->refs, 1, __ATOMIC_ACQ_REL) == 0) vu_dns_free(d);\n", 80); vu_str_cat(&v_s, &_t3783); drop_Str(&_t3783); });
+    ({ vu_str _t3783 = vu_str_lit("    vu_str e2 = {0};\n", 21); vu_str_cat(&v_s, &_t3783); drop_Str(&_t3783); });
     #line 20397 "vuc.vu"
     VU_AT(20397);
     #line 20397 "vuc.vu"
-    ({ vu_str _t3786 = vu_str_lit("    if (rc != 0) {\n", 19); vu_str_cat(&v_s, &_t3786); drop_Str(&_t3786); });
+    ({ vu_str _t3786 = vu_str_lit("    vu_sock *w = vu_sock_new(dup(d->efd), &e2);\n", 48); vu_str_cat(&v_s, &_t3786); drop_Str(&_t3786); });
     #line 20398 "vuc.vu"
     VU_AT(20398);
     #line 20398 "vuc.vu"
-    ({ vu_str _t3789 = vu_str_lit("        if (got) freeaddrinfo(got);\n", 36); vu_str_cat(&v_s, &_t3789); drop_Str(&_t3789); });
+    ({ vu_str _t3789 = vu_str_lit("    if (!w) { *err = e2; vu_dns_free(d); return false; }\n", 57); vu_str_cat(&v_s, &_t3789); drop_Str(&_t3789); });
     #line 20399 "vuc.vu"
     VU_AT(20399);
     #line 20399 "vuc.vu"
-    ({ vu_str _t3792 = vu_str_lit("        *err = vu_errf(\"can't look up '%.200s': %s\", host, gai_strerror(rc));\n", 78); vu_str_cat(&v_s, &_t3792); drop_Str(&_t3792); });
+    ({ vu_str _t3792 = vu_str_lit("    pthread_t th;\n", 18); vu_str_cat(&v_s, &_t3792); drop_Str(&_t3792); });
     #line 20400 "vuc.vu"
     VU_AT(20400);
     #line 20400 "vuc.vu"
-    ({ vu_str _t3795 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3795); drop_Str(&_t3795); });
+    ({ vu_str _t3795 = vu_str_lit("    pthread_attr_t at;\n", 23); vu_str_cat(&v_s, &_t3795); drop_Str(&_t3795); });
     #line 20401 "vuc.vu"
     VU_AT(20401);
     #line 20401 "vuc.vu"
-    ({ vu_str _t3798 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3798); drop_Str(&_t3798); });
+    ({ vu_str _t3798 = vu_str_lit("    pthread_attr_init(&at);\n", 28); vu_str_cat(&v_s, &_t3798); drop_Str(&_t3798); });
     #line 20402 "vuc.vu"
     VU_AT(20402);
     #line 20402 "vuc.vu"
-    ({ vu_str _t3801 = vu_str_lit("    *res = got;\n", 16); vu_str_cat(&v_s, &_t3801); drop_Str(&_t3801); });
+    ({ vu_str _t3801 = vu_str_lit("    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);\n", 63); vu_str_cat(&v_s, &_t3801); drop_Str(&_t3801); });
     #line 20403 "vuc.vu"
     VU_AT(20403);
     #line 20403 "vuc.vu"
-    ({ vu_str _t3804 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t3804); drop_Str(&_t3804); });
+    ({ vu_str _t3804 = vu_str_lit("    if (pthread_create(&th, &at, vu_dns_thread, d) != 0) {\n", 59); vu_str_cat(&v_s, &_t3804); drop_Str(&_t3804); });
     #line 20404 "vuc.vu"
     VU_AT(20404);
     #line 20404 "vuc.vu"
-    ({ vu_str _t3807 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3807); drop_Str(&_t3807); });
+    ({ vu_str _t3807 = vu_str_lit("        pthread_attr_destroy(&at);\n", 35); vu_str_cat(&v_s, &_t3807); drop_Str(&_t3807); });
     #line 20405 "vuc.vu"
     VU_AT(20405);
     #line 20405 "vuc.vu"
-    ({ vu_str _t3810 = vu_str_lit("/* Connects to h:port (h a C string the caller frees) by the deadline. */\n", 74); vu_str_cat(&v_s, &_t3810); drop_Str(&_t3810); });
+    ({ vu_str _t3810 = vu_str_lit("        vu_sock_drop(w);\n", 25); vu_str_cat(&v_s, &_t3810); drop_Str(&_t3810); });
     #line 20406 "vuc.vu"
     VU_AT(20406);
     #line 20406 "vuc.vu"
-    ({ vu_str _t3813 = vu_str_lit("static bool vu_connect_to(const char *h, int64_t port, int64_t deadline, void **out, vu_str *err, int line) {\n", 110); vu_str_cat(&v_s, &_t3813); drop_Str(&_t3813); });
+    ({ vu_str _t3813 = vu_str_lit("        vu_dns_free(d);\n", 24); vu_str_cat(&v_s, &_t3813); drop_Str(&_t3813); });
     #line 20407 "vuc.vu"
     VU_AT(20407);
     #line 20407 "vuc.vu"
-    ({ vu_str _t3816 = vu_str_lit("    struct addrinfo *res = NULL;\n", 33); vu_str_cat(&v_s, &_t3816); drop_Str(&_t3816); });
+    ({ vu_str _t3816 = vu_str_lit("        *err = vu_errf(\"can't look up '%.200s': no thread available\", host);\n", 77); vu_str_cat(&v_s, &_t3816); drop_Str(&_t3816); });
     #line 20408 "vuc.vu"
     VU_AT(20408);
     #line 20408 "vuc.vu"
-    ({ vu_str _t3819 = vu_str_lit("    if (!vu_resolve(h, port, deadline, &res, err, line)) return false;\n", 71); vu_str_cat(&v_s, &_t3819); drop_Str(&_t3819); });
+    ({ vu_str _t3819 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3819); drop_Str(&_t3819); });
     #line 20409 "vuc.vu"
     VU_AT(20409);
     #line 20409 "vuc.vu"
-    ({ vu_str _t3822 = vu_str_lit("    int last = ECONNREFUSED;\n", 29); vu_str_cat(&v_s, &_t3822); drop_Str(&_t3822); });
+    ({ vu_str _t3822 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3822); drop_Str(&_t3822); });
     #line 20410 "vuc.vu"
     VU_AT(20410);
     #line 20410 "vuc.vu"
-    ({ vu_str _t3825 = vu_str_lit("    for (struct addrinfo *a = res; a; a = a->ai_next) {\n", 56); vu_str_cat(&v_s, &_t3825); drop_Str(&_t3825); });
+    ({ vu_str _t3825 = vu_str_lit("    pthread_attr_destroy(&at);\n", 31); vu_str_cat(&v_s, &_t3825); drop_Str(&_t3825); });
     #line 20411 "vuc.vu"
     VU_AT(20411);
     #line 20411 "vuc.vu"
-    ({ vu_str _t3828 = vu_str_lit("        int fd = socket(a->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);\n", 86); vu_str_cat(&v_s, &_t3828); drop_Str(&_t3828); });
+    ({ vu_str _t3828 = vu_str_lit("    while (!__atomic_load_n(&d->done, __ATOMIC_ACQUIRE)) {\n", 59); vu_str_cat(&v_s, &_t3828); drop_Str(&_t3828); });
     #line 20412 "vuc.vu"
     VU_AT(20412);
     #line 20412 "vuc.vu"
-    ({ vu_str _t3831 = vu_str_lit("        if (fd < 0) { last = errno; continue; }\n", 48); vu_str_cat(&v_s, &_t3831); drop_Str(&_t3831); });
+    ({ vu_str _t3831 = vu_str_lit("        if ((deadline >= 0 && vu_now_ns() >= deadline) || !vu_wait_fd(w, false, deadline, line)) {\n", 99); vu_str_cat(&v_s, &_t3831); drop_Str(&_t3831); });
     #line 20413 "vuc.vu"
     VU_AT(20413);
     #line 20413 "vuc.vu"
-    ({ vu_str _t3834 = vu_str_lit("        vu_sock_flags(fd);\n", 27); vu_str_cat(&v_s, &_t3834); drop_Str(&_t3834); });
+    ({ vu_str _t3834 = vu_str_lit("            if (__atomic_sub_fetch(&d->refs, 1, __ATOMIC_ACQ_REL) == 0) vu_dns_free(d);   /* finished just now */\n", 114); vu_str_cat(&v_s, &_t3834); drop_Str(&_t3834); });
     #line 20414 "vuc.vu"
     VU_AT(20414);
     #line 20414 "vuc.vu"
-    ({ vu_str _t3837 = vu_str_lit("        vu_str e2 = {0};\n", 25); vu_str_cat(&v_s, &_t3837); drop_Str(&_t3837); });
+    ({ vu_str _t3837 = vu_str_lit("            vu_sock_drop(w);\n", 29); vu_str_cat(&v_s, &_t3837); drop_Str(&_t3837); });
     #line 20415 "vuc.vu"
     VU_AT(20415);
     #line 20415 "vuc.vu"
-    ({ vu_str _t3840 = vu_str_lit("        if (connect(fd, a->ai_addr, a->ai_addrlen) < 0 && errno != EINPROGRESS) { last = errno; close(fd); continue; }\n", 119); vu_str_cat(&v_s, &_t3840); drop_Str(&_t3840); });
+    ({ vu_str _t3840 = vu_str_lit("            *err = vu_errf(\"timed out looking up '%.200s'\", host);\n", 67); vu_str_cat(&v_s, &_t3840); drop_Str(&_t3840); });
     #line 20416 "vuc.vu"
     VU_AT(20416);
     #line 20416 "vuc.vu"
-    ({ vu_str _t3843 = vu_str_lit("        vu_sock *s = vu_sock_new(fd, &e2);\n", 43); vu_str_cat(&v_s, &_t3843); drop_Str(&_t3843); });
+    ({ vu_str _t3843 = vu_str_lit("            return false;\n", 26); vu_str_cat(&v_s, &_t3843); drop_Str(&_t3843); });
     #line 20417 "vuc.vu"
     VU_AT(20417);
     #line 20417 "vuc.vu"
-    ({ vu_str _t3846 = vu_str_lit("        if (!s) { drop_Str(&e2); last = errno; continue; }\n", 59); vu_str_cat(&v_s, &_t3846); drop_Str(&_t3846); });
+    ({ vu_str _t3846 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3846); drop_Str(&_t3846); });
     #line 20418 "vuc.vu"
     VU_AT(20418);
     #line 20418 "vuc.vu"
-    ({ vu_str _t3849 = vu_str_lit("        for (;;) {\n", 19); vu_str_cat(&v_s, &_t3849); drop_Str(&_t3849); });
+    ({ vu_str _t3849 = vu_str_lit("        /* read the count, so that a wake before the lookup finished leaves the next write a new edge */\n", 105); vu_str_cat(&v_s, &_t3849); drop_Str(&_t3849); });
     #line 20419 "vuc.vu"
     VU_AT(20419);
     #line 20419 "vuc.vu"
-    ({ vu_str _t3852 = vu_str_lit("            int soerr = 0;\n", 27); vu_str_cat(&v_s, &_t3852); drop_Str(&_t3852); });
+    ({ vu_str _t3852 = vu_str_lit("        uint64_t x;\n", 20); vu_str_cat(&v_s, &_t3852); drop_Str(&_t3852); });
     #line 20420 "vuc.vu"
     VU_AT(20420);
     #line 20420 "vuc.vu"
-    ({ vu_str _t3855 = vu_str_lit("            socklen_t sl = sizeof soerr;\n", 41); vu_str_cat(&v_s, &_t3855); drop_Str(&_t3855); });
+    ({ vu_str _t3855 = vu_str_lit("        if (read(w->fd, &x, 8) < 0) { /* not written yet */ }\n", 62); vu_str_cat(&v_s, &_t3855); drop_Str(&_t3855); });
     #line 20421 "vuc.vu"
     VU_AT(20421);
     #line 20421 "vuc.vu"
-    ({ vu_str _t3858 = vu_str_lit("            getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);\n", 63); vu_str_cat(&v_s, &_t3858); drop_Str(&_t3858); });
+    ({ vu_str _t3858 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3858); drop_Str(&_t3858); });
     #line 20422 "vuc.vu"
     VU_AT(20422);
     #line 20422 "vuc.vu"
-    ({ vu_str _t3861 = vu_str_lit("            if (soerr == 0) {\n", 30); vu_str_cat(&v_s, &_t3861); drop_Str(&_t3861); });
+    ({ vu_str _t3861 = vu_str_lit("    vu_sock_drop(w);\n", 21); vu_str_cat(&v_s, &_t3861); drop_Str(&_t3861); });
     #line 20423 "vuc.vu"
     VU_AT(20423);
     #line 20423 "vuc.vu"
-    ({ vu_str _t3864 = vu_str_lit("                struct sockaddr_storage peer;\n", 46); vu_str_cat(&v_s, &_t3864); drop_Str(&_t3864); });
+    ({ vu_str _t3864 = vu_str_lit("    int rc = d->rc;\n", 20); vu_str_cat(&v_s, &_t3864); drop_Str(&_t3864); });
     #line 20424 "vuc.vu"
     VU_AT(20424);
     #line 20424 "vuc.vu"
-    ({ vu_str _t3867 = vu_str_lit("                socklen_t pl = sizeof peer;\n", 44); vu_str_cat(&v_s, &_t3867); drop_Str(&_t3867); });
+    ({ vu_str _t3867 = vu_str_lit("    struct addrinfo *got = d->res;\n", 35); vu_str_cat(&v_s, &_t3867); drop_Str(&_t3867); });
     #line 20425 "vuc.vu"
     VU_AT(20425);
     #line 20425 "vuc.vu"
-    ({ vu_str _t3870 = vu_str_lit("                if (getpeername(fd, (struct sockaddr *)&peer, &pl) == 0) {\n", 75); vu_str_cat(&v_s, &_t3870); drop_Str(&_t3870); });
+    ({ vu_str _t3870 = vu_str_lit("    d->res = NULL;\n", 19); vu_str_cat(&v_s, &_t3870); drop_Str(&_t3870); });
     #line 20426 "vuc.vu"
     VU_AT(20426);
     #line 20426 "vuc.vu"
-    ({ vu_str _t3873 = vu_str_lit("                    int one = 1;\n", 33); vu_str_cat(&v_s, &_t3873); drop_Str(&_t3873); });
+    ({ vu_str _t3873 = vu_str_lit("    /* the thread may still be finishing its write: whichever of the two lets go last frees d */\n", 97); vu_str_cat(&v_s, &_t3873); drop_Str(&_t3873); });
     #line 20427 "vuc.vu"
     VU_AT(20427);
     #line 20427 "vuc.vu"
-    ({ vu_str _t3876 = vu_str_lit("                    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);\n", 80); vu_str_cat(&v_s, &_t3876); drop_Str(&_t3876); });
+    ({ vu_str _t3876 = vu_str_lit("    if (__atomic_sub_fetch(&d->refs, 1, __ATOMIC_ACQ_REL) == 0) vu_dns_free(d);\n", 80); vu_str_cat(&v_s, &_t3876); drop_Str(&_t3876); });
     #line 20428 "vuc.vu"
     VU_AT(20428);
     #line 20428 "vuc.vu"
-    ({ vu_str _t3879 = vu_str_lit("                    freeaddrinfo(res);\n", 39); vu_str_cat(&v_s, &_t3879); drop_Str(&_t3879); });
+    ({ vu_str _t3879 = vu_str_lit("    if (rc != 0) {\n", 19); vu_str_cat(&v_s, &_t3879); drop_Str(&_t3879); });
     #line 20429 "vuc.vu"
     VU_AT(20429);
     #line 20429 "vuc.vu"
-    ({ vu_str _t3882 = vu_str_lit("                    *out = s;\n", 30); vu_str_cat(&v_s, &_t3882); drop_Str(&_t3882); });
+    ({ vu_str _t3882 = vu_str_lit("        if (got) freeaddrinfo(got);\n", 36); vu_str_cat(&v_s, &_t3882); drop_Str(&_t3882); });
     #line 20430 "vuc.vu"
     VU_AT(20430);
     #line 20430 "vuc.vu"
-    ({ vu_str _t3885 = vu_str_lit("                    return true;\n", 33); vu_str_cat(&v_s, &_t3885); drop_Str(&_t3885); });
+    ({ vu_str _t3885 = vu_str_lit("        *err = vu_errf(\"can't look up '%.200s': %s\", host, gai_strerror(rc));\n", 78); vu_str_cat(&v_s, &_t3885); drop_Str(&_t3885); });
     #line 20431 "vuc.vu"
     VU_AT(20431);
     #line 20431 "vuc.vu"
-    ({ vu_str _t3888 = vu_str_lit("                }\n", 18); vu_str_cat(&v_s, &_t3888); drop_Str(&_t3888); });
+    ({ vu_str _t3888 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t3888); drop_Str(&_t3888); });
     #line 20432 "vuc.vu"
     VU_AT(20432);
     #line 20432 "vuc.vu"
-    ({ vu_str _t3891 = vu_str_lit("                if (errno != ENOTCONN) { soerr = errno; }\n", 58); vu_str_cat(&v_s, &_t3891); drop_Str(&_t3891); });
+    ({ vu_str _t3891 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3891); drop_Str(&_t3891); });
     #line 20433 "vuc.vu"
     VU_AT(20433);
     #line 20433 "vuc.vu"
-    ({ vu_str _t3894 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t3894); drop_Str(&_t3894); });
+    ({ vu_str _t3894 = vu_str_lit("    *res = got;\n", 16); vu_str_cat(&v_s, &_t3894); drop_Str(&_t3894); });
     #line 20434 "vuc.vu"
     VU_AT(20434);
     #line 20434 "vuc.vu"
-    ({ vu_str _t3897 = vu_str_lit("            if (soerr != 0) { last = soerr; break; }\n", 53); vu_str_cat(&v_s, &_t3897); drop_Str(&_t3897); });
+    ({ vu_str _t3897 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t3897); drop_Str(&_t3897); });
     #line 20435 "vuc.vu"
     VU_AT(20435);
     #line 20435 "vuc.vu"
-    ({ vu_str _t3900 = vu_str_lit("            if ((deadline >= 0 && vu_now_ns() >= deadline) || !vu_wait_fd(s, true, deadline, line)) {\n", 102); vu_str_cat(&v_s, &_t3900); drop_Str(&_t3900); });
+    ({ vu_str _t3900 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3900); drop_Str(&_t3900); });
     #line 20436 "vuc.vu"
     VU_AT(20436);
     #line 20436 "vuc.vu"
-    ({ vu_str _t3903 = vu_str_lit("                vu_sock_drop(s);\n", 33); vu_str_cat(&v_s, &_t3903); drop_Str(&_t3903); });
+    ({ vu_str _t3903 = vu_str_lit("/* Connects to h:port (h a C string the caller frees) by the deadline. */\n", 74); vu_str_cat(&v_s, &_t3903); drop_Str(&_t3903); });
     #line 20437 "vuc.vu"
     VU_AT(20437);
     #line 20437 "vuc.vu"
-    ({ vu_str _t3906 = vu_str_lit("                freeaddrinfo(res);\n", 35); vu_str_cat(&v_s, &_t3906); drop_Str(&_t3906); });
+    ({ vu_str _t3906 = vu_str_lit("static bool vu_connect_to(const char *h, int64_t port, int64_t deadline, void **out, vu_str *err, int line) {\n", 110); vu_str_cat(&v_s, &_t3906); drop_Str(&_t3906); });
     #line 20438 "vuc.vu"
     VU_AT(20438);
     #line 20438 "vuc.vu"
-    ({ vu_str _t3909 = vu_str_lit("                *err = vu_errf(\"timed out connecting to %.200s:%lld\", h, (long long)port);\n", 91); vu_str_cat(&v_s, &_t3909); drop_Str(&_t3909); });
+    ({ vu_str _t3909 = vu_str_lit("    struct addrinfo *res = NULL;\n", 33); vu_str_cat(&v_s, &_t3909); drop_Str(&_t3909); });
     #line 20439 "vuc.vu"
     VU_AT(20439);
     #line 20439 "vuc.vu"
-    ({ vu_str _t3912 = vu_str_lit("                return false;\n", 30); vu_str_cat(&v_s, &_t3912); drop_Str(&_t3912); });
+    ({ vu_str _t3912 = vu_str_lit("    if (!vu_resolve(h, port, deadline, &res, err, line)) return false;\n", 71); vu_str_cat(&v_s, &_t3912); drop_Str(&_t3912); });
     #line 20440 "vuc.vu"
     VU_AT(20440);
     #line 20440 "vuc.vu"
-    ({ vu_str _t3915 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t3915); drop_Str(&_t3915); });
+    ({ vu_str _t3915 = vu_str_lit("    int last = ECONNREFUSED;\n", 29); vu_str_cat(&v_s, &_t3915); drop_Str(&_t3915); });
     #line 20441 "vuc.vu"
     VU_AT(20441);
     #line 20441 "vuc.vu"
-    ({ vu_str _t3918 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t3918); drop_Str(&_t3918); });
+    ({ vu_str _t3918 = vu_str_lit("    for (struct addrinfo *a = res; a; a = a->ai_next) {\n", 56); vu_str_cat(&v_s, &_t3918); drop_Str(&_t3918); });
     #line 20442 "vuc.vu"
     VU_AT(20442);
     #line 20442 "vuc.vu"
-    ({ vu_str _t3921 = vu_str_lit("        vu_sock_drop(s);\n", 25); vu_str_cat(&v_s, &_t3921); drop_Str(&_t3921); });
+    ({ vu_str _t3921 = vu_str_lit("        int fd = socket(a->ai_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);\n", 86); vu_str_cat(&v_s, &_t3921); drop_Str(&_t3921); });
     #line 20443 "vuc.vu"
     VU_AT(20443);
     #line 20443 "vuc.vu"
-    ({ vu_str _t3924 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t3924); drop_Str(&_t3924); });
+    ({ vu_str _t3924 = vu_str_lit("        if (fd < 0) { last = errno; continue; }\n", 48); vu_str_cat(&v_s, &_t3924); drop_Str(&_t3924); });
     #line 20444 "vuc.vu"
     VU_AT(20444);
     #line 20444 "vuc.vu"
-    ({ vu_str _t3927 = vu_str_lit("    freeaddrinfo(res);\n", 23); vu_str_cat(&v_s, &_t3927); drop_Str(&_t3927); });
+    ({ vu_str _t3927 = vu_str_lit("        vu_sock_flags(fd);\n", 27); vu_str_cat(&v_s, &_t3927); drop_Str(&_t3927); });
     #line 20445 "vuc.vu"
     VU_AT(20445);
     #line 20445 "vuc.vu"
-    ({ vu_str _t3930 = vu_str_lit("    *err = vu_errf(\"can't connect to %.200s:%lld: %s\", h, (long long)port, strerror(last));\n", 92); vu_str_cat(&v_s, &_t3930); drop_Str(&_t3930); });
+    ({ vu_str _t3930 = vu_str_lit("        vu_str e2 = {0};\n", 25); vu_str_cat(&v_s, &_t3930); drop_Str(&_t3930); });
     #line 20446 "vuc.vu"
     VU_AT(20446);
     #line 20446 "vuc.vu"
-    ({ vu_str _t3933 = vu_str_lit("    return false;\n", 18); vu_str_cat(&v_s, &_t3933); drop_Str(&_t3933); });
+    ({ vu_str _t3933 = vu_str_lit("        if (connect(fd, a->ai_addr, a->ai_addrlen) < 0 && errno != EINPROGRESS) { last = errno; close(fd); continue; }\n", 119); vu_str_cat(&v_s, &_t3933); drop_Str(&_t3933); });
     #line 20447 "vuc.vu"
     VU_AT(20447);
     #line 20447 "vuc.vu"
-    ({ vu_str _t3936 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3936); drop_Str(&_t3936); });
+    ({ vu_str _t3936 = vu_str_lit("        vu_sock *s = vu_sock_new(fd, &e2);\n", 43); vu_str_cat(&v_s, &_t3936); drop_Str(&_t3936); });
     #line 20448 "vuc.vu"
     VU_AT(20448);
     #line 20448 "vuc.vu"
-    ({ vu_str _t3939 = vu_str_lit("static bool vu_net_connect(vu_cap net, const vu_str *host, int64_t port, double timeout, bool has, void **out,\n", 111); vu_str_cat(&v_s, &_t3939); drop_Str(&_t3939); });
+    ({ vu_str _t3939 = vu_str_lit("        if (!s) { drop_Str(&e2); last = errno; continue; }\n", 59); vu_str_cat(&v_s, &_t3939); drop_Str(&_t3939); });
     #line 20449 "vuc.vu"
     VU_AT(20449);
     #line 20449 "vuc.vu"
-    ({ vu_str _t3942 = vu_str_lit("                           vu_str *err, int line) {\n", 52); vu_str_cat(&v_s, &_t3942); drop_Str(&_t3942); });
+    ({ vu_str _t3942 = vu_str_lit("        for (;;) {\n", 19); vu_str_cat(&v_s, &_t3942); drop_Str(&_t3942); });
     #line 20450 "vuc.vu"
     VU_AT(20450);
     #line 20450 "vuc.vu"
-    ({ vu_str _t3945 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3945); drop_Str(&_t3945); });
+    ({ vu_str _t3945 = vu_str_lit("            int soerr = 0;\n", 27); vu_str_cat(&v_s, &_t3945); drop_Str(&_t3945); });
     #line 20451 "vuc.vu"
     VU_AT(20451);
     #line 20451 "vuc.vu"
-    ({ vu_str _t3948 = vu_str_lit("    vu_task_here(\"net.connect()\", line);\n", 41); vu_str_cat(&v_s, &_t3948); drop_Str(&_t3948); });
+    ({ vu_str _t3948 = vu_str_lit("            socklen_t sl = sizeof soerr;\n", 41); vu_str_cat(&v_s, &_t3948); drop_Str(&_t3948); });
     #line 20452 "vuc.vu"
     VU_AT(20452);
     #line 20452 "vuc.vu"
-    ({ vu_str _t3951 = vu_str_lit("    if (port < 1 || port > 65535) { *err = vu_errf(\"port %lld is not in 1..65535\", (long long)port); return false; }\n", 117); vu_str_cat(&v_s, &_t3951); drop_Str(&_t3951); });
+    ({ vu_str _t3951 = vu_str_lit("            getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);\n", 63); vu_str_cat(&v_s, &_t3951); drop_Str(&_t3951); });
     #line 20453 "vuc.vu"
     VU_AT(20453);
     #line 20453 "vuc.vu"
-    ({ vu_str _t3954 = vu_str_lit("    char *h = vu_cpath(host, err);\n", 35); vu_str_cat(&v_s, &_t3954); drop_Str(&_t3954); });
+    ({ vu_str _t3954 = vu_str_lit("            if (soerr == 0) {\n", 30); vu_str_cat(&v_s, &_t3954); drop_Str(&_t3954); });
     #line 20454 "vuc.vu"
     VU_AT(20454);
     #line 20454 "vuc.vu"
-    ({ vu_str _t3957 = vu_str_lit("    if (!h) { drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }\n", 102); vu_str_cat(&v_s, &_t3957); drop_Str(&_t3957); });
+    ({ vu_str _t3957 = vu_str_lit("                struct sockaddr_storage peer;\n", 46); vu_str_cat(&v_s, &_t3957); drop_Str(&_t3957); });
     #line 20455 "vuc.vu"
     VU_AT(20455);
     #line 20455 "vuc.vu"
-    ({ vu_str _t3960 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t3960); drop_Str(&_t3960); });
+    ({ vu_str _t3960 = vu_str_lit("                socklen_t pl = sizeof peer;\n", 44); vu_str_cat(&v_s, &_t3960); drop_Str(&_t3960); });
     #line 20456 "vuc.vu"
     VU_AT(20456);
     #line 20456 "vuc.vu"
-    ({ vu_str _t3963 = vu_str_lit("    bool ok = vu_connect_to(h, port, deadline, out, err, line);\n", 64); vu_str_cat(&v_s, &_t3963); drop_Str(&_t3963); });
+    ({ vu_str _t3963 = vu_str_lit("                if (getpeername(fd, (struct sockaddr *)&peer, &pl) == 0) {\n", 75); vu_str_cat(&v_s, &_t3963); drop_Str(&_t3963); });
     #line 20457 "vuc.vu"
     VU_AT(20457);
     #line 20457 "vuc.vu"
-    ({ vu_str _t3966 = vu_str_lit("    free(h);\n", 13); vu_str_cat(&v_s, &_t3966); drop_Str(&_t3966); });
+    ({ vu_str _t3966 = vu_str_lit("                    int one = 1;\n", 33); vu_str_cat(&v_s, &_t3966); drop_Str(&_t3966); });
     #line 20458 "vuc.vu"
     VU_AT(20458);
     #line 20458 "vuc.vu"
-    ({ vu_str _t3969 = vu_str_lit("    return ok;\n", 15); vu_str_cat(&v_s, &_t3969); drop_Str(&_t3969); });
+    ({ vu_str _t3969 = vu_str_lit("                    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);\n", 80); vu_str_cat(&v_s, &_t3969); drop_Str(&_t3969); });
     #line 20459 "vuc.vu"
     VU_AT(20459);
     #line 20459 "vuc.vu"
-    ({ vu_str _t3972 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t3972); drop_Str(&_t3972); });
+    ({ vu_str _t3972 = vu_str_lit("                    freeaddrinfo(res);\n", 39); vu_str_cat(&v_s, &_t3972); drop_Str(&_t3972); });
     #line 20460 "vuc.vu"
     VU_AT(20460);
     #line 20460 "vuc.vu"
-    ({ vu_str _t3975 = vu_str_lit("/* net.resolve(host): the addresses a name stands for, as text (\"93.184.215.14\", \"2606:2800::1\"), in the\n", 105); vu_str_cat(&v_s, &_t3975); drop_Str(&_t3975); });
+    ({ vu_str _t3975 = vu_str_lit("                    *out = s;\n", 30); vu_str_cat(&v_s, &_t3975); drop_Str(&_t3975); });
     #line 20461 "vuc.vu"
     VU_AT(20461);
     #line 20461 "vuc.vu"
-    ({ vu_str _t3978 = vu_str_lit("   order connect would try them, each once. An address resolves to itself. */\n", 78); vu_str_cat(&v_s, &_t3978); drop_Str(&_t3978); });
+    ({ vu_str _t3978 = vu_str_lit("                    return true;\n", 33); vu_str_cat(&v_s, &_t3978); drop_Str(&_t3978); });
     #line 20462 "vuc.vu"
     VU_AT(20462);
     #line 20462 "vuc.vu"
-    ({ vu_str _t3981 = vu_str_lit("static bool vu_net_resolve(vu_cap net, const vu_str *host, double timeout, bool has, vu_str **out, int64_t *count,\n", 115); vu_str_cat(&v_s, &_t3981); drop_Str(&_t3981); });
+    ({ vu_str _t3981 = vu_str_lit("                }\n", 18); vu_str_cat(&v_s, &_t3981); drop_Str(&_t3981); });
     #line 20463 "vuc.vu"
     VU_AT(20463);
     #line 20463 "vuc.vu"
-    ({ vu_str _t3984 = vu_str_lit("                           vu_str *err, int line) {\n", 52); vu_str_cat(&v_s, &_t3984); drop_Str(&_t3984); });
+    ({ vu_str _t3984 = vu_str_lit("                if (errno != ENOTCONN) { soerr = errno; }\n", 58); vu_str_cat(&v_s, &_t3984); drop_Str(&_t3984); });
     #line 20464 "vuc.vu"
     VU_AT(20464);
     #line 20464 "vuc.vu"
-    ({ vu_str _t3987 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t3987); drop_Str(&_t3987); });
+    ({ vu_str _t3987 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t3987); drop_Str(&_t3987); });
     #line 20465 "vuc.vu"
     VU_AT(20465);
     #line 20465 "vuc.vu"
-    ({ vu_str _t3990 = vu_str_lit("    vu_task_here(\"net.resolve()\", line);\n", 41); vu_str_cat(&v_s, &_t3990); drop_Str(&_t3990); });
+    ({ vu_str _t3990 = vu_str_lit("            if (soerr != 0) { last = soerr; break; }\n", 53); vu_str_cat(&v_s, &_t3990); drop_Str(&_t3990); });
     #line 20466 "vuc.vu"
     VU_AT(20466);
     #line 20466 "vuc.vu"
-    ({ vu_str _t3993 = vu_str_lit("    char *h = vu_cpath(host, err);\n", 35); vu_str_cat(&v_s, &_t3993); drop_Str(&_t3993); });
+    ({ vu_str _t3993 = vu_str_lit("            if ((deadline >= 0 && vu_now_ns() >= deadline) || !vu_wait_fd(s, true, deadline, line)) {\n", 102); vu_str_cat(&v_s, &_t3993); drop_Str(&_t3993); });
     #line 20467 "vuc.vu"
     VU_AT(20467);
     #line 20467 "vuc.vu"
-    ({ vu_str _t3996 = vu_str_lit("    if (!h) { drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }\n", 102); vu_str_cat(&v_s, &_t3996); drop_Str(&_t3996); });
+    ({ vu_str _t3996 = vu_str_lit("                vu_sock_drop(s);\n", 33); vu_str_cat(&v_s, &_t3996); drop_Str(&_t3996); });
     #line 20468 "vuc.vu"
     VU_AT(20468);
     #line 20468 "vuc.vu"
-    ({ vu_str _t3999 = vu_str_lit("    if (!*h) { free(h); *err = vu_errf(\"can't look up an empty host name\"); return false; }\n", 92); vu_str_cat(&v_s, &_t3999); drop_Str(&_t3999); });
+    ({ vu_str _t3999 = vu_str_lit("                freeaddrinfo(res);\n", 35); vu_str_cat(&v_s, &_t3999); drop_Str(&_t3999); });
     #line 20469 "vuc.vu"
     VU_AT(20469);
     #line 20469 "vuc.vu"
-    ({ vu_str _t4002 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t4002); drop_Str(&_t4002); });
+    ({ vu_str _t4002 = vu_str_lit("                *err = vu_errf(\"timed out connecting to %.200s:%lld\", h, (long long)port);\n", 91); vu_str_cat(&v_s, &_t4002); drop_Str(&_t4002); });
     #line 20470 "vuc.vu"
     VU_AT(20470);
     #line 20470 "vuc.vu"
-    ({ vu_str _t4005 = vu_str_lit("    struct addrinfo *res = NULL;\n", 33); vu_str_cat(&v_s, &_t4005); drop_Str(&_t4005); });
+    ({ vu_str _t4005 = vu_str_lit("                return false;\n", 30); vu_str_cat(&v_s, &_t4005); drop_Str(&_t4005); });
     #line 20471 "vuc.vu"
     VU_AT(20471);
     #line 20471 "vuc.vu"
-    ({ vu_str _t4008 = vu_str_lit("    bool ok = vu_resolve(h, 80, deadline, &res, err, line);\n", 60); vu_str_cat(&v_s, &_t4008); drop_Str(&_t4008); });
+    ({ vu_str _t4008 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t4008); drop_Str(&_t4008); });
     #line 20472 "vuc.vu"
     VU_AT(20472);
     #line 20472 "vuc.vu"
-    ({ vu_str _t4011 = vu_str_lit("    free(h);\n", 13); vu_str_cat(&v_s, &_t4011); drop_Str(&_t4011); });
+    ({ vu_str _t4011 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t4011); drop_Str(&_t4011); });
     #line 20473 "vuc.vu"
     VU_AT(20473);
     #line 20473 "vuc.vu"
-    ({ vu_str _t4014 = vu_str_lit("    if (!ok) return false;\n", 27); vu_str_cat(&v_s, &_t4014); drop_Str(&_t4014); });
+    ({ vu_str _t4014 = vu_str_lit("        vu_sock_drop(s);\n", 25); vu_str_cat(&v_s, &_t4014); drop_Str(&_t4014); });
     #line 20474 "vuc.vu"
     VU_AT(20474);
     #line 20474 "vuc.vu"
-    ({ vu_str _t4017 = vu_str_lit("    int64_t n = 0, cap = 4;\n", 28); vu_str_cat(&v_s, &_t4017); drop_Str(&_t4017); });
+    ({ vu_str _t4017 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4017); drop_Str(&_t4017); });
     #line 20475 "vuc.vu"
     VU_AT(20475);
     #line 20475 "vuc.vu"
-    ({ vu_str _t4020 = vu_str_lit("    vu_str *items = (vu_str *)vu_malloc((size_t)cap * sizeof(vu_str));\n", 71); vu_str_cat(&v_s, &_t4020); drop_Str(&_t4020); });
+    ({ vu_str _t4020 = vu_str_lit("    freeaddrinfo(res);\n", 23); vu_str_cat(&v_s, &_t4020); drop_Str(&_t4020); });
     #line 20476 "vuc.vu"
     VU_AT(20476);
     #line 20476 "vuc.vu"
-    ({ vu_str _t4023 = vu_str_lit("    for (struct addrinfo *a = res; a; a = a->ai_next) {\n", 56); vu_str_cat(&v_s, &_t4023); drop_Str(&_t4023); });
+    ({ vu_str _t4023 = vu_str_lit("    *err = vu_errf(\"can't connect to %.200s:%lld: %s\", h, (long long)port, strerror(last));\n", 92); vu_str_cat(&v_s, &_t4023); drop_Str(&_t4023); });
     #line 20477 "vuc.vu"
     VU_AT(20477);
     #line 20477 "vuc.vu"
-    ({ vu_str _t4026 = vu_str_lit("        char buf[INET6_ADDRSTRLEN + 1];\n", 40); vu_str_cat(&v_s, &_t4026); drop_Str(&_t4026); });
+    ({ vu_str _t4026 = vu_str_lit("    return false;\n", 18); vu_str_cat(&v_s, &_t4026); drop_Str(&_t4026); });
     #line 20478 "vuc.vu"
     VU_AT(20478);
     #line 20478 "vuc.vu"
-    ({ vu_str _t4029 = vu_str_lit("        const void *src = NULL;\n", 32); vu_str_cat(&v_s, &_t4029); drop_Str(&_t4029); });
+    ({ vu_str _t4029 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4029); drop_Str(&_t4029); });
     #line 20479 "vuc.vu"
     VU_AT(20479);
     #line 20479 "vuc.vu"
-    ({ vu_str _t4032 = vu_str_lit("        if (a->ai_family == AF_INET) src = &((struct sockaddr_in *)a->ai_addr)->sin_addr;\n", 90); vu_str_cat(&v_s, &_t4032); drop_Str(&_t4032); });
+    ({ vu_str _t4032 = vu_str_lit("static bool vu_net_connect(vu_cap net, const vu_str *host, int64_t port, double timeout, bool has, void **out,\n", 111); vu_str_cat(&v_s, &_t4032); drop_Str(&_t4032); });
     #line 20480 "vuc.vu"
     VU_AT(20480);
     #line 20480 "vuc.vu"
-    ({ vu_str _t4035 = vu_str_lit("        else if (a->ai_family == AF_INET6) src = &((struct sockaddr_in6 *)a->ai_addr)->sin6_addr;\n", 98); vu_str_cat(&v_s, &_t4035); drop_Str(&_t4035); });
+    ({ vu_str _t4035 = vu_str_lit("                           vu_str *err, int line) {\n", 52); vu_str_cat(&v_s, &_t4035); drop_Str(&_t4035); });
     #line 20481 "vuc.vu"
     VU_AT(20481);
     #line 20481 "vuc.vu"
-    ({ vu_str _t4038 = vu_str_lit("        if (!src || !inet_ntop(a->ai_family, src, buf, sizeof buf)) continue;\n", 78); vu_str_cat(&v_s, &_t4038); drop_Str(&_t4038); });
+    ({ vu_str _t4038 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t4038); drop_Str(&_t4038); });
     #line 20482 "vuc.vu"
     VU_AT(20482);
     #line 20482 "vuc.vu"
-    ({ vu_str _t4041 = vu_str_lit("        bool seen = false;\n", 27); vu_str_cat(&v_s, &_t4041); drop_Str(&_t4041); });
+    ({ vu_str _t4041 = vu_str_lit("    vu_task_here(\"net.connect()\", line);\n", 41); vu_str_cat(&v_s, &_t4041); drop_Str(&_t4041); });
     #line 20483 "vuc.vu"
     VU_AT(20483);
     #line 20483 "vuc.vu"
-    ({ vu_str _t4044 = vu_str_lit("        for (int64_t i = 0; i < n && !seen; i++)\n", 49); vu_str_cat(&v_s, &_t4044); drop_Str(&_t4044); });
+    ({ vu_str _t4044 = vu_str_lit("    if (port < 1 || port > 65535) { *err = vu_errf(\"port %lld is not in 1..65535\", (long long)port); return false; }\n", 117); vu_str_cat(&v_s, &_t4044); drop_Str(&_t4044); });
     #line 20484 "vuc.vu"
     VU_AT(20484);
     #line 20484 "vuc.vu"
-    ({ vu_str _t4047 = vu_str_lit("            seen = items[i].len == (int64_t)strlen(buf) && memcmp(items[i].data, buf, (size_t)items[i].len) == 0;\n", 114); vu_str_cat(&v_s, &_t4047); drop_Str(&_t4047); });
+    ({ vu_str _t4047 = vu_str_lit("    char *h = vu_cpath(host, err);\n", 35); vu_str_cat(&v_s, &_t4047); drop_Str(&_t4047); });
     #line 20485 "vuc.vu"
     VU_AT(20485);
     #line 20485 "vuc.vu"
-    ({ vu_str _t4050 = vu_str_lit("        if (seen) continue;\n", 28); vu_str_cat(&v_s, &_t4050); drop_Str(&_t4050); });
+    ({ vu_str _t4050 = vu_str_lit("    if (!h) { drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }\n", 102); vu_str_cat(&v_s, &_t4050); drop_Str(&_t4050); });
     #line 20486 "vuc.vu"
     VU_AT(20486);
     #line 20486 "vuc.vu"
-    ({ vu_str _t4053 = vu_str_lit("        if (n == cap) { cap *= 2; vu_str *m = (vu_str *)vu_malloc((size_t)cap * sizeof(vu_str)); memcpy(m, items, (size_t)n * sizeof(vu_str)); free(items); items = m; }\n", 169); vu_str_cat(&v_s, &_t4053); drop_Str(&_t4053); });
+    ({ vu_str _t4053 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t4053); drop_Str(&_t4053); });
     #line 20487 "vuc.vu"
     VU_AT(20487);
     #line 20487 "vuc.vu"
-    ({ vu_str _t4056 = vu_str_lit("        items[n++] = vu_str_from_c(buf);\n", 41); vu_str_cat(&v_s, &_t4056); drop_Str(&_t4056); });
+    ({ vu_str _t4056 = vu_str_lit("    bool ok = vu_connect_to(h, port, deadline, out, err, line);\n", 64); vu_str_cat(&v_s, &_t4056); drop_Str(&_t4056); });
     #line 20488 "vuc.vu"
     VU_AT(20488);
     #line 20488 "vuc.vu"
-    ({ vu_str _t4059 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4059); drop_Str(&_t4059); });
+    ({ vu_str _t4059 = vu_str_lit("    free(h);\n", 13); vu_str_cat(&v_s, &_t4059); drop_Str(&_t4059); });
     #line 20489 "vuc.vu"
     VU_AT(20489);
     #line 20489 "vuc.vu"
-    ({ vu_str _t4062 = vu_str_lit("    freeaddrinfo(res);\n", 23); vu_str_cat(&v_s, &_t4062); drop_Str(&_t4062); });
+    ({ vu_str _t4062 = vu_str_lit("    return ok;\n", 15); vu_str_cat(&v_s, &_t4062); drop_Str(&_t4062); });
     #line 20490 "vuc.vu"
     VU_AT(20490);
     #line 20490 "vuc.vu"
-    ({ vu_str _t4065 = vu_str_lit("    *out = items;\n", 18); vu_str_cat(&v_s, &_t4065); drop_Str(&_t4065); });
+    ({ vu_str _t4065 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4065); drop_Str(&_t4065); });
     #line 20491 "vuc.vu"
     VU_AT(20491);
     #line 20491 "vuc.vu"
-    ({ vu_str _t4068 = vu_str_lit("    *count = n;\n", 16); vu_str_cat(&v_s, &_t4068); drop_Str(&_t4068); });
+    ({ vu_str _t4068 = vu_str_lit("/* net.resolve(host): the addresses a name stands for, as text (\"93.184.215.14\", \"2606:2800::1\"), in the\n", 105); vu_str_cat(&v_s, &_t4068); drop_Str(&_t4068); });
     #line 20492 "vuc.vu"
     VU_AT(20492);
     #line 20492 "vuc.vu"
-    ({ vu_str _t4071 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4071); drop_Str(&_t4071); });
+    ({ vu_str _t4071 = vu_str_lit("   order connect would try them, each once. An address resolves to itself. */\n", 78); vu_str_cat(&v_s, &_t4071); drop_Str(&_t4071); });
     #line 20493 "vuc.vu"
     VU_AT(20493);
     #line 20493 "vuc.vu"
-    ({ vu_str _t4074 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4074); drop_Str(&_t4074); });
+    ({ vu_str _t4074 = vu_str_lit("static bool vu_net_resolve(vu_cap net, const vu_str *host, double timeout, bool has, vu_str **out, int64_t *count,\n", 115); vu_str_cat(&v_s, &_t4074); drop_Str(&_t4074); });
     #line 20494 "vuc.vu"
     VU_AT(20494);
     #line 20494 "vuc.vu"
-    ({ vu_str _t4077 = vu_str_lit("#ifndef VU_TLS\n", 15); vu_str_cat(&v_s, &_t4077); drop_Str(&_t4077); });
+    ({ vu_str _t4077 = vu_str_lit("                           vu_str *err, int line) {\n", 52); vu_str_cat(&v_s, &_t4077); drop_Str(&_t4077); });
     #line 20495 "vuc.vu"
     VU_AT(20495);
     #line 20495 "vuc.vu"
-    ({ vu_str _t4080 = vu_str_lit("static int vu_tls_pending(vu_sock *s) { (void)s; return 0; }\n", 61); vu_str_cat(&v_s, &_t4080); drop_Str(&_t4080); });
+    ({ vu_str _t4080 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t4080); drop_Str(&_t4080); });
     #line 20496 "vuc.vu"
     VU_AT(20496);
     #line 20496 "vuc.vu"
-    ({ vu_str _t4083 = vu_str_lit("static void vu_tls_free(vu_sock *s) { (void)s; }\n", 49); vu_str_cat(&v_s, &_t4083); drop_Str(&_t4083); });
+    ({ vu_str _t4083 = vu_str_lit("    vu_task_here(\"net.resolve()\", line);\n", 41); vu_str_cat(&v_s, &_t4083); drop_Str(&_t4083); });
     #line 20497 "vuc.vu"
     VU_AT(20497);
     #line 20497 "vuc.vu"
-    ({ vu_str _t4086 = vu_str_lit("static bool vu_tls_accepted(vu_sock *l, vu_sock *s, vu_str *err) { (void)l; (void)s; (void)err; return true; }\n", 111); vu_str_cat(&v_s, &_t4086); drop_Str(&_t4086); });
+    ({ vu_str _t4086 = vu_str_lit("    char *h = vu_cpath(host, err);\n", 35); vu_str_cat(&v_s, &_t4086); drop_Str(&_t4086); });
     #line 20498 "vuc.vu"
     VU_AT(20498);
     #line 20498 "vuc.vu"
-    ({ vu_str _t4089 = vu_str_lit("static bool vu_tls_recv(vu_sock *c, int64_t deadline, vu_str *out, vu_str *err, int line) {\n", 92); vu_str_cat(&v_s, &_t4089); drop_Str(&_t4089); });
+    ({ vu_str _t4089 = vu_str_lit("    if (!h) { drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }\n", 102); vu_str_cat(&v_s, &_t4089); drop_Str(&_t4089); });
     #line 20499 "vuc.vu"
     VU_AT(20499);
     #line 20499 "vuc.vu"
-    ({ vu_str _t4092 = vu_str_lit("    (void)c; (void)deadline; (void)out; (void)err; (void)line; return false;\n", 77); vu_str_cat(&v_s, &_t4092); drop_Str(&_t4092); });
+    ({ vu_str _t4092 = vu_str_lit("    if (!*h) { free(h); *err = vu_errf(\"can't look up an empty host name\"); return false; }\n", 92); vu_str_cat(&v_s, &_t4092); drop_Str(&_t4092); });
     #line 20500 "vuc.vu"
     VU_AT(20500);
     #line 20500 "vuc.vu"
-    ({ vu_str _t4095 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4095); drop_Str(&_t4095); });
+    ({ vu_str _t4095 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t4095); drop_Str(&_t4095); });
     #line 20501 "vuc.vu"
     VU_AT(20501);
     #line 20501 "vuc.vu"
-    ({ vu_str _t4098 = vu_str_lit("static bool vu_tls_send(vu_sock *c, const uint8_t *data, int64_t len, int64_t deadline, vu_str *err, int line) {\n", 113); vu_str_cat(&v_s, &_t4098); drop_Str(&_t4098); });
+    ({ vu_str _t4098 = vu_str_lit("    struct addrinfo *res = NULL;\n", 33); vu_str_cat(&v_s, &_t4098); drop_Str(&_t4098); });
     #line 20502 "vuc.vu"
     VU_AT(20502);
     #line 20502 "vuc.vu"
-    ({ vu_str _t4101 = vu_str_lit("    (void)c; (void)data; (void)len; (void)deadline; (void)err; (void)line; return false;\n", 89); vu_str_cat(&v_s, &_t4101); drop_Str(&_t4101); });
+    ({ vu_str _t4101 = vu_str_lit("    bool ok = vu_resolve(h, 80, deadline, &res, err, line);\n", 60); vu_str_cat(&v_s, &_t4101); drop_Str(&_t4101); });
     #line 20503 "vuc.vu"
     VU_AT(20503);
     #line 20503 "vuc.vu"
-    ({ vu_str _t4104 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4104); drop_Str(&_t4104); });
+    ({ vu_str _t4104 = vu_str_lit("    free(h);\n", 13); vu_str_cat(&v_s, &_t4104); drop_Str(&_t4104); });
     #line 20504 "vuc.vu"
     VU_AT(20504);
     #line 20504 "vuc.vu"
-    ({ vu_str _t4107 = vu_str_lit("#else\n", 6); vu_str_cat(&v_s, &_t4107); drop_Str(&_t4107); });
+    ({ vu_str _t4107 = vu_str_lit("    if (!ok) return false;\n", 27); vu_str_cat(&v_s, &_t4107); drop_Str(&_t4107); });
     #line 20505 "vuc.vu"
     VU_AT(20505);
     #line 20505 "vuc.vu"
-    ({ vu_str _t4110 = vu_str_lit("/* -- TLS (OpenSSL), compiled in when a program calls net.tls_connect or net.tls_listen. A TLS Conn is a\n", 105); vu_str_cat(&v_s, &_t4110); drop_Str(&_t4110); });
+    ({ vu_str _t4110 = vu_str_lit("    int64_t n = 0, cap = 4;\n", 28); vu_str_cat(&v_s, &_t4110); drop_Str(&_t4110); });
     #line 20506 "vuc.vu"
     VU_AT(20506);
     #line 20506 "vuc.vu"
-    ({ vu_str _t4113 = vu_str_lit("   plain one with an SSL object on top: recv and send go through it, and wait for the socket the same\n", 102); vu_str_cat(&v_s, &_t4113); drop_Str(&_t4113); });
+    ({ vu_str _t4113 = vu_str_lit("    vu_str *items = (vu_str *)vu_malloc((size_t)cap * sizeof(vu_str));\n", 71); vu_str_cat(&v_s, &_t4113); drop_Str(&_t4113); });
     #line 20507 "vuc.vu"
     VU_AT(20507);
     #line 20507 "vuc.vu"
-    ({ vu_str _t4116 = vu_str_lit("   way. OpenSSL's error queue is per thread and other tasks on the same thread run in between, so each\n", 103); vu_str_cat(&v_s, &_t4116); drop_Str(&_t4116); });
+    ({ vu_str _t4116 = vu_str_lit("    for (struct addrinfo *a = res; a; a = a->ai_next) {\n", 56); vu_str_cat(&v_s, &_t4116); drop_Str(&_t4116); });
     #line 20508 "vuc.vu"
     VU_AT(20508);
     #line 20508 "vuc.vu"
-    ({ vu_str _t4119 = vu_str_lit("   call clears it. */\n", 22); vu_str_cat(&v_s, &_t4119); drop_Str(&_t4119); });
+    ({ vu_str _t4119 = vu_str_lit("        char buf[INET6_ADDRSTRLEN + 1];\n", 40); vu_str_cat(&v_s, &_t4119); drop_Str(&_t4119); });
     #line 20509 "vuc.vu"
     VU_AT(20509);
     #line 20509 "vuc.vu"
-    ({ vu_str _t4122 = vu_str_lit("#include <openssl/ssl.h>\n", 25); vu_str_cat(&v_s, &_t4122); drop_Str(&_t4122); });
+    ({ vu_str _t4122 = vu_str_lit("        const void *src = NULL;\n", 32); vu_str_cat(&v_s, &_t4122); drop_Str(&_t4122); });
     #line 20510 "vuc.vu"
     VU_AT(20510);
     #line 20510 "vuc.vu"
-    ({ vu_str _t4125 = vu_str_lit("#include <openssl/err.h>\n", 25); vu_str_cat(&v_s, &_t4125); drop_Str(&_t4125); });
+    ({ vu_str _t4125 = vu_str_lit("        if (a->ai_family == AF_INET) src = &((struct sockaddr_in *)a->ai_addr)->sin_addr;\n", 90); vu_str_cat(&v_s, &_t4125); drop_Str(&_t4125); });
     #line 20511 "vuc.vu"
     VU_AT(20511);
     #line 20511 "vuc.vu"
-    ({ vu_str _t4128 = vu_str_lit("#include <openssl/x509v3.h>\n", 28); vu_str_cat(&v_s, &_t4128); drop_Str(&_t4128); });
+    ({ vu_str _t4128 = vu_str_lit("        else if (a->ai_family == AF_INET6) src = &((struct sockaddr_in6 *)a->ai_addr)->sin6_addr;\n", 98); vu_str_cat(&v_s, &_t4128); drop_Str(&_t4128); });
     #line 20512 "vuc.vu"
     VU_AT(20512);
     #line 20512 "vuc.vu"
-    ({ vu_str _t4131 = vu_str_lit("#include <arpa/inet.h>\n", 23); vu_str_cat(&v_s, &_t4131); drop_Str(&_t4131); });
+    ({ vu_str _t4131 = vu_str_lit("        if (!src || !inet_ntop(a->ai_family, src, buf, sizeof buf)) continue;\n", 78); vu_str_cat(&v_s, &_t4131); drop_Str(&_t4131); });
     #line 20513 "vuc.vu"
     VU_AT(20513);
     #line 20513 "vuc.vu"
-    ({ vu_str _t4134 = vu_str_lit("static int vu_tls_pending(vu_sock *s) { return s->ssl ? SSL_pending((SSL *)s->ssl) : 0; }\n", 90); vu_str_cat(&v_s, &_t4134); drop_Str(&_t4134); });
+    ({ vu_str _t4134 = vu_str_lit("        bool seen = false;\n", 27); vu_str_cat(&v_s, &_t4134); drop_Str(&_t4134); });
     #line 20514 "vuc.vu"
     VU_AT(20514);
     #line 20514 "vuc.vu"
-    ({ vu_str _t4137 = vu_str_lit("/* A socket BIO that sends with MSG_NOSIGNAL: a write to a closed connection is an error, never SIGPIPE. */\n", 108); vu_str_cat(&v_s, &_t4137); drop_Str(&_t4137); });
+    ({ vu_str _t4137 = vu_str_lit("        for (int64_t i = 0; i < n && !seen; i++)\n", 49); vu_str_cat(&v_s, &_t4137); drop_Str(&_t4137); });
     #line 20515 "vuc.vu"
     VU_AT(20515);
     #line 20515 "vuc.vu"
-    ({ vu_str _t4140 = vu_str_lit("static int vu_bio_write(BIO *b, const char *d, int n) {\n", 56); vu_str_cat(&v_s, &_t4140); drop_Str(&_t4140); });
+    ({ vu_str _t4140 = vu_str_lit("            seen = items[i].len == (int64_t)strlen(buf) && memcmp(items[i].data, buf, (size_t)items[i].len) == 0;\n", 114); vu_str_cat(&v_s, &_t4140); drop_Str(&_t4140); });
     #line 20516 "vuc.vu"
     VU_AT(20516);
     #line 20516 "vuc.vu"
-    ({ vu_str _t4143 = vu_str_lit("    BIO_clear_retry_flags(b);\n", 30); vu_str_cat(&v_s, &_t4143); drop_Str(&_t4143); });
+    ({ vu_str _t4143 = vu_str_lit("        if (seen) continue;\n", 28); vu_str_cat(&v_s, &_t4143); drop_Str(&_t4143); });
     #line 20517 "vuc.vu"
     VU_AT(20517);
     #line 20517 "vuc.vu"
-    ({ vu_str _t4146 = vu_str_lit("    ssize_t r = send((int)(intptr_t)BIO_get_data(b), d, (size_t)n, MSG_NOSIGNAL);\n", 82); vu_str_cat(&v_s, &_t4146); drop_Str(&_t4146); });
+    ({ vu_str _t4146 = vu_str_lit("        if (n == cap) { cap *= 2; vu_str *m = (vu_str *)vu_malloc((size_t)cap * sizeof(vu_str)); memcpy(m, items, (size_t)n * sizeof(vu_str)); free(items); items = m; }\n", 169); vu_str_cat(&v_s, &_t4146); drop_Str(&_t4146); });
     #line 20518 "vuc.vu"
     VU_AT(20518);
     #line 20518 "vuc.vu"
-    ({ vu_str _t4149 = vu_str_lit("    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) BIO_set_retry_write(b);\n", 102); vu_str_cat(&v_s, &_t4149); drop_Str(&_t4149); });
+    ({ vu_str _t4149 = vu_str_lit("        items[n++] = vu_str_from_c(buf);\n", 41); vu_str_cat(&v_s, &_t4149); drop_Str(&_t4149); });
     #line 20519 "vuc.vu"
     VU_AT(20519);
     #line 20519 "vuc.vu"
-    ({ vu_str _t4152 = vu_str_lit("    return (int)r;\n", 19); vu_str_cat(&v_s, &_t4152); drop_Str(&_t4152); });
+    ({ vu_str _t4152 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4152); drop_Str(&_t4152); });
     #line 20520 "vuc.vu"
     VU_AT(20520);
     #line 20520 "vuc.vu"
-    ({ vu_str _t4155 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4155); drop_Str(&_t4155); });
+    ({ vu_str _t4155 = vu_str_lit("    freeaddrinfo(res);\n", 23); vu_str_cat(&v_s, &_t4155); drop_Str(&_t4155); });
     #line 20521 "vuc.vu"
     VU_AT(20521);
     #line 20521 "vuc.vu"
-    ({ vu_str _t4158 = vu_str_lit("static int vu_bio_read(BIO *b, char *d, int n) {\n", 49); vu_str_cat(&v_s, &_t4158); drop_Str(&_t4158); });
+    ({ vu_str _t4158 = vu_str_lit("    *out = items;\n", 18); vu_str_cat(&v_s, &_t4158); drop_Str(&_t4158); });
     #line 20522 "vuc.vu"
     VU_AT(20522);
     #line 20522 "vuc.vu"
-    ({ vu_str _t4161 = vu_str_lit("    BIO_clear_retry_flags(b);\n", 30); vu_str_cat(&v_s, &_t4161); drop_Str(&_t4161); });
+    ({ vu_str _t4161 = vu_str_lit("    *count = n;\n", 16); vu_str_cat(&v_s, &_t4161); drop_Str(&_t4161); });
     #line 20523 "vuc.vu"
     VU_AT(20523);
     #line 20523 "vuc.vu"
-    ({ vu_str _t4164 = vu_str_lit("    ssize_t r = recv((int)(intptr_t)BIO_get_data(b), d, (size_t)n, 0);\n", 71); vu_str_cat(&v_s, &_t4164); drop_Str(&_t4164); });
+    ({ vu_str _t4164 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4164); drop_Str(&_t4164); });
     #line 20524 "vuc.vu"
     VU_AT(20524);
     #line 20524 "vuc.vu"
-    ({ vu_str _t4167 = vu_str_lit("    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) BIO_set_retry_read(b);\n", 101); vu_str_cat(&v_s, &_t4167); drop_Str(&_t4167); });
+    ({ vu_str _t4167 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4167); drop_Str(&_t4167); });
     #line 20525 "vuc.vu"
     VU_AT(20525);
     #line 20525 "vuc.vu"
-    ({ vu_str _t4170 = vu_str_lit("    return (int)r;\n", 19); vu_str_cat(&v_s, &_t4170); drop_Str(&_t4170); });
+    ({ vu_str _t4170 = vu_str_lit("#ifndef VU_TLS\n", 15); vu_str_cat(&v_s, &_t4170); drop_Str(&_t4170); });
     #line 20526 "vuc.vu"
     VU_AT(20526);
     #line 20526 "vuc.vu"
-    ({ vu_str _t4173 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4173); drop_Str(&_t4173); });
+    ({ vu_str _t4173 = vu_str_lit("static int vu_tls_pending(vu_sock *s) { (void)s; return 0; }\n", 61); vu_str_cat(&v_s, &_t4173); drop_Str(&_t4173); });
     #line 20527 "vuc.vu"
     VU_AT(20527);
     #line 20527 "vuc.vu"
-    ({ vu_str _t4176 = vu_str_lit("static long vu_bio_ctrl(BIO *b, int cmd, long num, void *ptr) {\n", 64); vu_str_cat(&v_s, &_t4176); drop_Str(&_t4176); });
+    ({ vu_str _t4176 = vu_str_lit("static void vu_tls_free(vu_sock *s) { (void)s; }\n", 49); vu_str_cat(&v_s, &_t4176); drop_Str(&_t4176); });
     #line 20528 "vuc.vu"
     VU_AT(20528);
     #line 20528 "vuc.vu"
-    ({ vu_str _t4179 = vu_str_lit("    (void)b; (void)num; (void)ptr;\n", 35); vu_str_cat(&v_s, &_t4179); drop_Str(&_t4179); });
+    ({ vu_str _t4179 = vu_str_lit("static bool vu_tls_accepted(vu_sock *l, vu_sock *s, vu_str *err) { (void)l; (void)s; (void)err; return true; }\n", 111); vu_str_cat(&v_s, &_t4179); drop_Str(&_t4179); });
     #line 20529 "vuc.vu"
     VU_AT(20529);
     #line 20529 "vuc.vu"
-    ({ vu_str _t4182 = vu_str_lit("    return cmd == BIO_CTRL_FLUSH ? 1 : 0;\n", 42); vu_str_cat(&v_s, &_t4182); drop_Str(&_t4182); });
+    ({ vu_str _t4182 = vu_str_lit("static bool vu_tls_recv(vu_sock *c, int64_t deadline, vu_str *out, vu_str *err, int line) {\n", 92); vu_str_cat(&v_s, &_t4182); drop_Str(&_t4182); });
     #line 20530 "vuc.vu"
     VU_AT(20530);
     #line 20530 "vuc.vu"
-    ({ vu_str _t4185 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4185); drop_Str(&_t4185); });
+    ({ vu_str _t4185 = vu_str_lit("    (void)c; (void)deadline; (void)out; (void)err; (void)line; return false;\n", 77); vu_str_cat(&v_s, &_t4185); drop_Str(&_t4185); });
     #line 20531 "vuc.vu"
     VU_AT(20531);
     #line 20531 "vuc.vu"
-    ({ vu_str _t4188 = vu_str_lit("static int vu_bio_create(BIO *b) { BIO_set_init(b, 1); return 1; }\n", 67); vu_str_cat(&v_s, &_t4188); drop_Str(&_t4188); });
+    ({ vu_str _t4188 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4188); drop_Str(&_t4188); });
     #line 20532 "vuc.vu"
     VU_AT(20532);
     #line 20532 "vuc.vu"
-    ({ vu_str _t4191 = vu_str_lit("VU_G BIO_METHOD *vu_bio_method;\n", 32); vu_str_cat(&v_s, &_t4191); drop_Str(&_t4191); });
+    ({ vu_str _t4191 = vu_str_lit("static bool vu_tls_send(vu_sock *c, const uint8_t *data, int64_t len, int64_t deadline, vu_str *err, int line) {\n", 113); vu_str_cat(&v_s, &_t4191); drop_Str(&_t4191); });
     #line 20533 "vuc.vu"
     VU_AT(20533);
     #line 20533 "vuc.vu"
-    ({ vu_str _t4194 = vu_str_lit("VU_G SSL_CTX *vu_tls_system;   /* clients that trust the system's certificates share one context */\n", 100); vu_str_cat(&v_s, &_t4194); drop_Str(&_t4194); });
+    ({ vu_str _t4194 = vu_str_lit("    (void)c; (void)data; (void)len; (void)deadline; (void)err; (void)line; return false;\n", 89); vu_str_cat(&v_s, &_t4194); drop_Str(&_t4194); });
     #line 20534 "vuc.vu"
     VU_AT(20534);
     #line 20534 "vuc.vu"
-    ({ vu_str _t4197 = vu_str_lit("VU_G pthread_once_t vu_tls_once VU_GI(PTHREAD_ONCE_INIT);\n", 58); vu_str_cat(&v_s, &_t4197); drop_Str(&_t4197); });
+    ({ vu_str _t4197 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4197); drop_Str(&_t4197); });
     #line 20535 "vuc.vu"
     VU_AT(20535);
     #line 20535 "vuc.vu"
-    ({ vu_str _t4200 = vu_str_lit("VU_G int vu_alpn_index VU_GI(-1);   /* a context's ALPN list (ex_data), freed with the context */\n", 98); vu_str_cat(&v_s, &_t4200); drop_Str(&_t4200); });
+    ({ vu_str _t4200 = vu_str_lit("#else\n", 6); vu_str_cat(&v_s, &_t4200); drop_Str(&_t4200); });
     #line 20536 "vuc.vu"
     VU_AT(20536);
     #line 20536 "vuc.vu"
-    ({ vu_str _t4203 = vu_str_lit("static void vu_alpn_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp) {\n", 104); vu_str_cat(&v_s, &_t4203); drop_Str(&_t4203); });
+    ({ vu_str _t4203 = vu_str_lit("/* -- TLS (OpenSSL), compiled in when a program calls net.tls_connect or net.tls_listen. A TLS Conn is a\n", 105); vu_str_cat(&v_s, &_t4203); drop_Str(&_t4203); });
     #line 20537 "vuc.vu"
     VU_AT(20537);
     #line 20537 "vuc.vu"
-    ({ vu_str _t4206 = vu_str_lit("    (void)parent; (void)ad; (void)idx; (void)argl; (void)argp;\n", 63); vu_str_cat(&v_s, &_t4206); drop_Str(&_t4206); });
+    ({ vu_str _t4206 = vu_str_lit("   plain one with an SSL object on top: recv and send go through it, and wait for the socket the same\n", 102); vu_str_cat(&v_s, &_t4206); drop_Str(&_t4206); });
     #line 20538 "vuc.vu"
     VU_AT(20538);
     #line 20538 "vuc.vu"
-    ({ vu_str _t4209 = vu_str_lit("    free(ptr);\n", 15); vu_str_cat(&v_s, &_t4209); drop_Str(&_t4209); });
+    ({ vu_str _t4209 = vu_str_lit("   way. OpenSSL's error queue is per thread and other tasks on the same thread run in between, so each\n", 103); vu_str_cat(&v_s, &_t4209); drop_Str(&_t4209); });
     #line 20539 "vuc.vu"
     VU_AT(20539);
     #line 20539 "vuc.vu"
-    ({ vu_str _t4212 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4212); drop_Str(&_t4212); });
+    ({ vu_str _t4212 = vu_str_lit("   call clears it. */\n", 22); vu_str_cat(&v_s, &_t4212); drop_Str(&_t4212); });
     #line 20540 "vuc.vu"
     VU_AT(20540);
     #line 20540 "vuc.vu"
-    ({ vu_str _t4215 = vu_str_lit("VU_G pthread_mutex_t vu_tls_lock VU_GI(PTHREAD_MUTEX_INITIALIZER);\n", 67); vu_str_cat(&v_s, &_t4215); drop_Str(&_t4215); });
+    ({ vu_str _t4215 = vu_str_lit("#include <openssl/ssl.h>\n", 25); vu_str_cat(&v_s, &_t4215); drop_Str(&_t4215); });
     #line 20541 "vuc.vu"
     VU_AT(20541);
     #line 20541 "vuc.vu"
-    ({ vu_str _t4218 = vu_str_lit("static void vu_tls_init(void) {\n", 32); vu_str_cat(&v_s, &_t4218); drop_Str(&_t4218); });
+    ({ vu_str _t4218 = vu_str_lit("#include <openssl/err.h>\n", 25); vu_str_cat(&v_s, &_t4218); drop_Str(&_t4218); });
     #line 20542 "vuc.vu"
     VU_AT(20542);
     #line 20542 "vuc.vu"
-    ({ vu_str _t4221 = vu_str_lit("    /* no cleanup at exit: other task threads may still be using TLS when main returns */\n", 90); vu_str_cat(&v_s, &_t4221); drop_Str(&_t4221); });
+    ({ vu_str _t4221 = vu_str_lit("#include <openssl/x509v3.h>\n", 28); vu_str_cat(&v_s, &_t4221); drop_Str(&_t4221); });
     #line 20543 "vuc.vu"
     VU_AT(20543);
     #line 20543 "vuc.vu"
-    ({ vu_str _t4224 = vu_str_lit("    OPENSSL_init_ssl(OPENSSL_INIT_NO_ATEXIT, NULL);\n", 52); vu_str_cat(&v_s, &_t4224); drop_Str(&_t4224); });
+    ({ vu_str _t4224 = vu_str_lit("#include <arpa/inet.h>\n", 23); vu_str_cat(&v_s, &_t4224); drop_Str(&_t4224); });
     #line 20544 "vuc.vu"
     VU_AT(20544);
     #line 20544 "vuc.vu"
-    ({ vu_str _t4227 = vu_str_lit("    vu_bio_method = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, \"vu socket\");\n", 91); vu_str_cat(&v_s, &_t4227); drop_Str(&_t4227); });
+    ({ vu_str _t4227 = vu_str_lit("static int vu_tls_pending(vu_sock *s) { return s->ssl ? SSL_pending((SSL *)s->ssl) : 0; }\n", 90); vu_str_cat(&v_s, &_t4227); drop_Str(&_t4227); });
     #line 20545 "vuc.vu"
     VU_AT(20545);
     #line 20545 "vuc.vu"
-    ({ vu_str _t4230 = vu_str_lit("    BIO_meth_set_write(vu_bio_method, vu_bio_write);\n", 53); vu_str_cat(&v_s, &_t4230); drop_Str(&_t4230); });
+    ({ vu_str _t4230 = vu_str_lit("/* A socket BIO that sends with MSG_NOSIGNAL: a write to a closed connection is an error, never SIGPIPE. */\n", 108); vu_str_cat(&v_s, &_t4230); drop_Str(&_t4230); });
     #line 20546 "vuc.vu"
     VU_AT(20546);
     #line 20546 "vuc.vu"
-    ({ vu_str _t4233 = vu_str_lit("    BIO_meth_set_read(vu_bio_method, vu_bio_read);\n", 51); vu_str_cat(&v_s, &_t4233); drop_Str(&_t4233); });
+    ({ vu_str _t4233 = vu_str_lit("static int vu_bio_write(BIO *b, const char *d, int n) {\n", 56); vu_str_cat(&v_s, &_t4233); drop_Str(&_t4233); });
     #line 20547 "vuc.vu"
     VU_AT(20547);
     #line 20547 "vuc.vu"
-    ({ vu_str _t4236 = vu_str_lit("    BIO_meth_set_ctrl(vu_bio_method, vu_bio_ctrl);\n", 51); vu_str_cat(&v_s, &_t4236); drop_Str(&_t4236); });
+    ({ vu_str _t4236 = vu_str_lit("    BIO_clear_retry_flags(b);\n", 30); vu_str_cat(&v_s, &_t4236); drop_Str(&_t4236); });
     #line 20548 "vuc.vu"
     VU_AT(20548);
     #line 20548 "vuc.vu"
-    ({ vu_str _t4239 = vu_str_lit("    BIO_meth_set_create(vu_bio_method, vu_bio_create);\n", 55); vu_str_cat(&v_s, &_t4239); drop_Str(&_t4239); });
+    ({ vu_str _t4239 = vu_str_lit("    ssize_t r = send((int)(intptr_t)BIO_get_data(b), d, (size_t)n, MSG_NOSIGNAL);\n", 82); vu_str_cat(&v_s, &_t4239); drop_Str(&_t4239); });
     #line 20549 "vuc.vu"
     VU_AT(20549);
     #line 20549 "vuc.vu"
-    ({ vu_str _t4242 = vu_str_lit("    vu_alpn_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, vu_alpn_free);\n", 81); vu_str_cat(&v_s, &_t4242); drop_Str(&_t4242); });
+    ({ vu_str _t4242 = vu_str_lit("    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) BIO_set_retry_write(b);\n", 102); vu_str_cat(&v_s, &_t4242); drop_Str(&_t4242); });
     #line 20550 "vuc.vu"
     VU_AT(20550);
     #line 20550 "vuc.vu"
-    ({ vu_str _t4245 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4245); drop_Str(&_t4245); });
+    ({ vu_str _t4245 = vu_str_lit("    return (int)r;\n", 19); vu_str_cat(&v_s, &_t4245); drop_Str(&_t4245); });
     #line 20551 "vuc.vu"
     VU_AT(20551);
     #line 20551 "vuc.vu"
-    ({ vu_str _t4248 = vu_str_lit("static bool vu_tls_attach(vu_sock *s, SSL_CTX *ctx, vu_str *err) {\n", 67); vu_str_cat(&v_s, &_t4248); drop_Str(&_t4248); });
+    ({ vu_str _t4248 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4248); drop_Str(&_t4248); });
     #line 20552 "vuc.vu"
     VU_AT(20552);
     #line 20552 "vuc.vu"
-    ({ vu_str _t4251 = vu_str_lit("    pthread_once(&vu_tls_once, vu_tls_init);\n", 45); vu_str_cat(&v_s, &_t4251); drop_Str(&_t4251); });
+    ({ vu_str _t4251 = vu_str_lit("static int vu_bio_read(BIO *b, char *d, int n) {\n", 49); vu_str_cat(&v_s, &_t4251); drop_Str(&_t4251); });
     #line 20553 "vuc.vu"
     VU_AT(20553);
     #line 20553 "vuc.vu"
-    ({ vu_str _t4254 = vu_str_lit("    SSL *ssl = SSL_new(ctx);\n", 29); vu_str_cat(&v_s, &_t4254); drop_Str(&_t4254); });
+    ({ vu_str _t4254 = vu_str_lit("    BIO_clear_retry_flags(b);\n", 30); vu_str_cat(&v_s, &_t4254); drop_Str(&_t4254); });
     #line 20554 "vuc.vu"
     VU_AT(20554);
     #line 20554 "vuc.vu"
-    ({ vu_str _t4257 = vu_str_lit("    BIO *b = ssl ? BIO_new(vu_bio_method) : NULL;\n", 50); vu_str_cat(&v_s, &_t4257); drop_Str(&_t4257); });
+    ({ vu_str _t4257 = vu_str_lit("    ssize_t r = recv((int)(intptr_t)BIO_get_data(b), d, (size_t)n, 0);\n", 71); vu_str_cat(&v_s, &_t4257); drop_Str(&_t4257); });
     #line 20555 "vuc.vu"
     VU_AT(20555);
     #line 20555 "vuc.vu"
-    ({ vu_str _t4260 = vu_str_lit("    if (!b) {\n", 14); vu_str_cat(&v_s, &_t4260); drop_Str(&_t4260); });
+    ({ vu_str _t4260 = vu_str_lit("    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) BIO_set_retry_read(b);\n", 101); vu_str_cat(&v_s, &_t4260); drop_Str(&_t4260); });
     #line 20556 "vuc.vu"
     VU_AT(20556);
     #line 20556 "vuc.vu"
-    ({ vu_str _t4263 = vu_str_lit("        if (ssl) SSL_free(ssl);\n", 32); vu_str_cat(&v_s, &_t4263); drop_Str(&_t4263); });
+    ({ vu_str _t4263 = vu_str_lit("    return (int)r;\n", 19); vu_str_cat(&v_s, &_t4263); drop_Str(&_t4263); });
     #line 20557 "vuc.vu"
     VU_AT(20557);
     #line 20557 "vuc.vu"
-    ({ vu_str _t4266 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4266); drop_Str(&_t4266); });
+    ({ vu_str _t4266 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4266); drop_Str(&_t4266); });
     #line 20558 "vuc.vu"
     VU_AT(20558);
     #line 20558 "vuc.vu"
-    ({ vu_str _t4269 = vu_str_lit("        *err = vu_errf(\"can't start TLS: out of memory\");\n", 58); vu_str_cat(&v_s, &_t4269); drop_Str(&_t4269); });
+    ({ vu_str _t4269 = vu_str_lit("static long vu_bio_ctrl(BIO *b, int cmd, long num, void *ptr) {\n", 64); vu_str_cat(&v_s, &_t4269); drop_Str(&_t4269); });
     #line 20559 "vuc.vu"
     VU_AT(20559);
     #line 20559 "vuc.vu"
-    ({ vu_str _t4272 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4272); drop_Str(&_t4272); });
+    ({ vu_str _t4272 = vu_str_lit("    (void)b; (void)num; (void)ptr;\n", 35); vu_str_cat(&v_s, &_t4272); drop_Str(&_t4272); });
     #line 20560 "vuc.vu"
     VU_AT(20560);
     #line 20560 "vuc.vu"
-    ({ vu_str _t4275 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4275); drop_Str(&_t4275); });
+    ({ vu_str _t4275 = vu_str_lit("    return cmd == BIO_CTRL_FLUSH ? 1 : 0;\n", 42); vu_str_cat(&v_s, &_t4275); drop_Str(&_t4275); });
     #line 20561 "vuc.vu"
     VU_AT(20561);
     #line 20561 "vuc.vu"
-    ({ vu_str _t4278 = vu_str_lit("    BIO_set_data(b, (void *)(intptr_t)s->fd);\n", 46); vu_str_cat(&v_s, &_t4278); drop_Str(&_t4278); });
+    ({ vu_str _t4278 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4278); drop_Str(&_t4278); });
     #line 20562 "vuc.vu"
     VU_AT(20562);
     #line 20562 "vuc.vu"
-    ({ vu_str _t4281 = vu_str_lit("    SSL_set_bio(ssl, b, b);\n", 28); vu_str_cat(&v_s, &_t4281); drop_Str(&_t4281); });
+    ({ vu_str _t4281 = vu_str_lit("static int vu_bio_create(BIO *b) { BIO_set_init(b, 1); return 1; }\n", 67); vu_str_cat(&v_s, &_t4281); drop_Str(&_t4281); });
     #line 20563 "vuc.vu"
     VU_AT(20563);
     #line 20563 "vuc.vu"
-    ({ vu_str _t4284 = vu_str_lit("    s->ssl = ssl;\n", 18); vu_str_cat(&v_s, &_t4284); drop_Str(&_t4284); });
+    ({ vu_str _t4284 = vu_str_lit("VU_G BIO_METHOD *vu_bio_method;\n", 32); vu_str_cat(&v_s, &_t4284); drop_Str(&_t4284); });
     #line 20564 "vuc.vu"
     VU_AT(20564);
     #line 20564 "vuc.vu"
-    ({ vu_str _t4287 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4287); drop_Str(&_t4287); });
+    ({ vu_str _t4287 = vu_str_lit("VU_G SSL_CTX *vu_tls_system;   /* clients that trust the system's certificates share one context */\n", 100); vu_str_cat(&v_s, &_t4287); drop_Str(&_t4287); });
     #line 20565 "vuc.vu"
     VU_AT(20565);
     #line 20565 "vuc.vu"
-    ({ vu_str _t4290 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4290); drop_Str(&_t4290); });
+    ({ vu_str _t4290 = vu_str_lit("VU_G pthread_once_t vu_tls_once VU_GI(PTHREAD_ONCE_INIT);\n", 58); vu_str_cat(&v_s, &_t4290); drop_Str(&_t4290); });
     #line 20566 "vuc.vu"
     VU_AT(20566);
     #line 20566 "vuc.vu"
-    ({ vu_str _t4293 = vu_str_lit("static void vu_tls_free(vu_sock *s) {\n", 38); vu_str_cat(&v_s, &_t4293); drop_Str(&_t4293); });
+    ({ vu_str _t4293 = vu_str_lit("VU_G int vu_alpn_index VU_GI(-1);   /* a context's ALPN list (ex_data), freed with the context */\n", 98); vu_str_cat(&v_s, &_t4293); drop_Str(&_t4293); });
     #line 20567 "vuc.vu"
     VU_AT(20567);
     #line 20567 "vuc.vu"
-    ({ vu_str _t4296 = vu_str_lit("    if (s->ssl) {\n", 18); vu_str_cat(&v_s, &_t4296); drop_Str(&_t4296); });
+    ({ vu_str _t4296 = vu_str_lit("static void vu_alpn_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp) {\n", 104); vu_str_cat(&v_s, &_t4296); drop_Str(&_t4296); });
     #line 20568 "vuc.vu"
     VU_AT(20568);
     #line 20568 "vuc.vu"
-    ({ vu_str _t4299 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4299); drop_Str(&_t4299); });
+    ({ vu_str _t4299 = vu_str_lit("    (void)parent; (void)ad; (void)idx; (void)argl; (void)argp;\n", 63); vu_str_cat(&v_s, &_t4299); drop_Str(&_t4299); });
     #line 20569 "vuc.vu"
     VU_AT(20569);
     #line 20569 "vuc.vu"
-    ({ vu_str _t4302 = vu_str_lit("        if (s->hs) SSL_shutdown((SSL *)s->ssl);   /* one try at close_notify; the socket closes either way */\n", 110); vu_str_cat(&v_s, &_t4302); drop_Str(&_t4302); });
+    ({ vu_str _t4302 = vu_str_lit("    free(ptr);\n", 15); vu_str_cat(&v_s, &_t4302); drop_Str(&_t4302); });
     #line 20570 "vuc.vu"
     VU_AT(20570);
     #line 20570 "vuc.vu"
-    ({ vu_str _t4305 = vu_str_lit("        SSL_free((SSL *)s->ssl);\n", 33); vu_str_cat(&v_s, &_t4305); drop_Str(&_t4305); });
+    ({ vu_str _t4305 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4305); drop_Str(&_t4305); });
     #line 20571 "vuc.vu"
     VU_AT(20571);
     #line 20571 "vuc.vu"
-    ({ vu_str _t4308 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4308); drop_Str(&_t4308); });
+    ({ vu_str _t4308 = vu_str_lit("VU_G pthread_mutex_t vu_tls_lock VU_GI(PTHREAD_MUTEX_INITIALIZER);\n", 67); vu_str_cat(&v_s, &_t4308); drop_Str(&_t4308); });
     #line 20572 "vuc.vu"
     VU_AT(20572);
     #line 20572 "vuc.vu"
-    ({ vu_str _t4311 = vu_str_lit("    if (s->tls_ctx) SSL_CTX_free((SSL_CTX *)s->tls_ctx);\n", 57); vu_str_cat(&v_s, &_t4311); drop_Str(&_t4311); });
+    ({ vu_str _t4311 = vu_str_lit("static void vu_tls_init(void) {\n", 32); vu_str_cat(&v_s, &_t4311); drop_Str(&_t4311); });
     #line 20573 "vuc.vu"
     VU_AT(20573);
     #line 20573 "vuc.vu"
-    ({ vu_str _t4314 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t4314); drop_Str(&_t4314); });
+    ({ vu_str _t4314 = vu_str_lit("    /* no cleanup at exit: other task threads may still be using TLS when main returns */\n", 90); vu_str_cat(&v_s, &_t4314); drop_Str(&_t4314); });
     #line 20574 "vuc.vu"
     VU_AT(20574);
     #line 20574 "vuc.vu"
-    ({ vu_str _t4317 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4317); drop_Str(&_t4317); });
+    ({ vu_str _t4317 = vu_str_lit("    OPENSSL_init_ssl(OPENSSL_INIT_NO_ATEXIT, NULL);\n", 52); vu_str_cat(&v_s, &_t4317); drop_Str(&_t4317); });
     #line 20575 "vuc.vu"
     VU_AT(20575);
     #line 20575 "vuc.vu"
-    ({ vu_str _t4320 = vu_str_lit("static SSL_CTX *vu_tls_ctx(bool server) {\n", 42); vu_str_cat(&v_s, &_t4320); drop_Str(&_t4320); });
+    ({ vu_str _t4320 = vu_str_lit("    vu_bio_method = BIO_meth_new(BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, \"vu socket\");\n", 91); vu_str_cat(&v_s, &_t4320); drop_Str(&_t4320); });
     #line 20576 "vuc.vu"
     VU_AT(20576);
     #line 20576 "vuc.vu"
-    ({ vu_str _t4323 = vu_str_lit("    pthread_once(&vu_tls_once, vu_tls_init);\n", 45); vu_str_cat(&v_s, &_t4323); drop_Str(&_t4323); });
+    ({ vu_str _t4323 = vu_str_lit("    BIO_meth_set_write(vu_bio_method, vu_bio_write);\n", 53); vu_str_cat(&v_s, &_t4323); drop_Str(&_t4323); });
     #line 20577 "vuc.vu"
     VU_AT(20577);
     #line 20577 "vuc.vu"
-    ({ vu_str _t4326 = vu_str_lit("    SSL_CTX *ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());\n", 84); vu_str_cat(&v_s, &_t4326); drop_Str(&_t4326); });
+    ({ vu_str _t4326 = vu_str_lit("    BIO_meth_set_read(vu_bio_method, vu_bio_read);\n", 51); vu_str_cat(&v_s, &_t4326); drop_Str(&_t4326); });
     #line 20578 "vuc.vu"
     VU_AT(20578);
     #line 20578 "vuc.vu"
-    ({ vu_str _t4329 = vu_str_lit("    if (!ctx) vu_oom();\n", 24); vu_str_cat(&v_s, &_t4329); drop_Str(&_t4329); });
+    ({ vu_str _t4329 = vu_str_lit("    BIO_meth_set_ctrl(vu_bio_method, vu_bio_ctrl);\n", 51); vu_str_cat(&v_s, &_t4329); drop_Str(&_t4329); });
     #line 20579 "vuc.vu"
     VU_AT(20579);
     #line 20579 "vuc.vu"
-    ({ vu_str _t4332 = vu_str_lit("    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);\n", 56); vu_str_cat(&v_s, &_t4332); drop_Str(&_t4332); });
+    ({ vu_str _t4332 = vu_str_lit("    BIO_meth_set_create(vu_bio_method, vu_bio_create);\n", 55); vu_str_cat(&v_s, &_t4332); drop_Str(&_t4332); });
     #line 20580 "vuc.vu"
     VU_AT(20580);
     #line 20580 "vuc.vu"
-    ({ vu_str _t4335 = vu_str_lit("    /* A peer that closes without close_notify reads as a close, as with plain TCP. Idle connections\n", 101); vu_str_cat(&v_s, &_t4335); drop_Str(&_t4335); });
+    ({ vu_str _t4335 = vu_str_lit("    vu_alpn_index = SSL_CTX_get_ex_new_index(0, NULL, NULL, NULL, vu_alpn_free);\n", 81); vu_str_cat(&v_s, &_t4335); drop_Str(&_t4335); });
     #line 20581 "vuc.vu"
     VU_AT(20581);
     #line 20581 "vuc.vu"
-    ({ vu_str _t4338 = vu_str_lit("       give their buffers back (RELEASE_BUFFERS): 26 KB each instead of 37, at no measured cost. */\n", 100); vu_str_cat(&v_s, &_t4338); drop_Str(&_t4338); });
+    ({ vu_str _t4338 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4338); drop_Str(&_t4338); });
     #line 20582 "vuc.vu"
     VU_AT(20582);
     #line 20582 "vuc.vu"
-    ({ vu_str _t4341 = vu_str_lit("    SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);\n", 60); vu_str_cat(&v_s, &_t4341); drop_Str(&_t4341); });
+    ({ vu_str _t4341 = vu_str_lit("static bool vu_tls_attach(vu_sock *s, SSL_CTX *ctx, vu_str *err) {\n", 67); vu_str_cat(&v_s, &_t4341); drop_Str(&_t4341); });
     #line 20583 "vuc.vu"
     VU_AT(20583);
     #line 20583 "vuc.vu"
-    ({ vu_str _t4344 = vu_str_lit("    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_RELEASE_BUFFERS);\n", 123); vu_str_cat(&v_s, &_t4344); drop_Str(&_t4344); });
+    ({ vu_str _t4344 = vu_str_lit("    pthread_once(&vu_tls_once, vu_tls_init);\n", 45); vu_str_cat(&v_s, &_t4344); drop_Str(&_t4344); });
     #line 20584 "vuc.vu"
     VU_AT(20584);
     #line 20584 "vuc.vu"
-    ({ vu_str _t4347 = vu_str_lit("    if (!server) SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);\n", 65); vu_str_cat(&v_s, &_t4347); drop_Str(&_t4347); });
+    ({ vu_str _t4347 = vu_str_lit("    SSL *ssl = SSL_new(ctx);\n", 29); vu_str_cat(&v_s, &_t4347); drop_Str(&_t4347); });
     #line 20585 "vuc.vu"
     VU_AT(20585);
     #line 20585 "vuc.vu"
-    ({ vu_str _t4350 = vu_str_lit("    return ctx;\n", 16); vu_str_cat(&v_s, &_t4350); drop_Str(&_t4350); });
+    ({ vu_str _t4350 = vu_str_lit("    BIO *b = ssl ? BIO_new(vu_bio_method) : NULL;\n", 50); vu_str_cat(&v_s, &_t4350); drop_Str(&_t4350); });
     #line 20586 "vuc.vu"
     VU_AT(20586);
     #line 20586 "vuc.vu"
-    ({ vu_str _t4353 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4353); drop_Str(&_t4353); });
+    ({ vu_str _t4353 = vu_str_lit("    if (!b) {\n", 14); vu_str_cat(&v_s, &_t4353); drop_Str(&_t4353); });
     #line 20587 "vuc.vu"
     VU_AT(20587);
     #line 20587 "vuc.vu"
-    ({ vu_str _t4356 = vu_str_lit("static int vu_no_password(char *b, int n, int rw, void *u) { (void)b; (void)n; (void)rw; (void)u; return 0; }\n", 110); vu_str_cat(&v_s, &_t4356); drop_Str(&_t4356); });
+    ({ vu_str _t4356 = vu_str_lit("        if (ssl) SSL_free(ssl);\n", 32); vu_str_cat(&v_s, &_t4356); drop_Str(&_t4356); });
     #line 20588 "vuc.vu"
     VU_AT(20588);
     #line 20588 "vuc.vu"
-    ({ vu_str _t4359 = vu_str_lit("static BIO *vu_pem_bio(const vu_str *pem) {\n", 44); vu_str_cat(&v_s, &_t4359); drop_Str(&_t4359); });
+    ({ vu_str _t4359 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4359); drop_Str(&_t4359); });
     #line 20589 "vuc.vu"
     VU_AT(20589);
     #line 20589 "vuc.vu"
-    ({ vu_str _t4362 = vu_str_lit("    return BIO_new_mem_buf(pem->data ? (const void *)pem->data : (const void *)\"\", (int)pem->len);\n", 99); vu_str_cat(&v_s, &_t4362); drop_Str(&_t4362); });
+    ({ vu_str _t4362 = vu_str_lit("        *err = vu_errf(\"can't start TLS: out of memory\");\n", 58); vu_str_cat(&v_s, &_t4362); drop_Str(&_t4362); });
     #line 20590 "vuc.vu"
     VU_AT(20590);
     #line 20590 "vuc.vu"
-    ({ vu_str _t4365 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4365); drop_Str(&_t4365); });
+    ({ vu_str _t4365 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4365); drop_Str(&_t4365); });
     #line 20591 "vuc.vu"
     VU_AT(20591);
     #line 20591 "vuc.vu"
-    ({ vu_str _t4368 = vu_str_lit("/* What OpenSSL says went wrong, as words (\"certificate verify failed\"), or fallback. */\n", 89); vu_str_cat(&v_s, &_t4368); drop_Str(&_t4368); });
+    ({ vu_str _t4368 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4368); drop_Str(&_t4368); });
     #line 20592 "vuc.vu"
     VU_AT(20592);
     #line 20592 "vuc.vu"
-    ({ vu_str _t4371 = vu_str_lit("static const char *vu_tls_reason(const char *fallback) {\n", 57); vu_str_cat(&v_s, &_t4371); drop_Str(&_t4371); });
+    ({ vu_str _t4371 = vu_str_lit("    BIO_set_data(b, (void *)(intptr_t)s->fd);\n", 46); vu_str_cat(&v_s, &_t4371); drop_Str(&_t4371); });
     #line 20593 "vuc.vu"
     VU_AT(20593);
     #line 20593 "vuc.vu"
-    ({ vu_str _t4374 = vu_str_lit("    unsigned long e = ERR_peek_last_error();\n", 45); vu_str_cat(&v_s, &_t4374); drop_Str(&_t4374); });
+    ({ vu_str _t4374 = vu_str_lit("    SSL_set_bio(ssl, b, b);\n", 28); vu_str_cat(&v_s, &_t4374); drop_Str(&_t4374); });
     #line 20594 "vuc.vu"
     VU_AT(20594);
     #line 20594 "vuc.vu"
-    ({ vu_str _t4377 = vu_str_lit("    const char *r = e ? ERR_reason_error_string(e) : NULL;\n", 59); vu_str_cat(&v_s, &_t4377); drop_Str(&_t4377); });
+    ({ vu_str _t4377 = vu_str_lit("    s->ssl = ssl;\n", 18); vu_str_cat(&v_s, &_t4377); drop_Str(&_t4377); });
     #line 20595 "vuc.vu"
     VU_AT(20595);
     #line 20595 "vuc.vu"
-    ({ vu_str _t4380 = vu_str_lit("    return r ? r : fallback;\n", 29); vu_str_cat(&v_s, &_t4380); drop_Str(&_t4380); });
+    ({ vu_str _t4380 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4380); drop_Str(&_t4380); });
     #line 20596 "vuc.vu"
     VU_AT(20596);
     #line 20596 "vuc.vu"
@@ -127770,123 +127770,123 @@ VU_FN vu_str fn_rt_tasks(void) {
     #line 20597 "vuc.vu"
     VU_AT(20597);
     #line 20597 "vuc.vu"
-    ({ vu_str _t4386 = vu_str_lit("/* After an SSL call returned r <= 0: 1 when it should be tried again (it waited for the socket),\n", 98); vu_str_cat(&v_s, &_t4386); drop_Str(&_t4386); });
+    ({ vu_str _t4386 = vu_str_lit("static void vu_tls_free(vu_sock *s) {\n", 38); vu_str_cat(&v_s, &_t4386); drop_Str(&_t4386); });
     #line 20598 "vuc.vu"
     VU_AT(20598);
     #line 20598 "vuc.vu"
-    ({ vu_str _t4389 = vu_str_lit("   -1 when the deadline passed, 0 on an error (*kind is SSL_get_error's answer). */\n", 84); vu_str_cat(&v_s, &_t4389); drop_Str(&_t4389); });
+    ({ vu_str _t4389 = vu_str_lit("    if (s->ssl) {\n", 18); vu_str_cat(&v_s, &_t4389); drop_Str(&_t4389); });
     #line 20599 "vuc.vu"
     VU_AT(20599);
     #line 20599 "vuc.vu"
-    ({ vu_str _t4392 = vu_str_lit("static int vu_tls_again(vu_sock *s, int r, int64_t deadline, int line, int *kind) {\n", 84); vu_str_cat(&v_s, &_t4392); drop_Str(&_t4392); });
+    ({ vu_str _t4392 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4392); drop_Str(&_t4392); });
     #line 20600 "vuc.vu"
     VU_AT(20600);
     #line 20600 "vuc.vu"
-    ({ vu_str _t4395 = vu_str_lit("    int k = SSL_get_error((SSL *)s->ssl, r);\n", 45); vu_str_cat(&v_s, &_t4395); drop_Str(&_t4395); });
+    ({ vu_str _t4395 = vu_str_lit("        if (s->hs) SSL_shutdown((SSL *)s->ssl);   /* one try at close_notify; the socket closes either way */\n", 110); vu_str_cat(&v_s, &_t4395); drop_Str(&_t4395); });
     #line 20601 "vuc.vu"
     VU_AT(20601);
     #line 20601 "vuc.vu"
-    ({ vu_str _t4398 = vu_str_lit("    *kind = k;\n", 15); vu_str_cat(&v_s, &_t4398); drop_Str(&_t4398); });
+    ({ vu_str _t4398 = vu_str_lit("        SSL_free((SSL *)s->ssl);\n", 33); vu_str_cat(&v_s, &_t4398); drop_Str(&_t4398); });
     #line 20602 "vuc.vu"
     VU_AT(20602);
     #line 20602 "vuc.vu"
-    ({ vu_str _t4401 = vu_str_lit("    if (k != SSL_ERROR_WANT_READ && k != SSL_ERROR_WANT_WRITE) return 0;\n", 73); vu_str_cat(&v_s, &_t4401); drop_Str(&_t4401); });
+    ({ vu_str _t4401 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4401); drop_Str(&_t4401); });
     #line 20603 "vuc.vu"
     VU_AT(20603);
     #line 20603 "vuc.vu"
-    ({ vu_str _t4404 = vu_str_lit("    if (deadline >= 0 && vu_now_ns() >= deadline) return -1;\n", 61); vu_str_cat(&v_s, &_t4404); drop_Str(&_t4404); });
+    ({ vu_str _t4404 = vu_str_lit("    if (s->tls_ctx) SSL_CTX_free((SSL_CTX *)s->tls_ctx);\n", 57); vu_str_cat(&v_s, &_t4404); drop_Str(&_t4404); });
     #line 20604 "vuc.vu"
     VU_AT(20604);
     #line 20604 "vuc.vu"
-    ({ vu_str _t4407 = vu_str_lit("    if (!vu_wait_fd(s, k == SSL_ERROR_WANT_WRITE, deadline, line)) return -1;\n", 78); vu_str_cat(&v_s, &_t4407); drop_Str(&_t4407); });
+    ({ vu_str _t4407 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t4407); drop_Str(&_t4407); });
     #line 20605 "vuc.vu"
     VU_AT(20605);
     #line 20605 "vuc.vu"
-    ({ vu_str _t4410 = vu_str_lit("    return 1;\n", 14); vu_str_cat(&v_s, &_t4410); drop_Str(&_t4410); });
+    ({ vu_str _t4410 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4410); drop_Str(&_t4410); });
     #line 20606 "vuc.vu"
     VU_AT(20606);
     #line 20606 "vuc.vu"
-    ({ vu_str _t4413 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4413); drop_Str(&_t4413); });
+    ({ vu_str _t4413 = vu_str_lit("static SSL_CTX *vu_tls_ctx(bool server) {\n", 42); vu_str_cat(&v_s, &_t4413); drop_Str(&_t4413); });
     #line 20607 "vuc.vu"
     VU_AT(20607);
     #line 20607 "vuc.vu"
-    ({ vu_str _t4416 = vu_str_lit("/* Runs the handshake if it hasn't happened yet (a server's connections do it on first use). */\n", 96); vu_str_cat(&v_s, &_t4416); drop_Str(&_t4416); });
+    ({ vu_str _t4416 = vu_str_lit("    pthread_once(&vu_tls_once, vu_tls_init);\n", 45); vu_str_cat(&v_s, &_t4416); drop_Str(&_t4416); });
     #line 20608 "vuc.vu"
     VU_AT(20608);
     #line 20608 "vuc.vu"
-    ({ vu_str _t4419 = vu_str_lit("static bool vu_tls_handshake(vu_sock *s, int64_t deadline, vu_str *err, int line) {\n", 84); vu_str_cat(&v_s, &_t4419); drop_Str(&_t4419); });
+    ({ vu_str _t4419 = vu_str_lit("    SSL_CTX *ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());\n", 84); vu_str_cat(&v_s, &_t4419); drop_Str(&_t4419); });
     #line 20609 "vuc.vu"
     VU_AT(20609);
     #line 20609 "vuc.vu"
-    ({ vu_str _t4422 = vu_str_lit("    while (!s->hs) {\n", 21); vu_str_cat(&v_s, &_t4422); drop_Str(&_t4422); });
+    ({ vu_str _t4422 = vu_str_lit("    if (!ctx) vu_oom();\n", 24); vu_str_cat(&v_s, &_t4422); drop_Str(&_t4422); });
     #line 20610 "vuc.vu"
     VU_AT(20610);
     #line 20610 "vuc.vu"
-    ({ vu_str _t4425 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4425); drop_Str(&_t4425); });
+    ({ vu_str _t4425 = vu_str_lit("    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);\n", 56); vu_str_cat(&v_s, &_t4425); drop_Str(&_t4425); });
     #line 20611 "vuc.vu"
     VU_AT(20611);
     #line 20611 "vuc.vu"
-    ({ vu_str _t4428 = vu_str_lit("        int r = SSL_do_handshake((SSL *)s->ssl);\n", 49); vu_str_cat(&v_s, &_t4428); drop_Str(&_t4428); });
+    ({ vu_str _t4428 = vu_str_lit("    /* A peer that closes without close_notify reads as a close, as with plain TCP. Idle connections\n", 101); vu_str_cat(&v_s, &_t4428); drop_Str(&_t4428); });
     #line 20612 "vuc.vu"
     VU_AT(20612);
     #line 20612 "vuc.vu"
-    ({ vu_str _t4431 = vu_str_lit("        if (r == 1) { s->hs = true; break; }\n", 45); vu_str_cat(&v_s, &_t4431); drop_Str(&_t4431); });
+    ({ vu_str _t4431 = vu_str_lit("       give their buffers back (RELEASE_BUFFERS): 26 KB each instead of 37, at no measured cost. */\n", 100); vu_str_cat(&v_s, &_t4431); drop_Str(&_t4431); });
     #line 20613 "vuc.vu"
     VU_AT(20613);
     #line 20613 "vuc.vu"
-    ({ vu_str _t4434 = vu_str_lit("        int k, a = vu_tls_again(s, r, deadline, line, &k);\n", 59); vu_str_cat(&v_s, &_t4434); drop_Str(&_t4434); });
+    ({ vu_str _t4434 = vu_str_lit("    SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF);\n", 60); vu_str_cat(&v_s, &_t4434); drop_Str(&_t4434); });
     #line 20614 "vuc.vu"
     VU_AT(20614);
     #line 20614 "vuc.vu"
-    ({ vu_str _t4437 = vu_str_lit("        if (a > 0) continue;\n", 29); vu_str_cat(&v_s, &_t4437); drop_Str(&_t4437); });
+    ({ vu_str _t4437 = vu_str_lit("    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_RELEASE_BUFFERS);\n", 123); vu_str_cat(&v_s, &_t4437); drop_Str(&_t4437); });
     #line 20615 "vuc.vu"
     VU_AT(20615);
     #line 20615 "vuc.vu"
-    ({ vu_str _t4440 = vu_str_lit("        if (a < 0) { *err = vu_errf(\"timed out\"); return false; }\n", 66); vu_str_cat(&v_s, &_t4440); drop_Str(&_t4440); });
+    ({ vu_str _t4440 = vu_str_lit("    if (!server) SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);\n", 65); vu_str_cat(&v_s, &_t4440); drop_Str(&_t4440); });
     #line 20616 "vuc.vu"
     VU_AT(20616);
     #line 20616 "vuc.vu"
-    ({ vu_str _t4443 = vu_str_lit("        long v = SSL_get_verify_result((SSL *)s->ssl);\n", 55); vu_str_cat(&v_s, &_t4443); drop_Str(&_t4443); });
+    ({ vu_str _t4443 = vu_str_lit("    return ctx;\n", 16); vu_str_cat(&v_s, &_t4443); drop_Str(&_t4443); });
     #line 20617 "vuc.vu"
     VU_AT(20617);
     #line 20617 "vuc.vu"
-    ({ vu_str _t4446 = vu_str_lit("        if (v != X509_V_OK && !SSL_is_server((SSL *)s->ssl))\n", 61); vu_str_cat(&v_s, &_t4446); drop_Str(&_t4446); });
+    ({ vu_str _t4446 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4446); drop_Str(&_t4446); });
     #line 20618 "vuc.vu"
     VU_AT(20618);
     #line 20618 "vuc.vu"
-    ({ vu_str _t4449 = vu_str_lit("            *err = vu_errf(\"can't verify the server's certificate: %s\", X509_verify_cert_error_string(v));\n", 107); vu_str_cat(&v_s, &_t4449); drop_Str(&_t4449); });
+    ({ vu_str _t4449 = vu_str_lit("static int vu_no_password(char *b, int n, int rw, void *u) { (void)b; (void)n; (void)rw; (void)u; return 0; }\n", 110); vu_str_cat(&v_s, &_t4449); drop_Str(&_t4449); });
     #line 20619 "vuc.vu"
     VU_AT(20619);
     #line 20619 "vuc.vu"
-    ({ vu_str _t4452 = vu_str_lit("        else if (k == SSL_ERROR_SYSCALL || k == SSL_ERROR_ZERO_RETURN)\n", 71); vu_str_cat(&v_s, &_t4452); drop_Str(&_t4452); });
+    ({ vu_str _t4452 = vu_str_lit("static BIO *vu_pem_bio(const vu_str *pem) {\n", 44); vu_str_cat(&v_s, &_t4452); drop_Str(&_t4452); });
     #line 20620 "vuc.vu"
     VU_AT(20620);
     #line 20620 "vuc.vu"
-    ({ vu_str _t4455 = vu_str_lit("            *err = vu_errf(\"the TLS handshake failed: the connection closed\");\n", 79); vu_str_cat(&v_s, &_t4455); drop_Str(&_t4455); });
+    ({ vu_str _t4455 = vu_str_lit("    return BIO_new_mem_buf(pem->data ? (const void *)pem->data : (const void *)\"\", (int)pem->len);\n", 99); vu_str_cat(&v_s, &_t4455); drop_Str(&_t4455); });
     #line 20621 "vuc.vu"
     VU_AT(20621);
     #line 20621 "vuc.vu"
-    ({ vu_str _t4458 = vu_str_lit("        else\n", 13); vu_str_cat(&v_s, &_t4458); drop_Str(&_t4458); });
+    ({ vu_str _t4458 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4458); drop_Str(&_t4458); });
     #line 20622 "vuc.vu"
     VU_AT(20622);
     #line 20622 "vuc.vu"
-    ({ vu_str _t4461 = vu_str_lit("            *err = vu_errf(\"the TLS handshake failed: %s\", vu_tls_reason(\"unknown error\"));\n", 92); vu_str_cat(&v_s, &_t4461); drop_Str(&_t4461); });
+    ({ vu_str _t4461 = vu_str_lit("/* What OpenSSL says went wrong, as words (\"certificate verify failed\"), or fallback. */\n", 89); vu_str_cat(&v_s, &_t4461); drop_Str(&_t4461); });
     #line 20623 "vuc.vu"
     VU_AT(20623);
     #line 20623 "vuc.vu"
-    ({ vu_str _t4464 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4464); drop_Str(&_t4464); });
+    ({ vu_str _t4464 = vu_str_lit("static const char *vu_tls_reason(const char *fallback) {\n", 57); vu_str_cat(&v_s, &_t4464); drop_Str(&_t4464); });
     #line 20624 "vuc.vu"
     VU_AT(20624);
     #line 20624 "vuc.vu"
-    ({ vu_str _t4467 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4467); drop_Str(&_t4467); });
+    ({ vu_str _t4467 = vu_str_lit("    unsigned long e = ERR_peek_last_error();\n", 45); vu_str_cat(&v_s, &_t4467); drop_Str(&_t4467); });
     #line 20625 "vuc.vu"
     VU_AT(20625);
     #line 20625 "vuc.vu"
-    ({ vu_str _t4470 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4470); drop_Str(&_t4470); });
+    ({ vu_str _t4470 = vu_str_lit("    const char *r = e ? ERR_reason_error_string(e) : NULL;\n", 59); vu_str_cat(&v_s, &_t4470); drop_Str(&_t4470); });
     #line 20626 "vuc.vu"
     VU_AT(20626);
     #line 20626 "vuc.vu"
-    ({ vu_str _t4473 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4473); drop_Str(&_t4473); });
+    ({ vu_str _t4473 = vu_str_lit("    return r ? r : fallback;\n", 29); vu_str_cat(&v_s, &_t4473); drop_Str(&_t4473); });
     #line 20627 "vuc.vu"
     VU_AT(20627);
     #line 20627 "vuc.vu"
@@ -127894,1247 +127894,1247 @@ VU_FN vu_str fn_rt_tasks(void) {
     #line 20628 "vuc.vu"
     VU_AT(20628);
     #line 20628 "vuc.vu"
-    ({ vu_str _t4479 = vu_str_lit("static bool vu_tls_accepted(vu_sock *l, vu_sock *s, vu_str *err) {\n", 67); vu_str_cat(&v_s, &_t4479); drop_Str(&_t4479); });
+    ({ vu_str _t4479 = vu_str_lit("/* After an SSL call returned r <= 0: 1 when it should be tried again (it waited for the socket),\n", 98); vu_str_cat(&v_s, &_t4479); drop_Str(&_t4479); });
     #line 20629 "vuc.vu"
     VU_AT(20629);
     #line 20629 "vuc.vu"
-    ({ vu_str _t4482 = vu_str_lit("    if (!vu_tls_attach(s, (SSL_CTX *)l->tls_ctx, err)) return false;\n", 69); vu_str_cat(&v_s, &_t4482); drop_Str(&_t4482); });
+    ({ vu_str _t4482 = vu_str_lit("   -1 when the deadline passed, 0 on an error (*kind is SSL_get_error's answer). */\n", 84); vu_str_cat(&v_s, &_t4482); drop_Str(&_t4482); });
     #line 20630 "vuc.vu"
     VU_AT(20630);
     #line 20630 "vuc.vu"
-    ({ vu_str _t4485 = vu_str_lit("    SSL_set_accept_state((SSL *)s->ssl);\n", 41); vu_str_cat(&v_s, &_t4485); drop_Str(&_t4485); });
+    ({ vu_str _t4485 = vu_str_lit("static int vu_tls_again(vu_sock *s, int r, int64_t deadline, int line, int *kind) {\n", 84); vu_str_cat(&v_s, &_t4485); drop_Str(&_t4485); });
     #line 20631 "vuc.vu"
     VU_AT(20631);
     #line 20631 "vuc.vu"
-    ({ vu_str _t4488 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4488); drop_Str(&_t4488); });
+    ({ vu_str _t4488 = vu_str_lit("    int k = SSL_get_error((SSL *)s->ssl, r);\n", 45); vu_str_cat(&v_s, &_t4488); drop_Str(&_t4488); });
     #line 20632 "vuc.vu"
     VU_AT(20632);
     #line 20632 "vuc.vu"
-    ({ vu_str _t4491 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4491); drop_Str(&_t4491); });
+    ({ vu_str _t4491 = vu_str_lit("    *kind = k;\n", 15); vu_str_cat(&v_s, &_t4491); drop_Str(&_t4491); });
     #line 20633 "vuc.vu"
     VU_AT(20633);
     #line 20633 "vuc.vu"
-    ({ vu_str _t4494 = vu_str_lit("static bool vu_tls_recv(vu_sock *c, int64_t deadline, vu_str *out, vu_str *err, int line) {\n", 92); vu_str_cat(&v_s, &_t4494); drop_Str(&_t4494); });
+    ({ vu_str _t4494 = vu_str_lit("    if (k != SSL_ERROR_WANT_READ && k != SSL_ERROR_WANT_WRITE) return 0;\n", 73); vu_str_cat(&v_s, &_t4494); drop_Str(&_t4494); });
     #line 20634 "vuc.vu"
     VU_AT(20634);
     #line 20634 "vuc.vu"
-    ({ vu_str _t4497 = vu_str_lit("    if (!vu_tls_handshake(c, deadline, err, line)) return false;\n", 65); vu_str_cat(&v_s, &_t4497); drop_Str(&_t4497); });
+    ({ vu_str _t4497 = vu_str_lit("    if (deadline >= 0 && vu_now_ns() >= deadline) return -1;\n", 61); vu_str_cat(&v_s, &_t4497); drop_Str(&_t4497); });
     #line 20635 "vuc.vu"
     VU_AT(20635);
     #line 20635 "vuc.vu"
-    ({ vu_str _t4500 = vu_str_lit("    vu_str s = {0};\n", 20); vu_str_cat(&v_s, &_t4500); drop_Str(&_t4500); });
+    ({ vu_str _t4500 = vu_str_lit("    if (!vu_wait_fd(s, k == SSL_ERROR_WANT_WRITE, deadline, line)) return -1;\n", 78); vu_str_cat(&v_s, &_t4500); drop_Str(&_t4500); });
     #line 20636 "vuc.vu"
     VU_AT(20636);
     #line 20636 "vuc.vu"
-    ({ vu_str _t4503 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t4503); drop_Str(&_t4503); });
+    ({ vu_str _t4503 = vu_str_lit("    return 1;\n", 14); vu_str_cat(&v_s, &_t4503); drop_Str(&_t4503); });
     #line 20637 "vuc.vu"
     VU_AT(20637);
     #line 20637 "vuc.vu"
-    ({ vu_str _t4506 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4506); drop_Str(&_t4506); });
+    ({ vu_str _t4506 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4506); drop_Str(&_t4506); });
     #line 20638 "vuc.vu"
     VU_AT(20638);
     #line 20638 "vuc.vu"
-    ({ vu_str _t4509 = vu_str_lit("        int n = SSL_read((SSL *)c->ssl, vu_iobuf, (int)sizeof vu_iobuf);\n", 73); vu_str_cat(&v_s, &_t4509); drop_Str(&_t4509); });
+    ({ vu_str _t4509 = vu_str_lit("/* Runs the handshake if it hasn't happened yet (a server's connections do it on first use). */\n", 96); vu_str_cat(&v_s, &_t4509); drop_Str(&_t4509); });
     #line 20639 "vuc.vu"
     VU_AT(20639);
     #line 20639 "vuc.vu"
-    ({ vu_str _t4512 = vu_str_lit("        if (n > 0) {\n", 21); vu_str_cat(&v_s, &_t4512); drop_Str(&_t4512); });
+    ({ vu_str _t4512 = vu_str_lit("static bool vu_tls_handshake(vu_sock *s, int64_t deadline, vu_str *err, int line) {\n", 84); vu_str_cat(&v_s, &_t4512); drop_Str(&_t4512); });
     #line 20640 "vuc.vu"
     VU_AT(20640);
     #line 20640 "vuc.vu"
-    ({ vu_str _t4515 = vu_str_lit("            vu_str_cat_bytes(&s, vu_iobuf, (int64_t)n);\n", 56); vu_str_cat(&v_s, &_t4515); drop_Str(&_t4515); });
+    ({ vu_str _t4515 = vu_str_lit("    while (!s->hs) {\n", 21); vu_str_cat(&v_s, &_t4515); drop_Str(&_t4515); });
     #line 20641 "vuc.vu"
     VU_AT(20641);
     #line 20641 "vuc.vu"
-    ({ vu_str _t4518 = vu_str_lit("            /* Stop after a short record with nothing left decrypted: reading on would only find the\n", 101); vu_str_cat(&v_s, &_t4518); drop_Str(&_t4518); });
+    ({ vu_str _t4518 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4518); drop_Str(&_t4518); });
     #line 20642 "vuc.vu"
     VU_AT(20642);
     #line 20642 "vuc.vu"
-    ({ vu_str _t4521 = vu_str_lit("               socket empty (one wasted syscall per request). Full records usually have more behind them. */\n", 109); vu_str_cat(&v_s, &_t4521); drop_Str(&_t4521); });
+    ({ vu_str _t4521 = vu_str_lit("        int r = SSL_do_handshake((SSL *)s->ssl);\n", 49); vu_str_cat(&v_s, &_t4521); drop_Str(&_t4521); });
     #line 20643 "vuc.vu"
     VU_AT(20643);
     #line 20643 "vuc.vu"
-    ({ vu_str _t4524 = vu_str_lit("            if (s.len >= (1 << 20) || (n < 16384 && SSL_pending((SSL *)c->ssl) == 0)) break;\n", 93); vu_str_cat(&v_s, &_t4524); drop_Str(&_t4524); });
+    ({ vu_str _t4524 = vu_str_lit("        if (r == 1) { s->hs = true; break; }\n", 45); vu_str_cat(&v_s, &_t4524); drop_Str(&_t4524); });
     #line 20644 "vuc.vu"
     VU_AT(20644);
     #line 20644 "vuc.vu"
-    ({ vu_str _t4527 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t4527); drop_Str(&_t4527); });
+    ({ vu_str _t4527 = vu_str_lit("        int k, a = vu_tls_again(s, r, deadline, line, &k);\n", 59); vu_str_cat(&v_s, &_t4527); drop_Str(&_t4527); });
     #line 20645 "vuc.vu"
     VU_AT(20645);
     #line 20645 "vuc.vu"
-    ({ vu_str _t4530 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t4530); drop_Str(&_t4530); });
+    ({ vu_str _t4530 = vu_str_lit("        if (a > 0) continue;\n", 29); vu_str_cat(&v_s, &_t4530); drop_Str(&_t4530); });
     #line 20646 "vuc.vu"
     VU_AT(20646);
     #line 20646 "vuc.vu"
-    ({ vu_str _t4533 = vu_str_lit("        int k = SSL_get_error((SSL *)c->ssl, n);\n", 49); vu_str_cat(&v_s, &_t4533); drop_Str(&_t4533); });
+    ({ vu_str _t4533 = vu_str_lit("        if (a < 0) { *err = vu_errf(\"timed out\"); return false; }\n", 66); vu_str_cat(&v_s, &_t4533); drop_Str(&_t4533); });
     #line 20647 "vuc.vu"
     VU_AT(20647);
     #line 20647 "vuc.vu"
-    ({ vu_str _t4536 = vu_str_lit("        if (k == SSL_ERROR_ZERO_RETURN) break;   /* closed */\n", 62); vu_str_cat(&v_s, &_t4536); drop_Str(&_t4536); });
+    ({ vu_str _t4536 = vu_str_lit("        long v = SSL_get_verify_result((SSL *)s->ssl);\n", 55); vu_str_cat(&v_s, &_t4536); drop_Str(&_t4536); });
     #line 20648 "vuc.vu"
     VU_AT(20648);
     #line 20648 "vuc.vu"
-    ({ vu_str _t4539 = vu_str_lit("        if (k == SSL_ERROR_WANT_READ || k == SSL_ERROR_WANT_WRITE) {\n", 69); vu_str_cat(&v_s, &_t4539); drop_Str(&_t4539); });
+    ({ vu_str _t4539 = vu_str_lit("        if (v != X509_V_OK && !SSL_is_server((SSL *)s->ssl))\n", 61); vu_str_cat(&v_s, &_t4539); drop_Str(&_t4539); });
     #line 20649 "vuc.vu"
     VU_AT(20649);
     #line 20649 "vuc.vu"
-    ({ vu_str _t4542 = vu_str_lit("            if (s.len) break;\n", 30); vu_str_cat(&v_s, &_t4542); drop_Str(&_t4542); });
+    ({ vu_str _t4542 = vu_str_lit("            *err = vu_errf(\"can't verify the server's certificate: %s\", X509_verify_cert_error_string(v));\n", 107); vu_str_cat(&v_s, &_t4542); drop_Str(&_t4542); });
     #line 20650 "vuc.vu"
     VU_AT(20650);
     #line 20650 "vuc.vu"
-    ({ vu_str _t4545 = vu_str_lit("            if ((deadline >= 0 && vu_now_ns() >= deadline) || !vu_wait_fd(c, k == SSL_ERROR_WANT_WRITE, deadline, line)) {\n", 123); vu_str_cat(&v_s, &_t4545); drop_Str(&_t4545); });
+    ({ vu_str _t4545 = vu_str_lit("        else if (k == SSL_ERROR_SYSCALL || k == SSL_ERROR_ZERO_RETURN)\n", 71); vu_str_cat(&v_s, &_t4545); drop_Str(&_t4545); });
     #line 20651 "vuc.vu"
     VU_AT(20651);
     #line 20651 "vuc.vu"
-    ({ vu_str _t4548 = vu_str_lit("                *err = vu_errf(\"timed out\");\n", 45); vu_str_cat(&v_s, &_t4548); drop_Str(&_t4548); });
+    ({ vu_str _t4548 = vu_str_lit("            *err = vu_errf(\"the TLS handshake failed: the connection closed\");\n", 79); vu_str_cat(&v_s, &_t4548); drop_Str(&_t4548); });
     #line 20652 "vuc.vu"
     VU_AT(20652);
     #line 20652 "vuc.vu"
-    ({ vu_str _t4551 = vu_str_lit("                return false;\n", 30); vu_str_cat(&v_s, &_t4551); drop_Str(&_t4551); });
+    ({ vu_str _t4551 = vu_str_lit("        else\n", 13); vu_str_cat(&v_s, &_t4551); drop_Str(&_t4551); });
     #line 20653 "vuc.vu"
     VU_AT(20653);
     #line 20653 "vuc.vu"
-    ({ vu_str _t4554 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t4554); drop_Str(&_t4554); });
+    ({ vu_str _t4554 = vu_str_lit("            *err = vu_errf(\"the TLS handshake failed: %s\", vu_tls_reason(\"unknown error\"));\n", 92); vu_str_cat(&v_s, &_t4554); drop_Str(&_t4554); });
     #line 20654 "vuc.vu"
     VU_AT(20654);
     #line 20654 "vuc.vu"
-    ({ vu_str _t4557 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t4557); drop_Str(&_t4557); });
+    ({ vu_str _t4557 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4557); drop_Str(&_t4557); });
     #line 20655 "vuc.vu"
     VU_AT(20655);
     #line 20655 "vuc.vu"
-    ({ vu_str _t4560 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t4560); drop_Str(&_t4560); });
+    ({ vu_str _t4560 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4560); drop_Str(&_t4560); });
     #line 20656 "vuc.vu"
     VU_AT(20656);
     #line 20656 "vuc.vu"
-    ({ vu_str _t4563 = vu_str_lit("        if (s.len) break;   /* report the error on the next call */\n", 68); vu_str_cat(&v_s, &_t4563); drop_Str(&_t4563); });
+    ({ vu_str _t4563 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4563); drop_Str(&_t4563); });
     #line 20657 "vuc.vu"
     VU_AT(20657);
     #line 20657 "vuc.vu"
-    ({ vu_str _t4566 = vu_str_lit("        if (k == SSL_ERROR_SYSCALL && (errno == 0 || errno == ECONNRESET)) break;   /* the other side is gone */\n", 113); vu_str_cat(&v_s, &_t4566); drop_Str(&_t4566); });
+    ({ vu_str _t4566 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4566); drop_Str(&_t4566); });
     #line 20658 "vuc.vu"
     VU_AT(20658);
     #line 20658 "vuc.vu"
-    ({ vu_str _t4569 = vu_str_lit("        *err = vu_errf(\"recv failed: %s\", vu_tls_reason(k == SSL_ERROR_SYSCALL ? strerror(errno) : \"TLS error\"));\n", 114); vu_str_cat(&v_s, &_t4569); drop_Str(&_t4569); });
+    ({ vu_str _t4569 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4569); drop_Str(&_t4569); });
     #line 20659 "vuc.vu"
     VU_AT(20659);
     #line 20659 "vuc.vu"
-    ({ vu_str _t4572 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4572); drop_Str(&_t4572); });
+    ({ vu_str _t4572 = vu_str_lit("static bool vu_tls_accepted(vu_sock *l, vu_sock *s, vu_str *err) {\n", 67); vu_str_cat(&v_s, &_t4572); drop_Str(&_t4572); });
     #line 20660 "vuc.vu"
     VU_AT(20660);
     #line 20660 "vuc.vu"
-    ({ vu_str _t4575 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4575); drop_Str(&_t4575); });
+    ({ vu_str _t4575 = vu_str_lit("    if (!vu_tls_attach(s, (SSL_CTX *)l->tls_ctx, err)) return false;\n", 69); vu_str_cat(&v_s, &_t4575); drop_Str(&_t4575); });
     #line 20661 "vuc.vu"
     VU_AT(20661);
     #line 20661 "vuc.vu"
-    ({ vu_str _t4578 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4578); drop_Str(&_t4578); });
+    ({ vu_str _t4578 = vu_str_lit("    SSL_set_accept_state((SSL *)s->ssl);\n", 41); vu_str_cat(&v_s, &_t4578); drop_Str(&_t4578); });
     #line 20662 "vuc.vu"
     VU_AT(20662);
     #line 20662 "vuc.vu"
-    ({ vu_str _t4581 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t4581); drop_Str(&_t4581); });
+    ({ vu_str _t4581 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4581); drop_Str(&_t4581); });
     #line 20663 "vuc.vu"
     VU_AT(20663);
     #line 20663 "vuc.vu"
-    ({ vu_str _t4584 = vu_str_lit("    *out = s;\n", 14); vu_str_cat(&v_s, &_t4584); drop_Str(&_t4584); });
+    ({ vu_str _t4584 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4584); drop_Str(&_t4584); });
     #line 20664 "vuc.vu"
     VU_AT(20664);
     #line 20664 "vuc.vu"
-    ({ vu_str _t4587 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4587); drop_Str(&_t4587); });
+    ({ vu_str _t4587 = vu_str_lit("static bool vu_tls_recv(vu_sock *c, int64_t deadline, vu_str *out, vu_str *err, int line) {\n", 92); vu_str_cat(&v_s, &_t4587); drop_Str(&_t4587); });
     #line 20665 "vuc.vu"
     VU_AT(20665);
     #line 20665 "vuc.vu"
-    ({ vu_str _t4590 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4590); drop_Str(&_t4590); });
+    ({ vu_str _t4590 = vu_str_lit("    if (!vu_tls_handshake(c, deadline, err, line)) return false;\n", 65); vu_str_cat(&v_s, &_t4590); drop_Str(&_t4590); });
     #line 20666 "vuc.vu"
     VU_AT(20666);
     #line 20666 "vuc.vu"
-    ({ vu_str _t4593 = vu_str_lit("static bool vu_tls_send(vu_sock *c, const uint8_t *data, int64_t len, int64_t deadline, vu_str *err, int line) {\n", 113); vu_str_cat(&v_s, &_t4593); drop_Str(&_t4593); });
+    ({ vu_str _t4593 = vu_str_lit("    vu_str s = {0};\n", 20); vu_str_cat(&v_s, &_t4593); drop_Str(&_t4593); });
     #line 20667 "vuc.vu"
     VU_AT(20667);
     #line 20667 "vuc.vu"
-    ({ vu_str _t4596 = vu_str_lit("    if (!vu_tls_handshake(c, deadline, err, line)) return false;\n", 65); vu_str_cat(&v_s, &_t4596); drop_Str(&_t4596); });
+    ({ vu_str _t4596 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t4596); drop_Str(&_t4596); });
     #line 20668 "vuc.vu"
     VU_AT(20668);
     #line 20668 "vuc.vu"
-    ({ vu_str _t4599 = vu_str_lit("    while (len > 0) {\n", 22); vu_str_cat(&v_s, &_t4599); drop_Str(&_t4599); });
+    ({ vu_str _t4599 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4599); drop_Str(&_t4599); });
     #line 20669 "vuc.vu"
     VU_AT(20669);
     #line 20669 "vuc.vu"
-    ({ vu_str _t4602 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4602); drop_Str(&_t4602); });
+    ({ vu_str _t4602 = vu_str_lit("        int n = SSL_read((SSL *)c->ssl, vu_iobuf, (int)sizeof vu_iobuf);\n", 73); vu_str_cat(&v_s, &_t4602); drop_Str(&_t4602); });
     #line 20670 "vuc.vu"
     VU_AT(20670);
     #line 20670 "vuc.vu"
-    ({ vu_str _t4605 = vu_str_lit("        int n = SSL_write((SSL *)c->ssl, data, len > (1 << 30) ? (1 << 30) : (int)len);\n", 88); vu_str_cat(&v_s, &_t4605); drop_Str(&_t4605); });
+    ({ vu_str _t4605 = vu_str_lit("        if (n > 0) {\n", 21); vu_str_cat(&v_s, &_t4605); drop_Str(&_t4605); });
     #line 20671 "vuc.vu"
     VU_AT(20671);
     #line 20671 "vuc.vu"
-    ({ vu_str _t4608 = vu_str_lit("        if (n > 0) { data += n; len -= n; continue; }\n", 54); vu_str_cat(&v_s, &_t4608); drop_Str(&_t4608); });
+    ({ vu_str _t4608 = vu_str_lit("            vu_str_cat_bytes(&s, vu_iobuf, (int64_t)n);\n", 56); vu_str_cat(&v_s, &_t4608); drop_Str(&_t4608); });
     #line 20672 "vuc.vu"
     VU_AT(20672);
     #line 20672 "vuc.vu"
-    ({ vu_str _t4611 = vu_str_lit("        int k, a = vu_tls_again(c, n, deadline, line, &k);\n", 59); vu_str_cat(&v_s, &_t4611); drop_Str(&_t4611); });
+    ({ vu_str _t4611 = vu_str_lit("            /* Stop after a short record with nothing left decrypted: reading on would only find the\n", 101); vu_str_cat(&v_s, &_t4611); drop_Str(&_t4611); });
     #line 20673 "vuc.vu"
     VU_AT(20673);
     #line 20673 "vuc.vu"
-    ({ vu_str _t4614 = vu_str_lit("        if (a > 0) continue;\n", 29); vu_str_cat(&v_s, &_t4614); drop_Str(&_t4614); });
+    ({ vu_str _t4614 = vu_str_lit("               socket empty (one wasted syscall per request). Full records usually have more behind them. */\n", 109); vu_str_cat(&v_s, &_t4614); drop_Str(&_t4614); });
     #line 20674 "vuc.vu"
     VU_AT(20674);
     #line 20674 "vuc.vu"
-    ({ vu_str _t4617 = vu_str_lit("        if (a < 0) { *err = vu_errf(\"timed out\"); return false; }\n", 66); vu_str_cat(&v_s, &_t4617); drop_Str(&_t4617); });
+    ({ vu_str _t4617 = vu_str_lit("            if (s.len >= (1 << 20) || (n < 16384 && SSL_pending((SSL *)c->ssl) == 0)) break;\n", 93); vu_str_cat(&v_s, &_t4617); drop_Str(&_t4617); });
     #line 20675 "vuc.vu"
     VU_AT(20675);
     #line 20675 "vuc.vu"
-    ({ vu_str _t4620 = vu_str_lit("        if (k == SSL_ERROR_ZERO_RETURN || (k == SSL_ERROR_SYSCALL && (errno == EPIPE || errno == ECONNRESET || errno == 0)))\n", 125); vu_str_cat(&v_s, &_t4620); drop_Str(&_t4620); });
+    ({ vu_str _t4620 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t4620); drop_Str(&_t4620); });
     #line 20676 "vuc.vu"
     VU_AT(20676);
     #line 20676 "vuc.vu"
-    ({ vu_str _t4623 = vu_str_lit("            *err = vu_errf(\"the connection is closed\");\n", 56); vu_str_cat(&v_s, &_t4623); drop_Str(&_t4623); });
+    ({ vu_str _t4623 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t4623); drop_Str(&_t4623); });
     #line 20677 "vuc.vu"
     VU_AT(20677);
     #line 20677 "vuc.vu"
-    ({ vu_str _t4626 = vu_str_lit("        else\n", 13); vu_str_cat(&v_s, &_t4626); drop_Str(&_t4626); });
+    ({ vu_str _t4626 = vu_str_lit("        int k = SSL_get_error((SSL *)c->ssl, n);\n", 49); vu_str_cat(&v_s, &_t4626); drop_Str(&_t4626); });
     #line 20678 "vuc.vu"
     VU_AT(20678);
     #line 20678 "vuc.vu"
-    ({ vu_str _t4629 = vu_str_lit("            *err = vu_errf(\"send failed: %s\", vu_tls_reason(\"TLS error\"));\n", 75); vu_str_cat(&v_s, &_t4629); drop_Str(&_t4629); });
+    ({ vu_str _t4629 = vu_str_lit("        if (k == SSL_ERROR_ZERO_RETURN) break;   /* closed */\n", 62); vu_str_cat(&v_s, &_t4629); drop_Str(&_t4629); });
     #line 20679 "vuc.vu"
     VU_AT(20679);
     #line 20679 "vuc.vu"
-    ({ vu_str _t4632 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4632); drop_Str(&_t4632); });
+    ({ vu_str _t4632 = vu_str_lit("        if (k == SSL_ERROR_WANT_READ || k == SSL_ERROR_WANT_WRITE) {\n", 69); vu_str_cat(&v_s, &_t4632); drop_Str(&_t4632); });
     #line 20680 "vuc.vu"
     VU_AT(20680);
     #line 20680 "vuc.vu"
-    ({ vu_str _t4635 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4635); drop_Str(&_t4635); });
+    ({ vu_str _t4635 = vu_str_lit("            if (s.len) break;\n", 30); vu_str_cat(&v_s, &_t4635); drop_Str(&_t4635); });
     #line 20681 "vuc.vu"
     VU_AT(20681);
     #line 20681 "vuc.vu"
-    ({ vu_str _t4638 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4638); drop_Str(&_t4638); });
+    ({ vu_str _t4638 = vu_str_lit("            if ((deadline >= 0 && vu_now_ns() >= deadline) || !vu_wait_fd(c, k == SSL_ERROR_WANT_WRITE, deadline, line)) {\n", 123); vu_str_cat(&v_s, &_t4638); drop_Str(&_t4638); });
     #line 20682 "vuc.vu"
     VU_AT(20682);
     #line 20682 "vuc.vu"
-    ({ vu_str _t4641 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4641); drop_Str(&_t4641); });
+    ({ vu_str _t4641 = vu_str_lit("                *err = vu_errf(\"timed out\");\n", 45); vu_str_cat(&v_s, &_t4641); drop_Str(&_t4641); });
     #line 20683 "vuc.vu"
     VU_AT(20683);
     #line 20683 "vuc.vu"
-    ({ vu_str _t4644 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4644); drop_Str(&_t4644); });
+    ({ vu_str _t4644 = vu_str_lit("                return false;\n", 30); vu_str_cat(&v_s, &_t4644); drop_Str(&_t4644); });
     #line 20684 "vuc.vu"
     VU_AT(20684);
     #line 20684 "vuc.vu"
-    ({ vu_str _t4647 = vu_str_lit("/* net.tls_listen(port, cert: pem, key: pem): the certificate (then any intermediate certificates) and\n", 103); vu_str_cat(&v_s, &_t4647); drop_Str(&_t4647); });
+    ({ vu_str _t4647 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t4647); drop_Str(&_t4647); });
     #line 20685 "vuc.vu"
     VU_AT(20685);
     #line 20685 "vuc.vu"
-    ({ vu_str _t4650 = vu_str_lit("   its private key, as PEM text. */\n", 36); vu_str_cat(&v_s, &_t4650); drop_Str(&_t4650); });
+    ({ vu_str _t4650 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t4650); drop_Str(&_t4650); });
     #line 20686 "vuc.vu"
     VU_AT(20686);
     #line 20686 "vuc.vu"
-    ({ vu_str _t4653 = vu_str_lit("/* \"h2,http/1.1\" -> a length byte, then the wire form: 2 h2 8 http/1.1 (NULL and *err if it's malformed) */\n", 108); vu_str_cat(&v_s, &_t4653); drop_Str(&_t4653); });
+    ({ vu_str _t4653 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t4653); drop_Str(&_t4653); });
     #line 20687 "vuc.vu"
     VU_AT(20687);
     #line 20687 "vuc.vu"
-    ({ vu_str _t4656 = vu_str_lit("static unsigned char *vu_alpn_wire(const vu_str *alpn, vu_str *err) {\n", 70); vu_str_cat(&v_s, &_t4656); drop_Str(&_t4656); });
+    ({ vu_str _t4656 = vu_str_lit("        if (s.len) break;   /* report the error on the next call */\n", 68); vu_str_cat(&v_s, &_t4656); drop_Str(&_t4656); });
     #line 20688 "vuc.vu"
     VU_AT(20688);
     #line 20688 "vuc.vu"
-    ({ vu_str _t4659 = vu_str_lit("    unsigned char *wire = (unsigned char *)vu_malloc((size_t)alpn->len + 3);\n", 77); vu_str_cat(&v_s, &_t4659); drop_Str(&_t4659); });
+    ({ vu_str _t4659 = vu_str_lit("        if (k == SSL_ERROR_SYSCALL && (errno == 0 || errno == ECONNRESET)) break;   /* the other side is gone */\n", 113); vu_str_cat(&v_s, &_t4659); drop_Str(&_t4659); });
     #line 20689 "vuc.vu"
     VU_AT(20689);
     #line 20689 "vuc.vu"
-    ({ vu_str _t4662 = vu_str_lit("    size_t w = 1, start = 0;\n", 29); vu_str_cat(&v_s, &_t4662); drop_Str(&_t4662); });
+    ({ vu_str _t4662 = vu_str_lit("        *err = vu_errf(\"recv failed: %s\", vu_tls_reason(k == SSL_ERROR_SYSCALL ? strerror(errno) : \"TLS error\"));\n", 114); vu_str_cat(&v_s, &_t4662); drop_Str(&_t4662); });
     #line 20690 "vuc.vu"
     VU_AT(20690);
     #line 20690 "vuc.vu"
-    ({ vu_str _t4665 = vu_str_lit("    for (size_t i = 0; i <= (size_t)alpn->len; i++) {\n", 54); vu_str_cat(&v_s, &_t4665); drop_Str(&_t4665); });
+    ({ vu_str _t4665 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4665); drop_Str(&_t4665); });
     #line 20691 "vuc.vu"
     VU_AT(20691);
     #line 20691 "vuc.vu"
-    ({ vu_str _t4668 = vu_str_lit("        if (i < (size_t)alpn->len && alpn->data[i] != ',') continue;\n", 69); vu_str_cat(&v_s, &_t4668); drop_Str(&_t4668); });
+    ({ vu_str _t4668 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4668); drop_Str(&_t4668); });
     #line 20692 "vuc.vu"
     VU_AT(20692);
     #line 20692 "vuc.vu"
-    ({ vu_str _t4671 = vu_str_lit("        size_t n = i - start;\n", 30); vu_str_cat(&v_s, &_t4671); drop_Str(&_t4671); });
+    ({ vu_str _t4671 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4671); drop_Str(&_t4671); });
     #line 20693 "vuc.vu"
     VU_AT(20693);
     #line 20693 "vuc.vu"
-    ({ vu_str _t4674 = vu_str_lit("        if (n == 0 || n > 255) { free(wire); *err = vu_errf(\"alpn: a comma-separated list of protocol names, like \\\"h2,http/1.1\\\"\"); return NULL; }\n", 148); vu_str_cat(&v_s, &_t4674); drop_Str(&_t4674); });
+    ({ vu_str _t4674 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t4674); drop_Str(&_t4674); });
     #line 20694 "vuc.vu"
     VU_AT(20694);
     #line 20694 "vuc.vu"
-    ({ vu_str _t4677 = vu_str_lit("        wire[w++] = (unsigned char)n;\n", 38); vu_str_cat(&v_s, &_t4677); drop_Str(&_t4677); });
+    ({ vu_str _t4677 = vu_str_lit("    *out = s;\n", 14); vu_str_cat(&v_s, &_t4677); drop_Str(&_t4677); });
     #line 20695 "vuc.vu"
     VU_AT(20695);
     #line 20695 "vuc.vu"
-    ({ vu_str _t4680 = vu_str_lit("        memcpy(wire + w, alpn->data + start, n);\n", 49); vu_str_cat(&v_s, &_t4680); drop_Str(&_t4680); });
+    ({ vu_str _t4680 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4680); drop_Str(&_t4680); });
     #line 20696 "vuc.vu"
     VU_AT(20696);
     #line 20696 "vuc.vu"
-    ({ vu_str _t4683 = vu_str_lit("        w += n;\n", 16); vu_str_cat(&v_s, &_t4683); drop_Str(&_t4683); });
+    ({ vu_str _t4683 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4683); drop_Str(&_t4683); });
     #line 20697 "vuc.vu"
     VU_AT(20697);
     #line 20697 "vuc.vu"
-    ({ vu_str _t4686 = vu_str_lit("        start = i + 1;\n", 23); vu_str_cat(&v_s, &_t4686); drop_Str(&_t4686); });
+    ({ vu_str _t4686 = vu_str_lit("static bool vu_tls_send(vu_sock *c, const uint8_t *data, int64_t len, int64_t deadline, vu_str *err, int line) {\n", 113); vu_str_cat(&v_s, &_t4686); drop_Str(&_t4686); });
     #line 20698 "vuc.vu"
     VU_AT(20698);
     #line 20698 "vuc.vu"
-    ({ vu_str _t4689 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4689); drop_Str(&_t4689); });
+    ({ vu_str _t4689 = vu_str_lit("    if (!vu_tls_handshake(c, deadline, err, line)) return false;\n", 65); vu_str_cat(&v_s, &_t4689); drop_Str(&_t4689); });
     #line 20699 "vuc.vu"
     VU_AT(20699);
     #line 20699 "vuc.vu"
-    ({ vu_str _t4692 = vu_str_lit("    if (w - 1 > 255) { free(wire); *err = vu_errf(\"alpn: the list is too long\"); return NULL; }\n", 96); vu_str_cat(&v_s, &_t4692); drop_Str(&_t4692); });
+    ({ vu_str _t4692 = vu_str_lit("    while (len > 0) {\n", 22); vu_str_cat(&v_s, &_t4692); drop_Str(&_t4692); });
     #line 20700 "vuc.vu"
     VU_AT(20700);
     #line 20700 "vuc.vu"
-    ({ vu_str _t4695 = vu_str_lit("    wire[0] = (unsigned char)(w - 1);\n", 38); vu_str_cat(&v_s, &_t4695); drop_Str(&_t4695); });
+    ({ vu_str _t4695 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4695); drop_Str(&_t4695); });
     #line 20701 "vuc.vu"
     VU_AT(20701);
     #line 20701 "vuc.vu"
-    ({ vu_str _t4698 = vu_str_lit("    return wire;\n", 17); vu_str_cat(&v_s, &_t4698); drop_Str(&_t4698); });
+    ({ vu_str _t4698 = vu_str_lit("        int n = SSL_write((SSL *)c->ssl, data, len > (1 << 30) ? (1 << 30) : (int)len);\n", 88); vu_str_cat(&v_s, &_t4698); drop_Str(&_t4698); });
     #line 20702 "vuc.vu"
     VU_AT(20702);
     #line 20702 "vuc.vu"
-    ({ vu_str _t4701 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4701); drop_Str(&_t4701); });
+    ({ vu_str _t4701 = vu_str_lit("        if (n > 0) { data += n; len -= n; continue; }\n", 54); vu_str_cat(&v_s, &_t4701); drop_Str(&_t4701); });
     #line 20703 "vuc.vu"
     VU_AT(20703);
     #line 20703 "vuc.vu"
-    ({ vu_str _t4704 = vu_str_lit("/* ALPN: the server picks the first of its protocols (alpn: \"h2,http/1.1\") that the client offers. */\n", 102); vu_str_cat(&v_s, &_t4704); drop_Str(&_t4704); });
+    ({ vu_str _t4704 = vu_str_lit("        int k, a = vu_tls_again(c, n, deadline, line, &k);\n", 59); vu_str_cat(&v_s, &_t4704); drop_Str(&_t4704); });
     #line 20704 "vuc.vu"
     VU_AT(20704);
     #line 20704 "vuc.vu"
-    ({ vu_str _t4707 = vu_str_lit("static int vu_alpn_pick(SSL *ssl, const unsigned char **out, unsigned char *outlen, const unsigned char *in, unsigned inlen, void *arg) {\n", 138); vu_str_cat(&v_s, &_t4707); drop_Str(&_t4707); });
+    ({ vu_str _t4707 = vu_str_lit("        if (a > 0) continue;\n", 29); vu_str_cat(&v_s, &_t4707); drop_Str(&_t4707); });
     #line 20705 "vuc.vu"
     VU_AT(20705);
     #line 20705 "vuc.vu"
-    ({ vu_str _t4710 = vu_str_lit("    (void)ssl;\n", 15); vu_str_cat(&v_s, &_t4710); drop_Str(&_t4710); });
+    ({ vu_str _t4710 = vu_str_lit("        if (a < 0) { *err = vu_errf(\"timed out\"); return false; }\n", 66); vu_str_cat(&v_s, &_t4710); drop_Str(&_t4710); });
     #line 20706 "vuc.vu"
     VU_AT(20706);
     #line 20706 "vuc.vu"
-    ({ vu_str _t4713 = vu_str_lit("    const unsigned char *ours = (const unsigned char *)arg;\n", 60); vu_str_cat(&v_s, &_t4713); drop_Str(&_t4713); });
+    ({ vu_str _t4713 = vu_str_lit("        if (k == SSL_ERROR_ZERO_RETURN || (k == SSL_ERROR_SYSCALL && (errno == EPIPE || errno == ECONNRESET || errno == 0)))\n", 125); vu_str_cat(&v_s, &_t4713); drop_Str(&_t4713); });
     #line 20707 "vuc.vu"
     VU_AT(20707);
     #line 20707 "vuc.vu"
-    ({ vu_str _t4716 = vu_str_lit("    unsigned char *o;\n", 22); vu_str_cat(&v_s, &_t4716); drop_Str(&_t4716); });
+    ({ vu_str _t4716 = vu_str_lit("            *err = vu_errf(\"the connection is closed\");\n", 56); vu_str_cat(&v_s, &_t4716); drop_Str(&_t4716); });
     #line 20708 "vuc.vu"
     VU_AT(20708);
     #line 20708 "vuc.vu"
-    ({ vu_str _t4719 = vu_str_lit("    if (SSL_select_next_proto(&o, outlen, ours + 1, ours[0], in, inlen) != OPENSSL_NPN_NEGOTIATED) return SSL_TLSEXT_ERR_NOACK;\n", 128); vu_str_cat(&v_s, &_t4719); drop_Str(&_t4719); });
+    ({ vu_str _t4719 = vu_str_lit("        else\n", 13); vu_str_cat(&v_s, &_t4719); drop_Str(&_t4719); });
     #line 20709 "vuc.vu"
     VU_AT(20709);
     #line 20709 "vuc.vu"
-    ({ vu_str _t4722 = vu_str_lit("    *out = o;\n", 14); vu_str_cat(&v_s, &_t4722); drop_Str(&_t4722); });
+    ({ vu_str _t4722 = vu_str_lit("            *err = vu_errf(\"send failed: %s\", vu_tls_reason(\"TLS error\"));\n", 75); vu_str_cat(&v_s, &_t4722); drop_Str(&_t4722); });
     #line 20710 "vuc.vu"
     VU_AT(20710);
     #line 20710 "vuc.vu"
-    ({ vu_str _t4725 = vu_str_lit("    return SSL_TLSEXT_ERR_OK;\n", 30); vu_str_cat(&v_s, &_t4725); drop_Str(&_t4725); });
+    ({ vu_str _t4725 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4725); drop_Str(&_t4725); });
     #line 20711 "vuc.vu"
     VU_AT(20711);
     #line 20711 "vuc.vu"
-    ({ vu_str _t4728 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4728); drop_Str(&_t4728); });
+    ({ vu_str _t4728 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4728); drop_Str(&_t4728); });
     #line 20712 "vuc.vu"
     VU_AT(20712);
     #line 20712 "vuc.vu"
-    ({ vu_str _t4731 = vu_str_lit("static bool vu_net_tls_listen_alpn(vu_cap net, int64_t port, const vu_str *cert, const vu_str *key, const vu_str *alpn,\n", 120); vu_str_cat(&v_s, &_t4731); drop_Str(&_t4731); });
+    ({ vu_str _t4731 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4731); drop_Str(&_t4731); });
     #line 20713 "vuc.vu"
     VU_AT(20713);
     #line 20713 "vuc.vu"
-    ({ vu_str _t4734 = vu_str_lit("                                   void **out, vu_str *err, int line);\n", 71); vu_str_cat(&v_s, &_t4734); drop_Str(&_t4734); });
+    ({ vu_str _t4734 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4734); drop_Str(&_t4734); });
     #line 20714 "vuc.vu"
     VU_AT(20714);
     #line 20714 "vuc.vu"
-    ({ vu_str _t4737 = vu_str_lit("static bool vu_net_tls_listen(vu_cap net, int64_t port, const vu_str *cert, const vu_str *key, void **out, vu_str *err,\n", 120); vu_str_cat(&v_s, &_t4737); drop_Str(&_t4737); });
+    ({ vu_str _t4737 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4737); drop_Str(&_t4737); });
     #line 20715 "vuc.vu"
     VU_AT(20715);
     #line 20715 "vuc.vu"
-    ({ vu_str _t4740 = vu_str_lit("                              int line) {\n", 42); vu_str_cat(&v_s, &_t4740); drop_Str(&_t4740); });
+    ({ vu_str _t4740 = vu_str_lit("/* net.tls_listen(port, cert: pem, key: pem): the certificate (then any intermediate certificates) and\n", 103); vu_str_cat(&v_s, &_t4740); drop_Str(&_t4740); });
     #line 20716 "vuc.vu"
     VU_AT(20716);
     #line 20716 "vuc.vu"
-    ({ vu_str _t4743 = vu_str_lit("    return vu_net_tls_listen_alpn(net, port, cert, key, NULL, out, err, line);\n", 79); vu_str_cat(&v_s, &_t4743); drop_Str(&_t4743); });
+    ({ vu_str _t4743 = vu_str_lit("   its private key, as PEM text. */\n", 36); vu_str_cat(&v_s, &_t4743); drop_Str(&_t4743); });
     #line 20717 "vuc.vu"
     VU_AT(20717);
     #line 20717 "vuc.vu"
-    ({ vu_str _t4746 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4746); drop_Str(&_t4746); });
+    ({ vu_str _t4746 = vu_str_lit("/* \"h2,http/1.1\" -> a length byte, then the wire form: 2 h2 8 http/1.1 (NULL and *err if it's malformed) */\n", 108); vu_str_cat(&v_s, &_t4746); drop_Str(&_t4746); });
     #line 20718 "vuc.vu"
     VU_AT(20718);
     #line 20718 "vuc.vu"
-    ({ vu_str _t4749 = vu_str_lit("static bool vu_net_tls_listen_alpn(vu_cap net, int64_t port, const vu_str *cert, const vu_str *key, const vu_str *alpn,\n", 120); vu_str_cat(&v_s, &_t4749); drop_Str(&_t4749); });
+    ({ vu_str _t4749 = vu_str_lit("static unsigned char *vu_alpn_wire(const vu_str *alpn, vu_str *err) {\n", 70); vu_str_cat(&v_s, &_t4749); drop_Str(&_t4749); });
     #line 20719 "vuc.vu"
     VU_AT(20719);
     #line 20719 "vuc.vu"
-    ({ vu_str _t4752 = vu_str_lit("                                   void **out, vu_str *err, int line) {\n", 72); vu_str_cat(&v_s, &_t4752); drop_Str(&_t4752); });
+    ({ vu_str _t4752 = vu_str_lit("    unsigned char *wire = (unsigned char *)vu_malloc((size_t)alpn->len + 3);\n", 77); vu_str_cat(&v_s, &_t4752); drop_Str(&_t4752); });
     #line 20720 "vuc.vu"
     VU_AT(20720);
     #line 20720 "vuc.vu"
-    ({ vu_str _t4755 = vu_str_lit("    vu_task_here(\"net.tls_listen()\", line);\n", 44); vu_str_cat(&v_s, &_t4755); drop_Str(&_t4755); });
+    ({ vu_str _t4755 = vu_str_lit("    size_t w = 1, start = 0;\n", 29); vu_str_cat(&v_s, &_t4755); drop_Str(&_t4755); });
     #line 20721 "vuc.vu"
     VU_AT(20721);
     #line 20721 "vuc.vu"
-    ({ vu_str _t4758 = vu_str_lit("    unsigned char *wire = NULL;\n", 32); vu_str_cat(&v_s, &_t4758); drop_Str(&_t4758); });
+    ({ vu_str _t4758 = vu_str_lit("    for (size_t i = 0; i <= (size_t)alpn->len; i++) {\n", 54); vu_str_cat(&v_s, &_t4758); drop_Str(&_t4758); });
     #line 20722 "vuc.vu"
     VU_AT(20722);
     #line 20722 "vuc.vu"
-    ({ vu_str _t4761 = vu_str_lit("    if (alpn && !(wire = vu_alpn_wire(alpn, err))) return false;\n", 65); vu_str_cat(&v_s, &_t4761); drop_Str(&_t4761); });
+    ({ vu_str _t4761 = vu_str_lit("        if (i < (size_t)alpn->len && alpn->data[i] != ',') continue;\n", 69); vu_str_cat(&v_s, &_t4761); drop_Str(&_t4761); });
     #line 20723 "vuc.vu"
     VU_AT(20723);
     #line 20723 "vuc.vu"
-    ({ vu_str _t4764 = vu_str_lit("    if (cert->len > (1 << 24) || key->len > (1 << 24)) { *err = vu_errf(\"the certificate or key is too long\"); return false; }\n", 127); vu_str_cat(&v_s, &_t4764); drop_Str(&_t4764); });
+    ({ vu_str _t4764 = vu_str_lit("        size_t n = i - start;\n", 30); vu_str_cat(&v_s, &_t4764); drop_Str(&_t4764); });
     #line 20724 "vuc.vu"
     VU_AT(20724);
     #line 20724 "vuc.vu"
-    ({ vu_str _t4767 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t4767); drop_Str(&_t4767); });
+    ({ vu_str _t4767 = vu_str_lit("        if (n == 0 || n > 255) { free(wire); *err = vu_errf(\"alpn: a comma-separated list of protocol names, like \\\"h2,http/1.1\\\"\"); return NULL; }\n", 148); vu_str_cat(&v_s, &_t4767); drop_Str(&_t4767); });
     #line 20725 "vuc.vu"
     VU_AT(20725);
     #line 20725 "vuc.vu"
-    ({ vu_str _t4770 = vu_str_lit("    SSL_CTX *ctx = vu_tls_ctx(true);\n", 37); vu_str_cat(&v_s, &_t4770); drop_Str(&_t4770); });
+    ({ vu_str _t4770 = vu_str_lit("        wire[w++] = (unsigned char)n;\n", 38); vu_str_cat(&v_s, &_t4770); drop_Str(&_t4770); });
     #line 20726 "vuc.vu"
     VU_AT(20726);
     #line 20726 "vuc.vu"
-    ({ vu_str _t4773 = vu_str_lit("    /* the ALPN list lives as long as the context (connections accepted from this listener hold it\n", 99); vu_str_cat(&v_s, &_t4773); drop_Str(&_t4773); });
+    ({ vu_str _t4773 = vu_str_lit("        memcpy(wire + w, alpn->data + start, n);\n", 49); vu_str_cat(&v_s, &_t4773); drop_Str(&_t4773); });
     #line 20727 "vuc.vu"
     VU_AT(20727);
     #line 20727 "vuc.vu"
-    ({ vu_str _t4776 = vu_str_lit("       too), and is freed with it on every path */\n", 51); vu_str_cat(&v_s, &_t4776); drop_Str(&_t4776); });
+    ({ vu_str _t4776 = vu_str_lit("        w += n;\n", 16); vu_str_cat(&v_s, &_t4776); drop_Str(&_t4776); });
     #line 20728 "vuc.vu"
     VU_AT(20728);
     #line 20728 "vuc.vu"
-    ({ vu_str _t4779 = vu_str_lit("    if (wire) SSL_CTX_set_ex_data(ctx, vu_alpn_index, wire);\n", 61); vu_str_cat(&v_s, &_t4779); drop_Str(&_t4779); });
+    ({ vu_str _t4779 = vu_str_lit("        start = i + 1;\n", 23); vu_str_cat(&v_s, &_t4779); drop_Str(&_t4779); });
     #line 20729 "vuc.vu"
     VU_AT(20729);
     #line 20729 "vuc.vu"
-    ({ vu_str _t4782 = vu_str_lit("    BIO *b = vu_pem_bio(cert);\n", 31); vu_str_cat(&v_s, &_t4782); drop_Str(&_t4782); });
+    ({ vu_str _t4782 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4782); drop_Str(&_t4782); });
     #line 20730 "vuc.vu"
     VU_AT(20730);
     #line 20730 "vuc.vu"
-    ({ vu_str _t4785 = vu_str_lit("    X509 *x = b ? PEM_read_bio_X509(b, NULL, vu_no_password, NULL) : NULL;\n", 75); vu_str_cat(&v_s, &_t4785); drop_Str(&_t4785); });
+    ({ vu_str _t4785 = vu_str_lit("    if (w - 1 > 255) { free(wire); *err = vu_errf(\"alpn: the list is too long\"); return NULL; }\n", 96); vu_str_cat(&v_s, &_t4785); drop_Str(&_t4785); });
     #line 20731 "vuc.vu"
     VU_AT(20731);
     #line 20731 "vuc.vu"
-    ({ vu_str _t4788 = vu_str_lit("    if (!x || SSL_CTX_use_certificate(ctx, x) != 1) {\n", 54); vu_str_cat(&v_s, &_t4788); drop_Str(&_t4788); });
+    ({ vu_str _t4788 = vu_str_lit("    wire[0] = (unsigned char)(w - 1);\n", 38); vu_str_cat(&v_s, &_t4788); drop_Str(&_t4788); });
     #line 20732 "vuc.vu"
     VU_AT(20732);
     #line 20732 "vuc.vu"
-    ({ vu_str _t4791 = vu_str_lit("        if (x) X509_free(x);\n", 29); vu_str_cat(&v_s, &_t4791); drop_Str(&_t4791); });
+    ({ vu_str _t4791 = vu_str_lit("    return wire;\n", 17); vu_str_cat(&v_s, &_t4791); drop_Str(&_t4791); });
     #line 20733 "vuc.vu"
     VU_AT(20733);
     #line 20733 "vuc.vu"
-    ({ vu_str _t4794 = vu_str_lit("        if (b) BIO_free(b);\n", 28); vu_str_cat(&v_s, &_t4794); drop_Str(&_t4794); });
+    ({ vu_str _t4794 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4794); drop_Str(&_t4794); });
     #line 20734 "vuc.vu"
     VU_AT(20734);
     #line 20734 "vuc.vu"
-    ({ vu_str _t4797 = vu_str_lit("        SSL_CTX_free(ctx);\n", 27); vu_str_cat(&v_s, &_t4797); drop_Str(&_t4797); });
+    ({ vu_str _t4797 = vu_str_lit("/* ALPN: the server picks the first of its protocols (alpn: \"h2,http/1.1\") that the client offers. */\n", 102); vu_str_cat(&v_s, &_t4797); drop_Str(&_t4797); });
     #line 20735 "vuc.vu"
     VU_AT(20735);
     #line 20735 "vuc.vu"
-    ({ vu_str _t4800 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4800); drop_Str(&_t4800); });
+    ({ vu_str _t4800 = vu_str_lit("static int vu_alpn_pick(SSL *ssl, const unsigned char **out, unsigned char *outlen, const unsigned char *in, unsigned inlen, void *arg) {\n", 138); vu_str_cat(&v_s, &_t4800); drop_Str(&_t4800); });
     #line 20736 "vuc.vu"
     VU_AT(20736);
     #line 20736 "vuc.vu"
-    ({ vu_str _t4803 = vu_str_lit("        *err = vu_errf(\"cert: no certificate found in the PEM text\");\n", 70); vu_str_cat(&v_s, &_t4803); drop_Str(&_t4803); });
+    ({ vu_str _t4803 = vu_str_lit("    (void)ssl;\n", 15); vu_str_cat(&v_s, &_t4803); drop_Str(&_t4803); });
     #line 20737 "vuc.vu"
     VU_AT(20737);
     #line 20737 "vuc.vu"
-    ({ vu_str _t4806 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4806); drop_Str(&_t4806); });
+    ({ vu_str _t4806 = vu_str_lit("    const unsigned char *ours = (const unsigned char *)arg;\n", 60); vu_str_cat(&v_s, &_t4806); drop_Str(&_t4806); });
     #line 20738 "vuc.vu"
     VU_AT(20738);
     #line 20738 "vuc.vu"
-    ({ vu_str _t4809 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4809); drop_Str(&_t4809); });
+    ({ vu_str _t4809 = vu_str_lit("    unsigned char *o;\n", 22); vu_str_cat(&v_s, &_t4809); drop_Str(&_t4809); });
     #line 20739 "vuc.vu"
     VU_AT(20739);
     #line 20739 "vuc.vu"
-    ({ vu_str _t4812 = vu_str_lit("    X509_free(x);\n", 18); vu_str_cat(&v_s, &_t4812); drop_Str(&_t4812); });
+    ({ vu_str _t4812 = vu_str_lit("    if (SSL_select_next_proto(&o, outlen, ours + 1, ours[0], in, inlen) != OPENSSL_NPN_NEGOTIATED) return SSL_TLSEXT_ERR_NOACK;\n", 128); vu_str_cat(&v_s, &_t4812); drop_Str(&_t4812); });
     #line 20740 "vuc.vu"
     VU_AT(20740);
     #line 20740 "vuc.vu"
-    ({ vu_str _t4815 = vu_str_lit("    while ((x = PEM_read_bio_X509(b, NULL, vu_no_password, NULL)))\n", 67); vu_str_cat(&v_s, &_t4815); drop_Str(&_t4815); });
+    ({ vu_str _t4815 = vu_str_lit("    *out = o;\n", 14); vu_str_cat(&v_s, &_t4815); drop_Str(&_t4815); });
     #line 20741 "vuc.vu"
     VU_AT(20741);
     #line 20741 "vuc.vu"
-    ({ vu_str _t4818 = vu_str_lit("        if (SSL_CTX_add_extra_chain_cert(ctx, x) != 1) X509_free(x);   /* on success the context owns it */\n", 108); vu_str_cat(&v_s, &_t4818); drop_Str(&_t4818); });
+    ({ vu_str _t4818 = vu_str_lit("    return SSL_TLSEXT_ERR_OK;\n", 30); vu_str_cat(&v_s, &_t4818); drop_Str(&_t4818); });
     #line 20742 "vuc.vu"
     VU_AT(20742);
     #line 20742 "vuc.vu"
-    ({ vu_str _t4821 = vu_str_lit("    BIO_free(b);\n", 17); vu_str_cat(&v_s, &_t4821); drop_Str(&_t4821); });
+    ({ vu_str _t4821 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4821); drop_Str(&_t4821); });
     #line 20743 "vuc.vu"
     VU_AT(20743);
     #line 20743 "vuc.vu"
-    ({ vu_str _t4824 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t4824); drop_Str(&_t4824); });
+    ({ vu_str _t4824 = vu_str_lit("static bool vu_net_tls_listen_alpn(vu_cap net, int64_t port, const vu_str *cert, const vu_str *key, const vu_str *alpn,\n", 120); vu_str_cat(&v_s, &_t4824); drop_Str(&_t4824); });
     #line 20744 "vuc.vu"
     VU_AT(20744);
     #line 20744 "vuc.vu"
-    ({ vu_str _t4827 = vu_str_lit("    b = vu_pem_bio(key);\n", 25); vu_str_cat(&v_s, &_t4827); drop_Str(&_t4827); });
+    ({ vu_str _t4827 = vu_str_lit("                                   void **out, vu_str *err, int line);\n", 71); vu_str_cat(&v_s, &_t4827); drop_Str(&_t4827); });
     #line 20745 "vuc.vu"
     VU_AT(20745);
     #line 20745 "vuc.vu"
-    ({ vu_str _t4830 = vu_str_lit("    EVP_PKEY *k = b ? PEM_read_bio_PrivateKey(b, NULL, vu_no_password, NULL) : NULL;\n", 85); vu_str_cat(&v_s, &_t4830); drop_Str(&_t4830); });
+    ({ vu_str _t4830 = vu_str_lit("static bool vu_net_tls_listen(vu_cap net, int64_t port, const vu_str *cert, const vu_str *key, void **out, vu_str *err,\n", 120); vu_str_cat(&v_s, &_t4830); drop_Str(&_t4830); });
     #line 20746 "vuc.vu"
     VU_AT(20746);
     #line 20746 "vuc.vu"
-    ({ vu_str _t4833 = vu_str_lit("    if (b) BIO_free(b);\n", 24); vu_str_cat(&v_s, &_t4833); drop_Str(&_t4833); });
+    ({ vu_str _t4833 = vu_str_lit("                              int line) {\n", 42); vu_str_cat(&v_s, &_t4833); drop_Str(&_t4833); });
     #line 20747 "vuc.vu"
     VU_AT(20747);
     #line 20747 "vuc.vu"
-    ({ vu_str _t4836 = vu_str_lit("    if (!k) {\n", 14); vu_str_cat(&v_s, &_t4836); drop_Str(&_t4836); });
+    ({ vu_str _t4836 = vu_str_lit("    return vu_net_tls_listen_alpn(net, port, cert, key, NULL, out, err, line);\n", 79); vu_str_cat(&v_s, &_t4836); drop_Str(&_t4836); });
     #line 20748 "vuc.vu"
     VU_AT(20748);
     #line 20748 "vuc.vu"
-    ({ vu_str _t4839 = vu_str_lit("        SSL_CTX_free(ctx);\n", 27); vu_str_cat(&v_s, &_t4839); drop_Str(&_t4839); });
+    ({ vu_str _t4839 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4839); drop_Str(&_t4839); });
     #line 20749 "vuc.vu"
     VU_AT(20749);
     #line 20749 "vuc.vu"
-    ({ vu_str _t4842 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4842); drop_Str(&_t4842); });
+    ({ vu_str _t4842 = vu_str_lit("static bool vu_net_tls_listen_alpn(vu_cap net, int64_t port, const vu_str *cert, const vu_str *key, const vu_str *alpn,\n", 120); vu_str_cat(&v_s, &_t4842); drop_Str(&_t4842); });
     #line 20750 "vuc.vu"
     VU_AT(20750);
     #line 20750 "vuc.vu"
-    ({ vu_str _t4845 = vu_str_lit("        *err = vu_errf(\"key: no private key found in the PEM text (keys protected by a password aren't supported)\");\n", 117); vu_str_cat(&v_s, &_t4845); drop_Str(&_t4845); });
+    ({ vu_str _t4845 = vu_str_lit("                                   void **out, vu_str *err, int line) {\n", 72); vu_str_cat(&v_s, &_t4845); drop_Str(&_t4845); });
     #line 20751 "vuc.vu"
     VU_AT(20751);
     #line 20751 "vuc.vu"
-    ({ vu_str _t4848 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4848); drop_Str(&_t4848); });
+    ({ vu_str _t4848 = vu_str_lit("    vu_task_here(\"net.tls_listen()\", line);\n", 44); vu_str_cat(&v_s, &_t4848); drop_Str(&_t4848); });
     #line 20752 "vuc.vu"
     VU_AT(20752);
     #line 20752 "vuc.vu"
-    ({ vu_str _t4851 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4851); drop_Str(&_t4851); });
+    ({ vu_str _t4851 = vu_str_lit("    unsigned char *wire = NULL;\n", 32); vu_str_cat(&v_s, &_t4851); drop_Str(&_t4851); });
     #line 20753 "vuc.vu"
     VU_AT(20753);
     #line 20753 "vuc.vu"
-    ({ vu_str _t4854 = vu_str_lit("    int used = SSL_CTX_use_PrivateKey(ctx, k);\n", 47); vu_str_cat(&v_s, &_t4854); drop_Str(&_t4854); });
+    ({ vu_str _t4854 = vu_str_lit("    if (alpn && !(wire = vu_alpn_wire(alpn, err))) return false;\n", 65); vu_str_cat(&v_s, &_t4854); drop_Str(&_t4854); });
     #line 20754 "vuc.vu"
     VU_AT(20754);
     #line 20754 "vuc.vu"
-    ({ vu_str _t4857 = vu_str_lit("    EVP_PKEY_free(k);\n", 22); vu_str_cat(&v_s, &_t4857); drop_Str(&_t4857); });
+    ({ vu_str _t4857 = vu_str_lit("    if (cert->len > (1 << 24) || key->len > (1 << 24)) { *err = vu_errf(\"the certificate or key is too long\"); return false; }\n", 127); vu_str_cat(&v_s, &_t4857); drop_Str(&_t4857); });
     #line 20755 "vuc.vu"
     VU_AT(20755);
     #line 20755 "vuc.vu"
-    ({ vu_str _t4860 = vu_str_lit("    if (used != 1 || SSL_CTX_check_private_key(ctx) != 1) {\n", 60); vu_str_cat(&v_s, &_t4860); drop_Str(&_t4860); });
+    ({ vu_str _t4860 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t4860); drop_Str(&_t4860); });
     #line 20756 "vuc.vu"
     VU_AT(20756);
     #line 20756 "vuc.vu"
-    ({ vu_str _t4863 = vu_str_lit("        SSL_CTX_free(ctx);\n", 27); vu_str_cat(&v_s, &_t4863); drop_Str(&_t4863); });
+    ({ vu_str _t4863 = vu_str_lit("    SSL_CTX *ctx = vu_tls_ctx(true);\n", 37); vu_str_cat(&v_s, &_t4863); drop_Str(&_t4863); });
     #line 20757 "vuc.vu"
     VU_AT(20757);
     #line 20757 "vuc.vu"
-    ({ vu_str _t4866 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4866); drop_Str(&_t4866); });
+    ({ vu_str _t4866 = vu_str_lit("    /* the ALPN list lives as long as the context (connections accepted from this listener hold it\n", 99); vu_str_cat(&v_s, &_t4866); drop_Str(&_t4866); });
     #line 20758 "vuc.vu"
     VU_AT(20758);
     #line 20758 "vuc.vu"
-    ({ vu_str _t4869 = vu_str_lit("        *err = vu_errf(\"key: the private key doesn't match the certificate\");\n", 78); vu_str_cat(&v_s, &_t4869); drop_Str(&_t4869); });
+    ({ vu_str _t4869 = vu_str_lit("       too), and is freed with it on every path */\n", 51); vu_str_cat(&v_s, &_t4869); drop_Str(&_t4869); });
     #line 20759 "vuc.vu"
     VU_AT(20759);
     #line 20759 "vuc.vu"
-    ({ vu_str _t4872 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4872); drop_Str(&_t4872); });
+    ({ vu_str _t4872 = vu_str_lit("    if (wire) SSL_CTX_set_ex_data(ctx, vu_alpn_index, wire);\n", 61); vu_str_cat(&v_s, &_t4872); drop_Str(&_t4872); });
     #line 20760 "vuc.vu"
     VU_AT(20760);
     #line 20760 "vuc.vu"
-    ({ vu_str _t4875 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4875); drop_Str(&_t4875); });
+    ({ vu_str _t4875 = vu_str_lit("    BIO *b = vu_pem_bio(cert);\n", 31); vu_str_cat(&v_s, &_t4875); drop_Str(&_t4875); });
     #line 20761 "vuc.vu"
     VU_AT(20761);
     #line 20761 "vuc.vu"
-    ({ vu_str _t4878 = vu_str_lit("    if (!vu_net_listen(net, port, out, err, line)) { SSL_CTX_free(ctx); return false; }\n", 88); vu_str_cat(&v_s, &_t4878); drop_Str(&_t4878); });
+    ({ vu_str _t4878 = vu_str_lit("    X509 *x = b ? PEM_read_bio_X509(b, NULL, vu_no_password, NULL) : NULL;\n", 75); vu_str_cat(&v_s, &_t4878); drop_Str(&_t4878); });
     #line 20762 "vuc.vu"
     VU_AT(20762);
     #line 20762 "vuc.vu"
-    ({ vu_str _t4881 = vu_str_lit("    if (wire) SSL_CTX_set_alpn_select_cb(ctx, vu_alpn_pick, wire);\n", 67); vu_str_cat(&v_s, &_t4881); drop_Str(&_t4881); });
+    ({ vu_str _t4881 = vu_str_lit("    if (!x || SSL_CTX_use_certificate(ctx, x) != 1) {\n", 54); vu_str_cat(&v_s, &_t4881); drop_Str(&_t4881); });
     #line 20763 "vuc.vu"
     VU_AT(20763);
     #line 20763 "vuc.vu"
-    ({ vu_str _t4884 = vu_str_lit("    ((vu_sock *)*out)->tls_ctx = ctx;\n", 38); vu_str_cat(&v_s, &_t4884); drop_Str(&_t4884); });
+    ({ vu_str _t4884 = vu_str_lit("        if (x) X509_free(x);\n", 29); vu_str_cat(&v_s, &_t4884); drop_Str(&_t4884); });
     #line 20764 "vuc.vu"
     VU_AT(20764);
     #line 20764 "vuc.vu"
-    ({ vu_str _t4887 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4887); drop_Str(&_t4887); });
+    ({ vu_str _t4887 = vu_str_lit("        if (b) BIO_free(b);\n", 28); vu_str_cat(&v_s, &_t4887); drop_Str(&_t4887); });
     #line 20765 "vuc.vu"
     VU_AT(20765);
     #line 20765 "vuc.vu"
-    ({ vu_str _t4890 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4890); drop_Str(&_t4890); });
+    ({ vu_str _t4890 = vu_str_lit("        SSL_CTX_free(ctx);\n", 27); vu_str_cat(&v_s, &_t4890); drop_Str(&_t4890); });
     #line 20766 "vuc.vu"
     VU_AT(20766);
     #line 20766 "vuc.vu"
-    ({ vu_str _t4893 = vu_str_lit("/* net.tls_connect(host, port, ca: pem, timeout: s): checks the server's certificate against the system's\n", 106); vu_str_cat(&v_s, &_t4893); drop_Str(&_t4893); });
+    ({ vu_str _t4893 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4893); drop_Str(&_t4893); });
     #line 20767 "vuc.vu"
     VU_AT(20767);
     #line 20767 "vuc.vu"
-    ({ vu_str _t4896 = vu_str_lit("   certificates (or only the ones in ca) and that it is for host. */\n", 69); vu_str_cat(&v_s, &_t4896); drop_Str(&_t4896); });
+    ({ vu_str _t4896 = vu_str_lit("        *err = vu_errf(\"cert: no certificate found in the PEM text\");\n", 70); vu_str_cat(&v_s, &_t4896); drop_Str(&_t4896); });
     #line 20768 "vuc.vu"
     VU_AT(20768);
     #line 20768 "vuc.vu"
-    ({ vu_str _t4899 = vu_str_lit("static bool vu_net_tls_connect(vu_cap net, const vu_str *host, int64_t port, const vu_str *ca, const vu_str *alpn, double timeout,\n", 131); vu_str_cat(&v_s, &_t4899); drop_Str(&_t4899); });
+    ({ vu_str _t4899 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4899); drop_Str(&_t4899); });
     #line 20769 "vuc.vu"
     VU_AT(20769);
     #line 20769 "vuc.vu"
-    ({ vu_str _t4902 = vu_str_lit("                               bool has, void **out, vu_str *err, int line) {\n", 78); vu_str_cat(&v_s, &_t4902); drop_Str(&_t4902); });
+    ({ vu_str _t4902 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4902); drop_Str(&_t4902); });
     #line 20770 "vuc.vu"
     VU_AT(20770);
     #line 20770 "vuc.vu"
-    ({ vu_str _t4905 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t4905); drop_Str(&_t4905); });
+    ({ vu_str _t4905 = vu_str_lit("    X509_free(x);\n", 18); vu_str_cat(&v_s, &_t4905); drop_Str(&_t4905); });
     #line 20771 "vuc.vu"
     VU_AT(20771);
     #line 20771 "vuc.vu"
-    ({ vu_str _t4908 = vu_str_lit("    vu_task_here(\"net.tls_connect()\", line);\n", 45); vu_str_cat(&v_s, &_t4908); drop_Str(&_t4908); });
+    ({ vu_str _t4908 = vu_str_lit("    while ((x = PEM_read_bio_X509(b, NULL, vu_no_password, NULL)))\n", 67); vu_str_cat(&v_s, &_t4908); drop_Str(&_t4908); });
     #line 20772 "vuc.vu"
     VU_AT(20772);
     #line 20772 "vuc.vu"
-    ({ vu_str _t4911 = vu_str_lit("    if (port < 1 || port > 65535) { *err = vu_errf(\"port %lld is not in 1..65535\", (long long)port); return false; }\n", 117); vu_str_cat(&v_s, &_t4911); drop_Str(&_t4911); });
+    ({ vu_str _t4911 = vu_str_lit("        if (SSL_CTX_add_extra_chain_cert(ctx, x) != 1) X509_free(x);   /* on success the context owns it */\n", 108); vu_str_cat(&v_s, &_t4911); drop_Str(&_t4911); });
     #line 20773 "vuc.vu"
     VU_AT(20773);
     #line 20773 "vuc.vu"
-    ({ vu_str _t4914 = vu_str_lit("    unsigned char *wire = NULL;\n", 32); vu_str_cat(&v_s, &_t4914); drop_Str(&_t4914); });
+    ({ vu_str _t4914 = vu_str_lit("    BIO_free(b);\n", 17); vu_str_cat(&v_s, &_t4914); drop_Str(&_t4914); });
     #line 20774 "vuc.vu"
     VU_AT(20774);
     #line 20774 "vuc.vu"
-    ({ vu_str _t4917 = vu_str_lit("    if (alpn && !(wire = vu_alpn_wire(alpn, err))) return false;\n", 65); vu_str_cat(&v_s, &_t4917); drop_Str(&_t4917); });
+    ({ vu_str _t4917 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t4917); drop_Str(&_t4917); });
     #line 20775 "vuc.vu"
     VU_AT(20775);
     #line 20775 "vuc.vu"
-    ({ vu_str _t4920 = vu_str_lit("    char *h = vu_cpath(host, err);\n", 35); vu_str_cat(&v_s, &_t4920); drop_Str(&_t4920); });
+    ({ vu_str _t4920 = vu_str_lit("    b = vu_pem_bio(key);\n", 25); vu_str_cat(&v_s, &_t4920); drop_Str(&_t4920); });
     #line 20776 "vuc.vu"
     VU_AT(20776);
     #line 20776 "vuc.vu"
-    ({ vu_str _t4923 = vu_str_lit("    if (!h) { free(wire); drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }\n", 114); vu_str_cat(&v_s, &_t4923); drop_Str(&_t4923); });
+    ({ vu_str _t4923 = vu_str_lit("    EVP_PKEY *k = b ? PEM_read_bio_PrivateKey(b, NULL, vu_no_password, NULL) : NULL;\n", 85); vu_str_cat(&v_s, &_t4923); drop_Str(&_t4923); });
     #line 20777 "vuc.vu"
     VU_AT(20777);
     #line 20777 "vuc.vu"
-    ({ vu_str _t4926 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t4926); drop_Str(&_t4926); });
+    ({ vu_str _t4926 = vu_str_lit("    if (b) BIO_free(b);\n", 24); vu_str_cat(&v_s, &_t4926); drop_Str(&_t4926); });
     #line 20778 "vuc.vu"
     VU_AT(20778);
     #line 20778 "vuc.vu"
-    ({ vu_str _t4929 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t4929); drop_Str(&_t4929); });
+    ({ vu_str _t4929 = vu_str_lit("    if (!k) {\n", 14); vu_str_cat(&v_s, &_t4929); drop_Str(&_t4929); });
     #line 20779 "vuc.vu"
     VU_AT(20779);
     #line 20779 "vuc.vu"
-    ({ vu_str _t4932 = vu_str_lit("    SSL_CTX *ctx;\n", 18); vu_str_cat(&v_s, &_t4932); drop_Str(&_t4932); });
+    ({ vu_str _t4932 = vu_str_lit("        SSL_CTX_free(ctx);\n", 27); vu_str_cat(&v_s, &_t4932); drop_Str(&_t4932); });
     #line 20780 "vuc.vu"
     VU_AT(20780);
     #line 20780 "vuc.vu"
-    ({ vu_str _t4935 = vu_str_lit("    if (ca) {\n", 14); vu_str_cat(&v_s, &_t4935); drop_Str(&_t4935); });
+    ({ vu_str _t4935 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4935); drop_Str(&_t4935); });
     #line 20781 "vuc.vu"
     VU_AT(20781);
     #line 20781 "vuc.vu"
-    ({ vu_str _t4938 = vu_str_lit("        if (ca->len > (1 << 24)) { free(wire); free(h); *err = vu_errf(\"ca: the PEM text is too long\"); return false; }\n", 120); vu_str_cat(&v_s, &_t4938); drop_Str(&_t4938); });
+    ({ vu_str _t4938 = vu_str_lit("        *err = vu_errf(\"key: no private key found in the PEM text (keys protected by a password aren't supported)\");\n", 117); vu_str_cat(&v_s, &_t4938); drop_Str(&_t4938); });
     #line 20782 "vuc.vu"
     VU_AT(20782);
     #line 20782 "vuc.vu"
-    ({ vu_str _t4941 = vu_str_lit("        ctx = vu_tls_ctx(false);\n", 33); vu_str_cat(&v_s, &_t4941); drop_Str(&_t4941); });
+    ({ vu_str _t4941 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4941); drop_Str(&_t4941); });
     #line 20783 "vuc.vu"
     VU_AT(20783);
     #line 20783 "vuc.vu"
-    ({ vu_str _t4944 = vu_str_lit("        X509_STORE *st = SSL_CTX_get_cert_store(ctx);\n", 54); vu_str_cat(&v_s, &_t4944); drop_Str(&_t4944); });
+    ({ vu_str _t4944 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4944); drop_Str(&_t4944); });
     #line 20784 "vuc.vu"
     VU_AT(20784);
     #line 20784 "vuc.vu"
-    ({ vu_str _t4947 = vu_str_lit("        BIO *b = vu_pem_bio(ca);\n", 33); vu_str_cat(&v_s, &_t4947); drop_Str(&_t4947); });
+    ({ vu_str _t4947 = vu_str_lit("    int used = SSL_CTX_use_PrivateKey(ctx, k);\n", 47); vu_str_cat(&v_s, &_t4947); drop_Str(&_t4947); });
     #line 20785 "vuc.vu"
     VU_AT(20785);
     #line 20785 "vuc.vu"
-    ({ vu_str _t4950 = vu_str_lit("        int n = 0;\n", 19); vu_str_cat(&v_s, &_t4950); drop_Str(&_t4950); });
+    ({ vu_str _t4950 = vu_str_lit("    EVP_PKEY_free(k);\n", 22); vu_str_cat(&v_s, &_t4950); drop_Str(&_t4950); });
     #line 20786 "vuc.vu"
     VU_AT(20786);
     #line 20786 "vuc.vu"
-    ({ vu_str _t4953 = vu_str_lit("        X509 *x;\n", 17); vu_str_cat(&v_s, &_t4953); drop_Str(&_t4953); });
+    ({ vu_str _t4953 = vu_str_lit("    if (used != 1 || SSL_CTX_check_private_key(ctx) != 1) {\n", 60); vu_str_cat(&v_s, &_t4953); drop_Str(&_t4953); });
     #line 20787 "vuc.vu"
     VU_AT(20787);
     #line 20787 "vuc.vu"
-    ({ vu_str _t4956 = vu_str_lit("        while (b && (x = PEM_read_bio_X509(b, NULL, vu_no_password, NULL))) { X509_STORE_add_cert(st, x); X509_free(x); n++; }\n", 127); vu_str_cat(&v_s, &_t4956); drop_Str(&_t4956); });
+    ({ vu_str _t4956 = vu_str_lit("        SSL_CTX_free(ctx);\n", 27); vu_str_cat(&v_s, &_t4956); drop_Str(&_t4956); });
     #line 20788 "vuc.vu"
     VU_AT(20788);
     #line 20788 "vuc.vu"
-    ({ vu_str _t4959 = vu_str_lit("        if (b) BIO_free(b);\n", 28); vu_str_cat(&v_s, &_t4959); drop_Str(&_t4959); });
+    ({ vu_str _t4959 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4959); drop_Str(&_t4959); });
     #line 20789 "vuc.vu"
     VU_AT(20789);
     #line 20789 "vuc.vu"
-    ({ vu_str _t4962 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t4962); drop_Str(&_t4962); });
+    ({ vu_str _t4962 = vu_str_lit("        *err = vu_errf(\"key: the private key doesn't match the certificate\");\n", 78); vu_str_cat(&v_s, &_t4962); drop_Str(&_t4962); });
     #line 20790 "vuc.vu"
     VU_AT(20790);
     #line 20790 "vuc.vu"
-    ({ vu_str _t4965 = vu_str_lit("        if (!n) { free(wire); SSL_CTX_free(ctx); free(h); *err = vu_errf(\"ca: no certificate found in the PEM text\"); return false; }\n", 134); vu_str_cat(&v_s, &_t4965); drop_Str(&_t4965); });
+    ({ vu_str _t4965 = vu_str_lit("        return false;\n", 22); vu_str_cat(&v_s, &_t4965); drop_Str(&_t4965); });
     #line 20791 "vuc.vu"
     VU_AT(20791);
     #line 20791 "vuc.vu"
-    ({ vu_str _t4968 = vu_str_lit("    } else {\n", 13); vu_str_cat(&v_s, &_t4968); drop_Str(&_t4968); });
+    ({ vu_str _t4968 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t4968); drop_Str(&_t4968); });
     #line 20792 "vuc.vu"
     VU_AT(20792);
     #line 20792 "vuc.vu"
-    ({ vu_str _t4971 = vu_str_lit("        pthread_mutex_lock(&vu_tls_lock);\n", 42); vu_str_cat(&v_s, &_t4971); drop_Str(&_t4971); });
+    ({ vu_str _t4971 = vu_str_lit("    if (!vu_net_listen(net, port, out, err, line)) { SSL_CTX_free(ctx); return false; }\n", 88); vu_str_cat(&v_s, &_t4971); drop_Str(&_t4971); });
     #line 20793 "vuc.vu"
     VU_AT(20793);
     #line 20793 "vuc.vu"
-    ({ vu_str _t4974 = vu_str_lit("        if (!vu_tls_system) {\n", 30); vu_str_cat(&v_s, &_t4974); drop_Str(&_t4974); });
+    ({ vu_str _t4974 = vu_str_lit("    if (wire) SSL_CTX_set_alpn_select_cb(ctx, vu_alpn_pick, wire);\n", 67); vu_str_cat(&v_s, &_t4974); drop_Str(&_t4974); });
     #line 20794 "vuc.vu"
     VU_AT(20794);
     #line 20794 "vuc.vu"
-    ({ vu_str _t4977 = vu_str_lit("            SSL_CTX *sys = vu_tls_ctx(false);\n", 46); vu_str_cat(&v_s, &_t4977); drop_Str(&_t4977); });
+    ({ vu_str _t4977 = vu_str_lit("    ((vu_sock *)*out)->tls_ctx = ctx;\n", 38); vu_str_cat(&v_s, &_t4977); drop_Str(&_t4977); });
     #line 20795 "vuc.vu"
     VU_AT(20795);
     #line 20795 "vuc.vu"
-    ({ vu_str _t4980 = vu_str_lit("            SSL_CTX_set_default_verify_paths(sys);\n", 51); vu_str_cat(&v_s, &_t4980); drop_Str(&_t4980); });
+    ({ vu_str _t4980 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t4980); drop_Str(&_t4980); });
     #line 20796 "vuc.vu"
     VU_AT(20796);
     #line 20796 "vuc.vu"
-    ({ vu_str _t4983 = vu_str_lit("            ERR_clear_error();\n", 31); vu_str_cat(&v_s, &_t4983); drop_Str(&_t4983); });
+    ({ vu_str _t4983 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t4983); drop_Str(&_t4983); });
     #line 20797 "vuc.vu"
     VU_AT(20797);
     #line 20797 "vuc.vu"
-    ({ vu_str _t4986 = vu_str_lit("            vu_tls_system = sys;\n", 33); vu_str_cat(&v_s, &_t4986); drop_Str(&_t4986); });
+    ({ vu_str _t4986 = vu_str_lit("/* net.tls_connect(host, port, ca: pem, timeout: s): checks the server's certificate against the system's\n", 106); vu_str_cat(&v_s, &_t4986); drop_Str(&_t4986); });
     #line 20798 "vuc.vu"
     VU_AT(20798);
     #line 20798 "vuc.vu"
-    ({ vu_str _t4989 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t4989); drop_Str(&_t4989); });
+    ({ vu_str _t4989 = vu_str_lit("   certificates (or only the ones in ca) and that it is for host. */\n", 69); vu_str_cat(&v_s, &_t4989); drop_Str(&_t4989); });
     #line 20799 "vuc.vu"
     VU_AT(20799);
     #line 20799 "vuc.vu"
-    ({ vu_str _t4992 = vu_str_lit("        ctx = vu_tls_system;\n", 29); vu_str_cat(&v_s, &_t4992); drop_Str(&_t4992); });
+    ({ vu_str _t4992 = vu_str_lit("static bool vu_net_tls_connect(vu_cap net, const vu_str *host, int64_t port, const vu_str *ca, const vu_str *alpn, double timeout,\n", 131); vu_str_cat(&v_s, &_t4992); drop_Str(&_t4992); });
     #line 20800 "vuc.vu"
     VU_AT(20800);
     #line 20800 "vuc.vu"
-    ({ vu_str _t4995 = vu_str_lit("        SSL_CTX_up_ref(ctx);\n", 29); vu_str_cat(&v_s, &_t4995); drop_Str(&_t4995); });
+    ({ vu_str _t4995 = vu_str_lit("                               bool has, void **out, vu_str *err, int line) {\n", 78); vu_str_cat(&v_s, &_t4995); drop_Str(&_t4995); });
     #line 20801 "vuc.vu"
     VU_AT(20801);
     #line 20801 "vuc.vu"
-    ({ vu_str _t4998 = vu_str_lit("        pthread_mutex_unlock(&vu_tls_lock);\n", 44); vu_str_cat(&v_s, &_t4998); drop_Str(&_t4998); });
+    ({ vu_str _t4998 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t4998); drop_Str(&_t4998); });
     #line 20802 "vuc.vu"
     VU_AT(20802);
     #line 20802 "vuc.vu"
-    ({ vu_str _t5001 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5001); drop_Str(&_t5001); });
+    ({ vu_str _t5001 = vu_str_lit("    vu_task_here(\"net.tls_connect()\", line);\n", 45); vu_str_cat(&v_s, &_t5001); drop_Str(&_t5001); });
     #line 20803 "vuc.vu"
     VU_AT(20803);
     #line 20803 "vuc.vu"
-    ({ vu_str _t5004 = vu_str_lit("    void *sp = NULL;\n", 21); vu_str_cat(&v_s, &_t5004); drop_Str(&_t5004); });
+    ({ vu_str _t5004 = vu_str_lit("    if (port < 1 || port > 65535) { *err = vu_errf(\"port %lld is not in 1..65535\", (long long)port); return false; }\n", 117); vu_str_cat(&v_s, &_t5004); drop_Str(&_t5004); });
     #line 20804 "vuc.vu"
     VU_AT(20804);
     #line 20804 "vuc.vu"
-    ({ vu_str _t5007 = vu_str_lit("    if (!vu_connect_to(h, port, deadline, &sp, err, line)) { free(wire); SSL_CTX_free(ctx); free(h); return false; }\n", 117); vu_str_cat(&v_s, &_t5007); drop_Str(&_t5007); });
+    ({ vu_str _t5007 = vu_str_lit("    unsigned char *wire = NULL;\n", 32); vu_str_cat(&v_s, &_t5007); drop_Str(&_t5007); });
     #line 20805 "vuc.vu"
     VU_AT(20805);
     #line 20805 "vuc.vu"
-    ({ vu_str _t5010 = vu_str_lit("    vu_sock *s = (vu_sock *)sp;\n", 32); vu_str_cat(&v_s, &_t5010); drop_Str(&_t5010); });
+    ({ vu_str _t5010 = vu_str_lit("    if (alpn && !(wire = vu_alpn_wire(alpn, err))) return false;\n", 65); vu_str_cat(&v_s, &_t5010); drop_Str(&_t5010); });
     #line 20806 "vuc.vu"
     VU_AT(20806);
     #line 20806 "vuc.vu"
-    ({ vu_str _t5013 = vu_str_lit("    bool ok = vu_tls_attach(s, ctx, err);\n", 42); vu_str_cat(&v_s, &_t5013); drop_Str(&_t5013); });
+    ({ vu_str _t5013 = vu_str_lit("    char *h = vu_cpath(host, err);\n", 35); vu_str_cat(&v_s, &_t5013); drop_Str(&_t5013); });
     #line 20807 "vuc.vu"
     VU_AT(20807);
     #line 20807 "vuc.vu"
-    ({ vu_str _t5016 = vu_str_lit("    SSL_CTX_free(ctx);   /* the SSL object keeps its own reference */\n", 70); vu_str_cat(&v_s, &_t5016); drop_Str(&_t5016); });
+    ({ vu_str _t5016 = vu_str_lit("    if (!h) { free(wire); drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }\n", 114); vu_str_cat(&v_s, &_t5016); drop_Str(&_t5016); });
     #line 20808 "vuc.vu"
     VU_AT(20808);
     #line 20808 "vuc.vu"
-    ({ vu_str _t5019 = vu_str_lit("    if (ok) {\n", 14); vu_str_cat(&v_s, &_t5019); drop_Str(&_t5019); });
+    ({ vu_str _t5019 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t5019); drop_Str(&_t5019); });
     #line 20809 "vuc.vu"
     VU_AT(20809);
     #line 20809 "vuc.vu"
-    ({ vu_str _t5022 = vu_str_lit("        SSL *ssl = (SSL *)s->ssl;\n", 34); vu_str_cat(&v_s, &_t5022); drop_Str(&_t5022); });
+    ({ vu_str _t5022 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t5022); drop_Str(&_t5022); });
     #line 20810 "vuc.vu"
     VU_AT(20810);
     #line 20810 "vuc.vu"
-    ({ vu_str _t5025 = vu_str_lit("        unsigned char ip[16];\n", 30); vu_str_cat(&v_s, &_t5025); drop_Str(&_t5025); });
+    ({ vu_str _t5025 = vu_str_lit("    SSL_CTX *ctx;\n", 18); vu_str_cat(&v_s, &_t5025); drop_Str(&_t5025); });
     #line 20811 "vuc.vu"
     VU_AT(20811);
     #line 20811 "vuc.vu"
-    ({ vu_str _t5028 = vu_str_lit("        bool is_ip = inet_pton(AF_INET, h, ip) == 1 || inet_pton(AF_INET6, h, ip) == 1;\n", 88); vu_str_cat(&v_s, &_t5028); drop_Str(&_t5028); });
+    ({ vu_str _t5028 = vu_str_lit("    if (ca) {\n", 14); vu_str_cat(&v_s, &_t5028); drop_Str(&_t5028); });
     #line 20812 "vuc.vu"
     VU_AT(20812);
     #line 20812 "vuc.vu"
-    ({ vu_str _t5031 = vu_str_lit("        if (is_ip) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), h);\n", 74); vu_str_cat(&v_s, &_t5031); drop_Str(&_t5031); });
+    ({ vu_str _t5031 = vu_str_lit("        if (ca->len > (1 << 24)) { free(wire); free(h); *err = vu_errf(\"ca: the PEM text is too long\"); return false; }\n", 120); vu_str_cat(&v_s, &_t5031); drop_Str(&_t5031); });
     #line 20813 "vuc.vu"
     VU_AT(20813);
     #line 20813 "vuc.vu"
-    ({ vu_str _t5034 = vu_str_lit("        else { SSL_set_tlsext_host_name(ssl, h); SSL_set1_host(ssl, h); }\n", 74); vu_str_cat(&v_s, &_t5034); drop_Str(&_t5034); });
+    ({ vu_str _t5034 = vu_str_lit("        ctx = vu_tls_ctx(false);\n", 33); vu_str_cat(&v_s, &_t5034); drop_Str(&_t5034); });
     #line 20814 "vuc.vu"
     VU_AT(20814);
     #line 20814 "vuc.vu"
-    ({ vu_str _t5037 = vu_str_lit("        if (wire) SSL_set_alpn_protos(ssl, wire + 1, wire[0]);\n", 63); vu_str_cat(&v_s, &_t5037); drop_Str(&_t5037); });
+    ({ vu_str _t5037 = vu_str_lit("        X509_STORE *st = SSL_CTX_get_cert_store(ctx);\n", 54); vu_str_cat(&v_s, &_t5037); drop_Str(&_t5037); });
     #line 20815 "vuc.vu"
     VU_AT(20815);
     #line 20815 "vuc.vu"
-    ({ vu_str _t5040 = vu_str_lit("        SSL_set_connect_state(ssl);\n", 36); vu_str_cat(&v_s, &_t5040); drop_Str(&_t5040); });
+    ({ vu_str _t5040 = vu_str_lit("        BIO *b = vu_pem_bio(ca);\n", 33); vu_str_cat(&v_s, &_t5040); drop_Str(&_t5040); });
     #line 20816 "vuc.vu"
     VU_AT(20816);
     #line 20816 "vuc.vu"
-    ({ vu_str _t5043 = vu_str_lit("        ok = vu_tls_handshake(s, deadline, err, line);\n", 55); vu_str_cat(&v_s, &_t5043); drop_Str(&_t5043); });
+    ({ vu_str _t5043 = vu_str_lit("        int n = 0;\n", 19); vu_str_cat(&v_s, &_t5043); drop_Str(&_t5043); });
     #line 20817 "vuc.vu"
     VU_AT(20817);
     #line 20817 "vuc.vu"
-    ({ vu_str _t5046 = vu_str_lit("        if (!ok) {\n", 19); vu_str_cat(&v_s, &_t5046); drop_Str(&_t5046); });
+    ({ vu_str _t5046 = vu_str_lit("        X509 *x;\n", 17); vu_str_cat(&v_s, &_t5046); drop_Str(&_t5046); });
     #line 20818 "vuc.vu"
     VU_AT(20818);
     #line 20818 "vuc.vu"
-    ({ vu_str _t5049 = vu_str_lit("            vu_str e = *err;\n", 29); vu_str_cat(&v_s, &_t5049); drop_Str(&_t5049); });
+    ({ vu_str _t5049 = vu_str_lit("        while (b && (x = PEM_read_bio_X509(b, NULL, vu_no_password, NULL))) { X509_STORE_add_cert(st, x); X509_free(x); n++; }\n", 127); vu_str_cat(&v_s, &_t5049); drop_Str(&_t5049); });
     #line 20819 "vuc.vu"
     VU_AT(20819);
     #line 20819 "vuc.vu"
-    ({ vu_str _t5052 = vu_str_lit("            *err = vu_errf(\"%.200s:%lld: %.*s\", h, (long long)port, (int)e.len, (const char *)e.data);\n", 103); vu_str_cat(&v_s, &_t5052); drop_Str(&_t5052); });
+    ({ vu_str _t5052 = vu_str_lit("        if (b) BIO_free(b);\n", 28); vu_str_cat(&v_s, &_t5052); drop_Str(&_t5052); });
     #line 20820 "vuc.vu"
     VU_AT(20820);
     #line 20820 "vuc.vu"
-    ({ vu_str _t5055 = vu_str_lit("            drop_Str(&e);\n", 26); vu_str_cat(&v_s, &_t5055); drop_Str(&_t5055); });
+    ({ vu_str _t5055 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t5055); drop_Str(&_t5055); });
     #line 20821 "vuc.vu"
     VU_AT(20821);
     #line 20821 "vuc.vu"
-    ({ vu_str _t5058 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5058); drop_Str(&_t5058); });
+    ({ vu_str _t5058 = vu_str_lit("        if (!n) { free(wire); SSL_CTX_free(ctx); free(h); *err = vu_errf(\"ca: no certificate found in the PEM text\"); return false; }\n", 134); vu_str_cat(&v_s, &_t5058); drop_Str(&_t5058); });
     #line 20822 "vuc.vu"
     VU_AT(20822);
     #line 20822 "vuc.vu"
-    ({ vu_str _t5061 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5061); drop_Str(&_t5061); });
+    ({ vu_str _t5061 = vu_str_lit("    } else {\n", 13); vu_str_cat(&v_s, &_t5061); drop_Str(&_t5061); });
     #line 20823 "vuc.vu"
     VU_AT(20823);
     #line 20823 "vuc.vu"
-    ({ vu_str _t5064 = vu_str_lit("    free(h);\n", 13); vu_str_cat(&v_s, &_t5064); drop_Str(&_t5064); });
+    ({ vu_str _t5064 = vu_str_lit("        pthread_mutex_lock(&vu_tls_lock);\n", 42); vu_str_cat(&v_s, &_t5064); drop_Str(&_t5064); });
     #line 20824 "vuc.vu"
     VU_AT(20824);
     #line 20824 "vuc.vu"
-    ({ vu_str _t5067 = vu_str_lit("    free(wire);\n", 16); vu_str_cat(&v_s, &_t5067); drop_Str(&_t5067); });
+    ({ vu_str _t5067 = vu_str_lit("        if (!vu_tls_system) {\n", 30); vu_str_cat(&v_s, &_t5067); drop_Str(&_t5067); });
     #line 20825 "vuc.vu"
     VU_AT(20825);
     #line 20825 "vuc.vu"
-    ({ vu_str _t5070 = vu_str_lit("    if (!ok) { vu_sock_drop(s); return false; }\n", 48); vu_str_cat(&v_s, &_t5070); drop_Str(&_t5070); });
+    ({ vu_str _t5070 = vu_str_lit("            SSL_CTX *sys = vu_tls_ctx(false);\n", 46); vu_str_cat(&v_s, &_t5070); drop_Str(&_t5070); });
     #line 20826 "vuc.vu"
     VU_AT(20826);
     #line 20826 "vuc.vu"
-    ({ vu_str _t5073 = vu_str_lit("    *out = s;\n", 14); vu_str_cat(&v_s, &_t5073); drop_Str(&_t5073); });
+    ({ vu_str _t5073 = vu_str_lit("            SSL_CTX_set_default_verify_paths(sys);\n", 51); vu_str_cat(&v_s, &_t5073); drop_Str(&_t5073); });
     #line 20827 "vuc.vu"
     VU_AT(20827);
     #line 20827 "vuc.vu"
-    ({ vu_str _t5076 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t5076); drop_Str(&_t5076); });
+    ({ vu_str _t5076 = vu_str_lit("            ERR_clear_error();\n", 31); vu_str_cat(&v_s, &_t5076); drop_Str(&_t5076); });
     #line 20828 "vuc.vu"
     VU_AT(20828);
     #line 20828 "vuc.vu"
-    ({ vu_str _t5079 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5079); drop_Str(&_t5079); });
+    ({ vu_str _t5079 = vu_str_lit("            vu_tls_system = sys;\n", 33); vu_str_cat(&v_s, &_t5079); drop_Str(&_t5079); });
     #line 20829 "vuc.vu"
     VU_AT(20829);
     #line 20829 "vuc.vu"
-    ({ vu_str _t5082 = vu_str_lit("/* net.start_tls(&conn, host, ca:, timeout:): TLS on a connection that's already open (STARTTLS, as\n", 100); vu_str_cat(&v_s, &_t5082); drop_Str(&_t5082); });
+    ({ vu_str _t5082 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5082); drop_Str(&_t5082); });
     #line 20830 "vuc.vu"
     VU_AT(20830);
     #line 20830 "vuc.vu"
-    ({ vu_str _t5085 = vu_str_lit("   PostgreSQL and SMTP do it), with the same checks as tls_connect. */\n", 71); vu_str_cat(&v_s, &_t5085); drop_Str(&_t5085); });
+    ({ vu_str _t5085 = vu_str_lit("        ctx = vu_tls_system;\n", 29); vu_str_cat(&v_s, &_t5085); drop_Str(&_t5085); });
     #line 20831 "vuc.vu"
     VU_AT(20831);
     #line 20831 "vuc.vu"
-    ({ vu_str _t5088 = vu_str_lit("static bool vu_net_start_tls(vu_cap net, void **conn, const vu_str *host, const vu_str *ca, double timeout, bool has,\n", 118); vu_str_cat(&v_s, &_t5088); drop_Str(&_t5088); });
+    ({ vu_str _t5088 = vu_str_lit("        SSL_CTX_up_ref(ctx);\n", 29); vu_str_cat(&v_s, &_t5088); drop_Str(&_t5088); });
     #line 20832 "vuc.vu"
     VU_AT(20832);
     #line 20832 "vuc.vu"
-    ({ vu_str _t5091 = vu_str_lit("                             vu_str *err, int line) {\n", 54); vu_str_cat(&v_s, &_t5091); drop_Str(&_t5091); });
+    ({ vu_str _t5091 = vu_str_lit("        pthread_mutex_unlock(&vu_tls_lock);\n", 44); vu_str_cat(&v_s, &_t5091); drop_Str(&_t5091); });
     #line 20833 "vuc.vu"
     VU_AT(20833);
     #line 20833 "vuc.vu"
-    ({ vu_str _t5094 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t5094); drop_Str(&_t5094); });
+    ({ vu_str _t5094 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5094); drop_Str(&_t5094); });
     #line 20834 "vuc.vu"
     VU_AT(20834);
     #line 20834 "vuc.vu"
-    ({ vu_str _t5097 = vu_str_lit("    vu_task_here(\"net.start_tls()\", line);\n", 43); vu_str_cat(&v_s, &_t5097); drop_Str(&_t5097); });
+    ({ vu_str _t5097 = vu_str_lit("    void *sp = NULL;\n", 21); vu_str_cat(&v_s, &_t5097); drop_Str(&_t5097); });
     #line 20835 "vuc.vu"
     VU_AT(20835);
     #line 20835 "vuc.vu"
-    ({ vu_str _t5100 = vu_str_lit("    vu_sock *s = (vu_sock *)*conn;\n", 35); vu_str_cat(&v_s, &_t5100); drop_Str(&_t5100); });
+    ({ vu_str _t5100 = vu_str_lit("    if (!vu_connect_to(h, port, deadline, &sp, err, line)) { free(wire); SSL_CTX_free(ctx); free(h); return false; }\n", 117); vu_str_cat(&v_s, &_t5100); drop_Str(&_t5100); });
     #line 20836 "vuc.vu"
     VU_AT(20836);
     #line 20836 "vuc.vu"
-    ({ vu_str _t5103 = vu_str_lit("    if (!s) { *err = vu_errf(\"net.start_tls(): the connection is closed\"); return false; }\n", 91); vu_str_cat(&v_s, &_t5103); drop_Str(&_t5103); });
+    ({ vu_str _t5103 = vu_str_lit("    vu_sock *s = (vu_sock *)sp;\n", 32); vu_str_cat(&v_s, &_t5103); drop_Str(&_t5103); });
     #line 20837 "vuc.vu"
     VU_AT(20837);
     #line 20837 "vuc.vu"
-    ({ vu_str _t5106 = vu_str_lit("    if (s->ssl) { *err = vu_errf(\"net.start_tls(): the connection already uses TLS\"); return false; }\n", 102); vu_str_cat(&v_s, &_t5106); drop_Str(&_t5106); });
+    ({ vu_str _t5106 = vu_str_lit("    bool ok = vu_tls_attach(s, ctx, err);\n", 42); vu_str_cat(&v_s, &_t5106); drop_Str(&_t5106); });
     #line 20838 "vuc.vu"
     VU_AT(20838);
     #line 20838 "vuc.vu"
-    ({ vu_str _t5109 = vu_str_lit("    char *h = vu_cpath(host, err);\n", 35); vu_str_cat(&v_s, &_t5109); drop_Str(&_t5109); });
+    ({ vu_str _t5109 = vu_str_lit("    SSL_CTX_free(ctx);   /* the SSL object keeps its own reference */\n", 70); vu_str_cat(&v_s, &_t5109); drop_Str(&_t5109); });
     #line 20839 "vuc.vu"
     VU_AT(20839);
     #line 20839 "vuc.vu"
-    ({ vu_str _t5112 = vu_str_lit("    if (!h) { drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }\n", 102); vu_str_cat(&v_s, &_t5112); drop_Str(&_t5112); });
+    ({ vu_str _t5112 = vu_str_lit("    if (ok) {\n", 14); vu_str_cat(&v_s, &_t5112); drop_Str(&_t5112); });
     #line 20840 "vuc.vu"
     VU_AT(20840);
     #line 20840 "vuc.vu"
-    ({ vu_str _t5115 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t5115); drop_Str(&_t5115); });
+    ({ vu_str _t5115 = vu_str_lit("        SSL *ssl = (SSL *)s->ssl;\n", 34); vu_str_cat(&v_s, &_t5115); drop_Str(&_t5115); });
     #line 20841 "vuc.vu"
     VU_AT(20841);
     #line 20841 "vuc.vu"
-    ({ vu_str _t5118 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t5118); drop_Str(&_t5118); });
+    ({ vu_str _t5118 = vu_str_lit("        unsigned char ip[16];\n", 30); vu_str_cat(&v_s, &_t5118); drop_Str(&_t5118); });
     #line 20842 "vuc.vu"
     VU_AT(20842);
     #line 20842 "vuc.vu"
-    ({ vu_str _t5121 = vu_str_lit("    SSL_CTX *ctx;\n", 18); vu_str_cat(&v_s, &_t5121); drop_Str(&_t5121); });
+    ({ vu_str _t5121 = vu_str_lit("        bool is_ip = inet_pton(AF_INET, h, ip) == 1 || inet_pton(AF_INET6, h, ip) == 1;\n", 88); vu_str_cat(&v_s, &_t5121); drop_Str(&_t5121); });
     #line 20843 "vuc.vu"
     VU_AT(20843);
     #line 20843 "vuc.vu"
-    ({ vu_str _t5124 = vu_str_lit("    if (ca) {\n", 14); vu_str_cat(&v_s, &_t5124); drop_Str(&_t5124); });
+    ({ vu_str _t5124 = vu_str_lit("        if (is_ip) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), h);\n", 74); vu_str_cat(&v_s, &_t5124); drop_Str(&_t5124); });
     #line 20844 "vuc.vu"
     VU_AT(20844);
     #line 20844 "vuc.vu"
-    ({ vu_str _t5127 = vu_str_lit("        if (ca->len > (1 << 24)) { free(h); *err = vu_errf(\"ca: the PEM text is too long\"); return false; }\n", 108); vu_str_cat(&v_s, &_t5127); drop_Str(&_t5127); });
+    ({ vu_str _t5127 = vu_str_lit("        else { SSL_set_tlsext_host_name(ssl, h); SSL_set1_host(ssl, h); }\n", 74); vu_str_cat(&v_s, &_t5127); drop_Str(&_t5127); });
     #line 20845 "vuc.vu"
     VU_AT(20845);
     #line 20845 "vuc.vu"
-    ({ vu_str _t5130 = vu_str_lit("        ctx = vu_tls_ctx(false);\n", 33); vu_str_cat(&v_s, &_t5130); drop_Str(&_t5130); });
+    ({ vu_str _t5130 = vu_str_lit("        if (wire) SSL_set_alpn_protos(ssl, wire + 1, wire[0]);\n", 63); vu_str_cat(&v_s, &_t5130); drop_Str(&_t5130); });
     #line 20846 "vuc.vu"
     VU_AT(20846);
     #line 20846 "vuc.vu"
-    ({ vu_str _t5133 = vu_str_lit("        X509_STORE *st = SSL_CTX_get_cert_store(ctx);\n", 54); vu_str_cat(&v_s, &_t5133); drop_Str(&_t5133); });
+    ({ vu_str _t5133 = vu_str_lit("        SSL_set_connect_state(ssl);\n", 36); vu_str_cat(&v_s, &_t5133); drop_Str(&_t5133); });
     #line 20847 "vuc.vu"
     VU_AT(20847);
     #line 20847 "vuc.vu"
-    ({ vu_str _t5136 = vu_str_lit("        BIO *b = vu_pem_bio(ca);\n", 33); vu_str_cat(&v_s, &_t5136); drop_Str(&_t5136); });
+    ({ vu_str _t5136 = vu_str_lit("        ok = vu_tls_handshake(s, deadline, err, line);\n", 55); vu_str_cat(&v_s, &_t5136); drop_Str(&_t5136); });
     #line 20848 "vuc.vu"
     VU_AT(20848);
     #line 20848 "vuc.vu"
-    ({ vu_str _t5139 = vu_str_lit("        int n = 0;\n", 19); vu_str_cat(&v_s, &_t5139); drop_Str(&_t5139); });
+    ({ vu_str _t5139 = vu_str_lit("        if (!ok) {\n", 19); vu_str_cat(&v_s, &_t5139); drop_Str(&_t5139); });
     #line 20849 "vuc.vu"
     VU_AT(20849);
     #line 20849 "vuc.vu"
-    ({ vu_str _t5142 = vu_str_lit("        X509 *x;\n", 17); vu_str_cat(&v_s, &_t5142); drop_Str(&_t5142); });
+    ({ vu_str _t5142 = vu_str_lit("            vu_str e = *err;\n", 29); vu_str_cat(&v_s, &_t5142); drop_Str(&_t5142); });
     #line 20850 "vuc.vu"
     VU_AT(20850);
     #line 20850 "vuc.vu"
-    ({ vu_str _t5145 = vu_str_lit("        while (b && (x = PEM_read_bio_X509(b, NULL, vu_no_password, NULL))) { X509_STORE_add_cert(st, x); X509_free(x); n++; }\n", 127); vu_str_cat(&v_s, &_t5145); drop_Str(&_t5145); });
+    ({ vu_str _t5145 = vu_str_lit("            *err = vu_errf(\"%.200s:%lld: %.*s\", h, (long long)port, (int)e.len, (const char *)e.data);\n", 103); vu_str_cat(&v_s, &_t5145); drop_Str(&_t5145); });
     #line 20851 "vuc.vu"
     VU_AT(20851);
     #line 20851 "vuc.vu"
-    ({ vu_str _t5148 = vu_str_lit("        if (b) BIO_free(b);\n", 28); vu_str_cat(&v_s, &_t5148); drop_Str(&_t5148); });
+    ({ vu_str _t5148 = vu_str_lit("            drop_Str(&e);\n", 26); vu_str_cat(&v_s, &_t5148); drop_Str(&_t5148); });
     #line 20852 "vuc.vu"
     VU_AT(20852);
     #line 20852 "vuc.vu"
-    ({ vu_str _t5151 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t5151); drop_Str(&_t5151); });
+    ({ vu_str _t5151 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5151); drop_Str(&_t5151); });
     #line 20853 "vuc.vu"
     VU_AT(20853);
     #line 20853 "vuc.vu"
-    ({ vu_str _t5154 = vu_str_lit("        if (!n) { SSL_CTX_free(ctx); free(h); *err = vu_errf(\"ca: no certificate found in the PEM text\"); return false; }\n", 122); vu_str_cat(&v_s, &_t5154); drop_Str(&_t5154); });
+    ({ vu_str _t5154 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5154); drop_Str(&_t5154); });
     #line 20854 "vuc.vu"
     VU_AT(20854);
     #line 20854 "vuc.vu"
-    ({ vu_str _t5157 = vu_str_lit("    } else {\n", 13); vu_str_cat(&v_s, &_t5157); drop_Str(&_t5157); });
+    ({ vu_str _t5157 = vu_str_lit("    free(h);\n", 13); vu_str_cat(&v_s, &_t5157); drop_Str(&_t5157); });
     #line 20855 "vuc.vu"
     VU_AT(20855);
     #line 20855 "vuc.vu"
-    ({ vu_str _t5160 = vu_str_lit("        pthread_mutex_lock(&vu_tls_lock);\n", 42); vu_str_cat(&v_s, &_t5160); drop_Str(&_t5160); });
+    ({ vu_str _t5160 = vu_str_lit("    free(wire);\n", 16); vu_str_cat(&v_s, &_t5160); drop_Str(&_t5160); });
     #line 20856 "vuc.vu"
     VU_AT(20856);
     #line 20856 "vuc.vu"
-    ({ vu_str _t5163 = vu_str_lit("        if (!vu_tls_system) {\n", 30); vu_str_cat(&v_s, &_t5163); drop_Str(&_t5163); });
+    ({ vu_str _t5163 = vu_str_lit("    if (!ok) { vu_sock_drop(s); return false; }\n", 48); vu_str_cat(&v_s, &_t5163); drop_Str(&_t5163); });
     #line 20857 "vuc.vu"
     VU_AT(20857);
     #line 20857 "vuc.vu"
-    ({ vu_str _t5166 = vu_str_lit("            SSL_CTX *sys = vu_tls_ctx(false);\n", 46); vu_str_cat(&v_s, &_t5166); drop_Str(&_t5166); });
+    ({ vu_str _t5166 = vu_str_lit("    *out = s;\n", 14); vu_str_cat(&v_s, &_t5166); drop_Str(&_t5166); });
     #line 20858 "vuc.vu"
     VU_AT(20858);
     #line 20858 "vuc.vu"
-    ({ vu_str _t5169 = vu_str_lit("            SSL_CTX_set_default_verify_paths(sys);\n", 51); vu_str_cat(&v_s, &_t5169); drop_Str(&_t5169); });
+    ({ vu_str _t5169 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t5169); drop_Str(&_t5169); });
     #line 20859 "vuc.vu"
     VU_AT(20859);
     #line 20859 "vuc.vu"
-    ({ vu_str _t5172 = vu_str_lit("            ERR_clear_error();\n", 31); vu_str_cat(&v_s, &_t5172); drop_Str(&_t5172); });
+    ({ vu_str _t5172 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5172); drop_Str(&_t5172); });
     #line 20860 "vuc.vu"
     VU_AT(20860);
     #line 20860 "vuc.vu"
-    ({ vu_str _t5175 = vu_str_lit("            vu_tls_system = sys;\n", 33); vu_str_cat(&v_s, &_t5175); drop_Str(&_t5175); });
+    ({ vu_str _t5175 = vu_str_lit("/* net.start_tls(&conn, host, ca:, timeout:): TLS on a connection that's already open (STARTTLS, as\n", 100); vu_str_cat(&v_s, &_t5175); drop_Str(&_t5175); });
     #line 20861 "vuc.vu"
     VU_AT(20861);
     #line 20861 "vuc.vu"
-    ({ vu_str _t5178 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5178); drop_Str(&_t5178); });
+    ({ vu_str _t5178 = vu_str_lit("   PostgreSQL and SMTP do it), with the same checks as tls_connect. */\n", 71); vu_str_cat(&v_s, &_t5178); drop_Str(&_t5178); });
     #line 20862 "vuc.vu"
     VU_AT(20862);
     #line 20862 "vuc.vu"
-    ({ vu_str _t5181 = vu_str_lit("        ctx = vu_tls_system;\n", 29); vu_str_cat(&v_s, &_t5181); drop_Str(&_t5181); });
+    ({ vu_str _t5181 = vu_str_lit("static bool vu_net_start_tls(vu_cap net, void **conn, const vu_str *host, const vu_str *ca, double timeout, bool has,\n", 118); vu_str_cat(&v_s, &_t5181); drop_Str(&_t5181); });
     #line 20863 "vuc.vu"
     VU_AT(20863);
     #line 20863 "vuc.vu"
-    ({ vu_str _t5184 = vu_str_lit("        SSL_CTX_up_ref(ctx);\n", 29); vu_str_cat(&v_s, &_t5184); drop_Str(&_t5184); });
+    ({ vu_str _t5184 = vu_str_lit("                             vu_str *err, int line) {\n", 54); vu_str_cat(&v_s, &_t5184); drop_Str(&_t5184); });
     #line 20864 "vuc.vu"
     VU_AT(20864);
     #line 20864 "vuc.vu"
-    ({ vu_str _t5187 = vu_str_lit("        pthread_mutex_unlock(&vu_tls_lock);\n", 44); vu_str_cat(&v_s, &_t5187); drop_Str(&_t5187); });
+    ({ vu_str _t5187 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t5187); drop_Str(&_t5187); });
     #line 20865 "vuc.vu"
     VU_AT(20865);
     #line 20865 "vuc.vu"
-    ({ vu_str _t5190 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5190); drop_Str(&_t5190); });
+    ({ vu_str _t5190 = vu_str_lit("    vu_task_here(\"net.start_tls()\", line);\n", 43); vu_str_cat(&v_s, &_t5190); drop_Str(&_t5190); });
     #line 20866 "vuc.vu"
     VU_AT(20866);
     #line 20866 "vuc.vu"
-    ({ vu_str _t5193 = vu_str_lit("    bool ok = vu_tls_attach(s, ctx, err);\n", 42); vu_str_cat(&v_s, &_t5193); drop_Str(&_t5193); });
+    ({ vu_str _t5193 = vu_str_lit("    vu_sock *s = (vu_sock *)*conn;\n", 35); vu_str_cat(&v_s, &_t5193); drop_Str(&_t5193); });
     #line 20867 "vuc.vu"
     VU_AT(20867);
     #line 20867 "vuc.vu"
-    ({ vu_str _t5196 = vu_str_lit("    SSL_CTX_free(ctx);\n", 23); vu_str_cat(&v_s, &_t5196); drop_Str(&_t5196); });
+    ({ vu_str _t5196 = vu_str_lit("    if (!s) { *err = vu_errf(\"net.start_tls(): the connection is closed\"); return false; }\n", 91); vu_str_cat(&v_s, &_t5196); drop_Str(&_t5196); });
     #line 20868 "vuc.vu"
     VU_AT(20868);
     #line 20868 "vuc.vu"
-    ({ vu_str _t5199 = vu_str_lit("    if (ok) {\n", 14); vu_str_cat(&v_s, &_t5199); drop_Str(&_t5199); });
+    ({ vu_str _t5199 = vu_str_lit("    if (s->ssl) { *err = vu_errf(\"net.start_tls(): the connection already uses TLS\"); return false; }\n", 102); vu_str_cat(&v_s, &_t5199); drop_Str(&_t5199); });
     #line 20869 "vuc.vu"
     VU_AT(20869);
     #line 20869 "vuc.vu"
-    ({ vu_str _t5202 = vu_str_lit("        SSL *ssl = (SSL *)s->ssl;\n", 34); vu_str_cat(&v_s, &_t5202); drop_Str(&_t5202); });
+    ({ vu_str _t5202 = vu_str_lit("    char *h = vu_cpath(host, err);\n", 35); vu_str_cat(&v_s, &_t5202); drop_Str(&_t5202); });
     #line 20870 "vuc.vu"
     VU_AT(20870);
     #line 20870 "vuc.vu"
-    ({ vu_str _t5205 = vu_str_lit("        unsigned char ip[16];\n", 30); vu_str_cat(&v_s, &_t5205); drop_Str(&_t5205); });
+    ({ vu_str _t5205 = vu_str_lit("    if (!h) { drop_Str(err); *err = vu_errf(\"a host name can't contain a zero byte\"); return false; }\n", 102); vu_str_cat(&v_s, &_t5205); drop_Str(&_t5205); });
     #line 20871 "vuc.vu"
     VU_AT(20871);
     #line 20871 "vuc.vu"
-    ({ vu_str _t5208 = vu_str_lit("        bool is_ip = inet_pton(AF_INET, h, ip) == 1 || inet_pton(AF_INET6, h, ip) == 1;\n", 88); vu_str_cat(&v_s, &_t5208); drop_Str(&_t5208); });
+    ({ vu_str _t5208 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t5208); drop_Str(&_t5208); });
     #line 20872 "vuc.vu"
     VU_AT(20872);
     #line 20872 "vuc.vu"
-    ({ vu_str _t5211 = vu_str_lit("        if (is_ip) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), h);\n", 74); vu_str_cat(&v_s, &_t5211); drop_Str(&_t5211); });
+    ({ vu_str _t5211 = vu_str_lit("    ERR_clear_error();\n", 23); vu_str_cat(&v_s, &_t5211); drop_Str(&_t5211); });
     #line 20873 "vuc.vu"
     VU_AT(20873);
     #line 20873 "vuc.vu"
-    ({ vu_str _t5214 = vu_str_lit("        else { SSL_set_tlsext_host_name(ssl, h); SSL_set1_host(ssl, h); }\n", 74); vu_str_cat(&v_s, &_t5214); drop_Str(&_t5214); });
+    ({ vu_str _t5214 = vu_str_lit("    SSL_CTX *ctx;\n", 18); vu_str_cat(&v_s, &_t5214); drop_Str(&_t5214); });
     #line 20874 "vuc.vu"
     VU_AT(20874);
     #line 20874 "vuc.vu"
-    ({ vu_str _t5217 = vu_str_lit("        SSL_set_connect_state(ssl);\n", 36); vu_str_cat(&v_s, &_t5217); drop_Str(&_t5217); });
+    ({ vu_str _t5217 = vu_str_lit("    if (ca) {\n", 14); vu_str_cat(&v_s, &_t5217); drop_Str(&_t5217); });
     #line 20875 "vuc.vu"
     VU_AT(20875);
     #line 20875 "vuc.vu"
-    ({ vu_str _t5220 = vu_str_lit("        ok = vu_tls_handshake(s, deadline, err, line);\n", 55); vu_str_cat(&v_s, &_t5220); drop_Str(&_t5220); });
+    ({ vu_str _t5220 = vu_str_lit("        if (ca->len > (1 << 24)) { free(h); *err = vu_errf(\"ca: the PEM text is too long\"); return false; }\n", 108); vu_str_cat(&v_s, &_t5220); drop_Str(&_t5220); });
     #line 20876 "vuc.vu"
     VU_AT(20876);
     #line 20876 "vuc.vu"
-    ({ vu_str _t5223 = vu_str_lit("        if (!ok) {\n", 19); vu_str_cat(&v_s, &_t5223); drop_Str(&_t5223); });
+    ({ vu_str _t5223 = vu_str_lit("        ctx = vu_tls_ctx(false);\n", 33); vu_str_cat(&v_s, &_t5223); drop_Str(&_t5223); });
     #line 20877 "vuc.vu"
     VU_AT(20877);
     #line 20877 "vuc.vu"
-    ({ vu_str _t5226 = vu_str_lit("            vu_str e = *err;\n", 29); vu_str_cat(&v_s, &_t5226); drop_Str(&_t5226); });
+    ({ vu_str _t5226 = vu_str_lit("        X509_STORE *st = SSL_CTX_get_cert_store(ctx);\n", 54); vu_str_cat(&v_s, &_t5226); drop_Str(&_t5226); });
     #line 20878 "vuc.vu"
     VU_AT(20878);
     #line 20878 "vuc.vu"
-    ({ vu_str _t5229 = vu_str_lit("            *err = vu_errf(\"%.200s: %.*s\", h, (int)e.len, (const char *)e.data);\n", 81); vu_str_cat(&v_s, &_t5229); drop_Str(&_t5229); });
+    ({ vu_str _t5229 = vu_str_lit("        BIO *b = vu_pem_bio(ca);\n", 33); vu_str_cat(&v_s, &_t5229); drop_Str(&_t5229); });
     #line 20879 "vuc.vu"
     VU_AT(20879);
     #line 20879 "vuc.vu"
-    ({ vu_str _t5232 = vu_str_lit("            drop_Str(&e);\n", 26); vu_str_cat(&v_s, &_t5232); drop_Str(&_t5232); });
+    ({ vu_str _t5232 = vu_str_lit("        int n = 0;\n", 19); vu_str_cat(&v_s, &_t5232); drop_Str(&_t5232); });
     #line 20880 "vuc.vu"
     VU_AT(20880);
     #line 20880 "vuc.vu"
-    ({ vu_str _t5235 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5235); drop_Str(&_t5235); });
+    ({ vu_str _t5235 = vu_str_lit("        X509 *x;\n", 17); vu_str_cat(&v_s, &_t5235); drop_Str(&_t5235); });
     #line 20881 "vuc.vu"
     VU_AT(20881);
     #line 20881 "vuc.vu"
-    ({ vu_str _t5238 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5238); drop_Str(&_t5238); });
+    ({ vu_str _t5238 = vu_str_lit("        while (b && (x = PEM_read_bio_X509(b, NULL, vu_no_password, NULL))) { X509_STORE_add_cert(st, x); X509_free(x); n++; }\n", 127); vu_str_cat(&v_s, &_t5238); drop_Str(&_t5238); });
     #line 20882 "vuc.vu"
     VU_AT(20882);
     #line 20882 "vuc.vu"
-    ({ vu_str _t5241 = vu_str_lit("    free(h);\n", 13); vu_str_cat(&v_s, &_t5241); drop_Str(&_t5241); });
+    ({ vu_str _t5241 = vu_str_lit("        if (b) BIO_free(b);\n", 28); vu_str_cat(&v_s, &_t5241); drop_Str(&_t5241); });
     #line 20883 "vuc.vu"
     VU_AT(20883);
     #line 20883 "vuc.vu"
-    ({ vu_str _t5244 = vu_str_lit("    if (!ok) { vu_sock_drop(s); *conn = NULL; return false; }\n", 62); vu_str_cat(&v_s, &_t5244); drop_Str(&_t5244); });
+    ({ vu_str _t5244 = vu_str_lit("        ERR_clear_error();\n", 27); vu_str_cat(&v_s, &_t5244); drop_Str(&_t5244); });
     #line 20884 "vuc.vu"
     VU_AT(20884);
     #line 20884 "vuc.vu"
-    ({ vu_str _t5247 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t5247); drop_Str(&_t5247); });
+    ({ vu_str _t5247 = vu_str_lit("        if (!n) { SSL_CTX_free(ctx); free(h); *err = vu_errf(\"ca: no certificate found in the PEM text\"); return false; }\n", 122); vu_str_cat(&v_s, &_t5247); drop_Str(&_t5247); });
     #line 20885 "vuc.vu"
     VU_AT(20885);
     #line 20885 "vuc.vu"
-    ({ vu_str _t5250 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5250); drop_Str(&_t5250); });
+    ({ vu_str _t5250 = vu_str_lit("    } else {\n", 13); vu_str_cat(&v_s, &_t5250); drop_Str(&_t5250); });
     #line 20886 "vuc.vu"
     VU_AT(20886);
     #line 20886 "vuc.vu"
-    ({ vu_str _t5253 = vu_str_lit("/* net.protocol(conn): the protocol chosen by ALPN on a TLS connection (\"h2\"), else \"\" */\n", 90); vu_str_cat(&v_s, &_t5253); drop_Str(&_t5253); });
+    ({ vu_str _t5253 = vu_str_lit("        pthread_mutex_lock(&vu_tls_lock);\n", 42); vu_str_cat(&v_s, &_t5253); drop_Str(&_t5253); });
     #line 20887 "vuc.vu"
     VU_AT(20887);
     #line 20887 "vuc.vu"
-    ({ vu_str _t5256 = vu_str_lit("static vu_str vu_net_protocol(vu_cap net, void *c) {\n", 53); vu_str_cat(&v_s, &_t5256); drop_Str(&_t5256); });
+    ({ vu_str _t5256 = vu_str_lit("        if (!vu_tls_system) {\n", 30); vu_str_cat(&v_s, &_t5256); drop_Str(&_t5256); });
     #line 20888 "vuc.vu"
     VU_AT(20888);
     #line 20888 "vuc.vu"
-    ({ vu_str _t5259 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t5259); drop_Str(&_t5259); });
+    ({ vu_str _t5259 = vu_str_lit("            SSL_CTX *sys = vu_tls_ctx(false);\n", 46); vu_str_cat(&v_s, &_t5259); drop_Str(&_t5259); });
     #line 20889 "vuc.vu"
     VU_AT(20889);
     #line 20889 "vuc.vu"
-    ({ vu_str _t5262 = vu_str_lit("    vu_sock *s = (vu_sock *)c;\n", 31); vu_str_cat(&v_s, &_t5262); drop_Str(&_t5262); });
+    ({ vu_str _t5262 = vu_str_lit("            SSL_CTX_set_default_verify_paths(sys);\n", 51); vu_str_cat(&v_s, &_t5262); drop_Str(&_t5262); });
     #line 20890 "vuc.vu"
     VU_AT(20890);
     #line 20890 "vuc.vu"
-    ({ vu_str _t5265 = vu_str_lit("    const unsigned char *p = NULL;\n", 35); vu_str_cat(&v_s, &_t5265); drop_Str(&_t5265); });
+    ({ vu_str _t5265 = vu_str_lit("            ERR_clear_error();\n", 31); vu_str_cat(&v_s, &_t5265); drop_Str(&_t5265); });
     #line 20891 "vuc.vu"
     VU_AT(20891);
     #line 20891 "vuc.vu"
-    ({ vu_str _t5268 = vu_str_lit("    unsigned n = 0;\n", 20); vu_str_cat(&v_s, &_t5268); drop_Str(&_t5268); });
+    ({ vu_str _t5268 = vu_str_lit("            vu_tls_system = sys;\n", 33); vu_str_cat(&v_s, &_t5268); drop_Str(&_t5268); });
     #line 20892 "vuc.vu"
     VU_AT(20892);
     #line 20892 "vuc.vu"
-    ({ vu_str _t5271 = vu_str_lit("    if (s && s->ssl) SSL_get0_alpn_selected((SSL *)s->ssl, &p, &n);\n", 68); vu_str_cat(&v_s, &_t5271); drop_Str(&_t5271); });
+    ({ vu_str _t5271 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5271); drop_Str(&_t5271); });
     #line 20893 "vuc.vu"
     VU_AT(20893);
     #line 20893 "vuc.vu"
-    ({ vu_str _t5274 = vu_str_lit("    vu_str r = {0};\n", 20); vu_str_cat(&v_s, &_t5274); drop_Str(&_t5274); });
+    ({ vu_str _t5274 = vu_str_lit("        ctx = vu_tls_system;\n", 29); vu_str_cat(&v_s, &_t5274); drop_Str(&_t5274); });
     #line 20894 "vuc.vu"
     VU_AT(20894);
     #line 20894 "vuc.vu"
-    ({ vu_str _t5277 = vu_str_lit("    if (n) vu_str_cat_bytes(&r, p, (int64_t)n);\n", 48); vu_str_cat(&v_s, &_t5277); drop_Str(&_t5277); });
+    ({ vu_str _t5277 = vu_str_lit("        SSL_CTX_up_ref(ctx);\n", 29); vu_str_cat(&v_s, &_t5277); drop_Str(&_t5277); });
     #line 20895 "vuc.vu"
     VU_AT(20895);
     #line 20895 "vuc.vu"
-    ({ vu_str _t5280 = vu_str_lit("    return r;\n", 14); vu_str_cat(&v_s, &_t5280); drop_Str(&_t5280); });
+    ({ vu_str _t5280 = vu_str_lit("        pthread_mutex_unlock(&vu_tls_lock);\n", 44); vu_str_cat(&v_s, &_t5280); drop_Str(&_t5280); });
     #line 20896 "vuc.vu"
     VU_AT(20896);
     #line 20896 "vuc.vu"
-    ({ vu_str _t5283 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5283); drop_Str(&_t5283); });
+    ({ vu_str _t5283 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5283); drop_Str(&_t5283); });
     #line 20897 "vuc.vu"
     VU_AT(20897);
     #line 20897 "vuc.vu"
-    ({ vu_str _t5286 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t5286); drop_Str(&_t5286); });
+    ({ vu_str _t5286 = vu_str_lit("    bool ok = vu_tls_attach(s, ctx, err);\n", 42); vu_str_cat(&v_s, &_t5286); drop_Str(&_t5286); });
     #line 20898 "vuc.vu"
     VU_AT(20898);
     #line 20898 "vuc.vu"
-    ({ vu_str _t5289 = vu_str_lit("/* -- select: waits until one of its arms can go ahead, then does it. Arms: take a value from a channel\n", 104); vu_str_cat(&v_s, &_t5289); drop_Str(&_t5289); });
+    ({ vu_str _t5289 = vu_str_lit("    SSL_CTX_free(ctx);\n", 23); vu_str_cat(&v_s, &_t5289); drop_Str(&_t5289); });
     #line 20899 "vuc.vu"
     VU_AT(20899);
     #line 20899 "vuc.vu"
-    ({ vu_str _t5292 = vu_str_lit("   (or see it closed), put one in, see a channel closed, see data on a connection (or its end). */\n", 99); vu_str_cat(&v_s, &_t5292); drop_Str(&_t5292); });
+    ({ vu_str _t5292 = vu_str_lit("    if (ok) {\n", 14); vu_str_cat(&v_s, &_t5292); drop_Str(&_t5292); });
     #line 20900 "vuc.vu"
     VU_AT(20900);
     #line 20900 "vuc.vu"
-    ({ vu_str _t5295 = vu_str_lit("#include <poll.h>\n", 18); vu_str_cat(&v_s, &_t5295); drop_Str(&_t5295); });
+    ({ vu_str _t5295 = vu_str_lit("        SSL *ssl = (SSL *)s->ssl;\n", 34); vu_str_cat(&v_s, &_t5295); drop_Str(&_t5295); });
     #line 20901 "vuc.vu"
     VU_AT(20901);
     #line 20901 "vuc.vu"
-    ({ vu_str _t5298 = vu_str_lit("enum { VU_SEL_RECV, VU_SEL_SEND, VU_SEL_CLOSED, VU_SEL_READABLE, VU_SEL_OFF };\n", 79); vu_str_cat(&v_s, &_t5298); drop_Str(&_t5298); });
+    ({ vu_str _t5298 = vu_str_lit("        unsigned char ip[16];\n", 30); vu_str_cat(&v_s, &_t5298); drop_Str(&_t5298); });
     #line 20902 "vuc.vu"
     VU_AT(20902);
     #line 20902 "vuc.vu"
-    ({ vu_str _t5301 = vu_str_lit("VU_G __thread uint64_t vu_sel_rng;\n", 35); vu_str_cat(&v_s, &_t5301); drop_Str(&_t5301); });
+    ({ vu_str _t5301 = vu_str_lit("        bool is_ip = inet_pton(AF_INET, h, ip) == 1 || inet_pton(AF_INET6, h, ip) == 1;\n", 88); vu_str_cat(&v_s, &_t5301); drop_Str(&_t5301); });
     #line 20903 "vuc.vu"
     VU_AT(20903);
     #line 20903 "vuc.vu"
-    ({ vu_str _t5304 = vu_str_lit("static uint64_t vu_rand_u64(void) {\n", 36); vu_str_cat(&v_s, &_t5304); drop_Str(&_t5304); });
+    ({ vu_str _t5304 = vu_str_lit("        if (is_ip) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), h);\n", 74); vu_str_cat(&v_s, &_t5304); drop_Str(&_t5304); });
     #line 20904 "vuc.vu"
     VU_AT(20904);
     #line 20904 "vuc.vu"
-    ({ vu_str _t5307 = vu_str_lit("    uint64_t x = vu_sel_rng ? vu_sel_rng : (uint64_t)(uintptr_t)&vu_sel_rng ^ (uint64_t)vu_now_ns();\n", 101); vu_str_cat(&v_s, &_t5307); drop_Str(&_t5307); });
+    ({ vu_str _t5307 = vu_str_lit("        else { SSL_set_tlsext_host_name(ssl, h); SSL_set1_host(ssl, h); }\n", 74); vu_str_cat(&v_s, &_t5307); drop_Str(&_t5307); });
     #line 20905 "vuc.vu"
     VU_AT(20905);
     #line 20905 "vuc.vu"
-    ({ vu_str _t5310 = vu_str_lit("    x ^= x << 13; x ^= x >> 7; x ^= x << 17;\n", 45); vu_str_cat(&v_s, &_t5310); drop_Str(&_t5310); });
+    ({ vu_str _t5310 = vu_str_lit("        SSL_set_connect_state(ssl);\n", 36); vu_str_cat(&v_s, &_t5310); drop_Str(&_t5310); });
     #line 20906 "vuc.vu"
     VU_AT(20906);
     #line 20906 "vuc.vu"
-    ({ vu_str _t5313 = vu_str_lit("    vu_sel_rng = x;\n", 20); vu_str_cat(&v_s, &_t5313); drop_Str(&_t5313); });
+    ({ vu_str _t5313 = vu_str_lit("        ok = vu_tls_handshake(s, deadline, err, line);\n", 55); vu_str_cat(&v_s, &_t5313); drop_Str(&_t5313); });
     #line 20907 "vuc.vu"
     VU_AT(20907);
     #line 20907 "vuc.vu"
-    ({ vu_str _t5316 = vu_str_lit("    return x;\n", 14); vu_str_cat(&v_s, &_t5316); drop_Str(&_t5316); });
+    ({ vu_str _t5316 = vu_str_lit("        if (!ok) {\n", 19); vu_str_cat(&v_s, &_t5316); drop_Str(&_t5316); });
     #line 20908 "vuc.vu"
     VU_AT(20908);
     #line 20908 "vuc.vu"
-    ({ vu_str _t5319 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5319); drop_Str(&_t5319); });
+    ({ vu_str _t5319 = vu_str_lit("            vu_str e = *err;\n", 29); vu_str_cat(&v_s, &_t5319); drop_Str(&_t5319); });
     #line 20909 "vuc.vu"
     VU_AT(20909);
     #line 20909 "vuc.vu"
-    ({ vu_str _t5322 = vu_str_lit("typedef struct { int kind; vu_chan *ch; void *buf; vu_sock *sock; } vu_sel;\n", 76); vu_str_cat(&v_s, &_t5322); drop_Str(&_t5322); });
+    ({ vu_str _t5322 = vu_str_lit("            *err = vu_errf(\"%.200s: %.*s\", h, (int)e.len, (const char *)e.data);\n", 81); vu_str_cat(&v_s, &_t5322); drop_Str(&_t5322); });
     #line 20910 "vuc.vu"
     VU_AT(20910);
     #line 20910 "vuc.vu"
-    ({ vu_str _t5325 = vu_str_lit("/* Whether arm a can go ahead now; a recv or send arm does its part if so. */\n", 78); vu_str_cat(&v_s, &_t5325); drop_Str(&_t5325); });
+    ({ vu_str _t5325 = vu_str_lit("            drop_Str(&e);\n", 26); vu_str_cat(&v_s, &_t5325); drop_Str(&_t5325); });
     #line 20911 "vuc.vu"
     VU_AT(20911);
     #line 20911 "vuc.vu"
-    ({ vu_str _t5328 = vu_str_lit("static bool vu_sel_try(vu_sel *a) {\n", 36); vu_str_cat(&v_s, &_t5328); drop_Str(&_t5328); });
+    ({ vu_str _t5328 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5328); drop_Str(&_t5328); });
     #line 20912 "vuc.vu"
     VU_AT(20912);
     #line 20912 "vuc.vu"
-    ({ vu_str _t5331 = vu_str_lit("    if (a->kind == VU_SEL_OFF) return false;\n", 45); vu_str_cat(&v_s, &_t5331); drop_Str(&_t5331); });
+    ({ vu_str _t5331 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5331); drop_Str(&_t5331); });
     #line 20913 "vuc.vu"
     VU_AT(20913);
     #line 20913 "vuc.vu"
-    ({ vu_str _t5334 = vu_str_lit("    if (a->kind == VU_SEL_READABLE) {\n", 38); vu_str_cat(&v_s, &_t5334); drop_Str(&_t5334); });
+    ({ vu_str _t5334 = vu_str_lit("    free(h);\n", 13); vu_str_cat(&v_s, &_t5334); drop_Str(&_t5334); });
     #line 20914 "vuc.vu"
     VU_AT(20914);
     #line 20914 "vuc.vu"
-    ({ vu_str _t5337 = vu_str_lit("        if (vu_tls_pending(a->sock) > 0) return true;\n", 54); vu_str_cat(&v_s, &_t5337); drop_Str(&_t5337); });
+    ({ vu_str _t5337 = vu_str_lit("    if (!ok) { vu_sock_drop(s); *conn = NULL; return false; }\n", 62); vu_str_cat(&v_s, &_t5337); drop_Str(&_t5337); });
     #line 20915 "vuc.vu"
     VU_AT(20915);
     #line 20915 "vuc.vu"
-    ({ vu_str _t5340 = vu_str_lit("        struct pollfd p = {.fd = a->sock->fd, .events = POLLIN};\n", 65); vu_str_cat(&v_s, &_t5340); drop_Str(&_t5340); });
+    ({ vu_str _t5340 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t5340); drop_Str(&_t5340); });
     #line 20916 "vuc.vu"
     VU_AT(20916);
     #line 20916 "vuc.vu"
-    ({ vu_str _t5343 = vu_str_lit("        return poll(&p, 1, 0) > 0;\n", 35); vu_str_cat(&v_s, &_t5343); drop_Str(&_t5343); });
+    ({ vu_str _t5343 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5343); drop_Str(&_t5343); });
     #line 20917 "vuc.vu"
     VU_AT(20917);
     #line 20917 "vuc.vu"
-    ({ vu_str _t5346 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5346); drop_Str(&_t5346); });
+    ({ vu_str _t5346 = vu_str_lit("/* net.protocol(conn): the protocol chosen by ALPN on a TLS connection (\"h2\"), else \"\" */\n", 90); vu_str_cat(&v_s, &_t5346); drop_Str(&_t5346); });
     #line 20918 "vuc.vu"
     VU_AT(20918);
     #line 20918 "vuc.vu"
-    ({ vu_str _t5349 = vu_str_lit("    vu_chan *c = a->ch;\n", 24); vu_str_cat(&v_s, &_t5349); drop_Str(&_t5349); });
+    ({ vu_str _t5349 = vu_str_lit("static vu_str vu_net_protocol(vu_cap net, void *c) {\n", 53); vu_str_cat(&v_s, &_t5349); drop_Str(&_t5349); });
     #line 20919 "vuc.vu"
     VU_AT(20919);
     #line 20919 "vuc.vu"
-    ({ vu_str _t5352 = vu_str_lit("    bool ok = false;\n", 21); vu_str_cat(&v_s, &_t5352); drop_Str(&_t5352); });
+    ({ vu_str _t5352 = vu_str_lit("    (void)net;\n", 15); vu_str_cat(&v_s, &_t5352); drop_Str(&_t5352); });
     #line 20920 "vuc.vu"
     VU_AT(20920);
     #line 20920 "vuc.vu"
-    ({ vu_str _t5355 = vu_str_lit("    pthread_mutex_lock(&c->lock);\n", 34); vu_str_cat(&v_s, &_t5355); drop_Str(&_t5355); });
+    ({ vu_str _t5355 = vu_str_lit("    vu_sock *s = (vu_sock *)c;\n", 31); vu_str_cat(&v_s, &_t5355); drop_Str(&_t5355); });
     #line 20921 "vuc.vu"
     VU_AT(20921);
     #line 20921 "vuc.vu"
-    ({ vu_str _t5358 = vu_str_lit("    if (a->kind == VU_SEL_CLOSED) ok = c->closed && c->len == 0;   /* (closed, and nothing left to take) */\n", 108); vu_str_cat(&v_s, &_t5358); drop_Str(&_t5358); });
+    ({ vu_str _t5358 = vu_str_lit("    const unsigned char *p = NULL;\n", 35); vu_str_cat(&v_s, &_t5358); drop_Str(&_t5358); });
     #line 20922 "vuc.vu"
     VU_AT(20922);
     #line 20922 "vuc.vu"
-    ({ vu_str _t5361 = vu_str_lit("    else if (a->kind == VU_SEL_RECV && c->len > 0) {\n", 53); vu_str_cat(&v_s, &_t5361); drop_Str(&_t5361); });
+    ({ vu_str _t5361 = vu_str_lit("    unsigned n = 0;\n", 20); vu_str_cat(&v_s, &_t5361); drop_Str(&_t5361); });
     #line 20923 "vuc.vu"
     VU_AT(20923);
     #line 20923 "vuc.vu"
-    ({ vu_str _t5364 = vu_str_lit("        memcpy(a->buf, c->buf + (size_t)c->head * c->esz, c->esz);\n", 67); vu_str_cat(&v_s, &_t5364); drop_Str(&_t5364); });
+    ({ vu_str _t5364 = vu_str_lit("    if (s && s->ssl) SSL_get0_alpn_selected((SSL *)s->ssl, &p, &n);\n", 68); vu_str_cat(&v_s, &_t5364); drop_Str(&_t5364); });
     #line 20924 "vuc.vu"
     VU_AT(20924);
     #line 20924 "vuc.vu"
-    ({ vu_str _t5367 = vu_str_lit("        c->head = (c->head + 1) % c->cap;\n", 42); vu_str_cat(&v_s, &_t5367); drop_Str(&_t5367); });
+    ({ vu_str _t5367 = vu_str_lit("    vu_str r = {0};\n", 20); vu_str_cat(&v_s, &_t5367); drop_Str(&_t5367); });
     #line 20925 "vuc.vu"
     VU_AT(20925);
     #line 20925 "vuc.vu"
-    ({ vu_str _t5370 = vu_str_lit("        c->len--;\n", 18); vu_str_cat(&v_s, &_t5370); drop_Str(&_t5370); });
+    ({ vu_str _t5370 = vu_str_lit("    if (n) vu_str_cat_bytes(&r, p, (int64_t)n);\n", 48); vu_str_cat(&v_s, &_t5370); drop_Str(&_t5370); });
     #line 20926 "vuc.vu"
     VU_AT(20926);
     #line 20926 "vuc.vu"
-    ({ vu_str _t5373 = vu_str_lit("        vu_chan_wake(&c->sq);\n", 30); vu_str_cat(&v_s, &_t5373); drop_Str(&_t5373); });
+    ({ vu_str _t5373 = vu_str_lit("    return r;\n", 14); vu_str_cat(&v_s, &_t5373); drop_Str(&_t5373); });
     #line 20927 "vuc.vu"
     VU_AT(20927);
     #line 20927 "vuc.vu"
-    ({ vu_str _t5376 = vu_str_lit("        if (c->len > 0) vu_chan_wake(&c->rq);\n", 46); vu_str_cat(&v_s, &_t5376); drop_Str(&_t5376); });
+    ({ vu_str _t5376 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5376); drop_Str(&_t5376); });
     #line 20928 "vuc.vu"
     VU_AT(20928);
     #line 20928 "vuc.vu"
-    ({ vu_str _t5379 = vu_str_lit("        vu_chan_notify(c);\n", 27); vu_str_cat(&v_s, &_t5379); drop_Str(&_t5379); });
+    ({ vu_str _t5379 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t5379); drop_Str(&_t5379); });
     #line 20929 "vuc.vu"
     VU_AT(20929);
     #line 20929 "vuc.vu"
-    ({ vu_str _t5382 = vu_str_lit("        ok = true;\n", 19); vu_str_cat(&v_s, &_t5382); drop_Str(&_t5382); });
+    ({ vu_str _t5382 = vu_str_lit("/* -- select: waits until one of its arms can go ahead, then does it. Arms: take a value from a channel\n", 104); vu_str_cat(&v_s, &_t5382); drop_Str(&_t5382); });
     #line 20930 "vuc.vu"
     VU_AT(20930);
     #line 20930 "vuc.vu"
-    ({ vu_str _t5385 = vu_str_lit("    } else if (a->kind == VU_SEL_SEND && !c->closed && c->len < c->cap) {\n", 74); vu_str_cat(&v_s, &_t5385); drop_Str(&_t5385); });
+    ({ vu_str _t5385 = vu_str_lit("   (or see it closed), put one in, see a channel closed, see data on a connection (or its end). */\n", 99); vu_str_cat(&v_s, &_t5385); drop_Str(&_t5385); });
     #line 20931 "vuc.vu"
     VU_AT(20931);
     #line 20931 "vuc.vu"
-    ({ vu_str _t5388 = vu_str_lit("        memcpy(c->buf + (size_t)((c->head + c->len) % c->cap) * c->esz, a->buf, c->esz);\n", 89); vu_str_cat(&v_s, &_t5388); drop_Str(&_t5388); });
+    ({ vu_str _t5388 = vu_str_lit("#include <poll.h>\n", 18); vu_str_cat(&v_s, &_t5388); drop_Str(&_t5388); });
     #line 20932 "vuc.vu"
     VU_AT(20932);
     #line 20932 "vuc.vu"
-    ({ vu_str _t5391 = vu_str_lit("        c->len++;\n", 18); vu_str_cat(&v_s, &_t5391); drop_Str(&_t5391); });
+    ({ vu_str _t5391 = vu_str_lit("enum { VU_SEL_RECV, VU_SEL_SEND, VU_SEL_CLOSED, VU_SEL_READABLE, VU_SEL_OFF };\n", 79); vu_str_cat(&v_s, &_t5391); drop_Str(&_t5391); });
     #line 20933 "vuc.vu"
     VU_AT(20933);
     #line 20933 "vuc.vu"
-    ({ vu_str _t5394 = vu_str_lit("        vu_chan_wake(&c->rq);\n", 30); vu_str_cat(&v_s, &_t5394); drop_Str(&_t5394); });
+    ({ vu_str _t5394 = vu_str_lit("VU_G __thread uint64_t vu_sel_rng;\n", 35); vu_str_cat(&v_s, &_t5394); drop_Str(&_t5394); });
     #line 20934 "vuc.vu"
     VU_AT(20934);
     #line 20934 "vuc.vu"
-    ({ vu_str _t5397 = vu_str_lit("        vu_chan_notify(c);\n", 27); vu_str_cat(&v_s, &_t5397); drop_Str(&_t5397); });
+    ({ vu_str _t5397 = vu_str_lit("static uint64_t vu_rand_u64(void) {\n", 36); vu_str_cat(&v_s, &_t5397); drop_Str(&_t5397); });
     #line 20935 "vuc.vu"
     VU_AT(20935);
     #line 20935 "vuc.vu"
-    ({ vu_str _t5400 = vu_str_lit("        ok = true;\n", 19); vu_str_cat(&v_s, &_t5400); drop_Str(&_t5400); });
+    ({ vu_str _t5400 = vu_str_lit("    uint64_t x = vu_sel_rng ? vu_sel_rng : (uint64_t)(uintptr_t)&vu_sel_rng ^ (uint64_t)vu_now_ns();\n", 101); vu_str_cat(&v_s, &_t5400); drop_Str(&_t5400); });
     #line 20936 "vuc.vu"
     VU_AT(20936);
     #line 20936 "vuc.vu"
-    ({ vu_str _t5403 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5403); drop_Str(&_t5403); });
+    ({ vu_str _t5403 = vu_str_lit("    x ^= x << 13; x ^= x >> 7; x ^= x << 17;\n", 45); vu_str_cat(&v_s, &_t5403); drop_Str(&_t5403); });
     #line 20937 "vuc.vu"
     VU_AT(20937);
     #line 20937 "vuc.vu"
-    ({ vu_str _t5406 = vu_str_lit("    pthread_mutex_unlock(&c->lock);\n", 36); vu_str_cat(&v_s, &_t5406); drop_Str(&_t5406); });
+    ({ vu_str _t5406 = vu_str_lit("    vu_sel_rng = x;\n", 20); vu_str_cat(&v_s, &_t5406); drop_Str(&_t5406); });
     #line 20938 "vuc.vu"
     VU_AT(20938);
     #line 20938 "vuc.vu"
-    ({ vu_str _t5409 = vu_str_lit("    return ok;\n", 15); vu_str_cat(&v_s, &_t5409); drop_Str(&_t5409); });
+    ({ vu_str _t5409 = vu_str_lit("    return x;\n", 14); vu_str_cat(&v_s, &_t5409); drop_Str(&_t5409); });
     #line 20939 "vuc.vu"
     VU_AT(20939);
     #line 20939 "vuc.vu"
@@ -129142,5198 +129142,5322 @@ VU_FN vu_str fn_rt_tasks(void) {
     #line 20940 "vuc.vu"
     VU_AT(20940);
     #line 20940 "vuc.vu"
-    ({ vu_str _t5415 = vu_str_lit("static void vu_watch_drop(vu_chan *c, vu_watch *w) {\n", 53); vu_str_cat(&v_s, &_t5415); drop_Str(&_t5415); });
+    ({ vu_str _t5415 = vu_str_lit("typedef struct { int kind; vu_chan *ch; void *buf; vu_sock *sock; } vu_sel;\n", 76); vu_str_cat(&v_s, &_t5415); drop_Str(&_t5415); });
     #line 20941 "vuc.vu"
     VU_AT(20941);
     #line 20941 "vuc.vu"
-    ({ vu_str _t5418 = vu_str_lit("    pthread_mutex_lock(&c->lock);\n", 34); vu_str_cat(&v_s, &_t5418); drop_Str(&_t5418); });
+    ({ vu_str _t5418 = vu_str_lit("/* Whether arm a can go ahead now; a recv or send arm does its part if so. */\n", 78); vu_str_cat(&v_s, &_t5418); drop_Str(&_t5418); });
     #line 20942 "vuc.vu"
     VU_AT(20942);
     #line 20942 "vuc.vu"
-    ({ vu_str _t5421 = vu_str_lit("    vu_watch **q = &c->watch;\n", 30); vu_str_cat(&v_s, &_t5421); drop_Str(&_t5421); });
+    ({ vu_str _t5421 = vu_str_lit("static bool vu_sel_try(vu_sel *a) {\n", 36); vu_str_cat(&v_s, &_t5421); drop_Str(&_t5421); });
     #line 20943 "vuc.vu"
     VU_AT(20943);
     #line 20943 "vuc.vu"
-    ({ vu_str _t5424 = vu_str_lit("    while (*q && *q != w) q = &(*q)->next;\n", 43); vu_str_cat(&v_s, &_t5424); drop_Str(&_t5424); });
+    ({ vu_str _t5424 = vu_str_lit("    if (a->kind == VU_SEL_OFF) return false;\n", 45); vu_str_cat(&v_s, &_t5424); drop_Str(&_t5424); });
     #line 20944 "vuc.vu"
     VU_AT(20944);
     #line 20944 "vuc.vu"
-    ({ vu_str _t5427 = vu_str_lit("    if (*q) *q = w->next;\n", 26); vu_str_cat(&v_s, &_t5427); drop_Str(&_t5427); });
+    ({ vu_str _t5427 = vu_str_lit("    if (a->kind == VU_SEL_READABLE) {\n", 38); vu_str_cat(&v_s, &_t5427); drop_Str(&_t5427); });
     #line 20945 "vuc.vu"
     VU_AT(20945);
     #line 20945 "vuc.vu"
-    ({ vu_str _t5430 = vu_str_lit("    pthread_mutex_unlock(&c->lock);\n", 36); vu_str_cat(&v_s, &_t5430); drop_Str(&_t5430); });
+    ({ vu_str _t5430 = vu_str_lit("        if (vu_tls_pending(a->sock) > 0) return true;\n", 54); vu_str_cat(&v_s, &_t5430); drop_Str(&_t5430); });
     #line 20946 "vuc.vu"
     VU_AT(20946);
     #line 20946 "vuc.vu"
-    ({ vu_str _t5433 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5433); drop_Str(&_t5433); });
+    ({ vu_str _t5433 = vu_str_lit("        struct pollfd p = {.fd = a->sock->fd, .events = POLLIN};\n", 65); vu_str_cat(&v_s, &_t5433); drop_Str(&_t5433); });
     #line 20947 "vuc.vu"
     VU_AT(20947);
     #line 20947 "vuc.vu"
-    ({ vu_str _t5436 = vu_str_lit("/* The arm that went ahead (its index), or n when the deadline came first. Arms are tried from a\n", 97); vu_str_cat(&v_s, &_t5436); drop_Str(&_t5436); });
+    ({ vu_str _t5436 = vu_str_lit("        return poll(&p, 1, 0) > 0;\n", 35); vu_str_cat(&v_s, &_t5436); drop_Str(&_t5436); });
     #line 20948 "vuc.vu"
     VU_AT(20948);
     #line 20948 "vuc.vu"
-    ({ vu_str _t5439 = vu_str_lit("   random one on, so a busy one can't keep the others waiting forever. */\n", 74); vu_str_cat(&v_s, &_t5439); drop_Str(&_t5439); });
+    ({ vu_str _t5439 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5439); drop_Str(&_t5439); });
     #line 20949 "vuc.vu"
     VU_AT(20949);
     #line 20949 "vuc.vu"
-    ({ vu_str _t5442 = vu_str_lit("static int vu_select(vu_sel *a, int n, double timeout, bool has, int line) {\n", 77); vu_str_cat(&v_s, &_t5442); drop_Str(&_t5442); });
+    ({ vu_str _t5442 = vu_str_lit("    vu_chan *c = a->ch;\n", 24); vu_str_cat(&v_s, &_t5442); drop_Str(&_t5442); });
     #line 20950 "vuc.vu"
     VU_AT(20950);
     #line 20950 "vuc.vu"
-    ({ vu_str _t5445 = vu_str_lit("    vu_task_here(\"select\", line);\n", 34); vu_str_cat(&v_s, &_t5445); drop_Str(&_t5445); });
+    ({ vu_str _t5445 = vu_str_lit("    bool ok = false;\n", 21); vu_str_cat(&v_s, &_t5445); drop_Str(&_t5445); });
     #line 20951 "vuc.vu"
     VU_AT(20951);
     #line 20951 "vuc.vu"
-    ({ vu_str _t5448 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t5448); drop_Str(&_t5448); });
+    ({ vu_str _t5448 = vu_str_lit("    pthread_mutex_lock(&c->lock);\n", 34); vu_str_cat(&v_s, &_t5448); drop_Str(&_t5448); });
     #line 20952 "vuc.vu"
     VU_AT(20952);
     #line 20952 "vuc.vu"
-    ({ vu_str _t5451 = vu_str_lit("    vu_task *t = vu_cur_task;\n", 30); vu_str_cat(&v_s, &_t5451); drop_Str(&_t5451); });
+    ({ vu_str _t5451 = vu_str_lit("    if (a->kind == VU_SEL_CLOSED) ok = c->closed && c->len == 0;   /* (closed, and nothing left to take) */\n", 108); vu_str_cat(&v_s, &_t5451); drop_Str(&_t5451); });
     #line 20953 "vuc.vu"
     VU_AT(20953);
     #line 20953 "vuc.vu"
-    ({ vu_str _t5454 = vu_str_lit("    vu_sock *sock = NULL;\n", 26); vu_str_cat(&v_s, &_t5454); drop_Str(&_t5454); });
+    ({ vu_str _t5454 = vu_str_lit("    else if (a->kind == VU_SEL_RECV && c->len > 0) {\n", 53); vu_str_cat(&v_s, &_t5454); drop_Str(&_t5454); });
     #line 20954 "vuc.vu"
     VU_AT(20954);
     #line 20954 "vuc.vu"
-    ({ vu_str _t5457 = vu_str_lit("    int live = 0;\n", 18); vu_str_cat(&v_s, &_t5457); drop_Str(&_t5457); });
+    ({ vu_str _t5457 = vu_str_lit("        memcpy(a->buf, c->buf + (size_t)c->head * c->esz, c->esz);\n", 67); vu_str_cat(&v_s, &_t5457); drop_Str(&_t5457); });
     #line 20955 "vuc.vu"
     VU_AT(20955);
     #line 20955 "vuc.vu"
-    ({ vu_str _t5460 = vu_str_lit("    for (int i = 0; i < n; i++) {\n", 34); vu_str_cat(&v_s, &_t5460); drop_Str(&_t5460); });
+    ({ vu_str _t5460 = vu_str_lit("        c->head = (c->head + 1) % c->cap;\n", 42); vu_str_cat(&v_s, &_t5460); drop_Str(&_t5460); });
     #line 20956 "vuc.vu"
     VU_AT(20956);
     #line 20956 "vuc.vu"
-    ({ vu_str _t5463 = vu_str_lit("        if (a[i].kind == VU_SEL_READABLE) sock = a[i].sock;\n", 60); vu_str_cat(&v_s, &_t5463); drop_Str(&_t5463); });
+    ({ vu_str _t5463 = vu_str_lit("        c->len--;\n", 18); vu_str_cat(&v_s, &_t5463); drop_Str(&_t5463); });
     #line 20957 "vuc.vu"
     VU_AT(20957);
     #line 20957 "vuc.vu"
-    ({ vu_str _t5466 = vu_str_lit("        if (a[i].kind != VU_SEL_OFF) live++;\n", 45); vu_str_cat(&v_s, &_t5466); drop_Str(&_t5466); });
+    ({ vu_str _t5466 = vu_str_lit("        vu_chan_wake(&c->sq);\n", 30); vu_str_cat(&v_s, &_t5466); drop_Str(&_t5466); });
     #line 20958 "vuc.vu"
     VU_AT(20958);
     #line 20958 "vuc.vu"
-    ({ vu_str _t5469 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5469); drop_Str(&_t5469); });
+    ({ vu_str _t5469 = vu_str_lit("        if (c->len > 0) vu_chan_wake(&c->rq);\n", 46); vu_str_cat(&v_s, &_t5469); drop_Str(&_t5469); });
     #line 20959 "vuc.vu"
     VU_AT(20959);
     #line 20959 "vuc.vu"
-    ({ vu_str _t5472 = vu_str_lit("    if (!live && !has) vu_fail(line, \"select: every arm's condition is false, and there's no timeout: it would wait forever\");\n", 127); vu_str_cat(&v_s, &_t5472); drop_Str(&_t5472); });
+    ({ vu_str _t5472 = vu_str_lit("        vu_chan_notify(c);\n", 27); vu_str_cat(&v_s, &_t5472); drop_Str(&_t5472); });
     #line 20960 "vuc.vu"
     VU_AT(20960);
     #line 20960 "vuc.vu"
-    ({ vu_str _t5475 = vu_str_lit("    vu_watch ws[64];\n", 21); vu_str_cat(&v_s, &_t5475); drop_Str(&_t5475); });
+    ({ vu_str _t5475 = vu_str_lit("        ok = true;\n", 19); vu_str_cat(&v_s, &_t5475); drop_Str(&_t5475); });
     #line 20961 "vuc.vu"
     VU_AT(20961);
     #line 20961 "vuc.vu"
-    ({ vu_str _t5478 = vu_str_lit("    if (n > 64) vu_fail(line, \"a select has at most 64 arms\");\n", 63); vu_str_cat(&v_s, &_t5478); drop_Str(&_t5478); });
+    ({ vu_str _t5478 = vu_str_lit("    } else if (a->kind == VU_SEL_SEND && !c->closed && c->len < c->cap) {\n", 74); vu_str_cat(&v_s, &_t5478); drop_Str(&_t5478); });
     #line 20962 "vuc.vu"
     VU_AT(20962);
     #line 20962 "vuc.vu"
-    ({ vu_str _t5481 = vu_str_lit("    int start = n ? (int)(vu_rand_u64() % (uint64_t)n) : 0;\n", 60); vu_str_cat(&v_s, &_t5481); drop_Str(&_t5481); });
+    ({ vu_str _t5481 = vu_str_lit("        memcpy(c->buf + (size_t)((c->head + c->len) % c->cap) * c->esz, a->buf, c->esz);\n", 89); vu_str_cat(&v_s, &_t5481); drop_Str(&_t5481); });
     #line 20963 "vuc.vu"
     VU_AT(20963);
     #line 20963 "vuc.vu"
-    ({ vu_str _t5484 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t5484); drop_Str(&_t5484); });
+    ({ vu_str _t5484 = vu_str_lit("        c->len++;\n", 18); vu_str_cat(&v_s, &_t5484); drop_Str(&_t5484); });
     #line 20964 "vuc.vu"
     VU_AT(20964);
     #line 20964 "vuc.vu"
-    ({ vu_str _t5487 = vu_str_lit("        for (int k = 0; k < n; k++) {\n", 38); vu_str_cat(&v_s, &_t5487); drop_Str(&_t5487); });
+    ({ vu_str _t5487 = vu_str_lit("        vu_chan_wake(&c->rq);\n", 30); vu_str_cat(&v_s, &_t5487); drop_Str(&_t5487); });
     #line 20965 "vuc.vu"
     VU_AT(20965);
     #line 20965 "vuc.vu"
-    ({ vu_str _t5490 = vu_str_lit("            int i = (start + k) % n;\n", 37); vu_str_cat(&v_s, &_t5490); drop_Str(&_t5490); });
+    ({ vu_str _t5490 = vu_str_lit("        vu_chan_notify(c);\n", 27); vu_str_cat(&v_s, &_t5490); drop_Str(&_t5490); });
     #line 20966 "vuc.vu"
     VU_AT(20966);
     #line 20966 "vuc.vu"
-    ({ vu_str _t5493 = vu_str_lit("            if (vu_sel_try(&a[i])) return i;\n", 45); vu_str_cat(&v_s, &_t5493); drop_Str(&_t5493); });
+    ({ vu_str _t5493 = vu_str_lit("        ok = true;\n", 19); vu_str_cat(&v_s, &_t5493); drop_Str(&_t5493); });
     #line 20967 "vuc.vu"
     VU_AT(20967);
     #line 20967 "vuc.vu"
-    ({ vu_str _t5496 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5496); drop_Str(&_t5496); });
+    ({ vu_str _t5496 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5496); drop_Str(&_t5496); });
     #line 20968 "vuc.vu"
     VU_AT(20968);
     #line 20968 "vuc.vu"
-    ({ vu_str _t5499 = vu_str_lit("        if (deadline >= 0 && vu_now_ns() >= deadline) return n;\n", 64); vu_str_cat(&v_s, &_t5499); drop_Str(&_t5499); });
+    ({ vu_str _t5499 = vu_str_lit("    pthread_mutex_unlock(&c->lock);\n", 36); vu_str_cat(&v_s, &_t5499); drop_Str(&_t5499); });
     #line 20969 "vuc.vu"
     VU_AT(20969);
     #line 20969 "vuc.vu"
-    ({ vu_str _t5502 = vu_str_lit("        /* wait: watch every channel, then look once more (what changed meanwhile has woken this task) */\n", 106); vu_str_cat(&v_s, &_t5502); drop_Str(&_t5502); });
+    ({ vu_str _t5502 = vu_str_lit("    return ok;\n", 15); vu_str_cat(&v_s, &_t5502); drop_Str(&_t5502); });
     #line 20970 "vuc.vu"
     VU_AT(20970);
     #line 20970 "vuc.vu"
-    ({ vu_str _t5505 = vu_str_lit("        if (sock) vu_sock_watch(sock, line);\n", 45); vu_str_cat(&v_s, &_t5505); drop_Str(&_t5505); });
+    ({ vu_str _t5505 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5505); drop_Str(&_t5505); });
     #line 20971 "vuc.vu"
     VU_AT(20971);
     #line 20971 "vuc.vu"
-    ({ vu_str _t5508 = vu_str_lit("        else __atomic_store_n(&t->sel_state, 1, __ATOMIC_SEQ_CST);\n", 67); vu_str_cat(&v_s, &_t5508); drop_Str(&_t5508); });
+    ({ vu_str _t5508 = vu_str_lit("static void vu_watch_drop(vu_chan *c, vu_watch *w) {\n", 53); vu_str_cat(&v_s, &_t5508); drop_Str(&_t5508); });
     #line 20972 "vuc.vu"
     VU_AT(20972);
     #line 20972 "vuc.vu"
-    ({ vu_str _t5511 = vu_str_lit("        t->wait_kind = sock ? VU_W_FD : VU_W_SEL;\n", 50); vu_str_cat(&v_s, &_t5511); drop_Str(&_t5511); });
+    ({ vu_str _t5511 = vu_str_lit("    pthread_mutex_lock(&c->lock);\n", 34); vu_str_cat(&v_s, &_t5511); drop_Str(&_t5511); });
     #line 20973 "vuc.vu"
     VU_AT(20973);
     #line 20973 "vuc.vu"
-    ({ vu_str _t5514 = vu_str_lit("        t->wait_obj = sock;\n", 28); vu_str_cat(&v_s, &_t5514); drop_Str(&_t5514); });
+    ({ vu_str _t5514 = vu_str_lit("    vu_watch **q = &c->watch;\n", 30); vu_str_cat(&v_s, &_t5514); drop_Str(&_t5514); });
     #line 20974 "vuc.vu"
     VU_AT(20974);
     #line 20974 "vuc.vu"
-    ({ vu_str _t5517 = vu_str_lit("        t->writing = false;\n", 28); vu_str_cat(&v_s, &_t5517); drop_Str(&_t5517); });
+    ({ vu_str _t5517 = vu_str_lit("    while (*q && *q != w) q = &(*q)->next;\n", 43); vu_str_cat(&v_s, &_t5517); drop_Str(&_t5517); });
     #line 20975 "vuc.vu"
     VU_AT(20975);
     #line 20975 "vuc.vu"
-    ({ vu_str _t5520 = vu_str_lit("        t->wait_line = line;\n", 29); vu_str_cat(&v_s, &_t5520); drop_Str(&_t5520); });
+    ({ vu_str _t5520 = vu_str_lit("    if (*q) *q = w->next;\n", 26); vu_str_cat(&v_s, &_t5520); drop_Str(&_t5520); });
     #line 20976 "vuc.vu"
     VU_AT(20976);
     #line 20976 "vuc.vu"
-    ({ vu_str _t5523 = vu_str_lit("        t->timed_out = false;\n", 30); vu_str_cat(&v_s, &_t5523); drop_Str(&_t5523); });
+    ({ vu_str _t5523 = vu_str_lit("    pthread_mutex_unlock(&c->lock);\n", 36); vu_str_cat(&v_s, &_t5523); drop_Str(&_t5523); });
     #line 20977 "vuc.vu"
     VU_AT(20977);
     #line 20977 "vuc.vu"
-    ({ vu_str _t5526 = vu_str_lit("        if (sock) __atomic_store_n(&sock->reader, t, __ATOMIC_SEQ_CST);\n", 72); vu_str_cat(&v_s, &_t5526); drop_Str(&_t5526); });
+    ({ vu_str _t5526 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5526); drop_Str(&_t5526); });
     #line 20978 "vuc.vu"
     VU_AT(20978);
     #line 20978 "vuc.vu"
-    ({ vu_str _t5529 = vu_str_lit("        for (int i = 0; i < n; i++) {\n", 38); vu_str_cat(&v_s, &_t5529); drop_Str(&_t5529); });
+    ({ vu_str _t5529 = vu_str_lit("/* The arm that went ahead (its index), or n when the deadline came first. Arms are tried from a\n", 97); vu_str_cat(&v_s, &_t5529); drop_Str(&_t5529); });
     #line 20979 "vuc.vu"
     VU_AT(20979);
     #line 20979 "vuc.vu"
-    ({ vu_str _t5532 = vu_str_lit("            ws[i].t = t;\n", 25); vu_str_cat(&v_s, &_t5532); drop_Str(&_t5532); });
+    ({ vu_str _t5532 = vu_str_lit("   random one on, so a busy one can't keep the others waiting forever. */\n", 74); vu_str_cat(&v_s, &_t5532); drop_Str(&_t5532); });
     #line 20980 "vuc.vu"
     VU_AT(20980);
     #line 20980 "vuc.vu"
-    ({ vu_str _t5535 = vu_str_lit("            ws[i].sock = sock;\n", 31); vu_str_cat(&v_s, &_t5535); drop_Str(&_t5535); });
+    ({ vu_str _t5535 = vu_str_lit("static int vu_select(vu_sel *a, int n, double timeout, bool has, int line) {\n", 77); vu_str_cat(&v_s, &_t5535); drop_Str(&_t5535); });
     #line 20981 "vuc.vu"
     VU_AT(20981);
     #line 20981 "vuc.vu"
-    ({ vu_str _t5538 = vu_str_lit("            ws[i].next = NULL;\n", 31); vu_str_cat(&v_s, &_t5538); drop_Str(&_t5538); });
+    ({ vu_str _t5538 = vu_str_lit("    vu_task_here(\"select\", line);\n", 34); vu_str_cat(&v_s, &_t5538); drop_Str(&_t5538); });
     #line 20982 "vuc.vu"
     VU_AT(20982);
     #line 20982 "vuc.vu"
-    ({ vu_str _t5541 = vu_str_lit("            if (a[i].kind == VU_SEL_READABLE || a[i].kind == VU_SEL_OFF) continue;\n", 83); vu_str_cat(&v_s, &_t5541); drop_Str(&_t5541); });
+    ({ vu_str _t5541 = vu_str_lit("    int64_t deadline = vu_deadline(timeout, has, line);\n", 56); vu_str_cat(&v_s, &_t5541); drop_Str(&_t5541); });
     #line 20983 "vuc.vu"
     VU_AT(20983);
     #line 20983 "vuc.vu"
-    ({ vu_str _t5544 = vu_str_lit("            pthread_mutex_lock(&a[i].ch->lock);\n", 48); vu_str_cat(&v_s, &_t5544); drop_Str(&_t5544); });
+    ({ vu_str _t5544 = vu_str_lit("    vu_task *t = vu_cur_task;\n", 30); vu_str_cat(&v_s, &_t5544); drop_Str(&_t5544); });
     #line 20984 "vuc.vu"
     VU_AT(20984);
     #line 20984 "vuc.vu"
-    ({ vu_str _t5547 = vu_str_lit("            ws[i].next = a[i].ch->watch;\n", 41); vu_str_cat(&v_s, &_t5547); drop_Str(&_t5547); });
+    ({ vu_str _t5547 = vu_str_lit("    vu_sock *sock = NULL;\n", 26); vu_str_cat(&v_s, &_t5547); drop_Str(&_t5547); });
     #line 20985 "vuc.vu"
     VU_AT(20985);
     #line 20985 "vuc.vu"
-    ({ vu_str _t5550 = vu_str_lit("            a[i].ch->watch = &ws[i];\n", 37); vu_str_cat(&v_s, &_t5550); drop_Str(&_t5550); });
+    ({ vu_str _t5550 = vu_str_lit("    int live = 0;\n", 18); vu_str_cat(&v_s, &_t5550); drop_Str(&_t5550); });
     #line 20986 "vuc.vu"
     VU_AT(20986);
     #line 20986 "vuc.vu"
-    ({ vu_str _t5553 = vu_str_lit("            pthread_mutex_unlock(&a[i].ch->lock);\n", 50); vu_str_cat(&v_s, &_t5553); drop_Str(&_t5553); });
+    ({ vu_str _t5553 = vu_str_lit("    for (int i = 0; i < n; i++) {\n", 34); vu_str_cat(&v_s, &_t5553); drop_Str(&_t5553); });
     #line 20987 "vuc.vu"
     VU_AT(20987);
     #line 20987 "vuc.vu"
-    ({ vu_str _t5556 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5556); drop_Str(&_t5556); });
+    ({ vu_str _t5556 = vu_str_lit("        if (a[i].kind == VU_SEL_READABLE) sock = a[i].sock;\n", 60); vu_str_cat(&v_s, &_t5556); drop_Str(&_t5556); });
     #line 20988 "vuc.vu"
     VU_AT(20988);
     #line 20988 "vuc.vu"
-    ({ vu_str _t5559 = vu_str_lit("        int got = -1;\n", 22); vu_str_cat(&v_s, &_t5559); drop_Str(&_t5559); });
+    ({ vu_str _t5559 = vu_str_lit("        if (a[i].kind != VU_SEL_OFF) live++;\n", 45); vu_str_cat(&v_s, &_t5559); drop_Str(&_t5559); });
     #line 20989 "vuc.vu"
     VU_AT(20989);
     #line 20989 "vuc.vu"
-    ({ vu_str _t5562 = vu_str_lit("        for (int k = 0; k < n && got < 0; k++) {\n", 49); vu_str_cat(&v_s, &_t5562); drop_Str(&_t5562); });
+    ({ vu_str _t5562 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5562); drop_Str(&_t5562); });
     #line 20990 "vuc.vu"
     VU_AT(20990);
     #line 20990 "vuc.vu"
-    ({ vu_str _t5565 = vu_str_lit("            int i = (start + k) % n;\n", 37); vu_str_cat(&v_s, &_t5565); drop_Str(&_t5565); });
+    ({ vu_str _t5565 = vu_str_lit("    if (!live && !has) vu_fail(line, \"select: every arm's condition is false, and there's no timeout: it would wait forever\");\n", 127); vu_str_cat(&v_s, &_t5565); drop_Str(&_t5565); });
     #line 20991 "vuc.vu"
     VU_AT(20991);
     #line 20991 "vuc.vu"
-    ({ vu_str _t5568 = vu_str_lit("            if (vu_sel_try(&a[i])) got = i;\n", 44); vu_str_cat(&v_s, &_t5568); drop_Str(&_t5568); });
+    ({ vu_str _t5568 = vu_str_lit("    vu_watch ws[64];\n", 21); vu_str_cat(&v_s, &_t5568); drop_Str(&_t5568); });
     #line 20992 "vuc.vu"
     VU_AT(20992);
     #line 20992 "vuc.vu"
-    ({ vu_str _t5571 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5571); drop_Str(&_t5571); });
+    ({ vu_str _t5571 = vu_str_lit("    if (n > 64) vu_fail(line, \"a select has at most 64 arms\");\n", 63); vu_str_cat(&v_s, &_t5571); drop_Str(&_t5571); });
     #line 20993 "vuc.vu"
     VU_AT(20993);
     #line 20993 "vuc.vu"
-    ({ vu_str _t5574 = vu_str_lit("        bool woken = false;   /* someone has woken (or is waking) this task: that wake must be taken */\n", 104); vu_str_cat(&v_s, &_t5574); drop_Str(&_t5574); });
+    ({ vu_str _t5574 = vu_str_lit("    int start = n ? (int)(vu_rand_u64() % (uint64_t)n) : 0;\n", 60); vu_str_cat(&v_s, &_t5574); drop_Str(&_t5574); });
     #line 20994 "vuc.vu"
     VU_AT(20994);
     #line 20994 "vuc.vu"
-    ({ vu_str _t5577 = vu_str_lit("        if (got >= 0 || (sock && __atomic_exchange_n(&sock->rpend, 0, __ATOMIC_SEQ_CST))) {\n", 92); vu_str_cat(&v_s, &_t5577); drop_Str(&_t5577); });
+    ({ vu_str _t5577 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t5577); drop_Str(&_t5577); });
     #line 20995 "vuc.vu"
     VU_AT(20995);
     #line 20995 "vuc.vu"
-    ({ vu_str _t5580 = vu_str_lit("            if (sock) {\n", 24); vu_str_cat(&v_s, &_t5580); drop_Str(&_t5580); });
+    ({ vu_str _t5580 = vu_str_lit("        for (int k = 0; k < n; k++) {\n", 38); vu_str_cat(&v_s, &_t5580); drop_Str(&_t5580); });
     #line 20996 "vuc.vu"
     VU_AT(20996);
     #line 20996 "vuc.vu"
-    ({ vu_str _t5583 = vu_str_lit("                vu_task *expected = t;\n", 39); vu_str_cat(&v_s, &_t5583); drop_Str(&_t5583); });
+    ({ vu_str _t5583 = vu_str_lit("            int i = (start + k) % n;\n", 37); vu_str_cat(&v_s, &_t5583); drop_Str(&_t5583); });
     #line 20997 "vuc.vu"
     VU_AT(20997);
     #line 20997 "vuc.vu"
-    ({ vu_str _t5586 = vu_str_lit("                woken = !__atomic_compare_exchange_n(&sock->reader, &expected, NULL, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);\n", 129); vu_str_cat(&v_s, &_t5586); drop_Str(&_t5586); });
+    ({ vu_str _t5586 = vu_str_lit("            if (vu_sel_try(&a[i])) return i;\n", 45); vu_str_cat(&v_s, &_t5586); drop_Str(&_t5586); });
     #line 20998 "vuc.vu"
     VU_AT(20998);
     #line 20998 "vuc.vu"
-    ({ vu_str _t5589 = vu_str_lit("            } else {\n", 21); vu_str_cat(&v_s, &_t5589); drop_Str(&_t5589); });
+    ({ vu_str _t5589 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5589); drop_Str(&_t5589); });
     #line 20999 "vuc.vu"
     VU_AT(20999);
     #line 20999 "vuc.vu"
-    ({ vu_str _t5592 = vu_str_lit("                int one = 1;\n", 29); vu_str_cat(&v_s, &_t5592); drop_Str(&_t5592); });
+    ({ vu_str _t5592 = vu_str_lit("        if (deadline >= 0 && vu_now_ns() >= deadline) return n;\n", 64); vu_str_cat(&v_s, &_t5592); drop_Str(&_t5592); });
     #line 21000 "vuc.vu"
     VU_AT(21000);
     #line 21000 "vuc.vu"
-    ({ vu_str _t5595 = vu_str_lit("                woken = !__atomic_compare_exchange_n(&t->sel_state, &one, 0, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);\n", 121); vu_str_cat(&v_s, &_t5595); drop_Str(&_t5595); });
+    ({ vu_str _t5595 = vu_str_lit("        /* wait: watch every channel, then look once more (what changed meanwhile has woken this task) */\n", 106); vu_str_cat(&v_s, &_t5595); drop_Str(&_t5595); });
     #line 21001 "vuc.vu"
     VU_AT(21001);
     #line 21001 "vuc.vu"
-    ({ vu_str _t5598 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t5598); drop_Str(&_t5598); });
+    ({ vu_str _t5598 = vu_str_lit("        if (sock) vu_sock_watch(sock, line);\n", 45); vu_str_cat(&v_s, &_t5598); drop_Str(&_t5598); });
     #line 21002 "vuc.vu"
     VU_AT(21002);
     #line 21002 "vuc.vu"
-    ({ vu_str _t5601 = vu_str_lit("            if (woken) vu_block();\n", 35); vu_str_cat(&v_s, &_t5601); drop_Str(&_t5601); });
+    ({ vu_str _t5601 = vu_str_lit("        else __atomic_store_n(&t->sel_state, 1, __ATOMIC_SEQ_CST);\n", 67); vu_str_cat(&v_s, &_t5601); drop_Str(&_t5601); });
     #line 21003 "vuc.vu"
     VU_AT(21003);
     #line 21003 "vuc.vu"
-    ({ vu_str _t5604 = vu_str_lit("        } else {\n", 17); vu_str_cat(&v_s, &_t5604); drop_Str(&_t5604); });
+    ({ vu_str _t5604 = vu_str_lit("        t->wait_kind = sock ? VU_W_FD : VU_W_SEL;\n", 50); vu_str_cat(&v_s, &_t5604); drop_Str(&_t5604); });
     #line 21004 "vuc.vu"
     VU_AT(21004);
     #line 21004 "vuc.vu"
-    ({ vu_str _t5607 = vu_str_lit("            vu_wait_until(deadline);\n", 37); vu_str_cat(&v_s, &_t5607); drop_Str(&_t5607); });
+    ({ vu_str _t5607 = vu_str_lit("        t->wait_obj = sock;\n", 28); vu_str_cat(&v_s, &_t5607); drop_Str(&_t5607); });
     #line 21005 "vuc.vu"
     VU_AT(21005);
     #line 21005 "vuc.vu"
-    ({ vu_str _t5610 = vu_str_lit("            vu_block();\n", 24); vu_str_cat(&v_s, &_t5610); drop_Str(&_t5610); });
+    ({ vu_str _t5610 = vu_str_lit("        t->writing = false;\n", 28); vu_str_cat(&v_s, &_t5610); drop_Str(&_t5610); });
     #line 21006 "vuc.vu"
     VU_AT(21006);
     #line 21006 "vuc.vu"
-    ({ vu_str _t5613 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5613); drop_Str(&_t5613); });
+    ({ vu_str _t5613 = vu_str_lit("        t->wait_line = line;\n", 29); vu_str_cat(&v_s, &_t5613); drop_Str(&_t5613); });
     #line 21007 "vuc.vu"
     VU_AT(21007);
     #line 21007 "vuc.vu"
-    ({ vu_str _t5616 = vu_str_lit("        vu_heap_remove(t);\n", 27); vu_str_cat(&v_s, &_t5616); drop_Str(&_t5616); });
+    ({ vu_str _t5616 = vu_str_lit("        t->timed_out = false;\n", 30); vu_str_cat(&v_s, &_t5616); drop_Str(&_t5616); });
     #line 21008 "vuc.vu"
     VU_AT(21008);
     #line 21008 "vuc.vu"
-    ({ vu_str _t5619 = vu_str_lit("        t->wait_kind = VU_W_NONE;\n", 34); vu_str_cat(&v_s, &_t5619); drop_Str(&_t5619); });
+    ({ vu_str _t5619 = vu_str_lit("        if (sock) __atomic_store_n(&sock->reader, t, __ATOMIC_SEQ_CST);\n", 72); vu_str_cat(&v_s, &_t5619); drop_Str(&_t5619); });
     #line 21009 "vuc.vu"
     VU_AT(21009);
     #line 21009 "vuc.vu"
-    ({ vu_str _t5622 = vu_str_lit("        __atomic_store_n(&t->sel_state, 0, __ATOMIC_SEQ_CST);\n", 62); vu_str_cat(&v_s, &_t5622); drop_Str(&_t5622); });
+    ({ vu_str _t5622 = vu_str_lit("        for (int i = 0; i < n; i++) {\n", 38); vu_str_cat(&v_s, &_t5622); drop_Str(&_t5622); });
     #line 21010 "vuc.vu"
     VU_AT(21010);
     #line 21010 "vuc.vu"
-    ({ vu_str _t5625 = vu_str_lit("        for (int i = 0; i < n; i++) if (a[i].kind != VU_SEL_READABLE && a[i].kind != VU_SEL_OFF) vu_watch_drop(a[i].ch, &ws[i]);\n", 129); vu_str_cat(&v_s, &_t5625); drop_Str(&_t5625); });
+    ({ vu_str _t5625 = vu_str_lit("            ws[i].t = t;\n", 25); vu_str_cat(&v_s, &_t5625); drop_Str(&_t5625); });
     #line 21011 "vuc.vu"
     VU_AT(21011);
     #line 21011 "vuc.vu"
-    ({ vu_str _t5628 = vu_str_lit("        if (got >= 0) return got;\n", 34); vu_str_cat(&v_s, &_t5628); drop_Str(&_t5628); });
+    ({ vu_str _t5628 = vu_str_lit("            ws[i].sock = sock;\n", 31); vu_str_cat(&v_s, &_t5628); drop_Str(&_t5628); });
     #line 21012 "vuc.vu"
     VU_AT(21012);
     #line 21012 "vuc.vu"
-    ({ vu_str _t5631 = vu_str_lit("        start = (start + 1) % (n ? n : 1);\n", 43); vu_str_cat(&v_s, &_t5631); drop_Str(&_t5631); });
+    ({ vu_str _t5631 = vu_str_lit("            ws[i].next = NULL;\n", 31); vu_str_cat(&v_s, &_t5631); drop_Str(&_t5631); });
     #line 21013 "vuc.vu"
     VU_AT(21013);
     #line 21013 "vuc.vu"
-    ({ vu_str _t5634 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5634); drop_Str(&_t5634); });
+    ({ vu_str _t5634 = vu_str_lit("            if (a[i].kind == VU_SEL_READABLE || a[i].kind == VU_SEL_OFF) continue;\n", 83); vu_str_cat(&v_s, &_t5634); drop_Str(&_t5634); });
     #line 21014 "vuc.vu"
     VU_AT(21014);
     #line 21014 "vuc.vu"
-    ({ vu_str _t5637 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5637); drop_Str(&_t5637); });
+    ({ vu_str _t5637 = vu_str_lit("            pthread_mutex_lock(&a[i].ch->lock);\n", 48); vu_str_cat(&v_s, &_t5637); drop_Str(&_t5637); });
     #line 21015 "vuc.vu"
     VU_AT(21015);
     #line 21015 "vuc.vu"
-    ({ vu_str _t5640 = vu_str_lit("static void drop_X_Conn(void **p) { if (*p) { vu_sock_drop(*p); *p = NULL; } }\n", 79); vu_str_cat(&v_s, &_t5640); drop_Str(&_t5640); });
+    ({ vu_str _t5640 = vu_str_lit("            ws[i].next = a[i].ch->watch;\n", 41); vu_str_cat(&v_s, &_t5640); drop_Str(&_t5640); });
     #line 21016 "vuc.vu"
     VU_AT(21016);
     #line 21016 "vuc.vu"
-    ({ vu_str _t5643 = vu_str_lit("static void drop_X_Listener(void **p) { if (*p) { vu_sock_drop(*p); *p = NULL; } }", 82); vu_str_cat(&v_s, &_t5643); drop_Str(&_t5643); });
+    ({ vu_str _t5643 = vu_str_lit("            a[i].ch->watch = &ws[i];\n", 37); vu_str_cat(&v_s, &_t5643); drop_Str(&_t5643); });
     #line 21017 "vuc.vu"
     VU_AT(21017);
     #line 21017 "vuc.vu"
+    ({ vu_str _t5646 = vu_str_lit("            pthread_mutex_unlock(&a[i].ch->lock);\n", 50); vu_str_cat(&v_s, &_t5646); drop_Str(&_t5646); });
+    #line 21018 "vuc.vu"
+    VU_AT(21018);
+    #line 21018 "vuc.vu"
+    ({ vu_str _t5649 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5649); drop_Str(&_t5649); });
+    #line 21019 "vuc.vu"
+    VU_AT(21019);
+    #line 21019 "vuc.vu"
+    ({ vu_str _t5652 = vu_str_lit("        int got = -1;\n", 22); vu_str_cat(&v_s, &_t5652); drop_Str(&_t5652); });
+    #line 21020 "vuc.vu"
+    VU_AT(21020);
+    #line 21020 "vuc.vu"
+    ({ vu_str _t5655 = vu_str_lit("        for (int k = 0; k < n && got < 0; k++) {\n", 49); vu_str_cat(&v_s, &_t5655); drop_Str(&_t5655); });
+    #line 21021 "vuc.vu"
+    VU_AT(21021);
+    #line 21021 "vuc.vu"
+    ({ vu_str _t5658 = vu_str_lit("            int i = (start + k) % n;\n", 37); vu_str_cat(&v_s, &_t5658); drop_Str(&_t5658); });
+    #line 21022 "vuc.vu"
+    VU_AT(21022);
+    #line 21022 "vuc.vu"
+    ({ vu_str _t5661 = vu_str_lit("            if (vu_sel_try(&a[i])) got = i;\n", 44); vu_str_cat(&v_s, &_t5661); drop_Str(&_t5661); });
+    #line 21023 "vuc.vu"
+    VU_AT(21023);
+    #line 21023 "vuc.vu"
+    ({ vu_str _t5664 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5664); drop_Str(&_t5664); });
+    #line 21024 "vuc.vu"
+    VU_AT(21024);
+    #line 21024 "vuc.vu"
+    ({ vu_str _t5667 = vu_str_lit("        bool woken = false;   /* someone has woken (or is waking) this task: that wake must be taken */\n", 104); vu_str_cat(&v_s, &_t5667); drop_Str(&_t5667); });
+    #line 21025 "vuc.vu"
+    VU_AT(21025);
+    #line 21025 "vuc.vu"
+    ({ vu_str _t5670 = vu_str_lit("        if (got >= 0 || (sock && __atomic_exchange_n(&sock->rpend, 0, __ATOMIC_SEQ_CST))) {\n", 92); vu_str_cat(&v_s, &_t5670); drop_Str(&_t5670); });
+    #line 21026 "vuc.vu"
+    VU_AT(21026);
+    #line 21026 "vuc.vu"
+    ({ vu_str _t5673 = vu_str_lit("            if (sock) {\n", 24); vu_str_cat(&v_s, &_t5673); drop_Str(&_t5673); });
+    #line 21027 "vuc.vu"
+    VU_AT(21027);
+    #line 21027 "vuc.vu"
+    ({ vu_str _t5676 = vu_str_lit("                vu_task *expected = t;\n", 39); vu_str_cat(&v_s, &_t5676); drop_Str(&_t5676); });
+    #line 21028 "vuc.vu"
+    VU_AT(21028);
+    #line 21028 "vuc.vu"
+    ({ vu_str _t5679 = vu_str_lit("                woken = !__atomic_compare_exchange_n(&sock->reader, &expected, NULL, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);\n", 129); vu_str_cat(&v_s, &_t5679); drop_Str(&_t5679); });
+    #line 21029 "vuc.vu"
+    VU_AT(21029);
+    #line 21029 "vuc.vu"
+    ({ vu_str _t5682 = vu_str_lit("            } else {\n", 21); vu_str_cat(&v_s, &_t5682); drop_Str(&_t5682); });
+    #line 21030 "vuc.vu"
+    VU_AT(21030);
+    #line 21030 "vuc.vu"
+    ({ vu_str _t5685 = vu_str_lit("                int one = 1;\n", 29); vu_str_cat(&v_s, &_t5685); drop_Str(&_t5685); });
+    #line 21031 "vuc.vu"
+    VU_AT(21031);
+    #line 21031 "vuc.vu"
+    ({ vu_str _t5688 = vu_str_lit("                woken = !__atomic_compare_exchange_n(&t->sel_state, &one, 0, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);\n", 121); vu_str_cat(&v_s, &_t5688); drop_Str(&_t5688); });
+    #line 21032 "vuc.vu"
+    VU_AT(21032);
+    #line 21032 "vuc.vu"
+    ({ vu_str _t5691 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t5691); drop_Str(&_t5691); });
+    #line 21033 "vuc.vu"
+    VU_AT(21033);
+    #line 21033 "vuc.vu"
+    ({ vu_str _t5694 = vu_str_lit("            if (woken) vu_block();\n", 35); vu_str_cat(&v_s, &_t5694); drop_Str(&_t5694); });
+    #line 21034 "vuc.vu"
+    VU_AT(21034);
+    #line 21034 "vuc.vu"
+    ({ vu_str _t5697 = vu_str_lit("        } else {\n", 17); vu_str_cat(&v_s, &_t5697); drop_Str(&_t5697); });
+    #line 21035 "vuc.vu"
+    VU_AT(21035);
+    #line 21035 "vuc.vu"
+    ({ vu_str _t5700 = vu_str_lit("            vu_wait_until(deadline);\n", 37); vu_str_cat(&v_s, &_t5700); drop_Str(&_t5700); });
+    #line 21036 "vuc.vu"
+    VU_AT(21036);
+    #line 21036 "vuc.vu"
+    ({ vu_str _t5703 = vu_str_lit("            vu_block();\n", 24); vu_str_cat(&v_s, &_t5703); drop_Str(&_t5703); });
+    #line 21037 "vuc.vu"
+    VU_AT(21037);
+    #line 21037 "vuc.vu"
+    ({ vu_str _t5706 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t5706); drop_Str(&_t5706); });
+    #line 21038 "vuc.vu"
+    VU_AT(21038);
+    #line 21038 "vuc.vu"
+    ({ vu_str _t5709 = vu_str_lit("        vu_heap_remove(t);\n", 27); vu_str_cat(&v_s, &_t5709); drop_Str(&_t5709); });
+    #line 21039 "vuc.vu"
+    VU_AT(21039);
+    #line 21039 "vuc.vu"
+    ({ vu_str _t5712 = vu_str_lit("        t->wait_kind = VU_W_NONE;\n", 34); vu_str_cat(&v_s, &_t5712); drop_Str(&_t5712); });
+    #line 21040 "vuc.vu"
+    VU_AT(21040);
+    #line 21040 "vuc.vu"
+    ({ vu_str _t5715 = vu_str_lit("        __atomic_store_n(&t->sel_state, 0, __ATOMIC_SEQ_CST);\n", 62); vu_str_cat(&v_s, &_t5715); drop_Str(&_t5715); });
+    #line 21041 "vuc.vu"
+    VU_AT(21041);
+    #line 21041 "vuc.vu"
+    ({ vu_str _t5718 = vu_str_lit("        for (int i = 0; i < n; i++) if (a[i].kind != VU_SEL_READABLE && a[i].kind != VU_SEL_OFF) vu_watch_drop(a[i].ch, &ws[i]);\n", 129); vu_str_cat(&v_s, &_t5718); drop_Str(&_t5718); });
+    #line 21042 "vuc.vu"
+    VU_AT(21042);
+    #line 21042 "vuc.vu"
+    ({ vu_str _t5721 = vu_str_lit("        if (got >= 0) return got;\n", 34); vu_str_cat(&v_s, &_t5721); drop_Str(&_t5721); });
+    #line 21043 "vuc.vu"
+    VU_AT(21043);
+    #line 21043 "vuc.vu"
+    ({ vu_str _t5724 = vu_str_lit("        start = (start + 1) % (n ? n : 1);\n", 43); vu_str_cat(&v_s, &_t5724); drop_Str(&_t5724); });
+    #line 21044 "vuc.vu"
+    VU_AT(21044);
+    #line 21044 "vuc.vu"
+    ({ vu_str _t5727 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t5727); drop_Str(&_t5727); });
+    #line 21045 "vuc.vu"
+    VU_AT(21045);
+    #line 21045 "vuc.vu"
+    ({ vu_str _t5730 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t5730); drop_Str(&_t5730); });
+    #line 21046 "vuc.vu"
+    VU_AT(21046);
+    #line 21046 "vuc.vu"
+    ({ vu_str _t5733 = vu_str_lit("static void drop_X_Conn(void **p) { if (*p) { vu_sock_drop(*p); *p = NULL; } }\n", 79); vu_str_cat(&v_s, &_t5733); drop_Str(&_t5733); });
+    #line 21047 "vuc.vu"
+    VU_AT(21047);
+    #line 21047 "vuc.vu"
+    ({ vu_str _t5736 = vu_str_lit("static void drop_X_Listener(void **p) { if (*p) { vu_sock_drop(*p); *p = NULL; } }", 82); vu_str_cat(&v_s, &_t5736); drop_Str(&_t5736); });
+    #line 21048 "vuc.vu"
+    VU_AT(21048);
+    #line 21048 "vuc.vu"
     {
-        #line 21017 "vuc.vu"
-        vu_str _t5644 = VU_MV(v_s);
-        #line 21017 "vuc.vu"
-        return _t5644;
-    #line 21017 "vuc.vu"
+        #line 21048 "vuc.vu"
+        vu_str _t5737 = VU_MV(v_s);
+        #line 21048 "vuc.vu"
+        return _t5737;
+    #line 21048 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_rt_json(void) {
-    #line 21019 "vuc.vu"
+    #line 21050 "vuc.vu"
     VU_ENTER("rt_json");
-    #line 21020 "vuc.vu"
-    VU_AT(21020);
-    #line 21020 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21021 "vuc.vu"
-    VU_AT(21021);
-    #line 21021 "vuc.vu"
-    ({ vu_str _t3 = vu_str_lit("/* JSON for to_json and from_json: string escaping for the encoder, and the decoder's scanner. The\n", 99); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
-    #line 21022 "vuc.vu"
-    VU_AT(21022);
-    #line 21022 "vuc.vu"
-    ({ vu_str _t6 = vu_str_lit("   code for each type (vu_jenc_T, vu_jdec_T) is generated; these handle the plain values. */\n", 93); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
-    #line 21023 "vuc.vu"
-    VU_AT(21023);
-    #line 21023 "vuc.vu"
-    ({ vu_str _t9 = vu_str_lit("static void vu_jcat(vu_str *o, const char *s, int64_t n) { vu_str_cat_bytes(o, (const uint8_t *)s, n); }\n", 105); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
-    #line 21024 "vuc.vu"
-    VU_AT(21024);
-    #line 21024 "vuc.vu"
-    ({ vu_str _t12 = vu_str_lit("/* A JSON string: quotes, backslashes and control characters escaped; bytes that aren't UTF-8 become U+FFFD. */\n", 112); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
-    #line 21025 "vuc.vu"
-    VU_AT(21025);
-    #line 21025 "vuc.vu"
-    ({ vu_str _t15 = vu_str_lit("static void vu_jenc_bytes(vu_str *o, const uint8_t *s, int64_t n) {\n", 68); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
-    #line 21026 "vuc.vu"
-    VU_AT(21026);
-    #line 21026 "vuc.vu"
-    ({ vu_str _t18 = vu_str_lit("    static const char hex[] = \"0123456789abcdef\";\n", 50); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
-    #line 21027 "vuc.vu"
-    VU_AT(21027);
-    #line 21027 "vuc.vu"
-    ({ vu_str _t21 = vu_str_lit("    vu_str_reserve(o, n + 2);\n", 30); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
-    #line 21028 "vuc.vu"
-    VU_AT(21028);
-    #line 21028 "vuc.vu"
-    ({ vu_str _t24 = vu_str_lit("    vu_jcat(o, \"\\\"\", 1);\n", 25); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
-    #line 21029 "vuc.vu"
-    VU_AT(21029);
-    #line 21029 "vuc.vu"
-    ({ vu_str _t27 = vu_str_lit("    int64_t i = 0, run = 0;\n", 28); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
-    #line 21030 "vuc.vu"
-    VU_AT(21030);
-    #line 21030 "vuc.vu"
-    ({ vu_str _t30 = vu_str_lit("    while (i < n) {\n", 20); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
-    #line 21031 "vuc.vu"
-    VU_AT(21031);
-    #line 21031 "vuc.vu"
-    ({ vu_str _t33 = vu_str_lit("        uint8_t c = s[i];\n", 26); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
-    #line 21032 "vuc.vu"
-    VU_AT(21032);
-    #line 21032 "vuc.vu"
-    ({ vu_str _t36 = vu_str_lit("        if (c >= 0x20 && c < 0x80 && c != '\"' && c != '\\\\') { i++; continue; }\n", 79); vu_str_cat(&v_s, &_t36); drop_Str(&_t36); });
-    #line 21033 "vuc.vu"
-    VU_AT(21033);
-    #line 21033 "vuc.vu"
-    ({ vu_str _t39 = vu_str_lit("        if (i > run) vu_str_cat_bytes(o, s + run, i - run);\n", 60); vu_str_cat(&v_s, &_t39); drop_Str(&_t39); });
-    #line 21034 "vuc.vu"
-    VU_AT(21034);
-    #line 21034 "vuc.vu"
-    ({ vu_str _t42 = vu_str_lit("        if (c == '\"' || c == '\\\\') { char e[2] = {'\\\\', (char)c}; vu_jcat(o, e, 2); i++; }\n", 91); vu_str_cat(&v_s, &_t42); drop_Str(&_t42); });
-    #line 21035 "vuc.vu"
-    VU_AT(21035);
-    #line 21035 "vuc.vu"
-    ({ vu_str _t45 = vu_str_lit("        else if (c < 0x20) {\n", 29); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
-    #line 21036 "vuc.vu"
-    VU_AT(21036);
-    #line 21036 "vuc.vu"
-    ({ vu_str _t48 = vu_str_lit("            const char *sh = c == '\\n' ? \"\\\\n\" : c == '\\t' ? \"\\\\t\" : c == '\\r' ? \"\\\\r\" : c == '\\b' ? \"\\\\b\" : c == '\\f' ? \"\\\\f\" : NULL;\n", 135); vu_str_cat(&v_s, &_t48); drop_Str(&_t48); });
-    #line 21037 "vuc.vu"
-    VU_AT(21037);
-    #line 21037 "vuc.vu"
-    ({ vu_str _t51 = vu_str_lit("            if (sh) vu_jcat(o, sh, 2);\n", 39); vu_str_cat(&v_s, &_t51); drop_Str(&_t51); });
-    #line 21038 "vuc.vu"
-    VU_AT(21038);
-    #line 21038 "vuc.vu"
-    ({ vu_str _t54 = vu_str_lit("            else { char e[6] = {'\\\\', 'u', '0', '0', hex[c >> 4], hex[c & 15]}; vu_jcat(o, e, 6); }\n", 100); vu_str_cat(&v_s, &_t54); drop_Str(&_t54); });
-    #line 21039 "vuc.vu"
-    VU_AT(21039);
-    #line 21039 "vuc.vu"
-    ({ vu_str _t57 = vu_str_lit("            i++;\n", 17); vu_str_cat(&v_s, &_t57); drop_Str(&_t57); });
-    #line 21040 "vuc.vu"
-    VU_AT(21040);
-    #line 21040 "vuc.vu"
-    ({ vu_str _t60 = vu_str_lit("        } else {\n", 17); vu_str_cat(&v_s, &_t60); drop_Str(&_t60); });
-    #line 21041 "vuc.vu"
-    VU_AT(21041);
-    #line 21041 "vuc.vu"
-    ({ vu_str _t63 = vu_str_lit("            size_t k = vu_utf8_len(s + i, (size_t)(n - i));\n", 60); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
-    #line 21042 "vuc.vu"
-    VU_AT(21042);
-    #line 21042 "vuc.vu"
-    ({ vu_str _t66 = vu_str_lit("            if (!k) { vu_jcat(o, \"\\\\ufffd\", 6); i++; }\n", 55); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 21043 "vuc.vu"
-    VU_AT(21043);
-    #line 21043 "vuc.vu"
-    ({ vu_str _t69 = vu_str_lit("            else { vu_str_cat_bytes(o, s + i, (int64_t)k); i += (int64_t)k; }\n", 78); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
-    #line 21044 "vuc.vu"
-    VU_AT(21044);
-    #line 21044 "vuc.vu"
-    ({ vu_str _t72 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
-    #line 21045 "vuc.vu"
-    VU_AT(21045);
-    #line 21045 "vuc.vu"
-    ({ vu_str _t75 = vu_str_lit("        run = i;\n", 17); vu_str_cat(&v_s, &_t75); drop_Str(&_t75); });
-    #line 21046 "vuc.vu"
-    VU_AT(21046);
-    #line 21046 "vuc.vu"
-    ({ vu_str _t78 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
-    #line 21047 "vuc.vu"
-    VU_AT(21047);
-    #line 21047 "vuc.vu"
-    ({ vu_str _t81 = vu_str_lit("    if (i > run) vu_str_cat_bytes(o, s + run, i - run);\n", 56); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
-    #line 21048 "vuc.vu"
-    VU_AT(21048);
-    #line 21048 "vuc.vu"
-    ({ vu_str _t84 = vu_str_lit("    vu_jcat(o, \"\\\"\", 1);\n", 25); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
-    #line 21049 "vuc.vu"
-    VU_AT(21049);
-    #line 21049 "vuc.vu"
-    ({ vu_str _t87 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
-    #line 21050 "vuc.vu"
-    VU_AT(21050);
-    #line 21050 "vuc.vu"
-    ({ vu_str _t90 = vu_str_lit("static void vu_jenc_Str(vu_str *o, const vu_str *v) { vu_jenc_bytes(o, v->data, v->len); }\n", 91); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 21051 "vuc.vu"
     VU_AT(21051);
     #line 21051 "vuc.vu"
-    ({ vu_str _t93 = vu_str_lit("static void vu_jenc_Int(vu_str *o, const int64_t *v) {\n", 55); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 21052 "vuc.vu"
     VU_AT(21052);
     #line 21052 "vuc.vu"
-    ({ vu_str _t96 = vu_str_lit("    char b[24];\n", 16); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
+    ({ vu_str _t3 = vu_str_lit("/* JSON for to_json and from_json: string escaping for the encoder, and the decoder's scanner. The\n", 99); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
     #line 21053 "vuc.vu"
     VU_AT(21053);
     #line 21053 "vuc.vu"
-    ({ vu_str _t99 = vu_str_lit("    int n = snprintf(b, sizeof b, \"%lld\", (long long)*v);\n", 58); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
+    ({ vu_str _t6 = vu_str_lit("   code for each type (vu_jenc_T, vu_jdec_T) is generated; these handle the plain values. */\n", 93); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
     #line 21054 "vuc.vu"
     VU_AT(21054);
     #line 21054 "vuc.vu"
-    ({ vu_str _t102 = vu_str_lit("    vu_jcat(o, b, n);\n", 22); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
+    ({ vu_str _t9 = vu_str_lit("static void vu_jcat(vu_str *o, const char *s, int64_t n) { vu_str_cat_bytes(o, (const uint8_t *)s, n); }\n", 105); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
     #line 21055 "vuc.vu"
     VU_AT(21055);
     #line 21055 "vuc.vu"
-    ({ vu_str _t105 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
+    ({ vu_str _t12 = vu_str_lit("/* A JSON string: quotes, backslashes and control characters escaped; bytes that aren't UTF-8 become U+FFFD. */\n", 112); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
     #line 21056 "vuc.vu"
     VU_AT(21056);
     #line 21056 "vuc.vu"
-    ({ vu_str _t108 = vu_str_lit("static void vu_jenc_Byte(vu_str *o, const uint8_t *v) { int64_t x = *v; vu_jenc_Int(o, &x); }\n", 94); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    ({ vu_str _t15 = vu_str_lit("static void vu_jenc_bytes(vu_str *o, const uint8_t *s, int64_t n) {\n", 68); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
     #line 21057 "vuc.vu"
     VU_AT(21057);
     #line 21057 "vuc.vu"
-    ({ vu_str _t111 = vu_str_lit("static void vu_jenc_Bool(vu_str *o, const bool *v) { if (*v) vu_jcat(o, \"true\", 4); else vu_jcat(o, \"false\", 5); }\n", 115); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
+    ({ vu_str _t18 = vu_str_lit("    static const char hex[] = \"0123456789abcdef\";\n", 50); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
     #line 21058 "vuc.vu"
     VU_AT(21058);
     #line 21058 "vuc.vu"
-    ({ vu_str _t114 = vu_str_lit("/* NaN and the infinities have no JSON form: they become null, as in JavaScript. */\n", 84); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
+    ({ vu_str _t21 = vu_str_lit("    vu_str_reserve(o, n + 2);\n", 30); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
     #line 21059 "vuc.vu"
     VU_AT(21059);
     #line 21059 "vuc.vu"
-    ({ vu_str _t117 = vu_str_lit("static void vu_jenc_Float(vu_str *o, const double *v) {\n", 56); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
+    ({ vu_str _t24 = vu_str_lit("    vu_jcat(o, \"\\\"\", 1);\n", 25); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
     #line 21060 "vuc.vu"
     VU_AT(21060);
     #line 21060 "vuc.vu"
-    ({ vu_str _t120 = vu_str_lit("    if (!isfinite(*v)) { vu_jcat(o, \"null\", 4); return; }\n", 58); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
+    ({ vu_str _t27 = vu_str_lit("    int64_t i = 0, run = 0;\n", 28); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
     #line 21061 "vuc.vu"
     VU_AT(21061);
     #line 21061 "vuc.vu"
-    ({ vu_str _t123 = vu_str_lit("    char b[40];\n", 16); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
+    ({ vu_str _t30 = vu_str_lit("    while (i < n) {\n", 20); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
     #line 21062 "vuc.vu"
     VU_AT(21062);
     #line 21062 "vuc.vu"
-    ({ vu_str _t126 = vu_str_lit("    const char *q = vu_shortest(*v, b);\n", 40); vu_str_cat(&v_s, &_t126); drop_Str(&_t126); });
+    ({ vu_str _t33 = vu_str_lit("        uint8_t c = s[i];\n", 26); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
     #line 21063 "vuc.vu"
     VU_AT(21063);
     #line 21063 "vuc.vu"
-    ({ vu_str _t129 = vu_str_lit("    vu_jcat(o, q, (int64_t)strlen(q));\n", 39); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
+    ({ vu_str _t36 = vu_str_lit("        if (c >= 0x20 && c < 0x80 && c != '\"' && c != '\\\\') { i++; continue; }\n", 79); vu_str_cat(&v_s, &_t36); drop_Str(&_t36); });
     #line 21064 "vuc.vu"
     VU_AT(21064);
     #line 21064 "vuc.vu"
-    ({ vu_str _t132 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
+    ({ vu_str _t39 = vu_str_lit("        if (i > run) vu_str_cat_bytes(o, s + run, i - run);\n", 60); vu_str_cat(&v_s, &_t39); drop_Str(&_t39); });
     #line 21065 "vuc.vu"
     VU_AT(21065);
     #line 21065 "vuc.vu"
-    ({ vu_str _t135 = vu_str_lit("#define VU_JSON_DEPTH 1000\n", 27); vu_str_cat(&v_s, &_t135); drop_Str(&_t135); });
+    ({ vu_str _t42 = vu_str_lit("        if (c == '\"' || c == '\\\\') { char e[2] = {'\\\\', (char)c}; vu_jcat(o, e, 2); i++; }\n", 91); vu_str_cat(&v_s, &_t42); drop_Str(&_t42); });
     #line 21066 "vuc.vu"
     VU_AT(21066);
     #line 21066 "vuc.vu"
-    ({ vu_str _t138 = vu_str_lit("typedef struct {\n", 17); vu_str_cat(&v_s, &_t138); drop_Str(&_t138); });
+    ({ vu_str _t45 = vu_str_lit("        else if (c < 0x20) {\n", 29); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
     #line 21067 "vuc.vu"
     VU_AT(21067);
     #line 21067 "vuc.vu"
-    ({ vu_str _t141 = vu_str_lit("    const uint8_t *s, *p, *end;\n", 32); vu_str_cat(&v_s, &_t141); drop_Str(&_t141); });
+    ({ vu_str _t48 = vu_str_lit("            const char *sh = c == '\\n' ? \"\\\\n\" : c == '\\t' ? \"\\\\t\" : c == '\\r' ? \"\\\\r\" : c == '\\b' ? \"\\\\b\" : c == '\\f' ? \"\\\\f\" : NULL;\n", 135); vu_str_cat(&v_s, &_t48); drop_Str(&_t48); });
     #line 21068 "vuc.vu"
     VU_AT(21068);
     #line 21068 "vuc.vu"
-    ({ vu_str _t144 = vu_str_lit("    int depth;\n", 15); vu_str_cat(&v_s, &_t144); drop_Str(&_t144); });
+    ({ vu_str _t51 = vu_str_lit("            if (sh) vu_jcat(o, sh, 2);\n", 39); vu_str_cat(&v_s, &_t51); drop_Str(&_t51); });
     #line 21069 "vuc.vu"
     VU_AT(21069);
     #line 21069 "vuc.vu"
-    ({ vu_str _t147 = vu_str_lit("    vu_str err;    /* what went wrong, and where */\n", 52); vu_str_cat(&v_s, &_t147); drop_Str(&_t147); });
+    ({ vu_str _t54 = vu_str_lit("            else { char e[6] = {'\\\\', 'u', '0', '0', hex[c >> 4], hex[c & 15]}; vu_jcat(o, e, 6); }\n", 100); vu_str_cat(&v_s, &_t54); drop_Str(&_t54); });
     #line 21070 "vuc.vu"
     VU_AT(21070);
     #line 21070 "vuc.vu"
-    ({ vu_str _t150 = vu_str_lit("    vu_str path;   /* where in the value: items[3].qty (built as the decoders return) */\n", 89); vu_str_cat(&v_s, &_t150); drop_Str(&_t150); });
+    ({ vu_str _t57 = vu_str_lit("            i++;\n", 17); vu_str_cat(&v_s, &_t57); drop_Str(&_t57); });
     #line 21071 "vuc.vu"
     VU_AT(21071);
     #line 21071 "vuc.vu"
-    ({ vu_str _t153 = vu_str_lit("} vu_jp;\n", 9); vu_str_cat(&v_s, &_t153); drop_Str(&_t153); });
+    ({ vu_str _t60 = vu_str_lit("        } else {\n", 17); vu_str_cat(&v_s, &_t60); drop_Str(&_t60); });
     #line 21072 "vuc.vu"
     VU_AT(21072);
     #line 21072 "vuc.vu"
-    ({ vu_str _t156 = vu_str_lit("static bool vu_jfail(vu_jp *j, const char *what) {\n", 51); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
+    ({ vu_str _t63 = vu_str_lit("            size_t k = vu_utf8_len(s + i, (size_t)(n - i));\n", 60); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
     #line 21073 "vuc.vu"
     VU_AT(21073);
     #line 21073 "vuc.vu"
-    ({ vu_str _t159 = vu_str_lit("    if (!j->err.len) {\n", 23); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
+    ({ vu_str _t66 = vu_str_lit("            if (!k) { vu_jcat(o, \"\\\\ufffd\", 6); i++; }\n", 55); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
     #line 21074 "vuc.vu"
     VU_AT(21074);
     #line 21074 "vuc.vu"
-    ({ vu_str _t162 = vu_str_lit("        drop_Str(&j->err);\n", 27); vu_str_cat(&v_s, &_t162); drop_Str(&_t162); });
+    ({ vu_str _t69 = vu_str_lit("            else { vu_str_cat_bytes(o, s + i, (int64_t)k); i += (int64_t)k; }\n", 78); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
     #line 21075 "vuc.vu"
     VU_AT(21075);
     #line 21075 "vuc.vu"
-    ({ vu_str _t165 = vu_str_lit("        j->err = vu_errf(\"%s at byte %lld\", what, (long long)(j->p - j->s));\n", 77); vu_str_cat(&v_s, &_t165); drop_Str(&_t165); });
+    ({ vu_str _t72 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
     #line 21076 "vuc.vu"
     VU_AT(21076);
     #line 21076 "vuc.vu"
-    ({ vu_str _t168 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t168); drop_Str(&_t168); });
+    ({ vu_str _t75 = vu_str_lit("        run = i;\n", 17); vu_str_cat(&v_s, &_t75); drop_Str(&_t75); });
     #line 21077 "vuc.vu"
     VU_AT(21077);
     #line 21077 "vuc.vu"
-    ({ vu_str _t171 = vu_str_lit("    return false;\n", 18); vu_str_cat(&v_s, &_t171); drop_Str(&_t171); });
+    ({ vu_str _t78 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
     #line 21078 "vuc.vu"
     VU_AT(21078);
     #line 21078 "vuc.vu"
-    ({ vu_str _t174 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t174); drop_Str(&_t174); });
+    ({ vu_str _t81 = vu_str_lit("    if (i > run) vu_str_cat_bytes(o, s + run, i - run);\n", 56); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
     #line 21079 "vuc.vu"
     VU_AT(21079);
     #line 21079 "vuc.vu"
-    ({ vu_str _t177 = vu_str_lit("/* Puts a field name or a list index in front of the path to the error. Past 200 bytes the outer\n", 97); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
+    ({ vu_str _t84 = vu_str_lit("    vu_jcat(o, \"\\\"\", 1);\n", 25); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
     #line 21080 "vuc.vu"
     VU_AT(21080);
     #line 21080 "vuc.vu"
-    ({ vu_str _t180 = vu_str_lit("   part is left out (\"...\") so deep data can't make a huge message. */\n", 71); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
+    ({ vu_str _t87 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
     #line 21081 "vuc.vu"
     VU_AT(21081);
     #line 21081 "vuc.vu"
-    ({ vu_str _t183 = vu_str_lit("static void vu_jpath(vu_jp *j, const char *name, int64_t n, int64_t index) {\n", 77); vu_str_cat(&v_s, &_t183); drop_Str(&_t183); });
+    ({ vu_str _t90 = vu_str_lit("static void vu_jenc_Str(vu_str *o, const vu_str *v) { vu_jenc_bytes(o, v->data, v->len); }\n", 91); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 21082 "vuc.vu"
     VU_AT(21082);
     #line 21082 "vuc.vu"
-    ({ vu_str _t186 = vu_str_lit("    if (j->path.len >= 200) {\n", 30); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
+    ({ vu_str _t93 = vu_str_lit("static void vu_jenc_Int(vu_str *o, const int64_t *v) {\n", 55); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
     #line 21083 "vuc.vu"
     VU_AT(21083);
     #line 21083 "vuc.vu"
-    ({ vu_str _t189 = vu_str_lit("        if (j->path.data[0] != '.') { vu_str p = {0}; vu_jcat(&p, \"...\", 3); vu_str_cat_bytes(&p, j->path.data, j->path.len); drop_Str(&j->path); j->path = p; }\n", 161); vu_str_cat(&v_s, &_t189); drop_Str(&_t189); });
+    ({ vu_str _t96 = vu_str_lit("    char b[24];\n", 16); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
     #line 21084 "vuc.vu"
     VU_AT(21084);
     #line 21084 "vuc.vu"
-    ({ vu_str _t192 = vu_str_lit("        return;\n", 16); vu_str_cat(&v_s, &_t192); drop_Str(&_t192); });
+    ({ vu_str _t99 = vu_str_lit("    int n = snprintf(b, sizeof b, \"%lld\", (long long)*v);\n", 58); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
     #line 21085 "vuc.vu"
     VU_AT(21085);
     #line 21085 "vuc.vu"
-    ({ vu_str _t195 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t195); drop_Str(&_t195); });
+    ({ vu_str _t102 = vu_str_lit("    vu_jcat(o, b, n);\n", 22); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
     #line 21086 "vuc.vu"
     VU_AT(21086);
     #line 21086 "vuc.vu"
-    ({ vu_str _t198 = vu_str_lit("    vu_str p = {0};\n", 20); vu_str_cat(&v_s, &_t198); drop_Str(&_t198); });
+    ({ vu_str _t105 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 21087 "vuc.vu"
     VU_AT(21087);
     #line 21087 "vuc.vu"
-    ({ vu_str _t201 = vu_str_lit("    if (name) vu_str_cat_bytes(&p, (const uint8_t *)name, n);\n", 62); vu_str_cat(&v_s, &_t201); drop_Str(&_t201); });
+    ({ vu_str _t108 = vu_str_lit("static void vu_jenc_Byte(vu_str *o, const uint8_t *v) { int64_t x = *v; vu_jenc_Int(o, &x); }\n", 94); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
     #line 21088 "vuc.vu"
     VU_AT(21088);
     #line 21088 "vuc.vu"
-    ({ vu_str _t204 = vu_str_lit("    else { char b[32]; int k = snprintf(b, sizeof b, \"[%lld]\", (long long)index); vu_jcat(&p, b, k); }\n", 103); vu_str_cat(&v_s, &_t204); drop_Str(&_t204); });
+    ({ vu_str _t111 = vu_str_lit("static void vu_jenc_Bool(vu_str *o, const bool *v) { if (*v) vu_jcat(o, \"true\", 4); else vu_jcat(o, \"false\", 5); }\n", 115); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
     #line 21089 "vuc.vu"
     VU_AT(21089);
     #line 21089 "vuc.vu"
-    ({ vu_str _t207 = vu_str_lit("    if (j->path.len && j->path.data[0] != '[') vu_jcat(&p, \".\", 1);\n", 68); vu_str_cat(&v_s, &_t207); drop_Str(&_t207); });
+    ({ vu_str _t114 = vu_str_lit("/* NaN and the infinities have no JSON form: they become null, as in JavaScript. */\n", 84); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
     #line 21090 "vuc.vu"
     VU_AT(21090);
     #line 21090 "vuc.vu"
-    ({ vu_str _t210 = vu_str_lit("    vu_str_cat_bytes(&p, j->path.data, j->path.len);\n", 53); vu_str_cat(&v_s, &_t210); drop_Str(&_t210); });
+    ({ vu_str _t117 = vu_str_lit("static void vu_jenc_Float(vu_str *o, const double *v) {\n", 56); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
     #line 21091 "vuc.vu"
     VU_AT(21091);
     #line 21091 "vuc.vu"
-    ({ vu_str _t213 = vu_str_lit("    drop_Str(&j->path);\n", 24); vu_str_cat(&v_s, &_t213); drop_Str(&_t213); });
+    ({ vu_str _t120 = vu_str_lit("    if (!isfinite(*v)) { vu_jcat(o, \"null\", 4); return; }\n", 58); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
     #line 21092 "vuc.vu"
     VU_AT(21092);
     #line 21092 "vuc.vu"
-    ({ vu_str _t216 = vu_str_lit("    j->path = p;\n", 17); vu_str_cat(&v_s, &_t216); drop_Str(&_t216); });
+    ({ vu_str _t123 = vu_str_lit("    char b[40];\n", 16); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
     #line 21093 "vuc.vu"
     VU_AT(21093);
     #line 21093 "vuc.vu"
-    ({ vu_str _t219 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t219); drop_Str(&_t219); });
+    ({ vu_str _t126 = vu_str_lit("    const char *q = vu_shortest(*v, b);\n", 40); vu_str_cat(&v_s, &_t126); drop_Str(&_t126); });
     #line 21094 "vuc.vu"
     VU_AT(21094);
     #line 21094 "vuc.vu"
-    ({ vu_str _t222 = vu_str_lit("static void vu_jws(vu_jp *j) {\n", 31); vu_str_cat(&v_s, &_t222); drop_Str(&_t222); });
+    ({ vu_str _t129 = vu_str_lit("    vu_jcat(o, q, (int64_t)strlen(q));\n", 39); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
     #line 21095 "vuc.vu"
     VU_AT(21095);
     #line 21095 "vuc.vu"
-    ({ vu_str _t225 = vu_str_lit("    while (j->p < j->end && (*j->p == ' ' || *j->p == '\\n' || *j->p == '\\r' || *j->p == '\\t')) j->p++;\n", 103); vu_str_cat(&v_s, &_t225); drop_Str(&_t225); });
+    ({ vu_str _t132 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
     #line 21096 "vuc.vu"
     VU_AT(21096);
     #line 21096 "vuc.vu"
-    ({ vu_str _t228 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t228); drop_Str(&_t228); });
+    ({ vu_str _t135 = vu_str_lit("#define VU_JSON_DEPTH 1000\n", 27); vu_str_cat(&v_s, &_t135); drop_Str(&_t135); });
     #line 21097 "vuc.vu"
     VU_AT(21097);
     #line 21097 "vuc.vu"
-    ({ vu_str _t231 = vu_str_lit("static bool vu_jword(vu_jp *j, const char *w, size_t n) {\n", 58); vu_str_cat(&v_s, &_t231); drop_Str(&_t231); });
+    ({ vu_str _t138 = vu_str_lit("typedef struct {\n", 17); vu_str_cat(&v_s, &_t138); drop_Str(&_t138); });
     #line 21098 "vuc.vu"
     VU_AT(21098);
     #line 21098 "vuc.vu"
-    ({ vu_str _t234 = vu_str_lit("    if ((size_t)(j->end - j->p) >= n && memcmp(j->p, w, n) == 0) { j->p += n; return true; }\n", 93); vu_str_cat(&v_s, &_t234); drop_Str(&_t234); });
+    ({ vu_str _t141 = vu_str_lit("    const uint8_t *s, *p, *end;\n", 32); vu_str_cat(&v_s, &_t141); drop_Str(&_t141); });
     #line 21099 "vuc.vu"
     VU_AT(21099);
     #line 21099 "vuc.vu"
-    ({ vu_str _t237 = vu_str_lit("    return false;\n", 18); vu_str_cat(&v_s, &_t237); drop_Str(&_t237); });
+    ({ vu_str _t144 = vu_str_lit("    int depth;\n", 15); vu_str_cat(&v_s, &_t144); drop_Str(&_t144); });
     #line 21100 "vuc.vu"
     VU_AT(21100);
     #line 21100 "vuc.vu"
-    ({ vu_str _t240 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t240); drop_Str(&_t240); });
+    ({ vu_str _t147 = vu_str_lit("    vu_str err;    /* what went wrong, and where */\n", 52); vu_str_cat(&v_s, &_t147); drop_Str(&_t147); });
     #line 21101 "vuc.vu"
     VU_AT(21101);
     #line 21101 "vuc.vu"
-    ({ vu_str _t243 = vu_str_lit("/* Is the next value null? (Then it's read.) */\n", 48); vu_str_cat(&v_s, &_t243); drop_Str(&_t243); });
+    ({ vu_str _t150 = vu_str_lit("    vu_str path;   /* where in the value: items[3].qty (built as the decoders return) */\n", 89); vu_str_cat(&v_s, &_t150); drop_Str(&_t150); });
     #line 21102 "vuc.vu"
     VU_AT(21102);
     #line 21102 "vuc.vu"
-    ({ vu_str _t246 = vu_str_lit("static bool vu_jnull(vu_jp *j) {\n", 33); vu_str_cat(&v_s, &_t246); drop_Str(&_t246); });
+    ({ vu_str _t153 = vu_str_lit("} vu_jp;\n", 9); vu_str_cat(&v_s, &_t153); drop_Str(&_t153); });
     #line 21103 "vuc.vu"
     VU_AT(21103);
     #line 21103 "vuc.vu"
-    ({ vu_str _t249 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t249); drop_Str(&_t249); });
+    ({ vu_str _t156 = vu_str_lit("static bool vu_jfail(vu_jp *j, const char *what) {\n", 51); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
     #line 21104 "vuc.vu"
     VU_AT(21104);
     #line 21104 "vuc.vu"
-    ({ vu_str _t252 = vu_str_lit("    return j->p < j->end && *j->p == 'n' && vu_jword(j, \"null\", 4);\n", 68); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
+    ({ vu_str _t159 = vu_str_lit("    if (!j->err.len) {\n", 23); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
     #line 21105 "vuc.vu"
     VU_AT(21105);
     #line 21105 "vuc.vu"
-    ({ vu_str _t255 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
+    ({ vu_str _t162 = vu_str_lit("        drop_Str(&j->err);\n", 27); vu_str_cat(&v_s, &_t162); drop_Str(&_t162); });
     #line 21106 "vuc.vu"
     VU_AT(21106);
     #line 21106 "vuc.vu"
-    ({ vu_str _t258 = vu_str_lit("static bool vu_jdec_Bool(vu_jp *j, bool *out) {\n", 48); vu_str_cat(&v_s, &_t258); drop_Str(&_t258); });
+    ({ vu_str _t165 = vu_str_lit("        j->err = vu_errf(\"%s at byte %lld\", what, (long long)(j->p - j->s));\n", 77); vu_str_cat(&v_s, &_t165); drop_Str(&_t165); });
     #line 21107 "vuc.vu"
     VU_AT(21107);
     #line 21107 "vuc.vu"
-    ({ vu_str _t261 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t261); drop_Str(&_t261); });
+    ({ vu_str _t168 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t168); drop_Str(&_t168); });
     #line 21108 "vuc.vu"
     VU_AT(21108);
     #line 21108 "vuc.vu"
-    ({ vu_str _t264 = vu_str_lit("    if (vu_jword(j, \"true\", 4)) { *out = true; return true; }\n", 62); vu_str_cat(&v_s, &_t264); drop_Str(&_t264); });
+    ({ vu_str _t171 = vu_str_lit("    return false;\n", 18); vu_str_cat(&v_s, &_t171); drop_Str(&_t171); });
     #line 21109 "vuc.vu"
     VU_AT(21109);
     #line 21109 "vuc.vu"
-    ({ vu_str _t267 = vu_str_lit("    if (vu_jword(j, \"false\", 5)) { *out = false; return true; }\n", 64); vu_str_cat(&v_s, &_t267); drop_Str(&_t267); });
+    ({ vu_str _t174 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t174); drop_Str(&_t174); });
     #line 21110 "vuc.vu"
     VU_AT(21110);
     #line 21110 "vuc.vu"
-    ({ vu_str _t270 = vu_str_lit("    return vu_jfail(j, \"expected true or false\");\n", 50); vu_str_cat(&v_s, &_t270); drop_Str(&_t270); });
+    ({ vu_str _t177 = vu_str_lit("/* Puts a field name or a list index in front of the path to the error. Past 200 bytes the outer\n", 97); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
     #line 21111 "vuc.vu"
     VU_AT(21111);
     #line 21111 "vuc.vu"
-    ({ vu_str _t273 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t273); drop_Str(&_t273); });
+    ({ vu_str _t180 = vu_str_lit("   part is left out (\"...\") so deep data can't make a huge message. */\n", 71); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
     #line 21112 "vuc.vu"
     VU_AT(21112);
     #line 21112 "vuc.vu"
-    ({ vu_str _t276 = vu_str_lit("/* The extent of a JSON number: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?; whole says it has no\n", 100); vu_str_cat(&v_s, &_t276); drop_Str(&_t276); });
+    ({ vu_str _t183 = vu_str_lit("static void vu_jpath(vu_jp *j, const char *name, int64_t n, int64_t index) {\n", 77); vu_str_cat(&v_s, &_t183); drop_Str(&_t183); });
     #line 21113 "vuc.vu"
     VU_AT(21113);
     #line 21113 "vuc.vu"
-    ({ vu_str _t279 = vu_str_lit("   fraction or exponent. */\n", 28); vu_str_cat(&v_s, &_t279); drop_Str(&_t279); });
+    ({ vu_str _t186 = vu_str_lit("    if (j->path.len >= 200) {\n", 30); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
     #line 21114 "vuc.vu"
     VU_AT(21114);
     #line 21114 "vuc.vu"
-    ({ vu_str _t282 = vu_str_lit("static bool vu_jnum(vu_jp *j, const uint8_t **a, bool *whole) {\n", 64); vu_str_cat(&v_s, &_t282); drop_Str(&_t282); });
+    ({ vu_str _t189 = vu_str_lit("        if (j->path.data[0] != '.') { vu_str p = {0}; vu_jcat(&p, \"...\", 3); vu_str_cat_bytes(&p, j->path.data, j->path.len); drop_Str(&j->path); j->path = p; }\n", 161); vu_str_cat(&v_s, &_t189); drop_Str(&_t189); });
     #line 21115 "vuc.vu"
     VU_AT(21115);
     #line 21115 "vuc.vu"
-    ({ vu_str _t285 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t285); drop_Str(&_t285); });
+    ({ vu_str _t192 = vu_str_lit("        return;\n", 16); vu_str_cat(&v_s, &_t192); drop_Str(&_t192); });
     #line 21116 "vuc.vu"
     VU_AT(21116);
     #line 21116 "vuc.vu"
-    ({ vu_str _t288 = vu_str_lit("    const uint8_t *p = j->p, *e = j->end;\n", 42); vu_str_cat(&v_s, &_t288); drop_Str(&_t288); });
+    ({ vu_str _t195 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t195); drop_Str(&_t195); });
     #line 21117 "vuc.vu"
     VU_AT(21117);
     #line 21117 "vuc.vu"
-    ({ vu_str _t291 = vu_str_lit("    *a = p;\n", 12); vu_str_cat(&v_s, &_t291); drop_Str(&_t291); });
+    ({ vu_str _t198 = vu_str_lit("    vu_str p = {0};\n", 20); vu_str_cat(&v_s, &_t198); drop_Str(&_t198); });
     #line 21118 "vuc.vu"
     VU_AT(21118);
     #line 21118 "vuc.vu"
-    ({ vu_str _t294 = vu_str_lit("    *whole = true;\n", 19); vu_str_cat(&v_s, &_t294); drop_Str(&_t294); });
+    ({ vu_str _t201 = vu_str_lit("    if (name) vu_str_cat_bytes(&p, (const uint8_t *)name, n);\n", 62); vu_str_cat(&v_s, &_t201); drop_Str(&_t201); });
     #line 21119 "vuc.vu"
     VU_AT(21119);
     #line 21119 "vuc.vu"
-    ({ vu_str _t297 = vu_str_lit("    if (p < e && *p == '-') p++;\n", 33); vu_str_cat(&v_s, &_t297); drop_Str(&_t297); });
+    ({ vu_str _t204 = vu_str_lit("    else { char b[32]; int k = snprintf(b, sizeof b, \"[%lld]\", (long long)index); vu_jcat(&p, b, k); }\n", 103); vu_str_cat(&v_s, &_t204); drop_Str(&_t204); });
     #line 21120 "vuc.vu"
     VU_AT(21120);
     #line 21120 "vuc.vu"
-    ({ vu_str _t300 = vu_str_lit("    if (p < e && *p == '0') p++;\n", 33); vu_str_cat(&v_s, &_t300); drop_Str(&_t300); });
+    ({ vu_str _t207 = vu_str_lit("    if (j->path.len && j->path.data[0] != '[') vu_jcat(&p, \".\", 1);\n", 68); vu_str_cat(&v_s, &_t207); drop_Str(&_t207); });
     #line 21121 "vuc.vu"
     VU_AT(21121);
     #line 21121 "vuc.vu"
-    ({ vu_str _t303 = vu_str_lit("    else if (p < e && *p >= '1' && *p <= '9') { while (p < e && *p >= '0' && *p <= '9') p++; }\n", 95); vu_str_cat(&v_s, &_t303); drop_Str(&_t303); });
+    ({ vu_str _t210 = vu_str_lit("    vu_str_cat_bytes(&p, j->path.data, j->path.len);\n", 53); vu_str_cat(&v_s, &_t210); drop_Str(&_t210); });
     #line 21122 "vuc.vu"
     VU_AT(21122);
     #line 21122 "vuc.vu"
-    ({ vu_str _t306 = vu_str_lit("    else return vu_jfail(j, \"expected a number\");\n", 50); vu_str_cat(&v_s, &_t306); drop_Str(&_t306); });
+    ({ vu_str _t213 = vu_str_lit("    drop_Str(&j->path);\n", 24); vu_str_cat(&v_s, &_t213); drop_Str(&_t213); });
     #line 21123 "vuc.vu"
     VU_AT(21123);
     #line 21123 "vuc.vu"
-    ({ vu_str _t309 = vu_str_lit("    if (p < e && *p == '.') {\n", 30); vu_str_cat(&v_s, &_t309); drop_Str(&_t309); });
+    ({ vu_str _t216 = vu_str_lit("    j->path = p;\n", 17); vu_str_cat(&v_s, &_t216); drop_Str(&_t216); });
     #line 21124 "vuc.vu"
     VU_AT(21124);
     #line 21124 "vuc.vu"
-    ({ vu_str _t312 = vu_str_lit("        p++;\n", 13); vu_str_cat(&v_s, &_t312); drop_Str(&_t312); });
+    ({ vu_str _t219 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t219); drop_Str(&_t219); });
     #line 21125 "vuc.vu"
     VU_AT(21125);
     #line 21125 "vuc.vu"
-    ({ vu_str _t315 = vu_str_lit("        *whole = false;\n", 24); vu_str_cat(&v_s, &_t315); drop_Str(&_t315); });
+    ({ vu_str _t222 = vu_str_lit("static void vu_jws(vu_jp *j) {\n", 31); vu_str_cat(&v_s, &_t222); drop_Str(&_t222); });
     #line 21126 "vuc.vu"
     VU_AT(21126);
     #line 21126 "vuc.vu"
-    ({ vu_str _t318 = vu_str_lit("        if (!(p < e && *p >= '0' && *p <= '9')) { j->p = p; return vu_jfail(j, \"expected a digit after '.'\"); }\n", 112); vu_str_cat(&v_s, &_t318); drop_Str(&_t318); });
+    ({ vu_str _t225 = vu_str_lit("    while (j->p < j->end && (*j->p == ' ' || *j->p == '\\n' || *j->p == '\\r' || *j->p == '\\t')) j->p++;\n", 103); vu_str_cat(&v_s, &_t225); drop_Str(&_t225); });
     #line 21127 "vuc.vu"
     VU_AT(21127);
     #line 21127 "vuc.vu"
-    ({ vu_str _t321 = vu_str_lit("        while (p < e && *p >= '0' && *p <= '9') p++;\n", 53); vu_str_cat(&v_s, &_t321); drop_Str(&_t321); });
+    ({ vu_str _t228 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t228); drop_Str(&_t228); });
     #line 21128 "vuc.vu"
     VU_AT(21128);
     #line 21128 "vuc.vu"
-    ({ vu_str _t324 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t324); drop_Str(&_t324); });
+    ({ vu_str _t231 = vu_str_lit("static bool vu_jword(vu_jp *j, const char *w, size_t n) {\n", 58); vu_str_cat(&v_s, &_t231); drop_Str(&_t231); });
     #line 21129 "vuc.vu"
     VU_AT(21129);
     #line 21129 "vuc.vu"
-    ({ vu_str _t327 = vu_str_lit("    if (p < e && (*p == 'e' || *p == 'E')) {\n", 45); vu_str_cat(&v_s, &_t327); drop_Str(&_t327); });
+    ({ vu_str _t234 = vu_str_lit("    if ((size_t)(j->end - j->p) >= n && memcmp(j->p, w, n) == 0) { j->p += n; return true; }\n", 93); vu_str_cat(&v_s, &_t234); drop_Str(&_t234); });
     #line 21130 "vuc.vu"
     VU_AT(21130);
     #line 21130 "vuc.vu"
-    ({ vu_str _t330 = vu_str_lit("        p++;\n", 13); vu_str_cat(&v_s, &_t330); drop_Str(&_t330); });
+    ({ vu_str _t237 = vu_str_lit("    return false;\n", 18); vu_str_cat(&v_s, &_t237); drop_Str(&_t237); });
     #line 21131 "vuc.vu"
     VU_AT(21131);
     #line 21131 "vuc.vu"
-    ({ vu_str _t333 = vu_str_lit("        *whole = false;\n", 24); vu_str_cat(&v_s, &_t333); drop_Str(&_t333); });
+    ({ vu_str _t240 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t240); drop_Str(&_t240); });
     #line 21132 "vuc.vu"
     VU_AT(21132);
     #line 21132 "vuc.vu"
-    ({ vu_str _t336 = vu_str_lit("        if (p < e && (*p == '+' || *p == '-')) p++;\n", 52); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    ({ vu_str _t243 = vu_str_lit("/* Is the next value null? (Then it's read.) */\n", 48); vu_str_cat(&v_s, &_t243); drop_Str(&_t243); });
     #line 21133 "vuc.vu"
     VU_AT(21133);
     #line 21133 "vuc.vu"
-    ({ vu_str _t339 = vu_str_lit("        if (!(p < e && *p >= '0' && *p <= '9')) { j->p = p; return vu_jfail(j, \"expected a digit in the exponent\"); }\n", 118); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    ({ vu_str _t246 = vu_str_lit("static bool vu_jnull(vu_jp *j) {\n", 33); vu_str_cat(&v_s, &_t246); drop_Str(&_t246); });
     #line 21134 "vuc.vu"
     VU_AT(21134);
     #line 21134 "vuc.vu"
-    ({ vu_str _t342 = vu_str_lit("        while (p < e && *p >= '0' && *p <= '9') p++;\n", 53); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    ({ vu_str _t249 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t249); drop_Str(&_t249); });
     #line 21135 "vuc.vu"
     VU_AT(21135);
     #line 21135 "vuc.vu"
-    ({ vu_str _t345 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    ({ vu_str _t252 = vu_str_lit("    return j->p < j->end && *j->p == 'n' && vu_jword(j, \"null\", 4);\n", 68); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
     #line 21136 "vuc.vu"
     VU_AT(21136);
     #line 21136 "vuc.vu"
-    ({ vu_str _t348 = vu_str_lit("    j->p = p;\n", 14); vu_str_cat(&v_s, &_t348); drop_Str(&_t348); });
+    ({ vu_str _t255 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
     #line 21137 "vuc.vu"
     VU_AT(21137);
     #line 21137 "vuc.vu"
-    ({ vu_str _t351 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t351); drop_Str(&_t351); });
+    ({ vu_str _t258 = vu_str_lit("static bool vu_jdec_Bool(vu_jp *j, bool *out) {\n", 48); vu_str_cat(&v_s, &_t258); drop_Str(&_t258); });
     #line 21138 "vuc.vu"
     VU_AT(21138);
     #line 21138 "vuc.vu"
-    ({ vu_str _t354 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t354); drop_Str(&_t354); });
+    ({ vu_str _t261 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t261); drop_Str(&_t261); });
     #line 21139 "vuc.vu"
     VU_AT(21139);
     #line 21139 "vuc.vu"
-    ({ vu_str _t357 = vu_str_lit("static bool vu_jdec_Int(vu_jp *j, int64_t *out) {\n", 50); vu_str_cat(&v_s, &_t357); drop_Str(&_t357); });
+    ({ vu_str _t264 = vu_str_lit("    if (vu_jword(j, \"true\", 4)) { *out = true; return true; }\n", 62); vu_str_cat(&v_s, &_t264); drop_Str(&_t264); });
     #line 21140 "vuc.vu"
     VU_AT(21140);
     #line 21140 "vuc.vu"
-    ({ vu_str _t360 = vu_str_lit("    const uint8_t *a;\n", 22); vu_str_cat(&v_s, &_t360); drop_Str(&_t360); });
+    ({ vu_str _t267 = vu_str_lit("    if (vu_jword(j, \"false\", 5)) { *out = false; return true; }\n", 64); vu_str_cat(&v_s, &_t267); drop_Str(&_t267); });
     #line 21141 "vuc.vu"
     VU_AT(21141);
     #line 21141 "vuc.vu"
-    ({ vu_str _t363 = vu_str_lit("    bool whole;\n", 16); vu_str_cat(&v_s, &_t363); drop_Str(&_t363); });
+    ({ vu_str _t270 = vu_str_lit("    return vu_jfail(j, \"expected true or false\");\n", 50); vu_str_cat(&v_s, &_t270); drop_Str(&_t270); });
     #line 21142 "vuc.vu"
     VU_AT(21142);
     #line 21142 "vuc.vu"
-    ({ vu_str _t366 = vu_str_lit("    if (!vu_jnum(j, &a, &whole)) return false;\n", 47); vu_str_cat(&v_s, &_t366); drop_Str(&_t366); });
+    ({ vu_str _t273 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t273); drop_Str(&_t273); });
     #line 21143 "vuc.vu"
     VU_AT(21143);
     #line 21143 "vuc.vu"
-    ({ vu_str _t369 = vu_str_lit("    if (!whole) { j->p = a; return vu_jfail(j, \"expected a whole number\"); }\n", 77); vu_str_cat(&v_s, &_t369); drop_Str(&_t369); });
+    ({ vu_str _t276 = vu_str_lit("/* The extent of a JSON number: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?; whole says it has no\n", 100); vu_str_cat(&v_s, &_t276); drop_Str(&_t276); });
     #line 21144 "vuc.vu"
     VU_AT(21144);
     #line 21144 "vuc.vu"
-    ({ vu_str _t372 = vu_str_lit("    bool neg = *a == '-';\n", 26); vu_str_cat(&v_s, &_t372); drop_Str(&_t372); });
+    ({ vu_str _t279 = vu_str_lit("   fraction or exponent. */\n", 28); vu_str_cat(&v_s, &_t279); drop_Str(&_t279); });
     #line 21145 "vuc.vu"
     VU_AT(21145);
     #line 21145 "vuc.vu"
-    ({ vu_str _t375 = vu_str_lit("    uint64_t v = 0, lim = neg ? (uint64_t)INT64_MAX + 1 : (uint64_t)INT64_MAX;\n", 79); vu_str_cat(&v_s, &_t375); drop_Str(&_t375); });
+    ({ vu_str _t282 = vu_str_lit("static bool vu_jnum(vu_jp *j, const uint8_t **a, bool *whole) {\n", 64); vu_str_cat(&v_s, &_t282); drop_Str(&_t282); });
     #line 21146 "vuc.vu"
     VU_AT(21146);
     #line 21146 "vuc.vu"
-    ({ vu_str _t378 = vu_str_lit("    for (const uint8_t *q = a + neg; q < j->p; q++) {\n", 54); vu_str_cat(&v_s, &_t378); drop_Str(&_t378); });
+    ({ vu_str _t285 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t285); drop_Str(&_t285); });
     #line 21147 "vuc.vu"
     VU_AT(21147);
     #line 21147 "vuc.vu"
-    ({ vu_str _t381 = vu_str_lit("        uint64_t d = (uint64_t)(*q - '0');\n", 43); vu_str_cat(&v_s, &_t381); drop_Str(&_t381); });
+    ({ vu_str _t288 = vu_str_lit("    const uint8_t *p = j->p, *e = j->end;\n", 42); vu_str_cat(&v_s, &_t288); drop_Str(&_t288); });
     #line 21148 "vuc.vu"
     VU_AT(21148);
     #line 21148 "vuc.vu"
-    ({ vu_str _t384 = vu_str_lit("        if (v > (lim - d) / 10) { j->p = a; return vu_jfail(j, \"number too large for an Int\"); }\n", 97); vu_str_cat(&v_s, &_t384); drop_Str(&_t384); });
+    ({ vu_str _t291 = vu_str_lit("    *a = p;\n", 12); vu_str_cat(&v_s, &_t291); drop_Str(&_t291); });
     #line 21149 "vuc.vu"
     VU_AT(21149);
     #line 21149 "vuc.vu"
-    ({ vu_str _t387 = vu_str_lit("        v = v * 10 + d;\n", 24); vu_str_cat(&v_s, &_t387); drop_Str(&_t387); });
+    ({ vu_str _t294 = vu_str_lit("    *whole = true;\n", 19); vu_str_cat(&v_s, &_t294); drop_Str(&_t294); });
     #line 21150 "vuc.vu"
     VU_AT(21150);
     #line 21150 "vuc.vu"
-    ({ vu_str _t390 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t390); drop_Str(&_t390); });
+    ({ vu_str _t297 = vu_str_lit("    if (p < e && *p == '-') p++;\n", 33); vu_str_cat(&v_s, &_t297); drop_Str(&_t297); });
     #line 21151 "vuc.vu"
     VU_AT(21151);
     #line 21151 "vuc.vu"
-    ({ vu_str _t393 = vu_str_lit("    *out = neg ? (int64_t)(0 - v) : (int64_t)v;\n", 48); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
+    ({ vu_str _t300 = vu_str_lit("    if (p < e && *p == '0') p++;\n", 33); vu_str_cat(&v_s, &_t300); drop_Str(&_t300); });
     #line 21152 "vuc.vu"
     VU_AT(21152);
     #line 21152 "vuc.vu"
-    ({ vu_str _t396 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
+    ({ vu_str _t303 = vu_str_lit("    else if (p < e && *p >= '1' && *p <= '9') { while (p < e && *p >= '0' && *p <= '9') p++; }\n", 95); vu_str_cat(&v_s, &_t303); drop_Str(&_t303); });
     #line 21153 "vuc.vu"
     VU_AT(21153);
     #line 21153 "vuc.vu"
-    ({ vu_str _t399 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t399); drop_Str(&_t399); });
+    ({ vu_str _t306 = vu_str_lit("    else return vu_jfail(j, \"expected a number\");\n", 50); vu_str_cat(&v_s, &_t306); drop_Str(&_t306); });
     #line 21154 "vuc.vu"
     VU_AT(21154);
     #line 21154 "vuc.vu"
-    ({ vu_str _t402 = vu_str_lit("static bool vu_jdec_Byte(vu_jp *j, uint8_t *out) {\n", 51); vu_str_cat(&v_s, &_t402); drop_Str(&_t402); });
+    ({ vu_str _t309 = vu_str_lit("    if (p < e && *p == '.') {\n", 30); vu_str_cat(&v_s, &_t309); drop_Str(&_t309); });
     #line 21155 "vuc.vu"
     VU_AT(21155);
     #line 21155 "vuc.vu"
-    ({ vu_str _t405 = vu_str_lit("    const uint8_t *a = j->p;\n", 29); vu_str_cat(&v_s, &_t405); drop_Str(&_t405); });
+    ({ vu_str _t312 = vu_str_lit("        p++;\n", 13); vu_str_cat(&v_s, &_t312); drop_Str(&_t312); });
     #line 21156 "vuc.vu"
     VU_AT(21156);
     #line 21156 "vuc.vu"
-    ({ vu_str _t408 = vu_str_lit("    int64_t v;\n", 15); vu_str_cat(&v_s, &_t408); drop_Str(&_t408); });
+    ({ vu_str _t315 = vu_str_lit("        *whole = false;\n", 24); vu_str_cat(&v_s, &_t315); drop_Str(&_t315); });
     #line 21157 "vuc.vu"
     VU_AT(21157);
     #line 21157 "vuc.vu"
-    ({ vu_str _t411 = vu_str_lit("    if (!vu_jdec_Int(j, &v)) return false;\n", 43); vu_str_cat(&v_s, &_t411); drop_Str(&_t411); });
+    ({ vu_str _t318 = vu_str_lit("        if (!(p < e && *p >= '0' && *p <= '9')) { j->p = p; return vu_jfail(j, \"expected a digit after '.'\"); }\n", 112); vu_str_cat(&v_s, &_t318); drop_Str(&_t318); });
     #line 21158 "vuc.vu"
     VU_AT(21158);
     #line 21158 "vuc.vu"
-    ({ vu_str _t414 = vu_str_lit("    if (v < 0 || v > 255) { j->p = a; vu_jws(j); return vu_jfail(j, \"expected a number from 0 to 255\"); }\n", 106); vu_str_cat(&v_s, &_t414); drop_Str(&_t414); });
+    ({ vu_str _t321 = vu_str_lit("        while (p < e && *p >= '0' && *p <= '9') p++;\n", 53); vu_str_cat(&v_s, &_t321); drop_Str(&_t321); });
     #line 21159 "vuc.vu"
     VU_AT(21159);
     #line 21159 "vuc.vu"
-    ({ vu_str _t417 = vu_str_lit("    *out = (uint8_t)v;\n", 23); vu_str_cat(&v_s, &_t417); drop_Str(&_t417); });
+    ({ vu_str _t324 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t324); drop_Str(&_t324); });
     #line 21160 "vuc.vu"
     VU_AT(21160);
     #line 21160 "vuc.vu"
-    ({ vu_str _t420 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t420); drop_Str(&_t420); });
+    ({ vu_str _t327 = vu_str_lit("    if (p < e && (*p == 'e' || *p == 'E')) {\n", 45); vu_str_cat(&v_s, &_t327); drop_Str(&_t327); });
     #line 21161 "vuc.vu"
     VU_AT(21161);
     #line 21161 "vuc.vu"
-    ({ vu_str _t423 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t423); drop_Str(&_t423); });
+    ({ vu_str _t330 = vu_str_lit("        p++;\n", 13); vu_str_cat(&v_s, &_t330); drop_Str(&_t330); });
     #line 21162 "vuc.vu"
     VU_AT(21162);
     #line 21162 "vuc.vu"
-    ({ vu_str _t426 = vu_str_lit("static bool vu_jdec_Float(vu_jp *j, double *out) {\n", 51); vu_str_cat(&v_s, &_t426); drop_Str(&_t426); });
+    ({ vu_str _t333 = vu_str_lit("        *whole = false;\n", 24); vu_str_cat(&v_s, &_t333); drop_Str(&_t333); });
     #line 21163 "vuc.vu"
     VU_AT(21163);
     #line 21163 "vuc.vu"
-    ({ vu_str _t429 = vu_str_lit("    const uint8_t *a;\n", 22); vu_str_cat(&v_s, &_t429); drop_Str(&_t429); });
+    ({ vu_str _t336 = vu_str_lit("        if (p < e && (*p == '+' || *p == '-')) p++;\n", 52); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
     #line 21164 "vuc.vu"
     VU_AT(21164);
     #line 21164 "vuc.vu"
-    ({ vu_str _t432 = vu_str_lit("    bool whole;\n", 16); vu_str_cat(&v_s, &_t432); drop_Str(&_t432); });
+    ({ vu_str _t339 = vu_str_lit("        if (!(p < e && *p >= '0' && *p <= '9')) { j->p = p; return vu_jfail(j, \"expected a digit in the exponent\"); }\n", 118); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
     #line 21165 "vuc.vu"
     VU_AT(21165);
     #line 21165 "vuc.vu"
-    ({ vu_str _t435 = vu_str_lit("    if (!vu_jnum(j, &a, &whole)) return false;\n", 47); vu_str_cat(&v_s, &_t435); drop_Str(&_t435); });
+    ({ vu_str _t342 = vu_str_lit("        while (p < e && *p >= '0' && *p <= '9') p++;\n", 53); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
     #line 21166 "vuc.vu"
     VU_AT(21166);
     #line 21166 "vuc.vu"
-    ({ vu_str _t438 = vu_str_lit("    vu_str view = {(uint8_t *)a, (int64_t)(j->p - a), 0}, e = {0};\n", 67); vu_str_cat(&v_s, &_t438); drop_Str(&_t438); });
+    ({ vu_str _t345 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
     #line 21167 "vuc.vu"
     VU_AT(21167);
     #line 21167 "vuc.vu"
-    ({ vu_str _t441 = vu_str_lit("    if (!vu_parse_float(&view, out, &e)) { drop_Str(&e); j->p = a; return vu_jfail(j, \"expected a number\"); }\n", 110); vu_str_cat(&v_s, &_t441); drop_Str(&_t441); });
+    ({ vu_str _t348 = vu_str_lit("    j->p = p;\n", 14); vu_str_cat(&v_s, &_t348); drop_Str(&_t348); });
     #line 21168 "vuc.vu"
     VU_AT(21168);
     #line 21168 "vuc.vu"
-    ({ vu_str _t444 = vu_str_lit("    if (!isfinite(*out)) { j->p = a; return vu_jfail(j, \"number too large for a Float\"); }\n", 91); vu_str_cat(&v_s, &_t444); drop_Str(&_t444); });
+    ({ vu_str _t351 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t351); drop_Str(&_t351); });
     #line 21169 "vuc.vu"
     VU_AT(21169);
     #line 21169 "vuc.vu"
-    ({ vu_str _t447 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t447); drop_Str(&_t447); });
+    ({ vu_str _t354 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t354); drop_Str(&_t354); });
     #line 21170 "vuc.vu"
     VU_AT(21170);
     #line 21170 "vuc.vu"
-    ({ vu_str _t450 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t450); drop_Str(&_t450); });
+    ({ vu_str _t357 = vu_str_lit("static bool vu_jdec_Int(vu_jp *j, int64_t *out) {\n", 50); vu_str_cat(&v_s, &_t357); drop_Str(&_t357); });
     #line 21171 "vuc.vu"
     VU_AT(21171);
     #line 21171 "vuc.vu"
-    ({ vu_str _t453 = vu_str_lit("static int vu_jhex4(const uint8_t *p) {\n", 40); vu_str_cat(&v_s, &_t453); drop_Str(&_t453); });
+    ({ vu_str _t360 = vu_str_lit("    const uint8_t *a;\n", 22); vu_str_cat(&v_s, &_t360); drop_Str(&_t360); });
     #line 21172 "vuc.vu"
     VU_AT(21172);
     #line 21172 "vuc.vu"
-    ({ vu_str _t456 = vu_str_lit("    int v = 0;\n", 15); vu_str_cat(&v_s, &_t456); drop_Str(&_t456); });
+    ({ vu_str _t363 = vu_str_lit("    bool whole;\n", 16); vu_str_cat(&v_s, &_t363); drop_Str(&_t363); });
     #line 21173 "vuc.vu"
     VU_AT(21173);
     #line 21173 "vuc.vu"
-    ({ vu_str _t459 = vu_str_lit("    for (int i = 0; i < 4; i++) {\n", 34); vu_str_cat(&v_s, &_t459); drop_Str(&_t459); });
+    ({ vu_str _t366 = vu_str_lit("    if (!vu_jnum(j, &a, &whole)) return false;\n", 47); vu_str_cat(&v_s, &_t366); drop_Str(&_t366); });
     #line 21174 "vuc.vu"
     VU_AT(21174);
     #line 21174 "vuc.vu"
-    ({ vu_str _t462 = vu_str_lit("        int c = p[i], d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;\n", 139); vu_str_cat(&v_s, &_t462); drop_Str(&_t462); });
+    ({ vu_str _t369 = vu_str_lit("    if (!whole) { j->p = a; return vu_jfail(j, \"expected a whole number\"); }\n", 77); vu_str_cat(&v_s, &_t369); drop_Str(&_t369); });
     #line 21175 "vuc.vu"
     VU_AT(21175);
     #line 21175 "vuc.vu"
-    ({ vu_str _t465 = vu_str_lit("        if (d < 0) return -1;\n", 30); vu_str_cat(&v_s, &_t465); drop_Str(&_t465); });
+    ({ vu_str _t372 = vu_str_lit("    bool neg = *a == '-';\n", 26); vu_str_cat(&v_s, &_t372); drop_Str(&_t372); });
     #line 21176 "vuc.vu"
     VU_AT(21176);
     #line 21176 "vuc.vu"
-    ({ vu_str _t468 = vu_str_lit("        v = v * 16 + d;\n", 24); vu_str_cat(&v_s, &_t468); drop_Str(&_t468); });
+    ({ vu_str _t375 = vu_str_lit("    uint64_t v = 0, lim = neg ? (uint64_t)INT64_MAX + 1 : (uint64_t)INT64_MAX;\n", 79); vu_str_cat(&v_s, &_t375); drop_Str(&_t375); });
     #line 21177 "vuc.vu"
     VU_AT(21177);
     #line 21177 "vuc.vu"
-    ({ vu_str _t471 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t471); drop_Str(&_t471); });
+    ({ vu_str _t378 = vu_str_lit("    for (const uint8_t *q = a + neg; q < j->p; q++) {\n", 54); vu_str_cat(&v_s, &_t378); drop_Str(&_t378); });
     #line 21178 "vuc.vu"
     VU_AT(21178);
     #line 21178 "vuc.vu"
-    ({ vu_str _t474 = vu_str_lit("    return v;\n", 14); vu_str_cat(&v_s, &_t474); drop_Str(&_t474); });
+    ({ vu_str _t381 = vu_str_lit("        uint64_t d = (uint64_t)(*q - '0');\n", 43); vu_str_cat(&v_s, &_t381); drop_Str(&_t381); });
     #line 21179 "vuc.vu"
     VU_AT(21179);
     #line 21179 "vuc.vu"
-    ({ vu_str _t477 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t477); drop_Str(&_t477); });
+    ({ vu_str _t384 = vu_str_lit("        if (v > (lim - d) / 10) { j->p = a; return vu_jfail(j, \"number too large for an Int\"); }\n", 97); vu_str_cat(&v_s, &_t384); drop_Str(&_t384); });
     #line 21180 "vuc.vu"
     VU_AT(21180);
     #line 21180 "vuc.vu"
-    ({ vu_str _t480 = vu_str_lit("static void vu_jutf8(vu_str *o, int cp) {\n", 42); vu_str_cat(&v_s, &_t480); drop_Str(&_t480); });
+    ({ vu_str _t387 = vu_str_lit("        v = v * 10 + d;\n", 24); vu_str_cat(&v_s, &_t387); drop_Str(&_t387); });
     #line 21181 "vuc.vu"
     VU_AT(21181);
     #line 21181 "vuc.vu"
-    ({ vu_str _t483 = vu_str_lit("    uint8_t b[4];\n", 18); vu_str_cat(&v_s, &_t483); drop_Str(&_t483); });
+    ({ vu_str _t390 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t390); drop_Str(&_t390); });
     #line 21182 "vuc.vu"
     VU_AT(21182);
     #line 21182 "vuc.vu"
-    ({ vu_str _t486 = vu_str_lit("    int n;\n", 11); vu_str_cat(&v_s, &_t486); drop_Str(&_t486); });
+    ({ vu_str _t393 = vu_str_lit("    *out = neg ? (int64_t)(0 - v) : (int64_t)v;\n", 48); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
     #line 21183 "vuc.vu"
     VU_AT(21183);
     #line 21183 "vuc.vu"
-    ({ vu_str _t489 = vu_str_lit("    if (cp < 0x80) { b[0] = (uint8_t)cp; n = 1; }\n", 50); vu_str_cat(&v_s, &_t489); drop_Str(&_t489); });
+    ({ vu_str _t396 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
     #line 21184 "vuc.vu"
     VU_AT(21184);
     #line 21184 "vuc.vu"
-    ({ vu_str _t492 = vu_str_lit("    else if (cp < 0x800) { b[0] = (uint8_t)(0xC0 | (cp >> 6)); b[1] = (uint8_t)(0x80 | (cp & 0x3F)); n = 2; }\n", 110); vu_str_cat(&v_s, &_t492); drop_Str(&_t492); });
+    ({ vu_str _t399 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t399); drop_Str(&_t399); });
     #line 21185 "vuc.vu"
     VU_AT(21185);
     #line 21185 "vuc.vu"
-    ({ vu_str _t495 = vu_str_lit("    else if (cp < 0x10000) { b[0] = (uint8_t)(0xE0 | (cp >> 12)); b[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F)); b[2] = (uint8_t)(0x80 | (cp & 0x3F)); n = 3; }\n", 158); vu_str_cat(&v_s, &_t495); drop_Str(&_t495); });
+    ({ vu_str _t402 = vu_str_lit("static bool vu_jdec_Byte(vu_jp *j, uint8_t *out) {\n", 51); vu_str_cat(&v_s, &_t402); drop_Str(&_t402); });
     #line 21186 "vuc.vu"
     VU_AT(21186);
     #line 21186 "vuc.vu"
-    ({ vu_str _t498 = vu_str_lit("    else { b[0] = (uint8_t)(0xF0 | (cp >> 18)); b[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F)); b[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F)); b[3] = (uint8_t)(0x80 | (cp & 0x3F)); n = 4; }\n", 186); vu_str_cat(&v_s, &_t498); drop_Str(&_t498); });
+    ({ vu_str _t405 = vu_str_lit("    const uint8_t *a = j->p;\n", 29); vu_str_cat(&v_s, &_t405); drop_Str(&_t405); });
     #line 21187 "vuc.vu"
     VU_AT(21187);
     #line 21187 "vuc.vu"
-    ({ vu_str _t501 = vu_str_lit("    vu_str_cat_bytes(o, b, n);\n", 31); vu_str_cat(&v_s, &_t501); drop_Str(&_t501); });
+    ({ vu_str _t408 = vu_str_lit("    int64_t v;\n", 15); vu_str_cat(&v_s, &_t408); drop_Str(&_t408); });
     #line 21188 "vuc.vu"
     VU_AT(21188);
     #line 21188 "vuc.vu"
-    ({ vu_str _t504 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t504); drop_Str(&_t504); });
+    ({ vu_str _t411 = vu_str_lit("    if (!vu_jdec_Int(j, &v)) return false;\n", 43); vu_str_cat(&v_s, &_t411); drop_Str(&_t411); });
     #line 21189 "vuc.vu"
     VU_AT(21189);
     #line 21189 "vuc.vu"
-    ({ vu_str _t507 = vu_str_lit("/* A string (the opening quote is next): escapes decoded, UTF-8 checked. */\n", 76); vu_str_cat(&v_s, &_t507); drop_Str(&_t507); });
+    ({ vu_str _t414 = vu_str_lit("    if (v < 0 || v > 255) { j->p = a; vu_jws(j); return vu_jfail(j, \"expected a number from 0 to 255\"); }\n", 106); vu_str_cat(&v_s, &_t414); drop_Str(&_t414); });
     #line 21190 "vuc.vu"
     VU_AT(21190);
     #line 21190 "vuc.vu"
-    ({ vu_str _t510 = vu_str_lit("static bool vu_jdec_Str(vu_jp *j, vu_str *out) {\n", 49); vu_str_cat(&v_s, &_t510); drop_Str(&_t510); });
+    ({ vu_str _t417 = vu_str_lit("    *out = (uint8_t)v;\n", 23); vu_str_cat(&v_s, &_t417); drop_Str(&_t417); });
     #line 21191 "vuc.vu"
     VU_AT(21191);
     #line 21191 "vuc.vu"
-    ({ vu_str _t513 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t513); drop_Str(&_t513); });
+    ({ vu_str _t420 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t420); drop_Str(&_t420); });
     #line 21192 "vuc.vu"
     VU_AT(21192);
     #line 21192 "vuc.vu"
-    ({ vu_str _t516 = vu_str_lit("    if (j->p >= j->end || *j->p != '\"') return vu_jfail(j, \"expected a string\");\n", 81); vu_str_cat(&v_s, &_t516); drop_Str(&_t516); });
+    ({ vu_str _t423 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t423); drop_Str(&_t423); });
     #line 21193 "vuc.vu"
     VU_AT(21193);
     #line 21193 "vuc.vu"
-    ({ vu_str _t519 = vu_str_lit("    const uint8_t *p = ++j->p, *e = j->end;\n", 44); vu_str_cat(&v_s, &_t519); drop_Str(&_t519); });
+    ({ vu_str _t426 = vu_str_lit("static bool vu_jdec_Float(vu_jp *j, double *out) {\n", 51); vu_str_cat(&v_s, &_t426); drop_Str(&_t426); });
     #line 21194 "vuc.vu"
     VU_AT(21194);
     #line 21194 "vuc.vu"
-    ({ vu_str _t522 = vu_str_lit("    vu_str s = {0};\n", 20); vu_str_cat(&v_s, &_t522); drop_Str(&_t522); });
+    ({ vu_str _t429 = vu_str_lit("    const uint8_t *a;\n", 22); vu_str_cat(&v_s, &_t429); drop_Str(&_t429); });
     #line 21195 "vuc.vu"
     VU_AT(21195);
     #line 21195 "vuc.vu"
-    ({ vu_str _t525 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t525); drop_Str(&_t525); });
+    ({ vu_str _t432 = vu_str_lit("    bool whole;\n", 16); vu_str_cat(&v_s, &_t432); drop_Str(&_t432); });
     #line 21196 "vuc.vu"
     VU_AT(21196);
     #line 21196 "vuc.vu"
-    ({ vu_str _t528 = vu_str_lit("        const uint8_t *run = p;\n", 32); vu_str_cat(&v_s, &_t528); drop_Str(&_t528); });
+    ({ vu_str _t435 = vu_str_lit("    if (!vu_jnum(j, &a, &whole)) return false;\n", 47); vu_str_cat(&v_s, &_t435); drop_Str(&_t435); });
     #line 21197 "vuc.vu"
     VU_AT(21197);
     #line 21197 "vuc.vu"
-    ({ vu_str _t531 = vu_str_lit("        while (p < e && *p >= 0x20 && *p != '\"' && *p != '\\\\' && *p < 0x80) p++;\n", 81); vu_str_cat(&v_s, &_t531); drop_Str(&_t531); });
+    ({ vu_str _t438 = vu_str_lit("    vu_str view = {(uint8_t *)a, (int64_t)(j->p - a), 0}, e = {0};\n", 67); vu_str_cat(&v_s, &_t438); drop_Str(&_t438); });
     #line 21198 "vuc.vu"
     VU_AT(21198);
     #line 21198 "vuc.vu"
-    ({ vu_str _t534 = vu_str_lit("        if (p > run) vu_str_cat_bytes(&s, run, (int64_t)(p - run));\n", 68); vu_str_cat(&v_s, &_t534); drop_Str(&_t534); });
+    ({ vu_str _t441 = vu_str_lit("    if (!vu_parse_float(&view, out, &e)) { drop_Str(&e); j->p = a; return vu_jfail(j, \"expected a number\"); }\n", 110); vu_str_cat(&v_s, &_t441); drop_Str(&_t441); });
     #line 21199 "vuc.vu"
     VU_AT(21199);
     #line 21199 "vuc.vu"
-    ({ vu_str _t537 = vu_str_lit("        if (p >= e) { j->p = p; drop_Str(&s); return vu_jfail(j, \"unterminated string\"); }\n", 91); vu_str_cat(&v_s, &_t537); drop_Str(&_t537); });
+    ({ vu_str _t444 = vu_str_lit("    if (!isfinite(*out)) { j->p = a; return vu_jfail(j, \"number too large for a Float\"); }\n", 91); vu_str_cat(&v_s, &_t444); drop_Str(&_t444); });
     #line 21200 "vuc.vu"
     VU_AT(21200);
     #line 21200 "vuc.vu"
-    ({ vu_str _t540 = vu_str_lit("        uint8_t c = *p;\n", 24); vu_str_cat(&v_s, &_t540); drop_Str(&_t540); });
+    ({ vu_str _t447 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t447); drop_Str(&_t447); });
     #line 21201 "vuc.vu"
     VU_AT(21201);
     #line 21201 "vuc.vu"
-    ({ vu_str _t543 = vu_str_lit("        if (c == '\"') { j->p = p + 1; *out = s; return true; }\n", 63); vu_str_cat(&v_s, &_t543); drop_Str(&_t543); });
+    ({ vu_str _t450 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t450); drop_Str(&_t450); });
     #line 21202 "vuc.vu"
     VU_AT(21202);
     #line 21202 "vuc.vu"
-    ({ vu_str _t546 = vu_str_lit("        if (c < 0x20) { j->p = p; drop_Str(&s); return vu_jfail(j, \"control character in a string\"); }\n", 103); vu_str_cat(&v_s, &_t546); drop_Str(&_t546); });
+    ({ vu_str _t453 = vu_str_lit("static int vu_jhex4(const uint8_t *p) {\n", 40); vu_str_cat(&v_s, &_t453); drop_Str(&_t453); });
     #line 21203 "vuc.vu"
     VU_AT(21203);
     #line 21203 "vuc.vu"
-    ({ vu_str _t549 = vu_str_lit("        if (c >= 0x80) {\n", 25); vu_str_cat(&v_s, &_t549); drop_Str(&_t549); });
+    ({ vu_str _t456 = vu_str_lit("    int v = 0;\n", 15); vu_str_cat(&v_s, &_t456); drop_Str(&_t456); });
     #line 21204 "vuc.vu"
     VU_AT(21204);
     #line 21204 "vuc.vu"
-    ({ vu_str _t552 = vu_str_lit("            size_t k = vu_utf8_len(p, (size_t)(e - p));\n", 56); vu_str_cat(&v_s, &_t552); drop_Str(&_t552); });
+    ({ vu_str _t459 = vu_str_lit("    for (int i = 0; i < 4; i++) {\n", 34); vu_str_cat(&v_s, &_t459); drop_Str(&_t459); });
     #line 21205 "vuc.vu"
     VU_AT(21205);
     #line 21205 "vuc.vu"
-    ({ vu_str _t555 = vu_str_lit("            if (!k) { j->p = p; drop_Str(&s); return vu_jfail(j, \"invalid UTF-8 in a string\"); }\n", 97); vu_str_cat(&v_s, &_t555); drop_Str(&_t555); });
+    ({ vu_str _t462 = vu_str_lit("        int c = p[i], d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;\n", 139); vu_str_cat(&v_s, &_t462); drop_Str(&_t462); });
     #line 21206 "vuc.vu"
     VU_AT(21206);
     #line 21206 "vuc.vu"
-    ({ vu_str _t558 = vu_str_lit("            vu_str_cat_bytes(&s, p, (int64_t)k);\n", 49); vu_str_cat(&v_s, &_t558); drop_Str(&_t558); });
+    ({ vu_str _t465 = vu_str_lit("        if (d < 0) return -1;\n", 30); vu_str_cat(&v_s, &_t465); drop_Str(&_t465); });
     #line 21207 "vuc.vu"
     VU_AT(21207);
     #line 21207 "vuc.vu"
-    ({ vu_str _t561 = vu_str_lit("            p += k;\n", 20); vu_str_cat(&v_s, &_t561); drop_Str(&_t561); });
+    ({ vu_str _t468 = vu_str_lit("        v = v * 16 + d;\n", 24); vu_str_cat(&v_s, &_t468); drop_Str(&_t468); });
     #line 21208 "vuc.vu"
     VU_AT(21208);
     #line 21208 "vuc.vu"
-    ({ vu_str _t564 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t564); drop_Str(&_t564); });
+    ({ vu_str _t471 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t471); drop_Str(&_t471); });
     #line 21209 "vuc.vu"
     VU_AT(21209);
     #line 21209 "vuc.vu"
-    ({ vu_str _t567 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t567); drop_Str(&_t567); });
+    ({ vu_str _t474 = vu_str_lit("    return v;\n", 14); vu_str_cat(&v_s, &_t474); drop_Str(&_t474); });
     #line 21210 "vuc.vu"
     VU_AT(21210);
     #line 21210 "vuc.vu"
-    ({ vu_str _t570 = vu_str_lit("        /* a backslash */\n", 26); vu_str_cat(&v_s, &_t570); drop_Str(&_t570); });
+    ({ vu_str _t477 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t477); drop_Str(&_t477); });
     #line 21211 "vuc.vu"
     VU_AT(21211);
     #line 21211 "vuc.vu"
-    ({ vu_str _t573 = vu_str_lit("        if (p + 1 >= e) { j->p = p; drop_Str(&s); return vu_jfail(j, \"unterminated string\"); }\n", 95); vu_str_cat(&v_s, &_t573); drop_Str(&_t573); });
+    ({ vu_str _t480 = vu_str_lit("static void vu_jutf8(vu_str *o, int cp) {\n", 42); vu_str_cat(&v_s, &_t480); drop_Str(&_t480); });
     #line 21212 "vuc.vu"
     VU_AT(21212);
     #line 21212 "vuc.vu"
-    ({ vu_str _t576 = vu_str_lit("        uint8_t x = p[1];\n", 26); vu_str_cat(&v_s, &_t576); drop_Str(&_t576); });
+    ({ vu_str _t483 = vu_str_lit("    uint8_t b[4];\n", 18); vu_str_cat(&v_s, &_t483); drop_Str(&_t483); });
     #line 21213 "vuc.vu"
     VU_AT(21213);
     #line 21213 "vuc.vu"
-    ({ vu_str _t579 = vu_str_lit("        const char *simple = x == '\"' ? \"\\\"\" : x == '\\\\' ? \"\\\\\" : x == '/' ? \"/\" : x == 'n' ? \"\\n\" : x == 't' ? \"\\t\"\n", 117); vu_str_cat(&v_s, &_t579); drop_Str(&_t579); });
+    ({ vu_str _t486 = vu_str_lit("    int n;\n", 11); vu_str_cat(&v_s, &_t486); drop_Str(&_t486); });
     #line 21214 "vuc.vu"
     VU_AT(21214);
     #line 21214 "vuc.vu"
-    ({ vu_str _t582 = vu_str_lit("                           : x == 'r' ? \"\\r\" : x == 'b' ? \"\\b\" : x == 'f' ? \"\\f\" : NULL;\n", 89); vu_str_cat(&v_s, &_t582); drop_Str(&_t582); });
+    ({ vu_str _t489 = vu_str_lit("    if (cp < 0x80) { b[0] = (uint8_t)cp; n = 1; }\n", 50); vu_str_cat(&v_s, &_t489); drop_Str(&_t489); });
     #line 21215 "vuc.vu"
     VU_AT(21215);
     #line 21215 "vuc.vu"
-    ({ vu_str _t585 = vu_str_lit("        if (simple) { vu_jcat(&s, simple, 1); p += 2; continue; }\n", 66); vu_str_cat(&v_s, &_t585); drop_Str(&_t585); });
+    ({ vu_str _t492 = vu_str_lit("    else if (cp < 0x800) { b[0] = (uint8_t)(0xC0 | (cp >> 6)); b[1] = (uint8_t)(0x80 | (cp & 0x3F)); n = 2; }\n", 110); vu_str_cat(&v_s, &_t492); drop_Str(&_t492); });
     #line 21216 "vuc.vu"
     VU_AT(21216);
     #line 21216 "vuc.vu"
-    ({ vu_str _t588 = vu_str_lit("        if (x != 'u') { j->p = p; drop_Str(&s); return vu_jfail(j, \"bad escape in a string\"); }\n", 96); vu_str_cat(&v_s, &_t588); drop_Str(&_t588); });
+    ({ vu_str _t495 = vu_str_lit("    else if (cp < 0x10000) { b[0] = (uint8_t)(0xE0 | (cp >> 12)); b[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F)); b[2] = (uint8_t)(0x80 | (cp & 0x3F)); n = 3; }\n", 158); vu_str_cat(&v_s, &_t495); drop_Str(&_t495); });
     #line 21217 "vuc.vu"
     VU_AT(21217);
     #line 21217 "vuc.vu"
-    ({ vu_str _t591 = vu_str_lit("        int cp = e - p >= 6 ? vu_jhex4(p + 2) : -1;\n", 52); vu_str_cat(&v_s, &_t591); drop_Str(&_t591); });
+    ({ vu_str _t498 = vu_str_lit("    else { b[0] = (uint8_t)(0xF0 | (cp >> 18)); b[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F)); b[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F)); b[3] = (uint8_t)(0x80 | (cp & 0x3F)); n = 4; }\n", 186); vu_str_cat(&v_s, &_t498); drop_Str(&_t498); });
     #line 21218 "vuc.vu"
     VU_AT(21218);
     #line 21218 "vuc.vu"
-    ({ vu_str _t594 = vu_str_lit("        if (cp < 0) { j->p = p; drop_Str(&s); return vu_jfail(j, \"bad \\\\u escape\"); }\n", 86); vu_str_cat(&v_s, &_t594); drop_Str(&_t594); });
+    ({ vu_str _t501 = vu_str_lit("    vu_str_cat_bytes(o, b, n);\n", 31); vu_str_cat(&v_s, &_t501); drop_Str(&_t501); });
     #line 21219 "vuc.vu"
     VU_AT(21219);
     #line 21219 "vuc.vu"
-    ({ vu_str _t597 = vu_str_lit("        p += 6;\n", 16); vu_str_cat(&v_s, &_t597); drop_Str(&_t597); });
+    ({ vu_str _t504 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t504); drop_Str(&_t504); });
     #line 21220 "vuc.vu"
     VU_AT(21220);
     #line 21220 "vuc.vu"
-    ({ vu_str _t600 = vu_str_lit("        if (cp >= 0xD800 && cp < 0xDC00) {\n", 43); vu_str_cat(&v_s, &_t600); drop_Str(&_t600); });
+    ({ vu_str _t507 = vu_str_lit("/* A string (the opening quote is next): escapes decoded, UTF-8 checked. */\n", 76); vu_str_cat(&v_s, &_t507); drop_Str(&_t507); });
     #line 21221 "vuc.vu"
     VU_AT(21221);
     #line 21221 "vuc.vu"
-    ({ vu_str _t603 = vu_str_lit("            int lo = e - p >= 6 && p[0] == '\\\\' && p[1] == 'u' ? vu_jhex4(p + 2) : -1;\n", 87); vu_str_cat(&v_s, &_t603); drop_Str(&_t603); });
+    ({ vu_str _t510 = vu_str_lit("static bool vu_jdec_Str(vu_jp *j, vu_str *out) {\n", 49); vu_str_cat(&v_s, &_t510); drop_Str(&_t510); });
     #line 21222 "vuc.vu"
     VU_AT(21222);
     #line 21222 "vuc.vu"
-    ({ vu_str _t606 = vu_str_lit("            if (lo < 0xDC00 || lo >= 0xE000) { j->p = p - 6; drop_Str(&s); return vu_jfail(j, \"unpaired surrogate in a string\"); }\n", 131); vu_str_cat(&v_s, &_t606); drop_Str(&_t606); });
+    ({ vu_str _t513 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t513); drop_Str(&_t513); });
     #line 21223 "vuc.vu"
     VU_AT(21223);
     #line 21223 "vuc.vu"
-    ({ vu_str _t609 = vu_str_lit("            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);\n", 66); vu_str_cat(&v_s, &_t609); drop_Str(&_t609); });
+    ({ vu_str _t516 = vu_str_lit("    if (j->p >= j->end || *j->p != '\"') return vu_jfail(j, \"expected a string\");\n", 81); vu_str_cat(&v_s, &_t516); drop_Str(&_t516); });
     #line 21224 "vuc.vu"
     VU_AT(21224);
     #line 21224 "vuc.vu"
-    ({ vu_str _t612 = vu_str_lit("            p += 6;\n", 20); vu_str_cat(&v_s, &_t612); drop_Str(&_t612); });
+    ({ vu_str _t519 = vu_str_lit("    const uint8_t *p = ++j->p, *e = j->end;\n", 44); vu_str_cat(&v_s, &_t519); drop_Str(&_t519); });
     #line 21225 "vuc.vu"
     VU_AT(21225);
     #line 21225 "vuc.vu"
-    ({ vu_str _t615 = vu_str_lit("        } else if (cp >= 0xDC00 && cp < 0xE000) { j->p = p - 6; drop_Str(&s); return vu_jfail(j, \"unpaired surrogate in a string\"); }\n", 134); vu_str_cat(&v_s, &_t615); drop_Str(&_t615); });
+    ({ vu_str _t522 = vu_str_lit("    vu_str s = {0};\n", 20); vu_str_cat(&v_s, &_t522); drop_Str(&_t522); });
     #line 21226 "vuc.vu"
     VU_AT(21226);
     #line 21226 "vuc.vu"
-    ({ vu_str _t618 = vu_str_lit("        vu_jutf8(&s, cp);\n", 26); vu_str_cat(&v_s, &_t618); drop_Str(&_t618); });
+    ({ vu_str _t525 = vu_str_lit("    for (;;) {\n", 15); vu_str_cat(&v_s, &_t525); drop_Str(&_t525); });
     #line 21227 "vuc.vu"
     VU_AT(21227);
     #line 21227 "vuc.vu"
-    ({ vu_str _t621 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t621); drop_Str(&_t621); });
+    ({ vu_str _t528 = vu_str_lit("        const uint8_t *run = p;\n", 32); vu_str_cat(&v_s, &_t528); drop_Str(&_t528); });
     #line 21228 "vuc.vu"
     VU_AT(21228);
     #line 21228 "vuc.vu"
-    ({ vu_str _t624 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t624); drop_Str(&_t624); });
+    ({ vu_str _t531 = vu_str_lit("        while (p < e && *p >= 0x20 && *p != '\"' && *p != '\\\\' && *p < 0x80) p++;\n", 81); vu_str_cat(&v_s, &_t531); drop_Str(&_t531); });
     #line 21229 "vuc.vu"
     VU_AT(21229);
     #line 21229 "vuc.vu"
-    ({ vu_str _t627 = vu_str_lit("static bool vu_jdeeper(vu_jp *j) {\n", 35); vu_str_cat(&v_s, &_t627); drop_Str(&_t627); });
+    ({ vu_str _t534 = vu_str_lit("        if (p > run) vu_str_cat_bytes(&s, run, (int64_t)(p - run));\n", 68); vu_str_cat(&v_s, &_t534); drop_Str(&_t534); });
     #line 21230 "vuc.vu"
     VU_AT(21230);
     #line 21230 "vuc.vu"
-    ({ vu_str _t630 = vu_str_lit("    if (++j->depth > VU_JSON_DEPTH) return vu_jfail(j, \"nested deeper than 1000 levels\");\n", 90); vu_str_cat(&v_s, &_t630); drop_Str(&_t630); });
+    ({ vu_str _t537 = vu_str_lit("        if (p >= e) { j->p = p; drop_Str(&s); return vu_jfail(j, \"unterminated string\"); }\n", 91); vu_str_cat(&v_s, &_t537); drop_Str(&_t537); });
     #line 21231 "vuc.vu"
     VU_AT(21231);
     #line 21231 "vuc.vu"
-    ({ vu_str _t633 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t633); drop_Str(&_t633); });
+    ({ vu_str _t540 = vu_str_lit("        uint8_t c = *p;\n", 24); vu_str_cat(&v_s, &_t540); drop_Str(&_t540); });
     #line 21232 "vuc.vu"
     VU_AT(21232);
     #line 21232 "vuc.vu"
-    ({ vu_str _t636 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t636); drop_Str(&_t636); });
+    ({ vu_str _t543 = vu_str_lit("        if (c == '\"') { j->p = p + 1; *out = s; return true; }\n", 63); vu_str_cat(&v_s, &_t543); drop_Str(&_t543); });
     #line 21233 "vuc.vu"
     VU_AT(21233);
     #line 21233 "vuc.vu"
-    ({ vu_str _t639 = vu_str_lit("/* Arrays: begin reads '['; next says whether a value follows (1), the array ended (0), or it's malformed (-1). */\n", 115); vu_str_cat(&v_s, &_t639); drop_Str(&_t639); });
+    ({ vu_str _t546 = vu_str_lit("        if (c < 0x20) { j->p = p; drop_Str(&s); return vu_jfail(j, \"control character in a string\"); }\n", 103); vu_str_cat(&v_s, &_t546); drop_Str(&_t546); });
     #line 21234 "vuc.vu"
     VU_AT(21234);
     #line 21234 "vuc.vu"
-    ({ vu_str _t642 = vu_str_lit("static bool vu_jarr_begin(vu_jp *j) {\n", 38); vu_str_cat(&v_s, &_t642); drop_Str(&_t642); });
+    ({ vu_str _t549 = vu_str_lit("        if (c >= 0x80) {\n", 25); vu_str_cat(&v_s, &_t549); drop_Str(&_t549); });
     #line 21235 "vuc.vu"
     VU_AT(21235);
     #line 21235 "vuc.vu"
-    ({ vu_str _t645 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t645); drop_Str(&_t645); });
+    ({ vu_str _t552 = vu_str_lit("            size_t k = vu_utf8_len(p, (size_t)(e - p));\n", 56); vu_str_cat(&v_s, &_t552); drop_Str(&_t552); });
     #line 21236 "vuc.vu"
     VU_AT(21236);
     #line 21236 "vuc.vu"
-    ({ vu_str _t648 = vu_str_lit("    if (j->p >= j->end || *j->p != '[') return vu_jfail(j, \"expected a list\");\n", 79); vu_str_cat(&v_s, &_t648); drop_Str(&_t648); });
+    ({ vu_str _t555 = vu_str_lit("            if (!k) { j->p = p; drop_Str(&s); return vu_jfail(j, \"invalid UTF-8 in a string\"); }\n", 97); vu_str_cat(&v_s, &_t555); drop_Str(&_t555); });
     #line 21237 "vuc.vu"
     VU_AT(21237);
     #line 21237 "vuc.vu"
-    ({ vu_str _t651 = vu_str_lit("    j->p++;\n", 12); vu_str_cat(&v_s, &_t651); drop_Str(&_t651); });
+    ({ vu_str _t558 = vu_str_lit("            vu_str_cat_bytes(&s, p, (int64_t)k);\n", 49); vu_str_cat(&v_s, &_t558); drop_Str(&_t558); });
     #line 21238 "vuc.vu"
     VU_AT(21238);
     #line 21238 "vuc.vu"
-    ({ vu_str _t654 = vu_str_lit("    return vu_jdeeper(j);\n", 26); vu_str_cat(&v_s, &_t654); drop_Str(&_t654); });
+    ({ vu_str _t561 = vu_str_lit("            p += k;\n", 20); vu_str_cat(&v_s, &_t561); drop_Str(&_t561); });
     #line 21239 "vuc.vu"
     VU_AT(21239);
     #line 21239 "vuc.vu"
-    ({ vu_str _t657 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t657); drop_Str(&_t657); });
+    ({ vu_str _t564 = vu_str_lit("            continue;\n", 22); vu_str_cat(&v_s, &_t564); drop_Str(&_t564); });
     #line 21240 "vuc.vu"
     VU_AT(21240);
     #line 21240 "vuc.vu"
-    ({ vu_str _t660 = vu_str_lit("static int vu_jarr_next(vu_jp *j, bool first) {\n", 48); vu_str_cat(&v_s, &_t660); drop_Str(&_t660); });
+    ({ vu_str _t567 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t567); drop_Str(&_t567); });
     #line 21241 "vuc.vu"
     VU_AT(21241);
     #line 21241 "vuc.vu"
-    ({ vu_str _t663 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t663); drop_Str(&_t663); });
+    ({ vu_str _t570 = vu_str_lit("        /* a backslash */\n", 26); vu_str_cat(&v_s, &_t570); drop_Str(&_t570); });
     #line 21242 "vuc.vu"
     VU_AT(21242);
     #line 21242 "vuc.vu"
-    ({ vu_str _t666 = vu_str_lit("    if (j->p < j->end && *j->p == ']') { j->p++; j->depth--; return 0; }\n", 73); vu_str_cat(&v_s, &_t666); drop_Str(&_t666); });
+    ({ vu_str _t573 = vu_str_lit("        if (p + 1 >= e) { j->p = p; drop_Str(&s); return vu_jfail(j, \"unterminated string\"); }\n", 95); vu_str_cat(&v_s, &_t573); drop_Str(&_t573); });
     #line 21243 "vuc.vu"
     VU_AT(21243);
     #line 21243 "vuc.vu"
-    ({ vu_str _t669 = vu_str_lit("    if (!first) {\n", 18); vu_str_cat(&v_s, &_t669); drop_Str(&_t669); });
+    ({ vu_str _t576 = vu_str_lit("        uint8_t x = p[1];\n", 26); vu_str_cat(&v_s, &_t576); drop_Str(&_t576); });
     #line 21244 "vuc.vu"
     VU_AT(21244);
     #line 21244 "vuc.vu"
-    ({ vu_str _t672 = vu_str_lit("        if (j->p >= j->end || *j->p != ',') { vu_jfail(j, \"expected ',' or ']'\"); return -1; }\n", 95); vu_str_cat(&v_s, &_t672); drop_Str(&_t672); });
+    ({ vu_str _t579 = vu_str_lit("        const char *simple = x == '\"' ? \"\\\"\" : x == '\\\\' ? \"\\\\\" : x == '/' ? \"/\" : x == 'n' ? \"\\n\" : x == 't' ? \"\\t\"\n", 117); vu_str_cat(&v_s, &_t579); drop_Str(&_t579); });
     #line 21245 "vuc.vu"
     VU_AT(21245);
     #line 21245 "vuc.vu"
-    ({ vu_str _t675 = vu_str_lit("        j->p++;\n", 16); vu_str_cat(&v_s, &_t675); drop_Str(&_t675); });
+    ({ vu_str _t582 = vu_str_lit("                           : x == 'r' ? \"\\r\" : x == 'b' ? \"\\b\" : x == 'f' ? \"\\f\" : NULL;\n", 89); vu_str_cat(&v_s, &_t582); drop_Str(&_t582); });
     #line 21246 "vuc.vu"
     VU_AT(21246);
     #line 21246 "vuc.vu"
-    ({ vu_str _t678 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t678); drop_Str(&_t678); });
+    ({ vu_str _t585 = vu_str_lit("        if (simple) { vu_jcat(&s, simple, 1); p += 2; continue; }\n", 66); vu_str_cat(&v_s, &_t585); drop_Str(&_t585); });
     #line 21247 "vuc.vu"
     VU_AT(21247);
     #line 21247 "vuc.vu"
-    ({ vu_str _t681 = vu_str_lit("    return 1;\n", 14); vu_str_cat(&v_s, &_t681); drop_Str(&_t681); });
+    ({ vu_str _t588 = vu_str_lit("        if (x != 'u') { j->p = p; drop_Str(&s); return vu_jfail(j, \"bad escape in a string\"); }\n", 96); vu_str_cat(&v_s, &_t588); drop_Str(&_t588); });
     #line 21248 "vuc.vu"
     VU_AT(21248);
     #line 21248 "vuc.vu"
-    ({ vu_str _t684 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t684); drop_Str(&_t684); });
+    ({ vu_str _t591 = vu_str_lit("        int cp = e - p >= 6 ? vu_jhex4(p + 2) : -1;\n", 52); vu_str_cat(&v_s, &_t591); drop_Str(&_t591); });
     #line 21249 "vuc.vu"
     VU_AT(21249);
     #line 21249 "vuc.vu"
-    ({ vu_str _t687 = vu_str_lit("/* Objects: next reads a key and its ':' (1), the end '}' (0), or fails (-1). */\n", 81); vu_str_cat(&v_s, &_t687); drop_Str(&_t687); });
+    ({ vu_str _t594 = vu_str_lit("        if (cp < 0) { j->p = p; drop_Str(&s); return vu_jfail(j, \"bad \\\\u escape\"); }\n", 86); vu_str_cat(&v_s, &_t594); drop_Str(&_t594); });
     #line 21250 "vuc.vu"
     VU_AT(21250);
     #line 21250 "vuc.vu"
-    ({ vu_str _t690 = vu_str_lit("static bool vu_jobj_begin(vu_jp *j) {\n", 38); vu_str_cat(&v_s, &_t690); drop_Str(&_t690); });
+    ({ vu_str _t597 = vu_str_lit("        p += 6;\n", 16); vu_str_cat(&v_s, &_t597); drop_Str(&_t597); });
     #line 21251 "vuc.vu"
     VU_AT(21251);
     #line 21251 "vuc.vu"
-    ({ vu_str _t693 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t693); drop_Str(&_t693); });
+    ({ vu_str _t600 = vu_str_lit("        if (cp >= 0xD800 && cp < 0xDC00) {\n", 43); vu_str_cat(&v_s, &_t600); drop_Str(&_t600); });
     #line 21252 "vuc.vu"
     VU_AT(21252);
     #line 21252 "vuc.vu"
-    ({ vu_str _t696 = vu_str_lit("    if (j->p >= j->end || *j->p != '{') return vu_jfail(j, \"expected an object\");\n", 82); vu_str_cat(&v_s, &_t696); drop_Str(&_t696); });
+    ({ vu_str _t603 = vu_str_lit("            int lo = e - p >= 6 && p[0] == '\\\\' && p[1] == 'u' ? vu_jhex4(p + 2) : -1;\n", 87); vu_str_cat(&v_s, &_t603); drop_Str(&_t603); });
     #line 21253 "vuc.vu"
     VU_AT(21253);
     #line 21253 "vuc.vu"
-    ({ vu_str _t699 = vu_str_lit("    j->p++;\n", 12); vu_str_cat(&v_s, &_t699); drop_Str(&_t699); });
+    ({ vu_str _t606 = vu_str_lit("            if (lo < 0xDC00 || lo >= 0xE000) { j->p = p - 6; drop_Str(&s); return vu_jfail(j, \"unpaired surrogate in a string\"); }\n", 131); vu_str_cat(&v_s, &_t606); drop_Str(&_t606); });
     #line 21254 "vuc.vu"
     VU_AT(21254);
     #line 21254 "vuc.vu"
-    ({ vu_str _t702 = vu_str_lit("    return vu_jdeeper(j);\n", 26); vu_str_cat(&v_s, &_t702); drop_Str(&_t702); });
+    ({ vu_str _t609 = vu_str_lit("            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);\n", 66); vu_str_cat(&v_s, &_t609); drop_Str(&_t609); });
     #line 21255 "vuc.vu"
     VU_AT(21255);
     #line 21255 "vuc.vu"
-    ({ vu_str _t705 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t705); drop_Str(&_t705); });
+    ({ vu_str _t612 = vu_str_lit("            p += 6;\n", 20); vu_str_cat(&v_s, &_t612); drop_Str(&_t612); });
     #line 21256 "vuc.vu"
     VU_AT(21256);
     #line 21256 "vuc.vu"
-    ({ vu_str _t708 = vu_str_lit("static int vu_jobj_next(vu_jp *j, bool first, vu_str *key) {\n", 61); vu_str_cat(&v_s, &_t708); drop_Str(&_t708); });
+    ({ vu_str _t615 = vu_str_lit("        } else if (cp >= 0xDC00 && cp < 0xE000) { j->p = p - 6; drop_Str(&s); return vu_jfail(j, \"unpaired surrogate in a string\"); }\n", 134); vu_str_cat(&v_s, &_t615); drop_Str(&_t615); });
     #line 21257 "vuc.vu"
     VU_AT(21257);
     #line 21257 "vuc.vu"
-    ({ vu_str _t711 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t711); drop_Str(&_t711); });
+    ({ vu_str _t618 = vu_str_lit("        vu_jutf8(&s, cp);\n", 26); vu_str_cat(&v_s, &_t618); drop_Str(&_t618); });
     #line 21258 "vuc.vu"
     VU_AT(21258);
     #line 21258 "vuc.vu"
-    ({ vu_str _t714 = vu_str_lit("    if (j->p < j->end && *j->p == '}') { j->p++; j->depth--; return 0; }\n", 73); vu_str_cat(&v_s, &_t714); drop_Str(&_t714); });
+    ({ vu_str _t621 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t621); drop_Str(&_t621); });
     #line 21259 "vuc.vu"
     VU_AT(21259);
     #line 21259 "vuc.vu"
-    ({ vu_str _t717 = vu_str_lit("    if (!first) {\n", 18); vu_str_cat(&v_s, &_t717); drop_Str(&_t717); });
+    ({ vu_str _t624 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t624); drop_Str(&_t624); });
     #line 21260 "vuc.vu"
     VU_AT(21260);
     #line 21260 "vuc.vu"
-    ({ vu_str _t720 = vu_str_lit("        if (j->p >= j->end || *j->p != ',') { vu_jfail(j, \"expected ',' or '}'\"); return -1; }\n", 95); vu_str_cat(&v_s, &_t720); drop_Str(&_t720); });
+    ({ vu_str _t627 = vu_str_lit("static bool vu_jdeeper(vu_jp *j) {\n", 35); vu_str_cat(&v_s, &_t627); drop_Str(&_t627); });
     #line 21261 "vuc.vu"
     VU_AT(21261);
     #line 21261 "vuc.vu"
-    ({ vu_str _t723 = vu_str_lit("        j->p++;\n", 16); vu_str_cat(&v_s, &_t723); drop_Str(&_t723); });
+    ({ vu_str _t630 = vu_str_lit("    if (++j->depth > VU_JSON_DEPTH) return vu_jfail(j, \"nested deeper than 1000 levels\");\n", 90); vu_str_cat(&v_s, &_t630); drop_Str(&_t630); });
     #line 21262 "vuc.vu"
     VU_AT(21262);
     #line 21262 "vuc.vu"
-    ({ vu_str _t726 = vu_str_lit("        vu_jws(j);\n", 19); vu_str_cat(&v_s, &_t726); drop_Str(&_t726); });
+    ({ vu_str _t633 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t633); drop_Str(&_t633); });
     #line 21263 "vuc.vu"
     VU_AT(21263);
     #line 21263 "vuc.vu"
-    ({ vu_str _t729 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t729); drop_Str(&_t729); });
+    ({ vu_str _t636 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t636); drop_Str(&_t636); });
     #line 21264 "vuc.vu"
     VU_AT(21264);
     #line 21264 "vuc.vu"
-    ({ vu_str _t732 = vu_str_lit("    if (!vu_jdec_Str(j, key)) return -1;\n", 41); vu_str_cat(&v_s, &_t732); drop_Str(&_t732); });
+    ({ vu_str _t639 = vu_str_lit("/* Arrays: begin reads '['; next says whether a value follows (1), the array ended (0), or it's malformed (-1). */\n", 115); vu_str_cat(&v_s, &_t639); drop_Str(&_t639); });
     #line 21265 "vuc.vu"
     VU_AT(21265);
     #line 21265 "vuc.vu"
-    ({ vu_str _t735 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t735); drop_Str(&_t735); });
+    ({ vu_str _t642 = vu_str_lit("static bool vu_jarr_begin(vu_jp *j) {\n", 38); vu_str_cat(&v_s, &_t642); drop_Str(&_t642); });
     #line 21266 "vuc.vu"
     VU_AT(21266);
     #line 21266 "vuc.vu"
-    ({ vu_str _t738 = vu_str_lit("    if (j->p >= j->end || *j->p != ':') { drop_Str(key); vu_jfail(j, \"expected ':'\"); return -1; }\n", 99); vu_str_cat(&v_s, &_t738); drop_Str(&_t738); });
+    ({ vu_str _t645 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t645); drop_Str(&_t645); });
     #line 21267 "vuc.vu"
     VU_AT(21267);
     #line 21267 "vuc.vu"
-    ({ vu_str _t741 = vu_str_lit("    j->p++;\n", 12); vu_str_cat(&v_s, &_t741); drop_Str(&_t741); });
+    ({ vu_str _t648 = vu_str_lit("    if (j->p >= j->end || *j->p != '[') return vu_jfail(j, \"expected a list\");\n", 79); vu_str_cat(&v_s, &_t648); drop_Str(&_t648); });
     #line 21268 "vuc.vu"
     VU_AT(21268);
     #line 21268 "vuc.vu"
-    ({ vu_str _t744 = vu_str_lit("    return 1;\n", 14); vu_str_cat(&v_s, &_t744); drop_Str(&_t744); });
+    ({ vu_str _t651 = vu_str_lit("    j->p++;\n", 12); vu_str_cat(&v_s, &_t651); drop_Str(&_t651); });
     #line 21269 "vuc.vu"
     VU_AT(21269);
     #line 21269 "vuc.vu"
-    ({ vu_str _t747 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t747); drop_Str(&_t747); });
+    ({ vu_str _t654 = vu_str_lit("    return vu_jdeeper(j);\n", 26); vu_str_cat(&v_s, &_t654); drop_Str(&_t654); });
     #line 21270 "vuc.vu"
     VU_AT(21270);
     #line 21270 "vuc.vu"
-    ({ vu_str _t750 = vu_str_lit("static bool vu_jkey(const vu_str *k, const char *name, int64_t n) { return k->len == n && memcmp(k->data, name, (size_t)n) == 0; }\n", 131); vu_str_cat(&v_s, &_t750); drop_Str(&_t750); });
+    ({ vu_str _t657 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t657); drop_Str(&_t657); });
     #line 21271 "vuc.vu"
     VU_AT(21271);
     #line 21271 "vuc.vu"
-    ({ vu_str _t753 = vu_str_lit("/* Skips any value (a field the type doesn't have). */\n", 55); vu_str_cat(&v_s, &_t753); drop_Str(&_t753); });
+    ({ vu_str _t660 = vu_str_lit("static int vu_jarr_next(vu_jp *j, bool first) {\n", 48); vu_str_cat(&v_s, &_t660); drop_Str(&_t660); });
     #line 21272 "vuc.vu"
     VU_AT(21272);
     #line 21272 "vuc.vu"
-    ({ vu_str _t756 = vu_str_lit("static bool vu_jskip(vu_jp *j) {\n", 33); vu_str_cat(&v_s, &_t756); drop_Str(&_t756); });
+    ({ vu_str _t663 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t663); drop_Str(&_t663); });
     #line 21273 "vuc.vu"
     VU_AT(21273);
     #line 21273 "vuc.vu"
-    ({ vu_str _t759 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t759); drop_Str(&_t759); });
+    ({ vu_str _t666 = vu_str_lit("    if (j->p < j->end && *j->p == ']') { j->p++; j->depth--; return 0; }\n", 73); vu_str_cat(&v_s, &_t666); drop_Str(&_t666); });
     #line 21274 "vuc.vu"
     VU_AT(21274);
     #line 21274 "vuc.vu"
-    ({ vu_str _t762 = vu_str_lit("    if (j->p >= j->end) return vu_jfail(j, \"expected a value\");\n", 64); vu_str_cat(&v_s, &_t762); drop_Str(&_t762); });
+    ({ vu_str _t669 = vu_str_lit("    if (!first) {\n", 18); vu_str_cat(&v_s, &_t669); drop_Str(&_t669); });
     #line 21275 "vuc.vu"
     VU_AT(21275);
     #line 21275 "vuc.vu"
-    ({ vu_str _t765 = vu_str_lit("    uint8_t c = *j->p;\n", 23); vu_str_cat(&v_s, &_t765); drop_Str(&_t765); });
+    ({ vu_str _t672 = vu_str_lit("        if (j->p >= j->end || *j->p != ',') { vu_jfail(j, \"expected ',' or ']'\"); return -1; }\n", 95); vu_str_cat(&v_s, &_t672); drop_Str(&_t672); });
     #line 21276 "vuc.vu"
     VU_AT(21276);
     #line 21276 "vuc.vu"
-    ({ vu_str _t768 = vu_str_lit("    if (c == '\"') { vu_str s = {0}; if (!vu_jdec_Str(j, &s)) return false; drop_Str(&s); return true; }\n", 104); vu_str_cat(&v_s, &_t768); drop_Str(&_t768); });
+    ({ vu_str _t675 = vu_str_lit("        j->p++;\n", 16); vu_str_cat(&v_s, &_t675); drop_Str(&_t675); });
     #line 21277 "vuc.vu"
     VU_AT(21277);
     #line 21277 "vuc.vu"
-    ({ vu_str _t771 = vu_str_lit("    if (c == 't' || c == 'f') { bool b; return vu_jdec_Bool(j, &b); }\n", 70); vu_str_cat(&v_s, &_t771); drop_Str(&_t771); });
+    ({ vu_str _t678 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t678); drop_Str(&_t678); });
     #line 21278 "vuc.vu"
     VU_AT(21278);
     #line 21278 "vuc.vu"
-    ({ vu_str _t774 = vu_str_lit("    if (c == 'n') { if (vu_jnull(j)) return true; return vu_jfail(j, \"expected a value\"); }\n", 92); vu_str_cat(&v_s, &_t774); drop_Str(&_t774); });
+    ({ vu_str _t681 = vu_str_lit("    return 1;\n", 14); vu_str_cat(&v_s, &_t681); drop_Str(&_t681); });
     #line 21279 "vuc.vu"
     VU_AT(21279);
     #line 21279 "vuc.vu"
-    ({ vu_str _t777 = vu_str_lit("    if (c == '[') {\n", 20); vu_str_cat(&v_s, &_t777); drop_Str(&_t777); });
+    ({ vu_str _t684 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t684); drop_Str(&_t684); });
     #line 21280 "vuc.vu"
     VU_AT(21280);
     #line 21280 "vuc.vu"
-    ({ vu_str _t780 = vu_str_lit("        if (!vu_jarr_begin(j)) return false;\n", 45); vu_str_cat(&v_s, &_t780); drop_Str(&_t780); });
+    ({ vu_str _t687 = vu_str_lit("/* Objects: next reads a key and its ':' (1), the end '}' (0), or fails (-1). */\n", 81); vu_str_cat(&v_s, &_t687); drop_Str(&_t687); });
     #line 21281 "vuc.vu"
     VU_AT(21281);
     #line 21281 "vuc.vu"
-    ({ vu_str _t783 = vu_str_lit("        for (bool first = true;; first = false) {\n", 50); vu_str_cat(&v_s, &_t783); drop_Str(&_t783); });
+    ({ vu_str _t690 = vu_str_lit("static bool vu_jobj_begin(vu_jp *j) {\n", 38); vu_str_cat(&v_s, &_t690); drop_Str(&_t690); });
     #line 21282 "vuc.vu"
     VU_AT(21282);
     #line 21282 "vuc.vu"
-    ({ vu_str _t786 = vu_str_lit("            int r = vu_jarr_next(j, first);\n", 44); vu_str_cat(&v_s, &_t786); drop_Str(&_t786); });
+    ({ vu_str _t693 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t693); drop_Str(&_t693); });
     #line 21283 "vuc.vu"
     VU_AT(21283);
     #line 21283 "vuc.vu"
-    ({ vu_str _t789 = vu_str_lit("            if (r <= 0) return r == 0;\n", 39); vu_str_cat(&v_s, &_t789); drop_Str(&_t789); });
+    ({ vu_str _t696 = vu_str_lit("    if (j->p >= j->end || *j->p != '{') return vu_jfail(j, \"expected an object\");\n", 82); vu_str_cat(&v_s, &_t696); drop_Str(&_t696); });
     #line 21284 "vuc.vu"
     VU_AT(21284);
     #line 21284 "vuc.vu"
-    ({ vu_str _t792 = vu_str_lit("            if (!vu_jskip(j)) return false;\n", 44); vu_str_cat(&v_s, &_t792); drop_Str(&_t792); });
+    ({ vu_str _t699 = vu_str_lit("    j->p++;\n", 12); vu_str_cat(&v_s, &_t699); drop_Str(&_t699); });
     #line 21285 "vuc.vu"
     VU_AT(21285);
     #line 21285 "vuc.vu"
-    ({ vu_str _t795 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t795); drop_Str(&_t795); });
+    ({ vu_str _t702 = vu_str_lit("    return vu_jdeeper(j);\n", 26); vu_str_cat(&v_s, &_t702); drop_Str(&_t702); });
     #line 21286 "vuc.vu"
     VU_AT(21286);
     #line 21286 "vuc.vu"
-    ({ vu_str _t798 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t798); drop_Str(&_t798); });
+    ({ vu_str _t705 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t705); drop_Str(&_t705); });
     #line 21287 "vuc.vu"
     VU_AT(21287);
     #line 21287 "vuc.vu"
-    ({ vu_str _t801 = vu_str_lit("    if (c == '{') {\n", 20); vu_str_cat(&v_s, &_t801); drop_Str(&_t801); });
+    ({ vu_str _t708 = vu_str_lit("static int vu_jobj_next(vu_jp *j, bool first, vu_str *key) {\n", 61); vu_str_cat(&v_s, &_t708); drop_Str(&_t708); });
     #line 21288 "vuc.vu"
     VU_AT(21288);
     #line 21288 "vuc.vu"
-    ({ vu_str _t804 = vu_str_lit("        if (!vu_jobj_begin(j)) return false;\n", 45); vu_str_cat(&v_s, &_t804); drop_Str(&_t804); });
+    ({ vu_str _t711 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t711); drop_Str(&_t711); });
     #line 21289 "vuc.vu"
     VU_AT(21289);
     #line 21289 "vuc.vu"
-    ({ vu_str _t807 = vu_str_lit("        for (bool first = true;; first = false) {\n", 50); vu_str_cat(&v_s, &_t807); drop_Str(&_t807); });
+    ({ vu_str _t714 = vu_str_lit("    if (j->p < j->end && *j->p == '}') { j->p++; j->depth--; return 0; }\n", 73); vu_str_cat(&v_s, &_t714); drop_Str(&_t714); });
     #line 21290 "vuc.vu"
     VU_AT(21290);
     #line 21290 "vuc.vu"
-    ({ vu_str _t810 = vu_str_lit("            vu_str k = {0};\n", 28); vu_str_cat(&v_s, &_t810); drop_Str(&_t810); });
+    ({ vu_str _t717 = vu_str_lit("    if (!first) {\n", 18); vu_str_cat(&v_s, &_t717); drop_Str(&_t717); });
     #line 21291 "vuc.vu"
     VU_AT(21291);
     #line 21291 "vuc.vu"
-    ({ vu_str _t813 = vu_str_lit("            int r = vu_jobj_next(j, first, &k);\n", 48); vu_str_cat(&v_s, &_t813); drop_Str(&_t813); });
+    ({ vu_str _t720 = vu_str_lit("        if (j->p >= j->end || *j->p != ',') { vu_jfail(j, \"expected ',' or '}'\"); return -1; }\n", 95); vu_str_cat(&v_s, &_t720); drop_Str(&_t720); });
     #line 21292 "vuc.vu"
     VU_AT(21292);
     #line 21292 "vuc.vu"
-    ({ vu_str _t816 = vu_str_lit("            if (r <= 0) return r == 0;\n", 39); vu_str_cat(&v_s, &_t816); drop_Str(&_t816); });
+    ({ vu_str _t723 = vu_str_lit("        j->p++;\n", 16); vu_str_cat(&v_s, &_t723); drop_Str(&_t723); });
     #line 21293 "vuc.vu"
     VU_AT(21293);
     #line 21293 "vuc.vu"
-    ({ vu_str _t819 = vu_str_lit("            drop_Str(&k);\n", 26); vu_str_cat(&v_s, &_t819); drop_Str(&_t819); });
+    ({ vu_str _t726 = vu_str_lit("        vu_jws(j);\n", 19); vu_str_cat(&v_s, &_t726); drop_Str(&_t726); });
     #line 21294 "vuc.vu"
     VU_AT(21294);
     #line 21294 "vuc.vu"
-    ({ vu_str _t822 = vu_str_lit("            if (!vu_jskip(j)) return false;\n", 44); vu_str_cat(&v_s, &_t822); drop_Str(&_t822); });
+    ({ vu_str _t729 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t729); drop_Str(&_t729); });
     #line 21295 "vuc.vu"
     VU_AT(21295);
     #line 21295 "vuc.vu"
-    ({ vu_str _t825 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t825); drop_Str(&_t825); });
+    ({ vu_str _t732 = vu_str_lit("    if (!vu_jdec_Str(j, key)) return -1;\n", 41); vu_str_cat(&v_s, &_t732); drop_Str(&_t732); });
     #line 21296 "vuc.vu"
     VU_AT(21296);
     #line 21296 "vuc.vu"
-    ({ vu_str _t828 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t828); drop_Str(&_t828); });
+    ({ vu_str _t735 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t735); drop_Str(&_t735); });
     #line 21297 "vuc.vu"
     VU_AT(21297);
     #line 21297 "vuc.vu"
-    ({ vu_str _t831 = vu_str_lit("    const uint8_t *a;\n", 22); vu_str_cat(&v_s, &_t831); drop_Str(&_t831); });
+    ({ vu_str _t738 = vu_str_lit("    if (j->p >= j->end || *j->p != ':') { drop_Str(key); vu_jfail(j, \"expected ':'\"); return -1; }\n", 99); vu_str_cat(&v_s, &_t738); drop_Str(&_t738); });
     #line 21298 "vuc.vu"
     VU_AT(21298);
     #line 21298 "vuc.vu"
-    ({ vu_str _t834 = vu_str_lit("    bool whole;\n", 16); vu_str_cat(&v_s, &_t834); drop_Str(&_t834); });
+    ({ vu_str _t741 = vu_str_lit("    j->p++;\n", 12); vu_str_cat(&v_s, &_t741); drop_Str(&_t741); });
     #line 21299 "vuc.vu"
     VU_AT(21299);
     #line 21299 "vuc.vu"
-    ({ vu_str _t837 = vu_str_lit("    return vu_jnum(j, &a, &whole);\n", 35); vu_str_cat(&v_s, &_t837); drop_Str(&_t837); });
+    ({ vu_str _t744 = vu_str_lit("    return 1;\n", 14); vu_str_cat(&v_s, &_t744); drop_Str(&_t744); });
     #line 21300 "vuc.vu"
     VU_AT(21300);
     #line 21300 "vuc.vu"
-    ({ vu_str _t840 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t840); drop_Str(&_t840); });
+    ({ vu_str _t747 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t747); drop_Str(&_t747); });
     #line 21301 "vuc.vu"
     VU_AT(21301);
     #line 21301 "vuc.vu"
-    ({ vu_str _t843 = vu_str_lit("/* After the whole value: only whitespace may follow. Then the error, if any, gets its path. */\n", 96); vu_str_cat(&v_s, &_t843); drop_Str(&_t843); });
+    ({ vu_str _t750 = vu_str_lit("static bool vu_jkey(const vu_str *k, const char *name, int64_t n) { return k->len == n && memcmp(k->data, name, (size_t)n) == 0; }\n", 131); vu_str_cat(&v_s, &_t750); drop_Str(&_t750); });
     #line 21302 "vuc.vu"
     VU_AT(21302);
     #line 21302 "vuc.vu"
-    ({ vu_str _t846 = vu_str_lit("static bool vu_jdone(vu_jp *j, bool ok, vu_str *err) {\n", 55); vu_str_cat(&v_s, &_t846); drop_Str(&_t846); });
+    ({ vu_str _t753 = vu_str_lit("/* Skips any value (a field the type doesn't have). */\n", 55); vu_str_cat(&v_s, &_t753); drop_Str(&_t753); });
     #line 21303 "vuc.vu"
     VU_AT(21303);
     #line 21303 "vuc.vu"
-    ({ vu_str _t849 = vu_str_lit("    if (ok) {\n", 14); vu_str_cat(&v_s, &_t849); drop_Str(&_t849); });
+    ({ vu_str _t756 = vu_str_lit("static bool vu_jskip(vu_jp *j) {\n", 33); vu_str_cat(&v_s, &_t756); drop_Str(&_t756); });
     #line 21304 "vuc.vu"
     VU_AT(21304);
     #line 21304 "vuc.vu"
-    ({ vu_str _t852 = vu_str_lit("        vu_jws(j);\n", 19); vu_str_cat(&v_s, &_t852); drop_Str(&_t852); });
+    ({ vu_str _t759 = vu_str_lit("    vu_jws(j);\n", 15); vu_str_cat(&v_s, &_t759); drop_Str(&_t759); });
     #line 21305 "vuc.vu"
     VU_AT(21305);
     #line 21305 "vuc.vu"
-    ({ vu_str _t855 = vu_str_lit("        if (j->p != j->end) ok = vu_jfail(j, \"extra data after the JSON value\");\n", 81); vu_str_cat(&v_s, &_t855); drop_Str(&_t855); });
+    ({ vu_str _t762 = vu_str_lit("    if (j->p >= j->end) return vu_jfail(j, \"expected a value\");\n", 64); vu_str_cat(&v_s, &_t762); drop_Str(&_t762); });
     #line 21306 "vuc.vu"
     VU_AT(21306);
     #line 21306 "vuc.vu"
-    ({ vu_str _t858 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t858); drop_Str(&_t858); });
+    ({ vu_str _t765 = vu_str_lit("    uint8_t c = *j->p;\n", 23); vu_str_cat(&v_s, &_t765); drop_Str(&_t765); });
     #line 21307 "vuc.vu"
     VU_AT(21307);
     #line 21307 "vuc.vu"
-    ({ vu_str _t861 = vu_str_lit("    if (!ok) {\n", 15); vu_str_cat(&v_s, &_t861); drop_Str(&_t861); });
+    ({ vu_str _t768 = vu_str_lit("    if (c == '\"') { vu_str s = {0}; if (!vu_jdec_Str(j, &s)) return false; drop_Str(&s); return true; }\n", 104); vu_str_cat(&v_s, &_t768); drop_Str(&_t768); });
     #line 21308 "vuc.vu"
     VU_AT(21308);
     #line 21308 "vuc.vu"
-    ({ vu_str _t864 = vu_str_lit("        if (j->path.len) {\n", 27); vu_str_cat(&v_s, &_t864); drop_Str(&_t864); });
+    ({ vu_str _t771 = vu_str_lit("    if (c == 't' || c == 'f') { bool b; return vu_jdec_Bool(j, &b); }\n", 70); vu_str_cat(&v_s, &_t771); drop_Str(&_t771); });
     #line 21309 "vuc.vu"
     VU_AT(21309);
     #line 21309 "vuc.vu"
-    ({ vu_str _t867 = vu_str_lit("            vu_str m = {0};\n", 28); vu_str_cat(&v_s, &_t867); drop_Str(&_t867); });
+    ({ vu_str _t774 = vu_str_lit("    if (c == 'n') { if (vu_jnull(j)) return true; return vu_jfail(j, \"expected a value\"); }\n", 92); vu_str_cat(&v_s, &_t774); drop_Str(&_t774); });
     #line 21310 "vuc.vu"
     VU_AT(21310);
     #line 21310 "vuc.vu"
-    ({ vu_str _t870 = vu_str_lit("            vu_str_cat_bytes(&m, j->path.data, j->path.len);\n", 61); vu_str_cat(&v_s, &_t870); drop_Str(&_t870); });
+    ({ vu_str _t777 = vu_str_lit("    if (c == '[') {\n", 20); vu_str_cat(&v_s, &_t777); drop_Str(&_t777); });
     #line 21311 "vuc.vu"
     VU_AT(21311);
     #line 21311 "vuc.vu"
-    ({ vu_str _t873 = vu_str_lit("            vu_jcat(&m, \": \", 2);\n", 34); vu_str_cat(&v_s, &_t873); drop_Str(&_t873); });
+    ({ vu_str _t780 = vu_str_lit("        if (!vu_jarr_begin(j)) return false;\n", 45); vu_str_cat(&v_s, &_t780); drop_Str(&_t780); });
     #line 21312 "vuc.vu"
     VU_AT(21312);
     #line 21312 "vuc.vu"
-    ({ vu_str _t876 = vu_str_lit("            vu_str_cat_bytes(&m, j->err.data, j->err.len);\n", 59); vu_str_cat(&v_s, &_t876); drop_Str(&_t876); });
+    ({ vu_str _t783 = vu_str_lit("        for (bool first = true;; first = false) {\n", 50); vu_str_cat(&v_s, &_t783); drop_Str(&_t783); });
     #line 21313 "vuc.vu"
     VU_AT(21313);
     #line 21313 "vuc.vu"
-    ({ vu_str _t879 = vu_str_lit("            drop_Str(&j->err);\n", 31); vu_str_cat(&v_s, &_t879); drop_Str(&_t879); });
+    ({ vu_str _t786 = vu_str_lit("            int r = vu_jarr_next(j, first);\n", 44); vu_str_cat(&v_s, &_t786); drop_Str(&_t786); });
     #line 21314 "vuc.vu"
     VU_AT(21314);
     #line 21314 "vuc.vu"
-    ({ vu_str _t882 = vu_str_lit("            *err = m;\n", 22); vu_str_cat(&v_s, &_t882); drop_Str(&_t882); });
+    ({ vu_str _t789 = vu_str_lit("            if (r <= 0) return r == 0;\n", 39); vu_str_cat(&v_s, &_t789); drop_Str(&_t789); });
     #line 21315 "vuc.vu"
     VU_AT(21315);
     #line 21315 "vuc.vu"
-    ({ vu_str _t885 = vu_str_lit("        } else *err = j->err;\n", 30); vu_str_cat(&v_s, &_t885); drop_Str(&_t885); });
+    ({ vu_str _t792 = vu_str_lit("            if (!vu_jskip(j)) return false;\n", 44); vu_str_cat(&v_s, &_t792); drop_Str(&_t792); });
     #line 21316 "vuc.vu"
     VU_AT(21316);
     #line 21316 "vuc.vu"
-    ({ vu_str _t888 = vu_str_lit("        j->err = (vu_str){0};\n", 30); vu_str_cat(&v_s, &_t888); drop_Str(&_t888); });
+    ({ vu_str _t795 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t795); drop_Str(&_t795); });
     #line 21317 "vuc.vu"
     VU_AT(21317);
     #line 21317 "vuc.vu"
-    ({ vu_str _t891 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t891); drop_Str(&_t891); });
+    ({ vu_str _t798 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t798); drop_Str(&_t798); });
     #line 21318 "vuc.vu"
     VU_AT(21318);
     #line 21318 "vuc.vu"
-    ({ vu_str _t894 = vu_str_lit("    drop_Str(&j->path);\n", 24); vu_str_cat(&v_s, &_t894); drop_Str(&_t894); });
+    ({ vu_str _t801 = vu_str_lit("    if (c == '{') {\n", 20); vu_str_cat(&v_s, &_t801); drop_Str(&_t801); });
     #line 21319 "vuc.vu"
     VU_AT(21319);
     #line 21319 "vuc.vu"
-    ({ vu_str _t897 = vu_str_lit("    return ok;\n", 15); vu_str_cat(&v_s, &_t897); drop_Str(&_t897); });
+    ({ vu_str _t804 = vu_str_lit("        if (!vu_jobj_begin(j)) return false;\n", 45); vu_str_cat(&v_s, &_t804); drop_Str(&_t804); });
     #line 21320 "vuc.vu"
     VU_AT(21320);
     #line 21320 "vuc.vu"
-    ({ vu_str _t900 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t900); drop_Str(&_t900); });
+    ({ vu_str _t807 = vu_str_lit("        for (bool first = true;; first = false) {\n", 50); vu_str_cat(&v_s, &_t807); drop_Str(&_t807); });
     #line 21321 "vuc.vu"
     VU_AT(21321);
     #line 21321 "vuc.vu"
+    ({ vu_str _t810 = vu_str_lit("            vu_str k = {0};\n", 28); vu_str_cat(&v_s, &_t810); drop_Str(&_t810); });
+    #line 21322 "vuc.vu"
+    VU_AT(21322);
+    #line 21322 "vuc.vu"
+    ({ vu_str _t813 = vu_str_lit("            int r = vu_jobj_next(j, first, &k);\n", 48); vu_str_cat(&v_s, &_t813); drop_Str(&_t813); });
+    #line 21323 "vuc.vu"
+    VU_AT(21323);
+    #line 21323 "vuc.vu"
+    ({ vu_str _t816 = vu_str_lit("            if (r <= 0) return r == 0;\n", 39); vu_str_cat(&v_s, &_t816); drop_Str(&_t816); });
+    #line 21324 "vuc.vu"
+    VU_AT(21324);
+    #line 21324 "vuc.vu"
+    ({ vu_str _t819 = vu_str_lit("            drop_Str(&k);\n", 26); vu_str_cat(&v_s, &_t819); drop_Str(&_t819); });
+    #line 21325 "vuc.vu"
+    VU_AT(21325);
+    #line 21325 "vuc.vu"
+    ({ vu_str _t822 = vu_str_lit("            if (!vu_jskip(j)) return false;\n", 44); vu_str_cat(&v_s, &_t822); drop_Str(&_t822); });
+    #line 21326 "vuc.vu"
+    VU_AT(21326);
+    #line 21326 "vuc.vu"
+    ({ vu_str _t825 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t825); drop_Str(&_t825); });
+    #line 21327 "vuc.vu"
+    VU_AT(21327);
+    #line 21327 "vuc.vu"
+    ({ vu_str _t828 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t828); drop_Str(&_t828); });
+    #line 21328 "vuc.vu"
+    VU_AT(21328);
+    #line 21328 "vuc.vu"
+    ({ vu_str _t831 = vu_str_lit("    const uint8_t *a;\n", 22); vu_str_cat(&v_s, &_t831); drop_Str(&_t831); });
+    #line 21329 "vuc.vu"
+    VU_AT(21329);
+    #line 21329 "vuc.vu"
+    ({ vu_str _t834 = vu_str_lit("    bool whole;\n", 16); vu_str_cat(&v_s, &_t834); drop_Str(&_t834); });
+    #line 21330 "vuc.vu"
+    VU_AT(21330);
+    #line 21330 "vuc.vu"
+    ({ vu_str _t837 = vu_str_lit("    return vu_jnum(j, &a, &whole);\n", 35); vu_str_cat(&v_s, &_t837); drop_Str(&_t837); });
+    #line 21331 "vuc.vu"
+    VU_AT(21331);
+    #line 21331 "vuc.vu"
+    ({ vu_str _t840 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t840); drop_Str(&_t840); });
+    #line 21332 "vuc.vu"
+    VU_AT(21332);
+    #line 21332 "vuc.vu"
+    ({ vu_str _t843 = vu_str_lit("/* After the whole value: only whitespace may follow. Then the error, if any, gets its path. */\n", 96); vu_str_cat(&v_s, &_t843); drop_Str(&_t843); });
+    #line 21333 "vuc.vu"
+    VU_AT(21333);
+    #line 21333 "vuc.vu"
+    ({ vu_str _t846 = vu_str_lit("static bool vu_jdone(vu_jp *j, bool ok, vu_str *err) {\n", 55); vu_str_cat(&v_s, &_t846); drop_Str(&_t846); });
+    #line 21334 "vuc.vu"
+    VU_AT(21334);
+    #line 21334 "vuc.vu"
+    ({ vu_str _t849 = vu_str_lit("    if (ok) {\n", 14); vu_str_cat(&v_s, &_t849); drop_Str(&_t849); });
+    #line 21335 "vuc.vu"
+    VU_AT(21335);
+    #line 21335 "vuc.vu"
+    ({ vu_str _t852 = vu_str_lit("        vu_jws(j);\n", 19); vu_str_cat(&v_s, &_t852); drop_Str(&_t852); });
+    #line 21336 "vuc.vu"
+    VU_AT(21336);
+    #line 21336 "vuc.vu"
+    ({ vu_str _t855 = vu_str_lit("        if (j->p != j->end) ok = vu_jfail(j, \"extra data after the JSON value\");\n", 81); vu_str_cat(&v_s, &_t855); drop_Str(&_t855); });
+    #line 21337 "vuc.vu"
+    VU_AT(21337);
+    #line 21337 "vuc.vu"
+    ({ vu_str _t858 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t858); drop_Str(&_t858); });
+    #line 21338 "vuc.vu"
+    VU_AT(21338);
+    #line 21338 "vuc.vu"
+    ({ vu_str _t861 = vu_str_lit("    if (!ok) {\n", 15); vu_str_cat(&v_s, &_t861); drop_Str(&_t861); });
+    #line 21339 "vuc.vu"
+    VU_AT(21339);
+    #line 21339 "vuc.vu"
+    ({ vu_str _t864 = vu_str_lit("        if (j->path.len) {\n", 27); vu_str_cat(&v_s, &_t864); drop_Str(&_t864); });
+    #line 21340 "vuc.vu"
+    VU_AT(21340);
+    #line 21340 "vuc.vu"
+    ({ vu_str _t867 = vu_str_lit("            vu_str m = {0};\n", 28); vu_str_cat(&v_s, &_t867); drop_Str(&_t867); });
+    #line 21341 "vuc.vu"
+    VU_AT(21341);
+    #line 21341 "vuc.vu"
+    ({ vu_str _t870 = vu_str_lit("            vu_str_cat_bytes(&m, j->path.data, j->path.len);\n", 61); vu_str_cat(&v_s, &_t870); drop_Str(&_t870); });
+    #line 21342 "vuc.vu"
+    VU_AT(21342);
+    #line 21342 "vuc.vu"
+    ({ vu_str _t873 = vu_str_lit("            vu_jcat(&m, \": \", 2);\n", 34); vu_str_cat(&v_s, &_t873); drop_Str(&_t873); });
+    #line 21343 "vuc.vu"
+    VU_AT(21343);
+    #line 21343 "vuc.vu"
+    ({ vu_str _t876 = vu_str_lit("            vu_str_cat_bytes(&m, j->err.data, j->err.len);\n", 59); vu_str_cat(&v_s, &_t876); drop_Str(&_t876); });
+    #line 21344 "vuc.vu"
+    VU_AT(21344);
+    #line 21344 "vuc.vu"
+    ({ vu_str _t879 = vu_str_lit("            drop_Str(&j->err);\n", 31); vu_str_cat(&v_s, &_t879); drop_Str(&_t879); });
+    #line 21345 "vuc.vu"
+    VU_AT(21345);
+    #line 21345 "vuc.vu"
+    ({ vu_str _t882 = vu_str_lit("            *err = m;\n", 22); vu_str_cat(&v_s, &_t882); drop_Str(&_t882); });
+    #line 21346 "vuc.vu"
+    VU_AT(21346);
+    #line 21346 "vuc.vu"
+    ({ vu_str _t885 = vu_str_lit("        } else *err = j->err;\n", 30); vu_str_cat(&v_s, &_t885); drop_Str(&_t885); });
+    #line 21347 "vuc.vu"
+    VU_AT(21347);
+    #line 21347 "vuc.vu"
+    ({ vu_str _t888 = vu_str_lit("        j->err = (vu_str){0};\n", 30); vu_str_cat(&v_s, &_t888); drop_Str(&_t888); });
+    #line 21348 "vuc.vu"
+    VU_AT(21348);
+    #line 21348 "vuc.vu"
+    ({ vu_str _t891 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t891); drop_Str(&_t891); });
+    #line 21349 "vuc.vu"
+    VU_AT(21349);
+    #line 21349 "vuc.vu"
+    ({ vu_str _t894 = vu_str_lit("    drop_Str(&j->path);\n", 24); vu_str_cat(&v_s, &_t894); drop_Str(&_t894); });
+    #line 21350 "vuc.vu"
+    VU_AT(21350);
+    #line 21350 "vuc.vu"
+    ({ vu_str _t897 = vu_str_lit("    return ok;\n", 15); vu_str_cat(&v_s, &_t897); drop_Str(&_t897); });
+    #line 21351 "vuc.vu"
+    VU_AT(21351);
+    #line 21351 "vuc.vu"
+    ({ vu_str _t900 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t900); drop_Str(&_t900); });
+    #line 21352 "vuc.vu"
+    VU_AT(21352);
+    #line 21352 "vuc.vu"
     {
-        #line 21321 "vuc.vu"
+        #line 21352 "vuc.vu"
         vu_str _t901 = VU_MV(v_s);
-        #line 21321 "vuc.vu"
+        #line 21352 "vuc.vu"
         return _t901;
-    #line 21321 "vuc.vu"
+    #line 21352 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_rt_ffi(void) {
-    #line 21323 "vuc.vu"
+    #line 21354 "vuc.vu"
     VU_ENTER("rt_ffi");
-    #line 21324 "vuc.vu"
-    VU_AT(21324);
-    #line 21324 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21325 "vuc.vu"
-    VU_AT(21325);
-    #line 21325 "vuc.vu"
-    ({ vu_str _t3 = vu_str_lit("/* The C side of extern blocks (SPEC.md, Calling C). A glue file can use these, vu_str, and\n", 92); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
-    #line 21326 "vuc.vu"
-    VU_AT(21326);
-    #line 21326 "vuc.vu"
-    ({ vu_str _t6 = vu_str_lit("   vu_errf(fmt, ...) to build error messages. */\n", 49); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
-    #line 21327 "vuc.vu"
-    VU_AT(21327);
-    #line 21327 "vuc.vu"
-    ({ vu_str _t9 = vu_str_lit("/* Inside a par loop? Only programs with par loops are built with OpenMP (VU_PAR is defined then;\n", 98); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
-    #line 21328 "vuc.vu"
-    VU_AT(21328);
-    #line 21328 "vuc.vu"
-    ({ vu_str _t12 = vu_str_lit("   without an OpenMP compiler, as Apple's clang without libomp, par loops run on one thread). */\n", 97); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
-    #line 21329 "vuc.vu"
-    VU_AT(21329);
-    #line 21329 "vuc.vu"
-    ({ vu_str _t15 = vu_str_lit("#if defined(VU_PAR) && defined(_OPENMP)\n", 40); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
-    #line 21330 "vuc.vu"
-    VU_AT(21330);
-    #line 21330 "vuc.vu"
-    ({ vu_str _t18 = vu_str_lit("#include <omp.h>\n", 17); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
-    #line 21331 "vuc.vu"
-    VU_AT(21331);
-    #line 21331 "vuc.vu"
-    ({ vu_str _t21 = vu_str_lit("#define vu_in_par() omp_in_parallel()\n", 38); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
-    #line 21332 "vuc.vu"
-    VU_AT(21332);
-    #line 21332 "vuc.vu"
-    ({ vu_str _t24 = vu_str_lit("#else\n", 6); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
-    #line 21333 "vuc.vu"
-    VU_AT(21333);
-    #line 21333 "vuc.vu"
-    ({ vu_str _t27 = vu_str_lit("#define vu_in_par() 0\n", 22); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
-    #line 21334 "vuc.vu"
-    VU_AT(21334);
-    #line 21334 "vuc.vu"
-    ({ vu_str _t30 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
-    #line 21335 "vuc.vu"
-    VU_AT(21335);
-    #line 21335 "vuc.vu"
-    ({ vu_str _t33 = vu_str_lit("/* A new Str holding a copy of n bytes at p. */\n", 48); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
-    #line 21336 "vuc.vu"
-    VU_AT(21336);
-    #line 21336 "vuc.vu"
-    ({ vu_str _t36 = vu_str_lit("static vu_str vu_str_from(const void *p, int64_t n) {\n", 54); vu_str_cat(&v_s, &_t36); drop_Str(&_t36); });
-    #line 21337 "vuc.vu"
-    VU_AT(21337);
-    #line 21337 "vuc.vu"
-    ({ vu_str _t39 = vu_str_lit("    vu_str s = {0};\n", 20); vu_str_cat(&v_s, &_t39); drop_Str(&_t39); });
-    #line 21338 "vuc.vu"
-    VU_AT(21338);
-    #line 21338 "vuc.vu"
-    ({ vu_str _t42 = vu_str_lit("    if (n > 0) vu_str_cat_bytes(&s, (const uint8_t *)p, n);\n", 60); vu_str_cat(&v_s, &_t42); drop_Str(&_t42); });
-    #line 21339 "vuc.vu"
-    VU_AT(21339);
-    #line 21339 "vuc.vu"
-    ({ vu_str _t45 = vu_str_lit("    return s;\n", 14); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
-    #line 21340 "vuc.vu"
-    VU_AT(21340);
-    #line 21340 "vuc.vu"
-    ({ vu_str _t48 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t48); drop_Str(&_t48); });
-    #line 21341 "vuc.vu"
-    VU_AT(21341);
-    #line 21341 "vuc.vu"
-    ({ vu_str _t51 = vu_str_lit("/* A NUL-terminated copy of s for C APIs (free it with free()); NULL if s contains a zero byte. */\n", 99); vu_str_cat(&v_s, &_t51); drop_Str(&_t51); });
-    #line 21342 "vuc.vu"
-    VU_AT(21342);
-    #line 21342 "vuc.vu"
-    ({ vu_str _t54 = vu_str_lit("static char *vu_cstr(const vu_str *s) {\n", 40); vu_str_cat(&v_s, &_t54); drop_Str(&_t54); });
-    #line 21343 "vuc.vu"
-    VU_AT(21343);
-    #line 21343 "vuc.vu"
-    ({ vu_str _t57 = vu_str_lit("    if (s->len && memchr(s->data, 0, (size_t)s->len)) return NULL;\n", 67); vu_str_cat(&v_s, &_t57); drop_Str(&_t57); });
-    #line 21344 "vuc.vu"
-    VU_AT(21344);
-    #line 21344 "vuc.vu"
-    ({ vu_str _t60 = vu_str_lit("    char *p = (char *)vu_malloc((size_t)s->len + 1);\n", 53); vu_str_cat(&v_s, &_t60); drop_Str(&_t60); });
-    #line 21345 "vuc.vu"
-    VU_AT(21345);
-    #line 21345 "vuc.vu"
-    ({ vu_str _t63 = vu_str_lit("    if (s->len) memcpy(p, s->data, (size_t)s->len);\n", 52); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
-    #line 21346 "vuc.vu"
-    VU_AT(21346);
-    #line 21346 "vuc.vu"
-    ({ vu_str _t66 = vu_str_lit("    p[s->len] = 0;\n", 19); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 21347 "vuc.vu"
-    VU_AT(21347);
-    #line 21347 "vuc.vu"
-    ({ vu_str _t69 = vu_str_lit("    return p;\n", 14); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
-    #line 21348 "vuc.vu"
-    VU_AT(21348);
-    #line 21348 "vuc.vu"
-    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
-    #line 21349 "vuc.vu"
-    VU_AT(21349);
-    #line 21349 "vuc.vu"
-    ({ vu_str _t75 = vu_str_lit("static void vu_ffi_here(const char *fn, int line) {\n", 52); vu_str_cat(&v_s, &_t75); drop_Str(&_t75); });
-    #line 21350 "vuc.vu"
-    VU_AT(21350);
-    #line 21350 "vuc.vu"
-    ({ vu_str _t78 = vu_str_lit("    if (vu_in_par()) {\n", 23); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
-    #line 21351 "vuc.vu"
-    VU_AT(21351);
-    #line 21351 "vuc.vu"
-    ({ vu_str _t81 = vu_str_lit("        char m[300];\n", 21); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
-    #line 21352 "vuc.vu"
-    VU_AT(21352);
-    #line 21352 "vuc.vu"
-    ({ vu_str _t84 = vu_str_lit("        int n = snprintf(m, sizeof m, \"%.200s() is C code, which can't be called inside a par loop\", fn);\n", 106); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
-    #line 21353 "vuc.vu"
-    VU_AT(21353);
-    #line 21353 "vuc.vu"
-    ({ vu_str _t87 = vu_str_lit("        vu_panic(line, m, n);\n", 30); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
-    #line 21354 "vuc.vu"
-    VU_AT(21354);
-    #line 21354 "vuc.vu"
-    ({ vu_str _t90 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 21355 "vuc.vu"
     VU_AT(21355);
     #line 21355 "vuc.vu"
-    ({ vu_str _t93 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 21356 "vuc.vu"
     VU_AT(21356);
     #line 21356 "vuc.vu"
-    ({ vu_str _t96 = vu_str_lit("__attribute__((noreturn)) static void vu_ffi_null(const char *fn, int line) {\n", 78); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
+    ({ vu_str _t3 = vu_str_lit("/* The C side of extern blocks (SPEC.md, Calling C). A glue file can use these, vu_str, and\n", 92); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
     #line 21357 "vuc.vu"
     VU_AT(21357);
     #line 21357 "vuc.vu"
-    ({ vu_str _t99 = vu_str_lit("    char m[300];\n", 17); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
+    ({ vu_str _t6 = vu_str_lit("   vu_errf(fmt, ...) to build error messages. */\n", 49); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
     #line 21358 "vuc.vu"
     VU_AT(21358);
     #line 21358 "vuc.vu"
-    ({ vu_str _t102 = vu_str_lit("    int n = snprintf(m, sizeof m, \"%.200s() returned no handle (NULL) without reporting an error\", fn);\n", 104); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
+    ({ vu_str _t9 = vu_str_lit("/* Inside a par loop? Only programs with par loops are built with OpenMP (VU_PAR is defined then;\n", 98); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
     #line 21359 "vuc.vu"
     VU_AT(21359);
     #line 21359 "vuc.vu"
-    ({ vu_str _t105 = vu_str_lit("    vu_panic(line, m, n);\n", 26); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
+    ({ vu_str _t12 = vu_str_lit("   without an OpenMP compiler, as Apple's clang without libomp, par loops run on one thread). */\n", 97); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
     #line 21360 "vuc.vu"
     VU_AT(21360);
     #line 21360 "vuc.vu"
-    ({ vu_str _t108 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    ({ vu_str _t15 = vu_str_lit("#if defined(VU_PAR) && defined(_OPENMP)\n", 40); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
     #line 21361 "vuc.vu"
     VU_AT(21361);
     #line 21361 "vuc.vu"
+    ({ vu_str _t18 = vu_str_lit("#include <omp.h>\n", 17); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
+    #line 21362 "vuc.vu"
+    VU_AT(21362);
+    #line 21362 "vuc.vu"
+    ({ vu_str _t21 = vu_str_lit("#define vu_in_par() omp_in_parallel()\n", 38); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
+    #line 21363 "vuc.vu"
+    VU_AT(21363);
+    #line 21363 "vuc.vu"
+    ({ vu_str _t24 = vu_str_lit("#else\n", 6); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
+    #line 21364 "vuc.vu"
+    VU_AT(21364);
+    #line 21364 "vuc.vu"
+    ({ vu_str _t27 = vu_str_lit("#define vu_in_par() 0\n", 22); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
+    #line 21365 "vuc.vu"
+    VU_AT(21365);
+    #line 21365 "vuc.vu"
+    ({ vu_str _t30 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
+    #line 21366 "vuc.vu"
+    VU_AT(21366);
+    #line 21366 "vuc.vu"
+    ({ vu_str _t33 = vu_str_lit("/* A new Str holding a copy of n bytes at p. */\n", 48); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
+    #line 21367 "vuc.vu"
+    VU_AT(21367);
+    #line 21367 "vuc.vu"
+    ({ vu_str _t36 = vu_str_lit("static vu_str vu_str_from(const void *p, int64_t n) {\n", 54); vu_str_cat(&v_s, &_t36); drop_Str(&_t36); });
+    #line 21368 "vuc.vu"
+    VU_AT(21368);
+    #line 21368 "vuc.vu"
+    ({ vu_str _t39 = vu_str_lit("    vu_str s = {0};\n", 20); vu_str_cat(&v_s, &_t39); drop_Str(&_t39); });
+    #line 21369 "vuc.vu"
+    VU_AT(21369);
+    #line 21369 "vuc.vu"
+    ({ vu_str _t42 = vu_str_lit("    if (n > 0) vu_str_cat_bytes(&s, (const uint8_t *)p, n);\n", 60); vu_str_cat(&v_s, &_t42); drop_Str(&_t42); });
+    #line 21370 "vuc.vu"
+    VU_AT(21370);
+    #line 21370 "vuc.vu"
+    ({ vu_str _t45 = vu_str_lit("    return s;\n", 14); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
+    #line 21371 "vuc.vu"
+    VU_AT(21371);
+    #line 21371 "vuc.vu"
+    ({ vu_str _t48 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t48); drop_Str(&_t48); });
+    #line 21372 "vuc.vu"
+    VU_AT(21372);
+    #line 21372 "vuc.vu"
+    ({ vu_str _t51 = vu_str_lit("/* A NUL-terminated copy of s for C APIs (free it with free()); NULL if s contains a zero byte. */\n", 99); vu_str_cat(&v_s, &_t51); drop_Str(&_t51); });
+    #line 21373 "vuc.vu"
+    VU_AT(21373);
+    #line 21373 "vuc.vu"
+    ({ vu_str _t54 = vu_str_lit("static char *vu_cstr(const vu_str *s) {\n", 40); vu_str_cat(&v_s, &_t54); drop_Str(&_t54); });
+    #line 21374 "vuc.vu"
+    VU_AT(21374);
+    #line 21374 "vuc.vu"
+    ({ vu_str _t57 = vu_str_lit("    if (s->len && memchr(s->data, 0, (size_t)s->len)) return NULL;\n", 67); vu_str_cat(&v_s, &_t57); drop_Str(&_t57); });
+    #line 21375 "vuc.vu"
+    VU_AT(21375);
+    #line 21375 "vuc.vu"
+    ({ vu_str _t60 = vu_str_lit("    char *p = (char *)vu_malloc((size_t)s->len + 1);\n", 53); vu_str_cat(&v_s, &_t60); drop_Str(&_t60); });
+    #line 21376 "vuc.vu"
+    VU_AT(21376);
+    #line 21376 "vuc.vu"
+    ({ vu_str _t63 = vu_str_lit("    if (s->len) memcpy(p, s->data, (size_t)s->len);\n", 52); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
+    #line 21377 "vuc.vu"
+    VU_AT(21377);
+    #line 21377 "vuc.vu"
+    ({ vu_str _t66 = vu_str_lit("    p[s->len] = 0;\n", 19); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
+    #line 21378 "vuc.vu"
+    VU_AT(21378);
+    #line 21378 "vuc.vu"
+    ({ vu_str _t69 = vu_str_lit("    return p;\n", 14); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
+    #line 21379 "vuc.vu"
+    VU_AT(21379);
+    #line 21379 "vuc.vu"
+    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
+    #line 21380 "vuc.vu"
+    VU_AT(21380);
+    #line 21380 "vuc.vu"
+    ({ vu_str _t75 = vu_str_lit("static void vu_ffi_here(const char *fn, int line) {\n", 52); vu_str_cat(&v_s, &_t75); drop_Str(&_t75); });
+    #line 21381 "vuc.vu"
+    VU_AT(21381);
+    #line 21381 "vuc.vu"
+    ({ vu_str _t78 = vu_str_lit("    if (vu_in_par()) {\n", 23); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
+    #line 21382 "vuc.vu"
+    VU_AT(21382);
+    #line 21382 "vuc.vu"
+    ({ vu_str _t81 = vu_str_lit("        char m[300];\n", 21); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
+    #line 21383 "vuc.vu"
+    VU_AT(21383);
+    #line 21383 "vuc.vu"
+    ({ vu_str _t84 = vu_str_lit("        int n = snprintf(m, sizeof m, \"%.200s() is C code, which can't be called inside a par loop\", fn);\n", 106); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
+    #line 21384 "vuc.vu"
+    VU_AT(21384);
+    #line 21384 "vuc.vu"
+    ({ vu_str _t87 = vu_str_lit("        vu_panic(line, m, n);\n", 30); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
+    #line 21385 "vuc.vu"
+    VU_AT(21385);
+    #line 21385 "vuc.vu"
+    ({ vu_str _t90 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
+    #line 21386 "vuc.vu"
+    VU_AT(21386);
+    #line 21386 "vuc.vu"
+    ({ vu_str _t93 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
+    #line 21387 "vuc.vu"
+    VU_AT(21387);
+    #line 21387 "vuc.vu"
+    ({ vu_str _t96 = vu_str_lit("__attribute__((noreturn)) static void vu_ffi_null(const char *fn, int line) {\n", 78); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
+    #line 21388 "vuc.vu"
+    VU_AT(21388);
+    #line 21388 "vuc.vu"
+    ({ vu_str _t99 = vu_str_lit("    char m[300];\n", 17); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
+    #line 21389 "vuc.vu"
+    VU_AT(21389);
+    #line 21389 "vuc.vu"
+    ({ vu_str _t102 = vu_str_lit("    int n = snprintf(m, sizeof m, \"%.200s() returned no handle (NULL) without reporting an error\", fn);\n", 104); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
+    #line 21390 "vuc.vu"
+    VU_AT(21390);
+    #line 21390 "vuc.vu"
+    ({ vu_str _t105 = vu_str_lit("    vu_panic(line, m, n);\n", 26); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
+    #line 21391 "vuc.vu"
+    VU_AT(21391);
+    #line 21391 "vuc.vu"
+    ({ vu_str _t108 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    #line 21392 "vuc.vu"
+    VU_AT(21392);
+    #line 21392 "vuc.vu"
     {
-        #line 21361 "vuc.vu"
+        #line 21392 "vuc.vu"
         vu_str _t109 = VU_MV(v_s);
-        #line 21361 "vuc.vu"
+        #line 21392 "vuc.vu"
         return _t109;
-    #line 21361 "vuc.vu"
+    #line 21392 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_rt_help(void) {
-    #line 21363 "vuc.vu"
+    #line 21394 "vuc.vu"
     VU_ENTER("rt_help");
-    #line 21364 "vuc.vu"
-    VU_AT(21364);
-    #line 21364 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21365 "vuc.vu"
-    VU_AT(21365);
-    #line 21365 "vuc.vu"
-    ({ vu_str _t3 = vu_str_lit("Vu 0.2.0 compiler: translates .vu source to C, then builds a native binary with the C compiler.\n", 96); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
-    #line 21366 "vuc.vu"
-    VU_AT(21366);
-    #line 21366 "vuc.vu"
-    ({ vu_str _t6 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
-    #line 21367 "vuc.vu"
-    VU_AT(21367);
-    #line 21367 "vuc.vu"
-    ({ vu_str _t9 = vu_str_lit("Usage:\n", 7); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
-    #line 21368 "vuc.vu"
-    VU_AT(21368);
-    #line 21368 "vuc.vu"
-    ({ vu_str _t12 = vu_str_lit("  vu check FILE.vu [--time] [--json] [--checks] [--caps]\n", 57); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
-    #line 21369 "vuc.vu"
-    VU_AT(21369);
-    #line 21369 "vuc.vu"
-    ({ vu_str _t15 = vu_str_lit("      report errors only: no binary and no C compiler, so it takes milliseconds.\n", 81); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
-    #line 21370 "vuc.vu"
-    VU_AT(21370);
-    #line 21370 "vuc.vu"
-    ({ vu_str _t18 = vu_str_lit("      --checks: for each loop, the index and arithmetic checks it still makes on every pass\n", 92); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
-    #line 21371 "vuc.vu"
-    VU_AT(21371);
-    #line 21371 "vuc.vu"
-    ({ vu_str _t21 = vu_str_lit("      --caps: what the program can reach outside itself (files, programs, network, C code)\n", 91); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
-    #line 21372 "vuc.vu"
-    VU_AT(21372);
-    #line 21372 "vuc.vu"
-    ({ vu_str _t24 = vu_str_lit("  vu run [--release] [--json] FILE.vu [ARGS...]\n", 48); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
-    #line 21373 "vuc.vu"
-    VU_AT(21373);
-    #line 21373 "vuc.vu"
-    ({ vu_str _t27 = vu_str_lit("      quick unoptimized build (-O0), then run it with ARGS; --release builds optimized first.\n", 94); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
-    #line 21374 "vuc.vu"
-    VU_AT(21374);
-    #line 21374 "vuc.vu"
-    ({ vu_str _t30 = vu_str_lit("      A panic prints the chain of calls that led to it (in quick builds).\n", 74); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
-    #line 21375 "vuc.vu"
-    VU_AT(21375);
-    #line 21375 "vuc.vu"
-    ({ vu_str _t33 = vu_str_lit("      The binary is kept (in ~/.cache/vu/run), so the same program runs again without building;\n", 96); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
-    #line 21376 "vuc.vu"
-    VU_AT(21376);
-    #line 21376 "vuc.vu"
-    ({ vu_str _t36 = vu_str_lit("      VU_RUN_CACHE=off builds every time. A script can start with: #!/usr/bin/env -S vu run\n", 92); vu_str_cat(&v_s, &_t36); drop_Str(&_t36); });
-    #line 21377 "vuc.vu"
-    VU_AT(21377);
-    #line 21377 "vuc.vu"
-    ({ vu_str _t39 = vu_str_lit("      Quick builds use clang when it's there (and CC isn't set); a big program's quick build is\n", 96); vu_str_cat(&v_s, &_t39); drop_Str(&_t39); });
-    #line 21378 "vuc.vu"
-    VU_AT(21378);
-    #line 21378 "vuc.vu"
-    ({ vu_str _t42 = vu_str_lit("      compiled in parts, in parallel, and each part is kept, so a rebuild compiles only what changed\n", 101); vu_str_cat(&v_s, &_t42); drop_Str(&_t42); });
-    #line 21379 "vuc.vu"
-    VU_AT(21379);
-    #line 21379 "vuc.vu"
-    ({ vu_str _t45 = vu_str_lit("      (VU_SPLIT=off: one C file; VU_SPLIT=always: split any program).\n", 70); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
-    #line 21380 "vuc.vu"
-    VU_AT(21380);
-    #line 21380 "vuc.vu"
-    ({ vu_str _t48 = vu_str_lit("  vu build FILE.vu [-o OUT] [--debug] [--malloc] [--san] [--san-pool] [--tsan] [--emit-c FILE] [--time] [--static] [--wasm] [--profile] [--lib]\n", 144); vu_str_cat(&v_s, &_t48); drop_Str(&_t48); });
-    #line 21381 "vuc.vu"
-    VU_AT(21381);
-    #line 21381 "vuc.vu"
-    ({ vu_str _t51 = vu_str_lit("      optimized binary (-O3); --debug builds quickly instead. With VU_CACHE=DIR set, each binary is\n", 100); vu_str_cat(&v_s, &_t51); drop_Str(&_t51); });
-    #line 21382 "vuc.vu"
-    VU_AT(21382);
-    #line 21382 "vuc.vu"
-    ({ vu_str _t54 = vu_str_lit("      kept in DIR under a hash of its C, the C compiler's command, version and CPU, and the same\n", 97); vu_str_cat(&v_s, &_t54); drop_Str(&_t54); });
-    #line 21383 "vuc.vu"
-    VU_AT(21383);
-    #line 21383 "vuc.vu"
-    ({ vu_str _t57 = vu_str_lit("      build again is a copy (not for programs with extern C files). --static links every library in\n", 100); vu_str_cat(&v_s, &_t57); drop_Str(&_t57); });
-    #line 21384 "vuc.vu"
-    VU_AT(21384);
-    #line 21384 "vuc.vu"
-    ({ vu_str _t60 = vu_str_lit("      (the binary runs anywhere with the same CPU and kernel; with glibc, host name lookups need glibc there).\n", 111); vu_str_cat(&v_s, &_t60); drop_Str(&_t60); });
-    #line 21385 "vuc.vu"
-    VU_AT(21385);
-    #line 21385 "vuc.vu"
-    ({ vu_str _t63 = vu_str_lit("      --wasm: a WebAssembly (WASI) module, with zig's C compiler (no tasks, sockets or processes)\n", 98); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
-    #line 21386 "vuc.vu"
-    VU_AT(21386);
-    #line 21386 "vuc.vu"
-    ({ vu_str _t66 = vu_str_lit("      --profile (build or run): optimized, and at exit the program reports where its CPU time went\n", 99); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 21387 "vuc.vu"
-    VU_AT(21387);
-    #line 21387 "vuc.vu"
-    ({ vu_str _t69 = vu_str_lit("      (by function and line, on stderr; all of it in vu-profile.txt, stacks in vu-profile.folded)\n", 98); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
-    #line 21388 "vuc.vu"
-    VU_AT(21388);
-    #line 21388 "vuc.vu"
-    ({ vu_str _t72 = vu_str_lit("      --lib: a shared library (libFILE.so, .dylib on macOS) of the functions marked 'export fn',\n", 97); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
-    #line 21389 "vuc.vu"
-    VU_AT(21389);
-    #line 21389 "vuc.vu"
-    ({ vu_str _t75 = vu_str_lit("      and a C header (FILE.h) declaring them, for C, or Python through ctypes\n", 78); vu_str_cat(&v_s, &_t75); drop_Str(&_t75); });
-    #line 21390 "vuc.vu"
-    VU_AT(21390);
-    #line 21390 "vuc.vu"
-    ({ vu_str _t78 = vu_str_lit("  vu get [FILE.vu]\n", 19); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
-    #line 21391 "vuc.vu"
-    VU_AT(21391);
-    #line 21391 "vuc.vu"
-    ({ vu_str _t81 = vu_str_lit("      fetch the packages in vu.pkg (and the ones they need) and write vu.lock\n", 78); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
-    #line 21392 "vuc.vu"
-    VU_AT(21392);
-    #line 21392 "vuc.vu"
-    ({ vu_str _t84 = vu_str_lit("  vu search [WORDS...] / vu add NAME [VERSION]\n", 47); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
-    #line 21393 "vuc.vu"
-    VU_AT(21393);
-    #line 21393 "vuc.vu"
-    ({ vu_str _t87 = vu_str_lit("      the registry (VU_REGISTRY, else https://vulang.org/registry/index.txt): list packages, or add\n", 100); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
-    #line 21394 "vuc.vu"
-    VU_AT(21394);
-    #line 21394 "vuc.vu"
-    ({ vu_str _t90 = vu_str_lit("      one to vu.pkg with the capabilities it takes, then fetch it (checked against the registry)\n", 97); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 21395 "vuc.vu"
     VU_AT(21395);
     #line 21395 "vuc.vu"
-    ({ vu_str _t93 = vu_str_lit("  vu publish NAME VERSION [DIR] [fs net os ffi]\n", 48); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 21396 "vuc.vu"
     VU_AT(21396);
     #line 21396 "vuc.vu"
-    ({ vu_str _t96 = vu_str_lit("      print the registry's lines for a git tag of a package (they go in by pull request)\n", 89); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
+    ({ vu_str _t3 = vu_str_lit("Vu 0.2.0 compiler: translates .vu source to C, then builds a native binary with the C compiler.\n", 96); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
     #line 21397 "vuc.vu"
     VU_AT(21397);
     #line 21397 "vuc.vu"
-    ({ vu_str _t99 = vu_str_lit("  vu version\n", 13); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
+    ({ vu_str _t6 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
     #line 21398 "vuc.vu"
     VU_AT(21398);
     #line 21398 "vuc.vu"
-    ({ vu_str _t102 = vu_str_lit("      prints the release (vu 0.2.0)\n", 36); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
+    ({ vu_str _t9 = vu_str_lit("Usage:\n", 7); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
     #line 21399 "vuc.vu"
     VU_AT(21399);
     #line 21399 "vuc.vu"
-    ({ vu_str _t105 = vu_str_lit("  vu new web NAME\n", 18); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
+    ({ vu_str _t12 = vu_str_lit("  vu check FILE.vu [--time] [--json] [--checks] [--caps]\n", 57); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
     #line 21400 "vuc.vu"
     VU_AT(21400);
     #line 21400 "vuc.vu"
-    ({ vu_str _t108 = vu_str_lit("      a folder NAME with a web app to start from: main.vu, public/, a Dockerfile, fly.toml, README.md\n", 102); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    ({ vu_str _t15 = vu_str_lit("      report errors only: no binary and no C compiler, so it takes milliseconds.\n", 81); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
     #line 21401 "vuc.vu"
     VU_AT(21401);
     #line 21401 "vuc.vu"
-    ({ vu_str _t111 = vu_str_lit("  --json: compile errors and panics are printed to stderr as one JSON object per line", 85); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
+    ({ vu_str _t18 = vu_str_lit("      --checks: for each loop, the index and arithmetic checks it still makes on every pass\n", 92); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
     #line 21402 "vuc.vu"
     VU_AT(21402);
     #line 21402 "vuc.vu"
+    ({ vu_str _t21 = vu_str_lit("      --caps: what the program can reach outside itself (files, programs, network, C code)\n", 91); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
+    #line 21403 "vuc.vu"
+    VU_AT(21403);
+    #line 21403 "vuc.vu"
+    ({ vu_str _t24 = vu_str_lit("  vu run [--release] [--json] FILE.vu [ARGS...]\n", 48); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
+    #line 21404 "vuc.vu"
+    VU_AT(21404);
+    #line 21404 "vuc.vu"
+    ({ vu_str _t27 = vu_str_lit("      quick unoptimized build (-O0), then run it with ARGS; --release builds optimized first.\n", 94); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
+    #line 21405 "vuc.vu"
+    VU_AT(21405);
+    #line 21405 "vuc.vu"
+    ({ vu_str _t30 = vu_str_lit("      A panic prints the chain of calls that led to it (in quick builds).\n", 74); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
+    #line 21406 "vuc.vu"
+    VU_AT(21406);
+    #line 21406 "vuc.vu"
+    ({ vu_str _t33 = vu_str_lit("      The binary is kept (in ~/.cache/vu/run), so the same program runs again without building;\n", 96); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
+    #line 21407 "vuc.vu"
+    VU_AT(21407);
+    #line 21407 "vuc.vu"
+    ({ vu_str _t36 = vu_str_lit("      VU_RUN_CACHE=off builds every time. A script can start with: #!/usr/bin/env -S vu run\n", 92); vu_str_cat(&v_s, &_t36); drop_Str(&_t36); });
+    #line 21408 "vuc.vu"
+    VU_AT(21408);
+    #line 21408 "vuc.vu"
+    ({ vu_str _t39 = vu_str_lit("      Quick builds use clang when it's there (and CC isn't set); a big program's quick build is\n", 96); vu_str_cat(&v_s, &_t39); drop_Str(&_t39); });
+    #line 21409 "vuc.vu"
+    VU_AT(21409);
+    #line 21409 "vuc.vu"
+    ({ vu_str _t42 = vu_str_lit("      compiled in parts, in parallel, and each part is kept, so a rebuild compiles only what changed\n", 101); vu_str_cat(&v_s, &_t42); drop_Str(&_t42); });
+    #line 21410 "vuc.vu"
+    VU_AT(21410);
+    #line 21410 "vuc.vu"
+    ({ vu_str _t45 = vu_str_lit("      (VU_SPLIT=off: one C file; VU_SPLIT=always: split any program).\n", 70); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
+    #line 21411 "vuc.vu"
+    VU_AT(21411);
+    #line 21411 "vuc.vu"
+    ({ vu_str _t48 = vu_str_lit("  vu build FILE.vu [-o OUT] [--debug] [--malloc] [--san] [--san-pool] [--tsan] [--emit-c FILE] [--time] [--static] [--wasm] [--profile] [--lib]\n", 144); vu_str_cat(&v_s, &_t48); drop_Str(&_t48); });
+    #line 21412 "vuc.vu"
+    VU_AT(21412);
+    #line 21412 "vuc.vu"
+    ({ vu_str _t51 = vu_str_lit("      optimized binary (-O3); --debug builds quickly instead. With VU_CACHE=DIR set, each binary is\n", 100); vu_str_cat(&v_s, &_t51); drop_Str(&_t51); });
+    #line 21413 "vuc.vu"
+    VU_AT(21413);
+    #line 21413 "vuc.vu"
+    ({ vu_str _t54 = vu_str_lit("      kept in DIR under a hash of its C, the C compiler's command, version and CPU, and the same\n", 97); vu_str_cat(&v_s, &_t54); drop_Str(&_t54); });
+    #line 21414 "vuc.vu"
+    VU_AT(21414);
+    #line 21414 "vuc.vu"
+    ({ vu_str _t57 = vu_str_lit("      build again is a copy (not for programs with extern C files). --static links every library in\n", 100); vu_str_cat(&v_s, &_t57); drop_Str(&_t57); });
+    #line 21415 "vuc.vu"
+    VU_AT(21415);
+    #line 21415 "vuc.vu"
+    ({ vu_str _t60 = vu_str_lit("      (the binary runs anywhere with the same CPU and kernel; with glibc, host name lookups need glibc there).\n", 111); vu_str_cat(&v_s, &_t60); drop_Str(&_t60); });
+    #line 21416 "vuc.vu"
+    VU_AT(21416);
+    #line 21416 "vuc.vu"
+    ({ vu_str _t63 = vu_str_lit("      --wasm: a WebAssembly (WASI) module, with zig's C compiler (no tasks, sockets or processes)\n", 98); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
+    #line 21417 "vuc.vu"
+    VU_AT(21417);
+    #line 21417 "vuc.vu"
+    ({ vu_str _t66 = vu_str_lit("      --profile (build or run): optimized, and at exit the program reports where its CPU time went\n", 99); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
+    #line 21418 "vuc.vu"
+    VU_AT(21418);
+    #line 21418 "vuc.vu"
+    ({ vu_str _t69 = vu_str_lit("      (by function and line, on stderr; all of it in vu-profile.txt, stacks in vu-profile.folded)\n", 98); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
+    #line 21419 "vuc.vu"
+    VU_AT(21419);
+    #line 21419 "vuc.vu"
+    ({ vu_str _t72 = vu_str_lit("      --lib: a shared library (libFILE.so, .dylib on macOS) of the functions marked 'export fn',\n", 97); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
+    #line 21420 "vuc.vu"
+    VU_AT(21420);
+    #line 21420 "vuc.vu"
+    ({ vu_str _t75 = vu_str_lit("      and a C header (FILE.h) declaring them, for C, or Python through ctypes\n", 78); vu_str_cat(&v_s, &_t75); drop_Str(&_t75); });
+    #line 21421 "vuc.vu"
+    VU_AT(21421);
+    #line 21421 "vuc.vu"
+    ({ vu_str _t78 = vu_str_lit("  vu get [FILE.vu]\n", 19); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
+    #line 21422 "vuc.vu"
+    VU_AT(21422);
+    #line 21422 "vuc.vu"
+    ({ vu_str _t81 = vu_str_lit("      fetch the packages in vu.pkg (and the ones they need) and write vu.lock\n", 78); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
+    #line 21423 "vuc.vu"
+    VU_AT(21423);
+    #line 21423 "vuc.vu"
+    ({ vu_str _t84 = vu_str_lit("  vu search [WORDS...] / vu add NAME [VERSION]\n", 47); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
+    #line 21424 "vuc.vu"
+    VU_AT(21424);
+    #line 21424 "vuc.vu"
+    ({ vu_str _t87 = vu_str_lit("      the registry (VU_REGISTRY, else https://vulang.org/registry/index.txt): list packages, or add\n", 100); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
+    #line 21425 "vuc.vu"
+    VU_AT(21425);
+    #line 21425 "vuc.vu"
+    ({ vu_str _t90 = vu_str_lit("      one to vu.pkg with the capabilities it takes, then fetch it (checked against the registry)\n", 97); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
+    #line 21426 "vuc.vu"
+    VU_AT(21426);
+    #line 21426 "vuc.vu"
+    ({ vu_str _t93 = vu_str_lit("  vu publish NAME VERSION [DIR] [fs net os ffi]\n", 48); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
+    #line 21427 "vuc.vu"
+    VU_AT(21427);
+    #line 21427 "vuc.vu"
+    ({ vu_str _t96 = vu_str_lit("      print the registry's lines for a git tag of a package (they go in by pull request)\n", 89); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
+    #line 21428 "vuc.vu"
+    VU_AT(21428);
+    #line 21428 "vuc.vu"
+    ({ vu_str _t99 = vu_str_lit("  vu version\n", 13); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
+    #line 21429 "vuc.vu"
+    VU_AT(21429);
+    #line 21429 "vuc.vu"
+    ({ vu_str _t102 = vu_str_lit("      prints the release (vu 0.2.0)\n", 36); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
+    #line 21430 "vuc.vu"
+    VU_AT(21430);
+    #line 21430 "vuc.vu"
+    ({ vu_str _t105 = vu_str_lit("  vu new web NAME\n", 18); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
+    #line 21431 "vuc.vu"
+    VU_AT(21431);
+    #line 21431 "vuc.vu"
+    ({ vu_str _t108 = vu_str_lit("      a folder NAME with a web app to start from: main.vu, public/, a Dockerfile, fly.toml, README.md\n", 102); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    #line 21432 "vuc.vu"
+    VU_AT(21432);
+    #line 21432 "vuc.vu"
+    ({ vu_str _t111 = vu_str_lit("  --json: compile errors and panics are printed to stderr as one JSON object per line", 85); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
+    #line 21433 "vuc.vu"
+    VU_AT(21433);
+    #line 21433 "vuc.vu"
     {
-        #line 21402 "vuc.vu"
+        #line 21433 "vuc.vu"
         vu_str _t112 = VU_MV(v_s);
-        #line 21402 "vuc.vu"
+        #line 21433 "vuc.vu"
         return _t112;
-    #line 21402 "vuc.vu"
+    #line 21433 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_new_web_main(void) {
-    #line 21404 "vuc.vu"
+    #line 21435 "vuc.vu"
     VU_ENTER("new_web_main");
-    #line 21405 "vuc.vu"
-    VU_AT(21405);
-    #line 21405 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21406 "vuc.vu"
-    VU_AT(21406);
-    #line 21406 "vuc.vu"
-    ({ vu_str _t3 = vu_str_lit("# A web app on Vu's web module. Run it with `vu run main.vu` and open http://localhost:8080.\n", 93); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
-    #line 21407 "vuc.vu"
-    VU_AT(21407);
-    #line 21407 "vuc.vu"
-    ({ vu_str _t6 = vu_str_lit("# Routes are added in main; each handler gets the request and the context (route parameters, values\n", 100); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
-    #line 21408 "vuc.vu"
-    VU_AT(21408);
-    #line 21408 "vuc.vu"
-    ({ vu_str _t9 = vu_str_lit("# from middleware) and returns a response. Templates escape every value they insert.\n", 85); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
-    #line 21409 "vuc.vu"
-    VU_AT(21409);
-    #line 21409 "vuc.vu"
-    ({ vu_str _t12 = vu_str_lit("import http\n", 12); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
-    #line 21410 "vuc.vu"
-    VU_AT(21410);
-    #line 21410 "vuc.vu"
-    ({ vu_str _t15 = vu_str_lit("import web\n", 11); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
-    #line 21411 "vuc.vu"
-    VU_AT(21411);
-    #line 21411 "vuc.vu"
-    ({ vu_str _t18 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
-    #line 21412 "vuc.vu"
-    VU_AT(21412);
-    #line 21412 "vuc.vu"
-    ({ vu_str _t21 = vu_str_lit("# The page around every view: a template is text written into the program, so request data can\n", 95); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
-    #line 21413 "vuc.vu"
-    VU_AT(21413);
-    #line 21413 "vuc.vu"
-    ({ vu_str _t24 = vu_str_lit("# only ever be a value, and every value is escaped unless it's web.Html.\n", 73); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
-    #line 21414 "vuc.vu"
-    VU_AT(21414);
-    #line 21414 "vuc.vu"
-    ({ vu_str _t27 = vu_str_lit("const LAYOUT = \"\"\"\n", 19); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
-    #line 21415 "vuc.vu"
-    VU_AT(21415);
-    #line 21415 "vuc.vu"
-    ({ vu_str _t30 = vu_str_lit("  <!doctype html>\n", 18); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
-    #line 21416 "vuc.vu"
-    VU_AT(21416);
-    #line 21416 "vuc.vu"
-    ({ vu_str _t33 = vu_str_lit("  <html lang=\"en\">\n", 19); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
-    #line 21417 "vuc.vu"
-    VU_AT(21417);
-    #line 21417 "vuc.vu"
-    ({ vu_str _t36 = vu_str_lit("  <head>\n", 9); vu_str_cat(&v_s, &_t36); drop_Str(&_t36); });
-    #line 21418 "vuc.vu"
-    VU_AT(21418);
-    #line 21418 "vuc.vu"
-    ({ vu_str _t39 = vu_str_lit("  <meta charset=\"utf-8\">\n", 25); vu_str_cat(&v_s, &_t39); drop_Str(&_t39); });
-    #line 21419 "vuc.vu"
-    VU_AT(21419);
-    #line 21419 "vuc.vu"
-    ({ vu_str _t42 = vu_str_lit("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n", 71); vu_str_cat(&v_s, &_t42); drop_Str(&_t42); });
-    #line 21420 "vuc.vu"
-    VU_AT(21420);
-    #line 21420 "vuc.vu"
-    ({ vu_str _t45 = vu_str_lit("  <title>{{title}}</title>\n", 27); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
-    #line 21421 "vuc.vu"
-    VU_AT(21421);
-    #line 21421 "vuc.vu"
-    ({ vu_str _t48 = vu_str_lit("  <link rel=\"stylesheet\" href=\"/static/style.css\">\n", 51); vu_str_cat(&v_s, &_t48); drop_Str(&_t48); });
-    #line 21422 "vuc.vu"
-    VU_AT(21422);
-    #line 21422 "vuc.vu"
-    ({ vu_str _t51 = vu_str_lit("  </head>\n", 10); vu_str_cat(&v_s, &_t51); drop_Str(&_t51); });
-    #line 21423 "vuc.vu"
-    VU_AT(21423);
-    #line 21423 "vuc.vu"
-    ({ vu_str _t54 = vu_str_lit("  <body>\n", 9); vu_str_cat(&v_s, &_t54); drop_Str(&_t54); });
-    #line 21424 "vuc.vu"
-    VU_AT(21424);
-    #line 21424 "vuc.vu"
-    ({ vu_str _t57 = vu_str_lit("  <main>{{body}}</main>\n", 24); vu_str_cat(&v_s, &_t57); drop_Str(&_t57); });
-    #line 21425 "vuc.vu"
-    VU_AT(21425);
-    #line 21425 "vuc.vu"
-    ({ vu_str _t60 = vu_str_lit("  </body>\n", 10); vu_str_cat(&v_s, &_t60); drop_Str(&_t60); });
-    #line 21426 "vuc.vu"
-    VU_AT(21426);
-    #line 21426 "vuc.vu"
-    ({ vu_str _t63 = vu_str_lit("  </html>\n", 10); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
-    #line 21427 "vuc.vu"
-    VU_AT(21427);
-    #line 21427 "vuc.vu"
-    ({ vu_str _t66 = vu_str_lit("  \"\"\"\n", 6); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 21428 "vuc.vu"
-    VU_AT(21428);
-    #line 21428 "vuc.vu"
-    ({ vu_str _t69 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
-    #line 21429 "vuc.vu"
-    VU_AT(21429);
-    #line 21429 "vuc.vu"
-    ({ vu_str _t72 = vu_str_lit("const FORM = \"\"\"\n", 17); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
-    #line 21430 "vuc.vu"
-    VU_AT(21430);
-    #line 21430 "vuc.vu"
-    ({ vu_str _t75 = vu_str_lit("  <form method=\"post\" action=\"/hello\">\n", 39); vu_str_cat(&v_s, &_t75); drop_Str(&_t75); });
-    #line 21431 "vuc.vu"
-    VU_AT(21431);
-    #line 21431 "vuc.vu"
-    ({ vu_str _t78 = vu_str_lit("  <label>Your name <input name=\"name\" autocomplete=\"given-name\" required></label>\n", 82); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
-    #line 21432 "vuc.vu"
-    VU_AT(21432);
-    #line 21432 "vuc.vu"
-    ({ vu_str _t81 = vu_str_lit("  <button>Say hello</button>\n", 29); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
-    #line 21433 "vuc.vu"
-    VU_AT(21433);
-    #line 21433 "vuc.vu"
-    ({ vu_str _t84 = vu_str_lit("  </form>\n", 10); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
-    #line 21434 "vuc.vu"
-    VU_AT(21434);
-    #line 21434 "vuc.vu"
-    ({ vu_str _t87 = vu_str_lit("  <p><a href=\"/hello/world\">/hello/world</a> &middot; <a href=\"/health\">/health</a></p>\n", 88); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
-    #line 21435 "vuc.vu"
-    VU_AT(21435);
-    #line 21435 "vuc.vu"
-    ({ vu_str _t90 = vu_str_lit("  \"\"\"\n", 6); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 21436 "vuc.vu"
     VU_AT(21436);
     #line 21436 "vuc.vu"
-    ({ vu_str _t93 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 21437 "vuc.vu"
     VU_AT(21437);
     #line 21437 "vuc.vu"
-    ({ vu_str _t96 = vu_str_lit("fn layout(title: Str, own body: web.Html) -> web.Html:\n", 55); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
+    ({ vu_str _t3 = vu_str_lit("# A web app on Vu's web module. Run it with `vu run main.vu` and open http://localhost:8080.\n", 93); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
     #line 21438 "vuc.vu"
     VU_AT(21438);
     #line 21438 "vuc.vu"
-    ({ vu_str _t99 = vu_str_lit("  return web.render(LAYOUT, [web.v(\"title\", title), web.h(\"body\", body)])\n", 74); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
+    ({ vu_str _t6 = vu_str_lit("# Routes are added in main; each handler gets the request and the context (route parameters, values\n", 100); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
     #line 21439 "vuc.vu"
     VU_AT(21439);
     #line 21439 "vuc.vu"
-    ({ vu_str _t102 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
+    ({ vu_str _t9 = vu_str_lit("# from middleware) and returns a response. Templates escape every value they insert.\n", 85); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
     #line 21440 "vuc.vu"
     VU_AT(21440);
     #line 21440 "vuc.vu"
-    ({ vu_str _t105 = vu_str_lit("fn home(req: http.Request, c: web.Ctx) -> http.Response:\n", 57); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
+    ({ vu_str _t12 = vu_str_lit("import http\n", 12); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
     #line 21441 "vuc.vu"
     VU_AT(21441);
     #line 21441 "vuc.vu"
-    ({ vu_str _t108 = vu_str_lit("  let name = web.get_cookie(req, \"name\") else \"\"\n", 49); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    ({ vu_str _t15 = vu_str_lit("import web\n", 11); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
     #line 21442 "vuc.vu"
     VU_AT(21442);
     #line 21442 "vuc.vu"
-    ({ vu_str _t111 = vu_str_lit("  var greeting = web.render(\"<h1>Hello.</h1>\", [])\n", 51); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
+    ({ vu_str _t18 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
     #line 21443 "vuc.vu"
     VU_AT(21443);
     #line 21443 "vuc.vu"
-    ({ vu_str _t114 = vu_str_lit("  if name != \"\": greeting = web.render(\"<h1>Welcome back, {{name}}.</h1>\", [web.v(\"name\", name)])\n", 98); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
+    ({ vu_str _t21 = vu_str_lit("# The page around every view: a template is text written into the program, so request data can\n", 95); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
     #line 21444 "vuc.vu"
     VU_AT(21444);
     #line 21444 "vuc.vu"
-    ({ vu_str _t117 = vu_str_lit("  let form = web.render(FORM, [])\n", 34); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
+    ({ vu_str _t24 = vu_str_lit("# only ever be a value, and every value is escaped unless it's web.Html.\n", 73); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
     #line 21445 "vuc.vu"
     VU_AT(21445);
     #line 21445 "vuc.vu"
-    ({ vu_str _t120 = vu_str_lit("  return web.html(200, layout(\"Hello\", web.join([greeting, form])))\n", 68); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
+    ({ vu_str _t27 = vu_str_lit("const LAYOUT = \"\"\"\n", 19); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
     #line 21446 "vuc.vu"
     VU_AT(21446);
     #line 21446 "vuc.vu"
-    ({ vu_str _t123 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
+    ({ vu_str _t30 = vu_str_lit("  <!doctype html>\n", 18); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
     #line 21447 "vuc.vu"
     VU_AT(21447);
     #line 21447 "vuc.vu"
-    ({ vu_str _t126 = vu_str_lit("# POST /hello: remember the name in a cookie, then show the page for it (303: the browser GETs it).\n", 100); vu_str_cat(&v_s, &_t126); drop_Str(&_t126); });
+    ({ vu_str _t33 = vu_str_lit("  <html lang=\"en\">\n", 19); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
     #line 21448 "vuc.vu"
     VU_AT(21448);
     #line 21448 "vuc.vu"
-    ({ vu_str _t129 = vu_str_lit("fn hello_post(req: http.Request, c: web.Ctx) -> http.Response:\n", 63); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
+    ({ vu_str _t36 = vu_str_lit("  <head>\n", 9); vu_str_cat(&v_s, &_t36); drop_Str(&_t36); });
     #line 21449 "vuc.vu"
     VU_AT(21449);
     #line 21449 "vuc.vu"
-    ({ vu_str _t132 = vu_str_lit("  let name = (web.field(req, \"name\") else \"\").strip()\n", 54); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
+    ({ vu_str _t39 = vu_str_lit("  <meta charset=\"utf-8\">\n", 25); vu_str_cat(&v_s, &_t39); drop_Str(&_t39); });
     #line 21450 "vuc.vu"
     VU_AT(21450);
     #line 21450 "vuc.vu"
-    ({ vu_str _t135 = vu_str_lit("  if name == \"\" or name.len > 100: return http.text(400, \"a name, please (at most 100 bytes)\")\n", 95); vu_str_cat(&v_s, &_t135); drop_Str(&_t135); });
+    ({ vu_str _t42 = vu_str_lit("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n", 71); vu_str_cat(&v_s, &_t42); drop_Str(&_t42); });
     #line 21451 "vuc.vu"
     VU_AT(21451);
     #line 21451 "vuc.vu"
-    ({ vu_str _t138 = vu_str_lit("  var resp = web.redirect(303, \"/hello/\" + encode(name))\n", 57); vu_str_cat(&v_s, &_t138); drop_Str(&_t138); });
+    ({ vu_str _t45 = vu_str_lit("  <title>{{title}}</title>\n", 27); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
     #line 21452 "vuc.vu"
     VU_AT(21452);
     #line 21452 "vuc.vu"
-    ({ vu_str _t141 = vu_str_lit("  web.set_cookie(&resp, web.cookie(\"name\", name))\n", 50); vu_str_cat(&v_s, &_t141); drop_Str(&_t141); });
+    ({ vu_str _t48 = vu_str_lit("  <link rel=\"stylesheet\" href=\"/static/style.css\">\n", 51); vu_str_cat(&v_s, &_t48); drop_Str(&_t48); });
     #line 21453 "vuc.vu"
     VU_AT(21453);
     #line 21453 "vuc.vu"
-    ({ vu_str _t144 = vu_str_lit("  return resp\n", 14); vu_str_cat(&v_s, &_t144); drop_Str(&_t144); });
+    ({ vu_str _t51 = vu_str_lit("  </head>\n", 10); vu_str_cat(&v_s, &_t51); drop_Str(&_t51); });
     #line 21454 "vuc.vu"
     VU_AT(21454);
     #line 21454 "vuc.vu"
-    ({ vu_str _t147 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t147); drop_Str(&_t147); });
+    ({ vu_str _t54 = vu_str_lit("  <body>\n", 9); vu_str_cat(&v_s, &_t54); drop_Str(&_t54); });
     #line 21455 "vuc.vu"
     VU_AT(21455);
     #line 21455 "vuc.vu"
-    ({ vu_str _t150 = vu_str_lit("fn hello(req: http.Request, c: web.Ctx) -> http.Response:\n", 58); vu_str_cat(&v_s, &_t150); drop_Str(&_t150); });
+    ({ vu_str _t57 = vu_str_lit("  <main>{{body}}</main>\n", 24); vu_str_cat(&v_s, &_t57); drop_Str(&_t57); });
     #line 21456 "vuc.vu"
     VU_AT(21456);
     #line 21456 "vuc.vu"
-    ({ vu_str _t153 = vu_str_lit("  let body = web.render(\"<h1>Hello, {{name}}!</h1><p><a href=\\\"/\\\">Back</a></p>\", [web.v(\"name\", web.param(c, \"name\"))])\n", 121); vu_str_cat(&v_s, &_t153); drop_Str(&_t153); });
+    ({ vu_str _t60 = vu_str_lit("  </body>\n", 10); vu_str_cat(&v_s, &_t60); drop_Str(&_t60); });
     #line 21457 "vuc.vu"
     VU_AT(21457);
     #line 21457 "vuc.vu"
-    ({ vu_str _t156 = vu_str_lit("  return web.html(200, layout(\"Hello\", body))\n", 46); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
+    ({ vu_str _t63 = vu_str_lit("  </html>\n", 10); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
     #line 21458 "vuc.vu"
     VU_AT(21458);
     #line 21458 "vuc.vu"
-    ({ vu_str _t159 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
+    ({ vu_str _t66 = vu_str_lit("  \"\"\"\n", 6); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
     #line 21459 "vuc.vu"
     VU_AT(21459);
     #line 21459 "vuc.vu"
-    ({ vu_str _t162 = vu_str_lit("fn health(req: http.Request, c: web.Ctx) -> http.Response:\n", 59); vu_str_cat(&v_s, &_t162); drop_Str(&_t162); });
+    ({ vu_str _t69 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
     #line 21460 "vuc.vu"
     VU_AT(21460);
     #line 21460 "vuc.vu"
-    ({ vu_str _t165 = vu_str_lit("  return http.json(200, \"{{\\\"ok\\\": true}}\")\n", 44); vu_str_cat(&v_s, &_t165); drop_Str(&_t165); });
+    ({ vu_str _t72 = vu_str_lit("const FORM = \"\"\"\n", 17); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
     #line 21461 "vuc.vu"
     VU_AT(21461);
     #line 21461 "vuc.vu"
-    ({ vu_str _t168 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t168); drop_Str(&_t168); });
+    ({ vu_str _t75 = vu_str_lit("  <form method=\"post\" action=\"/hello\">\n", 39); vu_str_cat(&v_s, &_t75); drop_Str(&_t75); });
     #line 21462 "vuc.vu"
     VU_AT(21462);
     #line 21462 "vuc.vu"
-    ({ vu_str _t171 = vu_str_lit("# Percent-encodes text for one part of a URL path.\n", 51); vu_str_cat(&v_s, &_t171); drop_Str(&_t171); });
+    ({ vu_str _t78 = vu_str_lit("  <label>Your name <input name=\"name\" autocomplete=\"given-name\" required></label>\n", 82); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
     #line 21463 "vuc.vu"
     VU_AT(21463);
     #line 21463 "vuc.vu"
-    ({ vu_str _t174 = vu_str_lit("fn encode(s: Str) -> Str:\n", 26); vu_str_cat(&v_s, &_t174); drop_Str(&_t174); });
+    ({ vu_str _t81 = vu_str_lit("  <button>Say hello</button>\n", 29); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
     #line 21464 "vuc.vu"
     VU_AT(21464);
     #line 21464 "vuc.vu"
-    ({ vu_str _t177 = vu_str_lit("  let hex = \"0123456789ABCDEF\"\n", 31); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
+    ({ vu_str _t84 = vu_str_lit("  </form>\n", 10); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
     #line 21465 "vuc.vu"
     VU_AT(21465);
     #line 21465 "vuc.vu"
-    ({ vu_str _t180 = vu_str_lit("  var out = \"\"\n", 15); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
+    ({ vu_str _t87 = vu_str_lit("  <p><a href=\"/hello/world\">/hello/world</a> &middot; <a href=\"/health\">/health</a></p>\n", 88); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
     #line 21466 "vuc.vu"
     VU_AT(21466);
     #line 21466 "vuc.vu"
-    ({ vu_str _t183 = vu_str_lit("  for i in 0..s.len:\n", 21); vu_str_cat(&v_s, &_t183); drop_Str(&_t183); });
+    ({ vu_str _t90 = vu_str_lit("  \"\"\"\n", 6); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 21467 "vuc.vu"
     VU_AT(21467);
     #line 21467 "vuc.vu"
-    ({ vu_str _t186 = vu_str_lit("    let b = s[i]\n", 17); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
+    ({ vu_str _t93 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
     #line 21468 "vuc.vu"
     VU_AT(21468);
     #line 21468 "vuc.vu"
-    ({ vu_str _t189 = vu_str_lit("    if (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '-' or b == '_' or b == '.' or b == '~':\n", 134); vu_str_cat(&v_s, &_t189); drop_Str(&_t189); });
+    ({ vu_str _t96 = vu_str_lit("fn layout(title: Str, own body: web.Html) -> web.Html:\n", 55); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
     #line 21469 "vuc.vu"
     VU_AT(21469);
     #line 21469 "vuc.vu"
-    ({ vu_str _t192 = vu_str_lit("      out += str([b])\n", 22); vu_str_cat(&v_s, &_t192); drop_Str(&_t192); });
+    ({ vu_str _t99 = vu_str_lit("  return web.render(LAYOUT, [web.v(\"title\", title), web.h(\"body\", body)])\n", 74); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
     #line 21470 "vuc.vu"
     VU_AT(21470);
     #line 21470 "vuc.vu"
-    ({ vu_str _t195 = vu_str_lit("    else:\n", 10); vu_str_cat(&v_s, &_t195); drop_Str(&_t195); });
+    ({ vu_str _t102 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
     #line 21471 "vuc.vu"
     VU_AT(21471);
     #line 21471 "vuc.vu"
-    ({ vu_str _t198 = vu_str_lit("      out += \"%\" + str([hex[int(b) >> 4], hex[int(b) & 15]])\n", 61); vu_str_cat(&v_s, &_t198); drop_Str(&_t198); });
+    ({ vu_str _t105 = vu_str_lit("fn home(req: http.Request, c: web.Ctx) -> http.Response:\n", 57); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 21472 "vuc.vu"
     VU_AT(21472);
     #line 21472 "vuc.vu"
-    ({ vu_str _t201 = vu_str_lit("  return out\n", 13); vu_str_cat(&v_s, &_t201); drop_Str(&_t201); });
+    ({ vu_str _t108 = vu_str_lit("  let name = web.get_cookie(req, \"name\") else \"\"\n", 49); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
     #line 21473 "vuc.vu"
     VU_AT(21473);
     #line 21473 "vuc.vu"
-    ({ vu_str _t204 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t204); drop_Str(&_t204); });
+    ({ vu_str _t111 = vu_str_lit("  var greeting = web.render(\"<h1>Hello.</h1>\", [])\n", 51); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
     #line 21474 "vuc.vu"
     VU_AT(21474);
     #line 21474 "vuc.vu"
-    ({ vu_str _t207 = vu_str_lit("fn main(net: Net, os: Os, fs: Fs) throws:\n", 42); vu_str_cat(&v_s, &_t207); drop_Str(&_t207); });
+    ({ vu_str _t114 = vu_str_lit("  if name != \"\": greeting = web.render(\"<h1>Welcome back, {{name}}.</h1>\", [web.v(\"name\", name)])\n", 98); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
     #line 21475 "vuc.vu"
     VU_AT(21475);
     #line 21475 "vuc.vu"
-    ({ vu_str _t210 = vu_str_lit("  let port = int(os.env(\"PORT\")) else 8080\n", 43); vu_str_cat(&v_s, &_t210); drop_Str(&_t210); });
+    ({ vu_str _t117 = vu_str_lit("  let form = web.render(FORM, [])\n", 34); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
     #line 21476 "vuc.vu"
     VU_AT(21476);
     #line 21476 "vuc.vu"
-    ({ vu_str _t213 = vu_str_lit("  var app = web.app()\n", 22); vu_str_cat(&v_s, &_t213); drop_Str(&_t213); });
+    ({ vu_str _t120 = vu_str_lit("  return web.html(200, layout(\"Hello\", web.join([greeting, form])))\n", 68); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
     #line 21477 "vuc.vu"
     VU_AT(21477);
     #line 21477 "vuc.vu"
-    ({ vu_str _t216 = vu_str_lit("  web.use(&app, web.logger(os))\n", 32); vu_str_cat(&v_s, &_t216); drop_Str(&_t216); });
+    ({ vu_str _t123 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
     #line 21478 "vuc.vu"
     VU_AT(21478);
     #line 21478 "vuc.vu"
-    ({ vu_str _t219 = vu_str_lit("  web.use(&app, web.same_origin)\n", 33); vu_str_cat(&v_s, &_t219); drop_Str(&_t219); });
+    ({ vu_str _t126 = vu_str_lit("# POST /hello: remember the name in a cookie, then show the page for it (303: the browser GETs it).\n", 100); vu_str_cat(&v_s, &_t126); drop_Str(&_t126); });
     #line 21479 "vuc.vu"
     VU_AT(21479);
     #line 21479 "vuc.vu"
-    ({ vu_str _t222 = vu_str_lit("  web.get(&app, \"/\", home)\n", 27); vu_str_cat(&v_s, &_t222); drop_Str(&_t222); });
+    ({ vu_str _t129 = vu_str_lit("fn hello_post(req: http.Request, c: web.Ctx) -> http.Response:\n", 63); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
     #line 21480 "vuc.vu"
     VU_AT(21480);
     #line 21480 "vuc.vu"
-    ({ vu_str _t225 = vu_str_lit("  web.post(&app, \"/hello\", hello_post)\n", 39); vu_str_cat(&v_s, &_t225); drop_Str(&_t225); });
+    ({ vu_str _t132 = vu_str_lit("  let name = (web.field(req, \"name\") else \"\").strip()\n", 54); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
     #line 21481 "vuc.vu"
     VU_AT(21481);
     #line 21481 "vuc.vu"
-    ({ vu_str _t228 = vu_str_lit("  web.get(&app, \"/hello/:name\", hello)\n", 39); vu_str_cat(&v_s, &_t228); drop_Str(&_t228); });
+    ({ vu_str _t135 = vu_str_lit("  if name == \"\" or name.len > 100: return http.text(400, \"a name, please (at most 100 bytes)\")\n", 95); vu_str_cat(&v_s, &_t135); drop_Str(&_t135); });
     #line 21482 "vuc.vu"
     VU_AT(21482);
     #line 21482 "vuc.vu"
-    ({ vu_str _t231 = vu_str_lit("  web.get(&app, \"/health\", health)\n", 35); vu_str_cat(&v_s, &_t231); drop_Str(&_t231); });
+    ({ vu_str _t138 = vu_str_lit("  var resp = web.redirect(303, \"/hello/\" + encode(name))\n", 57); vu_str_cat(&v_s, &_t138); drop_Str(&_t138); });
     #line 21483 "vuc.vu"
     VU_AT(21483);
     #line 21483 "vuc.vu"
-    ({ vu_str _t234 = vu_str_lit("  web.get(&app, \"/static/*file\", web.files(fs, \"public\"))\n", 58); vu_str_cat(&v_s, &_t234); drop_Str(&_t234); });
+    ({ vu_str _t141 = vu_str_lit("  web.set_cookie(&resp, web.cookie(\"name\", name))\n", 50); vu_str_cat(&v_s, &_t141); drop_Str(&_t141); });
     #line 21484 "vuc.vu"
     VU_AT(21484);
     #line 21484 "vuc.vu"
-    ({ vu_str _t237 = vu_str_lit("  print(\"listening on http://localhost:{port}\")\n", 48); vu_str_cat(&v_s, &_t237); drop_Str(&_t237); });
+    ({ vu_str _t144 = vu_str_lit("  return resp\n", 14); vu_str_cat(&v_s, &_t144); drop_Str(&_t144); });
     #line 21485 "vuc.vu"
     VU_AT(21485);
     #line 21485 "vuc.vu"
-    ({ vu_str _t240 = vu_str_lit("  web.serve(net, os, app, port)?\n", 33); vu_str_cat(&v_s, &_t240); drop_Str(&_t240); });
+    ({ vu_str _t147 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t147); drop_Str(&_t147); });
     #line 21486 "vuc.vu"
     VU_AT(21486);
     #line 21486 "vuc.vu"
+    ({ vu_str _t150 = vu_str_lit("fn hello(req: http.Request, c: web.Ctx) -> http.Response:\n", 58); vu_str_cat(&v_s, &_t150); drop_Str(&_t150); });
+    #line 21487 "vuc.vu"
+    VU_AT(21487);
+    #line 21487 "vuc.vu"
+    ({ vu_str _t153 = vu_str_lit("  let body = web.render(\"<h1>Hello, {{name}}!</h1><p><a href=\\\"/\\\">Back</a></p>\", [web.v(\"name\", web.param(c, \"name\"))])\n", 121); vu_str_cat(&v_s, &_t153); drop_Str(&_t153); });
+    #line 21488 "vuc.vu"
+    VU_AT(21488);
+    #line 21488 "vuc.vu"
+    ({ vu_str _t156 = vu_str_lit("  return web.html(200, layout(\"Hello\", body))\n", 46); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
+    #line 21489 "vuc.vu"
+    VU_AT(21489);
+    #line 21489 "vuc.vu"
+    ({ vu_str _t159 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
+    #line 21490 "vuc.vu"
+    VU_AT(21490);
+    #line 21490 "vuc.vu"
+    ({ vu_str _t162 = vu_str_lit("fn health(req: http.Request, c: web.Ctx) -> http.Response:\n", 59); vu_str_cat(&v_s, &_t162); drop_Str(&_t162); });
+    #line 21491 "vuc.vu"
+    VU_AT(21491);
+    #line 21491 "vuc.vu"
+    ({ vu_str _t165 = vu_str_lit("  return http.json(200, \"{{\\\"ok\\\": true}}\")\n", 44); vu_str_cat(&v_s, &_t165); drop_Str(&_t165); });
+    #line 21492 "vuc.vu"
+    VU_AT(21492);
+    #line 21492 "vuc.vu"
+    ({ vu_str _t168 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t168); drop_Str(&_t168); });
+    #line 21493 "vuc.vu"
+    VU_AT(21493);
+    #line 21493 "vuc.vu"
+    ({ vu_str _t171 = vu_str_lit("# Percent-encodes text for one part of a URL path.\n", 51); vu_str_cat(&v_s, &_t171); drop_Str(&_t171); });
+    #line 21494 "vuc.vu"
+    VU_AT(21494);
+    #line 21494 "vuc.vu"
+    ({ vu_str _t174 = vu_str_lit("fn encode(s: Str) -> Str:\n", 26); vu_str_cat(&v_s, &_t174); drop_Str(&_t174); });
+    #line 21495 "vuc.vu"
+    VU_AT(21495);
+    #line 21495 "vuc.vu"
+    ({ vu_str _t177 = vu_str_lit("  let hex = \"0123456789ABCDEF\"\n", 31); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
+    #line 21496 "vuc.vu"
+    VU_AT(21496);
+    #line 21496 "vuc.vu"
+    ({ vu_str _t180 = vu_str_lit("  var out = \"\"\n", 15); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
+    #line 21497 "vuc.vu"
+    VU_AT(21497);
+    #line 21497 "vuc.vu"
+    ({ vu_str _t183 = vu_str_lit("  for i in 0..s.len:\n", 21); vu_str_cat(&v_s, &_t183); drop_Str(&_t183); });
+    #line 21498 "vuc.vu"
+    VU_AT(21498);
+    #line 21498 "vuc.vu"
+    ({ vu_str _t186 = vu_str_lit("    let b = s[i]\n", 17); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
+    #line 21499 "vuc.vu"
+    VU_AT(21499);
+    #line 21499 "vuc.vu"
+    ({ vu_str _t189 = vu_str_lit("    if (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '-' or b == '_' or b == '.' or b == '~':\n", 134); vu_str_cat(&v_s, &_t189); drop_Str(&_t189); });
+    #line 21500 "vuc.vu"
+    VU_AT(21500);
+    #line 21500 "vuc.vu"
+    ({ vu_str _t192 = vu_str_lit("      out += str([b])\n", 22); vu_str_cat(&v_s, &_t192); drop_Str(&_t192); });
+    #line 21501 "vuc.vu"
+    VU_AT(21501);
+    #line 21501 "vuc.vu"
+    ({ vu_str _t195 = vu_str_lit("    else:\n", 10); vu_str_cat(&v_s, &_t195); drop_Str(&_t195); });
+    #line 21502 "vuc.vu"
+    VU_AT(21502);
+    #line 21502 "vuc.vu"
+    ({ vu_str _t198 = vu_str_lit("      out += \"%\" + str([hex[int(b) >> 4], hex[int(b) & 15]])\n", 61); vu_str_cat(&v_s, &_t198); drop_Str(&_t198); });
+    #line 21503 "vuc.vu"
+    VU_AT(21503);
+    #line 21503 "vuc.vu"
+    ({ vu_str _t201 = vu_str_lit("  return out\n", 13); vu_str_cat(&v_s, &_t201); drop_Str(&_t201); });
+    #line 21504 "vuc.vu"
+    VU_AT(21504);
+    #line 21504 "vuc.vu"
+    ({ vu_str _t204 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t204); drop_Str(&_t204); });
+    #line 21505 "vuc.vu"
+    VU_AT(21505);
+    #line 21505 "vuc.vu"
+    ({ vu_str _t207 = vu_str_lit("fn main(net: Net, os: Os, fs: Fs) throws:\n", 42); vu_str_cat(&v_s, &_t207); drop_Str(&_t207); });
+    #line 21506 "vuc.vu"
+    VU_AT(21506);
+    #line 21506 "vuc.vu"
+    ({ vu_str _t210 = vu_str_lit("  let port = int(os.env(\"PORT\")) else 8080\n", 43); vu_str_cat(&v_s, &_t210); drop_Str(&_t210); });
+    #line 21507 "vuc.vu"
+    VU_AT(21507);
+    #line 21507 "vuc.vu"
+    ({ vu_str _t213 = vu_str_lit("  var app = web.app()\n", 22); vu_str_cat(&v_s, &_t213); drop_Str(&_t213); });
+    #line 21508 "vuc.vu"
+    VU_AT(21508);
+    #line 21508 "vuc.vu"
+    ({ vu_str _t216 = vu_str_lit("  web.use(&app, web.logger(os))\n", 32); vu_str_cat(&v_s, &_t216); drop_Str(&_t216); });
+    #line 21509 "vuc.vu"
+    VU_AT(21509);
+    #line 21509 "vuc.vu"
+    ({ vu_str _t219 = vu_str_lit("  web.use(&app, web.same_origin)\n", 33); vu_str_cat(&v_s, &_t219); drop_Str(&_t219); });
+    #line 21510 "vuc.vu"
+    VU_AT(21510);
+    #line 21510 "vuc.vu"
+    ({ vu_str _t222 = vu_str_lit("  web.get(&app, \"/\", home)\n", 27); vu_str_cat(&v_s, &_t222); drop_Str(&_t222); });
+    #line 21511 "vuc.vu"
+    VU_AT(21511);
+    #line 21511 "vuc.vu"
+    ({ vu_str _t225 = vu_str_lit("  web.post(&app, \"/hello\", hello_post)\n", 39); vu_str_cat(&v_s, &_t225); drop_Str(&_t225); });
+    #line 21512 "vuc.vu"
+    VU_AT(21512);
+    #line 21512 "vuc.vu"
+    ({ vu_str _t228 = vu_str_lit("  web.get(&app, \"/hello/:name\", hello)\n", 39); vu_str_cat(&v_s, &_t228); drop_Str(&_t228); });
+    #line 21513 "vuc.vu"
+    VU_AT(21513);
+    #line 21513 "vuc.vu"
+    ({ vu_str _t231 = vu_str_lit("  web.get(&app, \"/health\", health)\n", 35); vu_str_cat(&v_s, &_t231); drop_Str(&_t231); });
+    #line 21514 "vuc.vu"
+    VU_AT(21514);
+    #line 21514 "vuc.vu"
+    ({ vu_str _t234 = vu_str_lit("  web.get(&app, \"/static/*file\", web.files(fs, \"public\"))\n", 58); vu_str_cat(&v_s, &_t234); drop_Str(&_t234); });
+    #line 21515 "vuc.vu"
+    VU_AT(21515);
+    #line 21515 "vuc.vu"
+    ({ vu_str _t237 = vu_str_lit("  print(\"listening on http://localhost:{port}\")\n", 48); vu_str_cat(&v_s, &_t237); drop_Str(&_t237); });
+    #line 21516 "vuc.vu"
+    VU_AT(21516);
+    #line 21516 "vuc.vu"
+    ({ vu_str _t240 = vu_str_lit("  web.serve(net, os, app, port)?\n", 33); vu_str_cat(&v_s, &_t240); drop_Str(&_t240); });
+    #line 21517 "vuc.vu"
+    VU_AT(21517);
+    #line 21517 "vuc.vu"
     {
-        #line 21486 "vuc.vu"
+        #line 21517 "vuc.vu"
         vu_str _t241 = VU_MV(v_s);
-        #line 21486 "vuc.vu"
+        #line 21517 "vuc.vu"
         return _t241;
-    #line 21486 "vuc.vu"
+    #line 21517 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_new_web_css(void) {
-    #line 21488 "vuc.vu"
+    #line 21519 "vuc.vu"
     VU_ENTER("new_web_css");
-    #line 21489 "vuc.vu"
-    VU_AT(21489);
-    #line 21489 "vuc.vu"
+    #line 21520 "vuc.vu"
+    VU_AT(21520);
+    #line 21520 "vuc.vu"
     vu_str v_s = vu_str_lit("", 0);
-    #line 21490 "vuc.vu"
-    VU_AT(21490);
-    #line 21490 "vuc.vu"
+    #line 21521 "vuc.vu"
+    VU_AT(21521);
+    #line 21521 "vuc.vu"
     ({ vu_str _t3 = vu_str_lit(":root { color-scheme: light dark; --fg: #1d1c1a; --bg: #faf8f3; --dim: #6b675e; --accent: #9a6b1f; }\n", 101); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
-    #line 21491 "vuc.vu"
-    VU_AT(21491);
-    #line 21491 "vuc.vu"
+    #line 21522 "vuc.vu"
+    VU_AT(21522);
+    #line 21522 "vuc.vu"
     ({ vu_str _t6 = vu_str_lit("@media (prefers-color-scheme: dark) { :root { --fg: #ece8dd; --bg: #0b0b0a; --dim: #9c9586; --accent: #e3bf86; } }\n", 115); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
-    #line 21492 "vuc.vu"
-    VU_AT(21492);
-    #line 21492 "vuc.vu"
+    #line 21523 "vuc.vu"
+    VU_AT(21523);
+    #line 21523 "vuc.vu"
     ({ vu_str _t9 = vu_str_lit("body { margin: 0; background: var(--bg); color: var(--fg); font: 18px/1.6 Georgia, serif; }\n", 92); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
-    #line 21493 "vuc.vu"
-    VU_AT(21493);
-    #line 21493 "vuc.vu"
+    #line 21524 "vuc.vu"
+    VU_AT(21524);
+    #line 21524 "vuc.vu"
     ({ vu_str _t12 = vu_str_lit("main { max-width: 40rem; margin: 0 auto; padding: 4rem 1.25rem; }\n", 66); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
-    #line 21494 "vuc.vu"
-    VU_AT(21494);
-    #line 21494 "vuc.vu"
+    #line 21525 "vuc.vu"
+    VU_AT(21525);
+    #line 21525 "vuc.vu"
     ({ vu_str _t15 = vu_str_lit("h1 { font-weight: 400; font-size: 2.6rem; line-height: 1.1; margin: 0 0 2rem; }\n", 80); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
-    #line 21495 "vuc.vu"
-    VU_AT(21495);
-    #line 21495 "vuc.vu"
+    #line 21526 "vuc.vu"
+    VU_AT(21526);
+    #line 21526 "vuc.vu"
     ({ vu_str _t18 = vu_str_lit("a { color: var(--accent); }\n", 28); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
-    #line 21496 "vuc.vu"
-    VU_AT(21496);
-    #line 21496 "vuc.vu"
+    #line 21527 "vuc.vu"
+    VU_AT(21527);
+    #line 21527 "vuc.vu"
     ({ vu_str _t21 = vu_str_lit("p { color: var(--dim); }\n", 25); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
-    #line 21497 "vuc.vu"
-    VU_AT(21497);
-    #line 21497 "vuc.vu"
+    #line 21528 "vuc.vu"
+    VU_AT(21528);
+    #line 21528 "vuc.vu"
     ({ vu_str _t24 = vu_str_lit("label { display: block; margin-bottom: 0.75rem; }\n", 50); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
-    #line 21498 "vuc.vu"
-    VU_AT(21498);
-    #line 21498 "vuc.vu"
+    #line 21529 "vuc.vu"
+    VU_AT(21529);
+    #line 21529 "vuc.vu"
     ({ vu_str _t27 = vu_str_lit("input, button { font: inherit; padding: 0.5rem 0.75rem; border: 1px solid var(--dim); border-radius: 3px; background: transparent; color: inherit; }\n", 149); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
-    #line 21499 "vuc.vu"
-    VU_AT(21499);
-    #line 21499 "vuc.vu"
+    #line 21530 "vuc.vu"
+    VU_AT(21530);
+    #line 21530 "vuc.vu"
     ({ vu_str _t30 = vu_str_lit("input { display: block; width: 100%; box-sizing: border-box; margin-top: 0.4rem; }\n", 83); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
-    #line 21500 "vuc.vu"
-    VU_AT(21500);
-    #line 21500 "vuc.vu"
+    #line 21531 "vuc.vu"
+    VU_AT(21531);
+    #line 21531 "vuc.vu"
     ({ vu_str _t33 = vu_str_lit("button { cursor: pointer; border-color: var(--accent); color: var(--accent); }\n", 79); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
-    #line 21501 "vuc.vu"
-    VU_AT(21501);
-    #line 21501 "vuc.vu"
+    #line 21532 "vuc.vu"
+    VU_AT(21532);
+    #line 21532 "vuc.vu"
     {
-        #line 21501 "vuc.vu"
+        #line 21532 "vuc.vu"
         vu_str _t34 = VU_MV(v_s);
-        #line 21501 "vuc.vu"
+        #line 21532 "vuc.vu"
         return _t34;
-    #line 21501 "vuc.vu"
+    #line 21532 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_new_web_dockerfile(vu_str *restrict v_name) {
-    #line 21503 "vuc.vu"
+    #line 21534 "vuc.vu"
     VU_ENTER("new_web_dockerfile");
-    #line 21504 "vuc.vu"
-    VU_AT(21504);
-    #line 21504 "vuc.vu"
+    #line 21535 "vuc.vu"
+    VU_AT(21535);
+    #line 21535 "vuc.vu"
     vu_str v_s = vu_str_lit("", 0);
-    #line 21505 "vuc.vu"
-    VU_AT(21505);
-    #line 21505 "vuc.vu"
+    #line 21536 "vuc.vu"
+    VU_AT(21536);
+    #line 21536 "vuc.vu"
     ({ vu_str _t3 = vu_str_lit("# Builds the app with the Vu compiler, then copies the binary and public/ into a small image.\n", 94); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
-    #line 21506 "vuc.vu"
-    VU_AT(21506);
-    #line 21506 "vuc.vu"
+    #line 21537 "vuc.vu"
+    VU_AT(21537);
+    #line 21537 "vuc.vu"
     ({ vu_str _t9 = ({ vu_str _t6 = {0}; vu_str_cat_bytes(&_t6, (const uint8_t *)"#   docker build -t ", 20); ({ vu_str *_t7 = &(*v_name); vu_str_cat(&_t6, &(*_t7)); }); vu_str_cat_bytes(&_t6, (const uint8_t *)" . && docker run -p 8080:8080 ", 30); ({ vu_str *_t8 = &(*v_name); vu_str_cat(&_t6, &(*_t8)); }); vu_str_cat_bytes(&_t6, (const uint8_t *)"\n", 1); _t6; }); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
-    #line 21507 "vuc.vu"
-    VU_AT(21507);
-    #line 21507 "vuc.vu"
+    #line 21538 "vuc.vu"
+    VU_AT(21538);
+    #line 21538 "vuc.vu"
     ({ vu_str _t12 = vu_str_lit("FROM gcc:14 AS build\n", 21); vu_str_cat(&v_s, &_t12); drop_Str(&_t12); });
-    #line 21508 "vuc.vu"
-    VU_AT(21508);
-    #line 21508 "vuc.vu"
+    #line 21539 "vuc.vu"
+    VU_AT(21539);
+    #line 21539 "vuc.vu"
     ({ vu_str _t15 = vu_str_lit("ARG VU_REF=main\n", 16); vu_str_cat(&v_s, &_t15); drop_Str(&_t15); });
-    #line 21509 "vuc.vu"
-    VU_AT(21509);
-    #line 21509 "vuc.vu"
+    #line 21540 "vuc.vu"
+    VU_AT(21540);
+    #line 21540 "vuc.vu"
     ({ vu_str _t18 = vu_str_lit("RUN git clone --depth 1 --branch \"$VU_REF\" https://github.com/vu0tran/vu /vu && /vu/vu check /vu/examples/json.vu\n", 114); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
-    #line 21510 "vuc.vu"
-    VU_AT(21510);
-    #line 21510 "vuc.vu"
+    #line 21541 "vuc.vu"
+    VU_AT(21541);
+    #line 21541 "vuc.vu"
     ({ vu_str _t21 = vu_str_lit("WORKDIR /app\n", 13); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
-    #line 21511 "vuc.vu"
-    VU_AT(21511);
-    #line 21511 "vuc.vu"
+    #line 21542 "vuc.vu"
+    VU_AT(21542);
+    #line 21542 "vuc.vu"
     ({ vu_str _t24 = vu_str_lit("COPY . .\n", 9); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
-    #line 21512 "vuc.vu"
-    VU_AT(21512);
-    #line 21512 "vuc.vu"
+    #line 21543 "vuc.vu"
+    VU_AT(21543);
+    #line 21543 "vuc.vu"
     ({ vu_str _t27 = vu_str_lit("# optimize for a CPU every cloud machine has, not the one that builds the image\n", 80); vu_str_cat(&v_s, &_t27); drop_Str(&_t27); });
-    #line 21513 "vuc.vu"
-    VU_AT(21513);
-    #line 21513 "vuc.vu"
+    #line 21544 "vuc.vu"
+    VU_AT(21544);
+    #line 21544 "vuc.vu"
     ({ vu_str _t30 = vu_str_lit("ARG TARGETARCH\n", 15); vu_str_cat(&v_s, &_t30); drop_Str(&_t30); });
-    #line 21514 "vuc.vu"
-    VU_AT(21514);
-    #line 21514 "vuc.vu"
+    #line 21545 "vuc.vu"
+    VU_AT(21545);
+    #line 21545 "vuc.vu"
     ({ vu_str _t33 = vu_str_lit("RUN if [ \"$TARGETARCH\" = \"arm64\" ]; then march=armv8.2-a; else march=x86-64-v2; fi && \\\n", 88); vu_str_cat(&v_s, &_t33); drop_Str(&_t33); });
-    #line 21515 "vuc.vu"
-    VU_AT(21515);
-    #line 21515 "vuc.vu"
+    #line 21546 "vuc.vu"
+    VU_AT(21546);
+    #line 21546 "vuc.vu"
     ({ vu_str _t36 = vu_str_lit("    VU_MARCH=$march /vu/vu build main.vu -o app\n", 48); vu_str_cat(&v_s, &_t36); drop_Str(&_t36); });
-    #line 21516 "vuc.vu"
-    VU_AT(21516);
-    #line 21516 "vuc.vu"
+    #line 21547 "vuc.vu"
+    VU_AT(21547);
+    #line 21547 "vuc.vu"
     ({ vu_str _t39 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t39); drop_Str(&_t39); });
-    #line 21517 "vuc.vu"
-    VU_AT(21517);
-    #line 21517 "vuc.vu"
+    #line 21548 "vuc.vu"
+    VU_AT(21548);
+    #line 21548 "vuc.vu"
     ({ vu_str _t42 = vu_str_lit("FROM debian:bookworm-slim\n", 26); vu_str_cat(&v_s, &_t42); drop_Str(&_t42); });
-    #line 21518 "vuc.vu"
-    VU_AT(21518);
-    #line 21518 "vuc.vu"
+    #line 21549 "vuc.vu"
+    VU_AT(21549);
+    #line 21549 "vuc.vu"
     ({ vu_str _t45 = vu_str_lit("RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 && rm -rf /var/lib/apt/lists/* && \\\n", 125); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
-    #line 21519 "vuc.vu"
-    VU_AT(21519);
-    #line 21519 "vuc.vu"
+    #line 21550 "vuc.vu"
+    VU_AT(21550);
+    #line 21550 "vuc.vu"
     ({ vu_str _t48 = vu_str_lit("    useradd --system --no-create-home app\n", 42); vu_str_cat(&v_s, &_t48); drop_Str(&_t48); });
-    #line 21520 "vuc.vu"
-    VU_AT(21520);
-    #line 21520 "vuc.vu"
+    #line 21551 "vuc.vu"
+    VU_AT(21551);
+    #line 21551 "vuc.vu"
     ({ vu_str _t51 = vu_str_lit("WORKDIR /app\n", 13); vu_str_cat(&v_s, &_t51); drop_Str(&_t51); });
-    #line 21521 "vuc.vu"
-    VU_AT(21521);
-    #line 21521 "vuc.vu"
+    #line 21552 "vuc.vu"
+    VU_AT(21552);
+    #line 21552 "vuc.vu"
     ({ vu_str _t54 = vu_str_lit("COPY --from=build /app/app ./app\n", 33); vu_str_cat(&v_s, &_t54); drop_Str(&_t54); });
-    #line 21522 "vuc.vu"
-    VU_AT(21522);
-    #line 21522 "vuc.vu"
+    #line 21553 "vuc.vu"
+    VU_AT(21553);
+    #line 21553 "vuc.vu"
     ({ vu_str _t57 = vu_str_lit("COPY public ./public\n", 21); vu_str_cat(&v_s, &_t57); drop_Str(&_t57); });
-    #line 21523 "vuc.vu"
-    VU_AT(21523);
-    #line 21523 "vuc.vu"
+    #line 21554 "vuc.vu"
+    VU_AT(21554);
+    #line 21554 "vuc.vu"
     ({ vu_str _t60 = vu_str_lit("USER app\n", 9); vu_str_cat(&v_s, &_t60); drop_Str(&_t60); });
-    #line 21524 "vuc.vu"
-    VU_AT(21524);
-    #line 21524 "vuc.vu"
+    #line 21555 "vuc.vu"
+    VU_AT(21555);
+    #line 21555 "vuc.vu"
     ({ vu_str _t63 = vu_str_lit("ENV PORT=8080\n", 14); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
-    #line 21525 "vuc.vu"
-    VU_AT(21525);
-    #line 21525 "vuc.vu"
+    #line 21556 "vuc.vu"
+    VU_AT(21556);
+    #line 21556 "vuc.vu"
     ({ vu_str _t66 = vu_str_lit("EXPOSE 8080\n", 12); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 21526 "vuc.vu"
-    VU_AT(21526);
-    #line 21526 "vuc.vu"
+    #line 21557 "vuc.vu"
+    VU_AT(21557);
+    #line 21557 "vuc.vu"
     ({ vu_str _t69 = vu_str_lit("CMD [\"./app\"]\n", 14); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
-    #line 21527 "vuc.vu"
-    VU_AT(21527);
-    #line 21527 "vuc.vu"
+    #line 21558 "vuc.vu"
+    VU_AT(21558);
+    #line 21558 "vuc.vu"
     {
-        #line 21527 "vuc.vu"
+        #line 21558 "vuc.vu"
         vu_str _t70 = VU_MV(v_s);
-        #line 21527 "vuc.vu"
+        #line 21558 "vuc.vu"
         return _t70;
-    #line 21527 "vuc.vu"
+    #line 21558 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_new_web_dockerignore(void) {
-    #line 21529 "vuc.vu"
+    #line 21560 "vuc.vu"
     VU_ENTER("new_web_dockerignore");
-    #line 21530 "vuc.vu"
-    VU_AT(21530);
-    #line 21530 "vuc.vu"
+    #line 21561 "vuc.vu"
+    VU_AT(21561);
+    #line 21561 "vuc.vu"
     vu_str v_s = vu_str_lit("", 0);
-    #line 21531 "vuc.vu"
-    VU_AT(21531);
-    #line 21531 "vuc.vu"
+    #line 21562 "vuc.vu"
+    VU_AT(21562);
+    #line 21562 "vuc.vu"
     ({ vu_str _t3 = vu_str_lit("app\n", 4); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
-    #line 21532 "vuc.vu"
-    VU_AT(21532);
-    #line 21532 "vuc.vu"
+    #line 21563 "vuc.vu"
+    VU_AT(21563);
+    #line 21563 "vuc.vu"
     ({ vu_str _t6 = vu_str_lit(".git\n", 5); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
-    #line 21533 "vuc.vu"
-    VU_AT(21533);
-    #line 21533 "vuc.vu"
+    #line 21564 "vuc.vu"
+    VU_AT(21564);
+    #line 21564 "vuc.vu"
     ({ vu_str _t9 = vu_str_lit("*.c\n", 4); vu_str_cat(&v_s, &_t9); drop_Str(&_t9); });
-    #line 21534 "vuc.vu"
-    VU_AT(21534);
-    #line 21534 "vuc.vu"
+    #line 21565 "vuc.vu"
+    VU_AT(21565);
+    #line 21565 "vuc.vu"
     {
-        #line 21534 "vuc.vu"
+        #line 21565 "vuc.vu"
         vu_str _t10 = VU_MV(v_s);
-        #line 21534 "vuc.vu"
+        #line 21565 "vuc.vu"
         return _t10;
-    #line 21534 "vuc.vu"
+    #line 21565 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_new_web_gitignore(void) {
-    #line 21536 "vuc.vu"
+    #line 21567 "vuc.vu"
     VU_ENTER("new_web_gitignore");
-    #line 21537 "vuc.vu"
-    VU_AT(21537);
-    #line 21537 "vuc.vu"
+    #line 21568 "vuc.vu"
+    VU_AT(21568);
+    #line 21568 "vuc.vu"
     vu_str v_s = vu_str_lit("", 0);
-    #line 21538 "vuc.vu"
-    VU_AT(21538);
-    #line 21538 "vuc.vu"
+    #line 21569 "vuc.vu"
+    VU_AT(21569);
+    #line 21569 "vuc.vu"
     ({ vu_str _t3 = vu_str_lit("/app\n", 5); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
-    #line 21539 "vuc.vu"
-    VU_AT(21539);
-    #line 21539 "vuc.vu"
+    #line 21570 "vuc.vu"
+    VU_AT(21570);
+    #line 21570 "vuc.vu"
     {
-        #line 21539 "vuc.vu"
+        #line 21570 "vuc.vu"
         vu_str _t4 = VU_MV(v_s);
-        #line 21539 "vuc.vu"
+        #line 21570 "vuc.vu"
         return _t4;
-    #line 21539 "vuc.vu"
+    #line 21570 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_new_web_fly(vu_str *restrict v_name) {
-    #line 21541 "vuc.vu"
+    #line 21572 "vuc.vu"
     VU_ENTER("new_web_fly");
-    #line 21542 "vuc.vu"
-    VU_AT(21542);
-    #line 21542 "vuc.vu"
+    #line 21573 "vuc.vu"
+    VU_AT(21573);
+    #line 21573 "vuc.vu"
     vu_str v_s = vu_str_lit("", 0);
-    #line 21543 "vuc.vu"
-    VU_AT(21543);
-    #line 21543 "vuc.vu"
+    #line 21574 "vuc.vu"
+    VU_AT(21574);
+    #line 21574 "vuc.vu"
     ({ vu_str _t3 = vu_str_lit("# Fly.io: `fly launch --copy-config --no-deploy` once (it may pick another app name: names are global),\n", 104); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
-    #line 21544 "vuc.vu"
-    VU_AT(21544);
-    #line 21544 "vuc.vu"
+    #line 21575 "vuc.vu"
+    VU_AT(21575);
+    #line 21575 "vuc.vu"
     ({ vu_str _t6 = vu_str_lit("# then `fly deploy`. The Dockerfile builds the app; Fly gives it HTTPS.\n", 72); vu_str_cat(&v_s, &_t6); drop_Str(&_t6); });
-    #line 21545 "vuc.vu"
-    VU_AT(21545);
-    #line 21545 "vuc.vu"
+    #line 21576 "vuc.vu"
+    VU_AT(21576);
+    #line 21576 "vuc.vu"
     ({ vu_str _t11 = ({ vu_str _t9 = {0}; vu_str_cat_bytes(&_t9, (const uint8_t *)"app = \"", 7); ({ vu_str *_t10 = &(*v_name); vu_str_cat(&_t9, &(*_t10)); }); vu_str_cat_bytes(&_t9, (const uint8_t *)"\"\n", 2); _t9; }); vu_str_cat(&v_s, &_t11); drop_Str(&_t11); });
-    #line 21546 "vuc.vu"
-    VU_AT(21546);
-    #line 21546 "vuc.vu"
+    #line 21577 "vuc.vu"
+    VU_AT(21577);
+    #line 21577 "vuc.vu"
     ({ vu_str _t14 = vu_str_lit("primary_region = \"sjc\"\n", 23); vu_str_cat(&v_s, &_t14); drop_Str(&_t14); });
-    #line 21547 "vuc.vu"
-    VU_AT(21547);
-    #line 21547 "vuc.vu"
+    #line 21578 "vuc.vu"
+    VU_AT(21578);
+    #line 21578 "vuc.vu"
     ({ vu_str _t17 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t17); drop_Str(&_t17); });
-    #line 21548 "vuc.vu"
-    VU_AT(21548);
-    #line 21548 "vuc.vu"
+    #line 21579 "vuc.vu"
+    VU_AT(21579);
+    #line 21579 "vuc.vu"
     ({ vu_str _t20 = vu_str_lit("[build]\n", 8); vu_str_cat(&v_s, &_t20); drop_Str(&_t20); });
-    #line 21549 "vuc.vu"
-    VU_AT(21549);
-    #line 21549 "vuc.vu"
+    #line 21580 "vuc.vu"
+    VU_AT(21580);
+    #line 21580 "vuc.vu"
     ({ vu_str _t23 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t23); drop_Str(&_t23); });
-    #line 21550 "vuc.vu"
-    VU_AT(21550);
-    #line 21550 "vuc.vu"
+    #line 21581 "vuc.vu"
+    VU_AT(21581);
+    #line 21581 "vuc.vu"
     ({ vu_str _t26 = vu_str_lit("[env]\n", 6); vu_str_cat(&v_s, &_t26); drop_Str(&_t26); });
-    #line 21551 "vuc.vu"
-    VU_AT(21551);
-    #line 21551 "vuc.vu"
+    #line 21582 "vuc.vu"
+    VU_AT(21582);
+    #line 21582 "vuc.vu"
     ({ vu_str _t29 = vu_str_lit("  PORT = \"8080\"\n", 16); vu_str_cat(&v_s, &_t29); drop_Str(&_t29); });
-    #line 21552 "vuc.vu"
-    VU_AT(21552);
-    #line 21552 "vuc.vu"
+    #line 21583 "vuc.vu"
+    VU_AT(21583);
+    #line 21583 "vuc.vu"
     ({ vu_str _t32 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t32); drop_Str(&_t32); });
-    #line 21553 "vuc.vu"
-    VU_AT(21553);
-    #line 21553 "vuc.vu"
+    #line 21584 "vuc.vu"
+    VU_AT(21584);
+    #line 21584 "vuc.vu"
     ({ vu_str _t35 = vu_str_lit("[http_service]\n", 15); vu_str_cat(&v_s, &_t35); drop_Str(&_t35); });
-    #line 21554 "vuc.vu"
-    VU_AT(21554);
-    #line 21554 "vuc.vu"
+    #line 21585 "vuc.vu"
+    VU_AT(21585);
+    #line 21585 "vuc.vu"
     ({ vu_str _t38 = vu_str_lit("  internal_port = 8080\n", 23); vu_str_cat(&v_s, &_t38); drop_Str(&_t38); });
-    #line 21555 "vuc.vu"
-    VU_AT(21555);
-    #line 21555 "vuc.vu"
+    #line 21586 "vuc.vu"
+    VU_AT(21586);
+    #line 21586 "vuc.vu"
     ({ vu_str _t41 = vu_str_lit("  force_https = true\n", 21); vu_str_cat(&v_s, &_t41); drop_Str(&_t41); });
-    #line 21556 "vuc.vu"
-    VU_AT(21556);
-    #line 21556 "vuc.vu"
+    #line 21587 "vuc.vu"
+    VU_AT(21587);
+    #line 21587 "vuc.vu"
     ({ vu_str _t44 = vu_str_lit("  auto_stop_machines = \"stop\"\n", 30); vu_str_cat(&v_s, &_t44); drop_Str(&_t44); });
-    #line 21557 "vuc.vu"
-    VU_AT(21557);
-    #line 21557 "vuc.vu"
+    #line 21588 "vuc.vu"
+    VU_AT(21588);
+    #line 21588 "vuc.vu"
     ({ vu_str _t47 = vu_str_lit("  auto_start_machines = true\n", 29); vu_str_cat(&v_s, &_t47); drop_Str(&_t47); });
-    #line 21558 "vuc.vu"
-    VU_AT(21558);
-    #line 21558 "vuc.vu"
+    #line 21589 "vuc.vu"
+    VU_AT(21589);
+    #line 21589 "vuc.vu"
     ({ vu_str _t50 = vu_str_lit("  min_machines_running = 0\n", 27); vu_str_cat(&v_s, &_t50); drop_Str(&_t50); });
-    #line 21559 "vuc.vu"
-    VU_AT(21559);
-    #line 21559 "vuc.vu"
+    #line 21590 "vuc.vu"
+    VU_AT(21590);
+    #line 21590 "vuc.vu"
     ({ vu_str _t53 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t53); drop_Str(&_t53); });
-    #line 21560 "vuc.vu"
-    VU_AT(21560);
-    #line 21560 "vuc.vu"
+    #line 21591 "vuc.vu"
+    VU_AT(21591);
+    #line 21591 "vuc.vu"
     ({ vu_str _t56 = vu_str_lit("  [[http_service.checks]]\n", 26); vu_str_cat(&v_s, &_t56); drop_Str(&_t56); });
-    #line 21561 "vuc.vu"
-    VU_AT(21561);
-    #line 21561 "vuc.vu"
+    #line 21592 "vuc.vu"
+    VU_AT(21592);
+    #line 21592 "vuc.vu"
     ({ vu_str _t59 = vu_str_lit("    grace_period = \"5s\"\n", 24); vu_str_cat(&v_s, &_t59); drop_Str(&_t59); });
-    #line 21562 "vuc.vu"
-    VU_AT(21562);
-    #line 21562 "vuc.vu"
+    #line 21593 "vuc.vu"
+    VU_AT(21593);
+    #line 21593 "vuc.vu"
     ({ vu_str _t62 = vu_str_lit("    interval = \"30s\"\n", 21); vu_str_cat(&v_s, &_t62); drop_Str(&_t62); });
-    #line 21563 "vuc.vu"
-    VU_AT(21563);
-    #line 21563 "vuc.vu"
+    #line 21594 "vuc.vu"
+    VU_AT(21594);
+    #line 21594 "vuc.vu"
     ({ vu_str _t65 = vu_str_lit("    method = \"GET\"\n", 19); vu_str_cat(&v_s, &_t65); drop_Str(&_t65); });
-    #line 21564 "vuc.vu"
-    VU_AT(21564);
-    #line 21564 "vuc.vu"
+    #line 21595 "vuc.vu"
+    VU_AT(21595);
+    #line 21595 "vuc.vu"
     ({ vu_str _t68 = vu_str_lit("    path = \"/health\"\n", 21); vu_str_cat(&v_s, &_t68); drop_Str(&_t68); });
-    #line 21565 "vuc.vu"
-    VU_AT(21565);
-    #line 21565 "vuc.vu"
+    #line 21596 "vuc.vu"
+    VU_AT(21596);
+    #line 21596 "vuc.vu"
     ({ vu_str _t71 = vu_str_lit("    timeout = \"2s\"\n", 19); vu_str_cat(&v_s, &_t71); drop_Str(&_t71); });
-    #line 21566 "vuc.vu"
-    VU_AT(21566);
-    #line 21566 "vuc.vu"
+    #line 21597 "vuc.vu"
+    VU_AT(21597);
+    #line 21597 "vuc.vu"
     ({ vu_str _t74 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t74); drop_Str(&_t74); });
-    #line 21567 "vuc.vu"
-    VU_AT(21567);
-    #line 21567 "vuc.vu"
+    #line 21598 "vuc.vu"
+    VU_AT(21598);
+    #line 21598 "vuc.vu"
     ({ vu_str _t77 = vu_str_lit("[[vm]]\n", 7); vu_str_cat(&v_s, &_t77); drop_Str(&_t77); });
-    #line 21568 "vuc.vu"
-    VU_AT(21568);
-    #line 21568 "vuc.vu"
+    #line 21599 "vuc.vu"
+    VU_AT(21599);
+    #line 21599 "vuc.vu"
     ({ vu_str _t80 = vu_str_lit("  memory = \"256mb\"\n", 19); vu_str_cat(&v_s, &_t80); drop_Str(&_t80); });
-    #line 21569 "vuc.vu"
-    VU_AT(21569);
-    #line 21569 "vuc.vu"
+    #line 21600 "vuc.vu"
+    VU_AT(21600);
+    #line 21600 "vuc.vu"
     ({ vu_str _t83 = vu_str_lit("  cpu_kind = \"shared\"\n", 22); vu_str_cat(&v_s, &_t83); drop_Str(&_t83); });
-    #line 21570 "vuc.vu"
-    VU_AT(21570);
-    #line 21570 "vuc.vu"
+    #line 21601 "vuc.vu"
+    VU_AT(21601);
+    #line 21601 "vuc.vu"
     ({ vu_str _t86 = vu_str_lit("  cpus = 1\n", 11); vu_str_cat(&v_s, &_t86); drop_Str(&_t86); });
-    #line 21571 "vuc.vu"
-    VU_AT(21571);
-    #line 21571 "vuc.vu"
+    #line 21602 "vuc.vu"
+    VU_AT(21602);
+    #line 21602 "vuc.vu"
     {
-        #line 21571 "vuc.vu"
+        #line 21602 "vuc.vu"
         vu_str _t87 = VU_MV(v_s);
-        #line 21571 "vuc.vu"
+        #line 21602 "vuc.vu"
         return _t87;
-    #line 21571 "vuc.vu"
+    #line 21602 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_new_web_readme(vu_str *restrict v_name) {
-    #line 21573 "vuc.vu"
+    #line 21604 "vuc.vu"
     VU_ENTER("new_web_readme");
-    #line 21574 "vuc.vu"
-    VU_AT(21574);
-    #line 21574 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21575 "vuc.vu"
-    VU_AT(21575);
-    #line 21575 "vuc.vu"
-    ({ vu_str _t5 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"# ", 2); ({ vu_str *_t4 = &(*v_name); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)"\n", 1); _t3; }); vu_str_cat(&v_s, &_t5); drop_Str(&_t5); });
-    #line 21576 "vuc.vu"
-    VU_AT(21576);
-    #line 21576 "vuc.vu"
-    ({ vu_str _t8 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t8); drop_Str(&_t8); });
-    #line 21577 "vuc.vu"
-    VU_AT(21577);
-    #line 21577 "vuc.vu"
-    ({ vu_str _t13 = ({ vu_str _t11 = {0}; vu_str_cat_bytes(&_t11, (const uint8_t *)"A web app in [Vu](https://github.com/vu0tran/vu), made by `vu new web ", 70); ({ vu_str *_t12 = &(*v_name); vu_str_cat(&_t11, &(*_t12)); }); vu_str_cat_bytes(&_t11, (const uint8_t *)"`. (`vu` is the script at the\n", 30); _t11; }); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
-    #line 21578 "vuc.vu"
-    VU_AT(21578);
-    #line 21578 "vuc.vu"
-    ({ vu_str _t16 = vu_str_lit("top of the Vu repository.)\n", 27); vu_str_cat(&v_s, &_t16); drop_Str(&_t16); });
-    #line 21579 "vuc.vu"
-    VU_AT(21579);
-    #line 21579 "vuc.vu"
-    ({ vu_str _t19 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t19); drop_Str(&_t19); });
-    #line 21580 "vuc.vu"
-    VU_AT(21580);
-    #line 21580 "vuc.vu"
-    ({ vu_str _t22 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t22); drop_Str(&_t22); });
-    #line 21581 "vuc.vu"
-    VU_AT(21581);
-    #line 21581 "vuc.vu"
-    ({ vu_str _t25 = vu_str_lit("vu run main.vu                  # http://localhost:8080 (PORT=3000 vu run main.vu for another port)\n", 100); vu_str_cat(&v_s, &_t25); drop_Str(&_t25); });
-    #line 21582 "vuc.vu"
-    VU_AT(21582);
-    #line 21582 "vuc.vu"
-    ({ vu_str _t28 = vu_str_lit("vu check main.vu                # every compile error, in milliseconds\n", 71); vu_str_cat(&v_s, &_t28); drop_Str(&_t28); });
-    #line 21583 "vuc.vu"
-    VU_AT(21583);
-    #line 21583 "vuc.vu"
-    ({ vu_str _t31 = vu_str_lit("vu build main.vu -o app         # the optimized binary: copy it and public/ anywhere and run ./app\n", 99); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
-    #line 21584 "vuc.vu"
-    VU_AT(21584);
-    #line 21584 "vuc.vu"
-    ({ vu_str _t34 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
-    #line 21585 "vuc.vu"
-    VU_AT(21585);
-    #line 21585 "vuc.vu"
-    ({ vu_str _t37 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
-    #line 21586 "vuc.vu"
-    VU_AT(21586);
-    #line 21586 "vuc.vu"
-    ({ vu_str _t40 = vu_str_lit("- `main.vu`: the routes and handlers (see \"web\" in Vu's SPEC.md).\n", 66); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
-    #line 21587 "vuc.vu"
-    VU_AT(21587);
-    #line 21587 "vuc.vu"
-    ({ vu_str _t43 = vu_str_lit("- `public/`: files served at `/static/...` (hidden files and anything outside the folder are 404).\n", 99); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
-    #line 21588 "vuc.vu"
-    VU_AT(21588);
-    #line 21588 "vuc.vu"
-    ({ vu_str _t46 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
-    #line 21589 "vuc.vu"
-    VU_AT(21589);
-    #line 21589 "vuc.vu"
-    ({ vu_str _t49 = vu_str_lit("## Deploy\n", 10); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
-    #line 21590 "vuc.vu"
-    VU_AT(21590);
-    #line 21590 "vuc.vu"
-    ({ vu_str _t52 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
-    #line 21591 "vuc.vu"
-    VU_AT(21591);
-    #line 21591 "vuc.vu"
-    ({ vu_str _t55 = vu_str_lit("With Docker (any host that runs containers):\n", 45); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
-    #line 21592 "vuc.vu"
-    VU_AT(21592);
-    #line 21592 "vuc.vu"
-    ({ vu_str _t58 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
-    #line 21593 "vuc.vu"
-    VU_AT(21593);
-    #line 21593 "vuc.vu"
-    ({ vu_str _t61 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t61); drop_Str(&_t61); });
-    #line 21594 "vuc.vu"
-    VU_AT(21594);
-    #line 21594 "vuc.vu"
-    ({ vu_str _t66 = ({ vu_str _t64 = {0}; vu_str_cat_bytes(&_t64, (const uint8_t *)"docker build -t ", 16); ({ vu_str *_t65 = &(*v_name); vu_str_cat(&_t64, &(*_t65)); }); vu_str_cat_bytes(&_t64, (const uint8_t *)" .\n", 3); _t64; }); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 21595 "vuc.vu"
-    VU_AT(21595);
-    #line 21595 "vuc.vu"
-    ({ vu_str _t71 = ({ vu_str _t69 = {0}; vu_str_cat_bytes(&_t69, (const uint8_t *)"docker run -p 8080:8080 ", 24); ({ vu_str *_t70 = &(*v_name); vu_str_cat(&_t69, &(*_t70)); }); vu_str_cat_bytes(&_t69, (const uint8_t *)"\n", 1); _t69; }); vu_str_cat(&v_s, &_t71); drop_Str(&_t71); });
-    #line 21596 "vuc.vu"
-    VU_AT(21596);
-    #line 21596 "vuc.vu"
-    ({ vu_str _t74 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t74); drop_Str(&_t74); });
-    #line 21597 "vuc.vu"
-    VU_AT(21597);
-    #line 21597 "vuc.vu"
-    ({ vu_str _t77 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t77); drop_Str(&_t77); });
-    #line 21598 "vuc.vu"
-    VU_AT(21598);
-    #line 21598 "vuc.vu"
-    ({ vu_str _t80 = vu_str_lit("On [Fly.io](https://fly.io), after `fly auth login`:\n", 53); vu_str_cat(&v_s, &_t80); drop_Str(&_t80); });
-    #line 21599 "vuc.vu"
-    VU_AT(21599);
-    #line 21599 "vuc.vu"
-    ({ vu_str _t83 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t83); drop_Str(&_t83); });
-    #line 21600 "vuc.vu"
-    VU_AT(21600);
-    #line 21600 "vuc.vu"
-    ({ vu_str _t86 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t86); drop_Str(&_t86); });
-    #line 21601 "vuc.vu"
-    VU_AT(21601);
-    #line 21601 "vuc.vu"
-    ({ vu_str _t89 = vu_str_lit("fly launch --copy-config --no-deploy   # once: creates the app (rename it if the name is taken)\n", 96); vu_str_cat(&v_s, &_t89); drop_Str(&_t89); });
-    #line 21602 "vuc.vu"
-    VU_AT(21602);
-    #line 21602 "vuc.vu"
-    ({ vu_str _t92 = vu_str_lit("fly deploy                             # builds the Dockerfile and starts it, with HTTPS\n", 89); vu_str_cat(&v_s, &_t92); drop_Str(&_t92); });
-    #line 21603 "vuc.vu"
-    VU_AT(21603);
-    #line 21603 "vuc.vu"
-    ({ vu_str _t95 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t95); drop_Str(&_t95); });
-    #line 21604 "vuc.vu"
-    VU_AT(21604);
-    #line 21604 "vuc.vu"
-    ({ vu_str _t98 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t98); drop_Str(&_t98); });
     #line 21605 "vuc.vu"
     VU_AT(21605);
     #line 21605 "vuc.vu"
-    ({ vu_str _t101 = vu_str_lit("Without containers: `vu build main.vu -o app` needs the server to have OpenSSL 3 (`libssl3`); `vu build\n", 104); vu_str_cat(&v_s, &_t101); drop_Str(&_t101); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 21606 "vuc.vu"
     VU_AT(21606);
     #line 21606 "vuc.vu"
-    ({ vu_str _t104 = vu_str_lit("main.vu -o app --static` links everything in, so it runs on any Linux with the same CPU type (with\n", 99); vu_str_cat(&v_s, &_t104); drop_Str(&_t104); });
+    ({ vu_str _t5 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"# ", 2); ({ vu_str *_t4 = &(*v_name); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)"\n", 1); _t3; }); vu_str_cat(&v_s, &_t5); drop_Str(&_t5); });
     #line 21607 "vuc.vu"
     VU_AT(21607);
     #line 21607 "vuc.vu"
-    ({ vu_str _t107 = vu_str_lit("glibc, looking up host names then needs glibc's own libraries there: fine for a server that only\n", 97); vu_str_cat(&v_s, &_t107); drop_Str(&_t107); });
+    ({ vu_str _t8 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t8); drop_Str(&_t8); });
     #line 21608 "vuc.vu"
     VU_AT(21608);
     #line 21608 "vuc.vu"
-    ({ vu_str _t110 = vu_str_lit("listens). Copy `app` and `public/` to the server and run `./app` behind a reverse proxy that does HTTPS.\n", 105); vu_str_cat(&v_s, &_t110); drop_Str(&_t110); });
+    ({ vu_str _t13 = ({ vu_str _t11 = {0}; vu_str_cat_bytes(&_t11, (const uint8_t *)"A web app in [Vu](https://github.com/vu0tran/vu), made by `vu new web ", 70); ({ vu_str *_t12 = &(*v_name); vu_str_cat(&_t11, &(*_t12)); }); vu_str_cat_bytes(&_t11, (const uint8_t *)"`. (`vu` is the script at the\n", 30); _t11; }); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
     #line 21609 "vuc.vu"
     VU_AT(21609);
     #line 21609 "vuc.vu"
+    ({ vu_str _t16 = vu_str_lit("top of the Vu repository.)\n", 27); vu_str_cat(&v_s, &_t16); drop_Str(&_t16); });
+    #line 21610 "vuc.vu"
+    VU_AT(21610);
+    #line 21610 "vuc.vu"
+    ({ vu_str _t19 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t19); drop_Str(&_t19); });
+    #line 21611 "vuc.vu"
+    VU_AT(21611);
+    #line 21611 "vuc.vu"
+    ({ vu_str _t22 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t22); drop_Str(&_t22); });
+    #line 21612 "vuc.vu"
+    VU_AT(21612);
+    #line 21612 "vuc.vu"
+    ({ vu_str _t25 = vu_str_lit("vu run main.vu                  # http://localhost:8080 (PORT=3000 vu run main.vu for another port)\n", 100); vu_str_cat(&v_s, &_t25); drop_Str(&_t25); });
+    #line 21613 "vuc.vu"
+    VU_AT(21613);
+    #line 21613 "vuc.vu"
+    ({ vu_str _t28 = vu_str_lit("vu check main.vu                # every compile error, in milliseconds\n", 71); vu_str_cat(&v_s, &_t28); drop_Str(&_t28); });
+    #line 21614 "vuc.vu"
+    VU_AT(21614);
+    #line 21614 "vuc.vu"
+    ({ vu_str _t31 = vu_str_lit("vu build main.vu -o app         # the optimized binary: copy it and public/ anywhere and run ./app\n", 99); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
+    #line 21615 "vuc.vu"
+    VU_AT(21615);
+    #line 21615 "vuc.vu"
+    ({ vu_str _t34 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
+    #line 21616 "vuc.vu"
+    VU_AT(21616);
+    #line 21616 "vuc.vu"
+    ({ vu_str _t37 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
+    #line 21617 "vuc.vu"
+    VU_AT(21617);
+    #line 21617 "vuc.vu"
+    ({ vu_str _t40 = vu_str_lit("- `main.vu`: the routes and handlers (see \"web\" in Vu's SPEC.md).\n", 66); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
+    #line 21618 "vuc.vu"
+    VU_AT(21618);
+    #line 21618 "vuc.vu"
+    ({ vu_str _t43 = vu_str_lit("- `public/`: files served at `/static/...` (hidden files and anything outside the folder are 404).\n", 99); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
+    #line 21619 "vuc.vu"
+    VU_AT(21619);
+    #line 21619 "vuc.vu"
+    ({ vu_str _t46 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
+    #line 21620 "vuc.vu"
+    VU_AT(21620);
+    #line 21620 "vuc.vu"
+    ({ vu_str _t49 = vu_str_lit("## Deploy\n", 10); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
+    #line 21621 "vuc.vu"
+    VU_AT(21621);
+    #line 21621 "vuc.vu"
+    ({ vu_str _t52 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
+    #line 21622 "vuc.vu"
+    VU_AT(21622);
+    #line 21622 "vuc.vu"
+    ({ vu_str _t55 = vu_str_lit("With Docker (any host that runs containers):\n", 45); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
+    #line 21623 "vuc.vu"
+    VU_AT(21623);
+    #line 21623 "vuc.vu"
+    ({ vu_str _t58 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
+    #line 21624 "vuc.vu"
+    VU_AT(21624);
+    #line 21624 "vuc.vu"
+    ({ vu_str _t61 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t61); drop_Str(&_t61); });
+    #line 21625 "vuc.vu"
+    VU_AT(21625);
+    #line 21625 "vuc.vu"
+    ({ vu_str _t66 = ({ vu_str _t64 = {0}; vu_str_cat_bytes(&_t64, (const uint8_t *)"docker build -t ", 16); ({ vu_str *_t65 = &(*v_name); vu_str_cat(&_t64, &(*_t65)); }); vu_str_cat_bytes(&_t64, (const uint8_t *)" .\n", 3); _t64; }); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
+    #line 21626 "vuc.vu"
+    VU_AT(21626);
+    #line 21626 "vuc.vu"
+    ({ vu_str _t71 = ({ vu_str _t69 = {0}; vu_str_cat_bytes(&_t69, (const uint8_t *)"docker run -p 8080:8080 ", 24); ({ vu_str *_t70 = &(*v_name); vu_str_cat(&_t69, &(*_t70)); }); vu_str_cat_bytes(&_t69, (const uint8_t *)"\n", 1); _t69; }); vu_str_cat(&v_s, &_t71); drop_Str(&_t71); });
+    #line 21627 "vuc.vu"
+    VU_AT(21627);
+    #line 21627 "vuc.vu"
+    ({ vu_str _t74 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t74); drop_Str(&_t74); });
+    #line 21628 "vuc.vu"
+    VU_AT(21628);
+    #line 21628 "vuc.vu"
+    ({ vu_str _t77 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t77); drop_Str(&_t77); });
+    #line 21629 "vuc.vu"
+    VU_AT(21629);
+    #line 21629 "vuc.vu"
+    ({ vu_str _t80 = vu_str_lit("On [Fly.io](https://fly.io), after `fly auth login`:\n", 53); vu_str_cat(&v_s, &_t80); drop_Str(&_t80); });
+    #line 21630 "vuc.vu"
+    VU_AT(21630);
+    #line 21630 "vuc.vu"
+    ({ vu_str _t83 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t83); drop_Str(&_t83); });
+    #line 21631 "vuc.vu"
+    VU_AT(21631);
+    #line 21631 "vuc.vu"
+    ({ vu_str _t86 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t86); drop_Str(&_t86); });
+    #line 21632 "vuc.vu"
+    VU_AT(21632);
+    #line 21632 "vuc.vu"
+    ({ vu_str _t89 = vu_str_lit("fly launch --copy-config --no-deploy   # once: creates the app (rename it if the name is taken)\n", 96); vu_str_cat(&v_s, &_t89); drop_Str(&_t89); });
+    #line 21633 "vuc.vu"
+    VU_AT(21633);
+    #line 21633 "vuc.vu"
+    ({ vu_str _t92 = vu_str_lit("fly deploy                             # builds the Dockerfile and starts it, with HTTPS\n", 89); vu_str_cat(&v_s, &_t92); drop_Str(&_t92); });
+    #line 21634 "vuc.vu"
+    VU_AT(21634);
+    #line 21634 "vuc.vu"
+    ({ vu_str _t95 = vu_str_lit("```\n", 4); vu_str_cat(&v_s, &_t95); drop_Str(&_t95); });
+    #line 21635 "vuc.vu"
+    VU_AT(21635);
+    #line 21635 "vuc.vu"
+    ({ vu_str _t98 = vu_str_lit("\n", 1); vu_str_cat(&v_s, &_t98); drop_Str(&_t98); });
+    #line 21636 "vuc.vu"
+    VU_AT(21636);
+    #line 21636 "vuc.vu"
+    ({ vu_str _t101 = vu_str_lit("Without containers: `vu build main.vu -o app` needs the server to have OpenSSL 3 (`libssl3`); `vu build\n", 104); vu_str_cat(&v_s, &_t101); drop_Str(&_t101); });
+    #line 21637 "vuc.vu"
+    VU_AT(21637);
+    #line 21637 "vuc.vu"
+    ({ vu_str _t104 = vu_str_lit("main.vu -o app --static` links everything in, so it runs on any Linux with the same CPU type (with\n", 99); vu_str_cat(&v_s, &_t104); drop_Str(&_t104); });
+    #line 21638 "vuc.vu"
+    VU_AT(21638);
+    #line 21638 "vuc.vu"
+    ({ vu_str _t107 = vu_str_lit("glibc, looking up host names then needs glibc's own libraries there: fine for a server that only\n", 97); vu_str_cat(&v_s, &_t107); drop_Str(&_t107); });
+    #line 21639 "vuc.vu"
+    VU_AT(21639);
+    #line 21639 "vuc.vu"
+    ({ vu_str _t110 = vu_str_lit("listens). Copy `app` and `public/` to the server and run `./app` behind a reverse proxy that does HTTPS.\n", 105); vu_str_cat(&v_s, &_t110); drop_Str(&_t110); });
+    #line 21640 "vuc.vu"
+    VU_AT(21640);
+    #line 21640 "vuc.vu"
     {
-        #line 21609 "vuc.vu"
+        #line 21640 "vuc.vu"
         vu_str _t111 = VU_MV(v_s);
-        #line 21609 "vuc.vu"
+        #line 21640 "vuc.vu"
         return _t111;
-    #line 21609 "vuc.vu"
+    #line 21640 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_box_code(vu_str *restrict v_x, vu_str *restrict v_t) {
-    #line 21611 "vuc.vu"
+    #line 21642 "vuc.vu"
     VU_ENTER("box_code");
-    #line 21612 "vuc.vu"
-    VU_AT(21612);
-    #line 21612 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21613 "vuc.vu"
-    VU_AT(21613);
-    #line 21613 "vuc.vu"
-    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"#define VU_NODE_", 16); ({ vu_str *_t4 = &(*v_x); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" (sizeof(", 9); ({ vu_str *_t5 = &(*v_t); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)") < 2 * sizeof(void *) ? 2 * sizeof(void *) : sizeof(", 53); ({ vu_str *_t6 = &(*v_t); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)"))\n", 3); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
-    #line 21614 "vuc.vu"
-    VU_AT(21614);
-    #line 21614 "vuc.vu"
-    ({ vu_str _t13 = ({ vu_str _t10 = {0}; vu_str_cat_bytes(&_t10, (const uint8_t *)"VU_G __thread ", 14); ({ vu_str *_t11 = &(*v_t); vu_str_cat(&_t10, &(*_t11)); }); vu_str_cat_bytes(&_t10, (const uint8_t *)" *vu_free_", 10); ({ vu_str *_t12 = &(*v_x); vu_str_cat(&_t10, &(*_t12)); }); vu_str_cat_bytes(&_t10, (const uint8_t *)";\n", 2); _t10; }); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
-    #line 21615 "vuc.vu"
-    VU_AT(21615);
-    #line 21615 "vuc.vu"
-    ({ vu_str _t18 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"VU_G __thread int64_t vu_nfree_", 31); ({ vu_str *_t17 = &(*v_x); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)";   /* how many are on it (counted with several threads) */\n", 60); _t16; }); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
-    #line 21616 "vuc.vu"
-    VU_AT(21616);
-    #line 21616 "vuc.vu"
-    ({ vu_str _t21 = vu_str_lit("/* Free nodes shared between threads (see vu_share_free): chunks, each a whole free list whose first\n", 101); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
-    #line 21617 "vuc.vu"
-    VU_AT(21617);
-    #line 21617 "vuc.vu"
-    ({ vu_str _t24 = vu_str_lit("   node links the next chunk in its second word. */\n", 52); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
-    #line 21618 "vuc.vu"
-    VU_AT(21618);
-    #line 21618 "vuc.vu"
-    ({ vu_str _t29 = ({ vu_str _t27 = {0}; vu_str_cat_bytes(&_t27, (const uint8_t *)"VU_G void *vu_chunks_", 21); ({ vu_str *_t28 = &(*v_x); vu_str_cat(&_t27, &(*_t28)); }); vu_str_cat_bytes(&_t27, (const uint8_t *)";\n", 2); _t27; }); vu_str_cat(&v_s, &_t29); drop_Str(&_t29); });
-    #line 21619 "vuc.vu"
-    VU_AT(21619);
-    #line 21619 "vuc.vu"
-    ({ vu_str _t34 = ({ vu_str _t32 = {0}; vu_str_cat_bytes(&_t32, (const uint8_t *)"VU_G pthread_mutex_t vu_chunks_lock_", 36); ({ vu_str *_t33 = &(*v_x); vu_str_cat(&_t32, &(*_t33)); }); vu_str_cat_bytes(&_t32, (const uint8_t *)" VU_GI(PTHREAD_MUTEX_INITIALIZER);\n", 35); _t32; }); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
-    #line 21620 "vuc.vu"
-    VU_AT(21620);
-    #line 21620 "vuc.vu"
-    ({ vu_str _t37 = vu_str_lit("/* Takes up to VU_TAKE nodes from the first chunk (the rest of it stays shared), so that threads\n", 97); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
-    #line 21621 "vuc.vu"
-    VU_AT(21621);
-    #line 21621 "vuc.vu"
-    ({ vu_str _t40 = vu_str_lit("   share a big list instead of one of them taking all of it. */\n", 64); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
-    #line 21622 "vuc.vu"
-    VU_AT(21622);
-    #line 21622 "vuc.vu"
-    ({ vu_str _t45 = ({ vu_str _t43 = {0}; vu_str_cat_bytes(&_t43, (const uint8_t *)"__attribute__((noinline)) static void vu_take_chunk_", 52); ({ vu_str *_t44 = &(*v_x); vu_str_cat(&_t43, &(*_t44)); }); vu_str_cat_bytes(&_t43, (const uint8_t *)"(void) {\n", 9); _t43; }); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
-    #line 21623 "vuc.vu"
-    VU_AT(21623);
-    #line 21623 "vuc.vu"
-    ({ vu_str _t50 = ({ vu_str _t48 = {0}; vu_str_cat_bytes(&_t48, (const uint8_t *)"    pthread_mutex_lock(&vu_chunks_lock_", 39); ({ vu_str *_t49 = &(*v_x); vu_str_cat(&_t48, &(*_t49)); }); vu_str_cat_bytes(&_t48, (const uint8_t *)");\n", 3); _t48; }); vu_str_cat(&v_s, &_t50); drop_Str(&_t50); });
-    #line 21624 "vuc.vu"
-    VU_AT(21624);
-    #line 21624 "vuc.vu"
-    ({ vu_str _t55 = ({ vu_str _t53 = {0}; vu_str_cat_bytes(&_t53, (const uint8_t *)"    char *c = (char *)vu_chunks_", 32); ({ vu_str *_t54 = &(*v_x); vu_str_cat(&_t53, &(*_t54)); }); vu_str_cat_bytes(&_t53, (const uint8_t *)";\n", 2); _t53; }); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
-    #line 21625 "vuc.vu"
-    VU_AT(21625);
-    #line 21625 "vuc.vu"
-    ({ vu_str _t58 = vu_str_lit("    if (c) {\n", 13); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
-    #line 21626 "vuc.vu"
-    VU_AT(21626);
-    #line 21626 "vuc.vu"
-    ({ vu_str _t61 = vu_str_lit("        void *next_chunk, *rest;\n", 33); vu_str_cat(&v_s, &_t61); drop_Str(&_t61); });
-    #line 21627 "vuc.vu"
-    VU_AT(21627);
-    #line 21627 "vuc.vu"
-    ({ vu_str _t64 = vu_str_lit("        VU_UNPOISON(c, 2 * sizeof(void *));\n", 44); vu_str_cat(&v_s, &_t64); drop_Str(&_t64); });
-    #line 21628 "vuc.vu"
-    VU_AT(21628);
-    #line 21628 "vuc.vu"
-    ({ vu_str _t67 = vu_str_lit("        memcpy(&next_chunk, c + sizeof(void *), sizeof(void *));\n", 65); vu_str_cat(&v_s, &_t67); drop_Str(&_t67); });
-    #line 21629 "vuc.vu"
-    VU_AT(21629);
-    #line 21629 "vuc.vu"
-    ({ vu_str _t70 = vu_str_lit("        VU_POISON(c, 2 * sizeof(void *));\n", 42); vu_str_cat(&v_s, &_t70); drop_Str(&_t70); });
-    #line 21630 "vuc.vu"
-    VU_AT(21630);
-    #line 21630 "vuc.vu"
-    ({ vu_str _t73 = vu_str_lit("        char *p = c;\n", 21); vu_str_cat(&v_s, &_t73); drop_Str(&_t73); });
-    #line 21631 "vuc.vu"
-    VU_AT(21631);
-    #line 21631 "vuc.vu"
-    ({ vu_str _t76 = vu_str_lit("        for (int i = 1;; i++) {\n", 32); vu_str_cat(&v_s, &_t76); drop_Str(&_t76); });
-    #line 21632 "vuc.vu"
-    VU_AT(21632);
-    #line 21632 "vuc.vu"
-    ({ vu_str _t79 = vu_str_lit("            VU_UNPOISON(p, sizeof(void *));\n", 44); vu_str_cat(&v_s, &_t79); drop_Str(&_t79); });
-    #line 21633 "vuc.vu"
-    VU_AT(21633);
-    #line 21633 "vuc.vu"
-    ({ vu_str _t82 = vu_str_lit("            memcpy(&rest, p, sizeof(void *));\n", 46); vu_str_cat(&v_s, &_t82); drop_Str(&_t82); });
-    #line 21634 "vuc.vu"
-    VU_AT(21634);
-    #line 21634 "vuc.vu"
-    ({ vu_str _t85 = vu_str_lit("            if (!rest || i == VU_TAKE) {\n", 41); vu_str_cat(&v_s, &_t85); drop_Str(&_t85); });
-    #line 21635 "vuc.vu"
-    VU_AT(21635);
-    #line 21635 "vuc.vu"
-    ({ vu_str _t88 = vu_str_lit("                memset(p, 0, sizeof(void *));   /* p ends the list this thread takes */\n", 88); vu_str_cat(&v_s, &_t88); drop_Str(&_t88); });
-    #line 21636 "vuc.vu"
-    VU_AT(21636);
-    #line 21636 "vuc.vu"
-    ({ vu_str _t91 = vu_str_lit("                VU_POISON(p, sizeof(void *));\n", 46); vu_str_cat(&v_s, &_t91); drop_Str(&_t91); });
-    #line 21637 "vuc.vu"
-    VU_AT(21637);
-    #line 21637 "vuc.vu"
-    ({ vu_str _t94 = vu_str_lit("                break;\n", 23); vu_str_cat(&v_s, &_t94); drop_Str(&_t94); });
-    #line 21638 "vuc.vu"
-    VU_AT(21638);
-    #line 21638 "vuc.vu"
-    ({ vu_str _t97 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t97); drop_Str(&_t97); });
-    #line 21639 "vuc.vu"
-    VU_AT(21639);
-    #line 21639 "vuc.vu"
-    ({ vu_str _t100 = vu_str_lit("            VU_POISON(p, sizeof(void *));\n", 42); vu_str_cat(&v_s, &_t100); drop_Str(&_t100); });
-    #line 21640 "vuc.vu"
-    VU_AT(21640);
-    #line 21640 "vuc.vu"
-    ({ vu_str _t103 = vu_str_lit("            p = (char *)rest;\n", 30); vu_str_cat(&v_s, &_t103); drop_Str(&_t103); });
-    #line 21641 "vuc.vu"
-    VU_AT(21641);
-    #line 21641 "vuc.vu"
-    ({ vu_str _t106 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t106); drop_Str(&_t106); });
-    #line 21642 "vuc.vu"
-    VU_AT(21642);
-    #line 21642 "vuc.vu"
-    ({ vu_str _t109 = vu_str_lit("        if (rest) {\n", 20); vu_str_cat(&v_s, &_t109); drop_Str(&_t109); });
     #line 21643 "vuc.vu"
     VU_AT(21643);
     #line 21643 "vuc.vu"
-    ({ vu_str _t112 = vu_str_lit("            VU_UNPOISON((char *)rest + sizeof(void *), sizeof(void *));\n", 72); vu_str_cat(&v_s, &_t112); drop_Str(&_t112); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 21644 "vuc.vu"
     VU_AT(21644);
     #line 21644 "vuc.vu"
-    ({ vu_str _t115 = vu_str_lit("            memcpy((char *)rest + sizeof(void *), &next_chunk, sizeof(void *));\n", 80); vu_str_cat(&v_s, &_t115); drop_Str(&_t115); });
+    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"#define VU_NODE_", 16); ({ vu_str *_t4 = &(*v_x); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" (sizeof(", 9); ({ vu_str *_t5 = &(*v_t); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)") < 2 * sizeof(void *) ? 2 * sizeof(void *) : sizeof(", 53); ({ vu_str *_t6 = &(*v_t); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)"))\n", 3); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
     #line 21645 "vuc.vu"
     VU_AT(21645);
     #line 21645 "vuc.vu"
-    ({ vu_str _t118 = vu_str_lit("            VU_POISON((char *)rest + sizeof(void *), sizeof(void *));\n", 70); vu_str_cat(&v_s, &_t118); drop_Str(&_t118); });
+    ({ vu_str _t13 = ({ vu_str _t10 = {0}; vu_str_cat_bytes(&_t10, (const uint8_t *)"VU_G __thread ", 14); ({ vu_str *_t11 = &(*v_t); vu_str_cat(&_t10, &(*_t11)); }); vu_str_cat_bytes(&_t10, (const uint8_t *)" *vu_free_", 10); ({ vu_str *_t12 = &(*v_x); vu_str_cat(&_t10, &(*_t12)); }); vu_str_cat_bytes(&_t10, (const uint8_t *)";\n", 2); _t10; }); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
     #line 21646 "vuc.vu"
     VU_AT(21646);
     #line 21646 "vuc.vu"
-    ({ vu_str _t121 = vu_str_lit("            next_chunk = rest;\n", 31); vu_str_cat(&v_s, &_t121); drop_Str(&_t121); });
+    ({ vu_str _t18 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"VU_G __thread int64_t vu_nfree_", 31); ({ vu_str *_t17 = &(*v_x); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)";   /* how many are on it (counted with several threads) */\n", 60); _t16; }); vu_str_cat(&v_s, &_t18); drop_Str(&_t18); });
     #line 21647 "vuc.vu"
     VU_AT(21647);
     #line 21647 "vuc.vu"
-    ({ vu_str _t124 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t124); drop_Str(&_t124); });
+    ({ vu_str _t21 = vu_str_lit("/* Free nodes shared between threads (see vu_share_free): chunks, each a whole free list whose first\n", 101); vu_str_cat(&v_s, &_t21); drop_Str(&_t21); });
     #line 21648 "vuc.vu"
     VU_AT(21648);
     #line 21648 "vuc.vu"
-    ({ vu_str _t129 = ({ vu_str _t127 = {0}; vu_str_cat_bytes(&_t127, (const uint8_t *)"        __atomic_store_n(&vu_chunks_", 36); ({ vu_str *_t128 = &(*v_x); vu_str_cat(&_t127, &(*_t128)); }); vu_str_cat_bytes(&_t127, (const uint8_t *)", next_chunk, __ATOMIC_RELAXED);\n", 33); _t127; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
+    ({ vu_str _t24 = vu_str_lit("   node links the next chunk in its second word. */\n", 52); vu_str_cat(&v_s, &_t24); drop_Str(&_t24); });
     #line 21649 "vuc.vu"
     VU_AT(21649);
     #line 21649 "vuc.vu"
-    ({ vu_str _t135 = ({ vu_str _t132 = {0}; vu_str_cat_bytes(&_t132, (const uint8_t *)"        vu_free_", 16); ({ vu_str *_t133 = &(*v_x); vu_str_cat(&_t132, &(*_t133)); }); vu_str_cat_bytes(&_t132, (const uint8_t *)" = (", 4); ({ vu_str *_t134 = &(*v_t); vu_str_cat(&_t132, &(*_t134)); }); vu_str_cat_bytes(&_t132, (const uint8_t *)" *)c;\n", 6); _t132; }); vu_str_cat(&v_s, &_t135); drop_Str(&_t135); });
+    ({ vu_str _t29 = ({ vu_str _t27 = {0}; vu_str_cat_bytes(&_t27, (const uint8_t *)"VU_G void *vu_chunks_", 21); ({ vu_str *_t28 = &(*v_x); vu_str_cat(&_t27, &(*_t28)); }); vu_str_cat_bytes(&_t27, (const uint8_t *)";\n", 2); _t27; }); vu_str_cat(&v_s, &_t29); drop_Str(&_t29); });
     #line 21650 "vuc.vu"
     VU_AT(21650);
     #line 21650 "vuc.vu"
-    ({ vu_str _t140 = ({ vu_str _t138 = {0}; vu_str_cat_bytes(&_t138, (const uint8_t *)"        vu_nfree_", 17); ({ vu_str *_t139 = &(*v_x); vu_str_cat(&_t138, &(*_t139)); }); vu_str_cat_bytes(&_t138, (const uint8_t *)" = VU_TAKE;   /* (at most; it only decides when to give some back) */\n", 70); _t138; }); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
+    ({ vu_str _t34 = ({ vu_str _t32 = {0}; vu_str_cat_bytes(&_t32, (const uint8_t *)"VU_G pthread_mutex_t vu_chunks_lock_", 36); ({ vu_str *_t33 = &(*v_x); vu_str_cat(&_t32, &(*_t33)); }); vu_str_cat_bytes(&_t32, (const uint8_t *)" VU_GI(PTHREAD_MUTEX_INITIALIZER);\n", 35); _t32; }); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
     #line 21651 "vuc.vu"
     VU_AT(21651);
     #line 21651 "vuc.vu"
-    ({ vu_str _t143 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t143); drop_Str(&_t143); });
+    ({ vu_str _t37 = vu_str_lit("/* Takes up to VU_TAKE nodes from the first chunk (the rest of it stays shared), so that threads\n", 97); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
     #line 21652 "vuc.vu"
     VU_AT(21652);
     #line 21652 "vuc.vu"
-    ({ vu_str _t148 = ({ vu_str _t146 = {0}; vu_str_cat_bytes(&_t146, (const uint8_t *)"    pthread_mutex_unlock(&vu_chunks_lock_", 41); ({ vu_str *_t147 = &(*v_x); vu_str_cat(&_t146, &(*_t147)); }); vu_str_cat_bytes(&_t146, (const uint8_t *)");\n", 3); _t146; }); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
+    ({ vu_str _t40 = vu_str_lit("   share a big list instead of one of them taking all of it. */\n", 64); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
     #line 21653 "vuc.vu"
     VU_AT(21653);
     #line 21653 "vuc.vu"
-    ({ vu_str _t151 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
+    ({ vu_str _t45 = ({ vu_str _t43 = {0}; vu_str_cat_bytes(&_t43, (const uint8_t *)"__attribute__((noinline)) static void vu_take_chunk_", 52); ({ vu_str *_t44 = &(*v_x); vu_str_cat(&_t43, &(*_t44)); }); vu_str_cat_bytes(&_t43, (const uint8_t *)"(void) {\n", 9); _t43; }); vu_str_cat(&v_s, &_t45); drop_Str(&_t45); });
     #line 21654 "vuc.vu"
     VU_AT(21654);
     #line 21654 "vuc.vu"
-    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"static void vu_give_chunk_", 26); ({ vu_str *_t155 = &(*v_x); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(void) {\n", 9); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
+    ({ vu_str _t50 = ({ vu_str _t48 = {0}; vu_str_cat_bytes(&_t48, (const uint8_t *)"    pthread_mutex_lock(&vu_chunks_lock_", 39); ({ vu_str *_t49 = &(*v_x); vu_str_cat(&_t48, &(*_t49)); }); vu_str_cat_bytes(&_t48, (const uint8_t *)");\n", 3); _t48; }); vu_str_cat(&v_s, &_t50); drop_Str(&_t50); });
     #line 21655 "vuc.vu"
     VU_AT(21655);
     #line 21655 "vuc.vu"
-    ({ vu_str _t161 = ({ vu_str _t159 = {0}; vu_str_cat_bytes(&_t159, (const uint8_t *)"    char *c = (char *)vu_free_", 30); ({ vu_str *_t160 = &(*v_x); vu_str_cat(&_t159, &(*_t160)); }); vu_str_cat_bytes(&_t159, (const uint8_t *)";\n", 2); _t159; }); vu_str_cat(&v_s, &_t161); drop_Str(&_t161); });
+    ({ vu_str _t55 = ({ vu_str _t53 = {0}; vu_str_cat_bytes(&_t53, (const uint8_t *)"    char *c = (char *)vu_chunks_", 32); ({ vu_str *_t54 = &(*v_x); vu_str_cat(&_t53, &(*_t54)); }); vu_str_cat_bytes(&_t53, (const uint8_t *)";\n", 2); _t53; }); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
     #line 21656 "vuc.vu"
     VU_AT(21656);
     #line 21656 "vuc.vu"
-    ({ vu_str _t164 = vu_str_lit("    if (!c) return;\n", 20); vu_str_cat(&v_s, &_t164); drop_Str(&_t164); });
+    ({ vu_str _t58 = vu_str_lit("    if (c) {\n", 13); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
     #line 21657 "vuc.vu"
     VU_AT(21657);
     #line 21657 "vuc.vu"
-    ({ vu_str _t169 = ({ vu_str _t167 = {0}; vu_str_cat_bytes(&_t167, (const uint8_t *)"    pthread_mutex_lock(&vu_chunks_lock_", 39); ({ vu_str *_t168 = &(*v_x); vu_str_cat(&_t167, &(*_t168)); }); vu_str_cat_bytes(&_t167, (const uint8_t *)");\n", 3); _t167; }); vu_str_cat(&v_s, &_t169); drop_Str(&_t169); });
+    ({ vu_str _t61 = vu_str_lit("        void *next_chunk, *rest;\n", 33); vu_str_cat(&v_s, &_t61); drop_Str(&_t61); });
     #line 21658 "vuc.vu"
     VU_AT(21658);
     #line 21658 "vuc.vu"
-    ({ vu_str _t172 = vu_str_lit("    VU_UNPOISON(c + sizeof(void *), sizeof(void *));\n", 53); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
+    ({ vu_str _t64 = vu_str_lit("        VU_UNPOISON(c, 2 * sizeof(void *));\n", 44); vu_str_cat(&v_s, &_t64); drop_Str(&_t64); });
     #line 21659 "vuc.vu"
     VU_AT(21659);
     #line 21659 "vuc.vu"
-    ({ vu_str _t177 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    memcpy(c + sizeof(void *), &vu_chunks_", 42); ({ vu_str *_t176 = &(*v_x); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)", sizeof(void *));\n", 19); _t175; }); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
+    ({ vu_str _t67 = vu_str_lit("        memcpy(&next_chunk, c + sizeof(void *), sizeof(void *));\n", 65); vu_str_cat(&v_s, &_t67); drop_Str(&_t67); });
     #line 21660 "vuc.vu"
     VU_AT(21660);
     #line 21660 "vuc.vu"
-    ({ vu_str _t180 = vu_str_lit("    VU_POISON(c + sizeof(void *), sizeof(void *));\n", 51); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
+    ({ vu_str _t70 = vu_str_lit("        VU_POISON(c, 2 * sizeof(void *));\n", 42); vu_str_cat(&v_s, &_t70); drop_Str(&_t70); });
     #line 21661 "vuc.vu"
     VU_AT(21661);
     #line 21661 "vuc.vu"
-    ({ vu_str _t185 = ({ vu_str _t183 = {0}; vu_str_cat_bytes(&_t183, (const uint8_t *)"    __atomic_store_n(&vu_chunks_", 32); ({ vu_str *_t184 = &(*v_x); vu_str_cat(&_t183, &(*_t184)); }); vu_str_cat_bytes(&_t183, (const uint8_t *)", (void *)c, __ATOMIC_RELAXED);\n", 32); _t183; }); vu_str_cat(&v_s, &_t185); drop_Str(&_t185); });
+    ({ vu_str _t73 = vu_str_lit("        char *p = c;\n", 21); vu_str_cat(&v_s, &_t73); drop_Str(&_t73); });
     #line 21662 "vuc.vu"
     VU_AT(21662);
     #line 21662 "vuc.vu"
-    ({ vu_str _t190 = ({ vu_str _t188 = {0}; vu_str_cat_bytes(&_t188, (const uint8_t *)"    pthread_mutex_unlock(&vu_chunks_lock_", 41); ({ vu_str *_t189 = &(*v_x); vu_str_cat(&_t188, &(*_t189)); }); vu_str_cat_bytes(&_t188, (const uint8_t *)");\n", 3); _t188; }); vu_str_cat(&v_s, &_t190); drop_Str(&_t190); });
+    ({ vu_str _t76 = vu_str_lit("        for (int i = 1;; i++) {\n", 32); vu_str_cat(&v_s, &_t76); drop_Str(&_t76); });
     #line 21663 "vuc.vu"
     VU_AT(21663);
     #line 21663 "vuc.vu"
-    ({ vu_str _t195 = ({ vu_str _t193 = {0}; vu_str_cat_bytes(&_t193, (const uint8_t *)"    vu_free_", 12); ({ vu_str *_t194 = &(*v_x); vu_str_cat(&_t193, &(*_t194)); }); vu_str_cat_bytes(&_t193, (const uint8_t *)" = NULL;\n", 9); _t193; }); vu_str_cat(&v_s, &_t195); drop_Str(&_t195); });
+    ({ vu_str _t79 = vu_str_lit("            VU_UNPOISON(p, sizeof(void *));\n", 44); vu_str_cat(&v_s, &_t79); drop_Str(&_t79); });
     #line 21664 "vuc.vu"
     VU_AT(21664);
     #line 21664 "vuc.vu"
-    ({ vu_str _t200 = ({ vu_str _t198 = {0}; vu_str_cat_bytes(&_t198, (const uint8_t *)"    vu_nfree_", 13); ({ vu_str *_t199 = &(*v_x); vu_str_cat(&_t198, &(*_t199)); }); vu_str_cat_bytes(&_t198, (const uint8_t *)" = 0;\n", 6); _t198; }); vu_str_cat(&v_s, &_t200); drop_Str(&_t200); });
+    ({ vu_str _t82 = vu_str_lit("            memcpy(&rest, p, sizeof(void *));\n", 46); vu_str_cat(&v_s, &_t82); drop_Str(&_t82); });
     #line 21665 "vuc.vu"
     VU_AT(21665);
     #line 21665 "vuc.vu"
-    ({ vu_str _t203 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t203); drop_Str(&_t203); });
+    ({ vu_str _t85 = vu_str_lit("            if (!rest || i == VU_TAKE) {\n", 41); vu_str_cat(&v_s, &_t85); drop_Str(&_t85); });
     #line 21666 "vuc.vu"
     VU_AT(21666);
     #line 21666 "vuc.vu"
-    ({ vu_str _t209 = ({ vu_str _t206 = {0}; vu_str_cat_bytes(&_t206, (const uint8_t *)"VU_G vu_pool vu_pool_", 21); ({ vu_str *_t207 = &(*v_x); vu_str_cat(&_t206, &(*_t207)); }); vu_str_cat_bytes(&_t206, (const uint8_t *)" VU_GI({ vu_give_chunk_", 23); ({ vu_str *_t208 = &(*v_x); vu_str_cat(&_t206, &(*_t208)); }); vu_str_cat_bytes(&_t206, (const uint8_t *)", NULL });\n", 11); _t206; }); vu_str_cat(&v_s, &_t209); drop_Str(&_t209); });
+    ({ vu_str _t88 = vu_str_lit("                memset(p, 0, sizeof(void *));   /* p ends the list this thread takes */\n", 88); vu_str_cat(&v_s, &_t88); drop_Str(&_t88); });
     #line 21667 "vuc.vu"
     VU_AT(21667);
     #line 21667 "vuc.vu"
-    ({ vu_str _t212 = vu_str_lit("#ifndef VU_PART\n", 16); vu_str_cat(&v_s, &_t212); drop_Str(&_t212); });
+    ({ vu_str _t91 = vu_str_lit("                VU_POISON(p, sizeof(void *));\n", 46); vu_str_cat(&v_s, &_t91); drop_Str(&_t91); });
     #line 21668 "vuc.vu"
     VU_AT(21668);
     #line 21668 "vuc.vu"
-    ({ vu_str _t219 = ({ vu_str _t215 = {0}; vu_str_cat_bytes(&_t215, (const uint8_t *)"__attribute__((constructor)) static void vu_pool_init_", 54); ({ vu_str *_t216 = &(*v_x); vu_str_cat(&_t215, &(*_t216)); }); vu_str_cat_bytes(&_t215, (const uint8_t *)"(void) { vu_pool_", 17); ({ vu_str *_t217 = &(*v_x); vu_str_cat(&_t215, &(*_t217)); }); vu_str_cat_bytes(&_t215, (const uint8_t *)".next = vu_pools; vu_pools = &vu_pool_", 38); ({ vu_str *_t218 = &(*v_x); vu_str_cat(&_t215, &(*_t218)); }); vu_str_cat_bytes(&_t215, (const uint8_t *)"; }\n", 4); _t215; }); vu_str_cat(&v_s, &_t219); drop_Str(&_t219); });
+    ({ vu_str _t94 = vu_str_lit("                break;\n", 23); vu_str_cat(&v_s, &_t94); drop_Str(&_t94); });
     #line 21669 "vuc.vu"
     VU_AT(21669);
     #line 21669 "vuc.vu"
-    ({ vu_str _t222 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t222); drop_Str(&_t222); });
+    ({ vu_str _t97 = vu_str_lit("            }\n", 14); vu_str_cat(&v_s, &_t97); drop_Str(&_t97); });
     #line 21670 "vuc.vu"
     VU_AT(21670);
     #line 21670 "vuc.vu"
-    ({ vu_str _t229 = ({ vu_str _t225 = {0}; vu_str_cat_bytes(&_t225, (const uint8_t *)"static inline ", 14); ({ vu_str *_t226 = &(*v_t); vu_str_cat(&_t225, &(*_t226)); }); vu_str_cat_bytes(&_t225, (const uint8_t *)" *vu_box_", 9); ({ vu_str *_t227 = &(*v_x); vu_str_cat(&_t225, &(*_t227)); }); vu_str_cat_bytes(&_t225, (const uint8_t *)"(", 1); ({ vu_str *_t228 = &(*v_t); vu_str_cat(&_t225, &(*_t228)); }); vu_str_cat_bytes(&_t225, (const uint8_t *)" v) {\n", 6); _t225; }); vu_str_cat(&v_s, &_t229); drop_Str(&_t229); });
+    ({ vu_str _t100 = vu_str_lit("            VU_POISON(p, sizeof(void *));\n", 42); vu_str_cat(&v_s, &_t100); drop_Str(&_t100); });
     #line 21671 "vuc.vu"
     VU_AT(21671);
     #line 21671 "vuc.vu"
-    ({ vu_str _t232 = vu_str_lit("#ifdef VU_MALLOC\n", 17); vu_str_cat(&v_s, &_t232); drop_Str(&_t232); });
+    ({ vu_str _t103 = vu_str_lit("            p = (char *)rest;\n", 30); vu_str_cat(&v_s, &_t103); drop_Str(&_t103); });
     #line 21672 "vuc.vu"
     VU_AT(21672);
     #line 21672 "vuc.vu"
-    ({ vu_str _t239 = ({ vu_str _t235 = {0}; vu_str_cat_bytes(&_t235, (const uint8_t *)"    ", 4); ({ vu_str *_t236 = &(*v_t); vu_str_cat(&_t235, &(*_t236)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)" *p = (", 7); ({ vu_str *_t237 = &(*v_t); vu_str_cat(&_t235, &(*_t237)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)" *)vu_malloc(sizeof(", 20); ({ vu_str *_t238 = &(*v_t); vu_str_cat(&_t235, &(*_t238)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)"));\n", 4); _t235; }); vu_str_cat(&v_s, &_t239); drop_Str(&_t239); });
+    ({ vu_str _t106 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t106); drop_Str(&_t106); });
     #line 21673 "vuc.vu"
     VU_AT(21673);
     #line 21673 "vuc.vu"
-    ({ vu_str _t242 = vu_str_lit("#else\n", 6); vu_str_cat(&v_s, &_t242); drop_Str(&_t242); });
+    ({ vu_str _t109 = vu_str_lit("        if (rest) {\n", 20); vu_str_cat(&v_s, &_t109); drop_Str(&_t109); });
     #line 21674 "vuc.vu"
     VU_AT(21674);
     #line 21674 "vuc.vu"
-    ({ vu_str _t245 = vu_str_lit("#if defined(_OPENMP) || defined(VU_MT)\n", 39); vu_str_cat(&v_s, &_t245); drop_Str(&_t245); });
+    ({ vu_str _t112 = vu_str_lit("            VU_UNPOISON((char *)rest + sizeof(void *), sizeof(void *));\n", 72); vu_str_cat(&v_s, &_t112); drop_Str(&_t112); });
     #line 21675 "vuc.vu"
     VU_AT(21675);
     #line 21675 "vuc.vu"
-    ({ vu_str _t252 = ({ vu_str _t248 = {0}; vu_str_cat_bytes(&_t248, (const uint8_t *)"    if (!vu_free_", 17); ({ vu_str *_t249 = &(*v_x); vu_str_cat(&_t248, &(*_t249)); }); vu_str_cat_bytes(&_t248, (const uint8_t *)" && __atomic_load_n(&vu_chunks_", 31); ({ vu_str *_t250 = &(*v_x); vu_str_cat(&_t248, &(*_t250)); }); vu_str_cat_bytes(&_t248, (const uint8_t *)", __ATOMIC_RELAXED)) vu_take_chunk_", 35); ({ vu_str *_t251 = &(*v_x); vu_str_cat(&_t248, &(*_t251)); }); vu_str_cat_bytes(&_t248, (const uint8_t *)"();\n", 4); _t248; }); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
+    ({ vu_str _t115 = vu_str_lit("            memcpy((char *)rest + sizeof(void *), &next_chunk, sizeof(void *));\n", 80); vu_str_cat(&v_s, &_t115); drop_Str(&_t115); });
     #line 21676 "vuc.vu"
     VU_AT(21676);
     #line 21676 "vuc.vu"
-    ({ vu_str _t255 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
+    ({ vu_str _t118 = vu_str_lit("            VU_POISON((char *)rest + sizeof(void *), sizeof(void *));\n", 70); vu_str_cat(&v_s, &_t118); drop_Str(&_t118); });
     #line 21677 "vuc.vu"
     VU_AT(21677);
     #line 21677 "vuc.vu"
-    ({ vu_str _t261 = ({ vu_str _t258 = {0}; vu_str_cat_bytes(&_t258, (const uint8_t *)"    ", 4); ({ vu_str *_t259 = &(*v_t); vu_str_cat(&_t258, &(*_t259)); }); vu_str_cat_bytes(&_t258, (const uint8_t *)" *p = vu_free_", 14); ({ vu_str *_t260 = &(*v_x); vu_str_cat(&_t258, &(*_t260)); }); vu_str_cat_bytes(&_t258, (const uint8_t *)";\n", 2); _t258; }); vu_str_cat(&v_s, &_t261); drop_Str(&_t261); });
+    ({ vu_str _t121 = vu_str_lit("            next_chunk = rest;\n", 31); vu_str_cat(&v_s, &_t121); drop_Str(&_t121); });
     #line 21678 "vuc.vu"
     VU_AT(21678);
     #line 21678 "vuc.vu"
-    ({ vu_str _t264 = vu_str_lit("    if (p) {\n", 13); vu_str_cat(&v_s, &_t264); drop_Str(&_t264); });
+    ({ vu_str _t124 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t124); drop_Str(&_t124); });
     #line 21679 "vuc.vu"
     VU_AT(21679);
     #line 21679 "vuc.vu"
-    ({ vu_str _t269 = ({ vu_str _t267 = {0}; vu_str_cat_bytes(&_t267, (const uint8_t *)"        VU_UNPOISON(p, VU_NODE_", 31); ({ vu_str *_t268 = &(*v_x); vu_str_cat(&_t267, &(*_t268)); }); vu_str_cat_bytes(&_t267, (const uint8_t *)");\n", 3); _t267; }); vu_str_cat(&v_s, &_t269); drop_Str(&_t269); });
+    ({ vu_str _t129 = ({ vu_str _t127 = {0}; vu_str_cat_bytes(&_t127, (const uint8_t *)"        __atomic_store_n(&vu_chunks_", 36); ({ vu_str *_t128 = &(*v_x); vu_str_cat(&_t127, &(*_t128)); }); vu_str_cat_bytes(&_t127, (const uint8_t *)", next_chunk, __ATOMIC_RELAXED);\n", 33); _t127; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
     #line 21680 "vuc.vu"
     VU_AT(21680);
     #line 21680 "vuc.vu"
-    ({ vu_str _t274 = ({ vu_str _t272 = {0}; vu_str_cat_bytes(&_t272, (const uint8_t *)"        memcpy(&vu_free_", 24); ({ vu_str *_t273 = &(*v_x); vu_str_cat(&_t272, &(*_t273)); }); vu_str_cat_bytes(&_t272, (const uint8_t *)", p, sizeof(void *));\n", 22); _t272; }); vu_str_cat(&v_s, &_t274); drop_Str(&_t274); });
+    ({ vu_str _t135 = ({ vu_str _t132 = {0}; vu_str_cat_bytes(&_t132, (const uint8_t *)"        vu_free_", 16); ({ vu_str *_t133 = &(*v_x); vu_str_cat(&_t132, &(*_t133)); }); vu_str_cat_bytes(&_t132, (const uint8_t *)" = (", 4); ({ vu_str *_t134 = &(*v_t); vu_str_cat(&_t132, &(*_t134)); }); vu_str_cat_bytes(&_t132, (const uint8_t *)" *)c;\n", 6); _t132; }); vu_str_cat(&v_s, &_t135); drop_Str(&_t135); });
     #line 21681 "vuc.vu"
     VU_AT(21681);
     #line 21681 "vuc.vu"
-    ({ vu_str _t277 = vu_str_lit("#if defined(_OPENMP) || defined(VU_MT)\n", 39); vu_str_cat(&v_s, &_t277); drop_Str(&_t277); });
+    ({ vu_str _t140 = ({ vu_str _t138 = {0}; vu_str_cat_bytes(&_t138, (const uint8_t *)"        vu_nfree_", 17); ({ vu_str *_t139 = &(*v_x); vu_str_cat(&_t138, &(*_t139)); }); vu_str_cat_bytes(&_t138, (const uint8_t *)" = VU_TAKE;   /* (at most; it only decides when to give some back) */\n", 70); _t138; }); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
     #line 21682 "vuc.vu"
     VU_AT(21682);
     #line 21682 "vuc.vu"
-    ({ vu_str _t282 = ({ vu_str _t280 = {0}; vu_str_cat_bytes(&_t280, (const uint8_t *)"        vu_nfree_", 17); ({ vu_str *_t281 = &(*v_x); vu_str_cat(&_t280, &(*_t281)); }); vu_str_cat_bytes(&_t280, (const uint8_t *)"--;\n", 4); _t280; }); vu_str_cat(&v_s, &_t282); drop_Str(&_t282); });
+    ({ vu_str _t143 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t143); drop_Str(&_t143); });
     #line 21683 "vuc.vu"
     VU_AT(21683);
     #line 21683 "vuc.vu"
-    ({ vu_str _t285 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t285); drop_Str(&_t285); });
+    ({ vu_str _t148 = ({ vu_str _t146 = {0}; vu_str_cat_bytes(&_t146, (const uint8_t *)"    pthread_mutex_unlock(&vu_chunks_lock_", 41); ({ vu_str *_t147 = &(*v_x); vu_str_cat(&_t146, &(*_t147)); }); vu_str_cat_bytes(&_t146, (const uint8_t *)");\n", 3); _t146; }); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
     #line 21684 "vuc.vu"
     VU_AT(21684);
     #line 21684 "vuc.vu"
-    ({ vu_str _t288 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t288); drop_Str(&_t288); });
+    ({ vu_str _t151 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
     #line 21685 "vuc.vu"
     VU_AT(21685);
     #line 21685 "vuc.vu"
-    ({ vu_str _t294 = ({ vu_str _t291 = {0}; vu_str_cat_bytes(&_t291, (const uint8_t *)"    else p = (", 14); ({ vu_str *_t292 = &(*v_t); vu_str_cat(&_t291, &(*_t292)); }); vu_str_cat_bytes(&_t291, (const uint8_t *)" *)vu_bump(VU_NODE_", 19); ({ vu_str *_t293 = &(*v_x); vu_str_cat(&_t291, &(*_t293)); }); vu_str_cat_bytes(&_t291, (const uint8_t *)");\n", 3); _t291; }); vu_str_cat(&v_s, &_t294); drop_Str(&_t294); });
+    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"static void vu_give_chunk_", 26); ({ vu_str *_t155 = &(*v_x); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(void) {\n", 9); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
     #line 21686 "vuc.vu"
     VU_AT(21686);
     #line 21686 "vuc.vu"
-    ({ vu_str _t297 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t297); drop_Str(&_t297); });
+    ({ vu_str _t161 = ({ vu_str _t159 = {0}; vu_str_cat_bytes(&_t159, (const uint8_t *)"    char *c = (char *)vu_free_", 30); ({ vu_str *_t160 = &(*v_x); vu_str_cat(&_t159, &(*_t160)); }); vu_str_cat_bytes(&_t159, (const uint8_t *)";\n", 2); _t159; }); vu_str_cat(&v_s, &_t161); drop_Str(&_t161); });
     #line 21687 "vuc.vu"
     VU_AT(21687);
     #line 21687 "vuc.vu"
-    ({ vu_str _t300 = vu_str_lit("    *p = v;\n", 12); vu_str_cat(&v_s, &_t300); drop_Str(&_t300); });
+    ({ vu_str _t164 = vu_str_lit("    if (!c) return;\n", 20); vu_str_cat(&v_s, &_t164); drop_Str(&_t164); });
     #line 21688 "vuc.vu"
     VU_AT(21688);
     #line 21688 "vuc.vu"
-    ({ vu_str _t303 = vu_str_lit("    return p;\n", 14); vu_str_cat(&v_s, &_t303); drop_Str(&_t303); });
+    ({ vu_str _t169 = ({ vu_str _t167 = {0}; vu_str_cat_bytes(&_t167, (const uint8_t *)"    pthread_mutex_lock(&vu_chunks_lock_", 39); ({ vu_str *_t168 = &(*v_x); vu_str_cat(&_t167, &(*_t168)); }); vu_str_cat_bytes(&_t167, (const uint8_t *)");\n", 3); _t167; }); vu_str_cat(&v_s, &_t169); drop_Str(&_t169); });
     #line 21689 "vuc.vu"
     VU_AT(21689);
     #line 21689 "vuc.vu"
-    ({ vu_str _t306 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t306); drop_Str(&_t306); });
+    ({ vu_str _t172 = vu_str_lit("    VU_UNPOISON(c + sizeof(void *), sizeof(void *));\n", 53); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
     #line 21690 "vuc.vu"
     VU_AT(21690);
     #line 21690 "vuc.vu"
-    ({ vu_str _t312 = ({ vu_str _t309 = {0}; vu_str_cat_bytes(&_t309, (const uint8_t *)"static inline void vu_release_", 30); ({ vu_str *_t310 = &(*v_x); vu_str_cat(&_t309, &(*_t310)); }); vu_str_cat_bytes(&_t309, (const uint8_t *)"(", 1); ({ vu_str *_t311 = &(*v_t); vu_str_cat(&_t309, &(*_t311)); }); vu_str_cat_bytes(&_t309, (const uint8_t *)" *p) {\n", 7); _t309; }); vu_str_cat(&v_s, &_t312); drop_Str(&_t312); });
+    ({ vu_str _t177 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    memcpy(c + sizeof(void *), &vu_chunks_", 42); ({ vu_str *_t176 = &(*v_x); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)", sizeof(void *));\n", 19); _t175; }); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
     #line 21691 "vuc.vu"
     VU_AT(21691);
     #line 21691 "vuc.vu"
-    ({ vu_str _t315 = vu_str_lit("#ifdef VU_MALLOC\n", 17); vu_str_cat(&v_s, &_t315); drop_Str(&_t315); });
+    ({ vu_str _t180 = vu_str_lit("    VU_POISON(c + sizeof(void *), sizeof(void *));\n", 51); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
     #line 21692 "vuc.vu"
     VU_AT(21692);
     #line 21692 "vuc.vu"
-    ({ vu_str _t318 = vu_str_lit("    free(p);\n", 13); vu_str_cat(&v_s, &_t318); drop_Str(&_t318); });
+    ({ vu_str _t185 = ({ vu_str _t183 = {0}; vu_str_cat_bytes(&_t183, (const uint8_t *)"    __atomic_store_n(&vu_chunks_", 32); ({ vu_str *_t184 = &(*v_x); vu_str_cat(&_t183, &(*_t184)); }); vu_str_cat_bytes(&_t183, (const uint8_t *)", (void *)c, __ATOMIC_RELAXED);\n", 32); _t183; }); vu_str_cat(&v_s, &_t185); drop_Str(&_t185); });
     #line 21693 "vuc.vu"
     VU_AT(21693);
     #line 21693 "vuc.vu"
-    ({ vu_str _t321 = vu_str_lit("#else\n", 6); vu_str_cat(&v_s, &_t321); drop_Str(&_t321); });
+    ({ vu_str _t190 = ({ vu_str _t188 = {0}; vu_str_cat_bytes(&_t188, (const uint8_t *)"    pthread_mutex_unlock(&vu_chunks_lock_", 41); ({ vu_str *_t189 = &(*v_x); vu_str_cat(&_t188, &(*_t189)); }); vu_str_cat_bytes(&_t188, (const uint8_t *)");\n", 3); _t188; }); vu_str_cat(&v_s, &_t190); drop_Str(&_t190); });
     #line 21694 "vuc.vu"
     VU_AT(21694);
     #line 21694 "vuc.vu"
-    ({ vu_str _t326 = ({ vu_str _t324 = {0}; vu_str_cat_bytes(&_t324, (const uint8_t *)"    memcpy(p, &vu_free_", 23); ({ vu_str *_t325 = &(*v_x); vu_str_cat(&_t324, &(*_t325)); }); vu_str_cat_bytes(&_t324, (const uint8_t *)", sizeof(void *));\n", 19); _t324; }); vu_str_cat(&v_s, &_t326); drop_Str(&_t326); });
+    ({ vu_str _t195 = ({ vu_str _t193 = {0}; vu_str_cat_bytes(&_t193, (const uint8_t *)"    vu_free_", 12); ({ vu_str *_t194 = &(*v_x); vu_str_cat(&_t193, &(*_t194)); }); vu_str_cat_bytes(&_t193, (const uint8_t *)" = NULL;\n", 9); _t193; }); vu_str_cat(&v_s, &_t195); drop_Str(&_t195); });
     #line 21695 "vuc.vu"
     VU_AT(21695);
     #line 21695 "vuc.vu"
-    ({ vu_str _t331 = ({ vu_str _t329 = {0}; vu_str_cat_bytes(&_t329, (const uint8_t *)"    vu_free_", 12); ({ vu_str *_t330 = &(*v_x); vu_str_cat(&_t329, &(*_t330)); }); vu_str_cat_bytes(&_t329, (const uint8_t *)" = p;\n", 6); _t329; }); vu_str_cat(&v_s, &_t331); drop_Str(&_t331); });
+    ({ vu_str _t200 = ({ vu_str _t198 = {0}; vu_str_cat_bytes(&_t198, (const uint8_t *)"    vu_nfree_", 13); ({ vu_str *_t199 = &(*v_x); vu_str_cat(&_t198, &(*_t199)); }); vu_str_cat_bytes(&_t198, (const uint8_t *)" = 0;\n", 6); _t198; }); vu_str_cat(&v_s, &_t200); drop_Str(&_t200); });
     #line 21696 "vuc.vu"
     VU_AT(21696);
     #line 21696 "vuc.vu"
-    ({ vu_str _t336 = ({ vu_str _t334 = {0}; vu_str_cat_bytes(&_t334, (const uint8_t *)"    VU_POISON(p, VU_NODE_", 25); ({ vu_str *_t335 = &(*v_x); vu_str_cat(&_t334, &(*_t335)); }); vu_str_cat_bytes(&_t334, (const uint8_t *)");   /* any later access to this freed node is reported */\n", 59); _t334; }); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    ({ vu_str _t203 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t203); drop_Str(&_t203); });
     #line 21697 "vuc.vu"
     VU_AT(21697);
     #line 21697 "vuc.vu"
-    ({ vu_str _t339 = vu_str_lit("#if defined(_OPENMP) || defined(VU_MT)\n", 39); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    ({ vu_str _t209 = ({ vu_str _t206 = {0}; vu_str_cat_bytes(&_t206, (const uint8_t *)"VU_G vu_pool vu_pool_", 21); ({ vu_str *_t207 = &(*v_x); vu_str_cat(&_t206, &(*_t207)); }); vu_str_cat_bytes(&_t206, (const uint8_t *)" VU_GI({ vu_give_chunk_", 23); ({ vu_str *_t208 = &(*v_x); vu_str_cat(&_t206, &(*_t208)); }); vu_str_cat_bytes(&_t206, (const uint8_t *)", NULL });\n", 11); _t206; }); vu_str_cat(&v_s, &_t209); drop_Str(&_t209); });
     #line 21698 "vuc.vu"
     VU_AT(21698);
     #line 21698 "vuc.vu"
-    ({ vu_str _t342 = vu_str_lit("    /* nodes made on other threads and freed here (a task receiving values from another thread)\n", 96); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    ({ vu_str _t212 = vu_str_lit("#ifndef VU_PART\n", 16); vu_str_cat(&v_s, &_t212); drop_Str(&_t212); });
     #line 21699 "vuc.vu"
     VU_AT(21699);
     #line 21699 "vuc.vu"
-    ({ vu_str _t345 = vu_str_lit("       would pile up on this list: past a limit the list goes to the shared pool */\n", 84); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    ({ vu_str _t219 = ({ vu_str _t215 = {0}; vu_str_cat_bytes(&_t215, (const uint8_t *)"__attribute__((constructor)) static void vu_pool_init_", 54); ({ vu_str *_t216 = &(*v_x); vu_str_cat(&_t215, &(*_t216)); }); vu_str_cat_bytes(&_t215, (const uint8_t *)"(void) { vu_pool_", 17); ({ vu_str *_t217 = &(*v_x); vu_str_cat(&_t215, &(*_t217)); }); vu_str_cat_bytes(&_t215, (const uint8_t *)".next = vu_pools; vu_pools = &vu_pool_", 38); ({ vu_str *_t218 = &(*v_x); vu_str_cat(&_t215, &(*_t218)); }); vu_str_cat_bytes(&_t215, (const uint8_t *)"; }\n", 4); _t215; }); vu_str_cat(&v_s, &_t219); drop_Str(&_t219); });
     #line 21700 "vuc.vu"
     VU_AT(21700);
     #line 21700 "vuc.vu"
-    ({ vu_str _t351 = ({ vu_str _t348 = {0}; vu_str_cat_bytes(&_t348, (const uint8_t *)"    if (++vu_nfree_", 19); ({ vu_str *_t349 = &(*v_x); vu_str_cat(&_t348, &(*_t349)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" >= 4 * VU_TAKE) vu_give_chunk_", 31); ({ vu_str *_t350 = &(*v_x); vu_str_cat(&_t348, &(*_t350)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)"();\n", 4); _t348; }); vu_str_cat(&v_s, &_t351); drop_Str(&_t351); });
+    ({ vu_str _t222 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t222); drop_Str(&_t222); });
     #line 21701 "vuc.vu"
     VU_AT(21701);
     #line 21701 "vuc.vu"
-    ({ vu_str _t354 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t354); drop_Str(&_t354); });
+    ({ vu_str _t229 = ({ vu_str _t225 = {0}; vu_str_cat_bytes(&_t225, (const uint8_t *)"static inline ", 14); ({ vu_str *_t226 = &(*v_t); vu_str_cat(&_t225, &(*_t226)); }); vu_str_cat_bytes(&_t225, (const uint8_t *)" *vu_box_", 9); ({ vu_str *_t227 = &(*v_x); vu_str_cat(&_t225, &(*_t227)); }); vu_str_cat_bytes(&_t225, (const uint8_t *)"(", 1); ({ vu_str *_t228 = &(*v_t); vu_str_cat(&_t225, &(*_t228)); }); vu_str_cat_bytes(&_t225, (const uint8_t *)" v) {\n", 6); _t225; }); vu_str_cat(&v_s, &_t229); drop_Str(&_t229); });
     #line 21702 "vuc.vu"
     VU_AT(21702);
     #line 21702 "vuc.vu"
-    ({ vu_str _t357 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t357); drop_Str(&_t357); });
+    ({ vu_str _t232 = vu_str_lit("#ifdef VU_MALLOC\n", 17); vu_str_cat(&v_s, &_t232); drop_Str(&_t232); });
     #line 21703 "vuc.vu"
     VU_AT(21703);
     #line 21703 "vuc.vu"
-    ({ vu_str _t360 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t360); drop_Str(&_t360); });
+    ({ vu_str _t239 = ({ vu_str _t235 = {0}; vu_str_cat_bytes(&_t235, (const uint8_t *)"    ", 4); ({ vu_str *_t236 = &(*v_t); vu_str_cat(&_t235, &(*_t236)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)" *p = (", 7); ({ vu_str *_t237 = &(*v_t); vu_str_cat(&_t235, &(*_t237)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)" *)vu_malloc(sizeof(", 20); ({ vu_str *_t238 = &(*v_t); vu_str_cat(&_t235, &(*_t238)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)"));\n", 4); _t235; }); vu_str_cat(&v_s, &_t239); drop_Str(&_t239); });
     #line 21704 "vuc.vu"
     VU_AT(21704);
     #line 21704 "vuc.vu"
+    ({ vu_str _t242 = vu_str_lit("#else\n", 6); vu_str_cat(&v_s, &_t242); drop_Str(&_t242); });
+    #line 21705 "vuc.vu"
+    VU_AT(21705);
+    #line 21705 "vuc.vu"
+    ({ vu_str _t245 = vu_str_lit("#if defined(_OPENMP) || defined(VU_MT)\n", 39); vu_str_cat(&v_s, &_t245); drop_Str(&_t245); });
+    #line 21706 "vuc.vu"
+    VU_AT(21706);
+    #line 21706 "vuc.vu"
+    ({ vu_str _t252 = ({ vu_str _t248 = {0}; vu_str_cat_bytes(&_t248, (const uint8_t *)"    if (!vu_free_", 17); ({ vu_str *_t249 = &(*v_x); vu_str_cat(&_t248, &(*_t249)); }); vu_str_cat_bytes(&_t248, (const uint8_t *)" && __atomic_load_n(&vu_chunks_", 31); ({ vu_str *_t250 = &(*v_x); vu_str_cat(&_t248, &(*_t250)); }); vu_str_cat_bytes(&_t248, (const uint8_t *)", __ATOMIC_RELAXED)) vu_take_chunk_", 35); ({ vu_str *_t251 = &(*v_x); vu_str_cat(&_t248, &(*_t251)); }); vu_str_cat_bytes(&_t248, (const uint8_t *)"();\n", 4); _t248; }); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
+    #line 21707 "vuc.vu"
+    VU_AT(21707);
+    #line 21707 "vuc.vu"
+    ({ vu_str _t255 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
+    #line 21708 "vuc.vu"
+    VU_AT(21708);
+    #line 21708 "vuc.vu"
+    ({ vu_str _t261 = ({ vu_str _t258 = {0}; vu_str_cat_bytes(&_t258, (const uint8_t *)"    ", 4); ({ vu_str *_t259 = &(*v_t); vu_str_cat(&_t258, &(*_t259)); }); vu_str_cat_bytes(&_t258, (const uint8_t *)" *p = vu_free_", 14); ({ vu_str *_t260 = &(*v_x); vu_str_cat(&_t258, &(*_t260)); }); vu_str_cat_bytes(&_t258, (const uint8_t *)";\n", 2); _t258; }); vu_str_cat(&v_s, &_t261); drop_Str(&_t261); });
+    #line 21709 "vuc.vu"
+    VU_AT(21709);
+    #line 21709 "vuc.vu"
+    ({ vu_str _t264 = vu_str_lit("    if (p) {\n", 13); vu_str_cat(&v_s, &_t264); drop_Str(&_t264); });
+    #line 21710 "vuc.vu"
+    VU_AT(21710);
+    #line 21710 "vuc.vu"
+    ({ vu_str _t269 = ({ vu_str _t267 = {0}; vu_str_cat_bytes(&_t267, (const uint8_t *)"        VU_UNPOISON(p, VU_NODE_", 31); ({ vu_str *_t268 = &(*v_x); vu_str_cat(&_t267, &(*_t268)); }); vu_str_cat_bytes(&_t267, (const uint8_t *)");\n", 3); _t267; }); vu_str_cat(&v_s, &_t269); drop_Str(&_t269); });
+    #line 21711 "vuc.vu"
+    VU_AT(21711);
+    #line 21711 "vuc.vu"
+    ({ vu_str _t274 = ({ vu_str _t272 = {0}; vu_str_cat_bytes(&_t272, (const uint8_t *)"        memcpy(&vu_free_", 24); ({ vu_str *_t273 = &(*v_x); vu_str_cat(&_t272, &(*_t273)); }); vu_str_cat_bytes(&_t272, (const uint8_t *)", p, sizeof(void *));\n", 22); _t272; }); vu_str_cat(&v_s, &_t274); drop_Str(&_t274); });
+    #line 21712 "vuc.vu"
+    VU_AT(21712);
+    #line 21712 "vuc.vu"
+    ({ vu_str _t277 = vu_str_lit("#if defined(_OPENMP) || defined(VU_MT)\n", 39); vu_str_cat(&v_s, &_t277); drop_Str(&_t277); });
+    #line 21713 "vuc.vu"
+    VU_AT(21713);
+    #line 21713 "vuc.vu"
+    ({ vu_str _t282 = ({ vu_str _t280 = {0}; vu_str_cat_bytes(&_t280, (const uint8_t *)"        vu_nfree_", 17); ({ vu_str *_t281 = &(*v_x); vu_str_cat(&_t280, &(*_t281)); }); vu_str_cat_bytes(&_t280, (const uint8_t *)"--;\n", 4); _t280; }); vu_str_cat(&v_s, &_t282); drop_Str(&_t282); });
+    #line 21714 "vuc.vu"
+    VU_AT(21714);
+    #line 21714 "vuc.vu"
+    ({ vu_str _t285 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t285); drop_Str(&_t285); });
+    #line 21715 "vuc.vu"
+    VU_AT(21715);
+    #line 21715 "vuc.vu"
+    ({ vu_str _t288 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t288); drop_Str(&_t288); });
+    #line 21716 "vuc.vu"
+    VU_AT(21716);
+    #line 21716 "vuc.vu"
+    ({ vu_str _t294 = ({ vu_str _t291 = {0}; vu_str_cat_bytes(&_t291, (const uint8_t *)"    else p = (", 14); ({ vu_str *_t292 = &(*v_t); vu_str_cat(&_t291, &(*_t292)); }); vu_str_cat_bytes(&_t291, (const uint8_t *)" *)vu_bump(VU_NODE_", 19); ({ vu_str *_t293 = &(*v_x); vu_str_cat(&_t291, &(*_t293)); }); vu_str_cat_bytes(&_t291, (const uint8_t *)");\n", 3); _t291; }); vu_str_cat(&v_s, &_t294); drop_Str(&_t294); });
+    #line 21717 "vuc.vu"
+    VU_AT(21717);
+    #line 21717 "vuc.vu"
+    ({ vu_str _t297 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t297); drop_Str(&_t297); });
+    #line 21718 "vuc.vu"
+    VU_AT(21718);
+    #line 21718 "vuc.vu"
+    ({ vu_str _t300 = vu_str_lit("    *p = v;\n", 12); vu_str_cat(&v_s, &_t300); drop_Str(&_t300); });
+    #line 21719 "vuc.vu"
+    VU_AT(21719);
+    #line 21719 "vuc.vu"
+    ({ vu_str _t303 = vu_str_lit("    return p;\n", 14); vu_str_cat(&v_s, &_t303); drop_Str(&_t303); });
+    #line 21720 "vuc.vu"
+    VU_AT(21720);
+    #line 21720 "vuc.vu"
+    ({ vu_str _t306 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t306); drop_Str(&_t306); });
+    #line 21721 "vuc.vu"
+    VU_AT(21721);
+    #line 21721 "vuc.vu"
+    ({ vu_str _t312 = ({ vu_str _t309 = {0}; vu_str_cat_bytes(&_t309, (const uint8_t *)"static inline void vu_release_", 30); ({ vu_str *_t310 = &(*v_x); vu_str_cat(&_t309, &(*_t310)); }); vu_str_cat_bytes(&_t309, (const uint8_t *)"(", 1); ({ vu_str *_t311 = &(*v_t); vu_str_cat(&_t309, &(*_t311)); }); vu_str_cat_bytes(&_t309, (const uint8_t *)" *p) {\n", 7); _t309; }); vu_str_cat(&v_s, &_t312); drop_Str(&_t312); });
+    #line 21722 "vuc.vu"
+    VU_AT(21722);
+    #line 21722 "vuc.vu"
+    ({ vu_str _t315 = vu_str_lit("#ifdef VU_MALLOC\n", 17); vu_str_cat(&v_s, &_t315); drop_Str(&_t315); });
+    #line 21723 "vuc.vu"
+    VU_AT(21723);
+    #line 21723 "vuc.vu"
+    ({ vu_str _t318 = vu_str_lit("    free(p);\n", 13); vu_str_cat(&v_s, &_t318); drop_Str(&_t318); });
+    #line 21724 "vuc.vu"
+    VU_AT(21724);
+    #line 21724 "vuc.vu"
+    ({ vu_str _t321 = vu_str_lit("#else\n", 6); vu_str_cat(&v_s, &_t321); drop_Str(&_t321); });
+    #line 21725 "vuc.vu"
+    VU_AT(21725);
+    #line 21725 "vuc.vu"
+    ({ vu_str _t326 = ({ vu_str _t324 = {0}; vu_str_cat_bytes(&_t324, (const uint8_t *)"    memcpy(p, &vu_free_", 23); ({ vu_str *_t325 = &(*v_x); vu_str_cat(&_t324, &(*_t325)); }); vu_str_cat_bytes(&_t324, (const uint8_t *)", sizeof(void *));\n", 19); _t324; }); vu_str_cat(&v_s, &_t326); drop_Str(&_t326); });
+    #line 21726 "vuc.vu"
+    VU_AT(21726);
+    #line 21726 "vuc.vu"
+    ({ vu_str _t331 = ({ vu_str _t329 = {0}; vu_str_cat_bytes(&_t329, (const uint8_t *)"    vu_free_", 12); ({ vu_str *_t330 = &(*v_x); vu_str_cat(&_t329, &(*_t330)); }); vu_str_cat_bytes(&_t329, (const uint8_t *)" = p;\n", 6); _t329; }); vu_str_cat(&v_s, &_t331); drop_Str(&_t331); });
+    #line 21727 "vuc.vu"
+    VU_AT(21727);
+    #line 21727 "vuc.vu"
+    ({ vu_str _t336 = ({ vu_str _t334 = {0}; vu_str_cat_bytes(&_t334, (const uint8_t *)"    VU_POISON(p, VU_NODE_", 25); ({ vu_str *_t335 = &(*v_x); vu_str_cat(&_t334, &(*_t335)); }); vu_str_cat_bytes(&_t334, (const uint8_t *)");   /* any later access to this freed node is reported */\n", 59); _t334; }); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    #line 21728 "vuc.vu"
+    VU_AT(21728);
+    #line 21728 "vuc.vu"
+    ({ vu_str _t339 = vu_str_lit("#if defined(_OPENMP) || defined(VU_MT)\n", 39); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    #line 21729 "vuc.vu"
+    VU_AT(21729);
+    #line 21729 "vuc.vu"
+    ({ vu_str _t342 = vu_str_lit("    /* nodes made on other threads and freed here (a task receiving values from another thread)\n", 96); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    #line 21730 "vuc.vu"
+    VU_AT(21730);
+    #line 21730 "vuc.vu"
+    ({ vu_str _t345 = vu_str_lit("       would pile up on this list: past a limit the list goes to the shared pool */\n", 84); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    #line 21731 "vuc.vu"
+    VU_AT(21731);
+    #line 21731 "vuc.vu"
+    ({ vu_str _t351 = ({ vu_str _t348 = {0}; vu_str_cat_bytes(&_t348, (const uint8_t *)"    if (++vu_nfree_", 19); ({ vu_str *_t349 = &(*v_x); vu_str_cat(&_t348, &(*_t349)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" >= 4 * VU_TAKE) vu_give_chunk_", 31); ({ vu_str *_t350 = &(*v_x); vu_str_cat(&_t348, &(*_t350)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)"();\n", 4); _t348; }); vu_str_cat(&v_s, &_t351); drop_Str(&_t351); });
+    #line 21732 "vuc.vu"
+    VU_AT(21732);
+    #line 21732 "vuc.vu"
+    ({ vu_str _t354 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t354); drop_Str(&_t354); });
+    #line 21733 "vuc.vu"
+    VU_AT(21733);
+    #line 21733 "vuc.vu"
+    ({ vu_str _t357 = vu_str_lit("#endif\n", 7); vu_str_cat(&v_s, &_t357); drop_Str(&_t357); });
+    #line 21734 "vuc.vu"
+    VU_AT(21734);
+    #line 21734 "vuc.vu"
+    ({ vu_str _t360 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t360); drop_Str(&_t360); });
+    #line 21735 "vuc.vu"
+    VU_AT(21735);
+    #line 21735 "vuc.vu"
     {
-        #line 21704 "vuc.vu"
+        #line 21735 "vuc.vu"
         vu_str _t361 = VU_MV(v_s);
-        #line 21704 "vuc.vu"
+        #line 21735 "vuc.vu"
         return _t361;
-    #line 21704 "vuc.vu"
+    #line 21735 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_list_code(vu_str *restrict v_m, vu_str *restrict v_lt, vu_str *restrict v_et) {
-    #line 21706 "vuc.vu"
+    #line 21737 "vuc.vu"
     VU_ENTER("list_code");
-    #line 21707 "vuc.vu"
-    VU_AT(21707);
-    #line 21707 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21708 "vuc.vu"
-    VU_AT(21708);
-    #line 21708 "vuc.vu"
-    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"static inline ", 14); ({ vu_str *_t4 = &(*v_et); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" *vu_at_", 8); ({ vu_str *_t5 = &(*v_m); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)"(", 1); ({ vu_str *_t6 = &(*v_lt); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" *l, int64_t i, int line) {\n", 28); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
-    #line 21709 "vuc.vu"
-    VU_AT(21709);
-    #line 21709 "vuc.vu"
-    ({ vu_str _t10 = vu_str_lit("    /* one unsigned comparison: also catches i < 0, and measured faster than two signed ones (n-body 17%) */\n", 109); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
-    #line 21710 "vuc.vu"
-    VU_AT(21710);
-    #line 21710 "vuc.vu"
-    ({ vu_str _t13 = vu_str_lit("    if (__builtin_expect((uint64_t)i >= (uint64_t)l->len, 0)) vu_oob(i, l->len, line);\n", 87); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
-    #line 21711 "vuc.vu"
-    VU_AT(21711);
-    #line 21711 "vuc.vu"
-    ({ vu_str _t16 = vu_str_lit("    return &l->data[i];\n", 24); vu_str_cat(&v_s, &_t16); drop_Str(&_t16); });
-    #line 21712 "vuc.vu"
-    VU_AT(21712);
-    #line 21712 "vuc.vu"
-    ({ vu_str _t19 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t19); drop_Str(&_t19); });
-    #line 21713 "vuc.vu"
-    VU_AT(21713);
-    #line 21713 "vuc.vu"
-    ({ vu_str _t22 = vu_str_lit("/* A read in a tried loop (vu_vf_add in the runtime): out of range records a failure and reads a zero. */\n", 106); vu_str_cat(&v_s, &_t22); drop_Str(&_t22); });
-    #line 21714 "vuc.vu"
-    VU_AT(21714);
-    #line 21714 "vuc.vu"
-    ({ vu_str _t25 = vu_str_lit("/* (const after the element type: for a list of pointers, the pointers are what's const) */\n", 92); vu_str_cat(&v_s, &_t25); drop_Str(&_t25); });
-    #line 21715 "vuc.vu"
-    VU_AT(21715);
-    #line 21715 "vuc.vu"
-    ({ vu_str _t32 = ({ vu_str _t28 = {0}; vu_str_cat_bytes(&_t28, (const uint8_t *)"static inline ", 14); ({ vu_str *_t29 = &(*v_et); vu_str_cat(&_t28, &(*_t29)); }); vu_str_cat_bytes(&_t28, (const uint8_t *)" const *vu_vfat_", 16); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t28, &(*_t30)); }); vu_str_cat_bytes(&_t28, (const uint8_t *)"(const ", 7); ({ vu_str *_t31 = &(*v_lt); vu_str_cat(&_t28, &(*_t31)); }); vu_str_cat_bytes(&_t28, (const uint8_t *)" *l, int64_t i, uint64_t *f) {\n", 31); _t28; }); vu_str_cat(&v_s, &_t32); drop_Str(&_t32); });
-    #line 21716 "vuc.vu"
-    VU_AT(21716);
-    #line 21716 "vuc.vu"
-    ({ vu_str _t37 = ({ vu_str _t35 = {0}; vu_str_cat_bytes(&_t35, (const uint8_t *)"    static ", 11); ({ vu_str *_t36 = &(*v_et); vu_str_cat(&_t35, &(*_t36)); }); vu_str_cat_bytes(&_t35, (const uint8_t *)" const zero;\n", 13); _t35; }); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
-    #line 21717 "vuc.vu"
-    VU_AT(21717);
-    #line 21717 "vuc.vu"
-    ({ vu_str _t40 = vu_str_lit("    int in = (uint64_t)i < (uint64_t)l->len;\n", 45); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
-    #line 21718 "vuc.vu"
-    VU_AT(21718);
-    #line 21718 "vuc.vu"
-    ({ vu_str _t43 = vu_str_lit("    *f |= (uint64_t)!in;\n", 25); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
-    #line 21719 "vuc.vu"
-    VU_AT(21719);
-    #line 21719 "vuc.vu"
-    ({ vu_str _t46 = vu_str_lit("    return in ? &l->data[i] : &zero;\n", 37); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
-    #line 21720 "vuc.vu"
-    VU_AT(21720);
-    #line 21720 "vuc.vu"
-    ({ vu_str _t49 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
-    #line 21721 "vuc.vu"
-    VU_AT(21721);
-    #line 21721 "vuc.vu"
-    ({ vu_str _t52 = vu_str_lit("/* xs[a..b] (let part = xs[a..b]): the elements in place, read-only and never freed; the list it's\n", 99); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
-    #line 21722 "vuc.vu"
-    VU_AT(21722);
-    #line 21722 "vuc.vu"
-    ({ vu_str _t55 = vu_str_lit("   part of is frozen while the view lives. */\n", 46); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
-    #line 21723 "vuc.vu"
-    VU_AT(21723);
-    #line 21723 "vuc.vu"
-    ({ vu_str _t62 = ({ vu_str _t58 = {0}; vu_str_cat_bytes(&_t58, (const uint8_t *)"static inline ", 14); ({ vu_str *_t59 = &(*v_lt); vu_str_cat(&_t58, &(*_t59)); }); vu_str_cat_bytes(&_t58, (const uint8_t *)" vu_view_", 9); ({ vu_str *_t60 = &(*v_m); vu_str_cat(&_t58, &(*_t60)); }); vu_str_cat_bytes(&_t58, (const uint8_t *)"(const ", 7); ({ vu_str *_t61 = &(*v_lt); vu_str_cat(&_t58, &(*_t61)); }); vu_str_cat_bytes(&_t58, (const uint8_t *)" *l, int64_t a, int64_t b, int line) {\n", 39); _t58; }); vu_str_cat(&v_s, &_t62); drop_Str(&_t62); });
-    #line 21724 "vuc.vu"
-    VU_AT(21724);
-    #line 21724 "vuc.vu"
-    ({ vu_str _t65 = vu_str_lit("    if (a < 0 || b < a || b > l->len)\n", 38); vu_str_cat(&v_s, &_t65); drop_Str(&_t65); });
-    #line 21725 "vuc.vu"
-    VU_AT(21725);
-    #line 21725 "vuc.vu"
-    ({ vu_str _t68 = vu_str_lit("        vu_fail(line, \"slice %lld..%lld out of bounds for a list of length %lld\", (long long)a, (long long)b, (long long)l->len);\n", 130); vu_str_cat(&v_s, &_t68); drop_Str(&_t68); });
-    #line 21726 "vuc.vu"
-    VU_AT(21726);
-    #line 21726 "vuc.vu"
-    ({ vu_str _t73 = ({ vu_str _t71 = {0}; vu_str_cat_bytes(&_t71, (const uint8_t *)"    ", 4); ({ vu_str *_t72 = &(*v_lt); vu_str_cat(&_t71, &(*_t72)); }); vu_str_cat_bytes(&_t71, (const uint8_t *)" r = { .data = l->data ? l->data + a : NULL, .len = b - a, .cap = 0 };   /* (NULL + 0 is undefined) */\n", 103); _t71; }); vu_str_cat(&v_s, &_t73); drop_Str(&_t73); });
-    #line 21727 "vuc.vu"
-    VU_AT(21727);
-    #line 21727 "vuc.vu"
-    ({ vu_str _t76 = vu_str_lit("    return r;\n", 14); vu_str_cat(&v_s, &_t76); drop_Str(&_t76); });
-    #line 21728 "vuc.vu"
-    VU_AT(21728);
-    #line 21728 "vuc.vu"
-    ({ vu_str _t79 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t79); drop_Str(&_t79); });
-    #line 21729 "vuc.vu"
-    VU_AT(21729);
-    #line 21729 "vuc.vu"
-    ({ vu_str _t82 = vu_str_lit("/* var part = xs[a..b]: a copy (plain values only, checked by the compiler). */\n", 80); vu_str_cat(&v_s, &_t82); drop_Str(&_t82); });
-    #line 21730 "vuc.vu"
-    VU_AT(21730);
-    #line 21730 "vuc.vu"
-    ({ vu_str _t89 = ({ vu_str _t85 = {0}; vu_str_cat_bytes(&_t85, (const uint8_t *)"static ", 7); ({ vu_str *_t86 = &(*v_lt); vu_str_cat(&_t85, &(*_t86)); }); vu_str_cat_bytes(&_t85, (const uint8_t *)" vu_sub_", 8); ({ vu_str *_t87 = &(*v_m); vu_str_cat(&_t85, &(*_t87)); }); vu_str_cat_bytes(&_t85, (const uint8_t *)"(const ", 7); ({ vu_str *_t88 = &(*v_lt); vu_str_cat(&_t85, &(*_t88)); }); vu_str_cat_bytes(&_t85, (const uint8_t *)" *l, int64_t a, int64_t b, int line) {\n", 39); _t85; }); vu_str_cat(&v_s, &_t89); drop_Str(&_t89); });
-    #line 21731 "vuc.vu"
-    VU_AT(21731);
-    #line 21731 "vuc.vu"
-    ({ vu_str _t92 = vu_str_lit("    if (a < 0 || b < a || b > l->len)\n", 38); vu_str_cat(&v_s, &_t92); drop_Str(&_t92); });
-    #line 21732 "vuc.vu"
-    VU_AT(21732);
-    #line 21732 "vuc.vu"
-    ({ vu_str _t95 = vu_str_lit("        vu_fail(line, \"slice %lld..%lld out of bounds for a list of length %lld\", (long long)a, (long long)b, (long long)l->len);\n", 130); vu_str_cat(&v_s, &_t95); drop_Str(&_t95); });
-    #line 21733 "vuc.vu"
-    VU_AT(21733);
-    #line 21733 "vuc.vu"
-    ({ vu_str _t100 = ({ vu_str _t98 = {0}; vu_str_cat_bytes(&_t98, (const uint8_t *)"    ", 4); ({ vu_str *_t99 = &(*v_lt); vu_str_cat(&_t98, &(*_t99)); }); vu_str_cat_bytes(&_t98, (const uint8_t *)" r = {0};\n", 10); _t98; }); vu_str_cat(&v_s, &_t100); drop_Str(&_t100); });
-    #line 21734 "vuc.vu"
-    VU_AT(21734);
-    #line 21734 "vuc.vu"
-    ({ vu_str _t103 = vu_str_lit("    if (b > a) {\n", 17); vu_str_cat(&v_s, &_t103); drop_Str(&_t103); });
-    #line 21735 "vuc.vu"
-    VU_AT(21735);
-    #line 21735 "vuc.vu"
-    ({ vu_str _t109 = ({ vu_str _t106 = {0}; vu_str_cat_bytes(&_t106, (const uint8_t *)"        r.data = (", 18); ({ vu_str *_t107 = &(*v_et); vu_str_cat(&_t106, &(*_t107)); }); vu_str_cat_bytes(&_t106, (const uint8_t *)" *)vu_malloc((size_t)(b - a) * sizeof(", 38); ({ vu_str *_t108 = &(*v_et); vu_str_cat(&_t106, &(*_t108)); }); vu_str_cat_bytes(&_t106, (const uint8_t *)"));\n", 4); _t106; }); vu_str_cat(&v_s, &_t109); drop_Str(&_t109); });
-    #line 21736 "vuc.vu"
-    VU_AT(21736);
-    #line 21736 "vuc.vu"
-    ({ vu_str _t114 = ({ vu_str _t112 = {0}; vu_str_cat_bytes(&_t112, (const uint8_t *)"        memcpy(r.data, l->data + a, (size_t)(b - a) * sizeof(", 61); ({ vu_str *_t113 = &(*v_et); vu_str_cat(&_t112, &(*_t113)); }); vu_str_cat_bytes(&_t112, (const uint8_t *)"));\n", 4); _t112; }); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
-    #line 21737 "vuc.vu"
-    VU_AT(21737);
-    #line 21737 "vuc.vu"
-    ({ vu_str _t117 = vu_str_lit("        r.len = r.cap = b - a;\n", 31); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
     #line 21738 "vuc.vu"
     VU_AT(21738);
     #line 21738 "vuc.vu"
-    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 21739 "vuc.vu"
     VU_AT(21739);
     #line 21739 "vuc.vu"
-    ({ vu_str _t123 = vu_str_lit("    return r;\n", 14); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
+    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"static inline ", 14); ({ vu_str *_t4 = &(*v_et); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" *vu_at_", 8); ({ vu_str *_t5 = &(*v_m); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)"(", 1); ({ vu_str *_t6 = &(*v_lt); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" *l, int64_t i, int line) {\n", 28); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
     #line 21740 "vuc.vu"
     VU_AT(21740);
     #line 21740 "vuc.vu"
-    ({ vu_str _t126 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t126); drop_Str(&_t126); });
+    ({ vu_str _t10 = vu_str_lit("    /* one unsigned comparison: also catches i < 0, and measured faster than two signed ones (n-body 17%) */\n", 109); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
     #line 21741 "vuc.vu"
     VU_AT(21741);
     #line 21741 "vuc.vu"
-    ({ vu_str _t132 = ({ vu_str _t129 = {0}; vu_str_cat_bytes(&_t129, (const uint8_t *)"static void vu_grow_", 20); ({ vu_str *_t130 = &(*v_m); vu_str_cat(&_t129, &(*_t130)); }); vu_str_cat_bytes(&_t129, (const uint8_t *)"(", 1); ({ vu_str *_t131 = &(*v_lt); vu_str_cat(&_t129, &(*_t131)); }); vu_str_cat_bytes(&_t129, (const uint8_t *)" *l) {\n", 7); _t129; }); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
+    ({ vu_str _t13 = vu_str_lit("    if (__builtin_expect((uint64_t)i >= (uint64_t)l->len, 0)) vu_oob(i, l->len, line);\n", 87); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
     #line 21742 "vuc.vu"
     VU_AT(21742);
     #line 21742 "vuc.vu"
-    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"    if (l->cap > (int64_t)(PTRDIFF_MAX / sizeof(", 48); ({ vu_str *_t136 = &(*v_et); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
+    ({ vu_str _t16 = vu_str_lit("    return &l->data[i];\n", 24); vu_str_cat(&v_s, &_t16); drop_Str(&_t16); });
     #line 21743 "vuc.vu"
     VU_AT(21743);
     #line 21743 "vuc.vu"
-    ({ vu_str _t140 = vu_str_lit("    int64_t c = l->cap ? l->cap * 2 : 4;\n", 41); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
+    ({ vu_str _t19 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t19); drop_Str(&_t19); });
     #line 21744 "vuc.vu"
     VU_AT(21744);
     #line 21744 "vuc.vu"
-    ({ vu_str _t147 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"    ", 4); ({ vu_str *_t144 = &(*v_et); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *d = (", 7); ({ vu_str *_t145 = &(*v_et); vu_str_cat(&_t143, &(*_t145)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *)realloc(l->data, (size_t)c * sizeof(", 39); ({ vu_str *_t146 = &(*v_et); vu_str_cat(&_t143, &(*_t146)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)"));\n", 4); _t143; }); vu_str_cat(&v_s, &_t147); drop_Str(&_t147); });
+    ({ vu_str _t22 = vu_str_lit("/* A read in a tried loop (vu_vf_add in the runtime): out of range records a failure and reads a zero. */\n", 106); vu_str_cat(&v_s, &_t22); drop_Str(&_t22); });
     #line 21745 "vuc.vu"
     VU_AT(21745);
     #line 21745 "vuc.vu"
-    ({ vu_str _t150 = vu_str_lit("    if (!d) vu_oom();\n", 22); vu_str_cat(&v_s, &_t150); drop_Str(&_t150); });
+    ({ vu_str _t25 = vu_str_lit("/* (const after the element type: for a list of pointers, the pointers are what's const) */\n", 92); vu_str_cat(&v_s, &_t25); drop_Str(&_t25); });
     #line 21746 "vuc.vu"
     VU_AT(21746);
     #line 21746 "vuc.vu"
-    ({ vu_str _t153 = vu_str_lit("    l->data = d;\n", 17); vu_str_cat(&v_s, &_t153); drop_Str(&_t153); });
+    ({ vu_str _t32 = ({ vu_str _t28 = {0}; vu_str_cat_bytes(&_t28, (const uint8_t *)"static inline ", 14); ({ vu_str *_t29 = &(*v_et); vu_str_cat(&_t28, &(*_t29)); }); vu_str_cat_bytes(&_t28, (const uint8_t *)" const *vu_vfat_", 16); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t28, &(*_t30)); }); vu_str_cat_bytes(&_t28, (const uint8_t *)"(const ", 7); ({ vu_str *_t31 = &(*v_lt); vu_str_cat(&_t28, &(*_t31)); }); vu_str_cat_bytes(&_t28, (const uint8_t *)" *l, int64_t i, uint64_t *f) {\n", 31); _t28; }); vu_str_cat(&v_s, &_t32); drop_Str(&_t32); });
     #line 21747 "vuc.vu"
     VU_AT(21747);
     #line 21747 "vuc.vu"
-    ({ vu_str _t156 = vu_str_lit("    l->cap = c;\n", 16); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
+    ({ vu_str _t37 = ({ vu_str _t35 = {0}; vu_str_cat_bytes(&_t35, (const uint8_t *)"    static ", 11); ({ vu_str *_t36 = &(*v_et); vu_str_cat(&_t35, &(*_t36)); }); vu_str_cat_bytes(&_t35, (const uint8_t *)" const zero;\n", 13); _t35; }); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
     #line 21748 "vuc.vu"
     VU_AT(21748);
     #line 21748 "vuc.vu"
-    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
+    ({ vu_str _t40 = vu_str_lit("    int in = (uint64_t)i < (uint64_t)l->len;\n", 45); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
     #line 21749 "vuc.vu"
     VU_AT(21749);
     #line 21749 "vuc.vu"
-    ({ vu_str _t165 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_reserve_", 23); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_lt); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *l, int64_t n, int line) {\n", 28); _t162; }); vu_str_cat(&v_s, &_t165); drop_Str(&_t165); });
+    ({ vu_str _t43 = vu_str_lit("    *f |= (uint64_t)!in;\n", 25); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
     #line 21750 "vuc.vu"
     VU_AT(21750);
     #line 21750 "vuc.vu"
-    ({ vu_str _t168 = vu_str_lit("    if (n < 0) vu_fail(line, \"reserve(%lld): the count can't be negative\", (long long)n);\n", 90); vu_str_cat(&v_s, &_t168); drop_Str(&_t168); });
+    ({ vu_str _t46 = vu_str_lit("    return in ? &l->data[i] : &zero;\n", 37); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
     #line 21751 "vuc.vu"
     VU_AT(21751);
     #line 21751 "vuc.vu"
-    ({ vu_str _t171 = vu_str_lit("    if (n <= l->cap - l->len) return;\n", 38); vu_str_cat(&v_s, &_t171); drop_Str(&_t171); });
+    ({ vu_str _t49 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
     #line 21752 "vuc.vu"
     VU_AT(21752);
     #line 21752 "vuc.vu"
-    ({ vu_str _t176 = ({ vu_str _t174 = {0}; vu_str_cat_bytes(&_t174, (const uint8_t *)"    if (n > (int64_t)(PTRDIFF_MAX / sizeof(", 43); ({ vu_str *_t175 = &(*v_et); vu_str_cat(&_t174, &(*_t175)); }); vu_str_cat_bytes(&_t174, (const uint8_t *)")) - l->len) vu_oom();\n", 23); _t174; }); vu_str_cat(&v_s, &_t176); drop_Str(&_t176); });
+    ({ vu_str _t52 = vu_str_lit("/* xs[a..b] (let part = xs[a..b]): the elements in place, read-only and never freed; the list it's\n", 99); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
     #line 21753 "vuc.vu"
     VU_AT(21753);
     #line 21753 "vuc.vu"
-    ({ vu_str _t179 = vu_str_lit("    int64_t c = l->len + n;\n", 28); vu_str_cat(&v_s, &_t179); drop_Str(&_t179); });
+    ({ vu_str _t55 = vu_str_lit("   part of is frozen while the view lives. */\n", 46); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
     #line 21754 "vuc.vu"
     VU_AT(21754);
     #line 21754 "vuc.vu"
-    ({ vu_str _t186 = ({ vu_str _t182 = {0}; vu_str_cat_bytes(&_t182, (const uint8_t *)"    ", 4); ({ vu_str *_t183 = &(*v_et); vu_str_cat(&_t182, &(*_t183)); }); vu_str_cat_bytes(&_t182, (const uint8_t *)" *d = (", 7); ({ vu_str *_t184 = &(*v_et); vu_str_cat(&_t182, &(*_t184)); }); vu_str_cat_bytes(&_t182, (const uint8_t *)" *)realloc(l->data, (size_t)c * sizeof(", 39); ({ vu_str *_t185 = &(*v_et); vu_str_cat(&_t182, &(*_t185)); }); vu_str_cat_bytes(&_t182, (const uint8_t *)"));\n", 4); _t182; }); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
+    ({ vu_str _t62 = ({ vu_str _t58 = {0}; vu_str_cat_bytes(&_t58, (const uint8_t *)"static inline ", 14); ({ vu_str *_t59 = &(*v_lt); vu_str_cat(&_t58, &(*_t59)); }); vu_str_cat_bytes(&_t58, (const uint8_t *)" vu_view_", 9); ({ vu_str *_t60 = &(*v_m); vu_str_cat(&_t58, &(*_t60)); }); vu_str_cat_bytes(&_t58, (const uint8_t *)"(const ", 7); ({ vu_str *_t61 = &(*v_lt); vu_str_cat(&_t58, &(*_t61)); }); vu_str_cat_bytes(&_t58, (const uint8_t *)" *l, int64_t a, int64_t b, int line) {\n", 39); _t58; }); vu_str_cat(&v_s, &_t62); drop_Str(&_t62); });
     #line 21755 "vuc.vu"
     VU_AT(21755);
     #line 21755 "vuc.vu"
-    ({ vu_str _t189 = vu_str_lit("    if (!d) vu_oom();\n", 22); vu_str_cat(&v_s, &_t189); drop_Str(&_t189); });
+    ({ vu_str _t65 = vu_str_lit("    if (a < 0 || b < a || b > l->len)\n", 38); vu_str_cat(&v_s, &_t65); drop_Str(&_t65); });
     #line 21756 "vuc.vu"
     VU_AT(21756);
     #line 21756 "vuc.vu"
-    ({ vu_str _t192 = vu_str_lit("    l->data = d;\n", 17); vu_str_cat(&v_s, &_t192); drop_Str(&_t192); });
+    ({ vu_str _t68 = vu_str_lit("        vu_fail(line, \"slice %lld..%lld out of bounds for a list of length %lld\", (long long)a, (long long)b, (long long)l->len);\n", 130); vu_str_cat(&v_s, &_t68); drop_Str(&_t68); });
     #line 21757 "vuc.vu"
     VU_AT(21757);
     #line 21757 "vuc.vu"
-    ({ vu_str _t195 = vu_str_lit("    l->cap = c;\n", 16); vu_str_cat(&v_s, &_t195); drop_Str(&_t195); });
+    ({ vu_str _t73 = ({ vu_str _t71 = {0}; vu_str_cat_bytes(&_t71, (const uint8_t *)"    ", 4); ({ vu_str *_t72 = &(*v_lt); vu_str_cat(&_t71, &(*_t72)); }); vu_str_cat_bytes(&_t71, (const uint8_t *)" r = { .data = l->data ? l->data + a : NULL, .len = b - a, .cap = 0 };   /* (NULL + 0 is undefined) */\n", 103); _t71; }); vu_str_cat(&v_s, &_t73); drop_Str(&_t73); });
     #line 21758 "vuc.vu"
     VU_AT(21758);
     #line 21758 "vuc.vu"
-    ({ vu_str _t198 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t198); drop_Str(&_t198); });
+    ({ vu_str _t76 = vu_str_lit("    return r;\n", 14); vu_str_cat(&v_s, &_t76); drop_Str(&_t76); });
     #line 21759 "vuc.vu"
     VU_AT(21759);
     #line 21759 "vuc.vu"
-    ({ vu_str _t205 = ({ vu_str _t201 = {0}; vu_str_cat_bytes(&_t201, (const uint8_t *)"static inline ", 14); ({ vu_str *_t202 = &(*v_et); vu_str_cat(&_t201, &(*_t202)); }); vu_str_cat_bytes(&_t201, (const uint8_t *)" vu_pop_", 8); ({ vu_str *_t203 = &(*v_m); vu_str_cat(&_t201, &(*_t203)); }); vu_str_cat_bytes(&_t201, (const uint8_t *)"(", 1); ({ vu_str *_t204 = &(*v_lt); vu_str_cat(&_t201, &(*_t204)); }); vu_str_cat_bytes(&_t201, (const uint8_t *)" *l, int line) {\n", 17); _t201; }); vu_str_cat(&v_s, &_t205); drop_Str(&_t205); });
+    ({ vu_str _t79 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t79); drop_Str(&_t79); });
     #line 21760 "vuc.vu"
     VU_AT(21760);
     #line 21760 "vuc.vu"
-    ({ vu_str _t208 = vu_str_lit("    if (__builtin_expect(l->len == 0, 0)) vu_fail(line, \"pop() from an empty list\");\n", 85); vu_str_cat(&v_s, &_t208); drop_Str(&_t208); });
+    ({ vu_str _t82 = vu_str_lit("/* var part = xs[a..b]: a copy (plain values only, checked by the compiler). */\n", 80); vu_str_cat(&v_s, &_t82); drop_Str(&_t82); });
     #line 21761 "vuc.vu"
     VU_AT(21761);
     #line 21761 "vuc.vu"
-    ({ vu_str _t211 = vu_str_lit("    return l->data[--l->len];\n", 30); vu_str_cat(&v_s, &_t211); drop_Str(&_t211); });
+    ({ vu_str _t89 = ({ vu_str _t85 = {0}; vu_str_cat_bytes(&_t85, (const uint8_t *)"static ", 7); ({ vu_str *_t86 = &(*v_lt); vu_str_cat(&_t85, &(*_t86)); }); vu_str_cat_bytes(&_t85, (const uint8_t *)" vu_sub_", 8); ({ vu_str *_t87 = &(*v_m); vu_str_cat(&_t85, &(*_t87)); }); vu_str_cat_bytes(&_t85, (const uint8_t *)"(const ", 7); ({ vu_str *_t88 = &(*v_lt); vu_str_cat(&_t85, &(*_t88)); }); vu_str_cat_bytes(&_t85, (const uint8_t *)" *l, int64_t a, int64_t b, int line) {\n", 39); _t85; }); vu_str_cat(&v_s, &_t89); drop_Str(&_t89); });
     #line 21762 "vuc.vu"
     VU_AT(21762);
     #line 21762 "vuc.vu"
-    ({ vu_str _t214 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t214); drop_Str(&_t214); });
+    ({ vu_str _t92 = vu_str_lit("    if (a < 0 || b < a || b > l->len)\n", 38); vu_str_cat(&v_s, &_t92); drop_Str(&_t92); });
     #line 21763 "vuc.vu"
     VU_AT(21763);
     #line 21763 "vuc.vu"
-    ({ vu_str _t221 = ({ vu_str _t217 = {0}; vu_str_cat_bytes(&_t217, (const uint8_t *)"static inline void vu_push_", 27); ({ vu_str *_t218 = &(*v_m); vu_str_cat(&_t217, &(*_t218)); }); vu_str_cat_bytes(&_t217, (const uint8_t *)"(", 1); ({ vu_str *_t219 = &(*v_lt); vu_str_cat(&_t217, &(*_t219)); }); vu_str_cat_bytes(&_t217, (const uint8_t *)" *l, ", 5); ({ vu_str *_t220 = &(*v_et); vu_str_cat(&_t217, &(*_t220)); }); vu_str_cat_bytes(&_t217, (const uint8_t *)" v) {\n", 6); _t217; }); vu_str_cat(&v_s, &_t221); drop_Str(&_t221); });
+    ({ vu_str _t95 = vu_str_lit("        vu_fail(line, \"slice %lld..%lld out of bounds for a list of length %lld\", (long long)a, (long long)b, (long long)l->len);\n", 130); vu_str_cat(&v_s, &_t95); drop_Str(&_t95); });
     #line 21764 "vuc.vu"
     VU_AT(21764);
     #line 21764 "vuc.vu"
-    ({ vu_str _t226 = ({ vu_str _t224 = {0}; vu_str_cat_bytes(&_t224, (const uint8_t *)"    if (l->len == l->cap) vu_grow_", 34); ({ vu_str *_t225 = &(*v_m); vu_str_cat(&_t224, &(*_t225)); }); vu_str_cat_bytes(&_t224, (const uint8_t *)"(l);\n", 5); _t224; }); vu_str_cat(&v_s, &_t226); drop_Str(&_t226); });
+    ({ vu_str _t100 = ({ vu_str _t98 = {0}; vu_str_cat_bytes(&_t98, (const uint8_t *)"    ", 4); ({ vu_str *_t99 = &(*v_lt); vu_str_cat(&_t98, &(*_t99)); }); vu_str_cat_bytes(&_t98, (const uint8_t *)" r = {0};\n", 10); _t98; }); vu_str_cat(&v_s, &_t100); drop_Str(&_t100); });
     #line 21765 "vuc.vu"
     VU_AT(21765);
     #line 21765 "vuc.vu"
-    ({ vu_str _t229 = vu_str_lit("    l->data[l->len++] = v;\n", 27); vu_str_cat(&v_s, &_t229); drop_Str(&_t229); });
+    ({ vu_str _t103 = vu_str_lit("    if (b > a) {\n", 17); vu_str_cat(&v_s, &_t103); drop_Str(&_t103); });
     #line 21766 "vuc.vu"
     VU_AT(21766);
     #line 21766 "vuc.vu"
-    ({ vu_str _t232 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t232); drop_Str(&_t232); });
+    ({ vu_str _t109 = ({ vu_str _t106 = {0}; vu_str_cat_bytes(&_t106, (const uint8_t *)"        r.data = (", 18); ({ vu_str *_t107 = &(*v_et); vu_str_cat(&_t106, &(*_t107)); }); vu_str_cat_bytes(&_t106, (const uint8_t *)" *)vu_malloc((size_t)(b - a) * sizeof(", 38); ({ vu_str *_t108 = &(*v_et); vu_str_cat(&_t106, &(*_t108)); }); vu_str_cat_bytes(&_t106, (const uint8_t *)"));\n", 4); _t106; }); vu_str_cat(&v_s, &_t109); drop_Str(&_t109); });
     #line 21767 "vuc.vu"
     VU_AT(21767);
     #line 21767 "vuc.vu"
-    ({ vu_str _t239 = ({ vu_str _t235 = {0}; vu_str_cat_bytes(&_t235, (const uint8_t *)"static ", 7); ({ vu_str *_t236 = &(*v_lt); vu_str_cat(&_t235, &(*_t236)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)" vu_rep_", 8); ({ vu_str *_t237 = &(*v_m); vu_str_cat(&_t235, &(*_t237)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)"(", 1); ({ vu_str *_t238 = &(*v_lt); vu_str_cat(&_t235, &(*_t238)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)" src, int64_t n, int line) {\n", 29); _t235; }); vu_str_cat(&v_s, &_t239); drop_Str(&_t239); });
+    ({ vu_str _t114 = ({ vu_str _t112 = {0}; vu_str_cat_bytes(&_t112, (const uint8_t *)"        memcpy(r.data, l->data + a, (size_t)(b - a) * sizeof(", 61); ({ vu_str *_t113 = &(*v_et); vu_str_cat(&_t112, &(*_t113)); }); vu_str_cat_bytes(&_t112, (const uint8_t *)"));\n", 4); _t112; }); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
     #line 21768 "vuc.vu"
     VU_AT(21768);
     #line 21768 "vuc.vu"
-    ({ vu_str _t244 = ({ vu_str _t242 = {0}; vu_str_cat_bytes(&_t242, (const uint8_t *)"    ", 4); ({ vu_str *_t243 = &(*v_lt); vu_str_cat(&_t242, &(*_t243)); }); vu_str_cat_bytes(&_t242, (const uint8_t *)" r = {0};\n", 10); _t242; }); vu_str_cat(&v_s, &_t244); drop_Str(&_t244); });
+    ({ vu_str _t117 = vu_str_lit("        r.len = r.cap = b - a;\n", 31); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
     #line 21769 "vuc.vu"
     VU_AT(21769);
     #line 21769 "vuc.vu"
-    ({ vu_str _t247 = vu_str_lit("    if (n > 0 && src.len > 0) {\n", 32); vu_str_cat(&v_s, &_t247); drop_Str(&_t247); });
+    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
     #line 21770 "vuc.vu"
     VU_AT(21770);
     #line 21770 "vuc.vu"
-    ({ vu_str _t252 = ({ vu_str _t250 = {0}; vu_str_cat_bytes(&_t250, (const uint8_t *)"        if (n > INT64_MAX / src.len || src.len * n > (int64_t)(PTRDIFF_MAX / sizeof(", 84); ({ vu_str *_t251 = &(*v_et); vu_str_cat(&_t250, &(*_t251)); }); vu_str_cat_bytes(&_t250, (const uint8_t *)")))\n", 4); _t250; }); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
+    ({ vu_str _t123 = vu_str_lit("    return r;\n", 14); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
     #line 21771 "vuc.vu"
     VU_AT(21771);
     #line 21771 "vuc.vu"
-    ({ vu_str _t255 = vu_str_lit("            vu_fail(line, \"list of %lld x %lld elements is too large\", (long long)src.len, (long long)n);\n", 106); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
+    ({ vu_str _t126 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t126); drop_Str(&_t126); });
     #line 21772 "vuc.vu"
     VU_AT(21772);
     #line 21772 "vuc.vu"
-    ({ vu_str _t258 = vu_str_lit("        int64_t total = src.len * n;\n", 37); vu_str_cat(&v_s, &_t258); drop_Str(&_t258); });
+    ({ vu_str _t132 = ({ vu_str _t129 = {0}; vu_str_cat_bytes(&_t129, (const uint8_t *)"static void vu_grow_", 20); ({ vu_str *_t130 = &(*v_m); vu_str_cat(&_t129, &(*_t130)); }); vu_str_cat_bytes(&_t129, (const uint8_t *)"(", 1); ({ vu_str *_t131 = &(*v_lt); vu_str_cat(&_t129, &(*_t131)); }); vu_str_cat_bytes(&_t129, (const uint8_t *)" *l) {\n", 7); _t129; }); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
     #line 21773 "vuc.vu"
     VU_AT(21773);
     #line 21773 "vuc.vu"
-    ({ vu_str _t264 = ({ vu_str _t261 = {0}; vu_str_cat_bytes(&_t261, (const uint8_t *)"        r.data = (", 18); ({ vu_str *_t262 = &(*v_et); vu_str_cat(&_t261, &(*_t262)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *)vu_malloc((size_t)total * sizeof(", 36); ({ vu_str *_t263 = &(*v_et); vu_str_cat(&_t261, &(*_t263)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"));\n", 4); _t261; }); vu_str_cat(&v_s, &_t264); drop_Str(&_t264); });
+    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"    if (l->cap > (int64_t)(PTRDIFF_MAX / sizeof(", 48); ({ vu_str *_t136 = &(*v_et); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
     #line 21774 "vuc.vu"
     VU_AT(21774);
     #line 21774 "vuc.vu"
-    ({ vu_str _t267 = vu_str_lit("        r.len = r.cap = total;\n", 31); vu_str_cat(&v_s, &_t267); drop_Str(&_t267); });
+    ({ vu_str _t140 = vu_str_lit("    int64_t c = l->cap ? l->cap * 2 : 4;\n", 41); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
     #line 21775 "vuc.vu"
     VU_AT(21775);
     #line 21775 "vuc.vu"
-    ({ vu_str _t272 = ({ vu_str _t270 = {0}; vu_str_cat_bytes(&_t270, (const uint8_t *)"        if (src.len == 1) { ", 28); ({ vu_str *_t271 = &(*v_et); vu_str_cat(&_t270, &(*_t271)); }); vu_str_cat_bytes(&_t270, (const uint8_t *)" v = src.data[0]; for (int64_t k = 0; k < total; k++) r.data[k] = v; }\n", 71); _t270; }); vu_str_cat(&v_s, &_t272); drop_Str(&_t272); });
+    ({ vu_str _t147 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"    ", 4); ({ vu_str *_t144 = &(*v_et); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *d = (", 7); ({ vu_str *_t145 = &(*v_et); vu_str_cat(&_t143, &(*_t145)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *)realloc(l->data, (size_t)c * sizeof(", 39); ({ vu_str *_t146 = &(*v_et); vu_str_cat(&_t143, &(*_t146)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)"));\n", 4); _t143; }); vu_str_cat(&v_s, &_t147); drop_Str(&_t147); });
     #line 21776 "vuc.vu"
     VU_AT(21776);
     #line 21776 "vuc.vu"
-    ({ vu_str _t277 = ({ vu_str _t275 = {0}; vu_str_cat_bytes(&_t275, (const uint8_t *)"        else for (int64_t k = 0; k < n; k++) memcpy(r.data + k * src.len, src.data, (size_t)src.len * sizeof(", 109); ({ vu_str *_t276 = &(*v_et); vu_str_cat(&_t275, &(*_t276)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"));\n", 4); _t275; }); vu_str_cat(&v_s, &_t277); drop_Str(&_t277); });
+    ({ vu_str _t150 = vu_str_lit("    if (!d) vu_oom();\n", 22); vu_str_cat(&v_s, &_t150); drop_Str(&_t150); });
     #line 21777 "vuc.vu"
     VU_AT(21777);
     #line 21777 "vuc.vu"
-    ({ vu_str _t280 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t280); drop_Str(&_t280); });
+    ({ vu_str _t153 = vu_str_lit("    l->data = d;\n", 17); vu_str_cat(&v_s, &_t153); drop_Str(&_t153); });
     #line 21778 "vuc.vu"
     VU_AT(21778);
     #line 21778 "vuc.vu"
-    ({ vu_str _t283 = vu_str_lit("    free(src.data);\n", 20); vu_str_cat(&v_s, &_t283); drop_Str(&_t283); });
+    ({ vu_str _t156 = vu_str_lit("    l->cap = c;\n", 16); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
     #line 21779 "vuc.vu"
     VU_AT(21779);
     #line 21779 "vuc.vu"
-    ({ vu_str _t286 = vu_str_lit("    return r;\n", 14); vu_str_cat(&v_s, &_t286); drop_Str(&_t286); });
+    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
     #line 21780 "vuc.vu"
     VU_AT(21780);
     #line 21780 "vuc.vu"
-    ({ vu_str _t289 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t289); drop_Str(&_t289); });
+    ({ vu_str _t165 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_reserve_", 23); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_lt); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *l, int64_t n, int line) {\n", 28); _t162; }); vu_str_cat(&v_s, &_t165); drop_Str(&_t165); });
     #line 21781 "vuc.vu"
     VU_AT(21781);
     #line 21781 "vuc.vu"
+    ({ vu_str _t168 = vu_str_lit("    if (n < 0) vu_fail(line, \"reserve(%lld): the count can't be negative\", (long long)n);\n", 90); vu_str_cat(&v_s, &_t168); drop_Str(&_t168); });
+    #line 21782 "vuc.vu"
+    VU_AT(21782);
+    #line 21782 "vuc.vu"
+    ({ vu_str _t171 = vu_str_lit("    if (n <= l->cap - l->len) return;\n", 38); vu_str_cat(&v_s, &_t171); drop_Str(&_t171); });
+    #line 21783 "vuc.vu"
+    VU_AT(21783);
+    #line 21783 "vuc.vu"
+    ({ vu_str _t176 = ({ vu_str _t174 = {0}; vu_str_cat_bytes(&_t174, (const uint8_t *)"    if (n > (int64_t)(PTRDIFF_MAX / sizeof(", 43); ({ vu_str *_t175 = &(*v_et); vu_str_cat(&_t174, &(*_t175)); }); vu_str_cat_bytes(&_t174, (const uint8_t *)")) - l->len) vu_oom();\n", 23); _t174; }); vu_str_cat(&v_s, &_t176); drop_Str(&_t176); });
+    #line 21784 "vuc.vu"
+    VU_AT(21784);
+    #line 21784 "vuc.vu"
+    ({ vu_str _t179 = vu_str_lit("    int64_t c = l->len + n;\n", 28); vu_str_cat(&v_s, &_t179); drop_Str(&_t179); });
+    #line 21785 "vuc.vu"
+    VU_AT(21785);
+    #line 21785 "vuc.vu"
+    ({ vu_str _t186 = ({ vu_str _t182 = {0}; vu_str_cat_bytes(&_t182, (const uint8_t *)"    ", 4); ({ vu_str *_t183 = &(*v_et); vu_str_cat(&_t182, &(*_t183)); }); vu_str_cat_bytes(&_t182, (const uint8_t *)" *d = (", 7); ({ vu_str *_t184 = &(*v_et); vu_str_cat(&_t182, &(*_t184)); }); vu_str_cat_bytes(&_t182, (const uint8_t *)" *)realloc(l->data, (size_t)c * sizeof(", 39); ({ vu_str *_t185 = &(*v_et); vu_str_cat(&_t182, &(*_t185)); }); vu_str_cat_bytes(&_t182, (const uint8_t *)"));\n", 4); _t182; }); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
+    #line 21786 "vuc.vu"
+    VU_AT(21786);
+    #line 21786 "vuc.vu"
+    ({ vu_str _t189 = vu_str_lit("    if (!d) vu_oom();\n", 22); vu_str_cat(&v_s, &_t189); drop_Str(&_t189); });
+    #line 21787 "vuc.vu"
+    VU_AT(21787);
+    #line 21787 "vuc.vu"
+    ({ vu_str _t192 = vu_str_lit("    l->data = d;\n", 17); vu_str_cat(&v_s, &_t192); drop_Str(&_t192); });
+    #line 21788 "vuc.vu"
+    VU_AT(21788);
+    #line 21788 "vuc.vu"
+    ({ vu_str _t195 = vu_str_lit("    l->cap = c;\n", 16); vu_str_cat(&v_s, &_t195); drop_Str(&_t195); });
+    #line 21789 "vuc.vu"
+    VU_AT(21789);
+    #line 21789 "vuc.vu"
+    ({ vu_str _t198 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t198); drop_Str(&_t198); });
+    #line 21790 "vuc.vu"
+    VU_AT(21790);
+    #line 21790 "vuc.vu"
+    ({ vu_str _t205 = ({ vu_str _t201 = {0}; vu_str_cat_bytes(&_t201, (const uint8_t *)"static inline ", 14); ({ vu_str *_t202 = &(*v_et); vu_str_cat(&_t201, &(*_t202)); }); vu_str_cat_bytes(&_t201, (const uint8_t *)" vu_pop_", 8); ({ vu_str *_t203 = &(*v_m); vu_str_cat(&_t201, &(*_t203)); }); vu_str_cat_bytes(&_t201, (const uint8_t *)"(", 1); ({ vu_str *_t204 = &(*v_lt); vu_str_cat(&_t201, &(*_t204)); }); vu_str_cat_bytes(&_t201, (const uint8_t *)" *l, int line) {\n", 17); _t201; }); vu_str_cat(&v_s, &_t205); drop_Str(&_t205); });
+    #line 21791 "vuc.vu"
+    VU_AT(21791);
+    #line 21791 "vuc.vu"
+    ({ vu_str _t208 = vu_str_lit("    if (__builtin_expect(l->len == 0, 0)) vu_fail(line, \"pop() from an empty list\");\n", 85); vu_str_cat(&v_s, &_t208); drop_Str(&_t208); });
+    #line 21792 "vuc.vu"
+    VU_AT(21792);
+    #line 21792 "vuc.vu"
+    ({ vu_str _t211 = vu_str_lit("    return l->data[--l->len];\n", 30); vu_str_cat(&v_s, &_t211); drop_Str(&_t211); });
+    #line 21793 "vuc.vu"
+    VU_AT(21793);
+    #line 21793 "vuc.vu"
+    ({ vu_str _t214 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t214); drop_Str(&_t214); });
+    #line 21794 "vuc.vu"
+    VU_AT(21794);
+    #line 21794 "vuc.vu"
+    ({ vu_str _t221 = ({ vu_str _t217 = {0}; vu_str_cat_bytes(&_t217, (const uint8_t *)"static inline void vu_push_", 27); ({ vu_str *_t218 = &(*v_m); vu_str_cat(&_t217, &(*_t218)); }); vu_str_cat_bytes(&_t217, (const uint8_t *)"(", 1); ({ vu_str *_t219 = &(*v_lt); vu_str_cat(&_t217, &(*_t219)); }); vu_str_cat_bytes(&_t217, (const uint8_t *)" *l, ", 5); ({ vu_str *_t220 = &(*v_et); vu_str_cat(&_t217, &(*_t220)); }); vu_str_cat_bytes(&_t217, (const uint8_t *)" v) {\n", 6); _t217; }); vu_str_cat(&v_s, &_t221); drop_Str(&_t221); });
+    #line 21795 "vuc.vu"
+    VU_AT(21795);
+    #line 21795 "vuc.vu"
+    ({ vu_str _t226 = ({ vu_str _t224 = {0}; vu_str_cat_bytes(&_t224, (const uint8_t *)"    if (l->len == l->cap) vu_grow_", 34); ({ vu_str *_t225 = &(*v_m); vu_str_cat(&_t224, &(*_t225)); }); vu_str_cat_bytes(&_t224, (const uint8_t *)"(l);\n", 5); _t224; }); vu_str_cat(&v_s, &_t226); drop_Str(&_t226); });
+    #line 21796 "vuc.vu"
+    VU_AT(21796);
+    #line 21796 "vuc.vu"
+    ({ vu_str _t229 = vu_str_lit("    l->data[l->len++] = v;\n", 27); vu_str_cat(&v_s, &_t229); drop_Str(&_t229); });
+    #line 21797 "vuc.vu"
+    VU_AT(21797);
+    #line 21797 "vuc.vu"
+    ({ vu_str _t232 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t232); drop_Str(&_t232); });
+    #line 21798 "vuc.vu"
+    VU_AT(21798);
+    #line 21798 "vuc.vu"
+    ({ vu_str _t239 = ({ vu_str _t235 = {0}; vu_str_cat_bytes(&_t235, (const uint8_t *)"static ", 7); ({ vu_str *_t236 = &(*v_lt); vu_str_cat(&_t235, &(*_t236)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)" vu_rep_", 8); ({ vu_str *_t237 = &(*v_m); vu_str_cat(&_t235, &(*_t237)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)"(", 1); ({ vu_str *_t238 = &(*v_lt); vu_str_cat(&_t235, &(*_t238)); }); vu_str_cat_bytes(&_t235, (const uint8_t *)" src, int64_t n, int line) {\n", 29); _t235; }); vu_str_cat(&v_s, &_t239); drop_Str(&_t239); });
+    #line 21799 "vuc.vu"
+    VU_AT(21799);
+    #line 21799 "vuc.vu"
+    ({ vu_str _t244 = ({ vu_str _t242 = {0}; vu_str_cat_bytes(&_t242, (const uint8_t *)"    ", 4); ({ vu_str *_t243 = &(*v_lt); vu_str_cat(&_t242, &(*_t243)); }); vu_str_cat_bytes(&_t242, (const uint8_t *)" r = {0};\n", 10); _t242; }); vu_str_cat(&v_s, &_t244); drop_Str(&_t244); });
+    #line 21800 "vuc.vu"
+    VU_AT(21800);
+    #line 21800 "vuc.vu"
+    ({ vu_str _t247 = vu_str_lit("    if (n > 0 && src.len > 0) {\n", 32); vu_str_cat(&v_s, &_t247); drop_Str(&_t247); });
+    #line 21801 "vuc.vu"
+    VU_AT(21801);
+    #line 21801 "vuc.vu"
+    ({ vu_str _t252 = ({ vu_str _t250 = {0}; vu_str_cat_bytes(&_t250, (const uint8_t *)"        if (n > INT64_MAX / src.len || src.len * n > (int64_t)(PTRDIFF_MAX / sizeof(", 84); ({ vu_str *_t251 = &(*v_et); vu_str_cat(&_t250, &(*_t251)); }); vu_str_cat_bytes(&_t250, (const uint8_t *)")))\n", 4); _t250; }); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
+    #line 21802 "vuc.vu"
+    VU_AT(21802);
+    #line 21802 "vuc.vu"
+    ({ vu_str _t255 = vu_str_lit("            vu_fail(line, \"list of %lld x %lld elements is too large\", (long long)src.len, (long long)n);\n", 106); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
+    #line 21803 "vuc.vu"
+    VU_AT(21803);
+    #line 21803 "vuc.vu"
+    ({ vu_str _t258 = vu_str_lit("        int64_t total = src.len * n;\n", 37); vu_str_cat(&v_s, &_t258); drop_Str(&_t258); });
+    #line 21804 "vuc.vu"
+    VU_AT(21804);
+    #line 21804 "vuc.vu"
+    ({ vu_str _t264 = ({ vu_str _t261 = {0}; vu_str_cat_bytes(&_t261, (const uint8_t *)"        r.data = (", 18); ({ vu_str *_t262 = &(*v_et); vu_str_cat(&_t261, &(*_t262)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *)vu_malloc((size_t)total * sizeof(", 36); ({ vu_str *_t263 = &(*v_et); vu_str_cat(&_t261, &(*_t263)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"));\n", 4); _t261; }); vu_str_cat(&v_s, &_t264); drop_Str(&_t264); });
+    #line 21805 "vuc.vu"
+    VU_AT(21805);
+    #line 21805 "vuc.vu"
+    ({ vu_str _t267 = vu_str_lit("        r.len = r.cap = total;\n", 31); vu_str_cat(&v_s, &_t267); drop_Str(&_t267); });
+    #line 21806 "vuc.vu"
+    VU_AT(21806);
+    #line 21806 "vuc.vu"
+    ({ vu_str _t272 = ({ vu_str _t270 = {0}; vu_str_cat_bytes(&_t270, (const uint8_t *)"        if (src.len == 1) { ", 28); ({ vu_str *_t271 = &(*v_et); vu_str_cat(&_t270, &(*_t271)); }); vu_str_cat_bytes(&_t270, (const uint8_t *)" v = src.data[0]; for (int64_t k = 0; k < total; k++) r.data[k] = v; }\n", 71); _t270; }); vu_str_cat(&v_s, &_t272); drop_Str(&_t272); });
+    #line 21807 "vuc.vu"
+    VU_AT(21807);
+    #line 21807 "vuc.vu"
+    ({ vu_str _t277 = ({ vu_str _t275 = {0}; vu_str_cat_bytes(&_t275, (const uint8_t *)"        else for (int64_t k = 0; k < n; k++) memcpy(r.data + k * src.len, src.data, (size_t)src.len * sizeof(", 109); ({ vu_str *_t276 = &(*v_et); vu_str_cat(&_t275, &(*_t276)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"));\n", 4); _t275; }); vu_str_cat(&v_s, &_t277); drop_Str(&_t277); });
+    #line 21808 "vuc.vu"
+    VU_AT(21808);
+    #line 21808 "vuc.vu"
+    ({ vu_str _t280 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t280); drop_Str(&_t280); });
+    #line 21809 "vuc.vu"
+    VU_AT(21809);
+    #line 21809 "vuc.vu"
+    ({ vu_str _t283 = vu_str_lit("    free(src.data);\n", 20); vu_str_cat(&v_s, &_t283); drop_Str(&_t283); });
+    #line 21810 "vuc.vu"
+    VU_AT(21810);
+    #line 21810 "vuc.vu"
+    ({ vu_str _t286 = vu_str_lit("    return r;\n", 14); vu_str_cat(&v_s, &_t286); drop_Str(&_t286); });
+    #line 21811 "vuc.vu"
+    VU_AT(21811);
+    #line 21811 "vuc.vu"
+    ({ vu_str _t289 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t289); drop_Str(&_t289); });
+    #line 21812 "vuc.vu"
+    VU_AT(21812);
+    #line 21812 "vuc.vu"
     {
-        #line 21781 "vuc.vu"
+        #line 21812 "vuc.vu"
         vu_str _t290 = VU_MV(v_s);
-        #line 21781 "vuc.vu"
+        #line 21812 "vuc.vu"
         return _t290;
-    #line 21781 "vuc.vu"
+    #line 21812 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_map_code_sc(vu_str *restrict v_m, vu_str *restrict v_kc, vu_str *restrict v_vc, vu_str *restrict v_vm) {
-    #line 21783 "vuc.vu"
+    #line 21814 "vuc.vu"
     VU_ENTER("map_code_sc");
-    #line 21784 "vuc.vu"
-    VU_AT(21784);
-    #line 21784 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21785 "vuc.vu"
-    VU_AT(21785);
-    #line 21785 "vuc.vu"
-    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"struct ME_", 10); ({ vu_str *_t4 = &(*v_m); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" { ", 3); ({ vu_str *_t5 = &(*v_kc); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" key; ", 6); ({ vu_str *_t6 = &(*v_vc); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" val; uint64_t hash; bool live; };\n", 35); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
-    #line 21786 "vuc.vu"
-    VU_AT(21786);
-    #line 21786 "vuc.vu"
-    ({ vu_str _t10 = vu_str_lit("/* Small maps (up to VU_SMALL_MAP entries) have no index: a scan comparing keys beats hashing them.\n", 100); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
-    #line 21787 "vuc.vu"
-    VU_AT(21787);
-    #line 21787 "vuc.vu"
-    ({ vu_str _t13 = vu_str_lit("   Bigger maps hash with SipHash and probe an index into the entries. */\n", 73); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
-    #line 21788 "vuc.vu"
-    VU_AT(21788);
-    #line 21788 "vuc.vu"
-    ({ vu_str _t20 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"static int64_t vu_mfind_", 24); ({ vu_str *_t17 = &(*v_m); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)"(const ", 7); ({ vu_str *_t18 = &(*v_m); vu_str_cat(&_t16, &(*_t18)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t19 = &(*v_kc); vu_str_cat(&_t16, &(*_t19)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *k) {\n", 7); _t16; }); vu_str_cat(&v_s, &_t20); drop_Str(&_t20); });
-    #line 21789 "vuc.vu"
-    VU_AT(21789);
-    #line 21789 "vuc.vu"
-    ({ vu_str _t23 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t23); drop_Str(&_t23); });
-    #line 21790 "vuc.vu"
-    VU_AT(21790);
-    #line 21790 "vuc.vu"
-    ({ vu_str _t26 = vu_str_lit("        for (int64_t i = 0; i < m->nents; i++) {\n", 49); vu_str_cat(&v_s, &_t26); drop_Str(&_t26); });
-    #line 21791 "vuc.vu"
-    VU_AT(21791);
-    #line 21791 "vuc.vu"
-    ({ vu_str _t31 = ({ vu_str _t29 = {0}; vu_str_cat_bytes(&_t29, (const uint8_t *)"            const ME_", 21); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t29, &(*_t30)); }); vu_str_cat_bytes(&_t29, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t29; }); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
-    #line 21792 "vuc.vu"
-    VU_AT(21792);
-    #line 21792 "vuc.vu"
-    ({ vu_str _t34 = vu_str_lit("            if (en->live && (vu_str_eq(&en->key, k))) return i;\n", 64); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
-    #line 21793 "vuc.vu"
-    VU_AT(21793);
-    #line 21793 "vuc.vu"
-    ({ vu_str _t37 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
-    #line 21794 "vuc.vu"
-    VU_AT(21794);
-    #line 21794 "vuc.vu"
-    ({ vu_str _t40 = vu_str_lit("        return -1;\n", 19); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
-    #line 21795 "vuc.vu"
-    VU_AT(21795);
-    #line 21795 "vuc.vu"
-    ({ vu_str _t43 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
-    #line 21796 "vuc.vu"
-    VU_AT(21796);
-    #line 21796 "vuc.vu"
-    ({ vu_str _t46 = vu_str_lit("    uint64_t h = vu_siphash(k->data, (size_t)k->len);\n", 54); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
-    #line 21797 "vuc.vu"
-    VU_AT(21797);
-    #line 21797 "vuc.vu"
-    ({ vu_str _t49 = vu_str_lit("    uint64_t mask = (uint64_t)m->nidx - 1;\n", 43); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
-    #line 21798 "vuc.vu"
-    VU_AT(21798);
-    #line 21798 "vuc.vu"
-    ({ vu_str _t52 = vu_str_lit("    for (uint64_t i = h & mask;; i = (i + 1) & mask) {\n", 55); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
-    #line 21799 "vuc.vu"
-    VU_AT(21799);
-    #line 21799 "vuc.vu"
-    ({ vu_str _t55 = vu_str_lit("        int64_t e = m->idx[i];\n", 31); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
-    #line 21800 "vuc.vu"
-    VU_AT(21800);
-    #line 21800 "vuc.vu"
-    ({ vu_str _t58 = vu_str_lit("        if (e == 0) return -1;\n", 31); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
-    #line 21801 "vuc.vu"
-    VU_AT(21801);
-    #line 21801 "vuc.vu"
-    ({ vu_str _t63 = ({ vu_str _t61 = {0}; vu_str_cat_bytes(&_t61, (const uint8_t *)"        const ME_", 17); ({ vu_str *_t62 = &(*v_m); vu_str_cat(&_t61, &(*_t62)); }); vu_str_cat_bytes(&_t61, (const uint8_t *)" *en = &m->ents[e - 1];\n", 24); _t61; }); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
-    #line 21802 "vuc.vu"
-    VU_AT(21802);
-    #line 21802 "vuc.vu"
-    ({ vu_str _t66 = vu_str_lit("        if (en->live && en->hash == h && (vu_str_eq(&en->key, k))) return e - 1;\n", 81); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 21803 "vuc.vu"
-    VU_AT(21803);
-    #line 21803 "vuc.vu"
-    ({ vu_str _t69 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
-    #line 21804 "vuc.vu"
-    VU_AT(21804);
-    #line 21804 "vuc.vu"
-    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
-    #line 21805 "vuc.vu"
-    VU_AT(21805);
-    #line 21805 "vuc.vu"
-    ({ vu_str _t78 = ({ vu_str _t75 = {0}; vu_str_cat_bytes(&_t75, (const uint8_t *)"static void vu_mindex_", 22); ({ vu_str *_t76 = &(*v_m); vu_str_cat(&_t75, &(*_t76)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)"(", 1); ({ vu_str *_t77 = &(*v_m); vu_str_cat(&_t75, &(*_t77)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)" *m, int64_t want) {\n", 21); _t75; }); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
-    #line 21806 "vuc.vu"
-    VU_AT(21806);
-    #line 21806 "vuc.vu"
-    ({ vu_str _t81 = vu_str_lit("    int64_t j = 0;\n", 19); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
-    #line 21807 "vuc.vu"
-    VU_AT(21807);
-    #line 21807 "vuc.vu"
-    ({ vu_str _t84 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) if (m->ents[i].live) m->ents[j++] = m->ents[i];\n", 91); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
-    #line 21808 "vuc.vu"
-    VU_AT(21808);
-    #line 21808 "vuc.vu"
-    ({ vu_str _t87 = vu_str_lit("    m->nents = j;\n", 18); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
-    #line 21809 "vuc.vu"
-    VU_AT(21809);
-    #line 21809 "vuc.vu"
-    ({ vu_str _t90 = vu_str_lit("    int64_t n = 8;\n", 19); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
-    #line 21810 "vuc.vu"
-    VU_AT(21810);
-    #line 21810 "vuc.vu"
-    ({ vu_str _t93 = vu_str_lit("    while (n < want) { if (n > INT64_MAX / 4) vu_oom(); n *= 2; }\n", 66); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
-    #line 21811 "vuc.vu"
-    VU_AT(21811);
-    #line 21811 "vuc.vu"
-    ({ vu_str _t96 = vu_str_lit("    free(m->idx);\n", 18); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
-    #line 21812 "vuc.vu"
-    VU_AT(21812);
-    #line 21812 "vuc.vu"
-    ({ vu_str _t99 = vu_str_lit("    m->idx = (int64_t *)calloc((size_t)n, sizeof(int64_t));\n", 60); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
-    #line 21813 "vuc.vu"
-    VU_AT(21813);
-    #line 21813 "vuc.vu"
-    ({ vu_str _t102 = vu_str_lit("    if (!m->idx) vu_oom();\n", 27); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
-    #line 21814 "vuc.vu"
-    VU_AT(21814);
-    #line 21814 "vuc.vu"
-    ({ vu_str _t105 = vu_str_lit("    m->nidx = n;\n", 17); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 21815 "vuc.vu"
     VU_AT(21815);
     #line 21815 "vuc.vu"
-    ({ vu_str _t108 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 21816 "vuc.vu"
     VU_AT(21816);
     #line 21816 "vuc.vu"
-    ({ vu_str _t111 = vu_str_lit("        uint64_t s = m->ents[i].hash & ((uint64_t)n - 1);\n", 58); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
+    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"struct ME_", 10); ({ vu_str *_t4 = &(*v_m); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" { ", 3); ({ vu_str *_t5 = &(*v_kc); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" key; ", 6); ({ vu_str *_t6 = &(*v_vc); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" val; uint64_t hash; bool live; };\n", 35); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
     #line 21817 "vuc.vu"
     VU_AT(21817);
     #line 21817 "vuc.vu"
-    ({ vu_str _t114 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & ((uint64_t)n - 1);\n", 59); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
+    ({ vu_str _t10 = vu_str_lit("/* Small maps (up to VU_SMALL_MAP entries) have no index: a scan comparing keys beats hashing them.\n", 100); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
     #line 21818 "vuc.vu"
     VU_AT(21818);
     #line 21818 "vuc.vu"
-    ({ vu_str _t117 = vu_str_lit("        m->idx[s] = i + 1;\n", 27); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
+    ({ vu_str _t13 = vu_str_lit("   Bigger maps hash with SipHash and probe an index into the entries. */\n", 73); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
     #line 21819 "vuc.vu"
     VU_AT(21819);
     #line 21819 "vuc.vu"
-    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
+    ({ vu_str _t20 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"static int64_t vu_mfind_", 24); ({ vu_str *_t17 = &(*v_m); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)"(const ", 7); ({ vu_str *_t18 = &(*v_m); vu_str_cat(&_t16, &(*_t18)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t19 = &(*v_kc); vu_str_cat(&_t16, &(*_t19)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *k) {\n", 7); _t16; }); vu_str_cat(&v_s, &_t20); drop_Str(&_t20); });
     #line 21820 "vuc.vu"
     VU_AT(21820);
     #line 21820 "vuc.vu"
-    ({ vu_str _t123 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
+    ({ vu_str _t23 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t23); drop_Str(&_t23); });
     #line 21821 "vuc.vu"
     VU_AT(21821);
     #line 21821 "vuc.vu"
-    ({ vu_str _t129 = ({ vu_str _t126 = {0}; vu_str_cat_bytes(&_t126, (const uint8_t *)"static void vu_mbig_", 20); ({ vu_str *_t127 = &(*v_m); vu_str_cat(&_t126, &(*_t127)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)"(", 1); ({ vu_str *_t128 = &(*v_m); vu_str_cat(&_t126, &(*_t128)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)" *m) {\n", 7); _t126; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
+    ({ vu_str _t26 = vu_str_lit("        for (int64_t i = 0; i < m->nents; i++) {\n", 49); vu_str_cat(&v_s, &_t26); drop_Str(&_t26); });
     #line 21822 "vuc.vu"
     VU_AT(21822);
     #line 21822 "vuc.vu"
-    ({ vu_str _t132 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
+    ({ vu_str _t31 = ({ vu_str _t29 = {0}; vu_str_cat_bytes(&_t29, (const uint8_t *)"            const ME_", 21); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t29, &(*_t30)); }); vu_str_cat_bytes(&_t29, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t29; }); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
     #line 21823 "vuc.vu"
     VU_AT(21823);
     #line 21823 "vuc.vu"
-    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"        ME_", 11); ({ vu_str *_t136 = &(*v_m); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
+    ({ vu_str _t34 = vu_str_lit("            if (en->live && (vu_str_eq(&en->key, k))) return i;\n", 64); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
     #line 21824 "vuc.vu"
     VU_AT(21824);
     #line 21824 "vuc.vu"
-    ({ vu_str _t140 = vu_str_lit("        if (!en->live) continue;\n", 33); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
+    ({ vu_str _t37 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
     #line 21825 "vuc.vu"
     VU_AT(21825);
     #line 21825 "vuc.vu"
-    ({ vu_str _t145 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"        const ", 14); ({ vu_str *_t144 = &(*v_kc); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *k = &en->key;\n", 16); _t143; }); vu_str_cat(&v_s, &_t145); drop_Str(&_t145); });
+    ({ vu_str _t40 = vu_str_lit("        return -1;\n", 19); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
     #line 21826 "vuc.vu"
     VU_AT(21826);
     #line 21826 "vuc.vu"
-    ({ vu_str _t148 = vu_str_lit("        en->hash = vu_siphash(k->data, (size_t)k->len);\n", 56); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
+    ({ vu_str _t43 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
     #line 21827 "vuc.vu"
     VU_AT(21827);
     #line 21827 "vuc.vu"
-    ({ vu_str _t151 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
+    ({ vu_str _t46 = vu_str_lit("    uint64_t h = vu_siphash(k->data, (size_t)k->len);\n", 54); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
     #line 21828 "vuc.vu"
     VU_AT(21828);
     #line 21828 "vuc.vu"
-    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"    vu_mindex_", 14); ({ vu_str *_t155 = &(*v_m); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
+    ({ vu_str _t49 = vu_str_lit("    uint64_t mask = (uint64_t)m->nidx - 1;\n", 43); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
     #line 21829 "vuc.vu"
     VU_AT(21829);
     #line 21829 "vuc.vu"
-    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
+    ({ vu_str _t52 = vu_str_lit("    for (uint64_t i = h & mask;; i = (i + 1) & mask) {\n", 55); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
     #line 21830 "vuc.vu"
     VU_AT(21830);
     #line 21830 "vuc.vu"
-    ({ vu_str _t167 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_mput_", 20); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_m); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *m, ", 5); ({ vu_str *_t165 = &(*v_kc); vu_str_cat(&_t162, &(*_t165)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *k, ", 5); ({ vu_str *_t166 = &(*v_vc); vu_str_cat(&_t162, &(*_t166)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" v, bool take) {\n", 17); _t162; }); vu_str_cat(&v_s, &_t167); drop_Str(&_t167); });
+    ({ vu_str _t55 = vu_str_lit("        int64_t e = m->idx[i];\n", 31); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
     #line 21831 "vuc.vu"
     VU_AT(21831);
     #line 21831 "vuc.vu"
-    ({ vu_str _t172 = ({ vu_str _t170 = {0}; vu_str_cat_bytes(&_t170, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t171 = &(*v_m); vu_str_cat(&_t170, &(*_t171)); }); vu_str_cat_bytes(&_t170, (const uint8_t *)"(m, k);\n", 8); _t170; }); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
+    ({ vu_str _t58 = vu_str_lit("        if (e == 0) return -1;\n", 31); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
     #line 21832 "vuc.vu"
     VU_AT(21832);
     #line 21832 "vuc.vu"
-    ({ vu_str _t177 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    if (e >= 0) { ME_", 21); ({ vu_str *_t176 = &(*v_m); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)" *en = &m->ents[e];  en->val = v; if (take) { drop_Str(k); } return; }\n", 71); _t175; }); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
+    ({ vu_str _t63 = ({ vu_str _t61 = {0}; vu_str_cat_bytes(&_t61, (const uint8_t *)"        const ME_", 17); ({ vu_str *_t62 = &(*v_m); vu_str_cat(&_t61, &(*_t62)); }); vu_str_cat_bytes(&_t61, (const uint8_t *)" *en = &m->ents[e - 1];\n", 24); _t61; }); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
     #line 21833 "vuc.vu"
     VU_AT(21833);
     #line 21833 "vuc.vu"
-    ({ vu_str _t180 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
+    ({ vu_str _t66 = vu_str_lit("        if (en->live && en->hash == h && (vu_str_eq(&en->key, k))) return e - 1;\n", 81); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
     #line 21834 "vuc.vu"
     VU_AT(21834);
     #line 21834 "vuc.vu"
-    ({ vu_str _t185 = ({ vu_str _t183 = {0}; vu_str_cat_bytes(&_t183, (const uint8_t *)"        if (m->nents >= VU_SMALL_MAP) vu_mbig_", 46); ({ vu_str *_t184 = &(*v_m); vu_str_cat(&_t183, &(*_t184)); }); vu_str_cat_bytes(&_t183, (const uint8_t *)"(m);\n", 5); _t183; }); vu_str_cat(&v_s, &_t185); drop_Str(&_t185); });
+    ({ vu_str _t69 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
     #line 21835 "vuc.vu"
     VU_AT(21835);
     #line 21835 "vuc.vu"
-    ({ vu_str _t190 = ({ vu_str _t188 = {0}; vu_str_cat_bytes(&_t188, (const uint8_t *)"    } else if ((m->nents + 1) * 4 > m->nidx * 3) vu_mindex_", 59); ({ vu_str *_t189 = &(*v_m); vu_str_cat(&_t188, &(*_t189)); }); vu_str_cat_bytes(&_t188, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t188; }); vu_str_cat(&v_s, &_t190); drop_Str(&_t190); });
+    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
     #line 21836 "vuc.vu"
     VU_AT(21836);
     #line 21836 "vuc.vu"
-    ({ vu_str _t193 = vu_str_lit("    uint64_t h = m->nidx ? vu_siphash(k->data, (size_t)k->len) : 0;\n", 68); vu_str_cat(&v_s, &_t193); drop_Str(&_t193); });
+    ({ vu_str _t78 = ({ vu_str _t75 = {0}; vu_str_cat_bytes(&_t75, (const uint8_t *)"static void vu_mindex_", 22); ({ vu_str *_t76 = &(*v_m); vu_str_cat(&_t75, &(*_t76)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)"(", 1); ({ vu_str *_t77 = &(*v_m); vu_str_cat(&_t75, &(*_t77)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)" *m, int64_t want) {\n", 21); _t75; }); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
     #line 21837 "vuc.vu"
     VU_AT(21837);
     #line 21837 "vuc.vu"
-    ({ vu_str _t196 = vu_str_lit("    if (m->nents == m->cap) {\n", 30); vu_str_cat(&v_s, &_t196); drop_Str(&_t196); });
+    ({ vu_str _t81 = vu_str_lit("    int64_t j = 0;\n", 19); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
     #line 21838 "vuc.vu"
     VU_AT(21838);
     #line 21838 "vuc.vu"
-    ({ vu_str _t201 = ({ vu_str _t199 = {0}; vu_str_cat_bytes(&_t199, (const uint8_t *)"        if (m->cap > (int64_t)(PTRDIFF_MAX / sizeof(ME_", 55); ({ vu_str *_t200 = &(*v_m); vu_str_cat(&_t199, &(*_t200)); }); vu_str_cat_bytes(&_t199, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t199; }); vu_str_cat(&v_s, &_t201); drop_Str(&_t201); });
+    ({ vu_str _t84 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) if (m->ents[i].live) m->ents[j++] = m->ents[i];\n", 91); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
     #line 21839 "vuc.vu"
     VU_AT(21839);
     #line 21839 "vuc.vu"
-    ({ vu_str _t204 = vu_str_lit("        /* 4 entries first (most objects are small), then 12, so a typical record grows once; then 1.5x. */\n", 108); vu_str_cat(&v_s, &_t204); drop_Str(&_t204); });
+    ({ vu_str _t87 = vu_str_lit("    m->nents = j;\n", 18); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
     #line 21840 "vuc.vu"
     VU_AT(21840);
     #line 21840 "vuc.vu"
-    ({ vu_str _t207 = vu_str_lit("        int64_t c = m->cap == 0 ? 4 : m->cap == 4 ? 12 : m->cap + m->cap / 2;\n", 78); vu_str_cat(&v_s, &_t207); drop_Str(&_t207); });
+    ({ vu_str _t90 = vu_str_lit("    int64_t n = 8;\n", 19); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 21841 "vuc.vu"
     VU_AT(21841);
     #line 21841 "vuc.vu"
-    ({ vu_str _t214 = ({ vu_str _t210 = {0}; vu_str_cat_bytes(&_t210, (const uint8_t *)"        ME_", 11); ({ vu_str *_t211 = &(*v_m); vu_str_cat(&_t210, &(*_t211)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)" *d = (ME_", 10); ({ vu_str *_t212 = &(*v_m); vu_str_cat(&_t210, &(*_t212)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)" *)realloc(m->ents, (size_t)c * sizeof(ME_", 42); ({ vu_str *_t213 = &(*v_m); vu_str_cat(&_t210, &(*_t213)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)"));\n", 4); _t210; }); vu_str_cat(&v_s, &_t214); drop_Str(&_t214); });
+    ({ vu_str _t93 = vu_str_lit("    while (n < want) { if (n > INT64_MAX / 4) vu_oom(); n *= 2; }\n", 66); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
     #line 21842 "vuc.vu"
     VU_AT(21842);
     #line 21842 "vuc.vu"
-    ({ vu_str _t217 = vu_str_lit("        if (!d) vu_oom();\n", 26); vu_str_cat(&v_s, &_t217); drop_Str(&_t217); });
+    ({ vu_str _t96 = vu_str_lit("    free(m->idx);\n", 18); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
     #line 21843 "vuc.vu"
     VU_AT(21843);
     #line 21843 "vuc.vu"
-    ({ vu_str _t220 = vu_str_lit("        m->ents = d;\n", 21); vu_str_cat(&v_s, &_t220); drop_Str(&_t220); });
+    ({ vu_str _t99 = vu_str_lit("    m->idx = (int64_t *)calloc((size_t)n, sizeof(int64_t));\n", 60); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
     #line 21844 "vuc.vu"
     VU_AT(21844);
     #line 21844 "vuc.vu"
-    ({ vu_str _t223 = vu_str_lit("        m->cap = c;\n", 20); vu_str_cat(&v_s, &_t223); drop_Str(&_t223); });
+    ({ vu_str _t102 = vu_str_lit("    if (!m->idx) vu_oom();\n", 27); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
     #line 21845 "vuc.vu"
     VU_AT(21845);
     #line 21845 "vuc.vu"
-    ({ vu_str _t226 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t226); drop_Str(&_t226); });
+    ({ vu_str _t105 = vu_str_lit("    m->nidx = n;\n", 17); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 21846 "vuc.vu"
     VU_AT(21846);
     #line 21846 "vuc.vu"
-    ({ vu_str _t231 = ({ vu_str _t229 = {0}; vu_str_cat_bytes(&_t229, (const uint8_t *)"    ME_", 7); ({ vu_str *_t230 = &(*v_m); vu_str_cat(&_t229, &(*_t230)); }); vu_str_cat_bytes(&_t229, (const uint8_t *)" *en = &m->ents[m->nents];\n", 27); _t229; }); vu_str_cat(&v_s, &_t231); drop_Str(&_t231); });
+    ({ vu_str _t108 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
     #line 21847 "vuc.vu"
     VU_AT(21847);
     #line 21847 "vuc.vu"
-    ({ vu_str _t234 = vu_str_lit("    en->key = take ? *k : vu_str_dup(k); en->val = v; en->hash = h; en->live = true;\n", 85); vu_str_cat(&v_s, &_t234); drop_Str(&_t234); });
+    ({ vu_str _t111 = vu_str_lit("        uint64_t s = m->ents[i].hash & ((uint64_t)n - 1);\n", 58); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
     #line 21848 "vuc.vu"
     VU_AT(21848);
     #line 21848 "vuc.vu"
-    ({ vu_str _t237 = vu_str_lit("    m->nents++;\n", 16); vu_str_cat(&v_s, &_t237); drop_Str(&_t237); });
+    ({ vu_str _t114 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & ((uint64_t)n - 1);\n", 59); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
     #line 21849 "vuc.vu"
     VU_AT(21849);
     #line 21849 "vuc.vu"
-    ({ vu_str _t240 = vu_str_lit("    m->live++;\n", 15); vu_str_cat(&v_s, &_t240); drop_Str(&_t240); });
+    ({ vu_str _t117 = vu_str_lit("        m->idx[s] = i + 1;\n", 27); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
     #line 21850 "vuc.vu"
     VU_AT(21850);
     #line 21850 "vuc.vu"
-    ({ vu_str _t243 = vu_str_lit("    if (m->nidx) {\n", 19); vu_str_cat(&v_s, &_t243); drop_Str(&_t243); });
+    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
     #line 21851 "vuc.vu"
     VU_AT(21851);
     #line 21851 "vuc.vu"
-    ({ vu_str _t246 = vu_str_lit("        uint64_t mask = (uint64_t)m->nidx - 1, s = h & mask;\n", 61); vu_str_cat(&v_s, &_t246); drop_Str(&_t246); });
+    ({ vu_str _t123 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
     #line 21852 "vuc.vu"
     VU_AT(21852);
     #line 21852 "vuc.vu"
-    ({ vu_str _t249 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & mask;\n", 46); vu_str_cat(&v_s, &_t249); drop_Str(&_t249); });
+    ({ vu_str _t129 = ({ vu_str _t126 = {0}; vu_str_cat_bytes(&_t126, (const uint8_t *)"static void vu_mbig_", 20); ({ vu_str *_t127 = &(*v_m); vu_str_cat(&_t126, &(*_t127)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)"(", 1); ({ vu_str *_t128 = &(*v_m); vu_str_cat(&_t126, &(*_t128)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)" *m) {\n", 7); _t126; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
     #line 21853 "vuc.vu"
     VU_AT(21853);
     #line 21853 "vuc.vu"
-    ({ vu_str _t252 = vu_str_lit("        m->idx[s] = m->nents;\n", 30); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
+    ({ vu_str _t132 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
     #line 21854 "vuc.vu"
     VU_AT(21854);
     #line 21854 "vuc.vu"
-    ({ vu_str _t255 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
+    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"        ME_", 11); ({ vu_str *_t136 = &(*v_m); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
     #line 21855 "vuc.vu"
     VU_AT(21855);
     #line 21855 "vuc.vu"
-    ({ vu_str _t258 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t258); drop_Str(&_t258); });
+    ({ vu_str _t140 = vu_str_lit("        if (!en->live) continue;\n", 33); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
     #line 21856 "vuc.vu"
     VU_AT(21856);
     #line 21856 "vuc.vu"
-    ({ vu_str _t268 = ({ vu_str _t261 = {0}; vu_str_cat_bytes(&_t261, (const uint8_t *)"static void vu_mset_", 20); ({ vu_str *_t262 = &(*v_m); vu_str_cat(&_t261, &(*_t262)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"(", 1); ({ vu_str *_t263 = &(*v_m); vu_str_cat(&_t261, &(*_t263)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t264 = &(*v_kc); vu_str_cat(&_t261, &(*_t264)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *k, ", 5); ({ vu_str *_t265 = &(*v_vc); vu_str_cat(&_t261, &(*_t265)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t266 = &(*v_m); vu_str_cat(&_t261, &(*_t266)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"(m, (", 5); ({ vu_str *_t267 = &(*v_kc); vu_str_cat(&_t261, &(*_t267)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *)k, v, false); }\n", 19); _t261; }); vu_str_cat(&v_s, &_t268); drop_Str(&_t268); });
+    ({ vu_str _t145 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"        const ", 14); ({ vu_str *_t144 = &(*v_kc); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *k = &en->key;\n", 16); _t143; }); vu_str_cat(&v_s, &_t145); drop_Str(&_t145); });
     #line 21857 "vuc.vu"
     VU_AT(21857);
     #line 21857 "vuc.vu"
-    ({ vu_str _t271 = vu_str_lit("/* Takes ownership of *k: the map keeps it, or frees it if the key was already there. */\n", 89); vu_str_cat(&v_s, &_t271); drop_Str(&_t271); });
+    ({ vu_str _t148 = vu_str_lit("        en->hash = vu_siphash(k->data, (size_t)k->len);\n", 56); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
     #line 21858 "vuc.vu"
     VU_AT(21858);
     #line 21858 "vuc.vu"
-    ({ vu_str _t280 = ({ vu_str _t274 = {0}; vu_str_cat_bytes(&_t274, (const uint8_t *)"static void vu_mtake_", 21); ({ vu_str *_t275 = &(*v_m); vu_str_cat(&_t274, &(*_t275)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)"(", 1); ({ vu_str *_t276 = &(*v_m); vu_str_cat(&_t274, &(*_t276)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" *m, ", 5); ({ vu_str *_t277 = &(*v_kc); vu_str_cat(&_t274, &(*_t277)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" *k, ", 5); ({ vu_str *_t278 = &(*v_vc); vu_str_cat(&_t274, &(*_t278)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t279 = &(*v_m); vu_str_cat(&_t274, &(*_t279)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)"(m, k, v, true); }\n", 19); _t274; }); vu_str_cat(&v_s, &_t280); drop_Str(&_t280); });
+    ({ vu_str _t151 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
     #line 21859 "vuc.vu"
     VU_AT(21859);
     #line 21859 "vuc.vu"
-    ({ vu_str _t288 = ({ vu_str _t283 = {0}; vu_str_cat_bytes(&_t283, (const uint8_t *)"static ", 7); ({ vu_str *_t284 = &(*v_vc); vu_str_cat(&_t283, &(*_t284)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *vu_mget_", 10); ({ vu_str *_t285 = &(*v_m); vu_str_cat(&_t283, &(*_t285)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)"(", 1); ({ vu_str *_t286 = &(*v_m); vu_str_cat(&_t283, &(*_t286)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t287 = &(*v_kc); vu_str_cat(&_t283, &(*_t287)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *k, int line) {\n", 17); _t283; }); vu_str_cat(&v_s, &_t288); drop_Str(&_t288); });
+    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"    vu_mindex_", 14); ({ vu_str *_t155 = &(*v_m); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
     #line 21860 "vuc.vu"
     VU_AT(21860);
     #line 21860 "vuc.vu"
-    ({ vu_str _t293 = ({ vu_str _t291 = {0}; vu_str_cat_bytes(&_t291, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t292 = &(*v_m); vu_str_cat(&_t291, &(*_t292)); }); vu_str_cat_bytes(&_t291, (const uint8_t *)"(m, k);\n", 8); _t291; }); vu_str_cat(&v_s, &_t293); drop_Str(&_t293); });
+    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
     #line 21861 "vuc.vu"
     VU_AT(21861);
     #line 21861 "vuc.vu"
-    ({ vu_str _t296 = vu_str_lit("    if (e < 0) vu_fail(line, \"key not found in map\");\n", 54); vu_str_cat(&v_s, &_t296); drop_Str(&_t296); });
+    ({ vu_str _t167 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_mput_", 20); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_m); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *m, ", 5); ({ vu_str *_t165 = &(*v_kc); vu_str_cat(&_t162, &(*_t165)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *k, ", 5); ({ vu_str *_t166 = &(*v_vc); vu_str_cat(&_t162, &(*_t166)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" v, bool take) {\n", 17); _t162; }); vu_str_cat(&v_s, &_t167); drop_Str(&_t167); });
     #line 21862 "vuc.vu"
     VU_AT(21862);
     #line 21862 "vuc.vu"
-    ({ vu_str _t299 = vu_str_lit("    return &m->ents[e].val;\n", 28); vu_str_cat(&v_s, &_t299); drop_Str(&_t299); });
+    ({ vu_str _t172 = ({ vu_str _t170 = {0}; vu_str_cat_bytes(&_t170, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t171 = &(*v_m); vu_str_cat(&_t170, &(*_t171)); }); vu_str_cat_bytes(&_t170, (const uint8_t *)"(m, k);\n", 8); _t170; }); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
     #line 21863 "vuc.vu"
     VU_AT(21863);
     #line 21863 "vuc.vu"
-    ({ vu_str _t302 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t302); drop_Str(&_t302); });
+    ({ vu_str _t177 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    if (e >= 0) { ME_", 21); ({ vu_str *_t176 = &(*v_m); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)" *en = &m->ents[e];  en->val = v; if (take) { drop_Str(k); } return; }\n", 71); _t175; }); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
     #line 21864 "vuc.vu"
     VU_AT(21864);
     #line 21864 "vuc.vu"
-    ({ vu_str _t310 = ({ vu_str _t305 = {0}; vu_str_cat_bytes(&_t305, (const uint8_t *)"static bool vu_mhas_", 20); ({ vu_str *_t306 = &(*v_m); vu_str_cat(&_t305, &(*_t306)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)"(const ", 7); ({ vu_str *_t307 = &(*v_m); vu_str_cat(&_t305, &(*_t307)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t308 = &(*v_kc); vu_str_cat(&_t305, &(*_t308)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)" *k) { return vu_mfind_", 23); ({ vu_str *_t309 = &(*v_m); vu_str_cat(&_t305, &(*_t309)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)"(m, k) >= 0; }\n", 15); _t305; }); vu_str_cat(&v_s, &_t310); drop_Str(&_t310); });
+    ({ vu_str _t180 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
     #line 21865 "vuc.vu"
     VU_AT(21865);
     #line 21865 "vuc.vu"
-    ({ vu_str _t317 = ({ vu_str _t313 = {0}; vu_str_cat_bytes(&_t313, (const uint8_t *)"static bool vu_mremove_", 23); ({ vu_str *_t314 = &(*v_m); vu_str_cat(&_t313, &(*_t314)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)"(", 1); ({ vu_str *_t315 = &(*v_m); vu_str_cat(&_t313, &(*_t315)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t316 = &(*v_kc); vu_str_cat(&_t313, &(*_t316)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)" *k) {\n", 7); _t313; }); vu_str_cat(&v_s, &_t317); drop_Str(&_t317); });
+    ({ vu_str _t185 = ({ vu_str _t183 = {0}; vu_str_cat_bytes(&_t183, (const uint8_t *)"        if (m->nents >= VU_SMALL_MAP) vu_mbig_", 46); ({ vu_str *_t184 = &(*v_m); vu_str_cat(&_t183, &(*_t184)); }); vu_str_cat_bytes(&_t183, (const uint8_t *)"(m);\n", 5); _t183; }); vu_str_cat(&v_s, &_t185); drop_Str(&_t185); });
     #line 21866 "vuc.vu"
     VU_AT(21866);
     #line 21866 "vuc.vu"
-    ({ vu_str _t322 = ({ vu_str _t320 = {0}; vu_str_cat_bytes(&_t320, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t321 = &(*v_m); vu_str_cat(&_t320, &(*_t321)); }); vu_str_cat_bytes(&_t320, (const uint8_t *)"(m, k);\n", 8); _t320; }); vu_str_cat(&v_s, &_t322); drop_Str(&_t322); });
+    ({ vu_str _t190 = ({ vu_str _t188 = {0}; vu_str_cat_bytes(&_t188, (const uint8_t *)"    } else if ((m->nents + 1) * 4 > m->nidx * 3) vu_mindex_", 59); ({ vu_str *_t189 = &(*v_m); vu_str_cat(&_t188, &(*_t189)); }); vu_str_cat_bytes(&_t188, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t188; }); vu_str_cat(&v_s, &_t190); drop_Str(&_t190); });
     #line 21867 "vuc.vu"
     VU_AT(21867);
     #line 21867 "vuc.vu"
-    ({ vu_str _t325 = vu_str_lit("    if (e < 0) return false;\n", 29); vu_str_cat(&v_s, &_t325); drop_Str(&_t325); });
+    ({ vu_str _t193 = vu_str_lit("    uint64_t h = m->nidx ? vu_siphash(k->data, (size_t)k->len) : 0;\n", 68); vu_str_cat(&v_s, &_t193); drop_Str(&_t193); });
     #line 21868 "vuc.vu"
     VU_AT(21868);
     #line 21868 "vuc.vu"
-    ({ vu_str _t330 = ({ vu_str _t328 = {0}; vu_str_cat_bytes(&_t328, (const uint8_t *)"    ME_", 7); ({ vu_str *_t329 = &(*v_m); vu_str_cat(&_t328, &(*_t329)); }); vu_str_cat_bytes(&_t328, (const uint8_t *)" *en = &m->ents[e];\n", 20); _t328; }); vu_str_cat(&v_s, &_t330); drop_Str(&_t330); });
+    ({ vu_str _t196 = vu_str_lit("    if (m->nents == m->cap) {\n", 30); vu_str_cat(&v_s, &_t196); drop_Str(&_t196); });
     #line 21869 "vuc.vu"
     VU_AT(21869);
     #line 21869 "vuc.vu"
-    ({ vu_str _t333 = vu_str_lit("    drop_Str(&en->key); \n", 25); vu_str_cat(&v_s, &_t333); drop_Str(&_t333); });
+    ({ vu_str _t201 = ({ vu_str _t199 = {0}; vu_str_cat_bytes(&_t199, (const uint8_t *)"        if (m->cap > (int64_t)(PTRDIFF_MAX / sizeof(ME_", 55); ({ vu_str *_t200 = &(*v_m); vu_str_cat(&_t199, &(*_t200)); }); vu_str_cat_bytes(&_t199, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t199; }); vu_str_cat(&v_s, &_t201); drop_Str(&_t201); });
     #line 21870 "vuc.vu"
     VU_AT(21870);
     #line 21870 "vuc.vu"
-    ({ vu_str _t336 = vu_str_lit("    en->live = false;\n", 22); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    ({ vu_str _t204 = vu_str_lit("        /* 4 entries first (most objects are small), then 12, so a typical record grows once; then 1.5x. */\n", 108); vu_str_cat(&v_s, &_t204); drop_Str(&_t204); });
     #line 21871 "vuc.vu"
     VU_AT(21871);
     #line 21871 "vuc.vu"
-    ({ vu_str _t339 = vu_str_lit("    m->live--;\n", 15); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    ({ vu_str _t207 = vu_str_lit("        int64_t c = m->cap == 0 ? 4 : m->cap == 4 ? 12 : m->cap + m->cap / 2;\n", 78); vu_str_cat(&v_s, &_t207); drop_Str(&_t207); });
     #line 21872 "vuc.vu"
     VU_AT(21872);
     #line 21872 "vuc.vu"
-    ({ vu_str _t342 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    ({ vu_str _t214 = ({ vu_str _t210 = {0}; vu_str_cat_bytes(&_t210, (const uint8_t *)"        ME_", 11); ({ vu_str *_t211 = &(*v_m); vu_str_cat(&_t210, &(*_t211)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)" *d = (ME_", 10); ({ vu_str *_t212 = &(*v_m); vu_str_cat(&_t210, &(*_t212)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)" *)realloc(m->ents, (size_t)c * sizeof(ME_", 42); ({ vu_str *_t213 = &(*v_m); vu_str_cat(&_t210, &(*_t213)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)"));\n", 4); _t210; }); vu_str_cat(&v_s, &_t214); drop_Str(&_t214); });
     #line 21873 "vuc.vu"
     VU_AT(21873);
     #line 21873 "vuc.vu"
-    ({ vu_str _t345 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    ({ vu_str _t217 = vu_str_lit("        if (!d) vu_oom();\n", 26); vu_str_cat(&v_s, &_t217); drop_Str(&_t217); });
     #line 21874 "vuc.vu"
     VU_AT(21874);
     #line 21874 "vuc.vu"
-    ({ vu_str _t354 = ({ vu_str _t348 = {0}; vu_str_cat_bytes(&_t348, (const uint8_t *)"static ", 7); ({ vu_str *_t349 = &(*v_vc); vu_str_cat(&_t348, &(*_t349)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" vu_mgetor_", 11); ({ vu_str *_t350 = &(*v_m); vu_str_cat(&_t348, &(*_t350)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)"(const ", 7); ({ vu_str *_t351 = &(*v_m); vu_str_cat(&_t348, &(*_t351)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t352 = &(*v_kc); vu_str_cat(&_t348, &(*_t352)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" *k, ", 5); ({ vu_str *_t353 = &(*v_vc); vu_str_cat(&_t348, &(*_t353)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" d) {\n", 6); _t348; }); vu_str_cat(&v_s, &_t354); drop_Str(&_t354); });
+    ({ vu_str _t220 = vu_str_lit("        m->ents = d;\n", 21); vu_str_cat(&v_s, &_t220); drop_Str(&_t220); });
     #line 21875 "vuc.vu"
     VU_AT(21875);
     #line 21875 "vuc.vu"
-    ({ vu_str _t359 = ({ vu_str _t357 = {0}; vu_str_cat_bytes(&_t357, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t358 = &(*v_m); vu_str_cat(&_t357, &(*_t358)); }); vu_str_cat_bytes(&_t357, (const uint8_t *)"(m, k);\n", 8); _t357; }); vu_str_cat(&v_s, &_t359); drop_Str(&_t359); });
+    ({ vu_str _t223 = vu_str_lit("        m->cap = c;\n", 20); vu_str_cat(&v_s, &_t223); drop_Str(&_t223); });
     #line 21876 "vuc.vu"
     VU_AT(21876);
     #line 21876 "vuc.vu"
-    ({ vu_str _t362 = vu_str_lit("    return e < 0 ? d : m->ents[e].val;\n", 39); vu_str_cat(&v_s, &_t362); drop_Str(&_t362); });
+    ({ vu_str _t226 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t226); drop_Str(&_t226); });
     #line 21877 "vuc.vu"
     VU_AT(21877);
     #line 21877 "vuc.vu"
-    ({ vu_str _t365 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t365); drop_Str(&_t365); });
+    ({ vu_str _t231 = ({ vu_str _t229 = {0}; vu_str_cat_bytes(&_t229, (const uint8_t *)"    ME_", 7); ({ vu_str *_t230 = &(*v_m); vu_str_cat(&_t229, &(*_t230)); }); vu_str_cat_bytes(&_t229, (const uint8_t *)" *en = &m->ents[m->nents];\n", 27); _t229; }); vu_str_cat(&v_s, &_t231); drop_Str(&_t231); });
     #line 21878 "vuc.vu"
     VU_AT(21878);
     #line 21878 "vuc.vu"
-    ({ vu_str _t370 = ({ vu_str _t368 = {0}; vu_str_cat_bytes(&_t368, (const uint8_t *)"static void vu_freeents_", 24); ({ vu_str *_t369 = &(*v_m); vu_str_cat(&_t368, &(*_t369)); }); vu_str_cat_bytes(&_t368, (const uint8_t *)"(void *v, int64_t n) {\n", 23); _t368; }); vu_str_cat(&v_s, &_t370); drop_Str(&_t370); });
+    ({ vu_str _t234 = vu_str_lit("    en->key = take ? *k : vu_str_dup(k); en->val = v; en->hash = h; en->live = true;\n", 85); vu_str_cat(&v_s, &_t234); drop_Str(&_t234); });
     #line 21879 "vuc.vu"
     VU_AT(21879);
     #line 21879 "vuc.vu"
-    ({ vu_str _t376 = ({ vu_str _t373 = {0}; vu_str_cat_bytes(&_t373, (const uint8_t *)"    ME_", 7); ({ vu_str *_t374 = &(*v_m); vu_str_cat(&_t373, &(*_t374)); }); vu_str_cat_bytes(&_t373, (const uint8_t *)" *ents = (ME_", 13); ({ vu_str *_t375 = &(*v_m); vu_str_cat(&_t373, &(*_t375)); }); vu_str_cat_bytes(&_t373, (const uint8_t *)" *)v;\n", 6); _t373; }); vu_str_cat(&v_s, &_t376); drop_Str(&_t376); });
+    ({ vu_str _t237 = vu_str_lit("    m->nents++;\n", 16); vu_str_cat(&v_s, &_t237); drop_Str(&_t237); });
     #line 21880 "vuc.vu"
     VU_AT(21880);
     #line 21880 "vuc.vu"
-    ({ vu_str _t381 = ({ vu_str _t379 = {0}; vu_str_cat_bytes(&_t379, (const uint8_t *)"    for (int64_t i = 0; i < n; i++) { ME_", 41); ({ vu_str *_t380 = &(*v_m); vu_str_cat(&_t379, &(*_t380)); }); vu_str_cat_bytes(&_t379, (const uint8_t *)" *en = &ents[i]; if (!en->live) continue; drop_Str(&en->key);  }\n", 65); _t379; }); vu_str_cat(&v_s, &_t381); drop_Str(&_t381); });
+    ({ vu_str _t240 = vu_str_lit("    m->live++;\n", 15); vu_str_cat(&v_s, &_t240); drop_Str(&_t240); });
     #line 21881 "vuc.vu"
     VU_AT(21881);
     #line 21881 "vuc.vu"
-    ({ vu_str _t384 = vu_str_lit("    free(ents);\n", 16); vu_str_cat(&v_s, &_t384); drop_Str(&_t384); });
+    ({ vu_str _t243 = vu_str_lit("    if (m->nidx) {\n", 19); vu_str_cat(&v_s, &_t243); drop_Str(&_t243); });
     #line 21882 "vuc.vu"
     VU_AT(21882);
     #line 21882 "vuc.vu"
-    ({ vu_str _t387 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t387); drop_Str(&_t387); });
+    ({ vu_str _t246 = vu_str_lit("        uint64_t mask = (uint64_t)m->nidx - 1, s = h & mask;\n", 61); vu_str_cat(&v_s, &_t246); drop_Str(&_t246); });
     #line 21883 "vuc.vu"
     VU_AT(21883);
     #line 21883 "vuc.vu"
-    ({ vu_str _t393 = ({ vu_str _t390 = {0}; vu_str_cat_bytes(&_t390, (const uint8_t *)"static void drop_", 17); ({ vu_str *_t391 = &(*v_m); vu_str_cat(&_t390, &(*_t391)); }); vu_str_cat_bytes(&_t390, (const uint8_t *)"(", 1); ({ vu_str *_t392 = &(*v_m); vu_str_cat(&_t390, &(*_t392)); }); vu_str_cat_bytes(&_t390, (const uint8_t *)" *p) {\n", 7); _t390; }); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
+    ({ vu_str _t249 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & mask;\n", 46); vu_str_cat(&v_s, &_t249); drop_Str(&_t249); });
     #line 21884 "vuc.vu"
     VU_AT(21884);
     #line 21884 "vuc.vu"
-    ({ vu_str _t396 = vu_str_lit("    free(p->idx);\n", 18); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
+    ({ vu_str _t252 = vu_str_lit("        m->idx[s] = m->nents;\n", 30); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
     #line 21885 "vuc.vu"
     VU_AT(21885);
     #line 21885 "vuc.vu"
-    ({ vu_str _t399 = vu_str_lit("    if (!p->ents) return;\n", 26); vu_str_cat(&v_s, &_t399); drop_Str(&_t399); });
+    ({ vu_str _t255 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
     #line 21886 "vuc.vu"
     VU_AT(21886);
     #line 21886 "vuc.vu"
-    ({ vu_str _t404 = ({ vu_str _t402 = {0}; vu_str_cat_bytes(&_t402, (const uint8_t *)"    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_freeents_", 95); ({ vu_str *_t403 = &(*v_m); vu_str_cat(&_t402, &(*_t403)); }); vu_str_cat_bytes(&_t402, (const uint8_t *)"(p->ents, p->nents); vu_drop_depth--; }\n", 40); _t402; }); vu_str_cat(&v_s, &_t404); drop_Str(&_t404); });
+    ({ vu_str _t258 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t258); drop_Str(&_t258); });
     #line 21887 "vuc.vu"
     VU_AT(21887);
     #line 21887 "vuc.vu"
-    ({ vu_str _t409 = ({ vu_str _t407 = {0}; vu_str_cat_bytes(&_t407, (const uint8_t *)"    else vu_defer(vu_freeents_", 30); ({ vu_str *_t408 = &(*v_m); vu_str_cat(&_t407, &(*_t408)); }); vu_str_cat_bytes(&_t407, (const uint8_t *)", p->ents, p->nents);\n", 22); _t407; }); vu_str_cat(&v_s, &_t409); drop_Str(&_t409); });
+    ({ vu_str _t268 = ({ vu_str _t261 = {0}; vu_str_cat_bytes(&_t261, (const uint8_t *)"static void vu_mset_", 20); ({ vu_str *_t262 = &(*v_m); vu_str_cat(&_t261, &(*_t262)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"(", 1); ({ vu_str *_t263 = &(*v_m); vu_str_cat(&_t261, &(*_t263)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t264 = &(*v_kc); vu_str_cat(&_t261, &(*_t264)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *k, ", 5); ({ vu_str *_t265 = &(*v_vc); vu_str_cat(&_t261, &(*_t265)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t266 = &(*v_m); vu_str_cat(&_t261, &(*_t266)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"(m, (", 5); ({ vu_str *_t267 = &(*v_kc); vu_str_cat(&_t261, &(*_t267)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *)k, v, false); }\n", 19); _t261; }); vu_str_cat(&v_s, &_t268); drop_Str(&_t268); });
     #line 21888 "vuc.vu"
     VU_AT(21888);
     #line 21888 "vuc.vu"
-    ({ vu_str _t412 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t412); drop_Str(&_t412); });
+    ({ vu_str _t271 = vu_str_lit("/* Takes ownership of *k: the map keeps it, or frees it if the key was already there. */\n", 89); vu_str_cat(&v_s, &_t271); drop_Str(&_t271); });
     #line 21889 "vuc.vu"
     VU_AT(21889);
     #line 21889 "vuc.vu"
+    ({ vu_str _t280 = ({ vu_str _t274 = {0}; vu_str_cat_bytes(&_t274, (const uint8_t *)"static void vu_mtake_", 21); ({ vu_str *_t275 = &(*v_m); vu_str_cat(&_t274, &(*_t275)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)"(", 1); ({ vu_str *_t276 = &(*v_m); vu_str_cat(&_t274, &(*_t276)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" *m, ", 5); ({ vu_str *_t277 = &(*v_kc); vu_str_cat(&_t274, &(*_t277)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" *k, ", 5); ({ vu_str *_t278 = &(*v_vc); vu_str_cat(&_t274, &(*_t278)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t279 = &(*v_m); vu_str_cat(&_t274, &(*_t279)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)"(m, k, v, true); }\n", 19); _t274; }); vu_str_cat(&v_s, &_t280); drop_Str(&_t280); });
+    #line 21890 "vuc.vu"
+    VU_AT(21890);
+    #line 21890 "vuc.vu"
+    ({ vu_str _t288 = ({ vu_str _t283 = {0}; vu_str_cat_bytes(&_t283, (const uint8_t *)"static ", 7); ({ vu_str *_t284 = &(*v_vc); vu_str_cat(&_t283, &(*_t284)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *vu_mget_", 10); ({ vu_str *_t285 = &(*v_m); vu_str_cat(&_t283, &(*_t285)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)"(", 1); ({ vu_str *_t286 = &(*v_m); vu_str_cat(&_t283, &(*_t286)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t287 = &(*v_kc); vu_str_cat(&_t283, &(*_t287)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *k, int line) {\n", 17); _t283; }); vu_str_cat(&v_s, &_t288); drop_Str(&_t288); });
+    #line 21891 "vuc.vu"
+    VU_AT(21891);
+    #line 21891 "vuc.vu"
+    ({ vu_str _t293 = ({ vu_str _t291 = {0}; vu_str_cat_bytes(&_t291, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t292 = &(*v_m); vu_str_cat(&_t291, &(*_t292)); }); vu_str_cat_bytes(&_t291, (const uint8_t *)"(m, k);\n", 8); _t291; }); vu_str_cat(&v_s, &_t293); drop_Str(&_t293); });
+    #line 21892 "vuc.vu"
+    VU_AT(21892);
+    #line 21892 "vuc.vu"
+    ({ vu_str _t296 = vu_str_lit("    if (e < 0) vu_fail(line, \"key not found in map\");\n", 54); vu_str_cat(&v_s, &_t296); drop_Str(&_t296); });
+    #line 21893 "vuc.vu"
+    VU_AT(21893);
+    #line 21893 "vuc.vu"
+    ({ vu_str _t299 = vu_str_lit("    return &m->ents[e].val;\n", 28); vu_str_cat(&v_s, &_t299); drop_Str(&_t299); });
+    #line 21894 "vuc.vu"
+    VU_AT(21894);
+    #line 21894 "vuc.vu"
+    ({ vu_str _t302 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t302); drop_Str(&_t302); });
+    #line 21895 "vuc.vu"
+    VU_AT(21895);
+    #line 21895 "vuc.vu"
+    ({ vu_str _t310 = ({ vu_str _t305 = {0}; vu_str_cat_bytes(&_t305, (const uint8_t *)"static bool vu_mhas_", 20); ({ vu_str *_t306 = &(*v_m); vu_str_cat(&_t305, &(*_t306)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)"(const ", 7); ({ vu_str *_t307 = &(*v_m); vu_str_cat(&_t305, &(*_t307)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t308 = &(*v_kc); vu_str_cat(&_t305, &(*_t308)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)" *k) { return vu_mfind_", 23); ({ vu_str *_t309 = &(*v_m); vu_str_cat(&_t305, &(*_t309)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)"(m, k) >= 0; }\n", 15); _t305; }); vu_str_cat(&v_s, &_t310); drop_Str(&_t310); });
+    #line 21896 "vuc.vu"
+    VU_AT(21896);
+    #line 21896 "vuc.vu"
+    ({ vu_str _t317 = ({ vu_str _t313 = {0}; vu_str_cat_bytes(&_t313, (const uint8_t *)"static bool vu_mremove_", 23); ({ vu_str *_t314 = &(*v_m); vu_str_cat(&_t313, &(*_t314)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)"(", 1); ({ vu_str *_t315 = &(*v_m); vu_str_cat(&_t313, &(*_t315)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t316 = &(*v_kc); vu_str_cat(&_t313, &(*_t316)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)" *k) {\n", 7); _t313; }); vu_str_cat(&v_s, &_t317); drop_Str(&_t317); });
+    #line 21897 "vuc.vu"
+    VU_AT(21897);
+    #line 21897 "vuc.vu"
+    ({ vu_str _t322 = ({ vu_str _t320 = {0}; vu_str_cat_bytes(&_t320, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t321 = &(*v_m); vu_str_cat(&_t320, &(*_t321)); }); vu_str_cat_bytes(&_t320, (const uint8_t *)"(m, k);\n", 8); _t320; }); vu_str_cat(&v_s, &_t322); drop_Str(&_t322); });
+    #line 21898 "vuc.vu"
+    VU_AT(21898);
+    #line 21898 "vuc.vu"
+    ({ vu_str _t325 = vu_str_lit("    if (e < 0) return false;\n", 29); vu_str_cat(&v_s, &_t325); drop_Str(&_t325); });
+    #line 21899 "vuc.vu"
+    VU_AT(21899);
+    #line 21899 "vuc.vu"
+    ({ vu_str _t330 = ({ vu_str _t328 = {0}; vu_str_cat_bytes(&_t328, (const uint8_t *)"    ME_", 7); ({ vu_str *_t329 = &(*v_m); vu_str_cat(&_t328, &(*_t329)); }); vu_str_cat_bytes(&_t328, (const uint8_t *)" *en = &m->ents[e];\n", 20); _t328; }); vu_str_cat(&v_s, &_t330); drop_Str(&_t330); });
+    #line 21900 "vuc.vu"
+    VU_AT(21900);
+    #line 21900 "vuc.vu"
+    ({ vu_str _t333 = vu_str_lit("    drop_Str(&en->key); \n", 25); vu_str_cat(&v_s, &_t333); drop_Str(&_t333); });
+    #line 21901 "vuc.vu"
+    VU_AT(21901);
+    #line 21901 "vuc.vu"
+    ({ vu_str _t336 = vu_str_lit("    en->live = false;\n", 22); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    #line 21902 "vuc.vu"
+    VU_AT(21902);
+    #line 21902 "vuc.vu"
+    ({ vu_str _t339 = vu_str_lit("    m->live--;\n", 15); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    #line 21903 "vuc.vu"
+    VU_AT(21903);
+    #line 21903 "vuc.vu"
+    ({ vu_str _t342 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    #line 21904 "vuc.vu"
+    VU_AT(21904);
+    #line 21904 "vuc.vu"
+    ({ vu_str _t345 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    #line 21905 "vuc.vu"
+    VU_AT(21905);
+    #line 21905 "vuc.vu"
+    ({ vu_str _t354 = ({ vu_str _t348 = {0}; vu_str_cat_bytes(&_t348, (const uint8_t *)"static ", 7); ({ vu_str *_t349 = &(*v_vc); vu_str_cat(&_t348, &(*_t349)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" vu_mgetor_", 11); ({ vu_str *_t350 = &(*v_m); vu_str_cat(&_t348, &(*_t350)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)"(const ", 7); ({ vu_str *_t351 = &(*v_m); vu_str_cat(&_t348, &(*_t351)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t352 = &(*v_kc); vu_str_cat(&_t348, &(*_t352)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" *k, ", 5); ({ vu_str *_t353 = &(*v_vc); vu_str_cat(&_t348, &(*_t353)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" d) {\n", 6); _t348; }); vu_str_cat(&v_s, &_t354); drop_Str(&_t354); });
+    #line 21906 "vuc.vu"
+    VU_AT(21906);
+    #line 21906 "vuc.vu"
+    ({ vu_str _t359 = ({ vu_str _t357 = {0}; vu_str_cat_bytes(&_t357, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t358 = &(*v_m); vu_str_cat(&_t357, &(*_t358)); }); vu_str_cat_bytes(&_t357, (const uint8_t *)"(m, k);\n", 8); _t357; }); vu_str_cat(&v_s, &_t359); drop_Str(&_t359); });
+    #line 21907 "vuc.vu"
+    VU_AT(21907);
+    #line 21907 "vuc.vu"
+    ({ vu_str _t362 = vu_str_lit("    return e < 0 ? d : m->ents[e].val;\n", 39); vu_str_cat(&v_s, &_t362); drop_Str(&_t362); });
+    #line 21908 "vuc.vu"
+    VU_AT(21908);
+    #line 21908 "vuc.vu"
+    ({ vu_str _t365 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t365); drop_Str(&_t365); });
+    #line 21909 "vuc.vu"
+    VU_AT(21909);
+    #line 21909 "vuc.vu"
+    ({ vu_str _t370 = ({ vu_str _t368 = {0}; vu_str_cat_bytes(&_t368, (const uint8_t *)"static void vu_freeents_", 24); ({ vu_str *_t369 = &(*v_m); vu_str_cat(&_t368, &(*_t369)); }); vu_str_cat_bytes(&_t368, (const uint8_t *)"(void *v, int64_t n) {\n", 23); _t368; }); vu_str_cat(&v_s, &_t370); drop_Str(&_t370); });
+    #line 21910 "vuc.vu"
+    VU_AT(21910);
+    #line 21910 "vuc.vu"
+    ({ vu_str _t376 = ({ vu_str _t373 = {0}; vu_str_cat_bytes(&_t373, (const uint8_t *)"    ME_", 7); ({ vu_str *_t374 = &(*v_m); vu_str_cat(&_t373, &(*_t374)); }); vu_str_cat_bytes(&_t373, (const uint8_t *)" *ents = (ME_", 13); ({ vu_str *_t375 = &(*v_m); vu_str_cat(&_t373, &(*_t375)); }); vu_str_cat_bytes(&_t373, (const uint8_t *)" *)v;\n", 6); _t373; }); vu_str_cat(&v_s, &_t376); drop_Str(&_t376); });
+    #line 21911 "vuc.vu"
+    VU_AT(21911);
+    #line 21911 "vuc.vu"
+    ({ vu_str _t381 = ({ vu_str _t379 = {0}; vu_str_cat_bytes(&_t379, (const uint8_t *)"    for (int64_t i = 0; i < n; i++) { ME_", 41); ({ vu_str *_t380 = &(*v_m); vu_str_cat(&_t379, &(*_t380)); }); vu_str_cat_bytes(&_t379, (const uint8_t *)" *en = &ents[i]; if (!en->live) continue; drop_Str(&en->key);  }\n", 65); _t379; }); vu_str_cat(&v_s, &_t381); drop_Str(&_t381); });
+    #line 21912 "vuc.vu"
+    VU_AT(21912);
+    #line 21912 "vuc.vu"
+    ({ vu_str _t384 = vu_str_lit("    free(ents);\n", 16); vu_str_cat(&v_s, &_t384); drop_Str(&_t384); });
+    #line 21913 "vuc.vu"
+    VU_AT(21913);
+    #line 21913 "vuc.vu"
+    ({ vu_str _t387 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t387); drop_Str(&_t387); });
+    #line 21914 "vuc.vu"
+    VU_AT(21914);
+    #line 21914 "vuc.vu"
+    ({ vu_str _t393 = ({ vu_str _t390 = {0}; vu_str_cat_bytes(&_t390, (const uint8_t *)"static void drop_", 17); ({ vu_str *_t391 = &(*v_m); vu_str_cat(&_t390, &(*_t391)); }); vu_str_cat_bytes(&_t390, (const uint8_t *)"(", 1); ({ vu_str *_t392 = &(*v_m); vu_str_cat(&_t390, &(*_t392)); }); vu_str_cat_bytes(&_t390, (const uint8_t *)" *p) {\n", 7); _t390; }); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
+    #line 21915 "vuc.vu"
+    VU_AT(21915);
+    #line 21915 "vuc.vu"
+    ({ vu_str _t396 = vu_str_lit("    free(p->idx);\n", 18); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
+    #line 21916 "vuc.vu"
+    VU_AT(21916);
+    #line 21916 "vuc.vu"
+    ({ vu_str _t399 = vu_str_lit("    if (!p->ents) return;\n", 26); vu_str_cat(&v_s, &_t399); drop_Str(&_t399); });
+    #line 21917 "vuc.vu"
+    VU_AT(21917);
+    #line 21917 "vuc.vu"
+    ({ vu_str _t404 = ({ vu_str _t402 = {0}; vu_str_cat_bytes(&_t402, (const uint8_t *)"    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_freeents_", 95); ({ vu_str *_t403 = &(*v_m); vu_str_cat(&_t402, &(*_t403)); }); vu_str_cat_bytes(&_t402, (const uint8_t *)"(p->ents, p->nents); vu_drop_depth--; }\n", 40); _t402; }); vu_str_cat(&v_s, &_t404); drop_Str(&_t404); });
+    #line 21918 "vuc.vu"
+    VU_AT(21918);
+    #line 21918 "vuc.vu"
+    ({ vu_str _t409 = ({ vu_str _t407 = {0}; vu_str_cat_bytes(&_t407, (const uint8_t *)"    else vu_defer(vu_freeents_", 30); ({ vu_str *_t408 = &(*v_m); vu_str_cat(&_t407, &(*_t408)); }); vu_str_cat_bytes(&_t407, (const uint8_t *)", p->ents, p->nents);\n", 22); _t407; }); vu_str_cat(&v_s, &_t409); drop_Str(&_t409); });
+    #line 21919 "vuc.vu"
+    VU_AT(21919);
+    #line 21919 "vuc.vu"
+    ({ vu_str _t412 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t412); drop_Str(&_t412); });
+    #line 21920 "vuc.vu"
+    VU_AT(21920);
+    #line 21920 "vuc.vu"
     {
-        #line 21889 "vuc.vu"
+        #line 21920 "vuc.vu"
         vu_str _t413 = VU_MV(v_s);
-        #line 21889 "vuc.vu"
+        #line 21920 "vuc.vu"
         return _t413;
-    #line 21889 "vuc.vu"
+    #line 21920 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_map_code_so(vu_str *restrict v_m, vu_str *restrict v_kc, vu_str *restrict v_vc, vu_str *restrict v_vm) {
-    #line 21891 "vuc.vu"
+    #line 21922 "vuc.vu"
     VU_ENTER("map_code_so");
-    #line 21892 "vuc.vu"
-    VU_AT(21892);
-    #line 21892 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21893 "vuc.vu"
-    VU_AT(21893);
-    #line 21893 "vuc.vu"
-    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"struct ME_", 10); ({ vu_str *_t4 = &(*v_m); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" { ", 3); ({ vu_str *_t5 = &(*v_kc); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" key; ", 6); ({ vu_str *_t6 = &(*v_vc); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" val; uint64_t hash; bool live; };\n", 35); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
-    #line 21894 "vuc.vu"
-    VU_AT(21894);
-    #line 21894 "vuc.vu"
-    ({ vu_str _t10 = vu_str_lit("/* Small maps (up to VU_SMALL_MAP entries) have no index: a scan comparing keys beats hashing them.\n", 100); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
-    #line 21895 "vuc.vu"
-    VU_AT(21895);
-    #line 21895 "vuc.vu"
-    ({ vu_str _t13 = vu_str_lit("   Bigger maps hash with SipHash and probe an index into the entries. */\n", 73); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
-    #line 21896 "vuc.vu"
-    VU_AT(21896);
-    #line 21896 "vuc.vu"
-    ({ vu_str _t20 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"static int64_t vu_mfind_", 24); ({ vu_str *_t17 = &(*v_m); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)"(const ", 7); ({ vu_str *_t18 = &(*v_m); vu_str_cat(&_t16, &(*_t18)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t19 = &(*v_kc); vu_str_cat(&_t16, &(*_t19)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *k) {\n", 7); _t16; }); vu_str_cat(&v_s, &_t20); drop_Str(&_t20); });
-    #line 21897 "vuc.vu"
-    VU_AT(21897);
-    #line 21897 "vuc.vu"
-    ({ vu_str _t23 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t23); drop_Str(&_t23); });
-    #line 21898 "vuc.vu"
-    VU_AT(21898);
-    #line 21898 "vuc.vu"
-    ({ vu_str _t26 = vu_str_lit("        for (int64_t i = 0; i < m->nents; i++) {\n", 49); vu_str_cat(&v_s, &_t26); drop_Str(&_t26); });
-    #line 21899 "vuc.vu"
-    VU_AT(21899);
-    #line 21899 "vuc.vu"
-    ({ vu_str _t31 = ({ vu_str _t29 = {0}; vu_str_cat_bytes(&_t29, (const uint8_t *)"            const ME_", 21); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t29, &(*_t30)); }); vu_str_cat_bytes(&_t29, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t29; }); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
-    #line 21900 "vuc.vu"
-    VU_AT(21900);
-    #line 21900 "vuc.vu"
-    ({ vu_str _t34 = vu_str_lit("            if (en->live && (vu_str_eq(&en->key, k))) return i;\n", 64); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
-    #line 21901 "vuc.vu"
-    VU_AT(21901);
-    #line 21901 "vuc.vu"
-    ({ vu_str _t37 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
-    #line 21902 "vuc.vu"
-    VU_AT(21902);
-    #line 21902 "vuc.vu"
-    ({ vu_str _t40 = vu_str_lit("        return -1;\n", 19); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
-    #line 21903 "vuc.vu"
-    VU_AT(21903);
-    #line 21903 "vuc.vu"
-    ({ vu_str _t43 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
-    #line 21904 "vuc.vu"
-    VU_AT(21904);
-    #line 21904 "vuc.vu"
-    ({ vu_str _t46 = vu_str_lit("    uint64_t h = vu_siphash(k->data, (size_t)k->len);\n", 54); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
-    #line 21905 "vuc.vu"
-    VU_AT(21905);
-    #line 21905 "vuc.vu"
-    ({ vu_str _t49 = vu_str_lit("    uint64_t mask = (uint64_t)m->nidx - 1;\n", 43); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
-    #line 21906 "vuc.vu"
-    VU_AT(21906);
-    #line 21906 "vuc.vu"
-    ({ vu_str _t52 = vu_str_lit("    for (uint64_t i = h & mask;; i = (i + 1) & mask) {\n", 55); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
-    #line 21907 "vuc.vu"
-    VU_AT(21907);
-    #line 21907 "vuc.vu"
-    ({ vu_str _t55 = vu_str_lit("        int64_t e = m->idx[i];\n", 31); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
-    #line 21908 "vuc.vu"
-    VU_AT(21908);
-    #line 21908 "vuc.vu"
-    ({ vu_str _t58 = vu_str_lit("        if (e == 0) return -1;\n", 31); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
-    #line 21909 "vuc.vu"
-    VU_AT(21909);
-    #line 21909 "vuc.vu"
-    ({ vu_str _t63 = ({ vu_str _t61 = {0}; vu_str_cat_bytes(&_t61, (const uint8_t *)"        const ME_", 17); ({ vu_str *_t62 = &(*v_m); vu_str_cat(&_t61, &(*_t62)); }); vu_str_cat_bytes(&_t61, (const uint8_t *)" *en = &m->ents[e - 1];\n", 24); _t61; }); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
-    #line 21910 "vuc.vu"
-    VU_AT(21910);
-    #line 21910 "vuc.vu"
-    ({ vu_str _t66 = vu_str_lit("        if (en->live && en->hash == h && (vu_str_eq(&en->key, k))) return e - 1;\n", 81); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 21911 "vuc.vu"
-    VU_AT(21911);
-    #line 21911 "vuc.vu"
-    ({ vu_str _t69 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
-    #line 21912 "vuc.vu"
-    VU_AT(21912);
-    #line 21912 "vuc.vu"
-    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
-    #line 21913 "vuc.vu"
-    VU_AT(21913);
-    #line 21913 "vuc.vu"
-    ({ vu_str _t78 = ({ vu_str _t75 = {0}; vu_str_cat_bytes(&_t75, (const uint8_t *)"static void vu_mindex_", 22); ({ vu_str *_t76 = &(*v_m); vu_str_cat(&_t75, &(*_t76)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)"(", 1); ({ vu_str *_t77 = &(*v_m); vu_str_cat(&_t75, &(*_t77)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)" *m, int64_t want) {\n", 21); _t75; }); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
-    #line 21914 "vuc.vu"
-    VU_AT(21914);
-    #line 21914 "vuc.vu"
-    ({ vu_str _t81 = vu_str_lit("    int64_t j = 0;\n", 19); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
-    #line 21915 "vuc.vu"
-    VU_AT(21915);
-    #line 21915 "vuc.vu"
-    ({ vu_str _t84 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) if (m->ents[i].live) m->ents[j++] = m->ents[i];\n", 91); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
-    #line 21916 "vuc.vu"
-    VU_AT(21916);
-    #line 21916 "vuc.vu"
-    ({ vu_str _t87 = vu_str_lit("    m->nents = j;\n", 18); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
-    #line 21917 "vuc.vu"
-    VU_AT(21917);
-    #line 21917 "vuc.vu"
-    ({ vu_str _t90 = vu_str_lit("    int64_t n = 8;\n", 19); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
-    #line 21918 "vuc.vu"
-    VU_AT(21918);
-    #line 21918 "vuc.vu"
-    ({ vu_str _t93 = vu_str_lit("    while (n < want) { if (n > INT64_MAX / 4) vu_oom(); n *= 2; }\n", 66); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
-    #line 21919 "vuc.vu"
-    VU_AT(21919);
-    #line 21919 "vuc.vu"
-    ({ vu_str _t96 = vu_str_lit("    free(m->idx);\n", 18); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
-    #line 21920 "vuc.vu"
-    VU_AT(21920);
-    #line 21920 "vuc.vu"
-    ({ vu_str _t99 = vu_str_lit("    m->idx = (int64_t *)calloc((size_t)n, sizeof(int64_t));\n", 60); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
-    #line 21921 "vuc.vu"
-    VU_AT(21921);
-    #line 21921 "vuc.vu"
-    ({ vu_str _t102 = vu_str_lit("    if (!m->idx) vu_oom();\n", 27); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
-    #line 21922 "vuc.vu"
-    VU_AT(21922);
-    #line 21922 "vuc.vu"
-    ({ vu_str _t105 = vu_str_lit("    m->nidx = n;\n", 17); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 21923 "vuc.vu"
     VU_AT(21923);
     #line 21923 "vuc.vu"
-    ({ vu_str _t108 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 21924 "vuc.vu"
     VU_AT(21924);
     #line 21924 "vuc.vu"
-    ({ vu_str _t111 = vu_str_lit("        uint64_t s = m->ents[i].hash & ((uint64_t)n - 1);\n", 58); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
+    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"struct ME_", 10); ({ vu_str *_t4 = &(*v_m); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" { ", 3); ({ vu_str *_t5 = &(*v_kc); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" key; ", 6); ({ vu_str *_t6 = &(*v_vc); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" val; uint64_t hash; bool live; };\n", 35); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
     #line 21925 "vuc.vu"
     VU_AT(21925);
     #line 21925 "vuc.vu"
-    ({ vu_str _t114 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & ((uint64_t)n - 1);\n", 59); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
+    ({ vu_str _t10 = vu_str_lit("/* Small maps (up to VU_SMALL_MAP entries) have no index: a scan comparing keys beats hashing them.\n", 100); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
     #line 21926 "vuc.vu"
     VU_AT(21926);
     #line 21926 "vuc.vu"
-    ({ vu_str _t117 = vu_str_lit("        m->idx[s] = i + 1;\n", 27); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
+    ({ vu_str _t13 = vu_str_lit("   Bigger maps hash with SipHash and probe an index into the entries. */\n", 73); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
     #line 21927 "vuc.vu"
     VU_AT(21927);
     #line 21927 "vuc.vu"
-    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
+    ({ vu_str _t20 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"static int64_t vu_mfind_", 24); ({ vu_str *_t17 = &(*v_m); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)"(const ", 7); ({ vu_str *_t18 = &(*v_m); vu_str_cat(&_t16, &(*_t18)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t19 = &(*v_kc); vu_str_cat(&_t16, &(*_t19)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *k) {\n", 7); _t16; }); vu_str_cat(&v_s, &_t20); drop_Str(&_t20); });
     #line 21928 "vuc.vu"
     VU_AT(21928);
     #line 21928 "vuc.vu"
-    ({ vu_str _t123 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
+    ({ vu_str _t23 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t23); drop_Str(&_t23); });
     #line 21929 "vuc.vu"
     VU_AT(21929);
     #line 21929 "vuc.vu"
-    ({ vu_str _t129 = ({ vu_str _t126 = {0}; vu_str_cat_bytes(&_t126, (const uint8_t *)"static void vu_mbig_", 20); ({ vu_str *_t127 = &(*v_m); vu_str_cat(&_t126, &(*_t127)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)"(", 1); ({ vu_str *_t128 = &(*v_m); vu_str_cat(&_t126, &(*_t128)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)" *m) {\n", 7); _t126; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
+    ({ vu_str _t26 = vu_str_lit("        for (int64_t i = 0; i < m->nents; i++) {\n", 49); vu_str_cat(&v_s, &_t26); drop_Str(&_t26); });
     #line 21930 "vuc.vu"
     VU_AT(21930);
     #line 21930 "vuc.vu"
-    ({ vu_str _t132 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
+    ({ vu_str _t31 = ({ vu_str _t29 = {0}; vu_str_cat_bytes(&_t29, (const uint8_t *)"            const ME_", 21); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t29, &(*_t30)); }); vu_str_cat_bytes(&_t29, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t29; }); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
     #line 21931 "vuc.vu"
     VU_AT(21931);
     #line 21931 "vuc.vu"
-    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"        ME_", 11); ({ vu_str *_t136 = &(*v_m); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
+    ({ vu_str _t34 = vu_str_lit("            if (en->live && (vu_str_eq(&en->key, k))) return i;\n", 64); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
     #line 21932 "vuc.vu"
     VU_AT(21932);
     #line 21932 "vuc.vu"
-    ({ vu_str _t140 = vu_str_lit("        if (!en->live) continue;\n", 33); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
+    ({ vu_str _t37 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
     #line 21933 "vuc.vu"
     VU_AT(21933);
     #line 21933 "vuc.vu"
-    ({ vu_str _t145 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"        const ", 14); ({ vu_str *_t144 = &(*v_kc); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *k = &en->key;\n", 16); _t143; }); vu_str_cat(&v_s, &_t145); drop_Str(&_t145); });
+    ({ vu_str _t40 = vu_str_lit("        return -1;\n", 19); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
     #line 21934 "vuc.vu"
     VU_AT(21934);
     #line 21934 "vuc.vu"
-    ({ vu_str _t148 = vu_str_lit("        en->hash = vu_siphash(k->data, (size_t)k->len);\n", 56); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
+    ({ vu_str _t43 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
     #line 21935 "vuc.vu"
     VU_AT(21935);
     #line 21935 "vuc.vu"
-    ({ vu_str _t151 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
+    ({ vu_str _t46 = vu_str_lit("    uint64_t h = vu_siphash(k->data, (size_t)k->len);\n", 54); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
     #line 21936 "vuc.vu"
     VU_AT(21936);
     #line 21936 "vuc.vu"
-    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"    vu_mindex_", 14); ({ vu_str *_t155 = &(*v_m); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
+    ({ vu_str _t49 = vu_str_lit("    uint64_t mask = (uint64_t)m->nidx - 1;\n", 43); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
     #line 21937 "vuc.vu"
     VU_AT(21937);
     #line 21937 "vuc.vu"
-    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
+    ({ vu_str _t52 = vu_str_lit("    for (uint64_t i = h & mask;; i = (i + 1) & mask) {\n", 55); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
     #line 21938 "vuc.vu"
     VU_AT(21938);
     #line 21938 "vuc.vu"
-    ({ vu_str _t167 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_mput_", 20); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_m); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *m, ", 5); ({ vu_str *_t165 = &(*v_kc); vu_str_cat(&_t162, &(*_t165)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *k, ", 5); ({ vu_str *_t166 = &(*v_vc); vu_str_cat(&_t162, &(*_t166)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" v, bool take) {\n", 17); _t162; }); vu_str_cat(&v_s, &_t167); drop_Str(&_t167); });
+    ({ vu_str _t55 = vu_str_lit("        int64_t e = m->idx[i];\n", 31); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
     #line 21939 "vuc.vu"
     VU_AT(21939);
     #line 21939 "vuc.vu"
-    ({ vu_str _t172 = ({ vu_str _t170 = {0}; vu_str_cat_bytes(&_t170, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t171 = &(*v_m); vu_str_cat(&_t170, &(*_t171)); }); vu_str_cat_bytes(&_t170, (const uint8_t *)"(m, k);\n", 8); _t170; }); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
+    ({ vu_str _t58 = vu_str_lit("        if (e == 0) return -1;\n", 31); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
     #line 21940 "vuc.vu"
     VU_AT(21940);
     #line 21940 "vuc.vu"
-    ({ vu_str _t178 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    if (e >= 0) { ME_", 21); ({ vu_str *_t176 = &(*v_m); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)" *en = &m->ents[e]; drop_", 25); ({ vu_str *_t177 = &(*v_vm); vu_str_cat(&_t175, &(*_t177)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)"(&en->val); en->val = v; if (take) { drop_Str(k); } return; }\n", 62); _t175; }); vu_str_cat(&v_s, &_t178); drop_Str(&_t178); });
+    ({ vu_str _t63 = ({ vu_str _t61 = {0}; vu_str_cat_bytes(&_t61, (const uint8_t *)"        const ME_", 17); ({ vu_str *_t62 = &(*v_m); vu_str_cat(&_t61, &(*_t62)); }); vu_str_cat_bytes(&_t61, (const uint8_t *)" *en = &m->ents[e - 1];\n", 24); _t61; }); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
     #line 21941 "vuc.vu"
     VU_AT(21941);
     #line 21941 "vuc.vu"
-    ({ vu_str _t181 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t181); drop_Str(&_t181); });
+    ({ vu_str _t66 = vu_str_lit("        if (en->live && en->hash == h && (vu_str_eq(&en->key, k))) return e - 1;\n", 81); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
     #line 21942 "vuc.vu"
     VU_AT(21942);
     #line 21942 "vuc.vu"
-    ({ vu_str _t186 = ({ vu_str _t184 = {0}; vu_str_cat_bytes(&_t184, (const uint8_t *)"        if (m->nents >= VU_SMALL_MAP) vu_mbig_", 46); ({ vu_str *_t185 = &(*v_m); vu_str_cat(&_t184, &(*_t185)); }); vu_str_cat_bytes(&_t184, (const uint8_t *)"(m);\n", 5); _t184; }); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
+    ({ vu_str _t69 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
     #line 21943 "vuc.vu"
     VU_AT(21943);
     #line 21943 "vuc.vu"
-    ({ vu_str _t191 = ({ vu_str _t189 = {0}; vu_str_cat_bytes(&_t189, (const uint8_t *)"    } else if ((m->nents + 1) * 4 > m->nidx * 3) vu_mindex_", 59); ({ vu_str *_t190 = &(*v_m); vu_str_cat(&_t189, &(*_t190)); }); vu_str_cat_bytes(&_t189, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t189; }); vu_str_cat(&v_s, &_t191); drop_Str(&_t191); });
+    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
     #line 21944 "vuc.vu"
     VU_AT(21944);
     #line 21944 "vuc.vu"
-    ({ vu_str _t194 = vu_str_lit("    uint64_t h = m->nidx ? vu_siphash(k->data, (size_t)k->len) : 0;\n", 68); vu_str_cat(&v_s, &_t194); drop_Str(&_t194); });
+    ({ vu_str _t78 = ({ vu_str _t75 = {0}; vu_str_cat_bytes(&_t75, (const uint8_t *)"static void vu_mindex_", 22); ({ vu_str *_t76 = &(*v_m); vu_str_cat(&_t75, &(*_t76)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)"(", 1); ({ vu_str *_t77 = &(*v_m); vu_str_cat(&_t75, &(*_t77)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)" *m, int64_t want) {\n", 21); _t75; }); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
     #line 21945 "vuc.vu"
     VU_AT(21945);
     #line 21945 "vuc.vu"
-    ({ vu_str _t197 = vu_str_lit("    if (m->nents == m->cap) {\n", 30); vu_str_cat(&v_s, &_t197); drop_Str(&_t197); });
+    ({ vu_str _t81 = vu_str_lit("    int64_t j = 0;\n", 19); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
     #line 21946 "vuc.vu"
     VU_AT(21946);
     #line 21946 "vuc.vu"
-    ({ vu_str _t202 = ({ vu_str _t200 = {0}; vu_str_cat_bytes(&_t200, (const uint8_t *)"        if (m->cap > (int64_t)(PTRDIFF_MAX / sizeof(ME_", 55); ({ vu_str *_t201 = &(*v_m); vu_str_cat(&_t200, &(*_t201)); }); vu_str_cat_bytes(&_t200, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t200; }); vu_str_cat(&v_s, &_t202); drop_Str(&_t202); });
+    ({ vu_str _t84 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) if (m->ents[i].live) m->ents[j++] = m->ents[i];\n", 91); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
     #line 21947 "vuc.vu"
     VU_AT(21947);
     #line 21947 "vuc.vu"
-    ({ vu_str _t205 = vu_str_lit("        /* 4 entries first (most objects are small), then 12, so a typical record grows once; then 1.5x. */\n", 108); vu_str_cat(&v_s, &_t205); drop_Str(&_t205); });
+    ({ vu_str _t87 = vu_str_lit("    m->nents = j;\n", 18); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
     #line 21948 "vuc.vu"
     VU_AT(21948);
     #line 21948 "vuc.vu"
-    ({ vu_str _t208 = vu_str_lit("        int64_t c = m->cap == 0 ? 4 : m->cap == 4 ? 12 : m->cap + m->cap / 2;\n", 78); vu_str_cat(&v_s, &_t208); drop_Str(&_t208); });
+    ({ vu_str _t90 = vu_str_lit("    int64_t n = 8;\n", 19); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 21949 "vuc.vu"
     VU_AT(21949);
     #line 21949 "vuc.vu"
-    ({ vu_str _t215 = ({ vu_str _t211 = {0}; vu_str_cat_bytes(&_t211, (const uint8_t *)"        ME_", 11); ({ vu_str *_t212 = &(*v_m); vu_str_cat(&_t211, &(*_t212)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)" *d = (ME_", 10); ({ vu_str *_t213 = &(*v_m); vu_str_cat(&_t211, &(*_t213)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)" *)realloc(m->ents, (size_t)c * sizeof(ME_", 42); ({ vu_str *_t214 = &(*v_m); vu_str_cat(&_t211, &(*_t214)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)"));\n", 4); _t211; }); vu_str_cat(&v_s, &_t215); drop_Str(&_t215); });
+    ({ vu_str _t93 = vu_str_lit("    while (n < want) { if (n > INT64_MAX / 4) vu_oom(); n *= 2; }\n", 66); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
     #line 21950 "vuc.vu"
     VU_AT(21950);
     #line 21950 "vuc.vu"
-    ({ vu_str _t218 = vu_str_lit("        if (!d) vu_oom();\n", 26); vu_str_cat(&v_s, &_t218); drop_Str(&_t218); });
+    ({ vu_str _t96 = vu_str_lit("    free(m->idx);\n", 18); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
     #line 21951 "vuc.vu"
     VU_AT(21951);
     #line 21951 "vuc.vu"
-    ({ vu_str _t221 = vu_str_lit("        m->ents = d;\n", 21); vu_str_cat(&v_s, &_t221); drop_Str(&_t221); });
+    ({ vu_str _t99 = vu_str_lit("    m->idx = (int64_t *)calloc((size_t)n, sizeof(int64_t));\n", 60); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
     #line 21952 "vuc.vu"
     VU_AT(21952);
     #line 21952 "vuc.vu"
-    ({ vu_str _t224 = vu_str_lit("        m->cap = c;\n", 20); vu_str_cat(&v_s, &_t224); drop_Str(&_t224); });
+    ({ vu_str _t102 = vu_str_lit("    if (!m->idx) vu_oom();\n", 27); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
     #line 21953 "vuc.vu"
     VU_AT(21953);
     #line 21953 "vuc.vu"
-    ({ vu_str _t227 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t227); drop_Str(&_t227); });
+    ({ vu_str _t105 = vu_str_lit("    m->nidx = n;\n", 17); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 21954 "vuc.vu"
     VU_AT(21954);
     #line 21954 "vuc.vu"
-    ({ vu_str _t232 = ({ vu_str _t230 = {0}; vu_str_cat_bytes(&_t230, (const uint8_t *)"    ME_", 7); ({ vu_str *_t231 = &(*v_m); vu_str_cat(&_t230, &(*_t231)); }); vu_str_cat_bytes(&_t230, (const uint8_t *)" *en = &m->ents[m->nents];\n", 27); _t230; }); vu_str_cat(&v_s, &_t232); drop_Str(&_t232); });
+    ({ vu_str _t108 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
     #line 21955 "vuc.vu"
     VU_AT(21955);
     #line 21955 "vuc.vu"
-    ({ vu_str _t235 = vu_str_lit("    en->key = take ? *k : vu_str_dup(k); en->val = v; en->hash = h; en->live = true;\n", 85); vu_str_cat(&v_s, &_t235); drop_Str(&_t235); });
+    ({ vu_str _t111 = vu_str_lit("        uint64_t s = m->ents[i].hash & ((uint64_t)n - 1);\n", 58); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
     #line 21956 "vuc.vu"
     VU_AT(21956);
     #line 21956 "vuc.vu"
-    ({ vu_str _t238 = vu_str_lit("    m->nents++;\n", 16); vu_str_cat(&v_s, &_t238); drop_Str(&_t238); });
+    ({ vu_str _t114 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & ((uint64_t)n - 1);\n", 59); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
     #line 21957 "vuc.vu"
     VU_AT(21957);
     #line 21957 "vuc.vu"
-    ({ vu_str _t241 = vu_str_lit("    m->live++;\n", 15); vu_str_cat(&v_s, &_t241); drop_Str(&_t241); });
+    ({ vu_str _t117 = vu_str_lit("        m->idx[s] = i + 1;\n", 27); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
     #line 21958 "vuc.vu"
     VU_AT(21958);
     #line 21958 "vuc.vu"
-    ({ vu_str _t244 = vu_str_lit("    if (m->nidx) {\n", 19); vu_str_cat(&v_s, &_t244); drop_Str(&_t244); });
+    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
     #line 21959 "vuc.vu"
     VU_AT(21959);
     #line 21959 "vuc.vu"
-    ({ vu_str _t247 = vu_str_lit("        uint64_t mask = (uint64_t)m->nidx - 1, s = h & mask;\n", 61); vu_str_cat(&v_s, &_t247); drop_Str(&_t247); });
+    ({ vu_str _t123 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
     #line 21960 "vuc.vu"
     VU_AT(21960);
     #line 21960 "vuc.vu"
-    ({ vu_str _t250 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & mask;\n", 46); vu_str_cat(&v_s, &_t250); drop_Str(&_t250); });
+    ({ vu_str _t129 = ({ vu_str _t126 = {0}; vu_str_cat_bytes(&_t126, (const uint8_t *)"static void vu_mbig_", 20); ({ vu_str *_t127 = &(*v_m); vu_str_cat(&_t126, &(*_t127)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)"(", 1); ({ vu_str *_t128 = &(*v_m); vu_str_cat(&_t126, &(*_t128)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)" *m) {\n", 7); _t126; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
     #line 21961 "vuc.vu"
     VU_AT(21961);
     #line 21961 "vuc.vu"
-    ({ vu_str _t253 = vu_str_lit("        m->idx[s] = m->nents;\n", 30); vu_str_cat(&v_s, &_t253); drop_Str(&_t253); });
+    ({ vu_str _t132 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
     #line 21962 "vuc.vu"
     VU_AT(21962);
     #line 21962 "vuc.vu"
-    ({ vu_str _t256 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t256); drop_Str(&_t256); });
+    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"        ME_", 11); ({ vu_str *_t136 = &(*v_m); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
     #line 21963 "vuc.vu"
     VU_AT(21963);
     #line 21963 "vuc.vu"
-    ({ vu_str _t259 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t259); drop_Str(&_t259); });
+    ({ vu_str _t140 = vu_str_lit("        if (!en->live) continue;\n", 33); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
     #line 21964 "vuc.vu"
     VU_AT(21964);
     #line 21964 "vuc.vu"
-    ({ vu_str _t269 = ({ vu_str _t262 = {0}; vu_str_cat_bytes(&_t262, (const uint8_t *)"static void vu_mset_", 20); ({ vu_str *_t263 = &(*v_m); vu_str_cat(&_t262, &(*_t263)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)"(", 1); ({ vu_str *_t264 = &(*v_m); vu_str_cat(&_t262, &(*_t264)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t265 = &(*v_kc); vu_str_cat(&_t262, &(*_t265)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *k, ", 5); ({ vu_str *_t266 = &(*v_vc); vu_str_cat(&_t262, &(*_t266)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t267 = &(*v_m); vu_str_cat(&_t262, &(*_t267)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)"(m, (", 5); ({ vu_str *_t268 = &(*v_kc); vu_str_cat(&_t262, &(*_t268)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *)k, v, false); }\n", 19); _t262; }); vu_str_cat(&v_s, &_t269); drop_Str(&_t269); });
+    ({ vu_str _t145 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"        const ", 14); ({ vu_str *_t144 = &(*v_kc); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *k = &en->key;\n", 16); _t143; }); vu_str_cat(&v_s, &_t145); drop_Str(&_t145); });
     #line 21965 "vuc.vu"
     VU_AT(21965);
     #line 21965 "vuc.vu"
-    ({ vu_str _t272 = vu_str_lit("/* Takes ownership of *k: the map keeps it, or frees it if the key was already there. */\n", 89); vu_str_cat(&v_s, &_t272); drop_Str(&_t272); });
+    ({ vu_str _t148 = vu_str_lit("        en->hash = vu_siphash(k->data, (size_t)k->len);\n", 56); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
     #line 21966 "vuc.vu"
     VU_AT(21966);
     #line 21966 "vuc.vu"
-    ({ vu_str _t281 = ({ vu_str _t275 = {0}; vu_str_cat_bytes(&_t275, (const uint8_t *)"static void vu_mtake_", 21); ({ vu_str *_t276 = &(*v_m); vu_str_cat(&_t275, &(*_t276)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"(", 1); ({ vu_str *_t277 = &(*v_m); vu_str_cat(&_t275, &(*_t277)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" *m, ", 5); ({ vu_str *_t278 = &(*v_kc); vu_str_cat(&_t275, &(*_t278)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" *k, ", 5); ({ vu_str *_t279 = &(*v_vc); vu_str_cat(&_t275, &(*_t279)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t280 = &(*v_m); vu_str_cat(&_t275, &(*_t280)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"(m, k, v, true); }\n", 19); _t275; }); vu_str_cat(&v_s, &_t281); drop_Str(&_t281); });
+    ({ vu_str _t151 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
     #line 21967 "vuc.vu"
     VU_AT(21967);
     #line 21967 "vuc.vu"
-    ({ vu_str _t289 = ({ vu_str _t284 = {0}; vu_str_cat_bytes(&_t284, (const uint8_t *)"static ", 7); ({ vu_str *_t285 = &(*v_vc); vu_str_cat(&_t284, &(*_t285)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *vu_mget_", 10); ({ vu_str *_t286 = &(*v_m); vu_str_cat(&_t284, &(*_t286)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)"(", 1); ({ vu_str *_t287 = &(*v_m); vu_str_cat(&_t284, &(*_t287)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t288 = &(*v_kc); vu_str_cat(&_t284, &(*_t288)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *k, int line) {\n", 17); _t284; }); vu_str_cat(&v_s, &_t289); drop_Str(&_t289); });
+    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"    vu_mindex_", 14); ({ vu_str *_t155 = &(*v_m); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
     #line 21968 "vuc.vu"
     VU_AT(21968);
     #line 21968 "vuc.vu"
-    ({ vu_str _t294 = ({ vu_str _t292 = {0}; vu_str_cat_bytes(&_t292, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t293 = &(*v_m); vu_str_cat(&_t292, &(*_t293)); }); vu_str_cat_bytes(&_t292, (const uint8_t *)"(m, k);\n", 8); _t292; }); vu_str_cat(&v_s, &_t294); drop_Str(&_t294); });
+    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
     #line 21969 "vuc.vu"
     VU_AT(21969);
     #line 21969 "vuc.vu"
-    ({ vu_str _t297 = vu_str_lit("    if (e < 0) vu_fail(line, \"key not found in map\");\n", 54); vu_str_cat(&v_s, &_t297); drop_Str(&_t297); });
+    ({ vu_str _t167 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_mput_", 20); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_m); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *m, ", 5); ({ vu_str *_t165 = &(*v_kc); vu_str_cat(&_t162, &(*_t165)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *k, ", 5); ({ vu_str *_t166 = &(*v_vc); vu_str_cat(&_t162, &(*_t166)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" v, bool take) {\n", 17); _t162; }); vu_str_cat(&v_s, &_t167); drop_Str(&_t167); });
     #line 21970 "vuc.vu"
     VU_AT(21970);
     #line 21970 "vuc.vu"
-    ({ vu_str _t300 = vu_str_lit("    return &m->ents[e].val;\n", 28); vu_str_cat(&v_s, &_t300); drop_Str(&_t300); });
+    ({ vu_str _t172 = ({ vu_str _t170 = {0}; vu_str_cat_bytes(&_t170, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t171 = &(*v_m); vu_str_cat(&_t170, &(*_t171)); }); vu_str_cat_bytes(&_t170, (const uint8_t *)"(m, k);\n", 8); _t170; }); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
     #line 21971 "vuc.vu"
     VU_AT(21971);
     #line 21971 "vuc.vu"
-    ({ vu_str _t303 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t303); drop_Str(&_t303); });
+    ({ vu_str _t178 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    if (e >= 0) { ME_", 21); ({ vu_str *_t176 = &(*v_m); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)" *en = &m->ents[e]; drop_", 25); ({ vu_str *_t177 = &(*v_vm); vu_str_cat(&_t175, &(*_t177)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)"(&en->val); en->val = v; if (take) { drop_Str(k); } return; }\n", 62); _t175; }); vu_str_cat(&v_s, &_t178); drop_Str(&_t178); });
     #line 21972 "vuc.vu"
     VU_AT(21972);
     #line 21972 "vuc.vu"
-    ({ vu_str _t311 = ({ vu_str _t306 = {0}; vu_str_cat_bytes(&_t306, (const uint8_t *)"static bool vu_mhas_", 20); ({ vu_str *_t307 = &(*v_m); vu_str_cat(&_t306, &(*_t307)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)"(const ", 7); ({ vu_str *_t308 = &(*v_m); vu_str_cat(&_t306, &(*_t308)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t309 = &(*v_kc); vu_str_cat(&_t306, &(*_t309)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)" *k) { return vu_mfind_", 23); ({ vu_str *_t310 = &(*v_m); vu_str_cat(&_t306, &(*_t310)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)"(m, k) >= 0; }\n", 15); _t306; }); vu_str_cat(&v_s, &_t311); drop_Str(&_t311); });
+    ({ vu_str _t181 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t181); drop_Str(&_t181); });
     #line 21973 "vuc.vu"
     VU_AT(21973);
     #line 21973 "vuc.vu"
-    ({ vu_str _t318 = ({ vu_str _t314 = {0}; vu_str_cat_bytes(&_t314, (const uint8_t *)"static bool vu_mremove_", 23); ({ vu_str *_t315 = &(*v_m); vu_str_cat(&_t314, &(*_t315)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)"(", 1); ({ vu_str *_t316 = &(*v_m); vu_str_cat(&_t314, &(*_t316)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t317 = &(*v_kc); vu_str_cat(&_t314, &(*_t317)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)" *k) {\n", 7); _t314; }); vu_str_cat(&v_s, &_t318); drop_Str(&_t318); });
+    ({ vu_str _t186 = ({ vu_str _t184 = {0}; vu_str_cat_bytes(&_t184, (const uint8_t *)"        if (m->nents >= VU_SMALL_MAP) vu_mbig_", 46); ({ vu_str *_t185 = &(*v_m); vu_str_cat(&_t184, &(*_t185)); }); vu_str_cat_bytes(&_t184, (const uint8_t *)"(m);\n", 5); _t184; }); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
     #line 21974 "vuc.vu"
     VU_AT(21974);
     #line 21974 "vuc.vu"
-    ({ vu_str _t323 = ({ vu_str _t321 = {0}; vu_str_cat_bytes(&_t321, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t322 = &(*v_m); vu_str_cat(&_t321, &(*_t322)); }); vu_str_cat_bytes(&_t321, (const uint8_t *)"(m, k);\n", 8); _t321; }); vu_str_cat(&v_s, &_t323); drop_Str(&_t323); });
+    ({ vu_str _t191 = ({ vu_str _t189 = {0}; vu_str_cat_bytes(&_t189, (const uint8_t *)"    } else if ((m->nents + 1) * 4 > m->nidx * 3) vu_mindex_", 59); ({ vu_str *_t190 = &(*v_m); vu_str_cat(&_t189, &(*_t190)); }); vu_str_cat_bytes(&_t189, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t189; }); vu_str_cat(&v_s, &_t191); drop_Str(&_t191); });
     #line 21975 "vuc.vu"
     VU_AT(21975);
     #line 21975 "vuc.vu"
-    ({ vu_str _t326 = vu_str_lit("    if (e < 0) return false;\n", 29); vu_str_cat(&v_s, &_t326); drop_Str(&_t326); });
+    ({ vu_str _t194 = vu_str_lit("    uint64_t h = m->nidx ? vu_siphash(k->data, (size_t)k->len) : 0;\n", 68); vu_str_cat(&v_s, &_t194); drop_Str(&_t194); });
     #line 21976 "vuc.vu"
     VU_AT(21976);
     #line 21976 "vuc.vu"
-    ({ vu_str _t331 = ({ vu_str _t329 = {0}; vu_str_cat_bytes(&_t329, (const uint8_t *)"    ME_", 7); ({ vu_str *_t330 = &(*v_m); vu_str_cat(&_t329, &(*_t330)); }); vu_str_cat_bytes(&_t329, (const uint8_t *)" *en = &m->ents[e];\n", 20); _t329; }); vu_str_cat(&v_s, &_t331); drop_Str(&_t331); });
+    ({ vu_str _t197 = vu_str_lit("    if (m->nents == m->cap) {\n", 30); vu_str_cat(&v_s, &_t197); drop_Str(&_t197); });
     #line 21977 "vuc.vu"
     VU_AT(21977);
     #line 21977 "vuc.vu"
-    ({ vu_str _t336 = ({ vu_str _t334 = {0}; vu_str_cat_bytes(&_t334, (const uint8_t *)"    drop_Str(&en->key); drop_", 29); ({ vu_str *_t335 = &(*v_vm); vu_str_cat(&_t334, &(*_t335)); }); vu_str_cat_bytes(&_t334, (const uint8_t *)"(&en->val);\n", 12); _t334; }); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    ({ vu_str _t202 = ({ vu_str _t200 = {0}; vu_str_cat_bytes(&_t200, (const uint8_t *)"        if (m->cap > (int64_t)(PTRDIFF_MAX / sizeof(ME_", 55); ({ vu_str *_t201 = &(*v_m); vu_str_cat(&_t200, &(*_t201)); }); vu_str_cat_bytes(&_t200, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t200; }); vu_str_cat(&v_s, &_t202); drop_Str(&_t202); });
     #line 21978 "vuc.vu"
     VU_AT(21978);
     #line 21978 "vuc.vu"
-    ({ vu_str _t339 = vu_str_lit("    en->live = false;\n", 22); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    ({ vu_str _t205 = vu_str_lit("        /* 4 entries first (most objects are small), then 12, so a typical record grows once; then 1.5x. */\n", 108); vu_str_cat(&v_s, &_t205); drop_Str(&_t205); });
     #line 21979 "vuc.vu"
     VU_AT(21979);
     #line 21979 "vuc.vu"
-    ({ vu_str _t342 = vu_str_lit("    m->live--;\n", 15); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    ({ vu_str _t208 = vu_str_lit("        int64_t c = m->cap == 0 ? 4 : m->cap == 4 ? 12 : m->cap + m->cap / 2;\n", 78); vu_str_cat(&v_s, &_t208); drop_Str(&_t208); });
     #line 21980 "vuc.vu"
     VU_AT(21980);
     #line 21980 "vuc.vu"
-    ({ vu_str _t345 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    ({ vu_str _t215 = ({ vu_str _t211 = {0}; vu_str_cat_bytes(&_t211, (const uint8_t *)"        ME_", 11); ({ vu_str *_t212 = &(*v_m); vu_str_cat(&_t211, &(*_t212)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)" *d = (ME_", 10); ({ vu_str *_t213 = &(*v_m); vu_str_cat(&_t211, &(*_t213)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)" *)realloc(m->ents, (size_t)c * sizeof(ME_", 42); ({ vu_str *_t214 = &(*v_m); vu_str_cat(&_t211, &(*_t214)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)"));\n", 4); _t211; }); vu_str_cat(&v_s, &_t215); drop_Str(&_t215); });
     #line 21981 "vuc.vu"
     VU_AT(21981);
     #line 21981 "vuc.vu"
-    ({ vu_str _t348 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t348); drop_Str(&_t348); });
+    ({ vu_str _t218 = vu_str_lit("        if (!d) vu_oom();\n", 26); vu_str_cat(&v_s, &_t218); drop_Str(&_t218); });
     #line 21982 "vuc.vu"
     VU_AT(21982);
     #line 21982 "vuc.vu"
-    ({ vu_str _t353 = ({ vu_str _t351 = {0}; vu_str_cat_bytes(&_t351, (const uint8_t *)"static void vu_freeents_", 24); ({ vu_str *_t352 = &(*v_m); vu_str_cat(&_t351, &(*_t352)); }); vu_str_cat_bytes(&_t351, (const uint8_t *)"(void *v, int64_t n) {\n", 23); _t351; }); vu_str_cat(&v_s, &_t353); drop_Str(&_t353); });
+    ({ vu_str _t221 = vu_str_lit("        m->ents = d;\n", 21); vu_str_cat(&v_s, &_t221); drop_Str(&_t221); });
     #line 21983 "vuc.vu"
     VU_AT(21983);
     #line 21983 "vuc.vu"
-    ({ vu_str _t359 = ({ vu_str _t356 = {0}; vu_str_cat_bytes(&_t356, (const uint8_t *)"    ME_", 7); ({ vu_str *_t357 = &(*v_m); vu_str_cat(&_t356, &(*_t357)); }); vu_str_cat_bytes(&_t356, (const uint8_t *)" *ents = (ME_", 13); ({ vu_str *_t358 = &(*v_m); vu_str_cat(&_t356, &(*_t358)); }); vu_str_cat_bytes(&_t356, (const uint8_t *)" *)v;\n", 6); _t356; }); vu_str_cat(&v_s, &_t359); drop_Str(&_t359); });
+    ({ vu_str _t224 = vu_str_lit("        m->cap = c;\n", 20); vu_str_cat(&v_s, &_t224); drop_Str(&_t224); });
     #line 21984 "vuc.vu"
     VU_AT(21984);
     #line 21984 "vuc.vu"
-    ({ vu_str _t365 = ({ vu_str _t362 = {0}; vu_str_cat_bytes(&_t362, (const uint8_t *)"    for (int64_t i = 0; i < n; i++) { ME_", 41); ({ vu_str *_t363 = &(*v_m); vu_str_cat(&_t362, &(*_t363)); }); vu_str_cat_bytes(&_t362, (const uint8_t *)" *en = &ents[i]; if (!en->live) continue; drop_Str(&en->key); drop_", 67); ({ vu_str *_t364 = &(*v_vm); vu_str_cat(&_t362, &(*_t364)); }); vu_str_cat_bytes(&_t362, (const uint8_t *)"(&en->val); }\n", 14); _t362; }); vu_str_cat(&v_s, &_t365); drop_Str(&_t365); });
+    ({ vu_str _t227 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t227); drop_Str(&_t227); });
     #line 21985 "vuc.vu"
     VU_AT(21985);
     #line 21985 "vuc.vu"
-    ({ vu_str _t368 = vu_str_lit("    free(ents);\n", 16); vu_str_cat(&v_s, &_t368); drop_Str(&_t368); });
+    ({ vu_str _t232 = ({ vu_str _t230 = {0}; vu_str_cat_bytes(&_t230, (const uint8_t *)"    ME_", 7); ({ vu_str *_t231 = &(*v_m); vu_str_cat(&_t230, &(*_t231)); }); vu_str_cat_bytes(&_t230, (const uint8_t *)" *en = &m->ents[m->nents];\n", 27); _t230; }); vu_str_cat(&v_s, &_t232); drop_Str(&_t232); });
     #line 21986 "vuc.vu"
     VU_AT(21986);
     #line 21986 "vuc.vu"
-    ({ vu_str _t371 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t371); drop_Str(&_t371); });
+    ({ vu_str _t235 = vu_str_lit("    en->key = take ? *k : vu_str_dup(k); en->val = v; en->hash = h; en->live = true;\n", 85); vu_str_cat(&v_s, &_t235); drop_Str(&_t235); });
     #line 21987 "vuc.vu"
     VU_AT(21987);
     #line 21987 "vuc.vu"
-    ({ vu_str _t377 = ({ vu_str _t374 = {0}; vu_str_cat_bytes(&_t374, (const uint8_t *)"static void drop_", 17); ({ vu_str *_t375 = &(*v_m); vu_str_cat(&_t374, &(*_t375)); }); vu_str_cat_bytes(&_t374, (const uint8_t *)"(", 1); ({ vu_str *_t376 = &(*v_m); vu_str_cat(&_t374, &(*_t376)); }); vu_str_cat_bytes(&_t374, (const uint8_t *)" *p) {\n", 7); _t374; }); vu_str_cat(&v_s, &_t377); drop_Str(&_t377); });
+    ({ vu_str _t238 = vu_str_lit("    m->nents++;\n", 16); vu_str_cat(&v_s, &_t238); drop_Str(&_t238); });
     #line 21988 "vuc.vu"
     VU_AT(21988);
     #line 21988 "vuc.vu"
-    ({ vu_str _t380 = vu_str_lit("    free(p->idx);\n", 18); vu_str_cat(&v_s, &_t380); drop_Str(&_t380); });
+    ({ vu_str _t241 = vu_str_lit("    m->live++;\n", 15); vu_str_cat(&v_s, &_t241); drop_Str(&_t241); });
     #line 21989 "vuc.vu"
     VU_AT(21989);
     #line 21989 "vuc.vu"
-    ({ vu_str _t383 = vu_str_lit("    if (!p->ents) return;\n", 26); vu_str_cat(&v_s, &_t383); drop_Str(&_t383); });
+    ({ vu_str _t244 = vu_str_lit("    if (m->nidx) {\n", 19); vu_str_cat(&v_s, &_t244); drop_Str(&_t244); });
     #line 21990 "vuc.vu"
     VU_AT(21990);
     #line 21990 "vuc.vu"
-    ({ vu_str _t388 = ({ vu_str _t386 = {0}; vu_str_cat_bytes(&_t386, (const uint8_t *)"    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_freeents_", 95); ({ vu_str *_t387 = &(*v_m); vu_str_cat(&_t386, &(*_t387)); }); vu_str_cat_bytes(&_t386, (const uint8_t *)"(p->ents, p->nents); vu_drop_depth--; }\n", 40); _t386; }); vu_str_cat(&v_s, &_t388); drop_Str(&_t388); });
+    ({ vu_str _t247 = vu_str_lit("        uint64_t mask = (uint64_t)m->nidx - 1, s = h & mask;\n", 61); vu_str_cat(&v_s, &_t247); drop_Str(&_t247); });
     #line 21991 "vuc.vu"
     VU_AT(21991);
     #line 21991 "vuc.vu"
-    ({ vu_str _t393 = ({ vu_str _t391 = {0}; vu_str_cat_bytes(&_t391, (const uint8_t *)"    else vu_defer(vu_freeents_", 30); ({ vu_str *_t392 = &(*v_m); vu_str_cat(&_t391, &(*_t392)); }); vu_str_cat_bytes(&_t391, (const uint8_t *)", p->ents, p->nents);\n", 22); _t391; }); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
+    ({ vu_str _t250 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & mask;\n", 46); vu_str_cat(&v_s, &_t250); drop_Str(&_t250); });
     #line 21992 "vuc.vu"
     VU_AT(21992);
     #line 21992 "vuc.vu"
-    ({ vu_str _t396 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
+    ({ vu_str _t253 = vu_str_lit("        m->idx[s] = m->nents;\n", 30); vu_str_cat(&v_s, &_t253); drop_Str(&_t253); });
     #line 21993 "vuc.vu"
     VU_AT(21993);
     #line 21993 "vuc.vu"
+    ({ vu_str _t256 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t256); drop_Str(&_t256); });
+    #line 21994 "vuc.vu"
+    VU_AT(21994);
+    #line 21994 "vuc.vu"
+    ({ vu_str _t259 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t259); drop_Str(&_t259); });
+    #line 21995 "vuc.vu"
+    VU_AT(21995);
+    #line 21995 "vuc.vu"
+    ({ vu_str _t269 = ({ vu_str _t262 = {0}; vu_str_cat_bytes(&_t262, (const uint8_t *)"static void vu_mset_", 20); ({ vu_str *_t263 = &(*v_m); vu_str_cat(&_t262, &(*_t263)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)"(", 1); ({ vu_str *_t264 = &(*v_m); vu_str_cat(&_t262, &(*_t264)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t265 = &(*v_kc); vu_str_cat(&_t262, &(*_t265)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *k, ", 5); ({ vu_str *_t266 = &(*v_vc); vu_str_cat(&_t262, &(*_t266)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t267 = &(*v_m); vu_str_cat(&_t262, &(*_t267)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)"(m, (", 5); ({ vu_str *_t268 = &(*v_kc); vu_str_cat(&_t262, &(*_t268)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *)k, v, false); }\n", 19); _t262; }); vu_str_cat(&v_s, &_t269); drop_Str(&_t269); });
+    #line 21996 "vuc.vu"
+    VU_AT(21996);
+    #line 21996 "vuc.vu"
+    ({ vu_str _t272 = vu_str_lit("/* Takes ownership of *k: the map keeps it, or frees it if the key was already there. */\n", 89); vu_str_cat(&v_s, &_t272); drop_Str(&_t272); });
+    #line 21997 "vuc.vu"
+    VU_AT(21997);
+    #line 21997 "vuc.vu"
+    ({ vu_str _t281 = ({ vu_str _t275 = {0}; vu_str_cat_bytes(&_t275, (const uint8_t *)"static void vu_mtake_", 21); ({ vu_str *_t276 = &(*v_m); vu_str_cat(&_t275, &(*_t276)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"(", 1); ({ vu_str *_t277 = &(*v_m); vu_str_cat(&_t275, &(*_t277)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" *m, ", 5); ({ vu_str *_t278 = &(*v_kc); vu_str_cat(&_t275, &(*_t278)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" *k, ", 5); ({ vu_str *_t279 = &(*v_vc); vu_str_cat(&_t275, &(*_t279)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t280 = &(*v_m); vu_str_cat(&_t275, &(*_t280)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"(m, k, v, true); }\n", 19); _t275; }); vu_str_cat(&v_s, &_t281); drop_Str(&_t281); });
+    #line 21998 "vuc.vu"
+    VU_AT(21998);
+    #line 21998 "vuc.vu"
+    ({ vu_str _t289 = ({ vu_str _t284 = {0}; vu_str_cat_bytes(&_t284, (const uint8_t *)"static ", 7); ({ vu_str *_t285 = &(*v_vc); vu_str_cat(&_t284, &(*_t285)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *vu_mget_", 10); ({ vu_str *_t286 = &(*v_m); vu_str_cat(&_t284, &(*_t286)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)"(", 1); ({ vu_str *_t287 = &(*v_m); vu_str_cat(&_t284, &(*_t287)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t288 = &(*v_kc); vu_str_cat(&_t284, &(*_t288)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *k, int line) {\n", 17); _t284; }); vu_str_cat(&v_s, &_t289); drop_Str(&_t289); });
+    #line 21999 "vuc.vu"
+    VU_AT(21999);
+    #line 21999 "vuc.vu"
+    ({ vu_str _t294 = ({ vu_str _t292 = {0}; vu_str_cat_bytes(&_t292, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t293 = &(*v_m); vu_str_cat(&_t292, &(*_t293)); }); vu_str_cat_bytes(&_t292, (const uint8_t *)"(m, k);\n", 8); _t292; }); vu_str_cat(&v_s, &_t294); drop_Str(&_t294); });
+    #line 22000 "vuc.vu"
+    VU_AT(22000);
+    #line 22000 "vuc.vu"
+    ({ vu_str _t297 = vu_str_lit("    if (e < 0) vu_fail(line, \"key not found in map\");\n", 54); vu_str_cat(&v_s, &_t297); drop_Str(&_t297); });
+    #line 22001 "vuc.vu"
+    VU_AT(22001);
+    #line 22001 "vuc.vu"
+    ({ vu_str _t300 = vu_str_lit("    return &m->ents[e].val;\n", 28); vu_str_cat(&v_s, &_t300); drop_Str(&_t300); });
+    #line 22002 "vuc.vu"
+    VU_AT(22002);
+    #line 22002 "vuc.vu"
+    ({ vu_str _t303 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t303); drop_Str(&_t303); });
+    #line 22003 "vuc.vu"
+    VU_AT(22003);
+    #line 22003 "vuc.vu"
+    ({ vu_str _t311 = ({ vu_str _t306 = {0}; vu_str_cat_bytes(&_t306, (const uint8_t *)"static bool vu_mhas_", 20); ({ vu_str *_t307 = &(*v_m); vu_str_cat(&_t306, &(*_t307)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)"(const ", 7); ({ vu_str *_t308 = &(*v_m); vu_str_cat(&_t306, &(*_t308)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t309 = &(*v_kc); vu_str_cat(&_t306, &(*_t309)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)" *k) { return vu_mfind_", 23); ({ vu_str *_t310 = &(*v_m); vu_str_cat(&_t306, &(*_t310)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)"(m, k) >= 0; }\n", 15); _t306; }); vu_str_cat(&v_s, &_t311); drop_Str(&_t311); });
+    #line 22004 "vuc.vu"
+    VU_AT(22004);
+    #line 22004 "vuc.vu"
+    ({ vu_str _t318 = ({ vu_str _t314 = {0}; vu_str_cat_bytes(&_t314, (const uint8_t *)"static bool vu_mremove_", 23); ({ vu_str *_t315 = &(*v_m); vu_str_cat(&_t314, &(*_t315)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)"(", 1); ({ vu_str *_t316 = &(*v_m); vu_str_cat(&_t314, &(*_t316)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t317 = &(*v_kc); vu_str_cat(&_t314, &(*_t317)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)" *k) {\n", 7); _t314; }); vu_str_cat(&v_s, &_t318); drop_Str(&_t318); });
+    #line 22005 "vuc.vu"
+    VU_AT(22005);
+    #line 22005 "vuc.vu"
+    ({ vu_str _t323 = ({ vu_str _t321 = {0}; vu_str_cat_bytes(&_t321, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t322 = &(*v_m); vu_str_cat(&_t321, &(*_t322)); }); vu_str_cat_bytes(&_t321, (const uint8_t *)"(m, k);\n", 8); _t321; }); vu_str_cat(&v_s, &_t323); drop_Str(&_t323); });
+    #line 22006 "vuc.vu"
+    VU_AT(22006);
+    #line 22006 "vuc.vu"
+    ({ vu_str _t326 = vu_str_lit("    if (e < 0) return false;\n", 29); vu_str_cat(&v_s, &_t326); drop_Str(&_t326); });
+    #line 22007 "vuc.vu"
+    VU_AT(22007);
+    #line 22007 "vuc.vu"
+    ({ vu_str _t331 = ({ vu_str _t329 = {0}; vu_str_cat_bytes(&_t329, (const uint8_t *)"    ME_", 7); ({ vu_str *_t330 = &(*v_m); vu_str_cat(&_t329, &(*_t330)); }); vu_str_cat_bytes(&_t329, (const uint8_t *)" *en = &m->ents[e];\n", 20); _t329; }); vu_str_cat(&v_s, &_t331); drop_Str(&_t331); });
+    #line 22008 "vuc.vu"
+    VU_AT(22008);
+    #line 22008 "vuc.vu"
+    ({ vu_str _t336 = ({ vu_str _t334 = {0}; vu_str_cat_bytes(&_t334, (const uint8_t *)"    drop_Str(&en->key); drop_", 29); ({ vu_str *_t335 = &(*v_vm); vu_str_cat(&_t334, &(*_t335)); }); vu_str_cat_bytes(&_t334, (const uint8_t *)"(&en->val);\n", 12); _t334; }); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    #line 22009 "vuc.vu"
+    VU_AT(22009);
+    #line 22009 "vuc.vu"
+    ({ vu_str _t339 = vu_str_lit("    en->live = false;\n", 22); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    #line 22010 "vuc.vu"
+    VU_AT(22010);
+    #line 22010 "vuc.vu"
+    ({ vu_str _t342 = vu_str_lit("    m->live--;\n", 15); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    #line 22011 "vuc.vu"
+    VU_AT(22011);
+    #line 22011 "vuc.vu"
+    ({ vu_str _t345 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    #line 22012 "vuc.vu"
+    VU_AT(22012);
+    #line 22012 "vuc.vu"
+    ({ vu_str _t348 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t348); drop_Str(&_t348); });
+    #line 22013 "vuc.vu"
+    VU_AT(22013);
+    #line 22013 "vuc.vu"
+    ({ vu_str _t353 = ({ vu_str _t351 = {0}; vu_str_cat_bytes(&_t351, (const uint8_t *)"static void vu_freeents_", 24); ({ vu_str *_t352 = &(*v_m); vu_str_cat(&_t351, &(*_t352)); }); vu_str_cat_bytes(&_t351, (const uint8_t *)"(void *v, int64_t n) {\n", 23); _t351; }); vu_str_cat(&v_s, &_t353); drop_Str(&_t353); });
+    #line 22014 "vuc.vu"
+    VU_AT(22014);
+    #line 22014 "vuc.vu"
+    ({ vu_str _t359 = ({ vu_str _t356 = {0}; vu_str_cat_bytes(&_t356, (const uint8_t *)"    ME_", 7); ({ vu_str *_t357 = &(*v_m); vu_str_cat(&_t356, &(*_t357)); }); vu_str_cat_bytes(&_t356, (const uint8_t *)" *ents = (ME_", 13); ({ vu_str *_t358 = &(*v_m); vu_str_cat(&_t356, &(*_t358)); }); vu_str_cat_bytes(&_t356, (const uint8_t *)" *)v;\n", 6); _t356; }); vu_str_cat(&v_s, &_t359); drop_Str(&_t359); });
+    #line 22015 "vuc.vu"
+    VU_AT(22015);
+    #line 22015 "vuc.vu"
+    ({ vu_str _t365 = ({ vu_str _t362 = {0}; vu_str_cat_bytes(&_t362, (const uint8_t *)"    for (int64_t i = 0; i < n; i++) { ME_", 41); ({ vu_str *_t363 = &(*v_m); vu_str_cat(&_t362, &(*_t363)); }); vu_str_cat_bytes(&_t362, (const uint8_t *)" *en = &ents[i]; if (!en->live) continue; drop_Str(&en->key); drop_", 67); ({ vu_str *_t364 = &(*v_vm); vu_str_cat(&_t362, &(*_t364)); }); vu_str_cat_bytes(&_t362, (const uint8_t *)"(&en->val); }\n", 14); _t362; }); vu_str_cat(&v_s, &_t365); drop_Str(&_t365); });
+    #line 22016 "vuc.vu"
+    VU_AT(22016);
+    #line 22016 "vuc.vu"
+    ({ vu_str _t368 = vu_str_lit("    free(ents);\n", 16); vu_str_cat(&v_s, &_t368); drop_Str(&_t368); });
+    #line 22017 "vuc.vu"
+    VU_AT(22017);
+    #line 22017 "vuc.vu"
+    ({ vu_str _t371 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t371); drop_Str(&_t371); });
+    #line 22018 "vuc.vu"
+    VU_AT(22018);
+    #line 22018 "vuc.vu"
+    ({ vu_str _t377 = ({ vu_str _t374 = {0}; vu_str_cat_bytes(&_t374, (const uint8_t *)"static void drop_", 17); ({ vu_str *_t375 = &(*v_m); vu_str_cat(&_t374, &(*_t375)); }); vu_str_cat_bytes(&_t374, (const uint8_t *)"(", 1); ({ vu_str *_t376 = &(*v_m); vu_str_cat(&_t374, &(*_t376)); }); vu_str_cat_bytes(&_t374, (const uint8_t *)" *p) {\n", 7); _t374; }); vu_str_cat(&v_s, &_t377); drop_Str(&_t377); });
+    #line 22019 "vuc.vu"
+    VU_AT(22019);
+    #line 22019 "vuc.vu"
+    ({ vu_str _t380 = vu_str_lit("    free(p->idx);\n", 18); vu_str_cat(&v_s, &_t380); drop_Str(&_t380); });
+    #line 22020 "vuc.vu"
+    VU_AT(22020);
+    #line 22020 "vuc.vu"
+    ({ vu_str _t383 = vu_str_lit("    if (!p->ents) return;\n", 26); vu_str_cat(&v_s, &_t383); drop_Str(&_t383); });
+    #line 22021 "vuc.vu"
+    VU_AT(22021);
+    #line 22021 "vuc.vu"
+    ({ vu_str _t388 = ({ vu_str _t386 = {0}; vu_str_cat_bytes(&_t386, (const uint8_t *)"    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_freeents_", 95); ({ vu_str *_t387 = &(*v_m); vu_str_cat(&_t386, &(*_t387)); }); vu_str_cat_bytes(&_t386, (const uint8_t *)"(p->ents, p->nents); vu_drop_depth--; }\n", 40); _t386; }); vu_str_cat(&v_s, &_t388); drop_Str(&_t388); });
+    #line 22022 "vuc.vu"
+    VU_AT(22022);
+    #line 22022 "vuc.vu"
+    ({ vu_str _t393 = ({ vu_str _t391 = {0}; vu_str_cat_bytes(&_t391, (const uint8_t *)"    else vu_defer(vu_freeents_", 30); ({ vu_str *_t392 = &(*v_m); vu_str_cat(&_t391, &(*_t392)); }); vu_str_cat_bytes(&_t391, (const uint8_t *)", p->ents, p->nents);\n", 22); _t391; }); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
+    #line 22023 "vuc.vu"
+    VU_AT(22023);
+    #line 22023 "vuc.vu"
+    ({ vu_str _t396 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
+    #line 22024 "vuc.vu"
+    VU_AT(22024);
+    #line 22024 "vuc.vu"
     {
-        #line 21993 "vuc.vu"
+        #line 22024 "vuc.vu"
         vu_str _t397 = VU_MV(v_s);
-        #line 21993 "vuc.vu"
+        #line 22024 "vuc.vu"
         return _t397;
-    #line 21993 "vuc.vu"
+    #line 22024 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_map_code_ic(vu_str *restrict v_m, vu_str *restrict v_kc, vu_str *restrict v_vc, vu_str *restrict v_vm) {
-    #line 21995 "vuc.vu"
+    #line 22026 "vuc.vu"
     VU_ENTER("map_code_ic");
-    #line 21996 "vuc.vu"
-    VU_AT(21996);
-    #line 21996 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 21997 "vuc.vu"
-    VU_AT(21997);
-    #line 21997 "vuc.vu"
-    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"struct ME_", 10); ({ vu_str *_t4 = &(*v_m); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" { ", 3); ({ vu_str *_t5 = &(*v_kc); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" key; ", 6); ({ vu_str *_t6 = &(*v_vc); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" val; uint64_t hash; bool live; };\n", 35); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
-    #line 21998 "vuc.vu"
-    VU_AT(21998);
-    #line 21998 "vuc.vu"
-    ({ vu_str _t10 = vu_str_lit("/* Small maps (up to VU_SMALL_MAP entries) have no index: a scan comparing keys beats hashing them.\n", 100); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
-    #line 21999 "vuc.vu"
-    VU_AT(21999);
-    #line 21999 "vuc.vu"
-    ({ vu_str _t13 = vu_str_lit("   Bigger maps hash with SipHash and probe an index into the entries. */\n", 73); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
-    #line 22000 "vuc.vu"
-    VU_AT(22000);
-    #line 22000 "vuc.vu"
-    ({ vu_str _t20 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"static int64_t vu_mfind_", 24); ({ vu_str *_t17 = &(*v_m); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)"(const ", 7); ({ vu_str *_t18 = &(*v_m); vu_str_cat(&_t16, &(*_t18)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t19 = &(*v_kc); vu_str_cat(&_t16, &(*_t19)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *k) {\n", 7); _t16; }); vu_str_cat(&v_s, &_t20); drop_Str(&_t20); });
-    #line 22001 "vuc.vu"
-    VU_AT(22001);
-    #line 22001 "vuc.vu"
-    ({ vu_str _t23 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t23); drop_Str(&_t23); });
-    #line 22002 "vuc.vu"
-    VU_AT(22002);
-    #line 22002 "vuc.vu"
-    ({ vu_str _t26 = vu_str_lit("        for (int64_t i = 0; i < m->nents; i++) {\n", 49); vu_str_cat(&v_s, &_t26); drop_Str(&_t26); });
-    #line 22003 "vuc.vu"
-    VU_AT(22003);
-    #line 22003 "vuc.vu"
-    ({ vu_str _t31 = ({ vu_str _t29 = {0}; vu_str_cat_bytes(&_t29, (const uint8_t *)"            const ME_", 21); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t29, &(*_t30)); }); vu_str_cat_bytes(&_t29, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t29; }); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
-    #line 22004 "vuc.vu"
-    VU_AT(22004);
-    #line 22004 "vuc.vu"
-    ({ vu_str _t34 = vu_str_lit("            if (en->live && (en->key == *k)) return i;\n", 55); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
-    #line 22005 "vuc.vu"
-    VU_AT(22005);
-    #line 22005 "vuc.vu"
-    ({ vu_str _t37 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
-    #line 22006 "vuc.vu"
-    VU_AT(22006);
-    #line 22006 "vuc.vu"
-    ({ vu_str _t40 = vu_str_lit("        return -1;\n", 19); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
-    #line 22007 "vuc.vu"
-    VU_AT(22007);
-    #line 22007 "vuc.vu"
-    ({ vu_str _t43 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
-    #line 22008 "vuc.vu"
-    VU_AT(22008);
-    #line 22008 "vuc.vu"
-    ({ vu_str _t46 = vu_str_lit("    uint64_t h = vu_hash_int((int64_t)*k);\n", 43); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
-    #line 22009 "vuc.vu"
-    VU_AT(22009);
-    #line 22009 "vuc.vu"
-    ({ vu_str _t49 = vu_str_lit("    uint64_t mask = (uint64_t)m->nidx - 1;\n", 43); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
-    #line 22010 "vuc.vu"
-    VU_AT(22010);
-    #line 22010 "vuc.vu"
-    ({ vu_str _t52 = vu_str_lit("    for (uint64_t i = h & mask;; i = (i + 1) & mask) {\n", 55); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
-    #line 22011 "vuc.vu"
-    VU_AT(22011);
-    #line 22011 "vuc.vu"
-    ({ vu_str _t55 = vu_str_lit("        int64_t e = m->idx[i];\n", 31); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
-    #line 22012 "vuc.vu"
-    VU_AT(22012);
-    #line 22012 "vuc.vu"
-    ({ vu_str _t58 = vu_str_lit("        if (e == 0) return -1;\n", 31); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
-    #line 22013 "vuc.vu"
-    VU_AT(22013);
-    #line 22013 "vuc.vu"
-    ({ vu_str _t63 = ({ vu_str _t61 = {0}; vu_str_cat_bytes(&_t61, (const uint8_t *)"        const ME_", 17); ({ vu_str *_t62 = &(*v_m); vu_str_cat(&_t61, &(*_t62)); }); vu_str_cat_bytes(&_t61, (const uint8_t *)" *en = &m->ents[e - 1];\n", 24); _t61; }); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
-    #line 22014 "vuc.vu"
-    VU_AT(22014);
-    #line 22014 "vuc.vu"
-    ({ vu_str _t66 = vu_str_lit("        if (en->live && en->hash == h && (en->key == *k)) return e - 1;\n", 72); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 22015 "vuc.vu"
-    VU_AT(22015);
-    #line 22015 "vuc.vu"
-    ({ vu_str _t69 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
-    #line 22016 "vuc.vu"
-    VU_AT(22016);
-    #line 22016 "vuc.vu"
-    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
-    #line 22017 "vuc.vu"
-    VU_AT(22017);
-    #line 22017 "vuc.vu"
-    ({ vu_str _t78 = ({ vu_str _t75 = {0}; vu_str_cat_bytes(&_t75, (const uint8_t *)"static void vu_mindex_", 22); ({ vu_str *_t76 = &(*v_m); vu_str_cat(&_t75, &(*_t76)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)"(", 1); ({ vu_str *_t77 = &(*v_m); vu_str_cat(&_t75, &(*_t77)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)" *m, int64_t want) {\n", 21); _t75; }); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
-    #line 22018 "vuc.vu"
-    VU_AT(22018);
-    #line 22018 "vuc.vu"
-    ({ vu_str _t81 = vu_str_lit("    int64_t j = 0;\n", 19); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
-    #line 22019 "vuc.vu"
-    VU_AT(22019);
-    #line 22019 "vuc.vu"
-    ({ vu_str _t84 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) if (m->ents[i].live) m->ents[j++] = m->ents[i];\n", 91); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
-    #line 22020 "vuc.vu"
-    VU_AT(22020);
-    #line 22020 "vuc.vu"
-    ({ vu_str _t87 = vu_str_lit("    m->nents = j;\n", 18); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
-    #line 22021 "vuc.vu"
-    VU_AT(22021);
-    #line 22021 "vuc.vu"
-    ({ vu_str _t90 = vu_str_lit("    int64_t n = 8;\n", 19); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
-    #line 22022 "vuc.vu"
-    VU_AT(22022);
-    #line 22022 "vuc.vu"
-    ({ vu_str _t93 = vu_str_lit("    while (n < want) { if (n > INT64_MAX / 4) vu_oom(); n *= 2; }\n", 66); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
-    #line 22023 "vuc.vu"
-    VU_AT(22023);
-    #line 22023 "vuc.vu"
-    ({ vu_str _t96 = vu_str_lit("    free(m->idx);\n", 18); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
-    #line 22024 "vuc.vu"
-    VU_AT(22024);
-    #line 22024 "vuc.vu"
-    ({ vu_str _t99 = vu_str_lit("    m->idx = (int64_t *)calloc((size_t)n, sizeof(int64_t));\n", 60); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
-    #line 22025 "vuc.vu"
-    VU_AT(22025);
-    #line 22025 "vuc.vu"
-    ({ vu_str _t102 = vu_str_lit("    if (!m->idx) vu_oom();\n", 27); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
-    #line 22026 "vuc.vu"
-    VU_AT(22026);
-    #line 22026 "vuc.vu"
-    ({ vu_str _t105 = vu_str_lit("    m->nidx = n;\n", 17); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 22027 "vuc.vu"
     VU_AT(22027);
     #line 22027 "vuc.vu"
-    ({ vu_str _t108 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 22028 "vuc.vu"
     VU_AT(22028);
     #line 22028 "vuc.vu"
-    ({ vu_str _t111 = vu_str_lit("        uint64_t s = m->ents[i].hash & ((uint64_t)n - 1);\n", 58); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
+    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"struct ME_", 10); ({ vu_str *_t4 = &(*v_m); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" { ", 3); ({ vu_str *_t5 = &(*v_kc); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" key; ", 6); ({ vu_str *_t6 = &(*v_vc); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" val; uint64_t hash; bool live; };\n", 35); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
     #line 22029 "vuc.vu"
     VU_AT(22029);
     #line 22029 "vuc.vu"
-    ({ vu_str _t114 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & ((uint64_t)n - 1);\n", 59); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
+    ({ vu_str _t10 = vu_str_lit("/* Small maps (up to VU_SMALL_MAP entries) have no index: a scan comparing keys beats hashing them.\n", 100); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
     #line 22030 "vuc.vu"
     VU_AT(22030);
     #line 22030 "vuc.vu"
-    ({ vu_str _t117 = vu_str_lit("        m->idx[s] = i + 1;\n", 27); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
+    ({ vu_str _t13 = vu_str_lit("   Bigger maps hash with SipHash and probe an index into the entries. */\n", 73); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
     #line 22031 "vuc.vu"
     VU_AT(22031);
     #line 22031 "vuc.vu"
-    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
+    ({ vu_str _t20 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"static int64_t vu_mfind_", 24); ({ vu_str *_t17 = &(*v_m); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)"(const ", 7); ({ vu_str *_t18 = &(*v_m); vu_str_cat(&_t16, &(*_t18)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t19 = &(*v_kc); vu_str_cat(&_t16, &(*_t19)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *k) {\n", 7); _t16; }); vu_str_cat(&v_s, &_t20); drop_Str(&_t20); });
     #line 22032 "vuc.vu"
     VU_AT(22032);
     #line 22032 "vuc.vu"
-    ({ vu_str _t123 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
+    ({ vu_str _t23 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t23); drop_Str(&_t23); });
     #line 22033 "vuc.vu"
     VU_AT(22033);
     #line 22033 "vuc.vu"
-    ({ vu_str _t129 = ({ vu_str _t126 = {0}; vu_str_cat_bytes(&_t126, (const uint8_t *)"static void vu_mbig_", 20); ({ vu_str *_t127 = &(*v_m); vu_str_cat(&_t126, &(*_t127)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)"(", 1); ({ vu_str *_t128 = &(*v_m); vu_str_cat(&_t126, &(*_t128)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)" *m) {\n", 7); _t126; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
+    ({ vu_str _t26 = vu_str_lit("        for (int64_t i = 0; i < m->nents; i++) {\n", 49); vu_str_cat(&v_s, &_t26); drop_Str(&_t26); });
     #line 22034 "vuc.vu"
     VU_AT(22034);
     #line 22034 "vuc.vu"
-    ({ vu_str _t132 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
+    ({ vu_str _t31 = ({ vu_str _t29 = {0}; vu_str_cat_bytes(&_t29, (const uint8_t *)"            const ME_", 21); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t29, &(*_t30)); }); vu_str_cat_bytes(&_t29, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t29; }); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
     #line 22035 "vuc.vu"
     VU_AT(22035);
     #line 22035 "vuc.vu"
-    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"        ME_", 11); ({ vu_str *_t136 = &(*v_m); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
+    ({ vu_str _t34 = vu_str_lit("            if (en->live && (en->key == *k)) return i;\n", 55); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
     #line 22036 "vuc.vu"
     VU_AT(22036);
     #line 22036 "vuc.vu"
-    ({ vu_str _t140 = vu_str_lit("        if (!en->live) continue;\n", 33); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
+    ({ vu_str _t37 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
     #line 22037 "vuc.vu"
     VU_AT(22037);
     #line 22037 "vuc.vu"
-    ({ vu_str _t145 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"        const ", 14); ({ vu_str *_t144 = &(*v_kc); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *k = &en->key;\n", 16); _t143; }); vu_str_cat(&v_s, &_t145); drop_Str(&_t145); });
+    ({ vu_str _t40 = vu_str_lit("        return -1;\n", 19); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
     #line 22038 "vuc.vu"
     VU_AT(22038);
     #line 22038 "vuc.vu"
-    ({ vu_str _t148 = vu_str_lit("        en->hash = vu_hash_int((int64_t)*k);\n", 45); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
+    ({ vu_str _t43 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
     #line 22039 "vuc.vu"
     VU_AT(22039);
     #line 22039 "vuc.vu"
-    ({ vu_str _t151 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
+    ({ vu_str _t46 = vu_str_lit("    uint64_t h = vu_hash_int((int64_t)*k);\n", 43); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
     #line 22040 "vuc.vu"
     VU_AT(22040);
     #line 22040 "vuc.vu"
-    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"    vu_mindex_", 14); ({ vu_str *_t155 = &(*v_m); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
+    ({ vu_str _t49 = vu_str_lit("    uint64_t mask = (uint64_t)m->nidx - 1;\n", 43); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
     #line 22041 "vuc.vu"
     VU_AT(22041);
     #line 22041 "vuc.vu"
-    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
+    ({ vu_str _t52 = vu_str_lit("    for (uint64_t i = h & mask;; i = (i + 1) & mask) {\n", 55); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
     #line 22042 "vuc.vu"
     VU_AT(22042);
     #line 22042 "vuc.vu"
-    ({ vu_str _t167 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_mput_", 20); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_m); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *m, ", 5); ({ vu_str *_t165 = &(*v_kc); vu_str_cat(&_t162, &(*_t165)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *k, ", 5); ({ vu_str *_t166 = &(*v_vc); vu_str_cat(&_t162, &(*_t166)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" v, bool take) {\n", 17); _t162; }); vu_str_cat(&v_s, &_t167); drop_Str(&_t167); });
+    ({ vu_str _t55 = vu_str_lit("        int64_t e = m->idx[i];\n", 31); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
     #line 22043 "vuc.vu"
     VU_AT(22043);
     #line 22043 "vuc.vu"
-    ({ vu_str _t172 = ({ vu_str _t170 = {0}; vu_str_cat_bytes(&_t170, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t171 = &(*v_m); vu_str_cat(&_t170, &(*_t171)); }); vu_str_cat_bytes(&_t170, (const uint8_t *)"(m, k);\n", 8); _t170; }); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
+    ({ vu_str _t58 = vu_str_lit("        if (e == 0) return -1;\n", 31); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
     #line 22044 "vuc.vu"
     VU_AT(22044);
     #line 22044 "vuc.vu"
-    ({ vu_str _t177 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    if (e >= 0) { ME_", 21); ({ vu_str *_t176 = &(*v_m); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)" *en = &m->ents[e];  en->val = v; if (take) {  } return; }\n", 59); _t175; }); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
+    ({ vu_str _t63 = ({ vu_str _t61 = {0}; vu_str_cat_bytes(&_t61, (const uint8_t *)"        const ME_", 17); ({ vu_str *_t62 = &(*v_m); vu_str_cat(&_t61, &(*_t62)); }); vu_str_cat_bytes(&_t61, (const uint8_t *)" *en = &m->ents[e - 1];\n", 24); _t61; }); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
     #line 22045 "vuc.vu"
     VU_AT(22045);
     #line 22045 "vuc.vu"
-    ({ vu_str _t180 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
+    ({ vu_str _t66 = vu_str_lit("        if (en->live && en->hash == h && (en->key == *k)) return e - 1;\n", 72); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
     #line 22046 "vuc.vu"
     VU_AT(22046);
     #line 22046 "vuc.vu"
-    ({ vu_str _t185 = ({ vu_str _t183 = {0}; vu_str_cat_bytes(&_t183, (const uint8_t *)"        if (m->nents >= VU_SMALL_MAP) vu_mbig_", 46); ({ vu_str *_t184 = &(*v_m); vu_str_cat(&_t183, &(*_t184)); }); vu_str_cat_bytes(&_t183, (const uint8_t *)"(m);\n", 5); _t183; }); vu_str_cat(&v_s, &_t185); drop_Str(&_t185); });
+    ({ vu_str _t69 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
     #line 22047 "vuc.vu"
     VU_AT(22047);
     #line 22047 "vuc.vu"
-    ({ vu_str _t190 = ({ vu_str _t188 = {0}; vu_str_cat_bytes(&_t188, (const uint8_t *)"    } else if ((m->nents + 1) * 4 > m->nidx * 3) vu_mindex_", 59); ({ vu_str *_t189 = &(*v_m); vu_str_cat(&_t188, &(*_t189)); }); vu_str_cat_bytes(&_t188, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t188; }); vu_str_cat(&v_s, &_t190); drop_Str(&_t190); });
+    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
     #line 22048 "vuc.vu"
     VU_AT(22048);
     #line 22048 "vuc.vu"
-    ({ vu_str _t193 = vu_str_lit("    uint64_t h = m->nidx ? vu_hash_int((int64_t)*k) : 0;\n", 57); vu_str_cat(&v_s, &_t193); drop_Str(&_t193); });
+    ({ vu_str _t78 = ({ vu_str _t75 = {0}; vu_str_cat_bytes(&_t75, (const uint8_t *)"static void vu_mindex_", 22); ({ vu_str *_t76 = &(*v_m); vu_str_cat(&_t75, &(*_t76)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)"(", 1); ({ vu_str *_t77 = &(*v_m); vu_str_cat(&_t75, &(*_t77)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)" *m, int64_t want) {\n", 21); _t75; }); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
     #line 22049 "vuc.vu"
     VU_AT(22049);
     #line 22049 "vuc.vu"
-    ({ vu_str _t196 = vu_str_lit("    if (m->nents == m->cap) {\n", 30); vu_str_cat(&v_s, &_t196); drop_Str(&_t196); });
+    ({ vu_str _t81 = vu_str_lit("    int64_t j = 0;\n", 19); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
     #line 22050 "vuc.vu"
     VU_AT(22050);
     #line 22050 "vuc.vu"
-    ({ vu_str _t201 = ({ vu_str _t199 = {0}; vu_str_cat_bytes(&_t199, (const uint8_t *)"        if (m->cap > (int64_t)(PTRDIFF_MAX / sizeof(ME_", 55); ({ vu_str *_t200 = &(*v_m); vu_str_cat(&_t199, &(*_t200)); }); vu_str_cat_bytes(&_t199, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t199; }); vu_str_cat(&v_s, &_t201); drop_Str(&_t201); });
+    ({ vu_str _t84 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) if (m->ents[i].live) m->ents[j++] = m->ents[i];\n", 91); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
     #line 22051 "vuc.vu"
     VU_AT(22051);
     #line 22051 "vuc.vu"
-    ({ vu_str _t204 = vu_str_lit("        /* 4 entries first (most objects are small), then 12, so a typical record grows once; then 1.5x. */\n", 108); vu_str_cat(&v_s, &_t204); drop_Str(&_t204); });
+    ({ vu_str _t87 = vu_str_lit("    m->nents = j;\n", 18); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
     #line 22052 "vuc.vu"
     VU_AT(22052);
     #line 22052 "vuc.vu"
-    ({ vu_str _t207 = vu_str_lit("        int64_t c = m->cap == 0 ? 4 : m->cap == 4 ? 12 : m->cap + m->cap / 2;\n", 78); vu_str_cat(&v_s, &_t207); drop_Str(&_t207); });
+    ({ vu_str _t90 = vu_str_lit("    int64_t n = 8;\n", 19); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 22053 "vuc.vu"
     VU_AT(22053);
     #line 22053 "vuc.vu"
-    ({ vu_str _t214 = ({ vu_str _t210 = {0}; vu_str_cat_bytes(&_t210, (const uint8_t *)"        ME_", 11); ({ vu_str *_t211 = &(*v_m); vu_str_cat(&_t210, &(*_t211)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)" *d = (ME_", 10); ({ vu_str *_t212 = &(*v_m); vu_str_cat(&_t210, &(*_t212)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)" *)realloc(m->ents, (size_t)c * sizeof(ME_", 42); ({ vu_str *_t213 = &(*v_m); vu_str_cat(&_t210, &(*_t213)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)"));\n", 4); _t210; }); vu_str_cat(&v_s, &_t214); drop_Str(&_t214); });
+    ({ vu_str _t93 = vu_str_lit("    while (n < want) { if (n > INT64_MAX / 4) vu_oom(); n *= 2; }\n", 66); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
     #line 22054 "vuc.vu"
     VU_AT(22054);
     #line 22054 "vuc.vu"
-    ({ vu_str _t217 = vu_str_lit("        if (!d) vu_oom();\n", 26); vu_str_cat(&v_s, &_t217); drop_Str(&_t217); });
+    ({ vu_str _t96 = vu_str_lit("    free(m->idx);\n", 18); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
     #line 22055 "vuc.vu"
     VU_AT(22055);
     #line 22055 "vuc.vu"
-    ({ vu_str _t220 = vu_str_lit("        m->ents = d;\n", 21); vu_str_cat(&v_s, &_t220); drop_Str(&_t220); });
+    ({ vu_str _t99 = vu_str_lit("    m->idx = (int64_t *)calloc((size_t)n, sizeof(int64_t));\n", 60); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
     #line 22056 "vuc.vu"
     VU_AT(22056);
     #line 22056 "vuc.vu"
-    ({ vu_str _t223 = vu_str_lit("        m->cap = c;\n", 20); vu_str_cat(&v_s, &_t223); drop_Str(&_t223); });
+    ({ vu_str _t102 = vu_str_lit("    if (!m->idx) vu_oom();\n", 27); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
     #line 22057 "vuc.vu"
     VU_AT(22057);
     #line 22057 "vuc.vu"
-    ({ vu_str _t226 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t226); drop_Str(&_t226); });
+    ({ vu_str _t105 = vu_str_lit("    m->nidx = n;\n", 17); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 22058 "vuc.vu"
     VU_AT(22058);
     #line 22058 "vuc.vu"
-    ({ vu_str _t231 = ({ vu_str _t229 = {0}; vu_str_cat_bytes(&_t229, (const uint8_t *)"    ME_", 7); ({ vu_str *_t230 = &(*v_m); vu_str_cat(&_t229, &(*_t230)); }); vu_str_cat_bytes(&_t229, (const uint8_t *)" *en = &m->ents[m->nents];\n", 27); _t229; }); vu_str_cat(&v_s, &_t231); drop_Str(&_t231); });
+    ({ vu_str _t108 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
     #line 22059 "vuc.vu"
     VU_AT(22059);
     #line 22059 "vuc.vu"
-    ({ vu_str _t234 = vu_str_lit("    en->key = take ? *k : *k; en->val = v; en->hash = h; en->live = true;\n", 74); vu_str_cat(&v_s, &_t234); drop_Str(&_t234); });
+    ({ vu_str _t111 = vu_str_lit("        uint64_t s = m->ents[i].hash & ((uint64_t)n - 1);\n", 58); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
     #line 22060 "vuc.vu"
     VU_AT(22060);
     #line 22060 "vuc.vu"
-    ({ vu_str _t237 = vu_str_lit("    m->nents++;\n", 16); vu_str_cat(&v_s, &_t237); drop_Str(&_t237); });
+    ({ vu_str _t114 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & ((uint64_t)n - 1);\n", 59); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
     #line 22061 "vuc.vu"
     VU_AT(22061);
     #line 22061 "vuc.vu"
-    ({ vu_str _t240 = vu_str_lit("    m->live++;\n", 15); vu_str_cat(&v_s, &_t240); drop_Str(&_t240); });
+    ({ vu_str _t117 = vu_str_lit("        m->idx[s] = i + 1;\n", 27); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
     #line 22062 "vuc.vu"
     VU_AT(22062);
     #line 22062 "vuc.vu"
-    ({ vu_str _t243 = vu_str_lit("    if (m->nidx) {\n", 19); vu_str_cat(&v_s, &_t243); drop_Str(&_t243); });
+    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
     #line 22063 "vuc.vu"
     VU_AT(22063);
     #line 22063 "vuc.vu"
-    ({ vu_str _t246 = vu_str_lit("        uint64_t mask = (uint64_t)m->nidx - 1, s = h & mask;\n", 61); vu_str_cat(&v_s, &_t246); drop_Str(&_t246); });
+    ({ vu_str _t123 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
     #line 22064 "vuc.vu"
     VU_AT(22064);
     #line 22064 "vuc.vu"
-    ({ vu_str _t249 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & mask;\n", 46); vu_str_cat(&v_s, &_t249); drop_Str(&_t249); });
+    ({ vu_str _t129 = ({ vu_str _t126 = {0}; vu_str_cat_bytes(&_t126, (const uint8_t *)"static void vu_mbig_", 20); ({ vu_str *_t127 = &(*v_m); vu_str_cat(&_t126, &(*_t127)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)"(", 1); ({ vu_str *_t128 = &(*v_m); vu_str_cat(&_t126, &(*_t128)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)" *m) {\n", 7); _t126; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
     #line 22065 "vuc.vu"
     VU_AT(22065);
     #line 22065 "vuc.vu"
-    ({ vu_str _t252 = vu_str_lit("        m->idx[s] = m->nents;\n", 30); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
+    ({ vu_str _t132 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
     #line 22066 "vuc.vu"
     VU_AT(22066);
     #line 22066 "vuc.vu"
-    ({ vu_str _t255 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
+    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"        ME_", 11); ({ vu_str *_t136 = &(*v_m); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
     #line 22067 "vuc.vu"
     VU_AT(22067);
     #line 22067 "vuc.vu"
-    ({ vu_str _t258 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t258); drop_Str(&_t258); });
+    ({ vu_str _t140 = vu_str_lit("        if (!en->live) continue;\n", 33); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
     #line 22068 "vuc.vu"
     VU_AT(22068);
     #line 22068 "vuc.vu"
-    ({ vu_str _t268 = ({ vu_str _t261 = {0}; vu_str_cat_bytes(&_t261, (const uint8_t *)"static void vu_mset_", 20); ({ vu_str *_t262 = &(*v_m); vu_str_cat(&_t261, &(*_t262)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"(", 1); ({ vu_str *_t263 = &(*v_m); vu_str_cat(&_t261, &(*_t263)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t264 = &(*v_kc); vu_str_cat(&_t261, &(*_t264)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *k, ", 5); ({ vu_str *_t265 = &(*v_vc); vu_str_cat(&_t261, &(*_t265)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t266 = &(*v_m); vu_str_cat(&_t261, &(*_t266)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"(m, (", 5); ({ vu_str *_t267 = &(*v_kc); vu_str_cat(&_t261, &(*_t267)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *)k, v, false); }\n", 19); _t261; }); vu_str_cat(&v_s, &_t268); drop_Str(&_t268); });
+    ({ vu_str _t145 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"        const ", 14); ({ vu_str *_t144 = &(*v_kc); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *k = &en->key;\n", 16); _t143; }); vu_str_cat(&v_s, &_t145); drop_Str(&_t145); });
     #line 22069 "vuc.vu"
     VU_AT(22069);
     #line 22069 "vuc.vu"
-    ({ vu_str _t271 = vu_str_lit("/* Takes ownership of *k: the map keeps it, or frees it if the key was already there. */\n", 89); vu_str_cat(&v_s, &_t271); drop_Str(&_t271); });
+    ({ vu_str _t148 = vu_str_lit("        en->hash = vu_hash_int((int64_t)*k);\n", 45); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
     #line 22070 "vuc.vu"
     VU_AT(22070);
     #line 22070 "vuc.vu"
-    ({ vu_str _t280 = ({ vu_str _t274 = {0}; vu_str_cat_bytes(&_t274, (const uint8_t *)"static void vu_mtake_", 21); ({ vu_str *_t275 = &(*v_m); vu_str_cat(&_t274, &(*_t275)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)"(", 1); ({ vu_str *_t276 = &(*v_m); vu_str_cat(&_t274, &(*_t276)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" *m, ", 5); ({ vu_str *_t277 = &(*v_kc); vu_str_cat(&_t274, &(*_t277)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" *k, ", 5); ({ vu_str *_t278 = &(*v_vc); vu_str_cat(&_t274, &(*_t278)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t279 = &(*v_m); vu_str_cat(&_t274, &(*_t279)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)"(m, k, v, true); }\n", 19); _t274; }); vu_str_cat(&v_s, &_t280); drop_Str(&_t280); });
+    ({ vu_str _t151 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
     #line 22071 "vuc.vu"
     VU_AT(22071);
     #line 22071 "vuc.vu"
-    ({ vu_str _t288 = ({ vu_str _t283 = {0}; vu_str_cat_bytes(&_t283, (const uint8_t *)"static ", 7); ({ vu_str *_t284 = &(*v_vc); vu_str_cat(&_t283, &(*_t284)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *vu_mget_", 10); ({ vu_str *_t285 = &(*v_m); vu_str_cat(&_t283, &(*_t285)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)"(", 1); ({ vu_str *_t286 = &(*v_m); vu_str_cat(&_t283, &(*_t286)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t287 = &(*v_kc); vu_str_cat(&_t283, &(*_t287)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *k, int line) {\n", 17); _t283; }); vu_str_cat(&v_s, &_t288); drop_Str(&_t288); });
+    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"    vu_mindex_", 14); ({ vu_str *_t155 = &(*v_m); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
     #line 22072 "vuc.vu"
     VU_AT(22072);
     #line 22072 "vuc.vu"
-    ({ vu_str _t293 = ({ vu_str _t291 = {0}; vu_str_cat_bytes(&_t291, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t292 = &(*v_m); vu_str_cat(&_t291, &(*_t292)); }); vu_str_cat_bytes(&_t291, (const uint8_t *)"(m, k);\n", 8); _t291; }); vu_str_cat(&v_s, &_t293); drop_Str(&_t293); });
+    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
     #line 22073 "vuc.vu"
     VU_AT(22073);
     #line 22073 "vuc.vu"
-    ({ vu_str _t296 = vu_str_lit("    if (e < 0) vu_fail(line, \"key not found in map\");\n", 54); vu_str_cat(&v_s, &_t296); drop_Str(&_t296); });
+    ({ vu_str _t167 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_mput_", 20); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_m); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *m, ", 5); ({ vu_str *_t165 = &(*v_kc); vu_str_cat(&_t162, &(*_t165)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *k, ", 5); ({ vu_str *_t166 = &(*v_vc); vu_str_cat(&_t162, &(*_t166)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" v, bool take) {\n", 17); _t162; }); vu_str_cat(&v_s, &_t167); drop_Str(&_t167); });
     #line 22074 "vuc.vu"
     VU_AT(22074);
     #line 22074 "vuc.vu"
-    ({ vu_str _t299 = vu_str_lit("    return &m->ents[e].val;\n", 28); vu_str_cat(&v_s, &_t299); drop_Str(&_t299); });
+    ({ vu_str _t172 = ({ vu_str _t170 = {0}; vu_str_cat_bytes(&_t170, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t171 = &(*v_m); vu_str_cat(&_t170, &(*_t171)); }); vu_str_cat_bytes(&_t170, (const uint8_t *)"(m, k);\n", 8); _t170; }); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
     #line 22075 "vuc.vu"
     VU_AT(22075);
     #line 22075 "vuc.vu"
-    ({ vu_str _t302 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t302); drop_Str(&_t302); });
+    ({ vu_str _t177 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    if (e >= 0) { ME_", 21); ({ vu_str *_t176 = &(*v_m); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)" *en = &m->ents[e];  en->val = v; if (take) {  } return; }\n", 59); _t175; }); vu_str_cat(&v_s, &_t177); drop_Str(&_t177); });
     #line 22076 "vuc.vu"
     VU_AT(22076);
     #line 22076 "vuc.vu"
-    ({ vu_str _t310 = ({ vu_str _t305 = {0}; vu_str_cat_bytes(&_t305, (const uint8_t *)"static bool vu_mhas_", 20); ({ vu_str *_t306 = &(*v_m); vu_str_cat(&_t305, &(*_t306)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)"(const ", 7); ({ vu_str *_t307 = &(*v_m); vu_str_cat(&_t305, &(*_t307)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t308 = &(*v_kc); vu_str_cat(&_t305, &(*_t308)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)" *k) { return vu_mfind_", 23); ({ vu_str *_t309 = &(*v_m); vu_str_cat(&_t305, &(*_t309)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)"(m, k) >= 0; }\n", 15); _t305; }); vu_str_cat(&v_s, &_t310); drop_Str(&_t310); });
+    ({ vu_str _t180 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t180); drop_Str(&_t180); });
     #line 22077 "vuc.vu"
     VU_AT(22077);
     #line 22077 "vuc.vu"
-    ({ vu_str _t317 = ({ vu_str _t313 = {0}; vu_str_cat_bytes(&_t313, (const uint8_t *)"static bool vu_mremove_", 23); ({ vu_str *_t314 = &(*v_m); vu_str_cat(&_t313, &(*_t314)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)"(", 1); ({ vu_str *_t315 = &(*v_m); vu_str_cat(&_t313, &(*_t315)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t316 = &(*v_kc); vu_str_cat(&_t313, &(*_t316)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)" *k) {\n", 7); _t313; }); vu_str_cat(&v_s, &_t317); drop_Str(&_t317); });
+    ({ vu_str _t185 = ({ vu_str _t183 = {0}; vu_str_cat_bytes(&_t183, (const uint8_t *)"        if (m->nents >= VU_SMALL_MAP) vu_mbig_", 46); ({ vu_str *_t184 = &(*v_m); vu_str_cat(&_t183, &(*_t184)); }); vu_str_cat_bytes(&_t183, (const uint8_t *)"(m);\n", 5); _t183; }); vu_str_cat(&v_s, &_t185); drop_Str(&_t185); });
     #line 22078 "vuc.vu"
     VU_AT(22078);
     #line 22078 "vuc.vu"
-    ({ vu_str _t322 = ({ vu_str _t320 = {0}; vu_str_cat_bytes(&_t320, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t321 = &(*v_m); vu_str_cat(&_t320, &(*_t321)); }); vu_str_cat_bytes(&_t320, (const uint8_t *)"(m, k);\n", 8); _t320; }); vu_str_cat(&v_s, &_t322); drop_Str(&_t322); });
+    ({ vu_str _t190 = ({ vu_str _t188 = {0}; vu_str_cat_bytes(&_t188, (const uint8_t *)"    } else if ((m->nents + 1) * 4 > m->nidx * 3) vu_mindex_", 59); ({ vu_str *_t189 = &(*v_m); vu_str_cat(&_t188, &(*_t189)); }); vu_str_cat_bytes(&_t188, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t188; }); vu_str_cat(&v_s, &_t190); drop_Str(&_t190); });
     #line 22079 "vuc.vu"
     VU_AT(22079);
     #line 22079 "vuc.vu"
-    ({ vu_str _t325 = vu_str_lit("    if (e < 0) return false;\n", 29); vu_str_cat(&v_s, &_t325); drop_Str(&_t325); });
+    ({ vu_str _t193 = vu_str_lit("    uint64_t h = m->nidx ? vu_hash_int((int64_t)*k) : 0;\n", 57); vu_str_cat(&v_s, &_t193); drop_Str(&_t193); });
     #line 22080 "vuc.vu"
     VU_AT(22080);
     #line 22080 "vuc.vu"
-    ({ vu_str _t330 = ({ vu_str _t328 = {0}; vu_str_cat_bytes(&_t328, (const uint8_t *)"    ME_", 7); ({ vu_str *_t329 = &(*v_m); vu_str_cat(&_t328, &(*_t329)); }); vu_str_cat_bytes(&_t328, (const uint8_t *)" *en = &m->ents[e];\n", 20); _t328; }); vu_str_cat(&v_s, &_t330); drop_Str(&_t330); });
+    ({ vu_str _t196 = vu_str_lit("    if (m->nents == m->cap) {\n", 30); vu_str_cat(&v_s, &_t196); drop_Str(&_t196); });
     #line 22081 "vuc.vu"
     VU_AT(22081);
     #line 22081 "vuc.vu"
-    ({ vu_str _t333 = vu_str_lit("     \n", 6); vu_str_cat(&v_s, &_t333); drop_Str(&_t333); });
+    ({ vu_str _t201 = ({ vu_str _t199 = {0}; vu_str_cat_bytes(&_t199, (const uint8_t *)"        if (m->cap > (int64_t)(PTRDIFF_MAX / sizeof(ME_", 55); ({ vu_str *_t200 = &(*v_m); vu_str_cat(&_t199, &(*_t200)); }); vu_str_cat_bytes(&_t199, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t199; }); vu_str_cat(&v_s, &_t201); drop_Str(&_t201); });
     #line 22082 "vuc.vu"
     VU_AT(22082);
     #line 22082 "vuc.vu"
-    ({ vu_str _t336 = vu_str_lit("    en->live = false;\n", 22); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    ({ vu_str _t204 = vu_str_lit("        /* 4 entries first (most objects are small), then 12, so a typical record grows once; then 1.5x. */\n", 108); vu_str_cat(&v_s, &_t204); drop_Str(&_t204); });
     #line 22083 "vuc.vu"
     VU_AT(22083);
     #line 22083 "vuc.vu"
-    ({ vu_str _t339 = vu_str_lit("    m->live--;\n", 15); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    ({ vu_str _t207 = vu_str_lit("        int64_t c = m->cap == 0 ? 4 : m->cap == 4 ? 12 : m->cap + m->cap / 2;\n", 78); vu_str_cat(&v_s, &_t207); drop_Str(&_t207); });
     #line 22084 "vuc.vu"
     VU_AT(22084);
     #line 22084 "vuc.vu"
-    ({ vu_str _t342 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    ({ vu_str _t214 = ({ vu_str _t210 = {0}; vu_str_cat_bytes(&_t210, (const uint8_t *)"        ME_", 11); ({ vu_str *_t211 = &(*v_m); vu_str_cat(&_t210, &(*_t211)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)" *d = (ME_", 10); ({ vu_str *_t212 = &(*v_m); vu_str_cat(&_t210, &(*_t212)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)" *)realloc(m->ents, (size_t)c * sizeof(ME_", 42); ({ vu_str *_t213 = &(*v_m); vu_str_cat(&_t210, &(*_t213)); }); vu_str_cat_bytes(&_t210, (const uint8_t *)"));\n", 4); _t210; }); vu_str_cat(&v_s, &_t214); drop_Str(&_t214); });
     #line 22085 "vuc.vu"
     VU_AT(22085);
     #line 22085 "vuc.vu"
-    ({ vu_str _t345 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    ({ vu_str _t217 = vu_str_lit("        if (!d) vu_oom();\n", 26); vu_str_cat(&v_s, &_t217); drop_Str(&_t217); });
     #line 22086 "vuc.vu"
     VU_AT(22086);
     #line 22086 "vuc.vu"
-    ({ vu_str _t354 = ({ vu_str _t348 = {0}; vu_str_cat_bytes(&_t348, (const uint8_t *)"static ", 7); ({ vu_str *_t349 = &(*v_vc); vu_str_cat(&_t348, &(*_t349)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" vu_mgetor_", 11); ({ vu_str *_t350 = &(*v_m); vu_str_cat(&_t348, &(*_t350)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)"(const ", 7); ({ vu_str *_t351 = &(*v_m); vu_str_cat(&_t348, &(*_t351)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t352 = &(*v_kc); vu_str_cat(&_t348, &(*_t352)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" *k, ", 5); ({ vu_str *_t353 = &(*v_vc); vu_str_cat(&_t348, &(*_t353)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" d) {\n", 6); _t348; }); vu_str_cat(&v_s, &_t354); drop_Str(&_t354); });
+    ({ vu_str _t220 = vu_str_lit("        m->ents = d;\n", 21); vu_str_cat(&v_s, &_t220); drop_Str(&_t220); });
     #line 22087 "vuc.vu"
     VU_AT(22087);
     #line 22087 "vuc.vu"
-    ({ vu_str _t359 = ({ vu_str _t357 = {0}; vu_str_cat_bytes(&_t357, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t358 = &(*v_m); vu_str_cat(&_t357, &(*_t358)); }); vu_str_cat_bytes(&_t357, (const uint8_t *)"(m, k);\n", 8); _t357; }); vu_str_cat(&v_s, &_t359); drop_Str(&_t359); });
+    ({ vu_str _t223 = vu_str_lit("        m->cap = c;\n", 20); vu_str_cat(&v_s, &_t223); drop_Str(&_t223); });
     #line 22088 "vuc.vu"
     VU_AT(22088);
     #line 22088 "vuc.vu"
-    ({ vu_str _t362 = vu_str_lit("    return e < 0 ? d : m->ents[e].val;\n", 39); vu_str_cat(&v_s, &_t362); drop_Str(&_t362); });
+    ({ vu_str _t226 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t226); drop_Str(&_t226); });
     #line 22089 "vuc.vu"
     VU_AT(22089);
     #line 22089 "vuc.vu"
-    ({ vu_str _t365 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t365); drop_Str(&_t365); });
+    ({ vu_str _t231 = ({ vu_str _t229 = {0}; vu_str_cat_bytes(&_t229, (const uint8_t *)"    ME_", 7); ({ vu_str *_t230 = &(*v_m); vu_str_cat(&_t229, &(*_t230)); }); vu_str_cat_bytes(&_t229, (const uint8_t *)" *en = &m->ents[m->nents];\n", 27); _t229; }); vu_str_cat(&v_s, &_t231); drop_Str(&_t231); });
     #line 22090 "vuc.vu"
     VU_AT(22090);
     #line 22090 "vuc.vu"
-    ({ vu_str _t370 = ({ vu_str _t368 = {0}; vu_str_cat_bytes(&_t368, (const uint8_t *)"static void vu_freeents_", 24); ({ vu_str *_t369 = &(*v_m); vu_str_cat(&_t368, &(*_t369)); }); vu_str_cat_bytes(&_t368, (const uint8_t *)"(void *v, int64_t n) {\n", 23); _t368; }); vu_str_cat(&v_s, &_t370); drop_Str(&_t370); });
+    ({ vu_str _t234 = vu_str_lit("    en->key = take ? *k : *k; en->val = v; en->hash = h; en->live = true;\n", 74); vu_str_cat(&v_s, &_t234); drop_Str(&_t234); });
     #line 22091 "vuc.vu"
     VU_AT(22091);
     #line 22091 "vuc.vu"
-    ({ vu_str _t376 = ({ vu_str _t373 = {0}; vu_str_cat_bytes(&_t373, (const uint8_t *)"    ME_", 7); ({ vu_str *_t374 = &(*v_m); vu_str_cat(&_t373, &(*_t374)); }); vu_str_cat_bytes(&_t373, (const uint8_t *)" *ents = (ME_", 13); ({ vu_str *_t375 = &(*v_m); vu_str_cat(&_t373, &(*_t375)); }); vu_str_cat_bytes(&_t373, (const uint8_t *)" *)v;\n", 6); _t373; }); vu_str_cat(&v_s, &_t376); drop_Str(&_t376); });
+    ({ vu_str _t237 = vu_str_lit("    m->nents++;\n", 16); vu_str_cat(&v_s, &_t237); drop_Str(&_t237); });
     #line 22092 "vuc.vu"
     VU_AT(22092);
     #line 22092 "vuc.vu"
-    ({ vu_str _t381 = ({ vu_str _t379 = {0}; vu_str_cat_bytes(&_t379, (const uint8_t *)"    for (int64_t i = 0; i < n; i++) { ME_", 41); ({ vu_str *_t380 = &(*v_m); vu_str_cat(&_t379, &(*_t380)); }); vu_str_cat_bytes(&_t379, (const uint8_t *)" *en = &ents[i]; if (!en->live) continue;   }\n", 46); _t379; }); vu_str_cat(&v_s, &_t381); drop_Str(&_t381); });
+    ({ vu_str _t240 = vu_str_lit("    m->live++;\n", 15); vu_str_cat(&v_s, &_t240); drop_Str(&_t240); });
     #line 22093 "vuc.vu"
     VU_AT(22093);
     #line 22093 "vuc.vu"
-    ({ vu_str _t384 = vu_str_lit("    free(ents);\n", 16); vu_str_cat(&v_s, &_t384); drop_Str(&_t384); });
+    ({ vu_str _t243 = vu_str_lit("    if (m->nidx) {\n", 19); vu_str_cat(&v_s, &_t243); drop_Str(&_t243); });
     #line 22094 "vuc.vu"
     VU_AT(22094);
     #line 22094 "vuc.vu"
-    ({ vu_str _t387 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t387); drop_Str(&_t387); });
+    ({ vu_str _t246 = vu_str_lit("        uint64_t mask = (uint64_t)m->nidx - 1, s = h & mask;\n", 61); vu_str_cat(&v_s, &_t246); drop_Str(&_t246); });
     #line 22095 "vuc.vu"
     VU_AT(22095);
     #line 22095 "vuc.vu"
-    ({ vu_str _t393 = ({ vu_str _t390 = {0}; vu_str_cat_bytes(&_t390, (const uint8_t *)"static void drop_", 17); ({ vu_str *_t391 = &(*v_m); vu_str_cat(&_t390, &(*_t391)); }); vu_str_cat_bytes(&_t390, (const uint8_t *)"(", 1); ({ vu_str *_t392 = &(*v_m); vu_str_cat(&_t390, &(*_t392)); }); vu_str_cat_bytes(&_t390, (const uint8_t *)" *p) {\n", 7); _t390; }); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
+    ({ vu_str _t249 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & mask;\n", 46); vu_str_cat(&v_s, &_t249); drop_Str(&_t249); });
     #line 22096 "vuc.vu"
     VU_AT(22096);
     #line 22096 "vuc.vu"
-    ({ vu_str _t396 = vu_str_lit("    free(p->idx);\n", 18); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
+    ({ vu_str _t252 = vu_str_lit("        m->idx[s] = m->nents;\n", 30); vu_str_cat(&v_s, &_t252); drop_Str(&_t252); });
     #line 22097 "vuc.vu"
     VU_AT(22097);
     #line 22097 "vuc.vu"
-    ({ vu_str _t399 = vu_str_lit("    if (!p->ents) return;\n", 26); vu_str_cat(&v_s, &_t399); drop_Str(&_t399); });
+    ({ vu_str _t255 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t255); drop_Str(&_t255); });
     #line 22098 "vuc.vu"
     VU_AT(22098);
     #line 22098 "vuc.vu"
-    ({ vu_str _t404 = ({ vu_str _t402 = {0}; vu_str_cat_bytes(&_t402, (const uint8_t *)"    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_freeents_", 95); ({ vu_str *_t403 = &(*v_m); vu_str_cat(&_t402, &(*_t403)); }); vu_str_cat_bytes(&_t402, (const uint8_t *)"(p->ents, p->nents); vu_drop_depth--; }\n", 40); _t402; }); vu_str_cat(&v_s, &_t404); drop_Str(&_t404); });
+    ({ vu_str _t258 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t258); drop_Str(&_t258); });
     #line 22099 "vuc.vu"
     VU_AT(22099);
     #line 22099 "vuc.vu"
-    ({ vu_str _t409 = ({ vu_str _t407 = {0}; vu_str_cat_bytes(&_t407, (const uint8_t *)"    else vu_defer(vu_freeents_", 30); ({ vu_str *_t408 = &(*v_m); vu_str_cat(&_t407, &(*_t408)); }); vu_str_cat_bytes(&_t407, (const uint8_t *)", p->ents, p->nents);\n", 22); _t407; }); vu_str_cat(&v_s, &_t409); drop_Str(&_t409); });
+    ({ vu_str _t268 = ({ vu_str _t261 = {0}; vu_str_cat_bytes(&_t261, (const uint8_t *)"static void vu_mset_", 20); ({ vu_str *_t262 = &(*v_m); vu_str_cat(&_t261, &(*_t262)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"(", 1); ({ vu_str *_t263 = &(*v_m); vu_str_cat(&_t261, &(*_t263)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t264 = &(*v_kc); vu_str_cat(&_t261, &(*_t264)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *k, ", 5); ({ vu_str *_t265 = &(*v_vc); vu_str_cat(&_t261, &(*_t265)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t266 = &(*v_m); vu_str_cat(&_t261, &(*_t266)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)"(m, (", 5); ({ vu_str *_t267 = &(*v_kc); vu_str_cat(&_t261, &(*_t267)); }); vu_str_cat_bytes(&_t261, (const uint8_t *)" *)k, v, false); }\n", 19); _t261; }); vu_str_cat(&v_s, &_t268); drop_Str(&_t268); });
     #line 22100 "vuc.vu"
     VU_AT(22100);
     #line 22100 "vuc.vu"
-    ({ vu_str _t412 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t412); drop_Str(&_t412); });
+    ({ vu_str _t271 = vu_str_lit("/* Takes ownership of *k: the map keeps it, or frees it if the key was already there. */\n", 89); vu_str_cat(&v_s, &_t271); drop_Str(&_t271); });
     #line 22101 "vuc.vu"
     VU_AT(22101);
     #line 22101 "vuc.vu"
+    ({ vu_str _t280 = ({ vu_str _t274 = {0}; vu_str_cat_bytes(&_t274, (const uint8_t *)"static void vu_mtake_", 21); ({ vu_str *_t275 = &(*v_m); vu_str_cat(&_t274, &(*_t275)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)"(", 1); ({ vu_str *_t276 = &(*v_m); vu_str_cat(&_t274, &(*_t276)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" *m, ", 5); ({ vu_str *_t277 = &(*v_kc); vu_str_cat(&_t274, &(*_t277)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" *k, ", 5); ({ vu_str *_t278 = &(*v_vc); vu_str_cat(&_t274, &(*_t278)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t279 = &(*v_m); vu_str_cat(&_t274, &(*_t279)); }); vu_str_cat_bytes(&_t274, (const uint8_t *)"(m, k, v, true); }\n", 19); _t274; }); vu_str_cat(&v_s, &_t280); drop_Str(&_t280); });
+    #line 22102 "vuc.vu"
+    VU_AT(22102);
+    #line 22102 "vuc.vu"
+    ({ vu_str _t288 = ({ vu_str _t283 = {0}; vu_str_cat_bytes(&_t283, (const uint8_t *)"static ", 7); ({ vu_str *_t284 = &(*v_vc); vu_str_cat(&_t283, &(*_t284)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *vu_mget_", 10); ({ vu_str *_t285 = &(*v_m); vu_str_cat(&_t283, &(*_t285)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)"(", 1); ({ vu_str *_t286 = &(*v_m); vu_str_cat(&_t283, &(*_t286)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t287 = &(*v_kc); vu_str_cat(&_t283, &(*_t287)); }); vu_str_cat_bytes(&_t283, (const uint8_t *)" *k, int line) {\n", 17); _t283; }); vu_str_cat(&v_s, &_t288); drop_Str(&_t288); });
+    #line 22103 "vuc.vu"
+    VU_AT(22103);
+    #line 22103 "vuc.vu"
+    ({ vu_str _t293 = ({ vu_str _t291 = {0}; vu_str_cat_bytes(&_t291, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t292 = &(*v_m); vu_str_cat(&_t291, &(*_t292)); }); vu_str_cat_bytes(&_t291, (const uint8_t *)"(m, k);\n", 8); _t291; }); vu_str_cat(&v_s, &_t293); drop_Str(&_t293); });
+    #line 22104 "vuc.vu"
+    VU_AT(22104);
+    #line 22104 "vuc.vu"
+    ({ vu_str _t296 = vu_str_lit("    if (e < 0) vu_fail(line, \"key not found in map\");\n", 54); vu_str_cat(&v_s, &_t296); drop_Str(&_t296); });
+    #line 22105 "vuc.vu"
+    VU_AT(22105);
+    #line 22105 "vuc.vu"
+    ({ vu_str _t299 = vu_str_lit("    return &m->ents[e].val;\n", 28); vu_str_cat(&v_s, &_t299); drop_Str(&_t299); });
+    #line 22106 "vuc.vu"
+    VU_AT(22106);
+    #line 22106 "vuc.vu"
+    ({ vu_str _t302 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t302); drop_Str(&_t302); });
+    #line 22107 "vuc.vu"
+    VU_AT(22107);
+    #line 22107 "vuc.vu"
+    ({ vu_str _t310 = ({ vu_str _t305 = {0}; vu_str_cat_bytes(&_t305, (const uint8_t *)"static bool vu_mhas_", 20); ({ vu_str *_t306 = &(*v_m); vu_str_cat(&_t305, &(*_t306)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)"(const ", 7); ({ vu_str *_t307 = &(*v_m); vu_str_cat(&_t305, &(*_t307)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t308 = &(*v_kc); vu_str_cat(&_t305, &(*_t308)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)" *k) { return vu_mfind_", 23); ({ vu_str *_t309 = &(*v_m); vu_str_cat(&_t305, &(*_t309)); }); vu_str_cat_bytes(&_t305, (const uint8_t *)"(m, k) >= 0; }\n", 15); _t305; }); vu_str_cat(&v_s, &_t310); drop_Str(&_t310); });
+    #line 22108 "vuc.vu"
+    VU_AT(22108);
+    #line 22108 "vuc.vu"
+    ({ vu_str _t317 = ({ vu_str _t313 = {0}; vu_str_cat_bytes(&_t313, (const uint8_t *)"static bool vu_mremove_", 23); ({ vu_str *_t314 = &(*v_m); vu_str_cat(&_t313, &(*_t314)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)"(", 1); ({ vu_str *_t315 = &(*v_m); vu_str_cat(&_t313, &(*_t315)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t316 = &(*v_kc); vu_str_cat(&_t313, &(*_t316)); }); vu_str_cat_bytes(&_t313, (const uint8_t *)" *k) {\n", 7); _t313; }); vu_str_cat(&v_s, &_t317); drop_Str(&_t317); });
+    #line 22109 "vuc.vu"
+    VU_AT(22109);
+    #line 22109 "vuc.vu"
+    ({ vu_str _t322 = ({ vu_str _t320 = {0}; vu_str_cat_bytes(&_t320, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t321 = &(*v_m); vu_str_cat(&_t320, &(*_t321)); }); vu_str_cat_bytes(&_t320, (const uint8_t *)"(m, k);\n", 8); _t320; }); vu_str_cat(&v_s, &_t322); drop_Str(&_t322); });
+    #line 22110 "vuc.vu"
+    VU_AT(22110);
+    #line 22110 "vuc.vu"
+    ({ vu_str _t325 = vu_str_lit("    if (e < 0) return false;\n", 29); vu_str_cat(&v_s, &_t325); drop_Str(&_t325); });
+    #line 22111 "vuc.vu"
+    VU_AT(22111);
+    #line 22111 "vuc.vu"
+    ({ vu_str _t330 = ({ vu_str _t328 = {0}; vu_str_cat_bytes(&_t328, (const uint8_t *)"    ME_", 7); ({ vu_str *_t329 = &(*v_m); vu_str_cat(&_t328, &(*_t329)); }); vu_str_cat_bytes(&_t328, (const uint8_t *)" *en = &m->ents[e];\n", 20); _t328; }); vu_str_cat(&v_s, &_t330); drop_Str(&_t330); });
+    #line 22112 "vuc.vu"
+    VU_AT(22112);
+    #line 22112 "vuc.vu"
+    ({ vu_str _t333 = vu_str_lit("     \n", 6); vu_str_cat(&v_s, &_t333); drop_Str(&_t333); });
+    #line 22113 "vuc.vu"
+    VU_AT(22113);
+    #line 22113 "vuc.vu"
+    ({ vu_str _t336 = vu_str_lit("    en->live = false;\n", 22); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    #line 22114 "vuc.vu"
+    VU_AT(22114);
+    #line 22114 "vuc.vu"
+    ({ vu_str _t339 = vu_str_lit("    m->live--;\n", 15); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    #line 22115 "vuc.vu"
+    VU_AT(22115);
+    #line 22115 "vuc.vu"
+    ({ vu_str _t342 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    #line 22116 "vuc.vu"
+    VU_AT(22116);
+    #line 22116 "vuc.vu"
+    ({ vu_str _t345 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    #line 22117 "vuc.vu"
+    VU_AT(22117);
+    #line 22117 "vuc.vu"
+    ({ vu_str _t354 = ({ vu_str _t348 = {0}; vu_str_cat_bytes(&_t348, (const uint8_t *)"static ", 7); ({ vu_str *_t349 = &(*v_vc); vu_str_cat(&_t348, &(*_t349)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" vu_mgetor_", 11); ({ vu_str *_t350 = &(*v_m); vu_str_cat(&_t348, &(*_t350)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)"(const ", 7); ({ vu_str *_t351 = &(*v_m); vu_str_cat(&_t348, &(*_t351)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t352 = &(*v_kc); vu_str_cat(&_t348, &(*_t352)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" *k, ", 5); ({ vu_str *_t353 = &(*v_vc); vu_str_cat(&_t348, &(*_t353)); }); vu_str_cat_bytes(&_t348, (const uint8_t *)" d) {\n", 6); _t348; }); vu_str_cat(&v_s, &_t354); drop_Str(&_t354); });
+    #line 22118 "vuc.vu"
+    VU_AT(22118);
+    #line 22118 "vuc.vu"
+    ({ vu_str _t359 = ({ vu_str _t357 = {0}; vu_str_cat_bytes(&_t357, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t358 = &(*v_m); vu_str_cat(&_t357, &(*_t358)); }); vu_str_cat_bytes(&_t357, (const uint8_t *)"(m, k);\n", 8); _t357; }); vu_str_cat(&v_s, &_t359); drop_Str(&_t359); });
+    #line 22119 "vuc.vu"
+    VU_AT(22119);
+    #line 22119 "vuc.vu"
+    ({ vu_str _t362 = vu_str_lit("    return e < 0 ? d : m->ents[e].val;\n", 39); vu_str_cat(&v_s, &_t362); drop_Str(&_t362); });
+    #line 22120 "vuc.vu"
+    VU_AT(22120);
+    #line 22120 "vuc.vu"
+    ({ vu_str _t365 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t365); drop_Str(&_t365); });
+    #line 22121 "vuc.vu"
+    VU_AT(22121);
+    #line 22121 "vuc.vu"
+    ({ vu_str _t370 = ({ vu_str _t368 = {0}; vu_str_cat_bytes(&_t368, (const uint8_t *)"static void vu_freeents_", 24); ({ vu_str *_t369 = &(*v_m); vu_str_cat(&_t368, &(*_t369)); }); vu_str_cat_bytes(&_t368, (const uint8_t *)"(void *v, int64_t n) {\n", 23); _t368; }); vu_str_cat(&v_s, &_t370); drop_Str(&_t370); });
+    #line 22122 "vuc.vu"
+    VU_AT(22122);
+    #line 22122 "vuc.vu"
+    ({ vu_str _t376 = ({ vu_str _t373 = {0}; vu_str_cat_bytes(&_t373, (const uint8_t *)"    ME_", 7); ({ vu_str *_t374 = &(*v_m); vu_str_cat(&_t373, &(*_t374)); }); vu_str_cat_bytes(&_t373, (const uint8_t *)" *ents = (ME_", 13); ({ vu_str *_t375 = &(*v_m); vu_str_cat(&_t373, &(*_t375)); }); vu_str_cat_bytes(&_t373, (const uint8_t *)" *)v;\n", 6); _t373; }); vu_str_cat(&v_s, &_t376); drop_Str(&_t376); });
+    #line 22123 "vuc.vu"
+    VU_AT(22123);
+    #line 22123 "vuc.vu"
+    ({ vu_str _t381 = ({ vu_str _t379 = {0}; vu_str_cat_bytes(&_t379, (const uint8_t *)"    for (int64_t i = 0; i < n; i++) { ME_", 41); ({ vu_str *_t380 = &(*v_m); vu_str_cat(&_t379, &(*_t380)); }); vu_str_cat_bytes(&_t379, (const uint8_t *)" *en = &ents[i]; if (!en->live) continue;   }\n", 46); _t379; }); vu_str_cat(&v_s, &_t381); drop_Str(&_t381); });
+    #line 22124 "vuc.vu"
+    VU_AT(22124);
+    #line 22124 "vuc.vu"
+    ({ vu_str _t384 = vu_str_lit("    free(ents);\n", 16); vu_str_cat(&v_s, &_t384); drop_Str(&_t384); });
+    #line 22125 "vuc.vu"
+    VU_AT(22125);
+    #line 22125 "vuc.vu"
+    ({ vu_str _t387 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t387); drop_Str(&_t387); });
+    #line 22126 "vuc.vu"
+    VU_AT(22126);
+    #line 22126 "vuc.vu"
+    ({ vu_str _t393 = ({ vu_str _t390 = {0}; vu_str_cat_bytes(&_t390, (const uint8_t *)"static void drop_", 17); ({ vu_str *_t391 = &(*v_m); vu_str_cat(&_t390, &(*_t391)); }); vu_str_cat_bytes(&_t390, (const uint8_t *)"(", 1); ({ vu_str *_t392 = &(*v_m); vu_str_cat(&_t390, &(*_t392)); }); vu_str_cat_bytes(&_t390, (const uint8_t *)" *p) {\n", 7); _t390; }); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
+    #line 22127 "vuc.vu"
+    VU_AT(22127);
+    #line 22127 "vuc.vu"
+    ({ vu_str _t396 = vu_str_lit("    free(p->idx);\n", 18); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
+    #line 22128 "vuc.vu"
+    VU_AT(22128);
+    #line 22128 "vuc.vu"
+    ({ vu_str _t399 = vu_str_lit("    if (!p->ents) return;\n", 26); vu_str_cat(&v_s, &_t399); drop_Str(&_t399); });
+    #line 22129 "vuc.vu"
+    VU_AT(22129);
+    #line 22129 "vuc.vu"
+    ({ vu_str _t404 = ({ vu_str _t402 = {0}; vu_str_cat_bytes(&_t402, (const uint8_t *)"    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_freeents_", 95); ({ vu_str *_t403 = &(*v_m); vu_str_cat(&_t402, &(*_t403)); }); vu_str_cat_bytes(&_t402, (const uint8_t *)"(p->ents, p->nents); vu_drop_depth--; }\n", 40); _t402; }); vu_str_cat(&v_s, &_t404); drop_Str(&_t404); });
+    #line 22130 "vuc.vu"
+    VU_AT(22130);
+    #line 22130 "vuc.vu"
+    ({ vu_str _t409 = ({ vu_str _t407 = {0}; vu_str_cat_bytes(&_t407, (const uint8_t *)"    else vu_defer(vu_freeents_", 30); ({ vu_str *_t408 = &(*v_m); vu_str_cat(&_t407, &(*_t408)); }); vu_str_cat_bytes(&_t407, (const uint8_t *)", p->ents, p->nents);\n", 22); _t407; }); vu_str_cat(&v_s, &_t409); drop_Str(&_t409); });
+    #line 22131 "vuc.vu"
+    VU_AT(22131);
+    #line 22131 "vuc.vu"
+    ({ vu_str _t412 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t412); drop_Str(&_t412); });
+    #line 22132 "vuc.vu"
+    VU_AT(22132);
+    #line 22132 "vuc.vu"
     {
-        #line 22101 "vuc.vu"
+        #line 22132 "vuc.vu"
         vu_str _t413 = VU_MV(v_s);
-        #line 22101 "vuc.vu"
+        #line 22132 "vuc.vu"
         return _t413;
-    #line 22101 "vuc.vu"
+    #line 22132 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_map_code_io(vu_str *restrict v_m, vu_str *restrict v_kc, vu_str *restrict v_vc, vu_str *restrict v_vm) {
-    #line 22103 "vuc.vu"
+    #line 22134 "vuc.vu"
     VU_ENTER("map_code_io");
-    #line 22104 "vuc.vu"
-    VU_AT(22104);
-    #line 22104 "vuc.vu"
-    vu_str v_s = vu_str_lit("", 0);
-    #line 22105 "vuc.vu"
-    VU_AT(22105);
-    #line 22105 "vuc.vu"
-    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"struct ME_", 10); ({ vu_str *_t4 = &(*v_m); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" { ", 3); ({ vu_str *_t5 = &(*v_kc); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" key; ", 6); ({ vu_str *_t6 = &(*v_vc); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" val; uint64_t hash; bool live; };\n", 35); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
-    #line 22106 "vuc.vu"
-    VU_AT(22106);
-    #line 22106 "vuc.vu"
-    ({ vu_str _t10 = vu_str_lit("/* Small maps (up to VU_SMALL_MAP entries) have no index: a scan comparing keys beats hashing them.\n", 100); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
-    #line 22107 "vuc.vu"
-    VU_AT(22107);
-    #line 22107 "vuc.vu"
-    ({ vu_str _t13 = vu_str_lit("   Bigger maps hash with SipHash and probe an index into the entries. */\n", 73); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
-    #line 22108 "vuc.vu"
-    VU_AT(22108);
-    #line 22108 "vuc.vu"
-    ({ vu_str _t20 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"static int64_t vu_mfind_", 24); ({ vu_str *_t17 = &(*v_m); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)"(const ", 7); ({ vu_str *_t18 = &(*v_m); vu_str_cat(&_t16, &(*_t18)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t19 = &(*v_kc); vu_str_cat(&_t16, &(*_t19)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *k) {\n", 7); _t16; }); vu_str_cat(&v_s, &_t20); drop_Str(&_t20); });
-    #line 22109 "vuc.vu"
-    VU_AT(22109);
-    #line 22109 "vuc.vu"
-    ({ vu_str _t23 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t23); drop_Str(&_t23); });
-    #line 22110 "vuc.vu"
-    VU_AT(22110);
-    #line 22110 "vuc.vu"
-    ({ vu_str _t26 = vu_str_lit("        for (int64_t i = 0; i < m->nents; i++) {\n", 49); vu_str_cat(&v_s, &_t26); drop_Str(&_t26); });
-    #line 22111 "vuc.vu"
-    VU_AT(22111);
-    #line 22111 "vuc.vu"
-    ({ vu_str _t31 = ({ vu_str _t29 = {0}; vu_str_cat_bytes(&_t29, (const uint8_t *)"            const ME_", 21); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t29, &(*_t30)); }); vu_str_cat_bytes(&_t29, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t29; }); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
-    #line 22112 "vuc.vu"
-    VU_AT(22112);
-    #line 22112 "vuc.vu"
-    ({ vu_str _t34 = vu_str_lit("            if (en->live && (en->key == *k)) return i;\n", 55); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
-    #line 22113 "vuc.vu"
-    VU_AT(22113);
-    #line 22113 "vuc.vu"
-    ({ vu_str _t37 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
-    #line 22114 "vuc.vu"
-    VU_AT(22114);
-    #line 22114 "vuc.vu"
-    ({ vu_str _t40 = vu_str_lit("        return -1;\n", 19); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
-    #line 22115 "vuc.vu"
-    VU_AT(22115);
-    #line 22115 "vuc.vu"
-    ({ vu_str _t43 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
-    #line 22116 "vuc.vu"
-    VU_AT(22116);
-    #line 22116 "vuc.vu"
-    ({ vu_str _t46 = vu_str_lit("    uint64_t h = vu_hash_int((int64_t)*k);\n", 43); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
-    #line 22117 "vuc.vu"
-    VU_AT(22117);
-    #line 22117 "vuc.vu"
-    ({ vu_str _t49 = vu_str_lit("    uint64_t mask = (uint64_t)m->nidx - 1;\n", 43); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
-    #line 22118 "vuc.vu"
-    VU_AT(22118);
-    #line 22118 "vuc.vu"
-    ({ vu_str _t52 = vu_str_lit("    for (uint64_t i = h & mask;; i = (i + 1) & mask) {\n", 55); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
-    #line 22119 "vuc.vu"
-    VU_AT(22119);
-    #line 22119 "vuc.vu"
-    ({ vu_str _t55 = vu_str_lit("        int64_t e = m->idx[i];\n", 31); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
-    #line 22120 "vuc.vu"
-    VU_AT(22120);
-    #line 22120 "vuc.vu"
-    ({ vu_str _t58 = vu_str_lit("        if (e == 0) return -1;\n", 31); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
-    #line 22121 "vuc.vu"
-    VU_AT(22121);
-    #line 22121 "vuc.vu"
-    ({ vu_str _t63 = ({ vu_str _t61 = {0}; vu_str_cat_bytes(&_t61, (const uint8_t *)"        const ME_", 17); ({ vu_str *_t62 = &(*v_m); vu_str_cat(&_t61, &(*_t62)); }); vu_str_cat_bytes(&_t61, (const uint8_t *)" *en = &m->ents[e - 1];\n", 24); _t61; }); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
-    #line 22122 "vuc.vu"
-    VU_AT(22122);
-    #line 22122 "vuc.vu"
-    ({ vu_str _t66 = vu_str_lit("        if (en->live && en->hash == h && (en->key == *k)) return e - 1;\n", 72); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
-    #line 22123 "vuc.vu"
-    VU_AT(22123);
-    #line 22123 "vuc.vu"
-    ({ vu_str _t69 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
-    #line 22124 "vuc.vu"
-    VU_AT(22124);
-    #line 22124 "vuc.vu"
-    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
-    #line 22125 "vuc.vu"
-    VU_AT(22125);
-    #line 22125 "vuc.vu"
-    ({ vu_str _t78 = ({ vu_str _t75 = {0}; vu_str_cat_bytes(&_t75, (const uint8_t *)"static void vu_mindex_", 22); ({ vu_str *_t76 = &(*v_m); vu_str_cat(&_t75, &(*_t76)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)"(", 1); ({ vu_str *_t77 = &(*v_m); vu_str_cat(&_t75, &(*_t77)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)" *m, int64_t want) {\n", 21); _t75; }); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
-    #line 22126 "vuc.vu"
-    VU_AT(22126);
-    #line 22126 "vuc.vu"
-    ({ vu_str _t81 = vu_str_lit("    int64_t j = 0;\n", 19); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
-    #line 22127 "vuc.vu"
-    VU_AT(22127);
-    #line 22127 "vuc.vu"
-    ({ vu_str _t84 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) if (m->ents[i].live) m->ents[j++] = m->ents[i];\n", 91); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
-    #line 22128 "vuc.vu"
-    VU_AT(22128);
-    #line 22128 "vuc.vu"
-    ({ vu_str _t87 = vu_str_lit("    m->nents = j;\n", 18); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
-    #line 22129 "vuc.vu"
-    VU_AT(22129);
-    #line 22129 "vuc.vu"
-    ({ vu_str _t90 = vu_str_lit("    int64_t n = 8;\n", 19); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
-    #line 22130 "vuc.vu"
-    VU_AT(22130);
-    #line 22130 "vuc.vu"
-    ({ vu_str _t93 = vu_str_lit("    while (n < want) { if (n > INT64_MAX / 4) vu_oom(); n *= 2; }\n", 66); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
-    #line 22131 "vuc.vu"
-    VU_AT(22131);
-    #line 22131 "vuc.vu"
-    ({ vu_str _t96 = vu_str_lit("    free(m->idx);\n", 18); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
-    #line 22132 "vuc.vu"
-    VU_AT(22132);
-    #line 22132 "vuc.vu"
-    ({ vu_str _t99 = vu_str_lit("    m->idx = (int64_t *)calloc((size_t)n, sizeof(int64_t));\n", 60); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
-    #line 22133 "vuc.vu"
-    VU_AT(22133);
-    #line 22133 "vuc.vu"
-    ({ vu_str _t102 = vu_str_lit("    if (!m->idx) vu_oom();\n", 27); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
-    #line 22134 "vuc.vu"
-    VU_AT(22134);
-    #line 22134 "vuc.vu"
-    ({ vu_str _t105 = vu_str_lit("    m->nidx = n;\n", 17); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 22135 "vuc.vu"
     VU_AT(22135);
     #line 22135 "vuc.vu"
-    ({ vu_str _t108 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
+    vu_str v_s = vu_str_lit("", 0);
     #line 22136 "vuc.vu"
     VU_AT(22136);
     #line 22136 "vuc.vu"
-    ({ vu_str _t111 = vu_str_lit("        uint64_t s = m->ents[i].hash & ((uint64_t)n - 1);\n", 58); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
+    ({ vu_str _t7 = ({ vu_str _t3 = {0}; vu_str_cat_bytes(&_t3, (const uint8_t *)"struct ME_", 10); ({ vu_str *_t4 = &(*v_m); vu_str_cat(&_t3, &(*_t4)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" { ", 3); ({ vu_str *_t5 = &(*v_kc); vu_str_cat(&_t3, &(*_t5)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" key; ", 6); ({ vu_str *_t6 = &(*v_vc); vu_str_cat(&_t3, &(*_t6)); }); vu_str_cat_bytes(&_t3, (const uint8_t *)" val; uint64_t hash; bool live; };\n", 35); _t3; }); vu_str_cat(&v_s, &_t7); drop_Str(&_t7); });
     #line 22137 "vuc.vu"
     VU_AT(22137);
     #line 22137 "vuc.vu"
-    ({ vu_str _t114 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & ((uint64_t)n - 1);\n", 59); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
+    ({ vu_str _t10 = vu_str_lit("/* Small maps (up to VU_SMALL_MAP entries) have no index: a scan comparing keys beats hashing them.\n", 100); vu_str_cat(&v_s, &_t10); drop_Str(&_t10); });
     #line 22138 "vuc.vu"
     VU_AT(22138);
     #line 22138 "vuc.vu"
-    ({ vu_str _t117 = vu_str_lit("        m->idx[s] = i + 1;\n", 27); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
+    ({ vu_str _t13 = vu_str_lit("   Bigger maps hash with SipHash and probe an index into the entries. */\n", 73); vu_str_cat(&v_s, &_t13); drop_Str(&_t13); });
     #line 22139 "vuc.vu"
     VU_AT(22139);
     #line 22139 "vuc.vu"
-    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
+    ({ vu_str _t20 = ({ vu_str _t16 = {0}; vu_str_cat_bytes(&_t16, (const uint8_t *)"static int64_t vu_mfind_", 24); ({ vu_str *_t17 = &(*v_m); vu_str_cat(&_t16, &(*_t17)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)"(const ", 7); ({ vu_str *_t18 = &(*v_m); vu_str_cat(&_t16, &(*_t18)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t19 = &(*v_kc); vu_str_cat(&_t16, &(*_t19)); }); vu_str_cat_bytes(&_t16, (const uint8_t *)" *k) {\n", 7); _t16; }); vu_str_cat(&v_s, &_t20); drop_Str(&_t20); });
     #line 22140 "vuc.vu"
     VU_AT(22140);
     #line 22140 "vuc.vu"
-    ({ vu_str _t123 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
+    ({ vu_str _t23 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t23); drop_Str(&_t23); });
     #line 22141 "vuc.vu"
     VU_AT(22141);
     #line 22141 "vuc.vu"
-    ({ vu_str _t129 = ({ vu_str _t126 = {0}; vu_str_cat_bytes(&_t126, (const uint8_t *)"static void vu_mbig_", 20); ({ vu_str *_t127 = &(*v_m); vu_str_cat(&_t126, &(*_t127)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)"(", 1); ({ vu_str *_t128 = &(*v_m); vu_str_cat(&_t126, &(*_t128)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)" *m) {\n", 7); _t126; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
+    ({ vu_str _t26 = vu_str_lit("        for (int64_t i = 0; i < m->nents; i++) {\n", 49); vu_str_cat(&v_s, &_t26); drop_Str(&_t26); });
     #line 22142 "vuc.vu"
     VU_AT(22142);
     #line 22142 "vuc.vu"
-    ({ vu_str _t132 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
+    ({ vu_str _t31 = ({ vu_str _t29 = {0}; vu_str_cat_bytes(&_t29, (const uint8_t *)"            const ME_", 21); ({ vu_str *_t30 = &(*v_m); vu_str_cat(&_t29, &(*_t30)); }); vu_str_cat_bytes(&_t29, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t29; }); vu_str_cat(&v_s, &_t31); drop_Str(&_t31); });
     #line 22143 "vuc.vu"
     VU_AT(22143);
     #line 22143 "vuc.vu"
-    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"        ME_", 11); ({ vu_str *_t136 = &(*v_m); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
+    ({ vu_str _t34 = vu_str_lit("            if (en->live && (en->key == *k)) return i;\n", 55); vu_str_cat(&v_s, &_t34); drop_Str(&_t34); });
     #line 22144 "vuc.vu"
     VU_AT(22144);
     #line 22144 "vuc.vu"
-    ({ vu_str _t140 = vu_str_lit("        if (!en->live) continue;\n", 33); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
+    ({ vu_str _t37 = vu_str_lit("        }\n", 10); vu_str_cat(&v_s, &_t37); drop_Str(&_t37); });
     #line 22145 "vuc.vu"
     VU_AT(22145);
     #line 22145 "vuc.vu"
-    ({ vu_str _t145 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"        const ", 14); ({ vu_str *_t144 = &(*v_kc); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *k = &en->key;\n", 16); _t143; }); vu_str_cat(&v_s, &_t145); drop_Str(&_t145); });
+    ({ vu_str _t40 = vu_str_lit("        return -1;\n", 19); vu_str_cat(&v_s, &_t40); drop_Str(&_t40); });
     #line 22146 "vuc.vu"
     VU_AT(22146);
     #line 22146 "vuc.vu"
-    ({ vu_str _t148 = vu_str_lit("        en->hash = vu_hash_int((int64_t)*k);\n", 45); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
+    ({ vu_str _t43 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t43); drop_Str(&_t43); });
     #line 22147 "vuc.vu"
     VU_AT(22147);
     #line 22147 "vuc.vu"
-    ({ vu_str _t151 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
+    ({ vu_str _t46 = vu_str_lit("    uint64_t h = vu_hash_int((int64_t)*k);\n", 43); vu_str_cat(&v_s, &_t46); drop_Str(&_t46); });
     #line 22148 "vuc.vu"
     VU_AT(22148);
     #line 22148 "vuc.vu"
-    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"    vu_mindex_", 14); ({ vu_str *_t155 = &(*v_m); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
+    ({ vu_str _t49 = vu_str_lit("    uint64_t mask = (uint64_t)m->nidx - 1;\n", 43); vu_str_cat(&v_s, &_t49); drop_Str(&_t49); });
     #line 22149 "vuc.vu"
     VU_AT(22149);
     #line 22149 "vuc.vu"
-    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
+    ({ vu_str _t52 = vu_str_lit("    for (uint64_t i = h & mask;; i = (i + 1) & mask) {\n", 55); vu_str_cat(&v_s, &_t52); drop_Str(&_t52); });
     #line 22150 "vuc.vu"
     VU_AT(22150);
     #line 22150 "vuc.vu"
-    ({ vu_str _t167 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_mput_", 20); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_m); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *m, ", 5); ({ vu_str *_t165 = &(*v_kc); vu_str_cat(&_t162, &(*_t165)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *k, ", 5); ({ vu_str *_t166 = &(*v_vc); vu_str_cat(&_t162, &(*_t166)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" v, bool take) {\n", 17); _t162; }); vu_str_cat(&v_s, &_t167); drop_Str(&_t167); });
+    ({ vu_str _t55 = vu_str_lit("        int64_t e = m->idx[i];\n", 31); vu_str_cat(&v_s, &_t55); drop_Str(&_t55); });
     #line 22151 "vuc.vu"
     VU_AT(22151);
     #line 22151 "vuc.vu"
-    ({ vu_str _t172 = ({ vu_str _t170 = {0}; vu_str_cat_bytes(&_t170, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t171 = &(*v_m); vu_str_cat(&_t170, &(*_t171)); }); vu_str_cat_bytes(&_t170, (const uint8_t *)"(m, k);\n", 8); _t170; }); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
+    ({ vu_str _t58 = vu_str_lit("        if (e == 0) return -1;\n", 31); vu_str_cat(&v_s, &_t58); drop_Str(&_t58); });
     #line 22152 "vuc.vu"
     VU_AT(22152);
     #line 22152 "vuc.vu"
-    ({ vu_str _t178 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    if (e >= 0) { ME_", 21); ({ vu_str *_t176 = &(*v_m); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)" *en = &m->ents[e]; drop_", 25); ({ vu_str *_t177 = &(*v_vm); vu_str_cat(&_t175, &(*_t177)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)"(&en->val); en->val = v; if (take) {  } return; }\n", 50); _t175; }); vu_str_cat(&v_s, &_t178); drop_Str(&_t178); });
+    ({ vu_str _t63 = ({ vu_str _t61 = {0}; vu_str_cat_bytes(&_t61, (const uint8_t *)"        const ME_", 17); ({ vu_str *_t62 = &(*v_m); vu_str_cat(&_t61, &(*_t62)); }); vu_str_cat_bytes(&_t61, (const uint8_t *)" *en = &m->ents[e - 1];\n", 24); _t61; }); vu_str_cat(&v_s, &_t63); drop_Str(&_t63); });
     #line 22153 "vuc.vu"
     VU_AT(22153);
     #line 22153 "vuc.vu"
-    ({ vu_str _t181 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t181); drop_Str(&_t181); });
+    ({ vu_str _t66 = vu_str_lit("        if (en->live && en->hash == h && (en->key == *k)) return e - 1;\n", 72); vu_str_cat(&v_s, &_t66); drop_Str(&_t66); });
     #line 22154 "vuc.vu"
     VU_AT(22154);
     #line 22154 "vuc.vu"
-    ({ vu_str _t186 = ({ vu_str _t184 = {0}; vu_str_cat_bytes(&_t184, (const uint8_t *)"        if (m->nents >= VU_SMALL_MAP) vu_mbig_", 46); ({ vu_str *_t185 = &(*v_m); vu_str_cat(&_t184, &(*_t185)); }); vu_str_cat_bytes(&_t184, (const uint8_t *)"(m);\n", 5); _t184; }); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
+    ({ vu_str _t69 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t69); drop_Str(&_t69); });
     #line 22155 "vuc.vu"
     VU_AT(22155);
     #line 22155 "vuc.vu"
-    ({ vu_str _t191 = ({ vu_str _t189 = {0}; vu_str_cat_bytes(&_t189, (const uint8_t *)"    } else if ((m->nents + 1) * 4 > m->nidx * 3) vu_mindex_", 59); ({ vu_str *_t190 = &(*v_m); vu_str_cat(&_t189, &(*_t190)); }); vu_str_cat_bytes(&_t189, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t189; }); vu_str_cat(&v_s, &_t191); drop_Str(&_t191); });
+    ({ vu_str _t72 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t72); drop_Str(&_t72); });
     #line 22156 "vuc.vu"
     VU_AT(22156);
     #line 22156 "vuc.vu"
-    ({ vu_str _t194 = vu_str_lit("    uint64_t h = m->nidx ? vu_hash_int((int64_t)*k) : 0;\n", 57); vu_str_cat(&v_s, &_t194); drop_Str(&_t194); });
+    ({ vu_str _t78 = ({ vu_str _t75 = {0}; vu_str_cat_bytes(&_t75, (const uint8_t *)"static void vu_mindex_", 22); ({ vu_str *_t76 = &(*v_m); vu_str_cat(&_t75, &(*_t76)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)"(", 1); ({ vu_str *_t77 = &(*v_m); vu_str_cat(&_t75, &(*_t77)); }); vu_str_cat_bytes(&_t75, (const uint8_t *)" *m, int64_t want) {\n", 21); _t75; }); vu_str_cat(&v_s, &_t78); drop_Str(&_t78); });
     #line 22157 "vuc.vu"
     VU_AT(22157);
     #line 22157 "vuc.vu"
-    ({ vu_str _t197 = vu_str_lit("    if (m->nents == m->cap) {\n", 30); vu_str_cat(&v_s, &_t197); drop_Str(&_t197); });
+    ({ vu_str _t81 = vu_str_lit("    int64_t j = 0;\n", 19); vu_str_cat(&v_s, &_t81); drop_Str(&_t81); });
     #line 22158 "vuc.vu"
     VU_AT(22158);
     #line 22158 "vuc.vu"
-    ({ vu_str _t202 = ({ vu_str _t200 = {0}; vu_str_cat_bytes(&_t200, (const uint8_t *)"        if (m->cap > (int64_t)(PTRDIFF_MAX / sizeof(ME_", 55); ({ vu_str *_t201 = &(*v_m); vu_str_cat(&_t200, &(*_t201)); }); vu_str_cat_bytes(&_t200, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t200; }); vu_str_cat(&v_s, &_t202); drop_Str(&_t202); });
+    ({ vu_str _t84 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) if (m->ents[i].live) m->ents[j++] = m->ents[i];\n", 91); vu_str_cat(&v_s, &_t84); drop_Str(&_t84); });
     #line 22159 "vuc.vu"
     VU_AT(22159);
     #line 22159 "vuc.vu"
-    ({ vu_str _t205 = vu_str_lit("        /* 4 entries first (most objects are small), then 12, so a typical record grows once; then 1.5x. */\n", 108); vu_str_cat(&v_s, &_t205); drop_Str(&_t205); });
+    ({ vu_str _t87 = vu_str_lit("    m->nents = j;\n", 18); vu_str_cat(&v_s, &_t87); drop_Str(&_t87); });
     #line 22160 "vuc.vu"
     VU_AT(22160);
     #line 22160 "vuc.vu"
-    ({ vu_str _t208 = vu_str_lit("        int64_t c = m->cap == 0 ? 4 : m->cap == 4 ? 12 : m->cap + m->cap / 2;\n", 78); vu_str_cat(&v_s, &_t208); drop_Str(&_t208); });
+    ({ vu_str _t90 = vu_str_lit("    int64_t n = 8;\n", 19); vu_str_cat(&v_s, &_t90); drop_Str(&_t90); });
     #line 22161 "vuc.vu"
     VU_AT(22161);
     #line 22161 "vuc.vu"
-    ({ vu_str _t215 = ({ vu_str _t211 = {0}; vu_str_cat_bytes(&_t211, (const uint8_t *)"        ME_", 11); ({ vu_str *_t212 = &(*v_m); vu_str_cat(&_t211, &(*_t212)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)" *d = (ME_", 10); ({ vu_str *_t213 = &(*v_m); vu_str_cat(&_t211, &(*_t213)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)" *)realloc(m->ents, (size_t)c * sizeof(ME_", 42); ({ vu_str *_t214 = &(*v_m); vu_str_cat(&_t211, &(*_t214)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)"));\n", 4); _t211; }); vu_str_cat(&v_s, &_t215); drop_Str(&_t215); });
+    ({ vu_str _t93 = vu_str_lit("    while (n < want) { if (n > INT64_MAX / 4) vu_oom(); n *= 2; }\n", 66); vu_str_cat(&v_s, &_t93); drop_Str(&_t93); });
     #line 22162 "vuc.vu"
     VU_AT(22162);
     #line 22162 "vuc.vu"
-    ({ vu_str _t218 = vu_str_lit("        if (!d) vu_oom();\n", 26); vu_str_cat(&v_s, &_t218); drop_Str(&_t218); });
+    ({ vu_str _t96 = vu_str_lit("    free(m->idx);\n", 18); vu_str_cat(&v_s, &_t96); drop_Str(&_t96); });
     #line 22163 "vuc.vu"
     VU_AT(22163);
     #line 22163 "vuc.vu"
-    ({ vu_str _t221 = vu_str_lit("        m->ents = d;\n", 21); vu_str_cat(&v_s, &_t221); drop_Str(&_t221); });
+    ({ vu_str _t99 = vu_str_lit("    m->idx = (int64_t *)calloc((size_t)n, sizeof(int64_t));\n", 60); vu_str_cat(&v_s, &_t99); drop_Str(&_t99); });
     #line 22164 "vuc.vu"
     VU_AT(22164);
     #line 22164 "vuc.vu"
-    ({ vu_str _t224 = vu_str_lit("        m->cap = c;\n", 20); vu_str_cat(&v_s, &_t224); drop_Str(&_t224); });
+    ({ vu_str _t102 = vu_str_lit("    if (!m->idx) vu_oom();\n", 27); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
     #line 22165 "vuc.vu"
     VU_AT(22165);
     #line 22165 "vuc.vu"
-    ({ vu_str _t227 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t227); drop_Str(&_t227); });
+    ({ vu_str _t105 = vu_str_lit("    m->nidx = n;\n", 17); vu_str_cat(&v_s, &_t105); drop_Str(&_t105); });
     #line 22166 "vuc.vu"
     VU_AT(22166);
     #line 22166 "vuc.vu"
-    ({ vu_str _t232 = ({ vu_str _t230 = {0}; vu_str_cat_bytes(&_t230, (const uint8_t *)"    ME_", 7); ({ vu_str *_t231 = &(*v_m); vu_str_cat(&_t230, &(*_t231)); }); vu_str_cat_bytes(&_t230, (const uint8_t *)" *en = &m->ents[m->nents];\n", 27); _t230; }); vu_str_cat(&v_s, &_t232); drop_Str(&_t232); });
+    ({ vu_str _t108 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t108); drop_Str(&_t108); });
     #line 22167 "vuc.vu"
     VU_AT(22167);
     #line 22167 "vuc.vu"
-    ({ vu_str _t235 = vu_str_lit("    en->key = take ? *k : *k; en->val = v; en->hash = h; en->live = true;\n", 74); vu_str_cat(&v_s, &_t235); drop_Str(&_t235); });
+    ({ vu_str _t111 = vu_str_lit("        uint64_t s = m->ents[i].hash & ((uint64_t)n - 1);\n", 58); vu_str_cat(&v_s, &_t111); drop_Str(&_t111); });
     #line 22168 "vuc.vu"
     VU_AT(22168);
     #line 22168 "vuc.vu"
-    ({ vu_str _t238 = vu_str_lit("    m->nents++;\n", 16); vu_str_cat(&v_s, &_t238); drop_Str(&_t238); });
+    ({ vu_str _t114 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & ((uint64_t)n - 1);\n", 59); vu_str_cat(&v_s, &_t114); drop_Str(&_t114); });
     #line 22169 "vuc.vu"
     VU_AT(22169);
     #line 22169 "vuc.vu"
-    ({ vu_str _t241 = vu_str_lit("    m->live++;\n", 15); vu_str_cat(&v_s, &_t241); drop_Str(&_t241); });
+    ({ vu_str _t117 = vu_str_lit("        m->idx[s] = i + 1;\n", 27); vu_str_cat(&v_s, &_t117); drop_Str(&_t117); });
     #line 22170 "vuc.vu"
     VU_AT(22170);
     #line 22170 "vuc.vu"
-    ({ vu_str _t244 = vu_str_lit("    if (m->nidx) {\n", 19); vu_str_cat(&v_s, &_t244); drop_Str(&_t244); });
+    ({ vu_str _t120 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t120); drop_Str(&_t120); });
     #line 22171 "vuc.vu"
     VU_AT(22171);
     #line 22171 "vuc.vu"
-    ({ vu_str _t247 = vu_str_lit("        uint64_t mask = (uint64_t)m->nidx - 1, s = h & mask;\n", 61); vu_str_cat(&v_s, &_t247); drop_Str(&_t247); });
+    ({ vu_str _t123 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t123); drop_Str(&_t123); });
     #line 22172 "vuc.vu"
     VU_AT(22172);
     #line 22172 "vuc.vu"
-    ({ vu_str _t250 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & mask;\n", 46); vu_str_cat(&v_s, &_t250); drop_Str(&_t250); });
+    ({ vu_str _t129 = ({ vu_str _t126 = {0}; vu_str_cat_bytes(&_t126, (const uint8_t *)"static void vu_mbig_", 20); ({ vu_str *_t127 = &(*v_m); vu_str_cat(&_t126, &(*_t127)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)"(", 1); ({ vu_str *_t128 = &(*v_m); vu_str_cat(&_t126, &(*_t128)); }); vu_str_cat_bytes(&_t126, (const uint8_t *)" *m) {\n", 7); _t126; }); vu_str_cat(&v_s, &_t129); drop_Str(&_t129); });
     #line 22173 "vuc.vu"
     VU_AT(22173);
     #line 22173 "vuc.vu"
-    ({ vu_str _t253 = vu_str_lit("        m->idx[s] = m->nents;\n", 30); vu_str_cat(&v_s, &_t253); drop_Str(&_t253); });
+    ({ vu_str _t132 = vu_str_lit("    for (int64_t i = 0; i < m->nents; i++) {\n", 45); vu_str_cat(&v_s, &_t132); drop_Str(&_t132); });
     #line 22174 "vuc.vu"
     VU_AT(22174);
     #line 22174 "vuc.vu"
-    ({ vu_str _t256 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t256); drop_Str(&_t256); });
+    ({ vu_str _t137 = ({ vu_str _t135 = {0}; vu_str_cat_bytes(&_t135, (const uint8_t *)"        ME_", 11); ({ vu_str *_t136 = &(*v_m); vu_str_cat(&_t135, &(*_t136)); }); vu_str_cat_bytes(&_t135, (const uint8_t *)" *en = &m->ents[i];\n", 20); _t135; }); vu_str_cat(&v_s, &_t137); drop_Str(&_t137); });
     #line 22175 "vuc.vu"
     VU_AT(22175);
     #line 22175 "vuc.vu"
-    ({ vu_str _t259 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t259); drop_Str(&_t259); });
+    ({ vu_str _t140 = vu_str_lit("        if (!en->live) continue;\n", 33); vu_str_cat(&v_s, &_t140); drop_Str(&_t140); });
     #line 22176 "vuc.vu"
     VU_AT(22176);
     #line 22176 "vuc.vu"
-    ({ vu_str _t269 = ({ vu_str _t262 = {0}; vu_str_cat_bytes(&_t262, (const uint8_t *)"static void vu_mset_", 20); ({ vu_str *_t263 = &(*v_m); vu_str_cat(&_t262, &(*_t263)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)"(", 1); ({ vu_str *_t264 = &(*v_m); vu_str_cat(&_t262, &(*_t264)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t265 = &(*v_kc); vu_str_cat(&_t262, &(*_t265)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *k, ", 5); ({ vu_str *_t266 = &(*v_vc); vu_str_cat(&_t262, &(*_t266)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t267 = &(*v_m); vu_str_cat(&_t262, &(*_t267)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)"(m, (", 5); ({ vu_str *_t268 = &(*v_kc); vu_str_cat(&_t262, &(*_t268)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *)k, v, false); }\n", 19); _t262; }); vu_str_cat(&v_s, &_t269); drop_Str(&_t269); });
+    ({ vu_str _t145 = ({ vu_str _t143 = {0}; vu_str_cat_bytes(&_t143, (const uint8_t *)"        const ", 14); ({ vu_str *_t144 = &(*v_kc); vu_str_cat(&_t143, &(*_t144)); }); vu_str_cat_bytes(&_t143, (const uint8_t *)" *k = &en->key;\n", 16); _t143; }); vu_str_cat(&v_s, &_t145); drop_Str(&_t145); });
     #line 22177 "vuc.vu"
     VU_AT(22177);
     #line 22177 "vuc.vu"
-    ({ vu_str _t272 = vu_str_lit("/* Takes ownership of *k: the map keeps it, or frees it if the key was already there. */\n", 89); vu_str_cat(&v_s, &_t272); drop_Str(&_t272); });
+    ({ vu_str _t148 = vu_str_lit("        en->hash = vu_hash_int((int64_t)*k);\n", 45); vu_str_cat(&v_s, &_t148); drop_Str(&_t148); });
     #line 22178 "vuc.vu"
     VU_AT(22178);
     #line 22178 "vuc.vu"
-    ({ vu_str _t281 = ({ vu_str _t275 = {0}; vu_str_cat_bytes(&_t275, (const uint8_t *)"static void vu_mtake_", 21); ({ vu_str *_t276 = &(*v_m); vu_str_cat(&_t275, &(*_t276)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"(", 1); ({ vu_str *_t277 = &(*v_m); vu_str_cat(&_t275, &(*_t277)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" *m, ", 5); ({ vu_str *_t278 = &(*v_kc); vu_str_cat(&_t275, &(*_t278)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" *k, ", 5); ({ vu_str *_t279 = &(*v_vc); vu_str_cat(&_t275, &(*_t279)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t280 = &(*v_m); vu_str_cat(&_t275, &(*_t280)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"(m, k, v, true); }\n", 19); _t275; }); vu_str_cat(&v_s, &_t281); drop_Str(&_t281); });
+    ({ vu_str _t151 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t151); drop_Str(&_t151); });
     #line 22179 "vuc.vu"
     VU_AT(22179);
     #line 22179 "vuc.vu"
-    ({ vu_str _t289 = ({ vu_str _t284 = {0}; vu_str_cat_bytes(&_t284, (const uint8_t *)"static ", 7); ({ vu_str *_t285 = &(*v_vc); vu_str_cat(&_t284, &(*_t285)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *vu_mget_", 10); ({ vu_str *_t286 = &(*v_m); vu_str_cat(&_t284, &(*_t286)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)"(", 1); ({ vu_str *_t287 = &(*v_m); vu_str_cat(&_t284, &(*_t287)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t288 = &(*v_kc); vu_str_cat(&_t284, &(*_t288)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *k, int line) {\n", 17); _t284; }); vu_str_cat(&v_s, &_t289); drop_Str(&_t289); });
+    ({ vu_str _t156 = ({ vu_str _t154 = {0}; vu_str_cat_bytes(&_t154, (const uint8_t *)"    vu_mindex_", 14); ({ vu_str *_t155 = &(*v_m); vu_str_cat(&_t154, &(*_t155)); }); vu_str_cat_bytes(&_t154, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t154; }); vu_str_cat(&v_s, &_t156); drop_Str(&_t156); });
     #line 22180 "vuc.vu"
     VU_AT(22180);
     #line 22180 "vuc.vu"
-    ({ vu_str _t294 = ({ vu_str _t292 = {0}; vu_str_cat_bytes(&_t292, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t293 = &(*v_m); vu_str_cat(&_t292, &(*_t293)); }); vu_str_cat_bytes(&_t292, (const uint8_t *)"(m, k);\n", 8); _t292; }); vu_str_cat(&v_s, &_t294); drop_Str(&_t294); });
+    ({ vu_str _t159 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t159); drop_Str(&_t159); });
     #line 22181 "vuc.vu"
     VU_AT(22181);
     #line 22181 "vuc.vu"
-    ({ vu_str _t297 = vu_str_lit("    if (e < 0) vu_fail(line, \"key not found in map\");\n", 54); vu_str_cat(&v_s, &_t297); drop_Str(&_t297); });
+    ({ vu_str _t167 = ({ vu_str _t162 = {0}; vu_str_cat_bytes(&_t162, (const uint8_t *)"static void vu_mput_", 20); ({ vu_str *_t163 = &(*v_m); vu_str_cat(&_t162, &(*_t163)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)"(", 1); ({ vu_str *_t164 = &(*v_m); vu_str_cat(&_t162, &(*_t164)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *m, ", 5); ({ vu_str *_t165 = &(*v_kc); vu_str_cat(&_t162, &(*_t165)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" *k, ", 5); ({ vu_str *_t166 = &(*v_vc); vu_str_cat(&_t162, &(*_t166)); }); vu_str_cat_bytes(&_t162, (const uint8_t *)" v, bool take) {\n", 17); _t162; }); vu_str_cat(&v_s, &_t167); drop_Str(&_t167); });
     #line 22182 "vuc.vu"
     VU_AT(22182);
     #line 22182 "vuc.vu"
-    ({ vu_str _t300 = vu_str_lit("    return &m->ents[e].val;\n", 28); vu_str_cat(&v_s, &_t300); drop_Str(&_t300); });
+    ({ vu_str _t172 = ({ vu_str _t170 = {0}; vu_str_cat_bytes(&_t170, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t171 = &(*v_m); vu_str_cat(&_t170, &(*_t171)); }); vu_str_cat_bytes(&_t170, (const uint8_t *)"(m, k);\n", 8); _t170; }); vu_str_cat(&v_s, &_t172); drop_Str(&_t172); });
     #line 22183 "vuc.vu"
     VU_AT(22183);
     #line 22183 "vuc.vu"
-    ({ vu_str _t303 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t303); drop_Str(&_t303); });
+    ({ vu_str _t178 = ({ vu_str _t175 = {0}; vu_str_cat_bytes(&_t175, (const uint8_t *)"    if (e >= 0) { ME_", 21); ({ vu_str *_t176 = &(*v_m); vu_str_cat(&_t175, &(*_t176)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)" *en = &m->ents[e]; drop_", 25); ({ vu_str *_t177 = &(*v_vm); vu_str_cat(&_t175, &(*_t177)); }); vu_str_cat_bytes(&_t175, (const uint8_t *)"(&en->val); en->val = v; if (take) {  } return; }\n", 50); _t175; }); vu_str_cat(&v_s, &_t178); drop_Str(&_t178); });
     #line 22184 "vuc.vu"
     VU_AT(22184);
     #line 22184 "vuc.vu"
-    ({ vu_str _t311 = ({ vu_str _t306 = {0}; vu_str_cat_bytes(&_t306, (const uint8_t *)"static bool vu_mhas_", 20); ({ vu_str *_t307 = &(*v_m); vu_str_cat(&_t306, &(*_t307)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)"(const ", 7); ({ vu_str *_t308 = &(*v_m); vu_str_cat(&_t306, &(*_t308)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t309 = &(*v_kc); vu_str_cat(&_t306, &(*_t309)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)" *k) { return vu_mfind_", 23); ({ vu_str *_t310 = &(*v_m); vu_str_cat(&_t306, &(*_t310)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)"(m, k) >= 0; }\n", 15); _t306; }); vu_str_cat(&v_s, &_t311); drop_Str(&_t311); });
+    ({ vu_str _t181 = vu_str_lit("    if (!m->nidx) {\n", 20); vu_str_cat(&v_s, &_t181); drop_Str(&_t181); });
     #line 22185 "vuc.vu"
     VU_AT(22185);
     #line 22185 "vuc.vu"
-    ({ vu_str _t318 = ({ vu_str _t314 = {0}; vu_str_cat_bytes(&_t314, (const uint8_t *)"static bool vu_mremove_", 23); ({ vu_str *_t315 = &(*v_m); vu_str_cat(&_t314, &(*_t315)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)"(", 1); ({ vu_str *_t316 = &(*v_m); vu_str_cat(&_t314, &(*_t316)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t317 = &(*v_kc); vu_str_cat(&_t314, &(*_t317)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)" *k) {\n", 7); _t314; }); vu_str_cat(&v_s, &_t318); drop_Str(&_t318); });
+    ({ vu_str _t186 = ({ vu_str _t184 = {0}; vu_str_cat_bytes(&_t184, (const uint8_t *)"        if (m->nents >= VU_SMALL_MAP) vu_mbig_", 46); ({ vu_str *_t185 = &(*v_m); vu_str_cat(&_t184, &(*_t185)); }); vu_str_cat_bytes(&_t184, (const uint8_t *)"(m);\n", 5); _t184; }); vu_str_cat(&v_s, &_t186); drop_Str(&_t186); });
     #line 22186 "vuc.vu"
     VU_AT(22186);
     #line 22186 "vuc.vu"
-    ({ vu_str _t323 = ({ vu_str _t321 = {0}; vu_str_cat_bytes(&_t321, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t322 = &(*v_m); vu_str_cat(&_t321, &(*_t322)); }); vu_str_cat_bytes(&_t321, (const uint8_t *)"(m, k);\n", 8); _t321; }); vu_str_cat(&v_s, &_t323); drop_Str(&_t323); });
+    ({ vu_str _t191 = ({ vu_str _t189 = {0}; vu_str_cat_bytes(&_t189, (const uint8_t *)"    } else if ((m->nents + 1) * 4 > m->nidx * 3) vu_mindex_", 59); ({ vu_str *_t190 = &(*v_m); vu_str_cat(&_t189, &(*_t190)); }); vu_str_cat_bytes(&_t189, (const uint8_t *)"(m, (m->live + 1) * 2);\n", 24); _t189; }); vu_str_cat(&v_s, &_t191); drop_Str(&_t191); });
     #line 22187 "vuc.vu"
     VU_AT(22187);
     #line 22187 "vuc.vu"
-    ({ vu_str _t326 = vu_str_lit("    if (e < 0) return false;\n", 29); vu_str_cat(&v_s, &_t326); drop_Str(&_t326); });
+    ({ vu_str _t194 = vu_str_lit("    uint64_t h = m->nidx ? vu_hash_int((int64_t)*k) : 0;\n", 57); vu_str_cat(&v_s, &_t194); drop_Str(&_t194); });
     #line 22188 "vuc.vu"
     VU_AT(22188);
     #line 22188 "vuc.vu"
-    ({ vu_str _t331 = ({ vu_str _t329 = {0}; vu_str_cat_bytes(&_t329, (const uint8_t *)"    ME_", 7); ({ vu_str *_t330 = &(*v_m); vu_str_cat(&_t329, &(*_t330)); }); vu_str_cat_bytes(&_t329, (const uint8_t *)" *en = &m->ents[e];\n", 20); _t329; }); vu_str_cat(&v_s, &_t331); drop_Str(&_t331); });
+    ({ vu_str _t197 = vu_str_lit("    if (m->nents == m->cap) {\n", 30); vu_str_cat(&v_s, &_t197); drop_Str(&_t197); });
     #line 22189 "vuc.vu"
     VU_AT(22189);
     #line 22189 "vuc.vu"
-    ({ vu_str _t336 = ({ vu_str _t334 = {0}; vu_str_cat_bytes(&_t334, (const uint8_t *)"     drop_", 10); ({ vu_str *_t335 = &(*v_vm); vu_str_cat(&_t334, &(*_t335)); }); vu_str_cat_bytes(&_t334, (const uint8_t *)"(&en->val);\n", 12); _t334; }); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    ({ vu_str _t202 = ({ vu_str _t200 = {0}; vu_str_cat_bytes(&_t200, (const uint8_t *)"        if (m->cap > (int64_t)(PTRDIFF_MAX / sizeof(ME_", 55); ({ vu_str *_t201 = &(*v_m); vu_str_cat(&_t200, &(*_t201)); }); vu_str_cat_bytes(&_t200, (const uint8_t *)") / 2)) vu_oom();\n", 18); _t200; }); vu_str_cat(&v_s, &_t202); drop_Str(&_t202); });
     #line 22190 "vuc.vu"
     VU_AT(22190);
     #line 22190 "vuc.vu"
-    ({ vu_str _t339 = vu_str_lit("    en->live = false;\n", 22); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    ({ vu_str _t205 = vu_str_lit("        /* 4 entries first (most objects are small), then 12, so a typical record grows once; then 1.5x. */\n", 108); vu_str_cat(&v_s, &_t205); drop_Str(&_t205); });
     #line 22191 "vuc.vu"
     VU_AT(22191);
     #line 22191 "vuc.vu"
-    ({ vu_str _t342 = vu_str_lit("    m->live--;\n", 15); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    ({ vu_str _t208 = vu_str_lit("        int64_t c = m->cap == 0 ? 4 : m->cap == 4 ? 12 : m->cap + m->cap / 2;\n", 78); vu_str_cat(&v_s, &_t208); drop_Str(&_t208); });
     #line 22192 "vuc.vu"
     VU_AT(22192);
     #line 22192 "vuc.vu"
-    ({ vu_str _t345 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    ({ vu_str _t215 = ({ vu_str _t211 = {0}; vu_str_cat_bytes(&_t211, (const uint8_t *)"        ME_", 11); ({ vu_str *_t212 = &(*v_m); vu_str_cat(&_t211, &(*_t212)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)" *d = (ME_", 10); ({ vu_str *_t213 = &(*v_m); vu_str_cat(&_t211, &(*_t213)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)" *)realloc(m->ents, (size_t)c * sizeof(ME_", 42); ({ vu_str *_t214 = &(*v_m); vu_str_cat(&_t211, &(*_t214)); }); vu_str_cat_bytes(&_t211, (const uint8_t *)"));\n", 4); _t211; }); vu_str_cat(&v_s, &_t215); drop_Str(&_t215); });
     #line 22193 "vuc.vu"
     VU_AT(22193);
     #line 22193 "vuc.vu"
-    ({ vu_str _t348 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t348); drop_Str(&_t348); });
+    ({ vu_str _t218 = vu_str_lit("        if (!d) vu_oom();\n", 26); vu_str_cat(&v_s, &_t218); drop_Str(&_t218); });
     #line 22194 "vuc.vu"
     VU_AT(22194);
     #line 22194 "vuc.vu"
-    ({ vu_str _t353 = ({ vu_str _t351 = {0}; vu_str_cat_bytes(&_t351, (const uint8_t *)"static void vu_freeents_", 24); ({ vu_str *_t352 = &(*v_m); vu_str_cat(&_t351, &(*_t352)); }); vu_str_cat_bytes(&_t351, (const uint8_t *)"(void *v, int64_t n) {\n", 23); _t351; }); vu_str_cat(&v_s, &_t353); drop_Str(&_t353); });
+    ({ vu_str _t221 = vu_str_lit("        m->ents = d;\n", 21); vu_str_cat(&v_s, &_t221); drop_Str(&_t221); });
     #line 22195 "vuc.vu"
     VU_AT(22195);
     #line 22195 "vuc.vu"
-    ({ vu_str _t359 = ({ vu_str _t356 = {0}; vu_str_cat_bytes(&_t356, (const uint8_t *)"    ME_", 7); ({ vu_str *_t357 = &(*v_m); vu_str_cat(&_t356, &(*_t357)); }); vu_str_cat_bytes(&_t356, (const uint8_t *)" *ents = (ME_", 13); ({ vu_str *_t358 = &(*v_m); vu_str_cat(&_t356, &(*_t358)); }); vu_str_cat_bytes(&_t356, (const uint8_t *)" *)v;\n", 6); _t356; }); vu_str_cat(&v_s, &_t359); drop_Str(&_t359); });
+    ({ vu_str _t224 = vu_str_lit("        m->cap = c;\n", 20); vu_str_cat(&v_s, &_t224); drop_Str(&_t224); });
     #line 22196 "vuc.vu"
     VU_AT(22196);
     #line 22196 "vuc.vu"
-    ({ vu_str _t365 = ({ vu_str _t362 = {0}; vu_str_cat_bytes(&_t362, (const uint8_t *)"    for (int64_t i = 0; i < n; i++) { ME_", 41); ({ vu_str *_t363 = &(*v_m); vu_str_cat(&_t362, &(*_t363)); }); vu_str_cat_bytes(&_t362, (const uint8_t *)" *en = &ents[i]; if (!en->live) continue;  drop_", 48); ({ vu_str *_t364 = &(*v_vm); vu_str_cat(&_t362, &(*_t364)); }); vu_str_cat_bytes(&_t362, (const uint8_t *)"(&en->val); }\n", 14); _t362; }); vu_str_cat(&v_s, &_t365); drop_Str(&_t365); });
+    ({ vu_str _t227 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t227); drop_Str(&_t227); });
     #line 22197 "vuc.vu"
     VU_AT(22197);
     #line 22197 "vuc.vu"
-    ({ vu_str _t368 = vu_str_lit("    free(ents);\n", 16); vu_str_cat(&v_s, &_t368); drop_Str(&_t368); });
+    ({ vu_str _t232 = ({ vu_str _t230 = {0}; vu_str_cat_bytes(&_t230, (const uint8_t *)"    ME_", 7); ({ vu_str *_t231 = &(*v_m); vu_str_cat(&_t230, &(*_t231)); }); vu_str_cat_bytes(&_t230, (const uint8_t *)" *en = &m->ents[m->nents];\n", 27); _t230; }); vu_str_cat(&v_s, &_t232); drop_Str(&_t232); });
     #line 22198 "vuc.vu"
     VU_AT(22198);
     #line 22198 "vuc.vu"
-    ({ vu_str _t371 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t371); drop_Str(&_t371); });
+    ({ vu_str _t235 = vu_str_lit("    en->key = take ? *k : *k; en->val = v; en->hash = h; en->live = true;\n", 74); vu_str_cat(&v_s, &_t235); drop_Str(&_t235); });
     #line 22199 "vuc.vu"
     VU_AT(22199);
     #line 22199 "vuc.vu"
-    ({ vu_str _t377 = ({ vu_str _t374 = {0}; vu_str_cat_bytes(&_t374, (const uint8_t *)"static void drop_", 17); ({ vu_str *_t375 = &(*v_m); vu_str_cat(&_t374, &(*_t375)); }); vu_str_cat_bytes(&_t374, (const uint8_t *)"(", 1); ({ vu_str *_t376 = &(*v_m); vu_str_cat(&_t374, &(*_t376)); }); vu_str_cat_bytes(&_t374, (const uint8_t *)" *p) {\n", 7); _t374; }); vu_str_cat(&v_s, &_t377); drop_Str(&_t377); });
+    ({ vu_str _t238 = vu_str_lit("    m->nents++;\n", 16); vu_str_cat(&v_s, &_t238); drop_Str(&_t238); });
     #line 22200 "vuc.vu"
     VU_AT(22200);
     #line 22200 "vuc.vu"
-    ({ vu_str _t380 = vu_str_lit("    free(p->idx);\n", 18); vu_str_cat(&v_s, &_t380); drop_Str(&_t380); });
+    ({ vu_str _t241 = vu_str_lit("    m->live++;\n", 15); vu_str_cat(&v_s, &_t241); drop_Str(&_t241); });
     #line 22201 "vuc.vu"
     VU_AT(22201);
     #line 22201 "vuc.vu"
-    ({ vu_str _t383 = vu_str_lit("    if (!p->ents) return;\n", 26); vu_str_cat(&v_s, &_t383); drop_Str(&_t383); });
+    ({ vu_str _t244 = vu_str_lit("    if (m->nidx) {\n", 19); vu_str_cat(&v_s, &_t244); drop_Str(&_t244); });
     #line 22202 "vuc.vu"
     VU_AT(22202);
     #line 22202 "vuc.vu"
-    ({ vu_str _t388 = ({ vu_str _t386 = {0}; vu_str_cat_bytes(&_t386, (const uint8_t *)"    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_freeents_", 95); ({ vu_str *_t387 = &(*v_m); vu_str_cat(&_t386, &(*_t387)); }); vu_str_cat_bytes(&_t386, (const uint8_t *)"(p->ents, p->nents); vu_drop_depth--; }\n", 40); _t386; }); vu_str_cat(&v_s, &_t388); drop_Str(&_t388); });
+    ({ vu_str _t247 = vu_str_lit("        uint64_t mask = (uint64_t)m->nidx - 1, s = h & mask;\n", 61); vu_str_cat(&v_s, &_t247); drop_Str(&_t247); });
     #line 22203 "vuc.vu"
     VU_AT(22203);
     #line 22203 "vuc.vu"
-    ({ vu_str _t393 = ({ vu_str _t391 = {0}; vu_str_cat_bytes(&_t391, (const uint8_t *)"    else vu_defer(vu_freeents_", 30); ({ vu_str *_t392 = &(*v_m); vu_str_cat(&_t391, &(*_t392)); }); vu_str_cat_bytes(&_t391, (const uint8_t *)", p->ents, p->nents);\n", 22); _t391; }); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
+    ({ vu_str _t250 = vu_str_lit("        while (m->idx[s]) s = (s + 1) & mask;\n", 46); vu_str_cat(&v_s, &_t250); drop_Str(&_t250); });
     #line 22204 "vuc.vu"
     VU_AT(22204);
     #line 22204 "vuc.vu"
-    ({ vu_str _t396 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
+    ({ vu_str _t253 = vu_str_lit("        m->idx[s] = m->nents;\n", 30); vu_str_cat(&v_s, &_t253); drop_Str(&_t253); });
     #line 22205 "vuc.vu"
     VU_AT(22205);
     #line 22205 "vuc.vu"
+    ({ vu_str _t256 = vu_str_lit("    }\n", 6); vu_str_cat(&v_s, &_t256); drop_Str(&_t256); });
+    #line 22206 "vuc.vu"
+    VU_AT(22206);
+    #line 22206 "vuc.vu"
+    ({ vu_str _t259 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t259); drop_Str(&_t259); });
+    #line 22207 "vuc.vu"
+    VU_AT(22207);
+    #line 22207 "vuc.vu"
+    ({ vu_str _t269 = ({ vu_str _t262 = {0}; vu_str_cat_bytes(&_t262, (const uint8_t *)"static void vu_mset_", 20); ({ vu_str *_t263 = &(*v_m); vu_str_cat(&_t262, &(*_t263)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)"(", 1); ({ vu_str *_t264 = &(*v_m); vu_str_cat(&_t262, &(*_t264)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t265 = &(*v_kc); vu_str_cat(&_t262, &(*_t265)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *k, ", 5); ({ vu_str *_t266 = &(*v_vc); vu_str_cat(&_t262, &(*_t266)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t267 = &(*v_m); vu_str_cat(&_t262, &(*_t267)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)"(m, (", 5); ({ vu_str *_t268 = &(*v_kc); vu_str_cat(&_t262, &(*_t268)); }); vu_str_cat_bytes(&_t262, (const uint8_t *)" *)k, v, false); }\n", 19); _t262; }); vu_str_cat(&v_s, &_t269); drop_Str(&_t269); });
+    #line 22208 "vuc.vu"
+    VU_AT(22208);
+    #line 22208 "vuc.vu"
+    ({ vu_str _t272 = vu_str_lit("/* Takes ownership of *k: the map keeps it, or frees it if the key was already there. */\n", 89); vu_str_cat(&v_s, &_t272); drop_Str(&_t272); });
+    #line 22209 "vuc.vu"
+    VU_AT(22209);
+    #line 22209 "vuc.vu"
+    ({ vu_str _t281 = ({ vu_str _t275 = {0}; vu_str_cat_bytes(&_t275, (const uint8_t *)"static void vu_mtake_", 21); ({ vu_str *_t276 = &(*v_m); vu_str_cat(&_t275, &(*_t276)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"(", 1); ({ vu_str *_t277 = &(*v_m); vu_str_cat(&_t275, &(*_t277)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" *m, ", 5); ({ vu_str *_t278 = &(*v_kc); vu_str_cat(&_t275, &(*_t278)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" *k, ", 5); ({ vu_str *_t279 = &(*v_vc); vu_str_cat(&_t275, &(*_t279)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)" v, int line) { (void)line; vu_mput_", 36); ({ vu_str *_t280 = &(*v_m); vu_str_cat(&_t275, &(*_t280)); }); vu_str_cat_bytes(&_t275, (const uint8_t *)"(m, k, v, true); }\n", 19); _t275; }); vu_str_cat(&v_s, &_t281); drop_Str(&_t281); });
+    #line 22210 "vuc.vu"
+    VU_AT(22210);
+    #line 22210 "vuc.vu"
+    ({ vu_str _t289 = ({ vu_str _t284 = {0}; vu_str_cat_bytes(&_t284, (const uint8_t *)"static ", 7); ({ vu_str *_t285 = &(*v_vc); vu_str_cat(&_t284, &(*_t285)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *vu_mget_", 10); ({ vu_str *_t286 = &(*v_m); vu_str_cat(&_t284, &(*_t286)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)"(", 1); ({ vu_str *_t287 = &(*v_m); vu_str_cat(&_t284, &(*_t287)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t288 = &(*v_kc); vu_str_cat(&_t284, &(*_t288)); }); vu_str_cat_bytes(&_t284, (const uint8_t *)" *k, int line) {\n", 17); _t284; }); vu_str_cat(&v_s, &_t289); drop_Str(&_t289); });
+    #line 22211 "vuc.vu"
+    VU_AT(22211);
+    #line 22211 "vuc.vu"
+    ({ vu_str _t294 = ({ vu_str _t292 = {0}; vu_str_cat_bytes(&_t292, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t293 = &(*v_m); vu_str_cat(&_t292, &(*_t293)); }); vu_str_cat_bytes(&_t292, (const uint8_t *)"(m, k);\n", 8); _t292; }); vu_str_cat(&v_s, &_t294); drop_Str(&_t294); });
+    #line 22212 "vuc.vu"
+    VU_AT(22212);
+    #line 22212 "vuc.vu"
+    ({ vu_str _t297 = vu_str_lit("    if (e < 0) vu_fail(line, \"key not found in map\");\n", 54); vu_str_cat(&v_s, &_t297); drop_Str(&_t297); });
+    #line 22213 "vuc.vu"
+    VU_AT(22213);
+    #line 22213 "vuc.vu"
+    ({ vu_str _t300 = vu_str_lit("    return &m->ents[e].val;\n", 28); vu_str_cat(&v_s, &_t300); drop_Str(&_t300); });
+    #line 22214 "vuc.vu"
+    VU_AT(22214);
+    #line 22214 "vuc.vu"
+    ({ vu_str _t303 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t303); drop_Str(&_t303); });
+    #line 22215 "vuc.vu"
+    VU_AT(22215);
+    #line 22215 "vuc.vu"
+    ({ vu_str _t311 = ({ vu_str _t306 = {0}; vu_str_cat_bytes(&_t306, (const uint8_t *)"static bool vu_mhas_", 20); ({ vu_str *_t307 = &(*v_m); vu_str_cat(&_t306, &(*_t307)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)"(const ", 7); ({ vu_str *_t308 = &(*v_m); vu_str_cat(&_t306, &(*_t308)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t309 = &(*v_kc); vu_str_cat(&_t306, &(*_t309)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)" *k) { return vu_mfind_", 23); ({ vu_str *_t310 = &(*v_m); vu_str_cat(&_t306, &(*_t310)); }); vu_str_cat_bytes(&_t306, (const uint8_t *)"(m, k) >= 0; }\n", 15); _t306; }); vu_str_cat(&v_s, &_t311); drop_Str(&_t311); });
+    #line 22216 "vuc.vu"
+    VU_AT(22216);
+    #line 22216 "vuc.vu"
+    ({ vu_str _t318 = ({ vu_str _t314 = {0}; vu_str_cat_bytes(&_t314, (const uint8_t *)"static bool vu_mremove_", 23); ({ vu_str *_t315 = &(*v_m); vu_str_cat(&_t314, &(*_t315)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)"(", 1); ({ vu_str *_t316 = &(*v_m); vu_str_cat(&_t314, &(*_t316)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)" *m, const ", 11); ({ vu_str *_t317 = &(*v_kc); vu_str_cat(&_t314, &(*_t317)); }); vu_str_cat_bytes(&_t314, (const uint8_t *)" *k) {\n", 7); _t314; }); vu_str_cat(&v_s, &_t318); drop_Str(&_t318); });
+    #line 22217 "vuc.vu"
+    VU_AT(22217);
+    #line 22217 "vuc.vu"
+    ({ vu_str _t323 = ({ vu_str _t321 = {0}; vu_str_cat_bytes(&_t321, (const uint8_t *)"    int64_t e = vu_mfind_", 25); ({ vu_str *_t322 = &(*v_m); vu_str_cat(&_t321, &(*_t322)); }); vu_str_cat_bytes(&_t321, (const uint8_t *)"(m, k);\n", 8); _t321; }); vu_str_cat(&v_s, &_t323); drop_Str(&_t323); });
+    #line 22218 "vuc.vu"
+    VU_AT(22218);
+    #line 22218 "vuc.vu"
+    ({ vu_str _t326 = vu_str_lit("    if (e < 0) return false;\n", 29); vu_str_cat(&v_s, &_t326); drop_Str(&_t326); });
+    #line 22219 "vuc.vu"
+    VU_AT(22219);
+    #line 22219 "vuc.vu"
+    ({ vu_str _t331 = ({ vu_str _t329 = {0}; vu_str_cat_bytes(&_t329, (const uint8_t *)"    ME_", 7); ({ vu_str *_t330 = &(*v_m); vu_str_cat(&_t329, &(*_t330)); }); vu_str_cat_bytes(&_t329, (const uint8_t *)" *en = &m->ents[e];\n", 20); _t329; }); vu_str_cat(&v_s, &_t331); drop_Str(&_t331); });
+    #line 22220 "vuc.vu"
+    VU_AT(22220);
+    #line 22220 "vuc.vu"
+    ({ vu_str _t336 = ({ vu_str _t334 = {0}; vu_str_cat_bytes(&_t334, (const uint8_t *)"     drop_", 10); ({ vu_str *_t335 = &(*v_vm); vu_str_cat(&_t334, &(*_t335)); }); vu_str_cat_bytes(&_t334, (const uint8_t *)"(&en->val);\n", 12); _t334; }); vu_str_cat(&v_s, &_t336); drop_Str(&_t336); });
+    #line 22221 "vuc.vu"
+    VU_AT(22221);
+    #line 22221 "vuc.vu"
+    ({ vu_str _t339 = vu_str_lit("    en->live = false;\n", 22); vu_str_cat(&v_s, &_t339); drop_Str(&_t339); });
+    #line 22222 "vuc.vu"
+    VU_AT(22222);
+    #line 22222 "vuc.vu"
+    ({ vu_str _t342 = vu_str_lit("    m->live--;\n", 15); vu_str_cat(&v_s, &_t342); drop_Str(&_t342); });
+    #line 22223 "vuc.vu"
+    VU_AT(22223);
+    #line 22223 "vuc.vu"
+    ({ vu_str _t345 = vu_str_lit("    return true;\n", 17); vu_str_cat(&v_s, &_t345); drop_Str(&_t345); });
+    #line 22224 "vuc.vu"
+    VU_AT(22224);
+    #line 22224 "vuc.vu"
+    ({ vu_str _t348 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t348); drop_Str(&_t348); });
+    #line 22225 "vuc.vu"
+    VU_AT(22225);
+    #line 22225 "vuc.vu"
+    ({ vu_str _t353 = ({ vu_str _t351 = {0}; vu_str_cat_bytes(&_t351, (const uint8_t *)"static void vu_freeents_", 24); ({ vu_str *_t352 = &(*v_m); vu_str_cat(&_t351, &(*_t352)); }); vu_str_cat_bytes(&_t351, (const uint8_t *)"(void *v, int64_t n) {\n", 23); _t351; }); vu_str_cat(&v_s, &_t353); drop_Str(&_t353); });
+    #line 22226 "vuc.vu"
+    VU_AT(22226);
+    #line 22226 "vuc.vu"
+    ({ vu_str _t359 = ({ vu_str _t356 = {0}; vu_str_cat_bytes(&_t356, (const uint8_t *)"    ME_", 7); ({ vu_str *_t357 = &(*v_m); vu_str_cat(&_t356, &(*_t357)); }); vu_str_cat_bytes(&_t356, (const uint8_t *)" *ents = (ME_", 13); ({ vu_str *_t358 = &(*v_m); vu_str_cat(&_t356, &(*_t358)); }); vu_str_cat_bytes(&_t356, (const uint8_t *)" *)v;\n", 6); _t356; }); vu_str_cat(&v_s, &_t359); drop_Str(&_t359); });
+    #line 22227 "vuc.vu"
+    VU_AT(22227);
+    #line 22227 "vuc.vu"
+    ({ vu_str _t365 = ({ vu_str _t362 = {0}; vu_str_cat_bytes(&_t362, (const uint8_t *)"    for (int64_t i = 0; i < n; i++) { ME_", 41); ({ vu_str *_t363 = &(*v_m); vu_str_cat(&_t362, &(*_t363)); }); vu_str_cat_bytes(&_t362, (const uint8_t *)" *en = &ents[i]; if (!en->live) continue;  drop_", 48); ({ vu_str *_t364 = &(*v_vm); vu_str_cat(&_t362, &(*_t364)); }); vu_str_cat_bytes(&_t362, (const uint8_t *)"(&en->val); }\n", 14); _t362; }); vu_str_cat(&v_s, &_t365); drop_Str(&_t365); });
+    #line 22228 "vuc.vu"
+    VU_AT(22228);
+    #line 22228 "vuc.vu"
+    ({ vu_str _t368 = vu_str_lit("    free(ents);\n", 16); vu_str_cat(&v_s, &_t368); drop_Str(&_t368); });
+    #line 22229 "vuc.vu"
+    VU_AT(22229);
+    #line 22229 "vuc.vu"
+    ({ vu_str _t371 = vu_str_lit("}\n", 2); vu_str_cat(&v_s, &_t371); drop_Str(&_t371); });
+    #line 22230 "vuc.vu"
+    VU_AT(22230);
+    #line 22230 "vuc.vu"
+    ({ vu_str _t377 = ({ vu_str _t374 = {0}; vu_str_cat_bytes(&_t374, (const uint8_t *)"static void drop_", 17); ({ vu_str *_t375 = &(*v_m); vu_str_cat(&_t374, &(*_t375)); }); vu_str_cat_bytes(&_t374, (const uint8_t *)"(", 1); ({ vu_str *_t376 = &(*v_m); vu_str_cat(&_t374, &(*_t376)); }); vu_str_cat_bytes(&_t374, (const uint8_t *)" *p) {\n", 7); _t374; }); vu_str_cat(&v_s, &_t377); drop_Str(&_t377); });
+    #line 22231 "vuc.vu"
+    VU_AT(22231);
+    #line 22231 "vuc.vu"
+    ({ vu_str _t380 = vu_str_lit("    free(p->idx);\n", 18); vu_str_cat(&v_s, &_t380); drop_Str(&_t380); });
+    #line 22232 "vuc.vu"
+    VU_AT(22232);
+    #line 22232 "vuc.vu"
+    ({ vu_str _t383 = vu_str_lit("    if (!p->ents) return;\n", 26); vu_str_cat(&v_s, &_t383); drop_Str(&_t383); });
+    #line 22233 "vuc.vu"
+    VU_AT(22233);
+    #line 22233 "vuc.vu"
+    ({ vu_str _t388 = ({ vu_str _t386 = {0}; vu_str_cat_bytes(&_t386, (const uint8_t *)"    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_freeents_", 95); ({ vu_str *_t387 = &(*v_m); vu_str_cat(&_t386, &(*_t387)); }); vu_str_cat_bytes(&_t386, (const uint8_t *)"(p->ents, p->nents); vu_drop_depth--; }\n", 40); _t386; }); vu_str_cat(&v_s, &_t388); drop_Str(&_t388); });
+    #line 22234 "vuc.vu"
+    VU_AT(22234);
+    #line 22234 "vuc.vu"
+    ({ vu_str _t393 = ({ vu_str _t391 = {0}; vu_str_cat_bytes(&_t391, (const uint8_t *)"    else vu_defer(vu_freeents_", 30); ({ vu_str *_t392 = &(*v_m); vu_str_cat(&_t391, &(*_t392)); }); vu_str_cat_bytes(&_t391, (const uint8_t *)", p->ents, p->nents);\n", 22); _t391; }); vu_str_cat(&v_s, &_t393); drop_Str(&_t393); });
+    #line 22235 "vuc.vu"
+    VU_AT(22235);
+    #line 22235 "vuc.vu"
+    ({ vu_str _t396 = vu_str_lit("}", 1); vu_str_cat(&v_s, &_t396); drop_Str(&_t396); });
+    #line 22236 "vuc.vu"
+    VU_AT(22236);
+    #line 22236 "vuc.vu"
     {
-        #line 22205 "vuc.vu"
+        #line 22236 "vuc.vu"
         vu_str _t397 = VU_MV(v_s);
-        #line 22205 "vuc.vu"
+        #line 22236 "vuc.vu"
         return _t397;
-    #line 22205 "vuc.vu"
+    #line 22236 "vuc.vu"
     }
 }
 /* vu-part */
 VU_FN vu_str fn_map_code(vu_str *restrict v_m, vu_str *restrict v_kc, vu_str *restrict v_vc, vu_str *restrict v_vm, bool v_str_key, bool v_copy_val) {
-    #line 22207 "vuc.vu"
+    #line 22238 "vuc.vu"
     VU_ENTER("map_code");
-    #line 22208 "vuc.vu"
-    VU_AT(22208);
-    #line 22208 "vuc.vu"
+    #line 22239 "vuc.vu"
+    VU_AT(22239);
+    #line 22239 "vuc.vu"
     if ((v_str_key && v_copy_val)) {
-        #line 22208 "vuc.vu"
-        VU_AT(22208);
-        #line 22208 "vuc.vu"
+        #line 22239 "vuc.vu"
+        VU_AT(22239);
+        #line 22239 "vuc.vu"
         {
-            #line 22208 "vuc.vu"
+            #line 22239 "vuc.vu"
             vu_str _t6 = ({ vu_str* _t1 = &(*v_m); vu_str* _t2 = &(*v_kc); vu_str* _t3 = &(*v_vc); vu_str* _t4 = &(*v_vm); vu_str _t5 = fn_map_code_sc(_t1, _t2, _t3, _t4);  _t5; });
-            #line 22208 "vuc.vu"
+            #line 22239 "vuc.vu"
             return _t6;
-        #line 22208 "vuc.vu"
+        #line 22239 "vuc.vu"
         }
-    #line 22208 "vuc.vu"
+    #line 22239 "vuc.vu"
     }
-    #line 22209 "vuc.vu"
-    VU_AT(22209);
-    #line 22209 "vuc.vu"
+    #line 22240 "vuc.vu"
+    VU_AT(22240);
+    #line 22240 "vuc.vu"
     if ((v_str_key && (!v_copy_val))) {
-        #line 22209 "vuc.vu"
-        VU_AT(22209);
-        #line 22209 "vuc.vu"
+        #line 22240 "vuc.vu"
+        VU_AT(22240);
+        #line 22240 "vuc.vu"
         {
-            #line 22209 "vuc.vu"
+            #line 22240 "vuc.vu"
             vu_str _t12 = ({ vu_str* _t7 = &(*v_m); vu_str* _t8 = &(*v_kc); vu_str* _t9 = &(*v_vc); vu_str* _t10 = &(*v_vm); vu_str _t11 = fn_map_code_so(_t7, _t8, _t9, _t10);  _t11; });
-            #line 22209 "vuc.vu"
+            #line 22240 "vuc.vu"
             return _t12;
-        #line 22209 "vuc.vu"
+        #line 22240 "vuc.vu"
         }
-    #line 22209 "vuc.vu"
+    #line 22240 "vuc.vu"
     }
-    #line 22210 "vuc.vu"
-    VU_AT(22210);
-    #line 22210 "vuc.vu"
+    #line 22241 "vuc.vu"
+    VU_AT(22241);
+    #line 22241 "vuc.vu"
     if (((!v_str_key) && v_copy_val)) {
-        #line 22210 "vuc.vu"
-        VU_AT(22210);
-        #line 22210 "vuc.vu"
+        #line 22241 "vuc.vu"
+        VU_AT(22241);
+        #line 22241 "vuc.vu"
         {
-            #line 22210 "vuc.vu"
+            #line 22241 "vuc.vu"
             vu_str _t18 = ({ vu_str* _t13 = &(*v_m); vu_str* _t14 = &(*v_kc); vu_str* _t15 = &(*v_vc); vu_str* _t16 = &(*v_vm); vu_str _t17 = fn_map_code_ic(_t13, _t14, _t15, _t16);  _t17; });
-            #line 22210 "vuc.vu"
+            #line 22241 "vuc.vu"
             return _t18;
-        #line 22210 "vuc.vu"
+        #line 22241 "vuc.vu"
         }
-    #line 22210 "vuc.vu"
+    #line 22241 "vuc.vu"
     }
-    #line 22211 "vuc.vu"
-    VU_AT(22211);
-    #line 22211 "vuc.vu"
+    #line 22242 "vuc.vu"
+    VU_AT(22242);
+    #line 22242 "vuc.vu"
     if (((!v_str_key) && (!v_copy_val))) {
-        #line 22211 "vuc.vu"
-        VU_AT(22211);
-        #line 22211 "vuc.vu"
+        #line 22242 "vuc.vu"
+        VU_AT(22242);
+        #line 22242 "vuc.vu"
         {
-            #line 22211 "vuc.vu"
+            #line 22242 "vuc.vu"
             vu_str _t24 = ({ vu_str* _t19 = &(*v_m); vu_str* _t20 = &(*v_kc); vu_str* _t21 = &(*v_vc); vu_str* _t22 = &(*v_vm); vu_str _t23 = fn_map_code_io(_t19, _t20, _t21, _t22);  _t23; });
-            #line 22211 "vuc.vu"
+            #line 22242 "vuc.vu"
             return _t24;
-        #line 22211 "vuc.vu"
+        #line 22242 "vuc.vu"
         }
-    #line 22211 "vuc.vu"
+    #line 22242 "vuc.vu"
     }
-    #line 22212 "vuc.vu"
-    VU_AT(22212);
-    #line 22212 "vuc.vu"
+    #line 22243 "vuc.vu"
+    VU_AT(22243);
+    #line 22243 "vuc.vu"
     {
-        #line 22212 "vuc.vu"
+        #line 22243 "vuc.vu"
         vu_str _t25 = vu_str_lit("", 0);
-        #line 22212 "vuc.vu"
+        #line 22243 "vuc.vu"
         return _t25;
-    #line 22212 "vuc.vu"
+    #line 22243 "vuc.vu"
     }
 }

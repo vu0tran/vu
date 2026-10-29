@@ -1065,17 +1065,47 @@ static bool vu_net_listen(vu_cap net, int64_t port, void **out, vu_str *err, int
     (void)net;
     vu_task_here("net.listen()", line);
     if (port < 0 || port > 65535) { *err = vu_errf("port %lld is not in 0..65535", (long long)port); return false; }
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) { *err = vu_errf("can't listen on port %lld: %s", (long long)port, strerror(errno)); return false; }
-    vu_sock_flags(fd);
-    int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
-    a.sin_port = htons((uint16_t)port);
-    if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0 || listen(fd, SOMAXCONN) < 0) {
+    /* IPv6 and IPv4 on one socket where the system has IPv6 (some hosts' private networks, such as
+       Railway's, reach a service only over IPv6); IPv4 alone where it doesn't */
+    int one = 1, zero = 0;
+    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd >= 0) {
+        vu_sock_flags(fd);
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+        struct sockaddr_in6 a6;
+        memset(&a6, 0, sizeof a6);
+        a6.sin6_family = AF_INET6;
+        a6.sin6_addr = in6addr_any;
+        a6.sin6_port = htons((uint16_t)port);
+        if (bind(fd, (struct sockaddr *)&a6, sizeof a6) < 0) {
+            int e = errno;
+            close(fd);
+            fd = -1;
+            if (e == EADDRINUSE || e == EACCES) {   /* the port's problem, not IPv6's */
+                *err = vu_errf("can't listen on port %lld: %s", (long long)port, strerror(e));
+                return false;
+            }
+        }
+    }
+    if (fd < 0) {
+        fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) { *err = vu_errf("can't listen on port %lld: %s", (long long)port, strerror(errno)); return false; }
+        vu_sock_flags(fd);
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
+        a.sin_port = htons((uint16_t)port);
+        if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) {
+            int e = errno;
+            close(fd);
+            *err = vu_errf("can't listen on port %lld: %s", (long long)port, strerror(e));
+            return false;
+        }
+    }
+    if (listen(fd, SOMAXCONN) < 0) {
         int e = errno;
         close(fd);
         *err = vu_errf("can't listen on port %lld: %s", (long long)port, strerror(e));
@@ -1089,10 +1119,11 @@ static bool vu_net_listen(vu_cap net, int64_t port, void **out, vu_str *err, int
 /* The port a listener is on (useful after listening on port 0, which picks a free one). */
 static int64_t vu_net_port(vu_cap net, void *l) {
     (void)net;
-    struct sockaddr_in a;
+    struct sockaddr_storage a;
     socklen_t n = sizeof a;
     if (getsockname(((vu_sock *)l)->fd, (struct sockaddr *)&a, &n) < 0) return 0;
-    return ntohs(a.sin_port);
+    if (a.ss_family == AF_INET6) return ntohs(((struct sockaddr_in6 *)&a)->sin6_port);
+    return ntohs(((struct sockaddr_in *)&a)->sin_port);
 }
 static bool vu_net_accept(vu_cap net, void *lp, double timeout, bool has, void **out, vu_str *err, int line) {
     (void)net;

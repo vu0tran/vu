@@ -607,7 +607,7 @@ fn main(net: Net) throws:
     spawn handle(net, c)
 ```
 
-- `net.listen(port) -> Listener`, `net.accept(l) -> Conn`, `net.connect(host, port) -> Conn`,
+- `net.listen(port) -> Listener` (IPv6 and IPv4 where the system has IPv6, else IPv4), `net.accept(l) -> Conn`, `net.connect(host, port) -> Conn`,
   `net.recv(c) -> Str` and `net.send(c, data)` can each fail, so they're handled with `?`,
   `else` or `match`. `accept`, `connect`, `recv` and `send` take `timeout: seconds`; when it
   passes, the call fails with "timed out".
