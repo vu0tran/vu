@@ -58,6 +58,17 @@ dup=$(for o in "$slot"/*.o; do nm "$o" 2>/dev/null | awk '$2 ~ /^[bdBD]$/ {print
 "$work/vuc1" build "$src" --emit-c "$work/a.c" -o "$work/vuc2" >/dev/null 2>&1
 "$VU" build "$src" --emit-c "$work/b.c" -o "$work/vuc3" >/dev/null 2>&1
 cmp -s "$work/a.c" "$work/b.c"; check "the split-built compiler writes the same C as the installed one" $? "$(diff "$work/a.c" "$work/b.c" | head -5)"
+# optimized builds are split too: the compiler built that way writes the same C
+VU_SPLIT=always "$VU" build "$src" -o "$work/vuc5" 2>"$work/e5"; rc=$?
+"$work/vuc5" build "$src" --emit-c "$work/c.c" -o "$work/vuc6" >/dev/null 2>&1
+[ $rc -eq 0 ] && cmp -s "$work/c.c" "$work/b.c"; check "an optimized split build of the compiler writes the same C" $? "rc=$rc $(head -3 "$work/e5") $(diff "$work/c.c" "$work/b.c" | head -5)"
+# and every example, optimized, prints the same split and whole
+for f in ../examples/*.vu; do
+  a=$(sed -n '3s/^# args: //p' "$f")
+  VU_SPLIT=off "$VU" build "$f" -o "$work/w1" 2>/dev/null; VU_SPLIT=always "$VU" build "$f" -o "$work/w2" 2>/dev/null
+  o1=$("$work/w1" 2>&1); o2=$("$work/w2" 2>&1)
+  [ "$o1" = "$o2" ]; check "optimized split and whole: $(basename "$f")" $? "[$o1] [$o2]"
+done
 # an edit to one function: one part compiled again
 cp -r ../compiler "$work/c2"; cp "$src" "$work/c2/vuc.vu"
 edit "$work/c2/vuc.vu" "fn shq(s: Str) -> Str:" "fn shq(s: Str) -> Str:

@@ -2331,3 +2331,53 @@ What CI found on the ARM64 runners (macOS and Linux), which the x86-64 gate coul
 - On macOS, split builds of programs that use TLS didn't find OpenSSL's headers. Homebrew's `-I`
   folder is given with the libraries, after the C file, and the parts were compiled with only the
   options before it. Each part now gets the `-I` options too.
+
+## Round 27: where Vu still lost to Rust
+
+The question was where Vu still loses to Rust, and the aim was to fix each case. The first finding
+was about the measurement itself.
+
+**The rebuild benchmark was wrong.** `bench/rebuild/gen.py` says each function calls another "on a
+path the run never takes, so nothing is dead code". But `main` passed constants, so gcc's
+interprocedural constant propagation proved those paths dead and deleted them in a whole-program
+build. The optimized-build numbers published last round (9.4 s against Rust's 7.1 s) measured
+that. `main` now passes a number read from the command line. With that, a whole-program optimized
+build took 44 s against `cargo build --release`'s 14.3 s, and the README and SPEC numbers are
+replaced.
+
+What changed:
+- **Optimized builds are split too**, as quick builds were: parts of about 6,000 lines compiled in
+  parallel and kept. Calls across parts aren't inlined, as with Rust's default 16 codegen units.
+  The tried copies of functions (`VU_FNI`) go in the header, so every part can still inline them
+  into its loops. The compiler built this way checks its own source 6% slower (median of 5, 489 ms
+  against 451). On the 20,000-line program, the first optimized build takes 29.6 s (Rust: 14.3 s),
+  and a rebuild after an edit takes 3.2 s (Rust: 14.1 s, since its release builds aren't
+  incremental).
+- **Quick builds' parts are 3,000 lines** (optimized ones keep 6,000), and the header and options
+  are hashed once instead of once per part.
+- **A precompiled header with clang.** Every part but part 0 uses one header compiled once and kept
+  with the parts. On the 20,000-line program, an edit and `vu run` went from 0.92 s to 0.68 s
+  (Rust: 0.79 s), and the first `vu run` from 4.99 s to 4.32 s (Rust: 5.16 s).
+- **`vu build --debug` with clang adds `-fno-standalone-debug`**, which writes type information
+  only where it's used, a third less time per part. An edit then takes 0.78 s against Rust's
+  0.76 s, and the first build 6.39 s against 5.67 s, still a loss.
+- **The front end makes fewer strings.** A chain `a + b + c + ...` of `Str` builds one string,
+  with its length reserved once, instead of a string per `+`. `s + ""` of static text shares the
+  text instead of copying it. Together they cut 13% of the instructions the front end runs on the
+  20,000-line program (1.73 billion to 1.51 billion, callgrind). The wall time went from a minimum
+  of 303 ms to 289 ms over 15 runs.
+
+Where Vu still loses, and why:
+- **The first optimized build**, by about 2x. gcc takes 20 to 30 ms a function at -O3 on Vu's C,
+  spread over all its passes. No flag tried that keeps the code fast (less inlining, no
+  vectorization, no unrolling, -O2) saved more than 15%; turning inlining off saved 39%. clang -O3 is slower still on this C, 97 s for the whole program. Leaner
+  generated C is the likely fix, and it hasn't been tried.
+- **n-body**, by 29% (`bench/compare.sh`, re-run today with every language on this VM). The Rust
+  program's bodies are a fixed-size array, which LLVM unrolls fully and vectorizes in pairs. gcc
+  doesn't do that even for C with a fixed-size array (2.53 s). clang does for Vu's C once the count
+  is a constant and an unroll hint is added by hand (1.76 s), but clang makes binary-trees 40% and
+  spectral-norm twice as slow (callgrind: clang's binary-trees runs 1.6 times the instructions,
+  without gcc's partial inlining of the base case; for spectral-norm, clang reports that it can't
+  vectorize the sum's loop without reordering the additions, and gcc's build runs twice as fast). So optimized builds stay with gcc.
+- The others are now ties or wins on this VM. Spectral-norm (1.63 s against 1.78 s) and
+  binary-trees are Vu's. fannkuch-redux (3%), nsieve (1%) and mandelbrot (1%) are close.

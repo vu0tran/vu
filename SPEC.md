@@ -1037,11 +1037,13 @@ a module it imports builds it again. It keeps the 64 programs used last and forg
 is gone; `VU_RUN_CACHE=off` builds every time.
 
 Quick builds (`vu run`, `vu build --debug`) use clang when it's installed and `CC` isn't set: it
-compiles Vu's C about 3 times as fast as gcc. A quick build of a big program (more than about 6,000
-lines of C in its functions) is split: its functions are compiled as several C files, as many at
-once as there are cores, and each one's object file is kept (in `~/.cache/vu/parts`), so a rebuild
-after an edit compiles only the part that changed. On a 20,000-line program, an edit and `vu run`
-takes 0.83 s, against 12.97 s before (Rust's `cargo run`: 0.74 s; see `bench/rebuild`).
+compiles Vu's C about 3 times as fast as gcc. A build of a big program (more than about 6,000 lines
+of C in its functions) is split: its functions are compiled as several C files, as many at once as
+there are cores, and each one's object file is kept (in `~/.cache/vu/parts`), so a rebuild after an
+edit compiles only the part that changed. On a 20,000-line program, an edit and `vu run` takes
+0.68 s (Rust's `cargo run`: 0.79 s), and an optimized rebuild 3.2 s (`cargo build --release`:
+14.1 s; see `bench/rebuild`). An optimized split build doesn't inline a function into a caller in
+another part: functions are grouped by source file, so calls within a module still can be.
 `VU_SPLIT=off` builds one C file; `VU_SPLIT=always` splits any program.
 
 - **`vu fmt`**: blocks indented 2 spaces per level, one space around binary operators and after

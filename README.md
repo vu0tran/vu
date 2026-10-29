@@ -335,35 +335,40 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
 
 ## Performance
 
-Measured with `bench/compare.sh` on a 2-vCPU Linux VM: median of 5, `-O3 -march=native`, each
-program's output checked against Vu's before it's timed. Seconds, lower is better.
+Measured with `bench/compare.sh` on a 2-vCPU Linux VM (Intel Xeon, 2.1 GHz) on 2026-10-29: median
+of 5, `-O3 -march=native`, each program's output checked against Vu's before it's timed. Seconds,
+lower is better. (Earlier rounds measured on another VM, where every time was higher.)
 
 | | binary-trees 20 | n-body 50M | fannkuch-redux 11 | nsieve 13 | mandelbrot 8000 (2 threads) | spectral-norm 8000 (2 threads) |
 |---|---|---|---|---|---|---|
-| C | 6.89 s, 130 MB | 3.16 s | **2.85 s** | 5.10 s | **2.84 s** | 2.45 s |
-| C, Vu's allocator | 2.73 s, 66 MB | | | | | |
-| C++ | 8.66 s, 132 MB | 4.62 s | 3.53 s | **2.55 s** | **2.84 s** | **1.82 s** |
-| Rust | 8.60 s, 130 MB | **2.81 s** | 3.26 s | 4.84 s | 2.93 s | 2.00 s |
-| Go | 18.97 s, 240 MB | 5.19 s | 3.21 s | 4.73 s | 2.93 s | 3.06 s |
-| **Vu** | **2.62 s, 66 MB** | 3.56 s | 3.14 s | 4.70 s | 3.00 s | 2.55 s |
+| C | 7.08 s, 130 MB | 2.53 s | **2.40 s** | 1.93 s | **1.75 s** | 1.97 s |
+| C, Vu's allocator | 2.78 s, 66 MB | | | | | |
+| C++ | 7.88 s, 132 MB | 3.00 s | 2.92 s | **1.42 s** | 1.80 s | 1.78 s |
+| Rust | 7.80 s, 130 MB | **2.03 s** | 2.70 s | 1.86 s | 1.82 s | 1.78 s |
+| Go | 16.04 s, 186 MB | 3.04 s | 2.80 s | 1.82 s | 1.92 s | 2.01 s |
+| **Vu** | **2.66 s, 66 MB** | 2.62 s | 2.79 s | 1.88 s | 1.84 s | **1.63 s** |
 
-- **binary-trees is an allocator result.** Vu is 2.6x faster than C that calls `malloc` and `free`
+- **binary-trees is an allocator result.** Vu is 2.7x faster than C that calls `malloc` and `free`
   per node, in half the memory, because the compiler knows when each node dies: freed nodes go on a
   free list for their type and new ones are carved from big chunks, with no runtime checks. C written
-  with that same allocator (`bench/bt_pool.c`) ties it: 2.73 s against 2.62 s. So the win is that Vu
-  does it for you, safely; it isn't faster code than C can be. (This column is from one run on
-  2026-10-28, with the pooled C added; the others are from round 11.)
-- **Every check stays on, and the rest are within 1.04–1.13x of C** (fannkuch-redux ahead of Rust
-  and Go). Vu checks every index and every Int operation, and in hot loops it makes those checks
-  cheap instead of dropping them: a loop's indexes that the loop bounds (`xs[i]`, `xs[i + 1]`,
-  `xs[0]`) are checked once before it starts, and a loop that only computes numbers runs first with
-  its checks recorded instead of stopping it, which lets the C compiler vectorize it, and again
-  checked only if one failed (details in CHANGELOG.md, round 11). That took spectral-norm from
-  3.3 s to 2.4–2.5 s, and fannkuch-redux from 3.4 s to 3.1–3.2 s. n-body asks for fused
-  multiply-add, as C's compiler does by itself: `fma(a, b, c)` gives the same result on every
-  machine, which leaving the choice to the C compiler doesn't (4.5 s to 3.6 s).
-- What's left: fannkuch-redux's flips index the list by values read from it, which no check before
-  the loop can cover (Rust pays the same). The rest of n-body's gap to C hasn't been investigated.
+  with that same allocator (`bench/bt_pool.c`) ties it: 2.78 s against 2.66 s. So the win is that Vu
+  does it for you, safely; it isn't faster code than C can be.
+- **Every check stays on, and the rest are within 1.16x of C** (nsieve slightly ahead of it), and
+  spectral-norm is ahead of all of them. Vu checks every index and every Int operation, and in hot
+  loops it makes those checks cheap instead of dropping them: a loop's indexes that the loop bounds
+  (`xs[i]`, `xs[i + 1]`, `xs[0]`) are checked once before it starts, and a loop that only computes
+  numbers runs first with its checks recorded instead of stopping it, which lets the C compiler
+  vectorize it, and again checked only if one failed (details in CHANGELOG.md, round 11). n-body
+  asks for fused multiply-add: `fma(a, b, c)` gives the same result on every machine, which leaving
+  the choice to the C compiler doesn't.
+- **Where Rust is ahead.** n-body, by 29%: the Rust program keeps its five bodies in an array whose
+  size is part of its type, so LLVM unrolls the loops over them completely and computes two
+  distances at once in vector registers. Vu's bodies are in a list, whose length isn't known until
+  the program runs, and gcc doesn't do that even for C with a fixed-size array (2.53 s). Vu's C,
+  with the count written as a constant and an unroll hint added by hand, built with clang, runs in
+  1.76 s, but clang makes binary-trees 40% and spectral-norm twice as slow, so Vu doesn't use it for
+  optimized builds. fannkuch-redux (3%), nsieve (1%) and mandelbrot (1%) are close. fannkuch-redux's
+  flips index the list by values read from it, which no check before the loop can cover.
 - nsieve's C++ version is fast because `vector<bool>` packs the sieve into bits; the others use a
   byte per number.
 - Against Python 3.13 and JavaScript on Node 22 (`bench/dyn/compare.sh`: every language pinned to one
@@ -375,11 +380,13 @@ program's output checked against Vu's before it's timed. Seconds, lower is bette
 - On HTTP, a Vu server on one core handled 121k requests/s for a minimal reply and 25.5k for a
   5.8 KB JSON order parsed and answered, against 112k and 9.5k for a raw-TCP Go server (details and
   memory in CHANGELOG.md, round 7).
-- **Rebuilds.** On a generated 20,000-line program (`bench/rebuild`, 2 cores), an edit and
-  `vu run` takes 0.83 s against 0.74 s for `cargo run`, and `vu check` 0.30 s against 0.45 s for
-  `cargo check`. Quick builds compile the program's functions in parts and keep each part, which
-  took the edit-and-run time down from 12.97 s. Optimized builds are still one C file: 9.4 s
-  against 7.1 s for `cargo build --release`.
+- **Rebuilds.** On a generated 20,000-line program (`bench/rebuild`, 2 cores, median of 3), an
+  edit and `vu run` takes 0.68 s against 0.79 s for `cargo run`, a first `vu run` 4.32 s against
+  5.16 s, and `vu check` 0.32 s against 0.50 s for `cargo check`. Builds are compiled in parts,
+  in parallel, and each part is kept, so an optimized rebuild after an edit takes 3.2 s against
+  14.1 s for `cargo build --release`. Vu still loses the first optimized build, 29.6 s against
+  14.3 s (gcc takes about twice as long on Vu's C as rustc on the Rust), and a first build
+  for a debugger, 6.4 s against 5.7 s.
 
 ## Built for the model that writes it
 

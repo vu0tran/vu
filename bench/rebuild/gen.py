@@ -43,13 +43,13 @@ for k in range(m):
         f.write("\n".join(rs_fn(k, i) for i in range(per)))
 # main sums every function of the last module
 with open(os.path.join(vu, "main.vu"), "w") as f:
-    f.write("import m%d\n\nfn main():\n  var t = 0\n" % (m - 1))
-    for i in range(per): f.write("  t += m%d.f%d_%d(%d, \"abcd\")\n" % (m - 1, m - 1, i, i))
+    f.write("import m%d\n\nfn main():\n  let base = arg(1, 0)\n  var t = 0\n" % (m - 1))
+    for i in range(per): f.write("  t += m%d.f%d_%d(base + %d, \"abcd\")\n" % (m - 1, m - 1, i, i))
     f.write("  print(\"{t}\")\n")
 with open(os.path.join(rs, "src", "main.rs"), "w") as f:
     for k in range(m): f.write("mod m%d;\n" % k)
-    f.write("\nfn main() {\n    let mut t: i64 = 0;\n")
-    for i in range(per): f.write("    t += m%d::f%d_%d(%d, \"abcd\");\n" % (m - 1, m - 1, i, i))
+    f.write("\nfn main() {\n    let base: i64 = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(0);\n    let mut t: i64 = 0;\n")
+    for i in range(per): f.write("    t += m%d::f%d_%d(base + %d, \"abcd\");\n" % (m - 1, m - 1, i, i))
     f.write("    println!(\"{}\", t);\n}\n")
 with open(os.path.join(rs, "Cargo.toml"), "w") as f:
     f.write('[package]\nname = "gen"\nversion = "0.1.0"\nedition = "2021"\n\n[profile.release]\nincremental = false\n')

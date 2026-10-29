@@ -1433,7 +1433,7 @@ fn shq(s: Str) -> Str:
 # first #line names, in order, and cut into parts of about 6,000 lines of C (on bench/rebuild,
 # 3,000 made the first build 18% slower and a rebuild 13% faster). A change to one function then
 # changes only its part's C.
-fn split_parts(rest: Str) -> [Str]:
+fn split_parts(rest: Str, size: Int) -> [Str]:
   var keys: [Str] = []
   var groups: [Str] = []
   for f in rest.split("\n/* vu-part */\n"):
@@ -1458,9 +1458,9 @@ fn split_parts(rest: Str) -> [Str]:
     var n = 0
     for f in g.split("\n/* vu-part */\n"):
       if f == "": continue
-      cur += f + "\n"
+      cur += "\n/* vu-part */\n" + f + "\n"
       n += f.count("\n")
-      if n >= 6000:
+      if n >= size:
         parts.push(cur)
         cur = ""
         n = 0
@@ -1485,8 +1485,20 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
     if argl[k].startswith("-I"): cflags.push(argl[k] + "")
     k += 1
   let at = csrc.find("\n/* vu-parts */\n", 0)
-  let head = csrc[0..at + 1]
-  let parts = split_parts(csrc[at + 15..csrc.len])
+  var head = csrc[0..at + 1]
+  var parts: [Str] = []
+  # (a tried copy, VU_FNI: static inline, so it goes in the header for every part to inline)
+  # (parts of about 3,000 lines for a quick build, where a rebuild compiles one; 6,000 for an
+  # optimized one, where a part's fixed cost is larger)
+  var size = 6000
+  for a in cflags:
+    if a == "-O0": size = 3000
+  for p in split_parts(csrc[at + 15..csrc.len], size):
+    var rest = ""
+    for f in p.split("\n/* vu-part */\n"):
+      if f.startswith("VU_FNI "): head += f + "\n"
+      elif f != "": rest += "\n/* vu-part */\n" + f
+    if rest != "": parts.push(rest)
   let ncpu = int((os.output(["getconf", "_NPROCESSORS_ONLN"]) else "1").strip()) else 1
   var home = os.env("XDG_CACHE_HOME")
   if home == "" and os.env("HOME") != "": home = os.env("HOME") + "/.cache"
@@ -1502,11 +1514,29 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
   fs.write(pdir + "/head.h", head) else 0
   var objs: [Str] = []
   var jobs = 0
+  let hkey = sha256(fkey + "\n" + head).hex() + "\n"   # (the header and options, hashed once)
   let tag = random_bytes(6).hex()
+  # clang: the header compiled once (a precompiled header, kept with the parts) for every part but
+  # part 0, instead of parsed by each
+  let cc0 = cflags[0][find_last(cflags[0], "/") + 1..cflags[0].len]
+  var pch = ""
+  if cc0.find("clang", 0) >= 0 and parts.len > 0:
+    pch = slot + "/head-" + hkey[0..24] + ".pch"
+    if not fs.exists(pch):
+      # (the header stays next to it: clang checks the file a precompiled header was made from)
+      let ph = slot + "/head-" + hkey[0..24] + ".h"
+      fs.write(ph, head) else 0
+      var pc = copy_strs(cflags)
+      for a in ["-DVU_PART", "-x", "c-header", ph, "-o", pch + "." + tag]: pc.push(a)
+      if (os.run(pc) else 1) == 0: fs.rename(pch + "." + tag, pch) else 0
+      else:
+        fs.remove(pch + "." + tag) else 0
+        pch = ""
   for i in 0..parts.len + 1:
     var src = "#define VU_PART0 1\n#include \"head.h\"\n"
-    if i > 0: src = "#define VU_PART 1\n#include \"head.h\"\n" + parts[i - 1]
-    let obj = slot + "/" + sha256(fkey + "\n" + head + "\n" + src).hex()[0..40] + ".o"
+    if i > 0 and pch != "": src = "/* after the precompiled header */\n" + parts[i - 1]
+    elif i > 0: src = "#define VU_PART 1\n#include \"head.h\"\n" + parts[i - 1]
+    let obj = slot + "/" + sha256(hkey + src).hex()[0..40] + ".o"
     objs.push(obj)
     if fs.exists(obj): continue
     let c = pdir + "/p{i}.c"
@@ -1514,6 +1544,7 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
     var cmd = ""
     for a in cflags: cmd += shq(a) + " "
     let tmp = obj + "." + tag
+    if i > 0 and pch != "": cmd += "-DVU_PART -include-pch " + shq(pch) + " "
     cmd += "-c " + shq(c) + " -o " + shq(tmp) + " && mv " + shq(tmp) + " " + shq(obj)
     fs.write(pdir + "/job{i}.sh", cmd + "\n") else 0
     jobs += 1
@@ -1535,7 +1566,7 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
   let have = fs.list(slot) else []
   if have.len > 2 * objs.len + 8:
     for n in have:
-      var used = n == "info"
+      var used = n == "info" or (pch != "" and (pch.endswith("/" + n) or (pch[0..pch.len - 4] + ".h").endswith("/" + n)))
       for o in objs:
         if o.endswith("/" + n): used = true
       if not used: fs.remove(slot + "/" + n) else 0
@@ -1911,7 +1942,10 @@ fn main(fs: Fs, os: Os):
     argl.push("-O0")
     # (debugging information for a debugger with --debug; vu run's binary is gone after the run, and
     # its panics' backtraces come from the shadow call stack)
-    if debug: argl.push("-g")
+    if debug:
+      argl.push("-g")
+      # (clang: type information only where it's used, a third less time on Vu's C)
+      if cc == "clang": argl.push("-fno-standalone-debug")
     argl.push("-DVU_TRACE")
   else:
     argl.push("-O3")
@@ -1980,7 +2014,7 @@ fn main(fs: Fs, os: Os):
   # each part is kept (see split_build). VU_SPLIT=always splits any program, VU_SPLIT=off none.
   var split = false
   let smode = os.env("VU_SPLIT")
-  if quick and not has_ext and not lib and not wasm and emit_c == "" and not san and not san_pool and not tsan and smode != "off":
+  if not has_ext and not lib and not wasm and emit_c == "" and not san and not san_pool and not tsan and not profile and smode != "off":
     let pat = csrc.find("\n/* vu-parts */\n", 0)
     if pat >= 0 and (smode == "always" or csrc[pat..csrc.len].count("\n") >= 6000): split = true
   # VU_CACHE=dir keeps each binary under the SHA-256 of everything it's made from (the C, the C

@@ -45,17 +45,18 @@ extern char **environ;
    C files, in parallel, and keeps each one's object file) includes this runtime in every part.
    VU_PART0 is the part that holds the runtime's state (VU_G) and main; the other parts (VU_PART) see
    that state through extern declarations, and the program's functions (VU_FN) are shared between
-   all of them. A program built as one file has static state and static functions. */
+   all of them. The tried copies of functions (VU_FNI, small and meant to be inlined into the loops
+   that call them) are in the header, so every part has its own. A program built as one file has static state and static functions. */
 #if defined(VU_PART)
 #define VU_G extern __attribute__((visibility("hidden")))
 #define VU_GI(...)
 #define VU_FN __attribute__((visibility("hidden")))
-#define VU_FNI __attribute__((visibility("hidden")))
+#define VU_FNI static inline
 #elif defined(VU_PART0)
 #define VU_G __attribute__((visibility("hidden")))
 #define VU_GI(...) = __VA_ARGS__
 #define VU_FN __attribute__((visibility("hidden")))
-#define VU_FNI __attribute__((visibility("hidden")))
+#define VU_FNI static inline
 #else
 #define VU_G static
 #define VU_GI(...) = __VA_ARGS__
@@ -572,6 +573,9 @@ static void vu_str_cat_int(vu_str *s, long long v) {
     vu_str_cat_bytes(s, (const uint8_t *)p, (int64_t)(b + sizeof b - p));
 }
 static vu_str vu_str_concat(const vu_str *a, const vu_str *b) {
+    /* static text (cap 0) plus nothing is the same static text: no copy (s + "" copies a Str) */
+    if (b->len == 0 && a->cap == 0) return *a;
+    if (a->len == 0 && b->cap == 0) return *b;
     vu_str r = {0};
     vu_str_reserve(&r, a->len + b->len);
     vu_str_cat_bytes(&r, a->data, a->len);
