@@ -61,7 +61,7 @@ static int epoll_wait(int ep, struct epoll_event *out, int max, int timeout_ms) 
     }
     return n;
 }
-static int vu_efd_w[65536];   /* an eventfd's stand-in: the write end of the pipe whose read end it is */
+VU_G int vu_efd_w[65536];   /* an eventfd's stand-in: the write end of the pipe whose read end it is */
 static void vu_fd_flags(int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -196,21 +196,21 @@ struct vu_loop {
     vu_task *qhead, *qtail;
     int64_t nready;
 };
-static int vu_nsleeping;          /* loops asleep in epoll_wait (that could take work)*/
-static vu_loop vu_loops[VU_MAX_LOOPS];
-static int vu_nloops;             /* 1 + the worker threads, once tasks are in use */
-static bool vu_workers_started;
-static uint32_t vu_next_loop;
-static int64_t vu_nactive;        /* tasks that can still run: every task not waiting forever on a channel */
-static int vu_last_wait_line;
-static __thread vu_loop *vu_my;
-static __thread vu_task vu_base_task;   /* the thread's own context */
-static __thread vu_task *vu_cur_task, *vu_dead;
-static __thread vu_task **vu_heap;
-static __thread int64_t vu_nheap, vu_capheap, vu_polls;
-static __thread char *vu_stack_pool[16];
-static __thread int vu_nstack_pool;
-static __thread uint8_t vu_iobuf[65536];
+VU_G int vu_nsleeping;          /* loops asleep in epoll_wait (that could take work)*/
+VU_G vu_loop vu_loops[VU_MAX_LOOPS];
+VU_G int vu_nloops;             /* 1 + the worker threads, once tasks are in use */
+VU_G bool vu_workers_started;
+VU_G uint32_t vu_next_loop;
+VU_G int64_t vu_nactive;        /* tasks that can still run: every task not waiting forever on a channel */
+VU_G int vu_last_wait_line;
+VU_G __thread vu_loop *vu_my;
+VU_G __thread vu_task vu_base_task;   /* the thread's own context */
+VU_G __thread vu_task *vu_cur_task, *vu_dead;
+VU_G __thread vu_task **vu_heap;
+VU_G __thread int64_t vu_nheap, vu_capheap, vu_polls;
+VU_G __thread char *vu_stack_pool[16];
+VU_G __thread int vu_nstack_pool;
+VU_G __thread uint8_t vu_iobuf[65536];
 
 static int64_t vu_now_ns(void) {
     struct timespec ts;
@@ -522,9 +522,9 @@ static __attribute__((noreturn, cold)) void vu_deadlock(int line) {
 /* -- sockets freed while another thread's poller may still hold an event for them: freed once every
    poller has finished the batch it was handling (each counts its batches in epoch). */
 typedef struct vu_retired { struct vu_retired *next; void *p; int n; int64_t epochs[]; } vu_retired;
-static pthread_mutex_t vu_retire_lock = PTHREAD_MUTEX_INITIALIZER;
-static vu_retired *vu_retired_list;
-static int64_t vu_nretired;
+VU_G pthread_mutex_t vu_retire_lock VU_GI(PTHREAD_MUTEX_INITIALIZER);
+VU_G vu_retired *vu_retired_list;
+VU_G int64_t vu_nretired;
 static void vu_retire(void *p) {
     int n = __atomic_load_n(&vu_nloops, __ATOMIC_ACQUIRE);
     vu_retired *r = (vu_retired *)vu_malloc(sizeof *r + (size_t)n * sizeof(int64_t));
@@ -869,7 +869,7 @@ static void vu_chan_release(vu_chan **p) {
     free(c->buf);
     free(c);
 }
-static vu_chan *vu_sig_chan;   /* os.signals(): a signal, not a task, can wake its receivers */
+VU_G vu_chan *vu_sig_chan;   /* os.signals(): a signal, not a task, can wake its receivers */
 /* With c locked: waits on the list at head until woken (or the deadline passes); c is locked again after. */
 static void vu_chan_wait(vu_chan *c, vu_task **head, int64_t deadline, int line) {
     vu_task *t = vu_cur_task;
@@ -985,8 +985,8 @@ static void vu_chan_offer(vu_chan *c, const void *v) {
 /* -- os.signals(): SIGTERM, SIGINT and SIGHUP arrive on a channel, as "TERM", "INT" and "HUP", instead of
    ending the program, so that a server can finish what it's doing and stop. The handler only writes
    the signal's number to a pipe; a thread of its own reads it and puts the name on the channel. */
-static int vu_sig_pipe[2] = {-1, -1};
-static pthread_mutex_t vu_sig_lock = PTHREAD_MUTEX_INITIALIZER;
+VU_G int vu_sig_pipe[2] VU_GI({-1, -1});
+VU_G pthread_mutex_t vu_sig_lock VU_GI(PTHREAD_MUTEX_INITIALIZER);
 static void vu_sig_handler(int sig) {
     int e = errno;
     unsigned char b = (unsigned char)sig;
@@ -1392,15 +1392,15 @@ static long vu_bio_ctrl(BIO *b, int cmd, long num, void *ptr) {
     return cmd == BIO_CTRL_FLUSH ? 1 : 0;
 }
 static int vu_bio_create(BIO *b) { BIO_set_init(b, 1); return 1; }
-static BIO_METHOD *vu_bio_method;
-static SSL_CTX *vu_tls_system;   /* clients that trust the system's certificates share one context */
-static pthread_once_t vu_tls_once = PTHREAD_ONCE_INIT;
-static int vu_alpn_index = -1;   /* a context's ALPN list (ex_data), freed with the context */
+VU_G BIO_METHOD *vu_bio_method;
+VU_G SSL_CTX *vu_tls_system;   /* clients that trust the system's certificates share one context */
+VU_G pthread_once_t vu_tls_once VU_GI(PTHREAD_ONCE_INIT);
+VU_G int vu_alpn_index VU_GI(-1);   /* a context's ALPN list (ex_data), freed with the context */
 static void vu_alpn_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad, int idx, long argl, void *argp) {
     (void)parent; (void)ad; (void)idx; (void)argl; (void)argp;
     free(ptr);
 }
-static pthread_mutex_t vu_tls_lock = PTHREAD_MUTEX_INITIALIZER;
+VU_G pthread_mutex_t vu_tls_lock VU_GI(PTHREAD_MUTEX_INITIALIZER);
 static void vu_tls_init(void) {
     /* no cleanup at exit: other task threads may still be using TLS when main returns */
     OPENSSL_init_ssl(OPENSSL_INIT_NO_ATEXIT, NULL);
@@ -1762,7 +1762,7 @@ static vu_str vu_net_protocol(vu_cap net, void *c) {
    (or see it closed), put one in, see a channel closed, see data on a connection (or its end). */
 #include <poll.h>
 enum { VU_SEL_RECV, VU_SEL_SEND, VU_SEL_CLOSED, VU_SEL_READABLE, VU_SEL_OFF };
-static __thread uint64_t vu_sel_rng;
+VU_G __thread uint64_t vu_sel_rng;
 static uint64_t vu_rand_u64(void) {
     uint64_t x = vu_sel_rng ? vu_sel_rng : (uint64_t)(uintptr_t)&vu_sel_rng ^ (uint64_t)vu_now_ns();
     x ^= x << 13; x ^= x >> 7; x ^= x << 17;

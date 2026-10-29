@@ -375,6 +375,11 @@ program's output checked against Vu's before it's timed. Seconds, lower is bette
 - On HTTP, a Vu server on one core handled 121k requests/s for a minimal reply and 25.5k for a
   5.8 KB JSON order parsed and answered, against 112k and 9.5k for a raw-TCP Go server (details and
   memory in CHANGELOG.md, round 7).
+- **Rebuilds.** On a generated 20,000-line program (`bench/rebuild`, 2 cores), an edit and
+  `vu run` takes 0.83 s against 0.74 s for `cargo run`, and `vu check` 0.30 s against 0.45 s for
+  `cargo check`. Quick builds compile the program's functions in parts and keep each part, which
+  took the edit-and-run time down from 12.97 s. Optimized builds are still one C file: 9.4 s
+  against 7.1 s for `cargo build --release`.
 
 ## Built for the model that writes it
 

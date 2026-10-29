@@ -2262,3 +2262,44 @@ cores). Its test matches pure Python on 6,001 answers with accents, CJK and emoj
 installs it into a fresh venv with pip and runs the test. The first version decoded UTF-8 with
 `.chars()`, which makes a Str per character; decoding the bytes by hand made `closest()` 1.7 times
 faster (56.5 ms to 32.6).
+
+Rebuild times against Rust (`bench/rebuild`): `gen.py` writes the same program in Vu and Rust, N
+functions in M modules, and `run.sh` times a clean build and a rebuild after a one-line edit (the
+median of 3, on 2 cores, with gcc 13.3, clang 18.1 and rustc 1.97). At 2,000 functions (20,000 lines
+of Vu, 24,000 of Rust), Vu lost badly at first. An edit and a quick build took 12.97 s, against 0.85 s
+for `cargo build`: Vu compiles the whole program as one C file, and Rust compiles incrementally. Three
+changes:
+
+- Quick builds use clang when it's there. On this program's 131,000 lines of C, clang -O0 takes
+  3.4 s and gcc -O0 10.2 s. `vu run` also stopped passing `-g`, which cost clang another 4 s: its
+  binary is deleted after the run, and panics get their backtraces from the shadow call stack.
+  `vu build --debug` keeps `-g`. An edit and `vu run` then took 4.48 s.
+- Split builds. A quick build of a program with more than about 6,000 lines of C in its functions
+  compiles them as separate C files, grouped by source file into parts of about 6,000 lines, as
+  many at once as there are cores. It keeps each part's object file under the hash of its C, so a
+  rebuild compiles only the parts that changed. This needed two changes. The runtime's state
+  (61 globals, among them the node pools' free lists) is now written `VU_G`: static in a one-file
+  build, defined in part 0 and declared `extern` in the others. And temporaries are numbered within
+  each function, not across the program, so an edit leaves the other functions' C as it was.
+- After both: an edit and `vu run` takes 0.83 s, against 0.74 s for `cargo run`. The first build
+  takes 4.66 s for both. `vu check` takes 0.30 s against `cargo check`'s 0.45 s. Optimized builds
+  are unchanged and still lose: 9.4 s against 7.1 s.
+
+`tests/run_split.sh` checks split builds. It builds every targeted test that runs, and every
+example (about 400 programs), both split (`VU_SPLIT=always`) and as one file, and compares their
+output, exit code and stderr. It also builds the compiler split (5 to 7 s), checks that no part
+defines writable data of its own, checks that the split-built compiler writes the same C as the
+installed one, and checks that an edit rebuilds the compiler in about 1.1 s. `compiler/build.sh` now
+builds stage 1 split, so every rebuild of the compiler goes through a split build.
+
+What testing split builds found:
+- The split markers first appeared in the compiler's own string literals (it writes them), and a
+  split of the compiler's C broke a string in half. They are now whole lines, which a C string
+  can't be.
+- `vu_files` (the names panics print) was declared `static const char *const *`, so the rewrite to
+  `VU_G` skipped it as a constant. The duplicate-data check found it. The first comparison had looked
+  only at the first line of stderr, so it missed the wrong file names that only part 0 could print;
+  it now compares all of stderr.
+- The compiler that has split builds builds itself, so a bug in them stops the next build. The first
+  version declared `vu_main` twice (`VU_FN` and `static`). `VU_SPLIT=off compiler/build.sh` got past
+  it.

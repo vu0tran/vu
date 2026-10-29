@@ -41,16 +41,37 @@ static ssize_t getrandom(void *buf, size_t n, unsigned flags) {
 #include <dirent.h>
 #include <sys/stat.h>
 extern char **environ;
-static int vu_argc;
-static char **vu_argv;
+/* A split build (quick builds of big programs: vu run compiles the program's functions as several
+   C files, in parallel, and keeps each one's object file) includes this runtime in every part.
+   VU_PART0 is the part that holds the runtime's state (VU_G) and main; the other parts (VU_PART) see
+   that state through extern declarations, and the program's functions (VU_FN) are shared between
+   all of them. A program built as one file has static state and static functions. */
+#if defined(VU_PART)
+#define VU_G extern __attribute__((visibility("hidden")))
+#define VU_GI(...)
+#define VU_FN __attribute__((visibility("hidden")))
+#define VU_FNI __attribute__((visibility("hidden")))
+#elif defined(VU_PART0)
+#define VU_G __attribute__((visibility("hidden")))
+#define VU_GI(...) = __VA_ARGS__
+#define VU_FN __attribute__((visibility("hidden")))
+#define VU_FNI __attribute__((visibility("hidden")))
+#else
+#define VU_G static
+#define VU_GI(...) = __VA_ARGS__
+#define VU_FN static
+#define VU_FNI static inline
+#endif
+VU_G int vu_argc;
+VU_G char **vu_argv;
 /* Where a panic happened. A location is (file index << 24) | line; vu_files names the files.
    Quick builds (vu run, --debug) define VU_TRACE: every function then keeps a frame on a per-thread
    shadow stack holding the line it is running, so a panic can print the whole chain of calls.
    Optimized builds compile VU_ENTER and VU_AT away and report only the panic's own line. */
-static const char *const *vu_files;
-static bool vu_json;   /* report panics as JSON (vu run --json, or VU_PANIC=json at run time) */
+VU_G const char *const *vu_files;
+VU_G bool vu_json;   /* report panics as JSON (vu run --json, or VU_PANIC=json at run time) */
 typedef struct vu_frame { const char *name; int loc; struct vu_frame *prev; } vu_frame;
-static __thread vu_frame *vu_top;
+VU_G __thread vu_frame *vu_top;
 static inline void vu_leave(vu_frame *f) { vu_top = f->prev; }
 #if defined(VU_TRACE) && defined(VU_PROF)
 /* (the profiler's signal handler reads the frames: each must be complete before vu_top points at it,
@@ -73,8 +94,8 @@ static inline void vu_leave_prof(vu_frame *f) { __asm__ volatile("" ::: "memory"
 #define VU_PAR_JOIN(t) ((void)0)
 #endif
 /* The report is built with write() only, so the stack-overflow signal handler can use it too. */
-static char vu_pbuf[4096];
-static size_t vu_plen;
+VU_G char vu_pbuf[4096];
+VU_G size_t vu_plen;
 static void vu_pflush(void) {
     size_t at = 0;
     while (at < vu_plen) { ssize_t w = write(2, vu_pbuf + at, vu_plen - at); if (w <= 0) break; at += (size_t)w; }
@@ -132,8 +153,8 @@ static const char *vu_file_of(int loc) { return vu_files ? vu_files[loc >> 24] :
 static void vu_ploc(int loc) { vu_pstr(vu_file_of(loc)); vu_pput(":", 1); vu_pint(loc & 0xFFFFFF); }
 /* One report at a time. A thread that panics while another is reporting waits for the process to
    exit; the thread already reporting (re-entered by a signal) carries on. */
-static uintptr_t vu_reporter;
-static __thread char vu_tid;   /* its address identifies the thread */
+VU_G uintptr_t vu_reporter;
+VU_G __thread char vu_tid;   /* its address identifies the thread */
 static void vu_report_lock(void) {
     uintptr_t me = (uintptr_t)&vu_tid, expected = 0;
     if (__atomic_compare_exchange_n(&vu_reporter, &expected, me, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
@@ -409,7 +430,7 @@ static const char *vu_shortest(double v, char *buf) {
 static inline double vu_nan_plain(double v) { return isnan(v) ? __builtin_nan("") : v; }
 static void *vu_malloc(size_t n) { void *p = malloc(n); if (!p) vu_oom(); return p; }
 /* Each thread carves tree nodes from its own blocks and keeps its own free lists, so no locking is needed. */
-static __thread char *vu_cur, *vu_end;
+VU_G __thread char *vu_cur, *vu_end;
 static void *vu_bump(size_t n) {
     n = (n + 15) & ~(size_t)15;
     if (!vu_cur || (size_t)(vu_end - vu_cur) < n) {
@@ -445,8 +466,8 @@ typedef struct { uint8_t *data; int64_t len, cap; } vu_str;
 #ifndef VU_SKEEP
 #define VU_SKEEP 4096
 #endif
-static __thread void *vu_sfree[5];
-static __thread int32_t vu_snum[5];
+VU_G __thread void *vu_sfree[5];
+VU_G __thread int32_t vu_snum[5];
 static inline int vu_sclass(int64_t c) { return c <= 16 ? 0 : c <= 32 ? 1 : c <= 64 ? 2 : c <= 128 ? 3 : c <= 256 ? 4 : -1; }
 /* A buffer of at least *cap bytes; *cap becomes its real size. */
 static inline uint8_t *vu_salloc(int64_t *cap) {
@@ -649,13 +670,13 @@ static void vu_print_ln(const uint8_t *p, int64_t n) {
 /* Freeing nested values (nodes that own nodes, lists that own lists) goes through a per-thread
    to-do list worked by a loop, so however deep the nesting, the C stack stays shallow. */
 typedef struct { void (*fn)(void *, int64_t); void *p; int64_t n; } vu_job;
-static __thread vu_job vu_jobs_small[64];
-static __thread vu_job *vu_jobs;
-static __thread int64_t vu_njobs, vu_capjobs;
-static __thread int vu_draining;
+VU_G __thread vu_job vu_jobs_small[64];
+VU_G __thread vu_job *vu_jobs;
+VU_G __thread int64_t vu_njobs, vu_capjobs;
+VU_G __thread int vu_draining;
 /* Shallow nesting is freed by direct calls (fast); past this depth the to-do list takes over. */
 #define VU_MAX_DROP_DEPTH 1000
-static __thread int vu_drop_depth;
+VU_G __thread int vu_drop_depth;
 __attribute__((noinline, cold)) static void vu_defer(void (*fn)(void *, int64_t), void *p, int64_t n) {
     if (!vu_jobs) { vu_jobs = vu_jobs_small; vu_capjobs = 64; }
     if (vu_njobs == vu_capjobs) {
@@ -949,13 +970,13 @@ VU_PICK_FN(vu_pick_str, vu_str, VU_LT_STR)
 
 /* Map hashing: SipHash-1-3 with a random key per run, so an attacker who controls the keys can't
    make them all collide (hash flooding). Iteration order is insertion order, so it doesn't leak. */
-static uint64_t vu_sip_k0, vu_sip_k1;
+VU_G uint64_t vu_sip_k0, vu_sip_k1;
 /* Deep recursion runs into the guard page below the stack. Like Rust, catch that on a separate
    signal stack and stop with a clear message (exit 101) instead of dying from a bare signal. */
-static uintptr_t vu_stack_top, vu_stack_size;
-static __thread uintptr_t vu_t_lo, vu_t_hi;   /* this par worker's stack, once guarded */
-static __thread void *vu_t_alt;
-static __thread bool vu_t_guarded;
+VU_G uintptr_t vu_stack_top, vu_stack_size;
+VU_G __thread uintptr_t vu_t_lo, vu_t_hi;   /* this par worker's stack, once guarded */
+VU_G __thread void *vu_t_alt;
+VU_G __thread bool vu_t_guarded;
 __attribute__((cold, noinline)) static void vu_thread_guard_slow(void) {
     vu_t_guarded = true;
 #ifndef VU_WASI
@@ -989,7 +1010,7 @@ __attribute__((cold, noinline)) static void vu_thread_guard_slow(void) {
    thread, whose lists never hold more nodes than were once alive at the same time.) */
 #define VU_TAKE 1024
 typedef struct vu_pool { void (*give)(void); struct vu_pool *next; } vu_pool;
-static vu_pool *vu_pools;   /* every node type's pool, linked at startup */
+VU_G vu_pool *vu_pools;   /* every node type's pool, linked at startup */
 static void vu_share_free(void) { for (vu_pool *p = vu_pools; p; p = p->next) p->give(); }
 static inline void vu_thread_guard(void) {
     if (__builtin_expect(!vu_t_guarded, 0)) vu_thread_guard_slow();
@@ -1008,7 +1029,7 @@ static void vu_guard_init(void *top) { vu_stack_top = (uintptr_t)top; }
 #endif
 #endif
 #ifdef VU_ASAN
-static struct sigaction vu_asan_segv, vu_asan_bus;   /* AddressSanitizer's handlers, from before ours */
+VU_G struct sigaction vu_asan_segv, vu_asan_bus;   /* AddressSanitizer's handlers, from before ours */
 #endif
 static void vu_segv(int sig, siginfo_t *si, void *ctx) {
     (void)sig; (void)ctx;
@@ -1054,7 +1075,7 @@ static void vu_guard_init(void *top) {
    as parsers and compilers works; recursion past that still stops cleanly with "stack overflow". */
 #define VU_MAIN_STACK ((size_t)256 << 20)
 static int (*vu_main_fn)(void);
-static int vu_main_rc;
+VU_G int vu_main_rc;
 static void vu_thread_guard(void);
 /* The main thread exits the process itself, while it's still alive: its thread-local free lists then
    still count as reachable for LeakSanitizer. */
@@ -1070,10 +1091,10 @@ static void vu_thread_guard(void);
 #define VU_PROF_DEPTH 40
 #define VU_PROF_MAX 65536
 typedef struct { const char *name; int loc; } vu_pf;
-static vu_pf *vu_prof_rows;
-static unsigned char *vu_prof_depth;
-static int vu_prof_taken;
-static int vu_prof_hz = 1000;
+VU_G vu_pf *vu_prof_rows;
+VU_G unsigned char *vu_prof_depth;
+VU_G int vu_prof_taken;
+VU_G int vu_prof_hz VU_GI(1000);
 static void vu_prof_tick(int sig) {
     (void)sig;
     int saved = errno;

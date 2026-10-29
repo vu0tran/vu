@@ -49,6 +49,13 @@ fn gen_extern(var g: G, items: [Node], name: Str):
     lines.push("    return r;")
   g.bodies.push(join(lines, "\n"))
 
+# A function of the program, as C declares it: static in a program built as one C file, shared
+# between the parts of a split build (VU_FN and VU_FNI in the runtime).
+fn vis(sig: Str) -> Str:
+  if sig.startswith("static inline "): return "VU_FNI " + sig[14..sig.len]
+  if sig.startswith("static "): return "VU_FN " + sig[7..sig.len]
+  return sig
+
 # export fn f: the C function f, in C's terms. A Str arrives as (const char *, int64_t length; a
 # negative length: up to the NUL), a list as (const T *, int64_t count), both borrowed for the call. A
 # Str or list result is a malloc'd copy (a Str's with a NUL after it) and its length in *vu_out_len
@@ -195,6 +202,7 @@ fn gen_fn(var g: G, items: [Node], name: Str):
   gen_fn_node(&g, items[ii], name)
 
 fn gen_fn_node(var g: G, node: Node, name: Str):
+  g.tmpn = 0   # (temporaries are numbered within a function, so a change to one leaves the others' C as it was)
   let params = copy_params(g.fns[name].params)
   let ret = g.fns[name].ret
   g.lines = []
@@ -596,9 +604,9 @@ fn build(var g: G, items: [Node]) -> Str:
   for k in 1..nlam + 1:
     if k in g.lam_drops: out.push(g.lam_drops[k] + "")
   for sig in g.sigs:
-    if starts_with(sig, "static") and sig != "static int vu_main(void)": out.push(sig + ";")
+    if starts_with(sig, "static"): out.push(vis(sig) + ";")
   for k in 1..nlam + 1:
-    if k in g.lam_sigs: out.push(g.lam_sigs[k] + ";")
+    if k in g.lam_sigs: out.push(vis(g.lam_sigs[k]) + ";")
   for tname in g.thunks:
     let tps = copy_params(g.fns[tname].params)
     var r = ct(g, g.fns[tname].ret)
@@ -614,7 +622,7 @@ fn build(var g: G, items: [Node]) -> Str:
   for t in g.types:
     if tkind(g, t) == "iface":
       for line in iface_code(g, t): out.push(line)
-  out.push("static int vu_main(void);")
+  if g.fns["main"].fails: out.push("static int vu_main(void);")   # (else main's own declaration above)
   for sname in g.spawned:
     # spawn name(...): the arguments travel to the new task in a block it frees
     let ps = copy_params(g.fns[sname].params)
@@ -726,14 +734,20 @@ fn build(var g: G, items: [Node]) -> Str:
     w += "    }}\n"
     w += "    return 0;\n}}"
     out.push(w)
+  out.push("#ifndef VU_PART")
   out.push("int main(int argc, char **argv) {{ return vu_start(argc, argv, vu_main, vu_file_names); }}")
+  out.push("#endif")
+  # (a split build compiles what follows in parts: each function's definition starts with a marker)
+  out.push("/* vu-parts */")
   for i in 0..g.sigs.len:
-    out.push(g.sigs[i] + " {{")
+    out.push("/* vu-part */")
+    out.push(vis(g.sigs[i]) + " {{")
     if g.bodies[i] != "": out.push(g.bodies[i])
     out.push("}}")
   for k in 1..nlam + 1:
     if k in g.lam_sigs:
-      out.push(g.lam_sigs[k] + " {{")
+      out.push("/* vu-part */")
+      out.push(vis(g.lam_sigs[k]) + " {{")
       out.push(g.lam_bodies[k] + "")
       out.push("}}")
   # export fn: the C functions (vu build --lib), and their declarations for the header, in a comment
@@ -1385,6 +1399,156 @@ fn fail_early(path: Str, json: Bool, line: Int, msg: Str):
   else: eprint("vu: " + msg)
 
 
+# ---- split builds
+
+fn shq(s: Str) -> Str:
+  return "'" + s.replace("'", "'\\''") + "'"
+
+# The parts of a split build: the program's functions (after the line /* vu-parts */, each behind a
+# line /* vu-part */: a whole line, so never inside a C string), grouped by the source file their
+# first #line names, in order, and cut into parts of about 6,000 lines of C (on bench/rebuild,
+# 3,000 made the first build 18% slower and a rebuild 13% faster). A change to one function then
+# changes only its part's C.
+fn split_parts(rest: Str) -> [Str]:
+  var keys: [Str] = []
+  var groups: [Str] = []
+  for f in rest.split("\n/* vu-part */\n"):
+    if f.strip() == "": continue
+    var key = ""
+    let li = f.find("#line ", 0)
+    if li >= 0:
+      let q = f.find("\"", li)
+      let nl = f.find("\n", li)
+      if q >= 0 and (nl < 0 or q < nl): key = f[q..nl]
+    var k = -1
+    for j in 0..keys.len:
+      if keys[j] == key: k = j
+    if k < 0:
+      keys.push(key)
+      groups.push("")
+      k = keys.len - 1
+    groups[k] += "\n/* vu-part */\n" + f
+  var parts: [Str] = []
+  for g in groups:
+    var cur = ""
+    var n = 0
+    for f in g.split("\n/* vu-part */\n"):
+      if f == "": continue
+      cur += f + "\n"
+      n += f.count("\n")
+      if n >= 6000:
+        parts.push(cur)
+        cur = ""
+        n = 0
+    if cur != "": parts.push(cur)
+  return parts
+
+# A split build (quick builds of big programs): the parts are compiled as separate C files, as many
+# at once as there are cores, and each part's object file is kept, under the hash of its C and the
+# options, in $XDG_CACHE_HOME/vu/parts (or ~/.cache/vu/parts), one folder per program and options.
+# A rebuild after an edit compiles only the parts that changed. Returns the C compiler's exit code.
+fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, out: Str, work: Str) -> Int:
+  var cflags: [Str] = []
+  var lflags: [Str] = []
+  var k = 0
+  while k < argl.len and argl[k] != cfile:
+    cflags.push(argl[k] + "")
+    k += 1
+  k += 3   # (the C file, -o, the output)
+  while k < argl.len:
+    lflags.push(argl[k] + "")
+    k += 1
+  let at = csrc.find("\n/* vu-parts */\n", 0)
+  let head = csrc[0..at + 1]
+  let parts = split_parts(csrc[at + 15..csrc.len])
+  let ncpu = int((os.output(["getconf", "_NPROCESSORS_ONLN"]) else "1").strip()) else 1
+  var home = os.env("XDG_CACHE_HOME")
+  if home == "" and os.env("HOME") != "": home = os.env("HOME") + "/.cache"
+  var abs = path + ""
+  if not abs.startswith("/"): abs = (os.output(["pwd"]) else "").strip() + "/" + path
+  let fkey = join(cflags, "\n")
+  var slot = work + "/objects"
+  if home != "": slot = home + "/vu/parts/" + sha256(abs + "\n" + fkey).hex()[0..32]
+  let fresh = not fs.exists(slot)
+  fs.mkdir(slot) else 0
+  let pdir = work + "/parts"
+  fs.mkdir(pdir) else 0
+  fs.write(pdir + "/head.h", head) else 0
+  var objs: [Str] = []
+  var jobs = 0
+  let tag = random_bytes(6).hex()
+  for i in 0..parts.len + 1:
+    var src = "#define VU_PART0 1\n#include \"head.h\"\n"
+    if i > 0: src = "#define VU_PART 1\n#include \"head.h\"\n" + parts[i - 1]
+    let obj = slot + "/" + sha256(fkey + "\n" + head + "\n" + src).hex()[0..40] + ".o"
+    objs.push(obj)
+    if fs.exists(obj): continue
+    let c = pdir + "/p{i}.c"
+    fs.write(c, src) else 0
+    var cmd = ""
+    for a in cflags: cmd += shq(a) + " "
+    let tmp = obj + "." + tag
+    cmd += "-c " + shq(c) + " -o " + shq(tmp) + " && mv " + shq(tmp) + " " + shq(obj)
+    fs.write(pdir + "/job{i}.sh", cmd + "\n") else 0
+    jobs += 1
+  var rc = 0
+  if jobs > 0:
+    rc = os.run(["sh", "-c", "find \"$0\" -name 'job*.sh' -print0 | xargs -0 -P {max(ncpu, 1)} -n 1 sh", pdir]) else 127
+  if rc == 0:
+    var link = copy_strs(cflags)
+    for o in objs: link.push(o)
+    link.push("-o")
+    link.push(out + "")
+    for a in lflags: link.push(a)
+    rc = os.run(link) else 127
+  remove_dir(fs, pdir)
+  if home == "":
+    remove_dir(fs, slot)
+    return rc
+  # what this folder kept from earlier versions of the program goes once it holds twice as many
+  let have = fs.list(slot) else []
+  if have.len > 2 * objs.len + 8:
+    for n in have:
+      var used = n == "info"
+      for o in objs:
+        if o.endswith("/" + n): used = true
+      if not used: fs.remove(slot + "/" + n) else 0
+  fs.write(slot + "/info", abs + "\n{os.time()}") else 0
+  if fresh: prune_parts(fs, home + "/vu/parts")
+  return rc
+
+# The split builds' folders: the 16 programs built last, and none whose source file is gone.
+fn prune_parts(fs: Fs, dir: Str):
+  let names = fs.list(dir) else return
+  var slots: [Str] = []
+  var times: [Float] = []
+  for n in names:
+    let slot = dir + "/" + n.replace("/", "")
+    let lines = (fs.read(slot + "/info") else "").split("\n")
+    if lines.len < 2 or not fs.exists(lines[0]):
+      if lines.len >= 2: remove_dir(fs, slot)
+      continue
+    slots.push(slot)
+    times.push(float(lines[1]) else 0.0)
+  var left = slots.len
+  while left > 16:
+    var k = -1
+    for i in 0..slots.len:
+      if slots[i] != "" and (k < 0 or times[i] < times[k]): k = i
+    remove_dir(fs, slots[k])
+    slots[k] = ""
+    left -= 1
+
+fn remove_dir(fs: Fs, d: Str):
+  let names = fs.list(d) else []
+  for n in names: fs.remove(d + "/" + n) else 0
+  fs.remove(d) else 0
+
+# The C compiler's run: one file, or the parts of a split build.
+fn run_cc(fs: Fs, os: Os, split: Bool, csrc: Str, path: Str, argl: [Str], cfile: Str, out: Str, work: Str) -> Int:
+  if split: return split_build(fs, os, csrc, path, argl, cfile, out, work)
+  return os.run(argl) else 127
+
 # The run cache keeps the 64 programs used last, and drops a program whose source file is gone
 # (a program run from a temporary folder).
 fn prune_run_cache(fs: Fs, rdir: Str):
@@ -1654,8 +1818,16 @@ fn main(fs: Fs, os: Os):
     eprint("vu: " + write_err)
     clean_up(fs, work, temps)
     exit(3)
+  # `run` is the edit-and-test loop, so it builds unoptimized (several times faster to compile)
+  # unless asked for --release; `build` makes the optimized binary unless asked for --debug.
+  let quick = (debug or (cmd == "run" and not release)) and not profile
   var cc = os.env("CC")
-  if cc == "": cc = "cc"
+  if cc == "":
+    cc = "cc"
+    # A quick build uses clang when it's there: it compiles Vu's C at -O0 about 3 times as fast as
+    # gcc (bench/rebuild). (Not for par loops, whose OpenMP clang may lack, or the sanitizers.)
+    if quick and not uses_par and not san and not san_pool and not tsan and not wasm and not lib:
+      if (os.output(["sh", "-c", "command -v clang"]) else "").strip() != "": cc = "clang"
   var argl = [cc, "-std=gnu11", "-fwrapv", "-fno-math-errno", "-fno-trapping-math", "-ffp-contract=off", "-w"]
   if wasm:
     # WebAssembly (WASI), with zig's C compiler: one thread, no processes, no sockets
@@ -1689,9 +1861,6 @@ fn main(fs: Fs, os: Os):
       eprint("vu: the WebAssembly build failed (exit {wrc})")
       exit(3)
     exit(0)
-  # `run` is the edit-and-test loop, so it builds unoptimized (several times faster to compile)
-  # unless asked for --release; `build` makes the optimized binary unless asked for --debug.
-  let quick = (debug or (cmd == "run" and not release)) and not profile
   # Quick builds also keep the shadow call stack that gives panics a backtrace.
   if profile:
     # optimized, with the shadow call stack, which the profiler samples
@@ -1703,7 +1872,9 @@ fn main(fs: Fs, os: Os):
     if march != "": argl.push(native_flag(os, march))
   elif quick:
     argl.push("-O0")
-    argl.push("-g")
+    # (debugging information for a debugger with --debug; vu run's binary is gone after the run, and
+    # its panics' backtraces come from the shadow call stack)
+    if debug: argl.push("-g")
     argl.push("-DVU_TRACE")
   else:
     argl.push("-O3")
@@ -1765,6 +1936,13 @@ fn main(fs: Fs, os: Os):
         eprint("vu: " + e)
         clean_up(fs, work, temps)
         exit(3)
+  # A quick build of a big program is split: its functions are compiled in parts, in parallel, and
+  # each part is kept (see split_build). VU_SPLIT=always splits any program, VU_SPLIT=off none.
+  var split = false
+  let smode = os.env("VU_SPLIT")
+  if quick and not has_ext and not lib and not wasm and emit_c == "" and not san and not san_pool and not tsan and smode != "off":
+    let pat = csrc.find("\n/* vu-parts */\n", 0)
+    if pat >= 0 and (smode == "always" or csrc[pat..csrc.len].count("\n") >= 6000): split = true
   # VU_CACHE=dir keeps each binary under the SHA-256 of everything it's made from (the C, the C
   # compiler's command and version), so building the same program the same way again is a copy. Not
   # for programs with extern C files (what they include isn't in the C here).
@@ -1793,7 +1971,7 @@ fn main(fs: Fs, os: Os):
         clean_up(fs, work, temps)
         code = os.run(ra) else 127
         exit(code)
-      let rc0 = os.run(argl) else 127
+      let rc0 = run_cc(fs, os, split, csrc, path, argl, cfile, out, work)
       if rc0 == 0:
         fs.mkdir(rdir) else 0
         let tmpf = slot + "." + random_bytes(8).hex()
@@ -1829,7 +2007,7 @@ fn main(fs: Fs, os: Os):
       if rc == 0: os.run(["touch", hit + ""]) else 0   # (the gate drops entries it didn't use)
       else: rc = -1
   if rc == -1:
-    rc = os.run(argl) else 127
+    rc = run_cc(fs, os, split, csrc, path, argl, cfile, out, work)
     if rc == 0 and key != "" and not out.startswith("/dev/"):   # (-o /dev/null: nothing to keep)
       fs.mkdir(cache) else 0
       let tmpf = cache + "/." + key + "." + random_bytes(8).hex()

@@ -1,10 +1,10 @@
 #define VU_NODE_@@X@@ (sizeof(@@T@@) < 2 * sizeof(void *) ? 2 * sizeof(void *) : sizeof(@@T@@))
-static __thread @@T@@ *vu_free_@@X@@;
-static __thread int64_t vu_nfree_@@X@@;   /* how many are on it (counted with several threads) */
+VU_G __thread @@T@@ *vu_free_@@X@@;
+VU_G __thread int64_t vu_nfree_@@X@@;   /* how many are on it (counted with several threads) */
 /* Free nodes shared between threads (see vu_share_free): chunks, each a whole free list whose first
    node links the next chunk in its second word. */
-static void *vu_chunks_@@X@@;
-static pthread_mutex_t vu_chunks_lock_@@X@@ = PTHREAD_MUTEX_INITIALIZER;
+VU_G void *vu_chunks_@@X@@;
+VU_G pthread_mutex_t vu_chunks_lock_@@X@@ VU_GI(PTHREAD_MUTEX_INITIALIZER);
 /* Takes up to VU_TAKE nodes from the first chunk (the rest of it stays shared), so that threads
    share a big list instead of one of them taking all of it. */
 __attribute__((noinline)) static void vu_take_chunk_@@X@@(void) {
@@ -51,8 +51,10 @@ static void vu_give_chunk_@@X@@(void) {
     vu_free_@@X@@ = NULL;
     vu_nfree_@@X@@ = 0;
 }
-static vu_pool vu_pool_@@X@@ = { vu_give_chunk_@@X@@, NULL };
+VU_G vu_pool vu_pool_@@X@@ VU_GI({ vu_give_chunk_@@X@@, NULL });
+#ifndef VU_PART
 __attribute__((constructor)) static void vu_pool_init_@@X@@(void) { vu_pool_@@X@@.next = vu_pools; vu_pools = &vu_pool_@@X@@; }
+#endif
 static inline @@T@@ *vu_box_@@X@@(@@T@@ v) {
 #ifdef VU_MALLOC
     @@T@@ *p = (@@T@@ *)vu_malloc(sizeof(@@T@@));
