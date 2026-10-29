@@ -2253,3 +2253,12 @@ Linux x86-64 runner a second time. The crash was a segmentation fault at its fir
 neither crash happens locally (800 starts). Vu's own handler had reported both as "segmentation
 fault", hiding where they happened. In AddressSanitizer builds, a fault that isn't a stack overflow
 now goes on to AddressSanitizer's handler, which prints the stack. The cause is still unknown.
+
+A Python package template (`packaging/python`): `pip install .` runs `vu build --lib` while it
+builds the wheel, and the package calls the library through ctypes. The example is edit distance:
+11 times faster than the same code in pure Python for single calls (half of that time is ctypes
+calling), and 25 times faster for `closest()` over 5,000 words (`tests/bench.py`, Python 3.13, 2
+cores). Its test matches pure Python on 6,001 answers with accents, CJK and emoji. `run_lib.sh`
+installs it into a fresh venv with pip and runs the test. The first version decoded UTF-8 with
+`.chars()`, which makes a Str per character; decoding the bytes by hand made `closest()` 1.7 times
+faster (56.5 ms to 32.6).

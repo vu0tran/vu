@@ -71,5 +71,16 @@ out=$($VU build --lib "$work/clash.vu" -o "$work/libclash.$ext" 2>&1); rc=$?
 out=$($VU run --lib "$work/both.vu" 2>&1); rc=$?
 [ $rc -eq 2 ]; check "--lib is only for build" $? "rc=$rc $out"
 
+# the Python package template (packaging/python): pip builds the Vu code into the wheel
+if python3 -m venv "$work/venv" >/dev/null 2>&1; then
+  cp -r "$d/../packaging/python" "$work/pkg"
+  out=$(cd "$work" && VU="$VU" "$work/venv/bin/pip" install -q ./pkg 2>&1); rc=$?
+  if [ $rc -eq 0 ]; then
+    out=$("$work/venv/bin/python" "$work/pkg/tests/test_fuzzy.py" 1000 2>&1); rc=$?
+    [ $rc -eq 0 ]; check "the Python package template installs with pip and matches pure Python" $? "$out"
+  elif echo "$out" | grep -q -i "network\|connection\|resolve"; then echo "skip  the Python package template (pip can't reach the package index)"
+  else check "the Python package template installs with pip" 1 "$out"; fi
+fi
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]
