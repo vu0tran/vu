@@ -2207,3 +2207,15 @@ every program ever run, including ones run from temporary folders (as the tests 
 the 64 programs used last and drops one whose file is gone. `tests/run_cli.sh` checks these cases:
 a second run calls no C compiler; an edit rebuilds; other options keep their own binary;
 `VU_RUN_CACHE=off`; the pruning. `VU_CACHE` (the build cache the gate uses) turns it off.
+
+Lists to C: an extern function can take a `[Byte]`, `[Int]` or `[Float]`, which C gets as a pointer
+to the elements and their count (no copy), and a `var` one, whose elements C may change in place.
+That is what wrapping most C libraries needs (a checksum over bytes, a numeric routine over an
+array, a buffer for C to fill). The ownership checks cover these calls as they do Vu calls: a list
+passed both read and `var` in one call, or changed by C while a view of it lives, is rejected
+(`tests/ffi/32`, `34`). `tests/ffi/31` and `35` pass lists from every kind of place (a literal, a
+call's result, parameters, a map value, an optional, an enum field, a closure, a slice, a list
+element, an empty list, whose pointer may be NULL) with AddressSanitizer and UBSan, and the C is
+clean under the gate's warning flags with gcc and clang. The SPEC's zlib example (`crc32` over a
+`[Byte]`) gives the same checksum as Python's `zlib.crc32`. Results stay scalars, `Str` or handles:
+a list doesn't come back from C.

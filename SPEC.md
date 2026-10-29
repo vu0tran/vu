@@ -789,7 +789,18 @@ fn main(ffi: Ffi) throws:
 ```
 
 - An extern function's first parameter is `ffi: Ffi` (it isn't passed to C). The others can be
-  `Int`, `Float`, `Bool`, `Byte`, `Str` or an extern type; it returns one of those or nothing.
+  `Int`, `Float`, `Bool`, `Byte`, `Str`, `[Byte]`, `[Int]`, `[Float]` or an extern type; it returns
+  one of the scalars, `Str`, an extern type or nothing.
+- A `[Byte]`, `[Int]` or `[Float]` reaches C as a pointer to its elements and their count, without a
+  copy. A `var` one C may change in place (not its length): to get bytes back, make a buffer of the
+  size C needs and have C return how many it wrote.
+
+  ```
+  extern "z_glue.c":
+    link "z"
+    fn crc(ffi: Ffi, data: [Byte]) -> Int        # C: int64_t crc(const uint8_t *p, int64_t n)
+    fn scale(ffi: Ffi, var xs: [Float], k: Float)  # C: void scale(double *p, int64_t n, double k)
+  ```
 - A handle (`type Db drop db_close`) is owned like a struct: moved, borrowed, stored in lists,
   maps and fields, and freed exactly once, by calling its drop function, when its owner goes.
   Vu code can't make one (only extern functions return them), copy one, or compare two. An
@@ -804,6 +815,7 @@ The C side. The glue file is included after Vu's runtime, so it can use these:
 |---|---|---|
 | `Int` / `Float` / `Bool` / `Byte` | `int64_t` / `double` / `bool` / `uint8_t` | the same |
 | `Str` | `const vu_str *s` (`s->data`, `s->len`; borrowed for the call) | `vu_str`, made with `vu_str_from(p, n)` |
+| `[Byte]` / `[Int]` / `[Float]` | `const uint8_t *p, int64_t n` / `const int64_t *` / `const double *` (`var`: without `const`); `p` may be NULL when `n` is 0 | (not a result) |
 | an extern type | `void *` | `void *` (never NULL) |
 | `throws` | after the others: `T *out` (if it returns a value), then `vu_str *err` | `bool`: true on success; on failure set `*err = vu_errf("fmt", ...)` |
 
@@ -813,7 +825,8 @@ including the file, so a definition that doesn't match is a compile error. C nam
 keywords or start with `vu_`, `fn_` or `drop_`. (`par` is a keyword only right before `for`;
 elsewhere it's an ordinary name.)
 
-C code is outside Vu's checks: the glue must not keep a borrowed `vu_str` pointer after the call,
+C code is outside Vu's checks: the glue must not keep a borrowed `vu_str` or list pointer after the
+call, write past a list's count,
 free a borrowed handle, or return a handle that is still owned elsewhere.
 
 ## Control flow
