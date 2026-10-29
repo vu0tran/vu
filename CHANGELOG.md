@@ -2328,3 +2328,6 @@ What CI found on the ARM64 runners (macOS and Linux), which the x86-64 gate coul
 - On macOS a `--lib` library recorded its own name as where to load it from, so a program linked
   against it found it only in the current folder. It's now `@rpath/libNAME.dylib`, as on Linux,
   where the loader searches the program's rpath.
+- On macOS, split builds of programs that use TLS didn't find OpenSSL's headers. Homebrew's `-I`
+  folder is given with the libraries, after the C file, and the parts were compiled with only the
+  options before it. Each part now gets the `-I` options too.
