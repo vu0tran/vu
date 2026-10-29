@@ -1041,8 +1041,8 @@ compiles Vu's C about 3 times as fast as gcc. A build of a big program (more tha
 of C in its functions) is split: its functions are compiled as several C files, as many at once as
 there are cores, and each one's object file is kept (in `~/.cache/vu/parts`), so a rebuild after an
 edit compiles only the part that changed. On a 20,000-line program, an edit and `vu run` takes
-0.68 s (Rust's `cargo run`: 0.79 s), and an optimized rebuild 3.2 s (`cargo build --release`:
-14.1 s; see `bench/rebuild`). An optimized split build doesn't inline a function into a caller in
+0.64 s (Rust's `cargo run`: 0.70 s), and an optimized rebuild 2.4 s (`cargo build --release`:
+14.0 s; see `bench/rebuild`). An optimized split build doesn't inline a function into a caller in
 another part: functions are grouped by source file, so calls within a module still can be.
 `VU_SPLIT=off` builds one C file; `VU_SPLIT=always` splits any program.
 

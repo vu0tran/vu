@@ -2381,3 +2381,42 @@ Where Vu still loses, and why:
   vectorize the sum's loop without reordering the additions, and gcc's build runs twice as fast). So optimized builds stay with gcc.
 - The others are now ties or wins on this VM. Spectral-norm (1.63 s against 1.78 s) and
   binary-trees are Vu's. fannkuch-redux (3%), nsieve (1%) and mandelbrot (1%) are close.
+
+### Leaner C for faster optimized builds
+
+The goal was to bring down the first optimized build (29.6 s, against Rust's 14.3 s on
+`bench/rebuild`'s 20,000-line program). The method: measure what gcc spends its time on, in parts
+of 50 to 200 of the program's functions and in programs of 100 functions of one kind each (the
+minimum of 5 compiles).
+
+- **What costs.** A function with an 8-pass loop of arithmetic costs gcc about the same as the same
+  loop written by hand in C (9 ms a function at -O3): the arithmetic Vu writes isn't the problem.
+  The costs are gcc's own: copying out short loops (complete peeling), and inlining the runtime's
+  string helpers at every use. One `s + "a"` cost 9 ms a function, mostly from `vu_sfree_` (the
+  small-string free list) inlined at every drop of a string.
+- **`vu_sfree_` and `vu_str_concat` are no longer inlined.** `drop_Str` stays inline and checks
+  for a buffer before calling. A string-building function compiled in half the time. The compiler's
+  own front end, which frees strings constantly, wasn't slower (a minimum of 398 ms against 416 over
+  9 runs).
+- **`--param=max-completely-peeled-insns=100` for gcc** (the default is 200): 16% less time on
+  functions with short loops. It didn't change five of the six benchmarks' binaries at all, and
+  mandelbrot's ran in the same time.
+- **Optimized split builds use parts of about 12,000 lines**, so the header is parsed half as many
+  times: 10% less time than 6,000.
+
+Together: the first optimized build went from 29.6 s to 21.2 s (Rust: 13.8 s). A rebuild after an
+edit went from 3.2 s to 2.4 s (Rust: 14.0 s).
+
+Tried, and not kept:
+- A precompiled header with gcc: no faster (it loads a 15 MB file per part).
+- Checking a whole arithmetic statement's overflow once instead of each operation (the tried
+  loops' `vu_vf_*`): no faster.
+- `-O2`, no vectorization, less GVN: 3 to 10% each.
+- Limiting inlining of `inline` functions (`max-inline-insns-single=40`): 14% faster to compile, but
+  spectral-norm ran 2.8 times as long.
+- `noinline` on lists' growth and freeing: no change.
+
+What's left is the measured gap: gcc does 1.8 times the CPU work on Vu's C that rustc does on the
+Rust (42 s of CPU against 24 s, measured with `time`). Vu checks every Int operation and Rust's release builds don't,
+which is about a fifth of gcc's time on arithmetic-heavy functions (19% on the program's typical
+function when the checks are taken out).

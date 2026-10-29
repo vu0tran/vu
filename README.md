@@ -381,12 +381,13 @@ lower is better. (Earlier rounds measured on another VM, where every time was hi
   5.8 KB JSON order parsed and answered, against 112k and 9.5k for a raw-TCP Go server (details and
   memory in CHANGELOG.md, round 7).
 - **Rebuilds.** On a generated 20,000-line program (`bench/rebuild`, 2 cores, median of 3), an
-  edit and `vu run` takes 0.68 s against 0.79 s for `cargo run`, a first `vu run` 4.32 s against
-  5.16 s, and `vu check` 0.32 s against 0.50 s for `cargo check`. Builds are compiled in parts,
-  in parallel, and each part is kept, so an optimized rebuild after an edit takes 3.2 s against
-  14.1 s for `cargo build --release`. Vu still loses the first optimized build, 29.6 s against
-  14.3 s (gcc takes about twice as long on Vu's C as rustc on the Rust), and a first build
-  for a debugger, 6.4 s against 5.7 s.
+  edit and `vu run` takes 0.64 s against 0.70 s for `cargo run`, a first `vu run` 4.36 s against
+  5.19 s, and `vu check` 0.33 s against 0.53 s for `cargo check`. Builds are compiled in parts, in
+  parallel, and each part is kept, so an optimized rebuild after an edit takes 2.4 s against 14.0 s
+  for `cargo build --release`. Vu still loses the first optimized build, 21.2 s against 13.8 s
+  (gcc does 1.8 times the CPU work on Vu's C as rustc does on the Rust; Vu's checks on every Int
+  operation, which Rust's release builds leave out, are about a fifth of it), and a first build for
+  a debugger, 5.9 s against 5.2 s.
 
 ## Built for the model that writes it
 

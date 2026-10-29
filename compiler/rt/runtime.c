@@ -489,7 +489,9 @@ static inline uint8_t *vu_salloc(int64_t *cap) {
     if (!d) vu_oom();
     return d;
 }
-static inline void vu_sfree_(uint8_t *p, int64_t cap) {
+/* (not inlined: a program frees strings in many places, and the C compiler spent a third of its time on
+   a string-building function's copies of this; the call costs a few instructions per free) */
+__attribute__((noinline)) static void vu_sfree_(uint8_t *p, int64_t cap) {
 #ifndef VU_MALLOC
     int k = vu_sclass(cap);
 #if defined(_OPENMP) || defined(VU_MT)
@@ -506,7 +508,7 @@ static inline void vu_sfree_(uint8_t *p, int64_t cap) {
 #endif
     free(p);
 }
-static void drop_Str(vu_str *s) { if (s->cap > 0) vu_sfree_(s->data, s->cap); }
+static inline void drop_Str(vu_str *s) { if (s->cap > 0) vu_sfree_(s->data, s->cap); }
 static vu_str vu_str_lit(const char *p, int64_t n) { vu_str s = { (uint8_t *)p, n, 0 }; return s; }
 static void vu_str_reserve(vu_str *s, int64_t extra) {
     if (extra < 0 || s->len > INT64_MAX / 2 - extra) vu_oom();
@@ -572,7 +574,7 @@ static void vu_str_cat_int(vu_str *s, long long v) {
     if (v < 0) *--p = '-';
     vu_str_cat_bytes(s, (const uint8_t *)p, (int64_t)(b + sizeof b - p));
 }
-static vu_str vu_str_concat(const vu_str *a, const vu_str *b) {
+__attribute__((noinline)) static vu_str vu_str_concat(const vu_str *a, const vu_str *b) {
     /* static text (cap 0) plus nothing is the same static text: no copy (s + "" copies a Str) */
     if (b->len == 0 && a->cap == 0) return *a;
     if (a->len == 0 && b->cap == 0) return *b;
