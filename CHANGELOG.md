@@ -2309,3 +2309,14 @@ capabilities `main` asks for, since nothing else can make one. For example, `mcp
 only the network, and `mcp/git` only files and programs. An agent skill (`packaging/skill/vu`) uses
 it: write the tool, `vu check` it, show the person what `--caps` prints, then `vu run` it (kept
 binary, about 10 ms a start after the first). The skill hasn't been tried in an agent session yet.
+
+What the full gate found after the clang change:
+- clang refuses brackets nested more than 256 deep. Vu writes that much nesting for a long chain of
+  operators (`tests/selfhost/r22_13`, a sum of 20,000 terms). Past a few thousand levels, even
+  `-fbracket-depth` doesn't help: clang's parser runs out of stack and crashes. Quick builds now
+  measure how deep the C nests and use clang only below 200 levels. Scanning the 131,000-line
+  program takes no measurable time. A clang build (macOS's `cc`, or `CC=clang`) also gets
+  `-fbracket-depth`.
+- Split and whole builds of the stack-overflow tests stop at different depths, because their
+  frames differ in size. The comparison now checks only the first line of a stack overflow's
+  report.
