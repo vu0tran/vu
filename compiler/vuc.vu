@@ -719,6 +719,12 @@ fn parse_program(var p: Parser) -> [Node]:
     elif at_kw(p, "const"):
       let it = parse_const(&p)
       items.push(it)
+    elif at(p, "name") and p.toks[p.i].v == "export" and peek_k(p, 1) == "kw" and peek_v(p, 1) == "fn":
+      # export fn: also a plain C function of the same name (vu build --lib)
+      advance(&p)
+      var it = parse_fn(&p)
+      it.op = "export"
+      items.push(it)
     elif at(p, "name") and p.toks[p.i].v == "extern" and peek_k(p, 1) == "str":
       var ext = parse_extern(&p)
       move_nodes(&ext, &items)
@@ -746,7 +752,7 @@ fn parse_program(var p: Parser) -> [Node]:
       expect_tok(&p, "NL", "", "")
       items.push(im)
     else:
-      report(p.ctx, cur_line(p), "expected 'fn', 'type', 'const', 'interface', 'impl', 'import' or 'extern' at top level")
+      report(p.ctx, cur_line(p), "expected 'fn', 'type', 'const', 'interface', 'impl', 'import', 'extern' or 'export fn' at top level")
   return items
 
 # interface Shape: then indented signatures, each with no body (fn area(s: Self) -> Float). The node:
@@ -2573,6 +2579,27 @@ fn check_extern(g: G, it: Node, params: [Param], ret: Str):
   if not ffi_plain(ret) and ret != "~void" and tkind(g, ret) != "ext":
     err(g, it.line, "an extern function can return Int, Float, Bool, Byte, Str, an extern type or nothing, not " + tn(ret))
 
+# export fn: a C function of the same name, for C (and Python, through ctypes) to call. What crosses
+# has a plain C form, and nothing it's given can be a capability: a library's code can't reach files,
+# the network or programs.
+fn check_export(g: G, it: Node, name: Str, params: [Param], ret: Str):
+  let d = disp(it.name)
+  if module_prefix(name) != "": err(g, it.line, "only the main file's functions can be exported ('" + d + "' is in a module); export a function there that calls it")
+  if it.name == "main": err(g, it.line, "main can't be exported; a library's functions are called by name")
+  let bad = c_name_problem(it.name)
+  if bad != "": err(g, it.line, bad + ", so it can't name an exported C function")
+  if it.names.len > 0: err(g, it.line, "an exported function can't have type parameters (C needs one signature)")
+  if it.name2 != "": err(g, it.line, "an exported function fails with a message ('throws'), not with " + disp(it.name2) + " values; C gets the message")
+  for pa in params:
+    for pb in params:
+      if (pb.ty == "Str" or ffi_list(pb.ty)) and pa.name == pb.name + "_len":
+        err(g, pa.line, "'" + pa.name + "' is the name C gives the length of '" + pb.name + "'; rename it")
+    if pa.is_var or pa.is_own: err(g, pa.line, "an exported function's parameters are read-only ('" + pa.name + "'); return what changed instead")
+    if not ffi_plain(pa.ty) and not ffi_list(pa.ty):
+      err(g, pa.line, "an exported function's parameters can be Int, Float, Bool, Byte, Str, [Byte], [Int] or [Float], not " + tn(pa.ty) + " ('" + pa.name + "')")
+  if not ffi_plain(ret) and not ffi_list(ret) and ret != "~void":
+    err(g, it.line, "an exported function can return Int, Float, Bool, Byte, Str, [Byte], [Int], [Float] or nothing, not " + tn(ret))
+
 fn visit_type(var g: G, name: Str, line: Int, var state: {Str: Int}):
   if state.get(name, 0) == 1:
     err(g, line, "type '" + disp(name) + "' contains itself directly; use an optional field (" + disp(name) + "?) or a list")
@@ -2696,6 +2723,7 @@ fn collect(var g: G, items: [Node]):
   for idx in 0..items.len:
     if items[idx].k == "fn" and items[idx].names.len > 0:
       if items[idx].name == "main": err(g, items[idx].line, "main can't have type parameters")
+      if items[idx].op == "export": err(g, items[idx].line, "an exported function can't have type parameters (C needs one signature)")
       g.gfn_nodes[items[idx].name] = copy_node(items[idx])
     elif items[idx].k == "fn":
       let sig = fn_sig(&g, items[idx], items[idx].name)
@@ -2973,6 +3001,7 @@ fn fn_sig(var g: G, it: Node, name: Str) -> Sig:
   if it.op == "extern":
     check_extern(g, it, params, ret)
     g.extern_fns[name] = true
+  if it.op == "export": check_export(g, it, name, params, ret)
   if it.name2 != "":
     let et = resolve(&g, it.name2, it.line)
     if tkind(g, et) != "enum": err(g, it.line, "throws names the enum its errors come from (throws ParseError), not " + tn(et))
@@ -8928,6 +8957,83 @@ fn gen_extern(var g: G, items: [Node], name: Str):
     lines.push("    return r;")
   g.bodies.push(join(lines, "\n"))
 
+# export fn f: the C function f, in C's terms. A Str arrives as (const char *, int64_t length; a
+# negative length: up to the NUL), a list as (const T *, int64_t count), both borrowed for the call. A
+# Str or list result is a malloc'd copy (a Str's with a NUL after it) and its length in *vu_out_len
+# (when not NULL); the caller frees it. A failing function's last parameter, char **vu_err, gets the
+# message (malloc'd) or NULL, and the result is then 0 or NULL.
+fn lib_elem(t: Str) -> Str:
+  if t == "[Int]": return "int64_t"
+  if t == "[Float]": return "double"
+  return "uint8_t"
+
+fn lib_cname(n: Str) -> Str:
+  if is_c_keyword(n) or n.startswith("vu_") or n.endswith("_t") or n == "NULL" or n == "errno": return n + "_"
+  return n
+
+fn export_code(g: G, name: Str) -> [Str]:
+  let fi = g.fns[name]
+  var cps: [Str] = []
+  var pre: [Str] = []
+  var args: [Str] = []
+  for pa in fi.params:
+    let cn = lib_cname(pa.name)
+    let lv = "vu_a_" + pa.name
+    if pa.ty == "Str":
+      cps.push("const char *" + cn)
+      cps.push("int64_t " + cn + "_len")
+      pre.push("vu_str " + lv + " = vu_lib_in(" + cn + ", " + cn + "_len);")
+      args.push("&" + lv)
+    elif ffi_list(pa.ty):
+      let e = lib_elem(pa.ty)
+      cps.push("const " + e + " *" + cn)
+      cps.push("int64_t " + cn + "_len")
+      pre.push(ct(g, pa.ty) + " " + lv + " = {{ (" + e + " *)" + cn + ", " + cn + " && " + cn + "_len > 0 ? " + cn + "_len : 0, 0 }};")
+      args.push("&" + lv)
+    else:
+      cps.push(ct(g, pa.ty) + " " + cn)
+      args.push(cn)
+  let ret = fi.ret
+  var rt = "void"
+  var big = false
+  if ret == "Str":
+    rt = "char *"
+    big = true
+  elif ffi_list(ret):
+    rt = lib_elem(ret) + " *"
+    big = true
+  elif ret != "~void": rt = ct(g, ret)
+  if big: cps.push("int64_t *vu_out_len")
+  if fi.fails: cps.push("char **vu_err")
+  var plist = join(cps, ", ")
+  if plist == "": plist = "void"
+  var proto = rt + " " + name + "(" + plist + ")"
+  if rt.endswith("*"): proto = rt + name + "(" + plist + ")"
+  var b: [Str] = []
+  for x in pre: b.push("    " + x)
+  var call = "fn_" + name + "(" + join(args, ", ") + ")"
+  var val = ""
+  if fi.fails:
+    b.push("    " + ct(g, "!" + ret) + " vu_r = " + call + ";")
+    b.push("    if (vu_r.bad) {{ if (vu_err) *vu_err = (char *)vu_lib_out(vu_r.err.data, vu_r.err.len, 1, 1, NULL); drop_Str(&vu_r.err);" + if_big(big, " if (vu_out_len) *vu_out_len = 0;") + " return" + if_big(ret != "~void", " 0") + "; }}")
+    b.push("    if (vu_err) *vu_err = NULL;")
+    val = "vu_r.val"
+  elif ret != "~void":
+    b.push("    " + ct(g, ret) + " vu_r = " + call + ";")
+    val = "vu_r"
+  else: b.push("    " + call + ";")
+  if ret == "Str":
+    b.push("    char *vu_p = (char *)vu_lib_out(" + val + ".data, " + val + ".len, 1, 1, vu_out_len); drop_Str(&" + val + "); return vu_p;")
+  elif ffi_list(ret):
+    let e = lib_elem(ret)
+    b.push("    " + e + " *vu_p = (" + e + " *)vu_lib_out(" + val + ".data, " + val + ".len, sizeof(" + e + "), 0, vu_out_len); drop_" + mg(g, ret) + "(&" + val + "); return vu_p;")
+  elif ret != "~void": b.push("    return " + val + ";")
+  return [proto, "__attribute__((visibility(\"default\"))) " + proto + " {{\n" + join(b, "\n") + "\n}}"]
+
+fn if_big(c: Bool, s: Str) -> Str:
+  if c: return s
+  return ""
+
 fn ffi_ct(g: G, t: Str, param: Bool) -> Str:
   if t == "Str":
     if param: return "const vu_str *"
@@ -9538,6 +9644,20 @@ fn build(var g: G, items: [Node]) -> Str:
       out.push(g.lam_sigs[k] + " {{")
       out.push(g.lam_bodies[k] + "")
       out.push("}}")
+  # export fn: the C functions (vu build --lib), and their declarations for the header, in a comment
+  var heads: [Str] = []
+  var wraps: [Str] = []
+  for fname, fi in g.fns:
+    if fi.item >= 0 and items[fi.item].op == "export":
+      let pc = export_code(g, fname)
+      heads.push(pc[0] + ";")
+      wraps.push(pc[1] + "")
+  if wraps.len > 0:
+    out.push("#line 1 \"(exported functions)\"")
+    out.push("static vu_str vu_lib_in(const char *p, int64_t n) {{ if (!p) n = 0; else if (n < 0) n = (int64_t)strlen(p); vu_str s = {{ (uint8_t *)p, n, 0 }}; return s; }}")
+    out.push("static void *vu_lib_out(const void *p, int64_t n, size_t size, int nul, int64_t *len) {{ char *r = (char *)malloc((size_t)n * size + 1); if (!r) vu_oom(); if (n) memcpy(r, p, (size_t)n * size); if (nul) r[(size_t)n * size] = 0; if (len) *len = n; return r; }}")
+    for w in wraps: out.push(w)
+    out.push("/* vu-lib-header\n" + join(heads, "\n") + "\nvu-lib-header */")
   return join(out, "\n") + "\n"
 
 # ============================================================================ driver
@@ -9816,6 +9936,18 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str, pkgs: [
   let toks = lex(ctx, src, 0, 0)
   var p0 = Parser(Ctx(ctx.path, copy_strs(ctx.lines), ctx.json), toks, 0, 0, 0)
   items.push(parse_program(&p0))
+  # A library (export fn and no main) gets an empty main, so it builds like a program.
+  var has_main = false
+  var has_export = false
+  for it in items[0]:
+    if it.k == "fn" and it.name == "main": has_main = true
+    if it.k == "fn" and it.op == "export": has_export = true
+  if has_export and not has_main:
+    let mtoks = lex(ctx, "fn main():\n  return\n", 0, 0)
+    var pm = Parser(Ctx(ctx.path, copy_strs(ctx.lines), ctx.json), mtoks, 0, p0.nid, 0)
+    var mi = parse_program(&pm)
+    mi[0].v = "(library)"   # (not in vu check --index)
+    move_nodes(&mi, &items[0])
   let main_name = stem_of(ctx.path)
   var fi = 0
   while fi < items.len:
@@ -10012,6 +10144,7 @@ fn index_text(g: G, items: [Node]) -> Str:
   for it in items:
     var k = it.k
     if k != "fn" and k != "type" and k != "enum" and k != "const" and k != "iface": continue
+    if k == "fn" and it.v == "(library)": continue
     let fi = it.line >> 24
     if fi >= g.files.len: continue
     let lines = g.files[fi].lines
@@ -10290,6 +10423,7 @@ fn main(fs: Fs, os: Os):
   var static = false
   var wasm = false
   var profile = false
+  var lib = false
   var checks = false
   var index = false
   var path = ""
@@ -10309,6 +10443,9 @@ fn main(fs: Fs, os: Os):
       if a == "-o": o = argv[i + 1]
       else: emit_c = argv[i + 1]
       i += 2
+    elif a == "--lib" and cmd == "build":
+      lib = true
+      i += 1
     elif a == "--checks" and cmd == "check":
       checks = true
       i += 1
@@ -10382,6 +10519,21 @@ fn main(fs: Fs, os: Os):
       eprint("vu: front end {fe:.1} ms")
     exit(0)
   if tsan: csrc = replace_all(csrc, "schedule(dynamic)", "schedule(static)")
+  # --lib: a shared library of the export fn functions, and a C header declaring them
+  var lib_head = ""
+  var mac = false
+  if lib:
+    let hs = csrc.find("/* vu-lib-header\n", 0)
+    var why = ""
+    if wasm or static or profile: why = "--lib builds a shared library, so it can't be combined with --wasm, --static or --profile"
+    elif hs < 0: why = "--lib builds a library of the functions marked 'export fn', and " + path + " has none"
+    elif csrc.find("#define VU_MT 1", 0) >= 0: why = "a library can't use tasks or channels yet (spawn, chan, select, os.sleep): its functions run on the calling program's threads"
+    if why != "":
+      eprint("vu: " + why)
+      exit(2)
+    lib_head = csrc[hs + 17..csrc.find("\nvu-lib-header */", hs)]
+    csrc = csrc.replace("int main(int argc, char **argv) {{ return vu_start(argc, argv, vu_main, vu_file_names); }}", "static char *vu_lib_argv[] = {{(char *)\"lib\", NULL}};\n__attribute__((constructor)) static void vu_lib_init(void) {{ vu_argc = 1; vu_argv = vu_lib_argv; vu_files = vu_file_names; vu_seed_init(); (void)vu_main; (void)vu_start; }}")
+    mac = (os.output(["uname", "-s"]) else "").strip() == "Darwin"
   let work = fs.temp_dir() else ""
   if work == "":
     eprint("vu: can't make a temporary folder for the C compiler's input")
@@ -10389,6 +10541,11 @@ fn main(fs: Fs, os: Os):
   var cfile = emit_c + ""
   if cfile == "": cfile = work + "/out.c"
   var out = o + ""
+  if out == "" and lib:
+    let base = without_ext(path)
+    let sl = find_last(base, "/") + 1
+    out = base[0..sl] + "lib" + base[sl..base.len] + ".so"
+    if mac: out = base[0..sl] + "lib" + base[sl..base.len] + ".dylib"
   if out == "":
     if cmd == "build": out = without_ext(path)
     else: out = work + "/prog"
@@ -10488,6 +10645,34 @@ fn main(fs: Fs, os: Os):
   for l in links: argl.push("-l" + l)
   # --static: no shared libraries needed where it runs (glibc's name lookup still wants its own at run time)
   if static: argl.push("-static")
+  if lib:
+    if mac: argl.push("-dynamiclib")
+    else: argl.push("-shared")
+    argl.push("-fPIC")
+    argl.push("-fvisibility=hidden")
+    # (libwords.so: words.h)
+    var hname = without_ext(out) + ".h"
+    let hs0 = find_last(hname, "/") + 1
+    if hname[hs0..hname.len].startswith("lib") and hname.len - hs0 > 5: hname = hname[0..hs0] + hname[hs0 + 3..hname.len]
+    let stem = stem_of(path)
+    var guard = "VU_LIB_"
+    for c in bytes(stem.upper()):
+      if (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9'): guard += str([c])
+      else: guard += "_"
+    var h = "/* The functions " + path + " exports (vu build --lib). A Str is passed as a pointer and\n"
+    h += "   a length (a negative length: up to the first zero byte), a list as a pointer and a count,\n"
+    h += "   both read only during the call. A Str or list result is a copy made with malloc, with its\n"
+    h += "   length in *vu_out_len (when not NULL); free it with free(). A function that can fail sets\n"
+    h += "   *vu_err to a message (free it) and returns 0 or NULL, or sets it to NULL. A panic ends the\n"
+    h += "   process, after printing its report. */\n"
+    h += "#ifndef " + guard + "_H\n#define " + guard + "_H\n#include <stdbool.h>\n#include <stdint.h>\n"
+    h += "#ifdef __cplusplus\nextern \"C\" {{\n#endif\n" + lib_head + "\n#ifdef __cplusplus\n}}\n#endif\n#endif\n"
+    match fs.write(hname, h):
+      ok: lib_head = ""
+      err(e):
+        eprint("vu: " + e)
+        clean_up(fs, work, temps)
+        exit(3)
   # VU_CACHE=dir keeps each binary under the SHA-256 of everything it's made from (the C, the C
   # compiler's command and version), so building the same program the same way again is a copy. Not
   # for programs with extern C files (what they include isn't in the C here).
@@ -10562,6 +10747,9 @@ fn main(fs: Fs, os: Os):
     clean_up(fs, work, temps)
     if has_ext:
       eprint("vu: the C compiler rejected the program; errors in an extern C file are shown above")
+      exit(1)
+    if lib:
+      eprint("vu: the C compiler rejected the library; if it named an exported function or one of its parameters (\"(exported functions)\" above), that name is already the C library's: rename it")
       exit(1)
     eprint("vu: internal error: the C compiler rejected the generated code")
     exit(3)
@@ -12802,6 +12990,16 @@ fn rt_runtime() -> Str:
   s += "#ifdef VU_WASI\n"
   s += "static void vu_guard_init(void *top) {{ vu_stack_top = (uintptr_t)top; }}\n"
   s += "#else\n"
+  s += "#if defined(__SANITIZE_ADDRESS__)\n"
+  s += "#define VU_ASAN 1\n"
+  s += "#elif defined(__has_feature)\n"
+  s += "#if __has_feature(address_sanitizer)\n"
+  s += "#define VU_ASAN 1\n"
+  s += "#endif\n"
+  s += "#endif\n"
+  s += "#ifdef VU_ASAN\n"
+  s += "static struct sigaction vu_asan_segv, vu_asan_bus;   /* AddressSanitizer's handlers, from before ours */\n"
+  s += "#endif\n"
   s += "static void vu_segv(int sig, siginfo_t *si, void *ctx) {{\n"
   s += "    (void)sig; (void)ctx;\n"
   s += "    uintptr_t a = (uintptr_t)si->si_addr;\n"
@@ -12809,6 +13007,14 @@ fn rt_runtime() -> Str:
   s += "    static const char other[] = \"segmentation fault (this is a bug in the Vu compiler; please report it)\";\n"
   s += "    bool is_over = (a < vu_stack_top && vu_stack_top - a < vu_stack_size + (1u << 20))\n"
   s += "                || (vu_t_hi && a < vu_t_hi && a + (1u << 20) >= vu_t_lo);\n"
+  s += "#ifdef VU_ASAN\n"
+  s += "    /* not a stack overflow: AddressSanitizer's report says where it happened (its handler runs when\n"
+  s += "       the faulting instruction runs again) */\n"
+  s += "    if (!is_over) {{\n"
+  s += "        struct sigaction *old = sig == SIGBUS ? &vu_asan_bus : &vu_asan_segv;\n"
+  s += "        if (old->sa_flags & SA_SIGINFO) {{ sigaction(sig, old, NULL); return; }}\n"
+  s += "    }}\n"
+  s += "#endif\n"
   s += "    vu_report_lock();   /* before touching the buffer: another thread may be writing its report */\n"
   s += "    vu_plen = 0;        /* this thread may have been interrupted halfway through its own report */\n"
   s += "    vu_report(is_over ? over : other, is_over ? sizeof over - 1 : sizeof other - 1, 0);\n"
@@ -12826,7 +13032,11 @@ fn rt_runtime() -> Str:
   s += "    sa.sa_sigaction = vu_segv;\n"
   s += "    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;\n"
   s += "    sigemptyset(&sa.sa_mask);\n"
+  s += "#ifdef VU_ASAN\n"
+  s += "    if (sigaltstack(&ss, NULL) == 0) {{ sigaction(SIGSEGV, &sa, &vu_asan_segv); sigaction(SIGBUS, &sa, &vu_asan_bus); }}\n"
+  s += "#else\n"
   s += "    if (sigaltstack(&ss, NULL) == 0) {{ sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); }}\n"
+  s += "#endif\n"
   s += "}}\n"
   s += "#endif\n"
   s += "#define VU_SMALL_MAP 16\n"
@@ -20836,7 +21046,7 @@ fn rt_help() -> Str:
   s += "      A panic prints the chain of calls that led to it (in quick builds).\n"
   s += "      The binary is kept (in ~/.cache/vu/run), so the same program runs again without building;\n"
   s += "      VU_RUN_CACHE=off builds every time. A script can start with: #!/usr/bin/env -S vu run\n"
-  s += "  vu build FILE.vu [-o OUT] [--debug] [--malloc] [--san] [--san-pool] [--tsan] [--emit-c FILE] [--time] [--static] [--wasm] [--profile]\n"
+  s += "  vu build FILE.vu [-o OUT] [--debug] [--malloc] [--san] [--san-pool] [--tsan] [--emit-c FILE] [--time] [--static] [--wasm] [--profile] [--lib]\n"
   s += "      optimized binary (-O3); --debug builds quickly instead. With VU_CACHE=DIR set, each binary is\n"
   s += "      kept in DIR under a hash of its C, the C compiler's command, version and CPU, and the same\n"
   s += "      build again is a copy (not for programs with extern C files). --static links every library in\n"
@@ -20844,6 +21054,8 @@ fn rt_help() -> Str:
   s += "      --wasm: a WebAssembly (WASI) module, with zig's C compiler (no tasks, sockets or processes)\n"
   s += "      --profile (build or run): optimized, and at exit the program reports where its CPU time went\n"
   s += "      (by function and line, on stderr; all of it in vu-profile.txt, stacks in vu-profile.folded)\n"
+  s += "      --lib: a shared library (libFILE.so, .dylib on macOS) of the functions marked 'export fn',\n"
+  s += "      and a C header (FILE.h) declaring them, for C, or Python through ctypes\n"
   s += "  vu get [FILE.vu]\n"
   s += "      fetch the packages in vu.pkg (and the ones they need) and write vu.lock\n"
   s += "  vu search [WORDS...] / vu add NAME [VERSION]\n"

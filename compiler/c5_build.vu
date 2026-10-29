@@ -49,6 +49,83 @@ fn gen_extern(var g: G, items: [Node], name: Str):
     lines.push("    return r;")
   g.bodies.push(join(lines, "\n"))
 
+# export fn f: the C function f, in C's terms. A Str arrives as (const char *, int64_t length; a
+# negative length: up to the NUL), a list as (const T *, int64_t count), both borrowed for the call. A
+# Str or list result is a malloc'd copy (a Str's with a NUL after it) and its length in *vu_out_len
+# (when not NULL); the caller frees it. A failing function's last parameter, char **vu_err, gets the
+# message (malloc'd) or NULL, and the result is then 0 or NULL.
+fn lib_elem(t: Str) -> Str:
+  if t == "[Int]": return "int64_t"
+  if t == "[Float]": return "double"
+  return "uint8_t"
+
+fn lib_cname(n: Str) -> Str:
+  if is_c_keyword(n) or n.startswith("vu_") or n.endswith("_t") or n == "NULL" or n == "errno": return n + "_"
+  return n
+
+fn export_code(g: G, name: Str) -> [Str]:
+  let fi = g.fns[name]
+  var cps: [Str] = []
+  var pre: [Str] = []
+  var args: [Str] = []
+  for pa in fi.params:
+    let cn = lib_cname(pa.name)
+    let lv = "vu_a_" + pa.name
+    if pa.ty == "Str":
+      cps.push("const char *" + cn)
+      cps.push("int64_t " + cn + "_len")
+      pre.push("vu_str " + lv + " = vu_lib_in(" + cn + ", " + cn + "_len);")
+      args.push("&" + lv)
+    elif ffi_list(pa.ty):
+      let e = lib_elem(pa.ty)
+      cps.push("const " + e + " *" + cn)
+      cps.push("int64_t " + cn + "_len")
+      pre.push(ct(g, pa.ty) + " " + lv + " = {{ (" + e + " *)" + cn + ", " + cn + " && " + cn + "_len > 0 ? " + cn + "_len : 0, 0 }};")
+      args.push("&" + lv)
+    else:
+      cps.push(ct(g, pa.ty) + " " + cn)
+      args.push(cn)
+  let ret = fi.ret
+  var rt = "void"
+  var big = false
+  if ret == "Str":
+    rt = "char *"
+    big = true
+  elif ffi_list(ret):
+    rt = lib_elem(ret) + " *"
+    big = true
+  elif ret != "~void": rt = ct(g, ret)
+  if big: cps.push("int64_t *vu_out_len")
+  if fi.fails: cps.push("char **vu_err")
+  var plist = join(cps, ", ")
+  if plist == "": plist = "void"
+  var proto = rt + " " + name + "(" + plist + ")"
+  if rt.endswith("*"): proto = rt + name + "(" + plist + ")"
+  var b: [Str] = []
+  for x in pre: b.push("    " + x)
+  var call = "fn_" + name + "(" + join(args, ", ") + ")"
+  var val = ""
+  if fi.fails:
+    b.push("    " + ct(g, "!" + ret) + " vu_r = " + call + ";")
+    b.push("    if (vu_r.bad) {{ if (vu_err) *vu_err = (char *)vu_lib_out(vu_r.err.data, vu_r.err.len, 1, 1, NULL); drop_Str(&vu_r.err);" + if_big(big, " if (vu_out_len) *vu_out_len = 0;") + " return" + if_big(ret != "~void", " 0") + "; }}")
+    b.push("    if (vu_err) *vu_err = NULL;")
+    val = "vu_r.val"
+  elif ret != "~void":
+    b.push("    " + ct(g, ret) + " vu_r = " + call + ";")
+    val = "vu_r"
+  else: b.push("    " + call + ";")
+  if ret == "Str":
+    b.push("    char *vu_p = (char *)vu_lib_out(" + val + ".data, " + val + ".len, 1, 1, vu_out_len); drop_Str(&" + val + "); return vu_p;")
+  elif ffi_list(ret):
+    let e = lib_elem(ret)
+    b.push("    " + e + " *vu_p = (" + e + " *)vu_lib_out(" + val + ".data, " + val + ".len, sizeof(" + e + "), 0, vu_out_len); drop_" + mg(g, ret) + "(&" + val + "); return vu_p;")
+  elif ret != "~void": b.push("    return " + val + ";")
+  return [proto, "__attribute__((visibility(\"default\"))) " + proto + " {{\n" + join(b, "\n") + "\n}}"]
+
+fn if_big(c: Bool, s: Str) -> Str:
+  if c: return s
+  return ""
+
 fn ffi_ct(g: G, t: Str, param: Bool) -> Str:
   if t == "Str":
     if param: return "const vu_str *"
@@ -659,6 +736,20 @@ fn build(var g: G, items: [Node]) -> Str:
       out.push(g.lam_sigs[k] + " {{")
       out.push(g.lam_bodies[k] + "")
       out.push("}}")
+  # export fn: the C functions (vu build --lib), and their declarations for the header, in a comment
+  var heads: [Str] = []
+  var wraps: [Str] = []
+  for fname, fi in g.fns:
+    if fi.item >= 0 and items[fi.item].op == "export":
+      let pc = export_code(g, fname)
+      heads.push(pc[0] + ";")
+      wraps.push(pc[1] + "")
+  if wraps.len > 0:
+    out.push("#line 1 \"(exported functions)\"")
+    out.push("static vu_str vu_lib_in(const char *p, int64_t n) {{ if (!p) n = 0; else if (n < 0) n = (int64_t)strlen(p); vu_str s = {{ (uint8_t *)p, n, 0 }}; return s; }}")
+    out.push("static void *vu_lib_out(const void *p, int64_t n, size_t size, int nul, int64_t *len) {{ char *r = (char *)malloc((size_t)n * size + 1); if (!r) vu_oom(); if (n) memcpy(r, p, (size_t)n * size); if (nul) r[(size_t)n * size] = 0; if (len) *len = n; return r; }}")
+    for w in wraps: out.push(w)
+    out.push("/* vu-lib-header\n" + join(heads, "\n") + "\nvu-lib-header */")
   return join(out, "\n") + "\n"
 
 # ============================================================================ driver
@@ -937,6 +1028,18 @@ fn load_program(fs: Fs, ctx: Ctx, src: Str, var files: [Ctx], stdd: Str, pkgs: [
   let toks = lex(ctx, src, 0, 0)
   var p0 = Parser(Ctx(ctx.path, copy_strs(ctx.lines), ctx.json), toks, 0, 0, 0)
   items.push(parse_program(&p0))
+  # A library (export fn and no main) gets an empty main, so it builds like a program.
+  var has_main = false
+  var has_export = false
+  for it in items[0]:
+    if it.k == "fn" and it.name == "main": has_main = true
+    if it.k == "fn" and it.op == "export": has_export = true
+  if has_export and not has_main:
+    let mtoks = lex(ctx, "fn main():\n  return\n", 0, 0)
+    var pm = Parser(Ctx(ctx.path, copy_strs(ctx.lines), ctx.json), mtoks, 0, p0.nid, 0)
+    var mi = parse_program(&pm)
+    mi[0].v = "(library)"   # (not in vu check --index)
+    move_nodes(&mi, &items[0])
   let main_name = stem_of(ctx.path)
   var fi = 0
   while fi < items.len:
@@ -1133,6 +1236,7 @@ fn index_text(g: G, items: [Node]) -> Str:
   for it in items:
     var k = it.k
     if k != "fn" and k != "type" and k != "enum" and k != "const" and k != "iface": continue
+    if k == "fn" and it.v == "(library)": continue
     let fi = it.line >> 24
     if fi >= g.files.len: continue
     let lines = g.files[fi].lines
@@ -1411,6 +1515,7 @@ fn main(fs: Fs, os: Os):
   var static = false
   var wasm = false
   var profile = false
+  var lib = false
   var checks = false
   var index = false
   var path = ""
@@ -1430,6 +1535,9 @@ fn main(fs: Fs, os: Os):
       if a == "-o": o = argv[i + 1]
       else: emit_c = argv[i + 1]
       i += 2
+    elif a == "--lib" and cmd == "build":
+      lib = true
+      i += 1
     elif a == "--checks" and cmd == "check":
       checks = true
       i += 1
@@ -1503,6 +1611,21 @@ fn main(fs: Fs, os: Os):
       eprint("vu: front end {fe:.1} ms")
     exit(0)
   if tsan: csrc = replace_all(csrc, "schedule(dynamic)", "schedule(static)")
+  # --lib: a shared library of the export fn functions, and a C header declaring them
+  var lib_head = ""
+  var mac = false
+  if lib:
+    let hs = csrc.find("/* vu-lib-header\n", 0)
+    var why = ""
+    if wasm or static or profile: why = "--lib builds a shared library, so it can't be combined with --wasm, --static or --profile"
+    elif hs < 0: why = "--lib builds a library of the functions marked 'export fn', and " + path + " has none"
+    elif csrc.find("#define VU_MT 1", 0) >= 0: why = "a library can't use tasks or channels yet (spawn, chan, select, os.sleep): its functions run on the calling program's threads"
+    if why != "":
+      eprint("vu: " + why)
+      exit(2)
+    lib_head = csrc[hs + 17..csrc.find("\nvu-lib-header */", hs)]
+    csrc = csrc.replace("int main(int argc, char **argv) {{ return vu_start(argc, argv, vu_main, vu_file_names); }}", "static char *vu_lib_argv[] = {{(char *)\"lib\", NULL}};\n__attribute__((constructor)) static void vu_lib_init(void) {{ vu_argc = 1; vu_argv = vu_lib_argv; vu_files = vu_file_names; vu_seed_init(); (void)vu_main; (void)vu_start; }}")
+    mac = (os.output(["uname", "-s"]) else "").strip() == "Darwin"
   let work = fs.temp_dir() else ""
   if work == "":
     eprint("vu: can't make a temporary folder for the C compiler's input")
@@ -1510,6 +1633,11 @@ fn main(fs: Fs, os: Os):
   var cfile = emit_c + ""
   if cfile == "": cfile = work + "/out.c"
   var out = o + ""
+  if out == "" and lib:
+    let base = without_ext(path)
+    let sl = find_last(base, "/") + 1
+    out = base[0..sl] + "lib" + base[sl..base.len] + ".so"
+    if mac: out = base[0..sl] + "lib" + base[sl..base.len] + ".dylib"
   if out == "":
     if cmd == "build": out = without_ext(path)
     else: out = work + "/prog"
@@ -1609,6 +1737,34 @@ fn main(fs: Fs, os: Os):
   for l in links: argl.push("-l" + l)
   # --static: no shared libraries needed where it runs (glibc's name lookup still wants its own at run time)
   if static: argl.push("-static")
+  if lib:
+    if mac: argl.push("-dynamiclib")
+    else: argl.push("-shared")
+    argl.push("-fPIC")
+    argl.push("-fvisibility=hidden")
+    # (libwords.so: words.h)
+    var hname = without_ext(out) + ".h"
+    let hs0 = find_last(hname, "/") + 1
+    if hname[hs0..hname.len].startswith("lib") and hname.len - hs0 > 5: hname = hname[0..hs0] + hname[hs0 + 3..hname.len]
+    let stem = stem_of(path)
+    var guard = "VU_LIB_"
+    for c in bytes(stem.upper()):
+      if (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9'): guard += str([c])
+      else: guard += "_"
+    var h = "/* The functions " + path + " exports (vu build --lib). A Str is passed as a pointer and\n"
+    h += "   a length (a negative length: up to the first zero byte), a list as a pointer and a count,\n"
+    h += "   both read only during the call. A Str or list result is a copy made with malloc, with its\n"
+    h += "   length in *vu_out_len (when not NULL); free it with free(). A function that can fail sets\n"
+    h += "   *vu_err to a message (free it) and returns 0 or NULL, or sets it to NULL. A panic ends the\n"
+    h += "   process, after printing its report. */\n"
+    h += "#ifndef " + guard + "_H\n#define " + guard + "_H\n#include <stdbool.h>\n#include <stdint.h>\n"
+    h += "#ifdef __cplusplus\nextern \"C\" {{\n#endif\n" + lib_head + "\n#ifdef __cplusplus\n}}\n#endif\n#endif\n"
+    match fs.write(hname, h):
+      ok: lib_head = ""
+      err(e):
+        eprint("vu: " + e)
+        clean_up(fs, work, temps)
+        exit(3)
   # VU_CACHE=dir keeps each binary under the SHA-256 of everything it's made from (the C, the C
   # compiler's command and version), so building the same program the same way again is a copy. Not
   # for programs with extern C files (what they include isn't in the C here).
@@ -1683,6 +1839,9 @@ fn main(fs: Fs, os: Os):
     clean_up(fs, work, temps)
     if has_ext:
       eprint("vu: the C compiler rejected the program; errors in an extern C file are shown above")
+      exit(1)
+    if lib:
+      eprint("vu: the C compiler rejected the library; if it named an exported function or one of its parameters (\"(exported functions)\" above), that name is already the C library's: rename it")
       exit(1)
     eprint("vu: internal error: the C compiler rejected the generated code")
     exit(3)

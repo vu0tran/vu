@@ -2219,3 +2219,37 @@ element, an empty list, whose pointer may be NULL) with AddressSanitizer and UBS
 clean under the gate's warning flags with gcc and clang. The SPEC's zlib example (`crc32` over a
 `[Byte]`) gives the same checksum as Python's `zlib.crc32`. Results stay scalars, `Str` or handles:
 a list doesn't come back from C.
+
+Libraries: `export fn` makes a function a plain C function too, and `vu build --lib` builds a file's
+exported functions into a shared library (`.so`, `.dylib` on macOS) with a C header. Strings and
+lists of numbers go in as a pointer and a length, read in place; strings and lists come out as
+`malloc`'d copies; a failing function hands back its message. An exported function gets no
+capabilities, so a library can't reach files, the network or programs. `tests/run_lib.sh` builds
+`tests/lib/words.vu` (every kind of parameter and result) and calls it from C, from one thread and
+eight at once (57,625 checks, clean under AddressSanitizer, LeakSanitizer, UBSan and
+ThreadSanitizer), and from Python through ctypes against the same functions written in Python (about
+26,700 answers a seed, three seeds, also with AddressSanitizer preloaded into Python). Only the
+exported names are visible in the library.
+
+What attacking it found:
+- ThreadSanitizer: the task runtime starts itself on the first task operation, assuming that's the
+  program's main thread. Called from eight threads of a C program, they all started it at once.
+  Making tasks work in a library is a larger change, so `--lib` refuses a program that uses tasks or
+  channels, and says why.
+- An exported function with type parameters was quietly left out of the library (generic functions
+  are kept apart until used). It's now an error.
+- The wrapper's own locals (`r`, `p`) could clash with a parameter of the same name, and a parameter
+  named `size_t` or `NULL` broke the header. The wrapper's names now start with `vu_`, and such
+  parameter names get a `_` in C.
+- A parameter `s_len` next to a `Str` named `s` would have collided with the length C passes for
+  `s`. It's an error now, with the reason.
+- An export named like a C library function (`puts`) failed with "internal error". It now says the
+  name is already the C library's and should be renamed.
+- My own test mistakes, not findings: a `Byte` that went past 255 (Vu checks), Python's `sum()` of
+  floats (it compensates, and Vu's loop doesn't), and an overflowing `Int` sum in the model.
+
+Tracing CI's AddressSanitizer crashes: the MCP time server crashed under AddressSanitizer on the
+Linux x86-64 runner a second time. The crash was a segmentation fault at its first request, and
+neither crash happens locally (800 starts). Vu's own handler had reported both as "segmentation
+fault", hiding where they happened. In AddressSanitizer builds, a fault that isn't a stack overflow
+now goes on to AddressSanitizer's handler, which prints the stack. The cause is still unknown.

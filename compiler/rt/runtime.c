@@ -1000,6 +1000,16 @@ static inline void vu_thread_guard(void) {
 #ifdef VU_WASI
 static void vu_guard_init(void *top) { vu_stack_top = (uintptr_t)top; }
 #else
+#if defined(__SANITIZE_ADDRESS__)
+#define VU_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define VU_ASAN 1
+#endif
+#endif
+#ifdef VU_ASAN
+static struct sigaction vu_asan_segv, vu_asan_bus;   /* AddressSanitizer's handlers, from before ours */
+#endif
 static void vu_segv(int sig, siginfo_t *si, void *ctx) {
     (void)sig; (void)ctx;
     uintptr_t a = (uintptr_t)si->si_addr;
@@ -1007,6 +1017,14 @@ static void vu_segv(int sig, siginfo_t *si, void *ctx) {
     static const char other[] = "segmentation fault (this is a bug in the Vu compiler; please report it)";
     bool is_over = (a < vu_stack_top && vu_stack_top - a < vu_stack_size + (1u << 20))
                 || (vu_t_hi && a < vu_t_hi && a + (1u << 20) >= vu_t_lo);
+#ifdef VU_ASAN
+    /* not a stack overflow: AddressSanitizer's report says where it happened (its handler runs when
+       the faulting instruction runs again) */
+    if (!is_over) {
+        struct sigaction *old = sig == SIGBUS ? &vu_asan_bus : &vu_asan_segv;
+        if (old->sa_flags & SA_SIGINFO) { sigaction(sig, old, NULL); return; }
+    }
+#endif
     vu_report_lock();   /* before touching the buffer: another thread may be writing its report */
     vu_plen = 0;        /* this thread may have been interrupted halfway through its own report */
     vu_report(is_over ? over : other, is_over ? sizeof over - 1 : sizeof other - 1, 0);
@@ -1024,7 +1042,11 @@ static void vu_guard_init(void *top) {
     sa.sa_sigaction = vu_segv;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
+#ifdef VU_ASAN
+    if (sigaltstack(&ss, NULL) == 0) { sigaction(SIGSEGV, &sa, &vu_asan_segv); sigaction(SIGBUS, &sa, &vu_asan_bus); }
+#else
     if (sigaltstack(&ss, NULL) == 0) { sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); }
+#endif
 }
 #endif
 #define VU_SMALL_MAP 16

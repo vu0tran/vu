@@ -829,6 +829,58 @@ C code is outside Vu's checks: the glue must not keep a borrowed `vu_str` or lis
 call, write past a list's count,
 free a borrowed handle, or return a handle that is still owned elsewhere.
 
+## Libraries for C and Python
+
+`export fn` makes a function a plain C function of the same name too, and `vu build --lib` builds
+the file's exported functions into a shared library (`libNAME.so`, or `.dylib` on macOS) with a
+header declaring them (`NAME.h`):
+
+```
+export fn count_words(text: Str) -> Int:
+  return text.split().len
+
+export fn mean(xs: [Float]) -> Float throws:
+  if xs.len == 0: fail "mean of no numbers"
+  var t = 0.0
+  for x in xs: t += x
+  return t / float(xs.len)
+```
+
+```
+vu build --lib words.vu           # libwords.so and words.h
+```
+
+```c
+int64_t count_words(const char *text, int64_t text_len);
+double mean(const double *xs, int64_t xs_len, char **vu_err);
+```
+
+From Python, with ctypes:
+
+```python
+import ctypes
+lib = ctypes.CDLL("./libwords.so")
+lib.count_words.restype = ctypes.c_int64
+lib.count_words.argtypes = [ctypes.c_char_p, ctypes.c_int64]
+print(lib.count_words(b"the quick brown fox", -1))   # 4
+```
+
+- Parameters can be `Int`, `Float`, `Bool`, `Byte` (as for extern functions), `Str` (a pointer
+  and a length; a negative length reads up to the first zero byte) and `[Byte]`, `[Int]` or
+  `[Float]` (a pointer and a count). Both are read in place, during the call only.
+- Results are those scalars, nothing, or a `Str` or list: a copy made with `malloc` (a Str's with
+  a zero byte after it), with its length in `*vu_out_len` when that isn't NULL. The caller frees
+  it with `free`.
+- A function that `throws` takes `char **vu_err` last: a message (free it) when it fails, with a
+  result of 0 or NULL, and NULL when it succeeds. Typed errors (`throws E`) can't be exported.
+- An exported function gets no capabilities, so a library can't reach files, the network or
+  programs, whatever it's called with. It can use `par` loops, not tasks or channels (yet).
+- It's called on the caller's threads, from as many at once as the caller likes.
+- A panic prints its report and ends the process (exit 101), as it does a program.
+- Only the main file's functions can be exported, without type parameters, and with names that
+  aren't C keywords or already the C library's (the C compiler names a clash). Exported functions
+  are ordinary Vu functions too, and a library may have a `main` (it isn't run).
+
 ## Control flow
 
 ```
@@ -955,6 +1007,7 @@ vu run --release file.vu    # optimized build, then run (options go before the f
                             #   everything after it goes to the program)
 #!/usr/bin/env -S vu run     # first line of a script: run it as ./script.vu
 vu build file.vu [-o out]   # optimized native binary
+vu build --lib file.vu      # a shared library of its export fn functions, and a C header
   --profile  report where the CPU time went, at exit (also for run)
   --debug    -O0 build for fast iteration
   --malloc   use malloc/free instead of the node free list
