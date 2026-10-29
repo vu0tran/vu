@@ -2303,3 +2303,9 @@ What testing split builds found:
 - The compiler that has split builds builds itself, so a bug in them stops the next build. The first
   version declared `vu_main` twice (`VU_FN` and `static`). `VU_SPLIT=off compiler/build.sh` got past
   it.
+
+Capabilities, shown: `vu check --caps FILE` prints what a program can reach, meaning the
+capabilities `main` asks for, since nothing else can make one. For example, `mcp/fetch` can use
+only the network, and `mcp/git` only files and programs. An agent skill (`packaging/skill/vu`) uses
+it: write the tool, `vu check` it, show the person what `--caps` prints, then `vu run` it (kept
+binary, about 10 ms a start after the first). The skill hasn't been tried in an agent session yet.

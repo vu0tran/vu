@@ -1002,6 +1002,7 @@ let k = from_hex("00ff")?          # fails on anything but hex digits in pairs; 
 vu check file.vu            # errors only: no binary, no C compiler (milliseconds)
 vu check --checks file.vu   # also: the index and overflow checks each loop still makes on every pass
 vu check --index file.vu    # also: what the language server knows (items, fields, variables' types), as JSON lines
+vu check --caps file.vu     # what the program can reach: the capabilities main asks for (fs, os, net, ffi)
 vu run file.vu [args]       # quick -O0 build, then run with args
 vu run --release file.vu    # optimized build, then run (options go before the file;
                             #   everything after it goes to the program)

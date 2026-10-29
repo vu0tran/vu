@@ -125,5 +125,15 @@ for i in $(seq 1 66); do $VU run "$work/p$i.vu" >/dev/null; done
 n=$(ls "$work/cache/vu/run" | wc -l); out=$(cat "$work/cache/vu/run"/*.key | grep -c "/p1.vu$")
 [ "$n" -eq 128 ] && [ "$out" -eq 0 ]; check "run: the 64 programs used last are kept" $? "n=$n p1=$out"
 
+# vu check --caps: what main asks for, and no C compiler
+printf 'fn main(fs: Fs, net: Net):\n  print("x")\n' > "$work/cap.vu"
+: > "$work/cc.log"; out=$($VU check --caps "$work/cap.vu" 2>&1); rc=$?
+[ $rc -eq 0 ] && echo "$out" | grep -q "^  fs   files" && echo "$out" | grep -q "^  net  the network" && ! echo "$out" | grep -q "^  os" && [ ! -s "$work/cc.log" ]
+check "check --caps: lists main's capabilities, and nothing else" $? "rc=$rc out=[$out]"
+out=$($VU check --caps "$work/ok.vu" 2>&1)
+echo "$out" | grep -q "uses nothing outside itself"; check "check --caps: a program with none says so" $? "[$out]"
+out=$($VU check --caps "$work/bad.vu" 2>&1); rc=$?
+[ $rc -eq 1 ]; check "check --caps: a program with errors reports them (exit 1)" $? "rc=$rc [$out]"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]
