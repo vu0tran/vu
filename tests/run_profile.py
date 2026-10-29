@@ -45,8 +45,10 @@ hot = build('hot')
 r = run(hot, '60')
 s = shares(r.stderr)
 check('hot.vu runs as without the profiler', r.returncode == 0 and r.stdout.strip().isdigit(), r.stdout + r.stderr)
-n = int(re.search(r'vu profile: (\d+) samples', r.stderr).group(1)) if 'vu profile:' in r.stderr else 0
-check(f'a report with samples ({n}: the kernel\'s timer tick, often 250 a second)', n >= 150, r.stderr)
+m = re.search(r'vu profile: (\d+) samples of ([\d.]+) s', r.stderr)
+n, cpu = (int(m.group(1)), float(m.group(2))) if m else (0, 0.0)
+# (samples per second of CPU, not a count: how long hot.vu runs depends on the C compiler's code)
+check(f'a report with samples ({n} in {cpu} s of CPU: the kernel\'s timer tick, often 250 a second)', n >= 50 and n >= 150 * cpu, r.stderr)
 ok = 'hot' in s and 'warm' in s and 60 <= s['hot'][1] <= 95 and 5 <= s['warm'][1] <= 35 and s['hot'][1] > s['warm'][1] and s.get('main', (0, 0))[0] >= 99
 check(f'hot() has most of the self time and warm() some (hot {s.get("hot")}, warm {s.get("warm")}, main {s.get("main")})', ok, r.stderr)
 check('cold() is too quick to appear, or close to 0%', s.get('cold', (0, 0))[1] < 2, s.get('cold'))
