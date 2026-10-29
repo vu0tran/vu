@@ -1,0 +1,1343 @@
+# mcp-git: the MCP git server (git_status, git_diff_unstaged, git_diff_staged, git_diff, git_commit,
+# git_add, git_reset, git_log, git_create_branch, git_checkout, git_show, git_branch) as one Vu
+# program, answering as the reference (mcp-server-git, Python, through GitPython) does: the same tools,
+# argument checks, results and messages, GitPython's own revision parser and commit writer included.
+#
+#   vu build mcp/git/main.vu -o mcp-git
+#   mcp-git [--repository PATH]        (with it, every repo_path must be inside that repository)
+#
+# It runs the git program for everything it reads and changes (GitPython does too, for most of it).
+import json
+import mcp
+import pyrepr
+import stdio
+import tools
+
+const PYDANTIC = "https://errors.pydantic.dev/2.14/v/"
+
+type Env:
+  fs: Fs
+  os: Os
+  tmp: Str            # a private folder for git's output
+  cwd: Str
+  allowed: Str        # --repository, resolved to its top folder ("" for none)
+
+# How a tool fails: a message the model sees (the reference's ToolError), or an exception the SDK
+# shows as "Error executing tool <name>" and nothing more.
+type Oops:
+  Tool(msg: Str)
+  Crash(msg: Str)
+
+# ---- running programs
+
+type Ran:
+  code: Int
+  out: Str
+  err: Str
+
+fn run_in(e: Env, dir: Str, argv: [Str]) -> Ran:
+  let base = e.tmp + "/run"
+  var a = ["sh", "-c", "d=$1; shift; cd \"$d\" 2>/dev/null || exit 127; exec \"$@\" >\"$0.out\" 2>\"$0.err\" </dev/null", base, dir + ""]
+  for x in argv: a.push(x + "")
+  let code = e.os.run(a) else 127
+  let out = e.fs.read(base + ".out") else ""
+  let err = e.fs.read(base + ".err") else ""
+  e.fs.remove(base + ".out") else 0
+  e.fs.remove(base + ".err") else 0
+  return Ran(code, out, err)
+
+fn strip1(s: Str) -> Str:
+  if s.endswith("\n"): return s[0..s.len - 1]
+  return s + ""
+
+fn utf8(s: Str) -> Str:
+  if s.is_utf8(): return s + ""
+  var o = ""
+  for c in s.chars(): o += c
+  return o
+
+# GitPython's GitCommandError text.
+fn command_error(argv: [Str], r: Ran) -> Str:
+  var m = "Cmd('git') failed due to: exit code({r.code})\n  cmdline: " + " ".join(argv)
+  let out = strip1(utf8(r.out))
+  let err = strip1(utf8(r.err))
+  if out != "": m += "\n  stdout: '" + out + "'"
+  if err != "": m += "\n  stderr: '" + err + "'"
+  return m
+
+type Repo:
+  root: Str          # the working tree ("" for a bare repository)
+  git_dir: Str
+
+# A git command as GitPython runs it (in the working tree), its output with one trailing line break
+# taken off; a failure is its GitCommandError.
+fn git(e: Env, r: Repo, args: [Str]) -> Str throws Oops:
+  var argv = ["git"]
+  for a in args: argv.push(a + "")
+  var dir = r.root
+  if dir == "": dir = r.git_dir
+  let ran = run_in(e, dir, argv)
+  if ran.code != 0: fail Tool(command_error(argv, ran))
+  return strip1(ran.out)
+
+fn git_ok(e: Env, r: Repo, args: [Str]) -> Ran:
+  var argv = ["git"]
+  for a in args: argv.push(a + "")
+  var dir = r.root
+  if dir == "": dir = r.git_dir
+  return run_in(e, dir, argv)
+
+# Path.resolve(): symlinks followed where they exist, "." and ".." resolved.
+fn resolve(e: Env, p: Str) -> Str:
+  let r = run_in(e, ".", ["realpath", "-m", "--", p])
+  if r.code != 0: return p + ""
+  return strip1(r.out)
+
+fn is_dir(e: Env, p: Str) -> Bool:
+  match e.fs.list(p):
+    ok(_): return true
+    err(_): return false
+
+fn is_file(e: Env, p: Str) -> Bool:
+  match e.fs.read(p):
+    ok(_): return true
+    err(_): return false
+
+fn exists(e: Env, p: Str) -> Bool:
+  return e.fs.exists(p)
+
+fn cwd_abs(e: Env, p: Str) -> Str:
+  if p.startswith("/"): return normpath(p)
+  return normpath(e.cwd + "/" + p)
+
+# os.path.normpath for an absolute path
+fn normpath(p: Str) -> Str:
+  var parts: [Str] = []
+  for x in p.split("/"):
+    if x == "" or x == ".": continue
+    if x == "..":
+      if parts.len > 0: parts.pop()
+      continue
+    parts.push(x + "")
+  return "/" + "/".join(parts)
+
+# ---- opening a repository as GitPython does (git.Repo(path), no searching upward)
+
+fn is_git_dir(e: Env, d: Str) -> Bool:
+  if not is_dir(e, d): return false
+  let head = e.fs.read(d + "/HEAD") else return false
+  var ok = false
+  if head.startswith("ref:"): ok = head[4..head.len].strip().startswith("refs/")
+  else:
+    var n = 0
+    while n < head.len and n < 40 and ((head[n] >= '0' and head[n] <= '9') or (head[n] >= 'a' and head[n] <= 'f') or (head[n] >= 'A' and head[n] <= 'F')): n += 1
+    ok = n == 40
+  return ok and is_dir(e, d + "/objects") and is_dir(e, d + "/refs")
+
+fn open_plain(e: Env, path: Str) -> Repo throws Oops:
+  let ep = cwd_abs(e, path)
+  if not exists(e, ep): fail Tool(ep)
+  var curpath = ep + ""
+  if is_git_dir(e, curpath):
+    # a git directory opened itself: its working tree is the folder above, unless it's bare
+    let bare = run_in(e, curpath, ["git", "config", "--file", curpath + "/config", "--get", "core.bare"])
+    if strip1(bare.out) == "true": return Repo("", curpath)
+    let k = rfind_slash(curpath)
+    var up = curpath[0..k]
+    if up == "": up = "/"
+    return Repo(up, curpath)
+  let dotgit = curpath + "/.git"
+  if is_git_dir(e, dotgit): return Repo(curpath, dotgit)
+  if is_file(e, dotgit):
+    let t = e.fs.read(dotgit) else ""
+    let c = t.rstrip()
+    if c.startswith("gitdir: "):
+      var gd = c[8..c.len]
+      if not gd.startswith("/"): gd = normpath(curpath + "/" + gd)
+      if is_git_dir(e, gd): return Repo(curpath, gd)
+  fail Tool(ep)
+
+fn rel_inside(p: Str, root: Str) -> Bool:
+  return p == root or p.startswith(root + "/") or root == "/"
+
+fn open_repo(e: Env, path: Str) -> Repo throws Oops:
+  if e.allowed != "":
+    let rr = resolve(e, path)
+    if not rel_inside(rr, e.allowed): fail Tool("Repository path '" + path + "' is outside the allowed repository '" + e.allowed + "'")
+  let r = open_plain(e, path)?
+  if e.allowed != "": check_opened(e, r, path)?
+  return r
+
+# validate_opened_repo: the working tree and git directories git uses must be inside too.
+fn check_opened(e: Env, r: Repo, path: Str) throws Oops:
+  let outside = fn(used: Str) => "Repository path '" + path + "' uses '" + used + "', which is outside the allowed repository '" + e.allowed + "'"
+  let lines = git(e, r, ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--is-bare-repository"])?.split("\n")
+  var trees: [Str] = []
+  if lines.len >= 3 and lines[2] != "true": trees.push(git(e, r, ["rev-parse", "--show-toplevel"])?)
+  if r.root != "": trees.push(r.root + "")
+  for t in trees:
+    if not rel_inside(resolve(e, t), e.allowed): fail Tool(outside(t))
+  var dirs: [Str] = []
+  for i in 0..2:
+    if i < lines.len: dirs.push(lines[i] + "")
+  dirs.push(r.git_dir + "")
+  dirs.push(common_dir(e, r))
+  var own: [Str] = []
+  let ar = open_plain(e, e.allowed) else return
+  own.push(resolve(e, ar.git_dir))
+  own.push(resolve(e, common_dir(e, ar)))
+  for d in dirs:
+    let rd = resolve(e, d)
+    if rel_inside(rd, e.allowed): continue
+    if not (rd in own): fail Tool(outside(d))
+
+fn common_dir(e: Env, r: Repo) -> Str:
+  let c = e.fs.read(r.git_dir + "/commondir") else return r.git_dir + ""
+  let t = c.rstrip()
+  if t.startswith("/"): return t
+  return normpath(r.git_dir + "/" + t)
+
+# ---- objects, read with git cat-file
+
+type Obj:
+  sha: Str
+  kind: Str          # commit, tree, blob, tag
+
+fn obj_of(e: Env, r: Repo, sha: Str) -> Obj throws Oops:
+  let ran = git_ok(e, r, ["cat-file", "-t", sha])
+  if ran.code != 0: fail Tool(sha)
+  return Obj(sha + "", strip1(ran.out))
+
+fn raw(e: Env, r: Repo, o: Obj) -> Str throws Oops:
+  let ran = git_ok(e, r, ["cat-file", o.kind, o.sha])
+  if ran.code != 0: fail Crash("cat-file")
+  return ran.out
+
+fn header_field(rawtext: Str, name: Str) -> Str:
+  for line in rawtext.split("\n"):
+    if line == "": break
+    if line.startswith(name + " "): return line[name.len + 1..line.len]
+  return ""
+
+fn parents(e: Env, r: Repo, c: Obj) -> [Str] throws Oops:
+  let t = raw(e, r, c)?
+  var ps: [Str] = []
+  for line in t.split("\n"):
+    if line == "": break
+    if line.startswith("parent "): ps.push(line[7..line.len])
+  return ps
+
+fn deref_tag(e: Env, r: Repo, o: Obj) -> Obj throws Oops:
+  var cur = Obj(o.sha + "", o.kind + "")
+  while cur.kind == "tag":
+    let t = raw(e, r, cur)?
+    cur = obj_of(e, r, header_field(t, "object"))?
+  return cur
+
+fn obj_repr(o: Obj) -> Str:
+  var cls = "Commit"
+  if o.kind == "tree": cls = "Tree"
+  elif o.kind == "blob": cls = "Blob"
+  elif o.kind == "tag": cls = "TagObject"
+  return "<git." + cls + " \"" + o.sha + "\">"
+
+fn to_commit(e: Env, r: Repo, o: Obj) -> Obj throws Oops:
+  var x = Obj(o.sha + "", o.kind + "")
+  if x.kind == "tag": x = deref_tag(e, r, x)?
+  if x.kind != "commit": fail Tool("Cannot convert object " + obj_repr(x) + " to type commit")
+  return x
+
+fn tree_of(e: Env, r: Repo, c: Obj) -> Obj throws Oops:
+  let t = raw(e, r, c)?
+  return Obj(header_field(t, "tree"), "tree")
+
+type Entry:
+  name: Str
+  kind: Str
+  sha: Str
+
+fn tree_entries(e: Env, r: Repo, t: Obj) -> [Entry] throws Oops:
+  let out = git(e, r, ["ls-tree", "-z", t.sha])?
+  var es: [Entry] = []
+  for item in out.split(chr(0)):
+    if item == "": continue
+    let tab = item.find("\t")
+    let meta = item[0..tab].split(" ")
+    es.push(Entry(item[tab + 1..item.len], meta[1] + "", meta[2] + ""))
+  return es
+
+fn key_error(msg: Str) -> Oops:
+  return Tool(pyrepr.str_repr(msg))
+
+# Tree.join
+fn tree_lookup(e: Env, r: Repo, o: Obj, path: Str) -> Obj throws Oops:
+  var t = Obj(o.sha + "", o.kind + "")
+  if t.kind != "tree": t = tree_of(e, r, to_commit(e, r, t)?)?
+  if path == "": return t
+  let msg = "Blob or Tree named " + pyrepr.str_repr(path) + " not found"
+  if path.find("/") >= 0:
+    let toks = path.split("/")
+    var tree = Obj(t.sha + "", "tree")
+    for i in 0..toks.len:
+      var found = false
+      var item = Obj("", "")
+      for en in tree_entries(e, r, tree)?:
+        if en.name == toks[i]:
+          item = Obj(en.sha + "", en.kind + "")
+          found = true
+          break
+      if not found: fail key_error("Blob or Tree named " + pyrepr.str_repr(toks[i]) + " not found")
+      if item.kind == "tree": tree = item
+      else:
+        if i != toks.len - 1: fail key_error(msg)
+        return item
+    if tree.sha == t.sha: fail key_error(msg)
+    return tree
+  for en in tree_entries(e, r, t)?:
+    if en.name == path: return Obj(en.sha + "", en.kind + "")
+  fail key_error(msg)
+
+# ---- references
+
+fn hexchar(b: Byte) -> Bool:
+  return (b >= '0' and b <= '9') or (b >= 'a' and b <= 'f') or (b >= 'A' and b <= 'F')
+
+fn short_hex(name: Str) -> Bool:
+  if name.len < 4 or name.len > 40: return false
+  for i in 0..name.len:
+    if not hexchar(name[i]): return false
+  return true
+
+# SymbolicReference.dereference_recursive for a ref path: the sha it ends at, or "".
+fn deref_ref(e: Env, r: Repo, refpath: Str) -> Str:
+  var p = refpath + ""
+  for depth in 0..10:
+    var content = ""
+    var have = false
+    let cd = common_dir(e, r)
+    var file = r.git_dir + "/" + p
+    if not (p == "HEAD" or p == "ORIG_HEAD" or p == "FETCH_HEAD" or p == "MERGE_HEAD" or p.startswith("refs/") == false): file = cd + "/" + p
+    if p.startswith("refs/"): file = cd + "/" + p
+    match e.fs.read(file):
+      ok(t):
+        content = t.strip()
+        have = true
+      err(_): have = false
+    if not have:
+      # packed-refs
+      let packed = e.fs.read(cd + "/packed-refs") else ""
+      for line in packed.split("\n"):
+        if line.startswith("#") or line.startswith("^") or line == "": continue
+        let sp = line.find(" ")
+        if sp > 0 and line[sp + 1..line.len] == p:
+          content = line[0..sp]
+          have = true
+          break
+    if not have: return ""
+    if content.startswith("ref: "):
+      p = content[5..content.len]
+      continue
+    if content.len == 40: return content
+    return ""
+  return ""
+
+type Named:
+  obj: Obj
+  ref: Str           # the reference path it came from ("" for a sha)
+
+fn name_to_object(e: Env, r: Repo, name: Str) -> Named throws Oops:
+  var hexsha = ""
+  if short_hex(name):
+    if name.len != 40:
+      let ran = git_ok(e, r, ["rev-parse", "--disambiguate=" + name.lower()])
+      let cands = strip1(ran.out)
+      if ran.code == 0 and cands != "" and cands.find("\n") < 0: hexsha = cands
+      elif cands.find("\n") >= 0: fail Tool("Short sha " + pyrepr.bytes_repr(name.lower()) + " is ambiguous")
+    else: hexsha = name.lower()
+  var ref = ""
+  if hexsha == "":
+    for base in ["%s", "refs/%s", "refs/tags/%s", "refs/heads/%s", "refs/remotes/%s", "refs/remotes/%s/HEAD"]:
+      let p = base.replace("%s", name)
+      if name == "" or p.find("..") >= 0 or p.startswith("/"): continue
+      let s = deref_ref(e, r, p)
+      if s != "":
+        hexsha = s
+        ref = p + ""
+        break
+  if hexsha == "": fail Tool("Ref '" + name + "' did not resolve to an object")
+  let o = obj_of(e, r, hexsha) else fail Tool(pyrepr.bytes_repr(hexsha))
+  return Named(o, ref)
+
+fn bad_name(rev: Str, msg: Str) -> Oops:
+  return Tool("Ref '" + msg + "' did not resolve to an object")
+
+fn first_token(rev: Str) -> Int:
+  for i in 0..rev.len:
+    let c = rev[i]
+    if c == '^' or c == '~' or c == ':': return i
+    if c == '@':
+      var next = 0
+      if i + 1 < rev.len: next = int(rev[i + 1])
+      if i == 0 and (i + 1 >= rev.len or next == 94 or next == 126 or next == 58 or next == 123): return i
+      if next == 123: return i
+  return -1
+
+fn closing_brace(rev: Str, start: Int) -> Int throws Oops:
+  var depth = 1
+  var esc = false
+  for i in start + 1..rev.len:
+    let c = rev[i]
+    if esc: esc = false
+    elif c == '\\': esc = true
+    elif c == '{': depth += 1
+    elif c == '}':
+      depth -= 1
+      if depth == 0: return i
+  fail Tool("Missing closing brace to define type in " + rev)
+
+fn head_ref(e: Env, r: Repo) -> Str:
+  let h = e.fs.read(r.git_dir + "/HEAD") else ""
+  let t = h.strip()
+  if t.startswith("ref: "): return t[5..t.len]
+  return "HEAD"
+
+fn reflog_entry(e: Env, r: Repo, ref: Str, n: Int) -> Str throws Oops:
+  let log = e.fs.read(common_dir(e, r) + "/logs/" + ref) else (e.fs.read(r.git_dir + "/logs/" + ref) else fail Tool("[Errno 2] No such file or directory: '" + r.git_dir + "/logs/" + ref + "'"))
+  var lines: [Str] = []
+  for l in log.split("\n"):
+    if l.strip() != "": lines.push(l + "")
+  let i = lines.len - 1 - n
+  if i < 0: fail Tool("Invalid revlog index: {n}")
+  return lines[i].split(" ")[1] + ""
+
+fn index_lookup(e: Env, r: Repo, spec: Str) -> Obj throws Oops:
+  if spec == "": fail Tool("':' must be followed by a path")
+  var stage = 0
+  var p = spec + ""
+  if spec.len >= 2 and spec[1] == ':' and spec[0] >= '0' and spec[0] <= '3':
+    stage = int(spec[0]) - 48
+    p = spec[2..spec.len]
+  let out = git(e, r, ["ls-files", "--stage", "-z", "--", ":(literal)" + p])?
+  for item in out.split(chr(0)):
+    if item == "": continue
+    let tab = item.find("\t")
+    let meta = item[0..tab].split(" ")
+    if item[tab + 1..item.len] == p and meta[2] == "{stage}": return Obj(meta[1] + "", "blob")
+  fail Tool("Ref 'Path " + pyrepr.str_repr(p) + " did not exist in the index at stage {stage}' did not resolve to an object")
+
+fn peel(e: Env, r: Repo, o: Obj, t: Str, rev: Str) -> Obj throws Oops:
+  if t.startswith("/"):
+    let ran = git_ok(e, r, ["rev-parse", "--verify", to_commit(e, r, o)?.sha + "^{{/" + t[1..t.len] + "}}"])
+    if ran.code != 0: fail Tool("Ref 'No commit found matching message pattern " + pyrepr.str_repr(t[1..t.len]) + "' did not resolve to an object")
+    return obj_of(e, r, strip1(ran.out))?
+  if t == "":
+    if o.kind == "tag": return deref_tag(e, r, o)?
+    return Obj(o.sha + "", o.kind + "")
+  if t == "object": return Obj(o.sha + "", o.kind + "")
+  if t == "commit": return to_commit(e, r, o)?
+  if t == "tree":
+    if o.kind == "tree": return Obj(o.sha + "", "tree")
+    return tree_of(e, r, to_commit(e, r, o)?)?
+  if t == "blob":
+    var x = Obj(o.sha + "", o.kind + "")
+    if x.kind == "tag": x = deref_tag(e, r, x)?
+    if x.kind == "blob": return x
+    fail Tool("Could not accommodate requested object type 'blob', got " + x.kind)
+  if t == "tag":
+    if o.kind == "tag": return Obj(o.sha + "", "tag")
+    fail Tool("Could not accommodate requested object type 'tag', got " + o.kind)
+  fail Tool("Invalid output type: " + t + " ( in " + rev + " )")
+
+# GitPython's rev_parse (git/repo/fun.py), ported: names, short shas, ~ ^ ^{type} :path @{n}.
+fn rev_parse(e: Env, r: Repo, rev: Str) -> Obj throws Oops:
+  if rev.startswith(":/"):
+    let pat = rev[2..rev.len]
+    if pat == "": fail Tool("Revision search requires a pattern")
+    let ran = git_ok(e, r, ["rev-parse", "--verify", rev])
+    if ran.code != 0: fail Tool("Ref 'No commit found matching message pattern " + pyrepr.str_repr(pat) + "' did not resolve to an object")
+    return obj_of(e, r, strip1(ran.out))?
+  if rev.startswith(":"): return index_lookup(e, r, rev[1..rev.len])?
+  let ft = first_token(rev)
+  if ft < 0:
+    let nm0 = name_to_object(e, r, rev)?
+    return Obj(nm0.obj.sha + "", nm0.obj.kind + "")
+  var obj = Obj("", "")
+  var ref = ""
+  var start = 0
+  if ft == 0:
+    if rev[0] != '@': fail Tool("Revision specifier must start with an object name: " + rev)
+    ref = head_ref(e, r)
+    let s = deref_ref(e, r, ref)
+    if s == "": fail Tool("Reference at " + pyrepr.str_repr(ref) + " does not exist")
+    obj = obj_of(e, r, s)?
+    if not rev.startswith("@{{"): start = 1
+  else:
+    let nm = name_to_object(e, r, rev[0..ft])?
+    obj = Obj(nm.obj.sha + "", nm.obj.kind + "")
+    if rev[ft] == '@':
+      if nm.ref == "": fail Tool("Couldn't find reference named " + pyrepr.str_repr(rev[0..ft]))
+      ref = nm.ref
+    start = ft
+  while start < rev.len:
+    let token = rev[start]
+    if token == '@':
+      if start + 1 >= rev.len or rev[start + 1] != '{': fail Tool("Invalid @ token in revision specifier: " + rev)
+      let end = closing_brace(rev, start + 1)?
+      var content = rev[start + 2..end]
+      if content.startswith("+"): content = content[1..content.len]
+      let n = int(content) else fail Crash("Support for additional @{{...}} modes not implemented")
+      var rf = ref + ""
+      if rf == "" or not (ft != 0 and start == ft): rf = head_ref(e, r)
+      if n == 0:
+        let s = deref_ref(e, r, rf)
+        obj = obj_of(e, r, s)?
+      else: obj = obj_of(e, r, reflog_entry(e, r, rf, n)?)?
+      ref = ""
+      start = end + 1
+      continue
+    if token == ':': return tree_lookup(e, r, obj, rev[start + 1..rev.len])?
+    start += 1
+    if token == '^' and start < rev.len and rev[start] == '{':
+      let end = closing_brace(rev, start)?
+      obj = peel(e, r, obj, rev[start + 1..end], rev)?
+      ref = ""
+      start = end + 1
+      continue
+    var num = 0
+    var digit = false
+    while start < rev.len and rev[start] >= '0' and rev[start] <= '9':
+      num = num * 10 + int(rev[start]) - 48
+      start += 1
+      digit = true
+    if not digit: num = 1
+    let tok = rev[start - 1..start]
+    let what = "Invalid revision spec '" + rev + "' - not enough parent commits to reach '" + chr(int(token)) + "{num}'"
+    if token == '~':
+      obj = to_commit(e, r, obj)?
+      for k in 0..num:
+        let ps = parents(e, r, obj)?
+        if ps.len == 0: fail bad_name(rev, what)
+        obj = obj_of(e, r, ps[0])?
+    elif token == '^':
+      obj = to_commit(e, r, obj)?
+      if num > 0:
+        let ps = parents(e, r, obj)?
+        if num - 1 >= ps.len: fail bad_name(rev, what)
+        obj = obj_of(e, r, ps[num - 1])?
+    else: fail Tool("Invalid token: " + pyrepr.str_repr(tok))
+  return obj
+
+fn repo_commit(e: Env, r: Repo, rev: Str) -> Obj throws Oops:
+  let o = rev_parse(e, r, rev)?
+  return to_commit(e, r, o)?
+
+# ---- commits as GitPython reads them
+
+type Commit:
+  sha: Str
+  author_name: Str
+  author_email: Str
+  secs: Int
+  tz: Int            # seconds east of UTC
+  message: Str
+
+fn parse_ident(line: Str, var name: Str, var email: Str, var secs: Int, var tz: Int):
+  let lt = line.find("<")
+  let gt = line.find(">", lt)
+  name = line[0..lt].strip()
+  email = line[lt + 1..gt]
+  let rest = line[gt + 1..line.len].strip().split(" ")
+  secs = int(rest[0]) else 0
+  var t = 0
+  if rest.len > 1 and rest[1].len == 5:
+    let z = rest[1]
+    t = ((int(z[1..3]) else 0) * 3600 + (int(z[3..5]) else 0) * 60)
+    if z[0] == '-': t = -t
+  tz = t
+
+fn read_commit(e: Env, r: Repo, sha: Str) -> Commit throws Oops:
+  let t = raw(e, r, Obj(sha + "", "commit"))?
+  return commit_of(sha, t)
+
+# The raw objects of many shas in one git process (cat-file --batch, as GitPython keeps one).
+fn cat_batch(e: Env, r: Repo, shas: [Str]) -> [Str] throws Oops:
+  var out: [Str] = []
+  if shas.len == 0: return out
+  var a = ["sh", "-c", "printf '%s\\n' \"$@\" | git cat-file --batch", "sh"]
+  for x in shas: a.push(x + "")
+  var dir = r.root
+  if dir == "": dir = r.git_dir
+  let ran = run_in(e, dir, a)
+  if ran.code != 0: fail Crash("cat-file --batch")
+  let b = ran.out
+  var p = 0
+  for i in 0..shas.len:
+    let nl = b.find("\n", p)
+    let head = b[p..nl].split(" ")
+    let size = int(head[2]) else 0
+    out.push(b[nl + 1..nl + 1 + size])
+    p = nl + 1 + size + 1
+  return out
+
+fn commit_of(sha: Str, t: Str) -> Commit:
+  var nm = ""
+  var em = ""
+  var secs = 0
+  var tz = 0
+  parse_ident(header_field(t, "author"), &nm, &em, &secs, &tz)
+  var c = Commit(sha + "", nm, em, secs, tz, "")
+  let blank = t.find("\n\n")
+  if blank >= 0: c.message = utf8(t[blank + 2..t.len])
+  return c
+
+fn pad2(n: Int) -> Str:
+  if n < 10: return "0{n}"
+  return "{n}"
+
+fn civil(days0: Int, var y: Int, var m: Int, var d: Int):
+  # days since 1970-01-01 to a date (Howard Hinnant's algorithm)
+  let z = days0 + 719468
+  var era = z / 146097
+  if z < 0 and z % 146097 != 0: era -= 1
+  let doe = z - era * 146097
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+  let mp = (5 * doy + 2) / 153
+  d = doy - (153 * mp + 2) / 5 + 1
+  if mp < 10: m = mp + 3
+  else: m = mp - 9
+  y = yoe + era * 400
+  if m <= 2: y += 1
+
+# "2024-01-15 14:30:25" in the commit's own zone, then the zone as sep(":" or "").
+fn local_time(secs: Int, tz: Int, colon: Bool) -> Str:
+  let t = secs + tz
+  var days = t / 86400
+  var rem = t % 86400
+  if rem < 0:
+    rem += 86400
+    days -= 1
+  var y = 0
+  var m = 0
+  var d = 0
+  civil(days, &y, &m, &d)
+  var sign = "+"
+  var a = tz
+  if tz < 0:
+    sign = "-"
+    a = -tz
+  var zone = sign + pad2(a / 3600) + pad2((a % 3600) / 60)
+  if colon: zone = sign + pad2(a / 3600) + ":" + pad2((a % 3600) / 60)
+  var ys = "{y}"
+  while ys.len < 4: ys = "0" + ys
+  var out = ys + "-" + pad2(m) + "-" + pad2(d) + " " + pad2(rem / 3600) + ":" + pad2((rem % 3600) / 60) + ":" + pad2(rem % 60)
+  if colon: return out + zone
+  return out + " " + zone
+
+# ---- the tools
+
+fn status(e: Env, r: Repo) -> Str throws Oops:
+  return "Repository status:\n" + utf8(git(e, r, ["-c", "core.quotepath=false", "status"])?)
+
+fn diff_unstaged(e: Env, r: Repo, n: Int) -> Str throws Oops:
+  return "Unstaged changes:\n" + utf8(git(e, r, ["-c", "core.quotepath=false", "diff", "--unified={n}"])?)
+
+fn diff_staged(e: Env, r: Repo, n: Int) -> Str throws Oops:
+  return "Staged changes:\n" + utf8(git(e, r, ["-c", "core.quotepath=false", "diff", "--unified={n}", "--cached"])?)
+
+fn diff(e: Env, r: Repo, target: Str, n: Int) -> Str throws Oops:
+  if target.startswith("-"): fail Tool("Invalid target: '" + target + "' - cannot start with '-'")
+  rev_parse(e, r, target)?
+  return "Diff with " + target + ":\n" + utf8(git(e, r, ["-c", "core.quotepath=false", "diff", "--unified={n}", target])?)
+
+fn head_valid(e: Env, r: Repo) -> Bool:
+  return deref_ref(e, r, "HEAD") != ""
+
+fn has_staged(e: Env, r: Repo) -> Bool throws Oops:
+  if is_file(e, r.git_dir + "/MERGE_HEAD"): return true
+  if not head_valid(e, r): return git(e, r, ["ls-files"])? != ""
+  let ran = git_ok(e, r, ["diff-index", "--cached", "--quiet", "HEAD", "--"])
+  return ran.code == 1
+
+type Ident:
+  name: Str
+  email: Str
+
+fn config(e: Env, r: Repo, key: Str) -> Str:
+  let ran = git_ok(e, r, ["config", "--get", key])
+  if ran.code != 0: return ""
+  return strip1(ran.out)
+
+# Actor.committer/author: the environment, then the configuration, then the user at this host.
+fn actor(e: Env, r: Repo, who: Str) -> Ident:
+  var name = e.os.env("GIT_" + who + "_NAME")
+  var email = e.os.env("GIT_" + who + "_EMAIL")
+  if name == "": name = config(e, r, "user.name")
+  if email == "": email = config(e, r, "user.email")
+  if name == "" or email == "":
+    let user = strip1(run_in(e, "/", ["id", "-un"]).out)
+    let host = strip1(run_in(e, "/", ["hostname"]).out)
+    if name == "": name = user
+    if email == "": email = user + "@" + host
+  return Ident(name, email)
+
+# GitPython's parse_date for git's own form ("1705321825 +0200") and ISO 8601 ("2024-01-15T14:30:25",
+# a space for the T, and a " +0200" zone or none): (seconds, zone seconds east of UTC).
+fn parse_date(s: Str, var secs: Int, var tz: Int) -> Bool:
+  if s.count(" ") == 1 and s.find(":") < 0:
+    let parts = s.split(" ")
+    var ts = parts[0]
+    if ts.startswith("@"): ts = ts[1..ts.len]
+    let n = int(ts) else return false
+    if not zone_ok(parts[1]): return false
+    secs = n
+    tz = zone_secs(parts[1])
+    return true
+  var t = s + ""
+  var off = 0
+  if t.len >= 6 and (t[t.len - 5] == '+' or t[t.len - 5] == '-'):
+    let z = t[t.len - 5..t.len]
+    if not zone_ok(z): return false
+    off = zone_secs(z)
+    t = t[0..t.len - 6]
+  var sp = t.find("T")
+  if sp < 0: sp = t.find(" ")
+  if sp < 0 or t.len - sp - 1 != 8 or sp != 10: return false
+  let d = t[0..sp]
+  let tm = t[sp + 1..t.len]
+  if d[4] != '-' or d[7] != '-' or tm[2] != ':' or tm[5] != ':': return false
+  let y = int(d[0..4]) else return false
+  let mo = int(d[5..7]) else return false
+  let dd = int(d[8..10]) else return false
+  let h = int(tm[0..2]) else return false
+  let mi = int(tm[3..5]) else return false
+  let se = int(tm[6..8]) else return false
+  var yy = y
+  if mo <= 2: yy -= 1
+  var era = yy / 400
+  if yy < 0 and yy % 400 != 0: era -= 1
+  let yoe = yy - era * 400
+  var mp = mo - 3
+  if mo <= 2: mp = mo + 9
+  let doy = (153 * mp + 2) / 5 + dd - 1
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+  let days = era * 146097 + doe - 719468
+  secs = days * 86400 + h * 3600 + mi * 60 + se - off
+  tz = off
+  return true
+
+fn zone_ok(z: Str) -> Bool:
+  if z.len != 5 or (z[0] != '+' and z[0] != '-'): return false
+  for k in 1..5:
+    if z[k] < '0' or z[k] > '9': return false
+  return true
+
+fn zone_secs(z: Str) -> Int:
+  let v = int(z[1..5]) else 0
+  let secs = (v / 100) * 3600 + (v % 100) * 60
+  if z[0] == '-': return -secs
+  return secs
+
+fn tz_text(tz: Int) -> Str:
+  var sign = "+"
+  var a = tz
+  if tz < 0:
+    sign = "-"
+    a = -tz
+  return sign + pad2(a / 3600) + pad2((a % 3600) / 60)
+
+fn commit(e: Env, r: Repo, message: Str) -> Str throws Oops:
+  if not has_staged(e, r)?:
+    fail Tool("No changes staged for commit. Use git_add to stage changes first; git_status shows what is currently staged.")
+  let tree = git(e, r, ["write-tree"])?
+  var parent_shas: [Str] = []
+  let head = deref_ref(e, r, "HEAD")
+  if head != "": parent_shas.push(head)
+  let merge = is_file(e, r.git_dir + "/MERGE_HEAD")
+  if merge:
+    let mh = e.fs.read(r.git_dir + "/MERGE_HEAD") else ""
+    for s in mh.split():
+      let c = repo_commit(e, r, s)?
+      parent_shas.push(c.sha)
+  let author = actor(e, r, "AUTHOR")
+  let committer = actor(e, r, "COMMITTER")
+  for v in [author.name, author.email, committer.name, committer.email]:
+    if v.find("<") >= 0 or v.find(">") >= 0 or v.find("\n") >= 0:
+      fail Tool("Commit identity " + pyrepr.str_repr(v) + " must not contain '<', '>' or a line feed")
+  let now = e.os.time()
+  var asecs = int(now)
+  var atz = 0
+  var csecs = int(now)
+  var ctz = 0
+  let ad = e.os.env("GIT_AUTHOR_DATE")
+  if ad != "" and not parse_date(ad, &asecs, &atz): fail Tool("Unsupported date format or type: " + ad + ", type=<class 'str'>")
+  let cd = e.os.env("GIT_COMMITTER_DATE")
+  if cd != "" and not parse_date(cd, &csecs, &ctz): fail Tool("Unsupported date format or type: " + cd + ", type=<class 'str'>")
+  var body = "tree " + tree + "\n"
+  for p in parent_shas: body += "parent " + p + "\n"
+  body += "author " + author.name + " <" + author.email + "> {asecs} " + tz_text(atz) + "\n"
+  body += "committer " + committer.name + " <" + committer.email + "> {csecs} " + tz_text(ctz) + "\n"
+  let enc = config(e, r, "i18n.commitencoding")
+  if enc != "" and enc != "UTF-8": body += "encoding " + enc + "\n"
+  body += "\n" + message
+  let f = e.tmp + "/commit"
+  e.fs.write(f, body) else fail Crash("can't write the commit")
+  let sha = git(e, r, ["hash-object", "-t", "commit", "-w", f])?
+  e.fs.remove(f) else 0
+  var first = message + ""
+  let nl = first.find("\n")
+  if nl >= 0: first = first[0..nl]
+  git(e, r, ["update-ref", "-m", "commit: " + first, "HEAD", sha])?
+  var note = ""
+  if merge:
+    for nm in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE"]: e.fs.remove(r.git_dir + "/" + nm) else 0
+  return "Changes committed successfully with hash " + sha + note
+
+fn index_entries(e: Env, r: Repo, files: [Str]) -> Str throws Oops:
+  var a = ["ls-files", "--stage", "--"]
+  for f in files: a.push(f + "")
+  return git(e, r, a)?
+
+fn add(e: Env, r: Repo, files: [Str]) -> Str throws Oops:
+  if files.len == 0: fail Tool("No files provided to stage. Pass one or more paths, or ['.'] to stage everything.")
+  var before = ""
+  if files.len == 1 and files[0] == ".":
+    before = index_entries(e, r, files)?
+    git(e, r, ["add", "."])?
+  else:
+    let root = resolve(e, r.root)
+    for f in files:
+      var p = root + "/" + f
+      if f.startswith("/"): p = f + ""
+      let resolved = resolve(e, p)
+      if not rel_inside(resolved, root): fail Tool("Path '" + f + "' is outside the repository '" + root + "'")
+    before = index_entries(e, r, files)?
+    var a = ["add", "--"]
+    for f in files: a.push(f + "")
+    git(e, r, a)?
+  if index_entries(e, r, files)? == before:
+    return "No changes were staged: the given paths had nothing new to stage. git_status shows what is modified or untracked."
+  return "Files staged successfully"
+
+fn reset(e: Env, r: Repo) -> Str throws Oops:
+  git(e, r, ["read-tree", "HEAD"])?
+  return "All staged changes reset"
+
+fn log(e: Env, r: Repo, max_count: Int, since: Str?, until: Str?) -> Str throws Oops:
+  var a = ["rev-list", "--max-count={max_count}"]
+  if s = since:
+    if s.startswith("-"): fail Tool("Invalid start_timestamp: '" + s + "' - cannot start with '-'")
+  if u = until:
+    if u.startswith("-"): fail Tool("Invalid end_timestamp: '" + u + "' - cannot start with '-'")
+  if s = since:
+    if s != "": a.push("--since=" + s)
+  if u = until:
+    if u != "": a.push("--until=" + u)
+  if not head_valid(e, r): fail Tool("Reference at " + pyrepr.str_repr(head_ref(e, r)) + " does not exist")
+  a.push("HEAD")
+  a.push("--")
+  let out = git(e, r, a)?
+  var shas: [Str] = []
+  for sha in out.split("\n"):
+    if sha != "": shas.push(sha + "")
+  let raws = cat_batch(e, r, shas)?
+  var entries: [Str] = []
+  for i in 0..shas.len:
+    let sha = shas[i]
+    let c = commit_of(sha, raws[i])
+    entries.push("Commit: " + sha + "\nAuthor: " + c.author_name + "\nDate: " + local_time(c.secs, c.tz, true) + "\nMessage: " + c.message + "\n")
+  return "Commit history:\n" + "\n".join(entries)
+
+# SymbolicReference._check_ref_name_valid
+fn check_ref_name(path: Str) throws Oops:
+  let pre = "Invalid reference '" + path + "': "
+  var prev = -1
+  var before = -1
+  for i in 0..path.len:
+    let c = path[i]
+    if c == ' ' or c == '~' or c == '^' or c == ':' or c == '?' or c == '*' or c == '[' or c == '\\':
+      fail Tool(pre + "references cannot contain spaces, tildes (~), carets (^), colons (:), question marks (?), asterisks (*), open brackets ([) or backslashes (\\)")
+    elif c == '.':
+      if prev == -1 or prev == 47: fail Tool(pre + "references cannot start with a period (.) or contain '/.'")
+      elif prev == 46: fail Tool(pre + "references cannot contain '..'")
+    elif c == '/':
+      if prev == 47: fail Tool(pre + "references cannot contain '//'")
+      elif prev == -1: fail Tool(pre + "references cannot start with forward slashes '/'")
+    elif c == '{' and prev == 64: fail Tool(pre + "references cannot contain '@{{'")
+    elif c < 32 or c == 127: fail Tool(pre + "references cannot contain ASCII control characters")
+    before = prev
+    prev = int(c)
+  if prev == 46: fail Tool(pre + "references cannot end with a period (.)")
+  elif prev == 47: fail Tool(pre + "references cannot end with a forward slash (/)")
+  elif prev == 64 and before == -1: fail Tool(pre + "references cannot be '@'")
+  for comp in path.split("/"):
+    if comp.endswith(".lock"): fail Tool(pre + "references cannot have slash-separated components that end with '.lock'")
+
+type RefItem:
+  name: Str          # as GitPython names it: main, origin/main, v1
+  path: Str
+  sha: Str
+
+fn references(e: Env, r: Repo) -> [RefItem] throws Oops:
+  let out = git(e, r, ["for-each-ref", "--format=%(refname) %(objectname)"])?
+  var items: [RefItem] = []
+  for line in out.split("\n"):
+    if line == "": continue
+    let sp = line.find(" ")
+    let p = line[0..sp]
+    var name = p + ""
+    for pre in ["refs/heads/", "refs/tags/", "refs/remotes/", "refs/"]:
+      if p.startswith(pre):
+        name = p[pre.len..p.len]
+        break
+    items.push(RefItem(name, p + "", line[sp + 1..line.len]))
+  return items
+
+fn create_branch(e: Env, r: Repo, name: Str, base_branch: Str?) -> Str throws Oops:
+  if name.startswith("-"): fail Tool("Invalid branch name: '" + name + "' - cannot start with '-'")
+  var given = ""
+  if b = base_branch: given = b + ""
+  if given.startswith("-"): fail Tool("Invalid base branch: '" + given + "' - cannot start with '-'")
+  var base_sha = ""
+  var label = ""
+  if given != "":
+    var found = false
+    for it in references(e, r)?:
+      if it.name == given:
+        base_sha = it.sha + ""
+        label = "'" + it.name + "'"
+        found = true
+        break
+    if not found:
+      match repo_commit(e, r, given):
+        ok(c):
+          base_sha = c.sha + ""
+          label = "commit " + c.sha[0..7]
+        err(_): fail Tool("Unknown base branch or commit: '" + given + "'")
+  elif head_ref(e, r) == "HEAD":
+    base_sha = deref_ref(e, r, "HEAD")
+    label = "commit " + base_sha[0..7]
+  else:
+    let hr = head_ref(e, r)
+    base_sha = deref_ref(e, r, hr)
+    label = "'" + hr.replace("refs/heads/", "") + "'"
+    if base_sha == "": fail Tool("Reference at " + pyrepr.str_repr(hr) + " does not exist")
+  for it in references(e, r)?:
+    if it.path == "refs/heads/" + name: fail Tool("Cannot create branch '" + name + "': refs/heads/" + name + " already exists")
+  check_ref_name("refs/heads/" + name)?
+  # (GitPython writes the ref file itself, whatever the object is: a tag's sha stays a tag's sha)
+  let file = common_dir(e, r) + "/refs/heads/" + name
+  let k = rfind_slash(file)
+  e.fs.mkdir(file[0..k]) else fail Tool("[Errno 20] Not a directory: '" + file[0..k] + "'")
+  e.fs.write(file, base_sha + "\n") else fail Tool("[Errno 21] Is a directory: '" + file + "'")
+  return "Created branch '" + name + "' from " + label
+
+fn checkout(e: Env, r: Repo, name: Str) -> Str throws Oops:
+  if name.startswith("-"): fail Tool("Invalid branch name: '" + name + "' - cannot start with '-'")
+  rev_parse(e, r, name)?
+  git(e, r, ["checkout", name])?
+  let hr = head_ref(e, r)
+  if hr == "HEAD":
+    let s = deref_ref(e, r, "HEAD")
+    return "HEAD is now detached at " + s[0..7]
+  return "Switched to branch '" + hr.replace("refs/heads/", "") + "'"
+
+type Change:
+  a: Str             # "/dev/null" or a/<path>
+  b: Str
+  diff: Str
+
+# Diff._index_from_patch_format: each "diff --git" header, and the text after the header's lines.
+fn parse_patch(text: Str) -> [Change]:
+  var out: [Change] = []
+  var starts: [Int] = []
+  if text.startswith("diff --git "): starts.push(0)
+  var k = text.find("\ndiff --git ")
+  while k >= 0:
+    starts.push(k + 1)
+    k = text.find("\ndiff --git ", k + 1)
+  for si in 0..starts.len:
+    let s = starts[si]
+    var e = text.len
+    if si + 1 < starts.len: e = starts[si + 1]
+    let seg = text[s..e]
+    var lines = seg.split("\n")
+    # the header's first line: the fallback paths
+    let first = lines[0]
+    var fa = ""
+    var fb = ""
+    let rest = first[11..first.len]
+    var cut = -1
+    var p = 0
+    while p < rest.len:
+      if rest[p] == ' ' and p + 2 < rest.len and (rest[p + 1] == 'a' or rest[p + 1] == 'b' or rest[p + 1] == '"') and (rest[p + 2] == '/' or rest[p + 1] == '"'):
+        cut = p
+        break
+      p += 1
+    if cut > 0:
+      fa = rest[0..cut]
+      fb = rest[cut + 1..rest.len]
+    var i = 1
+    var new_file = false
+    var deleted = false
+    var rename_from = ""
+    var rename_to = ""
+    var pa = ""
+    var pb = ""
+    var has_pa = false
+    var has_pb = false
+    var consumed = first.len + 1
+    let take = fn(ln: Str) => ln.len + 1
+    if i + 1 < lines.len and lines[i].startswith("old mode ") and lines[i + 1].startswith("new mode "):
+      consumed += take(lines[i]) + take(lines[i + 1])
+      i += 2
+    if i + 2 < lines.len and lines[i].startswith("similarity index ") and lines[i + 1].startswith("rename from ") and lines[i + 2].startswith("rename to "):
+      rename_from = lines[i + 1][12..lines[i + 1].len]
+      rename_to = lines[i + 2][10..lines[i + 2].len]
+      consumed += take(lines[i]) + take(lines[i + 1]) + take(lines[i + 2])
+      i += 3
+    if i < lines.len and lines[i].startswith("new file mode "):
+      new_file = true
+      consumed += take(lines[i])
+      i += 1
+    if i < lines.len and lines[i].startswith("deleted file mode "):
+      deleted = true
+      consumed += take(lines[i])
+      i += 1
+    if i + 2 < lines.len and lines[i].startswith("similarity index ") and lines[i + 1].startswith("copy from ") and lines[i + 2].startswith("copy to "):
+      consumed += take(lines[i]) + take(lines[i + 1]) + take(lines[i + 2])
+      i += 3
+    if i < lines.len and lines[i].startswith("index ") and lines[i].find("..") > 6:
+      consumed += take(lines[i])
+      i += 1
+    if i < lines.len and lines[i].startswith("--- "):
+      pa = lines[i][4..lines[i].len].rstrip("\t\r" + chr(11) + chr(12))
+      has_pa = true
+      consumed += take(lines[i])
+      i += 1
+    if i < lines.len and lines[i].startswith("+++ "):
+      pb = lines[i][4..lines[i].len].rstrip("\t\r" + chr(11) + chr(12))
+      has_pb = true
+      consumed += take(lines[i])
+      i += 1
+    if consumed > seg.len: consumed = seg.len
+    let a_path = best_path(pa, has_pa, rename_from, fa)
+    let b_path = best_path(pb, has_pb, rename_to, fb)
+    var a = "a/" + a_path
+    var b = "b/" + b_path
+    if new_file or a_path == chr(0): a = "/dev/null"
+    if deleted or b_path == chr(0): b = "/dev/null"
+    out.push(Change(a, b, seg[consumed..seg.len]))
+  return out
+
+# _pick_best_path and decode_path: "\0" stands for None
+fn best_path(path: Str, has: Bool, rename: Str, fallback: Str) -> Str:
+  if has and path != "": return decode_path(path, true)
+  if rename != "": return decode_path(rename, false)
+  if fallback != "": return decode_path(fallback, true)
+  return chr(0)
+
+fn decode_path(p0: Str, ab: Bool) -> Str:
+  if p0 == "/dev/null": return chr(0)
+  var p = p0 + ""
+  if p.len >= 2 and p.startswith("\"") and p.endswith("\""): p = unquote_c(p[1..p.len - 1])
+  if ab: p = p[2..p.len]
+  return utf8(p)
+
+fn unquote_c(s: Str) -> Str:
+  var out: [Byte] = []
+  var i = 0
+  while i < s.len:
+    if s[i] == '\\' and i + 1 < s.len:
+      let c = s[i + 1]
+      if c >= '0' and c <= '7' and i + 3 < s.len + 0:
+        out.push(byte((int(s[i + 1]) - 48) * 64 + (int(s[i + 2]) - 48) * 8 + int(s[i + 3]) - 48))
+        i += 4
+        continue
+      if c == 'n': out.push('\n')
+      elif c == 't': out.push('\t')
+      elif c == 'r': out.push('\r')
+      elif c == 'a': out.push(7)
+      elif c == 'b': out.push(8)
+      elif c == 'f': out.push(12)
+      elif c == 'v': out.push(11)
+      else: out.push(c)
+      i += 2
+    else:
+      out.push(s[i])
+      i += 1
+  return str(out)
+
+fn show(e: Env, r: Repo, revision: Str) -> Str throws Oops:
+  if revision.startswith("-"): fail Tool("Invalid revision: '" + revision + "' - cannot start with '-'")
+  let o = rev_parse(e, r, revision)?
+  if o.kind == "blob": return utf8(raw(e, r, o)?)
+  if o.kind == "tree":
+    var names: [Str] = []
+    for en in tree_entries(e, r, o)?:
+      if en.kind == "tree": names.push(en.name + "/")
+      else: names.push(en.name + "")
+    return "\n".join(names)
+  let c0 = repo_commit(e, r, revision)?
+  let c = read_commit(e, r, c0.sha)?
+  var msg = c.message + ""
+  while msg.endswith("\n"): msg = msg[0..msg.len - 1]
+  var out = "commit " + c.sha + "\nAuthor: " + c.author_name + " <" + c.author_email + ">\nDate:   " + local_time(c.secs, c.tz, false) + "\n\n"
+  for line in msg.split("\n"): out += "    " + line + "\n"
+  let ps = parents(e, r, c0)?
+  var patch = ""
+  if ps.len > 0: patch = git(e, r, ["-c", "diff.mnemonicPrefix=false", "diff-tree", ps[0], c.sha, "-r", "--abbrev=40", "--full-index", "-M", "-p", "--no-ext-diff", "--no-color"])?
+  else: patch = git(e, r, ["-c", "diff.mnemonicPrefix=false", "diff-tree", c.sha, "--root", "-r", "--abbrev=40", "--full-index", "-M", "-p", "--no-ext-diff", "--no-color"])?
+  # (GitPython reads the whole output, with its last line break)
+  for d in parse_patch(patch + "\n"):
+    out += "\n--- " + d.a + "\n+++ " + d.b + "\n" + utf8(d.diff)
+  return out
+
+fn branch(e: Env, r: Repo, kind: Str, contains: Str?, not_contains: Str?) -> Str throws Oops:
+  if c = contains:
+    if c.startswith("-"): fail Tool("Invalid contains value: '" + c + "' - cannot start with '-'")
+  if n = not_contains:
+    if n.startswith("-"): fail Tool("Invalid not_contains value: '" + n + "' - cannot start with '-'")
+  var a = ["branch"]
+  if kind == "remote": a.push("-r")
+  elif kind == "all": a.push("-a")
+  elif kind != "local": fail Tool("Invalid branch type: " + kind)
+  if c = contains:
+    a.push("--contains")
+    a.push(c + "")
+  if n = not_contains:
+    a.push("--no-contains")
+    a.push(n + "")
+  return git(e, r, a)?
+
+# ---- the arguments, checked as pydantic checks them (lax: "5" and 5.0 are 5)
+
+type Args:
+  errs: [Str]
+  fn_name: Str
+  all: json.Value
+
+fn problem(loc: Str, msg: Str, kind: Str, v: json.Value) -> Str:
+  return loc + "\n  " + msg + " [type=" + kind + ", input_value=" + pyrepr.shown(v) + ", input_type=" + pyrepr.type_name(v) + "]\n    For further information visit " + PYDANTIC + kind
+
+fn missing(var a: Args, name: Str):
+  a.errs.push(problem(name, "Field required", "missing", a.all))
+
+fn get_str(var a: Args, name: Str, required: Bool, optional_none: Bool) -> Str?:
+  if not json.has(a.all, name):
+    if required: missing(&a, name)
+    return nil
+  let v = json.at(a.all, name) else return nil
+  match v:
+    json.Text(t): return t + ""
+    json.Null:
+      if optional_none: return nil
+      a.errs.push(problem(name, "Input should be a valid string", "string_type", v))
+      return nil
+    _:
+      a.errs.push(problem(name, "Input should be a valid string", "string_type", v))
+      return nil
+
+# Python's int() of the text pydantic accepts: spaces around, a sign, digits with single underscores
+# between them, and an optional fraction of zeros.
+fn lax_int_text(s: Str, var n: Int) -> Bool:
+  var t = s.strip()
+  var neg = false
+  if t.startswith("+") or t.startswith("-"):
+    neg = t.startswith("-")
+    t = t[1..t.len]
+  let dot = t.find(".")
+  if dot >= 0:
+    for k in dot + 1..t.len:
+      if t[k] != '0': return false
+    t = t[0..dot]
+  if t == "" or t.startswith("_") or t.endswith("_") or t.find("__") >= 0: return false
+  var v = 0
+  for k in 0..t.len:
+    let c = t[k]
+    if c == '_': continue
+    if c < '0' or c > '9': return false
+    v = v * 10 + int(c) - 48
+  if neg: v = -v
+  n = v
+  return true
+
+fn get_int(var a: Args, name: Str, dflt: Int) -> Int:
+  let v = json.at(a.all, name) else return dflt
+  let bad = fn(k: Str, m: Str) => problem(name, m, k, v)
+  match v:
+    json.Whole(n): return n
+    json.Flag(b):
+      if b: return 1
+      return 0
+    json.Num(x):
+      if x != x or x > 9.2e18 or x < -9.2e18:
+        a.errs.push(bad("int_parsing_size", "Unable to parse input string as an integer, exceeded maximum size"))
+        return dflt
+      if x != float(int(x)):
+        a.errs.push(bad("int_from_float", "Input should be a valid integer, got a number with a fractional part"))
+        return dflt
+      return int(x)
+    json.Text(t):
+      var n = 0
+      if lax_int_text(t, &n): return n
+      a.errs.push(bad("int_parsing", "Input should be a valid integer, unable to parse string as an integer"))
+      return dflt
+    _:
+      a.errs.push(bad("int_type", "Input should be a valid integer"))
+      return dflt
+
+fn get_files(var a: Args, name: Str) -> [Str]:
+  var out: [Str] = []
+  if not json.has(a.all, name):
+    missing(&a, name)
+    return out
+  let v = json.at(a.all, name) else return out
+  match v:
+    json.Arr(items):
+      if items.len == 0:
+        a.errs.push(problem(name, "List should have at least 1 item after validation, not 0", "too_short", v))
+      for i in 0..items.len:
+        match items[i]:
+          json.Text(t): out.push(t + "")
+          _: a.errs.push(problem(name + ".{i}", "Input should be a valid string", "string_type", items[i]))
+    _: a.errs.push(problem(name, "Input should be a valid list", "list_type", v))
+  return out
+
+fn errors_text(a: Args) -> Str:
+  var head = "{a.errs.len} validation errors for " + a.fn_name + "Arguments"
+  if a.errs.len == 1: head = "1 validation error for " + a.fn_name + "Arguments"
+  return head + "\n" + "\n".join(a.errs)
+
+# ---- the dispatcher
+
+fn fn_name(tool: Str) -> Str:
+  return tool.replace("git_", "")
+
+fn run_tool(e: Env, name: Str, all: json.Value) -> Str throws Oops:
+  var a = Args([], fn_name(name), json.copy(all))
+  let repo_path = get_str(&a, "repo_path", true, false) else ""
+  if name == "git_status":
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    return status(e, open_repo(e, repo_path)?)?
+  if name == "git_diff_unstaged" or name == "git_diff_staged":
+    let n = get_int(&a, "context_lines", 3)
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    let r = open_repo(e, repo_path)?
+    if name == "git_diff_unstaged": return diff_unstaged(e, r, n)?
+    return diff_staged(e, r, n)?
+  if name == "git_diff":
+    let target = get_str(&a, "target", true, false) else ""
+    let n = get_int(&a, "context_lines", 3)
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    return diff(e, open_repo(e, repo_path)?, target, n)?
+  if name == "git_commit":
+    let m = get_str(&a, "message", true, false) else ""
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    return commit(e, open_repo(e, repo_path)?, m)?
+  if name == "git_add":
+    let files = get_files(&a, "files")
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    return add(e, open_repo(e, repo_path)?, files)?
+  if name == "git_reset":
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    return reset(e, open_repo(e, repo_path)?)?
+  if name == "git_log":
+    let n = get_int(&a, "max_count", 10)
+    let since = get_str(&a, "start_timestamp", false, true)
+    let until = get_str(&a, "end_timestamp", false, true)
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    return log(e, open_repo(e, repo_path)?, n, since, until)?
+  if name == "git_create_branch":
+    let b = get_str(&a, "branch_name", true, false) else ""
+    let base = get_str(&a, "base_branch", false, true)
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    return create_branch(e, open_repo(e, repo_path)?, b, base)?
+  if name == "git_checkout":
+    let b = get_str(&a, "branch_name", true, false) else ""
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    return checkout(e, open_repo(e, repo_path)?, b)?
+  if name == "git_show":
+    let rev = get_str(&a, "revision", true, false) else ""
+    if a.errs.len > 0: fail Tool(errors_text(a))
+    return show(e, open_repo(e, repo_path)?, rev)?
+  # git_branch
+  let kind = get_str(&a, "branch_type", true, false) else ""
+  let contains = get_str(&a, "contains", false, true)
+  let not_contains = get_str(&a, "not_contains", false, true)
+  if a.errs.len > 0: fail Tool(errors_text(a))
+  return branch(e, open_repo(e, repo_path)?, kind, contains, not_contains)?
+
+fn tool(e: Env, name: Str, args: json.Value) -> mcp.Outcome:
+  match run_tool(e, name, args):
+    ok(t): return mcp.Outcome("[{{\"type\":\"text\",\"text\":" + json.quote(t) + "}}]", "", false)
+    err(o):
+      match o:
+        Tool(m): return mcp.tool_error("Error executing tool " + name + ": " + m)
+        Crash(_): return mcp.tool_error("Error executing tool " + name)
+
+# The repository root for --repository: the working tree that holds it, searching upward.
+fn find_root(e: Env, p: Str) -> Str:
+  var cur = cwd_abs(e, p)
+  while true:
+    match open_plain(e, cur):
+      ok(r):
+        if r.root != "": return r.root
+        return r.git_dir
+      err(_): cur = cur + ""
+    if cur == "/": return ""
+    let k = rfind_slash(cur)
+    if k <= 0: cur = "/"
+    else: cur = cur[0..k]
+  return ""
+
+fn rfind_slash(s: Str) -> Int:
+  var i = s.len - 1
+  while i >= 0:
+    if s[i] == '/': return i
+    i -= 1
+  return -1
+
+fn main(fs: Fs, os: Os):
+  let argv = args()
+  var repo = ""
+  var i = 1
+  while i < argv.len:
+    let a = argv[i]
+    if (a == "--repository" or a == "-r") and i + 1 < argv.len:
+      repo = argv[i + 1] + ""
+      i += 1
+    elif a.startswith("--repository="): repo = a[13..a.len]
+    elif a == "-v" or a == "-vv" or a == "--verbose": repo = repo + ""
+    else:
+      eprint("Usage: mcp-git [OPTIONS]\nTry 'mcp-git --help' for help.\n\nError: No such option: " + a)
+      exit(2)
+    i += 1
+  let tmp = fs.temp_dir() else panic("can't make a temporary folder")
+  let pwd = strip1(os.output(["pwd"]) else "/")
+  var e = Env(fs, os, tmp, pwd, "")
+  if repo != "":
+    if not exists(e, cwd_abs(e, repo)):
+      eprint("ERROR:mcp_server_git.server:" + repo + " does not exist")
+      exit(1)
+    let root = find_root(e, repo)
+    if root == "":
+      eprint("ERROR:mcp_server_git.server:" + repo + " is not a valid Git repository")
+      exit(0)
+    e.allowed = root
+  serve(e)
+
+fn serve(e: Env):
+  var s = mcp.server("mcp-git", tools.VERSION, tools.TOOLS) else panic("the tool list isn't valid JSON")
+  s.caps = "{{\"prompts\":{{\"listChanged\":false}},\"resources\":{{\"listChanged\":false,\"subscribe\":false}},\"tools\":{{\"listChanged\":false}}}}"
+  s.unknown_tool = "Unknown tool: %s"
+  s.says_ok = true
+  while true:
+    let line = stdio.line() else break
+    match mcp.handle(s, line):
+      mcp.Reply(t): mcp.send(t)
+      mcp.ToolCall(c): mcp.send(mcp.result(s, c, tool(e, c.name, c.args)))
+      mcp.PromptGet(_): continue
+      mcp.Request(_, _): continue
+      mcp.Quiet: continue
+  e.fs.remove(e.tmp) else 0

@@ -1560,7 +1560,7 @@ A server with prompts gives them as JSON too (`mcp.set_prompts(&s, PROMPTS)?`) a
 text)` or `mcp.error_reply(c, code, message)`.
 
 `mcp/filesystem/main.vu` is a whole server on it: the reference MCP filesystem server's 14 tools,
-reaching only the folders it was started with; `mcp/time`, `mcp/fetch` and `mcp/sqlite` are more.
+reaching only the folders it was started with; `mcp/time`, `mcp/fetch`, `mcp/sqlite` and `mcp/git` are more.
 
 The standard library's own C (`dir`, `stdio`) is part of Vu, like the runtime: its modules may make the
 `Ffi` they pass to their extern functions (`Ffi()`), which no program or package can.

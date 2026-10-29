@@ -2179,3 +2179,21 @@ starts with INSERT) is rolled back there, and here too now; the SDK answers a re
 params it needs with its own -32602; and the two SQLite libraries (Python's bundled 3.53, the
 system's) report different errors first for a statement that is wrong twice over, which the test
 now avoids. Then six seeds, about 2,700 answers, the same, plain and with AddressSanitizer.
+
+And `mcp/git` (`mcp-server-git` 2026.10.28): 2.7 ms to start against 649–702, 2.2 MB against 73, and
+157 `git_status` calls a second against 123 (both run the git program for the work). The reference
+leans on GitPython, so its revision parser, commit writer, patch reader and ref-name rules are
+ported, the rest done with git. The first version answered *more slowly* than the reference, 66
+`git_status` calls a second against 193: it ran a program for every file test and every commit it
+read; reading files directly and fetching commits in one `git cat-file --batch` made it 302 (on a
+two-commit repository). What the comparison found (random sessions on two copies of one repository):
+GitPython rejects the ISO dates with a colon in the zone that git takes in `GIT_COMMITTER_DATE`
+("Unsupported date format"); opening a `.git` folder gives the folder above it as the working tree;
+GitPython makes a branch from an annotated tag by writing the tag object's sha into the branch,
+which `git update-ref` refuses (so this server writes the file as GitPython does); and the test's
+own paths had to be the same text for both (pydantic shows long argument values cut in the middle).
+Then about 3,300 answers on twelve seeds, two of them confined, the same, plain and with
+AddressSanitizer.
+
+CI, all three platforms: the run after the round's CI fixes passed on Linux x86-64, Linux ARM64 and
+macOS ARM64 (the ARM runner's slow AddressSanitizer given 120 seconds a test).

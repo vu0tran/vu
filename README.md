@@ -184,9 +184,9 @@ reference server on Node 22 (`mcp/filesystem/README.md` has the details):
 protocol eras, random edits, names and glob patterns) and checks every answer is the same JSON:
 12,600 answers on nine seeds, plain and under AddressSanitizer.
 
-Three more of the reference servers are rewritten the same way, each checked against its Python
-original (`mcp-server-time` and `mcp-server-fetch` 2026.10.28, `mcp-server-sqlite` 2025.4.25) and
-measured the same way:
+Four more of the reference servers are rewritten the same way, each checked against its Python
+original (`mcp-server-time`, `mcp-server-fetch` and `mcp-server-git` 2026.10.28, `mcp-server-sqlite`
+2025.4.25) and measured the same way:
 
 | | Vu | Python reference |
 |---|---|---|
@@ -194,6 +194,7 @@ measured the same way:
 | `mcp/fetch`: start / memory | 3.6 ms / 5.0 MB | 730 ms / 83 MB |
 | `mcp/fetch`: an HTML page, local server | 107 calls/s | 8 calls/s (pure Python), 881 ms a call (Readability.js) |
 | `mcp/sqlite`: start / memory / `read_query` calls per second | 2.1 ms / 3.4 MB / 15,683 | 443 ms / 57 MB / 457 |
+| `mcp/git`: start / memory / `git_status` calls per second | 2.7 ms / 2.2 MB / 157 | 649 ms / 73 MB / 123 |
 
 The fetch server answers as the reference does down to its argument errors (pydantic's messages),
 its URL rewriting, its robots.txt reading (Protego), its refusal of private addresses, its
@@ -434,7 +435,7 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 | `compiler/build.sh` | rebuilds the compiler and checks the fixed point |
 | `std/` | the standard library modules written in Vu |
 | `examples/` | the benchmark programs and a JSON parser |
-| `mcp/filesystem/`, `mcp/time/`, `mcp/fetch/`, `mcp/sqlite/`, `mcp/vu/` | MCP servers: filesystem, time, fetch, SQLite, and Vu's checker for models |
+| `mcp/filesystem/`, `mcp/time/`, `mcp/fetch/`, `mcp/sqlite/`, `mcp/git/`, `mcp/vu/` | MCP servers: filesystem, time, fetch, SQLite, git, and Vu's checker for models |
 | `tests/` | the test suites; `tests/gate.sh` runs them all |
 | `bench/` | benchmark programs in C, C++, Rust and Go, and the scripts that time them |
 | `SPEC.md` | the language |
