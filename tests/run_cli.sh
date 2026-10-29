@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 VU=${VU:-"$PWD/../vu"}
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 unset VU_CACHE   # (these checks watch the C compiler being called)
+export XDG_CACHE_HOME="$work/cache"   # (where vu run keeps binaries)
 real_cc=${CC:-cc}
 cat > "$work/cc" <<EOF
 #!/bin/sh
@@ -99,6 +100,30 @@ check "build --wasm: a program using the network is refused (exit 2)" $? "rc=$rc
 out=$($VU run --wasm "$work/ok.vu" 2>&1); rc=$?
 [ $rc -eq 2 ] && echo "$out" | grep -q "builds a .wasm file"
 check "run --wasm: refused, with how to run a .wasm file" $? "rc=$rc out=[$out]"
+
+# vu run keeps each program's binary (in $XDG_CACHE_HOME/vu/run): a second run calls no C compiler,
+# an edit rebuilds, and VU_RUN_CACHE=off always builds
+printf 'fn main():\n  print("one")\n' > "$work/sc.vu"
+out1=$($VU run "$work/sc.vu" 2>&1); : > "$work/cc.log"; out2=$($VU run "$work/sc.vu" 2>&1)
+[ "$out1" = "one" ] && [ "$out2" = "one" ] && [ ! -s "$work/cc.log" ]; check "run: a second run uses the kept binary" $? "out=[$out1][$out2] cc=$(cat "$work/cc.log")"
+printf 'fn main():\n  print("two")\n' > "$work/sc.vu"
+: > "$work/cc.log"; out=$($VU run "$work/sc.vu" 2>&1)
+[ "$out" = "two" ] && [ -s "$work/cc.log" ]; check "run: an edited program is built again" $? "out=[$out]"
+: > "$work/cc.log"; out=$($VU run --release "$work/sc.vu" 2>&1)
+[ "$out" = "two" ] && grep -q -- '-O3' "$work/cc.log"; check "run: other options keep their own binary" $? "out=[$out] cc=$(cat "$work/cc.log")"
+: > "$work/cc.log"; out=$(VU_RUN_CACHE=off $VU run "$work/sc.vu" 2>&1)
+[ "$out" = "two" ] && [ -s "$work/cc.log" ]; check "run: VU_RUN_CACHE=off always builds" $? "out=[$out]"
+rm -rf "$work/cache"; $VU run "$work/sc.vu" >/dev/null; $VU run --release "$work/sc.vu" >/dev/null
+n=$(ls "$work/cache/vu/run" | wc -l)
+[ "$n" -eq 4 ]; check "run: two files kept for each program and options" $? "n=$n $(ls "$work/cache/vu/run")"
+cp "$work/sc.vu" "$work/gone.vu"; $VU run "$work/gone.vu" >/dev/null; rm "$work/gone.vu"
+n1=$(ls "$work/cache/vu/run" | wc -l); printf 'fn main():\n  print("3")\n' > "$work/sc.vu"; $VU run "$work/sc.vu" >/dev/null
+n2=$(ls "$work/cache/vu/run" | wc -l)
+[ "$n1" -eq 6 ] && [ "$n2" -eq 4 ]; check "run: a program whose file is gone is dropped" $? "n=$n1 then $n2"
+for i in $(seq 1 66); do printf 'fn main():\n  print("%d")\n' $i > "$work/p$i.vu"; done
+for i in $(seq 1 66); do $VU run "$work/p$i.vu" >/dev/null; done
+n=$(ls "$work/cache/vu/run" | wc -l); out=$(cat "$work/cache/vu/run"/*.key | grep -c "/p1.vu$")
+[ "$n" -eq 128 ] && [ "$out" -eq 0 ]; check "run: the 64 programs used last are kept" $? "n=$n p1=$out"
 
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

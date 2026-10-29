@@ -940,6 +940,7 @@ vu check --index file.vu    # also: what the language server knows (items, field
 vu run file.vu [args]       # quick -O0 build, then run with args
 vu run --release file.vu    # optimized build, then run (options go before the file;
                             #   everything after it goes to the program)
+#!/usr/bin/env -S vu run     # first line of a script: run it as ./script.vu
 vu build file.vu [-o out]   # optimized native binary
   --profile  report where the CPU time went, at exit (also for run)
   --debug    -O0 build for fast iteration
@@ -961,6 +962,12 @@ vu version                  # the release: vu 0.2.0
 vu new web NAME             # a folder NAME with a web app: main.vu, public/, Dockerfile, fly.toml
 vu lsp                      # a language server for editors (diagnostics, formatting, hover, definition, completion)
 ```
+
+`vu run` keeps each program's binary (in `$XDG_CACHE_HOME/vu/run`, or `~/.cache/vu/run`), so running
+it again, unchanged and with the same options, starts it without the C compiler: a script that
+takes 234 ms the first time takes 9 ms after (measured on Linux x86-64). A change to the program or
+a module it imports builds it again. It keeps the 64 programs used last and forgets one whose file
+is gone; `VU_RUN_CACHE=off` builds every time.
 
 - **`vu fmt`**: blocks indented 2 spaces per level, one space around binary operators and after
   commas and colons, none inside brackets or before a call's `(`, and runs of blank lines down to

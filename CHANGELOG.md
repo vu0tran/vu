@@ -2197,3 +2197,13 @@ AddressSanitizer.
 
 CI, all three platforms: the run after the round's CI fixes passed on Linux x86-64, Linux ARM64 and
 macOS ARM64 (the ARM runner's slow AddressSanitizer given 120 seconds a test).
+
+Scripts: `vu run` now keeps each program's binary, under a hash of its path and options, with a key
+made from the options, the C compiler and the program's C. Running the same program again skips the
+C compiler, so a script with `#!/usr/bin/env -S vu run` as its first line starts in 9 ms instead of
+234 ms (the median of 20 runs on Linux x86-64; the front end still runs every time, to see whether
+the program changed). Before committing, a review found that the first version kept a binary for
+every program ever run, including ones run from temporary folders (as the tests do). Now it keeps
+the 64 programs used last and drops one whose file is gone. `tests/run_cli.sh` checks these cases:
+a second run calls no C compiler; an edit rebuilds; other options keep their own binary;
+`VU_RUN_CACHE=off`; the pruning. `VU_CACHE` (the build cache the gate uses) turns it off.
