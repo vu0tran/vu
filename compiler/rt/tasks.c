@@ -455,6 +455,7 @@ __attribute__((naked, noinline)) static void vu_ctx_switch(void **from, void *to
 #define VU_SW_HEAD ".hidden " VU_SW_SYM "\n.type " VU_SW_SYM ", %function\n"
 #endif
 void vu_ctx_switch_a64(void **from, void *to);
+#ifndef VU_PART   /* (a split build defines it once, in part 0) */
 __asm__(
     ".text\n.p2align 4\n.globl " VU_SW_SYM "\n" VU_SW_HEAD VU_SW_SYM ":\n"
     "sub sp, sp, #176\n"
@@ -468,6 +469,7 @@ __asm__(
     "ldp x25, x26, [sp, #48]\nldp x27, x28, [sp, #64]\nldp x29, x30, [sp, #80]\n"
     "ldp d8, d9, [sp, #96]\nldp d10, d11, [sp, #112]\nldp d12, d13, [sp, #128]\nldp d14, d15, [sp, #144]\n"
     "add sp, sp, #176\nret\n");
+#endif
 #define vu_ctx_switch vu_ctx_switch_a64
 #endif
 static void vu_task_boot(void);

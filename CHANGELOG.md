@@ -2320,3 +2320,11 @@ What the full gate found after the clang change:
 - Split and whole builds of the stack-overflow tests stop at different depths, because their
   frames differ in size. The comparison now checks only the first line of a stack overflow's
   report.
+
+What CI found on the ARM64 runners (macOS and Linux), which the x86-64 gate couldn't:
+- Split builds of programs that use tasks failed to link: the ARM64 context switch is a top-level
+  `asm` function, which every part defined. It's now defined in part 0 only. (Checked here by
+  building the network tests split for ARM64 with a cross compiler and running them in qemu.)
+- On macOS a `--lib` library recorded its own name as where to load it from, so a program linked
+  against it found it only in the current folder. It's now `@rpath/libNAME.dylib`, as on Linux,
+  where the loader searches the program's rpath.
