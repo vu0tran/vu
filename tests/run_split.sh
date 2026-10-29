@@ -51,8 +51,9 @@ s=$(now); VU_SPLIT=always "$VU" build --debug "$src" -o "$work/vuc1" 2>"$work/e1
 slot=$(ls -d "$XDG_CACHE_HOME"/vu/parts/*/ | head -1)
 nparts=$(ls "$slot" | grep -c '\.o$')
 [ $rc -eq 0 ] && [ "$nparts" -ge 10 ]; check "the compiler builds split ($nparts parts, $t1 s)" $? "rc=$rc $(head -5 "$work/e1")"
-# writable data defined in more than one part (state each part would have its own copy of)
-dup=$(for o in "$slot"/*.o; do nm "$o" 2>/dev/null | awk '$2 ~ /^[bdBDsS]$/ {print $3}' | sed 's/^_//; s/\.[0-9]*$//' | sort -u; done | grep -v -E '^(altstack|vu_guard_init\.altstack|__compound_literal)' | sort | uniq -d)
+# writable data defined in more than one part (state each part would have its own copy of; on
+# macOS, constants show as s, so only b and d count)
+dup=$(for o in "$slot"/*.o; do nm "$o" 2>/dev/null | awk '$2 ~ /^[bdBD]$/ {print $3}' | sed 's/^_//; s/\.[0-9]*$//' | sort -u; done | grep -v -E '^(altstack|vu_guard_init\.altstack|__compound_literal)' | sort | uniq -d)
 [ -z "$dup" ]; check "no part has its own copy of the runtime's state" $? "$(echo "$dup" | head -20 | tr '\n' ' ')"
 "$work/vuc1" build "$src" --emit-c "$work/a.c" -o "$work/vuc2" >/dev/null 2>&1
 "$VU" build "$src" --emit-c "$work/b.c" -o "$work/vuc3" >/dev/null 2>&1
