@@ -11,6 +11,13 @@
 # GATE_JOBS=1 runs every suite alone; VU_CACHE= (empty) turns the cache off.
 cd "$(dirname "$0")" || exit 1
 start=$SECONDS
+# The installed compiler must be the one the source makes: a copy of the repository moved to a newer
+# commit keeps its old compiler/vuc (a gate once tested such a copy and failed on features it had).
+if [ ! -x ../compiler/vuc ] || [ -n "$(find ../compiler/rt -newer ../compiler/vuc 2>/dev/null | head -1)" ] \
+   || [ -n "$(find ../compiler -maxdepth 1 -name 'c*.vu' -newer ../compiler/vuc | head -1)" ]; then
+  echo "the installed compiler is older than its source: rebuilding it first"
+  ../compiler/build.sh || { echo "GATE FAILED: the compiler doesn't build"; exit 1; }
+fi
 export VU_REAL="$PWD/../vu"
 export VU_CACHE=${VU_CACHE-$HOME/.cache/vu-gate}
 jobs=${GATE_JOBS:-$(nproc)}
