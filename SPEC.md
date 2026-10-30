@@ -1614,6 +1614,26 @@ let e = stripe.verify_webhook(os.env("STRIPE_WEBHOOK_SECRET"), req, os.time())? 
 - `tests/run_stripe.sh` checks the calls against a fake Stripe server and 86 webhook cases against
   what Stripe's Python library decides.
 
+**`s3`**: objects in Amazon S3 and the services that speak its API (Cloudflare R2, MinIO, Backblaze
+B2, DigitalOcean Spaces), with requests signed by AWS Signature Version 4.
+
+```
+import s3
+var b = s3.bucket("https://s3.us-east-1.amazonaws.com", "us-east-1", "my-bucket", key_id, secret)
+s3.put(net, os, &b, "avatars/42.png", data, "image/png")?
+let data = s3.get(net, os, &b, "avatars/42.png")?     # fails with s3.NotFound(key), Denied, Failed or Network
+let there = s3.exists(net, os, &b, key)?; s3.delete(net, os, &b, key)?
+let url = s3.presign(b, "PUT", "uploads/" + name, 600, os.time())   # a browser uploads there for 10 minutes
+```
+
+- Keys are any text, encoded in the URL as S3 expects. Amazon's endpoints get virtual-hosted URLs
+  (`bucket.host`) when the bucket's name allows it; other endpoints get path-style URLs, which they
+  all accept. R2's region is `"auto"`.
+- `tests/run_s3.sh` compares 120 random requests per run (keys with every reserved character and
+  Unicode, six endpoints, bodies up to 5,000 bytes, times up to 2100) with botocore's signatures and
+  presigned URLs, and runs put, get, exists, delete and a wrong secret against moto's S3, which
+  checks signatures.
+
 **`sqlite`**: SQLite databases (a file, or `":memory:"`) through the sqlite3 C library, so it takes
 the `Ffi` capability, and libsqlite3 where the program is built.
 

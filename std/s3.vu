@@ -1,0 +1,212 @@
+# s3: objects in Amazon S3 and the services that speak its API (Cloudflare R2, MinIO, Backblaze B2,
+# DigitalOcean Spaces, Railway's buckets), with requests signed by AWS Signature Version 4.
+#
+#   var b = s3.bucket("https://s3.us-east-1.amazonaws.com", "us-east-1", "my-bucket", key_id, secret)
+#   s3.put(net, os, &b, "avatars/42.png", data, "image/png")?
+#   let data = s3.get(net, os, &b, "avatars/42.png")?          # fails with s3.NotFound if it isn't there
+#   s3.delete(net, os, &b, "avatars/42.png")?
+#   let url = s3.presign(b, "GET", "avatars/42.png", 3600, os.time())   # a link that works for an hour
+#
+# A presigned PUT URL lets a browser upload straight to the bucket, without the file passing through
+# the app. Keys are any text; they're encoded in the URL as S3 expects.
+
+import http
+import time
+
+type Bucket:
+  endpoint: Str      # "https://s3.us-east-1.amazonaws.com", "https://ACCOUNT.r2.cloudflarestorage.com", ...
+  region: Str        # "us-east-1"; "auto" for R2
+  name: Str
+  key_id: Str
+  secret: Str
+  path_style: Bool   # https://host/bucket/key (true) or https://bucket.host/key (false)
+  client: http.Client
+  timeout: Float
+
+type Error:
+  NotFound(key: Str)
+  Denied(why: Str)              # 403: the keys, the clock (more than 15 minutes off), or a policy
+  Failed(status: Int, why: Str) # any other answer: S3's error code and message
+  Network(why: Str)
+
+fn describe(e: Error) -> Str:
+  match e:
+    NotFound(k): return "s3: no object '" + k + "'"
+    Denied(w): return "s3: access denied: " + w
+    Failed(s, w): return "s3: HTTP {s}: " + w
+    Network(w): return "s3: " + w
+
+# A bucket at an endpoint. Amazon's own endpoints use virtual-hosted URLs (bucket.host) when the
+# bucket's name allows it; every other endpoint uses path-style URLs (host/bucket), which they all take.
+fn bucket(endpoint: Str, region: Str, name: Str, key_id: Str, secret: Str) -> Bucket:
+  var ep = endpoint + ""
+  while ep.endswith("/"): ep = ep[0..ep.len - 1]
+  let virtual = ".amazonaws.com" in ep and dns_name(name)
+  return Bucket(ep, region + "", name + "", key_id + "", secret + "", not virtual, http.client(), 60.0)
+
+fn dns_name(s: Str) -> Bool:
+  if s.len < 3 or s.len > 63: return false
+  for i in 0..s.len:
+    let b = s[i]
+    if not ((b >= 'a' and b <= 'z') or (b >= '0' and b <= '9') or b == '-'): return false
+  return s[0] != '-' and s[s.len - 1] != '-'
+
+# ---- signing
+
+# Percent-encodes as SigV4 wants: everything but A-Z a-z 0-9 - _ . ~ (and '/' when slash is true).
+fn uri_encode(s: Str, slash: Bool) -> Str:
+  let hex = "0123456789ABCDEF"
+  var out: [Byte] = []
+  for i in 0..s.len:
+    let b = s[i]
+    if (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '-' or b == '_' or b == '.' or b == '~' or (slash and b == '/'):
+      out.push(b)
+    else:
+      out.push('%')
+      out.push(hex[int(b) >> 4])
+      out.push(hex[int(b) & 15])
+  return str(out)
+
+type Target:
+  host: Str          # with the port if it isn't the scheme's
+  path: Str          # encoded
+  base: Str          # scheme and host
+
+fn target(b: Bucket, key: Str) -> Target:
+  var scheme = "https://"
+  var host = b.endpoint + ""
+  if host.startswith("https://"): host = host[8..host.len]
+  elif host.startswith("http://"):
+    scheme = "http://"
+    host = host[7..host.len]
+  let slash = host.find("/")
+  if slash >= 0: host = host[0..slash]
+  # a default port isn't part of the signed host
+  if scheme == "https://" and host.endswith(":443"): host = host[0..host.len - 4]
+  if scheme == "http://" and host.endswith(":80"): host = host[0..host.len - 3]
+  if b.path_style: return Target(host, "/" + uri_encode(b.name, false) + "/" + uri_encode(key, true), scheme + host)
+  let vhost = b.name + "." + host
+  return Target(vhost, "/" + uri_encode(key, true), scheme + vhost)
+
+type Q:
+  k, v: Str
+
+# Sorted by the encoded name, then the encoded value (byte order).
+fn canonical_query(q: [Q]) -> Str:
+  var enc: [Q] = []
+  for x in q: enc.push(Q(uri_encode(x.k, false), uri_encode(x.v, false)))
+  enc.sort(by: fn(a, b) => a.k < b.k or (a.k == b.k and a.v < b.v))
+  var out: [Str] = []
+  for x in enc: out.push(x.k + "=" + x.v)
+  return "&".join(out)
+
+fn amz_date(t: Float) -> Str:
+  let d = time.utc(t)
+  return "{d.year:04}{d.month:02}{d.day:02}T{d.hour:02}{d.minute:02}{d.second:02}Z"
+
+fn signing_key(secret: Str, day: Str, region: Str) -> Str:
+  return hmac_sha256(hmac_sha256(hmac_sha256(hmac_sha256("AWS4" + secret, day), region), "s3"), "aws4_request")
+
+# The signature of a request: its method, encoded path, query, headers (lowercase names, in any
+# order; host must be one) and the payload's SHA-256 in hex (or UNSIGNED-PAYLOAD), at time t.
+# Gives "SIGNED_HEADERS SIGNATURE" for the Authorization header or a presigned URL.
+fn signature(b: Bucket, method: Str, path: Str, query: [Q], headers: [http.Header], payload_hash: Str, t: Float) -> [Str]:
+  let date = amz_date(t)
+  let day = date[0..8]
+  var hs: [Str] = []
+  for h in headers: hs.push(h.name.lower() + ":" + " ".join(h.value.split()))   # spaces trimmed and runs made one
+  let sh = sorted(hs)
+  var names: [Str] = []
+  for h in sh: names.push(h[0..h.find(":")])
+  let signed = ";".join(names)
+  let creq = method + "\n" + path + "\n" + canonical_query(query) + "\n" + "\n".join(sh) + "\n\n" + signed + "\n" + payload_hash
+  let scope = day + "/" + b.region + "/s3/aws4_request"
+  let sts = "AWS4-HMAC-SHA256\n" + date + "\n" + scope + "\n" + sha256(creq).hex()
+  return [signed, hmac_sha256(signing_key(b.secret, day, b.region), sts).hex()]
+
+# The headers for a signed request with this payload at time t (host, x-amz-date,
+# x-amz-content-sha256, any extra headers, and Authorization).
+fn signed_headers(b: Bucket, method: Str, key: Str, query: [Q], own extra: [http.Header], payload: Str, t: Float) -> [http.Header]:
+  let tg = target(b, key)
+  let ph = sha256(payload).hex()
+  var hs = extra
+  hs.push(http.Header("host", tg.host))
+  hs.push(http.Header("x-amz-content-sha256", ph))
+  hs.push(http.Header("x-amz-date", amz_date(t)))
+  let sig = signature(b, method, tg.path, query, hs, ph, t)
+  let day = amz_date(t)[0..8]
+  hs.push(http.Header("Authorization", "AWS4-HMAC-SHA256 Credential=" + b.key_id + "/" + day + "/" + b.region + "/s3/aws4_request, SignedHeaders=" + sig[0] + ", Signature=" + sig[1]))
+  return hs
+
+# A URL anyone can use for one request (GET to download, PUT to upload) for `expires` seconds
+# (1 to 604,800: a week) from t.
+fn presign(b: Bucket, method: Str, key: Str, expires: Int, t: Float) -> Str:
+  var secs = expires
+  if secs < 1: secs = 1
+  if secs > 604800: secs = 604800
+  let tg = target(b, key)
+  let date = amz_date(t)
+  let q = [Q("X-Amz-Algorithm", "AWS4-HMAC-SHA256"), Q("X-Amz-Credential", b.key_id + "/" + date[0..8] + "/" + b.region + "/s3/aws4_request"),
+    Q("X-Amz-Date", date), Q("X-Amz-Expires", "{secs}"), Q("X-Amz-SignedHeaders", "host")]
+  let sig = signature(b, method, tg.path, q, [http.Header("host", tg.host)], "UNSIGNED-PAYLOAD", t)
+  return tg.base + tg.path + "?" + canonical_query(q) + "&X-Amz-Signature=" + sig[1]
+
+# ---- requests
+
+fn send(net: Net, var b: Bucket, method: Str, key: Str, body: Str, own extra: [http.Header], t: Float) -> http.Response throws Error:
+  if key == "": fail Failed(0, "an object needs a key")
+  let tg = target(b, key)
+  var req = http.req(method, tg.base + tg.path)
+  req.timeout = b.timeout
+  req.body = body + ""
+  for h in signed_headers(b, method, key, [], extra, body, t):
+    if h.name != "host": req.headers.push(http.Header(h.name + "", h.value + ""))
+  match b.client.fetch(net, req):
+    ok(r):
+      if r.status >= 200 and r.status < 300: return r
+      if r.status == 404: fail NotFound(key + "")
+      if r.status == 403: fail Denied(error_text(r.body))
+      fail Failed(r.status, error_text(r.body))
+    err(e): fail Network(e)
+
+# "Code: Message" from S3's XML error body.
+fn error_text(body: Str) -> Str:
+  let code = tag(body, "Code")
+  let msg = tag(body, "Message")
+  if code == "" and msg == "": return "(no error details)"
+  return code + ": " + msg
+
+fn tag(body: Str, name: Str) -> Str:
+  let a = body.find("<" + name + ">")
+  if a < 0: return ""
+  let start = a + name.len + 2
+  let z = body.find("</" + name + ">", start)
+  if z < 0: return ""
+  return body[start..z]
+
+# Stores an object (replacing one with that key).
+fn put(net: Net, os: Os, var b: Bucket, key: Str, data: Str, content_type: Str) throws Error:
+  var extra: [http.Header] = []
+  if content_type != "": extra.push(http.Header("content-type", content_type + ""))
+  send(net, &b, "PUT", key, data, extra, os.time())?
+
+# An object's bytes.
+fn get(net: Net, os: Os, var b: Bucket, key: Str) -> Str throws Error:
+  let r = send(net, &b, "GET", key, "", [], os.time())?
+  return r.body + ""
+
+# Deletes an object (S3 answers the same whether it was there or not).
+fn delete(net: Net, os: Os, var b: Bucket, key: Str) throws Error:
+  send(net, &b, "DELETE", key, "", [], os.time())?
+
+# Whether an object exists.
+fn exists(net: Net, os: Os, var b: Bucket, key: Str) -> Bool throws Error:
+  match send(net, &b, "HEAD", key, "", [], os.time()):
+    ok(r): return true
+    err(e):
+      var missing = false
+      match e:
+        NotFound(k): missing = true
+        _: missing = false
+      if missing: return false
+      fail e

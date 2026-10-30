@@ -2501,3 +2501,13 @@ one of two `v1`s, another secret, a changed body or timestamp, `v0` only, no tim
 hex, a digit short, timestamps from 5,000 s ahead to 1,000 s old, and bodies that aren't events.
 One deliberate difference: Stripe's libraries accept a timestamp any distance in the future, and
 `verify_webhook` refuses one more than 5 minutes ahead. Attack round: no findings.
+
+**`std/s3`.** Put, get, exists, delete and presigned URLs, signed with AWS Signature Version 4.
+The signer matches AWS's documented example (the presigned GET of `test.txt` in `examplebucket`,
+signature `aeeed9bb...`) and, in `run_s3.sh`, botocore's signatures for 120 random requests per run.
+The first version sorted the query as `name=value` strings, which puts `a-b=` before `a=` (`-` sorts
+before `=`); SigV4 sorts by name. No request made it wrong (the presign parameters don't collide that
+way), but it's fixed. moto's S3, with signature checks on, runs put, get, exists and delete, and
+refuses a wrong secret. moto answers 500 to every presigned URL while it checks signatures (boto3's
+own included), so a second moto without checks shows where they lead. Attack round: no findings
+beyond moto's quirks (that, and urllib's default form type on a PUT making moto drop the body).
