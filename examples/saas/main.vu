@@ -1,0 +1,287 @@
+# A SaaS backend: accounts, a paid plan through Stripe, a welcome email, and avatars stored in S3 (or
+# R2, or any service with S3's API). Everything security-sensitive comes from the standard library:
+# std/auth (passwords, sessions), std/stripe (Checkout, signed webhooks), std/mail, std/s3.
+#
+#   POST /signup {"email", "password"}   -> 201 {"id", "email", "plan", "token"} (and a welcome email)
+#   POST /login  {"email", "password"}   -> 200 {"id", "email", "plan", "token"}
+#   POST /logout                         -> 204
+#   GET  /me                             -> 200 {"id", "email", "plan", "avatar"}
+#   POST /billing/checkout               -> 200 {"url"}: send the browser there to subscribe
+#   POST /billing/webhook                (Stripe calls it: the plan changes when a payment completes,
+#                                         and back when the subscription ends)
+#   POST /avatar                         -> 200 {"upload": URL}: PUT the image there, from the browser
+#   GET  /avatar                         -> 302 to the image, for 10 minutes
+#   GET  /health                         -> 200 {"ok": true}
+#
+# Configuration, from the environment: DATABASE_URL, APP_URL (https://your.app), STRIPE_SECRET_KEY,
+# STRIPE_WEBHOOK_SECRET, STRIPE_PRICE (the subscription's price_...), RESEND_API_KEY and MAIL_FROM
+# (no email is sent without them), S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_KEY_ID, S3_SECRET.
+import auth
+import http
+import json
+import mail
+import pg
+import s3
+import stripe
+import web
+
+const POOL = 8
+const SESSION_DAYS = 30
+
+type Settings:
+  app_url: Str
+  stripe_key: Str
+  webhook_secret: Str
+  price: Str
+  stripe_base: Str     # https://api.stripe.com (another for tests)
+  resend_key: Str
+  resend_base: Str
+  mail_from: Str
+  s3_endpoint: Str
+  s3_region: Str
+  s3_bucket: Str
+  s3_key_id: Str
+  s3_secret: Str
+
+type Env:
+  pool: Chan[pg.Db]
+  cfg: pg.Config
+  set: Settings
+
+type Creds:
+  email: Str
+  password: Str
+
+fn error(status: Int, message: Str) -> http.Response:
+  return http.json(status, "{{\"error\": " + json.quote(message) + "}}")
+
+fn db_error(e: pg.Error) -> http.Response:
+  eprint("database: " + pg.describe(e))
+  return error(500, "database error")
+
+fn env_or(os: Os, name: Str, default: Str) -> Str:
+  let v = os.env(name)
+  if v == "": return default
+  return v
+
+# ---- routes that hold a connection for the whole request
+
+type Api:
+  Logout
+  Me
+  Checkout
+  Webhook
+  AvatarUpload
+  AvatarGet
+
+fn handle(net: Net, os: Os, env: Shared[Env], api: Api, req: http.Request) -> http.Response:
+  var db = env.value.pool.recv() else return error(503, "no database connection")
+  var resp = error(500, "")
+  let set = env.value.set
+  match api:
+    Logout: resp = logout(net, &db, req)
+    Me: resp = me(net, os, &db, req)
+    Checkout: resp = checkout(net, os, &db, set, req)
+    Webhook: resp = webhook(net, os, &db, set, req)
+    AvatarUpload: resp = avatar_upload(net, os, &db, set, req)
+    AvatarGet: resp = avatar_get(net, os, &db, set, req)
+  pg.give_back(net, env.value.pool, db, env.value.cfg)
+  return resp
+
+fn route(net: Net, os: Os, env: Shared[Env], api: Api) -> fn(http.Request, web.Ctx) -> http.Response:
+  let e = env.share()
+  return own fn(req: http.Request, c: web.Ctx) => handle(net, os, e, api, req)
+
+fn on(net: Net, os: Os, env: Shared[Env], own f: fn(Net, Os, Shared[Env], http.Request) -> http.Response) -> fn(http.Request, web.Ctx) -> http.Response:
+  let e = env.share()
+  return own fn(req: http.Request, c: web.Ctx) => f(net, os, e, req)
+
+# ---- accounts
+
+fn valid_email(s: Str) -> Bool:
+  let at = s.find("@")
+  return s.len <= 254 and at > 0 and at < s.len - 1 and not (" " in s) and s.count("@") == 1
+
+fn user_json(id: Str, email: Str, plan: Str) -> Str:
+  return "\"id\": {id}, \"email\": " + json.quote(email) + ", \"plan\": " + json.quote(plan)
+
+fn signed_in(net: Net, os: Os, var db: pg.Db, id: Str, email: Str, plan: Str, status: Int) -> http.Response:
+  let token = auth.login(net, &db, os, id, SESSION_DAYS) else return error(500, "database error")
+  var resp = http.json(status, "{{" + user_json(id, email, plan) + ", \"token\": " + json.quote(token) + "}}")
+  auth.set_session(&resp, token, SESSION_DAYS)
+  return resp
+
+fn signup(net: Net, os: Os, env: Shared[Env], req: http.Request) -> http.Response:
+  let body = from_json(req.body, Creds) else return error(400, "expected {{\"email\": ..., \"password\": ...}}")
+  let email = body.email.strip().lower()
+  if not valid_email(email): return error(400, "that isn't an email address")
+  if body.password.len < 10 or body.password.len > 1000: return error(400, "a password has 10 to 1000 characters")
+  let hash = auth.hash_password(body.password)
+  var db = env.value.pool.recv() else return error(503, "no database connection")
+  var resp = error(500, "")
+  var created = false
+  match pg.query(net, &db, "insert into users (email, password_hash) values ($1, $2) on conflict (email) do nothing returning id", [email, hash]):
+    ok(rows):
+      if rows.rows.len == 0: resp = error(409, "that email has an account")
+      else:
+        let id = pg.text(rows, 0, "id") else ""
+        resp = signed_in(net, os, &db, id, email, "free", 201)
+        created = true
+    err(e): resp = db_error(e)
+  pg.give_back(net, env.value.pool, db, env.value.cfg)
+  # the email goes in a task of its own: the response doesn't wait for the mail service
+  if created: spawn welcome(net, os, env, email)
+  return resp
+
+fn welcome(net: Net, os: Os, own env: Shared[Env], own email: Str):
+  let set = env.value.set
+  if set.resend_key == "" or set.mail_from == "": return
+  var m = mail.message(set.mail_from, email, "Welcome", "Thanks for signing up.\n\nYou can upgrade any time from your account page: " + set.app_url + "\n")
+  m.html = web.render("<p>Thanks for signing up.</p><p>You can upgrade any time from <a href=\"{{url}}\">your account page</a>.</p>", [web.v("url", set.app_url)]).text
+  match mail.send_resend_to(net, set.resend_key, m, set.resend_base, ""):
+    ok(id): print("welcome email to " + email + ": " + id)
+    err(e): eprint("welcome email to " + email + " failed: " + e)
+
+fn login(net: Net, os: Os, env: Shared[Env], req: http.Request) -> http.Response:
+  let body = from_json(req.body, Creds) else return error(400, "expected {{\"email\": ..., \"password\": ...}}")
+  let email = body.email.strip().lower()
+  var db = env.value.pool.recv() else return error(503, "no database connection")
+  var id = ""
+  var stored = ""
+  var plan = ""
+  var failed = false
+  match pg.query(net, &db, "select id, password_hash, plan from users where email = $1", [email]):
+    ok(rows):
+      if rows.rows.len == 1:
+        id = pg.text(rows, 0, "id") else ""
+        stored = pg.text(rows, 0, "password_hash") else ""
+        plan = pg.text(rows, 0, "plan") else "free"
+    err(e): failed = true
+  pg.give_back(net, env.value.pool, db, env.value.cfg)
+  if failed: return error(500, "database error")
+  if id == "":
+    auth.check_password(body.password, "pbkdf2_sha256$600000$timingtimingtiming$x")
+    return error(401, "wrong email or password")
+  if not auth.check_password(body.password, stored): return error(401, "wrong email or password")
+  var db2 = env.value.pool.recv() else return error(503, "no database connection")
+  let resp = signed_in(net, os, &db2, id, email, plan, 200)
+  pg.give_back(net, env.value.pool, db2, env.value.cfg)
+  return resp
+
+fn logout(net: Net, var db: pg.Db, req: http.Request) -> http.Response:
+  auth.logout(net, &db, req) else return error(500, "database error")
+  var resp = http.Response(204, [], "")
+  auth.clear_session(&resp)
+  return resp
+
+type User:
+  id: Str
+  email: Str
+  plan: Str
+  avatar: Str
+
+# The signed-in user, or nil (id "" in the result).
+fn current(net: Net, os: Os, var db: pg.Db, req: http.Request) -> User throws:
+  let uid = auth.current_user(net, &db, os, req) else fail "database error"
+  let id = uid else return User("", "", "", "")
+  let rows = pg.query(net, &db, "select email, plan, coalesce(avatar, '') as avatar from users where id = $1", [id]) else fail "database error"
+  if rows.rows.len == 0: return User("", "", "", "")
+  return User(id + "", pg.text(rows, 0, "email") else "", pg.text(rows, 0, "plan") else "free", pg.text(rows, 0, "avatar") else "")
+
+fn me(net: Net, os: Os, var db: pg.Db, req: http.Request) -> http.Response:
+  let u = current(net, os, &db, req) else return error(500, "database error")
+  if u.id == "": return error(401, "sign in first")
+  return http.json(200, "{{" + user_json(u.id, u.email, u.plan) + ", \"avatar\": {u.avatar != ""}}}")
+
+# ---- billing
+
+fn checkout(net: Net, os: Os, var db: pg.Db, set: Settings, req: http.Request) -> http.Response:
+  let u = current(net, os, &db, req) else return error(500, "database error")
+  if u.id == "": return error(401, "sign in first")
+  if u.plan == "pro": return error(409, "you're on the paid plan already")
+  var s = stripe.new(set.stripe_key)
+  s.base = set.stripe_base + ""
+  let c = stripe.Checkout(set.price, 1, "subscription", set.app_url + "/?paid={{CHECKOUT_SESSION_ID}}", set.app_url + "/", u.id, u.email)
+  let session = stripe.checkout(net, &s, c) else return error(502, "the payment service didn't answer; try again")
+  return http.json(200, "{{\"url\": " + json.quote(session.url) + "}}")
+
+type CheckoutObject:
+  client_reference_id: Str?
+  customer: Str?
+
+type SubscriptionObject:
+  customer: Str?
+
+# Stripe tells the app about payments here. Every event is checked (signature and time) before it's
+# believed; an event this doesn't use gets 200 so Stripe doesn't send it again.
+fn webhook(net: Net, os: Os, var db: pg.Db, set: Settings, req: http.Request) -> http.Response:
+  let e = stripe.verify_webhook(set.webhook_secret, req, os.time()) else return error(400, "bad signature")
+  if e.kind == "checkout.session.completed":
+    let o = from_json(e.object, CheckoutObject) else return error(400, "unexpected session")
+    let uid = o.client_reference_id else return http.json(200, "{{}}")
+    let customer = o.customer else ""
+    pg.exec(net, &db, "update users set plan = 'pro', stripe_customer = $2 where id = $1", [uid, customer]) else return error(500, "database error")
+  elif e.kind == "customer.subscription.deleted":
+    let o = from_json(e.object, SubscriptionObject) else return error(400, "unexpected subscription")
+    let customer = o.customer else return http.json(200, "{{}}")
+    pg.exec(net, &db, "update users set plan = 'free' where stripe_customer = $1", [customer]) else return error(500, "database error")
+  return http.json(200, "{{}}")
+
+# ---- avatars
+
+fn bucket(set: Settings) -> s3.Bucket:
+  return s3.bucket(set.s3_endpoint, set.s3_region, set.s3_bucket, set.s3_key_id, set.s3_secret)
+
+fn avatar_upload(net: Net, os: Os, var db: pg.Db, set: Settings, req: http.Request) -> http.Response:
+  let u = current(net, os, &db, req) else return error(500, "database error")
+  if u.id == "": return error(401, "sign in first")
+  # a new key each time, so a cached old picture is never shown for a new one
+  let key = "avatars/" + u.id + "/" + auth.new_token()
+  pg.exec(net, &db, "update users set avatar = $2 where id = $1", [u.id, key]) else return error(500, "database error")
+  let url = s3.presign(bucket(set), "PUT", key, 600, os.time())
+  return http.json(200, "{{\"upload\": " + json.quote(url) + "}}")
+
+fn avatar_get(net: Net, os: Os, var db: pg.Db, set: Settings, req: http.Request) -> http.Response:
+  let u = current(net, os, &db, req) else return error(500, "database error")
+  if u.id == "": return error(401, "sign in first")
+  if u.avatar == "": return error(404, "no avatar yet")
+  let url = s3.presign(bucket(set), "GET", u.avatar, 600, os.time())
+  return http.Response(302, [http.Header("Location", url), http.Header("Cache-Control", "private, max-age=300")], "")
+
+fn health(req: http.Request, c: web.Ctx) -> http.Response:
+  return http.json(200, "{{\"ok\": true}}")
+
+fn migrate(net: Net, var db: pg.Db) throws pg.Error:
+  pg.exec(net, &db, "create table if not exists users (id bigserial primary key, email text not null unique, password_hash text not null, plan text not null default 'free', stripe_customer text, avatar text, created timestamptz not null default now())", [])?
+  pg.exec(net, &db, "create index if not exists users_customer on users (stripe_customer)", [])?
+  auth.setup(net, &db)?
+
+fn main(net: Net, os: Os) throws:
+  let port = int(os.env("PORT")) else 8080
+  let url = os.env("DATABASE_URL")
+  if url == "": fail "set DATABASE_URL (postgresql://user:password@host:5432/db)"
+  let set = Settings(env_or(os, "APP_URL", "http://localhost:{port}"), os.env("STRIPE_SECRET_KEY"), os.env("STRIPE_WEBHOOK_SECRET"),
+    os.env("STRIPE_PRICE"), env_or(os, "STRIPE_API_BASE", "https://api.stripe.com"), os.env("RESEND_API_KEY"),
+    env_or(os, "RESEND_API_BASE", "https://api.resend.com"), os.env("MAIL_FROM"), env_or(os, "S3_ENDPOINT", "https://s3.us-east-1.amazonaws.com"),
+    env_or(os, "S3_REGION", "us-east-1"), os.env("S3_BUCKET"), os.env("S3_KEY_ID"), os.env("S3_SECRET"))
+  let cfg = pg.from_url(url)?
+  let pool = pg.pool(net, cfg, POOL)?
+  var db = pool.recv() else fail "no database connection"
+  match migrate(net, &db):
+    ok: pool.send(db)
+    err(e): fail "setting up the tables: " + pg.describe(e)
+  let env = share(Env(pool, cfg, set))
+  var app = web.app()
+  web.use(&app, web.logger(os))
+  web.use(&app, web.same_origin)
+  web.get(&app, "/health", health)
+  web.post(&app, "/signup", on(net, os, env, signup))
+  web.post(&app, "/login", on(net, os, env, login))
+  web.post(&app, "/logout", route(net, os, env, Logout))
+  web.get(&app, "/me", route(net, os, env, Me))
+  web.post(&app, "/billing/checkout", route(net, os, env, Checkout))
+  web.post(&app, "/billing/webhook", route(net, os, env, Webhook))
+  web.post(&app, "/avatar", route(net, os, env, AvatarUpload))
+  web.get(&app, "/avatar", route(net, os, env, AvatarGet))
+  print("listening on http://localhost:{port}")
+  web.serve(net, os, app, port)?

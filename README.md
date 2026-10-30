@@ -267,8 +267,10 @@ A template is a `const` parameter, like SQL for `pg`: text from a request can be
 markup. `vu new web NAME` writes a starter app with a Dockerfile, a `fly.toml`, a `railway.json` and
 a README that says how to deploy it. `vu new api NAME` writes a JSON API on PostgreSQL with accounts:
 sign-up and sign-in (passwords hashed as Django hashes them), sessions by cookie or Bearer token, and
-data that belongs to each user, ready to deploy on Railway. `vu build --static` makes a binary that
-needs no shared libraries.
+data that belongs to each user, ready to deploy on Railway. `examples/saas` goes further: a paid plan
+through Stripe Checkout and signed webhooks, a welcome email through Resend, and avatars uploaded
+straight to S3 with presigned URLs, in 300 lines. `vu build --static` makes a binary that needs no
+shared libraries.
 
 ### Calling C
 

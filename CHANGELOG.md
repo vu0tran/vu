@@ -2530,3 +2530,13 @@ with its arguments, so calls inside them run in the same order either way; only 
 left of the whole `?` would be reordered. The checker now counts only those. Targeted test 731
 checks the order of every call in nested and side-by-side `?`s, and on both failing paths; tests 292
 and 296 (a call to the left, and in an assignment's value) are still refused.
+
+**`examples/saas`.** The modules together: accounts, a subscription through Stripe Checkout whose
+webhook switches the user's plan, a welcome email sent from its own task, and avatars uploaded from
+the browser to S3 with presigned URLs. `run_saas.sh` runs it against PostgreSQL, a fake Stripe and
+Resend, and moto's S3, through a customer's whole path in 27 checks: the email's sender, recipient
+and link, the exact fields Stripe receives, a forged webhook, one replayed an hour later and one
+without a signature (all 400, plan unchanged), the real one, cancelling, the avatar's bytes back
+through the redirect, another user who sees neither, and a cross-site POST. It passed on its first
+run, so I checked that the checks bite: with the app given another webhook secret, the real webhook
+gets 400 and the plan checks fail.
