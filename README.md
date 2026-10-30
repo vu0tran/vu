@@ -23,8 +23,8 @@ fn main():
   print("nodes: {check(make(arg(1, 10)))}")
 ```
 
-Vu is an experiment. v0 runs on Linux (x86-64 and ARM64); macOS builds but hasn't been run on a
-Mac yet. The compiler is written in Vu.
+Vu is an experiment. v0 runs on Linux (x86-64 and ARM64) and macOS (ARM64); CI runs the tests on
+all three. The compiler is written in Vu.
 
 ## Getting started
 
@@ -43,6 +43,17 @@ other tools are needed.
 ./vu build --wasm app.vu                 # a WebAssembly (WASI) module, with zig
 ./vu help                                # every command and flag
 ```
+
+A backend to deploy:
+
+```
+./vu new api notes                       # a JSON API on PostgreSQL: sign-up, sessions, per-user data
+cd notes && DATABASE_URL=postgresql://... ../vu run main.vu
+```
+
+It comes with a Dockerfile and a `railway.json`. Passwords, sessions, SQL parameters, cookies and
+cross-site requests are handled by the standard library, so the code you (or a model) write on top
+doesn't have to get them right. `examples/saas` adds Stripe, email and S3.
 
 `vu lsp` gives editors the compiler's errors as you type, formatting, hover, go to definition and
 completion.
@@ -269,7 +280,7 @@ a README that says how to deploy it. `vu new api NAME` writes a JSON API on Post
 sign-up and sign-in (passwords hashed as Django hashes them), sessions by cookie or Bearer token, and
 data that belongs to each user, ready to deploy on Railway. `examples/saas` goes further: a paid plan
 through Stripe Checkout and signed webhooks, a welcome email through Resend, and avatars uploaded
-straight to S3 with presigned URLs, in 300 lines. `vu build --static` makes a binary that needs no
+straight to S3 with presigned URLs, in under 300 lines. `vu build --static` makes a binary that needs no
 shared libraries.
 
 ### Calling C
