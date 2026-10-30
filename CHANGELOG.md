@@ -2511,3 +2511,14 @@ way), but it's fixed. moto's S3, with signature checks on, runs put, get, exists
 refuses a wrong secret. moto answers 500 to every presigned URL while it checks signatures (boto3's
 own included), so a second moto without checks shows where they lead. Attack round: no findings
 beyond moto's quirks (that, and urllib's default form type on a PUT making moto drop the body).
+
+**`std/mail`.** SMTP (STARTTLS or TLS from the start, PLAIN or LOGIN sign-in) and Resend's API, with
+messages that can't carry injected headers: a line break in an address, name or subject is refused.
+`run_mail.sh` checks it against aiosmtpd 1.4 (STARTTLS required with sign-in, TLS from the start, a
+local relay) and reads each delivered message with Python's `email` package: decoded From, To, Cc,
+Reply-To and a long subject in UTF-8 that wraps, no Bcc header while the Bcc recipient gets it, the
+text and HTML bodies byte for byte (including lines that start with a dot), and no line over 998
+bytes. It also checks the refusals: a wrong password (the server's 535), a remote server without
+STARTTLS, a server that sends a reply between its 220 to STARTTLS and the handshake, bad addresses,
+and a bad Resend key. Attack round: no findings in `mail.vu`. The test harness needed two fixes for
+aiosmtpd (it can't take port 0, and it hides AUTH on a TLS-from-the-start connection unless told).

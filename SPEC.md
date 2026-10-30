@@ -1634,6 +1634,26 @@ let url = s3.presign(b, "PUT", "uploads/" + name, 600, os.time())   # a browser 
   presigned URLs, and runs put, get, exists, delete and a wrong secret against moto's S3, which
   checks signatures.
 
+**`mail`**: sending email over SMTP or through Resend's API.
+
+```
+import mail
+var m = mail.message("App <hello@example.com>", "ada@example.com", "Your sign-in link", text)
+m.html = page                                            # optional; also m.cc, m.bcc, m.reply_to
+mail.send_smtp(net, os, mail.smtp("smtp.example.com", 587, user, password), m)?
+let id = mail.send_resend(net, os.env("RESEND_API_KEY"), m)?
+```
+
+- SMTP: TLS from the start on port 465 (`cfg.implicit_tls`), else STARTTLS, which is required except
+  for a server at `localhost` (a local relay); sign-in with PLAIN or LOGIN, only over TLS. A server
+  that sends anything between its answer to STARTTLS and the handshake is refused (that's how a man
+  in the middle would slip a command into the encrypted session).
+- An address, name or subject with a line break is refused, so headers can't be injected. Names and
+  subjects that aren't ASCII are RFC 2047 encoded words; bodies are UTF-8 in base64; with `html`, the
+  message is `multipart/alternative`. Bcc recipients get it without appearing in the headers.
+- `tests/run_mail.sh` sends through aiosmtpd (STARTTLS with sign-in, TLS from the start, a local
+  relay) and a fake Resend, and reads what arrived with Python's `email` package.
+
 **`sqlite`**: SQLite databases (a file, or `":memory:"`) through the sqlite3 C library, so it takes
 the `Ffi` capability, and libsqlite3 where the program is built.
 

@@ -1,0 +1,311 @@
+# mail: sending email, over SMTP (STARTTLS on 587, or TLS from the start on 465) or through Resend's
+# HTTP API.
+#
+#   var m = mail.message("App <hello@example.com>", "ada@example.com", "Your sign-in link", text)
+#   m.html = page                                         # optional: an HTML version too
+#   mail.send_smtp(net, os, mail.smtp("smtp.example.com", 587, user, password), m)?
+#   mail.send_resend(net, os.env("RESEND_API_KEY"), m)?   # gives Resend's id for the email
+#
+# Headers can't be injected: an address, a name or a subject with a line break is refused. Subjects
+# and names that aren't ASCII are encoded (RFC 2047), bodies are UTF-8 in base64, and the password
+# only ever goes over TLS.
+
+import http
+import json
+import time
+
+type Message:
+  sender: Str        # "Name <addr@example.com>" or "addr@example.com"
+  to: [Str]
+  cc: [Str]
+  bcc: [Str]         # get it, but aren't in the headers
+  reply_to: Str
+  subject: Str
+  text: Str
+  html: Str          # "" for a text-only email
+
+type Smtp:
+  host: Str
+  port: Int          # 587 (STARTTLS) or 465 (TLS from the start); 25 between servers
+  user: Str
+  password: Str
+  timeout: Float
+  ca: Str            # PEM certificates to trust instead of the system's ("" for the system's)
+  helo: Str          # the name this side gives in EHLO ("localhost")
+  implicit_tls: Bool # TLS from the start (smtp() sets it for port 465), else STARTTLS
+
+fn message(sender: Str, to: Str, subject: Str, text: Str) -> Message:
+  return Message(sender + "", [to + ""], [], [], "", subject + "", text + "", "")
+
+fn smtp(host: Str, port: Int, user: Str, password: Str) -> Smtp:
+  return Smtp(host + "", port, user + "", password + "", 30.0, "", "localhost", port == 465)
+
+# ---- addresses
+
+type Addr:
+  name: Str
+  addr: Str
+
+# "Name <a@b>" or "a@b" (a name in quotes may hold commas and '<'). Fails on anything that can't be
+# one address, including line breaks.
+fn parse_addr(s: Str) -> Addr throws:
+  for i in 0..s.len:
+    if s[i] == '\r' or s[i] == '\n' or s[i] == 0: fail "mail: an address can't contain a line break or a zero byte"
+  let t = s.strip()
+  var name = ""
+  var addr = t + ""
+  if t.endswith(">"):
+    let lt = t.find("<")
+    if lt < 0: fail "mail: '{t}' has a '>' without a '<'"
+    var lt2 = lt
+    for i in 0..t.len:
+      if t[i] == '<': lt2 = i
+    name = t[0..lt2].strip()
+    addr = t[lt2 + 1..t.len - 1].strip()
+    if name.startswith("\"") and name.endswith("\"") and name.len >= 2: name = name[1..name.len - 1].replace("\\\"", "\"")
+  let at = addr.find("@")
+  if at <= 0 or at == addr.len - 1 or addr.count("@") != 1: fail "mail: '{addr}' isn't an email address"
+  for i in 0..addr.len:
+    let b = addr[i]
+    if b <= 32 or b >= 127 or b == '<' or b == '>' or b == ',' or b == ';' or b == '"' or b == '(' or b == ')' or b == '[' or b == ']' or b == '\\':
+      fail "mail: '{addr}' isn't an email address this sends to (ASCII without spaces or brackets)"
+  return Addr(name, addr + "")
+
+fn needs_encoding(s: Str) -> Bool:
+  for i in 0..s.len:
+    if s[i] >= 127 or s[i] < 32: return true
+  return false
+
+# An RFC 2047 encoded word for text that isn't plain ASCII: =?UTF-8?B?...?=, split so each word
+# holds whole characters and the line stays short.
+fn encode_words(s: Str) -> Str:
+  if not needs_encoding(s): return s + ""
+  var words: [Str] = []
+  var chunk = ""
+  for c in s.chars():
+    if chunk.len + c.len > 45:
+      words.push("=?UTF-8?B?" + b64encode(chunk) + "?=")
+      chunk = ""
+    chunk += c
+  if chunk != "": words.push("=?UTF-8?B?" + b64encode(chunk) + "?=")
+  return "\r\n ".join(words)
+
+fn show_addr(a: Addr) -> Str:
+  if a.name == "": return a.addr + ""
+  if needs_encoding(a.name): return encode_words(a.name) + " <" + a.addr + ">"
+  var plain = true
+  for i in 0..a.name.len:
+    let b = a.name[i]
+    if not ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == ' ' or b == '-' or b == '_' or b == '.' or b == '!'): plain = false
+  if plain: return a.name + " <" + a.addr + ">"
+  return "\"" + a.name.replace("\\", "\\\\").replace("\"", "\\\"") + "\" <" + a.addr + ">"
+
+# ---- the message
+
+fn b64_lines(s: Str) -> Str:
+  let e = b64encode(s)
+  var out = ""
+  var i = 0
+  while i < e.len:
+    var j = i + 76
+    if j > e.len: j = e.len
+    out += e[i..j] + "\r\n"
+    i = j
+  return out
+
+fn date_header(t: Float) -> Str:
+  let d = time.utc(t)
+  return time.day_name(d.weekday) + ", {d.day} " + time.month_name(d.month) + " {d.year} {d.hour:02}:{d.minute:02}:{d.second:02} +0000"
+
+# The message as it goes over SMTP (lines end in CRLF; the dots aren't doubled yet), with a Date
+# for time t and a random Message-ID at the sender's domain. Fails on a bad address or a subject
+# with a line break.
+fn render(m: Message, t: Float) -> Str throws:
+  let from = parse_addr(m.sender)?
+  if m.to.len + m.cc.len + m.bcc.len == 0: fail "mail: no recipients"
+  for i in 0..m.subject.len:
+    if m.subject[i] == '\r' or m.subject[i] == '\n': fail "mail: a subject can't contain a line break"
+  var h = "From: " + show_addr(from) + "\r\n"
+  if m.to.len > 0:
+    let to = addr_list(m.to)?
+    h += "To: " + to + "\r\n"
+  if m.cc.len > 0:
+    let cc = addr_list(m.cc)?
+    h += "Cc: " + cc + "\r\n"
+  for a in m.bcc: parse_addr(a)?
+  if m.reply_to != "":
+    let rt = parse_addr(m.reply_to)?
+    h += "Reply-To: " + show_addr(rt) + "\r\n"
+  h += "Subject: " + encode_words(m.subject) + "\r\n"
+  h += "Date: " + date_header(t) + "\r\n"
+  let domain = from.addr[from.addr.find("@") + 1..from.addr.len]
+  h += "Message-ID: <" + random_bytes(16).hex() + "@" + domain + ">\r\n"
+  h += "MIME-Version: 1.0\r\n"
+  let text_part = "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" + b64_lines(m.text)
+  if m.html == "": return h + text_part
+  let boundary = "=_" + random_bytes(12).hex()
+  var body = "Content-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n\r\n"
+  body += "--" + boundary + "\r\n" + text_part
+  body += "--" + boundary + "\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" + b64_lines(m.html)
+  body += "--" + boundary + "--\r\n"
+  return h + body
+
+fn addr_list(xs: [Str]) -> Str throws:
+  var out: [Str] = []
+  for x in xs: out.push(show_addr(parse_addr(x)?))
+  return ",\r\n ".join(out)
+
+# ---- SMTP
+
+type Session:
+  conn: Conn
+  buf: Str
+  timeout: Float
+
+# One reply (possibly several lines: "250-..." then "250 ..."): its code and its text.
+type Reply:
+  code: Int
+  text: Str
+
+fn read_reply(net: Net, var s: Session) -> Reply throws:
+  var text = ""
+  while true:
+    var nl = s.buf.find("\r\n")
+    while nl < 0:
+      if s.buf.len > 65536: fail "mail: the server sent a line longer than 64 KB"
+      let more = net.recv(s.conn, timeout: s.timeout)?
+      if more == "": fail "mail: the server closed the connection"
+      s.buf += more
+      nl = s.buf.find("\r\n")
+    let line = s.buf[0..nl]
+    s.buf = s.buf[nl + 2..s.buf.len]
+    if line.len < 3: fail "mail: the server sent '{line}'"
+    let code = int(line[0..3]) else fail "mail: the server sent '{line}'"
+    if text != "": text += "\n"
+    if line.len > 4: text += line[4..line.len]
+    if line.len == 3 or line[3] == ' ': return Reply(code, text)
+    if line[3] != '-': fail "mail: the server sent '{line}'"
+
+fn command(net: Net, var s: Session, line: Str, want: Int) -> Reply throws:
+  net.send(s.conn, line + "\r\n", timeout: s.timeout)?
+  let r = read_reply(net, &s)?
+  if r.code / 100 != want / 100:
+    var shown = line + ""
+    if line.startswith("AUTH"): shown = "AUTH"
+    fail "mail: the server answered {r.code} to {shown}: " + r.text
+  return r
+
+# Doubles a dot at the start of a line ("." alone would end the message), and ends with "\r\n.\r\n".
+fn dot_stuff(data: Str) -> Str:
+  var out = ""
+  for line in data.split("\r\n"):
+    if line.startswith("."): out += "." + line + "\r\n"
+    else: out += line + "\r\n"
+  return out + ".\r\n"
+
+fn has_auth(ehlo: Str, mech: Str) -> Bool:
+  for line in ehlo.split("\n"):
+    let u = line.upper()
+    if u.startswith("AUTH ") or u.startswith("AUTH="):
+      for w in u[5..u.len].split():
+        if w == mech: return true
+  return false
+
+# Sends a message: TLS from the start on port 465, else STARTTLS (refused if the server doesn't offer
+# it, except on a server at localhost: a local relay or a test server), sign-in if a user is given
+# (PLAIN, else LOGIN), then the message to every recipient. Fails with the server's answer.
+fn send_smtp(net: Net, os: Os, cfg: Smtp, m: Message) throws:
+  let data = render(m, os.time())?
+  let from = parse_addr(m.sender)?
+  var rcpts: [Str] = []
+  for x in m.to: rcpts.push(parse_addr(x)?.addr)
+  for x in m.cc: rcpts.push(parse_addr(x)?.addr)
+  for x in m.bcc: rcpts.push(parse_addr(x)?.addr)
+  var conn = net.connect(cfg.host, cfg.port, timeout: cfg.timeout)?
+  var tls = false
+  if cfg.implicit_tls:
+    start_tls(net, &conn, cfg)?
+    tls = true
+  var s = Session(conn, "", cfg.timeout)
+  let hello = read_reply(net, &s)?
+  if hello.code != 220: fail "mail: the server greeted with {hello.code}: " + hello.text
+  var ehlo = command(net, &s, "EHLO " + cfg.helo, 250)?
+  if not tls:
+    var offers = false
+    for line in ehlo.text.split("\n"):
+      if line.upper() == "STARTTLS": offers = true
+    if offers:
+      command(net, &s, "STARTTLS", 220)?
+      if s.buf != "": fail "mail: the server sent data before the TLS handshake"
+      start_tls(net, &s.conn, cfg)?
+      tls = true
+      ehlo = command(net, &s, "EHLO " + cfg.helo, 250)?
+    elif cfg.host != "localhost" and cfg.host != "127.0.0.1" and cfg.host != "::1":
+      fail "mail: {cfg.host} doesn't offer STARTTLS, so this won't send the message (or a password) in the clear"
+  if cfg.user != "":
+    if not tls: fail "mail: signing in needs TLS"
+    if has_auth(ehlo.text, "PLAIN"):
+      command(net, &s, "AUTH PLAIN " + b64encode(str([byte(0)]) + cfg.user + str([byte(0)]) + cfg.password), 235)?
+    elif has_auth(ehlo.text, "LOGIN"):
+      command(net, &s, "AUTH LOGIN", 334)?
+      command(net, &s, b64encode(cfg.user), 334)?
+      command(net, &s, b64encode(cfg.password), 235)?
+    else: fail "mail: the server offers no sign-in this knows (PLAIN or LOGIN)"
+  command(net, &s, "MAIL FROM:<" + from.addr + ">", 250)?
+  for r in rcpts: command(net, &s, "RCPT TO:<" + r + ">", 250)?
+  command(net, &s, "DATA", 354)?
+  net.send(s.conn, dot_stuff(data), timeout: s.timeout)?
+  let done = read_reply(net, &s)?
+  if done.code / 100 != 2: fail "mail: the server refused the message ({done.code}): " + done.text
+  net.send(s.conn, "QUIT\r\n", timeout: s.timeout) else return
+
+fn start_tls(net: Net, var conn: Conn, cfg: Smtp) throws:
+  if cfg.ca == "": net.start_tls(&conn, cfg.host, timeout: cfg.timeout)?
+  else: net.start_tls(&conn, cfg.host, ca: cfg.ca, timeout: cfg.timeout)?
+
+# ---- Resend
+
+# Sends through Resend's API (resend.com) and gives the email's id. The sender's domain must be one
+# verified in Resend.
+fn send_resend(net: Net, key: Str, m: Message) -> Str throws:
+  return send_resend_to(net, key, m, "https://api.resend.com", "")?
+
+fn send_resend_to(net: Net, key: Str, m: Message, base: Str, ca: Str) -> Str throws:
+  if key == "": fail "mail: no Resend API key (set RESEND_API_KEY)"
+  let from = parse_addr(m.sender)?
+  for i in 0..m.subject.len:
+    if m.subject[i] == '\r' or m.subject[i] == '\n': fail "mail: a subject can't contain a line break"
+  let to = quoted_addrs(m.to)?
+  var body = "{{\"from\": " + json.quote(show_plain(from)) + ", \"to\": " + to + ", \"subject\": " + json.quote(m.subject) + ", \"text\": " + json.quote(m.text)
+  if m.html != "": body += ", \"html\": " + json.quote(m.html)
+  if m.cc.len > 0:
+    let cc = quoted_addrs(m.cc)?
+    body += ", \"cc\": " + cc
+  if m.bcc.len > 0:
+    let bcc = quoted_addrs(m.bcc)?
+    body += ", \"bcc\": " + bcc
+  if m.reply_to != "":
+    let rt = parse_addr(m.reply_to)?
+    body += ", \"reply_to\": " + json.quote(show_plain(rt))
+  body += "}}"
+  var req = http.req("POST", base + "/emails")
+  req.ca = ca + ""
+  req.headers.push(http.Header("Authorization", "Bearer " + key))
+  req.headers.push(http.Header("Content-Type", "application/json"))
+  req.body = body
+  let resp = http.send(net, req)?
+  let v = json.parse(resp.body) else fail "mail: Resend answered {resp.status} with a body that isn't JSON"
+  if resp.status < 200 or resp.status >= 300:
+    let msg = json.str_at(v, "message") else "HTTP {resp.status}"
+    fail "mail: Resend: " + msg
+  let id = json.str_at(v, "id") else fail "mail: Resend gave no id"
+  return id + ""
+
+fn show_plain(a: Addr) -> Str:
+  if a.name == "": return a.addr + ""
+  return "\"" + a.name.replace("\\", "\\\\").replace("\"", "\\\"") + "\" <" + a.addr + ">"
+
+fn quoted_addrs(xs: [Str]) -> Str throws:
+  var out: [Str] = []
+  for x in xs: out.push(json.quote(show_plain(parse_addr(x)?)))
+  return "[" + ", ".join(out) + "]"
