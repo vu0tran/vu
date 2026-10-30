@@ -87,7 +87,13 @@ static vu_str vu_hmac_sha256(const vu_str *key, const vu_str *msg) {
     vu_hmac_run(&m, msg->data ? msg->data : (const uint8_t *)"", (size_t)msg->len, d);
     return vu_bytes_str(d, 32);
 }
-/* PBKDF2-HMAC-SHA256 with a 32-byte result (one block), as SCRAM-SHA-256 uses it. */
+#ifdef VU_MT
+static void vu_task_yield(void);
+#endif
+/* PBKDF2-HMAC-SHA256 with a 32-byte result (one block), as SCRAM-SHA-256 uses it. A password hash takes
+   about half a second on purpose; in a program with tasks it gives the other tasks on its thread a turn
+   every 16,384 iterations (about 10 ms), so a server signing someone in doesn't stall the connections
+   that share the thread. */
 static vu_str vu_pbkdf2_sha256(const vu_str *pw, const vu_str *salt, int64_t iters, int line) {
     if (iters < 1 || iters > 100000000) vu_fail(line, "pbkdf2_sha256(): %lld iterations (it takes 1 to 100,000,000)", (long long)iters);
     vu_hmac m; uint8_t u[32], t[32];
@@ -101,6 +107,9 @@ static vu_str vu_pbkdf2_sha256(const vu_str *pw, const vu_str *salt, int64_t ite
     for (int64_t i = 1; i < iters; i++) {
         vu_hmac_run(&m, u, 32, u);
         for (int j = 0; j < 32; j++) t[j] ^= u[j];
+#ifdef VU_MT
+        if ((i & 16383) == 0) vu_task_yield();
+#endif
     }
     return vu_bytes_str(t, 32);
 }

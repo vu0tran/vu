@@ -21,6 +21,10 @@ docker build -t @@NAME@@ .
 docker run -p 8080:8080 @@NAME@@
 ```
 
+On [Railway](https://railway.com): push this folder to a GitHub repository and create a project from it
+(or, with the CLI, `railway init` and `railway up` here). `railway.json` tells it to build the Dockerfile
+and check `/health`; it gives the app a `PORT` and, under Settings, a domain with HTTPS.
+
 On [Fly.io](https://fly.io), after `fly auth login`:
 
 ```

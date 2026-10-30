@@ -264,8 +264,11 @@ fn main(net: Net, os: Os, fs: Fs) throws:
 ```
 
 A template is a `const` parameter, like SQL for `pg`: text from a request can be a value, never
-markup. `vu new web NAME` writes a starter app with a Dockerfile, a `fly.toml` and a README that
-says how to deploy it; `vu build --static` makes a binary that needs no shared libraries.
+markup. `vu new web NAME` writes a starter app with a Dockerfile, a `fly.toml`, a `railway.json` and
+a README that says how to deploy it. `vu new api NAME` writes a JSON API on PostgreSQL with accounts:
+sign-up and sign-in (passwords hashed as Django hashes them), sessions by cookie or Bearer token, and
+data that belongs to each user, ready to deploy on Railway. `vu build --static` makes a binary that
+needs no shared libraries.
 
 ### Calling C
 
@@ -316,7 +319,10 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
   keeps connections open and speaks HTTP/2 to servers that offer it;
 - `web`: routes, middleware, forms, file uploads, cookies, static files and escaping HTML templates, on `http`;
 - `ws`: WebSockets, server and client (and WebSocket routes in `web`);
-- `pg`: a PostgreSQL client (SCRAM-SHA-256, TLS, parameters only), and `sqlite` (through libsqlite3);
+- `pg`: a PostgreSQL client (SCRAM-SHA-256, TLS, parameters only, `DATABASE_URL`s and a pool of
+  connections), and `sqlite` (through libsqlite3);
+- `auth`: password hashes compatible with Django's, sessions stored as hashes of their tokens, and
+  CSRF tokens;
 - `re`: regular expressions with Python's syntax, in time linear in the text, and as fast as
   Python's on most patterns (faster on many: CHANGELOG.md, round 10);
 - `zlib`: zlib, gzip and raw DEFLATE decompression, the same results as Python's `zlib` (and zlib's

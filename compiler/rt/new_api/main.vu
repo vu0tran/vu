@@ -1,0 +1,212 @@
+# A JSON API on PostgreSQL with accounts: sign up, log in, and notes that belong to each user.
+# Run it with DATABASE_URL set (postgresql://user:password@host:5432/db) and `vu run main.vu`.
+#
+#   POST   /signup     {"email", "password"}  -> 201 {"id", "email", "token"} and a session cookie
+#   POST   /login      {"email", "password"}  -> 200 {"id", "email", "token"} and a session cookie
+#   POST   /logout                            -> 204
+#   GET    /me                                -> 200 {"id", "email"}
+#   GET    /notes                             -> 200 [{"id", "text", "created"}]
+#   POST   /notes      {"text"}               -> 201 {"id", "text", "created"}
+#   DELETE /notes/:id                         -> 204
+#   GET    /health                            -> 200 {"ok": true}
+#
+# Browsers use the cookie; other clients send the token as "Authorization: Bearer TOKEN".
+# Passwords are stored as PBKDF2 hashes (Django's format), sessions as hashes of their tokens, and
+# every SQL statement is written in the program: values only ever reach the database as parameters.
+import auth
+import http
+import json
+import pg
+import web
+
+const POOL = 8
+const SESSION_DAYS = 30
+
+type Creds:
+  email: Str
+  password: Str
+
+type NewNote:
+  text: Str
+
+type Note:
+  id: Int
+  text: Str
+  created: Str
+
+# What every handler gets: the database connections, and how to make new ones.
+type Env:
+  pool: Chan[pg.Db]
+  cfg: pg.Config
+
+fn error(status: Int, message: Str) -> http.Response:
+  return http.json(status, "{{\"error\": " + json.quote(message) + "}}")
+
+fn db_error(e: pg.Error) -> http.Response:
+  # the details go to the log, not to the client
+  eprint("database: " + pg.describe(e))
+  return error(500, "database error")
+
+# The routes that use the database for the whole request. A handler gets a connection with &db:
+# function values can't take var parameters, so the routes are named here and handle() calls the one
+# asked for. (Signing up and in take connections themselves: see signup.)
+type Api:
+  Logout
+  Me
+  Notes
+  AddNote
+  DeleteNote
+
+# Takes a connection for one request, runs the route's handler, and gives the connection back.
+fn handle(net: Net, os: Os, env: Shared[Env], api: Api, req: http.Request, c: web.Ctx) -> http.Response:
+  var db = env.value.pool.recv() else return error(503, "no database connection")
+  var resp = error(500, "")
+  match api:
+    Logout: resp = logout(net, &db, req)
+    Me: resp = me(net, os, &db, req)
+    Notes: resp = notes(net, os, &db, req)
+    AddNote: resp = add_note(net, os, &db, req)
+    DeleteNote: resp = delete_note(net, os, &db, req, c)
+  pg.give_back(net, env.value.pool, db, env.value.cfg)
+  return resp
+
+fn route(net: Net, os: Os, env: Shared[Env], api: Api) -> fn(http.Request, web.Ctx) -> http.Response:
+  let e = env.share()
+  return own fn(req: http.Request, c: web.Ctx) => handle(net, os, e, api, req, c)
+
+fn on(net: Net, os: Os, env: Shared[Env], own f: fn(Net, Os, Shared[Env], http.Request) -> http.Response) -> fn(http.Request, web.Ctx) -> http.Response:
+  let e = env.share()
+  return own fn(req: http.Request, c: web.Ctx) => f(net, os, e, req)
+
+fn valid_email(s: Str) -> Bool:
+  let at = s.find("@")
+  return s.len <= 254 and at > 0 and at < s.len - 1 and not (" " in s) and s.count("@") == 1
+
+fn signed_in(net: Net, os: Os, var db: pg.Db, id: Str, email: Str, status: Int) -> http.Response:
+  let token = auth.login(net, &db, os, id, SESSION_DAYS) else return error(500, "database error")
+  var resp = http.json(status, "{{\"id\": {id}, \"email\": " + json.quote(email) + ", \"token\": " + json.quote(token) + "}}")
+  auth.set_session(&resp, token, SESSION_DAYS)
+  return resp
+
+# Hashing a password takes half a second on purpose, so signing up and in hash without holding a
+# connection: a burst of sign-ins doesn't keep the pool from everyone else.
+fn signup(net: Net, os: Os, env: Shared[Env], req: http.Request) -> http.Response:
+  let body = from_json(req.body, Creds) else return error(400, "expected {{\"email\": ..., \"password\": ...}}")
+  let email = body.email.strip().lower()
+  if not valid_email(email): return error(400, "that isn't an email address")
+  if body.password.len < 10 or body.password.len > 1000: return error(400, "a password has 10 to 1000 characters")
+  let hash = auth.hash_password(body.password)
+  var db = env.value.pool.recv() else return error(503, "no database connection")
+  let resp = add_user(net, os, &db, email, hash)
+  pg.give_back(net, env.value.pool, db, env.value.cfg)
+  return resp
+
+fn add_user(net: Net, os: Os, var db: pg.Db, email: Str, hash: Str) -> http.Response:
+  match pg.query(net, &db, "insert into users (email, password_hash) values ($1, $2) on conflict (email) do nothing returning id", [email, hash]):
+    ok(rows):
+      if rows.rows.len == 0: return error(409, "that email has an account")
+      let id = pg.text(rows, 0, "id") else ""
+      return signed_in(net, os, &db, id, email, 201)
+    err(e): return db_error(e)
+
+fn login(net: Net, os: Os, env: Shared[Env], req: http.Request) -> http.Response:
+  let body = from_json(req.body, Creds) else return error(400, "expected {{\"email\": ..., \"password\": ...}}")
+  let email = body.email.strip().lower()
+  var db = env.value.pool.recv() else return error(503, "no database connection")
+  var id = ""
+  var stored = ""
+  var failed = false
+  match pg.query(net, &db, "select id, password_hash from users where email = $1", [email]):
+    ok(rows):
+      if rows.rows.len == 1:
+        id = pg.text(rows, 0, "id") else ""
+        stored = pg.text(rows, 0, "password_hash") else ""
+    err(e): failed = true
+  pg.give_back(net, env.value.pool, db, env.value.cfg)
+  if failed: return error(500, "database error")
+  if id == "":
+    # hash anyway, so the time taken doesn't say whether the email has an account
+    auth.check_password(body.password, "pbkdf2_sha256$600000$timingtimingtiming$x")
+    return error(401, "wrong email or password")
+  if not auth.check_password(body.password, stored): return error(401, "wrong email or password")
+  var newer = ""
+  if auth.needs_rehash(stored): newer = auth.hash_password(body.password)
+  var db2 = env.value.pool.recv() else return error(503, "no database connection")
+  var updated = true
+  if newer != "":
+    match pg.exec(net, &db2, "update users set password_hash = $1 where id = $2", [newer, id]):
+      ok(n): updated = true
+      err(e): updated = false
+  var resp = error(500, "database error")
+  if updated: resp = signed_in(net, os, &db2, id, email, 200)
+  pg.give_back(net, env.value.pool, db2, env.value.cfg)
+  return resp
+
+fn logout(net: Net, var db: pg.Db, req: http.Request) -> http.Response:
+  auth.logout(net, &db, req) else return error(500, "database error")
+  var resp = http.Response(204, [], "")
+  auth.clear_session(&resp)
+  return resp
+
+fn me(net: Net, os: Os, var db: pg.Db, req: http.Request) -> http.Response:
+  let uid = auth.current_user(net, &db, os, req) else return error(500, "database error")
+  let id = uid else return error(401, "sign in first")
+  let rows = pg.query(net, &db, "select email from users where id = $1", [id]) else return error(500, "database error")
+  if rows.rows.len == 0: return error(401, "sign in first")
+  return http.json(200, "{{\"id\": {id}, \"email\": " + json.quote(pg.text(rows, 0, "email") else "") + "}}")
+
+fn notes(net: Net, os: Os, var db: pg.Db, req: http.Request) -> http.Response:
+  let uid = auth.current_user(net, &db, os, req) else return error(500, "database error")
+  let id = uid else return error(401, "sign in first")
+  let rows = pg.query(net, &db, "select coalesce(json_agg(json_build_object('id', id, 'text', text, 'created', created) order by id), '[]')::text as list from notes where user_id = $1", [id]) else return error(500, "database error")
+  return http.json(200, pg.text(rows, 0, "list") else "[]")
+
+fn add_note(net: Net, os: Os, var db: pg.Db, req: http.Request) -> http.Response:
+  let uid = auth.current_user(net, &db, os, req) else return error(500, "database error")
+  let id = uid else return error(401, "sign in first")
+  let body = from_json(req.body, NewNote) else return error(400, "expected {{\"text\": ...}}")
+  if body.text.len == 0 or body.text.len > 10000: return error(400, "a note has 1 to 10,000 bytes")
+  let rows = pg.query(net, &db, "insert into notes (user_id, text) values ($1, $2) returning json_build_object('id', id, 'text', text, 'created', created)::text as note", [id, body.text]) else return error(500, "database error")
+  return http.json(201, pg.text(rows, 0, "note") else "{{}}")
+
+fn delete_note(net: Net, os: Os, var db: pg.Db, req: http.Request, c: web.Ctx) -> http.Response:
+  let uid = auth.current_user(net, &db, os, req) else return error(500, "database error")
+  let id = uid else return error(401, "sign in first")
+  let note = int(web.param(c, "id")) else return error(404, "no such note")
+  let n = pg.exec(net, &db, "delete from notes where id = $1 and user_id = $2", ["{note}", id]) else return error(500, "database error")
+  if n == 0: return error(404, "no such note")
+  return http.Response(204, [], "")
+
+fn health(req: http.Request, c: web.Ctx) -> http.Response:
+  return http.json(200, "{{\"ok\": true}}")
+
+fn migrate(net: Net, var db: pg.Db) throws pg.Error:
+  pg.exec(net, &db, "create table if not exists users (id bigserial primary key, email text not null unique, password_hash text not null, created timestamptz not null default now())", [])?
+  pg.exec(net, &db, "create table if not exists notes (id bigserial primary key, user_id bigint not null references users on delete cascade, text text not null, created timestamptz not null default now())", [])?
+  pg.exec(net, &db, "create index if not exists notes_user on notes (user_id, id)", [])?
+  auth.setup(net, &db)?
+
+fn main(net: Net, os: Os) throws:
+  let port = int(os.env("PORT")) else 8080
+  let url = os.env("DATABASE_URL")
+  if url == "": fail "set DATABASE_URL (postgresql://user:password@host:5432/db)"
+  let cfg = pg.from_url(url)?
+  let pool = pg.pool(net, cfg, POOL)?
+  var db = pool.recv() else fail "no database connection"
+  match migrate(net, &db):
+    ok: pool.send(db)
+    err(e): fail "setting up the tables: " + pg.describe(e)
+  let env = share(Env(pool, cfg))
+  var app = web.app()
+  web.use(&app, web.logger(os))
+  web.use(&app, web.same_origin)
+  web.get(&app, "/health", health)
+  web.post(&app, "/signup", on(net, os, env, signup))
+  web.post(&app, "/login", on(net, os, env, login))
+  web.post(&app, "/logout", route(net, os, env, Logout))
+  web.get(&app, "/me", route(net, os, env, Me))
+  web.get(&app, "/notes", route(net, os, env, Notes))
+  web.post(&app, "/notes", route(net, os, env, AddNote))
+  web.delete(&app, "/notes/:id", route(net, os, env, DeleteNote))
+  print("listening on http://localhost:{port}")
+  web.serve(net, os, app, port)?

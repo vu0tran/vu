@@ -2445,3 +2445,49 @@ the old CPU's AVX-512 instructions was reused on the new one. Those keys now inc
 and feature flags when a build uses `-march=native` (`/proc/cpuinfo` on Linux, `sysctl` on macOS).
 The installed compiler had the same problem, being an optimized build itself; `compiler/build.sh`
 recovers from that only by bootstrapping again from the seed (move `compiler/vuc` away first).
+
+## Round 28: accounts for backend apps
+
+The goal: an app with accounts on PostgreSQL, from `vu new api NAME` to Railway, with nothing
+security-sensitive left for the person (or the model) writing it to get right.
+
+**`std/auth`.** Password hashes are PBKDF2-HMAC-SHA256 with 600,000 iterations in Django's format
+(`pbkdf2_sha256$600000$SALT$HASH`), so users can move between a Django app and a Vu app with their
+passwords. Checking compares in constant time and refuses malformed hashes and ones asking for more
+than 10 million iterations. Sessions are 32 random bytes; PostgreSQL keeps only their SHA-256.
+`current_user` reads a Bearer token or the session cookie (HttpOnly, Secure, SameSite=Lax). CSRF
+tokens are an HMAC of the session token. `tests/run_auth.sh` checks hashes both ways against Django
+6.1 (60 random passwords per run, including Unicode, empty, 1,000-byte and invalid UTF-8 ones, and 14
+malformed hashes), and sessions against PostgreSQL 16, plain and under the sanitizers.
+
+**A hash no longer stalls a server.** A task runs until it waits, and a password hash takes 0.4 s
+of CPU, so every connection on the same thread waited for it. `pbkdf2_sha256` now lets the other
+tasks run every 16,384 iterations. Measured with one task thread: a task ticking every 2 ms saw a
+longest gap of 14 ms during a 600,000-iteration hash, instead of the hash's 390 ms. (Targeted test
+728 checks this with 64 tasks, so some share the hashing thread whatever the number of cores.)
+
+**`pg.from_url`, `pg.pool`, `pg.give_back`.** Platforms give `DATABASE_URL`; parsing it was 40
+lines in every app. The Railway benchmark's own parser had a bug the new tests found in the first
+version of `from_url` too: a `%` two bytes from the end read past the string. `give_back` replaces a
+connection that broke, so a database restart doesn't leave a pool of dead connections.
+
+**`Shared` values can hold channels of anything.** The checker refused a `Shared` struct holding a
+`Chan[pg.Db]`, because a `pg.Db` holds a connection. But a task takes a value out of a channel to own
+it, so no two tasks use a connection at once. Targeted test 730 runs a pool of connections in a
+`Shared` value from 10 tasks.
+
+**`vu new api NAME`** writes a JSON API with sign-up, sign-in, sign-out, `/me` and per-user notes,
+plus a Dockerfile and `railway.json` (`vu new web` gets a `railway.json` too). It hashes passwords
+before taking a database connection, so a burst of sign-ins doesn't hold the pool. `run_auth.sh`
+drives it over HTTP with 32 checks: cookies and Bearer tokens, wrong passwords, unknown emails,
+another user's notes, a cross-site POST (403), logout, and a stored hash with 1,000 iterations
+being upgraded at sign-in. CI runs `run_pg.sh` and `run_auth.sh` on Linux now (with Django).
+
+A language gap showed up: a function value can't take a `var` parameter (by design: a closure could
+hold the same variable), so handlers can't be `fn(var pg.Db, ...)` values. The template names its
+routes in an enum and calls each handler with `&db` from one function.
+
+Attack rounds: (1) malformed hashes, iteration limits, a 1 MB password (2,000 iterations in 6 ms:
+the key is hashed once), tokens' alphabet and uniqueness over 2,000, CSRF with the wrong token,
+session, secret or none: no findings. (2) `pg.from_url` on 13 URLs: found the `%` read past the end.
+(3) the API template over HTTP: no findings beyond my test harness (it expected JSON from a 403).

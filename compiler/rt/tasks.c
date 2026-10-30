@@ -817,6 +817,16 @@ static void vu_task_sleep(vu_cap os, double seconds, int line) {
     vu_wait_until(d);
     vu_block();
 }
+/* Gives the other tasks on this thread a turn (and lets it see the network), from inside a long
+   computation such as pbkdf2_sha256. Nothing outside a task (a par loop's threads, or before tasks start). */
+static void vu_task_yield(void) {
+    if (!vu_cur_task || vu_in_par()) return;
+    vu_task *t = vu_cur_task;
+    t->wait_kind = VU_W_SLEEP;
+    t->wait_line = 0;
+    vu_wait_until(vu_now_ns());
+    vu_block();
+}
 /* -- channels: a queue of up to cap values, shared by the tasks holding it (counted references).
    Tasks on any thread use it, under its lock. */
 typedef struct vu_chan {

@@ -16,7 +16,7 @@ printf 'local all all trust\nhost all all 127.0.0.1/32 scram-sha-256\n' > "$data
 pgport=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 app=
 asp "$bin/pg_ctl -D $data -o '-p $pgport -k /tmp -c listen_addresses=127.0.0.1 -c max_connections=100' -l $data/log start -w >/dev/null"
-trap 'set +e; tail -5 "$work"/*.log; [ -n "$app" ] && kill $app; asp "$bin/pg_ctl -D $data stop -m immediate >/dev/null"; rm -rf "$work"' EXIT
+trap 'set +e; tail -n 5 "$work"/*.log; [ -n "$app" ] && kill $app 2>/dev/null; asp "$bin/pg_ctl -D $data stop -m immediate >/dev/null"; rm -rf "$work"' EXIT
 asp "psql -h /tmp -p $pgport -U postgres -q -c \"create user app password 'bench pw'\" -c 'create database appdb owner app'"
 export DATABASE_URL="postgresql://app:bench%20pw@127.0.0.1:$pgport/appdb" PORT=8099
 $VU build vu/main.vu -o "$work/vu-app"

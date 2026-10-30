@@ -1,0 +1,176 @@
+# auth: passwords, sessions and CSRF tokens for a web app, done the way that's hard to get wrong.
+#
+#   let stored = auth.hash_password(password)             # "pbkdf2_sha256$600000$salt$hash"
+#   if auth.check_password(attempt, stored): ...          # constant-time; false on a malformed hash
+#
+#   auth.setup(net, &db)?                                  # the sessions table in PostgreSQL
+#   let token = auth.login(net, &db, os, user_id, 30)?     # a new session for 30 days
+#   auth.set_session(&resp, token, 30)                     # its cookie (HttpOnly, Secure, SameSite=Lax)
+#   let uid = auth.current_user(net, &db, os, req)?        # the user id, or nil (cookie or Bearer token)
+#   auth.logout(net, &db, req)?; auth.clear_session(&resp)
+#
+# Password hashes are Django's format (PBKDF2-HMAC-SHA256, 600,000 iterations as OWASP recommends),
+# so a Django app's users can sign in to a Vu app with the passwords they have, and the reverse.
+# Session tokens are 32 random bytes; the database keeps only their SHA-256, so a copy of the table
+# can't be used to sign in. CSRF tokens are an HMAC of the session token, so they need no storage.
+
+import http
+import pg
+import web
+
+const ITERATIONS = 600000
+const SALT_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+const COOKIE = "session"
+
+# ---- passwords
+
+# A hash to store for a password: "pbkdf2_sha256$600000$SALT$HASH" with a random 22-character salt
+# and the hash in base64, as Django writes it. Takes about half a second on purpose.
+fn hash_password(password: Str) -> Str:
+  return hash_with(password, new_salt(), ITERATIONS)
+
+fn hash_with(password: Str, salt: Str, iterations: Int) -> Str:
+  return "pbkdf2_sha256${iterations}${salt}$" + b64encode(pbkdf2_sha256(password, salt, iterations))
+
+# 22 characters from 62 (131 bits), drawn without bias: bytes from 248 up are thrown away.
+fn new_salt() -> Str:
+  var out = ""
+  while out.len < 22:
+    for b in bytes(random_bytes(32)):
+      if int(b) < 248 and out.len < 22:
+        let k = int(b) % 62
+        out += SALT_CHARS[k..k + 1]
+  return out
+
+type Parsed:
+  iterations: Int
+  salt: Str
+  hash: Str
+
+fn parse(encoded: Str) -> Parsed?:
+  let parts = encoded.split("$")
+  if parts.len != 4 or parts[0] != "pbkdf2_sha256": return nil
+  let digits = parts[1] + ""
+  if digits.len == 0 or digits.len > 9: return nil
+  for i in 0..digits.len:
+    if digits[i] < '0' or digits[i] > '9': return nil
+  let n = int(digits) else return nil
+  if n < 1: return nil
+  if parts[2].len == 0 or "$" in parts[2]: return nil
+  return Parsed(n, parts[2] + "", parts[3] + "")
+
+# Whether a password matches a stored hash. A malformed hash, or one with more than 10 million
+# iterations (a stored value someone could have made to stall the server), is false.
+fn check_password(password: Str, encoded: Str) -> Bool:
+  let p = parse(encoded) else return false
+  if p.iterations > 10000000: return false
+  let want = b64encode(pbkdf2_sha256(password, p.salt, p.iterations))
+  return same(want, p.hash)
+
+# Whether a stored hash should be made again (after the user signs in, with the password they gave):
+# it's malformed or uses fewer iterations than hash_password does now.
+fn needs_rehash(encoded: Str) -> Bool:
+  let p = parse(encoded) else return true
+  return p.iterations < ITERATIONS
+
+# Whether two strings are equal, comparing every byte so the time doesn't say where they differ.
+fn same(a: Str, b: Str) -> Bool:
+  if a.len != b.len: return false
+  var diff = 0
+  for i in 0..a.len: diff = diff | (int(a[i]) ^ int(b[i]))
+  return diff == 0
+
+# ---- tokens
+
+# 32 random bytes as 43 characters of URL-safe base64 (no padding): for sessions, password resets,
+# API keys and links in emails.
+fn new_token() -> Str:
+  let s = b64encode(random_bytes(32))
+  var out: [Byte] = []
+  for i in 0..s.len:
+    let b = s[i]
+    if b == '+': out.push('-')
+    elif b == '/': out.push('_')
+    elif b != '=': out.push(b)
+  return str(out)
+
+# What to store for a token: its SHA-256 in hex. Look tokens up by this, never by the token itself.
+fn token_hash(token: Str) -> Str:
+  return sha256(token).hex()
+
+# ---- CSRF
+
+# A token to put in a form (<input type=hidden name=csrf_token>) or send as X-CSRF-Token: an HMAC
+# of the session token with the app's secret, so it's the same for the whole session and needs no
+# storage. (web.same_origin refuses most cross-site requests already; this covers old browsers.)
+fn csrf_token(secret: Str, session: Str) -> Str:
+  return hmac_sha256(secret, "csrf:" + session).hex()
+
+# Whether a request carries the right CSRF token, in the X-CSRF-Token header or the csrf_token field
+# of a form.
+fn csrf_ok(req: http.Request, secret: Str, session: Str) -> Bool:
+  let want = csrf_token(secret, session)
+  for h in req.headers:
+    if h.name == "x-csrf-token": return same(h.value, want)
+  let got = web.field(req, "csrf_token") else return false
+  return same(got, want)
+
+# ---- sessions in PostgreSQL
+
+# Makes the sessions table if it isn't there: the token's hash, the user (as text, so any id
+# type fits), and when it ends (Unix seconds).
+fn setup(net: Net, var db: pg.Db) throws pg.Error:
+  pg.exec(net, &db, "create table if not exists vu_sessions (token_hash text primary key, user_id text not null, expires bigint not null)", [])?
+  pg.exec(net, &db, "create index if not exists vu_sessions_user on vu_sessions (user_id)", [])?
+
+# Starts a session for a user, for that many days, and gives its token (for set_session).
+fn login(net: Net, var db: pg.Db, os: Os, user_id: Str, days: Int) -> Str throws pg.Error:
+  let token = new_token()
+  let ends = int(os.time()) + days * 86400
+  pg.exec(net, &db, "insert into vu_sessions (token_hash, user_id, expires) values ($1, $2, $3)", [token_hash(token), user_id, "{ends}"])?
+  return token
+
+# The user of a session token, or nil for an unknown or expired one.
+fn session_user(net: Net, var db: pg.Db, os: Os, token: Str) -> Str? throws pg.Error:
+  if token.len != 43: return nil
+  let rows = pg.query(net, &db, "select user_id from vu_sessions where token_hash = $1 and expires > $2", [token_hash(token), "{int(os.time())}"])?
+  if rows.rows.len == 0: return nil
+  return pg.text(rows, 0, "user_id")
+
+# The user of the request's session (its Authorization: Bearer token, else its session cookie), or nil.
+fn current_user(net: Net, var db: pg.Db, os: Os, req: http.Request) -> Str? throws pg.Error:
+  let token = session_token(req) else return nil
+  return session_user(net, &db, os, token)?
+
+# Ends the request's session (if it has one).
+fn logout(net: Net, var db: pg.Db, req: http.Request) throws pg.Error:
+  let token = session_token(req) else return
+  pg.exec(net, &db, "delete from vu_sessions where token_hash = $1", [token_hash(token)])?
+
+# Ends every session of a user: after a password change, or "sign out everywhere".
+fn logout_all(net: Net, var db: pg.Db, user_id: Str) throws pg.Error:
+  pg.exec(net, &db, "delete from vu_sessions where user_id = $1", [user_id])?
+
+# Deletes sessions that have ended, and gives how many.
+fn prune(net: Net, var db: pg.Db, os: Os) -> Int throws pg.Error:
+  return pg.exec(net, &db, "delete from vu_sessions where expires <= $1", ["{int(os.time())}"])?
+
+# ---- the cookie
+
+# The session cookie for a token: HttpOnly, Secure, SameSite=Lax, for that many days.
+fn set_session(var resp: http.Response, token: Str, days: Int):
+  var c = web.cookie(COOKIE, token)
+  c.max_age = days * 86400
+  web.set_cookie(&resp, c)
+
+fn clear_session(var resp: http.Response):
+  web.clear_cookie(&resp, COOKIE)
+
+# The request's session token, or nil: from an "Authorization: Bearer TOKEN" header (API clients,
+# which get the token from login's response), else from the session cookie (browsers).
+fn session_token(req: http.Request) -> Str?:
+  for h in req.headers:
+    if h.name == "authorization":
+      if h.value.len > 7 and h.value[0..7].lower() == "bearer ": return h.value[7..h.value.len].strip()
+      return nil
+  return web.get_cookie(req, COOKIE)

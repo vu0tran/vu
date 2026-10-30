@@ -16,7 +16,7 @@
 #
 # Sign-in: SCRAM-SHA-256 (the default since PostgreSQL 14) or a plain password; MD5 isn't supported.
 # One query at a time per connection; for several tasks, keep connections in a Chan[pg.Db] as a pool.
-# Not yet: TLS to the server, COPY, LISTEN/NOTIFY, binary formats.
+# Not yet: COPY, LISTEN/NOTIFY, binary formats.
 
 type Config:
   host: Str
@@ -51,6 +51,111 @@ const MAX_MESSAGE = 268435456
 
 fn config(host: Str, port: Int, user: Str, password: Str, database: Str) -> Config:
   return Config(host, port, user, password, database, 30.0, false, false, "")
+
+# A Config from a connection URL, as hosting platforms give it in DATABASE_URL:
+# postgresql://user:password@host:port/database?sslmode=require (postgres:// too). %-escapes in the
+# user, password and database are decoded; the port defaults to 5432 and the database to the user;
+# an IPv6 host is written in brackets ([::1]). sslmode require, verify-ca or verify-full turns tls on
+# (always checking the certificate, as verify-full); disable, allow or prefer leave it off.
+fn from_url(u: Str) -> Config throws:
+  var rest = ""
+  if u.startswith("postgresql://"): rest = u[13..u.len]
+  elif u.startswith("postgres://"): rest = u[11..u.len]
+  else: fail "a PostgreSQL URL starts with postgresql:// or postgres://"
+  var query = ""
+  let qm = rest.find("?")
+  if qm >= 0:
+    query = rest[qm + 1..rest.len]
+    rest = rest[0..qm]
+  var database = ""
+  let slash = rest.find("/")
+  if slash >= 0:
+    database = rest[slash + 1..rest.len]
+    rest = rest[0..slash]
+  var user = ""
+  var password = ""
+  var at = -1
+  for i in 0..rest.len:
+    if rest[i] == '@': at = i
+  if at >= 0:
+    let cred = rest[0..at]
+    rest = rest[at + 1..rest.len]
+    let colon = cred.find(":")
+    if colon >= 0:
+      user = cred[0..colon]
+      password = cred[colon + 1..cred.len]
+    else: user = cred + ""
+  var host = rest + ""
+  var port = 5432
+  if rest.startswith("["):
+    let close = rest.find("]")
+    if close < 0: fail "the URL's host has a '[' and no ']'"
+    host = rest[1..close]
+    let after = rest[close + 1..rest.len]
+    if after.startswith(":"): port = int(after[1..after.len]) else fail "the URL's port isn't a number"
+    elif after != "": fail "the URL has '{after}' after the host"
+  else:
+    let pc = rest.find(":")
+    if pc >= 0:
+      host = rest[0..pc]
+      port = int(rest[pc + 1..rest.len]) else fail "the URL's port isn't a number"
+  if host == "": fail "the URL has no host"
+  if port < 1 or port > 65535: fail "the URL's port {port} is out of range"
+  let user_d = url_decode(user)?
+  var cfg = config(host, port, user_d, url_decode(password)?, url_decode(database)?)
+  if cfg.database == "": cfg.database = cfg.user + ""
+  if cfg.user == "": fail "the URL has no user"
+  if query != "":
+    for kv in query.split("&"):
+      let eq = kv.find("=")
+      if eq < 0: continue
+      let k = kv[0..eq]
+      let v = kv[eq + 1..kv.len]
+      if k == "sslmode":
+        if v == "require" or v == "verify-ca" or v == "verify-full": cfg.tls = true
+        elif v != "disable" and v != "allow" and v != "prefer": fail "the URL's sslmode '{v}' isn't one PostgreSQL has"
+      elif k == "connect_timeout":
+        let t = int(v) else fail "the URL's connect_timeout isn't a number"
+        if t > 0: cfg.timeout = float(t)
+  return cfg
+
+fn url_decode(s: Str) -> Str throws:
+  var out: [Byte] = []
+  var i = 0
+  while i < s.len:
+    if s[i] == '%':
+      if i + 3 > s.len: fail "the URL has a '%' that isn't followed by two hex digits"
+      let pair = from_hex(s[i + 1..i + 3]) else fail "the URL has a '%' that isn't followed by two hex digits"
+      out.push(pair[0])
+      i += 3
+      continue
+    out.push(s[i])
+    i += 1
+  return str(out)
+
+# n connections in a channel, for tasks to share: take one with recv() and give it back with send().
+#   let pool = pg.pool(net, cfg, 10)?
+#   var db = pool.recv() else return ...
+#   ... pg.query(net, &db, ...) ...
+#   pg.give_back(net, pool, db, cfg)
+fn pool(net: Net, cfg: Config, n: Int) -> Chan[Db] throws:
+  let p: Chan[Db] = chan(n)
+  for i in 0..n: p.send(connect(net, cfg)?)
+  return p
+
+# Returns a connection to a pool; one that broke (a network error) is replaced with a new one, so a
+# database restart doesn't leave the pool with dead connections. If that fails, the broken one goes
+# back, to be tried again next time.
+fn give_back(net: Net, pool: Chan[Db], own db: Db, cfg: Config):
+  if not db.broken:
+    pool.send(db)
+    return
+  match connect(net, cfg):
+    ok(fresh):
+      var old = db
+      close(net, &old)
+      pool.send(fresh)
+    err(e): pool.send(db)
 
 # ---- encoding
 

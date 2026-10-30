@@ -59,7 +59,7 @@ out=$($VU run "$work/typed.vu" 2>&1); rc=$?
 
 # vu new web NAME: the files, a starter that checks, and refusals that write nothing
 out=$(cd "$work" && $VU new web demo-app 2>&1); rc=$?
-[ $rc -eq 0 ] && for f in main.vu public/style.css Dockerfile .dockerignore .gitignore fly.toml README.md; do [ -s "$work/demo-app/$f" ] || exit 1; done \
+[ $rc -eq 0 ] && for f in main.vu public/style.css Dockerfile .dockerignore .gitignore fly.toml railway.json README.md; do [ -s "$work/demo-app/$f" ] || exit 1; done \
   && grep -q 'app = "demo-app"' "$work/demo-app/fly.toml" && ! grep -q '@@' "$work/demo-app/README.md" "$work/demo-app/Dockerfile"
 check "new web: writes the starter, with the name filled in" $? "rc=$rc out=[$out] $(ls -A "$work/demo-app" 2>&1)"
 out=$($VU check "$work/demo-app/main.vu" 2>&1); check "new web: its main.vu checks" $? "$out"
@@ -69,6 +69,16 @@ for bad in "Demo" "1app" "a/b" "../x" "a b" ""; do
   out=$(cd "$work" && $VU new web "$bad" 2>&1); rc=$?; [ $rc -eq 2 ] || break
 done
 [ $rc -eq 2 ] && [ ! -e "$work/x" ]; check "new web: names that aren't lowercase letters, digits and '-' are refused" $? "bad=[$bad] rc=$rc out=[$out]"
+
+# vu new api NAME
+out=$(cd "$work" && $VU new api notes-api 2>&1); rc=$?
+[ $rc -eq 0 ] && for f in main.vu Dockerfile .dockerignore .gitignore railway.json README.md; do [ -s "$work/notes-api/$f" ] || exit 1; done \
+  && [ ! -e "$work/notes-api/public" ] && ! grep -q '@@\|public' "$work/notes-api/Dockerfile" && grep -q 'vu new api notes-api' "$work/notes-api/README.md" \
+  && python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["deploy"]["healthcheckPath"] == "/health"' "$work/notes-api/railway.json"
+check "new api: writes the starter, with the name filled in" $? "rc=$rc out=[$out] $(ls -A "$work/notes-api" 2>&1)"
+out=$($VU check "$work/notes-api/main.vu" 2>&1); check "new api: its main.vu checks" $? "$out"
+out=$(cd "$work" && $VU new cli x 2>&1); rc=$?
+[ $rc -eq 2 ] && [ ! -e "$work/x" ]; check "new: a kind other than web or api is refused (exit 2)" $? "rc=$rc out=[$out]"
 
 # --static: no dynamic loader needed
 : > "$work/cc.log"; $VU build "$work/ok.vu" --static -o "$work/st" >/dev/null 2>&1

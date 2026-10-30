@@ -743,11 +743,13 @@ let h = share(own fn(req: Request) => answer(req, base))   # closures too: h.val
 - `share(v)` moves `v` into a `Shared[T]`, which any number of tasks, on any thread, can read at
   the same time. `s.value` is the value; nothing can change it (assignments, `push`, `&`, `var`
   bindings and moves out of it are compile errors), so readers never see it change and need no
-  locks. It's freed when its last handle goes.
+  locks. It's freed when its last handle goes. A channel inside is still a channel: tasks send and
+  receive through it (a pool of connections in a `Chan[pg.Db]` inside a `Shared` value works).
 - Passing a `Shared` value to an `own` parameter (or `spawn`) gives the callee another handle, as
   for channels; `s.share()` makes one to store. `let t = s` moves the handle.
 - A `Shared` value can't hold a connection, a listener or a C handle (using one from several tasks
-  at once isn't safe), nor a closure that borrows local variables. Channels inside are fine.
+  at once isn't safe), nor a closure that borrows local variables. Channels inside are fine,
+  whatever they carry: a task takes a value out of a channel to own, so a `Chan[Conn]` is too.
 - `.value` is read through a variable or field holding the handle, so the value stays alive while
   it's read: `make().value` is refused; write `let s = make()` first.
 
@@ -1026,7 +1028,8 @@ vu test file.vu...          # run each fn test_... in its own process; report wh
 vu get [file.vu]            # fetch the packages in vu.pkg, write vu.lock (see Packages)
 vu search WORDS / vu add NAME  # the package registry (see Packages); vu publish NAME VERSION
 vu version                  # the release: vu 0.2.0
-vu new web NAME             # a folder NAME with a web app: main.vu, public/, Dockerfile, fly.toml
+vu new web NAME             # a folder NAME with a web app: main.vu, public/, Dockerfile, fly.toml, railway.json
+vu new api NAME             # a JSON API on PostgreSQL with accounts and sessions: main.vu, Dockerfile, railway.json
 vu lsp                      # a language server for editors (diagnostics, formatting, hover, definition, completion)
 ```
 
@@ -1549,9 +1552,44 @@ let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows
   are bytes it sends before the handshake (they'd be read as if they came over TLS). `tests/run_pg_tls.py`
   runs a fake server with a test CA, a certificate for another host, a self-signed one, and these.
   `net.start_tls(&conn, host, ca:, timeout:)` is what it uses: TLS on a connection already open.
-- One query at a time per connection: for several tasks, keep connections in a `Chan[pg.Db]` and
-  take one for each query. Not yet: `COPY`, `LISTEN`/`NOTIFY`, MD5 passwords.
+- `pg.from_url(os.env("DATABASE_URL"))?` reads the URL hosting platforms give
+  (`postgresql://user:password@host:port/db?sslmode=require`): %-escapes are decoded, the port
+  defaults to 5432 and the database to the user, an IPv6 host goes in brackets, and `sslmode`
+  `require`, `verify-ca` or `verify-full` turns on TLS (always checking the certificate).
+- One query at a time per connection. For several tasks, `pg.pool(net, cfg, n)?` opens n connections
+  in a `Chan[pg.Db]`: take one with `recv()`, and return it with `pg.give_back(net, pool, db, cfg)`,
+  which replaces a connection that broke (a database restart) with a new one. Not yet: `COPY`,
+  `LISTEN`/`NOTIFY`, MD5 passwords.
   `tests/run_pg.sh` runs it against a real PostgreSQL.
+
+**`auth`**: passwords, sessions and CSRF tokens, for apps with accounts.
+
+```
+import auth
+let stored = auth.hash_password(password)           # "pbkdf2_sha256$600000$SALT$HASH" (Django's format)
+if auth.check_password(attempt, stored): ...        # compares in constant time; false for a malformed hash
+auth.setup(net, &db)?                                # the sessions table (PostgreSQL)
+let token = auth.login(net, &db, os, user_id, 30)?   # a session for 30 days
+auth.set_session(&resp, token, 30)                   # its cookie: HttpOnly, Secure, SameSite=Lax
+let who = auth.current_user(net, &db, os, req)?      # the user id (a Str?), from the cookie or a Bearer token
+auth.logout(net, &db, req)?                          # and auth.clear_session(&resp); auth.logout_all(net, &db, id)
+```
+
+- Hashes are PBKDF2-HMAC-SHA256 with 600,000 iterations (OWASP's number) and a random 22-character
+  salt, written as Django writes them, so users can move between a Django app and a Vu app with their
+  passwords. `auth.needs_rehash(stored)` says when to hash again at sign-in (fewer iterations than now).
+  `check_password` refuses hashes asking for more than 10 million iterations. A hash takes about half
+  a second; in a program with tasks it lets the other tasks on its thread run every 10 ms or so.
+- Session tokens are 32 random bytes in URL-safe base64 (`auth.new_token()`, also for reset links and
+  API keys); the table keeps only their SHA-256 (`auth.token_hash`), so a copy of it can't sign
+  anyone in. `auth.session_token(req)` reads `Authorization: Bearer TOKEN`, else the `session` cookie.
+  `auth.prune(net, &db, os)?` deletes ended sessions.
+- `auth.csrf_token(secret, session)` is an HMAC of the session token for a hidden form field
+  (`csrf_token`) or an `X-CSRF-Token` header; `auth.csrf_ok(req, secret, session)` checks it.
+  (`web.same_origin` refuses most cross-site requests already.)
+- `vu new api NAME` writes an app that uses all of this: sign-up, sign-in, sign-out and per-user data.
+- `tests/run_auth.sh` checks the hashes against Django (both ways), malformed hashes, tokens, CSRF and
+  cookies, the sessions in a real PostgreSQL, and that app over HTTP, plain and under the sanitizers.
 
 **`sqlite`**: SQLite databases (a file, or `":memory:"`) through the sqlite3 C library, so it takes
 the `Ffi` capability, and libsqlite3 where the program is built.
