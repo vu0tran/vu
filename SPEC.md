@@ -380,7 +380,8 @@ match parse_digit(b):                # inspect it
   `if parse(s)? > 3:`. Each one runs before the rest of its statement, in the order written,
   so it is an error where that would change what runs: after a call to its left in the same
   statement, on the right of `and`/`or`, in an `else` fallback, or in a `while` condition
-  (which runs again on every pass). In an `elif` condition it runs only when the conditions
+  (which runs again on every pass). Calls in the `?`'d call's own arguments move with it, so
+  `share(pg.from_url(os.env("DATABASE_URL"))?)` is fine. In an `elif` condition it runs only when the conditions
   before it were false.
 - When an error passes up with `?` or `fail`, every value the function owns is freed first.
 - `?` and `fail` aren't allowed inside `par` loops, since every iteration must run; use

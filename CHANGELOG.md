@@ -2522,3 +2522,11 @@ bytes. It also checks the refusals: a wrong password (the server's 535), a remot
 STARTTLS, a server that sends a reply between its 220 to STARTTLS and the handshake, bad addresses,
 and a bad Resend key. Attack round: no findings in `mail.vu`. The test harness needed two fixes for
 aiosmtpd (it can't take port 0, and it hides AUTH on a TLS-from-the-start connection unless told).
+
+**`?` after calls in its own arguments.** Writing these modules ran into the same refusal four
+times: `share(pg.from_url(os.env("DATABASE_URL"))?)` was "a `?` inside an expression that already
+did something before it", because of `os.env`. But a `?` is moved ahead of its statement together
+with its arguments, so calls inside them run in the same order either way; only a call to the
+left of the whole `?` would be reordered. The checker now counts only those. Targeted test 731
+checks the order of every call in nested and side-by-side `?`s, and on both failing paths; tests 292
+and 296 (a call to the left, and in an assignment's value) are still refused.
