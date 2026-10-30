@@ -13,7 +13,7 @@ def wait(port):
         except OSError: time.sleep(0.1)
     raise SystemExit("nothing listening on %d" % port)
 
-stripe_reqs, mails = [], []
+stripe_reqs, mails, mail_tries = [], [], []
 class Fake(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_POST(self):
@@ -22,6 +22,10 @@ class Fake(http.server.BaseHTTPRequestHandler):
             stripe_reqs.append((self.headers.get("Authorization"), dict(urllib.parse.parse_qsl(body))))
             data = json.dumps({"id": "cs_test_9", "url": "https://checkout.stripe.com/c/pay/cs_test_9"})
         elif self.path == "/emails":
+            # the mail service is down for the first try: the welcome job must be tried again
+            mail_tries.append(1)
+            if len(mail_tries) == 1:
+                b = b'{"message": "service unavailable"}'; self.send_response(503); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b); return
             mails.append((self.headers.get("Authorization"), json.loads(body)))
             data = json.dumps({"id": "mail_1"})
         else:
@@ -70,9 +74,11 @@ try:
     st, b, _ = call("POST", "/signup", {"email": "ada@example.com", "password": "correct horse battery"})
     expect("signup", (st, b and b.get("plan")), (201, "free"))
     ada, uid = b["token"], b["id"]
-    for _ in range(100):
+    # (the first try fails; the job's next try is 10 seconds later)
+    for _ in range(400):
         if mails: break
         time.sleep(0.05)
+    expect("the welcome email was tried twice", len(mail_tries), 2)
     expect("welcome email", [(a, m["to"], m["subject"], m["from"]) for a, m in mails], [("Bearer re_9", ["ada@example.com"], "Welcome", '"App" <hello@app.example>')])
     expect("welcome email links the app", bool(mails) and "https://app.example" in mails[0][1]["text"] and 'href="https://app.example"' in mails[0][1]["html"], True)
     expect("me", call("GET", "/me", token=ada)[:2], (200, {"id": uid, "email": "ada@example.com", "plan": "free", "avatar": False}))

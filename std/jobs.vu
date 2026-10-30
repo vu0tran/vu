@@ -1,0 +1,87 @@
+# jobs: background jobs kept in PostgreSQL, so they survive restarts and any number of workers (in
+# one process or many) can share them without running one twice.
+#
+#   jobs.setup(net, &db)?
+#   jobs.enqueue(net, &db, os, "welcome_email", to_json(w), 0.0)?      # now; or a delay in seconds
+#
+#   fn run(net: Net, os: Os, j: jobs.Job) -> Str:                     # "" for done, else what went wrong
+#     if j.kind == "welcome_email": ...
+#     return ""
+#   jobs.work(net, os, pool.share(), cfg, own fn(j: jobs.Job) -> Str => run(net, os, j))   # in its own task
+#
+# A worker takes a job with a lease (5 minutes): if it crashes, the job is taken again when the lease
+# ends. A job that fails is tried again later (after 10 s, 20 s, 40 s... up to an hour) until it has
+# been tried max_attempts times (5); then it stays in the table, failed, with its last error.
+# Jobs are taken with FOR UPDATE SKIP LOCKED: workers never wait for each other or take the same one.
+
+import pg
+
+const LEASE = 300.0
+const MAX_ATTEMPTS = 5
+
+type Job:
+  id: Int
+  kind: Str
+  payload: Str
+  attempts: Int      # including this one
+
+fn setup(net: Net, var db: pg.Db) throws pg.Error:
+  pg.exec(net, &db, "create table if not exists vu_jobs (id bigserial primary key, kind text not null, payload text not null, run_at double precision not null, locked_until double precision not null default 0, attempts int not null default 0, max_attempts int not null, failed boolean not null default false, last_error text not null default '')", [])?
+  pg.exec(net, &db, "create index if not exists vu_jobs_due on vu_jobs (run_at, id) where not failed", [])?
+
+# Adds a job, to run after `delay` seconds, and gives its id.
+fn enqueue(net: Net, var db: pg.Db, os: Os, kind: Str, payload: Str, delay: Float) -> Int throws pg.Error:
+  let rows = pg.query(net, &db, "insert into vu_jobs (kind, payload, run_at, max_attempts) values ($1, $2, $3, $4) returning id", [kind, payload, "{os.time() + delay}", "{MAX_ATTEMPTS}"])?
+  return pg.get_int(rows, 0, "id") else 0
+
+# Takes the next due job of one of these kinds (any kind if the list is empty), or nil, leasing it
+# for `lease` seconds.
+fn take(net: Net, var db: pg.Db, os: Os, kinds: [Str], lease: Float) -> Job? throws pg.Error:
+  let now = os.time()
+  let rows = pg.query(net, &db, "update vu_jobs set locked_until = $2, attempts = attempts + 1 where id = (select id from vu_jobs where not failed and run_at <= $1 and locked_until <= $1 and ($3 = '' or kind = any(string_to_array($3, ','))) order by run_at, id for update skip locked limit 1) returning id, kind, payload, attempts", ["{now}", "{now + lease}", ",".join(kinds)])?
+  if rows.rows.len == 0: return nil
+  let id = pg.get_int(rows, 0, "id") else 0
+  let attempts = pg.get_int(rows, 0, "attempts") else 1
+  return Job(id, pg.text(rows, 0, "kind") else "", pg.text(rows, 0, "payload") else "", attempts)
+
+# A job finished: it's deleted.
+fn done(net: Net, var db: pg.Db, j: Job) throws pg.Error:
+  pg.exec(net, &db, "delete from vu_jobs where id = $1", ["{j.id}"])?
+
+# A job failed: tried again after a wait that doubles each time (10 s, 20 s, ... at most an hour), or
+# marked failed after its last attempt.
+fn retry(net: Net, var db: pg.Db, os: Os, j: Job, error: Str) throws pg.Error:
+  var wait = 10.0
+  for i in 1..j.attempts:
+    if wait < 3600.0: wait = wait * 2.0
+  if wait > 3600.0: wait = 3600.0
+  pg.exec(net, &db, "update vu_jobs set failed = (attempts >= max_attempts), run_at = $2, locked_until = 0, last_error = $3 where id = $1", ["{j.id}", "{os.time() + wait}", error])?
+
+# How many jobs are waiting (not failed) and how many failed: [waiting, failed].
+fn counts(net: Net, var db: pg.Db) -> [Int] throws pg.Error:
+  let rows = pg.query(net, &db, "select count(*) filter (where not failed) as waiting, count(*) filter (where failed) as failed from vu_jobs", [])?
+  return [pg.get_int(rows, 0, "waiting") else 0, pg.get_int(rows, 0, "failed") else 0]
+
+# Failed jobs are tried again from the start (after fixing what made them fail). Gives how many.
+fn retry_failed(net: Net, var db: pg.Db, os: Os) -> Int throws pg.Error:
+  return pg.exec(net, &db, "update vu_jobs set failed = false, attempts = 0, run_at = $1, locked_until = 0 where failed", ["{os.time()}"])?
+
+# Runs jobs until the channel `stop` is closed: takes one with a connection from the pool, gives the
+# connection back while the handler runs (it may need one itself), then records what happened. Waits
+# `idle` seconds when there's nothing to do. Run several in tasks for several at once.
+fn work(net: Net, os: Os, own pool: Chan[pg.Db], own cfg: pg.Config, own kinds: [Str], idle: Float, own stop: Chan[Int], own handler: fn(Job) -> Str):
+  while not stop.closed():
+    var db = pool.recv() else return
+    var next: Job? = nil
+    match take(net, &db, os, kinds, LEASE):
+      ok(j): next = j
+      err(e): eprint("jobs: " + pg.describe(e))
+    pg.give_back(net, pool, db, cfg)
+    if j = next:
+      let problem = handler(j)
+      var db2 = pool.recv() else return
+      if problem == "": done(net, &db2, j) else eprint("jobs: couldn't mark job {j.id} done")
+      else: retry(net, &db2, os, j, problem) else eprint("jobs: couldn't record job {j.id}'s failure")
+      pg.give_back(net, pool, db2, cfg)
+    else:
+      stop.recv(timeout: idle) else continue

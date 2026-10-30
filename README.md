@@ -335,7 +335,7 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
 - `pg`: a PostgreSQL client (SCRAM-SHA-256, TLS, parameters only, `DATABASE_URL`s and a pool of
   connections), and `sqlite` (through libsqlite3);
 - `auth`: password hashes compatible with Django's, sessions stored as hashes of their tokens, and
-  CSRF tokens; `stripe`: Checkout, API calls and webhook signatures; `s3`: objects and presigned
+  CSRF tokens; `jobs`: background jobs in PostgreSQL, retried, shared by any number of workers; `stripe`: Checkout, API calls and webhook signatures; `s3`: objects and presigned
   URLs on S3, R2 and the others that speak its API; `mail`: email over SMTP or Resend;
 - `re`: regular expressions with Python's syntax, in time linear in the text, and as fast as
   Python's on most patterns (faster on many: CHANGELOG.md, round 10);

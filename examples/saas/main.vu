@@ -18,6 +18,7 @@
 # (no email is sent without them), S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_KEY_ID, S3_SECRET.
 import auth
 import http
+import jobs
 import json
 import mail
 import pg
@@ -128,19 +129,25 @@ fn signup(net: Net, os: Os, env: Shared[Env], req: http.Request) -> http.Respons
         resp = signed_in(net, os, &db, id, email, "free", 201)
         created = true
     err(e): resp = db_error(e)
+  # the email is a job: the response doesn't wait for the mail service, and if it's down the job is
+  # tried again later (a restart doesn't lose it either)
+  if created:
+    match jobs.enqueue(net, &db, os, "welcome", email, 0.0):
+      ok(id): created = true
+      err(e): eprint("couldn't queue the welcome email to " + email + ": " + pg.describe(e))
   pg.give_back(net, env.value.pool, db, env.value.cfg)
-  # the email goes in a task of its own: the response doesn't wait for the mail service
-  if created: spawn welcome(net, os, env, email)
   return resp
 
-fn welcome(net: Net, os: Os, own env: Shared[Env], own email: Str):
+# The welcome job: "" when it's sent, else why not (the job is tried again).
+fn welcome(net: Net, env: Shared[Env], j: jobs.Job) -> Str:
   let set = env.value.set
-  if set.resend_key == "" or set.mail_from == "": return
+  let email = j.payload
+  if set.resend_key == "" or set.mail_from == "": return ""
   var m = mail.message(set.mail_from, email, "Welcome", "Thanks for signing up.\n\nYou can upgrade any time from your account page: " + set.app_url + "\n")
   m.html = web.render("<p>Thanks for signing up.</p><p>You can upgrade any time from <a href=\"{{url}}\">your account page</a>.</p>", [web.v("url", set.app_url)]).text
   match mail.send_resend_to(net, set.resend_key, m, set.resend_base, ""):
-    ok(id): print("welcome email to " + email + ": " + id)
-    err(e): eprint("welcome email to " + email + " failed: " + e)
+    ok(id): return ""
+    err(e): return e
 
 fn login(net: Net, os: Os, env: Shared[Env], req: http.Request) -> http.Response:
   let body = from_json(req.body, Creds) else return error(400, "expected {{\"email\": ..., \"password\": ...}}")
@@ -255,6 +262,7 @@ fn migrate(net: Net, var db: pg.Db) throws pg.Error:
   pg.exec(net, &db, "create table if not exists users (id bigserial primary key, email text not null unique, password_hash text not null, plan text not null default 'free', stripe_customer text, avatar text, created timestamptz not null default now())", [])?
   pg.exec(net, &db, "create index if not exists users_customer on users (stripe_customer)", [])?
   auth.setup(net, &db)?
+  jobs.setup(net, &db)?
 
 fn main(net: Net, os: Os) throws:
   let port = int(os.env("PORT")) else 8080
@@ -271,6 +279,11 @@ fn main(net: Net, os: Os) throws:
     ok: pool.send(db)
     err(e): fail "setting up the tables: " + pg.describe(e)
   let env = share(Env(pool, cfg, set))
+  # two workers for background jobs, sharing the connections
+  for i in 0..2:
+    let e = env.share()
+    let wcfg = pg.from_url(url)?
+    spawn jobs.work(net, os, env.value.pool.share(), wcfg, ["welcome"], 0.5, chan(1), own fn(j: jobs.Job) -> Str => welcome(net, e, j))
   var app = web.app()
   web.use(&app, web.logger(os))
   web.use(&app, web.same_origin)

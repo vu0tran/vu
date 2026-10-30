@@ -1,0 +1,86 @@
+# For run_jobs.sh: std/jobs against a real PostgreSQL (arg 1: the port). 6 workers on a pool of 4
+# connections run 200 jobs; every tenth fails once and is tried again; each succeeds exactly once.
+# Then delays, kinds, leases that end, and a job that fails until it's marked failed.
+import jobs
+import pg
+
+fn handle(own out: Chan[Str], j: jobs.Job) -> Str:
+  let n = int(j.payload) else -1
+  if n % 10 == 0 and j.attempts == 1: return "first try of {n} fails"
+  out.send(j.payload + "")
+  return ""
+
+fn wait_for(net: Net, os: Os, var db: pg.Db, waiting: Int) -> Bool throws:
+  for i in 0..600:
+    let c = jobs.counts(net, &db)?
+    if c[0] == waiting: return true
+    os.sleep(0.05)
+  return false
+
+fn conf() -> pg.Config:
+  return pg.config("127.0.0.1", arg(1, 5432), "app", "s3cret pass", "appdb")
+
+fn main(net: Net, os: Os) throws:
+  let cfg = conf()
+  var db = pg.connect(net, cfg)?
+  pg.exec(net, &db, "drop table if exists vu_jobs", [])?
+  jobs.setup(net, &db)?
+  jobs.setup(net, &db)?
+  for i in 0..200: jobs.enqueue(net, &db, os, "count", "{i}", 0.0)?
+  let pool = pg.pool(net, cfg, 4)?
+  let out: Chan[Str] = chan(1000)
+  let stop: Chan[Int] = chan(1)
+  for w in 0..6:
+    let o = out.share()
+    spawn jobs.work(net, os, pool.share(), conf(), ["count"], 0.02, stop.share(), own fn(j: jobs.Job) -> Str => handle(o.share(), j))
+  let first = wait_for(net, os, &db, 20)?
+  let errs = pg.query(net, &db, "select count(*) as n from vu_jobs where attempts = 1 and last_error like 'first try of %' and run_at > extract(epoch from now()) + 5", [])?
+  print("after the first pass: {first}, {pg.text(errs, 0, "n") else "?"} waiting to be tried again")
+  pg.exec(net, &db, "update vu_jobs set run_at = 0", [])?
+  let second = wait_for(net, os, &db, 0)?
+  stop.close()
+  var seen: {Str: Int} = {}
+  var dup = 0
+  while true:
+    let s = out.recv(timeout: 0.5) else break
+    if s in seen: dup += 1
+    seen[s] = 1
+  print("all done: {second}, {seen.len} distinct, {dup} twice")
+  # a delay, and kinds
+  let later = jobs.enqueue(net, &db, os, "mail", "x", 3600.0)?
+  let a = jobs.take(net, &db, os, [], 60.0)?
+  print("delayed: {a == nil}")
+  pg.exec(net, &db, "delete from vu_jobs", [])?
+  jobs.enqueue(net, &db, os, "mail", "m", 0.0)?
+  let b = jobs.take(net, &db, os, ["sms", "push"], 60.0)?
+  let c = jobs.take(net, &db, os, ["sms", "mail"], 0.3)?
+  var ck = "none"
+  if j = c: ck = j.kind + " attempt {j.attempts}"
+  print("kinds: {b == nil} {ck}")
+  # a lease that ends: the job is taken again
+  let d = jobs.take(net, &db, os, [], 60.0)?
+  os.sleep(0.4)
+  let e = jobs.take(net, &db, os, [], 60.0)?
+  var ek = "none"
+  if j = e: ek = j.kind + " attempt {j.attempts}"
+  print("lease: {d == nil} then {ek}")
+  # failing every time: failed after 5 attempts, kept with its error
+  if j = e:
+    var job = jobs.Job(j.id, j.kind + "", j.payload + "", j.attempts)
+    jobs.retry(net, &db, os, job, "boom 2")?
+    for k in 0..3:
+      pg.exec(net, &db, "update vu_jobs set run_at = 0", [])?
+      let again = jobs.take(net, &db, os, [], 60.0)?
+      if t = again:
+        job = jobs.Job(t.id, t.kind + "", t.payload + "", t.attempts)
+        jobs.retry(net, &db, os, job, "boom {t.attempts}")?
+  pg.exec(net, &db, "update vu_jobs set run_at = 0", [])?
+  let gone = jobs.take(net, &db, os, [], 60.0)?
+  let cs = jobs.counts(net, &db)?
+  let row = pg.query(net, &db, "select attempts, last_error from vu_jobs where failed", [])?
+  print("failed: {gone == nil} {cs[0]} waiting {cs[1]} failed, attempts {pg.text(row, 0, "attempts") else "?"}, {pg.text(row, 0, "last_error") else "?"}")
+  let n = jobs.retry_failed(net, &db, os)?
+  let back = jobs.take(net, &db, os, [], 60.0)?
+  var bk = "none"
+  if j = back: bk = "attempt {j.attempts}"
+  print("retry_failed: {n}, then {bk}")

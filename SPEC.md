@@ -1600,6 +1600,27 @@ auth.logout(net, &db, req)?                          # and auth.clear_session(&r
 - `tests/run_auth.sh` checks the hashes against Django (both ways), malformed hashes, tokens, CSRF and
   cookies, the sessions in a real PostgreSQL, and that app over HTTP, plain and under the sanitizers.
 
+**`jobs`**: background jobs kept in PostgreSQL, shared by any number of workers.
+
+```
+import jobs
+jobs.setup(net, &db)?
+jobs.enqueue(net, &db, os, "welcome", email, 0.0)?      # a kind, a payload (JSON, say), a delay in seconds
+spawn jobs.work(net, os, pool.share(), cfg, ["welcome"], 0.5, stop.share(), own fn(j: jobs.Job) -> Str => send_welcome(net, j))
+```
+
+- A handler returns `""` when the job is done (it's deleted) or what went wrong: the job is tried
+  again after 10 s, 20 s, 40 s... (at most an hour) until it has had 5 tries, then kept with
+  `failed` set and its last error. `jobs.counts` gives `[waiting, failed]`; `jobs.retry_failed`
+  starts the failed ones again.
+- Workers take jobs with `FOR UPDATE SKIP LOCKED`, so they never wait for each other or take the
+  same job, and with a 5-minute lease: a job whose worker crashed is taken again when the lease
+  ends. So a job runs at least once, and more than once only after a crash. `jobs.take`,
+  `jobs.done` and `jobs.retry` are the steps, for a loop of your own. `work` runs until `stop` is
+  closed.
+- `tests/run_jobs.sh`: 6 workers on 4 connections run 200 jobs, with a tenth failing once, each
+  succeeding exactly once; delays, kinds, a lease that ends, and a job failing until it's failed.
+
 **`stripe`**: payments with Stripe: Checkout sessions, any API call, and webhooks with their
 signatures checked.
 

@@ -2553,3 +2553,12 @@ so tasks on different threads take turns. Test 732 checks addresses behind 0 to 
 429s, Retry-After, other clients and other paths. `vu new api` and `examples/saas` limit sign-ins
 and sign-ups to 20 a minute per client (`PROXIES`, which their Dockerfiles set to 1), and
 `run_auth.sh` checks that the 21st gets 429 while other routes still answer.
+
+**`std/jobs`.** Background jobs in PostgreSQL: enqueue with a delay, workers that take jobs with
+`FOR UPDATE SKIP LOCKED` and a lease, retries with doubling waits, and failed jobs kept with their
+error. `run_jobs.sh` runs 200 jobs through 6 workers sharing 4 connections, every tenth failing on
+its first try: all 200 succeed exactly once, and the 20 failures wait to be tried again. It also
+checks a delayed job that isn't taken early, kinds, a lease that ends (the job is taken again, on
+its second attempt) and a job that fails 5 times (kept, failed, with its last error, until
+`retry_failed`). It passed on its first run. `examples/saas` now sends its welcome email as a job:
+`run_saas.sh`'s fake Resend refuses the first try, and the email arrives on the second, 10 s later.
