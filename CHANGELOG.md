@@ -2435,3 +2435,13 @@ PostgreSQL and wrk), Vu answered 7,093 requests/s in 5 MB and Node 3,689 in 138 
 Building it found one gap: `net.listen` took IPv4 only, and Railway's private network reaches a
 service over IPv6. A listener now takes both on one socket where the system has IPv6, and IPv4
 alone where it doesn't. The http, net, web and WebSocket suites pass.
+
+### Kept binaries and a new CPU
+
+This machine's VM moved to a different CPU, and `vu run --release` began failing with "Illegal
+instruction". Optimized builds use `-march=native`, but the keys of what Vu keeps (the `vu run`
+binary cache, `VU_CACHE` and the split build's objects) didn't include the CPU, so a binary made for
+the old CPU's AVX-512 instructions was reused on the new one. Those keys now include the CPU's model
+and feature flags when a build uses `-march=native` (`/proc/cpuinfo` on Linux, `sysctl` on macOS).
+The installed compiler had the same problem, being an optimized build itself; `compiler/build.sh`
+recovers from that only by bootstrapping again from the seed (move `compiler/vuc` away first).
