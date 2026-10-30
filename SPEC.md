@@ -1591,6 +1591,29 @@ auth.logout(net, &db, req)?                          # and auth.clear_session(&r
 - `tests/run_auth.sh` checks the hashes against Django (both ways), malformed hashes, tokens, CSRF and
   cookies, the sessions in a real PostgreSQL, and that app over HTTP, plain and under the sanitizers.
 
+**`stripe`**: payments with Stripe: Checkout sessions, any API call, and webhooks with their
+signatures checked.
+
+```
+import stripe
+var s = stripe.new(os.env("STRIPE_SECRET_KEY"))
+let c = stripe.Checkout("price_123", 1, "payment", "https://example.com/thanks", "https://example.com/cart", user_id, email)
+let session = stripe.checkout(net, &s, c)?          # session.id, session.url: redirect the buyer there
+let v = stripe.call(net, &s, "GET", "/v1/customers", [stripe.Field("email", email)], "")?   # a json.Value
+let e = stripe.verify_webhook(os.env("STRIPE_WEBHOOK_SECRET"), req, os.time())?   # e.kind, e.object (JSON)
+```
+
+- `call(net, &s, method, path, fields, idempotency_key)` sends form fields (nested names as Stripe
+  writes them: `line_items[0][price]`) with the secret key, to a `/v1/` path only, keeping the
+  connection open between calls. A refusal fails with Stripe's message and code (`stripe: Your card
+  was declined. (card_declined)`).
+- `verify_webhook` checks the `Stripe-Signature` header as Stripe's libraries do (HMAC-SHA256 of
+  `TIMESTAMP.BODY`, any of several `v1` signatures, in constant time), and refuses a timestamp more
+  than 5 minutes old, or (stricter than Stripe's libraries) more than 5 minutes ahead. Answer 400
+  when it fails; Stripe tries again. `stripe.sign_payload(secret, body, t)` makes a header for tests.
+- `tests/run_stripe.sh` checks the calls against a fake Stripe server and 86 webhook cases against
+  what Stripe's Python library decides.
+
 **`sqlite`**: SQLite databases (a file, or `":memory:"`) through the sqlite3 C library, so it takes
 the `Ffi` capability, and libsqlite3 where the program is built.
 

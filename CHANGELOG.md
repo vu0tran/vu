@@ -2491,3 +2491,13 @@ Attack rounds: (1) malformed hashes, iteration limits, a 1 MB password (2,000 it
 the key is hashed once), tokens' alphabet and uniqueness over 2,000, CSRF with the wrong token,
 session, secret or none: no findings. (2) `pg.from_url` on 13 URLs: found the `%` read past the end.
 (3) the API template over HTTP: no findings beyond my test harness (it expected JSON from a 403).
+
+**`std/stripe`.** Checkout sessions, any API call (form fields with Stripe's nested names, an
+idempotency key, Stripe's error message on a refusal), and webhook verification. `run_stripe.sh`
+checks the calls against a fake Stripe server (the exact fields and headers that arrive, that a
+call to a URL other than a `/v1/` path never leaves, and that one without a key doesn't either) and
+86 webhook cases per run against what Stripe's Python library (16.1) decides: the right signature,
+one of two `v1`s, another secret, a changed body or timestamp, `v0` only, no timestamp, upper-case
+hex, a digit short, timestamps from 5,000 s ahead to 1,000 s old, and bodies that aren't events.
+One deliberate difference: Stripe's libraries accept a timestamp any distance in the future, and
+`verify_webhook` refuses one more than 5 minutes ahead. Attack round: no findings.

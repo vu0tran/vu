@@ -1,0 +1,166 @@
+# stripe: payments through Stripe's API: Checkout sessions, any other API call, and webhooks whose
+# signatures are checked.
+#
+#   var s = stripe.new(os.env("STRIPE_SECRET_KEY"))
+#   let session = stripe.checkout(net, &s, stripe.Checkout("price_123", 1, "payment",
+#       "https://example.com/thanks", "https://example.com/cart", "user-42", ""))?
+#   # redirect the browser to session.url
+#
+#   fn hook(req: http.Request, c: web.Ctx) -> http.Response:     # POST /stripe/webhook
+#     let e = stripe.verify_webhook(SECRET, req, os.time()) else return http.text(400, "bad signature")
+#     if e.kind == "checkout.session.completed": ...             # e.object is the session, as JSON
+#
+# Calls send the secret key over TLS to api.stripe.com only (the base URL can be changed for tests),
+# and give Stripe's own error message when it refuses one. Webhooks are checked as Stripe's libraries
+# check them: HMAC-SHA256 of "TIMESTAMP.BODY" with the endpoint's secret (whsec_...), compared in
+# constant time against every v1 signature in the Stripe-Signature header, and refused when the
+# timestamp is more than 5 minutes from now (so a captured request can't be replayed later).
+
+import http
+import json
+
+const TOLERANCE = 300
+
+type Stripe:
+  key: Str
+  base: Str          # "https://api.stripe.com"
+  client: http.Client
+  timeout: Float
+
+# A form field of a call. Nested names are written as Stripe documents them: "line_items[0][price]".
+type Field:
+  name, value: Str
+
+type Checkout:
+  price: Str         # a Price's id (price_...)
+  quantity: Int
+  mode: Str          # "payment", "subscription" or "setup"
+  success_url: Str   # where Stripe sends the browser after paying; {CHECKOUT_SESSION_ID} is filled in
+  cancel_url: Str
+  reference: Str     # your id for the buyer (client_reference_id), "" for none
+  email: Str         # the buyer's email to fill in, "" for none
+
+type Session:
+  id: Str
+  url: Str
+
+type Event:
+  id: Str
+  kind: Str          # the event's type: "checkout.session.completed", "invoice.paid", ...
+  created: Int
+  livemode: Bool
+  object: Str        # data.object, as JSON (read it with from_json or json.parse)
+
+fn new(key: Str) -> Stripe:
+  return Stripe(key + "", "https://api.stripe.com", http.client(), 30.0)
+
+# Percent-encodes for a form body (application/x-www-form-urlencoded).
+fn form_encode(s: Str) -> Str:
+  let hex = "0123456789ABCDEF"
+  var out: [Byte] = []
+  for i in 0..s.len:
+    let b = s[i]
+    if (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '-' or b == '_' or b == '.' or b == '~':
+      out.push(b)
+    else:
+      out.push('%')
+      out.push(hex[int(b) >> 4])
+      out.push(hex[int(b) & 15])
+  return str(out)
+
+fn form(fields: [Field]) -> Str:
+  var parts: [Str] = []
+  for f in fields: parts.push(form_encode(f.name) + "=" + form_encode(f.value))
+  return "&".join(parts)
+
+# Calls the API: method and path ("/v1/customers"), form fields, and an idempotency key ("" for none:
+# give one for a POST that mustn't happen twice if it's retried). Gives the answer as JSON, or fails
+# with Stripe's message.
+fn call(net: Net, var s: Stripe, method: Str, path: Str, fields: [Field], idempotency: Str) -> json.Value throws:
+  if s.key == "": fail "stripe: no secret key (set STRIPE_SECRET_KEY)"
+  if not path.startswith("/v1/") or "?" in path or "#" in path or ".." in path: fail "stripe: '{path}' isn't an API path (/v1/...)"
+  var req = http.req(method, s.base + path)
+  req.timeout = s.timeout
+  req.headers.push(http.Header("Authorization", "Bearer " + s.key))
+  req.headers.push(http.Header("Stripe-Version", "2024-06-20"))
+  if idempotency != "": req.headers.push(http.Header("Idempotency-Key", idempotency))
+  if fields.len > 0:
+    if method == "GET" or method == "DELETE": req.url += "?" + form(fields)
+    else:
+      req.headers.push(http.Header("Content-Type", "application/x-www-form-urlencoded"))
+      req.body = form(fields)
+  let resp = s.client.fetch(net, req)?
+  let v = json.parse(resp.body) else fail "stripe: HTTP {resp.status} with a body that isn't JSON"
+  if resp.status >= 200 and resp.status < 300: return v
+  var msg = "HTTP {resp.status}"
+  if e = json.at(v, "error"):
+    if m = json.str_at(e, "message"): msg = m + ""
+    if c = json.str_at(e, "code"): msg += " (" + c + ")"
+  fail "stripe: " + msg
+
+# Starts a Checkout session for one price, and gives its id and the URL to send the buyer to.
+fn checkout(net: Net, var s: Stripe, c: Checkout) -> Session throws:
+  if c.quantity < 1: fail "stripe: a quantity of at least 1"
+  if c.mode != "payment" and c.mode != "subscription" and c.mode != "setup": fail "stripe: mode is payment, subscription or setup, not '{c.mode}'"
+  var fields = [Field("mode", c.mode + ""), Field("line_items[0][price]", c.price + ""), Field("line_items[0][quantity]", "{c.quantity}"),
+    Field("success_url", c.success_url + ""), Field("cancel_url", c.cancel_url + "")]
+  if c.reference != "": fields.push(Field("client_reference_id", c.reference + ""))
+  if c.email != "": fields.push(Field("customer_email", c.email + ""))
+  let v = call(net, &s, "POST", "/v1/checkout/sessions", fields, "")?
+  let id = json.str_at(v, "id") else fail "stripe: the session has no id"
+  let url = json.str_at(v, "url") else fail "stripe: the session has no url"
+  return Session(id + "", url + "")
+
+# Reads a webhook request: checks its Stripe-Signature against the endpoint's secret (whsec_...) and
+# the time (now: os.time()), then gives the event. Fails on a missing or wrong signature, a stale
+# timestamp, or a body that isn't an event. Answer 400 for those: Stripe tries again later.
+fn verify_webhook(secret: Str, req: http.Request, now: Float) -> Event throws:
+  var header = ""
+  for h in req.headers:
+    if h.name == "stripe-signature": header = h.value + ""
+  if header == "": fail "stripe: no Stripe-Signature header"
+  return verify_payload(secret, req.body, header, now)?
+
+fn verify_payload(secret: Str, payload: Str, header: Str, now: Float) -> Event throws:
+  if secret == "": fail "stripe: no webhook secret"
+  var t = -1
+  var sigs: [Str] = []
+  for part in header.split(","):
+    let eq = part.find("=")
+    if eq < 0: continue
+    let k = part[0..eq].strip()
+    let v = part[eq + 1..part.len].strip()
+    if k == "t":
+      if v.len == 0 or v.len > 12: fail "stripe: a bad timestamp in Stripe-Signature"
+      for i in 0..v.len:
+        if v[i] < '0' or v[i] > '9': fail "stripe: a bad timestamp in Stripe-Signature"
+      t = int(v) else fail "stripe: a bad timestamp in Stripe-Signature"
+    elif k == "v1": sigs.push(v + "")
+  if t < 0: fail "stripe: no timestamp in Stripe-Signature"
+  if sigs.len == 0: fail "stripe: no v1 signature in Stripe-Signature"
+  let want = hmac_sha256(secret, "{t}." + payload).hex()
+  var good = false
+  for sg in sigs:
+    if same(sg, want): good = true
+  if not good: fail "stripe: the signature doesn't match"
+  let age = now - float(t)
+  if age > float(TOLERANCE) or age < -float(TOLERANCE): fail "stripe: the timestamp is more than 5 minutes from now"
+  let v = json.parse(payload) else fail "stripe: the body isn't JSON"
+  let id = json.str_at(v, "id") else fail "stripe: the event has no id"
+  let kind = json.str_at(v, "type") else fail "stripe: the event has no type"
+  let created = json.int_at(v, "created") else 0
+  let live = json.bool_at(v, "livemode") else false
+  var object = "null"
+  if d = json.at(v, "data"):
+    if o = json.at(d, "object"): object = json.stringify(o)
+  return Event(id + "", kind + "", created, live, object)
+
+# The Stripe-Signature header for a payload, as Stripe makes it: for tests of your webhook handler.
+fn sign_payload(secret: Str, payload: Str, t: Int) -> Str:
+  return "t={t},v1=" + hmac_sha256(secret, "{t}." + payload).hex()
+
+fn same(a: Str, b: Str) -> Bool:
+  if a.len != b.len: return false
+  var diff = 0
+  for i in 0..a.len: diff = diff | (int(a[i]) ^ int(b[i]))
+  return diff == 0
