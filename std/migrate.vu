@@ -1,0 +1,64 @@
+# migrate: database migrations from .sql files, applied in order, each once.
+#
+#   migrations/001_users.sql, migrations/002_notes.sql, ...
+#   let applied = migrate.run(net, fs, &db, "migrations")?     # the names it applied now
+#
+# Files are applied in name order, each in a transaction with its record in vu_migrations, so a file
+# either applies completely or not at all. An advisory lock makes instances starting at once (a
+# deploy with several replicas) take turns: the second finds the work done. A file that was applied
+# and has changed since is an error: a migration that ran can't be edited, only followed by another.
+# (So a file mustn't have BEGIN or COMMIT of its own; and statements that can't run in a transaction,
+# like CREATE INDEX CONCURRENTLY, can't be in one.)
+
+import pg
+
+const LOCK = 7354210001
+
+
+# Applies the .sql files in folder that haven't been applied, and gives their names.
+fn run(net: Net, fs: Fs, var db: pg.Db, folder: Str) -> [Str] throws:
+  var names: [Str] = []
+  for n in fs.list(folder)?:
+    if n.endswith(".sql"): names.push(n + "")
+  match apply(net, fs, &db, folder, names):
+    ok(done): return done
+    err(e): fail e
+
+fn apply(net: Net, fs: Fs, var db: pg.Db, folder: Str, names: [Str]) -> [Str] throws:
+  pg.exec(net, &db, "create table if not exists vu_migrations (name text primary key, checksum text not null, applied_at timestamptz not null default now())", []) else fail "migrate: can't make vu_migrations"
+  pg.exec(net, &db, "select pg_advisory_lock($1)", ["{LOCK}"]) else fail "migrate: can't take the migration lock"
+  var done: [Str] = []
+  var problem = ""
+  match each(net, fs, &db, folder, names, &done):
+    ok: problem = ""
+    err(e): problem = e
+  pg.exec(net, &db, "select pg_advisory_unlock($1)", ["{LOCK}"]) else fail "migrate: can't release the migration lock"
+  if problem != "": fail problem
+  return done
+
+fn each(net: Net, fs: Fs, var db: pg.Db, folder: Str, names: [Str], var done: [Str]) throws:
+  let rows = pg.query(net, &db, "select name, checksum from vu_migrations", []) else fail "migrate: can't read vu_migrations"
+  var have: {Str: Str} = {}
+  for i in 0..rows.rows.len:
+    let name = pg.text(rows, i, "name") else ""
+    have[name] = pg.text(rows, i, "checksum") else ""
+  for n in sorted(names):
+    let sql = fs.read(folder + "/" + n)?
+    let sum = sha256(sql).hex()
+    if n in have:
+      if have[n] != sum: fail "migrate: " + n + " was applied and has changed since; add a new migration instead"
+      continue
+    pg.run_sql(net, &db, "begin") else fail "migrate: can't start a transaction"
+    var why = ""
+    match pg.run_sql(net, &db, sql):
+      ok(r): why = ""
+      err(e): why = pg.describe(e)
+    if why == "":
+      match pg.exec(net, &db, "insert into vu_migrations (name, checksum) values ($1, $2)", [n, sum]):
+        ok(k): why = ""
+        err(e): why = "can't record it: " + pg.describe(e)
+    if why != "":
+      pg.run_sql(net, &db, "rollback") else fail "migrate: " + n + ": " + why
+      fail "migrate: " + n + ": " + why
+    pg.run_sql(net, &db, "commit") else fail "migrate: " + n + ": the commit failed"
+    done.push(n + "")

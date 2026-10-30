@@ -29,5 +29,39 @@ for flags in "--release" "--san"; do
   if [ "$got" = "$want" ] && [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/err"; then pass=$((pass+1)); echo "ok    jobs $flags"
   else fail=$((fail+1)); echo "FAIL  jobs $flags (exit $rc)"; diff <(echo "$want") <(echo "$got"); head -5 "$work/err"; fi
 done
+# std/migrate, in stages
+m="$work/mig"
+for flags in "--release" "--san"; do
+  if ! $VU build jobs/migrations_test.vu $flags -o "$work/mig_bin" 2>"$work/err"; then fail=$((fail+1)); echo "FAIL  build migrate $flags"; cat "$work/err"; continue; fi
+  asp "psql -h $work/sock -p $port -U postgres -q -d appdb -c 'drop table if exists vu_migrations, mig_a, mig_b, mig_c, mig_d' >/dev/null 2>&1"
+  rm -rf "$m"; mkdir "$m"
+  echo 'create table mig_a (id int);' > "$m/001_a.sql"
+  printf 'create table mig_b (id int);\ninsert into mig_b values (1), (2);\n' > "$m/002_b.sql"
+  echo 'not sql' > "$m/README"
+  got="$("$work/mig_bin" $port "$m" 2>&1)"
+  got="$got;$("$work/mig_bin" $port "$m" 2>&1)"
+  printf 'create table mig_c (id int);\nselect nonsense;\n' > "$m/003_c.sql"
+  got="$got;$("$work/mig_bin" $port "$m" 2>&1)"
+  echo 'create table mig_c (id int);' > "$m/003_c.sql"
+  got="$got;$("$work/mig_bin" $port "$m" 2>&1)"
+  echo 'create table mig_a (id bigint);' > "$m/001_a.sql"
+  got="$got;$("$work/mig_bin" $port "$m" 2>&1)"
+  echo 'create table mig_a (id int);' > "$m/001_a.sql"
+  # two instances at once: one applies it, the other waits for the lock and finds it done
+  printf 'select pg_sleep(1);\ncreate table mig_d (id int);\n' > "$m/004_d.sql"
+  "$work/mig_bin" $port "$m" > "$work/m1" 2>&1 & p1=$!
+  "$work/mig_bin" $port "$m" > "$work/m2" 2>&1 & p2=$!
+  wait $p1 $p2
+  both="$(sort "$work/m1" "$work/m2" | tr '\n' ' ')"
+  want='applied [001_a.sql, 002_b.sql]
+tables 2;applied []
+tables 2;error: migrate: 003_c.sql: server: column "nonsense" does not exist (SQLSTATE 42703)
+tables 2;applied [003_c.sql]
+tables 3;error: migrate: 001_a.sql was applied and has changed since; add a new migration instead
+tables 3'
+  wantboth='applied [004_d.sql] applied [] tables 4 tables 4 '
+  if [ "$got" = "$want" ] && [ "$both" = "$wantboth" ]; then pass=$((pass+1)); echo "ok    migrate $flags"
+  else fail=$((fail+1)); echo "FAIL  migrate $flags"; diff <(echo "$want") <(echo "$got"); echo "both: [$both]"; fi
+done
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

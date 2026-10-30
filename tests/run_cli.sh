@@ -72,8 +72,8 @@ done
 
 # vu new api NAME
 out=$(cd "$work" && $VU new api notes-api 2>&1); rc=$?
-[ $rc -eq 0 ] && for f in main.vu Dockerfile .dockerignore .gitignore railway.json README.md; do [ -s "$work/notes-api/$f" ] || exit 1; done \
-  && [ ! -e "$work/notes-api/public" ] && ! grep -q '@@\|public' "$work/notes-api/Dockerfile" && grep -q 'vu new api notes-api' "$work/notes-api/README.md" \
+[ $rc -eq 0 ] && for f in main.vu migrations/001_init.sql Dockerfile .dockerignore .gitignore railway.json README.md; do [ -s "$work/notes-api/$f" ] || exit 1; done \
+  && [ ! -e "$work/notes-api/public" ] && ! grep -q '@@\|public' "$work/notes-api/Dockerfile" && grep -q 'COPY migrations' "$work/notes-api/Dockerfile" && grep -q 'vu new api notes-api' "$work/notes-api/README.md" \
   && python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["deploy"]["healthcheckPath"] == "/health"' "$work/notes-api/railway.json"
 check "new api: writes the starter, with the name filled in" $? "rc=$rc out=[$out] $(ls -A "$work/notes-api" 2>&1)"
 out=$($VU check "$work/notes-api/main.vu" 2>&1); check "new api: its main.vu checks" $? "$out"

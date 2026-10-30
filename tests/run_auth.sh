@@ -60,12 +60,12 @@ for flags in "--release" "--san"; do
   else no "sessions in PostgreSQL $flags (exit $rc)"; diff <(echo "$want") <(echo "$got"); head -5 "$work/err"; fi
 done
 # the app `vu new api` makes, against the same database, driven over HTTP
-app=../compiler/rt/new_api/main.vu
+(cd "$work" && $VU new api notes-api >/dev/null) || no "vu new api"
 for flags in "--release" "--san"; do
-  asp "psql -h $work/sock -p $port -U postgres -q -d appdb -c 'drop table if exists notes, users, vu_sessions' >/dev/null"
-  if ! $VU build $app $flags -o "$work/api" 2>"$work/err"; then no "build the api template $flags"; cat "$work/err"; continue; fi
+  asp "psql -h $work/sock -p $port -U postgres -q -d appdb -c 'drop table if exists notes, users, vu_sessions, vu_migrations' >/dev/null 2>&1"
+  if ! $VU build "$work/notes-api/main.vu" $flags -o "$work/api" 2>"$work/err"; then no "build the api template $flags"; cat "$work/err"; continue; fi
   aport=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-  PORT=$aport DATABASE_URL="postgresql://app:s3cret%20pass@127.0.0.1:$port/appdb" "$work/api" > "$work/api.out" 2> "$work/api.err" &
+  (cd "$work/notes-api" && PORT=$aport DATABASE_URL="postgresql://app:s3cret%20pass@127.0.0.1:$port/appdb" exec "$work/api") > "$work/api.out" 2> "$work/api.err" &
   apid=$!
   for i in $(seq 100); do python3 -c "import socket; socket.create_connection(('127.0.0.1', $aport), 0.2)" 2>/dev/null && break; sleep 0.1; done
   # (first, while the sign-in limit has room) a hash with fewer iterations (from an older app, or Django's older defaults) is made again at sign-in

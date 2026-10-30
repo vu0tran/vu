@@ -2562,3 +2562,13 @@ checks a delayed job that isn't taken early, kinds, a lease that ends (the job i
 its second attempt) and a job that fails 5 times (kept, failed, with its last error, until
 `retry_failed`). It passed on its first run. `examples/saas` now sends its welcome email as a job:
 `run_saas.sh`'s fake Resend refuses the first try, and the email arrives on the second, 10 s later.
+
+**`std/migrate` and `pg.run_sql`.** Migrations from `migrations/*.sql`, each applied once in name
+order, in a transaction with its record, under an advisory lock so replicas starting together take
+turns; a file that ran and then changed stops the app. Since `pg.query` takes only SQL written in
+the program, files go through `pg.run_sql` (the simple query protocol: several statements, no
+parameters). `run_jobs.sh` checks two files, a rerun that applies nothing, a failing file whose
+table is rolled back, the fixed file, an edited one (refused), and two instances started at once
+(one applies the new file, the other waits and applies nothing). `vu new api` now writes
+`migrations/001_init.sql`, and `run_auth.sh` tests the project `vu new api` writes rather than the
+template's source.

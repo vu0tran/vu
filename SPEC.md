@@ -1565,6 +1565,8 @@ let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows
   (`postgresql://user:password@host:port/db?sslmode=require`): %-escapes are decoded, the port
   defaults to 5432 and the database to the user, an IPv6 host goes in brackets, and `sslmode`
   `require`, `verify-ca` or `verify-full` turns on TLS (always checking the certificate).
+- `pg.run_sql(net, &db, sql)?` runs SQL that can't be written in the program (a migration file, a
+  console): several statements, no parameters, the last one's rows. Never build it from values.
 - One query at a time per connection. For several tasks, `pg.pool(net, cfg, n)?` opens n connections
   in a `Chan[pg.Db]`: take one with `recv()`, and return it with `pg.give_back(net, pool, db, cfg)`,
   which replaces a connection that broke (a database restart) with a new one. Not yet: `COPY`,
@@ -1599,6 +1601,20 @@ auth.logout(net, &db, req)?                          # and auth.clear_session(&r
 - `vu new api NAME` writes an app that uses all of this: sign-up, sign-in, sign-out and per-user data.
 - `tests/run_auth.sh` checks the hashes against Django (both ways), malformed hashes, tokens, CSRF and
   cookies, the sessions in a real PostgreSQL, and that app over HTTP, plain and under the sanitizers.
+
+**`migrate`**: database migrations from `.sql` files.
+
+```
+import migrate
+let applied = migrate.run(net, fs, &db, "migrations")?   # 001_users.sql, 002_notes.sql, ... each once, in order
+```
+
+- Each file runs in a transaction with its record in `vu_migrations`, so it applies completely or
+  not at all; a failing one stops the run with the server's message and the file's name. Instances
+  starting at once take turns (an advisory lock), and the later ones find the work done. A file
+  that ran and has changed since is an error. Files can't have their own `BEGIN`/`COMMIT`.
+- `vu new api` keeps its tables in `migrations/`. `tests/run_jobs.sh` checks two files, a rerun, a
+  failing file (rolled back), its fix, an edited file, and two instances at once.
 
 **`jobs`**: background jobs kept in PostgreSQL, shared by any number of workers.
 

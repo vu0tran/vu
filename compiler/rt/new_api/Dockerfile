@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     useradd --system --no-create-home app
 WORKDIR /app
 COPY --from=build /app/app ./app
+COPY migrations ./migrations
 USER app
 ENV PORT=8080
 # behind one proxy (the platform's), which adds the client's address to X-Forwarded-For

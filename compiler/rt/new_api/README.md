@@ -5,7 +5,7 @@ A JSON API in [Vu](https://github.com/vu0tran/vu) with accounts and PostgreSQL, 
 
 ```
 export DATABASE_URL=postgresql://user:password@localhost:5432/@@NAME@@
-vu run main.vu                  # http://localhost:8080; it makes its tables on start
+vu run main.vu                  # http://localhost:8080; it applies migrations/*.sql on start
 vu check main.vu                # every compile error, in milliseconds
 vu build main.vu -o app         # the optimized binary
 ```
@@ -27,6 +27,10 @@ curl -s localhost:8080/notes -H "Authorization: Bearer TOKEN"
 | `GET /me` | the signed-in user |
 | `GET /notes`, `POST /notes {text}`, `DELETE /notes/:id` | the user's notes |
 | `GET /health` | `{"ok": true}`, for the platform's health check |
+
+The tables are in `migrations/`: each `.sql` file runs once, in name order, when the app starts. To
+change them, add `002_something.sql`; don't edit a file that has run (the app refuses to start if one
+changed).
 
 Browsers send the cookie (HttpOnly, Secure, SameSite=Lax); other clients send `Authorization: Bearer
 TOKEN`. Passwords are stored as PBKDF2 hashes in Django's format, and sessions as SHA-256 hashes of
