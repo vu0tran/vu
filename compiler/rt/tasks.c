@@ -1135,6 +1135,24 @@ static int64_t vu_net_port(vu_cap net, void *l) {
     if (a.ss_family == AF_INET6) return ntohs(((struct sockaddr_in6 *)&a)->sin6_port);
     return ntohs(((struct sockaddr_in *)&a)->sin_port);
 }
+/* net.peer(conn): the address of the other end, as text ("203.0.113.7", "2001:db8::1"; an IPv4 client
+   of a dual-stack listener as IPv4), or "" if the system can't say (the connection is gone). */
+static vu_str vu_net_peer(vu_cap net, void *c) {
+    (void)net;
+    struct sockaddr_storage a;
+    socklen_t n = sizeof a;
+    vu_str r = {0};
+    char buf[INET6_ADDRSTRLEN];
+    if (getpeername(((vu_sock *)c)->fd, (struct sockaddr *)&a, &n) < 0) return r;
+    const char *t = NULL;
+    if (a.ss_family == AF_INET6) {
+        struct in6_addr *x = &((struct sockaddr_in6 *)&a)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(x)) t = inet_ntop(AF_INET, &x->s6_addr[12], buf, sizeof buf);
+        else t = inet_ntop(AF_INET6, x, buf, sizeof buf);
+    } else if (a.ss_family == AF_INET) t = inet_ntop(AF_INET, &((struct sockaddr_in *)&a)->sin_addr, buf, sizeof buf);
+    if (t) vu_str_cat_bytes(&r, (const uint8_t *)t, (int64_t)strlen(t));
+    return r;
+}
 static bool vu_net_accept(vu_cap net, void *lp, double timeout, bool has, void **out, vu_str *err, int line) {
     (void)net;
     vu_task_here("net.accept()", line);

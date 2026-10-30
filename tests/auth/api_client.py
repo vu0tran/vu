@@ -27,6 +27,7 @@ st, b, ck = call("POST", "/signup", {"email": " Ada@Example.com ", "password": "
 expect("signup status", st, 201)
 expect("signup email", b and b.get("email"), "ada@example.com")
 tok = b["token"] if b else ""
+ada = b["id"] if b else 0
 expect("signup token length", len(tok), 43)
 expect("signup cookie", bool(ck) and ck.startswith("session=" + tok) and "HttpOnly" in ck and "Secure" in ck and "SameSite=Lax" in ck, True)
 expect("duplicate signup", call("POST", "/signup", {"email": "ada@example.com", "password": "another password"})[0], 409)
@@ -39,8 +40,8 @@ st, b, ck = call("POST", "/login", {"email": "ADA@example.com", "password": "cor
 expect("login", st, 200)
 tok2 = b["token"] if b else ""
 expect("a new token each login", tok2 != tok and len(tok2) == 43, True)
-expect("me by bearer", call("GET", "/me", token=tok)[:2], (200, {"id": 1, "email": "ada@example.com"}))
-expect("me by cookie", call("GET", "/me", cookie="session=" + tok2)[:2], (200, {"id": 1, "email": "ada@example.com"}))
+expect("me by bearer", call("GET", "/me", token=tok)[:2], (200, {"id": ada, "email": "ada@example.com"}))
+expect("me by cookie", call("GET", "/me", cookie="session=" + tok2)[:2], (200, {"id": ada, "email": "ada@example.com"}))
 expect("me signed out", call("GET", "/me")[0], 401)
 expect("me with a made-up token", call("GET", "/me", token="x" * 43)[0], 401)
 expect("me with a bad header", call("GET", "/me", headers={"Authorization": "Basic abc"})[0], 401)
@@ -65,6 +66,11 @@ expect("logout clears the cookie", bool(ck) and "Max-Age=0" in ck, True)
 expect("token after logout", call("GET", "/me", token=tok)[0], 401)
 expect("the other session still works", call("GET", "/me", cookie="session=" + tok2)[0], 200)
 expect("health", call("GET", "/health")[:2], (200, {"ok": True}))
+# 20 sign-ins and sign-ups a minute from one address: run_auth.sh made 1 and the checks above 9, so the
+# 11th more is refused
+codes = [call("POST", "/login", {"email": "x@example.com", "password": "guess %d" % i})[0] for i in range(12)]
+expect("sign-ins limited", codes, [401] * 10 + [429, 429])
+expect("other routes aren't", call("GET", "/me", cookie="session=" + tok2)[0], 200)
 for f in fails: print("FAIL  " + f)
 print("api: %d checks failed" % len(fails) if fails else "api: all checks passed")
 sys.exit(1 if fails else 0)

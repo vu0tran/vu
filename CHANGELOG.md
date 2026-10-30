@@ -2540,3 +2540,16 @@ without a signature (all 400, plan unchanged), the real one, cancelling, the ava
 through the redirect, another user who sees neither, and a cross-site POST. It passed on its first
 run, so I checked that the checks bite: with the app given another webhook secret, the real webhook
 gets 400 and the plan checks fail.
+
+**Sign-in limits, and the client's address.** Nothing in Vu could say where a request came from,
+so a login route couldn't be protected from password guessing. `net.peer(conn)` gives the other
+end's address (an IPv4 client of a dual-stack listener as IPv4: targeted test 733), and
+`http.Request` has a `peer` field, filled for HTTP/1.1 and HTTP/2. That's a change that breaks code
+building a `Request` by hand (tests, mostly): add `""` at the end. `web.client_ip(req, proxies)`
+reads `X-Forwarded-For` from the right, so behind Railway's proxy (`proxies` 1) a client that sends
+its own header doesn't choose its address. `web.limit` is middleware that answers 429 past a number
+of requests per client per window, on chosen paths; the per-client counts live in a channel of one,
+so tasks on different threads take turns. Test 732 checks addresses behind 0 to 2 proxies, the
+429s, Retry-After, other clients and other paths. `vu new api` and `examples/saas` limit sign-ins
+and sign-ups to 20 a minute per client (`PROXIES`, which their Dockerfiles set to 1), and
+`run_auth.sh` checks that the 21st gets 429 while other routes still answer.

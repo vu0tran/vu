@@ -247,6 +247,68 @@ fn same_origin(req: http.Request, c: Ctx, next: fn(http.Request, Ctx) -> http.Re
     return http.text(403, "cross-site request refused")
   return next(req, c)
 
+# The client's address. With proxies = 0 it's the connection's other end (req.peer). Behind proxies
+# that each add the address they got the request from to X-Forwarded-For (Railway, Fly, Render,
+# Heroku and most load balancers: 1), it's the address the first of them saw: counted from the
+# right, so a client can't choose it by sending its own X-Forwarded-For.
+fn client_ip(req: http.Request, proxies: Int) -> Str:
+  if proxies <= 0: return req.peer + ""
+  var hops: [Str] = []
+  for h in req.headers:
+    if h.name == "x-forwarded-for":
+      for part in h.value.split(","):
+        let a = part.strip()
+        if a != "": hops.push(a + "")
+  hops.push(req.peer + "")
+  if hops.len < proxies + 1: return hops[0] + ""
+  return hops[hops.len - 1 - proxies] + ""
+
+type Window:
+  start: Float
+  count: Int
+
+# A limit on requests per client: at most `max` requests in each `seconds` from one address (see
+# client_ip for `proxies`), to the paths that start with one of `paths` (all paths if it's empty).
+# More get 429 with Retry-After. For sign-in and sign-up routes, against password guessing:
+#   web.use(&app, web.limit(os, 10, 60.0, 1, ["/login", "/signup"]))
+# The counts are kept in memory, in this process, for at most 100,000 addresses at a time.
+fn limit(os: Os, max: Int, seconds: Float, proxies: Int, paths: [Str]) -> fn(http.Request, Ctx, fn(http.Request, Ctx) -> http.Response) -> http.Response:
+  # the map lives in a channel of one: a task takes it, counts, and puts it back, so tasks on
+  # different threads never change it at once
+  let state: Chan[{Str: Window}] = chan(1)
+  state.send({})
+  var ps: [Str] = []
+  for p in paths: ps.push(p + "")
+  return own fn(req: http.Request, c: Ctx, next: fn(http.Request, Ctx) -> http.Response) -> http.Response => limit_one(os, state, max, seconds, proxies, ps, req, c, next)
+
+fn limit_one(os: Os, state: Chan[{Str: Window}], max: Int, seconds: Float, proxies: Int, paths: [Str], req: http.Request, c: Ctx, next: fn(http.Request, Ctx) -> http.Response) -> http.Response:
+  var applies = paths.len == 0
+  for p in paths:
+    if req.path.startswith(p): applies = true
+  if not applies: return next(req, c)
+  let ip = client_ip(req, proxies)
+  let now = os.time()
+  var m = state.recv() else return next(req, c)
+  if m.len >= 100000:
+    # forget windows that have ended; if that isn't enough, start over
+    var keep: {Str: Window} = {}
+    for k, w in m:
+      if now - w.start < seconds: keep[k + ""] = Window(w.start, w.count)
+    if keep.len >= 100000: keep = {}
+    m = keep
+  var w = m.get(ip, Window(now, 0))
+  if now - w.start >= seconds: w = Window(now, 0)
+  w.count += 1
+  let over = w.count > max
+  let wait = seconds - (now - w.start)
+  m[ip] = w
+  state.send(m)
+  if over:
+    var resp = http.text(429, "too many requests; try again later")
+    resp.headers.push(http.Header("Retry-After", "{int(wait) + 1}"))
+    return resp
+  return next(req, c)
+
 # ---- responses
 
 # An HTML response, with headers that stop browsers from guessing another type or framing the page.

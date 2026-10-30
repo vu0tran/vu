@@ -18,5 +18,7 @@ COPY --from=build /app/app ./app
 COPY public ./public
 USER app
 ENV PORT=8080
+# behind one proxy (the platform's), which adds the client's address to X-Forwarded-For
+ENV PROXIES=1
 EXPOSE 8080
 CMD ["./app"]

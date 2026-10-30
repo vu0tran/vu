@@ -68,16 +68,17 @@ for flags in "--release" "--san"; do
   PORT=$aport DATABASE_URL="postgresql://app:s3cret%20pass@127.0.0.1:$port/appdb" "$work/api" > "$work/api.out" 2> "$work/api.err" &
   apid=$!
   for i in $(seq 100); do python3 -c "import socket; socket.create_connection(('127.0.0.1', $aport), 0.2)" 2>/dev/null && break; sleep 0.1; done
-  python3 auth/api_client.py $aport > "$work/client" 2>&1; rc=$?
-  # a hash with fewer iterations (from an older app, or Django's older defaults) is made again at sign-in
+  # (first, while the sign-in limit has room) a hash with fewer iterations (from an older app, or Django's older defaults) is made again at sign-in
   old=$(python3 -c 'import base64, hashlib; print("pbkdf2_sha256$1000$oldsalt$" + base64.b64encode(hashlib.pbkdf2_hmac("sha256", b"an old password", b"oldsalt", 1000)).decode())')
   asp "psql -h $work/sock -p $port -U postgres -q -d appdb -c \"insert into users (email, password_hash) values ('old@example.com', '${old//\$/\\\$}')\" >/dev/null"
   st=$(python3 -c "import http.client, json; c = http.client.HTTPConnection('127.0.0.1', $aport); c.request('POST', '/login', json.dumps({'email': 'old@example.com', 'password': 'an old password'})); print(c.getresponse().status)")
   now=$(asp "psql -h $work/sock -p $port -U postgres -d appdb -tA -c \"select password_hash from users where email = 'old@example.com'\"")
   if [ "$st" = 200 ] && [[ "$now" == pbkdf2_sha256\$600000\$* ]] && python3 -c "
 import base64, hashlib, sys; a, n, salt, h = sys.argv[1].split('\$')
-sys.exit(base64.b64encode(hashlib.pbkdf2_hmac('sha256', b'an old password', salt.encode(), int(n))).decode() != h)" "$now"; then :
-  else rc=1; echo "FAIL  rehash at sign-in: status $st, stored [$now]" >> "$work/client"; fi
+sys.exit(base64.b64encode(hashlib.pbkdf2_hmac('sha256', b'an old password', salt.encode(), int(n))).decode() != h)" "$now"; then rh=0
+  else rh=1; fi
+  python3 auth/api_client.py $aport > "$work/client" 2>&1; rc=$?
+  [ $rh = 0 ] || { rc=1; echo "FAIL  rehash at sign-in: status $st, stored [$now]" >> "$work/client"; }
   kill $apid; wait $apid 2>/dev/null
   if [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/api.err"; then ok "the api template $flags ($(tail -1 "$work/client"))"
   else no "the api template $flags"; cat "$work/client" | head -20; grep -v '^20' "$work/api.err" | head -10; fi

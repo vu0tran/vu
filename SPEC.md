@@ -611,7 +611,8 @@ fn main(net: Net) throws:
 - `net.listen(port) -> Listener` (IPv6 and IPv4 where the system has IPv6, else IPv4), `net.accept(l) -> Conn`, `net.connect(host, port) -> Conn`,
   `net.recv(c) -> Str` and `net.send(c, data)` can each fail, so they're handled with `?`,
   `else` or `match`. `accept`, `connect`, `recv` and `send` take `timeout: seconds`; when it
-  passes, the call fails with "timed out".
+  passes, the call fails with "timed out". `net.peer(c)` is the other end's address as text
+  (`"203.0.113.7"`, `"2001:db8::1"`; an IPv4 client of a dual-stack listener as IPv4).
 - A `Listener` or `Conn` is owned like a struct: moved (into a task, for example), borrowed,
   and closed when its owner goes out of scope. It can't be made any other way, copied, or
   compared.
@@ -1391,6 +1392,13 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   them: `max_age`, `same_site`...); `web.clear_cookie(&resp, name)`. Values are percent-encoded, so
   any text is safe in one. `web.sign(secret, value)` and `web.verify(secret, signed)` (HMAC-SHA256,
   compared in constant time) make a cookie the client can read but not change.
+- Clients: `req.peer` is the address the request came from (`net.peer`), and
+  `web.client_ip(req, proxies)` the client's, behind that many proxies that each add to
+  `X-Forwarded-For` (Railway, Fly and Render: 1), counted from the right so a client can't choose
+  it. `web.limit(os, max, seconds, proxies, paths)` is middleware that answers 429 (with
+  `Retry-After`) past `max` requests in `seconds` from one client to paths starting with one of
+  `paths` (all if empty): `web.use(&app, web.limit(os, 20, 60.0, 1, ["/login", "/signup"]))`.
+  The counts are in memory, for up to 100,000 clients at a time.
 - `web.redirect(status, to)` goes only to a path on the same site: anything else (`//host`, a
   scheme, a backslash, a control character) goes to `/`.
 - Static files: `web.files(fs, folder)` is a handler for a `*name` route. Names that would leave the
