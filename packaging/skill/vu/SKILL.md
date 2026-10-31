@@ -1,6 +1,6 @@
 ---
 name: vu
-description: Write small tools, scripts and MCP servers in Vu (a compiled, memory-safe language with Python-like syntax) instead of shell or Python, when the result should start fast, use little memory, or touch only what it says it touches. Covers checking, showing the person what the program can reach, and running it.
+description: Write small tools, scripts, MCP servers and web backends in Vu (a compiled, memory-safe language with Python-like syntax) instead of shell, Python or Node, when the result should start fast, use little memory, touch only what it says it touches, or be a backend with accounts that's secure without extra work. Covers checking, showing the person what the program can reach, running it, and starting a backend.
 ---
 
 # Writing tools in Vu
@@ -28,6 +28,26 @@ before writing Vu: it is the language in brief.
    small program). Later runs of the unchanged file start the kept binary in about 10 ms. A file
    whose first line is `#!/usr/bin/env -S vu run` can be made executable and run directly.
 
+## Backends
+
+Start from a template rather than an empty file: `vu new app NAME` (pages rendered on the server,
+with accounts), `vu new api NAME` (a JSON API with accounts), or `vu new web NAME` (pages, no
+database). Each has a Dockerfile and a `railway.json` and runs with `DATABASE_URL` set. Build on
+the standard library instead of writing these yourself; each is tested against a reference:
+
+- `auth`: password hashes, sessions, CSRF tokens. Never hash passwords or make tokens by hand.
+- `pg`: SQL is a string literal in the program and values go as `$1` parameters (building SQL from
+  values doesn't compile). `pg.from_url(os.env("DATABASE_URL"))`, `pg.pool`, `pg.give_back`.
+- `migrate`: tables live in `migrations/NNN_name.sql`; add a file to change them, never edit one
+  that has run.
+- `web`: routes, middleware (`web.same_origin`, `web.limit`), forms, cookies, templates that escape
+  every value (`web.render` with `web.v`).
+- `jobs` (background work that must survive restarts), `mail` (SMTP, Resend), `stripe` (Checkout,
+  verified webhooks), `s3` (objects, presigned URLs).
+
+A handler that needs a database connection takes `var db: pg.Db` and is routed with a small
+wrapper that takes one from the pool (see `route` in the templates).
+
 ## Mistakes models make in Vu
 
 - Every string interpolates: write literal braces doubled (`"{{"`), even inside nested strings.
@@ -39,7 +59,14 @@ before writing Vu: it is the language in brief.
 - `var` parameters need `&` at the call (`grow(&xs)`), and the same variable can't be passed with
   `&` twice in one call.
 - An optional is read with `if v = opt:` or `opt else default`, not by comparing with `nil`.
-- There are no `\x` or `\u` escapes: use `chr(n)` for a character by number.
+- There are no `\x` or `\u` escapes: use `chr(n)` for a character by number (`str([byte(0)])`
+  for a zero byte).
+- A `?` can't follow a call to its left in the same statement (`log(x) + f()?`): put the `?` call
+  in its own `let` first.
+- `x else y = z` isn't a statement; use `match` with `ok`/`err` arms to set a variable.
+- Maps: `k in m`, `m.get(k, default)`, `m.remove(k)`; there's no `.has`. Structs are built with
+  every field (`User(id, name)`), and there are no type aliases.
+- A closure with a `var` parameter must be `own fn(var x: T) => ...`.
 
 ## When not to use Vu
 
