@@ -2688,3 +2688,11 @@ Not changed: a 600,000-iteration dummy hash for unknown emails is slower or fast
 hash with another count (Django's newer defaults), which could tell an attacker which emails have
 accounts. But the sign-up form says so outright anyway. The starters default `PROXIES` to 0 outside
 their Dockerfile, which sets 1.
+
+**A stale-poison bug in sanitizer builds with tasks.** CI on macOS failed `run_ai.sh`'s streaming
+test under AddressSanitizer with "stack-use-after-scope", on its second request. It reproduced on
+Linux with `CC=clang` and `--san`: finished tasks' stacks go back to a pool, and clang marks a
+block's locals poisoned when the block is left, so the next task on that stack started with
+another task's poison and tripped over it. gcc's ASan doesn't poison scopes the same way, which is
+why the gate didn't see it. A reused stack is now unpoisoned before a task starts on it. 35 targeted
+tests with tasks, built with clang and the sanitizers, print what they should with no reports.

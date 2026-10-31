@@ -119,6 +119,7 @@ static void vu_sock_flags(int fd) { (void)fd; }
 #ifdef VU_ASAN_FIBERS
 #include <sanitizer/common_interface_defs.h>
 #include <sanitizer/lsan_interface.h>
+#include <sanitizer/asan_interface.h>
 /* A switched-out task's locals can sit in AddressSanitizer's "fake stack" (used to catch returns of
    pointers to locals, which Vu code can't make), and LeakSanitizer doesn't look there: it would
    report what a waiting task holds as leaked. */
@@ -757,6 +758,11 @@ static void vu_task_spawn(void (*entry)(void *), void *arg, int line) {
     vu_task *t = (vu_task *)calloc(1, sizeof *t);
     if (!t) vu_oom();
     char *mem = vu_nstack_pool ? vu_stack_pool[--vu_nstack_pool] : NULL;
+#ifdef VU_ASAN_FIBERS
+    /* a stack used before keeps the poison of the scopes its last task was in when it ended (clang
+       marks a block's locals poisoned once the block is left): the new task starts with it clean */
+    if (mem) ASAN_UNPOISON_MEMORY_REGION(mem + VU_TASK_GUARD, VU_TASK_STACK);
+#endif
     if (!mem) {
         mem = (char *)mmap(NULL, VU_TASK_GUARD + VU_TASK_STACK, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
