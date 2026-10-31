@@ -33,6 +33,8 @@ one() {  # a program: the same with and without splitting
   # (where a stack overflow happens depends on the frames' sizes, which differ: only its first line)
   same_err=1; cmp -s "$d/off.err" "$d/on.err" && same_err=0
   if head -1 "$d/off.err" | grep -q "stack overflow"; then [ "$(head -1 "$d/off.err")" = "$(head -1 "$d/on.err")" ] && same_err=0; fi
+  # (which iteration of a par loop fails first depends on the threads: its first line without numbers)
+  if grep -q "par for" "$f" && head -1 "$d/off.err" | grep -q "^panic"; then [ "$(head -1 "$d/off.err" | tr -d 0-9)" = "$(head -1 "$d/on.err" | tr -d 0-9)" ] && same_err=0; fi
   if cmp -s "$d/off.out" "$d/on.out" && cmp -s "$d/off.rc" "$d/on.rc" && [ $same_err -eq 0 ]; then echo ok; else echo "FAIL $f rc $(cat "$d/off.rc")/$(cat "$d/on.rc"): $(head -c 300 "$d/off.out" | tr '\n' ' ') // $(head -c 300 "$d/on.out" | tr '\n' ' ') // $(head -2 "$d/on.err" | tr '\n' ' ')"; fi
 }
 export -f one; export VU
