@@ -1,6 +1,6 @@
 #!/bin/bash
-# The PostgreSQL clients compared on one machine: Vu's pg, Python's asyncpg and psycopg 3, and Node's
-# pg (node-postgres), against a throwaway PostgreSQL on a free port. Each prints seconds for 20,000
+# The PostgreSQL clients compared on one machine: Vu's pg, Go's pgx, Python's asyncpg and psycopg 3,
+# and Node's pg (node-postgres), against a throwaway PostgreSQL on a free port. Each prints seconds for 20,000
 # point selects, one 200,000-row select, and 10,000 inserts; the best of RUNS (3) runs is kept.
 #   PY=path/to/python-with-asyncpg-and-psycopg NODE_PG=path/to/node_modules/pg bench/pg/run.sh
 cd "$(dirname "$0")" || exit 1
@@ -31,6 +31,7 @@ b = [min(float(r[i]) for r in runs) for i in (1, 3, 5)]
 print("%-18s point %6.3f s   bulk %6.3f s   insert %6.3f s" % (sys.argv[1], *b))' "$name"
 }
 best "vu pg" "$work/vu"
+command -v go >/dev/null && (cd go && go build -o "$work/pgbench" .) && best "go pgx" "$work/pgbench"
 $PY -c 'import asyncpg' 2>/dev/null && best "python asyncpg" "$PY" py_asyncpg.py
 $PY -c 'import psycopg' 2>/dev/null && best "python psycopg 3" "$PY" py_psycopg.py
 [ -n "$NODE_PG" ] && PG_MODULE="$NODE_PG" best "node pg" node node.js

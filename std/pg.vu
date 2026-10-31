@@ -36,6 +36,14 @@ type Db:
   timeout: Float
   broken: Bool     # the connection failed or the protocol went wrong: it can't be used again
   notes: [Note]    # notifications (LISTEN) that arrived while waiting for something else
+  prepare: Bool    # keep each SQL text as a prepared statement (on; off for a pooler such as
+                   # PgBouncer in transaction mode, which can't keep them: db.prepare = false)
+  stmts: {Str: Str}  # SQL text -> the prepared statement's name on this connection
+  cols: {Str: [Str]} # a prepared statement's name -> its result's columns (so they aren't asked again)
+  given: [Str]     # the columns read_rows starts from: a kept statement's, when no description comes
+  nstmt: Int       # statements named so far (names aren't reused, so a failed Parse can't collide)
+  parsed: Bool     # the last query's Parse was accepted (ParseComplete)
+  status: Byte     # the last ReadyForQuery's status: I idle, T in a transaction, E a failed one
 
 # A notification from NOTIFY (or pg_notify) on a channel this connection listens on.
 type Note:
@@ -287,7 +295,7 @@ fn describe(e: Error) -> Str:
 # Connects and signs in. It fails with a message (see describe).
 fn connect(net: Net, cfg: Config) -> Db throws:
   if has_nul(cfg.user) or has_nul(cfg.database) or has_nul(cfg.password): fail "the user, password and database can't contain a zero byte"
-  var db = Db(net.connect(cfg.host, cfg.port, timeout: cfg.timeout)?, "", 0, cfg.timeout, false, [])
+  var db = Db(net.connect(cfg.host, cfg.port, timeout: cfg.timeout)?, "", 0, cfg.timeout, false, [], true, {}, {}, [], 0, false, 'I')
   if cfg.tls:
     # SSLRequest; the server answers one byte: 'S' to start TLS, 'N' if it doesn't do TLS
     net.send(db.conn, be32(8) + be32(80877103), timeout: cfg.timeout)?
@@ -391,7 +399,7 @@ fn query(net: Net, var db: Db, const sql: Str, params: [Str?]) -> Rows throws Er
   if db.broken: fail Protocol("this connection failed earlier; connect again")
   if has_nul(sql): fail Protocol("the SQL text contains a zero byte")
   if params.len > 65535: fail Protocol("{params.len} parameters (the protocol allows 65,535)")
-  var bind = "\0\0" + be16(0) + be16(params.len)
+  var bind = be16(0) + be16(params.len)   # (after the portal and statement names, added below)
   for p in params:
     if v = p:
       if has_nul(v): fail Protocol("a parameter contains a zero byte, which PostgreSQL text can't hold")
@@ -399,9 +407,46 @@ fn query(net: Net, var db: Db, const sql: Str, params: [Str?]) -> Rows throws Er
     else:
       bind += be32(-1)
   bind += be16(0)
-  let out = msg('P', "\0" + sql + "\0" + be16(0)) + msg('B', bind) + msg('D', "P\0") + msg('E', "\0" + be32(0)) + msg('S', "")
+  # Each SQL text is parsed (and planned) by the server once per connection, as a named prepared
+  # statement, and its result's columns are kept; later runs send only Bind, Execute and Sync. (Go's
+  # pgx does the same: the server's parse and plan were most of a one-row query's time.)
+  var name = ""
+  var parse = ""
+  var describe = msg('D', "P\0")
+  db.given = []
+  if db.prepare and sql in db.stmts:
+    name = db.stmts[sql] + ""
+    if name in db.cols:
+      describe = ""
+      var given: [Str] = []
+      for c in db.cols[name]: given.push(c + "")
+      db.given = given
+  else:
+    if db.prepare:
+      db.nstmt += 1
+      name = "vu_{db.nstmt}"
+    parse = msg('P', name + "\0" + sql + "\0" + be16(0))
+  let out = parse + msg('B', "\0" + name + "\0" + bind) + describe + msg('E', "\0" + be32(0)) + msg('S', "")
+  db.parsed = false
   send_all(net, &db, out)?
-  return read_rows(net, &db)?
+  match read_rows(net, &db):
+    ok(r):
+      if parse != "" and name != "" and db.parsed: db.stmts[sql + ""] = name + ""
+      if describe != "" and name != "":
+        var cs: [Str] = []
+        for c in r.columns: cs.push(c + "")
+        db.cols[name + ""] = cs
+      return r
+    err(e):
+      if parse != "" and name != "" and db.parsed: db.stmts[sql + ""] = name + ""
+      # a kept statement the server can't use any more: a table it reads changed shape (0A000), or
+      # the statement is gone (26000: DISCARD ALL, or a pooler moved the session). Forget it; outside a
+      # transaction, run the query again (it's parsed anew).
+      if parse == "" and stale(e):
+        db.cols.remove(name)
+        db.stmts.remove(sql)
+        if db.status == 'I' and not db.broken: return query(net, &db, sql, params)?
+      fail e
 
 # ---- COPY
 
@@ -593,16 +638,26 @@ fn transaction(net: Net, var db: Db, f: fn(var Db) throws) throws:
     ok(r): return
     err(e): fail "pg: the commit failed: " + describe(e)
 
+fn stale(e: Error) -> Bool:
+  match e:
+    Server(code, message, detail): return code == "26000" or (code == "0A000" and message.find("cached plan") >= 0)
+    _: return false
+
 fn read_rows(net: Net, var db: Db) -> Rows throws Error:
   var rows = Rows([], [], 0)
+  # a kept statement's columns (no RowDescription comes when it isn't asked for)
+  for c in db.given: rows.columns.push(c + "")
+  db.given = []
   var total = 0
   var failed = false
   var ferr = Protocol("")
   while true:
     let m = next_msg(net, &db)?
     if m.kind == 'Z':
+      if m.body.len > 0: db.status = m.body[0]
       if failed: fail ferr
       return rows
+    if m.kind == '1': db.parsed = true
     if failed: continue
     if m.kind == 'E':
       failed = true

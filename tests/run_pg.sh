@@ -72,5 +72,12 @@ for flags in "" "--san"; do
   if [ "$got" = "$NOTIFY_WANT" ] && [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/err"; then pass=$((pass+1)); echo "ok    pg/notify.vu ${flags:-optimized}"
   else fail=$((fail+1)); echo "FAIL  pg/notify.vu ${flags:-optimized} (exit $rc)"; diff <(echo "$NOTIFY_WANT") <(echo "$got") | head -20; head -5 "$work/err"; fi
 done
+PREPARED_WANT='1999 from 2 statements | id,name then id,name,extra 7 | in a transaction: 0A000 | id,name | name 2 | 42601 42601, kept 0 | 4 rows | server 4, pg 4 | 0 | 2 | 4 | kept 0'
+for flags in "" "--san"; do
+  if ! $VU build pg/prepared.vu $flags -o "$work/prepared" 2>"$work/err"; then fail=$((fail+1)); echo "FAIL  build prepared $flags"; cat "$work/err"; continue; fi
+  got=$("$work/prepared" "$port" 2>"$work/err"); rc=$?
+  if [ "$got" = "$PREPARED_WANT" ] && [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/err"; then pass=$((pass+1)); echo "ok    pg/prepared.vu ${flags:-optimized}"
+  else fail=$((fail+1)); echo "FAIL  pg/prepared.vu ${flags:-optimized} (exit $rc)"; diff <(echo "$PREPARED_WANT") <(echo "$got") | head -20; head -5 "$work/err"; fi
+done
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

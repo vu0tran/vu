@@ -2744,6 +2744,10 @@ one, and it isn't faster here). Reading many rows is where a client's own code s
 2.6 times faster than asyncpg and 5 times faster than node-postgres. Go's pgx wasn't measured: its
 module proxy can't be reached from this machine.
 
+**Later** (round 31): that was wrong. Go's pgx, measured once its module proxy could be reached, did
+the point selects in 1.17 s: the server's parse and plan were most of each query, and pgx keeps a
+prepared statement per SQL text. `pg` now does too.
+
 **COPY and LISTEN/NOTIFY.** `pg.copy_in` loads rows with `COPY ... FROM STDIN`, escaping each value
 for the text format, and `pg.copy_out` returns `COPY ... TO STDOUT`'s output. `run_pg.sh` loads
 100,000 rows whose names hold tabs, newlines, carriage returns, backslashes, `\N`, `\.`, quotes,
@@ -2779,3 +2783,40 @@ release job writes the Homebrew formula (`packaging/homebrew/formula.sh`, Linux 
 three platforms and `brew install` and `brew test` on macOS against the published release. That
 job and the macOS and ARM builds haven't run yet; vulang.org/install needs the site to serve
 `install.sh` (the site is in another repository).
+
+## Round 31: prepared statements, and Go's pgx
+
+Go's module proxy became reachable, so `bench/pg` gained Go's pgx 5.7.6 (`bench/pg/go`). It did the
+20,000 point selects in 1.17 s against Vu's 2.90 s. With `PGX_MODE=exec` (pgx without its statement
+cache) it took 3.24 s, slower than Vu: the whole lead was the cache, the server parsing and planning
+each query once per connection instead of every time.
+
+**`pg` keeps a prepared statement per SQL text** on each connection, named `vu_N`, and the columns of
+its result, so a query run again sends only Bind, Execute and Sync. A statement is remembered only
+once the server confirms its Parse, and names aren't reused, so a refused Parse can't collide with a
+later one. A kept statement the server can't use any more (a table it reads changed shape, 0A000;
+or gone, 26000, after DISCARD ALL or a pooler moving the session) is forgotten, and outside a
+transaction the query is run again, parsed anew. `db.prepare = false` turns it off, for PgBouncer in
+transaction mode. `tests/pg/prepared.vu` checks each of those, and that the server then holds exactly
+the statements `pg` remembers. Its first run caught a test mistake (an expected sum worked out by
+hand: 2001, where Python gives 1999) and showed that after DISCARD ALL `pg` remembers statements the
+server dropped; each is parsed anew on its next use, which the test now checks for all of them.
+
+`bench/pg/run.sh`, five clients against one PostgreSQL 16 on this machine (2 cores, fsync off, best
+of 3):
+
+| client | 20,000 point selects | one 200,000-row select | 10,000 inserts |
+|---|---|---|---|
+| Vu pg | 1.66 s | 0.11 s | 0.86 s |
+| Go pgx 5.7.6 | 1.27 s | 0.11 s | 1.01 s |
+| asyncpg 0.32 | 2.44 s | 0.33 s | 1.32 s |
+| psycopg 3.3.6 | 2.58 s | 0.39 s | 1.46 s |
+| node pg 8.23 | 3.82 s | 0.69 s | 1.56 s |
+
+Vu's point selects went from 2.90 s to 1.66 s and its inserts from 1.33 s to 0.86 s. Go is still
+1.3 times faster on point selects; the runs vary by up to 0.3 s, so the bulk and insert columns are
+a tie. strace shows where Go's lead comes from: per query both make one write and about one and a
+half reads, but where Vu sleeps in `epoll_wait` until the answer comes, Go's runtime keeps threads
+spinning (17,856 `nanosleep` and 4,473 `futex` calls for the run), so it notices the answer sooner,
+at the cost of 15 s of system time against Vu's 1 s. Not copied, for now.
+
