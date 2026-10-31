@@ -2648,3 +2648,11 @@ events and the refusal when signed out.
 `call() else other()`, where `other` returns nothing, is now a statement as well (test 744).
 `run_sse.sh` also opens a page in Chromium (when Playwright is installed) whose `EventSource` reads a
 stream: the browser gets the six events, multi-line data and Unicode as sent.
+
+**CORS.** A frontend on another domain (a React app on Vercel calling an API on Railway) couldn't
+call a Vu app: there was no CORS, and `web.same_origin` refused its posts. `web.cors(origins,
+credentials)` answers preflights for listed origins, adds the headers, and marks the request so
+`web.same_origin` lets it through; other origins get nothing. Test 745 checks the headers, the
+403s and `*`; `run_cors.sh` loads a page in Chromium whose script calls an API on another port that
+allows it (a preflight with `Authorization` and credentials: the API answers) and one that doesn't
+(blocked). `vu new api` turns it on with `CORS_ORIGINS`.

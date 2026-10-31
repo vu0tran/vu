@@ -51,5 +51,10 @@ docker build -t @@NAME@@ .
 docker run -p 8080:8080 -e DATABASE_URL=... @@NAME@@
 ```
 
+A frontend on another domain (a React app on Vercel, say) needs `CORS_ORIGINS` set to its origin
+(`https://app.example.com`; several separated by commas), and sends the token as
+`Authorization: Bearer TOKEN` (the session cookie is SameSite=Lax, so browsers don't send it to
+another site).
+
 The app reads `PORT` (default 8080) and `DATABASE_URL` (`postgresql://user:password@host:port/db`,
 with `?sslmode=require` for TLS).

@@ -1409,6 +1409,10 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   quiet stream. Sending fails once the client has gone, which ends the handler. HTTP/1.1 only (an
   HTTP/2 request gets 505). `tests/run_sse.sh` reads the streams as the HTML standard says
   `EventSource` does, with 30 clients at once and clients that leave, and in Chromium.
+- Other origins: `web.cors(origins, credentials)` lets pages on those origins (exactly
+  `"https://app.example.com"`, or `"*"` without credentials) call the app: it answers preflights,
+  adds `Access-Control-Allow-Origin`, and lets them past `web.same_origin` (put it first). Other
+  origins get no CORS headers. `tests/run_cors.sh` checks it in Chromium.
 - Clients: `req.peer` is the address the request came from (`net.peer`), and
   `web.client_ip(req, proxies)` the client's, behind that many proxies that each add to
   `X-Forwarded-For` (Railway, Fly and Render: 1), counted from the right so a client can't choose
