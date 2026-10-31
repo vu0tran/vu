@@ -22,7 +22,9 @@ kinds: true mail attempt 1
 lease: true then mail attempt 2
 failed: true 0 waiting 1 failed, attempts 5, boom 5
 retry_failed: 1, then attempt 1
-transaction: 3,7, then not enough: -4'
+transaction: 3,7, then not enough: -4
+fencing: stale done left 1, stale extend false, extend true, done left 0
+lost last attempt: true then true, 1 failed'
 pass=0; fail=0
 for flags in "--release" "--san"; do
   if ! $VU build jobs/main.vu $flags -o "$work/jobs" 2>"$work/err"; then fail=$((fail+1)); echo "FAIL  build $flags"; cat "$work/err"; continue; fi

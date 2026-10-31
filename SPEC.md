@@ -1411,8 +1411,10 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   `EventSource` does, with 30 clients at once and clients that leave, and in Chromium.
 - Other origins: `web.cors(origins, credentials)` lets pages on those origins (exactly
   `"https://app.example.com"`, or `"*"` without credentials) call the app: it answers preflights,
-  adds `Access-Control-Allow-Origin`, and lets them past `web.same_origin` (put it first). Other
-  origins get no CORS headers. `tests/run_cors.sh` checks it in Chromium.
+  adds `Access-Control-Allow-Origin`, and, for origins listed by name with credentials, lets them
+  past `web.same_origin` (put it first): with `"*"` or without credentials, cross-site requests that
+  change things are still refused, since a browser sends cookies on a cross-site form post whatever
+  CORS says. Other origins get no CORS headers. `tests/run_cors.sh` checks it in Chromium.
 - Clients: `req.peer` is the address the request came from (`net.peer`), and
   `web.client_ip(req, proxies)` the client's, behind that many proxies that each add to
   `X-Forwarded-For` (Railway, Fly and Render: 1), counted from the right so a client can't choose
@@ -1708,7 +1710,9 @@ let e = stripe.verify_webhook(os.env("STRIPE_WEBHOOK_SECRET"), req, os.time())? 
 - `verify_webhook` checks the `Stripe-Signature` header as Stripe's libraries do (HMAC-SHA256 of
   `TIMESTAMP.BODY`, any of several `v1` signatures, in constant time), and refuses a timestamp more
   than 5 minutes old, or (stricter than Stripe's libraries) more than 5 minutes ahead. Answer 400
-  when it fails; Stripe tries again. `stripe.sign_payload(secret, body, t)` makes a header for tests.
+  when it fails; Stripe tries again. Stripe may send an event more than once (and a captured one
+  can be replayed within the 5 minutes): act on each `e.id` once. `stripe.sign_payload(secret,
+  body, t)` makes a header for tests.
 - `tests/run_stripe.sh` checks the calls against a fake Stripe server and 86 webhook cases against
   what Stripe's Python library decides.
 
@@ -1721,7 +1725,7 @@ var b = s3.bucket("https://s3.us-east-1.amazonaws.com", "us-east-1", "my-bucket"
 s3.put(net, os, &b, "avatars/42.png", data, "image/png")?
 let data = s3.get(net, os, &b, "avatars/42.png")?     # fails with s3.NotFound(key), Denied, Failed or Network
 let there = s3.exists(net, os, &b, key)?; s3.delete(net, os, &b, key)?
-let url = s3.presign(b, "PUT", "uploads/" + name, 600, os.time())   # a browser uploads there for 10 minutes
+let url = s3.presign(b, "PUT", "uploads/" + name, 600, os.time())?  # a browser uploads there for 10 minutes
 ```
 
 - Keys are any text, encoded in the URL as S3 expects. Amazon's endpoints get virtual-hosted URLs

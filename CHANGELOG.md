@@ -2656,3 +2656,35 @@ credentials)` answers preflights for listed origins, adds the headers, and marks
 403s and `*`; `run_cors.sh` loads a page in Chromium whose script calls an API on another port that
 allows it (a preflight with `Authorization` and credentials: the API answers) and one that doesn't
 (blocked). `vu new api` turns it on with `CORS_ORIGINS`.
+
+**An independent review of the new modules.** A separate agent, which hadn't seen them being
+written, read `auth`, the new parts of `web`, `stripe`, `s3`, `mail`, `jobs`, `migrate` and the two
+starters, looking for attacks. It confirmed the PBKDF2 format, the constant-time compares, the CSRF
+binding (including the pre-session cookie), Stripe's signature and time checks, the SigV4
+canonical form, mail's header and STARTTLS handling, and SSE's line handling. It found:
+
+1. **`web.cors` opened `web.same_origin` too widely (confirmed).** Every allowed origin was marked,
+   including `"*"` and origins allowed without credentials. A browser sends cookies on a cross-site
+   form post whatever CORS says, so any site could make a signed-in user change things. Now only
+   origins listed by name with credentials pass `same_origin`. Test 745 adds the `"*"` post: 403.
+2. **Jobs had no fencing.** A worker that ran past its lease could delete or reschedule a job that
+   another worker had taken since. And a job whose worker always crashed was taken forever. Each
+   take is now numbered (`attempts`), and `done`, `retry` and the new `jobs.extend` only act on the
+   take that's current. A last attempt whose lease ends marks the job failed. `run_jobs.sh` adds a
+   stale `done` and `extend` (no effect) and a lost last attempt (failed). The module's docs claimed
+   a job never runs twice; they now say at least once.
+3. **`web.limit` cleared every count when its table filled with 100,000 current addresses
+   (confirmed).** So a blocked client could free itself with fresh addresses. It now keeps the
+   clients over the limit and drops the others (test 746).
+4. **`s3.presign` signed an empty key**, which is the bucket's own URL (a GET lists every object).
+   It now fails on one, and on methods other than GET, PUT, HEAD and DELETE; it `throws`.
+5. Smaller ones, also fixed: mail kept a multi-line SMTP reply of any length (now at most 1 MB);
+   `migrate` made its table before taking the lock (replicas starting together could collide);
+   `auth.session_token` gave up on an `Authorization` header that isn't `Bearer` (Basic auth on a
+   staging proxy) instead of reading the cookie. The SPEC now says to act on each Stripe event id
+   once.
+
+Not changed: a 600,000-iteration dummy hash for unknown emails is slower or faster than a stored
+hash with another count (Django's newer defaults), which could tell an attacker which emails have
+accounts. But the sign-up form says so outright anyway. The starters default `PROXIES` to 0 outside
+their Dockerfile, which sets 1.

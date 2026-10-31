@@ -52,7 +52,7 @@ error in milliseconds; run it after each change.
   for the whole answer, or `ai.stream(...)` in a task to get it piece by piece, and
   `web.stream(&app, path, handler)` with `web.event` to pass the pieces to the browser as they come
   (`/ask/stream` in `examples/saas`).
-- **Files**: `s3.presign(bucket, "PUT", key, 600, os.time())` gives the browser a URL to upload to
+- **Files**: `s3.presign(bucket, "PUT", key, 600, os.time())?` gives the browser a URL to upload to
   directly; `s3.get`, `s3.put` and `s3.delete` for the app itself.
 
 `examples/saas` uses all of these together.
