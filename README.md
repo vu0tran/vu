@@ -47,7 +47,8 @@ other tools are needed.
 A backend to deploy:
 
 ```
-./vu new api notes                       # a JSON API on PostgreSQL: sign-up, sessions, per-user data
+./vu new app notes                       # pages with accounts on PostgreSQL: sign-up, sign-in, forms
+./vu new api notes                       # or a JSON API: sign-up, sessions by cookie or token, per-user data
 cd notes && DATABASE_URL=postgresql://... ../vu run main.vu
 ```
 

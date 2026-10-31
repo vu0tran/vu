@@ -83,5 +83,19 @@ sys.exit(base64.b64encode(hashlib.pbkdf2_hmac('sha256', b'an old password', salt
   if [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/api.err"; then ok "the api template $flags ($(tail -1 "$work/client"))"
   else no "the api template $flags"; cat "$work/client" | head -20; grep -v '^20' "$work/api.err" | head -10; fi
 done
+# the app `vu new app` makes, as a browser would use it
+(cd "$work" && $VU new app notes-app >/dev/null) || no "vu new app"
+for flags in "--release" "--san"; do
+  asp "psql -h $work/sock -p $port -U postgres -q -d appdb -c 'drop table if exists notes, users, vu_sessions, vu_migrations' >/dev/null 2>&1"
+  if ! $VU build "$work/notes-app/main.vu" $flags -o "$work/app" 2>"$work/err"; then no "build the app template $flags"; cat "$work/err"; continue; fi
+  aport=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  (cd "$work/notes-app" && PORT=$aport SECRET=test-secret-of-thirty-two-chars DATABASE_URL="postgresql://app:s3cret%20pass@127.0.0.1:$port/appdb" exec "$work/app") > "$work/app.out" 2> "$work/app.err" &
+  apid=$!
+  for i in $(seq 100); do python3 -c "import socket; socket.create_connection(('127.0.0.1', $aport), 0.2)" 2>/dev/null && break; sleep 0.1; done
+  python3 auth/app_client.py $aport > "$work/client" 2>&1; rc=$?
+  kill $apid; wait $apid 2>/dev/null
+  if [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/app.err"; then ok "the app template $flags ($(tail -1 "$work/client"))"
+  else no "the app template $flags"; cat "$work/client" | head -20; grep -v '^20' "$work/app.err" | head -10; fi
+done
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

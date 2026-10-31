@@ -1033,6 +1033,7 @@ vu get [file.vu]            # fetch the packages in vu.pkg, write vu.lock (see P
 vu search WORDS / vu add NAME  # the package registry (see Packages); vu publish NAME VERSION
 vu version                  # the release: vu 0.2.0
 vu new web NAME             # a folder NAME with a web app: main.vu, public/, Dockerfile, fly.toml, railway.json
+vu new app NAME             # a web app with accounts on PostgreSQL, pages rendered on the server, CSRF-checked forms
 vu new api NAME             # a JSON API on PostgreSQL with accounts and sessions: main.vu, Dockerfile, railway.json
 vu lsp                      # a language server for editors (diagnostics, formatting, hover, definition, completion)
 ```

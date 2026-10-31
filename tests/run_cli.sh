@@ -77,8 +77,13 @@ out=$(cd "$work" && $VU new api notes-api 2>&1); rc=$?
   && python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert d["deploy"]["healthcheckPath"] == "/health"' "$work/notes-api/railway.json"
 check "new api: writes the starter, with the name filled in" $? "rc=$rc out=[$out] $(ls -A "$work/notes-api" 2>&1)"
 out=$($VU check "$work/notes-api/main.vu" 2>&1); check "new api: its main.vu checks" $? "$out"
+out=$(cd "$work" && $VU new app notes-app 2>&1); rc=$?
+[ $rc -eq 0 ] && for f in main.vu migrations/001_init.sql public/style.css Dockerfile railway.json README.md; do [ -s "$work/notes-app/$f" ] || exit 1; done \
+  && grep -q 'COPY migrations' "$work/notes-app/Dockerfile" && grep -q 'COPY public' "$work/notes-app/Dockerfile" && ! grep -q '@@' "$work/notes-app/README.md"
+check "new app: writes the starter" $? "rc=$rc out=[$out] $(ls -A "$work/notes-app" 2>&1)"
+out=$($VU check "$work/notes-app/main.vu" 2>&1); check "new app: its main.vu checks" $? "$out"
 out=$(cd "$work" && $VU new cli x 2>&1); rc=$?
-[ $rc -eq 2 ] && [ ! -e "$work/x" ]; check "new: a kind other than web or api is refused (exit 2)" $? "rc=$rc out=[$out]"
+[ $rc -eq 2 ] && [ ! -e "$work/x" ]; check "new: a kind other than web, app or api is refused (exit 2)" $? "rc=$rc out=[$out]"
 
 # --static: no dynamic loader needed
 : > "$work/cc.log"; $VU build "$work/ok.vu" --static -o "$work/st" >/dev/null 2>&1

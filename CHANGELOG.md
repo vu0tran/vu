@@ -2586,3 +2586,12 @@ a `Shared` closure; 735-739 refuse a borrowing closure with a `var` parameter, a
 `fn(var Int)` where `fn(Int)` is expected, the same variable passed twice, and an own closure
 handed what it captured (moved). Test 462, which checked the old refusal, now checks the call. `vu
 new api` and `examples/saas` route to handlers with `route(net, os, env, me)`, with no enum.
+
+**`vu new app NAME`.** A web app with accounts rendered on the server, for people who want pages
+rather than a JSON API: sign-up and sign-in forms, a page of notes for each user, sign-out, all as
+templates in `main.vu`. Forms carry CSRF tokens (tied to a short-lived cookie before sign-in, and to
+the session after). It uses migrations, the sign-in limit and the same cookies as `vu new api`.
+`run_auth.sh` drives it as a browser: 25 checks on cookies, tokens read from the pages, redirects;
+forms without a token, with another one, or from another site (403); a note with markup (shown
+escaped); another user's notes (neither shown nor deletable); wrong passwords, unknown emails,
+sign-out and sign-in again.
