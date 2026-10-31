@@ -54,7 +54,8 @@ cd notes && DATABASE_URL=postgresql://... ../vu run main.vu
 
 It comes with a Dockerfile and a `railway.json`. Passwords, sessions, SQL parameters, cookies and
 cross-site requests are handled by the standard library, so the code you (or a model) write on top
-doesn't have to get them right. `examples/saas` adds Stripe, email and S3.
+doesn't have to get them right. `examples/saas` adds Stripe, email and S3, and
+[docs/backends.md](docs/backends.md) goes from an empty folder to an app deployed on Railway.
 
 `vu lsp` gives editors the compiler's errors as you type, formatting, hover, go to definition and
 completion.
