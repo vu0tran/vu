@@ -1591,6 +1591,10 @@ let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows
 - `query` and `exec` fail with a `pg.Error`: `Server(code, message, detail)` (code is the SQLSTATE,
   such as `23505` for a unique violation), `Network`, `Auth` or `Protocol`; `pg.describe(e)` makes
   a message. After a server error the connection is still usable; after a network error it isn't.
+- Each SQL text becomes a prepared statement on the connection the first time it runs, so the
+  server parses and plans it once; later runs send only the values. A table that changes shape
+  under it, or `DISCARD ALL`, is handled: outside a transaction the query is run again. For a pooler
+  that can't keep prepared statements (PgBouncer in transaction mode): `db.prepare = false`.
 - TLS: set `cfg.tls = true` (as `sslmode=verify-full`: the server's certificate must be valid and
   for `cfg.host`), and `cfg.ca` to PEM text to trust instead of the system's certificates
   (`cfg.ca = fs.read("server-ca.pem")?`). A server that says it doesn't do TLS is refused, and so
