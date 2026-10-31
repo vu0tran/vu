@@ -2712,7 +2712,7 @@ the field), and a server error (`describe`'s message). Writing the test turned u
 timestamps come in the session's time zone (the test sets UTC), now said in the docs.
 
 **How fast it is.** `bench/pg/run.sh` runs the same three workloads in Vu's `pg`, Python's asyncpg
-0.31 and psycopg 3.3, and Node's pg 8.16 against one PostgreSQL 16 on this machine (2 cores, fsync
+0.32 and psycopg 3.3.6, and Node's pg 8.23 against one PostgreSQL 16 on this machine (2 cores, fsync
 off, best of 3):
 
 | client | 20,000 point selects | one 200,000-row select | 10,000 inserts |
