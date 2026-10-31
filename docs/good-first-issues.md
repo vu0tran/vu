@@ -37,7 +37,9 @@ review and open, not issues yet. Each one names where to start.
 17. **`tests/run_split.sh`: also compare programs with `# args:` lines and stdin.**
 18. **The time server's AddressSanitizer crash on CI.** It has happened twice on Linux x86-64
     runners, never locally. The next one will print AddressSanitizer's own report.
-19. **The Homebrew formula.** Once there's a release, test `brew install` on a Mac
-    (`packaging/homebrew`).
-20. **`install.sh` on macOS and Linux ARM.** Once there's a release, run the installer on each
-    and fix what breaks.
+19. **An Intel Mac release.** The releases cover macOS on Apple silicon only; add a `macos-15-intel`
+    build to `.github/workflows/release.yml`, and its platform to `install.sh` and
+    `packaging/homebrew/formula.sh`.
+20. **A tap of its own.** Homebrew installs from this repository as a tap, which clones all of it;
+    a `vu0tran/homebrew-vu` repository holding only `Formula/vu.rb` would make it
+    `brew install vu0tran/vu/vu` with no `brew tap` line.

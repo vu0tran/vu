@@ -2741,3 +2741,25 @@ connection runs a query (kept and given in order), one sent in a transaction tha
 in a row in order, and a channel name with SQL in it (refused). LISTEN/NOTIFY passed on its first
 run; COPY's first run gave the server's "COPY from stdin failed" for the zero byte instead of a clear
 message, so values are now checked before the COPY starts.
+
+## Round 30: releases you can install
+
+Each `v*` tag now builds a GitHub release (`.github/workflows/release.yml`): the compiler with the
+standard library, and the six MCP servers, for Linux x86-64, Linux ARM64 and macOS on Apple silicon,
+with their SHA-256 sums. `packaging/release.sh` compiles the shipped `vuc` from the tag's
+`vuc_seed.c` with `-O3` for a baseline CPU (x86-64-v2, armv8-a), not the build machine's
+(`-march=native` would give "Illegal instruction" on an older CPU), and builds Linux in an Ubuntu
+22.04 container. Run here, the binaries it made needed glibc 2.34 at most (`objdump -T`); the
+compiler links only libc. A tag's release fails if `vu version` doesn't say the tag's version. A
+tag pushed before the workflow existed is released from Actions with Run workflow and the tag.
+
+`install.sh` (for `curl -fsSL https://vulang.org/install | sh`) picks the platform, finds the latest
+release from GitHub's redirect (or takes `VU_VERSION`), checks the archive against SHA256SUMS,
+checks that the compiler runs, and only then replaces `~/.vu`, writing a `vu` script in
+`~/.local/bin`. Tested here with curl and with wget only, against a local server: a fresh install,
+an update, a corrupted archive (refused, nothing installed) and a version that doesn't exist. The
+release job writes the Homebrew formula (`packaging/homebrew/formula.sh`, Linux and macOS) to
+`Formula/vu.rb` on main, so this repository is the tap, and a last job runs the installer on all
+three platforms and `brew install` and `brew test` on macOS against the published release. That
+job and the macOS and ARM builds haven't run yet; vulang.org/install needs the site to serve
+`install.sh` (the site is in another repository).

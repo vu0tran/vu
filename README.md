@@ -28,9 +28,21 @@ all three. The compiler is written in Vu.
 
 ## Getting started
 
-You need gcc (or clang, with `CC=clang`) on Linux, and git for packages. Clone the repository and run `./vu`. The first
-run builds the compiler from `compiler/vuc_seed.c`, the C the compiler produces from itself, so no
-other tools are needed.
+Install a release (Linux x86-64 or ARM64 with glibc 2.34 or later, or macOS on Apple silicon):
+
+```
+curl -fsSL https://vulang.org/install | sh           # into ~/.vu, with the command in ~/.local/bin
+brew tap vu0tran/vu https://github.com/vu0tran/vu && brew install vu0tran/vu/vu     # or Homebrew
+```
+
+The installer checks the archive against the release's SHA-256 sums; `VU_VERSION=0.2.0` picks a
+version, and running it again updates. The archives are also on the
+[releases page](https://github.com/vu0tran/vu/releases).
+
+Vu builds programs through a C compiler: gcc or clang on Linux (`CC=clang` for clang), the Command
+Line Tools on macOS (`xcode-select --install`), and git for packages. Or, from source: clone the
+repository and run `./vu`. The first run builds the compiler from `compiler/vuc_seed.c`, the C the
+compiler produces from itself, so nothing else is needed.
 
 ```
 ./vu run examples/binarytrees.vu 16      # build without optimization and run
