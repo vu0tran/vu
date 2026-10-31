@@ -24,15 +24,16 @@ if [ -n "${VU_CHECK_VERSION:-}" ] && [ "$(compiler/vuc version)" != "vu $v" ]; t
   echo "release: the tag is v$v but the compiler says '$(compiler/vuc version)'"; exit 1
 fi
 t=$(mktemp -d)
-printf 'import json\n\nfn main():\n  print(json.quote("ok"))\n' > "$t/hello.vu"
-[ "$(compiler/vuc run "$t/hello.vu")" = '"ok"' ] || { echo "release: the compiler can't run a program"; exit 1; }
+# (http: a module every release has; json was built in before 0.3)
+printf 'import http\n\nfn main():\n  let r = http.Response(200, [], "ok")\n  print(r.body)\n' > "$t/hello.vu"
+[ "$(compiler/vuc run "$t/hello.vu")" = ok ] || { echo "release: the compiler can't run a program"; exit 1; }
 rm -rf "$t"
 
 d="vu-$v-$platform"
 rm -rf "$d"; mkdir -p "$d/compiler"
 cp compiler/vuc "$d/compiler/"
 cp -r std "$d/std"
-cp README.md llms.txt "$d/"
+for f in README.md llms.txt; do [ -f "$f" ] && cp "$f" "$d/"; done
 for f in LICENSE LICENSE.md LICENSE.txt; do [ -f "$f" ] && cp "$f" "$d/"; done
 cat > "$d/vu" <<'SH'
 #!/bin/sh
