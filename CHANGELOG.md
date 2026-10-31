@@ -2738,5 +2738,6 @@ sent; a duplicate key gets the server's error, loads nothing, and leaves the con
 checks Unicode payloads, a timeout with nothing, notifications that arrive while the listening
 connection runs a query (kept and given in order), one sent in a transaction that rolls back
 (never delivered) and one that commits (delivered after the commit, not before), `unlisten`, 1,000
-in a row in order, and a channel name with SQL in it (refused). Both features passed on their first
-run, plain and under the sanitizers.
+in a row in order, and a channel name with SQL in it (refused). LISTEN/NOTIFY passed on its first
+run; COPY's first run gave the server's "COPY from stdin failed" for the zero byte instead of a clear
+message, so values are now checked before the COPY starts.
