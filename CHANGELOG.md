@@ -2646,3 +2646,5 @@ event in the middle; a reader that stops after two pieces stops it. `examples/sa
 events and the refusal when signed out.
 
 `call() else other()`, where `other` returns nothing, is now a statement as well (test 744).
+`run_sse.sh` also opens a page in Chromium (when Playwright is installed) whose `EventSource` reads a
+stream: the browser gets the six events, multi-line data and Unicode as sent.

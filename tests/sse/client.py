@@ -1,7 +1,7 @@
 # For run_sse.sh: starts server.vu's binary (arg 1) and reads its event streams as a browser's
 # EventSource would (the parsing rules of the HTML standard), checks refusals, many clients at once,
 # clients that leave in the middle, and HTTP/2.
-import socket, subprocess, sys, threading, time
+import json, socket, subprocess, sys, threading, time
 
 def free():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
@@ -80,6 +80,20 @@ try:
         s.sendall(c.data_to_send())
     s.close()
     expect("HTTP/2", status, b"505")
+    # a real browser's EventSource, when Playwright is installed
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        sync_playwright = None
+    if sync_playwright:
+        with sync_playwright() as p:
+            b = p.chromium.launch(); pg = b.new_page()
+            pg.goto("http://127.0.0.1:%d/page" % port)
+            pg.wait_for_function("document.getElementById('out').textContent.length > 0", timeout=10000)
+            got = json.loads(pg.text_content("#out")); b.close()
+        expect("Chromium's EventSource", got, ["message:plain 0 for tester", "multi:line one 1\nline two é 😀\nline three", "tick:",
+                                              "message:plain 3 for tester", "multi:line one 4\nline two é 😀\nline three", "tick:"])
+        print("checked in Chromium")
 finally:
     srv.terminate()
     try: _, err = srv.communicate(timeout=10)
