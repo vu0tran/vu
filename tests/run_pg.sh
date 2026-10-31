@@ -14,7 +14,7 @@ asp() { $sudo su postgres -s /bin/sh -c "$*"; }
 mkdir "$data" "$work/sock"; $sudo chown postgres "$data" "$work/sock"
 echo "s3cret pass" > "$work/pw"; chmod 644 "$work/pw"
 asp "$bin/initdb -D $data -U postgres --auth-local=trust --auth-host=scram-sha-256 >/dev/null"
-printf 'local all postgres trust\nhost all plain 127.0.0.1/32 password\nhost all all 127.0.0.1/32 scram-sha-256\n' > "$data/pg_hba.conf"
+printf 'local all postgres trust\nhost all plain 127.0.0.1/32 password\nhost all all 127.0.0.1/32 scram-sha-256\n' | $sudo tee "$data/pg_hba.conf" >/dev/null
 asp "$bin/pg_ctl -D $data -o '-p $port -k $work/sock -c listen_addresses=127.0.0.1' -l $data/log start -w >/dev/null"
 trap 'asp "$bin/pg_ctl -D $data stop -m immediate >/dev/null"; [ -n "$KEEP" ] || $sudo rm -rf "$work"' EXIT
 asp "psql -h $work/sock -p $port -U postgres -q -c \"create user app password 's3cret pass'\" -c \"create user plain password 'plainpw'\" -c 'create database appdb owner app' >/dev/null"
