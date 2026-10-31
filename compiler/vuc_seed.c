@@ -81294,7 +81294,7 @@ VU_FN vu_str fn_vu_version(void) {
     #line 10403 "vuc.vu"
     {
         #line 10403 "vuc.vu"
-        vu_str _t1 = vu_str_lit("0.2.0", 5);
+        vu_str _t1 = vu_str_lit("0.3.0", 5);
         #line 10403 "vuc.vu"
         return _t1;
     #line 10403 "vuc.vu"
@@ -131981,7 +131981,7 @@ VU_FN vu_str fn_rt_help(void) {
     #line 21552 "vuc.vu"
     VU_AT(21552);
     #line 21552 "vuc.vu"
-    ({ vu_str _t3 = vu_str_lit("Vu 0.2.0 compiler: translates .vu source to C, then builds a native binary with the C compiler.\n", 96); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
+    ({ vu_str _t3 = vu_str_lit("Vu 0.3.0 compiler: translates .vu source to C, then builds a native binary with the C compiler.\n", 96); vu_str_cat(&v_s, &_t3); drop_Str(&_t3); });
     #line 21553 "vuc.vu"
     VU_AT(21553);
     #line 21553 "vuc.vu"
@@ -132113,7 +132113,7 @@ VU_FN vu_str fn_rt_help(void) {
     #line 21585 "vuc.vu"
     VU_AT(21585);
     #line 21585 "vuc.vu"
-    ({ vu_str _t102 = vu_str_lit("      prints the release (vu 0.2.0)\n", 36); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
+    ({ vu_str _t102 = vu_str_lit("      prints the release (vu 0.3.0)\n", 36); vu_str_cat(&v_s, &_t102); drop_Str(&_t102); });
     #line 21586 "vuc.vu"
     VU_AT(21586);
     #line 21586 "vuc.vu"

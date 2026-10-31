@@ -9,6 +9,22 @@ The first sections (Results through LLM tokens) are the comparison from rounds 1
 
 ## Releases
 
+**0.3.0** (2026-10-31): rounds 25 to 30. The first release with prebuilt binaries (Linux x86-64
+and ARM64, and macOS on Apple silicon, all three tested in CI on every push), an installer
+(`curl -fsSL https://vulang.org/install | sh`) and a Homebrew formula. For backends: `vu new app`
+and `vu new api` write an app with accounts on PostgreSQL, ready for Railway; the standard library
+gained `auth` (Django-compatible password hashes, sessions, CSRF), `jobs` (background jobs in
+PostgreSQL), `migrate`, `stripe`, `s3`, `mail` (SMTP and Resend), `ai` (Anthropic and OpenAI, with
+streaming), server-sent events, CORS, rate limits and metrics in `web`; and `pg` gained connection
+pools, transactions, rows read into structs (`query_as`), COPY and LISTEN/NOTIFY, reading 200,000
+rows 2.6 times faster than asyncpg. MCP servers in Vu, each checked answer by answer against the
+reference server: filesystem, time, fetch, git and sqlite, with the modules they needed (`dir`
+folders as capabilities, `mcp`, `stdio`, `json`). Builds: an edited 20,000-line program rebuilds in
+0.83 s (split, cached C), `vu build --lib` makes shared libraries, and lists pass to C as pointers.
+The language: `else` after a call that sets a value or returns nothing, function values with `var`
+parameters, and `?` inside a call's own arguments. Changes that can break 0.2.0 code:
+`http.Request` has a `peer` field (a `Request` built by hand needs one more argument, `""`).
+
 **0.2.0** (2026-10-28): rounds 17 to 24. The language gained methods (`x.f()`), `"""` strings and
 text constants, wrapping operators and list slices, `own` parameters in function types, moving what
 a `match` on a call binds, `select` over channels and a connection, and generic interfaces. The
