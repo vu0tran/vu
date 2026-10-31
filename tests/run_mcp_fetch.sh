@@ -17,8 +17,9 @@ if [ ! -x "$py" ] || ! "$py" -c 'import mcp_server_fetch' 2>/dev/null; then
 fi
 if [ -x "$py" ] && "$py" -c 'import mcp_server_fetch' 2>/dev/null; then
   mkdir "$work/src" && cp "$top"/mcp/fetch/*.vu "$d"/mcp_fetch/*_driver.vu "$work/src/" && rm "$work/src/main.vu"
-  # the parts and the four whole-server runs are independent (each server run listens on ports of its
-  # own): they run side by side, VU_FETCH_JOBS at a time (default one per core), and report in order
+  # the parts check pure functions: they run side by side, VU_FETCH_JOBS at a time (default one per
+  # core). The four whole-server runs come after, one at a time: they time out requests, and under a
+  # loaded machine the reference server's own timeout fired (CI, 4 cores) while Vu's answered.
   for part in url robots guard tok charset; do
     "$top/vu" build --san "$work/src/${part}_driver.vu" -o "$work/$part" || exit 1
   done
@@ -31,8 +32,11 @@ if [ -x "$py" ] && "$py" -c 'import mcp_server_fetch' 2>/dev/null; then
   for b in plain san; do for s in 1 2; do
     printf 'python3 "%s" "%s" "%s" --seed %s --rounds 200\n' "$d/run_mcp_fetch.py" "$work/$b" "$py" $s > "$work/cmd/server-$b-$s"
   done; done
-  names="part-url-1 part-url-2 part-robots-1 part-robots-2 part-guard-1 part-guard-2 part-tok-1 part-tok-2 part-charset-1 part-charset-2 server-plain-1 server-plain-2 server-san-1 server-san-2"
-  printf '%s\n' $names | xargs -P "$jobs" -I{} sh -c 'sh "$1/cmd/$2" > "$1/out/$2" 2>&1; echo $? > "$1/out/$2.rc"' _ "$work" {}
+  parts="part-url-1 part-url-2 part-robots-1 part-robots-2 part-guard-1 part-guard-2 part-tok-1 part-tok-2 part-charset-1 part-charset-2"
+  servers="server-plain-1 server-plain-2 server-san-1 server-san-2"
+  printf '%s\n' $parts | xargs -P "$jobs" -I{} sh -c 'sh "$1/cmd/$2" > "$1/out/$2" 2>&1; echo $? > "$1/out/$2.rc"' _ "$work" {}
+  for n in $servers; do sh "$work/cmd/$n" > "$work/out/$n" 2>&1; echo $? > "$work/out/$n.rc"; done
+  names="$parts $servers"
   bad=0
   for n in $names; do
     cat "$work/out/$n"
