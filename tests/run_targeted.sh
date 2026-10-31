@@ -13,6 +13,8 @@ pass=0; fail=0
 ARCHER=${ARCHER:-/usr/lib/llvm-18/lib/libarcher.so}
 supp="$PWD/tsan.supp"   # (an absolute path: the programs run in $work)
 self="$PWD/run_targeted.sh"
+# where a sanitizer's report points: its first stack frames, on one line (CI shows only the result line)
+where() { grep -A12 'ERROR' "$1" 2>/dev/null | grep -m6 '^ *#[0-9]' | sed 's/^ *//; s/ 0x[0-9a-f]* / /' | tr '\n' ' ' | cut -c1-600 | sed 's/^./; at: &/'; }
 # One test: its three lines (ok/FAIL, attack, result) on stdout, built and run in a folder of its own.
 one() {
   f=$1; work=$(mktemp -d)
@@ -52,7 +54,7 @@ one() {
           # freed nodes are poisoned but still link the free list, so LeakSanitizer must follow pointers in them
           pgot=$(cd "$work" && LSAN_OPTIONS=use_poisoned=1 timeout 60 ./pprog $args 2>"$work/perr"); prc=$?
           if [ "$pgot" = "$want" ] && [ $prc -eq 0 ] && [ "$(grep -c 'ERROR\|runtime error' "$work/perr")" -eq 0 ]; then why="$why (malloc and pool)"
-          else ok=0; why="POOL MODE: exit $prc, output [$pgot], $(grep -m1 'ERROR\|runtime error' "$work/perr" | cut -c1-120)"; fi
+          else ok=0; why="POOL MODE: exit $prc, output [$pgot], $(grep -m1 'ERROR\|runtime error' "$work/perr" | cut -c1-120)$(where "$work/perr")"; fi
         else ok=0; why="failed to build with --san-pool"; fi
         # par and spawn programs also run under ThreadSanitizer (clang's OpenMP + Archer), when available
         if grep -q "par for\|spawn " "$f" && [ -f "$ARCHER" ] && command -v clang >/dev/null; then
@@ -65,7 +67,7 @@ one() {
           else ok=0; why="failed to build with --tsan"; fi
         fi
       elif [ $rc -ge 128 ]; then ok=0; why="CRASHED (signal $((rc-128)))"
-      else ok=0; why="exit $rc, output [$got], sanitizer reports $reports"; fi
+      else ok=0; why="exit $rc, output [$got], sanitizer reports $reports$(where "$work/err")"; fi
     fi
   fi
   if [ $ok -eq 1 ]; then pass=$((pass+1)); echo "ok    $f"; else fail=$((fail+1)); echo "FAIL  $f"; fi
