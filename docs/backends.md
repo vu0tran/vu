@@ -48,6 +48,10 @@ error in milliseconds; run it after each change.
 - **Email**: `mail.send_resend(net, key, m)?` or `mail.send_smtp(net, os, cfg, m)?`.
 - **Payments**: `stripe.checkout(...)` for a Checkout page, and `stripe.verify_webhook(secret, req,
   os.time())` in the webhook route before believing anything in it.
+- **A language model**: `ai.chat(net, os, ai.anthropic(key, model), system, [ai.user(q)], 500)?`
+  for the whole answer, or `ai.stream(...)` in a task to get it piece by piece, and
+  `web.stream(&app, path, handler)` with `web.event` to pass the pieces to the browser as they come
+  (`/ask/stream` in `examples/saas`).
 - **Files**: `s3.presign(bucket, "PUT", key, 600, os.time())` gives the browser a URL to upload to
   directly; `s3.get`, `s3.put` and `s3.delete` for the app itself.
 
@@ -82,7 +86,8 @@ stands in front of the app, so the sign-in limit counts the client's address fro
 
 ## How it's tested
 
-`tests/run_auth.sh` (accounts, both templates over HTTP, against Django's hashes),
+`tests/run_auth.sh` (accounts, both templates over HTTP, against Django's hashes), `tests/run_ai.sh`
+and `tests/run_sse.sh` (models and streams),
 `tests/run_jobs.sh` (jobs and migrations), `tests/run_saas.sh` (the example, against fake Stripe and
 Resend and moto's S3), `tests/run_stripe.sh`, `tests/run_s3.sh`, `tests/run_mail.sh`, all against
 a real PostgreSQL where they need one.
