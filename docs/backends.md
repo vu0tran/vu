@@ -1,7 +1,8 @@
 # Backends in Vu: from nothing to deployed
 
 This is the path from an empty folder to an app with accounts running on Railway. Each step says
-what to run and what you get. Everything here is checked by the test suites named at the end.
+what to run and what you get. The apps and modules are checked by the test suites named at the end;
+the Docker image and the Railway steps (4) haven't been run end to end yet.
 
 ## 1. Start from a template
 
