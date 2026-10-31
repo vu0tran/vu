@@ -52,7 +52,7 @@ want = ['anthropic: Hi back "é" 😀\n [end_turn 12/7]'.replace("\n", "\n"),
         "reasoning: Sure: {json} [stop 20/5]"]
 got = r.stdout
 bad = []
-if r.returncode != 0: bad.append("exit %d: %s" % (r.returncode, r.stderr[-300:]))
+if r.returncode != 0: bad.append("exit %d: %s" % (r.returncode, "\n".join(l for l in r.stderr.split("\n") if "ERROR" in l or l.lstrip().startswith("#") or "SUMMARY" in l or "READ" in l or "WRITE" in l)[:2500]))
 if got != "\n".join(want) + "\n": bad.append("output:\n%s\nwant:\n%s" % (got, "\n".join(want)))
 convo = [{"role": "user", "content": "Hi \"there\" é 😀\nline two"}, {"role": "assistant", "content": "Hello."}, {"role": "user", "content": "Say {json}"}]
 t0, p0, h0, b0 = reqs[0]

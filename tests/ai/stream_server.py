@@ -90,7 +90,7 @@ want = ["anthropic: Hel|lo, |wor|ld é😀 (as written) [end_turn 10/5] Hello, w
         "reader stops: w0 |w1  (all at once) error: ai: the reader stopped"]
 got = r.stdout.split("\n")[:-1]
 bad = []
-if r.returncode != 0: bad.append("exit %d: %s" % (r.returncode, r.stderr[-300:]))
+if r.returncode != 0: bad.append("exit %d: %s" % (r.returncode, "\n".join(l for l in r.stderr.split("\n") if "ERROR" in l or l.lstrip().startswith("#") or "SUMMARY" in l or "READ" in l or "WRITE" in l)[:2500]))
 for i, w in enumerate(want):
     g = got[i] if i < len(got) else None
     # (whether a short stream counts as "as written" depends on timing: only the long ones are checked)
