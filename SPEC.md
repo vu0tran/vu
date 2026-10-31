@@ -1402,6 +1402,11 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   `Retry-After`) past `max` requests in `seconds` from one client to paths starting with one of
   `paths` (all if empty): `web.use(&app, web.limit(os, 20, 60.0, 1, ["/login", "/signup"]))`.
   The counts are in memory, for up to 100,000 clients at a time.
+- Metrics: `let m = web.metrics(os)`, `web.use(&app, web.track(os, m))` (first, so it times the
+  rest) and `web.get(&app, "/metrics", web.metrics_page(m))` give Prometheus's text format:
+  `http_requests_total` by method and status, `http_request_duration_seconds` as a histogram, and
+  `process_start_time_seconds`. Methods HTTP doesn't define count as `OTHER`, so clients can't add
+  labels without end. Put the page behind a check if the app is public.
 - `web.redirect(status, to)` goes only to a path on the same site: anything else (`//host`, a
   scheme, a backslash, a control character) goes to `/`.
 - Static files: `web.files(fs, folder)` is a handler for a `*name` route. Names that would leave the

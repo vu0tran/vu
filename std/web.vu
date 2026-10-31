@@ -309,6 +309,76 @@ fn limit_one(os: Os, state: Chan[{Str: Window}], max: Int, seconds: Float, proxi
     return resp
   return next(req, c)
 
+# ---- metrics
+
+# Request counts and times for Prometheus (or anything that reads its text format):
+#   let m = web.metrics(os)
+#   web.use(&app, web.track(os, m))                  # first, so it times everything after it
+#   web.get(&app, "/metrics", web.metrics_page(m))
+# http_requests_total by method and status, and http_request_duration_seconds as a histogram.
+type Metrics:
+  state: Chan[Counts]
+
+type Counts:
+  counts: {Str: Int}   # "METHOD STATUS" -> requests
+  buckets: [Int]       # requests that took at most bounds()[i] seconds (cumulative)
+  sum: Float
+  count: Int
+  started: Float
+
+fn bounds() -> [Float]:
+  return [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+
+fn metrics(os: Os) -> Metrics:
+  let st: Chan[Counts] = chan(1)
+  var b: [Int] = []
+  for x in bounds(): b.push(0)
+  st.send(Counts({}, b, 0.0, 0, os.time()))
+  return Metrics(st)
+
+fn track(os: Os, m: Metrics) -> fn(http.Request, Ctx, fn(http.Request, Ctx) -> http.Response) -> http.Response:
+  let st = m.state.share()
+  return own fn(req: http.Request, c: Ctx, next: fn(http.Request, Ctx) -> http.Response) -> http.Response => track_one(os, st, req, c, next)
+
+fn track_one(os: Os, st: Chan[Counts], req: http.Request, c: Ctx, next: fn(http.Request, Ctx) -> http.Response) -> http.Response:
+  let t = os.clock()
+  let resp = next(req, c)
+  let took = os.clock() - t
+  # only the methods HTTP defines become labels, so a client can't make up new ones without end
+  var method = "OTHER"
+  for k in ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]:
+    if req.method == k: method = k + ""
+  var cs = st.recv() else return resp
+  let key = method + " {resp.status}"
+  cs.counts[key] = cs.counts.get(key, 0) + 1
+  let bs = bounds()
+  for i in 0..bs.len:
+    if took <= bs[i]: cs.buckets[i] += 1
+  cs.sum += took
+  cs.count += 1
+  st.send(cs)
+  return resp
+
+fn metrics_page(m: Metrics) -> fn(http.Request, Ctx) -> http.Response:
+  let st = m.state.share()
+  return own fn(req: http.Request, c: Ctx) -> http.Response => metrics_text(st)
+
+fn metrics_text(st: Chan[Counts]) -> http.Response:
+  var cs = st.recv() else return http.text(503, "busy")
+  var out = "# HELP http_requests_total Requests answered, by method and status.\n# TYPE http_requests_total counter\n"
+  var keys: [Str] = []
+  for k, v in cs.counts: keys.push(k + "")
+  for k in sorted(keys):
+    let sp = k.find(" ")
+    out += "http_requests_total{{method=\"" + k[0..sp] + "\",status=\"" + k[sp + 1..k.len] + "\"}} {cs.counts[k]}\n"
+  out += "# HELP http_request_duration_seconds Time to answer a request.\n# TYPE http_request_duration_seconds histogram\n"
+  let bs = bounds()
+  for i in 0..bs.len: out += "http_request_duration_seconds_bucket{{le=\"{bs[i]}\"}} {cs.buckets[i]}\n"
+  out += "http_request_duration_seconds_bucket{{le=\"+Inf\"}} {cs.count}\nhttp_request_duration_seconds_sum {cs.sum}\nhttp_request_duration_seconds_count {cs.count}\n"
+  out += "# HELP process_start_time_seconds When the process started (Unix time).\n# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds {cs.started}\n"
+  st.send(cs)
+  return http.response(200, "text/plain; version=0.0.4; charset=utf-8", out)
+
 # ---- responses
 
 # An HTML response, with headers that stop browsers from guessing another type or framing the page.

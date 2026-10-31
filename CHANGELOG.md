@@ -2595,3 +2595,7 @@ the session after). It uses migrations, the sign-in limit and the same cookies a
 forms without a token, with another one, or from another site (403); a note with markup (shown
 escaped); another user's notes (neither shown nor deletable); wrong passwords, unknown emails,
 sign-out and sign-in again.
+
+**Metrics.** `web.track` and `web.metrics_page` count requests by method and status and time them
+into a histogram, in Prometheus's text format (`prometheus_client`'s parser reads it: checked by
+hand). Unknown methods are counted as `OTHER`, so a client can't create labels. Targeted test 740.
