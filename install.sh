@@ -2,9 +2,11 @@
 # Installs Vu from its GitHub releases:
 #   curl -fsSL https://vulang.org/install | sh
 #   curl -fsSL https://vulang.org/install | VU_VERSION=0.2.0 sh        # a given version
+#   curl -fsSL https://vulang.org/install | sh -s -- mcp-filesystem    # also MCP servers (0.3.0 on):
+#     mcp-filesystem, mcp-time, mcp-fetch, mcp-git, mcp-sqlite, mcp-vu, or mcp for all of them
 # It puts the compiler and the standard library in ~/.vu (VU_HOME) and a `vu` command in ~/.local/bin
 # (VU_BIN), after checking the archive against the release's SHA-256 sums. Running it again updates
-# Vu. To uninstall: rm -rf ~/.vu ~/.local/bin/vu
+# Vu. To uninstall: rm -rf ~/.vu ~/.local/bin/vu ~/.local/bin/mcp-*
 # Platforms: Linux x86-64 and ARM64 (glibc 2.34 or later), macOS on Apple silicon.
 # Vu builds programs through a C compiler, so one must be installed (cc, gcc or clang).
 set -eu
@@ -26,6 +28,16 @@ elif command -v wget >/dev/null 2>&1; then
 else
   die "needs curl or wget"
 fi
+
+# the MCP servers asked for, checked before anything is downloaded
+servers=""
+for a in "$@"; do
+  case "$a" in
+    mcp) servers="filesystem time fetch git sqlite vu" ;;
+    mcp-filesystem | mcp-time | mcp-fetch | mcp-git | mcp-sqlite | mcp-vu) servers="$servers ${a#mcp-}" ;;
+    *) die "unknown argument '$a' (MCP servers: mcp-filesystem, mcp-time, mcp-fetch, mcp-git, mcp-sqlite, mcp-vu, or mcp)" ;;
+  esac
+done
 
 case "$(uname -s)/$(uname -m)" in
   Linux/x86_64 | Linux/amd64) platform=linux-x64 ;;
@@ -54,11 +66,22 @@ say "downloading Vu $version for $platform"
 get "$releases/download/v$version/$name.tar.gz" "$tmp/$name.tar.gz" || die "no $name.tar.gz in release v$version"
 get "$releases/download/v$version/SHA256SUMS" "$tmp/SHA256SUMS" || die "no SHA256SUMS in release v$version"
 
-want=$(awk -v f="$name.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")
-[ -n "$want" ] || die "$name.tar.gz isn't in the release's SHA256SUMS"
-if command -v sha256sum >/dev/null 2>&1; then have=$(sha256sum "$tmp/$name.tar.gz" | awk '{print $1}')
-else have=$(shasum -a 256 "$tmp/$name.tar.gz" | awk '{print $1}'); fi
-[ "$have" = "$want" ] || die "$name.tar.gz doesn't match its SHA-256 sum (got $have, want $want); nothing was installed"
+check() {
+  want=$(awk -v f="$1" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")
+  [ -n "$want" ] || die "$1 isn't in the release's SHA256SUMS"
+  if command -v sha256sum >/dev/null 2>&1; then have=$(sha256sum "$tmp/$1" | awk '{print $1}')
+  else have=$(shasum -a 256 "$tmp/$1" | awk '{print $1}'); fi
+  [ "$have" = "$want" ] || die "$1 doesn't match its SHA-256 sum (got $have, want $want); nothing was installed"
+}
+check "$name.tar.gz"
+# the servers too, before anything is replaced
+for s in $servers; do
+  m="mcp-$s-$version-$platform"
+  get "$releases/download/v$version/$m.tar.gz" "$tmp/$m.tar.gz" || die "no $m.tar.gz in release v$version (the MCP servers are released from 0.3.0 on)"
+  check "$m.tar.gz"
+  tar xzf "$tmp/$m.tar.gz" -C "$tmp"
+  [ -x "$tmp/$m/mcp-$s" ] || die "$m.tar.gz has no mcp-$s"
+done
 
 tar xzf "$tmp/$name.tar.gz" -C "$tmp"
 [ -x "$tmp/$name/compiler/vuc" ] || die "the archive has no compiler/vuc"
@@ -82,6 +105,11 @@ chmod +x "$bin/vu.new"
 mv "$bin/vu.new" "$bin/vu"
 
 say "installed $("$bin/vu" version) in $home, the command in $bin/vu"
+for s in $servers; do
+  m="mcp-$s-$version-$platform"
+  cp "$tmp/$m/mcp-$s" "$bin/mcp-$s.new" && chmod +x "$bin/mcp-$s.new" && mv "$bin/mcp-$s.new" "$bin/mcp-$s"
+  say "installed $bin/mcp-$s"
+done
 case ":$PATH:" in
   *":$bin:"*) ;;
   *) say "$bin isn't on your PATH: add  export PATH=\"$bin:\$PATH\"  to your shell's profile" ;;
