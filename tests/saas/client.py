@@ -21,6 +21,15 @@ class Fake(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/v1/checkout/sessions"):
             stripe_reqs.append((self.headers.get("Authorization"), dict(urllib.parse.parse_qsl(body))))
             data = json.dumps({"id": "cs_test_9", "url": "https://checkout.stripe.com/c/pay/cs_test_9"})
+        elif self.path == "/v1/messages" and json.loads(body).get("stream"):
+            asks.append((self.headers.get("x-api-key"), json.loads(body)))
+            evs = [("message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 30, "output_tokens": 1}}})]
+            for w in ["Forty", "-two", "."]: evs.append(("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": w}}))
+            evs.append(("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}}))
+            self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+            for name, obj in evs:
+                self.wfile.write(("event: %s\ndata: %s\n\n" % (name, json.dumps(obj))).encode()); self.wfile.flush(); time.sleep(0.05)
+            return
         elif self.path == "/v1/messages":
             asks.append((self.headers.get("x-api-key"), json.loads(body)))
             data = json.dumps({"id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "42."}],
@@ -105,6 +114,11 @@ try:
     expect("ask", call("POST", "/ask", {"question": "What is 6 * 7?"}, token=ada)[:2], (200, {"answer": "42."}))
     expect("what the model got", [(k, b["messages"]) for k, b in asks], [("sk-ant-9", [{"role": "user", "content": "What is 6 * 7?"}])])
     expect("an empty question", call("POST", "/ask", {"question": "  "}, token=ada)[0], 400)
+    st, body, h = call("GET", "/ask/stream?q=" + urllib.parse.quote("What is 6 * 7?"), token=ada)
+    events = [blk for blk in (body if isinstance(body, str) else "").split("\n\n") if blk]
+    expect("streamed answer", (st, h.get("Content-Type"), events), (200, "text/event-stream; charset=utf-8",
+        ["event: piece\ndata: Forty", "event: piece\ndata: -two", "event: piece\ndata: .", "event: done\ndata: "]))
+    expect("streaming signed out", call("GET", "/ask/stream?q=hi")[1], "event: problem\ndata: sign in on the paid plan, and ask 1 to 4,000 bytes\n\n")
     expect("checkout when pro", call("POST", "/billing/checkout", token=ada)[0], 409)
     expect("an event it doesn't use", hook({"id": "evt_2", "type": "invoice.paid", "data": {"object": {}}}), 200)
     expect("pro after logging in again", call("POST", "/login", {"email": "ada@example.com", "password": "correct horse battery"})[1]["plan"], "pro")

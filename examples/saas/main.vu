@@ -12,6 +12,7 @@
 #   POST /avatar                         -> 200 {"upload": URL}: PUT the image there, from the browser
 #   GET  /avatar                         -> 302 to the image, for 10 minutes
 #   POST /ask {"question"}               -> 200 {"answer"}: on the paid plan; tokens counted per user
+#   GET  /ask/stream?q=...               -> server-sent events: the answer as it's written
 #   GET  /health                         -> 200 {"ok": true}
 #
 # Configuration, from the environment: DATABASE_URL, APP_URL (https://your.app), STRIPE_SECRET_KEY,
@@ -262,6 +263,39 @@ fn ask(net: Net, os: Os, var db: pg.Db, set: Settings, req: http.Request) -> htt
   pg.exec(net, &db, "update users set tokens_used = tokens_used + $2 where id = $1", [u.id, "{r.input_tokens + r.output_tokens}"]) else return error(500, "database error")
   return http.json(200, "{{\"answer\": " + json.quote(r.text) + "}}")
 
+# GET /ask/stream?q=...: the same, with the answer sent as it's written, as server-sent events
+# (a browser's EventSource): "piece" events, then "done" (or "problem").
+fn ask_stream(net: Net, os: Os, env: Shared[Env], own s: web.Stream, req: http.Request):
+  var st = s
+  let q = (http.query(req, "q") else "").strip()
+  var db = env.value.pool.recv() else return
+  let u = current(net, os, &db, req) else User("", "", "", "")
+  pg.give_back(net, env.value.pool, db, env.value.cfg)
+  if u.id == "" or u.plan != "pro" or q == "" or q.len > 4000:
+    web.event(net, &st, "problem", "sign in on the paid plan, and ask 1 to 4,000 bytes") else return
+    return
+  let pieces: Chan[Str] = chan(64)
+  let result: Chan[Str] = chan(1)
+  spawn stream_answer(net, os, env, q, pieces.share(), result.share())
+  while true:
+    let t = pieces.recv() else break
+    web.event(net, &st, "piece", t) else pieces.close()
+  let r = result.recv() else "error"
+  if r.startswith("error"):
+    web.event(net, &st, "problem", "the model didn't answer; try again") else return
+    return
+  var db2 = env.value.pool.recv() else return
+  pg.exec(net, &db2, "update users set tokens_used = tokens_used + $2 where id = $1", [u.id, r]) else eprint("couldn't count the tokens of user " + u.id)
+  pg.give_back(net, env.value.pool, db2, env.value.cfg)
+  web.event(net, &st, "done", "") else return
+
+fn stream_answer(net: Net, os: Os, own env: Shared[Env], own q: Str, own out: Chan[Str], own result: Chan[Str]):
+  var m = ai.anthropic(env.value.set.ai_key, "claude-sonnet-4-5")
+  m.base = env.value.set.ai_base + ""
+  match ai.stream(net, os, m, "Answer briefly.", [ai.user(q)], 500, out):
+    ok(r): result.send("{r.input_tokens + r.output_tokens}")
+    err(e): result.send("error: " + e)
+
 fn health(req: http.Request, c: web.Ctx) -> http.Response:
   return http.json(200, "{{\"ok\": true}}")
 
@@ -310,5 +344,7 @@ fn main(net: Net, os: Os) throws:
   web.post(&app, "/avatar", route(net, os, env, avatar_upload))
   web.get(&app, "/avatar", route(net, os, env, avatar_get))
   web.post(&app, "/ask", route(net, os, env, ask))
+  let es = env.share()
+  web.stream(&app, "/ask/stream", own fn(own s: web.Stream, req: http.Request, c: web.Ctx) => ask_stream(net, os, es, s, req))
   print("listening on http://localhost:{port}")
   web.serve(net, os, app, port)?

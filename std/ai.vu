@@ -71,34 +71,32 @@ type OReply:
   usage: OUsage
 
 fn body(m: Model, system: Str, msgs: [Msg], max_tokens: Int) -> Str:
+  return body_with(m, system, msgs, max_tokens, false)
+
+fn body_with(m: Model, system: Str, msgs: [Msg], max_tokens: Int, stream: Bool) -> Str:
   var items: [Str] = []
   if m.provider == "openai" and system != "": items.push("{{\"role\": \"system\", \"content\": " + json.quote(system) + "}}")
   for x in msgs: items.push("{{\"role\": " + json.quote(x.role) + ", \"content\": " + json.quote(x.content) + "}}")
   var b = "{{\"model\": " + json.quote(m.name) + ", " + json.quote(m.limit_field) + ": {max_tokens}"
   if m.provider == "anthropic" and system != "": b += ", \"system\": " + json.quote(system)
+  if stream:
+    b += ", \"stream\": true"
+    if m.provider == "openai": b += ", \"stream_options\": {{\"include_usage\": true}}"
   return b + ", \"messages\": [" + ", ".join(items) + "]}}"
 
 fn retryable(status: Int) -> Bool:
   return status == 429 or status == 500 or status == 502 or status == 503 or status == 504 or status == 529
 
 # Sends the conversation and gives the model's answer.
-fn chat(net: Net, os: Os, m: Model, system: Str, msgs: [Msg], max_tokens: Int) -> Reply throws:
+fn check(m: Model, msgs: [Msg]) throws:
   if m.key == "": fail "ai: no API key"
   if msgs.len == 0: fail "ai: no messages"
   for x in msgs:
     if x.role != "user" and x.role != "assistant": fail "ai: a message's role is user or assistant, not '{x.role}'"
-  var req = http.req("POST", "")
-  if m.provider == "anthropic":
-    req.url = m.base + "/v1/messages"
-    req.headers.push(http.Header("x-api-key", m.key + ""))
-    req.headers.push(http.Header("anthropic-version", "2023-06-01"))
-  elif m.provider == "openai":
-    req.url = m.base + "/chat/completions"
-    req.headers.push(http.Header("Authorization", "Bearer " + m.key))
-  else: fail "ai: the provider is anthropic or openai, not '{m.provider}'"
-  req.headers.push(http.Header("Content-Type", "application/json"))
-  req.body = body(m, system, msgs, max_tokens)
-  req.timeout = m.timeout
+
+fn chat(net: Net, os: Os, m: Model, system: Str, msgs: [Msg], max_tokens: Int) -> Reply throws:
+  check(m, msgs)?
+  var req = request(m, body(m, system, msgs, max_tokens))?
   var waits = [1.0, 4.0]
   var attempt = 0
   while true:
@@ -112,6 +110,21 @@ fn chat(net: Net, os: Os, m: Model, system: Str, msgs: [Msg], max_tokens: Int) -
         if secs >= 0.0 and secs <= 20.0: wait = secs
     os.sleep(wait)
     attempt += 1
+
+fn request(m: Model, body: Str) -> http.ClientRequest throws:
+  var req = http.req("POST", "")
+  if m.provider == "anthropic":
+    req.url = m.base + "/v1/messages"
+    req.headers.push(http.Header("x-api-key", m.key + ""))
+    req.headers.push(http.Header("anthropic-version", "2023-06-01"))
+  elif m.provider == "openai":
+    req.url = m.base + "/chat/completions"
+    req.headers.push(http.Header("Authorization", "Bearer " + m.key))
+  else: fail "ai: the provider is anthropic or openai, not '{m.provider}'"
+  req.headers.push(http.Header("Content-Type", "application/json"))
+  req.timeout = m.timeout
+  req.body = body + ""
+  return req
 
 fn reply(m: Model, text: Str) -> Reply throws:
   if m.provider == "anthropic":
@@ -138,3 +151,118 @@ fn error_text(resp: http.Response) -> Str:
         if msg = json.str_at(e, "message"): return "HTTP {resp.status}: " + msg
     err(x): return "HTTP {resp.status}"
   return "HTTP {resp.status}"
+
+# ---- streaming
+
+# Like chat, but each piece of the answer's text is sent on `out` as the model writes it, and `out`
+# is closed at the end (so a loop receiving from it ends). A reader that stops early closes it, and
+# the stream stops too. Run it in a task of its own:
+#   let pieces: Chan[Str] = chan(64)
+#   spawn answer(net, os, m, question, pieces.share())     # calls ai.stream(..., pieces)
+#   while true:
+#     let t = pieces.recv() else break
+#     web.event(net, &s, "", t) else pieces.close()         # to the browser, as it comes
+# A busy service is asked again only before any text has been sent.
+fn stream(net: Net, os: Os, m: Model, system: Str, msgs: [Msg], max_tokens: Int, own out: Chan[Str]) -> Reply throws:
+  var sse = Sse(m.provider + "", "", out, Reply("", "", 0, 0), "", false)
+  match stream_into(net, os, m, system, msgs, max_tokens, &sse):
+    ok:
+      sse.out.close()
+      if sse.problem != "": fail "ai: " + sse.problem
+      return Reply(sse.reply.text + "", sse.reply.stop + "", sse.reply.input_tokens, sse.reply.output_tokens)
+    err(e):
+      sse.out.close()
+      fail e
+
+type Sse:
+  provider: Str
+  buf: Str
+  out: Chan[Str]
+  reply: Reply
+  problem: Str       # an error event in the stream
+  sent: Bool         # whether any text went out
+
+fn stream_into(net: Net, os: Os, m: Model, system: Str, msgs: [Msg], max_tokens: Int, var sse: Sse) throws:
+  check(m, msgs)?
+  let req = request(m, body_with(m, system, msgs, max_tokens, true))?
+  var waits = [1.0, 4.0]
+  var attempt = 0
+  while true:
+    let resp = http.stream(net, req, &sse, feed)?
+    if resp.status >= 200 and resp.status < 300: return
+    # an error answer's body went through feed as text: it's in sse.buf
+    let err = http.Response(resp.status, [], sse.buf + "")
+    sse.buf = ""
+    if not retryable(resp.status) or attempt >= waits.len or sse.sent: fail "ai: " + error_text(err)
+    var wait = waits[attempt]
+    for h in resp.headers:
+      if h.name == "retry-after":
+        let secs = float(h.value) else wait
+        if secs >= 0.0 and secs <= 20.0: wait = secs
+    os.sleep(wait)
+    attempt += 1
+
+# Takes a piece of the body: whole events (ending with a blank line) are read, the rest kept.
+fn feed(var sse: Sse, piece: Str) -> Bool:
+  sse.buf += piece
+  if sse.buf.startswith("{{"): return true    # an error answer, read whole by stream_into
+  while true:
+    var end = sse.buf.find("\n\n")
+    var skip = 2
+    let crlf = sse.buf.find("\r\n\r\n")
+    if crlf >= 0 and (end < 0 or crlf < end):
+      end = crlf
+      skip = 4
+    if end < 0: return true
+    let ev = sse.buf[0..end]
+    sse.buf = sse.buf[end + skip..sse.buf.len]
+    var data = ""
+    for line in ev.replace("\r\n", "\n").split("\n"):
+      if line.startswith("data:"):
+        var v = line[5..line.len]
+        if v.startswith(" "): v = v[1..v.len]
+        if data != "": data += "\n"
+        data += v
+    if data == "" or data == "[DONE]": continue
+    let v = json.parse(data) else continue
+    if sse.provider == "anthropic": anthropic_event(&sse, v)
+    else: openai_event(&sse, v)
+    if sse.problem != "": return false
+
+fn emit(var sse: Sse, t: Str):
+  if t == "": return
+  sse.reply.text += t
+  sse.sent = true
+  # the reader may have stopped (a browser that left) and closed the channel: then stop reading too
+  sse.out.send(t + "", timeout: 60.0) else sse.problem = "the reader stopped"
+
+fn anthropic_event(var sse: Sse, v: json.Value):
+  let kind = json.str_at(v, "type") else ""
+  if kind == "content_block_delta":
+    if d = json.at(v, "delta"):
+      if (json.str_at(d, "type") else "") == "text_delta": emit(&sse, json.str_at(d, "text") else "")
+  elif kind == "message_start":
+    if msg = json.at(v, "message"):
+      if u = json.at(msg, "usage"): sse.reply.input_tokens = json.int_at(u, "input_tokens") else 0
+  elif kind == "message_delta":
+    if d = json.at(v, "delta"): sse.reply.stop = json.str_at(d, "stop_reason") else ""
+    if u = json.at(v, "usage"): sse.reply.output_tokens = json.int_at(u, "output_tokens") else 0
+  elif kind == "error":
+    var msg = "an error in the stream"
+    if e = json.at(v, "error"): msg = json.str_at(e, "message") else msg
+    sse.problem = msg
+
+fn openai_event(var sse: Sse, v: json.Value):
+  if e = json.at(v, "error"):
+    sse.problem = json.str_at(e, "message") else "an error in the stream"
+    return
+  if cs = json.at(v, "choices"):
+    match cs:
+      json.Arr(items):
+        if items.len > 0:
+          if d = json.at(items[0], "delta"): emit(&sse, json.str_at(d, "content") else "")
+          if f = json.str_at(items[0], "finish_reason"): sse.reply.stop = f + ""
+      _: sse.problem = ""
+  if u = json.at(v, "usage"):
+    sse.reply.input_tokens = json.int_at(u, "prompt_tokens") else 0
+    sse.reply.output_tokens = json.int_at(u, "completion_tokens") else 0

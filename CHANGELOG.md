@@ -2634,3 +2634,15 @@ the app instead of writing a response. `run_sse.sh` reads the streams with the H
 parsing rules: named and unnamed events, multi-line data with `\r\n` and `\n`, Unicode, a 401 from
 middleware, 30 clients at once, 5 clients that leave an endless stream (all 5 handlers notice and
 end), and HTTP/2 (505).
+
+**Streaming a model's answer.** `http.stream` gives a response's body to a function as it arrives
+(decoding chunked transfer coding), and `ai.stream` uses it to read Anthropic's and OpenAI's event
+streams, sending each piece of text on a channel. A reader that closes the channel (a browser that
+left) stops the request. `run_ai.sh` streams from a fake of both APIs that splits its output in the
+middle of lines and of UTF-8 characters and sends it slowly: the pieces arrive as written (the first
+well before the end), with `\r\n` lines too, after a 529 retried before any text, and with an error
+event in the middle; a reader that stops after two pieces stops it. `examples/saas` has
+`/ask/stream`, relaying the pieces to the browser as server-sent events, and `run_saas.sh` checks the
+events and the refusal when signed out.
+
+`call() else other()`, where `other` returns nothing, is now a statement as well (test 744).

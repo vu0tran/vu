@@ -733,6 +733,98 @@ fn send(net: Net, req: ClientRequest) -> Response throws:
   var got = false
   return read_response_keep(net, c, req.method == "HEAD", req.timeout, &keep, &got)?
 
+# Sends a request and hands the response's body to on_data piece by piece, as it arrives (decoded from
+# chunked transfer coding), instead of keeping it: for streams (server-sent events, a model's answer
+# as it's written) and for bodies too big to keep. on_data gets the caller's state with &, and
+# returns false to stop reading. Gives the status and headers (the body is empty). The timeout
+# applies to each read, so a stream may last as long as data keeps coming.
+fn stream[T](net: Net, req: ClientRequest, var state: T, on_data: fn(var T, Str) -> Bool) -> Response throws:
+  let u = parse_url(req.url)?
+  let out = request_head(u, req, false)? + req.body
+  let c = open_conn(net, u, req.ca, "", req.timeout)?
+  net.send(c, out, timeout: req.timeout)?
+  var buf = ""
+  var status = 0
+  var headers: [Header] = []
+  while true:
+    let end = buf.find("\r\n\r\n")
+    if end >= 0:
+      let lines = buf[0..end].split("\r\n")
+      status = status_of(lines[0])?
+      if status >= 100 and status < 200:
+        buf = buf[end + 4..buf.len]
+        continue
+      for i in 1..lines.len:
+        let colon = lines[i].find(":")
+        if colon <= 0: fail "bad response: a header line without a name"
+        headers.push(Header(lower_str(lines[i][0..colon]), lines[i][colon + 1..lines[i].len].strip()))
+      buf = buf[end + 4..buf.len]
+      break
+    if buf.len > MAX_HEAD: fail "the response's headers are too large"
+    let d = net.recv(c, timeout: req.timeout)?
+    if d == "": fail "the connection closed before the response's headers"
+    buf += d
+  var chunked = false
+  var length = -1
+  for h in headers:
+    if h.name == "transfer-encoding" and "chunked" in h.value.lower(): chunked = true
+    if h.name == "content-length": length = int(h.value) else -1
+  if req.method == "HEAD" or status == 204 or status == 304: return Response(status, headers, "")
+  if not chunked:
+    var left = length
+    if buf != "":
+      var piece = buf + ""
+      if left >= 0 and piece.len > left: piece = piece[0..left]
+      if left >= 0: left -= piece.len
+      if not on_data(&state, piece): return Response(status, headers, "")
+    while left != 0:
+      let d = net.recv(c, timeout: req.timeout)?
+      if d == "":
+        if left > 0: fail "the connection closed in the middle of the body"
+        break
+      var piece = d + ""
+      if left >= 0 and piece.len > left: piece = piece[0..left]
+      if left >= 0: left -= piece.len
+      if not on_data(&state, piece): break
+    return Response(status, headers, "")
+  # chunked: SIZE (hex) CRLF, data, CRLF; a size of 0 ends it (trailers are skipped)
+  while true:
+    var nl = buf.find("\r\n")
+    while nl < 0:
+      if buf.len > 4096: fail "bad response: a chunk size line too long"
+      let d = net.recv(c, timeout: req.timeout)?
+      if d == "": fail "the connection closed in the middle of the body"
+      buf += d
+      nl = buf.find("\r\n")
+    var size_text = buf[0..nl]
+    let semi = size_text.find(";")
+    if semi >= 0: size_text = size_text[0..semi]
+    let size = hex_int(size_text.strip())?
+    buf = buf[nl + 2..buf.len]
+    if size == 0: return Response(status, headers, "")
+    if size > MAX_CLIENT_BODY: fail "bad response: a chunk of {size} bytes"
+    while buf.len < size + 2:
+      let d = net.recv(c, timeout: req.timeout)?
+      if d == "": fail "the connection closed in the middle of the body"
+      buf += d
+    if buf[size..size + 2] != "\r\n": fail "bad response: a chunk that doesn't end with CRLF"
+    let piece = buf[0..size]
+    buf = buf[size + 2..buf.len]
+    if not on_data(&state, piece): return Response(status, headers, "")
+
+fn hex_int(s: Str) -> Int throws:
+  if s.len == 0 or s.len > 15: fail "bad response: a chunk size '{s}'"
+  var n = 0
+  for i in 0..s.len:
+    let b = s[i]
+    var d = -1
+    if b >= '0' and b <= '9': d = int(b) - 48
+    elif b >= 'a' and b <= 'f': d = int(b) - 87
+    elif b >= 'A' and b <= 'F': d = int(b) - 55
+    if d < 0: fail "bad response: a chunk size '{s}'"
+    n = n * 16 + d
+  return n
+
 fn read_response(net: Net, c: Conn, head: Bool, timeout: Float) -> Response throws:
   var keep = false
   var got = false

@@ -378,6 +378,8 @@ match parse_digit(b):                # inspect it
   err(msg): print(msg)
 ```
 
+- `call() else log(...)`, with a call that returns nothing, is a statement too: the other call runs
+  when the first fails.
 - `call() else x = value` (or `+=` and the rest) is a statement: when the call fails, the
   assignment runs and the program goes on; when it succeeds, its value is dropped:
   `pg.exec(net, &db, sql, [id]) else failed += 1`.
@@ -1314,6 +1316,8 @@ fn main(net: Net) throws:
   content_type, body)` make responses; `http.Response(status, headers, body)` is the full form.
 - Pipelined requests are answered in order; the server doesn't rescan what it has already
   read, so a request sent a byte at a time costs time in proportion to its size.
+- `http.stream(net, req, &state, on_data)?` hands the body to `on_data(&state, piece) -> Bool` as it
+  arrives (chunked or not), for streams and bodies too big to keep; returning false stops reading.
 - The client: `http.get(net, url)`, `http.post(net, url, content_type, body)`, and
   `http.send(net, http.ClientRequest(method, url, headers, body, timeout, ca))` for the rest
   (`ca`: PEM certificates to trust for https, `""` for the system's). It sends one request per
@@ -1633,6 +1637,10 @@ let r = ai.chat(net, os, m, "You answer in one sentence.", [ai.user(question)], 
 print(r.text)                       # and r.stop, r.input_tokens, r.output_tokens
 ```
 
+- `ai.stream(net, os, m, system, msgs, max_tokens, out)?` is the same with the answer sent on the
+  channel `out` piece by piece as the model writes it (`out` is closed at the end; a reader that
+  closes it early stops the stream). Run it in its own task and relay the pieces, to a browser with
+  `web.event` for example (`examples/saas` has `/ask/stream`).
 - A conversation alternates `ai.user(text)` and `ai.assistant(text)`; the system prompt is its own
   argument (`""` for none). The answer's text blocks are joined; other blocks (tool calls) are
   skipped. A busy service (429, 5xx, 529) is asked twice more, after its `Retry-After` (at most 20
