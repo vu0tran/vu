@@ -76,6 +76,9 @@ def norm(x, roots):
     # a file's access time moves when the other server reads it, a second apart at most: not compared
     import re
     s = re.sub(r"accessed: [^\\]*", "accessed: <TIME>", s)
+    # each server has its own copy of the files, made a moment apart (or written by the run itself):
+    # the clock time can straddle a second, so it isn't compared; the rest of the format still is
+    s = re.sub(r"((?:created|modified): [^\\]*?)\d\d:\d\d:\d\d", r"\1<HMS>", s)
     return json.loads(s)
 
 checks = 0
