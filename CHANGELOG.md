@@ -2612,5 +2612,6 @@ modules include a client for Anthropic's Messages API and OpenAI's Chat Completi
 a conversation, the answer's text and token counts, retries after 429/5xx/529 that follow
 `Retry-After`, and the service's own error message. `run_ai.sh` checks it against a fake of both
 APIs. I compared the requests with what the official Python libraries (anthropic, openai) send for
-the same conversation, by pointing them at a small server: the same paths and JSON bodies. Not yet:
-streaming, tool calls, images, and `max_completion_tokens` for OpenAI's reasoning models.
+the same conversation, by pointing them at a small server: the same paths and JSON bodies. OpenAI's
+reasoning models get `max_completion_tokens` with `m.limit_field`. Not yet: streaming, tool calls,
+images.

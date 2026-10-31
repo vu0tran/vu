@@ -48,7 +48,8 @@ want = ['anthropic: Hi back "é" 😀\n [end_turn 12/7]'.replace("\n", "\n"),
         "garbled: error: ai: an answer that isn't a Chat Completions reply",
         "no key: error: ai: no API key",
         "empty: error: ai: no messages",
-        "bad role: error: ai: a message's role is user or assistant, not 'system'"]
+        "bad role: error: ai: a message's role is user or assistant, not 'system'",
+        "reasoning: Sure: {json} [stop 20/5]"]
 got = r.stdout
 bad = []
 if r.returncode != 0: bad.append("exit %d: %s" % (r.returncode, r.stderr[-300:]))
@@ -66,7 +67,9 @@ if len([x for x in reqs if x[3]["messages"][-1]["content"] == "bad request"]) !=
 oa = [x for x in reqs if x[1] == "/v1/chat/completions"][0]
 if oa[2].get("authorization") != "Bearer sk-test" or "x-api-key" in oa[2]: bad.append("openai headers: %r" % oa[2])
 if oa[3] != {"model": "gpt-test", "max_tokens": 100, "messages": [{"role": "system", "content": "Be brief."}] + convo}: bad.append("openai body: %r" % oa[3])
-if len(reqs) != 10: bad.append("%d requests, want 10 (none for the refused calls)" % len(reqs))
+rq = reqs[-1][3]
+if rq.get("max_completion_tokens") != 100 or "max_tokens" in rq: bad.append("reasoning model body: %r" % rq)
+if len(reqs) != 11: bad.append("%d requests, want 11 (none for the refused calls)" % len(reqs))
 for b in bad: print("FAIL  " + b)
 print("ai: %s" % ("both APIs, retries, errors and refusals as expected" if not bad else "%d problems" % len(bad)))
 sys.exit(1 if bad else 0)

@@ -1626,8 +1626,8 @@ print(r.text)                       # and r.stop, r.input_tokens, r.output_token
 - A conversation alternates `ai.user(text)` and `ai.assistant(text)`; the system prompt is its own
   argument (`""` for none). The answer's text blocks are joined; other blocks (tool calls) are
   skipped. A busy service (429, 5xx, 529) is asked twice more, after its `Retry-After` (at most 20
-  s) or 1 s then 4 s; other refusals fail with the service's message. OpenAI models that want
-  `max_completion_tokens` instead of `max_tokens` aren't supported yet, nor streaming or tools.
+  s) or 1 s then 4 s; other refusals fail with the service's message. For OpenAI's reasoning
+  models set `m.limit_field = "max_completion_tokens"`. Not yet: streaming, tools, images.
 - `tests/run_ai.sh` checks the requests against a fake server: the same paths, headers and JSON
   bodies as Anthropic's and OpenAI's Python libraries send (compared by hand), the answers, the
   retries and the errors.
