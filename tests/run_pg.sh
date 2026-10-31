@@ -39,5 +39,24 @@ for flags in "" "--san"; do
   if [ "$got" = "$want" ] && [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/err"; then pass=$((pass+1)); echo "ok    pg/basic.vu ${flags:-optimized}"
   else fail=$((fail+1)); echo "FAIL  pg/basic.vu ${flags:-optimized} (exit $rc)"; diff <(echo "$want") <(echo "$got") | head -20; head -5 "$work/err"; fi
 done
+# typed rows (pg/typed.vu prints what it found; the comparisons are inside it)
+TYPED_WANT='rows 300, 0 different
+short 3 2 true
+none 0
+one  5
+missing true
+returning 2 new b
+update 2 new a!
+wrong type: [0].id: expected a string at byte 7
+missing column: missing field '"'"'name'"'"' at byte 8
+bad sql: server: column "nope" does not exist (SQLSTATE 42703)'
+
+for flags in "" "--san"; do
+  if ! $VU build pg/typed.vu $flags -o "$work/typed" 2>"$work/err"; then fail=$((fail+1)); echo "FAIL  build typed $flags"; cat "$work/err"; continue; fi
+  got=$("$work/typed" "$port" 2>"$work/err"); rc=$?
+  echo "$got" > "$work/typed.out"
+  if [ "$got" = "$TYPED_WANT" ] && [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/err"; then pass=$((pass+1)); echo "ok    pg/typed.vu ${flags:-optimized}"
+  else fail=$((fail+1)); echo "FAIL  pg/typed.vu ${flags:-optimized} (exit $rc)"; diff <(echo "$TYPED_WANT") <(echo "$got") | head -20; head -5 "$work/err"; fi
+done
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

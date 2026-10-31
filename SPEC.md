@@ -1576,6 +1576,14 @@ let name = pg.text(rows, 0, "name") else ""       # row 0's name, nil for NULL
 let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows affected
 ```
 
+- **Typed rows**: `let users: [User] = pg.query_as(net, &db, "select id, email from users where id > $1", [n])?`
+  reads the rows into structs by column name (the type comes from where the result goes);
+  `let u: User? = pg.one_as(...)?` gives the first row or nil. The server turns the rows into JSON
+  (the statement runs as a CTE, so `insert/update/delete ... returning` work too) and `from_json`
+  checks them: a missing column is an error unless the field is optional, NULL is nil, a value of
+  the wrong kind is an error naming the field. bigint fits `Int`, numeric and floats `Float`,
+  `json`/`jsonb` nested structs, arrays lists, timestamps text (ISO 8601, in the session's time
+  zone).
 - The SQL is a `const` parameter, so values reach the server only as parameters (`$1`...), as text
   (`nil` is NULL); the server converts them to each column's type. `pg.get_int`, `get_float` and
   `get_bool` read a column as a number or Bool. For typed rows, have the server make JSON

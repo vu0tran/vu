@@ -2696,3 +2696,17 @@ block's locals poisoned when the block is left, so the next task on that stack s
 another task's poison and tripped over it. gcc's ASan doesn't poison scopes the same way, which is
 why the gate didn't see it. A reused stack is now unpoisoned before a task starts on it. 35 targeted
 tests with tasks, built with clang and the sanitizers, print what they should with no reports.
+
+## Round 29: the Postgres library
+
+**Typed rows.** `pg.query` gives text, and every app had a `pg.text(rows, i, "col") else ""` per
+field and `int(...)` per number, or a hand-written `json_agg`. `pg.query_as` and `pg.one_as` read
+rows into structs, the type coming from where the result goes (`let users: [User] = ...`). The server
+makes the JSON: the statement becomes a CTE, so `RETURNING` works, and the SQL is still a `const`
+(the library joins it to its own constant text). `run_pg.sh` puts 300 rows through it: int, bigint
+near 2^62, numeric, double precision (`i / 7` exactly), boolean, text with quotes, backslashes, tabs,
+newlines and emoji, text[], jsonb into a nested struct, a nullable column, date and timestamptz.
+Every field of every row came back equal. It also checks no rows, `one_as` with none (nil), INSERT
+and UPDATE ... RETURNING, a field of the wrong type and a missing column (`from_json`'s messages, with
+the field), and a server error (`describe`'s message). Writing the test turned up one surprise:
+timestamps come in the session's time zone (the test sets UTC), now said in the docs.
