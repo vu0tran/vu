@@ -1398,6 +1398,13 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   them: `max_age`, `same_site`...); `web.clear_cookie(&resp, name)`. Values are percent-encoded, so
   any text is safe in one. `web.sign(secret, value)` and `web.verify(secret, signed)` (HMAC-SHA256,
   compared in constant time) make a cookie the client can read but not change.
+- Server-sent events (a browser's `EventSource`): `web.stream(&app, "/rooms/:id/events", own fn(own s,
+  req, c) => follow(net, s, web.param(c, "id")))` passes the middleware like any GET, then hands the
+  handler the open stream; `web.event(net, &s, name, data)?` sends one (`""` for the default
+  name; data of any lines), `web.keep_alive(net, &s)?` a comment that keeps proxies from closing a
+  quiet stream. Sending fails once the client has gone, which ends the handler. HTTP/1.1 only (an
+  HTTP/2 request gets 505). `tests/run_sse.sh` reads the streams as the HTML standard says
+  `EventSource` does, with 30 clients at once and clients that leave.
 - Clients: `req.peer` is the address the request came from (`net.peer`), and
   `web.client_ip(req, proxies)` the client's, behind that many proxies that each add to
   `X-Forwarded-For` (Railway, Fly and Render: 1), counted from the right so a client can't choose

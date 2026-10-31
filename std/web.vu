@@ -29,14 +29,23 @@ type WsRoute:
   segs: [Str]
   handler: fn(own ws.Socket, http.Request, Ctx)
 
+type StreamRoute:
+  segs: [Str]
+  handler: fn(own Stream, http.Request, Ctx)
+
+# An open stream of server-sent events (text/event-stream): web.event sends one.
+type Stream:
+  conn: Conn
+
 type App:
   routes: [Route]
   mws: [fn(http.Request, Ctx, fn(http.Request, Ctx) -> http.Response) -> http.Response]
   ws_routes: [WsRoute]
   origins: [Str]       # pages on other origins that may open this app's WebSockets ("https://x.com")
+  streams: [StreamRoute]
 
 fn app() -> App:
-  return App([], [], [], [])
+  return App([], [], [], [], [])
 
 # A WebSocket route: a GET with the WebSocket handshake to p (the same patterns as get) passes the
 # middleware like any request, then h gets the open socket, the request and the context, and owns
@@ -44,6 +53,27 @@ fn app() -> App:
 # could otherwise open a socket with the user's cookies) unless allow_origin names it.
 fn websocket(var a: App, p: Str, own h: fn(own ws.Socket, http.Request, Ctx)):
   a.ws_routes.push(WsRoute(pattern(p), h))
+
+# A route for server-sent events (EventSource in a browser): a GET to p passes the middleware like
+# any request; then h gets the stream, the request and the context, and owns the connection until it
+# returns, sending events with web.event. Over HTTP/1.1 (an HTTP/2 request gets 505).
+#   web.stream(&app, "/rooms/:room/events", own fn(own s, req, c) => follow(net, s, web.param(c, "room")))
+fn stream(var a: App, p: Str, own h: fn(own Stream, http.Request, Ctx)):
+  a.streams.push(StreamRoute(pattern(p), h))
+
+# Sends one event: its name ("" for the default, "message") and data (any text: each line is sent as
+# a data line, and EventSource joins them back with newlines). Fails when the client has gone.
+fn event(net: Net, var s: Stream, name: Str, data: Str) throws:
+  var out = ""
+  if name != "":
+    if "\n" in name or "\r" in name: fail "web: an event's name can't contain a line break"
+    out += "event: " + name + "\n"
+  for line in data.replace("\r\n", "\n").replace("\r", "\n").split("\n"): out += "data: " + line + "\n"
+  net.send(s.conn, out + "\n", timeout: 30.0)?
+
+# A comment line, which clients ignore: sent now and then, it keeps proxies from closing a quiet stream.
+fn keep_alive(net: Net, var s: Stream) throws:
+  net.send(s.conn, ": keep-alive\n\n", timeout: 30.0)?
 
 fn allow_origin(var a: App, origin: Str):
   a.origins.push(origin + "")
@@ -134,6 +164,16 @@ fn dispatch(a: App, req: http.Request, c: Ctx) -> http.Response:
         for k, v in c.params: hs.push(http.Header(":param:" + k, v + ""))
         for k, v in c.vals: hs.push(http.Header(":val:" + k, v + ""))
         return http.Response(101, hs, "")
+  if req.method == "GET":
+    for i in 0..a.streams.len:
+      if ps = match_route(a.streams[i].segs, parts):
+        if req.version == "HTTP/2": return http.text(505, "server-sent events are served over HTTP/1.1")
+        # as for a WebSocket: http gives the connection to ws_take with this response
+        var hs = [http.Header(":stream", "{i}")]
+        for k, v in ps: hs.push(http.Header(":param:" + k, v + ""))
+        for k, v in c.params: hs.push(http.Header(":param:" + k, v + ""))
+        for k, v in c.vals: hs.push(http.Header(":val:" + k, v + ""))
+        return http.Response(101, hs, "")
   var allowed: [Str] = []
   for r in a.routes:
     if ps = match_route(r.segs, parts):
@@ -170,7 +210,7 @@ fn serve_tls(net: Net, os: Os, own a: App, port: Int, cert: Str, key: Str) throw
 
 # The app as an http.Site: its routes and middleware, and its WebSocket routes.
 fn site(net: Net, own a: App) -> http.Site:
-  let takes = a.ws_routes.len > 0
+  let takes = a.ws_routes.len > 0 or a.streams.len > 0
   let sa = share(a)
   let sb = sa.share()
   return http.Site(own fn(req: http.Request) -> http.Response => handle(sa.value, req), takes,
@@ -178,11 +218,18 @@ fn site(net: Net, own a: App) -> http.Site:
 
 fn ws_take(net: Net, a: Shared[App], own c: Conn, req: http.Request, resp: http.Response, rest: Str):
   var route = -1
+  var sr = -1
   var ctx = Ctx({}, {})
   for h in resp.headers:
     if h.name == ":route": route = int(h.value) else -1
+    elif h.name == ":stream": sr = int(h.value) else -1
     elif h.name.startswith(":param:"): ctx.params[h.name[7..h.name.len]] = h.value + ""
     elif h.name.startswith(":val:"): ctx.vals[h.name[5..h.name.len]] = h.value + ""
+  if sr >= 0 and sr < a.value.streams.len:
+    var conn = c
+    net.send(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n", timeout: 10.0) else return
+    a.value.streams[sr].handler(Stream(conn), req, ctx)
+    return
   if route < 0 or route >= a.value.ws_routes.len: return
   let s = ws.accept_request(net, c, req, rest) else return
   a.value.ws_routes[route].handler(s, req, ctx)

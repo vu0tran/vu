@@ -2624,3 +2624,13 @@ them.
 `examples/saas` has the pattern most AI products have: `/ask` sends a question to Claude for users
 on the paid plan (402 otherwise) and counts the tokens per user. `run_saas.sh` checks the 402
 before paying, the answer after, and what the (fake) Anthropic API received.
+
+**Server-sent events.** Streaming a language model's answer token by token, live dashboards and
+notifications all want a response that keeps going. `web.stream(&app, path, handler)` runs the
+middleware (so a stream can require sign-in), sends the `text/event-stream` headers, and hands the
+handler the connection; `web.event` sends an event, with data of any number of lines. It reuses the
+path WebSockets take: the route answers 101 inside the app, and the server gives the connection to
+the app instead of writing a response. `run_sse.sh` reads the streams with the HTML standard's
+parsing rules: named and unnamed events, multi-line data with `\r\n` and `\n`, Unicode, a 401 from
+middleware, 30 clients at once, 5 clients that leave an endless stream (all 5 handlers notice and
+end), and HTTP/2 (505).
