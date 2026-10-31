@@ -11,11 +11,14 @@
 #                                         and back when the subscription ends)
 #   POST /avatar                         -> 200 {"upload": URL}: PUT the image there, from the browser
 #   GET  /avatar                         -> 302 to the image, for 10 minutes
+#   POST /ask {"question"}               -> 200 {"answer"}: on the paid plan; tokens counted per user
 #   GET  /health                         -> 200 {"ok": true}
 #
 # Configuration, from the environment: DATABASE_URL, APP_URL (https://your.app), STRIPE_SECRET_KEY,
 # STRIPE_WEBHOOK_SECRET, STRIPE_PRICE (the subscription's price_...), RESEND_API_KEY and MAIL_FROM
-# (no email is sent without them), S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_KEY_ID, S3_SECRET.
+# (no email is sent without them), S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_KEY_ID, S3_SECRET,
+# ANTHROPIC_API_KEY.
+import ai
 import auth
 import http
 import jobs
@@ -43,6 +46,8 @@ type Settings:
   s3_bucket: Str
   s3_key_id: Str
   s3_secret: Str
+  ai_key: Str          # ANTHROPIC_API_KEY: /ask, for the paid plan
+  ai_base: Str
 
 type Env:
   pool: Chan[pg.Db]
@@ -240,12 +245,30 @@ fn avatar_get(net: Net, os: Os, var db: pg.Db, set: Settings, req: http.Request)
   let url = s3.presign(bucket(set), "GET", u.avatar, 600, os.time())
   return http.Response(302, [http.Header("Location", url), http.Header("Cache-Control", "private, max-age=300")], "")
 
+# ---- the paid feature: a question for a language model, and its cost kept per user
+
+type Question:
+  question: Str
+
+fn ask(net: Net, os: Os, var db: pg.Db, set: Settings, req: http.Request) -> http.Response:
+  let u = current(net, os, &db, req) else return error(500, "database error")
+  if u.id == "": return error(401, "sign in first")
+  if u.plan != "pro": return error(402, "asking is on the paid plan")
+  let q = from_json(req.body, Question) else return error(400, "expected {{\"question\": ...}}")
+  if q.question.strip() == "" or q.question.len > 4000: return error(400, "a question has 1 to 4,000 bytes")
+  var m = ai.anthropic(set.ai_key, "claude-sonnet-4-5")
+  m.base = set.ai_base + ""
+  let r = ai.chat(net, os, m, "Answer briefly.", [ai.user(q.question)], 500) else return error(502, "the model didn't answer; try again")
+  pg.exec(net, &db, "update users set tokens_used = tokens_used + $2 where id = $1", [u.id, "{r.input_tokens + r.output_tokens}"]) else return error(500, "database error")
+  return http.json(200, "{{\"answer\": " + json.quote(r.text) + "}}")
+
 fn health(req: http.Request, c: web.Ctx) -> http.Response:
   return http.json(200, "{{\"ok\": true}}")
 
 fn migrate(net: Net, var db: pg.Db) throws pg.Error:
   pg.exec(net, &db, "create table if not exists users (id bigserial primary key, email text not null unique, password_hash text not null, plan text not null default 'free', stripe_customer text, avatar text, created timestamptz not null default now())", [])?
   pg.exec(net, &db, "create index if not exists users_customer on users (stripe_customer)", [])?
+  pg.exec(net, &db, "alter table users add column if not exists tokens_used bigint not null default 0", [])?
   auth.setup(net, &db)?
   jobs.setup(net, &db)?
 
@@ -256,7 +279,8 @@ fn main(net: Net, os: Os) throws:
   let set = Settings(env_or(os, "APP_URL", "http://localhost:{port}"), os.env("STRIPE_SECRET_KEY"), os.env("STRIPE_WEBHOOK_SECRET"),
     os.env("STRIPE_PRICE"), env_or(os, "STRIPE_API_BASE", "https://api.stripe.com"), os.env("RESEND_API_KEY"),
     env_or(os, "RESEND_API_BASE", "https://api.resend.com"), os.env("MAIL_FROM"), env_or(os, "S3_ENDPOINT", "https://s3.us-east-1.amazonaws.com"),
-    env_or(os, "S3_REGION", "us-east-1"), os.env("S3_BUCKET"), os.env("S3_KEY_ID"), os.env("S3_SECRET"))
+    env_or(os, "S3_REGION", "us-east-1"), os.env("S3_BUCKET"), os.env("S3_KEY_ID"), os.env("S3_SECRET"),
+    os.env("ANTHROPIC_API_KEY"), env_or(os, "ANTHROPIC_BASE", "https://api.anthropic.com"))
   let cfg = pg.from_url(url)?
   let pool = pg.pool(net, cfg, POOL)?
   var db = pool.recv() else fail "no database connection"
@@ -285,5 +309,6 @@ fn main(net: Net, os: Os) throws:
   web.post(&app, "/billing/webhook", route(net, os, env, webhook))
   web.post(&app, "/avatar", route(net, os, env, avatar_upload))
   web.get(&app, "/avatar", route(net, os, env, avatar_get))
+  web.post(&app, "/ask", route(net, os, env, ask))
   print("listening on http://localhost:{port}")
   web.serve(net, os, app, port)?

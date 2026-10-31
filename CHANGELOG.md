@@ -2620,3 +2620,7 @@ images.
 between `begin` and `commit`, or rolls back and passes the error on. `run_jobs.sh` moves money
 between two rows twice; the second would overdraw, fails, and leaves both rows as the first left
 them.
+
+`examples/saas` has the pattern most AI products have: `/ask` sends a question to Claude for users
+on the paid plan (402 otherwise) and counts the tokens per user. `run_saas.sh` checks the 402
+before paying, the answer after, and what the (fake) Anthropic API received.

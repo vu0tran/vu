@@ -13,7 +13,7 @@ def wait(port):
         except OSError: time.sleep(0.1)
     raise SystemExit("nothing listening on %d" % port)
 
-stripe_reqs, mails, mail_tries = [], [], []
+stripe_reqs, mails, mail_tries, asks = [], [], [], []
 class Fake(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_POST(self):
@@ -21,6 +21,10 @@ class Fake(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/v1/checkout/sessions"):
             stripe_reqs.append((self.headers.get("Authorization"), dict(urllib.parse.parse_qsl(body))))
             data = json.dumps({"id": "cs_test_9", "url": "https://checkout.stripe.com/c/pay/cs_test_9"})
+        elif self.path == "/v1/messages":
+            asks.append((self.headers.get("x-api-key"), json.loads(body)))
+            data = json.dumps({"id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "42."}],
+                               "stop_reason": "end_turn", "usage": {"input_tokens": 30, "output_tokens": 3}})
         elif self.path == "/emails":
             # the mail service is down for the first try: the welcome job must be tried again
             mail_tries.append(1)
@@ -50,7 +54,7 @@ try:
     env = dict(os.environ, PORT=str(aport), DATABASE_URL=sys.argv[2], APP_URL="https://app.example", STRIPE_SECRET_KEY="sk_test_9",
                STRIPE_WEBHOOK_SECRET=secret, STRIPE_PRICE="price_pro", STRIPE_API_BASE="http://127.0.0.1:%d" % fport,
                RESEND_API_KEY="re_9", RESEND_API_BASE="http://127.0.0.1:%d" % fport, MAIL_FROM="App <hello@app.example>",
-               S3_ENDPOINT="http://127.0.0.1:%d" % mport, S3_REGION="us-east-1", S3_BUCKET="avatars", S3_KEY_ID="x", S3_SECRET="y")
+               ANTHROPIC_API_KEY="sk-ant-9", ANTHROPIC_BASE="http://127.0.0.1:%d" % fport, S3_ENDPOINT="http://127.0.0.1:%d" % mport, S3_REGION="us-east-1", S3_BUCKET="avatars", S3_KEY_ID="x", S3_SECRET="y")
     app = subprocess.Popen([sys.argv[1]], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     wait(aport)
 
@@ -88,12 +92,16 @@ try:
         "success_url": "https://app.example/?paid={CHECKOUT_SESSION_ID}", "cancel_url": "https://app.example/", "client_reference_id": str(uid), "customer_email": "ada@example.com"})])
     expect("checkout signed out", call("POST", "/billing/checkout")[0], 401)
     done = {"id": "evt_1", "type": "checkout.session.completed", "created": 1, "data": {"object": {"id": "cs_test_9", "client_reference_id": str(uid), "customer": "cus_ada"}}}
+    expect("asking on the free plan", call("POST", "/ask", {"question": "x"}, token=ada)[0], 402)
     expect("forged webhook", hook(done, key="whsec_guess"), 400)
     expect("replayed webhook (an hour old)", hook(done, t=int(time.time()) - 3600), 400)
     expect("no signature", call("POST", "/billing/webhook", raw=json.dumps(done))[0], 400)
     expect("still free", call("GET", "/me", token=ada)[1]["plan"], "free")
     expect("real webhook", hook(done), 200)
     expect("now pro", call("GET", "/me", token=ada)[1]["plan"], "pro")
+    expect("ask", call("POST", "/ask", {"question": "What is 6 * 7?"}, token=ada)[:2], (200, {"answer": "42."}))
+    expect("what the model got", [(k, b["messages"]) for k, b in asks], [("sk-ant-9", [{"role": "user", "content": "What is 6 * 7?"}])])
+    expect("an empty question", call("POST", "/ask", {"question": "  "}, token=ada)[0], 400)
     expect("checkout when pro", call("POST", "/billing/checkout", token=ada)[0], 409)
     expect("an event it doesn't use", hook({"id": "evt_2", "type": "invoice.paid", "data": {"object": {}}}), 200)
     expect("pro after logging in again", call("POST", "/login", {"email": "ada@example.com", "password": "correct horse battery"})[1]["plan"], "pro")

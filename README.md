@@ -282,7 +282,7 @@ a README that says how to deploy it. `vu new api NAME` writes a JSON API on Post
 sign-up and sign-in (passwords hashed as Django hashes them), sessions by cookie or Bearer token, and
 data that belongs to each user, ready to deploy on Railway. `examples/saas` goes further: a paid plan
 through Stripe Checkout and signed webhooks, a welcome email through Resend, and avatars uploaded
-straight to S3 with presigned URLs, in under 300 lines. `vu build --static` makes a binary that needs no
+straight to S3 with presigned URLs, and a question for Claude that only paying users can ask, in about 320 lines. `vu build --static` makes a binary that needs no
 shared libraries.
 
 ### Calling C
