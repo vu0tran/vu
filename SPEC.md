@@ -299,12 +299,15 @@ fn main():
   `fn(T)` for one that returns nothing. `(fn(Int) -> Int)?` is an optional one. `fn(own Conn)`
   takes ownership of that argument: a call moves it in, as for an `own` parameter, and a closure of
   that type names it `own` (`fn(own c) => serve(c)`), or gets that from where it goes. A named
-  function with `own` parameters is a value of such a type.
+  function with `own` parameters is a value of such a type. `fn(var pg.Db, Str)` may change that
+  argument: calls pass it with `&` (`f(&db, sql)`), as for a `var` parameter, and a named
+  function with `var` parameters is a value of such a type.
 - **Closures**: `fn(x: Int) -> Int => x * k` is an expression. Parameter and return types can be
   left out when the context gives them (an argument, a typed `let`, a field). `fn name(...): ...`
   inside a function is a nested function with a block body, bound to `name`; it can't call
-  itself (make it top-level to recurse). Closure parameters are read-only, except `own` ones
-  (there is no `var`).
+  itself (make it top-level to recurse). Closure parameters are read-only, except `own` ones and
+  `var` ones; a closure with a `var` parameter must be `own fn` (`own fn(var db: pg.Db) =>
+  ...`), since a borrowing one could be handed, with `&`, a variable it also borrows.
 - **What a closure can see.** It reads the variables it names from where it's written, and
   can't change them. A plain closure **borrows** them: it can be called, bound with `let`, or
   passed to a function, but not stored, returned, sent or put in a `var`, so it can never
@@ -318,8 +321,7 @@ fn main():
 - **Calling**: `f(x)`, `h.handler(req)`, `routes[path](req)`, `make()(x)`. A function value that
   throws is handled like any call that can fail: `f(x)?`, `f(x) else d`, `match f(x):`.
 - **Named functions as values**: `let f = double`, `apply(double, 3)`, `util.parse`. A function
-  with `var` parameters, or one that fails with typed errors (`throws E`), can't be a value; wrap
-  it in a closure. A generic function becomes a value given a type:
+  that fails with typed errors (`throws E`) can't be a value; wrap it in a closure. A generic function becomes a value given a type:
   `let f: fn(Int) -> Int = identity`.
 - A closure that captures a capability (`os`, `net`) carries it: whoever holds the closure can
   use that capability through it.

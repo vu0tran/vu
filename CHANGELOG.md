@@ -2572,3 +2572,17 @@ table is rolled back, the fixed file, an edited one (refused), and two instances
 (one applies the new file, the other waits and applies nothing). `vu new api` now writes
 `migrations/001_init.sql`, and `run_auth.sh` tests the project `vu new api` writes rather than the
 template's source.
+
+**Function values can take `var` parameters.** The templates named their routes in an enum and
+dispatched in one function, because a handler couldn't be a `fn(Net, Os, var pg.Db, ...)` value. The
+rule against it protected one thing: a closure that borrows a variable must not also be handed that
+variable with `&`, or there would be two ways to change it. An own closure has its own copies of what
+it captures, and a named function captures nothing, so only borrowing closures were ever a risk.
+Function types now have `var` parameters (`fn(var pg.Db, Str) -> Int`), named functions with `var`
+parameters are values, and closures can declare `var` parameters when they're `own fn`. Calls pass
+`&` and get the same exclusive-access checks as calls to named functions. Targeted test 734 runs
+named functions, own closures, a generic `apply[T](f: fn(var T), var x: T)`, a list of handlers and
+a `Shared` closure; 735-739 refuse a borrowing closure with a `var` parameter, a missing `&`, a
+`fn(var Int)` where `fn(Int)` is expected, the same variable passed twice, and an own closure
+handed what it captured (moved). Test 462, which checked the old refusal, now checks the call. `vu
+new api` and `examples/saas` route to handlers with `route(net, os, env, me)`, with no enum.

@@ -999,6 +999,10 @@ fn parse_type(var p: Parser) -> Str:
       if at(p, "name") and p.toks[p.i].v == "own" and not (peek_k(p, 1) == "op" and (peek_v(p, 1) == "," or peek_v(p, 1) == ")")):
         advance(&p)
         ps.push("^" + parse_type(&p))
+      elif at_kw(p, "var"):
+        # fn(var T): the function may change that argument, passed with '&' (&T in the type text)
+        advance(&p)
+        ps.push("&" + parse_type(&p))
       else:
         ps.push(parse_type(&p))
       if not accept_op(&p, ","): break
@@ -1102,8 +1106,10 @@ fn parse_closure(var p: Parser, own: Bool, named: Bool) -> Node:
   expect_tok(&p, "op", "(", "")
   var ps = new_node(&p, "params", ln)
   while not at_op(p, ")"):
+    var var_p = false
     if at_kw(p, "var"):
-      report(p.ctx, cur_line(p), "a closure's parameters can't be 'var' (a function value can't change its caller's variables); return the new value instead")
+      advance(&p)
+      var_p = true
     var own_p = false
     if at(p, "name") and p.toks[p.i].v == "own" and peek_k(p, 1) == "name":
       advance(&p)
@@ -1112,6 +1118,7 @@ fn parse_closure(var p: Parser, own: Bool, named: Bool) -> Node:
     var pn = new_node(&p, "param", nt.line)
     pn.name = nt.v
     pn.flag2 = own_p
+    pn.flag = var_p
     if accept_op(&p, ":"): pn.ty = parse_type(&p)
     elif named: report(p.ctx, nt.line, "missing type for '" + nt.v + "' (write '" + nt.v + ": Type')")
     ps.kids.push(pn)
@@ -2256,6 +2263,7 @@ fn tn(t: Str) -> Str:
   if t.len == 0: return t
   if t[0] == '!': return tn(t[1..t.len])
   if t[0] == '^': return "own " + tn(t[1..t.len])
+  if t[0] == '&': return "var " + tn(t[1..t.len])
   if t[t.len - 1] == '?':
     let inner = t[0..t.len - 1]
     if inner.len > 0 and inner[0] == '<': return "(" + tn(inner) + ")?"
@@ -2306,6 +2314,7 @@ fn ct(g: G, t: Str) -> Str:
 
 fn mg(g: G, t: Str) -> Str:
   if t.len > 0 and t[0] == '^': return "W_" + mg(g, t[1..t.len])   # an own parameter of a function type
+  if t.len > 0 and t[0] == '&': return "V_" + mg(g, t[1..t.len])   # a var parameter of a function type
   let k = tkind(g, t)
   if k == "int" or k == "float" or k == "bool" or k == "byte" or k == "str": return t
   if k == "cap": return "Cap"
@@ -2410,12 +2419,14 @@ fn by_value(g: G, t: Str) -> Bool:
 
 fn pdecl(g: G, t: Str, name: Str) -> Str:
   if t.len > 0 and t[0] == '^': return ct(g, t[1..t.len]) + " " + name   # own: passed by value, freed by the callee
+  if t.len > 0 and t[0] == '&': return ct(g, t[1..t.len]) + " *" + name  # var: a pointer to the caller's variable
   if by_value(g, t): return ct(g, t) + " " + name
   return ct(g, t) + " *" + name
 
 fn resolve(var g: G, t: Str, line: Int) -> Str:
   if t in g.tenv: return g.tenv[t] + ""
   if t.len > 0 and t[0] == '^': return "^" + resolve(&g, t[1..t.len], line)
+  if t.len > 0 and t[0] == '&': return "&" + resolve(&g, t[1..t.len], line)
   if t in g.gtype_nodes: err(g, line, disp(t) + " takes type arguments: " + disp(t) + "[" + join(g.gtype_nodes[t].names, ", ") + "]")
   let k = tkind(g, t)
   if k == "gapp":
@@ -3181,7 +3192,7 @@ fn has_str(xs: [Str], s: Str) -> Bool:
 # Binds the type parameters (tps) in type syntax syn to the parts of type actual that they stand for.
 fn unify(g: G, syn: Str, actual: Str, tps: [Str], var b: {Str: Str}):
   if actual == "" or actual == "~nil": return
-  if syn.len > 0 and syn[0] == '^' and actual.len > 0 and actual[0] == '^':
+  if syn.len > 0 and (syn[0] == '^' or syn[0] == '&') and actual.len > 0 and actual[0] == syn[0]:
     unify(g, syn[1..syn.len], actual[1..actual.len], tps, &b)
     return
   if has_str(tps, syn):
@@ -4857,20 +4868,31 @@ fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Boo
     let pname = e.kids[0].kids[i].name + ""
     let pline = e.kids[0].kids[i].line
     let wrote_own = e.kids[0].kids[i].flag2
+    let wrote_var = e.kids[0].kids[i].flag
+    # a var parameter is a pointer to the caller's variable: a closure that borrows variables could
+    # be handed one of them, so only an own closure (which has its own copies) may take one
+    if wrote_var and not e.flag2: err(g, pline, "a closure with a 'var' parameter must be 'own fn' (a closure that borrows variables could be passed one of them with '&')")
     var t = ""
     if e.kids[0].kids[i].ty != "":
       t = resolve(&g, e.kids[0].kids[i].ty, pline)
       if wrote_own: t = "^" + t
+      if wrote_var: t = "&" + t
       if has_exp and t != ef.params[i]:
+        if ef.params[i] == "&" + t: err(g, pline, "a " + tn(expect) + " lets the function change its parameter " + pname + ": write 'var " + pname + "'")
+        if t == "&" + ef.params[i]: err(g, pline, "a " + tn(expect) + " doesn't let the function change parameter " + pname + " (it isn't 'var')")
         if ef.params[i] == "^" + t: err(g, pline, "a " + tn(expect) + " gives its parameter " + pname + " to the function to own: write 'own " + pname + "'")
         if t == "^" + ef.params[i]: err(g, pline, "a " + tn(expect) + " lends parameter " + pname + " (it isn't 'own')")
         err(g, pline, "parameter '" + pname + "' is a " + tn(t) + ", but a " + tn(expect) + " passes a " + tn(ef.params[i]))
     elif has_exp:
       t = ef.params[i] + ""
       if wrote_own and t[0] != '^': err(g, pline, "a " + tn(expect) + " lends parameter " + pname + " (it isn't 'own')")
+      if wrote_var and t[0] != '&': err(g, pline, "a " + tn(expect) + " doesn't let the function change parameter " + pname + " (it isn't 'var')")
+      if t.len > 0 and t[0] == '&' and not wrote_var: err(g, pline, "a " + tn(expect) + " lets the function change its parameter " + pname + ": write 'var " + pname + "'")
+      if t.len > 0 and t[0] == '&' and not e.flag2: err(g, pline, "a closure with a 'var' parameter must be 'own fn' (a closure that borrows variables could be passed one of them with '&')")
     elif use_hint:
       t = hint_ps[i] + ""
       if wrote_own and (t.len == 0 or t[0] != '^'): t = "^" + t
+      if wrote_var and (t.len == 0 or t[0] != '&'): t = "&" + t
     else: err(g, pline, "give parameter '" + pname + "' a type, like fn(" + pname + ": Int) => ...; nothing here says what it is")
     ptys.push(t)
   var ret = ""
@@ -4931,6 +4953,11 @@ fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Boo
       # owned: a local the closure may change, move or return, freed at its end
       let ov = new_var(&g, pname, t[1..t.len], "v_" + pname, "local", true, false, e.kids[0].kids[i].line)
       declare(&g, ov)
+      continue
+    if t.len > 0 and t[0] == '&':
+      # var: the caller's variable, through a pointer
+      let vv = new_var(&g, pname, t[1..t.len], "v_" + pname, "param", true, true, e.kids[0].kids[i].line)
+      declare(&g, vv)
       continue
     let pv = new_var(&g, pname, t, "v_" + pname, "param", false, not by_value(g, t), e.kids[0].kids[i].line)
     declare(&g, pv)
@@ -5046,9 +5073,8 @@ fn fn_value(var g: G, e: Node, expect: Str) -> CT:
   var ps: [Str] = []
   for pa in params:
     if pa.is_const: err(g, e.line, d + "() has a const parameter ('" + pa.name + "'), so it can't be used as a value: a call through a value couldn't check that its argument is written into the program")
-    if pa.is_var:
-      err(g, e.line, d + "() has a 'var' parameter ('" + pa.name + "'), so it can't be used as a value (a function value can't change its caller's variables); wrap it in a closure: fn(...) => " + d + "(...)")
-    if pa.is_own: ps.push("^" + pa.ty)
+    if pa.is_var: ps.push("&" + pa.ty)
+    elif pa.is_own: ps.push("^" + pa.ty)
     else: ps.push(pa.ty + "")
   if name in g.fn_err: err(g, e.line, d + "() fails with " + tn(g.fn_err[name]) + " values, and a function value fails with a message; wrap it in a closure that turns the error into a message")
   if not has_str(g.thunks, name): g.thunks.push(name + "")
@@ -5096,6 +5122,7 @@ fn call_value(var g: G, e: Node, allow_throw: Bool) -> CT:
   for i in 0..ft.params.len:
     let pt = ft.params[i]
     if pt.len > 0 and pt[0] == '^': params.push(Param("#{i + 1}", pt[1..pt.len], false, e.line, true, false))
+    elif pt.len > 0 and pt[0] == '&': params.push(Param("#{i + 1}", pt[1..pt.len], true, e.line, false, false))
     else: params.push(Param("#{i + 1}", pt + "", false, e.line, false, false))
   var croot = -1
   if r.p.ok: croot = r.p.root
@@ -9541,7 +9568,7 @@ fn build(var g: G, items: [Node]) -> Str:
       if r == "void": rk = ""
       out.push("static inline " + r + " vu_call_" + mg(g, t) + "(vu_fn f" + decl + ") {{ " + rk + "((" + r + " (*)(void *" + ps + "))f.fn)(f.env" + cargs + "); }}")
       # (a sort key, fn(T) -> Int/Float/Byte/Bool/Str, as xs.sort(key: ...) calls it)
-      if f.params.len == 1 and f.params[0][0] != '^' and not f.fails and (f.ret == "Int" or f.ret == "Float" or f.ret == "Byte" or f.ret == "Bool" or f.ret == "Str"):
+      if f.params.len == 1 and f.params[0][0] != '^' and f.params[0][0] != '&' and not f.fails and (f.ret == "Int" or f.ret == "Float" or f.ret == "Byte" or f.ret == "Bool" or f.ret == "Str"):
         let kt = f.params[0]
         var x = "(" + ct(g, kt) + " *)x"
         var y = "(" + ct(g, kt) + " *)y"
@@ -9554,7 +9581,7 @@ fn build(var g: G, items: [Node]) -> Str:
         else:
           out.push("static inline bool vu_keyless_" + mg(g, t) + "(void *ctx, const void *x, const void *y) {{ return " + call + x + ") < " + call + y + "); }}")
       # (a comparison, fn(T, T) -> Bool, as xs.sort(by: ...) calls it)
-      if f.params.len == 2 and f.params[0] == f.params[1] and f.params[0][0] != '^' and f.ret == "Bool" and not f.fails:
+      if f.params.len == 2 and f.params[0] == f.params[1] and f.params[0][0] != '^' and f.params[0][0] != '&' and f.ret == "Bool" and not f.fails:
         let pt = f.params[0]
         var x = "(" + ct(g, pt) + " *)x"
         var y = "(" + ct(g, pt) + " *)y"
@@ -21785,32 +21812,17 @@ fn new_api_main() -> Str:
   s += "  eprint(\"database: \" + pg.describe(e))\n"
   s += "  return error(500, \"database error\")\n"
   s += "\n"
-  s += "# The routes that use the database for the whole request. A handler gets a connection with &db:\n"
-  s += "# function values can't take var parameters, so the routes are named here and handle() calls the one\n"
-  s += "# asked for. (Signing up and in take connections themselves: see signup.)\n"
-  s += "type Api:\n"
-  s += "  Logout\n"
-  s += "  Me\n"
-  s += "  Notes\n"
-  s += "  AddNote\n"
-  s += "  DeleteNote\n"
+  s += "# The route for a handler that uses the database for the whole request: it takes a connection from the pool, passes it to the handler with &db, and gives it back.\n"
+  s += "# (Signing up and in take connections themselves: see signup.)\n"
+  s += "fn route(net: Net, os: Os, env: Shared[Env], own f: fn(Net, Os, var pg.Db, http.Request, web.Ctx) -> http.Response) -> fn(http.Request, web.Ctx) -> http.Response:\n"
+  s += "  let e = env.share()\n"
+  s += "  return own fn(req: http.Request, c: web.Ctx) => with_db(net, os, e, f, req, c)\n"
   s += "\n"
-  s += "# Takes a connection for one request, runs the route's handler, and gives the connection back.\n"
-  s += "fn handle(net: Net, os: Os, env: Shared[Env], api: Api, req: http.Request, c: web.Ctx) -> http.Response:\n"
+  s += "fn with_db(net: Net, os: Os, env: Shared[Env], f: fn(Net, Os, var pg.Db, http.Request, web.Ctx) -> http.Response, req: http.Request, c: web.Ctx) -> http.Response:\n"
   s += "  var db = env.value.pool.recv() else return error(503, \"no database connection\")\n"
-  s += "  var resp = error(500, \"\")\n"
-  s += "  match api:\n"
-  s += "    Logout: resp = logout(net, &db, req)\n"
-  s += "    Me: resp = me(net, os, &db, req)\n"
-  s += "    Notes: resp = notes(net, os, &db, req)\n"
-  s += "    AddNote: resp = add_note(net, os, &db, req)\n"
-  s += "    DeleteNote: resp = delete_note(net, os, &db, req, c)\n"
+  s += "  let resp = f(net, os, &db, req, c)\n"
   s += "  pg.give_back(net, env.value.pool, db, env.value.cfg)\n"
   s += "  return resp\n"
-  s += "\n"
-  s += "fn route(net: Net, os: Os, env: Shared[Env], api: Api) -> fn(http.Request, web.Ctx) -> http.Response:\n"
-  s += "  let e = env.share()\n"
-  s += "  return own fn(req: http.Request, c: web.Ctx) => handle(net, os, e, api, req, c)\n"
   s += "\n"
   s += "fn on(net: Net, os: Os, env: Shared[Env], own f: fn(Net, Os, Shared[Env], http.Request) -> http.Response) -> fn(http.Request, web.Ctx) -> http.Response:\n"
   s += "  let e = env.share()\n"
@@ -21880,26 +21892,26 @@ fn new_api_main() -> Str:
   s += "  pg.give_back(net, env.value.pool, db2, env.value.cfg)\n"
   s += "  return resp\n"
   s += "\n"
-  s += "fn logout(net: Net, var db: pg.Db, req: http.Request) -> http.Response:\n"
+  s += "fn logout(net: Net, os: Os, var db: pg.Db, req: http.Request, c: web.Ctx) -> http.Response:\n"
   s += "  auth.logout(net, &db, req) else return error(500, \"database error\")\n"
   s += "  var resp = http.Response(204, [], \"\")\n"
   s += "  auth.clear_session(&resp)\n"
   s += "  return resp\n"
   s += "\n"
-  s += "fn me(net: Net, os: Os, var db: pg.Db, req: http.Request) -> http.Response:\n"
+  s += "fn me(net: Net, os: Os, var db: pg.Db, req: http.Request, c: web.Ctx) -> http.Response:\n"
   s += "  let uid = auth.current_user(net, &db, os, req) else return error(500, \"database error\")\n"
   s += "  let id = uid else return error(401, \"sign in first\")\n"
   s += "  let rows = pg.query(net, &db, \"select email from users where id = $1\", [id]) else return error(500, \"database error\")\n"
   s += "  if rows.rows.len == 0: return error(401, \"sign in first\")\n"
   s += "  return http.json(200, \"{{{{\\\"id\\\": {{id}}, \\\"email\\\": \" + json.quote(pg.text(rows, 0, \"email\") else \"\") + \"}}}}\")\n"
   s += "\n"
-  s += "fn notes(net: Net, os: Os, var db: pg.Db, req: http.Request) -> http.Response:\n"
+  s += "fn notes(net: Net, os: Os, var db: pg.Db, req: http.Request, c: web.Ctx) -> http.Response:\n"
   s += "  let uid = auth.current_user(net, &db, os, req) else return error(500, \"database error\")\n"
   s += "  let id = uid else return error(401, \"sign in first\")\n"
   s += "  let rows = pg.query(net, &db, \"select coalesce(json_agg(json_build_object('id', id, 'text', text, 'created', created) order by id), '[]')::text as list from notes where user_id = $1\", [id]) else return error(500, \"database error\")\n"
   s += "  return http.json(200, pg.text(rows, 0, \"list\") else \"[]\")\n"
   s += "\n"
-  s += "fn add_note(net: Net, os: Os, var db: pg.Db, req: http.Request) -> http.Response:\n"
+  s += "fn add_note(net: Net, os: Os, var db: pg.Db, req: http.Request, c: web.Ctx) -> http.Response:\n"
   s += "  let uid = auth.current_user(net, &db, os, req) else return error(500, \"database error\")\n"
   s += "  let id = uid else return error(401, \"sign in first\")\n"
   s += "  let body = from_json(req.body, NewNote) else return error(400, \"expected {{{{\\\"text\\\": ...}}}}\")\n"
@@ -21944,11 +21956,11 @@ fn new_api_main() -> Str:
   s += "  web.get(&app, \"/health\", health)\n"
   s += "  web.post(&app, \"/signup\", on(net, os, env, signup))\n"
   s += "  web.post(&app, \"/login\", on(net, os, env, login))\n"
-  s += "  web.post(&app, \"/logout\", route(net, os, env, Logout))\n"
-  s += "  web.get(&app, \"/me\", route(net, os, env, Me))\n"
-  s += "  web.get(&app, \"/notes\", route(net, os, env, Notes))\n"
-  s += "  web.post(&app, \"/notes\", route(net, os, env, AddNote))\n"
-  s += "  web.delete(&app, \"/notes/:id\", route(net, os, env, DeleteNote))\n"
+  s += "  web.post(&app, \"/logout\", route(net, os, env, logout))\n"
+  s += "  web.get(&app, \"/me\", route(net, os, env, me))\n"
+  s += "  web.get(&app, \"/notes\", route(net, os, env, notes))\n"
+  s += "  web.post(&app, \"/notes\", route(net, os, env, add_note))\n"
+  s += "  web.delete(&app, \"/notes/:id\", route(net, os, env, delete_note))\n"
   s += "  print(\"listening on http://localhost:{{port}}\")\n"
   s += "  web.serve(net, os, app, port)?\n"
   return s
