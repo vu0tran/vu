@@ -2727,3 +2727,16 @@ within noise of each other. So the prepared-statement cache I'd planned isn't wo
 one, and it isn't faster here). Reading many rows is where a client's own code shows, and there Vu is
 2.6 times faster than asyncpg and 5 times faster than node-postgres. Go's pgx wasn't measured: its
 module proxy can't be reached from this machine.
+
+**COPY and LISTEN/NOTIFY.** `pg.copy_in` loads rows with `COPY ... FROM STDIN`, escaping each value
+for the text format, and `pg.copy_out` returns `COPY ... TO STDOUT`'s output. `run_pg.sh` loads
+100,000 rows whose names hold tabs, newlines, carriage returns, backslashes, `\N`, `\.`, quotes,
+commas, Unicode and NULLs, and reads every one back unchanged with `query_as`: 0.20 s, where 10,000
+single inserts took 1.18 s in the benchmark. A value with a zero byte is refused before anything is
+sent; a duplicate key gets the server's error, loads nothing, and leaves the connection usable.
+`pg.listen`, `pg.notify` and `pg.wait_note` carry notifications between connections. The test
+checks Unicode payloads, a timeout with nothing, notifications that arrive while the listening
+connection runs a query (kept and given in order), one sent in a transaction that rolls back
+(never delivered) and one that commits (delivered after the commit, not before), `unlisten`, 1,000
+in a row in order, and a channel name with SQL in it (refused). Both features passed on their first
+run, plain and under the sanitizers.

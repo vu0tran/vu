@@ -35,6 +35,13 @@ type Db:
   at: Int
   timeout: Float
   broken: Bool     # the connection failed or the protocol went wrong: it can't be used again
+  notes: [Note]    # notifications (LISTEN) that arrived while waiting for something else
+
+# A notification from NOTIFY (or pg_notify) on a channel this connection listens on.
+type Note:
+  channel: Str
+  payload: Str
+  pid: Int         # the server process that sent it
 
 type Rows:
   columns: [Str]
@@ -207,7 +214,22 @@ type Msg:
   kind: Byte
   body: Str
 
+# The next message, keeping notifications that arrive in the meantime for wait_note.
 fn next_msg(net: Net, var db: Db) -> Msg throws Error:
+  while true:
+    let m = next_any(net, &db, db.timeout, false)?
+    if m.kind != 'A': return m
+    db.notes.push(note_of(m.body))
+
+fn note_of(body: Str) -> Note:
+  if body.len < 4: return Note("", "", 0)
+  let ch = cstr_at(body, 4)
+  let pl = cstr_at(body, ch.next)
+  return Note(ch.text, pl.text, rd32(body, 0))
+
+# The next message of any kind. quiet: a timeout isn't an error (the connection stays usable; the
+# result is a message of kind 0).
+fn next_any(net: Net, var db: Db, timeout: Float, quiet: Bool) -> Msg throws Error:
   while true:
     let avail = db.buf.len - db.at
     if avail >= 5:
@@ -226,13 +248,14 @@ fn next_msg(net: Net, var db: Db) -> Msg throws Error:
     if db.at > 0:
       db.buf = db.buf[db.at..db.buf.len]
       db.at = 0
-    match net.recv(db.conn, timeout: db.timeout):
+    match net.recv(db.conn, timeout: timeout):
       ok(data):
         if data.len == 0:
           db.broken = true
           fail Network("the server closed the connection")
         db.buf += data
       err(e):
+        if quiet and e == "timed out": return Msg(0, "")
         db.broken = true
         fail Network(e)
 
@@ -264,7 +287,7 @@ fn describe(e: Error) -> Str:
 # Connects and signs in. It fails with a message (see describe).
 fn connect(net: Net, cfg: Config) -> Db throws:
   if has_nul(cfg.user) or has_nul(cfg.database) or has_nul(cfg.password): fail "the user, password and database can't contain a zero byte"
-  var db = Db(net.connect(cfg.host, cfg.port, timeout: cfg.timeout)?, "", 0, cfg.timeout, false)
+  var db = Db(net.connect(cfg.host, cfg.port, timeout: cfg.timeout)?, "", 0, cfg.timeout, false, [])
   if cfg.tls:
     # SSLRequest; the server answers one byte: 'S' to start TLS, 'N' if it doesn't do TLS
     net.send(db.conn, be32(8) + be32(80877103), timeout: cfg.timeout)?
@@ -379,6 +402,134 @@ fn query(net: Net, var db: Db, const sql: Str, params: [Str?]) -> Rows throws Er
   let out = msg('P', "\0" + sql + "\0" + be16(0)) + msg('B', bind) + msg('D', "P\0") + msg('E', "\0" + be32(0)) + msg('S', "")
   send_all(net, &db, out)?
   return read_rows(net, &db)?
+
+# ---- COPY
+
+# Loads rows fast with COPY ... FROM STDIN (text format): many times quicker than an insert per row.
+# The SQL names the table and columns; each row has a value (nil for NULL) per column. Gives the
+# number of rows loaded. If anything fails, nothing is loaded.
+#   pg.copy_in(net, &db, "copy items (id, name) from stdin", [["1", "one"], ["2", nil]])?
+fn copy_in(net: Net, var db: Db, const sql: Str, rows: [[Str?]]) -> Int throws Error:
+  if db.broken: fail Protocol("this connection failed earlier; connect again")
+  if has_nul(sql): fail Protocol("the SQL text contains a zero byte")
+  for row in rows:
+    for v in row:
+      if x = v:
+        if has_nul(x): fail Protocol("a value contains a zero byte, which PostgreSQL text can't hold")
+  send_all(net, &db, msg('Q', sql + "\0"))?
+  # the server answers CopyInResponse (G), or an error
+  var failed = false
+  var ferr = Protocol("")
+  while true:
+    let m = next_msg(net, &db)?
+    if m.kind == 'G': break
+    if m.kind == 'E':
+      failed = true
+      ferr = server_error(m.body)
+    if m.kind == 'Z':
+      if failed: fail ferr
+      fail Protocol("the statement isn't COPY ... FROM STDIN")
+  # rows go in batches of about 64 KB of CopyData (d)
+  var batch = ""
+  for row in rows:
+    var line = ""
+    for i in 0..row.len:
+      if i > 0: line += "\t"
+      if v = row[i]: line += copy_escape(v)
+      else: line += "\\N"
+    batch += line + "\n"
+    if batch.len > 65536:
+      send_all(net, &db, msg('d', batch))?
+      batch = ""
+  if batch != "": send_all(net, &db, msg('d', batch))?
+  send_all(net, &db, msg('c', ""))?
+  let r = read_rows(net, &db)?
+  return r.affected
+
+# The text format's escapes: backslash, tab, newline and carriage return.
+fn copy_escape(v: Str) -> Str:
+  var plain = true
+  for i in 0..v.len:
+    let b = v[i]
+    if b == '\\' or b == '\t' or b == '\n' or b == '\r': plain = false
+  if plain: return v + ""
+  var out: [Byte] = []
+  for i in 0..v.len:
+    let b = v[i]
+    if b == '\\':
+      out.push('\\')
+      out.push('\\')
+    elif b == '\t':
+      out.push('\\')
+      out.push('t')
+    elif b == '\n':
+      out.push('\\')
+      out.push('n')
+    elif b == '\r':
+      out.push('\\')
+      out.push('r')
+    else: out.push(b)
+  return str(out)
+
+# Runs COPY ... TO STDOUT and gives its output as it is (in the format the SQL asks for: text by
+# default, or "with (format csv, header)").
+fn copy_out(net: Net, var db: Db, const sql: Str) -> Str throws Error:
+  if db.broken: fail Protocol("this connection failed earlier; connect again")
+  if has_nul(sql): fail Protocol("the SQL text contains a zero byte")
+  send_all(net, &db, msg('Q', sql + "\0"))?
+  var out = ""
+  var failed = false
+  var ferr = Protocol("")
+  while true:
+    let m = next_msg(net, &db)?
+    if m.kind == 'd': out += m.body
+    elif m.kind == 'E':
+      failed = true
+      ferr = server_error(m.body)
+    elif m.kind == 'Z':
+      if failed: fail ferr
+      return out
+
+# ---- LISTEN / NOTIFY
+
+# Starts listening on a channel (a name of letters, digits and _): notifications sent to it, by any
+# connection, come to this one, and wait_note gives them. A connection that listens is best kept for
+# that (out of the pool): notifications wait in it until read.
+fn listen(net: Net, var db: Db, channel: Str) throws Error:
+  check_channel(channel)?
+  run_sql(net, &db, "listen \"" + channel + "\"")?
+
+fn unlisten(net: Net, var db: Db, channel: Str) throws Error:
+  check_channel(channel)?
+  run_sql(net, &db, "unlisten \"" + channel + "\"")?
+
+fn check_channel(channel: Str) throws Error:
+  if channel.len == 0 or channel.len > 63: fail Protocol("a channel's name has 1 to 63 characters")
+  for i in 0..channel.len:
+    let b = channel[i]
+    if not ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_'):
+      fail Protocol("a channel's name is letters, digits and _, not '{channel}'")
+
+# Sends a notification (delivered when the transaction it's in commits; at once outside one).
+fn notify(net: Net, var db: Db, channel: Str, payload: Str) throws Error:
+  check_channel(channel)?
+  exec(net, &db, "select pg_notify($1, $2)", [channel, payload])?
+
+# The next notification, waiting up to `timeout` seconds for one; nil if none came.
+fn wait_note(net: Net, var db: Db, timeout: Float) -> Note? throws Error:
+  if db.broken: fail Protocol("this connection failed earlier; connect again")
+  if db.notes.len > 0:
+    var rest: [Note] = []
+    for i in 1..db.notes.len: rest.push(Note(db.notes[i].channel + "", db.notes[i].payload + "", db.notes[i].pid))
+    let first = Note(db.notes[0].channel + "", db.notes[0].payload + "", db.notes[0].pid)
+    db.notes = rest
+    return first
+  while true:
+    let m = next_any(net, &db, timeout, true)?
+    if m.kind == 0: return nil
+    if m.kind == 'A': return note_of(m.body)
+    if m.kind == 'E': fail server_error(m.body)
+    # anything else between queries (a notice, a parameter's new value) is skipped
 
 # ---- typed rows
 

@@ -1608,8 +1608,17 @@ let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows
   passed on).
 - One query at a time per connection. For several tasks, `pg.pool(net, cfg, n)?` opens n connections
   in a `Chan[pg.Db]`: take one with `recv()`, and return it with `pg.give_back(net, pool, db, cfg)`,
-  which replaces a connection that broke (a database restart) with a new one. Not yet: `COPY`,
-  `LISTEN`/`NOTIFY`, MD5 passwords.
+  which replaces a connection that broke (a database restart) with a new one. Not yet: MD5
+  passwords, binary results.
+- **COPY**: `pg.copy_in(net, &db, "copy items (id, name) from stdin", rows)?` loads a `[[Str?]]` (nil
+  is NULL) in one go, escaped for COPY's text format, and gives the count; nothing is loaded if
+  anything fails. 100,000 rows take 0.2 s here, against 1.2 s for 10,000 single inserts.
+  `pg.copy_out(net, &db, "copy (...) to stdout with (format csv, header)")?` gives the output.
+- **LISTEN/NOTIFY**: `pg.listen(net, &db, "events")?` on a connection kept for it, then
+  `let n = pg.wait_note(net, &db, 30.0)?` gives the next `pg.Note` (`channel`, `payload`, `pid`) or
+  nil after the timeout; notifications that arrive while that connection runs a query are kept, in
+  order. `pg.notify(net, &db, channel, payload)?` sends one (at commit, inside a transaction).
+  Channel names are letters, digits and `_`.
   `tests/run_pg.sh` runs it against a real PostgreSQL.
 
 **`auth`**: passwords, sessions and CSRF tokens, for apps with accounts.

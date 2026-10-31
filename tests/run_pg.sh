@@ -58,5 +58,19 @@ for flags in "" "--san"; do
   if [ "$got" = "$TYPED_WANT" ] && [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/err"; then pass=$((pass+1)); echo "ok    pg/typed.vu ${flags:-optimized}"
   else fail=$((fail+1)); echo "FAIL  pg/typed.vu ${flags:-optimized} (exit $rc)"; diff <(echo "$TYPED_WANT") <(echo "$got") | head -20; head -5 "$work/err"; fi
 done
+NOTIFY_WANT='none | events:hello é 😀 | 42 | events:one | Other_2:two | none | none | events:committed | none | 1000 in order | protocol: a channel'"'"'s name is letters, digits and _, not '"'"'bad name; drop table x'"'"''
+COPY_WANT='loaded 100000, read 100000, 0 different | protocol: a value contains a zero byte, which PostgreSQL text can'"'"'t hold | count 100000 | server: duplicate key value violates unique constraint "copied_pkey" (Key (id)=(5) already exists., SQLSTATE 23505) | count 100000 | protocol: the statement isn'"'"'t COPY ... FROM STDIN | id,name/1,tab	here 1/2,"new/line 2"/10,/'
+for flags in "" "--san"; do
+  if ! $VU build pg/copy.vu $flags -o "$work/copy" 2>"$work/err"; then fail=$((fail+1)); echo "FAIL  build copy $flags"; cat "$work/err"; continue; fi
+  got=$("$work/copy" "$port" 2>"$work/err"); rc=$?
+  if [ "$got" = "$COPY_WANT" ] && [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/err"; then pass=$((pass+1)); echo "ok    pg/copy.vu ${flags:-optimized} ($(grep 'copy of' "$work/err"))"
+  else fail=$((fail+1)); echo "FAIL  pg/copy.vu ${flags:-optimized} (exit $rc)"; diff <(echo "$COPY_WANT") <(echo "$got") | head -20; head -5 "$work/err"; fi
+done
+for flags in "" "--san"; do
+  if ! $VU build pg/notify.vu $flags -o "$work/notify" 2>"$work/err"; then fail=$((fail+1)); echo "FAIL  build notify $flags"; cat "$work/err"; continue; fi
+  got=$("$work/notify" "$port" 2>"$work/err"); rc=$?
+  if [ "$got" = "$NOTIFY_WANT" ] && [ $rc -eq 0 ] && ! grep -q 'ERROR\|runtime error' "$work/err"; then pass=$((pass+1)); echo "ok    pg/notify.vu ${flags:-optimized}"
+  else fail=$((fail+1)); echo "FAIL  pg/notify.vu ${flags:-optimized} (exit $rc)"; diff <(echo "$NOTIFY_WANT") <(echo "$got") | head -20; head -5 "$work/err"; fi
+done
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]
