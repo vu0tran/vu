@@ -2710,3 +2710,20 @@ Every field of every row came back equal. It also checks no rows, `one_as` with 
 and UPDATE ... RETURNING, a field of the wrong type and a missing column (`from_json`'s messages, with
 the field), and a server error (`describe`'s message). Writing the test turned up one surprise:
 timestamps come in the session's time zone (the test sets UTC), now said in the docs.
+
+**How fast it is.** `bench/pg/run.sh` runs the same three workloads in Vu's `pg`, Python's asyncpg
+0.31 and psycopg 3.3, and Node's pg 8.16 against one PostgreSQL 16 on this machine (2 cores, fsync
+off, best of 3):
+
+| client | 20,000 point selects | one 200,000-row select | 10,000 inserts |
+|---|---|---|---|
+| Vu pg | 2.89 s | 0.14 s | 1.18 s |
+| asyncpg | 2.92 s | 0.36 s | 1.59 s |
+| psycopg 3 | 2.85 s | 0.44 s | 1.41 s |
+| node pg | 4.06 s | 0.71 s | 1.65 s |
+
+Point selects are a round trip each, and the server's time sets the pace: the three fastest are
+within noise of each other. So the prepared-statement cache I'd planned isn't worth it (asyncpg has
+one, and it isn't faster here). Reading many rows is where a client's own code shows, and there Vu is
+2.6 times faster than asyncpg and 5 times faster than node-postgres. Go's pgx wasn't measured: its
+module proxy can't be reached from this machine.
