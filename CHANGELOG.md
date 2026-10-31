@@ -2820,3 +2820,19 @@ half reads, but where Vu sleeps in `epoll_wait` until the answer comes, Go's run
 spinning (17,856 `nanosleep` and 4,473 `futex` calls for the run), so it notices the answer sooner,
 at the cost of 15 s of system time against Vu's 1 s. Not copied, for now.
 
+
+**Under concurrency.** One query at a time measures how soon a client notices each answer, which is
+what Go's spinning threads buy. A server runs many at once, so `bench/pg/concurrent.sh` has WORKERS
+tasks (Vu) or goroutines (Go, with pgxpool) share a pool of CONNS connections and run 100,000 point
+selects between them, taking a connection for each query as a web handler does. It reports queries a
+second and the client's CPU time per 1,000 queries (best of 3; both clients' checksums agree; the
+client shares this machine's 2 cores with PostgreSQL, so the CPU it uses the server doesn't get):
+
+| workers, connections | Vu pg | Go pgx 5.7.6 (pgxpool) |
+|---|---|---|
+| 10, 10 | 35,469 /s, 16.1 ms CPU | 34,734 /s, 19.8 ms CPU |
+| 50, 10 | 30,697 /s, 18.1 ms CPU | 24,347 /s, 27.0 ms CPU |
+| 200, 20 | 30,308 /s, 17.2 ms CPU | 27,483 /s, 24.5 ms CPU |
+
+Vu ties Go with a connection per worker and is 1.1 to 1.26 times faster when workers wait for
+connections, using 18 to 33% less CPU per query in every case. Measured on one 2-core machine only.
