@@ -2615,3 +2615,8 @@ APIs. I compared the requests with what the official Python libraries (anthropic
 the same conversation, by pointing them at a small server: the same paths and JSON bodies. OpenAI's
 reasoning models get `max_completion_tokens` with `m.limit_field`. Not yet: streaming, tool calls,
 images.
+
+**`pg.transaction`**, now that a function value can take `var db: pg.Db`: it runs the function
+between `begin` and `commit`, or rolls back and passes the error on. `run_jobs.sh` moves money
+between two rows twice; the second would overdraw, fails, and leaves both rows as the first left
+them.

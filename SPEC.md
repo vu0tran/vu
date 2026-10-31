@@ -1578,6 +1578,9 @@ let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows
   `require`, `verify-ca` or `verify-full` turns on TLS (always checking the certificate).
 - `pg.run_sql(net, &db, sql)?` runs SQL that can't be written in the program (a migration file, a
   console): several statements, no parameters, the last one's rows. Never build it from values.
+- `pg.transaction(net, &db, own fn(var tx: pg.Db) throws => transfer(net, &tx, a, b)?)?` runs a
+  function in a transaction: committed when it succeeds, rolled back when it fails (and its error
+  passed on).
 - One query at a time per connection. For several tasks, `pg.pool(net, cfg, n)?` opens n connections
   in a `Chan[pg.Db]`: take one with `recv()`, and return it with `pg.give_back(net, pool, db, cfg)`,
   which replaces a connection that broke (a database restart) with a new one. Not yet: `COPY`,
