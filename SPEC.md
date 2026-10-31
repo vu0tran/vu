@@ -1613,6 +1613,25 @@ auth.logout(net, &db, req)?                          # and auth.clear_session(&r
 - `tests/run_auth.sh` checks the hashes against Django (both ways), malformed hashes, tokens, CSRF and
   cookies, the sessions in a real PostgreSQL, and that app over HTTP, plain and under the sanitizers.
 
+**`ai`**: language models through Anthropic's Messages API or OpenAI's Chat Completions (and the
+services compatible with it: set `m.base`).
+
+```
+import ai
+let m = ai.anthropic(os.env("ANTHROPIC_API_KEY"), "claude-sonnet-4-5")    # or ai.openai(key, "gpt-4o-mini")
+let r = ai.chat(net, os, m, "You answer in one sentence.", [ai.user(question)], 300)?
+print(r.text)                       # and r.stop, r.input_tokens, r.output_tokens
+```
+
+- A conversation alternates `ai.user(text)` and `ai.assistant(text)`; the system prompt is its own
+  argument (`""` for none). The answer's text blocks are joined; other blocks (tool calls) are
+  skipped. A busy service (429, 5xx, 529) is asked twice more, after its `Retry-After` (at most 20
+  s) or 1 s then 4 s; other refusals fail with the service's message. OpenAI models that want
+  `max_completion_tokens` instead of `max_tokens` aren't supported yet, nor streaming or tools.
+- `tests/run_ai.sh` checks the requests against a fake server: the same paths, headers and JSON
+  bodies as Anthropic's and OpenAI's Python libraries send (compared by hand), the answers, the
+  retries and the errors.
+
 **`migrate`**: database migrations from `.sql` files.
 
 ```

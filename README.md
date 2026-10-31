@@ -338,7 +338,8 @@ hashing (SHA-256, HMAC, PBKDF2) and base64, and formatting with Python's names (
   connections), and `sqlite` (through libsqlite3);
 - `auth`: password hashes compatible with Django's, sessions stored as hashes of their tokens, and
   CSRF tokens; `jobs`: background jobs in PostgreSQL, retried, shared by any number of workers; `stripe`: Checkout, API calls and webhook signatures; `s3`: objects and presigned
-  URLs on S3, R2 and the others that speak its API; `mail`: email over SMTP or Resend;
+  URLs on S3, R2 and the others that speak its API; `mail`: email over SMTP or Resend; `ai`:
+  Anthropic's and OpenAI's chat APIs, with retries;
 - `re`: regular expressions with Python's syntax, in time linear in the text, and as fast as
   Python's on most patterns (faster on many: CHANGELOG.md, round 10);
 - `zlib`: zlib, gzip and raw DEFLATE decompression, the same results as Python's `zlib` (and zlib's

@@ -1,0 +1,138 @@
+# ai: calling language models: Anthropic's Messages API and OpenAI's Chat Completions (and the many
+# services that copy it: set the base URL).
+#
+#   let m = ai.anthropic(os.env("ANTHROPIC_API_KEY"), "claude-sonnet-4-5")
+#   let r = ai.chat(net, os, m, "You answer in one sentence.", [ai.user("What is Vu?")], 300)?
+#   print(r.text)                                   # also r.stop, r.input_tokens, r.output_tokens
+#
+#   let o = ai.openai(os.env("OPENAI_API_KEY"), "gpt-4o-mini")      # same call
+#
+# A conversation is a list of messages, alternating ai.user(...) and ai.assistant(...). A busy or
+# overloaded service (429, 500, 502, 503, 504, 529) is asked again, twice, after the time it gives in
+# Retry-After (at most 20 s) or 1 s then 4 s. Other refusals fail with the service's own message.
+
+import http
+import json
+
+type Model:
+  provider: Str      # "anthropic" or "openai"
+  key: Str
+  name: Str          # the model's name
+  base: Str          # https://api.anthropic.com, https://api.openai.com/v1, or a compatible service
+  timeout: Float     # seconds for each request (120)
+
+type Msg:
+  role: Str          # "user" or "assistant"
+  content: Str
+
+type Reply:
+  text: Str
+  stop: Str          # why it stopped: Anthropic's stop_reason, or OpenAI's finish_reason
+  input_tokens: Int
+  output_tokens: Int
+
+fn anthropic(key: Str, name: Str) -> Model:
+  return Model("anthropic", key + "", name + "", "https://api.anthropic.com", 120.0)
+
+fn openai(key: Str, name: Str) -> Model:
+  return Model("openai", key + "", name + "", "https://api.openai.com/v1", 120.0)
+
+fn user(text: Str) -> Msg:
+  return Msg("user", text + "")
+
+fn assistant(text: Str) -> Msg:
+  return Msg("assistant", text + "")
+
+# ---- what the services answer (fields this doesn't use are skipped)
+
+type AUsage:
+  input_tokens: Int
+  output_tokens: Int
+
+type AReply:
+  stop_reason: Str?
+  usage: AUsage
+
+type OMessage:
+  content: Str?
+
+type OChoice:
+  message: OMessage
+  finish_reason: Str?
+
+type OUsage:
+  prompt_tokens: Int
+  completion_tokens: Int
+
+type OReply:
+  choices: [OChoice]
+  usage: OUsage
+
+fn body(m: Model, system: Str, msgs: [Msg], max_tokens: Int) -> Str:
+  var items: [Str] = []
+  if m.provider == "openai" and system != "": items.push("{{\"role\": \"system\", \"content\": " + json.quote(system) + "}}")
+  for x in msgs: items.push("{{\"role\": " + json.quote(x.role) + ", \"content\": " + json.quote(x.content) + "}}")
+  var b = "{{\"model\": " + json.quote(m.name) + ", \"max_tokens\": {max_tokens}"
+  if m.provider == "anthropic" and system != "": b += ", \"system\": " + json.quote(system)
+  return b + ", \"messages\": [" + ", ".join(items) + "]}}"
+
+fn retryable(status: Int) -> Bool:
+  return status == 429 or status == 500 or status == 502 or status == 503 or status == 504 or status == 529
+
+# Sends the conversation and gives the model's answer.
+fn chat(net: Net, os: Os, m: Model, system: Str, msgs: [Msg], max_tokens: Int) -> Reply throws:
+  if m.key == "": fail "ai: no API key"
+  if msgs.len == 0: fail "ai: no messages"
+  for x in msgs:
+    if x.role != "user" and x.role != "assistant": fail "ai: a message's role is user or assistant, not '{x.role}'"
+  var req = http.req("POST", "")
+  if m.provider == "anthropic":
+    req.url = m.base + "/v1/messages"
+    req.headers.push(http.Header("x-api-key", m.key + ""))
+    req.headers.push(http.Header("anthropic-version", "2023-06-01"))
+  elif m.provider == "openai":
+    req.url = m.base + "/chat/completions"
+    req.headers.push(http.Header("Authorization", "Bearer " + m.key))
+  else: fail "ai: the provider is anthropic or openai, not '{m.provider}'"
+  req.headers.push(http.Header("Content-Type", "application/json"))
+  req.body = body(m, system, msgs, max_tokens)
+  req.timeout = m.timeout
+  var waits = [1.0, 4.0]
+  var attempt = 0
+  while true:
+    let resp = http.send(net, req)?
+    if resp.status >= 200 and resp.status < 300: return reply(m, resp.body)?
+    if not retryable(resp.status) or attempt >= waits.len: fail "ai: " + error_text(resp)
+    var wait = waits[attempt]
+    for h in resp.headers:
+      if h.name == "retry-after":
+        let secs = float(h.value) else wait
+        if secs >= 0.0 and secs <= 20.0: wait = secs
+    os.sleep(wait)
+    attempt += 1
+
+fn reply(m: Model, text: Str) -> Reply throws:
+  if m.provider == "anthropic":
+    let r = from_json(text, AReply) else fail "ai: an answer that isn't a Messages reply"
+    # content is a list of blocks; the text ones ({"type": "text", "text": ...}) make the answer
+    let v = json.parse(text)?
+    var out = ""
+    if c = json.at(v, "content"):
+      match c:
+        json.Arr(items):
+          for b in items:
+            if (json.str_at(b, "type") else "") == "text": out += json.str_at(b, "text") else ""
+        _: out = ""
+    return Reply(out, r.stop_reason else "", r.usage.input_tokens, r.usage.output_tokens)
+  let r = from_json(text, OReply) else fail "ai: an answer that isn't a Chat Completions reply"
+  if r.choices.len == 0: fail "ai: an answer with no choices"
+  return Reply(r.choices[0].message.content else "", r.choices[0].finish_reason else "", r.usage.prompt_tokens, r.usage.completion_tokens)
+
+# The service's error message: Anthropic's and OpenAI's both put it at error.message.
+fn error_text(resp: http.Response) -> Str:
+  match json.parse(resp.body):
+    ok(v):
+      if e = json.at(v, "error"):
+        if msg = json.str_at(e, "message"): return "HTTP {resp.status}: " + msg
+    err(x): return "HTTP {resp.status}"
+  return "HTTP {resp.status}"

@@ -2606,3 +2606,11 @@ assignment (any of `=`, `+=`...) runs when the call fails, and the call's value,
 is freed. Using it where the call's value is wanted (`let n = f() else bad = true`) is refused, and
 so is `opt else x = v` on an optional (the message says to use `if v = opt`). Targeted tests
 741-743, under the sanitizers (a `Str` result is freed: LeakSanitizer reports nothing).
+
+**`std/ai`.** Most of what people build and deploy now calls a language model, so the backend
+modules include a client for Anthropic's Messages API and OpenAI's Chat Completions: a system prompt,
+a conversation, the answer's text and token counts, retries after 429/5xx/529 that follow
+`Retry-After`, and the service's own error message. `run_ai.sh` checks it against a fake of both
+APIs. I compared the requests with what the official Python libraries (anthropic, openai) send for
+the same conversation, by pointing them at a small server: the same paths and JSON bodies. Not yet:
+streaming, tool calls, images, and `max_completion_tokens` for OpenAI's reasoning models.
