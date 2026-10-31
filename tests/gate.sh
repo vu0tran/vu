@@ -21,6 +21,9 @@ fi
 export VU_REAL="$PWD/../vu"
 export VU_CACHE=${VU_CACHE-$HOME/.cache/vu-gate}
 jobs=${GATE_JOBS:-$(nproc)}
+# the gate runs suites side by side already: the suites that would run their own parts side by side
+# (CI uses that) run them one at a time here
+export VU_TARGETED_JOBS=${VU_TARGETED_JOBS:-1} VU_FETCH_JOBS=${VU_FETCH_JOBS:-1}
 out=$(mktemp -d); stamp="$out/stamp"; : > "$stamp"
 trap 'rm -rf "$out"' EXIT
 if [ -n "$VU_CACHE" ]; then

@@ -9,10 +9,13 @@ leaks=detect_leaks=1; [ "$(uname)" = Darwin ] && leaks=detect_leaks=0
 cd "$(dirname "$0")"
 # The compiler under test: ../vu (compiler/vuc) by default, or another build of it (VU=/path/to/vuc).
 VU=${VU:-"$PWD/../vu"}
-pass=0; fail=0; work=$(mktemp -d)
+pass=0; fail=0
 ARCHER=${ARCHER:-/usr/lib/llvm-18/lib/libarcher.so}
 supp="$PWD/tsan.supp"   # (an absolute path: the programs run in $work)
-for f in targeted/${ONLY:-*}.vu; do   # ONLY=5[12]*_iface* runs some
+self="$PWD/run_targeted.sh"
+# One test: its three lines (ok/FAIL, attack, result) on stdout, built and run in a folder of its own.
+one() {
+  f=$1; work=$(mktemp -d)
   attack=$(sed -n '1s/^# attack: //p' "$f")
   kind=$(sed -n '2s/^# expect: \([a-z]*\) .*/\1/p' "$f")
   want=$(sed -n '2s/^# expect: [a-z]* //p' "$f")
@@ -21,10 +24,10 @@ for f in targeted/${ONLY:-*}.vu; do   # ONLY=5[12]*_iface* runs some
     ms=$(timeout 120 $VU build "$f" --debug --time -o "$work/prog" 2>&1 | sed -n 's/^vu: front end \([0-9]*\).*/\1/p')
     if [ -n "$ms" ] && [ "$ms" -le "$want" ]; then pass=$((pass+1)); echo "ok    $f"; why="front end took $ms ms"
     else fail=$((fail+1)); echo "FAIL  $f"; why="front end took ${ms:-?} ms (limit $want)"; fi
-    echo "      attack: $attack"; echo "      result: $why"; continue
+    echo "      attack: $attack"; echo "      result: $why"; rm -rf "$work"; return
   fi
   out=$(timeout 60 $VU build "$f" --san -o "$work/prog" 2>&1); code=$?
-  if [ $code -eq 124 ]; then fail=$((fail+1)); echo "FAIL  $f"; echo "      attack: $attack"; echo "      result: COMPILER HUNG (killed after 60 s)"; continue; fi
+  if [ $code -eq 124 ]; then fail=$((fail+1)); echo "FAIL  $f"; echo "      attack: $attack"; echo "      result: COMPILER HUNG (killed after 60 s)"; rm -rf "$work"; return; fi
   if [ "$kind" = panic ]; then
     if [ $code -ne 0 ]; then ok=0; why="failed to compile: $out"
     else
@@ -68,7 +71,32 @@ for f in targeted/${ONLY:-*}.vu; do   # ONLY=5[12]*_iface* runs some
   if [ $ok -eq 1 ]; then pass=$((pass+1)); echo "ok    $f"; else fail=$((fail+1)); echo "FAIL  $f"; fi
   echo "      attack: $attack"
   echo "      result: $why"
+  rm -rf "$work"
+}
+
+if [ "${1:-}" = --one ]; then one "$2" > "$3"; exit 0; fi
+
+# The tests run several at a time (VU_TARGETED_JOBS, default one per core): each is a C build and a run
+# under the sanitizers, and the C compiler is most of the time. The compile-time tests run alone
+# afterwards, so the others' load doesn't count in their timings. The report keeps the files' order.
+jobs=${VU_TARGETED_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)}
+res=$(mktemp -d); mkdir -p "$res/targeted"
+for f in targeted/${ONLY:-*}.vu; do   # ONLY=5[12]*_iface* runs some
+  [ -f "$f" ] || continue
+  if sed -n 2p "$f" | grep -q '^# expect: compile '; then continue; fi
+  printf '%s\n' "$f"
+done | xargs -P "$jobs" -I{} sh "$self" --one {} "$res/{}.out"
+for f in targeted/${ONLY:-*}.vu; do
+  [ -f "$f" ] || continue
+  if sed -n 2p "$f" | grep -q '^# expect: compile '; then one "$f" > "$res/$f.out"; fi
 done
-rm -rf "$work"
+for f in targeted/${ONLY:-*}.vu; do
+  [ -f "$f" ] || continue
+  if [ -s "$res/$f.out" ]; then cat "$res/$f.out"
+  else printf 'FAIL  %s\n      attack: \n      result: NO RESULT (the runner itself failed)\n' "$f"; fi
+done > "$res/all"
+cat "$res/all"
+pass=$(grep -c '^ok    ' "$res/all"); fail=$(grep -c '^FAIL  ' "$res/all")
+rm -rf "$res"
 echo "$pass passed, $fail failed"
-[ $fail -eq 0 ]
+[ "$fail" -eq 0 ]

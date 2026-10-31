@@ -1,6 +1,12 @@
-# Every push: the compiler built from its seed and the targeted tests run on Linux (x86-64, ARM64) and
-# macOS (ARM64), plus the MCP filesystem server against its reference. The full gate (tests/gate.sh)
-# stays a local run: it takes about half an hour and needs services (PostgreSQL, TLS certificates).
+# Every push: the tests on Linux (x86-64, ARM64) and macOS (ARM64), as parallel jobs per platform:
+#   core      the compiler from its seed and to a fixed point, the examples, the targeted tests (several
+#             at a time), libraries
+#   services  PostgreSQL and the backend modules (Linux), std/ai against fake model APIs
+#   mcp       the MCP filesystem, time, SQLite and git servers against their references
+#   fetch     the MCP fetch server against its reference (Linux)
+#   split     split builds against whole ones
+# Built binaries are kept between runs (VU_CACHE, keyed by everything a binary is made from), so a test
+# whose C didn't change isn't compiled again. The full gate (tests/gate.sh) stays a local run.
 name: ci
 concurrency:
   group: ci-${{ github.ref }}
@@ -14,11 +20,18 @@ permissions:
   contents: read
 jobs:
   test:
+    name: ${{ matrix.group }} (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        group: [core, services, mcp, fetch, split]
+        exclude:
+          - os: macos-15
+            group: fetch
     runs-on: ${{ matrix.os }}
+    env:
+      VU_CACHE: ${{ github.workspace }}/../vu-cache
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -30,16 +43,37 @@ jobs:
       - name: "Linux: AddressSanitizer's address space (newer kernels randomize mmap past what it expects), libsqlite3"
         if: runner.os == 'Linux'
         run: sudo sysctl vm.mmap_rnd_bits=28 && sudo apt-get install -y -q libsqlite3-dev >/dev/null
+      # binaries from earlier runs: the key names the runner's image too (a binary depends on the system's
+      # headers and libraries, which the store's own keys don't see); a new image starts empty
+      - name: The runner's image
+        id: image
+        run: echo "v=${ImageOS:-x}-${ImageVersion:-x}" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../vu-cache
+          key: vu-${{ matrix.os }}-${{ steps.image.outputs.v }}-${{ matrix.group }}-${{ github.sha }}
+          restore-keys: vu-${{ matrix.os }}-${{ steps.image.outputs.v }}-${{ matrix.group }}-
       - name: Build the compiler from the seed
-        run: ./vu version
+        run: |
+          mkdir -p "$VU_CACHE"
+          # (access times back to 1970, so the first read of each binary this run updates its own: the
+          # last step keeps only the ones read or made after the stamp)
+          [ "$RUNNER_OS" = Linux ] && find "$VU_CACHE" -type f -exec touch -a -d @0 {} +
+          touch "$RUNNER_TEMP/stamp"; sleep 1
+          ./vu version
+
+      # ---- core
       - name: The compiler rebuilds itself to a fixed point
+        if: matrix.group == 'core'
         run: compiler/build.sh
       - name: Examples
+        if: matrix.group == 'core'
         run: |
           ./vu run examples/binarytrees.vu 12
           ./vu run examples/nbody.vu 1000
           ./vu run --release examples/fannkuch.vu 8
       - name: Targeted tests
+        if: matrix.group == 'core'
         run: |
           # (AddressSanitizer is slow on the ARM runners: two allocation-heavy tests take 40-50 s there
           # with it, 0.08 s without; measured in CI. They get more time there.)
@@ -52,8 +86,17 @@ jobs:
           fails=$(grep -a -A2 '^FAIL' targeted.log | grep -v '^--' | head -150 | cut -c1-400 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
           [ -n "$fails" ] && echo "::error::$fails"
           [ $ok = 1 ]
+      - name: Libraries (vu build --lib) called from C and Python
+        if: matrix.group == 'core' && always()
+        run: |
+          tests/run_lib.sh > lib.log 2>&1 && ok=1 || ok=0
+          tail -5 lib.log
+          msg=$(grep -A3 '^FAIL' lib.log | head -10 | cut -c1-900 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          [ $ok = 1 ] || { echo "::error::$msg"; exit 1; }
+
+      # ---- services
       - name: "Linux: PostgreSQL; std/auth, jobs, migrate and the templates; std/stripe, s3, mail; examples/saas"
-        if: runner.os == 'Linux' && always()
+        if: matrix.group == 'services' && runner.os == 'Linux'
         run: |
           python3 -m pip install -q django stripe boto3 "moto[server]" aiosmtpd
           ok=1
@@ -66,22 +109,24 @@ jobs:
           done
           [ $ok = 1 ]
       - name: std/ai against a fake Anthropic and OpenAI
-        if: always()
+        if: matrix.group == 'services' && always()
         run: |
           tests/run_ai.sh > ai.log 2>&1 && ok=1 || ok=0
           tail -6 ai.log
           fails=$(grep -a -A40 '^FAIL' ai.log | head -80 | cut -c1-300 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
           [ -n "$fails" ] && echo "::error::run_ai: $fails"
           [ $ok = 1 ]
+
+      # ---- mcp
       - name: MCP filesystem server against the reference
-        if: always()
+        if: matrix.group == 'mcp'
         run: |
           tests/run_mcp.sh > mcp.log 2>&1 && ok=1 || ok=0
           tail -5 mcp.log
           grep -a -m5 -A3 'FAIL' mcp.log | cut -c1-900 | while IFS= read -r l; do echo "::error::$l"; done
           [ $ok = 1 ]
       - name: MCP time server against the reference
-        if: always() && runner.os == 'Linux'
+        if: matrix.group == 'mcp' && runner.os == 'Linux' && always()
         run: |
           tests/run_mcp_time.sh > time.log 2>&1 && ok=1 || ok=0
           tail -5 time.log
@@ -89,38 +134,46 @@ jobs:
           if grep -q "ERROR: AddressSanitizer" time.log; then rep=$(grep -A24 "ERROR: AddressSanitizer" time.log | head -25); else rep=$(tail -12 time.log); fi
           msg=$(echo "$rep" | cut -c1-300 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
           [ $ok = 1 ] || { echo "::error::$msg"; exit 1; }
-      - name: MCP fetch server against the reference
-        if: always() && runner.os == 'Linux'
-        run: |
-          tests/run_mcp_fetch.sh > fetch.log 2>&1 && ok=1 || ok=0
-          tail -5 fetch.log
-          msg=$(tail -14 fetch.log | cut -c1-900 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
-          [ $ok = 1 ] || { echo "::error::$msg"; exit 1; }
       - name: MCP SQLite server against the reference
-        if: always() && runner.os == 'Linux'
+        if: matrix.group == 'mcp' && runner.os == 'Linux' && always()
         run: |
           tests/run_mcp_sqlite.sh > sqlite.log 2>&1 && ok=1 || ok=0
           tail -5 sqlite.log
           msg=$(tail -10 sqlite.log | cut -c1-900 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
           [ $ok = 1 ] || { echo "::error::$msg"; exit 1; }
       - name: MCP git server against the reference
-        if: always() && runner.os == 'Linux'
+        if: matrix.group == 'mcp' && runner.os == 'Linux' && always()
         run: |
           tests/run_mcp_git.sh > git.log 2>&1 && ok=1 || ok=0
           tail -5 git.log
           msg=$(tail -10 git.log | cut -c1-900 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
           [ $ok = 1 ] || { echo "::error::$msg"; exit 1; }
-      - name: Libraries (vu build --lib) called from C and Python
-        if: always()
+
+      # ---- fetch
+      - name: MCP fetch server against the reference
+        if: matrix.group == 'fetch'
         run: |
-          tests/run_lib.sh > lib.log 2>&1 && ok=1 || ok=0
-          tail -5 lib.log
-          msg=$(grep -A3 '^FAIL' lib.log | head -10 | cut -c1-900 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+          tests/run_mcp_fetch.sh > fetch.log 2>&1 && ok=1 || ok=0
+          tail -5 fetch.log
+          msg=$(tail -14 fetch.log | cut -c1-900 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
           [ $ok = 1 ] || { echo "::error::$msg"; exit 1; }
+
+      # ---- split
       - name: Split builds against whole ones
-        if: always()
+        if: matrix.group == 'split'
         run: |
           tests/run_split.sh > split.log 2>&1 && ok=1 || ok=0
           tail -6 split.log
           msg=$(grep '^FAIL' split.log | head -5 | cut -c1-900 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
           [ $ok = 1 ] || { echo "::error::$msg"; exit 1; }
+
+      # the store keeps only what this run used (Linux: a read updates a file's access time), so it
+      # doesn't grow without end
+      # (macOS doesn't keep access times reliably: there the store starts over past 3 GB)
+      - name: Keep only the binaries this run used
+        if: always()
+        run: |
+          before=$(du -sh "$VU_CACHE" | cut -f1)
+          if [ "$RUNNER_OS" = Linux ]; then find "$VU_CACHE" -type f ! -anewer "$RUNNER_TEMP/stamp" -delete
+          elif [ "$(du -sk "$VU_CACHE" | cut -f1)" -gt 3000000 ]; then find "$VU_CACHE" -mindepth 1 -delete; fi
+          echo "build store: $before before, $(du -sh "$VU_CACHE" | cut -f1) kept"
