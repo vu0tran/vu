@@ -48,6 +48,9 @@ def expect(what, got, want):
     if got != want: fails.append("%s: got %r, want %r" % (what, got, want))
 try:
     wait(mport)
+    for _ in range(600):   # (the socket accepts before moto answers)
+        try: urllib.request.urlopen("http://127.0.0.1:%d/moto-api/" % mport, timeout=2).read(); break
+        except Exception: time.sleep(0.1)
     s3 = boto3.client("s3", endpoint_url="http://127.0.0.1:%d" % mport, region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
     s3.create_bucket(Bucket="avatars")
     secret = "whsec_test_secret"

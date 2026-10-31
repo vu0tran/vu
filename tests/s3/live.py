@@ -2,13 +2,22 @@
 # a key and a bucket, runs live.vu (arg 1) against it, and checks its output and the presigned URLs.
 import os, random, socket, subprocess, sys, time, urllib.request, urllib.error
 import boto3
+
+def ready(port):
+    # the socket accepts before the app behind it answers: wait for an answer (up to 60 s, on a busy machine)
+    for _ in range(600):
+        try:
+            urllib.request.urlopen("http://127.0.0.1:%d/moto-api/" % port, timeout=2).read()
+            return
+        except Exception:
+            time.sleep(0.1)
+    raise SystemExit("moto didn't start on port %d" % port)
+
 port = random.randint(20000, 40000)
 env = dict(os.environ, INITIAL_NO_AUTH_ACTION_COUNT="4")
 srv = subprocess.Popen([sys.executable, "-m", "moto.server", "-p", str(port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
-    for _ in range(200):
-        try: socket.create_connection(("127.0.0.1", port), 0.2); break
-        except OSError: time.sleep(0.1)
+    ready(port)
     ep = "http://127.0.0.1:%d" % port
     iam = boto3.client("iam", endpoint_url=ep, region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
     iam.create_user(UserName="app")
@@ -29,9 +38,7 @@ try:
     port2 = random.randint(40001, 60000)
     srv2 = subprocess.Popen([sys.executable, "-m", "moto.server", "-p", str(port2)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        for _ in range(200):
-            try: socket.create_connection(("127.0.0.1", port2), 0.2); break
-            except OSError: time.sleep(0.1)
+        ready(port2)
         ep2 = "http://127.0.0.1:%d" % port2
         open_s3 = boto3.client("s3", endpoint_url=ep2, region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
         open_s3.create_bucket(Bucket="vu-test")
