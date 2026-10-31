@@ -63,7 +63,6 @@ wrapper that takes one from the pool (see `route` in the templates).
   for a zero byte).
 - A `?` can't follow a call to its left in the same statement (`log(x) + f()?`): put the `?` call
   in its own `let` first.
-- `x else y = z` isn't a statement; use `match` with `ok`/`err` arms to set a variable.
 - Maps: `k in m`, `m.get(k, default)`, `m.remove(k)`; there's no `.has`. Structs are built with
   every field (`User(id, name)`), and there are no type aliases.
 - A closure with a `var` parameter must be `own fn(var x: T) => ...`.

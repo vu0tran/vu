@@ -378,6 +378,9 @@ match parse_digit(b):                # inspect it
   err(msg): print(msg)
 ```
 
+- `call() else x = value` (or `+=` and the rest) is a statement: when the call fails, the
+  assignment runs and the program goes on; when it succeeds, its value is dropped:
+  `pg.exec(net, &db, sql, [id]) else failed += 1`.
 - `?` can go anywhere in an expression: `items.push(parse(&p)?)`, `add(num(a)?, num(b)?)`,
   `if parse(s)? > 3:`. Each one runs before the rest of its statement, in the order written,
   so it is an error where that would change what runs: after a call to its left in the same

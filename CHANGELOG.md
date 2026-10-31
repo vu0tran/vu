@@ -2599,3 +2599,10 @@ sign-out and sign-in again.
 **Metrics.** `web.track` and `web.metrics_page` count requests by method and status and time them
 into a histogram, in Prometheus's text format (`prometheus_client`'s parser reads it: checked by
 hand). Unknown methods are counted as `OTHER`, so a client can't create labels. Targeted test 740.
+
+**`call() else x = value`.** Twice in the new modules a failing call only needed to set a flag, and
+`call() else ok = false` didn't parse, so it became a four-line `match`. It's now a statement: the
+assignment (any of `=`, `+=`...) runs when the call fails, and the call's value, when it succeeds,
+is freed. Using it where the call's value is wanted (`let n = f() else bad = true`) is refused, and
+so is `opt else x = v` on an optional (the message says to use `if v = opt`). Targeted tests
+741-743, under the sanitizers (a `Str` result is freed: LeakSanitizer reports nothing).
