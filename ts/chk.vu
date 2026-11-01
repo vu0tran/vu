@@ -11,7 +11,7 @@ import rel
 import show
 import tyops
 from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP
-from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE
+from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE, LoopRec
 from types import S_VAR, S_LET, S_CONST, S_PARAM, S_FUNC, S_CLASS, S_INTERFACE, S_ALIAS, S_ENUM, S_NAMESPACE, S_TPARAM, S_PROP, S_METHOD, S_ACCESSOR, SF_OPTIONAL, SF_READONLY
 
 fn err(var c: C, n: Int, code: Int, msg: Str):
@@ -3580,6 +3580,8 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
       let h15_ = assigned_narrow(&c, target, rt)
       set_narrow(&c, key, h15_)
     return rt
+  if op == scan.T_ANDEQ or op == scan.T_OREQ or op == scan.T_QQEQ:
+    return logical_assign(&c, n, op, l, r)
   if op >= scan.T_PLUSEQ and op <= scan.T_QQEQ:
     let before = c.diags.len
     let target = assign_target(&c, l)
@@ -3816,6 +3818,8 @@ fn fresh_of(c: C, t: Int) -> Int:
 
 fn check_function_body(var c: C, d: Int, sg: Int):
   if d in c.checked_fns: return
+  # (a function inside a loop checked speculatively is checked in the real pass)
+  if c.spec > 0: return
   c.checked_fns[d] = true
   let body = fn_body(c, d)
   if body < 0: return
@@ -4035,6 +4039,22 @@ fn join_branches(var c: C, ft: {Str: Int}, fe: {Str: Int}, reach_t: Bool, reach_
     if v == -7 and not k.startswith("=") and k != "!u": set_narrow(&c, k + "", -7)
   for k, v in fe:
     if v == -7 and not k.startswith("=") and k != "!u": set_narrow(&c, k + "", -7)
+  # a plain variable narrowed in both branches (not assigned): the union of the two (a branch
+  # where the condition left nothing, never, gives the other one's)
+  for k, v in ft:
+    if k == "!u" or k.startswith("=") or (k.find(".") >= 0): continue
+    var is_assigned = false
+    for a0 in assigned:
+      if a0 == k: is_assigned = true
+    if is_assigned: continue
+    if not (k in fe): continue
+    let v2 = fe[k]
+    if v < 0 or v2 < 0: continue
+    var u = v
+    if c.tk[v] == TK_NEVER: u = v2
+    elif c.tk[v2] == TK_NEVER: u = v
+    elif v != v2: continue
+    set_narrow(&c, k + "", u)
   for key in assigned:
     var vt = outer_value(c, key)
     if key in ft: vt = ft[key]
@@ -4147,6 +4167,9 @@ fn check_stmt(var c: C, n: Int):
     check_expr(&c, c.t.a[n], -1)
     return
   if k == ast.N_RETURN:
+    if c.ret_stack.len == 0:
+      unsup(&c, n, "a return outside a function")
+      return
     let declared = c.ret_stack[c.ret_stack.len - 1]
     if c.t.a[n] >= 0:
       var ctx = declared
@@ -4163,14 +4186,16 @@ fn check_stmt(var c: C, n: Int):
     check_truthiness(&c, cond)
     push_facts(&c, cond, true)
     check_stmt(&c, c.t.b[n])
-    let then_ends = terminates(c, c.t.b[n])
     let ft = c.narrow.pop()
+    # (a branch ends with return or throw, or with break or continue: "!u" marks what follows)
+    let then_ends = terminates(c, c.t.b[n]) or ("!u" in ft)
     var else_ends = false
     # the false facts are needed for an else branch, or when the then branch doesn't fall through
     var then_assigns: [Str] = []
     assigned_in(&c, c.t.b[n], &then_assigns)
-    if c.t.c[n] >= 0 or then_ends or then_assigns.len > 0: push_facts(&c, cond, false)
-    else: c.narrow.push({})
+    # (the false facts also tell when the implicit else can't be taken: then what the then
+    # branch narrowed holds after the if)
+    push_facts(&c, cond, false)
     if c.t.c[n] >= 0:
       check_stmt(&c, c.t.c[n])
       else_ends = terminates(c, c.t.c[n])
@@ -4184,56 +4209,6 @@ fn check_stmt(var c: C, n: Int):
     return
   if k == ast.N_BLOCK:
     check_block(&c, n)
-    return
-  if k == ast.N_WHILE or k == ast.N_DO:
-    var cond = c.t.a[n]
-    var body = c.t.b[n]
-    if k == ast.N_DO:
-      cond = c.t.b[n]
-      body = c.t.a[n]
-    forget_assigned(&c, body)
-    check_expr(&c, cond, -1)
-    check_truthiness(&c, cond)
-    push_facts(&c, cond, true)
-    check_stmt(&c, body)
-    c.narrow.pop()
-    forget_assigned(&c, body)
-    return
-  if k == ast.N_FOR:
-    bind.scope_names(&c, n)
-    c.narrow.push({})
-    let init = c.t.a[n]
-    if init >= 0:
-      if c.t.k[init] == ast.N_VAR:
-        for d in kids(c, c.t.a[init]): check_var_decl(&c, d, c.t.f[init])
-      else: check_expr(&c, init, -1)
-    forget_assigned(&c, c.t.d[n])
-    forget_assigned(&c, c.t.c[n])
-    if c.t.b[n] >= 0:
-      check_expr(&c, c.t.b[n], -1)
-      check_truthiness(&c, c.t.b[n])
-      push_facts(&c, c.t.b[n], true)
-    else: c.narrow.push({})
-    check_stmt(&c, c.t.d[n])
-    if c.t.c[n] >= 0: check_expr(&c, c.t.c[n], -1)
-    c.narrow.pop()
-    c.narrow.pop()
-    forget_assigned(&c, c.t.d[n])
-    return
-  if k == ast.N_FORIN:
-    bind.scope_names(&c, n)
-    let left = c.t.a[n]
-    if c.t.f[n] == 2: unsup(&c, n, "for await")
-    if c.t.k[left] != ast.N_VAR:
-      unsup(&c, n, "a for loop over an existing variable")
-      return
-    let et = check_expr(&c, c.t.b[n], -1)
-    if c.t.f[n] == 1: element_type(&c, et, c.t.b[n])
-    forget_assigned(&c, c.t.c[n])
-    c.narrow.push({})
-    check_stmt(&c, c.t.c[n])
-    c.narrow.pop()
-    forget_assigned(&c, c.t.c[n])
     return
   if k == ast.N_FUNC:
     if c.t.d[n] < 0: return
@@ -4293,29 +4268,17 @@ fn check_stmt(var c: C, n: Int):
     if c.t.d[n] >= 0: check_block(&c, c.t.d[n])
     return
   if k == ast.N_SWITCH:
-    let st = check_expr(&c, c.t.a[n], -1)
-    for cs in kids(c, c.t.b[n]):
-      if c.t.a[cs] >= 0:
-        let ct = check_expr(&c, c.t.a[cs], -1)
-        let ctk = c.tk[ct]
-        if ctk != TK_NULL and ctk != TK_UNDEF and not comparable(&c, st, ct):
-          var a = types.regular(c, ct)
-          let b0 = types.regular(c, st)
-          let b = rel.report_target(&c, a, b0)
-          if c.tk[b] != types.TK_NEVER and not rel.could_have_singletons(&c, b):
-            if types.is_literal(c, a): a = types.base_of_literal(c, a)
-            elif c.tk[a] == types.TK_UNION and rel.all_units(c, a): a = widen_all(&c, a)
-          let h25_ = show.show(&c, a)
-          let h26_ = show.show(&c, b)
-          err(&c, c.t.a[cs], 2678, "Type '" + h25_ + "' is not comparable to type '" + h26_ + "'.")
-      bind.scope_names(&c, cs)
-      c.narrow.push({})
-      switch_facts(&c, n, cs, st)
-      check_stmts(&c, kids(c, c.t.b[cs]))
-      c.narrow.pop()
-    for cs in kids(c, c.t.b[n]): forget_assigned(&c, c.t.b[cs])
+    c.loop_rec.push(LoopRec([], true, {}, {}, false, {}))
+    check_switch(&c, n)
+    c.loop_rec.pop()
     return
-  if k == ast.N_BREAK or k == ast.N_CONTINUE or k == ast.N_DEBUGGER: return
+  if k == ast.N_WHILE or k == ast.N_DO or k == ast.N_FOR or k == ast.N_FORIN:
+    check_loop(&c, n)
+    return
+  if k == ast.N_BREAK or k == ast.N_CONTINUE:
+    loop_jump(&c, n, k == ast.N_CONTINUE)
+    return
+  if k == ast.N_DEBUGGER: return
   if k == ast.N_LABEL:
     check_stmt(&c, c.t.a[n])
     return
@@ -4381,6 +4344,32 @@ fn check_stmt(var c: C, n: Int):
 # ---- classes
 
 # The class a node is inside of (its declaration), and whether that's a static place.
+
+fn check_switch(var c: C, n: Int):
+  let k = c.t.k[n]
+  if k == ast.N_SWITCH:
+    let st = check_expr(&c, c.t.a[n], -1)
+    for cs in kids(c, c.t.b[n]):
+      if c.t.a[cs] >= 0:
+        let ct = check_expr(&c, c.t.a[cs], -1)
+        let ctk = c.tk[ct]
+        if ctk != TK_NULL and ctk != TK_UNDEF and not comparable(&c, st, ct):
+          var a = types.regular(c, ct)
+          let b0 = types.regular(c, st)
+          let b = rel.report_target(&c, a, b0)
+          if c.tk[b] != types.TK_NEVER and not rel.could_have_singletons(&c, b):
+            if types.is_literal(c, a): a = types.base_of_literal(c, a)
+            elif c.tk[a] == types.TK_UNION and rel.all_units(c, a): a = widen_all(&c, a)
+          let h25_ = show.show(&c, a)
+          let h26_ = show.show(&c, b)
+          err(&c, c.t.a[cs], 2678, "Type '" + h25_ + "' is not comparable to type '" + h26_ + "'.")
+      bind.scope_names(&c, cs)
+      c.narrow.push({})
+      switch_facts(&c, n, cs, st)
+      check_stmts(&c, kids(c, c.t.b[cs]))
+      c.narrow.pop()
+    for cs in kids(c, c.t.b[n]): forget_assigned(&c, c.t.b[cs])
+    return
 fn enclosing_class(c: C, n0: Int) -> Int:
   var n = bind.up(c, n0)
   while n >= 0:
@@ -5854,3 +5843,337 @@ fn global_err(var c: C, e: Ents, i: Int, code: Int, msg: Str):
     pos = c.t.npos[at]
     end = pos + c.t.names[c.t.s[at]].len
   c.diags.push(parse.Diag(c.t.file[at], pos, end, code, msg + ""))
+
+# a &&= b, a ||= b, a ??= b: b is assigned where a is truthy, falsy or nullish; after it, a is
+# what it was elsewhere joined with what was assigned.
+fn logical_assign(var c: C, n: Int, op: Int, l: Int, r: Int) -> Int:
+  let before = c.diags.len
+  let target = assign_target(&c, l)
+  let lt = check_expr(&c, l, -1)
+  # the flow: b runs where a is falsy (||=), nullish (??=) or truthy (&&=); afterwards a is the
+  # other branch's narrowing joined with what was assigned (the assignment counted even where
+  # that branch can't be taken)
+  let tp = truthy_part(&c, lt)
+  let df = definitely_falsy(&c, lt)
+  var flow_kept = tp
+  if op == scan.T_ANDEQ: flow_kept = df
+  if op == scan.T_QQEQ: flow_kept = types.filter_union(&c, lt, true, true)
+  if op == scan.T_ANDEQ:
+    check_truthiness(&c, l)
+    push_facts(&c, l, true)
+  else:
+    if op == scan.T_OREQ: check_truthiness(&c, l)
+    push_facts(&c, l, false)
+  var rctx = -1
+  if not is_any(c, target): rctx = target
+  let rt = check_expr(&c, r, rctx)
+  c.narrow.pop()
+  forget_assigned(&c, r)
+  if not bad_ref(c, before) and not is_any(c, target) and not rel.assignable(&c, rt, target): rel.report(&c, rt, target, l, r, 2322)
+  # the expression's type (checkBinaryLikeExpression)
+  var res = lt
+  if op == scan.T_QQEQ:
+    let nn = types.filter_union(&c, lt, true, true)
+    if nn != lt: res = types.union_of(&c, [nn, rt])
+  elif op == scan.T_OREQ:
+    if c.tk[df] != TK_NEVER or types.filter_union(&c, lt, true, false) != lt:
+      let k2 = types.filter_union(&c, tp, true, false)
+      res = types.union_of(&c, [k2, rt])
+  else:
+    if c.tk[tp] != TK_NEVER: res = types.union_of(&c, [df, rt])
+  let key = ref_key(&c, l)
+  if key != "":
+    let assigned = assigned_narrow(&c, target, rt)
+    let after = types.union_of(&c, [flow_kept, assigned])
+    forget(&c, key)
+    let s = int(key) else -1
+    if s >= 0 and after == bind.type_of_sym(&c, s): set_narrow(&c, key, -9)
+    else: set_narrow(&c, key, after)
+  return res
+
+# ---- loops (the flow type at a loop's head: what enters it joined with what comes back, to a
+# fixpoint; the body is checked speculatively, its errors dropped, until the types settle)
+
+# A variable's flow type here (-1 if it isn't known).
+fn key_type(var c: C, key: Str) -> Int:
+  let v = narrowed(c, key)
+  if v == -7: return -1
+  let s = int(key) else -1
+  if s < 0: return -1
+  if v < 0: return bind.type_of_sym(&c, s)
+  return v
+
+fn loop_jump(var c: C, n: Int, is_continue: Bool):
+  loop_jump_rec(&c, n, is_continue)
+  # what follows a jump in this branch isn't reached
+  if c.narrow.len > 0: set_narrow(&c, "!u", 1)
+
+fn loop_jump_rec(var c: C, n: Int, is_continue: Bool):
+  if c.loop_rec.len == 0: return
+  var i = c.loop_rec.len - 1
+  if c.t.s[n] >= 0:
+    # a labeled jump: not modeled for the loops it crosses
+    while i >= 0:
+      c.loop_rec[i].bad = true
+      i -= 1
+    return
+  # break leaves the innermost switch or loop; continue the innermost loop
+  if is_continue:
+    while i >= 0 and c.loop_rec[i].is_switch: i -= 1
+  if i < 0 or c.loop_rec[i].is_switch: return
+  var ks: [Str] = []
+  for k0 in c.loop_rec[i].keys: ks.push(k0 + "")
+  for k in ks:
+    let t = key_type(&c, k)
+    if t < 0:
+      c.loop_rec[i].bad = true
+      continue
+    if is_continue:
+      if not (k in c.loop_rec[i].back): c.loop_rec[i].back[k] = []
+      c.loop_rec[i].back[k].push(t)
+    else:
+      if not (k in c.loop_rec[i].out): c.loop_rec[i].out[k] = []
+      c.loop_rec[i].out[k].push(t)
+
+# The plain variables an expression reads (where a condition can narrow them).
+fn cond_refs(var c: C, e: Int, var out: [Str]):
+  if e < 0: return
+  let k = c.t.k[e]
+  if k == ast.N_ID:
+    let key = ref_key(&c, e)
+    if key != "" and is_tracked(&c, key): out.push(key)
+    return
+  if k == ast.N_BINARY or k == ast.N_ELEMACCESS:
+    cond_refs(&c, c.t.a[e], &out)
+    cond_refs(&c, c.t.b[e], &out)
+  elif k == ast.N_PREFIX or k == ast.N_PAREN or k == ast.N_NONNULL or k == ast.N_TYPEOF or k == ast.N_PROPACCESS or k == ast.N_AS:
+    cond_refs(&c, c.t.a[e], &out)
+  elif k == ast.N_COND:
+    cond_refs(&c, c.t.a[e], &out)
+    cond_refs(&c, c.t.b[e], &out)
+    cond_refs(&c, c.t.c[e], &out)
+
+fn is_tracked(var c: C, key: Str) -> Bool:
+  if key.find(".") >= 0: return false
+  let s = int(key) else -1
+  if s < 0: return false
+  let t = bind.type_of_sym(&c, s)
+  if t == c.auto_t or t == c.auto_arr: return false
+  return true
+
+# One run over the loop: head types set, the condition's true facts, the body (and the update);
+# the types at the end of the body join those at continue. Returns the record.
+fn loop_pass(var c: C, n: Int, keys: [Str], head: {Str: Int}) -> LoopRec:
+  let k = c.t.k[n]
+  var kc: [Str] = []
+  for x in keys: kc.push(x + "")
+  c.loop_rec.push(LoopRec(kc, false, {}, {}, false, {}))
+  c.narrow.push({})
+  for key in keys:
+    forget(&c, key)
+    let s = int(key) else -1
+    let dt = bind.type_of_sym(&c, s)
+    if head[key] == dt: set_narrow(&c, key, -9)
+    else: set_narrow(&c, key, head[key])
+  var body = -1
+  var cond = -1
+  var update = -1
+  if k == ast.N_WHILE:
+    cond = c.t.a[n]
+    body = c.t.b[n]
+  elif k == ast.N_DO:
+    cond = c.t.b[n]
+    body = c.t.a[n]
+  elif k == ast.N_FOR:
+    cond = c.t.b[n]
+    body = c.t.d[n]
+    update = c.t.c[n]
+  else: body = c.t.c[n]
+  if k == ast.N_FORIN:
+    c.narrow.push({})
+  elif k == ast.N_DO:
+    c.narrow.push({})
+  elif cond >= 0:
+    check_expr(&c, cond, -1)
+    check_truthiness(&c, cond)
+    push_facts(&c, cond, true)
+  else: c.narrow.push({})
+  check_stmt(&c, body)
+  let reach = not terminates(c, body) and not ("!u" in c.narrow[c.narrow.len - 1])
+  if k == ast.N_DO and cond >= 0:
+    # what reaches the condition (the end of the body, continue) goes back only where it's true
+    let top = c.loop_rec.len - 1
+    if reach:
+      for key in keys:
+        let t = key_type(&c, key)
+        if t < 0:
+          c.loop_rec[top].bad = true
+          continue
+        if not (key in c.loop_rec[top].back): c.loop_rec[top].back[key] = []
+        c.loop_rec[top].back[key].push(t)
+    c.narrow.push({})
+    var any_in = false
+    for key in keys:
+      if key in c.loop_rec[top].back:
+        var ts: [Int] = []
+        for t in c.loop_rec[top].back[key]: ts.push(t)
+        let u = types.union_of(&c, ts)
+        c.loop_rec[top].pre[key] = u
+        forget(&c, key)
+        set_narrow(&c, key, u)
+        any_in = true
+      else:
+        c.loop_rec[top].pre[key] = c.never_t
+        forget(&c, key)
+        set_narrow(&c, key, c.never_t)
+    check_expr(&c, cond, -1)
+    check_truthiness(&c, cond)
+    push_facts(&c, cond, true)
+    let dead = "!u" in c.narrow[c.narrow.len - 1]
+    for key in keys:
+      let t = key_type(&c, key)
+      c.loop_rec[top].back[key] = []
+      if not dead and t >= 0 and c.tk[t] != TK_NEVER: c.loop_rec[top].back[key].push(t)
+    c.narrow.pop()
+    c.narrow.pop()
+    c.narrow.pop()
+    c.narrow.pop()
+    var rec0 = c.loop_rec.pop()
+    return rec0
+  if update >= 0: check_expr(&c, update, -1)
+  if reach:
+    for key in keys:
+      let t = key_type(&c, key)
+      let top = c.loop_rec.len - 1
+      if t < 0:
+        c.loop_rec[top].bad = true
+        continue
+      if not (key in c.loop_rec[top].back): c.loop_rec[top].back[key] = []
+      c.loop_rec[top].back[key].push(t)
+  c.narrow.pop()
+  c.narrow.pop()
+  var rec = c.loop_rec.pop()
+  return rec
+
+fn check_loop(var c: C, n: Int):
+  let k = c.t.k[n]
+  var scoped = false
+  if k == ast.N_FOR or k == ast.N_FORIN:
+    bind.scope_names(&c, n)
+    c.narrow.push({})
+    scoped = true
+  if k == ast.N_FOR:
+    let init = c.t.a[n]
+    if init >= 0:
+      if c.t.k[init] == ast.N_VAR:
+        for d in kids(c, c.t.a[init]): check_var_decl(&c, d, c.t.f[init])
+      else: check_expr(&c, init, -1)
+  if k == ast.N_FORIN:
+    let left = c.t.a[n]
+    if c.t.f[n] == 2: unsup(&c, n, "for await")
+    if c.t.k[left] != ast.N_VAR:
+      unsup(&c, n, "a for loop over an existing variable")
+      if scoped: c.narrow.pop()
+      return
+    let et = check_expr(&c, c.t.b[n], -1)
+    if c.t.f[n] == 1: element_type(&c, et, c.t.b[n])
+  # the variables the loop assigns
+  var assigned: [Str] = []
+  if k == ast.N_WHILE:
+    assigned_in(&c, c.t.b[n], &assigned)
+    assigned_in(&c, c.t.a[n], &assigned)
+  elif k == ast.N_DO:
+    assigned_in(&c, c.t.a[n], &assigned)
+    assigned_in(&c, c.t.b[n], &assigned)
+  elif k == ast.N_FOR:
+    assigned_in(&c, c.t.d[n], &assigned)
+    assigned_in(&c, c.t.c[n], &assigned)
+    if c.t.b[n] >= 0: assigned_in(&c, c.t.b[n], &assigned)
+  else: assigned_in(&c, c.t.c[n], &assigned)
+  # the variables the condition narrows (their type after the loop is where it fails)
+  var cond0 = -1
+  if k == ast.N_WHILE: cond0 = c.t.a[n]
+  elif k == ast.N_DO: cond0 = c.t.b[n]
+  elif k == ast.N_FOR: cond0 = c.t.b[n]
+  if cond0 >= 0: cond_refs(&c, cond0, &assigned)
+  var keys: [Str] = []
+  var head: {Str: Int} = {}
+  for key in assigned:
+    if key in head: continue
+    var t = -1
+    if is_tracked(&c, key): t = key_type(&c, key)
+    if t < 0 or not needs_flow(&c, key):
+      reset_key(&c, key)
+      continue
+    if key in head: continue
+    keys.push(key + "")
+    head[key] = types.regular(c, t)
+  # the fixpoint (speculative passes)
+  var settled = keys.len == 0
+  var bad = false
+  var tries = 0
+  while not settled and tries < 6 and not bad:
+    tries += 1
+    let dlen = c.diags.len
+    c.spec += 1
+    let rec = loop_pass(&c, n, keys, head)
+    c.spec -= 1
+    while c.diags.len > dlen: c.diags.pop()
+    if rec.bad:
+      bad = true
+      break
+    settled = true
+    for key in keys:
+      var ts: [Int] = [head[key]]
+      if key in rec.back:
+        for t in rec.back[key]: ts.push(types.regular(c, t))
+      let nh = types.union_of(&c, ts)
+      if nh != head[key]:
+        settled = false
+        head[key] = nh
+  if not settled or bad:
+    for key in keys: reset_key(&c, key)
+    keys = []
+  # the real pass, then the types after the loop: the head where the condition fails, joined with
+  # those at break
+  let rec = loop_pass(&c, n, keys, head)
+  for key in keys:
+    var outs: [Int] = []
+    var exit_t = head[key]
+    var cond = -1
+    if k == ast.N_WHILE: cond = c.t.a[n]
+    elif k == ast.N_FOR: cond = c.t.b[n]
+    elif k == ast.N_DO: cond = c.t.b[n]
+    if k == ast.N_DO:
+      # do-while exits after the body: what reaches the condition
+      exit_t = c.never_t
+      if key in rec.pre: exit_t = rec.pre[key]
+    if cond >= 0 and not rec.bad:
+      c.narrow.push({})
+      let s = int(key) else -1
+      let dt = bind.type_of_sym(&c, s)
+      forget(&c, key)
+      if exit_t == dt: set_narrow(&c, key, -9)
+      else: set_narrow(&c, key, exit_t)
+      push_facts(&c, cond, false)
+      var ft = key_type(&c, key)
+      if "!u" in c.narrow[c.narrow.len - 1]: ft = c.never_t
+      c.narrow.pop()
+      c.narrow.pop()
+      if ft >= 0: exit_t = ft
+    outs.push(exit_t)
+    if key in rec.out:
+      for t in rec.out[key]: outs.push(t)
+    if rec.bad:
+      reset_key(&c, key)
+      continue
+    let s = int(key) else -1
+    let dt = bind.type_of_sym(&c, s)
+    let et = types.union_of(&c, outs)
+    forget(&c, key)
+    if et == dt: set_narrow(&c, key, -9)
+    else: set_narrow(&c, key, et)
+  if scoped:
+    # (the loop's own frame: what's known after it moves out)
+    let fr = c.narrow.pop()
+    for kk, vv in fr: set_narrow(&c, kk + "", vv)
