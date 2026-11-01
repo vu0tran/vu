@@ -116,7 +116,7 @@ func results(s string) {
 	fmt.Sprintf("%s", s)
 	fmt.Sprint(s)
 	strings.TrimSpace(s)
-	strings.Replace(s, "a", "b", -1)
+	_ = strings.Replace(s, "a", "b", -1)
 	strings.Replace(s, "a", "b", 1)
 	bytesHelper([]byte(s))
 }

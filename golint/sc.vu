@@ -1,0 +1,582 @@
+# staticcheck's checks (honnef.co/go/tools v0.6.1, as golangci-lint 2.5.0 enables them by default),
+# ported one at a time; each reports "CODE: message" where staticcheck does.
+
+import ast
+import scan
+import tc
+import pkg
+import format
+import resolve
+import vet
+import errcheck
+from scan import T_ASSIGN, T_DEFINE, T_LOR, T_LAND, T_EQL, T_NEQ, T_LSS, T_GTR, T_LEQ, T_GEQ, T_NOT, T_ARROW, T_AND, T_SUB, T_ADD
+from scan import K_BREAK, K_GOTO, K_VAR, K_CONST, K_RETURN
+
+type C:
+  pi: Int
+  out: [pkg.Issue]
+
+fn code_rank(code: Str) -> Int:
+  var base = 0
+  var digits = code
+  if code.startswith("SA"):
+    base = 10000
+    digits = code[2..code.len]
+  elif code.startswith("ST"):
+    base = 20000
+    digits = code[2..code.len]
+  elif code.startswith("QF"):
+    base = 40000
+    digits = code[2..code.len]
+  elif code.startswith("S"):
+    base = 30000
+    digits = code[1..code.len]
+  let n = int(digits) else 0
+  return base + n
+
+fn report(g: tc.Prog, var c: C, n: Int, code: Str, msg: Str):
+  let pi = c.pi
+  c.out.push(pkg.Issue(g.pk[pi].t.file[n], g.pk[pi].t.pos[n], "staticcheck", code + ": " + msg, code_rank(code)))
+
+fn k(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0: return 0
+  return g.pk[pi].t.k[n]
+
+fn nm(g: tc.Prog, pi: Int, n: Int) -> Str:
+  return g.pk[pi].t.names[g.pk[pi].t.s[n]] + ""
+
+fn unparen(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return vet.unparen(g, pi, n)
+
+fn fmt_expr(g: tc.Prog, pi: Int, n: Int) -> Str:
+  return format.expr(g.pk[pi].t, n)
+
+fn obj_of(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0 or n >= g.pk[pi].use.len: return -1
+  return g.pk[pi].use[n]
+
+# The full name of the function a call (or a function expression) refers to, "" if none.
+fn callee_name(var g: tc.Prog, fs: Fs, pi: Int, call: Int) -> Str:
+  let o = vet.callee(g, pi, call)
+  if o < 0: return ""
+  return errcheck.full_name(&g, fs, g.oorig[o])
+
+fn is_blank(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  return n > 0 and k(g, pi, n) == ast.N_IDENT and nm(g, pi, n) == "_"
+
+# code.MayHaveSideEffects with no purity information.
+fn may_side_effect(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  if n <= 0: return false
+  let kk = k(g, pi, n)
+  if kk == ast.N_CALL: return true
+  if kk == ast.N_FUNCLIT or kk == ast.N_BASICLIT or kk == ast.N_IDENT: return false
+  if kk == ast.N_ARRAYTYPE or kk == ast.N_STRUCTTYPE or kk == ast.N_FUNCTYPE or kk == ast.N_IFACETYPE or kk == ast.N_MAPTYPE or kk == ast.N_CHANTYPE: return false
+  if kk == ast.N_UNARY:
+    if may_side_effect(g, pi, g.pk[pi].t.a[n]): return true
+    let op = g.pk[pi].t.f[n]
+    return op == T_ARROW or op == T_AND
+  if kk == ast.N_LIST:
+    for x in ast.items(g.pk[pi].t, n):
+      if may_side_effect(g, pi, x): return true
+    return false
+  for ch in [g.pk[pi].t.a[n], g.pk[pi].t.b[n], g.pk[pi].t.c[n], g.pk[pi].t.d[n]]:
+    if ch > 0 and may_side_effect(g, pi, ch): return true
+  return false
+
+# ---- QF1008: embedded fields in selectors
+
+fn chain_of(g: tc.Prog, pi: Int, sel: Int, var fields: [Int]) -> Int:
+  # the innermost X of a chain of selectors, collecting the selected names outermost last
+  var x = sel
+  var rev: [Int] = []
+  while k(g, pi, x) == ast.N_SELECTOR:
+    rev.push(g.pk[pi].t.b[x])
+    x = g.pk[pi].t.a[x]
+  var i = rev.len - 1
+  while i >= 0:
+    fields.push(rev[i])
+    i -= 1
+  return x
+
+fn qf1008(var g: tc.Prog, fs: Fs, var c: C, nodes: [Int], parent: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_SELECTOR: continue
+    if k(g, pi, g.pk[pi].t.a[n]) != ast.N_SELECTOR: continue
+    # only the outermost selector around the leftmost token
+    var up = parent[n]
+    var outer = false
+    while up > 0:
+      if k(g, pi, up) == ast.N_SELECTOR: outer = true
+      up = parent[up]
+    if outer: continue
+    # the chains along the leftmost path: selectors broken by calls, indexes...
+    var chains: [[Int]] = []
+    var cur = n
+    while true:
+      var fields: [Int] = []
+      let x = chain_of(g, pi, cur, &fields)
+      var ch = [x]
+      for f in fields: ch.push(f)
+      chains.push(ch)
+      # descend to the leftmost operand of x to find further chains
+      var y = x
+      var found = -1
+      while y > 0:
+        let yk = k(g, pi, y)
+        if yk == ast.N_SELECTOR:
+          found = y
+          break
+        if yk == ast.N_CALL or yk == ast.N_INDEX or yk == ast.N_SLICE or yk == ast.N_TYPEASSERT or yk == ast.N_PAREN or yk == ast.N_STAR: y = g.pk[pi].t.a[y]
+        elif yk == ast.N_BINARY: y = g.pk[pi].t.a[y]
+        elif yk == ast.N_COMPOSITE: y = g.pk[pi].t.a[y]
+        else: break
+      if found < 0: break
+      cur = found
+    var nedits = 0
+    var ci = chains.len - 1
+    while ci >= 0:
+      let ch = chains[ci]
+      ci -= 1
+      var base = vet.ty(g, pi, ch[0])
+      var j = 1
+      while j + 1 < ch.len:
+        let hop1 = ch[j]
+        let hop2 = ch[j + 1]
+        let next_base = tc.obj_type(&g, fs, obj_of(g, pi, hop1))
+        if base > 0:
+          let left = tc.lookup_fm(&g, fs, base, nm(g, pi, hop1))
+          if left.len > 0 and left[2] == tc.S_FIELD and g.orecv[left[0]] == 1:
+            let direct = tc.lookup_fm(&g, fs, base, nm(g, pi, hop2))
+            let actual = obj_of(g, pi, hop2)
+            if direct.len > 0 and actual >= 0 and g.oorig[direct[0]] == g.oorig[actual]:
+              let lt = tc.obj_type(&g, fs, left[0])
+              let right = tc.lookup_fm(&g, fs, lt, nm(g, pi, hop2))
+              if right.len > 0:
+                # direct path == left path + hop1 + right path
+                var want: [Int] = []
+                for i in 3..left.len: want.push(g.oorig[left[i]])
+                want.push(g.oorig[left[0]])
+                for i in 3..right.len: want.push(g.oorig[right[i]])
+                var got: [Int] = []
+                for i in 3..direct.len: got.push(g.oorig[direct[i]])
+                var same = want.len == got.len
+                if same:
+                  for i in 0..want.len:
+                    if want[i] != got[i]: same = false
+                if same:
+                  nedits += 1
+                  report(g, &c, hop1, "QF1008", "could remove embedded field " + vet.go_quote(nm(g, pi, hop1)) + " from selector")
+        base = next_base
+        j += 1
+    if nedits > 1: report(g, &c, n, "QF1008", "could simplify selectors")
+
+# ---- SA5001: deferring Close before checking the error
+
+fn selector_x(g: tc.Prog, pi: Int, sel: Int) -> Int:
+  var x = g.pk[pi].t.a[sel]
+  while k(g, pi, x) == ast.N_SELECTOR: x = g.pk[pi].t.a[x]
+  return x
+
+fn sa5001(var g: tc.Prog, fs: Fs, var c: C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_BLOCK: continue
+    let list = ast.items(g.pk[pi].t, g.pk[pi].t.a[n])
+    if list.len < 2: continue
+    for i in 0..list.len - 1:
+      let st = list[i]
+      if k(g, pi, st) != ast.N_ASSIGN: continue
+      let rhs = ast.items(g.pk[pi].t, g.pk[pi].t.b[st])
+      let lhs = ast.items(g.pk[pi].t, g.pk[pi].t.a[st])
+      if rhs.len != 1 or lhs.len < 2: continue
+      if is_blank(g, pi, lhs[lhs.len - 1]): continue
+      let call = rhs[0]
+      if k(g, pi, call) != ast.N_CALL: continue
+      let ft = vet.ty(g, pi, g.pk[pi].t.a[call])
+      if ft <= 0 or g.tk[ft] != tc.TY_FUNC: continue
+      let rs = tc.tlist(g, g.tb[ft])
+      if rs.len < 2 or rs[rs.len - 1] != g.error_t: continue
+      if k(g, pi, lhs[0]) != ast.N_IDENT: continue
+      let d = list[i + 1]
+      if k(g, pi, d) != ast.N_DEFER: continue
+      let dc = g.pk[pi].t.a[d]
+      let sel = g.pk[pi].t.a[dc]
+      if k(g, pi, sel) != ast.N_SELECTOR: continue
+      let id = selector_x(g, pi, sel)
+      if k(g, pi, id) != ast.N_IDENT: continue
+      if obj_of(g, pi, id) != obj_of(g, pi, lhs[0]) or obj_of(g, pi, id) < 0: continue
+      if nm(g, pi, g.pk[pi].t.b[sel]) != "Close": continue
+      report(g, &c, d, "SA5001", "should check error returned from " + fmt_expr(g, pi, g.pk[pi].t.a[call]) + "() before deferring " + fmt_expr(g, pi, dc))
+
+# ---- QF1001: De Morgan's law
+
+fn has_floats(var g: tc.Prog, fs: Fs, pi: Int, n: Int) -> Bool:
+  for x in vet.preorder(g.pk[pi].t, [n]):
+    let t = vet.ty(g, pi, x)
+    if t <= 0: continue
+    let u = tc.under(&g, fs, t)
+    if u == tc.B_FLOAT32 or u == tc.B_FLOAT64 or u == tc.B_UFLOAT: return true
+  return false
+
+fn qf1001(var g: tc.Prog, fs: Fs, var c: C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_UNARY or g.pk[pi].t.f[n] != T_NOT: continue
+    let x = unparen(g, pi, g.pk[pi].t.a[n])
+    if k(g, pi, x) != ast.N_BINARY: continue
+    if has_floats(&g, fs, pi, x): continue
+    report(g, &c, n, "QF1001", "could apply De Morgan's law")
+
+# ---- QF1004: strings.Replace(..., -1) and friends
+
+fn is_int_lit(var g: tc.Prog, fs: Fs, pi: Int, n: Int, v: Int) -> Bool:
+  var x = unparen(g, pi, n)
+  var neg = false
+  if k(g, pi, x) == ast.N_UNARY and (g.pk[pi].t.f[x] == T_SUB or g.pk[pi].t.f[x] == T_ADD):
+    let y = unparen(g, pi, g.pk[pi].t.a[x])
+    if k(g, pi, y) != ast.N_BASICLIT and k(g, pi, y) != ast.N_UNARY: return false
+  elif k(g, pi, x) != ast.N_BASICLIT: return false
+  let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], x, -1, 0)
+  return cv.k == 1 and cv.i == v
+
+fn qf1004(var g: tc.Prog, fs: Fs, var c: C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_CALL: continue
+    let name = callee_name(&g, fs, pi, n)
+    var repl = ""
+    var argn = 0
+    if name == "strings.Replace":
+      repl = "strings.ReplaceAll"
+      argn = 4
+    elif name == "strings.SplitN":
+      repl = "strings.Split"
+      argn = 3
+    elif name == "strings.SplitAfterN":
+      repl = "strings.SplitAfter"
+      argn = 3
+    elif name == "bytes.Replace":
+      repl = "bytes.ReplaceAll"
+      argn = 4
+    elif name == "bytes.SplitN":
+      repl = "bytes.Split"
+      argn = 3
+    elif name == "bytes.SplitAfterN":
+      repl = "bytes.SplitAfter"
+      argn = 3
+    else: continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len != argn or not is_int_lit(&g, fs, pi, args[argn - 1], -1): continue
+    report(g, &c, g.pk[pi].t.a[n], "QF1004", "could use " + repl + " instead")
+
+# ---- QF1002 / QF1003: tagged switches
+
+fn switch_pairs(g: tc.Prog, pi: Int, e: Int, var pairs: [Int]) -> Bool:
+  let b = unparen(g, pi, e)
+  if k(g, pi, b) != ast.N_BINARY: return false
+  let op = g.pk[pi].t.f[b]
+  if op == T_EQL:
+    if may_side_effect(g, pi, g.pk[pi].t.a[b]) or may_side_effect(g, pi, g.pk[pi].t.b[b]): return false
+    if pairs.len > 0 and fmt_expr(g, pi, g.pk[pi].t.a[b]) != fmt_expr(g, pi, g.pk[pi].t.a[pairs[0]]): return false
+    pairs.push(b)
+    return true
+  if op == T_LOR: return switch_pairs(g, pi, g.pk[pi].t.a[b], &pairs) and switch_pairs(g, pi, g.pk[pi].t.b[b], &pairs)
+  return false
+
+fn has_branch(g: tc.Prog, pi: Int, body: Int) -> Bool:
+  for x in vet.preorder(g.pk[pi].t, [body]):
+    if k(g, pi, x) == ast.N_BRANCH and g.pk[pi].t.f[x] != K_GOTO: return true
+  return false
+
+fn qf1003(var g: tc.Prog, var c: C, nodes: [Int]):
+  let pi = c.pi
+  var else_if: {Int: Bool} = {}
+  for n in nodes:
+    if k(g, pi, n) == ast.N_IF and k(g, pi, g.pk[pi].t.d[n]) == ast.N_IF: else_if[g.pk[pi].t.d[n]] = true
+  for n in nodes:
+    if k(g, pi, n) != ast.N_IF or n in else_if: continue
+    var ok = true
+    var x = ""
+    var count = 0
+    var item = n
+    while item > 0:
+      if g.pk[pi].t.a[item] > 0:
+        ok = false
+        break
+      if has_branch(g, pi, g.pk[pi].t.c[item]):
+        ok = false
+        break
+      var pairs: [Int] = []
+      if not switch_pairs(g, pi, g.pk[pi].t.b[item], &pairs):
+        ok = false
+        break
+      count += 1
+      if pairs.len > 0:
+        let px = fmt_expr(g, pi, g.pk[pi].t.a[pairs[0]])
+        if x.len == 0: x = px
+        elif x != px:
+          ok = false
+          break
+      let els = g.pk[pi].t.d[item]
+      if k(g, pi, els) == ast.N_IF: item = els
+      else: item = -1
+    if not ok or x.len == 0 or count < 2: continue
+    report(g, &c, n, "QF1003", "could use tagged switch on " + x)
+
+fn qf1002(var g: tc.Prog, var c: C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_SWITCH or g.pk[pi].t.b[n] > 0: continue
+    let cases = ast.items(g.pk[pi].t, g.pk[pi].t.c[n])
+    if cases.len == 0: continue
+    var ok = true
+    var x = ""
+    for cc in cases:
+      var pairs: [Int] = []
+      for e in ast.items(g.pk[pi].t, g.pk[pi].t.a[cc]):
+        if not switch_pairs(g, pi, e, &pairs): ok = false
+      if not ok: break
+      if pairs.len > 0:
+        let px = fmt_expr(g, pi, g.pk[pi].t.a[pairs[0]])
+        if x.len == 0: x = px
+        elif x != px:
+          ok = false
+          break
+    if not ok or x.len == 0: continue
+    report(g, &c, n, "QF1002", "could use tagged switch on " + x)
+
+# ---- QF1006: lift if+break into the loop condition
+
+fn qf1006(var g: tc.Prog, var c: C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_FOR: continue
+    if g.pk[pi].t.a[n] > 0 or g.pk[pi].t.b[n] > 0 or g.pk[pi].t.c[n] > 0: continue
+    let body = ast.items(g.pk[pi].t, g.pk[pi].t.a[g.pk[pi].t.d[n]])
+    if body.len == 0: continue
+    let s = body[0]
+    if k(g, pi, s) != ast.N_IF or g.pk[pi].t.a[s] > 0 or g.pk[pi].t.d[s] > 0: continue
+    let ib = ast.items(g.pk[pi].t, g.pk[pi].t.a[g.pk[pi].t.c[s]])
+    if ib.len != 1 or k(g, pi, ib[0]) != ast.N_BRANCH or g.pk[pi].t.f[ib[0]] != K_BREAK or g.pk[pi].t.a[ib[0]] > 0: continue
+    report(g, &c, s, "QF1006", "could lift into loop condition")
+
+# ---- QF1012: WriteString(fmt.Sprintf(...))
+
+fn implements_named(var g: tc.Prog, fs: Fs, t: Int, methods: [Str]) -> Bool:
+  for m in methods:
+    if tc.method_in_set(&g, fs, t, m).len == 0: return false
+  return true
+
+fn qf1012(var g: tc.Prog, fs: Fs, var c: C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_CALL: continue
+    let fun = g.pk[pi].t.a[n]
+    if k(g, pi, fun) != ast.N_SELECTOR: continue
+    let mname = nm(g, pi, g.pk[pi].t.b[fun])
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len != 1: continue
+    var inner = unparen(g, pi, args[0])
+    var bytesv = false
+    if mname == "Write":
+      if k(g, pi, inner) != ast.N_CALL: continue
+      let cf = unparen(g, pi, g.pk[pi].t.a[inner])
+      if k(g, pi, cf) != ast.N_ARRAYTYPE or g.pk[pi].t.a[cf] > 0: continue
+      let el = g.pk[pi].t.b[cf]
+      if k(g, pi, el) != ast.N_IDENT or nm(g, pi, el) != "byte": continue
+      let ca = ast.items(g.pk[pi].t, g.pk[pi].t.b[inner])
+      if ca.len != 1: continue
+      inner = unparen(g, pi, ca[0])
+      bytesv = true
+    elif mname != "WriteString": continue
+    if k(g, pi, inner) != ast.N_CALL: continue
+    let fname = callee_name(&g, fs, pi, inner)
+    if fname != "fmt.Sprint" and fname != "fmt.Sprintf" and fname != "fmt.Sprintln": continue
+    let recv_t = vet.ty(g, pi, g.pk[pi].t.a[fun])
+    let name = fname[4..fname.len]
+    let newname = "F" + name[1..name.len]
+    if bytesv:
+      if not implements_named(&g, fs, recv_t, ["Write"]): continue
+      report(g, &c, n, "QF1012", "Use fmt." + newname + "(...) instead of Write([]byte(fmt." + name + "(...)))")
+    else:
+      if not implements_named(&g, fs, recv_t, ["WriteString", "Write"]): continue
+      report(g, &c, n, "QF1012", "Use fmt." + newname + "(...) instead of WriteString(fmt." + name + "(...))")
+
+# ---- S1005: unnecessary blank assignments
+
+fn s1005(var g: tc.Prog, fs: Fs, var c: C, p: pkg.Pkg, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    let kk = k(g, pi, n)
+    if p.hgen[g.pk[pi].t.file[n]]: continue
+    if kk == ast.N_ASSIGN:
+      let lhs = ast.items(g.pk[pi].t, g.pk[pi].t.a[n])
+      let rhs = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+      if rhs.len != 1: continue
+      let r = unparen(g, pi, rhs[0])
+      let is_recv = k(g, pi, r) == ast.N_UNARY and g.pk[pi].t.f[r] == T_ARROW
+      if lhs.len == 2 and is_blank(g, pi, lhs[1]) and (k(g, pi, r) == ast.N_INDEX or is_recv):
+        report(g, &c, n, "S1005", "unnecessary assignment to the blank identifier")
+      elif lhs.len == 1 and is_blank(g, pi, lhs[0]) and is_recv:
+        report(g, &c, n, "S1005", "unnecessary assignment to the blank identifier")
+    elif kk == ast.N_RANGE:
+      let xt = vet.ty(g, pi, g.pk[pi].t.c[n])
+      let xu = tc.under(&g, fs, xt)
+      if xu > 0 and g.tk[xu] == tc.TY_FUNC: continue
+      let key = g.pk[pi].t.a[n]
+      let val = g.pk[pi].t.b[n]
+      if val <= 0 and is_blank(g, pi, key): report(g, &c, key, "S1005", "unnecessary assignment to the blank identifier")
+      if is_blank(g, pi, key) and is_blank(g, pi, val): report(g, &c, key, "S1005", "unnecessary assignment to the blank identifier")
+      if key > 0 and not is_blank(g, pi, key) and is_blank(g, pi, val): report(g, &c, val, "S1005", "unnecessary assignment to the blank identifier")
+
+# ---- SA6002: non-pointers into sync.Pool
+
+fn pointer_like(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  var u = tc.under(&g, fs, t)
+  if u > 0 and g.tk[u] == tc.TY_TPARAM:
+    let ct = g.tb[u]
+    if ct <= 0: return true
+    u = tc.under(&g, fs, ct)
+    if u > 0 and g.tk[u] == tc.TY_IFACE:
+      let emb = g.tb[u]
+      if emb <= 0: return true
+      for e in tc.tlist(g, emb):
+        let eu = tc.under(&g, fs, e)
+        if eu > 0 and g.tk[eu] == tc.TY_UNION:
+          for x in tc.tlist(g, eu):
+            if pointer_like(&g, fs, x): return true
+          return false
+        if eu > 0 and g.tk[eu] != tc.TY_IFACE: return pointer_like(&g, fs, e)
+      return true
+  if u <= 0: return false
+  let uk = g.tk[u]
+  if uk == tc.TY_IFACE: return true
+  if uk == tc.TY_CHAN or uk == tc.TY_MAP or uk == tc.TY_FUNC or uk == tc.TY_PTR or uk == tc.TY_SLICE: return true
+  return u == tc.B_UNSAFEPTR
+
+fn sa6002(var g: tc.Prog, fs: Fs, var c: C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_CALL: continue
+    if callee_name(&g, fs, pi, n) != "(*sync.Pool).Put": continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len != 1: continue
+    var t = vet.ty(g, pi, args[0])
+    if t <= 0: continue
+    t = tc.default_type(t)
+    let u = tc.under(&g, fs, t)
+    if not pointer_like(&g, fs, t) or (u > 0 and g.tk[u] == tc.TY_SLICE):
+      report(g, &c, args[0], "SA6002", "argument should be pointer-like to avoid allocations")
+
+# ---- ST1006: receiver names
+
+fn st1006(var g: tc.Prog, var c: C, p: pkg.Pkg, roots: [Int]):
+  let pi = c.pi
+  for root in roots:
+    let fi = g.pk[pi].t.file[root]
+    if p.hgen[fi]: continue
+    for d in ast.items(g.pk[pi].t, g.pk[pi].t.c[root]):
+      if k(g, pi, d) != ast.N_FUNCDECL or g.pk[pi].t.a[d] < 0: continue
+      let recv = g.pk[pi].t.a[d]
+      if ast.count(g.pk[pi].t, recv) == 0: continue
+      let f = ast.item(g.pk[pi].t, recv, 0)
+      let names = g.pk[pi].t.a[f]
+      if names < 0 or ast.count(g.pk[pi].t, names) == 0: continue
+      let id = ast.item(g.pk[pi].t, names, 0)
+      let rn = nm(g, pi, id)
+      # only methods on package-level named types
+      let o = obj_of(g, pi, g.pk[pi].t.b[d])
+      if o < 0: continue
+      let bn = vet.recv_type_name(g, o)
+      let to = g.pk[pi].scope.get(bn, -1)
+      if to < 0 or g.pk[pi].t.f[g.odecl[to]] == 1: continue
+      if rn == "self" or rn == "this": report(g, &c, id, "ST1006", "receiver name should be a reflection of its identity; don't use generic names such as \"this\" or \"self\"")
+      if rn == "_": report(g, &c, id, "ST1006", "receiver name should not be an underscore, omit the name if it is unused")
+
+# ---- ST1001: dot imports
+
+fn st1001(var g: tc.Prog, var c: C, p: pkg.Pkg):
+  let pi = c.pi
+  for fi in 0..g.pk[pi].roots.len:
+    if p.test[fi] or p.hgen[fi]: continue
+    for im in ast.items(g.pk[pi].t, g.pk[pi].t.b[g.pk[pi].roots[fi]]):
+      let n = g.pk[pi].t.a[im]
+      if n <= 0 or nm(g, pi, n) != ".": continue
+      let lit = nm(g, pi, g.pk[pi].t.b[im])
+      let path = lit[1..lit.len - 1]
+      if path == "github.com/mmcloughlin/avo/build" or path == "github.com/mmcloughlin/avo/operand" or path == "github.com/mmcloughlin/avo/reg": continue
+      report(g, &c, im, "ST1001", "should not use dot imports")
+
+# ---- S1003: strings.Index(...) != -1
+
+fn s1003(var g: tc.Prog, fs: Fs, var c: C, p: pkg.Pkg, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_BINARY: continue
+    if p.hgen[g.pk[pi].t.file[n]]: continue
+    let op = g.pk[pi].t.f[n]
+    if not (op == T_GEQ or op == T_GTR or op == T_NEQ or op == T_LSS or op == T_EQL): continue
+    let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], g.pk[pi].t.b[n], -1, 0)
+    if cv.k != 1: continue
+    var positive = false
+    if cv.i == -1:
+      if op == T_GTR or op == T_NEQ: positive = true
+      elif op == T_EQL: positive = false
+      else: continue
+    elif cv.i == 0:
+      if op == T_GEQ: positive = true
+      elif op == T_LSS: positive = false
+      else: continue
+    else: continue
+    let call = g.pk[pi].t.a[n]
+    if k(g, pi, call) != ast.N_CALL: continue
+    let sel = g.pk[pi].t.a[call]
+    if k(g, pi, sel) != ast.N_SELECTOR: continue
+    let px = g.pk[pi].t.a[sel]
+    if k(g, pi, px) != ast.N_IDENT: continue
+    let pn = nm(g, pi, px)
+    if pn != "strings" and pn != "bytes": continue
+    let fname = nm(g, pi, g.pk[pi].t.b[sel])
+    var nn = ""
+    if fname == "IndexRune": nn = "ContainsRune"
+    elif fname == "IndexAny": nn = "ContainsAny"
+    elif fname == "Index": nn = "Contains"
+    else: continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[call])
+    var depth = 1
+    if args.len > 1: depth = 2
+    var s = pn + "." + nn + "("
+    for i in 0..args.len:
+      if i > 0: s += ", "
+      s += format.expr1(g.pk[pi].t, args[i], 0, depth)
+    if g.pk[pi].t.f[call] == 1: s += "..."
+    s += ")"
+    if not positive: s = "!" + s
+    report(g, &c, n, "S1003", "should use " + s + " instead")
+
+# ---- the driver
+
+fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gover: Int):
+  var c = C(pi, [])
+  var roots: [Int] = []
+  for fi in 0..g.pk[pi].roots.len:
+    if not p.gen[fi]: roots.push(g.pk[pi].roots[fi])
+  let nodes = vet.preorder(g.pk[pi].t, roots)
+  var parent = [-1] * g.pk[pi].t.k.len
+  for n in nodes:
+    for ch in resolve.kids(g.pk[pi].t, n): parent[ch] = n
+  sa5001(&g, fs, &c, nodes)
+  sa6002(&g, fs, &c, nodes)
+  st1001(&g, &c, p)
+  st1006(&g, &c, p, roots)
+  s1003(&g, fs, &c, p, nodes)
+  s1005(&g, fs, &c, p, nodes)
+  qf1001(&g, fs, &c, nodes)
+  qf1002(&g, &c, nodes)
+  qf1003(&g, &c, nodes)
+  qf1004(&g, fs, &c, nodes)
+  qf1006(&g, &c, nodes)
+  qf1008(&g, fs, &c, nodes, parent)
+  qf1012(&g, fs, &c, nodes)
+  for is in c.out: issues.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
