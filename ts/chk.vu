@@ -4740,8 +4740,11 @@ fn check_container(var c: C, own e0: Ents, root: Int):
     sflags[si] = both
     sdecls[si].push(i)
   for d in lone_fns: check_overloads(&c, [d])
+  let script_root = c.t.k[root] == ast.N_LIST and c.t.d[root] == -2 and not bind.is_module(c, root)
   for si in 0..sflags.len:
     let f = sflags[si]
+    # (a script's names shared with other files are checked once merged into the globals)
+    if script_root and e.name[sdecls[si][0]] in c.global_shared: continue
     if (f & DF_FUNC) != 0 and (f & DF_CLASS) != 0:
       unsup(&c, e.at[sdecls[si][0]], "a class merged with a function")
       return
@@ -5358,3 +5361,170 @@ fn object_dups(var c: C, o: Int):
     else:
       bind.err(&c, at[i], 1119, "An object literal cannot have property and accessor with the same name.")
       return
+
+# ---- script files merged into the globals (TypeScript's mergeSymbolTable(globals, file.locals))
+
+fn excluded_by(f: Int) -> Int:
+  var r = 0
+  if (f & DF_BSV) != 0: r = r | 111551
+  if (f & DF_FSV) != 0: r = r | 111550
+  if (f & DF_FUNC) != 0: r = r | 110991
+  if (f & DF_CLASS) != 0: r = r | 899503
+  if (f & DF_IFACE) != 0: r = r | 788872
+  if (f & DF_ALIAS) != 0: r = r | 788968
+  if (f & DF_IMPORT) != 0: r = r | DF_IMPORT
+  return r
+
+# A file's top-level symbols (its binder's merges), restricted to names in want: their flags and
+# entry indices.
+fn file_symbols(var c: C, root: Int, want: {Int: Bool}, var e: Ents, var fl: {Int: Int}, var ix: {Int: [Int]}):
+  e = container_ents(&c, kids(c, root), true)
+  sort_ents(&e)
+  for i in 0..e.name.len:
+    let n = e.name[i]
+    if not (n in want): continue
+    if not (n in fl):
+      fl[n] = e.flags[i]
+      ix[n] = [i]
+      continue
+    if (fl[n] & e.excl[i]) != 0: continue
+    fl[n] = fl[n] | e.flags[i]
+    ix[n].push(i)
+
+# Names a user script declares at its top that another file declares there too (a lib file or
+# another script): those merge in the globals.
+fn shared_globals(var c: C, user_from: Int):
+  var any_script = false
+  for fi in user_from..c.roots.len:
+    if not bind.is_module(c, c.roots[fi]): any_script = true
+  if not any_script: return
+  var count: {Int: Int} = {}
+  for fi in 1..c.roots.len:
+    let root = c.roots[fi]
+    if fi >= user_from and bind.is_module(c, root): continue
+    let e = container_ents(&c, kids(c, root), true)
+    var mine: {Int: Bool} = {}
+    for n in e.name: mine[n] = true
+    for n, x in mine:
+      if fi >= user_from: c.global_shared[n] = true
+      if n in count: count[n] = count[n] + 1
+      else: count[n] = 1
+  var keep: {Int: Bool} = {}
+  for n, x in c.global_shared:
+    if count[n] > 1: keep[n] = true
+  c.global_shared = keep
+
+fn global_conflicts(var c: C, user_from: Int):
+  # the names user script files declare at their top
+  var scripts: [Int] = []
+  var want: {Int: Bool} = {}
+  for fi in user_from..c.roots.len:
+    let root = c.roots[fi]
+    if bind.is_module(c, root): continue
+    scripts.push(fi)
+    var e = container_ents(&c, kids(c, root), true)
+    for n in e.name: want[n] = true
+  if scripts.len == 0: return
+  # merged in program order: the lib files, then the scripts
+  var gflags: {Int: Int} = {}
+  var gents: {Int: [Int]} = {}      # name -> (file, entry) pairs flattened
+  var files_e: [Ents] = []
+  var pair_count: {Int: Int} = {}   # (file a << 20 | file b) -> conflicting names
+  var conflicts: [Int] = []         # name, file a, file b
+  for fi in 1..c.roots.len:
+    if fi >= user_from and bind.is_module(c, c.roots[fi]): 
+      files_e.push(ents_new())
+      continue
+    var e = ents_new()
+    var sfl: {Int: Int} = {}
+    var six: {Int: [Int]} = {}
+    file_symbols(&c, c.roots[fi], want, &e, &sfl, &six)
+    for n, fl in sfl:
+      if not (n in gflags):
+        gflags[n] = fl
+        gents[n] = []
+        for x in six[n]:
+          gents[n].push(fi)
+          gents[n].push(x)
+        continue
+      if (gflags[n] & excluded_by(fl)) == 0:
+        gflags[n] = gflags[n] | fl
+        for x in six[n]:
+          gents[n].push(fi)
+          gents[n].push(x)
+        continue
+      if ((gflags[n] | fl) & (DF_ENUM | DF_NS)) != 0:
+        unsup(&c, e.at[six[n][0]], "a global declaration merged with a namespace or enum")
+        return
+      # the conflict: reported at every declaration of both (per pair of files, or one error at
+      # each file when eight names or more conflict between them)
+      let first_file = gents[n][0]
+      var bs = 0
+      if ((gflags[n] | fl) & DF_BSV) != 0: bs = 1
+      conflicts.push(n)
+      conflicts.push(first_file)
+      conflicts.push(fi)
+      conflicts.push(bs)
+      let key = (first_file << 20) | fi
+      if key in pair_count: pair_count[key] = pair_count[key] + 1
+      else: pair_count[key] = 1
+    files_e.push(e)
+  # the merged symbols' function overloads and var types
+  for n, fl in gflags:
+    if not (n in c.global_shared): continue
+    var fdecls: [Int] = []
+    var ve = ents_new()
+    var vds: [Int] = []
+    var j = 0
+    while j < gents[n].len:
+      let gf = gents[n][j]
+      let gi = gents[n][j + 1]
+      j += 2
+      let kd = files_e[gf - 1].kind[gi]
+      if kd == 3: fdecls.push(files_e[gf - 1].decl[gi])
+      if kd == 0:
+        let fe = files_e[gf - 1]
+        ent(&ve, c, fe.name[gi], fe.flags[gi], fe.excl[gi], fe.at[gi], fe.named[gi], fe.decl[gi], 0, false)
+        vds.push(vds.len)
+    if fdecls.len > 0: check_overloads(&c, fdecls)
+    if vds.len > 1: check_var_types(&c, ve, vds)
+  var k = 0
+  var reported_pair: {Int: Bool} = {}
+  while k < conflicts.len:
+    let n = conflicts[k]
+    let fa = conflicts[k + 1]
+    let fb = conflicts[k + 2]
+    var code = 2300
+    var msg = "Duplicate identifier '" + nm(c, n) + "'."
+    if conflicts[k + 3] == 1:
+      code = 2451
+      msg = "Cannot redeclare block-scoped variable '" + nm(c, n) + "'."
+    k += 4
+    let key = (fa << 20) | fb
+    if pair_count[key] >= 8:
+      if key in reported_pair: continue
+      reported_pair[key] = true
+      unsup(&c, c.roots[fb], "eight or more global names conflicting between two files")
+      return
+    # the target's declarations (from the first file and any merged later) and the source's
+    var j = 0
+    while j < gents[n].len:
+      let gf = gents[n][j]
+      let gi = gents[n][j + 1]
+      j += 2
+      global_err(&c, files_e[gf - 1], gi, code, msg)
+    var e = ents_new()
+    var sfl: {Int: Int} = {}
+    var six: {Int: [Int]} = {}
+    file_symbols(&c, c.roots[fb], want, &e, &sfl, &six)
+    for x in six[n]: global_err(&c, e, x, code, msg)
+
+# An error at a declaration in any file (a lib file too: tsc reports those).
+fn global_err(var c: C, e: Ents, i: Int, code: Int, msg: Str):
+  var at = e.at[i]
+  var pos = c.t.pos[at]
+  var end = c.t.end[at]
+  if e.named[i] and at in c.t.npos:
+    pos = c.t.npos[at]
+    end = pos + c.t.names[c.t.s[at]].len
+  c.diags.push(parse.Diag(c.t.file[at], pos, end, code, msg + ""))
