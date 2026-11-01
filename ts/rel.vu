@@ -18,6 +18,7 @@ fn assignable(var c: C, s: Int, t: Int) -> Bool:
     return true
   var key = (s << 32) | t
   if c.no_weak: key = key | (1 << 62)
+  if c.permissive: key = key | (1 << 61)
   if key in c.rel_cache: return c.rel_cache[key]
   # a relation being computed is assumed to hold (recursive types)
   c.rel_cache[key] = true
@@ -30,6 +31,36 @@ fn assignable(var c: C, s: Int, t: Int) -> Bool:
 fn generic_rel(var c: C, s: Int, t: Int) -> Int:
   let sk = c.tk[s]
   let tk = c.tk[t]
+  # a union source: each member (eachTypeRelatedToType)
+  if sk == TK_UNION:
+    for m in types.members(c, s):
+      if not assignable(&c, m, t): return 0
+    return 1
+  # a union target: some member first (typeRelatedToSomeType)
+  if tk == TK_UNION:
+    for m in types.members(c, t):
+      if m == s: return 1
+    for m in types.members(c, t):
+      if c.tk[m] >= types.TK_KEYOF and assignable(&c, s, m): return 1
+  # T[K] as a target: a concrete source relates to its writing constraint, when T's and K's base
+  # constraints aren't generic (else to nothing)
+  if tk == types.TK_INDEXED and not tyops.is_generic(&c, s) and sk < types.TK_KEYOF:
+    var bo = tyops.base_of(&c, c.ta[t], 0)
+    if bo == -2: return -1
+    if bo == -1: bo = c.ta[t]
+    var bi = tyops.base_of(&c, c.tb[t], 0)
+    if bi == -2: return -1
+    if bi == -1: bi = c.tb[t]
+    if generic_object(c, bo) or tyops.is_deferred(c, bi) or c.tk[bi] == TK_TPARAM: return 0
+    if bo != c.ta[t]: return -1
+    var parts: [Int] = []
+    for k in types.members(c, bi):
+      let r = tyops.indexed_of(&c, bo, k)
+      if c.tk[r] == TK_UNSUP: return -1
+      parts.push(r)
+    let w = types.inter_of(&c, parts)
+    if assignable(&c, s, w): return 1
+    return 0
   # two instantiations of one conditional type: the same checked and extends types, and the
   # branches related
   if sk == types.TK_COND and tk == types.TK_COND and c.ta[s] == c.ta[t]:
@@ -44,6 +75,23 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     if parts[0][0] == parts[1][0] and parts[0][1] == parts[1][1]:
       if assignable(&c, parts[0][2], parts[1][2]) and assignable(&c, parts[0][3], parts[1][3]): return 1
     return -1
+  # two conditional types: identical extends types, check types related one way, branches related
+  if sk == types.TK_COND and tk == types.TK_COND:
+    var inf1: [Int] = []
+    tyops.collect_infers(c, c.t.b[c.ta[s]], &inf1)
+    tyops.collect_infers(c, c.t.b[c.ta[t]], &inf1)
+    if inf1.len == 0:
+      var ps: [[Int]] = []
+      for x in [s, t]:
+        let n = c.ta[x]
+        var q: [Int] = []
+        for y in [c.t.a[n], c.t.b[n], c.t.c[n], c.t.d[n]]:
+          let r = tyops.raw(&c, y)
+          q.push(bind.instantiate(&c, r, c.tb[x]))
+        ps.push(q)
+      if ps[0][1] == ps[1][1] and (assignable(&c, ps[0][0], ps[1][0]) or assignable(&c, ps[1][0], ps[0][0])):
+        if assignable(&c, ps[0][2], ps[1][2]) and assignable(&c, ps[0][3], ps[1][3]): return 1
+    return -1
   # a deferred conditional type: through an upper bound of its branches
   if sk == types.TK_COND and tk != types.TK_COND:
     # isRelatedTo through the default constraint, then the distributive one
@@ -54,6 +102,11 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     let b = cond_bound(&c, s, 0)
     if b >= 0 and assignable(&c, b, t): return 1
     if d0 >= 0 and dd != -2 and not tyops.is_generic(&c, t): return 0
+    if d0 >= 0 and dd != -2 and tk == types.TK_KEYOF and (c.tk[c.ta[t]] == TK_TPARAM or c.tk[c.ta[t]] == types.TK_COND):
+      # no constraint relates: only the target's own rule is left
+      let kr = keyof_target(&c, s, t)
+      if kr == 1: return 1
+      return 0
     return -1
   if tk == types.TK_COND:
     let n = c.ta[t]
@@ -84,6 +137,9 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
             if assignable(&c, s, tb): return 1
           return 0
     return -1
+  if tk == types.TK_KEYOF:
+    let kr = keyof_target(&c, s, t)
+    if kr >= 0: return kr
   # keyof T is at most string | number | symbol
   if sk == types.TK_KEYOF:
     let all = types.union_of(&c, [c.string_t, c.number_t, c.symbol_t])
@@ -117,6 +173,14 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     return -1
   return -1
 
+# isGenericObjectType: a type variable, a generic mapped type, or an intersection with one.
+fn generic_object(c: C, t: Int) -> Bool:
+  for m in types.members_inter(c, t):
+    let k = c.tk[m]
+    if k == TK_TPARAM or k >= types.TK_KEYOF: return true
+    if k == TK_OBJ and c.objs[c.ta[m]].kind == types.OK_MAPPED: return true
+  return false
+
 # Whether a type node mentions a name (isTypeParameterPossiblyReferenced, by name).
 fn mentions(c: C, n: Int, name: Int) -> Bool:
   if n < 0: return false
@@ -131,6 +195,39 @@ fn mentions(c: C, n: Int, name: Int) -> Bool:
     if ch > 0 and mentions(c, ch, name): return true
   if k != ast.N_INTERFACE and k != ast.N_TYPEALIAS and k != ast.N_VAR and c.t.d[n] > 0: return mentions(c, c.t.d[n], name)
   return false
+
+# S to keyof T (1 related, 0 not, -1 unknown here).
+fn keyof_target(var c: C, s: Int, t: Int) -> Int:
+  let sk = c.tk[s]
+  let x = c.ta[t]
+  # keyof S to keyof T: T to S
+  if sk == types.TK_KEYOF:
+    if assignable(&c, x, c.ta[s]): return 1
+  # a type parameter source: through its constraint
+  var via_con = 0
+  if sk == TK_TPARAM:
+    let scon = constraint_of(&c, s)
+    if scon >= 0 and c.tk[scon] != TK_UNSUP:
+      if assignable(&c, scon, t): return 1
+    via_con = 1
+  # S to keyof T: S to keyof of T's constraint (tsc requires a definite result there)
+  var con = -2
+  if c.tk[x] == TK_TPARAM:
+    con = constraint_of(&c, x)
+    if con < 0: con = -1
+  elif c.tk[x] == types.TK_COND:
+    con = tyops.cond_constraint(&c, x, 0)
+    if con == -1: con = -2
+  if con == -1:
+    if sk < types.TK_KEYOF and not tyops.is_generic(&c, s): return 0
+    if via_con == 1: return 0
+  if con >= 0 and c.tk[con] != TK_UNSUP and not tyops.is_generic(&c, con):
+    let kc = tyops.keyof_of(&c, con)
+    if c.tk[kc] == TK_UNSUP: return -1
+    if assignable(&c, s, kc): return 1
+    if sk < types.TK_KEYOF and not tyops.is_generic(&c, s): return 0
+    if via_con == 1: return 0
+  return -1
 
 # An infer type parameter's constraint: written (infer X extends C), else implied by the type
 # parameter it stands in for (Foo<infer X> gets Foo's constraint); -1 if neither is known.
@@ -220,6 +317,10 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
   if s == t: return true
   let sk = c.tk[s]
   let tk = c.tk[t]
+  # getPermissiveInstantiation: type parameters (and what's deferred on them) are the wildcard
+  if c.permissive:
+    if sk == TK_TPARAM or sk >= types.TK_KEYOF or is_mapped(c, s): return tk != TK_NEVER
+    if tk == TK_TPARAM or tk >= types.TK_KEYOF or is_mapped(c, t): return true
   if tk == TK_ANY or tk == TK_UNKNOWN or tk == TK_ERROR: return true
   if sk == TK_ANY or sk == TK_ERROR: return tk != TK_NEVER
   if sk == TK_NEVER: return true
@@ -669,9 +770,13 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
         ok = true
         break
     if not ok: return false
-  # index signatures
+  # index signatures (with a string one, an index signature of type any takes anything that isn't
+  # a primitive)
   let tsi = bind.index_type(&c, t, false)
-  if tsi >= 0:
+  if tsi >= 0 and c.tk[tsi] == TK_ANY:
+    let tni0 = bind.index_type(&c, t, true)
+    if tni0 < 0 or c.tk[tni0] == TK_ANY: return true
+  if tsi >= 0 and c.tk[tsi] != TK_ANY:
     let ssi = bind.index_type(&c, s, false)
     if ssi >= 0:
       if not assignable(&c, ssi, tsi): return false
@@ -682,7 +787,7 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
         if not assignable(&c, gt, tsi): return false
     else: return false
   let tni = bind.index_type(&c, t, true)
-  if tni >= 0:
+  if tni >= 0 and not (tsi >= 0 and c.tk[tni] == TK_ANY):
     let sni = bind.index_type(&c, s, true)
     if sni >= 0:
       if not assignable(&c, sni, tni): return false

@@ -88,6 +88,26 @@ fn keyof_of(var c: C, t: Int) -> Int:
   if k == TK_UNSUP: return t
   if k == TK_UNKNOWN: return c.never_t
   if k == TK_NEVER: return types.union_of(&c, [c.string_t, c.number_t, c.symbol_t])
+  if k == TK_OBJ and c.objs[c.ta[t]].kind == OK_MAPPED:
+    # a generic mapped type's keys: its constraint (getIndexTypeForMappedType, no as clause)
+    let n = c.objs[c.ta[t]].node
+    if n >= 0 and c.t.b[n] < 0:
+      let tpn = c.t.a[n]
+      let g = raw(&c, c.t.a[tpn])
+      return bind.instantiate(&c, g, c.objs[c.ta[t]].mapper)
+  if k == TK_INTER:
+    # keyof (A & B) is keyof A | keyof B, generic members too (shouldDeferIndexType: unless an
+    # empty object type is with an instantiable one)
+    var inst = false
+    var empty = false
+    for m in types.members_inter(c, t):
+      let mk = c.tk[m]
+      if mk == TK_TPARAM or mk == TK_KEYOF or mk == TK_INDEXED or mk == TK_COND: inst = true
+      if mk == TK_OBJ and types.empty_object(c, m): empty = true
+    if not (inst and empty):
+      var all: [Int] = []
+      for m in types.members_inter(c, t): all.push(keyof_of(&c, m))
+      return types.union_of(&c, all)
   if is_deferred(c, t): return interned(&c, "k{t}", TK_KEYOF, types.F_INDEX, t, 0)
   if k == TK_UNION:
     # the keys every member has
@@ -117,7 +137,18 @@ fn keyof_of(var c: C, t: Int) -> Int:
   for name in bind.prop_names(&c, a):
     let text = c.t.names[name] + ""
     if text.startswith("[Symbol."): continue
-    keys.push(types.str_lit(&c, name, false))
+    # a property named by a numeric literal gives a number literal key
+    let ps = bind.get_prop(&c, a, name)
+    var numeric = false
+    if ps >= 0:
+      let d = c.sdecl[ps]
+      if d >= 0:
+        let dk = c.t.k[d]
+        if dk == ast.N_PROPASSIGN or dk == ast.N_PROP or dk == ast.N_METHOD:
+          let pn = c.t.a[d]
+          if pn >= 0 and c.t.k[pn] == ast.N_NUM: numeric = true
+    if numeric: keys.push(types.num_lit(&c, bind.num_value(text), false))
+    else: keys.push(types.str_lit(&c, name, false))
   let si = bind.index_type(&c, a, false)
   let ni = bind.index_type(&c, a, true)
   if si >= 0:
@@ -127,7 +158,11 @@ fn keyof_of(var c: C, t: Int) -> Int:
     keys.push(c.number_t)
   let u = types.union_of(&c, keys)
   if c.tk[u] != TK_UNION: return u
-  # the union remembers it was keyof T (it prints that way)
+  # the union remembers it was keyof T (it prints that way) for a class, an interface, a generic
+  # type's reference or an aliased type only
+  if c.tk[t] == TK_OBJ and not (t in c.t_alias):
+    let tkd = c.objs[c.ta[t]].kind
+    if tkd != OK_DECL and tkd != OK_REF: return u
   let u2 = types.mk(&c, TK_UNION, types.F_UNION, c.ta[u], c.tb[u])
   let kt = interned(&c, "k{t}", TK_KEYOF, types.F_INDEX, t, 0)
   c.t_origin[u2] = [kt]
@@ -234,6 +269,7 @@ fn indexed_constraint(var c: C, t: Int, depth: Int) -> Int:
     if co < 0 or c.tk[co] == TK_TPARAM: return -1
     o = co
   var parts: [Int] = []
+  if c.tk[o] == TK_OBJ and key_missing(&c, o, i): return -1
   for m in types.members_inter(c, o):
     var r = -1
     if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_MAPPED: r = mapped_at(&c, m, i)
@@ -276,13 +312,18 @@ fn base_of(var c: C, t: Int, depth: Int) -> Int:
     return -1
   if k == TK_INDEXED:
     let r = indexed_base(&c, t, depth)
+    if r == -3: return -1
     if r < 0: return -2
     return base_of(&c, r, depth + 1)
   if k == TK_COND:
     let r = cond_constraint(&c, t, depth)
     if r < 0: return r
     return base_of(&c, r, depth + 1)
-  if k == TK_KEYOF: return -2
+  if k == TK_KEYOF:
+    # keyofConstraintType (a generic mapped type with an as clause isn't modeled)
+    let x = c.ta[t]
+    if c.tk[x] == TK_OBJ and c.objs[c.ta[x]].kind == OK_MAPPED: return -2
+    return types.union_of(&c, [c.string_t, c.number_t, c.symbol_t])
   return t
 
 # T[K] by the base constraints of T and K (an intersection distributed, a generic mapped type's
@@ -297,7 +338,10 @@ fn indexed_base(var c: C, t: Int, depth: Int) -> Int:
     if co < 0 or is_deferred(c, co): return -1
     o = co
   var parts: [Int] = []
-  for m in types.members_inter(c, o):
+  let oms = types.members_inter(c, o)
+  # a plain object type without the key: no constraint (getIndexedAccessTypeOrUndefined)
+  if oms.len == 1 and c.tk[o] == TK_OBJ and key_missing(&c, o, i): return -3
+  for m in oms:
     var r = -1
     if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_MAPPED: r = mapped_at(&c, m, i)
     elif not is_deferred(c, m): r = indexed_of(&c, m, i)
@@ -305,6 +349,29 @@ fn indexed_base(var c: C, t: Int, depth: Int) -> Int:
     parts.push(r)
   if parts.len == 0: return -1
   return types.inter_of(&c, parts)
+
+fn key_missing(var c: C, o: Int, i: Int) -> Bool:
+  let kind = c.objs[c.ta[o]].kind
+  if kind == OK_MAPPED or kind == OK_TUPLE or rel.is_array_ref(&c, o): return false
+  let a = rel.apparent(&c, o)
+  if c.tk[a] != TK_OBJ: return false
+  let si = bind.index_type(&c, a, false)
+  let ni = bind.index_type(&c, a, true)
+  for k in types.members(c, i):
+    let kk = c.tk[k]
+    if kk == TK_STRLIT:
+      if bind.get_prop(&c, a, c.ta[k]) < 0 and si < 0: return true
+    elif kk == TK_NUMLIT:
+      let ntx = c.numtext[c.ta[k]] + ""
+      let nmid = ast.intern(&c.t, ntx)
+      if bind.get_prop(&c, a, nmid) < 0 and si < 0 and ni < 0: return true
+    elif kk == TK_NUMBER:
+      if si < 0 and ni < 0: return true
+    elif kk == TK_STRING:
+      if si < 0: return true
+    elif kk == TK_SYMBOL:
+      return true
+  return false
 
 # getConstraintFromConditionalType: the conditional instantiated for its check type's constraint
 # (when distributive and that isn't never), else the union of its branches. -2 when not computed here.
@@ -387,7 +454,26 @@ fn cond_one_fc(var c: C, n: Int, m: Int, ct: Int, depth: Int) -> Int:
   if infers.len > 0: return -2
   let g1 = raw(&c, c.t.b[n])
   let ext = bind.instantiate(&c, g1, m)
-  if c.tk[ext] == TK_UNSUP or is_generic(&c, ct) or is_generic(&c, ext): return -2
+  if c.tk[ext] == TK_UNSUP or is_deferred(c, ct) or is_deferred(c, ext): return -2
+  if is_generic(&c, ct) or is_generic(&c, ext):
+    # generic below the top: decided by the permissive instantiations only when they can't relate
+    let ek0 = c.tk[ext]
+    if ek0 == TK_ANY or ek0 == TK_UNKNOWN:
+      let rt0 = raw(&c, c.t.c[n])
+      if c.tk[rt0] == TK_COND: return -2
+      return bind.instantiate(&c, rt0, m)
+    let was = c.permissive
+    c.permissive = true
+    let ok = rel.assignable(&c, ct, ext)
+    var back = false
+    if not ok and ek0 != TK_NEVER:
+      for e in types.members(c, ext):
+        if rel.assignable(&c, e, ct): back = true
+    c.permissive = was
+    if ok or back: return -2
+    let rf0 = raw(&c, c.t.d[n])
+    if c.tk[rf0] == TK_COND or c.t.k[c.t.d[n]] == ast.N_TCOND: return -2
+    return bind.instantiate(&c, rf0, m)
   let ek = c.tk[ext]
   let rt = raw(&c, c.t.c[n])
   let rf = raw(&c, c.t.d[n])
@@ -445,6 +531,7 @@ fn idx_unsup(var c: C, o: Int, i: Int) -> Int:
     let a = show.show(&c, o)
     let b = show.show(&c, i)
     d = " [" + a + "][" + b + "]"
+    if c.cur_expr >= 0: d += " near {c.t.pos[c.cur_expr]}"
   return bind.unsupported(&c, 0, "an indexed access the checker can't type" + d)
 
 # ---- mappers
@@ -622,6 +709,11 @@ fn cond_of(var c: C, n: Int, m: Int) -> Int:
   let ct = bind.instantiate(&c, g4_83, m)
   if c.tk[ct] == TK_UNSUP: return ct
   if is_generic(&c, ct):
+    # generic but not deferred (isGenericType is about the top level): decided when the
+    # permissive instantiations can't relate (the false branch) or the extends type is any or
+    # unknown (the true branch)
+    let pr = permissive_pick(&c, n, m, ct)
+    if pr >= 0: return pr
     let ck = cond_key(&c, n, m)
     return interned(&c, ck, TK_COND, types.F_COND, n, m)
   # distributive over a union when the checked type is a naked type parameter
@@ -651,6 +743,31 @@ fn cond_key(var c: C, n: Int, m: Int) -> Str:
     if c.tk[f] != TK_TPARAM or not rel.mentions(c, n, c.sname[c.ta[f]]): continue
     key += ",{f}:{mp.to[i]}"
   return key
+
+fn permissive_pick(var c: C, n: Int, m: Int, ct: Int) -> Int:
+  if is_deferred(c, ct): return -1
+  var infers: [Int] = []
+  collect_infers(c, c.t.b[n], &infers)
+  if infers.len > 0: return -1
+  let g = raw(&c, c.t.b[n])
+  let ext = bind.instantiate(&c, g, m)
+  if c.tk[ext] == TK_UNSUP or is_deferred(c, ext): return -1
+  # a check type that is a union distributes (when the check is a naked type parameter)
+  var checkn = c.t.a[n]
+  while c.t.k[checkn] == ast.N_TPAREN: checkn = c.t.a[checkn]
+  let raw_check = raw(&c, checkn)
+  if c.tk[ct] == TK_UNION and c.tk[raw_check] == TK_TPARAM and c.t.k[checkn] == ast.N_TREF: return -1
+  let ek = c.tk[ext]
+  if ek == TK_ANY or ek == TK_UNKNOWN:
+    let rt = raw(&c, c.t.c[n])
+    return bind.instantiate(&c, rt, m)
+  let was = c.permissive
+  c.permissive = true
+  let ok = rel.assignable(&c, ct, ext)
+  c.permissive = was
+  if ok: return -1
+  let rf = raw(&c, c.t.d[n])
+  return bind.instantiate(&c, rf, m)
 
 fn cond_one(var c: C, n: Int, m: Int, ct: Int) -> Int:
   # infer type parameters in the extends clause: from the checked type
