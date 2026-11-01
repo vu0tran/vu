@@ -8,7 +8,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 d, mode, n, seed = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 rnd = random.Random(seed)
 src = open(HERE + '/check.vu').read() + open(HERE + '/parse.vu').read()
-codes = set(re.findall(r'\b([123]\d{3}), "', src)) | set('2034 2154 2031 2120 3014 3015 3018 3028 3045 1072'.split())
+codes = set(re.findall(r'\b([123]\d{3}), "', src)) | set('2034 2154 2031 2120 3014 3015 3018 3028 3045 1072 1137 2144 2245'.split())
 
 shebangs = ['#!/bin/sh', '#!/bin/bash', '#!/bin/dash', '#!/bin/busybox sh', '#!/bin/ksh', '#!/usr/bin/env bash', '']
 vars_ = ['a', 'b', 'foo', 'PATH', 'RANDOM', 'UID', 'BASH_SOURCE', '_', 'HOSTNAME', 'arr', 'x1', '1', '@', '*', '#', '?']

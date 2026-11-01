@@ -497,6 +497,15 @@ lower is better. (Earlier rounds measured on another VM, where every time was hi
 not checked rather than guessing. Its parser handles the same 2.0 MB in 52 ms. Details, caveats
 and how it's tested against tsc: `ts/README.md`.
 
+## A ShellCheck-compatible linter in Vu
+
+`shellcheck/` holds vsc, a port of ShellCheck 0.11.0 (parser, variable flow, control flow and
+data flow analysis, 315 of its codes) that prints the same `-f gcc` lines. On 5353 scripts from 19
+repositories it prints every line ShellCheck prints for those codes, with nothing extra (41,608
+of ShellCheck's 41,717 lines; the rest are 39 codes it doesn't implement yet), and it uses 31
+times less CPU (14.8 s against 463 s on a loaded 2-core VM; 17 times fewer instructions under
+callgrind on a sample). Details, method and what's missing: `shellcheck/README.md`.
+
 ## Built for the model that writes it
 
 Vu's compiler, runtime, standard library, tests and these documents were written by an AI model
