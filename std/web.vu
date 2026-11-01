@@ -20,17 +20,33 @@ type Ctx:
   params: {Str: Str}   # the route's :name and *name parts, percent-decoded
   vals: {Str: Str}     # set by middleware with web.with()
 
+# Who may call a route. Every route says, so a route nobody decided about can't be added: an admin
+# page left open by mistake has to be written web.Anyone, where a reader sees it.
+#   Anyone              no check (the home page, a webhook that checks its own signature, static files)
+#   SignedIn(login)     someone is signed in: middleware put a "user" value in the context
+#                       (web.with(c, "user", id)). Otherwise 401, or, for a page (GET or HEAD) when
+#                       login isn't "", a redirect to login with ?next= the page.
+#   Only(check)         check(req, c) says yes; otherwise 403, or as SignedIn("") when no one is
+#                       signed in. Checks see the route's parameters (web.param) and the context.
+type Who:
+  Anyone
+  SignedIn(login: Str)
+  Only(check: fn(http.Request, Ctx) -> Bool)
+
 type Route:
   method: Str
   segs: [Str]          # the pattern split at '/': literal text, ":name" or "*name" (last only)
+  who: Who
   handler: fn(http.Request, Ctx) -> http.Response
 
 type WsRoute:
   segs: [Str]
+  who: Who
   handler: fn(own ws.Socket, http.Request, Ctx)
 
 type StreamRoute:
   segs: [Str]
+  who: Who
   handler: fn(own Stream, http.Request, Ctx)
 
 # An open stream of server-sent events (text/event-stream): web.event sends one.
@@ -51,15 +67,15 @@ fn app() -> App:
 # middleware like any request, then h gets the open socket, the request and the context, and owns
 # the connection until it returns. A browser page from another origin is refused (403: anyone's page
 # could otherwise open a socket with the user's cookies) unless allow_origin names it.
-fn websocket(var a: App, p: Str, own h: fn(own ws.Socket, http.Request, Ctx)):
-  a.ws_routes.push(WsRoute(pattern(p), h))
+fn websocket(var a: App, p: Str, own who: Who, own h: fn(own ws.Socket, http.Request, Ctx)):
+  a.ws_routes.push(WsRoute(pattern(p), who, h))
 
 # A route for server-sent events (EventSource in a browser): a GET to p passes the middleware like
 # any request; then h gets the stream, the request and the context, and owns the connection until it
 # returns, sending events with web.event. Over HTTP/1.1 (an HTTP/2 request gets 505).
-#   web.stream(&app, "/rooms/:room/events", own fn(own s, req, c) => follow(net, s, web.param(c, "room")))
-fn stream(var a: App, p: Str, own h: fn(own Stream, http.Request, Ctx)):
-  a.streams.push(StreamRoute(pattern(p), h))
+#   web.stream(&app, "/rooms/:room/events", web.SignedIn(""), own fn(own s, req, c) => follow(net, s, web.param(c, "room")))
+fn stream(var a: App, p: Str, own who: Who, own h: fn(own Stream, http.Request, Ctx)):
+  a.streams.push(StreamRoute(pattern(p), who, h))
 
 # Sends one event: its name ("" for the default, "message") and data (any text: each line is sent as
 # a data line, and EventSource joins them back with newlines). Fails when the client has gone.
@@ -104,24 +120,51 @@ fn pattern(p: Str) -> [Str]:
       seen.push(name)
   return parts
 
-# Adds a route. The first route that matches a request answers it, so add specific ones first.
-fn route(var a: App, method: Str, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
-  a.routes.push(Route(method + "", pattern(p), h))
+# Adds a route: its method, its path pattern, who may call it (a Who) and its handler. The first
+# route that matches a request answers it, so add specific ones first.
+fn route(var a: App, method: Str, p: Str, own who: Who, own h: fn(http.Request, Ctx) -> http.Response):
+  a.routes.push(Route(method + "", pattern(p), who, h))
 
-fn get(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
-  route(&a, "GET", p, h)
+fn get(var a: App, p: Str, own who: Who, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "GET", p, who, h)
 
-fn post(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
-  route(&a, "POST", p, h)
+fn post(var a: App, p: Str, own who: Who, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "POST", p, who, h)
 
-fn put(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
-  route(&a, "PUT", p, h)
+fn put(var a: App, p: Str, own who: Who, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "PUT", p, who, h)
 
-fn patch(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
-  route(&a, "PATCH", p, h)
+fn patch(var a: App, p: Str, own who: Who, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "PATCH", p, who, h)
 
-fn delete(var a: App, p: Str, own h: fn(http.Request, Ctx) -> http.Response):
-  route(&a, "DELETE", p, h)
+fn delete(var a: App, p: Str, own who: Who, own h: fn(http.Request, Ctx) -> http.Response):
+  route(&a, "DELETE", p, who, h)
+
+# The answer for a request its route's Who refuses, or a response with status 0 to let it through.
+fn refuse(who: Who, req: http.Request, c: Ctx) -> http.Response:
+  let pass = http.Response(0, [], "")
+  match who:
+    Anyone: return pass
+    SignedIn(login):
+      if "user" in c.vals: return pass
+      return not_signed_in(login, req)
+    Only(check):
+      if check(req, c): return pass
+      if not ("user" in c.vals): return not_signed_in("", req)
+      return denied(req, 403, "forbidden")
+
+fn not_signed_in(login: Str, req: http.Request) -> http.Response:
+  if login != "" and (req.method == "GET" or req.method == "HEAD"):
+    var target = req.path + ""
+    if req.query != "": target = target + "?" + req.query
+    return redirect(303, login + "?next=" + query_encode(target))
+  return denied(req, 401, "sign in first")
+
+# A refusal as JSON ({"error": ...}) for a client that sends or asks for JSON, else as text.
+fn denied(req: http.Request, status: Int, msg: Str) -> http.Response:
+  let accept = (http.header(req, "accept") else "") + " " + (http.header(req, "content-type") else "")
+  if "json" in accept.lower() or req.path.startswith("/api/"): return http.json(status, "{{\"error\": \"" + msg + "\"}}")
+  return http.text(status, msg)
 
 # Adds middleware. Each runs in the order added, around everything added after it, for every request
 # (unmatched ones too, which get 404 or 405 at the end of the chain).
@@ -158,6 +201,10 @@ fn dispatch(a: App, req: http.Request, c: Ctx) -> http.Response:
     for i in 0..a.ws_routes.len:
       if ps = match_route(a.ws_routes[i].segs, parts):
         if not origin_ok(a, req): return http.text(403, "cross-site WebSocket refused")
+        var cw = copy_ctx(c)
+        for k, v in ps: cw.params[k] = v + ""
+        let no = refuse(a.ws_routes[i].who, req, cw)
+        if no.status != 0: return no
         # 101: http gives the connection to ws_take, with this response: which route, and the context
         var hs = [http.Header(":route", "{i}")]
         for k, v in ps: hs.push(http.Header(":param:" + k, v + ""))
@@ -167,6 +214,10 @@ fn dispatch(a: App, req: http.Request, c: Ctx) -> http.Response:
   if req.method == "GET":
     for i in 0..a.streams.len:
       if ps = match_route(a.streams[i].segs, parts):
+        var cs = copy_ctx(c)
+        for k, v in ps: cs.params[k] = v + ""
+        let no = refuse(a.streams[i].who, req, cs)
+        if no.status != 0: return no
         if req.version == "HTTP/2": return http.text(505, "server-sent events are served over HTTP/1.1")
         # as for a WebSocket: http gives the connection to ws_take with this response
         var hs = [http.Header(":stream", "{i}")]
@@ -181,6 +232,8 @@ fn dispatch(a: App, req: http.Request, c: Ctx) -> http.Response:
       if same:
         var c2 = copy_ctx(c)
         for k, v in ps: c2.params[k] = v + ""
+        let no = refuse(r.who, req, c2)
+        if no.status != 0: return no
         return r.handler(req, c2)
       if not (r.method in allowed): allowed.push(r.method + "")
       if r.method == "GET" and not ("HEAD" in allowed): allowed.push("HEAD")
@@ -262,6 +315,12 @@ fn with(c: Ctx, name: Str, value: Str) -> Ctx:
   var out = copy_ctx(c)
   out.vals[name] = value + ""
   return out
+
+# The context without a value (for middleware that decides it afresh).
+fn without(c: Ctx, name: Str) -> Ctx:
+  var c2 = copy_ctx(c)
+  c2.vals.remove(name)
+  return c2
 
 fn val(c: Ctx, name: Str) -> Str?:
   if name in c.vals: return c.vals[name] + ""
@@ -569,6 +628,18 @@ fn is_token(s: Str) -> Bool:
   return true
 
 # The value with every byte a cookie can't hold (and '%') written as %XX; web.get_cookie decodes it.
+# Text for a URL's query (a value after "name="): every byte but letters, digits and - . _ ~ as %XX.
+fn query_encode(s: Str) -> Str:
+  let hex = "0123456789ABCDEF"
+  var out = ""
+  for i in 0..s.len:
+    let b = s[i]
+    if (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '-' or b == '.' or b == '_' or b == '~':
+      out += str([b])
+    else:
+      out += "%" + str([hex[int(b) >> 4], hex[int(b) & 15]])
+  return out
+
 fn cookie_encode(s: Str) -> Str:
   let hex = "0123456789ABCDEF"
   var out = ""

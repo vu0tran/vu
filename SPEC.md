@@ -1419,8 +1419,8 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   web.use(&app, web.logger(os))          # middleware runs in the order added, around what follows
   web.use(&app, web.same_origin)
   web.use(&app, auth)
-  web.get(&app, "/items/:id", show)      # also post, put, patch, delete, and web.route(&app, METHOD, ...)
-  web.get(&app, "/static/*file", web.files(fs, "public"))
+  web.get(&app, "/items/:id", web.Anyone, show)      # also post, put, patch, delete, and web.route(&app, METHOD, ...)
+  web.get(&app, "/static/*file", web.Anyone, web.files(fs, "public"))
   web.serve(net, os, app, 8080)?         # http.serve with the app; stops on SIGTERM / SIGINT
 ```
 
@@ -1454,7 +1454,7 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   them: `max_age`, `same_site`...); `web.clear_cookie(&resp, name)`. Values are percent-encoded, so
   any text is safe in one. `web.sign(secret, value)` and `web.verify(secret, signed)` (HMAC-SHA256,
   compared in constant time) make a cookie the client can read but not change.
-- Server-sent events (a browser's `EventSource`): `web.stream(&app, "/rooms/:id/events", own fn(own s,
+- Server-sent events (a browser's `EventSource`): `web.stream(&app, "/rooms/:id/events", web.Anyone, own fn(own s,
   req, c) => follow(net, s, web.param(c, "id")))` passes the middleware like any GET, then hands the
   handler the open stream; `web.event(net, &s, name, data)?` sends one (`""` for the default
   name; data of any lines), `web.keep_alive(net, &s)?` a comment that keeps proxies from closing a
@@ -1475,7 +1475,7 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   `paths` (all if empty): `web.use(&app, web.limit(os, 20, 60.0, 1, ["/login", "/signup"]))`.
   The counts are in memory, for up to 100,000 clients at a time.
 - Metrics: `let m = web.metrics(os)`, `web.use(&app, web.track(os, m))` (first, so it times the
-  rest) and `web.get(&app, "/metrics", web.metrics_page(m))` give Prometheus's text format:
+  rest) and `web.get(&app, "/metrics", web.Anyone, web.metrics_page(m))` give Prometheus's text format:
   `http_requests_total` by method and status, `http_request_duration_seconds` as a histogram, and
   `process_start_time_seconds`. Methods HTTP doesn't define count as `OTHER`, so clients can't add
   labels without end. Put the page behind a check if the app is public.

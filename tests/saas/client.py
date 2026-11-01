@@ -118,7 +118,8 @@ try:
     events = [blk for blk in (body if isinstance(body, str) else "").split("\n\n") if blk]
     expect("streamed answer", (st, h.get("Content-Type"), events), (200, "text/event-stream; charset=utf-8",
         ["event: piece\ndata: Forty", "event: piece\ndata: -two", "event: piece\ndata: .", "event: done\ndata: "]))
-    expect("streaming signed out", call("GET", "/ask/stream?q=hi")[1], "event: problem\ndata: sign in on the paid plan, and ask 1 to 4,000 bytes\n\n")
+    # the route says web.SignedIn: refused before the stream opens
+    expect("streaming signed out", call("GET", "/ask/stream?q=hi")[0:2], (401, "sign in first"))
     expect("checkout when pro", call("POST", "/billing/checkout", token=ada)[0], 409)
     expect("an event it doesn't use", hook({"id": "evt_2", "type": "invoice.paid", "data": {"object": {}}}), 200)
     expect("pro after logging in again", call("POST", "/login", {"email": "ada@example.com", "password": "correct horse battery"})[1]["plan"], "pro")

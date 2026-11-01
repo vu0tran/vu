@@ -31,7 +31,7 @@ class Browser:
         return m.group(1) if m else ""
 
 ada = Browser()
-expect("home signed out", ada.req("GET", "/")[0::2], (303, "/login"))
+expect("home signed out", ada.req("GET", "/")[0::2], (303, "/login?next=%2F"))
 st, page, _ = ada.req("GET", "/signup")
 expect("signup page", (st, "<form" in page, "pre" in ada.jar), (200, True, True))
 tok = ada.csrf(page)
@@ -71,6 +71,18 @@ st, page, _ = ada.req("POST", "/login", {"email": "nobody@example.com", "passwor
 expect("unknown email", (st, "Wrong email or password." in page), (401, True))
 expect("signed in", ada.req("POST", "/login", {"email": "ADA@example.com", "password": "correct horse battery", "csrf_token": ltok})[0::2], (303, "/"))
 expect("signed in again", "Your notes" in ada.req("GET", "/")[1], True)
+# every route says who may call it: signed out, the notes routes refuse before the handler runs
+bob = Browser()
+expect("a note signed out", bob.req("POST", "/notes", {"text": "x"})[0], 401)
+expect("a delete signed out", bob.req("POST", "/notes/1/delete", {})[0], 401)
+# back to the page that sent the browser to sign in (?next=, kept in the form); never to another site
+st, page, _ = bob.req("GET", "/login?next=%2F%3Fq%3D1")
+expect("next in the form", 'name="next" value="/?q=1"' in page, True)
+btok = bob.csrf(bob.req("GET", "/signup")[1])
+expect("signed up, back to next", bob.req("POST", "/signup", {"email": "bob@example.com", "password": "bob's long password", "csrf_token": btok, "next": "/?q=1"})[0::2], (303, "/?q=1"))
+carl = Browser()
+ctok = carl.csrf(carl.req("GET", "/signup")[1])
+expect("a next on another site", carl.req("POST", "/signup", {"email": "carl@example.com", "password": "carl's long password", "csrf_token": ctok, "next": "//evil.example/x"})[0::2], (303, "/"))
 expect("stylesheet", ada.req("GET", "/static/style.css")[0], 200)
 expect("health", ada.req("GET", "/health")[0], 200)
 for f in fails: print("FAIL  " + f)

@@ -36,6 +36,7 @@ const AUTH_FORM = """
   <p class="error">{{error}}</p>
   <form method="post" action="{{action}}">
   <input type="hidden" name="csrf_token" value="{{csrf}}">
+  <input type="hidden" name="next" value="{{next}}">
   <label>Email <input name="email" type="email" autocomplete="email" value="{{email}}" required></label>
   <label>Password <input name="password" type="password" autocomplete="{{complete}}" minlength="10" required></label>
   <button>{{title}}</button>
@@ -97,7 +98,7 @@ fn auth_page(env: Shared[Env], req: http.Request, signup: Bool, error: Str, emai
     complete = "new-password"
     other = web.render("Have an account? <a href=\"/login\">Sign in</a>.", [])
   let body = web.render(AUTH_FORM, [web.v("title", title), web.v("error", error), web.v("action", action), web.v("csrf", auth.csrf_token(env.value.secret, pre)),
-    web.v("email", email), web.v("complete", complete), web.h("other", other)])
+    web.v("email", email), web.v("complete", complete), web.h("other", other), web.v("next", next_page(req))])
   var resp = page(title, nav_out(), body)
   resp.status = status
   return with_pre(resp, pre)
@@ -119,23 +120,21 @@ type User:
   email: Str
   token: Str
 
-fn current(net: Net, os: Os, var db: pg.Db, req: http.Request) -> User:
-  let token = auth.session_token(req) else return User("", "", "")
-  let uid = auth.session_user(net, &db, os, token) else return User("", "", "")
-  let id = uid else return User("", "", "")
-  let rows = pg.query(net, &db, "select email from users where id = $1", [id]) else return User("", "", "")
-  if rows.rows.len == 0: return User("", "", "")
-  return User(id + "", pg.text(rows, 0, "email") else "", token + "")
+# Who's signed in: auth.users puts the user and the session in the context, and the routes that use
+# this say web.SignedIn, so they never run without one.
+fn me(c: web.Ctx) -> User:
+  return User(web.val(c, "user") else "", "", web.val(c, "session") else "")
 
 fn home(net: Net, os: Os, var db: pg.Db, env: Shared[Env], req: http.Request, c: web.Ctx) -> http.Response:
-  let u = current(net, os, &db, req)
-  if u.id == "": return web.redirect(303, "/login")
+  let u = me(c)
   let csrf = auth.csrf_token(env.value.secret, u.token)
+  let who = pg.query(net, &db, "select email from users where id = $1", [u.id]) else return http.text(500, "database error")
+  let email = pg.text(who, 0, "email") else ""
   let rows = pg.query(net, &db, "select id, text from notes where user_id = $1 order by id", [u.id]) else return http.text(500, "database error")
   var items: [web.Html] = []
   for i in 0..rows.rows.len:
     items.push(web.render(ITEM, [web.v("text", pg.text(rows, i, "text") else ""), web.v("id", pg.text(rows, i, "id") else ""), web.v("csrf", csrf)]))
-  return page("Notes", nav_in(u.email, csrf), web.render(NOTES, [web.v("csrf", csrf), web.h("items", web.join(items))]))
+  return page("Notes", nav_in(email, csrf), web.render(NOTES, [web.v("csrf", csrf), web.h("items", web.join(items))]))
 
 fn signup_page(net: Net, os: Os, var db: pg.Db, env: Shared[Env], req: http.Request, c: web.Ctx) -> http.Response:
   return auth_page(env, req, true, "", "", 200)
@@ -147,9 +146,15 @@ fn valid_email(s: Str) -> Bool:
   let at = s.find("@")
   return s.len <= 254 and at > 0 and at < s.len - 1 and not (" " in s) and s.count("@") == 1
 
-fn signed_in(net: Net, os: Os, var db: pg.Db, id: Str) -> http.Response:
+# The page to go to after signing in: the one a SignedIn route sent the browser here from (?next=, or
+# the form's next field). web.redirect keeps it on this site.
+fn next_page(req: http.Request) -> Str:
+  if n = web.field(req, "next"): return n + ""
+  return http.query(req, "next") else "/"
+
+fn signed_in(net: Net, os: Os, var db: pg.Db, id: Str, req: http.Request) -> http.Response:
   let token = auth.login(net, &db, os, id, SESSION_DAYS) else return http.text(500, "database error")
-  var resp = web.redirect(303, "/")
+  var resp = web.redirect(303, next_page(req))
   auth.set_session(&resp, token, SESSION_DAYS)
   web.clear_cookie(&resp, "pre")
   return resp
@@ -163,7 +168,7 @@ fn signup(net: Net, os: Os, var db: pg.Db, env: Shared[Env], req: http.Request, 
   let hash = auth.hash_password(password)
   let rows = pg.query(net, &db, "insert into users (email, password_hash) values ($1, $2) on conflict (email) do nothing returning id", [email, hash]) else return http.text(500, "database error")
   if rows.rows.len == 0: return auth_page(env, req, true, "That email has an account.", email, 409)
-  return signed_in(net, os, &db, pg.text(rows, 0, "id") else "")
+  return signed_in(net, os, &db, pg.text(rows, 0, "id") else "", req)
 
 fn login(net: Net, os: Os, var db: pg.Db, env: Shared[Env], req: http.Request, c: web.Ctx) -> http.Response:
   if not auth.csrf_ok(req, env.value.secret, pre_token(req)): return auth_page(env, req, false, "That form expired; try again.", "", 403)
@@ -173,18 +178,17 @@ fn login(net: Net, os: Os, var db: pg.Db, env: Shared[Env], req: http.Request, c
   var stored = "pbkdf2_sha256$600000$timingtimingtiming$x"   # hashed anyway when there's no account: the time doesn't tell
   if rows.rows.len == 1: stored = pg.text(rows, 0, "password_hash") else ""
   if not auth.check_password(password, stored) or rows.rows.len == 0: return auth_page(env, req, false, "Wrong email or password.", email, 401)
-  return signed_in(net, os, &db, pg.text(rows, 0, "id") else "")
+  return signed_in(net, os, &db, pg.text(rows, 0, "id") else "", req)
 
 fn logout(net: Net, os: Os, var db: pg.Db, env: Shared[Env], req: http.Request, c: web.Ctx) -> http.Response:
-  let u = current(net, os, &db, req)
-  if u.id != "" and auth.csrf_ok(req, env.value.secret, u.token): auth.logout(net, &db, req) else return http.text(500, "database error")
+  let u = me(c)
+  if auth.csrf_ok(req, env.value.secret, u.token): auth.logout(net, &db, req) else return http.text(500, "database error")
   var resp = web.redirect(303, "/login")
   auth.clear_session(&resp)
   return resp
 
 fn add_note(net: Net, os: Os, var db: pg.Db, env: Shared[Env], req: http.Request, c: web.Ctx) -> http.Response:
-  let u = current(net, os, &db, req)
-  if u.id == "": return web.redirect(303, "/login")
+  let u = me(c)
   if not auth.csrf_ok(req, env.value.secret, u.token): return http.text(403, "that form expired; go back and reload the page")
   let text = (web.field(req, "text") else "").strip()
   if text == "" or text.len > 10000: return web.redirect(303, "/")
@@ -192,8 +196,7 @@ fn add_note(net: Net, os: Os, var db: pg.Db, env: Shared[Env], req: http.Request
   return web.redirect(303, "/")
 
 fn delete_note(net: Net, os: Os, var db: pg.Db, env: Shared[Env], req: http.Request, c: web.Ctx) -> http.Response:
-  let u = current(net, os, &db, req)
-  if u.id == "": return web.redirect(303, "/login")
+  let u = me(c)
   if not auth.csrf_ok(req, env.value.secret, u.token): return http.text(403, "that form expired; go back and reload the page")
   let id = int(web.param(c, "id")) else return web.redirect(303, "/")
   pg.exec(net, &db, "delete from notes where id = $1 and user_id = $2", ["{id}", u.id]) else return http.text(500, "database error")
@@ -220,21 +223,24 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   match setup(net, fs, &db):
     ok: pool.send(db)
     err(e): fail "setting up the tables: " + e
-  let env = share(Env(pool, cfg, secret))
   var app = web.app()
   web.use(&app, web.logger(os))
   web.use(&app, web.same_origin)
   let proxies = int(os.env("PROXIES")) else 0
   web.use(&app, web.limit(os, 20, 60.0, proxies, ["/login", "/signup"]))
-  web.get(&app, "/health", health)
-  web.get(&app, "/static/*file", web.files(fs, "public"))
-  web.get(&app, "/", route(net, os, env, home))
-  web.get(&app, "/signup", route(net, os, env, signup_page))
-  web.post(&app, "/signup", route(net, os, env, signup))
-  web.get(&app, "/login", route(net, os, env, login_page))
-  web.post(&app, "/login", route(net, os, env, login))
-  web.post(&app, "/logout", route(net, os, env, logout))
-  web.post(&app, "/notes", route(net, os, env, add_note))
-  web.post(&app, "/notes/:id/delete", route(net, os, env, delete_note))
+  let ucfg = pg.from_url(url)?
+  web.use(&app, auth.users(net, os, pool, ucfg))
+  let env = share(Env(pool, cfg, secret))
+  # every route says who may call it: web.SignedIn (sends a browser to /login) or web.Only
+  web.get(&app, "/health", web.Anyone, health)
+  web.get(&app, "/static/*file", web.Anyone, web.files(fs, "public"))
+  web.get(&app, "/", web.SignedIn("/login"), route(net, os, env, home))
+  web.get(&app, "/signup", web.Anyone, route(net, os, env, signup_page))
+  web.post(&app, "/signup", web.Anyone, route(net, os, env, signup))
+  web.get(&app, "/login", web.Anyone, route(net, os, env, login_page))
+  web.post(&app, "/login", web.Anyone, route(net, os, env, login))
+  web.post(&app, "/logout", web.SignedIn(""), route(net, os, env, logout))
+  web.post(&app, "/notes", web.SignedIn(""), route(net, os, env, add_note))
+  web.post(&app, "/notes/:id/delete", web.SignedIn(""), route(net, os, env, delete_note))
   print("listening on http://localhost:{port}")
   web.serve(net, os, app, port)?

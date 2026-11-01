@@ -314,8 +314,8 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   var app = web.app()
   web.use(&app, web.logger(os))
   web.use(&app, web.same_origin)                          # refuses cross-site form posts
-  web.get(&app, "/users/:name", user)
-  web.get(&app, "/static/*file", web.files(fs, "public"))
+  web.get(&app, "/users/:name", web.Anyone, user)
+  web.get(&app, "/static/*file", web.Anyone, web.files(fs, "public"))
   web.serve(net, os, app, 8080)?
 ```
 
