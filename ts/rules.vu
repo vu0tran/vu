@@ -29,6 +29,16 @@ type L:
   elsep: {Int: Int}   # an if statement in an else branch -> the if it's the else of
   in_import: Bool
   setfns: {Int: Bool}   # functions that are a property descriptor's set
+  getfns: {Int: Bool}   # ... and get
+  # break targets for the flow analyses: kind (1 loop, 2 switch, 3 label), label, states that break to it
+  fk: [Int]
+  fl: [Int]
+  fa: [Int]
+  cs_exits: Int
+  cs_dup: [Int]
+  cs_this: Bool
+  cs_mode: Int          # 0 constructor-super (statement-level super calls), 1 no-this-before-super
+  gr_bare: Bool
   tagged: {Int: Bool}   # templates with a tag
   fatal: Str            # an error that stops linting the file (as oxlint's parse errors do)
   fatal_at: Int
@@ -133,6 +143,7 @@ fn same(l: L, a: Int, b: Int) -> Bool:
 fn lint(path: Str, src: Str, var kw: {Str: Int}) -> [Str]:
   var out: [Str] = []
   var t = ast.new_ast()
+  ast.reserve_nodes(&t, src.len / 6 + 16)
   let pd = parse.parse_file_x(&t, src + "", 1, &kw, true)
   if pd.len > 0:
     let lc = line_col(src, pd[0].pos)
@@ -144,12 +155,13 @@ fn lint(path: Str, src: Str, var kw: {Str: Int}) -> [Str]:
   swap(&t2, &bld.t)
   var sc = scope.new_scopes()
   swap(&sc, &bld.sc)
-  var l = L(t2, src + "", [], [], [], [], false, 0, {}, sc, {}, false, {}, {}, "", -1)
+  var l = L(t2, src + "", [], [], [], [], false, 0, {}, sc, {}, false, {}, {}, [], [], [], 0, [], false, 0, false, {}, "", -1)
   collect_elses(&l)
   mark_directives(&l, root)
   l.jt.push(5)
   l.jl.push(-1)
   l.jused.push(false)
+  ur_list(&l, root, true)
   visit(&l, root)
   scope_rules(&l)
   if l.fatal != "":
@@ -228,10 +240,18 @@ fn directives(l: L) -> [Dir]:
       if sl >= 0: r = r[sl + 1..r.len]
       if r != "": rules.push(r)
     var line = 0
-    if kind == 3: line = line_col(l.src, a)[0]
-    if kind == 4: line = line_col(l.src, b)[0] + 1
+    if kind == 3: line = line_at(l.src, a)
+    if kind == 4: line = line_at(l.src, b) + 1
     out.push(Dir(a, kind, line, rules))
   return out
+
+fn line_at(src: Str, pos: Int) -> Int:
+  var line = 1
+  var i = src.find("\n")
+  while i >= 0 and i < pos:
+    line += 1
+    i = src.find("\n", i + 1)
+  return line
 
 fn short_rule(r: Str) -> Str:
   let p = r.find("(")
@@ -419,6 +439,8 @@ fn visit_function(var l: L, n: Int, kd: Int):
   var body = l.t.d[n]
   if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR: body = l.t.c[n]
   mark_directives(&l, body_list(l, body))
+  if body > 0 and l.t.k[body] == ast.N_BLOCK: ur_list(&l, l.t.a[body], true)
+  if body > 0 and l.t.k[body] == ast.N_BLOCK and (kd == ast.N_GET or n in l.getfns): getter_return(&l, n, kd, body)
   visit_kids(&l, n)
   pop_jt(&l)
   # require-yield
@@ -435,6 +457,8 @@ fn visit_function(var l: L, n: Int, kd: Int):
 # ---- rules at each node
 
 fn check(var l: L, n: Int, kd: Int):
+  # (the commonest kinds have no rules)
+  if kd == ast.N_ID or kd == ast.N_NUM or kd == ast.N_PARAM or kd == ast.N_TREF or kd == ast.N_TKW or kd == ast.N_BLOCK or kd == ast.N_PROPASSIGN or kd == ast.N_VAR or kd == ast.N_THIS: return
   if kd == ast.N_DEBUGGER:
     add(&l, l.t.pos[n], "eslint(no-debugger)", "`debugger` statement is not allowed", "Remove the debugger statement")
   elif kd == ast.N_WITH:
@@ -509,6 +533,7 @@ fn check(var l: L, n: Int, kd: Int):
   elif kd == ast.N_OBJECT: dupe_keys(&l, n)
   elif kd == ast.N_CLASS or kd == ast.N_CLASSEXPR:
     dupe_class_members(&l, n)
+    if l.t.b[n] > 0: ctor_super(&l, n)
     let ext = l.t.b[n]
     if ext > 0: unsafe_chain(&l, l.t.a[ext])
   elif kd == ast.N_STATICBLOCK:
@@ -1083,6 +1108,10 @@ fn descriptor(var l: L, n: Int):
       let f = unparen(l, l.t.b[pr])
       if k(l, f) == ast.N_FUNCEXPR or k(l, f) == ast.N_ARROW: l.setfns[f] = true
     elif kp == ast.N_METHOD and key_name(l, l.t.a[pr]) == "set": l.setfns[pr] = true
+    if kp == ast.N_PROPASSIGN and key_name(l, l.t.a[pr]) == "get":
+      let f = unparen(l, l.t.b[pr])
+      if k(l, f) == ast.N_FUNCEXPR or k(l, f) == ast.N_ARROW: l.getfns[f] = true
+    elif kp == ast.N_METHOD and key_name(l, l.t.a[pr]) == "get": l.getfns[pr] = true
 
 # ---- no-unsafe-optional-chaining
 
@@ -1796,3 +1825,463 @@ fn unused_var(var l: L, y: Int):
   elif kind == scope.Y_INTERFACE: add(&l, at, rule, "Interface '{name}' is declared but never used.", "Consider removing this declaration.")
   elif kind == scope.Y_ENUM: add(&l, at, rule, "Enum '{name}' is declared but never used.", "Consider removing this declaration.")
   elif kind == scope.Y_NAMESPACE: add(&l, at, rule, "Variable '{name}' is declared but never used.", "Consider removing this declaration.")
+
+# ---- flow: break targets
+
+fn fpush(var l: L, kind: Int, label: Int):
+  l.fk.push(kind)
+  l.fl.push(label)
+  l.fa.push(0)
+
+fn fpop(var l: L) -> Int:
+  l.fk.pop()
+  l.fl.pop()
+  return l.fa.pop()
+
+# Adds a state to the target of a break (n: the break statement).
+fn fbreak(var l: L, n: Int, st: Int):
+  let label = l.t.s[n]
+  var i = l.fk.len - 1
+  while i >= 0:
+    if label > 0:
+      if l.fk[i] == 3 and l.fl[i] == label:
+        l.fa[i] = l.fa[i] | st
+        return
+    elif l.fk[i] == 1 or l.fk[i] == 2:
+      l.fa[i] = l.fa[i] | st
+      return
+    i -= 1
+
+# For continue: the loop it continues (a labeled one's loop is the entry after its label).
+fn fcontinue(var l: L, n: Int, st: Int):
+  let label = l.t.s[n]
+  var i = l.fk.len - 1
+  while i >= 0:
+    if label > 0:
+      if l.fk[i] == 3 and l.fl[i] == label and i + 1 < l.fk.len:
+        return
+    elif l.fk[i] == 1:
+      return
+    i -= 1
+
+fn infinite_test(l: L, n: Int) -> Bool:
+  return n <= 0 or k(l, unparen(l, n)) == ast.N_TRUE
+
+# ---- no-unreachable
+
+fn reportable(l: L, n: Int) -> Bool:
+  let kd = k(l, n)
+  if kd == ast.N_EMPTY or kd == ast.N_FUNC or kd == ast.N_CLASS or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS: return false
+  if kd == ast.N_VAR:
+    if (l.t.d[n] & ast.M_DECLARE) != 0: return false
+    if l.t.f[n] != 0: return true
+    let lst = l.t.a[n]
+    for i in 0..ast.count(l.t, lst):
+      if l.t.c[ast.item(l.t, lst, i)] > 0: return true
+    return false
+  if kd == ast.N_MODULE or kd == ast.N_ENUM:
+    return (l.t.f[n] & ast.M_DECLARE) == 0 and kd == ast.N_ENUM
+  return true
+
+# Reachability: 1 reachable, 2 unreachable after a jump (return, throw, break, continue), 3
+# unreachable after an infinite loop. oxlint's control flow graph brings code back to life after
+# some statements (a ternary or a try with a catch; after an infinite loop also an if both of whose
+# ways can complete): its successors are reachable again.
+fn ur_list(var l: L, lst: Int, reach: Bool) -> Bool:
+  var st = 1
+  if not reach: st = 2
+  for i in 0..ast.count(l.t, lst):
+    let x = ast.item(l.t, lst, i)
+    st = ur_stmt(&l, x, st)
+  return st == 1
+
+fn ur_join(a: Int, b: Int) -> Int:
+  if a == 1 or b == 1: return 1
+  if a == 3 or b == 3: return 3
+  return 2
+
+fn has_cond(l: L, n: Int) -> Bool:
+  if n <= 0: return false
+  let kd = l.t.k[n]
+  if kd == ast.N_LIST:
+    for i in 0..l.t.b[n]:
+      if has_cond(l, l.t.L[l.t.a[n] + i]): return true
+    return false
+  if kd == ast.N_COND:
+    let tk = k(l, unparen(l, l.t.a[n]))
+    if tk != ast.N_TRUE and tk != ast.N_FALSE: return true
+  if is_func(kd) or kd == ast.N_CLASS or kd == ast.N_CLASSEXPR: return false
+  if has_cond(l, l.t.a[n]) or has_cond(l, l.t.b[n]) or has_cond(l, l.t.c[n]): return true
+  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS: return has_cond(l, l.t.d[n])
+  return false
+
+fn revives(var l: L, n: Int, st: Int) -> Bool:
+  let kd = l.t.k[n]
+  if kd == ast.N_TRY and l.t.c[n] > 0: return true
+  if st == 3 and kd == ast.N_IF:
+    let t = ur_stmt_quiet(&l, l.t.b[n])
+    var e = true
+    if l.t.c[n] > 0: e = ur_stmt_quiet(&l, l.t.c[n])
+    if t and e: return true
+  return has_cond(l, n)
+
+# Whether a statement can complete, without reporting anything.
+fn ur_stmt_quiet(var l: L, n: Int) -> Bool:
+  let before = l.ds.len
+  let r = ur_stmt(&l, n, 1) == 1
+  l.ds.truncate(before)
+  return r
+
+fn ur_stmt(var l: L, n: Int, st: Int) -> Int:
+  if n <= 0: return st
+  let kd = l.t.k[n]
+  if st != 1:
+    if reportable(l, n):
+      add(&l, l.t.pos[n], "eslint(no-unreachable)", "Unreachable code.", "Remove the unreachable code or fix the control flow to make it reachable.")
+    if revives(&l, n, st): return 1
+    if kd == ast.N_RETURN or kd == ast.N_THROW or kd == ast.N_BREAK or kd == ast.N_CONTINUE: return 2
+    return st
+  if kd == ast.N_BLOCK:
+    var s2 = 1
+    let lst = l.t.a[n]
+    for i in 0..ast.count(l.t, lst):
+      let x = ast.item(l.t, lst, i)
+      s2 = ur_stmt(&l, x, s2)
+    return s2
+  if kd == ast.N_RETURN or kd == ast.N_THROW: return 2
+  if kd == ast.N_BREAK:
+    fbreak(&l, n, 1)
+    return 2
+  if kd == ast.N_CONTINUE: return 2
+  if kd == ast.N_IF:
+    let t = ur_stmt(&l, l.t.b[n], 1)
+    var e = 1
+    if l.t.c[n] > 0: e = ur_stmt(&l, l.t.c[n], 1)
+    return ur_join(t, e)
+  if kd == ast.N_WHILE or kd == ast.N_FOR or kd == ast.N_FORIN or kd == ast.N_DO:
+    fpush(&l, 1, -1)
+    var body = l.t.b[n]
+    var inf = false
+    if kd == ast.N_WHILE: inf = infinite_test(l, l.t.a[n])
+    elif kd == ast.N_FOR:
+      body = l.t.d[n]
+      inf = infinite_test(l, l.t.b[n])
+    elif kd == ast.N_FORIN: body = l.t.c[n]
+    elif kd == ast.N_DO:
+      body = l.t.a[n]
+      inf = infinite_test(l, l.t.b[n])
+    let b = ur_stmt(&l, body, 1)
+    let broke = fpop(&l) != 0
+    let unused = b
+    if broke or not inf: return 1
+    return 3
+  if kd == ast.N_LABEL:
+    fpush(&l, 3, l.t.s[n])
+    let b = ur_stmt(&l, l.t.a[n], 1)
+    let broke = fpop(&l) != 0
+    if broke: return 1
+    return b
+  if kd == ast.N_SWITCH:
+    fpush(&l, 2, -1)
+    var r = 2
+    var has_default = false
+    let cs = l.t.b[n]
+    for i in 0..ast.count(l.t, cs):
+      let c = ast.item(l.t, cs, i)
+      if l.t.a[c] <= 0: has_default = true
+      var s2 = 1
+      let body = l.t.b[c]
+      for j in 0..ast.count(l.t, body):
+        let x = ast.item(l.t, body, j)
+        s2 = ur_stmt(&l, x, s2)
+      r = s2
+    let broke = fpop(&l) != 0
+    if broke or not has_default: return 1
+    return r
+  if kd == ast.N_TRY:
+    let t = ur_stmt(&l, l.t.a[n], 1)
+    var tc = t
+    if l.t.c[n] > 0: tc = ur_join(t, ur_stmt(&l, l.t.c[n], 1))
+    if l.t.d[n] > 0:
+      let f = ur_stmt(&l, l.t.d[n], 1)
+      if f != 1: return f
+    return tc
+  if kd == ast.N_WITH: return ur_stmt(&l, l.t.b[n], 1)
+  return 1
+
+# ---- getter-return
+
+fn getter_return(var l: L, n: Int, kd: Int, body: Int):
+  l.gr_bare = false
+  let saved_k = l.fk.len
+  let end = gr_list(&l, l.t.a[body], true)
+  if end or l.gr_bare:
+    var at = l.t.pos[n]
+    if kd == ast.N_GET or kd == ast.N_METHOD: at = l.t.pos[l.t.b[n]]
+    add(&l, at, "eslint(getter-return)", "Expected to always return a value in getter.", "Return a value from all code paths in getter.")
+  let unused = saved_k
+
+fn gr_list(var l: L, lst: Int, reach: Bool) -> Bool:
+  var r = reach
+  for i in 0..ast.count(l.t, lst):
+    if not r: return false
+    let x = ast.item(l.t, lst, i)
+    r = gr_stmt(&l, x, r)
+  return r
+
+fn gr_stmt(var l: L, n: Int, reach: Bool) -> Bool:
+  if n <= 0 or not reach: return reach
+  let kd = l.t.k[n]
+  if kd == ast.N_BLOCK: return gr_list(&l, l.t.a[n], reach)
+  if kd == ast.N_RETURN:
+    if l.t.a[n] <= 0: l.gr_bare = true
+    return false
+  if kd == ast.N_THROW: return false
+  if kd == ast.N_BREAK:
+    fbreak(&l, n, 1)
+    return false
+  if kd == ast.N_CONTINUE: return false
+  if kd == ast.N_IF:
+    let t = gr_stmt(&l, l.t.b[n], true)
+    var e = true
+    if l.t.c[n] > 0: e = gr_stmt(&l, l.t.c[n], true)
+    return t or e
+  if kd == ast.N_WHILE or kd == ast.N_FOR or kd == ast.N_FORIN or kd == ast.N_DO:
+    fpush(&l, 1, -1)
+    var body = l.t.b[n]
+    if kd == ast.N_FOR: body = l.t.d[n]
+    elif kd == ast.N_FORIN: body = l.t.c[n]
+    elif kd == ast.N_DO: body = l.t.a[n]
+    let b = gr_stmt(&l, body, true)
+    let broke = fpop(&l) != 0
+    # (oxlint: any loop may end; a do-while's body runs first)
+    if kd == ast.N_DO: return b or broke
+    return true
+  if kd == ast.N_LABEL:
+    fpush(&l, 3, l.t.s[n])
+    let b = gr_stmt(&l, l.t.a[n], true)
+    let broke = fpop(&l) != 0
+    return b or broke
+  if kd == ast.N_SWITCH:
+    fpush(&l, 2, -1)
+    var r = false
+    var has_default = false
+    let cs = l.t.b[n]
+    for i in 0..ast.count(l.t, cs):
+      let c = ast.item(l.t, cs, i)
+      if l.t.a[c] <= 0: has_default = true
+      r = gr_list(&l, l.t.b[c], true)
+    let broke = fpop(&l) != 0
+    return r or broke or not has_default
+  if kd == ast.N_TRY:
+    let t = gr_stmt(&l, l.t.a[n], true)
+    var tc = t
+    if l.t.c[n] > 0:
+      let c = gr_stmt(&l, l.t.c[n], true)
+      tc = t or c
+    if l.t.d[n] > 0:
+      let f = gr_stmt(&l, l.t.d[n], true)
+      return f and tc
+    return tc
+  if kd == ast.N_WITH: return gr_stmt(&l, l.t.b[n], true)
+  return true
+
+# ---- constructor-super, no-this-before-super
+
+fn ctor_super(var l: L, cls: Int):
+  let h = l.t.b[cls]
+  let base = unparen(l, l.t.a[h])
+  let null_base = k(l, base) == ast.N_NULL
+  let ms = l.t.d[cls]
+  for i in 0..ast.count(l.t, ms):
+    let m = ast.item(l.t, ms, i)
+    if k(l, m) != ast.N_CTOR or l.t.c[m] <= 0: continue
+    let body = l.t.c[m]
+    l.cs_exits = 0
+    l.cs_dup = []
+    l.cs_this = false
+    l.cs_mode = 1
+    let e1 = cs_list(&l, l.t.a[body], 1)
+    let this_before = l.cs_this
+    l.cs_exits = 0
+    l.cs_dup = []
+    l.cs_mode = 0
+    let end = cs_list(&l, l.t.a[body], 1)
+    l.cs_exits = l.cs_exits | end
+    let at = l.t.pos[m]
+    let unused_e1 = e1
+    if this_before:
+      add(&l, at, "eslint(no-this-before-super)", "Expected to always call `super()` before `this`/`super` property access.", "Call `super()` before `this`/`super` property access.")
+    if null_base:
+      let lst = l.t.a[body]
+      var found = false
+      for j in 0..ast.count(l.t, lst):
+        let x = ast.item(l.t, lst, j)
+        if k(l, x) == ast.N_EXPRSTMT and is_super_call(l, l.t.a[x]):
+          found = true
+          add(&l, l.t.pos[l.t.a[x]], "eslint(constructor-super)", "Unexpected `super()` because `super` is not a constructor.", "Remove the `super()` call or change the `extends` clause to a constructable superclass.")
+      if not found:
+        add(&l, at, "eslint(constructor-super)", "Expected to call `super()`.", "Add a `super()` call to the constructor")
+      continue
+    var dups: [Int] = []
+    for d in l.cs_dup: dups.push(d)
+    for d in dups:
+      add(&l, d, "eslint(constructor-super)", "Unexpected duplicate `super()`.", "Remove the duplicate `super()` call")
+    if l.cs_exits == 0:
+      if super_calls(l, body) == 0: add(&l, at, "eslint(constructor-super)", "Expected to call `super()`.", "Add a `super()` call to the constructor")
+      continue
+    if (l.cs_exits & 2) == 0:
+      add(&l, at, "eslint(constructor-super)", "Expected to call `super()`.", "Add a `super()` call to the constructor")
+    elif (l.cs_exits & 1) != 0:
+      add(&l, at, "eslint(constructor-super)", "Lacked a call of `super()` in some code paths.", "Ensure `super()` is called in all code paths")
+
+fn super_calls(l: L, body: Int) -> Int:
+  var c = 0
+  let lst = l.t.a[body]
+  for i in 0..ast.count(l.t, lst):
+    let x = ast.item(l.t, lst, i)
+    if k(l, x) == ast.N_EXPRSTMT and is_super_call(l, l.t.a[x]): c += 1
+  return c
+
+# A statement-level super call: super(...), or a conditional with one in both branches.
+fn is_super_call(l: L, e: Int) -> Bool:
+  let kd = k(l, e)
+  if kd == ast.N_CALL: return k(l, l.t.a[e]) == ast.N_SUPER
+  if kd == ast.N_COND: return is_super_call(l, l.t.b[e]) and is_super_call(l, l.t.c[e])
+  return false
+
+# Whether n uses this or super.x (not inside a nested non-arrow function or class).
+fn uses_this(l: L, n: Int) -> Bool:
+  if n <= 0: return false
+  let kd = l.t.k[n]
+  if kd == ast.N_LIST:
+    for i in 0..l.t.b[n]:
+      if uses_this(l, l.t.L[l.t.a[n] + i]): return true
+    return false
+  if kd == ast.N_THIS: return true
+  if (kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS) and k(l, l.t.a[n]) == ast.N_SUPER: return true
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_CLASS or kd == ast.N_CLASSEXPR or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET: return false
+  if uses_this(l, l.t.a[n]) or uses_this(l, l.t.b[n]) or uses_this(l, l.t.c[n]): return true
+  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS: return uses_this(l, l.t.d[n])
+  return false
+
+# In evaluation order: a this (or super.x) before a super() call in the same expression, on a
+# path where super() may not have been called. Returns whether e calls super().
+fn cs_check_this(var l: L, e: Int, st: Int) -> Bool:
+  if l.cs_mode != 1: return false
+  return this_walk(&l, e, (st & 1) != 0)
+
+fn this_walk(var l: L, n: Int, open: Bool) -> Bool:
+  # returns whether a super() call happened in n
+  if n <= 0: return false
+  let kd = l.t.k[n]
+  if kd == ast.N_LIST:
+    var o = open
+    var called = false
+    for i in 0..l.t.b[n]:
+      let x = l.t.L[l.t.a[n] + i]
+      if this_walk(&l, x, o):
+        called = true
+        o = false
+    return called
+  if kd == ast.N_THIS:
+    if open: l.cs_this = true
+    return false
+  if (kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS) and k(l, l.t.a[n]) == ast.N_SUPER:
+    if open: l.cs_this = true
+    return this_walk(&l, l.t.b[n], open) and kd == ast.N_ELEMACCESS
+  if kd == ast.N_CALL and k(l, l.t.a[n]) == ast.N_SUPER:
+    this_walk(&l, l.t.c[n], open)
+    return true
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW or kd == ast.N_CLASS or kd == ast.N_CLASSEXPR or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET: return false
+  var o = open
+  var called = false
+  for c in [l.t.a[n], l.t.b[n], l.t.c[n]]:
+    if this_walk(&l, c, o):
+      called = true
+      o = false
+  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS:
+    if this_walk(&l, l.t.d[n], o): called = true
+  return called
+
+fn cs_list(var l: L, lst: Int, st0: Int) -> Int:
+  var st = st0
+  for i in 0..ast.count(l.t, lst):
+    if st == 0: return 0
+    let x = ast.item(l.t, lst, i)
+    st = cs_stmt(&l, x, st)
+  return st
+
+fn cs_stmt(var l: L, n: Int, st: Int) -> Int:
+  if n <= 0 or st == 0: return st
+  let kd = l.t.k[n]
+  if kd == ast.N_EXPRSTMT:
+    let e = l.t.a[n]
+    if cs_check_this(&l, e, st): return 2
+    if l.cs_mode == 0 and is_super_call(l, e):
+      if (st & 2) != 0: l.cs_dup.push(l.t.pos[e])
+      return 2
+    return st
+  if kd == ast.N_BLOCK: return cs_list(&l, l.t.a[n], st)
+  if kd == ast.N_RETURN:
+    let ignored_c = cs_check_this(&l, l.t.a[n], st)
+    l.cs_exits = l.cs_exits | st
+    return 0
+  if kd == ast.N_THROW:
+    let ignored_c = cs_check_this(&l, l.t.a[n], st)
+    return 0
+  if kd == ast.N_BREAK:
+    fbreak(&l, n, st)
+    return 0
+  if kd == ast.N_CONTINUE: return 0
+  if kd == ast.N_IF:
+    var s1 = st
+    if cs_check_this(&l, l.t.a[n], st): s1 = 2
+    let t = cs_stmt(&l, l.t.b[n], s1)
+    var e = s1
+    if l.t.c[n] > 0: e = cs_stmt(&l, l.t.c[n], s1)
+    return t | e
+  if kd == ast.N_WHILE or kd == ast.N_FOR or kd == ast.N_FORIN or kd == ast.N_DO:
+    fpush(&l, 1, -1)
+    var body = l.t.b[n]
+    if kd == ast.N_WHILE: cs_check_this(&l, l.t.a[n], st)
+    elif kd == ast.N_FOR:
+      body = l.t.d[n]
+      let ignored_c = cs_check_this(&l, l.t.a[n], st)
+      cs_check_this(&l, l.t.b[n], st)
+    elif kd == ast.N_FORIN:
+      body = l.t.c[n]
+      let ignored_c = cs_check_this(&l, l.t.b[n], st)
+    elif kd == ast.N_DO: body = l.t.a[n]
+    let b = cs_stmt(&l, body, st)
+    let broke = fpop(&l)
+    return st | b | broke
+  if kd == ast.N_LABEL:
+    fpush(&l, 3, l.t.s[n])
+    let b = cs_stmt(&l, l.t.a[n], st)
+    let broke = fpop(&l)
+    return b | broke
+  if kd == ast.N_SWITCH:
+    let ignored_c = cs_check_this(&l, l.t.a[n], st)
+    fpush(&l, 2, -1)
+    var r = 0
+    var has_default = false
+    let cs = l.t.b[n]
+    for i in 0..ast.count(l.t, cs):
+      let c = ast.item(l.t, cs, i)
+      if l.t.a[c] <= 0: has_default = true
+      r = cs_list(&l, l.t.b[c], st | r)
+    let broke = fpop(&l)
+    var out = r | broke
+    if not has_default: out = out | st
+    return out
+  if kd == ast.N_TRY:
+    let t = cs_stmt(&l, l.t.a[n], st)
+    var tc = t
+    if l.t.c[n] > 0: tc = t | cs_stmt(&l, l.t.c[n], st)
+    if l.t.d[n] > 0:
+      return cs_stmt(&l, l.t.d[n], tc)
+    return tc
+  if kd == ast.N_FUNC or kd == ast.N_CLASS: return st
+  if cs_check_this(&l, n, st): return 2
+  return st
