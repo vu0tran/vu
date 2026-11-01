@@ -505,13 +505,6 @@ fn load_tsconfig(var p: Proj, fs: Fs):
     for f in glob_fs(p, fs, pats):
       if is_dts(f): dts.push(f)
   p.dts_entries = dts
-  # the plugin's inputs: types, plugins, importHelpers, jsxImportSource
-  for t in sc(p.tsc_types):
-    var i = scripts.inp(I_DEFER, t)
-    i.type_only = true
-    i.file = "tsconfig.json"
-    i.also_owner = true
-    p.inputs.push(i)
 
 fn sc(xs: [Str]) -> [Str]:
   var out: [Str] = []
@@ -696,6 +689,7 @@ fn handle_input(var p: Proj, fs: Fs, inp: Input) -> Str:
     if handled: return ""
   var base = inp.dir
   if base == "": base = resolve.dirname(inp.file)
+  if base == ".": base = ""
   var target = spec + ""
   if is_joinable(spec): target = resolve.join(base, spec)
   var r = resolve.resolve(&p.rs, fs, rel_spec(target), resolve.join(base, "file.ts"))
@@ -842,8 +836,9 @@ fn run_plugins(var p: Proj, fs: Fs):
       if node_test_script(p):
         add_entries(&p, ["**/*{{.,-,_}}test.{{cjs,mjs,js,cts,mts,ts}}", "**/test-*.{{cjs,mjs,js,cts,mts,ts}}", "**/test.{{cjs,mjs,js,cts,mts,ts}}", "**/test/**/*.{{cjs,mjs,js,cts,mts,ts}}"], "package.json")
     elif key == "typescript":
-      let found = find_configs(p, fs, ["tsconfig.json"])
-      for f in found: config_entry(&p, f)
+      var queue = find_configs(p, fs, ["tsconfig.json"])
+      for c in script_configs(p, "typescript"): queue.push(c)
+      typescript_configs(&p, fs, queue)
     elif key == "vitest":
       let found = plugin_std(&p, fs, true, ["vitest.config.{{js,mjs,ts,cjs,mts,cts}}", "vitest.{{workspace,projects}}.{{js,mjs,ts,cjs,mts,cts,json}}"], ["**/*.{{bench,test,test-d,spec,spec-d}}.?(c|m)[jt]s?(x)", "**/__mocks__/**/*.?(c|m)[jt]s?(x)"], [])
       for f in found: config_entry(&p, f)
@@ -924,6 +919,73 @@ fn script_vals(p: Proj) -> [Str]:
   var out: [Str] = []
   for _, v in p.scripts: out.push(v + "")
   return out
+
+# config files named in scripts for a plugin (tsc -p x, vitest --config y), as paths
+fn script_configs(p: Proj, plugin: Str) -> [Str]:
+  var out: [Str] = []
+  for i in p.inputs:
+    if i.kind == I_CONFIG and i.plugin == plugin:
+      var base = i.dir
+      if base == "": base = resolve.dirname(i.file)
+      if base == ".": base = ""
+      out.push(resolve.join(base, i.spec))
+  return out
+
+# The TypeScript plugin: each tsconfig file (raw, as knip loads it): extends, references, types,
+# plugins, importHelpers and jsxImportSource.
+fn typescript_configs(var p: Proj, fs: Fs, queue0: [Str]):
+  var queue = sc(queue0)
+  var seen: {Str: Bool} = {}
+  var k = 0
+  while k < queue.len:
+    let f = queue[k] + ""
+    k += 1
+    if f in seen: continue
+    seen[f] = true
+    if not exists_file(p, fs, f): continue
+    config_entry(&p, f)
+    let v = pkg.read_json(fs, fspath(p, f))
+    if not pkg.is_obj(v): continue
+    let dir = resolve.dirname(f)
+    for e in pkg.strs(pkg.get(v, "extends")):
+      if e.startswith(".") or e.startswith("/"):
+        var target = resolve.join(dir, e)
+        if not exists_file(p, fs, target) and exists_file(p, fs, target + ".json"): target = target + ".json"
+        queue.push(target)
+      else:
+        var i = scripts.inp(I_CONFIG, e)
+        i.file = f + ""
+        i.plugin = "typescript"
+        p.inputs.push(i)
+    for r in pkg.items(pkg.get(v, "references")):
+      let rp = pkg.str_of(pkg.get(r, "path"))
+      if rp == "": continue
+      if rp.endswith(".json"): queue.push(resolve.join(dir, rp))
+      else: queue.push(resolve.join(dir, rp + "/tsconfig.json"))
+    let co = pkg.get(v, "compilerOptions")
+    if not pkg.is_obj(co): continue
+    for t in pkg.strs(pkg.get(co, "types")):
+      var i = scripts.inp(I_DEFER, t)
+      i.type_only = true
+      i.file = f + ""
+      i.also_owner = true
+      p.inputs.push(i)
+    var names: [Str] = []
+    for pl in pkg.items(pkg.get(co, "plugins")):
+      let n = pkg.str_of(pkg.get(pl, "name"))
+      names.push(n)
+    if pkg.truthy(pkg.get(co, "importHelpers")): names.push("tslib")
+    for n in names:
+      if n == "": continue
+      var i = scripts.inp(I_DEFER, n)
+      i.file = f + ""
+      p.inputs.push(i)
+    let jsx = pkg.str_of(pkg.get(co, "jsxImportSource"))
+    if jsx != "":
+      var i = scripts.inp(I_DEP, jsx)
+      i.file = f + ""
+      i.production = true
+      p.inputs.push(i)
 
 fn node_test_script(p: Proj) -> Bool:
   for _, v in p.scripts:
@@ -1107,7 +1169,7 @@ fn github_workflow(var p: Proj, fs: Fs, f: Str):
     if (v.startswith("\"") and v.endswith("\"") and v.len >= 2) or (v.startswith("'") and v.endswith("'") and v.len >= 2): v = v[1..v.len - 1]
     runs.push(v)
     i += 1
-  add_script_inputs(&p, runs, f, true, "", false)
+  add_script_inputs(&p, runs, f, true, ".", false)
 
 # ---- the graph
 
@@ -1979,8 +2041,16 @@ fn main(fs: Fs, os: Os):
       else: entry_pats.push(s)
     elif inp.kind == I_PROJECT: project_pats.push(inp.spec + "")
     elif inp.kind == I_CONFIG:
-      # a config file named on a command line: an entry file when it exists
-      continue
+      if not scripts.is_internal(inp.spec) and pkg_from_spec(inp.spec) != "":
+        let f = handle_input(&p, fs, inp)
+        if f != "": add_entry(&b, f, true, true)
+      elif inp.plugin != "typescript":
+        # a config file named on a command line: an entry file when it exists
+        var base = inp.dir
+        if base == "": base = resolve.dirname(inp.file)
+        if base == ".": base = ""
+        let f = resolve.join(base, inp.spec)
+        if exists_file(p, fs, f): add_entry(&b, f, true, true)
     else:
       let f = handle_input(&p, fs, inp)
       if f != "": add_entry(&b, f, true, true)
