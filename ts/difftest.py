@@ -7,7 +7,7 @@ pos = [a for a in sys.argv[1:] if not a.startswith("--")]
 vtsc = pos[2] if len(pos) > 2 else "vtsc"
 tsc = pos[3] if len(pos) > 3 else "tsc"
 d = tempfile.mkdtemp()
-subprocess.run([sys.executable, os.path.join(here, "gen.py"), str(seed), str(count), d] + [a for a in sys.argv if a in ("--modules", "--classes")], check=True)
+subprocess.run([sys.executable, os.path.join(here, "gen.py"), str(seed), str(count), d] + [a for a in sys.argv if a in ("--modules", "--classes", "--generics")], check=True)
 files = sorted(os.path.join(d, f) for f in os.listdir(d))
 def run(cmd):
     t = time.time()

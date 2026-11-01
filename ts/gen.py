@@ -169,6 +169,41 @@ class G:
         if pt.endswith("[]"): return f"console.log({p}.length, {p}.join(\",\"))"
         return f"console.log({p})"
 
+    def gfunc(self):
+        """a generic function: a constrained type parameter read, narrowed and used"""
+        r = self.r
+        name = self.name("g")
+        con = r.choice(["", " extends string", " extends string | number", " extends number | undefined",
+                        " extends { x: number } | null", " extends Date | number", " extends string | null",
+                        " extends number", " extends { x: number }", " extends boolean | string"])
+        pt = r.choice(["T", "T", "T | undefined", "T | number", "T | null"])
+        body = []
+        for _ in range(r.randint(1, 4)):
+            c = r.random()
+            tgt = r.choice(["boolean", "number", "string", "object", "{ x: number }"])
+            if c < 0.15: body.append(f"const a{len(body)}: {tgt} = p")
+            elif c < 0.3: body.append(f"if (p) {{ const b: {tgt} = p }}")
+            elif c < 0.42: body.append(f"if (!p) {{ const b: {tgt} = p }}")
+            elif c < 0.6:
+                w = r.choice(["string", "number", "object", "function", "undefined", "boolean"])
+                op = r.choice(["===", "!=="])
+                body.append(f'if (typeof p {op} "{w}") {{ const b: {tgt} = p }}')
+            elif c < 0.72:
+                v = r.choice(["undefined", "null"])
+                op = r.choice(["===", "!==", "==", "!="])
+                body.append(f"if (p {op} {v}) {{ const b: {tgt} = p }}")
+            elif c < 0.82: body.append(f"p.{r.choice(['toString()', 'length', 'x', 'valueOf()'])}")
+            elif c < 0.9: body.append(f"const e{len(body)} = p\n  const f{len(body)}: {tgt} = e{len(body)}")
+            else: body.append(f"take{self.k}(p)")
+        ret = ""
+        if r.random() < 0.4:
+            ret = ": T"
+            body.append("return p" if r.random() < 0.7 else "return 1")
+        self.gfuncs = getattr(self, "gfuncs", []) + [(name, pt)]
+        decl = "" if getattr(self, "took", False) else f"declare function take{self.k}(b: boolean): void\n"
+        self.took = True
+        return decl + f"function {name}<T{con}>(p: {pt}){ret} {{\n  " + "\n  ".join(body) + "\n}"
+
     def call(self):
         r = self.r
         if not self.funcs: return "console.log(0)"
@@ -322,6 +357,7 @@ class G:
             c = self.r.random()
             if classes and c < 0.2: out.append(self.klass())
             elif classes and c < 0.35 and getattr(self, "classes", None): out.append(self.use_class())
+            elif getattr(self, "with_generics", False) and c < 0.3: out.append(self.gfunc())
             elif c < 0.35: out.append(self.decl())
             elif c < 0.55: out.append(self.func())
             elif c < 0.75: out.append(self.call())
@@ -399,6 +435,7 @@ def main():
             continue
         g = G(r, k)
         g.with_classes = "--classes" in sys.argv
+        g.with_generics = "--generics" in sys.argv
         with open(os.path.join(outdir, f"g{k:05d}.ts"), "w") as f:
             f.write(g.program())
 

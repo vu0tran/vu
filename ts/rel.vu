@@ -13,8 +13,11 @@ from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, 
 from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE, SF_OPTIONAL
 
 fn assignable(var c: C, s: Int, t: Int) -> Bool:
-  if s == t: return true
-  let key = "{s}>{t}"
+  if s == t:
+    c.no_weak = false
+    return true
+  var key = "{s}>{t}"
+  if c.no_weak: key = key + "w"
   if key in c.rel_cache: return c.rel_cache[key]
   # a relation being computed is assumed to hold (recursive types)
   c.rel_cache[key] = true
@@ -27,17 +30,24 @@ fn assignable(var c: C, s: Int, t: Int) -> Bool:
 fn generic_rel(var c: C, s: Int, t: Int) -> Int:
   let sk = c.tk[s]
   let tk = c.tk[t]
-  # a conditional type: by both of its branches
-  if sk == types.TK_COND:
+  # two instantiations of one conditional type: the same checked and extends types, and the
+  # branches related
+  if sk == types.TK_COND and tk == types.TK_COND and c.ta[s] == c.ta[t]:
     let n = c.ta[s]
-    var infers: [Int] = []
-    tyops.collect_infers(c, c.t.b[n], &infers)
-    if infers.len == 0:
-      let tb0 = tyops.raw(&c, c.t.c[n])
-      let tb = bind.instantiate(&c, tb0, c.tb[s])
-      let fb0 = tyops.raw(&c, c.t.d[n])
-      let fb = bind.instantiate(&c, fb0, c.tb[s])
-      if assignable(&c, tb, t) and assignable(&c, fb, t): return 1
+    var parts: [[Int]] = []
+    for m in [c.tb[s], c.tb[t]]:
+      var ps: [Int] = []
+      for x in [c.t.a[n], c.t.b[n], c.t.c[n], c.t.d[n]]:
+        let r = tyops.raw(&c, x)
+        ps.push(bind.instantiate(&c, r, m))
+      parts.push(ps)
+    if parts[0][0] == parts[1][0] and parts[0][1] == parts[1][1]:
+      if assignable(&c, parts[0][2], parts[1][2]) and assignable(&c, parts[0][3], parts[1][3]): return 1
+    return -1
+  # a deferred conditional type: through an upper bound of its branches
+  if sk == types.TK_COND and tk != types.TK_COND:
+    let b = cond_bound(&c, s, 0)
+    if b >= 0 and assignable(&c, b, t): return 1
     return -1
   if tk == types.TK_COND:
     let n = c.ta[t]
@@ -74,6 +84,74 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     return -1
   return -1
 
+# An infer type parameter's constraint: written (infer X extends C), else implied by the type
+# parameter it stands in for (Foo<infer X> gets Foo's constraint); -1 if neither is known.
+fn infer_constraint(var c: C, tp: Int) -> Int:
+  let ex = constraint_of(&c, tp)
+  if ex >= 0: return ex
+  let d = c.sdecl[c.ta[tp]]
+  if d < 0: return -1
+  let inn = c.parent[d]
+  if inn < 0 or c.t.k[inn] != ast.N_TINFER: return -1
+  let lst = c.parent[inn]
+  if lst < 0: return -1
+  let ref = c.parent[lst]
+  if ref < 0 or c.t.k[ref] != ast.N_TREF or c.t.b[ref] != lst: return -1
+  let nn = c.t.a[ref]
+  if c.t.k[nn] != ast.N_ID: return -1
+  let s = bind.lookup_type(&c, ref, c.t.s[nn])
+  if s < 0: return -1
+  if (c.sk[s] & (types.S_ALIAS | types.S_INTERFACE | types.S_CLASS)) == 0: return -1
+  let tl = c.t.a[c.sdecl[s]]
+  if tl < 0: return -1
+  let tps = ast.items(c.t, tl)
+  let args = ast.items(c.t, lst)
+  for i in 0..args.len:
+    if args[i] == inn:
+      if i >= tps.len or c.t.a[tps[i]] < 0: return -1
+      let con = tyops.raw(&c, c.t.a[tps[i]])
+      if c.tk[con] == TK_UNSUP or tyops.is_generic(&c, con): return -1
+      return con
+  return -1
+
+# An upper bound of a deferred conditional type: its branches, where an infer type parameter
+# stands for its constraint and the checked type in the true branch for the extends type
+# (T extends U ? T : ... is at most U there). -1 if a branch has no known bound.
+fn cond_bound(var c: C, t: Int, depth: Int) -> Int:
+  if depth > 8: return -1
+  let n = c.ta[t]
+  let m = c.tb[t]
+  let g1 = tyops.raw(&c, c.t.a[n])
+  let ct = bind.instantiate(&c, g1, m)
+  let g2 = tyops.raw(&c, c.t.b[n])
+  let ext = bind.instantiate(&c, g2, m)
+  let g3 = tyops.raw(&c, c.t.c[n])
+  var tb = bind.instantiate(&c, g3, m)
+  var tn = c.t.c[n]
+  while c.t.k[tn] == ast.N_TPAREN: tn = c.t.a[tn]
+  if c.t.k[tn] == ast.N_TREF and c.t.k[c.t.a[tn]] == ast.N_ID and tyops.infer_named(c, n, c.t.s[c.t.a[tn]]) >= 0:
+    let ic = infer_constraint(&c, g3)
+    if ic < 0: return -1
+    tb = ic
+  elif tb == ct:
+    if tyops.is_generic(&c, ext): return -1
+    tb = ext
+  let g4 = tyops.raw(&c, c.t.d[n])
+  var fb = bind.instantiate(&c, g4, m)
+  if c.tk[tb] == types.TK_COND: tb = cond_bound(&c, tb, depth + 1)
+  if c.tk[fb] == types.TK_COND: fb = cond_bound(&c, fb, depth + 1)
+  if tb < 0 or fb < 0: return -1
+  if c.tk[tb] == TK_UNSUP or c.tk[fb] == TK_UNSUP: return -1
+  return types.union_of(&c, [tb, fb])
+
+fn dbg_types(var c: C, s: Int, t: Int) -> Str:
+  if not c.debug: return ""
+  let a = show.show(&c, s)
+  let b = show.show(&c, t)
+  var at = ""
+  if c.cur_expr >= 0: at = " at {c.t.pos[c.cur_expr]}"
+  return a + " TO " + b + at
+
 fn is_mapped(c: C, t: Int) -> Bool:
   return c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == types.OK_MAPPED
 
@@ -86,6 +164,9 @@ fn is_prim(c: C, t: Int) -> Bool:
   return k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE
 
 fn rel(var c: C, s0: Int, t0: Int) -> Bool:
+  # a member of an intersection target: the weak type check is made on the whole intersection
+  let nw = c.no_weak
+  c.no_weak = false
   let s = types.regular(c, s0)
   let t = types.regular(c, t0)
   if s == t: return true
@@ -99,7 +180,10 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
     if r == 1: return true
     if r == 0: return false
     # not related by this checker yet: the file isn't checked
-    let u = bind.unsupported(&c, 0, "relating a generic keyof, indexed access, mapped or conditional type [{sk} {tk} {is_mapped(c, s)} {is_mapped(c, t)}]")
+    let dbg = dbg_types(&c, s, t)
+    let ms = is_mapped(c, s)
+    let mt = is_mapped(c, t)
+    let u = bind.unsupported(&c, 0, "relating a generic keyof, indexed access, mapped or conditional type [{sk} {tk} {ms} {mt}] " + dbg)
     bind.touch(&c, u)
     return true
   if sk == TK_UNSUP or tk == TK_UNSUP:
@@ -125,13 +209,29 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
       if assignable(&c, s, m): return true
     return false
   if tk == TK_INTER:
-    for m in types.members_inter(c, t):
-      if not assignable(&c, s, m): return false
+    let ms = types.members_inter(c, t)
+    var src = s
+    if sk == TK_OBJ and c.objs[c.ta[s]].fresh:
+      # excess properties: against the whole intersection
+      for name in bind.prop_names(&c, s):
+        var known = false
+        for m in ms:
+          if known_prop(&c, m, name): known = true
+        if not known: return false
+      src = unfresh(&c, s)
+    if weak_fails_inter(&c, src, ms): return false
+    for m in ms:
+      c.no_weak = true
+      if not assignable(&c, src, m): return false
     return true
   if sk == TK_INTER:
     for m in types.members_inter(c, s):
       if assignable(&c, m, t): return true
-    if tk == TK_OBJ: return structural(&c, s, t)
+    if tk == TK_OBJ:
+      # the members' properties together: not modeled here
+      let u = bind.unsupported(&c, 0, "relating an intersection to an object type by its combined properties")
+      bind.touch(&c, u)
+      return true
     return false
   if sk == TK_UNDEF: return tk == TK_VOID
   if sk == TK_NULL or sk == TK_VOID: return false
@@ -141,7 +241,7 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
     if con < 0: return tk == TK_OBJ and is_empty_obj(&c, t)
     return assignable(&c, con, t)
   if tk == TK_TPARAM: return false
-  if tk == TK_OBJ and weak_fails(&c, s, t): return false
+  if tk == TK_OBJ and not nw and weak_fails(&c, s, t): return false
   if sk == TK_STRLIT: return tk == TK_STRING or (tk == TK_OBJ and prim_to_obj(&c, c.string_t, t))
   if sk == TK_NUMLIT: return tk == TK_NUMBER or (tk == TK_OBJ and prim_to_obj(&c, c.number_t, t))
   if sk == TK_TRUE or sk == TK_FALSE: return tk == TK_OBJ and prim_to_obj(&c, c.boolean_t, t)
@@ -186,6 +286,20 @@ fn weak_fails(var c: C, s0: Int, t: Int) -> Bool:
   if names.len == 0 and bind.sigs_of(&c, a, false).len == 0 and bind.sigs_of(&c, a, true).len == 0: return false
   for name in names:
     if bind.get_prop(&c, t, name) >= 0: return false
+  return true
+
+# The weak type check for an intersection: when every member is a weak object type, the source
+# must share a property with one of them.
+fn weak_fails_inter(var c: C, s: Int, ms: [Int]) -> Bool:
+  for m in ms:
+    if c.tk[m] != TK_OBJ or not is_weak(&c, m): return false
+  let sk = c.tk[s]
+  if sk != TK_OBJ: return false
+  let names = bind.prop_names(&c, s)
+  if names.len == 0 and bind.sigs_of(&c, s, false).len == 0 and bind.sigs_of(&c, s, true).len == 0: return false
+  for name in names:
+    for m in ms:
+      if bind.get_prop(&c, m, name) >= 0: return false
   return true
 
 # A fresh object literal with a property the target doesn't know (excess property checks).
@@ -462,17 +576,28 @@ fn could_have_singletons(var c: C, t: Int) -> Bool:
     let ms = types.members(c, t)
     if ms.len == 2 and (c.tk[ms[0]] == TK_TRUE or c.tk[ms[0]] == TK_FALSE) and (c.tk[ms[1]] == TK_TRUE or c.tk[ms[1]] == TK_FALSE): return false
   if k == TK_NULL or k == TK_UNDEF: return true
-  if k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_TPARAM: return true
+  if k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE: return true
+  if k == TK_TPARAM:
+    let con = constraint_of(&c, t)
+    if con < 0 or con == t: return false
+    return could_have_singletons(&c, con)
   if k == TK_UNION or k == TK_INTER:
-    for m in types.members(c, t):
+    for m in types.parts(c, t):
       if could_have_singletons(&c, m): return true
   return false
+
+# isLiteralType for a union: every member a unit type (a literal, null or undefined).
+fn all_units(c: C, t: Int) -> Bool:
+  for m in types.members(c, t):
+    let k = c.tk[m]
+    if not types.is_literal(c, m) and k != TK_NULL and k != TK_UNDEF: return false
+  return true
 
 fn not_assignable_msg(var c: C, s: Int, t: Int, code: Int) -> Str:
   var src = s
   if c.tk[t] != TK_NEVER and not could_have_singletons(&c, t):
     if types.is_literal(c, s): src = types.base_of_literal(c, s)
-    elif c.tk[s] == TK_UNION: src = chk.widen_all(&c, s)
+    elif c.tk[s] == TK_UNION and all_units(c, s): src = chk.widen_all(&c, s)
   let ss = show.show(&c, src)
   let ts = show.show(&c, t)
   if code == 2345: return "Argument of type '" + ss + "' is not assignable to parameter of type '" + ts + "'."
@@ -480,6 +605,11 @@ fn not_assignable_msg(var c: C, s: Int, t: Int, code: Int) -> Str:
 
 # The target TypeScript names in the message: a union of null/undefined and one other type, with a
 # source that can't be null or undefined, is reported against that other type.
+fn mentions_inter(c: C, t: Int) -> Bool:
+  for m in types.members(c, t):
+    if c.tk[m] == TK_INTER: return true
+  return false
+
 fn report_target(var c: C, s: Int, t: Int) -> Int:
   if c.tk[t] != TK_UNION or is_nullish(c, s): return t
   if c.tk[s] == TK_UNION and types.regular(c, s) != c.boolean_t: return t
@@ -492,6 +622,11 @@ fn report_target(var c: C, s: Int, t: Int) -> Int:
 # Reports s not assignable to t at node, as TypeScript would (the first line of its message).
 # expr is the source expression (-1 if none), for errors moved onto the parts of literals.
 fn report(var c: C, s: Int, t0: Int, node: Int, expr: Int, code: Int):
+  if mentions_inter(c, t0):
+    # tsc's messages against intersections (excess properties, elaboration) aren't modeled
+    let u = bind.unsupported(&c, 0, "an error against an intersection type")
+    bind.touch(&c, u)
+    return
   if expr >= 0 and elaborate(&c, expr, t0, code): return
   let t = report_target(&c, s, t0)
   let sk = c.tk[s]
