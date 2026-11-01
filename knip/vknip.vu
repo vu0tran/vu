@@ -458,8 +458,6 @@ fn load_tsconfig(var p: Proj, fs: Fs):
   var base = ""
   if "baseUrl" in opts:
     base = pkg.str_of(opts["baseUrl"])
-    p.rs.has_base = true
-    p.rs.base_url = base + ""
   if "paths" in opts:
     var pdir = base
     if pdir == "" and "\0pathsdir" in opts: pdir = pkg.str_of(opts["\0pathsdir"])
@@ -692,7 +690,7 @@ fn handle_input(var p: Proj, fs: Fs, inp: Input) -> Str:
   if base == ".": base = ""
   var target = spec + ""
   if is_joinable(spec): target = resolve.join(base, spec)
-  var r = resolve.resolve(&p.rs, fs, rel_spec(target), resolve.join(base, "file.ts"))
+  var r = resolve.resolve(&p.rs, fs, rel_spec(target), "file.ts")
   if not is_joinable(spec): r = resolve.resolve(&p.rs, fs, spec, resolve.join(base, "file.ts"))
   if r.kind == R_FILE:
     if is_ignored_path(p, r.path, false): return ""
@@ -748,7 +746,7 @@ fn add_prod_entries(var p: Proj, pats: [Str], file: Str):
 fn new_ctx(p: Proj, optional: Bool) -> Ctx:
   var names: {Str: Str} = {}
   for k, v in p.scripts: names[k] = v + ""
-  return Ctx(names, false, optional, {})
+  return Ctx(names, false, optional, {}, false)
 
 fn add_script_inputs(var p: Proj, scs: [Str], file: Str, optional: Bool, dir: Str, production: Bool):
   for x in scripts.inputs_from_scripts(scs, new_ctx(p, optional)):
@@ -794,6 +792,9 @@ fn enabled_plugins(var p: Proj, fs: Fs):
   if has_dep(p, "lint-staged"): enable(&p, "lint-staged")
   if has_dep(p, "tsd"): enable(&p, "tsd")
   if has_dep(p, "c8"): enable(&p, "c8")
+  if has_dep(p, "@playwright/test"): enable(&p, "playwright")
+  for f in [".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"]:
+    if exists_file(p, fs, f): enable(&p, "mcp")
   let pm = pkg.str_of(pkg.get(p.manifest, "packageManager"))
   if pm.startswith("pnpm@") or exists_file(p, fs, "pnpm-lock.yaml") or exists_file(p, fs, "pnpm-workspace.yaml"): enable(&p, "pnpm")
   # GitHub Actions: a .yml or .yaml in .github/workflows
@@ -890,6 +891,25 @@ fn run_plugins(var p: Proj, fs: Fs):
       for f in found: config_entry(&p, f)
     elif key == "tsd":
       add_entries(&p, ["index.test-d.ts", "test-d/**/*.test-d.ts"], "package.json")
+    elif key == "playwright":
+      let found = plugin_std(&p, fs, true, ["playwright.config.{{js,cjs,mjs,ts,cts,mts}}"], ["**/*.@(spec|test).?(c|m)[jt]s?(x)"], [])
+      for f in found: config_entry(&p, f)
+    elif key == "mcp":
+      let found = find_configs(p, fs, [".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"])
+      for f in found:
+        config_entry(&p, f)
+        let v = pkg.read_json(fs, fspath(p, f))
+        var scs: [Str] = []
+        for sect in ["mcpServers", "servers", "mcp_servers"]:
+          let m = pkg.get(v, sect)
+          for name in pkg.keys(m):
+            let srv = pkg.get(m, name)
+            let cmd = pkg.str_of(pkg.get(srv, "command"))
+            if cmd == "": continue
+            var parts: [Str] = [cmd]
+            for a in pkg.strs(pkg.get(srv, "args")): parts.push(a + "")
+            scs.push(project_dir_var(" ".join(parts)))
+        add_script_inputs(&p, scs, f, true, ".", false)
     elif key == "pnpm":
       add_entries(&p, [".pnpmfile.{{cjs,mjs}}"], "package.json")
     elif key == "github-actions":
@@ -986,6 +1006,17 @@ fn typescript_configs(var p: Proj, fs: Fs, queue0: [Str]):
       i.file = f + ""
       i.production = true
       p.inputs.push(i)
+
+# ${workspaceFolder} and ${CLAUDE_PROJECT_DIR} are the project folder
+fn project_dir_var(s: Str) -> Str:
+  var out = s.replace("${{workspaceFolder}}", ".")
+  var i = out.find("${{CLAUDE_PROJECT_DIR")
+  while i >= 0:
+    let e = out.find("}}", i)
+    if e < 0: break
+    out = out[0..i] + "." + out[e + 1..out.len]
+    i = out.find("${{CLAUDE_PROJECT_DIR")
+  return out
 
 fn node_test_script(p: Proj) -> Bool:
   for _, v in p.scripts:
@@ -1126,50 +1157,103 @@ fn typedoc_config(var p: Proj, fs: Fs, found: [Str]):
       let th = pkg.str_of(pkg.get(v, "theme"))
       if th != "": add_defer(&p, th, f)
 
-# The run: scripts of a GitHub workflow (a small reader for the YAML they're written in).
+# The run: scripts of a GitHub workflow (a small reader for the YAML they're written in): each step's
+# run, with its working-directory.
+fn indent_of(l: Str) -> Int:
+  var i = 0
+  while i < l.len and l[i] == ' ': i += 1
+  return i
+
+fn yaml_scalar(v0: Str) -> Str:
+  var v = v0.strip()
+  if (v.startswith("\"") and v.endswith("\"") and v.len >= 2) or (v.startswith("'") and v.endswith("'") and v.len >= 2): v = v[1..v.len - 1]
+  return v
+
+# the value of a key at line i (key at column col): a plain scalar or a | / > block; returns the
+# value and moves i past it
+fn yaml_value(lines: [Str], var i: Int, col: Int, rest: Str) -> Str:
+  let v = rest.strip()
+  if v.startswith("|") or v.startswith(">"):
+    let folded = v.startswith(">")
+    var body: [Str] = []
+    i += 1
+    var block_indent = -1
+    while i < lines.len:
+      var bl = lines[i]
+      if bl.endswith("\r"): bl = bl[0..bl.len - 1]
+      if bl.strip() == "":
+        body.push("")
+        i += 1
+        continue
+      let ind = indent_of(bl)
+      if ind <= col: break
+      if block_indent < 0: block_indent = ind
+      body.push(bl[min(block_indent, ind)..bl.len])
+      i += 1
+    while body.len > 0 and body[body.len - 1] == "": body.pop()
+    if folded: return " ".join(body)
+    return "\n".join(body)
+  i += 1
+  return yaml_scalar(v)
+
 fn github_workflow(var p: Proj, fs: Fs, f: Str):
   let text = fs.read(fspath(p, f)) else return
   let lines = text.split("\n")
-  var i = 0
   var runs: [Str] = []
+  var dirs: [Str] = []
+  # the current step: its indent (of the '-'), run and working-directory
+  var step_ind = -1
+  var run = ""
+  var has_run = false
+  var wd = ""
+  var i = 0
   while i < lines.len:
     var l = lines[i]
     if l.endswith("\r"): l = l[0..l.len - 1]
     let t = l.strip()
-    var key_at = -1
-    if t.startswith("run:"): key_at = l.find("run:")
-    elif t.startswith("- run:"): key_at = l.find("run:")
-    if key_at < 0:
+    if t == "" or t.startswith("#"):
       i += 1
       continue
-    var v = l[key_at + 4..l.len].strip()
-    let indent = key_at
-    if v.startswith("|") or v.startswith(">"):
-      let folded = v.startswith(">")
-      var body: [Str] = []
-      i += 1
-      var block_indent = -1
-      while i < lines.len:
-        var bl = lines[i]
-        if bl.endswith("\r"): bl = bl[0..bl.len - 1]
-        if bl.strip() == "":
-          body.push("")
-          i += 1
-          continue
-        var ind = 0
-        while ind < bl.len and bl[ind] == ' ': ind += 1
-        if ind <= indent: break
-        if block_indent < 0: block_indent = ind
-        body.push(bl[min(block_indent, ind)..bl.len])
-        i += 1
-      while body.len > 0 and body[body.len - 1] == "": body.pop()
-      if folded: runs.push(" ".join(body))
-      else: runs.push("\n".join(body))
-      continue
-    if (v.startswith("\"") and v.endswith("\"") and v.len >= 2) or (v.startswith("'") and v.endswith("'") and v.len >= 2): v = v[1..v.len - 1]
-    runs.push(v)
+    let ind = indent_of(l)
+    var key_col = ind
+    var body = t
+    if t.startswith("- "):
+      # a new list item (a step when it holds run: or uses:)
+      if has_run:
+        runs.push(run)
+        dirs.push(wd)
+      if ind <= step_ind or step_ind < 0 or true:
+        step_ind = ind
+        has_run = false
+        run = ""
+        wd = ""
+      key_col = ind + 2
+      body = t[2..t.len].strip()
+    elif step_ind >= 0 and ind <= step_ind:
+      if has_run:
+        runs.push(run)
+        dirs.push(wd)
+      has_run = false
+      run = ""
+      wd = ""
+      step_ind = -1
+    if step_ind >= 0 and key_col == step_ind + 2:
+      if body.startswith("run:"):
+        run = yaml_value(lines, &i, key_col, body[4..body.len])
+        has_run = true
+        continue
+      if body.startswith("working-directory:"):
+        wd = yaml_value(lines, &i, key_col, body[18..body.len])
+        continue
     i += 1
-  add_script_inputs(&p, runs, f, true, ".", false)
+  if has_run:
+    runs.push(run)
+    dirs.push(wd)
+  for k in 0..runs.len:
+    var d = "."
+    if dirs[k] != "": d = resolve.norm(dirs[k])
+    if d == "": d = "."
+    add_script_inputs(&p, [runs[k]], f, true, d, false)
 
 # ---- the graph
 
@@ -1210,7 +1294,7 @@ type Graph:
   nodes: [Node]
 
 fn empty_raw(path: Str) -> Raw:
-  return Raw(path + "", true, [], [], [], [], 0, [0], false, "")
+  return Raw(path + "", true, [], [], [], [], [], 0, [0], false, "")
 
 fn node_id(var g: Graph, path: Str) -> Int:
   if path in g.ids: return g.ids[path]
@@ -1376,6 +1460,17 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
     if not ignored and (ext == "" or (ext != ".json" and not foreign_ext(ext))):
       b.g.nodes[id].unresolved.push(Ext(u.spec + "", "", u.line, u.col, u.pos, u.type_only, false))
   swap(&b.g.nodes[id].exts, &exts)
+  # shell commands the file runs
+  var scs: [Str] = []
+  swap(&scs, &b.g.nodes[id].raw.scripts)
+  if scs.len > 0:
+    for x in scripts.inputs_from_scripts(scs, new_ctx(p, false)):
+      var y = scripts.cp(x)
+      y.file = path + ""
+      if y.dir == "": y.dir = resolve.dirname(path)
+      if y.dir == "": y.dir = "."
+      let f = handle_input(&p, fs, y)
+      if f != "": add_entry(&b, f, true, true)
 
 fn foreign_ext(e: Str) -> Bool:
   return " .avif .css .eot .gif .html .ico .jpeg .jpg .less .mp3 .otf .png .sass .scss .sh .styl .stylus .svg .ttf .webp .woff .woff2 .yaml .yml ".find(" " + e + " ") >= 0
@@ -2036,6 +2131,12 @@ fn main(fs: Fs, os: Os):
   for inp in inputs:
     if inp.kind == I_ENTRY:
       var s = inp.spec + ""
+      if inp.plugin.startswith("mocha-dir:"):
+        var base = inp.dir
+        if base == "." : base = ""
+        var d = resolve.join(base, s)
+        while d.endswith("/"): d = d[0..d.len - 1]
+        if fs.exists(fspath(p, d) + "/"): s = d + "/" + inp.plugin[10..inp.plugin.len]
       if inp.dir != "" and not s.startswith("!"): s = resolve.join(inp.dir, s)
       if inp.production: entry_pats_prod_skip.push(s)
       else: entry_pats.push(s)

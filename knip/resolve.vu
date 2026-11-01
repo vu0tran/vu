@@ -22,12 +22,20 @@ type PathMap:
   wildcard: Bool
   values: [Str]      # targets, relative to the project folder
 
+type Tsc:
+  paths: [PathMap]
+  base_url: Str
+  has_base: Bool
+
 type Resolver:
   root: Str                    # what to put before a path for the file system ("" or "dir/")
   dirs: {Str: {Str: Bool}}     # folder -> its names (folders end with '/')
-  paths: [PathMap]
+  paths: [PathMap]             # the project's tsconfig.json paths (tried after node_modules too)
   base_url: Str                # "" none, "." the project folder, else a folder
   has_base: Bool
+  tscs: [Tsc]                  # tsconfig files met (paths, baseUrl)
+  tsc_of_dir: {Str: Int}       # folder -> its nearest tsconfig.json (index in tscs, -1 none)
+  tsc_of_file: {Str: Int}
   self_name: Str
   self_exports: Value
   has_exports: Bool
@@ -39,7 +47,7 @@ fn exts() -> [Str]:
   return [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".d.mts", ".d.cts", ".json", ".jsonc"]
 
 fn new_resolver(root: Str) -> Resolver:
-  return Resolver(root + "", {}, [], "", false, "", json.Null, false, json.Null, {}, {})
+  return Resolver(root + "", {}, [], "", false, [], {}, {}, "", json.Null, false, json.Null, {}, {})
 
 const BUILTINS = "_http_agent _http_client _http_common _http_incoming _http_outgoing _http_server _stream_duplex _stream_passthrough _stream_readable _stream_transform _stream_wrap _stream_writable _tls_common _tls_wrap assert assert/strict async_hooks buffer child_process cluster console constants crypto dgram diagnostics_channel dns dns/promises domain events fs fs/promises http http2 https inspector inspector/promises module net os path path/posix path/win32 perf_hooks process punycode querystring readline readline/promises repl stream stream/consumers stream/promises stream/web string_decoder sys timers timers/promises tls trace_events tty url util util/types v8 vm wasi worker_threads zlib"
 
@@ -334,18 +342,9 @@ fn pkg_from_path(p: Str) -> Str:
   while rest.find("node_modules/") >= 0: rest = rest[rest.find("node_modules/") + 13..rest.len]
   return pkg_name(rest)
 
-fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
-  if is_relative(spec):
-    let f = load_path(&r, fs, join(dir, spec))
-    if f != "": return file_res(f)
-    let cand = join(dir, spec)
-    if real_file(&r, fs, cand) or is_dir(&r, fs, cand): return Res(R_FILE, cand, "")
-    return Res(R_UNRESOLVED, "", "")
-  if spec.startswith("/"):
-    return Res(R_UNRESOLVED, "", "")
-  # tsconfig paths, then baseUrl
+fn mapped_paths(pm: [PathMap], spec: Str) -> [Str]:
   var cands: [Str] = []
-  for m in r.paths:
+  for m in pm:
     var hit = false
     var captured = ""
     if m.wildcard:
@@ -360,11 +359,98 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
         if st >= 0: mapped = v[0..st] + captured + v[st + 1..v.len]
         if not m.wildcard: mapped = v + ""
         cands.push(norm(mapped))
+  return cands
+
+fn try_paths(var r: Resolver, fs: Fs, ti: Int, spec: Str) -> Str:
+  let cands = mapped_paths(r.tscs[ti].paths, spec)
   for c in cands:
     let f = load_path(&r, fs, c)
+    if f != "": return f
+  if r.tscs[ti].has_base:
+    let base = r.tscs[ti].base_url + ""
+    let f = load_path(&r, fs, join(base, spec))
+    if f != "": return f
+  return ""
+
+# The nearest tsconfig.json at or above dir (inside the project), loaded once.
+fn tsc_for_dir(var r: Resolver, fs: Fs, dir: Str) -> Int:
+  if dir in r.tsc_of_dir: return r.tsc_of_dir[dir] + 0
+  var res = -1
+  let f = join(dir, "tsconfig.json")
+  if dir.startswith(".."): res = -1
+  elif real_file(&r, fs, f): res = load_tsc(&r, fs, f)
+  elif dir != "": res = tsc_for_dir(&r, fs, dirname(dir))
+  r.tsc_of_dir[dir] = res
+  return res
+
+fn load_tsc(var r: Resolver, fs: Fs, f: Str) -> Int:
+  if f in r.tsc_of_file: return r.tsc_of_file[f] + 0
+  var t = Tsc([], "", false)
+  var paths_dir = ""
+  var has_paths = false
+  var pm = json.Null
+  tsc_chain(&r, fs, f, &t, &paths_dir, &has_paths, &pm, 0)
+  if has_paths:
+    var pdir = paths_dir
+    if t.has_base: pdir = t.base_url + ""
+    for key in pkg.keys(pm):
+      var vals: [Str] = []
+      for v in pkg.strs(pkg.get(pm, key)): vals.push(join(pdir, v))
+      let st = key.find("*")
+      if st >= 0: t.paths.push(PathMap(key[0..st], true, vals))
+      else: t.paths.push(PathMap(key + "", false, vals))
+  let i = r.tscs.len
+  r.tscs.push(t)
+  r.tsc_of_file[f] = i
+  return i
+
+fn tsc_chain(var r: Resolver, fs: Fs, f: Str, var t: Tsc, var paths_dir: Str, var has_paths: Bool, var pm: Value, depth: Int):
+  if depth > 8: return
+  let v = pkg.read_json(fs, r.root + f)
+  if not pkg.is_obj(v): return
+  let dir = dirname(f)
+  for e in pkg.strs(pkg.get(v, "extends")):
+    var target = ""
+    if e.startswith("./") or e.startswith("../") or e.startswith("/"):
+      target = join(dir, e)
+      if not real_file(&r, fs, target) and real_file(&r, fs, target + ".json"): target = target + ".json"
+    else:
+      let name = pkg_name(e)
+      let pdir = find_package(&r, fs, name, dir)
+      if pdir != "":
+        let sub = e[name.len..e.len]
+        if sub == "":
+          let m = pkg.read_json(fs, r.root + join(pdir, "package.json"))
+          var tsc = pkg.str_of(pkg.get(m, "tsconfig"))
+          if tsc == "": tsc = "tsconfig.json"
+          target = join(pdir, tsc)
+        else:
+          target = join(pdir, sub[1..sub.len])
+          if not real_file(&r, fs, target) and real_file(&r, fs, target + ".json"): target = target + ".json"
+    if target != "": tsc_chain(&r, fs, target, &t, &paths_dir, &has_paths, &pm, depth + 1)
+  let co = pkg.get(v, "compilerOptions")
+  let bu = pkg.str_of(pkg.get(co, "baseUrl"))
+  if bu != "":
+    t.base_url = join(dir, bu)
+    t.has_base = true
+  if json.has(co, "paths"):
+    pm = pkg.get(co, "paths")
+    paths_dir = dir + ""
+    has_paths = true
+
+fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
+  if is_relative(spec):
+    let f = load_path(&r, fs, join(dir, spec))
     if f != "": return file_res(f)
-  if r.has_base:
-    let f = load_path(&r, fs, join(r.base_url, spec))
+    let cand = join(dir, spec)
+    if real_file(&r, fs, cand) or is_dir(&r, fs, cand): return Res(R_FILE, cand, "")
+    return Res(R_UNRESOLVED, "", "")
+  if spec.startswith("/"):
+    return Res(R_UNRESOLVED, "", "")
+  # the nearest tsconfig.json's paths, then its baseUrl
+  let ti = tsc_for_dir(&r, fs, dir)
+  if ti >= 0:
+    let f = try_paths(&r, fs, ti, spec)
     if f != "": return file_res(f)
   if spec.startswith("#") and pkg.is_obj(r.imports_map):
     for tg in map_targets(r.imports_map, spec):
@@ -385,6 +471,12 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
       if real_file(&r, fs, f): return file_res(f)
   let b = resolve_bare(&r, fs, spec, dir)
   if b.kind != R_UNRESOLVED: return b
+  # the project's tsconfig paths (knip's own path mappings)
+  if r.paths.len > 0:
+    var cands = mapped_paths(r.paths, spec)
+    for c in cands:
+      let f = load_path(&r, fs, c)
+      if f != "": return file_res(f)
   # a path relative to the importing file that exists (knip's last resort)
   let cand = join(dir, spec)
   if real_file(&r, fs, cand) or is_dir(&r, fs, cand): return Res(R_FILE, cand, "")

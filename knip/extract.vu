@@ -89,6 +89,7 @@ type PC:
 type Raw:
   path: Str
   ok: Bool          # parsed without errors
+  scripts: [Str]
   imps: [Imp]
   ops: [Op]
   exps: [Exp]
@@ -135,11 +136,16 @@ type St:
   n_static_exports: Int
   tag_reach: [Int]          # JSDoc lookup: reach positions (sorted) and their tags
   tag_bits: [Int]
+  cp_ns: {Str: Bool}        # child_process imported as a whole (local names)
+  cp_methods: {Str: Str}    # child_process functions imported by name (local -> name)
+  path_join: Bool
+  path_resolve: Bool
+  scripts: [Str]            # shell commands the file runs (exec, spawn...)
 
 fn new_st(own src: Str, path: Str) -> St:
   let is_js = path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")
   let is_dts = path.endswith(".d.ts") or path.endswith(".d.cts") or path.endswith(".d.mts")
-  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [])
+  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [], {}, {}, false, false, [])
 
 fn nm(t: Ast, n: Int) -> Str:
   let s = t.nd[n].s
@@ -478,9 +484,8 @@ fn collect_refs(var s: St, t: Ast, n: Int, exp: Str, sig_only: Bool, seen: Int, 
     collect_refs(&s, t, nd.a, exp, sig_only, seen, in_body, this_type)
     collect_refs(&s, t, nd.b, exp, sig_only, seen, in_body, this_type)
     collect_refs(&s, t, nd.c, exp, sig_only, seen, in_body, this_type)
-    # an expression body is a function body too
-    if kind(t, nd.d) == ast.N_BLOCK: collect_refs(&s, t, nd.d, exp, sig_only, seen, in_body, this_type)
-    elif not sig_only: collect_refs(&s, t, nd.d, exp, sig_only, seen, true, this_type)
+    # (an expression body is walked as it is, as in ESTree)
+    collect_refs(&s, t, nd.d, exp, sig_only, seen, in_body, this_type)
     return
   if k == ast.N_PROPACCESS or k == ast.N_ID or k == ast.N_STR or k == ast.N_NUM:
     if k == ast.N_PROPACCESS: collect_refs(&s, t, nd.a, exp, sig_only, seen, in_body, this_type)
@@ -710,7 +715,8 @@ fn handle_decl_export(var s: St, t: Ast, n: Int):
     if (f & ast.MOD_GLOBAL) != 0: return
     let id = t.nd[n].a
     if not is_id(t, id): return
-    let ms = ns_members(&s, t, n, "")
+    var ms = ns_members(&s, t, n, "")
+    if ms.len > 0: mark_ns_refs(t, n, &ms)
     add_export(&s, nm(t, id), "namespace", t.nd[id].pos, ms, false, tags)
 
 # extractNamespaceMembers: the exported declarations inside a namespace, nested ones prefixed
@@ -742,6 +748,191 @@ fn ns_members(var s: St, t: Ast, n: Int, prefix: Str) -> [Member]:
       if name != "": ns_add(&out, prefix, name, decl_name_pos(t, st), tags)
   return out
 
+# Members of a namespace that other declarations in it refer to (markNamespaceMemberRefs).
+type NsScope:
+  prefix: Str
+  names: {Str: Bool}
+  own: {Str: Bool}
+  shadow: Bool
+
+type NsMark:
+  scopes: [NsScope]
+  members: {Str: Int}
+
+fn mark_ns_refs(t: Ast, n: Int, var ms: [Member]):
+  var m = NsMark([], {})
+  for i in 0..ms.len: m.members[ms[i].name] = i
+  var hits: {Int: Bool} = {}
+  ns_visit_ns(t, &m, t.nd[n].b, "", &hits)
+  for i, _ in hits: ms[i].in_file = true
+
+fn ns_add_ref(var m: NsMark, name: Str, path: [Str], var hits: {Int: Bool}):
+  var i = m.scopes.len - 1
+  while i >= 0:
+    if not (name in m.scopes[i].names):
+      i -= 1
+      continue
+    if m.scopes[i].shadow: return
+    var id = name + ""
+    if m.scopes[i].prefix != "": id = m.scopes[i].prefix + "." + name
+    for j in 0..path.len + 1:
+      if not (id in m.scopes[i].own):
+        if id in m.members: hits[m.members[id]] = true
+      if j < path.len: id = id + "." + path[j]
+    return
+
+fn decl_names_of(t: Ast, st: Int, var names: {Str: Bool}):
+  let k = t.nd[st].k
+  if k == ast.N_VAR:
+    for d in ast.items(t, t.nd[st].a): binding_names(t, t.nd[d].a, &names)
+  elif k == ast.N_MODULE:
+    if is_id(t, t.nd[st].a): names[nm(t, t.nd[st].a)] = true
+  elif k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_INTERFACE or k == ast.N_TYPEALIAS or k == ast.N_ENUM:
+    let name = nm(t, st)
+    if name != "": names[name] = true
+
+fn binding_names(t: Ast, p: Int, var names: {Str: Bool}):
+  if p < 0: return
+  let k = t.nd[p].k
+  if k == ast.N_ID: names[nm(t, p)] = true
+  elif k == ast.N_OBJPAT or k == ast.N_ARRPAT:
+    for e in ast.items(t, t.nd[p].a):
+      if t.nd[e].k == ast.N_BINDEL: binding_names(t, t.nd[e].b, &names)
+  elif k == ast.N_PARAM: binding_names(t, t.nd[p].a, &names)
+
+fn ns_visit_ns(t: Ast, var m: NsMark, body: Int, name: Str, var hits: {Int: Bool}):
+  var prefix = ""
+  if m.scopes.len > 0:
+    let parent = m.scopes[m.scopes.len - 1].prefix + ""
+    if parent != "": prefix = parent + "." + name
+    else: prefix = name + ""
+  var names: {Str: Bool} = {}
+  for st in ast.items(t, body): decl_names_of(t, st, &names)
+  m.scopes.push(NsScope(prefix, names, {}, false))
+  let top = m.scopes.len - 1
+  for st in ast.items(t, body):
+    let k = t.nd[st].k
+    if k == ast.N_VAR:
+      for d in ast.items(t, t.nd[st].a):
+        var own: {Str: Bool} = {}
+        var dn: {Str: Bool} = {}
+        binding_names(t, t.nd[d].a, &dn)
+        for x, _ in dn:
+          if prefix != "": own[prefix + "." + x] = true
+          else: own[x + ""] = true
+        m.scopes[top].own = own
+        ns_visit_binding(t, &m, t.nd[d].a, &hits)
+        ns_visit(t, &m, t.nd[d].b, &hits)
+        ns_visit(t, &m, t.nd[d].c, &hits)
+    else:
+      var own: {Str: Bool} = {}
+      var dn: {Str: Bool} = {}
+      decl_names_of(t, st, &dn)
+      if k != ast.N_MODULE:
+        for x, _ in dn:
+          if prefix != "": own[prefix + "." + x] = true
+          else: own[x + ""] = true
+      m.scopes[top].own = own
+      ns_visit(t, &m, st, &hits)
+  m.scopes.pop()
+
+fn ns_visit_binding(t: Ast, var m: NsMark, p: Int, var hits: {Int: Bool}):
+  if p < 0: return
+  let k = t.nd[p].k
+  if k == ast.N_ID: return
+  if k == ast.N_OBJPAT or k == ast.N_ARRPAT:
+    for e in ast.items(t, t.nd[p].a):
+      if t.nd[e].k == ast.N_BINDEL:
+        if kind(t, t.nd[e].a) == ast.N_COMPUTED: ns_visit(t, &m, t.nd[e].a, &hits)
+        ns_visit_binding(t, &m, t.nd[e].b, &hits)
+        ns_visit(t, &m, t.nd[e].c, &hits)
+    return
+  ns_visit(t, &m, p, &hits)
+
+fn ns_visit(t: Ast, var m: NsMark, n: Int, var hits: {Int: Bool}):
+  if n < 0: return
+  let k = t.nd[n].k
+  let nd = t.nd[n]
+  if k == ast.N_LIST:
+    for x in ast.items(t, n): ns_visit(t, &m, x, &hits)
+    return
+  if k == ast.N_ID:
+    ns_add_ref(&m, nm(t, n), [], &hits)
+    return
+  if k == ast.N_SHORTHAND:
+    ns_add_ref(&m, nm(t, n), [], &hits)
+    ns_visit(t, &m, nd.b, &hits)
+    return
+  if k == ast.N_MODULE:
+    if nd.b >= 0:
+      var name = ""
+      if is_id(t, nd.a): name = nm(t, nd.a)
+      ns_visit_ns(t, &m, nd.b, name, &hits)
+    return
+  if (k == ast.N_PROPACCESS and (nd.f & 4) == 0) or k == ast.N_QNAME:
+    var path: [Str] = []
+    var obj = n
+    while (kind(t, obj) == ast.N_PROPACCESS and (t.nd[obj].f & 4) == 0) or kind(t, obj) == ast.N_QNAME:
+      path.push(nm(t, obj))
+      obj = t.nd[obj].a
+    var rev: [Str] = []
+    var i = path.len - 1
+    while i >= 0:
+      rev.push(path[i] + "")
+      i -= 1
+    if is_id(t, obj): ns_add_ref(&m, nm(t, obj), rev, &hits)
+    else: ns_visit(t, &m, obj, &hits)
+    return
+  if k == ast.N_PROPACCESS:
+    ns_visit(t, &m, nd.a, &hits)
+    return
+  if k == ast.N_PROPASSIGN or k == ast.N_PROP or k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET:
+    # names of properties aren't references (computed ones are)
+    if kind(t, nd.a) == ast.N_COMPUTED: ns_visit(t, &m, nd.a, &hits)
+    ns_visit(t, &m, nd.b, &hits)
+    ns_visit(t, &m, nd.c, &hits)
+    return
+  if k == ast.N_DECL:
+    ns_visit_binding(t, &m, nd.a, &hits)
+    ns_visit(t, &m, nd.b, &hits)
+    ns_visit(t, &m, nd.c, &hits)
+    return
+  if k == ast.N_PARAM:
+    ns_visit_binding(t, &m, nd.a, &hits)
+    ns_visit(t, &m, nd.b, &hits)
+    ns_visit(t, &m, nd.c, &hits)
+    return
+  if k == ast.N_ENUMMEMBER:
+    ns_visit(t, &m, nd.b, &hits)
+    return
+  if k == ast.N_TTUPLEEL or k == ast.N_TPARAM:
+    ns_visit(t, &m, nd.a, &hits)
+    ns_visit(t, &m, nd.b, &hits)
+    return
+  if k == ast.N_BREAK or k == ast.N_CONTINUE or k == ast.N_STR or k == ast.N_NUM or k == ast.N_TKW: return
+  if k == ast.N_LABEL:
+    ns_visit(t, &m, nd.a, &hits)
+    return
+  # functions: their parameters (and var names) shadow
+  var shadow: {Str: Bool} = {}
+  var has_shadow = false
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW:
+    for p in ast.items(t, nd.b): binding_names(t, p, &shadow)
+    if k == ast.N_FUNCEXPR and nm(t, n) != "": shadow[nm(t, n)] = true
+    has_shadow = shadow.len > 0
+  elif k == ast.N_BLOCK:
+    for st in ast.items(t, nd.a): decl_names_of(t, st, &shadow)
+    has_shadow = shadow.len > 0
+  elif k == ast.N_SIG:
+    for p in ast.items(t, nd.b): binding_names(t, p, &shadow)
+    has_shadow = shadow.len > 0
+  if has_shadow: m.scopes.push(NsScope("", shadow, {}, true))
+  ns_visit(t, &m, nd.a, &hits)
+  ns_visit(t, &m, nd.b, &hits)
+  ns_visit(t, &m, nd.c, &hits)
+  if k != ast.N_VAR and k != ast.N_INTERFACE and k != ast.N_TYPEALIAS and k != ast.N_PROPACCESS: ns_visit(t, &m, nd.d, &hits)
+  if has_shadow: m.scopes.pop()
+
 fn ns_add(var out: [Member], prefix: Str, name: Str, pos: Int, tags: Int):
   var full = name + ""
   if prefix != "": full = prefix + "." + name
@@ -771,9 +962,7 @@ fn handle_export_specs(var s: St, t: Ast, n: Int):
       elif l.imported != exported: op(&s, l.spec, OP_REEXPORTAS, l.imported, exported)
       else: op(&s, l.spec, OP_REEXPORT, l.imported, "")
     # the exported name's node is the second identifier when renamed
-    var pos = t.nd[sp].pos
-    if t.nd[sp].b >= 0:
-      pos = name_after_as(s, t, sp)
+    let pos = name_after_as(s, t, sp)
     add_export(&s, exported, typ, pos, [], reexport, tags)
     s.spec_names[exported] = true
     add_local_to_export(&s, local, exported)
@@ -1217,6 +1406,30 @@ fn handle_call(var s: St, t: Ast, n: Int):
       if arg >= 0:
         add_imp(&s, nm(t, arg), "", "", "", t.nd[arg].pos, F_ENTRY, -1)
         return
+  if (s.cp_ns.len > 0 or s.cp_methods.len > 0) and ast.count(t, t.nd[n].c) >= 1:
+    var method = ""
+    let cname = nm(t, callee)
+    if is_id(t, callee) and cname in s.cp_methods: method = s.cp_methods[cname] + ""
+    elif plain_access(t, callee) and is_id(t, t.nd[callee].a) and nm(t, t.nd[callee].a) in s.cp_ns: method = nm(t, callee)
+    if method != "":
+      let arg = ast.item(t, t.nd[n].c, 0)
+      if method == "exec" or method == "execSync":
+        let sc = script_from_arg(t, arg)
+        if sc != "":
+          s.scripts.push(sc)
+        return
+      if method == "fork" or method == "spawn" or method == "spawnSync" or method == "execFile" or method == "execFileSync":
+        let dp = dirname_path(s, t, arg)
+        if dp != "":
+          add_imp(&s, dp, "", "", "", t.nd[arg].pos, F_ENTRY, -1)
+          return
+        if method != "fork":
+          var arg1 = -1
+          if ast.count(t, t.nd[n].c) >= 2: arg1 = ast.item(t, t.nd[n].c, 1)
+          let sc = safe_script(t, arg, arg1)
+          if sc != "":
+            s.scripts.push(sc)
+            return
   if plain_access(t, callee) and is_id(t, t.nd[callee].a) and nm(t, t.nd[callee].a) == "Object":
     let m = nm(t, callee)
     if m == "keys" or m == "values" or m == "entries" or m == "getOwnPropertyNames":
@@ -1249,6 +1462,53 @@ fn handle_call(var s: St, t: Ast, n: Int):
         if pk == ast.N_PROPASSIGN and kind(t, t.nd[pr].a) != ast.N_COMPUTED and is_id(t, t.nd[pr].b): mark_ref_if_ns(&s, nm(t, t.nd[pr].b))
         elif pk == ast.N_SHORTHAND: mark_ref_if_ns(&s, nm(t, pr))
         elif pk == ast.N_SPREAD and is_id(t, t.nd[pr].a): mark_ref_if_ns(&s, nm(t, t.nd[pr].a))
+
+fn script_from_arg(t: Ast, a: Int) -> Str:
+  if is_str(t, a): return nm(t, a)
+  if kind(t, a) == ast.N_TEMPL:
+    var out = nm(t, a)
+    for sp in ast.items(t, t.nd[a].a): out = out + "$__knip__" + nm(t, sp)
+    return out
+  return ""
+
+fn safe_arg(v: Str) -> Bool:
+  if v == "": return false
+  for i in 0..v.len:
+    let c = v[i]
+    let ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '@' or c == '.' or c == ',' or c == ':' or c == '/' or c == '=' or c == '+' or c == '~' or c == '-'
+    if not ok: return false
+  return true
+
+fn safe_script(t: Ast, exe: Int, args: Int) -> Str:
+  if not is_str(t, exe): return ""
+  let v = nm(t, exe)
+  if not safe_arg(v): return ""
+  var parts: [Str] = [v]
+  if kind(t, args) == ast.N_ARRAY:
+    for e in ast.items(t, t.nd[args].a):
+      if is_str(t, e) and safe_arg(nm(t, e)): parts.push(nm(t, e))
+  return " ".join(parts)
+
+# path.join(__dirname, 'a', 'b') -> ./a/b (extractInlineDirnamePath)
+fn dirname_path(s: St, t: Ast, n: Int) -> Str:
+  if kind(t, n) != ast.N_CALL: return ""
+  let callee = t.nd[n].a
+  var helper = false
+  if plain_access(t, callee) and is_id(t, t.nd[callee].a) and nm(t, t.nd[callee].a) == "path" and (nm(t, callee) == "join" or nm(t, callee) == "resolve"): helper = true
+  elif is_id(t, callee):
+    if nm(t, callee) == "join" and s.path_join: helper = true
+    if nm(t, callee) == "resolve" and s.path_resolve: helper = true
+  if not helper: return ""
+  let args = ast.items(t, t.nd[n].c)
+  if args.len < 2 or not is_id(t, args[0]) or nm(t, args[0]) != "__dirname": return ""
+  var parts: [Str] = []
+  for i in 1..args.len:
+    if not is_str(t, args[i]): return ""
+    parts.push(nm(t, args[i]))
+  var joined = "/".join(parts)
+  while joined.find("//") >= 0: joined = joined.replace("//", "/")
+  if joined.startswith(".") or joined.startswith("/"): return joined
+  return "./" + joined
 
 fn mark_ref_if_ns(var s: St, name: Str):
   if name in s.li and s.li[name].is_ns: op_li(&s, name, OP_REF, name, "")
@@ -1641,8 +1901,7 @@ fn walk(var s: St, t: Ast, n: Int):
         let exported = nm(t, sp)
         var typ = "unknown"
         if type_only or (t.nd[sp].f & ast.M_TYPEONLY) != 0: typ = "type"
-        var pos = t.nd[sp].pos
-        if t.nd[sp].b >= 0: pos = name_after_as(s, t, sp)
+        let pos = name_after_as(s, t, sp)
         add_export(&s, exported, typ, pos, [], true, tags | tags_at(s, t.nd[sp].pos))
     return
   if k == ast.N_EXPORTDEFAULT:
@@ -1714,6 +1973,19 @@ fn static_imports(var s: St, t: Ast, root: Int):
     let b = t.nd[st].b
     let c = t.nd[st].c
     let d = t.nd[st].d
+    let is_cp = spec == "child_process" or spec == "node:child_process"
+    let is_path = spec == "path" or spec == "node:path"
+    if is_cp:
+      if b >= 0: s.cp_ns[nm(t, b)] = true
+      if c >= 0: s.cp_ns[nm(t, c)] = true
+    for sp in ast.items(t, d):
+      let local = nm(t, sp)
+      var imported = local
+      if t.nd[sp].b >= 0: imported = nm(t, t.nd[sp].b)
+      if is_cp: s.cp_methods[local] = imported
+      if is_path and local == imported:
+        if imported == "join": s.path_join = true
+        if imported == "resolve": s.path_resolve = true
     if b < 0 and c < 0 and ast.count(t, d) == 0:
       add_imp(&s, spec, "", "", "", pos, F_SIDEEFFECTS, -1)
       continue
@@ -1768,7 +2040,10 @@ fn count_exports(t: Ast, root: Int) -> Int:
   var n = 0
   for st in ast.items(t, root):
     let k = t.nd[st].k
-    if k == ast.N_EXPORT or k == ast.N_EXPORTDEFAULT: n += 1
+    if k == ast.N_EXPORTDEFAULT: n += 1
+    elif k == ast.N_EXPORT:
+      # export {} has no entries
+      if t.nd[st].b < 0 or ast.count(t, t.nd[st].b) > 0: n += 1
     elif (k == ast.N_VAR or k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_INTERFACE or k == ast.N_TYPEALIAS or k == ast.N_ENUM or k == ast.N_MODULE or k == ast.N_IMPORTEQ) and is_exported_decl(t, st): n += 1
   return n
 
@@ -1915,7 +2190,7 @@ fn analyze(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast) -> Raw:
     # knip parses with oxc, which recovers; a file this parser rejects is read as having nothing
     var keep = ""
     if wide: swap(&keep, &s.src)
-    return Raw(path + "", false, [], [], [], [], 0, lines, wide, keep)
+    return Raw(path + "", false, [], [], [], [], [], 0, lines, wide, keep)
   let root = t.nd.len - 1
   build_tags(&s)
   s.module_file = has_module_syntax(t, root, s.src)
@@ -1971,7 +2246,9 @@ fn analyze(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast) -> Raw:
   swap(&exps, &s.exps)
   var dups: [Dup] = []
   swap(&dups, &s.dups)
-  return Raw(path + "", true, imps, ops, exps, dups, s.n_static_exports, lines, wide, keep)
+  var scs: [Str] = []
+  swap(&scs, &s.scripts)
+  return Raw(path + "", true, scs, imps, ops, exps, dups, s.n_static_exports, lines, wide, keep)
 
 # line, column (1-based, in UTF-16 units) and offset (UTF-16) of byte offset pos
 fn loc(r: Raw, pos: Int) -> [Int]:
