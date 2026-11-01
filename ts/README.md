@@ -85,3 +85,57 @@ intersection target), the restrictive instantiation of a conditional, and subtyp
 assignability in type-predicate narrowing. What it still finds (about 1% of lines): substitution
 types in a conditional's true branch (`T & U` printed as `T`), and an assertion from a type
 parameter constrained to `{}` against a union.
+
+# vlint: an oxlint-compatible linter written in Vu
+
+`vlint` checks JavaScript and TypeScript (`.js .mjs .cjs .jsx .ts .mts .cts .tsx`) with oxlint's
+96 default rules (the correctness rules that need no type information: `eslint/*`, `typescript/*`,
+`unicorn/*`, `oxc/*`) and prints each diagnostic the way `oxlint -f unix` does. It reuses vtsc's
+scanner and parser, plus a scope builder (`scope.vu`), a regular-expression parser (`regex.vu`)
+and the rules (`rules.vu`): about 5,900 lines of Vu.
+
+```
+cd ts && ../vu build --release vlint.vu -o vlint
+./vlint [--jobs N] src/        # files, or folders searched for the extensions above
+```
+
+It honors `eslint-disable`/`oxlint-disable` comments, and reports parse errors with oxc's
+messages where they're known (redeclarations, invalid characters).
+
+## Matching oxlint
+
+`lint_diff.py` runs oxlint 1.90.0 (`-c` an empty config, `--disable-nested-config`) and vlint on
+the same files and compares every diagnostic (position, rule, message, help). On date-fns, zod,
+remeda, immer, jotai, ky, mitt, p-queue, redux and reselect (3,445 files), JavaScript from
+`node_modules`, preact, excalidraw, vscode (11,000 diagnostics) and a set of hand-written probe
+files, every warning matches: no missing ones, no extra ones. What still differs is parse errors
+in a few vscode test fixtures that oxc rejects and vlint accepts (duplicate class methods,
+TypeScript syntax in `.js` files).
+
+## Speed
+
+The TypeScript corpus above (3,445 files, 11.9 MB), user CPU time (best of 5), on a 2-core Intel
+Xeon @ 2.80GHz VM that was heavily loaded by other jobs (load average 4 to 9), so wall-clock times
+aren't meaningful and the CPU times are noisy (`lint_bench.sh`; measured 2026-11-01):
+
+| linter | CPU s (run 1) | CPU s (run 2) |
+|---|---|---|
+| vlint, 1 thread | 0.55 | 0.65 |
+| oxlint 1.90.0, `--threads 1` | 0.55 | 0.64 |
+| vlint, all cores | 0.65 | 0.63 |
+| oxlint, all cores | 0.56 | 0.60 |
+| Biome 2.6.4 `lint` (its recommended rules), all cores | 7.3 | |
+| ESLint 10.14 + typescript-eslint parser, the same 56 core rules, 1 thread | 72.3 | |
+
+So vlint runs about as fast as oxlint (written in Rust) and does the same work: 13 times less CPU
+than Biome and 130 times less than ESLint. Biome runs a different (larger) rule set, so its line
+compares the cost of a lint pass, not the same checks. On vscode/src (11,260 files, single thread,
+loaded machine) vlint took 7.9 to 8.6 s of CPU against oxlint's 7.2 to 7.5 s. All of this was
+measured on a busy machine: it needs repeating on an idle one.
+
+What made it fast, measured in instructions (callgrind, zod): a keyword recognizer reading the
+source bytes instead of a map lookup; identifiers interned straight from the source with an FNV
+table (no string per identifier); a small name table per file, which stays in the cache; arrays
+instead of hash maps for node-keyed data and a name-chained scope table; the source lent to the
+parser rather than copied; and an 8-bytes-at-a-time scan for irregular whitespace. Together these
+cut instructions by 24% and CPU time by about 25%.
