@@ -161,7 +161,9 @@ class G:
             base = ret.replace(" | undefined", "")
             if r.random() < 0.85: body.append(f"return {self.value(base)}")
         self.funcs.append((name, [pt for _, pt in params], ret))
-        ps = ", ".join(f"{p}: {t}" for p, t in params)
+        opt = getattr(self, "with_flow", False) and params and r.random() < 0.3
+        ps = ", ".join(f"{p}{'?' if opt and i == len(params) - 1 else ''}: {t}" for i, (p, t) in enumerate(params))
+        if opt and r.random() < 0.5: body.insert(0, f"const {self.name('z')}: boolean = {name}")
         return f"function {name}({ps}): {ret} {{\n  " + "\n  ".join(body) + "\n}"
 
     def narrow_stmt(self, p, pt):
