@@ -144,53 +144,37 @@ fn diag_less(a: parse.Diag, b: parse.Diag) -> Bool:
   if a.code != b.code: return a.code < b.code
   return a.msg < b.msg
 
-fn main(fs: Fs, os: Os) throws:
-  var files: [Str] = []
-  var dir = ""
-  var timing = false
-  var parse_only = false
-  var target = "es2025"
-  let argv = args()
-  var i = 1
-  while i < argv.len:
-    let a = argv[i]
-    if a == "--lib" and i + 1 < argv.len:
-      dir = argv[i + 1]
-      i += 2
-      continue
-    if a == "--time":
-      timing = true
-      i += 1
-      continue
-    if a == "--parse-only":
-      parse_only = true
-      i += 1
-      continue
-    if a == "--target" and i + 1 < argv.len:
-      target = argv[i + 1].lower()
-      i += 2
-      continue
-    files.push(a + "")
-    i += 1
-  if parse_only:
-    # the files named, parsed (read first; the time is for parsing alone)
-    var srcs0: [Str] = []
-    var bytes = 0
-    for path in files:
-      let src = fs.read(path)?
-      bytes += src.len
-      srcs0.push(src)
-    var kw0 = scan.keywords()
-    let p0 = os.clock()
-    var t1 = ast.new_ast()
-    ast.reserve_nodes(&t1, bytes / 9 + 16)
-    for j in 0..srcs0.len: parse.parse_file(&t1, srcs0[j] + "", j + 1, &kw0)
-    let p1 = os.clock()
-    print("vtsc parse: {files.len} files, {bytes} bytes, {t1.k.len} nodes, {(p1 - p0) * 1000.0} ms")
-    return
-  if dir == "": dir = lib_dir(fs, os)
-  if dir == "": fail "can't find TypeScript's lib files: pass --lib DIR (node_modules/typescript/lib) or set VTSC_LIB"
+
+type Out:
+  keys: [parse.Diag]
+  lines: [Str]
+  lib: [Bool]          # an error in a lib file (dropped when any user file isn't checked)
+  unsup_user: Bool
+  timing: Str
+  ok: Bool
+  unsup: [Str]         # why a file of this worker's isn't checked (its own constructs)
+  unsup_fi: [Int]
+  unsup_mine: [Bool]   # (the reason from the worker checking the file is the one reported)
+  fidx: [Int]          # each error's file index
+  user_from: Int       # (worker 0) the first user file, the names and each user file's deps
+  names: [Str]
+  deps: [[Int]]
+
+fn want_deps(f: Int, user_from: Int, deps: [[Str]], var want: [Bool], index: {Str: Int}):
+  if want[f]: return
+  want[f] = true
+  for d in deps[f - user_from]:
+    if d in index: want_deps(index[d], user_from, deps, &want, index)
+
+fn worker(fs: Fs, os: Os, own files: [Str], own dir: Str, own target: Str, shard: Int, nshards: Int, own ch: Chan[Out]):
+  let o = run(fs, os, files, dir, target, shard, nshards) else Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
+  ch.send(o)
+
+# The checker over the files: the errors of this worker's share of them (every nshards-th file,
+# starting at shard), each with its sort key.
+fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards: Int) -> Out throws:
   let t0 = os.clock()
+  var out = Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
   var seen: {Str: Bool} = {}
   var libs: [Str] = []
   # the default lib for the target, as tsc picks it
@@ -221,6 +205,7 @@ fn main(fs: Fs, os: Os) throws:
       queued[np] = true
       queue.push(np)
   var deps: [[Str]] = []
+  var imps: [[Str]] = []     # the deps through import statements (not export ... from)
   var pkg_present: {Str: Bool} = {}
   var qi = 0
   while qi < queue.len:
@@ -235,23 +220,28 @@ fn main(fs: Fs, os: Os) throws:
     let root = t.k.len - 1
     roots.push(root)
     var my_deps: [Str] = []
+    var my_imps: [Str] = []
     for st in ast.items(t, root):
       let k = t.k[st]
       var spec = -1
       if k == ast.N_IMPORT or k == ast.N_EXPORT: spec = t.a[st]
       if spec < 0 or t.k[spec] != ast.N_STR: continue
+      let is_imp = k == ast.N_IMPORT
       let sp = t.names[t.s[spec]] + ""
       if not bind.is_relative(sp) and package_may_exist(fs, os.env("PWD"), path, sp): pkg_present[path + "|" + sp] = true
       for cand in bind.module_candidates(path, sp):
         if cand in queued:
           my_deps.push(cand + "")
+          if is_imp: my_imps.push(cand + "")
           break
         if fs.exists(cand):
           queued[cand] = true
           queue.push(cand)
           my_deps.push(cand + "")
+          if is_imp: my_imps.push(cand + "")
           break
     deps.push(my_deps)
+    imps.push(my_imps)
   let t1 = os.clock()
   var c = types.new_checker(t)
   c.user_from = user_from
@@ -274,22 +264,45 @@ fn main(fs: Fs, os: Os) throws:
   var state: [Int] = []
   for fx in 0..roots.len: state.push(0)
   for fx in user_from..roots.len: visit(fx, user_from, deps, &state, &order0, c.file_index)
+  # this worker's files checked, and the declarations of what they import resolved (another
+  # worker checks those files)
+  var mine: [Bool] = []
+  var want: [Bool] = []
+  for fx in 0..roots.len:
+    mine.push(false)
+    want.push(false)
+  # contiguous parts of the order files are checked in (a part's imports mostly come before it),
+  # balanced by size
+  var uord: [Int] = []
+  var total = 0
+  for fx in order0:
+    if fx >= user_from:
+      uord.push(fx)
+      total += srcs[fx].len
+  var acc = 0
+  for fx in uord:
+    let part = (acc * nshards) / (total + 1)
+    if part == shard: mine[fx] = true
+    acc += srcs[fx].len
+  for fx in user_from..roots.len:
+    if mine[fx]: want_deps(fx, user_from, imps, &want, c.file_index)
+  var deps_only = 0
   chk.shared_globals(&c, user_from)
+  if os.env("VTSC_SHARDS") != "":
+    var nw = 0
+    for fx in user_from..roots.len:
+      if want[fx]: nw += 1
+    eprint("vtsc: worker {shard}: checks {nw} files")
   for fi in order0:
+    if not want[fi]: continue
     c.node_file = fi
-    chk.check_file(&c, roots[fi])
+    if mine[fi]: chk.check_file(&c, roots[fi])
+    else:
+      chk.declare_only(&c, roots[fi])
+      deps_only += 1
   chk.global_conflicts(&c, user_from)
-  # a file importing one that isn't checked isn't checked either (its types may be wrong)
-  var grew = true
-  while grew:
-    grew = false
-    for fi in user_from..roots.len:
-      if fi in c.unsupported: continue
-      for d in deps[fi - user_from]:
-        if d in c.file_index and c.file_index[d] in c.unsupported:
-          c.unsupported[fi] = "an import of " + d + ", which isn't checked"
-          grew = true
-          break
+  # (a file importing one that isn't checked isn't checked either: decided by the caller, over
+  # every worker's files)
   let t3 = os.clock()
   # report: syntax errors, then the checker's, by file and position (as tsc sorts them)
   # files are ordered by name, as tsc compares diagnostics (file index -> rank, and back)
@@ -305,7 +318,11 @@ fn main(fs: Fs, os: Os) throws:
   for ox in 0..names.len: rank.push(0)
   for ox in 0..order.len: rank[order[ox]] = ox
   var all: [parse.Diag] = []
-  for d in pdiags: all.push(parse.Diag(rank[d.file], d.pos, d.end, d.code, d.msg + ""))
+  var all_lib: [Bool] = []
+  if shard == 0:
+    for d in pdiags:
+      all.push(parse.Diag(rank[d.file], d.pos, d.end, d.code, d.msg + ""))
+      all_lib.push(false)
   var has_syntax: {Int: Bool} = {}
   for d in pdiags: has_syntax[d.file] = true
   # comment directives: // @ts-ignore and // @ts-expect-error hide the errors of the next line
@@ -327,7 +344,8 @@ fn main(fs: Fs, os: Os) throws:
     lstarts[fi] = ls
   for d in c.diags:
     if d.file in c.unsupported: continue
-    if d.file < user_from and has_unsupported_user(c, user_from): continue
+    if d.file >= user_from and not mine[d.file]: continue
+    if d.file < user_from and shard != 0: continue
     # as tsc: when any file has a syntax error, only syntax errors are reported
     if pdiags.len > 0: continue
     if d.file in c.t.nocheck: continue
@@ -337,28 +355,175 @@ fn main(fs: Fs, os: Os) throws:
         dir_used[(d.file << 32) | hid] = true
         continue
     all.push(parse.Diag(rank[d.file], d.pos, d.end, d.code, d.msg + ""))
+    all_lib.push(d.file < user_from)
   if pdiags.len == 0:
     for fi, m in dir_line:
-      if fi in c.unsupported or fi in c.t.nocheck: continue
+      if fi in c.unsupported or fi in c.t.nocheck or not mine[fi]: continue
       let ds = c.t.dirs[fi]
       var di = 0
       while di < ds.len:
         if ds[di + 2] == 2 and not (((fi << 32) | ds[di]) in dir_used):
           all.push(parse.Diag(rank[fi], ds[di], ds[di + 1], 2578, "Unused '@ts-expect-error' directive."))
+          all_lib.push(false)
         di += 3
-  # as tsc's compareDiagnostics: file, start, length, code, message
-  all.sort(by: fn(a, b) => diag_less(a, b))
-  var last = ""
-  for d in all:
+  # each error with its sort key (merged with the other workers' and sorted by the caller)
+  for ix in 0..all.len:
+    let d = all[ix]
     let fi = order[d.file]
     let lc = line_col(srcs[fi], d.pos)
     var fname = names[fi] + ""
     if fname.startswith("/"): fname = relative_to(c.cwd, fname)
     let line = fname + "({lc[0]},{lc[1]}): error TS{d.code}: " + d.msg
-    if line == last: continue
-    print(line)
-    last = line + ""
+    out.keys.push(parse.Diag(d.file, d.pos, d.end, d.code, d.msg + ""))
+    out.lines.push(line)
+    out.lib.push(all_lib[ix])
+    out.fidx.push(fi)
   for fi in user_from..roots.len:
-    if fi in c.unsupported: eprint("vtsc: " + names[fi] + ": not checked: uses " + c.unsupported[fi])
-  if timing: eprint("vtsc: parse {(t1 - t0) * 1000.0:.1} ms, bind {(t2 - t1) * 1000.0:.1} ms, check {(t3 - t2) * 1000.0:.1} ms")
-  if all.len > 0: exit(2)
+    if fi in c.unsupported:
+      out.unsup_fi.push(fi)
+      out.unsup.push(c.unsupported[fi] + "")
+      out.unsup_mine.push(mine[fi])
+      out.unsup_user = true
+  if shard == 0:
+    out.user_from = user_from
+    for fx in 0..names.len: out.names.push(names[fx] + "")
+    for dl in deps:
+      var ix2: [Int] = []
+      for d in dl:
+        if d in c.file_index: ix2.push(c.file_index[d])
+        else: ix2.push(-1)
+      out.deps.push(ix2)
+  out.timing = "vtsc: parse {(t1 - t0) * 1000.0:.1} ms, bind {(t2 - t1) * 1000.0:.1} ms, check {(t3 - t2) * 1000.0:.1} ms"
+  out.ok = true
+  return out
+
+
+fn main(fs: Fs, os: Os) throws:
+  var files: [Str] = []
+  var dir = ""
+  var timing = false
+  var parse_only = false
+  var jobs = 0
+  var target = "es2025"
+  let argv = args()
+  var i = 1
+  while i < argv.len:
+    let a = argv[i]
+    if a == "--lib" and i + 1 < argv.len:
+      dir = argv[i + 1]
+      i += 2
+      continue
+    if a == "--time":
+      timing = true
+      i += 1
+      continue
+    if a == "--jobs" and i + 1 < argv.len:
+      jobs = int(argv[i + 1]) else 1
+      i += 2
+      continue
+    if a == "--parse-only":
+      parse_only = true
+      i += 1
+      continue
+    if a == "--target" and i + 1 < argv.len:
+      target = argv[i + 1].lower()
+      i += 2
+      continue
+    files.push(a + "")
+    i += 1
+  if parse_only:
+    # the files named, parsed (read first; the time is for parsing alone)
+    var srcs0: [Str] = []
+    var bytes = 0
+    for path in files:
+      let src = fs.read(path)?
+      bytes += src.len
+      srcs0.push(src)
+    var kw0 = scan.keywords()
+    let p0 = os.clock()
+    var t1 = ast.new_ast()
+    ast.reserve_nodes(&t1, bytes / 9 + 16)
+    for j in 0..srcs0.len: parse.parse_file(&t1, srcs0[j] + "", j + 1, &kw0)
+    let p1 = os.clock()
+    print("vtsc parse: {files.len} files, {bytes} bytes, {t1.k.len} nodes, {(p1 - p0) * 1000.0} ms")
+    return
+  if dir == "": dir = lib_dir(fs, os)
+  if dir == "": fail "can't find TypeScript's lib files: pass --lib DIR (node_modules/typescript/lib) or set VTSC_LIB"
+  # (more than one worker for a big project: each parses everything and checks its share)
+  if jobs == 0:
+    jobs = 1
+    if files.len >= 64: jobs = cpu_count(fs)
+  if jobs > 8: jobs = 8
+  let tm0 = os.clock()
+  var outs: [Out] = []
+  if jobs == 1: outs.push(run(fs, os, files, dir, target, 0, 1)?)
+  else:
+    let ch: Chan[Out] = chan(jobs)
+    for k in 0..jobs:
+      var fc: [Str] = []
+      for x in files: fc.push(x + "")
+      spawn worker(fs, os, fc, dir + "", target + "", k, jobs, ch)
+    for k in 0..jobs:
+      let o = ch.recv()?
+      outs.push(o)
+  var any_unsup = false
+  for o in outs:
+    if not o.ok: fail "a worker failed"
+    if o.unsup_user: any_unsup = true
+  # files not checked: their own constructs (from their workers), then what imports them, as far
+  # as it goes (each the first of its imports found unchecked)
+  var w0 = 0
+  for k in 0..outs.len:
+    if outs[k].names.len > 0: w0 = k
+  let uf = outs[w0].user_from
+  var why: {Int: Str} = {}
+  # (marks any worker made, a file's own worker's reason first)
+  for o in outs:
+    for ix in 0..o.unsup_fi.len:
+      if o.unsup_mine[ix]: why[o.unsup_fi[ix]] = o.unsup[ix] + ""
+  for o in outs:
+    for ix in 0..o.unsup_fi.len:
+      if not (o.unsup_fi[ix] in why): why[o.unsup_fi[ix]] = o.unsup[ix] + ""
+  var grew = true
+  while grew:
+    grew = false
+    for fi in uf..outs[w0].names.len:
+      if fi in why: continue
+      for d in outs[w0].deps[fi - uf]:
+        if d >= 0 and d in why:
+          why[fi] = "an import of " + outs[w0].names[d] + ", which isn't checked"
+          grew = true
+          break
+  var keys: [parse.Diag] = []
+  var texts: [Str] = []
+  for o in outs:
+    for ix in 0..o.keys.len:
+      if o.lib[ix] and any_unsup: continue
+      if o.fidx[ix] in why: continue
+      let kd = o.keys[ix]
+      keys.push(parse.Diag(kd.file, kd.pos, kd.end, kd.code, kd.msg + ""))
+      texts.push(o.lines[ix] + "")
+  var idx: [Int] = []
+  for ix in 0..keys.len: idx.push(ix)
+  # as tsc's compareDiagnostics: file, start, length, code, message
+  idx.sort(by: fn(a, b) => diag_less(keys[a], keys[b]))
+  var last = ""
+  for ix in idx:
+    if texts[ix] == last: continue
+    print(texts[ix])
+    last = texts[ix] + ""
+  for fi in uf..outs[w0].names.len:
+    if fi in why: eprint("vtsc: " + outs[w0].names[fi] + ": not checked: uses " + why[fi])
+  if timing:
+    for o in outs: eprint(o.timing)
+    eprint("vtsc: total {(os.clock() - tm0) * 1000.0:.1} ms")
+  if keys.len > 0: exit(2)
+
+fn cpu_count(fs: Fs) -> Int:
+  let info = fs.read("/proc/cpuinfo") else ""
+  var n = 0
+  for l in info.split("\n"):
+    if l.startswith("processor"): n += 1
+  if n < 1: return 1
+  return n
+
