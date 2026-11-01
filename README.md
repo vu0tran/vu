@@ -489,6 +489,14 @@ lower is better. (Earlier rounds measured on another VM, where every time was hi
   operation, which Rust's release builds leave out, are about a fifth of it), and a first build for
   a debugger, 5.9 s against 5.2 s.
 
+## A TypeScript type checker in Vu
+
+`ts/` holds vtsc, a TypeScript type checker written in Vu that prints the same errors as
+`tsc --noEmit --strict`. On date-fns (1334 files) on a 2-core VM it checks in 566 ms where tsc 7
+(Go) takes 1660 ms and tsc 6 takes 8.7 s; it checks 1210 of the files and lists the other 124 as
+not checked rather than guessing. Its parser handles the same 2.0 MB in 52 ms. Details, caveats
+and how it's tested against tsc: `ts/README.md`.
+
 ## Built for the model that writes it
 
 Vu's compiler, runtime, standard library, tests and these documents were written by an AI model
@@ -551,6 +559,7 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 | `mcp/filesystem/`, `mcp/time/`, `mcp/fetch/`, `mcp/sqlite/`, `mcp/git/`, `mcp/vu/` | MCP servers: filesystem, time, fetch, SQLite, git, and Vu's checker for models |
 | `tests/` | the test suites; `tests/gate.sh` runs them all |
 | `bench/` | benchmark programs in C, C++, Rust and Go, and the scripts that time them |
+| `ts/` | vtsc, a TypeScript type checker written in Vu (2.9x faster than tsc 7 on date-fns; see `ts/README.md`) |
 | `SPEC.md` | the language |
 | `CHANGELOG.md` | how it was built, round by round, with measurements |
 | `attic/` | the retired Python compiler |
