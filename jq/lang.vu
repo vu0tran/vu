@@ -154,6 +154,7 @@ type P:
   text: Str
   err: Str
   errline: Int
+  errpos: Int
   line_base: Int
   ast: Ast
   fname: Str
@@ -163,7 +164,7 @@ fn new_ast() -> Ast:
 
 fn node(var p: P, k: Int, a: Int, b: Int, c: Int) -> Int:
   let id = p.ast.ns.len
-  p.ast.ns.push(N(k, a, b, c, -1, -1, -1, vnull(), line_at(p, p.ts)))
+  p.ast.ns.push(N(k, a, b, c, -1, -1, -1, vnull(), p.ts))
   return id
 
 fn line_at(p: P, pos: Int) -> Int:
@@ -191,19 +192,23 @@ fn perror(var p: P, msg: Str):
   if p.err == "":
     p.err = msg
     p.errline = line_at(p, p.ts)
+    p.errpos = p.ts
 
+# Bison's names for tokens, as jq's syntax errors print them.
 fn tok_name(p: P) -> Str:
   let t = p.tk
   if t == T_EOF: return "end of file"
-  if t == T_IDENT: return "IDENT " + p.text
-  if t == T_FIELD: return "FIELD ." + p.text
-  if t == T_VAR: return "'$'"
+  if t == T_IDENT: return "IDENT"
+  if t == T_FIELD: return "FIELD"
+  if t == T_VAR: return "BINDING"
+  if t == T_LOC: return "$__loc__"
   if t == T_FORMAT: return "FORMAT"
   if t == T_NUM: return "LITERAL"
   if t == T_QUOTE: return "QQSTRING_START"
-  if t >= T_DEF: return p.src[p.ts..p.te]
   if t == T_BAD: return "INVALID_CHARACTER"
-  return "'" + p.src[p.ts..p.te] + "'"
+  let text = p.src[p.ts..p.te]
+  if text.len == 1: return "'" + text + "'"
+  return text
 
 fn unexpected(var p: P):
   let _h1 = "syntax error, unexpected " + tok_name(p) + " (Unix shell quoting issues?)"
@@ -542,15 +547,95 @@ fn parse_mul(var p: P, var st: St) -> Int:
     lhs = bin_node(&p, &st, op, lhs, rhs)
   return lhs
 
+# The keyword forms (reduce, foreach, if, try, label, def): expressions, not terms, in jq's
+# grammar, so they take no suffixes (but ?) and can't be object values or reduce sources.
+fn is_keyword_start(t: Int) -> Bool:
+  return t == T_REDUCE or t == T_FOREACH or t == T_IF or t == T_TRY or t == T_LABEL or t == T_DEF
+
+fn parse_keyword_exp(var p: P, var st: St) -> Int:
+  let t = p.tk
+  if t == T_REDUCE or t == T_FOREACH:
+    next(&p)
+    let src = parse_postfix(&p, &st, false)
+    expect(&p, T_AS)
+    let pat = parse_pattern(&p, &st)
+    expect(&p, T_LPAREN)
+    let init = parse_pipe(&p, &st)
+    expect(&p, T_SEMI)
+    let upd = parse_pipe(&p, &st)
+    var ext = -1
+    if t == T_FOREACH and p.tk == T_SEMI:
+      next(&p)
+      ext = parse_pipe(&p, &st)
+    expect(&p, T_RPAREN)
+    if t == T_REDUCE:
+      let n = node(&p, N_REDUCE, src, pat, init)
+      set_d(&p, n, upd)
+      return n
+    let n = node(&p, N_FOREACH, src, pat, init)
+    set_d(&p, n, upd)
+    set_x(&p, n, ext)
+    return n
+  if t == T_IF:
+    next(&p)
+    return parse_if(&p, &st)
+  if t == T_TRY:
+    next(&p)
+    let body = parse_try_part(&p, &st)
+    var handler = -1
+    if p.tk == T_CATCH:
+      next(&p)
+      handler = parse_try_part(&p, &st)
+    return node(&p, N_TRY, body, handler, -1)
+  if t == T_LABEL:
+    next(&p)
+    if p.tk != T_VAR:
+      unexpected(&p)
+      return 0
+    let _h5 = p.text
+    let nm = name_id(&p, _h5)
+    next(&p)
+    expect(&p, T_PIPE)
+    let body = parse_pipe(&p, &st)
+    let n = node(&p, N_LABEL, body, -1, -1)
+    set_x(&p, n, nm)
+    return n
+  if t == T_DEF:
+    let f = parse_def(&p, &st)
+    let rest = parse_pipe(&p, &st)
+    let n = node(&p, N_DEF, rest, -1, -1)
+    set_x(&p, n, f)
+    return n
+  unexpected(&p)
+  return 0
+
+# try's body and handler: a term with suffixes, a keyword form, or a negation
+fn parse_try_part(var p: P, var st: St) -> Int:
+  if is_keyword_start(p.tk): return parse_keyword_exp(&p, &st)
+  if p.tk == T_MINUS:
+    next(&p)
+    let a = parse_postfix(&p, &st, false)
+    return node(&p, N_NEG, a, -1, -1)
+  return parse_postfix(&p, &st, false)
+
 fn parse_unary(var p: P, var st: St) -> Int:
   if p.tk == T_MINUS:
     next(&p)
     let a = parse_mul(&p, &st)
     return node(&p, N_NEG, a, -1, -1)
+  if is_keyword_start(p.tk):
+    var e = parse_keyword_exp(&p, &st)
+    while p.tk == T_QMARK and p.err == "":
+      next(&p)
+      e = node(&p, N_TRY, e, -1, -1)
+    return e
   return parse_postfix(&p, &st, true)
 
 # A term with its suffixes (.a, [i], [a:b], [], ?), then 'as' bindings when allowed.
 fn parse_postfix(var p: P, var st: St, allow_as: Bool) -> Int:
+  return parse_postfix_q(&p, &st, allow_as, true)
+
+fn parse_postfix_q(var p: P, var st: St, allow_as: Bool, generic_q: Bool) -> Int:
   var t = parse_term(&p, &st)
   while p.err == "":
     if p.tk == T_FIELD:
@@ -572,7 +657,7 @@ fn parse_postfix(var p: P, var st: St, allow_as: Bool) -> Int:
         unexpected(&p)
     elif p.tk == T_LBRACK:
       t = parse_bracket(&p, &st, t)
-    elif p.tk == T_QMARK:
+    elif p.tk == T_QMARK and generic_q:
       next(&p)
       t = node(&p, N_TRY, t, -1, -1)
     else:
@@ -696,6 +781,7 @@ fn parse_term(var p: P, var st: St) -> Int:
     return loc_node(&p, &st, line)
   if t == T_IDENT:
     let name = p.text
+    let start = p.ts
     next(&p)
     if p.tk != T_LPAREN:
       if name == "null": return lit_node(&p, vnull())
@@ -709,54 +795,11 @@ fn parse_term(var p: P, var st: St) -> Int:
         next(&p)
         args.push(parse_pipe(&p, &st))
       expect(&p, T_RPAREN)
-    return call_node(&p, name, args)
-  if t == T_REDUCE or t == T_FOREACH:
-    next(&p)
-    let src = parse_postfix(&p, &st, false)
-    expect(&p, T_AS)
-    let pat = parse_pattern(&p, &st)
-    expect(&p, T_LPAREN)
-    let init = parse_pipe(&p, &st)
-    expect(&p, T_SEMI)
-    let upd = parse_pipe(&p, &st)
-    var ext = -1
-    if t == T_FOREACH and p.tk == T_SEMI:
-      next(&p)
-      ext = parse_pipe(&p, &st)
-    expect(&p, T_RPAREN)
-    if t == T_REDUCE:
-      let n = node(&p, N_REDUCE, src, pat, init)
-      set_d(&p, n, upd)
-      return n
-    let n = node(&p, N_FOREACH, src, pat, init)
-    set_d(&p, n, upd)
-    set_x(&p, n, ext)
-    return n
-  if t == T_IF:
-    next(&p)
-    return parse_if(&p, &st)
-  if t == T_TRY:
-    next(&p)
-    let body = parse_postfix(&p, &st, false)
-    var handler = -1
-    if p.tk == T_CATCH:
-      next(&p)
-      handler = parse_postfix(&p, &st, false)
-    return node(&p, N_TRY, body, handler, -1)
-  if t == T_LABEL:
-    next(&p)
-    if p.tk != T_VAR:
-      unexpected(&p)
-      return 0
-    let _h5 = p.text
-    let nm = name_id(&p, _h5)
-    next(&p)
-    expect(&p, T_PIPE)
-    let body = parse_pipe(&p, &st)
-    let n = node(&p, N_LABEL, body, -1, -1)
-    set_x(&p, n, nm)
-    return n
+    let cn = call_node(&p, name, args)
+    p.ast.ns[cn].line = start
+    return cn
   if t == T_BREAK:
+    let bstart = p.ts
     next(&p)
     if p.tk != T_VAR:
       unexpected(&p)
@@ -767,16 +810,6 @@ fn parse_term(var p: P, var st: St) -> Int:
     set_x(&p, n, _h6)
     next(&p)
     return n
-  if t == T_DEF:
-    let f = parse_def(&p, &st)
-    let rest = parse_pipe(&p, &st)
-    let n = node(&p, N_DEF, rest, -1, -1)
-    set_x(&p, n, f)
-    return n
-  if t == T_MINUS:
-    next(&p)
-    let a = parse_postfix(&p, &st, false)
-    return node(&p, N_NEG, a, -1, -1)
   unexpected(&p)
   return 0
 
@@ -915,10 +948,12 @@ fn parse_object(var p: P, var st: St) -> Int:
         let _h10 = ident_node(&p)
         kv.push(node(&p, N_INDEX, _h10, key, 0))
     elif t == T_LPAREN:
+      let kstart = p.ts
       next(&p)
       let key = parse_pipe(&p, &st)
       expect(&p, T_RPAREN)
       check_key(&p, &st, key)
+      if p.err != "": p.errpos = kstart
       expect(&p, T_COLON)
       kv.push(key)
       kv.push(parse_expd(&p, &st))
@@ -959,7 +994,7 @@ fn parse_expd(var p: P, var st: St) -> Int:
     next(&p)
     let a = parse_expd(&p, &st)
     return node(&p, N_NEG, a, -1, -1)
-  t = parse_postfix(&p, &st, false)
+  t = parse_postfix_q(&p, &st, false, false)
   if p.tk == T_PIPE:
     next(&p)
     let rhs = parse_expd(&p, &st)
@@ -1140,7 +1175,7 @@ fn hex4(s: Str, i: Int) -> Int:
   return v
 
 fn new_parser(src: Str, fname: Str) -> P:
-  var p = P(src, 0, T_EOF, 0, 0, "", "", 0, 0, new_ast(), fname)
+  var p = P(src, 0, T_EOF, 0, 0, "", "", 0, 0, 0, new_ast(), fname)
   next(&p)
   return p
 
