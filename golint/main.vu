@@ -1,0 +1,144 @@
+# vgolint: a Go linter that prints what `golangci-lint run` prints with its default linters
+# (errcheck, govet, ineffassign, staticcheck, unused) for the checks it implements:
+#
+#   vgolint [--jobs N] [DIR[/...]]...      (default ./...)
+#
+# Packages are found as `go list` finds them for linux/amd64, and linted on all cores.
+
+import scan
+import ast
+import pkg
+import load
+import ineff
+import tc
+import errcheck
+
+type Spec:
+  dir: Str
+  files: [Str]
+  path: Str       # import path
+
+type Res:
+  idx: Int
+  lines: [Str]
+
+fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}) -> [Str]:
+  var p = pkg.new_pkg(sp.dir)
+  for f in sp.files:
+    let src = fs.read(f) else continue
+    pkg.add_file(&p, f, src, &kw)
+  var issues: [pkg.Issue] = []
+  var out: [Str] = []
+  for e in p.errs: out.push("PARSE ERROR " + e)
+  if p.errs.len > 0: return out
+  ineff.run(&p, &issues)
+  # type check
+  var path = sp.path + ""
+  var roots: [Int] = []
+  for r in p.roots: roots.push(r)
+  let pi = tc.add_target_ast(&g, fs, path, sp.dir, &p.t, roots)
+  errcheck.run(&g, fs, pi, p, &issues)
+  swap(&p.t, &g.pk[pi].t)
+  for l in pkg.report(p, issues): out.push(l)
+  return out
+
+fn worker(fs: Fs, own specs: Shared[[Spec]], own jobs: Chan[Int], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str):
+  var kw = scan.keywords()
+  var g = tc.new_prog(goroot, modcache)
+  tc.read_gomod(fs, &g, modroot)
+  while true:
+    let i = jobs.recv() else return
+    let lines = lint_one(fs, specs.value[i], &g, &kw)
+    res.send(Res(i, lines))
+
+fn cpu_count(fs: Fs) -> Int:
+  let info = fs.read("/proc/cpuinfo") else ""
+  var n = 0
+  for l in info.split("\n"):
+    if l.startswith("processor"): n += 1
+  if n < 1: return 1
+  return n
+
+# The package clause's name, read with the scanner.
+fn package_name(src: Str, var kw: {Str: Int}) -> Str:
+  var k2: {Str: Int} = {}
+  swap(&k2, &kw)
+  var sc = scan.scanner(src + "", k2)
+  scan.next(&sc)
+  var name = ""
+  if sc.tok == scan.K_PACKAGE:
+    scan.next(&sc)
+    if sc.tok == scan.T_IDENT: name = sc.src[sc.ts..sc.te]
+  swap(&sc.kw, &kw)
+  return name
+
+fn main(fs: Fs, os: Os) throws:
+  var roots: [Str] = []
+  var jobs = 0
+  let argv = args()
+  var i = 1
+  while i < argv.len:
+    let a = argv[i]
+    if a == "--jobs" and i + 1 < argv.len:
+      jobs = int(argv[i + 1]) else 1
+      i += 2
+      continue
+    var r = a + ""
+    if r.endswith("/..."): r = r[0..r.len - 4]
+    if r.len == 0: r = "."
+    while r.len > 1 and r.endswith("/"): r = r[0..r.len - 1]
+    if r.startswith("./") and r.len > 2: r = r[2..r.len]
+    roots.push(r)
+    i += 1
+  if roots.len == 0: roots.push(".")
+  var dirs: [load.Dir] = []
+  for r in roots: load.walk(fs, r, true, &dirs)
+  var kw = scan.keywords()
+  var probe = tc.new_prog("", "")
+  tc.read_gomod(fs, &probe, ".")
+  let modpath = probe.mod_path + ""
+  var goroot = os.env("GOROOT")
+  if goroot.len == 0: goroot = "/usr/local/go"
+  var modcache = os.env("GOMODCACHE")
+  if modcache.len == 0: modcache = os.env("HOME") + "/go/pkg/mod"
+  var specs: [Spec] = []
+  for d in dirs:
+    var main_files: [Str] = []
+    var x_files: [Str] = []
+    var pname = ""
+    for nm in d.files:
+      if not load.good_name(nm): continue
+      var path = d.path + "/" + nm
+      if d.path == ".": path = nm + ""
+      let src = fs.read(path) else continue
+      if not load.good_constraints(src): continue
+      let name = package_name(src, &kw)
+      if nm.endswith("_test.go") and name.endswith("_test") and name != pname:
+        x_files.push(path)
+      else:
+        if not nm.endswith("_test.go") or pname.len == 0: pname = name + ""
+        main_files.push(path)
+    var ip = modpath + ""
+    if d.path != ".": ip = modpath + "/" + d.path
+    if main_files.len > 0: specs.push(Spec(d.path + "", main_files, ip + ""))
+    if x_files.len > 0: specs.push(Spec(d.path + "", x_files, ip + "_test"))
+  if jobs == 0: jobs = cpu_count(fs)
+  if jobs > specs.len: jobs = specs.len
+  if jobs < 1: jobs = 1
+  let n = specs.len
+  var results: [[Str]] = []
+  for k in 0..n: results.push([])
+  let shared = share(specs)
+  let jc: Chan[Int] = chan(n + 1)
+  let rc: Chan[Res] = chan(n + 1)
+  for k in 0..n: jc.send(k)
+  jc.close()
+  for k in 0..jobs: spawn worker(fs, shared, jc, rc, ".", goroot + "", modcache + "")
+  for k in 0..n:
+    var r = rc.recv()?
+    swap(&results[r.idx], &r.lines)
+  var all: [Str] = []
+  for k in 0..n:
+    for l in results[k]: all.push(l)
+  for l in sorted(all): print(l)
+  if all.len > 0: exit(1)

@@ -1,0 +1,2012 @@
+# A Go type checker, enough for the linters: objects for every declaration, types for expressions,
+# selections (fields and methods through embedding), generic instantiation by unification. Imported
+# packages are loaded from source (GOROOT and the module cache), reading only their declarations.
+# What it can't work out gets type 0 (invalid), and checks that depend on it stay quiet.
+
+import scan
+import ast
+import parse
+import load
+from scan import T_INT, T_FLOAT, T_IMAG, T_CHAR, T_STRING, T_DEFINE, T_ASSIGN, T_AND, T_ARROW, T_NOT, T_SUB, T_ADD, T_XOR, T_TILDE, T_MUL, T_LAND, T_LOR
+from scan import T_EQL, T_NEQ, T_LSS, T_GTR, T_LEQ, T_GEQ, T_SHL, T_SHR
+from scan import K_VAR, K_CONST, K_TYPE, K_IMPORT
+
+# object kinds
+const O_PKGNAME = 1
+const O_CONST = 2
+const O_TYPE = 3
+const O_VAR = 4
+const O_FUNC = 5
+const O_BUILTIN = 6
+const O_NIL = 7
+const O_LABEL = 8
+
+# type kinds (type 0 is invalid; basic types have ids equal to their kind)
+const TY_BASIC = 1
+const TY_NAMED = 2
+const TY_PTR = 3
+const TY_SLICE = 4
+const TY_ARRAY = 5
+const TY_MAP = 6
+const TY_CHAN = 7
+const TY_FUNC = 8
+const TY_STRUCT = 9
+const TY_IFACE = 10
+const TY_TUPLE = 11
+const TY_TPARAM = 12
+const TY_UNION = 13
+
+const B_BOOL = 1
+const B_INT = 2
+const B_INT8 = 3
+const B_INT16 = 4
+const B_INT32 = 5
+const B_INT64 = 6
+const B_UINT = 7
+const B_UINT8 = 8
+const B_UINT16 = 9
+const B_UINT32 = 10
+const B_UINT64 = 11
+const B_UINTPTR = 12
+const B_FLOAT32 = 13
+const B_FLOAT64 = 14
+const B_COMPLEX64 = 15
+const B_COMPLEX128 = 16
+const B_STRING = 17
+const B_UNSAFEPTR = 18
+const B_UBOOL = 19
+const B_UINT_ = 20      # untyped int
+const B_URUNE = 21
+const B_UFLOAT = 22
+const B_UCOMPLEX = 23
+const B_USTRING = 24
+const B_UNIL = 25
+const NBASIC = 26
+
+# expression modes
+const M_VALUE = 0
+const M_TYPE = 1
+const M_PKG = 2
+const M_BUILTIN = 3
+const M_NOVALUE = 4
+
+# selection kinds (sk)
+const S_FIELD = 1
+const S_METHOD = 2
+const S_PKG = 3        # pkg.Name
+const S_MEXPR = 4      # T.Method
+
+type Pk:
+  path: Str
+  name: Str
+  dir: Str
+  t: ast.Ast
+  roots: [Int]
+  srcs: [Str]
+  imps: [[Int]]          # per file: N_IMPORT nodes
+  iname: [{Str: Int}]    # per file: resolved import names -> package index (-1: not an import)
+  scope: {Str: Int}
+  methods: {Int: [Int]}  # named type object -> its methods
+  mbyname: {Str: [Int]}  # receiver base type name -> methods, until the types are known
+  ety: [Int]             # node -> type (-1 not computed)
+  emd: [Int]             # node -> mode
+  use: [Int]             # identifier -> object (declarations included)
+  sobj: {Int: Int}       # selector node -> selected object
+  skind: {Int: Int}      # selector node -> S_*
+  spath: {Int: [Int]}    # selector node -> embedded fields walked through (field objects)
+  std: Bool
+  target: Bool
+  ok: Bool
+
+type Prog:
+  pk: [Pk]
+  bypath: {Str: Int}
+  # objects
+  ok: [Int]
+  oname: [Str]
+  opkg: [Int]
+  ofile: [Int]
+  onode: [Int]
+  odecl: [Int]
+  otype: [Int]
+  oaux: [Int]
+  orecv: [Int]      # methods: the receiver's base type name node; fields: 1 if embedded
+  oorig: [Int]      # a substituted copy -> the original
+  otp: {Int: [Int]} # generic types and functions (and methods: their receiver's) -> type parameter types
+  mowner: {Int: Int} # interface methods -> the named interface type declaring them
+  # types
+  tk: [Int]
+  ta: [Int]
+  tb: [Int]
+  tc: [Int]
+  tl: [Int]
+  tlen: [Int]
+  tkey: {Str: Int}
+  nunder: {Int: Int}
+  universe: {Str: Int}
+  error_t: Int
+  any_t: Int
+  empty_tuple: Int
+  goroot: Str
+  modcache: Str
+  mod_path: Str
+  mod_dir: Str
+  req_mods: [Str]
+  req_dirs: [Str]
+  kw: {Str: Int}
+  scopes: [{Str: Int}]
+  cur_target: Int
+  unsafe_pkg: Int
+
+fn new_prog(goroot: Str, modcache: Str) -> Prog:
+  var g = Prog([], {}, [], [], [], [], [], [], [], [], [], [], {}, {}, [], [], [], [], [], [], {}, {}, {}, 0, 0, 0, goroot + "", modcache + "", "", "", [], [], scan.keywords(), [], -1, -1)
+  # type 0: invalid; 1..25: basic
+  for i in 0..NBASIC:
+    g.tk.push(TY_BASIC)
+    g.ta.push(i)
+    g.tb.push(0)
+    g.tc.push(0)
+    g.tlen.push(0)
+  g.tk[0] = 0
+  let bnames = ["", "bool", "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "float32", "float64", "complex64", "complex128", "string"]
+  for i in 1..bnames.len: univ_type(&g, bnames[i], i)
+  univ_type(&g, "byte", B_UINT8)
+  univ_type(&g, "rune", B_INT32)
+  g.empty_tuple = mk(&g, TY_TUPLE, 0, 0, 0, [])
+  # error: a named interface with Error() string
+  let eo = new_obj(&g, O_TYPE, "error", -1, -1, -1, -1)
+  let et = mk(&g, TY_NAMED, eo, 0, 0, [])
+  g.otype[eo] = et
+  g.universe["error"] = eo
+  let mo = new_obj(&g, O_FUNC, "Error", -1, -1, -1, -1)
+  let st = mk(&g, TY_TUPLE, 0, 0, 0, [B_STRING])
+  g.otype[mo] = mk(&g, TY_FUNC, g.empty_tuple, st, 0, [])
+  let ei = mk(&g, TY_IFACE, 0, 0, 0, [mo])
+  g.nunder[et] = ei
+  g.error_t = et
+  g.any_t = mk(&g, TY_IFACE, 0, 0, 0, [])
+  univ_type(&g, "any", g.any_t)
+  let co = new_obj(&g, O_TYPE, "comparable", -1, -1, -1, -1)
+  let ct = mk(&g, TY_NAMED, co, 0, 0, [])
+  g.otype[co] = ct
+  g.nunder[ct] = mk(&g, TY_IFACE, 1, 0, 0, [])
+  g.universe["comparable"] = co
+  for nm in ["true", "false"]:
+    let o = new_obj(&g, O_CONST, nm, -1, -1, -1, -1)
+    g.otype[o] = B_UBOOL
+    g.universe[nm] = o
+  let io = new_obj(&g, O_CONST, "iota", -1, -1, -1, -1)
+  g.otype[io] = B_UINT_
+  g.universe["iota"] = io
+  let no = new_obj(&g, O_NIL, "nil", -1, -1, -1, -1)
+  g.otype[no] = B_UNIL
+  g.universe["nil"] = no
+  let builtins = ["append", "cap", "clear", "close", "complex", "copy", "delete", "imag", "len", "make", "max", "min", "new", "panic", "print", "println", "real", "recover"]
+  for i in 0..builtins.len:
+    let o = new_obj(&g, O_BUILTIN, builtins[i], -1, -1, -1, -1)
+    g.oaux[o] = i
+    g.otype[o] = 0
+    g.universe[builtins[i]] = o
+  return g
+
+fn univ_type(var g: Prog, name: Str, t: Int):
+  let o = new_obj(&g, O_TYPE, name, -1, -1, -1, -1)
+  g.otype[o] = t
+  g.universe[name] = o
+
+fn new_obj(var g: Prog, kind: Int, name: Str, pi: Int, fi: Int, node: Int, decl: Int) -> Int:
+  let id = g.ok.len
+  g.ok.push(kind)
+  g.oname.push(name + "")
+  g.opkg.push(pi)
+  g.ofile.push(fi)
+  g.onode.push(node)
+  g.odecl.push(decl)
+  g.otype.push(-1)
+  g.oaux.push(0)
+  g.orecv.push(-1)
+  g.oorig.push(id)
+  return id
+
+fn clone_obj(var g: Prog, o: Int, t: Int) -> Int:
+  let nm = g.oname[o] + ""
+  let id = new_obj(&g, g.ok[o], nm, g.opkg[o], g.ofile[o], g.onode[o], g.odecl[o])
+  g.otype[id] = t
+  g.oaux[id] = g.oaux[o]
+  g.orecv[id] = g.orecv[o]
+  g.oorig[id] = g.oorig[o]
+  return id
+
+# ---- types
+
+fn mk(var g: Prog, kind: Int, a: Int, b: Int, c: Int, list: [Int]) -> Int:
+  var key = "{kind}:{a}:{b}:{c}"
+  for x in list: key += ",{x}"
+  let found = g.tkey.get(key, -1)
+  if found >= 0: return found
+  let id = g.tk.len
+  g.tk.push(kind)
+  g.ta.push(a)
+  g.tb.push(b)
+  g.tc.push(g.tl.len)
+  g.tlen.push(list.len)
+  for x in list: g.tl.push(x)
+  g.tkey[key] = id
+  return id
+
+fn tlist(g: Prog, t: Int) -> [Int]:
+  var out: [Int] = []
+  let st = g.tc[t]
+  for i in 0..g.tlen[t]: out.push(g.tl[st + i])
+  return out
+
+fn ptr_to(var g: Prog, e: Int) -> Int:
+  if e == 0: return 0
+  return mk(&g, TY_PTR, e, 0, 0, [])
+
+fn slice_of(var g: Prog, e: Int) -> Int:
+  if e == 0: return 0
+  return mk(&g, TY_SLICE, e, 0, 0, [])
+
+fn tuple_of(var g: Prog, xs: [Int]) -> Int:
+  return mk(&g, TY_TUPLE, 0, 0, 0, xs)
+
+fn is_untyped(t: Int) -> Bool:
+  return t >= B_UBOOL and t <= B_UNIL
+
+fn default_type(t: Int) -> Int:
+  if t == B_UBOOL: return B_BOOL
+  if t == B_UINT_: return B_INT
+  if t == B_URUNE: return B_INT32
+  if t == B_UFLOAT: return B_FLOAT64
+  if t == B_UCOMPLEX: return B_COMPLEX128
+  if t == B_USTRING: return B_STRING
+  return t
+
+fn under(var g: Prog, fs: Fs, t: Int) -> Int:
+  var x = t
+  var guard = 0
+  while x > 0 and g.tk[x] == TY_NAMED and guard < 100:
+    guard += 1
+    if x in g.nunder:
+      x = g.nunder[x]
+      continue
+    let u = compute_under(&g, fs, x)
+    g.nunder[x] = u
+    x = u
+  return x
+
+fn compute_under(var g: Prog, fs: Fs, t: Int) -> Int:
+  let o = g.ta[t]
+  g.nunder[t] = 0
+  let gen = named_origin(&g, fs, o)
+  if gen <= 0: return 0
+  let u = under(&g, fs, gen)
+  let args = tlist(g, t)
+  if args.len == 0: return u
+  if not (o in g.otp): return u
+  var tps: [Int] = []
+  for x in g.otp[o]: tps.push(x)
+  return subst(&g, fs, u, tps, args)
+
+# The generic (uninstantiated) named type of a type object.
+fn named_origin(var g: Prog, fs: Fs, o: Int) -> Int:
+  let t = obj_type(&g, fs, o)
+  if t <= 0 or g.tk[t] != TY_NAMED: return t
+  # the declared underlying type
+  let pi = g.opkg[o]
+  if pi < 0: return 0
+  let sp = g.odecl[o]
+  let te = g.pk[pi].t.c[sp]
+  if g.oaux[o] == 1 and g.ok[o] == O_TYPE:
+    let lu = type_expr(&g, fs, pi, g.ofile[o], te)
+    if lu > 0 and g.tk[lu] == TY_NAMED: return under(&g, fs, lu)
+    return lu
+  let saved = save_scopes(&g)
+  push_tparams_scope(&g, o)
+  let u = type_expr(&g, fs, pi, g.ofile[o], te)
+  restore_scopes(&g, saved)
+  if u > 0 and g.tk[u] == TY_NAMED: return under(&g, fs, u)
+  if u > 0 and g.tk[u] == TY_IFACE:
+    for m in tlist(g, u):
+      if not (m in g.mowner): g.mowner[m] = o
+  return u
+
+fn deref(var g: Prog, fs: Fs, t: Int) -> Int:
+  if t > 0 and g.tk[t] == TY_PTR: return g.ta[t]
+  if t > 0 and g.tk[t] == TY_NAMED:
+    let u = under(&g, fs, t)
+    if u > 0 and g.tk[u] == TY_PTR: return g.ta[u]
+  return t
+
+# The core type of a type parameter (its constraint's single underlying type), else the underlying type.
+fn core(var g: Prog, fs: Fs, t: Int) -> Int:
+  let u = under(&g, fs, t)
+  if u > 0 and g.tk[u] == TY_TPARAM:
+    let c = g.tb[u]
+    if c <= 0: return 0
+    let cu = under(&g, fs, c)
+    if cu > 0 and g.tk[cu] == TY_IFACE:
+      let emb = g.tb[cu]
+      if emb > 0:
+        let es = tlist(g, emb)
+        if es.len == 1: return core(&g, fs, es[0])
+      return 0
+    return cu
+  if u > 0 and g.tk[u] == TY_UNION:
+    let xs = tlist(g, u)
+    if xs.len >= 1: return under(&g, fs, xs[0])
+  return u
+
+fn subst(var g: Prog, fs: Fs, t: Int, from: [Int], to: [Int]) -> Int:
+  if t <= 0 or from.len == 0: return t
+  let k = g.tk[t]
+  if k == TY_BASIC: return t
+  if k == TY_TPARAM:
+    for i in 0..from.len:
+      if from[i] == t and i < to.len: return to[i]
+    return t
+  if k == TY_PTR:
+    let e = subst(&g, fs, g.ta[t], from, to)
+    return ptr_to(&g, e)
+  if k == TY_SLICE:
+    let e = subst(&g, fs, g.ta[t], from, to)
+    return slice_of(&g, e)
+  if k == TY_ARRAY:
+    let e = subst(&g, fs, g.ta[t], from, to)
+    return mk(&g, TY_ARRAY, e, g.tb[t], 0, [])
+  if k == TY_MAP:
+    let a = subst(&g, fs, g.ta[t], from, to)
+    let b = subst(&g, fs, g.tb[t], from, to)
+    return mk(&g, TY_MAP, a, b, 0, [])
+  if k == TY_CHAN:
+    let e = subst(&g, fs, g.ta[t], from, to)
+    return mk(&g, TY_CHAN, e, g.tb[t], 0, [])
+  if k == TY_TUPLE:
+    var xs: [Int] = []
+    for x in tlist(g, t): xs.push(subst(&g, fs, x, from, to))
+    return tuple_of(&g, xs)
+  if k == TY_UNION:
+    var xs: [Int] = []
+    for x in tlist(g, t): xs.push(subst(&g, fs, x, from, to))
+    return mk(&g, TY_UNION, 0, 0, 0, xs)
+  if k == TY_FUNC:
+    let p = subst(&g, fs, g.ta[t], from, to)
+    let r = subst(&g, fs, g.tb[t], from, to)
+    return mk(&g, TY_FUNC, p, r, 0, tlist(g, t))
+  if k == TY_NAMED:
+    let args = tlist(g, t)
+    if args.len == 0: return t
+    var xs: [Int] = []
+    for x in args: xs.push(subst(&g, fs, x, from, to))
+    return mk(&g, TY_NAMED, g.ta[t], 0, 0, xs)
+  if k == TY_STRUCT:
+    var fields: [Int] = []
+    var changed = false
+    for f in tlist(g, t):
+      let ft = obj_type(&g, fs, f)
+      let nt = subst(&g, fs, ft, from, to)
+      if nt != ft:
+        changed = true
+        fields.push(clone_obj(&g, f, nt))
+      else: fields.push(f)
+    if not changed: return t
+    return mk(&g, TY_STRUCT, 0, 0, 0, fields)
+  if k == TY_IFACE:
+    var ms: [Int] = []
+    var changed = false
+    for m in tlist(g, t):
+      let mt = obj_type(&g, fs, m)
+      let nt = subst(&g, fs, mt, from, to)
+      if nt != mt:
+        changed = true
+        ms.push(clone_obj(&g, m, nt))
+      else: ms.push(m)
+    var emb = g.tb[t]
+    if emb > 0:
+      let ne = subst(&g, fs, emb, from, to)
+      if ne != emb:
+        changed = true
+        emb = ne
+    if not changed: return t
+    return mk(&g, TY_IFACE, g.ta[t], emb, 0, ms)
+  return t
+
+# ---- type strings (types.TypeString with full package paths, or relative to package rel)
+
+fn type_str(var g: Prog, fs: Fs, t: Int, rel: Str) -> Str:
+  if t <= 0: return "invalid type"
+  let k = g.tk[t]
+  if k == TY_BASIC:
+    let names = ["invalid type", "bool", "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "float32", "float64", "complex64", "complex128", "string", "unsafe.Pointer", "untyped bool", "untyped int", "untyped rune", "untyped float", "untyped complex", "untyped string", "untyped nil"]
+    return names[t] + ""
+  if k == TY_NAMED:
+    let o = g.ta[t]
+    var s = g.oname[o] + ""
+    let pi = g.opkg[o]
+    if pi >= 0 and g.pk[pi].path != rel: s = g.pk[pi].path + "." + s
+    let args = tlist(g, t)
+    if args.len > 0:
+      s += "["
+      for i in 0..args.len:
+        if i > 0: s += ", "
+        s += type_str(&g, fs, args[i], rel)
+      s += "]"
+    return s
+  if k == TY_PTR: return "*" + type_str(&g, fs, g.ta[t], rel)
+  if k == TY_SLICE: return "[]" + type_str(&g, fs, g.ta[t], rel)
+  if k == TY_ARRAY:
+    var n = "{g.tb[t]}"
+    if g.tb[t] < 0: n = "?"
+    return "[" + n + "]" + type_str(&g, fs, g.ta[t], rel)
+  if k == TY_MAP: return "map[" + type_str(&g, fs, g.ta[t], rel) + "]" + type_str(&g, fs, g.tb[t], rel)
+  if k == TY_CHAN:
+    let e = type_str(&g, fs, g.ta[t], rel)
+    if g.tb[t] == 1: return "chan<- " + e
+    if g.tb[t] == 2: return "<-chan " + e
+    return "chan " + e
+  if k == TY_TUPLE:
+    var s = "("
+    let xs = tlist(g, t)
+    for i in 0..xs.len:
+      if i > 0: s += ", "
+      s += type_str(&g, fs, xs[i], rel)
+    return s + ")"
+  if k == TY_FUNC: return "func" + sig_str(&g, fs, t, rel)
+  if k == TY_TPARAM: return g.oname[g.ta[t]] + ""
+  if k == TY_STRUCT:
+    var s = "struct{{"
+    let fs2 = tlist(g, t)
+    for i in 0..fs2.len:
+      if i > 0: s += "; "
+      let ft = obj_type(&g, fs, fs2[i])
+      if g.orecv[fs2[i]] == 1: s += type_str(&g, fs, ft, rel)
+      else: s += g.oname[fs2[i]] + " " + type_str(&g, fs, ft, rel)
+    return s + "}}"
+  if k == TY_IFACE:
+    let ms = tlist(g, t)
+    if ms.len == 0 and g.tb[t] <= 0:
+      if g.ta[t] == 1: return "comparable"
+      return "interface{{}}"
+    var s = "interface{{"
+    var first = true
+    if g.tb[t] > 0:
+      for e in tlist(g, g.tb[t]):
+        if not first: s += "; "
+        first = false
+        s += type_str(&g, fs, e, rel)
+    for m in ms:
+      if not first: s += "; "
+      first = false
+      let mt = obj_type(&g, fs, m)
+      s += g.oname[m] + sig_str(&g, fs, mt, rel)
+    return s + "}}"
+  if k == TY_UNION:
+    var s = ""
+    let xs = tlist(g, t)
+    for i in 0..xs.len:
+      if i > 0: s += " | "
+      s += type_str(&g, fs, xs[i], rel)
+    return s
+  return "?"
+
+fn sig_str(var g: Prog, fs: Fs, t: Int, rel: Str) -> Str:
+  if t <= 0 or g.tk[t] != TY_FUNC: return "()"
+  var s = "("
+  let ps = tlist(g, g.ta[t])
+  let variadic = tlist(g, t).len > 0
+  for i in 0..ps.len:
+    if i > 0: s += ", "
+    if variadic and i == ps.len - 1 and g.tk[ps[i]] == TY_SLICE: s += "..." + type_str(&g, fs, g.ta[ps[i]], rel)
+    else: s += type_str(&g, fs, ps[i], rel)
+  s += ")"
+  let rs = tlist(g, g.tb[t])
+  if rs.len == 1: s += " " + type_str(&g, fs, rs[0], rel)
+  elif rs.len > 1:
+    s += " ("
+    for i in 0..rs.len:
+      if i > 0: s += ", "
+      s += type_str(&g, fs, rs[i], rel)
+    s += ")"
+  return s
+
+fn is_variadic(g: Prog, ft: Int) -> Bool:
+  return ft > 0 and g.tk[ft] == TY_FUNC and g.tlen[ft] > 0
+
+fn mk_func(var g: Prog, params: [Int], results: [Int], variadic: Bool) -> Int:
+  let p = tuple_of(&g, params)
+  let r = tuple_of(&g, results)
+  var v: [Int] = []
+  if variadic: v.push(1)
+  return mk(&g, TY_FUNC, p, r, 0, v)
+
+# ---- module and package resolution
+
+fn escape_path(p: Str) -> Str:
+  var out = ""
+  for i in 0..p.len:
+    let c = p[i]
+    if c >= 'A' and c <= 'Z':
+      out += "!"
+      out += str([c + 32])
+    else: out += str([c])
+  return out
+
+# Reads go.mod of the module rooted at dir: its path, requirements and replacements.
+fn read_gomod(fs: Fs, var g: Prog, dir: Str):
+  g.mod_dir = dir + ""
+  let text = fs.read(dir + "/go.mod") else return
+  var in_req = false
+  var in_rep = false
+  var reps: {Str: Str} = {}
+  for raw in text.split("\n"):
+    var line = raw.strip()
+    let c = line.find("//")
+    if c >= 0: line = line[0..c].strip()
+    if line.len == 0: continue
+    if line.startswith("module "):
+      g.mod_path = line[7..line.len].strip().strip("\"")
+      continue
+    if line == ")":
+      in_req = false
+      in_rep = false
+      continue
+    if line == "require (":
+      in_req = true
+      continue
+    if line == "replace (":
+      in_rep = true
+      continue
+    var req = ""
+    if line.startswith("require "): req = line[8..line.len].strip()
+    elif in_req: req = line + ""
+    if req.len > 0:
+      let parts = req.split()
+      if parts.len >= 2:
+        g.req_mods.push(parts[0] + "")
+        g.req_dirs.push(g.modcache + "/" + escape_path(parts[0]) + "@" + parts[1])
+      continue
+    var rep = ""
+    if line.startswith("replace "): rep = line[8..line.len].strip()
+    elif in_rep: rep = line + ""
+    if rep.len > 0:
+      let i = rep.find("=>")
+      if i < 0: continue
+      let lhs = rep[0..i].strip().split()
+      let rhs = rep[i + 2..rep.len].strip().split()
+      if lhs.len == 0 or rhs.len == 0: continue
+      var target = ""
+      if rhs[0].startswith(".") or rhs[0].startswith("/"):
+        if rhs[0].startswith("/"): target = rhs[0] + ""
+        else: target = dir + "/" + rhs[0]
+      elif rhs.len >= 2: target = g.modcache + "/" + escape_path(rhs[0]) + "@" + rhs[1]
+      if target.len > 0: reps[lhs[0]] = target
+  for i in 0..g.req_mods.len:
+    let m = g.req_mods[i] + ""
+    if m in reps: g.req_dirs[i] = reps[m] + ""
+
+fn pkg_dir(g: Prog, path: Str, from_std: Bool) -> Str:
+  let slash = path.find("/")
+  var first = path + ""
+  if slash >= 0: first = path[0..slash]
+  if first.find(".") < 0:
+    if g.mod_path.len > 0 and (path == g.mod_path or path.startswith(g.mod_path + "/")):
+      return g.mod_dir + path[g.mod_path.len..path.len]
+    return g.goroot + "/src/" + path
+  if from_std: return g.goroot + "/src/vendor/" + path
+  if g.mod_path.len > 0 and (path == g.mod_path or path.startswith(g.mod_path + "/")):
+    return g.mod_dir + path[g.mod_path.len..path.len]
+  var best = -1
+  for i in 0..g.req_mods.len:
+    let m = g.req_mods[i]
+    if path == m or path.startswith(m + "/"):
+      if best < 0 or m.len > g.req_mods[best].len: best = i
+  if best < 0: return ""
+  return g.req_dirs[best] + path[g.req_mods[best].len..path.len]
+
+fn new_pk(path: Str, dir: Str) -> Pk:
+  return Pk(path + "", "", dir + "", ast.new_ast(), [], [], [], [], {}, {}, {}, [], [], [], {}, {}, {}, false, false, false)
+
+# Loads the declarations of the package at an import path (once). -1 if it can't be found.
+fn load_pkg(var g: Prog, fs: Fs, path: Str, from_std: Bool) -> Int:
+  var key = path + ""
+  if from_std and path.find(".") >= 0: key = "vendor/" + path
+  let found = g.bypath.get(key, -2)
+  if found != -2: return found
+  if path == "C":
+    g.bypath[key] = -1
+    return -1
+  if path == "unsafe": return load_unsafe(&g, key)
+  let dir = pkg_dir(g, path, from_std)
+  if dir.len == 0:
+    g.bypath[key] = -1
+    return -1
+  let names = fs.list(dir) else []
+  var files: [Str] = []
+  for nm in names:
+    if not nm.endswith(".go") or nm.endswith("_test.go") or nm.startswith(".") or nm.startswith("_"): continue
+    if not load.good_name(nm): continue
+    files.push(nm + "")
+  let pi = g.pk.len
+  g.bypath[key] = pi
+  var p = new_pk(path, dir)
+  p.std = dir.startswith(g.goroot + "/")
+  g.pk.push(p)
+  var kw: {Str: Int} = {}
+  swap(&kw, &g.kw)
+  for nm in files:
+    let src = fs.read(dir + "/" + nm) else continue
+    if not load.good_constraints(src): continue
+    add_src(&g, pi, src, true, &kw)
+  swap(&kw, &g.kw)
+  collect(&g, pi)
+  return pi
+
+fn load_unsafe(var g: Prog, key: Str) -> Int:
+  let pi = g.pk.len
+  g.bypath[key] = pi
+  var p = new_pk("unsafe", "")
+  p.name = "unsafe"
+  p.std = true
+  p.ok = true
+  g.pk.push(p)
+  let po = new_obj(&g, O_TYPE, "Pointer", pi, -1, -1, -1)
+  g.otype[po] = B_UNSAFEPTR
+  g.pk[pi].scope["Pointer"] = po
+  let fns = ["Sizeof", "Alignof", "Offsetof", "Add", "Slice", "String", "StringData", "SliceData"]
+  for i in 0..fns.len:
+    let o = new_obj(&g, O_BUILTIN, fns[i], pi, -1, -1, -1)
+    g.oaux[o] = 100 + i
+    g.otype[o] = 0
+    g.pk[pi].scope[fns[i]] = o
+  g.unsafe_pkg = pi
+  return pi
+
+# Parses one file into package pi.
+fn add_src(var g: Prog, pi: Int, own src: Str, skip: Bool, var kw: {Str: Int}) -> Bool:
+  let fi = g.pk[pi].roots.len
+  var k2: {Str: Int} = {}
+  swap(&k2, &kw)
+  var t = ast.new_ast()
+  swap(&t, &g.pk[pi].t)
+  var ps = parse.parser(scan.scanner(src, k2), t, fi)
+  ps.skip = skip
+  let root = parse.parse_file(&ps)
+  swap(&ps.t, &g.pk[pi].t)
+  swap(&ps.sc.kw, &kw)
+  var s2 = ""
+  swap(&s2, &ps.sc.src)
+  g.pk[pi].roots.push(root)
+  g.pk[pi].srcs.push(s2)
+  g.pk[pi].imps.push(ast.items(g.pk[pi].t, g.pk[pi].t.b[root]))
+  g.pk[pi].iname.push({})
+  if g.pk[pi].name.len == 0:
+    let nmid = g.pk[pi].t.s[g.pk[pi].t.a[root]]
+    g.pk[pi].name = g.pk[pi].t.names[nmid] + ""
+  return ps.err.len == 0
+
+# Package-level objects of package pi: its scope and methods.
+fn collect(var g: Prog, pi: Int):
+  let nf = g.pk[pi].roots.len
+  for fi in 0..nf:
+    let root = g.pk[pi].roots[fi]
+    let decls = ast.items(g.pk[pi].t, g.pk[pi].t.c[root])
+    for d in decls:
+      let k = g.pk[pi].t.k[d]
+      if k == ast.N_GENDECL:
+        let tok = g.pk[pi].t.f[d]
+        if tok == K_IMPORT: continue
+        let specs = ast.items(g.pk[pi].t, g.pk[pi].t.a[d])
+        for sp in specs:
+          if tok == K_TYPE:
+            let id = g.pk[pi].t.a[sp]
+            let o = decl_obj(&g, pi, fi, O_TYPE, id, sp)
+            add_scope(&g, pi, id, o)
+          else:
+            var kind = O_VAR
+            if tok == K_CONST: kind = O_CONST
+            let ids = ast.items(g.pk[pi].t, g.pk[pi].t.a[sp])
+            for j in 0..ids.len:
+              let o = decl_obj(&g, pi, fi, kind, ids[j], sp)
+              g.oaux[o] = j
+              add_scope(&g, pi, ids[j], o)
+      elif k == ast.N_FUNCDECL:
+        let id = g.pk[pi].t.b[d]
+        let o = decl_obj(&g, pi, fi, O_FUNC, id, d)
+        let recv = g.pk[pi].t.a[d]
+        if recv < 0:
+          let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]]
+          if nm != "init": add_scope(&g, pi, id, o)
+        else:
+          # the receiver's base type name
+          if ast.count(g.pk[pi].t, recv) > 0:
+            var rt = g.pk[pi].t.b[ast.item(g.pk[pi].t, recv, 0)]
+            if rt > 0 and g.pk[pi].t.k[rt] == ast.N_PAREN: rt = g.pk[pi].t.a[rt]
+            if rt > 0 and g.pk[pi].t.k[rt] == ast.N_STAR: rt = g.pk[pi].t.a[rt]
+            if rt > 0 and g.pk[pi].t.k[rt] == ast.N_PAREN: rt = g.pk[pi].t.a[rt]
+            if rt > 0 and g.pk[pi].t.k[rt] == ast.N_INDEX: rt = g.pk[pi].t.a[rt]
+            if rt > 0 and g.pk[pi].t.k[rt] == ast.N_IDENT:
+              g.orecv[o] = rt
+              let bn = g.pk[pi].t.names[g.pk[pi].t.s[rt]] + ""
+              if bn in g.pk[pi].mbyname: g.pk[pi].mbyname[bn].push(o)
+              else: g.pk[pi].mbyname[bn] = [o]
+  # attach methods to their types
+  var bns: [Str] = []
+  for bn in g.pk[pi].mbyname: bns.push(bn + "")
+  for bn in bns:
+    let to = g.pk[pi].scope.get(bn, -1)
+    if to < 0: continue
+    var ms: [Int] = []
+    for m in g.pk[pi].mbyname[bn]: ms.push(m)
+    g.pk[pi].methods[to] = ms
+  g.pk[pi].ok = true
+
+fn decl_obj(var g: Prog, pi: Int, fi: Int, kind: Int, id: Int, decl: Int) -> Int:
+  let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
+  let o = new_obj(&g, kind, nm, pi, fi, id, decl)
+  if g.pk[pi].target: g.pk[pi].use[id] = o
+  return o
+
+fn add_scope(var g: Prog, pi: Int, id: Int, o: Int):
+  let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
+  if nm == "_": return
+  if not (nm in g.pk[pi].scope): g.pk[pi].scope[nm] = o
+
+# ---- name lookup
+
+fn save_scopes(var g: Prog) -> [{Str: Int}]:
+  var s: [{Str: Int}] = []
+  swap(&s, &g.scopes)
+  return s
+
+fn restore_scopes(var g: Prog, own s: [{Str: Int}]):
+  var x = s
+  swap(&x, &g.scopes)
+
+fn push_tparams_scope(var g: Prog, o: Int):
+  var sc: {Str: Int} = {}
+  if o in g.otp:
+    for t in g.otp[o]:
+      let to = g.ta[t]
+      sc[g.oname[to] + ""] = to
+  g.scopes.push(sc)
+
+# The package an import name in file fi of package pi stands for (-1: none).
+fn file_import(var g: Prog, fs: Fs, pi: Int, fi: Int, name: Str) -> Int:
+  if fi < 0 or fi >= g.pk[pi].iname.len: return -1
+  let cached = g.pk[pi].iname[fi].get(name, -2)
+  if cached != -2: return cached
+  let std = g.pk[pi].std
+  var result = -1
+  var imps: [Int] = []
+  for x in g.pk[pi].imps[fi]: imps.push(x)
+  # explicit names first, then paths whose last element matches, then the rest
+  for pass in 0..3:
+    if result >= 0: break
+    for im in imps:
+      let pnode = g.pk[pi].t.b[im]
+      if pnode <= 0: continue
+      let lit = g.pk[pi].t.names[g.pk[pi].t.s[pnode]]
+      let path = lit[1..lit.len - 1]
+      let nn = g.pk[pi].t.a[im]
+      if nn > 0:
+        if pass == 0 and g.pk[pi].t.names[g.pk[pi].t.s[nn]] == name:
+          result = load_pkg(&g, fs, path, std)
+          break
+        continue
+      var last = path + ""
+      let sl = path.find("/")
+      if sl >= 0:
+        var j = path.len - 1
+        while j >= 0 and path[j] != '/': j -= 1
+        last = path[j + 1..path.len]
+      if pass == 1 and last != name: continue
+      if pass == 2 and last == name: continue
+      if pass == 0: continue
+      let q = load_pkg(&g, fs, path, std)
+      if q >= 0 and g.pk[q].name == name:
+        result = q
+        break
+  g.pk[pi].iname[fi][name] = result
+  return result
+
+# Objects for dot-imported packages of file fi.
+fn dot_lookup(var g: Prog, fs: Fs, pi: Int, fi: Int, name: Str) -> Int:
+  if fi < 0 or fi >= g.pk[pi].imps.len: return -1
+  let std = g.pk[pi].std
+  var imps: [Int] = []
+  for x in g.pk[pi].imps[fi]: imps.push(x)
+  for im in imps:
+    let nn = g.pk[pi].t.a[im]
+    if nn <= 0 or g.pk[pi].t.names[g.pk[pi].t.s[nn]] != ".": continue
+    let pnode = g.pk[pi].t.b[im]
+    let lit = g.pk[pi].t.names[g.pk[pi].t.s[pnode]]
+    let q = load_pkg(&g, fs, lit[1..lit.len - 1], std)
+    if q < 0: continue
+    let o = g.pk[q].scope.get(name, -1)
+    if o >= 0: return o
+  return -1
+
+fn pkgname_obj(var g: Prog, q: Int) -> Int:
+  let nm = g.pk[q].name + ""
+  let o = new_obj(&g, O_PKGNAME, nm, -1, -1, -1, -1)
+  g.oaux[o] = q
+  return o
+
+# Looks a name up: local scopes, the package, the file's imports, the universe. -1: not found.
+fn lookup(var g: Prog, fs: Fs, pi: Int, fi: Int, name: Str) -> Int:
+  var i = g.scopes.len - 1
+  while i >= 0:
+    let o = g.scopes[i].get(name, -1)
+    if o >= 0: return o
+    i -= 1
+  let o = g.pk[pi].scope.get(name, -1)
+  if o >= 0: return o
+  let q = file_import(&g, fs, pi, fi, name)
+  if q >= 0:
+    let key = "pkg:{q}"
+    let po = g.universe.get(key, -1)
+    if po >= 0: return po
+    let npo = pkgname_obj(&g, q)
+    g.universe[key] = npo
+    return npo
+  let d = dot_lookup(&g, fs, pi, fi, name)
+  if d >= 0: return d
+  return g.universe.get(name, -1)
+
+# ---- object types
+
+fn obj_type(var g: Prog, fs: Fs, o: Int) -> Int:
+  if o < 0: return 0
+  let t = g.otype[o]
+  if t >= 0: return t
+  g.otype[o] = 0
+  let saved = save_scopes(&g)
+  let r = compute_obj_type(&g, fs, o)
+  restore_scopes(&g, saved)
+  g.otype[o] = r
+  return r
+
+fn compute_obj_type(var g: Prog, fs: Fs, o: Int) -> Int:
+  let pi = g.opkg[o]
+  if pi < 0: return 0
+  let fi = g.ofile[o]
+  let d = g.odecl[o]
+  if d < 0: return 0
+  let k = g.ok[o]
+  let dk = g.pk[pi].t.k[d]
+  if k == O_TYPE and dk == ast.N_TYPESPEC:
+    if g.pk[pi].t.f[d] == 1:
+      # an alias
+      g.otype[o] = 0
+      return type_expr(&g, fs, pi, fi, g.pk[pi].t.c[d])
+    let nt = mk(&g, TY_NAMED, o, 0, 0, [])
+    g.otype[o] = nt
+    let tpl = g.pk[pi].t.b[d]
+    if tpl >= 0: declare_tparams(&g, fs, pi, fi, o, tpl)
+    return nt
+  if k == O_FUNC and dk == ast.N_FUNCDECL:
+    let ft = g.pk[pi].t.c[d]
+    g.scopes.push({})
+    let recv = g.pk[pi].t.a[d]
+    if recv >= 0 and ast.count(g.pk[pi].t, recv) > 0:
+      # receiver type parameters stand for the type's
+      var rt = g.pk[pi].t.b[ast.item(g.pk[pi].t, recv, 0)]
+      if g.pk[pi].t.k[rt] == ast.N_STAR: rt = g.pk[pi].t.a[rt]
+      if g.pk[pi].t.k[rt] == ast.N_INDEX:
+        var tps: [Int] = []
+        for x in ast.items(g.pk[pi].t, g.pk[pi].t.b[rt]):
+          if g.pk[pi].t.k[x] == ast.N_IDENT:
+            let nm = g.pk[pi].t.names[g.pk[pi].t.s[x]] + ""
+            let po = new_obj(&g, O_TYPE, nm, pi, fi, x, -1)
+            let tt = mk(&g, TY_TPARAM, po, 0, 0, [])
+            g.otype[po] = tt
+            tps.push(tt)
+            let top = g.scopes.len - 1
+            g.scopes[top][nm] = po
+        g.otp[o] = tps
+    if g.pk[pi].t.a[ft] >= 0: declare_tparams(&g, fs, pi, fi, o, g.pk[pi].t.a[ft])
+    return func_type(&g, fs, pi, fi, ft)
+  if k == O_FUNC and dk == ast.N_FIELD:
+    # an interface method
+    return type_expr(&g, fs, pi, fi, g.pk[pi].t.b[d])
+  if (k == O_VAR or k == O_CONST) and dk == ast.N_VALUESPEC:
+    return spec_type(&g, fs, pi, fi, o, d)
+  if k == O_VAR and dk == ast.N_FIELD:
+    let te = g.pk[pi].t.b[d]
+    return type_expr(&g, fs, pi, fi, te)
+  return 0
+
+# Type parameters of a generic type or function: declared into the top scope and recorded.
+fn declare_tparams(var g: Prog, fs: Fs, pi: Int, fi: Int, owner: Int, tpl: Int):
+  if g.scopes.len == 0: g.scopes.push({})
+  var tps: [Int] = []
+  if owner >= 0 and owner in g.otp:
+    for x in g.otp[owner]: tps.push(x)
+  var mine: [Int] = []
+  var cexprs: [Int] = []
+  for f in ast.items(g.pk[pi].t, tpl):
+    for id in ast.items(g.pk[pi].t, g.pk[pi].t.a[f]):
+      let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
+      let po = new_obj(&g, O_TYPE, nm, pi, fi, id, f)
+      let tt = mk(&g, TY_TPARAM, po, 0, 0, [])
+      g.otype[po] = tt
+      tps.push(tt)
+      mine.push(tt)
+      cexprs.push(g.pk[pi].t.b[f])
+      let top = g.scopes.len - 1
+      g.scopes[top][nm] = po
+      if g.pk[pi].target: g.pk[pi].use[id] = po
+  if owner >= 0: g.otp[owner] = tps
+  # constraints (they may mention the parameters)
+  for i in 0..mine.len:
+    let c = elem_type(&g, fs, pi, fi, cexprs[i])
+    g.tb[mine[i]] = c
+
+fn spec_type(var g: Prog, fs: Fs, pi: Int, fi: Int, o: Int, sp: Int) -> Int:
+  let te = g.pk[pi].t.b[sp]
+  if te > 0: return type_expr(&g, fs, pi, fi, te)
+  var vals = g.pk[pi].t.c[sp]
+  let idx = g.oaux[o]
+  var spec = sp
+  if vals < 0 and g.ok[o] == O_CONST:
+    # an implicit repetition of the previous spec in the group
+    let prev = prev_const_spec(g, pi, sp)
+    if prev < 0: return 0
+    let pte = g.pk[pi].t.b[prev]
+    if pte > 0: return type_expr(&g, fs, pi, fi, pte)
+    vals = g.pk[pi].t.c[prev]
+    spec = prev
+  if vals < 0: return 0
+  let n = ast.count(g.pk[pi].t, vals)
+  if n == 1 and ast.count(g.pk[pi].t, g.pk[pi].t.a[sp]) > 1:
+    let t = expr(&g, fs, pi, fi, ast.item(g.pk[pi].t, vals, 0), 0)
+    if t > 0 and g.tk[t] == TY_TUPLE:
+      let xs = tlist(g, t)
+      if idx < xs.len: return xs[idx]
+      return 0
+    let e = ast.item(g.pk[pi].t, vals, 0)
+    let ek = g.pk[pi].t.k[e]
+    if idx == 1 and (ek == ast.N_INDEX or ek == ast.N_TYPEASSERT or ek == ast.N_UNARY): return B_BOOL
+    if idx == 0: return default_type(t)
+    return 0
+  if idx >= n: return 0
+  let t = expr(&g, fs, pi, fi, ast.item(g.pk[pi].t, vals, idx), 0)
+  if g.ok[o] == O_CONST: return t
+  return default_type(t)
+
+# The const spec in the same group before sp that has values (for implicit repetition).
+fn prev_const_spec(g: Prog, pi: Int, sp: Int) -> Int:
+  # specs are consecutive nodes in the group's list; find the group
+  var best = -1
+  var x = sp - 1
+  while x > 0:
+    let k = g.pk[pi].t.k[x]
+    if k == ast.N_GENDECL:
+      for s in ast.items(g.pk[pi].t, g.pk[pi].t.a[x]):
+        if s == sp: return best
+        if g.pk[pi].t.c[s] >= 0: best = s
+      return -1
+    x -= 1
+  # the group node comes before its specs; search forward if not found behind
+  return best
+
+# ---- type expressions
+
+fn func_type(var g: Prog, fs: Fs, pi: Int, fi: Int, ft: Int) -> Int:
+  var params: [Int] = []
+  var variadic = false
+  for f in ast.items(g.pk[pi].t, g.pk[pi].t.b[ft]):
+    var te = g.pk[pi].t.b[f]
+    var pt = 0
+    if g.pk[pi].t.k[te] == ast.N_ELLIPSIS:
+      variadic = true
+      let et = type_expr(&g, fs, pi, fi, g.pk[pi].t.a[te])
+      pt = slice_of(&g, et)
+    else: pt = type_expr(&g, fs, pi, fi, te)
+    var n = ast.count(g.pk[pi].t, g.pk[pi].t.a[f])
+    if n == 0: n = 1
+    for i in 0..n: params.push(pt)
+  var results: [Int] = []
+  let rl = g.pk[pi].t.c[ft]
+  if rl >= 0:
+    for f in ast.items(g.pk[pi].t, rl):
+      let rt = type_expr(&g, fs, pi, fi, g.pk[pi].t.b[f])
+      var n = ast.count(g.pk[pi].t, g.pk[pi].t.a[f])
+      if n == 0: n = 1
+      for i in 0..n: results.push(rt)
+  return mk_func(&g, params, results, variadic)
+
+fn type_expr(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int) -> Int:
+  if n <= 0: return 0
+  let t = expr(&g, fs, pi, fi, n, 0)
+  if g.pk[pi].emd[n] != M_TYPE: return 0
+  return t
+
+fn struct_type(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int) -> Int:
+  var fields: [Int] = []
+  for f in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
+    let names = g.pk[pi].t.a[f]
+    if names < 0:
+      # embedded: named after its type
+      var te = g.pk[pi].t.b[f]
+      if g.pk[pi].t.k[te] == ast.N_STAR: te = g.pk[pi].t.a[te]
+      if g.pk[pi].t.k[te] == ast.N_INDEX: te = g.pk[pi].t.a[te]
+      var id = te
+      if g.pk[pi].t.k[te] == ast.N_SELECTOR: id = g.pk[pi].t.b[te]
+      let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
+      let o = new_obj(&g, O_VAR, nm, pi, fi, id, f)
+      g.orecv[o] = 1
+      fields.push(o)
+    else:
+      for id in ast.items(g.pk[pi].t, names):
+        let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
+        let o = new_obj(&g, O_VAR, nm, pi, fi, id, f)
+        if g.pk[pi].target: g.pk[pi].use[id] = o
+        fields.push(o)
+  return mk(&g, TY_STRUCT, 0, 0, 0, fields)
+
+fn iface_type(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int) -> Int:
+  var ms: [Int] = []
+  var embs: [Int] = []
+  for f in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
+    let names = g.pk[pi].t.a[f]
+    if names >= 0:
+      for id in ast.items(g.pk[pi].t, names):
+        let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
+        let o = new_obj(&g, O_FUNC, nm, pi, fi, id, f)
+        if g.pk[pi].target: g.pk[pi].use[id] = o
+        ms.push(o)
+    else:
+      let te = g.pk[pi].t.b[f]
+      embs.push(elem_type(&g, fs, pi, fi, te))
+  var emb = 0
+  if embs.len > 0: emb = tuple_of(&g, embs)
+  return mk(&g, TY_IFACE, 0, emb, 0, ms)
+
+# An interface element: a type or a union of ~terms.
+fn elem_type(var g: Prog, fs: Fs, pi: Int, fi: Int, te: Int) -> Int:
+  let k = g.pk[pi].t.k[te]
+  if k == ast.N_BINARY and g.pk[pi].t.f[te] == scan.T_OR:
+    var xs: [Int] = []
+    var stack = [te]
+    var terms: [Int] = []
+    while stack.len > 0:
+      let x = stack.pop()
+      if g.pk[pi].t.k[x] == ast.N_BINARY and g.pk[pi].t.f[x] == scan.T_OR:
+        stack.push(g.pk[pi].t.b[x])
+        stack.push(g.pk[pi].t.a[x])
+      else: terms.push(x)
+    for x in terms: xs.push(elem_type(&g, fs, pi, fi, x))
+    return mk(&g, TY_UNION, 0, 0, 0, xs)
+  if k == ast.N_UNARY and g.pk[pi].t.f[te] == T_TILDE:
+    return type_expr(&g, fs, pi, fi, g.pk[pi].t.a[te])
+  return type_expr(&g, fs, pi, fi, te)
+
+# ---- method sets and selection
+
+# Finds field or method name on type t. Returns [obj, type, kind, embedded field objs...] or [].
+fn lookup_fm(var g: Prog, fs: Fs, t0: Int, name: Str) -> [Int]:
+  var t = t0
+  if t > 0 and g.tk[t] == TY_PTR: t = g.ta[t]
+  var cur: [Int] = [t]
+  var paths: [[Int]] = [[]]
+  var seen: {Int: Bool} = {}
+  var depth = 0
+  while cur.len > 0 and depth < 8:
+    var next: [Int] = []
+    var npaths: [[Int]] = []
+    var found: [Int] = []
+    var nfound = 0
+    for ci in 0..cur.len:
+      let x = cur[ci]
+      if x <= 0: continue
+      if g.tk[x] == TY_NAMED:
+        if x in seen: continue
+        seen[x] = true
+        let m = find_method(&g, fs, x, name)
+        if m.len > 0:
+          nfound += 1
+          if nfound == 1:
+            found = [m[0], m[1], S_METHOD]
+            for p in paths[ci]: found.push(p)
+          continue
+      var u = under(&g, fs, x)
+      if u > 0 and g.tk[u] == TY_TPARAM:
+        let c = g.tb[u]
+        if c > 0: u = under(&g, fs, c)
+      if u <= 0: continue
+      if g.tk[u] == TY_STRUCT:
+        for f in tlist(g, u):
+          if g.oname[f] == name:
+            nfound += 1
+            if nfound == 1:
+              found = [f, obj_type(&g, fs, f), S_FIELD]
+              for p in paths[ci]: found.push(p)
+          if g.orecv[f] == 1:
+            var ft = obj_type(&g, fs, f)
+            if ft > 0 and g.tk[ft] == TY_PTR: ft = g.ta[ft]
+            next.push(ft)
+            var np: [Int] = []
+            for p in paths[ci]: np.push(p)
+            np.push(f)
+            npaths.push(np)
+      elif g.tk[u] == TY_IFACE:
+        let m = iface_method(&g, fs, u, name)
+        if m >= 0:
+          nfound += 1
+          if nfound == 1:
+            found = [m, obj_type(&g, fs, m), S_METHOD]
+            for p in paths[ci]: found.push(p)
+    if nfound == 1: return found
+    if nfound > 1: return []
+    cur = next
+    swap(&paths, &npaths)
+    depth += 1
+  return []
+
+# A declared method of named type t (with the type's arguments substituted): [obj, type] or [].
+fn find_method(var g: Prog, fs: Fs, t: Int, name: Str) -> [Int]:
+  let o = g.ta[t]
+  let pi = g.opkg[o]
+  if pi < 0: return []
+  if not (o in g.pk[pi].methods): return []
+  var hit = -1
+  for m in g.pk[pi].methods[o]:
+    if g.oname[m] == name: hit = m
+  if hit < 0: return []
+  var mt = obj_type(&g, fs, hit)
+  let args = tlist(g, t)
+  if args.len > 0 and hit in g.otp:
+    var from: [Int] = []
+    for x in g.otp[hit]: from.push(x)
+    mt = subst(&g, fs, mt, from, args)
+  return [hit, mt]
+
+# A method of an interface (its own or an embedded interface's). -1: none.
+fn iface_method(var g: Prog, fs: Fs, u: Int, name: Str) -> Int:
+  for m in tlist(g, u):
+    if g.oname[m] == name: return m
+  let emb = g.tb[u]
+  if emb <= 0: return -1
+  for e in tlist(g, emb):
+    let eu = under(&g, fs, e)
+    if eu > 0 and g.tk[eu] == TY_IFACE:
+      let m = iface_method(&g, fs, eu, name)
+      if m >= 0: return m
+  return -1
+
+# Whether t has method name in its method set (for a non-pointer named type, only value receivers).
+fn has_method(var g: Prog, fs: Fs, t: Int, name: Str) -> Bool:
+  if t <= 0: return false
+  let u = under(&g, fs, t)
+  if u > 0 and g.tk[u] == TY_IFACE: return iface_method(&g, fs, u, name) >= 0
+  let r = lookup_fm(&g, fs, t, name)
+  if r.len == 0 or r[2] != S_METHOD: return false
+  if g.tk[t] == TY_PTR: return true
+  # a value: the method needs a value receiver (or come through an embedded pointer)
+  let m = r[0]
+  let pi = g.opkg[m]
+  if pi < 0: return true
+  let d = g.odecl[m]
+  if d < 0 or g.pk[pi].t.k[d] != ast.N_FUNCDECL: return true
+  let recv = g.pk[pi].t.a[d]
+  let rt = g.pk[pi].t.b[ast.item(g.pk[pi].t, recv, 0)]
+  if g.pk[pi].t.k[rt] != ast.N_STAR: return true
+  # pointer receiver: reachable only through an embedded pointer
+  for i in 3..r.len:
+    let ft = obj_type(&g, fs, r[i])
+    if ft > 0 and g.tk[ft] == TY_PTR: return true
+  return false
+
+fn implements_error(var g: Prog, fs: Fs, t: Int) -> Bool:
+  if not has_method(&g, fs, t, "Error"): return false
+  # the signature must be Error() string
+  var mt = 0
+  let u = under(&g, fs, t)
+  if u > 0 and g.tk[u] == TY_IFACE:
+    let m = iface_method(&g, fs, u, "Error")
+    mt = obj_type(&g, fs, m)
+  else:
+    let r = lookup_fm(&g, fs, t, "Error")
+    if r.len == 0: return false
+    mt = r[1]
+  if mt <= 0 or g.tk[mt] != TY_FUNC: return false
+  if g.tlen[g.ta[mt]] != 0: return false
+  let rs = tlist(g, g.tb[mt])
+  return rs.len == 1 and rs[0] == B_STRING
+
+# ---- expressions
+
+fn ensure(var g: Prog, pi: Int):
+  let n = g.pk[pi].t.k.len
+  while g.pk[pi].ety.len < n:
+    g.pk[pi].ety.push(-1)
+    g.pk[pi].emd.push(0)
+    g.pk[pi].use.push(-1)
+
+fn set(var g: Prog, pi: Int, n: Int, t: Int, mode: Int) -> Int:
+  g.pk[pi].ety[n] = t
+  g.pk[pi].emd[n] = mode
+  return t
+
+# The type of expression n (hint: the type expected, for elided composite literal types).
+fn expr(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int, hint: Int) -> Int:
+  if n <= 0: return 0
+  ensure(&g, pi)
+  let cached = g.pk[pi].ety[n]
+  if cached >= 0: return cached
+  g.pk[pi].ety[n] = 0
+  let t = expr1(&g, fs, pi, fi, n, hint)
+  g.pk[pi].ety[n] = t
+  return t
+
+fn expr1(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int, hint: Int) -> Int:
+  let k = g.pk[pi].t.k[n]
+  if k == ast.N_IDENT:
+    let nm = g.pk[pi].t.names[g.pk[pi].t.s[n]] + ""
+    if nm == "_": return 0
+    let o = lookup(&g, fs, pi, fi, nm)
+    if o < 0: return 0
+    if g.pk[pi].use[n] < 0: g.pk[pi].use[n] = o
+    let ok = g.ok[o]
+    if ok == O_TYPE:
+      g.pk[pi].emd[n] = M_TYPE
+      return obj_type(&g, fs, o)
+    if ok == O_PKGNAME:
+      g.pk[pi].emd[n] = M_PKG
+      return 0
+    if ok == O_BUILTIN:
+      g.pk[pi].emd[n] = M_BUILTIN
+      return 0
+    return obj_type(&g, fs, o)
+  if k == ast.N_BASICLIT:
+    let f = g.pk[pi].t.f[n]
+    if f == T_INT: return B_UINT_
+    if f == T_FLOAT: return B_UFLOAT
+    if f == T_IMAG: return B_UCOMPLEX
+    if f == T_CHAR: return B_URUNE
+    return B_USTRING
+  if k == ast.N_PAREN:
+    let t = expr(&g, fs, pi, fi, g.pk[pi].t.a[n], hint)
+    g.pk[pi].emd[n] = g.pk[pi].emd[g.pk[pi].t.a[n]]
+    return t
+  if k == ast.N_FUNCLIT:
+    let ftn = g.pk[pi].t.a[n]
+    let ft = func_type(&g, fs, pi, fi, ftn)
+    if g.pk[pi].target: func_body(&g, fs, pi, fi, -1, -1, ftn, g.pk[pi].t.b[n])
+    return ft
+  if k == ast.N_COMPOSITE:
+    var t = hint
+    let te = g.pk[pi].t.a[n]
+    if te > 0:
+      if g.pk[pi].t.k[te] == ast.N_ARRAYTYPE and g.pk[pi].t.a[te] > 0 and g.pk[pi].t.k[g.pk[pi].t.a[te]] == ast.N_ELLIPSIS:
+        let el = type_expr(&g, fs, pi, fi, g.pk[pi].t.b[te])
+        t = mk(&g, TY_ARRAY, el, ast.count(g.pk[pi].t, g.pk[pi].t.b[n]), 0, [])
+        set(&g, pi, te, t, M_TYPE)
+      else: t = type_expr(&g, fs, pi, fi, te)
+    elif t > 0:
+      # &T{} elided inside a composite literal of pointers
+      let tu = under(&g, fs, t)
+      if tu > 0 and g.tk[tu] == TY_PTR: t = g.ta[tu]
+    composite_elems(&g, fs, pi, fi, n, t)
+    if te <= 0 and hint > 0:
+      let hu = under(&g, fs, hint)
+      if hu > 0 and g.tk[hu] == TY_PTR: return hint
+    return t
+  if k == ast.N_SELECTOR: return selector(&g, fs, pi, fi, n)
+  if k == ast.N_INDEX:
+    let x = g.pk[pi].t.a[n]
+    let xt = expr(&g, fs, pi, fi, x, 0)
+    let xm = g.pk[pi].emd[x]
+    let idx = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if xm == M_TYPE:
+      # an instantiated generic type
+      var args: [Int] = []
+      for a in idx: args.push(type_expr(&g, fs, pi, fi, a))
+      g.pk[pi].emd[n] = M_TYPE
+      if xt > 0 and g.tk[xt] == TY_NAMED: return mk(&g, TY_NAMED, g.ta[xt], 0, 0, args)
+      return 0
+    if xt > 0 and g.tk[xt] == TY_FUNC and generic_func(g, pi, x) >= 0:
+      # an explicit instantiation of a generic function
+      let fo = generic_func(g, pi, x)
+      var args: [Int] = []
+      for a in idx: args.push(type_expr(&g, fs, pi, fi, a))
+      if fo in g.otp:
+        var from: [Int] = []
+        for y in g.otp[fo]: from.push(y)
+        return subst(&g, fs, xt, from, args)
+      return xt
+    for a in idx: expr(&g, fs, pi, fi, a, 0)
+    let u = core(&g, fs, xt)
+    if u <= 0: return 0
+    let uk = g.tk[u]
+    if uk == TY_SLICE or uk == TY_ARRAY: return g.ta[u]
+    if uk == TY_MAP: return g.tb[u]
+    if uk == TY_PTR:
+      let e = under(&g, fs, g.ta[u])
+      if e > 0 and g.tk[e] == TY_ARRAY: return g.ta[e]
+      return 0
+    if uk == TY_BASIC and (u == B_STRING or u == B_USTRING): return B_UINT8
+    return 0
+  if k == ast.N_SLICE:
+    let xt = expr(&g, fs, pi, fi, g.pk[pi].t.a[n], 0)
+    expr(&g, fs, pi, fi, g.pk[pi].t.b[n], 0)
+    expr(&g, fs, pi, fi, g.pk[pi].t.c[n], 0)
+    expr(&g, fs, pi, fi, g.pk[pi].t.d[n], 0)
+    let u = core(&g, fs, xt)
+    if u <= 0: return 0
+    if g.tk[u] == TY_ARRAY: return slice_of(&g, g.ta[u])
+    if g.tk[u] == TY_PTR:
+      let e = under(&g, fs, g.ta[u])
+      if e > 0 and g.tk[e] == TY_ARRAY: return slice_of(&g, g.ta[e])
+      return 0
+    if u == B_USTRING: return B_STRING
+    return xt
+  if k == ast.N_TYPEASSERT:
+    expr(&g, fs, pi, fi, g.pk[pi].t.a[n], 0)
+    let te = g.pk[pi].t.b[n]
+    if te <= 0: return 0
+    return type_expr(&g, fs, pi, fi, te)
+  if k == ast.N_CALL: return call(&g, fs, pi, fi, n, hint)
+  if k == ast.N_STAR:
+    let x = g.pk[pi].t.a[n]
+    let xt = expr(&g, fs, pi, fi, x, 0)
+    if g.pk[pi].emd[x] == M_TYPE:
+      g.pk[pi].emd[n] = M_TYPE
+      return ptr_to(&g, xt)
+    let u = core(&g, fs, xt)
+    if u > 0 and g.tk[u] == TY_PTR: return g.ta[u]
+    return 0
+  if k == ast.N_UNARY:
+    let op = g.pk[pi].t.f[n]
+    let x = g.pk[pi].t.a[n]
+    if op == T_AND:
+      var h = 0
+      if hint > 0:
+        let hu = under(&g, fs, hint)
+        if hu > 0 and g.tk[hu] == TY_PTR: h = g.ta[hu]
+      let xt = expr(&g, fs, pi, fi, x, h)
+      return ptr_to(&g, xt)
+    let xt = expr(&g, fs, pi, fi, x, 0)
+    if op == T_ARROW:
+      let u = core(&g, fs, xt)
+      if u > 0 and g.tk[u] == TY_CHAN: return g.ta[u]
+      return 0
+    if op == T_NOT:
+      if is_untyped(xt): return B_UBOOL
+      return xt
+    if op == T_TILDE: return xt
+    return xt
+  if k == ast.N_BINARY:
+    let op = g.pk[pi].t.f[n]
+    let a = expr(&g, fs, pi, fi, g.pk[pi].t.a[n], 0)
+    let b = expr(&g, fs, pi, fi, g.pk[pi].t.b[n], 0)
+    if op == T_EQL or op == T_NEQ or op == T_LSS or op == T_GTR or op == T_LEQ or op == T_GEQ: return B_UBOOL
+    if op == T_LAND or op == T_LOR:
+      if is_untyped(a) and is_untyped(b): return B_UBOOL
+      if not is_untyped(a): return a
+      return b
+    if op == T_SHL or op == T_SHR: return a
+    if is_untyped(a) and not is_untyped(b): return b
+    if is_untyped(a) and is_untyped(b):
+      if a > b: return a
+      return b
+    return a
+  if k == ast.N_KEYVALUE: return 0
+  # type literals
+  if k == ast.N_ARRAYTYPE:
+    g.pk[pi].emd[n] = M_TYPE
+    let el = type_expr(&g, fs, pi, fi, g.pk[pi].t.b[n])
+    let ln = g.pk[pi].t.a[n]
+    if ln < 0: return slice_of(&g, el)
+    var len = -1
+    if g.pk[pi].t.k[ln] == ast.N_BASICLIT: len = int(g.pk[pi].t.names[g.pk[pi].t.s[ln]]) else -1
+    elif g.pk[pi].t.k[ln] != ast.N_ELLIPSIS: expr(&g, fs, pi, fi, ln, 0)
+    if el == 0: return 0
+    return mk(&g, TY_ARRAY, el, len, 0, [])
+  if k == ast.N_MAPTYPE:
+    g.pk[pi].emd[n] = M_TYPE
+    let a = type_expr(&g, fs, pi, fi, g.pk[pi].t.a[n])
+    let b = type_expr(&g, fs, pi, fi, g.pk[pi].t.b[n])
+    if a == 0 or b == 0: return 0
+    return mk(&g, TY_MAP, a, b, 0, [])
+  if k == ast.N_CHANTYPE:
+    g.pk[pi].emd[n] = M_TYPE
+    let e = type_expr(&g, fs, pi, fi, g.pk[pi].t.a[n])
+    if e == 0: return 0
+    return mk(&g, TY_CHAN, e, g.pk[pi].t.f[n], 0, [])
+  if k == ast.N_FUNCTYPE:
+    g.pk[pi].emd[n] = M_TYPE
+    g.scopes.push({})
+    if g.pk[pi].t.a[n] >= 0: declare_tparams(&g, fs, pi, fi, -1, g.pk[pi].t.a[n])
+    let ft = func_type(&g, fs, pi, fi, n)
+    g.scopes.pop()
+    return ft
+  if k == ast.N_STRUCTTYPE:
+    g.pk[pi].emd[n] = M_TYPE
+    return struct_type(&g, fs, pi, fi, n)
+  if k == ast.N_IFACETYPE:
+    g.pk[pi].emd[n] = M_TYPE
+    return iface_type(&g, fs, pi, fi, n)
+  if k == ast.N_ELLIPSIS:
+    g.pk[pi].emd[n] = M_TYPE
+    let et = type_expr(&g, fs, pi, fi, g.pk[pi].t.a[n])
+    return slice_of(&g, et)
+  return 0
+
+# The generic function object an expression names (an identifier or pkg.F), or -1.
+fn generic_func(g: Prog, pi: Int, x: Int) -> Int:
+  var o = -1
+  if g.pk[pi].t.k[x] == ast.N_IDENT and x < g.pk[pi].use.len: o = g.pk[pi].use[x]
+  elif g.pk[pi].t.k[x] == ast.N_SELECTOR: o = g.pk[pi].sobj.get(x, -1)
+  if o >= 0 and o in g.otp and g.ok[o] == O_FUNC: return o
+  return -1
+
+fn composite_elems(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int, t: Int):
+  let u = under(&g, fs, t)
+  var et = 0
+  var kt = 0
+  var is_struct = false
+  if u > 0:
+    let uk = g.tk[u]
+    if uk == TY_SLICE or uk == TY_ARRAY: et = g.ta[u]
+    elif uk == TY_MAP:
+      kt = g.ta[u]
+      et = g.tb[u]
+    elif uk == TY_STRUCT: is_struct = true
+  for e in ast.items(g.pk[pi].t, g.pk[pi].t.b[n]):
+    if g.pk[pi].t.k[e] == ast.N_KEYVALUE:
+      let key = g.pk[pi].t.a[e]
+      if is_struct and g.pk[pi].t.k[key] == ast.N_IDENT:
+        let nm = g.pk[pi].t.names[g.pk[pi].t.s[key]] + ""
+        var ft = 0
+        for f in tlist(g, u):
+          if g.oname[f] == nm:
+            g.pk[pi].use[key] = f
+            ft = obj_type(&g, fs, f)
+        set(&g, pi, key, ft, M_VALUE)
+        expr(&g, fs, pi, fi, g.pk[pi].t.b[e], ft)
+      else:
+        expr(&g, fs, pi, fi, key, kt)
+        expr(&g, fs, pi, fi, g.pk[pi].t.b[e], et)
+    elif is_struct:
+      expr(&g, fs, pi, fi, e, 0)
+    else: expr(&g, fs, pi, fi, e, et)
+  if is_struct:
+    # positional fields get their types as hints
+    let fields = tlist(g, u)
+    var i = 0
+    for e in ast.items(g.pk[pi].t, g.pk[pi].t.b[n]):
+      if g.pk[pi].t.k[e] != ast.N_KEYVALUE and i < fields.len and g.pk[pi].ety[e] <= 0 and g.pk[pi].t.k[e] == ast.N_COMPOSITE:
+        g.pk[pi].ety[e] = -1
+        let ft = obj_type(&g, fs, fields[i])
+        expr(&g, fs, pi, fi, e, ft)
+      i += 1
+
+fn selector(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int) -> Int:
+  let x = g.pk[pi].t.a[n]
+  let sel = g.pk[pi].t.b[n]
+  let name = g.pk[pi].t.names[g.pk[pi].t.s[sel]] + ""
+  let xt = expr(&g, fs, pi, fi, x, 0)
+  let xm = g.pk[pi].emd[x]
+  if xm == M_PKG:
+    let po = g.pk[pi].use[x]
+    let q = g.oaux[po]
+    if q < 0: return 0
+    let o = g.pk[q].scope.get(name, -1)
+    if o < 0: return 0
+    g.pk[pi].use[sel] = o
+    g.pk[pi].sobj[n] = o
+    g.pk[pi].skind[n] = S_PKG
+    let ok = g.ok[o]
+    if ok == O_TYPE:
+      g.pk[pi].emd[n] = M_TYPE
+      return obj_type(&g, fs, o)
+    if ok == O_BUILTIN:
+      g.pk[pi].emd[n] = M_BUILTIN
+      return 0
+    return obj_type(&g, fs, o)
+  if xt <= 0: return 0
+  let r = lookup_fm(&g, fs, xt, name)
+  if r.len == 0: return 0
+  g.pk[pi].use[sel] = r[0]
+  g.pk[pi].sobj[n] = r[0]
+  var path: [Int] = []
+  for i in 3..r.len: path.push(r[i])
+  g.pk[pi].spath[n] = path
+  if xm == M_TYPE:
+    # a method expression: the receiver becomes the first parameter
+    g.pk[pi].skind[n] = S_MEXPR
+    let mt = r[1]
+    if mt <= 0 or g.tk[mt] != TY_FUNC: return 0
+    var ps = [xt]
+    for p in tlist(g, g.ta[mt]): ps.push(p)
+    return mk_func(&g, ps, tlist(g, g.tb[mt]), is_variadic(g, mt))
+  g.pk[pi].skind[n] = r[2]
+  return r[1]
+
+# The results of a call as one type: the result, a tuple of several, or the empty tuple.
+fn call(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int, hint: Int) -> Int:
+  let fun = g.pk[pi].t.a[n]
+  let ft = expr(&g, fs, pi, fi, fun, 0)
+  let fm = g.pk[pi].emd[fun]
+  let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+  if fm == M_TYPE:
+    # a conversion
+    for a in args: expr(&g, fs, pi, fi, a, ft)
+    return ft
+  if fm == M_BUILTIN: return builtin_call(&g, fs, pi, fi, n, fun, args, hint)
+  let u = core(&g, fs, ft)
+  if u <= 0 or g.tk[u] != TY_FUNC:
+    for a in args: expr(&g, fs, pi, fi, a, 0)
+    return 0
+  let params = tlist(g, g.ta[u])
+  let variadic = is_variadic(g, u)
+  var ats: [Int] = []
+  for i in 0..args.len:
+    var h = 0
+    if i < params.len: h = params[i]
+    if variadic and i >= params.len - 1 and params.len > 0 and g.pk[pi].t.f[n] == 0:
+      let last = params[params.len - 1]
+      if g.tk[last] == TY_SLICE: h = g.ta[last]
+    ats.push(expr(&g, fs, pi, fi, args[i], h))
+  var res = g.tb[u]
+  let fo = generic_func(g, pi, fun)
+  if fo >= 0:
+    # infer the type arguments from the arguments
+    var tps: [Int] = []
+    for y in g.otp[fo]: tps.push(y)
+    var bound = [0] * tps.len
+    for i in 0..ats.len:
+      var pt = 0
+      if i < params.len: pt = params[i]
+      if variadic and i >= params.len - 1 and params.len > 0 and g.pk[pi].t.f[n] == 0:
+        let last = params[params.len - 1]
+        if g.tk[last] == TY_SLICE: pt = g.ta[last]
+      unify(&g, fs, pt, ats[i], tps, &bound)
+    var to: [Int] = []
+    for i in 0..tps.len:
+      if bound[i] > 0: to.push(bound[i])
+      else: to.push(tps[i])
+    res = subst(&g, fs, res, tps, to)
+  let rs = tlist(g, res)
+  if rs.len == 1: return rs[0]
+  if rs.len == 0:
+    g.pk[pi].emd[n] = M_NOVALUE
+  return res
+
+fn unify(var g: Prog, fs: Fs, p: Int, a0: Int, tps: [Int], var bound: [Int]):
+  if p <= 0 or a0 <= 0: return
+  let a = default_type(a0)
+  let k = g.tk[p]
+  if k == TY_TPARAM:
+    for i in 0..tps.len:
+      if tps[i] == p and bound[i] == 0: bound[i] = a
+    return
+  var ak = g.tk[a]
+  var au = a
+  if ak != k and ak == TY_NAMED and k != TY_NAMED:
+    au = under(&g, fs, a)
+    if au <= 0: return
+    ak = g.tk[au]
+  if ak != k: return
+  if k == TY_PTR or k == TY_SLICE or k == TY_ARRAY or k == TY_CHAN:
+    unify(&g, fs, g.ta[p], g.ta[au], tps, &bound)
+  elif k == TY_MAP:
+    unify(&g, fs, g.ta[p], g.ta[au], tps, &bound)
+    unify(&g, fs, g.tb[p], g.tb[au], tps, &bound)
+  elif k == TY_FUNC:
+    let pp = tlist(g, g.ta[p])
+    let ap = tlist(g, g.ta[au])
+    for i in 0..pp.len:
+      if i < ap.len: unify(&g, fs, pp[i], ap[i], tps, &bound)
+    let pr = tlist(g, g.tb[p])
+    let ar = tlist(g, g.tb[au])
+    for i in 0..pr.len:
+      if i < ar.len: unify(&g, fs, pr[i], ar[i], tps, &bound)
+  elif k == TY_NAMED and g.ta[p] == g.ta[au]:
+    let pa = tlist(g, p)
+    let aa = tlist(g, au)
+    for i in 0..pa.len:
+      if i < aa.len: unify(&g, fs, pa[i], aa[i], tps, &bound)
+
+fn builtin_call(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int, fun: Int, args: [Int], hint: Int) -> Int:
+  var o = g.pk[pi].use[fun]
+  if g.pk[pi].t.k[fun] == ast.N_SELECTOR: o = g.pk[pi].sobj.get(fun, -1)
+  if g.pk[pi].t.k[fun] == ast.N_PAREN: return 0
+  if o < 0: return 0
+  let b = g.oaux[o]
+  # make and new take a type first
+  if b == 9 or b == 12:
+    if args.len == 0: return 0
+    let t = type_expr(&g, fs, pi, fi, args[0])
+    for i in 1..args.len: expr(&g, fs, pi, fi, args[i], 0)
+    if b == 12: return ptr_to(&g, t)
+    return t
+  var ats: [Int] = []
+  for a in args: ats.push(expr(&g, fs, pi, fi, a, 0))
+  # append cap clear close complex copy delete imag len make max min new panic print println real recover
+  if b == 0:
+    if ats.len > 0 and ats[0] > 0: return ats[0]
+    return hint
+  if b == 1 or b == 5 or b == 8: return B_INT
+  if b == 4: return B_COMPLEX128
+  if b == 7 or b == 16:
+    if ats.len > 0 and ats[0] == B_COMPLEX64: return B_FLOAT32
+    return B_FLOAT64
+  if b == 10 or b == 11:
+    for t in ats:
+      if t > 0 and not is_untyped(t): return t
+    if ats.len > 0: return ats[0]
+    return 0
+  if b == 17: return g.any_t
+  if b >= 100:
+    let ub = b - 100
+    if ub <= 2: return B_UINTPTR
+    if ub == 3: return B_UNSAFEPTR
+    if ub == 4:
+      if ats.len > 0:
+        let u = under(&g, fs, ats[0])
+        if u > 0 and g.tk[u] == TY_PTR: return slice_of(&g, g.ta[u])
+      return 0
+    if ub == 5: return B_STRING
+    if ub == 6: return ptr_to(&g, B_UINT8)
+    if ub == 7:
+      if ats.len > 0:
+        let u = under(&g, fs, ats[0])
+        if u > 0 and g.tk[u] == TY_SLICE: return ptr_to(&g, g.ta[u])
+      return 0
+  g.pk[pi].emd[n] = M_NOVALUE
+  return g.empty_tuple
+
+# ---- function bodies (the target package)
+
+fn declare_var(var g: Prog, pi: Int, fi: Int, id: Int, t: Int, decl: Int) -> Int:
+  let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
+  let o = new_obj(&g, O_VAR, nm, pi, fi, id, decl)
+  g.otype[o] = t
+  g.pk[pi].use[id] = o
+  if nm != "_":
+    let top = g.scopes.len - 1
+    g.scopes[top][nm] = o
+  return o
+
+fn declare_fields(var g: Prog, fs: Fs, pi: Int, fi: Int, l: Int):
+  if l < 0: return
+  for f in ast.items(g.pk[pi].t, l):
+    let te = g.pk[pi].t.b[f]
+    var t = 0
+    if g.pk[pi].t.k[te] == ast.N_ELLIPSIS:
+      let et = type_expr(&g, fs, pi, fi, g.pk[pi].t.a[te])
+      t = slice_of(&g, et)
+    else: t = type_expr(&g, fs, pi, fi, te)
+    for id in ast.items(g.pk[pi].t, g.pk[pi].t.a[f]): declare_var(&g, pi, fi, id, t, f)
+
+fn func_body(var g: Prog, fs: Fs, pi: Int, fi: Int, o: Int, recv: Int, ft: Int, body: Int):
+  var sc: {Str: Int} = {}
+  if o >= 0 and o in g.otp:
+    for t in g.otp[o]:
+      let to = g.ta[t]
+      sc[g.oname[to] + ""] = to
+  g.scopes.push(sc)
+  if o < 0 and g.pk[pi].t.a[ft] >= 0: declare_tparams(&g, fs, pi, fi, -1, g.pk[pi].t.a[ft])
+  declare_fields(&g, fs, pi, fi, recv)
+  declare_fields(&g, fs, pi, fi, g.pk[pi].t.b[ft])
+  declare_fields(&g, fs, pi, fi, g.pk[pi].t.c[ft])
+  if body > 0: stmts(&g, fs, pi, fi, g.pk[pi].t.a[body])
+  g.scopes.pop()
+
+fn stmts(var g: Prog, fs: Fs, pi: Int, fi: Int, l: Int):
+  if l < 0: return
+  for s in ast.items(g.pk[pi].t, l): stmt(&g, fs, pi, fi, s)
+
+fn in_top(g: Prog, name: Str) -> Int:
+  let top = g.scopes.len - 1
+  return g.scopes[top].get(name, -1)
+
+# The types of the values on the right of an assignment of n values (a tuple, comma-ok, or each).
+fn rhs_types(var g: Prog, fs: Fs, pi: Int, fi: Int, rhs: Int, n: Int, hints: [Int]) -> [Int]:
+  let vals = ast.items(g.pk[pi].t, rhs)
+  var out: [Int] = []
+  if vals.len == 1 and n > 1:
+    let v = vals[0]
+    let t = expr(&g, fs, pi, fi, v, 0)
+    if t > 0 and g.tk[t] == TY_TUPLE:
+      for x in tlist(g, t): out.push(x)
+      return out
+    out.push(t)
+    let vk = g.pk[pi].t.k[resolve_unparen(g, pi, v)]
+    out.push(B_UBOOL)
+    return out
+  for i in 0..vals.len:
+    var h = 0
+    if i < hints.len: h = hints[i]
+    out.push(expr(&g, fs, pi, fi, vals[i], h))
+  return out
+
+fn resolve_unparen(g: Prog, pi: Int, x: Int) -> Int:
+  var y = x
+  while y > 0 and g.pk[pi].t.k[y] == ast.N_PAREN: y = g.pk[pi].t.a[y]
+  return y
+
+fn local_spec(var g: Prog, fs: Fs, pi: Int, fi: Int, tok: Int, sp: Int, prev: Int):
+  var te = g.pk[pi].t.b[sp]
+  var vals = g.pk[pi].t.c[sp]
+  if tok == K_CONST and vals < 0 and te <= 0 and prev > 0:
+    te = g.pk[pi].t.b[prev]
+    vals = g.pk[pi].t.c[prev]
+  let ids = ast.items(g.pk[pi].t, g.pk[pi].t.a[sp])
+  var t = 0
+  if te > 0: t = type_expr(&g, fs, pi, fi, te)
+  var ts: [Int] = []
+  if vals >= 0:
+    var hints: [Int] = []
+    for i in 0..ids.len: hints.push(t)
+    ts = rhs_types(&g, fs, pi, fi, vals, ids.len, hints)
+  for i in 0..ids.len:
+    var vt = t
+    if vt == 0 and i < ts.len:
+      vt = ts[i]
+      if tok == K_VAR: vt = default_type(vt)
+    let o = declare_var(&g, pi, fi, ids[i], vt, sp)
+    if tok == K_CONST: g.ok[o] = O_CONST
+    g.oaux[o] = i
+
+fn stmt(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int):
+  if n <= 0: return
+  let k = g.pk[pi].t.k[n]
+  if k == ast.N_BLOCK:
+    g.scopes.push({})
+    stmts(&g, fs, pi, fi, g.pk[pi].t.a[n])
+    g.scopes.pop()
+  elif k == ast.N_EXPRSTMT: expr(&g, fs, pi, fi, g.pk[pi].t.a[n], 0)
+  elif k == ast.N_DECLSTMT:
+    let d = g.pk[pi].t.a[n]
+    let tok = g.pk[pi].t.f[d]
+    var prev = -1
+    for sp in ast.items(g.pk[pi].t, g.pk[pi].t.a[d]):
+      if tok == K_TYPE:
+        let id = g.pk[pi].t.a[sp]
+        let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
+        let o = new_obj(&g, O_TYPE, nm, pi, fi, id, sp)
+        g.pk[pi].use[id] = o
+        g.oaux[o] = 1
+        if nm != "_":
+          let top = g.scopes.len - 1
+          g.scopes[top][nm] = o
+        obj_type(&g, fs, o)
+        local_type_methods(&g, fs, o)
+      else:
+        local_spec(&g, fs, pi, fi, tok, sp, prev)
+        if g.pk[pi].t.c[sp] >= 0: prev = sp
+  elif k == ast.N_ASSIGN:
+    let tok = g.pk[pi].t.f[n]
+    let lhs = ast.items(g.pk[pi].t, g.pk[pi].t.a[n])
+    if tok == T_DEFINE:
+      let ts = rhs_types(&g, fs, pi, fi, g.pk[pi].t.b[n], lhs.len, [])
+      for i in 0..lhs.len:
+        let id = lhs[i]
+        if g.pk[pi].t.k[id] != ast.N_IDENT: continue
+        let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
+        var t = 0
+        if i < ts.len: t = default_type(ts[i])
+        if nm == "_":
+          set(&g, pi, id, t, M_VALUE)
+          continue
+        let old = in_top(g, nm)
+        if old >= 0:
+          g.pk[pi].use[id] = old
+          let ot = obj_type(&g, fs, old)
+          set(&g, pi, id, ot, M_VALUE)
+        else:
+          declare_var(&g, pi, fi, id, t, n)
+          set(&g, pi, id, t, M_VALUE)
+    else:
+      var hints: [Int] = []
+      for x in lhs: hints.push(expr(&g, fs, pi, fi, x, 0))
+      rhs_types(&g, fs, pi, fi, g.pk[pi].t.b[n], lhs.len, hints)
+  elif k == ast.N_INCDEC: expr(&g, fs, pi, fi, g.pk[pi].t.a[n], 0)
+  elif k == ast.N_SEND:
+    let ct = expr(&g, fs, pi, fi, g.pk[pi].t.a[n], 0)
+    var h = 0
+    let u = core(&g, fs, ct)
+    if u > 0 and g.tk[u] == TY_CHAN: h = g.ta[u]
+    expr(&g, fs, pi, fi, g.pk[pi].t.b[n], h)
+  elif k == ast.N_GO or k == ast.N_DEFER: expr(&g, fs, pi, fi, g.pk[pi].t.a[n], 0)
+  elif k == ast.N_RETURN:
+    let l = g.pk[pi].t.a[n]
+    if l >= 0:
+      for x in ast.items(g.pk[pi].t, l): expr(&g, fs, pi, fi, x, 0)
+  elif k == ast.N_LABELED: stmt(&g, fs, pi, fi, g.pk[pi].t.b[n])
+  elif k == ast.N_IF:
+    g.scopes.push({})
+    stmt(&g, fs, pi, fi, g.pk[pi].t.a[n])
+    expr(&g, fs, pi, fi, g.pk[pi].t.b[n], 0)
+    stmt(&g, fs, pi, fi, g.pk[pi].t.c[n])
+    stmt(&g, fs, pi, fi, g.pk[pi].t.d[n])
+    g.scopes.pop()
+  elif k == ast.N_SWITCH:
+    g.scopes.push({})
+    stmt(&g, fs, pi, fi, g.pk[pi].t.a[n])
+    let tt = expr(&g, fs, pi, fi, g.pk[pi].t.b[n], 0)
+    for c in ast.items(g.pk[pi].t, g.pk[pi].t.c[n]):
+      let l = g.pk[pi].t.a[c]
+      if l >= 0:
+        for x in ast.items(g.pk[pi].t, l): expr(&g, fs, pi, fi, x, tt)
+      g.scopes.push({})
+      stmts(&g, fs, pi, fi, g.pk[pi].t.b[c])
+      g.scopes.pop()
+    g.scopes.pop()
+  elif k == ast.N_TYPESWITCH:
+    g.scopes.push({})
+    stmt(&g, fs, pi, fi, g.pk[pi].t.a[n])
+    let guard = g.pk[pi].t.b[n]
+    var sym = -1
+    var ta = -1
+    if g.pk[pi].t.k[guard] == ast.N_ASSIGN:
+      sym = ast.item(g.pk[pi].t, g.pk[pi].t.a[guard], 0)
+      ta = resolve_unparen(g, pi, ast.item(g.pk[pi].t, g.pk[pi].t.b[guard], 0))
+    else: ta = resolve_unparen(g, pi, g.pk[pi].t.a[guard])
+    var yt = 0
+    if ta > 0 and g.pk[pi].t.k[ta] == ast.N_TYPEASSERT: yt = expr(&g, fs, pi, fi, g.pk[pi].t.a[ta], 0)
+    for c in ast.items(g.pk[pi].t, g.pk[pi].t.c[n]):
+      let l = g.pk[pi].t.a[c]
+      var single = 0
+      var count = 0
+      if l >= 0:
+        for x in ast.items(g.pk[pi].t, l):
+          let t = expr(&g, fs, pi, fi, x, 0)
+          count += 1
+          if g.pk[pi].emd[x] == M_TYPE: single = t
+          else: single = 0
+      g.scopes.push({})
+      if sym > 0:
+        var st = yt
+        if count == 1 and single > 0: st = single
+        let nm = g.pk[pi].t.names[g.pk[pi].t.s[sym]] + ""
+        let o = new_obj(&g, O_VAR, nm, pi, fi, sym, c)
+        g.otype[o] = st
+        if g.pk[pi].use[sym] < 0: g.pk[pi].use[sym] = o
+        if nm != "_":
+          let top = g.scopes.len - 1
+          g.scopes[top][nm] = o
+      stmts(&g, fs, pi, fi, g.pk[pi].t.b[c])
+      g.scopes.pop()
+    g.scopes.pop()
+  elif k == ast.N_SELECT:
+    for c in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
+      g.scopes.push({})
+      stmt(&g, fs, pi, fi, g.pk[pi].t.a[c])
+      stmts(&g, fs, pi, fi, g.pk[pi].t.b[c])
+      g.scopes.pop()
+  elif k == ast.N_FOR:
+    g.scopes.push({})
+    stmt(&g, fs, pi, fi, g.pk[pi].t.a[n])
+    expr(&g, fs, pi, fi, g.pk[pi].t.b[n], 0)
+    stmt(&g, fs, pi, fi, g.pk[pi].t.c[n])
+    stmt(&g, fs, pi, fi, g.pk[pi].t.d[n])
+    g.scopes.pop()
+  elif k == ast.N_RANGE:
+    g.scopes.push({})
+    let xt = expr(&g, fs, pi, fi, g.pk[pi].t.c[n], 0)
+    var kt = 0
+    var vt = 0
+    let u = core(&g, fs, xt)
+    if u > 0:
+      let uk = g.tk[u]
+      if uk == TY_SLICE or uk == TY_ARRAY:
+        kt = B_INT
+        vt = g.ta[u]
+      elif uk == TY_PTR:
+        let e = under(&g, fs, g.ta[u])
+        if e > 0 and g.tk[e] == TY_ARRAY:
+          kt = B_INT
+          vt = g.ta[e]
+      elif uk == TY_MAP:
+        kt = g.ta[u]
+        vt = g.tb[u]
+      elif uk == TY_CHAN: kt = g.ta[u]
+      elif u == B_STRING or u == B_USTRING:
+        kt = B_INT
+        vt = B_INT32
+      elif uk == TY_BASIC: kt = default_type(xt)
+      elif uk == TY_FUNC:
+        let ps = tlist(g, g.ta[u])
+        if ps.len == 1:
+          let yu = under(&g, fs, ps[0])
+          if yu > 0 and g.tk[yu] == TY_FUNC:
+            let yps = tlist(g, g.ta[yu])
+            if yps.len >= 1: kt = yps[0]
+            if yps.len >= 2: vt = yps[1]
+    let key = g.pk[pi].t.a[n]
+    let val = g.pk[pi].t.b[n]
+    if g.pk[pi].t.f[n] == T_DEFINE:
+      if key > 0 and g.pk[pi].t.k[key] == ast.N_IDENT:
+        declare_var(&g, pi, fi, key, kt, n)
+        set(&g, pi, key, kt, M_VALUE)
+      if val > 0 and g.pk[pi].t.k[val] == ast.N_IDENT:
+        declare_var(&g, pi, fi, val, vt, n)
+        set(&g, pi, val, vt, M_VALUE)
+    else:
+      expr(&g, fs, pi, fi, key, 0)
+      expr(&g, fs, pi, fi, val, 0)
+    stmt(&g, fs, pi, fi, g.pk[pi].t.d[n])
+    g.scopes.pop()
+
+# Methods can't be declared on local types; nothing to attach. (Kept for symmetry.)
+fn local_type_methods(var g: Prog, fs: Fs, o: Int):
+  return
+
+# Loads, parses and checks the package made of the given files (the one being linted).
+fn check_target(var g: Prog, fs: Fs, pi: Int):
+  g.cur_target = pi
+  ensure(&g, pi)
+  let nf = g.pk[pi].roots.len
+  for fi in 0..nf:
+    let root = g.pk[pi].roots[fi]
+    for d in ast.items(g.pk[pi].t, g.pk[pi].t.c[root]):
+      let k = g.pk[pi].t.k[d]
+      if k == ast.N_FUNCDECL:
+        let id = g.pk[pi].t.b[d]
+        let o = g.pk[pi].use[id]
+        if o < 0: continue
+        obj_type(&g, fs, o)
+        func_body(&g, fs, pi, fi, o, g.pk[pi].t.a[d], g.pk[pi].t.c[d], g.pk[pi].t.d[d])
+      elif k == ast.N_GENDECL:
+        let tok = g.pk[pi].t.f[d]
+        if tok == K_IMPORT: continue
+        for sp in ast.items(g.pk[pi].t, g.pk[pi].t.a[d]):
+          if tok == K_TYPE:
+            let o = g.pk[pi].use[g.pk[pi].t.a[sp]]
+            if o >= 0:
+              obj_type(&g, fs, o)
+              let saved = save_scopes(&g)
+              push_tparams_scope(&g, o)
+              type_expr(&g, fs, pi, fi, g.pk[pi].t.c[sp])
+              restore_scopes(&g, saved)
+          else:
+            for id in ast.items(g.pk[pi].t, g.pk[pi].t.a[sp]):
+              let o = g.pk[pi].use[id]
+              if o >= 0: obj_type(&g, fs, o)
+            # values not tied to a name (more values than names) still get typed
+            let vals = g.pk[pi].t.c[sp]
+            if vals >= 0:
+              for v in ast.items(g.pk[pi].t, vals): expr(&g, fs, pi, fi, v, 0)
+            let te = g.pk[pi].t.b[sp]
+            if te > 0: type_expr(&g, fs, pi, fi, te)
+
+# Adds the target package (all files parsed with bodies) and checks it. Returns its index.
+fn add_target(var g: Prog, fs: Fs, path: Str, dir: Str, srcs: [Str]) -> Int:
+  let pi = g.pk.len
+  var p = new_pk(path, dir)
+  p.target = true
+  g.pk.push(p)
+  var kw: {Str: Int} = {}
+  swap(&kw, &g.kw)
+  for s in srcs: add_src(&g, pi, s + "", false, &kw)
+  swap(&kw, &g.kw)
+  ensure(&g, pi)
+  collect(&g, pi)
+  check_target(&g, fs, pi)
+  return pi
+
+# The same for a package already parsed (its tree moves in; take it back with swap).
+fn add_target_ast(var g: Prog, fs: Fs, path: Str, dir: Str, var t: ast.Ast, roots: [Int]) -> Int:
+  let pi = g.pk.len
+  var p = new_pk(path, dir)
+  p.target = true
+  g.pk.push(p)
+  swap(&t, &g.pk[pi].t)
+  for root in roots:
+    g.pk[pi].roots.push(root)
+    g.pk[pi].srcs.push("")
+    g.pk[pi].imps.push(ast.items(g.pk[pi].t, g.pk[pi].t.b[root]))
+    g.pk[pi].iname.push({})
+    if g.pk[pi].name.len == 0:
+      let nmid = g.pk[pi].t.s[g.pk[pi].t.a[root]]
+      g.pk[pi].name = g.pk[pi].t.names[nmid] + ""
+  ensure(&g, pi)
+  collect(&g, pi)
+  check_target(&g, fs, pi)
+  return pi
