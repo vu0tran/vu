@@ -1,0 +1,1112 @@
+# The Go parser: source files into the flat tree of ast.vu. It follows go/parser, including its
+# way of telling composite literals from blocks (exprlev < 0 inside control clauses) and type
+# parameter lists from array lengths.
+
+import scan
+import ast
+from scan import T_EOF, T_IDENT, T_INT, T_FLOAT, T_IMAG, T_CHAR, T_STRING, T_ADD, T_SUB, T_MUL, T_AND, T_OR, T_XOR, T_NOT, T_TILDE, T_ARROW
+from scan import T_LPAREN, T_RPAREN, T_LBRACK, T_RBRACK, T_LBRACE, T_RBRACE, T_COMMA, T_PERIOD, T_SEMI, T_COLON, T_ELLIPSIS, T_ASSIGN, T_DEFINE
+from scan import T_INC, T_DEC, T_LOR, T_LAND
+from scan import K_BREAK, K_CASE, K_CHAN, K_CONST, K_CONTINUE, K_DEFAULT, K_DEFER, K_ELSE, K_FALLTHROUGH, K_FOR, K_FUNC, K_GO, K_GOTO, K_IF, K_IMPORT, K_INTERFACE, K_MAP, K_PACKAGE, K_RANGE, K_RETURN, K_SELECT, K_STRUCT, K_SWITCH, K_TYPE, K_VAR
+
+type Parser:
+  sc: scan.Scanner
+  t: ast.Ast
+  file: Int
+  lev: Int
+  err: Str
+  err_at: Int
+
+fn parser(own sc: scan.Scanner, own t: ast.Ast, file: Int) -> Parser:
+  var p = Parser(sc, t, file, 0, "", -1)
+  scan.next(&p.sc)
+  return p
+
+fn tok(p: Parser) -> Int:
+  return p.sc.tok
+
+fn next(var p: Parser):
+  scan.next(&p.sc)
+
+fn error(var p: Parser, at: Int, msg: Str):
+  if p.err.len == 0:
+    p.err = msg + ""
+    p.err_at = at
+  # stop: every loop ends at EOF
+  p.sc.i = p.sc.n
+  p.sc.semi = false
+  p.sc.tok = T_EOF
+  p.sc.ts = p.sc.n
+
+fn expect(var p: Parser, k: Int) -> Int:
+  let pos = p.sc.ts
+  if p.sc.tok != k:
+    error(&p, pos, "expected '" + scan.tok_str(k) + "', found '" + scan.tok_str(p.sc.tok) + "'")
+    return pos
+  next(&p)
+  return pos
+
+fn expect_semi(var p: Parser):
+  let k = p.sc.tok
+  if k == T_SEMI:
+    next(&p)
+    return
+  if k == T_RPAREN or k == T_RBRACE or k == T_EOF: return
+  error(&p, p.sc.ts, "expected ';', found '" + scan.tok_str(k) + "'")
+
+fn nd(var p: Parser, k: Int, pos: Int) -> Int:
+  return ast.node(&p.t, k, pos, p.sc.pe, p.file)
+
+fn fin(var p: Parser, id: Int) -> Int:
+  p.t.end[id] = p.sc.pe
+  return id
+
+fn lst(var p: Parser, items: [Int], pos: Int) -> Int:
+  return ast.list(&p.t, items, pos, p.sc.pe, p.file)
+
+fn ident(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  if p.sc.tok != T_IDENT:
+    error(&p, pos, "expected 'IDENT', found '" + scan.tok_str(p.sc.tok) + "'")
+    let id = ast.node(&p.t, ast.N_IDENT, pos, pos, p.file)
+    p.t.s[id] = 0
+    return id
+  let id = ast.node(&p.t, ast.N_IDENT, pos, p.sc.te, p.file)
+  p.t.s[id] = ast.intern(&p.t, p.sc.src[pos..p.sc.te])
+  next(&p)
+  return id
+
+fn ident_list(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  var xs: [Int] = []
+  xs.push(ident(&p))
+  while p.sc.tok == T_COMMA:
+    next(&p)
+    xs.push(ident(&p))
+  return lst(&p, xs, pos)
+
+# ---- files and declarations
+
+fn parse_file(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let f = ast.node(&p.t, ast.N_FILE, pos, pos, p.file)
+  expect(&p, K_PACKAGE)
+  p.t.a[f] = ident(&p)
+  expect_semi(&p)
+  var imps: [Int] = []
+  var decls: [Int] = []
+  while p.sc.tok == K_IMPORT:
+    let d = gen_decl(&p, K_IMPORT)
+    for s in ast.items(p.t, p.t.a[d]): imps.push(s)
+    decls.push(d)
+  while p.sc.tok != T_EOF:
+    let k = p.sc.tok
+    if k == K_CONST or k == K_VAR or k == K_TYPE or k == K_IMPORT: decls.push(gen_decl(&p, k))
+    elif k == K_FUNC: decls.push(func_decl(&p))
+    else: error(&p, p.sc.ts, "non-declaration statement outside function body")
+  p.t.b[f] = lst(&p, imps, pos)
+  p.t.c[f] = lst(&p, decls, pos)
+  return fin(&p, f)
+
+fn gen_decl(var p: Parser, kw: Int) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  let d = nd(&p, ast.N_GENDECL, pos)
+  p.t.f[d] = kw
+  var specs: [Int] = []
+  if p.sc.tok == T_LPAREN:
+    p.t.s[d] = 1
+    next(&p)
+    var iota = 0
+    while p.sc.tok != T_RPAREN and p.sc.tok != T_EOF:
+      specs.push(spec(&p, kw, iota))
+      expect_semi(&p)
+      iota += 1
+    expect(&p, T_RPAREN)
+  else:
+    specs.push(spec(&p, kw, 0))
+  p.t.a[d] = lst(&p, specs, pos)
+  fin(&p, d)
+  expect_semi(&p)
+  return d
+
+fn spec(var p: Parser, kw: Int, iota: Int) -> Int:
+  let pos = p.sc.ts
+  if kw == K_IMPORT:
+    let s = nd(&p, ast.N_IMPORT, pos)
+    if p.sc.tok == T_IDENT: p.t.a[s] = ident(&p)
+    elif p.sc.tok == T_PERIOD:
+      let id = ast.node(&p.t, ast.N_IDENT, pos, p.sc.te, p.file)
+      p.t.s[id] = ast.intern(&p.t, ".")
+      p.t.a[s] = id
+      next(&p)
+    if p.sc.tok != T_STRING:
+      error(&p, p.sc.ts, "missing import path")
+      return s
+    p.t.b[s] = basic_lit(&p)
+    return fin(&p, s)
+  if kw == K_TYPE:
+    let s = nd(&p, ast.N_TYPESPEC, pos)
+    p.t.a[s] = ident(&p)
+    if p.sc.tok == T_LBRACK:
+      let lb = p.sc.ts
+      next(&p)
+      if p.sc.tok == T_IDENT:
+        # a type parameter list, or an array type with a named length
+        let save = scan_save(p)
+        next(&p)
+        let k = p.sc.tok
+        scan_restore(&p, save)
+        if k == T_IDENT or k == T_COMMA or k == T_LBRACK or k == K_INTERFACE or k == K_FUNC or k == K_MAP or k == K_CHAN or k == K_STRUCT or k == T_LPAREN or k == T_TILDE:
+          p.t.b[s] = param_list(&p, T_RBRACK, true, lb)
+          if p.sc.tok == T_ASSIGN:
+            p.t.f[s] = 1
+            next(&p)
+          p.t.c[s] = typ(&p)
+        else:
+          p.t.c[s] = array_type(&p, lb)
+      else:
+        p.t.c[s] = array_type(&p, lb)
+    else:
+      if p.sc.tok == T_ASSIGN:
+        p.t.f[s] = 1
+        next(&p)
+      p.t.c[s] = typ(&p)
+    return fin(&p, s)
+  # const or var
+  let s = nd(&p, ast.N_VALUESPEC, pos)
+  p.t.f[s] = iota
+  p.t.a[s] = ident_list(&p)
+  let k = p.sc.tok
+  if k != T_ASSIGN and k != T_SEMI and k != T_RPAREN: p.t.b[s] = typ(&p)
+  if p.sc.tok == T_ASSIGN:
+    next(&p)
+    p.t.c[s] = expr_list(&p)
+  return fin(&p, s)
+
+type SSave:
+  i: Int
+  tok: Int
+  ts: Int
+  te: Int
+  semi: Bool
+  auto: Bool
+  pe: Int
+  nlines: Int
+  ncomments: Int
+
+fn scan_save(p: Parser) -> SSave:
+  return SSave(p.sc.i, p.sc.tok, p.sc.ts, p.sc.te, p.sc.semi, p.sc.auto, p.sc.pe, p.sc.lines.len, p.sc.comments.len)
+
+fn scan_restore(var p: Parser, s: SSave):
+  p.sc.i = s.i
+  p.sc.tok = s.tok
+  p.sc.ts = s.ts
+  p.sc.te = s.te
+  p.sc.semi = s.semi
+  p.sc.auto = s.auto
+  p.sc.pe = s.pe
+  p.sc.lines.truncate(s.nlines)
+  p.sc.comments.truncate(s.ncomments)
+
+# [ already read: the rest of an array or slice type.
+fn array_type(var p: Parser, lb: Int) -> Int:
+  let n = ast.node(&p.t, ast.N_ARRAYTYPE, lb, lb, p.file)
+  if p.sc.tok == T_RBRACK:
+    next(&p)
+    p.t.b[n] = typ(&p)
+    return fin(&p, n)
+  if p.sc.tok == T_ELLIPSIS:
+    p.t.a[n] = nd(&p, ast.N_ELLIPSIS, p.sc.ts)
+    next(&p)
+    fin(&p, p.t.a[n])
+  else:
+    p.lev += 1
+    p.t.a[n] = expr(&p)
+    p.lev -= 1
+  expect(&p, T_RBRACK)
+  p.t.b[n] = typ(&p)
+  return fin(&p, n)
+
+fn func_decl(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  let d = nd(&p, ast.N_FUNCDECL, pos)
+  if p.sc.tok == T_LPAREN:
+    let lp = p.sc.ts
+    next(&p)
+    p.t.a[d] = param_list(&p, T_RPAREN, false, lp)
+  p.t.b[d] = ident(&p)
+  let ft = nd(&p, ast.N_FUNCTYPE, pos)
+  if p.sc.tok == T_LBRACK:
+    let lb = p.sc.ts
+    next(&p)
+    p.t.a[ft] = param_list(&p, T_RBRACK, true, lb)
+  signature(&p, ft)
+  p.t.c[d] = fin(&p, ft)
+  if p.sc.tok == T_LBRACE:
+    p.lev += 1
+    p.t.d[d] = block(&p)
+    p.lev -= 1
+  fin(&p, d)
+  expect_semi(&p)
+  return d
+
+# Parameters and results into a N_FUNCTYPE.
+fn signature(var p: Parser, ft: Int):
+  let lp = p.sc.ts
+  expect(&p, T_LPAREN)
+  p.t.b[ft] = param_list(&p, T_RPAREN, false, lp)
+  if p.sc.tok == T_LPAREN:
+    let rp = p.sc.ts
+    next(&p)
+    p.t.c[ft] = param_list(&p, T_RPAREN, false, rp)
+  elif starts_type(p.sc.tok):
+    let pos = p.sc.ts
+    let t = typ(&p)
+    let f = ast.node(&p.t, ast.N_FIELD, pos, p.sc.pe, p.file)
+    p.t.b[f] = t
+    p.t.c[ft] = lst(&p, [f], pos)
+
+fn starts_type(k: Int) -> Bool:
+  return k == T_IDENT or k == T_LBRACK or k == K_STRUCT or k == T_MUL or k == K_FUNC or k == K_INTERFACE or k == K_MAP or k == K_CHAN or k == T_LPAREN or k == T_ARROW
+
+# A parameter list up to the closing token (already past the opening one). Entries are names, types,
+# or names followed by a type; as in Go, if any entry has a name and a type, the bare ones are names
+# that share the next type.
+fn param_list(var p: Parser, close: Int, tparams: Bool, pos: Int) -> Int:
+  var names: [Int] = []     # each entry's name (-1)
+  var types: [Int] = []     # each entry's type (-1)
+  var poss: [Int] = []
+  var named = false
+  while p.sc.tok != close and p.sc.tok != T_EOF:
+    let ep = p.sc.ts
+    poss.push(ep)
+    if p.sc.tok == T_IDENT:
+      let id = ident(&p)
+      let k = p.sc.tok
+      if k == T_COMMA or k == close:
+        names.push(id)
+        types.push(-1)
+      elif k == T_PERIOD:
+        # a qualified type name
+        next(&p)
+        let sel = ident(&p)
+        var x = ast.node(&p.t, ast.N_SELECTOR, ep, p.sc.pe, p.file)
+        p.t.a[x] = id
+        p.t.b[x] = sel
+        if p.sc.tok == T_LBRACK: x = type_args(&p, x)
+        names.push(-1)
+        types.push(x)
+      elif k == T_LBRACK and not tparams:
+        # name []T, name [N]T, or a generic type T[A]
+        let lb = p.sc.ts
+        next(&p)
+        if p.sc.tok == T_RBRACK or p.sc.tok == T_ELLIPSIS:
+          names.push(id)
+          types.push(array_type(&p, lb))
+          named = true
+        else:
+          p.lev += 1
+          var args: [Int] = []
+          args.push(type_or_expr(&p))
+          while p.sc.tok == T_COMMA:
+            next(&p)
+            if p.sc.tok == T_RBRACK: break
+            args.push(type_or_expr(&p))
+          p.lev -= 1
+          expect(&p, T_RBRACK)
+          if args.len == 1 and starts_type(p.sc.tok):
+            let at = ast.node(&p.t, ast.N_ARRAYTYPE, lb, lb, p.file)
+            p.t.a[at] = args[0]
+            p.t.b[at] = typ(&p)
+            fin(&p, at)
+            names.push(id)
+            types.push(at)
+            named = true
+          else:
+            let x = ast.node(&p.t, ast.N_INDEX, ep, p.sc.pe, p.file)
+            p.t.a[x] = id
+            p.t.b[x] = lst(&p, args, lb)
+            names.push(-1)
+            types.push(x)
+      else:
+        names.push(id)
+        if k == T_ELLIPSIS:
+          let e = nd(&p, ast.N_ELLIPSIS, p.sc.ts)
+          next(&p)
+          p.t.a[e] = typ(&p)
+          types.push(fin(&p, e))
+        elif tparams: types.push(constraint(&p))
+        else: types.push(typ(&p))
+        named = true
+    elif p.sc.tok == T_ELLIPSIS:
+      let e = nd(&p, ast.N_ELLIPSIS, p.sc.ts)
+      next(&p)
+      p.t.a[e] = typ(&p)
+      names.push(-1)
+      types.push(fin(&p, e))
+    else:
+      names.push(-1)
+      if tparams: types.push(constraint(&p))
+      else: types.push(typ(&p))
+    if p.sc.tok != T_COMMA: break
+    next(&p)
+  expect(&p, close)
+  var fields: [Int] = []
+  if named:
+    var pend: [Int] = []
+    var pstart = -1
+    for i in 0..names.len:
+      if types[i] < 0:
+        if pstart < 0: pstart = poss[i]
+        pend.push(names[i])
+        continue
+      if names[i] >= 0:
+        if pstart < 0: pstart = poss[i]
+        pend.push(names[i])
+      var f = ast.node(&p.t, ast.N_FIELD, pstart, p.t.end[types[i]], p.file)
+      if pend.len > 0:
+        p.t.a[f] = ast.list(&p.t, pend, pstart, p.t.end[types[i]], p.file)
+      p.t.b[f] = types[i]
+      fields.push(f)
+      pend = []
+      pstart = -1
+    if pend.len > 0: error(&p, pstart, "missing parameter type")
+  else:
+    for i in 0..names.len:
+      var t = types[i]
+      if t < 0: t = names[i]
+      let f = ast.node(&p.t, ast.N_FIELD, p.t.pos[t], p.t.end[t], p.file)
+      p.t.b[f] = t
+      fields.push(f)
+  return lst(&p, fields, pos)
+
+# A type parameter's constraint: a union of ~T terms.
+fn constraint(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  var x = term(&p)
+  while p.sc.tok == T_OR:
+    next(&p)
+    let y = term(&p)
+    let b = ast.node(&p.t, ast.N_BINARY, pos, p.sc.pe, p.file)
+    p.t.f[b] = T_OR
+    p.t.a[b] = x
+    p.t.b[b] = y
+    x = b
+  return x
+
+fn term(var p: Parser) -> Int:
+  if p.sc.tok == T_TILDE:
+    let u = nd(&p, ast.N_UNARY, p.sc.ts)
+    next(&p)
+    p.t.f[u] = T_TILDE
+    p.t.a[u] = typ(&p)
+    return fin(&p, u)
+  return typ(&p)
+
+# ---- types
+
+fn typ(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if k == T_IDENT:
+    var x = ident(&p)
+    if p.sc.tok == T_PERIOD:
+      next(&p)
+      let sel = ident(&p)
+      let s = ast.node(&p.t, ast.N_SELECTOR, pos, p.sc.pe, p.file)
+      p.t.a[s] = x
+      p.t.b[s] = sel
+      x = s
+    if p.sc.tok == T_LBRACK: x = type_args(&p, x)
+    return x
+  if k == T_LBRACK:
+    next(&p)
+    return array_type(&p, pos)
+  if k == K_STRUCT: return struct_type(&p)
+  if k == T_MUL:
+    next(&p)
+    let s = nd(&p, ast.N_STAR, pos)
+    p.t.a[s] = typ(&p)
+    return fin(&p, s)
+  if k == K_FUNC:
+    next(&p)
+    let ft = nd(&p, ast.N_FUNCTYPE, pos)
+    signature(&p, ft)
+    return fin(&p, ft)
+  if k == K_INTERFACE: return iface_type(&p)
+  if k == K_MAP:
+    next(&p)
+    let m = nd(&p, ast.N_MAPTYPE, pos)
+    expect(&p, T_LBRACK)
+    p.t.a[m] = typ(&p)
+    expect(&p, T_RBRACK)
+    p.t.b[m] = typ(&p)
+    return fin(&p, m)
+  if k == K_CHAN:
+    next(&p)
+    let c = nd(&p, ast.N_CHANTYPE, pos)
+    if p.sc.tok == T_ARROW:
+      next(&p)
+      p.t.f[c] = 1
+    p.t.a[c] = typ(&p)
+    return fin(&p, c)
+  if k == T_ARROW:
+    next(&p)
+    let c = nd(&p, ast.N_CHANTYPE, pos)
+    expect(&p, K_CHAN)
+    p.t.f[c] = 2
+    p.t.a[c] = typ(&p)
+    return fin(&p, c)
+  if k == T_LPAREN:
+    next(&p)
+    let x = nd(&p, ast.N_PAREN, pos)
+    p.t.a[x] = typ(&p)
+    expect(&p, T_RPAREN)
+    return fin(&p, x)
+  error(&p, pos, "expected type, found '" + scan.tok_str(k) + "'")
+  return nd(&p, ast.N_BAD, pos)
+
+# x[ ... ] in a type: type arguments.
+fn type_args(var p: Parser, x: Int) -> Int:
+  let lb = p.sc.ts
+  next(&p)
+  var args: [Int] = []
+  p.lev += 1
+  while p.sc.tok != T_RBRACK and p.sc.tok != T_EOF:
+    args.push(type_or_expr(&p))
+    if p.sc.tok != T_COMMA: break
+    next(&p)
+  p.lev -= 1
+  expect(&p, T_RBRACK)
+  let n = ast.node(&p.t, ast.N_INDEX, p.t.pos[x], p.sc.pe, p.file)
+  p.t.a[n] = x
+  p.t.b[n] = lst(&p, args, lb)
+  return n
+
+fn struct_type(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  let st = nd(&p, ast.N_STRUCTTYPE, pos)
+  let lb = p.sc.ts
+  expect(&p, T_LBRACE)
+  var fields: [Int] = []
+  while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    fields.push(field_decl(&p))
+    expect_semi(&p)
+  expect(&p, T_RBRACE)
+  p.t.a[st] = lst(&p, fields, lb)
+  return fin(&p, st)
+
+fn field_decl(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let f = nd(&p, ast.N_FIELD, pos)
+  if p.sc.tok == T_MUL:
+    # an embedded pointer
+    next(&p)
+    let s = nd(&p, ast.N_STAR, pos)
+    p.t.a[s] = typ(&p)
+    p.t.b[f] = fin(&p, s)
+  elif p.sc.tok == T_LPAREN:
+    error(&p, pos, "cannot parenthesize embedded type")
+  elif p.sc.tok == T_IDENT:
+    let id = ident(&p)
+    let k = p.sc.tok
+    if k == T_PERIOD:
+      next(&p)
+      let sel = ident(&p)
+      var x = ast.node(&p.t, ast.N_SELECTOR, pos, p.sc.pe, p.file)
+      p.t.a[x] = id
+      p.t.b[x] = sel
+      if p.sc.tok == T_LBRACK: x = type_args(&p, x)
+      p.t.b[f] = x
+    elif k == T_LBRACK:
+      let lb = p.sc.ts
+      next(&p)
+      if p.sc.tok == T_RBRACK or p.sc.tok == T_ELLIPSIS:
+        p.t.a[f] = lst(&p, [id], pos)
+        p.t.b[f] = array_type(&p, lb)
+      else:
+        p.lev += 1
+        var args: [Int] = []
+        args.push(type_or_expr(&p))
+        while p.sc.tok == T_COMMA:
+          next(&p)
+          if p.sc.tok == T_RBRACK: break
+          args.push(type_or_expr(&p))
+        p.lev -= 1
+        expect(&p, T_RBRACK)
+        if args.len == 1 and starts_type(p.sc.tok):
+          let at = ast.node(&p.t, ast.N_ARRAYTYPE, lb, lb, p.file)
+          p.t.a[at] = args[0]
+          p.t.b[at] = typ(&p)
+          fin(&p, at)
+          p.t.a[f] = ast.list(&p.t, [id], pos, p.t.end[id], p.file)
+          p.t.b[f] = at
+        else:
+          let x = ast.node(&p.t, ast.N_INDEX, pos, p.sc.pe, p.file)
+          p.t.a[x] = id
+          p.t.b[x] = lst(&p, args, lb)
+          p.t.b[f] = x
+    elif k == T_STRING or k == T_SEMI or k == T_RBRACE:
+      p.t.b[f] = id
+    else:
+      var names: [Int] = [id]
+      while p.sc.tok == T_COMMA:
+        next(&p)
+        names.push(ident(&p))
+      p.t.a[f] = ast.list(&p.t, names, pos, p.sc.pe, p.file)
+      p.t.b[f] = typ(&p)
+  else:
+    error(&p, pos, "expected field name or embedded type")
+  if p.sc.tok == T_STRING: p.t.c[f] = basic_lit(&p)
+  return fin(&p, f)
+
+fn iface_type(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  let it = nd(&p, ast.N_IFACETYPE, pos)
+  let lb = p.sc.ts
+  expect(&p, T_LBRACE)
+  var elems: [Int] = []
+  while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    let ep = p.sc.ts
+    if p.sc.tok == T_IDENT:
+      let save = scan_save(p)
+      next(&p)
+      let k = p.sc.tok
+      scan_restore(&p, save)
+      if k == T_LPAREN:
+        let name = ident(&p)
+        let f = nd(&p, ast.N_FIELD, ep)
+        p.t.a[f] = lst(&p, [name], ep)
+        let ft = nd(&p, ast.N_FUNCTYPE, ep)
+        signature(&p, ft)
+        p.t.b[f] = fin(&p, ft)
+        elems.push(fin(&p, f))
+        expect_semi(&p)
+        continue
+    let f = nd(&p, ast.N_FIELD, ep)
+    p.t.b[f] = constraint(&p)
+    elems.push(fin(&p, f))
+    expect_semi(&p)
+  expect(&p, T_RBRACE)
+  p.t.a[it] = lst(&p, elems, lb)
+  return fin(&p, it)
+
+# ---- expressions
+
+fn basic_lit(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let n = ast.node(&p.t, ast.N_BASICLIT, pos, p.sc.te, p.file)
+  p.t.f[n] = p.sc.tok
+  p.t.s[n] = ast.intern(&p.t, p.sc.src[pos..p.sc.te])
+  next(&p)
+  return n
+
+fn expr_list(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  var xs: [Int] = []
+  xs.push(expr(&p))
+  while p.sc.tok == T_COMMA:
+    next(&p)
+    xs.push(expr(&p))
+  return lst(&p, xs, pos)
+
+fn type_or_expr(var p: Parser) -> Int:
+  return expr(&p)
+
+fn expr(var p: Parser) -> Int:
+  return binary(&p, 1)
+
+fn prec(k: Int) -> Int:
+  if k == T_LOR: return 1
+  if k == T_LAND: return 2
+  if k >= scan.T_EQL and k <= scan.T_GTR: return 3
+  if k == scan.T_NEQ or k == scan.T_LEQ or k == scan.T_GEQ: return 3
+  if k == T_ADD or k == T_SUB or k == T_OR or k == T_XOR: return 4
+  if k == T_MUL or k == scan.T_QUO or k == scan.T_REM or k == scan.T_SHL or k == scan.T_SHR or k == T_AND or k == scan.T_ANDNOT: return 5
+  return 0
+
+fn binary(var p: Parser, prec1: Int) -> Int:
+  var x = unary(&p)
+  while true:
+    let op = p.sc.tok
+    let pr = prec(op)
+    if pr < prec1: return x
+    next(&p)
+    let y = binary(&p, pr + 1)
+    let b = ast.node(&p.t, ast.N_BINARY, p.t.pos[x], p.sc.pe, p.file)
+    p.t.f[b] = op
+    p.t.a[b] = x
+    p.t.b[b] = y
+    x = b
+  return x
+
+fn unary(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if k == T_ADD or k == T_SUB or k == T_NOT or k == T_XOR or k == T_AND or k == T_TILDE:
+    next(&p)
+    let u = nd(&p, ast.N_UNARY, pos)
+    p.t.f[u] = k
+    p.t.a[u] = unary(&p)
+    return fin(&p, u)
+  if k == T_ARROW:
+    next(&p)
+    if p.sc.tok == K_CHAN:
+      # <-chan T
+      next(&p)
+      let c = nd(&p, ast.N_CHANTYPE, pos)
+      p.t.f[c] = 2
+      p.t.a[c] = typ(&p)
+      fin(&p, c)
+      return primary(&p, c)
+    let u = nd(&p, ast.N_UNARY, pos)
+    p.t.f[u] = k
+    p.t.a[u] = unary(&p)
+    return fin(&p, u)
+  if k == T_MUL:
+    next(&p)
+    let s = nd(&p, ast.N_STAR, pos)
+    p.t.a[s] = unary(&p)
+    return fin(&p, s)
+  return primary(&p, -1)
+
+fn operand(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if k == T_IDENT: return ident(&p)
+  if k == T_INT or k == T_FLOAT or k == T_IMAG or k == T_CHAR or k == T_STRING: return basic_lit(&p)
+  if k == T_LPAREN:
+    next(&p)
+    p.lev += 1
+    let x = nd(&p, ast.N_PAREN, pos)
+    p.t.a[x] = type_or_expr(&p)
+    p.lev -= 1
+    expect(&p, T_RPAREN)
+    return fin(&p, x)
+  if k == K_FUNC:
+    next(&p)
+    let ft = nd(&p, ast.N_FUNCTYPE, pos)
+    signature(&p, ft)
+    fin(&p, ft)
+    if p.sc.tok == T_LBRACE:
+      let fl = nd(&p, ast.N_FUNCLIT, pos)
+      p.t.a[fl] = ft
+      p.lev += 1
+      p.t.b[fl] = block(&p)
+      p.lev -= 1
+      return fin(&p, fl)
+    return ft
+  if k == T_LBRACK or k == K_STRUCT or k == K_MAP or k == K_CHAN or k == K_INTERFACE:
+    return typ(&p)
+  error(&p, pos, "expected operand, found '" + scan.tok_str(k) + "'")
+  return nd(&p, ast.N_BAD, pos)
+
+fn unparen(p: Parser, x: Int) -> Int:
+  var y = x
+  while p.t.k[y] == ast.N_PAREN: y = p.t.a[y]
+  return y
+
+fn primary(var p: Parser, x0: Int) -> Int:
+  var x = x0
+  if x < 0: x = operand(&p)
+  while true:
+    let k = p.sc.tok
+    let pos = p.t.pos[x]
+    if k == T_PERIOD:
+      next(&p)
+      if p.sc.tok == T_IDENT:
+        let sel = ident(&p)
+        let s = ast.node(&p.t, ast.N_SELECTOR, pos, p.sc.pe, p.file)
+        p.t.a[s] = x
+        p.t.b[s] = sel
+        x = s
+      elif p.sc.tok == T_LPAREN:
+        next(&p)
+        let ta = ast.node(&p.t, ast.N_TYPEASSERT, pos, pos, p.file)
+        p.t.a[ta] = x
+        if p.sc.tok == K_TYPE: next(&p)
+        else: p.t.b[ta] = typ(&p)
+        expect(&p, T_RPAREN)
+        x = fin(&p, ta)
+      else:
+        error(&p, p.sc.ts, "expected selector or type assertion")
+        return x
+    elif k == T_LBRACK:
+      let lb = p.sc.ts
+      next(&p)
+      p.lev += 1
+      var idx: [Int] = [-1, -1, -1]
+      var ncolons = 0
+      if p.sc.tok != T_COLON: idx[0] = type_or_expr(&p)
+      var multi: [Int] = []
+      if p.sc.tok == T_COMMA:
+        # an instantiation with several type arguments
+        multi.push(idx[0])
+        while p.sc.tok == T_COMMA:
+          next(&p)
+          if p.sc.tok == T_RBRACK: break
+          multi.push(type_or_expr(&p))
+      else:
+        while p.sc.tok == T_COLON and ncolons < 2:
+          ncolons += 1
+          next(&p)
+          if p.sc.tok != T_COLON and p.sc.tok != T_RBRACK and p.sc.tok != T_EOF:
+            idx[ncolons] = expr(&p)
+      p.lev -= 1
+      expect(&p, T_RBRACK)
+      if ncolons > 0:
+        let s = ast.node(&p.t, ast.N_SLICE, pos, p.sc.pe, p.file)
+        p.t.a[s] = x
+        p.t.b[s] = idx[0]
+        p.t.c[s] = idx[1]
+        p.t.d[s] = idx[2]
+        if ncolons == 2: p.t.f[s] = 1
+        x = s
+      else:
+        let ix = ast.node(&p.t, ast.N_INDEX, pos, p.sc.pe, p.file)
+        p.t.a[ix] = x
+        if multi.len > 0: p.t.b[ix] = ast.list(&p.t, multi, lb, p.sc.pe, p.file)
+        else: p.t.b[ix] = ast.list(&p.t, [idx[0]], lb, p.sc.pe, p.file)
+        x = ix
+    elif k == T_LPAREN:
+      let lp = p.sc.ts
+      next(&p)
+      p.lev += 1
+      var args: [Int] = []
+      var dots = 0
+      while p.sc.tok != T_RPAREN and p.sc.tok != T_EOF:
+        args.push(type_or_expr(&p))
+        if p.sc.tok == T_ELLIPSIS:
+          dots = 1
+          next(&p)
+        if p.sc.tok != T_COMMA: break
+        next(&p)
+      p.lev -= 1
+      let al = ast.list(&p.t, args, lp, p.sc.te, p.file)
+      expect(&p, T_RPAREN)
+      let c = ast.node(&p.t, ast.N_CALL, pos, p.sc.pe, p.file)
+      p.t.a[c] = x
+      p.t.b[c] = al
+      p.t.f[c] = dots
+      x = c
+    elif k == T_LBRACE:
+      let t = unparen(p, x)
+      let tk = p.t.k[t]
+      if tk == ast.N_IDENT or tk == ast.N_SELECTOR or tk == ast.N_INDEX:
+        if p.lev < 0: return x
+      elif tk == ast.N_ARRAYTYPE or tk == ast.N_STRUCTTYPE or tk == ast.N_MAPTYPE:
+        x = x
+      else: return x
+      x = composite(&p, x, pos)
+    else: return x
+  return x
+
+fn composite(var p: Parser, typ_: Int, pos: Int) -> Int:
+  let c = ast.node(&p.t, ast.N_COMPOSITE, pos, pos, p.file)
+  p.t.a[c] = typ_
+  let lb = p.sc.ts
+  expect(&p, T_LBRACE)
+  p.lev += 1
+  var elts: [Int] = []
+  while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    let ep = p.sc.ts
+    var e = element(&p)
+    if p.sc.tok == T_COLON:
+      next(&p)
+      let kv = ast.node(&p.t, ast.N_KEYVALUE, ep, ep, p.file)
+      p.t.a[kv] = e
+      p.t.b[kv] = element(&p)
+      e = fin(&p, kv)
+    elts.push(e)
+    if p.sc.tok != T_COMMA: break
+    next(&p)
+  p.lev -= 1
+  p.t.b[c] = lst(&p, elts, lb)
+  expect(&p, T_RBRACE)
+  return fin(&p, c)
+
+fn element(var p: Parser) -> Int:
+  if p.sc.tok == T_LBRACE:
+    let c = composite(&p, -1, p.sc.ts)
+    p.t.f[c] = 1
+    return c
+  return expr(&p)
+
+# ---- statements
+
+fn block(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let b = nd(&p, ast.N_BLOCK, pos)
+  expect(&p, T_LBRACE)
+  p.t.a[b] = stmt_list(&p)
+  expect(&p, T_RBRACE)
+  return fin(&p, b)
+
+fn stmt_list(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  var xs: [Int] = []
+  while p.sc.tok != K_CASE and p.sc.tok != K_DEFAULT and p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    xs.push(stmt(&p))
+  return lst(&p, xs, pos)
+
+fn stmt(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if k == K_CONST or k == K_TYPE or k == K_VAR:
+    let s = nd(&p, ast.N_DECLSTMT, pos)
+    p.t.a[s] = gen_decl(&p, k)
+    p.t.end[s] = p.t.end[p.t.a[s]]
+    return s
+  if k == K_GO or k == K_DEFER:
+    next(&p)
+    var kind = ast.N_GO
+    if k == K_DEFER: kind = ast.N_DEFER
+    let s = nd(&p, kind, pos)
+    p.t.a[s] = expr(&p)
+    fin(&p, s)
+    expect_semi(&p)
+    return s
+  if k == K_RETURN:
+    next(&p)
+    let s = nd(&p, ast.N_RETURN, pos)
+    if p.sc.tok != T_SEMI and p.sc.tok != T_RBRACE: p.t.a[s] = expr_list(&p)
+    fin(&p, s)
+    expect_semi(&p)
+    return s
+  if k == K_BREAK or k == K_CONTINUE or k == K_GOTO or k == K_FALLTHROUGH:
+    next(&p)
+    let s = nd(&p, ast.N_BRANCH, pos)
+    p.t.f[s] = k
+    if k != K_FALLTHROUGH and p.sc.tok == T_IDENT: p.t.a[s] = ident(&p)
+    fin(&p, s)
+    expect_semi(&p)
+    return s
+  if k == T_LBRACE:
+    let b = block(&p)
+    expect_semi(&p)
+    return b
+  if k == K_IF: return if_stmt(&p)
+  if k == K_SWITCH: return switch_stmt(&p)
+  if k == K_SELECT: return select_stmt(&p)
+  if k == K_FOR: return for_stmt(&p)
+  if k == T_SEMI:
+    let s = ast.node(&p.t, ast.N_EMPTY, pos, pos, p.file)
+    next(&p)
+    return s
+  if k == T_RBRACE:
+    return ast.node(&p.t, ast.N_EMPTY, pos, pos, p.file)
+  let s = simple_stmt(&p, 1)
+  if p.t.k[s] != ast.N_LABELED: expect_semi(&p)
+  return s
+
+# mode 0: basic, 1: a label may follow, 2: a range clause may follow.
+fn simple_stmt(var p: Parser, mode: Int) -> Int:
+  let pos = p.sc.ts
+  if mode == 2 and p.sc.tok == K_RANGE:
+    next(&p)
+    let r = nd(&p, ast.N_RANGE, pos)
+    p.t.c[r] = expr(&p)
+    return fin(&p, r)
+  let lhs = expr_list(&p)
+  let k = p.sc.tok
+  if k == T_ASSIGN or k == T_DEFINE or (k >= scan.T_ADD_ASSIGN and k <= scan.T_ANDNOT_ASSIGN):
+    next(&p)
+    if mode == 2 and p.sc.tok == K_RANGE and (k == T_ASSIGN or k == T_DEFINE):
+      next(&p)
+      let r = nd(&p, ast.N_RANGE, pos)
+      p.t.f[r] = k
+      let n = ast.count(p.t, lhs)
+      if n >= 1: p.t.a[r] = ast.item(p.t, lhs, 0)
+      if n >= 2: p.t.b[r] = ast.item(p.t, lhs, 1)
+      p.t.c[r] = expr(&p)
+      return fin(&p, r)
+    let s = nd(&p, ast.N_ASSIGN, pos)
+    p.t.f[s] = k
+    p.t.a[s] = lhs
+    p.t.b[s] = expr_list(&p)
+    return fin(&p, s)
+  let x = ast.item(p.t, lhs, 0)
+  if k == T_COLON and mode == 1 and ast.count(p.t, lhs) == 1 and p.t.k[x] == ast.N_IDENT:
+    next(&p)
+    let s = nd(&p, ast.N_LABELED, pos)
+    p.t.a[s] = x
+    if p.sc.tok == T_RBRACE:
+      p.t.b[s] = ast.node(&p.t, ast.N_EMPTY, p.sc.ts, p.sc.ts, p.file)
+    else: p.t.b[s] = stmt(&p)
+    return fin(&p, s)
+  if k == T_ARROW:
+    next(&p)
+    let s = nd(&p, ast.N_SEND, pos)
+    p.t.a[s] = x
+    p.t.b[s] = expr(&p)
+    return fin(&p, s)
+  if k == T_INC or k == T_DEC:
+    next(&p)
+    let s = nd(&p, ast.N_INCDEC, pos)
+    p.t.a[s] = x
+    p.t.f[s] = k
+    return fin(&p, s)
+  if ast.count(p.t, lhs) > 1:
+    error(&p, p.sc.ts, "expected 1 expression")
+  let s = nd(&p, ast.N_EXPRSTMT, pos)
+  p.t.a[s] = x
+  return s
+
+fn if_stmt(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  let s = nd(&p, ast.N_IF, pos)
+  let prev = p.lev
+  p.lev = -1
+  var init = -1
+  var cond = -1
+  if p.sc.tok == T_LBRACE:
+    error(&p, p.sc.ts, "missing condition in if statement")
+    return s
+  if p.sc.tok != T_SEMI: init = simple_stmt(&p, 0)
+  if p.sc.tok != T_LBRACE:
+    expect(&p, T_SEMI)
+    if p.sc.tok != T_LBRACE: cond = simple_stmt(&p, 0)
+  else:
+    cond = init
+    init = -1
+  p.lev = prev
+  p.t.a[s] = init
+  if cond >= 0 and p.t.k[cond] == ast.N_EXPRSTMT: p.t.b[s] = p.t.a[cond]
+  else:
+    error(&p, pos, "missing condition in if statement")
+    return s
+  p.t.c[s] = block(&p)
+  if p.sc.tok == K_ELSE:
+    next(&p)
+    if p.sc.tok == K_IF: p.t.d[s] = if_stmt(&p)
+    elif p.sc.tok == T_LBRACE:
+      p.t.d[s] = block(&p)
+      expect_semi(&p)
+    else: error(&p, p.sc.ts, "else must be followed by if or statement block")
+  else: expect_semi(&p)
+  return fin(&p, s)
+
+fn case_body(var p: Parser, typeswitch: Bool) -> Int:
+  let lb = p.sc.ts
+  expect(&p, T_LBRACE)
+  var cases: [Int] = []
+  while p.sc.tok == K_CASE or p.sc.tok == K_DEFAULT:
+    let cp = p.sc.ts
+    let c = nd(&p, ast.N_CASE, cp)
+    if p.sc.tok == K_CASE:
+      next(&p)
+      p.t.a[c] = expr_list(&p)
+    else: next(&p)
+    expect(&p, T_COLON)
+    p.t.b[c] = stmt_list(&p)
+    cases.push(fin(&p, c))
+  expect(&p, T_RBRACE)
+  return lst(&p, cases, lb)
+
+fn switch_stmt(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  var s1 = -1
+  var s2 = -1
+  if p.sc.tok != T_LBRACE:
+    let prev = p.lev
+    p.lev = -1
+    if p.sc.tok != T_SEMI: s2 = simple_stmt(&p, 0)
+    if p.sc.tok == T_SEMI:
+      next(&p)
+      s1 = s2
+      s2 = -1
+      if p.sc.tok != T_LBRACE: s2 = simple_stmt(&p, 0)
+    p.lev = prev
+  var ts = false
+  if s2 >= 0:
+    let k = p.t.k[s2]
+    if k == ast.N_ASSIGN and p.t.f[s2] == T_DEFINE and ast.count(p.t, p.t.a[s2]) == 1 and ast.count(p.t, p.t.b[s2]) == 1:
+      let r = ast.item(p.t, p.t.b[s2], 0)
+      ts = p.t.k[r] == ast.N_TYPEASSERT and p.t.b[r] < 0
+    elif k == ast.N_EXPRSTMT:
+      let r = p.t.a[s2]
+      ts = p.t.k[r] == ast.N_TYPEASSERT and p.t.b[r] < 0
+  if ts:
+    let s = nd(&p, ast.N_TYPESWITCH, pos)
+    p.t.a[s] = s1
+    p.t.b[s] = s2
+    p.t.c[s] = case_body(&p, true)
+    fin(&p, s)
+    expect_semi(&p)
+    return s
+  let s = nd(&p, ast.N_SWITCH, pos)
+  p.t.a[s] = s1
+  if s2 >= 0:
+    if p.t.k[s2] == ast.N_EXPRSTMT: p.t.b[s] = p.t.a[s2]
+    else: error(&p, p.t.pos[s2], "switch expression must be an expression")
+  p.t.c[s] = case_body(&p, false)
+  fin(&p, s)
+  expect_semi(&p)
+  return s
+
+fn select_stmt(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  let s = nd(&p, ast.N_SELECT, pos)
+  let lb = p.sc.ts
+  expect(&p, T_LBRACE)
+  var cases: [Int] = []
+  while p.sc.tok == K_CASE or p.sc.tok == K_DEFAULT:
+    let cp = p.sc.ts
+    let c = nd(&p, ast.N_COMM, cp)
+    if p.sc.tok == K_CASE:
+      next(&p)
+      p.t.a[c] = simple_stmt(&p, 0)
+    else: next(&p)
+    expect(&p, T_COLON)
+    p.t.b[c] = stmt_list(&p)
+    cases.push(fin(&p, c))
+  expect(&p, T_RBRACE)
+  p.t.a[s] = lst(&p, cases, lb)
+  fin(&p, s)
+  expect_semi(&p)
+  return s
+
+fn for_stmt(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  var s1 = -1
+  var s2 = -1
+  var s3 = -1
+  var is_range = false
+  if p.sc.tok != T_LBRACE:
+    let prev = p.lev
+    p.lev = -1
+    if p.sc.tok != T_SEMI:
+      s2 = simple_stmt(&p, 2)
+      is_range = p.t.k[s2] == ast.N_RANGE
+    if not is_range and p.sc.tok == T_SEMI:
+      next(&p)
+      s1 = s2
+      s2 = -1
+      if p.sc.tok != T_SEMI: s2 = simple_stmt(&p, 0)
+      expect_semi(&p)
+      if p.sc.tok != T_LBRACE: s3 = simple_stmt(&p, 0)
+    p.lev = prev
+  if is_range:
+    p.t.pos[s2] = pos
+    p.t.d[s2] = block(&p)
+    fin(&p, s2)
+    expect_semi(&p)
+    return s2
+  let s = nd(&p, ast.N_FOR, pos)
+  p.t.a[s] = s1
+  if s2 >= 0:
+    if p.t.k[s2] == ast.N_EXPRSTMT: p.t.b[s] = p.t.a[s2]
+    else: error(&p, p.t.pos[s2], "expected for loop condition")
+  p.t.c[s] = s3
+  p.t.d[s] = block(&p)
+  fin(&p, s)
+  expect_semi(&p)
+  return s
