@@ -1,0 +1,691 @@
+# Regular expressions, parsed as ECMAScript reads them (with Annex B's extensions when neither the u
+# nor the v flag is set), for the linter's regex rules. Offsets are byte offsets in the pattern.
+
+type Rx:
+  src: Str
+  i: Int
+  u: Bool            # u or v flag
+  v: Bool
+  named: Bool        # the pattern has named groups (\k is then a reference)
+  err: Str
+  err_at: Int
+  ngroups: Int
+  # characters: start, end, value, kind, class depth, class start  (6 each)
+  # kind: 0 literal, 1 identity escape, 2 control escape (\n...), 3 \cX, 4 \0, 5 \x, 6 \u, 7 legacy octal, 8 decimal-as-octal
+  ch: [Int]
+  empty: [Int]       # start of each empty, non-negated class
+  # nodes for the backreference rule: kind, start, end, parent, extra (8: alternative index in parent)
+  # kind: 1 pattern/disjunction holder, 2 alternative, 3 capturing group, 4 group, 5 lookahead,
+  # 6 negative lookahead, 7 lookbehind, 8 negative lookbehind, 9 backreference
+  nk: [Int]
+  ns: [Int]
+  ne: [Int]
+  np: [Int]
+  gnum: [Int]        # capturing group: its number; backreference: the number it names (-1: by name)
+  gname: [Str]
+  stack: [Int]       # open nodes
+  names: [Str]       # group names in order (one per capturing group, "" if none)
+  name_alts: [Int]   # each named group's node
+  quant: [Int]       # start, end of each quantifier (for the rules that look at them)
+
+fn new_rx(src: Str, u: Bool, v: Bool) -> Rx:
+  return Rx(src + "", 0, u, v, false, "", -1, 0, [], [], [], [], [], [], [], [], [], [], [], [])
+
+fn rx_fail(var r: Rx, at: Int, msg: Str):
+  if r.err == "":
+    r.err = msg + ""
+    r.err_at = at
+
+# The byte at i (0 past the end).
+fn peek(r: Rx) -> Byte:
+  if r.i >= r.src.len: return byte(0)
+  return r.src[r.i]
+
+fn at(r: Rx, j: Int) -> Byte:
+  if j >= r.src.len or j < 0: return byte(0)
+  return r.src[j]
+
+# The code point at i and its length in bytes.
+fn cp_at(s: Str, i: Int) -> [Int]:
+  let c = int(s[i])
+  if c < 0x80: return [c, 1]
+  if c >= 0xF0 and i + 3 < s.len: return [((c & 7) << 18) | ((int(s[i + 1]) & 63) << 12) | ((int(s[i + 2]) & 63) << 6) | (int(s[i + 3]) & 63), 4]
+  if c >= 0xE0 and i + 2 < s.len: return [((c & 15) << 12) | ((int(s[i + 1]) & 63) << 6) | (int(s[i + 2]) & 63), 3]
+  if c >= 0xC0 and i + 1 < s.len: return [((c & 31) << 6) | (int(s[i + 1]) & 63), 2]
+  return [c, 1]
+
+fn node(var r: Rx, kind: Int, start: Int) -> Int:
+  let id = r.nk.len
+  r.nk.push(kind)
+  r.ns.push(start)
+  r.ne.push(start)
+  var par = -1
+  if r.stack.len > 0: par = r.stack[r.stack.len - 1]
+  r.np.push(par)
+  r.gnum.push(-1)
+  r.gname.push("")
+  return id
+
+fn add_ch(var r: Rx, start: Int, end: Int, value: Int, kind: Int, depth: Int, cls: Int):
+  r.ch.push(start)
+  r.ch.push(end)
+  r.ch.push(value)
+  r.ch.push(kind)
+  r.ch.push(depth)
+  r.ch.push(cls)
+
+# Parses a pattern; r.err is "" when it's valid.
+fn parse(src: Str, flags: Str) -> Rx:
+  var u = false
+  var v = false
+  for c in flags.chars():
+    if c == "u": u = true
+    if c == "v": v = true
+  var r = new_rx(src, u or v, v)
+  # a first pass for group names and count (forward references are allowed)
+  prescan(&r)
+  r.i = 0
+  let root = node(&r, 1, 0)
+  r.stack.push(root)
+  disjunction(&r)
+  if r.i < r.src.len:
+    if peek(r) == ')': rx_fail(&r, r.i, "Unmatched ')'")
+    else: rx_fail(&r, r.i, "Could not parse the entire pattern")
+  r.ne[root] = r.src.len
+  r.stack.pop()
+  if r.err == "": check_names(&r)
+  if r.err == "": check_refs(&r)
+  return r
+
+fn prescan(var r: Rx):
+  var i = 0
+  var in_class = false
+  let n = r.src.len
+  while i < n:
+    let c = r.src[i]
+    if c == '\\':
+      i += 2
+      continue
+    if in_class:
+      if c == ']': in_class = false
+    elif c == '[': in_class = true
+    elif c == '(':
+      if i + 1 < n and r.src[i + 1] == '?':
+        if i + 2 < n and r.src[i + 2] == '<' and i + 3 < n and r.src[i + 3] != '=' and r.src[i + 3] != '!':
+          r.named = true
+          r.ngroups += 1
+      else: r.ngroups += 1
+    i += 1
+
+fn disjunction(var r: Rx):
+  var idx = 0
+  while true:
+    let alt = node(&r, 2, r.i)
+    r.gnum[alt] = idx
+    r.stack.push(alt)
+    alternative(&r)
+    r.ne[alt] = r.i
+    r.stack.pop()
+    if peek(r) != '|': return
+    r.i += 1
+    idx += 1
+
+fn alternative(var r: Rx):
+  while r.i < r.src.len and r.err == "":
+    let c = peek(r)
+    if c == '|' or c == ')': return
+    term(&r)
+
+fn is_syntax(c: Byte) -> Bool:
+  return c == '^' or c == '$' or c == '\\' or c == '.' or c == '*' or c == '+' or c == '?' or c == '(' or c == ')' or c == '[' or c == ']' or c == '{' or c == '}' or c == '|'
+
+fn term(var r: Rx):
+  let start = r.i
+  let c = peek(r)
+  var quantifiable = true
+  if c == '^' or c == '$':
+    r.i += 1
+    quantifiable = false
+  elif c == '\\' and (at(r, r.i + 1) == 'b' or at(r, r.i + 1) == 'B'):
+    r.i += 2
+    quantifiable = false
+  elif c == '(':
+    quantifiable = group(&r)
+  elif c == '.':
+    r.i += 1
+  elif c == '[':
+    char_class(&r)
+  elif c == '\\':
+    atom_escape(&r)
+  elif c == '*' or c == '+' or c == '?':
+    rx_fail(&r, r.i, "Nothing to repeat")
+    return
+  elif c == '{':
+    if r.u:
+      rx_fail(&r, r.i, "Lone quantifier brackets")
+      return
+    # Annex B: a '{' that isn't a valid quantifier is a character
+    if braced_quantifier_at(r, r.i) > 0:
+      rx_fail(&r, r.i, "Nothing to repeat")
+      return
+    add_ch(&r, r.i, r.i + 1, int(c), 0, 0, -1)
+    r.i += 1
+  elif c == '}' or c == ']':
+    if r.u:
+      rx_fail(&r, r.i, "Lone quantifier brackets")
+      return
+    add_ch(&r, r.i, r.i + 1, int(c), 0, 0, -1)
+    r.i += 1
+  else:
+    let cp = cp_at(r.src, r.i)
+    add_ch(&r, r.i, r.i + cp[1], cp[0], 0, 0, -1)
+    r.i += cp[1]
+  quantifier(&r, start, quantifiable)
+
+# The length of a braced quantifier at j ({n}, {n,}, {n,m}), 0 if none.
+fn braced_quantifier_at(r: Rx, j: Int) -> Int:
+  var i = j + 1
+  let n = r.src.len
+  let d0 = i
+  while i < n and r.src[i] >= '0' and r.src[i] <= '9': i += 1
+  if i == d0: return 0
+  if i < n and r.src[i] == '}': return i + 1 - j
+  if i >= n or r.src[i] != ',': return 0
+  i += 1
+  while i < n and r.src[i] >= '0' and r.src[i] <= '9': i += 1
+  if i < n and r.src[i] == '}': return i + 1 - j
+  return 0
+
+fn quantifier(var r: Rx, start: Int, quantifiable: Bool):
+  let c = peek(r)
+  var len = 0
+  if c == '*' or c == '+' or c == '?': len = 1
+  elif c == '{':
+    len = braced_quantifier_at(r, r.i)
+    if len > 0:
+      # {n,m} with n > m
+      let body = r.src[r.i + 1..r.i + len - 1]
+      let comma = body.find(",")
+      if comma > 0 and comma < body.len - 1:
+        let lo = float(body[0..comma]) else 0.0
+        let hi = float(body[comma + 1..body.len]) else 0.0
+        if lo > hi:
+          rx_fail(&r, r.i, "Numbers out of order in braced quantifier")
+          return
+    elif r.u:
+      rx_fail(&r, r.i, "Incomplete quantifier")
+      return
+  if len == 0: return
+  if not quantifiable:
+    rx_fail(&r, r.i, "Nothing to repeat")
+    return
+  r.quant.push(r.i)
+  r.i += len
+  if peek(r) == '?': r.i += 1
+  r.quant.push(r.i)
+
+# A group; returns whether a quantifier may follow.
+fn group(var r: Rx) -> Bool:
+  let start = r.i
+  r.i += 1
+  var kind = 3
+  var name = ""
+  if peek(r) == '?':
+    let c2 = at(r, r.i + 1)
+    if c2 == ':':
+      kind = 4
+      r.i += 2
+    elif c2 == '=':
+      kind = 5
+      r.i += 2
+    elif c2 == '!':
+      kind = 6
+      r.i += 2
+    elif c2 == '<' and at(r, r.i + 2) == '=':
+      kind = 7
+      r.i += 3
+    elif c2 == '<' and at(r, r.i + 2) == '!':
+      kind = 8
+      r.i += 3
+    elif c2 == '<':
+      r.i += 2
+      let ns = r.i
+      while r.i < r.src.len and peek(r) != '>': r.i += 1
+      name = r.src[ns..r.i]
+      if peek(r) != '>' or name == "" or not valid_group_name(name):
+        rx_fail(&r, ns, "Invalid capture group name")
+        return false
+      r.i += 1
+    else:
+      # modifiers (?ims-ims:...)
+      var j = r.i + 1
+      while j < r.src.len and (r.src[j] == 'i' or r.src[j] == 'm' or r.src[j] == 's' or r.src[j] == '-'): j += 1
+      if j < r.src.len and r.src[j] == ':' and j > r.i + 1:
+        kind = 4
+        r.i = j + 1
+      else:
+        rx_fail(&r, r.i, "Invalid group")
+        return false
+  let g = node(&r, kind, start)
+  if kind == 3:
+    r.names.push(name)
+    r.gnum[g] = r.names.len
+    r.gname[g] = name
+  r.stack.push(g)
+  disjunction(&r)
+  r.stack.pop()
+  if peek(r) != ')':
+    rx_fail(&r, r.i, "Unterminated group")
+    return false
+  r.i += 1
+  r.ne[g] = r.i
+  # lookbehinds are never quantifiable; lookaheads only outside u mode
+  if kind == 7 or kind == 8: return false
+  if (kind == 5 or kind == 6) and r.u: return false
+  return true
+
+fn valid_group_name(s: Str) -> Bool:
+  for i in 0..s.len:
+    let c = s[i]
+    let ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$' or c >= 128 or (i > 0 and c >= '0' and c <= '9') or c == '\\'
+    if not ok: return false
+  return true
+
+fn hex(c: Byte) -> Int:
+  if c >= '0' and c <= '9': return int(c) - 48
+  if c >= 'a' and c <= 'f': return int(c) - 87
+  if c >= 'A' and c <= 'F': return int(c) - 55
+  return -1
+
+fn atom_escape(var r: Rx):
+  let start = r.i
+  let c = at(r, r.i + 1)
+  if c == 0:
+    rx_fail(&r, r.i, "Terminated with backslash")
+    r.i += 1
+    return
+  # backreferences
+  if c >= '1' and c <= '9':
+    var j = r.i + 1
+    var num = 0
+    while j < r.src.len and r.src[j] >= '0' and r.src[j] <= '9':
+      num = num * 10 + int(r.src[j] - '0')
+      j += 1
+    if num <= r.ngroups:
+      let b = node(&r, 9, start)
+      r.gnum[b] = num
+      r.ne[b] = j
+      r.i = j
+      return
+    if r.u:
+      rx_fail(&r, r.i, "Invalid escape")
+      return
+    # Annex B: a legacy octal escape (or the digit itself for 8 and 9)
+    if c >= '8':
+      add_ch(&r, start, r.i + 2, int(c), 1, 0, -1)
+      r.i += 2
+      return
+    legacy_octal(&r, start, 8, 0, -1)
+    return
+  if c == 'k' and (r.u or r.named):
+    if at(r, r.i + 2) != '<':
+      rx_fail(&r, r.i, "Invalid named reference")
+      return
+    let ns = r.i + 3
+    var j = ns
+    while j < r.src.len and r.src[j] != '>': j += 1
+    if j >= r.src.len:
+      rx_fail(&r, r.i, "Invalid named reference")
+      return
+    let name = r.src[ns..j]
+    var found = false
+    for x in r.names:
+      if x == name: found = true
+    if not found and not prescan_has_name(r, name):
+      rx_fail(&r, r.i, "Invalid named capture referenced")
+      return
+    let b = node(&r, 9, start)
+    r.gname[b] = name
+    r.ne[b] = j + 1
+    r.i = j + 1
+    return
+  if c == 'd' or c == 'D' or c == 's' or c == 'S' or c == 'w' or c == 'W':
+    r.i += 2
+    return
+  if (c == 'p' or c == 'P') and r.u:
+    property_escape(&r)
+    return
+  character_escape(&r, 0, -1)
+
+fn prescan_has_name(r: Rx, name: Str) -> Bool:
+  return r.src.find("(?<" + name + ">") >= 0
+
+fn property_escape(var r: Rx):
+  let start = r.i
+  if at(r, r.i + 2) != '{':
+    rx_fail(&r, start, "Invalid property name")
+    return
+  var j = r.i + 3
+  while j < r.src.len and r.src[j] != '}': j += 1
+  if j >= r.src.len:
+    rx_fail(&r, start, "Invalid property name")
+    return
+  let body = r.src[r.i + 3..j]
+  if not known_property(body):
+    rx_fail(&r, r.i + 3, "Invalid unicode property name and/or value")
+    return
+  r.i = j + 1
+
+fn known_property(body: Str) -> Bool:
+  var name = body + ""
+  var value = ""
+  let eq = body.find("=")
+  if eq >= 0:
+    name = body[0..eq]
+    value = body[eq + 1..body.len]
+  if eq >= 0:
+    if name == "General_Category" or name == "gc": return gc_value(value)
+    if name == "Script" or name == "sc" or name == "Script_Extensions" or name == "scx": return value != ""
+    return false
+  if gc_value(name): return true
+  for p in ["ASCII", "ASCII_Hex_Digit", "AHex", "Alphabetic", "Alpha", "Any", "Assigned", "Bidi_Control", "Bidi_C", "Bidi_Mirrored", "Bidi_M", "Case_Ignorable", "CI", "Cased", "Changes_When_Casefolded", "CWCF", "Changes_When_Casemapped", "CWCM", "Changes_When_Lowercased", "CWL", "Changes_When_NFKC_Casefolded", "CWKCF", "Changes_When_Titlecased", "CWT", "Changes_When_Uppercased", "CWU", "Dash", "Default_Ignorable_Code_Point", "DI", "Deprecated", "Dep", "Diacritic", "Dia", "Emoji", "Emoji_Component", "EComp", "Emoji_Modifier", "EMod", "Emoji_Modifier_Base", "EBase", "Emoji_Presentation", "EPres", "Extended_Pictographic", "ExtPict", "Extender", "Ext", "Grapheme_Base", "Gr_Base", "Grapheme_Extend", "Gr_Ext", "Hex_Digit", "Hex", "IDS_Binary_Operator", "IDSB", "IDS_Trinary_Operator", "IDST", "ID_Continue", "IDC", "ID_Start", "IDS", "Ideographic", "Ideo", "Join_Control", "Join_C", "Logical_Order_Exception", "LOE", "Lowercase", "Lower", "Math", "Noncharacter_Code_Point", "NChar", "Pattern_Syntax", "Pat_Syn", "Pattern_White_Space", "Pat_WS", "Quotation_Mark", "QMark", "Radical", "Regional_Indicator", "RI", "Sentence_Terminal", "STerm", "Soft_Dotted", "SD", "Terminal_Punctuation", "Term", "Unified_Ideograph", "UIdeo", "Uppercase", "Upper", "Variation_Selector", "VS", "White_Space", "space", "XID_Continue", "XIDC", "XID_Start", "XIDS", "Basic_Emoji", "Emoji_Keycap_Sequence", "RGI_Emoji", "RGI_Emoji_Flag_Sequence", "RGI_Emoji_Modifier_Sequence", "RGI_Emoji_Tag_Sequence", "RGI_Emoji_ZWJ_Sequence"]:
+    if body == p: return true
+  return false
+
+fn gc_value(v: Str) -> Bool:
+  for g in ["C", "Other", "Cc", "Control", "cntrl", "Cf", "Format", "Cn", "Unassigned", "Co", "Private_Use", "Cs", "Surrogate", "L", "Letter", "LC", "Cased_Letter", "Ll", "Lowercase_Letter", "Lm", "Modifier_Letter", "Lo", "Other_Letter", "Lt", "Titlecase_Letter", "Lu", "Uppercase_Letter", "M", "Mark", "Combining_Mark", "Mc", "Spacing_Mark", "Me", "Enclosing_Mark", "Mn", "Nonspacing_Mark", "N", "Number", "Nd", "Decimal_Number", "digit", "Nl", "Letter_Number", "No", "Other_Number", "P", "Punctuation", "punct", "Pc", "Connector_Punctuation", "Pd", "Dash_Punctuation", "Pe", "Close_Punctuation", "Pf", "Final_Punctuation", "Pi", "Initial_Punctuation", "Po", "Other_Punctuation", "Ps", "Open_Punctuation", "S", "Symbol", "Sc", "Currency_Symbol", "Sk", "Modifier_Symbol", "Sm", "Math_Symbol", "So", "Other_Symbol", "Z", "Separator", "Zl", "Line_Separator", "Zp", "Paragraph_Separator", "Zs", "Space_Separator"]:
+    if v == g: return true
+  return false
+
+fn legacy_octal(var r: Rx, start: Int, kind: Int, depth: Int, cls: Int):
+  # \ then up to three octal digits (value at most 0o377)
+  var j = r.i + 1
+  var v = 0
+  var nd = 0
+  while j < r.src.len and nd < 3 and r.src[j] >= '0' and r.src[j] <= '7':
+    let nv = v * 8 + int(r.src[j] - '0')
+    if nv > 255: break
+    v = nv
+    j += 1
+    nd += 1
+  add_ch(&r, start, j, v, kind, depth, cls)
+  r.i = j
+
+# A CharacterEscape (or a class escape when depth > 0); adds the character.
+fn character_escape(var r: Rx, depth: Int, cls: Int):
+  let start = r.i
+  let c = at(r, r.i + 1)
+  if c == 'f' or c == 'n' or c == 'r' or c == 't' or c == 'v':
+    var v = 12
+    if c == 'n': v = 10
+    elif c == 'r': v = 13
+    elif c == 't': v = 9
+    elif c == 'v': v = 11
+    add_ch(&r, start, r.i + 2, v, 2, depth, cls)
+    r.i += 2
+    return
+  if c == 'c':
+    let d = at(r, r.i + 2)
+    if (d >= 'a' and d <= 'z') or (d >= 'A' and d <= 'Z'):
+      add_ch(&r, start, r.i + 3, int(d) % 32, 3, depth, cls)
+      r.i += 3
+      return
+    if depth > 0 and not r.u and ((d >= '0' and d <= '9') or d == '_'):
+      add_ch(&r, start, r.i + 3, int(d) % 32, 3, depth, cls)
+      r.i += 3
+      return
+    if r.u:
+      rx_fail(&r, r.i, "Invalid unicode escape")
+      return
+    # Annex B: the backslash is a character, and 'c' starts the next term
+    add_ch(&r, start, r.i + 1, 92, 0, depth, cls)
+    r.i += 1
+    return
+  if c == '0' and not (at(r, r.i + 2) >= '0' and at(r, r.i + 2) <= '9'):
+    add_ch(&r, start, r.i + 2, 0, 4, depth, cls)
+    r.i += 2
+    return
+  if c == '0' or (depth > 0 and c >= '1' and c <= '9'):
+    if r.u:
+      rx_fail(&r, r.i, "Invalid class escape")
+      return
+    if c >= '8':
+      add_ch(&r, start, r.i + 2, int(c), 1, depth, cls)
+      r.i += 2
+      return
+    legacy_octal(&r, start, 7, depth, cls)
+    return
+  if c == 'x':
+    let h1 = hex(at(r, r.i + 2))
+    let h2 = hex(at(r, r.i + 3))
+    if h1 >= 0 and h2 >= 0:
+      add_ch(&r, start, r.i + 4, h1 * 16 + h2, 5, depth, cls)
+      r.i += 4
+      return
+    if r.u:
+      rx_fail(&r, r.i, "Invalid escape")
+      return
+    add_ch(&r, start, r.i + 2, 120, 1, depth, cls)
+    r.i += 2
+    return
+  if c == 'u':
+    let v = unicode_escape(&r)
+    if v >= 0:
+      add_ch(&r, start, r.i, v, 6, depth, cls)
+      return
+    if r.err != "": return
+    add_ch(&r, start, r.i + 2, 117, 1, depth, cls)
+    r.i += 2
+    return
+  # identity escapes
+  let cp = cp_at(r.src, r.i + 1)
+  if r.u:
+    if not (is_syntax(c) or c == '/' or (depth > 0 and c == '-')):
+      rx_fail(&r, r.i, "Invalid escape")
+      return
+  elif c == 'k' and r.named:
+    rx_fail(&r, r.i, "Invalid named reference")
+    return
+  add_ch(&r, start, r.i + 1 + cp[1], cp[0], 1, depth, cls)
+  r.i += 1 + cp[1]
+
+# \uXXXX, \u{X...} (u mode), and surrogate pairs in u mode; -1 if not one.
+fn unicode_escape(var r: Rx) -> Int:
+  let j = r.i + 2
+  if r.u and at(r, j) == '{':
+    var k = j + 1
+    var v = 0
+    while k < r.src.len and hex(r.src[k]) >= 0:
+      v = v * 16 + hex(r.src[k])
+      if v > 0x10FFFF:
+        rx_fail(&r, r.i, "Invalid unicode escape")
+        return -1
+      k += 1
+    if k == j + 1 or at(r, k) != '}':
+      rx_fail(&r, r.i, "Invalid unicode escape")
+      return -1
+    r.i = k + 1
+    return v
+  var v = 0
+  for d in 0..4:
+    let h = hex(at(r, j + d))
+    if h < 0:
+      if r.u: rx_fail(&r, r.i, "Invalid unicode escape")
+      return -1
+    v = v * 16 + h
+  r.i = j + 4
+  if r.u and v >= 0xD800 and v <= 0xDBFF and at(r, r.i) == '\\' and at(r, r.i + 1) == 'u':
+    var lo = 0
+    var ok = true
+    for d in 0..4:
+      let h = hex(at(r, r.i + 2 + d))
+      if h < 0: ok = false
+      else: lo = lo * 16 + h
+    if ok and lo >= 0xDC00 and lo <= 0xDFFF:
+      r.i += 6
+      return 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00)
+  return v
+
+fn char_class(var r: Rx):
+  let start = r.i
+  r.i += 1
+  var negated = false
+  if peek(r) == '^':
+    negated = true
+    r.i += 1
+  let before = r.ch.len
+  var any = false
+  if r.v:
+    any = class_set(&r, start, 1)
+  else:
+    var prev_atom = -1      # index in ch of the previous single character (for ranges)
+    var prev_class = false  # the previous atom was a class escape like \d
+    while r.i < r.src.len and peek(r) != ']' and r.err == "":
+      any = true
+      let c = peek(r)
+      if c == '-' and (prev_atom >= 0 or prev_class) and at(r, r.i + 1) != ']' and at(r, r.i + 1) != 0:
+        # a range
+        let dash = r.i
+        r.i += 1
+        let rb = r.ch.len
+        let rc = class_atom(&r, start)
+        if r.err != "": return
+        if prev_class or rc:
+          if r.u:
+            rx_fail(&r, dash, "Invalid character class range")
+            return
+        elif rb < r.ch.len and prev_atom >= 0:
+          r.ch[prev_atom + 4] = r.ch[prev_atom + 4] | 64
+          r.ch[rb + 4] = r.ch[rb + 4] | 32
+          let lo = r.ch[prev_atom + 2]
+          let hi = r.ch[rb + 2]
+          if lo > hi:
+            rx_fail(&r, dash, "Character class atom range out of order")
+            return
+        prev_atom = -1
+        prev_class = false
+        continue
+      let cb = r.ch.len
+      let isc = class_atom(&r, start)
+      prev_class = isc
+      if not isc and r.ch.len > cb and r.ch[cb + 3] != 99: prev_atom = cb
+      else: prev_atom = -1
+  if peek(r) != ']':
+    rx_fail(&r, start, "Unterminated character class")
+    return
+  r.i += 1
+  if not any and not negated: r.empty.push(start)
+  let after = r.ch.len
+  # each character of this class gets the class's end (for the rules that look at the last one)
+  var x = before
+  while x < after:
+    if r.ch[x + 5] == start: r.ch[x + 4] = r.ch[x + 4] | (r.i << 8)
+    x += 6
+
+# One class atom; returns true for a class escape (\d, \w, \p{...}).
+fn class_atom(var r: Rx, cls: Int) -> Bool:
+  let c = peek(r)
+  if c == '\\':
+    let d = at(r, r.i + 1)
+    if d == 0:
+      rx_fail(&r, r.i, "Terminated with backslash")
+      return false
+    if d == 'd' or d == 'D' or d == 's' or d == 'S' or d == 'w' or d == 'W':
+      add_ch(&r, r.i, r.i + 2, -1, 99, 1, cls)
+      r.i += 2
+      return true
+    if (d == 'p' or d == 'P') and r.u:
+      let ps = r.i
+      property_escape(&r)
+      add_ch(&r, ps, r.i, -1, 99, 1, cls)
+      return true
+    if d == 'b':
+      add_ch(&r, r.i, r.i + 2, 8, 2, 1, cls)
+      r.i += 2
+      return false
+    if d == '-' and r.u:
+      add_ch(&r, r.i, r.i + 2, 45, 1, 1, cls)
+      r.i += 2
+      return false
+    character_escape(&r, 1, cls)
+    return false
+  let cp = cp_at(r.src, r.i)
+  add_ch(&r, r.i, r.i + cp[1], cp[0], 0, 1, cls)
+  r.i += cp[1]
+  return false
+
+# The v flag's class contents (nested classes, && and --, \q{...}); returns whether it had any.
+fn class_set(var r: Rx, cls: Int, depth: Int) -> Bool:
+  var any = false
+  while r.i < r.src.len and peek(r) != ']' and r.err == "":
+    any = true
+    let c = peek(r)
+    if c == '[':
+      let s = r.i
+      r.i += 1
+      var neg = false
+      if peek(r) == '^':
+        neg = true
+        r.i += 1
+      let inner = class_set(&r, s, depth + 1)
+      if peek(r) != ']':
+        rx_fail(&r, r.i, "Unterminated character class")
+        return any
+      r.i += 1
+      if not inner and not neg: r.empty.push(s)
+    elif (c == '&' and at(r, r.i + 1) == '&') or (c == '-' and at(r, r.i + 1) == '-'):
+      r.i += 2
+    elif c == '\\' and at(r, r.i + 1) == 'q' and at(r, r.i + 2) == '{':
+      var j = r.i + 3
+      while j < r.src.len and r.src[j] != '}':
+        if r.src[j] == '\\': j += 1
+        j += 1
+      r.i = j + 1
+    elif c == '-':
+      r.i += 1
+    else:
+      let isc = class_atom(&r, cls)
+      let unused = isc
+  return any
+
+# Duplicate group names are allowed only in different alternatives.
+fn check_names(var r: Rx):
+  var seen: {Str: Int} = {}
+  for g in 0..r.nk.len:
+    if r.nk[g] != 3 or r.gname[g] == "": continue
+    let nm = r.gname[g]
+    if nm in seen:
+      if not different_alternatives(r, seen[nm], g):
+        rx_fail(&r, r.ns[seen[nm]] + 3, "Duplicated capturing group names")
+        return
+    else: seen[nm] = g
+
+fn ancestors(r: Rx, n: Int) -> [Int]:
+  var out: [Int] = []
+  var x = n
+  while x >= 0:
+    out.push(x)
+    x = r.np[x]
+  return out
+
+fn different_alternatives(r: Rx, a: Int, b: Int) -> Bool:
+  let pa = ancestors(r, a)
+  let pb = ancestors(r, b)
+  for x in pa:
+    if r.nk[x] == 2:
+      for y in pb:
+        if r.nk[y] == 2 and r.np[x] == r.np[y] and x != y: return true
+  return false
+
+fn check_refs(var r: Rx):
+  # \k<name> without such a group is checked while parsing; numbered ones beyond the count fail in u mode
+  let unused = r.ngroups
+
+# The capturing group a backreference refers to (-1 if none).
+fn ref_group(r: Rx, b: Int) -> Int:
+  for g in 0..r.nk.len:
+    if r.nk[g] != 3: continue
+    if r.gnum[b] > 0 and r.gnum[g] == r.gnum[b]: return g
+    if r.gnum[b] < 0 and r.gname[b] != "" and r.gname[g] == r.gname[b]: return g
+  return -1
+

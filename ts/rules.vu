@@ -4,6 +4,8 @@
 import scan
 import ast
 import parse
+import regex
+import scope
 from scan import T_ASSIGN, T_EQ2, T_EQ3, T_NE, T_NE2, T_LT, T_GT, T_LE, T_GE, T_AND, T_OR, T_QQ, T_BANG, T_MINUS, T_PLUS, T_INC, T_DEC, T_COMMA
 
 type D:
@@ -23,10 +25,13 @@ type L:
   setter: Bool     # inside a setter's body
   yields: Int      # yields seen in the current function
   dirs: {Int: Bool}   # directive statements
-  declared: {Int: Bool}   # names declared anywhere in the file (until scopes are modeled)
+  sc: scope.Scopes
   elsep: {Int: Int}   # an if statement in an else branch -> the if it's the else of
   in_import: Bool
   setfns: {Int: Bool}   # functions that are a property descriptor's set
+  tagged: {Int: Bool}   # templates with a tag
+  fatal: Str            # an error that stops linting the file (as oxlint's parse errors do)
+  fatal_at: Int
 
 fn add(var l: L, pos: Int, rule: Str, msg: Str, help: Str):
   l.ds.push(D(pos, rule, msg, help))
@@ -50,7 +55,10 @@ fn text(l: L, n: Int) -> Str:
   return l.src[l.t.pos[n]..l.t.end[n]]
 
 fn global_name(l: L, n: Int, s: Str) -> Bool:
-  return id_is(l, n, s) and not (l.t.s[n] in l.declared)
+  return id_is(l, n, s) and is_global(l, n)
+
+fn is_global(l: L, n: Int) -> Bool:
+  return l.sc.res.get(n, -1) < 0
 
 fn is_space(c: Byte) -> Bool:
   return c == ' ' or c == '\t' or c == '\n' or c == '\r'
@@ -131,13 +139,23 @@ fn lint(path: Str, src: Str, var kw: {Str: Int}) -> [Str]:
     out.push("{path}:{lc[0]}:{lc[1]}: error vlint(parse): {pd[0].msg}")
     return out
   let root = t.k.len - 1
-  var l = L(t, src + "", [], [], [], [], false, 0, {}, {}, {}, false, {})
-  collect_declared(&l)
+  var bld = scope.build(t, root, path.endswith(".d.ts") or path.endswith(".d.mts") or path.endswith(".d.cts"))
+  var t2 = ast.new_ast()
+  swap(&t2, &bld.t)
+  var sc = scope.new_scopes()
+  swap(&sc, &bld.sc)
+  var l = L(t2, src + "", [], [], [], [], false, 0, {}, sc, {}, false, {}, {}, "", -1)
+  collect_elses(&l)
   mark_directives(&l, root)
   l.jt.push(5)
   l.jl.push(-1)
   l.jused.push(false)
   visit(&l, root)
+  scope_rules(&l)
+  if l.fatal != "":
+    let lc = line_col(src, l.fatal_at)
+    out.push("{path}:{lc[0]}:{lc[1]}: error: {l.fatal}")
+    return out
   # sorted by position, then rule (stable for the rest)
   var idx: [Int] = []
   for i in 0..l.ds.len: idx.push(i)
@@ -148,25 +166,13 @@ fn lint(path: Str, src: Str, var kw: {Str: Int}) -> [Str]:
   var at = 0
   for i in idx:
     let d = l.ds[i]
-    # (positions only grow: line and column carried along)
+    # (positions only grow: line and column, in bytes as oxlint counts them, carried along)
     while at < d.pos and at < src.len:
-      let ch = src[at]
-      if ch == '\n':
+      if src[at] == '\n':
         line += 1
         col = 1
-        at += 1
-      elif ch < 0x80:
-        col += 1
-        at += 1
-      elif ch >= 0xF0:
-        col += 2
-        at += 4
-      elif ch >= 0xE0:
-        col += 1
-        at += 3
-      else:
-        col += 1
-        at += 2
+      else: col += 1
+      at += 1
     if dv.len > 0 and suppressed(dv, d, line): continue
     var s = "{path}:{line}:{col}: warning {d.rule}: {d.msg}"
     if d.help != "": s = s + " help: " + d.help
@@ -292,31 +298,11 @@ fn line_col(src: Str, pos: Int) -> [Int]:
       i += 2
   return [line, col]
 
-# Every name bound by a declaration anywhere in the file (an over-approximation of shadowing).
-fn collect_declared(var l: L):
+fn collect_elses(var l: L):
   for n in 0..l.t.k.len:
-    let kd = l.t.k[n]
-    if kd == ast.N_IF:
+    if l.t.k[n] == ast.N_IF:
       let el = l.t.c[n]
       if el > 0 and l.t.k[el] == ast.N_IF: l.elsep[el] = n
-    elif kd == ast.N_FUNC or kd == ast.N_CLASS or kd == ast.N_ENUM or kd == ast.N_MODULE or kd == ast.N_FUNCEXPR or kd == ast.N_CLASSEXPR:
-      if l.t.s[n] > 0: l.declared[l.t.s[n]] = true
-    elif kd == ast.N_DECL or kd == ast.N_PARAM or kd == ast.N_BINDEL:
-      var tg = l.t.a[n]
-      if kd == ast.N_BINDEL: tg = l.t.b[n]
-      if tg > 0 and l.t.k[tg] == ast.N_ID: l.declared[l.t.s[tg]] = true
-    elif kd == ast.N_SHORTHAND:
-      l.declared[l.t.s[n]] = true
-    elif kd == ast.N_IMPORT:
-      for f in [l.t.b[n], l.t.c[n]]:
-        if f > 0: l.declared[l.t.s[f]] = true
-      let sp = l.t.d[n]
-      if sp > 0:
-        for i in 0..l.t.b[sp]:
-          let x = l.t.L[l.t.a[sp] + i]
-          l.declared[l.t.s[x]] = true
-    elif kd == ast.N_IMPORTEQ:
-      l.declared[l.t.s[n]] = true
 
 # Directive prologues: the string statements a file or function body starts with.
 fn mark_directives(var l: L, lst: Int):
@@ -457,7 +443,10 @@ fn check(var l: L, n: Int, kd: Int):
   elif kd == ast.N_BINARY: check_binary(&l, n)
   elif kd == ast.N_PREFIX:
     if l.t.f[n] == T_BANG: bool_ctx(&l, l.t.a[n])
+  elif kd == ast.N_POSTFIX or (kd == ast.N_PREFIX and (l.t.f[n] == T_INC or l.t.f[n] == T_DEC)):
+    if l.t.f[n] == T_INC or l.t.f[n] == T_DEC: ns_import_write(&l, n, l.t.a[n])
   elif kd == ast.N_DELETE:
+    ns_import_write(&l, n, l.t.a[n])
     if k(l, unparen(l, l.t.a[n])) == ast.N_ID:
       add(&l, l.t.pos[n], "eslint(no-delete-var)", "Variables should not be deleted", "Assign `undefined` to the variable instead of using `delete`. The `delete` operator is intended for removing properties from objects, not for variables.")
   elif kd == ast.N_IF:
@@ -536,7 +525,13 @@ fn check(var l: L, n: Int, kd: Int):
     if init > 0 and is_pattern(l, l.t.a[n]): unsafe_chain(&l, init)
   elif kd == ast.N_FORIN:
     if l.t.f[n] >= 1: unsafe_chain(&l, l.t.b[n])
-  elif kd == ast.N_TAGGED: unsafe_chain_obj(&l, l.t.a[n])
+  elif kd == ast.N_TAGGED:
+    unsafe_chain_obj(&l, l.t.a[n])
+    l.tagged[l.t.c[n]] = true
+  elif kd == ast.N_REGEX: regex_literal(&l, n)
+  elif kd == ast.N_STR: string_escapes(&l, n)
+  elif kd == ast.N_NOSUBTEMPL or kd == ast.N_TEMPL:
+    if not (n in l.tagged): template_escapes(&l, n)
   elif kd == ast.N_SWITCH: check_switch(&l, n)
   elif kd == ast.N_TRY: useless_catch(&l, n)
   elif kd == ast.N_SPEC or kd == ast.N_BINDEL: useless_rename(&l, n, kd)
@@ -601,12 +596,24 @@ fn check_binary(var l: L, n: Int):
   if op == T_ASSIGN or op == scan.T_ANDEQ or op == scan.T_OREQ or op == scan.T_QQEQ:
     self_assign(&l, a, b)
   if op == T_ASSIGN and is_pattern_expr(l, a): unsafe_chain(&l, b)
+  if is_assign_op(op): ns_import_write(&l, n, a)
   if op == T_ASSIGN:
     let ua = unparen(l, a)
     if (k(l, ua) == ast.N_OBJECT or k(l, ua) == ast.N_ARRAY) and ast.count(l.t, l.t.a[ua]) == 0:
       var what = "object"
       if k(l, ua) == ast.N_ARRAY: what = "array"
       add(&l, l.t.pos[ua], "eslint(no-empty-pattern)", "Empty {what} binding pattern", "Passing `null` or `undefined` will result in runtime error because `null` and `undefined` cannot be destructured.")
+
+# A write to a member of a namespace import (ns.x = 1, ns.x++, delete ns.x).
+fn ns_import_write(var l: L, n: Int, target: Int):
+  let t = unparen(l, target)
+  let kt = k(l, t)
+  if kt != ast.N_PROPACCESS and kt != ast.N_ELEMACCESS: return
+  let o = unparen(l, l.t.a[t])
+  if k(l, o) != ast.N_ID: return
+  let y = l.sc.res.get(o, -1)
+  if y >= 0 and (l.sc.yf[y] & scope.F_NSIMPORT) != 0:
+    add(&l, l.t.pos[n], "eslint(no-import-assign)", "Do not assign to imported bindings", "Imported bindings are readonly")
 
 fn is_pattern_expr(l: L, n: Int) -> Bool:
   let kd = k(l, n)
@@ -799,9 +806,9 @@ fn is_constant(l: L, n: Int, boolpos: Bool) -> Bool:
     if id_is(l, cal, "Boolean"):
       let args = l.t.c[n]
       if ast.count(l.t, args) == 0 or is_constant(l, ast.item(l.t, args, 0), true):
-        return not (l.t.s[cal] in l.declared)
+        return is_global(l, cal)
     return false
-  if kd == ast.N_ID: return name_of(l, n) == "undefined" and not (l.t.s[n] in l.declared)
+  if kd == ast.N_ID: return name_of(l, n) == "undefined" and is_global(l, n)
   return false
 
 fn bool_value(l: L, n: Int) -> Int:
@@ -1012,10 +1019,10 @@ fn check_new(var l: L, n: Int):
   unsafe_chain_obj(&l, l.t.a[n])
   if k(l, cal) == ast.N_ID:
     let nm = name_of(l, cal)
-    if (nm == "Symbol" or nm == "BigInt") and not (l.t.s[cal] in l.declared):
+    if (nm == "Symbol" or nm == "BigInt") and is_global(l, cal):
       add(&l, l.t.pos[n], "eslint(no-new-native-nonconstructor)", "`{nm}` cannot be called as a constructor.", "Remove the `new` operator to call `{nm}` as a function.")
     obj_call(&l, n, cal)
-    if nm == "Promise" and not (l.t.s[cal] in l.declared):
+    if nm == "Promise" and is_global(l, cal):
       let args = l.t.c[n]
       if ast.count(l.t, args) > 0:
         let a0 = unparen(l, ast.item(l.t, args, 0))
@@ -1025,11 +1032,12 @@ fn check_new(var l: L, n: Int):
     if nm == "Boolean":
       let args = l.t.c[n]
       if ast.count(l.t, args) > 0: bool_ctx(&l, ast.item(l.t, args, 0))
+    if nm == "RegExp" and is_global(l, cal): regexp_call(&l, n)
 
 fn obj_call(var l: L, n: Int, cal: Int):
   let nm = name_of(l, cal)
   if nm == "Math" or nm == "JSON" or nm == "Reflect" or nm == "Atomics" or nm == "Intl":
-    if not (l.t.s[cal] in l.declared):
+    if is_global(l, cal):
       add(&l, l.t.pos[n], "eslint(no-obj-calls)", "`{nm}` is not a function and cannot be called", "This call will throw a TypeError at runtime.")
 
 fn check_call(var l: L, n: Int):
@@ -1038,11 +1046,12 @@ fn check_call(var l: L, n: Int):
   if k(l, cal) == ast.N_ID:
     let nm = name_of(l, cal)
     obj_call(&l, n, cal)
-    if nm == "eval" and not (l.t.s[cal] in l.declared):
+    if nm == "eval" and is_global(l, cal):
       add(&l, l.t.pos[n], "eslint(no-eval)", "eval can be harmful.", "Avoid eval(). For JSON parsing use JSON.parse(); for dynamic property access use bracket notation (obj[key]); for other cases refactor to avoid evaluating strings as code.")
     if nm == "Boolean":
       let args = l.t.c[n]
       if ast.count(l.t, args) > 0: bool_ctx(&l, ast.item(l.t, args, 0))
+    if nm == "RegExp" and is_global(l, cal): regexp_call(&l, n)
   elif k(l, cal) == ast.N_PROPACCESS:
     let o = unparen(l, l.t.a[cal])
     let mn = name_of(l, cal)
@@ -1299,3 +1308,491 @@ fn useless_rename(var l: L, n: Int, kd: Int):
   let tg = l.t.b[n]
   if key > 0 and k(l, key) == ast.N_ID and k(l, tg) == ast.N_ID and l.t.s[key] == l.t.s[tg]:
     add(&l, l.t.pos[key], "eslint(no-useless-rename)", "Do not rename import, export, or destructured assignments to the same name", "Use the variable's original name or rename it to a different name")
+
+# ---- regular expressions
+
+fn regex_literal(var l: L, n: Int):
+  let raw = text(l, n)
+  var close = raw.len - 1
+  while close > 0 and raw[close] != '/': close -= 1
+  let pat = raw[1..close]
+  let flags = raw[close + 1..raw.len]
+  let base = l.t.pos[n] + 1
+  # flags
+  for i in 0..flags.len:
+    let c = flags[i]
+    if not (c == 'd' or c == 'g' or c == 'i' or c == 'm' or c == 's' or c == 'u' or c == 'v' or c == 'y'):
+      fatal(&l, base + close + i, "Invalid regular expression: Unknown flag")
+      return
+    for j in 0..i:
+      if flags[j] == c:
+        fatal(&l, base + close + i, "Invalid regular expression: Duplicated flag")
+        return
+  if flags.find("u") >= 0 and flags.find("v") >= 0:
+    fatal(&l, base + close, "Invalid regular expression: Invalid flag group")
+    return
+  let r = regex.parse(pat, flags)
+  if r.err != "":
+    fatal(&l, base + r.err_at, "Invalid regular expression: " + oxc_msg(r.err))
+    return
+  var map: [Int] = []
+  regex_rules(&l, r, base, map, true)
+
+fn fatal(var l: L, at: Int, msg: Str):
+  if l.fatal == "":
+    l.fatal = msg + ""
+    l.fatal_at = at
+
+fn oxc_msg(m: Str) -> Str:
+  if m == "Unterminated character class": return m + " help: Add the missing closing delimiter"
+  if m == "Numbers out of order in braced quantifier": return m + " help: In `{{n,m}}`, the minimum `n` must be less than or equal to the maximum `m`"
+  if m == "Duplicated capturing group names": return m + " help: Duplicate names must be in different alternatives"
+  if m == "Invalid unicode property name and/or value": return m + " help: Check the property name spelling or use a valid Unicode property"
+  if m == "Terminated with backslash": return "Invalid extended atom escape help: Use a valid escape sequence or remove the backslash"
+  if m == "Character class atom range out of order": return m + " help: In a character range `[a-z]`, the first character must have a smaller code point than the second"
+  return m
+
+# A source position for a pattern offset: the literal's start plus the offset, or through the map
+# from a string's cooked text to its source.
+fn rx_pos(base: Int, map: [Int], off: Int) -> Int:
+  if map.len == 0: return base + off
+  if off < map.len: return base + map[off]
+  return base + map[map.len - 1] + 1
+
+fn regex_rules(var l: L, r: regex.Rx, base: Int, map: [Int], literal: Bool):
+  # no-control-regex
+  var ctl = 0
+  var ctl_at = -1
+  var i = 0
+  while i < r.ch.len:
+    let v = r.ch[i + 2]
+    let kd = r.ch[i + 3]
+    # (oxlint passes over values from 2 to the number of groups, as if they were backreferences)
+    if v <= 0x1F and (kd == 0 or kd == 5 or kd == 6 or kd == 8) and not (v >= 2 and v <= r.ngroups):
+      if ctl == 0: ctl_at = rx_pos(base, map, r.ch[i])
+      ctl += 1
+    i += 6
+  if ctl > 0:
+    var m = "Unexpected control character"
+    if ctl > 1: m = "Unexpected control characters"
+    add(&l, ctl_at, "eslint(no-control-regex)", m, "Avoid matching control characters in regular expressions. If intentional, disable this rule for the expression.")
+  if not literal: return
+  # no-empty-character-class
+  for e in r.empty:
+    add(&l, base + e, "eslint(no-empty-character-class)", "Empty character class will not match anything", "Remove the empty character class: `[]`")
+  # no-useless-escape
+  i = 0
+  while i < r.ch.len:
+    if r.ch[i + 3] == 1: useless_rx_escape(&l, r, i, base)
+    i += 6
+  # no-useless-backreference
+  for b in 0..r.nk.len:
+    if r.nk[b] == 9: useless_backref(&l, r, b, base)
+  # no-misleading-character-class
+  misleading_class(&l, r, base)
+
+fn useless_rx_escape(var l: L, r: regex.Rx, i: Int, base: Int):
+  let start = r.ch[i]
+  let v = r.ch[i + 2]
+  let depth = r.ch[i + 4] & 31
+  let cls_end = r.ch[i + 4] >> 8
+  let cls = r.ch[i + 5]
+  if v > 127:
+    report_escape(&l, base + start, r.src[start + 1..r.ch[i + 1]])
+    return
+  let c = r.src[start + 1..start + 2]
+  let general = "\\bcdDfnpPrsStvwWxu0123456789]"
+  if depth > 0:
+    var allowed = general
+    if r.v: allowed = general + "q/[{{}}|()-!#%&*+,.:;<=>?@^`~$"
+    if allowed.find(c) >= 0: return
+    if c == "^" and cls + 1 == start: return
+    if c == "-" and not r.v and cls + 1 != start and r.ch[i + 1] != cls_end - 1: return
+  else:
+    if (general + "^/.$*+?[{{}}|()Bk").find(c) >= 0: return
+  report_escape(&l, base + start, c)
+
+fn report_escape(var l: L, at: Int, c: Str):
+  var shown = c + ""
+  if c == "'": shown = "\\'"
+  add(&l, at, "eslint(no-useless-escape)", "Unnecessary escape character '{shown}'", "Replace `\\{c}` with `{c}`.")
+
+fn useless_backref(var l: L, r: regex.Rx, b: Int, base: Int):
+  let g = regex.ref_group(r, b)
+  if g < 0: return
+  let bp = regex.ancestors(r, b)
+  let gp = regex.ancestors(r, g)
+  var why = ""
+  var nested = false
+  for x in bp:
+    if x == g: nested = true
+  if nested: why = "from within that group."
+  else:
+    var i = bp.len - 1
+    var j = gp.len - 1
+    while i >= 0 and j >= 0 and bp[i] == gp[j]:
+      i -= 1
+      j -= 1
+    let lca_idx = j + 1
+    # the lowest lookaround on the common path
+    var backward = false
+    var x = lca_idx
+    while x < gp.len:
+      let kd = r.nk[gp[x]]
+      if kd >= 5 and kd <= 8:
+        backward = kd >= 7
+        break
+      x += 1
+    var neg_cut = false
+    for y in 0..lca_idx:
+      let kd = r.nk[gp[y]]
+      if kd == 6 or kd == 8: neg_cut = true
+    if lca_idx > 0 and r.nk[gp[lca_idx - 1]] == 2: why = "which is in another alternative."
+    elif not backward and r.ne[b] <= r.ns[g]: why = "which appears before in the same lookbehind."
+    elif backward and r.ne[g] <= r.ns[b]: why = "which appears later in the pattern."
+    elif neg_cut: why = "which is in a negative lookaround."
+  if why == "": return
+  let braw = r.src[r.ns[b]..r.ne[b]]
+  let graw = r.src[r.ns[g]..r.ne[g]]
+  add(&l, base + r.ns[b], "eslint(no-useless-backreference)", "Backreference '{braw}' will be ignored. It references group '{graw}' {why}", "Consider revising the pattern to remove or relocate the backreference so it points to a group that can be matched at the time of evaluation.")
+
+fn misleading_class(var l: L, r: regex.Rx, base: Int):
+  # sequences of consecutive characters in each class (UTF-16 units without the u flag), split
+  # by class escapes and at ranges (a range's start ends one, its end starts the next)
+  var i = 0
+  var vals: [Int] = []
+  var poss: [Int] = []
+  var cls = -2
+  while i <= r.ch.len:
+    var flush = i == r.ch.len
+    if not flush and ((r.ch[i + 4] & 31) == 0 or r.ch[i + 5] != cls or r.ch[i + 3] == 99): flush = true
+    if flush:
+      if vals.len > 1: misleading_seq(&l, r, vals, poss, base)
+      vals = []
+      poss = []
+      if i < r.ch.len: cls = r.ch[i + 5]
+    if i == r.ch.len: break
+    if (r.ch[i + 4] & 31) > 0 and r.ch[i + 3] != 99:
+      let v = r.ch[i + 2]
+      if v >= 0x10000 and not r.u:
+        vals.push(0xD800 + ((v - 0x10000) >> 10))
+        poss.push(r.ch[i])
+        vals.push(0xDC00 + ((v - 0x10000) & 1023))
+        poss.push(r.ch[i])
+      else:
+        vals.push(v)
+        poss.push(r.ch[i])
+      if (r.ch[i + 4] & 64) != 0:
+        if vals.len > 1: misleading_seq(&l, r, vals, poss, base)
+        vals = []
+        poss = []
+    i += 6
+
+# oxlint's combining characters: the combining diacritical mark blocks and variation selectors.
+fn combining(c: Int) -> Bool:
+  return (c >= 0x300 and c <= 0x36F) or (c >= 0x1AB0 and c <= 0x1AFF) or (c >= 0x1DC0 and c <= 0x1DFF) or (c >= 0x20D0 and c <= 0x20FF) or (c >= 0xFE20 and c <= 0xFE2F) or (c >= 0xFE00 and c <= 0xFE0F) or (c >= 0xE0100 and c <= 0xE01EF)
+
+fn misleading_seq(var l: L, r: regex.Rx, vals: [Int], poss: [Int], base: Int):
+  for i in 1..vals.len:
+    let a = vals[i - 1]
+    let b = vals[i]
+    if not r.u and a >= 0xD800 and a <= 0xDBFF and b >= 0xDC00 and b <= 0xDFFF:
+      add(&l, base + poss[i - 1], "eslint(no-misleading-character-class)", "Unexpected surrogate pair in character class.", "Add the Unicode flag 'u'.")
+    if combining(b) and not combining(a):
+      add(&l, base + poss[i - 1], "eslint(no-misleading-character-class)", "Unexpected combining class in character class.", "Replace the character with its normalized form (NFC) or use Unicode code point escapes instead of combining sequences.")
+    if b >= 0x1F3FB and b <= 0x1F3FF and not (a >= 0x1F3FB and a <= 0x1F3FF):
+      add(&l, base + poss[i - 1], "eslint(no-misleading-character-class)", "Unexpected modified Emoji in character class.", "Use Unicode code point escapes instead of emoji modifiers in character classes.")
+    if b >= 0x1F1E6 and b <= 0x1F1FF and a >= 0x1F1E6 and a <= 0x1F1FF:
+      add(&l, base + poss[i - 1], "eslint(no-misleading-character-class)", "Unexpected regional indicator in character class.", "Use Unicode code point escapes (e.g., \\u{{1F1EF}} for the regional indicator symbol for 'J') instead of regional indicator symbol pairs in character classes.")
+    if a == 0x200D and i >= 2 and vals[i - 2] != 0x200D and b != 0x200D:
+      add(&l, base + poss[i - 2], "eslint(no-misleading-character-class)", "Unexpected joined character sequence in character class.", "Use Unicode code point escapes (e.g., \\u{{1F468}}\\u200D\\u{{1F469}} for '👨‍👩') instead of zero-width joiner sequences in character classes.")
+
+# RegExp(pattern, flags) with literal arguments
+fn regexp_call(var l: L, n: Int):
+  let args = l.t.c[n]
+  let na = ast.count(l.t, args)
+  if na == 0: return
+  let a0 = ast.item(l.t, args, 0)
+  let k0 = k(l, a0)
+  if k0 != ast.N_STR and k0 != ast.N_NOSUBTEMPL: return
+  var flags = ""
+  var flags_known = true
+  var a1 = -1
+  if na > 1:
+    a1 = ast.item(l.t, args, 1)
+    if k(l, a1) == ast.N_STR: flags = name_of(l, a1)
+    else: flags_known = false
+  var map: [Int] = []
+  let pat = cooked(l, a0, &map)
+  let base = l.t.pos[a0]
+  if flags_known and a1 > 0:
+    for i in 0..flags.len:
+      let c = flags[i]
+      var bad = not (c == 'd' or c == 'g' or c == 'i' or c == 'm' or c == 's' or c == 'u' or c == 'v' or c == 'y')
+      var msg = "Unknown flag"
+      if not bad:
+        for j in 0..i:
+          if flags[j] == c:
+            bad = true
+            msg = "Duplicated flag"
+      if bad:
+        if k0 == ast.N_STR: add(&l, l.t.pos[a1] + 1 + i, "eslint(no-invalid-regexp)", "Invalid regular expression: {msg}", "")
+        return
+  var r = regex.parse(pat, flags)
+  if r.err != "" and not flags_known:
+    let r2 = regex.parse(pat, "u")
+    if r2.err == "": return
+  if r.err != "":
+    if k0 == ast.N_STR:
+      let full = oxc_msg(r.err)
+      let hp = full.find(" help: ")
+      var msg = full + ""
+      var help = ""
+      if hp >= 0:
+        msg = full[0..hp]
+        help = full[hp + 7..full.len]
+      add(&l, rx_pos(base, map, r.err_at), "eslint(no-invalid-regexp)", "Invalid regular expression: {msg}", help)
+    return
+  regex_rules(&l, r, base, map, false)
+
+# A string literal's (or plain template's) value, with map[i] the source offset (from the
+# literal's start) of the value's byte i.
+fn cooked(l: L, n: Int, var map: [Int]) -> Str:
+  let raw = text(l, n)
+  var out: [Byte] = []
+  var i = 1
+  let end = raw.len - 1
+  while i < end:
+    let c = raw[i]
+    if c != '\\':
+      out.push(c)
+      map.push(i)
+      i += 1
+      continue
+    let d = raw[i + 1]
+    var cp = -1
+    var len = 2
+    if d == 'n': cp = 10
+    elif d == 't': cp = 9
+    elif d == 'r': cp = 13
+    elif d == 'b': cp = 8
+    elif d == 'f': cp = 12
+    elif d == 'v': cp = 11
+    elif d == '0' and not (i + 2 < end and raw[i + 2] >= '0' and raw[i + 2] <= '9'): cp = 0
+    elif d == 'x' and i + 3 < end + 1:
+      cp = regex.hex(raw[i + 2]) * 16 + regex.hex(raw[i + 3])
+      len = 4
+    elif d == 'u':
+      if raw[i + 2] == '{':
+        var j = i + 3
+        cp = 0
+        while j < end and raw[j] != '}':
+          cp = cp * 16 + regex.hex(raw[j])
+          j += 1
+        len = j + 1 - i
+      else:
+        cp = 0
+        for q in 0..4: cp = cp * 16 + regex.hex(raw[i + 2 + q])
+        len = 6
+    elif d == '\r':
+      if i + 2 < end and raw[i + 2] == '\n': len = 3
+    elif d == '\n':
+      len = 2
+    elif d >= '0' and d <= '7':
+      var j = i + 1
+      cp = 0
+      while j < end and j < i + 4 and raw[j] >= '0' and raw[j] <= '7' and cp * 8 + int(raw[j] - '0') <= 255:
+        cp = cp * 8 + int(raw[j] - '0')
+        j += 1
+      len = j - i
+    else:
+      let q = regex.cp_at(raw, i + 1)
+      cp = q[0]
+      len = 1 + q[1]
+    if cp >= 0:
+      var before = out.len
+      push_utf8(&out, cp)
+      while before < out.len:
+        map.push(i)
+        before += 1
+    i += len
+  return str(out)
+
+fn push_utf8(var out: [Byte], cp: Int):
+  if cp < 0x80: out.push(byte(cp))
+  elif cp < 0x800:
+    out.push(byte(0xC0 | (cp >> 6)))
+    out.push(byte(0x80 | (cp & 31)))
+  elif cp < 0x10000:
+    out.push(byte(0xE0 | (cp >> 12)))
+    out.push(byte(0x80 | ((cp >> 6) & 31)))
+    out.push(byte(0x80 | (cp & 31)))
+  else:
+    out.push(byte(0xF0 | (cp >> 18)))
+    out.push(byte(0x80 | ((cp >> 12) & 31)))
+    out.push(byte(0x80 | ((cp >> 6) & 31)))
+    out.push(byte(0x80 | (cp & 31)))
+
+# ---- string escapes
+
+fn string_escapes(var l: L, n: Int):
+  let p0 = l.t.pos[n]
+  let e = l.t.end[n]
+  if e - p0 < 2: return
+  let q = l.src[p0]
+  if q != '"' and q != '\'': return
+  var i = p0 + 1
+  while i < e - 1:
+    if l.src[i] != '\\':
+      i += 1
+      continue
+    let c = l.src[i + 1]
+    if c == '8' or c == '9':
+      add(&l, i, "eslint(no-nonoctal-decimal-escape)", "Don't use '\\{l.src[i + 1..i + 2]}' escape sequence.", "Use the actual character or a valid escape sequence instead.")
+      i += 2
+      continue
+    if (c >= '0' and c <= '9') or c == '\\' or c == 'n' or c == 'r' or c == 'v' or c == 't' or c == 'b' or c == 'f' or c == 'u' or c == 'x' or c == '\n' or c == '\r' or c == q:
+      i += 2
+      continue
+    let cp = regex.cp_at(l.src, i + 1)
+    if cp[0] == 0x2028 or cp[0] == 0x2029:
+      i += 1 + cp[1]
+      continue
+    report_escape(&l, i, l.src[i + 1..i + 1 + cp[1]])
+    i += 1 + cp[1]
+
+fn template_escapes(var l: L, n: Int):
+  # each piece of literal text: from the start (or a '}') to the next '${' or the closing '`'
+  var i = l.t.pos[n] + 1
+  let e = l.t.end[n]
+  var spans: [Int] = []
+  if l.t.k[n] == ast.N_TEMPL:
+    let lst = l.t.a[n]
+    for j in 0..ast.count(l.t, lst): spans.push(ast.item(l.t, lst, j))
+  var si = 0
+  while i < e:
+    let c = l.src[i]
+    if c == '`' and si >= spans.len: return
+    if c == '$' and i + 1 < e and l.src[i + 1] == '{' and si < spans.len:
+      # skip the expression: to just past the '}' after it
+      let ex = l.t.a[spans[si]]
+      si += 1
+      var j = l.t.end[ex]
+      j = skip_to_op(l, j)
+      while j < e and l.src[j] != '}': j += 1
+      i = j + 1
+      continue
+    if c != '\\':
+      i += 1
+      continue
+    let d = l.src[i + 1]
+    if (d >= '0' and d <= '9') or d == '\\' or d == 'n' or d == 'r' or d == 'v' or d == 't' or d == 'b' or d == 'f' or d == 'u' or d == 'x' or d == '\n' or d == '\r' or d == '`':
+      i += 2
+      continue
+    if d == '$':
+      if i + 2 < e and l.src[i + 2] == '{':
+        i += 2
+        continue
+    elif d == '{':
+      if l.src[i - 1] == '$':
+        i += 2
+        continue
+    let cp = regex.cp_at(l.src, i + 1)
+    if cp[0] == 0x2028 or cp[0] == 0x2029:
+      i += 1 + cp[1]
+      continue
+    report_escape(&l, i, l.src[i + 1..i + 1 + cp[1]])
+    i += 1 + cp[1]
+
+# ---- rules on symbols
+
+fn scope_rules(var l: L):
+  let n = l.sc.yn.len
+  for y in 0..n:
+    let kind = l.sc.yk[y]
+    let fl = l.sc.yf[y]
+    let name = l.t.names[l.sc.yn[y]] + ""
+    let at = l.sc.ypos[y]
+    # no-shadow-restricted-names
+    if kind != scope.Y_MEMBER and kind != scope.Y_TPARAM and kind != scope.Y_TYPE and kind != scope.Y_INTERFACE and kind != scope.Y_IMPORTTYPE:
+      if name == "NaN" or name == "Infinity" or name == "eval" or name == "arguments" or name == "globalThis" or (name == "undefined" and ((fl & scope.F_INIT) != 0 or l.sc.writes[y] > 0 or kind != scope.Y_VAR)):
+        add(&l, at, "eslint(no-shadow-restricted-names)", "Shadowing of global properties such as `undefined` is not allowed.", "Rename '{name}' to avoid shadowing the global property.")
+    # no-const-assign, no-class-assign
+    if kind == scope.Y_CONST or kind == scope.Y_USING:
+      for i in 0..l.sc.writes[y]:
+        add(&l, at, "eslint(no-const-assign)", "Unexpected re-assignment of `const` variable {name}.", "Use `let` instead of `const` if you need to reassign this variable.")
+    if kind == scope.Y_CLASS:
+      for i in 0..l.sc.writes[y]:
+        add(&l, at, "eslint(no-class-assign)", "Unexpected re-assignment of class {name}", "Use a different variable name instead of re-assigning the class declaration.")
+    # no-unassigned-vars
+    if (kind == scope.Y_LET or kind == scope.Y_VAR) and (fl & (scope.F_FORIN | scope.F_AMBIENT | scope.F_KEEP | scope.F_PATTERN)) == 0 and l.sc.writes[y] == 0 and l.sc.anyref[y] > 0:
+      if (fl & scope.F_INIT) == 0: add(&l, at, "eslint(no-unassigned-vars)", "'{name}' is always 'undefined' because it's never assigned.", "Variable declared without assignment. Either assign a value or remove the declaration.")
+      for i in 0..l.sc.xsym.len:
+        if l.sc.xsym[i] == y and not l.sc.xinit[i]: add(&l, l.sc.xpos[i], "eslint(no-unassigned-vars)", "'{name}' is always 'undefined' because it's never assigned.", "Variable declared without assignment. Either assign a value or remove the declaration.")
+    unused_var(&l, y)
+  # writes: no-func-assign, no-ex-assign, no-import-assign, no-global-assign
+  for i in 0..l.sc.wsym.len:
+    let y = l.sc.wsym[i]
+    let at = l.sc.wat[i]
+    if y < 0:
+      let gname = l.t.names[l.sc.wname[i]] + ""
+      if readonly_global(gname):
+        add(&l, at, "eslint(no-global-assign)", "Read-only global '{gname}' should not be modified.", "Use a local variable instead of modifying the global '{gname}'.")
+      continue
+    let kind = l.sc.yk[y]
+    let name = l.t.names[l.sc.yn[y]] + ""
+    if kind == scope.Y_FUNC:
+      add(&l, at, "eslint(no-func-assign)", "'{name}' is a function.", "Do not re-assign a function declared as a FunctionDeclaration.")
+    elif kind == scope.Y_CATCH:
+      add(&l, at, "eslint(no-ex-assign)", "Do not assign to the exception parameter.", "Remove the assignment to the exception parameter, or refactor the code to use a different variable.")
+    elif kind == scope.Y_IMPORT or kind == scope.Y_IMPORTTYPE:
+      add(&l, l.sc.wexpr[i], "eslint(no-import-assign)", "Do not assign to imported bindings", "Imported bindings are readonly")
+
+fn readonly_global(n: Str) -> Bool:
+  for g in ["AggregateError", "Array", "ArrayBuffer", "Atomics", "BigInt", "BigInt64Array", "BigUint64Array", "Boolean", "DataView", "Date", "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent", "Error", "escape", "eval", "EvalError", "FinalizationRegistry", "Float32Array", "Float64Array", "Function", "globalThis", "Infinity", "Int16Array", "Int32Array", "Int8Array", "Intl", "isFinite", "isNaN", "JSON", "Map", "Math", "NaN", "Number", "Object", "parseFloat", "parseInt", "Promise", "Proxy", "RangeError", "ReferenceError", "Reflect", "RegExp", "Set", "SharedArrayBuffer", "String", "Symbol", "SyntaxError", "TypeError", "Uint16Array", "Uint32Array", "Uint8Array", "Uint8ClampedArray", "undefined", "unescape", "URIError", "WeakMap", "WeakRef", "WeakSet"]:
+    if n == g: return true
+  return false
+
+fn unused_var(var l: L, y: Int):
+  let kind = l.sc.yk[y]
+  let fl = l.sc.yf[y]
+  if (fl & (scope.F_EXPORTED | scope.F_KEEP | scope.F_BODYLESS)) != 0: return
+  if kind == scope.Y_MEMBER or kind == scope.Y_FNNAME or kind == scope.Y_CLASSNAME: return
+  if l.sc.reads[y] > 0: return
+  let name = l.t.names[l.sc.yn[y]] + ""
+  if l.sc.treads[y] > 0:
+    if name.startswith("_") and not (name == "_" and kind == scope.Y_PARAM): return
+    var what = "Variable"
+    if kind == scope.Y_PARAM: what = "Parameter"
+    elif kind == scope.Y_FUNC: what = "Function"
+    elif kind == scope.Y_CATCH: what = "Catch parameter"
+    var help = "Consider removing this declaration."
+    if kind == scope.Y_PARAM: help = "Consider removing this parameter."
+    add(&l, l.sc.ypos[y], "eslint(no-unused-vars)", "{what} '{name}' is declared but only used as a type.", help)
+    return
+  if name.startswith("_") and kind != scope.Y_CATCH and not (name == "_" and kind == scope.Y_PARAM): return
+  if kind == scope.Y_PARAM and (fl & scope.F_POSITIONAL) != 0:
+    # after-used: only parameters after the last one used
+    let f = l.sc.yfn[y]
+    var y2 = y + 1
+    while y2 < l.sc.yn.len and l.sc.yfn[y2] == f:
+      if l.sc.reads[y2] > 0 and l.sc.yk[y2] == scope.Y_PARAM: return
+      y2 += 1
+  let at = l.sc.ypos[y]
+  let rule = "eslint(no-unused-vars)"
+  if kind == scope.Y_VAR or kind == scope.Y_LET or kind == scope.Y_CONST or kind == scope.Y_USING:
+    if l.sc.writes[y] > 0: add(&l, at, rule, "Variable '{name}' is assigned a value but never used. Unused variables should start with a '_'.", "Did you mean to use this variable?")
+    else: add(&l, at, rule, "Variable '{name}' is declared but never used. Unused variables should start with a '_'.", "Consider removing this declaration.")
+  elif kind == scope.Y_TPARAM: add(&l, at, rule, "Variable '{name}' is declared but never used. Unused variables should start with a '_'.", "Consider removing this declaration.")
+  elif kind == scope.Y_FUNC: add(&l, at, rule, "Function '{name}' is declared but never used.", "Consider removing this declaration.")
+  elif kind == scope.Y_CLASS: add(&l, at, rule, "Class '{name}' is declared but never used.", "Consider removing this declaration.")
+  elif kind == scope.Y_PARAM:
+    if name.startswith("_"): add(&l, at, rule, "Parameter '{name}' is declared but never used.", "Consider removing this parameter.")
+    else: add(&l, at, rule, "Parameter '{name}' is declared but never used. Unused parameters should start with a '_'.", "Consider removing this parameter.")
+  elif kind == scope.Y_CATCH: add(&l, at, rule, "Catch parameter '{name}' is caught but never used.", "Consider handling this error.")
+  elif kind == scope.Y_IMPORT: add(&l, at, rule, "Identifier '{name}' is imported but never used.", "Consider removing this import.")
+  elif kind == scope.Y_IMPORTTYPE: add(&l, at, rule, "Type '{name}' is imported but never used.", "Consider removing this import.")
+  elif kind == scope.Y_TYPE: add(&l, at, rule, "Type alias '{name}' is declared but never used.", "Consider removing this declaration.")
+  elif kind == scope.Y_INTERFACE: add(&l, at, rule, "Interface '{name}' is declared but never used.", "Consider removing this declaration.")
+  elif kind == scope.Y_ENUM: add(&l, at, rule, "Enum '{name}' is declared but never used.", "Consider removing this declaration.")
+  elif kind == scope.Y_NAMESPACE: add(&l, at, rule, "Variable '{name}' is declared but never used.", "Consider removing this declaration.")
