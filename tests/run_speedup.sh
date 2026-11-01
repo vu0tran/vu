@@ -137,7 +137,8 @@ while x < 300.0:
     x = x * 1.37 + 0.011
 print('\n'.join(out))")
 if [ "$vu_out" = "$py_out" ]; then ok "Float methods (optimized build): the same bits as Python's math module and ** on $(printf '%s\n' "$vu_out" | wc -l | tr -d ' ') values each"
-else bad "Float methods against Python" "$(diff <(printf '%s\n' "$vu_out") <(printf '%s\n' "$py_out") 2>/dev/null | head -10)"; fi
+else printf '%s\n' "$vu_out" > "$work/fm_vu"; printf '%s\n' "$py_out" > "$work/fm_py"
+  bad "Float methods against Python" "$(diff "$work/fm_vu" "$work/fm_py" | head -10)"; fi
 
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]
