@@ -19,7 +19,7 @@
    what the program does.
 """
 import argparse, ast, copy, ctypes, ctypes.util, importlib.util, inspect, json, math, os, random
-import re, shutil, signal, subprocess, sys, tempfile, textwrap, time, typing, types, urllib.request
+import re, shutil, signal, subprocess, sys, tempfile, textwrap, time, typing, types, urllib.error, urllib.request
 
 VERSION = 1
 
@@ -1090,7 +1090,13 @@ def main():
             res = None
             for attempt in range(1, a.attempts + 1):
                 say(f"attempt {attempt}: asking {a.model}")
-                answer = ask_model(a.model, messages)
+                try:
+                    answer = ask_model(a.model, messages)
+                except urllib.error.HTTPError as e:
+                    detail = e.read().decode("utf-8", "replace")[:500]
+                    sys.exit(f"vu speedup: the model API answered {e.code}: {detail}")
+                except (urllib.error.URLError, OSError) as e:
+                    sys.exit(f"vu speedup: can't reach the model API: {getattr(e, 'reason', e)}")
                 port = code_block(answer)
                 messages.append({"role": "assistant", "content": answer})
                 ok, msg = build(a.vu, t, port, out_dir)

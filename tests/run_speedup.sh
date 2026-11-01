@@ -39,7 +39,7 @@ m="$work/model"; mkdir -p "$m/req"; cp "$top/examples/speedup/closematch/suggest
 P="$top/examples/speedup/closematch/close_matches.vu"
 sed 's/p.x > q.x/p.x < q.x/' "$P" > "$m/wrong.vu"; sed 's/word.codes()/word.codez()/' "$P" > "$m/broken.vu"
 $PY "$d/speedup/fake_model.py" "$m/port" "$m/req" "$m/broken.vu" "$m/wrong.vu" "$P" & fake=$!
-i=0; while [ ! -s "$m/port" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+i=0; while [ ! -s "$m/port" ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done
 out=$(cd "$m" && ANTHROPIC_API_KEY=test-key ANTHROPIC_BASE_URL="http://127.0.0.1:$(cat "$m/port")" PYTHON=$PY "$VU" speedup suggest.py:close_matches --no-apply --inputs 1500 2>&1)
 kill $fake 2>/dev/null
 fb1=$($PY -c "import json,sys; m=json.load(open(sys.argv[1]))['body']['messages']; print(m[-1]['content'][:200])" "$m/req/1.json" 2>&1)
@@ -53,6 +53,12 @@ else bad "the model loop" "$out
 $fb1
 $fb2
 key $key llms $llms"; fi
+
+# a model API it can't reach: one line saying so, no traceback
+out=$(cd "$m" && ANTHROPIC_API_KEY=test-key ANTHROPIC_BASE_URL="http://127.0.0.1:1" PYTHON=$PY "$VU" speedup suggest.py:close_matches --no-apply --inputs 200 2>&1); rc=$?
+if [ $rc -ne 0 ] && printf '%s' "$out" | grep -q "can't reach the model API" && ! printf '%s' "$out" | grep -q Traceback; then
+  ok "a model API it can't reach: said in one line"
+else bad "an unreachable model API" "$out"; fi
 
 # agent mode: no key, no port: the prompt is written, exit 2
 rm -rf "$work/agent"; mkdir "$work/agent"; cp "$top/examples/speedup/closematch/suggest.py" "$work/agent/"

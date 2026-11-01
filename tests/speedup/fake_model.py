@@ -24,5 +24,6 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 s = http.server.HTTPServer(("127.0.0.1", 0), H)
-with open(port_file, "w") as fh: fh.write(str(s.server_address[1]))
+with open(port_file + ".tmp", "w") as fh: fh.write(str(s.server_address[1]))
+os.replace(port_file + ".tmp", port_file)
 s.serve_forever()
