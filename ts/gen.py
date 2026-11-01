@@ -228,11 +228,75 @@ class G:
             else: out.append(self.misc())
         return "\n".join(out) + "\n"
 
+def module_pair(r, k):
+    """two files: b exports some of its declarations, a imports (some of) them and uses them"""
+    b = G(r, k)
+    b.n = 100
+    out_b = []
+    exported = []   # (kind, name, payload)
+    for _ in range(r.randint(0, 2)): out_b.append(b.iface())
+    for _ in range(r.randint(0, 2)): out_b.append(b.alias())
+    for _ in range(r.randint(2, 6)):
+        c = r.random()
+        if c < 0.5: out_b.append(b.decl())
+        elif c < 0.8: out_b.append(b.func())
+        else: out_b.append(b.misc())
+    # export some declarations by prefixing them
+    lines = []
+    for chunk in out_b:
+        first = chunk.split("\n")[0]
+        word = first.split(" ")[0]
+        if word in ("interface", "type", "function", "let", "const") and r.random() < 0.75 and not first.startswith("const xs"):
+            chunk = "export " + chunk
+            name = first.split(" ")[1].split("(")[0].split(":")[0]
+            exported.append(name)
+        lines.append(chunk)
+    a = G(r, k)
+    a.n = 200
+    for (n, props) in b.ifaces:
+        if n in exported: a.ifaces.append((n, props))
+    for (n, t) in b.aliases:
+        if n in exported: a.aliases.append((n, t))
+    for (n, ps, ret) in b.funcs:
+        if n in exported: a.funcs.append((n, ps, ret))
+    for (n, t) in b.vars:
+        if n in exported: a.vars.append((n, t))
+    names = list(exported)
+    r.shuffle(names)
+    specs = names[: r.randint(0, len(names))] if names else []
+    # imported but not used names vanish from a's knowledge
+    keep = set(specs)
+    a.ifaces = [x for x in a.ifaces if x[0] in keep]
+    a.aliases = [x for x in a.aliases if x[0] in keep]
+    a.funcs = [x for x in a.funcs if x[0] in keep]
+    a.vars = [x for x in a.vars if x[0] in keep]
+    if r.random() < 0.2: specs.append(r.choice(["nope", "missing", (names[0] + "x") if names else "zz"]))
+    if r.random() < 0.15 and b.vars: specs.append(b.vars[0][0])
+    imp = []
+    if specs: imp.append("import { " + ", ".join(specs) + f' }} from "./g{k:05d}_b"')
+    elif r.random() < 0.5: imp.append(f'import * as ns{k} from "./g{k:05d}_b"')
+    if r.random() < 0.08: imp.append(f'import {{ q }} from "./nowhere{k}"')
+    body = []
+    for _ in range(r.randint(2, 7)):
+        c = r.random()
+        if c < 0.35: body.append(a.decl())
+        elif c < 0.55: body.append(a.func())
+        elif c < 0.75: body.append(a.call())
+        else: body.append(a.misc())
+    if not imp: imp.append("export {}")
+    return "\n".join(imp + body) + "\n", "\n".join(lines) + "\n"
+
 def main():
     seed, count, outdir = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+    mods = "--modules" in sys.argv
     os.makedirs(outdir, exist_ok=True)
     for k in range(count):
         r = random.Random(seed * 100003 + k)
+        if mods and r.random() < 0.5:
+            pa, pb = module_pair(r, k)
+            with open(os.path.join(outdir, f"g{k:05d}.ts"), "w") as f: f.write(pa)
+            with open(os.path.join(outdir, f"g{k:05d}_b.ts"), "w") as f: f.write(pb)
+            continue
         with open(os.path.join(outdir, f"g{k:05d}.ts"), "w") as f:
             f.write(G(r, k).program())
 

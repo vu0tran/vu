@@ -3,10 +3,11 @@ Prints the files whose errors differ (first lines only) and a summary."""
 import subprocess, sys, os, collections, tempfile, shutil, time
 here = os.path.dirname(os.path.abspath(__file__))
 seed, count = int(sys.argv[1]), int(sys.argv[2])
-vtsc = sys.argv[3] if len(sys.argv) > 3 else "vtsc"
-tsc = sys.argv[4] if len(sys.argv) > 4 else "tsc"
+pos = [a for a in sys.argv[1:] if not a.startswith("--")]
+vtsc = pos[2] if len(pos) > 2 else "vtsc"
+tsc = pos[3] if len(pos) > 3 else "tsc"
 d = tempfile.mkdtemp()
-subprocess.run([sys.executable, os.path.join(here, "gen.py"), str(seed), str(count), d], check=True)
+subprocess.run([sys.executable, os.path.join(here, "gen.py"), str(seed), str(count), d] + [a for a in sys.argv if a == "--modules"], check=True)
 files = sorted(os.path.join(d, f) for f in os.listdir(d))
 def run(cmd):
     t = time.time()

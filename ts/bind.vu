@@ -74,6 +74,15 @@ fn binding_ids(c: C, n: Int, var out: [Int]):
     for e in ast.items(c.t, c.t.a[n]):
       if c.t.k[e] == ast.N_BINDEL: binding_ids(c, c.t.b[e], &out)
 
+fn dup_err(var c: C, nd: Int, name: Int):
+  var at = nd
+  if c.t.k[nd] == ast.N_SPEC and c.t.b[nd] >= 0: at = nd
+  let f = c.t.file[at]
+  let msg = "Duplicate identifier '" + nm(c, name) + "'."
+  for d in c.diags:
+    if d.file == f and d.pos == c.t.pos[at] and d.code == 2300: return
+  err(&c, at, 2300, msg)
+
 fn declare_in(var c: C, var vals: {Int: Int}, var tys: {Int: Int}, stmt: Int):
   let k = c.t.k[stmt]
   if k == ast.N_VAR:
@@ -132,6 +141,25 @@ fn declare_in(var c: C, var vals: {Int: Int}, var tys: {Int: Int}, stmt: Int):
       vals[name] = s
       tys[name] = s
       c.nsym[stmt] = s
+  elif k == ast.N_IMPORT:
+    # import d, * as ns, { a as b } from "m": aliases, resolved when used
+    var names: [Int] = []
+    if c.t.b[stmt] >= 0: names.push(c.t.b[stmt])
+    if c.t.c[stmt] >= 0: names.push(c.t.c[stmt])
+    if c.t.d[stmt] >= 0:
+      for sp in ast.items(c.t, c.t.d[stmt]): names.push(sp)
+    for nd in names:
+      let nmid = c.t.s[nd]
+      if nmid in vals and (c.sk[vals[nmid]] & types.S_IMPORT) != 0:
+        # two imports of one name: TS2300 at both
+        let first = c.sdecl[vals[nmid]]
+        dup_err(&c, first, nmid)
+        dup_err(&c, nd, nmid)
+        continue
+      let s = types.new_sym(&c, types.S_IMPORT, c.t.s[nd], nd)
+      vals[c.t.s[nd]] = s
+      tys[c.t.s[nd]] = s
+      c.nsym[nd] = s
   elif k == ast.N_MODULE:
     let nn = c.t.a[stmt]
     if (c.t.f[stmt] & ast.MOD_GLOBAL) != 0 or c.t.k[nn] == ast.N_STR: return
@@ -171,6 +199,290 @@ fn is_module(c: C, root: Int) -> Bool:
     if (k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_ENUM or k == ast.N_MODULE) and (c.t.f[st] & ast.M_EXPORT) != 0: return true
     if (k == ast.N_INTERFACE or k == ast.N_TYPEALIAS) and (c.t.d[st] & ast.M_EXPORT) != 0: return true
   return false
+
+# ---- modules
+
+# "a/./b/../c" -> "a/c" (a relative path stays relative).
+fn norm_path(p: Str) -> Str:
+  var parts: [Str] = []
+  let abs = p.startswith("/")
+  for seg in p.split("/"):
+    if seg == "" or seg == ".": continue
+    if seg == "..":
+      if parts.len > 0 and parts[parts.len - 1] != "..":
+        parts.pop()
+      elif not abs:
+        parts.push("..")
+      continue
+    parts.push(seg + "")
+  var out = "/".join(parts)
+  if abs: out = "/" + out
+  if out == "": out = "."
+  return out
+
+fn dir_of(p: Str) -> Str:
+  var i = p.len - 1
+  while i >= 0 and p[i] != '/': i -= 1
+  if i < 0: return "."
+  if i == 0: return "/"
+  return p[0..i]
+
+fn is_relative(spec: Str) -> Bool:
+  return spec.startswith("./") or spec.startswith("../") or spec == "." or spec == ".." or spec.startswith("/")
+
+# The files a relative module specifier may name, in the order TypeScript tries them.
+fn module_candidates(from_path: Str, spec: Str) -> [Str]:
+  var out: [Str] = []
+  if not is_relative(spec): return out
+  var base = spec + ""
+  if not spec.startswith("/"): base = norm_path(dir_of(from_path) + "/" + spec)
+  for pair in [[".js", ".ts"], [".jsx", ".tsx"], [".mjs", ".mts"], [".cjs", ".cts"]]:
+    if base.endswith(pair[0]):
+      let stem = base[0..base.len - pair[0].len]
+      out.push(stem + pair[1])
+      if pair[0] == ".js": out.push(stem + ".tsx")
+      out.push(stem + ".d" + pair[1])
+      return out
+  if base.endswith(".ts") or base.endswith(".tsx") or base.endswith(".mts") or base.endswith(".cts"):
+    out.push(base + "")
+  for ext in [".ts", ".tsx", ".d.ts"]: out.push(base + ext)
+  for ext in ["/index.ts", "/index.tsx", "/index.d.ts"]: out.push(base + ext)
+  return out
+
+# The file a module specifier names: -1 (and TS2307) when a relative one names nothing.
+fn resolve_module(var c: C, at: Int, spec_node: Int) -> Int:
+  let f = c.t.file[at]
+  let spec = nm(c, c.t.s[spec_node])
+  for cand in module_candidates(c.files[f], spec):
+    if cand in c.file_index: return c.file_index[cand]
+  if is_relative(spec):
+    err(&c, spec_node, 2307, "Cannot find module '" + spec + "' or its corresponding type declarations.")
+    return -1
+  unsupported(&c, spec_node, "a package import")
+  return -2
+
+fn error_sym(var c: C, name: Int, decl: Int) -> Int:
+  let s = types.new_sym(&c, S_CONST, name, decl)
+  c.stype[s] = c.error_t
+  c.sdtype[s] = c.error_t
+  return s
+
+# What an import alias names (the exported symbol), reporting a missing module or export once.
+fn resolve_alias(var c: C, s: Int) -> Int:
+  if s < 0 or (c.sk[s] & types.S_IMPORT) == 0: return s
+  if s in c.imp_target:
+    let r = c.imp_target[s]
+    if r == -2: return error_sym(&c, c.sname[s], c.sdecl[s])
+    return r
+  c.imp_target[s] = -2
+  let d = c.sdecl[s]
+  var imp = d
+  while imp >= 0 and c.t.k[imp] != ast.N_IMPORT: imp = up(c, imp)
+  var r = -1
+  if imp >= 0:
+    let g = resolve_module(&c, imp, c.t.a[imp])
+    if g >= 0:
+      let spec = nm(c, c.t.s[c.t.a[imp]])
+      if c.t.c[imp] == d:
+        r = namespace_sym(&c, g, d)
+      else:
+        var name = ast.intern(&c.t, "default")
+        var at = d
+        if c.t.k[d] == ast.N_SPEC:
+          name = c.t.s[d]
+          if c.t.b[d] >= 0:
+            name = c.t.s[c.t.b[d]]
+            at = c.t.b[d]
+        let ex = exp_of(&c, g, name)
+        if ex >= 0:
+          r = resolve_alias(&c, ex)
+        elif c.t.k[d] == ast.N_SPEC:
+          no_member(&c, g, at, "\"" + spec + "\"", name)
+        else:
+          err(&c, at, 1192, "Module '\"" + module_abs(c, g) + "\"' has no default export.")
+  if r < 0: r = error_sym(&c, c.sname[s], d)
+  c.imp_target[s] = r
+  return r
+
+# A module's absolute path without its extension, as TypeScript names a file's module symbol.
+fn module_abs(c: C, f: Int) -> Str:
+  var p = c.files[f] + ""
+  if not p.startswith("/"): p = norm_path(c.cwd + "/" + p)
+  for ext in [".d.ts", ".d.mts", ".d.cts", ".tsx", ".ts", ".mts", ".cts"]:
+    if p.endswith(ext): return p[0..p.len - ext.len]
+  return p
+
+# errorNoModuleMemberSymbol: a spelling suggestion (TS2724), the default-import hint (TS2614), a
+# local that isn't exported (TS2459 / TS2460), or TS2305.
+fn no_member(var c: C, g: Int, at: Int, mod: Str, name: Int):
+  let text = nm(c, name)
+  var cands: [Str] = []
+  for en in exp_names(&c, g): cands.push(nm(c, en))
+  let sug = spelling(text, cands)
+  if sug != "":
+    err(&c, at, 2724, "'" + mod + "' has no exported member named '" + text + "'. Did you mean '" + sug + "'?")
+    return
+  let dflt = ast.intern(&c.t, "default")
+  if exp_of(&c, g, dflt) >= 0:
+    err(&c, at, 2614, "Module '" + mod + "' has no exported member '" + text + "'. Did you mean to use 'import " + text + " from " + mod + "' instead?")
+    return
+  let root = c.roots[g]
+  scope_names(&c, root)
+  var local = -1
+  if name in c.locals[root]: local = c.locals[root][name]
+  elif name in c.ltypes[root]: local = c.ltypes[root][name]
+  if local < 0:
+    err(&c, at, 2305, "Module '" + mod + "' has no exported member '" + text + "'.")
+    return
+  for en in exp_names(&c, g):
+    if exp_of(&c, g, en) == local:
+      err(&c, at, 2460, "Module '" + mod + "' declares '" + text + "' locally, but it is exported as '" + nm(c, en) + "'.")
+      return
+  err(&c, at, 2459, "Module '" + mod + "' declares '" + text + "' locally, but it is not exported.")
+
+# getSpellingSuggestion: the closest candidate by (case-aware) edit distance, "" if none is close.
+fn spelling(name: Str, cands: [Str]) -> Str:
+  var max_diff = name.len * 34 / 100
+  if max_diff < 2: max_diff = 2
+  var best = float(name.len * 4 / 10) + 1.0
+  var out = ""
+  for cand in cands:
+    let d = cand.len - name.len
+    if d > max_diff or 0 - d > max_diff: continue
+    if cand == name: continue
+    if cand.len < 3 and cand.lower() != name.lower(): continue
+    let dist = levenshtein_max(name, cand, best - 0.1)
+    if dist < 0.0: continue
+    best = dist
+    out = cand + ""
+  return out
+
+fn levenshtein_max(s1: Str, s2: Str, mx: Float) -> Float:
+  var prev: [Float] = []
+  var cur: [Float] = []
+  let big = mx + 0.01
+  for i in 0..s2.len + 1:
+    prev.push(float(i))
+    cur.push(0.0)
+  let l1 = s1.lower()
+  let l2 = s2.lower()
+  for i in 1..s1.len + 1:
+    var min_j = 1
+    if float(i) > mx: min_j = int(float(i) - mx + 0.999999)
+    if min_j < 1: min_j = 1
+    var max_j = s2.len
+    if float(s2.len) > mx + float(i): max_j = int(mx + float(i))
+    cur[0] = float(i)
+    var col_min = float(i)
+    for j in 1..min_j: cur[j] = big
+    for j in min_j..max_j + 1:
+      var sub = prev[j - 1] + 2.0
+      if l1[i - 1] == l2[j - 1]: sub = prev[j - 1] + 0.1
+      var dist = prev[j - 1]
+      if s1[i - 1] != s2[j - 1]:
+        dist = prev[j] + 1.0
+        if cur[j - 1] + 1.0 < dist: dist = cur[j - 1] + 1.0
+        if sub < dist: dist = sub
+      cur[j] = dist
+      if dist < col_min: col_min = dist
+    for j in max_j + 1..s2.len + 1: cur[j] = big
+    if col_min > mx: return -1.0
+    swap(&prev, &cur)
+  let res = prev[s2.len]
+  if res > mx: return -1.0
+  return res
+
+# import * as ns: a value whose properties are the module's exported values.
+fn namespace_sym(var c: C, g: Int, decl: Int) -> Int:
+  let s = types.new_sym(&c, S_CONST, c.t.s[decl], decl)
+  c.ns_file[s] = g
+  let t = types.anon_obj(&c, s, decl)
+  for name in exp_names(&c, g):
+    let e0 = exp_of(&c, g, name)
+    let es = resolve_alias(&c, e0)
+    if (c.sk[es] & S_VALUE) != 0: types.add_prop(&c, t, name, es)
+  c.objs[c.ta[t]].resolved = true
+  c.stype[s] = t
+  return s
+
+# A module file's exports: exported declarations, export lists, re-exports and the default.
+fn exp_of(var c: C, f: Int, name: Int) -> Int:
+  ensure_exports(&c, f)
+  if not (f in c.mexports): return -1
+  if name in c.mexports[f]: return c.mexports[f][name]
+  return -1
+
+fn exp_names(var c: C, f: Int) -> [Int]:
+  ensure_exports(&c, f)
+  var out: [Int] = []
+  if not (f in c.mexports): return out
+  for k, v in c.mexports[f]: out.push(k)
+  out.sort()
+  return out
+
+fn ensure_exports(var c: C, f: Int):
+  if f in c.mexports: return
+  var out: {Int: Int} = {}
+  if f in c.mod_busy: return
+  c.mod_busy[f] = true
+  let root = c.roots[f]
+  scope_names(&c, root)
+  let dflt = ast.intern(&c.t, "default")
+  let stmts = ast.items(c.t, root)
+  for st in stmts:
+    let k = c.t.k[st]
+    if k == ast.N_VAR and (c.t.d[st] & ast.M_EXPORT) != 0:
+      for d in ast.items(c.t, c.t.a[st]):
+        var ids: [Int] = []
+        binding_ids(c, c.t.a[d], &ids)
+        for id in ids:
+          if id in c.nsym: out[c.t.s[id]] = c.nsym[id]
+    elif (k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_ENUM or k == ast.N_MODULE) and (c.t.f[st] & ast.M_EXPORT) != 0:
+      if st in c.nsym:
+        if (c.t.f[st] & ast.M_DEFAULT) != 0: out[dflt] = c.nsym[st]
+        else: out[c.sname[c.nsym[st]]] = c.nsym[st]
+    elif (k == ast.N_INTERFACE or k == ast.N_TYPEALIAS) and (c.t.d[st] & ast.M_EXPORT) != 0:
+      if st in c.nsym:
+        if (c.t.d[st] & ast.M_DEFAULT) != 0: out[dflt] = c.nsym[st]
+        else: out[c.t.s[st]] = c.nsym[st]
+    elif k == ast.N_EXPORTDEFAULT:
+      out[dflt] = default_sym(&c, st)
+  for st in stmts:
+    if c.t.k[st] != ast.N_EXPORT: continue
+    if c.t.a[st] >= 0:
+      let g = resolve_module(&c, st, c.t.a[st])
+      if g < 0: continue
+      if c.t.b[st] < 0:
+        if c.t.c[st] >= 0:
+          out[c.t.s[c.t.c[st]]] = namespace_sym(&c, g, c.t.c[st])
+        else:
+          for name in exp_names(&c, g):
+            if name != dflt and not (name in out): out[name] = exp_of(&c, g, name)
+      else:
+        for sp in ast.items(c.t, c.t.b[st]):
+          var src = c.t.s[sp]
+          if c.t.b[sp] >= 0: src = c.t.s[c.t.b[sp]]
+          let es = exp_of(&c, g, src)
+          if es >= 0: out[c.t.s[sp]] = es
+    elif c.t.b[st] >= 0:
+      for sp in ast.items(c.t, c.t.b[st]):
+        var local = c.t.s[sp]
+        if c.t.b[sp] >= 0: local = c.t.s[c.t.b[sp]]
+        if local in c.locals[root]: out[c.t.s[sp]] = c.locals[root][local]
+        elif local in c.ltypes[root]: out[c.t.s[sp]] = c.ltypes[root][local]
+  c.mexports[f] = out
+  c.mod_busy.remove(f)
+
+# export default expr: a name for the expression (an identifier exports what it names).
+fn default_sym(var c: C, st: Int) -> Int:
+  let e = c.t.a[st]
+  if c.t.k[e] == ast.N_ID:
+    let v = lookup_value(&c, st, c.t.s[e])
+    if v >= 0: return v
+    let ty = lookup_type(&c, st, c.t.s[e])
+    if ty >= 0: return ty
+  let dn = ast.intern(&c.t, "default")
+  return types.new_sym(&c, S_CONST, dn, st)
 
 # The names a scope node declares (a block, a file, a function's parameters...), collected once.
 fn scope_names(var c: C, scope: Int):
@@ -233,6 +545,11 @@ fn is_scope(c: C, n: Int) -> Bool:
 
 # A value name seen from node at: the innermost declaration, then the file, then the globals.
 fn lookup_value(var c: C, at: Int, name: Int) -> Int:
+  let s = lookup_value_raw(&c, at, name)
+  return resolve_alias(&c, s)
+
+# The same without following an import to what it names.
+fn lookup_value_raw(var c: C, at: Int, name: Int) -> Int:
   var n = at
   var prev = at
   while n >= 0:
@@ -265,7 +582,7 @@ fn lookup_type(var c: C, at: Int, name: Int) -> Int:
       let is_file = c.t.k[n] == ast.N_LIST
       if not is_file or file_is_module(&c, n):
         scope_names(&c, n)
-        if name in c.ltypes[n]: return c.ltypes[n][name]
+        if name in c.ltypes[n]: return resolve_alias(&c, c.ltypes[n][name])
     n = c.parent[n]
   if name in c.gtypes: return c.gtypes[name]
   return -1
