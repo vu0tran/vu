@@ -1,6 +1,6 @@
 """Fuzzy name matching with jellyfish's pure-Python functions (jellyfish 1.3.0, _jellyfish.py, MIT
-license, (c) James Turk), as they are, with type hints added and the deprecation warning taken out;
-and closest_names, which uses them the way record-matching code does."""
+license, (c) 2015 James Turk: LICENSE.jellyfish), as they are, with type hints added and the
+deprecation warning taken out; and closest_names, which uses them the way record-matching code does."""
 from collections import defaultdict
 
 

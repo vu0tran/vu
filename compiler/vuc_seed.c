@@ -132992,7 +132992,7 @@ VU_FN vu_str fn_rt_help(void) {
     #line 21744 "vuc.vu"
     VU_AT(21744);
     #line 21744 "vuc.vu"
-    ({ vu_str _t138 = vu_str_lit("      the original on thousands of inputs, measured, and swapped in (two lines after it). The port\n", 99); vu_str_cat(&v_s, &_t138); drop_Str(&_t138); });
+    ({ vu_str _t138 = vu_str_lit("      the original on thousands of inputs, measured, and swapped in (a few lines after it). The port\n", 101); vu_str_cat(&v_s, &_t138); drop_Str(&_t138); });
     #line 21745 "vuc.vu"
     VU_AT(21745);
     #line 21745 "vuc.vu"

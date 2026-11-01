@@ -29,7 +29,7 @@ suggest.py: close_matches now runs the Vu version (the lines after it say so; de
    the original's: same types, same values (floats to the last bit), the same exception class where
    it raises.
 4. **Measures it,** on the test inputs and on bigger ones, and swaps it in only if it's faster
-   (1.2x or more): two lines after your function, saying so. Delete them to undo.
+   (1.2x or more): a few lines after your function, saying so. Delete them to undo.
 
 The swapped-in function never changes what your program does. Anything the Vu version can't take
 runs your Python instead: an int over 64 bits, a string Python can't encode as UTF-8, an argument of

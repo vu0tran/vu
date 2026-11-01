@@ -921,7 +921,7 @@ vu speedup suggest.py:close_matches --prompt                  # what to give an 
   prompt gives the exact signature. Without `--port`, a model writes it in a loop that feeds back
   the compiler's errors and the answers that differ (`--attempts`, default 6).
 - It's swapped in only when it's faster (1.2x or more on the inputs; `--force` overrides, and
-  `--no-apply` only checks): two lines after the function, which say so. The Vu version runs only
+  `--no-apply` only checks): a few lines after the function, which say so. The Vu version runs only
   on what it can take; an int over 64 bits, a string Python can't encode, an argument of another
   type than the hint, a panic, or `fail "vu-speedup: fallback"` (a port handing a call back) run
   the original instead.

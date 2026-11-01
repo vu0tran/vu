@@ -20,6 +20,7 @@ cat <<RB
 class Vu < Formula
   desc "Compiled, memory-safe language with Python-style syntax that compiles to C"
   homepage "https://vulang.org"
+  license "MIT"
   version "$v"
 
   on_macos do

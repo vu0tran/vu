@@ -20,7 +20,7 @@ bad() { fail=$((fail+1)); echo "FAIL  $1"; [ -n "$2" ] && printf '%s\n' "$2" | h
 
 # the ports: same answers on every input
 for c in "closematch suggest close_matches" "names names jaro_winkler_similarity" "names names damerau_levenshtein_distance" \
-         "names names closest_names" "geo geo track_km" "geo geo nearest"; do
+         "names names closest_names" "geo geo track_km" "geo geo nearest" "demo typos did_you_mean"; do
   set -- $c
   rm -rf "$work/$1"; cp -r "$top/examples/speedup/$1" "$work/$1"; rm -rf "$work/$1/_vu_$2"
   out=$(cd "$work/$1" && PYTHON=$PY "$VU" speedup "$2.py:$3" --port "$3.vu" --no-apply --inputs 2000 2>&1)
