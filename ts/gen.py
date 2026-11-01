@@ -79,6 +79,7 @@ class G:
                 pn = pn.strip().rstrip("?")
                 if r.random() < 0.9: parts.append(f"{pn}: {self.value(pt, depth + 1)}")
             if r.random() < 0.1: parts.append(f"extra: {self.value('number', depth + 1)}")
+            self.spread_in(parts)
             return "{ " + ", ".join(parts) + " }"
         if t.startswith("("):
             pn = t[1]
@@ -91,10 +92,18 @@ class G:
                     if opt and r.random() < 0.5: continue
                     if r.random() < 0.93: parts.append(f"{pn}: {self.value(pt, depth + 1)}")
                 if r.random() < 0.08: parts.append(f"zz: 1")
+                self.spread_in(parts)
                 return "{ " + ", ".join(parts) + " }"
         for aname, at in self.aliases:
             if aname == t: return self.value(at, depth)
         return "0"
+
+    def spread_in(self, parts):
+        """--spreads: sometimes spread a variable of an object type into an object literal"""
+        if not getattr(self, "with_spreads", False) or self.r.random() > 0.5: return
+        cands = [v for v, vt in self.vars if vt.startswith("{") or any(vt == i for i, _ in self.ifaces) or vt.endswith("| undefined") and (vt.startswith("{") or vt.split(" |")[0] in [i for i, _ in self.ifaces])]
+        if not cands: return
+        parts.insert(self.r.randint(0, len(parts)), "..." + self.r.choice(cands))
 
     def var_of(self, t, any_=False):
         cands = [v for v, vt in self.vars if vt == t or any_]
@@ -436,6 +445,7 @@ def main():
         g = G(r, k)
         g.with_classes = "--classes" in sys.argv
         g.with_generics = "--generics" in sys.argv
+        g.with_spreads = "--spreads" in sys.argv
         with open(os.path.join(outdir, f"g{k:05d}.ts"), "w") as f:
             f.write(g.program())
 

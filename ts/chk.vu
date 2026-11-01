@@ -1529,9 +1529,20 @@ fn object_literal(var c: C, n: Int, ctx: Int) -> Int:
   let t = types.anon_obj(&c, -1, n)
   let o = c.ta[t]
   c.objs[o].fresh = true
+  var spread = false
+  var written: {Int: Bool} = {}
   for p in kids(c, c.t.a[n]):
     let pk = c.t.k[p]
-    if pk == ast.N_SPREAD: return unsup(&c, p, "a spread in an object literal")
+    if pk == ast.N_SPREAD:
+      let st = check_expr(&c, c.t.a[p], -1)
+      if is_any(c, st):
+        # tsc: a spread of any makes the literal any (the rest is still checked)
+        for q in kids(c, c.t.a[n]):
+          if q != p and c.t.k[q] == ast.N_PROPASSIGN: check_expr(&c, c.t.b[q], -1)
+        return unsup(&c, p, "a spread of any")
+      if not spread_into(&c, t, st, &written): return unsup(&c, p, "a spread in an object literal of this type")
+      spread = true
+      continue
     if pk == ast.N_GET or pk == ast.N_SET: return unsup(&c, p, "an accessor in an object literal")
     var name = -1
     var vt = c.any_t
@@ -1561,22 +1572,116 @@ fn object_literal(var c: C, n: Int, ctx: Int) -> Int:
     if name < 0: continue
     let ps = types.new_sym(&c, S_PROP, name, p)
     c.stype[ps] = vt
+    written[name] = true
     types.add_prop(&c, t, name, ps)
+  if spread: sort_props(&c, t)
   c.objs[o].resolved = true
   return t
+
+# getSpreadType: the properties of a spread object over those written before it. A spread prop
+# that's optional joins the earlier one's type; tsc drops class methods and private members.
+# False when the spread type isn't modeled here.
+fn spread_into(var c: C, t: Int, st0: Int, var written: {Int: Bool}) -> Bool:
+  # X | undefined (or null): X's properties, all optional
+  var st = -1
+  var maybe = false
+  for m in types.members(c, st0):
+    let k = c.tk[m]
+    if k == TK_UNDEF or k == TK_NULL: maybe = true
+    elif st >= 0: return false
+    else: st = m
+  if st < 0: return false
+  if c.tk[st] != TK_OBJ: return false
+  let so = c.ta[st]
+  let kind = c.objs[so].kind
+  if kind == types.OK_TUPLE or kind == types.OK_MAPPED or rel.is_array_ref(&c, st): return false
+  if tyops.is_generic(&c, st): return false
+  if bind.sigs_of(&c, st, false).len > 0 or bind.sigs_of(&c, st, true).len > 0: return false
+  if bind.index_type(&c, st, false) >= 0 or bind.index_type(&c, st, true) >= 0: return false
+  for name in bind.prop_names(&c, st):
+    let sp = bind.get_prop(&c, st, name)
+    if sp < 0: continue
+    let fl = c.sflags[sp]
+    if (fl & (types.SF_PRIVATE | types.SF_PROTECTED)) != 0:
+      # dropped, and an earlier property of the name with it
+      if name in c.objs[c.ta[t]].props: return false
+      continue
+    if (c.sk[sp] & S_METHOD) != 0 and c.sparent[sp] >= 0 and (c.sk[c.sparent[sp]] & types.S_CLASS) != 0: continue
+    var pt = bind.type_of_sym(&c, sp)
+    if c.tk[pt] == TK_UNSUP: return false
+    var opt = (fl & SF_OPTIONAL) != 0
+    if maybe and not opt:
+      pt = types.union_of(&c, [pt, c.undef_t])
+      opt = true
+    let o = c.ta[t]
+    if name in c.objs[o].props:
+      # a property written before the spread and replaced by it: its node would mislead elaboration
+      if name in written: return false
+      let old = c.objs[o].props[name]
+      if opt:
+        let ot = bind.type_of_sym(&c, old)
+        let ow = types.filter_union(&c, ot, true, false)
+        let nw = types.filter_union(&c, pt, true, false)
+        if ow != nw:
+          let ns = types.new_sym(&c, S_PROP, name, c.sdecl[old])
+          c.stype[ns] = types.union_of(&c, [ot, nw])
+          c.sflags[ns] = c.sflags[old] & SF_OPTIONAL
+          c.spread_syms[ns] = true
+          types.add_prop(&c, t, name, ns)
+        continue
+    let ns = types.new_sym(&c, S_PROP, name, c.sdecl[sp])
+    c.stype[ns] = pt
+    if opt: c.sflags[ns] = SF_OPTIONAL
+    c.spread_syms[ns] = true
+    types.add_prop(&c, t, name, ns)
+  return true
+
+# tsc 7 lists a spread object's properties by where they're declared.
+fn sort_props(var c: C, t: Int):
+  let o = c.ta[t]
+  var names = types.ints(c.objs[o].order)
+  var i = 1
+  while i < names.len:
+    var j = i
+    while j > 0 and decl_before(c, c.objs[o].props[names[j]], c.objs[o].props[names[j - 1]]):
+      let tmp = names[j]
+      names[j] = names[j - 1]
+      names[j - 1] = tmp
+      j -= 1
+    i += 1
+  c.objs[o].order = names
+
+fn decl_before(c: C, a: Int, b: Int) -> Bool:
+  let da = c.sdecl[a]
+  let db = c.sdecl[b]
+  if da < 0 or db < 0: return false
+  let fa = c.t.file[da]
+  let fb = c.t.file[db]
+  if fa != fb: return fa < fb
+  return c.t.pos[da] < c.t.pos[db]
 
 fn ctx_prop(var c: C, ctx: Int, name: Int) -> Int:
   if ctx < 0 or name < 0: return -1
   var ts: [Int] = []
   for m in types.members(c, ctx):
-    if c.tk[m] != TK_OBJ: continue
-    let ps = bind.get_prop(&c, m, name)
-    if ps >= 0: ts.push(bind.type_of_sym(&c, ps))
-    else:
-      let si = bind.index_type(&c, m, false)
-      if si >= 0: ts.push(si)
+    if c.tk[m] == TK_INTER:
+      # an intersection: the intersection of its members' property types
+      var its: [Int] = []
+      for x in types.members_inter(c, m):
+        let xt = ctx_prop1(&c, x, name)
+        if xt >= 0: its.push(xt)
+      if its.len > 0: ts.push(types.inter_of(&c, its))
+      continue
+    let mt = ctx_prop1(&c, m, name)
+    if mt >= 0: ts.push(mt)
   if ts.len == 0: return -1
   return types.union_of(&c, ts)
+
+fn ctx_prop1(var c: C, m: Int, name: Int) -> Int:
+  if c.tk[m] != TK_OBJ: return -1
+  let ps = bind.get_prop(&c, m, name)
+  if ps >= 0: return bind.type_of_sym(&c, ps)
+  return bind.index_type(&c, m, false)
 
 fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
   # a tuple when the contextual type is a tuple
@@ -1584,6 +1689,7 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
   var elem_ctx = -1
   if ctx >= 0:
     for m in types.members(c, ctx):
+      if c.tk[m] == TK_INTER: return unsup(&c, n, "an array literal with an intersection contextual type")
       if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_TUPLE: tuple_ctx = m
       elif rel.is_array_ref(&c, m): elem_ctx = c.objs[c.ta[m]].args[0]
   var ts: [Int] = []
@@ -1661,7 +1767,7 @@ fn widen_in_ctx(var c: C, x: Int, ctx: Int) -> Int:
 # Whether a literal keeps its literal type in this contextual type: one with literals of its kind.
 fn literal_of_ctx(var c: C, lit: Int, ctx: Int) -> Bool:
   let lk = c.tk[lit]
-  for m in types.members(c, ctx):
+  for m in types.parts(c, ctx):
     let k = c.tk[m]
     if k == TK_TPARAM: return true
     if lk == TK_STRLIT and k == TK_STRLIT: return true
@@ -1676,6 +1782,7 @@ fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
   if ctx >= 0:
     var found = 0
     for m in types.members(c, ctx):
+      if c.tk[m] == TK_INTER: return unsup(&c, n, "a function with an intersection contextual type")
       if c.tk[m] == TK_OBJ:
         let sgs = bind.sigs_of(&c, m, false)
         if sgs.len == 1:
