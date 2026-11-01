@@ -761,17 +761,25 @@ fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gov
     if not p.gen[fi]: roots.push(g.pk[pi].roots[fi])
   var nodes: [Int] = []
   swap(&nodes, &w.nodes)
+  appends(&g, &v, nodes)
   assign(&g, fs, &v, nodes)
+  atomic(&g, &v, nodes)
   bools(&g, fs, &v, nodes)
+  composites(&g, fs, &v, nodes)
   copylocks(&g, fs, &v, nodes, w.parent, gover)
+  defers(&g, &v, nodes)
+  errorsas(&g, fs, &v, nodes)
+  httpresponse(&g, fs, &v, p, nodes, w.parent)
   nilfunc(&g, &v, nodes)
   printf.run(&g, fs, &v, pi, roots, nodes, gover, &w.parent)
   shift(&g, fs, &v, nodes)
+  sigchanyzer(&g, &v, p, nodes)
   stringintconv(&g, fs, &v, nodes)
   structtag(&g, fs, &v, p, nodes)
   testinggoroutine(&g, fs, &v, p, roots)
   tests(&g, fs, &v, p)
   timeformat(&g, fs, &v, nodes)
+  unmarshal(&g, fs, &v, nodes)
   unreachable(&g, &v, nodes)
   unusedresult(&g, fs, &v, nodes)
   swap(&nodes, &w.nodes)
@@ -1173,3 +1181,258 @@ fn copylocks(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int], parent: [Int], gove
       for e in ast.items(g.pk[pi].t, l):
         let p = lock_path_rhs(&g, fs, pi, e)
         if p.len > 0: report(g, &v, e, "copylocks", "return copies lock value: " + path_str(p))
+
+# ---- small analyzers: appends, atomic, defers, errorsas, sigchanyzer, unmarshal, composites, httpresponse
+
+fn imports(g: tc.Prog, pi: Int, path: Str) -> Bool:
+  let lit = "\"" + path + "\""
+  for fi in 0..g.pk[pi].imps.len:
+    for im in g.pk[pi].imps[fi]:
+      if g.pk[pi].t.names[g.pk[pi].t.s[g.pk[pi].t.b[im]]] == lit: return true
+  return false
+
+fn builtin_callee(g: tc.Prog, pi: Int, call: Int) -> Str:
+  let f = unparen(g, pi, g.pk[pi].t.a[call])
+  if g.pk[pi].t.k[f] != ast.N_IDENT: return ""
+  let o = g.pk[pi].use[f]
+  if o < 0 or g.ok[o] != tc.O_BUILTIN: return ""
+  return g.oname[o] + ""
+
+fn appends(var g: tc.Prog, var v: V, nodes: [Int]):
+  let pi = v.pi
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_CALL: continue
+    if builtin_callee(g, pi, n) == "append" and ast.count(g.pk[pi].t, g.pk[pi].t.b[n]) == 1: report(g, &v, n, "appends", "append with no values")
+
+fn atomic(var g: tc.Prog, var v: V, nodes: [Int]):
+  let pi = v.pi
+  if not imports(g, pi, "sync/atomic"): return
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_ASSIGN: continue
+    let lhs = ast.items(g.pk[pi].t, g.pk[pi].t.a[n])
+    let rhs = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if lhs.len != rhs.len: continue
+    if lhs.len == 1 and g.pk[pi].t.f[n] == T_DEFINE: continue
+    for i in 0..rhs.len:
+      let r = rhs[i]
+      if g.pk[pi].t.k[r] != ast.N_CALL: continue
+      let o = callee(g, pi, r)
+      var hit = false
+      for nm in ["AddInt32", "AddInt64", "AddUint32", "AddUint64", "AddUintptr"]:
+        if is_func_named(g, o, "sync/atomic", nm): hit = true
+      if not hit: continue
+      let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[r])
+      if args.len != 2: continue
+      let a = args[0]
+      let left = lhs[i]
+      var broken = false
+      if g.pk[pi].t.k[a] == ast.N_UNARY and g.pk[pi].t.f[a] == scan.T_AND: broken = format.expr(g.pk[pi].t, left) == format.expr(g.pk[pi].t, g.pk[pi].t.a[a])
+      elif g.pk[pi].t.k[left] == ast.N_STAR: broken = format.expr(g.pk[pi].t, g.pk[pi].t.a[left]) == format.expr(g.pk[pi].t, a)
+      if broken: report(g, &v, left, "atomic", "direct assignment to atomic value")
+
+fn defers_in(var g: tc.Prog, var v: V, n: Int):
+  if n <= 0: return
+  let k = g.pk[v.pi].t.k[n]
+  if k == ast.N_FUNCLIT: return
+  if k == ast.N_CALL and is_func_named(g, callee(g, v.pi, n), "time", "Since"): report(g, &v, n, "defers", "call to time.Since is not deferred")
+  for c in resolve.kids(g.pk[v.pi].t, n): defers_in(&g, &v, c)
+
+fn defers(var g: tc.Prog, var v: V, nodes: [Int]):
+  let pi = v.pi
+  if not imports(g, pi, "time"): return
+  for n in nodes:
+    if g.pk[pi].t.k[n] == ast.N_DEFER: defers_in(&g, &v, g.pk[pi].t.a[n])
+
+fn is_universe_error(g: tc.Prog, t: Int) -> Bool:
+  return t > 0 and g.tk[t] == tc.TY_NAMED and g.oname[g.ta[t]] == "error" and g.opkg[g.ta[t]] < 0
+
+fn empty_iface(g: tc.Prog, u: Int) -> Bool:
+  return u > 0 and g.tk[u] == tc.TY_IFACE and tc.tlist(g, u).len == 0 and (g.tb[u] <= 0 or tc.tlist(g, g.tb[u]).len == 0)
+
+fn errorsas(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
+  let pi = v.pi
+  let path = g.pk[pi].path + ""
+  if path == "errors" or path == "errors_test": return
+  if not imports(g, pi, "errors"): return
+  let bad = "second argument to errors.As must be a non-nil pointer to either a type that implements error, or to any interface type"
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_CALL: continue
+    if not is_func_named(g, callee(g, pi, n), "errors", "As"): continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len < 2: continue
+    let t = ty(g, pi, args[1])
+    if t <= 0: continue
+    let u = tc.under(&g, fs, t)
+    if empty_iface(g, u): continue
+    if u <= 0 or g.tk[u] != tc.TY_PTR:
+      report(g, &v, n, "errorsas", bad)
+      continue
+    let el = g.ta[u]
+    if is_universe_error(g, el):
+      report(g, &v, n, "errorsas", "second argument to errors.As should not be *error")
+      continue
+    let eu = tc.under(&g, fs, el)
+    if (eu > 0 and g.tk[eu] == tc.TY_IFACE) or tc.implements_error(&g, fs, el): continue
+    report(g, &v, n, "errorsas", bad)
+
+fn find_decl(var g: tc.Prog, p: pkg.Pkg, pi: Int, id: Int) -> Int:
+  let po = p.pobj
+  if id >= po.len or po[id] < 0: return -1
+  let dident = po[id]
+  let d = p.pdecl[dident]
+  if d <= 0: return -1
+  let t = g.pk[pi].t
+  if t.k[d] == ast.N_ASSIGN:
+    let lhs = ast.items(t, t.a[d])
+    let rhs = ast.items(t, t.b[d])
+    if lhs.len != rhs.len: return -1
+    for i in 0..lhs.len:
+      if t.k[lhs[i]] == ast.N_IDENT and t.s[lhs[i]] == t.s[id]: return rhs[i]
+  elif t.k[d] == ast.N_VALUESPEC:
+    let names = ast.items(t, t.a[d])
+    let vals = ast.items(t, t.c[d])
+    if names.len != vals.len: return -1
+    for i in 0..names.len:
+      if t.s[names[i]] == t.s[id]: return vals[i]
+  return -1
+
+fn sigchanyzer(var g: tc.Prog, var v: V, p: pkg.Pkg, nodes: [Int]):
+  let pi = v.pi
+  if not imports(g, pi, "os/signal"): return
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_CALL: continue
+    var fun = g.pk[pi].t.a[n]
+    if g.pk[pi].t.k[fun] == ast.N_IDENT: fun = find_decl(&g, p, pi, fun)
+    if fun <= 0 or g.pk[pi].t.k[fun] != ast.N_SELECTOR: continue
+    var so = g.pk[pi].sobj.get(fun, -1)
+    if so < 0: so = g.pk[pi].use[g.pk[pi].t.b[fun]]
+    if so < 0 or g.oname[so] != "Notify" or obj_pkg_path(g, so) != "os/signal": continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len == 0: continue
+    let a = args[0]
+    var cd = -1
+    if g.pk[pi].t.k[a] == ast.N_IDENT:
+      let d = find_decl(&g, p, pi, a)
+      if d > 0 and g.pk[pi].t.k[d] == ast.N_CALL: cd = d
+    elif g.pk[pi].t.k[a] == ast.N_CALL:
+      if builtin_callee(g, pi, a) == "make" and g.pk[pi].t.k[g.pk[pi].t.a[a]] == ast.N_IDENT: continue
+      cd = a
+    if cd <= 0 or ast.count(g.pk[pi].t, g.pk[pi].t.b[cd]) != 1: continue
+    report(g, &v, n, "sigchanyzer", "misuse of unbuffered os.Signal channel as argument to signal.Notify")
+
+fn unmarshal(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
+  let pi = v.pi
+  let path = g.pk[pi].path + ""
+  if path == "encoding/gob" or path == "encoding/json" or path == "encoding/xml" or path == "encoding/asn1": return
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_CALL: continue
+    let o = callee(g, pi, n)
+    if o < 0: continue
+    if g.mowner.get(o, -1) >= 0: continue
+    let pp = obj_pkg_path(g, o)
+    var idx = -1
+    if g.oname[o] == "Unmarshal" and not is_method(g, o):
+      if pp == "encoding/json" or pp == "encoding/xml" or pp == "encoding/asn1": idx = 1
+    elif g.oname[o] == "Decode" and recv_type_name(g, o) == "Decoder":
+      if pp == "encoding/json" or pp == "encoding/xml" or pp == "encoding/gob": idx = 0
+    if idx < 0: continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len < idx + 1: continue
+    let t = ty(g, pi, args[idx])
+    if t <= 0: continue
+    let u = tc.under(&g, fs, t)
+    if u > 0 and (g.tk[u] == tc.TY_PTR or g.tk[u] == tc.TY_IFACE or g.tk[u] == tc.TY_TPARAM): continue
+    if g.tk[t] == tc.TY_TPARAM: continue
+    let lp = g.pk[pi].t.pos[g.pk[pi].t.b[n]]
+    if idx == 0: report_at(g, &v, g.pk[pi].t.file[n], lp, "unmarshal", "call of " + g.oname[o] + " passes non-pointer")
+    else: report_at(g, &v, g.pk[pi].t.file[n], lp, "unmarshal", "call of " + g.oname[o] + " passes non-pointer as second argument")
+
+fn composites(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
+  let pi = v.pi
+  var white: {Str: Bool} = {}
+  for s in ["image/color.Alpha16", "image/color.Alpha", "image/color.CMYK", "image/color.Gray16", "image/color.Gray", "image/color.NRGBA64", "image/color.NRGBA", "image/color.NYCbCrA", "image/color.RGBA64", "image/color.RGBA", "image/color.YCbCr", "image.Point", "image.Rectangle", "image.Uniform", "unicode.Range16", "unicode.Range32", "testing.InternalBenchmark", "testing.InternalExample", "testing.InternalTest", "testing.InternalFuzzTarget"]:
+    white[s] = true
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_COMPOSITE: continue
+    let t = ty(g, pi, n)
+    if t <= 0 or g.tk[t] == tc.TY_TPARAM: continue
+    let name = tc.type_str(&g, fs, t, "")
+    if name in white: continue
+    var base = t
+    if g.tk[base] == tc.TY_PTR: base = g.ta[base]
+    let u = tc.under(&g, fs, base)
+    if u <= 0 or g.tk[u] != tc.TY_STRUCT: continue
+    if g.tk[base] != tc.TY_NAMED: continue
+    let o = g.ta[base]
+    if g.opkg[o] < 0 or g.opkg[o] == pi: continue
+    var p1 = g.pk[g.opkg[o]].path + ""
+    var p2 = g.pk[pi].path + ""
+    if p1.endswith("_test"): p1 = p1[0..p1.len - 5]
+    if p2.endswith("_test"): p2 = p2[0..p2.len - 5]
+    if p1 == p2: continue
+    var allkv = true
+    for e in ast.items(g.pk[pi].t, g.pk[pi].t.b[n]):
+      if g.pk[pi].t.k[e] != ast.N_KEYVALUE: allkv = false
+    if allkv: continue
+    report(g, &v, n, "composites", name + " struct literal uses unkeyed fields")
+
+fn root_ident(g: tc.Prog, pi: Int, n: Int) -> Int:
+  var x = n
+  while x > 0 and g.pk[pi].t.k[x] == ast.N_SELECTOR: x = g.pk[pi].t.a[x]
+  if x > 0 and g.pk[pi].t.k[x] == ast.N_IDENT: return x
+  return -1
+
+fn is_named_type(g: tc.Prog, t: Int, path: Str, name: Str) -> Bool:
+  return t > 0 and g.tk[t] == tc.TY_NAMED and g.oname[g.ta[t]] == name and obj_pkg_path(g, g.ta[t]) == path
+
+fn httpresponse(var g: tc.Prog, fs: Fs, var v: V, p: pkg.Pkg, nodes: [Int], parent: [Int]):
+  let pi = v.pi
+  if not imports(g, pi, "net/http"): return
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_CALL: continue
+    let fun = g.pk[pi].t.a[n]
+    if g.pk[pi].t.k[fun] != ast.N_SELECTOR: continue
+    let st = ty(g, pi, fun)
+    if st <= 0 or g.tk[st] != tc.TY_FUNC: continue
+    let res = tc.tlist(g, g.tb[st])
+    if res.len != 2: continue
+    if g.tk[res[0]] != tc.TY_PTR or not is_named_type(g, g.ta[res[0]], "net/http", "Response"): continue
+    if not is_universe_error(g, res[1]): continue
+    let x = g.pk[pi].t.a[fun]
+    var xt = ty(g, pi, x)
+    if g.pk[pi].t.k[x] == ast.N_IDENT and g.pk[pi].use[x] >= 0 and g.ok[g.pk[pi].use[x]] == tc.O_PKGNAME: xt = 0
+    if xt <= 0:
+      if not (g.pk[pi].t.k[x] == ast.N_IDENT and g.pk[pi].t.names[g.pk[pi].t.s[x]] == "http"): continue
+    elif not is_named_type(g, xt, "net/http", "Client"):
+      if not (g.tk[xt] == tc.TY_PTR and is_named_type(g, g.ta[xt], "net/http", "Client")): continue
+    # restOfBlock
+    var ncalls = 0
+    var child = -1
+    var cur = n
+    var stmts: [Int] = []
+    while cur > 0:
+      let ck = g.pk[pi].t.k[cur]
+      if ck == ast.N_BLOCK:
+        let lst = ast.items(g.pk[pi].t, g.pk[pi].t.a[cur])
+        for j in 0..lst.len:
+          if lst[j] == child:
+            for q in j..lst.len: stmts.push(lst[q])
+            break
+        break
+      if ck == ast.N_CALL: ncalls += 1
+      child = cur
+      cur = parent[cur]
+    if stmts.len < 2 or ncalls > 1: continue
+    if g.pk[pi].t.k[stmts[0]] != ast.N_ASSIGN or g.pk[pi].t.k[stmts[1]] != ast.N_DEFER: continue
+    let resp = root_ident(g, pi, ast.item(g.pk[pi].t, g.pk[pi].t.a[stmts[0]], 0))
+    if resp < 0: continue
+    let dc = g.pk[pi].t.a[stmts[1]]
+    if g.pk[pi].t.k[dc] != ast.N_CALL: continue
+    let root = root_ident(g, pi, g.pk[pi].t.a[dc])
+    if root < 0: continue
+    let po = p.pobj
+    var o1 = -1
+    var o2 = -1
+    if resp < po.len: o1 = po[resp]
+    if root < po.len: o2 = po[root]
+    if o1 == o2: report(g, &v, root, "httpresponse", "using " + g.pk[pi].t.names[g.pk[pi].t.s[resp]] + " before checking for errors")
