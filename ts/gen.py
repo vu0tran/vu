@@ -216,13 +216,113 @@ class G:
             return f"const {self.name('c')} = {self.value(self.prim())} ? {self.value(self.prim())} : {self.value(self.prim())}"
         return f"const {self.name('u')}: string | undefined = undefined\nconsole.log({self.vars[-1][0] if self.vars else 'undefined'})"
 
+    # ---- classes
+    def klass(self):
+        r = self.r
+        name = self.name("C")
+        if not hasattr(self, "classes"): self.classes = []
+        base = r.choice(self.classes) if self.classes and r.random() < 0.3 else None
+        impl = r.choice(self.ifaces) if self.ifaces and r.random() < 0.25 else None
+        props = []   # (name, type, mods)
+        lines = []
+        head = f"class {name}"
+        if base: head += f" extends {base['name']}"
+        if impl: head += f" implements {impl[0]}"
+        used = set(p[0] for p in (base["props"] if base else []))
+        if impl:
+            for (pn, pt, opt) in impl[1]:
+                if r.random() < 0.85:
+                    t = pt if r.random() < 0.85 else self.prim()
+                    used.add(pn)
+                    lines.append(f"  {pn}{'?' if opt and r.random() < 0.5 else ''}: {t} = {self.value(t, 1)}")
+                    props.append((pn, t, ""))
+        for _ in range(r.randint(0, 3)):
+            pn = r.choice(["a", "b", "count", "label", "flag", "size"])
+            if pn in used: continue
+            used.add(pn)
+            c = r.random()
+            mods = r.choice(["", "", "", "private ", "readonly ", "protected ", "static "])
+            t = self.prim()
+            if c < 0.45: lines.append(f"  {mods}{pn}: {t} = {self.value(t, 1)}")
+            elif c < 0.65: lines.append(f"  {mods}{pn} = {self.value(t, 1)}")
+            elif c < 0.85: lines.append(f"  {mods}{pn}: {t}")
+            else: lines.append(f"  {mods}{pn}{r.choice(['?', '!'])}: {t}")
+            if "static" not in mods: props.append((pn, t, mods))
+        ctor = []
+        if r.random() < 0.6:
+            ps = []
+            for i in range(r.randint(0, 2)):
+                pm = r.choice(["", "", "public ", "private ", "readonly "])
+                t = self.prim()
+                pn = f"q{i}"
+                ps.append(f"{pm}{pn}: {t}")
+                ctor.append(t)
+                if pm: props.append((pn, t, pm))
+            body = []
+            if base and r.random() < 0.85: body.append("super(" + ", ".join(self.value(t, 1) for t in base["ctor"]) + ")")
+            for (pn, t, mods) in props:
+                if r.random() < 0.3 and "static" not in mods: body.append(f"this.{pn} = {self.value(t, 1)}")
+            lines.append(f"  constructor({', '.join(ps)}) {{ " + "; ".join(body) + " }")
+        elif base:
+            ctor = list(base["ctor"])
+        methods = []
+        for _ in range(r.randint(0, 2)):
+            mn = self.name("m")
+            ret = self.prim()
+            body_t = ret if r.random() < 0.8 else self.prim()
+            ex = self.value(body_t, 1)
+            if props and r.random() < 0.5:
+                pn, pt, _m = r.choice(props)
+                ex = f"this.{pn}"
+                body_t = pt
+            ann = f": {ret}" if r.random() < 0.6 else ""
+            lines.append(f"  {mn}(){ann} {{ return {ex} }}")
+            methods.append((mn, ret if ann else body_t))
+        if r.random() < 0.2 and props:
+            pn, pt, _m = r.choice(props)
+            lines.append(f"  get g{pn}() {{ return this.{pn} }}")
+        if r.random() < 0.15:
+            lines.append(f"  static make() {{ return new {name}({', '.join(self.value(t, 1) for t in ctor)}) }}")
+        allprops = list(props) + ([p for p in base["props"] if p[0] not in used] if base else [])
+        self.classes.append({"name": name, "props": allprops, "ctor": ctor, "methods": methods + (base["methods"] if base else [])})
+        return head + " {\n" + "\n".join(lines) + "\n}"
+
+    def use_class(self):
+        r = self.r
+        k = r.choice(self.classes)
+        o = self.name("o")
+        args = [self.value(t) for t in k["ctor"]]
+        if r.random() < 0.1 and args: args.pop()
+        out = [f"const {o} = new {k['name']}({', '.join(args)})"]
+        for _ in range(r.randint(1, 3)):
+            c = r.random()
+            if c < 0.35 and k["props"]:
+                pn, pt, mods = r.choice(k["props"])
+                want = pt if r.random() < 0.7 else self.prim()
+                out.append(f"const {self.name('p')}: {want} = {o}.{pn}")
+            elif c < 0.55 and k["props"]:
+                pn, pt, mods = r.choice(k["props"])
+                out.append(f"{o}.{pn} = {self.value(pt)}")
+            elif c < 0.8 and k["methods"]:
+                mn, mt = r.choice(k["methods"])
+                want = mt if r.random() < 0.7 else self.prim()
+                out.append(f"const {self.name('v')}: {want} = {o}.{mn}()")
+            elif self.ifaces:
+                out.append(f"const {self.name('i')}: {r.choice(self.ifaces)[0]} = {o}")
+            else:
+                out.append(f"console.log({o}.zz)")
+        return "\n".join(out)
+
     def program(self):
         out = []
         for _ in range(self.r.randint(0, 2)): out.append(self.iface())
         for _ in range(self.r.randint(0, 2)): out.append(self.alias())
+        classes = getattr(self, "with_classes", False)
         for _ in range(self.r.randint(3, 9)):
             c = self.r.random()
-            if c < 0.35: out.append(self.decl())
+            if classes and c < 0.2: out.append(self.klass())
+            elif classes and c < 0.35 and getattr(self, "classes", None): out.append(self.use_class())
+            elif c < 0.35: out.append(self.decl())
             elif c < 0.55: out.append(self.func())
             elif c < 0.75: out.append(self.call())
             else: out.append(self.misc())
@@ -297,7 +397,9 @@ def main():
             with open(os.path.join(outdir, f"g{k:05d}.ts"), "w") as f: f.write(pa)
             with open(os.path.join(outdir, f"g{k:05d}_b.ts"), "w") as f: f.write(pb)
             continue
+        g = G(r, k)
+        g.with_classes = "--classes" in sys.argv
         with open(os.path.join(outdir, f"g{k:05d}.ts"), "w") as f:
-            f.write(G(r, k).program())
+            f.write(g.program())
 
 main()

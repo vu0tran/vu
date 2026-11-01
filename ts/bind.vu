@@ -21,7 +21,21 @@ fn err(var c: C, node: Int, code: Int, msg: Str):
 fn err_at(var c: C, node: Int, pos: Int, code: Int, msg: Str):
   let f = c.t.file[node]
   if f < c.user_from: return
-  c.diags.push(parse.Diag(f, pos, pos, code, msg + ""))
+  var end = pos
+  # a property access's name: its length, as tsc's span (diagnostics at one place sort by it)
+  if c.t.k[node] == ast.N_PROPACCESS and c.t.s[node] >= 0: end = pos + c.t.names[c.t.s[node]].len
+  c.diags.push(parse.Diag(f, pos, end, code, msg + ""))
+
+# An error at a declaration's name (a class's, recorded by the parser), else at the node.
+fn err_name(var c: C, node: Int, code: Int, msg: Str):
+  let f = c.t.file[node]
+  if f < c.user_from: return
+  var pos = c.t.pos[node]
+  var end = c.t.end[node]
+  if node in c.t.npos:
+    pos = c.t.npos[node]
+    end = pos + c.t.names[c.t.s[node]].len
+  c.diags.push(parse.Diag(f, pos, end, code, msg + ""))
 
 # Something the checker doesn't model: the file is reported as unsupported instead of checked.
 fn unsupported(var c: C, node: Int, what: Str) -> Int:
@@ -963,6 +977,8 @@ fn add_members(var c: C, t: Int, members: Int, owner: Int, statics: Bool):
     var fl = 0
     if (mf & ast.M_OPTIONAL) != 0: fl = fl | SF_OPTIONAL
     if (mf & ast.M_READONLY) != 0: fl = fl | SF_READONLY
+    if (mf & ast.M_PRIVATE) != 0: fl = fl | types.SF_PRIVATE
+    if (mf & ast.M_PROTECTED) != 0: fl = fl | types.SF_PROTECTED
     if is_static: fl = fl | SF_STATIC
     c.sflags[s] = fl
     types.add_prop(&c, t, name, s)
@@ -979,7 +995,19 @@ fn resolve_decl(var c: C, t: Int):
   for d in types.sym_decls(c, s):
     let k = c.t.k[d]
     if k == ast.N_INTERFACE: add_members(&c, t, c.t.c[d], s, false)
-    elif k == ast.N_CLASS: unsupported(&c, d, "a class")
+    elif k == ast.N_CLASS:
+      if c.t.a[d] >= 0: unsupported(&c, d, "a generic class")
+      add_members(&c, t, c.t.d[d], s, false)
+      add_param_props(&c, t, d, s)
+      # the base class's instance members, where not declared here
+      let base = class_base(&c, d)
+      if base >= 0 and c.tk[base] == TK_OBJ:
+        for name in prop_names(&c, base):
+          if not (name in c.objs[o].props):
+            let ps = get_prop(&c, base, name)
+            if ps >= 0: types.add_prop(&c, t, name, ps)
+        if c.objs[o].sidx < 0: c.objs[o].sidx = index_type(&c, base, false)
+        if c.objs[o].nidx < 0: c.objs[o].nidx = index_type(&c, base, true)
   # inherited members: from each base, what isn't declared here
   for d in types.sym_decls(c, s):
     if c.t.k[d] != ast.N_INTERFACE: continue
@@ -997,6 +1025,45 @@ fn resolve_decl(var c: C, t: Int):
         for sg in sigs_of(&c, base, true): c.objs[o].ctors.push(sg)
       if c.objs[o].sidx < 0: c.objs[o].sidx = index_type(&c, base, false)
       if c.objs[o].nidx < 0: c.objs[o].nidx = index_type(&c, base, true)
+
+# The instance type of a class's base (extends B): -1 when there's none.
+fn class_base(var c: C, d: Int) -> Int:
+  let h = c.t.b[d]
+  if h < 0: return -1
+  let e = c.t.a[h]
+  if c.t.k[e] != ast.N_ID:
+    unsupported(&c, h, "a class extending an expression")
+    return -1
+  let bs = lookup_value(&c, h, c.t.s[e])
+  if bs < 0:
+    err(&c, e, 2304, "Cannot find name '" + nm(c, c.t.s[e]) + "'.")
+    return -1
+  if (c.sk[bs] & S_CLASS) == 0:
+    unsupported(&c, h, "extending something other than a class")
+    return -1
+  if c.t.b[h] >= 0: unsupported(&c, h, "a generic base class")
+  return declared_type(&c, bs)
+
+# constructor(private x: number): parameter properties are instance properties.
+fn add_param_props(var c: C, t: Int, d: Int, owner: Int):
+  let o = c.ta[t]
+  for m in ast.items(c.t, c.t.d[d]):
+    if c.t.k[m] != ast.N_CTOR or c.t.c[m] < 0: continue
+    for p in ast.items(c.t, c.t.b[c.t.b[m]]):
+      let pf = c.t.f[p]
+      if (pf & (ast.M_PUBLIC | ast.M_PRIVATE | ast.M_PROTECTED | ast.M_READONLY)) == 0: continue
+      let pn = c.t.a[p]
+      if c.t.k[pn] != ast.N_ID: continue
+      let name = c.t.s[pn]
+      if name in c.objs[o].props: continue
+      let s = types.new_sym(&c, S_PROP, name, p)
+      c.sparent[s] = owner
+      var fl = 0
+      if (pf & ast.M_READONLY) != 0: fl = fl | SF_READONLY
+      if (pf & ast.M_PRIVATE) != 0: fl = fl | types.SF_PRIVATE
+      if (pf & ast.M_PROTECTED) != 0: fl = fl | types.SF_PROTECTED
+      c.sflags[s] = fl
+      types.add_prop(&c, t, name, s)
 
 fn heritage_type(var c: C, h: Int) -> Int:
   let e = c.t.a[h]
@@ -1145,10 +1212,15 @@ fn compute_sym_type(var c: C, s: Int) -> Int:
   let k = c.t.k[d]
   if (sk & (S_PROP | S_ACCESSOR)) != 0:
     if k == ast.N_PROP:
-      if c.t.b[d] < 0: return c.any_t
+      if c.t.b[d] < 0: return chk.prop_init_type(&c, d)
       let pt = type_from(&c, c.t.b[d])
       return pt
-    if k == ast.N_GET: return type_from_or_any(&c, c.t.c[c.t.b[d]])
+    if k == ast.N_PARAM: return chk.param_type(&c, d)
+    if k == ast.N_GET:
+      if c.t.c[c.t.b[d]] < 0 and c.t.c[d] >= 0:
+        let gs = chk.fn_sig(&c, d)
+        return c.sigs[gs].ret
+      return type_from_or_any(&c, c.t.c[c.t.b[d]])
     if k == ast.N_SET:
       let ps = ast.items(c.t, c.t.b[c.t.b[d]])
       if ps.len > 0: return type_from_or_any(&c, c.t.b[ps[0]])
@@ -1156,13 +1228,24 @@ fn compute_sym_type(var c: C, s: Int) -> Int:
   if (sk & S_METHOD) != 0:
     let t = types.anon_obj(&c, -1, d)
     let o = c.ta[t]
-    for md in types.sym_decls(c, s):
-      c.objs[o].calls.push(sig_from(&c, c.t.b[md], md))
+    let decls = types.sym_decls(c, s)
+    var bodies = 0
+    for md in decls:
+      if c.t.c[md] >= 0: bodies += 1
+    for md in decls:
+      # a class method: its return type may come from its body; with overloads the
+      # implementation isn't callable
+      let in_class = up(c, md) >= 0 and c.t.k[up(c, md)] == ast.N_CLASS
+      if in_class and decls.len > 1 and bodies < decls.len and c.t.c[md] >= 0: continue
+      if in_class: c.objs[o].calls.push(chk.fn_sig(&c, md))
+      else: c.objs[o].calls.push(sig_from(&c, c.t.b[md], md))
     c.objs[o].resolved = true
     return t
   if (sk & S_NAMESPACE) != 0: return unsupported(&c, d, "a namespace")
   if (sk & S_ENUM) != 0: return unsupported(&c, d, "an enum")
-  if (sk & S_CLASS) != 0: return unsupported(&c, d, "a class")
+  if (sk & S_CLASS) != 0:
+    if k == ast.N_CLASS: return chk.class_static(&c, s)
+    return unsupported(&c, d, "a class")
   return c.any_t
 
 fn type_from_or_any(var c: C, n: Int) -> Int:

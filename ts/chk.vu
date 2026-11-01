@@ -96,7 +96,8 @@ fn decl_type(var c: C, s: Int) -> Int:
         return auto_array(&c)
       let it = check_expr(&c, c.t.c[d], -1)
       if (sk & S_CONST) != 0:
-        if types.is_fresh_lit(c, it): return types.regular(c, it)
+        # a constant keeps the fresh literal type (so let x = c widens again)
+        if types.is_fresh_lit(c, it): return it
         let h3_ = widen_nested(&c, it)
         return regular_obj(&c, h3_)
       let h4_ = widen(&c, it)
@@ -111,6 +112,28 @@ fn decl_type(var c: C, s: Int) -> Int:
 fn widen_nested(var c: C, t: Int) -> Int:
   if t in c.freg: return c.freg[t]
   return t
+
+# Functions come in two shapes: declarations, expressions and arrows (a type params, b params,
+# c return type, d body) and class members (b signature with a/b/c, c body).
+fn is_member_fn(c: C, d: Int) -> Bool:
+  let k = c.t.k[d]
+  return k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET or k == ast.N_CTOR
+
+fn fn_body(c: C, d: Int) -> Int:
+  if is_member_fn(c, d): return c.t.c[d]
+  return c.t.d[d]
+
+fn fn_params(c: C, d: Int) -> Int:
+  if is_member_fn(c, d): return c.t.b[c.t.b[d]]
+  return c.t.b[d]
+
+fn fn_retnode(c: C, d: Int) -> Int:
+  if is_member_fn(c, d): return c.t.c[c.t.b[d]]
+  return c.t.c[d]
+
+fn fn_tparams(c: C, d: Int) -> Int:
+  if is_member_fn(c, d): return c.t.a[c.t.b[d]]
+  return c.t.a[d]
 
 fn param_type(var c: C, p: Int) -> Int:
   if c.t.b[p] >= 0:
@@ -145,10 +168,10 @@ fn fn_sig(var c: C, d: Int) -> Int:
   if d in c.fsig: return c.fsig[d]
   let sg = types.new_sig(&c, d)
   c.fsig[d] = sg
-  if c.t.a[d] >= 0: c.sigs[sg].tparams = bind.tparam_types(&c, c.t.a[d])
+  if fn_tparams(c, d) >= 0: c.sigs[sg].tparams = bind.tparam_types(&c, fn_tparams(c, d))
   var min = 0
   var i = 0
-  for p in kids(c, c.t.b[d]):
+  for p in kids(c, fn_params(c, d)):
     let pn = c.t.a[p]
     var name = 0
     if c.t.k[pn] == ast.N_ID: name = c.t.s[pn]
@@ -169,13 +192,14 @@ fn fn_sig(var c: C, d: Int) -> Int:
     if fl == 0: min = i + 1
     i += 1
   c.sigs[sg].min = min
-  if c.t.c[d] >= 0: c.sigs[sg].ret = bind.type_from(&c, c.t.c[d])
+  if fn_retnode(c, d) >= 0: c.sigs[sg].ret = bind.type_from(&c, fn_retnode(c, d))
+  elif c.t.k[d] == ast.N_CTOR: c.sigs[sg].ret = c.void_t
   else: c.sigs[sg].ret = infer_return(&c, d)
   return sg
 
 # The return type a function's body gives (its return expressions, widened; void with none).
 fn infer_return(var c: C, d: Int) -> Int:
-  let body = c.t.d[d]
+  let body = fn_body(c, d)
   if body < 0: return c.any_t
   if (c.t.f[d] & ast.M_ASYNC) != 0 or (c.t.f[d] & ast.M_GENERATOR) != 0: return unsup(&c, d, "an async or generator function")
   # the body is checked in the function's own flow (outer narrowings of constants only), and each
@@ -183,7 +207,7 @@ fn infer_return(var c: C, d: Int) -> Int:
   c.narrow.push({})
   var saved: [{Str: Int}] = []
   swap(&saved, &c.narrow)
-  if c.t.k[d] == ast.N_FUNC: c.narrow.push({})
+  if c.t.k[d] == ast.N_FUNC or is_member_fn(c, d): c.narrow.push({})
   else: c.narrow.push(const_facts(&c, saved, d))
   c.ret_stack.push(-1)
   var et = c.any_t
@@ -622,8 +646,10 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
   if k == ast.N_ELEMACCESS: return elem_access(&c, n)
   if k == ast.N_CALL:
     let rt = call(&c, n, false)
+    if c.t.k[c.t.a[n]] == ast.N_SUPER: return c.void_t
     evolve_call(&c, n)
     return rt
+  if k == ast.N_SUPER: return super_type(&c, n)
   if k == ast.N_NEW: return call(&c, n, true)
   if k == ast.N_OBJECT: return object_literal(&c, n, ctx)
   if k == ast.N_ARRAY: return array_literal(&c, n, ctx)
@@ -677,7 +703,7 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
   if k == ast.N_DELETE:
     check_expr(&c, c.t.a[n], -1)
     return c.boolean_t
-  if k == ast.N_THIS: return unsup(&c, n, "this")
+  if k == ast.N_THIS: return this_type(&c, n)
   if k == ast.N_SPREAD: return check_expr(&c, c.t.a[n], -1)
   if k == ast.N_AWAIT: return unsup(&c, n, "await")
   if k == ast.N_TYPEASSERT: return unsup(&c, n, "a <T> type assertion")
@@ -858,7 +884,12 @@ fn prop_access(var c: C, n: Int) -> Int:
   let key = ref_key(&c, n)
   if key != "":
     let nt = narrowed(c, key)
-    if nt >= 0: return nt
+    if nt >= 0:
+      for m in types.members(c, ot):
+        if c.tk[m] == TK_OBJ:
+          let ps = prop_of(&c, m, name)
+          if ps >= 0: check_access(&c, n, ps, name)
+      return nt
   if is_any(c, ot): return ot
   if c.tk[ot] == TK_UNKNOWN:
     err(&c, obj, 18046, "'" + expr_text(c, obj) + "' is of type 'unknown'.")
@@ -887,6 +918,7 @@ fn prop_access(var c: C, n: Int) -> Int:
       let shown = show.show(&c, ot)
       bind.err_at(&c, n, c.t.d[n], 2339, "Property '" + nm(c, name) + "' does not exist on type '" + shown + "'.")
       return c.error_t
+    check_access(&c, n, ps, name)
     var pt = bind.type_of_sym(&c, ps)
     if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
     ts.push(pt)
@@ -1209,10 +1241,11 @@ fn context_sensitive(c: C, e: Int) -> Bool:
       if c.t.k[p] == ast.N_PROPASSIGN and context_sensitive(c, c.t.b[p]): return true
   return false
 
-fn call(var c: C, n: Int, is_new: Bool) -> Int:
+fn call(var c: C, n: Int, is_new0: Bool) -> Int:
   let callee = c.t.a[n]
   let args = kids(c, c.t.c[n])
-  if c.t.k[callee] == ast.N_SUPER: return unsup(&c, n, "super calls")
+  # super(...): the base class's construct signatures
+  let is_new = is_new0 or c.t.k[callee] == ast.N_SUPER
   for a in args:
     if c.t.k[a] == ast.N_SPREAD: return unsup(&c, a, "a spread argument")
   var ft = check_expr(&c, callee, -1)
@@ -1225,6 +1258,12 @@ fn call(var c: C, n: Int, is_new: Bool) -> Int:
     for a in args: check_expr(&c, a, -1)
     return ft
   if c.tk[ft] == TK_UNION: return unsup(&c, n, "calling a union of functions")
+  if is_new and ft in c.static_side:
+    let cd = c.sdecl[c.static_side[ft]]
+    if (c.t.f[cd] & ast.M_ABSTRACT) != 0:
+      for a in args: check_expr(&c, a, -1)
+      err(&c, n, 2511, "Cannot create an instance of an abstract class.")
+      return bind.declared_type(&c, c.static_side[ft])
   let ap = rel.apparent(&c, ft)
   let sgs = bind.sigs_of(&c, ap, is_new)
   if sgs.len == 0:
@@ -1556,8 +1595,8 @@ fn assign_target(var c: C, l: Int) -> Int:
       let ot = check_expr(&c, c.t.a[l], -1)
       for m in types.members(c, ot):
         let ps = prop_of(&c, m, c.t.s[l])
-        if ps >= 0 and (c.sflags[ps] & SF_READONLY) != 0:
-          err(&c, l, 2540, "Cannot assign to '" + nm(c, c.t.s[l]) + "' because it is a read-only property.")
+        if ps >= 0 and (c.sflags[ps] & SF_READONLY) != 0 and not readonly_exempt(c, l, ps):
+          bind.err_at(&c, l, c.t.d[l], 2540, "Cannot assign to '" + nm(c, c.t.s[l]) + "' because it is a read-only property.")
           return c.error_t
     let key = ref_key(&c, l)
     var t = -1
@@ -1591,9 +1630,10 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
     if lk == ast.N_ELEMACCESS and c.t.k[c.t.a[l]] == ast.N_ID and c.t.b[l] in c.ntype and number_like(c, c.ntype[c.t.b[l]]):
       evolve(&c, c.t.a[l], [rt])
     # a constant or read-only target is reported alone (checkReferenceExpression fails)
-    if not bad_ref(c, before) and not is_any(c, target) and not rel.assignable(&c, rt, target): rel.report(&c, rt, target, l, r, 2322)
+    let bad = bad_ref(c, before)
+    if not bad and not is_any(c, target) and not rel.assignable(&c, rt, target): rel.report(&c, rt, target, l, r, 2322)
     let key = ref_key(&c, l)
-    if key != "":
+    if key != "" and not bad:
       forget(&c, key)
       let h15_ = assigned_narrow(&c, target, rt)
       set_narrow(&c, key, h15_)
@@ -1804,7 +1844,7 @@ fn assigned_narrow(var c: C, declared: Int, assigned: Int) -> Int:
 fn check_function_body(var c: C, d: Int, sg: Int):
   if d in c.checked_fns: return
   c.checked_fns[d] = true
-  let body = c.t.d[d]
+  let body = fn_body(c, d)
   if body < 0: return
   # outer narrowings of variables that can change don't hold inside a function
   c.narrow.push({})
@@ -1812,10 +1852,10 @@ fn check_function_body(var c: C, d: Int, sg: Int):
   swap(&saved, &c.narrow)
   # a function declaration is hoisted: no outer narrowing reaches it (only expressions and arrows
   # see the narrowings of constants)
-  if c.t.k[d] == ast.N_FUNC: c.narrow.push({})
+  if c.t.k[d] == ast.N_FUNC or is_member_fn(c, d): c.narrow.push({})
   else: c.narrow.push(const_facts(&c, saved, d))
   var declared = -1
-  if c.t.c[d] >= 0: declared = c.sigs[sg].ret
+  if fn_retnode(c, d) >= 0: declared = c.sigs[sg].ret
   c.ret_stack.push(declared)
   if c.t.k[body] == ast.N_BLOCK:
     check_block(&c, body)
@@ -1912,10 +1952,10 @@ fn check_missing_return(var c: C, d: Int, declared: Int, body: Int):
   var rets: [Int] = []
   collect_returns(c, body, &rets)
   if rets.len == 0:
-    err(&c, c.t.c[d], 2355, "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.")
+    err(&c, fn_retnode(c, d), 2355, "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.")
     return
   if rel.assignable(&c, c.undef_t, declared): return
-  err(&c, c.t.c[d], 2366, "Function lacks ending return statement and return type does not include 'undefined'.")
+  err(&c, fn_retnode(c, d), 2366, "Function lacks ending return statement and return type does not include 'undefined'.")
 
 fn check_block(var c: C, b: Int):
   bind.scope_names(&c, b)
@@ -2124,7 +2164,7 @@ fn check_stmt(var c: C, n: Int):
     check_stmt(&c, c.t.a[n])
     return
   if k == ast.N_CLASS:
-    unsup(&c, n, "a class")
+    check_class(&c, n)
     return
   if k == ast.N_ENUM:
     unsup(&c, n, "an enum")
@@ -2173,6 +2213,322 @@ fn check_stmt(var c: C, n: Int):
     unsup(&c, n, "export = / import = require")
     return
   unsup(&c, n, "this statement")
+
+# ---- classes
+
+# The class a node is inside of (its declaration), and whether that's a static place.
+fn enclosing_class(c: C, n0: Int) -> Int:
+  var n = bind.up(c, n0)
+  while n >= 0:
+    if c.t.k[n] == ast.N_CLASS: return n
+    n = bind.up(c, n)
+  return -1
+
+fn this_type(var c: C, n: Int) -> Int:
+  var x = bind.up(c, n)
+  while x >= 0:
+    let k = c.t.k[x]
+    if k == ast.N_ARROW:
+      x = bind.up(c, x)
+      continue
+    if k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET or k == ast.N_CTOR or k == ast.N_PROP or k == ast.N_STATICBLOCK:
+      if k == ast.N_CTOR: this_before_super(&c, n, x)
+      let cls = bind.up(c, x)
+      if cls < 0 or c.t.k[cls] != ast.N_CLASS or not (cls in c.nsym): return unsup(&c, n, "this outside a class")
+      let s = c.nsym[cls]
+      if (c.t.f[x] & ast.M_STATIC) != 0 or k == ast.N_STATICBLOCK: return bind.type_of_sym(&c, s)
+      return bind.declared_type(&c, s)
+    if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_CLASSEXPR or k == ast.N_OBJECT: return unsup(&c, n, "this outside a class")
+    x = bind.up(c, x)
+  return unsup(&c, n, "this outside a class")
+
+# A class member's own flow: no narrowing from outside reaches it.
+fn in_member_flow(var c: C, e: Int, ctx: Int) -> Int:
+  c.narrow.push({})
+  var saved: [{Str: Int}] = []
+  swap(&saved, &c.narrow)
+  c.narrow.push({})
+  let t = check_expr(&c, e, ctx)
+  swap(&saved, &c.narrow)
+  c.narrow.pop()
+  return t
+
+# super: the base class's constructor type (in super(...)), else its instance type.
+fn super_type(var c: C, n: Int) -> Int:
+  let cls = enclosing_class(c, n)
+  if cls < 0: return unsup(&c, n, "super outside a class")
+  let bs = class_sym_of_base(&c, cls)
+  if bs < 0: return unsup(&c, n, "super without a base class")
+  let p = c.parent[n]
+  if p >= 0 and c.t.k[p] == ast.N_CALL and c.t.a[p] == n: return bind.type_of_sym(&c, bs)
+  return bind.declared_type(&c, bs)
+
+# this before super(...) in a derived class's constructor (TS17009).
+fn this_before_super(var c: C, n: Int, ctor: Int):
+  let cls = bind.up(c, ctor)
+  if cls < 0 or c.t.k[cls] != ast.N_CLASS or c.t.b[cls] < 0: return
+  let body = c.t.c[ctor]
+  if body < 0: return
+  var first = -1
+  for st in ast.items(c.t, c.t.a[body]):
+    if has_super_call(c, st):
+      first = st
+      break
+  if first < 0 or c.t.pos[n] < c.t.pos[first] or (c.t.pos[n] < c.t.end[first] and not super_args_contain(c, first, n)):
+    if first >= 0 and c.t.pos[n] >= c.t.pos[first]: return
+    err(&c, n, 17009, "'super' must be called before accessing 'this' in the constructor of a derived class.")
+
+fn super_args_contain(c: C, st: Int, n: Int) -> Bool:
+  return c.t.pos[n] >= c.t.pos[st] and c.t.end[n] <= c.t.end[st]
+
+fn prop_init_type(var c: C, d: Int) -> Int:
+  let init = c.t.c[d]
+  if init < 0: return c.any_t
+  let it = in_member_flow(&c, init, -1)
+  if (c.t.f[d] & ast.M_READONLY) != 0 and types.is_fresh_lit(c, it): return types.regular(c, it)
+  let w = widen(&c, it)
+  return regular_obj(&c, w)
+
+fn class_sym_of_base(var c: C, d: Int) -> Int:
+  let h = c.t.b[d]
+  if h < 0: return -1
+  let e = c.t.a[h]
+  if c.t.k[e] != ast.N_ID: return -1
+  let bs = bind.lookup_value(&c, h, c.t.s[e])
+  if bs < 0 or (c.sk[bs] & S_CLASS) == 0: return -1
+  return bs
+
+# The class's constructor type: construct signatures (its constructor's, else its base's, else
+# none-argument ones) returning the instance type, and the static members.
+fn class_static(var c: C, s: Int) -> Int:
+  let d = c.sdecl[s]
+  let inst = bind.declared_type(&c, s)
+  let t = types.anon_obj(&c, s, d)
+  c.static_side[t] = s
+  c.stype[s] = t
+  let o = c.ta[t]
+  bind.add_members(&c, t, c.t.d[d], s, true)
+  let bs = class_sym_of_base(&c, d)
+  var bt = -1
+  if bs >= 0: bt = bind.type_of_sym(&c, bs)
+  if bt >= 0 and c.tk[bt] == TK_OBJ:
+    for name in bind.prop_names(&c, bt):
+      if not (name in c.objs[o].props):
+        let ps = bind.get_prop(&c, bt, name)
+        if ps >= 0: types.add_prop(&c, t, name, ps)
+  var ctors: [Int] = []
+  var bodies = 0
+  for m in kids(c, c.t.d[d]):
+    if c.t.k[m] == ast.N_CTOR:
+      ctors.push(m)
+      if c.t.c[m] >= 0: bodies += 1
+  for m in ctors:
+    if ctors.len > 1 and bodies < ctors.len and c.t.c[m] >= 0: continue
+    let sg = fn_sig(&c, m)
+    c.sigs[sg].ret = inst
+    c.objs[o].ctors.push(sg)
+  if ctors.len == 0:
+    if bt >= 0 and c.tk[bt] == TK_OBJ:
+      for bsg in bind.sigs_of(&c, bt, true):
+        let cp = types.sig_copy(c, bsg)
+        let ns = types.new_sig(&c, cp.node)
+        c.sigs[ns] = cp
+        c.sigs[ns].ret = inst
+        c.objs[o].ctors.push(ns)
+    else:
+      let ns = types.new_sig(&c, d)
+      c.sigs[ns].ret = inst
+      c.objs[o].ctors.push(ns)
+  c.objs[o].resolved = true
+  return t
+
+# Whether a constructor body calls super(...) among its statements.
+fn has_super_call(c: C, n: Int) -> Bool:
+  if n < 0: return false
+  let k = c.t.k[n]
+  if k == ast.N_CALL and c.t.k[c.t.a[n]] == ast.N_SUPER: return true
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_CLASS or k == ast.N_CLASSEXPR: return false
+  if k == ast.N_LIST:
+    for x in ast.items(c.t, n):
+      if has_super_call(c, x): return true
+    return false
+  if k == ast.N_PROPACCESS: return has_super_call(c, c.t.a[n])
+  for ch in [c.t.a[n], c.t.b[n], c.t.c[n]]:
+    if ch > 0 and has_super_call(c, ch): return true
+  if k != ast.N_VAR and k != ast.N_INTERFACE and k != ast.N_TYPEALIAS and c.t.d[n] > 0 and has_super_call(c, c.t.d[n]): return true
+  return false
+
+# The properties a constructor assigns at its top level (this.x = ...).
+fn ctor_assigned(c: C, ctor: Int) -> {Int: Bool}:
+  var out: {Int: Bool} = {}
+  if ctor < 0 or c.t.c[ctor] < 0: return out
+  let body = c.t.c[ctor]
+  for st in ast.items(c.t, c.t.a[body]):
+    if c.t.k[st] != ast.N_EXPRSTMT: continue
+    let e = c.t.a[st]
+    if c.t.k[e] != ast.N_BINARY or c.t.f[e] != scan.T_ASSIGN: continue
+    let l = c.t.a[e]
+    if c.t.k[l] == ast.N_PROPACCESS and c.t.k[c.t.a[l]] == ast.N_THIS: out[c.t.s[l]] = true
+  return out
+
+# issueMemberSpecificError: each instance member whose type doesn't fit the base's (TS2416).
+fn member_errors(var c: C, n: Int, inst: Int, base: Int) -> Bool:
+  var any = false
+  let cname = show.show(&c, inst)
+  let bname = show.show(&c, base)
+  for m in kids(c, c.t.d[n]):
+    let k = c.t.k[m]
+    if k != ast.N_PROP and k != ast.N_METHOD and k != ast.N_GET and k != ast.N_SET: continue
+    if (c.t.f[m] & ast.M_STATIC) != 0: continue
+    let name = bind.member_name(&c, m)
+    if name < 0: continue
+    let own = bind.get_prop(&c, inst, name)
+    let bp = bind.get_prop(&c, base, name)
+    if own < 0 or bp < 0: continue
+    var ot = bind.type_of_sym(&c, own)
+    if (c.sflags[own] & SF_OPTIONAL) != 0: ot = types.union_of(&c, [ot, c.undef_t])
+    var btp = bind.type_of_sym(&c, bp)
+    if (c.sflags[bp] & SF_OPTIONAL) != 0: btp = types.union_of(&c, [btp, c.undef_t])
+    if not rel.assignable(&c, ot, btp):
+      err(&c, c.t.a[m], 2416, "Property '" + nm(c, name) + "' in type '" + cname + "' is not assignable to the same property in base type '" + bname + "'.")
+      any = true
+  return any
+
+# Private members are seen only inside their class; protected ones in subclasses too.
+fn check_access(var c: C, n: Int, ps: Int, name: Int):
+  let fl = c.sflags[ps]
+  if (fl & (types.SF_PRIVATE | types.SF_PROTECTED)) == 0: return
+  let owner = c.sparent[ps]
+  if owner < 0: return
+  var cls = enclosing_class(c, n)
+  while cls >= 0:
+    if cls in c.nsym:
+      let cs = c.nsym[cls]
+      if cs == owner: return
+      if (fl & types.SF_PROTECTED) != 0 and derives_from(&c, cs, owner): return
+    cls = enclosing_class(c, cls)
+  let oname = nm(c, c.sname[owner])
+  if (fl & types.SF_PRIVATE) != 0:
+    bind.err_at(&c, n, c.t.d[n], 2341, "Property '" + nm(c, name) + "' is private and only accessible within class '" + oname + "'.")
+  else:
+    bind.err_at(&c, n, c.t.d[n], 2445, "Property '" + nm(c, name) + "' is protected and only accessible within class '" + oname + "' and its subclasses.")
+
+fn derives_from(var c: C, cs: Int, owner: Int) -> Bool:
+  var x = cs
+  var guard = 0
+  while x >= 0 and guard < 100:
+    let b = class_sym_of_base(&c, c.sdecl[x])
+    if b == owner: return true
+    x = b
+    guard += 1
+  return false
+
+# isAssignmentToReadonlyEntity's exception: this.x = ... in the constructor of x's own class.
+fn readonly_exempt(c: C, l: Int, ps: Int) -> Bool:
+  var o = c.t.a[l]
+  while c.t.k[o] == ast.N_PAREN: o = c.t.a[o]
+  if c.t.k[o] != ast.N_THIS: return false
+  let f = enclosing_fn(c, l)
+  if f < 0 or c.t.k[f] != ast.N_CTOR: return false
+  let d = c.sdecl[ps]
+  if d < 0: return false
+  if c.t.k[d] == ast.N_PARAM: return enclosing_fn(c, d) == f
+  return bind.up(c, d) == bind.up(c, f)
+
+fn check_class(var c: C, n: Int):
+  if c.t.a[n] >= 0:
+    unsup(&c, n, "a generic class")
+    return
+  if not (n in c.nsym): return
+  let s = c.nsym[n]
+  let inst = bind.declared_type(&c, s)
+  bind.prop_names(&c, inst)
+  bind.type_of_sym(&c, s)
+  let cname = nm(c, c.sname[s])
+  let derived = c.t.b[n] >= 0
+  let base = bind.class_base(&c, n)
+  var ctor = -1
+  for m in kids(c, c.t.d[n]):
+    if c.t.k[m] == ast.N_CTOR and c.t.c[m] >= 0: ctor = m
+  let assigned = ctor_assigned(c, ctor)
+  for m in kids(c, c.t.d[n]):
+    let k = c.t.k[m]
+    let mf = c.t.f[m]
+    if k == ast.N_PROP:
+      let nn = c.t.a[m]
+      if c.t.k[nn] == ast.N_COMPUTED:
+        unsup(&c, nn, "a computed property name")
+        continue
+      let name = bind.member_name(&c, m)
+      let init = c.t.c[m]
+      if (mf & ast.M_EXCL) != 0 and ((mf & (ast.M_STATIC | ast.M_ABSTRACT)) != 0 or init >= 0 or c.t.b[m] < 0):
+        let at = c.t.pos[nn] + c.t.names[c.t.s[nn]].len
+        bind.err_at(&c, m, at, 1255, "A definite assignment assertion '!' is not permitted in this context.")
+      # a redeclared base property without an initializer (class fields define it again)
+      if init < 0 and base >= 0 and (mf & (ast.M_STATIC | ast.M_ABSTRACT | ast.M_DECLARE)) == 0:
+        let bp = bind.get_prop(&c, base, name)
+        if bp >= 0 and (c.sk[bp] & S_PROP) != 0 and (c.t.f[c.sdecl[bp]] & ast.M_ABSTRACT) == 0:
+          if (mf & ast.M_EXCL) != 0 or ctor < 0 or not (name in assigned):
+            let bname = show.show(&c, base)
+            err(&c, nn, 2612, "Property '" + nm(c, name) + "' will overwrite the base property in '" + bname + "'. If this is intentional, add an initializer. Otherwise, add a 'declare' modifier or remove the redundant declaration.")
+      if c.t.b[m] >= 0:
+        var declared = bind.type_from(&c, c.t.b[m])
+        if (mf & ast.M_OPTIONAL) != 0: declared = types.union_of(&c, [declared, c.undef_t])
+        if init >= 0:
+          let it = in_member_flow(&c, init, declared)
+          if not rel.assignable(&c, it, declared): rel.report(&c, it, declared, nn, init, 2322)
+        elif (mf & (ast.M_STATIC | ast.M_ABSTRACT | ast.M_OPTIONAL | ast.M_DECLARE | ast.M_EXCL)) == 0 and not includes_undefined(&c, declared) and not (name in assigned):
+          err(&c, nn, 2564, "Property '" + nm(c, name) + "' has no initializer and is not definitely assigned in the constructor.")
+      elif init >= 0:
+        let ps = bind.get_prop(&c, inst, name)
+        if ps >= 0 and (mf & ast.M_STATIC) == 0: bind.type_of_sym(&c, ps)
+        else: prop_init_type(&c, m)
+      else:
+        err(&c, nn, 7008, "Member '" + nm(c, name) + "' implicitly has an 'any' type.")
+    elif k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET or k == ast.N_CTOR:
+      if k != ast.N_CTOR and c.t.k[c.t.a[m]] == ast.N_COMPUTED:
+        unsup(&c, c.t.a[m], "a computed member name")
+        continue
+      if c.t.c[m] < 0: continue
+      let sg = fn_sig(&c, m)
+      check_function_body(&c, m, sg)
+      if k == ast.N_CTOR and derived and not has_super_call(c, c.t.c[m]):
+        err(&c, m, 2377, "Constructors for derived classes must contain a 'super' call.")
+    elif k == ast.N_STATICBLOCK:
+      unsup(&c, m, "a static block")
+  # the base class, then each implemented interface: member by member, else as a whole
+  var base_ok = true
+  if base >= 0 and c.tk[base] == TK_OBJ and not rel.assignable(&c, inst, base):
+    base_ok = false
+    if not member_errors(&c, n, inst, base):
+      let bname = show.show(&c, base)
+      bind.err_name(&c, n, 2415, "Class '" + cname + "' incorrectly extends base class '" + bname + "'.")
+  # the static side against the base's (its members, not its construct signatures)
+  let bsym = class_sym_of_base(&c, n)
+  if bsym >= 0 and base_ok:
+    let st = bind.type_of_sym(&c, s)
+    let bst = bind.type_of_sym(&c, bsym)
+    var bad = false
+    for name in bind.prop_names(&c, bst):
+      let bp = bind.get_prop(&c, bst, name)
+      let sp = bind.get_prop(&c, st, name)
+      if bp < 0 or sp < 0 or bp == sp: continue
+      let spt = bind.type_of_sym(&c, sp)
+      let bpt = bind.type_of_sym(&c, bp)
+      if not rel.assignable(&c, spt, bpt): bad = true
+    if bad:
+      let sn = show.show(&c, st)
+      let bn = show.show(&c, bst)
+      bind.err_name(&c, n, 2417, "Class static side '" + sn + "' incorrectly extends base class static side '" + bn + "'.")
+  for h in kids(c, c.t.c[n]):
+    let it = bind.heritage_type(&c, h)
+    if c.tk[it] != TK_OBJ: continue
+    if not member_errors(&c, n, inst, it) and not rel.assignable(&c, inst, it):
+      let iname = show.show(&c, it)
+      if rel.weak_fails(&c, inst, it):
+        bind.err_name(&c, n, 2559, "Type '" + cname + "' has no properties in common with type '" + iname + "'.")
+        continue
+      bind.err_name(&c, n, 2420, "Class '" + cname + "' incorrectly implements interface '" + iname + "'.")
 
 fn check_type_alias(var c: C, n: Int):
   bind.type_from(&c, c.t.b[n])

@@ -236,6 +236,17 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
     if sp < 0:
       if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
       return false
+    # private members are nominal (the same declaration only); a protected one is fitted by
+    # an override in a class derived from its own
+    if sp != tp:
+      let sf = c.sflags[sp]
+      let tf = c.sflags[tp]
+      if ((sf | tf) & types.SF_PRIVATE) != 0: return false
+      if (tf & types.SF_PROTECTED) != 0:
+        let sown = c.sparent[sp]
+        let to2 = c.sparent[tp]
+        if sown != to2 and not (sown >= 0 and to2 >= 0 and chk.derives_from(&c, sown, to2)): return false
+      elif (sf & types.SF_PROTECTED) != 0: return false
     var tt = bind.type_of_sym(&c, tp)
     if (c.sflags[tp] & SF_OPTIONAL) != 0: tt = types.union_of(&c, [tt, c.undef_t])
     var st = bind.type_of_sym(&c, sp)
@@ -341,7 +352,9 @@ fn could_have_singletons(var c: C, t: Int) -> Bool:
 
 fn not_assignable_msg(var c: C, s: Int, t: Int, code: Int) -> Str:
   var src = s
-  if types.is_literal(c, s) and c.tk[t] != TK_NEVER and not could_have_singletons(&c, t): src = types.base_of_literal(c, s)
+  if c.tk[t] != TK_NEVER and not could_have_singletons(&c, t):
+    if types.is_literal(c, s): src = types.base_of_literal(c, s)
+    elif c.tk[s] == TK_UNION: src = chk.widen_all(&c, s)
   let ss = show.show(&c, src)
   let ts = show.show(&c, t)
   if code == 2345: return "Argument of type '" + ss + "' is not assignable to parameter of type '" + ts + "'."
@@ -497,9 +510,27 @@ fn excess(var c: C, s: Int, t0: Int, node: Int) -> Bool:
       return true
   return false
 
+fn no_own_members(c: C, t: Int) -> Bool:
+  let sym = c.objs[c.ta[t]].sym
+  if sym < 0: return false
+  var has_base = false
+  for d in types.sym_decls(c, sym):
+    let k = c.t.k[d]
+    if k == ast.N_CLASS:
+      if ast.items(c.t, c.t.d[d]).len > 0: return false
+      if c.t.b[d] >= 0: has_base = true
+    elif k == ast.N_INTERFACE:
+      if ast.items(c.t, c.t.c[d]).len > 0: return false
+      if c.t.b[d] >= 0 and ast.items(c.t, c.t.b[d]).len > 0: has_base = true
+    else:
+      return false
+  return has_base
+
 # Required properties of t that s lacks: TS2741 for one, TS2739 / TS2740 for more.
 fn missing(var c: C, s: Int, t: Int, node: Int) -> Bool:
   if obj_kind(c, t) == OK_TUPLE or obj_kind(c, s) == OK_TUPLE: return false
+  # a class or interface with no members of its own over a base: tsc gives the plain message
+  if obj_kind(c, s) == OK_DECL and no_own_members(c, s): return false
   # a bare function type against a type without call signatures: the plain message
   let scalls = bind.sigs_of(&c, s, false).len
   let snews = bind.sigs_of(&c, s, true).len
@@ -554,63 +585,74 @@ fn elem_shown(var c: C, el: Int) -> Int:
 # checkExpressionForMutableLocationWithContextualType: expression e checked again with contextual
 # type wide (its own widened type). A literal keeps its type when wide has literals of its kind
 # (so `false` stays `false` against boolean, but "s" becomes string), at any depth.
-fn recheck(var c: C, e0: Int, wide: Int) -> Int:
+fn recheck(var c: C, e0: Int, ctx: Int) -> Int:
   var e = e0
   while c.t.k[e] == ast.N_PAREN: e = c.t.a[e]
-  if not (e in c.ntype) or wide < 0: return wide
+  if not (e in c.ntype): return ctx
   let raw = c.ntype[e]
   let k = c.t.k[e]
-  if types.is_fresh_lit(c, raw) or raw in c.freg: return chk.widen_in_ctx(&c, raw, wide)
-  if k == ast.N_OBJECT and c.tk[raw] == TK_OBJ and c.tk[wide] == TK_OBJ:
+  if types.is_fresh_lit(c, raw) or raw in c.freg:
+    if ctx < 0: return chk.widen(&c, raw)
+    return chk.widen_in_ctx(&c, raw, ctx)
+  if ctx < 0: return raw
+  if k == ast.N_OBJECT and c.tk[raw] == TK_OBJ:
     let t = types.anon_obj(&c, -1, e)
     c.objs[c.ta[t]].fresh = c.objs[c.ta[raw]].fresh
     var changed = false
     for p in ast.items(c.t, c.t.a[e]):
-      if c.t.k[p] != ast.N_PROPASSIGN and c.t.k[p] != ast.N_SHORTHAND: return wide
+      if c.t.k[p] != ast.N_PROPASSIGN and c.t.k[p] != ast.N_SHORTHAND: return raw
       var name = c.t.s[p]
       if c.t.k[p] == ast.N_PROPASSIGN: name = bind.member_name(&c, p)
-      if name < 0: return wide
+      if name < 0: return raw
       let ps = bind.get_prop(&c, raw, name)
-      if ps < 0: return wide
+      if ps < 0: return raw
       let pw = bind.type_of_sym(&c, ps)
       var pt = pw
-      if c.t.k[p] == ast.N_PROPASSIGN: pt = recheck(&c, c.t.b[p], pw)
+      if c.t.k[p] == ast.N_PROPASSIGN:
+        var pctx = -1
+        if c.tk[ctx] == TK_OBJ or c.tk[ctx] == TK_UNION: pctx = chk.ctx_prop(&c, ctx, name)
+        pt = recheck(&c, c.t.b[p], pctx)
       if pt != pw: changed = true
       let ns = types.new_sym(&c, types.S_PROP, name, p)
       c.stype[ns] = pt
       types.add_prop(&c, t, name, ns)
-    if not changed: return wide
+    if not changed: return raw
     c.objs[c.ta[t]].resolved = true
     return t
   if k == ast.N_ARRAY and ast.items(c.t, c.t.a[e]).len == 0 and c.arr_elab > 0:
     # an empty array literal checked again with a contextual type is the empty tuple
     return types.new_obj(&c, OK_TUPLE, -1, e)
-  if k == ast.N_ARRAY and c.tk[wide] == TK_OBJ:
-    let wo = c.ta[wide]
-    let tuple = c.objs[wo].kind == OK_TUPLE
-    if not tuple and not is_array_ref(&c, wide): return wide
+  if k == ast.N_ARRAY:
+    # each element's context: the context's element type (per position for a tuple)
+    var tuple = -1
+    var els: [Int] = []
+    for m in types.members(c, ctx):
+      if c.tk[m] != TK_OBJ: continue
+      if obj_kind(c, m) == OK_TUPLE: tuple = m
+      elif is_array_ref(&c, m): els.push(c.objs[c.ta[m]].args[0])
+    if tuple < 0 and els.len == 0: return raw
     var rs: [Int] = []
     var i = 0
     for el in ast.items(c.t, c.t.a[e]):
-      if c.t.k[el] == ast.N_SPREAD or c.t.k[el] == ast.N_OMIT: return wide
+      if c.t.k[el] == ast.N_SPREAD or c.t.k[el] == ast.N_OMIT: return raw
       var ec = -1
-      if tuple:
-        if i < c.objs[wo].args.len: ec = c.objs[wo].args[i]
-      else: ec = c.objs[wo].args[0]
-      if ec < 0: return wide
+      if tuple >= 0 and c.tk[ctx] != TK_UNION:
+        let to = c.ta[tuple]
+        if i < c.objs[to].args.len: ec = c.objs[to].args[i]
+      elif els.len > 0: ec = types.union_of(&c, els)
       rs.push(recheck(&c, el, ec))
       i += 1
-    if tuple:
+    if tuple >= 0 and c.tk[ctx] != TK_UNION:
       let t = types.new_obj(&c, OK_TUPLE, -1, e)
       let o = c.ta[t]
       for r in rs:
         c.objs[o].args.push(r)
         c.objs[o].eflags.push(0)
       return t
-    if rs.len == 0: return wide
+    if rs.len == 0: return raw
     let red = chk.subtype_reduce(&c, rs)
     return bind.array_of(&c, red)
-  return wide
+  return raw
 
 # elaborateDidYouMeanToCallOrConstruct: a function whose result would fit is reported (as not
 # assignable) at the expression itself, parentheses included.
