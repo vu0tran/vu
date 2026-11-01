@@ -400,10 +400,61 @@ fn fn_sig(var c: C, d: Int) -> Int:
   return sg
 
 # The return type a function's body gives (its return expressions, widened; void with none).
+# The global Promise<t>.
+fn promise_of(var c: C, t: Int, at: Int) -> Int:
+  let pn = ast.intern(&c.t, "Promise")
+  if not (pn in c.gtypes): return unsup(&c, at, "an async function without the Promise type")
+  let dt = bind.declared_type(&c, c.gtypes[pn])
+  return bind.ref_of(&c, dt, [t])
+
+# A return expression's contextual type in an async function: T | PromiseLike<T>.
+fn async_return_ctx(var c: C, t: Int, at: Int) -> Int:
+  let pn = ast.intern(&c.t, "PromiseLike")
+  if not (pn in c.gtypes): return t
+  let dt = bind.declared_type(&c, c.gtypes[pn])
+  let pl = bind.ref_of(&c, dt, [t])
+  return types.union_of(&c, [t, pl])
+
+# T of the global Promise<T> (-1 if the type isn't one).
+fn promise_arg(var c: C, t: Int) -> Int:
+  if c.tk[t] != TK_OBJ: return -1
+  let o = c.ta[t]
+  if c.objs[o].kind != OK_REF or c.objs[o].args.len != 1: return -1
+  let pn = ast.intern(&c.t, "Promise")
+  if not (pn in c.gtypes): return -1
+  if c.objs[o].target != bind.declared_type(&c, c.gtypes[pn]): return -1
+  return c.objs[o].args[0]
+
+# Awaited<t> (getAwaitedType): a Promise's or PromiseLike's value, recursively; other types as they
+# are (a thenable or a generic type: not modeled).
+fn awaited(var c: C, t: Int, at: Int) -> Int:
+  let k = c.tk[t]
+  if k == TK_ANY or k == TK_ERROR or k == TK_UNKNOWN or k == TK_NEVER: return t
+  if k == TK_UNSUP: return t
+  if k == TK_UNION:
+    var ms: [Int] = []
+    for m in types.members(c, t):
+      let a = awaited(&c, m, at)
+      if c.tk[a] == TK_UNSUP: return a
+      ms.push(a)
+    return types.union_of(&c, ms)
+  if k == TK_TPARAM or k == TK_INTER or k >= types.TK_KEYOF: return unsup(&c, at, "awaiting a generic type")
+  if k != TK_OBJ: return t
+  let o = c.ta[t]
+  if c.objs[o].kind == OK_REF and c.objs[o].args.len == 1:
+    let tsym = c.objs[c.ta[c.objs[o].target]].sym
+    if tsym >= 0 and c.t.file[c.sdecl[tsym]] < c.user_from:
+      let tn = nm(c, c.sname[tsym])
+      if tn == "Promise" or tn == "PromiseLike": return awaited(&c, c.objs[o].args[0], at)
+  let then = ast.intern(&c.t, "then")
+  let ap = rel.apparent(&c, t)
+  if bind.get_prop(&c, ap, then) >= 0: return unsup(&c, at, "awaiting a thenable")
+  return t
+
 fn infer_return(var c: C, d: Int) -> Int:
   let body = fn_body(c, d)
   if body < 0: return c.any_t
-  if (c.t.f[d] & ast.M_ASYNC) != 0 or (c.t.f[d] & ast.M_GENERATOR) != 0: return unsup(&c, d, "an async or generator function")
+  if (c.t.f[d] & ast.M_GENERATOR) != 0: return unsup(&c, d, "a generator function")
   # the body is checked in the function's own flow (outer narrowings of constants only), and each
   # return's type read as it was seen there
   c.narrow.push({})
@@ -418,14 +469,30 @@ fn infer_return(var c: C, d: Int) -> Int:
   c.ret_stack.pop()
   swap(&saved, &c.narrow)
   c.narrow.pop()
-  if c.t.k[body] != ast.N_BLOCK: return widen(&c, et)
+  let is_async = (c.t.f[d] & ast.M_ASYNC) != 0
+  if c.t.k[body] != ast.N_BLOCK:
+    if is_async:
+      let aw = awaited(&c, et, body)
+      let wa = return_widen(&c, d, [aw])
+      return promise_of(&c, wa, d)
+    return return_widen(&c, d, [et])
+  if is_async:
+    let inner = infer_body_return(&c, d, body)
+    return promise_of(&c, inner, d)
+  return infer_body_return(&c, d, body)
+
+fn infer_body_return(var c: C, d: Int, body: Int) -> Int:
+  let is_async = (c.t.f[d] & ast.M_ASYNC) != 0
   var rets: [Int] = []
   collect_returns(c, body, &rets)
   # no return with a value: void, or undefined when the contextual return type has undefined
   var none: Int = c.void_t
   if d in c.ret_ctx:
-    for m in types.members(c, c.ret_ctx[d]):
-      if c.tk[m] == TK_UNDEF: none = c.undef_t
+    var rc = c.ret_ctx[d]
+    if is_async: rc = awaited(&c, rc, d)
+    if rc >= 0:
+      for m in types.members(c, rc):
+        if c.tk[m] == TK_UNDEF: none = c.undef_t
   if rets.len == 0: return none
   var ts: [Int] = []
   var has_empty = false
@@ -434,11 +501,33 @@ fn infer_return(var c: C, d: Int) -> Int:
     else:
       var rt = c.any_t
       if c.t.a[r] in c.ntype: rt = c.ntype[c.t.a[r]]
-      ts.push(widen(&c, rt))
+      if is_async: rt = awaited(&c, rt, c.t.a[r])
+      ts.push(rt)
   if ts.len == 0: return none
   if has_empty: ts.push(c.undef_t)
   if not bind_terminates(&c, body) and ts.len > 0: ts.push(c.undef_t)
-  return types.union_of(&c, ts)
+  return return_widen(&c, d, ts)
+
+# getReturnTypeFromBody's widening: the union of the returned types; a lone fresh literal widens
+# (unless the contextual return type has literals of its kind); object literals widen.
+fn return_widen(var c: C, d: Int, ts: [Int]) -> Int:
+  var parts: [Int] = []
+  var fresh = false
+  for t in ts:
+    if types.is_fresh_lit(c, t) or t in c.freg: fresh = true
+    if c.tk[t] == TK_SYMBOL and c.tb[t] == 1: fresh = true
+    if c.tk[t] == TK_OBJ and c.objs[c.ta[t]].fresh: parts.push(widen_obj(&c, t))
+    else: parts.push(t)
+  let u = types.union_of(&c, parts)
+  let unit = types.is_literal(c, u) or (c.tk[u] == TK_SYMBOL and c.tb[u] == 1)
+  if unit and fresh:
+    if d in c.ret_ctx:
+      var rc = c.ret_ctx[d]
+      if (c.t.f[d] & ast.M_ASYNC) != 0: rc = awaited(&c, rc, d)
+      if rc >= 0 and literal_of_ctx(&c, u, rc): return u
+    if c.tk[u] == TK_SYMBOL: return c.symbol_t
+    return types.base_of_literal(c, u)
+  return u
 
 fn bind_terminates(var c: C, n: Int) -> Bool:
   return terminates(c, n)
@@ -1534,7 +1623,11 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
     return c.boolean_t
   if k == ast.N_THIS: return this_type(&c, n)
   if k == ast.N_SPREAD: return check_expr(&c, c.t.a[n], -1)
-  if k == ast.N_AWAIT: return unsup(&c, n, "await")
+  if k == ast.N_AWAIT:
+    let ef = enclosing_fn(c, n)
+    if ef < 0 or (c.t.f[ef] & ast.M_ASYNC) == 0: return unsup(&c, n, "await outside an async function")
+    let ot = check_expr(&c, c.t.a[n], -1)
+    return awaited(&c, ot, n)
   if k == ast.N_TYPEASSERT: return unsup(&c, n, "a <T> type assertion")
   if k == ast.N_TAGGED: return unsup(&c, n, "a tagged template")
   if k == ast.N_CLASSEXPR: return unsup(&c, n, "a class expression")
@@ -2404,7 +2497,7 @@ fn literal_of_ctx(var c: C, lit: Int, ctx: Int) -> Bool:
 
 # An arrow or function expression: parameters from annotations, else from the contextual signature.
 fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
-  if (c.t.f[n] & ast.M_ASYNC) != 0 or (c.t.f[n] & ast.M_GENERATOR) != 0: return unsup(&c, n, "an async or generator function")
+  if (c.t.f[n] & ast.M_GENERATOR) != 0: return unsup(&c, n, "a generator function")
   var csig = -1
   if ctx >= 0:
     var found = 0
@@ -2794,6 +2887,11 @@ fn return_expr(var c: C, in_return: Bool, stmt: Int, expr: Int, et: Int, declare
     if wt in c.ntype: tt = c.ntype[wt]
     var ft = c.any_t
     if wf in c.ntype: ft = c.ntype[wf]
+    # (in an async function each branch is awaited)
+    let ef = enclosing_fn(c, stmt)
+    if ef >= 0 and (c.t.f[ef] & ast.M_ASYNC) != 0:
+      tt = awaited(&c, tt, wt)
+      ft = awaited(&c, ft, wf)
     return_expr(&c, in_return, stmt, wt, tt, declared, true)
     return_expr(&c, in_return, stmt, wf, ft, declared, true)
     return
@@ -2823,6 +2921,16 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx: Int) -> Int:
     var seen0: {Int: Bool} = {}
     infer_in(&c, ret, ctx, &inf, false, P_RETURN, ret, &seen0)
   # first the arguments that don't depend on context, then the others with what's known
+  # the return mapper: what the contextual type alone infers (a literal argument keeps its
+  # literal type where that instantiated parameter type has literals of its kind)
+  var rmap = -1
+  if ctx >= 0 and ret >= 0 and not is_any(c, ctx):
+    var any_ret = false
+    for i in 0..inf.tps.len:
+      if inf.cov[i].len > 0: any_ret = true
+    if any_ret:
+      var inf2 = copy_inf(inf)
+      rmap = inf_mapper(&c, &inf2, sg)
   for pass in 0..2:
     for i in 0..args.len:
       let sens = context_sensitive(c, args[i])
@@ -2833,7 +2941,14 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx: Int) -> Int:
         pt = bind.instantiate(&c, pt, m)
         c.fsig.remove(args[i])
         clear_ctx_params(&c, args[i])
-      let at = check_expr(&c, args[i], pt)
+      var at = check_expr(&c, args[i], pt)
+      if rmap >= 0 and (types.is_fresh_lit(c, at) or at in c.freg):
+        let rp0 = raw_param_at(&c, sg, i)
+        let rp = bind.instantiate(&c, rp0, rmap)
+        var all_lit = true
+        for am in types.members(c, at):
+          if not literal_of_ctx(&c, am, rp): all_lit = false
+        if all_lit: at = types.regular(c, at)
       let h13_ = raw_param_at(&c, sg, i)
       var seen: {Int: Bool} = {}
       infer_in(&c, h13_, at, &inf, false, 0, h13_, &seen)
@@ -2869,6 +2984,20 @@ const P_NONE = 1048576
 const P_NAKED = 1
 const P_RETURN = 128
 
+fn copy_inf(inf: Inf) -> Inf:
+  var r = Inf([], [], [], [], [])
+  for i in 0..inf.tps.len:
+    r.tps.push(inf.tps[i])
+    var cv: [Int] = []
+    for x in inf.cov[i]: cv.push(x)
+    r.cov.push(cv)
+    var ct: [Int] = []
+    for x in inf.contra[i]: ct.push(x)
+    r.contra.push(ct)
+    r.prio.push(inf.prio[i])
+    r.top.push(inf.top[i])
+  return r
+
 fn new_inf(tps: [Int]) -> Inf:
   var inf = Inf([], [], [], [], [])
   for t in tps:
@@ -2902,7 +3031,7 @@ fn inf_mapper(var c: C, var inf: Inf, sg: Int) -> Int:
       var base: [Int] = []
       for x in inf.cov[i]:
         if prim: base.push(types.regular(c, x))
-        elif widen_lits: base.push(widen_all(&c, x))
+        elif widen_lits: base.push(widen_fresh(&c, x))
         else: base.push(x)
       if (inf.prio[i] & P_RETURN) != 0: t = subtype_reduce(&c, base)
       else: t = common_supertype(&c, base)
@@ -2968,6 +3097,21 @@ fn prim_constraint(var c: C, t: Int) -> Bool:
     if k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_TRUE or k == TK_FALSE: return true
   return false
 
+# getWidenedLiteralType: fresh literals widen (a regular literal type stays).
+fn widen_fresh(var c: C, t: Int) -> Int:
+  if t in c.freg: return widen_all(&c, t)
+  if types.is_fresh_lit(c, t): return types.base_of_literal(c, t)
+  if c.tk[t] == TK_UNION:
+    var ts: [Int] = []
+    var changed = false
+    for m in types.members(c, t):
+      if types.is_fresh_lit(c, m):
+        ts.push(types.base_of_literal(c, m))
+        changed = true
+      else: ts.push(m)
+    if changed: return types.union_of(&c, ts)
+  return t
+
 fn widen_all(var c: C, t: Int) -> Int:
   var ts: [Int] = []
   var changed = false
@@ -3006,6 +3150,18 @@ fn infer_in(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, ori
   let key = (p << 32) + a
   if key in seen: return
   seen[key] = true
+  if pk == types.TK_COND and c.tk[a] != types.TK_COND:
+    # inferToConditionalType: into both branches (as inferToMultipleTypes)
+    let cn = c.ta[p]
+    let cm = c.tb[p]
+    let g1 = tyops.raw(&c, c.t.c[cn])
+    let tb = bind.instantiate(&c, g1, cm)
+    let g2 = tyops.raw(&c, c.t.d[cn])
+    let fb = bind.instantiate(&c, g2, cm)
+    if c.tk[tb] == TK_UNSUP or c.tk[fb] == TK_UNSUP: return
+    let both = types.union_of(&c, [tb, fb])
+    infer_in(&c, both, a, &inf, contra, prio, orig, &seen)
+    return
   if pk == TK_UNION:
     # inferToMultipleTypes: the members that aren't naked type parameters first; a naked one
     # gets what the others don't take
@@ -3018,7 +3174,8 @@ fn infer_in(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, ori
       for am in types.members(c, a):
         var taken = false
         for m2 in types.members(c, p):
-          if c.tk[m2] != TK_TPARAM and rel.assignable(&c, am, m2): taken = true
+          if c.tk[m2] == TK_TPARAM or c.tk[m2] >= types.TK_KEYOF: continue
+          if rel.assignable(&c, am, m2): taken = true
         if not taken: rest.push(am)
       if rest.len > 0:
         let g4_1 = types.union_of(&c, rest)
@@ -3586,15 +3743,28 @@ fn check_function_body(var c: C, d: Int, sg: Int):
   else: c.narrow.push(const_facts(&c, saved, d))
   var declared = -1
   if fn_retnode(c, d) >= 0: declared = c.sigs[sg].ret
+  let is_async = (c.t.f[d] & ast.M_ASYNC) != 0
+  if is_async and declared >= 0:
+    let inner = promise_arg(&c, declared)
+    if inner < 0:
+      unsup(&c, fn_retnode(c, d), "an async function's return type that isn't Promise<T>")
+      swap(&saved, &c.narrow)
+      c.narrow.pop()
+      return
+    declared = inner
   c.ret_stack.push(declared)
   if c.t.k[body] == ast.N_BLOCK:
     check_block(&c, body)
     if declared >= 0: check_missing_return(&c, d, declared, body)
   else:
     var rctx = declared
-    if rctx < 0 and d in c.ret_ctx: rctx = c.ret_ctx[d]
-    let et = check_expr(&c, body, rctx)
-    if declared >= 0 and c.tk[declared] != TK_VOID: return_expr(&c, false, body, body, et, declared, false)
+    if rctx < 0 and d in c.ret_ctx:
+      rctx = c.ret_ctx[d]
+      if is_async: rctx = awaited(&c, rctx, body)
+    if is_async and rctx >= 0: rctx = async_return_ctx(&c, rctx, body)
+    var et = check_expr(&c, body, rctx)
+    if is_async: et = awaited(&c, et, body)
+    if declared >= 0: return_expr(&c, false, body, body, et, declared, false)
   c.ret_stack.pop()
   swap(&saved, &c.narrow)
   c.narrow.pop()
@@ -3885,7 +4055,11 @@ fn check_stmt(var c: C, n: Int):
     let declared = c.ret_stack[c.ret_stack.len - 1]
     if c.t.a[n] >= 0:
       var ctx = declared
-      let et = check_expr(&c, c.t.a[n], ctx)
+      let ef = enclosing_fn(c, n)
+      let in_async = ef >= 0 and (c.t.f[ef] & ast.M_ASYNC) != 0
+      if in_async and ctx >= 0: ctx = async_return_ctx(&c, ctx, n)
+      var et = check_expr(&c, c.t.a[n], ctx)
+      if in_async: et = awaited(&c, et, c.t.a[n])
       if declared >= 0: return_expr(&c, true, n, c.t.a[n], et, declared, false)
     return
   if k == ast.N_IF:
@@ -3968,8 +4142,8 @@ fn check_stmt(var c: C, n: Int):
     return
   if k == ast.N_FUNC:
     if c.t.d[n] < 0: return
-    if (c.t.f[n] & (ast.M_ASYNC | ast.M_GENERATOR)) != 0:
-      unsup(&c, n, "an async or generator function")
+    if (c.t.f[n] & ast.M_GENERATOR) != 0:
+      unsup(&c, n, "a generator function")
       return
     for p in kids(c, c.t.b[n]):
       if c.t.k[c.t.a[p]] != ast.N_ID:
