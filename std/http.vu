@@ -715,19 +715,163 @@ fn host_port(u: Url) -> Str:
   if (u.tls and u.port != 443) or (not u.tls and u.port != 80): hostport += ":{u.port}"
   return hostport
 
-fn open_conn(net: Net, u: Url, ca: Str, alpn: Str, timeout: Float) -> Conn throws:
-  if u.tls and ca != "" and alpn != "": return net.tls_connect(u.host, u.port, ca: ca, alpn: alpn, timeout: timeout)?
-  if u.tls and ca != "": return net.tls_connect(u.host, u.port, ca: ca, timeout: timeout)?
-  if u.tls and alpn != "": return net.tls_connect(u.host, u.port, alpn: alpn, timeout: timeout)?
-  if u.tls: return net.tls_connect(u.host, u.port, timeout: timeout)?
-  return net.connect(u.host, u.port, timeout: timeout)?
+# ---- where the client may connect
+#
+# The client looks the host up itself, checks each address, and connects to an address it checked
+# (then starts TLS for the host name), so a name can't be checked as one address and connect to
+# another (DNS rebinding). It never connects to a link-local address: that's where clouds serve a
+# machine's credentials (169.254.169.254), the usual prize of a request forged through an app (SSRF).
+# get_public, send_public and a Client with public_only also refuse this machine and private
+# networks: for URLs that come from users (a link preview, a webhook to call). A program that means to
+# reach a metadata service uses net.connect, where a reader sees it.
+
+# What an address (as net.resolve writes it) is: "metadata" (link-local: 169.254.0.0/16, fe80::/10,
+# and the metadata addresses 100.100.100.200 and fd00:ec2::254), "private" (unspecified, loopback,
+# private and shared networks, documentation and benchmark ranges, multicast, reserved), or "public".
+# IPv6 addresses that carry an IPv4 one (mapped, compatible, NAT64, 6to4) are what that one is.
+fn ip_class(a: Str) -> Str:
+  if ":" in a:
+    let g = v6_groups(a) else return "private"
+    if g[0] == 0 and g[1] == 0 and g[2] == 0 and g[3] == 0 and g[4] == 0 and (g[5] == 0xffff or g[5] == 0):
+      if g[5] == 0 and g[6] == 0 and g[7] <= 1: return "private"          # :: and ::1
+      return v4_class(g[6] >> 8, g[6] & 255, g[7] >> 8, g[7] & 255)          # ::ffff:a.b.c.d, ::a.b.c.d
+    if g[0] == 0x64 and g[1] == 0xff9b and g[2] == 0 and g[3] == 0 and g[4] == 0 and g[5] == 0:
+      return v4_class(g[6] >> 8, g[6] & 255, g[7] >> 8, g[7] & 255)          # NAT64
+    if g[0] == 0x2002: return v4_class(g[1] >> 8, g[1] & 255, g[2] >> 8, g[2] & 255)   # 6to4
+    if (g[0] & 0xffc0) == 0xfe80: return "metadata"
+    if g[0] == 0xfd00 and g[1] == 0xec2 and g[2] == 0 and g[3] == 0 and g[4] == 0 and g[5] == 0 and g[6] == 0 and g[7] == 0x254: return "metadata"
+    if (g[0] & 0xfe00) == 0xfc00: return "private"                          # unique local
+    if (g[0] & 0xff00) == 0xff00: return "private"                          # multicast
+    if (g[0] & 0xffc0) == 0xfec0: return "private"                          # site-local (old)
+    if g[0] == 0x2001 and g[1] == 0xdb8: return "private"                   # documentation
+    if g[0] == 0x100 and g[1] == 0 and g[2] == 0 and g[3] == 0: return "private"   # discard
+    if g[0] == 0x2001 and g[1] < 0x200: return "private"                    # Teredo, benchmarking, ORCHID...
+    return "public"
+  let p = a.split(".")
+  if p.len != 4: return "private"
+  var n: [Int] = []
+  for x in p:
+    let v = int(x) else return "private"
+    if v < 0 or v > 255: return "private"
+    n.push(v)
+  return v4_class(n[0], n[1], n[2], n[3])
+
+fn v4_class(a: Int, b: Int, c: Int, d: Int) -> Str:
+  if a == 169 and b == 254: return "metadata"
+  if a == 100 and b == 100 and c == 100 and d == 200: return "metadata"   # Alibaba Cloud's
+  if a == 0 or a == 10 or a == 127 or a >= 224: return "private"
+  if a == 100 and b >= 64 and b <= 127: return "private"                  # shared (carrier NAT)
+  if a == 172 and b >= 16 and b <= 31: return "private"
+  if a == 192 and b == 168: return "private"
+  if a == 192 and b == 0 and (c == 0 or c == 2): return "private"
+  if a == 198 and (b == 18 or b == 19): return "private"
+  if a == 198 and b == 51 and c == 100: return "private"
+  if a == 203 and b == 0 and c == 113: return "private"
+  return "public"
+
+# The eight groups of an IPv6 address in text (with ::, and a dotted IPv4 tail), or nil.
+fn v6_groups(a: Str) -> [Int]?:
+  var s = a + ""
+  let pct = s.find("%")
+  if pct >= 0: s = s[0..pct]
+  var tail: [Int] = []
+  var lc = -1
+  for i in 0..s.len:
+    if s[i] == ':': lc = i
+  if lc >= 0 and "." in s[lc + 1..s.len]:
+    let q = s[lc + 1..s.len].split(".")
+    if q.len != 4: return nil
+    var o: [Int] = []
+    for x in q:
+      let v = int(x) else return nil
+      if v < 0 or v > 255: return nil
+      o.push(v)
+    tail = [o[0] * 256 + o[1], o[2] * 256 + o[3]]
+    s = s[0..lc + 1] + "0:0"
+  let dc = s.find("::")
+  var head: [Int] = []
+  var back: [Int] = []
+  if dc >= 0:
+    if s.find("::", dc + 1) >= 0: return nil
+    head = hex_groups(s[0..dc]) else return nil
+    back = hex_groups(s[dc + 2..s.len]) else return nil
+    if head.len + back.len > 7: return nil
+  else:
+    head = hex_groups(s) else return nil
+    if head.len != 8: return nil
+  var out: [Int] = []
+  for v in head: out.push(v)
+  if dc >= 0:
+    for i in 0..8 - head.len - back.len: out.push(0)
+  for v in back: out.push(v)
+  if tail.len == 2:
+    out[6] = tail[0]
+    out[7] = tail[1]
+  return out
+
+# "1:ab:0" as [1, 0xab, 0] ("" as []), or nil if a group isn't 1 to 4 hex digits.
+fn hex_groups(s: Str) -> [Int]?:
+  var out: [Int] = []
+  if s == "": return out
+  for h in s.split(":"):
+    if h == "" or h.len > 4: return nil
+    var v = 0
+    for i in 0..h.len:
+      let ch = h[i]
+      var dv = -1
+      if ch >= '0' and ch <= '9': dv = int(ch) - 48
+      elif ch >= 'a' and ch <= 'f': dv = int(ch) - 87
+      elif ch >= 'A' and ch <= 'F': dv = int(ch) - 55
+      if dv < 0: return nil
+      v = v * 16 + dv
+    out.push(v)
+  return out
+
+# Connects to u: to an address of its host the rule allows (public: public addresses only), then TLS
+# for the host name when u is https.
+fn open_conn(net: Net, u: Url, ca: Str, alpn: Str, timeout: Float, public: Bool) -> Conn throws:
+  let addrs = net.resolve(u.host, timeout: timeout)?
+  var why = "no address for " + u.host
+  for a in addrs:
+    let k = ip_class(a)
+    if k == "metadata":
+      why = "refused to connect to " + u.host + " (" + a + "): a link-local address, where clouds serve credentials; a program that means to reach it uses net.connect"
+      continue
+    if public and k == "private":
+      why = "refused to connect to " + u.host + " (" + a + "): not a public address, and this request may only reach public ones"
+      continue
+    var c: Conn? = nil
+    match net.connect(a, u.port, timeout: timeout):
+      ok(conn): c = conn
+      err(e):
+        why = e + ""
+        continue
+    var cc = c else continue
+    if u.tls:
+      if ca != "" and alpn != "": net.start_tls(&cc, u.host, ca: ca, alpn: alpn, timeout: timeout)?
+      elif ca != "": net.start_tls(&cc, u.host, ca: ca, timeout: timeout)?
+      elif alpn != "": net.start_tls(&cc, u.host, alpn: alpn, timeout: timeout)?
+      else: net.start_tls(&cc, u.host, timeout: timeout)?
+    return cc
+  fail why
 
 # Sends the request on a new connection ("Connection: close") and reads the whole response. To keep
 # connections open between requests, and for HTTP/2, use a Client.
 fn send(net: Net, req: ClientRequest) -> Response throws:
+  return send_to(net, req, false)?
+
+# As get and send, but only to public addresses: for a URL that came from a user (a link to preview,
+# a webhook to call), which must not reach this machine or the private network.
+fn get_public(net: Net, url: Str) -> Response throws:
+  return send_to(net, ClientRequest("GET", url + "", [], "", 30.0, ""), true)?
+
+fn send_public(net: Net, req: ClientRequest) -> Response throws:
+  return send_to(net, req, true)?
+
+fn send_to(net: Net, req: ClientRequest, public: Bool) -> Response throws:
   let u = parse_url(req.url)?
   let out = request_head(u, req, false)? + req.body
-  let c = open_conn(net, u, req.ca, "", req.timeout)?
+  let c = open_conn(net, u, req.ca, "", req.timeout, public)?
   net.send(c, out, timeout: req.timeout)?
   var keep = false
   var got = false
@@ -741,7 +885,7 @@ fn send(net: Net, req: ClientRequest) -> Response throws:
 fn stream[T](net: Net, req: ClientRequest, var state: T, on_data: fn(var T, Str) -> Bool) -> Response throws:
   let u = parse_url(req.url)?
   let out = request_head(u, req, false)? + req.body
-  let c = open_conn(net, u, req.ca, "", req.timeout)?
+  let c = open_conn(net, u, req.ca, "", req.timeout, false)?
   net.send(c, out, timeout: req.timeout)?
   var buf = ""
   var status = 0
@@ -884,6 +1028,7 @@ type Client:
   http2: Bool        # offer HTTP/2 to https servers (true)
   opened: Int        # connections opened so far
   reused: Int        # requests sent on a connection that was already open
+  public_only: Bool  # connect only to public addresses (false): for URLs that come from users
 
 type Idle:
   key: Str           # scheme, host, port and the CA it was checked against
@@ -897,7 +1042,7 @@ fn copy_response(r: Response) -> Response:
   return Response(r.status, hs, r.body + "")
 
 fn client() -> Client:
-  return Client([], 8, true, 0, 0)
+  return Client([], 8, true, 0, 0, false)
 
 # A request with no headers or body, a 30 second timeout and the system's certificates.
 fn req(method: Str, url: Str) -> ClientRequest:
@@ -983,7 +1128,7 @@ fn fetch_all(var cl: Client, net: Net, reqs: [ClientRequest]) -> [Fetched]:
       if it.h2: usable = h2.client_ready(net, c, &it.k)
     if not usable:
       cn = nil
-      let c2 = open_conn(net, u, reqs[i].ca, "h2,http/1.1", reqs[i].timeout) else continue
+      let c2 = open_conn(net, u, reqs[i].ca, "h2,http/1.1", reqs[i].timeout, cl.public_only) else continue
       cl.opened += 1
       if net.protocol(c2) != "h2":
         # not HTTP/2: keep the connection for fetch, which sends these one by one
@@ -1077,7 +1222,7 @@ fn fetch(var cl: Client, net: Net, req: ClientRequest) -> Response throws:
     if not reused:
       var alpn = ""
       if u.tls and cl.http2: alpn = "h2,http/1.1"
-      let c = open_conn(net, u, req.ca, alpn, req.timeout)?
+      let c = open_conn(net, u, req.ca, alpn, req.timeout, cl.public_only)?
       cl.opened += 1
       var is_h2 = false
       if alpn != "": is_h2 = net.protocol(c) == "h2"

@@ -9,7 +9,11 @@ The first sections (Results through LLM tokens) are the comparison from rounds 1
 
 ## Releases
 
-**0.4.0** (2026-11-01): rounds 31 and 32. `vu speedup FILE.py:FUNC`: a slow Python function ported
+**0.4.0** (2026-11-01): rounds 31 to 33. Every web route says who may call it (`web.Anyone`,
+`web.SignedIn`, `web.Only`), or it doesn't compile; packages can't get a capability they weren't
+granted through callbacks, interfaces, closures or the command line; the HTTP client never connects
+to cloud metadata addresses, and `get_public` keeps user URLs off private networks. **Breaking:**
+`web.get` and the other route functions take a Who before the handler. `vu speedup FILE.py:FUNC`: a slow Python function ported
 to Vu (by a model, a coding agent or you), checked to give the same answers as the original on
 thousands of generated inputs (floats to the last bit), measured, and swapped in only when it's
 faster, with everything the Vu version can't take still running the Python. Ports of
@@ -2917,3 +2921,41 @@ loaded the library (200,000 overflow panics in a row: the process kept 18 MB).
 `tests/run_speedup.sh` (17 checks) is in the gate and in CI on all three platforms. Not measured: a
 model writing the ports through the API (no key here; the loop is tested against a fake API that
 answers with a port that doesn't compile, then a wrong one, then the right one).
+
+## Round 33: the mistakes that get backends hacked don't compile
+
+Most new backend code is written with an AI's help now, and a lot of it ships with the classic holes;
+compromised packages that steal tokens (the 2025 npm worms) are the other way in. Vu already refused
+SQL built at run time, text sent as HTML, and capabilities a package wasn't granted. This round
+closed the gaps in those, and added the two most common remaining ones: a route nobody decided
+about, and a request forged to the cloud's metadata address.
+
+- **Packages.** An audit of the wall around them found five ways in: a package not granted `os`
+  could still take a callback that returns an `Os`, a struct field holding such a callback, an
+  interface function returning one, or write a closure that takes one and have the caller call it;
+  and `args()`/`arg()` read the command line, where secrets are sometimes passed. Each is a compile
+  error now (function and interface types are walked for capabilities, closures written in a package
+  are checked, and the command line needs `os`); `tests/run_pkg.sh` tries all of them. A second
+  round (generics over structs holding capabilities, optional and list function types, interface
+  bounds) found nothing. `examples/supply-chain` shows the same compromised package in Node (the
+  token reaches the attacker's server) and in Vu (the build stops, naming the package), recorded from
+  a real run.
+- **Routes.** Every `web` route, WebSocket and stream takes a Who before its handler: `web.Anyone`,
+  `web.SignedIn(login)` or `web.Only(check)`; without one it doesn't compile, and the error says how to
+  write it. `auth.users` is middleware that finds the session's user once. The `vu new app` and
+  `vu new api` templates and the SaaS example declare each route's Who; the app template's handlers no
+  longer check sign-in themselves (the check that's easy to forget). Testing it found that the
+  `?next=` address wasn't fully encoded (an `&` in it would split it): it's percent-encoded now, and
+  the app template returns to it after signing in (only on this site).
+- **The HTTP client** resolves the host itself, refuses link-local addresses (169.254.169.254 and the
+  other metadata addresses, in IPv4, mapped, NAT64 and 6to4 spellings), connects to the address it
+  checked and then starts TLS for the name (`net.start_tls` gained `alpn:` for HTTP/2), so DNS can't
+  pass one address and connect to another. `get_public`, `send_public` and a `public_only` Client also
+  refuse private networks, for URLs from users. The classifier agrees with a Python model built on
+  `ipaddress` on 12,000 random addresses. My first version fell back to connecting by name when every
+  checked address failed, which would have reopened DNS rebinding; caught in review before it ran.
+- `sqlite.prepared` took any text as SQL; it takes `const` SQL now, like `query` and `exec`.
+
+Not done this round: a `Secret` type that can't be printed or logged (secrets in logs are the next
+most common leak). Not measured: whether models write Vu backends with fewer holes than in other
+languages; that needs the attack lab described in the plan.

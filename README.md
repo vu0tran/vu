@@ -1,15 +1,49 @@
 # Vu
 
+**A backend language where the common security mistakes don't compile, whoever writes the code:
+you, or the AI you asked.** Vu is small, compiled and memory-safe, with Python-style syntax. Its
+compiler and standard library turn the usual ways web backends get hacked into compile errors:
+
+- **SQL injection doesn't compile.** `pg.query`, `pg.exec` and SQLite's `query` and `exec` take SQL
+  written in the program; text built at run time can't be passed there, so values go in only as
+  `$1, $2`. (The one way to run SQL text, `run_sql`, is for migration files and consoles, and takes
+  no values.)
+- **XSS doesn't compile.** Templates escape every value, and text becomes HTML only through an
+  explicit `web.trust`.
+- **A package can't steal your secrets.** Each dependency gets only the capabilities its `vu.pkg`
+  line grants: files, the network, the environment (where tokens live), C. A compromised update that
+  reaches for any other stops the build, naming the package:
+
+  ![The same compromised package: in Node it sends GITHUB_TOKEN to the attacker; in Vu the build stops](examples/supply-chain/demo.gif)
+
+- **Every route says who may call it.** `web.get(&app, "/admin", web.Only(is_admin), admin)`; a route
+  without its `web.Anyone`, `web.SignedIn(...)` or `web.Only(...)` doesn't compile, so an endpoint
+  nobody decided about can't ship by accident.
+- **No forged requests to cloud credentials.** The HTTP client never connects to the metadata
+  address (169.254.169.254, in any spelling), checks addresses so DNS can't switch them, and
+  `http.get_public` keeps URLs from users off your private network.
+- And the rest done the way that's hard to get wrong: no memory bugs and no garbage collector, CSRF
+  tokens, cookies HttpOnly/Secure/SameSite by default, password hashes compatible with Django's,
+  rate limits for sign-in, path traversal and open redirects refused, TLS checks that can't be
+  turned off.
+
+```
+curl -fsSL https://vulang.org/install | sh
+vu new app notes      # a web app with accounts on PostgreSQL: every route with its Who, CSRF-checked forms
+```
+
+What it doesn't cover: which rows a signed-in user may see (queries still say
+`where user_id = $2`), logic mistakes, secrets you print yourself, C code you grant `ffi`, and bugs in
+Vu itself. [BREAK_IT.md](BREAK_IT.md) is how to report one.
+
+## Speed up slow Python
+
 **Make slow Python fast, and check that nothing changed.** `vu speedup` takes a slow Python function, gets
 a version of it in Vu (written by a model, your coding agent, or you), checks that it gives exactly
 the same answers as your Python on thousands of inputs, and swaps it in only if it's faster. Anything
 the Vu version can't handle runs your Python instead.
 
 ![vu speedup: did_you_mean goes from 15.5 ms to 2.1 ms, same answers on all 3000 inputs](examples/speedup/demo/demo.gif)
-
-```
-curl -fsSL https://vulang.org/install | sh
-```
 
 Ports of real, widely used pure-Python code, each checked on thousands of inputs (floats to the last
 bit) and measured on realistic data ([examples/speedup](examples/speedup)):

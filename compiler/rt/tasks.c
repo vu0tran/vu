@@ -1758,20 +1758,22 @@ static bool vu_net_tls_connect(vu_cap net, const vu_str *host, int64_t port, con
 }
 /* net.start_tls(&conn, host, ca:, timeout:): TLS on a connection that's already open (STARTTLS, as
    PostgreSQL and SMTP do it), with the same checks as tls_connect. */
-static bool vu_net_start_tls(vu_cap net, void **conn, const vu_str *host, const vu_str *ca, double timeout, bool has,
+static bool vu_net_start_tls(vu_cap net, void **conn, const vu_str *host, const vu_str *ca, const vu_str *alpn, double timeout, bool has,
                              vu_str *err, int line) {
     (void)net;
     vu_task_here("net.start_tls()", line);
     vu_sock *s = (vu_sock *)*conn;
     if (!s) { *err = vu_errf("net.start_tls(): the connection is closed"); return false; }
     if (s->ssl) { *err = vu_errf("net.start_tls(): the connection already uses TLS"); return false; }
+    unsigned char *wire = NULL;
+    if (alpn && !(wire = vu_alpn_wire(alpn, err))) return false;
     char *h = vu_cpath(host, err);
-    if (!h) { drop_Str(err); *err = vu_errf("a host name can't contain a zero byte"); return false; }
+    if (!h) { free(wire); drop_Str(err); *err = vu_errf("a host name can't contain a zero byte"); return false; }
     int64_t deadline = vu_deadline(timeout, has, line);
     ERR_clear_error();
     SSL_CTX *ctx;
     if (ca) {
-        if (ca->len > (1 << 24)) { free(h); *err = vu_errf("ca: the PEM text is too long"); return false; }
+        if (ca->len > (1 << 24)) { free(wire); free(h); *err = vu_errf("ca: the PEM text is too long"); return false; }
         ctx = vu_tls_ctx(false);
         X509_STORE *st = SSL_CTX_get_cert_store(ctx);
         BIO *b = vu_pem_bio(ca);
@@ -1780,7 +1782,7 @@ static bool vu_net_start_tls(vu_cap net, void **conn, const vu_str *host, const 
         while (b && (x = PEM_read_bio_X509(b, NULL, vu_no_password, NULL))) { X509_STORE_add_cert(st, x); X509_free(x); n++; }
         if (b) BIO_free(b);
         ERR_clear_error();
-        if (!n) { SSL_CTX_free(ctx); free(h); *err = vu_errf("ca: no certificate found in the PEM text"); return false; }
+        if (!n) { free(wire); SSL_CTX_free(ctx); free(h); *err = vu_errf("ca: no certificate found in the PEM text"); return false; }
     } else {
         pthread_mutex_lock(&vu_tls_lock);
         if (!vu_tls_system) {
@@ -1801,6 +1803,7 @@ static bool vu_net_start_tls(vu_cap net, void **conn, const vu_str *host, const 
         bool is_ip = inet_pton(AF_INET, h, ip) == 1 || inet_pton(AF_INET6, h, ip) == 1;
         if (is_ip) X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), h);
         else { SSL_set_tlsext_host_name(ssl, h); SSL_set1_host(ssl, h); }
+        if (wire) SSL_set_alpn_protos(ssl, wire + 1, wire[0]);
         SSL_set_connect_state(ssl);
         ok = vu_tls_handshake(s, deadline, err, line);
         if (!ok) {
@@ -1810,6 +1813,7 @@ static bool vu_net_start_tls(vu_cap net, void **conn, const vu_str *host, const 
         }
     }
     free(h);
+    free(wire);
     if (!ok) { vu_sock_drop(s); *conn = NULL; return false; }
     return true;
 }

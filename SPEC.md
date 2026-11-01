@@ -1244,11 +1244,16 @@ need github.com/someone/log v1.1.0 as slog        # imported as slog instead of 
 - `import pg` finds the package's `pg.vu` (the last part of its source; `as` changes the import
   name, not the file). A file next to the importing one comes first, then the packages, then `std`.
   Inside a package, imports see its own files and the packages its `vu.pkg` lists.
-- **A package receives only the capabilities its line grants** (`fs`, `net`, `os`, `ffi`): one of
-  its functions taking a capability it wasn't granted (directly, or inside a struct, list or
-  optional), or an `extern` block without `ffi`, is a compile error naming the package. A package
-  can pass on only what it was granted itself. So a dependency that starts reading files or calling
-  C in a new version stops the build until someone edits `vu.pkg` to allow it.
+- **A package receives only the capabilities its line grants** (`fs`, `net`, `os`, `ffi`): code in
+  it that would hold a capability it wasn't granted is a compile error naming the package: a
+  function taking or returning one (directly, or inside a struct, enum, list, map, optional, channel,
+  or a function value that takes or returns one), an interface function that takes or returns one, a
+  closure written in the package that takes or returns one, an `extern` block without `ffi`, and
+  `args()` or `arg()` (the command line, where secrets are sometimes passed) without `os`. A package
+  can pass on only what it was granted itself. So a dependency whose new version starts reading
+  environment variables, files or the network, or calling C, stops the build until someone edits
+  `vu.pkg` to allow it ([examples/supply-chain](examples/supply-chain)). What the program hands a
+  package on purpose is its choice: a `Dir` (one folder), or a closure such as `fn(k) => os.env(k)`.
 - Two different modules can't have the same name (a package and a local file, say); import a
   package under another name with `as`.
 - **The registry** names packages: `need clock v1.2.0 os` (a name instead of a source) is the
@@ -1375,6 +1380,16 @@ fn main(net: Net) throws:
   (`ca`: PEM certificates to trust for https, `""` for the system's). It sends one request per
   connection and reads bodies by length, chunked, or until the connection closes (up to 64 MB).
   It returns redirects instead of following them.
+- **Where the client connects.** It looks the host up, checks each address, connects to an address
+  it checked, and then starts TLS for the host name, so a name can't pass the check as one address and
+  connect to another (DNS rebinding). It never connects to a link-local address (169.254.0.0/16,
+  fe80::/10, and the metadata addresses 100.100.100.200 and fd00:ec2::254), however it's written
+  (an IPv6 form carrying the IPv4 address too): that's where clouds serve a machine's credentials,
+  the usual prize of a request forged through an app (SSRF). A program that means to reach a metadata
+  service uses `net.connect`. `http.get_public(net, url)`, `http.send_public(net, req)` and a
+  `Client` with `client.public_only = true` also refuse loopback, private and shared networks,
+  multicast and reserved ranges: use them for URLs that come from users (a link preview, a webhook
+  to call). `http.ip_class(addr)` says which an address is: `"metadata"`, `"private"` or `"public"`.
 - `client.fetch_all(net, requests)` sends a list of requests and gives an `http.Fetched` for each
   (`ok`, `resp`, `error`), in order: those to an HTTP/2 server go out at once on one connection, as
   many streams as the server allows, and their answers come back interleaved.
@@ -1419,10 +1434,24 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   web.use(&app, web.logger(os))          # middleware runs in the order added, around what follows
   web.use(&app, web.same_origin)
   web.use(&app, auth)
-  web.get(&app, "/items/:id", web.Anyone, show)      # also post, put, patch, delete, and web.route(&app, METHOD, ...)
+  web.get(&app, "/items/:id", web.SignedIn("/login"), show)   # also post, put, patch, delete, and web.route(&app, METHOD, ...)
   web.get(&app, "/static/*file", web.Anyone, web.files(fs, "public"))
   web.serve(net, os, app, 8080)?         # http.serve with the app; stops on SIGTERM / SIGINT
 ```
+
+- **Every route says who may call it**, before its handler, so a route nobody decided about can't be
+  added (it doesn't compile, and the error says how to say it):
+  - `web.Anyone`: no check (the home page, static files, a webhook that checks its own signature).
+  - `web.SignedIn(login)`: someone is signed in: middleware put a `"user"` value in the context
+    (`auth.users` does it from the session; `web.with(c, "user", id)` in your own). Otherwise 401,
+    or, for a page (GET or HEAD) when `login` isn't `""`, a redirect to `login` with `?next=` the page
+    (encoded; `web.redirect` keeps it on the site).
+  - `web.Only(check)`: `check(req, c) -> Bool` says yes, seeing the route's parameters and the
+    context: `web.Only(fn(r, c) => is_admin(c))`. Otherwise 403 (401 when no one is signed in).
+
+  Refusals are JSON (`{"error": ...}`) for a client that sends or asks for JSON. WebSocket and stream
+  routes take a Who too, checked before the connection is handed over. A Who decides who may call a
+  route, not which rows they may see: a query still says `where user_id = $2`.
 
 - A handler is a `fn(http.Request, web.Ctx) -> http.Response`. The first route that matches the
   method and path answers (HEAD runs a GET route); a path that matches only other methods' routes
@@ -1485,7 +1514,7 @@ fn main(net: Net, os: Os, fs: Fs) throws:
   folder (`..`, encoded or not), hidden files (a part starting with `.`), a NUL or a backslash get 404;
   a name ending in `/` gets its `index.html`. Each file has a `Content-Type` by its extension, `nosniff`,
   and an ETag, and `If-None-Match` gets 304. Symbolic links inside the folder are followed.
-- WebSockets: `web.websocket(&app, path, handler)` (the same patterns as `get`). The handshake passes
+- WebSockets: `web.websocket(&app, path, who, handler)` (the same patterns as `get`). The handshake passes
   the middleware like any request (which can refuse it: 401...), then the handler gets the open
   socket to own, with the request and the context, and has the connection until it returns:
 
@@ -1652,7 +1681,7 @@ let n = pg.exec(net, &db, "delete from users where id = $1", ["{id}"])?   # rows
   (`cfg.ca = fs.read("server-ca.pem")?`). A server that says it doesn't do TLS is refused, and so
   are bytes it sends before the handshake (they'd be read as if they came over TLS). `tests/run_pg_tls.py`
   runs a fake server with a test CA, a certificate for another host, a self-signed one, and these.
-  `net.start_tls(&conn, host, ca:, timeout:)` is what it uses: TLS on a connection already open.
+  `net.start_tls(&conn, host, ca:, alpn:, timeout:)` is what it uses: TLS on a connection already open.
 - `pg.from_url(os.env("DATABASE_URL"))?` reads the URL hosting platforms give
   (`postgresql://user:password@host:port/db?sslmode=require`): %-escapes are decoded, the port
   defaults to 5432 and the database to the user, an IPv6 host goes in brackets, and `sslmode`
@@ -1688,6 +1717,7 @@ let token = auth.login(net, &db, os, user_id, 30)?   # a session for 30 days
 auth.set_session(&resp, token, 30)                   # its cookie: HttpOnly, Secure, SameSite=Lax
 let who = auth.current_user(net, &db, os, req)?      # the user id (a Str?), from the cookie or a Bearer token
 auth.logout(net, &db, req)?                          # and auth.clear_session(&resp); auth.logout_all(net, &db, id)
+web.use(&app, auth.users(net, os, pool, cfg))        # middleware: the session's user as "user", for web.SignedIn
 ```
 
 - Hashes are PBKDF2-HMAC-SHA256 with 600,000 iterations (OWASP's number) and a random 22-character
@@ -1699,10 +1729,17 @@ auth.logout(net, &db, req)?                          # and auth.clear_session(&r
   API keys); the table keeps only their SHA-256 (`auth.token_hash`), so a copy of it can't sign
   anyone in. `auth.session_token(req)` reads `Authorization: Bearer TOKEN`, else the `session` cookie.
   `auth.prune(net, &db, os)?` deletes ended sessions.
+- `auth.users(net, os, pool, cfg)` is middleware that finds who is signed in, for routes that say
+  `web.SignedIn` or `web.Only`: a request with a live session (Bearer token or cookie) goes on with
+  the user's id as `"user"` in the context and the token as `"session"` (for `csrf_token`); any other
+  goes on without them, and the route's Who decides. It takes a connection from the pool only for a
+  request that has a token (503 if none is free or the database fails). It takes the pool and a
+  `pg.Config` to own: pass `pg.from_url(url)?` again, or `env.value.pool.share()`.
 - `auth.csrf_token(secret, session)` is an HMAC of the session token for a hidden form field
   (`csrf_token`) or an `X-CSRF-Token` header; `auth.csrf_ok(req, secret, session)` checks it.
   (`web.same_origin` refuses most cross-site requests already.)
-- `vu new api NAME` writes an app that uses all of this: sign-up, sign-in, sign-out and per-user data.
+- `vu new api NAME` and `vu new app NAME` write apps that use all of this: sign-up, sign-in, sign-out
+  and per-user data, each route with its Who.
 - `tests/run_auth.sh` checks the hashes against Django (both ways), malformed hashes, tokens, CSRF and
   cookies, the sessions in a real PostgreSQL, and that app over HTTP, plain and under the sanitizers.
 
