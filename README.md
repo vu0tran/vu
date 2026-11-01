@@ -497,6 +497,15 @@ lower is better. (Earlier rounds measured on another VM, where every time was hi
 not checked rather than guessing. Its parser handles the same 2.0 MB in 52 ms. Details, caveats
 and how it's tested against tsc: `ts/README.md`.
 
+## jq in Vu
+
+`jq/` holds vjq, a jq 1.7.1-compatible JSON processor written in Vu (8,800 lines). It passes all
+721 cases of jq's own test files (jq.test 447/447, man, onig, base64, optional) and gives
+byte-identical stdout, stderr and exit status on 2980 of 3000 random filter/document pairs
+fuzzed against jq. On 100 MB of JSON it pretty-prints in 1.7 s of CPU where jq takes 7.5 s, gojq
+4.7 s and jaq 4.0 s, and runs `map(select(.x > 5))` in 1.4 s (jq 4.5 s, jaq 1.9 s), measured on a
+loaded 2-core VM. Details and what's not done: `jq/README.md`.
+
 ## Built for the model that writes it
 
 Vu's compiler, runtime, standard library, tests and these documents were written by an AI model
