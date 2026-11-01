@@ -36,6 +36,7 @@ const F_REST_SIB = 64     # has a rest sibling in an object pattern
 const F_BODYLESS = 128    # only overload signatures (or declare function) so far
 const F_POSITIONAL = 256  # a parameter that's a plain name (or default or rest) at the top level
 const F_NSIMPORT = 512    # import * as x
+const F_TYPED = 1024      # a value merged with a type of the same name
 
 # reference flags
 const R_READ = 1
@@ -43,6 +44,7 @@ const R_WRITE = 2
 const R_TYPE = 4
 const R_SELF = 8          # inside its own declaration, or reading itself to update itself
 const R_EXPORT = 16       # export { x } or export default x
+const R_QUAL = 32         # the left of a qualified name A.B (not a self reference)
 
 # scope kinds
 const S_FILE = 1
@@ -119,6 +121,24 @@ fn declare(var sc: Scopes, s: Int, name: Int, pos: Int, kind: Int, flags: Int) -
   if value_meaning(kind) and vk in sc.tab: existing = sc.tab[vk]
   elif not value_meaning(kind) and tk in sc.tab: existing = sc.tab[tk]
   if existing < 0 and kind == Y_CLASS and tk in sc.tab and sc.yk[sc.tab[tk]] == Y_INTERFACE: existing = sc.tab[tk]
+  if existing < 0 and kind == Y_NAMESPACE and tk in sc.tab: existing = sc.tab[tk]
+  if existing < 0 and (kind == Y_TYPE or kind == Y_INTERFACE) and vk in sc.tab:
+    let ev = sc.tab[vk]
+    let evk = sc.yk[ev]
+    if evk == Y_VAR or evk == Y_LET or evk == Y_CONST or evk == Y_FUNC:
+      sc.tab[tk] = ev
+      sc.yf[ev] = sc.yf[ev] | F_TYPED | (flags & (F_EXPORTED | F_KEEP))
+      return ev
+  if existing < 0 and (kind == Y_VAR or kind == Y_LET or kind == Y_CONST or kind == Y_FUNC) and tk in sc.tab:
+    let et = sc.tab[tk]
+    let etk = sc.yk[et]
+    if etk == Y_TYPE or etk == Y_INTERFACE:
+      sc.tab[vk] = et
+      sc.yk[et] = kind
+      sc.ypos[et] = pos
+      sc.yf[et] = sc.yf[et] | flags | F_TYPED
+      return et
+  if existing < 0 and (kind == Y_INTERFACE or kind == Y_TYPE) and vk in sc.tab and sc.yk[sc.tab[vk]] == Y_NAMESPACE: existing = sc.tab[vk]
   if existing >= 0:
     let ek = sc.yk[existing]
     if ek == kind or (ek == Y_PARAM and kind == Y_VAR) or (ek == Y_INTERFACE and kind == Y_CLASS) or (ek == Y_CLASS and kind == Y_INTERFACE) or (ek == Y_NAMESPACE or kind == Y_NAMESPACE) or (ek == Y_INTERFACE and kind == Y_INTERFACE) or (ek == Y_FUNC and kind == Y_FUNC):
@@ -166,11 +186,12 @@ type B:
   sc: Scopes
   wexpr: Int       # the assignment or update being resolved (for write positions)
   loops: Int       # loops around the current position, in the current function
+  modstr: Int      # >0 inside declare module "x" { }
   ambient: Int     # >0 inside declare ... / declare module / .d.ts
   global_aug: Int  # >0 inside declare global { }
 
 fn build(own t: ast.Ast, root: Int, dts: Bool) -> B:
-  var b = B(t, new_scopes(), -1, 0, 0, 0)
+  var b = B(t, new_scopes(), -1, 0, 0, 0, 0)
   if dts: b.ambient = 1
   b.sc.ambient_file = dts
   # a module if it imports or exports anything
@@ -182,6 +203,11 @@ fn build(own t: ast.Ast, root: Int, dts: Bool) -> B:
   let fs = new_scope(&b.sc, S_FILE, -1, root)
   decl_list(&b, root, fs)
   resolve_list(&b, root, fs)
+  # decorators (resolved in the file's scope)
+  if -1000001 in b.t.dirs:
+    var ds: [Int] = []
+    for x in b.t.dirs[-1000001]: ds.push(x)
+    for x in ds: resolve(&b, x, fs, false)
   # JSX uses React (the classic runtime)
   var has_jsx = false
   for x in 0..b.t.k.len:
@@ -189,10 +215,11 @@ fn build(own t: ast.Ast, root: Int, dts: Bool) -> B:
       has_jsx = true
       break
   if has_jsx:
-    let rid = b.t.ids.get("React", -1)
-    if rid >= 0:
-      let y = lookup(b.sc, fs, rid, false)
-      if y >= 0: b.sc.reads[y] += 1
+    for pragma in ["React", "h"]:
+      let rid = b.t.ids.get(pragma, -1)
+      if rid >= 0:
+        let y = lookup(b.sc, fs, rid, false)
+        if y >= 0 and (pragma == "React" or b.sc.yk[y] == Y_IMPORT): b.sc.reads[y] += 1
   # a .d.ts file that isn't a module declares globals
   if dts and not b.sc.module:
     for y in 0..b.sc.yn.len:
@@ -205,7 +232,7 @@ fn has_export_mod(t: ast.Ast, st: Int) -> Bool:
 fn mods_of(t: ast.Ast, n: Int) -> Int:
   let kd = t.k[n]
   if kd == ast.N_VAR or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS: return t.d[n]
-  if kd == ast.N_FUNC or kd == ast.N_CLASS or kd == ast.N_ENUM or kd == ast.N_MODULE: return t.f[n]
+  if kd == ast.N_FUNC or kd == ast.N_CLASS or kd == ast.N_ENUM or kd == ast.N_MODULE or kd == ast.N_IMPORTEQ: return t.f[n]
   return 0
 
 fn decl_list(var b: B, l: Int, s: Int):
@@ -324,7 +351,7 @@ fn decl(var b: B, n: Int, s: Int):
     var kind = Y_TYPE
     if kd == ast.N_INTERFACE: kind = Y_INTERFACE
     var fl = base_flags(b, b.t.d[n])
-    if kd == ast.N_INTERFACE and b.sc.sk[s] == S_MODSTR: fl = fl | F_KEEP
+    if kd == ast.N_INTERFACE and b.modstr > 0: fl = fl | F_KEEP
     let y = declare(&b.sc, s, b.t.s[n], b.t.npos.get(n, b.t.pos[n]), kind, fl)
     if b.sc.ylo[y] < 0:
       b.sc.ylo[y] = b.t.pos[n]
@@ -360,6 +387,7 @@ fn decl(var b: B, n: Int, s: Int):
       kind = S_GLOBAL_AUG
     elif nm > 0 and b.t.k[nm] == ast.N_STR:
       b.ambient += 1
+      b.modstr += 1
       kind = S_MODSTR
     elif nm > 0:
       var first = nm
@@ -370,6 +398,7 @@ fn decl(var b: B, n: Int, s: Int):
         b.sc.yhi[y] = b.t.end[n]
     let ns = new_scope(&b.sc, kind, s, n)
     decl(&b, b.t.b[n], ns)
+    if kind == S_MODSTR: b.modstr -= 1
     b.ambient = was
     b.global_aug = wasg
     return
@@ -481,6 +510,9 @@ fn decl_tparams(var b: B, l: Int, s: Int):
   for i in 0..ast.count(b.t, l):
     let tp = ast.item(b.t, l, i)
     let y = declare(&b.sc, s, b.t.s[tp], b.t.pos[tp], Y_TPARAM, 0)
+    # (a use in its own constraint or default isn't a use)
+    b.sc.ylo[y] = b.t.pos[tp]
+    b.sc.yhi[y] = b.t.end[tp]
     if b.ambient > 0 or b.global_aug > 0: b.sc.yf[y] = b.sc.yf[y] | F_KEEP
     decl(&b, b.t.a[tp], s)
     decl(&b, b.t.b[tp], s)
@@ -511,7 +543,7 @@ fn decl_function(var b: B, n: Int, s: Int):
       continue
     var f = F_POSITIONAL
     if (b.t.f[p] & (ast.M_PUBLIC | ast.M_PRIVATE | ast.M_PROTECTED | ast.M_READONLY | ast.M_OVERRIDE)) != 0: f = f | F_KEEP
-    if bodyless or b.ambient > 0 or b.global_aug > 0 or kd == ast.N_SET: f = f | F_KEEP
+    if bodyless or b.ambient > 0 or b.global_aug > 0 or kd == ast.N_SET or (kd == ast.N_METHOD and (b.t.f[n] & ast.M_OVERRIDE) != 0 and (b.t.f[p] & ast.M_REST) == 0): f = f | F_KEEP
     let before = b.sc.yn.len
     bind_target(&b, tg, fs, Y_PARAM, f)
     var y = before
@@ -553,12 +585,12 @@ fn ref(var b: B, n: Int, s: Int, flags: Int):
   b.sc.anyref[y] += 1
   var f = flags
   let p = b.t.pos[n]
-  if b.sc.ylo[y] >= 0 and p >= b.sc.ylo[y] and p < b.sc.yhi[y]: f = f | R_SELF
+  if b.sc.ylo[y] >= 0 and p >= b.sc.ylo[y] and p < b.sc.yhi[y] and (f & R_QUAL) == 0: f = f | R_SELF
   if (f & R_WRITE) != 0:
     b.sc.writes[y] += 1
     if b.sc.ywrite_at[y] < 0: b.sc.ywrite_at[y] = p
   if (f & R_SELF) == 0:
-    if (f & (R_READ | R_EXPORT)) != 0 or ((f & R_TYPE) != 0 and type_meaning(b.sc.yk[y])): b.sc.reads[y] += 1
+    if (f & (R_READ | R_EXPORT)) != 0 or ((f & R_TYPE) != 0 and (type_meaning(b.sc.yk[y]) or (b.sc.yf[y] & F_TYPED) != 0)): b.sc.reads[y] += 1
     elif (f & R_TYPE) != 0: b.sc.treads[y] += 1
 
 # An assignment target: names are written (and read too for compound operators).
@@ -901,7 +933,10 @@ fn resolve(var b: B, n: Int, s: Int, ty: Bool):
     return
   if kd == ast.N_TLIT or kd == ast.N_TKW or kd == ast.N_TTHIS: return
   if kd == ast.N_JSXELEM:
-    let nm = b.t.a[n]
+    var nm = b.t.a[n]
+    if nm > 0 and b.t.k[nm] == ast.N_EXPRTARGS:
+      resolve(&b, b.t.b[nm], s, true)
+      nm = b.t.a[nm]
     if nm > 0:
       if b.t.k[nm] == ast.N_ID:
         let s0 = b.t.names[b.t.s[nm]]
@@ -956,7 +991,7 @@ fn resolve_entity(var b: B, n: Int, s: Int, ty: Bool):
     qualified = true
   if b.t.k[x] == ast.N_ID:
     # A.B in a type position: A is a namespace (or an enum, a class...): look it up as either
-    if ty and qualified: ref(&b, x, s, R_TYPE)
+    if ty and qualified: ref(&b, x, s, R_TYPE | R_QUAL)
     elif ty: ref(&b, x, s, R_TYPE)
     else: ref(&b, x, s, R_READ)
   else: resolve(&b, x, s, ty)
@@ -1049,9 +1084,10 @@ fn assign2(var b: B, n: Int, s: Int, unused: Bool):
     # value isn't a use (a = a + 1, a += 1)
     let y0 = lookup(b.sc, s, b.t.s[ul], false)
     var selfish = unused and y0 >= 0
-    if op == T_ASSIGN and selfish:
+    if selfish and op == T_ASSIGN:
       # (a = a + 1 in another function, or in a loop, uses the old value)
-      selfish = b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops <= b.sc.yloop[y0]
+      selfish = b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops == 0
+    elif selfish and b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops > 0: selfish = false
     if selfish and op != T_ASSIGN: f = f | R_SELF
     ref(&b, ul, s, f)
     if selfish: resolve_self(&b, right, s, y0)
@@ -1072,7 +1108,7 @@ fn update2(var b: B, n: Int, s: Int, unused: Bool):
   if b.t.k[x] == ast.N_ID:
     var f = R_WRITE | R_READ
     let y0 = lookup(b.sc, s, b.t.s[x], false)
-    if unused and y0 >= 0: f = f | R_SELF
+    if unused and y0 >= 0 and not (b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops > 0): f = f | R_SELF
     ref(&b, x, s, f)
     return
   resolve(&b, b.t.a[n], s, false)
