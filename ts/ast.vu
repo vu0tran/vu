@@ -179,6 +179,83 @@ type Node:
   s: Int
   file: Int
 
+# reference flags (a reference event's kind)
+const R_READ = 1
+const R_WRITE = 2
+const R_TYPE = 4
+const R_SELF = 8          # inside its own declaration, or reading itself to update itself
+const R_EXPORT = 16       # export { x } or export default x
+const R_QUAL = 32         # the left of a qualified name A.B (not a self reference)
+
+# the other events (kinds from 64)
+const Q_ASSIGN = 64     # n: an assignment to a name; s; x: loops * 2 + unused
+const Q_ASSIGN_END = 65 # n: its right side
+const Q_UPDATE = 66     # n: ++/-- of a name; s; x: loops * 2 + unused
+const Q_SETLOOP = 67    # n: a declared name; x: loops
+const Q_VARFN = 68      # n: a declared name; s: the function or class initializing it
+const Q_LOOPVAR = 69    # n: a for-in/of's left side
+const Q_IFACE = 70      # n: an interface (counts when it's in declare module "x" { }); s
+const Q_EXPSPEC = 71    # n: an export specifier; s
+const Q_EXPDEF = 72     # n: the name in export default x / export = x; s
+const Q_TPRED = 73      # n: a type predicate; s
+const Q_DEAD = 74       # nothing (an event taken back)
+
+# scope kinds
+const S_FILE = 1
+const S_FUNC = 2
+const S_BLOCK = 3
+const S_CLASS = 4
+const S_NS = 5
+const S_TYPE = 6
+const S_ENUM = 7
+const S_GLOBAL_AUG = 8   # declare global { }
+const S_MODSTR = 9       # declare module "x" { }
+
+# declaration events (d*): n the node, s the scope, x as noted. The context bits in x: C_AMB inside
+# declare ... (or a .d.ts file, added when replayed), C_GAUG inside declare global { }, C_MODSTR inside
+# declare module "x" { }.
+const C_AMB = 1
+const C_GAUG = 2
+const C_MODSTR = 4
+const D_SCOPE = 1       # a scope opens (its id: the scopes opened before it); s its parent; x its kind
+const D_FUNC = 2        # a function declaration's name; x context
+const D_CLASS = 3       # a class declaration's name; x context
+const D_CLASSNAME = 4   # a class expression's own name (in its class scope)
+const D_FNNAME = 5      # a function expression's own name (in its function scope)
+const D_IFACE = 6       # an interface or a type alias; x context
+const D_ENUM = 7        # an enum; x context
+const D_MEMBER = 8      # an enum member
+const D_NAMESPACE = 9   # a namespace's (first) name; x context
+const D_IMPORT = 10     # an import statement's names
+const D_IMPORTEQ = 11   # import x = ...
+const D_TPARAM = 12     # a type parameter; x context
+const D_TPARAM_K = 13   # a mapped type's or infer's type parameter
+const D_PARAM = 14      # a parameter (n) of the function x >> 3; x & 7 context
+const D_VAR = 15        # a declarator; x: kind (0 var 1 let 2 const 3 using) | V_* bits
+const D_CATCH = 16      # a catch clause's binding (n: the N_DECL)
+const D_PARAM0 = 17     # a parameter starts (what its defaults declare belongs to its function too)
+const V_EXPORT = 4
+const V_AMB = 8
+const V_GAUG = 16
+const V_FORIN = 32
+
+# Scope events, recorded by the parser in the linter's mode (scope.vu replays them): declarations
+# and scopes in d*, references and the other events in q* (each: kind, node, scope, extra).
+type Sev:
+  dk: [Int]
+  dn: [Int]
+  ds: [Int]
+  dx: [Int]
+  qk: [Int]
+  qn: [Int]
+  qs: [Int]
+  qx: [Int]
+  nscopes: Int     # scopes opened (the next one's id)
+  jsx: Bool        # the file has a JSX element
+
+fn new_sev() -> Sev:
+  return Sev([], [], [], [], [], [], [], [], 0, false)
+
 type Ast:
   nd: [Node]
   L: [Int]
@@ -188,13 +265,14 @@ type Ast:
   npos: {Int: Int}    # declaration node -> where its name starts (classes, functions...)
   dirs: {Int: [Int]}  # file -> its comment directives (start, end, kind triples)
   nocheck: {Int: Bool}
+  sv: Sev
 
 # An empty tree with nothing in it, not even name 0 or node 0 (a placeholder to swap with).
 fn blank() -> Ast:
-  return Ast([], [], [], [], [], {}, {}, {})
+  return Ast([], [], [], [], [], {}, {}, {}, new_sev())
 
 fn new_ast() -> Ast:
-  var t = Ast([], [], [], [], [], {}, {}, {})
+  var t = Ast([], [], [], [], [], {}, {}, {}, new_sev())
   intern(&t, "")          # name 0 is ""
   node(&t, N_EMPTY, 0, 0, 0)    # node 0 is unused, so 0 never means a real child
   return t
@@ -210,6 +288,16 @@ fn clear_nodes(var t: Ast):
   t.npos = {}
   t.dirs = {}
   t.nocheck = {}
+  t.sv.dk.truncate(0)
+  t.sv.dn.truncate(0)
+  t.sv.ds.truncate(0)
+  t.sv.dx.truncate(0)
+  t.sv.qk.truncate(0)
+  t.sv.qn.truncate(0)
+  t.sv.qs.truncate(0)
+  t.sv.qx.truncate(0)
+  t.sv.nscopes = 0
+  t.sv.jsx = false
 
 # A hash of s[a..b] (names are hashed often; SipHash's protection isn't needed for them): FNV-1a
 # over the bytes of a short name, over 8-byte words for a longer one (the last word overlapping the
@@ -343,13 +431,31 @@ fn item(t: Ast, l: Int, i: Int) -> Int:
   return t.L[t.nd[l].a + i]
 
 # Drops everything added after a mark (for the parser's speculative parses).
+# (and the scope events recorded after it)
 type Mark:
   nodes: Int
   lst: Int
+  dl: Int
+  ql: Int
+  nsc: Int
+  jsx: Bool
 
 fn mark(t: Ast) -> Mark:
-  return Mark(t.nd.len, t.L.len)
+  return Mark(t.nd.len, t.L.len, t.sv.dk.len, t.sv.qk.len, t.sv.nscopes, t.sv.jsx)
 
 fn reset(var t: Ast, m: Mark):
   t.nd.truncate(m.nodes)
   while t.L.len > m.lst: t.L.pop()
+  if t.sv.dk.len > m.dl or t.sv.qk.len > m.ql: sev_reset(&t.sv, m.dl, m.ql)
+  t.sv.nscopes = m.nsc
+  t.sv.jsx = m.jsx
+
+fn sev_reset(var v: Sev, dl: Int, ql: Int):
+  v.dk.truncate(dl)
+  v.dn.truncate(dl)
+  v.ds.truncate(dl)
+  v.dx.truncate(dl)
+  v.qk.truncate(ql)
+  v.qn.truncate(ql)
+  v.qs.truncate(ql)
+  v.qx.truncate(ql)
