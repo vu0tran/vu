@@ -1,0 +1,2136 @@
+# run: the interpreter. jq filters produce any number of outputs, so evaluation is written in
+# continuation-passing style with the continuations as data: ev(n, input, ...) runs node n and
+# hands each output to continuation k (an entry of it.ks, saying what to do next). Both the
+# continuations and the variable frames (it.fr) are pushed before a node runs and popped after,
+# since every output is delivered before ev returns. A continuation returns a status: go on,
+# break out to a label, or an error, which unwinds until a try (or the top) handles it.
+#
+# Path expressions (path(f), assignments, del, paths) run the same nodes with a path: each output
+# carries where it came from in the input (p >= 0, a chain in it.pp/it.pk), -2 for a value that
+# didn't come from a path, -1 when no path is being tracked.
+
+import jv
+import lang
+import nat
+from jv import V, St, vnull, vnum, vint, vbool, vstr, varr, vobj, kind, truthy, K_NULL, K_FALSE, K_TRUE, K_NUM, K_LIT, K_STR, K_ARR, K_OBJ
+from lang import N, Ast, FDef
+
+const ST_OK = 0
+const ST_BREAK = 1
+const ST_ERR = 2
+const ST_HALT = 3
+
+# frames
+const FR_VAR = 0
+const FR_CLOS = 1
+const FR_FUNC = 2
+const FR_LABEL = 3
+
+# call targets
+const CT_FRAME = 0
+const CT_STATIC = 1
+const CT_CLOS = 2
+const CT_NATIVE = 3
+
+# continuations
+const K_OUT = 1
+const K_PIPE = 2
+const K_COLLECT = 3
+const K_BINR = 4
+const K_BINL = 5
+const K_NEG = 6
+const K_FIELD = 7
+const K_IDXKEY = 8
+const K_INDEX = 9
+const K_SLFROM = 10
+const K_SLTO = 11
+const K_SLICE = 12
+const K_ITER = 13
+const K_OBJKEY = 14
+const K_OBJVAL = 15
+const K_STRPART = 16
+const K_ANDL = 17
+const K_ANDR = 18
+const K_ORL = 19
+const K_ORR = 20
+const K_ALT = 21
+const K_IF = 22
+const K_TRYOUT = 23
+const K_AS = 24
+const K_REDINIT = 25
+const K_REDSRC = 26
+const K_REDSET = 27
+const K_FORINIT = 28
+const K_FORSRC = 29
+const K_FORUPD = 30
+const K_VPARAM = 31
+const K_PATH = 32
+const K_UPDRHS = 33
+const K_UPDPATH = 34
+const K_FIRST = 35
+const K_NATARG = 36
+const K_SELECT = 37
+const K_RECURSE = 38
+const K_LIMIT = 39
+const K_ISEMPTY = 40
+const K_ANYGEN = 41
+const K_ANYCOND = 42
+const K_GENARG = 43
+const K_COLLECTP = 44
+const K_LAST = 45
+const K_ALTOUT = 46
+const K_ASALT = 47
+const K_FORMAT = 48
+const K_GETPATH = 49
+const K_LOOPC = 51
+const K_LOOPN = 52
+
+# scope entries (resolution)
+const SC_VAR = 0
+const SC_CLOS = 1
+const SC_FUNC = 2
+const SC_SFUNC = 3
+const SC_LABEL = 4
+
+type Fr:
+  par: Int
+  k: Int
+  v: V
+  a: Int
+  env: Int
+
+type Kf:
+  t: Int
+  n: Int
+  env: Int
+  nx: Int
+  i: Int
+  j: Int
+  v: V
+  w: V
+  p: Int
+
+type Scope:
+  kind: [Int]
+  name: [Str]
+  ar: [Int]
+  fid: [Int]
+  nglobal: Int
+
+type It:
+  st: St
+  ast: Ast
+  ffi: Ffi
+  fr: [Fr]
+  ks: [Kf]
+  simple: [Bool]
+  fd_static: [Bool]
+  fd_np: [Int]
+  fd_vs: [Int]       # start of the function's value parameters in fd_vp
+  fd_nv: [Int]
+  fd_vp: [Int]
+  err: V
+  bad: Bool
+  brk: Int
+  crossed: Int
+  lab: Int
+  owner: Int
+  pp: [Int]
+  pk: [V]
+  argv: [V]
+  genv: Int
+  cerr: Str          # compile error
+  cerrline: Int
+  # inputs
+  ipos: Int
+  iend: Int
+  ifiles: [Str]
+  istarts: [Int]
+  ifile: Int
+  iline: Int
+  ierr: Str
+  slurp: Bool
+  null_input: Bool
+  raw_input: Bool
+  # outputs
+  results: [V]
+  collect: Bool
+  raw: Bool
+  join: Bool
+  seq: Bool
+  ascii_out: Bool
+  halted: Bool
+  exit_code: Int
+  last_output: V
+  had_output: Bool
+  fname: Str
+  aown: [Int]
+  oown: [Int]
+  regex_cache: [nat.ReEntry]
+  env_obj: V
+  nid: nat.Ids
+  nkind: [Int]
+
+fn new_it(ffi: Ffi) -> It:
+  return It(jv.new_store(), lang.new_ast(), ffi, [], [], [], [], [], [], [], [], vnull(), false, 0, -1, 1, 1, [-1], [vnull()], [], -1, "", 0, 0, 0, [], [], 0, 0, "", false, false, false, [], false, false, false, false, false, false, 0, vnull(), false, "<stdin>", [], [], [], vnull(), nat.ids(), nat_kinds())
+
+fn nat_kinds() -> [Int]:
+  var ks: [Int] = []
+  let ns = nat.names()
+  for i in 0..ns.len:
+    if nat.is_val(i): ks.push(0)
+    else: ks.push(1 + nat.nvals(i))
+  return ks
+
+fn append_bytes(var it: It, s: V):
+  let id = s.k >> 4
+  let o = it.st.so[id]
+  let n = it.st.sl[id] >> 2
+  for i in o..o + n: it.st.b.push(it.st.b[i])
+
+# ---------------------------------------------------------------- errors and names
+
+fn kname(v: V) -> Str:
+  let k = v.k & 15
+  if k == K_NULL: return "null"
+  if k == K_FALSE or k == K_TRUE: return "boolean"
+  if k == K_NUM or k == K_LIT: return "number"
+  if k == K_STR: return "string"
+  if k == K_ARR: return "array"
+  return "object"
+
+# jq's jv_dump_string_trunc: the compact text cut to size-1 bytes, ending in "..." when cut.
+fn trunc_dump(var it: It, v: V, size: Int) -> Str:
+  let s = jv.to_json_str(&it.st, v)
+  if s.len <= size - 1: return s
+  return s[0..size - 4] + "..."
+
+fn errv(var it: It, v: V) -> Int:
+  it.err = v
+  return ST_ERR
+
+fn rfail(var it: It, msg: Str) -> Int:
+  let v = jv.new_str(&it.st, msg)
+  it.err = v
+  return ST_ERR
+
+# For value helpers: records an error and returns null.
+fn sfail(var it: It, msg: Str) -> V:
+  let v = jv.new_str(&it.st, msg)
+  it.err = v
+  it.bad = true
+  return vnull()
+
+fn type_err(var it: It, v: V, msg: Str) -> V:
+  let d = trunc_dump(&it, v, 15)
+  return sfail(&it, kname(v) + " (" + d + ") " + msg)
+
+fn type_err2(var it: It, a: V, b: V, msg: Str) -> V:
+  let da = trunc_dump(&it, a, 15)
+  let db = trunc_dump(&it, b, 15)
+  return sfail(&it, kname(a) + " (" + da + ") and " + kname(b) + " (" + db + ") " + msg)
+
+# ---------------------------------------------------------------- paths
+
+fn pnew(var it: It, p: Int, key: V) -> Int:
+  it.pp.push(p)
+  it.pk.push(key)
+  return it.pp.len - 1
+
+fn path_arr(var it: It, p: Int) -> V:
+  var keys: [V] = []
+  var q = p
+  while q > 0:
+    keys.push(it.pk[q])
+    q = it.pp[q]
+  let start = it.st.tv.len
+  var i = keys.len - 1
+  while i >= 0:
+    it.st.tv.push(keys[i])
+    i -= 1
+  return jv.end_arr(&it.st, start)
+
+# Path for an output computed from input `in` while tracking paths: the same path when it is the
+# very same value (as jq's identity check), else not a path.
+fn vp(p: Int, out: V, inp: V) -> Int:
+  if p == -1: return -1
+  if p >= 0 and out.k == inp.k and (out.n == inp.n or (out.n != out.n and inp.n != inp.n)): return p
+  return -2
+
+# ---------------------------------------------------------------- continuations and frames
+
+fn kpush(var it: It, t: Int, n: Int, env: Int, nx: Int) -> Int:
+  it.ks.push(Kf(t, n, env, nx, 0, 0, vnull(), vnull(), -1))
+  return it.ks.len - 1
+
+fn frpush(var it: It, par: Int, k: Int, v: V, a: Int, env: Int) -> Int:
+  it.fr.push(Fr(par, k, v, a, env))
+  return it.fr.len - 1
+
+fn up(it: It, env: Int, depth: Int) -> Int:
+  var e = env
+  var d = depth
+  while d > 0:
+    e = it.fr[e].par
+    d -= 1
+  return e
+
+# ---------------------------------------------------------------- value operations
+
+fn new_owner(var it: It) -> Int:
+  it.owner += 1
+  return it.owner
+
+fn track(var it: It):
+  while it.aown.len < it.st.ao.len: it.aown.push(0)
+  while it.oown.len < it.st.oo.len: it.oown.push(0)
+
+fn num_add(var it: It, a: V, b: V) -> V:
+  let ka = a.k & 15
+  let kb = b.k & 15
+  if (ka == K_NUM or ka == K_LIT) and (kb == K_NUM or kb == K_LIT): return vnum(a.n + b.n)
+  if ka == K_NULL: return b
+  if kb == K_NULL: return a
+  if ka == K_STR and kb == K_STR:
+    let start = it.st.b.len
+    let ia = a.k >> 4
+    let ib = b.k >> 4
+    let oa = it.st.so[ia]
+    let na = it.st.sl[ia] >> 2
+    let ob = it.st.so[ib]
+    let nb = it.st.sl[ib] >> 2
+    for i in oa..oa + na: it.st.b.push(it.st.b[i])
+    for i in ob..ob + nb: it.st.b.push(it.st.b[i])
+    let f = it.st.sl[ia] & it.st.sl[ib] & 3
+    return vstr(jv.add_span(&it.st, start, na + nb, f))
+  if ka == K_ARR and kb == K_ARR:
+    let na = jv.alen(it.st, a)
+    let nb = jv.alen(it.st, b)
+    if nb == 0: return a
+    if na == 0: return b
+    let start = it.st.tv.len
+    for i in 0..na: it.st.tv.push(jv.aget(it.st, a, i))
+    for i in 0..nb: it.st.tv.push(jv.aget(it.st, b, i))
+    return jv.end_arr(&it.st, start)
+  if ka == K_OBJ and kb == K_OBJ:
+    let start = it.st.tk.len
+    let na = jv.olen(it.st, a)
+    let nb = jv.olen(it.st, b)
+    for i in 0..na:
+      it.st.tk.push(jv.okey(it.st, a, i))
+      it.st.tw.push(jv.oval(it.st, a, i))
+    for i in 0..nb:
+      it.st.tk.push(jv.okey(it.st, b, i))
+      it.st.tw.push(jv.oval(it.st, b, i))
+    return jv.end_obj(&it.st, start)
+  return type_err2(&it, a, b, "cannot be added")
+
+fn binop(var it: It, op: Int, a: V, b: V) -> V:
+  if op == lang.OP_ADD: return num_add(&it, a, b)
+  let ka = a.k & 15
+  let kb = b.k & 15
+  let an = ka == K_NUM or ka == K_LIT
+  let bn = kb == K_NUM or kb == K_LIT
+  if op == lang.OP_SUB:
+    if an and bn: return vnum(a.n - b.n)
+    if ka == K_ARR and kb == K_ARR:
+      let start = it.st.tv.len
+      let na = jv.alen(it.st, a)
+      let nb = jv.alen(it.st, b)
+      for i in 0..na:
+        let x = jv.aget(it.st, a, i)
+        var found = false
+        for j in 0..nb:
+          if jv.veq(it.st, x, jv.aget(it.st, b, j)):
+            found = true
+            break
+        if not found: it.st.tv.push(x)
+      return jv.end_arr(&it.st, start)
+    return type_err2(&it, a, b, "cannot be subtracted")
+  if op == lang.OP_MUL:
+    if an and bn: return vnum(a.n * b.n)
+    if (ka == K_STR and bn) or (an and kb == K_STR):
+      var s = a
+      var nv = b.n
+      if an:
+        s = b
+        nv = a.n
+      if nv < 0.0 or nv != nv: return vnull()
+      var reps = 0
+      if nv >= 2147483647.0: reps = 2147483647
+      else: reps = int(nv)
+      let id = s.k >> 4
+      let o = it.st.so[id]
+      let len = it.st.sl[id] >> 2
+      let start = it.st.b.len
+      for r in 0..reps:
+        for i in o..o + len: it.st.b.push(it.st.b[i])
+      return vstr(jv.add_span(&it.st, start, len * reps, it.st.sl[id] & 3))
+    if ka == K_OBJ and kb == K_OBJ: return deep_merge(&it, a, b)
+    return type_err2(&it, a, b, "cannot be multiplied")
+  if op == lang.OP_DIV:
+    if an and bn:
+      if b.n == 0.0: return type_err2(&it, a, b, "cannot be divided because the divisor is zero")
+      return vnum(a.n / b.n)
+    if ka == K_STR and kb == K_STR: return nat.split_str(&it, a, b)
+    return type_err2(&it, a, b, "cannot be divided")
+  if op == lang.OP_MOD:
+    if an and bn:
+      if a.n != a.n or b.n != b.n: return vnum(0.0 / 0.0)
+      let y = dtoi(b.n)
+      if y == 0: return type_err2(&it, a, b, "cannot be divided (remainder) because the divisor is zero")
+      if y == -1: return vint(0)
+      return vint(dtoi(a.n) % y)
+    return type_err2(&it, a, b, "cannot be divided (remainder)")
+  if op == lang.OP_EQ: return vbool(jv.veq(it.st, a, b))
+  if op == lang.OP_NE: return vbool(not jv.veq(it.st, a, b))
+  let c = jv.vcmp(it.st, a, b)
+  if op == lang.OP_LT: return vbool(c < 0)
+  if op == lang.OP_LE: return vbool(c <= 0)
+  if op == lang.OP_GT: return vbool(c > 0)
+  return vbool(c >= 0)
+
+# A double to Int as C's (intmax_t) cast does for jq's %: saturating, NaN as 0.
+fn dtoi(x: Float) -> Int:
+  if x != x: return 0
+  if x >= 9223372036854775807.0: return 9223372036854775807
+  if x <= -9223372036854775808.0: return -9223372036854775807 - 1
+  return int(x)
+
+fn deep_merge(var it: It, a: V, b: V) -> V:
+  let start = it.st.tk.len
+  let na = jv.olen(it.st, a)
+  for i in 0..na:
+    it.st.tk.push(jv.okey(it.st, a, i))
+    it.st.tw.push(jv.oval(it.st, a, i))
+  let nb = jv.olen(it.st, b)
+  for i in 0..nb:
+    let key = jv.okey(it.st, b, i)
+    let bv = jv.oval(it.st, b, i)
+    var pos = -1
+    for j in start..it.st.tk.len:
+      if it.st.tk[j] == key:
+        pos = j
+        break
+    if pos >= 0:
+      let av = it.st.tw[pos]
+      if kind(av) == K_OBJ and kind(bv) == K_OBJ:
+        let m = deep_merge(&it, av, bv)
+        it.st.tw[pos] = m
+      else:
+        it.st.tw[pos] = bv
+    else:
+      it.st.tk.push(key)
+      it.st.tw.push(bv)
+  return jv.end_obj(&it.st, start)
+
+fn negate(var it: It, a: V) -> V:
+  let k = a.k & 15
+  if k == K_NUM or k == K_LIT: return vnum(-a.n)
+  return type_err(&it, a, "cannot be negated")
+
+# t[key] for a string key id (interned), as .name does.
+fn index_field(var it: It, t: V, key: Int) -> V:
+  let k = t.k & 15
+  if k == K_OBJ:
+    let pos = jv.ofind(it.st, t, key)
+    if pos < 0: return vnull()
+    return jv.oval(it.st, t, pos)
+  if k == K_NULL: return vnull()
+  let ks = jv.sid_str(it.st, key)
+  if ks.len < 30: return sfail(&it, "Cannot index " + kname(t) + " with string \"" + ks + "\"")
+  return sfail(&it, "Cannot index " + kname(t) + " with string")
+
+# jv_get: t[k] for any key.
+fn index_val(var it: It, t: V, key: V) -> V:
+  let k = t.k & 15
+  let kk = key.k & 15
+  if k == K_OBJ and kk == K_STR:
+    let id = jv.intern_id(&it.st, key.k >> 4)
+    return index_field(&it, t, id)
+  if k == K_ARR and (kk == K_NUM or kk == K_LIT):
+    if key.n != key.n: return vnull()
+    var d = key.n
+    if d < -2147483648.0: d = -2147483648.0
+    if d > 2147483647.0: d = 2147483647.0
+    var idx = int(d)
+    let n = jv.alen(it.st, t)
+    if idx < 0: idx += n
+    if idx < 0 or idx >= n: return vnull()
+    return jv.aget(it.st, t, idx)
+  if (k == K_ARR or k == K_STR) and kk == K_OBJ:
+    let sk = jv.intern_str(&it.st, "start")
+    let ek = jv.intern_str(&it.st, "end")
+    var from = vnull()
+    var to = vnull()
+    let pf = jv.ofind(it.st, key, sk)
+    if pf >= 0: from = jv.oval(it.st, key, pf)
+    let pt = jv.ofind(it.st, key, ek)
+    if pt >= 0: to = jv.oval(it.st, key, pt)
+    return slice(&it, t, from, to)
+  if k == K_ARR and kk == K_ARR: return nat.indexes(&it, t, key)
+  if k == K_NULL and (kk == K_STR or kk == K_NUM or kk == K_LIT or kk == K_OBJ): return vnull()
+  if kk == K_STR:
+    let ks = jv.str_of(it.st, key)
+    if ks.len < 30: return sfail(&it, "Cannot index " + kname(t) + " with string \"" + ks + "\"")
+  return sfail(&it, "Cannot index " + kname(t) + " with " + kname(key))
+
+# parse_slice: the start and end indexes (clamped, end rounded up) for length len.
+fn slice_bounds(var it: It, len: Int, from: V, to: V) -> [Int]:
+  var f = from
+  var t = to
+  if kind(t) == K_NULL: t = vint(len)
+  if kind(f) == K_NULL: f = vnum(0.0)
+  if not jv.is_num(f) or not jv.is_num(t):
+    it.bad = true
+    let v = jv.new_str(&it.st, "Array/string slice indices must be integers")
+    it.err = v
+    return [0, 0]
+  var ds = f.n
+  var de = t.n
+  let dl = float(len)
+  if ds != ds: ds = 0.0
+  if ds < 0.0: ds += dl
+  if ds < 0.0: ds = 0.0
+  if ds > dl: ds = dl
+  var s = 2147483647
+  if ds <= 2147483647.0: s = int(ds)
+  if de != de: de = dl
+  if de < 0.0: de += dl
+  if de < 0.0: de = float(s)
+  var e = 2147483647
+  if de <= 2147483647.0: e = int(de)
+  if e > len: e = len
+  if e < len and float(e) < de: e += 1
+  if e < s: e = s
+  return [s, e]
+
+fn slice(var it: It, t: V, from: V, to: V) -> V:
+  let k = t.k & 15
+  if k == K_NULL: return vnull()
+  if k == K_ARR:
+    let n = jv.alen(it.st, t)
+    let be = slice_bounds(&it, n, from, to)
+    if it.bad: return vnull()
+    return jv.sub_arr(&it.st, t, be[0], be[1] - be[0])
+  if k == K_STR:
+    let n = nat.cp_len(it.st, t)
+    let be = slice_bounds(&it, n, from, to)
+    if it.bad: return vnull()
+    return nat.str_slice_cp(&it, t, be[0], be[1])
+  if kind(from) == K_STR or kind(to) == K_STR:
+    return sfail(&it, "Start and end indices of an array slice must be numbers")
+  return sfail(&it, "Cannot index " + kname(t) + " with object")
+
+fn tostring(var it: It, v: V) -> V:
+  if kind(v) == K_STR: return v
+  let s = jv.to_json_str(&it.st, v)
+  return jv.new_str(&it.st, s)
+
+# ---------------------------------------------------------------- simple evaluation
+
+# Single-output nodes evaluated directly, without continuations. Errors set it.bad.
+fn sev(var it: It, n: Int, v: V, env: Int) -> V:
+  let nd = it.ast.ns[n]
+  let k = nd.k
+  if k == lang.N_ID: return v
+  if k == lang.N_FIELD:
+    var t = v
+    if nd.a >= 0 and it.ast.ns[nd.a].k != lang.N_ID:
+      t = sev(&it, nd.a, v, env)
+      if it.bad: return vnull()
+    return index_field(&it, t, nd.x)
+  if k == lang.N_LIT: return nd.v
+  if k == lang.N_VAR: return it.fr[up(it, env, nd.e)].v
+  if k == lang.N_BIN:
+    let b = sev(&it, nd.b, v, env)
+    if it.bad: return vnull()
+    let a = sev(&it, nd.a, v, env)
+    if it.bad: return vnull()
+    return binop(&it, nd.x, a, b)
+  if k == lang.N_INDEX:
+    let key = sev(&it, nd.b, v, env)
+    if it.bad: return vnull()
+    let t = sev(&it, nd.a, v, env)
+    if it.bad: return vnull()
+    return index_val(&it, t, key)
+  if k == lang.N_PIPE:
+    let x = sev(&it, nd.a, v, env)
+    if it.bad: return vnull()
+    return sev(&it, nd.b, x, env)
+  if k == lang.N_AND or k == lang.N_OR:
+    let a = sev(&it, nd.a, v, env)
+    if it.bad: return vnull()
+    if k == lang.N_AND and not truthy(a): return vbool(false)
+    if k == lang.N_OR and truthy(a): return vbool(true)
+    let b = sev(&it, nd.b, v, env)
+    if it.bad: return vnull()
+    return vbool(truthy(b))
+  if k == lang.N_NEG:
+    let a = sev(&it, nd.a, v, env)
+    if it.bad: return vnull()
+    return negate(&it, a)
+  if k == lang.N_CALL:
+    return sev_call(&it, n, v, env)
+  if k == lang.N_SLICE:
+    var from = vnull()
+    if nd.b >= 0:
+      from = sev(&it, nd.b, v, env)
+      if it.bad: return vnull()
+    var to = vnull()
+    if nd.d >= 0:
+      to = sev(&it, nd.d, v, env)
+      if it.bad: return vnull()
+    let t = sev(&it, nd.a, v, env)
+    if it.bad: return vnull()
+    return slice(&it, t, from, to)
+  if k == lang.N_ARR:
+    if nd.a < 0: return jv.empty_arr(&it.st)
+    let x = sev(&it, nd.a, v, env)
+    if it.bad: return vnull()
+    let start = it.st.tv.len
+    it.st.tv.push(x)
+    return jv.end_arr(&it.st, start)
+  if k == lang.N_OBJ:
+    let start = it.st.tk.len
+    for i in 0..nd.c:
+      let kn = it.ast.kids[nd.b + 2 * i]
+      let vn = it.ast.kids[nd.b + 2 * i + 1]
+      let key = sev(&it, kn, v, env)
+      if it.bad:
+        jv.obj_fail(&it.st, start)
+        return vnull()
+      if kind(key) != K_STR:
+        jv.obj_fail(&it.st, start)
+        return obj_key_err(&it, key)
+      let val = sev(&it, vn, v, env)
+      if it.bad:
+        jv.obj_fail(&it.st, start)
+        return vnull()
+      let kid = jv.intern_id(&it.st, key.k >> 4)
+      it.st.tk.push(kid)
+      it.st.tw.push(val)
+    return jv.end_obj(&it.st, start)
+  if k == lang.N_STR:
+    let start = it.st.tv.len
+    var i = nd.c - 1
+    while i >= 0:
+      let pn = it.ast.kids[nd.b + i]
+      let x = sev(&it, pn, v, env)
+      if it.bad:
+        it.st.tv.truncate(start)
+        return vnull()
+      it.st.tv.push(x)
+      i -= 1
+    return str_join_parts(&it, n, start)
+  if k == lang.N_FORMAT:
+    return nat.format(&it, nd.x, v)
+  if k == lang.N_ALT:
+    let a = sev(&it, nd.a, v, env)
+    if it.bad:
+      it.bad = false
+    elif truthy(a):
+      return a
+    return sev(&it, nd.b, v, env)
+  if k == lang.N_IF:
+    let c = sev(&it, nd.a, v, env)
+    if it.bad: return vnull()
+    if truthy(c): return sev(&it, nd.b, v, env)
+    if nd.c < 0: return v
+    return sev(&it, nd.c, v, env)
+  return sfail(&it, "internal: not simple")
+
+fn obj_key_err(var it: It, key: V) -> V:
+  let d = trunc_dump(&it, key, 15)
+  return sfail(&it, "Cannot use " + kname(key) + " (" + d + ") as object key")
+
+# An interpolated string from its parts' values, pushed on tv from start in reverse order.
+fn str_join_parts(var it: It, n: Int, start: Int) -> V:
+  let nd = it.ast.ns[n]
+  let fmt = nd.x
+  let b0 = it.st.b.len
+  var buf: [Byte] = []
+  var i = it.st.tv.len - 1
+  var pi = 0
+  while i >= start:
+    let x = it.st.tv[i]
+    let pn = it.ast.kids[nd.b + pi]
+    if it.ast.ns[pn].k == lang.N_LIT and kind(x) == K_STR:
+      append_str(it.st, x, &buf)
+    elif fmt >= 0:
+      let f = nat.format(&it, fmt, x)
+      if it.bad:
+        it.st.tv.truncate(start)
+        return vnull()
+      append_str(it.st, f, &buf)
+    elif kind(x) == K_STR:
+      append_str(it.st, x, &buf)
+    else:
+      let s = jv.to_json_str(&it.st, x)
+      for c in bytes(s): buf.push(c)
+    i -= 1
+    pi += 1
+  it.st.tv.truncate(start)
+  let off = it.st.b.len
+  for c in buf: it.st.b.push(c)
+  return jv.end_str(&it.st, off)
+
+fn append_str(st: St, s: V, var out: [Byte]):
+  let id = s.k >> 4
+  let o = st.so[id]
+  let n = st.sl[id] >> 2
+  for i in o..o + n: out.push(st.b[i])
+
+# ---------------------------------------------------------------- the evaluator
+
+fn emit(var it: It, k: Int, v: V, p: Int) -> Int:
+  let kf = it.ks[k]
+  let t = kf.t
+  if t == K_PIPE: return ev(&it, kf.n, v, p, kf.env, kf.nx)
+  if t == K_COLLECT:
+    it.st.tv.push(v)
+    return ST_OK
+  if t == K_OUT: return output(&it, v)
+  if t == K_ITER:
+    let nd = it.ast.ns[kf.n]
+    return do_iter(&it, v, p, nd.c != 0, kf.nx)
+  if t == K_FIELD:
+    let nd = it.ast.ns[kf.n]
+    return do_field(&it, nd, v, p, kf.nx)
+  if t == K_BINR:
+    # got the right operand: now the left, then the operator
+    let nd = it.ast.ns[kf.n]
+    if it.simple[nd.a]:
+      let a = sev(&it, nd.a, kf.v, kf.env)
+      if it.bad: return bad_status(&it)
+      let r = binop(&it, nd.x, a, v)
+      if it.bad: return bad_status(&it)
+      return emit(&it, kf.nx, r, vp(kf.p, r, kf.v))
+    let k2 = kpush(&it, K_BINL, kf.n, kf.env, kf.nx)
+    it.ks[k2].w = v
+    it.ks[k2].v = kf.v
+    it.ks[k2].p = kf.p
+    let s = ev(&it, nd.a, kf.v, -1, kf.env, k2)
+    it.ks.truncate(k2)
+    return s
+  if t == K_BINL:
+    let nd = it.ast.ns[kf.n]
+    let r = binop(&it, nd.x, v, kf.w)
+    if it.bad: return bad_status(&it)
+    return emit(&it, kf.nx, r, vp(kf.p, r, kf.v))
+  if t == K_IF:
+    let nd = it.ast.ns[kf.n]
+    if truthy(v): return ev(&it, nd.b, kf.v, kf.p, kf.env, kf.nx)
+    if nd.c < 0: return emit(&it, kf.nx, kf.v, kf.p)
+    return ev(&it, nd.c, kf.v, kf.p, kf.env, kf.nx)
+  if t == K_SELECT:
+    if truthy(v): return emit(&it, kf.nx, kf.v, kf.p)
+    return ST_OK
+  if t == K_TRYOUT:
+    let s = emit(&it, kf.nx, v, p)
+    if s == ST_ERR and it.crossed < 0: it.crossed = k
+    return s
+  return emit2(&it, k, kf, v, p)
+
+fn bad_status(var it: It) -> Int:
+  it.bad = false
+  return ST_ERR
+
+fn do_field(var it: It, nd: N, t: V, p: Int, k: Int) -> Int:
+  if p == -2:
+    let key = vstr(nd.x)
+    return invalid_access(&it, key, t)
+  let r = index_field(&it, t, nd.x)
+  if it.bad:
+    it.bad = false
+    if nd.c != 0: return ST_OK
+    return ST_ERR
+  if p >= 0:
+    let _h2 = pnew(&it, p, vstr(nd.x))
+    return emit(&it, k, r, _h2)
+  return emit(&it, k, r, -1)
+
+fn invalid_access(var it: It, key: V, t: V) -> Int:
+  let dk = trunc_dump(&it, key, 15)
+  let dt = trunc_dump(&it, t, 30)
+  return rfail(&it, "Invalid path expression near attempt to access element " + dk + " of " + dt)
+
+fn do_index(var it: It, t: V, key: V, p: Int, opt: Bool, k: Int) -> Int:
+  if p == -2: return invalid_access(&it, key, t)
+  let r = index_val(&it, t, key)
+  if it.bad:
+    it.bad = false
+    if opt: return ST_OK
+    return ST_ERR
+  if p >= 0:
+    let _h3 = pnew(&it, p, key)
+    return emit(&it, k, r, _h3)
+  return emit(&it, k, r, -1)
+
+fn do_slice(var it: It, t: V, from: V, to: V, p: Int, opt: Bool, k: Int) -> Int:
+  if p == -2:
+    let key = slice_key(&it, from, to)
+    return invalid_access(&it, key, t)
+  let r = slice(&it, t, from, to)
+  if it.bad:
+    it.bad = false
+    if opt: return ST_OK
+    return ST_ERR
+  if p >= 0:
+    let key = slice_key(&it, from, to)
+    let _h4 = pnew(&it, p, key)
+    return emit(&it, k, r, _h4)
+  return emit(&it, k, r, -1)
+
+fn slice_key(var it: It, from: V, to: V) -> V:
+  let start = it.st.tk.len
+  it.st.tk.push(jv.intern_str(&it.st, "start"))
+  it.st.tw.push(from)
+  it.st.tk.push(jv.intern_str(&it.st, "end"))
+  it.st.tw.push(to)
+  return jv.end_obj(&it.st, start)
+
+fn do_iter(var it: It, t: V, p: Int, opt: Bool, k: Int) -> Int:
+  if p == -2:
+    let d = trunc_dump(&it, t, 30)
+    return rfail(&it, "Invalid path expression near attempt to iterate through " + d)
+  let kd = t.k & 15
+  if kd == K_ARR:
+    let n = jv.alen(it.st, t)
+    for i in 0..n:
+      let x = jv.aget(it.st, t, i)
+      var q = -1
+      if p >= 0: q = pnew(&it, p, vint(i))
+      let s = emit(&it, k, x, q)
+      if s != ST_OK: return s
+    return ST_OK
+  if kd == K_OBJ:
+    let n = jv.olen(it.st, t)
+    for i in 0..n:
+      let x = jv.oval(it.st, t, i)
+      var q = -1
+      if p >= 0:
+        let _h5 = vstr(jv.okey(it.st, t, i))
+        q = pnew(&it, p, _h5)
+      let s = emit(&it, k, x, q)
+      if s != ST_OK: return s
+    return ST_OK
+  if opt: return ST_OK
+  let d = trunc_dump(&it, t, 15)
+  return rfail(&it, "Cannot iterate over " + kname(t) + " (" + d + ")")
+
+fn emit2(var it: It, k: Int, kf: Kf, v: V, p: Int) -> Int:
+  let t = kf.t
+  if t == K_IDXKEY:
+    # got the key of .[key]: now the term
+    let nd = it.ast.ns[kf.n]
+    let ta = it.ast.ns[nd.a]
+    if ta.k == lang.N_ID: return do_index(&it, kf.v, v, kf.p, nd.c != 0, kf.nx)
+    let k2 = kpush(&it, K_INDEX, kf.n, kf.env, kf.nx)
+    it.ks[k2].w = v
+    let s = ev(&it, nd.a, kf.v, kf.p, kf.env, k2)
+    it.ks.truncate(k2)
+    return s
+  if t == K_INDEX:
+    let nd = it.ast.ns[kf.n]
+    return do_index(&it, v, kf.w, p, nd.c != 0, kf.nx)
+  if t == K_SLFROM:
+    return slice_after_from(&it, kf.n, kf.v, kf.p, kf.env, kf.nx, v)
+  if t == K_SLTO:
+    return slice_term(&it, kf.n, kf.v, kf.p, kf.env, kf.nx, kf.w, v)
+  if t == K_SLICE:
+    let nd = it.ast.ns[kf.n]
+    let _h6 = it.argv[kf.i]
+    return do_slice(&it, v, kf.w, _h6, p, nd.c != 0, kf.nx)
+  if t == K_NEG:
+    let r = negate(&it, v)
+    if it.bad: return bad_status(&it)
+    return emit(&it, kf.nx, r, vp(kf.p, r, kf.v))
+  if t == K_OBJKEY:
+    if kind(v) != K_STR:
+      obj_key_err(&it, v)
+      return bad_status(&it)
+    return obj_val(&it, kf.n, kf.i, v, kf.v, kf.env, kf.nx, kf.j, kf.p)
+  if t == K_OBJVAL:
+    let kid = jv.intern_id(&it.st, kf.w.k >> 4)
+    it.st.tk.push(kid)
+    it.st.tw.push(v)
+    let s = obj_step(&it, kf.n, kf.i + 1, kf.v, kf.env, kf.nx, kf.j, kf.p)
+    it.st.tk.pop()
+    it.st.tw.pop()
+    return s
+  if t == K_STRPART:
+    it.st.tv.push(v)
+    let s = str_step(&it, kf.n, kf.i - 1, kf.v, kf.env, kf.nx, kf.j, kf.p)
+    it.st.tv.pop()
+    return s
+  if t == K_ANDL:
+    let nd = it.ast.ns[kf.n]
+    if nd.k == lang.N_AND and not truthy(v): return emit(&it, kf.nx, vbool(false), vp(kf.p, vbool(false), kf.v))
+    if nd.k == lang.N_OR and truthy(v): return emit(&it, kf.nx, vbool(true), vp(kf.p, vbool(true), kf.v))
+    let k2 = kpush(&it, K_ANDR, kf.n, kf.env, kf.nx)
+    it.ks[k2].v = kf.v
+    it.ks[k2].p = kf.p
+    let s = ev(&it, nd.b, kf.v, -1, kf.env, k2)
+    it.ks.truncate(k2)
+    return s
+  if t == K_ANDR:
+    let r = vbool(truthy(v))
+    return emit(&it, kf.nx, r, vp(kf.p, r, kf.v))
+  if t == K_ALT:
+    if truthy(v):
+      it.ks[k].i = 1
+      return emit(&it, kf.nx, v, p)
+    return ST_OK
+  if t == K_AS:
+    return bind_and_run(&it, kf.n, v, kf.v, kf.p, kf.env, kf.nx)
+  if t == K_REDINIT:
+    return reduce_run(&it, kf.n, kf.v, kf.env, kf.nx, v)
+  if t == K_REDSRC:
+    let nd = it.ast.ns[kf.n]
+    let base = it.fr.len
+    let env2 = push_pattern_frames(&it, nd.b, kf.env, nd.e)
+    let s0 = destructure(&it, nd.b, v, base, kf.env)
+    if s0 != ST_OK:
+      it.fr.truncate(base)
+      return s0
+    let acc = it.ks[k].w
+    it.ks[k].w = vnull()
+    let k2 = kpush(&it, K_REDSET, kf.n, env2, k)
+    let s = ev(&it, nd.d, acc, -1, env2, k2)
+    it.ks.truncate(k2)
+    it.fr.truncate(base)
+    return s
+  if t == K_REDSET:
+    it.ks[kf.nx].w = v
+    return ST_OK
+  if t == K_FORINIT:
+    return foreach_run(&it, kf.n, kf.v, kf.env, kf.nx, v)
+  if t == K_FORSRC:
+    let nd = it.ast.ns[kf.n]
+    let base = it.fr.len
+    let env2 = push_pattern_frames(&it, nd.b, kf.env, nd.e)
+    let s0 = destructure(&it, nd.b, v, base, kf.env)
+    if s0 != ST_OK:
+      it.fr.truncate(base)
+      return s0
+    let acc = it.ks[k].w
+    let k2 = kpush(&it, K_FORUPD, kf.n, env2, k)
+    let s = ev(&it, nd.d, acc, -1, env2, k2)
+    it.ks.truncate(k2)
+    it.fr.truncate(base)
+    return s
+  if t == K_FORUPD:
+    let nd = it.ast.ns[kf.n]
+    it.ks[kf.nx].w = v
+    let outer = it.ks[kf.nx]
+    if nd.x < 0: return emit(&it, outer.nx, v, -1)
+    return ev(&it, nd.x, v, -1, kf.env, outer.nx)
+  if t == K_VPARAM:
+    let base = it.fr.len
+    let fe = frpush(&it, kf.env, FR_VAR, v, -1, -1)
+    let s = bind_vparams(&it, kf.i, kf.j + 1, fe, kf.n, kf.w.k, kf.v, kf.p, kf.nx)
+    it.fr.truncate(base)
+    return s
+  if t == K_PATH:
+    if p == -2:
+      let d = trunc_dump(&it, v, 30)
+      return rfail(&it, "Invalid path expression with result " + d)
+    let arr = path_arr(&it, p)
+    return emit(&it, kf.nx, arr, vp(kf.p, arr, kf.v))
+  if t == K_NATARG:
+    it.argv.push(v)
+    let s = nat_args(&it, kf.j, kf.n, kf.i - 1, kf.v, kf.p, kf.env, kf.nx)
+    it.argv.pop()
+    return s
+  if t == K_GENARG:
+    it.argv.push(v)
+    let s = gen_args(&it, kf.j, kf.n, kf.i + 1, kf.v, kf.p, kf.env, kf.nx)
+    it.argv.pop()
+    return s
+  if t == K_ASALT:
+    let s = emit(&it, kf.nx, v, p)
+    if s == ST_ERR and it.crossed < 0: it.crossed = k
+    return s
+  if t == K_ALTOUT:
+    let s = emit(&it, kf.nx, v, p)
+    if s == ST_ERR and it.crossed < 0: it.crossed = k
+    return s
+  return nat.kont(&it, k, kf, v, p)
+
+# a slice's start is known: now its end, then the term
+fn slice_after_from(var it: It, n: Int, v: V, p: Int, env: Int, k: Int, from: V) -> Int:
+  let nd = it.ast.ns[n]
+  if nd.d < 0: return slice_term(&it, n, v, p, env, k, from, vnull())
+  if it.simple[nd.d]:
+    let to = sev(&it, nd.d, v, env)
+    if it.bad: return bad_status(&it)
+    return slice_term(&it, n, v, p, env, k, from, to)
+  let k2 = kpush(&it, K_SLTO, n, env, k)
+  it.ks[k2].v = v
+  it.ks[k2].p = p
+  it.ks[k2].w = from
+  let s = ev(&it, nd.d, v, -1, env, k2)
+  it.ks.truncate(k2)
+  return s
+
+fn slice_term(var it: It, n: Int, v: V, p: Int, env: Int, k: Int, from: V, to: V) -> Int:
+  let nd = it.ast.ns[n]
+  if it.ast.ns[nd.a].k == lang.N_ID: return do_slice(&it, v, from, to, p, nd.c != 0, k)
+  it.argv.push(to)
+  let k2 = kpush(&it, K_SLICE, n, env, k)
+  it.ks[k2].w = from
+  it.ks[k2].i = it.argv.len - 1
+  let s = ev(&it, nd.a, v, p, env, k2)
+  it.ks.truncate(k2)
+  it.argv.pop()
+  return s
+
+fn obj_step(var it: It, n: Int, i: Int, v: V, env: Int, k: Int, start: Int, p: Int) -> Int:
+  let nd = it.ast.ns[n]
+  if i == nd.c:
+    let s0 = it.st.tk.len
+    for j in start..s0:
+      it.st.tk.push(it.st.tk[j])
+      it.st.tw.push(it.st.tw[j])
+    let o = jv.end_obj(&it.st, s0)
+    return emit(&it, k, o, vp(p, o, v))
+  let kn = it.ast.kids[nd.b + 2 * i]
+  if it.simple[kn]:
+    let key = sev(&it, kn, v, env)
+    if it.bad: return bad_status(&it)
+    if kind(key) != K_STR:
+      obj_key_err(&it, key)
+      return bad_status(&it)
+    return obj_val(&it, n, i, key, v, env, k, start, p)
+  let k2 = kpush(&it, K_OBJKEY, n, env, k)
+  it.ks[k2].i = i
+  it.ks[k2].v = v
+  it.ks[k2].j = start
+  it.ks[k2].p = p
+  let s = ev(&it, kn, v, -1, env, k2)
+  it.ks.truncate(k2)
+  return s
+
+fn obj_val(var it: It, n: Int, i: Int, key: V, v: V, env: Int, k: Int, start: Int, p: Int) -> Int:
+  let nd = it.ast.ns[n]
+  let vn = it.ast.kids[nd.b + 2 * i + 1]
+  if it.simple[vn]:
+    let val = sev(&it, vn, v, env)
+    if it.bad: return bad_status(&it)
+    let kid = jv.intern_id(&it.st, key.k >> 4)
+    it.st.tk.push(kid)
+    it.st.tw.push(val)
+    let s = obj_step(&it, n, i + 1, v, env, k, start, p)
+    it.st.tk.pop()
+    it.st.tw.pop()
+    return s
+  let k2 = kpush(&it, K_OBJVAL, n, env, k)
+  it.ks[k2].i = i
+  it.ks[k2].v = v
+  it.ks[k2].j = start
+  it.ks[k2].w = key
+  it.ks[k2].p = p
+  let s = ev(&it, vn, v, -1, env, k2)
+  it.ks.truncate(k2)
+  return s
+
+# String interpolation: the last part varies slowest (as jq's left-nested + does).
+fn str_step(var it: It, n: Int, i: Int, v: V, env: Int, k: Int, start: Int, p: Int) -> Int:
+  let nd = it.ast.ns[n]
+  if i < 0:
+    # parts are on tv from start, last part first; str_join_parts pops them, so copy first
+    let s0 = it.st.tv.len
+    for j in start..s0: it.st.tv.push(it.st.tv[j])
+    let r = str_join_parts(&it, n, s0)
+    if it.bad: return bad_status(&it)
+    return emit(&it, k, r, vp(p, r, v))
+  let pn = it.ast.kids[nd.b + i]
+  if it.simple[pn]:
+    let x = sev(&it, pn, v, env)
+    if it.bad: return bad_status(&it)
+    it.st.tv.push(x)
+    let s = str_step(&it, n, i - 1, v, env, k, start, p)
+    it.st.tv.pop()
+    return s
+  let k2 = kpush(&it, K_STRPART, n, env, k)
+  it.ks[k2].i = i
+  it.ks[k2].v = v
+  it.ks[k2].j = start
+  it.ks[k2].p = p
+  let s = ev(&it, pn, v, -1, env, k2)
+  it.ks.truncate(k2)
+  return s
+
+fn ev(var it: It, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  if p == -1 and it.simple[n]:
+    let r = sev(&it, n, v, env)
+    if it.bad: return bad_status(&it)
+    return emit(&it, k, r, vp(p, r, v))
+  let nd = it.ast.ns[n]
+  let kd = nd.k
+  if kd == lang.N_ID: return emit(&it, k, v, p)
+  if kd == lang.N_PIPE:
+    if p == -1 and it.simple[nd.a]:
+      let x = sev(&it, nd.a, v, env)
+      if it.bad: return bad_status(&it)
+      return ev(&it, nd.b, x, -1, env, k)
+    let k2 = kpush(&it, K_PIPE, nd.b, env, k)
+    let s = ev(&it, nd.a, v, p, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_COMMA:
+    let s = ev(&it, nd.a, v, p, env, k)
+    if s != ST_OK: return s
+    return ev(&it, nd.b, v, p, env, k)
+  if kd == lang.N_FIELD:
+    let ta = it.ast.ns[nd.a]
+    if ta.k == lang.N_ID: return do_field(&it, nd, v, p, k)
+    let k2 = kpush(&it, K_FIELD, n, env, k)
+    let s = ev(&it, nd.a, v, p, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_ITER:
+    let ta = it.ast.ns[nd.a]
+    if ta.k == lang.N_ID: return do_iter(&it, v, p, nd.c != 0, k)
+    if p == -1 and it.simple[nd.a]:
+      let x = sev(&it, nd.a, v, env)
+      if it.bad:
+        it.bad = false
+        if nd.c != 0: return ST_OK
+        return ST_ERR
+      return do_iter(&it, x, -1, nd.c != 0, k)
+    let k2 = kpush(&it, K_ITER, n, env, k)
+    let s = ev(&it, nd.a, v, p, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_LIT: return emit(&it, k, nd.v, vp(p, nd.v, v))
+  if kd == lang.N_VAR:
+    let x = it.fr[up(it, env, nd.e)].v
+    return emit(&it, k, x, vp(p, x, v))
+  if kd == lang.N_INDEX:
+    if it.simple[nd.b]:
+      let key = sev(&it, nd.b, v, env)
+      if it.bad: return bad_status(&it)
+      let ta = it.ast.ns[nd.a]
+      if ta.k == lang.N_ID: return do_index(&it, v, key, p, nd.c != 0, k)
+      let k2 = kpush(&it, K_INDEX, n, env, k)
+      it.ks[k2].w = key
+      let s = ev(&it, nd.a, v, p, env, k2)
+      it.ks.truncate(k2)
+      return s
+    let k2 = kpush(&it, K_IDXKEY, n, env, k)
+    it.ks[k2].v = v
+    it.ks[k2].p = p
+    let s = ev(&it, nd.b, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_SLICE:
+    if nd.b < 0: return slice_after_from(&it, n, v, p, env, k, vnull())
+    let k2 = kpush(&it, K_SLFROM, n, env, k)
+    it.ks[k2].v = v
+    it.ks[k2].p = p
+    let s = ev(&it, nd.b, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_ARR:
+    if nd.a < 0:
+      let e = jv.empty_arr(&it.st)
+      return emit(&it, k, e, vp(p, e, v))
+    let start = it.st.tv.len
+    let k2 = kpush(&it, K_COLLECT, -1, env, -1)
+    let s = ev(&it, nd.a, v, -1, env, k2)
+    it.ks.truncate(k2)
+    if s != ST_OK:
+      it.st.tv.truncate(start)
+      return s
+    let arr = jv.end_arr(&it.st, start)
+    return emit(&it, k, arr, vp(p, arr, v))
+  if kd == lang.N_OBJ:
+    let start = it.st.tk.len
+    let s = obj_step(&it, n, 0, v, env, k, start, p)
+    it.st.tk.truncate(start)
+    it.st.tw.truncate(start)
+    return s
+  if kd == lang.N_STR:
+    let start = it.st.tv.len
+    let s = str_step(&it, n, nd.c - 1, v, env, k, start, p)
+    it.st.tv.truncate(start)
+    return s
+  if kd == lang.N_BIN:
+    if it.simple[nd.b]:
+      let b = sev(&it, nd.b, v, env)
+      if it.bad: return bad_status(&it)
+      let k2 = kpush(&it, K_BINL, n, env, k)
+      it.ks[k2].w = b
+      it.ks[k2].v = v
+      it.ks[k2].p = p
+      let s = ev(&it, nd.a, v, -1, env, k2)
+      it.ks.truncate(k2)
+      return s
+    let k2 = kpush(&it, K_BINR, n, env, k)
+    it.ks[k2].v = v
+    it.ks[k2].p = p
+    let s = ev(&it, nd.b, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_NEG:
+    let k2 = kpush(&it, K_NEG, n, env, k)
+    it.ks[k2].v = v
+    it.ks[k2].p = p
+    let s = ev(&it, nd.a, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_AND or kd == lang.N_OR:
+    let k2 = kpush(&it, K_ANDL, n, env, k)
+    it.ks[k2].v = v
+    it.ks[k2].p = p
+    let s = ev(&it, nd.a, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_ALT:
+    let k2 = kpush(&it, K_ALT, n, env, k)
+    let k3 = kpush(&it, K_ALTOUT, n, env, k2)
+    let saved = it.crossed
+    it.crossed = -1
+    var s = ev(&it, nd.a, v, p, env, k3)
+    let any = it.ks[k2].i
+    it.ks.truncate(k2)
+    if s == ST_ERR:
+      if it.crossed == k3:
+        it.crossed = saved
+        return s
+      if it.crossed >= 0: return s
+      s = ST_OK
+    it.crossed = saved
+    if s != ST_OK: return s
+    if any != 0: return ST_OK
+    return ev(&it, nd.b, v, p, env, k)
+  if kd == lang.N_IF:
+    if it.simple[nd.a]:
+      let c = sev(&it, nd.a, v, env)
+      if it.bad: return bad_status(&it)
+      if truthy(c): return ev(&it, nd.b, v, p, env, k)
+      if nd.c < 0: return emit(&it, k, v, p)
+      return ev(&it, nd.c, v, p, env, k)
+    let k2 = kpush(&it, K_IF, n, env, k)
+    it.ks[k2].v = v
+    it.ks[k2].p = p
+    let s = ev(&it, nd.a, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_TRY: return ev_try(&it, n, v, p, env, k)
+  if kd == lang.N_AS:
+    if it.simple[nd.a]:
+      let x = sev(&it, nd.a, v, env)
+      if it.bad: return bad_status(&it)
+      return bind_and_run(&it, n, x, v, p, env, k)
+    let k2 = kpush(&it, K_AS, n, env, k)
+    it.ks[k2].v = v
+    it.ks[k2].p = p
+    let s = ev(&it, nd.a, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_REDUCE:
+    if it.simple[nd.c]:
+      let init = sev(&it, nd.c, v, env)
+      if it.bad: return bad_status(&it)
+      return reduce_run(&it, n, v, env, k, init)
+    let k2 = kpush(&it, K_REDINIT, n, env, k)
+    it.ks[k2].v = v
+    let s = ev(&it, nd.c, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_FOREACH:
+    if it.simple[nd.c]:
+      let init = sev(&it, nd.c, v, env)
+      if it.bad: return bad_status(&it)
+      return foreach_run(&it, n, v, env, k, init)
+    let k2 = kpush(&it, K_FORINIT, n, env, k)
+    it.ks[k2].v = v
+    let s = ev(&it, nd.c, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if kd == lang.N_LABEL:
+    it.lab += 1
+    let id = it.lab
+    let base = it.fr.len
+    let e2 = frpush(&it, env, FR_LABEL, vint(id), -1, -1)
+    let s = ev(&it, nd.a, v, p, e2, k)
+    it.fr.truncate(base)
+    if s == ST_BREAK and it.brk == id: return ST_OK
+    return s
+  if kd == lang.N_BREAK:
+    let f = up(it, env, nd.e)
+    it.brk = int(it.fr[f].v.n)
+    return ST_BREAK
+  if kd == lang.N_DEF:
+    if it.fd_static[nd.x]: return ev(&it, nd.a, v, p, env, k)
+    let base = it.fr.len
+    let e2 = frpush(&it, env, FR_FUNC, vnull(), nd.x, -1)
+    let s = ev(&it, nd.a, v, p, e2, k)
+    it.fr.truncate(base)
+    return s
+  if kd == lang.N_CALL: return ev_call(&it, n, v, p, env, k)
+  if kd == lang.N_UPD: return ev_update(&it, n, v, p, env, k)
+  if kd == lang.N_FORMAT:
+    let r = nat.format(&it, nd.x, v)
+    if it.bad: return bad_status(&it)
+    return emit(&it, k, r, vp(p, r, v))
+  return rfail(&it, "internal: bad node")
+
+fn ev_try(var it: It, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let nd = it.ast.ns[n]
+  let k2 = kpush(&it, K_TRYOUT, n, env, k)
+  let saved = it.crossed
+  it.crossed = -1
+  let s = ev(&it, nd.a, v, p, env, k2)
+  it.ks.truncate(k2)
+  if s != ST_ERR:
+    it.crossed = saved
+    return s
+  if it.crossed == k2:
+    it.crossed = saved
+    return s
+  if it.crossed >= 0: return s
+  it.crossed = saved
+  # caught
+  let e = it.err
+  if nd.b < 0:
+    return ST_OK
+  return ev(&it, nd.b, e, vp(p, e, v), env, k)
+
+# ---------------------------------------------------------------- destructuring
+
+# Pushes one frame per variable of the pattern list (all alternatives' variables), null-valued.
+fn push_pattern_frames(var it: It, pat: Int, env: Int, nvars: Int) -> Int:
+  var e = env
+  for i in 0..nvars:
+    e = frpush(&it, e, FR_VAR, vnull(), -1, -1)
+  return e
+
+# Binds value v to pattern pat; variables are frames base + slot. env: for key expressions.
+fn destructure(var it: It, pat: Int, v: V, base: Int, env: Int) -> Int:
+  let nd = it.ast.ns[pat]
+  if nd.k == lang.N_P_VAR:
+    it.fr[base + nd.e].v = v
+    return ST_OK
+  if nd.k == lang.N_P_ARR:
+    for i in 0..nd.c:
+      let sub = it.ast.kids[nd.b + i]
+      let kv = vint(i)
+      let x = index_val(&it, v, kv)
+      if it.bad: return bad_status(&it)
+      let s = destructure(&it, sub, x, base, env)
+      if s != ST_OK: return s
+    return ST_OK
+  if nd.k == lang.N_P_OBJ:
+    for i in 0..nd.c:
+      let kn = it.ast.kids[nd.b + 3 * i]
+      let vn = it.ast.kids[nd.b + 3 * i + 1]
+      let pn = it.ast.kids[nd.b + 3 * i + 2]
+      # key expressions see the variables bound so far
+      let key = sev_key(&it, kn, v, base, env)
+      if it.bad: return bad_status(&it)
+      if kind(key) != K_STR:
+        let d = trunc_dump(&it, key, 15)
+        return rfail(&it, "Cannot index " + kname(v) + " with " + kname(key))
+      let x = index_val(&it, v, key)
+      if it.bad: return bad_status(&it)
+      if vn >= 0: it.fr[base + it.ast.ns[vn].e].v = x
+      if pn >= 0:
+        let s = destructure(&it, pn, x, base, env)
+        if s != ST_OK: return s
+    return ST_OK
+  return rfail(&it, "internal: bad pattern")
+
+fn sev_key(var it: It, kn: Int, v: V, base: Int, env: Int) -> V:
+  # the key expression runs with the pattern's frames visible (env is the last frame)
+  let _h7 = it.fr.len - 1
+  return sev(&it, kn, v, _h7)
+
+fn bind_and_run(var it: It, n: Int, x: V, v: V, p: Int, env: Int, k: Int) -> Int:
+  let nd = it.ast.ns[n]
+  let base = it.fr.len
+  let env2 = push_pattern_frames(&it, -1, env, nd.e)
+  if nd.c == 1:
+    let pat = it.ast.kids[nd.b]
+    let s0 = destructure(&it, pat, x, base, env)
+    if s0 != ST_OK:
+      it.fr.truncate(base)
+      return s0
+    let s = ev(&it, nd.d, v, p, env2, k)
+    it.fr.truncate(base)
+    return s
+  # ?// alternatives: an error (in destructuring or the body) moves on to the next pattern
+  var s = ST_OK
+  for i in 0..nd.c:
+    for j in 0..nd.e: it.fr[base + j].v = vnull()
+    let pat = it.ast.kids[nd.b + i]
+    let last = i == nd.c - 1
+    s = destructure(&it, pat, x, base, env)
+    if s == ST_ERR and not last: continue
+    if s != ST_OK: break
+    if last:
+      s = ev(&it, nd.d, v, p, env2, k)
+      break
+    let k2 = kpush(&it, K_ASALT, n, env2, k)
+    let saved = it.crossed
+    it.crossed = -1
+    s = ev(&it, nd.d, v, p, env2, k2)
+    it.ks.truncate(k2)
+    if s == ST_ERR:
+      if it.crossed == k2:
+        it.crossed = saved
+        break
+      if it.crossed >= 0: break
+      it.crossed = saved
+      continue
+    it.crossed = saved
+    break
+  it.fr.truncate(base)
+  return s
+
+fn reduce_run(var it: It, n: Int, v: V, env: Int, k: Int, init: V) -> Int:
+  let nd = it.ast.ns[n]
+  let k2 = kpush(&it, K_REDSRC, n, env, k)
+  it.ks[k2].w = init
+  let s = ev(&it, nd.a, v, -1, env, k2)
+  let acc = it.ks[k2].w
+  it.ks.truncate(k2)
+  if s != ST_OK: return s
+  return emit(&it, k, acc, -1)
+
+fn foreach_run(var it: It, n: Int, v: V, env: Int, k: Int, init: V) -> Int:
+  let nd = it.ast.ns[n]
+  let k2 = kpush(&it, K_FORSRC, n, env, k)
+  it.ks[k2].w = init
+  let s = ev(&it, nd.a, v, -1, env, k2)
+  it.ks.truncate(k2)
+  return s
+
+# ---------------------------------------------------------------- calls
+
+fn ev_call(var it: It, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let nd = it.ast.ns[n]
+  if nd.d == CT_NATIVE: return nat.call(&it, nd.e, n, v, p, env, k)
+  if nd.d == CT_CLOS:
+    let f = up(it, env, nd.e)
+    let fr = it.fr[f]
+    return ev(&it, fr.a, v, p, fr.env, k)
+  var fid = nd.e
+  var defenv = it.genv
+  if nd.d == CT_FRAME:
+    let f = up(it, env, nd.e)
+    fid = it.fr[f].a
+    defenv = f
+  return call_user(&it, fid, defenv, n, v, p, env, k)
+
+fn call_user(var it: It, fid: Int, defenv: Int, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let nd = it.ast.ns[n]
+  let base = it.fr.len
+  var par = defenv
+  let np = it.fd_np[fid]
+  for i in 0..np:
+    let _h8 = it.ast.kids[nd.b + i]
+    par = frpush(&it, par, FR_CLOS, vnull(), _h8, env)
+  var s = ST_OK
+  if it.fd_nv[fid] == 0:
+    let _h9 = it.ast.fdefs[fid].body
+    s = ev(&it, _h9, v, p, par, k)
+  else:
+    s = bind_vparams(&it, fid, 0, par, n, env, v, p, k)
+  it.fr.truncate(base)
+  return s
+
+# Binds value parameter j (and the ones after it) of function fid, then runs its body.
+fn bind_vparams(var it: It, fid: Int, j: Int, par: Int, n: Int, cenv: Int, v: V, p: Int, k: Int) -> Int:
+  if j == it.fd_nv[fid]:
+    let _h10 = it.ast.fdefs[fid].body
+    return ev(&it, _h10, v, p, par, k)
+  let pi = it.fd_vp[it.fd_vs[fid] + j]
+  let nd = it.ast.ns[n]
+  let an = it.ast.kids[nd.b + pi]
+  if it.simple[an]:
+    let x = sev(&it, an, v, cenv)
+    if it.bad: return bad_status(&it)
+    let base = it.fr.len
+    let fe = frpush(&it, par, FR_VAR, x, -1, -1)
+    let s = bind_vparams(&it, fid, j + 1, fe, n, cenv, v, p, k)
+    it.fr.truncate(base)
+    return s
+  let k2 = kpush(&it, K_VPARAM, n, par, k)
+  it.ks[k2].i = fid
+  it.ks[k2].j = j
+  it.ks[k2].w = V(cenv, 0.0)
+  it.ks[k2].v = v
+  it.ks[k2].p = p
+  let s = ev(&it, an, v, -1, cenv, k2)
+  it.ks.truncate(k2)
+  return s
+
+# Value natives: arguments evaluated last first (the last varies slowest, as jq's C functions).
+fn nat_args(var it: It, id: Int, n: Int, i: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  if i < 0:
+    let r = nat.call_val(&it, id, n, v)
+    if it.bad: return bad_status(&it)
+    return emit(&it, k, r, vp(p, r, v))
+  let nd = it.ast.ns[n]
+  let an = it.ast.kids[nd.b + i]
+  if it.simple[an]:
+    let x = sev(&it, an, v, env)
+    if it.bad: return bad_status(&it)
+    it.argv.push(x)
+    let s = nat_args(&it, id, n, i - 1, v, p, env, k)
+    it.argv.pop()
+    return s
+  let k2 = kpush(&it, K_NATARG, n, env, k)
+  it.ks[k2].i = i
+  it.ks[k2].j = id
+  it.ks[k2].v = v
+  it.ks[k2].p = p
+  let s = ev(&it, an, v, -1, env, k2)
+  it.ks.truncate(k2)
+  return s
+
+# Generator natives with value arguments bound first to last (the first varies slowest, as a jq
+# def with $parameters does); then nat.gen runs with the values on argv.
+fn gen_args(var it: It, id: Int, n: Int, i: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let nd = it.ast.ns[n]
+  if i == it.nkind[id] - 1: return nat.gen(&it, id, n, v, p, env, k)
+  let an = it.ast.kids[nd.b + i]
+  if it.simple[an]:
+    let x = sev(&it, an, v, env)
+    if it.bad: return bad_status(&it)
+    it.argv.push(x)
+    let s = gen_args(&it, id, n, i + 1, v, p, env, k)
+    it.argv.pop()
+    return s
+  let k2 = kpush(&it, K_GENARG, n, env, k)
+  it.ks[k2].i = i
+  it.ks[k2].j = id
+  it.ks[k2].v = v
+  it.ks[k2].p = p
+  let s = ev(&it, an, v, -1, env, k2)
+  it.ks.truncate(k2)
+  return s
+
+fn sev_call(var it: It, n: Int, v: V, env: Int) -> V:
+  let nd = it.ast.ns[n]
+  let start = it.argv.len
+  var i = nd.c - 1
+  while i >= 0:
+    let _h11 = it.ast.kids[nd.b + i]
+    let x = sev(&it, _h11, v, env)
+    if it.bad:
+      it.argv.truncate(start)
+      return vnull()
+    it.argv.push(x)
+    i -= 1
+  let r = nat.call_val(&it, nd.e, n, v)
+  it.argv.truncate(start)
+  return r
+
+# ---------------------------------------------------------------- paths: get, set, delete
+
+fn getpath(var it: It, t: V, path: V) -> V:
+  if kind(path) != K_ARR: return sfail(&it, "Path must be specified as an array")
+  var cur = t
+  let n = jv.alen(it.st, path)
+  for i in 0..n:
+    if kind(cur) == K_NULL: return vnull()
+    let _h12 = jv.aget(it.st, path, i)
+    cur = index_val(&it, cur, _h12)
+    if it.bad: return vnull()
+  return cur
+
+fn owned_arr(it: It, v: V, op: Int) -> Bool:
+  let id = v.k >> 4
+  return id < it.aown.len and it.aown[id] == op
+
+fn owned_obj(it: It, v: V, op: Int) -> Bool:
+  let id = v.k >> 4
+  return id < it.oown.len and it.oown[id] == op
+
+# setpath with keys path[i..]; containers owned by op (made by this same operation) change in
+# place, others are copied (and the copies owned by op). op 0 owns nothing.
+fn setpath(var it: It, t: V, path: V, i: Int, val: V, op: Int) -> V:
+  let n = jv.alen(it.st, path)
+  if i == n: return val
+  let key = jv.aget(it.st, path, i)
+  let kk = key.k & 15
+  let tk = t.k & 15
+  if kk == K_OBJ:
+    # a slice
+    let sub = index_val(&it, t, key)
+    if it.bad: return vnull()
+    let nv = setpath(&it, sub, path, i + 1, val, op)
+    if it.bad: return vnull()
+    return set_slice(&it, t, key, nv)
+  let sub = index_val(&it, t, key)
+  if it.bad: return vnull()
+  let nv = setpath(&it, sub, path, i + 1, val, op)
+  if it.bad: return vnull()
+  return set_key(&it, t, key, nv, op)
+
+fn set_key(var it: It, t: V, key: V, val: V, op: Int) -> V:
+  let kk = key.k & 15
+  let tk = t.k & 15
+  if kk == K_STR and (tk == K_OBJ or tk == K_NULL):
+    let kid = jv.intern_id(&it.st, key.k >> 4)
+    if tk == K_NULL:
+      let start = it.st.tk.len
+      it.st.tk.push(kid)
+      it.st.tw.push(val)
+      let o = jv.end_obj(&it.st, start)
+      own_obj(&it, o, op)
+      return o
+    let pos = jv.ofind(it.st, t, kid)
+    if op != 0 and owned_obj(it, t, op):
+      if pos >= 0:
+        it.st.ov[it.st.oo[t.k >> 4] + pos] = val
+        return t
+    let start = it.st.tk.len
+    let nn = jv.olen(it.st, t)
+    for i in 0..nn:
+      it.st.tk.push(jv.okey(it.st, t, i))
+      if i == pos: it.st.tw.push(val)
+      else: it.st.tw.push(jv.oval(it.st, t, i))
+    if pos < 0:
+      it.st.tk.push(kid)
+      it.st.tw.push(val)
+    let o = end_obj_nodup(&it, start)
+    own_obj(&it, o, op)
+    return o
+  if (kk == K_NUM or kk == K_LIT) and (tk == K_ARR or tk == K_NULL):
+    if key.n != key.n: return sfail(&it, "Cannot set array element at NaN index")
+    var d = key.n
+    if d < -2147483648.0: d = -2147483648.0
+    if d > 2147483647.0: d = 2147483647.0
+    var idx = int(d)
+    var len = 0
+    if tk == K_ARR: len = jv.alen(it.st, t)
+    if idx < 0: idx += len
+    if idx < 0: return sfail(&it, "Out of bounds negative array index")
+    if tk == K_ARR and idx < len and op != 0 and owned_arr(it, t, op):
+      it.st.av[it.st.ao[t.k >> 4] + idx] = val
+      return t
+    if idx > 100000000: return sfail(&it, "Array index too large")
+    let start = it.st.tv.len
+    for i in 0..len:
+      if i == idx: it.st.tv.push(val)
+      else: it.st.tv.push(jv.aget(it.st, t, i))
+    if idx >= len:
+      for i in len..idx: it.st.tv.push(vnull())
+      it.st.tv.push(val)
+    let a = jv.end_arr(&it.st, start)
+    own_arr(&it, a, op)
+    return a
+  if kk == K_OBJ and (tk == K_ARR or tk == K_NULL): return set_slice(&it, t, key, val)
+  if kk == K_OBJ and tk == K_STR: return sfail(&it, "Cannot update string slices")
+  return sfail(&it, "Cannot update field at " + kname(key) + " index of " + kname(t))
+
+fn end_obj_nodup(var it: It, start: Int) -> V:
+  return jv.end_obj(&it.st, start)
+
+fn own_arr(var it: It, a: V, op: Int):
+  if op == 0: return
+  track(&it)
+  it.aown[a.k >> 4] = op
+
+fn own_obj(var it: It, o: V, op: Int):
+  if op == 0: return
+  track(&it)
+  it.oown[o.k >> 4] = op
+
+fn set_slice(var it: It, t: V, key: V, val: V) -> V:
+  var arr = t
+  if kind(arr) == K_NULL: arr = jv.empty_arr(&it.st)
+  if kind(arr) != K_ARR:
+    if kind(arr) == K_STR: return sfail(&it, "Cannot update string slices")
+    return sfail(&it, "Cannot update field at object index of " + kname(t))
+  let sk = jv.intern_str(&it.st, "start")
+  let ek = jv.intern_str(&it.st, "end")
+  var from = vnull()
+  var to = vnull()
+  let pf = jv.ofind(it.st, key, sk)
+  if pf >= 0: from = jv.oval(it.st, key, pf)
+  let pt = jv.ofind(it.st, key, ek)
+  if pt >= 0: to = jv.oval(it.st, key, pt)
+  let n = jv.alen(it.st, arr)
+  let be = slice_bounds(&it, n, from, to)
+  if it.bad: return vnull()
+  if kind(val) != K_ARR: return sfail(&it, "A slice of an array can only be assigned another array")
+  let start = it.st.tv.len
+  for i in 0..be[0]: it.st.tv.push(jv.aget(it.st, arr, i))
+  let m = jv.alen(it.st, val)
+  for i in 0..m: it.st.tv.push(jv.aget(it.st, val, i))
+  for i in be[1]..n: it.st.tv.push(jv.aget(it.st, arr, i))
+  return jv.end_arr(&it.st, start)
+
+fn delpaths(var it: It, t: V, paths: V) -> V:
+  if kind(paths) != K_ARR: return sfail(&it, "Paths must be specified as an array")
+  let n = jv.alen(it.st, paths)
+  var ps: [V] = []
+  for i in 0..n:
+    let x = jv.aget(it.st, paths, i)
+    if kind(x) != K_ARR: return sfail(&it, "Path must be specified as array, not " + kname(x))
+    ps.push(x)
+  if ps.len == 0: return t
+  nat.sort_vals(it.st, &ps)
+  if jv.alen(it.st, ps[0]) == 0: return vnull()
+  return delpaths_sorted(&it, t, ps, 0)
+
+fn delpaths_sorted(var it: It, t: V, ps: [V], start: Int) -> V:
+  var obj = t
+  var delkeys: [V] = []
+  var i = 0
+  while i < ps.len:
+    var j = i
+    let delkey = jv.alen(it.st, ps[i]) == start + 1
+    let key = jv.aget(it.st, ps[i], start)
+    while j < ps.len and jv.veq(it.st, key, jv.aget(it.st, ps[j], start)): j += 1
+    if delkey:
+      delkeys.push(key)
+    else:
+      let sub = index_val(&it, obj, key)
+      if it.bad: return vnull()
+      if kind(sub) != K_NULL:
+        var rest: [V] = []
+        for q in i..j: rest.push(ps[q])
+        let ns = delpaths_sorted(&it, sub, rest, start + 1)
+        if it.bad: return vnull()
+        obj = set_key(&it, obj, key, ns, 0)
+        if it.bad: return vnull()
+    i = j
+  return dels(&it, obj, delkeys)
+
+fn dels(var it: It, t: V, keys: [V]) -> V:
+  let tk = kind(t)
+  if tk == K_NULL or keys.len == 0: return t
+  if tk == K_ARR:
+    let len = jv.alen(it.st, t)
+    var del = [false] * len
+    for key in keys:
+      let kk = kind(key)
+      if kk == K_NUM or kk == K_LIT:
+        var idx = int(nat.clampd(key.n))
+        if key.n < 0.0: idx = len + int(nat.clampd(key.n))
+        if idx >= 0 and idx < len: del[idx] = true
+      elif kk == K_OBJ:
+        let sk = jv.intern_str(&it.st, "start")
+        let ek = jv.intern_str(&it.st, "end")
+        var from = vnull()
+        var to = vnull()
+        let pf = jv.ofind(it.st, key, sk)
+        if pf >= 0: from = jv.oval(it.st, key, pf)
+        let pt = jv.ofind(it.st, key, ek)
+        if pt >= 0: to = jv.oval(it.st, key, pt)
+        let be = slice_bounds(&it, len, from, to)
+        if it.bad: return vnull()
+        for q in be[0]..be[1]: del[q] = true
+      else:
+        return sfail(&it, "Cannot delete " + kname(key) + " element of array")
+    let start = it.st.tv.len
+    for i in 0..len:
+      if not del[i]: it.st.tv.push(jv.aget(it.st, t, i))
+    return jv.end_arr(&it.st, start)
+  if tk == K_OBJ:
+    var cur = t
+    for key in keys:
+      if kind(key) != K_STR: return sfail(&it, "Cannot delete " + kname(key) + " field of object")
+      let kid = jv.intern_id(&it.st, key.k >> 4)
+      let pos = jv.ofind(it.st, cur, kid)
+      if pos >= 0:
+        let start = it.st.tk.len
+        let nn = jv.olen(it.st, cur)
+        for i in 0..nn:
+          if i != pos:
+            it.st.tk.push(jv.okey(it.st, cur, i))
+            it.st.tw.push(jv.oval(it.st, cur, i))
+        cur = jv.end_obj(&it.st, start)
+    return cur
+  return sfail(&it, "Cannot delete fields from " + kname(t))
+
+# ---------------------------------------------------------------- assignment operators
+
+# lhs = rhs, lhs |= f, lhs op= rhs, lhs //= rhs. The right side of = and op= runs on the input;
+# for each of its values, the paths of lhs are updated in turn (jq's _assign and _modify).
+fn ev_update(var it: It, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let nd = it.ast.ns[n]
+  if nd.x == lang.OP_UPDATE: return update_run(&it, n, v, p, env, k, vnull())
+  if it.simple[nd.b]:
+    let r = sev(&it, nd.b, v, env)
+    if it.bad: return bad_status(&it)
+    return update_run(&it, n, v, p, env, k, r)
+  let k2 = kpush(&it, K_UPDRHS, n, env, k)
+  it.ks[k2].v = v
+  it.ks[k2].p = p
+  let s = ev(&it, nd.b, v, -1, env, k2)
+  it.ks.truncate(k2)
+  return s
+
+fn update_run(var it: It, n: Int, v: V, p: Int, env: Int, k: Int, rhs: V) -> Int:
+  let nd = it.ast.ns[n]
+  let op = new_owner(&it)
+  let k2 = kpush(&it, K_UPDPATH, n, env, k)
+  it.ks[k2].v = v          # the result being built
+  it.ks[k2].w = rhs
+  it.ks[k2].i = op
+  it.ks[k2].j = -1         # start of deleted paths on argv (|= with empty)
+  let dstart = it.argv.len
+  it.ks[k2].j = dstart
+  let s = ev(&it, nd.a, v, 0, env, k2)
+  var res = it.ks[k2].v
+  it.ks.truncate(k2)
+  if s != ST_OK:
+    it.argv.truncate(dstart)
+    return s
+  if it.argv.len > dstart:
+    let start = it.st.tv.len
+    for i in dstart..it.argv.len: it.st.tv.push(it.argv[i])
+    it.argv.truncate(dstart)
+    let dl = jv.end_arr(&it.st, start)
+    res = delpaths(&it, res, dl)
+    if it.bad: return bad_status(&it)
+  return emit(&it, k, res, vp(p, res, v))
+
+# One path of an assignment's left side.
+fn update_path(var it: It, k: Int, kf: Kf, x: V, p: Int) -> Int:
+  if p == -2:
+    let d = trunc_dump(&it, x, 30)
+    return rfail(&it, "Invalid path expression with result " + d)
+  let nd = it.ast.ns[kf.n]
+  let path = path_arr(&it, p)
+  var root = it.ks[k].v
+  var op = kf.i
+  if nd.x == lang.OP_SET:
+    let r = setpath(&it, root, path, 0, kf.w, op)
+    if it.bad: return bad_status(&it)
+    it.ks[k].v = r
+    return ST_OK
+  let cur = getpath(&it, root, path)
+  if it.bad: return bad_status(&it)
+  # the update sees cur: if this operation made it, it must not change in place any more
+  let ck = kind(cur)
+  if (ck == K_ARR and owned_arr(it, cur, op)) or (ck == K_OBJ and owned_obj(it, cur, op)):
+    op = new_owner(&it)
+    it.ks[k].i = op
+  var nv = vnull()
+  if nd.x == lang.OP_UPDATE:
+    let k2 = kpush(&it, K_FIRST, -1, -1, -1)
+    it.lab += 1
+    let id = it.lab
+    it.ks[k2].i = id
+    let s = ev(&it, nd.b, cur, -1, kf.env, k2)
+    let got = it.ks[k2].j
+    nv = it.ks[k2].w
+    it.ks.truncate(k2)
+    if s == ST_BREAK and it.brk == id:
+      let _h13 = it.ks[k].v
+      let r = setpath(&it, _h13, path, 0, nv, op)
+      if it.bad: return bad_status(&it)
+      it.ks[k].v = r
+      return ST_OK
+    if s != ST_OK: return s
+    # no output: the path is deleted at the end
+    it.argv.push(path)
+    return ST_OK
+  if nd.x == lang.OP_ALTSET:
+    if truthy(cur): nv = cur
+    else: nv = kf.w
+  else:
+    nv = binop(&it, nd.x, cur, kf.w)
+    if it.bad: return bad_status(&it)
+  let _h14 = it.ks[k].v
+  let r = setpath(&it, _h14, path, 0, nv, op)
+  if it.bad: return bad_status(&it)
+  it.ks[k].v = r
+  return ST_OK
+
+# ---------------------------------------------------------------- output
+
+fn output(var it: It, v: V) -> Int:
+  if it.collect:
+    it.results.push(v)
+    return ST_OK
+  it.had_output = true
+  it.last_output = v
+  if it.seq: it.st.out.push(30)
+  if it.raw and kind(v) == K_STR and not it.st.ascii:
+    let id = v.k >> 4
+    let o = it.st.so[id]
+    let n = it.st.sl[id] >> 2
+    for i in o..o + n: it.st.out.push(it.st.b[i])
+  else:
+    jv.dump(&it.st, v, 0)
+  if not it.join: it.st.out.push('\n')
+  if it.st.out.len >= 65536: flush_out(&it)
+  return ST_OK
+
+fn flush_out(var it: It):
+  if it.st.out.len > 0:
+    write(it.st.out)
+    it.st.out.truncate(0)
+
+# ---------------------------------------------------------------- resolution
+
+fn sc_push(var sc: Scope, kind: Int, name: Str, ar: Int, fid: Int):
+  sc.kind.push(kind)
+  sc.name.push(name)
+  sc.ar.push(ar)
+  sc.fid.push(fid)
+
+fn sc_pop(var sc: Scope, n: Int):
+  sc.kind.truncate(sc.kind.len - n)
+  sc.name.truncate(sc.name.len - n)
+  sc.ar.truncate(sc.ar.len - n)
+  sc.fid.truncate(sc.fid.len - n)
+
+fn cerr(var it: It, msg: Str, line: Int):
+  if it.cerr == "":
+    it.cerr = msg
+    it.cerrline = line
+
+fn ensure_fd(var it: It):
+  while it.fd_static.len < it.ast.fdefs.len:
+    it.fd_static.push(false)
+    it.fd_np.push(0)
+    it.fd_vs.push(0)
+    it.fd_nv.push(0)
+
+fn only_static(sc: Scope) -> Bool:
+  for i in sc.nglobal..sc.kind.len:
+    if sc.kind[i] != SC_SFUNC: return false
+  return true
+
+# Resolves names in node n with scope sc: variables and labels to frame depths, calls to their
+# targets. Then decides which nodes are simple.
+fn resolve(var it: It, n: Int, var sc: Scope):
+  if n < 0 or it.cerr != "": return
+  let nd = it.ast.ns[n]
+  let k = nd.k
+  if k == lang.N_VAR:
+    let name = it.ast.names[nd.x]
+    var depth = 0
+    var i = sc.kind.len - 1
+    while i >= 0:
+      let sk = sc.kind[i]
+      if sk == SC_VAR and sc.name[i] == name:
+        it.ast.ns[n].e = depth
+        return
+      if sk != SC_SFUNC: depth += 1
+      i -= 1
+    if name == "__prog_args" or name == "__named":
+      it.ast.ns[n].k = lang.N_LIT
+      it.ast.ns[n].v = vnull()
+      return
+    cerr(&it, "$" + name + " is not defined", nd.line)
+    return
+  if k == lang.N_BREAK:
+    let name = it.ast.names[nd.x]
+    var depth = 0
+    var i = sc.kind.len - 1
+    while i >= 0:
+      let sk = sc.kind[i]
+      if sk == SC_LABEL and sc.name[i] == name:
+        it.ast.ns[n].e = depth
+        return
+      if sk != SC_SFUNC: depth += 1
+      i -= 1
+    cerr(&it, "$*label-" + name + " is not defined", nd.line)
+    return
+  if k == lang.N_CALL:
+    for i in 0..nd.c:
+      let _h15 = it.ast.kids[nd.b + i]
+      resolve(&it, _h15, &sc)
+    let name = it.ast.names[nd.x]
+    var depth = 0
+    var i = sc.kind.len - 1
+    while i >= 0:
+      let sk = sc.kind[i]
+      if sc.name[i] == name and sc.ar[i] == nd.c and sk != SC_VAR and sk != SC_LABEL:
+        if sk == SC_SFUNC:
+          it.ast.ns[n].d = CT_STATIC
+          it.ast.ns[n].e = sc.fid[i]
+        elif sk == SC_FUNC:
+          it.ast.ns[n].d = CT_FRAME
+          it.ast.ns[n].e = depth
+        else:
+          it.ast.ns[n].d = CT_CLOS
+          it.ast.ns[n].e = depth
+        return
+      if sk != SC_SFUNC: depth += 1
+      i -= 1
+    let nid = nat.lookup(name, nd.c)
+    if nid < 0:
+      cerr(&it, name + "/{nd.c} is not defined", nd.line)
+      return
+    it.ast.ns[n].d = CT_NATIVE
+    it.ast.ns[n].e = nid
+    return
+  if k == lang.N_AS:
+    resolve(&it, nd.a, &sc)
+    # every alternative's variables, in order of first appearance
+    var names: [Str] = []
+    for i in 0..nd.c:
+      let _h16 = it.ast.kids[nd.b + i]
+      pattern_vars(&it, _h16, &names)
+    for i in 0..nd.c:
+      let _h17 = it.ast.kids[nd.b + i]
+      resolve_pattern(&it, _h17, &sc, names)
+    for nm in names: sc_push(&sc, SC_VAR, nm, 0, -1)
+    it.ast.ns[n].e = names.len
+    resolve(&it, nd.d, &sc)
+    sc_pop(&sc, names.len)
+    return
+  if k == lang.N_REDUCE or k == lang.N_FOREACH:
+    resolve(&it, nd.a, &sc)
+    resolve(&it, nd.c, &sc)
+    var names: [Str] = []
+    pattern_vars(&it, nd.b, &names)
+    resolve_pattern(&it, nd.b, &sc, names)
+    for nm in names: sc_push(&sc, SC_VAR, nm, 0, -1)
+    it.ast.ns[n].e = names.len
+    resolve(&it, nd.d, &sc)
+    if k == lang.N_FOREACH: resolve(&it, nd.x, &sc)
+    sc_pop(&sc, names.len)
+    return
+  if k == lang.N_LABEL:
+    sc_push(&sc, SC_LABEL, it.ast.names[nd.x], 0, -1)
+    resolve(&it, nd.a, &sc)
+    sc_pop(&sc, 1)
+    return
+  if k == lang.N_DEF:
+    let fid = nd.x
+    resolve_def(&it, fid, &sc)
+    resolve(&it, nd.a, &sc)
+    sc_pop(&sc, 1)
+    return
+  if k == lang.N_STR or k == lang.N_OBJ:
+    var cnt = nd.c
+    if k == lang.N_OBJ: cnt = 2 * nd.c
+    for i in 0..cnt:
+      let _h18 = it.ast.kids[nd.b + i]
+      resolve(&it, _h18, &sc)
+    return
+  if k == lang.N_FOREACH: return
+  if nd.a >= 0: resolve(&it, nd.a, &sc)
+  if nd.b >= 0 and k != lang.N_FIELD: resolve(&it, nd.b, &sc)
+  if nd.c >= 0 and (k == lang.N_IF): resolve(&it, nd.c, &sc)
+  if nd.d >= 0 and (k == lang.N_SLICE): resolve(&it, nd.d, &sc)
+
+# Resolves function fid's body and leaves its own entry on the scope (for what follows).
+fn resolve_def(var it: It, fid: Int, var sc: Scope):
+  ensure_fd(&it)
+  let np = it.ast.fdefs[fid].params.len
+  let static = only_static(sc)
+  let name = it.ast.fdefs[fid].name + ""
+  it.fd_static[fid] = static
+  it.fd_np[fid] = np
+  it.fd_vs[fid] = it.fd_vp.len
+  var nv = 0
+  for i in 0..np:
+    let pn = it.ast.fdefs[fid].params[i] + ""
+    if pn.startswith("$"):
+      it.fd_vp.push(i)
+      nv += 1
+  it.fd_nv[fid] = nv
+  if static: sc_push(&sc, SC_SFUNC, name, np, fid)
+  else: sc_push(&sc, SC_FUNC, name, np, fid)
+  # the body sees: the function itself, its filter parameters, then its value parameters
+  var pushed = 0
+  for i in 0..np:
+    var pn = it.ast.fdefs[fid].params[i] + ""
+    if pn.startswith("$"): pn = pn[1..pn.len]
+    sc_push(&sc, SC_CLOS, pn, 0, -1)
+    pushed += 1
+  for i in 0..np:
+    let pn = it.ast.fdefs[fid].params[i] + ""
+    if pn.startswith("$"):
+      sc_push(&sc, SC_VAR, pn[1..pn.len], 0, -1)
+      pushed += 1
+  let body = it.ast.fdefs[fid].body
+  resolve(&it, body, &sc)
+  sc_pop(&sc, pushed)
+
+fn pattern_vars(var it: It, pat: Int, var names: [Str]):
+  let nd = it.ast.ns[pat]
+  if nd.k == lang.N_P_VAR:
+    let nm = it.ast.names[nd.x] + ""
+    if not (nm in names): names.push(nm)
+    return
+  if nd.k == lang.N_P_ARR:
+    for i in 0..nd.c:
+      let _h19 = it.ast.kids[nd.b + i]
+      pattern_vars(&it, _h19, &names)
+    return
+  if nd.k == lang.N_P_OBJ:
+    for i in 0..nd.c:
+      let vn = it.ast.kids[nd.b + 3 * i + 1]
+      let pn = it.ast.kids[nd.b + 3 * i + 2]
+      if vn >= 0: pattern_vars(&it, vn, &names)
+      if pn >= 0: pattern_vars(&it, pn, &names)
+
+# Gives each pattern variable its slot; key expressions are resolved with the pattern's variables
+# visible (they may use the ones bound before them).
+fn resolve_pattern(var it: It, pat: Int, var sc: Scope, names: [Str]):
+  let nd = it.ast.ns[pat]
+  if nd.k == lang.N_P_VAR:
+    let nm = it.ast.names[nd.x]
+    for i in 0..names.len:
+      if names[i] == nm: it.ast.ns[pat].e = i
+    return
+  if nd.k == lang.N_P_ARR:
+    for i in 0..nd.c:
+      let _h20 = it.ast.kids[nd.b + i]
+      resolve_pattern(&it, _h20, &sc, names)
+    return
+  if nd.k == lang.N_P_OBJ:
+    for i in 0..nd.c:
+      let kn = it.ast.kids[nd.b + 3 * i]
+      let vn = it.ast.kids[nd.b + 3 * i + 1]
+      let pn = it.ast.kids[nd.b + 3 * i + 2]
+      for nm in names: sc_push(&sc, SC_VAR, nm, 0, -1)
+      resolve(&it, kn, &sc)
+      sc_pop(&sc, names.len)
+      if vn >= 0: resolve_pattern(&it, vn, &sc, names)
+      if pn >= 0: resolve_pattern(&it, pn, &sc, names)
+
+# Which nodes run as single-valued expressions (sev).
+fn mark_simple(var it: It):
+  while it.simple.len < it.ast.ns.len: it.simple.push(false)
+  var changed = true
+  while changed:
+    changed = false
+    for n in 1..it.ast.ns.len:
+      if not it.simple[n] and is_simple(it, n):
+        it.simple[n] = true
+        changed = true
+
+fn simple_or_none(it: It, n: Int) -> Bool:
+  return n < 0 or it.simple[n]
+
+fn is_simple(it: It, n: Int) -> Bool:
+  let nd = it.ast.ns[n]
+  let k = nd.k
+  if k == lang.N_ID or k == lang.N_LIT or k == lang.N_VAR or k == lang.N_FORMAT: return true
+  if k == lang.N_FIELD: return nd.c == 0 and it.simple[nd.a]
+  if k == lang.N_INDEX: return nd.c == 0 and it.simple[nd.a] and it.simple[nd.b]
+  if k == lang.N_SLICE: return nd.c == 0 and it.simple[nd.a] and simple_or_none(it, nd.b) and simple_or_none(it, nd.d)
+  if k == lang.N_BIN or k == lang.N_AND or k == lang.N_OR or k == lang.N_PIPE or k == lang.N_ALT: return it.simple[nd.a] and it.simple[nd.b]
+  if k == lang.N_NEG: return it.simple[nd.a]
+  if k == lang.N_ARR: return nd.a < 0 or it.simple[nd.a]
+  if k == lang.N_IF: return it.simple[nd.a] and it.simple[nd.b] and simple_or_none(it, nd.c)
+  if k == lang.N_STR or k == lang.N_OBJ:
+    var cnt = nd.c
+    if k == lang.N_OBJ: cnt = 2 * nd.c
+    for i in 0..cnt:
+      if not it.simple[it.ast.kids[nd.b + i]]: return false
+    return true
+  if k == lang.N_CALL:
+    if nd.d != CT_NATIVE or not nat.is_val(nd.e): return false
+    for i in 0..nd.c:
+      if not it.simple[it.ast.kids[nd.b + i]]: return false
+    return true
+  return false

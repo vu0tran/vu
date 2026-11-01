@@ -1,0 +1,1410 @@
+# jv: vjq's values. Every value is a V: a kind and a number, 16 bytes of plain data. Strings,
+# arrays and objects live in one store (St) and a V names them by index, so copying a value is
+# free and nothing is reference counted. The store only grows while a top-level input is being
+# processed and is cut back to its mark after (reset): nothing a finished run made can be
+# reached any more, since jq values never outlive the run that made them.
+#
+# Strings are spans of one byte buffer (St.b) that holds the input text first, then the
+# program's constants, then strings made while running. A string read from the input without
+# escapes is the input's own bytes: parsing it copies nothing. Object keys are interned (one
+# string id per distinct key), so looking up a field compares integers.
+
+const K_NULL = 0
+const K_FALSE = 1
+const K_TRUE = 2
+const K_NUM = 3
+const K_LIT = 4      # a number that keeps its literal text (jq 1.7): n is its double, id its text
+const K_STR = 5
+const K_ARR = 6
+const K_OBJ = 7
+
+const SF_CLEAN = 1   # no byte needs escaping when written as JSON (valid UTF-8, no " \ or controls)
+const SF_ASCII = 2   # every byte is ASCII
+const SF_SHIFT = 2
+
+type V:
+  k: Int
+  n: Float
+
+type St:
+  b: [Byte]
+  so: [Int]
+  sl: [Int]          # len << 2 | flags
+  knext: [Int]       # intern chain, -2 when not interned
+  heads: [Int]
+  hmask: Int
+  nint: Int
+  ilog: [Int]
+  av: [V]
+  ao: [Int]
+  an: [Int]
+  ok: [Int]
+  ov: [V]
+  oo: [Int]
+  on: [Int]
+  tv: [V]
+  tk: [Int]
+  tw: [V]           # object values being built (keys on tk)
+  seen: [Int]
+  seenat: [Int]
+  stamp: Int
+  # marks for reset
+  mb: Int
+  ms: Int
+  mav: Int
+  ma: Int
+  mok: Int
+  mo: Int
+  mil: Int
+  # JSON parser state
+  pp: Int
+  pend: Int
+  perr: Str
+  pline: Int
+  plinestart: Int
+  depth: Int
+  # output
+  out: [Byte]
+  indent: Int
+  tab: Bool
+  sortkeys: Bool
+  ascii: Bool
+  color: Bool
+  lit_ok: Bool       # keep number literals (on unless --no-literals)
+  nanv: V
+
+fn new_store() -> St:
+  var st = St(b: [], so: [], sl: [], knext: [], heads: [0] * 1024, hmask: 1023, nint: 0, ilog: [], av: [], ao: [], an: [], ok: [], ov: [], oo: [], on: [], tv: [], tk: [], tw: [], seen: [], seenat: [], stamp: 1, mb: 0, ms: 0, mav: 0, ma: 0, mok: 0, mo: 0, mil: 0, pp: 0, pend: 0, perr: "", pline: 1, plinestart: 0, depth: 0, out: [], indent: 2, tab: false, sortkeys: false, ascii: false, color: false, lit_ok: true, nanv: V(K_NUM, 0.0 / 0.0))
+  for i in 0..1024: st.heads[i] = -1
+  return st
+
+fn vnull() -> V:
+  return V(K_NULL, 0.0)
+
+fn vbool(b: Bool) -> V:
+  if b: return V(K_TRUE, 0.0)
+  return V(K_FALSE, 0.0)
+
+fn vnum(x: Float) -> V:
+  return V(K_NUM, x)
+
+fn vint(i: Int) -> V:
+  return V(K_NUM, float(i))
+
+fn kind(v: V) -> Int:
+  return v.k & 15
+
+fn vid(v: V) -> Int:
+  return v.k >> 4
+
+fn vstr(id: Int) -> V:
+  return V(K_STR + (id << 4), 0.0)
+
+fn varr(id: Int) -> V:
+  return V(K_ARR + (id << 4), 0.0)
+
+fn vobj(id: Int) -> V:
+  return V(K_OBJ + (id << 4), 0.0)
+
+fn is_num(v: V) -> Bool:
+  let k = v.k & 15
+  return k == K_NUM or k == K_LIT
+
+fn truthy(v: V) -> Bool:
+  return (v.k & 15) > K_FALSE
+
+# ---------------------------------------------------------------- marks
+
+fn set_mark(var st: St):
+  st.mb = st.b.len
+  st.ms = st.so.len
+  st.mav = st.av.len
+  st.ma = st.ao.len
+  st.mok = st.ok.len
+  st.mo = st.oo.len
+  st.mil = st.ilog.len
+
+fn reset(var st: St):
+  # un-intern the keys made since the mark, newest first: each is the head of its chain
+  var i = st.ilog.len - 1
+  while i >= st.mil:
+    let id = st.ilog[i]
+    let h = hash_span(st, st.so[id], st.sl[id] >> SF_SHIFT) & st.hmask
+    st.heads[h] = st.knext[id]
+    st.nint -= 1
+    i -= 1
+  st.ilog.truncate(st.mil)
+  st.b.truncate(st.mb)
+  st.so.truncate(st.ms)
+  st.sl.truncate(st.ms)
+  st.knext.truncate(st.ms)
+  if st.seen.len > st.ms:
+    st.seen.truncate(st.ms)
+    st.seenat.truncate(st.ms)
+  st.av.truncate(st.mav)
+  st.ao.truncate(st.ma)
+  st.an.truncate(st.ma)
+  st.ok.truncate(st.mok)
+  st.ov.truncate(st.mok)
+  st.oo.truncate(st.mo)
+  st.on.truncate(st.mo)
+
+# ---------------------------------------------------------------- strings
+
+fn slen(st: St, id: Int) -> Int:
+  return st.sl[id] >> SF_SHIFT
+
+fn sflags(st: St, id: Int) -> Int:
+  return st.sl[id] & 3
+
+fn soff(st: St, id: Int) -> Int:
+  return st.so[id]
+
+# A new string over bytes already in b.
+fn add_span(var st: St, off: Int, n: Int, flags: Int) -> Int:
+  let id = st.so.len
+  st.so.push(off)
+  st.sl.push((n << SF_SHIFT) | flags)
+  st.knext.push(-2)
+  return id
+
+# The flags of b[off..off+n] (assumed valid UTF-8).
+fn scan_flags(st: St, off: Int, n: Int) -> Int:
+  var clean = true
+  var ascii = true
+  for i in off..off + n:
+    let c = st.b[i]
+    if c < 32 or c == '"' or c == '\\' or c == 127: clean = false
+    elif c >= 128: ascii = false
+  var f = 0
+  if clean: f = SF_CLEAN
+  if ascii: f = f | SF_ASCII
+  return f
+
+# Copies a Str into b and makes a string of it (replacing invalid UTF-8 with U+FFFD).
+fn new_str(var st: St, s: Str) -> V:
+  let off = st.b.len
+  if s.is_utf8():
+    for i in 0..s.len: st.b.push(s[i])
+  else:
+    for c in s.codes(): push_utf8(&st.b, c)
+  let n = st.b.len - off
+  return vstr(add_span(&st, off, n, scan_flags(st, off, n)))
+
+# A string made of bytes the caller has just pushed onto b from start (valid UTF-8).
+fn end_str(var st: St, start: Int) -> V:
+  let n = st.b.len - start
+  return vstr(add_span(&st, start, n, scan_flags(st, start, n)))
+
+fn str_of(st: St, v: V) -> Str:
+  let id = v.k >> 4
+  let off = st.so[id]
+  let n = st.sl[id] >> SF_SHIFT
+  let part = st.b[off..off + n]
+  return str(part)
+
+fn sid_str(st: St, id: Int) -> Str:
+  let off = st.so[id]
+  let n = st.sl[id] >> SF_SHIFT
+  let part = st.b[off..off + n]
+  return str(part)
+
+fn push_utf8(var b: [Byte], c: Int):
+  if c < 0x80:
+    b.push(byte(c))
+  elif c < 0x800:
+    b.push(byte(0xC0 | (c >> 6)))
+    b.push(byte(0x80 | (c & 63)))
+  elif c < 0x10000:
+    b.push(byte(0xE0 | (c >> 12)))
+    b.push(byte(0x80 | ((c >> 6) & 63)))
+    b.push(byte(0x80 | (c & 63)))
+  else:
+    b.push(byte(0xF0 | (c >> 18)))
+    b.push(byte(0x80 | ((c >> 12) & 63)))
+    b.push(byte(0x80 | ((c >> 6) & 63)))
+    b.push(byte(0x80 | (c & 63)))
+
+fn str_eq(st: St, a: Int, b: Int) -> Bool:
+  if a == b: return true
+  let n = st.sl[a] >> SF_SHIFT
+  if n != st.sl[b] >> SF_SHIFT: return false
+  let oa = st.so[a]
+  let ob = st.so[b]
+  for i in 0..n:
+    if st.b[oa + i] != st.b[ob + i]: return false
+  return true
+
+# Byte order (which is code point order for UTF-8), as jq compares strings.
+fn str_cmp(st: St, a: Int, b: Int) -> Int:
+  if a == b: return 0
+  let na = st.sl[a] >> SF_SHIFT
+  let nb = st.sl[b] >> SF_SHIFT
+  let oa = st.so[a]
+  let ob = st.so[b]
+  var n = na
+  if nb < n: n = nb
+  for i in 0..n:
+    let x = st.b[oa + i]
+    let y = st.b[ob + i]
+    if x != y:
+      if x < y: return -1
+      return 1
+  if na < nb: return -1
+  if na > nb: return 1
+  return 0
+
+# ---------------------------------------------------------------- interning
+
+fn hash_span(st: St, off: Int, n: Int) -> Int:
+  var h = -3750763034362895579
+  for i in off..off + n:
+    h = (h ^ int(st.b[i])) *% 1099511628211
+  return (h ^ (h >>> 29)) & 0x7fffffffffffffff
+
+fn grow_heads(var st: St):
+  let nb = st.heads.len * 2
+  st.heads = [-1] * nb
+  st.hmask = nb - 1
+  for q in 0..st.ilog.len:
+    let id = st.ilog[q]
+    let h = hash_span(st, st.so[id], st.sl[id] >> SF_SHIFT) & st.hmask
+    st.knext[id] = st.heads[h]
+    st.heads[h] = id
+
+# The canonical id of the string at b[off..off+n], adding it as a new string (over those bytes)
+# when it isn't interned yet.
+fn intern_span(var st: St, off: Int, n: Int, flags: Int) -> Int:
+  let h = hash_span(st, off, n) & st.hmask
+  var id = st.heads[h]
+  while id >= 0:
+    if st.sl[id] >> SF_SHIFT == n:
+      let o2 = st.so[id]
+      var same = true
+      for i in 0..n:
+        if st.b[off + i] != st.b[o2 + i]:
+          same = false
+          break
+      if same: return id
+    id = st.knext[id]
+  let nid = add_span(&st, off, n, flags)
+  st.knext[nid] = st.heads[h]
+  st.heads[h] = nid
+  st.ilog.push(nid)
+  st.nint += 1
+  if st.nint > st.heads.len * 2: grow_heads(&st)
+  return nid
+
+# The canonical (interned) id for string id s.
+fn intern_id(var st: St, s: Int) -> Int:
+  if st.knext[s] != -2: return s
+  return intern_span(&st, st.so[s], st.sl[s] >> SF_SHIFT, st.sl[s] & 3)
+
+fn intern_str(var st: St, s: Str) -> Int:
+  let v = new_str(&st, s)
+  return intern_id(&st, v.k >> 4)
+
+# ---------------------------------------------------------------- arrays and objects
+
+fn alen(st: St, v: V) -> Int:
+  return st.an[v.k >> 4]
+
+fn aget(st: St, v: V, i: Int) -> V:
+  let id = v.k >> 4
+  return st.av[st.ao[id] + i]
+
+# An array of the values on tv from start (they're popped).
+fn end_arr(var st: St, start: Int) -> V:
+  let id = st.ao.len
+  let n = st.tv.len - start
+  st.ao.push(st.av.len)
+  st.an.push(n)
+  for i in start..st.tv.len: st.av.push(st.tv[i])
+  st.tv.truncate(start)
+  return varr(id)
+
+fn empty_arr(var st: St) -> V:
+  let id = st.ao.len
+  st.ao.push(st.av.len)
+  st.an.push(0)
+  return varr(id)
+
+# An array viewing part of another's elements (arrays never change, so they can share them).
+fn sub_arr(var st: St, v: V, from: Int, n: Int) -> V:
+  let id = st.ao.len
+  st.ao.push(st.ao[v.k >> 4] + from)
+  st.an.push(n)
+  return varr(id)
+
+fn olen(st: St, v: V) -> Int:
+  return st.on[v.k >> 4]
+
+fn okey(st: St, v: V, i: Int) -> Int:
+  return st.ok[st.oo[v.k >> 4] + i]
+
+fn oval(st: St, v: V, i: Int) -> V:
+  return st.ov[st.oo[v.k >> 4] + i]
+
+# The position of key (an interned id) in object v, or -1.
+fn ofind(st: St, v: V, key: Int) -> Int:
+  let id = v.k >> 4
+  let o = st.oo[id]
+  let n = st.on[id]
+  for i in 0..n:
+    if st.ok[o + i] == key: return i
+  return -1
+
+fn mark_seen(var st: St):
+  while st.seen.len < st.so.len:
+    st.seen.push(0)
+    st.seenat.push(0)
+  st.stamp += 1
+
+# An object of the key/value pairs on tk/tw from start (popped). Keys are interned ids; a key that
+# appears again replaces the earlier value, in the earlier position.
+fn end_obj(var st: St, start: Int) -> V:
+  let n = st.tk.len - start
+  var dup = false
+  if n > 1:
+    if n <= 8:
+      for i in start + 1..start + n:
+        let key = st.tk[i]
+        for j in start..i:
+          if st.tk[j] == key:
+            dup = true
+            break
+        if dup: break
+    else:
+      mark_seen(&st)
+      for i in start..start + n:
+        let key = st.tk[i]
+        if st.seen[key] == st.stamp:
+          dup = true
+          break
+        st.seen[key] = st.stamp
+  if dup: dedup(&st, start)
+  let id = st.oo.len
+  let m = st.tk.len - start
+  st.oo.push(st.ok.len)
+  st.on.push(m)
+  for i in start..st.tk.len:
+    st.ok.push(st.tk[i])
+    st.ov.push(st.tw[i])
+  st.tk.truncate(start)
+  st.tw.truncate(start)
+  return vobj(id)
+
+fn dedup(var st: St, start: Int):
+  mark_seen(&st)
+  var w = start
+  for i in start..st.tk.len:
+    let key = st.tk[i]
+    if st.seen[key] == st.stamp:
+      st.tw[st.seenat[key]] = st.tw[i]
+    else:
+      st.seen[key] = st.stamp
+      st.seenat[key] = w
+      st.tk[w] = key
+      st.tw[w] = st.tw[i]
+      w += 1
+  st.tk.truncate(w)
+  st.tw.truncate(w)
+
+fn empty_obj(var st: St) -> V:
+  let id = st.oo.len
+  st.oo.push(st.ok.len)
+  st.on.push(0)
+  return vobj(id)
+
+# ---------------------------------------------------------------- comparison (jq's order)
+
+fn korder(v: V) -> Int:
+  let k = v.k & 15
+  if k == K_LIT: return K_NUM
+  if k > K_LIT: return k - 1
+  return k
+
+fn veq(st: St, a: V, b: V) -> Bool:
+  let ka = korder(a)
+  if ka != korder(b): return false
+  if ka == K_NUM:
+    if a.n != b.n: return false
+    if (a.k & 15) == K_LIT or (b.k & 15) == K_LIT: return num_cmp_exact(st, a, b) == 0
+    return true
+  if ka <= K_TRUE: return true
+  if ka == K_STR - 1: return str_eq(st, a.k >> 4, b.k >> 4)
+  if a.k == b.k: return true
+  if ka == K_ARR - 1:
+    let n = st.an[a.k >> 4]
+    if n != st.an[b.k >> 4]: return false
+    let oa = st.ao[a.k >> 4]
+    let ob = st.ao[b.k >> 4]
+    for i in 0..n:
+      if not veq(st, st.av[oa + i], st.av[ob + i]): return false
+    return true
+  let n = st.on[a.k >> 4]
+  if n != st.on[b.k >> 4]: return false
+  let oa = st.oo[a.k >> 4]
+  for i in 0..n:
+    let j = ofind(st, b, st.ok[oa + i])
+    if j < 0: return false
+    if not veq(st, st.ov[oa + i], oval(st, b, j)): return false
+  return true
+
+# jq's jv_cmp for numbers: a NaN compares as null (below every number, and below a NaN).
+fn fcmp(x: Float, y: Float) -> Int:
+  if x != x: return -1
+  if y != y: return 1
+  if x < y: return -1
+  if x == y: return 0
+  return 1
+
+fn vcmp(st: St, a: V, b: V) -> Int:
+  let ka = korder(a)
+  let kb = korder(b)
+  if ka != kb:
+    if ka < kb: return -1
+    return 1
+  if ka == K_NUM:
+    let c = fcmp(a.n, b.n)
+    if c == 0 and ((a.k & 15) == K_LIT or (b.k & 15) == K_LIT): return num_cmp_exact(st, a, b)
+    return c
+  if ka <= K_TRUE: return 0
+  if ka == K_STR - 1: return str_cmp(st, a.k >> 4, b.k >> 4)
+  if ka == K_ARR - 1:
+    let na = st.an[a.k >> 4]
+    let nb = st.an[b.k >> 4]
+    let oa = st.ao[a.k >> 4]
+    let ob = st.ao[b.k >> 4]
+    var i = 0
+    while i < na and i < nb:
+      let c = vcmp(st, st.av[oa + i], st.av[ob + i])
+      if c != 0: return c
+      i += 1
+    if na < nb: return -1
+    if na > nb: return 1
+    return 0
+  # objects: first their sorted key lists, then the values in that key order
+  let ka2 = sorted_keys(st, a)
+  let kb2 = sorted_keys(st, b)
+  var i = 0
+  while i < ka2.len and i < kb2.len:
+    let c = str_cmp(st, ka2[i], kb2[i])
+    if c != 0: return c
+    i += 1
+  if ka2.len < kb2.len: return -1
+  if ka2.len > kb2.len: return 1
+  for key in ka2:
+    let c = vcmp(st, oval(st, a, ofind(st, a, key)), oval(st, b, ofind(st, b, key)))
+    if c != 0: return c
+  return 0
+
+# Numbers whose doubles are equal: when both came from literals (a K_LIT, or a K_NUM marked as
+# read from a literal that printed the same as its double), jq 1.7 compares their decimal values.
+fn num_cmp_exact(st: St, a: V, b: V) -> Int:
+  if not is_literal(a) or not is_literal(b): return 0
+  let da = dec_parts(lit_text(st, a))
+  let db = dec_parts(lit_text(st, b))
+  # dec_parts: [sign (-1, 0, 1), adjusted exponent, digits...]
+  if da[0] != db[0]:
+    if da[0] < db[0]: return -1
+    return 1
+  if da[0] == 0: return 0
+  var c = 0
+  if da[1] != db[1]:
+    if da[1] < db[1]: c = -1
+    else: c = 1
+  else:
+    var i = 2
+    while c == 0 and (i < da.len or i < db.len):
+      var x = 0
+      var y = 0
+      if i < da.len: x = da[i]
+      if i < db.len: y = db[i]
+      if x < y: c = -1
+      elif x > y: c = 1
+      i += 1
+  return c * da[0]
+
+fn is_literal(v: V) -> Bool:
+  return (v.k & 15) == K_LIT or v.k == K_NUM + 16
+
+fn lit_text(st: St, v: V) -> Str:
+  if (v.k & 15) == K_LIT: return sid_str(st, v.k >> 4)
+  return fmt_num(v.n)
+
+fn dec_parts(t: Str) -> [Int]:
+  var neg = false
+  var i = 0
+  if i < t.len and t[i] == '-':
+    neg = true
+    i += 1
+  var digits: [Int] = []
+  var intd = 0
+  var lead = 0
+  var before_point = true
+  var seen_sig = false
+  var exp = 0
+  while i < t.len:
+    let c = t[i]
+    if c == '.':
+      before_point = false
+    elif c == 'E' or c == 'e':
+      exp = int(t[i + 1..t.len]) else 0
+      break
+    else:
+      if c != '0': seen_sig = true
+      if seen_sig:
+        digits.push(int(c) - 48)
+        if before_point: intd += 1
+      elif not before_point:
+        lead += 1
+    i += 1
+  while digits.len > 0 and digits[digits.len - 1] == 0: digits.pop()
+  var r: [Int] = []
+  if digits.len == 0:
+    r.push(0)
+    r.push(0)
+    return r
+  var adj = exp - lead - 1
+  if intd > 0: adj = intd - 1 + exp
+  if neg: r.push(-1)
+  else: r.push(1)
+  r.push(adj)
+  for d in digits: r.push(d)
+  return r
+
+fn sorted_keys(st: St, v: V) -> [Int]:
+  let n = olen(st, v)
+  var ks: [Int] = []
+  for i in 0..n: ks.push(okey(st, v, i))
+  sort_ids(st, &ks)
+  return ks
+
+# Sorts string ids by their text (insertion sort for short lists, merge sort beyond).
+fn sort_ids(st: St, var ks: [Int]):
+  let n = ks.len
+  if n < 2: return
+  if n <= 12:
+    for i in 1..n:
+      let x = ks[i]
+      var j = i - 1
+      while j >= 0 and str_cmp(st, ks[j], x) > 0:
+        ks[j + 1] = ks[j]
+        j -= 1
+      ks[j + 1] = x
+    return
+  var tmp = [0] * n
+  var width = 1
+  while width < n:
+    var lo = 0
+    while lo < n:
+      var mid = lo + width
+      if mid > n: mid = n
+      var hi = lo + 2 * width
+      if hi > n: hi = n
+      var i = lo
+      var j = mid
+      var w = lo
+      while i < mid and j < hi:
+        if str_cmp(st, ks[j], ks[i]) < 0:
+          tmp[w] = ks[j]
+          j += 1
+        else:
+          tmp[w] = ks[i]
+          i += 1
+        w += 1
+      while i < mid:
+        tmp[w] = ks[i]
+        i += 1
+        w += 1
+      while j < hi:
+        tmp[w] = ks[j]
+        j += 1
+        w += 1
+      lo = hi
+    swap(&ks, &tmp)
+    width *= 2
+
+# ---------------------------------------------------------------- numbers as text
+
+# jq's text for a double: the shortest digits that read back exactly, plain unless the decimal
+# point would be 4 or more places left of them or 15 or more places right of their end.
+fn fmt_num(x: Float) -> Str:
+  if x != x: return "null"
+  if x == 0.0:
+    if 1.0 / x < 0.0: return "-0"
+    return "0"
+  if x > 1.7976931348623157e308: return "1.7976931348623157e+308"
+  if x < -1.7976931348623157e308: return "-1.7976931348623157e+308"
+  if x == x.trunc() and x < 1e16 and x > -1e16: return "{int(x)}"
+  # digits and exponent from the shortest repr
+  let r = "{x}"
+  var neg = false
+  var digits: [Byte] = []
+  var exp = 0
+  var seen_point = false
+  var pointpos = 0
+  var i = 0
+  if r[0] == '-':
+    neg = true
+    i = 1
+  while i < r.len:
+    let c = r[i]
+    if c == '.':
+      seen_point = true
+    elif c == 'e' or c == 'E':
+      exp = int(r[i + 1..r.len]) else 0
+      break
+    else:
+      digits.push(c)
+      if not seen_point: pointpos += 1
+    i += 1
+  # strip leading zeros
+  var lead = 0
+  while lead < digits.len - 1 and digits[lead] == '0':
+    lead += 1
+  var decpt = pointpos + exp - lead
+  var d: [Byte] = []
+  for j in lead..digits.len: d.push(digits[j])
+  while d.len > 1 and d[d.len - 1] == '0': d.pop()
+  let nd = d.len
+  var o: [Byte] = []
+  if neg: o.push('-')
+  if decpt <= -4 or decpt > nd + 15:
+    o.push(d[0])
+    if nd > 1:
+      o.push('.')
+      for j in 1..nd: o.push(d[j])
+    o.push('e')
+    var e = decpt - 1
+    if e < 0:
+      o.push('-')
+      e = -e
+    else:
+      o.push('+')
+    if e < 10: o.push('0')
+    for c in bytes("{e}"): o.push(c)
+  elif decpt <= 0:
+    o.push('0')
+    o.push('.')
+    for j in 0..-decpt: o.push('0')
+    for j in 0..nd: o.push(d[j])
+  elif decpt >= nd:
+    for j in 0..nd: o.push(d[j])
+    for j in 0..decpt - nd: o.push('0')
+  else:
+    for j in 0..decpt: o.push(d[j])
+    o.push('.')
+    for j in decpt..nd: o.push(d[j])
+  return o.take_str()
+
+# The canonical text jq 1.7 keeps for a number literal (decNumber's to-scientific-string):
+# coefficient digits and exponent, plain when the exponent is <= 0 and the adjusted exponent
+# >= -6, else d.dddE+n. Returns "" when the literal isn't worth keeping (its double prints the
+# same). lit is the literal's bytes in b[off..off+n].
+fn canon_lit(st: St, off: Int, n: Int, x: Float) -> Str:
+  var neg = false
+  var i = off
+  let e = off + n
+  if i < e and (st.b[i] == '-' or st.b[i] == '+'):
+    neg = st.b[i] == '-'
+    i += 1
+  var coef: [Byte] = []
+  var exp = 0
+  var frac = 0
+  var seen_point = false
+  while i < e:
+    let c = st.b[i]
+    if c == '.':
+      seen_point = true
+    elif c == 'e' or c == 'E':
+      var j = i + 1
+      var eneg = false
+      if j < e and (st.b[j] == '+' or st.b[j] == '-'):
+        eneg = st.b[j] == '-'
+        j += 1
+      var ev = 0
+      while j < e:
+        if ev < 100000000000: ev = ev * 10 + int(st.b[j]) - 48
+        j += 1
+      if eneg: ev = -ev
+      exp = ev
+      break
+    else:
+      coef.push(c)
+      if seen_point: frac += 1
+    i += 1
+  exp -= frac
+  # strip leading zeros of the coefficient
+  var lead = 0
+  while lead < coef.len - 1 and coef[lead] == '0': lead += 1
+  var d: [Byte] = []
+  for j in lead..coef.len: d.push(coef[j])
+  if d.len == 1 and d[0] == '0':
+    # zero keeps its exponent in decNumber, but jq prints these as the double does except -0
+    if neg and exp == 0: return "-0"
+    if exp == 0: return ""
+  let nd = d.len
+  let adj = exp + nd - 1
+  var o: [Byte] = []
+  if neg: o.push('-')
+  if exp <= 0 and adj >= -6:
+    if exp == 0:
+      for c in d: o.push(c)
+    elif nd + exp > 0:
+      for j in 0..nd + exp: o.push(d[j])
+      o.push('.')
+      for j in nd + exp..nd: o.push(d[j])
+    else:
+      o.push('0')
+      o.push('.')
+      for j in 0..-(nd + exp): o.push('0')
+      for c in d: o.push(c)
+  else:
+    o.push(d[0])
+    if nd > 1:
+      o.push('.')
+      for j in 1..nd: o.push(d[j])
+    o.push('E')
+    if adj < 0:
+      o.push('-')
+      for c in bytes("{-adj}"): o.push(c)
+    else:
+      o.push('+')
+      for c in bytes("{adj}"): o.push(c)
+  let s = o.take_str()
+  if s == fmt_num(x): return ""
+  return s
+
+# ---------------------------------------------------------------- JSON parsing
+
+fn perr(var st: St, msg: Str):
+  if st.perr == "": st.perr = msg
+
+fn skip_ws(var st: St):
+  var i = st.pp
+  let e = st.pend
+  while i < e:
+    let c = st.b[i]
+    if c == ' ' or c == '\t' or c == '\r':
+      i += 1
+    elif c == '\n':
+      st.pline += 1
+      st.plinestart = i + 1
+      i += 1
+    else:
+      break
+  st.pp = i
+
+# Parses one JSON value at st.pp (after skipping whitespace). On error st.perr is set (the exact
+# message and position come from json_error, which replays jq's own parser).
+fn parse_value(var st: St) -> V:
+  skip_ws(&st)
+  if st.pp >= st.pend:
+    perr(&st, "Unfinished JSON term at EOF")
+    return vnull()
+  let c = st.b[st.pp]
+  if c == '{': return parse_object(&st)
+  if c == '[': return parse_array(&st)
+  if c == '"':
+    st.pp += 1
+    return parse_string(&st, false)
+  if c == ']' or c == '}' or c == ',' or c == ':':
+    perr(&st, "Unexpected structure")
+    return vnull()
+  return parse_literal(&st)
+
+# jq's token delimiters: whitespace, structure and quotes; everything else is part of a literal.
+fn is_delim(c: Byte) -> Bool:
+  return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == ',' or c == ']' or c == '}' or c == ':' or c == '[' or c == '{' or c == '"'
+
+# true, false, null or a number: the bytes up to the next delimiter.
+fn parse_literal(var st: St) -> V:
+  let s = st.pp
+  var e = s
+  while e < st.pend and not is_delim(st.b[e]): e += 1
+  st.pp = e
+  let c = st.b[s]
+  if c == 't':
+    if e - s == 4 and st.b[s + 1] == 'r' and st.b[s + 2] == 'u' and st.b[s + 3] == 'e': return V(K_TRUE, 0.0)
+    perr(&st, "Invalid literal")
+    return vnull()
+  if c == 'f':
+    if e - s == 5 and st.b[s + 1] == 'a' and st.b[s + 2] == 'l' and st.b[s + 3] == 's' and st.b[s + 4] == 'e': return V(K_FALSE, 0.0)
+    perr(&st, "Invalid literal")
+    return vnull()
+  if c == 'n' and e - s > 1 and st.b[s + 1] == 'u':
+    if e - s == 4 and st.b[s + 2] == 'l' and st.b[s + 3] == 'l': return vnull()
+    perr(&st, "Invalid literal")
+    return vnull()
+  return parse_num_token(&st, s, e)
+
+fn pow10(e: Int) -> Float:
+  var r = 1.0
+  var i = 0
+  while i < e:
+    r *= 10.0
+    i += 1
+  return r
+
+fn lower_at(st: St, i: Int) -> Byte:
+  let c = st.b[i]
+  if c >= 'A' and c <= 'Z': return c + 32
+  return c
+
+fn word_ci(st: St, s: Int, e: Int, w: Str) -> Bool:
+  if e - s != w.len: return false
+  for i in 0..w.len:
+    if lower_at(st, s + i) != w[i]: return false
+  return true
+
+# A number literal b[s..e] as jq 1.7 reads one (decNumber's syntax: an optional sign, digits with
+# an optional point (or a point and digits), an optional exponent; or inf, infinity, nan).
+fn parse_num_token(var st: St, s: Int, e: Int) -> V:
+  var i = s
+  var neg = false
+  if i < e and (st.b[i] == '-' or st.b[i] == '+'):
+    neg = st.b[i] == '-'
+    i += 1
+  if i < e and not (st.b[i] >= '0' and st.b[i] <= '9') and st.b[i] != '.':
+    # inf, infinity, nan, snan (with optional digits)
+    if word_ci(st, i, e, "inf") or word_ci(st, i, e, "infinity"):
+      if neg: return V(K_NUM, -1.0 / 0.0)
+      return V(K_NUM, 1.0 / 0.0)
+    var j = i
+    if j < e and lower_at(st, j) == 's': j += 1
+    if j + 3 <= e and lower_at(st, j) == 'n' and lower_at(st, j + 1) == 'a' and lower_at(st, j + 2) == 'n':
+      var q = j + 3
+      while q < e and st.b[q] >= '0' and st.b[q] <= '9': q += 1
+      if q == e: return st.nanv
+    perr(&st, "Invalid numeric literal")
+    return vnull()
+  let ds = i
+  var mant = 0
+  var nd = 0          # significant digits kept in mant (up to 18)
+  var ndig = 0        # all digits
+  var simple = true
+  var plain_int = true
+  var frac = 0
+  while i < e and st.b[i] >= '0' and st.b[i] <= '9':
+    let c = st.b[i]
+    if nd < 18:
+      if mant > 0 or c != '0':
+        mant = mant * 10 + int(c) - 48
+        nd += 1
+    else:
+      simple = false
+    ndig += 1
+    i += 1
+  if i < e and st.b[i] == '.':
+    plain_int = false
+    i += 1
+    while i < e and st.b[i] >= '0' and st.b[i] <= '9':
+      let c = st.b[i]
+      if nd < 18:
+        if mant > 0 or c != '0':
+          mant = mant * 10 + int(c) - 48
+          nd += 1
+        frac += 1
+      else:
+        simple = false
+      ndig += 1
+      i += 1
+  if ndig == 0:
+    perr(&st, "Invalid numeric literal")
+    return vnull()
+  var exp = 0
+  if i < e and (st.b[i] == 'e' or st.b[i] == 'E'):
+    plain_int = false
+    i += 1
+    var eneg = false
+    if i < e and (st.b[i] == '+' or st.b[i] == '-'):
+      eneg = st.b[i] == '-'
+      i += 1
+    let es = i
+    while i < e and st.b[i] >= '0' and st.b[i] <= '9':
+      if exp < 100000000: exp = exp * 10 + int(st.b[i]) - 48
+      i += 1
+    if i == es:
+      perr(&st, "Invalid numeric literal")
+      return vnull()
+    if eneg: exp = -exp
+  if i != e:
+    perr(&st, "Invalid numeric literal")
+    return vnull()
+  var x = 0.0
+  let e10 = exp - frac
+  if simple and nd <= 15 and e10 >= -22 and e10 <= 22:
+    x = float(mant)
+    if e10 < 0: x = x / pow10(-e10)
+    elif e10 > 0: x = x * pow10(e10)
+  else:
+    # digits and an exponent, for the correctly rounding float()
+    var t: [Byte] = []
+    var fr = 0
+    var seen_point = false
+    for q in ds..e:
+      let c = st.b[q]
+      if c >= '0' and c <= '9':
+        t.push(c)
+        if seen_point: fr += 1
+      elif c == '.':
+        seen_point = true
+      else:
+        break
+    let ex2 = exp - fr
+    let txt = t.take_str() + "e{ex2}"
+    x = float(txt) else parse_big(txt)
+  if neg: x = -x
+  if plain_int and ndig <= 15 and (ndig == 1 or st.b[ds] != '0') and not (neg and mant == 0) and st.b[s] != '+':
+    return V(K_NUM + 16, x)
+  if not st.lit_ok: return V(K_NUM, x)
+  let c = canon_lit(st, s, e - s, x)
+  if c == "": return V(K_NUM + 16, x)
+  let sv = new_str(&st, c)
+  return V(K_LIT + ((sv.k >> 4) << 4), x)
+
+# float() refuses out-of-range text; jq gives the nearest double (overflow becomes the largest).
+# t is "DIGITSeEXP".
+fn parse_big(t: Str) -> Float:
+  let ep = t.find("e")
+  if ep < 0: return 0.0
+  var mant_zero = true
+  for i in 0..ep:
+    if t[i] >= '1' and t[i] <= '9': mant_zero = false
+  if mant_zero: return 0.0
+  let ex = int(t[ep + 1..t.len]) else 0
+  if ex < 0: return 0.0
+  return 1.0 / 0.0
+
+fn hexval(c: Byte) -> Int:
+  if c >= '0' and c <= '9': return int(c) - 48
+  if c >= 'a' and c <= 'f': return int(c) - 87
+  if c >= 'A' and c <= 'F': return int(c) - 55
+  return -1
+
+# The length of a valid UTF-8 sequence at b[i..e], or 0.
+fn utf8_len(st: St, i: Int, e: Int) -> Int:
+  let c = int(st.b[i])
+  if c < 0x80: return 1
+  if c < 0xC2: return 0
+  if c < 0xE0:
+    if i + 1 < e and (int(st.b[i + 1]) & 0xC0) == 0x80: return 2
+    return 0
+  if c < 0xF0:
+    if i + 2 >= e: return 0
+    let c1 = int(st.b[i + 1])
+    if (c1 & 0xC0) != 0x80 or (int(st.b[i + 2]) & 0xC0) != 0x80: return 0
+    if c == 0xE0 and c1 < 0xA0: return 0
+    if c == 0xED and c1 >= 0xA0: return 0
+    return 3
+  if c < 0xF5:
+    if i + 3 >= e: return 0
+    let c1 = int(st.b[i + 1])
+    if (c1 & 0xC0) != 0x80 or (int(st.b[i + 2]) & 0xC0) != 0x80 or (int(st.b[i + 3]) & 0xC0) != 0x80: return 0
+    if c == 0xF0 and c1 < 0x90: return 0
+    if c == 0xF4 and c1 >= 0x90: return 0
+    return 4
+  return 0
+
+# A string body after its opening quote. Without escapes or bad UTF-8 it is a span of the input;
+# otherwise it is decoded onto the end of b. key: intern it.
+fn parse_string(var st: St, key: Bool) -> V:
+  let start = st.pp
+  var i = start
+  let e = st.pend
+  var flags = SF_CLEAN | SF_ASCII
+  while i < e:
+    let c = st.b[i]
+    if c == '"':
+      st.pp = i + 1
+      if key: return vstr(intern_span(&st, start, i - start, flags))
+      return vstr(add_span(&st, start, i - start, flags))
+    if c == '\\': break
+    if c < 32 or c == 127:
+      flags = flags & SF_ASCII
+      if c == '\n': st.pline += 1
+      i += 1
+    elif c < 128:
+      i += 1
+    else:
+      let n = utf8_len(st, i, e)
+      if n == 0: break
+      flags = flags & SF_CLEAN
+      i += n
+  # slow path: decode into a fresh span at the end of b
+  let out = st.b.len
+  var j = start
+  while j < i:
+    st.b.push(st.b[j])
+    j += 1
+  while i < e:
+    let c = st.b[i]
+    if c == '"':
+      st.pp = i + 1
+      let n = st.b.len - out
+      if key: return vstr(intern_span(&st, out, n, scan_flags(st, out, n)))
+      return vstr(add_span(&st, out, n, scan_flags(st, out, n)))
+    if c == '\\':
+      if i + 1 >= e: break
+      let d = st.b[i + 1]
+      i += 2
+      if d == 'n': st.b.push('\n')
+      elif d == 't': st.b.push('\t')
+      elif d == 'r': st.b.push('\r')
+      elif d == 'b': st.b.push(8)
+      elif d == 'f': st.b.push(12)
+      elif d == '/' or d == '\\' or d == '"': st.b.push(d)
+      elif d == 'u':
+        var cp = read_hex4(st, i, e)
+        if cp < 0:
+          st.pp = i
+          perr(&st, "Invalid escape")
+          return vnull()
+        i += 4
+        if cp >= 0xD800 and cp < 0xDC00:
+          if i + 5 < e and st.b[i] == '\\' and st.b[i + 1] == 'u':
+            let lo = read_hex4(st, i + 2, e)
+            if lo >= 0xDC00 and lo < 0xE000:
+              cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+              i += 6
+            else:
+              cp = 0xFFFD
+          else:
+            cp = 0xFFFD
+        elif cp >= 0xDC00 and cp < 0xE000:
+          cp = 0xFFFD
+        push_utf8(&st.b, cp)
+      else:
+        st.pp = i
+        perr(&st, "Invalid escape")
+        return vnull()
+    elif c < 128:
+      if c == '\n': st.pline += 1
+      st.b.push(c)
+      i += 1
+    else:
+      let n = utf8_len(st, i, e)
+      if n == 0:
+        push_utf8(&st.b, 0xFFFD)
+        i += 1
+      else:
+        for k in 0..n: st.b.push(st.b[i + k])
+        i += n
+  st.pp = e
+  st.b.truncate(out)
+  perr(&st, "Unfinished string at EOF")
+  return vnull()
+
+fn read_hex4(st: St, i: Int, e: Int) -> Int:
+  if i + 4 > e: return -1
+  var v = 0
+  for k in 0..4:
+    let h = hexval(st.b[i + k])
+    if h < 0: return -1
+    v = v * 16 + h
+  return v
+
+fn parse_array(var st: St) -> V:
+  st.depth += 1
+  if st.depth > 10000:
+    perr(&st, "Exceeds depth limit for parsing")
+    return vnull()
+  st.pp += 1
+  let start = st.tv.len
+  skip_ws(&st)
+  if st.pp < st.pend and st.b[st.pp] == ']':
+    st.pp += 1
+    st.depth -= 1
+    return end_arr(&st, start)
+  while true:
+    let v = parse_value(&st)
+    if st.perr != "":
+      st.tv.truncate(start)
+      return vnull()
+    st.tv.push(v)
+    skip_ws(&st)
+    if st.pp >= st.pend:
+      perr(&st, "Unfinished JSON term at EOF")
+      st.tv.truncate(start)
+      return vnull()
+    let c = st.b[st.pp]
+    st.pp += 1
+    if c == ']': break
+    if c != ',':
+      st.pp -= 1
+      if c == '}': perr(&st, "Unmatched '}}'")
+      else: perr(&st, "Expected separator between values")
+      st.tv.truncate(start)
+      return vnull()
+    skip_ws(&st)
+    if st.pp < st.pend and st.b[st.pp] == ']':
+      perr(&st, "Expected another array element")
+      st.tv.truncate(start)
+      return vnull()
+  st.depth -= 1
+  return end_arr(&st, start)
+
+fn parse_object(var st: St) -> V:
+  st.depth += 1
+  if st.depth > 10000:
+    perr(&st, "Exceeds depth limit for parsing")
+    return vnull()
+  st.pp += 1
+  let start = st.tk.len
+  skip_ws(&st)
+  if st.pp < st.pend and st.b[st.pp] == '}':
+    st.pp += 1
+    st.depth -= 1
+    return end_obj(&st, start)
+  while true:
+    skip_ws(&st)
+    if st.pp >= st.pend:
+      perr(&st, "Unfinished JSON term at EOF")
+      return obj_fail(&st, start)
+    if st.b[st.pp] != '"':
+      perr(&st, "Object keys must be strings")
+      return obj_fail(&st, start)
+    st.pp += 1
+    let kv = parse_string(&st, true)
+    if st.perr != "": return obj_fail(&st, start)
+    skip_ws(&st)
+    if st.pp >= st.pend:
+      perr(&st, "Unfinished JSON term at EOF")
+      return obj_fail(&st, start)
+    if st.b[st.pp] != ':':
+      perr(&st, "Objects must consist of key:value pairs")
+      return obj_fail(&st, start)
+    st.pp += 1
+    let v = parse_value(&st)
+    if st.perr != "": return obj_fail(&st, start)
+    st.tk.push(kv.k >> 4)
+    st.tw.push(v)
+    skip_ws(&st)
+    if st.pp >= st.pend:
+      perr(&st, "Unfinished JSON term at EOF")
+      return obj_fail(&st, start)
+    let c = st.b[st.pp]
+    st.pp += 1
+    if c == '}': break
+    if c != ',':
+      st.pp -= 1
+      if c == ']': perr(&st, "Unmatched ']'")
+      else: perr(&st, "Expected separator between values")
+      return obj_fail(&st, start)
+  st.depth -= 1
+  return end_obj(&st, start)
+
+fn obj_fail(var st: St, start: Int) -> V:
+  st.tk.truncate(start)
+  st.tw.truncate(start)
+  return vnull()
+
+# ---------------------------------------------------------------- JSON output
+
+fn out_str(var st: St, s: Str):
+  for i in 0..s.len: st.out.push(s[i])
+
+fn out_num(var st: St, v: V):
+  if (v.k & 15) == K_LIT:
+    let id = v.k >> 4
+    let o = st.so[id]
+    let n = st.sl[id] >> SF_SHIFT
+    for i in o..o + n: st.out.push(st.b[i])
+    return
+  let x = v.n
+  if x == x.trunc() and x < 1e16 and x > -1e16:
+    var iv = int(x)
+    if iv == 0:
+      if 1.0 / x < 0.0: st.out.push('-')
+      st.out.push('0')
+      return
+    if iv < 0:
+      st.out.push('-')
+      iv = -iv
+    var buf = [0] * 20
+    var n = 0
+    while iv > 0:
+      buf[n] = iv % 10
+      iv = iv / 10
+      n += 1
+    while n > 0:
+      n -= 1
+      st.out.push(byte(48 + buf[n]))
+    return
+  out_str(&st, fmt_num(x))
+
+const HEX = "0123456789abcdef"
+
+fn out_string(var st: St, id: Int):
+  let o = st.so[id]
+  let n = st.sl[id] >> SF_SHIFT
+  let f = st.sl[id] & 3
+  st.out.push('"')
+  if (f & SF_CLEAN) != 0 and (not st.ascii or (f & SF_ASCII) != 0):
+    for i in o..o + n: st.out.push(st.b[i])
+  else:
+    out_escaped(&st, o, n)
+  st.out.push('"')
+
+fn out_escaped(var st: St, o: Int, n: Int):
+  var i = o
+  let e = o + n
+  while i < e:
+    let c = st.b[i]
+    if c >= 32 and c != '"' and c != '\\' and c < 127:
+      st.out.push(c)
+      i += 1
+    elif c == '"':
+      st.out.push('\\')
+      st.out.push('"')
+      i += 1
+    elif c == '\\':
+      st.out.push('\\')
+      st.out.push('\\')
+      i += 1
+    elif c == '\n':
+      st.out.push('\\')
+      st.out.push('n')
+      i += 1
+    elif c == '\t':
+      st.out.push('\\')
+      st.out.push('t')
+      i += 1
+    elif c == '\r':
+      st.out.push('\\')
+      st.out.push('r')
+      i += 1
+    elif c == 8:
+      st.out.push('\\')
+      st.out.push('b')
+      i += 1
+    elif c == 12:
+      st.out.push('\\')
+      st.out.push('f')
+      i += 1
+    elif c < 128:
+      out_u(&st, int(c))
+      i += 1
+    elif not st.ascii:
+      st.out.push(c)
+      i += 1
+    else:
+      let len = utf8_len(st, i, e)
+      var cp = 0xFFFD
+      var adv = 1
+      if len == 2:
+        cp = ((int(c) & 31) << 6) | (int(st.b[i + 1]) & 63)
+        adv = 2
+      elif len == 3:
+        cp = ((int(c) & 15) << 12) | ((int(st.b[i + 1]) & 63) << 6) | (int(st.b[i + 2]) & 63)
+        adv = 3
+      elif len == 4:
+        cp = ((int(c) & 7) << 18) | ((int(st.b[i + 1]) & 63) << 12) | ((int(st.b[i + 2]) & 63) << 6) | (int(st.b[i + 3]) & 63)
+        adv = 4
+      if cp >= 0x10000:
+        let x = cp - 0x10000
+        out_u(&st, 0xD800 + (x >> 10))
+        out_u(&st, 0xDC00 + (x & 1023))
+      else:
+        out_u(&st, cp)
+      i += adv
+
+fn out_u(var st: St, c: Int):
+  st.out.push('\\')
+  st.out.push('u')
+  st.out.push(HEX[(c >> 12) & 15])
+  st.out.push(HEX[(c >> 8) & 15])
+  st.out.push(HEX[(c >> 4) & 15])
+  st.out.push(HEX[c & 15])
+
+fn out_nl_indent(var st: St, level: Int):
+  st.out.push('\n')
+  if st.tab:
+    for i in 0..level: st.out.push('\t')
+  else:
+    for i in 0..level * st.indent: st.out.push(' ')
+
+# Writes v as JSON: compact when indent is 0, else pretty with that many spaces (or tabs).
+fn dump(var st: St, v: V, level: Int):
+  let k = v.k & 15
+  if k == K_STR:
+    out_string(&st, v.k >> 4)
+  elif k == K_NUM or k == K_LIT:
+    out_num(&st, v)
+  elif k == K_NULL:
+    out_str(&st, "null")
+  elif k == K_FALSE:
+    out_str(&st, "false")
+  elif k == K_TRUE:
+    out_str(&st, "true")
+  elif k == K_ARR:
+    let id = v.k >> 4
+    let n = st.an[id]
+    let o = st.ao[id]
+    st.out.push('[')
+    if n == 0:
+      st.out.push(']')
+      return
+    let pretty = st.indent > 0 or st.tab
+    for i in 0..n:
+      if i > 0: st.out.push(',')
+      if pretty: out_nl_indent(&st, level + 1)
+      let x = st.av[o + i]
+      dump(&st, x, level + 1)
+    if pretty: out_nl_indent(&st, level)
+    st.out.push(']')
+  else:
+    let id = v.k >> 4
+    let n = st.on[id]
+    let o = st.oo[id]
+    st.out.push('{')
+    if n == 0:
+      st.out.push('}')
+      return
+    let pretty = st.indent > 0 or st.tab
+    if st.sortkeys and n > 1:
+      let ks = sorted_keys(st, v)
+      var first = true
+      for key in ks:
+        if not first: st.out.push(',')
+        first = false
+        if pretty: out_nl_indent(&st, level + 1)
+        out_string(&st, key)
+        st.out.push(':')
+        if pretty: st.out.push(' ')
+        let x = oval(st, v, ofind(st, v, key))
+        dump(&st, x, level + 1)
+    else:
+      for i in 0..n:
+        if i > 0: st.out.push(',')
+        if pretty: out_nl_indent(&st, level + 1)
+        let key = st.ok[o + i]
+        out_string(&st, key)
+        st.out.push(':')
+        if pretty: st.out.push(' ')
+        let x = st.ov[o + i]
+        dump(&st, x, level + 1)
+    if pretty: out_nl_indent(&st, level)
+    st.out.push('}')
+
+# v as compact JSON text (for tojson, tostring and error messages).
+fn to_json_str(var st: St, v: V) -> Str:
+  var saved: [Byte] = []
+  swap(&saved, &st.out)
+  let ind = st.indent
+  let tb = st.tab
+  let sk = st.sortkeys
+  let asc = st.ascii
+  st.indent = 0
+  st.tab = false
+  st.sortkeys = false
+  st.ascii = false
+  dump(&st, v, 0)
+  st.indent = ind
+  st.tab = tb
+  st.sortkeys = sk
+  st.ascii = asc
+  swap(&saved, &st.out)
+  return saved.take_str()

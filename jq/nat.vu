@@ -1,0 +1,1865 @@
+# nat: jq's built-in functions that aren't written in jq (see builtins.vu for those), with
+# jq 1.7.1's results and error messages.
+
+import jv
+import lang
+import run
+from jv import V, St, vnull, vnum, vint, vbool, vstr, varr, vobj, kind, truthy, K_NULL, K_FALSE, K_TRUE, K_NUM, K_LIT, K_STR, K_ARR, K_OBJ
+from run import It, Kf, ST_OK, ST_ERR, ST_BREAK, ST_HALT, sfail, type_err, type_err2, kname
+
+extern "glue.c":
+  type Re drop vjq_re_free
+  fn vjq_m1(ffi: Ffi, op: Int, x: Float) -> Float
+  fn vjq_m2(ffi: Ffi, op: Int, x: Float, y: Float) -> Float
+  fn vjq_m3(ffi: Ffi, op: Int, x: Float, y: Float, z: Float) -> Float
+  fn vjq_now(ffi: Ffi) -> Float
+  fn vjq_brokendown(ffi: Ffi, t: Float, local: Bool, var out: [Float]) -> Bool
+  fn vjq_timegm(ffi: Ffi, fields: [Float]) -> Float
+  fn vjq_strftime(ffi: Ffi, fmt: Str, fields: [Float]) -> Str
+  fn vjq_strptime(ffi: Ffi, s: Str, fmt: Str, var out: [Float]) -> Int
+  fn vjq_environ(ffi: Ffi) -> Str
+  fn vjq_re_compile(ffi: Ffi, pat: Str, options: Int) -> Re throws
+  fn vjq_re_ncap(ffi: Ffi, re: Re) -> Int
+  fn vjq_re_search(ffi: Ffi, re: Re, s: Str, start: Int, var out: [Int]) -> Int
+  fn vjq_re_names(ffi: Ffi, re: Re) -> Str
+  fn vjq_ewrite(ffi: Ffi, s: Str)
+
+type ReEntry:
+  pat: Str
+  opts: Int
+  re: Re
+
+# The natives: "name/arity" and a kind: v (one output from the input and argument values; the
+# last argument varies slowest), or gN (handled by gen, its first N arguments bound as values
+# first to last, the rest passed as filters).
+const NATIVES = "length/0:v utf8bytelength/0:v not/0:v keys/0:v keys_unsorted/0:v has/1:v contains/1:v add/0:v type/0:v tostring/0:v tojson/0:v fromjson/0:v tonumber/0:v ascii_downcase/0:v ascii_upcase/0:v explode/0:v implode/0:v ltrimstr/1:v rtrimstr/1:v startswith/1:v endswith/1:v split/1:v join/1:v sort/0:v min/0:v max/0:v unique/0:v reverse/0:v to_entries/0:v from_entries/0:v setpath/2:v delpaths/1:v _strindices/1:v indices/1:v index/1:v rindex/1:v flatten/0:v flatten/1:v infinite/0:v nan/0:v isinfinite/0:v isnan/0:v isnormal/0:v error/0:v env/0:v builtins/0:v input_filename/0:v now/0:v mktime/0:v gmtime/0:v localtime/0:v strftime/1:v strflocaltime/1:v strptime/1:v format/1:v _match_impl/3:v _sort_by_impl/1:v _group_by_impl/1:v _min_by_impl/1:v _max_by_impl/1:v _unique_by_impl/1:v floor/0:v sqrt/0:v frexp/0:v modf/0:v lgamma_r/0:v fma/3:v input_line_number/0:v have_literal_numbers/0:v have_decnum/0:v stderr/0:v debug/0:v getpath/1:g1 empty/0:g0 path/1:g0 select/1:g0 recurse/0:g0 recurse/1:g0 range/1:g1 range/2:g2 range/3:g3 limit/2:g1 first/1:g0 last/1:g0 isempty/1:g0 any/2:g0 all/2:g0 input/0:g0 inputs/0:g0 halt/0:g0 halt_error/1:g1 map/1:g0 until/2:g0 while/2:g0 repeat/1:g0 get_search_list/0:v modulemeta/0:v get_prog_origin/0:v get_jq_origin/0:v min_by/1:g0 max_by/1:g0 sort_by/1:g0 group_by/1:g0 unique_by/1:g0 any/1:g0 all/1:g0 any/0:v all/0:v"
+
+const MATH1 = "acos acosh asin asinh atan atanh cbrt ceil cos cosh erf erfc exp exp10 exp2 expm1 fabs floor gamma j0 j1 lgamma log log10 log1p log2 logb nearbyint pow10 rint round significand sin sinh sqrt tan tanh tgamma trunc y0 y1"
+const MATH2 = "atan2 copysign drem fdim fmax fmin fmod hypot jn ldexp nextafter nexttoward pow remainder scalb scalbln yn"
+
+const NM_MATH1 = 1000
+const NM_MATH2 = 1100
+
+fn names() -> [Str]:
+  return NATIVES.split(" ")
+
+# The id of native name/arity, or -1.
+fn lookup(name: Str, arity: Int) -> Int:
+  let key = name + "/{arity}:"
+  let ns = names()
+  for i in 0..ns.len:
+    if ns[i].startswith(key): return i
+  if arity == 0:
+    let m1 = MATH1.split(" ")
+    for i in 0..m1.len:
+      if m1[i] == name: return NM_MATH1 + i
+  if arity == 2:
+    let m2 = MATH2.split(" ")
+    for i in 0..m2.len:
+      if m2[i] == name: return NM_MATH2 + i
+  return -1
+
+fn kind_of(id: Int) -> Str:
+  if id >= NM_MATH1: return "v"
+  let e = names()[id]
+  let c = e.find(":")
+  return e[c + 1..e.len]
+
+fn is_val(id: Int) -> Bool:
+  return kind_of(id) == "v"
+
+fn nvals(id: Int) -> Int:
+  let k = kind_of(id)
+  if k.startswith("g"): return int(k[1..k.len]) else 0
+  return 0
+
+fn native_name(id: Int) -> Str:
+  if id >= NM_MATH2: return MATH2.split(" ")[id - NM_MATH2] + "/2"
+  if id >= NM_MATH1: return MATH1.split(" ")[id - NM_MATH1] + "/0"
+  let e = names()[id]
+  return e[0..e.find(":")]
+
+# Native ids by name, resolved once (the dispatch below compares ids).
+type Ids:
+  length, utf8bytelength, not_, keys, keys_unsorted, has, contains, add, type_, tostring, tojson, fromjson, tonumber: Int
+  ascii_downcase, ascii_upcase, explode, implode, ltrimstr, rtrimstr, startswith, endswith, split, join, sort, min, max, unique, reverse: Int
+  to_entries, from_entries, setpath, delpaths, strindices, indices, index, rindex, flatten0, flatten1, infinite, nan, isinfinite, isnan, isnormal: Int
+  error0, env, builtins, input_filename, now, mktime, gmtime, localtime, strftime, strflocaltime, strptime, format, match_impl: Int
+  sort_by_impl, group_by_impl, min_by_impl, max_by_impl, unique_by_impl, floor, sqrt, frexp, modf, lgamma_r, fma, input_line_number: Int
+  have_literal_numbers, have_decnum, stderr, debug, getpath, empty, path, select, recurse0, recurse1, range1, range2, range3: Int
+  limit, first, last, isempty, any2, all2, input, inputs, halt, halt_error, map, until, while_, repeat, any0, all0, any1, all1: Int
+  min_by, max_by, sort_by, group_by, unique_by: Int
+
+fn ids() -> Ids:
+  return Ids(lookup("length", 0), lookup("utf8bytelength", 0), lookup("not", 0), lookup("keys", 0), lookup("keys_unsorted", 0), lookup("has", 1), lookup("contains", 1), lookup("add", 0), lookup("type", 0), lookup("tostring", 0), lookup("tojson", 0), lookup("fromjson", 0), lookup("tonumber", 0), lookup("ascii_downcase", 0), lookup("ascii_upcase", 0), lookup("explode", 0), lookup("implode", 0), lookup("ltrimstr", 1), lookup("rtrimstr", 1), lookup("startswith", 1), lookup("endswith", 1), lookup("split", 1), lookup("join", 1), lookup("sort", 0), lookup("min", 0), lookup("max", 0), lookup("unique", 0), lookup("reverse", 0), lookup("to_entries", 0), lookup("from_entries", 0), lookup("setpath", 2), lookup("delpaths", 1), lookup("_strindices", 1), lookup("indices", 1), lookup("index", 1), lookup("rindex", 1), lookup("flatten", 0), lookup("flatten", 1), lookup("infinite", 0), lookup("nan", 0), lookup("isinfinite", 0), lookup("isnan", 0), lookup("isnormal", 0), lookup("error", 0), lookup("env", 0), lookup("builtins", 0), lookup("input_filename", 0), lookup("now", 0), lookup("mktime", 0), lookup("gmtime", 0), lookup("localtime", 0), lookup("strftime", 1), lookup("strflocaltime", 1), lookup("strptime", 1), lookup("format", 1), lookup("_match_impl", 3), lookup("_sort_by_impl", 1), lookup("_group_by_impl", 1), lookup("_min_by_impl", 1), lookup("_max_by_impl", 1), lookup("_unique_by_impl", 1), lookup("floor", 0), lookup("sqrt", 0), lookup("frexp", 0), lookup("modf", 0), lookup("lgamma_r", 0), lookup("fma", 3), lookup("input_line_number", 0), lookup("have_literal_numbers", 0), lookup("have_decnum", 0), lookup("stderr", 0), lookup("debug", 0), lookup("getpath", 1), lookup("empty", 0), lookup("path", 1), lookup("select", 1), lookup("recurse", 0), lookup("recurse", 1), lookup("range", 1), lookup("range", 2), lookup("range", 3), lookup("limit", 2), lookup("first", 1), lookup("last", 1), lookup("isempty", 1), lookup("any", 2), lookup("all", 2), lookup("input", 0), lookup("inputs", 0), lookup("halt", 0), lookup("halt_error", 1), lookup("map", 1), lookup("until", 2), lookup("while", 2), lookup("repeat", 1), lookup("any", 0), lookup("all", 0), lookup("any", 1), lookup("all", 1), lookup("min_by", 1), lookup("max_by", 1), lookup("sort_by", 1), lookup("group_by", 1), lookup("unique_by", 1))
+
+# argument i of a value native (pushed last first, so argument 0 is on top)
+fn varg(it: It, i: Int) -> V:
+  return it.argv[it.argv.len - 1 - i]
+
+# argument i of a generator native (pushed first to last)
+fn garg(it: It, n: Int, i: Int) -> V:
+  return it.argv[it.argv.len - n + i]
+
+fn call(var it: It, id: Int, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let nd = it.ast.ns[n]
+  if id >= NM_MATH1 or it.nkind[id] == 0: return run.nat_args(&it, id, n, nd.c - 1, v, p, env, k)
+  return run.gen_args(&it, id, n, 0, v, p, env, k)
+
+# ---------------------------------------------------------------- strings
+
+fn sv(it: It, v: V) -> Str:
+  return jv.str_of(it.st, v)
+
+fn mkstr(var it: It, s: Str) -> V:
+  return jv.new_str(&it.st, s)
+
+# Code points in a string value.
+fn cp_len(st: St, v: V) -> Int:
+  let id = v.k >> 4
+  let o = st.so[id]
+  let n = st.sl[id] >> 2
+  if (st.sl[id] & 2) != 0: return n
+  var c = 0
+  for i in o..o + n:
+    if (int(st.b[i]) & 0xC0) != 0x80: c += 1
+  return c
+
+# The byte offset of code point index ci in string v.
+fn cp_off(st: St, v: V, ci: Int) -> Int:
+  let id = v.k >> 4
+  let o = st.so[id]
+  let n = st.sl[id] >> 2
+  if (st.sl[id] & 2) != 0: return ci
+  var c = 0
+  var i = 0
+  while i < n:
+    if (int(st.b[o + i]) & 0xC0) != 0x80:
+      if c == ci: return i
+      c += 1
+    i += 1
+  return n
+
+fn str_slice_cp(var it: It, v: V, from: Int, to: Int) -> V:
+  let a = cp_off(it.st, v, from)
+  let b = cp_off(it.st, v, to)
+  let id = v.k >> 4
+  let o = it.st.so[id]
+  let _h1 = it.st.sl[id] & 3
+  return vstr(jv.add_span(&it.st, o + a, b - a, _h1))
+
+fn sub_bytes(var it: It, v: V, a: Int, b: Int) -> V:
+  let id = v.k >> 4
+  let o = it.st.so[id]
+  let f = it.st.sl[id] & 3
+  if (f & 2) != 0: return vstr(jv.add_span(&it.st, o + a, b - a, f))
+  let _h2 = jv.scan_flags(it.st, o + a, b - a)
+  return vstr(jv.add_span(&it.st, o + a, b - a, _h2))
+
+fn split_str(var it: It, a: V, sep: V) -> V:
+  let s = sv(it, a)
+  let d = sv(it, sep)
+  let start = it.st.tv.len
+  if s.len == 0:
+    return jv.end_arr(&it.st, start)
+  if d.len == 0:
+    # every character (code point)
+    var i = 0
+    while i < s.len:
+      var j = i + 1
+      while j < s.len and (int(s[j]) & 0xC0) == 0x80: j += 1
+      it.st.tv.push(sub_bytes(&it, a, i, j))
+      i = j
+    return jv.end_arr(&it.st, start)
+  var pos = 0
+  while true:
+    let f = s.find(d, pos)
+    if f < 0:
+      it.st.tv.push(sub_bytes(&it, a, pos, s.len))
+      break
+    it.st.tv.push(sub_bytes(&it, a, pos, f))
+    pos = f + d.len
+  return jv.end_arr(&it.st, start)
+
+# [..] of the start indexes of b (an array) inside array a.
+fn indexes(var it: It, a: V, b: V) -> V:
+  let na = jv.alen(it.st, a)
+  let nb = jv.alen(it.st, b)
+  let start = it.st.tv.len
+  if nb == 0:
+    return vnull()
+  var i = 0
+  while i + nb <= na:
+    var ok = true
+    for j in 0..nb:
+      if not jv.veq(it.st, jv.aget(it.st, a, i + j), jv.aget(it.st, b, j)):
+        ok = false
+        break
+    if ok: it.st.tv.push(vint(i))
+    i += 1
+  return jv.end_arr(&it.st, start)
+
+fn clampd(x: Float) -> Float:
+  if x != x: return 0.0
+  if x < -2147483648.0: return -2147483648.0
+  if x > 2147483647.0: return 2147483647.0
+  return x
+
+# ---------------------------------------------------------------- sorting
+
+fn sort_vals(st: St, var xs: [V]):
+  let n = xs.len
+  if n < 2: return
+  var tmp: [V] = []
+  for x in xs: tmp.push(x)
+  var width = 1
+  while width < n:
+    var lo = 0
+    while lo < n:
+      var mid = lo + width
+      if mid > n: mid = n
+      var hi = lo + 2 * width
+      if hi > n: hi = n
+      var i = lo
+      var j = mid
+      var w = lo
+      while i < mid and j < hi:
+        if jv.vcmp(st, xs[j], xs[i]) < 0:
+          tmp[w] = xs[j]
+          j += 1
+        else:
+          tmp[w] = xs[i]
+          i += 1
+        w += 1
+      while i < mid:
+        tmp[w] = xs[i]
+        i += 1
+        w += 1
+      while j < hi:
+        tmp[w] = xs[j]
+        j += 1
+        w += 1
+      lo = hi
+    swap(&xs, &tmp)
+    width *= 2
+
+# Indexes 0..n-1 sorted (stably) by keys[i].
+fn sort_idx(st: St, keys: [V]) -> [Int]:
+  let n = keys.len
+  var idx: [Int] = []
+  for i in 0..n: idx.push(i)
+  if n < 2: return idx
+  var tmp = [0] * n
+  var width = 1
+  while width < n:
+    var lo = 0
+    while lo < n:
+      var mid = lo + width
+      if mid > n: mid = n
+      var hi = lo + 2 * width
+      if hi > n: hi = n
+      var i = lo
+      var j = mid
+      var w = lo
+      while i < mid and j < hi:
+        if jv.vcmp(st, keys[idx[j]], keys[idx[i]]) < 0:
+          tmp[w] = idx[j]
+          j += 1
+        else:
+          tmp[w] = idx[i]
+          i += 1
+        w += 1
+      while i < mid:
+        tmp[w] = idx[i]
+        i += 1
+        w += 1
+      while j < hi:
+        tmp[w] = idx[j]
+        j += 1
+        w += 1
+      lo = hi
+    swap(&idx, &tmp)
+    width *= 2
+  return idx
+
+fn arr_vals(st: St, a: V) -> [V]:
+  var xs: [V] = []
+  let n = jv.alen(st, a)
+  for i in 0..n: xs.push(jv.aget(st, a, i))
+  return xs
+
+fn mkarr(var it: It, xs: [V]) -> V:
+  let start = it.st.tv.len
+  for x in xs: it.st.tv.push(x)
+  return jv.end_arr(&it.st, start)
+
+# ---------------------------------------------------------------- value natives
+
+fn call_val(var it: It, id: Int, n: Int, v: V) -> V:
+  if id >= NM_MATH1: return math(&it, id, v)
+  let I = it.nid
+  let k = v.k & 15
+  if id == I.length:
+    if k == K_ARR: return vint(jv.alen(it.st, v))
+    if k == K_OBJ: return vint(jv.olen(it.st, v))
+    if k == K_STR: return vint(cp_len(it.st, v))
+    if k == K_NUM or k == K_LIT: return vnum(abs(v.n))
+    if k == K_NULL: return vint(0)
+    return type_err(&it, v, "has no length")
+  if id == I.not_: return vbool(not truthy(v))
+  if id == I.type_: return mkstr(&it, kname(v))
+  if id == I.tostring: return run.tostring(&it, v)
+  if id == I.tojson:
+    let s = jv.to_json_str(&it.st, v)
+    return mkstr(&it, s)
+  if id == I.keys or id == I.keys_unsorted:
+    if k == K_OBJ:
+      let start = it.st.tv.len
+      if id == I.keys:
+        let ks = jv.sorted_keys(it.st, v)
+        for key in ks: it.st.tv.push(vstr(key))
+      else:
+        let nn = jv.olen(it.st, v)
+        for i in 0..nn: it.st.tv.push(vstr(jv.okey(it.st, v, i)))
+      return jv.end_arr(&it.st, start)
+    if k == K_ARR:
+      let start = it.st.tv.len
+      let nn = jv.alen(it.st, v)
+      for i in 0..nn: it.st.tv.push(vint(i))
+      return jv.end_arr(&it.st, start)
+    return type_err(&it, v, "has no keys")
+  if id == I.has:
+    let _h3 = varg(it, 0)
+    return has(&it, v, _h3)
+  if id == I.contains:
+    let b = varg(it, 0)
+    if jv.korder(v) != jv.korder(b): return type_err2(&it, v, b, "cannot have their containment checked")
+    return vbool(contains(&it, v, b))
+  if id == I.add: return add(&it, v)
+  if id == I.utf8bytelength:
+    if k != K_STR: return type_err(&it, v, "only strings have UTF-8 byte length")
+    return vint(jv.slen(it.st, v.k >> 4))
+  if id == I.fromjson:
+    if k != K_STR: return type_err(&it, v, "only strings can be parsed")
+    return parse_text(&it, v, false)
+  if id == I.tonumber:
+    if k == K_NUM or k == K_LIT: return v
+    if k == K_STR:
+      let r = parse_text(&it, v, true)
+      if it.bad or jv.is_num(r): return r
+    return type_err(&it, v, "cannot be parsed as a number")
+  if id == I.ascii_downcase or id == I.ascii_upcase:
+    if k != K_STR: return sfail(&it, "explode input must be a string")
+    let s = sv(it, v)
+    if id == I.ascii_downcase: return mkstr(&it, ascii_case(s, true))
+    return mkstr(&it, ascii_case(s, false))
+  if id == I.explode:
+    if k != K_STR: return sfail(&it, "explode input must be a string")
+    let s = sv(it, v)
+    let start = it.st.tv.len
+    for c in s.codes(): it.st.tv.push(vint(c))
+    return jv.end_arr(&it.st, start)
+  if id == I.implode: return implode(&it, v)
+  if id == I.ltrimstr or id == I.rtrimstr:
+    let b = varg(it, 0)
+    if k != K_STR or kind(b) != K_STR: return v
+    let s = sv(it, v)
+    let t = sv(it, b)
+    if id == I.ltrimstr:
+      if s.startswith(t): return sub_bytes(&it, v, t.len, s.len)
+      return v
+    if s.endswith(t) and t.len <= s.len: return sub_bytes(&it, v, 0, s.len - t.len)
+    return v
+  if id == I.startswith or id == I.endswith:
+    let b = varg(it, 0)
+    if k != K_STR or kind(b) != K_STR:
+      if id == I.startswith: return sfail(&it, "startswith() requires string inputs")
+      return sfail(&it, "endswith() requires string inputs")
+    if id == I.startswith: return vbool(sv(it, v).startswith(sv(it, b)))
+    return vbool(sv(it, v).endswith(sv(it, b)))
+  if id == I.split:
+    let b = varg(it, 0)
+    if k != K_STR or kind(b) != K_STR: return sfail(&it, "split input and separator must be strings")
+    return split_str(&it, v, b)
+  if id == I.join:
+    let _h4 = varg(it, 0)
+    return join(&it, v, _h4)
+  if id == I.sort:
+    if k != K_ARR:
+      let _h5 = "cannot be sorted, as it is not an array"
+      return type_err(&it, v, _h5)
+    var xs = arr_vals(it.st, v)
+    sort_vals(it.st, &xs)
+    return mkarr(&it, xs)
+  if id == I.min or id == I.max:
+    if k != K_ARR: return type_err2(&it, v, v, "cannot be iterated over")
+    return minmax(&it, v, v, id == I.min)
+  if id == I.unique:
+    if k != K_ARR:
+      let _h6 = "cannot be sorted, as it is not an array"
+      return type_err(&it, v, _h6)
+    var xs = arr_vals(it.st, v)
+    sort_vals(it.st, &xs)
+    var out: [V] = []
+    for x in xs:
+      if out.len == 0 or not jv.veq(it.st, out[out.len - 1], x): out.push(x)
+    return mkarr(&it, out)
+  if id == I.reverse:
+    if k == K_ARR:
+      var xs = arr_vals(it.st, v)
+      var out: [V] = []
+      var i = xs.len - 1
+      while i >= 0:
+        out.push(xs[i])
+        i -= 1
+      return mkarr(&it, out)
+    if k == K_NULL: return jv.empty_arr(&it.st)
+    let len = call_val(&it, I.length, n, v)
+    if it.bad: return vnull()
+    if len.n == 0.0: return jv.empty_arr(&it.st)
+    return sfail(&it, "Cannot index " + kname(v) + " with number")
+  if id == I.to_entries:
+    let kk = jv.intern_str(&it.st, "key")
+    let vk = jv.intern_str(&it.st, "value")
+    let start = it.st.tv.len
+    if k == K_OBJ:
+      let nn = jv.olen(it.st, v)
+      for i in 0..nn:
+        let s0 = it.st.tk.len
+        it.st.tk.push(kk)
+        it.st.tw.push(vstr(jv.okey(it.st, v, i)))
+        it.st.tk.push(vk)
+        it.st.tw.push(jv.oval(it.st, v, i))
+        let e = jv.end_obj(&it.st, s0)
+        it.st.tv.push(e)
+      return jv.end_arr(&it.st, start)
+    if k == K_ARR:
+      let nn = jv.alen(it.st, v)
+      for i in 0..nn:
+        let s0 = it.st.tk.len
+        it.st.tk.push(kk)
+        it.st.tw.push(vint(i))
+        it.st.tk.push(vk)
+        it.st.tw.push(jv.aget(it.st, v, i))
+        let e = jv.end_obj(&it.st, s0)
+        it.st.tv.push(e)
+      return jv.end_arr(&it.st, start)
+    return type_err(&it, v, "has no keys")
+  if id == I.from_entries: return from_entries(&it, v)
+  if id == I.setpath:
+    let path = varg(it, 0)
+    if kind(path) != K_ARR: return sfail(&it, "Path must be specified as an array")
+    let _h7 = varg(it, 1)
+    return run.setpath(&it, v, path, 0, _h7, 0)
+  if id == I.delpaths:
+    let _h8 = varg(it, 0)
+    return run.delpaths(&it, v, _h8)
+  if id == I.strindices:
+    let b = varg(it, 0)
+    return strindices(&it, v, b)
+  if id == I.indices or id == I.index or id == I.rindex:
+    let b = varg(it, 0)
+    var r = vnull()
+    if k == K_ARR and kind(b) == K_ARR:
+      r = run.index_val(&it, v, b)
+    elif k == K_ARR:
+      let one = mkarr(&it, [b])
+      r = run.index_val(&it, v, one)
+    elif k == K_STR and kind(b) == K_STR:
+      r = strindices(&it, v, b)
+    else:
+      r = run.index_val(&it, v, b)
+    if it.bad: return vnull()
+    if id == I.indices: return r
+    if kind(r) == K_NULL: return r
+    if kind(r) != K_ARR: return run.index_val(&it, r, vint(0))
+    let nn = jv.alen(it.st, r)
+    if nn == 0: return vnull()
+    if id == I.index: return jv.aget(it.st, r, 0)
+    return jv.aget(it.st, r, nn - 1)
+  if id == I.flatten0: return flatten(&it, v, -1.0)
+  if id == I.flatten1:
+    let d = varg(it, 0)
+    if jv.is_num(d) and d.n < 0.0: return sfail(&it, "flatten depth must not be negative")
+    if not jv.is_num(d):
+      # jq compares $x < 0 for any type; non-numbers sort above numbers
+      if jv.vcmp(it.st, d, vint(0)) < 0: return sfail(&it, "flatten depth must not be negative")
+    return flatten(&it, v, d.n)
+  if id == I.infinite: return vnum(1.0 / 0.0)
+  if id == I.nan: return vnum(0.0 / 0.0)
+  if id == I.isinfinite or id == I.isnan or id == I.isnormal:
+    if k != K_NUM and k != K_LIT: return type_err(&it, v, "number required")
+    let x = v.n
+    if id == I.isinfinite: return vbool(x == 1.0 / 0.0 or x == -1.0 / 0.0)
+    if id == I.isnan: return vbool(x != x)
+    return vbool(x == x and x != 0.0 and abs(x) >= 2.2250738585072014e-308 and abs(x) != 1.0 / 0.0)
+  if id == I.error0:
+    it.err = v
+    it.bad = true
+    return vnull()
+  if id == I.env: return env_obj(&it)
+  if id == I.builtins: return builtins_list(&it)
+  if id == I.input_filename:
+    if it.ifile < it.ifiles.len and it.ifiles[it.ifile] != "":
+      let _h9 = it.ifiles[it.ifile]
+      return mkstr(&it, _h9)
+    return vnull()
+  if id == I.now: return vnum(vjq_now(it.ffi))
+  if id == I.mktime: return mktime(&it, v)
+  if id == I.gmtime or id == I.localtime:
+    if k != K_NUM and k != K_LIT:
+      if id == I.gmtime: return sfail(&it, "gmtime() requires numeric inputs")
+      return sfail(&it, "localtime() requires numeric inputs")
+    return brokendown(&it, v.n, id == I.localtime)
+  if id == I.strftime or id == I.strflocaltime:
+    let _h10 = varg(it, 0)
+    return strftime(&it, v, _h10, id == I.strflocaltime)
+  if id == I.strptime:
+    let _h11 = varg(it, 0)
+    return strptime(&it, v, _h11)
+  if id == I.format:
+    let f = varg(it, 0)
+    if kind(f) != K_STR: return type_err(&it, f, "is not a valid format")
+    let _h12 = sv(it, f)
+    return format_name(&it, _h12, v)
+  if id == I.match_impl:
+    let _h15 = varg(it, 0)
+    let _h14 = varg(it, 1)
+    let _h13 = varg(it, 2)
+    return match_impl(&it, v, _h15, _h14, _h13)
+  if id == I.sort_by_impl or id == I.group_by_impl or id == I.unique_by_impl:
+    let _h16 = varg(it, 0)
+    return by_impl(&it, id, v, _h16)
+  if id == I.min_by_impl or id == I.max_by_impl:
+    let keys = varg(it, 0)
+    if k != K_ARR or kind(keys) != K_ARR: return type_err2(&it, v, keys, "cannot be iterated over")
+    if jv.alen(it.st, v) != jv.alen(it.st, keys): return type_err2(&it, v, keys, "have wrong length")
+    return minmax(&it, v, keys, id == I.min_by_impl)
+  if id == I.floor:
+    if k != K_NUM and k != K_LIT: return type_err(&it, v, "number required")
+    return vnum(v.n.floor())
+  if id == I.sqrt:
+    if k != K_NUM and k != K_LIT: return type_err(&it, v, "number required")
+    return vnum(sqrt(v.n))
+  if id == I.frexp or id == I.modf or id == I.lgamma_r:
+    if k != K_NUM and k != K_LIT: return type_err(&it, v, "number required")
+    var a = 41
+    if id == I.modf: a = 43
+    if id == I.lgamma_r: a = 45
+    let x = vjq_m1(it.ffi, a, v.n)
+    let y = vjq_m1(it.ffi, a + 1, v.n)
+    if id == I.modf: return mkarr(&it, [vnum(x), vnum(y)])
+    return mkarr(&it, [vnum(x), vnum(y)])
+  if id == I.fma:
+    let a = varg(it, 0)
+    let b = varg(it, 1)
+    let c = varg(it, 2)
+    if not jv.is_num(a): return type_err(&it, a, "number required")
+    if not jv.is_num(b): return type_err(&it, b, "number required")
+    if not jv.is_num(c): return type_err(&it, c, "number required")
+    return vnum(vjq_m3(it.ffi, 0, a.n, b.n, c.n))
+  if id == I.input_line_number: return vint(it.iline)
+  if id == I.have_literal_numbers: return vbool(true)
+  if id == I.have_decnum: return vbool(false)
+  if id == I.stderr:
+    let s = jv.to_json_str(&it.st, v)
+    run.flush_out(&it)
+    vjq_ewrite(it.ffi, s)
+    return v
+  if id == I.debug:
+    let s = jv.to_json_str(&it.st, v)
+    run.flush_out(&it)
+    eprint("[\"DEBUG:\"," + s + "]")
+    return v
+  if id == I.any0 or id == I.all0:
+    if k != K_ARR and k != K_OBJ:
+      let d = run.trunc_dump(&it, v, 15)
+      return sfail(&it, "Cannot iterate over " + kname(v) + " (" + d + ")")
+    var nn = 0
+    if k == K_ARR: nn = jv.alen(it.st, v)
+    else: nn = jv.olen(it.st, v)
+    for i in 0..nn:
+      var x = vnull()
+      if k == K_ARR: x = jv.aget(it.st, v, i)
+      else: x = jv.oval(it.st, v, i)
+      if id == I.any0 and truthy(x): return vbool(true)
+      if id == I.all0 and not truthy(x): return vbool(false)
+    return vbool(id == I.all0)
+  if native_name(id) == "get_search_list/0": return jv.empty_arr(&it.st)
+  if native_name(id) == "get_prog_origin/0" or native_name(id) == "get_jq_origin/0": return vnull()
+  if native_name(id) == "modulemeta/0": return sfail(&it, "modulemeta input module name must be a string")
+  return sfail(&it, "internal: native " + native_name(id))
+
+
+fn math(var it: It, id: Int, v: V) -> V:
+  if id >= NM_MATH2:
+    let a = varg(it, 0)
+    let b = varg(it, 1)
+    if not jv.is_num(a): return type_err(&it, a, "number required")
+    if not jv.is_num(b): return type_err(&it, b, "number required")
+    return vnum(vjq_m2(it.ffi, id - NM_MATH2, a.n, b.n))
+  if not jv.is_num(v): return type_err(&it, v, "number required")
+  let op = id - NM_MATH1
+  if op == 17: return vnum(v.n.floor())
+  if op == 34: return vnum(sqrt(v.n))
+  return vnum(vjq_m1(it.ffi, op, v.n))
+
+fn ascii_case(s: Str, down: Bool) -> Str:
+  var b = bytes(s)
+  for i in 0..b.len:
+    let c = b[i]
+    if down and c >= 'A' and c <= 'Z': b[i] = c + 32
+    if not down and c >= 'a' and c <= 'z': b[i] = c - 32
+  return b.take_str()
+
+fn implode(var it: It, v: V) -> V:
+  if kind(v) != K_ARR: return sfail(&it, "implode input must be an array")
+  let n = jv.alen(it.st, v)
+  var out: [Byte] = []
+  for i in 0..n:
+    let x = jv.aget(it.st, v, i)
+    if not jv.is_num(x) or x.n != x.n:
+      return type_err(&it, x, "can't be imploded, unicode codepoint needs to be numeric")
+    var c = int(clampd(x.n))
+    if c > 0x10FFFF or c < 0 or (c >= 0xD800 and c <= 0xDFFF): c = 0xFFFD
+    jv.push_utf8(&out, c)
+  let off = it.st.b.len
+  for c in out: it.st.b.push(c)
+  return jv.end_str(&it.st, off)
+
+fn has(var it: It, t: V, key: V) -> V:
+  let tk = kind(t)
+  let kk = kind(key)
+  if tk == K_NULL: return vbool(false)
+  if tk == K_OBJ and kk == K_STR:
+    let kid = jv.intern_id(&it.st, key.k >> 4)
+    return vbool(jv.ofind(it.st, t, kid) >= 0)
+  if tk == K_ARR and (kk == K_NUM or kk == K_LIT):
+    if key.n != key.n: return vbool(false)
+    let i = int(clampd(key.n))
+    return vbool(i >= 0 and i < jv.alen(it.st, t))
+  return sfail(&it, "Cannot check whether " + kname(t) + " has a " + kname(key) + " key")
+
+fn contains(var it: It, a: V, b: V) -> Bool:
+  let ka = kind(a)
+  if ka == K_OBJ and kind(b) == K_OBJ:
+    let nb = jv.olen(it.st, b)
+    for i in 0..nb:
+      let key = jv.okey(it.st, b, i)
+      let pos = jv.ofind(it.st, a, key)
+      if pos < 0: return false
+      let av = jv.oval(it.st, a, pos)
+      let bv = jv.oval(it.st, b, i)
+      if jv.korder(av) != jv.korder(bv):
+        return jv.veq(it.st, av, bv)
+      if not contains(&it, av, bv): return false
+    return true
+  if ka == K_ARR and kind(b) == K_ARR:
+    let nb = jv.alen(it.st, b)
+    let na = jv.alen(it.st, a)
+    for i in 0..nb:
+      let bv = jv.aget(it.st, b, i)
+      var found = false
+      for j in 0..na:
+        let av = jv.aget(it.st, a, j)
+        if jv.korder(av) == jv.korder(bv) and contains(&it, av, bv):
+          found = true
+          break
+      if not found: return false
+    return true
+  if ka == K_STR and kind(b) == K_STR:
+    let s = sv(it, a)
+    let t = sv(it, b)
+    return s.find(t) >= 0
+  return jv.veq(it.st, a, b)
+
+fn iter_vals(var it: It, v: V) -> [V]:
+  var xs: [V] = []
+  let k = kind(v)
+  if k == K_ARR:
+    let n = jv.alen(it.st, v)
+    for i in 0..n: xs.push(jv.aget(it.st, v, i))
+  elif k == K_OBJ:
+    let n = jv.olen(it.st, v)
+    for i in 0..n: xs.push(jv.oval(it.st, v, i))
+  else:
+    let d = run.trunc_dump(&it, v, 15)
+    sfail(&it, "Cannot iterate over " + kname(v) + " (" + d + ")")
+  return xs
+
+fn add(var it: It, v: V) -> V:
+  let xs = iter_vals(&it, v)
+  if it.bad: return vnull()
+  if xs.len == 0: return vnull()
+  # fast paths: all numbers, all strings
+  var allnum = true
+  var allstr = true
+  for x in xs:
+    if not jv.is_num(x): allnum = false
+    if kind(x) != K_STR: allstr = false
+  if allnum:
+    var s = 0.0
+    for x in xs: s += x.n
+    if xs.len == 1: return xs[0]
+    return vnum(s)
+  if allstr and xs.len > 1:
+    let off = it.st.b.len
+    var flags = 3
+    for x in xs:
+      run.append_bytes(&it, x)
+      flags = flags & (it.st.sl[x.k >> 4] & 3)
+    let _h17 = it.st.b.len - off
+    return vstr(jv.add_span(&it.st, off, _h17, flags))
+  if kind(xs[0]) == K_ARR:
+    var allarr = true
+    for x in xs:
+      if kind(x) != K_ARR and kind(x) != K_NULL: allarr = false
+    if allarr:
+      let start = it.st.tv.len
+      for x in xs:
+        if kind(x) == K_ARR:
+          let n = jv.alen(it.st, x)
+          for i in 0..n: it.st.tv.push(jv.aget(it.st, x, i))
+      return jv.end_arr(&it.st, start)
+  var acc = vnull()
+  for x in xs:
+    acc = run.num_add(&it, acc, x)
+    if it.bad: return vnull()
+  return acc
+
+fn join(var it: It, v: V, sep: V) -> V:
+  let xs = iter_vals(&it, v)
+  if it.bad: return vnull()
+  if xs.len == 0: return mkstr(&it, "")
+  # fast path: string separator, scalar elements
+  if kind(sep) == K_STR:
+    var simple = true
+    for x in xs:
+      let k = kind(x)
+      if k == K_ARR or k == K_OBJ: simple = false
+    if simple:
+      let off = it.st.b.len
+      var first = true
+      for x in xs:
+        if not first: run.append_bytes(&it, sep)
+        first = false
+        let k = kind(x)
+        if k == K_STR: run.append_bytes(&it, x)
+        elif k == K_NUM or k == K_LIT or k == K_TRUE or k == K_FALSE:
+          let s = jv.to_json_str(&it.st, x)
+          for i in 0..s.len: it.st.b.push(s[i])
+      return jv.end_str(&it.st, off)
+  var acc = vnull()
+  for x in xs:
+    var left = mkstr(&it, "")
+    if kind(acc) != K_NULL:
+      left = run.num_add(&it, acc, sep)
+      if it.bad: return vnull()
+    let k = kind(x)
+    var piece = x
+    if k == K_TRUE or k == K_FALSE or k == K_NUM or k == K_LIT: piece = run.tostring(&it, x)
+    elif not truthy(x): piece = mkstr(&it, "")
+    acc = run.num_add(&it, left, piece)
+    if it.bad: return vnull()
+  if kind(acc) == K_NULL: return mkstr(&it, "")
+  return acc
+
+fn minmax(var it: It, vals: V, keys: V, is_min: Bool) -> V:
+  let n = jv.alen(it.st, vals)
+  if n == 0: return vnull()
+  var ret = jv.aget(it.st, vals, 0)
+  var retkey = jv.aget(it.st, keys, 0)
+  for i in 1..n:
+    let item = jv.aget(it.st, keys, i)
+    let c = jv.vcmp(it.st, item, retkey)
+    if (c < 0) == is_min:
+      retkey = item
+      ret = jv.aget(it.st, vals, i)
+  return ret
+
+fn by_impl(var it: It, id: Int, v: V, keys: V) -> V:
+  let I = it.nid
+  if kind(v) != K_ARR or kind(keys) != K_ARR or jv.alen(it.st, v) != jv.alen(it.st, keys):
+    if kind(v) == K_ARR and kind(keys) == K_ARR: return type_err2(&it, v, keys, "cannot be sorted, as they are not both arrays")
+    return type_err2(&it, v, keys, "cannot be sorted, as they are not both arrays")
+  let ks = arr_vals(it.st, keys)
+  let idx = sort_idx(it.st, ks)
+  if id == I.sort_by_impl:
+    let start = it.st.tv.len
+    for i in idx: it.st.tv.push(jv.aget(it.st, v, i))
+    return jv.end_arr(&it.st, start)
+  # group_by: runs of equal keys
+  let outer = it.st.tv.len
+  var groups: [V] = []
+  var i = 0
+  while i < idx.len:
+    var j = i + 1
+    while j < idx.len and jv.veq(it.st, ks[idx[j]], ks[idx[i]]): j += 1
+    if id == I.unique_by_impl:
+      groups.push(jv.aget(it.st, v, idx[i]))
+    else:
+      let start = it.st.tv.len
+      for q in i..j: it.st.tv.push(jv.aget(it.st, v, idx[q]))
+      groups.push(jv.end_arr(&it.st, start))
+    i = j
+  return mkarr(&it, groups)
+
+fn from_entries(var it: It, v: V) -> V:
+  let xs = iter_vals(&it, v)
+  if it.bad: return vnull()
+  let names = ["key", "Key", "name", "Name"]
+  var ids: [Int] = []
+  for nm in names: ids.push(jv.intern_str(&it.st, nm))
+  let vk = jv.intern_str(&it.st, "value")
+  let vk2 = jv.intern_str(&it.st, "Value")
+  let start = it.st.tk.len
+  for x in xs:
+    var key = vnull()
+    for kid in ids:
+      key = run.index_field(&it, x, kid)
+      if it.bad:
+        jv.obj_fail(&it.st, start)
+        return vnull()
+      if truthy(key): break
+    var val = vnull()
+    let h = has(&it, x, vstr(vk))
+    if it.bad:
+      jv.obj_fail(&it.st, start)
+      return vnull()
+    if truthy(h): val = run.index_field(&it, x, vk)
+    else: val = run.index_field(&it, x, vk2)
+    if it.bad:
+      jv.obj_fail(&it.st, start)
+      return vnull()
+    if kind(key) != K_STR:
+      jv.obj_fail(&it.st, start)
+      let d = run.trunc_dump(&it, key, 15)
+      return sfail(&it, "Cannot use " + kname(key) + " (" + d + ") as object key")
+    it.st.tk.push(jv.intern_id(&it.st, key.k >> 4))
+    it.st.tw.push(val)
+  return jv.end_obj(&it.st, start)
+
+fn flatten(var it: It, v: V, depth: Float) -> V:
+  let xs = iter_vals(&it, v)
+  if it.bad: return vnull()
+  let start = it.st.tv.len
+  flat_into(&it, xs, depth)
+  return jv.end_arr(&it.st, start)
+
+fn flat_into(var it: It, xs: [V], depth: Float):
+  for x in xs:
+    if kind(x) == K_ARR and depth != 0.0:
+      let sub = arr_vals(it.st, x)
+      flat_into(&it, sub, depth - 1.0)
+    else:
+      it.st.tv.push(x)
+
+# byte offsets of b in a (jq 1.7.1's _strindices counts bytes)
+fn strindices(var it: It, a: V, b: V) -> V:
+  if kind(a) != K_STR or kind(b) != K_STR: return sfail(&it, "_strindices requires string inputs")
+  let s = sv(it, a)
+  let t = sv(it, b)
+  let start = it.st.tv.len
+  if t.len == 0: return jv.end_arr(&it.st, start)
+  var pos = 0
+  while true:
+    let f = s.find(t, pos)
+    if f < 0: break
+    it.st.tv.push(vint(f))
+    pos = f + 1
+  return jv.end_arr(&it.st, start)
+
+fn env_obj(var it: It) -> V:
+  if kind(it.env_obj) == K_OBJ: return it.env_obj
+  let all = vjq_environ(it.ffi)
+  let start = it.st.tk.len
+  for e in all.split("\0"):
+    let eq = e.find("=")
+    if eq <= 0: continue
+    it.st.tk.push(jv.intern_str(&it.st, e[0..eq]))
+    it.st.tw.push(mkstr(&it, e[eq + 1..e.len]))
+  return jv.end_obj(&it.st, start)
+
+fn builtins_list(var it: It) -> V:
+  var seen: {Str: Bool} = {}
+  let start = it.st.tv.len
+  for e in names():
+    let nm = e[0..e.find(":")]
+    if nm.startswith("_") or nm in seen: continue
+    seen[nm] = true
+    it.st.tv.push(mkstr(&it, nm))
+  for nm in MATH1.split(" "):
+    let s = nm + "/0"
+    if s in seen: continue
+    seen[s] = true
+    it.st.tv.push(mkstr(&it, s))
+  for nm in MATH2.split(" "):
+    it.st.tv.push(mkstr(&it, nm + "/2"))
+  for i in 0..it.ast.fdefs.len:
+    if i >= it.fd_static.len or not it.fd_static[i]: continue
+    let f = it.ast.fdefs[i].name + "/{it.ast.fdefs[i].params.len}"
+    if f.startswith("_") or f in seen: continue
+    seen[f] = true
+    it.st.tv.push(mkstr(&it, f))
+  return jv.end_arr(&it.st, start)
+
+# ---------------------------------------------------------------- dates
+
+fn tm_fields(var it: It, v: V) -> [Float]:
+  var f: [Float] = []
+  if kind(v) != K_ARR: return f
+  let n = jv.alen(it.st, v)
+  if n < 8: return f
+  for i in 0..8:
+    let x = jv.aget(it.st, v, i)
+    if not jv.is_num(x): return []
+    f.push(x.n)
+  return f
+
+fn mktime(var it: It, v: V) -> V:
+  if kind(v) != K_ARR: return sfail(&it, "mktime requires array inputs")
+  if jv.alen(it.st, v) < 6: return sfail(&it, "mktime requires parsed datetime inputs")
+  let f = tm_fields(&it, v)
+  if f.len < 8: return sfail(&it, "mktime requires parsed datetime inputs")
+  let t = vjq_timegm(it.ffi, f)
+  if t == -1.0: return sfail(&it, "invalid gmtime representation")
+  return vnum(t)
+
+fn brokendown(var it: It, t: Float, local: Bool) -> V:
+  var out = [0.0] * 8
+  if not vjq_brokendown(it.ffi, t, local, &out): return sfail(&it, "error converting number of seconds since epoch to datetime")
+  var xs: [V] = []
+  for x in out: xs.push(vnum(x))
+  return mkarr(&it, xs)
+
+fn strftime(var it: It, v: V, fmt: V, local: Bool) -> V:
+  var t = v
+  let nm = if_str(local, "strflocaltime/1", "strftime/1")
+  if jv.is_num(v):
+    t = brokendown(&it, v.n, local)
+    if it.bad: return vnull()
+  elif kind(v) != K_ARR:
+    return sfail(&it, nm + " requires parsed datetime inputs")
+  if kind(fmt) != K_STR: return sfail(&it, nm + " requires a string format")
+  let f = tm_fields(&it, t)
+  if f.len < 8: return sfail(&it, nm + " requires parsed datetime inputs")
+  let s = vjq_strftime(it.ffi, sv(it, fmt), f)
+  if s.len == 0: return sfail(&it, nm + ": unknown system failure")
+  return mkstr(&it, s)
+
+fn if_str(c: Bool, a: Str, b: Str) -> Str:
+  if c: return a
+  return b
+
+fn strptime(var it: It, v: V, fmt: V) -> V:
+  if kind(v) != K_STR or kind(fmt) != K_STR: return sfail(&it, "strptime/1 requires string inputs and arguments")
+  let s = sv(it, v)
+  let f = sv(it, fmt)
+  var out = [0.0] * 8
+  let used = vjq_strptime(it.ffi, s, f, &out)
+  if used < 0 or (used < s.len and not is_space(s[used])):
+    return sfail(&it, "date \"" + s + "\" does not match format \"" + f + "\"")
+  var xs: [V] = []
+  for x in out: xs.push(vnum(x))
+  if used < s.len: xs.push(mkstr(&it, s[used..s.len]))
+  return mkarr(&it, xs)
+
+fn is_space(c: Byte) -> Bool:
+  return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12
+
+# ---------------------------------------------------------------- JSON text
+
+# Parses a string value as JSON (fromjson; tonumber when num). Errors are jq's.
+fn parse_text(var it: It, v: V, num: Bool) -> V:
+  let id = v.k >> 4
+  let off = it.st.so[id]
+  let n = it.st.sl[id] >> 2
+  let spp = it.st.pp
+  let spend = it.st.pend
+  let sline = it.st.pline
+  let sls = it.st.plinestart
+  let sdepth = it.st.depth
+  it.st.pp = off
+  it.st.pend = off + n
+  it.st.perr = ""
+  it.st.pline = 1
+  it.st.plinestart = off
+  it.st.depth = 0
+  var r = vnull()
+  if n >= 3 and it.st.b[off] == 0xEF and it.st.b[off + 1] == 0xBB and it.st.b[off + 2] == 0xBF: it.st.pp += 3
+  jv.skip_ws(&it.st)
+  if it.st.pp >= it.st.pend:
+    r = vnull()
+    if num: it.st.perr = "Expected JSON value"
+  else:
+    r = jv.parse_value(&it.st)
+    if it.st.perr == "":
+      jv.skip_ws(&it.st)
+      if it.st.pp < it.st.pend: it.st.perr = "Unexpected extra JSON values"
+  var msg = it.st.perr + ""
+  let col = it.st.pp - it.st.plinestart
+  let line = it.st.pline
+  it.st.pp = spp
+  it.st.pend = spend
+  it.st.pline = sline
+  it.st.plinestart = sls
+  it.st.depth = sdepth
+  it.st.perr = ""
+  if msg != "":
+    let text = sv(it, v)
+    if msg == "Unexpected extra JSON values" or msg == "Expected JSON value":
+      return sfail(&it, msg + " (while parsing '" + text + "')")
+    var at = ""
+    if msg.startswith("Unfinished") or (it.st.pp >= 0 and col >= 0 and false): at = ""
+    return sfail(&it, msg + " at line {line}, column {col} (while parsing '" + text + "')")
+  return r
+
+# ---------------------------------------------------------------- formats
+
+fn format(var it: It, name_id: Int, v: V) -> V:
+  let nm = it.ast.names[name_id] + ""
+  return format_name(&it, nm, v)
+
+const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+fn format_name(var it: It, nm: Str, v: V) -> V:
+  if nm == "text": return run.tostring(&it, v)
+  if nm == "json":
+    let s = jv.to_json_str(&it.st, v)
+    return mkstr(&it, s)
+  if nm == "csv" or nm == "tsv":
+    let csv = nm == "csv"
+    if kind(v) != K_ARR:
+      if csv: return type_err(&it, v, "cannot be csv-formatted, only array")
+      return type_err(&it, v, "cannot be tsv-formatted, only array")
+    var out: [Byte] = []
+    let n = jv.alen(it.st, v)
+    for i in 0..n:
+      if i > 0:
+        if csv: out.push(',')
+        else: out.push('\t')
+      let x = jv.aget(it.st, v, i)
+      let k = kind(x)
+      if k == K_NULL:
+        continue
+      elif k == K_TRUE or k == K_FALSE or ((k == K_NUM or k == K_LIT) and x.n == x.n):
+        let s = jv.to_json_str(&it.st, x)
+        for c in bytes(s): out.push(c)
+      elif k == K_NUM or k == K_LIT:
+        continue
+      elif k == K_STR:
+        let s = sv(it, x)
+        if csv:
+          out.push('"')
+          for c in bytes(s):
+            if c == '"': out.push('"')
+            out.push(c)
+          out.push('"')
+        else:
+          for c in bytes(s):
+            if c == '\t':
+              out.push('\\')
+              out.push('t')
+            elif c == '\r':
+              out.push('\\')
+              out.push('r')
+            elif c == '\n':
+              out.push('\\')
+              out.push('n')
+            elif c == '\\':
+              out.push('\\')
+              out.push('\\')
+            else:
+              out.push(c)
+      else:
+        return type_err(&it, x, "is not valid in a csv row")
+    return bytes_str(&it, out)
+  if nm == "html":
+    let t = run.tostring(&it, v)
+    var out: [Byte] = []
+    for c in bytes(sv(it, t)):
+      if c == '&': push_all(&out, "&amp;")
+      elif c == '<': push_all(&out, "&lt;")
+      elif c == '>': push_all(&out, "&gt;")
+      elif c == '\'': push_all(&out, "&apos;")
+      elif c == '"': push_all(&out, "&quot;")
+      else: out.push(c)
+    return bytes_str(&it, out)
+  if nm == "uri":
+    let t = run.tostring(&it, v)
+    var out: [Byte] = []
+    let hex = "0123456789ABCDEF"
+    for c in bytes(sv(it, t)):
+      if (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.' or c == '~':
+        out.push(c)
+      else:
+        out.push('%')
+        out.push(hex[int(c) >> 4])
+        out.push(hex[int(c) & 15])
+    return bytes_str(&it, out)
+  if nm == "sh":
+    var xs: [V] = []
+    if kind(v) == K_ARR: xs = arr_vals(it.st, v)
+    else: xs.push(v)
+    var out: [Byte] = []
+    for i in 0..xs.len:
+      if i > 0: out.push(' ')
+      let x = xs[i]
+      let k = kind(x)
+      if k == K_STR:
+        out.push('\'')
+        for c in bytes(sv(it, x)):
+          if c == '\'':
+            for d in bytes("'\\''"): out.push(d)
+          else:
+            out.push(c)
+        out.push('\'')
+      elif k == K_ARR or k == K_OBJ:
+        return type_err(&it, x, "can not be escaped for shell")
+      else:
+        let s = jv.to_json_str(&it.st, x)
+        for c in bytes(s): out.push(c)
+    return bytes_str(&it, out)
+  if nm == "base64":
+    let t = run.tostring(&it, v)
+    let s = bytes(sv(it, t))
+    var out: [Byte] = []
+    var i = 0
+    while i < s.len:
+      var n = s.len - i
+      if n > 3: n = 3
+      var code = 0
+      for j in 0..3:
+        code = code << 8
+        if j < n: code = code | int(s[i + j])
+      for j in 0..4: out.push(B64[(code >> (18 - j * 6)) & 63])
+      if n < 3: out[out.len - 1] = '='
+      if n < 2: out[out.len - 2] = '='
+      i += 3
+    return bytes_str(&it, out)
+  if nm == "base64d":
+    let t = run.tostring(&it, v)
+    let s = bytes(sv(it, t))
+    var out: [Byte] = []
+    var code = 0
+    var nread = 0
+    var i = 0
+    while i < s.len and s[i] != '=':
+      let d = b64val(s[i])
+      if d < 0: return type_err(&it, t, "is not valid base64 data")
+      code = (code << 6) | d
+      nread += 1
+      if nread == 4:
+        out.push(byte((code >> 16) & 255))
+        out.push(byte((code >> 8) & 255))
+        out.push(byte(code & 255))
+        nread = 0
+        code = 0
+      i += 1
+    if nread == 3:
+      out.push(byte((code >> 10) & 255))
+      out.push(byte((code >> 2) & 255))
+    elif nread == 2:
+      out.push(byte((code >> 4) & 255))
+    elif nread == 1:
+      return type_err(&it, t, "trailing base64 byte found")
+    return mkstr(&it, out.take_str())
+  if nm == "base32":
+    let t = run.tostring(&it, v)
+    let s = bytes(sv(it, t))
+    var out: [Byte] = []
+    var i = 0
+    while i < s.len:
+      var n = s.len - i
+      if n > 5: n = 5
+      var code = 0
+      for j in 0..5:
+        code = code << 8
+        if j < n: code = code | int(s[i + j])
+      for j in 0..8: out.push(B32[(code >> (35 - j * 5)) & 31])
+      var pad = 0
+      if n == 1: pad = 6
+      elif n == 2: pad = 4
+      elif n == 3: pad = 3
+      elif n == 4: pad = 1
+      for j in 0..pad: out[out.len - 1 - j] = '='
+      i += 5
+    return bytes_str(&it, out)
+  if nm == "base32d":
+    let t = run.tostring(&it, v)
+    let s = bytes(sv(it, t))
+    var out: [Byte] = []
+    var acc = 0
+    var bits = 0
+    for c in s:
+      if c == '=': break
+      var d = -1
+      if c >= 'A' and c <= 'Z': d = int(c) - 65
+      elif c >= '2' and c <= '7': d = int(c) - 24
+      if d < 0: continue
+      acc = ((acc << 5) | d) & 0xFFFF
+      bits += 5
+      if bits >= 8:
+        bits -= 8
+        out.push(byte((acc >> bits) & 255))
+    return mkstr(&it, out.take_str())
+  return sfail(&it, nm + " is not a valid format")
+
+fn b64val(c: Byte) -> Int:
+  if c >= 'A' and c <= 'Z': return int(c) - 65
+  if c >= 'a' and c <= 'z': return int(c) - 71
+  if c >= '0' and c <= '9': return int(c) + 4
+  if c == '+': return 62
+  if c == '/': return 63
+  return -1
+
+fn bytes_str(var it: It, out: [Byte]) -> V:
+  let off = it.st.b.len
+  for c in out: it.st.b.push(c)
+  return jv.end_str(&it.st, off)
+
+# ---------------------------------------------------------------- regular expressions
+
+fn regex(var it: It, pat: Str, opts: Int) -> Int:
+  for i in 0..it.regex_cache.len:
+    if it.regex_cache[i].opts == opts and it.regex_cache[i].pat == pat: return i
+  match vjq_re_compile(it.ffi, pat, opts):
+    ok(re):
+      if it.regex_cache.len >= 64:
+        it.regex_cache = []
+      it.regex_cache.push(ReEntry(pat, opts, re))
+      return it.regex_cache.len - 1
+    err(e):
+      sfail(&it, pat + " (at offset 0) is not a valid regex: " + e)
+      return -1
+
+fn match_impl(var it: It, v: V, re: V, mods: V, testmode: V) -> V:
+  let test = kind(testmode) == K_TRUE
+  if kind(v) != K_STR:
+    let _h18 = "cannot be matched, as it is not a string"
+    return type_err(&it, v, _h18)
+  if kind(re) != K_STR: return type_err(&it, re, "is not a string")
+  var opts = 256   # ONIG_OPTION_CAPTURE_GROUP
+  var global = false
+  if kind(mods) == K_STR:
+    for c in bytes(sv(it, mods)):
+      if c == 'g': global = true
+      elif c == 'i': opts = opts | 1
+      elif c == 'x': opts = opts | 2
+      elif c == 'm': opts = opts | 4
+      elif c == 's': opts = opts | 8
+      elif c == 'p': opts = opts | 12
+      elif c == 'l': opts = opts | 16
+      elif c == 'n': opts = opts | 32
+      else:
+        let _h19 = sv(it, mods) + " is not a valid modifier string"
+        return sfail(&it, _h19)
+  elif kind(mods) != K_NULL:
+    return type_err(&it, mods, "is not a string")
+  let pat = sv(it, re)
+  let ri = regex_entry(&it, pat, opts)
+  if ri < 0: return vnull()
+  let s = sv(it, v)
+  let ncap = vjq_re_ncap(it.ffi, it.regex_cache[ri].re)
+  var groups = [0] * (2 * ncap + 2)
+  # group names, by group number
+  var gname: [Str] = []
+  for i in 0..ncap + 1: gname.push("")
+  let nm = vjq_re_names(it.ffi, it.regex_cache[ri].re)
+  if nm.len > 0:
+    for e in nm.split("\0"):
+      let eq = e.find("=")
+      if eq <= 0: continue
+      let g = int(e[0..eq]) else 0
+      if g > 0 and g <= ncap: gname[g] = e[eq + 1..e.len]
+  let ok_ = jv.intern_str(&it.st, "offset")
+  let lk = jv.intern_str(&it.st, "length")
+  let sk = jv.intern_str(&it.st, "string")
+  let ck = jv.intern_str(&it.st, "captures")
+  let nk = jv.intern_str(&it.st, "name")
+  var results: [V] = []
+  var start = 0
+  while true:
+    let rc = vjq_re_search(it.ffi, it.regex_cache[ri].re, s, start, &groups)
+    if rc < 0: return sfail(&it, "Regex failure")
+    if rc == 0: break
+    if test: return vbool(true)
+    let b0 = groups[0]
+    let e0 = groups[1]
+    if e0 == b0:
+      let idx = cps(s, 0, b0)
+      var caps: [V] = []
+      for i in 1..ncap + 1:
+        let s0 = it.st.tk.len
+        it.st.tk.push(ok_)
+        it.st.tw.push(vint(idx))
+        it.st.tk.push(sk)
+        it.st.tw.push(mkstr(&it, ""))
+        it.st.tk.push(lk)
+        it.st.tw.push(vint(0))
+        it.st.tk.push(nk)
+        it.st.tw.push(name_val(&it, gname[i]))
+        caps.push(jv.end_obj(&it.st, s0))
+      let s0 = it.st.tk.len
+      it.st.tk.push(ok_)
+      it.st.tw.push(vint(idx))
+      it.st.tk.push(lk)
+      it.st.tw.push(vint(0))
+      it.st.tk.push(sk)
+      it.st.tw.push(mkstr(&it, ""))
+      it.st.tk.push(ck)
+      it.st.tw.push(mkarr(&it, caps))
+      results.push(jv.end_obj(&it.st, s0))
+      start = e0 + 1
+    else:
+      let idx = cps(s, 0, b0)
+      let len = cps(s, b0, e0)
+      var caps: [V] = []
+      for i in 1..ncap + 1:
+        let bi = groups[2 * i]
+        let ei = groups[2 * i + 1]
+        let s0 = it.st.tk.len
+        if bi == ei:
+          if bi == -1:
+            it.st.tk.push(ok_)
+            it.st.tw.push(vint(-1))
+            it.st.tk.push(sk)
+            it.st.tw.push(vnull())
+          else:
+            it.st.tk.push(ok_)
+            it.st.tw.push(vint(cps(s, 0, bi)))
+            it.st.tk.push(sk)
+            it.st.tw.push(mkstr(&it, ""))
+          it.st.tk.push(lk)
+          it.st.tw.push(vint(0))
+          it.st.tk.push(nk)
+          it.st.tw.push(name_val(&it, gname[i]))
+        else:
+          it.st.tk.push(ok_)
+          it.st.tw.push(vint(cps(s, 0, bi)))
+          it.st.tk.push(lk)
+          it.st.tw.push(vint(cps(s, bi, ei)))
+          it.st.tk.push(sk)
+          it.st.tw.push(sub_bytes(&it, v, bi, ei))
+          it.st.tk.push(nk)
+          it.st.tw.push(name_val(&it, gname[i]))
+        caps.push(jv.end_obj(&it.st, s0))
+      let s0 = it.st.tk.len
+      it.st.tk.push(ok_)
+      it.st.tw.push(vint(idx))
+      it.st.tk.push(lk)
+      it.st.tw.push(vint(len))
+      it.st.tk.push(sk)
+      it.st.tw.push(sub_bytes(&it, v, b0, e0))
+      it.st.tk.push(ck)
+      it.st.tw.push(mkarr(&it, caps))
+      results.push(jv.end_obj(&it.st, s0))
+      start = e0
+    if not global or start > s.len: break
+  if test: return vbool(false)
+  return mkarr(&it, results)
+
+fn regex_entry(var it: It, pat: Str, opts: Int) -> Int:
+  for i in 0..it.regex_cache.len:
+    if it.regex_cache[i].opts == opts and it.regex_cache[i].pat == pat: return i
+  match vjq_re_compile(it.ffi, pat, opts):
+    ok(re):
+      if it.regex_cache.len >= 64: it.regex_cache = []
+      it.regex_cache.push(ReEntry(pat, opts, re))
+      return it.regex_cache.len - 1
+    err(e):
+      sfail(&it, pat + " (at offset 0) is not a valid regex: " + e)
+      return -1
+
+fn name_val(var it: It, nm: Str) -> V:
+  if nm == "": return vnull()
+  return mkstr(&it, nm)
+
+# code points in s[a..b]
+fn cps(s: Str, a: Int, b: Int) -> Int:
+  var c = 0
+  var i = a
+  while i < b:
+    let x = int(s[i])
+    if x < 0x80: i += 1
+    elif x < 0xE0: i += 2
+    elif x < 0xF0: i += 3
+    else: i += 4
+    c += 1
+  return c
+
+# ---------------------------------------------------------------- generator natives
+
+fn gen(var it: It, id: Int, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let I = it.nid
+  let nd = it.ast.ns[n]
+  if id == I.empty: return ST_OK
+  if id == I.select:
+    let fnode = it.ast.kids[nd.b]
+    if it.simple[fnode]:
+      let c = run.sev(&it, fnode, v, env)
+      if it.bad: return run.bad_status(&it)
+      if truthy(c): return run.emit(&it, k, v, p)
+      return ST_OK
+    let k2 = run.kpush(&it, run.K_SELECT, n, env, k)
+    it.ks[k2].v = v
+    it.ks[k2].p = p
+    let s = run.ev(&it, fnode, v, -1, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if id == I.path:
+    let k2 = run.kpush(&it, run.K_PATH, n, env, k)
+    it.ks[k2].v = v
+    it.ks[k2].p = p
+    let _h20 = it.ast.kids[nd.b]
+    let s = run.ev(&it, _h20, v, 0, env, k2)
+    it.ks.truncate(k2)
+    return s
+  if id == I.getpath:
+    let path = garg(it, 1, 0)
+    if kind(path) != K_ARR: return run.rfail(&it, "Path must be specified as an array")
+    if p == -2:
+      let d = run.trunc_dump(&it, v, 30)
+      return run.rfail(&it, "Invalid path expression with result " + d)
+    let r = run.getpath(&it, v, path)
+    if it.bad:
+      it.bad = false
+      if p < 0: return ST_ERR
+      return ST_ERR
+    if p >= 0:
+      var q = p
+      let m = jv.alen(it.st, path)
+      for i in 0..m:
+        let _h21 = jv.aget(it.st, path, i)
+        q = run.pnew(&it, q, _h21)
+      return run.emit(&it, k, r, q)
+    return run.emit(&it, k, r, -1)
+  if id == I.recurse0: return recurse_all(&it, v, p, k)
+  if id == I.recurse1:
+    let _h22 = it.ast.kids[nd.b]
+    return recurse_f(&it, n, _h22, v, p, env, k)
+  if id == I.range1 or id == I.range2 or id == I.range3:
+    var from = vint(0)
+    var upto = vnull()
+    var step = vint(1)
+    if id == I.range1:
+      upto = garg(it, 1, 0)
+    elif id == I.range2:
+      from = garg(it, 2, 0)
+      upto = garg(it, 2, 1)
+    else:
+      from = garg(it, 3, 0)
+      upto = garg(it, 3, 1)
+      step = garg(it, 3, 2)
+    if id != I.range3 and (not jv.is_num(from) or not jv.is_num(upto)): return run.rfail(&it, "Range bounds must be numeric")
+    if id == I.range3:
+      # def range($init; $upto; $by): while(. < $upto; . + $by), in jq's own arithmetic
+      return range3(&it, from, upto, step, k)
+    var x = from.n
+    let e = upto.n
+    while x < e:
+      let s = run.emit(&it, k, vnum(x), -1)
+      if s != ST_OK: return s
+      x += 1.0
+    return ST_OK
+  if id == I.limit:
+    let lim = garg(it, 1, 0)
+    let f = it.ast.kids[nd.b + 1]
+    let c = jv.vcmp(it.st, lim, vint(0))
+    if c < 0: return run.ev(&it, f, v, p, env, k)
+    if c == 0: return ST_OK
+    it.lab += 1
+    let lid = it.lab
+    let k2 = run.kpush(&it, run.K_LIMIT, n, env, k)
+    it.ks[k2].w = lim
+    it.ks[k2].i = lid
+    let s = run.ev(&it, f, v, p, env, k2)
+    it.ks.truncate(k2)
+    if s == ST_BREAK and it.brk == lid: return ST_OK
+    return s
+  if id == I.first:
+    it.lab += 1
+    let lid = it.lab
+    let k2 = run.kpush(&it, run.K_LIMIT, n, env, k)
+    it.ks[k2].w = vint(1)
+    it.ks[k2].i = lid
+    let _h23 = it.ast.kids[nd.b]
+    let s = run.ev(&it, _h23, v, p, env, k2)
+    it.ks.truncate(k2)
+    if s == ST_BREAK and it.brk == lid: return ST_OK
+    return s
+  if id == I.last:
+    let k2 = run.kpush(&it, run.K_LAST, n, env, k)
+    it.ks[k2].w = vnull()
+    it.ks[k2].p = -3
+    let _h24 = it.ast.kids[nd.b]
+    let s = run.ev(&it, _h24, v, p, env, k2)
+    let last = it.ks[k2].w
+    let lp = it.ks[k2].p
+    it.ks.truncate(k2)
+    if s != ST_OK: return s
+    if lp == -3:
+      if p == -1: return run.emit(&it, k, vnull(), -1)
+      return run.emit(&it, k, vnull(), -2)
+    return run.emit(&it, k, last, lp)
+  if id == I.isempty:
+    it.lab += 1
+    let lid = it.lab
+    let k2 = run.kpush(&it, run.K_ISEMPTY, n, env, k)
+    it.ks[k2].i = lid
+    let _h25 = it.ast.kids[nd.b]
+    let s = run.ev(&it, _h25, v, -1, env, k2)
+    it.ks.truncate(k2)
+    if s == ST_BREAK and it.brk == lid: return run.emit(&it, k, vbool(false), run.vp(p, vbool(false), v))
+    if s != ST_OK: return s
+    return run.emit(&it, k, vbool(true), run.vp(p, vbool(true), v))
+  if id == I.any2 or id == I.all2 or id == I.any1 or id == I.all1:
+    let is_any = id == I.any2 or id == I.any1
+    it.lab += 1
+    let lid = it.lab
+    let k2 = run.kpush(&it, run.K_ANYGEN, n, env, k)
+    it.ks[k2].i = lid
+    if is_any: it.ks[k2].j = 1
+    var s = ST_OK
+    if id == I.any1 or id == I.all1:
+      it.ks[k2].t = run.K_ANYCOND
+      it.ks[k2].n = it.ast.kids[nd.b]
+      s = run.do_iter(&it, v, -1, false, k2)
+    else:
+      it.ks[k2].n = it.ast.kids[nd.b + 1]
+      let _h26 = it.ast.kids[nd.b]
+      s = run.ev(&it, _h26, v, -1, env, k2)
+    it.ks.truncate(k2)
+    var r = not is_any
+    if s == ST_BREAK and it.brk == lid:
+      r = is_any
+    elif s != ST_OK:
+      return s
+    return run.emit(&it, k, vbool(r), run.vp(p, vbool(r), v))
+  if id == I.map:
+    if kind(v) != K_ARR and kind(v) != K_OBJ:
+      let d = run.trunc_dump(&it, v, 15)
+      return run.rfail(&it, "Cannot iterate over " + kname(v) + " (" + d + ")")
+    let f = it.ast.kids[nd.b]
+    let start = it.st.tv.len
+    let k2 = run.kpush(&it, run.K_COLLECT, -1, env, -1)
+    var s = ST_OK
+    let xs = iter_vals(&it, v)
+    if it.simple[f]:
+      for x in xs:
+        let r = run.sev(&it, f, x, env)
+        if it.bad:
+          s = run.bad_status(&it)
+          break
+        it.st.tv.push(r)
+    else:
+      for x in xs:
+        s = run.ev(&it, f, x, -1, env, k2)
+        if s != ST_OK: break
+    it.ks.truncate(k2)
+    if s != ST_OK:
+      it.st.tv.truncate(start)
+      return s
+    let arr = jv.end_arr(&it.st, start)
+    return run.emit(&it, k, arr, run.vp(p, arr, v))
+  if id == I.sort_by or id == I.group_by or id == I.unique_by or id == I.min_by or id == I.max_by:
+    return by_native(&it, id, n, v, p, env, k)
+  if id == I.input:
+    let r = read_input(&it)
+    if it.bad: return run.bad_status(&it)
+    return run.emit(&it, k, r, run.vp(p, r, v))
+  if id == I.inputs:
+    while true:
+      let r = read_input(&it)
+      if it.bad:
+        it.bad = false
+        if kind(it.err) == K_STR and sv(it, it.err) == "No more inputs": return ST_OK
+        return ST_ERR
+      let s = run.emit(&it, k, r, run.vp(p, r, v))
+      if s != ST_OK: return s
+    return ST_OK
+  if id == I.halt:
+    it.halted = true
+    it.exit_code = 0
+    return ST_HALT
+  if id == I.halt_error:
+    let code = garg(it, 1, 0)
+    if not jv.is_num(code):
+      let _h27 = kname(v) + " (" + run.trunc_dump(&it, v, 15) + ") halt_error/1: number required"
+      return run.rfail(&it, _h27)
+    run.flush_out(&it)
+    if kind(v) == K_STR:
+      vjq_ewrite(it.ffi, sv(it, v))
+    else:
+      let s = jv.to_json_str(&it.st, v)
+      eprint(s)
+    it.halted = true
+    it.exit_code = int(code.n)
+    return ST_HALT
+  if id == I.until or id == I.while_ or id == I.repeat:
+    return loop_native(&it, id, n, v, p, env, k)
+  return run.rfail(&it, "internal: generator " + native_name(id))
+
+
+fn range3(var it: It, from: V, upto: V, step: V, k: Int) -> Int:
+  # if $by > 0 then $init|while(. < $upto; . + $by) elif $by < 0 then ...(. > $upto) else empty end
+  let c = jv.vcmp(it.st, step, vint(0))
+  if c == 0: return ST_OK
+  var x = from
+  while true:
+    let lt = jv.vcmp(it.st, x, upto)
+    if c > 0 and lt >= 0: break
+    if c < 0 and lt <= 0: break
+    let s = run.emit(&it, k, x, -1)
+    if s != ST_OK: return s
+    x = run.num_add(&it, x, step)
+    if it.bad: return run.bad_status(&it)
+  return ST_OK
+
+# recurse: ., (.[]? | recurse)
+fn recurse_all(var it: It, v: V, p: Int, k: Int) -> Int:
+  let s = run.emit(&it, k, v, p)
+  if s != ST_OK: return s
+  let kd = kind(v)
+  if kd == K_ARR:
+    let n = jv.alen(it.st, v)
+    for i in 0..n:
+      var q = -1
+      if p >= 0: q = run.pnew(&it, p, vint(i))
+      elif p == -2: q = -2
+      let _h28 = jv.aget(it.st, v, i)
+      let s2 = recurse_all(&it, _h28, q, k)
+      if s2 != ST_OK: return s2
+  elif kd == K_OBJ:
+    let n = jv.olen(it.st, v)
+    for i in 0..n:
+      var q = -1
+      if p >= 0:
+        let _h29 = vstr(jv.okey(it.st, v, i))
+        q = run.pnew(&it, p, _h29)
+      elif p == -2: q = -2
+      let _h30 = jv.oval(it.st, v, i)
+      let s2 = recurse_all(&it, _h30, q, k)
+      if s2 != ST_OK: return s2
+  return ST_OK
+
+fn recurse_f(var it: It, n: Int, f: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let s = run.emit(&it, k, v, p)
+  if s != ST_OK: return s
+  let k2 = run.kpush(&it, run.K_RECURSE, n, env, k)
+  it.ks[k2].i = f
+  let s2 = run.ev(&it, f, v, p, env, k2)
+  it.ks.truncate(k2)
+  return s2
+
+fn loop_native(var it: It, id: Int, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let I = it.nid
+  let nd = it.ast.ns[n]
+  let a = it.ast.kids[nd.b]
+  var x = v
+  if id == I.repeat:
+    # def repeat(f): def _repeat: f | (., _repeat); _repeat  (1.7.1: ., then f | _repeat? see below)
+    return repeat_f(&it, n, a, v, env, k)
+  let b = it.ast.kids[nd.b + 1]
+  if not it.simple[a] or not it.simple[b]:
+    return loop_general(&it, id, n, a, b, v, env, k)
+  while true:
+    let c = run.sev(&it, a, x, env)
+    if it.bad: return run.bad_status(&it)
+    if id == I.until:
+      if truthy(c): return run.emit(&it, k, x, -1)
+    else:
+      if not truthy(c): return ST_OK
+      let s = run.emit(&it, k, x, -1)
+      if s != ST_OK: return s
+    x = run.sev(&it, b, x, env)
+    if it.bad: return run.bad_status(&it)
+  return ST_OK
+
+# until/while with generators: the jq definitions, recursively
+fn loop_general(var it: It, id: Int, n: Int, a: Int, b: Int, v: V, env: Int, k: Int) -> Int:
+  let k2 = run.kpush(&it, run.K_LOOPC, n, env, k)
+  it.ks[k2].i = id
+  it.ks[k2].j = 0
+  it.ks[k2].v = v
+  let s = run.ev(&it, a, v, -1, env, k2)
+  it.ks.truncate(k2)
+  return s
+
+fn repeat_f(var it: It, n: Int, f: Int, v: V, env: Int, k: Int) -> Int:
+  # jq 1.7.1: def repeat(exp): def _repeat: exp, _repeat; _repeat  (exp, again and again, on the same input)
+  while true:
+    let s = run.ev(&it, f, v, -1, env, k)
+    if s != ST_OK: return s
+  return ST_OK
+
+# sort_by(f) and friends: [f] for each element, then the _impl.
+fn by_native(var it: It, id: Int, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  let I = it.nid
+  let nd = it.ast.ns[n]
+  let f = it.ast.kids[nd.b]
+  if kind(v) != K_ARR and kind(v) != K_OBJ:
+    let d = run.trunc_dump(&it, v, 15)
+    return run.rfail(&it, "Cannot iterate over " + kname(v) + " (" + d + ")")
+  let xs = iter_vals(&it, v)
+  var keys: [V] = []
+  let k2 = run.kpush(&it, run.K_COLLECT, -1, env, -1)
+  for x in xs:
+    let start = it.st.tv.len
+    var s = ST_OK
+    if it.simple[f]:
+      let r = run.sev(&it, f, x, env)
+      if it.bad: s = run.bad_status(&it)
+      else: it.st.tv.push(r)
+    else:
+      s = run.ev(&it, f, x, -1, env, k2)
+    if s != ST_OK:
+      it.st.tv.truncate(start)
+      it.ks.truncate(k2)
+      return s
+    keys.push(jv.end_arr(&it.st, start))
+  it.ks.truncate(k2)
+  let vals = mkarr(&it, xs)
+  let ka = mkarr(&it, keys)
+  var r = vnull()
+  if id == I.sort_by: r = by_impl(&it, I.sort_by_impl, vals, ka)
+  elif id == I.group_by: r = by_impl(&it, I.group_by_impl, vals, ka)
+  elif id == I.unique_by: r = by_impl(&it, I.unique_by_impl, vals, ka)
+  elif id == I.min_by: r = minmax(&it, vals, ka, true)
+  else: r = minmax(&it, vals, ka, false)
+  if it.bad: return run.bad_status(&it)
+  return run.emit(&it, k, r, run.vp(p, r, v))
+
+# Continuations for the natives above.
+fn kont(var it: It, k: Int, kf: Kf, v: V, p: Int) -> Int:
+  let t = kf.t
+  if t == run.K_LIMIT:
+    let c = it.ks[k].j + 1
+    it.ks[k].j = c
+    let s = run.emit(&it, kf.nx, v, p)
+    if s != ST_OK: return s
+    if jv.vcmp(it.st, vint(c), kf.w) >= 0:
+      it.brk = kf.i
+      return ST_BREAK
+    return ST_OK
+  if t == run.K_LAST:
+    it.ks[k].w = v
+    it.ks[k].p = p
+    return ST_OK
+  if t == run.K_ISEMPTY:
+    it.brk = kf.i
+    return ST_BREAK
+  if t == run.K_ANYGEN:
+    let k2 = run.kpush(&it, run.K_ANYCOND, -1, kf.env, k)
+    it.ks[k2].i = kf.i
+    it.ks[k2].j = kf.j
+    let s = run.ev(&it, kf.n, v, -1, kf.env, k2)
+    it.ks.truncate(k2)
+    return s
+  if t == run.K_ANYCOND:
+    if kf.n >= 0 and kf.nx >= 0 and it.ks[kf.nx].t != run.K_ANYGEN:
+      # any(f)/all(f): v is an element; run the condition on it
+      let k2 = run.kpush(&it, run.K_ANYCOND, -1, kf.env, k)
+      it.ks[k2].i = kf.i
+      it.ks[k2].j = kf.j
+      let s = run.ev(&it, kf.n, v, -1, kf.env, k2)
+      it.ks.truncate(k2)
+      return s
+    if kf.j == 1 and truthy(v):
+      it.brk = kf.i
+      return ST_BREAK
+    if kf.j == 0 and not truthy(v):
+      it.brk = kf.i
+      return ST_BREAK
+    return ST_OK
+  if t == run.K_RECURSE:
+    return recurse_f(&it, kf.n, kf.i, v, p, kf.env, kf.nx)
+  if t == run.K_FIRST:
+    it.ks[k].w = v
+    it.ks[k].j = 1
+    it.brk = kf.i
+    return ST_BREAK
+  if t == run.K_UPDRHS:
+    return run.update_run(&it, kf.n, kf.v, kf.p, kf.env, kf.nx, v)
+  if t == run.K_UPDPATH:
+    return run.update_path(&it, k, kf, v, p)
+  if t == run.K_LOOPC:
+    # until/while condition output
+    let I = it.nid
+    let nd = it.ast.ns[kf.n]
+    let b = it.ast.kids[nd.b + 1]
+    if kf.i == I.until:
+      if truthy(v): return run.emit(&it, kf.nx, kf.v, -1)
+      let k2 = run.kpush(&it, run.K_LOOPN, kf.n, kf.env, kf.nx)
+      it.ks[k2].i = -1
+      it.ks[k2].j = kf.i
+      let s = run.ev(&it, b, kf.v, -1, kf.env, k2)
+      it.ks.truncate(k2)
+      return s
+    if not truthy(v): return ST_OK
+    let s0 = run.emit(&it, kf.nx, kf.v, -1)
+    if s0 != ST_OK: return s0
+    let k2 = run.kpush(&it, run.K_LOOPN, kf.n, kf.env, kf.nx)
+    it.ks[k2].i = -1
+    it.ks[k2].j = kf.i
+    let s = run.ev(&it, b, kf.v, -1, kf.env, k2)
+    it.ks.truncate(k2)
+    return s
+  if t == run.K_LOOPN:
+    # until/while: the next state
+    let nd = it.ast.ns[kf.n]
+    let a = it.ast.kids[nd.b]
+    let b = it.ast.kids[nd.b + 1]
+    return loop_general(&it, kf.j, kf.n, a, b, v, kf.env, kf.nx)
+  return run.rfail(&it, "internal: continuation {t}")
+
+# ---------------------------------------------------------------- inputs
+
+# The next input value (for input/inputs and the main loop). Sets it.bad with "No more inputs"
+# at the end; a parse error is reported and ends the inputs.
+fn read_input(var it: It) -> V:
+  if it.collect: return sfail(&it, "break")
+  if it.ierr != "":
+    return sfail(&it, "No more inputs")
+  if it.raw_input:
+    if it.ipos >= it.iend: return sfail(&it, "No more inputs")
+    var e = it.ipos
+    while e < it.iend and it.st.b[e] != '\n': e += 1
+    let off = it.ipos
+    var len = e - off
+    it.ipos = e + 1
+    if e >= it.iend: it.ipos = it.iend
+    it.iline += 1
+    let f = jv.scan_flags(it.st, off, len)
+    return vstr(jv.add_span(&it.st, off, len, f))
+  it.st.pp = it.ipos
+  it.st.pend = it.iend
+  it.st.perr = ""
+  it.st.depth = 0
+  jv.skip_ws(&it.st)
+  if it.st.pp >= it.st.pend:
+    it.ipos = it.st.pp
+    it.iline = it.st.pline - 1
+    return sfail(&it, "No more inputs")
+  let v = jv.parse_value(&it.st)
+  if it.st.perr != "":
+    let line = it.st.pline
+    let col = it.st.pp - it.st.plinestart
+    it.ierr = it.st.perr + " at line {line}, column {col}"
+    it.ipos = it.iend
+    return sfail(&it, "No more inputs")
+  # a scalar ends at the byte after it: a newline there counts toward the line number
+  if it.st.pp < it.st.pend and it.st.b[it.st.pp] == '\n':
+    let kd = kind(v)
+    if kd != K_ARR and kd != K_OBJ and kd != K_STR:
+      it.st.pline += 1
+      it.st.plinestart = it.st.pp + 1
+      it.st.pp += 1
+  it.ipos = it.st.pp
+  it.iline = it.st.pline - 1
+  while it.ifile + 1 < it.istarts.len and it.ipos > it.istarts[it.ifile + 1]: it.ifile += 1
+  return v
+
+fn push_all(var out: [Byte], s: Str):
+  for i in 0..s.len: out.push(s[i])

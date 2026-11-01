@@ -1,0 +1,643 @@
+# vjq: a jq-compatible command-line JSON processor (jq 1.7.1's filter language, options, output
+# format and messages).
+#
+#   vjq [options] FILTER [FILES...]
+#   vjq --run-tests FILE      run a jq test file (jq's tests/jq.test format)
+
+import jv
+import lang
+import run
+import nat
+import builtins
+from jv import V, St, vnull, vnum, vstr, kind, K_NULL, K_FALSE, K_TRUE, K_STR, K_ARR, K_OBJ
+from run import It, ST_OK, ST_ERR, ST_BREAK, ST_HALT
+
+const USAGE = """
+  Usage:	vjq [OPTIONS] FILTER [FILES...]
+  	vjq [OPTIONS] --args FILTER [ARGUMENTS...]
+  	vjq [OPTIONS] --jsonargs FILTER [JSON_VALUES...]
+
+  vjq is a jq-compatible tool for processing JSON inputs: it applies the given filter to its
+  JSON text inputs and writes each result as JSON on standard output.
+
+  Example:
+
+  	$ echo '{{"foo": 0}}' | vjq .
+  	{{
+  	  "foo": 0
+  	}}
+
+  Command options:
+    -n, --null-input          use `null` as the single input value;
+    -R, --raw-input           read each line as string instead of JSON;
+    -s, --slurp               read all inputs into an array and use it as
+                              the single input value;
+    -c, --compact-output      compact instead of pretty-printed output;
+    -r, --raw-output          output strings without escapes and quotes;
+        --raw-output0         implies -r and output NUL after each output;
+    -j, --join-output         implies -r and output without newline after
+                              each output;
+    -a, --ascii-output        output strings by only ASCII characters
+                              using escape sequences;
+    -S, --sort-keys           sort keys of each object on output;
+    -C, --color-output        colorize JSON output;
+    -M, --monochrome-output   disable colored output;
+        --tab                 use tabs for indentation;
+        --indent n            use n spaces for indentation (max 7 spaces);
+        --unbuffered          flush output stream after each output;
+        --seq                 parse input/output as application/json-seq;
+    -f, --from-file file      load filter from the file;
+    -L directory              search modules from the directory;
+        --arg name value      set $name to the string value;
+        --argjson name value  set $name to the JSON value;
+        --slurpfile name file set $name to an array of JSON values read
+                              from the file;
+        --rawfile name file   set $name to string contents of file;
+        --args                consume remaining arguments as positional
+                              string values;
+        --jsonargs            consume remaining arguments as positional
+                              JSON values;
+    -e, --exit-status         set exit status code based on the output;
+    -V, --version             show the version;
+    -h, --help                show the help;
+        --run-tests file      run a jq test file;
+    --                        terminates argument processing;
+  """
+
+type Opts:
+  filter: Str
+  have_filter: Bool
+  files: [Str]
+  null_input: Bool
+  raw_input: Bool
+  slurp: Bool
+  compact: Bool
+  raw: Bool
+  raw0: Bool
+  join: Bool
+  ascii: Bool
+  sortkeys: Bool
+  tab: Bool
+  indent: Int
+  seq: Bool
+  exit_status: Bool
+  from_file: Str
+  libdirs: [Str]
+  named_k: [Str]
+  named_v: [Str]       # "s:" + string, or "j:" + JSON text, "J:" slurp file, "R:" raw file
+  positional: [Str]
+  posjson: Bool
+  run_tests: Str
+
+fn die(msg: Str, code: Int):
+  eprint(msg)
+  exit(code)
+
+fn usage_err(msg: Str):
+  eprint("vjq: error: " + msg)
+  eprint("Use vjq --help for help with command-line options,")
+  eprint("or see the jq manpage, or online docs  at https://jqlang.github.io/jq")
+  exit(2)
+
+fn parse_args(argv: [Str]) -> Opts:
+  var o = Opts("", false, [], false, false, false, false, false, false, false, false, false, false, 2, false, false, "", [], [], [], [], false, "")
+  var i = 1
+  var further = true
+  var args_mode = 0     # 1: --args, 2: --jsonargs
+  while i < argv.len:
+    let a = argv[i]
+    i += 1
+    if further and a == "--":
+      further = false
+      continue
+    if not further or not a.startswith("-") or a == "-":
+      if not o.have_filter and o.from_file == "":
+        o.filter = a
+        o.have_filter = true
+      elif args_mode == 1:
+        o.positional.push(a)
+      elif args_mode == 2:
+        o.positional.push(a)
+        o.posjson = true
+      else:
+        o.files.push(a)
+      continue
+    if a.startswith("--"):
+      if a == "--null-input": o.null_input = true
+      elif a == "--raw-input": o.raw_input = true
+      elif a == "--slurp": o.slurp = true
+      elif a == "--compact-output": o.compact = true
+      elif a == "--raw-output": o.raw = true
+      elif a == "--raw-output0":
+        o.raw = true
+        o.raw0 = true
+      elif a == "--join-output":
+        o.raw = true
+        o.join = true
+      elif a == "--ascii-output": o.ascii = true
+      elif a == "--sort-keys": o.sortkeys = true
+      elif a == "--color-output" or a == "--monochrome-output" or a == "--unbuffered" or a == "--stream-errors": o.seq = o.seq
+      elif a == "--tab": o.tab = true
+      elif a == "--indent":
+        if i >= argv.len: usage_err("--indent takes one parameter")
+        let n = int(argv[i]) else -1
+        if n < 0: usage_err("--indent takes a number")
+        if n > 7: die("vjq: Cannot indent more than 7 characters", 2)
+        o.indent = n
+        i += 1
+      elif a == "--seq": o.seq = true
+      elif a == "--exit-status": o.exit_status = true
+      elif a == "--from-file":
+        if i >= argv.len: usage_err("-f takes a parameter")
+        o.from_file = argv[i]
+        i += 1
+      elif a == "--arg" or a == "--argjson" or a == "--slurpfile" or a == "--rawfile":
+        if i + 1 >= argv.len: usage_err(a + " takes two parameters (e.g. " + a + " varname value)")
+        o.named_k.push(argv[i])
+        var tag = "s:"
+        if a == "--argjson": tag = "j:"
+        if a == "--slurpfile": tag = "J:"
+        if a == "--rawfile": tag = "R:"
+        o.named_v.push(tag + argv[i + 1])
+        i += 2
+      elif a == "--args": args_mode = 1
+      elif a == "--jsonargs": args_mode = 2
+      elif a == "--run-tests":
+        if i < argv.len:
+          o.run_tests = argv[i]
+          i += 1
+        else:
+          o.run_tests = "-"
+      elif a == "--help":
+        print(USAGE)
+        exit(0)
+      elif a == "--version":
+        print("jq-1.7.1")
+        exit(0)
+      elif a == "--stream":
+        die("vjq: --stream is not supported", 2)
+      else:
+        usage_err("Unknown option: " + a)
+      continue
+    # short options, possibly combined (-nr)
+    var j = 1
+    while j < a.len:
+      let c = a[j]
+      j += 1
+      if c == 'n': o.null_input = true
+      elif c == 'R': o.raw_input = true
+      elif c == 's': o.slurp = true
+      elif c == 'c': o.compact = true
+      elif c == 'r': o.raw = true
+      elif c == 'j':
+        o.raw = true
+        o.join = true
+      elif c == 'a': o.ascii = true
+      elif c == 'S': o.sortkeys = true
+      elif c == 'C' or c == 'M': o.seq = o.seq
+      elif c == 'e': o.exit_status = true
+      elif c == 'h':
+        print(USAGE)
+        exit(0)
+      elif c == 'V':
+        print("jq-1.7.1")
+        exit(0)
+      elif c == 'f':
+        if i >= argv.len: usage_err("-f takes a parameter")
+        o.from_file = argv[i]
+        i += 1
+      elif c == 'L':
+        if j < a.len:
+          o.libdirs.push(a[j..a.len])
+          j = a.len
+        else:
+          if i >= argv.len: usage_err("-L takes a parameter")
+          o.libdirs.push(argv[i])
+          i += 1
+      else:
+        usage_err("Unknown option: " + a)
+  return o
+
+# Parses JSON text held in a Str (for --argjson and the test runner); nil if it isn't one value.
+fn parse_json_str(var it: It, s: Str) -> V?:
+  let v = jv.new_str(&it.st, s)
+  let r = nat.parse_text(&it, v, false)
+  if it.bad:
+    it.bad = false
+    return nil
+  return r
+
+fn compile_error(it: It, src: Str) -> Str:
+  var lines = src.split("\n")
+  var line = it.cerrline
+  if line < 0: line = 0
+  var text = ""
+  if line < lines.len: text = lines[line]
+  return "jq: error: " + it.cerr + " at <top-level>, line {line + 1}:\n" + text
+
+# Builds the interpreter: globals, builtins and the program. Returns the program's root node,
+# or -1 with it.cerr set.
+fn compile(var it: It, src: Str, names: [Str], vals: [V]) -> Int:
+  # globals: $ENV, then the named arguments
+  var sc = run.Scope([], [], [], [], 0)
+  var genv = -1
+  let envv = nat.env_obj(&it)
+  it.env_obj = envv
+  genv = run.frpush(&it, genv, run.FR_VAR, envv, -1, -1)
+  run.sc_push(&sc, run.SC_VAR, "ENV", 0, -1)
+  for i in 0..names.len:
+    genv = run.frpush(&it, genv, run.FR_VAR, vals[i], -1, -1)
+    run.sc_push(&sc, run.SC_VAR, names[i], 0, -1)
+  it.genv = genv
+  sc.nglobal = sc.kind.len
+  # the builtins written in jq
+  var bp = lang.new_parser(builtins.SOURCE, "<builtin>")
+  let bdefs = lang.parse_defs(&bp, &it.st)
+  if bp.err != "":
+    it.cerr = "internal: builtins: " + bp.err
+    return -1
+  swap(&it.ast, &bp.ast)
+  for f in bdefs: run.resolve_def(&it, f, &sc)
+  # the program
+  var p = lang.new_parser(src, "<top-level>")
+  swap(&p.ast, &it.ast)
+  let root = lang.parse_program(&p, &it.st)
+  swap(&p.ast, &it.ast)
+  if p.err != "":
+    it.cerr = p.err
+    it.cerrline = p.errline
+    return -1
+  if root < 0:
+    # only definitions: the program is the identity
+    let id = it.ast.ns.len
+    it.ast.ns.push(lang.N(lang.N_ID, -1, -1, -1, -1, -1, -1, vnull(), 0))
+    run.mark_simple(&it)
+    return id
+  run.resolve(&it, root, &sc)
+  if it.cerr != "": return -1
+  run.mark_simple(&it)
+  return root
+
+fn reset_run(var it: It):
+  jv.reset(&it.st)
+  it.pp.truncate(1)
+  it.pk.truncate(1)
+  if it.aown.len > it.st.ao.len: it.aown.truncate(it.st.ao.len)
+  if it.oown.len > it.st.oo.len: it.oown.truncate(it.st.oo.len)
+  it.fr.truncate(it.genv + 1)
+  it.ks.truncate(0)
+  it.argv.truncate(0)
+
+# Runs the program on one input. Returns the status; errors are reported here.
+fn run_one(var it: It, root: Int, v: V) -> Int:
+  it.ks.truncate(0)
+  it.ks.push(run.Kf(run.K_OUT, -1, -1, -1, 0, 0, vnull(), vnull(), -1))
+  it.crossed = -1
+  let _h1 = it.genv
+  let s = run.ev(&it, root, v, -1, _h1, 0)
+  return s
+
+fn pos_text(it: It) -> Str:
+  if it.null_input: return "<unknown>"
+  var name = "<stdin>"
+  if it.ifile < it.ifiles.len and it.ifiles[it.ifile] != "": name = it.ifiles[it.ifile]
+  return name + ":{it.iline}"
+
+fn report_error(var it: It):
+  run.flush_out(&it)
+  let e = it.err
+  if kind(e) == K_STR:
+    eprint("jq: error (at " + pos_text(it) + "): " + jv.str_of(it.st, e))
+  else:
+    let s = jv.to_json_str(&it.st, e)
+    eprint("jq: error (at " + pos_text(it) + ") (not a string): " + s)
+
+fn main(fs: Fs, os: Os, ffi: Ffi):
+  let argv = args()
+  let o = parse_args(argv)
+  if o.run_tests != "":
+    let code = run_tests(fs, os, ffi, o.run_tests)
+    exit(code)
+  var src = o.filter
+  var files: [Str] = []
+  for f in o.files: files.push(f)
+  if o.from_file != "":
+    src = fs.read(o.from_file) else ""
+    if not fs.exists(o.from_file): die("jq: error: Could not open " + o.from_file + ": No such file or directory", 2)
+    if o.have_filter:
+      var fs2: [Str] = [o.filter]
+      for f in files: fs2.push(f)
+      files = fs2
+  elif not o.have_filter:
+    print(USAGE)
+    exit(2)
+  var it = run.new_it(ffi)
+  it.null_input = o.null_input
+  it.raw_input = o.raw_input
+  it.slurp = o.slurp
+  it.raw = o.raw
+  it.join = o.join or o.raw0
+  it.seq = o.seq
+  it.st.sortkeys = o.sortkeys
+  it.st.ascii = o.ascii
+  it.st.tab = o.tab
+  it.st.indent = o.indent
+  if o.compact:
+    it.st.indent = 0
+    it.st.tab = false
+  # read the inputs into the store's buffer first (strings in them are spans of it)
+  var text = ""
+  var ierrs = 0
+  if files.len == 0:
+    if not o.null_input or true:
+      text = os.read_stdin() else ""
+    it.ifiles.push("")
+    it.istarts.push(0)
+  else:
+    for f in files:
+      match fs.read(f):
+        ok(t):
+          it.ifiles.push(f)
+          it.istarts.push(text.len)
+          if has_bom(t): text += t[3..t.len]
+          else: text += t
+        err(e):
+          eprint("jq: error: Could not open " + f + ": " + open_err(fs, f))
+          ierrs += 1
+  if has_bom(text): text = text[3..text.len]
+  it.st.b = bytes(text)
+  it.ipos = 0
+  it.iend = it.st.b.len
+  it.st.pline = 1
+  it.st.plinestart = 0
+  # named arguments
+  var names: [Str] = []
+  var vals: [V] = []
+  var nk: [Int] = []
+  var nv: [V] = []
+  for i in 0..o.named_k.len:
+    let tag = o.named_v[i][0..2]
+    let val = o.named_v[i][2..o.named_v[i].len]
+    var v = vnull()
+    if tag == "s:":
+      v = jv.new_str(&it.st, val)
+    elif tag == "j:":
+      v = parse_json_str(&it, val) else die_v("jq: Invalid JSON text passed to --argjson")
+    elif tag == "R:":
+      let t = fs.read(val) else die_s("jq: error: Could not open " + val + ": " + open_err(fs, val))
+      v = jv.new_str(&it.st, t)
+    else:
+      let t = fs.read(val) else die_s("jq: error: Could not open " + val + ": " + open_err(fs, val))
+      v = slurp_text(&it, t, val)
+    names.push(o.named_k[i])
+    vals.push(v)
+    nk.push(jv.intern_str(&it.st, o.named_k[i]))
+    nv.push(v)
+  # $ARGS
+  let ps = it.st.tv.len
+  for a in o.positional:
+    if o.posjson:
+      let v = parse_json_str(&it, a) else die_v("jq: Invalid JSON text passed to --jsonargs")
+      it.st.tv.push(v)
+    else:
+      it.st.tv.push(jv.new_str(&it.st, a))
+  let posarr = jv.end_arr(&it.st, ps)
+  let s0 = it.st.tk.len
+  for i in 0..nk.len:
+    it.st.tk.push(nk[i])
+    it.st.tw.push(nv[i])
+  let named = jv.end_obj(&it.st, s0)
+  let s1 = it.st.tk.len
+  it.st.tk.push(jv.intern_str(&it.st, "positional"))
+  it.st.tw.push(posarr)
+  it.st.tk.push(jv.intern_str(&it.st, "named"))
+  it.st.tw.push(named)
+  let argsv = jv.end_obj(&it.st, s1)
+  names.push("ARGS")
+  vals.push(argsv)
+  let root = compile(&it, src, names, vals)
+  if root < 0:
+    eprint(compile_error(it, src))
+    eprint("jq: 1 compile error")
+    exit(3)
+  jv.set_mark(&it.st)
+  var ret = -4            # no output yet
+  var last_result = -1
+  if o.null_input:
+    ret = process(&it, root, vnull())
+  elif o.slurp:
+    var v = vnull()
+    if o.raw_input:
+      let n = it.iend - it.ipos
+      let _h3 = it.ipos
+      let _h2 = jv.scan_flags(it.st, it.ipos, n)
+      v = vstr(jv.add_span(&it.st, _h3, n, _h2))
+      it.ipos = it.iend
+    else:
+      var xs: [V] = []
+      while true:
+        let x = nat.read_input(&it)
+        if it.bad:
+          it.bad = false
+          break
+        xs.push(x)
+      v = nat.mkarr(&it, xs)
+    if it.ierr != "":
+      eprint("jq: parse error: " + it.ierr)
+      ret = 2
+    else:
+      ret = process(&it, root, v)
+  else:
+    while true:
+      let v = nat.read_input(&it)
+      if it.bad:
+        it.bad = false
+        break
+      ret = process(&it, root, v)
+      if ret <= 0 and ret != -4:
+        if ret == -1: last_result = 0
+        else: last_result = 1
+      reset_run(&it)
+      if it.halted: break
+    if it.ierr != "":
+      run.flush_out(&it)
+      eprint("jq: parse error: " + it.ierr)
+      ret = 2
+  run.flush_out(&it)
+  if ierrs > 0: ret = 2
+  if o.exit_status:
+    if ret != -4: exit(abs(ret))
+    if last_result == -1: exit(4)
+    if last_result == 0: exit(1)
+    exit(0)
+  if ret > 0: exit(ret)
+  exit(0)
+
+fn die_v(msg: Str) -> V:
+  eprint(msg)
+  exit(2)
+
+fn die_s(msg: Str) -> Str:
+  eprint(msg)
+  exit(2)
+
+fn open_err(fs: Fs, f: Str) -> Str:
+  if not fs.exists(f): return "No such file or directory"
+  return "Permission denied"
+
+fn slurp_text(var it: It, t: Str, name: Str) -> V:
+  let off = it.st.b.len
+  for i in 0..t.len: it.st.b.push(t[i])
+  let spp = it.st.pp
+  let spend = it.st.pend
+  it.st.pp = off
+  it.st.pend = it.st.b.len
+  it.st.perr = ""
+  var xs: [V] = []
+  while true:
+    jv.skip_ws(&it.st)
+    if it.st.pp >= it.st.pend: break
+    let v = jv.parse_value(&it.st)
+    if it.st.perr != "":
+      eprint("jq: Bad JSON in --slurpfile " + name + ": " + it.st.perr)
+      exit(2)
+    xs.push(v)
+  it.st.pp = spp
+  it.st.pend = spend
+  return nat.mkarr(&it, xs)
+
+# One input through the program, with jq's result code: 0 ok, -1 last output null or false,
+# -4 no output, 5 error, or halt's code.
+fn process(var it: It, root: Int, v: V) -> Int:
+  it.had_output = false
+  let s = run_one(&it, root, v)
+  if s == ST_HALT:
+    run.flush_out(&it)
+    return it.exit_code
+  if s == ST_ERR:
+    report_error(&it)
+    return 5
+  if s == ST_BREAK:
+    report_error_msg(&it, "break")
+    return 5
+  if not it.had_output: return -4
+  let k = kind(it.last_output)
+  if (k == K_NULL or k == K_FALSE) and not (it.raw and k == K_STR): return -1
+  return 0
+
+fn report_error_msg(var it: It, msg: Str):
+  run.flush_out(&it)
+  eprint("jq: error (at " + pos_text(it) + "): " + msg)
+
+# ---------------------------------------------------------------- the test runner
+
+fn skipline(l: Str) -> Bool:
+  let t = l.strip()
+  return t == "" or t.startswith("#")
+
+fn run_tests(fs: Fs, os: Os, ffi: Ffi, path: Str) -> Int:
+  var text = ""
+  if path == "-": text = os.read_stdin() else ""
+  else: text = fs.read(path) else die_s("jq: error: Could not open " + path)
+  let lines = text.split("\n")
+  var i = 0
+  var tests = 0
+  var passed = 0
+  var invalid = 0
+  var must_fail = false
+  var check_msg = false
+  while i < lines.len:
+    let l = lines[i]
+    i += 1
+    if skipline(l): continue
+    if l.startswith("%%FAIL"):
+      must_fail = true
+      check_msg = l == "%%FAIL"
+      continue
+    let prog = l
+    tests += 1
+    print("Test #{tests}: '" + prog + "' at line number {i}")
+    var it = run.new_it(ffi)
+    it.collect = true
+    it.st.b = []
+    it.st.pline = 1
+    var names: [Str] = []
+    var vals: [V] = []
+    let root = compile(&it, prog, names, vals)
+    if must_fail:
+      must_fail = false
+      let expected = lines[i] + ""
+      i += 1
+      if root >= 0:
+        print("*** Test program compiled that should not have at line {i}: " + prog)
+        invalid += 1
+        check_msg = false
+        continue
+      let msg = compile_error(it, prog).split("\n")[0]
+      if check_msg and msg != expected:
+        print("*** Erroneous test program failed with wrong message (" + msg + ") at line {i}: " + prog)
+        invalid += 1
+      else:
+        passed += 1
+      check_msg = false
+      continue
+    if root < 0:
+      print("*** Test program failed to compile at line {i}: " + prog + " (" + it.cerr + ")")
+      invalid += 1
+      while i < lines.len and lines[i].strip() != "": i += 1
+      continue
+    if i >= lines.len:
+      invalid += 1
+      break
+    let inl = lines[i] + ""
+    i += 1
+    let input = parse_json_str(&it, inl)
+    if input == nil:
+      print("*** Input is invalid on line {i}: " + inl)
+      invalid += 1
+      continue
+    let inv = input else vnull()
+    jv.set_mark(&it.st)
+    let s = run_one(&it, root, inv)
+    var pass = true
+    var ri = 0
+    while i < lines.len:
+      let el = lines[i] + ""
+      i += 1
+      if skipline(el): break
+      let exp = parse_json_str(&it, el)
+      if exp == nil:
+        print("*** Expected result is invalid on line {i}: " + el)
+        invalid += 1
+        continue
+      let ev = exp else vnull()
+      if ri >= it.results.len:
+        var why = ""
+        if s == ST_ERR:
+          if kind(it.err) == K_STR: why = " (error: " + jv.str_of(it.st, it.err) + ")"
+          else:
+            let _h4 = it.err
+            why = " (error: " + jv.to_json_str(&it.st, _h4) + ")"
+        print("*** Insufficient results for test at line number {i}: " + prog + why)
+        pass = false
+        while i < lines.len and not skipline(lines[i]): i += 1
+        break
+      let got = it.results[ri]
+      ri += 1
+      if not jv.veq(it.st, ev, got):
+        let es = jv.to_json_str(&it.st, ev)
+        let gs = jv.to_json_str(&it.st, got)
+        print("*** Expected " + es + ", but got " + gs + " for test at line number {i}: " + prog)
+        pass = false
+    if pass and ri < it.results.len:
+      let _h5 = it.results[ri]
+      let gs = jv.to_json_str(&it.st, _h5)
+      print("*** Superfluous result: " + gs + " for test at line number {i}, " + prog)
+      pass = false
+    if pass: passed += 1
+  print("{passed} of {tests} tests passed ({invalid} malformed, 0 skipped)")
+  if passed != tests: return 1
+  return 0
+
+fn has_bom(t: Str) -> Bool:
+  return t.len >= 3 and t[0] == 0xEF and t[1] == 0xBB and t[2] == 0xBF
