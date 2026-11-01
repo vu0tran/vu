@@ -46,8 +46,14 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     return -1
   # a deferred conditional type: through an upper bound of its branches
   if sk == types.TK_COND and tk != types.TK_COND:
+    # isRelatedTo through the default constraint, then the distributive one
+    let d0 = tyops.cond_default(&c, s)
+    if d0 >= 0 and assignable(&c, d0, t): return 1
+    let dd = tyops.cond_dist(&c, s)
+    if dd >= 0 and assignable(&c, dd, t): return 1
     let b = cond_bound(&c, s, 0)
     if b >= 0 and assignable(&c, b, t): return 1
+    if d0 >= 0 and dd != -2 and not tyops.is_generic(&c, t): return 0
     return -1
   if tk == types.TK_COND:
     let n = c.ta[t]
@@ -70,6 +76,11 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     let ic = tyops.indexed_constraint(&c, s, 0)
     if ic >= 0:
       if assignable(&c, ic, t): return 1
+      if not tyops.is_generic(&c, t): return 0
+    # through its base constraint (an upper bound: unrelated to a concrete target, so is T[K])
+    let bb = tyops.base_of(&c, s, 0)
+    if bb >= 0:
+      if assignable(&c, bb, t): return 1
       if not tyops.is_generic(&c, t): return 0
     var o = c.ta[s]
     var i = c.tb[s]
@@ -229,11 +240,16 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
       if not assignable(&c, src, m): return false
     return true
   if sk == TK_INTER:
+    if tk == TK_OBJ and not nw and inter_weak_fails(&c, s, t): return false
     for m in types.members_inter(c, s):
       if assignable(&c, m, t): return true
     if tk == TK_OBJ:
+      let r = combined_rel(&c, s, t)
+      if r == 1: return true
+      if r == 0: return false
       # the members' properties together: not modeled here
-      let u = bind.unsupported(&c, 0, "relating an intersection to an object type by its combined properties")
+      let dbg = dbg_types(&c, s, t)
+      let u = bind.unsupported(&c, 0, "relating an intersection to an object type by its combined properties" + dbg)
       bind.touch(&c, u)
       return true
     return false
@@ -480,6 +496,63 @@ fn rest_tuple_rel(var c: C, s: Int, t: Int) -> Bool:
   for i in sf..tf:
     if not assignable(&c, c.objs[so].args[sf], c.objs[to].args[i]): return false
   return assignable(&c, c.objs[so].args[sf], c.objs[to].args[tf])
+
+# An intersection of plain object types against an object type with only properties, by the
+# intersection's combined properties (propertiesRelatedTo). 1 related, 0 not, -1 not modeled.
+fn combined_rel(var c: C, s: Int, t: Int) -> Int:
+  let to = c.ta[t]
+  let ms = types.members_inter(c, s)
+  # getUnmatchedProperty: a required property no member has
+  if c.objs[to].kind != types.OK_MAPPED and not tyops.is_generic(&c, t):
+    var plain = true
+    for m in ms:
+      if c.tk[m] != TK_OBJ or c.objs[c.ta[m]].kind == types.OK_MAPPED or tyops.is_generic(&c, m): plain = false
+    if plain:
+      for name in bind.prop_names(&c, t):
+        let tp = bind.get_prop(&c, t, name)
+        if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
+        var found = false
+        for m in ms:
+          if bind.get_prop(&c, m, name) >= 0: found = true
+        if not found: return 0
+  if c.objs[to].kind == types.OK_TUPLE or c.objs[to].kind == types.OK_MAPPED or is_array_ref(&c, t): return -1
+  for m in ms:
+    if c.tk[m] != TK_OBJ: return -1
+    let k = c.objs[c.ta[m]].kind
+    if k == types.OK_MAPPED or k == types.OK_TUPLE or is_array_ref(&c, m): return -1
+    if tyops.is_generic(&c, m): return -1
+  if bind.sigs_of(&c, t, false).len > 0 or bind.sigs_of(&c, t, true).len > 0: return -1
+  if bind.index_type(&c, t, false) >= 0 or bind.index_type(&c, t, true) >= 0: return -1
+  let names = bind.prop_names(&c, t)
+  # the weak type check: a target of only optional properties shares one with the source
+  var weak = names.len > 0
+  var common = false
+  for name in names:
+    let tp = bind.get_prop(&c, t, name)
+    if (c.sflags[tp] & SF_OPTIONAL) == 0: weak = false
+    for m in ms:
+      if src_prop(&c, m, name) >= 0: common = true
+  if weak and not common: return 0
+  for name in names:
+    let tp = bind.get_prop(&c, t, name)
+    if (c.sflags[tp] & (types.SF_PRIVATE | types.SF_PROTECTED)) != 0: return -1
+    var sts: [Int] = []
+    var all_opt = true
+    for m in ms:
+      let sp = src_prop(&c, m, name)
+      if sp < 0: continue
+      if (c.sflags[sp] & (types.SF_PRIVATE | types.SF_PROTECTED)) != 0: return -1
+      sts.push(bind.prop_type_for(&c, sp, m))
+      if (c.sflags[sp] & SF_OPTIONAL) == 0: all_opt = false
+    if sts.len == 0:
+      if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
+      return 0
+    var st = types.inter_of(&c, sts)
+    if all_opt: st = types.union_of(&c, [st, c.undef_t])
+    var tt = bind.prop_type_for(&c, tp, t)
+    if (c.sflags[tp] & SF_OPTIONAL) != 0: tt = types.union_of(&c, [tt, c.undef_t])
+    if not assignable(&c, st, tt): return 0
+  return 1
 
 fn structural(var c: C, s: Int, t: Int) -> Bool:
   let so = c.ta[s]
@@ -753,6 +826,18 @@ fn report(var c: C, s: Int, t0: Int, node: Int, expr: Int, code: Int):
   let t = report_target(&c, s, t0)
   let sk = c.tk[s]
   let tk = c.tk[t]
+  if sk == TK_INTER and tk == TK_OBJ:
+    if inter_weak_fails(&c, s, t):
+      let ss = show.show(&c, s)
+      let ts = show.show(&c, t)
+      bind.err(&c, node, 2559, "Type '" + ss + "' has no properties in common with type '" + ts + "'.")
+      return
+    let mi = missing_inter(&c, s, t, node)
+    if mi == 1: return
+    if mi == -1:
+      let u = bind.unsupported(&c, 0, "an error from an intersection with a tuple, array or non-object member")
+      bind.touch(&c, u)
+      return
   if sk == TK_OBJ and tk == TK_OBJ:
     let s_ro = is_readonly_array(&c, s) or (obj_kind(c, s) == OK_TUPLE and c.objs[c.ta[s]].ro)
     let t_mut = (is_array_ref(&c, t) and not is_readonly_array(&c, t)) or (obj_kind(c, t) == OK_TUPLE and not c.objs[c.ta[t]].ro)
@@ -963,13 +1048,53 @@ fn missing(var c: C, s: Int, t: Int, node: Int) -> Bool:
   let ts = show.show(&c, t)
   if miss.len == 1:
     bind.err(&c, node, 2741, "Property '" + miss[0] + "' is missing in type '" + ss + "' but required in type '" + ts + "'.")
-  elif miss.len <= 4:
+  elif miss.len <= 5:
     bind.err(&c, node, 2739, "Type '" + ss + "' is missing the following properties from type '" + ts + "': " + ", ".join(miss))
   else:
     var first: [Str] = []
     for i in 0..4: first.push(miss[i] + "")
     bind.err(&c, node, 2740, "Type '" + ss + "' is missing the following properties from type '" + ts + "': " + ", ".join(first) + ", and {miss.len - 4} more.")
   return true
+
+# The weak type check with an intersection source: its members' properties together.
+fn inter_weak_fails(var c: C, s: Int, t: Int) -> Bool:
+  if not is_weak(&c, t): return false
+  var any_member = false
+  for m in types.members_inter(c, s):
+    let a = apparent(&c, m)
+    if c.tk[a] != TK_OBJ: continue
+    let names = bind.prop_names(&c, a)
+    if names.len > 0 or bind.sigs_of(&c, a, false).len > 0 or bind.sigs_of(&c, a, true).len > 0: any_member = true
+    for name in names:
+      if bind.get_prop(&c, t, name) >= 0: return false
+  return any_member
+
+# getUnmatchedProperties with an intersection source of plain object types (no tuples).
+fn missing_inter(var c: C, s: Int, t: Int, node: Int) -> Int:
+  if obj_kind(c, t) == OK_TUPLE or is_array_ref(&c, t): return -1
+  let ms = types.members_inter(c, s)
+  for m in ms:
+    if c.tk[m] != TK_OBJ or obj_kind(c, m) == OK_TUPLE or is_array_ref(&c, m): return -1
+  var miss: [Str] = []
+  for name in bind.prop_names(&c, t):
+    let tp = bind.get_prop(&c, t, name)
+    if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
+    var found = false
+    for m in ms:
+      if src_prop(&c, m, name) >= 0: found = true
+    if not found: miss.push(c.t.names[name] + "")
+  if miss.len == 0: return 0
+  let ss = show.show(&c, s)
+  let ts = show.show(&c, t)
+  if miss.len == 1:
+    bind.err(&c, node, 2741, "Property '" + miss[0] + "' is missing in type '" + ss + "' but required in type '" + ts + "'.")
+  elif miss.len <= 5:
+    bind.err(&c, node, 2739, "Type '" + ss + "' is missing the following properties from type '" + ts + "': " + ", ".join(miss))
+  else:
+    var first: [Str] = []
+    for i in 0..4: first.push(miss[i] + "")
+    bind.err(&c, node, 2740, "Type '" + ss + "' is missing the following properties from type '" + ts + "': " + ", ".join(first) + ", and {miss.len - 4} more.")
+  return 1
 
 # An expression's type as TypeScript re-checks it when elaborating an array literal: nested array
 # literals become tuples of their widened elements.
