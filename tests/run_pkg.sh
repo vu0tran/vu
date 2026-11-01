@@ -165,5 +165,58 @@ done
 check "a registry URL that isn't https or file" "must be an https:// or file:// URL" env VU_REGISTRY="http://example.com/i" $VU search
 unset VU_REGISTRY
 
+
+# smuggling a capability into a package that isn't granted it: through a function value (a callback
+# that returns one, a struct field holding one, a callback that hands one to a package closure), an
+# interface function's result, a closure written in the package, or the command line
+smuggle() {  # name, package source, main source
+  rm -rf "$work/sm"; mkdir -p "$work/sm/evil" "$work/sm/app"
+  printf '%s\n' "$2" > "$work/sm/evil/evil.vu"; echo "need ../evil" > "$work/sm/app/vu.pkg"; printf '%s\n' "$3" > "$work/sm/app/main.vu"
+  check "smuggled in: $1" "package 'evil' isn't granted" sh -c "cd '$work/sm/app' && $VU run main.vu"
+}
+smuggle "a callback returning Os" 'fn steal(get: fn() -> Os) -> Str:
+  return get().env("HOME")' 'import evil
+fn main(os: Os):
+  print(evil.steal(fn() => os))'
+smuggle "a struct field holding a function" 'type Hook:
+  get: fn() -> Fs
+fn steal(h: Hook) -> Str:
+  return h.get().read("/etc/hostname") else ""' 'import evil
+fn main(fs: Fs):
+  print(evil.steal(evil.Hook(own fn() => fs)))'
+smuggle "an interface function's result" 'interface Getter:
+  fn get(s: Self) -> Net
+fn steal(g: Getter) -> Int:
+  return 1' 'import evil
+type G:
+  n: Net
+impl evil.Getter for G:
+  fn get(s: G) -> Net:
+    return s.n
+fn main(net: Net):
+  print("{evil.steal(G(net))}")'
+smuggle "a package closure handed Os by the caller" 'fn steal(run: fn(fn(Os) -> Str) -> Str) -> Str:
+  return run(fn(o: Os) => o.env("HOME"))' 'import evil
+fn main(os: Os):
+  print(evil.steal(fn(f) => f(os)))'
+smuggle "a package function returning a closure that takes Os" 'fn helper() -> fn(Os) -> Str:
+  return own fn(o: Os) => o.env("HOME")' 'import evil
+fn main(os: Os):
+  let f = evil.helper()
+  print(f(os))'
+smuggle "the command line, args()" 'fn steal() -> Str:
+  return " ".join(args())' 'import evil
+fn main():
+  print(evil.steal())'
+smuggle "the command line, arg()" 'fn steal() -> Str:
+  return arg(1, "")' 'import evil
+fn main():
+  print(evil.steal())'
+# what the program hands over on purpose still works: a closure that reads one variable
+rm -rf "$work/sm"; mkdir -p "$work/sm/evil" "$work/sm/app"
+printf 'fn apply(f: fn(Str) -> Str) -> Str:\n  return f("VU_PKG_TEST")\n' > "$work/sm/evil/evil.vu"; echo "need ../evil" > "$work/sm/app/vu.pkg"
+printf 'import evil\nfn main(os: Os):\n  print(evil.apply(fn(k) => os.env(k)))\n' > "$work/sm/app/main.vu"
+check "a closure the program passes (reading one variable)" "only this" sh -c "cd '$work/sm/app' && VU_PKG_TEST='only this' $VU run main.vu"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]
