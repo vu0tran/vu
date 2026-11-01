@@ -262,6 +262,9 @@ fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
       if c.t.k[e] == ast.N_OMIT:
         i += 1
         continue
+      if c.tk[src] == TK_OBJ and c.objs[c.ta[src]].kind == OK_TUPLE and bind.tuple_has_rest(c, src):
+        unsup(&c, e, "destructuring a tuple with a rest element")
+        return
       if (c.t.f[e] & ast.M_REST) != 0:
         var rt = -1
         if c.tk[src] == TK_OBJ and c.objs[c.ta[src]].kind == OK_TUPLE:
@@ -392,6 +395,12 @@ fn fn_sig(var c: C, d: Int) -> Int:
     c.sigs[sg].ptypes.push(pt)
     c.sigs[sg].pflags.push(fl)
     if fl == 0: min = i + 1
+    # ...args: [A, B?, ...C[]]: its required elements count toward the minimum
+    if fl == 2 and c.tk[pt] == TK_OBJ and c.objs[c.ta[pt]].kind == OK_TUPLE:
+      let tf = bind.tuple_fixed(c, pt)
+      if tf + 1 < c.objs[c.ta[pt]].args.len: unsup(&c, p, "a rest parameter typed as a tuple with elements after a rest element")
+      for j in 0..tf:
+        if c.objs[c.ta[pt]].eflags[j] == 0: min = i + j + 1
     i += 1
   c.sigs[sg].min = min
   if fn_retnode(c, d) >= 0: c.sigs[sg].ret = bind.type_from(&c, fn_retnode(c, d))
@@ -2191,6 +2200,22 @@ fn elem_of(var c: C, n: Int, ot: Int, it: Int) -> Int:
         if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
         ts.push(pt)
         continue
+      # past a fixed tuple's end: TS2493, undefined
+      if ik == TK_NUMLIT and c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_TUPLE and not bind.tuple_has_rest(c, m):
+        let len = c.objs[c.ta[m]].args.len
+        let iv = c.nums[c.ta[it]]
+        if iv >= float(len) and iv == float(int(iv)):
+          let h9_ = show.show(&c, m)
+          err(&c, idx, 2493, "Tuple type '" + h9_ + "' of length '{len}' has no element at index '" + c.numtext[c.ta[it]] + "'.")
+          ts.push(c.undef_t)
+          continue
+      # past a rest tuple's leading elements: the rest element's type (and those after it)
+      if ik == TK_NUMLIT and c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_TUPLE and bind.tuple_has_rest(c, m):
+        let tf = bind.tuple_fixed(c, m)
+        var rs: [Int] = []
+        for j in tf..c.objs[c.ta[m]].args.len: rs.push(c.objs[c.ta[m]].args[j])
+        ts.push(types.union_of(&c, rs))
+        continue
       let a = rel.apparent(&c, m)
       var xt = -1
       if ik == TK_NUMLIT: xt = bind.index_type(&c, a, true)
@@ -2463,6 +2488,7 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
       if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_TUPLE: tuple_ctx = m
       elif rel.is_array_ref(&c, m): elem_ctx = c.objs[c.ta[m]].args[0]
   var ts: [Int] = []
+  var ecs: [Int] = []
   var i = 0
   for el in kids(c, c.t.a[n]):
     if c.t.k[el] == ast.N_SPREAD:
@@ -2496,14 +2522,21 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
     var ec = elem_ctx
     if tuple_ctx >= 0:
       let to = c.ta[tuple_ctx]
-      if i < c.objs[to].args.len: ec = c.objs[to].args[i]
+      let tf = bind.tuple_fixed(c, tuple_ctx)
+      if tf < c.objs[to].args.len and tf + 1 < c.objs[to].args.len: return unsup(&c, n, "an array literal in a tuple context with elements after a rest element")
+      if i < tf: ec = c.objs[to].args[i]
+      elif tf < c.objs[to].args.len: ec = c.objs[to].args[tf]
     ts.push(check_expr(&c, el, ec))
+    ecs.push(ec)
     i += 1
   if tuple_ctx >= 0:
     let t = types.new_obj(&c, OK_TUPLE, -1, n)
     let o = c.ta[t]
-    for x in ts:
-      c.objs[o].args.push(widen_in_ctx(&c, x, tuple_ctx))
+    for j in 0..ts.len:
+      let x = ts[j]
+      # each element widens in its own element's contextual type
+      if ecs[j] >= 0: c.objs[o].args.push(widen_in_ctx(&c, x, ecs[j]))
+      else: c.objs[o].args.push(widen_lit(&c, x))
       c.objs[o].eflags.push(0)
     return t
   if ts.len == 0:
@@ -2656,10 +2689,9 @@ fn arg_count_msg(var c: C, sgs: [Int], n: Int, at: Int):
   for sg in sgs:
     let s = types.sig_copy(c, sg)
     if s.min < lo: lo = s.min
-    var mx = s.ptypes.len
-    for f in s.pflags:
-      if f == 2: rest = true
-    if mx > hi: hi = mx
+    let smx = sig_max(c, sg)
+    if smx < 0: rest = true
+    elif smx > hi: hi = smx
   var code = 2554
   var msg = "Expected {lo}-{hi} arguments, but got {n}."
   if rest:
@@ -2720,15 +2752,37 @@ fn sig_type_args(var c: C, sg: Int, targs: [Int]) -> [Int]:
   if out.len != tps.len: return []
   return out
 
+# The most arguments a signature takes (-1: no limit; a rest parameter typed as a tuple without a
+# rest element takes that many).
+fn sig_max(c: C, sg: Int) -> Int:
+  let s = types.sig_copy(c, sg)
+  let np = s.ptypes.len
+  if np > 0 and s.pflags[np - 1] == 2:
+    let rt = s.ptypes[np - 1]
+    if c.tk[rt] == TK_OBJ and c.objs[c.ta[rt]].kind == OK_TUPLE and not bind.tuple_has_rest(c, rt): return np - 1 + c.objs[c.ta[rt]].args.len
+    return -1
+  return np
+
 fn arity_ok(c: C, sg: Int, n: Int) -> Bool:
   let s = types.sig_copy(c, sg)
   if n < s.min: return false
-  for f in s.pflags:
-    if f == 2: return true
-  return n <= s.ptypes.len
+  let mx = sig_max(c, sg)
+  return mx < 0 or n <= mx
 
 fn param_at(var c: C, sg: Int, i: Int) -> Int:
   let s = types.sig_copy(c, sg)
+  # a rest parameter typed as a tuple: its elements by position
+  let np = s.ptypes.len
+  if np > 0 and s.pflags[np - 1] == 2 and i >= np - 1:
+    let rt = s.ptypes[np - 1]
+    if c.tk[rt] == TK_OBJ and c.objs[c.ta[rt]].kind == OK_TUPLE:
+      let tf0 = bind.tuple_fixed(c, rt)
+      if tf0 + 1 < c.objs[c.ta[rt]].args.len: return unsup(&c, s.node, "a rest parameter typed as a tuple with elements after a rest element")
+      let pt = rel.param_at_sig(&c, s, i)
+      if pt < 0: return c.any_t
+      let j = i - (np - 1)
+      if j < bind.tuple_fixed(c, rt) and c.objs[c.ta[rt]].eflags[j] == 1: return types.union_of(&c, [pt, c.undef_t])
+      return pt
   if i < s.ptypes.len:
     if s.pflags[i] == 2: return element_type(&c, s.ptypes[i], s.node)
     if s.pflags[i] == 1: return types.union_of(&c, [s.ptypes[i], c.undef_t])
@@ -2957,15 +3011,16 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
     var best = -1
     var best_n = -1
     for sg in sgs2:
-      let pn = c.sigs[sg].ptypes.len
-      var has_rest = false
-      for f in types.ints(c.sigs[sg].pflags):
-        if f == 2: has_rest = true
-      if best < 0 and (has_rest or pn >= args.len): best = sg
+      let smx = sig_max(c, sg)
+      var pn = smx
+      if smx < 0: pn = c.sigs[sg].ptypes.len
+      if best < 0 and (smx < 0 or smx >= args.len): best = sg
       if pn > best_n: best_n = pn
     if best < 0:
       for sg in sgs2:
-        if c.sigs[sg].ptypes.len == best_n and best < 0: best = sg
+        var pn2 = sig_max(c, sg)
+        if pn2 < 0: pn2 = c.sigs[sg].ptypes.len
+        if pn2 == best_n and best < 0: best = sg
     let bsg = instantiate_call(&c, best, args, ctx)
     for i in 0..args.len:
       let pt = param_at(&c, bsg, i)
@@ -2974,9 +3029,9 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
     var mx = 0
     var rest = false
     for sg in sgs2:
-      if c.sigs[sg].ptypes.len > mx: mx = c.sigs[sg].ptypes.len
-      for f in types.ints(c.sigs[sg].pflags):
-        if f == 2: rest = true
+      let smx = sig_max(c, sg)
+      if smx < 0: rest = true
+      elif smx > mx: mx = smx
     var at = n
     if not rest and args.len > mx: at = args[mx]
     arg_count_msg(&c, sgs2, args.len, at)
