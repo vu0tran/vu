@@ -1,9 +1,1237 @@
-# The checks: ports of ShellCheck's Analytics.hs and friends.
+# The checks: ports of ShellCheck's Analytics.hs, Checks/Commands.hs and Checks/ShellSupport.hs, on
+# the tree from parse.vu. AnalyzerLib's variable flow (a linear list of assignments and references
+# with subshell scopes) is rebuilt here as ShellCheck builds it.
 
 import ast
 import astlib
 import parse
+import data
+import cfg
+import dfa
+from ast import T_AND_IF, T_Bang, TC_Empty, T_DollarSingleQuoted, T_Glob, T_GREATAND, T_Greater
+from ast import T_LESSAND, T_Less, T_DGREAT, T_Literal, T_ParamSubSpecialChar, T_Pipe, T_SingleQuoted
+from ast import T_UnparsedIndex, TA_Assignment, TA_Binary, TA_Expansion, T_AndIf, T_Annotation
+from ast import T_Arithmetic, T_Array, TA_Sequence, TA_Parenthesis, T_Assignment, TA_Trinary, TA_Unary
+from ast import TA_Variable, T_Backgrounded, T_Backticked, T_Banged, T_BatsTest, T_BraceExpansion
+from ast import T_BraceGroup, TC_And, T_CaseExpression, TC_Binary, TC_Group, TC_Nullary, T_Condition
+from ast import T_CoProcBody, T_CoProc, TC_Or, TC_Unary, T_DollarArithmetic, T_DollarBraceCommandExpansion
+from ast import T_DollarBraced, T_DollarBracket, T_DollarDoubleQuoted, T_DollarExpansion, T_DoubleQuoted
+from ast import T_Extglob, T_FdRedirect, T_ForArithmetic, T_ForIn, T_Function, T_HereDoc, T_HereString
+from ast import T_IfExpression, T_Include, T_IndexedElement, T_IoDuplicate, T_IoFile, T_NormalWord, T_OrIf
+from ast import T_Pipeline, T_ProcSub, T_Redirecting, T_Script, T_SelectIn, T_SimpleCommand, T_SourceCommand
+from ast import T_Subshell, T_UntilExpression, T_WhileExpression, SINGLE, DOUBLE, ANN_DISABLE, ANN_SHELL
+from parse import Note, ERR, WARN, INFO, STYLE
+from astlib import oversimp, get_literal, only_literal, lit_def, lit_or, word_parts, all_flags, Flag, Opt
 
-fn analyze(var t: ast.Ast, root: Int, path: Str) -> [parse.Note]:
-  var out: [parse.Note] = []
+const SH_SH = 0
+const SH_BASH = 1
+const SH_DASH = 2
+const SH_KSH = 3
+const SH_BUSYBOX = 4
+
+const F_SCOPE = 1
+const F_END = 2
+const F_ASSIGN = 3
+const F_REF = 4
+
+const SRC_FROM = 1
+const SRC_EXTERNAL = 2
+const SRC_DECL = 3
+const SRC_INT = 4
+const SRC_CHECKED = 5
+
+type Flow:
+  kind: Int
+  base: Int
+  tok: Int
+  name: Str
+  arr: Bool
+  src: Int
+  from: Int      # SRC_FROM: start of the value tokens in An.srcs
+  nfrom: Int
+
+type An:
+  t: ast.Ast
+  root: Int
+  parent: [Int]
+  shell: Int
+  shell_specified: Bool
+  lastpipe: Bool
+  flow: [Flow]
+  srcs: [Int]
+  out: [Note]
+  oid: [Int]
+  path: Str
+  trange: {Int: Int}
+  res: dfa.Result
+  cfg_ok: Bool
+
+fn add_note(var a: An, sev: Int, id: Int, code: Int, msg: Str):
+  a.out.push(Note(a.t.sp[id], a.t.ep[id], sev, code, msg))
+  a.oid.push(id)
+
+fn warn(var a: An, id: Int, code: Int, msg: Str):
+  add_note(&a, WARN, id, code, msg)
+
+fn err(var a: An, id: Int, code: Int, msg: Str):
+  add_note(&a, ERR, id, code, msg)
+
+fn info(var a: An, id: Int, code: Int, msg: Str):
+  add_note(&a, INFO, id, code, msg)
+
+fn style(var a: An, id: Int, code: Int, msg: Str):
+  add_note(&a, STYLE, id, code, msg)
+
+fn kind(a: An, n: Int) -> Int:
+  return a.t.k[n]
+
+fn par(a: An, n: Int) -> Int:
+  return a.parent[n]
+
+# ---------------------------------------------------------------- tree helpers
+
+fn build_parents(var a: An):
+  a.parent = [-1] * a.t.k.len
+  var stack: [Int] = [a.root]
+  while stack.len > 0:
+    let n = stack.pop()
+    for c in ast.kids(a.t, n):
+      a.parent[c] = n
+      stack.push(c)
+
+# All nodes in ShellCheck's traversal order (pre-order).
+fn preorder(t: ast.Ast, root: Int) -> [Int]:
+  var out: [Int] = []
+  var stack: [Int] = [root]
+  while stack.len > 0:
+    let n = stack.pop()
+    out.push(n)
+    let ks = ast.kids(t, n)
+    var i = ks.len - 1
+    while i >= 0:
+      stack.push(ks[i])
+      i -= 1
   return out
+
+# Structural equality, ignoring positions (Haskell's Eq on Token).
+fn struct_eq(t: ast.Ast, x: Int, y: Int) -> Bool:
+  if x == y: return true
+  if x < 0 or y < 0: return false
+  if t.k[x] != t.k[y] or t.s[x] != t.s[y]: return false
+  let k = t.k[x]
+  if k != T_UnparsedIndex and t.f[x] != t.f[y]: return false
+  if not struct_eq(t, t.a[x], t.a[y]) or not struct_eq(t, t.b[x], t.b[y]) or not struct_eq(t, t.c[x], t.c[y]): return false
+  if t.n1[x] != t.n1[y] or t.n2[x] != t.n2[y]: return false
+  for i in 0..t.n1[x]:
+    if not struct_eq(t, ast.at1(t, x, i), ast.at1(t, y, i)): return false
+  if k == T_CaseExpression or k == T_IfExpression:
+    for i in 0..t.n2[x]:
+      if ast.at2(t, x, i) != ast.at2(t, y, i): return false
+  else:
+    for i in 0..t.n2[x]:
+      if not struct_eq(t, ast.at2(t, x, i), ast.at2(t, y, i)): return false
+  return true
+
+fn opt_is(x: Str?, v: Str) -> Bool:
+  if s = x: return s == v
+  return false
+
+fn is_var_start_c(b: Byte) -> Bool:
+  return b == '_' or (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z')
+
+fn is_var_char_c(b: Byte) -> Bool:
+  return is_var_start_c(b) or (b >= '0' and b <= '9')
+
+fn is_variable_name(s: Str) -> Bool:
+  if s.len == 0 or not is_var_start_c(s[0]): return false
+  for k in 1..s.len:
+    if not is_var_char_c(s[k]): return false
+  return true
+
+fn take_var_chars(s: Str, from: Int) -> Str:
+  var j = from
+  while j < s.len and is_var_char_c(s[j]): j += 1
+  return s[from..j]
+
+fn is_special_var_char(b: Byte) -> Bool:
+  return b == '*' or b == '@' or b == '#' or b == '?' or b == '-' or b == '$' or b == '!'
+
+# getBracedReference: the variable name in ${...}
+fn braced_reference(s: Str) -> Str:
+  # nameExpansion: ${!foo*} ${!foo@}
+  if s.len >= 2 and s[0] == '!' and is_var_char_c(s[1]):
+    var j = 2
+    while j < s.len and is_var_char_c(s[j]): j += 1
+    if j < s.len and (s[j] == '*' or s[j] == '?' or s[j] == '@'): return ""
+  var np = s
+  if s.len > 0 and (s[0] == '!' or s[0] == '#'): np = s[1..s.len]
+  let name = take_var_chars(np, 0)
+  if name.len > 0: return name
+  if np.len > 0 and is_special_var_char(np[0]): return np[0..1]
+  if s.len > 0 and is_special_var_char(s[0]): return s[0..1]
+  return s
+
+# getBracedModifier: what follows the name in ${...}
+fn braced_modifier(s: Str) -> Str:
+  let v = braced_reference(s)
+  var cands: [Str] = []
+  if s.len > 0 and (s[0] == '#' or s[0] == '!'):
+    cands.push(s[1..s.len])
+    cands.push(s + "")
+  else: cands.push(s + "")
+  for c in cands:
+    if c.startswith(v): return c[v.len..c.len]
+  return ""
+
+fn var_names_in(s: Str) -> [Str]:
+  # matchAllStrings "[_a-zA-Z][_a-zA-Z0-9]*"
+  var out: [Str] = []
+  var j = 0
+  while j < s.len:
+    if is_var_start_c(s[j]):
+      let st = j
+      while j < s.len and is_var_char_c(s[j]): j += 1
+      out.push(s[st..j])
+    else: j += 1
+  return out
+
+# getIndexReferences: names inside the outermost [...]
+fn index_references(s: Str) -> [Str]:
+  let a = s.find("[")
+  if a < 0:
+    let e: [Str] = []
+    return e
+  var b = s.len - 1
+  while b > a and s[b] != ']': b -= 1
+  if b <= a:
+    let e: [Str] = []
+    return e
+  return var_names_in(s[a..b + 1])
+
+fn offset_tail(m: Str, from: Int) -> Str?:
+  # " *:([^-=?+].*)" at from
+  var j = from
+  while j < m.len and m[j] == ' ': j += 1
+  if j >= m.len or m[j] != ':': return nil
+  j += 1
+  if j >= m.len: return nil
+  let c = m[j]
+  if c == '-' or c == '=' or c == '?' or c == '+': return nil
+  return m[j..m.len]
+
+# getOffsetReferences: names in the offset of ${var:offset:length}
+fn offset_references(m: Str) -> [Str]:
+  let e: [Str] = []
+  if m.len > 0 and m[0] == '[':
+    var j = m.len - 1
+    while j > 1:
+      if m[j] == ']':
+        if s = offset_tail(m, j + 1): return var_names_in(s)
+      j -= 1
+    return e
+  if s = offset_tail(m, 0): return var_names_in(s)
+  return e
+
+# getVariablesFromLiteral: names after $ or ${
+fn vars_from_literal(s: Str) -> [Str]:
+  var out: [Str] = []
+  var j = 0
+  while j < s.len:
+    if s[j] == '$':
+      var q = j + 1
+      if q < s.len and s[q] == '{': q += 1
+      let st = q
+      while q < s.len and is_var_char_c(s[q]): q += 1
+      if q > st:
+        out.push(s[st..q])
+        j = q
+        continue
+    j += 1
+  return out
+
+fn vars_from_literal_token(t: ast.Ast, n: Int) -> [Str]:
+  return vars_from_literal(lit_or(t, n, " "))
+
+fn get_literal_ext_glob(t: ast.Ast, n: Int, var out: Str) -> Bool:
+  # getLiteralStringExt toStr where globs give their text and other parts give "\0"
+  let k = t.k[n]
+  if k == T_DoubleQuoted or k == T_DollarDoubleQuoted or k == T_NormalWord or k == TA_Expansion:
+    for i in 0..t.n1[n]: get_literal_ext_glob(t, ast.at1(t, n, i), &out)
+    return true
+  if k == T_Glob:
+    out += t.s[n]
+    return true
+  lit_def(t, n, "\0", &out)
+  return true
+
+# getVariableForTestDashV
+fn var_for_test_dash_v(t: ast.Ast, n: Int) -> Str?:
+  var s = ""
+  get_literal_ext_glob(t, n, &s)
+  let k = s.find("[")
+  if k >= 0: s = s[0..k]
+  if not is_variable_name(s): return nil
+  return s
+
+fn is_closing_file_op(t: ast.Ast, op: Int) -> Bool:
+  if t.k[op] != T_IoDuplicate or t.s[op] != "-": return false
+  let o = t.a[op]
+  return t.k[o] == T_GREATAND or t.k[o] == T_LESSAND
+
+fn arg_words(t: ast.Ast, cmd: Int) -> [Int]:
+  var r: [Int] = []
+  for i in 1..t.n2[cmd]: r.push(ast.at2(t, cmd, i))
+  return r
+
+fn flag_strs(t: ast.Ast, cmd: Int) -> [Str]:
+  var r: [Str] = []
+  for f in all_flags(t, cmd): r.push(f.f + "")
+  return r
+
+fn any_in(xs: [Str], ys: [Str]) -> Bool:
+  for x in xs:
+    if x in ys: return true
+  return false
+
+# The literal text of a command's first word part, when the word starts with a literal.
+fn first_literal(t: ast.Ast, cmd: Int) -> Str?:
+  if t.k[cmd] != T_SimpleCommand or t.n2[cmd] == 0: return nil
+  let w = ast.at2(t, cmd, 0)
+  if t.k[w] != T_NormalWord or t.n1[w] == 0: return nil
+  let l = ast.at1(t, w, 0)
+  if t.k[l] != T_Literal: return nil
+  return t.s[l] + ""
+
+# ---------------------------------------------------------------- variable flow
+
+fn push_assign(var a: An, base: Int, tok: Int, name: Str, arr: Bool, src: Int, from: [Int]):
+  let st = a.srcs.len
+  for x in from: a.srcs.push(x)
+  a.flow.push(Flow(F_ASSIGN, base, tok, name, arr, src, st, from.len))
+
+fn push_ref(var a: An, base: Int, tok: Int, name: Str):
+  a.flow.push(Flow(F_REF, base, tok, name, false, 0, 0, 0))
+
+fn lead_type(a: An, n: Int) -> Str:
+  let k = a.t.k[n]
+  if k == T_DollarExpansion: return "$(..) expansion"
+  if k == T_Backticked: return "`..` expansion"
+  if k == T_Backgrounded: return "backgrounding &"
+  if k == T_Subshell: return "(..) group"
+  if k == T_BatsTest: return "@bats test"
+  if k == T_CoProcBody: return "coproc"
+  if k == T_Redirecting:
+    let p = a.parent[n]
+    if p >= 0 and a.t.k[p] == T_Pipeline and a.t.n2[p] >= 2:
+      if not a.lastpipe or ast.last2(a.t, p) != n: return "pipeline"
+  return ""
+
+fn assign_first(k: Int) -> Bool:
+  return k == T_ForIn or k == T_SelectIn or k == T_BatsTest
+
+fn build_flow(var a: An):
+  # doStackAnalysis startScope endScope
+  var stack: [Int] = [a.root]
+  var state: [Int] = [0]
+  while stack.len > 0:
+    let n = stack[stack.len - 1]
+    let st = state[state.len - 1]
+    if st == 0:
+      state[state.len - 1] = 1
+      let reason = lead_type(a, n)
+      if reason.len > 0: a.flow.push(Flow(F_SCOPE, -1, -1, reason, false, 0, 0, 0))
+      if assign_first(a.t.k[n]): set_written(&a, n)
+      let ks = ast.kids(a.t, n)
+      var i = ks.len - 1
+      while i >= 0:
+        stack.push(ks[i])
+        state.push(0)
+        i -= 1
+    else:
+      stack.pop()
+      state.pop()
+      set_read(&a, n)
+      if not assign_first(a.t.k[n]): set_written(&a, n)
+      if lead_type(a, n).len > 0: a.flow.push(Flow(F_END, -1, -1, "", false, 0, 0, 0))
+
+fn is_arithmetic_assignment_lhs(a: An, n: Int) -> Bool:
+  let p = a.parent[n]
+  if p < 0 or a.t.k[p] != TA_Assignment or a.t.s[p] != "=": return false
+  return struct_eq(a.t, a.t.a[p], n)
+
+fn if_reference(var a: An, ctx: Int, tok: Int):
+  if s = var_for_test_dash_v(a.t, tok):
+    push_ref(&a, ctx, tok, braced_reference(s))
+
+fn set_read(var a: An, n: Int):
+  let k = a.t.k[n]
+  if k == T_DollarBraced:
+    let l = a.t.a[n]
+    let s = oversimp(a.t, l)
+    push_ref(&a, n, n, braced_reference(s))
+    for x in index_references(s): push_ref(&a, l, l, x)
+    for x in offset_references(braced_modifier(s)): push_ref(&a, l, l, x)
+  elif k == TA_Variable:
+    if not is_arithmetic_assignment_lhs(a, n): push_ref(&a, n, n, a.t.s[n] + "")
+  elif k == T_Assignment:
+    let name = a.t.s[n] + ""
+    if a.t.f[n] == 1: push_ref(&a, n, n, name)
+    if name in ["PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND"]:
+      for x in vars_from_literal_token(a.t, a.t.a[n]): push_ref(&a, n, n, x)
+  elif k == TC_Unary:
+    if a.t.s[n] == "-v" or a.t.s[n] == "-R": if_reference(&a, n, a.t.a[n])
+  elif k == TC_Binary:
+    if a.t.f[n] == DOUBLE and a.t.s[n] in ["-eq", "-ne", "-lt", "-le", "-gt", "-ge"]:
+      if_reference(&a, n, a.t.a[n])
+      if_reference(&a, n, a.t.b[n])
+  elif k == T_BatsTest:
+    push_ref(&a, n, n, "lines")
+    push_ref(&a, n, n, "status")
+    push_ref(&a, n, n, "output")
+  elif k == T_FdRedirect:
+    let v = a.t.s[n]
+    if v.startswith("{{") and is_closing_file_op(a.t, a.t.a[n]):
+      var e = v.find("}}")
+      if e < 0: e = v.len
+      push_ref(&a, n, n, v[1..e])
+  elif k == T_SimpleCommand:
+    referenced_command(&a, n)
+
+fn referenced_command(var a: An, base: Int):
+  let x = first_literal(a.t, base) else return
+  let rest = arg_words(a.t, base)
+  if x == "declare" or x == "typeset":
+    let flags = flag_strs(a.t, base)
+    if any_in(["x", "p"], flags) and not any_in(["f", "F"], flags):
+      for r in rest: get_reference(&a, r)
+  elif x == "export":
+    if not ("f" in flag_strs(a.t, base)):
+      for r in rest: get_reference(&a, r)
+  elif x == "local":
+    if "x" in flag_strs(a.t, base):
+      for r in rest: get_reference(&a, r)
+  elif x == "trap":
+    if rest.len > 0:
+      for v in vars_from_literal_token(a.t, rest[0]): push_ref(&a, base, rest[0], v)
+  elif x == "alias":
+    for r in rest:
+      for v in vars_from_literal_token(a.t, r): push_ref(&a, base, r, v)
+
+fn get_reference(var a: An, r: Int):
+  if a.t.k[r] == T_Assignment:
+    push_ref(&a, r, r, a.t.s[r] + "")
+  elif a.t.k[r] == T_NormalWord and a.t.n1[r] == 1:
+    let l = ast.at1(a.t, r, 0)
+    if a.t.k[l] == T_Literal and not a.t.s[l].startswith("-"): push_ref(&a, r, r, a.t.s[l] + "")
+
+fn set_written(var a: An, n: Int):
+  let k = a.t.k[n]
+  let none: [Int] = []
+  if k == T_SimpleCommand:
+    if a.t.n2[n] == 0:
+      for i in 0..a.t.n1[n]:
+        let x = ast.at1(a.t, n, i)
+        if a.t.k[x] == T_Assignment:
+          let w = a.t.a[x]
+          push_assign(&a, x, x, a.t.s[x] + "", a.t.k[w] == T_Array, SRC_FROM, [w])
+    else: modified_command(&a, n, n, 0)
+  elif k == TA_Unary:
+    let v = a.t.a[n]
+    if a.t.k[v] == TA_Variable and (a.t.s[n].find("--") >= 0 or a.t.s[n].find("++") >= 0):
+      push_assign(&a, n, v, a.t.s[v] + "", false, SRC_INT, none)
+  elif k == TA_Assignment:
+    let v = a.t.a[n]
+    if a.t.k[v] == TA_Variable and a.t.s[n] in ["=", "*=", "/=", "%=", "+=", "-=", "<<=", ">>=", "&=", "^=", "|="]:
+      push_assign(&a, n, n, a.t.s[v] + "", false, SRC_INT, none)
+  elif k == T_BatsTest:
+    push_assign(&a, n, n, "lines", true, SRC_EXTERNAL, none)
+    push_assign(&a, n, n, "status", false, SRC_INT, none)
+    push_assign(&a, n, n, "output", false, SRC_EXTERNAL, none)
+    push_assign(&a, n, n, "stderr", false, SRC_EXTERNAL, none)
+    push_assign(&a, n, n, "stderr_lines", true, SRC_EXTERNAL, none)
+  elif k == TC_Unary:
+    let op = a.t.s[n]
+    if op == "-v":
+      if s = var_for_test_dash_v(a.t, a.t.a[n]): push_assign(&a, n, a.t.a[n], s, false, SRC_CHECKED, none)
+    elif op == "-n" or op == "-z": mark_checked(&a, n, a.t.a[n])
+  elif k == TC_Nullary:
+    mark_checked(&a, n, a.t.a[n])
+  elif k == T_DollarBraced:
+    let l = a.t.a[n]
+    let s = oversimp(a.t, l)
+    let m = braced_modifier(s)
+    if m.startswith("=") or m.startswith(":="):
+      push_assign(&a, n, n, braced_reference(s), false, SRC_FROM, [l])
+  elif k == T_FdRedirect:
+    let v = a.t.s[n]
+    if v.startswith("{{") and not is_closing_file_op(a.t, a.t.a[n]):
+      var e = v.find("}}")
+      if e < 0: e = v.len
+      push_assign(&a, n, n, v[1..e], false, SRC_INT, none)
+  elif k == T_CoProc:
+    if a.t.a[n] < 0: push_assign(&a, n, n, "COPROC", true, SRC_INT, none)
+    elif s = get_literal(a.t, a.t.a[n]): push_assign(&a, n, n, s, true, SRC_INT, none)
+  elif k == T_ForIn:
+    if a.t.n1[n] == 0: push_assign(&a, n, n, a.t.s[n] + "", false, SRC_EXTERNAL, none)
+    else: push_assign(&a, n, n, a.t.s[n] + "", false, SRC_FROM, ast.list1(a.t, n))
+  elif k == T_SelectIn:
+    push_assign(&a, n, n, a.t.s[n] + "", false, SRC_FROM, ast.list1(a.t, n))
+
+fn mark_checked(var a: An, place: Int, tok: Int):
+  let none: [Int] = []
+  for x in word_parts(a.t, tok):
+    if a.t.k[x] == T_DollarBraced:
+      let s = braced_reference(oversimp(a.t, a.t.a[x]))
+      if is_variable_name(s): push_assign(&a, place, x, s, false, SRC_CHECKED, none)
+
+# A literal argument as an assigned name (unless it starts with a dash).
+fn lit_assign(var a: An, base: Int, tok: Int, arr: Bool) -> Bool:
+  let none: [Int] = []
+  let s = get_literal(a.t, tok) else return false
+  if s.startswith("-"): return false
+  push_assign(&a, base, tok, s, arr, SRC_EXTERNAL, none)
+  return true
+
+fn modifier_param(var a: An, base: Int, tok: Int, arr: Bool):
+  let none: [Int] = []
+  if a.t.k[tok] == T_Assignment:
+    let v = a.t.a[tok]
+    if not a.t.s[tok].startswith("-"): push_assign(&a, base, tok, a.t.s[tok] + "", arr or a.t.k[v] == T_Array, SRC_FROM, [v])
+  elif a.t.k[tok] == T_NormalWord:
+    if s = get_literal(a.t, tok):
+      if is_variable_name(s): push_assign(&a, base, tok, s, arr, SRC_DECL, none)
+
+fn set_params(t: ast.Ast, args: [Int], from: Int, var out: [Int]) -> Bool:
+  # getSetParams; false is Nothing
+  if from >= args.len: return false
+  let tok = args[from]
+  let s = get_literal(t, tok)
+  if from + 1 < args.len and opt_is(s, "-o"): return set_params(t, args, from + 2, &out)
+  if x = s:
+    if x == "--":
+      for k in from + 1..args.len: out.push(args[k])
+      return true
+    if x.startswith("-"): return set_params(t, args, from + 1, &out)
+  out.push(tok)
+  set_params(t, args, from + 1, &out)
+  return true
+
+fn generic_opts(t: ast.Ast, args: [Int]) -> [Opt]:
+  var out: [Opt] = []
+  var i = 0
+  while i < args.len:
+    let token = args[i]
+    let s = lit_or(t, token, "\0")
+    if s == "--":
+      for k in i + 1..args.len: out.push(Opt("", args[k], args[k]))
+      return out
+    if s.startswith("--"):
+      var j = 2
+      while j < s.len and s[j] != '\0' and s[j] != '=': j += 1
+      out.push(Opt(s[2..j], token, token))
+      i += 1
+      continue
+    if s.startswith("-"):
+      var j = 1
+      while j < s.len and s[j] != '\0': j += 1
+      let opts = s[1..j]
+      if i + 1 < args.len and lit_or(t, args[i + 1], "\0").startswith("-"):
+        for c in 0..opts.len: out.push(Opt(opts[c..c + 1], token, token))
+        i += 1
+        continue
+      if i + 1 < args.len:
+        if opts.len > 0:
+          for c in 0..opts.len - 1: out.push(Opt(opts[c..c + 1], token, token))
+          out.push(Opt(opts[opts.len - 1..opts.len], token, args[i + 1]))
+        i += 2
+        continue
+      for c in 0..opts.len: out.push(Opt(opts[c..c + 1], token, token))
+      i += 1
+      continue
+    out.push(Opt("", token, token))
+    i += 1
+  return out
+
+fn flag_assigned_var(var a: An, base: Int, flag: Str, opts: [Opt], src: Int, from: [Int]):
+  for o in opts:
+    if o.name == flag:
+      let name = lit_or(a.t, o.val, "!")
+      let k = name.find("[")
+      if k >= 0: push_assign(&a, base, o.val, name[0..k], true, src, from)
+      else: push_assign(&a, base, o.val, name, false, src, from)
+      return
+
+fn modified_command(var a: An, base: Int, cmd: Int, skip: Int):
+  # getModifiedVariableCommand, on the words of cmd after `skip` leading words (for builtin)
+  if a.t.n2[cmd] <= skip: return
+  let w0 = ast.at2(a.t, cmd, skip)
+  if a.t.k[w0] != T_NormalWord or a.t.n1[w0] == 0: return
+  let l0 = ast.at1(a.t, w0, 0)
+  if a.t.k[l0] != T_Literal: return
+  let x = a.t.s[l0] + ""
+  var rest: [Int] = []
+  for i in skip + 1..a.t.n2[cmd]: rest.push(ast.at2(a.t, cmd, i))
+  let n0 = a.flow.len
+  let none: [Int] = []
+  if x == "builtin":
+    modified_command(&a, base, cmd, skip + 1)
+    return
+  if x == "read":
+    var done = false
+    let ls: [Str] = []
+    let la: [Bool] = []
+    if parsed = astlib.get_opts(a.t, true, false, "sreu:n:N:i:p:a:t:", ls, la, rest):
+      var arr = -1
+      for o in parsed:
+        if o.name == "a" and arr < 0: arr = o.val
+      if arr >= 0:
+        if lit_assign(&a, base, arr, true): done = true
+      else:
+        for o in parsed:
+          if o.name.len == 0: lit_assign(&a, base, o.val, false)
+        done = true
+    if not done:
+      # fallback: trailing literal arguments
+      var names: [Int] = []
+      var k = rest.len - 1
+      while k >= 0:
+        let s = get_literal(a.t, rest[k]) else break
+        if s.startswith("-"): break
+        names.push(rest[k])
+        k -= 1
+      for nm in names: lit_assign(&a, base, nm, false)
+  elif x == "getopts":
+    if rest.len >= 2: lit_assign(&a, base, rest[1], false)
+  elif x == "let":
+    for tok in rest:
+      var s = oversimp(a.t, tok)
+      var j = 0
+      while j < s.len and (s[j] == '+' or s[j] == '-'): j += 1
+      let v = take_var_chars(s, j)
+      if v.len > 0: push_assign(&a, base, tok, v, false, SRC_FROM, [tok])
+  elif x == "export":
+    if not ("f" in flag_strs(a.t, cmd)):
+      for r in rest: modifier_param(&a, base, r, false)
+  elif x == "declare" or x == "typeset":
+    let flags = flag_strs(a.t, cmd)
+    if not any_in(["F", "f", "p"], flags):
+      let arr = any_in(["a", "A"], flags)
+      for r in rest: modifier_param(&a, base, r, arr)
+  elif x == "local":
+    for r in rest: modifier_param(&a, base, r, false)
+  elif x == "readonly":
+    if not any_in(["f", "p"], flag_strs(a.t, cmd)):
+      for r in rest: modifier_param(&a, base, r, false)
+  elif x == "set":
+    var ps: [Int] = []
+    if set_params(a.t, rest, 0, &ps): push_assign(&a, base, base, "@", false, SRC_FROM, ps)
+  elif x == "printf":
+    let ls: [Str] = []
+    let la: [Bool] = []
+    if opts = astlib.get_opts(a.t, false, false, "v:", ls, la, rest): flag_assigned_var(&a, base, "v", opts, SRC_FROM, rest)
+  elif x == "wait":
+    flag_assigned_var(&a, base, "p", generic_opts(a.t, rest), SRC_INT, none)
+  elif x == "mapfile" or x == "readarray":
+    var done = false
+    let ls: [Str] = []
+    let la: [Bool] = []
+    if opts = astlib.get_opts(a.t, true, false, "d:n:O:s:u:C:c:t", ls, la, rest):
+      var first = -1
+      for o in opts:
+        if o.name.len == 0 and first < 0: first = o.val
+      if first < 0:
+        push_assign(&a, base, base, "MAPFILE", true, SRC_EXTERNAL, none)
+        done = true
+      elif s = get_literal(a.t, first):
+        if is_variable_name(s):
+          push_assign(&a, base, first, s, true, SRC_EXTERNAL, none)
+          done = true
+    if not done:
+      var k = rest.len - 1
+      while k >= 0:
+        if s = get_literal(a.t, rest[k]):
+          if is_variable_name(s):
+            push_assign(&a, base, rest[k], s, true, SRC_EXTERNAL, none)
+            break
+        k -= 1
+  elif x == "DEFINE_boolean" or x == "DEFINE_float" or x == "DEFINE_integer" or x == "DEFINE_string":
+    if rest.len >= 2:
+      if s = get_literal(a.t, rest[0]): push_assign(&a, base, rest[0], "FLAGS_" + s, false, SRC_EXTERNAL, none)
+  # names starting with a dash aren't variables
+  var bad = false
+  for k in n0..a.flow.len:
+    if a.flow[k].name.startswith("-"): bad = true
+  if bad:
+    var kept: [Flow] = []
+    while a.flow.len > n0:
+      let f = a.flow.pop()
+      if not f.name.startswith("-"): kept.push(f)
+    while kept.len > 0: a.flow.push(kept.pop())
+
+fn is_true_assignment_source(f: Flow) -> Bool:
+  return not (f.src == SRC_CHECKED or f.src == SRC_DECL)
+
+# ---------------------------------------------------------------- the analysis
+
+fn shell_for(name: Str) -> Int:
+  if name == "sh": return SH_SH
+  if name == "bash" or name == "bats": return SH_BASH
+  if name == "busybox" or name == "busybox sh" or name == "busybox ash": return SH_BUSYBOX
+  if name == "dash" or name == "ash": return SH_DASH
+  if name == "ksh" or name == "ksh88" or name == "ksh93" or name == "oksh": return SH_KSH
+  return -1
+
+fn fallback_shell(path: Str) -> Int:
+  if path.endswith(".ksh"): return SH_KSH
+  if path.endswith(".bash") or path.endswith(".bats"): return SH_BASH
+  if path.endswith(".dash"): return SH_DASH
+  return -1
+
+fn root_script(t: ast.Ast, root: Int) -> Int:
+  if t.k[root] == T_Annotation: return t.a[root]
+  return root
+
+fn shebang_text(t: ast.Ast, root: Int) -> Str:
+  let s = root_script(t, root)
+  return t.s[t.a[s]] + ""
+
+fn determine_shell(t: ast.Ast, root: Int, path: Str) -> Int:
+  var cand = parse.executable_from_shebang(shebang_text(t, root))
+  if t.k[root] == T_Annotation:
+    for an in t.anns[t.f[root]]:
+      if an.kind == ANN_SHELL:
+        cand = an.s + ""
+        break
+  let s = shell_for(cand)
+  if s >= 0: return s
+  let f = fallback_shell(path)
+  if f >= 0: return f
+  return SH_BASH
+
+fn analyze(var t: ast.Ast, root: Int, path: Str) -> [Note]:
+  var a = An(ast.new_ast(), root, [], SH_BASH, false, false, [], [], [], [], path + "", {}, dfa.new_result(), false)
+  swap(&a.t, &t)
+  build_parents(&a)
+  a.shell = determine_shell(a.t, root, path)
+  a.shell_specified = fallback_shell(path) >= 0
+  a.lastpipe = false
+  if a.shell == SH_KSH: a.lastpipe = true
+  elif a.shell == SH_BASH: a.lastpipe = is_option_set(a, "lastpipe")
+  build_flow(&a)
+  run_cfg(&a)
+  run_checks(&a)
+  var out = filter_by_annotation(a)
+  swap(&a.t, &t)
+  return out
+
+fn ann_ignores(a: An, n: Int, code: Int) -> Bool:
+  if a.t.k[n] != T_Annotation: return false
+  for an in a.t.anns[a.t.f[n]]:
+    if an.kind == ANN_DISABLE and code >= an.lo and code < an.hi: return true
+  return false
+
+fn filter_by_annotation(a: An) -> [Note]:
+  var out: [Note] = []
+  for i in 0..a.out.len:
+    let n = a.out[i]
+    var x = a.parent[a.oid[i]]
+    var ignored = false
+    while x >= 0:
+      if ann_ignores(a, x, n.code):
+        ignored = true
+        break
+      x = a.parent[x]
+    if not ignored: out.push(parse.ncopy(n))
+  return out
+
+fn is_unqualified_command(t: ast.Ast, n: Int, name: Str) -> Bool:
+  if s = astlib.command_name(t, n): return s == name
+  return false
+
+fn is_command(t: ast.Ast, n: Int, name: Str) -> Bool:
+  if s = astlib.command_name(t, n): return s == name or s.endswith("/" + name)
+  return false
+
+# isOptionSet: shopt -s opt or set -o opt anywhere
+fn is_option_set(a: An, opt: Str) -> Bool:
+  for n in preorder(a.t, a.root):
+    if a.t.k[n] == T_SimpleCommand:
+      if is_unqualified_command(a.t, n, "shopt"):
+        var ws: [Str] = []
+        astlib.oversimplify(a.t, n, &ws)
+        if opt in ws: return true
+      if is_unqualified_command(a.t, n, "set"):
+        var ws: [Str] = []
+        astlib.oversimplify(a.t, n, &ws)
+        if opt in ws or "o" in flag_strs(a.t, n): return true
+  return false
+
+fn run_checks(var a: An):
+  check_unused_assignments(&a)
+  check_unassigned_references(&a)
+  check_shebang(&a)
+  check_array_without_index(&a)
+  check_subshell_assignment(&a)
+  let nodes = preorder(a.t, a.root)
+  for n in nodes:
+    node_checks(&a, n)
+
+fn node_checks(var a: An, n: Int):
+  let k = a.t.k[n]
+  if k == T_SingleQuoted: check_single_quoted_variables(&a, n)
+  elif k == T_DollarBraced: check_spacefulness(&a, n)
+  elif k == T_Pipeline or k == T_Function: check_unreachable(&a, n)
+
+# ---------------------------------------------------------------- control flow
+
+fn run_cfg(var a: An):
+  var t = ast.new_ast()
+  swap(&t, &a.t)
+  var dummy = ast.new_ast()
+  var g = cfg.build_graph(t, a.root, a.lastpipe, &dummy)
+  cfg.simplify(&g)
+  var res = dfa.new_result()
+  dfa.analyze(&g, a.root, &res)
+  swap(&a.t, &g.t)
+  swap(&a.trange, &g.trange)
+  a.cfg_ok = res.ok
+  a.res = res
+
+# getIncomingState: the state at the start of a token's range; nil when it has none
+fn incoming_state(var a: An, id: Int) -> dfa.St?:
+  if not (id in a.trange): return nil
+  return dfa.incoming(&a.res, cfg.rs(a.trange[id]))
+
+fn is_unreachable(var a: An, id: Int) -> Bool:
+  if s = incoming_state(&a, id): return not dfa.reachable(s)
+  return false
+
+fn is_unreachable_function(var a: An, n: Int) -> Bool:
+  if a.t.k[n] != T_Function: return false
+  return is_unreachable(&a, a.t.a[n])
+
+fn is_sourced(a: An, n: Int) -> Bool:
+  var x = n
+  while x >= 0:
+    if a.t.k[x] == T_SourceCommand: return true
+    x = a.parent[x]
+  return false
+
+fn check_unreachable(var a: An, n: Int):
+  if a.t.k[n] == T_Pipeline:
+    if not is_unreachable(&a, n): return
+    if is_sourced(a, n): return
+    var x = a.parent[n]
+    while x >= 0:
+      if is_unreachable(&a, x) or is_unreachable_function(&a, x): return
+      x = a.parent[x]
+    info(&a, n, 2317, "Command appears to be unreachable. Check usage (or ignore if invoked indirectly).")
+  else:
+    if not is_unreachable_function(&a, n): return
+    var x = a.parent[n]
+    while x >= 0:
+      if is_unreachable_function(&a, x): return
+      x = a.parent[x]
+    if is_sourced(a, n): return
+    info(&a, n, 2329, "This function is never invoked. Check usage (or ignored if invoked indirectly).")
+
+# ---------------------------------------------------------------- quoting helpers
+
+fn assignment_is_quoting(a: An, id: Int) -> Bool:
+  if a.shell != SH_SH: return true
+  let p = a.parent[id]
+  if p >= 0 and a.t.k[p] == T_SimpleCommand:
+    for i in 1..a.t.n2[p]:
+      if ast.at2(a.t, p, i) == id: return false
+  return true
+
+# isQuoteFreeNode strict
+fn is_quote_free_node(a: An, strict: Bool, n: Int) -> Bool:
+  let k = a.t.k[n]
+  if k == T_Assignment: 
+    if assignment_is_quoting(a, n): return true
+  elif k == T_FdRedirect: return true
+  var x = a.parent[n]
+  while x >= 0:
+    let xk = a.t.k[x]
+    if xk == TC_Nullary or xk == TC_Unary or xk == TC_Binary:
+      if a.t.f[x] == DOUBLE: return true
+    elif xk == TA_Sequence or xk == T_Arithmetic or xk == T_DoubleQuoted or xk == T_DollarDoubleQuoted or xk == T_CaseExpression or xk == T_HereDoc or xk == T_DollarBraced:
+      return true
+    elif xk == T_Assignment: return assignment_is_quoting(a, x)
+    elif xk == T_Redirecting: return false
+    elif xk == T_ForIn or xk == T_SelectIn: return not strict
+    x = a.parent[x]
+  return false
+
+fn is_quote_free(a: An, n: Int) -> Bool:
+  return is_quote_free_node(a, false, n)
+
+fn is_strictly_quote_free(a: An, n: Int) -> Bool:
+  return is_quote_free_node(a, true, n)
+
+fn used_as_command_name(a: An, n: Int) -> Bool:
+  var cur = n
+  var x = a.parent[n]
+  while x >= 0:
+    let k = a.t.k[x]
+    if (k == T_NormalWord or k == T_DoubleQuoted) and a.t.n1[x] == 1 and ast.at1(a.t, x, 0) == cur:
+      cur = x
+      x = a.parent[x]
+      continue
+    if k == T_SimpleCommand and a.t.n2[x] > 0:
+      if ast.at2(a.t, x, 0) == cur: return true
+      var tok = 0
+      astlib.command_name_token(a.t, x, false, &tok)
+      return tok == cur
+    return false
+  return false
+
+fn is_param_to(a: An, n: Int, cmd: Str) -> Bool:
+  var x = a.parent[n]
+  while x >= 0:
+    let k = a.t.k[x]
+    if k == T_SingleQuoted or k == T_DoubleQuoted or k == T_NormalWord:
+      x = a.parent[x]
+      continue
+    if k == T_SimpleCommand or k == T_Redirecting: return is_command(a.t, x, cmd)
+    return false
+  return false
+
+fn is_counting_reference(a: An, n: Int) -> Bool:
+  return a.t.k[n] == T_DollarBraced and oversimp(a.t, a.t.a[n]).startswith("#")
+
+fn is_quoted_alternative_reference(a: An, n: Int) -> Bool:
+  if a.t.k[n] != T_DollarBraced: return false
+  let m = braced_modifier(oversimp(a.t, a.t.a[n]))
+  for i in 0..m.len:
+    if i == 0 or m[i - 1] == ']' or m[i - 1] == '\n':
+      if m[i] == '+' or (m[i] == ':' and i + 1 < m.len and m[i + 1] == '+'): return true
+  return false
+
+fn is_array_expansion(a: An, n: Int) -> Bool:
+  if a.t.k[n] != T_DollarBraced: return false
+  let s = oversimp(a.t, a.t.a[n])
+  return s.startswith("@") or (not s.startswith("#") and s.find("[@]") >= 0)
+
+fn quotes_may_conflict_2281(a: An, n: Int) -> Bool:
+  let w = a.parent[n]
+  if w < 0 or a.t.k[w] != T_NormalWord or a.t.n1[w] < 2: return false
+  if ast.at1(a.t, w, 0) != n: return false
+  let l = ast.at1(a.t, w, 1)
+  if a.t.k[l] != T_Literal or not a.t.s[l].startswith("="): return false
+  let sc = a.parent[w]
+  if sc < 0 or a.t.k[sc] != T_SimpleCommand or a.t.n2[sc] == 0: return false
+  return ast.at2(a.t, sc, 0) == w
+
+# ---------------------------------------------------------------- SC2086, SC2223
+
+fn check_spacefulness(var a: An, n: Int):
+  let s = oversimp(a.t, a.t.a[n])
+  let name = braced_reference(s)
+  if is_array_expansion(a, n) or is_counting_reference(a, n) or is_quote_free(a, n) or is_quoted_alternative_reference(a, n) or used_as_command_name(a, n): return
+  var clean = false
+  if st = incoming_state(&a, n):
+    let v = dfa.var_state(a.res, st, name)
+    if v >= 0: clean = dfa.all_have(dfa.vs_props(v), cfg.VP_INTEGER) or dfa.vs_space(v) == dfa.SP_CLEAN
+  if clean: return
+  if name in data.special_variables_without_spaces() or quotes_may_conflict_2281(a, n): return
+  let m = braced_modifier(s)
+  if (m.startswith("=") or m.startswith(":=")) and is_param_to(a, n, ":"):
+    info(&a, n, 2223, "This default assignment may cause DoS due to globbing. Quote it.")
+  else:
+    info(&a, n, 2086, "Double quote to prevent globbing and word splitting.")
+
+# ---------------------------------------------------------------- SC2034
+
+fn check_unused_assignments(var a: An):
+  var refs: {Str: Bool} = {}
+  for v in data.internal_variables(): refs[v] = true
+  for f in a.flow:
+    if f.kind == F_REF: refs[take_var_chars(f.name, 0)] = true
+  var assigned: {Str: Int} = {}
+  for f in a.flow:
+    if f.kind == F_ASSIGN and is_variable_name(f.name): assigned[f.name] = f.tok
+  for name, tok in assigned:
+    if not (name in refs) and not name.startswith("_"):
+      warn(&a, tok, 2034, name + " appears unused. Verify use (or export if used externally).")
+
+# ---------------------------------------------------------------- SC2154, SC2153
+
+fn edit_distance(x: Str, y: Str) -> Int:
+  let cx = x.codes()
+  let cy = y.codes()
+  var prev: [Int] = []
+  for j in 0..cy.len + 1: prev.push(j)
+  for i in 1..cx.len + 1:
+    var cur: [Int] = [i]
+    for j in 1..cy.len + 1:
+      var v = prev[j - 1]
+      if cx[i - 1] != cy[j - 1]:
+        v = 1 + min(prev[j], prev[j - 1], cur[j - 1])
+      cur.push(v)
+    prev = cur
+  return prev[cy.len]
+
+fn match_score(v: Str, c: Str) -> Int:
+  if v != c and v.lower() == c.lower(): return 1
+  return edit_distance(v, c)
+
+fn best_match(v: Str, written: [Str]) -> Str?:
+  var best = ""
+  var score = -1
+  let vl = v.char_count()
+  for w in written:
+    # a candidate can only score 2 or less when the lengths differ by 2 at most
+    let d = w.char_count() - vl
+    if d > 2 or d < -2: continue
+    let s = match_score(v, w)
+    if score < 0 or s < score:
+      score = s
+      best = w + ""
+  if score < 0 or score > 2: return nil
+  let l = best.char_count()
+  if (l > 3 and score <= 1) or (l > 7 and score <= 2): return best
+  return nil
+
+fn is_guarded(a: An, n: Int) -> Bool:
+  if a.t.k[n] != T_DollarBraced: return false
+  let name = oversimp(a.t, a.t.a[n])
+  var j = 0
+  while j < name.len and (name[j] == '#' or name[j] == '!'): j += 1
+  while j < name.len and is_var_char_c(name[j]): j += 1
+  let rest = name[j..name.len]
+  if guard_tail(rest, 0): return true
+  if rest.startswith("["):
+    for q in 1..rest.len:
+      if rest[q] == ']' and guard_tail(rest, q + 1): return true
+  return false
+
+fn guard_tail(s: Str, from: Int) -> Bool:
+  var j = from
+  if j < s.len and s[j] == ':': j += 1
+  return j < s.len and (s[j] == '-' or s[j] == '?')
+
+fn is_exception(a: An, v: Str, place: Int) -> Bool:
+  var x = place
+  while x >= 0:
+    if a.t.k[x] == T_DollarBraced:
+      let s = oversimp(a.t, a.t.a[x])
+      let m = braced_modifier(s)
+      if braced_reference(s) != v or m.startswith("+") or m.startswith(":+"): return true
+    x = a.parent[x]
+  return false
+
+fn has_lower(s: Str) -> Bool:
+  for k in 0..s.len:
+    if s[k] >= 'a' and s[k] <= 'z': return true
+  return false
+
+fn check_unassigned_references(var a: An):
+  var read: {Str: Int} = {}
+  var written: {Str: Bool} = {}
+  for f in a.flow:
+    if f.kind == F_ASSIGN: written[f.name] = true
+    elif f.kind == F_REF:
+      if not (f.name in read): read[f.name] = f.tok
+  var defaults: {Str: Bool} = {}
+  for v in data.internal_variables():
+    if v.len > 0: defaults[v] = true
+  var wv: [Str] = []
+  for w in written:
+    if is_variable_name(w): wv.push(w + "")
+  wv.sort()
+  for v, place in read:
+    if v in written or v in defaults: continue
+    if not is_variable_name(v): continue
+    if is_exception(a, v, place) or is_guarded(a, place): continue
+    if has_lower(v):
+      var tip = ""
+      if parse.is_common_command(v): tip = " (for output from commands, use \"$(" + v + " ..." + ")\" )"
+      elif m = best_match(v, wv): tip = " (did you mean '" + m + "'?)"
+      warn(&a, place, 2154, v + " is referenced but not assigned" + tip + ".")
+    elif m = best_match(v, wv):
+      info(&a, place, 2153, "Possible misspelling: " + v + " may not be assigned. Did you mean " + m + "?")
+
+# ---------------------------------------------------------------- shebang
+
+fn check_shebang(var a: An):
+  let scr = root_script(a.t, a.root)
+  let sbn = a.t.a[scr]
+  let sb = a.t.s[sbn] + ""
+  # checkShebangParameters
+  let ws = sb.split()
+  if ws.len > 2 and not env_split(sb): err(&a, sbn, 2096, "On most OS, shebangs can only specify a single parameter.")
+  if a.t.k[a.root] == T_Annotation:
+    for an in a.t.anns[a.t.f[a.root]]:
+      if an.kind == ANN_SHELL: return
+  if not a.shell_specified:
+    if sb.len == 0: err(&a, sbn, 2148, "Tips depend on target shell and yours is unknown. Add a shebang or a 'shell' directive.")
+    if parse.executable_from_shebang(sb) == "ash": warn(&a, sbn, 2187, "Ash scripts will be checked as Dash. Add '# shellcheck shell=dash' to silence.")
+  if sb.len > 0:
+    if not sb.startswith("/"): err(&a, sbn, 2239, "Ensure the shebang uses an absolute path to the interpreter.")
+    if ws.len > 0 and ws[0].endswith("/"): err(&a, sbn, 2246, "This shebang specifies a directory. Ensure the interpreter is a file.")
+
+fn env_split(s: Str) -> Bool:
+  # "env +(-S|--split-string)"
+  var j = 0
+  while true:
+    let k = s.find("env ", j)
+    if k < 0: return false
+    var q = k + 3
+    while q < s.len and s[q] == ' ': q += 1
+    let r = s[q..s.len]
+    if r.startswith("-S") or r.startswith("--split-string"): return true
+    j = k + 1
+  return false
+
+# ---------------------------------------------------------------- SC2016
+
+fn closest_command(a: An, n: Int) -> Int:
+  var x = n
+  while x >= 0:
+    let k = a.t.k[x]
+    if k == T_Redirecting: return x
+    if k == T_Script: return -1
+    x = a.parent[x]
+  return -1
+
+fn command_basename(t: ast.Ast, n: Int) -> Str?:
+  let s = astlib.command_name(t, n) else return nil
+  return parse.basename(s)
+
+fn sq_has_expansion(s: Str) -> Bool:
+  # "\$[{(0-9a-zA-Z_]|`[^`]+`"
+  for j in 0..s.len:
+    let c = s[j]
+    if c == '$' and j + 1 < s.len:
+      let d = s[j + 1]
+      if d == '{' or d == '(' or is_var_char_c(d): return true
+    if c == '`':
+      var q = j + 1
+      while q < s.len and s[q] != '`' and s[q] != '\n': q += 1
+      if q < s.len and s[q] == '`' and q > j + 1: return true
+  return false
+
+fn sed_contra(s: Str) -> Bool:
+  # "\$[{dpsaic]($|[^a-zA-Z])"
+  for j in 0..s.len:
+    if s[j] == '$' and j + 1 < s.len:
+      let d = s[j + 1]
+      if d == '{' or d == 'd' or d == 'p' or d == 's' or d == 'a' or d == 'i' or d == 'c':
+        if j + 2 >= s.len: return true
+        let e = s[j + 2]
+        if not ((e >= 'a' and e <= 'z') or (e >= 'A' and e <= 'Z')): return true
+  return false
+
+fn words_literal(t: ast.Ast, cmd: Int) -> [Str?]:
+  var r: [Str?] = []
+  for i in 0..t.n2[cmd]: r.push(get_literal(t, ast.at2(t, cmd, i)))
+  return r
+
+fn check_single_quoted_variables(var a: An, n: Int):
+  let s = a.t.s[n] + ""
+  if not sq_has_expansion(s): return
+  var name = ""
+  let cmd = closest_command(a, n)
+  if cmd >= 0:
+    if b = command_basename(a.t, cmd):
+      name = b
+      let sc = a.t.a[cmd]
+      if b == "find":
+        name = "find"
+        if a.t.k[sc] == T_SimpleCommand:
+          let ws = words_literal(a.t, sc)
+          var i = 0
+          while i < ws.len and not opt_is(ws[i], "-exec") and not opt_is(ws[i], "-execdir"): i += 1
+          if i + 1 < ws.len:
+            if c = ws[i + 1]: name = c
+      elif b == "git":
+        name = "git"
+        if a.t.k[sc] == T_SimpleCommand:
+          let ws = words_literal(a.t, sc)
+          if ws.len >= 2 and opt_is(ws[0], "git") and opt_is(ws[1], "filter-branch"): name = "git filter-branch"
+      elif b == "mumps":
+        name = "mumps"
+        if a.t.k[sc] == T_SimpleCommand:
+          let ws = words_literal(a.t, sc)
+          if ws.len >= 3 and opt_is(ws[0], "mumps") and opt_is(ws[1], "-run"):
+            if opt_is(ws[2], "%XCMD"): name = "mumps -run %XCMD"
+            elif opt_is(ws[2], "LOOP%XCMD"): name = "mumps -run LOOP%XCMD"
+  if name == "sed":
+    if not sed_contra(s): info(&a, n, 2016, "Expressions don't expand in single quotes, use double quotes for that.")
+    return
+  # isProbablyOk
+  var x = n
+  for k in 0..3:
+    if x < 0: break
+    let kk = a.t.k[x]
+    if kk == T_Assignment and a.t.s[x] in ["PS1", "PS2", "PS3", "PS4", "PROMPT_COMMAND"]: return
+    if kk == TC_Unary and a.t.s[x] == "-v": return
+    x = a.parent[x]
+  if name in ["trap", "sh", "bash", "ksh", "zsh", "ssh", "eval", "xprop", "alias", "sudo", "doas", "run0", "docker", "podman", "oc", "dpkg-query", "jq", "rename", "rg", "unset", "git filter-branch", "mumps -run %XCMD", "mumps -run LOOP%XCMD"]: return
+  if name.endswith("awk") or name.startswith("perl"): return
+  info(&a, n, 2016, "Expressions don't expand in single quotes, use double quotes for that.")
+
+# ---------------------------------------------------------------- SC2128, SC2178, SC2179
+
+fn check_array_without_index(var a: An):
+  var arrays: {Str: Bool} = {}
+  for v in data.array_variables(): arrays[v] = true
+  var flow: [Flow] = []
+  swap(&flow, &a.flow)
+  for f in flow:
+    if f.kind == F_REF:
+      if a.t.k[f.tok] == T_DollarBraced:
+        if name = get_literal(a.t, a.t.a[f.tok]):
+          if name in arrays and arrays[name]:
+            warn(&a, f.tok, 2128, "Expanding an array without an index only gives the first element.")
+    elif f.kind == F_ASSIGN:
+      let tk = f.tok
+      if a.t.k[tk] == T_Assignment and a.t.n1[tk] == 0 and not f.arr:
+        if f.name in arrays and arrays[f.name]:
+          if a.t.f[tk] == 0: warn(&a, tk, 2178, "Variable was used as an array but is now assigned a string.")
+          else: warn(&a, tk, 2179, "Use array+=(\"item\") to append items to an array.")
+      elif f.arr: arrays[f.name] = true
+      elif a.t.k[tk] == T_Assignment and a.t.n1[tk] > 0: arrays[f.name] = true
+      else: arrays[f.name] = false
+  swap(&flow, &a.flow)
+
+# ---------------------------------------------------------------- SC2030, SC2031
+
+type Dead:
+  tok: Int
+  reason: Str
+
+fn check_subshell_assignment(var a: An):
+  var scopes: [[Int]] = [[]]
+  var reasons: [Str] = ["oops"]
+  var dead: {Str: Dead} = {}
+  var flow: [Flow] = []
+  swap(&flow, &a.flow)
+  for fi in 0..flow.len:
+    let f = flow[fi]
+    if f.kind == F_ASSIGN:
+      if is_true_assignment_source(f):
+        scopes[scopes.len - 1].push(fi)
+        dead[f.name] = Dead(-1, "")
+    elif f.kind == F_REF:
+      if not (f.name in ["@", "*", "IFS"]):
+        if f.name in dead:
+          let d = dead[f.name]
+          if d.tok >= 0:
+            info(&a, d.tok, 2030, "Modification of " + f.name + " is local (to subshell caused by " + d.reason + ").")
+            info(&a, f.tok, 2031, f.name + " was modified in a subshell. That change might be lost.")
+    elif f.kind == F_SCOPE:
+      scopes.push([])
+      reasons.push(f.name + "")
+    elif f.kind == F_END:
+      var sc = scopes.pop()
+      let reason = reasons.pop()
+      # foldl over the scope list, newest first: the oldest assignment of a name wins
+      var k = sc.len - 1
+      while k >= 0:
+        let g = flow[sc[k]]
+        dead[g.name] = Dead(g.tok, reason + "")
+        k -= 1
+  swap(&flow, &a.flow)

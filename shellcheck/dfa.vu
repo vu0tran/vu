@@ -1,0 +1,1130 @@
+# Data flow analysis on the control flow graph, as ShellCheck's CFGAnalysis.hs does it: an
+# iterative analysis per frame (the script, each subshell, each function call), with reads that
+# miss the frame's state looking up the call stack and recording what they depended on, a cache of
+# function and subshell results keyed by those dependencies, and the per-node states of all
+# invocations merged at the end.
+#
+# A variable's state is packed in an Int: space status (0 empty, 1 clean, 2 dirty), numerical
+# status << 2 (0 unknown, 1 empty, 2 maybe, 3 definitely), and its possible property sets << 4
+# (bit k set: the property set k, a mask of cfg.VP_*, is possible).
+
+import ast
+import cfg
+import data
+from cfg import G, Eff, Val, Part, FDef
+
+const SP_EMPTY = 0
+const SP_CLEAN = 1
+const SP_DIRTY = 2
+const NS_UNKNOWN = 0
+const NS_EMPTY = 1
+const NS_MAYBE = 2
+const NS_DEF = 3
+
+fn vs(space: Int, num: Int, props: Int) -> Int:
+  return space | (num << 2) | (props << 4)
+
+fn vs_space(x: Int) -> Int:
+  return x & 3
+
+fn vs_num(x: Int) -> Int:
+  return (x >> 2) & 3
+
+fn vs_props(x: Int) -> Int:
+  return x >> 4
+
+fn vs_value(x: Int) -> Int:
+  return x & 15
+
+const UNKNOWN_VS = 2 | 16
+const UNSET_VS = 4 | 16
+const UNKNOWN_VAL = 2
+const EMPTY_VAL = 4
+const INT_VAL = 13
+
+fn merge_space(a: Int, b: Int) -> Int:
+  if a == SP_EMPTY: return b
+  if b == SP_EMPTY: return a
+  if a == SP_CLEAN and b == SP_CLEAN: return SP_CLEAN
+  return SP_DIRTY
+
+fn merge_num(a: Int, b: Int) -> Int:
+  if a == NS_DEF and b == NS_DEF: return NS_DEF
+  if a == NS_DEF or b == NS_DEF: return NS_MAYBE
+  if a == NS_MAYBE or b == NS_MAYBE: return NS_MAYBE
+  if a == NS_EMPTY and b == NS_EMPTY: return NS_EMPTY
+  return NS_UNKNOWN
+
+fn append_num(a: Int, b: Int) -> Int:
+  if a == NS_EMPTY: return b
+  if b == NS_EMPTY: return a
+  if a == NS_DEF and b == NS_DEF: return NS_DEF
+  if a == NS_UNKNOWN or b == NS_UNKNOWN: return NS_UNKNOWN
+  return NS_MAYBE
+
+fn merge_vs(a: Int, b: Int) -> Int:
+  return vs(merge_space(vs_space(a), vs_space(b)), merge_num(vs_num(a), vs_num(b)), vs_props(a) | vs_props(b))
+
+fn add_props(m: Int, props: Int) -> Int:
+  var r = 0
+  for k in 0..16:
+    if (m >> k) & 1 == 1: r = r | (1 << (k | props))
+  return r
+
+fn remove_props(m: Int, props: Int) -> Int:
+  var r = 0
+  for k in 0..16:
+    if (m >> k) & 1 == 1: r = r | (1 << (k & (15 - props)))
+  return r
+
+fn all_have(m: Int, prop: Int) -> Bool:
+  for k in 0..16:
+    if (m >> k) & 1 == 1 and (k & prop) == 0: return false
+  return true
+
+fn any_has(m: Int, prop: Int) -> Bool:
+  for k in 0..16:
+    if (m >> k) & 1 == 1 and (k & prop) != 0: return true
+  return false
+
+# ---------------------------------------------------------------- maps: sorted keys with values
+
+type IM:
+  k: [Int]
+  v: [Int]
+
+fn im_new() -> IM:
+  return IM([], [])
+
+fn im_find(m: IM, key: Int) -> Int:
+  var lo = 0
+  var hi = m.k.len
+  while lo < hi:
+    let mid = (lo + hi) / 2
+    let x = m.k[mid]
+    if x == key: return mid
+    if x < key: lo = mid + 1
+    else: hi = mid
+  return -1 - lo
+
+fn im_get(m: IM, key: Int) -> Int:
+  let i = im_find(m, key)
+  if i >= 0: return m.v[i]
+  return -1
+
+fn im_has(m: IM, key: Int) -> Bool:
+  return im_find(m, key) >= 0
+
+fn im_set(var m: IM, key: Int, val: Int):
+  let i = im_find(m, key)
+  if i >= 0:
+    m.v[i] = val
+    return
+  let at = -1 - i
+  let n = m.k.len
+  m.k.push(0)
+  m.v.push(0)
+  if at < n:
+    m.k.copy_within(at + 1, at, n - at)
+    m.v.copy_within(at + 1, at, n - at)
+  m.k[at] = key
+  m.v[at] = val
+
+fn im_copy(m: IM) -> IM:
+  var k = m.k[0..m.k.len]
+  var v = m.v[0..m.v.len]
+  return IM(k, v)
+
+fn ints_eq(a: [Int], b: [Int]) -> Bool:
+  if a.len != b.len: return false
+  for i in 0..a.len:
+    if a[i] != b[i]: return false
+  return true
+
+fn im_eq(a: IM, b: IM) -> Bool:
+  return ints_eq(a.k, b.k) and ints_eq(a.v, b.v)
+
+# b's entries over a's
+fn im_patch(a: IM, b: IM) -> IM:
+  if b.k.len == 0: return im_copy(a)
+  if a.k.len == 0: return im_copy(b)
+  var r = im_new()
+  var i = 0
+  var j = 0
+  while i < a.k.len or j < b.k.len:
+    if j >= b.k.len or (i < a.k.len and a.k[i] < b.k[j]):
+      r.k.push(a.k[i])
+      r.v.push(a.v[i])
+      i += 1
+    elif i >= a.k.len or b.k[j] < a.k[i]:
+      r.k.push(b.k[j])
+      r.v.push(b.v[j])
+      j += 1
+    else:
+      r.k.push(b.k[j])
+      r.v.push(b.v[j])
+      i += 1
+      j += 1
+  return r
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn union_ints(a: [Int], b: [Int]) -> [Int]:
+  var r: [Int] = []
+  var i = 0
+  var j = 0
+  while i < a.len or j < b.len:
+    if j >= b.len or (i < a.len and a[i] < b[j]):
+      r.push(a[i])
+      i += 1
+    elif i >= a.len or b[j] < a[i]:
+      r.push(b[j])
+      j += 1
+    else:
+      r.push(a[i])
+      i += 1
+      j += 1
+  return r
+
+# ---------------------------------------------------------------- states
+
+type St:
+  g: IM
+  l: IM
+  p: IM
+  f: IM             # name -> interned function set
+  ec: [Int]
+  has_ec: Bool
+  reach: Int        # -1 unknown, 0 unreachable, 1 reachable, -2 (internal) exit never reached
+
+fn new_st() -> St:
+  return St(im_new(), im_new(), im_new(), im_new(), [], false, -1)
+
+fn unreachable_st() -> St:
+  return St(im_new(), im_new(), im_new(), im_new(), [], false, 0)
+
+fn st_copy(s: St) -> St:
+  return St(im_copy(s.g), im_copy(s.l), im_copy(s.p), im_copy(s.f), copy_ints(s.ec), s.has_ec, s.reach)
+
+# stateIsSlowEqual (exit codes aren't compared)
+fn st_eq(a: St, b: St) -> Bool:
+  return a.reach == b.reach and im_eq(a.g, b.g) and im_eq(a.l, b.l) and im_eq(a.p, b.p) and im_eq(a.f, b.f)
+
+# patchState base diff
+fn patch(base: St, diff: St) -> St:
+  var r = St(im_patch(base.g, diff.g), im_patch(base.l, diff.l), im_patch(base.p, diff.p), im_patch(base.f, diff.f), [], false, base.reach)
+  if diff.has_ec:
+    r.ec = copy_ints(diff.ec)
+    r.has_ec = true
+  elif base.has_ec:
+    r.ec = copy_ints(base.ec)
+    r.has_ec = true
+  if diff.reach >= 0: r.reach = diff.reach
+  return r
+
+# ---------------------------------------------------------------- dependencies
+
+const D_STATE = 1
+const D_PROPS = 2
+const D_FUNC = 3
+const D_REC = 4
+const D_EXIT = 5
+
+type Dep:
+  kind: Int
+  scope: Int
+  name: Int
+  val: Int
+  set: [Int]
+
+type Frame:
+  entry: Int
+  is_call: Bool
+  call_site: Int
+  deps: [Dep]
+  dkeys: {Int: Int}
+  state: St
+
+type CacheEnt:
+  deps: [Dep]
+  diff: St
+
+type Inv:
+  deps: [Dep]
+  nodes: [Int]
+  ins: [St]
+  outs: [St]
+
+type Ctx:
+  g: G
+  frames: [Frame]
+  input: St
+  output: St
+  node: Int
+  cache: {Int: [CacheEnt]}
+  enable_cache: Bool
+  invs: {Str: Inv}
+  inv_order: [Str]
+  preds: [[Int]]
+  succs: [[Int]]
+  failed: Bool
+  names: {Str: Int}
+  name_list: [Str]
+  eff_name: [Int]        # interned name of each effect
+  part_name: [Int]       # interned name of each P_VAR part
+  fsets: [[Int]]
+  fset_ids: {Str: Int}
+  fn_unknown: Int
+  steps: Int
+
+fn intern(var c: Ctx, s: Str) -> Int:
+  if s in c.names: return c.names[s]
+  let id = c.name_list.len
+  c.names[s] = id
+  c.name_list.push(s + "")
+  return id
+
+fn fset_id(var c: Ctx, set: [Int]) -> Int:
+  var key = ""
+  for x in set: key += "{x},"
+  if key in c.fset_ids: return c.fset_ids[key]
+  let id = c.fsets.len
+  c.fsets.push(copy_ints(set))
+  c.fset_ids[key] = id
+  return id
+
+fn dep_key(d: Dep) -> Int:
+  if d.kind == D_REC: return (d.kind << 40) | d.val
+  if d.kind == D_EXIT: return d.kind << 40
+  return (d.kind << 40) | (d.scope << 36) | d.name
+
+fn add_dep(var c: Ctx, fi: Int, own d: Dep):
+  let k = dep_key(d)
+  if k in c.frames[fi].dkeys: return
+  c.frames[fi].dkeys[k] = c.frames[fi].deps.len
+  c.frames[fi].deps.push(d)
+
+# getVariableWithScope: prefix, local, global; the scope (2, 1, 0) or -1
+fn var_with_scope(s: St, name: Int, var val: Int) -> Int:
+  var i = im_find(s.p, name)
+  if i >= 0:
+    val = s.p.v[i]
+    return 2
+  i = im_find(s.l, name)
+  if i >= 0:
+    val = s.l.v[i]
+    return 1
+  i = im_find(s.g, name)
+  if i >= 0:
+    val = s.g.v[i]
+    return 0
+  return -1
+
+fn record(var c: Ctx, lo: Int, kind: Int, scope: Int, name: Int, val: Int, set: [Int]):
+  var k = c.frames.len - 1
+  while k >= lo:
+    add_dep(&c, k, Dep(kind, scope, name, val, copy_ints(set)))
+    k -= 1
+
+# readVariableWithScope (lookupStack); scope in out
+fn read_var_ws(var c: Ctx, use_input: Bool, name: Int, var scope: Int) -> Int:
+  var v = 0
+  if use_input:
+    let sc = var_with_scope(c.input, name, &v)
+    if sc >= 0:
+      scope = sc
+      return v
+  var fi = c.frames.len - 1
+  var found = -1
+  var fv = UNKNOWN_VS
+  var fs = 0
+  while fi >= 0:
+    let sc = var_with_scope(c.frames[fi].state, name, &v)
+    if sc >= 0:
+      found = fi
+      fv = v
+      fs = sc
+      break
+    fi -= 1
+  let none: [Int] = []
+  record(&c, max(found, 0), D_STATE, fs, name, fv, none)
+  scope = fs
+  return fv
+
+fn read_variable(var c: Ctx, use_input: Bool, name: Int) -> Int:
+  var sc = 0
+  return read_var_ws(&c, use_input, name, &sc)
+
+fn read_props_ws(var c: Ctx, name: Int, var scope: Int) -> Int:
+  var v = 0
+  let sc = var_with_scope(c.input, name, &v)
+  if sc >= 0:
+    scope = sc
+    return vs_props(v)
+  var fi = c.frames.len - 1
+  var found = -1
+  var fp = 1
+  var fs = 0
+  while fi >= 0:
+    let s2 = var_with_scope(c.frames[fi].state, name, &v)
+    if s2 >= 0:
+      found = fi
+      fp = vs_props(v)
+      fs = s2
+      break
+    fi -= 1
+  let none: [Int] = []
+  record(&c, max(found, 0), D_PROPS, fs, name, fp, none)
+  scope = fs
+  return fp
+
+fn read_global(var c: Ctx, use_input: Bool, name: Int) -> Int:
+  if use_input:
+    let i = im_find(c.input.g, name)
+    if i >= 0: return c.input.g.v[i]
+  var fi = c.frames.len - 1
+  var found = -1
+  var fv = UNKNOWN_VS
+  while fi >= 0:
+    let i = im_find(c.frames[fi].state.g, name)
+    if i >= 0:
+      found = fi
+      fv = c.frames[fi].state.g.v[i]
+      break
+    fi -= 1
+  let none: [Int] = []
+  record(&c, max(found, 0), D_STATE, 0, name, fv, none)
+  return fv
+
+fn read_global_props(var c: Ctx, name: Int) -> Int:
+  let i0 = im_find(c.input.g, name)
+  if i0 >= 0: return vs_props(c.input.g.v[i0])
+  var fi = c.frames.len - 1
+  var found = -1
+  var fp = 1
+  while fi >= 0:
+    let i = im_find(c.frames[fi].state.g, name)
+    if i >= 0:
+      found = fi
+      fp = vs_props(c.frames[fi].state.g.v[i])
+      break
+    fi -= 1
+  let none: [Int] = []
+  record(&c, max(found, 0), D_PROPS, 0, name, fp, none)
+  return fp
+
+fn read_local(var c: Ctx, name: Int) -> Int:
+  let i0 = im_find(c.input.l, name)
+  if i0 >= 0: return c.input.l.v[i0]
+  var fi = c.frames.len - 1
+  var found = -1
+  var fv = UNSET_VS
+  while fi >= 0:
+    if c.frames[fi].is_call: break
+    let i = im_find(c.frames[fi].state.l, name)
+    if i >= 0:
+      found = fi
+      fv = c.frames[fi].state.l.v[i]
+      break
+    fi -= 1
+  var lo = found
+  if lo < 0: lo = fi + 1
+  let none: [Int] = []
+  record(&c, lo, D_STATE, 1, name, fv, none)
+  return fv
+
+fn read_local_props(var c: Ctx, name: Int) -> Int:
+  var i0 = im_find(c.input.l, name)
+  if i0 >= 0: return vs_props(c.input.l.v[i0])
+  i0 = im_find(c.input.p, name)
+  if i0 >= 0: return vs_props(c.input.p.v[i0])
+  var fi = c.frames.len - 1
+  var found = -1
+  var fp = 1
+  var fs = 1
+  while fi >= 0:
+    if c.frames[fi].is_call: break
+    var i = im_find(c.frames[fi].state.l, name)
+    if i >= 0:
+      found = fi
+      fp = vs_props(c.frames[fi].state.l.v[i])
+      break
+    i = im_find(c.frames[fi].state.p, name)
+    if i >= 0:
+      found = fi
+      fp = vs_props(c.frames[fi].state.p.v[i])
+      fs = 2
+      break
+    fi -= 1
+  var lo = found
+  if lo < 0: lo = fi + 1
+  let none: [Int] = []
+  record(&c, lo, D_PROPS, fs, name, fp, none)
+  return fp
+
+fn read_function(var c: Ctx, use_input: Bool, name: Int) -> Int:
+  if use_input:
+    let i = im_find(c.input.f, name)
+    if i >= 0: return c.input.f.v[i]
+  var fi = c.frames.len - 1
+  var found = -1
+  var fv = c.fn_unknown
+  while fi >= 0:
+    let i = im_find(c.frames[fi].state.f, name)
+    if i >= 0:
+      found = fi
+      fv = c.frames[fi].state.f.v[i]
+      break
+    fi -= 1
+  let none: [Int] = []
+  record(&c, max(found, 0), D_FUNC, 0, name, fv, none)
+  return fv
+
+fn read_exit_codes(var c: Ctx, use_input: Bool) -> [Int]:
+  if use_input and c.input.has_ec: return copy_ints(c.input.ec)
+  var fi = c.frames.len - 1
+  var found = -1
+  var fv: [Int] = []
+  while fi >= 0:
+    if c.frames[fi].state.has_ec:
+      found = fi
+      fv = copy_ints(c.frames[fi].state.ec)
+      break
+    fi -= 1
+  record(&c, max(found, 0), D_EXIT, 0, 0, 0, fv)
+  return fv
+
+# ---------------------------------------------------------------- merging
+
+# mergeMaps with a reader for names one side lacks: 0 global, 1 variable, 2 function
+fn merge_im(var c: Ctx, a: IM, b: IM, reader: Int) -> IM:
+  if im_eq(a, b): return im_copy(a)
+  var r = im_new()
+  var i = 0
+  var j = 0
+  while i < a.k.len or j < b.k.len:
+    var key = 0
+    var va = 0
+    var vb = 0
+    if j >= b.k.len or (i < a.k.len and a.k[i] < b.k[j]):
+      key = a.k[i]
+      va = a.v[i]
+      vb = read_for_merge(&c, reader, key)
+      i += 1
+    elif i >= a.k.len or b.k[j] < a.k[i]:
+      key = b.k[j]
+      vb = b.v[j]
+      va = read_for_merge(&c, reader, key)
+      j += 1
+    else:
+      key = a.k[i]
+      va = a.v[i]
+      vb = b.v[j]
+      i += 1
+      j += 1
+    r.k.push(key)
+    if reader == 2: r.v.push(fset_id(&c, union_ints(c.fsets[va], c.fsets[vb])))
+    else: r.v.push(merge_vs(va, vb))
+  return r
+
+fn read_for_merge(var c: Ctx, reader: Int, key: Int) -> Int:
+  if reader == 0: return read_global(&c, false, key)
+  if reader == 1: return read_variable(&c, false, key)
+  return read_function(&c, false, key)
+
+# mergeState (runs with an empty input: names one side lacks come from the stack)
+fn merge_state(var c: Ctx, a: St, b: St) -> St:
+  if (a.reach == 1 and b.reach == 0) or (a.reach == 0 and b.reach == 1): c.failed = true
+  if a.reach == 0 and b.reach == 0: return unreachable_st()
+  var old = new_st()
+  swap(&old, &c.input)
+  var r = St(merge_im(&c, a.g, b.g, 0), merge_im(&c, a.l, b.l, 1), merge_im(&c, a.p, b.p, 1), merge_im(&c, a.f, b.f, 2), [], false, -1)
+  if a.has_ec and b.has_ec:
+    r.ec = union_ints(a.ec, b.ec)
+    r.has_ec = true
+  elif a.has_ec:
+    r.ec = union_ints(a.ec, read_exit_codes(&c, false))
+    r.has_ec = true
+  elif b.has_ec:
+    r.ec = union_ints(b.ec, read_exit_codes(&c, false))
+    r.has_ec = true
+  swap(&old, &c.input)
+  if a.reach >= 0 and b.reach >= 0:
+    if a.reach == 1 and b.reach == 1: r.reach = 1
+    else: r.reach = 0
+  return r
+
+# ---------------------------------------------------------------- values
+
+fn literal_space(s: Str) -> Int:
+  if s.len == 0: return SP_EMPTY
+  for k in 0..s.len:
+    let b = s[k]
+    if b == ' ' or b == '\t' or b == '\n' or b == '*' or b == '?' or b == '[': return SP_DIRTY
+  return SP_CLEAN
+
+fn all_digits(s: Str, from: Int) -> Bool:
+  for k in from..s.len:
+    if s[k] < '0' or s[k] > '9': return false
+  return true
+
+fn literal_num(s: Str) -> Int:
+  if s.len == 0: return NS_EMPTY
+  if s[0] == '-':
+    if all_digits(s, 1): return NS_DEF
+    return NS_UNKNOWN
+  if all_digits(s, 0): return NS_DEF
+  return NS_UNKNOWN
+
+fn compute_part(var c: Ctx, pi: Int) -> Int:
+  let kind = c.g.parts[pi].kind
+  if kind == cfg.P_LIT:
+    let s = c.g.parts[pi].lit + ""
+    return literal_space(s) | (literal_num(s) << 2)
+  if kind == cfg.P_INT: return INT_VAL
+  if kind == cfg.P_UNKNOWN: return UNKNOWN_VAL
+  let st = read_variable(&c, true, c.part_name[pi])
+  if all_have(vs_props(st), cfg.VP_INTEGER): return INT_VAL
+  return vs_value(st)
+
+fn value_of(var c: Ctx, vi: Int) -> Int:
+  let kind = c.g.vals[vi].kind
+  if kind == cfg.V_ARRAY or kind == cfg.V_STRING: return UNKNOWN_VAL
+  if kind == cfg.V_INTEGER: return INT_VAL
+  if kind == cfg.V_UNINIT: return EMPTY_VAL
+  var cur = EMPTY_VAL
+  let st = c.g.vals[vi].ps
+  for k in 0..c.g.vals[vi].pn:
+    let nx = compute_part(&c, st + k)
+    cur = merge_space(vs_space(cur), vs_space(nx)) | (append_num(vs_num(cur), vs_num(nx)) << 2)
+  return cur
+
+# ---------------------------------------------------------------- effects
+
+fn write_variable(var c: Ctx, name: Int, v: Int):
+  var sc = 0
+  read_props_ws(&c, name, &sc)
+  if sc == 0: im_set(&c.output.g, name, v)
+  else: im_set(&c.output.l, name, v)
+
+fn transfer_effect(var c: Ctx, ei: Int):
+  let kind = c.g.effs[ei].kind
+  let name = c.eff_name[ei]
+  if kind == cfg.X_READ:
+    if c.g.effs[ei].name == "?": read_exit_codes(&c, true)
+    else: read_variable(&c, true, name)
+  elif kind == cfg.X_WRITE:
+    let val = value_of(&c, c.g.effs[ei].val)
+    var sc = 0
+    let props = read_props_ws(&c, name, &sc)
+    if sc == 0: im_set(&c.output.g, name, val | (props << 4))
+    else: im_set(&c.output.l, name, val | (props << 4))
+  elif kind == cfg.X_WGLOBAL:
+    let val = value_of(&c, c.g.effs[ei].val)
+    let props = read_global_props(&c, name)
+    im_set(&c.output.g, name, val | (props << 4))
+  elif kind == cfg.X_WLOCAL:
+    let val = value_of(&c, c.g.effs[ei].val)
+    let props = read_local_props(&c, name)
+    im_set(&c.output.l, name, val | (props << 4))
+  elif kind == cfg.X_WPREFIX:
+    let val = value_of(&c, c.g.effs[ei].val)
+    im_set(&c.output.p, name, val | (1 << 4))
+  elif kind == cfg.X_SETPROPS or kind == cfg.X_UNSETPROPS:
+    let props = c.g.effs[ei].props
+    let scope = c.g.effs[ei].scope
+    var st = 0
+    if scope == cfg.SC_NONE: st = read_variable(&c, true, name)
+    elif scope == cfg.SC_GLOBAL: st = read_global(&c, true, name)
+    else: st = read_local(&c, name)
+    var np = 0
+    if kind == cfg.X_SETPROPS: np = add_props(vs_props(st), props)
+    else: np = remove_props(vs_props(st), props)
+    let nv = vs_value(st) | (np << 4)
+    if scope == cfg.SC_NONE: write_variable(&c, name, nv)
+    elif scope == cfg.SC_GLOBAL: im_set(&c.output.g, name, nv)
+    else: im_set(&c.output.l, name, nv)
+  elif kind == cfg.X_UNDEFVAR or kind == cfg.X_UNDEFNAMEREF:
+    write_variable(&c, name, UNSET_VS)
+  elif kind == cfg.X_UNDEFFN:
+    im_set(&c.output.f, name, c.fn_unknown)
+  elif kind == cfg.X_UNDEF:
+    write_variable(&c, name, UNSET_VS)
+    im_set(&c.output.f, name, c.fn_unknown)
+  elif kind == cfg.X_DEFFN:
+    let fs = fset_id(&c, [c.g.effs[ei].fdef])
+    im_set(&c.output.f, name, fs)
+
+# ---------------------------------------------------------------- frames, cache, calls
+
+fn push_frame(var c: Ctx, entry: Int, is_call: Bool):
+  c.frames.push(Frame(entry, is_call, c.node, [], {}, st_copy(c.output)))
+  var ni = new_st()
+  var no = new_st()
+  swap(&c.input, &ni)
+  swap(&c.output, &no)
+
+type Saved:
+  input: St
+  output: St
+  node: Int
+
+fn save_io(var c: Ctx) -> Saved:
+  var s = Saved(new_st(), new_st(), c.node)
+  swap(&s.input, &c.input)
+  swap(&s.output, &c.output)
+  return s
+
+fn restore_io(var c: Ctx, var s: Saved):
+  swap(&s.input, &c.input)
+  swap(&s.output, &c.output)
+  c.node = s.node
+
+fn peek_var(c: Ctx, scope: Int, name: Int, var v: Int) -> Int:
+  let sc = var_with_scope(c.input, name, &v)
+  if sc >= 0: return sc
+  var fi = c.frames.len - 1
+  while fi >= 0:
+    let s2 = var_with_scope(c.frames[fi].state, name, &v)
+    if s2 >= 0: return s2
+    fi -= 1
+  if scope == 0:
+    v = UNKNOWN_VS
+    return 0
+  v = UNSET_VS
+  return 1
+
+fn peek_func(c: Ctx, name: Int) -> Int:
+  let i = im_find(c.input.f, name)
+  if i >= 0: return c.input.f.v[i]
+  var fi = c.frames.len - 1
+  while fi >= 0:
+    let j = im_find(c.frames[fi].state.f, name)
+    if j >= 0: return c.frames[fi].state.f.v[j]
+    fi -= 1
+  return c.fn_unknown
+
+fn peek_exit(c: Ctx) -> [Int]:
+  if c.input.has_ec: return copy_ints(c.input.ec)
+  var fi = c.frames.len - 1
+  while fi >= 0:
+    if c.frames[fi].state.has_ec: return copy_ints(c.frames[fi].state.ec)
+    fi -= 1
+  let e: [Int] = []
+  return e
+
+fn fulfills(c: Ctx, entry: Int, d: Dep) -> Bool:
+  if d.kind == D_STATE:
+    var v = 0
+    let sc = peek_var(c, d.scope, d.name, &v)
+    return sc == d.scope and v == d.val
+  if d.kind == D_PROPS:
+    var v = 0
+    let sc = peek_var(c, d.scope, d.name, &v)
+    return sc == d.scope and vs_props(v) == d.val
+  if d.kind == D_FUNC: return peek_func(c, d.name) == d.val
+  if d.kind == D_REC:
+    if d.val == entry: return true
+    var any = false
+    for f in c.frames:
+      if f.entry == d.val: any = true
+    return (d.set.len > 0) == any
+  return ints_eq(peek_exit(c), d.set)
+
+fn get_cache(c: Ctx, node: Int) -> Int:
+  if not c.enable_cache or not (node in c.cache): return -1
+  let ents = c.cache[node]
+  for i in 0..ents.len:
+    var ok = true
+    for d in ents[i].deps:
+      if not fulfills(c, node, d):
+        ok = false
+        break
+    if ok: return i
+  return -1
+
+fn copy_deps(ds: [Dep]) -> [Dep]:
+  var r: [Dep] = []
+  for d in ds: r.push(Dep(d.kind, d.scope, d.name, d.val, copy_ints(d.set)))
+  return r
+
+fn put_cache(var c: Ctx, node: Int, deps: [Dep], diff: St):
+  var ents: [CacheEnt] = [CacheEnt(copy_deps(deps), st_copy(diff))]
+  if node in c.cache:
+    var old: [CacheEnt] = []
+    swap(&old, &c.cache[node])
+    var i = 0
+    while i < old.len and i < 10:
+      var e = CacheEnt([], new_st())
+      swap(&e, &old[i])
+      ents.push(e)
+      i += 1
+  c.cache[node] = ents
+
+fn register_flow(var c: Ctx, entry: Int, deps: [Dep], var nodes: [Int], var ins: [St], var outs: [St]):
+  var key = "{entry},{c.node}"
+  var fi = c.frames.len - 1
+  while fi >= 0:
+    key += ",{c.frames[fi].call_site}"
+    fi -= 1
+  var inv = Inv(copy_deps(deps), [], [], [])
+  swap(&inv.nodes, &nodes)
+  swap(&inv.ins, &ins)
+  swap(&inv.outs, &outs)
+  if not (key in c.invs): c.inv_order.push(key + "")
+  c.invs[key] = inv
+
+# Runs a frame's dataflow from entry; the output state at exit (reach -2 if never reached)
+fn run_frame(var c: Ctx, entry: Int, exit: Int, is_call: Bool, var deps_out: [Dep]) -> St:
+  push_frame(&c, entry, is_call)
+  var nodes: [Int] = []
+  var ins: [St] = []
+  var outs: [St] = []
+  dataflow(&c, entry, &nodes, &ins, &outs)
+  var res = new_st()
+  res.reach = -2
+  for i in 0..nodes.len:
+    if nodes[i] == exit: res = st_copy(outs[i])
+  var fr = c.frames.pop()
+  deps_out = copy_deps(fr.deps)
+  var ni = new_st()
+  swap(&c.input, &ni)
+  register_flow(&c, entry, fr.deps, &nodes, &ins, &outs)
+  return res
+
+fn run_cached(var c: Ctx, entry: Int, exit: Int, is_call: Bool):
+  let ci = get_cache(c, entry)
+  if ci >= 0:
+    c.output = patch(c.output, c.cache[entry][ci].diff)
+    return
+  var deps: [Dep] = []
+  var saved = save_io(&c)
+  c.input = st_copy(saved.input)
+  c.output = st_copy(saved.output)
+  var res = run_frame(&c, entry, exit, is_call, &deps)
+  restore_io(&c, &saved)
+  if res.reach == -2: res = unreachable_st()
+  elif is_call: res.l = im_new()
+  put_cache(&c, entry, deps, res)
+  c.output = patch(c.output, res)
+
+fn transfer_subshell(var c: Ctx, entry: Int, exit: Int):
+  let initial = st_copy(c.output)
+  run_cached(&c, entry, exit, false)
+  var r = st_copy(initial)
+  r.ec = copy_ints(c.output.ec)
+  r.has_ec = c.output.has_ec
+  c.output = r
+
+fn would_be_recursive(var c: Ctx, entry: Int) -> Bool:
+  var found_at = -1
+  var k = c.frames.len - 1
+  while k >= 0:
+    if c.frames[k].entry == entry:
+      found_at = k
+      break
+    k -= 1
+  var set: [Int] = []
+  if found_at >= 0: set.push(1)
+  record(&c, max(found_at, 0), D_REC, 0, 0, entry, set)
+  return found_at >= 0
+
+fn transfer_function_value(var c: Ctx, fd: Int):
+  if fd < 0: return
+  let entry = c.g.fdefs[fd].entry
+  let exit = c.g.fdefs[fd].exit
+  if would_be_recursive(&c, entry): return
+  run_cached(&c, entry, exit, true)
+
+fn transfer_command(var c: Ctx, name: Int):
+  let tid = read_function(&c, true, name)
+  let targets = copy_ints(c.fsets[tid])
+  let original = st_copy(c.output)
+  var branches: [St] = []
+  for fd in targets:
+    c.output = st_copy(original)
+    transfer_function_value(&c, fd)
+    var o = new_st()
+    swap(&o, &c.output)
+    branches.push(o)
+  var merged = new_st()
+  swap(&merged, &branches[0])
+  for i in 1..branches.len: merged = merge_state(&c, merged, branches[i])
+  c.output = patch(original, merged)
+
+fn transfer(var c: Ctx, node: Int):
+  let lab = c.g.lab[node]
+  if lab == cfg.N_EXEC:
+    if c.g.na[node] == 1:
+      let nm = intern(&c, c.g.ns[node] + "")
+      transfer_command(&c, nm)
+  elif lab == cfg.N_SUBSHELL: transfer_subshell(&c, c.g.na[node], c.g.nb[node])
+  elif lab == cfg.N_EFFECTS:
+    for k in 0..c.g.nen[node]: transfer_effect(&c, c.g.nef[node] + k)
+  elif lab == cfg.N_SETEXIT:
+    c.output.ec = [c.g.na[node]]
+    c.output.has_ec = true
+  elif lab == cfg.N_UNRESOLVEDEXIT or lab == cfg.N_UNREACHABLE:
+    c.output = patch(c.output, unreachable_st())
+  elif lab == cfg.N_DROPPREFIX:
+    c.output.p = im_new()
+
+# ---------------------------------------------------------------- the iterative analysis
+
+fn heap_push(var h: [Int], v: Int):
+  h.push(v)
+  var i = h.len - 1
+  while i > 0:
+    let p = (i - 1) / 2
+    if h[p] <= h[i]: break
+    h.swap(p, i)
+    i = p
+
+fn heap_pop(var h: [Int]) -> Int:
+  let top = h[0]
+  let last = h.pop()
+  if h.len > 0:
+    h[0] = last
+    var i = 0
+    while true:
+      let l = 2 * i + 1
+      let r = l + 1
+      var m = i
+      if l < h.len and h[l] < h[m]: m = l
+      if r < h.len and h[r] < h[m]: m = r
+      if m == i: break
+      h.swap(m, i)
+      i = m
+  return top
+
+fn dataflow(var c: Ctx, entry: Int, var nodes: [Int], var ins: [St], var outs: [St]):
+  var saved = save_io(&c)
+  var index: {Int: Int} = {}
+  var pend: {Int: Bool} = {}
+  var heap: [Int] = [entry]
+  pend[entry] = true
+  var n = 0
+  while heap.len > 0:
+    n += 1
+    if n == 10000: c.enable_cache = false
+    c.steps += 1
+    if n > 1000000 or c.steps > 4000000:
+      c.failed = true
+      break
+    let node = heap_pop(&heap)
+    pend.remove(node)
+    # input
+    var input = new_st()
+    if c.preds[node].len > 0:
+      var have = false
+      let ps = copy_ints(c.preds[node])
+      for pr in ps:
+        if pr in index:
+          let oi = index[pr]
+          if outs[oi].reach != 0:
+            if not have:
+              input = st_copy(outs[oi])
+              have = true
+            else: input = merge_state(&c, input, outs[oi])
+      if not have: input = unreachable_st()
+    c.input = st_copy(input)
+    c.output = input
+    c.node = node
+    transfer(&c, node)
+    var result = new_st()
+    swap(&result, &c.output)
+    var changed = true
+    var in2 = new_st()
+    swap(&in2, &c.input)
+    if node in index:
+      let i = index[node]
+      changed = not st_eq(outs[i], result)
+      ins[i] = in2
+      outs[i] = result
+    else:
+      index[node] = nodes.len
+      nodes.push(node)
+      ins.push(in2)
+      outs.push(result)
+    if changed:
+      for s in c.succs[node]:
+        if not (s in pend):
+          pend[s] = true
+          heap_push(&heap, s)
+  restore_io(&c, &saved)
+
+# ---------------------------------------------------------------- the whole analysis
+
+fn env_state(var c: Ctx) -> St:
+  var s = new_st()
+  for v in data.internal_variables(): im_set(&s.g, intern(&c, v), UNKNOWN_VS)
+  for v in data.variables_without_spaces(): im_set(&s.g, intern(&c, v), vs(SP_CLEAN, NS_UNKNOWN, 1))
+  for v in ["$", "?", "!", "#"]: im_set(&s.g, intern(&c, v), vs(SP_CLEAN, NS_DEF, 1))
+  return s
+
+type Result:
+  ok: Bool
+  invs: [Inv]
+  bynode: {Int: [Int]}      # node -> invocation indices
+  bases: [St]               # depsToState per invocation
+  memo: {Int: St}
+  names: {Str: Int}
+
+fn deps_to_state(deps: [Dep]) -> St:
+  var s = new_st()
+  for d in deps:
+    if d.kind == D_STATE:
+      if d.scope == 2: im_set(&s.p, d.name, d.val)
+      elif d.scope == 1: im_set(&s.l, d.name, d.val)
+      else: im_set(&s.g, d.name, d.val)
+    elif d.kind == D_FUNC: im_set(&s.f, d.name, d.val)
+    elif d.kind == D_EXIT:
+      s.ec = copy_ints(d.set)
+      s.has_ec = true
+  for d in deps:
+    if d.kind == D_PROPS:
+      let v = UNKNOWN_VS & 15
+      if d.scope == 2:
+        if not im_has(s.p, d.name): im_set(&s.p, d.name, v | (d.val << 4))
+      elif d.scope == 1:
+        if not im_has(s.l, d.name): im_set(&s.l, d.name, v | (d.val << 4))
+      else:
+        if not im_has(s.g, d.name): im_set(&s.g, d.name, v | (d.val << 4))
+  return s
+
+fn analyze(var g0: G, root: Int, var out: Result):
+  let nn = g0.lab.len
+  var c = Ctx(cfg.empty_g(), [], new_st(), new_st(), 0, {}, true, {}, [], [], [], false, {}, [], [], [], [], {}, 0, 0)
+  swap(&c.g, &g0)
+  c.fn_unknown = fset_id(&c, [-1])
+  for ei in 0..c.g.effs.len:
+    let nm = c.g.effs[ei].name + ""
+    let id = intern(&c, nm)
+    c.eff_name.push(id)
+  for pi in 0..c.g.parts.len:
+    if c.g.parts[pi].kind == cfg.P_VAR:
+      let nm = c.g.parts[pi].name + ""
+      let id = intern(&c, nm)
+      c.part_name.push(id)
+    else: c.part_name.push(-1)
+  var preds: [[Int]] = []
+  var succs: [[Int]] = []
+  for k in 0..nn:
+    preds.push([])
+    succs.push([])
+  for i in 0..c.g.efrom.len:
+    let a = c.g.efrom[i]
+    let b = c.g.eto[i]
+    if c.g.ekind[i] == cfg.E_FLOW: preds[b].push(a)
+    succs[a].push(b)
+  c.preds = preds
+  c.succs = succs
+  let r = c.g.trange[root]
+  let entry = cfg.rs(r)
+  let exit = cfg.re(r)
+  c.input = env_state(&c)
+  c.output = st_copy(c.input)
+  c.node = entry
+  var deps: [Dep] = []
+  let exit_state = run_frame(&c, entry, exit, false, &deps)
+  # stragglers: functions defined at the end of the script that nothing invoked
+  var invoked: {Int: Bool} = {}
+  for key in c.inv_order:
+    for n in c.invs[key].nodes: invoked[n] = true
+  var strag: [Int] = []
+  for i in 0..exit_state.f.k.len:
+    for fd in c.fsets[exit_state.f.v[i]]:
+      if fd >= 0 and not (c.g.fdefs[fd].entry in invoked) and not (fd in strag): strag.push(fd)
+  strag.sort(by: fn(x, y) => c.g.fdefs[x].entry < c.g.fdefs[y].entry)
+  if exit_state.reach != -2 and not c.failed:
+    var sin = patch(env_state(&c), exit_state)
+    sin.has_ec = false
+    sin.ec = []
+    for fd in strag:
+      c.input = st_copy(sin)
+      c.output = st_copy(sin)
+      c.node = c.g.fdefs[fd].entry
+      transfer_function_value(&c, fd)
+  out.ok = not c.failed
+  var order: [Str] = []
+  swap(&order, &c.inv_order)
+  for key in order:
+    var inv = Inv([], [], [], [])
+    swap(&inv, &c.invs[key])
+    let idx = out.invs.len
+    out.bases.push(deps_to_state(inv.deps))
+    for n in inv.nodes:
+      if not (n in out.bynode): out.bynode[n] = []
+      out.bynode[n].push(idx)
+    out.invs.push(inv)
+  swap(&out.names, &c.names)
+  swap(&c.g, &g0)
+
+fn new_result() -> Result:
+  return Result(true, [], {}, [], {}, {})
+
+# The incoming state of a node, merged over every invocation that reached it (unreachable if none).
+fn incoming(var res: Result, node: Int) -> St:
+  if node in res.memo: return st_copy(res.memo[node])
+  if not (node in res.bynode): return unreachable_st()
+  var acc = new_st()
+  var first = true
+  for ii in res.bynode[node]:
+    var k = 0
+    while res.invs[ii].nodes[k] != node: k += 1
+    let s = patch(res.bases[ii], res.invs[ii].ins[k])
+    if first:
+      acc = s
+      first = false
+    else: acc = merge_plain(acc, s)
+  res.memo[node] = st_copy(acc)
+  return acc
+
+fn merge_im_plain(a: IM, b: IM, def: Int) -> IM:
+  var r = im_new()
+  var i = 0
+  var j = 0
+  while i < a.k.len or j < b.k.len:
+    if j >= b.k.len or (i < a.k.len and a.k[i] < b.k[j]):
+      r.k.push(a.k[i])
+      r.v.push(merge_vs(a.v[i], def))
+      i += 1
+    elif i >= a.k.len or b.k[j] < a.k[i]:
+      r.k.push(b.k[j])
+      r.v.push(merge_vs(def, b.v[j]))
+      j += 1
+    else:
+      r.k.push(a.k[i])
+      r.v.push(merge_vs(a.v[i], b.v[j]))
+      i += 1
+      j += 1
+  return r
+
+# mergeState with no stack (defaults for names only one side has)
+fn merge_plain(a: St, b: St) -> St:
+  if a.reach == 0 and b.reach == 0: return unreachable_st()
+  var r = St(merge_im_plain(a.g, b.g, UNKNOWN_VS), merge_im_plain(a.l, b.l, UNKNOWN_VS), merge_im_plain(a.p, b.p, UNKNOWN_VS), im_new(), [], false, -1)
+  if a.reach >= 0 and b.reach >= 0:
+    if a.reach == 1 and b.reach == 1: r.reach = 1
+    else: r.reach = 0
+  if a.has_ec or b.has_ec:
+    r.ec = union_ints(a.ec, b.ec)
+    r.has_ec = true
+  return r
+
+# variablesInScope lookup: prefix, local, global; -1 when absent
+fn var_state(res: Result, s: St, name: Str) -> Int:
+  if not (name in res.names): return -1
+  let id = res.names[name]
+  var i = im_find(s.p, id)
+  if i >= 0: return s.p.v[i]
+  i = im_find(s.l, id)
+  if i >= 0: return s.l.v[i]
+  i = im_find(s.g, id)
+  if i >= 0: return s.g.v[i]
+  return -1
+
+fn reachable(s: St) -> Bool:
+  return s.reach != 0
