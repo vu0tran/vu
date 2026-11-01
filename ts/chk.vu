@@ -29,8 +29,30 @@ fn kids(c: C, l: Int) -> [Int]:
 # ---- widening
 
 # A fresh literal widens to its primitive where a variable can change (let, var, properties).
+# const x = Symbol() / Symbol.for("..."): a unique symbol (typeof x).
+fn is_symbol_call(c: C, e: Int) -> Bool:
+  let x = skip_parens(c, e)
+  if c.t.k[x] != ast.N_CALL: return false
+  let f = c.t.a[x]
+  if c.t.k[f] == ast.N_ID: return nm(c, c.t.s[f]) == "Symbol"
+  if c.t.k[f] == ast.N_PROPACCESS and c.t.k[c.t.a[f]] == ast.N_ID: return nm(c, c.t.s[c.t.a[f]]) == "Symbol" and nm(c, c.t.s[f]) == "for"
+  return false
+
+fn unique_symbol(var c: C, s: Int) -> Int:
+  let key = "us{s}"
+  if key in c.tl_cache: return c.tl_cache[key]
+  let t = types.mk(&c, TK_SYMBOL, types.F_SYMBOL, s, 1)
+  c.tl_cache[key] = t
+  return t
+
+# The property name a unique symbol keys ("[x]", as tsc prints it), or -1.
+fn symbol_key(var c: C, t: Int) -> Int:
+  if c.tk[t] != TK_SYMBOL or c.tb[t] != 1: return -1
+  return ast.intern(&c.t, "[" + nm(c, c.sname[c.ta[t]]) + "]")
+
 fn widen(var c: C, t: Int) -> Int:
   if types.is_fresh_lit(c, t): return types.base_of_literal(c, t)
+  if c.tk[t] == TK_SYMBOL and c.tb[t] == 1: return c.symbol_t
   if t in c.freg:
     var ts: [Int] = []
     for m in types.members(c, t): ts.push(types.base_of_literal(c, m))
@@ -100,6 +122,7 @@ fn decl_type(var c: C, s: Int) -> Int:
         check_expr(&c, init, -1)
         return auto_array(&c)
       let it = check_expr(&c, c.t.c[d], -1)
+      if (sk & S_CONST) != 0 and is_symbol_call(c, c.t.c[d]) and c.tk[it] == TK_SYMBOL: return unique_symbol(&c, s)
       if (sk & S_CONST) != 0:
         # a constant keeps the fresh literal type (so let x = c widens again)
         if types.is_fresh_lit(c, it): return it
@@ -443,6 +466,30 @@ fn collect_returns(c: C, n: Int, var out: [Int]):
   if k == ast.N_LABEL: collect_returns(c, c.t.a[n], &out)
 
 # Whether control can't reach the end of a statement.
+# isExhaustiveSwitchStatement: a literal type whose every member has a case.
+fn exhaustive_switch(c: C, n: Int) -> Bool:
+  let e = c.t.a[n]
+  if not (e in c.ntype): return false
+  let st = c.ntype[e]
+  var cts: [Int] = []
+  for cs in ast.items(c.t, c.t.b[n]):
+    let ce = c.t.a[cs]
+    if ce < 0: continue
+    if not (ce in c.ntype): return false
+    let ct = types.regular(c, c.ntype[ce])
+    if not unitish(c, ct): return false
+    cts.push(ct)
+  if cts.len == 0: return false
+  for m in types.members(c, st):
+    let r = types.regular(c, m)
+    if not unitish(c, r): return false
+    if not types.has_int(cts, r): return false
+  return true
+
+fn unitish(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return types.is_literal(c, t) or k == TK_NULL or k == TK_UNDEF
+
 fn terminates(c: C, n: Int) -> Bool:
   if n < 0: return false
   let k = c.t.k[n]
@@ -466,7 +513,7 @@ fn terminates(c: C, n: Int) -> Bool:
     let cases = ast.items(c.t, c.t.b[n])
     for cs in cases:
       if c.t.a[cs] < 0: has_default = true
-    if not has_default: return false
+    if not has_default and not exhaustive_switch(c, n): return false
     # every case ends by returning or throwing (falling through to the next is fine), and no break
     for i in 0..cases.len:
       let body = ast.items(c.t, c.t.b[cases[i]])
@@ -579,7 +626,7 @@ fn definitely_falsy(var c: C, t: Int) -> Int:
     elif k == TK_FALSE or k == TK_VOID or k == TK_UNDEF or k == TK_NULL or k == TK_ANY or k == TK_UNKNOWN or k == TK_ERROR: keep.push(m)
     elif k == TK_STRLIT and c.t.names[c.ta[m]] == "": keep.push(m)
     elif k == TK_NUMLIT and c.nums[c.ta[m]] == 0.0: keep.push(m)
-    elif k == TK_BIGLIT or k == TK_TPARAM or k >= types.TK_KEYOF: return unsup(&c, 0, "the falsy part of this type")
+    elif k == TK_BIGLIT: return unsup(&c, 0, "the falsy part of this type")
   return types.union_of(&c, keep)
 
 fn truthy_part(var c: C, t: Int) -> Int:
@@ -696,11 +743,23 @@ type Fact:
   t: Int
 
 fn current_type(var c: C, e: Int) -> Int:
+  if not c.sub_mode:
+    # an unknown flow type stays unknown (-7) through narrowing
+    let x0 = skip_parens(c, e)
+    if c.t.k[x0] == ast.N_ID:
+      let vs = bind.lookup_value(&c, x0, c.t.s[x0])
+      if vs >= 0 and narrowed(c, "{vs}") == -7:
+        c.allow_unknown = true
+        check_expr(&c, x0, -1)
+        c.allow_unknown = false
+        return -7
   if c.sub_mode:
     var x = e
     while c.t.k[x] == ast.N_PAREN: x = c.t.a[x]
     if c.t.k[x] == ast.N_ID:
+      c.allow_unknown = true
       check_expr(&c, x, -1)
+      c.allow_unknown = false
       let st = sub_read(&c, x)
       if st >= 0: return st
   return check_expr(&c, e, -1)
@@ -740,6 +799,49 @@ fn keep_fresh(var c: C, t: Int, r: Int) -> Int:
   if ms.len == 1: return ms[0]
   return union_fresh(&c, ms)
 
+# Narrowing that would leave a type parameter written as tsc writes it (T & {...}): in the plain
+# pass the reference's type is unknown (-7, reading it leaves the file unchecked); a read where
+# tsc substitutes the constraint uses the second pass's fact.
+fn generic_fact(var c: C, e: Int, key: Str, var out: [Fact]):
+  if c.sub_mode or key == "":
+    unsup(&c, e, "narrowing a type parameter")
+    return
+  out.push(Fact(key + "", -7))
+
+# a && b false (truth false), a || b true (truth true): either a alone decides, or a doesn't and
+# b does; a reference narrowed on both paths gets the union.
+fn either_facts(var c: C, a: Int, b: Int, truth: Bool, var out: [Fact]):
+  var p1: [Fact] = []
+  facts1(&c, a, truth, &p1)
+  var p2: [Fact] = []
+  facts1(&c, a, not truth, &p2)
+  c.narrow.push({})
+  for f in p2: set_narrow(&c, f.key, f.t)
+  var more: [Fact] = []
+  facts1(&c, b, truth, &more)
+  c.narrow.pop()
+  var m2: {Str: Int} = {}
+  for f in p2: m2[f.key + ""] = f.t
+  for f in more: m2[f.key + ""] = f.t
+  var m1: {Str: Int} = {}
+  for f in p1: m1[f.key + ""] = f.t
+  for k, v1 in m1:
+    if not (k in m2): continue
+    let v2 = m2[k]
+    if v1 == -7 or v2 == -7:
+      out.push(Fact(k + "", -7))
+      continue
+    if v1 < 0 or v2 < 0: continue
+    let u = union_fresh(&c, [v1, v2])
+    # all of the reference's type again: no narrowing (an alias keeps its name)
+    let cur = narrowed(c, k)
+    if cur >= 0 and same_members(c, u, cur): continue
+    let s = int(k) else -1
+    if cur < 0 and s >= 0:
+      let dt = bind.type_of_sym(&c, s)
+      if same_members(c, u, dt): continue
+    out.push(Fact(k + "", u))
+
 fn fact_key(var c: C, e: Int) -> Str:
   let k = ref_key(&c, e)
   if k == "" or not c.sub_mode: return k
@@ -755,6 +857,9 @@ fn chain_roots(var c: C, e: Int, var out: [Fact]):
       let key = fact_key(&c, obj)
       if key != "":
         let t = current_type(&c, obj)
+        if t == -7:
+          if key != "": out.push(Fact(key + "", -7))
+          return
         for m in types.members(c, t):
           if is_generic_member(c, m):
             unsup(&c, obj, "narrowing a type parameter")
@@ -775,13 +880,16 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     let key = fact_key(&c, e)
     if key == "": return
     let t = current_type(&c, e)
+    if t == -7:
+      if key != "": out.push(Fact(key + "", -7))
+      return
     var plain: [Int] = []
     var tps: [Int] = []
     for m in types.members(c, t):
       if is_generic_member(c, m):
         let r = tp_truthy(&c, m, truth)
         if r == -2:
-          unsup(&c, e, "narrowing a type parameter")
+          generic_fact(&c, e, key, &out)
           return
         if r >= 0: tps.push(r)
       else: plain.push(m)
@@ -806,6 +914,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         facts1(&c, c.t.b[e], true, &more)
         c.narrow.pop()
         for f in more: out.push(Fact(f.key + "", f.t))
+      else: either_facts(&c, c.t.a[e], c.t.b[e], false, &out)
       return
     if op == scan.T_OR:
       if not truth:
@@ -816,6 +925,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         facts1(&c, c.t.b[e], false, &more)
         c.narrow.pop()
         for f in more: out.push(Fact(f.key + "", f.t))
+      else: either_facts(&c, c.t.a[e], c.t.b[e], true, &out)
       return
     if op == scan.T_EQ3 or op == scan.T_NE2 or op == scan.T_EQ2 or op == scan.T_NE:
       var pos = op == scan.T_EQ3 or op == scan.T_EQ2
@@ -832,6 +942,9 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         let key = fact_key(&c, c.t.a[l])
         if key == "": return
         let t = current_type(&c, c.t.a[l])
+        if t == -7:
+          if key != "": out.push(Fact(key + "", -7))
+          return
         let what = nm(c, c.t.s[r])
         var keep: [Int] = []
         for m in types.members(c, t):
@@ -850,7 +963,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
           elif is_generic_member(c, m):
             let tr = tp_typeof(&c, m, what, pos)
             if tr == -2:
-              unsup(&c, e, "narrowing a type parameter")
+              generic_fact(&c, e, key, &out)
               return
             if tr >= 0: keep.push(tr)
           elif typeof_matches(&c, m, what) == pos: keep.push(m)
@@ -866,7 +979,11 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
       let key = fact_key(&c, refside)
       if key == "": return
       let vt = current_type(&c, valside)
+      if vt == -7: return
       let t = current_type(&c, refside)
+      if t == -7:
+        if key != "": out.push(Fact(key + "", -7))
+        return
       let vk = c.tk[vt]
       if vk == TK_NULL or vk == TK_UNDEF:
         var keep: [Int] = []
@@ -880,7 +997,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
           if is_generic_member(c, m):
             let tr = tp_nullcmp(&c, m, vk, pos, loose)
             if tr == -2:
-              unsup(&c, e, "narrowing a type parameter")
+              generic_fact(&c, e, key, &out)
               return
             if tr >= 0: keep.push(tr)
             continue
@@ -893,7 +1010,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         var keep: [Int] = []
         for m in types.members(c, t):
           if is_generic_member(c, m):
-            unsup(&c, e, "narrowing a type parameter")
+            generic_fact(&c, e, key, &out)
             return
           if pos:
             if m == rv: keep.push(m)
@@ -923,15 +1040,22 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
                 if not pos and not (types.is_literal(c, pt) and pt == rv): ok.push(m)
               out.push(Fact(okey, types.union_of(&c, ok)))
       return
-    if op == scan.W_IN and (c.t.k[c.t.a[e]] == ast.N_STR):
+    if op == scan.W_IN and (c.t.k[c.t.a[e]] == ast.N_STR or c.t.k[c.t.a[e]] == ast.N_ID):
       let key = fact_key(&c, c.t.b[e])
       if key == "": return
+      var name = c.t.s[c.t.a[e]]
+      if c.t.k[c.t.a[e]] == ast.N_ID:
+        let lt = check_expr(&c, c.t.a[e], -1)
+        name = symbol_key(&c, lt)
+        if name < 0: return
       let t = current_type(&c, c.t.b[e])
-      let name = c.t.s[c.t.a[e]]
+      if t == -7:
+        if key != "": out.push(Fact(key + "", -7))
+        return
       var keep: [Int] = []
       for m in types.members(c, t):
         if is_generic_member(c, m):
-          unsup(&c, e, "narrowing a type parameter")
+          generic_fact(&c, e, key, &out)
           return
         if c.tk[m] != TK_OBJ:
           keep.push(m)
@@ -950,9 +1074,16 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         unsup(&c, e, "instanceof narrowing with this right side")
         return
       let t = current_type(&c, c.t.a[e])
+      if t == -7:
+        if key != "": out.push(Fact(key + "", -7))
+        return
       let r = narrow_instanceof(&c, t, it, truth)
       if r < 0:
-        unsup(&c, e, "instanceof narrowing of this type")
+        var gen = false
+        for m in types.members(c, t):
+          if is_generic_member(c, m): gen = true
+        if gen: generic_fact(&c, e, key, &out)
+        else: unsup(&c, e, "instanceof narrowing of this type")
         return
       out.push(Fact(key, r))
       return
@@ -980,10 +1111,13 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     if key == "": return
     let pt = bind.type_from(&c, c.t.a[rnode])
     let t = current_type(&c, args[idx])
+    if t == -7:
+      if key != "": out.push(Fact(key + "", -7))
+      return
     var keep: [Int] = []
     for m in types.members(c, t):
       if is_generic_member(c, m) or is_generic_member(c, pt):
-        unsup(&c, e, "narrowing a type parameter")
+        generic_fact(&c, e, key, &out)
         return
       if truth:
         if rel.assignable(&c, m, pt): keep.push(m)
@@ -1250,7 +1384,10 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
     let t = check_expr(&c, c.t.a[n], -1)
     return types.filter_union(&c, t, true, true)
   if k == ast.N_TYPEOF:
+    # the operand's type doesn't matter (an unknown flow type is fine)
+    c.allow_unknown = true
     check_expr(&c, c.t.a[n], -1)
+    c.allow_unknown = false
     var ts: [Int] = []
     for w in ["string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function"]: ts.push(types.str_lit_s(&c, w, false))
     return types.union_of(&c, ts)
@@ -1339,11 +1476,16 @@ fn no_sub_yet(var c: C, n: Int, t: Int, ctx: Int) -> Int:
   return unsup(&c, n, "a property of a type parameter with a union constraint")
 
 fn ident_type(var c: C, n: Int, ctx: Int) -> Int:
+  let subp = sub_position(&c, n, ctx)
+  if subp: c.allow_unknown = true
   let t0 = ident_type0(&c, n)
+  c.allow_unknown = false
   if t0 < 0 or c.tk[t0] == TK_UNSUP: return t0
-  if not sub_position(&c, n, ctx): return t0
+  if not subp: return t0
   let st = sub_read(&c, n)
   if st >= 0: return st
+  let vs = bind.lookup_value(&c, n, c.t.s[n])
+  if narrowed(c, "{vs}") == -7: return unsup(&c, n, "a variable whose flow type isn't known here")
   return t0
 
 # The type a reference reads as where tsc substitutes constraints (-1: no substitution applies):
@@ -1393,7 +1535,7 @@ fn ident_type0(var c: C, n: Int) -> Int:
     err(&c, n, 2454, "Variable '" + nm(c, name) + "' is used before being assigned.")
   let key = "{s}"
   let nt = narrowed(c, key)
-  if nt == -7: return unsup(&c, n, "a variable assigned in a loop, a try or a switch")
+  if nt == -7 and not c.allow_unknown: return unsup(&c, n, "a variable assigned in a loop, a try or a switch")
   var t = bind.type_of_sym(&c, s)
   if t == c.auto_arr and t >= 0:
     # an evolving array: auto[] where it evolves, its element type so far elsewhere
@@ -1707,6 +1849,16 @@ fn elem_access(var c: C, n: Int) -> Int:
 fn elem_of(var c: C, n: Int, ot: Int, it: Int) -> Int:
   let idx = c.t.b[n]
   let ik = c.tk[it]
+  let skey = symbol_key(&c, it)
+  if skey >= 0:
+    var ts: [Int] = []
+    for m in types.members(c, ot):
+      let ps = prop_of(&c, m, skey)
+      if ps < 0: return unsup(&c, n, "an element access by a symbol the type doesn't have")
+      var pt = bind.type_of_sym(&c, ps)
+      if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+      ts.push(pt)
+    return types.union_of(&c, ts)
   if ik == TK_STRLIT or ik == TK_NUMLIT:
     var pname = c.ta[it]
     if ik == TK_NUMLIT:
@@ -2798,6 +2950,13 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
   let op = c.t.f[n]
   let l = c.t.a[n]
   let r = c.t.b[n]
+  if op == scan.W_INSTANCEOF:
+    # tsc's checks on the operands aren't made here: the left side's flow type doesn't matter
+    c.allow_unknown = true
+    check_expr(&c, l, -1)
+    c.allow_unknown = false
+    check_expr(&c, r, -1)
+    return c.boolean_t
   if op == scan.T_ASSIGN:
     let lk = c.t.k[l]
     if lk == ast.N_OBJECT or lk == ast.N_ARRAY: return unsup(&c, n, "a destructuring assignment")
@@ -3244,6 +3403,11 @@ fn join_branches(var c: C, ft: {Str: Int}, fe: {Str: Int}, reach_t: Bool, reach_
       if k != "!u": set_narrow(&c, k + "", v)
     return
   if not reach_t and not reach_e: return
+  # a branch where a type parameter's narrowing isn't known: tsc's join keeps its intersections
+  for k, v in ft:
+    if v == -7 and not k.startswith("=") and k != "!u": set_narrow(&c, k + "", -7)
+  for k, v in fe:
+    if v == -7 and not k.startswith("=") and k != "!u": set_narrow(&c, k + "", -7)
   for key in assigned:
     var vt = outer_value(c, key)
     if key in ft: vt = ft[key]
@@ -3511,6 +3675,11 @@ fn check_stmt(var c: C, n: Int):
     return
   if k == ast.N_MODULE:
     if (c.t.f[n] & ast.MOD_GLOBAL) != 0 and c.t.b[n] >= 0:
+      check_stmts(&c, kids(c, c.t.b[n]))
+      return
+    # an ambient namespace: declarations only
+    if (c.t.f[n] & ast.M_DECLARE) != 0 and c.t.k[c.t.a[n]] == ast.N_ID and c.t.b[n] >= 0:
+      bind.scope_names(&c, c.t.b[n])
       check_stmts(&c, kids(c, c.t.b[n]))
       return
     unsup(&c, n, "a namespace")
