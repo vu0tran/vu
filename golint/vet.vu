@@ -1,0 +1,729 @@
+# govet's analyzers (golang.org/x/tools v0.37.0, the default set golangci-lint runs), ported one
+# by one. Each reports "analyzer: message" at the position the analyzer uses.
+
+import ast
+import scan
+import tc
+import pkg
+import format
+import resolve
+from scan import T_ASSIGN, T_DEFINE, T_LOR, T_LAND, T_EQL, T_NEQ, T_SHL, T_SHR, T_SHL_ASSIGN, T_SHR_ASSIGN, T_ARROW, T_STRING
+from scan import K_BREAK, K_CONTINUE, K_GOTO, K_FALLTHROUGH, K_VAR, K_CONST
+
+const ANALYZERS = "appends asmdecl assign atomic bools buildtag cgocall composites copylocks defers directive errorsas framepointer httpresponse ifaceassert loopclosure lostcancel nilfunc printf shift sigchanyzer slog stdmethods stdversion stringintconv structtag testinggoroutine tests timeformat unmarshal unreachable unsafeptr unusedresult"
+
+type V:
+  pi: Int
+  ranks: {Str: Int}
+  out: [pkg.Issue]
+
+fn report(g: tc.Prog, var v: V, n: Int, analyzer: Str, msg: Str):
+  let pi = v.pi
+  report_at(g, &v, g.pk[pi].t.file[n], g.pk[pi].t.pos[n], analyzer, msg)
+
+fn report_at(g: tc.Prog, var v: V, fi: Int, pos: Int, analyzer: Str, msg: Str):
+  let r = 1000 + v.ranks.get(analyzer, 99)
+  v.out.push(pkg.Issue(fi, pos, "govet", analyzer + ": " + msg, r))
+
+# All nodes of the package's files in ast.Inspect order.
+fn preorder(t: ast.Ast, roots: [Int]) -> [Int]:
+  var out: [Int] = []
+  var stack: [Int] = []
+  var i = roots.len - 1
+  while i >= 0:
+    stack.push(roots[i])
+    i -= 1
+  while stack.len > 0:
+    let n = stack.pop()
+    out.push(n)
+    let ks = resolve.kids(t, n)
+    var j = ks.len - 1
+    while j >= 0:
+      stack.push(ks[j])
+      j -= 1
+  return out
+
+fn ty(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0 or n >= g.pk[pi].ety.len: return 0
+  let t = g.pk[pi].ety[n]
+  if t < 0: return 0
+  return t
+
+fn unparen(g: tc.Prog, pi: Int, n: Int) -> Int:
+  var x = n
+  while x > 0 and g.pk[pi].t.k[x] == ast.N_PAREN: x = g.pk[pi].t.a[x]
+  return x
+
+# typeutil.Callee: the function or method a call calls (-1 if not a *types.Func).
+fn callee(g: tc.Prog, pi: Int, call: Int) -> Int:
+  var f = unparen(g, pi, g.pk[pi].t.a[call])
+  if g.pk[pi].t.k[f] == ast.N_INDEX: f = unparen(g, pi, g.pk[pi].t.a[f])
+  var o = -1
+  if g.pk[pi].t.k[f] == ast.N_IDENT: o = g.pk[pi].use[f]
+  elif g.pk[pi].t.k[f] == ast.N_SELECTOR:
+    o = g.pk[pi].sobj.get(f, -1)
+    if g.pk[pi].skind.get(f, 0) == tc.S_FIELD: return -1
+  if o >= 0 and g.ok[o] == tc.O_FUNC: return o
+  return -1
+
+fn obj_pkg_path(g: tc.Prog, o: Int) -> Str:
+  let pi = g.opkg[o]
+  if pi < 0: return ""
+  return g.pk[pi].path + ""
+
+fn is_method(g: tc.Prog, o: Int) -> Bool:
+  let pi = g.opkg[o]
+  if pi < 0: return false
+  let d = g.odecl[o]
+  if d < 0: return false
+  if g.pk[pi].t.k[d] == ast.N_FUNCDECL: return g.pk[pi].t.a[d] >= 0
+  return g.pk[pi].t.k[d] == ast.N_FIELD
+
+# The named type a method's receiver names (for a FuncDecl method), else "".
+fn recv_type_name(g: tc.Prog, o: Int) -> Str:
+  let pi = g.opkg[o]
+  if pi < 0: return ""
+  let d = g.odecl[o]
+  if d < 0 or g.pk[pi].t.k[d] != ast.N_FUNCDECL or g.pk[pi].t.a[d] < 0: return ""
+  let rt = g.orecv[o]
+  if rt < 0: return ""
+  return g.pk[pi].t.names[g.pk[pi].t.s[rt]] + ""
+
+fn is_func_named(g: tc.Prog, o: Int, path: Str, name: Str) -> Bool:
+  return o >= 0 and g.ok[o] == tc.O_FUNC and not is_method(g, o) and obj_pkg_path(g, o) == path and g.oname[o] == name
+
+fn is_method_named(g: tc.Prog, o: Int, path: Str, tname: Str, name: Str) -> Bool:
+  return o >= 0 and g.ok[o] == tc.O_FUNC and obj_pkg_path(g, o) == path and recv_type_name(g, o) == tname and g.oname[o] == name
+
+# analysisutil.HasSideEffects
+fn has_side_effects(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  if n <= 0: return false
+  let k = g.pk[pi].t.k[n]
+  if k == ast.N_CALL:
+    let fun = g.pk[pi].t.a[n]
+    if fun < g.pk[pi].emd.len and g.pk[pi].emd[fun] == tc.M_TYPE: return has_side_effects_kids(g, pi, n)
+    return true
+  if k == ast.N_UNARY and g.pk[pi].t.f[n] == T_ARROW: return true
+  return has_side_effects_kids(g, pi, n)
+
+fn has_side_effects_kids(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  for c in resolve.kids(g.pk[pi].t, n):
+    if has_side_effects(g, pi, c): return true
+  return false
+
+# ---- structtag
+
+# reflect.StructTag.Get
+fn tag_get(tag0: Str, key: Str) -> Str:
+  var tag = tag0 + ""
+  while tag.len > 0:
+    var i = 0
+    while i < tag.len and tag[i] == ' ': i += 1
+    tag = tag[i..tag.len]
+    if tag.len == 0: break
+    i = 0
+    while i < tag.len and tag[i] > ' ' and tag[i] != ':' and tag[i] != '"' and tag[i] != 0x7f: i += 1
+    if i == 0 or i + 1 >= tag.len or tag[i] != ':' or tag[i + 1] != '"': break
+    let name = tag[0..i]
+    tag = tag[i + 1..tag.len]
+    i = 1
+    while i < tag.len and tag[i] != '"':
+      if tag[i] == '\\': i += 1
+      i += 1
+    if i >= tag.len: break
+    let qvalue = tag[0..i + 1]
+    tag = tag[i + 1..tag.len]
+    if key == name: return tc.unquote(qvalue)
+  return ""
+
+fn validate_tag(tag0: Str) -> Str:
+  var tag = tag0 + ""
+  var n = 0
+  while tag.len > 0:
+    if n > 0 and tag.len > 0 and tag[0] != ' ': return "key:\"value\" pairs not separated by spaces"
+    n += 1
+    var i = 0
+    while i < tag.len and tag[i] == ' ': i += 1
+    tag = tag[i..tag.len]
+    if tag.len == 0: break
+    i = 0
+    while i < tag.len and tag[i] > ' ' and tag[i] != ':' and tag[i] != '"' and tag[i] != 0x7f: i += 1
+    if i == 0: return "bad syntax for struct tag key"
+    if i + 1 >= tag.len or tag[i] != ':': return "bad syntax for struct tag pair"
+    if tag[i + 1] != '"': return "bad syntax for struct tag value"
+    let key = tag[0..i]
+    tag = tag[i + 1..tag.len]
+    i = 1
+    while i < tag.len and tag[i] != '"':
+      if tag[i] == '\\': i += 1
+      i += 1
+    if i >= tag.len: return "bad syntax for struct tag value"
+    let qvalue = tag[0..i + 1]
+    tag = tag[i + 1..tag.len]
+    if not valid_quoted(qvalue): return "bad syntax for struct tag value"
+    var value = tc.unquote(qvalue)
+    if key != "json" and key != "xml" and key != "asn1": continue
+    if key == "xml":
+      if value.strip(" ") != value: return "suspicious space in struct tag value"
+      if value.count(" ") > 1: return "suspicious space in struct tag value"
+      let comma = value.find(",")
+      if comma < 0: continue
+      if comma > 0 and value[comma - 1] == ' ': return "suspicious space in struct tag value"
+      value = value[comma + 1..value.len]
+    elif key == "json":
+      let comma = value.find(",")
+      if comma < 0: continue
+      value = value[comma + 1..value.len]
+    if value.find(" ") >= 0: return "suspicious space in struct tag value"
+  return ""
+
+# Whether a "..." string is valid for strconv.Unquote (escapes known, no raw newline).
+fn valid_quoted(q: Str) -> Bool:
+  var i = 1
+  let n = q.len - 1
+  while i < n:
+    let c = q[i]
+    if c == '\n': return false
+    if c == '\\':
+      if i + 1 >= n: return false
+      let e = q[i + 1]
+      if e == 'x':
+        i += 4
+        continue
+      if e == 'u':
+        i += 6
+        continue
+      if e == 'U':
+        i += 10
+        continue
+      if e >= '0' and e <= '7':
+        i += 4
+        continue
+      if not (e == 'a' or e == 'b' or e == 'f' or e == 'n' or e == 'r' or e == 't' or e == 'v' or e == '\\' or e == '"'): return false
+      i += 2
+      continue
+    i += 1
+  return true
+
+# Go's %#q: a raw string if it can be backquoted, else a quoted one.
+fn sharp_q(s: Str) -> Str:
+  var ok = true
+  for i in 0..s.len:
+    let c = s[i]
+    if c == '`' or c == 0x7f or (c < ' ' and c != '\t'): ok = false
+  if ok and s.is_utf8(): return "`" + s + "`"
+  return go_quote(s)
+
+fn go_quote(s: Str) -> Str:
+  var out = "\""
+  for i in 0..s.len:
+    let c = s[i]
+    if c == '"': out += "\\\""
+    elif c == '\\': out += "\\\\"
+    elif c == '\n': out += "\\n"
+    elif c == '\t': out += "\\t"
+    elif c == '\r': out += "\\r"
+    elif c < ' ' or c == 0x7f:
+      let hx = "0123456789abcdef"
+      out += "\\x" + hx[int(c) / 16..int(c) / 16 + 1] + hx[int(c) % 16..int(c) % 16 + 1]
+    else: out += str([c])
+  return out + "\""
+
+type Seen:
+  keys: {Str: Int}     # key|name|level -> field object
+
+fn field_tag(g: tc.Prog, f: Int) -> Str:
+  let pi = g.opkg[f]
+  if pi < 0: return ""
+  let d = g.odecl[f]
+  if d < 0 or g.pk[pi].t.k[d] != ast.N_FIELD: return ""
+  let tl = g.pk[pi].t.c[d]
+  if tl <= 0: return ""
+  return tc.unquote(g.pk[pi].t.names[g.pk[pi].t.s[tl]])
+
+fn exported(name: Str) -> Bool:
+  return name.len > 0 and name[0] >= 'A' and name[0] <= 'Z'
+
+fn obj_pos_str(var g: tc.Prog, here_fi: Int, pi_here: Int, o: Int, p: pkg.Pkg) -> Str:
+  # file:line of an object, the file relative to the reporting file's folder
+  let pi = g.opkg[o]
+  let id = g.onode[o]
+  if pi == pi_here:
+    let fi = g.pk[pi].t.file[id]
+    let line = pkg.line_of(p.lines[fi], g.pk[pi].t.pos[id])
+    var path = p.paths[fi] + ""
+    var j = path.len - 1
+    while j >= 0 and path[j] != '/': j -= 1
+    var here = p.paths[here_fi] + ""
+    var h = here.len - 1
+    while h >= 0 and here[h] != '/': h -= 1
+    if h >= 0 and j >= 0 and here[0..h] == path[0..j]: path = path[j + 1..path.len]
+    elif h < 0 and j < 0: path = path + ""
+    return path + ":{line}"
+  return "?"
+
+fn check_dups(var g: tc.Prog, fs: Fs, var v: V, p: pkg.Pkg, tag: Str, key0: Str, nearest: Int, field: Int, var seen: Seen, level: Int):
+  let val0 = tag_get(tag, key0)
+  if val0 == "-": return
+  if val0.len == 0 or val0[0] == ',':
+    if g.orecv[field] != 1: return
+    let ft = tc.obj_type(&g, fs, field)
+    let u = tc.under(&g, fs, ft)
+    if u <= 0 or g.tk[u] != tc.TY_STRUCT: return
+    for f2 in tc.tlist(g, u):
+      if not exported(g.oname[f2]): continue
+      let t2 = field_tag(g, f2)
+      check_dups(&g, fs, &v, p, t2, key0, nearest, f2, &seen, level + 1)
+    return
+  var key = key0 + ""
+  if key == "xml" and g.oname[field] == "XMLName": return
+  var val = val0 + ""
+  let i = val.find(",")
+  if i >= 0:
+    if key == "xml":
+      for part in val[i..val.len].split(","):
+        if part == "attr": key = "xml attribute"
+    val = val[0..i]
+  let sk = key + "|" + val + "|{level}"
+  if sk in seen.keys:
+    let prev = seen.keys[sk]
+    let pi = v.pi
+    let nid = g.onode[nearest]
+    let here = g.pk[pi].t.file[nid]
+    let ps = obj_pos_str(&g, here, pi, prev, p)
+    report(g, &v, nid, "structtag", "struct field " + g.oname[field] + " repeats " + key + " tag " + go_quote(val) + " also at " + ps)
+  else: seen.keys[sk] = field
+
+fn structtag(var g: tc.Prog, fs: Fs, var v: V, p: pkg.Pkg, nodes: [Int]):
+  let pi = v.pi
+  if g.pk[pi].path.startswith("encoding/"): return
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_STRUCTTYPE: continue
+    let st = ty(g, pi, n)
+    if st <= 0 or g.tk[st] != tc.TY_STRUCT: continue
+    var seen = Seen({})
+    for f in tc.tlist(g, st):
+      let tag = field_tag(g, f)
+      for key in ["json", "xml"]: check_dups(&g, fs, &v, p, tag, key, f, f, &seen, 1)
+      let err = validate_tag(tag)
+      if err.len > 0: report(g, &v, g.onode[f], "structtag", "struct field tag " + sharp_q(tag) + " not compatible with reflect.StructTag.Get: " + err)
+      if g.orecv[f] == 1 or exported(g.oname[f]): continue
+      for enc in ["json", "xml"]:
+        let tv = tag_get(tag, enc)
+        if tv.len > 0 and tv != "-":
+          report(g, &v, g.onode[f], "structtag", "struct field " + g.oname[f] + " has " + enc + " tag but is not exported")
+          break
+
+# ---- assign
+
+fn is_map_index(var g: tc.Prog, fs: Fs, pi: Int, e: Int) -> Bool:
+  let x = unparen(g, pi, e)
+  if g.pk[pi].t.k[x] != ast.N_INDEX: return false
+  let t = ty(g, pi, g.pk[pi].t.a[x])
+  let u = tc.under(&g, fs, t)
+  return u > 0 and g.tk[u] == tc.TY_MAP
+
+fn assign(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
+  let pi = v.pi
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_ASSIGN or g.pk[pi].t.f[n] != T_ASSIGN: continue
+    let lhs = ast.items(g.pk[pi].t, g.pk[pi].t.a[n])
+    let rhs = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if lhs.len != rhs.len: continue
+    var exprs: [Str] = []
+    for i in 0..lhs.len:
+      let l = lhs[i]
+      let r = rhs[i]
+      if has_side_effects(g, pi, l) or has_side_effects(g, pi, r) or is_map_index(&g, fs, pi, l): continue
+      if g.pk[pi].t.k[l] != g.pk[pi].t.k[r]: continue
+      let le = format.expr(g.pk[pi].t, l)
+      if le == format.expr(g.pk[pi].t, r): exprs.push(le)
+    if exprs.len > 0: report(g, &v, n, "assign", "self-assignment of " + ", ".join(exprs))
+
+# ---- bools
+
+fn split_op(g: tc.Prog, pi: Int, e0: Int, op: Int, var seen: {Int: Bool}, var out: [Int]):
+  var e = e0
+  while true:
+    e = unparen(g, pi, e)
+    if g.pk[pi].t.k[e] == ast.N_BINARY and g.pk[pi].t.f[e] == op:
+      seen[e] = true
+      split_op(g, pi, g.pk[pi].t.b[e], op, &seen, &out)
+      e = g.pk[pi].t.a[e]
+    else:
+      out.push(e)
+      return
+
+fn bools(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
+  let pi = v.pi
+  var seen: {Int: Bool} = {}
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_BINARY or n in seen: continue
+    let op = g.pk[pi].t.f[n]
+    if op != T_LOR and op != T_LAND: continue
+    var name = "or"
+    var bad_eq = T_NEQ
+    if op == T_LAND:
+      name = "and"
+      bad_eq = T_EQL
+    let opstr = scan.tok_str(op)
+    var exprs: [Int] = []
+    split_op(g, pi, n, op, &seen, &exprs)
+    var i = 0
+    var j = 0
+    while j <= exprs.len:
+      if j == exprs.len or has_side_effects(g, pi, exprs[j]):
+        if i < j:
+          # one commutative set
+          var rs: {Str: Bool} = {}
+          for k in i..j:
+            let ef = format.expr(g.pk[pi].t, exprs[k])
+            if ef in rs: report(g, &v, exprs[k], "bools", "redundant " + name + ": " + ef + " " + opstr + " " + ef)
+            else: rs[ef] = true
+          var ss: {Str: Str} = {}
+          for k in i..j:
+            let e = exprs[k]
+            if g.pk[pi].t.k[e] != ast.N_BINARY or g.pk[pi].t.f[e] != bad_eq: continue
+            var x = -1
+            if tc.is_const(&g, fs, pi, g.pk[pi].t.b[e]): x = g.pk[pi].t.a[e]
+            elif tc.is_const(&g, fs, pi, g.pk[pi].t.a[e]): x = g.pk[pi].t.b[e]
+            else: continue
+            let xf = format.expr(g.pk[pi].t, x)
+            let ef = format.expr(g.pk[pi].t, e)
+            if xf in ss:
+              let prev = ss[xf] + ""
+              if ef != prev: report(g, &v, e, "bools", "suspect " + name + ": " + ef + " " + opstr + " " + prev)
+            else: ss[xf] = ef
+        i = j + 1
+      j += 1
+
+# ---- unreachable
+
+type Dead:
+  has_break: {Int: Bool}
+  has_goto: {Str: Bool}
+  labels: {Str: Int}
+  target: Int
+  reachable: Bool
+
+fn find_labels(g: tc.Prog, pi: Int, var d: Dead, s: Int):
+  if s <= 0: return
+  let k = g.pk[pi].t.k[s]
+  if k == ast.N_BLOCK:
+    for x in ast.items(g.pk[pi].t, g.pk[pi].t.a[s]): find_labels(g, pi, &d, x)
+  elif k == ast.N_BRANCH:
+    let tok = g.pk[pi].t.f[s]
+    let lbl = g.pk[pi].t.a[s]
+    if tok == K_GOTO and lbl > 0: d.has_goto[g.pk[pi].t.names[g.pk[pi].t.s[lbl]] + ""] = true
+    elif tok == K_BREAK:
+      var st = d.target
+      if lbl > 0: st = d.labels.get(g.pk[pi].t.names[g.pk[pi].t.s[lbl]], -1)
+      if st > 0: d.has_break[st] = true
+  elif k == ast.N_IF:
+    find_labels(g, pi, &d, g.pk[pi].t.c[s])
+    find_labels(g, pi, &d, g.pk[pi].t.d[s])
+  elif k == ast.N_LABELED:
+    d.labels[g.pk[pi].t.names[g.pk[pi].t.s[g.pk[pi].t.a[s]]] + ""] = g.pk[pi].t.b[s]
+    find_labels(g, pi, &d, g.pk[pi].t.b[s])
+  elif k == ast.N_FOR or k == ast.N_RANGE:
+    let outer = d.target
+    d.target = s
+    find_labels(g, pi, &d, g.pk[pi].t.d[s])
+    d.target = outer
+  elif k == ast.N_SELECT or k == ast.N_SWITCH or k == ast.N_TYPESWITCH:
+    let outer = d.target
+    d.target = s
+    var body = g.pk[pi].t.c[s]
+    if k == ast.N_SELECT: body = g.pk[pi].t.a[s]
+    for c in ast.items(g.pk[pi].t, body):
+      for x in ast.items(g.pk[pi].t, g.pk[pi].t.b[c]): find_labels(g, pi, &d, x)
+    d.target = outer
+
+fn is_panic_call(g: tc.Prog, pi: Int, s: Int) -> Bool:
+  let x = g.pk[pi].t.a[s]
+  if g.pk[pi].t.k[x] != ast.N_CALL: return false
+  let fun = g.pk[pi].t.a[x]
+  if g.pk[pi].t.k[fun] != ast.N_IDENT or g.pk[pi].t.names[g.pk[pi].t.s[fun]] != "panic": return false
+  # go/parser leaves it unresolved unless something named panic is declared in this file
+  let o = g.pk[pi].use[fun]
+  if o < 0: return true
+  if g.opkg[o] < 0: return true
+  if g.pk[pi].scope.get("panic", -1) == o: return g.pk[pi].t.file[g.onode[o]] != g.pk[pi].t.file[fun]
+  return false
+
+fn find_dead(var g: tc.Prog, var v: V, var d: Dead, s: Int):
+  if s <= 0: return
+  let pi = v.pi
+  let k = g.pk[pi].t.k[s]
+  if k == ast.N_LABELED and g.pk[pi].t.names[g.pk[pi].t.s[g.pk[pi].t.a[s]]] in d.has_goto: d.reachable = true
+  if not d.reachable and k != ast.N_EMPTY:
+    report(g, &v, s, "unreachable", "unreachable code")
+    d.reachable = true
+  if k == ast.N_BLOCK:
+    for x in ast.items(g.pk[pi].t, g.pk[pi].t.a[s]): find_dead(&g, &v, &d, x)
+  elif k == ast.N_BRANCH:
+    let tok = g.pk[pi].t.f[s]
+    if tok == K_BREAK or tok == K_GOTO or tok == K_FALLTHROUGH or tok == K_CONTINUE: d.reachable = false
+  elif k == ast.N_EXPRSTMT:
+    if is_panic_call(g, pi, s): d.reachable = false
+  elif k == ast.N_FOR:
+    find_dead(&g, &v, &d, g.pk[pi].t.d[s])
+    d.reachable = g.pk[pi].t.b[s] > 0 or s in d.has_break
+  elif k == ast.N_IF:
+    find_dead(&g, &v, &d, g.pk[pi].t.c[s])
+    if g.pk[pi].t.d[s] > 0:
+      let r = d.reachable
+      d.reachable = true
+      find_dead(&g, &v, &d, g.pk[pi].t.d[s])
+      d.reachable = d.reachable or r
+    else: d.reachable = true
+  elif k == ast.N_LABELED: find_dead(&g, &v, &d, g.pk[pi].t.b[s])
+  elif k == ast.N_RANGE:
+    find_dead(&g, &v, &d, g.pk[pi].t.d[s])
+    d.reachable = true
+  elif k == ast.N_RETURN: d.reachable = false
+  elif k == ast.N_SELECT:
+    var any = false
+    for c in ast.items(g.pk[pi].t, g.pk[pi].t.a[s]):
+      d.reachable = true
+      for x in ast.items(g.pk[pi].t, g.pk[pi].t.b[c]): find_dead(&g, &v, &d, x)
+      any = any or d.reachable
+    d.reachable = any or s in d.has_break
+  elif k == ast.N_SWITCH or k == ast.N_TYPESWITCH:
+    var any = false
+    var has_default = false
+    for c in ast.items(g.pk[pi].t, g.pk[pi].t.c[s]):
+      if g.pk[pi].t.a[c] < 0: has_default = true
+      d.reachable = true
+      for x in ast.items(g.pk[pi].t, g.pk[pi].t.b[c]): find_dead(&g, &v, &d, x)
+      any = any or d.reachable
+    d.reachable = any or s in d.has_break or not has_default
+
+fn unreachable(var g: tc.Prog, var v: V, nodes: [Int]):
+  let pi = v.pi
+  for n in nodes:
+    let k = g.pk[pi].t.k[n]
+    var body = -1
+    if k == ast.N_FUNCDECL: body = g.pk[pi].t.d[n]
+    elif k == ast.N_FUNCLIT: body = g.pk[pi].t.b[n]
+    else: continue
+    if body <= 0: continue
+    var d = Dead({}, {}, {}, -1, true)
+    find_labels(g, pi, &d, body)
+    d.reachable = true
+    find_dead(&g, &v, &d, body)
+
+# ---- unusedresult
+
+fn unusedresult(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
+  let pi = v.pi
+  let funcs = ["context.WithCancel", "context.WithDeadline", "context.WithTimeout", "context.WithValue", "errors.New", "fmt.Append", "fmt.Appendf", "fmt.Appendln", "fmt.Errorf", "fmt.Sprint", "fmt.Sprintf", "fmt.Sprintln", "maps.All", "maps.Clone", "maps.Collect", "maps.Equal", "maps.EqualFunc", "maps.Keys", "maps.Values", "slices.All", "slices.AppendSeq", "slices.Backward", "slices.BinarySearch", "slices.BinarySearchFunc", "slices.Chunk", "slices.Clip", "slices.Clone", "slices.Collect", "slices.Compact", "slices.CompactFunc", "slices.Compare", "slices.CompareFunc", "slices.Concat", "slices.Contains", "slices.ContainsFunc", "slices.Delete", "slices.DeleteFunc", "slices.Equal", "slices.EqualFunc", "slices.Grow", "slices.Index", "slices.IndexFunc", "slices.Insert", "slices.IsSorted", "slices.IsSortedFunc", "slices.Max", "slices.MaxFunc", "slices.Min", "slices.MinFunc", "slices.Repeat", "slices.Replace", "slices.Sorted", "slices.SortedFunc", "slices.SortedStableFunc", "slices.Values", "sort.Reverse"]
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_EXPRSTMT: continue
+    let call = unparen(g, pi, g.pk[pi].t.a[n])
+    if g.pk[pi].t.k[call] != ast.N_CALL: continue
+    let o = callee(g, pi, call)
+    if o < 0: continue
+    if is_method(g, o):
+      let nm = g.oname[o]
+      if nm != "Error" and nm != "String": continue
+      let mt = tc.obj_type(&g, fs, o)
+      if mt <= 0 or g.tlen[g.ta[mt]] != 0: continue
+      let rs = tc.tlist(g, g.tb[mt])
+      if rs.len != 1 or rs[0] != tc.B_STRING: continue
+      # the receiver type
+      let fun = unparen(g, pi, g.pk[pi].t.a[call])
+      var rtn = ""
+      let opi = g.opkg[o]
+      let d = g.odecl[o]
+      if opi >= 0 and d >= 0 and g.pk[opi].t.k[d] == ast.N_FUNCDECL:
+        let rt = g.pk[opi].t.b[ast.item(g.pk[opi].t, g.pk[opi].t.a[d], 0)]
+        var star = ""
+        if g.pk[opi].t.k[rt] == ast.N_STAR: star = "*"
+        rtn = star + g.pk[opi].path + "." + recv_type_name(g, o)
+      else:
+        let owner = g.mowner.get(o, -1)
+        if owner < 0: continue
+        let ot = tc.obj_type(&g, fs, owner)
+        rtn = tc.type_str(&g, fs, ot, "")
+      report(g, &v, call, "unusedresult", "result of (" + rtn + ")." + nm + " call not used")
+    else:
+      let full = obj_pkg_path(g, o) + "." + g.oname[o]
+      if full in funcs: report(g, &v, call, "unusedresult", "result of " + full + " call not used")
+
+# ---- nilfunc
+
+fn is_nil(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  let x = unparen(g, pi, n)
+  if g.pk[pi].t.k[x] != ast.N_IDENT: return false
+  let o = g.pk[pi].use[x]
+  return o >= 0 and g.ok[o] == tc.O_NIL
+
+fn used_ident(g: tc.Prog, pi: Int, n: Int) -> Int:
+  var x = unparen(g, pi, n)
+  if g.pk[pi].t.k[x] == ast.N_INDEX: x = unparen(g, pi, g.pk[pi].t.a[x])
+  if g.pk[pi].t.k[x] == ast.N_SELECTOR: x = g.pk[pi].t.b[x]
+  if g.pk[pi].t.k[x] == ast.N_IDENT: return x
+  return -1
+
+fn nilfunc(var g: tc.Prog, var v: V, nodes: [Int]):
+  let pi = v.pi
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_BINARY: continue
+    let op = g.pk[pi].t.f[n]
+    if op != T_EQL and op != T_NEQ: continue
+    var e2 = -1
+    if is_nil(g, pi, g.pk[pi].t.a[n]): e2 = g.pk[pi].t.b[n]
+    elif is_nil(g, pi, g.pk[pi].t.b[n]): e2 = g.pk[pi].t.a[n]
+    else: continue
+    let id = used_ident(g, pi, e2)
+    if id < 0: continue
+    let o = g.pk[pi].use[id]
+    if o < 0 or g.ok[o] != tc.O_FUNC: continue
+    var res = "false"
+    if op == T_NEQ: res = "true"
+    report(g, &v, n, "nilfunc", "comparison of function " + g.oname[o] + " " + scan.tok_str(op) + " nil is always " + res)
+
+# ---- shift
+
+fn int_size(var g: tc.Prog, fs: Fs, t: Int) -> Int:
+  let u = tc.under(&g, fs, t)
+  if u == tc.B_INT8 or u == tc.B_UINT8: return 8
+  if u == tc.B_INT16 or u == tc.B_UINT16: return 16
+  if u == tc.B_INT32 or u == tc.B_UINT32: return 32
+  if u == tc.B_INT or u == tc.B_UINT or u == tc.B_INT64 or u == tc.B_UINT64 or u == tc.B_UINTPTR: return 64
+  return 0
+
+fn shift_dead(var g: tc.Prog, fs: Fs, pi: Int, nodes: [Int], var dead: {Int: Bool}):
+  for n in nodes:
+    let k = g.pk[pi].t.k[n]
+    if k == ast.N_IF:
+      let c = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], g.pk[pi].t.b[n], -1, 0)
+      if c.k != 4: continue
+      if c.i == 1: mark_dead(g, pi, g.pk[pi].t.d[n], &dead)
+      else: mark_dead(g, pi, g.pk[pi].t.c[n], &dead)
+    elif k == ast.N_SWITCH:
+      if g.pk[pi].t.b[n] > 0: continue
+      # a tagless switch with constant cases
+      var live = false
+      for c in ast.items(g.pk[pi].t, g.pk[pi].t.c[n]):
+        let l = g.pk[pi].t.a[c]
+        if l < 0: continue
+        var all_false = true
+        for e in ast.items(g.pk[pi].t, l):
+          let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], e, -1, 0)
+          if not (cv.k == 4 and cv.i == 0): all_false = false
+        if all_false:
+          for s in ast.items(g.pk[pi].t, g.pk[pi].t.b[c]): mark_dead(g, pi, s, &dead)
+
+fn mark_dead(g: tc.Prog, pi: Int, n: Int, var dead: {Int: Bool}):
+  if n <= 0: return
+  var stack = [n]
+  while stack.len > 0:
+    let x = stack.pop()
+    dead[x] = true
+    for c in resolve.kids(g.pk[pi].t, x): stack.push(c)
+
+fn shift(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
+  let pi = v.pi
+  var dead: {Int: Bool} = {}
+  shift_dead(&g, fs, pi, nodes, &dead)
+  for n in nodes:
+    if n in dead: continue
+    let k = g.pk[pi].t.k[n]
+    var x = -1
+    var y = -1
+    if k == ast.N_BINARY and (g.pk[pi].t.f[n] == T_SHL or g.pk[pi].t.f[n] == T_SHR):
+      x = g.pk[pi].t.a[n]
+      y = g.pk[pi].t.b[n]
+    elif k == ast.N_ASSIGN and (g.pk[pi].t.f[n] == T_SHL_ASSIGN or g.pk[pi].t.f[n] == T_SHR_ASSIGN):
+      if ast.count(g.pk[pi].t, g.pk[pi].t.a[n]) != 1 or ast.count(g.pk[pi].t, g.pk[pi].t.b[n]) != 1: continue
+      x = ast.item(g.pk[pi].t, g.pk[pi].t.a[n], 0)
+      y = ast.item(g.pk[pi].t, g.pk[pi].t.b[n], 0)
+    else: continue
+    if tc.is_const(&g, fs, pi, x): continue
+    let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], y, -1, 0)
+    if cv.k != 1: continue
+    let size = int_size(&g, fs, ty(g, pi, x))
+    if size == 0: continue
+    if cv.i >= size: report(g, &v, n, "shift", format.expr(g.pk[pi].t, x) + " ({size} bits) too small for shift of {cv.i}")
+
+# ---- stringintconv
+
+fn basic_name(var g: tc.Prog, fs: Fs, t: Int) -> Str:
+  if t <= 0: return ""
+  if g.tk[t] == tc.TY_BASIC: return tc.type_str(&g, fs, t, "")
+  if g.tk[t] == tc.TY_NAMED: return g.oname[g.ta[t]] + ""
+  return ""
+
+fn stringintconv(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
+  let pi = v.pi
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_CALL: continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len != 1: continue
+    let fun = g.pk[pi].t.a[n]
+    var tobj = -1
+    if g.pk[pi].t.k[fun] == ast.N_IDENT: tobj = g.pk[pi].use[fun]
+    elif g.pk[pi].t.k[fun] == ast.N_SELECTOR: tobj = g.pk[pi].use[g.pk[pi].t.b[fun]]
+    if tobj < 0 or g.ok[tobj] != tc.O_TYPE: continue
+    let t = tc.obj_type(&g, fs, tobj)
+    if t <= 0 or g.tk[t] == tc.TY_TPARAM: continue
+    if tc.under(&g, fs, t) != tc.B_STRING: continue
+    let vt = ty(g, pi, args[0])
+    if vt <= 0 or g.tk[vt] == tc.TY_TPARAM: continue
+    let vu = tc.under(&g, fs, vt)
+    if not (vu >= tc.B_INT and vu <= tc.B_UINTPTR or vu == tc.B_UINT_): continue
+    if vu == tc.B_UINT8 or vu == tc.B_INT32 or vu == tc.B_URUNE: continue
+    var target = g.oname[tobj] + ""
+    let tun = tc.under(&g, fs, t)
+    let tu = basic_name(&g, fs, tun)
+    if tu.len > 0 and tu != target: target += " (" + tu + ")"
+    var source = basic_name(&g, fs, vt)
+    if source.len == 0: continue
+    let su = basic_name(&g, fs, vu)
+    if su.len > 0 and su != source: source += " (" + su + ")"
+    report(g, &v, n, "stringintconv", "conversion from " + source + " to " + target + " yields a string of one rune, not a string of digits")
+
+# ---- timeformat
+
+fn timeformat(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
+  let pi = v.pi
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_CALL: continue
+    let o = callee(g, pi, n)
+    if not (is_method_named(g, o, "time", "Time", "Format") or is_func_named(g, o, "time", "Parse")): continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len == 0: continue
+    let a = args[0]
+    let at = ty(g, pi, a)
+    if at != tc.B_STRING and at != tc.B_USTRING: continue
+    let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], a, -1, 0)
+    if cv.k != 2: continue
+    let bad = cv.s.find("2006-02-01")
+    if bad < 0: continue
+    if g.pk[pi].t.k[a] == ast.N_BASICLIT:
+      report_at(g, &v, g.pk[pi].t.file[a], g.pk[pi].t.pos[a] + bad + 1, "timeformat", "2006-02-01 should be 2006-01-02")
+    else: report(g, &v, a, "timeformat", "2006-02-01 should be 2006-01-02")
+
+# ---- the driver
+
+fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue]):
+  var ranks: {Str: Int} = {}
+  let names = ANALYZERS.split()
+  for i in 0..names.len: ranks[names[i]] = i
+  var v = V(pi, ranks, [])
+  var roots: [Int] = []
+  for fi in 0..g.pk[pi].roots.len:
+    if not p.gen[fi]: roots.push(g.pk[pi].roots[fi])
+  let nodes = preorder(g.pk[pi].t, roots)
+  assign(&g, fs, &v, nodes)
+  bools(&g, fs, &v, nodes)
+  nilfunc(&g, &v, nodes)
+  shift(&g, fs, &v, nodes)
+  stringintconv(&g, fs, &v, nodes)
+  structtag(&g, fs, &v, p, nodes)
+  timeformat(&g, fs, &v, nodes)
+  unreachable(&g, &v, nodes)
+  unusedresult(&g, fs, &v, nodes)
+  for is in v.out: issues.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))

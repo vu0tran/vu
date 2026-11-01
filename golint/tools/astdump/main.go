@@ -11,6 +11,12 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-fmt" {
+		for _, path := range os.Args[2:] {
+			dumpFmt(path)
+		}
+		return
+	}
 	for _, path := range os.Args[1:] {
 		fset := token.NewFileSet()
 		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
