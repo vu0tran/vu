@@ -25,6 +25,7 @@ type Parser:
   no_cond: Bool     # inside a conditional type's extends clause
   gen: Bool         # inside a generator's body: 'yield' is an operator
   exact: Bool       # nodes end where their last token ends (else where the next token starts)
+  jsx: Bool         # '<' in an expression starts JSX (not a type assertion)
 
 # A saved scanner position, for looking ahead.
 type Save:
@@ -166,14 +167,14 @@ fn semi(var p: Parser):
 # ---- the file
 
 fn parse_file(var t: ast.Ast, own src: Str, file: Int, var kw: {Str: Int}) -> [Diag]:
-  return parse_file_x(&t, src, file, &kw, false)
+  return parse_file_x(&t, src, file, &kw, false, false)
 
 # exact: each node ends where its last token ends (the linter's mode)
-fn parse_file_x(var t: ast.Ast, own src: Str, file: Int, var kw: {Str: Int}, exact: Bool) -> [Diag]:
+fn parse_file_x(var t: ast.Ast, own src: Str, file: Int, var kw: {Str: Int}, exact: Bool, jsx: Bool) -> [Diag]:
   # the keyword table lent to the scanner (moved, not copied) and given back at the end
   var km: {Str: Int} = {}
   swap(&km, &kw)
-  var p = Parser(scan.scanner(src, km), ast.new_ast(), file, [], 0, false, false, false, exact)
+  var p = Parser(scan.scanner(src, km), ast.new_ast(), file, [], 0, false, false, false, exact, jsx)
   swap(&p.t, &t)
   next(&p)
   var stmts: [Int] = []
@@ -1891,6 +1892,7 @@ fn unary(var p: Parser) -> Int:
     let id = n(&p, ast.N_AWAIT, pos)
     p.t.a[id] = unary(&p)
     return fin(&p, id)
+  if k == T_LT and p.jsx: return jsx_element(&p, false)
   if k == T_LT:
     # <T>expr (a type assertion; .ts files only)
     next(&p)
@@ -2294,3 +2296,161 @@ fn object_literal(var p: Parser) -> Int:
   expect(&p, T_RBRACE)
   p.t.a[id] = lst(&p, props, pos)
   return fin(&p, id)
+
+# ---- JSX
+
+# Moves the scanner to src position i and reads the token there.
+fn jsx_seek(var p: Parser, i: Int):
+  p.sc.i = i
+  scan.next(&p.sc)
+
+# A JSX name: identifiers joined by '-' (and a namespace a:b), or a member expression a.b.c.
+fn jsx_name(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  if p.sc.tok == scan.W_THIS:
+    var e = n(&p, ast.N_THIS, pos)
+    next(&p)
+    return jsx_member(&p, e)
+  if not is_name(p.sc.tok):
+    err(&p, pos, 1003, "Identifier expected.")
+    return n(&p, ast.N_ID, pos)
+  # extend over '-' and ':' parts straight from the source
+  var j = p.sc.te
+  let src = p.sc.src
+  while j < src.len and (src[j] == '-' or (src[j] == ':' and j + 1 < src.len and scan.is_id_start(src[j + 1]))):
+    j += 1
+    while j < src.len and (scan.is_id_part(src[j]) or src[j] == '-'): j += 1
+  let id = n(&p, ast.N_ID, pos)
+  p.t.s[id] = ast.intern(&p.t, src[pos..j])
+  if j > p.sc.te:
+    p.t.end[id] = j
+    jsx_seek(&p, j)
+    return id
+  next(&p)
+  return jsx_member(&p, id)
+
+fn jsx_member(var p: Parser, e0: Int) -> Int:
+  var e = e0
+  let pos = p.t.pos[e0]
+  while p.sc.tok == scan.T_DOT:
+    next(&p)
+    let id = n(&p, ast.N_PROPACCESS, pos)
+    p.t.a[id] = e
+    p.t.d[id] = p.sc.ts
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    e = fin(&p, id)
+  return e
+
+# An element or fragment; the current token is '<'. Inside children, the scanner is left just past
+# the final '>' (the caller goes on reading text); otherwise at the next token.
+fn jsx_element(var p: Parser, in_children: Bool) -> Int:
+  let pos = p.sc.ts
+  let id = n(&p, ast.N_JSXELEM, pos)
+  next(&p)
+  var frag = false
+  if p.sc.tok == T_GT:
+    frag = true
+    p.t.f[id] = 1
+  else:
+    p.t.a[id] = jsx_name(&p)
+    if p.sc.tok == T_LT: p.t.d[id] = type_args(&p)
+    # attributes
+    var attrs: [Int] = []
+    let apos = p.sc.ts
+    while p.sc.tok != T_GT and p.sc.tok != T_SLASH and p.sc.tok != T_EOF:
+      if p.sc.tok == T_LBRACE:
+        let sp = n(&p, ast.N_JSXSPREAD, p.sc.ts)
+        next(&p)
+        expect(&p, scan.T_DOTS)
+        p.t.a[sp] = assignment(&p)
+        if p.sc.tok != T_RBRACE: err(&p, p.sc.ts, 1005, "'}}' expected.")
+        next(&p)
+        attrs.push(fin(&p, sp))
+        continue
+      let at = n(&p, ast.N_JSXATTR, p.sc.ts)
+      p.t.a[at] = jsx_name(&p)
+      if p.sc.tok == T_ASSIGN:
+        next(&p)
+        if p.sc.tok == T_STR: p.t.b[at] = string_lit(&p)
+        elif p.sc.tok == T_LBRACE:
+          let ex = n(&p, ast.N_JSXEXPR, p.sc.ts)
+          next(&p)
+          p.t.a[ex] = assignment(&p)
+          if p.sc.tok != T_RBRACE: err(&p, p.sc.ts, 1005, "'}}' expected.")
+          next(&p)
+          p.t.b[at] = fin(&p, ex)
+        elif p.sc.tok == T_LT: p.t.b[at] = jsx_element(&p, false)
+        else:
+          err(&p, p.sc.ts, 1145, "'{{' or JSX element expected.")
+          next(&p)
+      attrs.push(fin(&p, at))
+      if p.sc.ts == p.t.pos[at] and p.sc.tok != T_EOF: next(&p)
+    p.t.b[id] = lst(&p, attrs, apos)
+    if p.sc.tok == T_SLASH:
+      next(&p)
+      if p.sc.tok != T_GT:
+        err(&p, p.sc.ts, 1005, "'>' expected.")
+        return fin(&p, id)
+      if in_children:
+        let e = p.sc.te
+        p.t.end[id] = e
+        p.sc.i = e
+        return id
+      p.t.end[id] = p.sc.te
+      next(&p)
+      return id
+  if p.sc.tok != T_GT:
+    err(&p, p.sc.ts, 1005, "'>' expected.")
+    return fin(&p, id)
+  # children, read from just past the '>'
+  var kids: [Int] = []
+  let cpos = p.sc.te
+  var i = p.sc.te
+  let src = p.sc.src
+  while true:
+    let start = i
+    while i < src.len and src[i] != '{' and src[i] != '<': i += 1
+    if i > start:
+      let tx = ast.node(&p.t, ast.N_JSXTEXT, start, i, p.file)
+      kids.push(tx)
+    if i >= src.len:
+      err(&p, i, 17008, "JSX element has no corresponding closing tag.")
+      p.sc.i = i
+      next(&p)
+      return id
+    if src[i] == '{':
+      jsx_seek(&p, i)
+      let ex = n(&p, ast.N_JSXEXPR, i)
+      next(&p)
+      if p.sc.tok == scan.T_DOTS:
+        next(&p)
+        p.t.k[ex] = ast.N_JSXSPREAD
+        p.t.a[ex] = assignment(&p)
+      elif p.sc.tok != T_RBRACE: p.t.a[ex] = expression(&p)
+      if p.sc.tok != T_RBRACE:
+        err(&p, p.sc.ts, 1005, "'}}' expected.")
+        return id
+      p.t.end[ex] = p.sc.te
+      kids.push(ex)
+      i = p.sc.te
+      continue
+    # '<': a closing tag or a child element
+    var j = i + 1
+    while j < src.len and (src[j] == ' ' or src[j] == '\t' or src[j] == '\n' or src[j] == '\r'): j += 1
+    if j < src.len and src[j] == '/':
+      p.t.c[id] = ast.list(&p.t, kids, cpos, i, p.file)
+      jsx_seek(&p, j + 1)
+      if not frag: p.t.d[id] = jsx_name(&p)
+      if p.sc.tok != T_GT:
+        err(&p, p.sc.ts, 1005, "'>' expected.")
+        return id
+      p.t.end[id] = p.sc.te
+      if in_children: p.sc.i = p.sc.te
+      else: next(&p)
+      return id
+    jsx_seek(&p, i)
+    let child = jsx_element(&p, true)
+    kids.push(child)
+    i = p.sc.i
+  return id
