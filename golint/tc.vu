@@ -98,6 +98,12 @@ type Pk:
   target: Bool
   ok: Bool
   cmts: [[Int]]          # per file: comments (start, end, end of the token before)
+  lazy: Bool             # files are parsed when a name they declare is needed
+  lsrc: [Str]            # lazy: each file's source, until parsed
+  lparsed: [Bool]
+  lnames: {Str: [Int]}   # lazy: top-level name -> files declaring it
+  lmethods: {Str: [Int]} # lazy: receiver base type name -> files with its methods
+  pkgdoc: [Str]          # lazy: each file's package doc comment text
 
 type Prog:
   pk: [Pk]
@@ -115,7 +121,8 @@ type Prog:
   oorig: [Int]      # a substituted copy -> the original
   otp: {Int: [Int]} # generic types and functions (and methods: their receiver's) -> type parameter types
   mowner: {Int: Int} # interface methods -> the named interface type declaring them
-  locals: [Int]      # objects declared inside functions of target packages
+  locals: [Int]      # objects declared inside functions of the target package
+  fmcache: {Str: [Int]}  # lookup_fm results by type and name
   # types
   tk: [Int]
   ta: [Int]
@@ -141,7 +148,7 @@ type Prog:
   unsafe_pkg: Int
 
 fn new_prog(goroot: Str, modcache: Str) -> Prog:
-  var g = Prog([], {}, [], [], [], [], [], [], [], [], [], [], {}, {}, [], [], [], [], [], [], [], {}, {}, {}, 0, 0, 0, goroot + "", modcache + "", "", "", [], [], scan.keywords(), [], -1, -1)
+  var g = Prog([], {}, [], [], [], [], [], [], [], [], [], [], {}, {}, [], {}, [], [], [], [], [], [], {}, {}, {}, 0, 0, 0, goroot + "", modcache + "", "", "", [], [], scan.keywords(), [], -1, -1)
   # type 0: invalid; 1..25: basic
   for i in 0..NBASIC:
     g.tk.push(TY_BASIC)
@@ -607,7 +614,7 @@ fn pkg_dir(g: Prog, path: Str, from_std: Bool) -> Str:
   return g.req_dirs[best] + path[g.req_mods[best].len..path.len]
 
 fn new_pk(path: Str, dir: Str) -> Pk:
-  return Pk(path + "", "", dir + "", ast.new_ast(), [], [], [], [], {}, {}, {}, [], [], [], {}, {}, {}, false, false, false, [])
+  return Pk(path + "", "", dir + "", ast.new_ast(), [], [], [], [], {}, {}, {}, [], [], [], {}, {}, {}, false, false, false, [], false, [], [], {}, {}, [])
 
 # Loads the declarations of the package at an import path (once). -1 if it can't be found.
 fn load_pkg(var g: Prog, fs: Fs, path: Str, from_std: Bool) -> Int:
@@ -634,15 +641,255 @@ fn load_pkg(var g: Prog, fs: Fs, path: Str, from_std: Bool) -> Int:
   var p = new_pk(path, dir)
   p.std = dir.startswith(g.goroot + "/")
   g.pk.push(p)
+  g.pk[pi].lazy = true
   var kw: {Str: Int} = {}
   swap(&kw, &g.kw)
   for nm in files:
     let src = fs.read(dir + "/" + nm) else continue
     if not load.good_constraints(src): continue
-    add_src(&g, pi, src, true, &kw)
+    let lf = g.pk[pi].lsrc.len
+    let ix = index_lines(src)
+    if g.pk[pi].name.len == 0: g.pk[pi].name = ix.pkgname + ""
+    for nm2 in ix.names:
+      if nm2 in g.pk[pi].lnames: g.pk[pi].lnames[nm2].push(lf)
+      else: g.pk[pi].lnames[nm2] = [lf]
+    for b in ix.methods:
+      if b in g.pk[pi].lmethods: g.pk[pi].lmethods[b].push(lf)
+      else: g.pk[pi].lmethods[b] = [lf]
+    g.pk[pi].pkgdoc.push(ix.doc)
+    g.pk[pi].lsrc.push(src)
+    g.pk[pi].lparsed.push(false)
   swap(&kw, &g.kw)
-  collect(&g, pi)
+  g.pk[pi].ok = true
   return pi
+
+# Parses lazy file lf of package pi (once) and adds its declarations.
+fn ensure_file(var g: Prog, pi: Int, lf: Int):
+  if g.pk[pi].lparsed[lf]: return
+  g.pk[pi].lparsed[lf] = true
+  var src = ""
+  swap(&src, &g.pk[pi].lsrc[lf])
+  var kw: {Str: Int} = {}
+  swap(&kw, &g.kw)
+  add_src(&g, pi, src, true, &kw)
+  swap(&kw, &g.kw)
+  collect_file(&g, pi, g.pk[pi].roots.len - 1)
+
+# A package-level object by name, parsing the file that declares it if needed. -1: none.
+fn scope_get(var g: Prog, pi: Int, name: Str) -> Int:
+  let o = g.pk[pi].scope.get(name, -1)
+  if o >= 0 or not g.pk[pi].lazy: return o
+  if not (name in g.pk[pi].lnames): return -1
+  var lfs: [Int] = []
+  for x in g.pk[pi].lnames[name]: lfs.push(x)
+  for lf in lfs: ensure_file(&g, pi, lf)
+  return g.pk[pi].scope.get(name, -1)
+
+# The methods declared on package-level type object o.
+fn methods_of(var g: Prog, o: Int) -> [Int]:
+  var out: [Int] = []
+  let pi = g.opkg[o]
+  if pi < 0: return out
+  let name = g.oname[o] + ""
+  if g.pk[pi].lazy and name in g.pk[pi].lmethods:
+    var lfs: [Int] = []
+    for x in g.pk[pi].lmethods[name]: lfs.push(x)
+    for lf in lfs: ensure_file(&g, pi, lf)
+  if g.pk[pi].scope.get(name, -1) != o: return out
+  if name in g.pk[pi].mbyname:
+    for m in g.pk[pi].mbyname[name]: out.push(m)
+  return out
+
+type Index:
+  pkgname: Str
+  names: [Str]
+  methods: [Str]
+  doc: Str
+
+# The top-level names (and the receiver types of methods) a file declares, from its tokens.
+fn index_file(src: Str, var kw: {Str: Int}) -> Index:
+  var k2: {Str: Int} = {}
+  swap(&k2, &kw)
+  var sc = scan.scanner(src + "", k2)
+  var ix = Index("", [], [], "")
+  scan.next(&sc)
+  if sc.tok == scan.K_PACKAGE:
+    let ppos = sc.ts
+    scan.next(&sc)
+    if sc.tok == scan.T_IDENT: ix.pkgname = sc.src[sc.ts..sc.te]
+    var cm: [Int] = []
+    for x in sc.comments: cm.push(x)
+    ix.doc = deprecated_doc(sc.src, cm, ppos)
+  var depth = 0
+  while sc.tok != scan.T_EOF:
+    let t = sc.tok
+    if depth == 0 and t == scan.K_FUNC:
+      scan.next(&sc)
+      if sc.tok == scan.T_LPAREN:
+        scan.next(&sc)
+        var d = 1
+        var bd = 0
+        var last = ""
+        while d > 0 and sc.tok != scan.T_EOF:
+          let u = sc.tok
+          if u == scan.T_LPAREN: d += 1
+          elif u == scan.T_RPAREN: d -= 1
+          elif u == scan.T_LBRACK: bd += 1
+          elif u == scan.T_RBRACK: bd -= 1
+          elif u == scan.T_IDENT and bd == 0 and d == 1: last = sc.src[sc.ts..sc.te]
+          scan.next(&sc)
+        if last.len > 0: ix.methods.push(last)
+      elif sc.tok == scan.T_IDENT:
+        ix.names.push(sc.src[sc.ts..sc.te])
+        scan.next(&sc)
+      continue
+    if depth == 0 and (t == scan.K_TYPE or t == scan.K_VAR or t == scan.K_CONST):
+      let is_type = t == scan.K_TYPE
+      scan.next(&sc)
+      if sc.tok == scan.T_LPAREN:
+        scan.next(&sc)
+        var d = 1
+        var at_start = true
+        while d > 0 and sc.tok != scan.T_EOF:
+          let u = sc.tok
+          if d == 1 and at_start and u == scan.T_IDENT:
+            ix.names.push(sc.src[sc.ts..sc.te])
+            at_start = false
+            scan.next(&sc)
+            if not is_type:
+              while sc.tok == scan.T_COMMA:
+                scan.next(&sc)
+                if sc.tok == scan.T_IDENT:
+                  ix.names.push(sc.src[sc.ts..sc.te])
+                  scan.next(&sc)
+            continue
+          if u == scan.T_LPAREN or u == scan.T_LBRACE or u == scan.T_LBRACK: d += 1
+          elif u == scan.T_RPAREN or u == scan.T_RBRACE or u == scan.T_RBRACK: d -= 1
+          elif u == scan.T_SEMI and d == 1: at_start = true
+          else: at_start = false
+          scan.next(&sc)
+        continue
+      if sc.tok == scan.T_IDENT:
+        ix.names.push(sc.src[sc.ts..sc.te])
+        scan.next(&sc)
+        if not is_type:
+          while sc.tok == scan.T_COMMA:
+            scan.next(&sc)
+            if sc.tok == scan.T_IDENT:
+              ix.names.push(sc.src[sc.ts..sc.te])
+              scan.next(&sc)
+      continue
+    if t == scan.T_LPAREN or t == scan.T_LBRACE or t == scan.T_LBRACK: depth += 1
+    elif t == scan.T_RPAREN or t == scan.T_RBRACE or t == scan.T_RBRACK: depth -= 1
+    scan.next(&sc)
+  swap(&sc.kw, &kw)
+  return ix
+
+fn is_ident_byte(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c >= 128
+
+# The identifier at the start of s[i..] (or "").
+fn ident_at(s: Str, i: Int) -> Str:
+  var j = i
+  while j < s.len and is_ident_byte(s[j]): j += 1
+  if j == i or (s[i] >= '0' and s[i] <= '9'): return ""
+  return s[i..j]
+
+# index_file's result from the lines of a gofmt'ed file: top-level declarations start in column 0,
+# and the specs of a parenthesized group are indented by one tab.
+fn index_lines(src: Str) -> Index:
+  var ix = Index("", [], [], "")
+  var i = 0
+  let n = src.len
+  var group = 0          # 1 type, 2 var or const
+  var doc: [Str] = []
+  while i < n:
+    var j = src.find("\n", i)
+    if j < 0: j = n
+    let c = src[i]
+    if group > 0:
+      if c == ')': group = 0
+      elif c == '\t' and i + 1 < j and is_ident_byte(src[i + 1]):
+        let nm = ident_at(src, i + 1)
+        if nm.len > 0:
+          ix.names.push(nm)
+          if group == 2:
+            # more names: a, b, c
+            var k = i + 1 + nm.len
+            while k + 1 < j and src[k] == ',' and src[k + 1] == ' ':
+              let more = ident_at(src, k + 2)
+              if more.len == 0: break
+              ix.names.push(more)
+              k = k + 2 + more.len
+    elif c == 'f' and src[i..min(i + 5, n)] == "func ":
+      if i + 5 < n and src[i + 5] == '(':
+        # a method: the receiver's type name is its last identifier outside brackets
+        var k = i + 6
+        var d = 1
+        var bd = 0
+        var last = ""
+        while k < j and d > 0:
+          let ch = src[k]
+          if ch == '(': d += 1
+          elif ch == ')': d -= 1
+          elif ch == '[': bd += 1
+          elif ch == ']': bd -= 1
+          elif bd == 0 and d == 1 and is_ident_byte(ch) and not is_ident_byte(src[k - 1]):
+            let id = ident_at(src, k)
+            if id.len > 0:
+              last = id
+              k += id.len
+              continue
+          k += 1
+        if last.len > 0: ix.methods.push(last)
+      else:
+        let nm = ident_at(src, i + 5)
+        if nm.len > 0: ix.names.push(nm)
+    elif c == 't' and src[i..min(i + 5, n)] == "type ":
+      if i + 5 < n and src[i + 5] == '(': group = 1
+      else:
+        let nm = ident_at(src, i + 5)
+        if nm.len > 0: ix.names.push(nm)
+    elif (c == 'v' and src[i..min(i + 4, n)] == "var ") or (c == 'c' and src[i..min(i + 6, n)] == "const "):
+      var k = i + 4
+      if c == 'c': k = i + 6
+      if k < n and src[k] == '(': group = 2
+      else:
+        let nm = ident_at(src, k)
+        if nm.len > 0:
+          ix.names.push(nm)
+          var m = k + nm.len
+          while m + 1 < j and src[m] == ',' and src[m + 1] == ' ':
+            let more = ident_at(src, m + 2)
+            if more.len == 0: break
+            ix.names.push(more)
+            m = m + 2 + more.len
+    elif c == 'p' and ix.pkgname.len == 0 and src[i..min(i + 8, n)] == "package ":
+      ix.pkgname = ident_at(src, i + 8)
+      var txt = ""
+      for d in doc: txt += d + "\n"
+      if "Deprecated: " in txt: ix.doc = txt
+    elif ix.pkgname.len == 0:
+      if c == '/' and i + 1 < j and src[i + 1] == '/': doc.push(src[i..j])
+      elif j == i: doc = []
+    i = j + 1
+  return ix
+
+# The package doc comment's deprecation notice, if any ("" otherwise).
+fn deprecated_doc(src: Str, cm: [Int], pos: Int) -> Str:
+  var j = -1
+  var i = 0
+  while i < cm.len:
+    if cm[i + 1] <= pos: j = i
+    i += 3
+  if j < 0: return ""
+  var txt = ""
+  var k = 0
+  while k <= j:
+    txt += src[cm[k]..cm[k + 1]] + "\n"
+    k += 3
+  if not ("Deprecated: " in txt): return ""
+  return txt
 
 fn load_unsafe(var g: Prog, key: Str) -> Int:
   let pi = g.pk.len
@@ -693,7 +940,11 @@ fn add_src(var g: Prog, pi: Int, own src: Str, skip: Bool, var kw: {Str: Int}) -
 # Package-level objects of package pi: its scope and methods.
 fn collect(var g: Prog, pi: Int):
   let nf = g.pk[pi].roots.len
-  for fi in 0..nf:
+  for fi in 0..nf: collect_file(&g, pi, fi)
+  g.pk[pi].ok = true
+
+fn collect_file(var g: Prog, pi: Int, fi: Int):
+  if fi >= 0:
     let root = g.pk[pi].roots[fi]
     let decls = ast.items(g.pk[pi].t, g.pk[pi].t.c[root])
     for d in decls:
@@ -735,16 +986,6 @@ fn collect(var g: Prog, pi: Int):
               let bn = g.pk[pi].t.names[g.pk[pi].t.s[rt]] + ""
               if bn in g.pk[pi].mbyname: g.pk[pi].mbyname[bn].push(o)
               else: g.pk[pi].mbyname[bn] = [o]
-  # attach methods to their types
-  var bns: [Str] = []
-  for bn in g.pk[pi].mbyname: bns.push(bn + "")
-  for bn in bns:
-    let to = g.pk[pi].scope.get(bn, -1)
-    if to < 0: continue
-    var ms: [Int] = []
-    for m in g.pk[pi].mbyname[bn]: ms.push(m)
-    g.pk[pi].methods[to] = ms
-  g.pk[pi].ok = true
 
 fn decl_obj(var g: Prog, pi: Int, fi: Int, kind: Int, id: Int, decl: Int) -> Int:
   let nm = g.pk[pi].t.names[g.pk[pi].t.s[id]] + ""
@@ -828,7 +1069,7 @@ fn dot_lookup(var g: Prog, fs: Fs, pi: Int, fi: Int, name: Str) -> Int:
     let lit = g.pk[pi].t.names[g.pk[pi].t.s[pnode]]
     let q = load_pkg(&g, fs, lit[1..lit.len - 1], std)
     if q < 0: continue
-    let o = g.pk[q].scope.get(name, -1)
+    let o = scope_get(&g, q, name)
     if o >= 0: return o
   return -1
 
@@ -845,7 +1086,7 @@ fn lookup(var g: Prog, fs: Fs, pi: Int, fi: Int, name: Str) -> Int:
     let o = g.scopes[i].get(name, -1)
     if o >= 0: return o
     i -= 1
-  let o = g.pk[pi].scope.get(name, -1)
+  let o = scope_get(&g, pi, name)
   if o >= 0: return o
   let q = file_import(&g, fs, pi, fi, name)
   if q >= 0:
@@ -1103,6 +1344,18 @@ fn elem_type(var g: Prog, fs: Fs, pi: Int, fi: Int, te: Int) -> Int:
 
 # Finds field or method name on type t. Returns [obj, type, kind, embedded field objs...] or [].
 fn lookup_fm(var g: Prog, fs: Fs, t0: Int, name: Str) -> [Int]:
+  let key = "{t0}." + name
+  if key in g.fmcache:
+    var out: [Int] = []
+    for x in g.fmcache[key]: out.push(x)
+    return out
+  let r = lookup_fm0(&g, fs, t0, name)
+  var c: [Int] = []
+  for x in r: c.push(x)
+  g.fmcache[key] = c
+  return r
+
+fn lookup_fm0(var g: Prog, fs: Fs, t0: Int, name: Str) -> [Int]:
   var t = t0
   if t > 0 and g.tk[t] == TY_PTR: t = g.ta[t]
   var cur: [Int] = [t]
@@ -1166,9 +1419,8 @@ fn find_method(var g: Prog, fs: Fs, t: Int, name: Str) -> [Int]:
   let o = g.ta[t]
   let pi = g.opkg[o]
   if pi < 0: return []
-  if not (o in g.pk[pi].methods): return []
   var hit = -1
-  for m in g.pk[pi].methods[o]:
+  for m in methods_of(&g, o):
     if g.oname[m] == name: hit = m
   if hit < 0: return []
   var mt = obj_type(&g, fs, hit)
@@ -1510,7 +1762,7 @@ fn selector(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int) -> Int:
     let po = g.pk[pi].use[x]
     let q = g.oaux[po]
     if q < 0: return 0
-    let o = g.pk[q].scope.get(name, -1)
+    let o = scope_get(&g, q, name)
     if o < 0: return 0
     if g.pk[pi].use[sel] < 0: g.pk[pi].use[sel] = o
     g.pk[pi].sobj[n] = o
@@ -2023,6 +2275,8 @@ fn add_target(var g: Prog, fs: Fs, path: Str, dir: Str, srcs: [Str]) -> Int:
 
 # The same for a package already parsed (its tree moves in; take it back with swap).
 fn add_target_ast(var g: Prog, fs: Fs, path: Str, dir: Str, var t: ast.Ast, roots: [Int]) -> Int:
+  g.locals = []
+  g.fmcache = {}
   let pi = g.pk.len
   var p = new_pk(path, dir)
   p.target = true
