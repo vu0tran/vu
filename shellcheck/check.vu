@@ -770,6 +770,7 @@ fn run_checks(var a: An):
   check_unchecked_cd(&a)
   check_unpassed_in_functions(&a)
   check_unused_assignments(&a)
+  check_quotes_in_literals(&a)
   check_unassigned_references(&a)
   check_shebang(&a)
   check_array_without_index(&a)
@@ -809,7 +810,21 @@ fn node_checks(var a: An, n: Int):
   elif k == T_Assignment: check_array_as_string(&a, n)
   elif k == T_Redirecting: check_echo_sed(&a, n)
   if k == TC_Binary or k == TA_Binary or k == TA_Unary or k == TA_Sequence: check_return_against_zero(&a, n)
-  if k == TC_Binary: check_comparison_leading_x(&a, n)
+  if k == TC_Binary:
+    check_comparison_leading_x(&a, n)
+    check_comparison_against_glob(&a, n)
+    if a.t.s[n] == "=~": check_quoted_cond_regex(&a, n)
+  if k == TC_And or k == TC_Or: check_conditional_and_ors(&a, n)
+  if k == TC_Nullary or k == TC_Unary: check_should_use_grep_q(&a, n)
+  if k == T_ForIn: check_for_loop_glob_variables(&a, n)
+  if k == T_Glob: check_char_range_glob(&a, n)
+  if k == T_IoFile: check_redirection_to_command(&a, n)
+  if k == T_NormalWord:
+    check_inexplicably_unquoted(&a, n)
+    check_tilde_in_quotes(&a, n)
+  if k == T_DollarExpansion or k == T_Backticked: check_uuoe_var(&a, n)
+  if k == T_Redirecting: check_stderr_redirect(&a, n)
+  check_multiple_appends(&a, n)
 
 # ---------------------------------------------------------------- control flow
 
@@ -2099,3 +2114,361 @@ fn alpha_duplicated(s: Str) -> Bool:
       if c in seen: return true
       seen[c] = true
   return false
+
+# ---------------------------------------------------------------- SC2231
+
+fn is_quoteable_expansion(t: ast.Ast, n: Int) -> Bool:
+  let k = t.k[n]
+  return k == T_DollarBraced or k == T_DollarExpansion or k == T_DollarBraceCommandExpansion or k == T_Backticked
+
+fn check_for_loop_glob_variables(var a: An, n: Int):
+  for i in 0..a.t.n1[n]:
+    let w = ast.at1(a.t, n, i)
+    if a.t.k[w] != T_NormalWord: continue
+    var g = false
+    for j in 0..a.t.n1[w]:
+      if is_glob(a.t, ast.at1(a.t, w, j)): g = true
+    if not g: continue
+    for j in 0..a.t.n1[w]:
+      let x = ast.at1(a.t, w, j)
+      if is_quoteable_expansion(a.t, x):
+        info(&a, x, 2231, "Quote expansions in this for loop glob to prevent wordsplitting, e.g. \"$dir\"/*.txt .")
+
+# ---------------------------------------------------------------- SC2101, SC2102
+
+fn check_char_range_glob(var a: An, n: Int):
+  let str = a.t.s[n] + ""
+  if not (str.startswith("[") and str.endswith("]")): return
+  let cmd = closest_command(a, n)
+  if cmd >= 0:
+    if nm = astlib.command_name(a.t, cmd):
+      if nm == "tr" or nm == "read": return
+  var x = n
+  while x >= 0:
+    let k = a.t.k[x]
+    if k == TC_Binary and a.t.f[x] == DOUBLE:
+      if a.t.s[x] in ["-eq", "-ne", "-lt", "-le", "-gt", "-ge"]: return
+      break
+    if k == TC_Unary:
+      if a.t.s[x] == "-v": return
+      break
+    if k == T_SimpleCommand: break
+    x = a.parent[x]
+  var cs = str.chars()
+  var inner: [Str] = []
+  for i in 1..cs.len - 1: inner.push(cs[i] + "")
+  if inner.len > 0 and (inner[0] == "!" or inner[0] == "^"):
+    var r: [Str] = []
+    for i in 1..inner.len: r.push(inner[i] + "")
+    inner = r
+  var contents = ""
+  for c in inner: contents += c
+  if contents.startswith(":") and contents.endswith(":") and contents != ":":
+    warn(&a, n, 2101, "Named class needs outer [], e.g. [[:digit:]].")
+    return
+  if contents.find("[") >= 0: return
+  var seen: {Str: Bool} = {}
+  for c in inner:
+    if c == "-": continue
+    if c in seen:
+      info(&a, n, 2102, "Ranges can only match single chars (mentioned due to duplicates).")
+      return
+    seen[c] = true
+
+# ---------------------------------------------------------------- SC2129
+
+fn append_target(t: ast.Ast, n: Int, var file: Int) -> Int:
+  let k = t.k[n]
+  if k == T_Annotation: return append_target(t, t.a[n], &file)
+  if k == T_Pipeline:
+    if t.n2[n] == 0: return -1
+    return append_target(t, ast.last2(t, n), &file)
+  if k == T_Redirecting:
+    for i in 0..t.n1[n]:
+      let r = ast.at1(t, n, i)
+      if t.k[r] == T_FdRedirect:
+        let io = t.a[r]
+        if t.k[io] == T_IoFile and t.k[t.a[io]] == T_DGREAT:
+          file = t.b[io]
+          return n
+    return -1
+  return -1
+
+fn command_sequences(t: ast.Ast, n: Int) -> [[Int]]:
+  var out: [[Int]] = []
+  let k = t.k[n]
+  if k == T_Script or k == T_BraceGroup or k == T_Subshell or k == T_DollarExpansion or k == T_DollarBraceCommandExpansion or k == T_Backticked:
+    out.push(ast.list1(t, n))
+  elif k == T_WhileExpression or k == T_UntilExpression:
+    out.push(ast.list1(t, n))
+    out.push(ast.list2(t, n))
+  elif k == T_ForIn: out.push(ast.list2(t, n))
+  elif k == T_ForArithmetic: out.push(ast.list1(t, n))
+  elif k == T_IfExpression:
+    let lens = ast.list2(t, n)
+    var pos = 0
+    for l in lens:
+      var part: [Int] = []
+      for i in 0..l: part.push(ast.at1(t, n, pos + i))
+      pos += l
+      out.push(part)
+  elif k == T_Annotation: return command_sequences(t, t.a[n])
+  return out
+
+fn check_multiple_appends(var a: An, n: Int):
+  for list in command_sequences(a.t, n):
+    var i = 0
+    while i < list.len:
+      var f0 = -1
+      let id0 = append_target(a.t, list[i], &f0)
+      var j = i + 1
+      while j < list.len:
+        var f1 = -1
+        let id1 = append_target(a.t, list[j], &f1)
+        if (id0 < 0) != (id1 < 0): break
+        if id0 >= 0 and not struct_eq(a.t, f0, f1): break
+        j += 1
+      if id0 >= 0 and j - i >= 3:
+        style(&a, id0, 2129, "Consider using {{ cmd1; cmd2; }} >> file instead of individual redirects.")
+      i = j
+
+# ---------------------------------------------------------------- SC2238
+
+fn check_redirection_to_command(var a: An, n: Int):
+  let w = a.t.b[n]
+  if a.t.k[w] != T_NormalWord or a.t.n1[w] != 1: return
+  let l = ast.at1(a.t, w, 0)
+  if a.t.k[l] != T_Literal: return
+  let s = a.t.s[l]
+  if parse.is_common_command(s) and s != "file":
+    warn(&a, w, 2238, "Redirecting to/from command name instead of file. Did you want pipes/xargs (or quote to ignore)?")
+
+# ---------------------------------------------------------------- SC2053, SC2081, SC2330
+
+fn check_comparison_against_glob(var a: An, n: Int):
+  let op = a.t.s[n]
+  if not (op == "=" or op == "==" or op == "!="): return
+  let w = a.t.b[n]
+  if a.t.f[n] == DOUBLE:
+    if a.t.k[w] == T_NormalWord and a.t.n1[w] == 1 and a.t.k[ast.at1(a.t, w, 0)] == T_DollarBraced:
+      warn(&a, w, 2053, "Quote the right-hand side of " + op + " in [[ ]] to prevent glob matching.")
+      return
+    if a.shell == SH_BUSYBOX and is_glob(a.t, w):
+      err(&a, w, 2330, "BusyBox [[ .. ]] does not support glob matching. Use a case statement.")
+  else:
+    if is_glob(a.t, w):
+      if a.shell == SH_BASH or a.shell == SH_KSH: err(&a, w, 2081, "[ .. ] can't match globs. Use [[ .. ]] or case statement.")
+      else: err(&a, w, 2081, "[ .. ] can't match globs. Use a case statement.")
+
+# ---------------------------------------------------------------- SC2076
+
+fn check_quoted_cond_regex(var a: An, n: Int):
+  let r = a.t.b[n]
+  if a.t.k[r] != T_NormalWord or a.t.n1[r] != 1: return
+  let q = a.t.k[ast.at1(a.t, r, 0)]
+  if q != T_DoubleQuoted and q != T_SingleQuoted: return
+  if s = get_literal(a.t, r):
+    var meta = false
+    for i in 0..s.len:
+      if "][*.+()|".find(s[i..i + 1]) >= 0: meta = true
+    if not meta: return
+  warn(&a, r, 2076, "Remove quotes from right-hand side of =~ to match as a regex rather than literally.")
+
+# ---------------------------------------------------------------- SC2107-SC2110, SC2166
+
+fn check_conditional_and_ors(var a: An, n: Int):
+  let k = a.t.k[n]
+  let op = a.t.s[n]
+  let single = a.t.f[n] == SINGLE
+  if k == TC_And:
+    if single and op == "&&": err(&a, n, 2107, "Instead of [ a && b ], use [ a ] && [ b ].")
+    elif not single and op == "-a": err(&a, n, 2108, "In [[..]], use && instead of -a.")
+    elif single and op == "-a": warn(&a, n, 2166, "Prefer [ p ] && [ q ] as [ p -a q ] is not well defined.")
+  else:
+    if single and op == "||": err(&a, n, 2109, "Instead of [ a || b ], use [ a ] || [ b ].")
+    elif not single and op == "-o": err(&a, n, 2110, "In [[..]], use || instead of -o.")
+    elif single and op == "-o": warn(&a, n, 2166, "Prefer [ p ] || [ q ] as [ p -o q ] is not well defined.")
+
+# ---------------------------------------------------------------- SC2143
+
+fn final_grep(t: ast.Ast, n: Int) -> Str?:
+  var x = n
+  while true:
+    let k = t.k[x]
+    if (k == T_NormalWord or k == T_DoubleQuoted or k == T_DollarExpansion) and t.n1[x] == 1: x = ast.at1(t, x, 0)
+    elif k == T_Pipeline: break
+    else: return nil
+  if t.n2[x] == 0: return nil
+  let name = command_basename(t, ast.last2(t, x)) else return nil
+  if name in ["grep", "egrep", "fgrep", "bz3grep", "bzgrep", "xzgrep", "zgrep", "zipgrep", "zstdgrep"]: return name
+  return nil
+
+fn check_should_use_grep_q(var a: An, n: Int):
+  var bool_ = true
+  if a.t.k[n] == TC_Unary:
+    if a.t.s[n] == "-z": bool_ = false
+    elif a.t.s[n] != "-n": return
+  let name = final_grep(a.t, a.t.a[n]) else return
+  if bool_: style(&a, n, 2143, "Use " + name + " -q instead of comparing output with [ -n .. ].")
+  else: style(&a, n, 2143, "Use ! " + name + " -q instead of comparing output with [ -z .. ].")
+
+# ---------------------------------------------------------------- SC2026, SC2027, SC2140
+
+fn quotes_single_thing(t: ast.Ast, n: Int) -> Bool:
+  if t.n1[n] != 1: return false
+  let k = t.k[ast.at1(t, n, 0)]
+  return k == T_DollarExpansion or k == T_DollarBraced or k == T_Backticked
+
+fn is_special_path(a: An, n: Int) -> Bool:
+  var x = n
+  while x >= 0:
+    let k = a.t.k[x]
+    if k == T_Redirecting: return false
+    if k == T_DollarBraced: return true
+    let p = a.parent[x]
+    if p >= 0 and a.t.k[p] == TC_Binary and a.t.s[p] == "=~": return a.t.b[p] == x
+    x = p
+  return false
+
+fn is_alnum_str(s: Str) -> Bool:
+  for c in s.chars():
+    if not c.is_alnum(): return false
+  return true
+
+fn check_inexplicably_unquoted(var a: An, n: Int):
+  let ts = ast.list1(a.t, n)
+  for i in 0..ts.len:
+    let x = ts[i]
+    let kx = a.t.k[x]
+    if kx == T_SingleQuoted and i + 1 < ts.len:
+      let l = ts[i + 1]
+      if a.t.k[l] == T_Literal and a.t.s[l].len > 0 and is_alnum_str(a.t.s[l]):
+        info(&a, l, 2026, "This word is outside of quotes. Did you intend to 'nest '\"'single quotes'\"' instead'? ")
+    elif kx == T_DoubleQuoted and i + 2 < ts.len and a.t.k[ts[i + 2]] == T_DoubleQuoted:
+      let tr = ts[i + 1]
+      let kt = a.t.k[tr]
+      if kt == T_DollarExpansion or kt == T_DollarBraced:
+        warn(&a, tr, 2027, "The surrounding quotes actually unquote this. Remove or escape them.")
+      elif kt == T_Literal:
+        let s = a.t.s[tr]
+        if not ((quotes_single_thing(a.t, x) and quotes_single_thing(a.t, ts[i + 2])) or s == "=" or s == ":" or s == "/" or is_special_path(a, tr)):
+          warn(&a, tr, 2140, "Word is of the form \"A\"B\"C\" (B indicated). Did you mean \"ABC\" or \"A\\\"B\\\"C\"?")
+
+# ---------------------------------------------------------------- SC2088
+
+fn check_tilde_in_quotes(var a: An, n: Int):
+  if a.t.n1[n] == 0: return
+  let f = ast.at1(a.t, n, 0)
+  if a.t.k[f] == T_SingleQuoted:
+    if a.t.s[f].startswith("~/"): warn(&a, f, 2088, "Tilde does not expand in quotes. Use $HOME.")
+  elif a.t.k[f] == T_DoubleQuoted and a.t.n1[f] > 0:
+    let l = ast.at1(a.t, f, 0)
+    if a.t.k[l] == T_Literal and a.t.s[l].startswith("~/"): warn(&a, l, 2088, "Tilde does not expand in quotes. Use $HOME.")
+
+# ---------------------------------------------------------------- SC2116
+
+fn could_be_optimized(t: ast.Ast, n: Int) -> Bool:
+  let k = t.k[n]
+  if k == T_Glob or k == T_Extglob or k == T_BraceExpansion: return false
+  if k == T_NormalWord or k == T_DoubleQuoted:
+    for i in 0..t.n1[n]:
+      if not could_be_optimized(t, ast.at1(t, n, i)): return false
+  return true
+
+fn check_uuoe_var(var a: An, n: Int):
+  if a.t.n1[n] != 1: return
+  let pl = ast.at1(a.t, n, 0)
+  if a.t.k[pl] != T_Pipeline or a.t.n2[pl] != 1: return
+  let r = ast.at2(a.t, pl, 0)
+  if a.t.k[r] != T_Redirecting: return
+  let c = a.t.a[r]
+  if a.t.k[c] != T_SimpleCommand or a.t.n2[c] == 0: return
+  if not is_unqualified_command(a.t, c, "echo"): return
+  let vars = arg_words(a.t, c)
+  if vars.len == 0: return
+  if vars.len == 1 and token_is_just_command_output(a.t, vars[0]): return
+  if only_literal(a.t, vars[0]).startswith("-"): return
+  for v in vars:
+    if not could_be_optimized(a.t, v): return
+  style(&a, n, 2116, "Useless echo? Instead of 'cmd $(echo foo)', just use 'cmd foo'.")
+
+# ---------------------------------------------------------------- SC2069
+
+fn check_stderr_redirect(var a: An, n: Int):
+  if a.t.n1[n] != 2: return
+  let r0 = ast.at1(a.t, n, 0)
+  let r1 = ast.at1(a.t, n, 1)
+  if a.t.k[r0] != T_FdRedirect or a.t.s[r0] != "2": return
+  let d = a.t.a[r0]
+  if a.t.k[d] != T_IoDuplicate or a.t.k[a.t.a[d]] != T_GREATAND or a.t.s[d] != "1": return
+  if a.t.k[r1] != T_FdRedirect: return
+  let io = a.t.a[r1]
+  if a.t.k[io] != T_IoFile: return
+  let op = a.t.k[a.t.a[io]]
+  if op != T_Greater and op != T_DGREAT: return
+  var x = n
+  while x >= 0:
+    let k = a.t.k[x]
+    if k == T_Pipeline:
+      if a.t.n2[x] > 1 and not is_ancestor_or_self(a, ast.last2(a.t, x), n): return
+    elif k == T_ProcSub or k == T_DollarExpansion or k == T_Backticked: return
+    x = a.parent[x]
+  warn(&a, r0, 2069, "To redirect stdout+stderr, 2>&1 must be last (or use '{{ cmd > file; }} 2>&1' to clarify).")
+
+fn is_ancestor_or_self(a: An, p: Int, c: Int) -> Bool:
+  var x = c
+  while x >= 0:
+    if x == p: return true
+    x = a.parent[x]
+  return false
+
+# ---------------------------------------------------------------- SC2089, SC2090
+
+fn contains_quotes(s: Str) -> Bool:
+  # "\"|([/= ]|^)'|'( |$)|\\\\ "
+  for i in 0..s.len:
+    let c = s[i]
+    if c == '"': return true
+    if c == '\'':
+      if i == 0 or s[i - 1] == '/' or s[i - 1] == '=' or s[i - 1] == ' ' or s[i - 1] == '\n': return true
+      if i + 1 >= s.len or s[i + 1] == ' ' or s[i + 1] == '\n': return true
+    if c == '\\' and i + 1 < s.len and s[i + 1] == ' ': return true
+  return false
+
+fn for_token(a: An, m: {Str: Int}, n: Int) -> Int:
+  let k = a.t.k[n]
+  if k == T_DollarBraced:
+    let s = oversimp(a.t, a.t.a[n])
+    if s in m: return m[s]
+    return -1
+  if k == T_DoubleQuoted or k == T_NormalWord:
+    for i in 0..a.t.n1[n]:
+      let r = for_token(a, m, ast.at1(a.t, n, i))
+      if r >= 0: return r
+    return -1
+  if contains_quotes(oversimp(a.t, n)): return n
+  return -1
+
+fn check_quotes_in_literals(var a: An):
+  var m: {Str: Int} = {}
+  var flow: [Flow] = []
+  swap(&flow, &a.flow)
+  for f in flow:
+    if f.kind == F_ASSIGN:
+      if f.arr or f.src != SRC_FROM: continue
+      var q = -1
+      for i in 0..f.nfrom:
+        q = for_token(a, m, a.srcs[f.from + i])
+        if q >= 0: break
+      if q < 0: m.remove(f.name)
+      else: m[f.name] = q
+    elif f.kind == F_REF:
+      if f.name in m:
+        let j = m[f.name]
+        let e = f.tok
+        var squash = a.t.k[e] == T_DollarBraced and oversimp(a.t, a.t.a[e]).startswith("#")
+        if not is_param_to(a, e, "eval") and not is_quote_free(a, e) and not squash:
+          if a.shell == SH_BASH or a.shell == SH_KSH: warn(&a, j, 2089, "Quotes/backslashes will be treated literally. Use an array.")
+          else: warn(&a, j, 2089, "Quotes/backslashes will be treated literally. Rewrite using set/\"$@\" or functions.")
+          warn(&a, e, 2090, "Quotes/backslashes in this variable will not be respected.")
+  swap(&flow, &a.flow)
