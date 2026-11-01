@@ -1,9 +1,13 @@
 # vgolint: a Go linter that prints what `golangci-lint run` prints with its default linters
 # (errcheck, govet, ineffassign, staticcheck, unused) for the checks it implements:
 #
-#   vgolint [--jobs N] [DIR[/...]]...      (default ./...)
+#   vgolint [--jobs N] [--no-cache] [DIR[/...]]...      (default ./...)
 #
 # Packages are found as `go list` finds them for linux/amd64, and linted on all cores.
+# A run over the whole module (./...) caches its output under $XDG_CACHE_HOME/vgolint (or
+# ~/.cache/vgolint), keyed by a hash of every .go file in the module, go.mod, go.sum, the Go
+# version and the vgolint binary itself; a module whose go.mod replaces a module with a local
+# directory isn't cached (that directory's files aren't in the key).
 
 import scan
 import ast
@@ -62,6 +66,38 @@ fn worker(fs: Fs, own specs: Shared[[Spec]], own jobs: Chan[Int], own res: Chan[
     let lines = lint_one(fs, specs.value[i], &g, &kw, gover)
     res.send(Res(i, lines))
 
+# Two 32-bit FNV-style lanes over s (four bytes at a time), then its length.
+fn hash_feed(var h: [Int], s: Str):
+  var a = h[0]
+  var b = h[1]
+  let n = s.len
+  var i = 0
+  while i + 4 <= n:
+    let w = s.read_le(i, 4)
+    a = ((a ^ w) * 16777619) & 0xFFFFFFFF
+    b = ((b ^ w) * 1540483477) & 0xFFFFFFFF
+    i += 4
+  while i < n:
+    let w = int(s[i])
+    a = ((a ^ w) * 16777619) & 0xFFFFFFFF
+    b = ((b ^ w) * 1540483477) & 0xFFFFFFFF
+    i += 1
+  let w = n & 0xFFFFFFFF
+  a = ((a ^ w) * 16777619) & 0xFFFFFFFF
+  b = ((b ^ w) * 1540483477) & 0xFFFFFFFF
+  h[0] = a
+  h[1] = b
+
+fn hex8(x: Int) -> Str:
+  let digits = "0123456789abcdef"
+  var s = ""
+  var i = 7
+  while i >= 0:
+    let d = (x >> (i * 4)) & 15
+    s += digits[d..d + 1]
+    i -= 1
+  return s
+
 fn cpu_count(fs: Fs) -> Int:
   let info = fs.read("/proc/cpuinfo") else ""
   var n = 0
@@ -86,10 +122,15 @@ fn package_name(src: Str, var kw: {Str: Int}) -> Str:
 fn main(fs: Fs, os: Os) throws:
   var roots: [Str] = []
   var jobs = 0
+  var use_cache = true
   let argv = args()
   var i = 1
   while i < argv.len:
     let a = argv[i]
+    if a == "--no-cache":
+      use_cache = false
+      i += 1
+      continue
     if a == "--jobs" and i + 1 < argv.len:
       jobs = int(argv[i + 1]) else 1
       i += 2
@@ -102,6 +143,19 @@ fn main(fs: Fs, os: Os) throws:
     roots.push(r)
     i += 1
   if roots.len == 0: roots.push(".")
+  if roots.len != 1 or roots[0] != ".": use_cache = false
+  var h = [2166136261, 84696351]
+  if use_cache:
+    let gm = fs.read("go.mod") else ""
+    if gm.len == 0: use_cache = false
+    for l in gm.split("\n"):
+      let ar = l.find("=>")
+      if ar >= 0:
+        let rhs = l[ar + 2..l.len].strip()
+        if rhs.startswith(".") or rhs.startswith("/"): use_cache = false
+    hash_feed(&h, gm)
+    let gs = fs.read("go.sum") else ""
+    hash_feed(&h, gs)
   var dirs: [load.Dir] = []
   for r in roots: load.walk(fs, r, true, &dirs)
   var kw = scan.keywords()
@@ -112,6 +166,14 @@ fn main(fs: Fs, os: Os) throws:
   if goroot.len == 0: goroot = "/usr/local/go"
   var modcache = os.env("GOMODCACHE")
   if modcache.len == 0: modcache = os.env("HOME") + "/go/pkg/mod"
+  var cache_file = ""
+  if use_cache:
+    hash_feed(&h, goroot + "\n" + modcache)
+    let gv = fs.read(goroot + "/VERSION") else ""
+    hash_feed(&h, gv)
+    let exe = fs.read("/proc/self/exe") else ""
+    if exe.len == 0: use_cache = false
+    hash_feed(&h, exe)
   var specs: [Spec] = []
   for d in dirs:
     var main_files: [Str] = []
@@ -122,6 +184,9 @@ fn main(fs: Fs, os: Os) throws:
       var path = d.path + "/" + nm
       if d.path == ".": path = nm + ""
       let src = fs.read(path) else continue
+      if use_cache:
+        hash_feed(&h, path)
+        hash_feed(&h, src)
       if not load.good_constraints(src): continue
       let name = package_name(src, &kw)
       if nm.endswith("_test.go") and name.endswith("_test") and name != pname:
@@ -133,6 +198,20 @@ fn main(fs: Fs, os: Os) throws:
     if d.path != ".": ip = modpath + "/" + d.path
     if main_files.len > 0: specs.push(Spec(d.path + "", main_files, ip + ""))
     if x_files.len > 0: specs.push(Spec(d.path + "", x_files, ip + "_test"))
+  if use_cache:
+    var cdir = os.env("XDG_CACHE_HOME")
+    if cdir.len == 0: cdir = os.env("HOME") + "/.cache"
+    cdir += "/vgolint"
+    cache_file = cdir + "/" + hex8(h[0]) + hex8(h[1])
+    if fs.exists(cache_file):
+      let text = fs.read(cache_file) else ""
+      if text.startswith("vgolint1\n"):
+        let body = text[9..text.len]
+        if body.len > 0:
+          for l in body.split("\n"): print(l)
+          exit(1)
+        return
+    fs.mkdir(cdir) else 0
   if jobs == 0: jobs = cpu_count(fs)
   if jobs > specs.len: jobs = specs.len
   if jobs < 1: jobs = 1
@@ -151,5 +230,10 @@ fn main(fs: Fs, os: Os) throws:
   var all: [Str] = []
   for k in 0..n:
     for l in results[k]: all.push(l)
-  for l in sorted(all): print(l)
-  if all.len > 0: exit(1)
+  let out = sorted(all)
+  for l in out: print(l)
+  if cache_file.len > 0:
+    let tmp = cache_file + ".tmp"
+    fs.write(tmp, "vgolint1\n" + "\n".join(out)) else 0
+    fs.rename(tmp, cache_file) else 0
+  if out.len > 0: exit(1)
