@@ -273,7 +273,7 @@ fn lookup(sc: Scopes, s0: Int, name: Int, ty: Bool) -> Int:
     s = sc.sp[s]
   return -1
 
-# ---- pass 1: declarations
+# ---- declarations
 
 type B:
   t: ast.Ast
@@ -283,10 +283,19 @@ type B:
   modstr: Int      # >0 inside declare module "x" { }
   ambient: Int     # >0 inside declare ... / declare module / .d.ts
   global_aug: Int  # >0 inside declare global { }
+  dm: Bool         # declaring as well as recording references
+  qk: [Int]        # the recorded events: kind (a reference's flags), node, scope, extra
+  qn: [Int]
+  qs: [Int]
+  qx: [Int]
 
 fn build(own t: ast.Ast, root: Int, dts: Bool) -> B:
-  var b = B(t, new_scopes(), -1, 0, 0, 0, 0)
+  var b = B(t, new_scopes(), -1, 0, 0, 0, 0, true, [], [], [], [])
   let nn = b.t.nd.len
+  b.qk.reserve(nn / 4)
+  b.qn.reserve(nn / 4)
+  b.qs.reserve(nn / 4)
+  b.qx.reserve(nn / 4)
   b.sc.res = [-2] * nn
   b.sc.scope_of = [-1] * nn
   if dts: b.ambient = 1
@@ -298,13 +307,14 @@ fn build(own t: ast.Ast, root: Int, dts: Bool) -> B:
     if kd == ast.N_IMPORT or kd == ast.N_EXPORT or kd == ast.N_EXPORTDEFAULT or kd == ast.N_EXPORTASSIGN or kd == ast.N_IMPORTEQ: b.sc.module = true
     if has_export_mod(b.t, st): b.sc.module = true
   let fs = new_scope(&b.sc, S_FILE, -1, root)
-  decl_list(&b, root, fs)
-  resolve_list(&b, root, fs)
-  # decorators (resolved in the file's scope)
+  resolve(&b, root, fs, false)
+  # decorators (resolved in the file's scope; nothing in them is declared)
+  b.dm = false
   if -1000001 in b.t.dirs:
     var ds: [Int] = []
     for x in b.t.dirs[-1000001]: ds.push(x)
     for x in ds: resolve(&b, x, fs, false)
+  run_events(&b)
   # JSX uses React (the classic runtime)
   var has_jsx = false
   for x in 0..b.t.nd.len:
@@ -656,15 +666,41 @@ fn decl_function(var b: B, n: Int, s: Int):
       decl(&b, b.t.nd[body].a, fs)
     else: decl(&b, body, fs)
 
-# ---- pass 2: references
+# ---- the walk: declarations as they're met, references recorded
+#
+# One walk does what a declaration pass and a reference pass would: it follows the order the
+# references are resolved in, declaring names and opening scopes where they're met (in the order a
+# declaration pass would meet them, so symbol and scope ids are the same), and records every
+# reference, with the context it needs, as an event. The events are run after the walk, when every
+# scope's declarations are complete (var and function hoisting, names declared later in a block).
+# With b.dm false the walk only records (parts the declarations never covered: variable types,
+# defaults in patterns, decorators); decl() is the declarations alone (parts the references skip).
 
-fn resolve_list(var b: B, l: Int, s: Int):
-  if l <= 0: return
-  for i in 0..b.t.nd[l].b:
-    let x = b.t.L[b.t.nd[l].a + i]
-    resolve(&b, x, s, false)
+# event kinds (a reference's kind is its flags, below 64)
+const Q_ASSIGN = 64     # n: an assignment to a name; s; x: loops * 2 + unused
+const Q_ASSIGN_END = 65 # n: its right side
+const Q_UPDATE = 66     # n: ++/-- of a name; s; x: loops * 2 + unused
+const Q_SETLOOP = 67    # n: a declared name; x: loops
+const Q_VARFN = 68      # n: a declared name; s: the function or class initializing it
+const Q_LOOPVAR = 69    # n: a for-in/of's left side
+const Q_IFACE = 70      # n: an interface in declare module "x" { }
+const Q_EXPSPEC = 71    # n: an export specifier; s
+const Q_EXPDEF = 72     # n: the name in export default x / export = x; s
+const Q_TPRED = 73      # n: a type predicate; s
+
+fn ev(var b: B, k: Int, n: Int, s: Int, x: Int):
+  b.qk.push(k)
+  b.qn.push(n)
+  b.qs.push(s)
+  b.qx.push(x)
 
 fn ref(var b: B, n: Int, s: Int, flags: Int):
+  b.qk.push(flags)
+  b.qn.push(n)
+  b.qs.push(s)
+  b.qx.push(b.wexpr)
+
+fn do_ref(var b: B, n: Int, s: Int, flags: Int, wexpr: Int):
   let name = b.t.nd[n].s
   let ty = (flags & R_TYPE) != 0
   var y = lookup(b.sc, s, name, ty)
@@ -675,7 +711,7 @@ fn ref(var b: B, n: Int, s: Int, flags: Int):
     b.sc.wsym.push(y)
     b.sc.wat.push(b.t.nd[n].pos)
     b.sc.wname.push(name)
-    var we = b.wexpr
+    var we = wexpr
     if we < 0: we = b.t.nd[n].pos
     b.sc.wexpr.push(we)
   if y < 0: return
@@ -689,6 +725,138 @@ fn ref(var b: B, n: Int, s: Int, flags: Int):
   if (f & R_SELF) == 0:
     if (f & (R_READ | R_EXPORT)) != 0 or ((f & R_TYPE) != 0 and (type_meaning(b.sc.yk[y]) or (b.sc.yf[y] & F_TYPED) != 0)): b.sc.reads[y] += 1
     elif (f & R_TYPE) != 0: b.sc.treads[y] += 1
+
+# Runs the recorded events in order.
+fn run_events(var b: B):
+  var sy: [Int] = []       # assignments being resolved: the symbol (-1 unless selfish), its reads before
+  var sr: [Int] = []
+  for i in 0..b.qk.len:
+    let k = b.qk[i]
+    let n = b.qn[i]
+    let s = b.qs[i]
+    if k < 64:
+      do_ref(&b, n, s, k, b.qx[i])
+    elif k == Q_ASSIGN:
+      let unused = (b.qx[i] & 1) != 0
+      let loops = b.qx[i] >> 1
+      let op = b.t.nd[n].f
+      let ul = unparen(b.t, b.t.nd[n].a)
+      var f = R_WRITE
+      if op != T_ASSIGN: f = R_WRITE | R_READ
+      # an assignment statement to a variable of this function: reading it to compute its own new
+      # value isn't a use (a = a + 1, a += 1)
+      let y0 = lookup(b.sc, s, b.t.nd[ul].s, false)
+      var selfish = unused and y0 >= 0
+      if selfish and op == T_ASSIGN:
+        # (a = a + 1 in another function, or in a loop, uses the old value)
+        selfish = b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops == 0
+      elif selfish and b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops > 0: selfish = false
+      if selfish and op != T_ASSIGN: f = f | R_SELF
+      do_ref(&b, ul, s, f, b.t.nd[n].pos)
+      if selfish:
+        sy.push(y0)
+        sr.push(b.sc.reads[y0])
+      else:
+        sy.push(-1)
+        sr.push(0)
+    elif k == Q_ASSIGN_END:
+      let y = sy.pop()
+      let before = sr.pop()
+      # take back the reads (not inside a function within the right side) that only compute y
+      if y >= 0 and b.sc.reads[y] != before: b.sc.reads[y] -= self_reads(b, n, y, false)
+    elif k == Q_UPDATE:
+      let unused = (b.qx[i] & 1) != 0
+      let loops = b.qx[i] >> 1
+      let x = unparen(b.t, b.t.nd[n].a)
+      var f = R_WRITE | R_READ
+      let y0 = lookup(b.sc, s, b.t.nd[x].s, false)
+      if unused and y0 >= 0 and not (b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops > 0): f = f | R_SELF
+      do_ref(&b, x, s, f, b.t.nd[n].pos)
+    elif k == Q_SETLOOP:
+      let y = sym_of(b.sc, n)
+      if y >= 0 and b.sc.yk[y] != Y_PARAM: b.sc.yloop[y] = b.qx[i]
+    elif k == Q_VARFN:
+      # a function or class initializer: references to the variable inside it are its own
+      let y = sym_of(b.sc, n)
+      if y >= 0:
+        b.sc.ylo[y] = b.t.nd[s].pos
+        b.sc.yhi[y] = b.t.nd[s].end
+        if b.t.nd[s].k != ast.N_CLASSEXPR: b.sc.fsym[s] = y
+    elif k == Q_LOOPVAR:
+      loop_var_used(&b, n)
+    elif k == Q_IFACE:
+      # an interface augmenting a module: an import of the same name counts as used
+      let y = lookup(b.sc, 0, b.t.nd[n].s, true)
+      if y >= 0 and (b.sc.yk[y] == Y_IMPORT or b.sc.yk[y] == Y_IMPORTTYPE): b.sc.reads[y] += 1
+    elif k == Q_EXPSPEC:
+      var nm = b.t.nd[n].s
+      var at = n
+      if b.t.nd[n].b > 0:
+        nm = b.t.nd[b.t.nd[n].b].s
+        at = b.t.nd[n].b
+      var y = lookup(b.sc, s, nm, false)
+      if y < 0: y = lookup(b.sc, s, nm, true)
+      if y >= 0:
+        b.sc.reads[y] += 1
+        b.sc.anyref[y] += 1
+        b.sc.yf[y] = b.sc.yf[y] | F_EXPORTED
+        b.sc.res[at] = y
+    elif k == Q_EXPDEF:
+      var y = lookup(b.sc, s, b.t.nd[n].s, false)
+      if y < 0: y = lookup(b.sc, s, b.t.nd[n].s, true)
+      b.sc.res[n] = y
+      if y >= 0:
+        b.sc.reads[y] += 1
+        b.sc.anyref[y] += 1
+        b.sc.yf[y] = b.sc.yf[y] | F_EXPORTED
+    elif k == Q_TPRED:
+      let y = lookup(b.sc, s, b.t.nd[n].s, false)
+      if y >= 0:
+        b.sc.anyref[y] += 1
+        b.sc.treads[y] += 1
+
+# n with references recorded only (no declarations).
+fn ro(var b: B, n: Int, s: Int, ty: Bool):
+  if n <= 0: return
+  if not b.dm:
+    resolve(&b, n, s, ty)
+    return
+  b.dm = false
+  resolve(&b, n, s, ty)
+  b.dm = true
+
+# Defaults and computed keys of a binding pattern (declared already by bind_target).
+fn ro_pattern(var b: B, n: Int, s: Int):
+  if n <= 0: return
+  let kd = b.t.nd[n].k
+  if kd != ast.N_OBJPAT and kd != ast.N_ARRPAT: return
+  let was = b.dm
+  b.dm = false
+  pattern_exprs(&b, n, s)
+  b.dm = was
+
+# The declarations alone in a part the references skip.
+fn dk(var b: B, n: Int, s: Int):
+  if b.dm and n > 0: decl(&b, n, s)
+
+# A scope opened at node n: made when declaring, else found.
+fn open_scope(var b: B, kind: Int, s: Int, n: Int) -> Int:
+  if b.dm: return new_scope(&b.sc, kind, s, n)
+  return sc_of(b, n, s)
+
+# Type parameters: declared, then their constraints and defaults.
+fn tparams(var b: B, l: Int, s: Int):
+  if l <= 0: return
+  for i in 0..b.t.nd[l].b:
+    let tp = b.t.L[b.t.nd[l].a + i]
+    if b.dm:
+      let y = declare(&b.sc, s, b.t.nd[tp].s, b.t.nd[tp].pos, Y_TPARAM, 0)
+      # (a use in its own constraint or default isn't a use)
+      b.sc.ylo[y] = b.t.nd[tp].pos
+      b.sc.yhi[y] = b.t.nd[tp].end
+      if b.ambient > 0 or b.global_aug > 0: b.sc.yf[y] = b.sc.yf[y] | F_KEEP
+    resolve(&b, b.t.nd[tp].a, s, true)
+    resolve(&b, b.t.nd[tp].b, s, true)
 
 # An assignment target: names are written (and read too for compound operators).
 fn target(var b: B, n: Int, s: Int, flags: Int):
@@ -717,6 +885,7 @@ fn target(var b: B, n: Int, s: Int, flags: Int):
         ref(&b, e, s, R_WRITE)
         resolve(&b, b.t.nd[e].b, s, false)
       elif ke == ast.N_SPREAD: target(&b, b.t.nd[e].a, s, R_WRITE)
+      else: dk(&b, e, s)
   elif kd == ast.N_SPREAD:
     target(&b, b.t.nd[n].a, s, R_WRITE)
   elif kd == ast.N_BINARY and b.t.nd[n].f == T_ASSIGN:
@@ -742,11 +911,6 @@ fn sc_of(b: B, n: Int, s: Int) -> Int:
   if n >= 0 and n < b.sc.scope_of.len and b.sc.scope_of[n] >= 0: return b.sc.scope_of[n]
   return s
 
-# Whether the value of expression n is unused (an expression statement, or not the last of a
-# comma sequence whose value is unused).
-fn unused_value(b: B, n: Int, par: Int) -> Bool:
-  return par == 1
-
 fn resolve(var b: B, n: Int, s: Int, ty: Bool):
   if n <= 0: return
   let kd = b.t.nd[n].k
@@ -758,6 +922,16 @@ fn resolve(var b: B, n: Int, s: Int, ty: Bool):
   if kd == ast.N_ID:
     if ty: ref(&b, n, s, R_TYPE)
     else: ref(&b, n, s, R_READ)
+    return
+  # (the commonest kinds first: literals, which have no children, member accesses and calls)
+  if kd >= ast.N_NUM and kd <= ast.N_SUPER and kd != ast.N_TEMPL: return
+  if kd == ast.N_PROPACCESS:
+    resolve(&b, b.t.nd[n].a, s, ty)
+    return
+  if kd == ast.N_CALL or kd == ast.N_NEW or kd == ast.N_TAGGED or kd == ast.N_EXPRTARGS:
+    resolve(&b, b.t.nd[n].a, s, false)
+    resolve(&b, b.t.nd[n].b, s, true)
+    resolve(&b, b.t.nd[n].c, s, false)
     return
   if kd == ast.N_EXPRSTMT:
     stmt_expr(&b, b.t.nd[n].a, s)
@@ -773,42 +947,75 @@ fn resolve(var b: B, n: Int, s: Int, ty: Bool):
       update(&b, n, s, false)
       return
   if kd == ast.N_VAR:
+    var kind = Y_VAR
+    var tgs = s
+    var flags = 0
+    if b.dm:
+      let f = b.t.nd[n].f
+      tgs = b.sc.sfn[s]
+      if f == 1: kind = Y_LET
+      elif f == 2: kind = Y_CONST
+      elif f == 3: kind = Y_USING
+      if f != 0: tgs = s
+      flags = base_flags(b, b.t.nd[n].d)
     let lst = b.t.nd[n].a
     for i in 0..ast.count(b.t, lst):
       let d = ast.item(b.t, lst, i)
       let tg = b.t.nd[d].a
-      set_loop(&b, tg)
-      pattern_exprs(&b, tg, s)
-      resolve(&b, b.t.nd[d].b, s, true)
       let init = b.t.nd[d].c
+      if b.dm:
+        var f2 = flags
+        if init > 0: f2 = f2 | F_INIT
+        bind_target(&b, tg, tgs, kind, f2)
+      if tg > 0 and b.t.nd[tg].k == ast.N_ID: ev(&b, Q_SETLOOP, tg, s, b.loops)
+      ro_pattern(&b, tg, s)
+      ro(&b, b.t.nd[d].b, s, true)
       if init > 0:
-        # a function or class initializer: references to the variable inside it are its own
         let ui = unparen(b.t, init)
         let ki = b.t.nd[ui].k
-        if b.t.nd[tg].k == ast.N_ID and (ki == ast.N_FUNCEXPR or ki == ast.N_ARROW or ki == ast.N_CLASSEXPR):
-          let y = sym_of(b.sc, tg)
-          if y >= 0:
-            b.sc.ylo[y] = b.t.nd[ui].pos
-            b.sc.yhi[y] = b.t.nd[ui].end
-            if ki != ast.N_CLASSEXPR: b.sc.fsym[ui] = y
+        if b.t.nd[tg].k == ast.N_ID and (ki == ast.N_FUNCEXPR or ki == ast.N_ARROW or ki == ast.N_CLASSEXPR): ev(&b, Q_VARFN, tg, ui, 0)
         resolve(&b, init, s, false)
     return
   if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
+    if kd == ast.N_FUNC and b.dm and b.t.nd[n].s > 0:
+      var f = base_flags(b, b.t.nd[n].f)
+      if b.t.nd[n].d <= 0: f = f | F_BODYLESS
+      if (b.t.nd[n].f & ast.M_DEFAULT) != 0: f = f | F_EXPORTED
+      let y = declare(&b.sc, s, b.t.nd[n].s, b.t.npos.get(n, b.t.nd[n].pos), Y_FUNC, f)
+      if b.t.nd[n].d > 0: b.sc.fsym[n] = y
+      if b.sc.ylo[y] < 0 and b.t.nd[n].d > 0:
+        b.sc.ylo[y] = b.t.nd[n].pos
+        b.sc.yhi[y] = b.t.nd[n].end
     resolve_function(&b, n, s)
     return
   if kd == ast.N_CLASS or kd == ast.N_CLASSEXPR:
-    let cs = sc_of(b, n, s)
-    resolve(&b, b.t.nd[n].a, cs, true)
+    if b.dm and kd == ast.N_CLASS and b.t.nd[n].s > 0:
+      var f = base_flags(b, b.t.nd[n].f)
+      if (b.t.nd[n].f & ast.M_DEFAULT) != 0: f = f | F_EXPORTED
+      let y = declare(&b.sc, s, b.t.nd[n].s, b.t.npos.get(n, b.t.nd[n].pos), Y_CLASS, f)
+      b.sc.ylo[y] = b.t.nd[n].pos
+      b.sc.yhi[y] = b.t.nd[n].end
+    let cs = open_scope(&b, S_CLASS, s, n)
+    if b.dm and kd == ast.N_CLASSEXPR and b.t.nd[n].s > 0:
+      let y = declare(&b.sc, cs, b.t.nd[n].s, b.t.npos.get(n, b.t.nd[n].pos), Y_CLASSNAME, F_KEEP)
+      b.sc.ylo[y] = b.t.nd[n].pos
+      b.sc.yhi[y] = b.t.nd[n].end
+    let was = b.ambient
+    if (b.t.nd[n].f & ast.M_DECLARE) != 0: b.ambient += 1
+    tparams(&b, b.t.nd[n].a, cs)
     let h = b.t.nd[n].b
     if h > 0:
+      # (the type arguments are declared in the outer scope, resolved in the class's)
       resolve(&b, b.t.nd[h].a, s, false)
-      resolve(&b, b.t.nd[h].b, cs, true)
+      dk(&b, b.t.nd[h].b, s)
+      ro(&b, b.t.nd[h].b, cs, true)
     let im = b.t.nd[n].c
     for i in 0..ast.count(b.t, im):
       let x = ast.item(b.t, im, i)
       resolve(&b, b.t.nd[x].a, cs, true)
       resolve(&b, b.t.nd[x].b, cs, true)
     resolve(&b, b.t.nd[n].d, cs, false)
+    b.ambient = was
     return
   if kd == ast.N_PROP:
     let key = b.t.nd[n].a
@@ -816,13 +1023,23 @@ fn resolve(var b: B, n: Int, s: Int, ty: Bool):
     resolve(&b, b.t.nd[n].b, s, true)
     resolve(&b, b.t.nd[n].c, s, false)
     return
-  if kd == ast.N_INTERFACE:
-    let ts = sc_of(b, n, s)
-    if b.sc.sk[s] == S_MODSTR:
-      # an interface augmenting a module: an import of the same name counts as used
-      let y = lookup(b.sc, 0, b.t.nd[n].s, true)
-      if y >= 0 and (b.sc.yk[y] == Y_IMPORT or b.sc.yk[y] == Y_IMPORTTYPE): b.sc.reads[y] += 1
-    resolve(&b, b.t.nd[n].a, ts, true)
+  if kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS:
+    if b.dm:
+      var kind = Y_TYPE
+      if kd == ast.N_INTERFACE: kind = Y_INTERFACE
+      var fl = base_flags(b, b.t.nd[n].d)
+      if kd == ast.N_INTERFACE and b.modstr > 0: fl = fl | F_KEEP
+      let y = declare(&b.sc, s, b.t.nd[n].s, b.t.npos.get(n, b.t.nd[n].pos), kind, fl)
+      if b.sc.ylo[y] < 0:
+        b.sc.ylo[y] = b.t.nd[n].pos
+        b.sc.yhi[y] = b.t.nd[n].end
+    let ts = open_scope(&b, S_TYPE, s, n)
+    if kd == ast.N_TYPEALIAS:
+      tparams(&b, b.t.nd[n].a, ts)
+      resolve(&b, b.t.nd[n].b, ts, true)
+      return
+    if b.sc.sk[s] == S_MODSTR: ev(&b, Q_IFACE, n, s, 0)
+    tparams(&b, b.t.nd[n].a, ts)
     let ex = b.t.nd[n].b
     for i in 0..ast.count(b.t, ex):
       let x = ast.item(b.t, ex, i)
@@ -830,64 +1047,85 @@ fn resolve(var b: B, n: Int, s: Int, ty: Bool):
       resolve(&b, b.t.nd[x].b, ts, true)
     resolve(&b, b.t.nd[n].c, ts, true)
     return
-  if kd == ast.N_TYPEALIAS:
-    let ts = sc_of(b, n, s)
-    resolve(&b, b.t.nd[n].a, ts, true)
-    resolve(&b, b.t.nd[n].b, ts, true)
-    return
   if kd == ast.N_TPARAM:
     resolve(&b, b.t.nd[n].a, s, true)
     resolve(&b, b.t.nd[n].b, s, true)
     return
   if kd == ast.N_ENUM:
-    let es = sc_of(b, n, s)
+    if b.dm:
+      let y = declare(&b.sc, s, b.t.nd[n].s, b.t.npos.get(n, b.t.nd[n].pos), Y_ENUM, base_flags(b, b.t.nd[n].f))
+      if b.sc.ylo[y] < 0:
+        b.sc.ylo[y] = b.t.nd[n].pos
+        b.sc.yhi[y] = b.t.nd[n].end
+    let es = open_scope(&b, S_ENUM, s, n)
     let lst = b.t.nd[n].a
     for i in 0..ast.count(b.t, lst):
       let m = ast.item(b.t, lst, i)
+      if b.dm:
+        let nm = b.t.nd[m].a
+        if nm > 0 and (b.t.nd[nm].k == ast.N_ID or b.t.nd[nm].k == ast.N_STR):
+          declare(&b.sc, es, b.t.nd[nm].s, b.t.nd[nm].pos, Y_MEMBER, F_KEEP)
       resolve(&b, b.t.nd[m].b, es, false)
     return
   if kd == ast.N_MODULE:
-    let ms = sc_of(b, n, s)
+    let nm = b.t.nd[n].a
+    let f = b.t.nd[n].f
+    let was = b.ambient
+    let wasg = b.global_aug
+    let wasm = b.modstr
+    if (f & ast.M_DECLARE) != 0: b.ambient += 1
+    var kind = S_NS
+    if (f & ast.MOD_GLOBAL) != 0:
+      b.global_aug += 1
+      kind = S_GLOBAL_AUG
+    elif nm > 0 and b.t.nd[nm].k == ast.N_STR:
+      b.ambient += 1
+      b.modstr += 1
+      kind = S_MODSTR
+    elif nm > 0 and b.dm:
+      var first = nm
+      while b.t.nd[first].k == ast.N_QNAME: first = b.t.nd[first].a
+      let y = declare(&b.sc, s, b.t.nd[first].s, b.t.nd[first].pos, Y_NAMESPACE, base_flags(b, f))
+      if b.sc.ylo[y] < 0:
+        b.sc.ylo[y] = b.t.nd[n].pos
+        b.sc.yhi[y] = b.t.nd[n].end
+    let ms = open_scope(&b, kind, s, n)
     resolve(&b, b.t.nd[n].b, ms, false)
+    b.modstr = wasm
+    b.ambient = was
+    b.global_aug = wasg
     return
-  if kd == ast.N_IMPORT: return
+  if kd == ast.N_IMPORT:
+    dk(&b, n, s)
+    return
   if kd == ast.N_IMPORTEQ:
+    if b.dm:
+      var f = 0
+      if has_export_mod(b.t, n): f = F_EXPORTED
+      declare(&b.sc, s, b.t.nd[n].s, b.t.nd[n].pos + 7, Y_IMPORT, f)
     let r = b.t.nd[n].a
-    if r > 0 and b.t.nd[r].k != ast.N_EXTERNALREF: resolve_entity(&b, r, s, false)
+    if r > 0 and b.t.nd[r].k != ast.N_EXTERNALREF:
+      let was = b.dm
+      b.dm = false
+      resolve_entity(&b, r, s, false)
+      b.dm = was
     return
   if kd == ast.N_EXPORT:
     if b.t.nd[n].a > 0: return    # export ... from "x"
     let sp = b.t.nd[n].b
     for i in 0..ast.count(b.t, sp):
-      let x = ast.item(b.t, sp, i)
-      var nm = b.t.nd[x].s
-      var at = x
-      if b.t.nd[x].b > 0:
-        nm = b.t.nd[b.t.nd[x].b].s
-        at = b.t.nd[x].b
-      var y = lookup(b.sc, s, nm, false)
-      if y < 0: y = lookup(b.sc, s, nm, true)
-      if y >= 0:
-        b.sc.reads[y] += 1
-        b.sc.anyref[y] += 1
-        b.sc.yf[y] = b.sc.yf[y] | F_EXPORTED
-        b.sc.res[at] = y
+      ev(&b, Q_EXPSPEC, ast.item(b.t, sp, i), s, 0)
     return
   if kd == ast.N_EXPORTDEFAULT or kd == ast.N_EXPORTASSIGN:
     let e = unparen(b.t, b.t.nd[n].a)
     if b.t.nd[e].k == ast.N_ID:
-      var y = lookup(b.sc, s, b.t.nd[e].s, false)
-      if y < 0: y = lookup(b.sc, s, b.t.nd[e].s, true)
-      b.sc.res[e] = y
-      if y >= 0:
-        b.sc.reads[y] += 1
-        b.sc.anyref[y] += 1
-        b.sc.yf[y] = b.sc.yf[y] | F_EXPORTED
+      ev(&b, Q_EXPDEF, e, s, 0)
       return
     resolve(&b, b.t.nd[n].a, s, false)
     return
   if kd == ast.N_BLOCK:
-    resolve(&b, b.t.nd[n].a, sc_of(b, n, s), false)
+    let bs = open_scope(&b, S_BLOCK, s, n)
+    resolve(&b, b.t.nd[n].a, bs, false)
     return
   if kd == ast.N_WHILE or kd == ast.N_DO:
     b.loops += 1
@@ -896,51 +1134,59 @@ fn resolve(var b: B, n: Int, s: Int, ty: Bool):
     return
   if kd == ast.N_FOR:
     b.loops += 1
-    let fs = sc_of(b, n, s)
-    let init = b.t.nd[n].a
-    resolve(&b, init, fs, false)
+    let fs = open_scope(&b, S_BLOCK, s, n)
+    resolve(&b, b.t.nd[n].a, fs, false)
     resolve(&b, b.t.nd[n].b, fs, false)
-    let upd = b.t.nd[n].c
-    resolve(&b, upd, fs, false)
+    resolve(&b, b.t.nd[n].c, fs, false)
     resolve(&b, b.t.nd[n].d, fs, false)
     b.loops -= 1
     return
   if kd == ast.N_FORIN:
     b.loops += 1
-    let fs = sc_of(b, n, s)
+    let fs = open_scope(&b, S_BLOCK, s, n)
     let left = b.t.nd[n].a
-    let before = b.sc.yn.len
     if left > 0 and b.t.nd[left].k == ast.N_VAR:
       let lst = b.t.nd[left].a
+      if b.dm:
+        # the loop variable is bound by the loop, not an initializer
+        let f = b.t.nd[left].f
+        var kind = Y_VAR
+        var tgs = b.sc.sfn[fs]
+        if f == 1: kind = Y_LET
+        elif f == 2: kind = Y_CONST
+        elif f == 3: kind = Y_USING
+        if f != 0: tgs = fs
+        for i in 0..ast.count(b.t, lst):
+          let d = ast.item(b.t, lst, i)
+          bind_target(&b, b.t.nd[d].a, tgs, kind, F_FORIN)
       for i in 0..ast.count(b.t, lst):
         let d = ast.item(b.t, lst, i)
-        pattern_exprs(&b, b.t.nd[d].a, fs)
-        resolve(&b, b.t.nd[d].b, fs, true)
+        ro_pattern(&b, b.t.nd[d].a, fs)
+        ro(&b, b.t.nd[d].b, fs, true)
     else: target(&b, left, fs, R_WRITE)
-    if body_returns(b, b.t.nd[n].c): loop_var_used(&b, left)
+    if body_returns(b, b.t.nd[n].c): ev(&b, Q_LOOPVAR, left, s, 0)
     resolve(&b, b.t.nd[n].b, fs, false)
     resolve(&b, b.t.nd[n].c, fs, false)
-    let unused_b = before
     b.loops -= 1
     return
   if kd == ast.N_SWITCH:
     resolve(&b, b.t.nd[n].a, s, false)
-    resolve(&b, b.t.nd[n].b, sc_of(b, n, s), false)
+    let ss = open_scope(&b, S_BLOCK, s, n)
+    resolve(&b, b.t.nd[n].b, ss, false)
     return
   if kd == ast.N_TRY:
     resolve(&b, b.t.nd[n].a, s, false)
     let cd = b.t.nd[n].b
     let cb = b.t.nd[n].c
     if cb > 0:
-      let cs = sc_of(b, cb, s)
+      let cs = open_scope(&b, S_BLOCK, s, cb)
       if cd > 0:
-        pattern_exprs(&b, b.t.nd[cd].a, cs)
-        resolve(&b, b.t.nd[cd].b, cs, true)
+        if b.dm: bind_target(&b, b.t.nd[cd].a, cs, Y_CATCH, 0)
+        ro_pattern(&b, b.t.nd[cd].a, cs)
+        ro(&b, b.t.nd[cd].b, cs, true)
+      # the block's own declarations share the catch scope
       resolve(&b, b.t.nd[cb].a, cs, false)
     resolve(&b, b.t.nd[n].d, s, false)
-    return
-  if kd == ast.N_PROPACCESS:
-    resolve(&b, b.t.nd[n].a, s, ty)
     return
   if kd == ast.N_QNAME:
     resolve_entity(&b, n, s, ty)
@@ -971,11 +1217,13 @@ fn resolve(var b: B, n: Int, s: Int, ty: Bool):
     resolve(&b, b.t.nd[n].c, s, true)
     return
   if kd == ast.N_TFUNC or kd == ast.N_CALLSIG or kd == ast.N_CTORSIG:
-    resolve(&b, b.t.nd[n].b, sc_of(b, n, s), true)
+    let ts = open_scope(&b, S_TYPE, s, n)
+    resolve(&b, b.t.nd[n].b, ts, true)
     return
   if kd == ast.N_SIG:
-    let ts = sc_of(b, n, s)
-    resolve(&b, b.t.nd[n].a, ts, true)
+    # a signature in a type: parameters aren't bindings anyone can use (their types are walked)
+    let ts = open_scope(&b, S_TYPE, s, n)
+    tparams(&b, b.t.nd[n].a, ts)
     let ps = b.t.nd[n].b
     for i in 0..ast.count(b.t, ps):
       let p = ast.item(b.t, ps, i)
@@ -986,42 +1234,40 @@ fn resolve(var b: B, n: Int, s: Int, ty: Bool):
     let ps = b.t.nd[n].a
     for i in 0..ast.count(b.t, ps):
       let p = ast.item(b.t, ps, i)
+      dk(&b, b.t.nd[p].a, s)
       resolve(&b, b.t.nd[p].b, s, true)
+      dk(&b, b.t.nd[p].c, s)
     resolve(&b, b.t.nd[n].b, s, true)
     return
-  if kd == ast.N_TMAPPED or kd == ast.N_TCOND:
-    let ts = sc_of(b, n, s)
-    if kd == ast.N_TMAPPED:
-      let tp = b.t.nd[n].a
-      if tp > 0: resolve(&b, b.t.nd[tp].a, ts, true)
-      resolve(&b, b.t.nd[n].b, ts, true)
-      resolve(&b, b.t.nd[n].c, ts, true)
-    else:
-      resolve(&b, b.t.nd[n].a, s, true)
-      resolve(&b, b.t.nd[n].b, ts, true)
-      resolve(&b, b.t.nd[n].c, ts, true)
-      resolve(&b, b.t.nd[n].d, s, true)
+  if kd == ast.N_TMAPPED:
+    let ts = open_scope(&b, S_TYPE, s, n)
+    let tp = b.t.nd[n].a
+    if tp > 0:
+      if b.dm: declare(&b.sc, ts, b.t.nd[tp].s, b.t.nd[tp].pos, Y_TPARAM, F_KEEP)
+      resolve(&b, b.t.nd[tp].a, ts, true)
+    resolve(&b, b.t.nd[n].b, ts, true)
+    resolve(&b, b.t.nd[n].c, ts, true)
+    return
+  if kd == ast.N_TCOND:
+    resolve(&b, b.t.nd[n].a, s, true)
+    let ts = open_scope(&b, S_TYPE, s, n)
+    resolve(&b, b.t.nd[n].b, ts, true)
+    resolve(&b, b.t.nd[n].c, ts, true)
+    resolve(&b, b.t.nd[n].d, s, true)
     return
   if kd == ast.N_TINFER:
     let tp = b.t.nd[n].a
-    if tp > 0: resolve(&b, b.t.nd[tp].a, s, true)
+    if tp > 0:
+      if b.dm: declare(&b.sc, s, b.t.nd[tp].s, b.t.nd[tp].pos, Y_TPARAM, F_KEEP)
+      resolve(&b, b.t.nd[tp].a, s, true)
     return
   if kd == ast.N_TPRED:
-    if b.t.nd[n].s > 0:
-      let y = lookup(b.sc, s, b.t.nd[n].s, false)
-      if y >= 0:
-        b.sc.anyref[y] += 1
-        b.sc.treads[y] += 1
+    if b.t.nd[n].s > 0: ev(&b, Q_TPRED, n, s, 0)
     resolve(&b, b.t.nd[n].a, s, true)
     return
   if kd == ast.N_AS or kd == ast.N_SATISFIES or kd == ast.N_TYPEASSERT:
     resolve(&b, b.t.nd[n].a, s, false)
     resolve(&b, b.t.nd[n].b, s, true)
-    return
-  if kd == ast.N_CALL or kd == ast.N_NEW or kd == ast.N_TAGGED or kd == ast.N_EXPRTARGS:
-    resolve(&b, b.t.nd[n].a, s, false)
-    resolve(&b, b.t.nd[n].b, s, true)
-    resolve(&b, b.t.nd[n].c, s, false)
     return
   if kd == ast.N_TTUPLEEL or kd == ast.N_TOP or kd == ast.N_TARRAY or kd == ast.N_TUNION or kd == ast.N_TINTER or kd == ast.N_TPAREN or kd == ast.N_TOBJ or kd == ast.N_TTUPLE or kd == ast.N_TINDEXED or kd == ast.N_TOPTIONAL or kd == ast.N_TREST:
     resolve_kids(&b, n, s, true)
@@ -1108,11 +1354,6 @@ fn pattern_exprs(var b: B, n: Int, s: Int):
       pattern_exprs(&b, b.t.nd[e].b, s)
       resolve(&b, b.t.nd[e].c, s, false)
 
-fn set_loop(var b: B, tg: Int):
-  if tg > 0 and b.t.nd[tg].k == ast.N_ID:
-    let y = sym_of(b.sc, tg)
-    if y >= 0 and b.sc.yk[y] != Y_PARAM: b.sc.yloop[y] = b.loops
-
 fn resolve_function(var b: B, n: Int, s: Int):
   let was = b.loops
   b.loops = 0
@@ -1121,26 +1362,49 @@ fn resolve_function(var b: B, n: Int, s: Int):
 
 fn resolve_function2(var b: B, n: Int, s: Int):
   let kd = b.t.nd[n].k
-  let fs = sc_of(b, n, s)
+  let fs = open_scope(&b, S_FUNC, s, n)
   var sig = n
   var body = b.t.nd[n].d
   if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
     sig = b.t.nd[n].b
     body = b.t.nd[n].c
+    # a computed key is outside
     if kd != ast.N_CTOR:
       let key = b.t.nd[n].a
       if key > 0 and b.t.nd[key].k == ast.N_COMPUTED: resolve(&b, key, s, false)
+  if b.dm and kd == ast.N_FUNCEXPR and b.t.nd[n].s > 0:
+    let y = declare(&b.sc, fs, b.t.nd[n].s, b.t.npos.get(n, b.t.nd[n].pos), Y_FNNAME, F_KEEP)
+    b.sc.ylo[y] = b.t.nd[n].pos
+    b.sc.yhi[y] = b.t.nd[n].end
+  let bodyless = body <= 0
   if sig > 0:
-    resolve(&b, b.t.nd[sig].a, fs, true)
+    tparams(&b, b.t.nd[sig].a, fs)
     let ps = b.t.nd[sig].b
     for i in 0..ast.count(b.t, ps):
       let p = ast.item(b.t, ps, i)
-      pattern_exprs(&b, b.t.nd[p].a, fs)
+      let tg = b.t.nd[p].a
+      if tg > 0 and b.t.nd[tg].k == ast.N_ID and b.t.names[b.t.nd[tg].s] == "this":
+        resolve(&b, b.t.nd[p].b, fs, true)
+        ro(&b, b.t.nd[p].c, fs, false)
+        continue
+      if b.dm:
+        var f = F_POSITIONAL
+        if (b.t.nd[p].f & (ast.M_PUBLIC | ast.M_PRIVATE | ast.M_PROTECTED | ast.M_READONLY | ast.M_OVERRIDE)) != 0: f = f | F_KEEP
+        if bodyless or b.ambient > 0 or b.global_aug > 0 or kd == ast.N_SET or (kd == ast.N_METHOD and (b.t.nd[n].f & ast.M_OVERRIDE) != 0 and (b.t.nd[p].f & ast.M_REST) == 0): f = f | F_KEEP
+        let before = b.sc.yn.len
+        bind_target(&b, tg, fs, Y_PARAM, f)
+        var y = before
+        while y < b.sc.yn.len:
+          b.sc.yfn[y] = n
+          y += 1
+      ro_pattern(&b, tg, fs)
       resolve(&b, b.t.nd[p].b, fs, true)
       resolve(&b, b.t.nd[p].c, fs, false)
     resolve(&b, b.t.nd[sig].c, fs, true)
   if body > 0:
-    if b.t.nd[body].k == ast.N_BLOCK: resolve(&b, b.t.nd[body].a, fs, false)
+    if b.t.nd[body].k == ast.N_BLOCK:
+      if b.dm: b.sc.scope_of[body] = fs
+      resolve(&b, b.t.nd[body].a, fs, false)
     else: resolve(&b, body, fs, false)
 
 # An expression whose value is unused (a statement, a for header's init or update).
@@ -1167,58 +1431,32 @@ fn stmt_expr(var b: B, e: Int, s: Int):
 fn assign(var b: B, n: Int, s: Int, unused: Bool):
   let was = b.wexpr
   b.wexpr = b.t.nd[n].pos
-  assign2(&b, n, s, unused)
-  b.wexpr = was
-
-fn assign2(var b: B, n: Int, s: Int, unused: Bool):
   let op = b.t.nd[n].f
   let left = b.t.nd[n].a
   let right = b.t.nd[n].b
   let ul = unparen(b.t, left)
   if b.t.nd[ul].k == ast.N_ID:
-    var f = R_WRITE
-    if op != T_ASSIGN: f = R_WRITE | R_READ
-    # an assignment statement to a variable of this function: reading it to compute its own new
-    # value isn't a use (a = a + 1, a += 1)
-    let y0 = lookup(b.sc, s, b.t.nd[ul].s, false)
-    var selfish = unused and y0 >= 0
-    if selfish and op == T_ASSIGN:
-      # (a = a + 1 in another function, or in a loop, uses the old value)
-      selfish = b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops == 0
-    elif selfish and b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops > 0: selfish = false
-    if selfish and op != T_ASSIGN: f = f | R_SELF
-    ref(&b, ul, s, f)
-    if selfish: resolve_self(&b, right, s, y0)
-    else: resolve(&b, right, s, false)
-    return
-  if op == T_ASSIGN: target(&b, left, s, R_WRITE)
-  else: resolve(&b, left, s, false)
-  resolve(&b, right, s, false)
+    var u = 0
+    if unused: u = 1
+    ev(&b, Q_ASSIGN, n, s, b.loops * 2 + u)
+    resolve(&b, right, s, false)
+    ev(&b, Q_ASSIGN_END, right, s, 0)
+  else:
+    if op == T_ASSIGN: target(&b, left, s, R_WRITE)
+    else: resolve(&b, left, s, false)
+    resolve(&b, right, s, false)
+  b.wexpr = was
 
 fn update(var b: B, n: Int, s: Int, unused: Bool):
   let was = b.wexpr
   b.wexpr = b.t.nd[n].pos
-  update2(&b, n, s, unused)
-  b.wexpr = was
-
-fn update2(var b: B, n: Int, s: Int, unused: Bool):
   let x = unparen(b.t, b.t.nd[n].a)
   if b.t.nd[x].k == ast.N_ID:
-    var f = R_WRITE | R_READ
-    let y0 = lookup(b.sc, s, b.t.nd[x].s, false)
-    if unused and y0 >= 0 and not (b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops > 0): f = f | R_SELF
-    ref(&b, x, s, f)
-    return
-  resolve(&b, b.t.nd[n].a, s, false)
-
-# Resolves n, with reads of symbol y (outside functions inside n) counted as self references.
-fn resolve_self(var b: B, n: Int, s: Int, y: Int):
-  let before = b.sc.reads[y]
-  resolve(&b, n, s, false)
-  if b.sc.reads[y] == before: return
-  # take back the reads not inside a function within n
-  let cnt = self_reads(b, n, y, false)
-  b.sc.reads[y] -= cnt
+    var u = 0
+    if unused: u = 1
+    ev(&b, Q_UPDATE, n, s, b.loops * 2 + u)
+  else: resolve(&b, b.t.nd[n].a, s, false)
+  b.wexpr = was
 
 # The reads of y in n that only compute a new value for y (call arguments and values stored
 # elsewhere are uses).
