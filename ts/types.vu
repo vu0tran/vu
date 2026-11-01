@@ -164,6 +164,7 @@ type C:
   checked_fns: {Int: Bool}
   funions: {Int: Int}      # union -> its widenable (fresh) twin
   freg: {Int: Int}         # fresh twin -> the union
+  t_origin: {Int: [Int]}   # union -> what it was written as (aliased unions kept whole), for display
   ftrue: Int               # fresh true and false (they widen to boolean)
   ffalse: Int
 
@@ -198,7 +199,7 @@ const SF_DECLARE = 32
 
 fn new_checker(own t: ast.Ast) -> C:
   var c = C(t, [], [], [], [], [], [], [], {}, {}, {}, [], [], [], [], [], [], {}, [], [], [], [], {}, {}, {}, {}, [], {}, {}, [], [], 0, {},
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}, {}, {}, {}, {}, [], [], [], [], 0, {}, {}, {}, {}, {}, {}, {}, 0, 0)
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}, {}, {}, {}, {}, [], [], [], [], 0, {}, {}, {}, {}, {}, {}, {}, {}, 0, 0)
   mk(&c, 0, 0, 0, 0)                    # type 0 unused
   c.any_t = mk(&c, TK_ANY, F_ANY, 0, 0)
   c.unknown_t = mk(&c, TK_UNKNOWN, F_UNKNOWN, 0, 0)
@@ -331,14 +332,81 @@ fn cmp_types(c: C, a: Int, b: Int) -> Int:
     return 0
   if k == TK_FALSE: return -1
   if k == TK_TRUE: return 1
+  if k == TK_UNION:
+    let ha = a in c.t_alias
+    let hb = b in c.t_alias
+    if ha and not hb: return -1
+    if hb and not ha: return 1
+    if ha and hb:
+      let na = c.t.names[c.sname[c.t_alias[a]]]
+      let nb = c.t.names[c.sname[c.t_alias[b]]]
+      if na < nb: return -1
+      if na > nb: return 1
+    let ma = members(c, a)
+    let mb = members(c, b)
+    let r = cmp_lists(c, ma, mb)
+    if r != 0: return r
   if k == TK_OBJ:
-    let pa = obj_order_key(c, a)
-    let pb = obj_order_key(c, b)
-    if pa != pb:
-      if pa < pb: return -1
-      return 1
+    let r = cmp_obj(c, a, b)
+    if r != 0: return r
   if a < b: return -1
   return 1
+
+fn cmp_lists(c: C, xs: [Int], ys: [Int]) -> Int:
+  if xs.len != ys.len: return xs.len - ys.len
+  for i in 0..xs.len:
+    let r = cmp_types(c, xs[i], ys[i])
+    if r != 0: return r
+  return 0
+
+# compareTypes for object types (TypeScript 7's stable union order): by the name of the type
+# (alias, interface, class, or a reference's target; unnamed last), then by the symbol's declaration,
+# then references (by tuple shape and type arguments) before the rest.
+fn cmp_obj(c: C, a: Int, b: Int) -> Int:
+  let na = obj_name_sym(c, a)
+  let nb = obj_name_sym(c, b)
+  if na != nb:
+    if na < 0: return 1
+    if nb < 0: return -1
+    let sa = c.t.names[c.sname[na]]
+    let sb = c.t.names[c.sname[nb]]
+    if sa < sb: return -1
+    if sa > sb: return 1
+  let pa = obj_order_key(c, a)
+  let pb = obj_order_key(c, b)
+  if pa != pb:
+    if pa < pb: return -1
+    return 1
+  let oa = c.ta[a]
+  let ob = c.ta[b]
+  let ka = c.objs[oa].kind
+  let kb = c.objs[ob].kind
+  let ra = ka == OK_REF or ka == OK_TUPLE
+  let rb = kb == OK_REF or kb == OK_TUPLE
+  if ra and rb:
+    if ka == OK_TUPLE and kb == OK_TUPLE:
+      let la = c.objs[oa].args.len
+      let lb = c.objs[ob].args.len
+      if la != lb: return la - lb
+      for i in 0..la:
+        let d = c.objs[oa].eflags[i] - c.objs[ob].eflags[i]
+        if d != 0: return d
+    let xa = ints(c.objs[oa].args)
+    let xb = ints(c.objs[ob].args)
+    return cmp_lists(c, xa, xb)
+  if ra: return -1
+  if rb: return 1
+  return 0
+
+# The symbol that names an object type in compareTypeNames: -1 for an anonymous or tuple type.
+fn obj_name_sym(c: C, t: Int) -> Int:
+  let o = c.ta[t]
+  let k = c.objs[o].kind
+  if k == OK_REF:
+    let tg = c.objs[o].target
+    return c.objs[c.ta[tg]].sym
+  if k == OK_DECL: return c.objs[o].sym
+  return -1
 
 # JavaScript compares strings by UTF-16 code units; for text that's all below U+10000 that's code point
 # order, which is UTF-8 byte order.
@@ -349,7 +417,8 @@ fn js_less(a: Str, b: Str) -> Bool:
 fn obj_order_key(c: C, t: Int) -> Int:
   let o = c.ta[t]
   var n = c.objs[o].node
-  if c.objs[o].sym >= 0 and n < 0: n = c.sdecl[c.objs[o].sym]
+  if c.objs[o].sym >= 0: n = c.sdecl[c.objs[o].sym]
+  if c.objs[o].kind == OK_TUPLE: return 1 << 61
   if c.objs[o].kind == OK_REF:
     let tg = c.objs[o].target
     let to = c.ta[tg]
@@ -369,6 +438,36 @@ fn sort_types(c: C, var xs: [Int]):
 # any absorbs everything; unknown absorbs everything but any. Literal types fold into their primitive
 # when the primitive is present ("a" | string is string).
 fn union_of(var c: C, ts: [Int]) -> Int:
+  var named: [Int] = []
+  for t in ts:
+    if c.tk[t] == TK_UNION and (t in c.t_alias or t in c.t_origin) and not has_int(named, t): named.push(t)
+  let u = union_plain(&c, ts)
+  if named.len == 0 or c.tk[u] != TK_UNION: return u
+  # TypeScript's origin: the named unions plus the members none of them has, if they don't overlap
+  let flat = members(c, u)
+  var reduced: [Int] = []
+  for m in flat:
+    var inside = false
+    for nu in named:
+      if has_int(members(c, nu), m): inside = true
+    if not inside: reduced.push(m)
+  if named.len == 1 and reduced.len == 0: return named[0]
+  var count = 0
+  for nu in named: count += members(c, nu).len
+  if count + reduced.len != flat.len: return u
+  var origin: [Int] = []
+  for m in reduced: origin.push(m)
+  for nu in named: origin.push(nu)
+  sort_types(c, &origin)
+  var key = "o{u}"
+  for m in origin: key += ",{m}"
+  if key in c.unions: return c.unions[key]
+  let t = mk(&c, TK_UNION, F_UNION, c.ta[u], c.tb[u])
+  c.t_origin[t] = origin
+  c.unions[key] = t
+  return t
+
+fn union_plain(var c: C, ts: [Int]) -> Int:
   var flat: [Int] = []
   var has_any = false
   var has_unknown = false

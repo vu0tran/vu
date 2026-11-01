@@ -170,9 +170,21 @@ fn infer_return(var c: C, d: Int) -> Int:
   let body = c.t.d[d]
   if body < 0: return c.any_t
   if (c.t.f[d] & ast.M_ASYNC) != 0 or (c.t.f[d] & ast.M_GENERATOR) != 0: return unsup(&c, d, "an async or generator function")
-  if c.t.k[body] != ast.N_BLOCK:
-    let h5_ = check_expr(&c, body, -1)
-    return widen(&c, h5_)
+  # the body is checked in the function's own flow (outer narrowings of constants only), and each
+  # return's type read as it was seen there
+  c.narrow.push({})
+  var saved: [{Str: Int}] = []
+  swap(&saved, &c.narrow)
+  if c.t.k[d] == ast.N_FUNC: c.narrow.push({})
+  else: c.narrow.push(const_facts(&c, saved))
+  c.ret_stack.push(-1)
+  var et = c.any_t
+  if c.t.k[body] != ast.N_BLOCK: et = check_expr(&c, body, -1)
+  else: check_block(&c, body)
+  c.ret_stack.pop()
+  swap(&saved, &c.narrow)
+  c.narrow.pop()
+  if c.t.k[body] != ast.N_BLOCK: return widen(&c, et)
   var rets: [Int] = []
   collect_returns(c, body, &rets)
   if rets.len == 0: return c.void_t
@@ -181,8 +193,9 @@ fn infer_return(var c: C, d: Int) -> Int:
   for r in rets:
     if c.t.a[r] < 0: has_empty = true
     else:
-      let g2_1 = check_expr(&c, c.t.a[r], -1)
-      ts.push(widen(&c, g2_1))
+      var rt = c.any_t
+      if c.t.a[r] in c.ntype: rt = c.ntype[c.t.a[r]]
+      ts.push(widen(&c, rt))
   if has_empty: ts.push(c.undef_t)
   if ts.len == 0: return c.void_t
   if not bind_terminates(&c, body) and ts.len > 0: ts.push(c.undef_t)
@@ -295,6 +308,7 @@ fn ref_key(var c: C, e: Int) -> Str:
 fn narrowed(c: C, key: Str) -> Int:
   var i = c.narrow.len - 1
   while i >= 0:
+    if "!u" in c.narrow[i]: return -1
     if key in c.narrow[i]: return c.narrow[i][key]
     i -= 1
   return -1
@@ -533,11 +547,40 @@ fn is_unit_expr(c: C, e: Int) -> Bool:
   let k = c.t.k[e]
   return k == ast.N_NULL or k == ast.N_STR or k == ast.N_NUM or k == ast.N_TRUE or k == ast.N_FALSE or (k == ast.N_ID and nm(c, c.t.s[e]) == "undefined")
 
+# TypeScript 5.6's check of conditions that are syntactically always truthy or always falsy.
+# 1 always truthy, 2 always falsy, 0 sometimes.
+fn truth_semantics(var c: C, e0: Int) -> Int:
+  var e = e0
+  while c.t.k[e] == ast.N_PAREN or c.t.k[e] == ast.N_AS or c.t.k[e] == ast.N_SATISFIES or c.t.k[e] == ast.N_NONNULL: e = c.t.a[e]
+  let k = c.t.k[e]
+  if k == ast.N_NUM:
+    let txt = nm(c, c.t.s[e])
+    if txt == "0" or txt == "1": return 0
+    return 1
+  if k == ast.N_ARRAY or k == ast.N_ARROW or k == ast.N_BIGINT or k == ast.N_CLASSEXPR or k == ast.N_FUNCEXPR or k == ast.N_OBJECT or k == ast.N_REGEX: return 1
+  if k == ast.N_VOIDEXPR or k == ast.N_NULL: return 2
+  if k == ast.N_STR or k == ast.N_NOSUBTEMPL:
+    if nm(c, c.t.s[e]) != "": return 1
+    return 2
+  if k == ast.N_COND: return truth_semantics(&c, c.t.b[e]) | truth_semantics(&c, c.t.c[e])
+  if k == ast.N_ID and nm(c, c.t.s[e]) == "undefined" and bind.lookup_value(&c, e, c.t.s[e]) < 0: return 2
+  return 0
+
+fn check_truthiness(var c: C, e: Int):
+  let sem = truth_semantics(&c, e)
+  if sem == 1: err(&c, e, 2872, "This kind of expression is always truthy.")
+  elif sem == 2: err(&c, e, 2873, "This kind of expression is always falsy.")
+
 fn push_facts(var c: C, e: Int, truth: Bool):
   var fs: [Fact] = []
   facts(&c, e, truth, &fs)
   c.narrow.push({})
   for f in fs: set_narrow(&c, f.key, f.t)
+  # the branch a literal true/false never takes is unreachable: references there have their
+  # declared types (TypeScript's flow analysis gives up on unreachable code)
+  var u = e
+  while c.t.k[u] == ast.N_PAREN: u = c.t.a[u]
+  if (c.t.k[u] == ast.N_FALSE and truth) or (c.t.k[u] == ast.N_TRUE and not truth): set_narrow(&c, "!u", 1)
 
 # ---- expressions
 
@@ -583,6 +626,7 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
   if k == ast.N_COND:
     let cond = c.t.a[n]
     check_expr(&c, cond, -1)
+    check_truthiness(&c, cond)
     push_facts(&c, cond, true)
     let a = check_expr(&c, c.t.b[n], ctx)
     c.narrow.pop()
@@ -655,12 +699,30 @@ fn ident_type(var c: C, n: Int) -> Int:
     if text == "arguments": return unsup(&c, n, "arguments")
     err(&c, n, 2304, "Cannot find name '" + text + "'.")
     return c.error_t
+  if (c.sk[s] & (S_LET | S_CONST)) != 0 and used_before_decl(&c, n, s):
+    err(&c, n, 2448, "Block-scoped variable '" + nm(c, name) + "' used before its declaration.")
+    err(&c, n, 2454, "Variable '" + nm(c, name) + "' is used before being assigned.")
   let key = "{s}"
   let nt = narrowed(c, key)
   if nt >= 0: return nt
   var t = bind.type_of_sym(&c, s)
   if (c.sk[s] & (S_CLASS | S_ENUM | S_NAMESPACE)) != 0 and c.t.file[c.sdecl[s]] >= c.user_from: return t
   return t
+
+# A use of a let or const before its declaration ends, not inside a function that could run later.
+fn used_before_decl(var c: C, use: Int, s: Int) -> Bool:
+  let d = c.sdecl[s]
+  if d < 0 or c.t.file[d] != c.t.file[use]: return false
+  let p = bind.up(c, d)
+  var stmt_end = c.t.end[d]
+  if p >= 0: stmt_end = c.t.end[p]
+  if c.t.pos[use] >= stmt_end: return false
+  var x = c.parent[use]
+  while x >= 0 and x != p:
+    let k = c.t.k[x]
+    if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET: return false
+    x = c.parent[x]
+  return true
 
 fn prop_of(var c: C, t: Int, name: Int) -> Int:
   let a = rel.apparent(&c, t)
@@ -700,13 +762,13 @@ fn non_null(var c: C, t: Int, e: Int) -> Int:
     if c.tk[m] == TK_UNDEF or c.tk[m] == TK_VOID: has_undef = true
   if not has_null and not has_undef: return t
   let rest = types.filter_union(&c, t, true, true)
-  if c.tk[rest] == TK_NEVER:
-    # the value is only null or undefined
+  if is_null_literal(c, e):
     var what = "undefined"
     if has_null and not has_undef: what = "null"
     err(&c, e, 18050, "The value '" + what + "' cannot be used here.")
     return c.error_t
   possibly_msg(&c, e, has_null, has_undef)
+  if c.tk[rest] == TK_NEVER: return c.error_t
   return rest
 
 fn in_optional_chain(c: C, n: Int) -> Bool:
@@ -735,6 +797,9 @@ fn prop_access(var c: C, n: Int) -> Int:
   if optional: ot = types.filter_union(&c, ot, true, true)
   else: ot = non_null(&c, ot, obj)
   if is_any(c, ot): return ot
+  if c.tk[ot] == TK_NEVER:
+    bind.err_at(&c, n, c.t.d[n], 2339, "Property '" + nm(c, name) + "' does not exist on type 'never'.")
+    return c.error_t
   var ts: [Int] = []
   for m in types.members(c, ot):
     if is_any(c, m):
@@ -918,17 +983,53 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
     return bind.array_of(&c, c.never_t)
   var ws: [Int] = []
   for x in ts:
-    if elem_ctx >= 0 and could_keep_literal(&c, elem_ctx): ws.push(x)
+    if elem_ctx >= 0: ws.push(widen_in_ctx(&c, x, elem_ctx))
     else: ws.push(widen(&c, x))
-  let h12_ = types.union_of(&c, ws)
+  let red = subtype_reduce(&c, ws)
+  return bind.array_of(&c, red)
+
+# An array literal's element type: the union with members that are subtypes of others removed
+# (two identical function types become one).
+fn subtype_reduce(var c: C, ts: [Int]) -> Int:
+  let u = types.union_of(&c, ts)
+  let ms = types.members(c, u)
+  var keep: [Int] = []
+  for i in 0..ms.len:
+    let m = ms[i]
+    var drop = false
+    if c.tk[m] == TK_OBJ and not c.objs[c.ta[m]].fresh:
+      for j in 0..ms.len:
+        if j == i: continue
+        let n2 = ms[j]
+        if c.tk[n2] != TK_OBJ or c.objs[c.ta[n2]].fresh: continue
+        if rel.assignable(&c, m, n2):
+          if not rel.assignable(&c, n2, m) or j < i: drop = true
+    if not drop: keep.push(m)
+  return types.union_of(&c, keep)
   return bind.array_of(&c, h12_)
 
 fn could_keep_literal(var c: C, t: Int) -> Bool:
   return rel.could_have_singletons(&c, t)
 
 fn widen_in_ctx(var c: C, x: Int, ctx: Int) -> Int:
-  if rel.could_have_singletons(&c, ctx): return x
-  return widen(&c, x)
+  if not types.is_fresh_lit(c, x) and not (x in c.freg): return widen(&c, x)
+  var out: [Int] = []
+  for m in types.members(c, x):
+    if literal_of_ctx(&c, m, ctx): out.push(m)
+    else: out.push(types.base_of_literal(c, m))
+  if out.len == 1: return out[0]
+  return types.union_of(&c, out)
+
+# Whether a literal keeps its literal type in this contextual type: one with literals of its kind.
+fn literal_of_ctx(var c: C, lit: Int, ctx: Int) -> Bool:
+  let lk = c.tk[lit]
+  for m in types.members(c, ctx):
+    let k = c.tk[m]
+    if k == TK_TPARAM: return true
+    if lk == TK_STRLIT and k == TK_STRLIT: return true
+    if lk == TK_NUMLIT and k == TK_NUMLIT: return true
+    if (lk == TK_TRUE or lk == TK_FALSE) and (k == TK_TRUE or k == TK_FALSE): return true
+  return false
 
 # An arrow or function expression: parameters from annotations, else from the contextual signature.
 fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
@@ -1062,7 +1163,24 @@ fn call(var c: C, n: Int, is_new: Bool) -> Int:
   for sg in sgs:
     if arity_ok(c, sg, args.len): cands.push(sg)
   if cands.len == 0:
-    for a in args: check_expr(&c, a, -1)
+    # the arguments still get their contextual types, from the longest candidate
+    # (getCandidateForOverloadFailure / getLongestCandidateIndex)
+    var best = -1
+    var best_n = -1
+    for sg in sgs:
+      let pn = c.sigs[sg].ptypes.len
+      var has_rest = false
+      for f in types.ints(c.sigs[sg].pflags):
+        if f == 2: has_rest = true
+      if best < 0 and (has_rest or pn >= args.len): best = sg
+      if pn > best_n: best_n = pn
+    if best < 0:
+      for sg in sgs:
+        if c.sigs[sg].ptypes.len == best_n and best < 0: best = sg
+    let bsg = instantiate_call(&c, best, args)
+    for i in 0..args.len:
+      let pt = param_at(&c, bsg, i)
+      check_expr(&c, args[i], pt)
     # too few: at the call; too many: at the first extra argument
     var mx = 0
     var rest = false
@@ -1100,11 +1218,39 @@ fn args_fit(var c: C, sg: Int, args: [Int]) -> Bool:
     if not rel.assignable(&c, at, pt): return false
   return true
 
+fn skip_parens(c: C, e0: Int) -> Int:
+  var e = e0
+  while c.t.k[e] == ast.N_PAREN: e = c.t.a[e]
+  return e
+
+# checkReturnExpression: each branch of a conditional on its own (reported where it's written);
+# otherwise at the return statement, or at the expression for an arrow's expression body.
+fn return_expr(var c: C, in_return: Bool, stmt: Int, expr: Int, et: Int, declared: Int, in_cond: Bool):
+  let u = skip_parens(c, expr)
+  if c.t.k[u] == ast.N_COND:
+    let wt = c.t.b[u]
+    let wf = c.t.c[u]
+    var tt = c.any_t
+    if wt in c.ntype: tt = c.ntype[wt]
+    var ft = c.any_t
+    if wf in c.ntype: ft = c.ntype[wf]
+    return_expr(&c, in_return, stmt, wt, tt, declared, true)
+    return_expr(&c, in_return, stmt, wf, ft, declared, true)
+    return
+  if rel.assignable(&c, et, declared): return
+  var at = u
+  if in_return and not in_cond: at = stmt
+  rel.report(&c, et, declared, at, u, 2322)
+
 fn check_args(var c: C, sg: Int, args: [Int], report: Bool):
+  var reported = false
   for i in 0..args.len:
     let pt = param_at(&c, sg, i)
     let at = check_expr(&c, args[i], pt)
-    if report and not rel.assignable(&c, at, pt): rel.report(&c, at, pt, args[i], args[i], 2345)
+    if report and not reported and not rel.assignable(&c, at, pt):
+      let an = skip_parens(c, args[i])
+      rel.report(&c, at, pt, an, an, 2345)
+      reported = true
 
 # Infers a generic signature's type arguments from the arguments and instantiates it.
 fn instantiate_call(var c: C, sg: Int, args: [Int]) -> Int:
@@ -1286,7 +1432,15 @@ fn comparable(var c: C, a: Int, b: Int) -> Bool:
     for y in types.members(c, b):
       if rel.assignable(&c, x, y) or rel.assignable(&c, y, x): return true
       if c.tk[x] == TK_UNKNOWN or c.tk[y] == TK_UNKNOWN: return true
+      # the comparable relation skips the weak-type check unless the source is a unit type
+      if weak_comparable(&c, x, y) or weak_comparable(&c, y, x): return true
   return false
+
+fn weak_comparable(var c: C, s: Int, t: Int) -> Bool:
+  if not rel.is_weak(&c, t): return false
+  let k = c.tk[s]
+  if types.is_literal(c, s) or k == TK_NULL or k == TK_UNDEF or k == TK_VOID: return false
+  return k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_OBJ or k == TK_NONPRIM
 
 fn assign_target(var c: C, l: Int) -> Int:
   # the declared type of what's assigned to (not narrowed)
@@ -1298,7 +1452,7 @@ fn assign_target(var c: C, l: Int) -> Int:
       return c.error_t
     if (c.sk[s] & S_CONST) != 0:
       err(&c, l, 2588, "Cannot assign to '" + nm(c, c.t.s[l]) + "' because it is a constant.")
-      return c.error_t
+      return bind.type_of_sym(&c, s)
     if (c.sk[s] & (S_FUNC | S_CLASS | S_ENUM | S_NAMESPACE)) != 0: return unsup(&c, l, "assigning to a function or class")
     return bind.type_of_sym(&c, s)
   if k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS:
@@ -1322,6 +1476,12 @@ fn assign_target(var c: C, l: Int) -> Int:
   if k == ast.N_PAREN: return assign_target(&c, c.t.a[l])
   return unsup(&c, l, "this assignment target")
 
+fn bad_ref(c: C, before: Int) -> Bool:
+  for i in before..c.diags.len:
+    let code = c.diags[i].code
+    if code == 2588 or code == 2540: return true
+  return false
+
 fn binary(var c: C, n: Int, ctx: Int) -> Int:
   let op = c.t.f[n]
   let l = c.t.a[n]
@@ -1329,9 +1489,11 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
   if op == scan.T_ASSIGN:
     let lk = c.t.k[l]
     if lk == ast.N_OBJECT or lk == ast.N_ARRAY: return unsup(&c, n, "a destructuring assignment")
+    let before = c.diags.len
     let target = assign_target(&c, l)
     let rt = check_expr(&c, r, target)
-    if not is_any(c, target) and not rel.assignable(&c, rt, target): rel.report(&c, rt, target, l, r, 2322)
+    # a constant or read-only target is reported alone (checkReferenceExpression fails)
+    if not bad_ref(c, before) and not is_any(c, target) and not rel.assignable(&c, rt, target): rel.report(&c, rt, target, l, r, 2322)
     let key = ref_key(&c, l)
     if key != "":
       forget(&c, key)
@@ -1339,6 +1501,7 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
       set_narrow(&c, key, h15_)
     return rt
   if op >= scan.T_PLUSEQ and op <= scan.T_QQEQ:
+    let before = c.diags.len
     let target = assign_target(&c, l)
     let lt = check_expr(&c, l, -1)
     let rt = check_expr(&c, r, -1)
@@ -1352,12 +1515,13 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
       arith_operand(&c, r, rt, 2363)
       res = c.number_t
       if bigint_like(c, lt) and bigint_like(c, rt): res = c.bigint_t
-    if not is_any(c, target) and not rel.assignable(&c, res, target): rel.report(&c, res, target, l, -1, 2322)
+    if not bad_ref(c, before) and not is_any(c, target) and not rel.assignable(&c, res, target): rel.report(&c, res, target, l, -1, 2322)
     let key = ref_key(&c, l)
     if key != "": forget(&c, key)
     return res
   if op == scan.T_AND:
     let lt = check_expr(&c, l, -1)
+    check_truthiness(&c, l)
     push_facts(&c, l, true)
     let rt = check_expr(&c, r, -1)
     c.narrow.pop()
@@ -1365,6 +1529,7 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
     return union_fresh(&c, [h16_, rt])
   if op == scan.T_OR:
     let lt = check_expr(&c, l, -1)
+    check_truthiness(&c, l)
     push_facts(&c, l, false)
     let rt = check_expr(&c, r, ctx)
     c.narrow.pop()
@@ -1382,10 +1547,8 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
   let rt = check_expr(&c, r, -1)
   if op == scan.T_PLUS: return plus_type(&c, n, l, r, lt, rt, op)
   if op == scan.T_MINUS or op == scan.T_STAR or op == scan.T_SLASH or op == scan.T_PCT or op == scan.T_STAR2 or op == scan.T_SHL or op == scan.T_SHR or op == scan.T_SHRU or op == scan.T_AMP or op == scan.T_BAR or op == scan.T_CARET:
-    var la = lt
-    var ra = rt
-    if c.tk[la] != TK_NULL and c.tk[la] != TK_UNDEF: la = non_nullable_operand(&c, l, la)
-    if c.tk[ra] != TK_NULL and c.tk[ra] != TK_UNDEF: ra = non_nullable_operand(&c, r, ra)
+    let la = non_nullable_operand(&c, l, lt)
+    let ra = non_nullable_operand(&c, r, rt)
     let ok1 = arith_operand(&c, l, la, 2362)
     let ok2 = arith_operand(&c, r, ra, 2363)
     if bigint_like(c, lt) and bigint_like(c, rt): return c.bigint_t
@@ -1404,7 +1567,7 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
       err(&c, n, 2365, "Operator '" + op_text(op) + "' cannot be applied to types '" + h19_ + "' and '" + h20_ + "'.")
     return c.boolean_t
   if op == scan.T_EQ3 or op == scan.T_NE2 or op == scan.T_EQ2 or op == scan.T_NE:
-    if not comparable(&c, lt, rt):
+    if not only_nullish(c, lt) and not only_nullish(c, rt) and not comparable(&c, lt, rt):
       var a = types.regular(c, lt)
       var b = types.regular(c, rt)
       let ab = widen_all(&c, a)
@@ -1425,6 +1588,17 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
     return c.boolean_t
   return unsup(&c, n, "this operator")
 
+fn is_null_literal(c: C, e: Int) -> Bool:
+  var x = e
+  while c.t.k[x] == ast.N_PAREN: x = c.t.a[x]
+  return c.t.k[x] == ast.N_NULL or (c.t.k[x] == ast.N_ID and nm(c, c.t.s[x]) == "undefined")
+
+fn only_nullish(c: C, t: Int) -> Bool:
+  for m in types.members(c, t):
+    let k = c.tk[m]
+    if k != TK_NULL and k != TK_UNDEF and k != TK_VOID: return false
+  return true
+
 fn non_nullable_operand(var c: C, e: Int, t: Int) -> Int:
   var has_null = false
   var has_undef = false
@@ -1433,20 +1607,21 @@ fn non_nullable_operand(var c: C, e: Int, t: Int) -> Int:
     if c.tk[m] == TK_UNDEF: has_undef = true
   if not has_null and not has_undef: return t
   let rest = types.filter_union(&c, t, true, true)
-  if c.tk[rest] == TK_NEVER:
+  if is_null_literal(c, e):
     var what = "undefined"
     if has_null and not has_undef: what = "null"
     err(&c, e, 18050, "The value '" + what + "' cannot be used here.")
     return c.error_t
   possibly_msg(&c, e, has_null, has_undef)
+  if c.tk[rest] == TK_NEVER: return c.error_t
   return rest
 
 fn plus_type(var c: C, n: Int, l: Int, r: Int, lt0: Int, rt0: Int, op: Int) -> Int:
   var lt = lt0
   var rt = rt0
   if not string_like(c, lt) and not string_like(c, rt) and not is_any(c, lt) and not is_any(c, rt):
-    if c.tk[lt] != TK_NULL and c.tk[lt] != TK_UNDEF: lt = non_nullable_operand(&c, l, lt)
-    if c.tk[rt] != TK_NULL and c.tk[rt] != TK_UNDEF: rt = non_nullable_operand(&c, r, rt)
+    lt = non_nullable_operand(&c, l, lt)
+    rt = non_nullable_operand(&c, r, rt)
   if is_any(c, lt) or is_any(c, rt):
     if string_like(c, lt) or string_like(c, rt): return c.string_t
     return c.any_t
@@ -1471,7 +1646,27 @@ fn prefix(var c: C, n: Int) -> Int:
   let op = c.t.f[n]
   let a = c.t.a[n]
   let t = check_expr(&c, a, -1)
-  if op == scan.T_BANG: return c.boolean_t
+  if op == scan.T_BANG:
+    check_truthiness(&c, a)
+    # !x of something always falsy is true, of something always truthy false
+    var can_true = false
+    var can_false = false
+    for m in types.members(c, t):
+      let mk = c.tk[m]
+      if mk == TK_NULL or mk == TK_UNDEF or mk == TK_VOID or mk == TK_FALSE: can_false = true
+      elif mk == TK_TRUE or mk == TK_OBJ or mk == TK_NONPRIM or mk == TK_SYMBOL: can_true = true
+      elif mk == TK_STRLIT:
+        if c.t.names[c.ta[m]] == "": can_false = true
+        else: can_true = true
+      elif mk == TK_NUMLIT:
+        if c.nums[c.ta[m]] == 0.0: can_false = true
+        else: can_true = true
+      else:
+        can_true = true
+        can_false = true
+    if can_true and not can_false: return c.ffalse
+    if can_false and not can_true: return c.ftrue
+    return c.boolean_t
   if op == scan.T_INC or op == scan.T_DEC:
     arith_operand(&c, a, t, 2356)
     return c.number_t
@@ -1510,7 +1705,10 @@ fn check_function_body(var c: C, d: Int, sg: Int):
   c.narrow.push({})
   var saved: [{Str: Int}] = []
   swap(&saved, &c.narrow)
-  c.narrow.push(const_facts(&c, saved))
+  # a function declaration is hoisted: no outer narrowing reaches it (only expressions and arrows
+  # see the narrowings of constants)
+  if c.t.k[d] == ast.N_FUNC: c.narrow.push({})
+  else: c.narrow.push(const_facts(&c, saved))
   var declared = -1
   if c.t.c[d] >= 0: declared = c.sigs[sg].ret
   c.ret_stack.push(declared)
@@ -1521,7 +1719,7 @@ fn check_function_body(var c: C, d: Int, sg: Int):
     var rctx = declared
     if rctx < 0 and d in c.ret_ctx: rctx = c.ret_ctx[d]
     let et = check_expr(&c, body, rctx)
-    if declared >= 0 and not rel.assignable(&c, et, declared) and c.tk[declared] != TK_VOID: rel.report(&c, et, declared, body, body, 2322)
+    if declared >= 0 and c.tk[declared] != TK_VOID: return_expr(&c, false, body, body, et, declared, false)
   c.ret_stack.pop()
   swap(&saved, &c.narrow)
   c.narrow.pop()
@@ -1547,19 +1745,16 @@ fn includes_undefined(var c: C, t: Int) -> Bool:
 
 fn check_missing_return(var c: C, d: Int, declared: Int, body: Int):
   let k = c.tk[declared]
-  if k == TK_VOID or k == TK_ANY or k == TK_ERROR or k == TK_UNSUP or k == TK_UNKNOWN or k == TK_NEVER: return
-  if includes_undefined(&c, declared) and k != TK_UNION: return
+  if k == TK_ANY or k == TK_ERROR or k == TK_UNSUP or k == TK_UNDEF or k == TK_NEVER: return
+  for m in types.members(c, declared):
+    if c.tk[m] == TK_VOID: return
+  if terminates(c, body): return
   var rets: [Int] = []
   collect_returns(c, body, &rets)
-  var with_value = 0
-  for r in rets:
-    if c.t.a[r] >= 0: with_value += 1
-  if terminates(c, body): return
-  if with_value == 0:
-    if includes_undefined(&c, declared): return
+  if rets.len == 0:
     err(&c, c.t.c[d], 2355, "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.")
     return
-  if includes_undefined(&c, declared): return
+  if rel.assignable(&c, c.undef_t, declared): return
   err(&c, c.t.c[d], 2366, "Function lacks ending return statement and return type does not include 'undefined'.")
 
 fn check_block(var c: C, b: Int):
@@ -1631,12 +1826,12 @@ fn check_stmt(var c: C, n: Int):
     if c.t.a[n] >= 0:
       var ctx = declared
       let et = check_expr(&c, c.t.a[n], ctx)
-      if declared >= 0 and c.tk[declared] != TK_VOID and not rel.assignable(&c, et, declared): rel.report(&c, et, declared, c.t.a[n], c.t.a[n], 2322)
-      elif declared >= 0 and c.tk[declared] == TK_VOID and not rel.assignable(&c, et, declared): rel.report(&c, et, declared, c.t.a[n], c.t.a[n], 2322)
+      if declared >= 0: return_expr(&c, true, n, c.t.a[n], et, declared, false)
     return
   if k == ast.N_IF:
     let cond = c.t.a[n]
     check_expr(&c, cond, -1)
+    check_truthiness(&c, cond)
     push_facts(&c, cond, true)
     check_stmt(&c, c.t.b[n])
     let then_ends = terminates(c, c.t.b[n])
@@ -1671,6 +1866,7 @@ fn check_stmt(var c: C, n: Int):
       body = c.t.a[n]
     forget_assigned(&c, body)
     check_expr(&c, cond, -1)
+    check_truthiness(&c, cond)
     push_facts(&c, cond, true)
     check_stmt(&c, body)
     c.narrow.pop()
@@ -1688,6 +1884,7 @@ fn check_stmt(var c: C, n: Int):
     forget_assigned(&c, c.t.c[n])
     if c.t.b[n] >= 0:
       check_expr(&c, c.t.b[n], -1)
+      check_truthiness(&c, c.t.b[n])
       push_facts(&c, c.t.b[n], true)
     else: c.narrow.push({})
     check_stmt(&c, c.t.d[n])
