@@ -34,7 +34,7 @@ rm -rf "$d"; mkdir -p "$d/compiler"
 cp compiler/vuc "$d/compiler/"
 cp -r std "$d/std"
 for f in README.md llms.txt; do [ -f "$f" ] && cp "$f" "$d/"; done
-for f in LICENSE LICENSE.md LICENSE.txt; do [ -f "$f" ] && cp "$f" "$d/"; done
+for f in LICENSE NOTICE; do [ -f "$f" ] && cp "$f" "$d/"; done
 cat > "$d/vu" <<'SH'
 #!/bin/sh
 # The Vu compiler. https://vulang.org

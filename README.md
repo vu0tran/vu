@@ -524,4 +524,4 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 ## License
 
 MIT ([LICENSE](LICENSE)). A few example and benchmark files carry code from other projects under
-their own licenses; LICENSE lists them.
+their own licenses; [NOTICE](NOTICE) lists them.
