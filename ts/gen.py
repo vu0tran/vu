@@ -213,6 +213,28 @@ class G:
         self.took = True
         return decl + f"function {name}<T{con}>(p: {pt}){ret} {{\n  " + "\n  ".join(body) + "\n}"
 
+    def flow(self):
+        """--flow: a union-typed variable assigned in branches and blocks, then read"""
+        r = self.r
+        x = self.name("x")
+        parts = r.sample(["number", "string", "boolean", "undefined", "null", '"a"', "1"], r.randint(2, 3))
+        if r.random() < 0.3 and self.aliases: t = r.choice(self.aliases)[0]
+        else: t = " | ".join(parts)
+        kw = r.choice(["let", "let", "var"])
+        out = [f"{kw} {x}: {t} = {self.value(r.choice(split_union(t)) if ' | ' in t else t)}"]
+        for _ in range(r.randint(1, 3)):
+            c = r.random()
+            val = lambda: self.value(r.choice(split_union(t)))
+            cond = r.choice([f"typeof {x} === \"string\"", f"{x} === undefined", f"!{x}", "1 > 2", f"{x}"])
+            if c < 0.35: out.append(f"if ({cond}) {{ {x} = {val()} }}")
+            elif c < 0.6: out.append(f"if ({cond}) {{ {x} = {val()} }} else {{ {x} = {val()} }}")
+            elif c < 0.7: out.append(f"if ({cond}) {{ {x} = {val()}; }} else {{ console.log({x}) }}")
+            elif c < 0.8: out.append(f"{{ {x} = {val()} }}")
+            elif c < 0.9: out.append(f"if ({cond}) {{ {x} = {val()}; throw 0 }}")
+            else: out.append(f"const {self.name('r')}: {r.choice(['number', 'string', 'boolean'])} = {x}")
+        out.append(f"const {self.name('r')}: {r.choice(['number', 'string', 'boolean', 'object'])} = {x}")
+        return "\n".join(out)
+
     def call(self):
         r = self.r
         if not self.funcs: return "console.log(0)"
@@ -355,6 +377,16 @@ class G:
                 out.append(f"const {self.name('i')}: {r.choice(self.ifaces)[0]} = {o}")
             else:
                 out.append(f"console.log({o}.zz)")
+        if getattr(self, "with_instanceof", False) and r.random() < 0.6:
+            # x instanceof K on a union of classes (and a primitive or two)
+            ks = r.sample(self.classes, min(len(self.classes), r.randint(1, 3)))
+            ut = " | ".join([k2["name"] for k2 in ks] + r.sample(["string", "number", "Date", "Error"], r.randint(0, 2)))
+            x = self.name("u")
+            out.append(f"declare const {x}: {ut}")
+            k3 = r.choice(self.classes)["name"] if r.random() < 0.8 else r.choice(["Date", "Error", "Object"])
+            tgt = r.choice(["number", "boolean", "string"])
+            neg = "!" if r.random() < 0.2 else ""
+            out.append(f"if ({neg}({x} instanceof {k3})) {{ const {self.name('n')}: {tgt} = {x} }} else {{ const {self.name('m')}: {tgt} = {x} }}")
         return "\n".join(out)
 
     def program(self):
@@ -367,6 +399,7 @@ class G:
             if classes and c < 0.2: out.append(self.klass())
             elif classes and c < 0.35 and getattr(self, "classes", None): out.append(self.use_class())
             elif getattr(self, "with_generics", False) and c < 0.3: out.append(self.gfunc())
+            elif getattr(self, "with_flow", False) and c < 0.35: out.append(self.flow())
             elif c < 0.35: out.append(self.decl())
             elif c < 0.55: out.append(self.func())
             elif c < 0.75: out.append(self.call())
@@ -446,6 +479,9 @@ def main():
         g.with_classes = "--classes" in sys.argv
         g.with_generics = "--generics" in sys.argv
         g.with_spreads = "--spreads" in sys.argv
+        g.with_instanceof = "--instanceof" in sys.argv
+        g.with_flow = "--flow" in sys.argv
+        if g.with_instanceof: g.with_classes = True
         with open(os.path.join(outdir, f"g{k:05d}.ts"), "w") as f:
             f.write(g.program())
 
