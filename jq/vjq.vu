@@ -9,6 +9,7 @@ import lang
 import run
 import nat
 import builtins
+import mods
 from jv import V, St, vnull, vnum, vstr, kind, K_NULL, K_FALSE, K_TRUE, K_STR, K_ARR, K_OBJ
 from run import It, ST_OK, ST_ERR, ST_BREAK, ST_HALT
 
@@ -88,6 +89,7 @@ type Opts:
   positional: [Str]
   posjson: Bool
   run_tests: Str
+  stream: Bool
 
 fn die(msg: Str, code: Int):
   eprint(msg)
@@ -100,7 +102,7 @@ fn usage_err(msg: Str):
   exit(2)
 
 fn parse_args(argv: [Str]) -> Opts:
-  var o = Opts("", false, [], false, false, false, false, false, false, false, false, false, false, 2, false, false, "", [], [], [], [], false, "")
+  var o = Opts("", false, [], false, false, false, false, false, false, false, false, false, false, 2, false, false, "", [], [], [], [], false, "", false)
   var i = 1
   var further = true
   var args_mode = 0     # 1: --args, 2: --jsonargs
@@ -175,7 +177,7 @@ fn parse_args(argv: [Str]) -> Opts:
         print("jq-1.7.1")
         exit(0)
       elif a == "--stream":
-        die("vjq: --stream is not supported", 2)
+        o.stream = true
       else:
         usage_err("Unknown option: " + a)
       continue
@@ -235,20 +237,21 @@ fn compile_error(it: It, src: Str) -> Str:
   if line < lines.len: text = lines[line]
   return "jq: error: " + it.cerr + " at <top-level>, line {line + 1}:\n" + text
 
-# Builds the interpreter: globals, builtins and the program. Returns the program's root node,
-# or -1 with it.cerr set.
-fn compile(var it: It, src: Str, names: [Str], vals: [V]) -> Int:
-  # globals: $ENV, then the named arguments
+# Builds the interpreter: globals, builtins, modules and the program. Returns the program's root
+# node, or -1 with it.cerr set.
+fn compile(var it: It, fs: Fs, src: Str, names: [Str], vals: [V], libdirs: [Str], home: Str) -> Int:
+  for d in libdirs: it.libdirs.push(d)
+  it.home = home
+  # globals ($ENV, then the named arguments) are frames at fixed places, not on any chain
   var sc = run.Scope([], [], [], [], 0)
-  var genv = -1
   let envv = nat.env_obj(&it)
   it.env_obj = envv
-  genv = run.frpush(&it, genv, run.FR_VAR, envv, -1, -1)
-  run.sc_push(&sc, run.SC_VAR, "ENV", 0, -1)
+  let fe = run.frpush(&it, -1, run.FR_VAR, envv, -1, -1)
+  run.sc_push(&sc, run.SC_GVAR, "ENV", 0, fe)
   for i in 0..names.len:
-    genv = run.frpush(&it, genv, run.FR_VAR, vals[i], -1, -1)
-    run.sc_push(&sc, run.SC_VAR, names[i], 0, -1)
-  it.genv = genv
+    let f = run.frpush(&it, -1, run.FR_VAR, vals[i], -1, -1)
+    run.sc_push(&sc, run.SC_GVAR, names[i], 0, f)
+  it.genv = -1
   sc.nglobal = sc.kind.len
   # the builtins written in jq
   var bp = lang.new_parser(builtins.SOURCE, "<builtin>")
@@ -257,22 +260,37 @@ fn compile(var it: It, src: Str, names: [Str], vals: [V]) -> Int:
     it.cerr = "internal: builtins: " + bp.err
     return -1
   swap(&it.ast, &bp.ast)
-  for f in bdefs: run.resolve_def(&it, f, &sc)
   # the program
   var p = lang.new_parser(src, "<top-level>")
   swap(&p.ast, &it.ast)
-  let root = lang.parse_program(&p, &it.st)
+  let mi0 = it.ast.imeta.len
+  let root = lang.parse_program(&p, &it.st, false)
   swap(&p.ast, &it.ast)
   if p.err != "":
     it.cerr = p.err
     it.cerrline = p.errline
     return -1
-  if root < 0:
-    # only definitions: the program is the identity
-    let id = it.ast.ns.len
-    it.ast.ns.push(lang.N(lang.N_ID, -1, -1, -1, -1, -1, -1, vnull(), 0))
-    run.mark_simple(&it)
-    return id
+  if root == -2:
+    it.cerr = "Top-level program not given (try \".\")"
+    return -1
+  # modules (data modules become global frames too)
+  var m = mods.new_mods()
+  let mi1 = it.ast.imeta.len
+  for i in mi0..mi1:
+    let ip = it.ast.imports[2 * i] + ""
+    let alias = it.ast.imports[2 * i + 1] + ""
+    let _h80301 = it.ast.imeta[i]
+    let r = mods.load(&it, &m, fs, ip, alias.startswith("$"), _h80301, ".", libdirs, home)
+    if r < 0:
+      it.cerr = m.err
+      return -1
+    while m.imp_mod.len <= i: m.imp_mod.push(-1)
+    m.imp_mod[i] = r
+  it.nglobals = it.fr.len
+  for f in bdefs: run.resolve_def(&it, f, &sc)
+  let base = mods.copy_scope(sc)
+  mods.add_imports(&it, &m, &sc, base, mi0, mi1)
+  if it.cerr != "": return -1
   run.resolve(&it, root, &sc)
   if it.cerr != "": return -1
   run.mark_simple(&it)
@@ -284,7 +302,7 @@ fn reset_run(var it: It):
   it.pk.truncate(1)
   if it.aown.len > it.st.ao.len: it.aown.truncate(it.st.ao.len)
   if it.oown.len > it.st.oo.len: it.oown.truncate(it.st.oo.len)
-  it.fr.truncate(it.genv + 1)
+  it.fr.truncate(it.nglobals)
   it.ks.truncate(0)
   it.argv.truncate(0)
 
@@ -297,26 +315,26 @@ fn run_one(var it: It, root: Int, v: V) -> Int:
   let s = run.ev(&it, root, v, -1, _h1, 0)
   return s
 
-fn pos_text(it: It) -> Str:
+fn pos_text(var it: It) -> Str:
   if it.null_input: return "<unknown>"
   var name = "<stdin>"
   if it.ifile < it.ifiles.len and it.ifiles[it.ifile] != "": name = it.ifiles[it.ifile]
-  return name + ":{it.iline}"
+  return name + ":{nat.fed_lines(&it)}"
 
 fn report_error(var it: It):
   run.flush_out(&it)
   let e = it.err
   if kind(e) == K_STR:
-    eprint("jq: error (at " + pos_text(it) + "): " + jv.str_of(it.st, e))
+    eprint("jq: error (at " + pos_text(&it) + "): " + jv.str_of(it.st, e))
   else:
     let s = jv.to_json_str(&it.st, e)
-    eprint("jq: error (at " + pos_text(it) + ") (not a string): " + s)
+    eprint("jq: error (at " + pos_text(&it) + ") (not a string): " + s)
 
 fn main(fs: Fs, os: Os, ffi: Ffi):
   let argv = args()
   let o = parse_args(argv)
   if o.run_tests != "":
-    let code = run_tests(fs, os, ffi, o.run_tests)
+    let code = run_tests(fs, os, ffi, o.run_tests, lib_dirs(o, os))
     exit(code)
   var src = o.filter
   var files: [Str] = []
@@ -331,7 +349,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   elif not o.have_filter:
     print(USAGE)
     exit(2)
-  var it = run.new_it(ffi)
+  var it = run.new_it(ffi, fs, os)
   it.null_input = o.null_input
   it.raw_input = o.raw_input
   it.slurp = o.slurp
@@ -349,8 +367,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   var text = ""
   var ierrs = 0
   if files.len == 0:
-    if not o.null_input or true:
-      text = os.read_stdin() else ""
+    if o.null_input: it.stdin_pending = true
+    else: text = os.read_stdin() else ""
     it.ifiles.push("")
     it.istarts.push(0)
   else:
@@ -359,7 +377,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
         ok(t):
           it.ifiles.push(f)
           it.istarts.push(text.len)
-          if has_bom(t): text += t[3..t.len]
+          if files.len == 1 and not has_bom(t): text = t
+          elif has_bom(t): text += t[3..t.len]
           else: text += t
         err(e):
           eprint("jq: error: Could not open " + f + ": " + open_err(fs, f))
@@ -415,7 +434,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   let argsv = jv.end_obj(&it.st, s1)
   names.push("ARGS")
   vals.push(argsv)
-  let root = compile(&it, src, names, vals)
+  let root = compile(&it, fs, src, names, vals, lib_dirs(o, os), os.env("HOME"))
   if root < 0:
     eprint(compile_error(it, src))
     eprint("jq: 1 compile error")
@@ -453,6 +472,19 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       if it.bad:
         it.bad = false
         break
+      if o.stream:
+        var path: [V] = []
+        var evs: [V] = []
+        nat.stream_events(&it, v, &path, &evs)
+        for ev in evs:
+          ret = process(&it, root, ev)
+          if ret <= 0 and ret != -4:
+            if ret == -1: last_result = 0
+            else: last_result = 1
+          if it.halted: break
+        reset_run(&it)
+        if it.halted: break
+        continue
       ret = process(&it, root, v)
       if ret <= 0 and ret != -4:
         if ret == -1: last_result = 0
@@ -527,7 +559,7 @@ fn process(var it: It, root: Int, v: V) -> Int:
 
 fn report_error_msg(var it: It, msg: Str):
   run.flush_out(&it)
-  eprint("jq: error (at " + pos_text(it) + "): " + msg)
+  eprint("jq: error (at " + pos_text(&it) + "): " + msg)
 
 # ---------------------------------------------------------------- the test runner
 
@@ -535,7 +567,7 @@ fn skipline(l: Str) -> Bool:
   let t = l.strip()
   return t == "" or t.startswith("#")
 
-fn run_tests(fs: Fs, os: Os, ffi: Ffi, path: Str) -> Int:
+fn run_tests(fs: Fs, os: Os, ffi: Ffi, path: Str, libdirs: [Str]) -> Int:
   var text = ""
   if path == "-": text = os.read_stdin() else ""
   else: text = fs.read(path) else die_s("jq: error: Could not open " + path)
@@ -557,13 +589,13 @@ fn run_tests(fs: Fs, os: Os, ffi: Ffi, path: Str) -> Int:
     let prog = l
     tests += 1
     print("Test #{tests}: '" + prog + "' at line number {i}")
-    var it = run.new_it(ffi)
+    var it = run.new_it(ffi, fs, os)
     it.collect = true
     it.st.b = []
     it.st.pline = 1
     var names: [Str] = []
     var vals: [V] = []
-    let root = compile(&it, prog, names, vals)
+    let root = compile(&it, fs, prog, names, vals, libdirs, os.env("HOME"))
     if must_fail:
       must_fail = false
       let expected = lines[i] + ""
@@ -641,3 +673,18 @@ fn run_tests(fs: Fs, os: Os, ffi: Ffi, path: Str) -> Int:
 
 fn has_bom(t: Str) -> Bool:
   return t.len >= 3 and t[0] == 0xEF and t[1] == 0xBB and t[2] == 0xBF
+
+# The module search path: -L directories, else jq's default.
+fn lib_dirs(o: Opts, os: Os) -> [Str]:
+  var ds: [Str] = []
+  for d in o.libdirs: ds.push(d)
+  if ds.len == 0:
+    ds.push("~/.jq")
+    let origin = exe_dir()
+    ds.push(origin + "/../lib/jq")
+    ds.push(origin + "/../lib")
+  return ds
+
+fn exe_dir() -> Str:
+  let a0 = args()[0]
+  return mods.dirname(a0)

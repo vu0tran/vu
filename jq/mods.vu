@@ -1,0 +1,198 @@
+# mods: jq's module system: import "path" as name; import "path" as $data; include "path";
+# Modules are found on the search path (-L, else ~/.jq, $ORIGIN/../lib/jq, $ORIGIN/../lib), or on
+# the paths in an import's {search: ...} metadata, relative to the importing file's folder.
+
+import jv
+import lang
+import run
+import nat
+from jv import V, vnull, vstr, kind, K_STR, K_ARR, K_OBJ
+from run import It, Scope
+
+type Mods:
+  path: [Str]
+  dir: [Str]
+  is_data: [Bool]
+  frame: [Int]          # data module: the global frame holding its value
+  defs_start: [Int]     # code module: its top-level functions in ast.topdefs
+  defs_end: [Int]
+  imp_start: [Int]      # its imports in ast.imports (pairs) / ast.imeta
+  imp_end: [Int]
+  imp_mod: [Int]        # per import (indexed like ast.imeta): the module it resolved to
+  state: [Int]          # 0 loaded, 1 resolving, 2 resolved
+  err: Str
+
+fn new_mods() -> Mods:
+  return Mods([], [], [], [], [], [], [], [], [], [], "")
+
+fn dirname(p: Str) -> Str:
+  var i = p.len - 1
+  while i >= 0 and p[i] != '/': i -= 1
+  if i < 0: return "."
+  if i == 0: return "/"
+  return p[0..i]
+
+fn join_path(d: Str, p: Str) -> Str:
+  if p.startswith("/"): return p
+  if d == "" or d == ".": return p
+  if d.endswith("/"): return d + p
+  return d + "/" + p
+
+fn last_part(p: Str) -> Str:
+  var i = p.len - 1
+  while i >= 0 and p[i] != '/': i -= 1
+  return p[i + 1..p.len]
+
+# The search directories for an import (metadata node meta, -1 for none) in a file in dir.
+fn search_dirs(var it: It, meta: Int, dir: Str, libdirs: [Str], home: Str) -> [Str]:
+  var out: [Str] = []
+  if meta >= 0:
+    let was_bad = it.bad
+    it.bad = false
+    let mv = run.sev(&it, meta, vnull(), -1)
+    if it.bad: eprint("vjq: bad module metadata")
+    it.bad = was_bad
+    if kind(mv) == K_OBJ:
+      let sk = jv.intern_str(&it.st, "search")
+      let pos = jv.ofind(it.st, mv, sk)
+      if pos >= 0:
+        let sv = jv.oval(it.st, mv, pos)
+        var xs: [V] = []
+        if kind(sv) == K_STR: xs.push(sv)
+        elif kind(sv) == K_ARR:
+          let n = jv.alen(it.st, sv)
+          for i in 0..n: xs.push(jv.aget(it.st, sv, i))
+        for x in xs:
+          if kind(x) == K_STR: out.push(join_path(dir, jv.str_of(it.st, x)))
+        return out
+  for d in libdirs:
+    if d.startswith("~/"): out.push(join_path(home, d[2..d.len]))
+    elif d == "~": out.push(home)
+    else: out.push(d)
+  return out
+
+# Loads the module path (and, recursively, what it imports). Returns its index, or -1 with m.err.
+fn load(var it: It, var m: Mods, fs: Fs, path: Str, is_data: Bool, meta: Int, dir: Str, libdirs: [Str], home: Str) -> Int:
+  let dirs = search_dirs(&it, meta, dir, libdirs, home)
+  var ext = ".jq"
+  if is_data: ext = ".json"
+  var found = ""
+  for d in dirs:
+    let c1 = join_path(d, path + ext)
+    if fs.exists(c1):
+      found = c1
+      break
+    let c2 = join_path(d, path + "/" + last_part(path) + ext)
+    if fs.exists(c2):
+      found = c2
+      break
+  if found == "":
+    m.err = "module not found: " + path
+    return -1
+  for i in 0..m.path.len:
+    if m.path[i] == found and m.is_data[i] == is_data: return i
+  let text = fs.read(found) else ""
+  let idx = m.path.len
+  m.path.push(found)
+  m.dir.push(dirname(found))
+  m.is_data.push(is_data)
+  m.state.push(0)
+  if is_data:
+    let sv = jv.new_str(&it.st, text)
+    let v = slurp_values(&it, sv)
+    if it.bad:
+      it.bad = false
+      m.err = "Bad JSON in module " + found
+      return -1
+    m.frame.push(run.frpush(&it, -1, run.FR_VAR, v, -1, -1))
+    m.defs_start.push(0)
+    m.defs_end.push(0)
+    m.imp_start.push(0)
+    m.imp_end.push(0)
+    return idx
+  m.frame.push(-1)
+  let ds = it.ast.topdefs.len
+  let is0 = it.ast.imeta.len
+  var p = lang.new_parser(text, found)
+  swap(&p.ast, &it.ast)
+  # the module's own imports and metadata belong to it, not to the program
+  let saved_meta = it.ast.modmeta
+  lang.parse_program(&p, &it.st, true)
+  it.ast.modmeta = saved_meta
+  swap(&p.ast, &it.ast)
+  if p.err != "":
+    m.err = p.err + " at " + found + ", line {p.errline + 1}"
+    return -1
+  m.defs_start.push(ds)
+  m.defs_end.push(it.ast.topdefs.len)
+  m.imp_start.push(is0)
+  m.imp_end.push(it.ast.imeta.len)
+  let mydir = dirname(found)
+  for i in is0..it.ast.imeta.len:
+    let ip = it.ast.imports[2 * i] + ""
+    let alias = it.ast.imports[2 * i + 1] + ""
+    let _h46801 = it.ast.imeta[i]
+    let r = load(&it, &m, fs, ip, alias.startswith("$"), _h46801, mydir, libdirs, home)
+    if r < 0: return -1
+    while m.imp_mod.len <= i: m.imp_mod.push(-1)
+    m.imp_mod[i] = r
+  return idx
+
+fn slurp_values(var it: It, sv: V) -> V:
+  let id = sv.k >> 4
+  let off = it.st.so[id]
+  let n = it.st.sl[id] >> 2
+  let spp = it.st.pp
+  let spend = it.st.pend
+  it.st.pp = off
+  it.st.pend = off + n
+  it.st.perr = ""
+  var xs: [V] = []
+  while true:
+    jv.skip_ws(&it.st)
+    if it.st.pp >= it.st.pend: break
+    let v = jv.parse_value(&it.st)
+    if it.st.perr != "":
+      it.bad = true
+      break
+    xs.push(v)
+  it.st.pp = spp
+  it.st.pend = spend
+  it.st.perr = ""
+  return nat.mkarr(&it, xs)
+
+fn copy_scope(sc: Scope) -> Scope:
+  var c = Scope([], [], [], [], sc.nglobal)
+  for i in 0..sc.kind.len:
+    c.kind.push(sc.kind[i])
+    c.name.push(sc.name[i] + "")
+    c.ar.push(sc.ar[i])
+    c.fid.push(sc.fid[i])
+  return c
+
+# Adds to sc what the imports ast.imeta[a..b] bring (resolving code modules first).
+fn add_imports(var it: It, var m: Mods, var sc: Scope, base: Scope, a: Int, b: Int):
+  for i in a..b:
+    let alias = it.ast.imports[2 * i + 1] + ""
+    let mi = m.imp_mod[i]
+    if m.is_data[mi]:
+      let nm = alias[1..alias.len]
+      run.sc_push(&sc, run.SC_GVAR, nm, 0, m.frame[mi])
+      run.sc_push(&sc, run.SC_GVAR, nm + "::" + nm, 0, m.frame[mi])
+      continue
+    resolve_mod(&it, &m, base, mi)
+    for q in m.defs_start[mi]..m.defs_end[mi]:
+      let fid = it.ast.topdefs[q]
+      var nm = it.ast.fdefs[fid].name + ""
+      if alias != "": nm = alias + "::" + nm
+      run.sc_push(&sc, run.SC_SFUNC, nm, it.ast.fdefs[fid].params.len, fid)
+
+fn resolve_mod(var it: It, var m: Mods, base: Scope, mi: Int):
+  if m.state[mi] != 0: return
+  m.state[mi] = 1
+  var sc = copy_scope(base)
+  add_imports(&it, &m, &sc, base, m.imp_start[mi], m.imp_end[mi])
+  for q in m.defs_start[mi]..m.defs_end[mi]:
+    let _h46802 = it.ast.topdefs[q]
+    run.resolve_def(&it, _h46802, &sc)
+  m.state[mi] = 2

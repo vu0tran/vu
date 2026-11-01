@@ -91,6 +91,7 @@ const SC_CLOS = 1
 const SC_FUNC = 2
 const SC_SFUNC = 3
 const SC_LABEL = 4
+const SC_GVAR = 5      # a global variable: an absolute frame (fid), not on the chain
 
 type Fr:
   par: Int
@@ -121,6 +122,11 @@ type It:
   st: St
   ast: Ast
   ffi: Ffi
+  fs: Fs
+  os: Os
+  stdin_pending: Bool   # -n without files: standard input is read at the first `input`
+  libdirs: [Str]
+  home: Str
   fr: [Fr]
   ks: [Kf]
   simple: [Bool]
@@ -139,6 +145,7 @@ type It:
   pk: [V]
   argv: [V]
   genv: Int
+  nglobals: Int      # frames holding globals ($ENV, named arguments, data modules)
   cerr: Str          # compile error
   cerrline: Int
   # inputs
@@ -148,6 +155,10 @@ type It:
   istarts: [Int]
   ifile: Int
   iline: Int
+  ivend: Int         # input bytes the parser has used
+  lc_end: Int        # fed_lines' state
+  lc_lines: Int
+  lc_file: Int
   ierr: Str
   slurp: Bool
   null_input: Bool
@@ -171,8 +182,8 @@ type It:
   nid: nat.Ids
   nkind: [Int]
 
-fn new_it(ffi: Ffi) -> It:
-  return It(jv.new_store(), lang.new_ast(), ffi, [], [], [], [], [], [], [], [], vnull(), false, 0, -1, 1, 1, [-1], [vnull()], [], -1, "", 0, 0, 0, [], [], 0, 0, "", false, false, false, [], false, false, false, false, false, false, 0, vnull(), false, "<stdin>", [], [], [], vnull(), nat.ids(), nat_kinds())
+fn new_it(ffi: Ffi, fs: Fs, os: Os) -> It:
+  return It(jv.new_store(), lang.new_ast(), ffi, fs, os, false, [], "", [], [], [], [], [], [], [], [], vnull(), false, 0, -1, 1, 1, [-1], [vnull()], [], -1, 0, "", 0, 0, 0, [], [], 0, 0, 0, 0, 0, 0, "", false, false, false, [], false, false, false, false, false, false, 0, vnull(), false, "<stdin>", [], [], [], vnull(), nat.ids(), nat_kinds())
 
 fn nat_kinds() -> [Int]:
   var ks: [Int] = []
@@ -365,7 +376,8 @@ fn binop(var it: It, op: Int, a: V, b: V) -> V:
       let start = it.st.b.len
       for r in 0..reps:
         for i in o..o + len: it.st.b.push(it.st.b[i])
-      return vstr(jv.add_span(&it.st, start, len * reps, it.st.sl[id] & 3))
+      let _h16801 = it.st.sl[id] & 3
+      return vstr(jv.add_span(&it.st, start, len * reps, _h16801))
     if ka == K_OBJ and kb == K_OBJ: return deep_merge(&it, a, b)
     return type_err2(&it, a, b, "cannot be multiplied")
   if op == lang.OP_DIV:
@@ -541,7 +553,9 @@ fn sev(var it: It, n: Int, v: V, env: Int) -> V:
       if it.bad: return vnull()
     return index_field(&it, t, nd.x)
   if k == lang.N_LIT: return nd.v
-  if k == lang.N_VAR: return it.fr[up(it, env, nd.e)].v
+  if k == lang.N_VAR:
+    if nd.d == 1: return it.fr[nd.e].v
+    return it.fr[up(it, env, nd.e)].v
   if k == lang.N_BIN:
     let b = sev(&it, nd.b, v, env)
     if it.bad: return vnull()
@@ -1106,7 +1120,9 @@ fn ev(var it: It, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
     return s
   if kd == lang.N_LIT: return emit(&it, k, nd.v, vp(p, nd.v, v))
   if kd == lang.N_VAR:
-    let x = it.fr[up(it, env, nd.e)].v
+    var x = vnull()
+    if nd.d == 1: x = it.fr[nd.e].v
+    else: x = it.fr[up(it, env, nd.e)].v
     return emit(&it, k, x, vp(p, x, v))
   if kd == lang.N_INDEX:
     if it.simple[nd.b]:
@@ -1901,7 +1917,7 @@ fn ensure_fd(var it: It):
 
 fn only_static(sc: Scope) -> Bool:
   for i in sc.nglobal..sc.kind.len:
-    if sc.kind[i] != SC_SFUNC: return false
+    if sc.kind[i] != SC_SFUNC and sc.kind[i] != SC_GVAR: return false
   return true
 
 # Resolves names in node n with scope sc: variables and labels to frame depths, calls to their
@@ -1917,9 +1933,14 @@ fn resolve(var it: It, n: Int, var sc: Scope):
     while i >= 0:
       let sk = sc.kind[i]
       if sk == SC_VAR and sc.name[i] == name:
+        it.ast.ns[n].d = 0
         it.ast.ns[n].e = depth
         return
-      if sk != SC_SFUNC: depth += 1
+      if sk == SC_GVAR and sc.name[i] == name:
+        it.ast.ns[n].d = 1
+        it.ast.ns[n].e = sc.fid[i]
+        return
+      if sk != SC_SFUNC and sk != SC_GVAR: depth += 1
       i -= 1
     if name == "__prog_args" or name == "__named":
       it.ast.ns[n].k = lang.N_LIT
@@ -1936,7 +1957,7 @@ fn resolve(var it: It, n: Int, var sc: Scope):
       if sk == SC_LABEL and sc.name[i] == name:
         it.ast.ns[n].e = depth
         return
-      if sk != SC_SFUNC: depth += 1
+      if sk != SC_SFUNC and sk != SC_GVAR: depth += 1
       i -= 1
     cerr(&it, "$*label-" + name + " is not defined", nd.line)
     return
@@ -1949,7 +1970,7 @@ fn resolve(var it: It, n: Int, var sc: Scope):
     var i = sc.kind.len - 1
     while i >= 0:
       let sk = sc.kind[i]
-      if sc.name[i] == name and sc.ar[i] == nd.c and sk != SC_VAR and sk != SC_LABEL:
+      if sc.name[i] == name and sc.ar[i] == nd.c and sk != SC_VAR and sk != SC_LABEL and sk != SC_GVAR:
         if sk == SC_SFUNC:
           it.ast.ns[n].d = CT_STATIC
           it.ast.ns[n].e = sc.fid[i]
@@ -1960,7 +1981,7 @@ fn resolve(var it: It, n: Int, var sc: Scope):
           it.ast.ns[n].d = CT_CLOS
           it.ast.ns[n].e = depth
         return
-      if sk != SC_SFUNC: depth += 1
+      if sk != SC_SFUNC and sk != SC_GVAR: depth += 1
       i -= 1
     let nid = nat.lookup(name, nd.c)
     if nid < 0:

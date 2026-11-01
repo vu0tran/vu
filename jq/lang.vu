@@ -140,7 +140,10 @@ type Ast:
   kids: [Int]
   names: [Str]
   fdefs: [FDef]
-  imports: [Str]     # import/include paths, in order (resolved by the caller)
+  imports: [Str]     # import/include path and alias pairs, in order (resolved by the caller)
+  imeta: [Int]       # each import's metadata node, or -1
+  modmeta: Int       # the module directive's metadata node, or -1
+  topdefs: [Int]     # a module's (or a defs-only program's) top-level functions
 
 type P:
   src: Str
@@ -156,7 +159,7 @@ type P:
   fname: Str
 
 fn new_ast() -> Ast:
-  return Ast([N(0, 0, 0, 0, 0, 0, 0, vnull(), 0)], [], [""], [], [])
+  return Ast([N(0, 0, 0, 0, 0, 0, 0, vnull(), 0)], [], [""], [], [], [], -1, [])
 
 fn node(var p: P, k: Int, a: Int, b: Int, c: Int) -> Int:
   let id = p.ast.ns.len
@@ -1090,7 +1093,7 @@ fn parse_string(var p: P, var st: St, fmt: Int) -> Int:
         var cp = hex4(s, i)
         if cp < 0:
           p.ts = i
-          perror(&p, "invalid escape")
+          perror(&p, string_literal_error(&st, s, p.te - 1))
           return 0
         i += 4
         if cp >= 0xD800 and cp < 0xDC00 and i + 5 < s.len and s[i] == '\\' and s[i + 1] == 'u':
@@ -1105,7 +1108,7 @@ fn parse_string(var p: P, var st: St, fmt: Int) -> Int:
         jv.push_utf8(&cur, cp)
       else:
         p.ts = i - 2
-        perror(&p, "invalid escape")
+        perror(&p, string_literal_error(&st, s, p.te - 1))
         return 0
     else:
       cur.push(c)
@@ -1141,13 +1144,37 @@ fn new_parser(src: Str, fname: Str) -> P:
   next(&p)
   return p
 
-# Parses a whole program: imports, then defs and an expression (or only defs, for a module).
-fn parse_program(var p: P, var st: St) -> Int:
+# Whether node n is a constant (literals, and arrays and objects of constants).
+fn is_const(p: P, n: Int) -> Bool:
+  let nd = p.ast.ns[n]
+  if nd.k == N_LIT: return true
+  if nd.k == N_ARR: return nd.a < 0 or is_const(p, nd.a)
+  if nd.k == N_COMMA: return is_const(p, nd.a) and is_const(p, nd.b)
+  if nd.k == N_OBJ:
+    for i in 0..2 * nd.c:
+      if not is_const(p, p.ast.kids[nd.b + i]): return false
+    return true
+  if nd.k == N_NEG: return p.ast.ns[nd.a].k == N_LIT
+  return false
+
+fn parse_meta(var p: P, var st: St) -> Int:
+  let m = parse_postfix(&p, &st, false)
+  if p.err != "": return -1
+  if not is_const(p, m):
+    perror(&p, "Module metadata must be constant")
+    return -1
+  if p.ast.ns[m].k != N_OBJ:
+    perror(&p, "Module metadata must be an object")
+    return -1
+  return m
+
+# Parses a whole program: a module directive, imports, defs, then the expression. A module
+# (module = true) has only defs. Returns the root, -1 for a module, -2 for a program of only defs.
+fn parse_program(var p: P, var st: St, module: Bool) -> Int:
   if p.tk == T_MODULE:
     next(&p)
-    let m = parse_postfix(&p, &st, false)
-    if p.ast.ns[m].k != N_OBJ:
-      perror(&p, "Module metadata must be constant")
+    p.ast.modmeta = parse_meta(&p, &st)
+    if p.err != "": return 0
     expect(&p, T_SEMI)
   while (p.tk == T_IMPORT or p.tk == T_INCLUDE) and p.err == "":
     let inc = p.tk == T_INCLUDE
@@ -1156,6 +1183,7 @@ fn parse_program(var p: P, var st: St) -> Int:
       unexpected(&p)
       return 0
     let path = parse_string(&p, &st, -1)
+    if p.err != "": return 0
     if p.ast.ns[path].k != N_LIT:
       perror(&p, "Import path must be constant")
       return 0
@@ -1171,17 +1199,48 @@ fn parse_program(var p: P, var st: St) -> Int:
         unexpected(&p)
         return 0
       next(&p)
+    var meta = -1
     if p.tk != T_SEMI:
-      let meta = parse_postfix(&p, &st, false)
-      if p.ast.ns[meta].k != N_OBJ:
-        perror(&p, "Module metadata must be constant")
-        return 0
+      meta = parse_meta(&p, &st)
+      if p.err != "": return 0
     expect(&p, T_SEMI)
     p.ast.imports.push(ps)
     p.ast.imports.push(alias)
-  if p.tk == T_EOF:
-    return -1
-  let e = parse_pipe(&p, &st)
+    p.ast.imeta.push(meta)
+  var defs: [Int] = []
+  while p.tk == T_DEF and p.err == "":
+    defs.push(parse_def(&p, &st))
+  if p.err != "": return 0
+  if module or p.tk == T_EOF:
+    if p.tk != T_EOF: unexpected(&p)
+    for f in defs: p.ast.topdefs.push(f)
+    if module: return -1
+    return -2
+  var e = parse_pipe(&p, &st)
   if p.err == "" and p.tk != T_EOF:
     unexpected(&p)
+  var i = defs.len - 1
+  while i >= 0:
+    let n = node(&p, N_DEF, e, -1, -1)
+    set_x(&p, n, defs[i])
+    e = n
+    i -= 1
   return e
+
+# jq reads a string literal's text with its JSON parser: an error in it is that parser's message.
+fn string_literal_error(var st: St, s: Str, q: Int) -> Str:
+  var e = q + 1
+  var esc = false
+  while e < s.len:
+    let c = s[e]
+    if c == '"' and not esc: break
+    esc = c == '\\' and not esc
+    e += 1
+  if e < s.len: e += 1
+  let text = s[q..e]
+  let off = st.b.len
+  for i in 0..text.len: st.b.push(text[i])
+  var m = jv.json_error(st, off, st.b.len, 1, 0)
+  st.b.truncate(off)
+  if m == "": m = "invalid escape"
+  return m + " (while parsing '" + text + "')"
