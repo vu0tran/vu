@@ -96,11 +96,79 @@ and the rules (`rules.vu`): about 5,900 lines of Vu.
 
 ```
 cd ts && ../vu build --release vlint.vu -o vlint
-./vlint [--jobs N] src/        # files, or folders searched for the extensions above
+./vlint [--jobs N] [--cache] [--cache-location PATH] src/   # files, or folders searched for the extensions above
 ```
 
 It honors `eslint-disable`/`oxlint-disable` comments, and reports parse errors with oxc's
 messages where they're known (redeclarations, invalid characters).
+
+## The cache
+
+`vlint --cache` works like `eslint --cache`: it keeps each file's output in `.vlintcache` in the
+current directory (ESLint's default place, `.eslintcache`), or in `--cache-location PATH` (a folder,
+or a path ending in `/`, gets `PATH/.vlintcache`; ESLint names the file after a hash of the current
+directory there). A later run prints the saved lines of files that haven't changed without parsing
+them, lints the rest, and saves the cache again only if something changed. The output is the same
+bytes in the same order as without the cache. The code is `lcache.vu` (with `lcache_glue.c` for
+`stat`) and `cached_run` in `vlint.vu`; the path without `--cache` is unchanged.
+
+- The cache as a whole is keyed by a hash of the vlint executable (`/proc/self/exe`), a version
+  string and the options that change the output, so a rebuilt vlint or other rules start over. Where
+  the executable can't be read, nothing is cached.
+- Each file's entry holds its path (as printed), size, modification and change times (ns), inode, a
+  64-bit content hash (xxHash64's word step, one lane) and the output lines. A file whose size,
+  times and inode all match is a hit without being read. Otherwise it's read and hashed (in the
+  workers), and a matching size and hash is still a hit (a fresh checkout, a copied tree, `touch`).
+  Times less than 2 s old aren't trusted, as git does with its index ("racy" files): such a file is
+  saved without them, so the next run checks its content. A file edited to the same size with its
+  modification time put back is caught by its change time.
+- Entries of files outside this run are kept while the file exists; deleted files' are dropped.
+- The file is one header line (`vlintcache1`, the key, the record count, the body's length and its
+  hash) and length-prefixed records. A truncated, corrupt or foreign file is ignored and rebuilt. It's
+  written to a temporary file with a unique name and renamed, so concurrent runs each leave a whole
+  cache (the last one wins). 660 KB for the 3,445-file corpus, 5 MB for vscode/src (ESLint's: 3.2 MB
+  for the corpus).
+
+Checked (`cache_verify.sh`): on that corpus, the `node_modules` JavaScript, preact, excalidraw and
+vscode/src the output without a cache, with a cold one, a warm one, in a copy of the tree (new inodes
+and times) and, in that copy, after appending to, truncating, deleting and adding 1% of the files each
+and changing a byte of 1% more without changing their size or modification time, is identical
+(first cached run and the next). Also: truncated, bit-flipped, random, empty and crafted cache files
+(lengths past the end, 20-digit numbers, a folder in its place, a location in a missing folder) give
+the same output and the cache is rebuilt; six runs at once on one cache, twice, give the right output
+and a valid cache; the sanitizer build (ASan, UBSan) is clean on cold and warm runs.
+
+Measured (`cache_bench.py`, copies of the trees in `/dev/shm`, CPU = user + system, best of 5 for
+the corpus and of 3 for vscode/src; 1% changed = a line appended to 1% of the files before each run,
+starting from the warm cache). The machine is the same loaded 2-core VM (load average 7 to 11 during
+these runs), so wall times are inflated and noisy; CPU times are the comparison:
+
+| 3,445-file corpus (11.9 MB) | 1 thread CPU s | wall s | all cores CPU s | wall s |
+|---|---|---|---|---|
+| vlint, no cache | 0.50 | 1.37 | 0.50 | 1.56 |
+| vlint `--cache`, cold (writes it) | 0.58 | 1.51 | 0.51 | 1.57 |
+| vlint `--cache`, warm | 0.030 | 0.072 | 0.028 | 0.084 |
+| vlint `--cache`, warm, 1% changed | 0.041 | 0.106 | 0.037 | 0.119 |
+| oxlint 1.90.0 (it has no cache) | 0.57 | 1.46 | 0.62 | 1.59 |
+| ESLint 10.14 `--cache`, cold | 67.3 | 144 | | |
+| ESLint `--cache`, warm | 2.69 | 4.41 | | |
+| ESLint `--cache`, warm, 1% changed | 5.17 | 9.23 | | |
+
+| vscode/src (11,260 files) | 1 thread CPU s | wall s | all cores CPU s | wall s |
+|---|---|---|---|---|
+| vlint, no cache | 6.99 | 17.0 | 6.71 | 14.4 |
+| vlint `--cache`, cold | 7.22 | 15.9 | 6.84 | 11.5 |
+| vlint `--cache`, warm | 0.087 | 0.23 | 0.086 | 0.18 |
+| vlint `--cache`, warm, 1% changed | 0.160 | 0.41 | 0.154 | 0.31 |
+| oxlint | 6.64 | 13.8 | 7.38 | 19.3 |
+
+In instructions (callgrind, the corpus, one thread), which the load doesn't disturb: no cache
+2,352 M (the build before the cache: 2,406 M), cold cache 2,399 M (+2%: hashing and writing), warm
+cache 44 M (1.9%: hashing the executable, reading and checking the cache, a map of paths; the rest of
+a warm run is `stat` and directory reading). A warm run takes 17 times less CPU than linting the
+corpus and 80 times less on vscode/src, and 90 times less than ESLint's warm cache. The cold runs'
+extra CPU time in the tables (up to 16%) is mostly noise from the load: the instruction count says 2%. ESLint was measured on the corpus only (its cold run on
+vscode/src would take many minutes on this machine).
 
 ## Matching oxlint
 
