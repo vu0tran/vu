@@ -1,0 +1,1791 @@
+# Checking code: the type of every expression (with contextual types), statements, functions and
+# their returns, calls with overloads and inferred type arguments, operators, and narrowing by
+# typeof, equality, truthiness, `in` and type predicates.
+
+import scan
+import ast
+import parse
+import types
+import bind
+import rel
+import show
+from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP
+from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE
+from types import S_VAR, S_LET, S_CONST, S_PARAM, S_FUNC, S_CLASS, S_INTERFACE, S_ALIAS, S_ENUM, S_NAMESPACE, S_TPARAM, S_PROP, S_METHOD, S_ACCESSOR, SF_OPTIONAL, SF_READONLY
+
+fn err(var c: C, n: Int, code: Int, msg: Str):
+  bind.err(&c, n, code, msg)
+
+fn unsup(var c: C, n: Int, what: Str) -> Int:
+  return bind.unsupported(&c, n, what)
+
+fn nm(c: C, id: Int) -> Str:
+  return c.t.names[id] + ""
+
+fn kids(c: C, l: Int) -> [Int]:
+  return ast.items(c.t, l)
+
+# ---- widening
+
+# A fresh literal widens to its primitive where a variable can change (let, var, properties).
+fn widen(var c: C, t: Int) -> Int:
+  if types.is_fresh_lit(c, t): return types.base_of_literal(c, t)
+  if t in c.freg:
+    var ts: [Int] = []
+    for m in types.members(c, t): ts.push(types.base_of_literal(c, m))
+    return types.union_of(&c, ts)
+  if c.tk[t] == TK_OBJ:
+    let o = c.ta[t]
+    if c.objs[o].fresh: return widen_obj(&c, t)
+  return t
+
+# An object literal's type with its properties widened and its freshness dropped (after a declaration).
+fn widen_obj(var c: C, t: Int) -> Int:
+  let o = c.ta[t]
+  let r = types.anon_obj(&c, -1, c.objs[o].node)
+  let ro = c.ta[r]
+  for name in types.ints(c.objs[o].order):
+    let ps = c.objs[o].props[name]
+    let ns = types.new_sym(&c, c.sk[ps], name, c.sdecl[ps])
+    c.sflags[ns] = c.sflags[ps]
+    let h1_ = bind.type_of_sym(&c, ps)
+    c.stype[ns] = widen_deep(&c, h1_)
+    types.add_prop(&c, r, name, ns)
+  for sg in types.ints(c.objs[o].calls): c.objs[ro].calls.push(sg)
+  c.objs[ro].resolved = true
+  return r
+
+fn widen_deep(var c: C, t: Int) -> Int:
+  let w = widen(&c, t)
+  return w
+
+# A fresh object literal stops being fresh once it's been assigned somewhere.
+fn regular_obj(var c: C, t: Int) -> Int:
+  if c.tk[t] == TK_OBJ and c.objs[c.ta[t]].fresh: return widen_obj(&c, t)
+  return t
+
+# ---- symbols' types (called by bind for values)
+
+fn decl_type(var c: C, s: Int) -> Int:
+  let sk = c.sk[s]
+  let d = c.sdecl[s]
+  if d < 0: return c.any_t
+  let k = c.t.k[d]
+  if (sk & (S_VAR | S_LET | S_CONST)) != 0:
+    if k == ast.N_DECL:
+      if c.t.b[d] >= 0: return bind.type_from(&c, c.t.b[d])
+      let p = bind.up(c, d)
+      # for (const x of xs)
+      if p >= 0 and c.t.k[p] == ast.N_VAR:
+        let pp = bind.up(c, p)
+        if pp >= 0 and c.t.k[pp] == ast.N_FORIN and c.t.a[pp] == p:
+          if c.t.f[pp] == 0: return c.string_t
+          let h2_ = check_expr(&c, c.t.b[pp], -1)
+          return element_type(&c, h2_, c.t.b[pp])
+      if c.t.k[c.t.a[d]] != ast.N_ID: return unsup(&c, d, "a destructuring declaration")
+      if c.t.c[d] < 0:
+        if p >= 0 and c.t.k[p] == ast.N_VAR and c.t.f[p] == 2: return c.any_t
+        return c.any_t
+      let it = check_expr(&c, c.t.c[d], -1)
+      if (sk & S_CONST) != 0:
+        if types.is_fresh_lit(c, it): return types.regular(c, it)
+        let h3_ = widen_nested(&c, it)
+        return regular_obj(&c, h3_)
+      let h4_ = widen(&c, it)
+      return regular_obj(&c, h4_)
+    # catch (e)
+    return c.unknown_t
+  if (sk & S_PARAM) != 0: return param_type(&c, d)
+  if (sk & S_FUNC) != 0: return func_type(&c, s)
+  return bind.compute_sym_type(&c, s)
+
+# const x = cond ? 1 : 2 keeps 1 | 2; nested parts of objects widen.
+fn widen_nested(var c: C, t: Int) -> Int:
+  if t in c.freg: return c.freg[t]
+  return t
+
+fn param_type(var c: C, p: Int) -> Int:
+  if c.t.b[p] >= 0:
+    var t = bind.type_from(&c, c.t.b[p])
+    if (c.t.f[p] & ast.M_OPTIONAL) != 0: t = types.union_of(&c, [t, c.undef_t])
+    return t
+  # contextually typed parameters get their type when their function is checked
+  if p in c.ptype_ctx: return c.ptype_ctx[p]
+  if c.t.c[p] >= 0:
+    let g1_1 = check_expr(&c, c.t.c[p], -1)
+    return widen(&c, g1_1)
+  if (c.t.f[p] & ast.M_REST) != 0: return bind.array_of(&c, c.any_t)
+  return c.any_t
+
+# A function declaration's type: one call signature per overload (or the implementation alone).
+fn func_type(var c: C, s: Int) -> Int:
+  let decls = types.sym_decls(c, s)
+  let t = types.anon_obj(&c, s, decls[0])
+  let o = c.ta[t]
+  var with_body = 0
+  for d in decls:
+    if c.t.d[d] < 0: with_body += 1
+  for d in decls:
+    # with overloads, the implementation's signature isn't callable
+    if decls.len > 1 and with_body < decls.len and c.t.d[d] >= 0: continue
+    c.objs[o].calls.push(fn_sig(&c, d))
+  c.objs[o].resolved = true
+  return t
+
+# A function-like node's signature; its return type is inferred from the body when not written.
+fn fn_sig(var c: C, d: Int) -> Int:
+  if d in c.fsig: return c.fsig[d]
+  let sg = types.new_sig(&c, d)
+  c.fsig[d] = sg
+  if c.t.a[d] >= 0: c.sigs[sg].tparams = bind.tparam_types(&c, c.t.a[d])
+  var min = 0
+  var i = 0
+  for p in kids(c, c.t.b[d]):
+    let pn = c.t.a[p]
+    var name = 0
+    if c.t.k[pn] == ast.N_ID: name = c.t.s[pn]
+    else: name = ast.intern(&c.t, "__{i}")
+    if c.t.k[pn] == ast.N_ID and nm(c, name) == "this":
+      c.sigs[sg].this_t = bind.type_from(&c, c.t.b[p])
+      continue
+    var pt = param_type(&c, p)
+    var fl = 0
+    if (c.t.f[p] & ast.M_OPTIONAL) != 0 or c.t.c[p] >= 0:
+      fl = 1
+      if c.t.b[p] < 0 and c.t.c[p] >= 0: pt = pt
+    if (c.t.f[p] & ast.M_REST) != 0: fl = 2
+    if (c.t.f[p] & ast.M_OPTIONAL) != 0 and c.t.b[p] >= 0: pt = bind.type_from(&c, c.t.b[p])
+    c.sigs[sg].pnames.push(name)
+    c.sigs[sg].ptypes.push(pt)
+    c.sigs[sg].pflags.push(fl)
+    if fl == 0: min = i + 1
+    i += 1
+  c.sigs[sg].min = min
+  if c.t.c[d] >= 0: c.sigs[sg].ret = bind.type_from(&c, c.t.c[d])
+  else: c.sigs[sg].ret = infer_return(&c, d)
+  return sg
+
+# The return type a function's body gives (its return expressions, widened; void with none).
+fn infer_return(var c: C, d: Int) -> Int:
+  let body = c.t.d[d]
+  if body < 0: return c.any_t
+  if (c.t.f[d] & ast.M_ASYNC) != 0 or (c.t.f[d] & ast.M_GENERATOR) != 0: return unsup(&c, d, "an async or generator function")
+  if c.t.k[body] != ast.N_BLOCK:
+    let h5_ = check_expr(&c, body, -1)
+    return widen(&c, h5_)
+  var rets: [Int] = []
+  collect_returns(c, body, &rets)
+  if rets.len == 0: return c.void_t
+  var ts: [Int] = []
+  var has_empty = false
+  for r in rets:
+    if c.t.a[r] < 0: has_empty = true
+    else:
+      let g2_1 = check_expr(&c, c.t.a[r], -1)
+      ts.push(widen(&c, g2_1))
+  if has_empty: ts.push(c.undef_t)
+  if ts.len == 0: return c.void_t
+  if not bind_terminates(&c, body) and ts.len > 0: ts.push(c.undef_t)
+  return types.union_of(&c, ts)
+
+fn bind_terminates(var c: C, n: Int) -> Bool:
+  return terminates(c, n)
+
+# The return statements of a function body (not of nested functions).
+fn collect_returns(c: C, n: Int, var out: [Int]):
+  if n < 0: return
+  let k = c.t.k[n]
+  if k == ast.N_RETURN:
+    out.push(n)
+    return
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_CLASS or k == ast.N_CLASSEXPR or k == ast.N_METHOD: return
+  if k == ast.N_LIST:
+    for x in ast.items(c.t, n): collect_returns(c, x, &out)
+    return
+  if k == ast.N_BLOCK: collect_returns(c, c.t.a[n], &out)
+  elif k == ast.N_IF:
+    collect_returns(c, c.t.b[n], &out)
+    collect_returns(c, c.t.c[n], &out)
+  elif k == ast.N_WHILE or k == ast.N_LABEL or k == ast.N_WITH: collect_returns(c, c.t.b[n], &out)
+  elif k == ast.N_DO: collect_returns(c, c.t.a[n], &out)
+  elif k == ast.N_FOR: collect_returns(c, c.t.d[n], &out)
+  elif k == ast.N_FORIN: collect_returns(c, c.t.c[n], &out)
+  elif k == ast.N_TRY:
+    collect_returns(c, c.t.a[n], &out)
+    collect_returns(c, c.t.c[n], &out)
+    collect_returns(c, c.t.d[n], &out)
+  elif k == ast.N_SWITCH:
+    for cs in ast.items(c.t, c.t.b[n]): collect_returns(c, c.t.b[cs], &out)
+  if k == ast.N_LABEL: collect_returns(c, c.t.a[n], &out)
+
+# Whether control can't reach the end of a statement.
+fn terminates(c: C, n: Int) -> Bool:
+  if n < 0: return false
+  let k = c.t.k[n]
+  if k == ast.N_RETURN or k == ast.N_THROW: return true
+  if k == ast.N_BLOCK:
+    for st in ast.items(c.t, c.t.a[n]):
+      if terminates(c, st): return true
+    return false
+  if k == ast.N_IF: return c.t.c[n] >= 0 and terminates(c, c.t.b[n]) and terminates(c, c.t.c[n])
+  if k == ast.N_TRY:
+    if c.t.d[n] >= 0 and terminates(c, c.t.d[n]): return true
+    return terminates(c, c.t.a[n]) and (c.t.c[n] < 0 or terminates(c, c.t.c[n]))
+  if k == ast.N_WHILE:
+    let cond = c.t.a[n]
+    return c.t.k[cond] == ast.N_TRUE and not has_break(c, c.t.b[n])
+  if k == ast.N_FOR:
+    return c.t.b[n] < 0 and not has_break(c, c.t.d[n])
+  if k == ast.N_DO: return terminates(c, c.t.a[n]) and not has_break(c, c.t.a[n])
+  if k == ast.N_SWITCH:
+    var has_default = false
+    let cases = ast.items(c.t, c.t.b[n])
+    for cs in cases:
+      if c.t.a[cs] < 0: has_default = true
+    if not has_default: return false
+    # every case ends by returning or throwing (falling through to the next is fine), and no break
+    for i in 0..cases.len:
+      let body = ast.items(c.t, c.t.b[cases[i]])
+      for st in body:
+        if has_break_direct(c, st): return false
+      if i == cases.len - 1:
+        var ends = false
+        for st in body:
+          if terminates(c, st): ends = true
+        if not ends: return false
+    return true
+  if k == ast.N_LABEL: return terminates(c, c.t.a[n])
+  return false
+
+fn has_break(c: C, n: Int) -> Bool:
+  if n < 0: return false
+  let k = c.t.k[n]
+  if k == ast.N_BREAK: return true
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_WHILE or k == ast.N_DO or k == ast.N_FOR or k == ast.N_FORIN or k == ast.N_SWITCH: return false
+  if k == ast.N_LIST:
+    for x in ast.items(c.t, n):
+      if has_break(c, x): return true
+    return false
+  if k == ast.N_BLOCK: return has_break(c, c.t.a[n])
+  if k == ast.N_IF: return has_break(c, c.t.b[n]) or has_break(c, c.t.c[n])
+  if k == ast.N_TRY: return has_break(c, c.t.a[n]) or has_break(c, c.t.c[n]) or has_break(c, c.t.d[n])
+  if k == ast.N_LABEL: return has_break(c, c.t.a[n])
+  return false
+
+fn has_break_direct(c: C, n: Int) -> Bool:
+  return has_break(c, n)
+
+# ---- narrowing
+
+# The reference an expression names (x, x.a.b), as a key, or "".
+fn ref_key(var c: C, e: Int) -> Str:
+  let k = c.t.k[e]
+  if k == ast.N_ID:
+    let s = bind.lookup_value(&c, e, c.t.s[e])
+    if s < 0: return ""
+    return "{s}"
+  if k == ast.N_PROPACCESS:
+    let inner = ref_key(&c, c.t.a[e])
+    if inner == "": return ""
+    return inner + "." + nm(c, c.t.s[e])
+  if k == ast.N_PAREN: return ref_key(&c, c.t.a[e])
+  if k == ast.N_NONNULL: return ref_key(&c, c.t.a[e])
+  return ""
+
+fn narrowed(c: C, key: Str) -> Int:
+  var i = c.narrow.len - 1
+  while i >= 0:
+    if key in c.narrow[i]: return c.narrow[i][key]
+    i -= 1
+  return -1
+
+fn set_narrow(var c: C, key: Str, t: Int):
+  let top = c.narrow.len - 1
+  c.narrow[top][key] = t
+
+# Forgets what's known about a reference and everything below it (after an assignment).
+fn forget(var c: C, key: Str):
+  for i in 0..c.narrow.len:
+    var drop: [Str] = []
+    for k, v in c.narrow[i]:
+      if k == key or k.startswith(key + "."): drop.push(k + "")
+    for k in drop: c.narrow[i].remove(k)
+  # a fresh entry hides older ones in outer frames
+  set_narrow(&c, key, -9)
+
+fn falsy_part(var c: C, t: Int) -> Int:
+  var keep: [Int] = []
+  for m in types.members(c, t):
+    let k = c.tk[m]
+    if k == TK_UNDEF or k == TK_NULL or k == TK_FALSE or k == TK_VOID: keep.push(m)
+    elif k == TK_STRLIT and c.t.names[c.ta[m]] == "": keep.push(m)
+    elif k == TK_NUMLIT and c.nums[c.ta[m]] == 0.0: keep.push(m)
+    elif k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_ANY or k == TK_UNKNOWN or k == TK_ERROR or k == TK_TPARAM: keep.push(m)
+  return types.union_of(&c, keep)
+
+fn truthy_part(var c: C, t: Int) -> Int:
+  var keep: [Int] = []
+  for m in types.members(c, t):
+    let k = c.tk[m]
+    if k == TK_UNDEF or k == TK_NULL or k == TK_FALSE or k == TK_VOID: continue
+    if k == TK_STRLIT and c.t.names[c.ta[m]] == "": continue
+    if k == TK_NUMLIT and c.nums[c.ta[m]] == 0.0: continue
+    keep.push(m)
+  return types.union_of(&c, keep)
+
+fn typeof_matches(var c: C, m: Int, what: Str) -> Bool:
+  let k = c.tk[m]
+  if what == "string": return k == TK_STRING or k == TK_STRLIT
+  if what == "number": return k == TK_NUMBER or k == TK_NUMLIT
+  if what == "bigint": return k == TK_BIGINT or k == TK_BIGLIT
+  if what == "boolean": return k == TK_TRUE or k == TK_FALSE
+  if what == "symbol": return k == TK_SYMBOL
+  if what == "undefined": return k == TK_UNDEF or k == TK_VOID
+  if what == "function": return k == TK_OBJ and bind.sigs_of(&c, m, false).len > 0
+  if what == "object": return k == TK_NULL or k == TK_NONPRIM or (k == TK_OBJ and bind.sigs_of(&c, m, false).len == 0)
+  return false
+
+# The facts a condition gives when it's true (truth) or false: (reference, narrowed type) pairs.
+type Fact:
+  key: Str
+  t: Int
+
+fn current_type(var c: C, e: Int) -> Int:
+  return check_expr(&c, e, -1)
+
+fn facts(var c: C, e: Int, truth: Bool, var out: [Fact]):
+  let k = c.t.k[e]
+  if k == ast.N_PAREN:
+    facts(&c, c.t.a[e], truth, &out)
+    return
+  if k == ast.N_PREFIX and c.t.f[e] == scan.T_BANG:
+    facts(&c, c.t.a[e], not truth, &out)
+    return
+  if k == ast.N_ID or k == ast.N_PROPACCESS:
+    let key = ref_key(&c, e)
+    if key == "": return
+    let t = current_type(&c, e)
+    if truth: out.push(Fact(key, truthy_part(&c, t)))
+    else: out.push(Fact(key, falsy_part(&c, t)))
+    return
+  if k == ast.N_BINARY:
+    let op = c.t.f[e]
+    if op == scan.T_AND:
+      if truth:
+        facts(&c, c.t.a[e], true, &out)
+        # the right side is checked knowing the left is true
+        c.narrow.push({})
+        for f in out: set_narrow(&c, f.key, f.t)
+        var more: [Fact] = []
+        facts(&c, c.t.b[e], true, &more)
+        c.narrow.pop()
+        for f in more: out.push(Fact(f.key + "", f.t))
+      return
+    if op == scan.T_OR:
+      if not truth:
+        facts(&c, c.t.a[e], false, &out)
+        c.narrow.push({})
+        for f in out: set_narrow(&c, f.key, f.t)
+        var more: [Fact] = []
+        facts(&c, c.t.b[e], false, &more)
+        c.narrow.pop()
+        for f in more: out.push(Fact(f.key + "", f.t))
+      return
+    if op == scan.T_EQ3 or op == scan.T_NE2 or op == scan.T_EQ2 or op == scan.T_NE:
+      var pos = op == scan.T_EQ3 or op == scan.T_EQ2
+      if not truth: pos = not pos
+      let loose = op == scan.T_EQ2 or op == scan.T_NE
+      var l = c.t.a[e]
+      var r = c.t.b[e]
+      # typeof x === "string"
+      if c.t.k[l] != ast.N_TYPEOF and c.t.k[r] == ast.N_TYPEOF:
+        let tmp = l
+        l = r
+        r = tmp
+      if c.t.k[l] == ast.N_TYPEOF and (c.t.k[r] == ast.N_STR or c.t.k[r] == ast.N_NOSUBTEMPL):
+        let key = ref_key(&c, c.t.a[l])
+        if key == "": return
+        let t = current_type(&c, c.t.a[l])
+        let what = nm(c, c.t.s[r])
+        var keep: [Int] = []
+        for m in types.members(c, t):
+          let mk = c.tk[m]
+          if mk == TK_ANY or mk == TK_UNKNOWN or mk == TK_ERROR or mk == TK_TPARAM:
+            if pos:
+              if what == "string": keep.push(c.string_t)
+              elif what == "number": keep.push(c.number_t)
+              elif what == "boolean": keep.push(c.boolean_t)
+              elif what == "undefined": keep.push(c.undef_t)
+              elif what == "bigint": keep.push(c.bigint_t)
+              elif what == "symbol": keep.push(c.symbol_t)
+              elif what == "object": keep.push(types.union_of(&c, [c.nonprim_t, c.null_t]))
+              else: keep.push(m)
+            else: keep.push(m)
+          elif typeof_matches(&c, m, what) == pos: keep.push(m)
+        out.push(Fact(key, types.union_of(&c, keep)))
+        return
+      # x === null / undefined / a literal (either side)
+      var refside = l
+      var valside = r
+      if ref_key(&c, l) == "" or is_unit_expr(c, l):
+        refside = r
+        valside = l
+      let key = ref_key(&c, refside)
+      if key == "": return
+      let vt = current_type(&c, valside)
+      let t = current_type(&c, refside)
+      let vk = c.tk[vt]
+      if vk == TK_NULL or vk == TK_UNDEF:
+        var keep: [Int] = []
+        for m in types.members(c, t):
+          let mk = c.tk[m]
+          var is_match = mk == vk or (vk == TK_UNDEF and mk == TK_VOID)
+          if loose: is_match = mk == TK_NULL or mk == TK_UNDEF or mk == TK_VOID
+          if mk == TK_ANY or mk == TK_UNKNOWN or mk == TK_ERROR:
+            keep.push(m)
+            continue
+          if is_match == pos: keep.push(m)
+        out.push(Fact(key, types.union_of(&c, keep)))
+        return
+      if types.is_literal(c, vt):
+        let rv = types.regular(c, vt)
+        var keep: [Int] = []
+        for m in types.members(c, t):
+          if pos:
+            if m == rv: keep.push(m)
+            elif rel.assignable(&c, rv, m) and not types.is_literal(c, m): keep.push(rv)
+          else:
+            if m != rv: keep.push(m)
+        if pos and keep.len == 0: return
+        out.push(Fact(key, types.union_of(&c, keep)))
+        # a discriminant: x.kind === "a" narrows x
+        if c.t.k[refside] == ast.N_PROPACCESS:
+          let okey = ref_key(&c, c.t.a[refside])
+          if okey != "":
+            let ot = current_type(&c, c.t.a[refside])
+            if c.tk[ot] == TK_UNION:
+              var ok: [Int] = []
+              for m in types.members(c, ot):
+                let ps = prop_of(&c, m, c.t.s[refside])
+                if ps < 0:
+                  ok.push(m)
+                  continue
+                let pt = bind.type_of_sym(&c, ps)
+                var overlap = false
+                for pm in types.members(c, pt):
+                  if pm == rv or (not types.is_literal(c, pm) and rel.assignable(&c, rv, pm)): overlap = true
+                if pos and overlap: ok.push(m)
+                if not pos and not (types.is_literal(c, pt) and pt == rv): ok.push(m)
+              out.push(Fact(okey, types.union_of(&c, ok)))
+      return
+    if op == scan.W_IN and (c.t.k[c.t.a[e]] == ast.N_STR):
+      let key = ref_key(&c, c.t.b[e])
+      if key == "": return
+      let t = current_type(&c, c.t.b[e])
+      let name = c.t.s[c.t.a[e]]
+      var keep: [Int] = []
+      for m in types.members(c, t):
+        if c.tk[m] != TK_OBJ:
+          keep.push(m)
+          continue
+        let has = prop_of(&c, m, name) >= 0
+        if has == truth: keep.push(m)
+      out.push(Fact(key, types.union_of(&c, keep)))
+      return
+    if op == scan.W_INSTANCEOF:
+      unsup(&c, e, "instanceof narrowing")
+      return
+  if k == ast.N_CALL:
+    # a type predicate: isFoo(x) narrows x
+    let ft = check_expr(&c, c.t.a[e], -1)
+    let h6_ = rel.apparent(&c, ft)
+    let sgs = bind.sigs_of(&c, h6_, false)
+    if sgs.len != 1: return
+    let sg = sgs[0]
+    let sn = c.sigs[sg].node
+    if sn < 0: return
+    var rnode = -1
+    let snk = c.t.k[sn]
+    if snk == ast.N_FUNC or snk == ast.N_FUNCEXPR or snk == ast.N_ARROW: rnode = c.t.c[sn]
+    elif snk == ast.N_METHOD or snk == ast.N_CALLSIG: rnode = c.t.c[c.t.b[sn]]
+    if rnode < 0 or c.t.k[rnode] != ast.N_TPRED or c.t.f[rnode] != 0: return
+    let pname = c.t.s[rnode]
+    var idx = -1
+    for i in 0..c.sigs[sg].pnames.len:
+      if c.sigs[sg].pnames[i] == pname: idx = i
+    let args = kids(c, c.t.c[e])
+    if idx < 0 or idx >= args.len: return
+    let key = ref_key(&c, args[idx])
+    if key == "": return
+    let pt = bind.type_from(&c, c.t.a[rnode])
+    let t = current_type(&c, args[idx])
+    var keep: [Int] = []
+    for m in types.members(c, t):
+      if truth:
+        if rel.assignable(&c, m, pt): keep.push(m)
+        elif c.tk[m] == TK_ANY or c.tk[m] == TK_UNKNOWN: keep.push(pt)
+      else:
+        if not rel.assignable(&c, m, pt): keep.push(m)
+    if truth and keep.len == 0: keep.push(pt)
+    out.push(Fact(key, types.union_of(&c, keep)))
+
+fn is_unit_expr(c: C, e: Int) -> Bool:
+  let k = c.t.k[e]
+  return k == ast.N_NULL or k == ast.N_STR or k == ast.N_NUM or k == ast.N_TRUE or k == ast.N_FALSE or (k == ast.N_ID and nm(c, c.t.s[e]) == "undefined")
+
+fn push_facts(var c: C, e: Int, truth: Bool):
+  var fs: [Fact] = []
+  facts(&c, e, truth, &fs)
+  c.narrow.push({})
+  for f in fs: set_narrow(&c, f.key, f.t)
+
+# ---- expressions
+
+fn check_expr(var c: C, n: Int, ctx: Int) -> Int:
+  let t = expr_type(&c, n, ctx)
+  c.ntype[n] = t
+  return t
+
+fn is_any(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_ANY or k == TK_ERROR or k == TK_UNSUP
+
+fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
+  let k = c.t.k[n]
+  if k == ast.N_NUM: return types.num_lit(&c, bind.num_value(c.t.names[c.t.s[n]]), true)
+  if k == ast.N_STR or k == ast.N_NOSUBTEMPL: return types.str_lit(&c, c.t.s[n], true)
+  if k == ast.N_TEMPL:
+    for sp in kids(c, c.t.a[n]): check_expr(&c, c.t.a[sp], -1)
+    return c.string_t
+  if k == ast.N_TRUE: return c.ftrue
+  if k == ast.N_FALSE: return c.ffalse
+  if k == ast.N_NULL: return c.null_t
+  if k == ast.N_BIGINT: return c.bigint_t
+  if k == ast.N_REGEX:
+    let s = bind.global_type_sym(&c, "RegExp")
+    if s < 0: return c.any_t
+    return bind.declared_type(&c, s)
+  if k == ast.N_ID: return ident_type(&c, n)
+  if k == ast.N_PAREN: return check_expr(&c, c.t.a[n], ctx)
+  if k == ast.N_PROPACCESS: return prop_access(&c, n)
+  if k == ast.N_ELEMACCESS: return elem_access(&c, n)
+  if k == ast.N_CALL: return call(&c, n, false)
+  if k == ast.N_NEW: return call(&c, n, true)
+  if k == ast.N_OBJECT: return object_literal(&c, n, ctx)
+  if k == ast.N_ARRAY: return array_literal(&c, n, ctx)
+  if k == ast.N_ARROW or k == ast.N_FUNCEXPR: return function_expr(&c, n, ctx)
+  if k == ast.N_BINARY: return binary(&c, n, ctx)
+  if k == ast.N_PREFIX: return prefix(&c, n)
+  if k == ast.N_POSTFIX:
+    let t = check_expr(&c, c.t.a[n], -1)
+    arith_operand(&c, c.t.a[n], t, 2356)
+    return c.number_t
+  if k == ast.N_COND:
+    let cond = c.t.a[n]
+    check_expr(&c, cond, -1)
+    push_facts(&c, cond, true)
+    let a = check_expr(&c, c.t.b[n], ctx)
+    c.narrow.pop()
+    push_facts(&c, cond, false)
+    let b = check_expr(&c, c.t.c[n], ctx)
+    c.narrow.pop()
+    return union_fresh(&c, [a, b])
+  if k == ast.N_AS or k == ast.N_SATISFIES:
+    let tn = c.t.b[n]
+    if c.t.k[tn] == ast.N_TREF and c.t.k[c.t.a[tn]] == ast.N_ID and nm(c, c.t.s[c.t.a[tn]]) == "const":
+      let et = check_expr(&c, c.t.a[n], -1)
+      if types.is_literal(c, et): return types.regular(c, et)
+      return unsup(&c, n, "as const on an object or array")
+    let target = bind.type_from(&c, tn)
+    let et = check_expr(&c, c.t.a[n], target)
+    if k == ast.N_SATISFIES:
+      if not rel.assignable(&c, et, target): rel.report(&c, et, target, c.t.a[n], c.t.a[n], 1360)
+      return et
+    # an assertion needs the types to be comparable one way or the other
+    let w = widen(&c, et)
+    if not rel.assignable(&c, w, target) and not rel.assignable(&c, target, w) and not is_any(c, et):
+      let h7_ = show.show(&c, w)
+      let h8_ = show.show(&c, target)
+      err(&c, n, 2352, "Conversion of type '" + h7_ + "' to type '" + h8_ + "' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.")
+    return target
+  if k == ast.N_NONNULL:
+    let t = check_expr(&c, c.t.a[n], -1)
+    return types.filter_union(&c, t, true, true)
+  if k == ast.N_TYPEOF:
+    check_expr(&c, c.t.a[n], -1)
+    var ts: [Int] = []
+    for w in ["string", "number", "bigint", "boolean", "symbol", "undefined", "object", "function"]: ts.push(types.str_lit_s(&c, w, false))
+    return types.union_of(&c, ts)
+  if k == ast.N_VOIDEXPR:
+    check_expr(&c, c.t.a[n], -1)
+    return c.undef_t
+  if k == ast.N_DELETE:
+    check_expr(&c, c.t.a[n], -1)
+    return c.boolean_t
+  if k == ast.N_THIS: return unsup(&c, n, "this")
+  if k == ast.N_SPREAD: return check_expr(&c, c.t.a[n], -1)
+  if k == ast.N_AWAIT: return unsup(&c, n, "await")
+  if k == ast.N_TYPEASSERT: return unsup(&c, n, "a <T> type assertion")
+  if k == ast.N_TAGGED: return unsup(&c, n, "a tagged template")
+  if k == ast.N_CLASSEXPR: return unsup(&c, n, "a class expression")
+  if k == ast.N_YIELD: return unsup(&c, n, "yield")
+  if k == ast.N_EXPRTARGS: return unsup(&c, n, "an instantiation expression")
+  return unsup(&c, n, "this expression")
+
+# A union that stays widenable when any part is a fresh literal (let x = c ? 1 : 2 is number).
+fn union_fresh(var c: C, ts: [Int]) -> Int:
+  var fresh = false
+  for t in ts:
+    if types.is_fresh_lit(c, t) or t in c.freg: fresh = true
+  let u = types.union_of(&c, ts)
+  if not fresh or c.tk[u] != TK_UNION: return u
+  if u in c.funions: return c.funions[u]
+  let f = types.mk(&c, TK_UNION, types.F_UNION, c.ta[u], c.tb[u])
+  c.funions[u] = f
+  c.freg[f] = u
+  return f
+
+fn ident_type(var c: C, n: Int) -> Int:
+  let name = c.t.s[n]
+  if name == 0: return c.error_t
+  let s = bind.lookup_value(&c, n, name)
+  if s < 0:
+    let text = nm(c, name)
+    if text == "undefined": return c.undef_t
+    if text == "arguments": return unsup(&c, n, "arguments")
+    err(&c, n, 2304, "Cannot find name '" + text + "'.")
+    return c.error_t
+  let key = "{s}"
+  let nt = narrowed(c, key)
+  if nt >= 0: return nt
+  var t = bind.type_of_sym(&c, s)
+  if (c.sk[s] & (S_CLASS | S_ENUM | S_NAMESPACE)) != 0 and c.t.file[c.sdecl[s]] >= c.user_from: return t
+  return t
+
+fn prop_of(var c: C, t: Int, name: Int) -> Int:
+  let a = rel.apparent(&c, t)
+  return bind.get_prop(&c, a, name)
+
+fn possibly_msg(var c: C, e: Int, has_null: Bool, has_undef: Bool):
+  var what = "'undefined'"
+  var code = 18048
+  if has_null and has_undef:
+    what = "'null' or 'undefined'"
+    code = 18049
+  elif has_null:
+    what = "'null'"
+    code = 18047
+  var e2 = e
+  while c.t.k[e2] == ast.N_PAREN: e2 = c.t.a[e2]
+  if c.t.k[e2] == ast.N_ID or c.t.k[e2] == ast.N_PROPACCESS:
+    err(&c, e, code, "'" + expr_text(c, e2) + "' is possibly " + what + ".")
+  else:
+    var gcode = 2532
+    if has_null and has_undef: gcode = 2533
+    elif has_null: gcode = 2531
+    err(&c, e, gcode, "Object is possibly " + what + ".")
+
+fn expr_text(c: C, e: Int) -> Str:
+  let k = c.t.k[e]
+  if k == ast.N_ID: return nm(c, c.t.s[e])
+  if k == ast.N_PROPACCESS: return expr_text(c, c.t.a[e]) + "." + nm(c, c.t.s[e])
+  return "..."
+
+# Removes null and undefined from a receiver's type, reporting them (strict mode).
+fn non_null(var c: C, t: Int, e: Int) -> Int:
+  var has_null = false
+  var has_undef = false
+  for m in types.members(c, t):
+    if c.tk[m] == TK_NULL: has_null = true
+    if c.tk[m] == TK_UNDEF or c.tk[m] == TK_VOID: has_undef = true
+  if not has_null and not has_undef: return t
+  let rest = types.filter_union(&c, t, true, true)
+  if c.tk[rest] == TK_NEVER:
+    # the value is only null or undefined
+    var what = "undefined"
+    if has_null and not has_undef: what = "null"
+    err(&c, e, 18050, "The value '" + what + "' cannot be used here.")
+    return c.error_t
+  possibly_msg(&c, e, has_null, has_undef)
+  return rest
+
+fn in_optional_chain(c: C, n: Int) -> Bool:
+  var e = n
+  while true:
+    let k = c.t.k[e]
+    if (k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS or k == ast.N_CALL) and (c.t.f[e] & 1) != 0: return true
+    if k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS or k == ast.N_CALL or k == ast.N_NONNULL: e = c.t.a[e]
+    else: return false
+  return false
+
+fn prop_access(var c: C, n: Int) -> Int:
+  let obj = c.t.a[n]
+  let name = c.t.s[n]
+  if (c.t.f[n] & 4) != 0: return unsup(&c, n, "a private name")
+  var ot = check_expr(&c, obj, -1)
+  let key = ref_key(&c, n)
+  if key != "":
+    let nt = narrowed(c, key)
+    if nt >= 0: return nt
+  if is_any(c, ot): return ot
+  if c.tk[ot] == TK_UNKNOWN:
+    err(&c, obj, 18046, "'" + expr_text(c, obj) + "' is of type 'unknown'.")
+    return c.error_t
+  let optional = (c.t.f[n] & 1) != 0
+  if optional: ot = types.filter_union(&c, ot, true, true)
+  else: ot = non_null(&c, ot, obj)
+  if is_any(c, ot): return ot
+  var ts: [Int] = []
+  for m in types.members(c, ot):
+    if is_any(c, m):
+      ts.push(m)
+      continue
+    if c.tk[m] == TK_NEVER: continue
+    let ps = prop_of(&c, m, name)
+    if ps < 0:
+      # an index signature answers any name
+      let a = rel.apparent(&c, m)
+      let si = bind.index_type(&c, a, false)
+      if si >= 0:
+        ts.push(si)
+        continue
+      let shown = show.show(&c, ot)
+      bind.err_at(&c, n, c.t.d[n], 2339, "Property '" + nm(c, name) + "' does not exist on type '" + shown + "'.")
+      return c.error_t
+    var pt = bind.type_of_sym(&c, ps)
+    if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+    ts.push(pt)
+  var r = types.union_of(&c, ts)
+  if optional or in_optional_chain(c, obj):
+    if optional and ot != check_expr(&c, obj, -1): r = types.union_of(&c, [r, c.undef_t])
+  return r
+
+fn elem_access(var c: C, n: Int) -> Int:
+  let obj = c.t.a[n]
+  let idx = c.t.b[n]
+  var ot = check_expr(&c, obj, -1)
+  let it = check_expr(&c, idx, -1)
+  if is_any(c, ot): return ot
+  if (c.t.f[n] & 1) != 0: ot = types.filter_union(&c, ot, true, true)
+  else: ot = non_null(&c, ot, obj)
+  if is_any(c, ot): return ot
+  let ik = c.tk[it]
+  if ik == TK_STRLIT or ik == TK_NUMLIT:
+    var pname = c.ta[it]
+    if ik == TK_NUMLIT:
+      let ntext = c.numtext[c.ta[it]] + ""
+      pname = ast.intern(&c.t, ntext)
+    var ts: [Int] = []
+    for m in types.members(c, ot):
+      let ps = prop_of(&c, m, pname)
+      if ps >= 0:
+        var pt = bind.type_of_sym(&c, ps)
+        if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+        ts.push(pt)
+        continue
+      let a = rel.apparent(&c, m)
+      var xt = -1
+      if ik == TK_NUMLIT: xt = bind.index_type(&c, a, true)
+      if xt < 0: xt = bind.index_type(&c, a, false)
+      if xt < 0:
+        if ik == TK_NUMLIT and c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_TUPLE:
+          let len = c.objs[c.ta[m]].args.len
+          let h9_ = show.show(&c, m)
+          err(&c, idx, 2493, "Tuple type '" + h9_ + "' of length '{len}' has no element at index '" + c.numtext[c.ta[it]] + "'.")
+          return c.error_t
+        return unsup(&c, n, "an element access the checker can't type")
+      ts.push(xt)
+    return types.union_of(&c, ts)
+  if ik == TK_NUMBER or ik == TK_ANY:
+    var ts: [Int] = []
+    for m in types.members(c, ot):
+      let a = rel.apparent(&c, m)
+      var xt = bind.index_type(&c, a, true)
+      if xt < 0: xt = bind.index_type(&c, a, false)
+      if xt < 0: return unsup(&c, n, "an element access the checker can't type")
+      ts.push(xt)
+    return types.union_of(&c, ts)
+  if ik == TK_STRING:
+    var ts: [Int] = []
+    for m in types.members(c, ot):
+      let h10_ = rel.apparent(&c, m)
+      let xt = bind.index_type(&c, h10_, false)
+      if xt < 0: return unsup(&c, n, "an element access the checker can't type")
+      ts.push(xt)
+    return types.union_of(&c, ts)
+  return unsup(&c, n, "an element access the checker can't type")
+
+# The element type of an iterable used in for-of / spread (arrays, tuples, strings).
+fn element_type(var c: C, t: Int, at: Int) -> Int:
+  if is_any(c, t): return t
+  var ts: [Int] = []
+  for m in types.members(c, t):
+    if c.tk[m] == TK_STRING or c.tk[m] == TK_STRLIT:
+      ts.push(c.string_t)
+      continue
+    if c.tk[m] == TK_OBJ:
+      let o = c.ta[m]
+      if c.objs[o].kind == OK_TUPLE:
+        ts.push(bind.tuple_elem_union(&c, m))
+        continue
+      if rel.is_array_ref(&c, m):
+        ts.push(c.objs[o].args[0])
+        continue
+    return unsup(&c, at, "iterating this type")
+  return types.union_of(&c, ts)
+
+fn object_literal(var c: C, n: Int, ctx: Int) -> Int:
+  let t = types.anon_obj(&c, -1, n)
+  let o = c.ta[t]
+  c.objs[o].fresh = true
+  for p in kids(c, c.t.a[n]):
+    let pk = c.t.k[p]
+    if pk == ast.N_SPREAD: return unsup(&c, p, "a spread in an object literal")
+    if pk == ast.N_GET or pk == ast.N_SET: return unsup(&c, p, "an accessor in an object literal")
+    var name = -1
+    var vt = c.any_t
+    if pk == ast.N_PROPASSIGN:
+      let pn = c.t.a[p]
+      if c.t.k[pn] == ast.N_COMPUTED: return unsup(&c, pn, "a computed property name")
+      name = bind.member_name(&c, p)
+      let pctx = ctx_prop(&c, ctx, name)
+      let raw = check_expr(&c, c.t.b[p], pctx)
+      # a property's literal widens unless its contextual type has literals (a mutable location)
+      if pctx >= 0: vt = widen_in_ctx(&c, raw, pctx)
+      else: vt = widen(&c, raw)
+    elif pk == ast.N_SHORTHAND:
+      name = c.t.s[p]
+      let idn = p
+      let s = bind.lookup_value(&c, p, name)
+      if s < 0:
+        err(&c, p, 18004, "No value exists in scope for the shorthand property '" + nm(c, name) + "'. Either declare one or provide an initializer.")
+        vt = c.error_t
+      else:
+        let nt = narrowed(c, "{s}")
+        if nt >= 0: vt = nt
+        else: vt = bind.type_of_sym(&c, s)
+      c.ntype[idn] = vt
+    elif pk == ast.N_METHOD:
+      return unsup(&c, p, "a method in an object literal")
+    if name < 0: continue
+    let ps = types.new_sym(&c, S_PROP, name, p)
+    c.stype[ps] = vt
+    types.add_prop(&c, t, name, ps)
+  c.objs[o].resolved = true
+  return t
+
+fn ctx_prop(var c: C, ctx: Int, name: Int) -> Int:
+  if ctx < 0 or name < 0: return -1
+  var ts: [Int] = []
+  for m in types.members(c, ctx):
+    if c.tk[m] != TK_OBJ: continue
+    let ps = bind.get_prop(&c, m, name)
+    if ps >= 0: ts.push(bind.type_of_sym(&c, ps))
+    else:
+      let si = bind.index_type(&c, m, false)
+      if si >= 0: ts.push(si)
+  if ts.len == 0: return -1
+  return types.union_of(&c, ts)
+
+fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
+  # a tuple when the contextual type is a tuple
+  var tuple_ctx = -1
+  var elem_ctx = -1
+  if ctx >= 0:
+    for m in types.members(c, ctx):
+      if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_TUPLE: tuple_ctx = m
+      elif rel.is_array_ref(&c, m): elem_ctx = c.objs[c.ta[m]].args[0]
+  var ts: [Int] = []
+  var i = 0
+  for el in kids(c, c.t.a[n]):
+    if c.t.k[el] == ast.N_SPREAD: return unsup(&c, el, "a spread in an array literal")
+    if c.t.k[el] == ast.N_OMIT: return unsup(&c, el, "a hole in an array literal")
+    var ec = elem_ctx
+    if tuple_ctx >= 0:
+      let to = c.ta[tuple_ctx]
+      if i < c.objs[to].args.len: ec = c.objs[to].args[i]
+    ts.push(check_expr(&c, el, ec))
+    i += 1
+  if tuple_ctx >= 0:
+    let t = types.new_obj(&c, OK_TUPLE, -1, n)
+    let o = c.ta[t]
+    for x in ts:
+      c.objs[o].args.push(widen_in_ctx(&c, x, tuple_ctx))
+      c.objs[o].eflags.push(0)
+    return t
+  if ts.len == 0:
+    # [] is never[] (strict mode, no contextual type: an evolving array; modeled as never[])
+    return bind.array_of(&c, c.never_t)
+  var ws: [Int] = []
+  for x in ts:
+    if elem_ctx >= 0 and could_keep_literal(&c, elem_ctx): ws.push(x)
+    else: ws.push(widen(&c, x))
+  let h12_ = types.union_of(&c, ws)
+  return bind.array_of(&c, h12_)
+
+fn could_keep_literal(var c: C, t: Int) -> Bool:
+  return rel.could_have_singletons(&c, t)
+
+fn widen_in_ctx(var c: C, x: Int, ctx: Int) -> Int:
+  if rel.could_have_singletons(&c, ctx): return x
+  return widen(&c, x)
+
+# An arrow or function expression: parameters from annotations, else from the contextual signature.
+fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
+  if (c.t.f[n] & ast.M_ASYNC) != 0 or (c.t.f[n] & ast.M_GENERATOR) != 0: return unsup(&c, n, "an async or generator function")
+  var csig = -1
+  if ctx >= 0:
+    var found = 0
+    for m in types.members(c, ctx):
+      if c.tk[m] == TK_OBJ:
+        let sgs = bind.sigs_of(&c, m, false)
+        if sgs.len == 1:
+          csig = sgs[0]
+          found += 1
+    if found != 1: csig = -1
+  var i = 0
+  for p in kids(c, c.t.b[n]):
+    if c.t.k[c.t.a[p]] != ast.N_ID: return unsup(&c, p, "a destructuring parameter")
+    if c.t.b[p] < 0 and not (p in c.ptype_ctx):
+      var pt = -1
+      if csig >= 0:
+        let cs = types.sig_copy(c, csig)
+        if i < cs.ptypes.len:
+          pt = cs.ptypes[i]
+          if cs.pflags[i] == 2: pt = element_type(&c, pt, p)
+        elif cs.pflags.len > 0 and cs.pflags[cs.pflags.len - 1] == 2:
+          pt = element_type(&c, cs.ptypes[cs.ptypes.len - 1], p)
+        else:
+          pt = c.any_t
+      if pt < 0:
+        if c.t.c[p] < 0:
+          err(&c, c.t.a[p], 7006, "Parameter '" + nm(c, c.t.s[c.t.a[p]]) + "' implicitly has an 'any' type.")
+          pt = c.any_t
+        else:
+          let g3_1 = check_expr(&c, c.t.c[p], -1)
+          pt = widen(&c, g3_1)
+      if (c.t.f[p] & ast.M_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+      c.ptype_ctx[p] = pt
+    i += 1
+  let t = types.anon_obj(&c, -1, n)
+  let o = c.ta[t]
+  # the return type: written, or inferred (in the contextual return type's light)
+  let sg = fn_sig_ctx(&c, n, csig)
+  c.objs[o].calls.push(sg)
+  c.objs[o].resolved = true
+  check_function_body(&c, n, sg)
+  return t
+
+fn fn_sig_ctx(var c: C, d: Int, csig: Int) -> Int:
+  if d in c.fsig: return c.fsig[d]
+  if c.t.c[d] < 0 and csig >= 0:
+    let cret = rel.sig_ret(&c, csig)
+    c.ret_ctx[d] = cret
+  return fn_sig(&c, d)
+
+# ---- calls
+
+fn arg_count_msg(var c: C, sgs: [Int], n: Int, at: Int):
+  var lo = 1000000
+  var hi = 0
+  var rest = false
+  for sg in sgs:
+    let s = types.sig_copy(c, sg)
+    if s.min < lo: lo = s.min
+    var mx = s.ptypes.len
+    for f in s.pflags:
+      if f == 2: rest = true
+    if mx > hi: hi = mx
+  if rest:
+    err(&c, at, 2555, "Expected at least {lo} arguments, but got {n}.")
+  elif lo == hi:
+    err(&c, at, 2554, "Expected {lo} arguments, but got {n}.")
+  else:
+    err(&c, at, 2554, "Expected {lo}-{hi} arguments, but got {n}.")
+
+fn arity_ok(c: C, sg: Int, n: Int) -> Bool:
+  let s = types.sig_copy(c, sg)
+  if n < s.min: return false
+  for f in s.pflags:
+    if f == 2: return true
+  return n <= s.ptypes.len
+
+fn param_at(var c: C, sg: Int, i: Int) -> Int:
+  let s = types.sig_copy(c, sg)
+  if i < s.ptypes.len:
+    if s.pflags[i] == 2: return element_type(&c, s.ptypes[i], s.node)
+    if s.pflags[i] == 1: return types.union_of(&c, [s.ptypes[i], c.undef_t])
+    return s.ptypes[i]
+  if s.pflags.len > 0 and s.pflags[s.pflags.len - 1] == 2: return element_type(&c, s.ptypes[s.ptypes.len - 1], s.node)
+  return c.any_t
+
+# Whether an argument's type depends on its contextual type (an arrow with untyped parameters).
+fn context_sensitive(c: C, e: Int) -> Bool:
+  let k = c.t.k[e]
+  if k == ast.N_ARROW or k == ast.N_FUNCEXPR:
+    for p in ast.items(c.t, c.t.b[e]):
+      if c.t.b[p] < 0: return true
+    return false
+  if k == ast.N_PAREN: return context_sensitive(c, c.t.a[e])
+  if k == ast.N_OBJECT:
+    for p in ast.items(c.t, c.t.a[e]):
+      if c.t.k[p] == ast.N_PROPASSIGN and context_sensitive(c, c.t.b[p]): return true
+  return false
+
+fn call(var c: C, n: Int, is_new: Bool) -> Int:
+  let callee = c.t.a[n]
+  let args = kids(c, c.t.c[n])
+  if c.t.k[callee] == ast.N_SUPER: return unsup(&c, n, "super calls")
+  for a in args:
+    if c.t.k[a] == ast.N_SPREAD: return unsup(&c, a, "a spread argument")
+  var ft = check_expr(&c, callee, -1)
+  if is_any(c, ft):
+    for a in args: check_expr(&c, a, -1)
+    return ft
+  if (c.t.f[n] & 1) != 0: ft = types.filter_union(&c, ft, true, true)
+  elif not is_new: ft = non_null(&c, ft, callee)
+  if is_any(c, ft):
+    for a in args: check_expr(&c, a, -1)
+    return ft
+  if c.tk[ft] == TK_UNION: return unsup(&c, n, "calling a union of functions")
+  let ap = rel.apparent(&c, ft)
+  let sgs = bind.sigs_of(&c, ap, is_new)
+  if sgs.len == 0:
+    for a in args: check_expr(&c, a, -1)
+    if is_new:
+      err(&c, callee, 2351, "This expression is not constructable.")
+    else:
+      err(&c, callee, 2349, "This expression is not callable.")
+    return c.error_t
+  if c.t.b[n] >= 0: return unsup(&c, n, "explicit type arguments in a call")
+  var cands: [Int] = []
+  for sg in sgs:
+    if arity_ok(c, sg, args.len): cands.push(sg)
+  if cands.len == 0:
+    for a in args: check_expr(&c, a, -1)
+    # too few: at the call; too many: at the first extra argument
+    var mx = 0
+    var rest = false
+    for sg in sgs:
+      if c.sigs[sg].ptypes.len > mx: mx = c.sigs[sg].ptypes.len
+      for f in types.ints(c.sigs[sg].pflags):
+        if f == 2: rest = true
+    var at = n
+    if not rest and args.len > mx: at = args[mx]
+    arg_count_msg(&c, sgs, args.len, at)
+    return sig_result(&c, sgs[0], n)
+  if cands.len == 1:
+    let sg = instantiate_call(&c, cands[0], args)
+    check_args(&c, sg, args, true)
+    return sig_result(&c, sg, n)
+  # overloads: the first whose arguments all fit
+  for cand in cands:
+    let sg = instantiate_call(&c, cand, args)
+    if args_fit(&c, sg, args):
+      check_args(&c, sg, args, false)
+      return sig_result(&c, sg, n)
+  for a in args: check_expr(&c, a, -1)
+  err(&c, n, 2769, "No overload matches this call.")
+  return c.error_t
+
+fn sig_result(var c: C, sg: Int, n: Int) -> Int:
+  let r = c.sigs[sg].ret
+  if r < 0: return c.any_t
+  return r
+
+fn args_fit(var c: C, sg: Int, args: [Int]) -> Bool:
+  for i in 0..args.len:
+    let pt = param_at(&c, sg, i)
+    let at = check_expr(&c, args[i], pt)
+    if not rel.assignable(&c, at, pt): return false
+  return true
+
+fn check_args(var c: C, sg: Int, args: [Int], report: Bool):
+  for i in 0..args.len:
+    let pt = param_at(&c, sg, i)
+    let at = check_expr(&c, args[i], pt)
+    if report and not rel.assignable(&c, at, pt): rel.report(&c, at, pt, args[i], args[i], 2345)
+
+# Infers a generic signature's type arguments from the arguments and instantiates it.
+fn instantiate_call(var c: C, sg: Int, args: [Int]) -> Int:
+  let tps = types.ints(c.sigs[sg].tparams)
+  if tps.len == 0: return sg
+  var cands: [[Int]] = []
+  for x in tps: cands.push([])
+  # first the arguments that don't depend on context, then the others with what's known
+  for pass in 0..2:
+    for i in 0..args.len:
+      let sens = context_sensitive(c, args[i])
+      if (pass == 0) == sens: continue
+      var pt = raw_param_at(&c, sg, i)
+      if pass == 1:
+        let m = current_mapper(&c, tps, cands, sg)
+        pt = bind.instantiate(&c, pt, m)
+        c.fsig.remove(args[i])
+        clear_ctx_params(&c, args[i])
+      let at = check_expr(&c, args[i], pt)
+      let h13_ = raw_param_at(&c, sg, i)
+      infer(&c, h13_, at, tps, &cands)
+  let m = current_mapper(&c, tps, cands, sg)
+  return bind.inst_sig(&c, sg, m)
+
+fn clear_ctx_params(var c: C, e: Int):
+  var x = e
+  while c.t.k[x] == ast.N_PAREN: x = c.t.a[x]
+  if c.t.k[x] == ast.N_ARROW or c.t.k[x] == ast.N_FUNCEXPR:
+    for p in kids(c, c.t.b[x]):
+      if p in c.ptype_ctx: c.ptype_ctx.remove(p)
+    if x in c.ret_ctx: c.ret_ctx.remove(x)
+
+fn raw_param_at(var c: C, sg: Int, i: Int) -> Int:
+  let s = types.sig_copy(c, sg)
+  if i < s.ptypes.len:
+    if s.pflags[i] == 2: return element_type(&c, s.ptypes[i], s.node)
+    return s.ptypes[i]
+  if s.pflags.len > 0 and s.pflags[s.pflags.len - 1] == 2: return element_type(&c, s.ptypes[s.ptypes.len - 1], s.node)
+  return c.any_t
+
+fn current_mapper(var c: C, tps: [Int], cands: [[Int]], sg: Int) -> Int:
+  var to: [Int] = []
+  for i in 0..tps.len:
+    if cands[i].len == 0:
+      let con = rel.constraint_of(&c, tps[i])
+      if con >= 0: to.push(con)
+      else: to.push(c.unknown_t)
+    else:
+      var t = types.union_of(&c, cands[i])
+      # literals widen unless the type parameter is the whole return type or constrained to primitives
+      let ret = c.sigs[sg].ret
+      let con = rel.constraint_of(&c, tps[i])
+      let keep = ret == tps[i] or (con >= 0 and prim_constraint(&c, con))
+      if not keep: t = widen_all(&c, t)
+      else: t = types.regular(c, t)
+      to.push(t)
+  return types.new_mapper(&c, tps, to)
+
+fn prim_constraint(var c: C, t: Int) -> Bool:
+  for m in types.members(c, t):
+    let k = c.tk[m]
+    if k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_TRUE or k == TK_FALSE: return true
+  return false
+
+fn widen_all(var c: C, t: Int) -> Int:
+  var ts: [Int] = []
+  for m in types.members(c, t): ts.push(types.base_of_literal(c, m))
+  return types.union_of(&c, ts)
+
+fn infer(var c: C, p: Int, a: Int, tps: [Int], var cands: [[Int]]):
+  let pk = c.tk[p]
+  if pk == TK_TPARAM:
+    for i in 0..tps.len:
+      if tps[i] == p:
+        if not types.has_int(cands[i], a): cands[i].push(a)
+    return
+  if pk == TK_UNION:
+    # infer to the naked type parameter from what the other members don't take
+    for m in types.members(c, p):
+      if c.tk[m] == TK_TPARAM:
+        var rest: [Int] = []
+        for am in types.members(c, a):
+          var taken = false
+          for m2 in types.members(c, p):
+            if m2 != m and c.tk[m2] != TK_TPARAM and rel.assignable(&c, am, m2): taken = true
+          if not taken: rest.push(am)
+        if rest.len > 0:
+          let g4_1 = types.union_of(&c, rest)
+          infer(&c, m, g4_1, tps, &cands)
+      else:
+        infer(&c, m, a, tps, &cands)
+    return
+  if pk != TK_OBJ or c.tk[a] != TK_OBJ: return
+  let po = c.ta[p]
+  let ao = c.ta[a]
+  if c.objs[po].kind == OK_REF and c.objs[ao].kind == OK_REF and c.objs[po].target == c.objs[ao].target:
+    for i in 0..c.objs[po].args.len: infer(&c, c.objs[po].args[i], c.objs[ao].args[i], tps, &cands)
+    return
+  if rel.is_array_ref(&c, p) and c.objs[ao].kind == OK_TUPLE:
+    let h14_ = bind.tuple_elem_union(&c, a)
+    infer(&c, c.objs[po].args[0], h14_, tps, &cands)
+    return
+  if rel.is_array_ref(&c, p) and rel.is_array_ref(&c, a):
+    infer(&c, c.objs[po].args[0], c.objs[ao].args[0], tps, &cands)
+    return
+  let psg = bind.sigs_of(&c, p, false)
+  let asg = bind.sigs_of(&c, a, false)
+  if psg.len == 1 and asg.len == 1:
+    let ps = types.sig_copy(c, psg[0])
+    let as_ = types.sig_copy(c, asg[0])
+    for i in 0..ps.ptypes.len:
+      if i < as_.ptypes.len: infer(&c, ps.ptypes[i], as_.ptypes[i], tps, &cands)
+    if ps.ret >= 0 and as_.ret >= 0: infer(&c, ps.ret, as_.ret, tps, &cands)
+    return
+  for name in bind.prop_names(&c, p):
+    let pp = bind.get_prop(&c, p, name)
+    let ap = bind.get_prop(&c, a, name)
+    if pp >= 0 and ap >= 0:
+      let g5_1 = bind.type_of_sym(&c, pp)
+      let g6_1 = bind.type_of_sym(&c, ap)
+      infer(&c, g5_1, g6_1, tps, &cands)
+
+# ---- operators
+
+fn number_like(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  if k == TK_NUMBER or k == TK_NUMLIT or k == TK_ANY or k == TK_ERROR or k == TK_NEVER or k == TK_UNSUP: return true
+  if k == TK_UNION:
+    for m in types.members(c, t):
+      if not number_like(c, m): return false
+    return true
+  return false
+
+fn bigint_like(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  if k == TK_BIGINT or k == TK_BIGLIT: return true
+  if k == TK_UNION:
+    for m in types.members(c, t):
+      if not bigint_like(c, m): return false
+    return true
+  return false
+
+fn string_like(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  if k == TK_STRING or k == TK_STRLIT: return true
+  if k == TK_UNION:
+    for m in types.members(c, t):
+      if not string_like(c, m): return false
+    return true
+  return false
+
+fn arith_operand(var c: C, e: Int, t: Int, code: Int) -> Bool:
+  if number_like(c, t) or bigint_like(c, t): return true
+  if c.tk[t] == TK_NULL or c.tk[t] == TK_UNDEF:
+    var what = "null"
+    if c.tk[t] == TK_UNDEF: what = "undefined"
+    err(&c, e, 18050, "The value '" + what + "' cannot be used here.")
+    return false
+  if code == 2356:
+    err(&c, e, 2356, "An arithmetic operand must be of type 'any', 'number', 'bigint' or an enum type.")
+  elif code == 2362:
+    err(&c, e, 2362, "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.")
+  else:
+    err(&c, e, 2363, "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.")
+  return false
+
+fn op_text(k: Int) -> Str:
+  if k == scan.T_PLUS: return "+"
+  if k == scan.T_LT: return "<"
+  if k == scan.T_GT: return ">"
+  if k == scan.T_LE: return "<="
+  if k == scan.T_GE: return ">="
+  if k == scan.T_PLUSEQ: return "+="
+  return "?"
+
+fn comparable(var c: C, a: Int, b: Int) -> Bool:
+  if is_any(c, a) or is_any(c, b): return true
+  for x in types.members(c, a):
+    for y in types.members(c, b):
+      if rel.assignable(&c, x, y) or rel.assignable(&c, y, x): return true
+      if c.tk[x] == TK_UNKNOWN or c.tk[y] == TK_UNKNOWN: return true
+  return false
+
+fn assign_target(var c: C, l: Int) -> Int:
+  # the declared type of what's assigned to (not narrowed)
+  let k = c.t.k[l]
+  if k == ast.N_ID:
+    let s = bind.lookup_value(&c, l, c.t.s[l])
+    if s < 0:
+      err(&c, l, 2304, "Cannot find name '" + nm(c, c.t.s[l]) + "'.")
+      return c.error_t
+    if (c.sk[s] & S_CONST) != 0:
+      err(&c, l, 2588, "Cannot assign to '" + nm(c, c.t.s[l]) + "' because it is a constant.")
+      return c.error_t
+    if (c.sk[s] & (S_FUNC | S_CLASS | S_ENUM | S_NAMESPACE)) != 0: return unsup(&c, l, "assigning to a function or class")
+    return bind.type_of_sym(&c, s)
+  if k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS:
+    if k == ast.N_PROPACCESS:
+      let ot = check_expr(&c, c.t.a[l], -1)
+      for m in types.members(c, ot):
+        let ps = prop_of(&c, m, c.t.s[l])
+        if ps >= 0 and (c.sflags[ps] & SF_READONLY) != 0:
+          err(&c, l, 2540, "Cannot assign to '" + nm(c, c.t.s[l]) + "' because it is a read-only property.")
+          return c.error_t
+    let key = ref_key(&c, l)
+    var t = -1
+    if key != "":
+      # the declared type, not a narrowed one
+      c.narrow.push({})
+      set_narrow(&c, key, -9)
+      t = check_expr(&c, l, -1)
+      c.narrow.pop()
+    else: t = check_expr(&c, l, -1)
+    return t
+  if k == ast.N_PAREN: return assign_target(&c, c.t.a[l])
+  return unsup(&c, l, "this assignment target")
+
+fn binary(var c: C, n: Int, ctx: Int) -> Int:
+  let op = c.t.f[n]
+  let l = c.t.a[n]
+  let r = c.t.b[n]
+  if op == scan.T_ASSIGN:
+    let lk = c.t.k[l]
+    if lk == ast.N_OBJECT or lk == ast.N_ARRAY: return unsup(&c, n, "a destructuring assignment")
+    let target = assign_target(&c, l)
+    let rt = check_expr(&c, r, target)
+    if not is_any(c, target) and not rel.assignable(&c, rt, target): rel.report(&c, rt, target, l, r, 2322)
+    let key = ref_key(&c, l)
+    if key != "":
+      forget(&c, key)
+      let h15_ = assigned_narrow(&c, target, rt)
+      set_narrow(&c, key, h15_)
+    return rt
+  if op >= scan.T_PLUSEQ and op <= scan.T_QQEQ:
+    let target = assign_target(&c, l)
+    let lt = check_expr(&c, l, -1)
+    let rt = check_expr(&c, r, -1)
+    var res = c.any_t
+    if op == scan.T_PLUSEQ:
+      res = plus_type(&c, n, l, r, lt, rt, op)
+    elif op == scan.T_ANDEQ or op == scan.T_OREQ or op == scan.T_QQEQ:
+      res = types.union_of(&c, [lt, rt])
+    else:
+      arith_operand(&c, l, lt, 2362)
+      arith_operand(&c, r, rt, 2363)
+      res = c.number_t
+      if bigint_like(c, lt) and bigint_like(c, rt): res = c.bigint_t
+    if not is_any(c, target) and not rel.assignable(&c, res, target): rel.report(&c, res, target, l, -1, 2322)
+    let key = ref_key(&c, l)
+    if key != "": forget(&c, key)
+    return res
+  if op == scan.T_AND:
+    let lt = check_expr(&c, l, -1)
+    push_facts(&c, l, true)
+    let rt = check_expr(&c, r, -1)
+    c.narrow.pop()
+    let h16_ = falsy_part(&c, lt)
+    return union_fresh(&c, [h16_, rt])
+  if op == scan.T_OR:
+    let lt = check_expr(&c, l, -1)
+    push_facts(&c, l, false)
+    let rt = check_expr(&c, r, ctx)
+    c.narrow.pop()
+    let h17_ = truthy_part(&c, lt)
+    return union_fresh(&c, [h17_, rt])
+  if op == scan.T_QQ:
+    let lt = check_expr(&c, l, -1)
+    let rt = check_expr(&c, r, ctx)
+    let h18_ = types.filter_union(&c, lt, true, true)
+    return union_fresh(&c, [h18_, rt])
+  if op == scan.T_COMMA:
+    check_expr(&c, l, -1)
+    return check_expr(&c, r, ctx)
+  let lt = check_expr(&c, l, -1)
+  let rt = check_expr(&c, r, -1)
+  if op == scan.T_PLUS: return plus_type(&c, n, l, r, lt, rt, op)
+  if op == scan.T_MINUS or op == scan.T_STAR or op == scan.T_SLASH or op == scan.T_PCT or op == scan.T_STAR2 or op == scan.T_SHL or op == scan.T_SHR or op == scan.T_SHRU or op == scan.T_AMP or op == scan.T_BAR or op == scan.T_CARET:
+    var la = lt
+    var ra = rt
+    if c.tk[la] != TK_NULL and c.tk[la] != TK_UNDEF: la = non_nullable_operand(&c, l, la)
+    if c.tk[ra] != TK_NULL and c.tk[ra] != TK_UNDEF: ra = non_nullable_operand(&c, r, ra)
+    let ok1 = arith_operand(&c, l, la, 2362)
+    let ok2 = arith_operand(&c, r, ra, 2363)
+    if bigint_like(c, lt) and bigint_like(c, rt): return c.bigint_t
+    return c.number_t
+  if op == scan.T_LT or op == scan.T_GT or op == scan.T_LE or op == scan.T_GE:
+    let a = non_nullable_operand(&c, l, lt)
+    let b = non_nullable_operand(&c, r, rt)
+    if is_any(c, a) or is_any(c, b): return c.boolean_t
+    let ok = (number_like(c, a) or bigint_like(c, a)) and (number_like(c, b) or bigint_like(c, b))
+    let ok2 = string_like(c, a) and string_like(c, b)
+    if not ok and not ok2 and not comparable(&c, types.base_of_literal(c, a), types.base_of_literal(c, b)):
+      let g1_68 = widen_all(&c, a)
+      let h19_ = show.show(&c, g1_68)
+      let g2_68 = widen_all(&c, b)
+      let h20_ = show.show(&c, g2_68)
+      err(&c, n, 2365, "Operator '" + op_text(op) + "' cannot be applied to types '" + h19_ + "' and '" + h20_ + "'.")
+    return c.boolean_t
+  if op == scan.T_EQ3 or op == scan.T_NE2 or op == scan.T_EQ2 or op == scan.T_NE:
+    if not comparable(&c, lt, rt):
+      var a = types.regular(c, lt)
+      var b = types.regular(c, rt)
+      let ab = widen_all(&c, a)
+      let bb = widen_all(&c, b)
+      if not comparable(&c, ab, bb):
+        a = ab
+        b = bb
+      let neg = op == scan.T_NE2 or op == scan.T_NE
+      var extra = ""
+      if neg: extra = ""
+      let h21_ = show.show(&c, a)
+      let h22_ = show.show(&c, b)
+      err(&c, n, 2367, "This comparison appears to be unintentional because the types '" + h21_ + "' and '" + h22_ + "' have no overlap.")
+    return c.boolean_t
+  if op == scan.W_IN:
+    return c.boolean_t
+  if op == scan.W_INSTANCEOF:
+    return c.boolean_t
+  return unsup(&c, n, "this operator")
+
+fn non_nullable_operand(var c: C, e: Int, t: Int) -> Int:
+  var has_null = false
+  var has_undef = false
+  for m in types.members(c, t):
+    if c.tk[m] == TK_NULL: has_null = true
+    if c.tk[m] == TK_UNDEF: has_undef = true
+  if not has_null and not has_undef: return t
+  let rest = types.filter_union(&c, t, true, true)
+  if c.tk[rest] == TK_NEVER:
+    var what = "undefined"
+    if has_null and not has_undef: what = "null"
+    err(&c, e, 18050, "The value '" + what + "' cannot be used here.")
+    return c.error_t
+  possibly_msg(&c, e, has_null, has_undef)
+  return rest
+
+fn plus_type(var c: C, n: Int, l: Int, r: Int, lt0: Int, rt0: Int, op: Int) -> Int:
+  var lt = lt0
+  var rt = rt0
+  if not string_like(c, lt) and not string_like(c, rt) and not is_any(c, lt) and not is_any(c, rt):
+    if c.tk[lt] != TK_NULL and c.tk[lt] != TK_UNDEF: lt = non_nullable_operand(&c, l, lt)
+    if c.tk[rt] != TK_NULL and c.tk[rt] != TK_UNDEF: rt = non_nullable_operand(&c, r, rt)
+  if is_any(c, lt) or is_any(c, rt):
+    if string_like(c, lt) or string_like(c, rt): return c.string_t
+    return c.any_t
+  # null or undefined alone can't be added
+  if (c.tk[lt] == TK_NULL or c.tk[lt] == TK_UNDEF) and not string_like(c, rt):
+    arith_operand(&c, l, lt, 2362)
+    return c.error_t
+  if (c.tk[rt] == TK_NULL or c.tk[rt] == TK_UNDEF) and not string_like(c, lt):
+    arith_operand(&c, r, rt, 2363)
+    return c.error_t
+  if number_like(c, lt) and number_like(c, rt): return c.number_t
+  if bigint_like(c, lt) and bigint_like(c, rt): return c.bigint_t
+  if string_like(c, lt) or string_like(c, rt): return c.string_t
+  let g3_68 = widen_all(&c, lt)
+  let h23_ = show.show(&c, g3_68)
+  let g4_68 = widen_all(&c, rt)
+  let h24_ = show.show(&c, g4_68)
+  err(&c, n, 2365, "Operator '" + op_text(op) + "' cannot be applied to types '" + h23_ + "' and '" + h24_ + "'.")
+  return c.error_t
+
+fn prefix(var c: C, n: Int) -> Int:
+  let op = c.t.f[n]
+  let a = c.t.a[n]
+  let t = check_expr(&c, a, -1)
+  if op == scan.T_BANG: return c.boolean_t
+  if op == scan.T_INC or op == scan.T_DEC:
+    arith_operand(&c, a, t, 2356)
+    return c.number_t
+  if op == scan.T_MINUS and c.tk[t] == TK_NUMLIT:
+    return types.num_lit(&c, 0.0 - c.nums[c.ta[t]], true)
+  if op == scan.T_PLUS: return c.number_t
+  if op == scan.T_MINUS or op == scan.T_TILDE:
+    if bigint_like(c, t): return c.bigint_t
+    arith_operand(&c, a, t, 2356)
+    return c.number_t
+  return c.number_t
+
+# After x = v: x's type is the declared type narrowed to what v's type allows.
+fn assigned_narrow(var c: C, declared: Int, assigned: Int) -> Int:
+  if c.tk[declared] != TK_UNION: return declared
+  if is_any(c, assigned): return declared
+  var keep: [Int] = []
+  let a = types.regular(c, assigned)
+  for m in types.members(c, declared):
+    var fits = false
+    for am in types.members(c, a):
+      if rel.assignable(&c, am, m): fits = true
+    if fits: keep.push(m)
+  if keep.len == 0: return declared
+  # a literal assigned to a primitive member narrows to the literal's primitive, not further
+  return types.union_of(&c, keep)
+
+# ---- statements
+
+fn check_function_body(var c: C, d: Int, sg: Int):
+  if d in c.checked_fns: return
+  c.checked_fns[d] = true
+  let body = c.t.d[d]
+  if body < 0: return
+  # outer narrowings of variables that can change don't hold inside a function
+  c.narrow.push({})
+  var saved: [{Str: Int}] = []
+  swap(&saved, &c.narrow)
+  c.narrow.push(const_facts(&c, saved))
+  var declared = -1
+  if c.t.c[d] >= 0: declared = c.sigs[sg].ret
+  c.ret_stack.push(declared)
+  if c.t.k[body] == ast.N_BLOCK:
+    check_block(&c, body)
+    if declared >= 0: check_missing_return(&c, d, declared, body)
+  else:
+    var rctx = declared
+    if rctx < 0 and d in c.ret_ctx: rctx = c.ret_ctx[d]
+    let et = check_expr(&c, body, rctx)
+    if declared >= 0 and not rel.assignable(&c, et, declared) and c.tk[declared] != TK_VOID: rel.report(&c, et, declared, body, body, 2322)
+  c.ret_stack.pop()
+  swap(&saved, &c.narrow)
+  c.narrow.pop()
+
+# Narrowings that still hold inside a nested function: those of constants and parameters never
+# assigned to (approximated by constants).
+fn const_facts(var c: C, frames: [{Str: Int}]) -> {Str: Int}:
+  var out: {Str: Int} = {}
+  for f in frames:
+    for k, v in f:
+      let dot = k.find(".")
+      var base = k + ""
+      if dot >= 0: base = k[0..dot]
+      let s = int(base) else -1
+      if s >= 0 and (c.sk[s] & S_CONST) != 0: out[k + ""] = v
+  return out
+
+fn includes_undefined(var c: C, t: Int) -> Bool:
+  for m in types.members(c, t):
+    let k = c.tk[m]
+    if k == TK_UNDEF or k == TK_VOID or k == TK_ANY or k == TK_UNKNOWN or k == TK_ERROR: return true
+  return false
+
+fn check_missing_return(var c: C, d: Int, declared: Int, body: Int):
+  let k = c.tk[declared]
+  if k == TK_VOID or k == TK_ANY or k == TK_ERROR or k == TK_UNSUP or k == TK_UNKNOWN or k == TK_NEVER: return
+  if includes_undefined(&c, declared) and k != TK_UNION: return
+  var rets: [Int] = []
+  collect_returns(c, body, &rets)
+  var with_value = 0
+  for r in rets:
+    if c.t.a[r] >= 0: with_value += 1
+  if terminates(c, body): return
+  if with_value == 0:
+    if includes_undefined(&c, declared): return
+    err(&c, c.t.c[d], 2355, "A function whose declared type is neither 'undefined', 'void', nor 'any' must return a value.")
+    return
+  if includes_undefined(&c, declared): return
+  err(&c, c.t.c[d], 2366, "Function lacks ending return statement and return type does not include 'undefined'.")
+
+fn check_block(var c: C, b: Int):
+  bind.scope_names(&c, b)
+  check_stmts(&c, kids(c, c.t.a[b]))
+
+fn check_stmts(var c: C, stmts: [Int]):
+  # facts from early exits (if (!x) return;) hold for the rest of the list
+  c.narrow.push({})
+  for st in stmts: check_stmt(&c, st)
+  c.narrow.pop()
+
+# The references assigned anywhere inside a node (a loop's body), to forget before checking it.
+fn assigned_in(var c: C, n: Int, var out: [Str]):
+  if n < 0: return
+  let k = c.t.k[n]
+  if k == ast.N_BINARY and (c.t.f[n] == scan.T_ASSIGN or (c.t.f[n] >= scan.T_PLUSEQ and c.t.f[n] <= scan.T_QQEQ)):
+    let key = ref_key(&c, c.t.a[n])
+    if key != "": out.push(key)
+  if (k == ast.N_PREFIX or k == ast.N_POSTFIX) and (c.t.f[n] == scan.T_INC or c.t.f[n] == scan.T_DEC):
+    let key = ref_key(&c, c.t.a[n])
+    if key != "": out.push(key)
+  if k == ast.N_LIST:
+    for x in ast.items(c.t, n): assigned_in(&c, x, &out)
+    return
+  if k == ast.N_VAR or k == ast.N_INTERFACE or k == ast.N_TYPEALIAS:
+    assigned_in(&c, c.t.a[n], &out)
+    return
+  if k >= ast.N_TREF and k <= ast.N_TREST: return
+  assigned_in(&c, c.t.a[n], &out)
+  assigned_in(&c, c.t.b[n], &out)
+  assigned_in(&c, c.t.c[n], &out)
+  assigned_in(&c, c.t.d[n], &out)
+
+fn forget_assigned(var c: C, n: Int):
+  var keys: [Str] = []
+  assigned_in(&c, n, &keys)
+  for k in keys: forget(&c, k)
+
+fn check_var_decl(var c: C, d: Int, kind: Int):
+  let name = c.t.a[d]
+  if c.t.k[name] != ast.N_ID:
+    unsup(&c, d, "a destructuring declaration")
+    return
+  let s = bind.lookup_value(&c, name, c.t.s[name])
+  let init = c.t.c[d]
+  if c.t.b[d] >= 0:
+    let declared = bind.type_from(&c, c.t.b[d])
+    if init >= 0:
+      let it = check_expr(&c, init, declared)
+      if not rel.assignable(&c, it, declared): rel.report(&c, it, declared, name, init, 2322)
+      elif s >= 0:
+        let g7_1 = assigned_narrow(&c, declared, it)
+        set_narrow(&c, "{s}", g7_1)
+  elif init >= 0 and s >= 0:
+    bind.type_of_sym(&c, s)
+
+fn check_stmt(var c: C, n: Int):
+  let k = c.t.k[n]
+  if k == ast.N_VAR:
+    if (c.t.d[n] & ast.M_DECLARE) != 0: return
+    for d in kids(c, c.t.a[n]): check_var_decl(&c, d, c.t.f[n])
+    return
+  if k == ast.N_EXPRSTMT:
+    check_expr(&c, c.t.a[n], -1)
+    return
+  if k == ast.N_RETURN:
+    let declared = c.ret_stack[c.ret_stack.len - 1]
+    if c.t.a[n] >= 0:
+      var ctx = declared
+      let et = check_expr(&c, c.t.a[n], ctx)
+      if declared >= 0 and c.tk[declared] != TK_VOID and not rel.assignable(&c, et, declared): rel.report(&c, et, declared, c.t.a[n], c.t.a[n], 2322)
+      elif declared >= 0 and c.tk[declared] == TK_VOID and not rel.assignable(&c, et, declared): rel.report(&c, et, declared, c.t.a[n], c.t.a[n], 2322)
+    return
+  if k == ast.N_IF:
+    let cond = c.t.a[n]
+    check_expr(&c, cond, -1)
+    push_facts(&c, cond, true)
+    check_stmt(&c, c.t.b[n])
+    let then_ends = terminates(c, c.t.b[n])
+    c.narrow.pop()
+    var else_ends = false
+    if c.t.c[n] >= 0:
+      push_facts(&c, cond, false)
+      check_stmt(&c, c.t.c[n])
+      else_ends = terminates(c, c.t.c[n])
+      c.narrow.pop()
+    # what's assigned in a branch isn't known after it
+    forget_assigned(&c, c.t.b[n])
+    if c.t.c[n] >= 0: forget_assigned(&c, c.t.c[n])
+    # if (!x) return;  -> x is truthy from here on
+    if then_ends and not else_ends:
+      var fs: [Fact] = []
+      facts(&c, cond, false, &fs)
+      for f in fs: set_narrow(&c, f.key, f.t)
+    elif else_ends and not then_ends:
+      var fs: [Fact] = []
+      facts(&c, cond, true, &fs)
+      for f in fs: set_narrow(&c, f.key, f.t)
+    return
+  if k == ast.N_BLOCK:
+    check_block(&c, n)
+    return
+  if k == ast.N_WHILE or k == ast.N_DO:
+    var cond = c.t.a[n]
+    var body = c.t.b[n]
+    if k == ast.N_DO:
+      cond = c.t.b[n]
+      body = c.t.a[n]
+    forget_assigned(&c, body)
+    check_expr(&c, cond, -1)
+    push_facts(&c, cond, true)
+    check_stmt(&c, body)
+    c.narrow.pop()
+    forget_assigned(&c, body)
+    return
+  if k == ast.N_FOR:
+    bind.scope_names(&c, n)
+    c.narrow.push({})
+    let init = c.t.a[n]
+    if init >= 0:
+      if c.t.k[init] == ast.N_VAR:
+        for d in kids(c, c.t.a[init]): check_var_decl(&c, d, c.t.f[init])
+      else: check_expr(&c, init, -1)
+    forget_assigned(&c, c.t.d[n])
+    forget_assigned(&c, c.t.c[n])
+    if c.t.b[n] >= 0:
+      check_expr(&c, c.t.b[n], -1)
+      push_facts(&c, c.t.b[n], true)
+    else: c.narrow.push({})
+    check_stmt(&c, c.t.d[n])
+    if c.t.c[n] >= 0: check_expr(&c, c.t.c[n], -1)
+    c.narrow.pop()
+    c.narrow.pop()
+    forget_assigned(&c, c.t.d[n])
+    return
+  if k == ast.N_FORIN:
+    bind.scope_names(&c, n)
+    let left = c.t.a[n]
+    if c.t.f[n] == 2: unsup(&c, n, "for await")
+    if c.t.k[left] != ast.N_VAR:
+      unsup(&c, n, "a for loop over an existing variable")
+      return
+    let et = check_expr(&c, c.t.b[n], -1)
+    if c.t.f[n] == 1: element_type(&c, et, c.t.b[n])
+    forget_assigned(&c, c.t.c[n])
+    c.narrow.push({})
+    check_stmt(&c, c.t.c[n])
+    c.narrow.pop()
+    forget_assigned(&c, c.t.c[n])
+    return
+  if k == ast.N_FUNC:
+    if c.t.d[n] < 0: return
+    if (c.t.f[n] & (ast.M_ASYNC | ast.M_GENERATOR)) != 0:
+      unsup(&c, n, "an async or generator function")
+      return
+    for p in kids(c, c.t.b[n]):
+      if c.t.k[c.t.a[p]] != ast.N_ID:
+        unsup(&c, p, "a destructuring parameter")
+        return
+      if c.t.b[p] < 0 and c.t.c[p] < 0 and nm(c, c.t.s[c.t.a[p]]) != "this":
+        err(&c, c.t.a[p], 7006, "Parameter '" + nm(c, c.t.s[c.t.a[p]]) + "' implicitly has an 'any' type.")
+    let sg = fn_sig(&c, n)
+    check_function_body(&c, n, sg)
+    return
+  if k == ast.N_INTERFACE or k == ast.N_TYPEALIAS or k == ast.N_EMPTY:
+    if k == ast.N_TYPEALIAS: check_type_alias(&c, n)
+    if k == ast.N_INTERFACE: check_interface(&c, n)
+    return
+  if k == ast.N_THROW:
+    check_expr(&c, c.t.a[n], -1)
+    return
+  if k == ast.N_TRY:
+    check_block(&c, c.t.a[n])
+    if c.t.c[n] >= 0:
+      bind.scope_names(&c, n)
+      check_block(&c, c.t.c[n])
+    if c.t.d[n] >= 0: check_block(&c, c.t.d[n])
+    return
+  if k == ast.N_SWITCH:
+    let st = check_expr(&c, c.t.a[n], -1)
+    for cs in kids(c, c.t.b[n]):
+      if c.t.a[cs] >= 0:
+        let ct = check_expr(&c, c.t.a[cs], -1)
+        if not comparable(&c, st, ct):
+          var a = types.regular(c, ct)
+          var b = types.regular(c, st)
+          let g1_55 = widen_all(&c, a)
+          let g2_55 = widen_all(&c, b)
+          if not comparable(&c, g1_55, g2_55):
+            a = widen_all(&c, a)
+            b = widen_all(&c, b)
+          let h25_ = show.show(&c, a)
+          let h26_ = show.show(&c, b)
+          err(&c, c.t.a[cs], 2678, "Type '" + h25_ + "' is not comparable to type '" + h26_ + "'.")
+      bind.scope_names(&c, cs)
+      check_stmts(&c, kids(c, c.t.b[cs]))
+    return
+  if k == ast.N_BREAK or k == ast.N_CONTINUE or k == ast.N_DEBUGGER: return
+  if k == ast.N_LABEL:
+    check_stmt(&c, c.t.a[n])
+    return
+  if k == ast.N_CLASS:
+    unsup(&c, n, "a class")
+    return
+  if k == ast.N_ENUM:
+    unsup(&c, n, "an enum")
+    return
+  if k == ast.N_MODULE:
+    unsup(&c, n, "a namespace")
+    return
+  if k == ast.N_IMPORT or k == ast.N_EXPORT or k == ast.N_EXPORTDEFAULT or k == ast.N_EXPORTASSIGN or k == ast.N_IMPORTEQ:
+    unsup(&c, n, "modules")
+    return
+  unsup(&c, n, "this statement")
+
+fn check_type_alias(var c: C, n: Int):
+  bind.type_from(&c, c.t.b[n])
+
+fn check_interface(var c: C, n: Int):
+  # members' types are checked for unknown names
+  for m in kids(c, c.t.c[n]):
+    let k = c.t.k[m]
+    if k == ast.N_PROP and c.t.b[m] >= 0: bind.type_from(&c, c.t.b[m])
+    elif k == ast.N_METHOD or k == ast.N_CALLSIG or k == ast.N_CTORSIG: bind.sig_from(&c, c.t.b[m], m)
+  for h in kids(c, c.t.b[n]): bind.heritage_type(&c, h)
+
+fn check_file(var c: C, root: Int):
+  check_stmts(&c, kids(c, root))

@@ -1,0 +1,440 @@
+# Assignability (TypeScript's assignable relation, strict mode) and the first line of the error
+# TypeScript reports when it fails: TS2322 / TS2345 with the types as TypeScript shows them, TS2741 /
+# TS2739 / TS2740 for missing properties, TS2353 for an object literal's excess property, and errors
+# moved onto the parts of an object or array literal that don't fit.
+
+import ast
+import types
+import bind
+import show
+from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP
+from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE, SF_OPTIONAL
+
+fn assignable(var c: C, s: Int, t: Int) -> Bool:
+  if s == t: return true
+  let key = "{s}>{t}"
+  if key in c.rel_cache: return c.rel_cache[key]
+  # a relation being computed is assumed to hold (recursive types)
+  c.rel_cache[key] = true
+  let r = rel(&c, s, t)
+  c.rel_cache[key] = r
+  return r
+
+fn is_nullish(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_UNDEF or k == TK_NULL or k == TK_VOID
+
+fn is_prim(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE
+
+fn rel(var c: C, s0: Int, t0: Int) -> Bool:
+  let s = types.regular(c, s0)
+  let t = types.regular(c, t0)
+  if s == t: return true
+  let sk = c.tk[s]
+  let tk = c.tk[t]
+  if tk == TK_ANY or tk == TK_UNKNOWN or tk == TK_ERROR: return true
+  if sk == TK_ANY or sk == TK_ERROR: return tk != TK_NEVER
+  if sk == TK_NEVER: return true
+  if sk == TK_UNSUP or tk == TK_UNSUP: return true
+  if tk == TK_NEVER: return false
+  if sk == TK_UNKNOWN: return false
+  if sk == TK_UNION:
+    for m in types.members(c, s):
+      if not assignable(&c, m, t): return false
+    return true
+  if tk == TK_UNION:
+    if sk == TK_OBJ and c.objs[c.ta[s]].fresh:
+      for name in bind.prop_names(&c, s):
+        if not known_prop(&c, t, name): return false
+      let plain = unfresh(&c, s)
+      for m in types.members(c, t):
+        if assignable(&c, plain, m): return true
+      return false
+    for m in types.members(c, t):
+      if assignable(&c, s, m): return true
+    return false
+  if tk == TK_INTER:
+    for m in types.members_inter(c, t):
+      if not assignable(&c, s, m): return false
+    return true
+  if sk == TK_INTER:
+    for m in types.members_inter(c, s):
+      if assignable(&c, m, t): return true
+    if tk == TK_OBJ: return structural(&c, s, t)
+    return false
+  if sk == TK_UNDEF: return tk == TK_VOID
+  if sk == TK_NULL or sk == TK_VOID: return false
+  if sk == TK_TPARAM:
+    if tk == TK_TPARAM: return false
+    let con = constraint_of(&c, s)
+    if con < 0: return tk == TK_OBJ and is_empty_obj(&c, t)
+    return assignable(&c, con, t)
+  if tk == TK_TPARAM: return false
+  if sk == TK_STRLIT: return tk == TK_STRING or (tk == TK_OBJ and prim_to_obj(&c, c.string_t, t))
+  if sk == TK_NUMLIT: return tk == TK_NUMBER or (tk == TK_OBJ and prim_to_obj(&c, c.number_t, t))
+  if sk == TK_TRUE or sk == TK_FALSE: return tk == TK_OBJ and prim_to_obj(&c, c.boolean_t, t)
+  if sk == TK_BIGLIT: return tk == TK_BIGINT or (tk == TK_OBJ and prim_to_obj(&c, c.bigint_t, t))
+  if sk == TK_STRING or sk == TK_NUMBER or sk == TK_BIGINT or sk == TK_SYMBOL: return tk == TK_OBJ and prim_to_obj(&c, s, t)
+  if tk == TK_NONPRIM: return sk == TK_OBJ or sk == TK_NONPRIM
+  if sk == TK_NONPRIM: return tk == TK_OBJ and is_empty_obj(&c, t)
+  if sk == TK_OBJ and tk == TK_OBJ:
+    if has_excess(&c, s, t): return false
+    return structural(&c, s, t)
+  return false
+
+# A fresh object literal with a property the target doesn't know (excess property checks).
+fn has_excess(var c: C, s: Int, t: Int) -> Bool:
+  let so = c.ta[s]
+  if not c.objs[so].fresh: return false
+  for name in bind.prop_names(&c, s):
+    if not known_prop(&c, t, name): return true
+  return false
+
+fn constraint_of(var c: C, tp: Int) -> Int:
+  let s = c.ta[tp]
+  let d = c.sdecl[s]
+  if d < 0 or c.t.a[d] < 0: return -1
+  return bind.type_from(&c, c.t.a[d])
+
+fn is_empty_obj(var c: C, t: Int) -> Bool:
+  if c.tk[t] != TK_OBJ: return false
+  let o = c.ta[t]
+  if c.objs[o].kind == OK_TUPLE: return false
+  return bind.prop_names(&c, t).len == 0 and bind.sigs_of(&c, t, false).len == 0 and bind.sigs_of(&c, t, true).len == 0 and bind.index_type(&c, t, false) < 0 and bind.index_type(&c, t, true) < 0
+
+# The interface that stands for a primitive's members (String for string...).
+fn apparent(var c: C, t: Int) -> Int:
+  let k = c.tk[t]
+  var name = ""
+  if k == TK_STRING or k == TK_STRLIT: name = "String"
+  elif k == TK_NUMBER or k == TK_NUMLIT: name = "Number"
+  elif k == TK_TRUE or k == TK_FALSE: name = "Boolean"
+  elif k == TK_BIGINT or k == TK_BIGLIT: name = "BigInt"
+  elif k == TK_SYMBOL: name = "Symbol"
+  elif k == TK_NONPRIM: name = "Object"
+  elif k == TK_UNION and t == c.boolean_t: name = "Boolean"
+  elif k == TK_TPARAM:
+    let con = constraint_of(&c, t)
+    if con >= 0: return apparent(&c, con)
+    return c.empty_obj
+  if name == "": return t
+  let s = bind.global_type_sym(&c, name)
+  if s < 0: return t
+  return bind.declared_type(&c, s)
+
+fn prim_to_obj(var c: C, s: Int, t: Int) -> Bool:
+  if is_empty_obj(&c, t): return true
+  let a = apparent(&c, s)
+  if c.tk[a] != TK_OBJ: return false
+  return structural(&c, a, t)
+
+fn obj_kind(c: C, t: Int) -> Int:
+  return c.objs[c.ta[t]].kind
+
+fn ref_target(c: C, t: Int) -> Int:
+  let o = c.ta[t]
+  if c.objs[o].kind == OK_REF: return c.objs[o].target
+  return -1
+
+fn is_array_ref(var c: C, t: Int) -> Bool:
+  if c.tk[t] != TK_OBJ: return false
+  let tg = ref_target(c, t)
+  if tg < 0: return false
+  let name = bind.nm(c, c.sname[c.objs[c.ta[tg]].sym])
+  return name == "Array" or name == "ReadonlyArray"
+
+fn structural(var c: C, s: Int, t: Int) -> Bool:
+  let so = c.ta[s]
+  let to = c.ta[t]
+  let skind = c.objs[so].kind
+  let tkind = c.objs[to].kind
+  # the same generic type: compare type arguments (covariantly, as for arrays)
+  if skind == OK_REF and tkind == OK_REF and c.objs[so].target == c.objs[to].target:
+    for i in 0..c.objs[so].args.len:
+      if not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]): return false
+    return true
+  # Array<T> to ReadonlyArray<U>
+  if skind == OK_REF and tkind == OK_REF and is_array_ref(&c, s) and is_array_ref(&c, t):
+    let sn = bind.nm(c, c.sname[c.objs[c.ta[c.objs[so].target]].sym])
+    let tn = bind.nm(c, c.sname[c.objs[c.ta[c.objs[to].target]].sym])
+    if sn == "ReadonlyArray" and tn == "Array": return false
+    return assignable(&c, c.objs[so].args[0], c.objs[to].args[0])
+  if tkind == OK_TUPLE:
+    if skind != OK_TUPLE: return false
+    let sa = c.objs[so].args.len
+    let ta = c.objs[to].args.len
+    var tmin = 0
+    for i in 0..ta:
+      if c.objs[to].eflags[i] == 0: tmin = i + 1
+    if sa < tmin or sa > ta: return false
+    for i in 0..sa:
+      if not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]): return false
+    return true
+  if skind == OK_TUPLE and is_array_ref(&c, t):
+    let h1_ = bind.tuple_elem_union(&c, s)
+    return assignable(&c, h1_, c.objs[to].args[0])
+  # properties
+  for name in bind.prop_names(&c, t):
+    let tp = bind.get_prop(&c, t, name)
+    let sp = bind.get_prop(&c, s, name)
+    if sp < 0:
+      if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
+      return false
+    var tt = bind.type_of_sym(&c, tp)
+    if (c.sflags[tp] & SF_OPTIONAL) != 0: tt = types.union_of(&c, [tt, c.undef_t])
+    var st = bind.type_of_sym(&c, sp)
+    if (c.sflags[sp] & SF_OPTIONAL) != 0: st = types.union_of(&c, [st, c.undef_t])
+    if not assignable(&c, st, tt): return false
+  # signatures
+  for tsg in bind.sigs_of(&c, t, false):
+    var ok = false
+    for ssg in bind.sigs_of(&c, s, false):
+      if sig_assignable(&c, ssg, tsg):
+        ok = true
+        break
+    if not ok: return false
+  for tsg in bind.sigs_of(&c, t, true):
+    var ok = false
+    for ssg in bind.sigs_of(&c, s, true):
+      if sig_assignable(&c, ssg, tsg):
+        ok = true
+        break
+    if not ok: return false
+  # index signatures
+  let tsi = bind.index_type(&c, t, false)
+  if tsi >= 0:
+    let ssi = bind.index_type(&c, s, false)
+    if ssi >= 0:
+      if not assignable(&c, ssi, tsi): return false
+    elif skind == OK_ANON:
+      for name in bind.prop_names(&c, s):
+        let gp = bind.get_prop(&c, s, name)
+        let gt = bind.type_of_sym(&c, gp)
+        if not assignable(&c, gt, tsi): return false
+    else: return false
+  let tni = bind.index_type(&c, t, true)
+  if tni >= 0:
+    let sni = bind.index_type(&c, s, true)
+    if sni >= 0:
+      if not assignable(&c, sni, tni): return false
+    elif tsi < 0:
+      let ssi2 = bind.index_type(&c, s, false)
+      if ssi2 >= 0:
+        if not assignable(&c, ssi2, tni): return false
+      elif skind == OK_ANON:
+        for name in bind.prop_names(&c, s):
+          let v = float(c.t.names[name]) else -1.0
+          let gp = bind.get_prop(&c, s, name)
+          let gt = bind.type_of_sym(&c, gp)
+          if v >= 0.0 and not assignable(&c, gt, tni): return false
+      else: return false
+  return true
+
+fn sig_ret(var c: C, sg: Int) -> Int:
+  if c.sigs[sg].ret >= 0: return c.sigs[sg].ret
+  return c.any_t
+
+fn sig_assignable(var c: C, ssg0: Int, tsg: Int) -> Bool:
+  var ssg = ssg0
+  # a generic source: its type parameters erased to any
+  if c.sigs[ssg].tparams.len > 0:
+    var anys: [Int] = []
+    for x in types.ints(c.sigs[ssg].tparams): anys.push(c.any_t)
+    let m = types.new_mapper(&c, types.ints(c.sigs[ssg].tparams), anys)
+    ssg = bind.inst_sig(&c, ssg, m)
+  let ss = types.sig_copy(c, ssg)
+  let ts = types.sig_copy(c, tsg)
+  var t_has_rest = false
+  for f in ts.pflags:
+    if f == 2: t_has_rest = true
+  if ss.min > ts.ptypes.len and not t_has_rest: return false
+  let strict = ts.node >= 0 and c.t.k[ts.node] == ast.N_TFUNC
+  let n = ss.ptypes.len
+  for i in 0..n:
+    if i >= ts.ptypes.len and not t_has_rest: break
+    var tp = c.any_t
+    if i < ts.ptypes.len: tp = ts.ptypes[i]
+    else: tp = ts.ptypes[ts.ptypes.len - 1]
+    let sp = ss.ptypes[i]
+    if strict:
+      if not assignable(&c, tp, sp): return false
+    else:
+      if not assignable(&c, tp, sp) and not assignable(&c, sp, tp): return false
+  let tr = sig_ret(&c, tsg)
+  if c.tk[tr] == TK_VOID: return true
+  let h2_ = sig_ret(&c, ssg)
+  return assignable(&c, h2_, tr)
+
+# ---- error messages
+
+# Whether a target could have a literal type at its top (then the source isn't widened in messages).
+fn could_have_singletons(var c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  if k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_TPARAM: return true
+  if k == TK_UNION or k == TK_INTER:
+    for m in types.members(c, t):
+      if could_have_singletons(&c, m): return true
+  return false
+
+fn not_assignable_msg(var c: C, s: Int, t: Int, code: Int) -> Str:
+  var src = s
+  if types.is_literal(c, s) and c.tk[t] != TK_NEVER and not could_have_singletons(&c, t): src = types.base_of_literal(c, s)
+  let ss = show.show(&c, src)
+  let ts = show.show(&c, t)
+  if code == 2345: return "Argument of type '" + ss + "' is not assignable to parameter of type '" + ts + "'."
+  return "Type '" + ss + "' is not assignable to type '" + ts + "'."
+
+# The target TypeScript names in the message: a union of null/undefined and one other type, with a
+# source that can't be null or undefined, is reported against that other type.
+fn report_target(var c: C, s: Int, t: Int) -> Int:
+  if c.tk[t] != TK_UNION or is_nullish(c, s) or c.tk[s] == TK_UNION: return t
+  if t in c.t_alias: return t
+  let ms = types.members(c, t)
+  if ms.len == 2 and is_nullish(c, ms[0]) and not is_nullish(c, ms[1]): return ms[1]
+  if ms.len == 3 and is_nullish(c, ms[0]) and is_nullish(c, ms[1]) and not is_nullish(c, ms[2]): return ms[2]
+  return t
+
+# Reports s not assignable to t at node, as TypeScript would (the first line of its message).
+# expr is the source expression (-1 if none), for errors moved onto the parts of literals.
+fn report(var c: C, s: Int, t0: Int, node: Int, expr: Int, code: Int):
+  if expr >= 0 and elaborate(&c, expr, t0, code): return
+  let t = report_target(&c, s, t0)
+  let sk = c.tk[s]
+  let tk = c.tk[t]
+  if sk == TK_OBJ and tk == TK_OBJ:
+    if excess(&c, s, t, node): return
+    if missing(&c, s, t, node): return
+  if sk == TK_OBJ and tk == TK_UNION:
+    if excess(&c, s, t, node): return
+  let h3_ = not_assignable_msg(&c, s, t, code)
+  bind.err(&c, node, code, h3_)
+
+fn literal_prop_node(c: C, lit: Int, name: Int) -> Int:
+  if lit < 0 or c.t.k[lit] != ast.N_OBJECT: return -1
+  for p in ast.items(c.t, c.t.a[lit]):
+    let k = c.t.k[p]
+    if k == ast.N_PROPASSIGN or k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET:
+      let pn = c.t.a[p]
+      if c.t.s[pn] == name: return pn
+    elif k == ast.N_SHORTHAND:
+      if c.t.s[p] == name: return p
+  return -1
+
+fn known_prop(var c: C, t: Int, name: Int) -> Bool:
+  for m in types.members(c, t):
+    if c.tk[m] != TK_OBJ: return true
+    if bind.get_prop(&c, m, name) >= 0: return true
+    if bind.index_type(&c, m, false) >= 0: return true
+    if bind.index_type(&c, m, true) >= 0:
+      let v = float(c.t.names[name]) else -1.0
+      if v >= 0.0: return true
+    if is_empty_obj(&c, m): return true
+  return false
+
+# The same object literal type without freshness (its properties shared).
+fn unfresh(var c: C, s: Int) -> Int:
+  let so = c.ta[s]
+  let r = types.anon_obj(&c, -1, c.objs[so].node)
+  let ro = c.ta[r]
+  for name in types.ints(c.objs[so].order):
+    let ps = c.objs[so].props[name]
+    types.add_prop(&c, r, name, ps)
+  for sg in types.ints(c.objs[so].calls): c.objs[ro].calls.push(sg)
+  c.objs[ro].resolved = true
+  return r
+
+# A fresh object literal's property the target doesn't have: TS2353 on the property.
+fn excess(var c: C, s: Int, t: Int, node: Int) -> Bool:
+  let so = c.ta[s]
+  if not c.objs[so].fresh: return false
+  for name in bind.prop_names(&c, s):
+    if not known_prop(&c, t, name):
+      var at = literal_prop_node(c, c.objs[so].node, name)
+      if at < 0: at = node
+      let h4_ = show.show(&c, t)
+      bind.err(&c, at, 2353, "Object literal may only specify known properties, and '" + show.prop_key(c.t.names[name]) + "' does not exist in type '" + h4_ + "'.")
+      return true
+  return false
+
+# Required properties of t that s lacks: TS2741 for one, TS2739 / TS2740 for more.
+fn missing(var c: C, s: Int, t: Int, node: Int) -> Bool:
+  if obj_kind(c, t) == OK_TUPLE or obj_kind(c, s) == OK_TUPLE: return false
+  var miss: [Str] = []
+  for name in bind.prop_names(&c, t):
+    let tp = bind.get_prop(&c, t, name)
+    if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
+    if bind.get_prop(&c, s, name) < 0: miss.push(c.t.names[name] + "")
+  if miss.len == 0: return false
+  let ss = show.show(&c, s)
+  let ts = show.show(&c, t)
+  if miss.len == 1:
+    bind.err(&c, node, 2741, "Property '" + miss[0] + "' is missing in type '" + ss + "' but required in type '" + ts + "'.")
+  elif miss.len <= 4:
+    bind.err(&c, node, 2739, "Type '" + ss + "' is missing the following properties from type '" + ts + "': " + ", ".join(miss))
+  else:
+    var first: [Str] = []
+    for i in 0..4: first.push(miss[i] + "")
+    bind.err(&c, node, 2740, "Type '" + ss + "' is missing the following properties from type '" + ts + "': " + ", ".join(first) + ", and {miss.len - 4} more.")
+  return true
+
+# Moves the error onto the parts of an object or array literal (elaborateError): each property or
+# element whose type doesn't fit is reported where it's written. True if anything was reported.
+fn elaborate(var c: C, e0: Int, t: Int, code: Int) -> Bool:
+  var e = e0
+  while c.t.k[e] == ast.N_PAREN: e = c.t.a[e]
+  let k = c.t.k[e]
+  if k == ast.N_OBJECT and c.tk[t] == TK_OBJ:
+    var any = false
+    for p in ast.items(c.t, c.t.a[e]):
+      let pk = c.t.k[p]
+      var name = -1
+      var val = -1
+      var at = -1
+      if pk == ast.N_PROPASSIGN:
+        name = c.t.s[c.t.a[p]]
+        val = c.t.b[p]
+        at = c.t.a[p]
+      elif pk == ast.N_SHORTHAND:
+        name = c.t.s[p]
+        at = p
+      else: continue
+      if name < 0: continue
+      let tp = bind.get_prop(&c, t, name)
+      if tp < 0: continue
+      var tt = bind.type_of_sym(&c, tp)
+      if (c.sflags[tp] & SF_OPTIONAL) != 0: tt = types.union_of(&c, [tt, c.undef_t])
+      var vt = c.any_t
+      if val >= 0 and val in c.ntype: vt = c.ntype[val]
+      elif pk == ast.N_SHORTHAND and p in c.ntype: vt = c.ntype[p]
+      if assignable(&c, vt, tt): continue
+      any = true
+      if val >= 0 and elaborate(&c, val, tt, 2322): continue
+      let g1_95 = report_target(&c, vt, tt)
+      let h5_ = not_assignable_msg(&c, vt, g1_95, 2322)
+      bind.err(&c, at, 2322, h5_)
+    return any
+  if k == ast.N_ARRAY and c.tk[t] == TK_OBJ:
+    let to = c.ta[t]
+    var any = false
+    var i = 0
+    for el in ast.items(c.t, c.t.a[e]):
+      if c.t.k[el] == ast.N_SPREAD or c.t.k[el] == ast.N_OMIT:
+        i += 1
+        continue
+      var tt = -1
+      if c.objs[to].kind == OK_TUPLE:
+        if i < c.objs[to].args.len: tt = c.objs[to].args[i]
+      elif is_array_ref(&c, t): tt = c.objs[to].args[0]
+      i += 1
+      if tt < 0 or not (el in c.ntype): continue
+      let vt = c.ntype[el]
+      if assignable(&c, vt, tt): continue
+      any = true
+      if elaborate(&c, el, tt, 2322): continue
+      let g2_95 = report_target(&c, vt, tt)
+      let h6_ = not_assignable_msg(&c, vt, g2_95, 2322)
+      bind.err(&c, el, 2322, h6_)
+    return any
+  return false

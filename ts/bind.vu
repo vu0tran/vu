@@ -1,0 +1,917 @@
+# Names and declared types: symbols for declarations, scopes found by walking up the tree (each
+# scope's names collected once), type annotations turned into types, interfaces merged across
+# declarations, and generic types instantiated.
+
+import scan
+import ast
+import parse
+import types
+import chk
+from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP
+from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE
+from types import S_VAR, S_LET, S_CONST, S_PARAM, S_FUNC, S_CLASS, S_INTERFACE, S_ALIAS, S_ENUM, S_NAMESPACE, S_TPARAM, S_PROP, S_METHOD, S_ENUMMEMBER, S_TYPELIT, S_ACCESSOR, S_VALUE, S_TYPE
+from types import SF_OPTIONAL, SF_READONLY, SF_STATIC
+
+fn err(var c: C, node: Int, code: Int, msg: Str):
+  let f = c.t.file[node]
+  if f < c.user_from: return
+  c.diags.push(parse.Diag(f, c.t.pos[node], c.t.end[node], code, msg + ""))
+
+# An error at a position inside node's file (a name that has no node of its own).
+fn err_at(var c: C, node: Int, pos: Int, code: Int, msg: Str):
+  let f = c.t.file[node]
+  if f < c.user_from: return
+  c.diags.push(parse.Diag(f, pos, pos, code, msg + ""))
+
+# Something the checker doesn't model: the file is reported as unsupported instead of checked.
+fn unsupported(var c: C, node: Int, what: Str) -> Int:
+  let f = c.t.file[node]
+  if f >= c.user_from and not (f in c.unsupported): c.unsupported[f] = what + " at {c.t.pos[node]}"
+  return c.error_t
+
+fn nm(c: C, id: Int) -> Str:
+  return c.t.names[id] + ""
+
+# ---- parents
+
+fn link_parents(var c: C):
+  let n = c.t.k.len
+  while c.parent.len < n: c.parent.push(-1)
+  for i in 0..n:
+    let k = c.t.k[i]
+    if k == ast.N_LIST:
+      let start = c.t.a[i]
+      for j in 0..c.t.b[i]:
+        let ch = c.t.L[start + j]
+        if ch >= 0: c.parent[ch] = i
+      continue
+    if c.t.a[i] > 0 and not (k == ast.N_TKW): c.parent[c.t.a[i]] = i
+    if c.t.b[i] > 0: c.parent[c.t.b[i]] = i
+    if c.t.c[i] > 0: c.parent[c.t.c[i]] = i
+    if c.t.d[i] > 0 and k != ast.N_VAR and k != ast.N_INTERFACE and k != ast.N_TYPEALIAS and k != ast.N_PROPACCESS: c.parent[c.t.d[i]] = i
+
+# The list node's real parent (lists sit between a node and its children).
+fn up(c: C, n: Int) -> Int:
+  var p = c.parent[n]
+  while p >= 0 and c.t.k[p] == ast.N_LIST: p = c.parent[p]
+  return p
+
+# ---- declaring
+
+fn decl_kind_of_var(c: C, v: Int) -> Int:
+  let f = c.t.f[v]
+  if f == 2: return S_CONST
+  if f == 1 or f == 3: return S_LET
+  return S_VAR
+
+# The names a binding pattern declares (the N_ID nodes).
+fn binding_ids(c: C, n: Int, var out: [Int]):
+  if n < 0: return
+  let k = c.t.k[n]
+  if k == ast.N_ID:
+    out.push(n)
+  elif k == ast.N_OBJPAT or k == ast.N_ARRPAT:
+    for e in ast.items(c.t, c.t.a[n]):
+      if c.t.k[e] == ast.N_BINDEL: binding_ids(c, c.t.b[e], &out)
+
+fn declare_in(var c: C, var vals: {Int: Int}, var tys: {Int: Int}, stmt: Int):
+  let k = c.t.k[stmt]
+  if k == ast.N_VAR:
+    let sk = decl_kind_of_var(c, stmt)
+    for d in ast.items(c.t, c.t.a[stmt]):
+      var ids: [Int] = []
+      binding_ids(c, c.t.a[d], &ids)
+      for id in ids:
+        let name = c.t.s[id]
+        let s = types.new_sym(&c, sk, name, d)
+        c.nsym[id] = s
+        if c.t.k[c.t.a[d]] == ast.N_ID: c.nsym[d] = s
+        vals[name] = s
+  elif k == ast.N_FUNC:
+    let name = c.t.s[stmt]
+    if name < 0: return
+    if name in vals and (c.sk[vals[name]] & S_FUNC) != 0:
+      types.add_decl(&c, vals[name], stmt)
+      c.nsym[stmt] = vals[name]
+    else:
+      let s = types.new_sym(&c, S_FUNC, name, stmt)
+      vals[name] = s
+      c.nsym[stmt] = s
+  elif k == ast.N_CLASS:
+    let name = c.t.s[stmt]
+    if name < 0: return
+    let s = types.new_sym(&c, S_CLASS, name, stmt)
+    vals[name] = s
+    tys[name] = s
+    c.nsym[stmt] = s
+  elif k == ast.N_INTERFACE:
+    let name = c.t.s[stmt]
+    if name in tys and (c.sk[tys[name]] & S_INTERFACE) != 0:
+      types.add_decl(&c, tys[name], stmt)
+      c.nsym[stmt] = tys[name]
+    elif name in tys and (c.sk[tys[name]] & S_CLASS) != 0:
+      # interface merging with a class: members added to the class
+      types.add_decl(&c, tys[name], stmt)
+      c.nsym[stmt] = tys[name]
+    else:
+      let s = types.new_sym(&c, S_INTERFACE, name, stmt)
+      tys[name] = s
+      c.nsym[stmt] = s
+  elif k == ast.N_TYPEALIAS:
+    let name = c.t.s[stmt]
+    let s = types.new_sym(&c, S_ALIAS, name, stmt)
+    tys[name] = s
+    c.nsym[stmt] = s
+  elif k == ast.N_ENUM:
+    let name = c.t.s[stmt]
+    if name in vals and (c.sk[vals[name]] & S_ENUM) != 0:
+      types.add_decl(&c, vals[name], stmt)
+      c.nsym[stmt] = vals[name]
+    else:
+      let s = types.new_sym(&c, S_ENUM, name, stmt)
+      vals[name] = s
+      tys[name] = s
+      c.nsym[stmt] = s
+  elif k == ast.N_MODULE:
+    let nn = c.t.a[stmt]
+    if (c.t.f[stmt] & ast.MOD_GLOBAL) != 0 or c.t.k[nn] == ast.N_STR: return
+    # namespace A.B: the outer name
+    var first = nn
+    while c.t.k[first] == ast.N_QNAME: first = c.t.a[first]
+    let name = c.t.s[first]
+    if name in vals and (c.sk[vals[name]] & S_NAMESPACE) != 0:
+      types.add_decl(&c, vals[name], stmt)
+      c.nsym[stmt] = vals[name]
+    else:
+      let s = types.new_sym(&c, S_NAMESPACE, name, stmt)
+      vals[name] = s
+      if not (name in tys): tys[name] = s
+      c.nsym[stmt] = s
+
+# Declarations of a file into the globals (lib files and script files).
+fn declare_globals(var c: C, root: Int):
+  var vals: {Int: Int} = {}
+  var tys: {Int: Int} = {}
+  swap(&vals, &c.globals)
+  swap(&tys, &c.gtypes)
+  for st in ast.items(c.t, root):
+    if c.t.k[st] == ast.N_MODULE and (c.t.f[st] & ast.MOD_GLOBAL) != 0:
+      for inner in ast.items(c.t, c.t.b[st]): declare_in(&c, &vals, &tys, inner)
+    else:
+      declare_in(&c, &vals, &tys, st)
+  swap(&vals, &c.globals)
+  swap(&tys, &c.gtypes)
+
+# Whether a file is a module (has a top-level import or export).
+fn is_module(c: C, root: Int) -> Bool:
+  for st in ast.items(c.t, root):
+    let k = c.t.k[st]
+    if k == ast.N_IMPORT or k == ast.N_EXPORT or k == ast.N_EXPORTDEFAULT or k == ast.N_EXPORTASSIGN or k == ast.N_IMPORTEQ: return true
+    if k == ast.N_VAR and (c.t.d[st] & ast.M_EXPORT) != 0: return true
+    if (k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_ENUM or k == ast.N_MODULE) and (c.t.f[st] & ast.M_EXPORT) != 0: return true
+    if (k == ast.N_INTERFACE or k == ast.N_TYPEALIAS) and (c.t.d[st] & ast.M_EXPORT) != 0: return true
+  return false
+
+# The names a scope node declares (a block, a file, a function's parameters...), collected once.
+fn scope_names(var c: C, scope: Int):
+  if scope in c.locals: return
+  var vals: {Int: Int} = {}
+  var tys: {Int: Int} = {}
+  let k = c.t.k[scope]
+  if k == ast.N_BLOCK:
+    for st in ast.items(c.t, c.t.a[scope]): declare_in(&c, &vals, &tys, st)
+  elif k == ast.N_LIST:
+    # a file root (module file) or a namespace body
+    for st in ast.items(c.t, scope): declare_in(&c, &vals, &tys, st)
+  elif k == ast.N_CASE:
+    for st in ast.items(c.t, c.t.b[scope]): declare_in(&c, &vals, &tys, st)
+  elif k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET:
+    var plist = c.t.b[scope]
+    if k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET: plist = c.t.b[c.t.b[scope]]
+    for p in ast.items(c.t, plist):
+      var ids: [Int] = []
+      binding_ids(c, c.t.a[p], &ids)
+      for id in ids:
+        let name = c.t.s[id]
+        let s = types.new_sym(&c, S_PARAM, name, p)
+        c.nsym[id] = s
+        if c.t.k[c.t.a[p]] == ast.N_ID: c.nsym[p] = s
+        vals[name] = s
+    # a named function expression sees its own name
+    if k == ast.N_FUNCEXPR and c.t.s[scope] >= 0:
+      let s = types.new_sym(&c, S_FUNC, c.t.s[scope], scope)
+      c.nsym[scope] = s
+      vals[c.t.s[scope]] = s
+  elif k == ast.N_FOR or k == ast.N_FORIN:
+    let init = c.t.a[scope]
+    if init >= 0 and c.t.k[init] == ast.N_VAR: declare_in(&c, &vals, &tys, init)
+  elif k == ast.N_TRY:
+    let cd = c.t.b[scope]
+    if cd >= 0:
+      var ids: [Int] = []
+      binding_ids(c, c.t.a[cd], &ids)
+      for id in ids:
+        let s = types.new_sym(&c, S_LET, c.t.s[id], cd)
+        c.nsym[id] = s
+        if c.t.k[c.t.a[cd]] == ast.N_ID: c.nsym[cd] = s
+        vals[c.t.s[id]] = s
+  elif k == ast.N_CLASSEXPR:
+    if c.t.s[scope] >= 0:
+      let s = types.new_sym(&c, S_CLASS, c.t.s[scope], scope)
+      c.nsym[scope] = s
+      vals[c.t.s[scope]] = s
+      tys[c.t.s[scope]] = s
+  c.locals[scope] = vals
+  c.ltypes[scope] = tys
+
+fn is_scope(c: C, n: Int) -> Bool:
+  let k = c.t.k[n]
+  if k == ast.N_BLOCK or k == ast.N_CASE or k == ast.N_FOR or k == ast.N_FORIN or k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET or k == ast.N_CLASSEXPR: return true
+  if k == ast.N_TRY: return true
+  if k == ast.N_LIST and c.t.d[n] == -2: return true
+  return false
+
+# A value name seen from node at: the innermost declaration, then the file, then the globals.
+fn lookup_value(var c: C, at: Int, name: Int) -> Int:
+  var n = at
+  var prev = at
+  while n >= 0:
+    if is_scope(c, n):
+      # a catch block's scope is the try's catch clause, only inside the catch block
+      if c.t.k[n] == ast.N_TRY and prev != c.t.c[n]:
+        prev = n
+        n = c.parent[n]
+        continue
+      # a function's parameters are visible inside it, not in its name
+      let is_file = c.t.k[n] == ast.N_LIST
+      if not is_file or file_is_module(&c, n):
+        scope_names(&c, n)
+        if name in c.locals[n]: return c.locals[n][name]
+    prev = n
+    n = c.parent[n]
+  if name in c.globals: return c.globals[name]
+  return -1
+
+fn file_is_module(var c: C, root: Int) -> Bool:
+  return root in c.locals or is_module(c, root)
+
+fn lookup_type(var c: C, at: Int, name: Int) -> Int:
+  var n = at
+  while n >= 0:
+    # type parameters of enclosing generic declarations
+    let tp = tparam_here(&c, n, name)
+    if tp >= 0: return tp
+    if is_scope(c, n):
+      let is_file = c.t.k[n] == ast.N_LIST
+      if not is_file or file_is_module(&c, n):
+        scope_names(&c, n)
+        if name in c.ltypes[n]: return c.ltypes[n][name]
+    n = c.parent[n]
+  if name in c.gtypes: return c.gtypes[name]
+  return -1
+
+# The type parameter list of a declaration node (-1 if none).
+fn tparams_of(c: C, n: Int) -> Int:
+  let k = c.t.k[n]
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_SIG or k == ast.N_INTERFACE or k == ast.N_CLASS or k == ast.N_CLASSEXPR or k == ast.N_TYPEALIAS: return c.t.a[n]
+  return -1
+
+fn tparam_here(var c: C, n: Int, name: Int) -> Int:
+  let tl = tparams_of(c, n)
+  if tl < 0: return -1
+  for tp in ast.items(c.t, tl):
+    if c.t.s[tp] == name: return tparam_sym(&c, tp)
+  return -1
+
+fn tparam_sym(var c: C, tp: Int) -> Int:
+  if tp in c.nsym: return c.nsym[tp]
+  let s = types.new_sym(&c, S_TPARAM, c.t.s[tp], tp)
+  c.nsym[tp] = s
+  let t = types.mk(&c, TK_TPARAM, types.F_TPARAM, s, 0)
+  c.sdtype[s] = t
+  return s
+
+fn tparam_types(var c: C, tl: Int) -> [Int]:
+  var out: [Int] = []
+  for tp in ast.items(c.t, tl):
+    let ts = tparam_sym(&c, tp)
+    out.push(c.sdtype[ts])
+  return out
+
+# ---- types from annotations
+
+fn type_from(var c: C, n: Int) -> Int:
+  if n < 0: return c.any_t
+  let k = c.t.k[n]
+  if k == ast.N_TKW: return kw_type(c, c.t.f[n])
+  if k == ast.N_TLIT: return literal_type(&c, c.t.a[n])
+  if k == ast.N_TPAREN: return type_from(&c, c.t.a[n])
+  if k == ast.N_TUNION:
+    var ts: [Int] = []
+    for m in ast.items(c.t, c.t.a[n]): ts.push(type_from(&c, m))
+    return types.union_of(&c, ts)
+  if k == ast.N_TINTER:
+    var ts: [Int] = []
+    for m in ast.items(c.t, c.t.a[n]): ts.push(type_from(&c, m))
+    return types.inter_of(&c, ts)
+  if k == ast.N_TARRAY:
+    let g1_35 = type_from(&c, c.t.a[n])
+    return array_of(&c, g1_35)
+  if k == ast.N_TREF: return type_ref(&c, n)
+  if k == ast.N_TFUNC:
+    if c.t.f[n] != 0: return unsupported(&c, n, "a constructor type")
+    let t = types.anon_obj(&c, -1, n)
+    let sg = sig_from(&c, c.t.b[n], n)
+    let o = c.ta[t]
+    c.objs[o].calls.push(sg)
+    c.objs[o].resolved = true
+    return t
+  if k == ast.N_TOBJ:
+    let t = types.anon_obj(&c, -1, n)
+    return t
+  if k == ast.N_TTUPLE:
+    let t = types.new_obj(&c, OK_TUPLE, -1, n)
+    let o = c.ta[t]
+    for e in ast.items(c.t, c.t.a[n]):
+      let ek = c.t.k[e]
+      if ek == ast.N_TOPTIONAL:
+        c.objs[o].args.push(type_from(&c, c.t.a[e]))
+        c.objs[o].eflags.push(1)
+      elif ek == ast.N_TREST or ek == ast.N_TTUPLEEL:
+        if ek == ast.N_TREST or (c.t.f[e] & ast.M_REST) != 0: return unsupported(&c, e, "a rest element in a tuple type")
+        c.objs[o].args.push(type_from(&c, c.t.a[e]))
+        if (c.t.f[e] & ast.M_OPTIONAL) != 0: c.objs[o].eflags.push(1)
+        else: c.objs[o].eflags.push(0)
+      else:
+        c.objs[o].args.push(type_from(&c, e))
+        c.objs[o].eflags.push(0)
+    return t
+  if k == ast.N_TOP:
+    let op = c.t.f[n]
+    if op == scan.W_READONLY:
+      let inner = c.t.a[n]
+      if c.t.k[inner] == ast.N_TARRAY:
+        let g2_35 = type_from(&c, c.t.a[inner])
+        return readonly_array_of(&c, g2_35)
+      return type_from(&c, inner)
+    if op == scan.W_UNIQUE: return c.symbol_t
+    return unsupported(&c, n, "keyof")
+  if k == ast.N_TQUERY:
+    let e = c.t.a[n]
+    if c.t.k[e] == ast.N_ID:
+      let s = lookup_value(&c, n, c.t.s[e])
+      if s < 0:
+        err(&c, e, 2304, "Cannot find name '" + nm(c, c.t.s[e]) + "'.")
+        return c.error_t
+      return type_of_sym(&c, s)
+    return unsupported(&c, n, "typeof with a qualified name")
+  if k == ast.N_TTHIS: return unsupported(&c, n, "the this type")
+  if k == ast.N_TPRED: return c.boolean_t
+  if k == ast.N_TINDEXED: return unsupported(&c, n, "an indexed access type")
+  if k == ast.N_TCOND: return unsupported(&c, n, "a conditional type")
+  if k == ast.N_TMAPPED: return unsupported(&c, n, "a mapped type")
+  if k == ast.N_TTEMPLATE: return unsupported(&c, n, "a template literal type")
+  if k == ast.N_TINFER: return unsupported(&c, n, "infer")
+  if k == ast.N_TIMPORT: return unsupported(&c, n, "an import type")
+  return unsupported(&c, n, "this type")
+
+fn kw_type(c: C, k: Int) -> Int:
+  if k == scan.W_ANY: return c.any_t
+  if k == scan.W_UNKNOWN: return c.unknown_t
+  if k == scan.W_NUMBER: return c.number_t
+  if k == scan.W_STRING: return c.string_t
+  if k == scan.W_BOOLEAN: return c.boolean_t
+  if k == scan.W_BIGINT: return c.bigint_t
+  if k == scan.W_SYMBOL: return c.symbol_t
+  if k == scan.W_OBJECT: return c.nonprim_t
+  if k == scan.W_NEVER: return c.never_t
+  if k == scan.W_UNDEFINED: return c.undef_t
+  if k == scan.W_VOID: return c.void_t
+  if k == scan.W_NULL: return c.null_t
+  return c.any_t
+
+# The value of a numeric literal's text (decimal, hex, octal, binary; with separators).
+fn num_value(s0: Str) -> Float:
+  let s = s0.replace("_", "")
+  if s.len > 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X' or s[1] == 'o' or s[1] == 'O' or s[1] == 'b' or s[1] == 'B'):
+    var base = 16.0
+    if s[1] == 'o' or s[1] == 'O': base = 8.0
+    if s[1] == 'b' or s[1] == 'B': base = 2.0
+    var v = 0.0
+    for i in 2..s.len: v = v * base + float(scan.hexval(s[i]))
+    return v
+  # legacy octal (017) isn't allowed in strict code; read as decimal
+  return float(s) else 0.0
+
+fn literal_type(var c: C, e: Int) -> Int:
+  let k = c.t.k[e]
+  if k == ast.N_STR or k == ast.N_NOSUBTEMPL: return types.str_lit(&c, c.t.s[e], false)
+  if k == ast.N_NUM: return types.num_lit(&c, num_value(c.t.names[c.t.s[e]]), false)
+  if k == ast.N_TRUE: return c.true_t
+  if k == ast.N_FALSE: return c.false_t
+  if k == ast.N_PREFIX and c.t.k[c.t.a[e]] == ast.N_NUM: return types.num_lit(&c, 0.0 - num_value(c.t.names[c.t.s[c.t.a[e]]]), false)
+  if k == ast.N_BIGINT: return unsupported(&c, e, "a bigint literal type")
+  return c.error_t
+
+fn global_type_sym(var c: C, name: Str) -> Int:
+  let id = ast.intern(&c.t, name)
+  if id in c.gtypes: return c.gtypes[id]
+  return -1
+
+fn array_of(var c: C, el: Int) -> Int:
+  let s = global_type_sym(&c, "Array")
+  if s < 0: return c.error_t
+  let h1_ = declared_type(&c, s)
+  return ref_of(&c, h1_, [el])
+
+fn readonly_array_of(var c: C, el: Int) -> Int:
+  let s = global_type_sym(&c, "ReadonlyArray")
+  if s < 0: return c.error_t
+  let h2_ = declared_type(&c, s)
+  return ref_of(&c, h2_, [el])
+
+fn type_ref(var c: C, n: Int) -> Int:
+  let nn = c.t.a[n]
+  if c.t.k[nn] != ast.N_ID: return unsupported(&c, n, "a qualified type name")
+  let name = c.t.s[nn]
+  let s = lookup_type(&c, n, name)
+  if s < 0:
+    err(&c, nn, 2304, "Cannot find name '" + nm(c, name) + "'.")
+    return c.error_t
+  var args: [Int] = []
+  for a in ast.items(c.t, c.t.b[n]): args.push(type_from(&c, a))
+  let sk = c.sk[s]
+  if (sk & S_TPARAM) != 0: return c.sdtype[s]
+  if (sk & S_ALIAS) != 0:
+    let d = c.sdecl[s]
+    let tl = c.t.a[d]
+    if tl < 0:
+      return declared_type(&c, s)
+    let tps = tparam_types(&c, tl)
+    let full = fill_defaults(&c, tl, args, n, nm(c, name))
+    if full.len != tps.len: return c.error_t
+    let body = declared_type(&c, s)
+    let m = types.new_mapper(&c, tps, full)
+    return instantiate(&c, body, m)
+  if (sk & (S_INTERFACE | S_CLASS)) != 0:
+    let dt = declared_type(&c, s)
+    let o = c.ta[dt]
+    let tps = types.ints(c.objs[o].tparams)
+    if tps.len == 0:
+      if args.len > 0:
+        err(&c, n, 2315, "Type '" + nm(c, name) + "' is not generic.")
+      return dt
+    let d = c.sdecl[s]
+    let full = fill_defaults(&c, c.t.a[d], args, n, nm(c, name))
+    if full.len != tps.len: return c.error_t
+    return ref_of(&c, dt, full)
+  if (sk & S_ENUM) != 0: return unsupported(&c, n, "an enum type")
+  if (sk & S_NAMESPACE) != 0: return unsupported(&c, n, "a namespace used as a type")
+  return unsupported(&c, n, "this kind of type name")
+
+# Type arguments with the defaults filled in; reports a wrong count (TS2314 / TS2707).
+fn fill_defaults(var c: C, tl: Int, args: [Int], at: Int, name: Str) -> [Int]:
+  let tps = ast.items(c.t, tl)
+  var minimum = 0
+  for tp in tps:
+    if c.t.b[tp] < 0: minimum += 1
+  var out: [Int] = []
+  for a in args: out.push(a)
+  if args.len < minimum or args.len > tps.len:
+    if minimum == tps.len: err(&c, at, 2314, "Generic type '" + name + "' requires {tps.len} type argument(s).")
+    else: err(&c, at, 2707, "Generic type '" + name + "' requires between {minimum} and {tps.len} type arguments.")
+    return []
+  for i in args.len..tps.len:
+    let tps_t = tparam_types(&c, tl)
+    var head: [Int] = []
+    for j in 0..i: head.push(tps_t[j])
+    let m = types.new_mapper(&c, head, out)
+    let h3_ = type_from(&c, c.t.b[tps[i]])
+    out.push(instantiate(&c, h3_, m))
+  return out
+
+# The type an interface, class or alias declares (for a generic one, with its own type parameters).
+fn declared_type(var c: C, s: Int) -> Int:
+  if c.sdtype[s] >= 0: return c.sdtype[s]
+  let sk = c.sk[s]
+  if (sk & S_ALIAS) != 0:
+    c.sdtype[s] = c.error_t      # a circular alias resolves to an error
+    let d = c.sdecl[s]
+    var t = type_from(&c, c.t.b[d])
+    # the alias's name is what messages show (a union gets its own copy that remembers it)
+    if c.t.a[d] < 0:
+      if c.tk[t] == TK_UNION and not (t in c.t_alias) and t != c.boolean_t:
+        let t2 = types.mk(&c, TK_UNION, types.F_UNION, c.ta[t], c.tb[t])
+        c.t_alias[t2] = s
+        t = t2
+      elif c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == OK_ANON and c.objs[c.ta[t]].node == c.t.b[d]:
+        c.t_alias[t] = s
+    c.sdtype[s] = t
+    return t
+  if (sk & (S_INTERFACE | S_CLASS)) != 0:
+    let t = types.new_obj(&c, OK_DECL, s, -1)
+    c.sdtype[s] = t
+    let o = c.ta[t]
+    let d = c.sdecl[s]
+    let tl = c.t.a[d]
+    if tl >= 0:
+      let tps = tparam_types(&c, tl)
+      c.objs[o].tparams = tps
+    return t
+  return c.error_t
+
+# A generic type with type arguments (cached, so Array<number> is always the same type).
+fn ref_of(var c: C, target: Int, args: [Int]) -> Int:
+  var key = "{target}"
+  for a in args: key += ",{a}"
+  if key in c.ref_cache: return c.ref_cache[key]
+  let o = c.ta[target]
+  let t = types.new_obj(&c, OK_REF, c.objs[o].sym, -1)
+  let ro = c.ta[t]
+  c.objs[ro].target = target
+  for a in args: c.objs[ro].args.push(a)
+  c.ref_cache[key] = t
+  return t
+
+# A signature from a declaration with type params (a), params (b) and a return type (c).
+fn sig_from(var c: C, sn: Int, decl: Int) -> Int:
+  let sg = types.new_sig(&c, decl)
+  if c.t.a[sn] >= 0: c.sigs[sg].tparams = tparam_types(&c, c.t.a[sn])
+  var min = 0
+  var i = 0
+  for p in ast.items(c.t, c.t.b[sn]):
+    let pn = c.t.a[p]
+    var name = 0
+    if c.t.k[pn] == ast.N_ID: name = c.t.s[pn]
+    else: name = ast.intern(&c.t, "__" + "{i}")
+    if name == ast.intern(&c.t, "this"):
+      c.sigs[sg].this_t = type_from(&c, c.t.b[p])
+      continue
+    var pt = c.any_t
+    if c.t.b[p] >= 0: pt = type_from(&c, c.t.b[p])
+    var fl = 0
+    if (c.t.f[p] & ast.M_OPTIONAL) != 0 or c.t.c[p] >= 0: fl = 1
+    if (c.t.f[p] & ast.M_REST) != 0: fl = 2
+    c.sigs[sg].pnames.push(name)
+    c.sigs[sg].ptypes.push(pt)
+    c.sigs[sg].pflags.push(fl)
+    if fl == 0: min = i + 1
+    i += 1
+  c.sigs[sg].min = min
+  if c.t.c[sn] >= 0: c.sigs[sg].ret = type_from(&c, c.t.c[sn])
+  return sg
+
+# ---- members of object types
+
+fn ensure_resolved(var c: C, t: Int):
+  let o = c.ta[t]
+  if c.objs[o].resolved: return
+  c.objs[o].resolved = true
+  let kind = c.objs[o].kind
+  if kind == OK_DECL: resolve_decl(&c, t)
+  elif kind == OK_ANON: resolve_anon(&c, t)
+
+fn member_name(var c: C, m: Int) -> Int:
+  let pn = c.t.a[m]
+  if pn < 0: return -1
+  let k = c.t.k[pn]
+  if k == ast.N_ID or k == ast.N_STR or k == ast.N_PRIVNAME: return c.t.s[pn]
+  if k == ast.N_NUM: return ast.intern(&c.t, types.num_text(num_value(c.t.names[c.t.s[pn]])))
+  return -1
+
+# Members from a list of member nodes (an interface's, a type literal's, a class's) into object type t.
+fn add_members(var c: C, t: Int, members: Int, owner: Int, statics: Bool):
+  let o = c.ta[t]
+  for m in ast.items(c.t, members):
+    let k = c.t.k[m]
+    let mf = c.t.f[m]
+    let is_static = (mf & ast.M_STATIC) != 0
+    if k == ast.N_CALLSIG:
+      if not statics: c.objs[o].calls.push(sig_from(&c, c.t.b[m], m))
+      continue
+    if k == ast.N_CTORSIG:
+      if not statics: c.objs[o].ctors.push(sig_from(&c, c.t.b[m], m))
+      continue
+    if k == ast.N_INDEXSIG:
+      if is_static != statics: continue
+      let ps = ast.items(c.t, c.t.a[m])
+      if ps.len == 1:
+        let kt = type_from(&c, c.t.b[ps[0]])
+        let vt = type_from(&c, c.t.b[m])
+        if c.tk[kt] == TK_STRING: c.objs[o].sidx = vt
+        elif c.tk[kt] == TK_NUMBER: c.objs[o].nidx = vt
+      continue
+    if k == ast.N_CTOR or k == ast.N_STATICBLOCK or k == ast.N_SEMIMEMBER: continue
+    if is_static != statics: continue
+    let name = member_name(&c, m)
+    if name < 0:
+      continue                       # computed names (Symbol.iterator...) aren't modeled yet
+    if name in c.objs[o].props:
+      let existing = c.objs[o].props[name]
+      if c.sparent[existing] == owner:
+        # overloads of a method, or a getter and its setter
+        types.add_decl(&c, existing, m)
+        continue
+    var sk = S_PROP
+    if k == ast.N_METHOD: sk = S_METHOD
+    elif k == ast.N_GET or k == ast.N_SET: sk = S_ACCESSOR
+    let s = types.new_sym(&c, sk, name, m)
+    c.sparent[s] = owner
+    var fl = 0
+    if (mf & ast.M_OPTIONAL) != 0: fl = fl | SF_OPTIONAL
+    if (mf & ast.M_READONLY) != 0: fl = fl | SF_READONLY
+    if is_static: fl = fl | SF_STATIC
+    c.sflags[s] = fl
+    types.add_prop(&c, t, name, s)
+
+fn resolve_anon(var c: C, t: Int):
+  let o = c.ta[t]
+  let n = c.objs[o].node
+  if n < 0: return
+  if c.t.k[n] == ast.N_TOBJ: add_members(&c, t, c.t.a[n], -2 - n, false)
+
+fn resolve_decl(var c: C, t: Int):
+  let o = c.ta[t]
+  let s = c.objs[o].sym
+  for d in types.sym_decls(c, s):
+    let k = c.t.k[d]
+    if k == ast.N_INTERFACE: add_members(&c, t, c.t.c[d], s, false)
+    elif k == ast.N_CLASS: unsupported(&c, d, "a class")
+  # inherited members: from each base, what isn't declared here
+  for d in types.sym_decls(c, s):
+    if c.t.k[d] != ast.N_INTERFACE: continue
+    for h in ast.items(c.t, c.t.b[d]):
+      let base = heritage_type(&c, h)
+      if c.tk[base] != TK_OBJ: continue
+      for name in prop_names(&c, base):
+        if not (name in c.objs[o].props):
+          let ps = get_prop(&c, base, name)
+          if ps >= 0: types.add_prop(&c, t, name, ps)
+      let bo = c.ta[base]
+      if c.objs[o].calls.len == 0:
+        for sg in sigs_of(&c, base, false): c.objs[o].calls.push(sg)
+      if c.objs[o].ctors.len == 0:
+        for sg in sigs_of(&c, base, true): c.objs[o].ctors.push(sg)
+      if c.objs[o].sidx < 0: c.objs[o].sidx = index_type(&c, base, false)
+      if c.objs[o].nidx < 0: c.objs[o].nidx = index_type(&c, base, true)
+
+fn heritage_type(var c: C, h: Int) -> Int:
+  let e = c.t.a[h]
+  if c.t.k[e] != ast.N_ID: return unsupported(&c, h, "a qualified base type")
+  let s = lookup_type(&c, h, c.t.s[e])
+  if s < 0:
+    err(&c, e, 2304, "Cannot find name '" + nm(c, c.t.s[e]) + "'.")
+    return c.error_t
+  var args: [Int] = []
+  for a in ast.items(c.t, c.t.b[h]): args.push(type_from(&c, a))
+  if (c.sk[s] & (S_INTERFACE | S_CLASS)) == 0:
+    if (c.sk[s] & S_ALIAS) != 0 and args.len == 0: return declared_type(&c, s)
+    return unsupported(&c, h, "this base type")
+  let dt = declared_type(&c, s)
+  let o = c.ta[dt]
+  if c.objs[o].tparams.len == 0: return dt
+  let full = fill_defaults(&c, c.t.a[c.sdecl[s]], args, h, nm(c, c.t.s[e]))
+  if full.len != c.objs[o].tparams.len: return c.error_t
+  return ref_of(&c, dt, full)
+
+# The property names of an object type, in order.
+fn prop_names(var c: C, t: Int) -> [Int]:
+  var out: [Int] = []
+  if c.tk[t] != TK_OBJ: return out
+  let o = c.ta[t]
+  let kind = c.objs[o].kind
+  if kind == OK_REF or kind == OK_INST:
+    return prop_names(&c, c.objs[o].target)
+  if kind == OK_TUPLE:
+    for i in 0..c.objs[o].args.len: out.push(ast.intern(&c.t, "{i}"))
+    let h4_ = tuple_elem_union(&c, t)
+    let arr = array_of(&c, h4_)
+    for nmid in prop_names(&c, arr): out.push(nmid)
+    return out
+  ensure_resolved(&c, t)
+  for x in types.ints(c.objs[o].order): out.push(x)
+  return out
+
+fn tuple_elem_union(var c: C, t: Int) -> Int:
+  let o = c.ta[t]
+  var ts: [Int] = []
+  for i in 0..c.objs[o].args.len:
+    ts.push(c.objs[o].args[i])
+  return types.union_of(&c, ts)
+
+# The property symbol of an object type's member name (-1 if none). For instantiated types the
+# property is a new symbol whose type is the instantiated type.
+fn get_prop(var c: C, t: Int, name: Int) -> Int:
+  if c.tk[t] != TK_OBJ: return -1
+  let key = "{t}:{name}"
+  if key in c.prop_cache: return c.prop_cache[key]
+  let o = c.ta[t]
+  let kind = c.objs[o].kind
+  var r = -1
+  if kind == OK_DECL or kind == OK_ANON:
+    ensure_resolved(&c, t)
+    if name in c.objs[o].props: r = c.objs[o].props[name]
+  elif kind == OK_REF or kind == OK_INST:
+    let target = c.objs[o].target
+    let base = get_prop(&c, target, name)
+    if base >= 0:
+      var m = c.objs[o].mapper
+      if kind == OK_REF:
+        let to = c.ta[target]
+        m = types.new_mapper(&c, types.ints(c.objs[to].tparams), types.ints(c.objs[o].args))
+      r = types.new_sym(&c, c.sk[base], name, c.sdecl[base])
+      c.sparent[r] = c.sparent[base]
+      c.sflags[r] = c.sflags[base]
+      if base in c.smore:
+        var more: [Int] = []
+        for d in types.ints(c.smore[base]): more.push(d)
+        c.smore[r] = more
+      let h5_ = type_of_sym(&c, base)
+      c.stype[r] = instantiate(&c, h5_, m)
+  elif kind == OK_TUPLE:
+    let s = c.t.names[name]
+    let idx = int(s) else -1
+    if idx >= 0 and idx < c.objs[o].args.len and "{idx}" == s:
+      r = types.new_sym(&c, S_PROP, name, -1)
+      c.stype[r] = c.objs[o].args[idx]
+      if c.objs[o].eflags[idx] == 1: c.sflags[r] = SF_OPTIONAL
+    else:
+      let g1_4 = tuple_elem_union(&c, t)
+      let h6_ = array_of(&c, g1_4)
+      r = get_prop(&c, h6_, name)
+  c.prop_cache[key] = r
+  return r
+
+fn sigs_of(var c: C, t: Int, ctor: Bool) -> [Int]:
+  var out: [Int] = []
+  if c.tk[t] != TK_OBJ: return out
+  let o = c.ta[t]
+  let kind = c.objs[o].kind
+  if kind == OK_REF or kind == OK_INST:
+    let target = c.objs[o].target
+    var m = c.objs[o].mapper
+    if kind == OK_REF:
+      let to = c.ta[target]
+      m = types.new_mapper(&c, types.ints(c.objs[to].tparams), types.ints(c.objs[o].args))
+    for sg in sigs_of(&c, target, ctor): out.push(inst_sig(&c, sg, m))
+    return out
+  ensure_resolved(&c, t)
+  if ctor:
+    for sg in types.ints(c.objs[o].ctors): out.push(sg)
+  else:
+    for sg in types.ints(c.objs[o].calls): out.push(sg)
+  return out
+
+fn index_type(var c: C, t: Int, number: Bool) -> Int:
+  if c.tk[t] != TK_OBJ: return -1
+  let o = c.ta[t]
+  let kind = c.objs[o].kind
+  if kind == OK_REF or kind == OK_INST:
+    let target = c.objs[o].target
+    let it = index_type(&c, target, number)
+    if it < 0: return -1
+    var m = c.objs[o].mapper
+    if kind == OK_REF:
+      let to = c.ta[target]
+      m = types.new_mapper(&c, types.ints(c.objs[to].tparams), types.ints(c.objs[o].args))
+    return instantiate(&c, it, m)
+  if kind == OK_TUPLE:
+    if number: return tuple_elem_union(&c, t)
+    return -1
+  ensure_resolved(&c, t)
+  if number: return c.objs[o].nidx
+  return c.objs[o].sidx
+
+# ---- the type of a symbol (a value's type)
+
+fn type_of_sym(var c: C, s: Int) -> Int:
+  if c.stype[s] >= 0: return c.stype[s]
+  if c.stype[s] == -2:
+    return c.any_t          # circular: TypeScript reports TS7022; treated as any here
+  c.stype[s] = -2
+  let t = compute_sym_type(&c, s)
+  c.stype[s] = t
+  return t
+
+# Filled in by the expression checker (it knows initializers); set at start.
+fn compute_sym_type(var c: C, s: Int) -> Int:
+  let sk = c.sk[s]
+  let d = c.sdecl[s]
+  if d < 0: return c.any_t
+  if (sk & (S_VAR | S_LET | S_CONST | S_PARAM | S_FUNC)) != 0: return chk.decl_type(&c, s)
+  let k = c.t.k[d]
+  if (sk & (S_PROP | S_ACCESSOR)) != 0:
+    if k == ast.N_PROP:
+      if c.t.b[d] < 0: return c.any_t
+      let pt = type_from(&c, c.t.b[d])
+      return pt
+    if k == ast.N_GET: return type_from_or_any(&c, c.t.c[c.t.b[d]])
+    if k == ast.N_SET:
+      let ps = ast.items(c.t, c.t.b[c.t.b[d]])
+      if ps.len > 0: return type_from_or_any(&c, c.t.b[ps[0]])
+    return c.any_t
+  if (sk & S_METHOD) != 0:
+    let t = types.anon_obj(&c, -1, d)
+    let o = c.ta[t]
+    for md in types.sym_decls(c, s):
+      c.objs[o].calls.push(sig_from(&c, c.t.b[md], md))
+    c.objs[o].resolved = true
+    return t
+  if (sk & S_NAMESPACE) != 0: return unsupported(&c, d, "a namespace")
+  if (sk & S_ENUM) != 0: return unsupported(&c, d, "an enum")
+  if (sk & S_CLASS) != 0: return unsupported(&c, d, "a class")
+  return c.any_t
+
+fn type_from_or_any(var c: C, n: Int) -> Int:
+  if n < 0: return c.any_t
+  return type_from(&c, n)
+
+# ---- instantiation
+
+fn map_tparam(c: C, t: Int, m: Int) -> Int:
+  let mp = types.mapper_copy(c, m)
+  for i in 0..mp.from.len:
+    if mp.from[i] == t: return mp.to[i]
+  return t
+
+fn instantiate(var c: C, t: Int, m: Int) -> Int:
+  if m < 0: return t
+  let k = c.tk[t]
+  if k == TK_TPARAM: return map_tparam(c, t, m)
+  if k == TK_UNION or k == TK_INTER:
+    var ts: [Int] = []
+    var changed = false
+    for x in types.members(c, t):
+      let y = instantiate(&c, x, m)
+      if y != x: changed = true
+      ts.push(y)
+    if not changed: return t
+    if k == TK_UNION: return types.union_of(&c, ts)
+    return types.inter_of(&c, ts)
+  if k != TK_OBJ: return t
+  let key = "{t}:{m}"
+  if key in c.inst_cache: return c.inst_cache[key]
+  let o = c.ta[t]
+  let kind = c.objs[o].kind
+  var r = t
+  if kind == OK_REF:
+    var args: [Int] = []
+    var changed = false
+    for a in types.ints(c.objs[o].args):
+      let b = instantiate(&c, a, m)
+      if b != a: changed = true
+      args.push(b)
+    if changed: r = ref_of(&c, c.objs[o].target, args)
+  elif kind == OK_TUPLE:
+    var args: [Int] = []
+    var changed = false
+    for a in types.ints(c.objs[o].args):
+      let b = instantiate(&c, a, m)
+      if b != a: changed = true
+      args.push(b)
+    if changed:
+      r = types.new_obj(&c, OK_TUPLE, -1, c.objs[o].node)
+      let ro = c.ta[r]
+      for a in args: c.objs[ro].args.push(a)
+      for f in types.ints(c.objs[o].eflags): c.objs[ro].eflags.push(f)
+  elif kind == OK_ANON:
+    if mentions_tparams(&c, t):
+      r = types.new_obj(&c, OK_INST, -1, c.objs[o].node)
+      let ro = c.ta[r]
+      c.objs[ro].target = t
+      c.objs[ro].mapper = m
+      c.objs[ro].resolved = true
+  elif kind == OK_INST:
+    # compose: the inner mapper, then m
+    let inner = c.objs[o].mapper
+    let mp = types.mapper_copy(c, inner)
+    var to: [Int] = []
+    for x in mp.to: to.push(instantiate(&c, x, m))
+    let m2 = types.new_mapper(&c, mp.from, to)
+    r = instantiate(&c, c.objs[o].target, m2)
+  c.inst_cache[key] = r
+  return r
+
+# Whether an anonymous object type could contain type parameters (conservatively yes for type literals
+# and function types written inside a generic declaration).
+fn mentions_tparams(var c: C, t: Int) -> Bool:
+  let o = c.ta[t]
+  let n = c.objs[o].node
+  if n < 0: return false
+  var p = c.parent[n]
+  while p >= 0:
+    if tparams_of(c, p) >= 0: return true
+    p = c.parent[p]
+  return c.t.k[n] == ast.N_TFUNC and c.t.a[c.t.b[n]] >= 0
+
+fn inst_sig(var c: C, sg: Int, m: Int) -> Int:
+  let s = types.sig_copy(c, sg)
+  let r = types.new_sig(&c, s.node)
+  for x in s.tparams: c.sigs[r].tparams.push(x)
+  for x in s.pnames: c.sigs[r].pnames.push(x)
+  for x in s.ptypes: c.sigs[r].ptypes.push(instantiate(&c, x, m))
+  for x in s.pflags: c.sigs[r].pflags.push(x)
+  c.sigs[r].min = s.min
+  if s.ret >= 0: c.sigs[r].ret = instantiate(&c, s.ret, m)
+  if s.this_t >= 0: c.sigs[r].this_t = instantiate(&c, s.this_t, m)
+  return r

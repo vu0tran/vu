@@ -1,0 +1,141 @@
+# vtsc: a TypeScript type checker. Prints what `tsc --noEmit --strict --pretty false` prints (each
+# error's first line), for the files given, with TypeScript's own lib files (lib.es2025.full.d.ts and
+# what it references, as TypeScript 7 loads by default).
+#
+#   vtsc [--lib DIR] FILE.ts...
+#
+# A file using something the checker doesn't model yet is listed as unsupported instead of checked.
+
+import scan
+import ast
+import parse
+import types
+import bind
+import chk
+
+fn lib_dir(fs: Fs, os: Os) -> Str:
+  let env = os.env("VTSC_LIB")
+  if env != "": return env
+  for cand in ["node_modules/typescript/lib", "node_modules/@typescript/typescript-linux-x64/lib"]:
+    if fs.exists(cand + "/lib.es5.d.ts"): return cand
+  return ""
+
+# The lib files a root lib references (/// <reference lib="x" />), each once, references first.
+fn lib_files(fs: Fs, dir: Str, name: Str, var seen: {Str: Bool}, var out: [Str]):
+  if name in seen: return
+  seen[name] = true
+  let path = dir + "/lib." + name + ".d.ts"
+  let src = fs.read(path) else ""
+  for line in src.split("\n"):
+    let l = line.strip()
+    if not l.startswith("///"): continue
+    let at = l.find("lib=\"")
+    if at < 0: continue
+    let rest = l[at + 5..l.len]
+    let q = rest.find("\"")
+    if q > 0: lib_files(fs, dir, rest[0..q], &seen, &out)
+  out.push(path)
+
+# Line and column (1-based; the column counts UTF-16 code units, as TypeScript does).
+fn line_col(src: Str, pos: Int) -> [Int]:
+  var line = 1
+  var col = 1
+  var i = 0
+  while i < pos and i < src.len:
+    let ch = src[i]
+    if ch == '\n':
+      line += 1
+      col = 1
+      i += 1
+    elif ch < 0x80:
+      col += 1
+      i += 1
+    elif ch >= 0xF0:
+      col += 2
+      i += 4
+    elif ch >= 0xE0:
+      col += 1
+      i += 3
+    else:
+      col += 1
+      i += 2
+  return [line, col]
+
+fn main(fs: Fs, os: Os) throws:
+  var files: [Str] = []
+  var dir = ""
+  var timing = false
+  var i = 1
+  while i < args().len:
+    let a = args()[i]
+    if a == "--lib" and i + 1 < args().len:
+      dir = args()[i + 1]
+      i += 2
+      continue
+    if a == "--time":
+      timing = true
+      i += 1
+      continue
+    files.push(a + "")
+    i += 1
+  if dir == "": dir = lib_dir(fs, os)
+  if dir == "": fail "can't find TypeScript's lib files: pass --lib DIR (node_modules/typescript/lib) or set VTSC_LIB"
+  let t0 = os.clock()
+  var seen: {Str: Bool} = {}
+  var libs: [Str] = []
+  lib_files(fs, dir, "es2025.full", &seen, &libs)
+  let kw = scan.keywords()
+  var t = ast.new_ast()
+  var srcs: [Str] = [""]
+  var roots: [Int] = [0]
+  var names: [Str] = [""]
+  var pdiags: [parse.Diag] = []
+  for path in libs:
+    let src = fs.read(path)?
+    let fi = srcs.len
+    parse.parse_file(&t, src + "", fi, kw)
+    srcs.push(src)
+    names.push(path + "")
+    roots.push(t.k.len - 1)
+  let user_from = srcs.len
+  for path in files:
+    let src = fs.read(path)?
+    let fi = srcs.len
+    let ds = parse.parse_file(&t, src + "", fi, kw)
+    for d in ds: pdiags.push(parse.Diag(d.file, d.pos, d.end, d.code, d.msg + ""))
+    srcs.push(src)
+    names.push(path + "")
+    roots.push(t.k.len - 1)
+  let t1 = os.clock()
+  var c = types.new_checker(t)
+  c.user_from = user_from
+  bind.link_parents(&c)
+  for fi in 1..roots.len:
+    let root = roots[fi]
+    if fi < user_from or not bind.is_module(c, root): bind.declare_globals(&c, root)
+  let t2 = os.clock()
+  for fi in user_from..roots.len:
+    c.node_file = fi
+    chk.check_file(&c, roots[fi])
+  let t3 = os.clock()
+  # report: syntax errors, then the checker's, by file and position (as tsc sorts them)
+  var all: [parse.Diag] = []
+  for d in pdiags: all.push(parse.Diag(d.file, d.pos, d.end, d.code, d.msg + ""))
+  var has_syntax: {Int: Bool} = {}
+  for d in pdiags: has_syntax[d.file] = true
+  for d in c.diags:
+    if d.file in c.unsupported: continue
+    if d.file in has_syntax: continue
+    all.push(parse.Diag(d.file, d.pos, d.end, d.code, d.msg + ""))
+  all.sort(by: fn(a, b) => a.file < b.file or (a.file == b.file and a.pos < b.pos) or (a.file == b.file and a.pos == b.pos and a.code < b.code))
+  var last = ""
+  for d in all:
+    let lc = line_col(srcs[d.file], d.pos)
+    let line = names[d.file] + "({lc[0]},{lc[1]}): error TS{d.code}: " + d.msg
+    if line == last: continue
+    print(line)
+    last = line + ""
+  for fi in user_from..roots.len:
+    if fi in c.unsupported: eprint("vtsc: " + names[fi] + ": not checked: uses " + c.unsupported[fi])
+  if timing: eprint("vtsc: parse {(t1 - t0) * 1000.0:.1} ms, bind {(t2 - t1) * 1000.0:.1} ms, check {(t3 - t2) * 1000.0:.1} ms")
+  if all.len > 0: exit(2)
