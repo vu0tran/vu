@@ -98,6 +98,8 @@ fn op_text(op: Int) -> Str:
   if op == T_GT: return ">"
   if op == T_LE: return "<="
   if op == T_GE: return ">="
+  if op == T_AND: return "&&"
+  if op == T_OR: return "||"
   if op == scan.W_IN: return "in"
   if op == scan.W_INSTANCEOF: return "instanceof"
   return parse.tok_text(op)
@@ -162,6 +164,7 @@ fn lint(path: Str, src: Str, var kw: {Str: Int}) -> [Str]:
   l.jl.push(-1)
   l.jused.push(false)
   ur_list(&l, root, true)
+  irregular_whitespace(&l)
   visit(&l, root)
   scope_rules(&l)
   if l.fatal != "":
@@ -458,7 +461,7 @@ fn visit_function(var l: L, n: Int, kd: Int):
 
 fn check(var l: L, n: Int, kd: Int):
   # (the commonest kinds have no rules)
-  if kd == ast.N_ID or kd == ast.N_NUM or kd == ast.N_PARAM or kd == ast.N_TREF or kd == ast.N_TKW or kd == ast.N_BLOCK or kd == ast.N_PROPASSIGN or kd == ast.N_VAR or kd == ast.N_THIS: return
+  if kd == ast.N_ID or kd == ast.N_PARAM or kd == ast.N_TREF or kd == ast.N_TKW or kd == ast.N_BLOCK or kd == ast.N_PROPASSIGN or kd == ast.N_VAR or kd == ast.N_THIS: return
   if kd == ast.N_DEBUGGER:
     add(&l, l.t.pos[n], "eslint(no-debugger)", "`debugger` statement is not allowed", "Remove the debugger statement")
   elif kd == ast.N_WITH:
@@ -533,6 +536,7 @@ fn check(var l: L, n: Int, kd: Int):
   elif kd == ast.N_OBJECT: dupe_keys(&l, n)
   elif kd == ast.N_CLASS or kd == ast.N_CLASSEXPR:
     dupe_class_members(&l, n)
+    private_members(&l, n)
     if l.t.b[n] > 0: ctor_super(&l, n)
     let ext = l.t.b[n]
     if ext > 0: unsafe_chain(&l, l.t.a[ext])
@@ -554,6 +558,7 @@ fn check(var l: L, n: Int, kd: Int):
     unsafe_chain_obj(&l, l.t.a[n])
     l.tagged[l.t.c[n]] = true
   elif kd == ast.N_REGEX: regex_literal(&l, n)
+  elif kd == ast.N_NUM: loss_of_precision(&l, n)
   elif kd == ast.N_STR: string_escapes(&l, n)
   elif kd == ast.N_NOSUBTEMPL or kd == ast.N_TEMPL:
     if not (n in l.tagged): template_escapes(&l, n)
@@ -621,6 +626,18 @@ fn check_binary(var l: L, n: Int):
   if op == T_ASSIGN or op == scan.T_ANDEQ or op == scan.T_OREQ or op == scan.T_QQEQ:
     self_assign(&l, a, b)
   if op == T_ASSIGN and is_pattern_expr(l, a): unsafe_chain(&l, b)
+  if op == T_LT or op == T_GT or op == T_LE or op == T_GE:
+    if is_literal(k(l, unparen(l, a))) and is_literal(k(l, unparen(l, b))):
+      add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected constant relational comparison", "Both sides of the {op_text(op)} are literal values")
+  if is_eq_op(op):
+    const_binary(&l, n, op, a, b)
+    bad_literal_cmp(&l, n, op, a, b)
+  elif op == T_AND or op == T_OR:
+    if is_constant(l, a, true):
+      add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected constant truthiness on the left-hand side of a \"{op_text(op)}\" expression", "This expression always evaluates to the constant on the left-hand side")
+  elif op == T_QQ:
+    if const_nullish(l, a, false):
+      add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected constant nullishness on the left-hand side of a \"??\" expression", "This expression always evaluates to the constant on the left-hand side")
   if is_assign_op(op): ns_import_write(&l, n, a)
   if op == T_ASSIGN:
     let ua = unparen(l, a)
@@ -659,6 +676,9 @@ fn is_nan(l: L, n: Int) -> Bool:
 
 fn valid_typeof(var l: L, n: Int):
   let kd = k(l, n)
+  if kd == ast.N_ID and name_of(l, n) == "undefined" and is_global(l, n):
+    add(&l, l.t.pos[n], "eslint(valid-typeof)", "Invalid `typeof` comparison value.", "Use `\"undefined\"` instead of `undefined`.")
+    return
   if kd != ast.N_STR and kd != ast.N_NOSUBTEMPL: return
   let v = name_of(l, n)
   for ok in ["symbol", "undefined", "object", "boolean", "number", "string", "function", "bigint"]:
@@ -2285,3 +2305,555 @@ fn cs_stmt(var l: L, n: Int, st: Int) -> Int:
   if kd == ast.N_FUNC or kd == ast.N_CLASS: return st
   if cs_check_this(&l, n, st): return 2
   return st
+
+# ---- no-constant-binary-expression
+
+fn null_or_undef(l: L, n: Int) -> Bool:
+  let x = unparen(l, n)
+  let kd = k(l, x)
+  if kd == ast.N_NULL or kd == ast.N_VOIDEXPR: return true
+  return kd == ast.N_ID and name_of(l, x) == "undefined" and is_global(l, x)
+
+fn global_call(l: L, n: Int, names: [Str]) -> Bool:
+  if k(l, n) != ast.N_CALL: return false
+  let c = l.t.a[n]
+  if k(l, c) != ast.N_ID or not is_global(l, c): return false
+  let nm = name_of(l, c)
+  for x in names:
+    if nm == x: return true
+  return false
+
+fn bool_call_const(l: L, n: Int) -> Bool:
+  let args = l.t.c[n]
+  return ast.count(l.t, args) == 0 or is_constant(l, ast.item(l.t, args, 0), true)
+
+fn last_of_seq(l: L, n: Int) -> Int:
+  var x = n
+  while is_bin(l, x, T_COMMA): x = unparen(l, l.t.b[x])
+  return x
+
+fn const_nullish(l: L, n0: Int, non_nullish: Bool) -> Bool:
+  let n = unparen(l, n0)
+  if non_nullish and null_or_undef(l, n): return false
+  let kd = k(l, n)
+  if kd == ast.N_OBJECT or kd == ast.N_ARRAY or kd == ast.N_ARROW or kd == ast.N_FUNCEXPR or kd == ast.N_CLASSEXPR or kd == ast.N_NEW or is_literal(kd) or kd == ast.N_TEMPL or kd == ast.N_NOSUBTEMPL or kd == ast.N_POSTFIX: return true
+  if kd == ast.N_PREFIX or kd == ast.N_TYPEOF or kd == ast.N_VOIDEXPR or kd == ast.N_DELETE: return true
+  if kd == ast.N_CALL: return global_call(l, n, ["Boolean", "String", "Number"])
+  if kd == ast.N_BINARY:
+    let op = l.t.f[n]
+    if op == T_QQ: return const_nullish(l, l.t.b[n], true)
+    if op == T_AND or op == T_OR: return false
+    if op == T_ASSIGN: return const_nullish(l, l.t.b[n], non_nullish)
+    if op == scan.T_ANDEQ or op == scan.T_OREQ or op == scan.T_QQEQ: return false
+    if op == T_COMMA: return const_nullish(l, last_of_seq(l, n), non_nullish)
+    return true
+  if kd == ast.N_ID: return name_of(l, n) == "undefined" and is_global(l, n)
+  return false
+
+fn static_boolean(l: L, n0: Int) -> Bool:
+  let n = unparen(l, n0)
+  let kd = k(l, n)
+  if kd == ast.N_TRUE or kd == ast.N_FALSE: return true
+  if global_call(l, n, ["Boolean"]): return bool_call_const(l, n)
+  if is_not(l, n): return is_constant(l, l.t.a[n], true)
+  return false
+
+fn const_loose_bool(l: L, n0: Int) -> Bool:
+  let n = unparen(l, n0)
+  let kd = k(l, n)
+  if kd == ast.N_OBJECT or kd == ast.N_CLASSEXPR or kd == ast.N_ARROW or kd == ast.N_FUNCEXPR or is_literal(kd): return true
+  if kd == ast.N_ARRAY:
+    let lst = l.t.a[n]
+    let cnt = ast.count(l.t, lst)
+    var ns = 0
+    for i in 0..cnt:
+      let e = ast.item(l.t, lst, i)
+      if k(l, e) != ast.N_OMIT and k(l, e) != ast.N_SPREAD: ns += 1
+    return cnt == 0 or ns > 1
+  if kd == ast.N_VOIDEXPR or kd == ast.N_TYPEOF: return true
+  if is_not(l, n): return is_constant(l, l.t.a[n], true)
+  if kd == ast.N_CALL: return global_call(l, n, ["Boolean"]) and bool_call_const(l, n)
+  if kd == ast.N_ID: return name_of(l, n) == "undefined" and is_global(l, n)
+  if kd == ast.N_NOSUBTEMPL: return true
+  if kd == ast.N_BINARY:
+    if l.t.f[n] == T_ASSIGN: return const_loose_bool(l, l.t.b[n])
+    if l.t.f[n] == T_COMMA: return const_loose_bool(l, last_of_seq(l, n))
+  return false
+
+fn const_strict_bool(l: L, n0: Int) -> Bool:
+  let n = unparen(l, n0)
+  let kd = k(l, n)
+  if kd == ast.N_OBJECT or kd == ast.N_ARRAY or kd == ast.N_ARROW or kd == ast.N_FUNCEXPR or kd == ast.N_CLASSEXPR or kd == ast.N_NEW or kd == ast.N_TEMPL or kd == ast.N_NOSUBTEMPL or is_literal(kd) or kd == ast.N_POSTFIX: return true
+  if kd == ast.N_BINARY:
+    let op = l.t.f[n]
+    if op == T_ASSIGN: return const_strict_bool(l, l.t.b[n])
+    if op == scan.T_ANDEQ or op == scan.T_OREQ or op == scan.T_QQEQ: return false
+    if is_assign_op(op): return true
+    if op == T_COMMA: return const_strict_bool(l, last_of_seq(l, n))
+    return op == T_PLUS or op == T_MINUS or op == scan.T_STAR or op == scan.T_SLASH or op == scan.T_PCT or op == scan.T_BAR or op == scan.T_CARET or op == scan.T_AMP or op == scan.T_STAR2 or op == scan.T_SHL or op == scan.T_SHR or op == scan.T_SHRU
+  if kd == ast.N_DELETE: return false
+  if is_not(l, n): return is_constant(l, l.t.a[n], true)
+  if kd == ast.N_PREFIX or kd == ast.N_TYPEOF or kd == ast.N_VOIDEXPR: return true
+  if kd == ast.N_ID: return name_of(l, n) == "undefined" and is_global(l, n)
+  if kd == ast.N_CALL:
+    if global_call(l, n, ["String", "Number"]): return true
+    if global_call(l, n, ["Boolean"]): return bool_call_const(l, n)
+  return false
+
+fn always_new(l: L, n0: Int) -> Bool:
+  let n = unparen(l, n0)
+  let kd = k(l, n)
+  if kd == ast.N_OBJECT or kd == ast.N_ARRAY or kd == ast.N_ARROW or kd == ast.N_FUNCEXPR or kd == ast.N_CLASSEXPR or kd == ast.N_REGEX: return true
+  if kd == ast.N_NEW:
+    let c = l.t.a[n]
+    return k(l, c) == ast.N_ID and is_global(l, c) and (readonly_global(name_of(l, c)) or name_of(l, c) == "Iterator")
+  if kd == ast.N_BINARY:
+    if l.t.f[n] == T_ASSIGN: return always_new(l, l.t.b[n])
+    if l.t.f[n] == T_COMMA: return always_new(l, last_of_seq(l, n))
+  if kd == ast.N_COND: return always_new(l, l.t.b[n]) and always_new(l, l.t.c[n])
+  return false
+
+fn constant_operand(l: L, a: Int, b: Int, op: Int) -> Bool:
+  if op == T_EQ2 or op == T_NE:
+    return (null_or_undef(l, a) and const_nullish(l, b, false)) or (static_boolean(l, a) and const_loose_bool(l, b))
+  return (null_or_undef(l, a) and const_nullish(l, b, false)) or (static_boolean(l, a) and const_strict_bool(l, b))
+
+fn const_binary(var l: L, n: Int, op: Int, a: Int, b: Int):
+  let ot = op_text(op)
+  if constant_operand(l, a, b, op):
+    add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected constant binary expression", "This compares constantly with the left-hand side of the {ot}")
+  elif constant_operand(l, b, a, op):
+    add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected constant binary expression", "This compares constantly with the right-hand side of the {ot}")
+  elif op == T_EQ3 or op == T_NE2:
+    if always_new(l, a) or always_new(l, b):
+      add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected comparison to newly constructed object", "These two values can never be equal")
+  elif always_new(l, a) and always_new(l, b):
+    add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected comparison of two newly constructed objects", "These two values can never be equal")
+
+# oxc(bad-object-literal-comparison): comparing with {} or []
+fn bad_literal_cmp(var l: L, n: Int, op: Int, a: Int, b: Int):
+  var what = ""
+  for side in [a, b]:
+    if what != "": break
+    if k(l, side) == ast.N_OBJECT and ast.count(l.t, l.t.a[side]) == 0: what = "object"
+    elif k(l, side) == ast.N_ARRAY and ast.count(l.t, l.t.a[side]) == 0: what = "array"
+  if what == "": return
+  var res = "false"
+  if op == T_NE or op == T_NE2: res = "true"
+  if what == "object":
+    add(&l, l.t.pos[n], "oxc(bad-object-literal-comparison)", "Unexpected object literal comparison.", "This comparison will always return {res} as object literals are never equal to each other. Consider using `Object.entries()` of `Object.keys()` and comparing their lengths.")
+  else:
+    add(&l, l.t.pos[n], "oxc(bad-object-literal-comparison)", "Unexpected array literal comparison.", "This comparison will always return {res} as array literals are never equal to each other. Consider using `Array.length` if empty checking was intended.")
+
+# ---- no-irregular-whitespace
+
+fn irregular_at(src: Str, i: Int) -> Int:
+  # the length of the irregular whitespace at i (0 if none)
+  let c = src[i]
+  if c == 11 or c == 12: return 1
+  if i + 1 < src.len and c == 0xC2 and (src[i + 1] == 0x85 or src[i + 1] == 0xA0): return 2
+  if i + 2 >= src.len: return 0
+  let d = src[i + 1]
+  let e = src[i + 2]
+  if c == 0xEF and d == 0xBB and e == 0xBF: return 3
+  if c == 0xE1 and d == 0x9A and e == 0x80: return 3
+  if c == 0xE1 and d == 0xA0 and e == 0x8E: return 3
+  if c == 0xE2 and d == 0x80 and ((e >= 0x80 and e <= 0x8A) or e == 0xA8 or e == 0xA9 or e == 0xAF): return 3
+  if c == 0xE2 and d == 0x81 and e == 0x9F: return 3
+  if c == 0xE3 and d == 0x80 and e == 0x80: return 3
+  return 0
+
+fn irregular_whitespace(var l: L):
+  var runs: [Int] = []
+  var i = 0
+  let n = l.src.len
+  # (a byte order mark at the start doesn't count)
+  if n >= 3 and l.src[0] == 0xEF and l.src[1] == 0xBB and l.src[2] == 0xBF: i = 3
+  while i < n:
+    let c = l.src[i]
+    if c == 11 or c == 12 or c == 0xC2 or c == 0xE1 or c == 0xE2 or c == 0xE3 or c == 0xEF:
+      let len = irregular_at(l.src, i)
+      if len > 0:
+        let start = i
+        i += len
+        while i < n and irregular_at(l.src, i) > 0: i += irregular_at(l.src, i)
+        runs.push(start)
+        continue
+    i += 1
+  if runs.len == 0: return
+  # literals (strings, templates, regular expressions) are skipped
+  var lo: [Int] = []
+  var hi: [Int] = []
+  for x in 0..l.t.k.len:
+    let kd = l.t.k[x]
+    if kd == ast.N_STR or kd == ast.N_NOSUBTEMPL or kd == ast.N_TEMPL or kd == ast.N_REGEX:
+      lo.push(l.t.pos[x])
+      hi.push(l.t.end[x])
+  for r in runs:
+    var inside = false
+    for j in 0..lo.len:
+      if r >= lo[j] and r < hi[j]:
+        inside = true
+        break
+    if not inside: add(&l, r, "eslint(no-irregular-whitespace)", "Unexpected irregular whitespace", "Try to remove the irregular whitespace")
+
+# ---- no-loss-of-precision
+
+fn loss_of_precision(var l: L, n: Int):
+  let raw0 = name_of(l, n)
+  let raw = raw0.replace("_", "")
+  if raw.len < 16 and raw.find("e") < 0 and raw.find("E") < 0 and raw.find("x") < 0 and raw.find("X") < 0: return
+  let v = num_value(raw0)
+  var lost = false
+  let low = raw.lower()
+  if low.startswith("0x") or low.startswith("0b") or low.startswith("0o") or (raw.len > 1 and raw[0] == '0' and raw[1] >= '0' and raw[1] <= '7' and legacy_octal_raw(raw)):
+    var base = 8
+    var digits = raw[1..raw.len]
+    if low.startswith("0x"):
+      base = 16
+      digits = raw[2..raw.len]
+    elif low.startswith("0b"):
+      base = 2
+      digits = raw[2..raw.len]
+    elif low.startswith("0o"):
+      digits = raw[2..raw.len]
+    lost = not digits.upper().endswith(int_to_base(v, base))
+  else:
+    let norm = sci(raw)
+    let coef = norm[0..norm.find("e")]
+    let prec = coef.replace(".", "").len
+    if prec > 100: lost = true
+    else: lost = norm != sci(to_precision(v, prec))
+  if lost:
+    add(&l, l.t.pos[n], "eslint(no-loss-of-precision)", "This number literal will lose precision at runtime.", "Use a number literal representable by a 64-bit floating-point number, or use a `BigInt` literal (for example, `9007199254740993n`) for exact large integers.")
+
+fn legacy_octal_raw(raw: Str) -> Bool:
+  for i in 1..raw.len:
+    if raw[i] < '0' or raw[i] > '7': return false
+  return true
+
+# An integral double in base 2, 8 or 16, upper case (as JavaScript's toString(base)).
+fn int_to_base(v: Float, base: Int) -> Str:
+  if v != v or v > 1.7976931348623157e308: return "?"
+  if v < 9007199254740992.0:
+    var x = int(v)
+    if x == 0: return "0"
+    var out = ""
+    while x > 0:
+      let d = x % base
+      out = "0123456789ABCDEF"[d..d + 1] + out
+      x = x / base
+    return out
+  # v = m * 2^e with m < 2^53: the binary digits of m, then e zeros, grouped
+  var m = v
+  var e = 0
+  while m >= 9007199254740992.0:
+    m = m / 2.0
+    e += 1
+  var bits = ""
+  var mi = int(m)
+  while mi > 0:
+    if mi % 2 == 1: bits = "1" + bits
+    else: bits = "0" + bits
+    mi = mi / 2
+  for i in 0..e: bits = bits + "0"
+  var w = 1
+  if base == 8: w = 3
+  elif base == 16: w = 4
+  while bits.len % w != 0: bits = "0" + bits
+  var out = ""
+  var i = 0
+  while i < bits.len:
+    var d = 0
+    for j in 0..w: d = d * 2 + int(bits[i + j] - '0')
+    out = out + "0123456789ABCDEF"[d..d + 1]
+    i += w
+  return out
+
+fn strip_leading_zeros(s: Str) -> Str:
+  for i in 0..s.len:
+    if s[i] != '0': return s[i..s.len]
+  return s
+
+fn strip_trailing_zeros(s: Str) -> Str:
+  var i = s.len - 1
+  while i >= 0:
+    if s[i] != '0': return s[0..i + 1]
+    i -= 1
+  return s
+
+fn add_point(s: Str) -> Str:
+  if s.len == 0: return "."
+  return s[0..1] + "." + s[1..s.len]
+
+# ESLint's convertNumberToScientificNotation.
+fn sci(s0: Str) -> Str:
+  let s = s0.replace("E", "e")
+  let parts = s.split("e")
+  let coef = parts[0]
+  var c = ""
+  var mag = 0
+  if s.find(".") >= 0:
+    let t = strip_leading_zeros(coef)
+    if t.startswith("."):
+      let dec = t[1..t.len]
+      let sig = strip_leading_zeros(dec)
+      mag = sig.len - dec.len - 1
+      c = add_point(sig)
+    else:
+      mag = t.find(".") - 1
+      c = add_point(t.replace(".", ""))
+  else:
+    let sig = strip_trailing_zeros(strip_leading_zeros(coef))
+    if coef.startswith("0"): mag = coef.len - 2
+    else: mag = coef.len - 1
+    c = add_point(sig)
+  if parts.len > 1:
+    var ex = parts[1]
+    var neg = false
+    if ex.startswith("+"): ex = ex[1..ex.len]
+    elif ex.startswith("-"):
+      neg = true
+      ex = ex[1..ex.len]
+    var e = int(ex) else 0
+    if neg: e = -e
+    mag += e
+  return c + "e{mag}"
+
+type Dec:
+  digits: Str
+  e: Int
+
+# A positive finite double's exact decimal expansion: digits d1 d2 ... with x = d1.d2... * 10^e.
+fn exact_decimal(x0: Float) -> Dec:
+  var x = x0
+  var k = 0
+  while x >= 9007199254740992.0:
+    x = x / 2.0
+    k += 1
+  while x != x.floor():
+    x = x * 2.0
+    k -= 1
+  var m = int(x)
+  # little-endian decimal digits of m
+  var d: [Int] = []
+  while m > 0:
+    d.push(m % 10)
+    m = m / 10
+  var mul = 2
+  var times = k
+  var shift = 0
+  if k < 0:
+    # m / 2^-k = m * 5^-k / 10^-k
+    mul = 5
+    times = -k
+    shift = -k
+  for i in 0..times:
+    var carry = 0
+    for j in 0..d.len:
+      let v = d[j] * mul + carry
+      d[j] = v % 10
+      carry = v / 10
+    while carry > 0:
+      d.push(carry % 10)
+      carry = carry / 10
+  var hi = d.len - 1
+  while hi > 0 and d[hi] == 0: hi -= 1
+  var lo = 0
+  while lo < hi and d[lo] == 0: lo += 1
+  var out = ""
+  var i = hi
+  while i >= lo:
+    out = out + "{d[i]}"
+    i -= 1
+  return Dec(out, hi - shift)
+
+# JavaScript's Number.prototype.toPrecision.
+fn to_precision(v: Float, p: Int) -> Str:
+  if v != v: return "NaN"
+  if v > 1.7976931348623157e308: return "Infinity"
+  var x = v
+  var sign = ""
+  if x < 0.0:
+    sign = "-"
+    x = -x
+  # the exact decimal digits, rounded (half up, as toPrecision) to p
+  var all = ""
+  var e = 0
+  if x != 0.0:
+    let ex = exact_decimal(x)
+    all = ex.digits
+    e = ex.e
+  while all.len < p + 1: all = all + "0"
+  var dg: [Int] = []
+  for i in 0..p: dg.push(int(all[i] - '0'))
+  if p < all.len and all[p] >= '5':
+    var i = p - 1
+    while i >= 0:
+      if dg[i] == 9:
+        dg[i] = 0
+        i -= 1
+      else:
+        dg[i] += 1
+        break
+  var digits = ""
+  if p < all.len and all[p] >= '5' and dg[0] == 0 and all[0] == '9':
+    # carried past the first digit: 10...0
+    digits = "1"
+    for i in 1..p: digits = digits + "0"
+    e += 1
+  else:
+    for d in dg: digits = digits + "{d}"
+  if x == 0.0:
+    if p == 1: return sign + "0"
+    return sign + "0." + digits[1..digits.len]
+  if e < -6 or e >= p:
+    var m = digits[0..1]
+    if p > 1: m = m + "." + digits[1..digits.len]
+    if e >= 0: return sign + m + "e+{e}"
+    return sign + m + "e{e}"
+  if e >= 0:
+    if p > e + 1: return sign + digits[0..e + 1] + "." + digits[e + 1..digits.len]
+    return sign + digits
+  var z = ""
+  for i in 0..(-e - 1): z = z + "0"
+  return sign + "0." + z + digits
+
+# ---- no-unused-private-class-members
+
+fn private_members(var l: L, cls: Int):
+  let ms = l.t.d[cls]
+  var any = false
+  for i in 0..ast.count(l.t, ms):
+    let m = ast.item(l.t, ms, i)
+    let key = l.t.a[m]
+    let km = k(l, m)
+    if (km == ast.N_PROP or km == ast.N_METHOD or km == ast.N_GET or km == ast.N_SET) and k(l, key) == ast.N_PRIVNAME: any = true
+  if not any: return
+  # uses: name -> value reads, other reads (statements, compound updates), writes
+  var vr: {Int: Int} = {}
+  var sr: {Int: Int} = {}
+  var wr: {Int: Int} = {}
+  pm_walk(l, ms, 0, &vr, &sr, &wr)
+  for i in 0..ast.count(l.t, ms):
+    let m = ast.item(l.t, ms, i)
+    let key = l.t.a[m]
+    let km = k(l, m)
+    if k(l, key) != ast.N_PRIVNAME: continue
+    let nm = l.t.s[key]
+    var used = false
+    if km == ast.N_PROP or km == ast.N_METHOD: used = vr.get(nm, 0) > 0
+    elif km == ast.N_GET: used = vr.get(nm, 0) + sr.get(nm, 0) > 0
+    elif km == ast.N_SET: used = wr.get(nm, 0) > 0
+    else: continue
+    if not used:
+      var name = l.t.names[nm] + ""
+      if name.startswith("#"): name = name[1..name.len]
+      add(&l, l.t.pos[key], "eslint(no-unused-private-class-members)", "'{name}' is defined but never used.", "Remove the declaration or use it in the code.")
+
+fn pm_bump(var m: {Int: Int}, k: Int):
+  m[k] = m.get(k, 0) + 1
+
+# ctx: 0 value read, 1 write target, 2 read and write in a statement (x++, x += 1), 3 a statement's value
+fn pm_walk(l: L, n: Int, ctx: Int, var vr: {Int: Int}, var sr: {Int: Int}, var wr: {Int: Int}):
+  if n <= 0: return
+  let kd = l.t.k[n]
+  if kd == ast.N_LIST:
+    for i in 0..l.t.b[n]: pm_walk(l, l.t.L[l.t.a[n] + i], ctx, &vr, &sr, &wr)
+    return
+  if kd == ast.N_PROPACCESS and (l.t.f[n] & 4) != 0:
+    let nm = l.t.s[n]
+    if ctx == 0: pm_bump(&vr, nm)
+    elif ctx == 1: pm_bump(&wr, nm)
+    else:
+      pm_bump(&sr, nm)
+      if ctx == 2: pm_bump(&wr, nm)
+    pm_walk(l, l.t.a[n], 0, &vr, &sr, &wr)
+    return
+  if kd == ast.N_PAREN or kd == ast.N_NONNULL or kd == ast.N_AS or kd == ast.N_SATISFIES:
+    pm_walk(l, l.t.a[n], ctx, &vr, &sr, &wr)
+    return
+  if kd == ast.N_EXPRSTMT:
+    pm_walk(l, l.t.a[n], 3, &vr, &sr, &wr)
+    return
+  if kd == ast.N_BINARY:
+    let op = l.t.f[n]
+    if op == T_ASSIGN:
+      pm_target(l, l.t.a[n], &vr, &sr, &wr)
+      pm_walk(l, l.t.b[n], 0, &vr, &sr, &wr)
+      return
+    if is_assign_op(op):
+      var c2 = 0
+      if ctx == 3: c2 = 2
+      if c2 == 0:
+        # the value is used: a read (and a write)
+        pm_walk(l, l.t.a[n], 0, &vr, &sr, &wr)
+        pm_target(l, l.t.a[n], &vr, &sr, &wr)
+      else: pm_walk(l, l.t.a[n], 2, &vr, &sr, &wr)
+      pm_walk(l, l.t.b[n], 0, &vr, &sr, &wr)
+      return
+    if op == scan.W_IN and k(l, l.t.a[n]) == ast.N_PRIVNAME:
+      pm_walk(l, l.t.b[n], 0, &vr, &sr, &wr)
+      return
+    if ctx == 3 and (op == T_AND or op == T_OR or op == T_QQ):
+      # this.#x || (this.#x = v) as a statement: the read only decides the write
+      let rgt = unparen(l, l.t.b[n])
+      if is_bin(l, rgt, T_ASSIGN):
+        let tg = unparen(l, l.t.a[rgt])
+        if k(l, tg) == ast.N_PROPACCESS and (l.t.f[tg] & 4) != 0:
+          var ops: [Int] = []
+          split_by(l, l.t.a[n], op, &ops)
+          for o in ops:
+            if k(l, o) == ast.N_PROPACCESS and (l.t.f[o] & 4) != 0 and l.t.s[o] == l.t.s[tg]: pm_walk(l, o, 3, &vr, &sr, &wr)
+            else: pm_walk(l, o, 0, &vr, &sr, &wr)
+          pm_walk(l, rgt, 3, &vr, &sr, &wr)
+          return
+    if op == T_COMMA:
+      var c3 = 0
+      if ctx == 3: c3 = 3
+      pm_walk(l, l.t.a[n], 3, &vr, &sr, &wr)
+      pm_walk(l, l.t.b[n], c3, &vr, &sr, &wr)
+      return
+  if (kd == ast.N_POSTFIX or kd == ast.N_PREFIX) and (l.t.f[n] == T_INC or l.t.f[n] == T_DEC):
+    if ctx == 3: pm_walk(l, l.t.a[n], 2, &vr, &sr, &wr)
+    else:
+      pm_walk(l, l.t.a[n], 0, &vr, &sr, &wr)
+      pm_target(l, l.t.a[n], &vr, &sr, &wr)
+    return
+  pm_walk(l, l.t.a[n], 0, &vr, &sr, &wr)
+  pm_walk(l, l.t.b[n], 0, &vr, &sr, &wr)
+  pm_walk(l, l.t.c[n], 0, &vr, &sr, &wr)
+  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS: pm_walk(l, l.t.d[n], 0, &vr, &sr, &wr)
+
+# A write target (patterns included).
+fn pm_target(l: L, n: Int, var vr: {Int: Int}, var sr: {Int: Int}, var wr: {Int: Int}):
+  if n <= 0: return
+  let kd = l.t.k[n]
+  if kd == ast.N_PROPACCESS and (l.t.f[n] & 4) != 0:
+    pm_bump(&wr, l.t.s[n])
+    pm_walk(l, l.t.a[n], 0, &vr, &sr, &wr)
+    return
+  if kd == ast.N_PAREN:
+    pm_target(l, l.t.a[n], &vr, &sr, &wr)
+    return
+  if kd == ast.N_ARRAY:
+    for i in 0..ast.count(l.t, l.t.a[n]): pm_target(l, ast.item(l.t, l.t.a[n], i), &vr, &sr, &wr)
+    return
+  if kd == ast.N_OBJECT:
+    for i in 0..ast.count(l.t, l.t.a[n]):
+      let p = ast.item(l.t, l.t.a[n], i)
+      if k(l, p) == ast.N_PROPASSIGN: pm_target(l, l.t.b[p], &vr, &sr, &wr)
+      elif k(l, p) == ast.N_SPREAD: pm_target(l, l.t.a[p], &vr, &sr, &wr)
+    return
+  if kd == ast.N_SPREAD:
+    pm_target(l, l.t.a[n], &vr, &sr, &wr)
+    return
+  if kd == ast.N_BINARY and l.t.f[n] == T_ASSIGN:
+    pm_target(l, l.t.a[n], &vr, &sr, &wr)
+    pm_walk(l, l.t.b[n], 0, &vr, &sr, &wr)
+    return
+  if kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS:
+    pm_walk(l, l.t.a[n], 0, &vr, &sr, &wr)
+    pm_walk(l, l.t.b[n], 0, &vr, &sr, &wr)
+    return
+  pm_walk(l, n, 0, &vr, &sr, &wr)
