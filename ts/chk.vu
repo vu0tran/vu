@@ -619,6 +619,7 @@ fn push_facts(var c: C, e: Int, truth: Bool):
 fn check_expr(var c: C, n: Int, ctx: Int) -> Int:
   let t = expr_type(&c, n, ctx)
   c.ntype[n] = t
+  bind.touch(&c, t)
   return t
 
 fn is_any(c: C, t: Int) -> Bool:
@@ -645,12 +646,12 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
   if k == ast.N_PROPACCESS: return prop_access(&c, n)
   if k == ast.N_ELEMACCESS: return elem_access(&c, n)
   if k == ast.N_CALL:
-    let rt = call(&c, n, false)
+    let rt = call(&c, n, false, ctx)
     if c.t.k[c.t.a[n]] == ast.N_SUPER: return c.void_t
     evolve_call(&c, n)
     return rt
   if k == ast.N_SUPER: return super_type(&c, n)
-  if k == ast.N_NEW: return call(&c, n, true)
+  if k == ast.N_NEW: return call(&c, n, true, ctx)
   if k == ast.N_OBJECT: return object_literal(&c, n, ctx)
   if k == ast.N_ARRAY: return array_literal(&c, n, ctx)
   if k == ast.N_ARROW or k == ast.N_FUNCEXPR: return function_expr(&c, n, ctx)
@@ -822,6 +823,8 @@ fn used_before_decl(var c: C, use: Int, s: Int) -> Bool:
 
 fn prop_of(var c: C, t: Int, name: Int) -> Int:
   let a = rel.apparent(&c, t)
+  # with the augmentations: Function's members for functions, Object's for every object
+  if c.tk[a] == TK_OBJ: return rel.src_prop(&c, a, name)
   return bind.get_prop(&c, a, name)
 
 fn possibly_msg(var c: C, e: Int, has_null: Bool, has_undef: Bool):
@@ -1212,6 +1215,49 @@ fn arg_count_msg(var c: C, sgs: [Int], n: Int, at: Int):
   else:
     err(&c, at, 2554, "Expected {lo}-{hi} arguments, but got {n}.")
 
+# A signature's type parameter list node (-1 if none known).
+fn sig_tparam_list(c: C, sg: Int) -> Int:
+  let d = c.sigs[sg].node
+  if d < 0: return -1
+  let k = c.t.k[d]
+  if k == ast.N_CLASS: return c.t.a[d]
+  if k == ast.N_CTOR:
+    let cls = bind.up(c, d)
+    if cls >= 0 and c.t.k[cls] == ast.N_CLASS: return c.t.a[cls]
+    return -1
+  if k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET or k == ast.N_CALLSIG or k == ast.N_CTORSIG: return c.t.a[c.t.b[d]]
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW: return c.t.a[d]
+  if k == ast.N_TFUNC or k == ast.N_SIG: return c.t.a[d]
+  return -1
+
+fn min_type_args(c: C, sg: Int) -> Int:
+  let tl = sig_tparam_list(c, sg)
+  if tl < 0: return c.sigs[sg].tparams.len
+  var mn = 0
+  for tp in ast.items(c.t, tl):
+    if c.t.b[tp] < 0: mn += 1
+  return mn
+
+# The type arguments for a signature, defaults filled in; [] when the count doesn't fit.
+fn sig_type_args(var c: C, sg: Int, targs: [Int]) -> [Int]:
+  let tps = types.ints(c.sigs[sg].tparams)
+  var out: [Int] = []
+  if targs.len > tps.len or targs.len < min_type_args(c, sg): return out
+  for a in targs: out.push(a)
+  let tl = sig_tparam_list(c, sg)
+  if out.len < tps.len and tl >= 0:
+    let tnodes = ast.items(c.t, tl)
+    for i in out.len..tps.len:
+      var head: [Int] = []
+      for j in 0..i: head.push(tps[j])
+      let m = types.new_mapper(&c, head, types.ints(out))
+      let dn = c.t.b[tnodes[i]]
+      if dn < 0: return []
+      let dt = bind.type_from(&c, dn)
+      out.push(bind.instantiate(&c, dt, m))
+  if out.len != tps.len: return []
+  return out
+
 fn arity_ok(c: C, sg: Int, n: Int) -> Bool:
   let s = types.sig_copy(c, sg)
   if n < s.min: return false
@@ -1241,7 +1287,7 @@ fn context_sensitive(c: C, e: Int) -> Bool:
       if c.t.k[p] == ast.N_PROPASSIGN and context_sensitive(c, c.t.b[p]): return true
   return false
 
-fn call(var c: C, n: Int, is_new0: Bool) -> Int:
+fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
   let callee = c.t.a[n]
   let args = kids(c, c.t.c[n])
   # super(...): the base class's construct signatures
@@ -1273,16 +1319,42 @@ fn call(var c: C, n: Int, is_new0: Bool) -> Int:
     else:
       err(&c, callee, 2349, "This expression is not callable.")
     return c.error_t
-  if c.t.b[n] >= 0: return unsup(&c, n, "explicit type arguments in a call")
+  var sgs2: [Int] = []
+  if c.t.b[n] >= 0:
+    # f<T>(...): the signatures with that many type parameters, instantiated (no inference)
+    var targs: [Int] = []
+    for a in kids(c, c.t.b[n]): targs.push(bind.type_from(&c, a))
+    for sg in sgs:
+      let full = sig_type_args(&c, sg, targs)
+      if full.len == 0: continue
+      let m = types.new_mapper(&c, types.ints(c.sigs[sg].tparams), full)
+      let ns = bind.inst_sig(&c, sg, m)
+      c.sigs[ns].tparams = []
+      sgs2.push(ns)
+    if sgs2.len == 0:
+      for a in args: check_expr(&c, a, -1)
+      var lo = 1000
+      var hi = 0
+      for sg in sgs:
+        let tn = c.sigs[sg].tparams.len
+        let mn = min_type_args(c, sg)
+        if mn < lo: lo = mn
+        if tn > hi: hi = tn
+      let tl = c.t.b[n]
+      if lo == hi: bind.err_at(&c, n, c.t.pos[tl], 2558, "Expected {lo} type arguments, but got {targs.len}.")
+      else: bind.err_at(&c, n, c.t.pos[tl], 2558, "Expected {lo}-{hi} type arguments, but got {targs.len}.")
+      return c.error_t
+  else:
+    for sg in sgs: sgs2.push(sg)
   var cands: [Int] = []
-  for sg in sgs:
+  for sg in sgs2:
     if arity_ok(c, sg, args.len): cands.push(sg)
   if cands.len == 0:
     # the arguments still get their contextual types, from the longest candidate
     # (getCandidateForOverloadFailure / getLongestCandidateIndex)
     var best = -1
     var best_n = -1
-    for sg in sgs:
+    for sg in sgs2:
       let pn = c.sigs[sg].ptypes.len
       var has_rest = false
       for f in types.ints(c.sigs[sg].pflags):
@@ -1290,30 +1362,30 @@ fn call(var c: C, n: Int, is_new0: Bool) -> Int:
       if best < 0 and (has_rest or pn >= args.len): best = sg
       if pn > best_n: best_n = pn
     if best < 0:
-      for sg in sgs:
+      for sg in sgs2:
         if c.sigs[sg].ptypes.len == best_n and best < 0: best = sg
-    let bsg = instantiate_call(&c, best, args)
+    let bsg = instantiate_call(&c, best, args, ctx)
     for i in 0..args.len:
       let pt = param_at(&c, bsg, i)
       check_expr(&c, args[i], pt)
     # too few: at the call; too many: at the first extra argument
     var mx = 0
     var rest = false
-    for sg in sgs:
+    for sg in sgs2:
       if c.sigs[sg].ptypes.len > mx: mx = c.sigs[sg].ptypes.len
       for f in types.ints(c.sigs[sg].pflags):
         if f == 2: rest = true
     var at = n
     if not rest and args.len > mx: at = args[mx]
-    arg_count_msg(&c, sgs, args.len, at)
-    return sig_result(&c, sgs[0], n)
+    arg_count_msg(&c, sgs2, args.len, at)
+    return sig_result(&c, sgs2[0], n)
   if cands.len == 1:
-    let sg = instantiate_call(&c, cands[0], args)
+    let sg = instantiate_call(&c, cands[0], args, ctx)
     check_args(&c, sg, args, true)
     return sig_result(&c, sg, n)
   # overloads: the first whose arguments all fit
   for cand in cands:
-    let sg = instantiate_call(&c, cand, args)
+    let sg = instantiate_call(&c, cand, args, ctx)
     if args_fit(&c, sg, args):
       check_args(&c, sg, args, false)
       return sig_result(&c, sg, n)
@@ -1368,11 +1440,15 @@ fn check_args(var c: C, sg: Int, args: [Int], report: Bool):
       reported = true
 
 # Infers a generic signature's type arguments from the arguments and instantiates it.
-fn instantiate_call(var c: C, sg: Int, args: [Int]) -> Int:
+fn instantiate_call(var c: C, sg: Int, args: [Int], ctx: Int) -> Int:
   let tps = types.ints(c.sigs[sg].tparams)
   if tps.len == 0: return sg
-  var cands: [[Int]] = []
-  for x in tps: cands.push([])
+  var inf = new_inf(tps)
+  # the contextual type of the call infers from the return type, at the lowest priority
+  let ret = c.sigs[sg].ret
+  if ctx >= 0 and ret >= 0 and not is_any(c, ctx):
+    var seen0: {Int: Bool} = {}
+    infer_in(&c, ret, ctx, &inf, false, P_RETURN, ret, &seen0)
   # first the arguments that don't depend on context, then the others with what's known
   for pass in 0..2:
     for i in 0..args.len:
@@ -1380,14 +1456,15 @@ fn instantiate_call(var c: C, sg: Int, args: [Int]) -> Int:
       if (pass == 0) == sens: continue
       var pt = raw_param_at(&c, sg, i)
       if pass == 1:
-        let m = current_mapper(&c, tps, cands, sg)
+        let m = inf_mapper(&c, &inf, sg)
         pt = bind.instantiate(&c, pt, m)
         c.fsig.remove(args[i])
         clear_ctx_params(&c, args[i])
       let at = check_expr(&c, args[i], pt)
       let h13_ = raw_param_at(&c, sg, i)
-      infer(&c, h13_, at, tps, &cands)
-  let m = current_mapper(&c, tps, cands, sg)
+      var seen: {Int: Bool} = {}
+      infer_in(&c, h13_, at, &inf, false, 0, h13_, &seen)
+  let m = inf_mapper(&c, &inf, sg)
   return bind.inst_sig(&c, sg, m)
 
 fn clear_ctx_params(var c: C, e: Int):
@@ -1406,23 +1483,110 @@ fn raw_param_at(var c: C, sg: Int, i: Int) -> Int:
   if s.pflags.len > 0 and s.pflags[s.pflags.len - 1] == 2: return element_type(&c, s.ptypes[s.ptypes.len - 1], s.node)
   return c.any_t
 
-fn current_mapper(var c: C, tps: [Int], cands: [[Int]], sg: Int) -> Int:
+# Inference state per type parameter (TypeScript's InferenceInfo): covariant and contravariant
+# candidates, the priority they came with (lower wins), and whether all came at the top level.
+type Inf:
+  tps: [Int]
+  cov: [[Int]]
+  contra: [[Int]]
+  prio: [Int]
+  top: [Bool]
+
+const P_NONE = 1048576
+const P_NAKED = 1
+const P_RETURN = 128
+
+fn new_inf(tps: [Int]) -> Inf:
+  var inf = Inf([], [], [], [], [])
+  for t in tps:
+    inf.tps.push(t)
+    inf.cov.push([])
+    inf.contra.push([])
+    inf.prio.push(P_NONE)
+    inf.top.push(true)
+  return inf
+
+# isTypeParameterAtTopLevel: tp itself or a member of a union at the top.
+fn at_top_level(c: C, t: Int, tp: Int) -> Bool:
+  if t == tp: return true
+  if c.tk[t] == TK_UNION:
+    for m in types.members(c, t):
+      if m == tp: return true
+  return false
+
+fn inf_mapper(var c: C, var inf: Inf, sg: Int) -> Int:
   var to: [Int] = []
-  for i in 0..tps.len:
-    if cands[i].len == 0:
-      let con = rel.constraint_of(&c, tps[i])
-      if con >= 0: to.push(con)
-      else: to.push(c.unknown_t)
+  for i in 0..inf.tps.len: to.push(c.unknown_t)
+  let ret = c.sigs[sg].ret
+  for i in 0..inf.tps.len:
+    let tp = inf.tps[i]
+    var t = -1
+    let con = rel.constraint_of(&c, tp)
+    if inf.cov[i].len > 0:
+      let prim = con >= 0 and prim_constraint(&c, con)
+      let widen_lits = not prim and inf.top[i] and not (ret >= 0 and at_top_level(c, ret, tp))
+      var base: [Int] = []
+      for x in inf.cov[i]:
+        if prim: base.push(types.regular(c, x))
+        elif widen_lits: base.push(widen_all(&c, x))
+        else: base.push(x)
+      if (inf.prio[i] & P_RETURN) != 0: t = subtype_reduce(&c, base)
+      else: t = common_supertype(&c, base)
+      t = regular_obj(&c, t)
+      if c.tk[t] == TK_UNION and types.regular(c, t) != t: t = types.regular(c, t)
+    elif inf.contra[i].len > 0:
+      t = common_subtype(&c, inf.contra[i])
     else:
-      var t = types.union_of(&c, cands[i])
-      # literals widen unless the type parameter is the whole return type or constrained to primitives
-      let ret = c.sigs[sg].ret
-      let con = rel.constraint_of(&c, tps[i])
-      let keep = ret == tps[i] or (con >= 0 and prim_constraint(&c, con))
-      if not keep: t = widen_all(&c, t)
-      else: t = types.regular(c, t)
-      to.push(t)
-  return types.new_mapper(&c, tps, to)
+      t = c.unknown_t
+    # an inference that doesn't meet the constraint becomes the constraint
+    if con >= 0:
+      let m0 = types.new_mapper(&c, inf.tps, to)
+      let ci = bind.instantiate(&c, con, m0)
+      if not rel.assignable(&c, t, ci): t = ci
+    to[i] = t
+  return types.new_mapper(&c, inf.tps, to)
+
+# getCommonSupertype: literals of one base type make a union; otherwise the leftmost supertype.
+fn common_supertype(var c: C, ts: [Int]) -> Int:
+  if ts.len == 1: return ts[0]
+  var nullable: [Int] = []
+  var prim: [Int] = []
+  for t in ts:
+    var rest: [Int] = []
+    for m in types.members(c, t):
+      let k = c.tk[m]
+      if k == TK_NULL or k == TK_UNDEF:
+        if not types.has_int(nullable, m): nullable.push(m)
+      else: rest.push(m)
+    if rest.len > 0: prim.push(types.union_of(&c, rest))
+  if prim.len == 0: return types.union_of(&c, nullable)
+  var out = prim[0]
+  if same_base_literals(c, prim):
+    out = types.union_of(&c, prim)
+  else:
+    for i in 1..prim.len:
+      if rel.assignable(&c, out, prim[i]) and not (rel.assignable(&c, prim[i], out) and true and false): out = prim[i]
+  if nullable.len > 0:
+    var all = [out]
+    for x in nullable: all.push(x)
+    return types.union_of(&c, all)
+  return out
+
+fn same_base_literals(c: C, ts: [Int]) -> Bool:
+  var base = -1
+  for t in ts:
+    for m in types.members(c, t):
+      if not types.is_literal(c, m): return false
+      let b = types.base_of_literal(c, m)
+      if base < 0: base = b
+      elif b != base: return false
+  return true
+
+fn common_subtype(var c: C, ts: [Int]) -> Int:
+  var out = ts[0]
+  for i in 1..ts.len:
+    if rel.assignable(&c, ts[i], out): out = ts[i]
+  return out
 
 fn prim_constraint(var c: C, t: Int) -> Bool:
   for m in types.members(c, t):
@@ -1441,59 +1605,64 @@ fn widen_all(var c: C, t: Int) -> Int:
   if not changed: return t
   return types.union_of(&c, ts)
 
-fn infer(var c: C, p: Int, a: Int, tps: [Int], var cands: [[Int]]):
-  var seen: {Int: Bool} = {}
-  infer_in(&c, p, a, tps, &cands, &seen)
-
-# inferFromTypes: each (parameter type, argument type) pair once, so recursive types end
-fn infer_in(var c: C, p: Int, a: Int, tps: [Int], var cands: [[Int]], var seen: {Int: Bool}):
+# inferFromTypes: what the argument type a says about the type parameters in p. contra: in a
+# parameter position of a function (contravariant); prio: the priority of what's found.
+fn infer_in(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, orig: Int, var seen: {Int: Bool}):
   let pk = c.tk[p]
-  if pk != TK_TPARAM:
-    let key = (p << 32) + a
-    if key in seen: return
-    seen[key] = true
   if pk == TK_TPARAM:
-    for i in 0..tps.len:
-      if tps[i] == p:
-        if not types.has_int(cands[i], a): cands[i].push(a)
+    for i in 0..inf.tps.len:
+      if inf.tps[i] != p: continue
+      if c.tk[a] == TK_UNSUP:
+        bind.touch(&c, a)
+        return
+      if prio < inf.prio[i]:
+        inf.cov[i] = []
+        inf.contra[i] = []
+        inf.prio[i] = prio
+        inf.top[i] = true
+      if prio == inf.prio[i]:
+        if contra:
+          if not types.has_int(inf.contra[i], a): inf.contra[i].push(a)
+        elif not types.has_int(inf.cov[i], a):
+          inf.cov[i].push(a)
+        if (prio & P_RETURN) == 0 and not at_top_level(c, orig, p): inf.top[i] = false
     return
+  let key = (p << 32) + a
+  if key in seen: return
+  seen[key] = true
   if pk == TK_UNION:
-    # infer to the naked type parameter from what the other members don't take
+    # inferToMultipleTypes: the members that aren't naked type parameters first; a naked one
+    # gets what the others don't take
+    var naked: [Int] = []
     for m in types.members(c, p):
-      if c.tk[m] == TK_TPARAM:
-        var rest: [Int] = []
-        for am in types.members(c, a):
-          var taken = false
-          for m2 in types.members(c, p):
-            if m2 != m and c.tk[m2] != TK_TPARAM and rel.assignable(&c, am, m2): taken = true
-          if not taken: rest.push(am)
-        if rest.len > 0:
-          let g4_1 = types.union_of(&c, rest)
-          infer_in(&c, m, g4_1, tps, &cands, &seen)
-      else:
-        infer_in(&c, m, a, tps, &cands, &seen)
+      if c.tk[m] == TK_TPARAM and types.has_int(inf.tps, m): naked.push(m)
+      else: infer_in(&c, m, a, &inf, contra, prio, orig, &seen)
+    if naked.len == 1:
+      var rest: [Int] = []
+      for am in types.members(c, a):
+        var taken = false
+        for m2 in types.members(c, p):
+          if c.tk[m2] != TK_TPARAM and rel.assignable(&c, am, m2): taken = true
+        if not taken: rest.push(am)
+      if rest.len > 0:
+        let g4_1 = types.union_of(&c, rest)
+        infer_in(&c, naked[0], g4_1, &inf, contra, prio | P_NAKED, orig, &seen)
+    return
+  if c.tk[a] == TK_UNION:
+    for am in types.members(c, a): infer_in(&c, p, am, &inf, contra, prio, orig, &seen)
     return
   if pk != TK_OBJ or c.tk[a] != TK_OBJ: return
   let po = c.ta[p]
   let ao = c.ta[a]
   if c.objs[po].kind == OK_REF and c.objs[ao].kind == OK_REF and c.objs[po].target == c.objs[ao].target:
-    for i in 0..c.objs[po].args.len: infer_in(&c, c.objs[po].args[i], c.objs[ao].args[i], tps, &cands, &seen)
+    for i in 0..c.objs[po].args.len: infer_in(&c, c.objs[po].args[i], c.objs[ao].args[i], &inf, contra, prio, orig, &seen)
     return
   if rel.is_array_ref(&c, p) and c.objs[ao].kind == OK_TUPLE:
     let h14_ = bind.tuple_elem_union(&c, a)
-    infer_in(&c, c.objs[po].args[0], h14_, tps, &cands, &seen)
+    infer_in(&c, c.objs[po].args[0], h14_, &inf, contra, prio, orig, &seen)
     return
   if rel.is_array_ref(&c, p) and rel.is_array_ref(&c, a):
-    infer_in(&c, c.objs[po].args[0], c.objs[ao].args[0], tps, &cands, &seen)
-    return
-  let psg = bind.sigs_of(&c, p, false)
-  let asg = bind.sigs_of(&c, a, false)
-  if psg.len == 1 and asg.len == 1:
-    let ps = types.sig_copy(c, psg[0])
-    let as_ = types.sig_copy(c, asg[0])
-    for i in 0..ps.ptypes.len:
-      if i < as_.ptypes.len: infer_in(&c, ps.ptypes[i], as_.ptypes[i], tps, &cands, &seen)
-    if ps.ret >= 0 and as_.ret >= 0: infer_in(&c, ps.ret, as_.ret, tps, &cands, &seen)
+    infer_in(&c, c.objs[po].args[0], c.objs[ao].args[0], &inf, contra, prio, orig, &seen)
     return
   for name in bind.prop_names(&c, p):
     let pp = bind.get_prop(&c, p, name)
@@ -1501,7 +1670,19 @@ fn infer_in(var c: C, p: Int, a: Int, tps: [Int], var cands: [[Int]], var seen: 
     if pp >= 0 and ap >= 0:
       let g5_1 = bind.type_of_sym(&c, pp)
       let g6_1 = bind.type_of_sym(&c, ap)
-      infer_in(&c, g5_1, g6_1, tps, &cands, &seen)
+      infer_in(&c, g5_1, g6_1, &inf, contra, prio, orig, &seen)
+  # signatures: parameters the other way round, return types the same way
+  let psg = bind.sigs_of(&c, p, false)
+  let asg = bind.sigs_of(&c, a, false)
+  if psg.len > 0 and asg.len > 0:
+    let ps = types.sig_copy(c, psg[psg.len - 1])
+    let as_ = types.sig_copy(c, asg[asg.len - 1])
+    for i in 0..ps.ptypes.len:
+      if i < as_.ptypes.len: infer_in(&c, ps.ptypes[i], as_.ptypes[i], &inf, not contra, prio, orig, &seen)
+    if ps.ret >= 0 and as_.ret >= 0: infer_in(&c, ps.ret, as_.ret, &inf, contra, prio, orig, &seen)
+  let pi = bind.index_type(&c, p, false)
+  let ai = bind.index_type(&c, a, false)
+  if pi >= 0 and ai >= 0: infer_in(&c, pi, ai, &inf, contra, prio, orig, &seen)
 
 # ---- operators
 
@@ -2170,6 +2351,9 @@ fn check_stmt(var c: C, n: Int):
     unsup(&c, n, "an enum")
     return
   if k == ast.N_MODULE:
+    if (c.t.f[n] & ast.MOD_GLOBAL) != 0 and c.t.b[n] >= 0:
+      check_stmts(&c, kids(c, c.t.b[n]))
+      return
     unsup(&c, n, "a namespace")
     return
   if k == ast.N_IMPORT:
@@ -2237,7 +2421,7 @@ fn this_type(var c: C, n: Int) -> Int:
       if cls < 0 or c.t.k[cls] != ast.N_CLASS or not (cls in c.nsym): return unsup(&c, n, "this outside a class")
       let s = c.nsym[cls]
       if (c.t.f[x] & ast.M_STATIC) != 0 or k == ast.N_STATICBLOCK: return bind.type_of_sym(&c, s)
-      return bind.declared_type(&c, s)
+      return bind.self_type(&c, s)
     if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_CLASSEXPR or k == ast.N_OBJECT: return unsup(&c, n, "this outside a class")
     x = bind.up(c, x)
   return unsup(&c, n, "this outside a class")
@@ -2260,8 +2444,8 @@ fn super_type(var c: C, n: Int) -> Int:
   let bs = class_sym_of_base(&c, cls)
   if bs < 0: return unsup(&c, n, "super without a base class")
   let p = c.parent[n]
-  if p >= 0 and c.t.k[p] == ast.N_CALL and c.t.a[p] == n: return bind.type_of_sym(&c, bs)
-  return bind.declared_type(&c, bs)
+  if p >= 0 and c.t.k[p] == ast.N_CALL and c.t.a[p] == n: return base_ctor_type(&c, cls, bs)
+  return bind.class_base(&c, cls)
 
 # this before super(...) in a derived class's constructor (TS17009).
 fn this_before_super(var c: C, n: Int, ctor: Int):
@@ -2302,7 +2486,9 @@ fn class_sym_of_base(var c: C, d: Int) -> Int:
 # none-argument ones) returning the instance type, and the static members.
 fn class_static(var c: C, s: Int) -> Int:
   let d = c.sdecl[s]
-  let inst = bind.declared_type(&c, s)
+  let inst = bind.self_type(&c, s)
+  let dt = bind.declared_type(&c, s)
+  let ctps = types.ints(c.objs[c.ta[dt]].tparams)
   let t = types.anon_obj(&c, s, d)
   c.static_side[t] = s
   c.stype[s] = t
@@ -2326,19 +2512,44 @@ fn class_static(var c: C, s: Int) -> Int:
     if ctors.len > 1 and bodies < ctors.len and c.t.c[m] >= 0: continue
     let sg = fn_sig(&c, m)
     c.sigs[sg].ret = inst
+    c.sigs[sg].tparams = types.ints(ctps)
     c.objs[o].ctors.push(sg)
   if ctors.len == 0:
-    if bt >= 0 and c.tk[bt] == TK_OBJ:
-      for bsg in bind.sigs_of(&c, bt, true):
+    if bs >= 0:
+      # the base's construct signatures, through extends Base<X>, returning this class
+      let bct = base_ctor_type(&c, d, bs)
+      for bsg in bind.sigs_of(&c, bct, true):
         let cp = types.sig_copy(c, bsg)
         let ns = types.new_sig(&c, cp.node)
         c.sigs[ns] = cp
         c.sigs[ns].ret = inst
+        c.sigs[ns].tparams = types.ints(ctps)
         c.objs[o].ctors.push(ns)
     else:
       let ns = types.new_sig(&c, d)
       c.sigs[ns].ret = inst
+      c.sigs[ns].tparams = types.ints(ctps)
       c.objs[o].ctors.push(ns)
+  c.objs[o].resolved = true
+  return t
+
+# The base class's constructor type as the derived class sees it: its construct signatures with
+# the base's type parameters set to the arguments of extends Base<X>.
+fn base_ctor_type(var c: C, d: Int, bs: Int) -> Int:
+  let bst = bind.type_of_sym(&c, bs)
+  let bdt = bind.declared_type(&c, bs)
+  let btps = types.ints(c.objs[c.ta[bdt]].tparams)
+  if btps.len == 0: return bst
+  let base = bind.class_base(&c, d)
+  if base < 0 or c.tk[base] != TK_OBJ or c.objs[c.ta[base]].kind != OK_REF: return bst
+  let args = types.ints(c.objs[c.ta[base]].args)
+  let m = types.new_mapper(&c, btps, args)
+  let t = types.anon_obj(&c, -1, d)
+  let o = c.ta[t]
+  for bsg in bind.sigs_of(&c, bst, true):
+    let ns = bind.inst_sig(&c, bsg, m)
+    c.sigs[ns].tparams = []
+    c.objs[o].ctors.push(ns)
   c.objs[o].resolved = true
   return t
 
@@ -2436,12 +2647,9 @@ fn readonly_exempt(c: C, l: Int, ps: Int) -> Bool:
   return bind.up(c, d) == bind.up(c, f)
 
 fn check_class(var c: C, n: Int):
-  if c.t.a[n] >= 0:
-    unsup(&c, n, "a generic class")
-    return
   if not (n in c.nsym): return
   let s = c.nsym[n]
-  let inst = bind.declared_type(&c, s)
+  let inst = bind.self_type(&c, s)
   bind.prop_names(&c, inst)
   bind.type_of_sym(&c, s)
   let cname = nm(c, c.sname[s])
