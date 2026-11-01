@@ -763,6 +763,7 @@ fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gov
   swap(&nodes, &w.nodes)
   assign(&g, fs, &v, nodes)
   bools(&g, fs, &v, nodes)
+  copylocks(&g, fs, &v, nodes, w.parent, gover)
   nilfunc(&g, &v, nodes)
   printf.run(&g, fs, &v, pi, roots, nodes, gover, &w.parent)
   shift(&g, fs, &v, nodes)
@@ -1017,3 +1018,158 @@ fn testinggoroutine(var g: tc.Prog, fs: Fs, var v: V, p: pkg.Pkg, roots: [Int]):
 
 fn vet_ty(g: tc.Prog, pi: Int, n: Int) -> Int:
   return ty(g, pi, n)
+
+# ---- copylocks
+
+fn is_locker_method(var g: tc.Prog, fs: Fs, t: Int, name: Str) -> Bool:
+  let r = tc.method_in_set(&g, fs, t, name)
+  if r.len == 0: return false
+  let mt = r[1]
+  return mt > 0 and g.tk[mt] == tc.TY_FUNC and g.tlen[g.ta[mt]] == 0 and g.tlen[g.tb[mt]] == 0
+
+fn is_locker(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return is_locker_method(&g, fs, t, "Lock") and is_locker_method(&g, fs, t, "Unlock")
+
+# The chain of types (outermost last) that makes copying t copy a lock, or [].
+fn lock_path(var g: tc.Prog, fs: Fs, t0: Int, var seen: {Int: Bool}) -> [Str]:
+  var t = t0
+  if t <= 0 or t in seen: return []
+  seen[t] = true
+  if g.tk[t] == tc.TY_TPARAM: return []
+  var guard = 0
+  while guard < 20:
+    guard += 1
+    let u = tc.under(&g, fs, t)
+    if u > 0 and g.tk[u] == tc.TY_ARRAY: t = g.ta[u]
+    else: break
+  let u = tc.under(&g, fs, t)
+  if u <= 0: return []
+  if g.tk[u] == tc.TY_TUPLE:
+    for x in tc.tlist(g, u):
+      var sub = lock_path(&g, fs, x, &seen)
+      if sub.len > 0:
+        sub.push(tc.type_str(&g, fs, t, ""))
+        return sub
+    return []
+  if g.tk[u] != tc.TY_STRUCT: return []
+  let pt = tc.ptr_to(&g, t)
+  if is_locker(&g, fs, pt) and not is_locker(&g, fs, t): return [tc.type_str(&g, fs, t, "")]
+  if g.tk[t] == tc.TY_NAMED:
+    let o = g.ta[t]
+    if g.oname[o] == "noCopy" and g.opkg[o] >= 0 and g.pk[g.opkg[o]].path == "sync": return [tc.type_str(&g, fs, t, "")]
+  for f in tc.tlist(g, u):
+    let ft = tc.obj_type(&g, fs, f)
+    var sub = lock_path(&g, fs, ft, &seen)
+    if sub.len > 0:
+      sub.push(tc.type_str(&g, fs, t, ""))
+      return sub
+  return []
+
+fn path_str(p: [Str]) -> Str:
+  var s = ""
+  var i = p.len - 1
+  while i >= 0:
+    if i < p.len - 1: s += " contains "
+    s += p[i]
+    i -= 1
+  return s
+
+fn lock_path_rhs(var g: tc.Prog, fs: Fs, pi: Int, x0: Int) -> [Str]:
+  let x = unparen(g, pi, x0)
+  let k = g.pk[pi].t.k[x]
+  if k == ast.N_COMPOSITE or k == ast.N_CALL: return []
+  if k == ast.N_STAR and g.pk[pi].t.k[unparen(g, pi, g.pk[pi].t.a[x])] == ast.N_CALL: return []
+  if x >= g.pk[pi].emd.len or g.pk[pi].emd[x] != tc.M_VALUE: return []
+  let t = ty(g, pi, x)
+  if t <= 0: return []
+  var seen: {Int: Bool} = {}
+  return lock_path(&g, fs, t, &seen)
+
+fn copylocks(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int], parent: [Int], gover: Int):
+  let pi = v.pi
+  for n in nodes:
+    let k = g.pk[pi].t.k[n]
+    if k == ast.N_RANGE:
+      for e in [g.pk[pi].t.a[n], g.pk[pi].t.b[n]]:
+        if e <= 0: continue
+        let isid = g.pk[pi].t.k[e] == ast.N_IDENT
+        if isid and g.pk[pi].t.names[g.pk[pi].t.s[e]] == "_": continue
+        var t = 0
+        if g.pk[pi].t.f[n] == T_DEFINE:
+          if not isid: continue
+          let o = g.pk[pi].use[e]
+          if o < 0 or g.onode[o] != e: continue
+          t = tc.obj_type(&g, fs, o)
+        else: t = ty(g, pi, e)
+        if t <= 0: continue
+        var seen: {Int: Bool} = {}
+        let p = lock_path(&g, fs, t, &seen)
+        if p.len > 0: report(g, &v, e, "copylocks", "range var " + format.expr(g.pk[pi].t, e) + " copies lock: " + path_str(p))
+    elif k == ast.N_FUNCDECL or k == ast.N_FUNCLIT:
+      var name = "func"
+      var ft = g.pk[pi].t.a[n]
+      var exprs: [Int] = []
+      if k == ast.N_FUNCDECL:
+        name = g.pk[pi].t.names[g.pk[pi].t.s[g.pk[pi].t.b[n]]] + ""
+        ft = g.pk[pi].t.c[n]
+        let recv = g.pk[pi].t.a[n]
+        if recv >= 0 and ast.count(g.pk[pi].t, recv) > 0: exprs.push(g.pk[pi].t.b[ast.item(g.pk[pi].t, recv, 0)])
+      for f in ast.items(g.pk[pi].t, g.pk[pi].t.b[ft]): exprs.push(g.pk[pi].t.b[f])
+      for e in exprs:
+        let t = ty(g, pi, e)
+        if t <= 0: continue
+        var seen: {Int: Bool} = {}
+        let p = lock_path(&g, fs, t, &seen)
+        if p.len > 0: report(g, &v, e, "copylocks", name + " passes lock by value: " + path_str(p))
+    elif k == ast.N_CALL:
+      let fun = g.pk[pi].t.a[n]
+      var id = -1
+      if g.pk[pi].t.k[fun] == ast.N_IDENT: id = fun
+      elif g.pk[pi].t.k[fun] == ast.N_SELECTOR: id = g.pk[pi].t.b[fun]
+      if id > 0:
+        let o = g.pk[pi].use[id]
+        if o >= 0 and g.ok[o] == tc.O_BUILTIN:
+          let bn = g.oname[o]
+          if bn == "new" or bn == "len" or bn == "cap" or bn == "Sizeof" or bn == "Offsetof" or bn == "Alignof": continue
+      for a in ast.items(g.pk[pi].t, g.pk[pi].t.b[n]):
+        let p = lock_path_rhs(&g, fs, pi, a)
+        if p.len > 0: report(g, &v, a, "copylocks", "call of " + format.expr(g.pk[pi].t, fun) + " copies lock value: " + path_str(p))
+    elif k == ast.N_ASSIGN:
+      let lhs = ast.items(g.pk[pi].t, g.pk[pi].t.a[n])
+      let rhs = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+      var reported = false
+      for i in 0..rhs.len:
+        let p = lock_path_rhs(&g, fs, pi, rhs[i])
+        if p.len > 0 and i < lhs.len:
+          report(g, &v, rhs[i], "copylocks", "assignment copies lock value to " + format.expr(g.pk[pi].t, lhs[i]) + ": " + path_str(p))
+          reported = true
+      if g.pk[pi].t.f[n] == T_DEFINE and gover >= 22 and not reported:
+        let par = parent[n]
+        if par > 0 and g.pk[pi].t.k[par] == ast.N_FOR and g.pk[pi].t.a[par] == n:
+          for l in lhs:
+            if g.pk[pi].t.k[l] != ast.N_IDENT or g.pk[pi].t.names[g.pk[pi].t.s[l]] == "_": continue
+            let o = g.pk[pi].use[l]
+            if o < 0 or g.onode[o] != l: continue
+            var seen: {Int: Bool} = {}
+            let lt = tc.obj_type(&g, fs, o)
+            let p = lock_path(&g, fs, lt, &seen)
+            if p.len > 0: report(g, &v, l, "copylocks", "for loop iteration copies lock value to " + format.expr(g.pk[pi].t, l) + ": " + path_str(p))
+    elif k == ast.N_GENDECL and g.pk[pi].t.f[n] == K_VAR:
+      for sp in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
+        let names = ast.items(g.pk[pi].t, g.pk[pi].t.a[sp])
+        let vals = ast.items(g.pk[pi].t, g.pk[pi].t.c[sp])
+        for i in 0..vals.len:
+          let p = lock_path_rhs(&g, fs, pi, vals[i])
+          if p.len > 0 and i < names.len: report(g, &v, vals[i], "copylocks", "variable declaration copies lock value to " + g.pk[pi].t.names[g.pk[pi].t.s[names[i]]] + ": " + path_str(p))
+    elif k == ast.N_COMPOSITE:
+      for e0 in ast.items(g.pk[pi].t, g.pk[pi].t.b[n]):
+        var e = e0
+        if g.pk[pi].t.k[e] == ast.N_KEYVALUE: e = g.pk[pi].t.b[e]
+        let p = lock_path_rhs(&g, fs, pi, e)
+        if p.len > 0: report(g, &v, e, "copylocks", "literal copies lock value from " + format.expr(g.pk[pi].t, e) + ": " + path_str(p))
+    elif k == ast.N_RETURN:
+      let l = g.pk[pi].t.a[n]
+      if l < 0: continue
+      for e in ast.items(g.pk[pi].t, l):
+        let p = lock_path_rhs(&g, fs, pi, e)
+        if p.len > 0: report(g, &v, e, "copylocks", "return copies lock value: " + path_str(p))
