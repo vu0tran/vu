@@ -26,6 +26,39 @@ fn main():
 Vu is an experiment. v0 runs on Linux (x86-64 and ARM64) and macOS (ARM64); CI runs the tests on
 all three. The compiler is written in Vu.
 
+## Speed up slow Python
+
+`vu speedup` takes a slow Python function, gets a Vu version of it (from a model, a coding agent,
+or you), checks that it gives the same answers as the original on thousands of generated inputs,
+and swaps it in with two lines that say so:
+
+```
+$ vu speedup suggest.py:close_matches --port close_matches.vu     # or no --port: a model writes it
+close_matches(word: str, possibilities: list[str], n: int, cutoff: float) -> list[str]  [direct call]
+3000 inputs; the original raises on 703
+same answers as the original on all 2982 inputs; 18 more ran the original (the Vu version can't take them, or hands them back)
+speed on 34 bigger inputs (lists of 500 to 2,000): Python 142.4 ms, Vu 20.9 ms: 6.8x
+suggest.py: close_matches now runs the Vu version (the lines after it say so; delete them to undo)
+```
+
+Ports of real, widely used pure-Python code, each checked on thousands of inputs (floats to the last
+bit) and measured on realistic data ([examples/speedup](examples/speedup)):
+
+| | Python | Vu | |
+|---|---|---|---|
+| `difflib.get_close_matches` (the standard library's "did you mean?"), 10,000 words | 16.5 ms | 2.07 ms | 8.0x |
+| jellyfish `jaro_winkler_similarity`, a pair of names | 3.72 us | 0.55 us | 6.7x |
+| jellyfish `damerau_levenshtein_distance`, a pair | 15.9 us | 1.21 us | 13.2x |
+| the closest of 5,000 names | 22.6 ms | 2.37 ms | 9.6x |
+| a GPS track's length, 100,000 points | 77.4 ms | 12.8 ms | 6.1x |
+
+jellyfish ships a hand-written Rust extension for those two functions too: on the same machine it
+takes 0.74 and 1.84 us a pair, so the Vu ports are faster per call. Nothing the Vu version can't
+take changes behaviour: ints over 64 bits, strings Python can't encode, arguments of other types and
+any panic run the original Python instead. Where Python's own C code already does the work (`re`,
+`Counter`, `sorted`), the Vu version isn't faster, and `vu speedup` measures that and leaves the
+function alone.
+
 ## Getting started
 
 Install a release (Linux x86-64 or ARM64 with glibc 2.34 or later, or macOS on Apple silicon):

@@ -887,10 +887,50 @@ print(lib.count_words(b"the quick brown fox", -1))   # 4
 - An exported function gets no capabilities, so a library can't reach files, the network or
   programs, whatever it's called with. It can use `par` loops, not tasks or channels (yet).
 - It's called on the caller's threads, from as many at once as the caller likes.
-- A panic prints its report and ends the process (exit 101), as it does a program.
+- In a function that `throws`, a panic on the calling thread (an overflow, an index out of range)
+  is returned as its error, `panic: ` and the message, instead of ending the program that loaded
+  the library; what the function had allocated by then isn't freed. Elsewhere (a function that
+  can't fail, or a `par` loop's other threads) a panic prints its report and ends the process
+  (exit 101), as it does a program.
 - Only the main file's functions can be exported, without type parameters, and with names that
   aren't C keywords or already the C library's (the C compiler names a clash). Exported functions
   are ordinary Vu functions too, and a library may have a `main` (it isn't run).
+
+## Python: vu speedup
+
+`vu speedup FILE.py:FUNC` ports a slow Python function to Vu, checks the port against the
+original, and swaps it in:
+
+```
+vu speedup suggest.py:close_matches --port close_matches.vu   # a port you or an agent wrote
+vu speedup suggest.py:close_matches                           # a model writes it (ANTHROPIC_API_KEY or OPENAI_API_KEY)
+vu speedup suggest.py:close_matches --prompt                  # what to give an agent
+```
+
+- The function needs type hints of `int`, `float`, `bool`, `str`, `bytes`, `list[T]`,
+  `dict[str, T]`, `tuple[T, ...]` and `T | None`, and must be pure (its result from its
+  arguments, which it leaves alone; a function that changes them is refused).
+- Inputs: thousands generated from the hints (edge cases, Unicode, ints past 64 bits, infinities
+  and NaN), plus calls recorded from a script (`--record script.py ARGS`) or listed in a JSON file
+  (`--inputs-file`). The port runs on each in a separate process and must give the same answer:
+  the same values and types (floats to the last bit), and the same exception class where the
+  original raises (the port fails with `"ValueError: message"`; a class of the function's module
+  works too).
+- The port is a Vu file with a function of the same name and the matching Vu types (`str` is
+  `Str`, `list[str]` is `[Str]`, `dict[str, int]` is `{Str: Int}`, `int | None` is `Int?`); the
+  prompt gives the exact signature. Without `--port`, a model writes it in a loop that feeds back
+  the compiler's errors and the answers that differ (`--attempts`, default 6).
+- It's swapped in only when it's faster (1.2x or more on the inputs; `--force` overrides, and
+  `--no-apply` only checks): two lines after the function, which say so. The Vu version runs only
+  on what it can take; an int over 64 bits, a string Python can't encode, an argument of another
+  type than the hint, a panic, or `fail "vu-speedup: fallback"` (a port handing a call back) run
+  the original instead.
+- Arguments of `int`, `float`, `bool`, `str`, `bytes` and lists of numbers or strings are passed
+  directly (a CPython extension it builds, or ctypes without Python's headers); the others as JSON.
+  The library and the extension are in `_vu_MODULE/` beside the module, with the port.
+- Needs Python 3 (`PYTHON=path` picks one) and a C compiler. `examples/speedup` has ports of
+  `difflib.get_close_matches`, jellyfish's Jaro-Winkler and Damerau-Levenshtein, and GPS-track
+  code, with what they measured; `tests/run_speedup.sh` checks them.
 
 ## Control flow
 
@@ -933,7 +973,18 @@ output first; like `panic`, it never returns, so a function may end with it. `ar
 returns all command-line arguments as a `[Str]` (index 0 is the program).
 `swap(&a, &b)` exchanges two values of the same type. Also: `panic("...")`, `sqrt`, `fma`, `abs`,
 `min`, `max` (of two or more numbers, or of a list), `float`, `int`, `byte`, `str`, `bytes`.
-A NaN always prints as `nan`, as in Python. `arg(i, 10)` reads command-line
+A NaN always prints as `nan`, as in Python.
+
+A Float has the C math library's functions as methods: `x.sin()`, `cos`, `tan`, `asin`, `acos`,
+`atan`, `sinh`, `cosh`, `tanh`, `exp`, `expm1`, `log` (natural), `log1p`, `log2`, `log10`,
+`floor`, `ceil`, `trunc` (each a Float), and `y.atan2(x)`, `x.pow(y)`, `x.hypot(y)`, `x.fmod(y)`,
+`x.copysign(y)`. They call the library's functions without letting the C compiler compute any
+itself (it would turn `pow(x, 2.0)` into `x * x`, which differs in the last bit for some x), so
+the results are the same bits as Python's `math` functions and float `**` on the same machine,
+except `hypot` (Python's `math.hypot` is its own algorithm). Out of their domain they give NaN or
+an infinity where Python raises ValueError. `(-2.5).floor()` is `-3.0`; `int(x)` makes an Int.
+
+`arg(i, 10)` reads command-line
 argument i as an Int and `arg(i, "default")` as a Str, falling back to the default when it's
 missing.
 
@@ -963,6 +1014,7 @@ Text: strings are bytes, and these read them as UTF-8 characters, with Python's 
 "straße".upper()          # "STRASSE": Python's full Unicode case mapping (also s.lower())
 "aé中😀".char_count()     # 4 (s.len is 10: bytes)
 for c in s.chars(): ...    # each character as a Str
+s.codes()                  # each character's code point, an [Int]: [97, 233, 20013, 128512]
 s.normalize("NFC")          # Unicode normalization: "NFC", "NFD", "NFKC" or "NFKD", as Python's
 s.is_alpha()                # and is_digit, is_space, is_alnum, is_upper, is_lower, is_decimal: Python's isalpha()...
 ord("é")                   # 233; chr(233) is "é"

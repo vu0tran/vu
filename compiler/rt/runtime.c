@@ -11,6 +11,9 @@
 #include <math.h>
 #include <errno.h>
 #include <time.h>
+#ifndef __wasi__
+#include <setjmp.h>
+#endif
 #include <sys/random.h>
 #if defined(__APPLE__) || defined(__wasi__)
 #ifdef __APPLE__
@@ -74,6 +77,41 @@ VU_G bool vu_json;   /* report panics as JSON (vu run --json, or VU_PANIC=json a
 typedef struct vu_frame { const char *name; int loc; struct vu_frame *prev; } vu_frame;
 VU_G __thread vu_frame *vu_top;
 static inline void vu_leave(vu_frame *f) { vu_top = f->prev; }
+/* x.sin(), y.atan2(x), x.pow(y)...: the C math library's functions, called through pointers the
+   compiler can't see through. Otherwise it computes some itself (pow(x, 2.0) as x * x, constant
+   arguments with its own arithmetic), and those can differ in the last bit from the library, which
+   is what Python's math module and float ** call. */
+static double (*volatile vu_m_sin)(double) = sin;
+static double (*volatile vu_m_cos)(double) = cos;
+static double (*volatile vu_m_tan)(double) = tan;
+static double (*volatile vu_m_asin)(double) = asin;
+static double (*volatile vu_m_acos)(double) = acos;
+static double (*volatile vu_m_atan)(double) = atan;
+static double (*volatile vu_m_sinh)(double) = sinh;
+static double (*volatile vu_m_cosh)(double) = cosh;
+static double (*volatile vu_m_tanh)(double) = tanh;
+static double (*volatile vu_m_exp)(double) = exp;
+static double (*volatile vu_m_expm1)(double) = expm1;
+static double (*volatile vu_m_log)(double) = log;
+static double (*volatile vu_m_log1p)(double) = log1p;
+static double (*volatile vu_m_log2)(double) = log2;
+static double (*volatile vu_m_log10)(double) = log10;
+static double (*volatile vu_m_floor)(double) = floor;
+static double (*volatile vu_m_ceil)(double) = ceil;
+static double (*volatile vu_m_trunc)(double) = trunc;
+static double (*volatile vu_m_atan2)(double, double) = atan2;
+static double (*volatile vu_m_pow)(double, double) = pow;
+static double (*volatile vu_m_hypot)(double, double) = hypot;
+static double (*volatile vu_m_fmod)(double, double) = fmod;
+static double (*volatile vu_m_copysign)(double, double) = copysign;
+/* A library's exported function that can fail catches a panic on its own thread: vu_lib_jmp is where
+   to go back to, and the message ("panic: ...") waits in vu_lib_msg for the function to return as its
+   error, so a bug or an overflow in a library doesn't end the program that loaded it. Elsewhere (a
+   program, or a par loop's other threads) a panic ends the process. */
+#ifndef __wasi__
+VU_G __thread jmp_buf *vu_lib_jmp;
+VU_G __thread char *vu_lib_msg;
+#endif
 #if defined(VU_TRACE) && defined(VU_PROF)
 /* (the profiler's signal handler reads the frames: each must be complete before vu_top points at it,
    and the optimizer must keep the stores to vu_top, which no code it can see reads) */
@@ -171,6 +209,16 @@ static vu_frame *vu_run_end(vu_frame *g, int loc, long long *times) {
 }
 /* panic: <msg>, then "at file:line in fn" and one "called from" line per caller. */
 static void vu_report(const char *msg, size_t n, int loc) {
+#ifndef __wasi__
+    if (vu_lib_jmp) {
+        char *m = (char *)malloc(n + 8);
+        if (m) { memcpy(m, "panic: ", 7); memcpy(m + 7, msg, n); m[n + 7] = 0; }
+        vu_lib_msg = m;
+        jmp_buf *j = vu_lib_jmp;
+        vu_lib_jmp = NULL;
+        longjmp(*j, 1);
+    }
+#endif
     vu_report_lock();
     vu_frame *f = vu_top;
     if (!loc && f) loc = f->loc;

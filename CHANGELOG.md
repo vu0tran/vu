@@ -9,6 +9,18 @@ The first sections (Results through LLM tokens) are the comparison from rounds 1
 
 ## Releases
 
+**0.4.0** (2026-11-01): rounds 31 and 32. `vu speedup FILE.py:FUNC`: a slow Python function ported
+to Vu (by a model, a coding agent or you), checked to give the same answers as the original on
+thousands of generated inputs (floats to the last bit), measured, and swapped in only when it's
+faster, with everything the Vu version can't take still running the Python. Ports of
+`difflib.get_close_matches` and of jellyfish's string distances measured 6.7 to 13.2 times faster than
+the Python (and faster per call than jellyfish's Rust extension). The language gained `s.codes()` and
+Float methods for the C math library (the same bits as Python's `math`), and an exported function
+that throws returns a panic as its error instead of ending the program that loaded it. `pg` keeps a
+prepared statement per SQL text (point selects 2.90 s to 1.66 s), and under concurrent load it served
+1.1 to 1.26 times the queries of Go's pgx on a third less CPU (`bench/pg/concurrent.sh`). CI runs in
+parallel (47 minutes to about 10).
+
 **0.3.0** (2026-10-31): rounds 25 to 30. The first release with prebuilt binaries (Linux x86-64
 and ARM64, and macOS on Apple silicon, all three tested in CI on every push), an installer
 (`curl -fsSL https://vulang.org/install | sh`) and a Homebrew formula. For backends: `vu new app`
@@ -2836,3 +2848,72 @@ client shares this machine's 2 cores with PostgreSQL, so the CPU it uses the ser
 
 Vu ties Go with a connection per worker and is 1.1 to 1.26 times faster when workers wait for
 connections, using 18 to 33% less CPU per query in every case. Measured on one 2-core machine only.
+
+## Round 32: vu speedup
+
+**The aim:** something that makes people want Vu without first learning it. Python is the largest
+audience, slow Python is a daily pain, and Vu looks like Python, so: `vu speedup FILE.py:FUNC` takes a
+slow function with type hints, gets a Vu version of it, checks that version against the original on
+thousands of inputs, measures both, and swaps the Vu one in only if it's faster. The helper is
+Python (it has to call the original), carried inside `vuc` (`compiler/rt/speedup.py`); the port comes
+from `--port` (written by you or a coding agent; `--prompt` prints what to give one) or from a model
+(`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`) in a loop that feeds back compile errors and every answer
+that differs. Inputs are generated from the hints (edge cases, Unicode, ints past 64 bits,
+infinities, NaN, values near each parameter's default, lists of the same length for functions taking
+several) and can be recorded from a script (`--record`). Each answer must equal the original's:
+types, values (floats to the last bit), and the exception class where it raises. Anything the Vu
+version can't take runs the original: an int over 64 bits, a string Python can't encode, an argument
+of another type than the hint, a panic, or a call the port hands back (`fail "vu-speedup: fallback"`).
+
+**Measured** (`examples/speedup/*/bench.py`, realistic data, 2-core x86-64, Python 3.13, best of 3;
+every port ported in agent mode by Claude from the prompt, and identical on every generated input):
+
+| | Python | Vu | |
+|---|---|---|---|
+| `difflib.get_close_matches`, 1,000 words | 1.71 ms | 0.205 ms | 8.4x |
+| `difflib.get_close_matches`, 10,000 words | 16.5 ms | 2.07 ms | 8.0x |
+| jellyfish `jaro_winkler_similarity`, a pair | 3.72 us | 0.55 us | 6.7x |
+| jellyfish `damerau_levenshtein_distance`, a pair | 15.9 us | 1.21 us | 13.2x |
+| the closest of 5,000 names (Jaro-Winkler) | 22.6 ms | 2.37 ms | 9.6x |
+| a GPS track's length, 100,000 points | 77.4 ms | 12.8 ms | 6.1x |
+| the nearest of 5,000 points, 200 queries | 688 ms | 99.2 ms | 6.9x |
+
+jellyfish's own Rust extension takes 0.74 and 1.84 us for the two pair functions on the same machine:
+the Vu ports are faster per call. The numeric ports are bound by the C math library both languages
+call; the string ports by Vu's own code. Where Python's C code already does the work (`re` and
+`Counter`, `min` and `max`), the Vu version is slower (0.1x to 0.3x, the cost of passing arguments),
+and it isn't swapped in.
+
+**Built for it, in the language:** `s.codes()` (code points as an `[Int]`); Float methods for the C
+math library (`x.sin()`, `y.atan2(x)`, `x.pow(y)` and 20 more); and an exported function that throws
+now returns a panic on its thread as its error (`panic: ...`) instead of ending the program that
+loaded the library (200,000 overflow panics in a row: the process kept 18 MB).
+
+**What each round found.**
+- Building it: the first port, `get_close_matches`, gave the same answers on its first check. 73% of
+  the generated inputs only made the original raise (random `n` and `cutoff`): parameters with
+  defaults now get values near them. The loader's settings were written as JSON (`false`) into Python.
+  The check caught ctypes passing `n = 2**64` as 0 (it wraps ints instead of refusing them): ints are
+  range-checked. The port was only 2x faster: `chars()` made a string per character, so `s.codes()`
+  went into the language (5.4x), and lists of strings now pass as one buffer instead of JSON (8x).
+  ctypes cost 1.5 to 2 us a call, more than jellyfish's functions take: a CPython extension it builds
+  now calls the Vu function directly (0.55 us for Jaro-Winkler, from 2.34).
+- Numbers: 2 of 3,000 GPS tracks differed from Python in the last bit, in optimized builds only. gcc
+  turns `pow(x, 2.0)` into `x * x`, which differs from glibc's `pow` for some x (0.37796883434360806
+  squared: ...585 against ...582), and Python calls `pow`. Float methods now call the library through
+  pointers the compiler can't see through; then the tracks matched on 10,000 inputs, and
+  `run_speedup.sh` compares every method with Python's `math` bit for bit. `hypot` can't match:
+  Python's `math.hypot` is its own algorithm; that's documented, and the prompt says so.
+- Attacking the tool: a function faster in Python's C code (`Counter`, `min`, `max`) was swapped in
+  though slower: now only at 1.2x or more (`--force` overrides). A port raising the module's own
+  exception class came back as RuntimeError: the class is looked up in the function's module. A bool
+  passed for an int was taken as 1 (`str(True)` isn't `str(1)`): ints must be exactly int. The
+  generator had no NaN and no capital sigma (Python's `lower()` makes a final one "ς", Vu's doesn't):
+  both added, and ports hand such calls back. My own mistakes, not findings: test copies that carried
+  earlier swaps, and a range where `math.sinh` overflows.
+- The last round found nothing: every port with five new seeds (150,000 checks), `--record` and
+  `--inputs-file`, threads with panics in between, surrogates, NUL and `str` subclasses.
+
+`tests/run_speedup.sh` (17 checks) is in the gate and in CI on all three platforms. Not measured: a
+model writing the ports through the API (no key here; the loop is tested against a fake API that
+answers with a port that doesn't compile, then a wrong one, then the right one).

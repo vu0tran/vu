@@ -73,6 +73,7 @@ fn lib_cname(n: Str) -> Str:
 fn export_code(g: G, name: Str) -> [Str]:
   let fi = g.fns[name]
   var cps: [Str] = []
+  var cnames: [Str] = []
   var pre: [Str] = []
   var args: [Str] = []
   for pa in fi.params:
@@ -81,16 +82,21 @@ fn export_code(g: G, name: Str) -> [Str]:
     if pa.ty == "Str":
       cps.push("const char *" + cn)
       cps.push("int64_t " + cn + "_len")
+      cnames.push(cn + "")
+      cnames.push(cn + "_len")
       pre.push("vu_str " + lv + " = vu_lib_in(" + cn + ", " + cn + "_len);")
       args.push("&" + lv)
     elif ffi_list(pa.ty):
       let e = lib_elem(pa.ty)
       cps.push("const " + e + " *" + cn)
       cps.push("int64_t " + cn + "_len")
+      cnames.push(cn + "")
+      cnames.push(cn + "_len")
       pre.push(ct(g, pa.ty) + " " + lv + " = {{ (" + e + " *)" + cn + ", " + cn + " && " + cn + "_len > 0 ? " + cn + "_len : 0, 0 }};")
       args.push("&" + lv)
     else:
       cps.push(ct(g, pa.ty) + " " + cn)
+      cnames.push(cn + "")
       args.push(cn)
   let ret = fi.ret
   var rt = "void"
@@ -102,8 +108,12 @@ fn export_code(g: G, name: Str) -> [Str]:
     rt = lib_elem(ret) + " *"
     big = true
   elif ret != "~void": rt = ct(g, ret)
-  if big: cps.push("int64_t *vu_out_len")
-  if fi.fails: cps.push("char **vu_err")
+  if big:
+    cps.push("int64_t *vu_out_len")
+    cnames.push("vu_out_len")
+  if fi.fails:
+    cps.push("char **vu_err")
+    cnames.push("vu_err")
   var plist = join(cps, ", ")
   if plist == "": plist = "void"
   var proto = rt + " " + name + "(" + plist + ")"
@@ -127,7 +137,34 @@ fn export_code(g: G, name: Str) -> [Str]:
     let e = lib_elem(ret)
     b.push("    " + e + " *vu_p = (" + e + " *)vu_lib_out(" + val + ".data, " + val + ".len, sizeof(" + e + "), 0, vu_out_len); drop_" + mg(g, ret) + "(&" + val + "); return vu_p;")
   elif ret != "~void": b.push("    return " + val + ";")
-  return [proto, "__attribute__((visibility(\"default\"))) " + proto + " {{\n" + join(b, "\n") + "\n}}"]
+  let body = join(b, "\n")
+  if not fi.fails: return [proto, "__attribute__((visibility(\"default\"))) " + proto + " {{\n" + body + "\n}}"]
+  # a function that can fail also reports a panic on the calling thread as its error ("panic: ..."),
+  # instead of ending the program that loaded the library (vu_report jumps back here)
+  var inner = "static " + rt + " vu_lib_body_" + name + "(" + plist + ")"
+  if rt.endswith("*"): inner = "static " + rt + "vu_lib_body_" + name + "(" + plist + ")"
+  var w: [Str] = []
+  w.push("#ifndef __wasi__")
+  w.push("    jmp_buf vu_jb;")
+  w.push("    jmp_buf *volatile vu_saved = vu_lib_jmp;")
+  w.push("    vu_frame *volatile vu_top0 = vu_top;")
+  w.push("    if (setjmp(vu_jb)) {{")
+  w.push("        vu_lib_jmp = vu_saved; vu_top = vu_top0;")
+  w.push("        if (vu_err) *vu_err = vu_lib_msg; else free(vu_lib_msg);")
+  w.push("        vu_lib_msg = NULL;")
+  if big: w.push("        if (vu_out_len) *vu_out_len = 0;")
+  w.push("        return" + if_big(ret != "~void", " 0") + ";")
+  w.push("    }}")
+  w.push("    vu_lib_jmp = &vu_jb;")
+  w.push("#endif")
+  let icall = "vu_lib_body_" + name + "(" + join(cnames, ", ") + ")"
+  if ret == "~void": w.push("    " + icall + ";")
+  else: w.push("    " + rt + " vu_res = " + icall + ";")
+  w.push("#ifndef __wasi__")
+  w.push("    vu_lib_jmp = vu_saved;")
+  w.push("#endif")
+  if ret != "~void": w.push("    return vu_res;")
+  return [proto, inner + " {{\n" + body + "\n}}\n__attribute__((visibility(\"default\"))) " + proto + " {{\n" + join(w, "\n") + "\n}}"]
 
 fn if_big(c: Bool, s: Str) -> Str:
   if c: return s
@@ -1368,12 +1405,38 @@ fn wasm_cc(os: Os) -> [Str]:
   if pz != "" and not ("No module" in pz): return ["python3", "-m", "ziglang", "cc"]
   return []
 
-# The release: tagged v0.3.0 in git. Change it with the tag.
+# The release: tagged v0.4.0 in git. Change it with the tag.
 fn vu_version() -> Str:
-  return "0.3.0"
+  return "0.4.0"
 
 # vu new web NAME: a folder NAME with a web app to start from (main.vu, public/, a Dockerfile, a
 # fly.toml and a README that says how to run and deploy it). It writes nothing if NAME exists.
+# vu speedup FILE.py:FUNC ...: the helper (rt/speedup.py, carried inside vuc) run with Python, given this
+# compiler and the llms.txt beside it (for the prompt a model or an agent gets).
+fn speedup_cmd(fs: Fs, os: Os, argv: [Str]) -> Int:
+  let work = fs.temp_dir() else ""
+  if work == "":
+    eprint("vu: can't make a temporary folder")
+    return 3
+  let helper = work + "/vu_speedup.py"
+  fs.write(helper, rt_speedup_py()) else return 3
+  var exe = args()[0] + ""
+  if exe.len == 0 or exe[0] != '/': exe = os.env("PWD") + "/" + exe
+  var py = os.env("PYTHON")
+  if py == "": py = "python3"
+  var cmd = [py, helper]
+  for i in 2..argv.len: cmd.push(argv[i] + "")
+  cmd.push("--vu")
+  cmd.push(exe + "")
+  let llms = norm_path(dir_of(exe) + "/../llms.txt")
+  if fs.exists(llms):
+    cmd.push("--llms")
+    cmd.push(llms + "")
+  let rc = os.run(cmd) else 127
+  if rc == 127: eprint("vu speedup needs Python 3 (python3, or PYTHON=path)")
+  clean_up(fs, work, [helper])
+  return rc
+
 fn new_project(fs: Fs, argv: [Str]) -> Int:
   if argv.len != 4 or not (argv[2] == "web" or argv[2] == "api" or argv[2] == "app"):
     eprint("vu new web NAME: a folder NAME with a web app (pages, forms, static files) to start from")
@@ -1705,6 +1768,7 @@ fn main(fs: Fs, os: Os):
     if check and changed > 0: exit(1)
     exit(0)
   if argv.len >= 2 and argv[1] == "new": exit(new_project(fs, argv))
+  if argv.len >= 2 and argv[1] == "speedup": exit(speedup_cmd(fs, os, argv))
   if argv.len >= 2 and (argv[1] == "version" or argv[1] == "--version"):
     print("vu " + vu_version())
     exit(0)
