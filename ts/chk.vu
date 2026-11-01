@@ -76,6 +76,7 @@ fn decl_type(var c: C, s: Int) -> Int:
       let et = check_expr(&c, c.t.a[d], -1)
       return widen(&c, et)
     if k == ast.N_DECL:
+      if c.t.k[c.t.a[d]] != ast.N_ID: return pattern_sym_type(&c, s, d)
       if c.t.b[d] >= 0: return bind.type_from(&c, c.t.b[d])
       let p = bind.up(c, d)
       # for (const x of xs)
@@ -85,7 +86,6 @@ fn decl_type(var c: C, s: Int) -> Int:
           if c.t.f[pp] == 0: return c.string_t
           let h2_ = check_expr(&c, c.t.b[pp], -1)
           return element_type(&c, h2_, c.t.b[pp])
-      if c.t.k[c.t.a[d]] != ast.N_ID: return unsup(&c, d, "a destructuring declaration")
       if c.t.c[d] < 0:
         if p >= 0 and c.t.k[p] == ast.N_VAR and c.t.f[p] == 2: return c.any_t
         return c.any_t
@@ -104,9 +104,183 @@ fn decl_type(var c: C, s: Int) -> Int:
       return regular_obj(&c, h4_)
     # catch (e)
     return c.unknown_t
-  if (sk & S_PARAM) != 0: return param_type(&c, d)
+  if (sk & S_PARAM) != 0:
+    if c.t.k[d] == ast.N_PARAM and c.t.k[c.t.a[d]] != ast.N_ID: return pattern_sym_type(&c, s, d)
+    return param_type(&c, d)
   if (sk & S_FUNC) != 0: return func_type(&c, s)
   return bind.compute_sym_type(&c, s)
+
+# A name bound by a destructuring pattern: the pattern's types are worked out once (from the
+# declaration's annotation, else its initializer, else the element of what's iterated).
+fn pattern_sym_type(var c: C, s: Int, d: Int) -> Int:
+  let pat = c.t.a[d]
+  if not (pat in c.ntype):
+    c.ntype[pat] = c.any_t
+    var src = -1
+    var mutable = false
+    if c.t.k[d] == ast.N_PARAM:
+      src = param_type(&c, d)
+      if c.t.b[d] < 0 and not (d in c.ptype_ctx) and c.t.c[d] < 0: return unsup(&c, d, "a destructuring parameter without a type")
+    else:
+      let p = bind.up(c, d)
+      mutable = p >= 0 and c.t.k[p] == ast.N_VAR and c.t.f[p] != 2
+      var pp = -1
+      if p >= 0: pp = bind.up(c, p)
+      if c.t.b[d] >= 0: src = bind.type_from(&c, c.t.b[d])
+      elif pp >= 0 and c.t.k[pp] == ast.N_FORIN and c.t.a[pp] == p:
+        if c.t.f[pp] == 0: src = c.string_t
+        else:
+          let ot = check_expr(&c, c.t.b[pp], -1)
+          src = element_type(&c, ot, c.t.b[pp])
+      elif c.t.c[d] >= 0:
+        src = pattern_init_type(&c, pat, c.t.c[d])
+      else:
+        return unsup(&c, d, "a destructuring declaration without an initializer")
+    bind_pattern(&c, pat, src, mutable)
+  # the binding's own name node
+  var ids: [Int] = []
+  bind.binding_ids(c, pat, &ids)
+  for id in ids:
+    if id in c.nsym and c.nsym[id] == s and id in c.ntype: return c.ntype[id]
+  return c.any_t
+
+# An initializer checked for a pattern: an array literal for an array pattern is a tuple.
+fn pattern_init_type(var c: C, pat: Int, init: Int) -> Int:
+  var e = init
+  while c.t.k[e] == ast.N_PAREN: e = c.t.a[e]
+  if c.t.k[pat] == ast.N_ARRPAT and c.t.k[e] == ast.N_ARRAY:
+    let ctx = types.new_obj(&c, OK_TUPLE, -1, pat)
+    let o = c.ta[ctx]
+    for el in kids(c, c.t.a[pat]):
+      c.objs[o].args.push(c.any_t)
+      c.objs[o].eflags.push(0)
+    return check_expr(&c, init, ctx)
+  return check_expr(&c, init, -1)
+
+# The types of the names in a pattern, from the type it takes apart.
+fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
+  let k = c.t.k[pat]
+  var src = src0
+  if k == ast.N_ID:
+    var t = src
+    if mutable: t = widen(&c, t)
+    c.ntype[pat] = regular_obj(&c, t)
+    return
+  if is_any(c, src):
+    var ids: [Int] = []
+    bind.binding_ids(c, pat, &ids)
+    for id in ids: c.ntype[id] = src
+    return
+  if k == ast.N_OBJPAT:
+    src = non_null(&c, src, pat)
+    var named: [Int] = []
+    for e in kids(c, c.t.a[pat]):
+      if c.t.k[e] != ast.N_BINDEL: continue
+      if (c.t.f[e] & ast.M_REST) != 0:
+        # ...rest: what's left of the object
+        let rt = types.anon_obj(&c, -1, e)
+        for m in types.members(c, src):
+          if c.tk[m] != TK_OBJ: continue
+          for nmid in bind.prop_names(&c, m):
+            if types.has_int(named, nmid) or nmid in c.objs[c.ta[rt]].props: continue
+            let ps = bind.get_prop(&c, m, nmid)
+            if ps >= 0: types.add_prop(&c, rt, nmid, ps)
+        c.objs[c.ta[rt]].resolved = true
+        bind_pattern(&c, c.t.b[e], rt, mutable)
+        continue
+      var pn = c.t.a[e]
+      if pn < 0: pn = c.t.b[e]
+      var name = -1
+      let pk = c.t.k[pn]
+      if pk == ast.N_ID or pk == ast.N_STR: name = c.t.s[pn]
+      elif pk == ast.N_NUM:
+        let ntext = types.num_text(bind.num_value(c.t.names[c.t.s[pn]]))
+        name = ast.intern(&c.t, ntext)
+      else:
+        unsup(&c, pn, "a computed name in a destructuring pattern")
+        return
+      named.push(name)
+      var pts: [Int] = []
+      for m in types.members(c, src):
+        if is_any(c, m):
+          pts.push(m)
+          continue
+        let ps = prop_of(&c, m, name)
+        if ps >= 0:
+          var pt = bind.prop_type_for(&c, ps, m)
+          if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+          pts.push(pt)
+          continue
+        let a = rel.apparent(&c, m)
+        let si = bind.index_type(&c, a, false)
+        if si >= 0:
+          pts.push(si)
+          continue
+        if c.t.c[e] < 0 or c.tk[m] != TK_OBJ:
+          let shown = show.show(&c, src)
+          err(&c, pn, 2339, "Property '" + nm(c, name) + "' does not exist on type '" + shown + "'.")
+          pts.push(c.error_t)
+        else:
+          unsup(&c, e, "a default for a missing property")
+          return
+      var pt = types.union_of(&c, pts)
+      pt = with_default(&c, e, pt)
+      bind_pattern(&c, c.t.b[e], pt, mutable)
+    return
+  if k == ast.N_ARRPAT:
+    src = non_null(&c, src, pat)
+    var i = 0
+    for e in kids(c, c.t.a[pat]):
+      if c.t.k[e] == ast.N_OMIT:
+        i += 1
+        continue
+      if (c.t.f[e] & ast.M_REST) != 0:
+        var rt = -1
+        if c.tk[src] == TK_OBJ and c.objs[c.ta[src]].kind == OK_TUPLE:
+          let so = c.ta[src]
+          rt = types.new_obj(&c, OK_TUPLE, -1, e)
+          let ro = c.ta[rt]
+          for j in i..c.objs[so].args.len:
+            c.objs[ro].args.push(c.objs[so].args[j])
+            c.objs[ro].eflags.push(c.objs[so].eflags[j])
+        elif rel.is_array_ref(&c, src):
+          rt = bind.array_of(&c, c.objs[c.ta[src]].args[0])
+        else:
+          unsup(&c, e, "a rest element of this type")
+          return
+        bind_pattern(&c, c.t.b[e], rt, mutable)
+        break
+      var et = -1
+      if c.tk[src] == TK_OBJ and c.objs[c.ta[src]].kind == OK_TUPLE:
+        let so = c.ta[src]
+        if i < c.objs[so].args.len:
+          et = c.objs[so].args[i]
+          if c.objs[so].eflags[i] == 1: et = types.union_of(&c, [et, c.undef_t])
+        elif c.t.c[e] >= 0:
+          et = c.undef_t
+        else:
+          let shown = show.show(&c, src)
+          err(&c, e, 2493, "Tuple type '" + shown + "' of length '{c.objs[so].args.len}' has no element at index '{i}'.")
+          et = c.error_t
+      elif rel.is_array_ref(&c, src): et = c.objs[c.ta[src]].args[0]
+      elif c.tk[src] == TK_STRING: et = c.string_t
+      else:
+        unsup(&c, e, "destructuring this type")
+        return
+      et = with_default(&c, e, et)
+      bind_pattern(&c, c.t.b[e], et, mutable)
+      i += 1
+    return
+  unsup(&c, pat, "this destructuring pattern")
+
+# A binding's default: undefined leaves the type, the default's type joins it.
+fn with_default(var c: C, e: Int, t: Int) -> Int:
+  let dn = c.t.c[e]
+  if dn < 0: return t
+  let base = types.filter_union(&c, t, true, false)
+  let dt = check_expr(&c, dn, base)
+  if c.tk[base] == TK_NEVER: return widen(&c, dt)
+  return types.union_of(&c, [base, dt])
 
 # const x = cond ? 1 : 2 keeps 1 | 2; nested parts of objects widen.
 fn widen_nested(var c: C, t: Int) -> Int:
@@ -399,6 +573,20 @@ type Fact:
 fn current_type(var c: C, e: Int) -> Int:
   return check_expr(&c, e, -1)
 
+# a?.b truthy: a (each object before a ?.) isn't null or undefined.
+fn chain_roots(var c: C, e: Int, var out: [Fact]):
+  var x = e
+  while x >= 0:
+    let k = c.t.k[x]
+    if k != ast.N_PROPACCESS and k != ast.N_ELEMACCESS and k != ast.N_CALL: return
+    let obj = c.t.a[x]
+    if (c.t.f[x] & 1) != 0:
+      let key = ref_key(&c, obj)
+      if key != "":
+        let t = current_type(&c, obj)
+        out.push(Fact(key, types.filter_union(&c, t, true, true)))
+    x = obj
+
 fn facts(var c: C, e: Int, truth: Bool, var out: [Fact]):
   let k = c.t.k[e]
   if k == ast.N_PAREN:
@@ -407,6 +595,7 @@ fn facts(var c: C, e: Int, truth: Bool, var out: [Fact]):
   if k == ast.N_PREFIX and c.t.f[e] == scan.T_BANG:
     facts(&c, c.t.a[e], not truth, &out)
     return
+  if truth: chain_roots(&c, e, &out)
   if k == ast.N_ID or k == ast.N_PROPACCESS:
     let key = ref_key(&c, e)
     if key == "": return
@@ -671,13 +860,18 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
     push_facts(&c, cond, false)
     let b = check_expr(&c, c.t.c[n], ctx)
     c.narrow.pop()
-    return union_fresh(&c, [a, b])
+    # subtype reduction (identical function types from different members become one)
+    let u = union_fresh(&c, [a, b])
+    if c.tk[u] == TK_UNION and not (u in c.freg):
+      var objs = 0
+      for m in types.members(c, u):
+        if c.tk[m] == TK_OBJ: objs += 1
+      if objs > 1: return subtype_reduce(&c, types.members(c, u))
+    return u
   if k == ast.N_AS or k == ast.N_SATISFIES:
     let tn = c.t.b[n]
     if c.t.k[tn] == ast.N_TREF and c.t.k[c.t.a[tn]] == ast.N_ID and nm(c, c.t.s[c.t.a[tn]]) == "const":
-      let et = check_expr(&c, c.t.a[n], -1)
-      if types.is_literal(c, et): return types.regular(c, et)
-      return unsup(&c, n, "as const on an object or array")
+      return const_type(&c, c.t.a[n])
     let target = bind.type_from(&c, tn)
     let et = check_expr(&c, c.t.a[n], target)
     if k == ast.N_SATISFIES:
@@ -904,12 +1098,16 @@ fn prop_access(var c: C, n: Int) -> Int:
   if c.tk[ot] == TK_NEVER:
     bind.err_at(&c, n, c.t.d[n], 2339, "Property '" + nm(c, name) + "' does not exist on type 'never'.")
     return c.error_t
+  if c.tk[ot] == TK_INTER: return inter_prop(&c, n, ot, name)
   var ts: [Int] = []
   for m in types.members(c, ot):
     if is_any(c, m):
       ts.push(m)
       continue
     if c.tk[m] == TK_NEVER: continue
+    if c.tk[m] == TK_INTER:
+      ts.push(inter_prop(&c, n, m, name))
+      continue
     let ps = prop_of(&c, m, name)
     if ps < 0:
       # an index signature answers any name
@@ -930,6 +1128,34 @@ fn prop_access(var c: C, n: Int) -> Int:
     if optional and ot != check_expr(&c, obj, -1): r = types.union_of(&c, [r, c.undef_t])
   return r
 
+# A property of an intersection: the intersection of the members that declare it (index
+# signatures only when none does).
+fn inter_prop(var c: C, n: Int, t: Int, name: Int) -> Int:
+  var ts: [Int] = []
+  var all_opt = true
+  for m in types.members_inter(c, t):
+    if is_any(c, m): return m
+    if c.tk[m] != TK_OBJ and c.tk[m] != TK_STRING and c.tk[m] != TK_NUMBER and c.tk[m] != TK_TRUE and c.tk[m] != TK_FALSE and c.tk[m] != TK_STRLIT and c.tk[m] != TK_NUMLIT: continue
+    let ps = prop_of(&c, m, name)
+    if ps < 0: continue
+    check_access(&c, n, ps, name)
+    ts.push(bind.prop_type_for(&c, ps, m))
+    if (c.sflags[ps] & SF_OPTIONAL) == 0: all_opt = false
+  if ts.len == 0:
+    for m in types.members_inter(c, t):
+      if c.tk[m] != TK_OBJ: continue
+      let am = rel.apparent(&c, m)
+      let si = bind.index_type(&c, am, false)
+      if si >= 0: ts.push(si)
+    if ts.len == 0:
+      let shown = show.show(&c, t)
+      bind.err_at(&c, n, c.t.d[n], 2339, "Property '" + nm(c, name) + "' does not exist on type '" + shown + "'.")
+      return c.error_t
+    return types.inter_of(&c, ts)
+  var r = types.inter_of(&c, ts)
+  if all_opt: r = types.union_of(&c, [r, c.undef_t])
+  return r
+
 fn elem_access(var c: C, n: Int) -> Int:
   let obj = c.t.a[n]
   let idx = c.t.b[n]
@@ -939,6 +1165,22 @@ fn elem_access(var c: C, n: Int) -> Int:
   if (c.t.f[n] & 1) != 0: ot = types.filter_union(&c, ot, true, true)
   else: ot = non_null(&c, ot, obj)
   if is_any(c, ot): return ot
+  # a union of literal keys: each key's type
+  if c.tk[it] == TK_UNION:
+    var all_lit = true
+    for km in types.members(c, it):
+      if c.tk[km] != TK_STRLIT and c.tk[km] != TK_NUMLIT: all_lit = false
+    if all_lit:
+      var ts: [Int] = []
+      for km in types.members(c, it):
+        let r = elem_of(&c, n, ot, km)
+        if c.tk[r] == TK_UNSUP or c.tk[r] == TK_ERROR: return r
+        ts.push(r)
+      return types.union_of(&c, ts)
+  return elem_of(&c, n, ot, it)
+
+fn elem_of(var c: C, n: Int, ot: Int, it: Int) -> Int:
+  let idx = c.t.b[n]
   let ik = c.tk[it]
   if ik == TK_STRLIT or ik == TK_NUMLIT:
     var pname = c.ta[it]
@@ -1022,7 +1264,7 @@ fn object_literal(var c: C, n: Int, ctx: Int) -> Int:
       let raw = check_expr(&c, c.t.b[p], pctx)
       # a property's literal widens unless its contextual type has literals (a mutable location)
       if pctx >= 0: vt = widen_in_ctx(&c, raw, pctx)
-      else: vt = widen(&c, raw)
+      else: vt = widen_lit(&c, raw)
     elif pk == ast.N_SHORTHAND:
       name = c.t.s[p]
       let idn = p
@@ -1089,7 +1331,7 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
   var ws: [Int] = []
   for x in ts:
     if elem_ctx >= 0: ws.push(widen_in_ctx(&c, x, elem_ctx))
-    else: ws.push(widen(&c, x))
+    else: ws.push(widen_lit(&c, x))
   let red = subtype_reduce(&c, ws)
   return bind.array_of(&c, red)
 
@@ -1122,8 +1364,14 @@ fn subtype_reduce(var c: C, ts: [Int]) -> Int:
 fn could_keep_literal(var c: C, t: Int) -> Bool:
   return rel.could_have_singletons(&c, t)
 
+# Literal widening only (fresh literals and unions of them).
+fn widen_lit(var c: C, x: Int) -> Int:
+  if types.is_fresh_lit(c, x) or x in c.freg: return widen(&c, x)
+  return x
+
 fn widen_in_ctx(var c: C, x: Int, ctx: Int) -> Int:
-  if not types.is_fresh_lit(c, x) and not (x in c.freg): return widen(&c, x)
+  # only literals widen here (a nested object literal was widened by its own context)
+  if not types.is_fresh_lit(c, x) and not (x in c.freg): return x
   var out: [Int] = []
   for m in types.members(c, x):
     if literal_of_ctx(&c, m, ctx): out.push(m)
@@ -1157,7 +1405,7 @@ fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
     if found != 1: csig = -1
   var i = 0
   for p in kids(c, c.t.b[n]):
-    if c.t.k[c.t.a[p]] != ast.N_ID: return unsup(&c, p, "a destructuring parameter")
+    let is_pat = c.t.k[c.t.a[p]] != ast.N_ID
     if c.t.b[p] < 0 and not (p in c.ptype_ctx):
       var pt = -1
       if csig >= 0:
@@ -1171,6 +1419,7 @@ fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
           pt = c.any_t
       if pt < 0:
         if c.t.c[p] < 0:
+          if is_pat: return unsup(&c, p, "a destructuring parameter without a type")
           err(&c, c.t.a[p], 7006, "Parameter '" + nm(c, c.t.s[c.t.a[p]]) + "' implicitly has an 'any' type.")
           pt = c.any_t
         else:
@@ -1521,7 +1770,8 @@ fn inf_mapper(var c: C, var inf: Inf, sg: Int) -> Int:
   for i in 0..inf.tps.len:
     let tp = inf.tps[i]
     var t = -1
-    let con = rel.constraint_of(&c, tp)
+    var con = rel.constraint_of(&c, tp)
+    if con >= 0 and sg in c.sig_outer: con = bind.instantiate(&c, con, c.sig_outer[sg])
     if inf.cov[i].len > 0:
       let prim = con >= 0 and prim_constraint(&c, con)
       let widen_lits = not prim and inf.top[i] and not (ret >= 0 and at_top_level(c, ret, tp))
@@ -2190,7 +2440,7 @@ fn forget_assigned(var c: C, n: Int):
 fn check_var_decl(var c: C, d: Int, kind: Int):
   let name = c.t.a[d]
   if c.t.k[name] != ast.N_ID:
-    unsup(&c, d, "a destructuring declaration")
+    check_pattern_decl(&c, d)
     return
   let s = bind.lookup_value(&c, name, c.t.s[name])
   let init = c.t.c[d]
@@ -2208,6 +2458,17 @@ fn check_var_decl(var c: C, d: Int, kind: Int):
     if init in c.ntype and c.tk[dt] == TK_UNION:
       let g8_1 = assigned_narrow(&c, dt, c.ntype[init])
       set_narrow(&c, "{s}", g8_1)
+
+fn check_pattern_decl(var c: C, d: Int):
+  let pat = c.t.a[d]
+  var ids: [Int] = []
+  bind.binding_ids(c, pat, &ids)
+  if c.t.b[d] >= 0 and c.t.c[d] >= 0:
+    let declared = bind.type_from(&c, c.t.b[d])
+    let it = check_expr(&c, c.t.c[d], declared)
+    if not rel.assignable(&c, it, declared): rel.report(&c, it, declared, pat, c.t.c[d], 2322)
+  for id in ids:
+    if id in c.nsym: bind.type_of_sym(&c, c.nsym[id])
 
 fn check_stmt(var c: C, n: Int):
   let k = c.t.k[n]
@@ -2312,8 +2573,10 @@ fn check_stmt(var c: C, n: Int):
       return
     for p in kids(c, c.t.b[n]):
       if c.t.k[c.t.a[p]] != ast.N_ID:
-        unsup(&c, p, "a destructuring parameter")
-        return
+        if c.t.b[p] < 0:
+          unsup(&c, p, "a destructuring parameter without a type")
+          return
+        continue
       if c.t.b[p] < 0 and c.t.c[p] < 0 and nm(c, c.t.s[c.t.a[p]]) != "this":
         err(&c, c.t.a[p], 7006, "Parameter '" + nm(c, c.t.s[c.t.a[p]]) + "' implicitly has an 'any' type.")
     let sg = fn_sig(&c, n)
@@ -2749,6 +3012,48 @@ fn check_class(var c: C, n: Int):
         bind.err_name(&c, n, 2559, "Type '" + cname + "' has no properties in common with type '" + iname + "'.")
         continue
       bind.err_name(&c, n, 2420, "Class '" + cname + "' incorrectly implements interface '" + iname + "'.")
+
+# An expression in a const context (x as const): literals keep their types, object literals get
+# readonly properties, array literals become readonly tuples, all the way down.
+fn const_type(var c: C, e: Int) -> Int:
+  let k = c.t.k[e]
+  if k == ast.N_PAREN: return const_type(&c, c.t.a[e])
+  if k == ast.N_OBJECT:
+    let t = types.anon_obj(&c, -1, e)
+    for p in kids(c, c.t.a[e]):
+      let pk = c.t.k[p]
+      var name = -1
+      var vt = c.any_t
+      if pk == ast.N_PROPASSIGN:
+        if c.t.k[c.t.a[p]] == ast.N_COMPUTED: return unsup(&c, p, "a computed property name")
+        name = bind.member_name(&c, p)
+        vt = const_type(&c, c.t.b[p])
+      elif pk == ast.N_SHORTHAND:
+        name = c.t.s[p]
+        vt = check_expr(&c, p, -1)
+      else: return unsup(&c, p, "this member in a const object literal")
+      if name < 0: continue
+      let ps = types.new_sym(&c, types.S_PROP, name, p)
+      c.stype[ps] = vt
+      c.sflags[ps] = SF_READONLY
+      types.add_prop(&c, t, name, ps)
+    c.objs[c.ta[t]].resolved = true
+    c.ntype[e] = t
+    return t
+  if k == ast.N_ARRAY:
+    let t = types.new_obj(&c, OK_TUPLE, -1, e)
+    let o = c.ta[t]
+    for el in kids(c, c.t.a[e]):
+      if c.t.k[el] == ast.N_SPREAD or c.t.k[el] == ast.N_OMIT: return unsup(&c, el, "a spread or hole in a const array")
+      let et = const_type(&c, el)
+      c.objs[o].args.push(et)
+      c.objs[o].eflags.push(0)
+    c.objs[o].ro = true
+    c.ntype[e] = t
+    return t
+  let et = check_expr(&c, e, -1)
+  if types.is_literal(c, et) or et in c.freg: return types.regular(c, et)
+  return et
 
 fn check_type_alias(var c: C, n: Int):
   bind.type_from(&c, c.t.b[n])

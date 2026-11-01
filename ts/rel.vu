@@ -22,6 +22,58 @@ fn assignable(var c: C, s: Int, t: Int) -> Bool:
   c.rel_cache[key] = r
   return r
 
+# Relations with deferred type-level operators that tsc decides by their constraints:
+# 1 related, 0 not related, -1 unknown here.
+fn generic_rel(var c: C, s: Int, t: Int) -> Int:
+  let sk = c.tk[s]
+  let tk = c.tk[t]
+  # a conditional type: by both of its branches
+  if sk == types.TK_COND:
+    let n = c.ta[s]
+    var infers: [Int] = []
+    tyops.collect_infers(c, c.t.b[n], &infers)
+    if infers.len == 0:
+      let tb0 = tyops.raw(&c, c.t.c[n])
+      let tb = bind.instantiate(&c, tb0, c.tb[s])
+      let fb0 = tyops.raw(&c, c.t.d[n])
+      let fb = bind.instantiate(&c, fb0, c.tb[s])
+      if assignable(&c, tb, t) and assignable(&c, fb, t): return 1
+    return -1
+  if tk == types.TK_COND:
+    let n = c.ta[t]
+    var infers: [Int] = []
+    tyops.collect_infers(c, c.t.b[n], &infers)
+    if infers.len == 0 and sk != TK_TPARAM:
+      let tb0 = tyops.raw(&c, c.t.c[n])
+      let tb = bind.instantiate(&c, tb0, c.tb[t])
+      let fb0 = tyops.raw(&c, c.t.d[n])
+      let fb = bind.instantiate(&c, fb0, c.tb[t])
+      if assignable(&c, s, tb) and assignable(&c, s, fb): return 1
+    return -1
+  # keyof T is at most string | number | symbol
+  if sk == types.TK_KEYOF:
+    let all = types.union_of(&c, [c.string_t, c.number_t, c.symbol_t])
+    if assignable(&c, all, t): return 1
+    return -1
+  # T[K]: through the constraints of T and K
+  if sk == types.TK_INDEXED:
+    var o = c.ta[s]
+    var i = c.tb[s]
+    if c.tk[o] == TK_TPARAM:
+      let co = constraint_of(&c, o)
+      if co < 0: return -1
+      o = co
+    if c.tk[i] == TK_TPARAM:
+      let ci = constraint_of(&c, i)
+      if ci < 0: return -1
+      i = ci
+    if tyops.is_generic(&c, o) or tyops.is_generic(&c, i): return -1
+    let r = tyops.indexed_of(&c, o, i)
+    if c.tk[r] == TK_UNSUP: return -1
+    if assignable(&c, r, t): return 1
+    return -1
+  return -1
+
 fn is_mapped(c: C, t: Int) -> Bool:
   return c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == types.OK_MAPPED
 
@@ -43,8 +95,11 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
   if sk == TK_ANY or sk == TK_ERROR: return tk != TK_NEVER
   if sk == TK_NEVER: return true
   if sk >= types.TK_KEYOF or tk >= types.TK_KEYOF or is_mapped(c, s) or is_mapped(c, t):
-    # generic type-level operators: not related by this checker yet
-    let u = bind.unsupported(&c, 0, "relating a generic keyof, indexed access, mapped or conditional type")
+    let r = generic_rel(&c, s, t)
+    if r == 1: return true
+    if r == 0: return false
+    # not related by this checker yet: the file isn't checked
+    let u = bind.unsupported(&c, 0, "relating a generic keyof, indexed access, mapped or conditional type [{sk} {tk} {is_mapped(c, s)} {is_mapped(c, t)}]")
     bind.touch(&c, u)
     return true
   if sk == TK_UNSUP or tk == TK_UNSUP:
@@ -235,6 +290,7 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
     return assignable(&c, c.objs[so].args[0], c.objs[to].args[0])
   if tkind == OK_TUPLE:
     if skind != OK_TUPLE: return false
+    if c.objs[so].ro and not c.objs[to].ro: return false
     let sa = c.objs[so].args.len
     let ta = c.objs[to].args.len
     var tmin = 0
@@ -245,6 +301,7 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
       if not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]): return false
     return true
   if skind == OK_TUPLE and is_array_ref(&c, t):
+    if c.objs[so].ro and not is_readonly_array(&c, t): return false
     let h1_ = bind.tuple_elem_union(&c, s)
     return assignable(&c, h1_, c.objs[to].args[0])
   # properties: a missing one first (getUnmatchedProperty), then their types
@@ -322,6 +379,17 @@ fn sig_ret(var c: C, sg: Int) -> Int:
   if c.sigs[sg].ret >= 0: return c.sigs[sg].ret
   return c.any_t
 
+# Whether a signature returns a type predicate (x is T).
+fn sig_is_pred(c: C, sg: Int) -> Bool:
+  let sn = c.sigs[sg].node
+  if sn < 0: return false
+  var rnode = -1
+  let snk = c.t.k[sn]
+  if snk == ast.N_FUNC or snk == ast.N_FUNCEXPR or snk == ast.N_ARROW: rnode = c.t.c[sn]
+  elif snk == ast.N_METHOD or snk == ast.N_CALLSIG: rnode = c.t.c[c.t.b[sn]]
+  elif snk == ast.N_TFUNC: rnode = c.t.c[c.t.b[sn]]
+  return rnode >= 0 and c.t.k[rnode] == ast.N_TPRED and c.t.f[rnode] == 0 and c.t.a[rnode] >= 0
+
 # The type of parameter i (a rest parameter's element, or its tuple's i-th), -1 if there's none.
 fn param_at_sig(var c: C, sg: types.Sig, i: Int) -> Int:
   let np = sg.ptypes.len
@@ -350,6 +418,8 @@ fn sig_assignable(var c: C, ssg0: Int, tsg: Int) -> Bool:
     ssg = bind.inst_sig(&c, ssg, m)
   let ss = types.sig_copy(c, ssg)
   let ts = types.sig_copy(c, tsg)
+  # a type predicate signature takes a predicate
+  if sig_is_pred(c, tsg) and not sig_is_pred(c, ssg): return false
   var t_has_rest = false
   for f in ts.pflags:
     if f == 2: t_has_rest = true
@@ -426,6 +496,14 @@ fn report(var c: C, s: Int, t0: Int, node: Int, expr: Int, code: Int):
   let t = report_target(&c, s, t0)
   let sk = c.tk[s]
   let tk = c.tk[t]
+  if sk == TK_OBJ and tk == TK_OBJ:
+    let s_ro = is_readonly_array(&c, s) or (obj_kind(c, s) == OK_TUPLE and c.objs[c.ta[s]].ro)
+    let t_mut = (is_array_ref(&c, t) and not is_readonly_array(&c, t)) or (obj_kind(c, t) == OK_TUPLE and not c.objs[c.ta[t]].ro)
+    if s_ro and t_mut:
+      let ss = show.show(&c, s)
+      let ts = show.show(&c, t)
+      bind.err(&c, node, 4104, "The type '" + ss + "' is 'readonly' and cannot be assigned to the mutable type '" + ts + "'.")
+      return
   if sk == TK_OBJ and tk == TK_OBJ:
     if excess(&c, s, t, node): return
   if tk == TK_OBJ and weak_fails(&c, s, t):

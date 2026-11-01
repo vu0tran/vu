@@ -220,13 +220,45 @@ fn declare_globals(var c: C, root: Int):
   var tys: {Int: Int} = {}
   swap(&vals, &c.globals)
   swap(&tys, &c.gtypes)
+  let user = c.t.file[root] >= c.user_from
   for st in ast.items(c.t, root):
     if c.t.k[st] == ast.N_MODULE and (c.t.f[st] & ast.MOD_GLOBAL) != 0:
       for inner in ast.items(c.t, c.t.b[st]): declare_in(&c, &vals, &tys, inner)
+    elif user and c.t.k[st] == ast.N_VAR:
+      # a script's let or const over a global of the same name: TS2451 at both, the first stays
+      var before: {Int: Int} = {}
+      for d in ast.items(c.t, c.t.a[st]):
+        var ids: [Int] = []
+        binding_ids(c, c.t.a[d], &ids)
+        for id in ids:
+          if c.t.s[id] in vals: before[c.t.s[id]] = vals[c.t.s[id]]
+      declare_in(&c, &vals, &tys, st)
+      for name, old in before:
+        let os = old
+        let ns = vals[name]
+        let block_new = (c.sk[ns] & (S_LET | S_CONST)) != 0
+        let block_old = (c.sk[os] & (S_LET | S_CONST | S_CLASS)) != 0
+        if block_new or block_old:
+          redeclared(&c, os, name)
+          redeclared(&c, ns, name)
+          vals[name] = os
     else:
       declare_in(&c, &vals, &tys, st)
   swap(&vals, &c.globals)
   swap(&tys, &c.gtypes)
+
+# TS2451 at a block-scoped declaration's name (in a lib file too: tsc reports those).
+fn redeclared(var c: C, s: Int, name: Int):
+  let d = c.sdecl[s]
+  if d < 0: return
+  var at = d
+  if c.t.k[d] == ast.N_DECL: at = c.t.a[d]
+  var ids: [Int] = []
+  binding_ids(c, c.t.a[d], &ids)
+  for id in ids:
+    if c.t.s[id] == name: at = id
+  let f = c.t.file[at]
+  c.diags.push(parse.Diag(f, c.t.pos[at], c.t.end[at], 2451, "Cannot redeclare block-scoped variable '" + nm(c, name) + "'."))
 
 # A module's declare global { ... } blocks add to the globals.
 fn declare_global_blocks(var c: C, root: Int):
@@ -679,6 +711,20 @@ fn tparam_here(var c: C, n: Int, name: Int) -> Int:
 
 fn tparam_sym(var c: C, tp: Int) -> Int:
   if tp in c.nsym: return c.nsym[tp]
+  # merged interface declarations share their type parameters (by position)
+  let lst = c.parent[tp]
+  let decl = up(c, tp)
+  if lst >= 0 and decl >= 0 and (c.t.k[decl] == ast.N_INTERFACE or c.t.k[decl] == ast.N_CLASS) and c.t.a[decl] == lst and decl in c.nsym:
+    let owner = c.nsym[decl]
+    let first = c.sdecl[owner]
+    if first != decl and first >= 0 and (c.t.k[first] == ast.N_INTERFACE or c.t.k[first] == ast.N_CLASS) and c.t.a[first] >= 0:
+      let mine = ast.items(c.t, lst)
+      let theirs = ast.items(c.t, c.t.a[first])
+      for i in 0..mine.len:
+        if mine[i] == tp and i < theirs.len:
+          let fs = tparam_sym(&c, theirs[i])
+          c.nsym[tp] = fs
+          return fs
   let s = types.new_sym(&c, S_TPARAM, c.t.s[tp], tp)
   c.nsym[tp] = s
   let t = types.mk(&c, TK_TPARAM, types.F_TPARAM, s, 0)
@@ -747,7 +793,9 @@ fn type_from(var c: C, n: Int) -> Int:
       if c.t.k[inner] == ast.N_TARRAY:
         let g2_35 = type_from(&c, c.t.a[inner])
         return readonly_array_of(&c, g2_35)
-      return type_from(&c, inner)
+      let it = type_from(&c, inner)
+      if c.t.k[inner] == ast.N_TTUPLE and c.tk[it] == TK_OBJ: c.objs[c.ta[it]].ro = true
+      return it
     if op == scan.W_UNIQUE: return c.symbol_t
     let kt = type_from(&c, c.t.a[n])
     return tyops.keyof_of(&c, kt)
@@ -1347,7 +1395,9 @@ fn get_prop(var c: C, t: Int, name: Int) -> Int:
       if c.objs[o].eflags[idx] == 1: c.sflags[r] = SF_OPTIONAL
     else:
       let g1_4 = tuple_elem_union(&c, t)
-      let h6_ = array_of(&c, g1_4)
+      var h6_ = -1
+      if c.objs[o].ro: h6_ = readonly_array_of(&c, g1_4)
+      else: h6_ = array_of(&c, g1_4)
       r = get_prop(&c, h6_, name)
   c.prop_cache[key] = r
   return r
@@ -1520,6 +1570,7 @@ fn instantiate(var c: C, t: Int, m: Int) -> Int:
       let ro = c.ta[r]
       for a in args: c.objs[ro].args.push(a)
       for f in types.ints(c.objs[o].eflags): c.objs[ro].eflags.push(f)
+      c.objs[ro].ro = c.objs[o].ro
   elif kind == OK_ANON:
     if mentions_tparams(&c, t):
       r = types.new_obj(&c, OK_INST, -1, c.objs[o].node)
@@ -1572,4 +1623,9 @@ fn inst_sig(var c: C, sg: Int, m: Int) -> Int:
   c.sigs[r].min = s.min
   if s.ret >= 0: c.sigs[r].ret = instantiate(&c, s.ret, m)
   if s.this_t >= 0: c.sigs[r].this_t = instantiate(&c, s.this_t, m)
+  # its own type parameters' constraints are seen through m too
+  if s.tparams.len > 0:
+    var om = m
+    if sg in c.sig_outer: om = tyops.compose(&c, c.sig_outer[sg], m)
+    c.sig_outer[r] = om
   return r
