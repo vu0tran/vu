@@ -1,0 +1,6 @@
+const pm = require('/dev/shm/knip/ref/node_modules/picomatch');
+const pats = ['**/dist','**/*.log','**/.cache','**/x.js','**/*.{bench,test,test-d,spec,spec-d}.?(c|m)[jt]s?(x)','**/__mocks__/**/*.?(c|m)[jt]s?(x)','{index,cli,main}.{js,mjs,cjs,jsx,ts,tsx,mts,cts}','src/{index,cli,main}.{js,mjs,cjs,jsx,ts,tsx,mts,cts}','**/*.{js,mjs,cjs,jsx,ts,tsx,mts,cts}','**/node_modules','**/node_modules/**','**/dist','**/dist/**','**/*{.,-,_}test.{cjs,mjs,js,cts,mts,ts}','**/test-*.{cjs,mjs,js,cts,mts,ts}','**/test/**/*.{cjs,mjs,js,cts,mts,ts}','.github/workflows/*.{yml,yaml}','**/*.log','src/!(foo).ts','**/.*','**/*.d.ts','test/**','*.config.?(c|m)js','**/{a,b{c,d}}/x.js'];
+const paths = ['src/a.test.ts','src/a.spec.mjs','a.test-d.tsx','test/x.ts','src/__mocks__/a/b.cjs','index.ts','src/index.mts','src/main.jsx','lib/index.ts','node_modules','x/node_modules/y.js','dist/a.js','a/dist','foo.test.js','foo-test.cts','test-foo.ts','test/sub/a.js','.github/workflows/ci.yml','a.log','src/foo.ts','src/bar.ts','.eslintrc.js','src/.hidden.ts','.vitepress/dist/a.js','x.d.ts','test/a/b','vite.config.mjs','bd/x.js','a/bc/x.js','.x/test/a.js'];
+const out=[];
+for (const p of pats) for (const dot of [false,true]) for (const s of paths) out.push(`${p}\t${dot?1:0}\t${s}\t${pm(p,{dot})(s)?1:0}`);
+console.log(out.join('\n'));
