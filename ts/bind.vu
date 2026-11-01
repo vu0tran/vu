@@ -94,7 +94,297 @@ fn up(c: C, n: Int) -> Int:
   while p >= 0 and c.t.k[p] == ast.N_LIST: p = c.parent[p]
   return p
 
+# ---- names not found (TypeScript's onFailedToResolveSymbol for an identifier)
+
+fn is_fn_like(k: Int) -> Bool:
+  return k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET
+
+# getThisContainer without arrow functions: the nearest function, member or static block.
+fn this_container(c: C, n: Int) -> Int:
+  var x = up(c, n)
+  while x >= 0:
+    let k = c.t.k[x]
+    if k != ast.N_ARROW and is_fn_like(k): return x
+    if k == ast.N_PROP or k == ast.N_STATICBLOCK or k == ast.N_MODULE or k == ast.N_ENUMMEMBER: return x
+    x = up(c, x)
+  return -1
+
+# A class member named like the missing name: TypeScript asks for this.x or K.x.
+fn missing_prefix(var c: C, e: Int, name: Int) -> Bool:
+  let container = this_container(c, e)
+  var loc = container
+  while loc >= 0:
+    let p = up(c, loc)
+    if p >= 0 and (c.t.k[p] == ast.N_CLASS or c.t.k[p] == ast.N_CLASSEXPR):
+      if not (p in c.nsym): return false
+      let s = c.nsym[p]
+      let ct = type_of_sym(&c, s)
+      touch(&c, ct)
+      if get_prop(&c, ct, name) >= 0:
+        err(&c, e, 2662, "Cannot find name '" + nm(c, name) + "'. Did you mean the static member '" + nm(c, c.sname[s]) + "." + nm(c, name) + "'?")
+        return true
+      let static = (c.t.f[loc] & ast.M_STATIC) != 0 or c.t.k[loc] == ast.N_STATICBLOCK
+      if loc == container and not static:
+        let it = self_type(&c, s)
+        touch(&c, it)
+        if get_prop(&c, it, name) >= 0:
+          err(&c, e, 2663, "Cannot find name '" + nm(c, name) + "'. Did you mean the instance member 'this." + nm(c, name) + "'?")
+          return true
+    loc = p
+  return false
+
+fn ascii(s: Str) -> Bool:
+  for i in 0..s.len:
+    if s[i] >= 128: return false
+  return true
+
+# compareSymbols: by first declaration (file, then position), those without one last by name.
+fn sort_syms(c: C, var xs: [Int]):
+  for i in 1..xs.len:
+    var j = i
+    while j > 0 and sym_after(c, xs[j - 1], xs[j]):
+      xs.swap(j - 1, j)
+      j -= 1
+
+fn sym_after(c: C, a: Int, b: Int) -> Bool:
+  let da = c.sdecl[a]
+  let db = c.sdecl[b]
+  if da >= 0 and db >= 0:
+    let fa = c.t.file[da]
+    let fb = c.t.file[db]
+    if fa != fb: return fa > fb
+    return c.t.pos[da] > c.t.pos[db]
+  if da >= 0: return false
+  if db >= 0: return true
+  return c.t.names[c.sname[a]] > c.t.names[c.sname[b]]
+
+fn sorted_names(c: C, table: {Int: Int}, values: Bool) -> [Str]:
+  var syms: [Int] = []
+  for k, s in table:
+    if values and (c.sk[s] & (S_VALUE | types.S_IMPORT)) == 0: continue
+    syms.push(s)
+  sort_syms(c, &syms)
+  var out: [Str] = []
+  for s in syms: out.push(c.t.names[c.sname[s]] + "")
+  return out
+
+fn in_class_extends(c: C, e: Int) -> Bool:
+  let p = up(c, e)
+  if p < 0 or c.t.k[p] != ast.N_EXPRTARGS: return false
+  let q = up(c, p)
+  return q >= 0 and (c.t.k[q] == ast.N_CLASS or c.t.k[q] == ast.N_CLASSEXPR) and c.t.b[q] == p
+
+# The body block of a function-like node (-1 if none or an expression body).
+fn fn_body(c: C, f: Int) -> Int:
+  let k = c.t.k[f]
+  var b = -1
+  if k == ast.N_FUNC: b = c.t.d[f]
+  elif k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET or k == ast.N_FUNCEXPR or k == ast.N_ARROW: b = c.t.c[f]
+  if b >= 0 and c.t.k[b] == ast.N_BLOCK: return b
+  return -1
+
+# Candidate names, scope by scope as TypeScript's resolver looks (the first scope with a close
+# enough name wins): a function's parameters, type parameters and body are one scope there.
+fn suggestion(var c: C, at: Int, text: Str, values: Bool) -> Str:
+  var n = at
+  var prev = at
+  var done: {Int: Bool} = {}
+  while n >= 0:
+    if not (n in done):
+      var syms: [Int] = []
+      var have = false
+      var group: [Int] = [n]
+      let p = up(c, n)
+      if c.t.k[n] == ast.N_BLOCK and p >= 0 and is_fn_like(c.t.k[p]) and fn_body(c, p) == n: group.push(p)
+      if is_fn_like(c.t.k[n]):
+        let bd = fn_body(c, n)
+        if bd >= 0: group.push(bd)
+      for g in group:
+        done[g] = true
+        if not values:
+          let tl = tparams_of(c, g)
+          if tl >= 0:
+            have = true
+            for tp in ast.items(c.t, tl): syms.push(tparam_sym(&c, tp))
+          let kg = c.t.k[g]
+          if kg == ast.N_TMAPPED and c.t.a[g] >= 0 and prev != c.t.a[g]:
+            have = true
+            syms.push(tparam_sym(&c, c.t.a[g]))
+          if kg == ast.N_TCOND and prev == c.t.c[g] and has_infer(c, c.t.b[g]): return "?"
+        if is_scope(c, g):
+          var ok = true
+          if c.t.k[g] == ast.N_TRY and prev != c.t.c[g] and g == n: ok = false
+          let is_file = c.t.k[g] == ast.N_LIST and c.t.d[g] == -2
+          if is_file and not file_is_module(&c, g): ok = false
+          if ok:
+            scope_names(&c, g)
+            have = true
+            if values:
+              for k, s in c.locals[g]:
+                if (c.sk[s] & (S_VALUE | types.S_IMPORT)) != 0: syms.push(s)
+            else:
+              for k, s in c.ltypes[g]: syms.push(s)
+      if have:
+        sort_syms(c, &syms)
+        var names: [Str] = []
+        for s in syms: names.push(c.t.names[c.sname[s]] + "")
+        let got = spelling(text, names)
+        if got != "":
+          # from a function's parameters or return type, only its type parameters count for types
+          # (TypeScript drops anything else it found there and looks further out)
+          let from_outside = is_fn_like(c.t.k[n]) and prev != fn_body(c, n)
+          if not from_outside: return got
+          var gs = -1
+          for s in syms:
+            if c.t.names[c.sname[s]] == got: gs = s
+          if gs >= 0 and (c.sk[gs] & S_TPARAM) != 0: return got
+          if values: return "?"
+    prev = n
+    n = c.parent[n]
+  var gl = sorted_names(c, c.globals, true)
+  if values:
+    if not ("globalThis" in c.t.ids and c.t.ids["globalThis"] in c.globals): gl.push("globalThis")
+    if not ("undefined" in c.t.ids and c.t.ids["undefined"] in c.globals): gl.push("undefined")
+    return spelling(text, gl)
+  var syms: [Int] = []
+  for k, s in c.gtypes: syms.push(s)
+  sort_syms(c, &syms)
+  var names: [Str] = []
+  for s in syms:
+    if c.sdecl[s] >= 0: names.push(c.t.names[c.sname[s]] + "")
+  # the primitives TypeScript adds to the globals (no declaration: last, by name), then the rest
+  var tail: [Str] = []
+  for s in syms:
+    if c.sdecl[s] < 0: tail.push(c.t.names[c.sname[s]] + "")
+  for pn in ["string", "number", "boolean", "object", "bigint", "symbol"]: tail.push(pn)
+  tail.sort()
+  for x in tail: names.push(x)
+  return spelling(text, names)
+
+fn has_infer(c: C, n: Int) -> Bool:
+  if n < 0: return false
+  let k = c.t.k[n]
+  if k == ast.N_TINFER: return true
+  if k == ast.N_LIST:
+    for x in ast.items(c.t, n):
+      if has_infer(c, x): return true
+    return false
+  if k < ast.N_TREF or k > ast.N_TREST: return false
+  if k == ast.N_TOBJ or k == ast.N_TFUNC: return true   # (not looked into)
+  return has_infer(c, c.t.a[n]) or has_infer(c, c.t.b[n]) or has_infer(c, c.t.c[n]) or has_infer(c, c.t.d[n])
+
+fn value_suggestion(var c: C, at: Int, text: Str) -> Str:
+  return suggestion(&c, at, text, true)
+
+# The error for a type name that resolves to nothing, as TypeScript reports it (false: unsure).
+fn type_not_found(var c: C, e: Int, name: Int) -> Bool:
+  let text = nm(c, name)
+  let vs = lookup_value(&c, e, name)
+  if vs >= 0:
+    if (c.sk[vs] & S_NAMESPACE) != 0: return false
+    err(&c, e, 2749, "'" + text + "' refers to a value, but is being used as a type here. Did you mean 'typeof " + text + "'?")
+    return true
+  if not ascii(text): return false
+  let sug = suggestion(&c, e, text, false)
+  if sug == "?": return false
+  return report_not_found(&c, e, text, sug)
+
+# The error for a value name that resolves to nothing, as TypeScript reports it. False when the
+# checker can't tell which message TypeScript gives (the file is then left unchecked).
+fn value_not_found(var c: C, e: Int, name: Int, in_typeof: Bool) -> Bool:
+  let text = nm(c, name)
+  if not in_typeof and missing_prefix(&c, e, name): return true
+  if in_class_extends(c, e) and lookup_type(&c, e, name) >= 0: return false
+  let ty = lookup_type(&c, e, name)
+  if ty >= 0 and (c.sk[ty] & S_NAMESPACE) != 0: return false
+  if text == "any" or text == "string" or text == "number" or text == "boolean" or text == "never" or text == "unknown" or (ty >= 0 and (c.sk[ty] & S_VALUE) == 0):
+    # (in a heritage clause or a type literal TypeScript says more)
+    var x = up(c, e)
+    while x >= 0:
+      let k = c.t.k[x]
+      if k == ast.N_CLASS or k == ast.N_CLASSEXPR or k == ast.N_INTERFACE or k == ast.N_TOBJ: return false
+      if is_fn_like(k) or is_scope(c, x): break
+      x = up(c, x)
+    err(&c, e, 2693, "'" + text + "' only refers to a type, but is being used as a value here.")
+    return true
+  c.nf_count += 1
+  if not ascii(text): return false   # (tsc 7 has no limit on suggestions; tsc 6 stops after 10)
+  let sug = value_suggestion(&c, e, text)
+  if sug == "?": return false
+  return report_not_found(&c, e, text, sug)
+
+fn report_not_found(var c: C, e: Int, text: Str, sug: Str) -> Bool:
+  if sug != "":
+    err(&c, e, 2552, "Cannot find name '" + text + "'. Did you mean '" + sug + "'?")
+    return true
+  let pre = "Cannot find name '" + text + "'. Do you need to install type definitions for "
+  if text == "process" or text == "require" or text == "Buffer" or text == "module" or text == "NodeJS":
+    err(&c, e, 2591, pre + "node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.")
+  elif text == "$":
+    err(&c, e, 2592, pre + "jQuery? Try `npm i --save-dev @types/jquery` and then add 'jquery' to the types field in your tsconfig.")
+  elif text == "beforeEach" or text == "describe" or text == "suite" or text == "it" or text == "test":
+    err(&c, e, 2593, pre + "a test runner? Try `npm i --save-dev @types/jest` or `npm i --save-dev @types/mocha` and then add 'jest' or 'mocha' to the types field in your tsconfig.")
+  elif text == "Bun":
+    err(&c, e, 2868, pre + "Bun? Try `npm i --save-dev @types/bun` and then add 'bun' to the types field in your tsconfig.")
+  else:
+    err(&c, e, 2304, "Cannot find name '" + text + "'.")
+  return true
+
 # ---- declaring
+
+# A symbol's declarations in source order (vars from nested blocks are declared after the rest).
+fn sort_decls(var c: C, s: Int):
+  var ds = types.sym_decls(c, s)
+  ds.sort(by: fn(a, b) => c.t.pos[a] < c.t.pos[b])
+  c.sdecl[s] = ds[0]
+  var rest: [Int] = []
+  for i in 1..ds.len: rest.push(ds[i])
+  c.smore[s] = rest
+
+# A var statement (function-scoped: it belongs to the enclosing function or file).
+fn is_var_stmt(c: C, st: Int) -> Bool:
+  return c.t.k[st] == ast.N_VAR and decl_kind_of_var(c, st) == S_VAR
+
+# The var statements nested in blocks of these statements (not in functions or classes), with the
+# statement or block each is in.
+fn nested_vars(c: C, st: Int, holder: Int, var out: [Int], var where: [Int]):
+  if st < 0: return
+  let k = c.t.k[st]
+  if k == ast.N_VAR:
+    if holder >= 0 and decl_kind_of_var(c, st) == S_VAR:
+      out.push(st)
+      where.push(holder)
+  elif k == ast.N_BLOCK:
+    for x in ast.items(c.t, c.t.a[st]): nested_vars(c, x, st, &out, &where)
+  elif k == ast.N_IF:
+    nested_vars(c, c.t.b[st], st, &out, &where)
+    nested_vars(c, c.t.c[st], st, &out, &where)
+  elif k == ast.N_WHILE: nested_vars(c, c.t.b[st], st, &out, &where)
+  elif k == ast.N_LABEL: nested_vars(c, c.t.a[st], st, &out, &where)
+  elif k == ast.N_DO: nested_vars(c, c.t.a[st], st, &out, &where)
+  elif k == ast.N_FOR:
+    nested_vars(c, c.t.a[st], st, &out, &where)
+    nested_vars(c, c.t.d[st], st, &out, &where)
+  elif k == ast.N_FORIN:
+    nested_vars(c, c.t.a[st], st, &out, &where)
+    nested_vars(c, c.t.c[st], st, &out, &where)
+  elif k == ast.N_TRY:
+    nested_vars(c, c.t.a[st], st, &out, &where)
+    nested_vars(c, c.t.c[st], st, &out, &where)
+    nested_vars(c, c.t.d[st], st, &out, &where)
+  elif k == ast.N_SWITCH:
+    for cs in ast.items(c.t, c.t.b[st]):
+      for x in ast.items(c.t, c.t.b[cs]): nested_vars(c, x, cs, &out, &where)
+
+# Vars from nested blocks are declared where the function's (or file's) own names are.
+fn hoist_vars(var c: C, var vals: {Int: Int}, var tys: {Int: Int}, stmts: [Int]):
+  var vs: [Int] = []
+  var ws: [Int] = []
+  for st in stmts: nested_vars(c, st, -1, &vs, &ws)
+  for i in 0..vs.len:
+    c.hoisting = ws[i]
+    declare_in(&c, &vals, &tys, vs[i])
+  c.hoisting = -1
 
 fn decl_kind_of_var(c: C, v: Int) -> Int:
   let f = c.t.f[v]
@@ -130,9 +420,18 @@ fn declare_in(var c: C, var vals: {Int: Int}, var tys: {Int: Int}, stmt: Int):
       binding_ids(c, c.t.a[d], &ids)
       for id in ids:
         let name = c.t.s[id]
+        if sk == S_VAR and name in vals and c.sk[vals[name]] == S_VAR:
+          # var x twice: one symbol (its type is the first declaration's)
+          let s0 = vals[name]
+          types.add_decl(&c, s0, d)
+          sort_decls(&c, s0)
+          c.nsym[id] = s0
+          if c.t.k[c.t.a[d]] == ast.N_ID: c.nsym[d] = s0
+          continue
         let s = types.new_sym(&c, sk, name, d)
         c.nsym[id] = s
         if c.t.k[c.t.a[d]] == ast.N_ID: c.nsym[d] = s
+        if c.hoisting >= 0: c.hoisted[s] = c.hoisting
         vals[name] = s
   elif k == ast.N_FUNC:
     let name = c.t.s[stmt]
@@ -244,6 +543,7 @@ fn declare_globals(var c: C, root: Int):
           vals[name] = os
     else:
       declare_in(&c, &vals, &tys, st)
+  if user: hoist_vars(&c, &vals, &tys, ast.items(c.t, root))
   swap(&vals, &c.globals)
   swap(&tys, &c.gtypes)
 
@@ -637,12 +937,18 @@ fn scope_names(var c: C, scope: Int):
   var tys: {Int: Int} = {}
   let k = c.t.k[scope]
   if k == ast.N_BLOCK:
-    for st in ast.items(c.t, c.t.a[scope]): declare_in(&c, &vals, &tys, st)
+    let p = up(c, scope)
+    let body = p >= 0 and is_fn_like(c.t.k[p]) and fn_body(c, p) == scope
+    for st in ast.items(c.t, c.t.a[scope]):
+      if body or not is_var_stmt(c, st): declare_in(&c, &vals, &tys, st)
+    if body: hoist_vars(&c, &vals, &tys, ast.items(c.t, c.t.a[scope]))
   elif k == ast.N_LIST:
     # a file root (module file) or a namespace body
     for st in ast.items(c.t, scope): declare_in(&c, &vals, &tys, st)
+    hoist_vars(&c, &vals, &tys, ast.items(c.t, scope))
   elif k == ast.N_CASE:
-    for st in ast.items(c.t, c.t.b[scope]): declare_in(&c, &vals, &tys, st)
+    for st in ast.items(c.t, c.t.b[scope]):
+      if not is_var_stmt(c, st): declare_in(&c, &vals, &tys, st)
   elif k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET:
     var plist = c.t.b[scope]
     if k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET: plist = c.t.b[c.t.b[scope]]
@@ -662,7 +968,7 @@ fn scope_names(var c: C, scope: Int):
       vals[c.t.s[scope]] = s
   elif k == ast.N_FOR or k == ast.N_FORIN:
     let init = c.t.a[scope]
-    if init >= 0 and c.t.k[init] == ast.N_VAR: declare_in(&c, &vals, &tys, init)
+    if init >= 0 and c.t.k[init] == ast.N_VAR and not is_var_stmt(c, init): declare_in(&c, &vals, &tys, init)
   elif k == ast.N_TRY:
     let cd = c.t.b[scope]
     if cd >= 0:
@@ -850,7 +1156,7 @@ fn type_from(var c: C, n: Int) -> Int:
     if c.t.k[e] == ast.N_ID:
       let s = lookup_value(&c, n, c.t.s[e])
       if s < 0:
-        err(&c, e, 2304, "Cannot find name '" + nm(c, c.t.s[e]) + "'.")
+        if not value_not_found(&c, e, c.t.s[e], true): return unsupported(&c, e, "a name TypeScript may suggest another name for")
         return c.error_t
       return type_of_sym(&c, s)
     return unsupported(&c, n, "typeof with a qualified name")
@@ -957,7 +1263,7 @@ fn type_ref(var c: C, n: Int) -> Int:
     s = lookup_type(&c, n, name)
   if s < 0:
     if c.t.file[n] < c.user_from: return unsupported(&c, n, "a lib type the checker can't resolve")
-    err(&c, nn, 2304, "Cannot find name '" + nm(c, name) + "'.")
+    if not type_not_found(&c, nn, name): return unsupported(&c, nn, "a name TypeScript may suggest another name for")
     return c.error_t
   return type_ref_sym(&c, n, s, name)
 
@@ -971,6 +1277,9 @@ fn type_ref_sym(var c: C, n: Int, s: Int, name: Int) -> Int:
     let d = c.sdecl[s]
     let tl = c.t.a[d]
     if tl < 0:
+      if args.len > 0:
+        err(&c, n, 2315, "Type '" + nm(c, name) + "' is not generic.")
+        return c.error_t
       return declared_type(&c, s)
     let tps = tparam_types(&c, tl)
     let full = fill_defaults(&c, tl, args, n, nm(c, name))
@@ -1006,12 +1315,40 @@ fn type_ref_sym(var c: C, n: Int, s: Int, name: Int) -> Int:
         err(&c, n, 2315, "Type '" + nm(c, name) + "' is not generic.")
       return dt
     let d = c.sdecl[s]
-    let full = fill_defaults(&c, c.t.a[d], args, n, nm(c, name))
+    let full = fill_defaults(&c, c.t.a[d], args, n, generic_name(c, name, c.t.a[d]))
     if full.len != tps.len: return c.error_t
     return ref_of(&c, dt, full)
   if (sk & S_ENUM) != 0: return unsupported(&c, n, "an enum type")
   if (sk & S_NAMESPACE) != 0: return unsupported(&c, n, "a namespace used as a type")
   return unsupported(&c, n, "this kind of type name")
+
+# A class or interface as TypeScript prints its declared type: Name<T, U>.
+fn generic_name(c: C, name: Int, tl: Int) -> Str:
+  var r = nm(c, name)
+  if tl < 0: return r
+  var ps: [Str] = []
+  for tp in ast.items(c.t, tl): ps.push(nm(c, c.t.s[tp]))
+  return r + "<" + ", ".join(ps) + ">"
+
+# The type-argument count check alone (for type nodes that aren't resolved yet).
+fn arity_check(var c: C, n: Int, s: Int, name: Int, nargs: Int):
+  let sk = c.sk[s]
+  if (sk & (S_ALIAS | S_INTERFACE | S_CLASS)) == 0: return
+  let d = c.sdecl[s]
+  if d < 0: return
+  let tl = c.t.a[d]
+  var shown = nm(c, name)
+  if (sk & S_ALIAS) == 0: shown = generic_name(c, name, tl)
+  if tl < 0:
+    if nargs > 0: err(&c, n, 2315, "Type '" + nm(c, name) + "' is not generic.")
+    return
+  let tps = ast.items(c.t, tl)
+  var minimum = 0
+  for tp in tps:
+    if c.t.b[tp] < 0: minimum += 1
+  if nargs < minimum or nargs > tps.len:
+    if minimum == tps.len: err(&c, n, 2314, "Generic type '" + shown + "' requires {tps.len} type argument(s).")
+    else: err(&c, n, 2707, "Generic type '" + shown + "' requires between {minimum} and {tps.len} type arguments.")
 
 # Type arguments with the defaults filled in; reports a wrong count (TS2314 / TS2707).
 fn fill_defaults(var c: C, tl: Int, args: [Int], at: Int, name: Str) -> [Int]:
@@ -1377,7 +1714,7 @@ fn class_base(var c: C, d: Int) -> Int:
     return -1
   let bs = lookup_value(&c, h, c.t.s[e])
   if bs < 0:
-    err(&c, e, 2304, "Cannot find name '" + nm(c, c.t.s[e]) + "'.")
+    if not value_not_found(&c, e, c.t.s[e], false): unsupported(&c, e, "a name TypeScript may suggest another name for")
     return -1
   if (c.sk[bs] & S_CLASS) == 0:
     # extends Error: a value whose type has construct signatures (their instance type)
@@ -1439,7 +1776,7 @@ fn heritage_type(var c: C, h: Int) -> Int:
   if c.t.k[e] != ast.N_ID: return unsupported(&c, h, "a qualified base type")
   let s = lookup_type(&c, h, c.t.s[e])
   if s < 0:
-    err(&c, e, 2304, "Cannot find name '" + nm(c, c.t.s[e]) + "'.")
+    if not type_not_found(&c, e, c.t.s[e]): return unsupported(&c, e, "a name TypeScript may suggest another name for")
     return c.error_t
   return heritage_sym(&c, h, s, c.t.s[e])
 

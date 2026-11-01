@@ -232,7 +232,14 @@ class G:
             elif c < 0.6: out.append(f"if ({cond}) {{ {x} = {val()} }} else {{ {x} = {val()} }}")
             elif c < 0.7: out.append(f"if ({cond}) {{ {x} = {val()}; }} else {{ console.log({x}) }}")
             elif c < 0.8: out.append(f"{{ {x} = {val()} }}")
-            elif c < 0.9: out.append(f"if ({cond}) {{ {x} = {val()}; throw 0 }}")
+            elif c < 0.85: out.append(f"if ({cond}) {{ {x} = {val()}; throw 0 }}")
+            elif c < 0.9:
+                lits = [p for p in split_union(t) if p.startswith('"') or p[0].isdigit() or p in ("null", "undefined", "true", "false")] or ['"a"', "1"]
+                cs = r.sample(lits + ['"zz"', "2"], min(len(lits) + 2, r.randint(1, 3)))
+                tg = r.choice(["number", "string", "boolean"])
+                body = " ".join(f"case {v}:" + (f" {{ const {self.name('w')}: {tg} = {x}; break }}" if r.random() < 0.7 else "") for v in cs)
+                if r.random() < 0.4: body += f" default: {{ const {self.name('w')}: {tg} = {x} }}"
+                out.append(f"switch ({x}) {{ {body} }}")
             else: out.append(f"const {self.name('r')}: {r.choice(['number', 'string', 'boolean'])} = {x}")
         out.append(f"const {self.name('r')}: {r.choice(['number', 'string', 'boolean', 'object'])} = {x}")
         return "\n".join(out)

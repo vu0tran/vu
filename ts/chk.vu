@@ -1106,7 +1106,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
           let okey = fact_key(&c, c.t.a[refside])
           if okey != "":
             let ot = current_type(&c, c.t.a[refside])
-            if c.tk[ot] == TK_UNION:
+            if ot == -7: out.push(Fact(okey + "", -7))
+            elif c.tk[ot] == TK_UNION:
               var ok: [Int] = []
               for m in types.members(c, ot):
                 let ps = prop_of(&c, m, c.t.s[refside])
@@ -1651,6 +1652,17 @@ fn sub_read(var c: C, n: Int) -> Int:
     i -= 1
   return substitute_constraints(&c, declared)
 
+fn not_found(var c: C, n: Int, text: Str):
+  if not bind.value_not_found(&c, n, c.t.s[n], false):
+    bind.unsupported(&c, n, "a name TypeScript may suggest another name for")
+
+fn inside(c: C, n: Int, anc: Int) -> Bool:
+  var x = n
+  while x >= 0:
+    if x == anc: return true
+    x = c.parent[x]
+  return false
+
 fn ident_type0(var c: C, n: Int) -> Int:
   let name = c.t.s[n]
   if name == 0: return c.error_t
@@ -1660,8 +1672,10 @@ fn ident_type0(var c: C, n: Int) -> Int:
     if text == "undefined": return c.undef_t
     if text == "arguments": return unsup(&c, n, "arguments")
     if text == "globalThis": return unsup(&c, n, "globalThis")
-    err(&c, n, 2304, "Cannot find name '" + text + "'.")
+    not_found(&c, n, text)
     return c.error_t
+  if s in c.hoisted and not inside(c, n, c.hoisted[s]):
+    return unsup(&c, n, "a var read outside the block that declares it")
   if (c.sk[s] & (S_LET | S_CONST)) != 0 and used_before_decl(&c, n, s):
     err(&c, n, 2448, "Block-scoped variable '" + nm(c, name) + "' used before its declaration.")
     err(&c, n, 2454, "Variable '" + nm(c, name) + "' is used before being assigned.")
@@ -2568,6 +2582,13 @@ fn spread_call(var c: C, n: Int, sgs: [Int], args: [Int], at: Int) -> Int:
   if not reported and not rel.assignable(&c, et, pe): rel.report(&c, et, pe, args[at], -1, 2345)
   return sig_result(&c, sg, n)
 
+# isTypeAssignableTo(t, globalFunctionType) for a type without signatures
+fn function_like(var c: C, t: Int) -> Bool:
+  let fs = bind.global_type_sym(&c, "Function")
+  if fs < 0: return false
+  let ft = bind.declared_type(&c, fs)
+  return rel.assignable(&c, t, ft)
+
 fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
   let callee = c.t.a[n]
   let args = kids(c, c.t.c[n])
@@ -2602,6 +2623,10 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
   let from_union = usgs.len > 0
   var sgs = usgs
   if not from_union: sgs = bind.sigs_of(&c, ap, is_new)
+  if sgs.len == 0 and not is_new and c.tk[ap] == TK_OBJ and bind.sigs_of(&c, ap, true).len == 0 and function_like(&c, ft):
+    # an untyped call: a Function (no signatures) returns any
+    for a in args: check_expr(&c, a, -1)
+    return c.any_t
   if sgs.len == 0:
     for a in args: check_expr(&c, a, -1)
     if is_new:
@@ -3097,7 +3122,7 @@ fn assign_target(var c: C, l: Int) -> Int:
       return bind.type_of_sym(&c, tgt)
     let s = bind.lookup_value(&c, l, c.t.s[l])
     if s < 0:
-      err(&c, l, 2304, "Cannot find name '" + nm(c, c.t.s[l]) + "'.")
+      not_found(&c, l, nm(c, c.t.s[l]))
       return c.error_t
     if (c.sk[s] & S_CONST) != 0:
       err(&c, l, 2588, "Cannot assign to '" + nm(c, c.t.s[l]) + "' because it is a constant.")
@@ -3124,6 +3149,86 @@ fn assign_target(var c: C, l: Int) -> Int:
     return t
   if k == ast.N_PAREN: return assign_target(&c, c.t.a[l])
   return unsup(&c, l, "this assignment target")
+
+# narrowTypeBySwitchOnDiscriminant: in a case clause the switch's reference is narrowed to the
+# members comparable to the clause's labels (those it falls into from empty clauses before it),
+# with string and number replaced by the labels' literals. A clause reached by falling through
+# from a non-empty one, or a default with other labels, leaves the reference unknown.
+fn switch_facts(var c: C, n: Int, cs: Int, st: Int):
+  let e = c.t.a[n]
+  let key = ref_key(&c, e)
+  if key == "": return
+  let cases = kids(c, c.t.b[n])
+  var idx = -1
+  for i in 0..cases.len:
+    if cases[i] == cs: idx = i
+  # the run of empty clauses that falls into this one
+  var start = idx
+  while start > 0 and kids(c, c.t.b[cases[start - 1]]).len == 0: start -= 1
+  if start > 0:
+    let prev = kids(c, c.t.b[cases[start - 1]])
+    var ends = false
+    for p in prev:
+      if terminates(c, p) or has_break_direct(c, p): ends = true
+    if not ends:
+      set_narrow(&c, key, -7)
+      return
+  var labels: [Int] = []
+  var has_default = false
+  for i in start..idx + 1:
+    let ce = c.t.a[cases[i]]
+    if ce < 0: has_default = true
+    elif ce in c.ntype: labels.push(types.regular(c, c.ntype[ce]))
+    else:
+      set_narrow(&c, key, -7)
+      return
+  let t = current_type(&c, e)
+  if t == -7 or is_any(c, t) or c.tk[t] == TK_UNKNOWN: return
+  for m in types.members(c, t):
+    if is_generic_member(c, m):
+      set_narrow(&c, key, -7)
+      return
+  if has_default:
+    if labels.len > 0 or idx == 0 and false:
+      set_narrow(&c, key, -7)
+      return
+    # default alone: without the members every case names (unit types only)
+    var all: [Int] = []
+    for c2 in cases:
+      let ce = c.t.a[c2]
+      if ce < 0: continue
+      if not (ce in c.ntype): return
+      let ct = types.regular(c, c.ntype[ce])
+      if not unitish(c, ct): return
+      all.push(ct)
+    var keep: [Int] = []
+    for m in types.members(c, t):
+      if not types.has_int(all, types.regular(c, m)): keep.push(m)
+    let uk = types.union_of(&c, keep)
+    let nk = keep_fresh(&c, t, uk)
+    set_narrow(&c, key, nk)
+    return
+  let lt = types.union_of(&c, labels)
+  var keep: [Int] = []
+  for m in types.members(c, t):
+    if comparable(&c, lt, m): keep.push(m)
+  # replacePrimitivesWithLiterals
+  var out: [Int] = []
+  for m in keep:
+    let mk = c.tk[m]
+    if mk == TK_STRING or mk == TK_NUMBER:
+      for l in types.members(c, lt):
+        let lk = c.tk[l]
+        if (mk == TK_STRING and lk == TK_STRLIT) or (mk == TK_NUMBER and lk == TK_NUMLIT): out.push(l)
+      var any_lit = false
+      for l in types.members(c, lt):
+        let lk = c.tk[l]
+        if (mk == TK_STRING and lk == TK_STRLIT) or (mk == TK_NUMBER and lk == TK_NUMLIT): any_lit = true
+      if not any_lit: out.push(m)
+    else: out.push(m)
+  let uo = types.union_of(&c, out)
+  let no = keep_fresh(&c, t, uo)
+  set_narrow(&c, key, no)
 
 fn compound_like(c: C, r: Int) -> Bool:
   let x = skip_parens(c, r)
@@ -3866,19 +3971,20 @@ fn check_stmt(var c: C, n: Int):
     for cs in kids(c, c.t.b[n]):
       if c.t.a[cs] >= 0:
         let ct = check_expr(&c, c.t.a[cs], -1)
-        if not comparable(&c, st, ct):
+        let ctk = c.tk[ct]
+        if ctk != TK_NULL and ctk != TK_UNDEF and not comparable(&c, st, ct):
           var a = types.regular(c, ct)
-          var b = types.regular(c, st)
-          let g1_55 = widen_all(&c, a)
-          let g2_55 = widen_all(&c, b)
-          if not comparable(&c, g1_55, g2_55):
-            a = widen_all(&c, a)
-            b = widen_all(&c, b)
+          let b0 = types.regular(c, st)
+          let b = rel.report_target(&c, a, b0)
+          if c.tk[b] != types.TK_NEVER and not rel.could_have_singletons(&c, b):
+            if types.is_literal(c, a): a = types.base_of_literal(c, a)
+            elif c.tk[a] == types.TK_UNION and rel.all_units(c, a): a = widen_all(&c, a)
           let h25_ = show.show(&c, a)
           let h26_ = show.show(&c, b)
           err(&c, c.t.a[cs], 2678, "Type '" + h25_ + "' is not comparable to type '" + h26_ + "'.")
       bind.scope_names(&c, cs)
       c.narrow.push({})
+      switch_facts(&c, n, cs, st)
       check_stmts(&c, kids(c, c.t.b[cs]))
       c.narrow.pop()
     for cs in kids(c, c.t.b[n]): forget_assigned(&c, c.t.b[cs])
@@ -4333,13 +4439,83 @@ fn const_type(var c: C, e: Int) -> Int:
 
 fn check_type_alias(var c: C, n: Int):
   bind.type_from(&c, c.t.b[n])
+  # a generic alias's body (and deferred parts) isn't resolved until used: its names are checked here
+  names_in_type(&c, c.t.b[n])
+  if c.t.a[n] >= 0:
+    for tp in kids(c, c.t.a[n]):
+      if c.t.a[tp] >= 0: names_in_type(&c, c.t.a[tp])
+      if c.t.b[tp] >= 0: names_in_type(&c, c.t.b[tp])
+
+# Every type name in a type node resolves (TypeScript's checkSourceElement on the type).
+fn names_in_type(var c: C, n: Int):
+  if n < 0: return
+  let k = c.t.k[n]
+  if k == ast.N_TREF:
+    let nn = c.t.a[n]
+    if c.t.k[nn] == ast.N_ID:
+      let ts = bind.lookup_type(&c, n, c.t.s[nn])
+      if ts < 0:
+        if not bind.type_not_found(&c, nn, c.t.s[nn]): bind.unsupported(&c, nn, "a name TypeScript may suggest another name for")
+      else:
+        var na = 0
+        if c.t.b[n] >= 0: na = kids(c, c.t.b[n]).len
+        bind.arity_check(&c, n, ts, c.t.s[nn], na)
+    if c.t.b[n] >= 0:
+      for x in kids(c, c.t.b[n]): names_in_type(&c, x)
+  elif k == ast.N_TQUERY:
+    let e = c.t.a[n]
+    if c.t.k[e] == ast.N_ID and bind.lookup_value(&c, n, c.t.s[e]) < 0:
+      if not bind.value_not_found(&c, e, c.t.s[e], true): bind.unsupported(&c, e, "a name TypeScript may suggest another name for")
+  elif k == ast.N_TUNION or k == ast.N_TINTER or k == ast.N_TTUPLE or k == ast.N_TTEMPLATE:
+    for x in kids(c, c.t.a[n]): names_in_type(&c, x)
+  elif k == ast.N_TARRAY or k == ast.N_TTUPLEEL or k == ast.N_TPAREN or k == ast.N_TOP or k == ast.N_TSPAN or k == ast.N_TOPTIONAL or k == ast.N_TREST or k == ast.N_TPRED:
+    names_in_type(&c, c.t.a[n])
+  elif k == ast.N_TINDEXED:
+    names_in_type(&c, c.t.a[n])
+    names_in_type(&c, c.t.b[n])
+  elif k == ast.N_TCOND:
+    names_in_type(&c, c.t.a[n])
+    names_in_type(&c, c.t.b[n])
+    names_in_type(&c, c.t.c[n])
+    names_in_type(&c, c.t.d[n])
+  elif k == ast.N_TINFER:
+    let tp = c.t.a[n]
+    if tp >= 0: names_in_type(&c, c.t.a[tp])
+  elif k == ast.N_TMAPPED:
+    let tp = c.t.a[n]
+    if tp >= 0: names_in_type(&c, c.t.a[tp])
+    names_in_type(&c, c.t.b[n])
+    names_in_type(&c, c.t.c[n])
+  elif k == ast.N_TFUNC:
+    names_in_sig(&c, c.t.b[n])
+  elif k == ast.N_TOBJ:
+    for m in kids(c, c.t.a[n]):
+      let mk = c.t.k[m]
+      if mk == ast.N_PROP: names_in_type(&c, c.t.b[m])
+      elif mk == ast.N_METHOD or mk == ast.N_CALLSIG or mk == ast.N_CTORSIG or mk == ast.N_GET or mk == ast.N_SET: names_in_sig(&c, c.t.b[m])
+      elif mk == ast.N_INDEXSIG:
+        for p in kids(c, c.t.a[m]): names_in_type(&c, c.t.b[p])
+        names_in_type(&c, c.t.b[m])
+
+fn names_in_sig(var c: C, sg: Int):
+  if sg < 0 or c.t.k[sg] != ast.N_SIG: return
+  if c.t.a[sg] >= 0:
+    for tp in kids(c, c.t.a[sg]):
+      names_in_type(&c, c.t.a[tp])
+      names_in_type(&c, c.t.b[tp])
+  for p in kids(c, c.t.b[sg]): names_in_type(&c, c.t.b[p])
+  names_in_type(&c, c.t.c[sg])
 
 fn check_interface(var c: C, n: Int):
   # members' types are checked for unknown names
   for m in kids(c, c.t.c[n]):
     let k = c.t.k[m]
-    if k == ast.N_PROP and c.t.b[m] >= 0: bind.type_from(&c, c.t.b[m])
-    elif k == ast.N_METHOD or k == ast.N_CALLSIG or k == ast.N_CTORSIG: bind.sig_from(&c, c.t.b[m], m)
+    if k == ast.N_PROP and c.t.b[m] >= 0:
+      bind.type_from(&c, c.t.b[m])
+      names_in_type(&c, c.t.b[m])
+    elif k == ast.N_METHOD or k == ast.N_CALLSIG or k == ast.N_CTORSIG:
+      bind.sig_from(&c, c.t.b[m], m)
+      names_in_sig(&c, c.t.b[m])
   for h in kids(c, c.t.b[n]): bind.heritage_type(&c, h)
 
 fn check_file(var c: C, root: Int):
@@ -4349,3 +4525,397 @@ fn check_file(var c: C, root: Int):
   c.narrow.push({})
   check_stmts(&c, kids(c, root))
   while c.narrow.len > saved: c.narrow.pop()
+  check_declarations(&c, root)
+
+# ---- declarations that conflict (TypeScript's binder declareSymbol and the checker's overload checks)
+
+const DF_FSV = 1
+const DF_BSV = 2
+const DF_FUNC = 16
+const DF_CLASS = 32
+const DF_IFACE = 64
+const DF_ENUM = 384
+const DF_NS = 1536
+const DF_TPARAM = 262144
+const DF_ALIAS = 524288
+const DF_IMPORT = 2097152
+
+type Ents:
+  name: [Int]
+  flags: [Int]
+  excl: [Int]
+  at: [Int]        # the node the error is at (an identifier, or a declaration reported at its name)
+  named: [Bool]    # at is a declaration (its name's position)
+  decl: [Int]      # the declaration (N_DECL, N_PARAM, N_FUNC...)
+  kind: [Int]      # 0 var, 1 parameter, 2 let/const, 3 function, 4 other, 5 import, 6 type parameter
+  pos: [Int]
+  exported: [Bool]
+
+fn ents_new() -> Ents:
+  return Ents([], [], [], [], [], [], [], [], [])
+
+fn ent(var e: Ents, c: C, name: Int, flags: Int, excl: Int, at: Int, named: Bool, decl: Int, kind: Int, exported: Bool):
+  e.name.push(name)
+  e.flags.push(flags)
+  e.excl.push(excl)
+  e.at.push(at)
+  e.named.push(named)
+  e.decl.push(decl)
+  e.kind.push(kind)
+  var p = c.t.pos[at]
+  if named and at in c.t.npos: p = c.t.npos[at]
+  e.pos.push(p)
+  e.exported.push(exported)
+
+fn ent_stmt(var e: Ents, var c: C, st: Int, vars: Bool):
+  let k = c.t.k[st]
+  if k == ast.N_VAR:
+    let is_var = bind.decl_kind_of_var(c, st) == S_VAR
+    if is_var and not vars: return
+    let exp = (c.t.d[st] & ast.M_EXPORT) != 0
+    for d in kids(c, c.t.a[st]):
+      var ids: [Int] = []
+      bind.binding_ids(c, c.t.a[d], &ids)
+      for id in ids:
+        if is_var: ent(&e, c, c.t.s[id], DF_FSV, 111550, id, false, d, 0, exp)
+        else: ent(&e, c, c.t.s[id], DF_BSV, 111551, id, false, d, 2, exp)
+  elif k == ast.N_FUNC and c.t.s[st] >= 0:
+    ent(&e, c, c.t.s[st], DF_FUNC, 110991, st, true, st, 3, (c.t.f[st] & ast.M_EXPORT) != 0)
+  elif k == ast.N_CLASS and c.t.s[st] >= 0:
+    ent(&e, c, c.t.s[st], DF_CLASS, 899503, st, true, st, 4, (c.t.f[st] & ast.M_EXPORT) != 0)
+  elif k == ast.N_INTERFACE:
+    ent(&e, c, c.t.s[st], DF_IFACE, 788872, st, true, st, 4, (c.t.d[st] & ast.M_EXPORT) != 0)
+  elif k == ast.N_TYPEALIAS:
+    ent(&e, c, c.t.s[st], DF_ALIAS, 788968, st, true, st, 4, (c.t.d[st] & ast.M_EXPORT) != 0)
+  elif k == ast.N_ENUM:
+    ent(&e, c, c.t.s[st], DF_ENUM, 899503, st, true, st, 4, false)
+  elif k == ast.N_MODULE:
+    let nn = c.t.a[st]
+    if c.t.k[nn] == ast.N_ID: ent(&e, c, c.t.s[nn], DF_NS, 0, st, true, st, 4, false)
+  elif k == ast.N_IMPORT:
+    var names: [Int] = []
+    if c.t.b[st] >= 0: names.push(c.t.b[st])
+    if c.t.c[st] >= 0: names.push(c.t.c[st])
+    if c.t.d[st] >= 0:
+      for sp in kids(c, c.t.d[st]): names.push(sp)
+    for nd in names: ent(&e, c, c.t.s[nd], DF_IMPORT, DF_IMPORT, nd, false, nd, 5, false)
+  elif k == ast.N_IMPORTEQ:
+    ent(&e, c, c.t.s[st], DF_IMPORT, DF_IMPORT, st, true, st, 5, false)
+
+# The declarations of one container, in source order (vars from nested blocks when it's a function
+# or a file).
+fn container_ents(var c: C, stmts: [Int], vars: Bool) -> Ents:
+  var e = ents_new()
+  for st in stmts: ent_stmt(&e, &c, st, vars)
+  if vars:
+    var vs: [Int] = []
+    var ws: [Int] = []
+    for st in stmts: bind.nested_vars(c, st, -1, &vs, &ws)
+    for v in vs: ent_stmt(&e, &c, v, true)
+  return e
+
+fn sort_ents(var e: Ents):
+  var idx: [Int] = []
+  for i in 0..e.name.len: idx.push(i)
+  var ps: [Int] = []
+  for p in e.pos: ps.push(p)
+  idx.sort(by: fn(a, b) => ps[a] < ps[b] or (ps[a] == ps[b] and a < b))
+  var r = ents_new()
+  for i in idx:
+    r.name.push(e.name[i])
+    r.flags.push(e.flags[i])
+    r.excl.push(e.excl[i])
+    r.at.push(e.at[i])
+    r.named.push(e.named[i])
+    r.decl.push(e.decl[i])
+    r.kind.push(e.kind[i])
+    r.pos.push(e.pos[i])
+    r.exported.push(e.exported[i])
+  e = r
+
+fn ent_err(var c: C, e: Ents, i: Int, code: Int, msg: Str):
+  if e.named[i]: bind.err_name(&c, e.at[i], code, msg)
+  else: bind.err(&c, e.at[i], code, msg)
+
+# declareSymbol over the container's declarations: a conflict reports at every earlier declaration
+# of the name and at the new one (which then isn't added).
+fn check_container(var c: C, own e0: Ents, root: Int):
+  var e = e0
+  sort_ents(&e)
+  var first: {Int: Int} = {}      # name -> symbol index
+  var sflags: [Int] = []
+  var sdecls: [[Int]] = []
+  var sexp: [Int] = []            # 1 exported, 2 local, 3 both
+  for i in 0..e.name.len:
+    let name = e.name[i]
+    var ex = 2
+    if e.exported[i]: ex = 1
+    if not (name in first):
+      first[name] = sflags.len
+      sflags.push(e.flags[i])
+      sdecls.push([i])
+      sexp.push(ex)
+      continue
+    let si = first[name]
+    sexp[si] = sexp[si] | ex
+    if sexp[si] == 3:
+      # exported and local declarations of one name live in two tables in TypeScript
+      unsup(&c, e.at[i], "exported and local declarations of one name")
+      return
+    let both = sflags[si] | e.flags[i]
+    if (both & DF_IMPORT) != 0 and both != DF_IMPORT:
+      unsup(&c, e.at[i], "an import and a local declaration of one name")
+      return
+    if (both & DF_IMPORT) != 0: continue     # (two imports: reported where imports are declared)
+    if (sflags[si] & e.excl[i]) != 0:
+      if (both & (DF_ENUM | DF_NS)) != 0:
+        unsup(&c, e.at[i], "an enum or namespace merged with another declaration")
+        return
+      var code = 2300
+      var msg = "Duplicate identifier '" + nm(c, name) + "'."
+      if (sflags[si] & DF_BSV) != 0:
+        code = 2451
+        msg = "Cannot redeclare block-scoped variable '" + nm(c, name) + "'."
+      for j in sdecls[si]: ent_err(&c, e, j, code, msg)
+      ent_err(&c, e, i, code, msg)
+      continue
+    sflags[si] = both
+    sdecls[si].push(i)
+  for si in 0..sflags.len:
+    let f = sflags[si]
+    if (f & DF_FUNC) != 0 and (f & DF_CLASS) != 0:
+      unsup(&c, e.at[sdecls[si][0]], "a class merged with a function")
+      return
+    if (f & DF_FUNC) != 0:
+      var fs: [Int] = []
+      for j in sdecls[si]:
+        if e.kind[j] == 3: fs.push(e.decl[j])
+      if fs.len > 1: check_overloads(&c, fs)
+    if (f & DF_FSV) != 0 and sdecls[si].len > 1: check_var_types(&c, e, sdecls[si])
+
+fn ambient_decl(c: C, d: Int) -> Bool:
+  if (c.t.f[d] & ast.M_DECLARE) != 0: return true
+  let f = c.files[c.t.file[d]]
+  return f.endswith(".d.ts") or f.endswith(".d.mts") or f.endswith(".d.cts")
+
+# The statement after d in its statement list (-1 if last).
+fn next_stmt(c: C, d: Int) -> Int:
+  let l = c.parent[d]
+  if l < 0 or c.t.k[l] != ast.N_LIST: return -1
+  let xs = kids(c, l)
+  for i in 0..xs.len:
+    if xs[i] == d and i + 1 < xs.len: return xs[i + 1]
+  return -1
+
+fn impl_expected(var c: C, d: Int):
+  let nx = next_stmt(c, d)
+  if nx >= 0 and c.t.k[nx] == ast.N_FUNC:
+    if c.t.s[nx] >= 0 and c.t.s[nx] == c.t.s[d]: return
+    if c.t.d[nx] >= 0:
+      bind.err_name(&c, nx, 2389, "Function implementation name must be '" + nm(c, c.t.s[d]) + "'.")
+      return
+  bind.err_name(&c, d, 2391, "Function implementation is missing or not immediately following the declaration.")
+
+# checkFunctionOrConstructorSymbol for function declarations.
+fn check_overloads(var c: C, decls: [Int]):
+  var body = -1
+  var prev = -1
+  var dup = false
+  var last_concrete = -1
+  var overloads = false
+  var some_exp = false
+  var all_exp = true
+  var some_amb = false
+  var all_amb = true
+  for d in decls:
+    let amb = ambient_decl(c, d)
+    if amb: prev = -1
+    let ex = (c.t.f[d] & ast.M_EXPORT) != 0
+    some_exp = some_exp or ex
+    all_exp = all_exp and ex
+    some_amb = some_amb or amb
+    all_amb = all_amb and amb
+    let has_body = c.t.d[d] >= 0
+    if has_body and body >= 0: dup = true
+    elif prev >= 0 and c.parent[prev] == c.parent[d] and next_stmt(c, prev) != d: impl_expected(&c, prev)
+    if has_body:
+      if body < 0: body = d
+    else: overloads = true
+    prev = d
+    if not amb: last_concrete = d
+  if dup:
+    for d in decls: bind.err_name(&c, d, 2393, "Duplicate function implementation.")
+  if last_concrete >= 0 and c.t.d[last_concrete] < 0: impl_expected(&c, last_concrete)
+  if not overloads: return
+  if some_exp != all_exp or some_amb != all_amb:
+    var canon = decls[0]
+    if body >= 0 and c.parent[body] == c.parent[decls[0]]: canon = body
+    let cex = (c.t.f[canon] & ast.M_EXPORT) != 0
+    let camb = ambient_decl(c, canon)
+    for d in decls:
+      if ((c.t.f[d] & ast.M_EXPORT) != 0) != cex: bind.err_name(&c, d, 2383, "Overload signatures must all be exported or non-exported.")
+      elif ambient_decl(c, d) != camb: bind.err_name(&c, d, 2384, "Overload signatures must all be ambient or non-ambient.")
+  if body < 0: return
+  let bsg = fn_sig(&c, body)
+  for d in decls:
+    if c.t.d[d] >= 0: continue
+    let osg = fn_sig(&c, d)
+    let r = impl_compatible(&c, bsg, osg)
+    if r == 0:
+      bind.err_name(&c, d, 2394, "This overload signature is not compatible with its implementation signature.")
+      return
+    if r < 0:
+      unsup(&c, d, "an overload compared with its implementation through a callback parameter")
+      return
+
+fn erased(var c: C, sg: Int) -> Int:
+  if c.sigs[sg].tparams.len == 0: return sg
+  var anys: [Int] = []
+  for x in types.ints(c.sigs[sg].tparams): anys.push(c.any_t)
+  let m = types.new_mapper(&c, types.ints(c.sigs[sg].tparams), anys)
+  return bind.inst_sig(&c, sg, m)
+
+fn has_calls(var c: C, t: Int) -> Bool:
+  for m in types.members(c, t):
+    let a = rel.apparent(&c, m)
+    if c.tk[a] == TK_OBJ:
+      bind.ensure_resolved(&c, a)
+      if c.objs[c.ta[a]].calls.len > 0: return true
+  return false
+
+# isImplementationCompatibleWithOverload: 1 yes, 0 no, -1 can't tell.
+fn impl_compatible(var c: C, impl0: Int, over0: Int) -> Int:
+  let impl = erased(&c, impl0)
+  let over = erased(&c, over0)
+  let sr = rel.sig_ret(&c, impl)
+  let tr = rel.sig_ret(&c, over)
+  bind.touch(&c, sr)
+  bind.touch(&c, tr)
+  if not (c.tk[tr] == TK_VOID or rel.assignable(&c, tr, sr) or rel.assignable(&c, sr, tr)): return 0
+  let ss = types.sig_copy(c, impl)
+  let ts = types.sig_copy(c, over)
+  var t_rest = false
+  for f in ts.pflags:
+    if f == 2: t_rest = true
+  var s_rest = false
+  for f in ss.pflags:
+    if f == 2: s_rest = true
+  if not t_rest and ss.min > ts.ptypes.len: return 0
+  var n = ss.ptypes.len
+  if ts.ptypes.len > n: n = ts.ptypes.len
+  if s_rest or t_rest:
+    n = ss.ptypes.len
+    if ts.ptypes.len < n: n = ts.ptypes.len
+  for i in 0..n:
+    let sp = rel.param_at_sig(&c, ss, i)
+    let tp = rel.param_at_sig(&c, ts, i)
+    if sp < 0 or tp < 0: continue
+    bind.touch(&c, sp)
+    bind.touch(&c, tp)
+    if rel.assignable(&c, sp, tp) or rel.assignable(&c, tp, sp): continue
+    if has_calls(&c, sp) or has_calls(&c, tp): return -1
+    return 0
+  return 1
+
+# A later var declaration of a name must have the first one's type (TS2403).
+fn var_decl_type(var c: C, d: Int) -> Int:
+  if c.t.k[d] == ast.N_PARAM: return param_type(&c, d)
+  if c.t.b[d] >= 0: return bind.type_from(&c, c.t.b[d])
+  if c.t.c[d] < 0: return c.any_t
+  let it = check_expr(&c, c.t.c[d], -1)
+  let w = widen(&c, it)
+  return regular_obj(&c, w)
+
+fn simple_var(c: C, d: Int) -> Bool:
+  if c.t.k[c.t.a[d]] != ast.N_ID: return false
+  if c.t.k[d] == ast.N_PARAM: return (c.t.f[d] & ast.M_REST) == 0
+  let p = bind.up(c, d)
+  if p >= 0 and c.t.k[p] == ast.N_VAR:
+    let pp = bind.up(c, p)
+    if pp >= 0 and c.t.k[pp] == ast.N_FORIN and c.t.a[pp] == p: return false
+  return true
+
+fn check_var_types(var c: C, e: Ents, ds: [Int]):
+  let f0 = ds[0]
+  for idx in 1..ds.len:
+    let j = ds[idx]
+    if e.kind[j] != 0: continue
+    if not simple_var(c, e.decl[f0]) or not simple_var(c, e.decl[j]):
+      unsup(&c, e.at[j], "a var declared again with a pattern")
+      return
+    let t1 = var_decl_type(&c, e.decl[f0])
+    let t2 = var_decl_type(&c, e.decl[j])
+    bind.touch(&c, t1)
+    bind.touch(&c, t2)
+    if t1 == t2: continue
+    let a1 = c.tk[t1] == TK_ANY
+    let a2 = c.tk[t2] == TK_ANY
+    if a1 or a2 or not (rel.assignable(&c, t1, t2) and rel.assignable(&c, t2, t1)):
+      let s1 = show.show(&c, t1)
+      let s2 = show.show(&c, t2)
+      bind.err(&c, e.at[j], 2403, "Subsequent variable declarations must have the same type.  Variable '" + nm(c, e.name[j]) + "' must be of type '" + s1 + "', but here has type '" + s2 + "'.")
+    else:
+      unsup(&c, e.at[j], "a var declared again with a type that may be identical")
+      return
+
+# Every container in a file: the file, functions (parameters, type parameters and body together),
+# blocks, case blocks and for headers; type parameter lists; catch clauses.
+fn check_declarations(var c: C, root: Int):
+  let f = c.t.file[root]
+  let re = container_ents(&c, kids(c, root), true)
+  check_container(&c, re, root)
+  # (a file's nodes are contiguous, its root list made last)
+  var n = root
+  while n > 1 and c.t.file[n - 1] == f: n -= 1
+  while n < root:
+    let k = c.t.k[n]
+    if bind.is_fn_like(k):
+      var e = ents_new()
+      let tl = fn_tparams(c, n)
+      if tl >= 0:
+        for tp in kids(c, tl): ent(&e, c, c.t.s[tp], DF_TPARAM, 526824, tp, false, tp, 6, false)
+      let pl = fn_params(c, n)
+      if pl >= 0:
+        for p in kids(c, pl):
+          var ids: [Int] = []
+          bind.binding_ids(c, c.t.a[p], &ids)
+          for id in ids: ent(&e, c, c.t.s[id], DF_FSV, 111551, id, false, p, 1, false)
+      let bd = bind.fn_body(c, n)
+      if bd >= 0:
+        let be = container_ents(&c, kids(c, c.t.a[bd]), true)
+        for i in 0..be.name.len: ent(&e, c, be.name[i], be.flags[i], be.excl[i], be.at[i], be.named[i], be.decl[i], be.kind[i], false)
+      check_container(&c, e, n)
+    elif k == ast.N_BLOCK:
+      let p = bind.up(c, n)
+      if not (p >= 0 and bind.is_fn_like(c.t.k[p]) and bind.fn_body(c, p) == n):
+        let ce = container_ents(&c, kids(c, c.t.a[n]), false)
+        check_container(&c, ce, n)
+    elif k == ast.N_SWITCH:
+      var all: [Int] = []
+      for cs in kids(c, c.t.b[n]):
+        for st in kids(c, c.t.b[cs]): all.push(st)
+      let ce = container_ents(&c, all, false)
+      check_container(&c, ce, n)
+    elif k == ast.N_FOR or k == ast.N_FORIN:
+      let init = c.t.a[n]
+      if init >= 0 and c.t.k[init] == ast.N_VAR:
+        let ce = container_ents(&c, [init], false)
+        check_container(&c, ce, n)
+    elif k == ast.N_TRY and c.t.b[n] >= 0 and c.t.c[n] >= 0:
+      var caught: [Int] = []
+      bind.binding_ids(c, c.t.a[c.t.b[n]], &caught)
+      for st in kids(c, c.t.a[c.t.c[n]]):
+        if c.t.k[st] == ast.N_VAR and bind.decl_kind_of_var(c, st) != S_VAR:
+          for d in kids(c, c.t.a[st]):
+            var ids: [Int] = []
+            bind.binding_ids(c, c.t.a[d], &ids)
+            for id in ids:
+              for cid in caught:
+                if c.t.s[cid] == c.t.s[id]: bind.err(&c, d, 2492, "Cannot redeclare identifier '" + nm(c, c.t.s[id]) + "' in catch clause.")
+    let tl = bind.tparams_of(c, n)
+    if tl >= 0:
+      var seen: {Int: Bool} = {}
+      for tp in kids(c, tl):
+        if c.t.s[tp] in seen: bind.err(&c, tp, 2300, "Duplicate identifier '" + nm(c, c.t.s[tp]) + "'.")
+        seen[c.t.s[tp]] = true
+    n += 1
