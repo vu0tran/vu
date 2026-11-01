@@ -407,6 +407,21 @@ fn promise_of(var c: C, t: Int, at: Int) -> Int:
   let dt = bind.declared_type(&c, c.gtypes[pn])
   return bind.ref_of(&c, dt, [t])
 
+# A generator's return type annotation as [yield, return, next] types ([] if not one of the lib's
+# iterator types).
+fn generator_types(var c: C, t: Int) -> [Int]:
+  if c.tk[t] != TK_OBJ: return []
+  let o = c.ta[t]
+  if c.objs[o].kind != OK_REF: return []
+  let tsym = c.objs[c.ta[c.objs[o].target]].sym
+  if tsym < 0 or c.t.file[c.sdecl[tsym]] >= c.user_from: return []
+  let tn = nm(c, c.sname[tsym])
+  if tn != "Generator" and tn != "Iterator" and tn != "Iterable" and tn != "IterableIterator" and tn != "IteratorObject": return []
+  var r: [Int] = []
+  for x in types.ints(c.objs[o].args): r.push(x)
+  while r.len < 3: r.push(c.any_t)
+  return [r[0], r[1], r[2]]
+
 # A return expression's contextual type in an async function: T | PromiseLike<T>.
 fn async_return_ctx(var c: C, t: Int, at: Int) -> Int:
   let pn = ast.intern(&c.t, "PromiseLike")
@@ -454,7 +469,9 @@ fn awaited(var c: C, t: Int, at: Int) -> Int:
 fn infer_return(var c: C, d: Int) -> Int:
   let body = fn_body(c, d)
   if body < 0: return c.any_t
-  if (c.t.f[d] & ast.M_GENERATOR) != 0: return unsup(&c, d, "a generator function")
+  let is_gen = (c.t.f[d] & ast.M_GENERATOR) != 0
+  if is_gen and (c.t.f[d] & ast.M_ASYNC) != 0: return unsup(&c, d, "an async generator function")
+  if is_gen: c.gen_yields[d] = []
   # the body is checked in the function's own flow (outer narrowings of constants only), and each
   # return's type read as it was seen there
   c.narrow.push({})
@@ -479,6 +496,21 @@ fn infer_return(var c: C, d: Int) -> Int:
   if is_async:
     let inner = infer_body_return(&c, d, body)
     return promise_of(&c, inner, d)
+  if is_gen:
+    # Generator<the yields, the returns (void if none), unknown>
+    var yt = c.never_t
+    if c.gen_yields[d].len > 0:
+      var ys: [Int] = []
+      for y in c.gen_yields[d]: ys.push(y)
+      yt = return_widen(&c, d, ys)
+    var rets: [Int] = []
+    collect_returns(c, body, &rets)
+    var rt = c.void_t
+    if rets.len > 0: rt = infer_body_return(&c, d, body)
+    let gn = ast.intern(&c.t, "Generator")
+    if not (gn in c.gtypes): return unsup(&c, d, "a generator without the Generator type")
+    let gdt = bind.declared_type(&c, c.gtypes[gn])
+    return bind.ref_of(&c, gdt, [yt, rt, c.unknown_t])
   return infer_body_return(&c, d, body)
 
 fn infer_body_return(var c: C, d: Int, body: Int) -> Int:
@@ -1631,7 +1663,24 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
   if k == ast.N_TYPEASSERT: return unsup(&c, n, "a <T> type assertion")
   if k == ast.N_TAGGED: return unsup(&c, n, "a tagged template")
   if k == ast.N_CLASSEXPR: return unsup(&c, n, "a class expression")
-  if k == ast.N_YIELD: return unsup(&c, n, "yield")
+  if k == ast.N_YIELD:
+    let ef = enclosing_fn(c, n)
+    if ef < 0 or (c.t.f[ef] & ast.M_GENERATOR) == 0: return unsup(&c, n, "yield outside a generator")
+    if c.t.f[n] == 1: return unsup(&c, n, "yield*")
+    if ef in c.gen_ann:
+      let y0 = c.gen_ann[ef][0]
+      let n0 = c.gen_ann[ef][2]
+      if c.t.a[n] >= 0:
+        let ot = check_expr(&c, c.t.a[n], y0)
+        if not rel.assignable(&c, ot, y0): rel.report(&c, ot, y0, c.t.a[n], c.t.a[n], 2322)
+      elif not rel.assignable(&c, c.undef_t, y0): return unsup(&c, n, "a bare yield in a generator that yields values")
+      return n0
+    var yt = c.undef_t
+    if c.t.a[n] >= 0: yt = check_expr(&c, c.t.a[n], -1)
+    if ef in c.gen_yields: c.gen_yields[ef].push(yt)
+    let par = bind.up(c, n)
+    if par >= 0 and c.t.k[par] == ast.N_EXPRSTMT: return c.any_t
+    return unsup(&c, n, "the value of a yield in a generator without a return type")
   if k == ast.N_EXPRTARGS: return unsup(&c, n, "an instantiation expression")
   return unsup(&c, n, "this expression")
 
@@ -2190,8 +2239,36 @@ fn element_type(var c: C, t: Int, at: Int) -> Int:
       if rel.is_array_ref(&c, m):
         ts.push(c.objs[o].args[0])
         continue
+      # the iterator protocol: [Symbol.iterator]() returning one of the lib's iterator types
+      let et = iterated(&c, m)
+      if et >= 0:
+        ts.push(et)
+        continue
     return unsup(&c, at, "iterating this type")
   return types.union_of(&c, ts)
+
+fn iterator_arg(var c: C, r: Int) -> Int:
+  if c.tk[r] != TK_OBJ: return -1
+  let o = c.ta[r]
+  if c.objs[o].kind != OK_REF or c.objs[o].args.len == 0: return -1
+  let tsym = c.objs[c.ta[c.objs[o].target]].sym
+  if tsym < 0 or c.t.file[c.sdecl[tsym]] >= c.user_from: return -1
+  let tn = nm(c, c.sname[tsym])
+  if tn == "Iterator" or tn == "IterableIterator" or tn == "IteratorObject" or tn == "Generator" or tn == "MapIterator" or tn == "SetIterator" or tn == "ArrayIterator" or tn == "StringIterator": return c.objs[o].args[0]
+  return -1
+
+fn iterated(var c: C, t: Int) -> Int:
+  let direct = iterator_arg(&c, t)
+  if direct >= 0: return direct
+  let key = ast.intern(&c.t, "[Symbol.iterator]")
+  let ap = rel.apparent(&c, t)
+  let ps = bind.get_prop(&c, ap, key)
+  if ps < 0: return -1
+  let pt = bind.type_of_sym(&c, ps)
+  let sgs = bind.sigs_of(&c, pt, false)
+  if sgs.len != 1 or c.sigs[sgs[0]].tparams.len > 0: return -1
+  let r = rel.sig_ret(&c, sgs[0])
+  return iterator_arg(&c, r)
 
 fn object_literal(var c: C, n: Int, ctx: Int) -> Int:
   let t = types.anon_obj(&c, -1, n)
@@ -2405,6 +2482,15 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
           if c.objs[so].eflags[k] != 0: return unsup(&c, el, "a spread of a tuple with optional or rest elements")
           ts.push(c.objs[so].args[k])
         continue
+      # an iterable (es2015 and later): its iterated type
+      if c.tk[st] == TK_STRING or c.tk[st] == TK_STRLIT:
+        ts.push(c.string_t)
+        continue
+      if c.tk[st] == TK_OBJ:
+        let it = iterated(&c, st)
+        if it >= 0:
+          ts.push(it)
+          continue
       return unsup(&c, el, "a spread in an array literal of this type")
     if c.t.k[el] == ast.N_OMIT: return unsup(&c, el, "a hole in an array literal")
     var ec = elem_ctx
@@ -2497,7 +2583,7 @@ fn literal_of_ctx(var c: C, lit: Int, ctx: Int) -> Bool:
 
 # An arrow or function expression: parameters from annotations, else from the contextual signature.
 fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
-  if (c.t.f[n] & ast.M_GENERATOR) != 0: return unsup(&c, n, "a generator function")
+  if (c.t.f[n] & ast.M_GENERATOR) != 0 and (c.t.f[n] & ast.M_ASYNC) != 0: return unsup(&c, n, "an async generator function")
   var csig = -1
   if ctx >= 0:
     var found = 0
@@ -3744,6 +3830,15 @@ fn check_function_body(var c: C, d: Int, sg: Int):
   var declared = -1
   if fn_retnode(c, d) >= 0: declared = c.sigs[sg].ret
   let is_async = (c.t.f[d] & ast.M_ASYNC) != 0
+  if (c.t.f[d] & ast.M_GENERATOR) != 0 and declared >= 0:
+    let yrn = generator_types(&c, declared)
+    if yrn.len == 0:
+      unsup(&c, fn_retnode(c, d), "a generator's return type that isn't a Generator or an iterable")
+      swap(&saved, &c.narrow)
+      c.narrow.pop()
+      return
+    declared = yrn[1]
+    c.gen_ann[d] = yrn
   if is_async and declared >= 0:
     let inner = promise_arg(&c, declared)
     if inner < 0:
@@ -4142,8 +4237,8 @@ fn check_stmt(var c: C, n: Int):
     return
   if k == ast.N_FUNC:
     if c.t.d[n] < 0: return
-    if (c.t.f[n] & ast.M_GENERATOR) != 0:
-      unsup(&c, n, "a generator function")
+    if (c.t.f[n] & ast.M_GENERATOR) != 0 and (c.t.f[n] & ast.M_ASYNC) != 0:
+      unsup(&c, n, "an async generator function")
       return
     for p in kids(c, c.t.b[n]):
       if c.t.k[c.t.a[p]] != ast.N_ID:
