@@ -89,6 +89,11 @@ fn decl_type(var c: C, s: Int) -> Int:
       if c.t.c[d] < 0:
         if p >= 0 and c.t.k[p] == ast.N_VAR and c.t.f[p] == 2: return c.any_t
         return c.any_t
+      let init = c.t.c[d]
+      if c.t.k[init] == ast.N_ARRAY and ast.items(c.t, c.t.a[init]).len == 0 and not exported_decl(c, d):
+        # let x = []: an evolving array (its element type comes from what's pushed later)
+        check_expr(&c, init, -1)
+        return auto_array(&c)
       let it = check_expr(&c, c.t.c[d], -1)
       if (sk & S_CONST) != 0:
         if types.is_fresh_lit(c, it): return types.regular(c, it)
@@ -615,7 +620,10 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
   if k == ast.N_PAREN: return check_expr(&c, c.t.a[n], ctx)
   if k == ast.N_PROPACCESS: return prop_access(&c, n)
   if k == ast.N_ELEMACCESS: return elem_access(&c, n)
-  if k == ast.N_CALL: return call(&c, n, false)
+  if k == ast.N_CALL:
+    let rt = call(&c, n, false)
+    evolve_call(&c, n)
+    return rt
   if k == ast.N_NEW: return call(&c, n, true)
   if k == ast.N_OBJECT: return object_literal(&c, n, ctx)
   if k == ast.N_ARRAY: return array_literal(&c, n, ctx)
@@ -707,10 +715,69 @@ fn ident_type(var c: C, n: Int) -> Int:
     err(&c, n, 2454, "Variable '" + nm(c, name) + "' is used before being assigned.")
   let key = "{s}"
   let nt = narrowed(c, key)
-  if nt >= 0: return nt
   var t = bind.type_of_sym(&c, s)
+  if t == c.auto_arr and t >= 0:
+    # an evolving array: auto[] where it evolves, its element type so far elsewhere
+    if evolving_target(c, n): return t
+    if nt >= 0 and nt != t: return nt
+    let dn = c.t.a[c.sdecl[s]]
+    err(&c, dn, 7034, "Variable '" + nm(c, name) + "' implicitly has type 'any[]' in some locations where its type cannot be determined.")
+    err(&c, n, 7005, "Variable '" + nm(c, name) + "' implicitly has an 'any[]' type.")
+    return bind.array_of(&c, c.any_t)
+  if nt >= 0: return nt
   if (c.sk[s] & (S_CLASS | S_ENUM | S_NAMESPACE)) != 0 and c.t.file[c.sdecl[s]] >= c.user_from: return t
   return t
+
+fn auto_array(var c: C) -> Int:
+  if c.auto_arr < 0: c.auto_arr = bind.array_of(&c, c.auto_t)
+  return c.auto_arr
+
+fn exported_decl(c: C, d: Int) -> Bool:
+  let p = bind.up(c, d)
+  return p >= 0 and c.t.k[p] == ast.N_VAR and (c.t.d[p] & ast.M_EXPORT) != 0
+
+# isEvolvingArrayOperationTarget: x.length, x.push(...), x.unshift(...), x[i] = v.
+fn evolving_target(c: C, n: Int) -> Bool:
+  let p = c.parent[n]
+  if p < 0: return false
+  let pk = c.t.k[p]
+  if pk == ast.N_PROPACCESS and c.t.a[p] == n:
+    let pn = nm(c, c.t.s[p])
+    if pn == "length": return true
+    let gp = c.parent[p]
+    if gp >= 0 and c.t.k[gp] == ast.N_CALL and c.t.a[gp] == p and (pn == "push" or pn == "unshift"): return true
+  if pk == ast.N_ELEMACCESS and c.t.a[p] == n:
+    let gp = c.parent[p]
+    if gp >= 0 and c.t.k[gp] == ast.N_BINARY and c.t.f[gp] == scan.T_ASSIGN and c.t.a[gp] == p: return true
+  return false
+
+# After x.push(a, b) / x.unshift(...) on an evolving array: its element type grows.
+fn evolve_call(var c: C, n: Int):
+  let callee = c.t.a[n]
+  if c.t.k[callee] != ast.N_PROPACCESS: return
+  let pn = nm(c, c.t.s[callee])
+  if pn != "push" and pn != "unshift": return
+  let obj = c.t.a[callee]
+  if c.t.k[obj] != ast.N_ID: return
+  var ts: [Int] = []
+  for a in kids(c, c.t.c[n]):
+    if a in c.ntype: ts.push(c.ntype[a])
+  evolve(&c, obj, ts)
+
+fn evolve(var c: C, obj: Int, ts: [Int]):
+  let s = bind.lookup_value(&c, obj, c.t.s[obj])
+  if s < 0 or c.auto_arr < 0 or bind.type_of_sym(&c, s) != c.auto_arr: return
+  let key = "{s}"
+  var els: [Int] = []
+  let prev = narrowed(c, key)
+  if prev >= 0 and prev != c.auto_arr and rel.is_array_ref(&c, prev): els.push(c.objs[c.ta[prev]].args[0])
+  for t in ts:
+    let w = widen(&c, t)
+    els.push(regular_obj(&c, w))
+  if els.len == 0: return
+  let u = types.union_of(&c, els)
+  let at = bind.array_of(&c, u)
+  set_narrow(&c, key, at)
 
 # A use of a let or const before its declaration ends, not inside a function that could run later.
 fn used_before_decl(var c: C, use: Int, s: Int) -> Bool:
@@ -1000,6 +1067,12 @@ fn subtype_reduce(var c: C, ts: [Int]) -> Int:
   for i in 0..ms.len:
     let m = ms[i]
     var drop = false
+    if c.tk[m] != TK_OBJ and c.tk[m] != TK_NULL and c.tk[m] != TK_UNDEF:
+      # a primitive is a subtype of an object type it fits ({} and the like)
+      for j in 0..ms.len:
+        let n2 = ms[j]
+        if j == i or c.tk[n2] != TK_OBJ: continue
+        if rel.assignable(&c, m, n2) and not rel.assignable(&c, n2, m): drop = true
     if c.tk[m] == TK_OBJ and not c.objs[c.ta[m]].fresh:
       for j in 0..ms.len:
         if j == i: continue
@@ -1320,7 +1393,13 @@ fn prim_constraint(var c: C, t: Int) -> Bool:
 
 fn widen_all(var c: C, t: Int) -> Int:
   var ts: [Int] = []
-  for m in types.members(c, t): ts.push(types.base_of_literal(c, m))
+  var changed = false
+  for m in types.members(c, t):
+    let b = types.base_of_literal(c, m)
+    if b != m: changed = true
+    ts.push(b)
+  # mapType keeps the type itself when nothing changes (an alias keeps its name)
+  if not changed: return t
   return types.union_of(&c, ts)
 
 fn infer(var c: C, p: Int, a: Int, tps: [Int], var cands: [[Int]]):
@@ -1509,6 +1588,8 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
     let before = c.diags.len
     let target = assign_target(&c, l)
     let rt = check_expr(&c, r, target)
+    if lk == ast.N_ELEMACCESS and c.t.k[c.t.a[l]] == ast.N_ID and c.t.b[l] in c.ntype and number_like(c, c.ntype[c.t.b[l]]):
+      evolve(&c, c.t.a[l], [rt])
     # a constant or read-only target is reported alone (checkReferenceExpression fails)
     if not bad_ref(c, before) and not is_any(c, target) and not rel.assignable(&c, rt, target): rel.report(&c, rt, target, l, r, 2322)
     let key = ref_key(&c, l)
@@ -1714,7 +1795,8 @@ fn assigned_narrow(var c: C, declared: Int, assigned: Int) -> Int:
       if rel.assignable(&c, am, m): fits = true
     if fits: keep.push(m)
   if keep.len == 0: return declared
-  # a literal assigned to a primitive member narrows to the literal's primitive, not further
+  # nothing ruled out: the declared type itself (an alias keeps its name)
+  if keep.len == types.members(c, declared).len: return declared
   return types.union_of(&c, keep)
 
 # ---- statements
@@ -1761,13 +1843,29 @@ fn const_facts(var c: C, frames: [{Str: Int}], fnode: Int) -> {Str: Int}:
       let s = int(base) else -1
       if s < 0: continue
       if (c.sk[s] & S_CONST) != 0:
+        # a constant evolving array doesn't carry its evolution into a closure
+        if c.auto_arr >= 0 and c.stype[s] == c.auto_arr: continue
         out[k + ""] = v
-      elif dot < 0 and (c.sk[s] & (S_LET | S_VAR | S_PARAM)) != 0:
+      elif dot < 0 and mutable_local(&c, s):
         # a mutable variable keeps its narrowing in a closure that comes after its last assignment
         var last = -1
         if s in c.last_assign: last = c.last_assign[s]
         if last < c.t.pos[fnode]: out[k + ""] = v
   return out
+
+# isParameterOrMutableLocalVariable: a parameter, or a let that isn't exported or a script's top level.
+fn mutable_local(var c: C, s: Int) -> Bool:
+  if (c.sk[s] & S_PARAM) != 0: return true
+  if (c.sk[s] & S_LET) == 0: return false
+  let d = c.sdecl[s]
+  if d < 0 or c.t.k[d] != ast.N_DECL: return true
+  let v = bind.up(c, d)
+  if v < 0 or c.t.k[v] != ast.N_VAR: return true
+  if c.t.f[v] != 1: return false
+  if (c.t.d[v] & ast.M_EXPORT) != 0: return false
+  let p = c.parent[v]
+  if p >= 0 and c.t.k[p] == ast.N_LIST and c.t.d[p] == -2 and not bind.is_module(c, p): return false
+  return true
 
 fn enclosing_fn(c: C, n0: Int) -> Int:
   var n = bind.up(c, n0)
