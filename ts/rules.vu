@@ -28,6 +28,11 @@ type L:
   sc: scope.Scopes
   elsep: {Int: Int}   # an if statement in an else branch -> the if it's the else of
   in_import: Bool
+  ts: Bool              # a TypeScript file
+  cont: {Int: Bool}     # nodes that a member access or call continues
+  set_arg: {Int: Bool}  # arrays already reported by no-useless-spread
+  recur: {Int: Int}     # parameter -> uses as the same argument of a recursive call
+  parent_list: {Int: Int}   # statement -> the list it's in (for declarations)
   setfns: {Int: Bool}   # functions that are a property descriptor's set
   getfns: {Int: Bool}   # ... and get
   # break targets for the flow analyses: kind (1 loop, 2 switch, 3 label), label, states that break to it
@@ -157,7 +162,7 @@ fn lint(path: Str, src: Str, var kw: {Str: Int}) -> [Str]:
   swap(&t2, &bld.t)
   var sc = scope.new_scopes()
   swap(&sc, &bld.sc)
-  var l = L(t2, src + "", [], [], [], [], false, 0, {}, sc, {}, false, {}, {}, [], [], [], 0, [], false, 0, false, {}, "", -1)
+  var l = L(t2, src + "", [], [], [], [], false, 0, {}, sc, {}, false, path.endswith(".ts") or path.endswith(".mts") or path.endswith(".cts"), {}, {}, {}, {}, {}, {}, [], [], [], 0, [], false, 0, false, {}, "", -1)
   collect_elses(&l)
   mark_directives(&l, root)
   l.jt.push(5)
@@ -167,6 +172,7 @@ fn lint(path: Str, src: Str, var kw: {Str: Int}) -> [Str]:
   irregular_whitespace(&l)
   visit(&l, root)
   scope_rules(&l)
+  file_rules(&l, root)
   if l.fatal != "":
     let lc = line_col(src, l.fatal_at)
     out.push("{path}:{lc[0]}:{lc[1]}: error: {l.fatal}")
@@ -323,6 +329,11 @@ fn line_col(src: Str, pos: Int) -> [Int]:
 
 fn collect_elses(var l: L):
   for n in 0..l.t.k.len:
+    if l.t.k[n] == ast.N_LIST:
+      let st = l.t.a[n]
+      for i in 0..l.t.b[n]:
+        let x = l.t.L[st + i]
+        if x > 0 and (l.t.k[x] == ast.N_INTERFACE or l.t.k[x] == ast.N_CLASS): l.parent_list[x] = n
     if l.t.k[n] == ast.N_IF:
       let el = l.t.c[n]
       if el > 0 and l.t.k[el] == ast.N_IF: l.elsep[el] = n
@@ -461,12 +472,14 @@ fn visit_function(var l: L, n: Int, kd: Int):
 
 fn check(var l: L, n: Int, kd: Int):
   # (the commonest kinds have no rules)
-  if kd == ast.N_ID or kd == ast.N_PARAM or kd == ast.N_TREF or kd == ast.N_TKW or kd == ast.N_BLOCK or kd == ast.N_PROPASSIGN or kd == ast.N_VAR or kd == ast.N_THIS: return
+  if kd == ast.N_ID or kd == ast.N_PARAM or kd == ast.N_TKW or kd == ast.N_BLOCK or kd == ast.N_PROPASSIGN or kd == ast.N_VAR or kd == ast.N_THIS: return
   if kd == ast.N_DEBUGGER:
     add(&l, l.t.pos[n], "eslint(no-debugger)", "`debugger` statement is not allowed", "Remove the debugger statement")
   elif kd == ast.N_WITH:
     add(&l, l.t.pos[n], "eslint(no-with)", "Unexpected use of `with` statement.", "Do not use the `with` statement.")
-  elif kd == ast.N_EXPRSTMT: check_expr_stmt(&l, n)
+  elif kd == ast.N_EXPRSTMT:
+    check_expr_stmt(&l, n)
+    missing_throw(&l, n)
   elif kd == ast.N_BINARY: check_binary(&l, n)
   elif kd == ast.N_PREFIX:
     if l.t.f[n] == T_BANG: bool_ctx(&l, l.t.a[n])
@@ -511,8 +524,20 @@ fn check(var l: L, n: Int, kd: Int):
     unsafe_finally(&l, n, 0, -1)
   elif kd == ast.N_THROW: unsafe_finally(&l, n, 0, -1)
   elif kd == ast.N_YIELD: l.yields += 1
-  elif kd == ast.N_NEW: check_new(&l, n)
-  elif kd == ast.N_CALL: check_call(&l, n)
+  elif kd == ast.N_NEW:
+    check_new(&l, n)
+    plugin_new(&l, n)
+  elif kd == ast.N_CALL:
+    check_call(&l, n)
+    plugin_call(&l, n)
+  elif kd == ast.N_TREF: wrapper_type(&l, n)
+  elif kd == ast.N_AS: as_const(&l, l.t.b[n], l.t.a[n])
+  elif kd == ast.N_NONNULL: non_null(&l, n)
+  elif kd == ast.N_ENUM: dupe_enum_values(&l, n)
+  elif kd == ast.N_INTERFACE: interface_rules(&l, n)
+  elif kd == ast.N_MODULE: namespace_keyword(&l, n)
+  elif kd == ast.N_AWAIT: unnecessary_await(&l, n)
+  elif kd == ast.N_EXPORT: empty_export(&l, n)
   elif kd == ast.N_PROPACCESS:
     let pn = name_of(l, n)
     if pn == "callee" or pn == "caller":
@@ -521,8 +546,13 @@ fn check(var l: L, n: Int, kd: Int):
     elif pn == "__iterator__":
       add(&l, l.t.pos[n], "eslint(no-iterator)", "Reserved name `__iterator__`", "Consider using [Symbol.iterator] instead")
     if (l.t.f[n] & 1) == 0: unsafe_chain_obj(&l, l.t.a[n])
+    l.cont[l.t.a[n]] = true
+    args_method(&l, n, l.t.s[n])
+    if pn == "length": set_size(&l, n)
   elif kd == ast.N_ELEMACCESS:
     let ix = l.t.b[n]
+    l.cont[l.t.a[n]] = true
+    if k(l, ix) == ast.N_STR: args_method(&l, n, l.t.s[ix])
     if k(l, ix) == ast.N_STR and name_of(l, ix) == "__iterator__":
       add(&l, l.t.pos[n], "eslint(no-iterator)", "Reserved name `__iterator__`", "Consider using [Symbol.iterator] instead")
     if (l.t.f[n] & 1) == 0: unsafe_chain_obj(&l, l.t.a[n])
@@ -532,11 +562,18 @@ fn check(var l: L, n: Int, kd: Int):
       let e = ast.item(l.t, lst, i)
       if l.t.k[e] == ast.N_OMIT:
         add(&l, l.t.pos[e], "eslint(no-sparse-arrays)", "Unexpected comma in middle of array", "remove the comma or insert `undefined`")
-      elif l.t.k[e] == ast.N_SPREAD: unsafe_chain(&l, l.t.a[e])
-  elif kd == ast.N_OBJECT: dupe_keys(&l, n)
+      elif l.t.k[e] == ast.N_SPREAD:
+        unsafe_chain(&l, l.t.a[e])
+        if k(l, unparen(l, l.t.a[e])) == ast.N_ARRAY and not (n in l.set_arg):
+          add(&l, l.t.pos[e], "unicorn(no-useless-spread)", "Using a spread operator here creates a new array unnecessarily.", "Consider removing the spread operator.")
+        elif ast.count(l.t, lst) == 1 and not (n in l.set_arg): new_array_spread(&l, e)
+  elif kd == ast.N_OBJECT:
+    dupe_keys(&l, n)
+    object_rules(&l, n)
   elif kd == ast.N_CLASS or kd == ast.N_CLASSEXPR:
     dupe_class_members(&l, n)
     private_members(&l, n)
+    class_rules(&l, n)
     if l.t.b[n] > 0: ctor_super(&l, n)
     let ext = l.t.b[n]
     if ext > 0: unsafe_chain(&l, l.t.a[ext])
@@ -552,8 +589,14 @@ fn check(var l: L, n: Int, kd: Int):
   elif kd == ast.N_DECL:
     let init = l.t.c[n]
     if init > 0 and is_pattern(l, l.t.a[n]): unsafe_chain(&l, init)
+    decl_rules(&l, n)
   elif kd == ast.N_FORIN:
-    if l.t.f[n] >= 1: unsafe_chain(&l, l.t.b[n])
+    if l.t.f[n] >= 1:
+      unsafe_chain(&l, l.t.b[n])
+      let it = unparen(l, l.t.b[n])
+      if k(l, it) == ast.N_ARRAY and ast.count(l.t, l.t.a[it]) == 1 and k(l, ast.item(l.t, l.t.a[it], 0)) == ast.N_SPREAD:
+        l.set_arg[it] = true
+        add(&l, l.t.pos[ast.item(l.t, l.t.a[it], 0)], "unicorn(no-useless-spread)", "Using a spread operator here creates a new array unnecessarily.", "`for…of` can iterate over iterable, it's unnecessary to convert to an array.")
   elif kd == ast.N_TAGGED:
     unsafe_chain_obj(&l, l.t.a[n])
     l.tagged[l.t.c[n]] = true
@@ -626,16 +669,35 @@ fn check_binary(var l: L, n: Int):
   if op == T_ASSIGN or op == scan.T_ANDEQ or op == scan.T_OREQ or op == scan.T_QQEQ:
     self_assign(&l, a, b)
   if op == T_ASSIGN and is_pattern_expr(l, a): unsafe_chain(&l, b)
+  if (op == T_LT or op == T_GT) and same(l, unparen(l, a), unparen(l, b)):
+    var w = "greater"
+    if op == T_LT: w = "less"
+    add(&l, l.t.pos[n], "oxc(const-comparisons)", "This comparison will always evaluate to false", "Because `{text(l, unparen(l, a))}` will never be {w} than itself")
   if op == T_LT or op == T_GT or op == T_LE or op == T_GE:
     if is_literal(k(l, unparen(l, a))) and is_literal(k(l, unparen(l, b))):
       add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected constant relational comparison", "Both sides of the {op_text(op)} are literal values")
+  if is_cmp_op(op):
+    let ua2 = a
+    if k(l, ua2) == ast.N_BINARY and is_cmp_op(l.t.f[ua2]) and is_eq_op(l.t.f[ua2]) == is_eq_op(op):
+      add(&l, l.t.pos[n], "oxc(bad-comparison-sequence)", "Bad comparison sequence", "Comparison result should not be used directly as an operand of another comparison. If you need to compare three or more operands, you should connect each comparison operation with logical AND operator (`&&`)")
   if is_eq_op(op):
     const_binary(&l, n, op, a, b)
     bad_literal_cmp(&l, n, op, a, b)
-  elif op == T_AND or op == T_OR:
+    char_at_cmp(&l, a, b)
+    char_at_cmp(&l, b, a)
+  if op == scan.T_STAR or op == scan.T_AMP:
+    if is_zero(l, a) or is_zero(l, b): erasing(&l, n)
+  elif op == scan.T_SLASH:
+    if is_zero(l, a): erasing(&l, n)
+  if op == T_AND or op == T_OR:
+    double_cmp(&l, n, op, a, b)
+    if op == T_AND: const_cmp(&l, n, a, b)
+    if same(l, unparen(l, a), unparen(l, b)):
+      add(&l, l.t.pos[n], "oxc(const-comparisons)", "Both sides of the logical operator are the same", "This logical expression will always evaluate to the same value as the expression itself.")
+    useless_length_check(&l, n, op, a, b)
     if is_constant(l, a, true):
       add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected constant truthiness on the left-hand side of a \"{op_text(op)}\" expression", "This expression always evaluates to the constant on the left-hand side")
-  elif op == T_QQ:
+  if op == T_QQ:
     if const_nullish(l, a, false):
       add(&l, l.t.pos[n], "eslint(no-constant-binary-expression)", "Unexpected constant nullishness on the left-hand side of a \"??\" expression", "This expression always evaluates to the constant on the left-hand side")
   if is_assign_op(op): ns_import_write(&l, n, a)
@@ -1779,6 +1841,9 @@ fn scope_rules(var l: L):
       for i in 0..l.sc.xsym.len:
         if l.sc.xsym[i] == y and not l.sc.xinit[i]: add(&l, l.sc.xpos[i], "eslint(no-unassigned-vars)", "'{name}' is always 'undefined' because it's never assigned.", "Variable declared without assignment. Either assign a value or remove the declaration.")
     unused_var(&l, y)
+    let rc = l.recur.get(y, 0)
+    if kind == scope.Y_PARAM and rc > 0 and rc == l.sc.reads[y] and l.sc.treads[y] == 0:
+      add(&l, at, "oxc(only-used-in-recursion)", "Parameter `{name}` is only used in recursive calls", "Remove the argument and its usage. Alternatively, use the argument in the function body.")
   # writes: no-func-assign, no-ex-assign, no-import-assign, no-global-assign
   for i in 0..l.sc.wsym.len:
     let y = l.sc.wsym[i]
@@ -1806,6 +1871,7 @@ fn unused_var(var l: L, y: Int):
   let kind = l.sc.yk[y]
   let fl = l.sc.yf[y]
   if (fl & (scope.F_EXPORTED | scope.F_KEEP | scope.F_BODYLESS)) != 0: return
+  if (fl & scope.F_AMBIENT) != 0 and (kind == scope.Y_CLASS or kind == scope.Y_NAMESPACE or kind == scope.Y_FUNC): return
   if kind == scope.Y_MEMBER or kind == scope.Y_FNNAME or kind == scope.Y_CLASSNAME: return
   if l.sc.reads[y] > 0: return
   let name = l.t.names[l.sc.yn[y]] + ""
@@ -2857,3 +2923,662 @@ fn pm_target(l: L, n: Int, var vr: {Int: Int}, var sr: {Int: Int}, var wr: {Int:
     pm_walk(l, l.t.b[n], 0, &vr, &sr, &wr)
     return
   pm_walk(l, n, 0, &vr, &sr, &wr)
+
+# ======== plugin rules (oxc, typescript, unicorn)
+
+fn file_rules(var l: L, root: Int):
+  # unicorn(no-empty-file): nothing but directives and comments
+  var empty = true
+  for i in 0..ast.count(l.t, root):
+    let st = ast.item(l.t, root, i)
+    if not (st in l.dirs) and k(l, st) != ast.N_EMPTY: empty = false
+  if empty and has_triple_slash(l.src): empty = false
+  if empty:
+    add(&l, 0, "unicorn(no-empty-file)", "Empty files are not allowed.", "Delete this file or add some code to it.")
+  # typescript(triple-slash-reference): reference comments before the first statement
+  var i = 0
+  let n = l.src.len
+  var first = n
+  if ast.count(l.t, root) > 0: first = l.t.pos[ast.item(l.t, root, 0)]
+  while i < first:
+    let c = l.src[i]
+    if is_space(c):
+      i += 1
+      continue
+    if c == '/' and i + 1 < n and l.src[i + 1] == '/':
+      var e = l.src.find("\n", i)
+      if e < 0: e = n
+      let line = l.src[i..e]
+      if line.startswith("///"): triple_slash(&l, i, line, root)
+      i = e
+      continue
+    if c == '/' and i + 1 < n and l.src[i + 1] == '*':
+      let e = l.src.find("*/", i + 2)
+      if e < 0: return
+      i = e + 2
+      continue
+    return
+
+fn has_triple_slash(src: Str) -> Bool:
+  var i = src.find("///")
+  while i >= 0:
+    var j = i + 3
+    while j < src.len and (src[j] == ' ' or src[j] == '\t'): j += 1
+    if j < src.len and src[j] == '<': return true
+    i = src.find("///", i + 3)
+  return false
+
+fn triple_slash(var l: L, at: Int, line: Str, root: Int):
+  let t = line[3..line.len].strip()
+  if not t.startswith("<reference"): return
+  for kind in ["path", "types"]:
+    let key = kind + "=\""
+    var p = t.find(key)
+    var q = '"'
+    if p < 0:
+      p = t.find(kind + "='")
+      q = '\''
+    if p < 0: continue
+    let s0 = p + kind.len + 2
+    var e = s0
+    while e < t.len and t[e] != q: e += 1
+    let name = t[s0..e]
+    var report = kind == "path"
+    if kind == "types":
+      for i in 0..ast.count(l.t, root):
+        let st = ast.item(l.t, root, i)
+        if k(l, st) == ast.N_IMPORT and l.t.a[st] > 0 and name_of(l, l.t.a[st]) == name: report = true
+        if k(l, st) == ast.N_IMPORTEQ:
+          let r = l.t.a[st]
+          if k(l, r) == ast.N_EXTERNALREF and name_of(l, l.t.a[r]) == name: report = true
+    if report:
+      add(&l, at, "typescript(triple-slash-reference)", "Do not use a triple slash reference for {name}, use `import` style instead.", "Use of triple-slash reference type directives is generally discouraged in favor of ECMAScript Module imports.")
+
+fn missing_throw(var l: L, n: Int):
+  let e = l.t.a[n]
+  if k(l, e) == ast.N_NEW and id_is(l, l.t.a[e], "Error") and is_global(l, l.t.a[e]):
+    add(&l, l.t.pos[e], "oxc(missing-throw)", "Missing throw", "The `throw` keyword seems to be missing in front of this 'new' expression")
+
+fn is_zero(l: L, n: Int) -> Bool:
+  let x = unparen(l, n)
+  return k(l, x) == ast.N_NUM and num_value(name_of(l, x)) == 0.0
+
+fn erasing(var l: L, n: Int):
+  add(&l, l.t.pos[n], "oxc(erasing-op)", "Unexpected erasing operation. This expression will always evaluate to zero.", "This is most likely not the intended outcome. Consider removing the operation, or directly assigning zero to the variable")
+
+# oxc(bad-char-at-comparison): x.charAt(i) compared with a string longer than one character
+fn char_at_cmp(var l: L, a: Int, b: Int):
+  let c = unparen(l, a)
+  if k(l, c) != ast.N_CALL: return
+  let m = l.t.a[c]
+  if k(l, m) != ast.N_PROPACCESS or name_of(l, m) != "charAt": return
+  let s = unparen(l, b)
+  if k(l, s) != ast.N_STR or name_of(l, s).char_count() <= 1: return
+  add(&l, l.t.pos[c], "oxc(bad-char-at-comparison)", "Invalid character comparison", "Character access returns a string of length at most 1. If the return value is compared with a string of length greater than 1, the comparison will always be false.")
+
+fn is_eq_strict_or_loose(op: Int) -> Bool:
+  return op == T_EQ2 or op == T_EQ3
+
+# oxc(double-comparisons): a == b || a < b and the like
+fn double_cmp(var l: L, n: Int, op: Int, a0: Int, b0: Int):
+  let a = unparen(l, a0)
+  let b = unparen(l, b0)
+  if k(l, a) != ast.N_BINARY or k(l, b) != ast.N_BINARY: return
+  let o1 = l.t.f[a]
+  let o2 = l.t.f[b]
+  if not is_cmp_op(o1) or not is_cmp_op(o2): return
+  if not ((same(l, l.t.a[a], l.t.a[b]) and same(l, l.t.b[a], l.t.b[b])) or (same(l, l.t.a[a], l.t.b[b]) and same(l, l.t.b[a], l.t.a[b]))): return
+  var o2n = o2
+  if not same(l, l.t.a[a], l.t.a[b]):
+    # b is written the other way round
+    if o2 == T_LT: o2n = T_GT
+    elif o2 == T_GT: o2n = T_LT
+    elif o2 == T_LE: o2n = T_GE
+    elif o2 == T_GE: o2n = T_LE
+  var sug = ""
+  if op == T_OR:
+    if (is_eq_strict_or_loose(o1) and o2n == T_LT) or (o1 == T_LT and is_eq_strict_or_loose(o2n)): sug = "<="
+    elif (is_eq_strict_or_loose(o1) and o2n == T_GT) or (o1 == T_GT and is_eq_strict_or_loose(o2n)): sug = ">="
+    elif (o1 == T_LT and o2n == T_GT) or (o1 == T_GT and o2n == T_LT): sug = "!="
+  else:
+    if (o1 == T_LE and o2n == T_GE) or (o1 == T_GE and o2n == T_LE): sug = "=="
+  if sug == "": return
+  add(&l, l.t.pos[n], "oxc(double-comparisons)", "Unexpected double comparisons.", "This logical expression can be simplified. Try using the `{sug}` operator instead.")
+
+# A comparison of something with a number: (thing, op as if the number is on the right, number node).
+fn bound(l: L, n0: Int) -> [Int]:
+  let n = unparen(l, n0)
+  if k(l, n) != ast.N_BINARY: return []
+  let op = l.t.f[n]
+  if op != T_LT and op != T_GT and op != T_LE and op != T_GE: return []
+  let a = l.t.a[n]
+  let b = l.t.b[n]
+  if is_num_lit(l, b) and not is_num_lit(l, a): return [a, op, b]
+  if is_num_lit(l, a) and not is_num_lit(l, b):
+    var f = op
+    if op == T_LT: f = T_GT
+    elif op == T_GT: f = T_LT
+    elif op == T_LE: f = T_GE
+    elif op == T_GE: f = T_LE
+    return [b, f, a]
+  return []
+
+fn is_num_lit(l: L, n0: Int) -> Bool:
+  let n = unparen(l, n0)
+  if k(l, n) == ast.N_NUM: return true
+  return k(l, n) == ast.N_PREFIX and l.t.f[n] == T_MINUS and k(l, unparen(l, l.t.a[n])) == ast.N_NUM
+
+fn lit_num(l: L, n0: Int) -> Float:
+  let n = unparen(l, n0)
+  if k(l, n) == ast.N_NUM: return num_value(name_of(l, n))
+  return 0.0 - num_value(name_of(l, unparen(l, l.t.a[n])))
+
+# oxc(const-comparisons) on &&
+fn const_cmp(var l: L, n: Int, a: Int, b: Int):
+  let x = bound(l, a)
+  let y = bound(l, b)
+  if x.len == 0 or y.len == 0: return
+  if not same(l, unparen(l, x[0]), unparen(l, y[0])): return
+  let c1 = lit_num(l, x[2])
+  let c2 = lit_num(l, y[2])
+  let lower1 = x[1] == T_GT or x[1] == T_GE
+  let lower2 = y[1] == T_GT or y[1] == T_GE
+  let tx = text(l, unparen(l, x[0]))
+  if lower1 == lower2:
+    # the stronger bound makes the other redundant
+    var left_stronger = false
+    if c1 == c2:
+      if x[1] == y[1]: return
+      left_stronger = x[1] == T_GT or x[1] == T_LT
+    elif lower1: left_stronger = c1 > c2
+    else: left_stronger = c1 < c2
+    let ta = text(l, unparen(l, a))
+    let tb = text(l, unparen(l, b))
+    if left_stronger:
+      add(&l, l.t.pos[unparen(l, a)], "oxc(const-comparisons)", "Right-hand side of `&&` operator has no effect.", "if `{ta}` evaluates to true, `{tb}` will always evaluate to true as well")
+    else:
+      add(&l, l.t.pos[unparen(l, b)], "oxc(const-comparisons)", "Left-hand side of `&&` operator has no effect.", "if `{tb}` evaluates to true, `{ta}` will always evaluate to true as well")
+    return
+  var lo = c1
+  var lo_op = x[1]
+  var lo_n = x[2]
+  var hi = c2
+  var hi_op = y[1]
+  var hi_n = y[2]
+  if not lower1:
+    lo = c2
+    lo_op = y[1]
+    lo_n = y[2]
+    hi = c1
+    hi_op = x[1]
+    hi_n = x[2]
+  if lo > hi:
+    add(&l, l.t.pos[n], "oxc(const-comparisons)", "Unexpected constant comparison", "since `{text(l, unparen(l, lo_n))}` > `{text(l, unparen(l, hi_n))}`, the expression evaluates to false for any value of `{tx}`")
+  elif lo == hi and not (lo_op == T_GE and hi_op == T_LE):
+    add(&l, l.t.pos[n], "oxc(const-comparisons)", "Unexpected constant comparison", "`{tx}` cannot simultaneously be greater than and less than `{text(l, unparen(l, lo_n))}`")
+
+# unicorn(no-useless-length-check)
+fn length_of(l: L, n0: Int) -> Int:
+  # x.length -> x (else -1)
+  let n = unparen(l, n0)
+  if k(l, n) == ast.N_PROPACCESS and name_of(l, n) == "length": return unparen(l, l.t.a[n])
+  return -1
+
+fn useless_length_check(var l: L, n: Int, op: Int, a0: Int, b0: Int):
+  let a = unparen(l, a0)
+  let b = unparen(l, b0)
+  if k(l, a) != ast.N_BINARY or k(l, b) != ast.N_CALL: return
+  let m = l.t.a[b]
+  if k(l, m) != ast.N_PROPACCESS or (l.t.f[b] & 1) != 0: return
+  let mn = name_of(l, m)
+  let arr = length_of(l, l.t.a[a])
+  if arr < 0 or not same(l, arr, unparen(l, l.t.a[m])): return
+  let cop = l.t.f[a]
+  let cv = l.t.b[a]
+  if not is_zero(l, cv) and not (k(l, unparen(l, cv)) == ast.N_NUM and num_value(name_of(l, unparen(l, cv))) == 1.0): return
+  let zero = is_zero(l, cv)
+  if op == T_OR and mn == "every" and zero and (cop == T_EQ3 or cop == T_EQ2):
+    add(&l, l.t.pos[a], "unicorn(no-useless-length-check)", "Found a useless array length check", "The empty check is useless as `Array#every()` returns `true` for an empty array.")
+  elif op == T_AND and mn == "some" and ((zero and (cop == T_NE2 or cop == T_NE or cop == T_GT)) or (not zero and cop == T_GE)):
+    add(&l, l.t.pos[a], "unicorn(no-useless-length-check)", "Found a useless array length check", "The non-empty check is useless as `Array#some()` returns `false` for an empty array.")
+
+# oxc(bad-array-method-on-arguments)
+fn args_method(var l: L, n: Int, name: Int):
+  let o = l.t.a[n]
+  if k(l, o) != ast.N_ID or name_of(l, o) != "arguments" or not is_global(l, o): return
+  if not in_plain_function(l): return
+  let nm = l.t.names[name] + ""
+  for m in ["at", "concat", "copyWithin", "entries", "every", "fill", "filter", "find", "findIndex", "findLast", "findLastIndex", "flat", "flatMap", "forEach", "includes", "indexOf", "join", "keys", "lastIndexOf", "map", "pop", "push", "reduce", "reduceRight", "reverse", "shift", "slice", "some", "sort", "splice", "toReversed", "toSorted", "toSpliced", "unshift", "values", "with"]:
+    if nm == m:
+      add(&l, l.t.pos[n], "oxc(bad-array-method-on-arguments)", "Bad array method on `arguments`.", "The `arguments` object does not have a `{nm}()` method. If you intended to use an array method, consider using rest parameters instead or converting the `arguments` object to an array.")
+      return
+
+fn in_plain_function(l: L) -> Bool:
+  return l.jt.len > 1
+
+# typescript(no-wrapper-object-types)
+fn wrapper_type(var l: L, n: Int):
+  let nm = l.t.a[n]
+  if k(l, nm) != ast.N_ID or l.t.b[n] > 0: return
+  let s = name_of(l, nm)
+  if s == "String" or s == "Number" or s == "Boolean" or s == "Object" or s == "Symbol" or s == "BigInt":
+    if l.sc.res.get(nm, -1) >= 0: return
+    add(&l, l.t.pos[n], "typescript(no-wrapper-object-types)", "Do not use wrapper object types.", "Replace `{s}` with `{s.lower()}`.")
+
+# typescript(no-extra-non-null-assertion), typescript(no-non-null-asserted-optional-chain)
+fn non_null(var l: L, n: Int):
+  let inner = l.t.a[n]
+  if k(l, inner) == ast.N_NONNULL:
+    add(&l, l.t.end[l.t.a[inner]], "typescript(no-extra-non-null-assertion)", "extra non-null assertion", "Remove the redundant non-null assertion operator (`!`).")
+    return
+  if n in l.cont: return
+  let x = unparen(l, inner)
+  let kx = k(l, x)
+  if (kx == ast.N_PROPACCESS or kx == ast.N_ELEMACCESS or kx == ast.N_CALL) and in_chain(l, x):
+    add(&l, l.t.end[inner], "typescript(no-non-null-asserted-optional-chain)", "Optional chain expressions can return undefined by design: using a non-null assertion is unsafe and wrong.", "Remove the non-null assertion.")
+
+# typescript(no-duplicate-enum-values)
+fn dupe_enum_values(var l: L, n: Int):
+  var seen: {Str: Int} = {}
+  let lst = l.t.a[n]
+  for i in 0..ast.count(l.t, lst):
+    let m = ast.item(l.t, lst, i)
+    let v = l.t.b[m]
+    if v <= 0: continue
+    let x = unparen(l, v)
+    var key = ""
+    var shown = ""
+    if k(l, x) == ast.N_NUM:
+      key = "n{num_value(name_of(l, x))}"
+      shown = name_of(l, x)
+    elif k(l, x) == ast.N_STR or k(l, x) == ast.N_NOSUBTEMPL:
+      key = "s" + name_of(l, x)
+      shown = "'" + name_of(l, x) + "'"
+    else: continue
+    if key in seen:
+      let mn = text(l, l.t.a[m])
+      add(&l, seen[key], "typescript(no-duplicate-enum-values)", "Duplicate enum value `{shown}`", "Give {mn} a unique value")
+    else: seen[key] = l.t.pos[x]
+
+# typescript(no-misused-new) in interfaces, no-unsafe-declaration-merging
+fn interface_rules(var l: L, n: Int):
+  let ms = l.t.c[n]
+  for i in 0..ast.count(l.t, ms):
+    let m = ast.item(l.t, ms, i)
+    let km = k(l, m)
+    if km == ast.N_CTORSIG:
+      let sig = l.t.b[m]
+      let ret = l.t.c[sig]
+      if k(l, ret) == ast.N_TREF and k(l, l.t.a[ret]) == ast.N_ID and l.t.s[l.t.a[ret]] == l.t.s[n]:
+        add(&l, l.t.pos[m], "typescript(no-misused-new)", "Interfaces cannot be constructed, only classes.", "Consider removing this method from your interface.")
+    elif km == ast.N_METHOD and key_name(l, l.t.a[m]) == "constructor":
+      add(&l, l.t.pos[m], "typescript(no-misused-new)", "Interfaces cannot be constructed, only classes.", "Consider removing this method from your interface.")
+  # a class of the same name in the same scope
+  let y = l.sc.res.get(n, -2)
+  let unused = y
+
+fn class_rules(var l: L, n: Int):
+  let ms = l.t.d[n]
+  for i in 0..ast.count(l.t, ms):
+    let m = ast.item(l.t, ms, i)
+    let km = k(l, m)
+    let key = l.t.a[m]
+    # no-misused-new: a method named new, without a body, returning the class
+    if km == ast.N_METHOD and l.t.c[m] <= 0 and key_name(l, key) == "new" and l.t.s[n] > 0:
+      let ret = l.t.c[l.t.b[m]]
+      if k(l, ret) == ast.N_TREF and k(l, l.t.a[ret]) == ast.N_ID and l.t.s[l.t.a[ret]] == l.t.s[n]:
+        add(&l, l.t.pos[key], "typescript(no-misused-new)", "Class cannot have method named `new`.", "This method name is confusing, consider renaming the method to `constructor`")
+    # unicorn(no-thenable)
+    if (km == ast.N_METHOD or km == ast.N_PROP or km == ast.N_GET or km == ast.N_SET) and (l.t.f[m] & ast.M_STATIC) == 0 and key_name(l, key) == "then":
+      add(&l, l.t.pos[key], "unicorn(no-thenable)", "Do not add `then` to a class.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
+    # no-unnecessary-parameter-property-assignment
+    if km == ast.N_CTOR and l.t.c[m] > 0: param_prop_assign(&l, m)
+  # no-unsafe-declaration-merging: an interface of the same name in the same scope
+  if k(l, n) == ast.N_CLASS and l.t.s[n] > 0:
+    for x in 0..l.t.k.len:
+      if l.t.k[x] == ast.N_INTERFACE and l.t.s[x] == l.t.s[n] and same_scope_parent(l, x, n):
+        var at = l.t.npos.get(x, l.t.pos[x])
+        let at2 = l.t.npos.get(n, l.t.pos[n])
+        if at2 < at: at = at2
+        add(&l, at, "typescript(no-unsafe-declaration-merging)", "Unsafe declaration merging between classes and interfaces.", "The TypeScript compiler doesn't check whether properties are initialized, which can lead to TypeScript not detecting code that will cause runtime errors.")
+
+fn same_scope_parent(l: L, a: Int, b: Int) -> Bool:
+  # both statements of the same list
+  let la = l.parent_list.get(a, -1)
+  return la >= 0 and la == l.parent_list.get(b, -2)
+
+fn param_prop_assign(var l: L, ctor: Int):
+  let sig = l.t.b[ctor]
+  var props: {Int: Bool} = {}
+  let ps = l.t.b[sig]
+  for i in 0..ast.count(l.t, ps):
+    let p = ast.item(l.t, ps, i)
+    if (l.t.f[p] & (ast.M_PUBLIC | ast.M_PRIVATE | ast.M_PROTECTED | ast.M_READONLY | ast.M_OVERRIDE)) != 0 and k(l, l.t.a[p]) == ast.N_ID:
+      props[l.t.s[l.t.a[p]]] = true
+  if props.len == 0: return
+  let body = l.t.a[l.t.c[ctor]]
+  for i in 0..ast.count(l.t, body):
+    let st = ast.item(l.t, body, i)
+    if k(l, st) != ast.N_EXPRSTMT: continue
+    let e = l.t.a[st]
+    if not is_bin(l, e, T_ASSIGN): continue
+    let lhs = l.t.a[e]
+    let rhs = unparen(l, l.t.b[e])
+    if k(l, lhs) == ast.N_PROPACCESS and k(l, l.t.a[lhs]) == ast.N_THIS and k(l, rhs) == ast.N_ID and l.t.s[rhs] == l.t.s[lhs] and l.t.s[rhs] in props:
+      add(&l, l.t.pos[e], "typescript(no-unnecessary-parameter-property-assignment)", "Assignment of parameter property is unnecessary", "Remove the unnecessary assignment")
+
+# typescript(prefer-namespace-keyword)
+fn namespace_keyword(var l: L, n: Int):
+  let f = l.t.f[n]
+  if (f & (ast.MOD_NAMESPACE | ast.MOD_GLOBAL)) != 0: return
+  let nm = l.t.a[n]
+  if k(l, nm) == ast.N_STR: return
+  add(&l, l.t.pos[n], "typescript(prefer-namespace-keyword)", "Use `namespace` instead of `module` to declare custom TypeScript modules.", "Replace `module` with `namespace` for internal declarations.")
+
+# typescript(no-useless-empty-export)
+fn empty_export(var l: L, n: Int):
+  if l.t.a[n] > 0 or l.t.b[n] <= 0 or ast.count(l.t, l.t.b[n]) > 0 or l.t.c[n] > 0: return
+  # other imports or exports in the file
+  let root = l.t.k.len - 1
+  for i in 0..ast.count(l.t, root):
+    let st = ast.item(l.t, root, i)
+    if st == n: continue
+    let ks = k(l, st)
+    if ks == ast.N_IMPORT or ks == ast.N_EXPORT or ks == ast.N_EXPORTDEFAULT or ks == ast.N_EXPORTASSIGN or (ks == ast.N_IMPORTEQ) or scope.has_export_mod(l.t, st):
+      add(&l, l.t.pos[n], "typescript(no-useless-empty-export)", "Empty exports do nothing in module files", "Remove this empty export.")
+      return
+
+# typescript(no-this-alias), typescript(prefer-as-const), unicorn(no-thenable) for exports
+fn decl_rules(var l: L, n: Int):
+  let tg = l.t.a[n]
+  let init = l.t.c[n]
+  if init > 0 and k(l, tg) == ast.N_ID and k(l, unparen(l, init)) == ast.N_THIS and l.ts:
+    add(&l, l.t.pos[tg], "typescript(no-this-alias)", "Unexpected aliasing of 'this' to local variable.", "Assigning a variable to this instead of properly using arrow lambdas may be a symptom of pre-ES2015 practices or not managing scope well.")
+  let ty = l.t.b[n]
+  if ty > 0 and init > 0: as_const(&l, ty, init)
+  if k(l, tg) == ast.N_ID and name_of(l, tg) == "then":
+    let y = l.sc.res.get(tg, -1)
+    if y >= 0 and (l.sc.yf[y] & scope.F_EXPORTED) != 0 and l.sc.ys[y] == 0:
+      add(&l, l.t.pos[tg], "unicorn(no-thenable)", "Do not export `then`.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
+
+fn as_const(var l: L, ty: Int, val: Int):
+  if k(l, ty) != ast.N_TLIT: return
+  let lit = l.t.a[ty]
+  let v = unparen(l, val)
+  let kl = k(l, lit)
+  if kl != k(l, v): return
+  if (kl == ast.N_STR or kl == ast.N_NUM) and l.t.s[lit] == l.t.s[v]:
+    add(&l, l.t.pos[ty], "typescript(prefer-as-const)", "Expected a `const` assertion instead of a literal type annotation.", "You should use `as const` instead of type annotation.")
+
+# unicorn(no-unnecessary-await)
+fn unnecessary_await(var l: L, n: Int):
+  let x = unparen(l, l.t.a[n])
+  let kx = k(l, x)
+  var bad = is_literal(kx) and kx != ast.N_REGEX
+  if kx == ast.N_ARRAY or kx == ast.N_OBJECT or kx == ast.N_NOSUBTEMPL or kx == ast.N_TEMPL or kx == ast.N_ARROW or kx == ast.N_FUNCEXPR or kx == ast.N_CLASSEXPR or kx == ast.N_REGEX: bad = true
+  if kx == ast.N_BINARY:
+    let op = l.t.f[x]
+    if not is_assign_op(op) and op != T_AND and op != T_OR and op != T_QQ and op != T_COMMA: bad = true
+  if kx == ast.N_PREFIX or kx == ast.N_TYPEOF or kx == ast.N_DELETE or kx == ast.N_POSTFIX: bad = true
+  if bad: add(&l, l.t.pos[n], "unicorn(no-unnecessary-await)", "Unexpected `await` on a non-Promise value", "Consider removing the `await`")
+
+# object literals: unicorn(no-thenable), unicorn(no-useless-fallback-in-spread)
+fn object_rules(var l: L, n: Int):
+  let lst = l.t.a[n]
+  for i in 0..ast.count(l.t, lst):
+    let p = ast.item(l.t, lst, i)
+    let kp = k(l, p)
+    if kp == ast.N_PROPASSIGN or kp == ast.N_METHOD or kp == ast.N_GET or kp == ast.N_SET:
+      if key_name(l, l.t.a[p]) == "then":
+        add(&l, l.t.pos[l.t.a[p]], "unicorn(no-thenable)", "Do not add `then` to an object.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
+    elif kp == ast.N_SHORTHAND and name_of(l, p) == "then":
+      add(&l, l.t.pos[p], "unicorn(no-thenable)", "Do not add `then` to an object.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
+    elif kp == ast.N_SPREAD:
+      let e = unparen(l, l.t.a[p])
+      if k(l, e) == ast.N_BINARY and (l.t.f[e] == T_OR or l.t.f[e] == T_QQ):
+        let r = unparen(l, l.t.b[e])
+        if k(l, r) == ast.N_OBJECT and ast.count(l.t, l.t.a[r]) == 0:
+          add(&l, l.t.pos[p], "unicorn(no-useless-fallback-in-spread)", "Empty fallbacks in spreads are unnecessary", "Spreading falsy values in object literals won't add any unexpected properties, so it's unnecessary to add an empty object as fallback.")
+
+# unicorn(prefer-set-size): [...new Set(x)].length
+fn set_size(var l: L, n: Int):
+  let o = unparen(l, l.t.a[n])
+  if k(l, o) != ast.N_ARRAY or ast.count(l.t, l.t.a[o]) != 1: return
+  let sp = ast.item(l.t, l.t.a[o], 0)
+  if k(l, sp) != ast.N_SPREAD: return
+  let nw = unparen(l, l.t.a[sp])
+  if k(l, nw) == ast.N_NEW and id_is(l, l.t.a[nw], "Set") and is_global(l, l.t.a[nw]):
+    add(&l, l.t.d[n], "unicorn(prefer-set-size)", "Use `Set#size` instead of converting a `Set` to an array and using its `length` property.", "Replace array conversion with direct `Set.size` access")
+
+fn plugin_new(var l: L, n: Int):
+  let c = l.t.a[n]
+  let args = l.t.c[n]
+  let na = ast.count(l.t, args)
+  if k(l, c) != ast.N_ID or not is_global(l, c): return
+  let nm = name_of(l, c)
+  if nm == "Array" and na == 1 and k(l, ast.item(l.t, args, 0)) != ast.N_SPREAD:
+    add(&l, l.t.pos[n], "unicorn(no-new-array)", "Do not use `new Array(singleArgument)`.", "It's not clear whether the argument is meant to be the length of the array or the only element. If the argument is the array's length, consider using `Array.from({{ length: n }})`. If the argument is the only element, use `[element]`.")
+  if nm == "Request" and na >= 2: fetch_options(&l, ast.item(l.t, args, 1))
+  if (nm == "Set" or nm == "Map" or nm == "WeakSet" or nm == "WeakMap") and na >= 1: iterable_spread(&l, ast.item(l.t, args, 0), "`{nm}` accepts an iterable, so it's unnecessary to convert the iterable to an array.", "Consider removing the spread operator.")
+
+fn new_array_spread(var l: L, sp: Int):
+  let c = unparen(l, l.t.a[sp])
+  if k(l, c) != ast.N_CALL or (l.t.f[c] & 3) != 0: return
+  let m = l.t.a[c]
+  if k(l, m) != ast.N_PROPACCESS: return
+  let mn = name_of(l, m)
+  var ok = false
+  for x in ["concat", "copyWithin", "fill", "filter", "flat", "flatMap", "map", "reverse", "slice", "sort", "splice", "toReversed", "toSorted", "toSpliced", "with", "split"]:
+    if mn == x: ok = true
+  if not ok: return
+  add(&l, l.t.pos[sp], "unicorn(no-useless-spread)", "Using a spread operator here creates a new array unnecessarily.", "`{text(l, m)}` returns a new array. Spreading it into an array expression to create a new array is redundant.")
+
+fn iterable_spread(var l: L, a: Int, msg: Str, help: Str):
+  let x = unparen(l, a)
+  if k(l, x) != ast.N_ARRAY or ast.count(l.t, l.t.a[x]) != 1: return
+  let sp = ast.item(l.t, l.t.a[x], 0)
+  if k(l, sp) != ast.N_SPREAD: return
+  l.set_arg[x] = true
+  add(&l, l.t.pos[sp], "unicorn(no-useless-spread)", msg, help)
+
+fn fetch_options(var l: L, o0: Int):
+  let o = unparen(l, o0)
+  if k(l, o) != ast.N_OBJECT: return
+  var method = "GET"
+  var body = -1
+  let lst = l.t.a[o]
+  for i in 0..ast.count(l.t, lst):
+    let p = ast.item(l.t, lst, i)
+    let kp = k(l, p)
+    if kp == ast.N_SPREAD: return
+    if kp == ast.N_PROPASSIGN or kp == ast.N_SHORTHAND:
+      var key = ""
+      if kp == ast.N_SHORTHAND: key = name_of(l, p)
+      else: key = key_name(l, l.t.a[p])
+      if key == "method":
+        if kp != ast.N_PROPASSIGN: return
+        let v = unparen(l, l.t.b[p])
+        if k(l, v) != ast.N_STR and k(l, v) != ast.N_NOSUBTEMPL: return
+        method = name_of(l, v).upper()
+      elif key == "body":
+        if kp == ast.N_PROPASSIGN:
+          let v = unparen(l, l.t.b[p])
+          if k(l, v) == ast.N_NULL or id_is(l, v, "undefined"): continue
+          body = l.t.a[p]
+        else: body = p
+  if body > 0 and (method == "GET" or method == "HEAD"):
+    add(&l, l.t.pos[body], "unicorn(no-invalid-fetch-options)", "\"body\" is not allowed when method is \"{method}\"", "")
+
+fn plugin_call(var l: L, n: Int):
+  let c = l.t.a[n]
+  l.cont[c] = true
+  let args = l.t.c[n]
+  let na = ast.count(l.t, args)
+  # spreads of array literals into arguments
+  for i in 0..na:
+    let a = ast.item(l.t, args, i)
+    if k(l, a) == ast.N_SPREAD and k(l, unparen(l, l.t.a[a])) == ast.N_ARRAY:
+      add(&l, l.t.pos[a], "unicorn(no-useless-spread)", "Using a spread operator here creates a new array unnecessarily.", "Pass arguments directly instead of spreading an array.")
+  if k(l, c) == ast.N_ID:
+    if name_of(l, c) == "fetch" and is_global(l, c) and na >= 2: fetch_options(&l, ast.item(l.t, args, 1))
+    recursion_args(&l, n)
+    return
+  if k(l, c) != ast.N_PROPACCESS or (l.t.f[n] & 1) != 0: return
+  let mn = name_of(l, c)
+  let obj = unparen(l, l.t.a[c])
+  if mn == "matchAll" or mn == "replaceAll":
+    if na >= 1 and missing_g(l, ast.item(l.t, args, 0)):
+      if mn == "matchAll": add(&l, l.t.d[c], "oxc(bad-match-all-arg)", "Global flag (g) is missing in the regular expression supplied to the `matchAll` method.", "Add the global flag (g) to the regular expression.")
+      else: add(&l, l.t.d[c], "oxc(bad-replace-all-arg)", "Global flag (g) is missing in the regular expression supplied to the `replaceAll` method.", "To replace all occurrences of a string, use the `replaceAll` method with the global flag (g) in the regular expression.")
+  if mn == "removeEventListener" and na >= 2:
+    let f = unparen(l, ast.item(l.t, args, 1))
+    var bad = k(l, f) == ast.N_ARROW or k(l, f) == ast.N_FUNCEXPR
+    if k(l, f) == ast.N_CALL and k(l, l.t.a[f]) == ast.N_PROPACCESS and name_of(l, l.t.a[f]) == "bind": bad = true
+    if bad: add(&l, l.t.d[c], "unicorn(no-invalid-remove-event-listener)", "Invalid `removeEventListener` call.", "The listener argument should be a function reference.")
+  if id_is(l, obj, "Promise") and is_global(l, obj) and (mn == "all" or mn == "allSettled" or mn == "any" or mn == "race") and na >= 1:
+    let arr = unparen(l, ast.item(l.t, args, 0))
+    if k(l, arr) == ast.N_ARRAY:
+      let el = l.t.a[arr]
+      if mn != "allSettled" and ast.count(l.t, el) == 1 and k(l, ast.item(l.t, el, 0)) != ast.N_SPREAD and k(l, ast.item(l.t, el, 0)) != ast.N_OMIT:
+        add(&l, l.t.d[c], "unicorn(no-single-promise-in-promise-methods)", "Wrapping single-element array with `Promise.{mn}()` is unnecessary.", "Either use the value directly, or switch to `Promise.resolve(…)`.")
+      for i in 0..ast.count(l.t, el):
+        let e = unparen(l, ast.item(l.t, el, i))
+        if k(l, e) == ast.N_AWAIT:
+          add(&l, l.t.pos[e], "unicorn(no-await-in-promise-methods)", "Promise in `Promise.{mn}()` should not be awaited.", "Remove the `await`")
+  if id_is(l, obj, "Math") and is_global(l, obj) and (mn == "min" or mn == "max"): min_max(&l, n, mn)
+  if (mn == "toFixed" or mn == "toString" or mn == "toPrecision" or mn == "toExponential") and na >= 1:
+    let a = unparen(l, ast.item(l.t, args, 0))
+    if k(l, a) == ast.N_NUM:
+      let v = num_value(name_of(l, a))
+      var lo = 0.0
+      var hi = 20.0
+      if mn == "toString":
+        lo = 2.0
+        hi = 36.0
+      elif mn == "toPrecision":
+        lo = 1.0
+        hi = 21.0
+      if v < lo or v > hi:
+        add(&l, l.t.pos[n], "oxc(number-arg-out-of-range)", "Radix or precision arguments of number-related functions should not exceed the limit", "The first argument of 'Number.prototype.{mn}' should be a number between {int(lo)} and {int(hi)}")
+  # unicorn(prefer-string-starts-ends-with): /^lit/.test(s), /lit$/.test(s)
+  if mn == "test" and na == 1 and k(l, obj) == ast.N_REGEX: starts_ends(&l, n, obj, ast.item(l.t, args, 0))
+  # only-used-in-recursion is counted here
+  recursion_args(&l, n)
+
+fn missing_g(l: L, a0: Int) -> Bool:
+  let a = unparen(l, a0)
+  if k(l, a) == ast.N_REGEX:
+    let raw = text(l, a)
+    var close = raw.len - 1
+    while close > 0 and raw[close] != '/': close -= 1
+    return raw[close..raw.len].find("g") < 0
+  if (k(l, a) == ast.N_NEW or k(l, a) == ast.N_CALL) and id_is(l, l.t.a[a], "RegExp"):
+    let args = l.t.c[a]
+    let na = ast.count(l.t, args)
+    if na == 0: return false
+    if na == 1: return k(l, ast.item(l.t, args, 0)) == ast.N_STR
+    let f = unparen(l, ast.item(l.t, args, 1))
+    if k(l, f) != ast.N_STR: return false
+    return name_of(l, f).find("g") < 0
+  return false
+
+fn min_max(var l: L, n: Int, outer: Str):
+  let args = l.t.c[n]
+  if ast.count(l.t, args) != 2: return
+  var inner = -1
+  var c_out = -1
+  for i in 0..2:
+    let a = unparen(l, ast.item(l.t, args, i))
+    if is_num_lit(l, a): c_out = a
+    elif k(l, a) == ast.N_CALL: inner = a
+  if inner < 0 or c_out < 0: return
+  let ic = l.t.a[inner]
+  if k(l, ic) != ast.N_PROPACCESS or not id_is(l, unparen(l, l.t.a[ic]), "Math"): return
+  let iname = name_of(l, ic)
+  if iname == outer or (iname != "min" and iname != "max"): return
+  let iargs = l.t.c[inner]
+  if ast.count(l.t, iargs) != 2: return
+  var c_in = -1
+  var others = 0
+  for i in 0..2:
+    let a = unparen(l, ast.item(l.t, iargs, i))
+    if is_num_lit(l, a): c_in = a
+    else: others += 1
+  if c_in < 0 or others > 1: return
+  let vi = lit_num(l, c_in)
+  let vo = lit_num(l, c_out)
+  var constant = false
+  if outer == "min": constant = vi >= vo
+  else: constant = vi <= vo
+  if not constant: return
+  var shown = "{vo}"
+  if vo == vo.floor() and vo < 1e16 and vo > -1e16: shown = "{int(vo)}.0"
+  add(&l, l.t.pos[n], "oxc(bad-min-max-func)", "Math.min and Math.max combination leads to constant result", "This evaluates to {shown} because of the incorrect `Math.min`/`Math.max` combination")
+
+fn starts_ends(var l: L, n: Int, re: Int, arg: Int):
+  let raw = text(l, re)
+  var close = raw.len - 1
+  while close > 0 and raw[close] != '/': close -= 1
+  let pat = raw[1..close]
+  let flags = raw[close + 1..raw.len]
+  if flags.find("i") >= 0 or flags.find("m") >= 0: return
+  var lit = ""
+  var start = false
+  if pat.startswith("^") and pat.len > 1:
+    start = true
+    lit = pat[1..pat.len]
+  elif pat.endswith("$") and pat.len > 1 and not pat.endswith("\\$"): lit = pat[0..pat.len - 1]
+  else: return
+  # plain characters only (an escaped special character stands for itself)
+  var out = ""
+  var i = 0
+  while i < lit.len:
+    let c = lit[i]
+    if c == '\\':
+      if i + 1 >= lit.len: return
+      let d = lit[i + 1]
+      if (d >= 'a' and d <= 'z') or (d >= 'A' and d <= 'Z') or (d >= '0' and d <= '9'): return
+      out = out + lit[i + 1..i + 2]
+      i += 2
+      continue
+    if c == '^' or c == '$' or c == '.' or c == '*' or c == '+' or c == '?' or c == '(' or c == ')' or c == '[' or c == ']' or c == '{' or c == '}' or c == '|': return
+    out = out + lit[i..i + 1]
+    i += 1
+  let at = text(l, arg)
+  let call = text(l, n)
+  let ka = k(l, arg)
+  if ka == ast.N_BINARY or ka == ast.N_COND or ka == ast.N_ARROW or ka == ast.N_AWAIT or ka == ast.N_YIELD:
+    if start: add(&l, l.t.pos[n], "unicorn(prefer-string-starts-ends-with)", "Prefer String#startsWith over a regex with a caret.", "")
+    else: add(&l, l.t.pos[n], "unicorn(prefer-string-starts-ends-with)", "Prefer String#endsWith over a regex with a dollar sign.", "")
+    return
+  out = out.replace("\\", "\\\\").replace("'", "\\'")
+  if start: add(&l, l.t.pos[n], "unicorn(prefer-string-starts-ends-with)", "Prefer String#startsWith over a regex with a caret.", "Replace `{call}` with `{at}.startsWith('{out}')`.")
+  else: add(&l, l.t.pos[n], "unicorn(prefer-string-starts-ends-with)", "Prefer String#endsWith over a regex with a dollar sign.", "Replace `{call}` with `{at}.endsWith('{out}')`.")
+
+# oxc(only-used-in-recursion): count each parameter's appearances as the same argument of a call to
+# its own function
+fn recursion_args(var l: L, n: Int):
+  let c = unparen(l, l.t.a[n])
+  if k(l, c) != ast.N_ID: return
+  let fy = l.sc.res.get(c, -1)
+  if fy < 0: return
+  let args = l.t.c[n]
+  for i in 0..ast.count(l.t, args):
+    let a = unparen(l, ast.item(l.t, args, i))
+    if k(l, a) != ast.N_ID: continue
+    let py = l.sc.res.get(a, -1)
+    if py < 0 or l.sc.yk[py] != scope.Y_PARAM: continue
+    let f = l.sc.yfn[py]
+    if l.sc.fsym.get(f, -1) != fy or l.sc.writes[fy] > 0: continue
+    if param_index(l, f, py) == i: l.recur[py] = l.recur.get(py, 0) + 1
+
+fn param_index(l: L, f: Int, py: Int) -> Int:
+  var sig = f
+  let kd = k(l, f)
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR: sig = l.t.b[f]
+  let ps = l.t.b[sig]
+  for i in 0..ast.count(l.t, ps):
+    let p = ast.item(l.t, ps, i)
+    let tg = l.t.a[p]
+    if k(l, tg) == ast.N_ID and l.sc.res.get(tg, -1) == py: return i
+  return -1
