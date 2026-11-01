@@ -27,6 +27,9 @@ const TK_OBJ = 19         # a: index in objs
 const TK_UNION = 20       # a, b: start and count in tl
 const TK_INTER = 21
 const TK_UNSUP = 22       # something the checker doesn't model (a: node): stops checking the file
+const TK_KEYOF = 23       # keyof T, deferred while T is generic (a: T)
+const TK_INDEXED = 24     # T[K], deferred (a: object type, b: index type)
+const TK_COND = 25        # a conditional type, deferred (a: node, b: mapper)
 
 # TypeScript's TypeFlags values, in TypeScript 7's order, used to sort union members
 const F_ANY = 1
@@ -50,6 +53,9 @@ const F_NONPRIM = 131072
 const F_NEVER = 262144
 const F_TPARAM = 524288
 const F_OBJECT = 1048576
+const F_INDEX = 2097152
+const F_INDEXED = 33554432
+const F_COND = 67108864
 const F_UNION = 134217728
 const F_INTER = 268435456
 
@@ -59,6 +65,7 @@ const OK_REF = 2          # a generic interface or class with type arguments: ta
 const OK_ANON = 3         # an object literal, a type literal, a function type
 const OK_INST = 4         # an anonymous object type seen through a mapper (inside a generic)
 const OK_TUPLE = 5        # elements in args; flags per element
+const OK_MAPPED = 6       # a generic mapped type (node: the N_TMAPPED, mapper: its instantiation)
 
 type Obj:
   kind: Int
@@ -183,6 +190,10 @@ type C:
   auto_arr: Int            # auto[] (-1 until made)
   static_side: {Int: Int}  # a class's constructor type -> the class symbol (prints as typeof C)
   lib_unsup: {Int: Str}    # a lib node the checker doesn't model -> what it is (its type is TK_UNSUP)
+  tcache: {Int: Int}       # type node -> its type (the parts of mapped and conditional types)
+  tl_cache: {Str: Int}     # deferred keyof / indexed / conditional / mapped types, interned
+  lazy_inst: {Int: [Int]}  # a member of an instantiated type -> [its generic member, the mapper]
+  this_tp: {Int: Int}      # an interface or class symbol -> its polymorphic this type (a type parameter)
 
 # symbol kinds
 const S_VAR = 1
@@ -215,7 +226,7 @@ const SF_DECLARE = 32
 
 fn new_checker(own t: ast.Ast) -> C:
   var c = C(t, [], [], [], [], [], [], [], {}, {}, {}, [], [], [], [], [], [], {}, [], [], [], [], {}, {}, {}, {}, [], {}, {}, [], [], 0, {},
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}, {}, {}, {}, {}, [], [], [], [], 0, {}, {}, {}, {}, {}, {}, {}, {}, 0, 0, [], {}, {}, {}, {}, {}, "", 0, {}, false, {}, 0, -1, {}, {})
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {}, {}, {}, {}, {}, [], [], [], [], 0, {}, {}, {}, {}, {}, {}, {}, {}, 0, 0, [], {}, {}, {}, {}, {}, "", 0, {}, false, {}, 0, -1, {}, {}, {}, {}, {}, {})
   mk(&c, 0, 0, 0, 0)                    # type 0 unused
   c.any_t = mk(&c, TK_ANY, F_ANY, 0, 0)
   c.unknown_t = mk(&c, TK_UNKNOWN, F_UNKNOWN, 0, 0)
@@ -533,6 +544,17 @@ fn union_plain(var c: C, ts: [Int]) -> Int:
   return id
 
 fn inter_of(var c: C, ts: [Int]) -> Int:
+  # (A | B) & C is (A & C) | (B & C)
+  for i in 0..ts.len:
+    if c.tk[ts[i]] == TK_UNION:
+      var parts: [Int] = []
+      for m in members(c, ts[i]):
+        var rest: [Int] = []
+        for j in 0..ts.len:
+          if j == i: rest.push(m)
+          else: rest.push(ts[j])
+        parts.push(inter_of(&c, rest))
+      return union_of(&c, parts)
   var flat: [Int] = []
   for t in ts:
     for m in members_inter(c, t):
@@ -541,6 +563,35 @@ fn inter_of(var c: C, ts: [Int]) -> Int:
       if c.tk[m] == TK_UNKNOWN: continue
       if not has_int(flat, m): flat.push(m)
   if flat.len == 0: return c.unknown_t
+  if flat.len == 1: return flat[0]
+  # a primitive with an empty object type is the primitive; null and undefined with an object
+  # type are never; a literal with its own primitive is the literal
+  var prim = -1
+  var nonnull_obj = false
+  var keep: [Int] = []
+  for m in flat:
+    let k = c.tk[m]
+    if k == TK_OBJ and empty_object(c, m):
+      nonnull_obj = true
+      continue
+    if k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE:
+      if prim >= 0 and prim != m:
+        let pk = c.tk[prim]
+        if base_of_literal(c, m) == prim: prim = m
+        elif base_of_literal(c, prim) == m: continue
+        else: return c.never_t
+      else: prim = m
+      continue
+    if (k == TK_NULL or k == TK_UNDEF or k == TK_VOID) and nonnull_obj: return c.never_t
+    keep.push(m)
+  for m in keep:
+    let k = c.tk[m]
+    if (k == TK_NULL or k == TK_UNDEF or k == TK_VOID) and (nonnull_obj or prim >= 0): return c.never_t
+  if prim >= 0 and keep.len == 0: return prim
+  if prim >= 0: keep.push(prim)
+  if keep.len == 0 and nonnull_obj: return c.empty_obj
+  if nonnull_obj and prim < 0: keep.push(c.empty_obj)
+  flat = keep
   if flat.len == 1: return flat[0]
   # disjoint primitives make never
   var prims = 0
@@ -556,6 +607,16 @@ fn inter_of(var c: C, ts: [Int]) -> Int:
   let id = mk(&c, TK_INTER, F_INTER, start, flat.len)
   c.unions[key] = id
   return id
+
+# An object type with nothing in it ({}): no properties, signatures or index signatures. (A
+# written {} is a type literal with no members.)
+fn empty_object(c: C, t: Int) -> Bool:
+  let o = c.ta[t]
+  if c.objs[o].kind != OK_ANON: return false
+  let n = c.objs[o].node
+  if t == c.empty_obj: return true
+  if n < 0 or c.t.k[n] != ast.N_TOBJ: return false
+  return ast.items(c.t, c.t.a[n]).len == 0
 
 fn members_inter(c: C, t: Int) -> [Int]:
   var out: [Int] = []

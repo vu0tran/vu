@@ -7,6 +7,7 @@ import ast
 import parse
 import types
 import chk
+import tyops
 from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP
 from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE
 from types import S_VAR, S_LET, S_CONST, S_PARAM, S_FUNC, S_CLASS, S_INTERFACE, S_ALIAS, S_ENUM, S_NAMESPACE, S_TPARAM, S_PROP, S_METHOD, S_ENUMMEMBER, S_TYPELIT, S_ACCESSOR, S_VALUE, S_TYPE
@@ -608,6 +609,8 @@ fn is_scope(c: C, n: Int) -> Bool:
   if k == ast.N_BLOCK or k == ast.N_CASE or k == ast.N_FOR or k == ast.N_FORIN or k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET or k == ast.N_CLASSEXPR: return true
   if k == ast.N_TRY: return true
   if k == ast.N_LIST and c.t.d[n] == -2: return true
+  # a namespace's body
+  if k == ast.N_LIST and c.parent[n] >= 0 and c.t.k[c.parent[n]] == ast.N_MODULE: return true
   return false
 
 # A value name seen from node at: the innermost declaration, then the file, then the globals.
@@ -627,7 +630,7 @@ fn lookup_value_raw(var c: C, at: Int, name: Int) -> Int:
         n = c.parent[n]
         continue
       # a function's parameters are visible inside it, not in its name
-      let is_file = c.t.k[n] == ast.N_LIST
+      let is_file = c.t.k[n] == ast.N_LIST and c.t.d[n] == -2
       if not is_file or file_is_module(&c, n):
         scope_names(&c, n)
         if name in c.locals[n]: return c.locals[n][name]
@@ -641,12 +644,19 @@ fn file_is_module(var c: C, root: Int) -> Bool:
 
 fn lookup_type(var c: C, at: Int, name: Int) -> Int:
   var n = at
+  var prev = at
   while n >= 0:
-    # type parameters of enclosing generic declarations
+    # type parameters of enclosing generic declarations, mapped types, infer declarations
     let tp = tparam_here(&c, n, name)
     if tp >= 0: return tp
+    let kn = c.t.k[n]
+    if kn == ast.N_TMAPPED and c.t.a[n] >= 0 and c.t.s[c.t.a[n]] == name and prev != c.t.a[n]: return tparam_sym(&c, c.t.a[n])
+    if kn == ast.N_TCOND and (prev == c.t.b[n] or prev == c.t.c[n]):
+      let inn = tyops.infer_named(c, n, name)
+      if inn >= 0: return tparam_sym(&c, inn)
+    prev = n
     if is_scope(c, n):
-      let is_file = c.t.k[n] == ast.N_LIST
+      let is_file = c.t.k[n] == ast.N_LIST and c.t.d[n] == -2
       if not is_file or file_is_module(&c, n):
         scope_names(&c, n)
         if name in c.ltypes[n]: return resolve_alias(&c, c.ltypes[n][name])
@@ -739,7 +749,8 @@ fn type_from(var c: C, n: Int) -> Int:
         return readonly_array_of(&c, g2_35)
       return type_from(&c, inner)
     if op == scan.W_UNIQUE: return c.symbol_t
-    return unsupported(&c, n, "keyof")
+    let kt = type_from(&c, c.t.a[n])
+    return tyops.keyof_of(&c, kt)
   if k == ast.N_TQUERY:
     let e = c.t.a[n]
     if c.t.k[e] == ast.N_ID:
@@ -749,15 +760,27 @@ fn type_from(var c: C, n: Int) -> Int:
         return c.error_t
       return type_of_sym(&c, s)
     return unsupported(&c, n, "typeof with a qualified name")
-  if k == ast.N_TTHIS: return unsupported(&c, n, "the this type")
+  if k == ast.N_TTHIS:
+    var x = c.parent[n]
+    while x >= 0:
+      let kx = c.t.k[x]
+      if (kx == ast.N_INTERFACE or kx == ast.N_CLASS) and x in c.nsym: return this_param(&c, c.nsym[x])
+      if kx == ast.N_TOBJ or kx == ast.N_CLASSEXPR or kx == ast.N_OBJECT: break
+      x = c.parent[x]
+    return unsupported(&c, n, "the this type")
   if k == ast.N_TPRED: return c.boolean_t
-  if k == ast.N_TINDEXED: return unsupported(&c, n, "an indexed access type")
-  if k == ast.N_TCOND: return unsupported(&c, n, "a conditional type")
-  if k == ast.N_TMAPPED: return unsupported(&c, n, "a mapped type")
+  if k == ast.N_TINDEXED:
+    let ot = type_from(&c, c.t.a[n])
+    let it = type_from(&c, c.t.b[n])
+    return tyops.indexed_of(&c, ot, it)
+  if k == ast.N_TCOND: return tyops.cond_of(&c, n, -1)
+  if k == ast.N_TMAPPED: return tyops.mapped_of(&c, n, -1)
   if k == ast.N_TTEMPLATE: return unsupported(&c, n, "a template literal type")
-  if k == ast.N_TINFER: return unsupported(&c, n, "infer")
+  if k == ast.N_TINFER:
+    let isym = tparam_sym(&c, c.t.a[n])
+    return c.sdtype[isym]
   if k == ast.N_TIMPORT: return unsupported(&c, n, "an import type")
-  return unsupported(&c, n, "this type")
+  return unsupported(&c, n, "this type (node kind {k} at {c.t.pos[n]} in {c.t.file[n]} parent {c.t.k[c.parent[n]]})")
 
 fn kw_type(c: C, k: Int) -> Int:
   if k == scan.W_ANY: return c.any_t
@@ -816,10 +839,22 @@ fn readonly_array_of(var c: C, el: Int) -> Int:
 
 fn type_ref(var c: C, n: Int) -> Int:
   let nn = c.t.a[n]
-  if c.t.k[nn] != ast.N_ID: return unsupported(&c, n, "a qualified type name")
-  let name = c.t.s[nn]
-  let s = lookup_type(&c, n, name)
+  var name = 0
+  var s = -1
+  if c.t.k[nn] == ast.N_QNAME:
+    # A.B: a type inside a namespace
+    let ns = qualified_left(&c, n, c.t.a[nn])
+    name = c.t.s[nn]
+    if ns < 0: return unsupported(&c, n, "a qualified type name")
+    s = ns_member(&c, ns, name, false)
+    if s < 0:
+      err(&c, nn, 2694, "Namespace '" + nm(c, c.sname[ns]) + "' has no exported member '" + nm(c, name) + "'.")
+      return c.error_t
+  else:
+    name = c.t.s[nn]
+    s = lookup_type(&c, n, name)
   if s < 0:
+    if c.t.file[n] < c.user_from: return unsupported(&c, n, "a lib type the checker can't resolve")
     err(&c, nn, 2304, "Cannot find name '" + nm(c, name) + "'.")
     return c.error_t
   var args: [Int] = []
@@ -836,7 +871,26 @@ fn type_ref(var c: C, n: Int) -> Int:
     if full.len != tps.len: return c.error_t
     let body = declared_type(&c, s)
     let m = types.new_mapper(&c, tps, full)
-    return instantiate(&c, body, m)
+    let r = instantiate(&c, body, m)
+    # an object or union the instantiation made prints as an alias: the alias declaration this
+    # reference is the whole body of, else this alias with its arguments
+    if r == body or types.has_int(full, r) or r in c.t_alias: return r
+    var host = c.parent[n]
+    while host >= 0 and c.t.k[host] == ast.N_TPAREN: host = c.parent[host]
+    var asym = s
+    var aargs = full
+    # a homomorphic mapped type ({ [P in keyof T]: ... }) keeps its own alias
+    var homo = false
+    let bnode = c.t.b[c.sdecl[s]]
+    if c.t.k[bnode] == ast.N_TMAPPED:
+      var cn = c.t.a[c.t.a[bnode]]
+      while cn >= 0 and c.t.k[cn] == ast.N_TPAREN: cn = c.t.a[cn]
+      homo = cn >= 0 and c.t.k[cn] == ast.N_TOP and c.t.f[cn] == scan.W_KEYOF
+    if host >= 0 and c.t.k[host] == ast.N_TYPEALIAS and host in c.nsym and not homo:
+      asym = c.nsym[host]
+      aargs = []
+      if c.t.a[host] >= 0: aargs = tparam_types(&c, c.t.a[host])
+    return alias_tag(&c, r, asym, aargs)
   if (sk & (S_INTERFACE | S_CLASS)) != 0:
     let dt = declared_type(&c, s)
     let o = c.ta[dt]
@@ -874,6 +928,22 @@ fn fill_defaults(var c: C, tl: Int, args: [Int], at: Int, name: Str) -> [Int]:
     out.push(instantiate(&c, h3_, m))
   return out
 
+# t printed as alias a (with arguments): a union gets a copy that remembers it.
+fn alias_tag(var c: C, t: Int, a: Int, args: [Int]) -> Int:
+  let k = c.tk[t]
+  if k == TK_UNION:
+    if t == c.boolean_t: return t
+    let t2 = types.mk(&c, TK_UNION, types.F_UNION, c.ta[t], c.tb[t])
+    c.t_alias[t2] = a
+    if args.len > 0: c.t_alias_args[t2] = types.ints(args)
+    return t2
+  if k == TK_OBJ:
+    let kind = c.objs[c.ta[t]].kind
+    if kind == OK_ANON or kind == types.OK_MAPPED or kind == OK_INST:
+      c.t_alias[t] = a
+      if args.len > 0: c.t_alias_args[t] = types.ints(args)
+  return t
+
 # The type an interface, class or alias declares (for a generic one, with its own type parameters).
 fn declared_type(var c: C, s: Int) -> Int:
   if c.sdtype[s] >= 0: return c.sdtype[s]
@@ -893,6 +963,8 @@ fn declared_type(var c: C, s: Int) -> Int:
         t = t2
       elif c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == OK_ANON and c.objs[c.ta[t]].node == c.t.b[d]:
         c.t_alias[t] = s
+      elif (c.t.k[body] == ast.N_TMAPPED or c.t.k[body] == ast.N_TCOND) and not (t in c.t_alias):
+        t = alias_tag(&c, t, s, [])
     c.sdtype[s] = t
     return t
   if (sk & (S_INTERFACE | S_CLASS)) != 0:
@@ -906,6 +978,86 @@ fn declared_type(var c: C, s: Int) -> Int:
       c.objs[o].tparams = tps
     return t
   return c.error_t
+
+# The namespace an entity name's left part names (-1 if not a namespace).
+fn qualified_left(var c: C, at: Int, e: Int) -> Int:
+  var s = -1
+  if c.t.k[e] == ast.N_ID:
+    s = lookup_type(&c, at, c.t.s[e])
+    if s < 0 or (c.sk[s] & S_NAMESPACE) == 0: s = lookup_value(&c, at, c.t.s[e])
+  elif c.t.k[e] == ast.N_QNAME:
+    let left = qualified_left(&c, at, c.t.a[e])
+    if left >= 0: s = ns_member(&c, left, c.t.s[e], true)
+  if s < 0 or (c.sk[s] & S_NAMESPACE) == 0: return -1
+  return s
+
+# A member of a namespace (merged across its declarations): exported ones in a user file,
+# everything in an ambient one. values: look at values (else types).
+fn ns_member(var c: C, ns: Int, name: Int, values: Bool) -> Int:
+  for d in types.sym_decls(c, ns):
+    if c.t.k[d] != ast.N_MODULE: continue
+    let body = c.t.b[d]
+    if body < 0: continue
+    scope_names(&c, body)
+    var s = -1
+    if values:
+      if name in c.locals[body]: s = c.locals[body][name]
+      elif name in c.ltypes[body]: s = c.ltypes[body][name]
+    else:
+      if name in c.ltypes[body]: s = c.ltypes[body][name]
+      elif name in c.locals[body] and (c.sk[c.locals[body][name]] & S_NAMESPACE) != 0: s = c.locals[body][name]
+    if s < 0: continue
+    if ns_exported(c, d, s): return resolve_alias(&c, s)
+  return -1
+
+fn ns_exported(c: C, d: Int, s: Int) -> Bool:
+  if c.t.file[d] < c.user_from or (c.t.f[d] & ast.M_DECLARE) != 0: return true
+  let sd = c.sdecl[s]
+  if sd < 0: return false
+  var x = sd
+  let k = c.t.k[x]
+  if k == ast.N_DECL: x = up(c, x)
+  let kx = c.t.k[x]
+  if kx == ast.N_VAR or kx == ast.N_INTERFACE or kx == ast.N_TYPEALIAS: return (c.t.d[x] & ast.M_EXPORT) != 0
+  return (c.t.f[x] & ast.M_EXPORT) != 0
+
+# A namespace as a value: an object with its values.
+fn ns_value_type(var c: C, s: Int) -> Int:
+  let d0 = c.sdecl[s]
+  let t = types.anon_obj(&c, s, d0)
+  for d in types.sym_decls(c, s):
+    if c.t.k[d] != ast.N_MODULE or c.t.b[d] < 0: continue
+    let body = c.t.b[d]
+    scope_names(&c, body)
+    var names: [Int] = []
+    for k, v in c.locals[body]: names.push(k)
+    names.sort()
+    for name in names:
+      let ms = c.locals[body][name]
+      if not ns_exported(c, d, ms): continue
+      if (c.sk[ms] & S_VALUE) != 0 and not (name in c.objs[c.ta[t]].props):
+        let rs = resolve_alias(&c, ms)
+        types.add_prop(&c, t, name, rs)
+  c.objs[c.ta[t]].resolved = true
+  return t
+
+# The polymorphic this type of an interface or class (a type parameter bound per receiver).
+fn this_param(var c: C, owner: Int) -> Int:
+  if owner in c.this_tp: return c.this_tp[owner]
+  let tn = ast.intern(&c.t, "this")
+  let s = types.new_sym(&c, S_TPARAM, tn, c.sdecl[owner])
+  let t = types.mk(&c, TK_TPARAM, types.F_TPARAM, s, 0)
+  c.sdtype[s] = t
+  c.this_tp[owner] = t
+  return t
+
+# A member's type seen from a receiver: its this type is the receiver.
+fn prop_type_for(var c: C, ps: Int, recv: Int) -> Int:
+  let t = type_of_sym(&c, ps)
+  let owner = c.sparent[ps]
+  if owner < 0 or not (owner in c.this_tp): return t
+  let m = types.new_mapper(&c, [c.this_tp[owner]], [recv])
+  return instantiate(&c, t, m)
 
 # A generic type with type arguments (cached, so Array<number> is always the same type).
 fn ref_of(var c: C, target: Int, args: [Int]) -> Int:
@@ -1184,8 +1336,8 @@ fn get_prop(var c: C, t: Int, name: Int) -> Int:
         var more: [Int] = []
         for d in types.ints(c.smore[base]): more.push(d)
         c.smore[r] = more
-      let h5_ = type_of_sym(&c, base)
-      c.stype[r] = instantiate(&c, h5_, m)
+      # its type is instantiated when asked for (most members of Array<T> never are)
+      c.lazy_inst[r] = [base, m]
   elif kind == OK_TUPLE:
     let s = c.t.names[name]
     let idx = int(s) else -1
@@ -1244,6 +1396,14 @@ fn index_type(var c: C, t: Int, number: Bool) -> Int:
 
 fn type_of_sym(var c: C, s: Int) -> Int:
   if c.stype[s] >= 0: return c.stype[s]
+  if s in c.lazy_inst:
+    let li = types.ints(c.lazy_inst[s])
+    c.lazy_inst.remove(s)
+    c.stype[s] = -2
+    let bt = type_of_sym(&c, li[0])
+    let t = instantiate(&c, bt, li[1])
+    c.stype[s] = t
+    return t
   if c.stype[s] == -2:
     return c.any_t          # circular: TypeScript reports TS7022; treated as any here
   c.stype[s] = -2
@@ -1289,7 +1449,7 @@ fn compute_sym_type(var c: C, s: Int) -> Int:
       else: c.objs[o].calls.push(sig_from(&c, c.t.b[md], md))
     c.objs[o].resolved = true
     return t
-  if (sk & S_NAMESPACE) != 0: return unsupported(&c, d, "a namespace")
+  if (sk & S_NAMESPACE) != 0: return ns_value_type(&c, s)
   if (sk & S_ENUM) != 0: return unsupported(&c, d, "an enum")
   if (sk & S_CLASS) != 0:
     if k == ast.N_CLASS: return chk.class_static(&c, s)
@@ -1312,6 +1472,18 @@ fn instantiate(var c: C, t: Int, m: Int) -> Int:
   if m < 0: return t
   let k = c.tk[t]
   if k == TK_TPARAM: return map_tparam(c, t, m)
+  if k == types.TK_KEYOF:
+    let x = instantiate(&c, c.ta[t], m)
+    if x == c.ta[t]: return t
+    return tyops.keyof_of(&c, x)
+  if k == types.TK_INDEXED:
+    let x = instantiate(&c, c.ta[t], m)
+    let y = instantiate(&c, c.tb[t], m)
+    if x == c.ta[t] and y == c.tb[t]: return t
+    return tyops.indexed_of(&c, x, y)
+  if k == types.TK_COND:
+    let m2 = tyops.compose(&c, c.tb[t], m)
+    return tyops.cond_of(&c, c.ta[t], m2)
   if k == TK_UNION or k == TK_INTER:
     var ts: [Int] = []
     var changed = false
@@ -1355,6 +1527,9 @@ fn instantiate(var c: C, t: Int, m: Int) -> Int:
       c.objs[ro].target = t
       c.objs[ro].mapper = m
       c.objs[ro].resolved = true
+  elif kind == types.OK_MAPPED:
+    let m2 = tyops.compose(&c, c.objs[o].mapper, m)
+    r = tyops.mapped_of(&c, c.objs[o].node, m2)
   elif kind == OK_INST:
     # compose: the inner mapper, then m
     let inner = c.objs[o].mapper

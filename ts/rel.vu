@@ -8,6 +8,7 @@ import types
 import bind
 import show
 import chk
+import tyops
 from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP
 from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE, SF_OPTIONAL
 
@@ -20,6 +21,9 @@ fn assignable(var c: C, s: Int, t: Int) -> Bool:
   let r = rel(&c, s, t)
   c.rel_cache[key] = r
   return r
+
+fn is_mapped(c: C, t: Int) -> Bool:
+  return c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == types.OK_MAPPED
 
 fn is_nullish(c: C, t: Int) -> Bool:
   let k = c.tk[t]
@@ -38,6 +42,11 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
   if tk == TK_ANY or tk == TK_UNKNOWN or tk == TK_ERROR: return true
   if sk == TK_ANY or sk == TK_ERROR: return tk != TK_NEVER
   if sk == TK_NEVER: return true
+  if sk >= types.TK_KEYOF or tk >= types.TK_KEYOF or is_mapped(c, s) or is_mapped(c, t):
+    # generic type-level operators: not related by this checker yet
+    let u = bind.unsupported(&c, 0, "relating a generic keyof, indexed access, mapped or conditional type")
+    bind.touch(&c, u)
+    return true
   if sk == TK_UNSUP or tk == TK_UNSUP:
     bind.touch(&c, s)
     bind.touch(&c, t)
@@ -135,8 +144,8 @@ fn has_excess(var c: C, s: Int, t: Int) -> Bool:
 fn constraint_of(var c: C, tp: Int) -> Int:
   let s = c.ta[tp]
   let d = c.sdecl[s]
-  if d < 0 or c.t.a[d] < 0: return -1
-  return bind.type_from(&c, c.t.a[d])
+  if d < 0 or c.t.k[d] != ast.N_TPARAM or c.t.a[d] < 0: return -1
+  return tyops.raw(&c, c.t.a[d])
 
 fn is_empty_obj(var c: C, t: Int) -> Bool:
   if c.tk[t] != TK_OBJ: return false
@@ -177,6 +186,12 @@ fn ref_target(c: C, t: Int) -> Int:
   let o = c.ta[t]
   if c.objs[o].kind == OK_REF: return c.objs[o].target
   return -1
+
+fn is_readonly_array(var c: C, t: Int) -> Bool:
+  if c.tk[t] != TK_OBJ: return false
+  let tg = ref_target(c, t)
+  if tg < 0: return false
+  return bind.nm(c, c.sname[c.objs[c.ta[tg]].sym]) == "ReadonlyArray"
 
 fn is_array_ref(var c: C, t: Int) -> Bool:
   if c.tk[t] != TK_OBJ: return false
@@ -232,7 +247,10 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
   if skind == OK_TUPLE and is_array_ref(&c, t):
     let h1_ = bind.tuple_elem_union(&c, s)
     return assignable(&c, h1_, c.objs[to].args[0])
-  # properties
+  # properties: a missing one first (getUnmatchedProperty), then their types
+  for name in bind.prop_names(&c, t):
+    let tp = bind.get_prop(&c, t, name)
+    if (c.sflags[tp] & SF_OPTIONAL) == 0 and src_prop(&c, s, name) < 0: return false
   for name in bind.prop_names(&c, t):
     let tp = bind.get_prop(&c, t, name)
     let sp = src_prop(&c, s, name)
@@ -250,9 +268,9 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
         let to2 = c.sparent[tp]
         if sown != to2 and not (sown >= 0 and to2 >= 0 and chk.derives_from(&c, sown, to2)): return false
       elif (sf & types.SF_PROTECTED) != 0: return false
-    var tt = bind.type_of_sym(&c, tp)
+    var tt = bind.prop_type_for(&c, tp, t)
     if (c.sflags[tp] & SF_OPTIONAL) != 0: tt = types.union_of(&c, [tt, c.undef_t])
-    var st = bind.type_of_sym(&c, sp)
+    var st = bind.prop_type_for(&c, sp, s)
     if (c.sflags[sp] & SF_OPTIONAL) != 0: st = types.union_of(&c, [st, c.undef_t])
     if not assignable(&c, st, tt): return false
   # signatures
@@ -304,6 +322,24 @@ fn sig_ret(var c: C, sg: Int) -> Int:
   if c.sigs[sg].ret >= 0: return c.sigs[sg].ret
   return c.any_t
 
+# The type of parameter i (a rest parameter's element, or its tuple's i-th), -1 if there's none.
+fn param_at_sig(var c: C, sg: types.Sig, i: Int) -> Int:
+  let np = sg.ptypes.len
+  if np == 0: return -1
+  let last = np - 1
+  if sg.pflags[last] == 2 and i >= last:
+    let rt = sg.ptypes[last]
+    if c.tk[rt] == TK_ANY or c.tk[rt] == TK_ERROR: return rt
+    if c.tk[rt] == TK_OBJ:
+      if is_array_ref(&c, rt): return c.objs[c.ta[rt]].args[0]
+      if obj_kind(c, rt) == OK_TUPLE:
+        let j = i - last
+        if j < c.objs[c.ta[rt]].args.len: return c.objs[c.ta[rt]].args[j]
+        return -1
+    return rt
+  if i < np: return sg.ptypes[i]
+  return -1
+
 fn sig_assignable(var c: C, ssg0: Int, tsg: Int) -> Bool:
   var ssg = ssg0
   # a generic source: its type parameters erased to any
@@ -317,15 +353,24 @@ fn sig_assignable(var c: C, ssg0: Int, tsg: Int) -> Bool:
   var t_has_rest = false
   for f in ts.pflags:
     if f == 2: t_has_rest = true
-  if ss.min > ts.ptypes.len and not t_has_rest: return false
+  var s_has_rest = false
+  for f in ss.pflags:
+    if f == 2: s_has_rest = true
+  # the target's parameter count (a rest tuple counts its elements)
+  var tmax = ts.ptypes.len
+  if t_has_rest:
+    let rt = ts.ptypes[ts.ptypes.len - 1]
+    if c.tk[rt] == TK_OBJ and obj_kind(c, rt) == OK_TUPLE: tmax = ts.ptypes.len - 1 + c.objs[c.ta[rt]].args.len
+    else: tmax = 1000000
+  if ss.min > tmax: return false
   let strict = ts.node >= 0 and c.t.k[ts.node] == ast.N_TFUNC
-  let n = ss.ptypes.len
+  var n = ss.ptypes.len
+  if s_has_rest: n = ss.ptypes.len - 1
+  if tmax < 1000000 and tmax > n and s_has_rest: n = tmax
   for i in 0..n:
-    if i >= ts.ptypes.len and not t_has_rest: break
-    var tp = c.any_t
-    if i < ts.ptypes.len: tp = ts.ptypes[i]
-    else: tp = ts.ptypes[ts.ptypes.len - 1]
-    let sp = ss.ptypes[i]
+    let tp = param_at_sig(&c, ts, i)
+    let sp = param_at_sig(&c, ss, i)
+    if tp < 0 or sp < 0: break
     if strict:
       if not assignable(&c, tp, sp): return false
     else:

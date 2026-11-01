@@ -1,0 +1,405 @@
+# Type-level operators: keyof, indexed access (T[K]), mapped types and conditional types. Each is
+# computed when its operands are known, and deferred (a TK_KEYOF / TK_INDEXED / TK_COND type, or an
+# OK_MAPPED object) while they still mention type parameters; instantiating a deferred type
+# computes it again.
+
+import scan
+import ast
+import types
+import bind
+import rel
+import chk
+from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP, TK_KEYOF, TK_INDEXED, TK_COND
+from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE, OK_MAPPED, S_PROP, SF_OPTIONAL, SF_READONLY
+
+# A type node's type, computed once (the parts of mapped and conditional types are reused).
+fn raw(var c: C, n: Int) -> Int:
+  if n < 0: return c.any_t
+  if n in c.tcache: return c.tcache[n]
+  let t = bind.type_from(&c, n)
+  c.tcache[n] = t
+  return t
+
+# Whether a type still mentions type parameters (so a type-level operator on it waits).
+fn is_generic(var c: C, t: Int) -> Bool:
+  var seen: {Int: Bool} = {}
+  return generic_in(&c, t, &seen, 0)
+
+fn generic_in(var c: C, t: Int, var seen: {Int: Bool}, depth: Int) -> Bool:
+  let k = c.tk[t]
+  if k == TK_TPARAM or k == TK_KEYOF or k == TK_INDEXED or k == TK_COND: return true
+  if k == TK_UNION or k == TK_INTER:
+    for m in types.members(c, t):
+      if generic_in(&c, m, &seen, depth): return true
+    return false
+  if k != TK_OBJ or depth > 4: return false
+  if t in seen: return false
+  seen[t] = true
+  let o = c.ta[t]
+  let kind = c.objs[o].kind
+  if kind == OK_MAPPED: return true
+  if kind == OK_REF or kind == OK_TUPLE:
+    for a in types.ints(c.objs[o].args):
+      if generic_in(&c, a, &seen, depth + 1): return true
+    return false
+  if kind == OK_INST:
+    let mp = types.mapper_copy(c, c.objs[o].mapper)
+    for x in mp.to:
+      if generic_in(&c, x, &seen, depth + 1): return true
+    return false
+  if kind == OK_ANON:
+    if bind.mentions_tparams(&c, t):
+      for name in bind.prop_names(&c, t):
+        let ps = bind.get_prop(&c, t, name)
+        if ps >= 0:
+          let pt = bind.type_of_sym(&c, ps)
+          if generic_in(&c, pt, &seen, depth + 1): return true
+      for sg in bind.sigs_of(&c, t, false):
+        if c.sigs[sg].tparams.len > 0: continue
+        let cp = types.sig_copy(c, sg)
+        for pt in cp.ptypes:
+          if generic_in(&c, pt, &seen, depth + 1): return true
+        if cp.ret >= 0 and generic_in(&c, cp.ret, &seen, depth + 1): return true
+  return false
+
+fn interned(var c: C, key: Str, k: Int, f: Int, a: Int, b: Int) -> Int:
+  if key in c.tl_cache: return c.tl_cache[key]
+  let t = types.mk(&c, k, f, a, b)
+  c.tl_cache[key] = t
+  return t
+
+# ---- keyof
+
+fn keyof_of(var c: C, t: Int) -> Int:
+  let k = c.tk[t]
+  if k == TK_ANY or k == TK_ERROR: return types.union_of(&c, [c.string_t, c.number_t, c.symbol_t])
+  if k == TK_UNSUP: return t
+  if k == TK_UNKNOWN: return c.never_t
+  if k == TK_NEVER: return types.union_of(&c, [c.string_t, c.number_t, c.symbol_t])
+  if is_generic(&c, t): return interned(&c, "k{t}", TK_KEYOF, types.F_INDEX, t, 0)
+  if k == TK_UNION:
+    # the keys every member has
+    var common: [Int] = []
+    var first = true
+    for m in types.members(c, t):
+      let kof = keyof_of(&c, m)
+      let km = types.members(c, kof)
+      if first:
+        for x in km: common.push(x)
+        first = false
+      else:
+        var keep: [Int] = []
+        for x in common:
+          if types.has_int(km, x): keep.push(x)
+          elif c.tk[x] == TK_STRLIT and types.has_int(km, c.string_t): keep.push(x)
+          elif c.tk[x] == TK_NUMLIT and types.has_int(km, c.number_t): keep.push(x)
+        common = keep
+    return types.union_of(&c, common)
+  if k == TK_INTER:
+    var all: [Int] = []
+    for m in types.members_inter(c, t): all.push(keyof_of(&c, m))
+    return types.union_of(&c, all)
+  let a = rel.apparent(&c, t)
+  if c.tk[a] != TK_OBJ: return c.never_t
+  var keys: [Int] = []
+  for name in bind.prop_names(&c, a):
+    let text = c.t.names[name] + ""
+    if text.startswith("[Symbol."): continue
+    keys.push(types.str_lit(&c, name, false))
+  let si = bind.index_type(&c, a, false)
+  let ni = bind.index_type(&c, a, true)
+  if si >= 0:
+    keys.push(c.string_t)
+    keys.push(c.number_t)
+  elif ni >= 0 or rel.is_array_ref(&c, a):
+    keys.push(c.number_t)
+  let u = types.union_of(&c, keys)
+  if c.tk[u] != TK_UNION: return u
+  # the union remembers it was keyof T (it prints that way)
+  let u2 = types.mk(&c, TK_UNION, types.F_UNION, c.ta[u], c.tb[u])
+  let kt = interned(&c, "k{t}", TK_KEYOF, types.F_INDEX, t, 0)
+  c.t_origin[u2] = [kt]
+  return u2
+
+# ---- indexed access
+
+fn indexed_of(var c: C, o: Int, i: Int) -> Int:
+  let ok = c.tk[o]
+  let ik = c.tk[i]
+  if ok == TK_UNSUP: return o
+  if ik == TK_UNSUP: return i
+  if ok == TK_ANY or ok == TK_ERROR: return o
+  if is_generic(&c, o) or is_generic(&c, i): return interned(&c, "i{o},{i}", TK_INDEXED, types.F_INDEXED, o, i)
+  if ik == TK_UNION:
+    var ts: [Int] = []
+    for m in types.members(c, i): ts.push(indexed_of(&c, o, m))
+    return types.union_of(&c, ts)
+  if ok == TK_UNION:
+    var ts: [Int] = []
+    for m in types.members(c, o): ts.push(indexed_of(&c, m, i))
+    return types.union_of(&c, ts)
+  let a = rel.apparent(&c, o)
+  if c.tk[a] != TK_OBJ: return bind.unsupported(&c, 0, "an indexed access the checker can't type")
+  let ao = c.ta[a]
+  if ik == TK_STRLIT or ik == TK_NUMLIT:
+    var name = 0
+    if ik == TK_STRLIT: name = c.ta[i]
+    else:
+      let ntx = c.numtext[c.ta[i]] + ""
+      name = ast.intern(&c.t, ntx)
+    if c.objs[ao].kind == OK_TUPLE and ik == TK_NUMLIT:
+      let idx = int(c.nums[c.ta[i]])
+      if idx >= 0 and idx < c.objs[ao].args.len: return c.objs[ao].args[idx]
+    let ps = bind.get_prop(&c, a, name)
+    if ps >= 0:
+      var pt = bind.type_of_sym(&c, ps)
+      if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+      return pt
+    if ik == TK_NUMLIT:
+      if rel.is_array_ref(&c, a): return c.objs[ao].args[0]
+      let ni = bind.index_type(&c, a, true)
+      if ni >= 0: return ni
+    let si = bind.index_type(&c, a, false)
+    if si >= 0: return si
+    return bind.unsupported(&c, 0, "an indexed access the checker can't type")
+  if ik == TK_NUMBER:
+    if rel.is_array_ref(&c, a): return c.objs[ao].args[0]
+    if c.objs[ao].kind == OK_TUPLE: return bind.tuple_elem_union(&c, a)
+    let ni = bind.index_type(&c, a, true)
+    if ni >= 0: return ni
+    let si = bind.index_type(&c, a, false)
+    if si >= 0: return si
+    return bind.unsupported(&c, 0, "an indexed access the checker can't type")
+  if ik == TK_STRING:
+    let si = bind.index_type(&c, a, false)
+    if si >= 0: return si
+  return bind.unsupported(&c, 0, "an indexed access the checker can't type")
+
+# ---- mappers
+
+# m1, then m2 (the inner mapper's results instantiated by m2, and m2's own parameters too).
+fn compose(var c: C, m1: Int, m2: Int) -> Int:
+  if m1 < 0: return m2
+  if m2 < 0: return m1
+  let a = types.mapper_copy(c, m1)
+  var from: [Int] = []
+  var to: [Int] = []
+  for i in 0..a.from.len:
+    from.push(a.from[i])
+    to.push(bind.instantiate(&c, a.to[i], m2))
+  let b = types.mapper_copy(c, m2)
+  for i in 0..b.from.len:
+    if not types.has_int(from, b.from[i]):
+      from.push(b.from[i])
+      to.push(b.to[i])
+  return types.new_mapper(&c, from, to)
+
+fn extend(var c: C, m: Int, tp: Int, t: Int) -> Int:
+  var from: [Int] = [tp]
+  var to: [Int] = [t]
+  if m >= 0:
+    let a = types.mapper_copy(c, m)
+    for i in 0..a.from.len:
+      if a.from[i] != tp:
+        from.push(a.from[i])
+        to.push(a.to[i])
+  return types.new_mapper(&c, from, to)
+
+# ---- mapped types
+
+fn mapped_of(var c: C, n: Int, m: Int) -> Int:
+  let tpn = c.t.a[n]
+  let tps0 = bind.tparam_sym(&c, tpn)
+  let tp = c.sdtype[tps0]
+  let g1_83 = raw(&c, c.t.a[tpn])
+  let cons = bind.instantiate(&c, g1_83, m)
+  if c.tk[cons] == TK_UNSUP: return cons
+  # homomorphic: { [P in keyof T]: ... } keeps T's modifiers (and maps arrays and primitives)
+  var src = -1
+  var cn = c.t.a[tpn]
+  while cn >= 0 and c.t.k[cn] == ast.N_TPAREN: cn = c.t.a[cn]
+  if cn >= 0 and c.t.k[cn] == ast.N_TOP and c.t.f[cn] == scan.W_KEYOF:
+    let g2_83 = raw(&c, c.t.a[cn])
+    src = bind.instantiate(&c, g2_83, m)
+  if is_generic(&c, cons) or (src >= 0 and is_generic(&c, src)):
+    let key = "m{n},{m}"
+    if key in c.tl_cache: return c.tl_cache[key]
+    let t = types.new_obj(&c, OK_MAPPED, -1, n)
+    let o = c.ta[t]
+    c.objs[o].mapper = m
+    c.objs[o].resolved = true
+    c.tl_cache[key] = t
+    return t
+  if src >= 0:
+    let sk = c.tk[src]
+    if sk == TK_UNION:
+      # distributes over a union
+      var ts: [Int] = []
+      for mem in types.members(c, src):
+        let km = keyof_of(&c, mem)
+        ts.push(mapped_over(&c, n, m, tp, km, mem))
+      return types.union_of(&c, ts)
+    if sk != TK_OBJ and sk != TK_INTER: return src
+    if sk == TK_OBJ and rel.is_array_ref(&c, src):
+      # an array maps to an array of the mapped element
+      let tmpl0 = raw(&c, c.t.c[n])
+      let mx = extend(&c, m, tp, c.number_t)
+      let el = bind.instantiate(&c, tmpl0, mx)
+      let fl = c.t.f[n]
+      let ro = rel.is_readonly_array(&c, src)
+      if ((fl & ast.MAP_READONLY) != 0 or ro) and (fl & ast.MAP_NOREADONLY) == 0: return bind.readonly_array_of(&c, el)
+      return bind.array_of(&c, el)
+    if sk == TK_OBJ and c.objs[c.ta[src]].kind == OK_TUPLE:
+      # a tuple maps element by element
+      let tup = types.new_obj(&c, OK_TUPLE, -1, n)
+      let so = c.ta[src]
+      let to = c.ta[tup]
+      let fl = c.t.f[n]
+      for i in 0..c.objs[so].args.len:
+        let key = types.str_lit_s(&c, "{i}", false)
+        let tmpl1 = raw(&c, c.t.c[n])
+        let mk2 = extend(&c, m, tp, key)
+        let el = bind.instantiate(&c, tmpl1, mk2)
+        c.objs[to].args.push(el)
+        var ef = c.objs[so].eflags[i]
+        if (fl & ast.MAP_OPTIONAL) != 0 and ef == 0: ef = 1
+        if (fl & ast.MAP_NOOPTIONAL) != 0 and ef == 1: ef = 0
+        c.objs[to].eflags.push(ef)
+      return tup
+  return mapped_over(&c, n, m, tp, cons, src)
+
+fn mapped_over(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int) -> Int:
+  let fl = c.t.f[n]
+  let t = types.anon_obj(&c, -1, n)
+  let o = c.ta[t]
+  let tmpl = raw(&c, c.t.c[n])
+  for key in types.members(c, cons):
+    let kk = c.tk[key]
+    let m2 = extend(&c, m, tp, key)
+    if kk == TK_STRING:
+      c.objs[o].sidx = bind.instantiate(&c, tmpl, m2)
+      continue
+    if kk == TK_NUMBER:
+      c.objs[o].nidx = bind.instantiate(&c, tmpl, m2)
+      continue
+    if kk != TK_STRLIT and kk != TK_NUMLIT: continue
+    # as clause: the property's name (never drops it)
+    var names: [Int] = [key]
+    if c.t.b[n] >= 0:
+      let g3_83 = raw(&c, c.t.b[n])
+      let nt = bind.instantiate(&c, g3_83, m2)
+      names = types.members(c, nt)
+    for nk in names:
+      var name = 0
+      if c.tk[nk] == TK_STRLIT: name = c.ta[nk]
+      elif c.tk[nk] == TK_NUMLIT:
+        let ntx = c.numtext[c.ta[nk]] + ""
+        name = ast.intern(&c.t, ntx)
+      else: continue
+      var pt = bind.instantiate(&c, tmpl, m2)
+      var opt = false
+      var ro = false
+      if src >= 0 and c.tk[src] == TK_OBJ:
+        let sp = bind.get_prop(&c, src, name)
+        if sp >= 0:
+          opt = (c.sflags[sp] & SF_OPTIONAL) != 0
+          ro = (c.sflags[sp] & SF_READONLY) != 0
+      if (fl & ast.MAP_OPTIONAL) != 0: opt = true
+      if (fl & ast.MAP_NOOPTIONAL) != 0:
+        if opt: pt = types.filter_union(&c, pt, true, false)
+        opt = false
+      if (fl & ast.MAP_READONLY) != 0: ro = true
+      if (fl & ast.MAP_NOREADONLY) != 0: ro = false
+      let ps = types.new_sym(&c, S_PROP, name, n)
+      c.stype[ps] = pt
+      var f = 0
+      if opt: f = f | SF_OPTIONAL
+      if ro: f = f | SF_READONLY
+      c.sflags[ps] = f
+      types.add_prop(&c, t, name, ps)
+  c.objs[o].resolved = true
+  return t
+
+# ---- conditional types
+
+fn cond_of(var c: C, n: Int, m: Int) -> Int:
+  var checkn = c.t.a[n]
+  let g4_83 = raw(&c, checkn)
+  let ct = bind.instantiate(&c, g4_83, m)
+  if c.tk[ct] == TK_UNSUP: return ct
+  if is_generic(&c, ct): return interned(&c, "c{n},{m}", TK_COND, types.F_COND, n, m)
+  # distributive over a union when the checked type is a naked type parameter
+  while c.t.k[checkn] == ast.N_TPAREN: checkn = c.t.a[checkn]
+  let raw_check = raw(&c, checkn)
+  if c.tk[raw_check] == TK_TPARAM and c.t.k[checkn] == ast.N_TREF:
+    if c.tk[ct] == TK_NEVER: return c.never_t
+    if c.tk[ct] == TK_UNION:
+      var ts: [Int] = []
+      for mem in types.members(c, ct):
+        let m2 = extend(&c, m, raw_check, mem)
+        ts.push(cond_one(&c, n, m2, mem))
+      return types.union_of(&c, ts)
+  return cond_one(&c, n, m, ct)
+
+fn cond_one(var c: C, n: Int, m: Int, ct: Int) -> Int:
+  # infer type parameters in the extends clause: from the checked type
+  var infers: [Int] = []
+  collect_infers(c, c.t.b[n], &infers)
+  var m2 = m
+  let g5_83 = raw(&c, c.t.b[n])
+  let ext0 = bind.instantiate(&c, g5_83, m)
+  if infers.len > 0:
+    var tps: [Int] = []
+    for inn in infers:
+      let isym = bind.tparam_sym(&c, c.t.a[inn])
+      tps.push(c.sdtype[isym])
+    var inf = chk.new_inf(tps)
+    var seen: {Int: Bool} = {}
+    chk.infer_in(&c, ext0, ct, &inf, false, 0, ext0, &seen)
+    var to: [Int] = []
+    for i in 0..tps.len:
+      if inf.cov[i].len > 0: to.push(types.union_of(&c, types.ints(inf.cov[i])))
+      elif inf.contra[i].len > 0: to.push(chk.common_subtype(&c, types.ints(inf.contra[i])))
+      else: to.push(c.unknown_t)
+    let im = types.new_mapper(&c, tps, to)
+    m2 = compose(&c, m, im)
+  let g6_83 = raw(&c, c.t.b[n])
+  let ext = bind.instantiate(&c, g6_83, m2)
+  if c.tk[ext] == TK_UNSUP: return ext
+  if c.tk[ct] == TK_ANY:
+    let g7_83 = raw(&c, c.t.c[n])
+    let tb = bind.instantiate(&c, g7_83, m2)
+    let g8_83 = raw(&c, c.t.d[n])
+    let fb = bind.instantiate(&c, g8_83, m)
+    return types.union_of(&c, [tb, fb])
+  if rel.assignable(&c, ct, ext):
+    let g9_83 = raw(&c, c.t.c[n])
+    return bind.instantiate(&c, g9_83, m2)
+  let g10_83 = raw(&c, c.t.d[n])
+  return bind.instantiate(&c, g10_83, m)
+
+fn collect_infers(c: C, n: Int, var out: [Int]):
+  if n < 0: return
+  let k = c.t.k[n]
+  if k == ast.N_TINFER:
+    out.push(n)
+    return
+  if k == ast.N_LIST:
+    for x in ast.items(c.t, n): collect_infers(c, x, &out)
+    return
+  if k == ast.N_TCOND:
+    # infer declarations of a nested conditional type belong to it
+    collect_infers(c, c.t.a[n], &out)
+    return
+  if k == ast.N_ID or k == ast.N_STR or k == ast.N_NUM: return
+  for ch in [c.t.a[n], c.t.b[n], c.t.c[n]]:
+    if ch > 0: collect_infers(c, ch, &out)
+  if k != ast.N_INTERFACE and k != ast.N_TYPEALIAS and k != ast.N_VAR and c.t.d[n] > 0: collect_infers(c, c.t.d[n], &out)
+
+# The infer declaration a name means inside a conditional type (-1 if none).
+fn infer_named(c: C, cond: Int, name: Int) -> Int:
+  var infers: [Int] = []
+  collect_infers(c, c.t.b[cond], &infers)
+  for inn in infers:
+    if c.t.s[c.t.a[inn]] == name: return c.t.a[inn]
+  return -1
