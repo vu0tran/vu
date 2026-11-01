@@ -7,6 +7,7 @@ import tc
 import pkg
 import format
 import resolve
+import printf
 from scan import T_ASSIGN, T_DEFINE, T_LOR, T_LAND, T_EQL, T_NEQ, T_SHL, T_SHR, T_SHL_ASSIGN, T_SHR_ASSIGN, T_ARROW, T_STRING
 from scan import K_BREAK, K_CONTINUE, K_GOTO, K_FALLTHROUGH, K_VAR, K_CONST
 
@@ -708,7 +709,7 @@ fn timeformat(var g: tc.Prog, fs: Fs, var v: V, nodes: [Int]):
 
 # ---- the driver
 
-fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue]):
+fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gover: Int):
   var ranks: {Str: Int} = {}
   let names = ANALYZERS.split()
   for i in 0..names.len: ranks[names[i]] = i
@@ -720,10 +721,255 @@ fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue]):
   assign(&g, fs, &v, nodes)
   bools(&g, fs, &v, nodes)
   nilfunc(&g, &v, nodes)
+  printf.run(&g, fs, &v, pi, roots, nodes, gover)
   shift(&g, fs, &v, nodes)
   stringintconv(&g, fs, &v, nodes)
   structtag(&g, fs, &v, p, nodes)
+  testinggoroutine(&g, fs, &v, p, roots)
+  tests(&g, fs, &v, p)
   timeformat(&g, fs, &v, nodes)
   unreachable(&g, &v, nodes)
   unusedresult(&g, fs, &v, nodes)
   for is in v.out: issues.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
+
+# ---- tests
+
+fn lower_first(s: Str) -> Bool:
+  if s.len == 0: return false
+  let c = s[0]
+  if c >= 'a' and c <= 'z': return true
+  if c >= 128:
+    let cs = s.codes()
+    if cs.len > 0:
+      let ch = chr(cs[0])
+      return ch.is_lower()
+  return false
+
+fn is_test_param(g: tc.Prog, pi: Int, te: Int, want: Str) -> Bool:
+  if g.pk[pi].t.k[te] != ast.N_STAR: return false
+  let x = g.pk[pi].t.a[te]
+  if g.pk[pi].t.k[x] == ast.N_IDENT: return g.pk[pi].t.names[g.pk[pi].t.s[x]] == want
+  if g.pk[pi].t.k[x] == ast.N_SELECTOR: return g.pk[pi].t.names[g.pk[pi].t.s[g.pk[pi].t.b[x]]] == want
+  return false
+
+fn example_lookup(var g: tc.Prog, fs: Fs, pi: Int, name: Str) -> [Int]:
+  let o = g.pk[pi].scope.get(name, -1)
+  if o >= 0: return [o]
+  var out: [Int] = []
+  var seen: {Str: Bool} = {}
+  for fi in 0..g.pk[pi].imps.len:
+    var imps: [Int] = []
+    for x in g.pk[pi].imps[fi]: imps.push(x)
+    for im in imps:
+      let pnode = g.pk[pi].t.b[im]
+      let lit = g.pk[pi].t.names[g.pk[pi].t.s[pnode]]
+      let path = lit[1..lit.len - 1]
+      if path in seen: continue
+      seen[path] = true
+      let q = tc.load_pkg(&g, fs, path, false)
+      if q < 0: continue
+      let qo = g.pk[q].scope.get(name, -1)
+      if qo >= 0: out.push(qo)
+  return out
+
+fn tests(var g: tc.Prog, fs: Fs, var v: V, p: pkg.Pkg):
+  let pi = v.pi
+  for fi in 0..g.pk[pi].roots.len:
+    if not p.test[fi] or p.gen[fi]: continue
+    let root = g.pk[pi].roots[fi]
+    for d in ast.items(g.pk[pi].t, g.pk[pi].t.c[root]):
+      if g.pk[pi].t.k[d] != ast.N_FUNCDECL or g.pk[pi].t.a[d] >= 0: continue
+      let name = g.pk[pi].t.names[g.pk[pi].t.s[g.pk[pi].t.b[d]]] + ""
+      let ft = g.pk[pi].t.c[d]
+      if name.startswith("Example"):
+        if ast.count(g.pk[pi].t, g.pk[pi].t.b[ft]) != 0: report(g, &v, d, "tests", name + " should be niladic")
+        if ast.count(g.pk[pi].t, g.pk[pi].t.c[ft]) != 0: report(g, &v, d, "tests", name + " should return nothing")
+        if ast.count(g.pk[pi].t, g.pk[pi].t.a[ft]) > 0: report(g, &v, d, "tests", name + " should not have type params")
+        if name == "Example": continue
+        let ex = name[7..name.len]
+        var elems = ex.split("_")
+        if elems.len > 3:
+          var rest = elems[2] + ""
+          for i in 3..elems.len: rest += "_" + elems[i]
+          elems = [elems[0] + "", elems[1] + "", rest]
+        let ident = elems[0] + ""
+        let objs = example_lookup(&g, fs, pi, ident)
+        if ident.len > 0 and objs.len == 0:
+          report(g, &v, d, "tests", name + " refers to unknown identifier: " + ident)
+          continue
+        if elems.len < 2: continue
+        if ident.len == 0:
+          var residual = ex + ""
+          if residual.startswith("_"): residual = residual[1..residual.len]
+          if not lower_first(residual): report(g, &v, d, "tests", name + " has malformed example suffix: " + residual)
+          continue
+        let mmbr = elems[1] + ""
+        if not lower_first(mmbr):
+          var found = false
+          for o in objs:
+            let t = tc.obj_type(&g, fs, o)
+            let pt = tc.ptr_to(&g, t)
+            if tc.lookup_fm(&g, fs, pt, mmbr).len > 0 or tc.lookup_fm(&g, fs, t, mmbr).len > 0: found = true
+          if not found: report(g, &v, d, "tests", name + " refers to unknown field or method: " + ident + "." + mmbr)
+        if elems.len == 3 and not lower_first(elems[2]): report(g, &v, d, "tests", name + " has malformed example suffix: " + elems[2])
+        continue
+      var prefix = ""
+      if name.startswith("Test"): prefix = "Test"
+      elif name.startswith("Benchmark"): prefix = "Benchmark"
+      elif name.startswith("Fuzz"): prefix = "Fuzz"
+      else: continue
+      if ast.count(g.pk[pi].t, g.pk[pi].t.c[ft]) > 0: continue
+      let params = ast.items(g.pk[pi].t, g.pk[pi].t.b[ft])
+      if params.len != 1 or ast.count(g.pk[pi].t, g.pk[pi].t.a[params[0]]) > 1: continue
+      if not is_test_param(g, pi, g.pk[pi].t.b[params[0]], prefix[0..1]): continue
+      if ast.count(g.pk[pi].t, g.pk[pi].t.a[ft]) > 0:
+        let tl = g.pk[pi].t.a[ft]
+        report_at(g, &v, fi, g.pk[pi].t.pos[tl] - 1, "tests", name + " has type parameters: it will not be run by go test as a " + prefix + "XXX function")
+      if lower_first(name[prefix.len..name.len]):
+        report(g, &v, g.pk[pi].t.b[d], "tests", name + " has malformed name: first letter after '" + prefix + "' must not be lowercase")
+
+# ---- testinggoroutine
+
+type Async:
+  region: Int
+  async: Int
+  fun: Int
+  is_go: Bool
+
+fn testing_param(g: tc.Prog, pi: Int, te: Int) -> Bool:
+  if g.pk[pi].t.k[te] != ast.N_STAR: return false
+  let x = g.pk[pi].t.a[te]
+  if g.pk[pi].t.k[x] != ast.N_SELECTOR: return false
+  let px = g.pk[pi].t.a[x]
+  if g.pk[pi].t.k[px] != ast.N_IDENT or g.pk[pi].t.names[g.pk[pi].t.s[px]] != "testing": return false
+  let nm = g.pk[pi].t.names[g.pk[pi].t.s[g.pk[pi].t.b[x]]]
+  return nm == "B" or nm == "T"
+
+# go/parser's resolution: a function literal assigned to the identifier where it's declared.
+fn func_lit_in_scope(g: tc.Prog, p: pkg.Pkg, pi: Int, id: Int) -> Int:
+  if id >= p.pobj.len: return -1
+  let o = p.pobj[id]
+  if o < 0: return -1
+  let d = p.pdecl[o]
+  if d < 0: return -1
+  let name = g.pk[pi].t.names[g.pk[pi].t.s[id]]
+  var rhs = -1
+  if g.pk[pi].t.k[d] == ast.N_ASSIGN:
+    let lhs = ast.items(g.pk[pi].t, g.pk[pi].t.a[d])
+    let rs = ast.items(g.pk[pi].t, g.pk[pi].t.b[d])
+    for i in 0..lhs.len:
+      if g.pk[pi].t.k[lhs[i]] == ast.N_IDENT and g.pk[pi].t.names[g.pk[pi].t.s[lhs[i]]] == name and i < rs.len: rhs = rs[i]
+  elif g.pk[pi].t.k[d] == ast.N_VALUESPEC:
+    let ns = ast.items(g.pk[pi].t, g.pk[pi].t.a[d])
+    let vs = ast.items(g.pk[pi].t, g.pk[pi].t.c[d])
+    for i in 0..ns.len:
+      if g.pk[pi].t.names[g.pk[pi].t.s[ns[i]]] == name and i < vs.len: rhs = vs[i]
+  if rhs > 0 and g.pk[pi].t.k[rhs] == ast.N_FUNCLIT: return rhs
+  return -1
+
+fn testinggoroutine(var g: tc.Prog, fs: Fs, var v: V, p: pkg.Pkg, roots: [Int]):
+  let pi = v.pi
+  var imports_testing = false
+  for fi in 0..g.pk[pi].imps.len:
+    for im in g.pk[pi].imps[fi]:
+      if g.pk[pi].t.names[g.pk[pi].t.s[g.pk[pi].t.b[im]]] == "\"testing\"": imports_testing = true
+  if not imports_testing: return
+  var decls: {Int: Int} = {}
+  for root in roots:
+    for d in ast.items(g.pk[pi].t, g.pk[pi].t.c[root]):
+      if g.pk[pi].t.k[d] == ast.N_FUNCDECL:
+        let o = g.pk[pi].use[g.pk[pi].t.b[d]]
+        if o >= 0: decls[o] = d
+  # walk, skipping functions without *testing.T or *testing.B parameters
+  var asyncs: [Async] = []
+  var stack: [Int] = []
+  var ri = roots.len - 1
+  while ri >= 0:
+    stack.push(roots[ri])
+    ri -= 1
+  while stack.len > 0:
+    let n = stack.pop()
+    let k = g.pk[pi].t.k[n]
+    if k == ast.N_FUNCDECL:
+      var has = false
+      for f in ast.items(g.pk[pi].t, g.pk[pi].t.b[g.pk[pi].t.c[n]]):
+        if testing_param(g, pi, g.pk[pi].t.b[f]): has = true
+      if not has: continue
+    elif k == ast.N_GO:
+      let call = g.pk[pi].t.a[n]
+      let fun = unparen(g, pi, g.pk[pi].t.a[call])
+      var region = n
+      let id = used_ident(g, pi, fun)
+      var done = false
+      if id > 0:
+        let lit = func_lit_in_scope(g, p, pi, id)
+        if lit > 0:
+          region = lit
+          done = true
+      if not done:
+        let o = callee(g, pi, call)
+        if o >= 0 and o in decls: region = decls[o]
+      asyncs.push(Async(region, n, fun, true))
+    elif k == ast.N_CALL:
+      let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+      if args.len == 2:
+        let o = callee(g, pi, n)
+        if o >= 0 and is_method(g, o) and obj_pkg_path(g, o) == "testing" and g.oname[o] == "Run":
+          let fun = unparen(g, pi, args[1])
+          var region = n
+          if g.pk[pi].t.k[fun] == ast.N_FUNCLIT: region = fun
+          else:
+            let id = used_ident(g, pi, fun)
+            if id > 0:
+              let lit = func_lit_in_scope(g, p, pi, id)
+              if lit > 0: region = lit
+          asyncs.push(Async(region, n, fun, false))
+    let ks = resolve.kids(g.pk[pi].t, n)
+    var j = ks.len - 1
+    while j >= 0:
+      stack.push(ks[j])
+      j -= 1
+  var regions: [Int] = []
+  var byregion: {Int: [Int]} = {}
+  for i in 0..asyncs.len:
+    let r = asyncs[i].region
+    if r in byregion: byregion[r].push(i)
+    else:
+      regions.push(r)
+      byregion[r] = [i]
+  let forb = ["FailNow", "Fatal", "Fatalf", "Skip", "Skipf", "SkipNow"]
+  for r in regions:
+    var st = [r]
+    while st.len > 0:
+      let n = st.pop()
+      if n != r and n in byregion: continue
+      if g.pk[pi].t.k[n] == ast.N_CALL:
+        let fun = unparen(g, pi, g.pk[pi].t.a[n])
+        if g.pk[pi].t.k[fun] == ast.N_SELECTOR and g.pk[pi].skind.get(fun, 0) == tc.S_METHOD:
+          let x = unparen(g, pi, g.pk[pi].t.a[fun])
+          var xo = -1
+          if g.pk[pi].t.k[x] == ast.N_IDENT: xo = g.pk[pi].use[x]
+          let m = g.pk[pi].sobj.get(fun, -1)
+          if xo >= 0 and g.ok[xo] == tc.O_VAR and m >= 0 and is_method(g, m) and obj_pkg_path(g, m) == "testing" and g.oname[m] in forb:
+            var rt = vet_ty(g, pi, x)
+            var ptr = ""
+            if rt > 0 and g.tk[rt] == tc.TY_PTR:
+              ptr = "*"
+              rt = g.ta[rt]
+            let forbidden = "(" + ptr + tc.type_str(&g, fs, rt, "") + ")." + g.oname[m]
+            for ai in byregion[r]:
+              let a = asyncs[ai]
+              if not a.is_go: continue
+              var where = a.async
+              var ctx = ""
+              if g.pk[pi].t.k[a.fun] == ast.N_FUNCLIT: where = n
+              elif g.pk[pi].t.k[a.fun] == ast.N_IDENT: ctx = " (" + g.pk[pi].t.names[g.pk[pi].t.s[a.fun]] + " calls " + forbidden + ")"
+              report(g, &v, where, "testinggoroutine", "call to " + forbidden + " from a non-test goroutine" + ctx)
+      let ks = resolve.kids(g.pk[pi].t, n)
+      var j = ks.len - 1
+      while j >= 0:
+        st.push(ks[j])
+        j -= 1
+
+fn vet_ty(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return ty(g, pi, n)
