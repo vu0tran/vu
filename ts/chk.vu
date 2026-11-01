@@ -1367,8 +1367,15 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         if deferred and tyops.base_of(&c, m, 0) < 0:
           generic_fact(&c, e, key, &out)
           return
-        if rel.assignable(&c, m, pt): direct.push(m)
-        elif mk != TK_TPARAM and rel.assignable(&c, pt, m): direct.push(pt)
+        # isTypeSubtypeOf either way (any isn't a subtype of anything else)
+        let ws0 = c.subtype
+        c.subtype = true
+        let sub1 = rel.assignable(&c, m, pt)
+        var sub2 = false
+        if not sub1 and mk != TK_TPARAM: sub2 = rel.assignable(&c, pt, m)
+        c.subtype = ws0
+        if sub1: direct.push(m)
+        elif sub2: direct.push(pt)
       if direct.len > 0: true_t = types.union_of(&c, direct)
       else:
         var gen = false
@@ -2288,10 +2295,17 @@ fn elem_access(var c: C, n: Int) -> Int:
       if c.tk[km] != TK_STRLIT and c.tk[km] != TK_NUMLIT: all_lit = false
     if all_lit:
       var ts: [Int] = []
+      c.elem_key_full = it
       for km in types.members(c, it):
         let r = elem_of(&c, n, ot, km)
-        if c.tk[r] == TK_UNSUP or c.tk[r] == TK_ERROR: return r
+        if c.tk[r] == TK_ERROR:
+          c.elem_key_full = -1
+          return r
+        if c.tk[r] == TK_UNSUP or c.tk[r] == TK_ERROR:
+          c.elem_key_full = -1
+          return r
         ts.push(r)
+      c.elem_key_full = -1
       return types.union_of(&c, ts)
   return elem_of(&c, n, ot, it)
 
@@ -2311,6 +2325,52 @@ fn index_fits(var c: C, r: Int) -> Bool:
     return false
   return true
 
+# A key the object type doesn't have (noImplicitAny): TS7015 when it has a number index signature,
+# else TS7053; the access is any. -1 when the key is found or the case isn't modeled here.
+fn elem_missing(var c: C, n: Int, ot: Int, it: Int) -> Int:
+  let ik = c.tk[it]
+  if ik != TK_STRLIT and ik != TK_NUMLIT and ik != TK_STRING and ik != TK_NUMBER: return -1
+  var base = ot
+  if c.tk[ot] == TK_TPARAM:
+    let b = base_constraint(&c, ot, 0)
+    if b < 0 or b == ot: return -1
+    base = b
+  let bk = c.tk[base]
+  if bk == TK_UNION or bk == TK_INTER or bk >= types.TK_KEYOF or bk == TK_TPARAM: return -1
+  if bk == TK_OBJ:
+    let kind = c.objs[c.ta[base]].kind
+    if kind == OK_TUPLE or kind == types.OK_MAPPED: return -1
+  elif bk != TK_STRING and bk != TK_NUMBER and bk != TK_BIGINT and bk != TK_STRLIT and bk != TK_NUMLIT and bk != TK_TRUE and bk != TK_FALSE and bk != types.TK_NONPRIM: return -1
+  let ao = rel.apparent(&c, base)
+  if c.tk[ao] != TK_OBJ: return -1
+  let si = bind.index_type(&c, ao, false)
+  let ni = bind.index_type(&c, ao, true)
+  let arr = rel.is_array_ref(&c, ao)
+  if si >= 0: return -1
+  var numeric = ik == TK_NUMLIT or ik == TK_NUMBER
+  if ik == TK_STRLIT:
+    let pn = c.ta[it]
+    if bind.get_prop(&c, ao, pn) >= 0: return -1
+    let v = float(c.t.names[pn]) else -1.0
+    if v >= 0.0 and c.t.names[pn] == types.num_text(v): numeric = true
+  if ik == TK_NUMLIT:
+    let ntext = c.numtext[c.ta[it]] + ""
+    let nid = ast.intern(&c.t, ntext)
+    if bind.get_prop(&c, ao, nid) >= 0: return -1
+  if numeric and (ni >= 0 or arr): return -1
+  let idx = c.t.b[n]
+  if ni >= 0 or arr:
+    err(&c, idx, 7015, "Element implicitly has an 'any' type because index expression is not of type 'number'.")
+    return c.error_t
+  var shown_i = it
+  if c.elem_key_full >= 0: shown_i = c.elem_key_full
+  let h1 = show.show(&c, shown_i)
+  var h2 = ""
+  if bk == types.TK_NONPRIM: h2 = "{{}}"
+  else: h2 = show.show(&c, ao)
+  err(&c, n, 7053, "Element implicitly has an 'any' type because expression of type '" + h1 + "' can't be used to index type '" + h2 + "'.")
+  return c.error_t
+
 fn elem_of(var c: C, n: Int, ot: Int, it: Int) -> Int:
   let idx = c.t.b[n]
   let ik = c.tk[it]
@@ -2324,6 +2384,8 @@ fn elem_of(var c: C, n: Int, ot: Int, it: Int) -> Int:
       err(&c, n, 2536, "Type '" + h1 + "' cannot be used to index type '" + h2 + "'.")
       return c.error_t
     return r
+  let miss = elem_missing(&c, n, ot, it)
+  if miss >= 0: return miss
   if c.tk[ot] == TK_INTER and (ik == TK_STRLIT or ik == TK_NUMLIT):
     c.eager_index = true
     let r = tyops.indexed_of(&c, ot, it)
@@ -2643,7 +2705,16 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
   var tuple_ctx = -1
   var elem_ctx = -1
   if ctx >= 0:
-    for m in types.members(c, ctx):
+    # getApparentTypeOfContextualType: deferred members by their base constraints
+    var cms: [Int] = []
+    for m0 in types.members(c, ctx):
+      if c.tk[m0] == types.TK_COND or c.tk[m0] == types.TK_INDEXED:
+        let b = tyops.base_of(&c, m0, 0)
+        if b >= 0 and b != m0:
+          for bm in types.members(c, b): cms.push(bm)
+        continue
+      cms.push(m0)
+    for m in cms:
       if c.tk[m] == TK_INTER: return unsup(&c, n, "an array literal with an intersection contextual type")
       if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_TUPLE: tuple_ctx = m
       elif rel.is_array_ref(&c, m): elem_ctx = c.objs[c.ta[m]].args[0]
