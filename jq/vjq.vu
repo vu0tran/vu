@@ -90,19 +90,22 @@ type Opts:
   posjson: Bool
   run_tests: Str
   stream: Bool
+  color: Int           # 1: -C, 0: -M, -1: when standard output is a terminal
+  unbuffered: Bool
 
 fn die(msg: Str, code: Int):
   eprint(msg)
   exit(code)
 
 fn usage_err(msg: Str):
-  eprint("vjq: error: " + msg)
-  eprint("Use vjq --help for help with command-line options,")
+  let prog = args()[0]
+  eprint(prog + ": " + msg)
+  eprint("Use " + prog + " --help for help with command-line options,")
   eprint("or see the jq manpage, or online docs  at https://jqlang.github.io/jq")
   exit(2)
 
 fn parse_args(argv: [Str]) -> Opts:
-  var o = Opts("", false, [], false, false, false, false, false, false, false, false, false, false, 2, false, false, "", [], [], [], [], false, "", false)
+  var o = Opts("", false, [], false, false, false, false, false, false, false, false, false, false, 2, false, false, "", [], [], [], [], false, "", false, -1, false)
   var i = 1
   var further = true
   var args_mode = 0     # 1: --args, 2: --jsonargs
@@ -138,7 +141,10 @@ fn parse_args(argv: [Str]) -> Opts:
         o.join = true
       elif a == "--ascii-output": o.ascii = true
       elif a == "--sort-keys": o.sortkeys = true
-      elif a == "--color-output" or a == "--monochrome-output" or a == "--unbuffered" or a == "--stream-errors": o.seq = o.seq
+      elif a == "--color-output": o.color = 1
+      elif a == "--monochrome-output": o.color = 0
+      elif a == "--unbuffered": o.unbuffered = true
+      elif a == "--stream-errors": o.seq = o.seq
       elif a == "--tab": o.tab = true
       elif a == "--indent":
         if i >= argv.len: usage_err("--indent takes one parameter")
@@ -179,7 +185,7 @@ fn parse_args(argv: [Str]) -> Opts:
       elif a == "--stream":
         o.stream = true
       else:
-        usage_err("Unknown option: " + a)
+        usage_err("Unknown option " + a)
       continue
     # short options, possibly combined (-nr)
     var j = 1
@@ -196,7 +202,8 @@ fn parse_args(argv: [Str]) -> Opts:
         o.join = true
       elif c == 'a': o.ascii = true
       elif c == 'S': o.sortkeys = true
-      elif c == 'C' or c == 'M': o.seq = o.seq
+      elif c == 'C': o.color = 1
+      elif c == 'M': o.color = 0
       elif c == 'e': o.exit_status = true
       elif c == 'h':
         print(USAGE)
@@ -217,7 +224,7 @@ fn parse_args(argv: [Str]) -> Opts:
           o.libdirs.push(argv[i])
           i += 1
       else:
-        usage_err("Unknown option: " + a)
+        usage_err("Unknown option " + a)
   return o
 
 # Parses JSON text held in a Str (for --argjson and the test runner); nil if it isn't one value.
@@ -309,6 +316,8 @@ fn compile(var it: It, fs: Fs, src: Str, names: [Str], vals: [V], libdirs: [Str]
   return root
 
 fn reset_run(var it: It):
+  # input read while running stays (it may hold the next values)
+  if it.iend > it.st.mb: it.st.mb = it.iend
   jv.reset(&it.st)
   it.pp.truncate(1)
   it.pk.truncate(1)
@@ -337,7 +346,11 @@ fn report_error(var it: It):
   run.flush_out(&it)
   let e = it.err
   if kind(e) == K_STR:
-    eprint("jq: error (at " + pos_text(&it) + "): " + jv.str_of(it.st, e))
+    # jq prints the message as a C string: it ends at a NUL byte
+    var m = jv.str_of(it.st, e)
+    let z = m.find("\0")
+    if z >= 0: m = m[0..z]
+    eprint("jq: error (at " + pos_text(&it) + "): " + m)
   else:
     let s = jv.to_json_str(&it.st, e)
     eprint("jq: error (at " + pos_text(&it) + ") (not a string): " + s)
@@ -359,7 +372,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       for f in files: fs2.push(f)
       files = fs2
   elif not o.have_filter:
-    print(USAGE)
+    eprint(USAGE)
     exit(2)
   var it = run.new_it(ffi, fs, os)
   it.null_input = o.null_input
@@ -367,6 +380,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   it.slurp = o.slurp
   it.raw = o.raw
   it.join = o.join or o.raw0
+  it.raw0 = o.raw0
   it.seq = o.seq
   it.st.sortkeys = o.sortkeys
   it.st.ascii = o.ascii
@@ -375,12 +389,22 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   if o.compact:
     it.st.indent = 0
     it.st.tab = false
+  # each result goes out at once to a terminal (or with --unbuffered), as jq's stdio does
+  it.unbuffered = o.unbuffered or nat.vjq_isatty(ffi, 1)
+  var color = o.color == 1
+  if o.color == -1 and nat.vjq_isatty(ffi, 1) and os.env("NO_COLOR") == "": color = true
+  if color:
+    if not jv.set_colors(&it.st, os.env("JQ_COLORS")):
+      eprint("Failed to set $JQ_COLORS")
+      jv.set_colors(&it.st, "")
+    it.st.color = true
   # read the inputs into the store's buffer first (strings in them are spans of it)
   var text = ""
   var ierrs = 0
   if files.len == 0:
     if o.null_input: it.stdin_pending = true
-    else: text = os.read_stdin() else ""
+    elif o.slurp or o.raw_input: text = os.read_stdin() else ""
+    else: it.stdin_stream = true
     it.ifiles.push("")
     it.istarts.push(0)
   else:
@@ -393,10 +417,11 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
           elif has_bom(t): text += t[3..t.len]
           else: text += t
         err(e):
-          eprint("jq: error: Could not open " + f + ": " + open_err(fs, f))
+          eprint("jq: error: Could not open file " + f + ": " + open_err(fs, f))
           ierrs += 1
   if has_bom(text): text = text[3..text.len]
   it.st.b = bytes(text)
+  text = ""
   it.ipos = 0
   it.iend = it.st.b.len
   it.st.pline = 1
@@ -451,6 +476,13 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     eprint(compile_error(it, src))
     eprint("jq: 1 compile error")
     exit(3)
+  if it.stdin_stream:
+    # standard input will be appended after the program's constants
+    it.ipos = it.st.b.len
+    it.iend = it.st.b.len
+    it.istarts[0] = it.st.b.len
+    it.lc_end = it.st.b.len
+    it.st.plinestart = it.st.b.len
   jv.set_mark(&it.st)
   var ret = -4            # no output yet
   var last_result = -1

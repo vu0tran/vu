@@ -302,3 +302,6 @@ void vjq_ewrite(const vu_str *s) {
     fflush(stdout);
     fwrite(s->data, 1, (size_t)s->len, stderr);
 }
+
+#include <unistd.h>
+bool vjq_isatty(int64_t fd) { return isatty((int)fd) != 0; }
