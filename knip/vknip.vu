@@ -128,6 +128,8 @@ type Proj:
   file_set: {Str: Bool}
   ign: [glob.Pat]
   unign: [glob.Pat]
+  ign_exact: [glob.Pat]       # "*" and "**": not extended to what's below a match
+  unign_exact: [glob.Pat]
   plugins: {Str: Bool}
   inputs: [Input]
   issues: Issues
@@ -140,7 +142,7 @@ type Proj:
   config_files: {Str: Bool}  # plugin config files seen
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, json.Null, "", "", [], [], [], [], {}, {}, {}, {}, {}, {}, {}, [], {}, [], {}, [], [], {}, [], Issues([], {}), resolve.new_resolver(root), coll_table(), [], [], "", "", {})
+  return Proj(root, json.Null, "", "", [], [], [], [], {}, {}, {}, {}, {}, {}, {}, [], {}, [], {}, [], [], [], [], {}, [], Issues([], {}), resolve.new_resolver(root), coll_table(), [], [], "", "", {})
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -172,8 +174,12 @@ fn add_gitignore(var p: Proj, text: Str, base: Str):
     line = line.strip()
     let neg = line.startswith("!")
     var pat = convert_gitignore(line)
+    let exact = pat == "*" or pat == "**"
     if base != "": pat = resolve.norm(base + "/" + pat)
-    if neg: p.unign.push(glob.compile(pat))
+    if exact and base == "":
+      if neg: p.unign_exact.push(glob.compile(pat))
+      else: p.ign_exact.push(glob.compile(pat))
+    elif neg: p.unign.push(glob.compile(pat))
     else: p.ign.push(glob.compile(pat))
 
 fn matches_any(pats: [glob.Pat], path: Str, dot: Bool) -> Bool:
@@ -181,16 +187,15 @@ fn matches_any(pats: [glob.Pat], path: Str, dot: Bool) -> Bool:
 
 # ignored: a pattern matches the path or one of its folders
 fn is_ignored_path(p: Proj, path: Str, dot: Bool) -> Bool:
-  if p.ign.len == 0: return false
-  var hit = false
+  if p.ign.len == 0 and p.ign_exact.len == 0: return false
+  var hit = matches_any(p.ign_exact, path, dot)
   var cur = path
-  while cur != "":
-    if matches_any(p.ign, cur, dot):
-      hit = true
-      break
+  while not hit and cur != "":
+    if matches_any(p.ign, cur, dot): hit = true
     cur = resolve.dirname(cur)
   if not hit: return false
-  if p.unign.len == 0: return true
+  if p.unign.len == 0 and p.unign_exact.len == 0: return true
+  if matches_any(p.unign_exact, path, dot): return false
   var c2 = path
   while c2 != "":
     if matches_any(p.unign, c2, dot): return false
@@ -199,9 +204,9 @@ fn is_ignored_path(p: Proj, path: Str, dot: Bool) -> Bool:
 
 # (in the walk, the folders above a path aren't ignored, so only the path itself is checked)
 fn is_ignored_here(p: Proj, path: Str) -> Bool:
-  if not matches_any(p.ign, path, true): return false
-  if p.unign.len == 0: return true
-  return not matches_any(p.unign, path, true)
+  if not matches_any(p.ign, path, true) and not matches_any(p.ign_exact, path, true): return false
+  if p.unign.len == 0 and p.unign_exact.len == 0: return true
+  return not matches_any(p.unign, path, true) and not matches_any(p.unign_exact, path, true)
 
 fn walk(var p: Proj, fs: Fs, dir: Str):
   let names = fs.list(fspath(p, dir)) else return
@@ -797,6 +802,7 @@ fn enabled_plugins(var p: Proj, fs: Fs):
   if has_dep(p, "tsd"): enable(&p, "tsd")
   if has_dep(p, "c8"): enable(&p, "c8")
   if has_dep(p, "@playwright/test"): enable(&p, "playwright")
+  if has_dep(p, "borp"): enable(&p, "borp")
   for f in [".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"]:
     if exists_file(p, fs, f): enable(&p, "mcp")
   let pm = pkg.str_of(pkg.get(p.manifest, "packageManager"))
@@ -902,6 +908,17 @@ fn run_plugins(var p: Proj, fs: Fs):
     elif key == "playwright":
       let found = plugin_std(&p, fs, true, ["playwright.config.{{js,cjs,mjs,ts,cts,mts}}"], ["**/*.@(spec|test).?(c|m)[jt]s?(x)"], [])
       for f in found: config_entry(&p, f)
+    elif key == "borp":
+      let found = plugin_std(&p, fs, true, [".borp.yaml", ".borp.yml"], ["**/*.test.{{js,mjs,cjs,ts,mts,cts}}"], [])
+      for f in found:
+        config_entry(&p, f)
+        let text = fs.read(fspath(p, f)) else ""
+        for r in yaml_list(text, "reporters"):
+          let ri = scripts.borp_reporter(r)
+          if ri != "": add_defer(&p, ri, f)
+        var files = yaml_list(text, "files")
+        if files.len == 0: files = ["**/*.test.{{js,mjs,cjs,ts,mts,cts}}"]
+        add_entries(&p, files, f)
     elif key == "mcp":
       let found = find_configs(p, fs, [".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"])
       for f in found:
@@ -1167,6 +1184,28 @@ fn typedoc_config(var p: Proj, fs: Fs, found: [Str]):
 
 # The run: scripts of a GitHub workflow (a small reader for the YAML they're written in): each step's
 # run, with its working-directory.
+# The items of a top-level list in a simple YAML file (key:, then - item lines).
+fn yaml_list(text: Str, key: Str) -> [Str]:
+  var out: [Str] = []
+  var on = false
+  for raw in text.split("\n"):
+    var l = raw
+    if l.endswith("\r"): l = l[0..l.len - 1]
+    let t = l.strip()
+    if t == "" or t.startswith("#"): continue
+    if indent_of(l) == 0:
+      on = t.startswith(key + ":")
+      if on:
+        let rest = t[key.len + 1..t.len].strip()
+        if rest.startswith("[") and rest.endswith("]"):
+          for x in rest[1..rest.len - 1].split(","):
+            let v = yaml_scalar(x)
+            if v != "": out.push(v)
+          on = false
+      continue
+    if on and t.startswith("- "): out.push(yaml_scalar(t[2..t.len]))
+  return out
+
 fn indent_of(l: Str) -> Int:
   var i = 0
   while i < l.len and l[i] == ' ': i += 1
@@ -1444,7 +1483,9 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
   # the operations on resolved internal imports
   var ops: [Op] = []
   swap(&ops, &b.g.nodes[id].raw.ops)
+  let skip_exp = b.g.nodes[id].skip_exports
   for o in ops:
+    if o.exp and skip_exp: continue
     if not (o.spec in targets): continue
     let tid = targets[o.spec]
     if tid < 0: continue
@@ -2196,7 +2237,9 @@ fn main(fs: Fs, os: Os):
       if path in b.project:
         b.g.nodes[id].analyzed = true
         b.g.nodes[id].skip_exports = id in b.skip
-        if id in b.skip: b.g.nodes[id].raw.exps = []
+        if id in b.skip:
+          b.g.nodes[id].raw.exps = []
+          b.g.nodes[id].raw.dups = []
         link_file(&p, fs, &b, id)
       else:
         # not a project file: only followed
