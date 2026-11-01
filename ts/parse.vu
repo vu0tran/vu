@@ -1,0 +1,2213 @@
+# The TypeScript parser: statements, expressions and types into the flat tree of ast.vu. It follows
+# TypeScript's grammar, including its ambiguities: arrow functions and generic calls are told apart by
+# looking ahead or by parsing speculatively and rolling the tree back.
+
+import scan
+import ast
+from scan import T_EOF, T_IDENT, T_NUM, T_BIGINT, T_STR, T_NOSUB, T_THEAD, T_TMID, T_TTAIL, T_REGEX, T_PRIVATE
+from scan import T_LBRACE, T_RBRACE, T_LPAREN, T_RPAREN, T_LBRACK, T_RBRACK, T_DOT, T_DOTS, T_SEMI, T_COMMA
+from scan import T_LT, T_GT, T_ARROW, T_Q, T_QDOT, T_COLON, T_AT, T_ASSIGN, T_BANG, T_STAR, T_MINUS, T_PLUS, T_SLASH, T_SLASHEQ, T_BAR, T_AMP, T_HASH
+
+type Diag:
+  file: Int
+  pos: Int
+  end: Int
+  code: Int
+  msg: Str
+
+type Parser:
+  sc: scan.Scanner
+  t: ast.Ast
+  file: Int
+  diags: [Diag]
+  in_type: Int      # >0 while parsing a type (no regex, '>' closes type arguments)
+  no_in: Bool       # inside a for header: 'in' isn't a binary operator
+  no_cond: Bool     # inside a conditional type's extends clause
+  gen: Bool         # inside a generator's body: 'yield' is an operator
+
+# A saved scanner position, for looking ahead.
+type Save:
+  i: Int
+  tok: Int
+  ts: Int
+  te: Int
+  nl: Bool
+  tval: Str
+  bad: Str
+  bad_at: Int
+  ndiags: Int
+
+fn save(p: Parser) -> Save:
+  return Save(p.sc.i, p.sc.tok, p.sc.ts, p.sc.te, p.sc.nl, p.sc.tval + "", p.sc.bad + "", p.sc.bad_at, p.diags.len)
+
+fn restore(var p: Parser, s: Save):
+  p.sc.i = s.i
+  p.sc.tok = s.tok
+  p.sc.ts = s.ts
+  p.sc.te = s.te
+  p.sc.nl = s.nl
+  p.sc.tval = s.tval + ""
+  p.sc.bad = s.bad + ""
+  p.sc.bad_at = s.bad_at
+  while p.diags.len > s.ndiags: p.diags.pop()
+
+fn tok(p: Parser) -> Int:
+  return p.sc.tok
+
+fn next(var p: Parser):
+  scan.next(&p.sc)
+
+fn err(var p: Parser, pos: Int, code: Int, msg: Str):
+  # one error per position, as tsc reports the first
+  if p.diags.len > 0 and p.diags[p.diags.len - 1].pos == pos: return
+  p.diags.push(Diag(p.file, pos, pos, code, msg + ""))
+
+fn eat(var p: Parser, k: Int) -> Bool:
+  if p.sc.tok == k:
+    next(&p)
+    return true
+  return false
+
+fn tok_text(k: Int) -> Str:
+  if k == T_LBRACE: return "{{"
+  if k == T_RBRACE: return "}}"
+  if k == T_LPAREN: return "("
+  if k == T_RPAREN: return ")"
+  if k == T_LBRACK: return "["
+  if k == T_RBRACK: return "]"
+  if k == T_SEMI: return ";"
+  if k == T_COMMA: return ","
+  if k == T_COLON: return ":"
+  if k == T_GT: return ">"
+  if k == T_LT: return "<"
+  if k == T_ASSIGN: return "="
+  if k == T_ARROW: return "=>"
+  if k == T_DOT: return "."
+  if k == scan.W_IN: return "in"
+  if k == scan.W_OF: return "of"
+  if k == scan.W_WHILE: return "while"
+  if k == scan.W_FROM: return "from"
+  if k == T_IDENT: return "identifier"
+  return "token"
+
+fn expect(var p: Parser, k: Int) -> Bool:
+  if p.sc.tok == k:
+    next(&p)
+    return true
+  if k == T_IDENT: err(&p, p.sc.ts, 1003, "Identifier expected.")
+  else: err(&p, p.sc.ts, 1005, "'" + tok_text(k) + "' expected.")
+  return false
+
+# A token that can be an identifier here: a name, or a keyword that isn't reserved.
+fn is_ident(k: Int) -> Bool:
+  return k == T_IDENT or k > scan.RESERVED_LAST
+
+# Any name, reserved words included (after '.', in property names).
+fn is_name(k: Int) -> Bool:
+  return k == T_IDENT or k >= scan.K_FIRST
+
+fn n(var p: Parser, k: Int, pos: Int) -> Int:
+  return ast.node(&p.t, k, pos, pos, p.file)
+
+fn fin(var p: Parser, id: Int) -> Int:
+  # ends a node where the current token starts (exact ends aren't needed for diagnostics)
+  p.t.end[id] = p.sc.ts
+  return id
+
+fn lst(var p: Parser, items: [Int], pos: Int) -> Int:
+  return ast.list(&p.t, items, pos, p.sc.ts, p.file)
+
+fn name_id(var p: Parser, s: Str) -> Int:
+  return ast.intern(&p.t, s)
+
+# The current token's text, interned.
+fn tok_name(var p: Parser) -> Int:
+  let v = p.sc.tval + ""
+  return ast.intern(&p.t, v)
+
+fn ident(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let id = n(&p, ast.N_ID, pos)
+  if is_ident(p.sc.tok) or (p.in_type > 0 and is_name(p.sc.tok)):
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+  else:
+    err(&p, pos, 1003, "Identifier expected.")
+    p.t.s[id] = 0
+  return id
+
+fn semi(var p: Parser):
+  if p.sc.tok == T_SEMI:
+    next(&p)
+    return
+  if p.sc.tok == T_RBRACE or p.sc.tok == T_EOF or p.sc.nl: return
+  err(&p, p.sc.ts, 1005, "';' expected.")
+
+# ---- the file
+
+fn parse_file(var t: ast.Ast, own src: Str, file: Int, kw: {Str: Int}) -> [Diag]:
+  var p = Parser(scan.scanner(src, kw), ast.new_ast(), file, [], 0, false, false, false)
+  swap(&p.t, &t)
+  next(&p)
+  var stmts: [Int] = []
+  while p.sc.tok != T_EOF:
+    let before = p.sc.ts
+    stmts.push(statement(&p))
+    if p.sc.ts == before and p.sc.tok != T_EOF:
+      err(&p, p.sc.ts, 1128, "Declaration or statement expected.")
+      next(&p)
+  let root = lst(&p, stmts, 0)
+  # the file's statement list is the last node added for it; the program remembers it
+  p.t.f[root] = file
+  if p.sc.bad != "": p.diags.push(Diag(file, p.sc.bad_at, p.sc.bad_at, 1002, p.sc.bad + ""))
+  swap(&p.t, &t)
+  t.d[root] = -2      # marks a file root
+  var out: [Diag] = []
+  for d in p.diags: out.push(Diag(d.file, d.pos, d.end, d.code, d.msg + ""))
+  return out
+
+# ---- statements
+
+# A function's body, with 'yield' an operator only when the function is a generator.
+fn body(var p: Parser, gen: Bool) -> Int:
+  let was = p.gen
+  p.gen = gen
+  let b = block(&p)
+  p.gen = was
+  return b
+
+fn block(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let id = n(&p, ast.N_BLOCK, pos)
+  expect(&p, T_LBRACE)
+  var stmts: [Int] = []
+  while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    let before = p.sc.ts
+    stmts.push(statement(&p))
+    if p.sc.ts == before:
+      err(&p, p.sc.ts, 1128, "Declaration or statement expected.")
+      next(&p)
+  p.t.a[id] = lst(&p, stmts, pos)
+  expect(&p, T_RBRACE)
+  return fin(&p, id)
+
+# Modifiers before a declaration (export, declare, abstract, async, default, const before enum...).
+fn modifiers(var p: Parser) -> Int:
+  var f = 0
+  while true:
+    let k = p.sc.tok
+    if k == scan.W_EXPORT:
+      next(&p)
+      f = f | ast.M_EXPORT
+      if p.sc.tok == scan.W_DEFAULT:
+        next(&p)
+        f = f | ast.M_DEFAULT
+    elif k == scan.W_DECLARE and next_on_same_line_is_decl(&p):
+      next(&p)
+      f = f | ast.M_DECLARE
+    elif k == scan.W_ABSTRACT and next_is(&p, scan.W_CLASS):
+      next(&p)
+      f = f | ast.M_ABSTRACT
+    elif k == scan.W_ASYNC and next_is(&p, scan.W_FUNCTION):
+      next(&p)
+      f = f | ast.M_ASYNC
+    elif k == scan.W_CONST and next_is(&p, scan.W_ENUM):
+      next(&p)
+      f = f | ast.M_CONST
+    else:
+      return f
+  return f
+
+# Whether the token after the current one is k (on the same line).
+fn next_is(var p: Parser, k: Int) -> Bool:
+  let s = save(p)
+  next(&p)
+  let ok = p.sc.tok == k and not p.sc.nl
+  restore(&p, s)
+  return ok
+
+fn next_on_same_line_is_decl(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let k = p.sc.tok
+  let ok = not p.sc.nl and (k == scan.W_VAR or k == scan.W_LET or k == scan.W_CONST or k == scan.W_FUNCTION or k == scan.W_CLASS or k == scan.W_INTERFACE or k == scan.W_TYPE or k == scan.W_ENUM or k == scan.W_MODULE or k == scan.W_NAMESPACE or k == scan.W_GLOBAL or k == scan.W_ABSTRACT or k == scan.W_ASYNC or k == scan.W_USING or k == scan.W_IMPORT or k == scan.W_EXPORT)
+  restore(&p, s)
+  return ok
+
+fn decorators(var p: Parser):
+  while p.sc.tok == T_AT:
+    next(&p)
+    lhs(&p)
+
+fn statement(var p: Parser) -> Int:
+  decorators(&p)
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if k == T_LBRACE: return block(&p)
+  if k == T_SEMI:
+    next(&p)
+    return n(&p, ast.N_EMPTY, pos)
+  if k == scan.W_EXPORT or k == scan.W_DECLARE or k == scan.W_ABSTRACT or k == scan.W_ASYNC or (k == scan.W_CONST and next_is(&p, scan.W_ENUM)):
+    if k == scan.W_EXPORT: return export_stmt(&p)
+    let s = save(p)
+    let mods = modifiers(&p)
+    if mods != 0: return declaration(&p, mods, pos)
+    restore(&p, s)
+  if k == scan.W_VAR or k == scan.W_CONST: return var_stmt(&p, 0)
+  if k == scan.W_LET and let_starts_decl(&p): return var_stmt(&p, 0)
+  if k == scan.W_USING and next_is_ident_same_line(&p): return var_stmt(&p, 0)
+  if k == scan.W_FUNCTION: return function_decl(&p, 0, pos)
+  if k == scan.W_CLASS: return class_decl(&p, 0, pos, false)
+  if k == scan.W_INTERFACE and next_is_ident_same_line(&p): return interface_decl(&p, 0, pos)
+  if k == scan.W_TYPE and next_is_ident_same_line(&p): return type_alias(&p, 0, pos)
+  if k == scan.W_ENUM: return enum_decl(&p, 0, pos)
+  if (k == scan.W_NAMESPACE or k == scan.W_MODULE) and (next_is_ident_same_line(&p) or next_is(&p, T_STR)): return module_decl(&p, 0, pos)
+  if k == scan.W_GLOBAL and next_is(&p, T_LBRACE): return module_decl(&p, 0, pos)
+  if k == scan.W_IMPORT and not next_is(&p, T_LPAREN) and not next_is(&p, T_DOT): return import_stmt(&p)
+  if k == scan.W_IF:
+    next(&p)
+    let id = n(&p, ast.N_IF, pos)
+    expect(&p, T_LPAREN)
+    p.t.a[id] = expression(&p)
+    expect(&p, T_RPAREN)
+    p.t.b[id] = statement(&p)
+    if eat(&p, scan.W_ELSE): p.t.c[id] = statement(&p)
+    return fin(&p, id)
+  if k == scan.W_RETURN:
+    next(&p)
+    let id = n(&p, ast.N_RETURN, pos)
+    if p.sc.tok != T_SEMI and p.sc.tok != T_RBRACE and p.sc.tok != T_EOF and not p.sc.nl: p.t.a[id] = expression(&p)
+    semi(&p)
+    return fin(&p, id)
+  if k == scan.W_WHILE:
+    next(&p)
+    let id = n(&p, ast.N_WHILE, pos)
+    expect(&p, T_LPAREN)
+    p.t.a[id] = expression(&p)
+    expect(&p, T_RPAREN)
+    p.t.b[id] = statement(&p)
+    return fin(&p, id)
+  if k == scan.W_DO:
+    next(&p)
+    let id = n(&p, ast.N_DO, pos)
+    p.t.a[id] = statement(&p)
+    expect(&p, scan.W_WHILE)
+    expect(&p, T_LPAREN)
+    p.t.b[id] = expression(&p)
+    expect(&p, T_RPAREN)
+    eat(&p, T_SEMI)
+    return fin(&p, id)
+  if k == scan.W_FOR: return for_stmt(&p)
+  if k == scan.W_BREAK or k == scan.W_CONTINUE:
+    next(&p)
+    var kind = ast.N_BREAK
+    if k == scan.W_CONTINUE: kind = ast.N_CONTINUE
+    let id = n(&p, kind, pos)
+    if is_ident(p.sc.tok) and not p.sc.nl:
+      p.t.s[id] = tok_name(&p)
+      next(&p)
+    semi(&p)
+    return fin(&p, id)
+  if k == scan.W_THROW:
+    next(&p)
+    let id = n(&p, ast.N_THROW, pos)
+    p.t.a[id] = expression(&p)
+    semi(&p)
+    return fin(&p, id)
+  if k == scan.W_TRY:
+    next(&p)
+    let id = n(&p, ast.N_TRY, pos)
+    p.t.a[id] = block(&p)
+    if p.sc.tok == scan.W_CATCH:
+      next(&p)
+      if eat(&p, T_LPAREN):
+        let d = n(&p, ast.N_DECL, p.sc.ts)
+        p.t.a[d] = binding_name(&p)
+        if eat(&p, T_COLON): p.t.b[d] = type_(&p)
+        expect(&p, T_RPAREN)
+        p.t.b[id] = fin(&p, d)
+      p.t.c[id] = block(&p)
+    if eat(&p, scan.W_FINALLY): p.t.d[id] = block(&p)
+    return fin(&p, id)
+  if k == scan.W_SWITCH:
+    next(&p)
+    let id = n(&p, ast.N_SWITCH, pos)
+    expect(&p, T_LPAREN)
+    p.t.a[id] = expression(&p)
+    expect(&p, T_RPAREN)
+    expect(&p, T_LBRACE)
+    var cases: [Int] = []
+    while p.sc.tok == scan.W_CASE or p.sc.tok == scan.W_DEFAULT:
+      let cpos = p.sc.ts
+      let c = n(&p, ast.N_CASE, cpos)
+      if eat(&p, scan.W_CASE): p.t.a[c] = expression(&p)
+      else: next(&p)
+      expect(&p, T_COLON)
+      var body: [Int] = []
+      while p.sc.tok != scan.W_CASE and p.sc.tok != scan.W_DEFAULT and p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+        let before = p.sc.ts
+        body.push(statement(&p))
+        if p.sc.ts == before: next(&p)
+      p.t.b[c] = lst(&p, body, cpos)
+      cases.push(fin(&p, c))
+    p.t.b[id] = lst(&p, cases, pos)
+    expect(&p, T_RBRACE)
+    return fin(&p, id)
+  if k == scan.W_DEBUGGER:
+    next(&p)
+    semi(&p)
+    return n(&p, ast.N_DEBUGGER, pos)
+  if k == scan.W_WITH:
+    next(&p)
+    let id = n(&p, ast.N_WITH, pos)
+    expect(&p, T_LPAREN)
+    p.t.a[id] = expression(&p)
+    expect(&p, T_RPAREN)
+    p.t.b[id] = statement(&p)
+    return fin(&p, id)
+  # a label
+  if is_ident(k) and next_is_colon(&p):
+    let id = n(&p, ast.N_LABEL, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    next(&p)
+    p.t.a[id] = statement(&p)
+    return fin(&p, id)
+  let id = n(&p, ast.N_EXPRSTMT, pos)
+  p.t.a[id] = expression(&p)
+  semi(&p)
+  return fin(&p, id)
+
+fn next_is_colon(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let ok = p.sc.tok == T_COLON
+  restore(&p, s)
+  return ok
+
+fn next_is_ident_same_line(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let ok = is_name(p.sc.tok) and not p.sc.nl
+  restore(&p, s)
+  return ok
+
+# 'let' starts a declaration when a name, '[' or '{' follows.
+fn let_starts_decl(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let k = p.sc.tok
+  let ok = is_ident(k) or k == T_LBRACK or k == T_LBRACE
+  restore(&p, s)
+  return ok
+
+fn declaration(var p: Parser, mods: Int, pos: Int) -> Int:
+  let k = p.sc.tok
+  if k == scan.W_VAR or k == scan.W_LET or k == scan.W_CONST or k == scan.W_USING: return var_stmt(&p, mods)
+  if k == scan.W_FUNCTION: return function_decl(&p, mods, pos)
+  if k == scan.W_CLASS: return class_decl(&p, mods, pos, false)
+  if k == scan.W_INTERFACE: return interface_decl(&p, mods, pos)
+  if k == scan.W_TYPE: return type_alias(&p, mods, pos)
+  if k == scan.W_ENUM: return enum_decl(&p, mods, pos)
+  if k == scan.W_NAMESPACE or k == scan.W_MODULE or k == scan.W_GLOBAL: return module_decl(&p, mods, pos)
+  if k == scan.W_IMPORT: return import_stmt(&p)
+  if (mods & ast.M_DEFAULT) != 0:
+    let id = n(&p, ast.N_EXPORTDEFAULT, pos)
+    p.t.a[id] = assignment(&p)
+    semi(&p)
+    return fin(&p, id)
+  err(&p, p.sc.ts, 1128, "Declaration or statement expected.")
+  return n(&p, ast.N_EMPTY, pos)
+
+fn export_stmt(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let s = save(p)
+  next(&p)
+  if p.sc.tok == T_ASSIGN:
+    next(&p)
+    let id = n(&p, ast.N_EXPORTASSIGN, pos)
+    p.t.a[id] = expression(&p)
+    semi(&p)
+    return fin(&p, id)
+  if p.sc.tok == scan.W_AS:
+    # export as namespace X;
+    next(&p)
+    expect(&p, scan.W_NAMESPACE)
+    let id = n(&p, ast.N_NSEXPORT, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    semi(&p)
+    return fin(&p, id)
+  var type_only = false
+  if p.sc.tok == scan.W_TYPE and (next_is(&p, T_LBRACE) or next_is(&p, T_STAR)):
+    next(&p)
+    type_only = true
+  if p.sc.tok == T_LBRACE or p.sc.tok == T_STAR:
+    let id = n(&p, ast.N_EXPORT, pos)
+    if type_only: p.t.f[id] = ast.M_TYPEONLY
+    if eat(&p, T_STAR):
+      if eat(&p, scan.W_AS):
+        let nm = ident_or_string(&p)
+        p.t.c[id] = nm
+    else:
+      p.t.b[id] = specifiers(&p)
+    if eat(&p, scan.W_FROM):
+      p.t.a[id] = string_lit(&p)
+    attributes(&p)
+    semi(&p)
+    return fin(&p, id)
+  if p.sc.tok == scan.W_IMPORT:
+    # export import a = b.c;
+    return import_stmt(&p)
+  if p.sc.tok == scan.W_DEFAULT:
+    restore(&p, s)
+    let mods = modifiers(&p)
+    return declaration(&p, mods, pos)
+  restore(&p, s)
+  let mods = modifiers(&p)
+  return declaration(&p, mods, pos)
+
+fn ident_or_string(var p: Parser) -> Int:
+  if p.sc.tok == T_STR: return string_lit(&p)
+  let pos = p.sc.ts
+  let id = n(&p, ast.N_ID, pos)
+  if is_name(p.sc.tok):
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+  else: err(&p, pos, 1003, "Identifier expected.")
+  return id
+
+fn string_lit(var p: Parser) -> Int:
+  let id = n(&p, ast.N_STR, p.sc.ts)
+  if p.sc.tok == T_STR:
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+  else: err(&p, p.sc.ts, 1141, "String literal expected.")
+  return id
+
+fn attributes(var p: Parser):
+  # with { type: "json" }
+  if (p.sc.tok == scan.W_WITH or (p.sc.tok == T_IDENT and p.sc.tval == "assert")) and not p.sc.nl:
+    next(&p)
+    object_literal(&p)
+
+fn specifiers(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  expect(&p, T_LBRACE)
+  var specs: [Int] = []
+  while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    let spos = p.sc.ts
+    let sp = n(&p, ast.N_SPEC, spos)
+    if p.sc.tok == scan.W_TYPE and not next_is(&p, T_COMMA) and not next_is(&p, T_RBRACE) and not next_is(&p, scan.W_AS):
+      next(&p)
+      p.t.f[sp] = ast.M_TYPEONLY
+    let first = ident_or_string(&p)
+    if eat(&p, scan.W_AS):
+      p.t.b[sp] = first
+      let second = ident_or_string(&p)
+      p.t.s[sp] = p.t.s[second]
+    else:
+      p.t.s[sp] = p.t.s[first]
+    specs.push(fin(&p, sp))
+    if not eat(&p, T_COMMA): break
+  expect(&p, T_RBRACE)
+  return lst(&p, specs, pos)
+
+fn import_stmt(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  expect(&p, scan.W_IMPORT)
+  var type_only = false
+  if p.sc.tok == scan.W_TYPE and not next_is(&p, T_COMMA) and not next_is(&p, scan.W_FROM) and not next_is(&p, T_ASSIGN):
+    next(&p)
+    type_only = true
+  # import x = require("y") / import x = a.b
+  if is_ident(p.sc.tok) and next_is(&p, T_ASSIGN):
+    let id = n(&p, ast.N_IMPORTEQ, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    next(&p)
+    if p.sc.tok == scan.W_REQUIRE and next_is(&p, T_LPAREN):
+      next(&p)
+      next(&p)
+      let r = n(&p, ast.N_EXTERNALREF, p.sc.ts)
+      p.t.a[r] = string_lit(&p)
+      expect(&p, T_RPAREN)
+      p.t.a[id] = r
+    else:
+      p.t.a[id] = entity_name(&p)
+    semi(&p)
+    return fin(&p, id)
+  let id = n(&p, ast.N_IMPORT, pos)
+  if type_only: p.t.f[id] = ast.M_TYPEONLY
+  if p.sc.tok == T_STR:
+    p.t.a[id] = string_lit(&p)
+    attributes(&p)
+    semi(&p)
+    return fin(&p, id)
+  if is_ident(p.sc.tok):
+    p.t.b[id] = ident(&p)
+    eat(&p, T_COMMA)
+  if eat(&p, T_STAR):
+    expect(&p, scan.W_AS)
+    p.t.c[id] = ident(&p)
+  elif p.sc.tok == T_LBRACE:
+    p.t.d[id] = specifiers(&p)
+  expect(&p, scan.W_FROM)
+  p.t.a[id] = string_lit(&p)
+  attributes(&p)
+  semi(&p)
+  return fin(&p, id)
+
+fn var_stmt(var p: Parser, mods: Int) -> Int:
+  let pos = p.sc.ts
+  let id = n(&p, ast.N_VAR, pos)
+  let k = p.sc.tok
+  if k == scan.W_LET: p.t.f[id] = 1
+  elif k == scan.W_CONST: p.t.f[id] = 2
+  elif k == scan.W_USING: p.t.f[id] = 3
+  next(&p)
+  p.t.d[id] = mods
+  p.t.a[id] = declarators(&p)
+  semi(&p)
+  return fin(&p, id)
+
+fn declarators(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  var ds: [Int] = []
+  while true:
+    let d = n(&p, ast.N_DECL, p.sc.ts)
+    p.t.a[d] = binding_name(&p)
+    if p.sc.tok == T_BANG:
+      next(&p)
+      p.t.f[d] = ast.M_EXCL
+    if eat(&p, T_COLON): p.t.b[d] = type_(&p)
+    if eat(&p, T_ASSIGN): p.t.c[d] = assignment(&p)
+    ds.push(fin(&p, d))
+    if not eat(&p, T_COMMA): break
+  return lst(&p, ds, pos)
+
+# A name or a destructuring pattern.
+fn binding_name(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  if p.sc.tok == T_LBRACE:
+    next(&p)
+    let id = n(&p, ast.N_OBJPAT, pos)
+    var els: [Int] = []
+    while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+      let e = n(&p, ast.N_BINDEL, p.sc.ts)
+      if eat(&p, T_DOTS):
+        p.t.f[e] = ast.M_REST
+        p.t.b[e] = binding_name(&p)
+      else:
+        let pn = property_name(&p)
+        if eat(&p, T_COLON):
+          p.t.a[e] = pn
+          p.t.b[e] = binding_name(&p)
+        else:
+          # shorthand: the property name is the binding
+          p.t.b[e] = pn
+        if eat(&p, T_ASSIGN): p.t.c[e] = assignment(&p)
+      els.push(fin(&p, e))
+      if not eat(&p, T_COMMA): break
+    expect(&p, T_RBRACE)
+    p.t.a[id] = lst(&p, els, pos)
+    return fin(&p, id)
+  if p.sc.tok == T_LBRACK:
+    next(&p)
+    let id = n(&p, ast.N_ARRPAT, pos)
+    var els: [Int] = []
+    while p.sc.tok != T_RBRACK and p.sc.tok != T_EOF:
+      if p.sc.tok == T_COMMA:
+        els.push(n(&p, ast.N_OMIT, p.sc.ts))
+        next(&p)
+        continue
+      let e = n(&p, ast.N_BINDEL, p.sc.ts)
+      if eat(&p, T_DOTS): p.t.f[e] = ast.M_REST
+      p.t.b[e] = binding_name(&p)
+      if eat(&p, T_ASSIGN): p.t.c[e] = assignment(&p)
+      els.push(fin(&p, e))
+      if not eat(&p, T_COMMA): break
+    expect(&p, T_RBRACK)
+    p.t.a[id] = lst(&p, els, pos)
+    return fin(&p, id)
+  return ident(&p)
+
+fn for_stmt(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  var await_ = false
+  if p.sc.tok == scan.W_AWAIT:
+    next(&p)
+    await_ = true
+  expect(&p, T_LPAREN)
+  var init = -1
+  p.no_in = true
+  if p.sc.tok == T_SEMI:
+    init = -1
+  elif p.sc.tok == scan.W_VAR or p.sc.tok == scan.W_CONST or (p.sc.tok == scan.W_LET and let_starts_decl(&p)) or (p.sc.tok == scan.W_USING and next_is_ident_same_line(&p)):
+    let vpos = p.sc.ts
+    let v = n(&p, ast.N_VAR, vpos)
+    let k = p.sc.tok
+    if k == scan.W_LET: p.t.f[v] = 1
+    elif k == scan.W_CONST: p.t.f[v] = 2
+    elif k == scan.W_USING: p.t.f[v] = 3
+    next(&p)
+    p.t.a[v] = declarators(&p)
+    init = fin(&p, v)
+  else:
+    init = expression(&p)
+  p.no_in = false
+  if p.sc.tok == scan.W_OF or p.sc.tok == scan.W_IN:
+    let id = n(&p, ast.N_FORIN, pos)
+    if p.sc.tok == scan.W_OF:
+      p.t.f[id] = 1
+      if await_: p.t.f[id] = 2
+    next(&p)
+    p.t.a[id] = init
+    if p.t.f[id] >= 1: p.t.b[id] = assignment(&p)
+    else: p.t.b[id] = expression(&p)
+    expect(&p, T_RPAREN)
+    p.t.c[id] = statement(&p)
+    return fin(&p, id)
+  let id = n(&p, ast.N_FOR, pos)
+  p.t.a[id] = init
+  expect(&p, T_SEMI)
+  if p.sc.tok != T_SEMI: p.t.b[id] = expression(&p)
+  expect(&p, T_SEMI)
+  if p.sc.tok != T_RPAREN: p.t.c[id] = expression(&p)
+  expect(&p, T_RPAREN)
+  p.t.d[id] = statement(&p)
+  return fin(&p, id)
+
+fn function_decl(var p: Parser, mods: Int, pos: Int) -> Int:
+  expect(&p, scan.W_FUNCTION)
+  let id = n(&p, ast.N_FUNC, pos)
+  var f = mods
+  if eat(&p, T_STAR): f = f | ast.M_GENERATOR
+  p.t.f[id] = f
+  if is_ident(p.sc.tok) or p.sc.tok == scan.W_YIELD or p.sc.tok == scan.W_AWAIT:
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+  elif (mods & ast.M_DEFAULT) == 0:
+    err(&p, p.sc.ts, 1003, "Identifier expected.")
+  signature_into(&p, id, T_COLON)
+  if p.sc.tok == T_LBRACE: p.t.d[id] = body(&p, (f & ast.M_GENERATOR) != 0)
+  else: semi(&p)
+  return fin(&p, id)
+
+# Type parameters, parameters and return type into a, b, c of node id.
+fn signature_into(var p: Parser, id: Int, ret_tok: Int):
+  if p.sc.tok == T_LT: p.t.a[id] = type_params(&p)
+  p.t.b[id] = params(&p)
+  if eat(&p, ret_tok): p.t.c[id] = return_type(&p)
+
+fn signature(var p: Parser, ret_tok: Int) -> Int:
+  let id = n(&p, ast.N_SIG, p.sc.ts)
+  signature_into(&p, id, ret_tok)
+  return fin(&p, id)
+
+fn params(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  expect(&p, T_LPAREN)
+  var ps: [Int] = []
+  while p.sc.tok != T_RPAREN and p.sc.tok != T_EOF:
+    ps.push(param(&p))
+    if not eat(&p, T_COMMA): break
+  expect(&p, T_RPAREN)
+  return lst(&p, ps, pos)
+
+fn param(var p: Parser) -> Int:
+  decorators(&p)
+  let id = n(&p, ast.N_PARAM, p.sc.ts)
+  var f = 0
+  # accessibility and readonly (constructor parameter properties)
+  while (p.sc.tok == scan.W_PUBLIC or p.sc.tok == scan.W_PRIVATE or p.sc.tok == scan.W_PROTECTED or p.sc.tok == scan.W_READONLY or p.sc.tok == scan.W_OVERRIDE) and next_starts_param(&p):
+    if p.sc.tok == scan.W_PUBLIC: f = f | ast.M_PUBLIC
+    elif p.sc.tok == scan.W_PRIVATE: f = f | ast.M_PRIVATE
+    elif p.sc.tok == scan.W_PROTECTED: f = f | ast.M_PROTECTED
+    elif p.sc.tok == scan.W_READONLY: f = f | ast.M_READONLY
+    else: f = f | ast.M_OVERRIDE
+    next(&p)
+  if eat(&p, T_DOTS): f = f | ast.M_REST
+  if p.sc.tok == scan.W_THIS:
+    let tid = n(&p, ast.N_ID, p.sc.ts)
+    p.t.s[tid] = name_id(&p, "this")
+    next(&p)
+    p.t.a[id] = tid
+  else:
+    p.t.a[id] = binding_name(&p)
+  if eat(&p, T_Q): f = f | ast.M_OPTIONAL
+  if eat(&p, T_COLON): p.t.b[id] = type_(&p)
+  if eat(&p, T_ASSIGN): p.t.c[id] = assignment(&p)
+  p.t.f[id] = f
+  return fin(&p, id)
+
+fn next_starts_param(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let k = p.sc.tok
+  let ok = is_ident(k) or k == T_LBRACE or k == T_LBRACK or k == T_DOTS or k == scan.W_THIS
+  restore(&p, s)
+  return ok
+
+fn type_params(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  expect(&p, T_LT)
+  p.in_type += 1
+  var tps: [Int] = []
+  while p.sc.tok != T_GT and p.sc.tok != T_EOF:
+    let id = n(&p, ast.N_TPARAM, p.sc.ts)
+    var f = 0
+    while (p.sc.tok == scan.W_CONST or p.sc.tok == scan.W_IN or p.sc.tok == scan.W_OUT) and next_is_tparam_name(&p):
+      if p.sc.tok == scan.W_CONST: f = f | ast.M_CONST
+      elif p.sc.tok == scan.W_IN: f = f | ast.M_IN
+      else: f = f | ast.M_OUT
+      next(&p)
+    p.t.f[id] = f
+    p.t.s[id] = tok_name(&p)
+    if is_name(p.sc.tok): next(&p)
+    else: err(&p, p.sc.ts, 1003, "Identifier expected.")
+    if eat(&p, scan.W_EXTENDS): p.t.a[id] = type_(&p)
+    if eat(&p, T_ASSIGN): p.t.b[id] = type_(&p)
+    tps.push(fin(&p, id))
+    if not eat(&p, T_COMMA): break
+  p.in_type -= 1
+  expect(&p, T_GT)
+  return lst(&p, tps, pos)
+
+fn next_is_tparam_name(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let ok = is_name(p.sc.tok)
+  restore(&p, s)
+  return ok
+
+fn class_decl(var p: Parser, mods: Int, pos: Int, is_expr: Bool) -> Int:
+  expect(&p, scan.W_CLASS)
+  var kind = ast.N_CLASS
+  if is_expr: kind = ast.N_CLASSEXPR
+  let id = n(&p, kind, pos)
+  p.t.f[id] = mods
+  if is_ident(p.sc.tok) and p.sc.tok != scan.W_IMPLEMENTS:
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+  if p.sc.tok == T_LT: p.t.a[id] = type_params(&p)
+  while p.sc.tok == scan.W_EXTENDS or p.sc.tok == scan.W_IMPLEMENTS:
+    if eat(&p, scan.W_EXTENDS):
+      p.t.b[id] = heritage(&p, false)
+    else:
+      next(&p)
+      let hpos = p.sc.ts
+      var hs: [Int] = []
+      while true:
+        hs.push(heritage(&p, true))
+        if not eat(&p, T_COMMA): break
+      p.t.c[id] = lst(&p, hs, hpos)
+  p.t.d[id] = class_members(&p)
+  return fin(&p, id)
+
+# A class's extends expression or an implements / interface extends type: name with type arguments.
+fn heritage(var p: Parser, is_type: Bool) -> Int:
+  let id = n(&p, ast.N_EXPRTARGS, p.sc.ts)
+  if is_type: p.t.a[id] = entity_name(&p)
+  else:
+    let e = lhs(&p)
+    # a trailing instantiation (Base<T> parsed as an expression with type arguments) is the clause's
+    if p.t.k[e] == ast.N_EXPRTARGS:
+      p.t.a[id] = p.t.a[e]
+      p.t.b[id] = p.t.b[e]
+      return fin(&p, id)
+    p.t.a[id] = e
+  scan.rescan_lt(&p.sc)
+  if p.sc.tok == T_LT: p.t.b[id] = type_args(&p)
+  return fin(&p, id)
+
+fn class_members(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  expect(&p, T_LBRACE)
+  var ms: [Int] = []
+  while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    if eat(&p, T_SEMI): continue
+    let before = p.sc.ts
+    ms.push(member(&p, true))
+    if p.sc.ts == before:
+      err(&p, p.sc.ts, 1068, "Unexpected token. A constructor, method, accessor, or property was expected.")
+      next(&p)
+  expect(&p, T_RBRACE)
+  return lst(&p, ms, pos)
+
+# Member modifiers: each is a modifier unless what follows makes it the member's name.
+fn member_modifiers(var p: Parser) -> Int:
+  var f = 0
+  while true:
+    let k = p.sc.tok
+    var bit = 0
+    if k == scan.W_PUBLIC: bit = ast.M_PUBLIC
+    elif k == scan.W_PRIVATE: bit = ast.M_PRIVATE
+    elif k == scan.W_PROTECTED: bit = ast.M_PROTECTED
+    elif k == scan.W_STATIC: bit = ast.M_STATIC
+    elif k == scan.W_READONLY: bit = ast.M_READONLY
+    elif k == scan.W_ABSTRACT: bit = ast.M_ABSTRACT
+    elif k == scan.W_OVERRIDE: bit = ast.M_OVERRIDE
+    elif k == scan.W_DECLARE: bit = ast.M_DECLARE
+    elif k == scan.W_ASYNC: bit = ast.M_ASYNC
+    elif k == scan.W_ACCESSOR: bit = ast.M_ACCESSOR
+    elif k == scan.W_EXPORT: bit = ast.M_EXPORT
+    elif k == scan.W_DEFAULT: bit = ast.M_DEFAULT
+    if bit == 0: return f
+    if not modifier_applies(&p): return f
+    next(&p)
+    f = f | bit
+  return f
+
+fn modifier_applies(var p: Parser) -> Bool:
+  let s = save(p)
+  let was = p.sc.tok
+  next(&p)
+  let k = p.sc.tok
+  var ok = not p.sc.nl or was == scan.W_STATIC or was == scan.W_READONLY or was == scan.W_PUBLIC or was == scan.W_PRIVATE or was == scan.W_PROTECTED
+  if k == T_LPAREN or k == T_LT or k == T_COLON or k == T_ASSIGN or k == T_SEMI or k == T_RBRACE or k == T_Q or k == T_BANG or k == T_COMMA or k == T_EOF: ok = false
+  if was == scan.W_ASYNC and p.sc.nl: ok = false
+  restore(&p, s)
+  return ok
+
+# A class member (in_class) or an interface / type literal member.
+fn member(var p: Parser, in_class: Bool) -> Int:
+  decorators(&p)
+  let pos = p.sc.ts
+  if in_class and p.sc.tok == scan.W_STATIC and next_is(&p, T_LBRACE):
+    next(&p)
+    let id = n(&p, ast.N_STATICBLOCK, pos)
+    p.t.a[id] = block(&p)
+    return fin(&p, id)
+  let mods = member_modifiers(&p)
+  # call and construct signatures
+  if not in_class and (p.sc.tok == T_LPAREN or p.sc.tok == T_LT):
+    let id = n(&p, ast.N_CALLSIG, pos)
+    p.t.b[id] = signature(&p, T_COLON)
+    member_end(&p)
+    return fin(&p, id)
+  if not in_class and p.sc.tok == scan.W_NEW and (next_is(&p, T_LPAREN) or next_is(&p, T_LT)):
+    next(&p)
+    let id = n(&p, ast.N_CTORSIG, pos)
+    p.t.b[id] = signature(&p, T_COLON)
+    member_end(&p)
+    return fin(&p, id)
+  # an index signature [k: T]: U
+  if p.sc.tok == T_LBRACK and is_index_signature(&p):
+    next(&p)
+    let id = n(&p, ast.N_INDEXSIG, pos)
+    p.t.f[id] = mods
+    var ps: [Int] = []
+    while p.sc.tok != T_RBRACK and p.sc.tok != T_EOF:
+      ps.push(param(&p))
+      if not eat(&p, T_COMMA): break
+    p.t.a[id] = lst(&p, ps, pos)
+    expect(&p, T_RBRACK)
+    if eat(&p, T_COLON): p.t.b[id] = type_(&p)
+    member_end(&p)
+    return fin(&p, id)
+  # get / set accessors
+  if (p.sc.tok == scan.W_GET or p.sc.tok == scan.W_SET) and accessor_follows(&p):
+    var kind = ast.N_GET
+    if p.sc.tok == scan.W_SET: kind = ast.N_SET
+    next(&p)
+    let id = n(&p, kind, pos)
+    p.t.f[id] = mods
+    p.t.a[id] = property_name(&p)
+    p.t.b[id] = signature(&p, T_COLON)
+    if p.sc.tok == T_LBRACE: p.t.c[id] = body(&p, false)
+    else: member_end(&p)
+    return fin(&p, id)
+  if in_class and p.sc.tok == scan.W_CONSTRUCTOR and (next_is(&p, T_LPAREN) or next_is(&p, T_LT)):
+    next(&p)
+    let id = n(&p, ast.N_CTOR, pos)
+    p.t.f[id] = mods
+    p.t.b[id] = signature(&p, T_COLON)
+    if p.sc.tok == T_LBRACE: p.t.c[id] = body(&p, false)
+    else: member_end(&p)
+    return fin(&p, id)
+  var f = mods
+  if in_class and eat(&p, T_STAR): f = f | ast.M_GENERATOR
+  let name = property_name(&p)
+  if eat(&p, T_Q): f = f | ast.M_OPTIONAL
+  elif in_class and p.sc.tok == T_BANG:
+    next(&p)
+    f = f | ast.M_EXCL
+  if p.sc.tok == T_LPAREN or p.sc.tok == T_LT:
+    let id = n(&p, ast.N_METHOD, pos)
+    p.t.f[id] = f
+    p.t.a[id] = name
+    p.t.b[id] = signature(&p, T_COLON)
+    if in_class and p.sc.tok == T_LBRACE: p.t.c[id] = body(&p, (f & ast.M_GENERATOR) != 0)
+    else: member_end(&p)
+    return fin(&p, id)
+  let id = n(&p, ast.N_PROP, pos)
+  p.t.f[id] = f
+  p.t.a[id] = name
+  if eat(&p, T_COLON): p.t.b[id] = type_(&p)
+  if in_class and eat(&p, T_ASSIGN): p.t.c[id] = assignment(&p)
+  member_end(&p)
+  return fin(&p, id)
+
+fn member_end(var p: Parser):
+  if p.sc.tok == T_SEMI or p.sc.tok == T_COMMA:
+    next(&p)
+    return
+  if p.sc.tok == T_RBRACE or p.sc.nl or p.sc.tok == T_EOF: return
+  err(&p, p.sc.ts, 1005, "';' expected.")
+
+fn accessor_follows(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let k = p.sc.tok
+  let ok = is_name(k) or k == T_STR or k == T_NUM or k == T_LBRACK or k == T_PRIVATE
+  restore(&p, s)
+  return ok
+
+fn is_index_signature(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  var ok = false
+  if p.sc.tok == T_DOTS or p.sc.tok == T_RBRACK: ok = true
+  elif is_ident(p.sc.tok) or p.sc.tok == scan.W_THIS:
+    next(&p)
+    ok = p.sc.tok == T_COLON or p.sc.tok == T_COMMA or (p.sc.tok == T_Q)
+  # modifiers before the name
+  elif p.sc.tok == scan.W_PUBLIC or p.sc.tok == scan.W_PRIVATE or p.sc.tok == scan.W_READONLY:
+    next(&p)
+    ok = is_ident(p.sc.tok)
+  restore(&p, s)
+  return ok
+
+# A property name: a name (keywords too), a string, a number, a computed [expr] or a #private name.
+fn property_name(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if k == T_STR: return string_lit(&p)
+  if k == T_NUM or k == T_BIGINT:
+    var kind = ast.N_NUM
+    if k == T_BIGINT: kind = ast.N_BIGINT
+    let id = n(&p, kind, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    return id
+  if k == T_LBRACK:
+    next(&p)
+    let id = n(&p, ast.N_COMPUTED, pos)
+    p.t.a[id] = assignment(&p)
+    expect(&p, T_RBRACK)
+    return fin(&p, id)
+  if k == T_PRIVATE:
+    let id = n(&p, ast.N_PRIVNAME, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    return id
+  let id = n(&p, ast.N_ID, pos)
+  if is_name(k):
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+  else:
+    err(&p, pos, 1003, "Identifier expected.")
+    p.t.s[id] = 0
+  return id
+
+fn interface_decl(var p: Parser, mods: Int, pos: Int) -> Int:
+  expect(&p, scan.W_INTERFACE)
+  let id = n(&p, ast.N_INTERFACE, pos)
+  p.t.d[id] = mods
+  p.t.s[id] = tok_name(&p)
+  if is_name(p.sc.tok): next(&p)
+  else: err(&p, p.sc.ts, 1003, "Identifier expected.")
+  if p.sc.tok == T_LT: p.t.a[id] = type_params(&p)
+  if eat(&p, scan.W_EXTENDS):
+    let hpos = p.sc.ts
+    var hs: [Int] = []
+    while true:
+      hs.push(heritage(&p, true))
+      if not eat(&p, T_COMMA): break
+    p.t.b[id] = lst(&p, hs, hpos)
+  p.t.c[id] = type_members(&p)
+  return fin(&p, id)
+
+fn type_members(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  expect(&p, T_LBRACE)
+  p.in_type += 1
+  var ms: [Int] = []
+  while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    let before = p.sc.ts
+    ms.push(member(&p, false))
+    if p.sc.ts == before:
+      err(&p, p.sc.ts, 1131, "Property or signature expected.")
+      next(&p)
+  p.in_type -= 1
+  expect(&p, T_RBRACE)
+  return lst(&p, ms, pos)
+
+fn type_alias(var p: Parser, mods: Int, pos: Int) -> Int:
+  expect(&p, scan.W_TYPE)
+  let id = n(&p, ast.N_TYPEALIAS, pos)
+  p.t.d[id] = mods
+  p.t.s[id] = tok_name(&p)
+  if is_name(p.sc.tok): next(&p)
+  if p.sc.tok == T_LT: p.t.a[id] = type_params(&p)
+  expect(&p, T_ASSIGN)
+  p.t.b[id] = type_(&p)
+  semi(&p)
+  return fin(&p, id)
+
+fn enum_decl(var p: Parser, mods: Int, pos: Int) -> Int:
+  expect(&p, scan.W_ENUM)
+  let id = n(&p, ast.N_ENUM, pos)
+  p.t.f[id] = mods
+  p.t.s[id] = tok_name(&p)
+  if is_name(p.sc.tok): next(&p)
+  let lpos = p.sc.ts
+  expect(&p, T_LBRACE)
+  var ms: [Int] = []
+  while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    let m = n(&p, ast.N_ENUMMEMBER, p.sc.ts)
+    p.t.a[m] = property_name(&p)
+    if eat(&p, T_ASSIGN): p.t.b[m] = assignment(&p)
+    ms.push(fin(&p, m))
+    if not eat(&p, T_COMMA): break
+  expect(&p, T_RBRACE)
+  p.t.a[id] = lst(&p, ms, lpos)
+  return fin(&p, id)
+
+fn module_decl(var p: Parser, mods: Int, pos: Int) -> Int:
+  let id = n(&p, ast.N_MODULE, pos)
+  var f = mods
+  if p.sc.tok == scan.W_GLOBAL:
+    f = f | ast.MOD_GLOBAL
+    let gid = n(&p, ast.N_ID, p.sc.ts)
+    p.t.s[gid] = name_id(&p, "global")
+    next(&p)
+    p.t.a[id] = gid
+  else:
+    if p.sc.tok == scan.W_NAMESPACE: f = f | ast.MOD_NAMESPACE
+    next(&p)
+    if p.sc.tok == T_STR: p.t.a[id] = string_lit(&p)
+    else: p.t.a[id] = entity_name(&p)
+  p.t.f[id] = f
+  if p.sc.tok == T_LBRACE:
+    let bpos = p.sc.ts
+    next(&p)
+    var stmts: [Int] = []
+    while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+      let before = p.sc.ts
+      stmts.push(statement(&p))
+      if p.sc.ts == before:
+        err(&p, p.sc.ts, 1128, "Declaration or statement expected.")
+        next(&p)
+    expect(&p, T_RBRACE)
+    p.t.b[id] = lst(&p, stmts, bpos)
+  else:
+    semi(&p)
+  return fin(&p, id)
+
+fn entity_name(var p: Parser) -> Int:
+  var e = ident_any(&p)
+  while p.sc.tok == T_DOT:
+    let pos = p.t.pos[e]
+    next(&p)
+    let q = n(&p, ast.N_QNAME, pos)
+    p.t.a[q] = e
+    p.t.s[q] = tok_name(&p)
+    if is_name(p.sc.tok): next(&p)
+    else: err(&p, p.sc.ts, 1003, "Identifier expected.")
+    e = fin(&p, q)
+  return e
+
+fn ident_any(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let id = n(&p, ast.N_ID, pos)
+  if is_name(p.sc.tok):
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+  else:
+    err(&p, pos, 1003, "Identifier expected.")
+    p.t.s[id] = 0
+  return id
+
+# ---- types
+
+fn return_type(var p: Parser) -> Int:
+  p.in_type += 1
+  let r = return_type_inner(&p)
+  p.in_type -= 1
+  return r
+
+fn return_type_inner(var p: Parser) -> Int:
+  # asserts x is T, asserts x, x is T
+  let pos = p.sc.ts
+  if p.sc.tok == scan.W_ASSERTS and next_is_ident_or_this(&p):
+    next(&p)
+    let id = n(&p, ast.N_TPRED, pos)
+    p.t.f[id] = 1
+    if p.sc.tok == scan.W_THIS: p.t.s[id] = -1
+    else: p.t.s[id] = tok_name(&p)
+    next(&p)
+    if eat(&p, scan.W_IS): p.t.a[id] = type_(&p)
+    return fin(&p, id)
+  if (is_ident(p.sc.tok) or p.sc.tok == scan.W_THIS) and next_is(&p, scan.W_IS):
+    let id = n(&p, ast.N_TPRED, pos)
+    if p.sc.tok == scan.W_THIS: p.t.s[id] = -1
+    else: p.t.s[id] = tok_name(&p)
+    next(&p)
+    next(&p)
+    p.t.a[id] = type_(&p)
+    return fin(&p, id)
+  return type_(&p)
+
+fn next_is_ident_or_this(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let ok = (is_ident(p.sc.tok) or p.sc.tok == scan.W_THIS) and not p.sc.nl
+  restore(&p, s)
+  return ok
+
+fn type_(var p: Parser) -> Int:
+  p.in_type += 1
+  let r = type_inner(&p)
+  p.in_type -= 1
+  return r
+
+fn type_inner(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  if starts_function_type(&p): return function_type(&p, 0)
+  if p.sc.tok == scan.W_NEW:
+    next(&p)
+    return function_type(&p, 1)
+  if p.sc.tok == scan.W_ABSTRACT and next_is(&p, scan.W_NEW):
+    next(&p)
+    next(&p)
+    return function_type(&p, 3)
+  let t = union_type(&p)
+  if not p.no_cond and p.sc.tok == scan.W_EXTENDS and not p.sc.nl:
+    next(&p)
+    let id = n(&p, ast.N_TCOND, pos)
+    p.t.a[id] = t
+    let was = p.no_cond
+    p.no_cond = true
+    p.t.b[id] = type_inner(&p)
+    p.no_cond = was
+    expect(&p, T_Q)
+    let was2 = p.no_cond
+    p.no_cond = false
+    p.t.c[id] = type_inner(&p)
+    expect(&p, T_COLON)
+    p.t.d[id] = type_inner(&p)
+    p.no_cond = was2
+    return fin(&p, id)
+  return t
+
+fn function_type(var p: Parser, kind: Int) -> Int:
+  let id = n(&p, ast.N_TFUNC, p.sc.ts)
+  p.t.f[id] = kind
+  let was = p.no_cond
+  p.no_cond = false
+  p.t.b[id] = signature(&p, T_ARROW)
+  p.no_cond = was
+  return fin(&p, id)
+
+# '<' or '(' that begins a function type: (a) =>, (a: T, (...a, (), ({, ([, (this...
+fn starts_function_type(var p: Parser) -> Bool:
+  if p.sc.tok == T_LT: return true
+  if p.sc.tok != T_LPAREN: return false
+  let s = save(p)
+  next(&p)
+  var ok = false
+  let k = p.sc.tok
+  if k == T_RPAREN or k == T_DOTS: ok = true
+  elif k == T_LBRACE or k == T_LBRACK:
+    # skip a pattern, then look for : , ? = ) =>
+    ok = skip_balanced(&p) and (p.sc.tok == T_COLON or p.sc.tok == T_COMMA or p.sc.tok == T_Q or p.sc.tok == T_ASSIGN or (p.sc.tok == T_RPAREN and after_paren_is_arrow(&p)))
+  elif is_ident(k) or k == scan.W_THIS:
+    next(&p)
+    let k2 = p.sc.tok
+    if k2 == T_COLON or k2 == T_COMMA or k2 == T_Q or k2 == T_ASSIGN: ok = true
+    elif k2 == T_RPAREN:
+      next(&p)
+      ok = p.sc.tok == T_ARROW
+  elif k == scan.W_PUBLIC or k == scan.W_PRIVATE or k == scan.W_PROTECTED or k == scan.W_READONLY: ok = true
+  restore(&p, s)
+  return ok
+
+fn after_paren_is_arrow(var p: Parser) -> Bool:
+  next(&p)
+  return p.sc.tok == T_ARROW
+
+# Skips from an opening bracket to just after its match (re-scanning template literals on the way).
+# False at the end of the file.
+fn skip_balanced(var p: Parser) -> Bool:
+  var stack: [Int] = []
+  while true:
+    let k = p.sc.tok
+    if k == T_EOF: return false
+    if k == T_LPAREN or k == T_LBRACK or k == T_LBRACE or k == T_THEAD:
+      stack.push(k)
+    elif k == T_RPAREN or k == T_RBRACK or k == T_RBRACE:
+      if stack.len == 0: return false
+      let top = stack.pop()
+      if top == T_THEAD:
+        if k != T_RBRACE: return false
+        scan.rescan_template(&p.sc)
+        # }...${ keeps the template open; }...` closes it
+        if p.sc.tok == T_TMID: stack.push(T_THEAD)
+      if stack.len == 0:
+        next(&p)
+        return true
+    next(&p)
+  return false
+
+fn union_type(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let lead = eat(&p, T_BAR)
+  var t = inter_type(&p)
+  if p.sc.tok != T_BAR:
+    if lead:
+      let id = n(&p, ast.N_TUNION, pos)
+      p.t.a[id] = lst(&p, [t], pos)
+      return fin(&p, id)
+    return t
+  var ts = [t]
+  while eat(&p, T_BAR): ts.push(inter_type(&p))
+  let id = n(&p, ast.N_TUNION, pos)
+  p.t.a[id] = lst(&p, ts, pos)
+  return fin(&p, id)
+
+fn inter_type(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let lead = eat(&p, T_AMP)
+  let t = operator_type(&p)
+  if p.sc.tok != T_AMP:
+    if lead:
+      let id = n(&p, ast.N_TINTER, pos)
+      p.t.a[id] = lst(&p, [t], pos)
+      return fin(&p, id)
+    return t
+  var ts = [t]
+  while eat(&p, T_AMP): ts.push(operator_type(&p))
+  let id = n(&p, ast.N_TINTER, pos)
+  p.t.a[id] = lst(&p, ts, pos)
+  return fin(&p, id)
+
+fn operator_type(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if k == scan.W_KEYOF or k == scan.W_UNIQUE or k == scan.W_READONLY:
+    next(&p)
+    let id = n(&p, ast.N_TOP, pos)
+    p.t.f[id] = k
+    p.t.a[id] = operator_type(&p)
+    return fin(&p, id)
+  if k == scan.W_INFER:
+    next(&p)
+    let id = n(&p, ast.N_TINFER, pos)
+    let tp = n(&p, ast.N_TPARAM, p.sc.ts)
+    p.t.s[tp] = tok_name(&p)
+    if is_name(p.sc.tok): next(&p)
+    # infer X extends C (only where it can't be a conditional type's extends)
+    if p.sc.tok == scan.W_EXTENDS:
+      let s = save(p)
+      let m = ast.mark(p.t)
+      next(&p)
+      let was = p.no_cond
+      p.no_cond = true
+      let c = type_inner(&p)
+      p.no_cond = was
+      if p.no_cond or p.sc.tok != T_Q: p.t.a[tp] = c
+      else:
+        ast.reset(&p.t, m)
+        restore(&p, s)
+    p.t.a[id] = fin(&p, tp)
+    return fin(&p, id)
+  return postfix_type(&p)
+
+fn postfix_type(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  var t = primary_type(&p)
+  while p.sc.tok == T_LBRACK and not p.sc.nl:
+    next(&p)
+    if eat(&p, T_RBRACK):
+      let id = n(&p, ast.N_TARRAY, pos)
+      p.t.a[id] = t
+      t = fin(&p, id)
+    else:
+      let id = n(&p, ast.N_TINDEXED, pos)
+      p.t.a[id] = t
+      p.t.b[id] = type_(&p)
+      expect(&p, T_RBRACK)
+      t = fin(&p, id)
+  return t
+
+fn kw_type(k: Int) -> Bool:
+  return k == scan.W_ANY or k == scan.W_UNKNOWN or k == scan.W_NUMBER or k == scan.W_STRING or k == scan.W_BOOLEAN or k == scan.W_BIGINT or k == scan.W_SYMBOL or k == scan.W_OBJECT or k == scan.W_NEVER or k == scan.W_UNDEFINED or k == scan.W_VOID or k == scan.W_NULL
+
+fn primary_type(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if kw_type(k) and not next_is(&p, T_DOT):
+    next(&p)
+    let id = n(&p, ast.N_TKW, pos)
+    p.t.f[id] = k
+    return id
+  if k == scan.W_THIS:
+    next(&p)
+    return n(&p, ast.N_TTHIS, pos)
+  if k == T_STR or k == T_NUM or k == T_BIGINT or k == scan.W_TRUE or k == scan.W_FALSE or k == T_NOSUB:
+    let id = n(&p, ast.N_TLIT, pos)
+    p.t.a[id] = primary(&p)
+    return fin(&p, id)
+  if k == T_MINUS:
+    next(&p)
+    let id = n(&p, ast.N_TLIT, pos)
+    let neg = n(&p, ast.N_PREFIX, pos)
+    p.t.f[neg] = T_MINUS
+    p.t.a[neg] = primary(&p)
+    p.t.a[id] = fin(&p, neg)
+    return fin(&p, id)
+  if k == T_THEAD: return template_type(&p)
+  if k == T_LPAREN:
+    next(&p)
+    let id = n(&p, ast.N_TPAREN, pos)
+    let was = p.no_cond
+    p.no_cond = false
+    p.t.a[id] = type_(&p)
+    p.no_cond = was
+    expect(&p, T_RPAREN)
+    return fin(&p, id)
+  if k == T_LBRACK:
+    next(&p)
+    let id = n(&p, ast.N_TTUPLE, pos)
+    let was = p.no_cond
+    p.no_cond = false
+    var els: [Int] = []
+    while p.sc.tok != T_RBRACK and p.sc.tok != T_EOF:
+      els.push(tuple_element(&p))
+      if not eat(&p, T_COMMA): break
+    p.no_cond = was
+    expect(&p, T_RBRACK)
+    p.t.a[id] = lst(&p, els, pos)
+    return fin(&p, id)
+  if k == T_LBRACE:
+    if is_mapped_type(&p): return mapped_type(&p)
+    let id = n(&p, ast.N_TOBJ, pos)
+    let was = p.no_cond
+    p.no_cond = false
+    p.t.a[id] = type_members(&p)
+    p.no_cond = was
+    return fin(&p, id)
+  if k == scan.W_TYPEOF:
+    next(&p)
+    if p.sc.tok == scan.W_IMPORT: return import_type(&p, true, pos)
+    let id = n(&p, ast.N_TQUERY, pos)
+    p.t.a[id] = typeof_name(&p)
+    if p.sc.tok == T_LT and not p.sc.nl: p.t.b[id] = type_args(&p)
+    return fin(&p, id)
+  if k == scan.W_IMPORT: return import_type(&p, false, pos)
+  if k == T_Q:
+    # JSDoc-style ?T: not TypeScript; report and go on
+    err(&p, pos, 1110, "Type expected.")
+    next(&p)
+    return primary_type(&p)
+  if is_name(k) and k != scan.W_FUNCTION:
+    let id = n(&p, ast.N_TREF, pos)
+    p.t.a[id] = entity_name(&p)
+    if (p.sc.tok == T_LT or p.sc.tok == scan.T_SHL) and not p.sc.nl: p.t.b[id] = type_args(&p)
+    return fin(&p, id)
+  err(&p, pos, 1110, "Type expected.")
+  let id = n(&p, ast.N_TKW, pos)
+  p.t.f[id] = scan.W_ANY
+  return id
+
+fn typeof_name(var p: Parser) -> Int:
+  var e = -1
+  if p.sc.tok == scan.W_THIS:
+    e = n(&p, ast.N_THIS, p.sc.ts)
+    next(&p)
+  else: e = ident_any(&p)
+  while p.sc.tok == T_DOT or p.sc.tok == T_LBRACK:
+    let pos = p.t.pos[e]
+    if p.sc.tok == T_LBRACK:
+      # typeof x["a"]: indexed access on the type of x
+      return e
+    next(&p)
+    let q = n(&p, ast.N_QNAME, pos)
+    p.t.a[q] = e
+    if p.sc.tok == T_PRIVATE or is_name(p.sc.tok):
+      p.t.s[q] = tok_name(&p)
+      next(&p)
+    else: err(&p, p.sc.ts, 1003, "Identifier expected.")
+    e = fin(&p, q)
+  return e
+
+fn import_type(var p: Parser, is_typeof: Bool, pos: Int) -> Int:
+  next(&p)
+  let id = n(&p, ast.N_TIMPORT, pos)
+  if is_typeof: p.t.f[id] = 1
+  expect(&p, T_LPAREN)
+  p.t.a[id] = string_lit(&p)
+  if eat(&p, T_COMMA): object_literal(&p)
+  expect(&p, T_RPAREN)
+  if eat(&p, T_DOT): p.t.b[id] = entity_name(&p)
+  if p.sc.tok == T_LT and not p.sc.nl: p.t.c[id] = type_args(&p)
+  return fin(&p, id)
+
+fn tuple_element(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  # named members: name: T, name?: T, ...name: T
+  var rest = false
+  let s = save(p)
+  if eat(&p, T_DOTS): rest = true
+  if is_name(p.sc.tok) and (next_is(&p, T_COLON) or (next_is(&p, T_Q) and q_then_colon(&p))):
+    let id = n(&p, ast.N_TTUPLEEL, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    var f = 0
+    if rest: f = ast.M_REST
+    if eat(&p, T_Q): f = f | ast.M_OPTIONAL
+    expect(&p, T_COLON)
+    p.t.f[id] = f
+    p.t.a[id] = type_(&p)
+    return fin(&p, id)
+  restore(&p, s)
+  if eat(&p, T_DOTS):
+    let id = n(&p, ast.N_TREST, pos)
+    p.t.a[id] = type_(&p)
+    return fin(&p, id)
+  let t = type_(&p)
+  if p.sc.tok == T_Q:
+    next(&p)
+    let id = n(&p, ast.N_TOPTIONAL, pos)
+    p.t.a[id] = t
+    return fin(&p, id)
+  return t
+
+fn q_then_colon(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  next(&p)
+  let ok = p.sc.tok == T_COLON
+  restore(&p, s)
+  return ok
+
+fn is_mapped_type(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  if p.sc.tok == T_PLUS or p.sc.tok == T_MINUS:
+    next(&p)
+    let ok = p.sc.tok == scan.W_READONLY
+    restore(&p, s)
+    return ok
+  if p.sc.tok == scan.W_READONLY: next(&p)
+  var ok = false
+  if p.sc.tok == T_LBRACK:
+    next(&p)
+    if is_name(p.sc.tok):
+      next(&p)
+      ok = p.sc.tok == scan.W_IN
+  restore(&p, s)
+  return ok
+
+fn mapped_type(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  expect(&p, T_LBRACE)
+  let id = n(&p, ast.N_TMAPPED, pos)
+  var f = 0
+  if p.sc.tok == T_PLUS or p.sc.tok == T_MINUS:
+    let minus = p.sc.tok == T_MINUS
+    next(&p)
+    expect(&p, scan.W_READONLY)
+    if minus: f = f | ast.MAP_NOREADONLY
+    else: f = f | ast.MAP_READONLY
+  elif eat(&p, scan.W_READONLY): f = f | ast.MAP_READONLY
+  expect(&p, T_LBRACK)
+  let tp = n(&p, ast.N_TPARAM, p.sc.ts)
+  p.t.s[tp] = tok_name(&p)
+  next(&p)
+  expect(&p, scan.W_IN)
+  p.t.a[tp] = type_(&p)
+  p.t.a[id] = fin(&p, tp)
+  if eat(&p, scan.W_AS): p.t.b[id] = type_(&p)
+  expect(&p, T_RBRACK)
+  if p.sc.tok == T_PLUS or p.sc.tok == T_MINUS:
+    let minus = p.sc.tok == T_MINUS
+    next(&p)
+    expect(&p, T_Q)
+    if minus: f = f | ast.MAP_NOOPTIONAL
+    else: f = f | ast.MAP_OPTIONAL
+  elif eat(&p, T_Q): f = f | ast.MAP_OPTIONAL
+  if eat(&p, T_COLON): p.t.c[id] = type_(&p)
+  eat(&p, T_SEMI)
+  eat(&p, T_COMMA)
+  expect(&p, T_RBRACE)
+  p.t.f[id] = f
+  return fin(&p, id)
+
+fn template_type(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let id = n(&p, ast.N_TTEMPLATE, pos)
+  p.t.s[id] = tok_name(&p)
+  next(&p)
+  var spans: [Int] = []
+  while true:
+    let sp = n(&p, ast.N_TSPAN, p.sc.ts)
+    p.t.a[sp] = type_(&p)
+    if p.sc.tok != T_RBRACE:
+      err(&p, p.sc.ts, 1005, "'}}' expected.")
+      spans.push(fin(&p, sp))
+      break
+    scan.rescan_template(&p.sc)
+    p.t.s[sp] = tok_name(&p)
+    let last = p.sc.tok == T_TTAIL
+    next(&p)
+    spans.push(fin(&p, sp))
+    if last: break
+  p.t.a[id] = lst(&p, spans, pos)
+  return fin(&p, id)
+
+fn type_args(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  scan.rescan_lt(&p.sc)
+  expect(&p, T_LT)
+  let was = p.no_cond
+  p.no_cond = false
+  p.in_type += 1
+  var ts: [Int] = []
+  while p.sc.tok != T_GT and p.sc.tok != T_EOF:
+    ts.push(type_(&p))
+    if not eat(&p, T_COMMA): break
+  p.in_type -= 1
+  p.no_cond = was
+  expect(&p, T_GT)
+  return lst(&p, ts, pos)
+
+# ---- expressions
+
+fn expression(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  var e = assignment(&p)
+  while p.sc.tok == T_COMMA:
+    next(&p)
+    let id = n(&p, ast.N_BINARY, pos)
+    p.t.f[id] = T_COMMA
+    p.t.a[id] = e
+    p.t.b[id] = assignment(&p)
+    e = fin(&p, id)
+  return e
+
+fn is_assign_op(k: Int) -> Bool:
+  return k == T_ASSIGN or (k >= scan.T_PLUSEQ and k <= scan.T_QQEQ)
+
+fn assignment(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  # arrow functions
+  if p.sc.tok == scan.W_YIELD and p.in_type == 0 and p.gen: return yield_expr(&p)
+  let arrow = try_arrow(&p)
+  if arrow >= 0: return arrow
+  let left = conditional(&p)
+  scan.rescan_gt_ops(&p.sc)
+  if is_assign_op(p.sc.tok):
+    let op = p.sc.tok
+    next(&p)
+    let id = n(&p, ast.N_BINARY, pos)
+    p.t.f[id] = op
+    p.t.a[id] = left
+    p.t.b[id] = assignment(&p)
+    return fin(&p, id)
+  return left
+
+fn yield_here(var p: Parser) -> Bool:
+  # 'yield' as an expression when what follows can start one (otherwise it's a name)
+  let s = save(p)
+  next(&p)
+  let k = p.sc.tok
+  let ok = not (k == T_ASSIGN or k == T_COLON or k == T_DOT or k == T_LPAREN or k == T_ARROW)
+  restore(&p, s)
+  return ok
+
+fn yield_expr(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  next(&p)
+  let id = n(&p, ast.N_YIELD, pos)
+  if eat(&p, T_STAR):
+    p.t.f[id] = 1
+    p.t.a[id] = assignment(&p)
+  elif not p.sc.nl and p.sc.tok != T_RPAREN and p.sc.tok != T_RBRACK and p.sc.tok != T_RBRACE and p.sc.tok != T_COMMA and p.sc.tok != T_SEMI and p.sc.tok != T_COLON and p.sc.tok != T_EOF:
+    p.t.a[id] = assignment(&p)
+  return fin(&p, id)
+
+# An arrow function here, or -1 (with nothing consumed).
+fn try_arrow(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let s0 = save(p)
+  let m0 = ast.mark(p.t)
+  var is_async = false
+  if p.sc.tok == scan.W_ASYNC and not next_is_newline(&p):
+    next(&p)
+    if (is_ident(p.sc.tok) and next_is_arrow_same_line(&p)) or p.sc.tok == T_LPAREN or p.sc.tok == T_LT: is_async = true
+    else:
+      restore(&p, s0)
+      return -1
+  let k = p.sc.tok
+  # x => ...
+  if is_ident(k) and next_is_arrow_same_line(&p):
+    let id = n(&p, ast.N_ARROW, pos)
+    if is_async: p.t.f[id] = ast.M_ASYNC
+    let pp = n(&p, ast.N_PARAM, p.sc.ts)
+    p.t.a[pp] = ident(&p)
+    let ppid = fin(&p, pp)
+    p.t.b[id] = lst(&p, [ppid], pos)
+    expect(&p, T_ARROW)
+    p.t.d[id] = arrow_body(&p)
+    return fin(&p, id)
+  if (k != T_LPAREN and k != T_LT) or (k == T_LPAREN and not paren_may_be_arrow(&p)):
+    ast.reset(&p.t, m0)
+    restore(&p, s0)
+    return -1
+  # (params) => or (params): T => or <T>(params) =>, parsed speculatively
+  let id = n(&p, ast.N_ARROW, pos)
+  if is_async: p.t.f[id] = ast.M_ASYNC
+  let nd = p.diags.len
+  if p.sc.tok == T_LT: p.t.a[id] = type_params(&p)
+  if p.sc.tok == T_LPAREN:
+    p.t.b[id] = params(&p)
+    if eat(&p, T_COLON): p.t.c[id] = return_type(&p)
+  if p.sc.tok != T_ARROW or p.diags.len > nd or p.t.b[id] < 0:
+    ast.reset(&p.t, m0)
+    restore(&p, s0)
+    return -1
+  next(&p)
+  p.t.d[id] = arrow_body(&p)
+  return fin(&p, id)
+
+fn next_is_newline(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let nl = p.sc.nl
+  restore(&p, s)
+  return nl
+
+fn next_is_arrow_same_line(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let ok = p.sc.tok == T_ARROW and not p.sc.nl
+  restore(&p, s)
+  return ok
+
+# Quick look past a parenthesized list: an arrow needs => or : after the ')'.
+fn paren_may_be_arrow(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  var ok = false
+  let k = p.sc.tok
+  if k == T_RPAREN:
+    next(&p)
+    ok = p.sc.tok == T_ARROW or p.sc.tok == T_COLON or p.sc.tok == T_LBRACE
+  elif k == T_DOTS: ok = true
+  else:
+    restore(&p, s)
+    if skip_balanced(&p):
+      ok = (p.sc.tok == T_ARROW and not p.sc.nl) or p.sc.tok == T_COLON
+  restore(&p, s)
+  return ok
+
+fn arrow_body(var p: Parser) -> Int:
+  if p.sc.tok == T_LBRACE: return body(&p, false)
+  let was = p.no_in
+  p.no_in = false
+  let e = assignment(&p)
+  p.no_in = was
+  return e
+
+fn conditional(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let c = binary(&p, 0)
+  if p.sc.tok != T_Q: return c
+  next(&p)
+  let id = n(&p, ast.N_COND, pos)
+  p.t.a[id] = c
+  let was = p.no_in
+  p.no_in = false
+  p.t.b[id] = assignment(&p)
+  p.no_in = was
+  expect(&p, T_COLON)
+  p.t.c[id] = assignment(&p)
+  return fin(&p, id)
+
+fn prec(var p: Parser, k: Int) -> Int:
+  if k == scan.T_QQ: return 1
+  if k == scan.T_OR: return 2
+  if k == scan.T_AND: return 3
+  if k == T_BAR: return 4
+  if k == scan.T_CARET: return 5
+  if k == T_AMP: return 6
+  if k == scan.T_EQ2 or k == scan.T_NE or k == scan.T_EQ3 or k == scan.T_NE2: return 7
+  if k == T_LT or k == T_GT or k == scan.T_LE or k == scan.T_GE or k == scan.W_INSTANCEOF: return 8
+  if k == scan.W_IN and not p.no_in: return 8
+  if (k == scan.W_AS or k == scan.W_SATISFIES) and not p.sc.nl: return 8
+  if k == scan.T_SHL or k == scan.T_SHR or k == scan.T_SHRU: return 9
+  if k == T_PLUS or k == T_MINUS: return 10
+  if k == T_STAR or k == T_SLASH or k == scan.T_PCT: return 11
+  if k == scan.T_STAR2: return 12
+  return 0
+
+fn binary(var p: Parser, min: Int) -> Int:
+  let pos = p.sc.ts
+  var left = unary(&p)
+  while true:
+    scan.rescan_gt_ops(&p.sc)
+    let k = p.sc.tok
+    let pr = prec(&p, k)
+    if pr == 0 or pr <= min: break
+    if k == scan.W_AS or k == scan.W_SATISFIES:
+      next(&p)
+      var kind = ast.N_AS
+      if k == scan.W_SATISFIES: kind = ast.N_SATISFIES
+      let id = n(&p, kind, pos)
+      p.t.a[id] = left
+      if kind == ast.N_AS and p.sc.tok == scan.W_CONST:
+        let c = n(&p, ast.N_TREF, p.sc.ts)
+        let cid = n(&p, ast.N_ID, p.sc.ts)
+        p.t.s[cid] = name_id(&p, "const")
+        p.t.a[c] = cid
+        next(&p)
+        p.t.b[id] = c
+      else:
+        p.t.b[id] = type_(&p)
+      left = fin(&p, id)
+      continue
+    next(&p)
+    let id = n(&p, ast.N_BINARY, pos)
+    p.t.f[id] = k
+    p.t.a[id] = left
+    if k == scan.T_STAR2: p.t.b[id] = binary(&p, pr - 1)
+    else: p.t.b[id] = binary(&p, pr)
+    left = fin(&p, id)
+  return left
+
+fn unary(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if k == T_PLUS or k == T_MINUS or k == scan.T_TILDE or k == T_BANG or k == scan.T_INC or k == scan.T_DEC:
+    next(&p)
+    let id = n(&p, ast.N_PREFIX, pos)
+    p.t.f[id] = k
+    p.t.a[id] = unary(&p)
+    return fin(&p, id)
+  if k == scan.W_TYPEOF or k == scan.W_VOID or k == scan.W_DELETE:
+    next(&p)
+    var kind = ast.N_TYPEOF
+    if k == scan.W_VOID: kind = ast.N_VOIDEXPR
+    elif k == scan.W_DELETE: kind = ast.N_DELETE
+    let id = n(&p, kind, pos)
+    p.t.a[id] = unary(&p)
+    return fin(&p, id)
+  if k == scan.W_AWAIT and await_here(&p):
+    next(&p)
+    let id = n(&p, ast.N_AWAIT, pos)
+    p.t.a[id] = unary(&p)
+    return fin(&p, id)
+  if k == T_LT:
+    # <T>expr (a type assertion; .ts files only)
+    next(&p)
+    let id = n(&p, ast.N_TYPEASSERT, pos)
+    p.t.b[id] = type_(&p)
+    expect(&p, T_GT)
+    p.t.a[id] = unary(&p)
+    return fin(&p, id)
+  let e = lhs(&p)
+  if (p.sc.tok == scan.T_INC or p.sc.tok == scan.T_DEC) and not p.sc.nl:
+    let id = n(&p, ast.N_POSTFIX, pos)
+    p.t.f[id] = p.sc.tok
+    p.t.a[id] = e
+    next(&p)
+    return fin(&p, id)
+  return e
+
+fn await_here(var p: Parser) -> Bool:
+  let s = save(p)
+  next(&p)
+  let k = p.sc.tok
+  let ok = not (k == T_SEMI or k == T_RPAREN or k == T_RBRACK or k == T_RBRACE or k == T_COMMA or k == T_COLON or k == T_ASSIGN or k == T_DOT or k == T_EOF or k == T_ARROW) or (k == T_LPAREN)
+  restore(&p, s)
+  return ok
+
+# A left-hand-side expression: primary, then member accesses, calls, and so on.
+fn lhs(var p: Parser) -> Int:
+  let e = lhs_no_call(&p)
+  return call_tail(&p, e)
+
+fn lhs_no_call(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  if p.sc.tok == scan.W_NEW:
+    next(&p)
+    if p.sc.tok == T_DOT:
+      next(&p)
+      let id = n(&p, ast.N_METAPROP, pos)
+      p.t.f[id] = scan.W_NEW
+      p.t.s[id] = tok_name(&p)
+      next(&p)
+      return member_tail(&p, id)
+    let id = n(&p, ast.N_NEW, pos)
+    p.t.a[id] = lhs_no_call(&p)
+    if p.sc.tok == T_LT:
+      let ta = try_type_args(&p)
+      if ta >= 0: p.t.b[id] = ta
+    if p.sc.tok == T_LPAREN: p.t.c[id] = call_args(&p)
+    let nid = fin(&p, id)
+    return member_tail(&p, nid)
+  let e = primary(&p)
+  return member_tail(&p, e)
+
+# .x [i] !  and template tags, without calls.
+fn member_tail(var p: Parser, e0: Int) -> Int:
+  var e = e0
+  let pos = p.t.pos[e0]
+  while true:
+    let k = p.sc.tok
+    if k == T_DOT:
+      next(&p)
+      let id = n(&p, ast.N_PROPACCESS, pos)
+      p.t.a[id] = e
+      if p.sc.tok == T_PRIVATE: p.t.f[id] = 4
+      if is_name(p.sc.tok) or p.sc.tok == T_PRIVATE:
+        p.t.s[id] = tok_name(&p)
+        next(&p)
+      else:
+        err(&p, p.sc.ts, 1003, "Identifier expected.")
+        p.t.s[id] = 0
+      e = fin(&p, id)
+    elif k == T_LBRACK:
+      next(&p)
+      let id = n(&p, ast.N_ELEMACCESS, pos)
+      p.t.a[id] = e
+      let was = p.no_in
+      p.no_in = false
+      p.t.b[id] = expression(&p)
+      p.no_in = was
+      expect(&p, T_RBRACK)
+      e = fin(&p, id)
+    elif k == T_BANG and not p.sc.nl:
+      next(&p)
+      let id = n(&p, ast.N_NONNULL, pos)
+      p.t.a[id] = e
+      e = fin(&p, id)
+    elif k == T_NOSUB or k == T_THEAD:
+      let id = n(&p, ast.N_TAGGED, pos)
+      p.t.a[id] = e
+      p.t.c[id] = primary(&p)
+      e = fin(&p, id)
+    else:
+      return e
+  return e
+
+fn call_tail(var p: Parser, e0: Int) -> Int:
+  var e = e0
+  let pos = p.t.pos[e0]
+  while true:
+    e = member_tail(&p, e)
+    let k = p.sc.tok
+    if k == T_LPAREN:
+      let id = n(&p, ast.N_CALL, pos)
+      p.t.a[id] = e
+      p.t.c[id] = call_args(&p)
+      e = fin(&p, id)
+    elif k == T_LT:
+      let ta = try_type_args(&p)
+      if ta < 0: return e
+      if p.sc.tok == T_LPAREN:
+        let id = n(&p, ast.N_CALL, pos)
+        p.t.a[id] = e
+        p.t.b[id] = ta
+        p.t.c[id] = call_args(&p)
+        e = fin(&p, id)
+      elif p.sc.tok == T_NOSUB or p.sc.tok == T_THEAD:
+        let id = n(&p, ast.N_TAGGED, pos)
+        p.t.a[id] = e
+        p.t.b[id] = ta
+        p.t.c[id] = primary(&p)
+        e = fin(&p, id)
+      else:
+        let id = n(&p, ast.N_EXPRTARGS, pos)
+        p.t.a[id] = e
+        p.t.b[id] = ta
+        e = fin(&p, id)
+    elif k == T_QDOT:
+      next(&p)
+      if p.sc.tok == T_LPAREN:
+        let id = n(&p, ast.N_CALL, pos)
+        p.t.a[id] = e
+        p.t.f[id] = 1
+        p.t.c[id] = call_args(&p)
+        e = fin(&p, id)
+      elif p.sc.tok == T_LBRACK:
+        next(&p)
+        let id = n(&p, ast.N_ELEMACCESS, pos)
+        p.t.a[id] = e
+        p.t.f[id] = 1
+        p.t.b[id] = expression(&p)
+        expect(&p, T_RBRACK)
+        e = fin(&p, id)
+      elif p.sc.tok == T_LT:
+        let ta = try_type_args(&p)
+        let id = n(&p, ast.N_CALL, pos)
+        p.t.a[id] = e
+        p.t.f[id] = 1
+        p.t.b[id] = ta
+        p.t.c[id] = call_args(&p)
+        e = fin(&p, id)
+      else:
+        let id = n(&p, ast.N_PROPACCESS, pos)
+        p.t.a[id] = e
+        p.t.f[id] = 1
+        if p.sc.tok == T_PRIVATE: p.t.f[id] = 5
+        p.t.s[id] = tok_name(&p)
+        if is_name(p.sc.tok) or p.sc.tok == T_PRIVATE: next(&p)
+        else: err(&p, p.sc.ts, 1003, "Identifier expected.")
+        e = fin(&p, id)
+    else:
+      return e
+  return e
+
+# Type arguments in an expression, kept only when what follows makes them type arguments.
+fn try_type_args(var p: Parser) -> Int:
+  let s = save(p)
+  let m = ast.mark(p.t)
+  let nd = p.diags.len
+  let ta = type_args(&p)
+  var ok = p.diags.len == nd
+  if ok:
+    let k = p.sc.tok
+    # what may follow type arguments (TypeScript's canFollowTypeArgumentsInExpression)
+    if k == T_LPAREN or k == T_NOSUB or k == T_THEAD: ok = true
+    elif k == T_LT or k == T_GT or k == T_PLUS or k == T_MINUS: ok = false
+    elif p.sc.nl: ok = true
+    else:
+      # a binary operator, or something that can't start an expression
+      ok = not starts_expression(k) or prec(&p, k) > 0
+  if not ok:
+    ast.reset(&p.t, m)
+    restore(&p, s)
+    return -1
+  return ta
+
+fn starts_expression(k: Int) -> Bool:
+  if is_ident(k): return true
+  return k == T_NUM or k == T_BIGINT or k == T_STR or k == T_NOSUB or k == T_THEAD or k == T_LPAREN or k == T_LBRACK or k == T_LBRACE or k == scan.W_FUNCTION or k == scan.W_CLASS or k == scan.W_NEW or k == T_SLASH or k == T_SLASHEQ or k == scan.W_THIS or k == scan.W_SUPER or k == scan.W_TRUE or k == scan.W_FALSE or k == scan.W_NULL or k == T_BANG or k == scan.T_TILDE or k == scan.W_TYPEOF or k == scan.W_VOID or k == scan.W_DELETE or k == scan.T_INC or k == scan.T_DEC or k == T_PRIVATE
+
+fn call_args(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  expect(&p, T_LPAREN)
+  var xs: [Int] = []
+  let was = p.no_in
+  p.no_in = false
+  while p.sc.tok != T_RPAREN and p.sc.tok != T_EOF:
+    if p.sc.tok == T_DOTS:
+      let sp = n(&p, ast.N_SPREAD, p.sc.ts)
+      next(&p)
+      p.t.a[sp] = assignment(&p)
+      xs.push(fin(&p, sp))
+    else:
+      xs.push(assignment(&p))
+    if not eat(&p, T_COMMA): break
+  p.no_in = was
+  expect(&p, T_RPAREN)
+  return lst(&p, xs, pos)
+
+fn primary(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let k = p.sc.tok
+  if k == T_NUM or k == T_BIGINT:
+    var kind = ast.N_NUM
+    if k == T_BIGINT: kind = ast.N_BIGINT
+    let id = n(&p, kind, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    return id
+  if k == T_STR:
+    let id = n(&p, ast.N_STR, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    return id
+  if k == T_NOSUB:
+    let id = n(&p, ast.N_NOSUBTEMPL, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    return id
+  if k == T_THEAD: return template_expr(&p)
+  if k == scan.W_TRUE or k == scan.W_FALSE or k == scan.W_NULL or k == scan.W_THIS or k == scan.W_SUPER:
+    next(&p)
+    var kind = ast.N_TRUE
+    if k == scan.W_FALSE: kind = ast.N_FALSE
+    elif k == scan.W_NULL: kind = ast.N_NULL
+    elif k == scan.W_THIS: kind = ast.N_THIS
+    elif k == scan.W_SUPER: kind = ast.N_SUPER
+    return n(&p, kind, pos)
+  if k == T_LPAREN:
+    next(&p)
+    let id = n(&p, ast.N_PAREN, pos)
+    let was = p.no_in
+    p.no_in = false
+    p.t.a[id] = expression(&p)
+    p.no_in = was
+    expect(&p, T_RPAREN)
+    return fin(&p, id)
+  if k == T_LBRACK:
+    next(&p)
+    let id = n(&p, ast.N_ARRAY, pos)
+    var xs: [Int] = []
+    let was = p.no_in
+    p.no_in = false
+    while p.sc.tok != T_RBRACK and p.sc.tok != T_EOF:
+      if p.sc.tok == T_COMMA:
+        xs.push(n(&p, ast.N_OMIT, p.sc.ts))
+        next(&p)
+        continue
+      if p.sc.tok == T_DOTS:
+        let sp = n(&p, ast.N_SPREAD, p.sc.ts)
+        next(&p)
+        p.t.a[sp] = assignment(&p)
+        xs.push(fin(&p, sp))
+      else: xs.push(assignment(&p))
+      if not eat(&p, T_COMMA): break
+    p.no_in = was
+    expect(&p, T_RBRACK)
+    p.t.a[id] = lst(&p, xs, pos)
+    return fin(&p, id)
+  if k == T_LBRACE: return object_literal(&p)
+  if k == scan.W_FUNCTION:
+    next(&p)
+    let id = n(&p, ast.N_FUNCEXPR, pos)
+    if eat(&p, T_STAR): p.t.f[id] = ast.M_GENERATOR
+    if is_ident(p.sc.tok):
+      p.t.s[id] = tok_name(&p)
+      next(&p)
+    signature_into(&p, id, T_COLON)
+    p.t.d[id] = body(&p, (p.t.f[id] & ast.M_GENERATOR) != 0)
+    return fin(&p, id)
+  if k == scan.W_ASYNC and next_is(&p, scan.W_FUNCTION):
+    next(&p)
+    let id = primary(&p)
+    p.t.f[id] = p.t.f[id] | ast.M_ASYNC
+    p.t.pos[id] = pos
+    return id
+  if k == scan.W_CLASS: return class_decl(&p, 0, pos, true)
+  if k == T_SLASH or k == T_SLASHEQ:
+    scan.rescan_regex(&p.sc)
+    let id = n(&p, ast.N_REGEX, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    return id
+  if k == scan.W_IMPORT:
+    next(&p)
+    if p.sc.tok == T_DOT:
+      next(&p)
+      let id = n(&p, ast.N_METAPROP, pos)
+      p.t.f[id] = scan.W_IMPORT
+      p.t.s[id] = tok_name(&p)
+      next(&p)
+      return id
+    let id = n(&p, ast.N_IMPORTCALL, pos)
+    p.t.c[id] = call_args(&p)
+    return fin(&p, id)
+  if k == T_PRIVATE:
+    # #x in obj
+    let id = n(&p, ast.N_PRIVNAME, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    return id
+  if is_ident(k):
+    let id = n(&p, ast.N_ID, pos)
+    p.t.s[id] = tok_name(&p)
+    next(&p)
+    return id
+  err(&p, pos, 1109, "Expression expected.")
+  let id = n(&p, ast.N_ID, pos)
+  p.t.s[id] = 0
+  if k != T_EOF and k != T_RBRACE and k != T_SEMI and k != T_RPAREN and k != T_RBRACK and k != T_COMMA: next(&p)
+  return id
+
+fn template_expr(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  let id = n(&p, ast.N_TEMPL, pos)
+  p.t.s[id] = tok_name(&p)
+  next(&p)
+  var spans: [Int] = []
+  let was = p.no_in
+  p.no_in = false
+  while true:
+    let sp = n(&p, ast.N_TSPAN, p.sc.ts)
+    p.t.a[sp] = expression(&p)
+    if p.sc.tok != T_RBRACE:
+      err(&p, p.sc.ts, 1005, "'}}' expected.")
+      spans.push(fin(&p, sp))
+      break
+    scan.rescan_template(&p.sc)
+    p.t.s[sp] = tok_name(&p)
+    let last = p.sc.tok == T_TTAIL
+    next(&p)
+    spans.push(fin(&p, sp))
+    if last: break
+  p.no_in = was
+  p.t.a[id] = lst(&p, spans, pos)
+  return fin(&p, id)
+
+fn object_literal(var p: Parser) -> Int:
+  let pos = p.sc.ts
+  expect(&p, T_LBRACE)
+  let id = n(&p, ast.N_OBJECT, pos)
+  var props: [Int] = []
+  let was = p.no_in
+  p.no_in = false
+  while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
+    let ppos = p.sc.ts
+    if p.sc.tok == T_DOTS:
+      next(&p)
+      let sp = n(&p, ast.N_SPREAD, ppos)
+      p.t.a[sp] = assignment(&p)
+      props.push(fin(&p, sp))
+    elif (p.sc.tok == scan.W_GET or p.sc.tok == scan.W_SET) and accessor_follows(&p):
+      var kind = ast.N_GET
+      if p.sc.tok == scan.W_SET: kind = ast.N_SET
+      next(&p)
+      let g = n(&p, kind, ppos)
+      p.t.a[g] = property_name(&p)
+      p.t.b[g] = signature(&p, T_COLON)
+      p.t.c[g] = body(&p, false)
+      props.push(fin(&p, g))
+    else:
+      var f = 0
+      if p.sc.tok == scan.W_ASYNC and accessor_follows(&p) and not next_is(&p, T_LPAREN):
+        next(&p)
+        f = ast.M_ASYNC
+      if eat(&p, T_STAR): f = f | ast.M_GENERATOR
+      let name_tok = p.sc.tok
+      let name = property_name(&p)
+      if p.sc.tok == T_LPAREN or p.sc.tok == T_LT:
+        let m = n(&p, ast.N_METHOD, ppos)
+        p.t.f[m] = f
+        p.t.a[m] = name
+        p.t.b[m] = signature(&p, T_COLON)
+        p.t.c[m] = body(&p, (f & ast.M_GENERATOR) != 0)
+        props.push(fin(&p, m))
+      elif eat(&p, T_COLON):
+        let pa = n(&p, ast.N_PROPASSIGN, ppos)
+        p.t.a[pa] = name
+        p.t.b[pa] = assignment(&p)
+        props.push(fin(&p, pa))
+      else:
+        # shorthand: x, or x = default (only valid when the object is a pattern)
+        let sh = n(&p, ast.N_SHORTHAND, ppos)
+        p.t.s[sh] = p.t.s[name]
+        if not is_ident(name_tok) and name_tok != T_IDENT: err(&p, p.sc.ts, 1005, "':' expected.")
+        if eat(&p, T_ASSIGN): p.t.b[sh] = assignment(&p)
+        props.push(fin(&p, sh))
+    if not eat(&p, T_COMMA): break
+  p.no_in = was
+  expect(&p, T_RBRACE)
+  p.t.a[id] = lst(&p, props, pos)
+  return fin(&p, id)
