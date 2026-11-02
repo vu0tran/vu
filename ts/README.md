@@ -96,7 +96,7 @@ the rules (`rules.vu`) and, for `--fix`, a printer of expressions as oxc prints 
 (`fixgen.vu`): about 7,700 lines of Vu.
 
 ```
-cd ts && ../vu build --release vlint.vu -o vlint
+cd ts && VU_SPLIT=off ../vu build --release vlint.vu -o vlint   # one C file: the fastest binary
 ./vlint [--jobs N] [--cache] [--cache-location PATH] src/   # files, or folders searched for the extensions above
 ./vlint --fix src/             # rewrites the files as `oxlint --fix` does (see below)
 ```
