@@ -100,6 +100,7 @@ type Raw:
   lines: [Int]      # line starts (bytes)
   wide: Bool        # has non-ASCII bytes (columns count UTF-16 units)
   src: Str          # kept only when wide (for columns)
+  globs: [Str]      # import globs (plugin visitors): kind \t cwd \t base \t filter \t patterns joined by \n
 
 type St:
   src: Str
@@ -147,11 +148,13 @@ type St:
   user_tags: [Str]          # --tags: tag names whose presence gets bits 256, 512...
   mref_id: [Int]            # (name id, member id) pairs: x.y where x isn't an import
   fix_next: [Int]           # the fix of the next export added
+  vis: {Str: Bool}          # the plugins whose visitors run (registerVisitors)
+  globs: [Str]
 
 fn new_st(own src: Str, path: Str) -> St:
   let is_js = path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")
   let is_dts = path.endswith(".d.ts") or path.endswith(".d.cts") or path.endswith(".d.mts")
-  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [], {}, {}, false, false, [], false, [], [], [])
+  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [], {}, {}, false, false, [], false, [], [], [], {}, [])
 
 fn nm(t: Ast, n: Int) -> Str:
   let s = t.nd[n].s
@@ -2242,7 +2245,9 @@ fn analyze_t(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags:
   ast.reserve_nodes(&t, src.len / 6 + 16)
   let jsx = not (path.endswith(".ts") or path.endswith(".mts") or path.endswith(".cts"))
   var s = new_st(src, path)
-  for u in user_tags: s.user_tags.push(u + "")
+  for u in user_tags:
+    if u.startswith("\0"): s.vis[u[1..u.len]] = true
+    else: s.user_tags.push(u + "")
   let pd = parse.parse_file_v(&t, &s.src, 1, &kw, true, jsx)
   let lines = line_starts(s.src)
   let wide = has_wide(s.src)
@@ -2250,13 +2255,14 @@ fn analyze_t(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags:
     # knip parses with oxc, which recovers; a file this parser rejects is read as having nothing
     var keep = ""
     if wide: swap(&keep, &s.src)
-    return Raw(path + "", false, [], [], [], [], [], 0, lines, wide, keep)
+    return Raw(path + "", false, [], [], [], [], [], 0, lines, wide, keep, [])
   let root = t.nd.len - 1
   build_tags(&s)
   s.module_file = has_module_syntax(t, root, s.src)
   s.n_static_exports = count_exports(t, root)
   static_imports(&s, t, root)
   static_reexports(&s, t, root)
+  if s.vis.len > 0: plugin_visitors(&s, t, root)
   walk_list(&s, t, root)
   run_pending(&s, t)
   # members referenced in the file
@@ -2317,7 +2323,9 @@ fn analyze_t(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags:
   swap(&dups, &s.dups)
   var scs: [Str] = []
   swap(&scs, &s.scripts)
-  return Raw(path + "", true, scs, imps, ops, exps, dups, s.n_static_exports, lines, wide, keep)
+  var gl: [Str] = []
+  swap(&gl, &s.globs)
+  return Raw(path + "", true, scs, imps, ops, exps, dups, s.n_static_exports, lines, wide, keep, gl)
 
 # line, column (1-based, in UTF-16 units) and offset (UTF-16) of byte offset pos
 fn loc(r: Raw, pos: Int) -> [Int]:
@@ -2399,3 +2407,308 @@ fn import_type_specs(path: Str, own src: Str) -> [Str]:
     let x = str_of_node(t, t.nd[n].a)
     if x != "\0": out.push(x)
   return out
+
+
+# ---- the plugins' visitors (registerVisitors): mocks, script runners, import globs, loaders
+
+fn imported_as(t: Ast, root: Int, mods: [Str], name: Str, default_too: Bool) -> [Str]:
+  var out: [Str] = []
+  for st in ast.items(t, root):
+    if t.nd[st].k != ast.N_IMPORT: continue
+    let a = t.nd[st].a
+    if not is_str(t, a): continue
+    var hit = false
+    for m in mods:
+      if str_val(t, a) == m: hit = true
+    if not hit: continue
+    if default_too and is_id(t, t.nd[st].b): out.push(nm(t, t.nd[st].b))
+    for sp in ast.items(t, t.nd[st].d):
+      var imported = nm(t, sp)
+      let pn = t.nd[sp].b
+      if pn >= 0: imported = nm(t, pn)
+      if imported == name: out.push(nm(t, sp))
+  return out
+
+fn has_name(xs: [Str], s: Str) -> Bool:
+  for x in xs:
+    if x == s: return true
+  return false
+
+# const x = require("m") / const { name: y } = require("m"): [whole names, names of `name`]
+fn required_as(t: Ast, mods: [Str], name: Str) -> [[Str]]:
+  var whole: [Str] = []
+  var named: [Str] = []
+  for n in 0..t.nd.len:
+    if t.nd[n].k != ast.N_DECL: continue
+    let init = t.nd[n].c
+    if kind(t, init) != ast.N_CALL: continue
+    let callee = t.nd[init].a
+    if not (is_id(t, callee) and nm(t, callee) == "require") or ast.count(t, t.nd[init].c) < 1: continue
+    let a0 = ast.item(t, t.nd[init].c, 0)
+    if not is_str(t, a0) or not has_name(mods, str_val(t, a0)): continue
+    let id = t.nd[n].a
+    if is_id(t, id): whole.push(nm(t, id))
+    elif kind(t, id) == ast.N_OBJPAT:
+      for e in ast.items(t, t.nd[id].a):
+        if t.nd[e].k != ast.N_BINDEL: continue
+        let key = t.nd[e].a
+        var kname = ""
+        if key >= 0: kname = nm(t, key)
+        elif is_id(t, t.nd[e].b): kname = nm(t, t.nd[e].b)
+        if kname == name and is_id(t, t.nd[e].b): named.push(nm(t, t.nd[e].b))
+  return [whole, named]
+
+fn call_arg(t: Ast, n: Int, i: Int) -> Int:
+  if ast.count(t, t.nd[n].c) <= i: return -1
+  return ast.item(t, t.nd[n].c, i)
+
+fn member_of(t: Ast, callee: Int, objs: [Str], prop: Str) -> Bool:
+  if kind(t, callee) != ast.N_PROPACCESS or (t.nd[callee].f & 4) != 0: return false
+  let o = t.nd[callee].a
+  if not is_id(t, o) or not has_name(objs, nm(t, o)): return false
+  return prop == "" or nm(t, callee) == prop
+
+fn obj_prop(t: Ast, obj: Int, key: Str) -> Int:
+  if kind(t, obj) != ast.N_OBJECT: return -1
+  for p in ast.items(t, t.nd[obj].a):
+    if t.nd[p].k == ast.N_PROPASSIGN:
+      let k = t.nd[p].a
+      if (is_id(t, k) and nm(t, k) == key) or (is_str(t, k) and str_val(t, k) == key): return t.nd[p].b
+  return -1
+
+fn add_glob(var s: St, kind_: Str, cwd: Str, base: Str, filter: Str, pats: [Str]):
+  s.globs.push(kind_ + "\t" + cwd + "\t" + base + "\t" + filter + "\t" + "\n".join(pats))
+
+fn plugin_visitors(var s: St, t: Ast, root: Int):
+  # (each visitor only where the file mentions what it looks for)
+  var vi: [Str] = []
+  if "vitest" in s.vis and s.src.find("vitest") >= 0: vi = imported_as(t, root, ["vitest"], "vi", false)
+  var jest: [Str] = ["jest"]
+  if "jest" in s.vis and s.src.find("@jest/globals") >= 0:
+    for x in imported_as(t, root, ["@jest/globals"], "jest", false): jest.push(x)
+  var rs: [Str] = []
+  if "rstest" in s.vis and s.src.find("@rstest/core") >= 0:
+    rs = imported_as(t, root, ["@rstest/core"], "rs", false)
+    for x in imported_as(t, root, ["@rstest/core"], "rstest", false): rs.push(x)
+  var fsg: [Str] = []
+  var fsns: [Str] = []
+  if "node" in s.vis and s.src.find("fs/promises") >= 0:
+    fsg = imported_as(t, root, ["node:fs/promises", "fs/promises"], "glob", false)
+    for st in ast.items(t, root):
+      if t.nd[st].k == ast.N_IMPORT and is_str(t, t.nd[st].a):
+        let m = str_val(t, t.nd[st].a)
+        if (m == "node:fs/promises" or m == "fs/promises") and t.nd[st].c >= 0: fsns.push(nm(t, t.nd[st].c))
+    let fr = required_as(t, ["node:fs/promises", "fs/promises"], "glob")
+    for x in fr[0]: fsns.push(x)
+    for x in fr[1]: fsg.push(x)
+  var pino_default: [Str] = []
+  var pino_tr: [Str] = []
+  if "pino" in s.vis and s.src.find("pino") >= 0:
+    pino_default = imported_as(t, root, ["pino"], "", true)
+    pino_tr = imported_as(t, root, ["pino"], "transport", false)
+    if pino_default.len == 0:
+      let pr = required_as(t, ["pino"], "")
+      for x in pr[0]: pino_default.push(x)
+  var knex_d: [Str] = []
+  var knex_n: [Str] = []
+  if "knex" in s.vis and s.src.find("knex") >= 0:
+    knex_d = imported_as(t, root, ["knex"], "", true)
+    knex_n = imported_as(t, root, ["knex"], "knex", false)
+    let kr = required_as(t, ["knex"], "knex")
+    for x in kr[0]: knex_d.push(x)
+    for x in kr[1]: knex_n.push(x)
+  var any_call = vi.len > 0 or rs.len > 0 or fsg.len > 0 or fsns.len > 0 or pino_default.len > 0 or pino_tr.len > 0 or knex_d.len > 0 or knex_n.len > 0
+  if "jest" in s.vis and s.src.find("jest") >= 0: any_call = true
+  if "execa" in s.vis and s.src.find("execa") >= 0: any_call = true
+  if "zx" in s.vis and s.src.startswith("#!/usr/bin/env zx"): any_call = true
+  if "nano-spawn" in s.vis and s.src.find("spawn") >= 0: any_call = true
+  if "vite" in s.vis and s.src.find("import.meta.glob") >= 0: any_call = true
+  if ("webpack" in s.vis or "rspack" in s.vis) and s.src.find("require.context") >= 0: any_call = true
+  if not any_call: return
+  let zx_file = s.src.startswith("#!/usr/bin/env zx")
+  var mock_lookups: [Int] = []
+  var virtual: [Str] = []
+  var virtual_esm: [Str] = []
+  for n in 0..t.nd.len:
+    let k = t.nd[n].k
+    if k == ast.N_TAGGED:
+      let tag = t.nd[n].a
+      var tname = ""
+      if is_id(t, tag): tname = nm(t, tag)
+      elif kind(t, tag) == ast.N_CALL and is_id(t, t.nd[tag].a): tname = nm(t, t.nd[tag].a)
+      let tpl = t.nd[n].c
+      if "execa" in s.vis and (tname == "$" or tname == "$sync" or tname == "execaNode"):
+        let sc = script_from_arg(t, tpl)
+        if sc != "":
+          if tname == "execaNode": s.scripts.push("node " + sc)
+          else: s.scripts.push(sc)
+      if "zx" in s.vis and zx_file and is_id(t, tag) and tname == "$":
+        let sc = script_from_arg(t, tpl)
+        if sc != "": s.scripts.push(sc)
+      continue
+    if k != ast.N_CALL: continue
+    let callee = t.nd[n].a
+    let a0 = call_arg(t, n, 0)
+    # vi.mock(import("x"), () => ({ ... })) (rs.mock / rs.doMock for rstest)
+    var mocked = false
+    if kind(t, a0) == ast.N_IMPORTCALL:
+      if "vitest" in s.vis and vi.len > 0 and member_of(t, callee, vi, "mock"): mocked = true
+      if "rstest" in s.vis and rs.len > 0 and (member_of(t, callee, rs, "mock") or member_of(t, callee, rs, "doMock")): mocked = true
+    if mocked:
+      let srcn = first_str_arg(t, a0)
+      let fac = call_arg(t, n, 1)
+      if srcn >= 0 and kind(t, fac) == ast.N_ARROW and (t.nd[fac].f & ast.M_ASYNC) == 0 and ast.count(t, t.nd[fac].b) == 0:
+        let body = t.nd[fac].d
+        if kind(t, body) == ast.N_PAREN and kind(t, t.nd[body].a) == ast.N_OBJECT:
+          var spread = false
+          for pp in ast.items(t, t.nd[t.nd[body].a].a):
+            if t.nd[pp].k == ast.N_SPREAD: spread = true
+          if not spread:
+            s.handled_ix[a0] = true
+            add_imp(&s, str_val(t, srcn), "", "", "", t.nd[srcn].pos, F_SIDEEFFECTS, -1)
+            continue
+    # jest.mock("x") and the other module methods (rs.mock for rstest)
+    if "jest" in s.vis and is_str(t, a0) and member_of(t, callee, jest, ""):
+      let m = nm(t, callee)
+      let spec = str_val(t, a0)
+      if " mock doMock requireActual requireMock createMockFromModule unmock dontMock deepUnmock setMock unstable_mockModule unstable_unmockModule ".find(" " + m + " ") >= 0:
+        let o = call_arg(t, n, 2)
+        if (m == "mock" or m == "doMock" or m == "unstable_mockModule") and kind(t, o) == ast.N_OBJECT:
+          let vv = obj_prop(t, o, "virtual")
+          if kind(t, vv) == ast.N_TRUE:
+            if m == "unstable_mockModule": virtual_esm.push(spec)
+            else: virtual.push(spec)
+            continue
+        if m == "requireActual": add_imp(&s, spec, "", "", "", t.nd[a0].pos, F_OPAQUE, -1)
+        elif m == "createMockFromModule": add_imp(&s, spec, "", "", "", t.nd[a0].pos, F_SIDEEFFECTS, -1)
+        else: mock_lookups.push(n)
+        continue
+    if "execa" in s.vis and is_id(t, callee):
+      let fname = nm(t, callee)
+      if " execa execaSync execaCommand execaCommandSync execaNode $sync ".find(" " + fname + " ") >= 0:
+        if fname.startswith("execaCommand"):
+          let sc = script_from_arg(t, a0)
+          if sc != "": s.scripts.push(sc)
+        else:
+          let sc = safe_script(t, a0, call_arg(t, n, 1))
+          if sc != "":
+            if fname == "execaNode": s.scripts.push("node " + sc)
+            else: s.scripts.push(sc)
+        continue
+    if "nano-spawn" in s.vis and is_id(t, callee) and nm(t, callee) == "spawn":
+      let sc = safe_script(t, a0, call_arg(t, n, 1))
+      if sc != "": s.scripts.push(sc)
+      continue
+    # import.meta.glob(...)
+    if "vite" in s.vis and kind(t, callee) == ast.N_PROPACCESS and kind(t, t.nd[callee].a) == ast.N_METAPROP and nm(t, callee) == "glob" and a0 >= 0:
+      var pats: [Str] = []
+      if is_str(t, a0): pats.push(str_val(t, a0))
+      elif kind(t, a0) == ast.N_ARRAY:
+        for e in ast.items(t, t.nd[a0].a):
+          if is_str(t, e): pats.push(str_val(t, e))
+      if pats.len == 0: continue
+      var raw = false
+      let o = call_arg(t, n, 1)
+      if kind(t, o) == ast.N_OBJECT:
+        let qn = obj_prop(t, o, "query")
+        var q = "\0"
+        if is_str(t, qn): q = str_val(t, qn)
+        let asn = obj_prop(t, o, "as")
+        if is_str(t, asn) and str_val(t, asn) == "raw": raw = true
+        if q != "\0":
+          var qq = q + ""
+          if not qq.startswith("?"): qq = "?" + qq
+          if qq.find("?raw") >= 0 or qq.find("&raw") >= 0:
+            let after = qq.find("raw") + 3
+            if after >= qq.len or qq[after] == '&': raw = true
+        let rn = obj_prop(t, qn, "raw")
+        if is_str(t, rn) and str_val(t, rn) == "": raw = true
+      if raw: add_glob(&s, "analyze", "", "", "", pats)
+      else: add_glob(&s, "entry", "", "", "", pats)
+      continue
+    # require.context(dir, recursive, /re/)
+    if ("webpack" in s.vis or "rspack" in s.vis) and member_of(t, callee, ["require"], "context") and is_str(t, a0):
+      let a1 = call_arg(t, n, 1)
+      let rec = not (kind(t, a1) == ast.N_FALSE)
+      let a2 = call_arg(t, n, 2)
+      var filter = ""
+      if kind(t, a2) == ast.N_REGEX: filter = nm(t, a2)
+      var pat = "**/*"
+      if not rec: pat = "*"
+      add_glob(&s, "entry", "", str_val(t, a0), filter, [pat])
+      continue
+    # fs/promises glob
+    if "node" in s.vis and (fsg.len > 0 or fsns.len > 0) and ((is_id(t, callee) and has_name(fsg, nm(t, callee))) or member_of(t, callee, fsns, "glob")) and a0 >= 0:
+      var pats: [Str] = []
+      var ok = true
+      if is_str(t, a0): pats.push(str_val(t, a0))
+      elif kind(t, a0) == ast.N_ARRAY:
+        for e in ast.items(t, t.nd[a0].a):
+          if is_str(t, e): pats.push(str_val(t, e))
+          else: ok = false
+      for x in pats:
+        if x.startswith("!"): ok = false
+      let o = call_arg(t, n, 1)
+      var cwd = "."
+      if o >= 0:
+        if kind(t, o) != ast.N_OBJECT: ok = false
+        else:
+          let ps = ast.items(t, t.nd[o].a)
+          if ps.len > 1: ok = false
+          for pp in ps:
+            if t.nd[pp].k != ast.N_PROPASSIGN or not ((is_id(t, t.nd[pp].a) and nm(t, t.nd[pp].a) == "cwd") or (is_str(t, t.nd[pp].a) and str_val(t, t.nd[pp].a) == "cwd")): ok = false
+          let cn = obj_prop(t, o, "cwd")
+          if cn >= 0:
+            if is_str(t, cn): cwd = str_val(t, cn)
+            else: ok = false
+      if ok and pats.len > 0: add_glob(&s, "entry", cwd, "", "", pats)
+      continue
+    # pino transports
+    if "pino" in s.vis and (pino_default.len > 0 or pino_tr.len > 0) and kind(t, a0) == ast.N_OBJECT:
+      if member_of(t, callee, pino_default, "transport") or (is_id(t, callee) and has_name(pino_tr, nm(t, callee))):
+        pino_targets(&s, t, a0)
+        continue
+      if is_id(t, callee) and has_name(pino_default, nm(t, callee)):
+        let tr = obj_prop(t, a0, "transport")
+        if kind(t, tr) == ast.N_OBJECT: pino_targets(&s, t, tr)
+        continue
+    # knex({ client })
+    if "knex" in s.vis and (knex_d.len > 0 or knex_n.len > 0) and kind(t, a0) == ast.N_OBJECT:
+      if (is_id(t, callee) and (has_name(knex_d, nm(t, callee)) or has_name(knex_n, nm(t, callee)))) or member_of(t, callee, knex_d, "knex"):
+        let c = obj_prop(t, a0, "client")
+        if is_str(t, c):
+          for pk in knex_packages(str_val(t, c)): add_imp(&s, pk, "", "", "", t.nd[a0].pos, 0, -1)
+  for n in mock_lookups:
+    let callee = t.nd[n].a
+    let m = nm(t, callee)
+    let a0 = call_arg(t, n, 0)
+    let spec = str_val(t, a0)
+    let esm = m == "unstable_mockModule" or m == "unstable_unmockModule"
+    if esm and has_name(virtual_esm, spec): continue
+    if not esm and has_name(virtual, spec): continue
+    add_imp(&s, spec, "", "", "", t.nd[a0].pos, F_SIDEEFFECTS, -1)
+
+fn pino_targets(var s: St, t: Ast, obj: Int):
+  for p in ast.items(t, t.nd[obj].a):
+    if t.nd[p].k != ast.N_PROPASSIGN or not is_id(t, t.nd[p].a): continue
+    let key = nm(t, t.nd[p].a)
+    let v = t.nd[p].b
+    if key == "target" and is_str(t, v):
+      let spec = str_val(t, v)
+      var fl = 0
+      if spec.startswith(".") or spec.startswith("/"): fl = F_ENTRY
+      add_imp(&s, spec, "", "", "", t.nd[v].pos, fl, -1)
+    elif (key == "targets" or key == "pipeline") and kind(t, v) == ast.N_ARRAY:
+      for e in ast.items(t, t.nd[v].a):
+        if kind(t, e) == ast.N_OBJECT: pino_targets(&s, t, e)
+
+fn knex_packages(client: Str) -> [Str]:
+  let c = client.lower()
+  if c == "pg" or c == "postgres" or c == "postgresql" or c == "cockroachdb" or c == "redshift": return ["pg"]
+  if c == "mysql": return ["mysql", "mysql2"]
+  if c == "mysql2": return ["mysql2"]
+  if c == "sqlite3": return ["sqlite3"]
+  if c == "better-sqlite3": return ["better-sqlite3"]
+  if c == "mssql" or c == "tedious": return ["tedious"]
+  if c == "oracledb" or c == "oracle": return ["oracledb"]
+  return []

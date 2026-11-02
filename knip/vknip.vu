@@ -3095,7 +3095,7 @@ type Graph:
   nodes: [Node]
 
 fn empty_raw(path: Str) -> Raw:
-  return Raw(path + "", true, [], [], [], [], [], 0, [0], false, "")
+  return Raw(path + "", true, [], [], [], [], [], 0, [0], false, "", [])
 
 fn node_id(var g: Graph, path: Str) -> Int:
   if path in g.ids: return g.ids[path]
@@ -3286,6 +3286,19 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
       b.g.nodes[id].unresolved.push(Ext(u.spec + "", "", u.line, u.col, u.pos, u.type_only, false))
   for e in ws_exts: exts.push(Ext(e.spec + "", e.pkg + "", e.line, e.col, e.pos, e.type_only, e.resolved))
   swap(&b.g.nodes[id].exts, &exts)
+  # files an import glob of a plugin's visitor names (import.meta.glob, require.context, fs.glob)
+  var gls: [Str] = []
+  swap(&gls, &b.g.nodes[id].raw.globs)
+  if gls.len > 0 and wi >= 0:
+    let wdir = p.ws[wi].dir + ""
+    for g in gls:
+      # (addEntryPath with skipExportsAnalysis; the analyzed ones are program paths: reached, exports checked)
+      let analyzed = g.startswith("analyze\t")
+      for f in import_glob_files(p, fs, g, path, wdir):
+        if is_ignored_path(p, f, false): continue
+        if analyzed:
+          if acc(b, f): visit_path(&b, f)
+        else: add_entry(&b, f, true, true)
   # shell commands the file runs
   var scs: [Str] = []
   swap(&scs, &b.g.nodes[id].raw.scripts)
@@ -4869,6 +4882,12 @@ fn main(fs: Fs, os: Os):
     done = b.order.len
     var utags: [Str] = sc(p.tags_incl)
     for x in p.tags_excl: utags.push(x + "")
+    # the visitors of the plugins enabled in any workspace (registerVisitors)
+    for v in ["jest", "vitest", "rstest", "execa", "zx", "nano-spawn", "vite", "webpack", "rspack", "node", "pino", "knex"]:
+      var on = false
+      for w in p.ws:
+        if v in w.plugins: on = true
+      if on: utags.push("\0" + v)
     var raws = read_batch(fs, root, paths, jobs, &kw, &t, utags)
     for k in 0..wave.len:
       let id = wave[k]
@@ -5850,3 +5869,88 @@ fn json_strings(v: Value, var out: [Str]):
     Obj(m):
       for _, x in m: json_strings(x, &out)
     _: return
+
+# resolveImportGlobs (typescript/glob-imports.js): the files of an import glob; the ones whose exports
+# are analyzed (import.meta.glob with ?raw) are only program files, so none are returned for them
+fn import_glob_files(p: Proj, fs: Fs, g: Str, path: Str, wdir: Str) -> [Str]:
+  let parts = g.split("\t")
+  if parts.len < 5: return []
+  let cwd = parts[1]
+  let base = parts[2]
+  let filter = parts[3]
+  let pats = parts[4].split("\n")
+  let dir = resolve.dirname(path)
+  var out: [Str] = []
+  if cwd != "":
+    let d = cjoin(wdir, cwd)
+    var ps: [Str] = []
+    for x in pats: ps.push(glob_rel(d, x))
+    return glob_fs(p, fs, ps)
+  if base != "":
+    var d = ""
+    if base.startswith("."): d = resolve.join(dir, base)
+    elif base.startswith("/"): d = resolve.norm(base[1..base.len])
+    else:
+      var found = false
+      for r in alias_glob(p, base, dir):
+        if r != base and fs.exists(fspath(p, r)) and not found:
+          d = r + ""
+          found = true
+      if not found: return []
+    var ps: [Str] = []
+    for x in pats: ps.push(glob_rel(d, x))
+    var rx: [re.Regex] = []
+    if filter != "":
+      var src = filter + ""
+      if src.startswith("/"):
+        let e = src.rfind("/")
+        if e > 0: src = src[1..e]
+      let r = re.compile(src) else return []
+      rx.push(r)
+    for f in glob_fs(p, fs, ps):
+      var rel = f + ""
+      if d != "" and rel.startswith(d + "/"): rel = rel[d.len + 1..rel.len]
+      if rx.len > 0:
+        if hit = re.search(rx[0], "./" + rel): out.push(f)
+      else: out.push(f)
+    return out
+  var ps: [Str] = []
+  for x in pats:
+    var neg = ""
+    var spec = x + ""
+    if spec.startswith("!"):
+      neg = "!"
+      spec = spec[1..spec.len]
+    if spec.startswith("/"): ps.push(neg + resolve.join(wdir, spec[1..spec.len]))
+    else:
+      for r in alias_glob(p, spec, dir):
+        if r == spec: ps.push(neg + resolve.join(dir, spec))
+        else: ps.push(neg + r)
+  if ps.len == 0: return []
+  return glob_fs(p, fs, ps)
+
+fn glob_rel(dir: Str, x: Str) -> Str:
+  if x.startswith("!"): return "!" + resolve.join(dir, x[1..x.len])
+  return resolve.join(dir, x)
+
+# createGlobAliasResolver: a pattern through the path aliases that apply to the folder (the most
+# specific scope, then the longest prefix); the pattern itself when none applies
+fn alias_glob(p: Proj, spec: Str, dir: Str) -> [Str]:
+  var best = -1
+  for k in 0..p.rs.paths.len:
+    let m = p.rs.paths[k]
+    if m.scope != "" and dir != m.scope and not dir.startswith(m.scope + "/"): continue
+    var hit = false
+    if m.wildcard: hit = spec.startswith(m.prefix)
+    else: hit = spec == m.prefix or spec.startswith(m.prefix + "/")
+    if not hit: continue
+    if best < 0 or m.scope.len > p.rs.paths[best].scope.len or (m.scope.len == p.rs.paths[best].scope.len and m.prefix.len > p.rs.paths[best].prefix.len): best = k
+  if best < 0: return [spec + ""]
+  let m = p.rs.paths[best]
+  let captured = spec[m.prefix.len..spec.len]
+  var out: [Str] = []
+  for v in m.values:
+    let st = v.find("*")
+    if st >= 0: out.push(v[0..st] + captured + v[st + 1..v.len])
+    else: out.push(v + captured)
+  return out
