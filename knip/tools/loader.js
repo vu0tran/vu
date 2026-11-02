@@ -138,6 +138,14 @@ for (const r of reqs) {
     if (r.mode === 'vite') v = await viteConfigs(v);
     if (r.mode === 'next' && typeof v === 'function') v = await v('phase-production-build', { defaultConfig: {} });
     if (r.mode === 'webpack') v = await webpackPasses(v, r.args[0] === true);
+    if (r.mode === 'expo' && typeof v === 'function') {
+      const root = path.dirname(path.resolve(cwd, r.file));
+      v = await v({ projectRoot: root, staticConfigPath: null, packageJsonPath: path.join(root, 'package.json'), config: { plugins: [] } });
+    }
+    if (r.mode === 'karma') {
+      if (typeof v !== 'function') v = null;
+      else { const mem = { config: undefined, set(c) { this.config = c; } }; await v(mem); v = mem.config ?? {}; }
+    }
     if (r.mode === 'vue' && v && v.configureWebpack) {
       const base = { mode: 'development', entry: {}, resolve: {}, plugins: [], module: { rules: [] } };
       const cw = typeof v.configureWebpack === 'function' ? v.configureWebpack(base) : v.configureWebpack;

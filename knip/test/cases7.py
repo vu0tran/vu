@@ -106,3 +106,44 @@ case("p7_github_action", {
     "package.json": pkg(), "action.yml": "name: a\nruns:\n  using: node20\n  main: dist/index.js\n  pre: src/pre.js\n",
     "src/pre.js": "", "src/index.ts": "export {};\n", "src/orphan.ts": "export {};\n",
 })
+
+case("p7_expo", {
+    "package.json": pkg(deps=["expo", "expo-router", "expo-dev-client", "react-native-web", "react-dom", "expo-updates", "expo-camera", "expo-system-ui", "unused-dep"], extra={"main": "expo-router/entry"}),
+    **mods("expo", "expo-router", "expo-dev-client", "react-native-web", "react-dom", "expo-updates", "expo-camera", "expo-system-ui", "unused-dep"),
+    "app.config.ts": "export default ({ config }) => ({ ...config, platforms: ['ios', 'web'], backgroundColor: '#fff', plugins: ['expo-camera', ['expo-router', { root: './src/routes' }], './plugins/local.js'] });\n",
+    "src/routes/index.tsx": "export default 1;\n", "app/old.tsx": "export {};\n", "plugins/local.js": "module.exports = () => {};\n",
+}, PROD)
+case("p7_expo_json", {
+    "package.json": pkg(deps=["expo", "expo-notifications", "@expo/metro-runtime", "react-native-web", "react-dom"]), **mods("expo", "expo-notifications", "@expo/metro-runtime", "react-native-web", "react-dom"),
+    "app.json": json.dumps({"expo": {"platforms": ["web"], "notification": {}, "updates": {"enabled": False}}}),
+})
+case("p7_rspack", {
+    "package.json": pkg(dev=["@rspack/core", "@rspack/cli", "sass-loader"]), **mods("@rspack/core", "@rspack/cli", "sass-loader"),
+    "rspack.config.mjs": "export default { entry: './src/main.js', module: { rules: [{ test: /\\.jsx$/, use: { loader: 'builtin:swc-loader' } }, { test: /\\.s[ac]ss$/, loader: 'sass-loader' }] } };\n",
+    "src/main.js": "", "src/other.js": "",
+})
+case("p7_codegen", {
+    "package.json": pkg(dev=["@graphql-codegen/cli", "@graphql-codegen/typescript", "@graphql-codegen/typescript-operations", "@graphql-codegen/client-preset", "@graphql-codegen/near-operation-file-preset", "unused-dev"]),
+    **mods("@graphql-codegen/cli", "@graphql-codegen/typescript", "@graphql-codegen/typescript-operations", "@graphql-codegen/client-preset", "@graphql-codegen/near-operation-file-preset", "unused-dev"),
+    "codegen.ts": "export default { schema: 'schema.graphql', generates: { 'src/gql/': { preset: 'client' }, 'src/types.ts': { plugins: ['typescript', 'typescript-operations'] }, 'src/': { preset: 'near-operation-file', presetConfig: { extension: '.gen.ts', baseTypesPath: 'types.ts' }, plugins: ['./local-plugin.js'] } } };\n",
+    "src/gql/index.ts": "export const g = 1;\n", "src/types.ts": "export type T = 1;\n", "src/a/q.gen.ts": "export const q = 1;\n", "local-plugin.js": "", "src/other.ts": "export {};\n",
+}, PROD)
+case("p7_knex_pm2_karma", {
+    "package.json": pkg(deps=["knex", "pg", "sqlite3", "pm2"], dev=["karma", "karma-jasmine", "karma-chrome-launcher", "jasmine-core", "unused-dev"]),
+    **mods("knex", "pg", "sqlite3", "pm2", "karma", "karma-jasmine", "karma-chrome-launcher", "jasmine-core", "unused-dev"),
+    "knexfile.js": "module.exports = { development: { client: 'sqlite3', migrations: { directory: './db/migrations' } }, production: { client: 'pg', seeds: { directory: ['./db/seeds'] } } };\n",
+    "db/migrations/001.js": "", "db/seeds/s.ts": "export {};\n", "db/other.js": "",
+    "ecosystem.config.js": "module.exports = { apps: [{ name: 'a', script: './server/app.js' }, { name: 'b', script: 'npm' }] };\n", "server/app.js": "", "server/x.js": "",
+    "karma.conf.js": "module.exports = (config) => config.set({ frameworks: ['jasmine'], files: ['test/**/*.spec.js', { pattern: 'test/fixtures/*.js' }], exclude: ['test/skip.spec.js'] });\n",
+    "test/a.spec.js": "", "test/skip.spec.js": "", "test/fixtures/f.js": "", "test/helper.js": "",
+})
+case("p7_pwa", {
+    "package.json": pkg(dev=["vite", "vite-plugin-pwa"]), **mods("vite", "vite-plugin-pwa"),
+    "vite.config.ts": "import { VitePWA } from 'vite-plugin-pwa';\nexport default { plugins: [VitePWA({ strategies: 'injectManifest', srcDir: 'src', filename: 'my-sw.ts' })] };\n",
+    "src/my-sw.ts": "export {};\n", "src/x.ts": "export {};\n",
+})
+case("p7_mdx_tsconfig", {
+    "package.json": pkg(dev=["astro", "remark-gfm", "remark-toc", "unused-dev"]), **mods("astro", "remark-gfm", "remark-toc", "unused-dev"),
+    "tsconfig.json": json.dumps({"compilerOptions": {}, "mdx": {"plugins": ["remark-gfm", ["remark-toc", {}]]}}),
+    "src/pages/index.astro": "---\n---\n<div/>\n",
+})
