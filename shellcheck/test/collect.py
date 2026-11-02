@@ -1,5 +1,8 @@
+# collect.py SRC DST [MAXBYTES]: copy the shell scripts under SRC (by extension or shebang, zsh
+# excluded, files up to MAXBYTES, default 400000) to DST
 import os, sys, shutil, re
 src, dst = sys.argv[1], sys.argv[2]
+maxb = int(sys.argv[3]) if len(sys.argv) > 3 else 400000
 n = 0
 for root, dirs, files in os.walk(src):
     dirs[:] = [d for d in dirs if d not in ('.git', 'node_modules', 'vendor', 'third_party', '_output')]
@@ -7,7 +10,7 @@ for root, dirs, files in os.walk(src):
         p = os.path.join(root, f)
         if os.path.islink(p): continue
         try:
-            if os.path.getsize(p) > 400000: continue
+            if os.path.getsize(p) > maxb: continue
         except OSError: continue
         ok = False
         if f.endswith(('.zsh', '.zsh-theme')): continue

@@ -115,11 +115,12 @@ type GetOpt:
   files: [Str]
   errs: [Str]
   unrec: [Str]
+  jobs: Int          # vsc's --jobs N (-1: not given)
 
 # getOpt Permute
 fn getopt(argv: [Str]) -> GetOpt:
   let ds = opt_descrs()
-  var g = GetOpt([], [], [], [])
+  var g = GetOpt([], [], [], [], -1)
   var rest: [Str] = []
   for a in argv: rest.push(a + "")
   var i = 0
@@ -141,6 +142,15 @@ fn getopt(argv: [Str]) -> GetOpt:
         name = body[0..e]
         arg = body[e + 1..body.len]
         has_eq = true
+      # vsc's own --jobs N (exactly that name): anything else about it is ShellCheck's error
+      if name == "jobs":
+        var v = arg + ""
+        if not has_eq and i < rest.len: v = rest[i] + ""
+        if v.len > 0 and v.len < 7 and all_digits(v):
+          g.jobs = int(v) else 1
+          if not has_eq: i += 1
+        else: g.unrec.push("--" + body)
+        continue
       var cands: [Int] = []
       for k in 0..ds.len:
         if ds[k].long == name: cands.push(k)
@@ -328,7 +338,7 @@ fn apply_flag(ffi: Ffi, prog: Str, var o: Opts, f: Flag):
   elif f.name == "wiki-link-count":
     var x = v + ""
     while x.startswith("SC"): x = x[2..x.len]
-    o.wiki_bad = x.len == 0 and all_digits(v)
+    o.wiki_bad = x.len == 0
     o.wiki = parse_num(ffi, prog, v, true)
   elif f.name == "norc": o.norc = true
   elif f.name == "rcfile":
@@ -553,14 +563,15 @@ fn read_config(ffi: Ffi, file: Str, var found: Bool) -> Rc:
   swap(&probs, &r.probs)
   return Rc(anns, r.err + "", msg, probs, file + "", keep)
 
-# getAppUserDataDirectory and getXdgDirectory XdgConfig: $HOME (the password entry's home when
-# unset), $XDG_CONFIG_HOME when it is absolute
+# getAppUserDataDirectory ($HOME + "/.shellcheckrc", the password entry's home when HOME is
+# unset) and getXdgDirectory XdgConfig ($XDG_CONFIG_HOME when it is absolute, else $HOME </>
+# ".config"; then </> "shellcheckrc", simplified)
 fn home_paths(ffi: Ffi, os: Os) -> [Str]:
   var home = env_get(ffi, os, "HOME")
   if sc_env_has(ffi, "HOME") == 0: home = sc_fs_decode(ffi, sc_pw_home(ffi))
   var xdg = env_get(ffi, os, "XDG_CONFIG_HOME")
   if not xdg.startswith("/"): xdg = combine(home, ".config")
-  return [combine(home, ".shellcheckrc"), normalise(combine(xdg, "shellcheckrc"))]
+  return [home + "/.shellcheckrc", normalise(combine(xdg, "shellcheckrc"))]
 
 fn find_config(ffi: Ffi, os: Os, dir: Str) -> Rc:
   var d = dir + ""
@@ -634,13 +645,13 @@ type FileRes:
   rc: Rc
   rckey: Str
   fatal: Str         # an exception while checking (a sourced name that can't be encoded)
-  crash: Bool        # a -i/-e number that doesn't parse was read
+  crash: Str         # an error ShellCheck raises when the comments are read: "" none
   pcs: [PC]
   names: [Str]
   texts: [Str]
 
 fn failed(err: Str) -> FileRes:
-  return FileRes(false, err, no_rc(), "", "", false, [], [], [])
+  return FileRes(false, err, no_rc(), "", "", "", [], [], [])
 
 fn allowable(ffi: Ffi, c: Ctx, ext: Int, x: Str) -> Bool:
   if ext == 1: return true
@@ -723,27 +734,32 @@ fn lint(ffi: Ffi, path: Str, own src: Str, c: Ctx, own rc: Rc, rckey: Str) -> Fi
   let script = path + ""
   var pr = parse.parse_script(src, ps, own fn(ext: Int, paths: [Str], name: Str) -> ast.SrcRes => resolve_source(ffi, cc, script, ext, paths, name))
   let fatal = sc_fatal_take(ffi)
-  if fatal.len > 0: return FileRes(true, "", rc, rckey + "", fatal, false, [], [], [])
+  if fatal.len > 0: return FileRes(true, "", rc, rckey + "", fatal, "", [], [], [])
   var notes: [parse.Note] = []
   for n in pr.notes: notes.push(parse.ncopy(n))
+  let nparse = notes.len
+  var dfa_crash = ""
   if pr.root >= 0:
     var opt: [Str] = []
     for o in c.optional: opt.push(o + "")
     let asp = check.ASpec(c.shell + "", c.cs, c.extended, opt)
-    for n in check.analyze(&pr.t, pr.root, path, asp): notes.push(parse.ncopy(n))
+    for n in check.analyze(&pr.t, pr.root, path, asp):
+      if n.code < 0: dfa_crash = n.msg + ""
+      else: notes.push(parse.ncopy(n))
   var pcs: [PC] = []
-  var crash = false
-  for n in notes:
+  var crash = ""
+  for k in 0..notes.len:
+    let n = notes[k]
+    if k == nparse and crash.len == 0: crash = dfa_crash
     if n.sev > c.min_sev: continue
-    if c.has_inc:
-      let e = lazy_elem(n.code, c.includes)
-      if e < 0: crash = true
-      if e != 1: continue
-    else:
-      let e = lazy_elem(n.code, c.excludes)
-      if e < 0: crash = true
-      if e != 0: continue
+    var e = 0
+    if c.has_inc: e = lazy_elem(n.code, c.includes)
+    else: e = lazy_elem(n.code, c.excludes)
+    if e < 0 and crash.len == 0: crash = "Prelude.read: no parse"
+    if c.has_inc and e != 1: continue
+    if not c.has_inc and e != 0: continue
     pcs.push(to_pc(n, pr.files))
+  if crash.len == 0: crash = dfa_crash
   pcs.sort(by: fn(a, b) => pc_less(a, b))
   var out: [PC] = []
   for k in 0..pcs.len:
@@ -947,21 +963,10 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   var argv: [Str] = []
   for x in env_get(ffi, os, "SHELLCHECK_OPTS").split(" "):
     if x.len > 0: argv.push(x + "")
-  var jobs = 1
-  var i = 1
-  while i < av.len:
-    let a = av[i]
-    if a == "--jobs" and i + 1 < av.len:
-      jobs = int(av[i + 1]) else 1
-      i += 2
-      continue
-    if a.startswith("--jobs="):
-      jobs = int(a[7..a.len]) else 1
-      i += 1
-      continue
-    argv.push(sc_fs_decode(ffi, a))
-    i += 1
+  for k in 1..av.len: argv.push(sc_fs_decode(ffi, av[k]))
   let g = getopt(argv)
+  var jobs = 1
+  if g.jobs >= 0: jobs = g.jobs
   var errs = ""
   for e in g.errs: errs += e
   for u in g.unrec: errs += "unrecognized option `" + u + "'\n"
@@ -1059,7 +1064,7 @@ fn report(ffi: Ffi, var out: Out, var rc_key: Str, r: FileRes, path: Str) -> Int
   if r.fatal.len > 0:
     on_failure(ffi, &out, path, r.fatal)
     return ST_RUNTIME
-  if r.crash: uncaught(ffi, out.prog, "Prelude.read: no parse")
+  if r.crash.len > 0: uncaught(ffi, out.prog, r.crash)
   let e = on_result(ffi, &out, r, path)
   if e.len > 0:
     on_failure(ffi, &out, path, e)

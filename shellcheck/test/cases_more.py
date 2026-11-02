@@ -9,6 +9,7 @@ U = '#!/bin/sh\necho ’ $1\n'          # a unicode quote: SC1110 and non-ASCII 
 E = '#!/bin/sh\necho "é" $1\n'         # Latin-1-encodable
 LIB = 'x=1\necho $1\n'
 SRC = '#!/bin/bash\nsource ./lib.sh\necho "$x"\n'
+import os
 FORMATS = ['tty', 'gcc', 'json', 'json1', 'checkstyle', 'diff', 'quiet']
 
 def more():
@@ -160,4 +161,49 @@ def more():
         ('path_missing_rc_dir', {'.shellcheckrc': 'disable=SC2086\n'}, ['no/such/../../a.sh'], {}),
         ('path_diff_names', {'d/a.sh': A}, ['-f', 'diff', './d/a.sh', '@/d/a.sh', 'd//a.sh'], {}),
     ]
+    # ---- command line
+    c += [
+        ('cli_jobs_bad', {'a.sh': A}, ['--jobs', 'x', 'a.sh'], {}),
+        ('cli_jobs_after_dashdash', {'a.sh': A}, ['--', '--jobs', '2'], {}),
+        ('cli_jobs_noarg', {'a.sh': A}, ['--jobs'], {}),
+        ('cli_jobs_empty', {'a.sh': A}, ['--jobs=', 'a.sh'], {}),
+        ('cli_jobs_as_arg', {'a.sh': A}, ['-f', '--jobs', 'a.sh'], {}),
+        ('cli_jobs_prefix', {'a.sh': A}, ['--jo', '2', 'a.sh'], {}),
+        ('cli_wiki_sc', {'a.sh': A, 'b.sh': B}, ['-W', 'SC', 'b.sh', 'a.sh'], {}),
+        ('cli_wiki_sc_gcc', {'a.sh': A}, ['-W', 'SC', '-f', 'gcc', 'a.sh'], {}),
+        ('cli_wiki_sc_missing', {}, ['-W', 'SC', 'nope.sh'], {}),
+        ('cli_wiki_huge', {'a.sh': A}, ['-W', '18446744073709551615', 'a.sh'], {}),
+        ('cli_wiki_wrap', {'a.sh': A, 'b.sh': B}, ['-W', '18446744073709551617', 'a.sh', 'b.sh'], {}),
+        ('cli_exclude_sc', {'a.sh': A}, ['-e', 'SC', 'a.sh'], {}),
+        ('cli_exclude_sc_clean', {'a.sh': '#!/bin/sh\necho "$1"\n'}, ['-e', 'SC', 'a.sh'], {}),
+        ('cli_exclude_sc_later', {'a.sh': A}, ['-e', '2086,SC', 'a.sh'], {}),
+        ('cli_include_sc', {'a.sh': A}, ['-i', 'SC,2086', 'a.sh'], {}),
+        ('cli_include_sc_later', {'a.sh': A}, ['-i', '2086,SC', 'a.sh'], {}),
+        ('cli_include_sc_severity', {'a.sh': A}, ['-S', 'error', '-i', 'SC', 'a.sh'], {}),
+        ('cli_sc_many', {'a.sh': A}, ['-e', 'SCSCSC2086', 'a.sh'], {}),
+        ('cli_opts_tabs', {'a.sh': A}, ['a.sh'], {'SHELLCHECK_OPTS': '-f\tgcc'}),
+        ('cli_opts_only_spaces', {'a.sh': A}, ['a.sh'], {'SHELLCHECK_OPTS': '   '}),
+        ('cli_opts_bad', {'a.sh': A}, ['a.sh'], {'SHELLCHECK_OPTS': '--frob'}),
+        ('cli_home_slash', {'h/.shellcheckrc': 'disable=SC2086\n', 'f/a.sh': A}, [], {'HOME': '@/h/'}, {'sh': 'cd h && exec TOOL ../f/a.sh'}),
+        ('cli_home_empty_cwd', {'w/.shellcheckrc': 'disable=SC2086\n', 'f/a.sh': A}, [], {'HOME': ''}, {'sh': 'cd w && exec TOOL ../f/a.sh'}),
+        ('cli_xdg_trailing', {'x/shellcheckrc': 'disable=SC2086\n', 'f/a.sh': A}, [], {'XDG_CONFIG_HOME': '@/x//'}, {'sh': 'cd x && exec TOOL ../f/a.sh'}),
+        # (with stdin closed, ShellCheck reads "-" from a descriptor of its own runtime and hangs)
+        ('cli_stdin_dir', {'a.sh': A}, ['-', 'a.sh'], {}, {'sh': 'exec TOOL - a.sh < .'}),
+        ('cli_stdout_full', {'a.sh': A}, ['a.sh'], {}, {'sh': 'exec TOOL a.sh > /dev/full'}),
+        ('cli_stdout_full_json', {'a.sh': A}, ['-f', 'json', 'a.sh'], {}, {'sh': 'exec TOOL -f json a.sh > /dev/full'}),
+        ('cli_stdout_full_version', {}, ['-V'], {}, {'sh': 'exec TOOL -V > /dev/full'}),
+        ('cli_stderr_full', {}, ['nope.sh'], {}, {'sh': 'exec TOOL nope.sh 2> /dev/full'}),
+        # (likewise with stdout closed: ShellCheck's writes go to its runtime's descriptor and it hangs)
+    ]
+    # ---- the data flow analysis's limit of 1,000,000 steps (ShellCheck takes about 3 minutes on
+    # each): loops nested 340 deep need 994,319 steps, 341 deep over a million (SC_SLOW=1)
+    if os.environ.get('SC_SLOW'):
+        for n in (340, 341):
+            c.append((f'dfa_nest{n}', {'a.sh': nest(n)}, ['-f', 'gcc', 'a.sh'], {}))
     return c
+
+def nest(n):
+    L = ['#!/bin/bash']
+    for i in range(n): L.append(' ' * i + f'while [ "$v{i}" ]; do v{i}=$((v{i}+1)); x{i}=$v{(i+1)%n}')
+    for i in reversed(range(n)): L.append(' ' * i + 'done')
+    return '\n'.join(L) + '\n'

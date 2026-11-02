@@ -110,7 +110,7 @@ def run(cmd, d, env, stdin, x, merge):
         cmd = ['sh', '-c', x['sh'].replace('TOOL', tool)]
     try: p = subprocess.run(cmd, cwd=d, env=e, input=inp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE, timeout=20)
     except subprocess.TimeoutExpired: return b'', b'TIMEOUT', -1
-    return p.stdout, p.stderr, p.returncode
+    return p.stdout, p.stderr or b'', p.returncode
 
 def setup(d, files, x):
     if os.path.isdir(d):

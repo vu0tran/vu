@@ -1,13 +1,19 @@
-# attack.py DIR MODE N SEED [ARGS...]: writes N generated scripts into DIR, runs shellcheck and vsc
-# on them with -f json1 (and ARGS, e.g. -o all), and prints every comment that differs in any
-# field, the fix included.
-# MODE: gen (snippets from a grammar of shell features) or mut (mutated corpus files)
+# attack.py DIR MODE N SEED [--fmt] [ARGS...]: writes N generated scripts into DIR, runs shellcheck
+# and vsc on them with -f json1 (and ARGS, e.g. -o all), and prints every comment that differs in
+# any field, the fix included. With --fmt: runs both in every format (tty, gcc, checkstyle, diff,
+# json, json1, quiet) on chunks of 50 files and compares stdout, stderr and exit status, then
+# narrows a chunk that differs down to its files.
+# MODE: gen (snippets from a grammar of shell features), mut (mutated corpus files), splice
+# (pieces of corpus files), tok (tokens inserted), bytes (random bytes: invalid UTF-8, NUL, CR,
+# control characters) or deep (deep nesting, unbalanced quotes, here-documents)
 import sys, os, random, subprocess, re, collections
 # SCW: the work directory (shellcheck, vsc, corpus/, corpus2/, files.txt, ...)
 W = os.environ['SCW']
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 d, mode, n, seed = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 extra_args = sys.argv[5:]
+fmt_mode = '--fmt' in extra_args
+extra_args = [a for a in extra_args if a != '--fmt']
 import json
 rnd = random.Random(seed)
 src = open(HERE + '/check.vu').read() + open(HERE + '/parse.vu').read()
@@ -112,11 +118,14 @@ def gen():
     if rnd.random() < 0.1: lines.append('# shellcheck shell=' + rnd.choice(['sh', 'bash', 'dash', 'ksh']))
     for _ in range(rnd.randint(1, 8)): lines.append(stmt() if rnd.random() < 0.6 else rnd.choice(extras))
     return '\n'.join(lines) + '\n'
-corpus = [l.strip() for l in open(W + '/files.txt')] + [l.strip() for l in open(W + '/files2.txt')]
+corpus = [('corpus', l.strip()) for l in open(W + '/files.txt')] + [('corpus2', l.strip()) for l in open(W + '/files2.txt')]
+if os.path.exists(W + '/files3.txt'): corpus += [('corpus3', l.strip()) for l in open(W + '/files3.txt')]
+def pick():
+    d, f = rnd.choice(corpus)
+    return W + '/' + d + '/' + f
 def mut():
     while True:
-        f = rnd.choice(corpus)
-        base = W + ('/corpus/' if os.path.exists(W + '/corpus/' + f) else '/corpus2/') + f
+        base = pick()
         try: b = open(base, 'rb').read()
         except OSError: continue
         if 0 < len(b) < 20000: break
@@ -133,8 +142,7 @@ def mut():
     return bytes(b)
 def readc():
     while True:
-        f = rnd.choice(corpus)
-        base = W + ('/corpus/' if os.path.exists(W + '/corpus/' + f) else '/corpus2/') + f
+        base = pick()
         try: b = open(base, 'rb').read()
         except OSError: continue
         if 0 < len(b) < 60000: return b
@@ -160,11 +168,34 @@ def tok():
             if 0 < j - i < 20: del b[i + 1:j]
         b[i + 1:i + 1] = t + b' '
     return bytes(b)
+def rbytes():
+    b = bytearray(readc())
+    for _ in range(rnd.randint(1, 6)):
+        i = rnd.randrange(len(b) + 1)
+        b[i:i] = rnd.choice([bytes([rnd.randrange(256)]), b'\xff', b'\xc3', b'\xc3\xa9', b'\xe2\x80\x99', b'\xed\xa0\x80',
+            b'\xc0\x80', b'\xf4\x90\x80\x80', b'\x00', b'\r', b'\r\n', b'\x1b[1m', b'\t', b'\xef\xbb\xbf', b'\x0c', b'\xa0',
+            b'\xe2\x80\x9c', b'\xc2\xa0', b'\x7f'])
+    return bytes(b)
+def deep():
+    k = rnd.randint(1, 60)
+    kind = rnd.randrange(8)
+    lines = [rnd.choice(shebangs)]
+    if kind == 0: lines.append('if true; then ' * k + 'echo $x' + '; fi' * rnd.choice([k, k - 1, k + 1]))
+    elif kind == 1: lines.append('$(' * k + 'echo $y' + ')' * rnd.choice([k, k - 1]))
+    elif kind == 2: lines.append('echo ' + '"$(' * k + 'ls' + ')"' * rnd.choice([k, k - 1]))
+    elif kind == 3: lines.append('{ ' * k + 'a=1; ' + '} ' * rnd.choice([k, k - 1, k + 1]))
+    elif kind == 4:
+        for i in range(k): lines.append(f'cat <<{"-" if i % 2 else ""}E{i}\n$x{i} `y`\n' + ('\t' if i % 2 else '') + f'E{i}' * rnd.choice([1, 1, 0]))
+    elif kind == 5: lines.append('echo ' + rnd.choice(['"', "'", '`', '$(', '${', '((']) * rnd.randint(1, 5) + ' x ' + rnd.choice(['', '"', "'"]))
+    elif kind == 6: lines.append('f() { ' * k + 'g; ' + '}; ' * k + 'f')
+    else: lines.append('(' * k + 'echo' + ')' * rnd.choice([k, k - 1, k + 1]))
+    if rnd.random() < 0.5: lines.append(gen())
+    return '\n'.join(lines) + '\n'
 os.makedirs(d, exist_ok=True)
 names = []
 for k in range(n):
     p = f'{d}/t{k}.sh'
-    data = gen().encode() if mode == 'gen' else mut() if mode == 'mut' else splice() if mode == 'splice' else tok()
+    data = gen().encode() if mode == 'gen' else mut() if mode == 'mut' else splice() if mode == 'splice' else rbytes() if mode == 'bytes' else deep().encode() if mode == 'deep' else tok()
     open(p, 'wb').write(data)
     names.append(p)
 def run(cmd, chunk):
@@ -175,6 +206,27 @@ def run(cmd, chunk):
         except Exception: cs = []
         for c in cs: out[c['file']].append(json.dumps(c, ensure_ascii=False))
     return out
+def run_all(tool, fmt, files):
+    r = subprocess.run([tool, '-f', fmt] + extra_args + files, capture_output=True, timeout=3000)
+    return r.stdout, r.stderr, r.returncode
+if fmt_mode:
+    bad = 0
+    for fmt in ['tty', 'gcc', 'checkstyle', 'diff', 'json', 'json1', 'quiet']:
+        for i in range(0, len(names), 50):
+            chunk = names[i:i + 50]
+            if run_all(W + '/shellcheck', fmt, chunk) == run_all(W + '/vsc', fmt, chunk): continue
+            single = 0
+            for p in chunk:
+                a, b = run_all(W + '/shellcheck', fmt, [p]), run_all(W + '/vsc', fmt, [p])
+                if a != b:
+                    bad += 1
+                    single += 1
+                    print('==', fmt, p, 'exit', a[2], b[2], 'stdout same' if a[0] == b[0] else 'stdout differs', 'stderr same' if a[1] == b[1] else 'stderr differs')
+            if single == 0:
+                bad += 1
+                print('==', fmt, 'chunk', i, 'differs only as a whole')
+    print(f'{bad} (format, file) pairs differ of {n} files x 7 formats', file=sys.stderr)
+    sys.exit(0)
 ref = run([W + '/shellcheck', '-f', 'json1'] + extra_args, 200)
 vsc = run([W + '/vsc', '-f', 'json1'] + extra_args, 2000)
 bad = 0
