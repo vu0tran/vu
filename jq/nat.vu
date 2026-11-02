@@ -1626,7 +1626,9 @@ fn gen(var it: It, id: Int, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
     return by_native(&it, id, n, v, p, env, k)
   if id == I.input:
     let r = read_input(&it)
-    if it.bad: return run.bad_status(&it)
+    if it.bad:
+      it.ierr = ""        # the program got the parse error; the main loop doesn't report it again
+      return run.bad_status(&it)
     let rp_ = run.vp(&it, p, r, v)
     return run.emit(&it, k, r, rp_)
   if id == I.inputs:
@@ -1634,7 +1636,8 @@ fn gen(var it: It, id: Int, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
       let r = read_input(&it)
       if it.bad:
         it.bad = false
-        if kind(it.err) == K_STR and sv(it, it.err) == "No more inputs": return ST_OK
+        it.ierr = ""
+        if kind(it.err) == K_STR and sv(it, it.err) == "break": return ST_OK
         return ST_ERR
       let rp_ = run.vp(&it, p, r, v)
       let s = run.emit(&it, k, r, rp_)
@@ -1652,6 +1655,8 @@ fn gen(var it: It, id: Int, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
     run.flush_out(&it)
     if kind(v) == K_STR:
       vjq_ewrite(it.ffi, sv(it, v))
+    elif kind(v) == K_NULL:
+      it.halted = true
     else:
       let s = jv.to_json_str(&it.st, v)
       eprint(s)
@@ -1885,6 +1890,158 @@ fn kont(var it: It, k: Int, kf: Kf, v: V, p: Int) -> Int:
 
 # The next input value (for input/inputs and the main loop). Sets it.bad with "No more inputs"
 # at the end; a parse error is reported and ends the inputs.
+# --seq input (RFC 7464 records, each started by RS, 0x1e), read as jq's parser reads it: a value
+# cut short by an RS ("Truncated value", or a number that may be), a syntax error (skipped up to the
+# next RS), text left without an RS at the end. The bad parts become spaces (lines stay where they
+# are), RSes too, and their messages wait in it.serr_* for the reader to reach them.
+fn seq_prepare(var it: It):
+  let a = it.ipos
+  let e = it.iend
+  var pos = a
+  var waiting = true       # jq's parser starts out waiting for an RS
+  var ret = a - 1          # where jq's parser last handed back a value or an error
+  var fls = a              # the start of the last line
+  for j in a..e:
+    if it.st.b[j] == '\n': fls = j + 1
+  while true:
+    var r = pos
+    while r < e and int(it.st.b[r]) != 0x1E: r += 1
+    if waiting:
+      blank(&it, pos, r)
+      if r >= e:
+        let lc = line_col(it, a, e)
+        seq_err(&it, e, "Unfinished abandoned text at EOF at line {lc[0]}, column {lc[1]}")
+        break
+      blank(&it, r, r + 1)
+      waiting = false
+      pos = r + 1
+      continue
+    var q = pos
+    var stop = false         # an error ended this record
+    while true:
+      while q < r and (it.st.b[q] == ' ' or it.st.b[q] == '\t' or it.st.b[q] == '\n' or it.st.b[q] == '\r'): q += 1
+      if q >= r: break
+      let lc0 = line_col(it, a, q)
+      it.st.pp = q
+      it.st.pend = r
+      it.st.perr = ""
+      it.st.depth = 0
+      let v = jv.parse_value(&it.st)
+      if it.st.perr != "":
+        var m = jv.json_error(it.st, q, r, lc0[0], lc0[1])
+        if m == "": m = it.st.perr
+        let at_end = m.find(" at EOF at line ") >= 0
+        let c = it.st.b[r - 1]
+        let ws_before = c == ' ' or c == '\t' or c == '\n' or c == '\r'
+        blank(&it, q, r)
+        if at_end and r < e and ws_before and not m.startswith("Unfinished string"):
+          # nothing reported: the RS resets the parser (see below)
+          stop = false
+          break
+        if at_end and r < e:
+          let lc = line_col(it, a, r + 1)
+          seq_err(&it, r, "Truncated value at line {lc[0]}, column {lc[1]}")
+        elif at_end:
+          seq_err(&it, q, m)
+        else:
+          seq_err(&it, q, m + " (need RS to resync)")
+          waiting = true
+        ret = r
+        stop = true
+        break
+      let ve = it.st.pp
+      let k = kind(v)
+      if ve == r and k != K_STR and k != K_ARR and k != K_OBJ:
+        # a number or literal running into the RS (or the end) may have been cut short
+        let isnum = k != K_NULL and k != K_TRUE and k != K_FALSE
+        if r < e:
+          blank(&it, q, r)
+          let lc = line_col(it, a, r + 1)
+          if isnum: seq_err(&it, r, "Potentially truncated top-level numeric value at line {lc[0]}, column {lc[1]}")
+          else: seq_err(&it, r, "Truncated value at line {lc[0]}, column {lc[1]}")
+          ret = r
+          stop = true
+          break
+        if isnum:
+          blank(&it, q, r)
+          let lc = line_col(it, a, r)
+          seq_err(&it, q, "Potentially truncated top-level numeric value at EOF at line {lc[0]}, column {lc[1]}")
+          stop = true
+          break
+      if k == K_STR or k == K_ARR or k == K_OBJ: ret = ve - 1
+      else: ret = ve
+      q = ve
+    if r >= e: break
+    if waiting:
+      pos = r
+      continue
+    if not stop:
+      # an RS with nothing pending resets jq's parser and reads as "need more input": that ends
+      # the input when the read that brought in the last line (jq reads by lines) has handed
+      # back nothing yet (not when slurping, which reads on while text is left)
+      if r >= fls and ret < fls and not it.slurp:
+        blank(&it, r, e)
+        break
+    blank(&it, r, r + 1)
+    pos = r + 1
+  it.st.pp = a
+  it.st.pline = 1
+  it.st.plinestart = a
+
+fn blank(var it: It, s: Int, e: Int):
+  for i in s..e:
+    if it.st.b[i] != '\n': it.st.b[i] = ' '
+
+fn seq_err(var it: It, off: Int, msg: Str):
+  it.serr_off.push(off)
+  it.serr_msg.push(msg)
+
+# jq's line and column after reading b[a..i] (the column counts the bytes since the last newline).
+fn line_col(it: It, a: Int, i: Int) -> [Int]:
+  var line = 1
+  var ls = a
+  for j in a..i:
+    if it.st.b[j] == '\n':
+      line += 1
+      ls = j + 1
+  return [line, i - ls]
+
+# A read found no more input. jq reads input by lines and closes it when a read starts at its
+# end; from then on error positions are "<unknown>". That is this read when the last line has no
+# newline and was read already (the last value ended in it), else the next one.
+fn eof_seen(var it: It, last_end: Int):
+  if it.ieof_n == 0:
+    let s = it.istarts[0]
+    var fls = s
+    var i = it.iend - 1
+    while i >= s:
+      if it.st.b[i] == '\n':
+        fls = i + 1
+        break
+      i -= 1
+    let unterminated = it.iend > s and it.st.b[it.iend - 1] != '\n'
+    if unterminated and last_end > fls: it.ieof_n = 1
+  it.ieof_n += 1
+
+# --seq: the parse errors before input offset upto, reported as jq does (and skipped).
+# The main loop reports them and goes on; the program's input gets them as errors. Returns
+# whether one is pending for the program (it.bad set).
+fn seq_errors(var it: It, upto: Int) -> Bool:
+  while it.serr_i < it.serr_off.len and (it.serr_off[it.serr_i] <= upto or upto >= it.iend):
+    let m = it.serr_msg[it.serr_i]
+    it.serr_i += 1
+    if not it.main_read:
+      # jq has read (by lines) the line the error is on
+      var le = it.serr_off[it.serr_i - 1]
+      while le < it.iend and it.st.b[le] != '\n': le += 1
+      if le < it.iend: le += 1
+      if le > it.ivend: it.ivend = le
+      sfail(&it, m)
+      return true
+    run.flush_out(&it)
+    eprint("jq: ignoring parse error: " + m)
+  return false
+
 fn read_input(var it: It) -> V:
   if it.collect: return sfail(&it, "break")
   it.iread = true
@@ -1900,10 +2057,13 @@ fn read_input(var it: It) -> V:
     it.istarts[0] = off
     it.lc_end = off
     it.st.plinestart = off
+    if it.seq and not it.raw_input: seq_prepare(&it)
   if it.ierr != "":
-    return sfail(&it, "No more inputs")
+    return sfail(&it, "break")
   if it.raw_input:
-    if it.ipos >= it.iend: return sfail(&it, "No more inputs")
+    if it.ipos >= it.iend:
+      eof_seen(&it, it.ipos)
+      return sfail(&it, "break")
     var e = it.ipos
     while e < it.iend and it.st.b[e] != '\n': e += 1
     let off = it.ipos
@@ -1925,14 +2085,18 @@ fn read_input(var it: It) -> V:
     let line0 = it.st.pline
     let ls0 = it.st.plinestart
     jv.skip_ws(&it.st)
+    if it.serr_i < it.serr_off.len and seq_errors(&it, it.st.pp):
+      it.ipos = it.st.pp
+      return vnull()
     if it.st.pp >= it.st.pend:
       if more_input(&it):
         it.st.pline = line0
         it.st.plinestart = ls0
         continue
+      eof_seen(&it, it.ipos)
       it.ipos = it.st.pp
       it.ivend = it.iend
-      return sfail(&it, "No more inputs")
+      return sfail(&it, "break")
     vs = it.st.pp
     vline = it.st.pline
     vcol = vs - it.st.plinestart
@@ -1949,8 +2113,13 @@ fn read_input(var it: It) -> V:
     var m = jv.json_error(it.st, vs, it.iend, vline, vcol)
     if m == "": m = it.st.perr + " at line {vline}, column {vcol}"
     it.ierr = m
+    # jq has read (by lines) up to the end of the line where it found the error
+    var le = it.st.pp
+    while le < it.iend and it.st.b[le] != '\n': le += 1
+    if le < it.iend: le += 1
+    it.ivend = le
     it.ipos = it.iend
-    return sfail(&it, "No more inputs")
+    return sfail(&it, m)
   # jq's parser takes a scalar at the byte after it (a delimiter), a string or container at its end
   var consumed = it.st.pp
   let kd = kind(v)
