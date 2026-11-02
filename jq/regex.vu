@@ -1,0 +1,1699 @@
+# regex: a backtracking regular expression engine for jq's regex built-ins (test, match,
+# capture, scan, split, sub, gsub), written to behave like the Oniguruma jq 1.7.1 is built with:
+# its Perl_NT syntax (named groups, (?imx) options, lookaround, atomic groups, possessive and
+# lazy quantifiers, \Q..\E, \K, \R, \p{...} with Oniguruma's Unicode properties), jq's options
+# (i, x, s, p, l, n and capture of every group), UTF-8 strings, leftmost-first matching, and
+# Oniguruma's messages for invalid patterns. A pattern using what this engine doesn't do
+# (absent groups, callouts, subexpression calls, \X, variable-length look-behind...) comes back
+# `unsupported`; the caller then uses Oniguruma itself if it can load it.
+
+import unitab
+
+# options (Oniguruma's bits)
+const O_ICASE = 1
+const O_EXTEND = 2
+const O_MULTILINE = 4      # '.' matches a newline
+const O_SINGLELINE = 8     # '^' and '$' only at the ends ($ also before a final newline)
+const O_LONGEST = 16
+const O_NOTEMPTY = 32
+
+# tree nodes
+const N_EMPTY = 0
+const N_CHAR = 1           # a: code point, b: case-insensitive
+const N_ANY = 2            # b: matches a newline too
+const N_SET = 3            # a: set, b: negated, c: case-insensitive
+const N_CAT = 4
+const N_ALT = 5
+const N_CAP = 6            # a: group
+const N_REP = 7            # a: min, b: max (-1: no limit), c: 1 greedy, 0 lazy, 2 possessive
+const N_ANCHOR = 8         # a: kind
+const N_BREF = 9           # a: index into brefs, b: case-insensitive
+const N_LOOK = 10          # a: 0 ahead, 1 not ahead, 2 behind, 3 not behind
+const N_ATOMIC = 11
+const N_KEEP = 12
+const N_COND = 13          # a: group; kids: yes, no
+
+# anchors
+const A_BEGBUF = 1
+const A_ENDBUF = 2
+const A_SEMIEND = 3
+const A_BEGLINE = 4
+const A_ENDLINE = 5
+const A_WORDB = 6
+const A_NWORDB = 7
+const A_BEGPOS = 8
+
+# instructions: three ints each
+const I_CHAR = 1
+const I_CHARI = 2
+const I_ANY = 3
+const I_ANYNL = 4
+const I_SET = 5            # a: set, b: 1 negated | 2 case-insensitive
+const I_SPLIT = 6          # a: first choice, b: second
+const I_JMP = 7
+const I_SAVE = 8
+const I_ASSERT = 9
+const I_BREF = 10          # a: brefs index, b: case-insensitive
+const I_LOOK = 11          # a: kind | length << 2 (behind), b: the instruction after the body
+const I_ATOMIC = 12        # b: the instruction after the body
+const I_SUCCEED = 13       # end of a look-around or atomic body
+const I_MATCH = 14
+const I_ECHK_S = 15        # a: slot: remember the position
+const I_ECHK_E = 16        # a: slot, b: where to go when the iteration matched nothing
+const I_KEEP = 17
+const I_COND = 18          # a: group, b: the "no" branch
+
+type RNode:
+  k: Int
+  a: Int
+  b: Int
+  c: Int
+  kids: [Int]
+
+type Rx:
+  code: [Int]
+  sets: [[Int]]        # sorted, merged ranges lo, hi, lo, hi...
+  brefs: [[Int]]       # groups a backreference may mean (a name can name several)
+  ncap: Int
+  names: [Str]         # per group (0 unused): its name or ""
+  nslots: Int
+  opts: Int
+  err: Str
+  unsupported: Bool
+  lead: Int            # a code point every match starts with (-1: unknown)
+  anchored: Bool       # starts with \A
+
+type Ps:
+  p: Str
+  i: Int
+  opts: Int
+  nodes: [RNode]
+  sets: [[Int]]
+  brefs: [[Int]]
+  bref_names: [Str]    # names used by \k<name>, checked at the end
+  bref_nums: [Int]     # numbers used, checked at the end
+  ncap: Int
+  names: [Str]
+  err: Str
+  unsupported: Bool
+  depth: Int
+  class_neg: Bool      # the last bracket class was [^...]
+
+# ---------------------------------------------------------------- Unicode data
+
+type Uni:
+  pnames: [Str]
+  pids: [Int]
+  pstarts: [Int]       # where each property's ranges start in PROP_RANGES
+  fold_from: [Int]
+  fold_to: [Int]
+  unfold_key: [Int]    # folded code point -> the code points folding to it (sorted by key)
+  unfold_val: [Int]
+  flat: [Int]          # decoded properties' ranges
+  poff: [Int]          # by ctype: where its ranges start in flat (-1 until decoded)
+  plen: [Int]
+
+fn b36(s: Str, a: Int, e: Int) -> Int:
+  var n = 0
+  for i in a..e:
+    let c = int(s[i])
+    if c >= 97: n = n * 36 + c - 87
+    else: n = n * 36 + c - 48
+  return n
+
+fn uni_load() -> Uni:
+  var u = Uni([], [], [], [], [], [], [], [], [], [])
+  for e in unitab.PROP_NAMES.split(","):
+    let c = e.find(":")
+    u.pnames.push(e[0..c])
+    u.pids.push(int(e[c + 1..e.len]) else 0)
+  let r = unitab.PROP_RANGES
+  u.pstarts.push(0)
+  for i in 0..r.len:
+    if r[i] == ';': u.pstarts.push(i + 1)
+  u.pstarts.push(r.len + 1)
+  for i in 0..u.pstarts.len - 1:
+    u.poff.push(-1)
+    u.plen.push(0)
+  let f = unitab.FOLDS
+  var i = 0
+  var prev = 0
+  while i < f.len:
+    var j = i
+    while f[j] != '.': j += 1
+    let from = prev + b36(f, i, j)
+    var k = j + 1
+    var neg = false
+    if f[k] == '-':
+      neg = true
+      k += 1
+    var e = k
+    while e < f.len and f[e] != ',': e += 1
+    var d = b36(f, k, e)
+    if neg: d = -d
+    u.fold_from.push(from)
+    u.fold_to.push(from + d)
+    prev = from
+    i = e + 1
+  # unfold: pairs (to, from) sorted by to
+  var pairs: [Int] = []
+  for x in 0..u.fold_from.len:
+    pairs.push(u.fold_to[x] * 2097152 + u.fold_from[x])
+  pairs.sort()
+  for x in pairs:
+    u.unfold_key.push(x / 2097152)
+    u.unfold_val.push(x % 2097152)
+  return u
+
+fn prop_decode(var u: Uni, ctype: Int):
+  if u.poff[ctype] >= 0: return
+  let r = unitab.PROP_RANGES
+  let off = u.flat.len
+  var i = u.pstarts[ctype]
+  let e = u.pstarts[ctype + 1] - 1
+  var prev = 0
+  while i < e:
+    var j = i
+    while r[j] != '.': j += 1
+    var k = j + 1
+    while k < e and r[k] != ',': k += 1
+    let lo = prev + b36(r, i, j)
+    let hi = lo + b36(r, j + 1, k)
+    u.flat.push(lo)
+    u.flat.push(hi)
+    prev = hi
+    i = k + 1
+  u.poff[ctype] = off
+  u.plen[ctype] = u.flat.len - off
+
+# A property's ranges (a copy, for compiling a class).
+fn prop_ranges(var u: Uni, ctype: Int) -> [Int]:
+  prop_decode(&u, ctype)
+  var out: [Int] = []
+  let o = u.poff[ctype]
+  for i in o..o + u.plen[ctype]: out.push(u.flat[i])
+  return out
+
+fn in_prop(var u: Uni, ctype: Int, c: Int) -> Bool:
+  prop_decode(&u, ctype)
+  let o = u.poff[ctype]
+  var lo = 0
+  var hi = u.plen[ctype] / 2 - 1
+  while lo <= hi:
+    let mid = (lo + hi) / 2
+    if c < u.flat[o + 2 * mid]: hi = mid - 1
+    elif c > u.flat[o + 2 * mid + 1]: lo = mid + 1
+    else: return true
+  return false
+
+fn prop_id(u: Uni, name: Str) -> Int:
+  var tb: [Byte] = []
+  for c in bytes(name):
+    if c == ' ' or c == '-' or c == '_': continue
+    if c >= 'A' and c <= 'Z': tb.push(byte(int(c) + 32))
+    else: tb.push(c)
+  let t = tb.take_str()
+  var lo = 0
+  var hi = u.pnames.len - 1
+  while lo <= hi:
+    let mid = (lo + hi) / 2
+    let m = u.pnames[mid]
+    if m == t: return u.pids[mid]
+    if m < t: lo = mid + 1
+    else: hi = mid - 1
+  return -1
+
+fn fold(u: Uni, c: Int) -> Int:
+  if c < 128:
+    if c >= 65 and c <= 90: return c + 32
+    return c
+  var lo = 0
+  var hi = u.fold_from.len - 1
+  while lo <= hi:
+    let mid = (lo + hi) / 2
+    let m = u.fold_from[mid]
+    if m == c: return u.fold_to[mid]
+    if m < c: lo = mid + 1
+    else: hi = mid - 1
+  return c
+
+fn in_ranges(r: [Int], c: Int) -> Bool:
+  var lo = 0
+  var hi = r.len / 2 - 1
+  while lo <= hi:
+    let mid = (lo + hi) / 2
+    if c < r[2 * mid]: hi = mid - 1
+    elif c > r[2 * mid + 1]: lo = mid + 1
+    else: return true
+  return false
+
+# Whether c (or, case-insensitively, anything of its case) is in the set.
+fn set_has(u: Uni, r: [Int], c: Int, icase: Bool) -> Bool:
+  if in_ranges(r, c): return true
+  if not icase: return false
+  let f = fold(u, c)
+  if f != c and in_ranges(r, f): return true
+  # the code points folding to f
+  var lo = 0
+  var hi = u.unfold_key.len - 1
+  while lo <= hi:
+    let mid = (lo + hi) / 2
+    if u.unfold_key[mid] < f: lo = mid + 1
+    else: hi = mid - 1
+  var i = lo
+  while i < u.unfold_key.len and u.unfold_key[i] == f:
+    let x = u.unfold_val[i]
+    if x != c and in_ranges(r, x): return true
+    i += 1
+  return false
+
+# ---------------------------------------------------------------- sets
+
+fn norm(r: [Int]) -> [Int]:
+  var ps: [Int] = []
+  var i = 0
+  while i < r.len:
+    ps.push(r[i] * 2097152 + r[i + 1])
+    i += 2
+  ps.sort()
+  var out: [Int] = []
+  for x in ps:
+    let lo = x / 2097152
+    let hi = x % 2097152
+    if out.len > 0 and lo <= out[out.len - 1] + 1:
+      if hi > out[out.len - 1]: out[out.len - 1] = hi
+    else:
+      out.push(lo)
+      out.push(hi)
+  return out
+
+fn negate(r: [Int]) -> [Int]:
+  var out: [Int] = []
+  var next = 0
+  var i = 0
+  while i < r.len:
+    if r[i] > next:
+      out.push(next)
+      out.push(r[i] - 1)
+    next = r[i + 1] + 1
+    i += 2
+  if next <= 0x10FFFF:
+    out.push(next)
+    out.push(0x10FFFF)
+  return out
+
+fn add_ranges(var to: [Int], r: [Int]):
+  for x in r: to.push(x)
+
+# ---------------------------------------------------------------- parsing
+
+fn node(var ps: Ps, k: Int, a: Int, b: Int, c: Int) -> Int:
+  ps.nodes.push(RNode(k, a, b, c, []))
+  return ps.nodes.len - 1
+
+fn perr(var ps: Ps, msg: Str):
+  if ps.err == "" and not ps.unsupported: ps.err = msg
+
+fn unsup(var ps: Ps):
+  if ps.err == "": ps.unsupported = true
+
+fn b2i(b: Bool) -> Int:
+  if b: return 1
+  return 0
+
+fn at_end(ps: Ps) -> Bool:
+  return ps.i >= ps.p.len
+
+fn peek(ps: Ps) -> Int:
+  if ps.i >= ps.p.len: return -1
+  return int(ps.p[ps.i])
+
+# The code point at byte i of s and its length, packed as cp << 3 | len.
+fn dec(s: Str, i: Int) -> Int:
+  let c = int(s[i])
+  if c < 0xC0: return (c << 3) | 1
+  if c < 0xE0 and i + 1 < s.len: return ((((c & 0x1F) << 6) | (int(s[i + 1]) & 0x3F)) << 3) | 2
+  if c < 0xF0 and i + 2 < s.len: return ((((c & 0x0F) << 12) | ((int(s[i + 1]) & 0x3F) << 6) | (int(s[i + 2]) & 0x3F)) << 3) | 3
+  if i + 3 < s.len: return ((((c & 0x07) << 18) | ((int(s[i + 1]) & 0x3F) << 12) | ((int(s[i + 2]) & 0x3F) << 6) | (int(s[i + 3]) & 0x3F)) << 3) | 4
+  return (c << 3) | 1
+
+# an entry of the compiled-pattern cache
+type RxEntry:
+  pat: Str
+  opts: Int
+  rx: Rx
+  onig: Int            # Oniguruma's compiled pattern (the caller's list) when this engine can't, else -1
+
+fn empty_uni() -> Uni:
+  return Uni([], [], [], [], [], [], [], [], [], [])
+
+fn next_cp(var ps: Ps) -> Int:
+  let d = dec(ps.p, ps.i)
+  ps.i += d & 7
+  return d >> 3
+
+fn skip_extended(var ps: Ps):
+  if (ps.opts & O_EXTEND) == 0: return
+  while ps.i < ps.p.len:
+    let c = ps.p[ps.i]
+    if c == ' ' or c == '\t' or c == '\n' or c == '\r' or int(c) == 12 or int(c) == 11:
+      ps.i += 1
+    elif c == '#':
+      while ps.i < ps.p.len and ps.p[ps.i] != '\n': ps.i += 1
+    else:
+      break
+
+# alternatives: a|b|c
+fn parse_alt(var ps: Ps, var u: Uni, top: Bool) -> Int:
+  var kids: [Int] = [parse_cat(&ps, &u)]
+  while ps.err == "" and not ps.unsupported and peek(ps) == int('|'):
+    ps.i += 1
+    kids.push(parse_cat(&ps, &u))
+  if ps.err == "" and not ps.unsupported:
+    if top and peek(ps) == int(')'): perr(&ps, "unmatched close parenthesis")
+  if kids.len == 1: return kids[0]
+  let n = node(&ps, N_ALT, 0, 0, 0)
+  ps.nodes[n].kids = kids
+  return n
+
+fn parse_cat(var ps: Ps, var u: Uni) -> Int:
+  var kids: [Int] = []
+  while ps.err == "" and not ps.unsupported:
+    skip_extended(&ps)
+    if at_end(ps): break
+    let c = peek(ps)
+    if c == int('|') or c == int(')'): break
+    let t = parse_quantified(&ps, &u, kids.len == 0)
+    if t >= 0: kids.push(t)
+  if kids.len == 0: return node(&ps, N_EMPTY, 0, 0, 0)
+  if kids.len == 1: return kids[0]
+  let n = node(&ps, N_CAT, 0, 0, 0)
+  ps.nodes[n].kids = kids
+  return n
+
+# A term with its quantifiers. -1: nothing (an option-only group, a comment).
+fn parse_quantified(var ps: Ps, var u: Uni, first: Bool) -> Int:
+  let start = ps.i
+  var t = parse_atom(&ps, &u)
+  if ps.err != "" or ps.unsupported: return t
+  if t == -2:
+    # (?imsx) without a body: the options go on to the end of the group (done in parse_atom)
+    return -1
+  let quantifiable = t >= 0 and not invalid_target(ps, t)
+  while ps.err == "" and not ps.unsupported:
+    skip_extended(&ps)
+    if at_end(ps): break
+    let c = peek(ps)
+    var mn = -1
+    var mx = -1
+    let save = ps.i
+    if c == int('*'):
+      mn = 0
+      mx = -1
+      ps.i += 1
+    elif c == int('+'):
+      mn = 1
+      mx = -1
+      ps.i += 1
+    elif c == int('?'):
+      mn = 0
+      mx = 1
+      ps.i += 1
+    elif c == int('{'):
+      let iv = parse_interval(&ps)
+      if iv.len == 0:
+        ps.i = save
+        break
+      mn = iv[0]
+      mx = iv[1]
+    else:
+      break
+    if ps.err != "": return t
+    if t < 0:
+      perr(&ps, "target of repeat operator is not specified")
+      return t
+    if not quantifiable:
+      perr(&ps, "target of repeat operator is invalid")
+      return t
+    var mode = 1
+    if peek(ps) == int('?'):
+      mode = 0
+      ps.i += 1
+    elif peek(ps) == int('+') and c != int('{'):
+      mode = 2
+      ps.i += 1
+    elif peek(ps) == int('+') and c == int('{'):
+      # {n,m}+ is possessive (an interval followed by + is not two quantifiers here)
+      mode = 2
+      ps.i += 1
+    if ps.nodes[t].k == N_CAT and ps.nodes[t].c == 7:
+      # \Q..\E: quantify the last character only
+      let nk = ps.nodes[t].kids.len
+      let last = ps.nodes[t].kids[nk - 1]
+      let r = node(&ps, N_REP, mn, mx, mode)
+      ps.nodes[r].kids = [last]
+      ps.nodes[t].kids[nk - 1] = r
+      ps.nodes[t].c = 0
+      continue
+    let r = node(&ps, N_REP, mn, mx, mode)
+    ps.nodes[r].kids = [t]
+    t = r
+  if start == ps.i and t < 0: return -1
+  return t
+
+# Oniguruma's is_invalid_quantifier_target: anchors (look-arounds too) and \K, or an
+# alternation with one of them; groups and sequences are fine.
+fn invalid_target(ps: Ps, n: Int) -> Bool:
+  let nd = ps.nodes[n]
+  if nd.k == N_ANCHOR or nd.k == N_LOOK or nd.k == N_KEEP: return true
+  if nd.k == N_ALT:
+    for x in nd.kids:
+      if invalid_target(ps, x): return true
+  return false
+
+# {n}, {n,}, {n,m}: [min, max] (max -1: no limit), or [] when it isn't an interval (a literal '{')
+fn parse_interval(var ps: Ps) -> [Int]:
+  let s = ps.p
+  var i = ps.i + 1
+  var a = 0
+  var na = 0
+  while i < s.len and s[i] >= '0' and s[i] <= '9':
+    a = a * 10 + int(s[i] - '0')
+    if a > 1000000: a = 1000000
+    i += 1
+    na += 1
+  if na == 0: return []
+  var b = a
+  if i < s.len and s[i] == ',':
+    i += 1
+    var nb = 0
+    b = 0
+    while i < s.len and s[i] >= '0' and s[i] <= '9':
+      b = b * 10 + int(s[i] - '0')
+      if b > 1000000: b = 1000000
+      i += 1
+      nb += 1
+    if nb == 0: b = -1
+  if i >= s.len or s[i] != '}': return []
+  ps.i = i + 1
+  if a > 100000 or b > 100000:
+    perr(&ps, "too big number for repeat range")
+    return [0, 0]
+  if b >= 0 and b < a:
+    perr(&ps, "upper is smaller than lower in repeat range")
+    return [0, 0]
+  return [a, b]
+
+fn char_node(var ps: Ps, c: Int) -> Int:
+  return node(&ps, N_CHAR, c, b2i((ps.opts & O_ICASE) != 0), 0)
+
+# A class from brackets (case-insensitive under (?i), as Oniguruma closes it over case first).
+fn set_node(var ps: Ps, own r: [Int], neg: Bool) -> Int:
+  ps.sets.push(r)
+  var nb = 0
+  if neg: nb = 1
+  var ic = 0
+  if (ps.opts & O_ICASE) != 0: ic = 1
+  return node(&ps, N_SET, ps.sets.len - 1, nb, ic)
+
+# A class from an escape (\w, \p{Lu}...): never folded.
+fn esc_set(var ps: Ps, own r: [Int]) -> Int:
+  ps.sets.push(r)
+  return node(&ps, N_SET, ps.sets.len - 1, 0, 0)
+
+fn parse_atom(var ps: Ps, var u: Uni) -> Int:
+  let c = peek(ps)
+  if c == int('('): return parse_group(&ps, &u)
+  if c == int('['):
+    ps.i += 1
+    let r = parse_class(&ps, &u)
+    if ps.err != "" or ps.unsupported: return -1
+    return set_node(&ps, r, ps.class_neg)
+  if c == int('.'):
+    ps.i += 1
+    var nl = 0
+    if (ps.opts & O_MULTILINE) != 0: nl = 1
+    return node(&ps, N_ANY, 0, nl, 0)
+  if c == int('^'):
+    ps.i += 1
+    if (ps.opts & O_SINGLELINE) != 0: return node(&ps, N_ANCHOR, A_BEGBUF, 0, 0)
+    return node(&ps, N_ANCHOR, A_BEGLINE, 0, 0)
+  if c == int('$'):
+    ps.i += 1
+    if (ps.opts & O_SINGLELINE) != 0: return node(&ps, N_ANCHOR, A_SEMIEND, 0, 0)
+    return node(&ps, N_ANCHOR, A_ENDLINE, 0, 0)
+  if c == int('*') or c == int('+') or c == int('?'):
+    perr(&ps, "target of repeat operator is not specified")
+    return -1
+  if c == int('{'):
+    let save = ps.i
+    let iv = parse_interval(&ps)
+    if iv.len > 0 and ps.err == "":
+      perr(&ps, "target of repeat operator is not specified")
+      return -1
+    ps.i = save + 1
+    return char_node(&ps, int('{'))
+  if c == int('\\'): return parse_escape(&ps, &u)
+  let cp = next_cp(&ps)
+  return char_node(&ps, cp)
+
+fn parse_escape(var ps: Ps, var u: Uni) -> Int:
+  ps.i += 1
+  if at_end(ps):
+    perr(&ps, "end pattern at escape")
+    return -1
+  let c = next_cp(&ps)
+  if c == int('w') or c == int('W') or c == int('s') or c == int('S') or c == int('d') or c == int('D'):
+    return esc_set(&ps, class_escape(&u, c))
+  if c == int('b'): return node(&ps, N_ANCHOR, A_WORDB, 0, 0)
+  if c == int('B'): return node(&ps, N_ANCHOR, A_NWORDB, 0, 0)
+  if c == int('A'): return node(&ps, N_ANCHOR, A_BEGBUF, 0, 0)
+  if c == int('Z'): return node(&ps, N_ANCHOR, A_SEMIEND, 0, 0)
+  if c == int('z'): return node(&ps, N_ANCHOR, A_ENDBUF, 0, 0)
+  if c == int('G'): return node(&ps, N_ANCHOR, A_BEGPOS, 0, 0)
+  if c == int('K'): return node(&ps, N_KEEP, 0, 0, 0)
+  if c == int('N'): return esc_set(&ps, negate([10, 10]))
+  if c == int('O'): return esc_set(&ps, [0, 0x10FFFF])
+  if c == int('R'):
+    # (?>\r\n|[\n\v\f\r\x85  ])
+    let a = node(&ps, N_CAT, 0, 0, 0)
+    ps.nodes[a].kids = [node(&ps, N_CHAR, 13, 0, 0), node(&ps, N_CHAR, 10, 0, 0)]
+    ps.sets.push([10, 13, 0x85, 0x85, 0x2028, 0x2029])
+    let b = node(&ps, N_SET, ps.sets.len - 1, 0, 0)
+    let alt = node(&ps, N_ALT, 0, 0, 0)
+    ps.nodes[alt].kids = [a, b]
+    let at = node(&ps, N_ATOMIC, 0, 0, 0)
+    ps.nodes[at].kids = [alt]
+    return at
+  if c == int('X') or c == int('y') or c == int('Y') or c == int('g'):
+    unsup(&ps)
+    return -1
+  if c == int('p') or c == int('P'):
+    let r = parse_property(&ps, &u, c == int('P'))
+    if ps.err != "" or ps.unsupported: return -1
+    return esc_set(&ps, r)
+  if c == int('Q'):
+    # quoted to \E (or the end)
+    var kids: [Int] = []
+    while not at_end(ps):
+      if ps.p[ps.i] == '\\' and ps.i + 1 < ps.p.len and ps.p[ps.i + 1] == 'E':
+        ps.i += 2
+        break
+      let cp = next_cp(&ps)
+      kids.push(char_node(&ps, cp))
+    if kids.len == 0: return node(&ps, N_EMPTY, 0, 0, 0)
+    if kids.len == 1: return kids[0]
+    # a string: a quantifier after it takes only its last character
+    let n = node(&ps, N_CAT, 0, 0, 7)
+    ps.nodes[n].kids = kids
+    return n
+  if c == int('k'):
+    return parse_kref(&ps)
+  if c >= int('1') and c <= int('9'):
+    # a backreference (to a group so far, or 1-9), else octal (or the digit 8/9)
+    var j = ps.i - 1
+    var num = 0
+    while j < ps.p.len and ps.p[j] >= '0' and ps.p[j] <= '9' and num < 100000:
+      num = num * 10 + int(ps.p[j] - '0')
+      j += 1
+    if num <= ps.ncap or num <= 9:
+      ps.i = j
+      ps.bref_nums.push(num)
+      ps.brefs.push([num])
+      return node(&ps, N_BREF, ps.brefs.len - 1, b2i((ps.opts & O_ICASE) != 0), 0)
+    if c == int('8') or c == int('9'): return char_node(&ps, c)
+    ps.i -= 1
+    return octal_escape(&ps, 3)
+  if c == int('0'):
+    ps.i -= 1
+    return octal_escape(&ps, 3)
+  let v = escape_value(&ps, c)
+  if v < 0: return -1
+  return char_node(&ps, v)
+
+fn octal_escape(var ps: Ps, maxd: Int) -> Int:
+  var v = 0
+  var n = 0
+  while n < maxd and ps.i < ps.p.len and ps.p[ps.i] >= '0' and ps.p[ps.i] <= '7':
+    v = v * 8 + int(ps.p[ps.i] - '0')
+    ps.i += 1
+    n += 1
+  if v >= 0x80:
+    unsup(&ps)
+    return -1
+  return char_node(&ps, v)
+
+# The code point an escape \c (outside or inside a class) stands for, or -1 (error set).
+fn escape_value(var ps: Ps, c: Int) -> Int:
+  if c == int('t'): return 9
+  if c == int('n'): return 10
+  if c == int('r'): return 13
+  if c == int('f'): return 12
+  if c == int('a'): return 7
+  if c == int('e'): return 27
+  if c == int('x'):
+    if peek(ps) == int('{'):
+      ps.i += 1
+      var v = 0
+      var n = 0
+      while ps.i < ps.p.len and is_hex(ps.p[ps.i]):
+        v = v * 16 + hexv(ps.p[ps.i])
+        ps.i += 1
+        n += 1
+        if n > 8:
+          perr(&ps, "too long wide-char value")
+          return -1
+      if peek(ps) != int('}') or n == 0:
+        unsup(&ps)
+        return -1
+      ps.i += 1
+      if v > 0x10FFFF:
+        perr(&ps, "invalid code point value")
+        return -1
+      return v
+    var v = 0
+    var n = 0
+    while n < 2 and ps.i < ps.p.len and is_hex(ps.p[ps.i]):
+      v = v * 16 + hexv(ps.p[ps.i])
+      ps.i += 1
+      n += 1
+    if v >= 0x80:
+      unsup(&ps)
+      return -1
+    return v
+  if c == int('o') and peek(ps) == int('{'):
+    unsup(&ps)
+    return -1
+  if c == int('c'):
+    if at_end(ps):
+      perr(&ps, "end pattern at control")
+      return -1
+    let x = next_cp(&ps)
+    if x == int('?'): return 0x7F
+    if x == int('\\'):
+      unsup(&ps)
+      return -1
+    return x & 0x9F
+  return c
+
+fn is_hex(c: Byte) -> Bool:
+  return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+
+fn hexv(c: Byte) -> Int:
+  if c >= '0' and c <= '9': return int(c - '0')
+  if c >= 'a' and c <= 'f': return int(c) - 87
+  return int(c) - 55
+
+fn class_escape(var u: Uni, c: Int) -> [Int]:
+  if c == int('w'): return prop_ranges(&u, 12)
+  if c == int('W'): return negate(prop_ranges(&u, 12))
+  if c == int('s'): return prop_ranges(&u, 9)
+  if c == int('S'): return negate(prop_ranges(&u, 9))
+  if c == int('d'): return prop_ranges(&u, 4)
+  return negate(prop_ranges(&u, 4))
+
+fn parse_property(var ps: Ps, var u: Uni, neg0: Bool) -> [Int]:
+  if peek(ps) != int('{'):
+    unsup(&ps)
+    return []
+  ps.i += 1
+  var neg = neg0
+  if peek(ps) == int('^'):
+    neg = not neg
+    ps.i += 1
+  let st = ps.i
+  while ps.i < ps.p.len and ps.p[ps.i] != '}': ps.i += 1
+  if at_end(ps):
+    unsup(&ps)
+    return []
+  let name = ps.p[st..ps.i]
+  ps.i += 1
+  let id = prop_id(u, name)
+  if id < 0:
+    perr(&ps, "invalid character property name {" + name + "}")
+    return []
+  let r = prop_ranges(&u, id)
+  if neg: return negate(r)
+  return r
+
+fn parse_kref(var ps: Ps) -> Int:
+  let open = peek(ps)
+  if open != int('<') and open != int('\''):
+    perr(&ps, "invalid backref number/name")
+    return -1
+  var close: Byte = '>'
+  if open == int('\''): close = '\''
+  ps.i += 1
+  let st = ps.i
+  while ps.i < ps.p.len and ps.p[ps.i] != close: ps.i += 1
+  if at_end(ps):
+    perr(&ps, "invalid backref number/name")
+    return -1
+  let name = ps.p[st..ps.i]
+  ps.i += 1
+  if name == "":
+    perr(&ps, "group name is empty")
+    return -1
+  var ic = 0
+  if (ps.opts & O_ICASE) != 0: ic = 1
+  if name[0] >= '0' and name[0] <= '9':
+    let num = int(name) else -1
+    if num < 0:
+      unsup(&ps)
+      return -1
+    ps.bref_nums.push(num)
+    ps.brefs.push([num])
+    return node(&ps, N_BREF, ps.brefs.len - 1, ic, 0)
+  if name[0] == '-' or name[0] == '+' or name.find("+") >= 0 or name.find("-") > 0:
+    unsup(&ps)
+    return -1
+  # a name must be defined before it is used
+  var gs: [Int] = []
+  for g in 1..ps.ncap + 1:
+    if ps.names[g] == name: gs.push(g)
+  if gs.len == 0:
+    perr(&ps, "undefined name <" + name + "> reference")
+    return -1
+  ps.brefs.push(gs)
+  return node(&ps, N_BREF, ps.brefs.len - 1, ic, 0)
+
+fn valid_name(n: Str) -> Bool:
+  if n.len == 0: return false
+  let c = n[0]
+  if c >= '0' and c <= '9': return false
+  for b in bytes(n):
+    if not ((b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_' or int(b) >= 0x80): return false
+  return true
+
+fn parse_group(var ps: Ps, var u: Uni) -> Int:
+  ps.i += 1
+  ps.depth += 1
+  if ps.depth > 4000:
+    perr(&ps, "parse depth limit over")
+    return -1
+  let saved = ps.opts
+  var kind = 0          # 0 capture, 1 plain, 2 look, 3 atomic
+  var look = 0
+  var optgroup = false
+  var name = ""
+  if peek(ps) == int('?'):
+    ps.i += 1
+    if at_end(ps):
+      perr(&ps, "end pattern in group")
+      return -1
+    let c = peek(ps)
+    if c == int('#'):
+      while ps.i < ps.p.len and ps.p[ps.i] != ')': ps.i += 1
+      if at_end(ps):
+        perr(&ps, "end pattern in group")
+        return -1
+      ps.i += 1
+      ps.depth -= 1
+      return -1
+    if c == int(':'):
+      kind = 1
+      ps.i += 1
+    elif c == int('='):
+      kind = 2
+      look = 0
+      ps.i += 1
+    elif c == int('!'):
+      kind = 2
+      look = 1
+      ps.i += 1
+    elif c == int('>'):
+      kind = 3
+      ps.i += 1
+    elif c == int('<') and ps.i + 1 < ps.p.len and (ps.p[ps.i + 1] == '=' or ps.p[ps.i + 1] == '!'):
+      kind = 2
+      if ps.p[ps.i + 1] == '=': look = 2
+      else: look = 3
+      ps.i += 2
+    elif c == int('<') or c == int('\''):
+      var close: Byte = '>'
+      if c == int('\''): close = '\''
+      ps.i += 1
+      let st = ps.i
+      while ps.i < ps.p.len and ps.p[ps.i] != close: ps.i += 1
+      if at_end(ps):
+        if st == ps.i: perr(&ps, "end pattern with unmatched parenthesis")
+        else: perr(&ps, "invalid group name <" + ps.p[st..ps.i] + ">")
+        return -1
+      name = ps.p[st..ps.i]
+      ps.i += 1
+      if name == "":
+        perr(&ps, "group name is empty")
+        return -1
+      if not valid_name(name):
+        if name[0] >= '0' and name[0] <= '9': perr(&ps, "invalid group name <" + name + ">")
+        else: perr(&ps, "invalid char in group name <" + name + ">")
+        return -1
+    elif c == int('(') :
+      return parse_cond(&ps, &u, saved)
+    elif c == int('i') or c == int('m') or c == int('s') or c == int('x') or c == int('-') or c == int('a'):
+      var neg = false
+      while true:
+        if at_end(ps):
+          perr(&ps, "end pattern in group")
+          return -1
+        let o = peek(ps)
+        if o == int(')') or o == int(':'): break
+        if o == int('-'): neg = true
+        elif o == int('i'): ps.opts = opt_set(ps.opts, O_ICASE, not neg)
+        elif o == int('x'): ps.opts = opt_set(ps.opts, O_EXTEND, not neg)
+        elif o == int('s'): ps.opts = opt_set(ps.opts, O_MULTILINE, not neg)
+        elif o == int('m'): ps.opts = opt_set(ps.opts, O_SINGLELINE, neg)
+        elif o == int('a'):
+          unsup(&ps)
+          return -1
+        else:
+          perr(&ps, "undefined group option")
+          return -1
+        ps.i += 1
+      if peek(ps) == int(')'):
+        # options for the rest of the enclosing group
+        ps.i += 1
+        ps.depth -= 1
+        return -2
+      ps.i += 1
+      kind = 1
+      optgroup = true
+    elif c == int('~') or c == int('{') or c == int('R') or c == int('&') or c == int('P') or (c >= int('0') and c <= int('9')) or c == int('+'):
+      unsup(&ps)
+      return -1
+    else:
+      perr(&ps, "undefined group option")
+      return -1
+  elif peek(ps) == int('*'):
+    unsup(&ps)
+    return -1
+  var gnum = 0
+  if kind == 0:
+    ps.ncap += 1
+    gnum = ps.ncap
+    ps.names.push(name)
+  let body = parse_alt(&ps, &u, false)
+  if ps.err != "" or ps.unsupported: return -1
+  if at_end(ps) or peek(ps) != int(')'):
+    perr(&ps, "end pattern with unmatched parenthesis")
+    return -1
+  ps.i += 1
+  let had_opts = ps.opts != saved
+  ps.opts = saved
+  ps.depth -= 1
+  if kind == 1:
+    if had_opts or optgroup:
+      # an option group is a node of its own in Oniguruma (it can be quantified)
+      let og = node(&ps, N_CAT, 0, 0, 0)
+      ps.nodes[og].kids = [body]
+      return og
+    return body
+  if kind == 0:
+    let n = node(&ps, N_CAP, gnum, 0, 0)
+    ps.nodes[n].kids = [body]
+    return n
+  if kind == 2:
+    let n = node(&ps, N_LOOK, look, 0, 0)
+    ps.nodes[n].kids = [body]
+    return n
+  let n = node(&ps, N_ATOMIC, 0, 0, 0)
+  ps.nodes[n].kids = [body]
+  return n
+
+fn opt_set(o: Int, bit: Int, on: Bool) -> Int:
+  if on: return o | bit
+  return o & (0x7FFFFFFF - bit)
+
+# (?(1)yes|no), (?(<name>)yes|no)
+fn parse_cond(var ps: Ps, var u: Uni, saved: Int) -> Int:
+  ps.i += 1
+  let st = ps.i
+  while ps.i < ps.p.len and ps.p[ps.i] != ')': ps.i += 1
+  if at_end(ps):
+    perr(&ps, "invalid if-else syntax")
+    return -1
+  var ref = ps.p[st..ps.i]
+  ps.i += 1
+  if ref.len >= 2 and ((ref[0] == '<' and ref[ref.len - 1] == '>') or (ref[0] == '\'' and ref[ref.len - 1] == '\'')):
+    ref = ref[1..ref.len - 1]
+  let num = int(ref) else -1
+  if num <= 0:
+    unsup(&ps)
+    return -1
+  ps.bref_nums.push(num)
+  let body = parse_alt(&ps, &u, false)
+  if ps.err != "" or ps.unsupported: return -1
+  if at_end(ps) or peek(ps) != int(')'):
+    perr(&ps, "end pattern with unmatched parenthesis")
+    return -1
+  ps.i += 1
+  ps.opts = saved
+  ps.depth -= 1
+  var yes = body
+  var no = node(&ps, N_EMPTY, 0, 0, 0)
+  if ps.nodes[body].k == N_ALT:
+    if ps.nodes[body].kids.len > 2:
+      perr(&ps, "invalid if-else syntax")
+      return -1
+    yes = ps.nodes[body].kids[0]
+    no = ps.nodes[body].kids[1]
+  let n = node(&ps, N_COND, num, 0, 0)
+  ps.nodes[n].kids = [yes, no]
+  return n
+
+# A bracket class after its '['; returns its ranges (negation applied).
+fn parse_class(var ps: Ps, var u: Uni) -> [Int]:
+  var neg = false
+  if peek(ps) == int('^'):
+    neg = true
+    ps.i += 1
+  var r: [Int] = []
+  var first = true
+  var prev = -1          # the last single character (for a range), -1 none
+  while true:
+    if at_end(ps):
+      perr(&ps, "premature end of char-class")
+      return []
+    let c = peek(ps)
+    if c == int(']'):
+      if not first:
+        ps.i += 1
+        break
+      # a ']' first is a literal when another one comes later
+      if ps.p[ps.i + 1..ps.p.len].find("]") < 0:
+        perr(&ps, "empty char-class")
+        return []
+    first = false
+    if c == int('[') and ps.i + 1 < ps.p.len and ps.p[ps.i + 1] == ':':
+      let pr = posix_bracket(&ps, &u)
+      if ps.err != "" or ps.unsupported: return []
+      if pr.len > 0 or ps.p[ps.i - 1] == ']':
+        add_ranges(&r, pr)
+        prev = -1
+        continue
+    var lo = -1
+    var multi: [Int] = []
+    var is_multi = false
+    if c == int('\\'):
+      ps.i += 1
+      if at_end(ps):
+        perr(&ps, "end pattern at escape")
+        return []
+      let e = next_cp(&ps)
+      if e == int('w') or e == int('W') or e == int('s') or e == int('S') or e == int('d') or e == int('D'):
+        multi = class_escape(&u, e)
+        is_multi = true
+      elif e == int('p') or e == int('P'):
+        multi = parse_property(&ps, &u, e == int('P'))
+        if ps.err != "" or ps.unsupported: return []
+        is_multi = true
+      elif e == int('b'):
+        lo = 8
+      elif e >= int('0') and e <= int('7'):
+        ps.i -= 1
+        var v = 0
+        var n = 0
+        while n < 3 and ps.i < ps.p.len and ps.p[ps.i] >= '0' and ps.p[ps.i] <= '7':
+          v = v * 8 + int(ps.p[ps.i] - '0')
+          ps.i += 1
+          n += 1
+        if v >= 0x80:
+          unsup(&ps)
+          return []
+        lo = v
+      elif e == int('R') or e == int('X') or e == int('N') or e == int('O') or e == int('K'):
+        unsup(&ps)
+        return []
+      else:
+        lo = escape_value(&ps, e)
+        if lo < 0: return []
+    else:
+      lo = next_cp(&ps)
+    if is_multi:
+      if peek(ps) == int('-') and ps.i + 1 < ps.p.len and ps.p[ps.i + 1] != ']':
+        unsup(&ps)
+        return []
+      add_ranges(&r, multi)
+      prev = -1
+      continue
+    # a range a-b?
+    if peek(ps) == int('-') and ps.i + 1 < ps.p.len and ps.p[ps.i + 1] != ']':
+      ps.i += 1
+      var hi = -1
+      let c2 = peek(ps)
+      if c2 == int('['):
+        unsup(&ps)
+        return []
+      if c2 == int('\\'):
+        ps.i += 1
+        if at_end(ps):
+          perr(&ps, "end pattern at escape")
+          return []
+        let e2 = next_cp(&ps)
+        if e2 == int('w') or e2 == int('W') or e2 == int('s') or e2 == int('S') or e2 == int('d') or e2 == int('D') or e2 == int('p') or e2 == int('P'):
+          unsup(&ps)
+          return []
+        if e2 == int('b'): hi = 8
+        elif e2 >= int('0') and e2 <= int('7'):
+          unsup(&ps)
+          return []
+        else:
+          hi = escape_value(&ps, e2)
+          if hi < 0: return []
+      else:
+        hi = next_cp(&ps)
+      if hi < lo:
+        perr(&ps, "empty range in char class")
+        return []
+      r.push(lo)
+      r.push(hi)
+      prev = -1
+      continue
+    r.push(lo)
+    r.push(lo)
+    prev = lo
+  # negation comes after case closure (at match time), so it is kept apart
+  ps.class_neg = neg
+  return norm(r)
+
+fn posix_bracket(var ps: Ps, var u: Uni) -> [Int]:
+  # at "[:"
+  let st = ps.i
+  var j = ps.i + 2
+  var neg = false
+  if j < ps.p.len and ps.p[j] == '^':
+    neg = true
+    j += 1
+  let ns = j
+  while j < ps.p.len and ps.p[j] >= 'a' and ps.p[j] <= 'z': j += 1
+  if j + 1 < ps.p.len and ps.p[j] == ':' and ps.p[j + 1] == ']':
+    let name = ps.p[ns..j]
+    var id = -1
+    if name == "alpha": id = 1
+    elif name == "blank": id = 2
+    elif name == "cntrl": id = 3
+    elif name == "digit": id = 4
+    elif name == "graph": id = 5
+    elif name == "lower": id = 6
+    elif name == "print": id = 7
+    elif name == "punct": id = 8
+    elif name == "space": id = 9
+    elif name == "upper": id = 10
+    elif name == "xdigit": id = 11
+    elif name == "word": id = 12
+    elif name == "alnum": id = 13
+    elif name == "ascii": id = 14
+    if id < 0:
+      perr(&ps, "invalid POSIX bracket type")
+      return []
+    ps.i = j + 2
+    let r = prop_ranges(&u, id)
+    if neg: return negate(r)
+    return r
+  # not a POSIX bracket: Oniguruma checks for a closing ":]" further on
+  var k = ps.i + 2
+  while k + 1 < ps.p.len:
+    if ps.p[k] == ':' and ps.p[k + 1] == ']':
+      perr(&ps, "invalid POSIX bracket type")
+      return []
+    if ps.p[k] == ']': break
+    k += 1
+  # a literal '['
+  ps.i = st + 1
+  return [int('['), int('[')]
+
+fn compile_rx(pat: Str, opts: Int, var u: Uni) -> Rx:
+  var ps = Ps(pat, 0, opts | O_SINGLELINE, [], [], [], [], [], 0, [""], "", false, 0, false)
+  let root = parse_alt(&ps, &u, true)
+  var rx = Rx([], [], [], 0, [], 0, opts | O_SINGLELINE, "", false, -1, false)
+  if ps.err == "" and not ps.unsupported and not at_end(ps):
+    perr(&ps, "unmatched close parenthesis")
+  if ps.err == "" and not ps.unsupported:
+    var badref = false
+    for n in ps.bref_nums:
+      if n > ps.ncap: badref = true
+    if badref: perr(&ps, "invalid backref number/name")
+  if ps.err != "":
+    rx.err = ps.err
+    return rx
+  if ps.unsupported:
+    rx.unsupported = true
+    return rx
+  rx.ncap = ps.ncap
+  for nm in ps.names: rx.names.push(nm)
+  swap(&rx.sets, &ps.sets)
+  swap(&rx.brefs, &ps.brefs)
+  var cs = Cs([], 0, false)
+  emit(&cs, ps, u, root)
+  if cs.bad:
+    rx.unsupported = true
+    return rx
+  cs.code.push(I_MATCH)
+  cs.code.push(0)
+  cs.code.push(0)
+  swap(&rx.code, &cs.code)
+  rx.nslots = cs.nslots
+  rx.lead = lead_char(ps, root)
+  rx.anchored = starts_anchored(ps, root)
+  return rx
+
+# ---------------------------------------------------------------- compiling to instructions
+
+type Cs:
+  code: [Int]
+  nslots: Int
+  bad: Bool
+
+fn ins(var cs: Cs, op: Int, a: Int, b: Int) -> Int:
+  let pc = cs.code.len
+  cs.code.push(op)
+  cs.code.push(a)
+  cs.code.push(b)
+  return pc
+
+fn nullable(ps: Ps, n: Int) -> Bool:
+  let nd = ps.nodes[n]
+  let k = nd.k
+  if k == N_CHAR or k == N_ANY or k == N_SET: return false
+  if k == N_CAT:
+    for x in nd.kids:
+      if not nullable(ps, x): return false
+    return true
+  if k == N_ALT:
+    for x in nd.kids:
+      if nullable(ps, x): return true
+    return false
+  if k == N_CAP or k == N_ATOMIC: return nullable(ps, nd.kids[0])
+  if k == N_REP: return nd.a == 0 or nullable(ps, nd.kids[0])
+  if k == N_COND: return nullable(ps, nd.kids[0]) or nullable(ps, nd.kids[1])
+  return true
+
+# Length in characters if fixed, else -1.
+fn fixed_len(ps: Ps, n: Int) -> Int:
+  let nd = ps.nodes[n]
+  let k = nd.k
+  if k == N_CHAR or k == N_ANY or k == N_SET: return 1
+  if k == N_EMPTY or k == N_ANCHOR or k == N_LOOK or k == N_KEEP: return 0
+  if k == N_CAT:
+    var t = 0
+    for x in nd.kids:
+      let l = fixed_len(ps, x)
+      if l < 0: return -1
+      t += l
+    return t
+  if k == N_ALT:
+    var l0 = -1
+    for x in nd.kids:
+      let l = fixed_len(ps, x)
+      if l < 0: return -1
+      if l0 >= 0 and l != l0: return -1
+      l0 = l
+    return l0
+  if k == N_CAP or k == N_ATOMIC: return fixed_len(ps, nd.kids[0])
+  if k == N_REP:
+    if nd.a != nd.b: return -1
+    let l = fixed_len(ps, nd.kids[0])
+    if l < 0: return -1
+    return l * nd.a
+  return -1
+
+fn emit(var cs: Cs, ps: Ps, u: Uni, n: Int):
+  if cs.code.len > 3000000:
+    cs.bad = true
+    return
+  let nd = ps.nodes[n]
+  let k = nd.k
+  if k == N_EMPTY: return
+  if k == N_CHAR:
+    if nd.b != 0:
+      let f = fold(u, nd.a)
+      # characters whose case doesn't vary stay plain
+      if f == nd.a and not has_unfold(u, nd.a): ins(&cs, I_CHAR, nd.a, 0)
+      else: ins(&cs, I_CHARI, f, 0)
+    else:
+      ins(&cs, I_CHAR, nd.a, 0)
+    return
+  if k == N_ANY:
+    if nd.b != 0: ins(&cs, I_ANYNL, 0, 0)
+    else: ins(&cs, I_ANY, 0, 0)
+    return
+  if k == N_SET:
+    ins(&cs, I_SET, nd.a, nd.b + 2 * nd.c)
+    return
+  if k == N_CAT:
+    for x in nd.kids: emit(&cs, ps, u, x)
+    return
+  if k == N_ALT:
+    var jumps: [Int] = []
+    for i in 0..nd.kids.len:
+      if i < nd.kids.len - 1:
+        let sp = ins(&cs, I_SPLIT, 0, 0)
+        cs.code[sp + 1] = cs.code.len
+        emit(&cs, ps, u, nd.kids[i])
+        jumps.push(ins(&cs, I_JMP, 0, 0))
+        cs.code[sp + 2] = cs.code.len
+      else:
+        emit(&cs, ps, u, nd.kids[i])
+    for j in jumps: cs.code[j + 1] = cs.code.len
+    return
+  if k == N_CAP:
+    ins(&cs, I_SAVE, 2 * nd.a, 0)
+    emit(&cs, ps, u, nd.kids[0])
+    ins(&cs, I_SAVE, 2 * nd.a + 1, 0)
+    return
+  if k == N_ANCHOR:
+    ins(&cs, I_ASSERT, nd.a, 0)
+    return
+  if k == N_BREF:
+    ins(&cs, I_BREF, nd.a, nd.b)
+    return
+  if k == N_KEEP:
+    ins(&cs, I_KEEP, 0, 0)
+    return
+  if k == N_LOOK:
+    var len = 0
+    if nd.a >= 2:
+      len = fixed_len(ps, nd.kids[0])
+      if len < 0:
+        cs.bad = true
+        return
+    let pc = ins(&cs, I_LOOK, nd.a | (len << 2), 0)
+    emit(&cs, ps, u, nd.kids[0])
+    ins(&cs, I_SUCCEED, 0, 0)
+    cs.code[pc + 2] = cs.code.len
+    return
+  if k == N_ATOMIC:
+    let pc = ins(&cs, I_ATOMIC, 0, 0)
+    emit(&cs, ps, u, nd.kids[0])
+    ins(&cs, I_SUCCEED, 0, 0)
+    cs.code[pc + 2] = cs.code.len
+    return
+  if k == N_COND:
+    let pc = ins(&cs, I_COND, nd.a, 0)
+    emit(&cs, ps, u, nd.kids[0])
+    let j = ins(&cs, I_JMP, 0, 0)
+    cs.code[pc + 2] = cs.code.len
+    emit(&cs, ps, u, nd.kids[1])
+    cs.code[j + 1] = cs.code.len
+    return
+  if k == N_REP:
+    if nd.c == 2:
+      # possessive: atomic greedy
+      let pc = ins(&cs, I_ATOMIC, 0, 0)
+      emit_rep(&cs, ps, u, nd.kids[0], nd.a, nd.b, true)
+      ins(&cs, I_SUCCEED, 0, 0)
+      cs.code[pc + 2] = cs.code.len
+      return
+    emit_rep(&cs, ps, u, nd.kids[0], nd.a, nd.b, nd.c == 1)
+    return
+
+fn has_unfold(u: Uni, c: Int) -> Bool:
+  var lo = 0
+  var hi = u.unfold_key.len - 1
+  while lo <= hi:
+    let mid = (lo + hi) / 2
+    let m = u.unfold_key[mid]
+    if m == c: return true
+    if m < c: lo = mid + 1
+    else: hi = mid - 1
+  return false
+
+fn emit_rep(var cs: Cs, ps: Ps, u: Uni, body: Int, mn: Int, mx: Int, greedy: Bool):
+  for i in 0..mn:
+    emit(&cs, ps, u, body)
+    if cs.bad: return
+  if mx == -1:
+    let check = nullable(ps, body)
+    let top = ins(&cs, I_SPLIT, 0, 0)
+    let start = cs.code.len
+    var slot = -1
+    if check:
+      slot = cs.nslots
+      cs.nslots += 1
+      ins(&cs, I_ECHK_S, slot, 0)
+    emit(&cs, ps, u, body)
+    var ec = -1
+    if check: ec = ins(&cs, I_ECHK_E, slot, 0)
+    ins(&cs, I_JMP, top, 0)
+    let out = cs.code.len
+    if greedy:
+      cs.code[top + 1] = start
+      cs.code[top + 2] = out
+    else:
+      cs.code[top + 1] = out
+      cs.code[top + 2] = start
+    if ec >= 0: cs.code[ec + 2] = out
+    return
+  var splits: [Int] = []
+  for i in mn..mx:
+    let sp = ins(&cs, I_SPLIT, 0, 0)
+    splits.push(sp)
+    cs.code[sp + 1] = cs.code.len
+    emit(&cs, ps, u, body)
+    if cs.bad: return
+  let out = cs.code.len
+  for sp in splits:
+    let first = cs.code[sp + 1]
+    if greedy:
+      cs.code[sp + 2] = out
+    else:
+      cs.code[sp + 1] = out
+      cs.code[sp + 2] = first
+
+# A code point every match must start with (case-sensitively), or -1.
+fn lead_char(ps: Ps, n: Int) -> Int:
+  let nd = ps.nodes[n]
+  if nd.k == N_CHAR and nd.b == 0: return nd.a
+  if nd.k == N_CAT and nd.kids.len > 0: return lead_char(ps, nd.kids[0])
+  if nd.k == N_CAP: return lead_char(ps, nd.kids[0])
+  if nd.k == N_REP and nd.a > 0: return lead_char(ps, nd.kids[0])
+  return -1
+
+fn starts_anchored(ps: Ps, n: Int) -> Bool:
+  let nd = ps.nodes[n]
+  if nd.k == N_ANCHOR: return nd.a == A_BEGBUF
+  if nd.k == N_CAT and nd.kids.len > 0: return starts_anchored(ps, nd.kids[0])
+  if nd.k == N_CAP: return starts_anchored(ps, nd.kids[0])
+  return false
+
+# ---------------------------------------------------------------- matching
+
+type Mx:
+  s: Str
+  caps: [Int]
+  slots: [Int]
+  stk: [Int]           # backtracking: kind, a, b triples
+  search_start: Int    # where this search began (\G)
+  keep: Int            # \K's position, -1 none
+  best: Int            # -l: the longest end so far
+  best_caps: [Int]
+  steps: Int
+
+const BT_ALT = 1
+const BT_CAP = 2
+const BT_SLOT = 3
+const BT_KEEP = 4
+
+fn is_word(var u: Uni, s: Str, i: Int) -> Bool:
+  let c = int(s[i])
+  if c < 0x80:
+    return (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57) or c == 95
+  let d = dec(s, i)
+  return in_prop(&u, 12, d >> 3)
+
+fn prev_start(s: Str, i: Int) -> Int:
+  var j = i - 1
+  while j > 0 and (int(s[j]) & 0xC0) == 0x80: j -= 1
+  return j
+
+fn assert_ok(var m: Mx, var u: Uni, kind: Int, pos: Int) -> Bool:
+  let s = m.s
+  let n = s.len
+  if kind == A_BEGBUF: return pos == 0
+  if kind == A_ENDBUF: return pos == n
+  if kind == A_SEMIEND: return pos == n or (pos == n - 1 and s[pos] == '\n')
+  if kind == A_BEGLINE: return pos == 0 or s[pos - 1] == '\n'
+  if kind == A_ENDLINE: return pos == n or s[pos] == '\n'
+  if kind == A_BEGPOS: return pos == m.search_start
+  let a = pos > 0 and is_word(&u, s, prev_start(s, pos))
+  let b = pos < n and is_word(&u, s, pos)
+  if kind == A_WORDB: return a != b
+  return a == b
+
+# Runs the program from pc at pos: the end position, or -1. Backtracking entries above the
+# stack's height at entry stay there on success (the caller keeps or drops them).
+fn run(var m: Mx, rx: Rx, var u: Uni, pc0: Int, pos0: Int, start: Int) -> Int:
+  let base = m.stk.len
+  let code = rx.code
+  let s = m.s
+  let n = s.len
+  var pc = pc0
+  var pos = pos0
+  while true:
+    let op = code[pc]
+    var ok = true
+    if op == I_CHAR:
+      let c = code[pc + 1]
+      if c < 0x80:
+        if pos < n and int(s[pos]) == c:
+          pos += 1
+          pc += 3
+          continue
+        ok = false
+      elif pos < n:
+        let d = dec(s, pos)
+        if (d >> 3) == c:
+          pos += d & 7
+          pc += 3
+          continue
+        ok = false
+      else:
+        ok = false
+    elif op == I_CHARI:
+      if pos < n:
+        let d = dec(s, pos)
+        if fold(u, d >> 3) == code[pc + 1]:
+          pos += d & 7
+          pc += 3
+          continue
+      ok = false
+    elif op == I_ANY:
+      if pos < n and s[pos] != '\n':
+        pos += dec(s, pos) & 7
+        pc += 3
+        continue
+      ok = false
+    elif op == I_ANYNL:
+      if pos < n:
+        pos += dec(s, pos) & 7
+        pc += 3
+        continue
+      ok = false
+    elif op == I_SET:
+      if pos < n:
+        let d = dec(s, pos)
+        let fl = code[pc + 2]
+        let has = set_has(u, rx.sets[code[pc + 1]], d >> 3, (fl & 2) != 0)
+        if has != ((fl & 1) != 0):
+          pos += d & 7
+          pc += 3
+          continue
+      ok = false
+    elif op == I_SPLIT:
+      m.stk.push(BT_ALT)
+      m.stk.push(code[pc + 2])
+      m.stk.push(pos)
+      pc = code[pc + 1]
+      continue
+    elif op == I_JMP:
+      pc = code[pc + 1]
+      continue
+    elif op == I_SAVE:
+      let k = code[pc + 1]
+      m.stk.push(BT_CAP)
+      m.stk.push(k)
+      m.stk.push(m.caps[k])
+      m.caps[k] = pos
+      pc += 3
+      continue
+    elif op == I_ASSERT:
+      if assert_ok(&m, &u, code[pc + 1], pos):
+        pc += 3
+        continue
+      ok = false
+    elif op == I_KEEP:
+      m.stk.push(BT_KEEP)
+      m.stk.push(m.keep)
+      m.stk.push(0)
+      m.keep = pos
+      pc += 3
+      continue
+    elif op == I_ECHK_S:
+      let k = code[pc + 1]
+      m.stk.push(BT_SLOT)
+      m.stk.push(k)
+      m.stk.push(m.slots[k])
+      m.slots[k] = pos
+      pc += 3
+      continue
+    elif op == I_ECHK_E:
+      if m.slots[code[pc + 1]] == pos: pc = code[pc + 2]
+      else: pc += 3
+      continue
+    elif op == I_BREF:
+      let gs = rx.brefs[code[pc + 1]]
+      var matched = -1
+      var gi = gs.len - 1
+      while gi >= 0:
+        let g = gs[gi]
+        let b0 = m.caps[2 * g]
+        let e0 = m.caps[2 * g + 1]
+        if b0 >= 0 and e0 >= 0:
+          matched = bref_at(s, &u, b0, e0, pos, code[pc + 2] != 0)
+          break
+        gi -= 1
+      if matched >= 0:
+        pos = matched
+        pc += 3
+        continue
+      ok = false
+    elif op == I_COND:
+      let g = code[pc + 1]
+      if m.caps[2 * g] >= 0 and m.caps[2 * g + 1] >= 0: pc += 3
+      else: pc = code[pc + 2]
+      continue
+    elif op == I_LOOK:
+      let kind = code[pc + 1] & 3
+      let len = code[pc + 1] >> 2
+      var from = pos
+      var possible = true
+      if kind >= 2:
+        var j = 0
+        while j < len:
+          if from <= 0:
+            possible = false
+            break
+          from = prev_start(s, from)
+          j += 1
+      let h = m.stk.len
+      var r = -1
+      if possible: r = run(&m, rx, &u, pc + 3, from, start)
+      let positive = kind == 0 or kind == 2
+      if r >= 0:
+        if positive:
+          keep_undo(&m, h)
+          pc = code[pc + 2]
+          continue
+        unwind(&m, h)
+        ok = false
+      else:
+        if positive:
+          ok = false
+        else:
+          pc = code[pc + 2]
+          continue
+    elif op == I_ATOMIC:
+      let h = m.stk.len
+      let r = run(&m, rx, &u, pc + 3, pos, start)
+      if r >= 0:
+        keep_undo(&m, h)
+        pos = r
+        pc = code[pc + 2]
+        continue
+      ok = false
+    elif op == I_SUCCEED:
+      return pos
+    elif op == I_MATCH:
+      var mstart = start
+      if m.keep >= 0: mstart = m.keep
+      if (rx.opts & O_NOTEMPTY) != 0 and pos == start:
+        ok = false
+      elif (rx.opts & O_LONGEST) != 0:
+        if pos - start > m.best:
+          m.best = pos - start
+          var bc: [Int] = []
+          for x in m.caps: bc.push(x)
+          swap(&m.best_caps, &bc)
+          if m.keep >= 0: m.best_caps[0] = m.keep
+          else: m.best_caps[0] = start
+          m.best_caps[1] = pos
+        ok = false
+      else:
+        return pos
+    if not ok:
+      # backtrack
+      m.steps += 1
+      var resumed = false
+      while m.stk.len > base:
+        let t = m.stk.len - 3
+        let kind = m.stk[t]
+        let a = m.stk[t + 1]
+        let b = m.stk[t + 2]
+        m.stk.truncate(t)
+        if kind == BT_ALT:
+          pc = a
+          pos = b
+          resumed = true
+          break
+        if kind == BT_CAP: m.caps[a] = b
+        elif kind == BT_SLOT: m.slots[a] = b
+        elif kind == BT_KEEP: m.keep = a
+      if not resumed: return -1
+  return -1
+
+# Drops the choice points above h, keeping what undoes captures (for atomic groups and
+# look-arounds that succeeded).
+fn keep_undo(var m: Mx, h: Int):
+  var w = h
+  var i = h
+  while i < m.stk.len:
+    if m.stk[i] != BT_ALT:
+      m.stk[w] = m.stk[i]
+      m.stk[w + 1] = m.stk[i + 1]
+      m.stk[w + 2] = m.stk[i + 2]
+      w += 3
+    i += 3
+  m.stk.truncate(w)
+
+fn unwind(var m: Mx, h: Int):
+  while m.stk.len > h:
+    let t = m.stk.len - 3
+    let kind = m.stk[t]
+    let a = m.stk[t + 1]
+    let b = m.stk[t + 2]
+    m.stk.truncate(t)
+    if kind == BT_CAP: m.caps[a] = b
+    elif kind == BT_SLOT: m.slots[a] = b
+    elif kind == BT_KEEP: m.keep = a
+
+fn bref_at(s: Str, var u: Uni, b0: Int, e0: Int, pos: Int, icase: Bool) -> Int:
+  if not icase:
+    let len = e0 - b0
+    if pos + len > s.len: return -1
+    for i in 0..len:
+      if s[b0 + i] != s[pos + i]: return -1
+    return pos + len
+  var i = b0
+  var j = pos
+  while i < e0:
+    if j >= s.len: return -1
+    let d1 = dec(s, i)
+    let d2 = dec(s, j)
+    if fold(u, d1 >> 3) != fold(u, d2 >> 3): return -1
+    i += d1 & 7
+    j += d2 & 7
+  return j
+
+# Searches s from byte offset `from`. Returns false when there is no match; else out holds
+# 2 * (ncap + 1) byte offsets (-1 for a group that didn't take part).
+fn search(rx: Rx, var u: Uni, s: Str, from: Int, var out: [Int]) -> Bool:
+  let nc = 2 * (rx.ncap + 1)
+  var m = Mx(s, [-1] * nc, [-1] * (rx.nslots + 1), [], from, -1, -1, [], 0)
+  var st = from
+  let longest = (rx.opts & O_LONGEST) != 0
+  while st <= s.len:
+    if rx.lead >= 0 and rx.lead < 0x80:
+      # skip to the next possible start
+      var j = st
+      while j < s.len and int(s[j]) != rx.lead: j += 1
+      if j >= s.len: break
+      st = j
+    for i in 0..nc: m.caps[i] = -1
+    m.keep = -1
+    m.stk.truncate(0)
+    let r = run(&m, rx, &u, 0, st, st)
+    if r >= 0:
+      for i in 0..nc: out[i] = m.caps[i]
+      if m.keep >= 0: out[0] = m.keep
+      else: out[0] = st
+      out[1] = r
+      return true
+    if longest and m.best >= 0 and (st + m.best >= s.len):
+      break
+    if rx.anchored: break
+    if st >= s.len: break
+    st += dec(s, st) & 7
+  if longest and m.best >= 0:
+    for i in 0..nc: out[i] = m.best_caps[i]
+    return true
+  return false
