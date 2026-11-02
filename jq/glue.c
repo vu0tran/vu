@@ -5,6 +5,8 @@
    its shared library, not its development headers, is needed. */
 #define _GNU_SOURCE
 #include <math.h>
+#include <float.h>
+#include <stdint.h>
 #include <time.h>
 #include <string.h>
 #include <errno.h>
@@ -14,6 +16,23 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* exp10 as the glibc jq 1.7.1's release binaries are linked with computes it (e_exp10.c before
+   glibc 2.39: exp of the argument split in two parts times ln 10, not correctly rounded) */
+static double jq_exp10(double arg) {
+    static const double log10_high = 0x2.4d7637p0;
+    static const double log10_low = 0x1.daaa8ac16ea57p-26;
+    if (!isfinite(arg)) return exp(arg);
+    if (arg < DBL_MIN_10_EXP - DBL_DIG - 10) return DBL_MIN * DBL_MIN;
+    if (arg > DBL_MAX_10_EXP + 1) return DBL_MAX * DBL_MAX;
+    if (fabs(arg) < 0x1p-56) return 1.0;
+    union { double d; uint64_t u; } h = { arg };
+    h.u &= 0xfffffffff8000000ULL;
+    double arg_high = h.d, arg_low = arg - arg_high;
+    double exp_high = arg_high * log10_high;
+    double exp_low = arg_high * log10_low + arg_low * M_LN10;
+    return exp(exp_high) * exp(exp_low);
+}
+
 /* ---- math: one entry point per arity, op chosen by number (see run.vu's math table) */
 double vjq_m1(int64_t op, double x) {
     switch (op) {
@@ -21,7 +40,7 @@ double vjq_m1(int64_t op, double x) {
     case 3: return asinh(x);  case 4: return atan(x);   case 5: return atanh(x);
     case 6: return cbrt(x);   case 7: return ceil(x);   case 8: return cos(x);
     case 9: return cosh(x);   case 10: return erf(x);   case 11: return erfc(x);
-    case 12: return exp(x);   case 13: return exp10(x); case 14: return exp2(x);
+    case 12: return exp(x);   case 13: return jq_exp10(x); case 14: return exp2(x);
     case 15: return expm1(x); case 16: return fabs(x);  case 17: return floor(x);
     case 18: return lgamma(x); case 19: return j0(x);   case 20: return j1(x);
     case 21: return lgamma(x); case 22: return log(x);  case 23: return log10(x);
