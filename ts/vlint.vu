@@ -361,24 +361,29 @@ fn ignored(w: Walker, path: Str, is_dir: Bool) -> Bool:
     k -= 1
   return false
 
-fn walk(fs: Fs, dir: Str, var w: Walker, var out: [Str]):
-  let names = fs.list(dir) else return
+# oxlint's walker (one thread): a stack of the folder's entries in the file system's order, so the
+# last entry is linted first and a folder's files come where the folder was.
+fn walk(fs: Fs, ffi: Ffi, dir: Str, var w: Walker, var out: [Str]):
+  let names = lcache.readdir(ffi, dir)
   var pushed = 0
   if load_ignore_file(fs, dir, ".gitignore", &w): pushed += 1
   let iname = w.ignore_name + ""
   if w.use_ignore and iname != "" and load_ignore_file(fs, dir, iname, &w): pushed += 1
-  for nm in names:
+  var k = names.len - 1
+  while k >= 0:
+    let nm = names[k]
+    k -= 1
     if nm == ".git/" or nm == ".jj/": continue
     if nm.endswith("/"):
       let sub = dir + "/" + nm[0..nm.len - 1]
       if ignored(w, sub, true): continue
-      walk(fs, sub, &w, &out)
+      walk(fs, ffi, sub, &w, &out)
     elif want(nm) or nm.endswith(".vue") or nm.endswith(".astro") or nm.endswith(".svelte"):
       let p = dir + "/" + nm
       if is_min(nm): continue
       if ignored(w, p, false): continue
       out.push(p)
-  for k in 0..pushed: w.ignores.pop()
+  for j in 0..pushed: w.ignores.pop()
 
 fn abs_path(cwd: Str, p: Str) -> Str:
   if p.startswith("/"): return lconf.norm_path(p)
@@ -434,7 +439,7 @@ fn load_conf(fs: Fs, o: lout.Opts, m: lmeta.Meta, path: Str, a: Args, root: Bool
       config_error(o, "Failed to parse oxlint configuration file at {path}.\n", e)
     var stack = [path + ""]
     var err: [Str] = []
-    rc = lconf.resolve_extends(fs, [], rc, &stack, &err)
+    rc = lconf.resolve_extends(fs, m, rc, &stack, &err)
     if err.len > 0:
       if root: config_error(o, "Failed to parse oxlint configuration file.\n", err[0])
       config_error(o, "Failed to build configuration from {path}.\n", err[0])
@@ -461,6 +466,7 @@ type Work:
   files: [Str]       # absolute paths
   shown: [Str]       # as printed
   sevs: [[Int]]      # severity tables
+  optss: [[Str]]     # and the rules' options
   sev_of: [Int]      # each file's table
   cx: rules.Cx
 
@@ -475,11 +481,11 @@ fn lint_one(fs: Fs, w: Work, i: Int, var kw: {Str: Int}, phase: Int, var t: ast.
   let sev = w.sevs[w.sev_of[i]]
   if phase == 10:
     var fixed: [Str] = []
-    var recs = rules.lint_fix(w.cx, sev, w.shown[i], src, &kw, &t, &fixed)
+    var recs = rules.lint_fix(w.cx, sev, w.optss[w.sev_of[i]], w.shown[i], src, &kw, &t, &fixed)
     if fixed.len > 0:
       fs.write(w.files[i], fixed[0]) else recs.push(rules.plain_error(w.cx, w.shown[i], "", -1, -1, "Failed to write file {w.shown[i]}", ""))
     return recs
-  return rules.lint_upto(w.cx, sev, w.shown[i], src, &kw, phase, &t)
+  return rules.lint_upto(w.cx, sev, w.optss[w.sev_of[i]], w.shown[i], src, &kw, phase, &t)
 
 fn worker(fs: Fs, own w: Shared[Work], own jobs: Chan[Int], own res: Chan[Res], phase: Int):
   var kw = scan.keywords()
@@ -524,7 +530,7 @@ fn check_one(fs: Fs, w: Work, i: Int, esize: Int, ehash: Int, var kw: {Str: Int}
   let h = lcache.hash64(src)
   if size == esize and h == ehash: return CRes(0, true, [], size, h)
   if phase == 0: return CRes(0, false, [], size, h)
-  return CRes(0, false, rules.lint_upto(w.cx, w.sevs[w.sev_of[i]], w.shown[i], src, &kw, phase, &t), size, h)
+  return CRes(0, false, rules.lint_upto(w.cx, w.sevs[w.sev_of[i]], w.optss[w.sev_of[i]], w.shown[i], src, &kw, phase, &t), size, h)
 
 fn cworker(fs: Fs, own sj: Shared[CJobs], own jobs: Chan[Int], own res: Chan[CRes], phase: Int):
   var kw = scan.keywords()
@@ -1039,22 +1045,21 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   # the paths: explicit files that an ignore pattern matches are dropped
   var w = Walker([], lglob.gi_new(cwd), not a.no_ignore, a.ignore_path)
   for p in a.ignore_patterns: lglob.gi_add(&w.over, p)
-  var roots: [Str] = []
   var files: [Str] = []
   var explicit_ignore = lglob.gi_new(cwd)
   if not a.no_ignore:
     let t = fs.read(abs_path(cwd, a.ignore_path)) else ""
     for line in t.split("\n"): lglob.gi_add(&explicit_ignore, line)
-  for p in a.paths:
-    let ap = abs_path(cwd, p)
-    if fs.exists(ap + "/"):
-      roots.push(ap)
-      continue
-    if not fs.exists(ap): continue
-    if not a.no_ignore and (lglob.gi_ignores(w.over, ap, false) or lglob.gi_ignores(explicit_ignore, ap, false)): continue
-    if want(ap) or ap.endswith(".vue") or ap.endswith(".astro") or ap.endswith(".svelte"): files.push(ap)
+  var roots: [Str] = []
+  for p in a.paths: roots.push(abs_path(cwd, p))
   if a.paths.len == 0: roots.push(cwd + "")
   for r in roots:
+    if not fs.exists(r + "/"):
+      # a file named on the command line (gitignore doesn't apply to it)
+      if not fs.exists(r): continue
+      if not a.no_ignore and (lglob.gi_ignores(w.over, r, false) or lglob.gi_ignores(explicit_ignore, r, false)): continue
+      if want(r) or r.endswith(".vue") or r.endswith(".astro") or r.endswith(".svelte"): files.push(r + "")
+      continue
     # ignore files in the folders above a root (up to the repository's root)
     var ups: [Str] = []
     var d = parent_dir(r)
@@ -1075,7 +1080,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       if fs.exists(ups[k] + "/.git/info/exclude"): load_ignore_file(fs, ups[k] + "/.git/info", "exclude", &w2)
       k -= 1
     if r != cwd and ignored(w2, r, true): continue
-    walk(fs, r, &w2, &files)
+    walk(fs, ffi, r, &w2, &files)
   # the configuration
   var root_path = ""
   if a.config != "": root_path = abs_path(cwd, a.config)
@@ -1149,6 +1154,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     exit(1)
   # each file's severities: one table per configuration and set of matching overrides
   var sevs: [[Int]] = []
+  var optss: [[Str]] = []
   var sev_at: {Str: Int} = {}
   var sev_of: [Int] = []
   var shown: [Str] = []
@@ -1164,6 +1170,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     if not (key in sev_at):
       sev_at[key] = sevs.len
       sevs.push(lconf.resolve(m, cc, rel))
+      optss.push(lconf.resolve_opts(m, cc, rel))
     sev_of.push(sev_at[key])
     shown.push(display(cwd, kept[i]))
   var phase = int(os.env("VLINT_PHASE")) else 9
@@ -1171,8 +1178,15 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   var results: [[lout.Rec]] = []
   let nfiles = kept.len
   let cx = rules.Cx(o, m)
-  let nsevs = sevs.len
-  var work = Work(kept, shown, sevs, sev_of, cx)
+  # (the cache's key covers the tables)
+  var tkey: [Str] = []
+  for k in 0..sevs.len:
+    var parts: [Str] = []
+    for i in 0..sevs[k].len:
+      if sevs[k][i] > 0 or optss[k][i] != "": parts.push("{i}:{sevs[k][i]}:{optss[k][i]}")
+    tkey.push(",".join(parts))
+  let nsevs = lcache.hex16(lcache.hash64(";".join(tkey)))
+  var work = Work(kept, shown, sevs, optss, sev_of, cx)
   var shown2: [Str] = []
   for s in work.shown: shown2.push(s + "")
   if a.cache and phase != 10:
