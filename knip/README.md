@@ -163,8 +163,8 @@ on the small projects.
 | uvu | 93 | 0.95 | 0.006 | 147x | 1.40 | 0.006 |
 | vscode | 15571 | 46.27 | 10.31 | 4.5x | 160.79 | 25.15 |
 
-On vscode vknip takes 10.3 s of CPU with one thread or two (`--jobs 1`: 10.36 s), so its wall time
-halves on an idle 2-core machine; knip's work there is mostly on one thread. About half of vknip's
+On vscode vknip takes the same CPU time with one thread or two (`--jobs 1`: 10.36 s); with two, that
+work is split across both cores (the wall-time gain on an idle machine wasn't measured here). About half of vknip's
 time is vtsc's parser; the rest is the walk over each tree, module resolution, and the file walk with
 its `.gitignore` matching.
 
