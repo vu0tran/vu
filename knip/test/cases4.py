@@ -113,3 +113,20 @@ case("pl_nested_ws_plugins", {
     "packages/x/package.json": pkg("x"), "packages/x/vitest.config.ts": "export default { test: { include: ['spec/*.ts'] } };\n", "packages/x/spec/a.ts": "export {};\n",
     "packages/x/index.ts": "export const z = 1;\n", "packages/x/b.test.ts": "export {};\n",
 })
+case("pl_storybook", {
+    "package.json": pkg(deps=["react"], dev=["@storybook/react-vite", "@storybook/addon-docs", "@storybook/addon-links", "storybook"]), **mods("react", "@storybook/react-vite", "@storybook/addon-docs", "@storybook/addon-links", "storybook"),
+    ".storybook/main.ts": "export default {\n  stories: ['../src/**/*.stories.tsx', { directory: '../docs', files: '*.mdx' }],\n  addons: ['@storybook/addon-docs', { name: '@storybook/addon-links' }, '@storybook/addon-missing'],\n  framework: { name: '@storybook/react-vite', options: {} },\n};\n",
+    ".storybook/preview.ts": "export const parameters = {};\n", ".storybook/helper.ts": "export const x = 1;\n",
+    "src/Button.stories.tsx": "export default {};\nexport const Primary = {};\n", "src/Button.tsx": "export const B = 1;\n", "src/other.stories.ts": "export default {};\n",
+    "docs/intro.mdx": "# Intro\n", "index.ts": "export {};\n",
+})
+case("pl_cypress", {
+    "package.json": pkg(dev=["cypress"]), **mods("cypress"),
+    "cypress.config.ts": "export default { e2e: { specPattern: 'e2e/**/*.cy.ts', supportFile: 'e2e/support.ts' } };\n",
+    "e2e/a.cy.ts": "export {};\n", "e2e/support.ts": "export {};\n", "cypress/e2e/b.cy.ts": "export {};\n", "index.ts": "export {};\n",
+})
+case("pl_unported_fallback", {
+    "package.json": pkg(deps=["next", "react"]), **mods("next", "react"),
+    "next.config.js": "module.exports = { reactStrictMode: true };\n",
+    "pages/index.tsx": "export default function P() {}\n", "app/layout.tsx": "export default function L() {}\n", "lib/x.ts": "export const x = 1;\n",
+}, args=[[], ["--production"]])

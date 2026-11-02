@@ -40,3 +40,8 @@ case("ignore_ws_config", {
     "packages/use/package.json": pkg("use"), "packages/use/lib/a.js": "require('../x');\n", "packages/use/x.js": "", "packages/use/y.js": "",
     "packages/skip/package.json": pkg("skip"), "packages/skip/z.js": "",
 })
+case("tags", {
+    "package.json": pkg(), "index.ts": "import { used, usedIgnored, E } from './lib';\nconsole.log(used, usedIgnored, E.A, E.C);\n",
+    "lib.ts": "export const used = 1;\n/** @lintignore */\nexport const usedIgnored = 2;\n/** @lintignore */\nexport const unusedIgnored = 3;\n/** @custom */\nexport const unusedCustom = 4;\nexport const plain = 5;\nexport enum E { A, /** @lintignore */ B, /** @lintignore */ C, D }\n",
+    "knip.json": json.dumps({"tags": ["-lintignore"]}),
+}, args=[[], ["--tags", "custom"], ["--tags=-lintignore,-custom"], ["--treat-tag-hints-as-errors"], ["--no-tag-hints"]])
