@@ -1,0 +1,359 @@
+# A YAML reader for the configuration files knip loads (pnpm-workspace.yaml, .mocharc.yml, workflow
+# files, lefthook.yml...): block mappings and sequences, flow [...] and {...}, plain, quoted and block
+# (| >) scalars, comments, documents (the first one), anchors and aliases (an alias gives the anchored
+# value), and merge keys (<<). Scalars are typed as YAML 1.2's core schema types them.
+
+import json
+from json import Value
+
+type Line:
+  ind: Int
+  text: Str      # without the indentation and without a trailing comment
+  raw: Str       # the whole line (for block scalars)
+
+type Y:
+  lines: [Line]
+  i: Int
+  anchors: {Str: Value}
+
+fn parse(src: Str) -> Value:
+  var y = Y([], 0, {})
+  var started = false
+  for raw0 in src.split("\n"):
+    var raw = raw0
+    if raw.endswith("\r"): raw = raw[0..raw.len - 1]
+    if raw.startswith("---"):
+      if started: break
+      started = true
+      let rest = raw[3..raw.len].strip()
+      if rest == "": continue
+      raw = rest
+    if raw.startswith("..."): break
+    if raw.startswith("%"): continue
+    var ind = 0
+    while ind < raw.len and raw[ind] == ' ': ind += 1
+    let t = strip_comment(raw[ind..raw.len])
+    y.lines.push(Line(ind, t, raw + ""))
+    if t != "": started = true
+  skip_blank(&y)
+  if y.i >= y.lines.len: return json.Null
+  return block(&y, y.lines[y.i].ind)
+
+fn skip_blank(var y: Y):
+  while y.i < y.lines.len and y.lines[y.i].text == "": y.i += 1
+
+# a comment starts at " #" (or a line's first "#") outside quotes
+fn strip_comment(s: Str) -> Str:
+  var q: Byte = 0
+  var depth = 0
+  for k in 0..s.len:
+    let c = s[k]
+    if q != 0:
+      if c == q:
+        if q == '\'' and k + 1 < s.len and s[k + 1] == '\'': continue
+        q = 0
+      elif c == '\\' and q == '"': continue
+      continue
+    if (c == '"' or c == '\'') and (k == 0 or s[k - 1] == ' ' or s[k - 1] == '[' or s[k - 1] == '{' or s[k - 1] == ',' or s[k - 1] == ':' or s[k - 1] == '-'): q = c
+    elif c == '#' and (k == 0 or s[k - 1] == ' ' or s[k - 1] == '\t'): return s[0..k].rstrip()
+  return s.rstrip()
+
+# the position of a mapping's ": " (or a final ":") outside quotes and brackets, or -1
+fn key_colon(s: Str) -> Int:
+  var q: Byte = 0
+  var depth = 0
+  for k in 0..s.len:
+    let c = s[k]
+    if q != 0:
+      if c == q: q = 0
+      elif c == '\\' and q == '"': continue
+      continue
+    if (c == '"' or c == '\'') and k == 0: q = c
+    elif c == '[' or c == '{':
+      if k == 0: return -1
+      depth += 1
+    elif c == ']' or c == '}': depth -= 1
+    elif c == ':' and depth <= 0 and (k + 1 == s.len or s[k + 1] == ' ' or s[k + 1] == '\t'): return k
+  return -1
+
+fn block(var y: Y, ind: Int) -> Value:
+  skip_blank(&y)
+  if y.i >= y.lines.len: return json.Null
+  let lt = y.lines[y.i].text + ""
+  let li = y.lines[y.i].ind
+  if lt == "-" or lt.startswith("- "): return seq(&y, li)
+  if key_colon(lt) >= 0: return mapping(&y, li)
+  # a scalar (possibly on several lines) or a flow value
+  return scalar_lines(&y, ind)
+
+fn scalar_lines(var y: Y, ind: Int) -> Value:
+  var parts: [Str] = []
+  let first = y.lines[y.i].ind
+  while y.i < y.lines.len:
+    let lt = y.lines[y.i].text + ""
+    let li = y.lines[y.i].ind
+    if lt == "":
+      y.i += 1
+      continue
+    if li < first or (parts.len > 0 and li < ind): break
+    parts.push(lt)
+    y.i += 1
+  let s = " ".join(parts)
+  return value_of(&y, s)
+
+fn seq(var y: Y, ind: Int) -> Value:
+  var out: [Value] = []
+  while true:
+    skip_blank(&y)
+    if y.i >= y.lines.len: break
+    let l = Line(y.lines[y.i].ind, y.lines[y.i].text + "", y.lines[y.i].raw + "")
+    if l.ind != ind or not (l.text == "-" or l.text.startswith("- ")): break
+    if l.text == "-":
+      y.i += 1
+      skip_blank(&y)
+      var nind = -1
+      if y.i < y.lines.len: nind = y.lines[y.i].ind
+      if nind > ind: out.push(block(&y, nind))
+      else: out.push(json.Null)
+      continue
+    # "- rest": rest is an inline item; a mapping item continues on the next lines
+    var rest = l.text[2..l.text.len]
+    var k = 0
+    while k < rest.len and rest[k] == ' ': k += 1
+    rest = rest[k..rest.len]
+    let item_ind = ind + 2 + k
+    if rest.startswith("- ") or rest == "-":
+      y.lines[y.i] = Line(item_ind, rest + "", l.raw + "")
+      out.push(seq(&y, item_ind))
+      continue
+    if key_colon(rest) >= 0 and not rest.startswith("[") and not rest.startswith("{{"):
+      y.lines[y.i] = Line(item_ind, rest + "", l.raw + "")
+      out.push(mapping(&y, item_ind))
+      continue
+    if rest.startswith("|") or rest.startswith(">"):
+      out.push(json.Text(block_scalar(&y, ind, rest)))
+      continue
+    y.i += 1
+    out.push(value_of(&y, rest))
+  return json.Arr(out)
+
+fn mapping(var y: Y, ind: Int) -> Value:
+  var m: {Str: Value} = {}
+  while true:
+    skip_blank(&y)
+    if y.i >= y.lines.len: break
+    let l = Line(y.lines[y.i].ind, y.lines[y.i].text + "", y.lines[y.i].raw + "")
+    if l.ind != ind: break
+    let c = key_colon(l.text)
+    if c < 0: break
+    let key = unquote(l.text[0..c].strip())
+    var rest = l.text[c + 1..l.text.len].strip()
+    var anchor = ""
+    if rest.startswith("&"):
+      let sp = rest.find(" ")
+      if sp < 0:
+        anchor = rest[1..rest.len]
+        rest = ""
+      else:
+        anchor = rest[1..sp]
+        rest = rest[sp + 1..rest.len].strip()
+    var v = json.Null
+    if rest == "":
+      y.i += 1
+      skip_blank(&y)
+      if y.i < y.lines.len:
+        let nind = y.lines[y.i].ind
+        let ntext = y.lines[y.i].text + ""
+        if nind > ind: v = block(&y, nind)
+        elif nind == ind and (ntext == "-" or ntext.startswith("- ")): v = seq(&y, ind)
+    elif rest.startswith("|") or rest.startswith(">"):
+      v = json.Text(block_scalar(&y, ind, rest))
+    else:
+      y.i += 1
+      # a plain scalar may continue on more-indented lines
+      var s = rest
+      while y.i < y.lines.len and y.lines[y.i].text != "" and y.lines[y.i].ind > ind and not rest.startswith("[") and not rest.startswith("{{") and not rest.startswith("\"") and not rest.startswith("'") and key_colon(y.lines[y.i].text) < 0:
+        s = s + " " + y.lines[y.i].text
+        y.i += 1
+      v = value_of(&y, s)
+    if anchor != "": y.anchors[anchor] = json.copy(v)
+    if key == "<<":
+      match v:
+        Obj(f):
+          for k2, x in f:
+            if not (k2 in m): m[k2] = json.copy(x)
+        _: m[key] = json.copy(v)
+    else:
+      m[key] = v
+  return json.Obj(m)
+
+fn block_scalar(var y: Y, ind: Int, head: Str) -> Str:
+  let folded = head.startswith(">")
+  let keep = head.find("+") >= 0
+  let strip = head.find("-") >= 0
+  y.i += 1
+  var body: [Str] = []
+  var bi = -1
+  while y.i < y.lines.len:
+    let raw = y.lines[y.i].raw + ""
+    if raw.strip() == "":
+      body.push("")
+      y.i += 1
+      continue
+    var k = 0
+    while k < raw.len and raw[k] == ' ': k += 1
+    if k <= ind: break
+    if bi < 0: bi = k
+    body.push(raw[min(bi, k)..raw.len])
+    y.i += 1
+  var trailing = 0
+  while body.len > 0 and body[body.len - 1] == "":
+    body.pop()
+    trailing += 1
+  var s = ""
+  if folded:
+    var k = 0
+    while k < body.len:
+      if k > 0:
+        if body[k] == "" or body[k - 1] == "": s += "\n"
+        elif body[k].startswith(" ") or body[k - 1].startswith(" "): s += "\n"
+        else: s += " "
+      s += body[k]
+      k += 1
+  else:
+    s = "\n".join(body)
+  if strip: return s
+  if keep:
+    s += "\n"
+    for k in 0..trailing: s += "\n"
+    return s
+  if body.len > 0: s += "\n"
+  return s
+
+fn unquote(s: Str) -> Str:
+  if s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"':
+    let v = json.parse(s) else json.Text(s[1..s.len - 1])
+    match v:
+      Text(t): return t + ""
+      _: return s[1..s.len - 1]
+  if s.len >= 2 and s[0] == '\'' and s[s.len - 1] == '\'': return s[1..s.len - 1].replace("''", "'")
+  return s + ""
+
+fn value_of(var y: Y, s0: Str) -> Value:
+  var s = s0.strip()
+  if s.startswith("&"):
+    let sp = s.find(" ")
+    if sp > 0:
+      let name = s[1..sp]
+      let v = value_of(&y, s[sp + 1..s.len])
+      y.anchors[name] = json.copy(v)
+      return v
+  if s.startswith("*"):
+    let name = s[1..s.len]
+    if name in y.anchors: return json.copy(y.anchors[name])
+    return json.Null
+  if s.startswith("!!str "): return json.Text(unquote(s[6..s.len].strip()))
+  if s.startswith("!"):
+    let sp = s.find(" ")
+    if sp > 0: s = s[sp + 1..s.len].strip()
+  if s.startswith("[") or s.startswith("{{"):
+    var k = 0
+    return flow(&y, s, &k)
+  return scalar(s)
+
+fn scalar(s: Str) -> Value:
+  if s.len >= 1 and (s[0] == '"' or s[0] == '\''): return json.Text(unquote(s))
+  if s == "" or s == "~" or s == "null" or s == "Null" or s == "NULL": return json.Null
+  if s == "true" or s == "True" or s == "TRUE": return json.Flag(true)
+  if s == "false" or s == "False" or s == "FALSE": return json.Flag(false)
+  if is_int(s):
+    let n = int(s) else 0
+    return json.Whole(n)
+  if is_float(s):
+    let f = float(s) else 0.0
+    return json.Num(f)
+  return json.Text(s + "")
+
+fn is_int(s: Str) -> Bool:
+  var k = 0
+  if s.len > 0 and (s[0] == '-' or s[0] == '+'): k = 1
+  if k >= s.len or s.len - k > 18: return false
+  for j in k..s.len:
+    if s[j] < '0' or s[j] > '9': return false
+  return true
+
+fn is_float(s: Str) -> Bool:
+  var k = 0
+  if s.len > 0 and (s[0] == '-' or s[0] == '+'): k = 1
+  var digits = 0
+  var dot = 0
+  var e = false
+  while k < s.len:
+    let c = s[k]
+    if c >= '0' and c <= '9': digits += 1
+    elif c == '.' and not e: dot += 1
+    elif (c == 'e' or c == 'E') and digits > 0 and not e:
+      e = true
+      if k + 1 < s.len and (s[k + 1] == '-' or s[k + 1] == '+'): k += 1
+    else: return false
+    k += 1
+  return digits > 0 and dot <= 1
+
+fn flow_ws(s: Str, var k: Int):
+  while k < s.len and (s[k] == ' ' or s[k] == '\t'): k += 1
+
+fn flow(var y: Y, s: Str, var k: Int) -> Value:
+  flow_ws(s, &k)
+  if k >= s.len: return json.Null
+  if s[k] == '[':
+    k += 1
+    var out: [Value] = []
+    while k < s.len:
+      flow_ws(s, &k)
+      if k < s.len and s[k] == ']':
+        k += 1
+        break
+      out.push(flow(&y, s, &k))
+      flow_ws(s, &k)
+      if k < s.len and s[k] == ',': k += 1
+    return json.Arr(out)
+  if s[k] == '{':
+    k += 1
+    var m: {Str: Value} = {}
+    while k < s.len:
+      flow_ws(s, &k)
+      if k < s.len and s[k] == '}':
+        k += 1
+        break
+      let key = flow_word(s, &k, true)
+      flow_ws(s, &k)
+      var v = json.Null
+      if k < s.len and s[k] == ':':
+        k += 1
+        v = flow(&y, s, &k)
+      m[unquote(key)] = v
+      flow_ws(s, &k)
+      if k < s.len and s[k] == ',': k += 1
+    return json.Obj(m)
+  let w = flow_word(s, &k, false)
+  if w.startswith("*"):
+    let name = w[1..w.len]
+    if name in y.anchors: return json.copy(y.anchors[name])
+  return scalar(w)
+
+fn flow_word(s: Str, var k: Int, is_key: Bool) -> Str:
+  let st = k
+  if k < s.len and (s[k] == '"' or s[k] == '\''):
+    let q = s[k]
+    k += 1
+    while k < s.len and s[k] != q:
+      if s[k] == '\\' and q == '"': k += 1
+      k += 1
+    k += 1
+    return s[st..min(k, s.len)]
+  while k < s.len:
+    let c = s[k]
+    if c == ',' or c == ']' or c == '}': break
+    if is_key and c == ':' and (k + 1 >= s.len or s[k + 1] == ' ' or s[k + 1] == ','): break
+    k += 1
+  return s[st..k].strip()
