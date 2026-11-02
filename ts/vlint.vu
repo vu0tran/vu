@@ -1,7 +1,14 @@
 # vlint: a JavaScript and TypeScript linter. It checks oxlint's default rules (the correctness
 # rules that need no type information) and prints what `oxlint` prints for them, one line each:
 #
-#   vlint [--jobs N] PATH...      (files, or folders searched for .js .mjs .cjs .ts .mts .cts)
+#   vlint [--jobs N] [--fix] [--cache] [--cache-location PATH] PATH...
+#                                 (files, or folders searched for .js .mjs .cjs .ts .mts .cts)
+#
+# --fix rewrites each file with the safe fixes `oxlint --fix` applies (one pass) and prints the
+# diagnostics left, at their places in the original text, as oxlint does.
+# --cache keeps each file's output in .vlintcache (or PATH; a folder gets PATH/.vlintcache) and
+# prints it again for files that haven't changed, without parsing them (lcache.vu). It's off with
+# --fix (the files must be rewritten).
 #
 # It uses vtsc's scanner and parser; files are linted on all cores, each on its own.
 
@@ -9,16 +16,17 @@ import scan
 import ast
 import parse
 import rules
+import lcache
 
 fn want(name: Str) -> Bool:
-  for e in [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"]:
+  for e in [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".jsx", ".tsx"]:
     if name.endswith(e): return true
   return false
 
 fn walk(fs: Fs, dir: Str, var out: [Str]):
   let names = fs.list(dir) else return
   for nm in names:
-    if nm.startswith("."): continue
+    if nm == ".git/": continue
     if nm.endswith("/"):
       walk(fs, dir + "/" + nm[0..nm.len - 1], &out)
     elif want(nm): out.push(dir + "/" + nm)
@@ -28,18 +36,168 @@ type Res:
   lines: [Str]
   nwarn: Int
 
-fn lint_one(fs: Fs, path: Str, var kw: {Str: Int}) -> [Str]:
+fn lint_one(fs: Fs, path: Str, var kw: {Str: Int}, phase: Int, var t: ast.Ast) -> [Str]:
   var out: [Str] = []
   let src = fs.read(path) else return out
-  return rules.lint(path, src, &kw)
+  if phase == 0: return out
+  if phase == 10:
+    var fixed: [Str] = []
+    var lines = rules.lint_fix(path, src, &kw, &t, &fixed)
+    if fixed.len > 0:
+      fs.write(path, fixed[0]) else lines.push("Failed to write file {path}")
+    return lines
+  return rules.lint_upto(path, src, &kw, phase, &t)
 
-fn worker(fs: Fs, own files: [Str], own jobs: Chan[Int], own res: Chan[Res]):
+fn worker(fs: Fs, own files: [Str], own jobs: Chan[Int], own res: Chan[Res], phase: Int):
   var kw = scan.keywords()
+  var t = rules.new_tree()
   while true:
     let i = jobs.recv() else return
-    let lines = lint_one(fs, files[i], &kw)
+    let lines = lint_one(fs, files[i], &kw, phase, &t)
     let n = lines.len
     res.send(Res(i, lines, n))
+
+# --cache: one file's result. A file whose size and content hash are the cached ones is a hit.
+type CRes:
+  idx: Int
+  hit: Bool
+  lines: [Str]
+  size: Int
+  hash: Int
+
+type CJobs:
+  files: [Str]
+  esize: [Int]
+  ehash: [Int]
+
+fn check_one(fs: Fs, path: Str, esize: Int, ehash: Int, var kw: {Str: Int}, phase: Int, var t: ast.Ast) -> CRes:
+  let src = fs.read(path) else return CRes(0, false, [], -1, 0)
+  let size = src.len
+  let h = lcache.hash64(src)
+  if size == esize and h == ehash: return CRes(0, true, [], size, h)
+  if phase == 0: return CRes(0, false, [], size, h)
+  return CRes(0, false, rules.lint_upto(path, src, &kw, phase, &t), size, h)
+
+fn cworker(fs: Fs, own sj: Shared[CJobs], own jobs: Chan[Int], own res: Chan[CRes], phase: Int):
+  var kw = scan.keywords()
+  var t = rules.new_tree()
+  while true:
+    let i = jobs.recv() else return
+    var r = check_one(fs, sj.value.files[i], sj.value.esize[i], sj.value.ehash[i], &kw, phase, &t)
+    r.idx = i
+    res.send(r)
+
+fn cached_run(fs: Fs, ffi: Ffi, files: [Str], jobs0: Int, phase: Int, loc: Str):
+  let cfg = lcache.config_key(fs, "phase={phase}")
+  var old = lcache.empty()
+  if cfg != 0: old = lcache.load(fs, loc, cfg)
+  let n = files.len
+  # Timestamps this close to now may not change again when the file does (coarse clocks): such a
+  # file is checked by its content next time.
+  let fresh = lcache.now_ns(ffi) - 2000000000
+  var st = [0, 0, 0, 0]
+  var ki: [Int] = []
+  var hit: [Bool] = []
+  var ssz: [Int] = []
+  var smt: [Int] = []
+  var sct: [Int] = []
+  var sino: [Int] = []
+  var esize: [Int] = []
+  var ehash: [Int] = []
+  var todo: [Int] = []
+  for i in 0..n:
+    let k = old.at.get(files[i], -1)
+    ki.push(k)
+    var s0 = -1
+    var mt = 0
+    var ct = 0
+    var ino = 0
+    if lcache.stat(ffi, files[i], &st):
+      s0 = st[0]
+      if st[1] < fresh and st[2] < fresh:
+        mt = st[1]
+        ct = st[2]
+        ino = st[3]
+    ssz.push(s0)
+    smt.push(mt)
+    sct.push(ct)
+    sino.push(ino)
+    var h = false
+    if k >= 0 and mt != 0 and old.mt[k] == mt and old.ct[k] == ct and old.ino[k] == ino and old.size[k] == s0:
+      h = true
+    hit.push(h)
+    if k >= 0:
+      esize.push(old.size[k])
+      ehash.push(old.hash[k])
+    else:
+      esize.push(-1)
+      ehash.push(0)
+    if not h: todo.push(i)
+  var res: [CRes] = []
+  for i in 0..n: res.push(CRes(i, false, [], -1, 0))
+  var jobs = jobs0
+  if jobs > todo.len: jobs = todo.len
+  if jobs <= 1:
+    var kw = scan.keywords()
+    var t = rules.new_tree()
+    for i in todo:
+      var r = check_one(fs, files[i], esize[i], ehash[i], &kw, phase, &t)
+      r.idx = i
+      res[i] = r
+  else:
+    let jc: Chan[Int] = chan(todo.len + 1)
+    let rc: Chan[CRes] = chan(todo.len + 1)
+    for i in todo: jc.send(i)
+    jc.close()
+    var fc: [Str] = []
+    for x in files: fc.push(x + "")
+    let sj = share(CJobs(fc, esize, ehash))
+    for k in 0..jobs: spawn cworker(fs, sj, jc, rc, phase)
+    for k in 0..todo.len:
+      var r = rc.recv() else break
+      swap(&res[r.idx], &r)
+  # The output, in file order, and the new cache.
+  var nc = lcache.empty()
+  var dirty = cfg != 0 and old.paths.len == 0
+  for i in 0..n:
+    let k = ki[i]
+    var text = ""
+    var nl = 0
+    var size = ssz[i]
+    var h = 0
+    if hit[i]:
+      text = old.text[k] + ""
+      nl = old.nl[k]
+      h = old.hash[k]
+    elif res[i].size < 0:
+      dirty = dirty or k >= 0
+      continue
+    elif res[i].hit:
+      text = old.text[k] + ""
+      nl = old.nl[k]
+      size = res[i].size
+      h = res[i].hash
+    else:
+      text = "\n".join(res[i].lines)
+      nl = res[i].lines.len
+      size = res[i].size
+      h = res[i].hash
+    if nl > 0: print(text)
+    if nc.at.get(files[i], -1) >= 0: continue
+    var mt = smt[i]
+    if size != ssz[i]: mt = 0       # changed between the stat and the read
+    if k < 0 or old.size[k] != size or old.hash[k] != h or old.mt[k] != mt or old.ct[k] != sct[i] or old.ino[k] != sino[i]:
+      dirty = true
+    lcache.add(&nc, files[i] + "", size, mt, sct[i], sino[i], h, nl, text)
+  if cfg == 0: return
+  # Entries for files outside this run stay while the file exists.
+  for k in 0..old.paths.len:
+    if nc.at.get(old.paths[k], -1) >= 0: continue
+    if not fs.exists(old.paths[k]):
+      dirty = true
+      continue
+    lcache.add(&nc, old.paths[k] + "", old.size[k], old.mt[k], old.ct[k], old.ino[k], old.hash[k], old.nl[k], old.text[k] + "")
+  if dirty: lcache.save(fs, ffi, loc, lcache.encode(nc, cfg))
 
 fn cpu_count(fs: Fs) -> Int:
   let info = fs.read("/proc/cpuinfo") else ""
@@ -49,9 +207,12 @@ fn cpu_count(fs: Fs) -> Int:
   if n < 1: return 1
   return n
 
-fn main(fs: Fs, os: Os) throws:
+fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   var paths: [Str] = []
   var jobs = 0
+  var cache = false
+  var loc = ".vlintcache"
+  var phase = int(os.env("VLINT_PHASE")) else 9
   let argv = args()
   var i = 1
   while i < argv.len:
@@ -60,6 +221,24 @@ fn main(fs: Fs, os: Os) throws:
       jobs = int(argv[i + 1]) else 1
       i += 2
       continue
+    if a == "--cache":
+      cache = true
+      i += 1
+      continue
+    if a == "--cache-location" and i + 1 < argv.len:
+      loc = argv[i + 1] + ""
+      if loc.endswith("/") or fs.exists(loc + "/"):
+        while loc.len > 1 and loc.endswith("/"): loc = loc[0..loc.len - 1]
+        loc += "/.vlintcache"
+      i += 2
+      continue
+    if a == "--fix":
+      phase = 10
+      i += 1
+      continue
+    if a == "--fix-suggestions" or a == "--fix-dangerously":
+      eprint("vlint: {a} isn't supported (only --fix, oxlint's safe fixes)")
+      exit(2)
     paths.push(a + "")
     i += 1
   var files: [Str] = []
@@ -70,6 +249,9 @@ fn main(fs: Fs, os: Os) throws:
       while q.len > 1 and q.endswith("/"): q = q[0..q.len - 1]
       walk(fs, q, &files)
   if jobs == 0: jobs = cpu_count(fs)
+  if cache and phase != 10:
+    cached_run(fs, ffi, files, jobs, phase, loc)
+    return
   if jobs > files.len: jobs = files.len
   if jobs < 1: jobs = 1
   var results: [[Str]] = []
@@ -77,8 +259,9 @@ fn main(fs: Fs, os: Os) throws:
   var total = 0
   if jobs == 1:
     var kw = scan.keywords()
+    var t = rules.new_tree()
     for k in 0..files.len:
-      results[k] = lint_one(fs, files[k], &kw)
+      results[k] = lint_one(fs, files[k], &kw, phase, &t)
       total += results[k].len
   else:
     let jc: Chan[Int] = chan(files.len + 1)
@@ -88,11 +271,10 @@ fn main(fs: Fs, os: Os) throws:
     for k in 0..jobs:
       var fc: [Str] = []
       for x in files: fc.push(x + "")
-      spawn worker(fs, fc, jc, rc)
+      spawn worker(fs, fc, jc, rc, phase)
     for k in 0..files.len:
       var r = rc.recv()?
       total += r.nwarn
       swap(&results[r.idx], &r.lines)
   for k in 0..files.len:
     for l in results[k]: print(l)
-  if total > 0: exit(1)

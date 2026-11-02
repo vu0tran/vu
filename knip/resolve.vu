@@ -1,0 +1,491 @@
+# Module resolution as knip sets up oxc-resolver: relative paths with extensions, extension aliases
+# (.js -> .ts...), directory index files and package.json main, tsconfig paths and baseUrl, package
+# self-references through "exports", and packages in node_modules. Paths are relative to the project
+# folder ("src/a.ts"; "../x" outside it).
+
+import json
+import pkg
+from json import Value
+
+const R_UNRESOLVED = 0
+const R_FILE = 1
+const R_EXTERNAL = 2
+const R_BUILTIN = 3
+
+type Res:
+  kind: Int
+  path: Str
+  pkg: Str
+
+type PathMap:
+  prefix: Str
+  wildcard: Bool
+  values: [Str]      # targets, relative to the project folder
+
+type Tsc:
+  paths: [PathMap]
+  base_url: Str
+  has_base: Bool
+
+type Resolver:
+  root: Str                    # what to put before a path for the file system ("" or "dir/")
+  dirs: {Str: {Str: Bool}}     # folder -> its names (folders end with '/')
+  paths: [PathMap]             # the project's tsconfig.json paths (tried after node_modules too)
+  base_url: Str                # "" none, "." the project folder, else a folder
+  has_base: Bool
+  tscs: [Tsc]                  # tsconfig files met (paths, baseUrl)
+  tsc_of_dir: {Str: Int}       # folder -> its nearest tsconfig.json (index in tscs, -1 none)
+  tsc_of_file: {Str: Int}
+  self_name: Str
+  self_exports: Value
+  has_exports: Bool
+  imports_map: Value
+  cache: {Str: Res}
+  pkgs: {Str: Value}           # package.json by folder (node_modules lookups)
+
+fn exts() -> [Str]:
+  return [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".d.mts", ".d.cts", ".json", ".jsonc"]
+
+fn new_resolver(root: Str) -> Resolver:
+  return Resolver(root + "", {}, [], "", false, [], {}, {}, "", json.Null, false, json.Null, {}, {})
+
+const BUILTINS = "_http_agent _http_client _http_common _http_incoming _http_outgoing _http_server _stream_duplex _stream_passthrough _stream_readable _stream_transform _stream_wrap _stream_writable _tls_common _tls_wrap assert assert/strict async_hooks buffer child_process cluster console constants crypto dgram diagnostics_channel dns dns/promises domain events fs fs/promises http http2 https inspector inspector/promises module net os path path/posix path/win32 perf_hooks process punycode querystring readline readline/promises repl stream stream/consumers stream/promises stream/web string_decoder sys timers timers/promises tls trace_events tty url util util/types v8 vm wasi worker_threads zlib"
+
+fn is_builtin(spec: Str) -> Bool:
+  var s = spec
+  if s.startswith("node:"):
+    s = s[5..s.len]
+    if s == "test" or s == "test/reporters" or s == "sqlite" or s == "sea": return true
+  if s == "" or s[0] == '.' or s[0] == '@' or s[0] == '/' or s[0] == '#': return false
+  # (a word in the list: a space or the start before it, a space or the end after it)
+  var i = BUILTINS.find(s)
+  while i >= 0:
+    let before = i == 0 or BUILTINS[i - 1] == ' '
+    let after = i + s.len == BUILTINS.len or BUILTINS[i + s.len] == ' '
+    if before and after: return true
+    i = BUILTINS.find(s, i + 1)
+  return false
+
+# ---- paths
+
+fn norm(p: Str) -> Str:
+  var out: [Str] = []
+  var ups = 0
+  for part in p.split("/"):
+    if part == "" or part == ".": continue
+    if part == "..":
+      if out.len > 0: out.pop()
+      else: ups += 1
+      continue
+    out.push(part + "")
+  var s = ""
+  for i in 0..ups:
+    if s != "": s += "/"
+    s += ".."
+  for x in out:
+    if s != "": s += "/"
+    s += x
+  return s
+
+fn dirname(p: Str) -> Str:
+  var i = p.len - 1
+  while i >= 0 and p[i] != '/': i -= 1
+  if i < 0: return ""
+  return p[0..i]
+
+fn basename(p: Str) -> Str:
+  var i = p.len - 1
+  while i >= 0 and p[i] != '/': i -= 1
+  return p[i + 1..p.len]
+
+fn join(a: Str, b: Str) -> Str:
+  if a == "": return norm(b)
+  return norm(a + "/" + b)
+
+fn extname(p: Str) -> Str:
+  let b = basename(p)
+  var i = b.len - 1
+  while i > 0:
+    if b[i] == '.': return b[i..b.len]
+    i -= 1
+  return ""
+
+fn in_node_modules(p: Str) -> Bool:
+  return p.find("node_modules/") >= 0 or p.endswith("node_modules")
+
+fn load_listing(var r: Resolver, fs: Fs, dir: Str):
+  if dir in r.dirs: return
+  var m: {Str: Bool} = {}
+  var d = r.root + dir
+  if d == "": d = "."
+  if dir == "" and r.root != "": d = r.root[0..r.root.len - 1]
+  let names = fs.list(d) else []
+  for n in names: m[n] = true
+  r.dirs[dir] = m
+
+fn has_name(var r: Resolver, fs: Fs, dir: Str, name: Str) -> Bool:
+  load_listing(&r, fs, dir)
+  return name in r.dirs[dir]
+
+fn is_file(var r: Resolver, fs: Fs, p: Str) -> Bool:
+  if p == "": return false
+  return has_name(&r, fs, dirname(p), basename(p))
+
+fn is_dir(var r: Resolver, fs: Fs, p: Str) -> Bool:
+  if p == "": return true
+  let d = dirname(p)
+  let b = basename(p)
+  if has_name(&r, fs, d, b + "/"): return true
+  if has_name(&r, fs, d, b): return fs.exists(r.root + p + "/")
+  return false
+
+fn real_file(var r: Resolver, fs: Fs, p: Str) -> Bool:
+  return is_file(&r, fs, p) and not is_dir(&r, fs, p)
+
+# ---- files and folders
+
+fn alias_exts(ext: Str) -> [Str]:
+  if ext == ".js": return [".js", ".ts", ".tsx", ".d.ts"]
+  if ext == ".jsx": return [".jsx", ".tsx"]
+  if ext == ".mjs": return [".mjs", ".mts", ".d.mts"]
+  if ext == ".cjs": return [".cjs", ".cts", ".d.cts"]
+  return []
+
+fn load_file(var r: Resolver, fs: Fs, p: Str) -> Str:
+  let ext = extname(p)
+  let al = alias_exts(ext)
+  if al.len > 0:
+    let base = p[0..p.len - ext.len]
+    for a in al:
+      if real_file(&r, fs, base + a): return base + a
+  elif real_file(&r, fs, p): return p + ""
+  for e in exts():
+    if real_file(&r, fs, p + e): return p + e
+  return ""
+
+fn load_dir(var r: Resolver, fs: Fs, p: Str) -> Str:
+  if not is_dir(&r, fs, p): return ""
+  let pj = join(p, "package.json")
+  if real_file(&r, fs, pj):
+    let m = pkg.read_json(fs, r.root + pj)
+    let main = pkg.str_of(pkg.get(m, "main"))
+    if main != "":
+      let target = join(p, main)
+      let f = load_file(&r, fs, target)
+      if f != "": return f
+      let g = load_index(&r, fs, target)
+      if g != "": return g
+  return load_index(&r, fs, p)
+
+fn load_index(var r: Resolver, fs: Fs, p: Str) -> Str:
+  if not is_dir(&r, fs, p): return ""
+  for e in exts():
+    let f = join(p, "index" + e)
+    if real_file(&r, fs, f): return f
+  return ""
+
+fn load_path(var r: Resolver, fs: Fs, p: Str) -> Str:
+  let f = load_file(&r, fs, p)
+  if f != "": return f
+  return load_dir(&r, fs, p)
+
+# ---- package.json exports / imports
+
+fn pick_target(v: Value, star: Str) -> [Str]:
+  # the targets for conditions require, import, node, default (in the map's order)
+  var out: [Str] = []
+  match v:
+    Text(s):
+      out.push(s.replace("*", star))
+    Arr(xs):
+      for x in xs:
+        for t in pick_target(x, star): out.push(t)
+    Obj(fields):
+      for k, x in fields:
+        if k == "require" or k == "import" or k == "node" or k == "default" or k == "types":
+          for t in pick_target(x, star): out.push(t)
+    _: return out
+  return out
+
+# The targets of key ("." or "./sub") in an exports map.
+fn map_targets(m: Value, key: Str) -> [Str]:
+  var out: [Str] = []
+  if not pkg.is_obj(m):
+    if key == ".": return pick_target(m, "")
+    return out
+  var has_sub = false
+  for k in pkg.keys(m):
+    if k.startswith(".") or k.startswith("#"): has_sub = true
+  if not has_sub:
+    if key == ".": return pick_target(m, "")
+    return out
+  if json.has(m, key): return pick_target(pkg.get(m, key), "")
+  var best = ""
+  var best_star = ""
+  for k in pkg.keys(m):
+    let st = k.find("*")
+    if st < 0: continue
+    let pre = k[0..st]
+    let suf = k[st + 1..k.len]
+    if key.startswith(pre) and key.endswith(suf) and key.len >= pre.len + suf.len:
+      if best == "" or pre.len > best.find("*"):
+        best = k + ""
+        best_star = key[pre.len..key.len - suf.len]
+  if best != "": return pick_target(pkg.get(m, best), best_star)
+  return out
+
+# ---- bare specifiers
+
+fn pkg_name(spec: Str) -> Str:
+  if spec == "": return ""
+  let c = spec[0]
+  if c == '@':
+    let sl = spec.find("/")
+    if sl < 0: return spec + ""
+    let sl2 = spec.find("/", sl + 1)
+    if sl2 < 0: return spec + ""
+    return spec[0..sl2]
+  let sl = spec.find("/")
+  if sl < 0: return spec + ""
+  return spec[0..sl]
+
+# The folder of package name as seen from dir (node_modules here or above), or "".
+fn find_package(var r: Resolver, fs: Fs, name: Str, from_dir: Str) -> Str:
+  var d = from_dir
+  while true:
+    let cand = join(d, "node_modules/" + name)
+    if is_dir(&r, fs, cand): return cand
+    if d == "" or d == ".": break
+    if d.startswith("..") and basename(d) == "..":
+      # outside the project: keep going up a few levels
+      if d.len > 30: break
+      d = d + "/.."
+      continue
+    d = dirname(d)
+  # above the project folder
+  var up = ".."
+  for i in 0..6:
+    let cand = join(up, "node_modules/" + name)
+    if fs.exists(r.root + cand + "/"): return cand
+    up = up + "/.."
+  return ""
+
+fn manifest_of(var r: Resolver, fs: Fs, dir: Str) -> Value:
+  if dir in r.pkgs: return json.copy(r.pkgs[dir])
+  let v = pkg.read_json(fs, r.root + join(dir, "package.json"))
+  r.pkgs[dir] = json.copy(v)
+  return v
+
+fn resolve_bare(var r: Resolver, fs: Fs, spec: Str, from_dir: Str) -> Res:
+  let name = pkg_name(spec)
+  let pdir = find_package(&r, fs, name, from_dir)
+  if pdir == "": return Res(R_UNRESOLVED, "", "")
+  let sub = spec[name.len..spec.len]
+  let m = manifest_of(&r, fs, pdir)
+  let ex = pkg.get(m, "exports")
+  match ex:
+    Null:
+      if sub == "":
+        let f = load_dir(&r, fs, pdir)
+        if f != "": return Res(R_EXTERNAL, f, name)
+        return Res(R_UNRESOLVED, "", "")
+      let f = load_path(&r, fs, join(pdir, sub[1..sub.len]))
+      if f != "": return Res(R_EXTERNAL, f, name)
+      return Res(R_UNRESOLVED, "", "")
+    _:
+      var key = "."
+      if sub != "": key = "." + sub
+      for tg in map_targets(ex, key):
+        let f = join(pdir, tg)
+        if real_file(&r, fs, f): return Res(R_EXTERNAL, f, name)
+      return Res(R_UNRESOLVED, "", "")
+
+# ---- the resolver
+
+fn sanitize(spec: Str) -> Str:
+  if spec.startswith("node:") or spec.startswith("cloudflare:") or spec.startswith("/") or spec.startswith(":") or spec.startswith("virtual:"): return spec + ""
+  let sub = spec.startswith("#")
+  var start = 0
+  var end = spec.len
+  var colon = -1
+  var slash = false
+  for i in 0..spec.len:
+    let c = spec[i]
+    if i == start and (c == '!' or c == '-'):
+      start += 1
+      continue
+    if c == '/' and colon == -1: slash = true
+    if colon == -1 and c == ':' and not slash and not sub: colon = i
+    if c == '!' or c == '?' or (c == '#' and i > start):
+      end = i
+      break
+  if colon != -1 and colon < end: return spec[start..colon]
+  return spec[start..end]
+
+fn is_relative(spec: Str) -> Bool:
+  return spec.startswith("./") or spec.startswith("../") or spec == "." or spec == ".."
+
+fn resolve(var r: Resolver, fs: Fs, spec0: Str, from: Str) -> Res:
+  let dir = dirname(from)
+  let key = dir + "\0" + spec0
+  if key in r.cache:
+    let c = r.cache[key]
+    return Res(c.kind, c.path + "", c.pkg + "")
+  let spec = sanitize(spec0)
+  if is_builtin(spec):
+    r.cache[key] = Res(R_BUILTIN, "", "")
+    return Res(R_BUILTIN, "", "")
+  let res = resolve_uncached(&r, fs, spec, dir)
+  r.cache[key] = Res(res.kind, res.path + "", res.pkg + "")
+  return res
+
+fn file_res(p: Str) -> Res:
+  if in_node_modules(p): return Res(R_EXTERNAL, p, pkg_from_path(p))
+  return Res(R_FILE, p, "")
+
+fn pkg_from_path(p: Str) -> Str:
+  let i = p.find("node_modules/")
+  if i < 0: return ""
+  var rest = p[i + 13..p.len]
+  while rest.find("node_modules/") >= 0: rest = rest[rest.find("node_modules/") + 13..rest.len]
+  return pkg_name(rest)
+
+fn mapped_paths(pm: [PathMap], spec: Str) -> [Str]:
+  var cands: [Str] = []
+  for m in pm:
+    var hit = false
+    var captured = ""
+    if m.wildcard:
+      if spec.startswith(m.prefix):
+        hit = true
+        captured = spec[m.prefix.len..spec.len]
+    elif spec == m.prefix: hit = true
+    if hit:
+      for v in m.values:
+        let st = v.find("*")
+        var mapped = v + captured
+        if st >= 0: mapped = v[0..st] + captured + v[st + 1..v.len]
+        if not m.wildcard: mapped = v + ""
+        cands.push(norm(mapped))
+  return cands
+
+fn try_paths(var r: Resolver, fs: Fs, ti: Int, spec: Str) -> Str:
+  let cands = mapped_paths(r.tscs[ti].paths, spec)
+  for c in cands:
+    let f = load_path(&r, fs, c)
+    if f != "": return f
+  if r.tscs[ti].has_base:
+    let base = r.tscs[ti].base_url + ""
+    let f = load_path(&r, fs, join(base, spec))
+    if f != "": return f
+  return ""
+
+# The nearest tsconfig.json at or above dir (inside the project), loaded once.
+fn tsc_for_dir(var r: Resolver, fs: Fs, dir: Str) -> Int:
+  if dir in r.tsc_of_dir: return r.tsc_of_dir[dir] + 0
+  var res = -1
+  let f = join(dir, "tsconfig.json")
+  if dir.startswith(".."): res = -1
+  elif real_file(&r, fs, f): res = load_tsc(&r, fs, f)
+  elif dir != "": res = tsc_for_dir(&r, fs, dirname(dir))
+  r.tsc_of_dir[dir] = res
+  return res
+
+fn load_tsc(var r: Resolver, fs: Fs, f: Str) -> Int:
+  if f in r.tsc_of_file: return r.tsc_of_file[f] + 0
+  var t = Tsc([], "", false)
+  var paths_dir = ""
+  var has_paths = false
+  var pm = json.Null
+  tsc_chain(&r, fs, f, &t, &paths_dir, &has_paths, &pm, 0)
+  if has_paths:
+    var pdir = paths_dir
+    if t.has_base: pdir = t.base_url + ""
+    for key in pkg.keys(pm):
+      var vals: [Str] = []
+      for v in pkg.strs(pkg.get(pm, key)): vals.push(join(pdir, v))
+      let st = key.find("*")
+      if st >= 0: t.paths.push(PathMap(key[0..st], true, vals))
+      else: t.paths.push(PathMap(key + "", false, vals))
+  let i = r.tscs.len
+  r.tscs.push(t)
+  r.tsc_of_file[f] = i
+  return i
+
+fn tsc_chain(var r: Resolver, fs: Fs, f: Str, var t: Tsc, var paths_dir: Str, var has_paths: Bool, var pm: Value, depth: Int):
+  if depth > 8: return
+  let v = pkg.read_json(fs, r.root + f)
+  if not pkg.is_obj(v): return
+  let dir = dirname(f)
+  for e in pkg.strs(pkg.get(v, "extends")):
+    var target = ""
+    if e.startswith("./") or e.startswith("../") or e.startswith("/"):
+      target = join(dir, e)
+      if not real_file(&r, fs, target) and real_file(&r, fs, target + ".json"): target = target + ".json"
+    else:
+      let name = pkg_name(e)
+      let pdir = find_package(&r, fs, name, dir)
+      if pdir != "":
+        let sub = e[name.len..e.len]
+        if sub == "":
+          let m = pkg.read_json(fs, r.root + join(pdir, "package.json"))
+          var tsc = pkg.str_of(pkg.get(m, "tsconfig"))
+          if tsc == "": tsc = "tsconfig.json"
+          target = join(pdir, tsc)
+        else:
+          target = join(pdir, sub[1..sub.len])
+          if not real_file(&r, fs, target) and real_file(&r, fs, target + ".json"): target = target + ".json"
+    if target != "": tsc_chain(&r, fs, target, &t, &paths_dir, &has_paths, &pm, depth + 1)
+  let co = pkg.get(v, "compilerOptions")
+  let bu = pkg.str_of(pkg.get(co, "baseUrl"))
+  if bu != "":
+    t.base_url = join(dir, bu)
+    t.has_base = true
+  if json.has(co, "paths"):
+    pm = pkg.get(co, "paths")
+    paths_dir = dir + ""
+    has_paths = true
+
+fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
+  if is_relative(spec):
+    let f = load_path(&r, fs, join(dir, spec))
+    if f != "": return file_res(f)
+    let cand = join(dir, spec)
+    if real_file(&r, fs, cand) or is_dir(&r, fs, cand): return Res(R_FILE, cand, "")
+    return Res(R_UNRESOLVED, "", "")
+  if spec.startswith("/"):
+    return Res(R_UNRESOLVED, "", "")
+  # the nearest tsconfig.json's paths, then its baseUrl
+  let ti = tsc_for_dir(&r, fs, dir)
+  if ti >= 0:
+    let f = try_paths(&r, fs, ti, spec)
+    if f != "": return file_res(f)
+  if spec.startswith("#") and pkg.is_obj(r.imports_map):
+    for tg in map_targets(r.imports_map, spec):
+      if tg.startswith("./"):
+        let f = load_path(&r, fs, norm(tg))
+        if f != "": return file_res(f)
+      else:
+        let b = resolve_bare(&r, fs, tg, dir)
+        if b.kind != R_UNRESOLVED: return b
+  # the package itself, through its exports
+  let name = pkg_name(spec)
+  if r.has_exports and name == r.self_name:
+    let sub = spec[name.len..spec.len]
+    var key = "."
+    if sub != "": key = "." + sub
+    for tg in map_targets(r.self_exports, key):
+      let f = norm(tg)
+      if real_file(&r, fs, f): return file_res(f)
+  let b = resolve_bare(&r, fs, spec, dir)
+  if b.kind != R_UNRESOLVED: return b
+  # the project's tsconfig paths (knip's own path mappings)
+  if r.paths.len > 0:
+    var cands = mapped_paths(r.paths, spec)
+    for c in cands:
+      let f = load_path(&r, fs, c)
+      if f != "": return file_res(f)
+  # a path relative to the importing file that exists (knip's last resort)
+  let cand = join(dir, spec)
+  if real_file(&r, fs, cand) or is_dir(&r, fs, cand): return Res(R_FILE, cand, "")
+  return Res(R_UNRESOLVED, "", "")
