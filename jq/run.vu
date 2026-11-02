@@ -207,10 +207,18 @@ type It:
   ieof_n: Int        # reads that found the end of the input (from 2 on, jq has closed it: positions are <unknown>)
   uni: regex.Uni     # Unicode data for regexes (loaded at the first one)
   rxs: [regex.RxEntry]
+  rerr: [Str]        # names not defined: messages, positions, and the function each is in
+  rpos: [Int]
+  rctx: [Int]
+  cpar: [Int]        # functions (as jq compiles them separately): each one's parent
+  cctx: Int
+  cdef: [Int]        # per function context: the def it is the body of, or -1
+  callf: [Int]       # calls of defs: the def, and the context of the call
+  callc: [Int]
   pfid: [Int]        # per native: its jq definition (_p_NAME in builtins.PATHDEFS) for tracked paths, or -1
 
 fn new_it(ffi: Ffi, fs: Fs, os: Os) -> It:
-  return It(jv.new_store(), lang.new_ast(), ffi, fs, os, false, false, false, false, false, 65536, [], [], "", [], [], [], [], [], [], [], [], vnull(), false, 0, -1, 1, 1, [-1], [vnull()], [], [], -1, 0, "", 0, 0, 0, [], [], 0, 0, 0, 0, 0, 0, "", false, false, false, [], false, false, false, false, false, false, false, false, 0, vnull(), false, "<stdin>", [], [], [], vnull(), nat.ids(), nat_kinds(), [], [], [], [], 0, false, 0, regex.empty_uni(), [], [])
+  return It(jv.new_store(), lang.new_ast(), ffi, fs, os, false, false, false, false, false, 65536, [], [], "", [], [], [], [], [], [], [], [], vnull(), false, 0, -1, 1, 1, [-1], [vnull()], [], [], -1, 0, "", 0, 0, 0, [], [], 0, 0, 0, 0, 0, 0, "", false, false, false, [], false, false, false, false, false, false, false, false, 0, vnull(), false, "<stdin>", [], [], [], vnull(), nat.ids(), nat_kinds(), [], [], [], [], 0, false, 0, regex.empty_uni(), [], [], [], [], [-1], 0, [-1], [], [], [])
 
 fn nat_kinds() -> [Int]:
   var ks: [Int] = []
@@ -2057,6 +2065,73 @@ fn cerr(var it: It, msg: Str, line: Int):
     it.cerr = msg
     it.cerrline = line   # the node's position (byte offset in the program)
 
+# A name that isn't defined: jq reports every one, function by function (see undefined_report).
+fn uerr(var it: It, msg: Str, line: Int):
+  it.rerr.push(msg)
+  it.rpos.push(line)
+  it.rctx.push(it.cctx)
+
+# Enters a new function context (a def body, or a closure argument jq compiles as a function).
+fn ctx_push(var it: It) -> Int:
+  let saved = it.cctx
+  it.cpar.push(saved)
+  it.cdef.push(-1)
+  it.cctx = it.cpar.len - 1
+  return saved
+
+# The undefined-name errors in jq's order: those of a function; its inner functions only when it
+# has none (jq doesn't compile them then). Returns indexes into it.rerr.
+fn undefined_report(it: It) -> [Int]:
+  # jq drops a def nothing (still there) calls, unchecked
+  let nc = it.cpar.len
+  var alive = [false] * nc
+  alive[0] = true
+  var changed = true
+  while changed:
+    changed = false
+    for c in 1..nc:
+      if alive[c] or not alive[it.cpar[c]]: continue
+      let f = it.cdef[c]
+      if f < 0:
+        alive[c] = true
+        changed = true
+        continue
+      for j in 0..it.callf.len:
+        if it.callf[j] == f and alive[it.callc[j]] and not inside(it, it.callc[j], c):
+          alive[c] = true
+          changed = true
+          break
+  var out: [Int] = []
+  report_ctx(it, 0, alive, &out)
+  return out
+
+# whether context c is d or within it
+fn inside(it: It, c: Int, d: Int) -> Bool:
+  var x = c
+  while x >= 0:
+    if x == d: return true
+    x = it.cpar[x]
+  return false
+
+fn report_ctx(it: It, c: Int, alive: [Bool], var out: [Int]):
+  if not alive[c]: return
+  var own = false
+  for i in 0..it.rerr.len:
+    if it.rctx[i] == c:
+      out.push(i)
+      own = true
+  if own: return
+  for j in 1..it.cpar.len:
+    if it.cpar[j] == c: report_ctx(it, j, alive, &out)
+
+# jq's C functions taking arguments: their arguments are part of the caller's code (others are
+# jq definitions, whose closure arguments jq compiles as functions of their own).
+fn c_args(name: Str, ar: Int) -> Bool:
+  if ar == 1: return name == "startswith" or name == "endswith" or name == "ltrimstr" or name == "rtrimstr" or name == "split" or name == "_strindices" or name == "getpath" or name == "delpaths" or name == "has" or name == "contains" or name == "_sort_by_impl" or name == "_group_by_impl" or name == "_min_by_impl" or name == "_max_by_impl" or name == "format" or name == "halt_error" or name == "strptime" or name == "strftime" or name == "strflocaltime"
+  if ar == 2: return name == "setpath" or nat.lookup(name, 2) >= nat.NM_MATH2
+  if ar == 3: return name == "_match_impl" or name == "fma"
+  return false
+
 fn ensure_fd(var it: It):
   while it.fd_static.len < it.ast.fdefs.len:
     it.fd_static.push(false)
@@ -2091,7 +2166,7 @@ fn resolve(var it: It, n: Int, var sc: Scope):
         return
       if sk != SC_SFUNC and sk != SC_GVAR: depth += 1
       i -= 1
-    cerr(&it, "$" + name + " is not defined", nd.line)
+    uerr(&it, "$" + name + " is not defined", nd.line)
     return
   if k == lang.N_BREAK:
     let name = it.ast.names[nd.x]
@@ -2104,15 +2179,13 @@ fn resolve(var it: It, n: Int, var sc: Scope):
         return
       if sk != SC_SFUNC and sk != SC_GVAR: depth += 1
       i -= 1
-    cerr(&it, "$*label-" + name + " is not defined", nd.line)
+    uerr(&it, "$*label-" + name + " is not defined", nd.line)
     return
   if k == lang.N_CALL:
-    for i in 0..nd.c:
-      let _h15 = it.ast.kids[nd.b + i]
-      resolve(&it, _h15, &sc)
-    let name = it.ast.names[nd.x]
+    let name = it.ast.names[nd.x] + ""
     var depth = 0
     var i = sc.kind.len - 1
+    var found = false
     while i >= 0:
       let sk = sc.kind[i]
       if sc.name[i] == name and sc.ar[i] == nd.c and sk != SC_VAR and sk != SC_LABEL and sk != SC_GVAR:
@@ -2125,15 +2198,30 @@ fn resolve(var it: It, n: Int, var sc: Scope):
         else:
           it.ast.ns[n].d = CT_CLOS
           it.ast.ns[n].e = depth
-        return
+        if sk == SC_SFUNC or sk == SC_FUNC:
+          it.callf.push(sc.fid[i])
+          it.callc.push(it.cctx)
+        found = true
+        break
       if sk != SC_SFUNC and sk != SC_GVAR: depth += 1
       i -= 1
-    let nid = nat.lookup(name, nd.c)
-    if nid < 0:
-      cerr(&it, name + "/{nd.c} is not defined", nd.line)
-      return
-    it.ast.ns[n].d = CT_NATIVE
-    it.ast.ns[n].e = nid
+    if not found:
+      let nid = nat.lookup(name, nd.c)
+      if nid < 0:
+        # jq doesn't look into the arguments of a call it can't bind
+        uerr(&it, name + "/{nd.c} is not defined", nd.line)
+        return
+      it.ast.ns[n].d = CT_NATIVE
+      it.ast.ns[n].e = nid
+    let inline = it.ast.ns[n].d == CT_NATIVE and c_args(name, nd.c)
+    for j in 0..nd.c:
+      let an = it.ast.kids[nd.b + j]
+      if inline:
+        resolve(&it, an, &sc)
+      else:
+        let saved = ctx_push(&it)
+        resolve(&it, an, &sc)
+        it.cctx = saved
     return
   if k == lang.N_AS:
     resolve(&it, nd.a, &sc)
@@ -2151,8 +2239,9 @@ fn resolve(var it: It, n: Int, var sc: Scope):
     sc_pop(&sc, names.len)
     return
   if k == lang.N_REDUCE or k == lang.N_FOREACH:
-    resolve(&it, nd.a, &sc)
+    # jq's code runs (and binds) the init first
     resolve(&it, nd.c, &sc)
+    resolve(&it, nd.a, &sc)
     var names: [Str] = []
     pattern_vars(&it, nd.b, &names)
     resolve_pattern(&it, nd.b, &sc, names)
@@ -2169,7 +2258,10 @@ fn resolve(var it: It, n: Int, var sc: Scope):
     return
   if k == lang.N_DEF:
     let fid = nd.x
+    let saved = ctx_push(&it)
+    it.cdef[it.cctx] = fid
     resolve_def(&it, fid, &sc)
+    it.cctx = saved
     resolve(&it, nd.a, &sc)
     sc_pop(&sc, 1)
     return
@@ -2181,6 +2273,31 @@ fn resolve(var it: It, n: Int, var sc: Scope):
       resolve(&it, _h18, &sc)
     return
   if k == lang.N_FOREACH: return
+  if k == lang.N_INDEX:
+    # jq's code computes the key first
+    resolve(&it, nd.b, &sc)
+    resolve(&it, nd.a, &sc)
+    return
+  if k == lang.N_SLICE:
+    if nd.b >= 0: resolve(&it, nd.b, &sc)
+    if nd.d >= 0: resolve(&it, nd.d, &sc)
+    resolve(&it, nd.a, &sc)
+    return
+  if k == lang.N_UPD:
+    # lhs |= f and lhs = v are calls of jq's _modify/_assign (closures); lhs op= v computes v first
+    if nd.x == lang.OP_UPDATE or nd.x == lang.OP_SET:
+      let s1 = ctx_push(&it)
+      resolve(&it, nd.a, &sc)
+      it.cctx = s1
+      let s2 = ctx_push(&it)
+      resolve(&it, nd.b, &sc)
+      it.cctx = s2
+    else:
+      resolve(&it, nd.b, &sc)
+      let s3 = ctx_push(&it)
+      resolve(&it, nd.a, &sc)
+      it.cctx = s3
+    return
   if nd.a >= 0: resolve(&it, nd.a, &sc)
   if nd.b >= 0 and k != lang.N_FIELD: resolve(&it, nd.b, &sc)
   if nd.c >= 0 and (k == lang.N_IF): resolve(&it, nd.c, &sc)
