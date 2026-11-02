@@ -5,7 +5,8 @@
 # narrows a chunk that differs down to its files.
 # MODE: gen (snippets from a grammar of shell features), mut (mutated corpus files), splice
 # (pieces of corpus files), tok (tokens inserted), bytes (random bytes: invalid UTF-8, NUL, CR,
-# control characters) or deep (deep nesting, unbalanced quotes, here-documents)
+# control characters), deep (deep nesting, unbalanced quotes, here-documents) or uni (generated
+# scripts with characters of every Unicode category in names, operators and words)
 import sys, os, random, subprocess, re, collections
 # SCW: the work directory (shellcheck, vsc, corpus/, corpus2/, files.txt, ...)
 W = os.environ['SCW']
@@ -176,6 +177,25 @@ def rbytes():
             b'\xc0\x80', b'\xf4\x90\x80\x80', b'\x00', b'\r', b'\r\n', b'\x1b[1m', b'\t', b'\xef\xbb\xbf', b'\x0c', b'\xa0',
             b'\xe2\x80\x9c', b'\xc2\xa0', b'\x7f'])
     return bytes(b)
+# characters of every category GHC's Data.Char tells apart: letters (Lu Ll Lt Lm Lo), digits and
+# other numbers, marks, spaces (Zs, Zl, Zp), format and private-use characters, case pairs whose
+# simple mappings differ from the full ones, surrogates and characters past the BMP
+UNI = ['\u00e9', '\u00c9', '\u01c5', '\u01c6', '\u02b0', '\u05d0', '\u4e2d', '\u0661', '\u2163', '\u00b2', '\u0301', '\u00a0',
+       '\u2003', '\u3000', '\u2028', '\u2029', '\u200b', '\ue000', '\u0130', '\u00df', '\u1e9e', '\u03a3', '\u03c2', '\u212a',
+       '\U0001d400', '\U0001f600', '\U0002ebf0', '\u24b6', '\u2019', '\u201c', '\u2013', '\u00ad', '\u0149', '\u1f80', '\u1680']
+def uni():
+    t = gen()
+    out = []
+    for ch in t:
+        if ch.isalpha() and rnd.random() < 0.08: out.append(rnd.choice(UNI))
+        elif ch == ' ' and rnd.random() < 0.03: out.append(rnd.choice(UNI))
+        else: out.append(ch)
+    if rnd.random() < 0.3:
+        out.append(rnd.choice(['$' + rnd.choice(UNI) + 'x\n', 'echo "${' + rnd.choice(UNI) + 'a}"\n', 'set -' + rnd.choice(UNI) + 'e\n',
+            'trap x ' + rnd.choice(UNI) + 'int\n', 'tr ' + rnd.choice(UNI) * 2 + ' x\n', 'f' + rnd.choice(UNI) + '() { :; }\n',
+            '[ -' + rnd.choice(UNI) + ' x ]\n', 'cat <<E' + rnd.choice(UNI) + '\nx\ne' + rnd.choice(UNI) + '\n',
+            'kill -' + rnd.choice(UNI) + ' 1\n', 'X' + rnd.choice(UNI) + '=1; echo "$x' + rnd.choice(UNI) + '"\n']))
+    return ''.join(out)
 def deep():
     k = rnd.randint(1, 60)
     kind = rnd.randrange(8)
@@ -195,7 +215,7 @@ os.makedirs(d, exist_ok=True)
 names = []
 for k in range(n):
     p = f'{d}/t{k}.sh'
-    data = gen().encode() if mode == 'gen' else mut() if mode == 'mut' else splice() if mode == 'splice' else rbytes() if mode == 'bytes' else deep().encode() if mode == 'deep' else tok()
+    data = gen().encode() if mode == 'gen' else mut() if mode == 'mut' else splice() if mode == 'splice' else rbytes() if mode == 'bytes' else deep().encode() if mode == 'deep' else uni().encode('utf-8', 'surrogatepass') if mode == 'uni' else tok()
     open(p, 'wb').write(data)
     names.append(p)
 def run(cmd, chunk):

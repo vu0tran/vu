@@ -106,7 +106,8 @@ def run(cmd, d, env, stdin, x, merge):
     cmd = [a.replace('@/', d + '/') if isinstance(a, str) else a for a in cmd]
     if x.get('nocaps'): cmd = ['setpriv', '--bounding-set=-all', '--inh-caps=-all'] + cmd
     if 'sh' in x:
-        tool = cmd[0] if not x.get('nocaps') else ' '.join(cmd[:4])
+        k = 3 if x.get('nocaps') else 0
+        tool = ' '.join(cmd[:k + 1] + (vsc_args if cmd[k] == vsc else []))
         cmd = ['sh', '-c', x['sh'].replace('TOOL', tool)]
     try: p = subprocess.run(cmd, cwd=d, env=e, input=inp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE, timeout=20)
     except subprocess.TimeoutExpired: return b'', b'TIMEOUT', -1
@@ -123,6 +124,8 @@ def setup(d, files, x):
         open(p, 'wb').write(c if isinstance(c, bytes) else c.replace('@/', d + '/').encode())
     if 'pre' in x: subprocess.run(['sh', '-c', x['pre']], cwd=d, check=True)
 
+# CASES_VSC_ARGS: arguments given to vsc before each case's (e.g. "--jobs 2")
+vsc_args = os.environ.get('CASES_VSC_ARGS', '').split()
 ok = bad = 0
 for case in cases:
     name, files, args, env = case[:4]
@@ -133,7 +136,7 @@ for case in cases:
         setup(d, files, x)
         r1 = run([sc] + args, d, env, env.get('STDIN'), x, merge)
         setup(d, files, x)
-        r2 = run([vsc] + args, d, env, env.get('STDIN'), x, merge)
+        r2 = run([vsc] + vsc_args + args, d, env, env.get('STDIN'), x, merge)
         if r1 == r2: ok += 1
         else:
             bad += 1
