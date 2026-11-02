@@ -33,6 +33,7 @@ type Issue:
   line: Int         # 0: none
   col: Int
   pos: Int
+  extra: Str        # duplicates: their names and positions as JSON
 
 type Issues:
   list: [Issue]
@@ -47,7 +48,7 @@ fn add_issue(var is: Issues, own i: Issue):
   is.list.push(i)
 
 fn issue(typ: Str, file: Str, symbol: Str) -> Issue:
-  return Issue(typ + "", file + "", symbol + "", symbol + "", "", "", 0, 0, 0)
+  return Issue(typ + "", file + "", symbol + "", symbol + "", "", "", 0, 0, 0, "")
 
 # ---- ICU-like string order (Intl.Collator's root collation for ASCII: punctuation, digits, letters
 # without case first, then lowercase before uppercase)
@@ -404,15 +405,15 @@ fn dep_location(p: Proj, section: Str, name: Str) -> [Int]:
     if sec == section:
       start = i
       spos = pos
-    pos += l.len + 1
+    pos += extract.u16(l, 0, l.len) + 1
   if start < 0: return []
-  var q = spos + lines[start].len + 1
+  var q = spos + extract.u16(lines[start], 0, lines[start].len) + 1
   for i in start + 1..lines.len:
     let l = lines[i]
     if l.find("\"" + name + "\"") >= 0:
-      let col = l.find(name)
+      let col = extract.u16(l, 0, l.find(name))
       return [i + 1, col + 1, q + col]
-    q += l.len + 1
+    q += extract.u16(l, 0, l.len) + 1
   return []
 
 # ---- tsconfig
@@ -1831,6 +1832,11 @@ fn analyze_imports(var p: Proj, b: Build):
     for d in node.raw.dups:
       if d.names.len > 1:
         var i = issue("duplicates", node.path, "|".join(d.names))
+        var ds: [Str] = []
+        for k in 0..d.names.len:
+          let l = extract.loc(node.raw, d.pos[k])
+          ds.push("{{\"name\":" + json_str(d.names[k]) + ",\"line\":{l[0]},\"col\":{l[1]},\"pos\":{l[2]}}}")
+        i.extra = "[" + ",".join(ds) + "]"
         add_issue(&p.issues, i)
     for e in node.exts:
       let name = e.pkg
@@ -1879,11 +1885,26 @@ fn settle_deps(var p: Proj):
       i.col = l[1]
       i.pos = l[2]
     add_issue(&p.issues, i)
+  for d in sc(p.peer_deps):
+    if not (d in p.opt_peer) or not (d in p.referenced): continue
+    var listed = false
+    for x in p.deps:
+      if x == d: listed = true
+    for x in p.dev_deps:
+      if x == d: listed = true
+    if listed: continue
+    var i = issue("optionalPeerDependencies", "package.json", d)
+    let l = dep_location(p, "optionalPeerDependencies", d)
+    if l.len == 3:
+      i.line = l[0]
+      i.col = l[1]
+      i.pos = l[2]
+    add_issue(&p.issues, i)
   # knip and typescript are never reported (removeIgnoredIssues)
   var kept: [Issue] = []
   for i in p.issues.list:
     let t = i.typ
-    if t == "dependencies" or t == "devDependencies" or t == "unlisted" or t == "unresolved":
+    if t == "dependencies" or t == "devDependencies" or t == "optionalPeerDependencies" or t == "unlisted" or t == "unresolved":
       let name = pkg_from_spec(i.symbol)
       if name == "knip" or name == "typescript":
         if not (t == "devDependencies" and name in p.deps): continue
@@ -1923,7 +1944,7 @@ fn sorted_issues(c: [Int], xs: [Issue]) -> [Issue]:
   return out
 
 fn copy_issue(i: Issue) -> Issue:
-  return Issue(i.typ + "", i.file + "", i.symbol + "", i.display + "", i.stype + "", i.parent + "", i.line, i.col, i.pos)
+  return Issue(i.typ + "", i.file + "", i.symbol + "", i.display + "", i.stype + "", i.parent + "", i.line, i.col, i.pos, i.extra + "")
 
 # text width in characters (UTF-8 code points)
 fn width(s: Str) -> Int:
@@ -2066,7 +2087,40 @@ fn report_symbols(p: Proj) -> Int:
 fn json_str(s: Str) -> Str:
   return json.quote(s)
 
-fn report_json(p: Proj) -> Int:
+type Owner:
+  pats: [glob.Pat]
+  owners: [Str]
+
+# .github/CODEOWNERS rules (the last matching rule gives a file's owners)
+fn codeowners(p: Proj, fs: Fs) -> [Owner]:
+  var out: [Owner] = []
+  let text = fs.read(fspath(p, ".github/CODEOWNERS")) else return out
+  for raw in text.split("\n"):
+    var l = raw
+    if l.endswith("\r"): l = l[0..l.len - 1]
+    if l == "" or l.startswith("#"): continue
+    var parts: [Str] = []
+    for x in l.split():
+      parts.push(x + "")
+    if parts.len == 0: continue
+    let pat = convert_gitignore(parts[0])
+    var pats: [glob.Pat] = [glob.compile(pat)]
+    if pat != "*" and pat != "**" and not pat.endswith("/*"): pats.push(glob.compile(pat + "/**"))
+    var owners: [Str] = []
+    for k in 1..parts.len: owners.push(parts[k] + "")
+    out.push(Owner(pats, owners))
+  return out
+
+fn owners_of(rules: [Owner], file: Str) -> [Str]:
+  var i = rules.len - 1
+  while i >= 0:
+    if matches_any(rules[i].pats, file, false): return sc(rules[i].owners)
+    i -= 1
+  return []
+
+fn report_json(p: Proj, fs: Fs) -> Int:
+  let rules = codeowners(p, fs)
+  let has_owners = fs.exists(fspath(p, ".github/CODEOWNERS"))
   var files: [Str] = []
   var byf: {Str: [Issue]} = {}
   for i in p.issues.list:
@@ -2078,16 +2132,17 @@ fn report_json(p: Proj) -> Int:
   let cats = ["binaries", "catalog", "catalogReferences", "dependencies", "devDependencies", "duplicates", "enumMembers", "exports", "files", "namespaceMembers", "optionalPeerDependencies", "types", "unlisted", "unresolved"]
   for f in files:
     var row = "{{\"file\":" + json_str(f)
+    if has_owners:
+      var os_: [Str] = []
+      for o in owners_of(rules, f): os_.push("{{\"name\":" + json_str(o) + "}}")
+      row += ",\"owners\":[" + ",".join(os_) + "]"
     for c in cats:
       var items: [Str] = []
       for i in byf[f]:
         if i.typ != c: continue
         if c == "files": items.push("{{\"name\":" + json_str(i.symbol) + "}}")
         elif c == "binaries": items.push("{{\"name\":" + json_str(i.symbol) + "}}")
-        elif c == "duplicates":
-          var ds: [Str] = []
-          for s in i.symbol.split("|"): ds.push("{{\"name\":" + json_str(s) + "}}")
-          items.push("[" + ",".join(ds) + "]")
+        elif c == "duplicates": items.push(i.extra + "")
         else:
           var o = "{{"
           if i.parent != "": o += "\"namespace\":" + json_str(i.parent) + ","
@@ -2262,7 +2317,7 @@ fn main(fs: Fs, os: Os):
   analyze_imports(&p, b)
   settle_deps(&p)
   var n = 0
-  if reporter == "json": n = report_json(p)
+  if reporter == "json": n = report_json(p, fs)
   else: n = report_symbols(p)
   if n > 0: exit(1)
 

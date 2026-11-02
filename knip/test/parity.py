@@ -1,5 +1,8 @@
 import sys,os,re,subprocess,collections
 W=os.path.dirname(os.path.abspath(__file__))
+# VKNIP: the vknip binary; REF: the folder of knip's outputs (NAME.txt for each project)
+VK=os.environ.get('VKNIP', os.path.join(W,'vknip'))
+REF=os.environ.get('REF', os.path.join(W,'ref'))
 def parse(text):
     cats=collections.OrderedDict(); cur=None
     for line in text.split('\n'):
@@ -9,11 +12,11 @@ def parse(text):
     return cats
 def main():
     corpus=sys.argv[1]; names=sys.argv[2:]
-    vk=os.path.join(W,'vknip')
+    vk=VK
     tot=collections.Counter(); ident_files=0
     rows=[]
     for n in names:
-        ref=open(os.path.join(W,'ref',n+'.txt')).read()
+        ref=open(os.path.join(REF,n+'.txt')).read()
         out=subprocess.run([vk],cwd=os.path.join(corpus,n),capture_output=True,text=True)
         got=out.stdout
         same = got==ref
