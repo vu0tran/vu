@@ -31,9 +31,11 @@ for r in repos:
         pre = f"../gocorpus/{r}/"
         if path.startswith(pre): path = path[len(pre):]
         want[(r, path + l[len(m.group(1)):], key(m.group(4), m.group(5)))] += 1
-    out = subprocess.run([S + "/vgolint", "./..."], cwd=f"{C}/{r}", capture_output=True, text=True).stdout.splitlines()
+    out = subprocess.run([os.environ.get("VG", S + "/vgolint"), "run", "-c", S + "/golint/golangci.yml", "--max-issues-per-linter", "0", "--max-same-issues", "0", "--output.text.print-issued-lines=false", "--show-stats=false", "--no-cache", "./..."], cwd=f"{C}/{r}", capture_output=True, text=True).stdout.splitlines()
     for l in out:
         if l.startswith("PARSE ERROR"): parse_err.append(r + ": " + l); continue
+        pre = f"../gocorpus/{r}/"
+        if l.startswith(pre): l = l[len(pre):]
         m = pat.match(l)
         if not m: print("??", r, l); continue
         got[(r, l, key(m.group(4), m.group(5)))] += 1

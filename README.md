@@ -502,6 +502,17 @@ default rules (every warning matched on date-fns, zod, vscode, preact, excalidra
 takes about as much CPU as oxlint (Rust), 13 times less than Biome and 130 times less than ESLint
 (measured on a loaded 2-core VM; `ts/README.md`).
 
+## A golangci-lint replacement in Vu
+
+`golint/` holds vgolint, a drop-in replacement for `golangci-lint run` 2.5.0: it finds and reads
+the same `.golangci.yml/.yaml/.toml/.json` (v2 schema: linter sets and settings, exclusions and
+presets, `//nolint`, limits, severities, diffs against git), takes the same flags and prints the
+same nine output formats byte for byte, with the same exit codes. It implements the five default
+linters (1744 of golangci-lint's 1754 findings on 21 modules) and nine of the most enabled
+optional ones (misspell, unconvert, whitespace, nolintlint, copyloopvar, nakedret, asciicheck,
+dogsled, predeclared, gocyclo: 1860 of 1861 findings), using about half golangci-lint's CPU time
+against its warm cache (loaded 2-core VM). What it does and doesn't do yet: `golint/README.md`.
+
 ## Built for the model that writes it
 
 Vu's compiler, runtime, standard library, tests and these documents were written by an AI model
@@ -565,6 +576,7 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 | `tests/` | the test suites; `tests/gate.sh` runs them all |
 | `bench/` | benchmark programs in C, C++, Rust and Go, and the scripts that time them |
 | `ts/` | vtsc, a TypeScript type checker written in Vu (2.9x faster than tsc 7 on date-fns; see `ts/README.md`) |
+| `golint/` | vgolint, a drop-in replacement for golangci-lint (see `golint/README.md`) |
 | `SPEC.md` | the language |
 | `CHANGELOG.md` | how it was built, round by round, with measurements |
 | `attic/` | the retired Python compiler |
