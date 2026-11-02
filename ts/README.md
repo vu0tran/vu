@@ -90,7 +90,9 @@ parameter constrained to `{}` against a union.
 
 `vlint` checks JavaScript and TypeScript (`.js .mjs .cjs .jsx .ts .mts .cts .tsx`) with oxlint's
 96 default rules (the correctness rules that need no type information: `eslint/*`, `typescript/*`,
-`unicorn/*`, `oxc/*`) and prints each diagnostic the way `oxlint -f unix` does. It reuses vtsc's
+`unicorn/*`, `oxc/*`) and prints each diagnostic on one line, as oxlint 1.90.0 prints them when it
+runs under an AI agent (`file:line:col: warning eslint(rule): message help: ...`; not `-f unix`'s
+`[Warning/eslint(rule)]` form, checked). It reuses vtsc's
 scanner and parser, plus a scope builder (`scope.vu`), a regular-expression parser (`regex.vu`)
 the rules (`rules.vu`) and, for `--fix`, a printer of expressions as oxc prints them
 (`fixgen.vu`): about 7,700 lines of Vu.
@@ -103,6 +105,28 @@ cd ts && VU_SPLIT=off ../vu build --release vlint.vu -o vlint   # one C file: th
 
 It honors `eslint-disable`/`oxlint-disable` comments, and reports parse errors with oxc's
 messages where they're known (redeclarations, invalid characters).
+
+With no paths it lints the current folder, skipping `node_modules` folders (oxlint skips them
+through `.gitignore`; vlint reads no ignore files). Options it doesn't have are refused (exit code
+2) rather than read as paths, and the exit code is 1 when it printed an error (a parse error), as
+oxlint's is. Paths are printed as oxlint prints them (`./src` gives `src/a.ts`), and when there is
+nothing to lint it prints oxlint's "No files found to lint" line and exits with 1. (Checked against
+oxlint 1.90.0 for `./src`, `src/`, `./src/a.js`, a missing file and an empty folder; `.` differs only
+by the files oxlint's `.gitignore` handling skips.)
+
+## Install
+
+```sh
+npm install --save-dev @vu0tran/vlint      # the vlint and oxlint commands
+```
+
+or, to replace oxlint in a project without touching its scripts, one line in `package.json`:
+`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`. The npm packages are laid out as oxlint's are (a Node
+launcher and one optional dependency per platform with the binary: Linux x64/ARM64, static; macOS
+12+ on Apple silicon and Intel; no Windows). What works and what doesn't as a drop-in (no config
+files, no ignore files, one output format): `packaging/npm/vlint/README.md`, which is also the
+package's README. Each `vlint-vX.Y.Z` tag also puts the bare binaries on the GitHub release
+(`vlint-X.Y.Z-<platform>.tar.gz`). Releasing: `RELEASING.md`.
 
 ## The cache
 

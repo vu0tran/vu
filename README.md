@@ -500,7 +500,9 @@ and how it's tested against tsc: `ts/README.md`.
 The same directory holds vlint, a linter that prints exactly what oxlint prints for its 96
 default rules (every warning matched on date-fns, zod, vscode, preact, excalidraw and more). It
 takes about as much CPU as oxlint (Rust), 13 times less than Biome and 130 times less than ESLint
-(measured on a loaded 2-core VM; `ts/README.md`).
+(measured on a loaded 2-core VM; `ts/README.md`). It's on npm as `@vu0tran/vlint`, laid out as
+oxlint is, with an `oxlint` command too (`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`; not published
+yet: `RELEASING.md`).
 
 ## A golangci-lint replacement in Vu
 
@@ -511,7 +513,9 @@ same nine output formats byte for byte, with the same exit codes. It implements 
 linters (1744 of golangci-lint's 1754 findings on 21 modules) and ten of the most enabled
 optional ones (misspell, unconvert, whitespace, nolintlint, copyloopvar, nakedret, asciicheck,
 dogsled, predeclared, gocyclo: 1860 of 1861 findings over three configs), using about half golangci-lint's CPU time
-against its warm cache (loaded 2-core VM). What it does and doesn't do yet: `golint/README.md`.
+against its warm cache (loaded 2-core VM). What it does and doesn't do yet: `golint/README.md`. It installs
+as golangci-lint does, from release archives through an `install.sh` with the same interface or a
+GitHub Action (`golint/README.md`, Install).
 
 ## Built for the model that writes it
 
@@ -577,6 +581,7 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 | `bench/` | benchmark programs in C, C++, Rust and Go, and the scripts that time them |
 | `ts/` | vtsc, a TypeScript type checker written in Vu (2.9x faster than tsc 7 on date-fns; see `ts/README.md`) |
 | `golint/` | vgolint, a drop-in replacement for golangci-lint (see `golint/README.md`) |
+| `packaging/` | release scripts: Vu's archives, Homebrew, and the drop-in tools' builds and npm packages (`RELEASING.md`) |
 | `SPEC.md` | the language |
 | `CHANGELOG.md` | how it was built, round by round, with measurements |
 | `attic/` | the retired Python compiler |

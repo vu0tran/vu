@@ -16,6 +16,72 @@ for linux/amd64 (build tags from `run.build-tags` included) and linted on all co
 cached per run, keyed by every linted file, go.mod/go.sum, the Go version, the effective config
 and the binary (`--no-cache` turns that off).
 
+## Install
+
+Releases are tagged `vgolint-vX.Y.Z` and have archives named as golangci-lint's
+(`vgolint-0.1.0-linux-amd64.tar.gz`, `-linux-arm64`, `-darwin-amd64`, `-darwin-arm64`) with
+`SHA256SUMS`. Each archive holds one binary, `vgolint`. Linux binaries are static (any glibc or
+musl); macOS binaries need macOS 12 or later. There is no Windows build (Vu doesn't target Windows).
+
+**The installer** has golangci-lint's interface, so switching is one line:
+
+```sh
+# golangci-lint:
+curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.5.0
+# vgolint:
+curl -sSfL https://raw.githubusercontent.com/vu0tran/vu/main/golint/install.sh | sh -s -- -b $(go env GOPATH)/bin v0.1.0
+```
+
+It checks the archive against `SHA256SUMS` and installs `vgolint` and `golangci-lint`, a link to it,
+so Makefiles and scripts that call `golangci-lint run` keep working. A `golangci-lint` that is
+already in the folder and isn't vgolint's is left alone unless `-f` is given; `-n` installs
+`vgolint` only. With no version it installs the newest vgolint release. The version is vgolint's own
+(`v0.1.0`), not golangci-lint's: `golangci-lint version` says which golangci-lint it mirrors
+(`golangci-lint has version 2.5.0 built with vgolint (Vu) ...`).
+
+**What it needs where it runs** (as golangci-lint does): the Go toolchain's standard library
+source and the module cache, because it type-checks against them. It reads source files and never
+runs the Go compiler (the only `go` command it runs is `go env`). It finds them as golangci-lint does: `GOROOT` and
+`GOMODCACHE` if set, else from `go env GOROOT GOMODCACHE` (the `go` on `PATH`), else
+`/usr/local/go` and `$GOPATH/pkg/mod` (`~/go/pkg/mod`). Unlike golangci-lint, it never downloads
+modules: run `go mod download` first where the cache may be empty (a fresh CI runner without a
+module cache). A dependency missing from the cache isn't reported: vgolint lints without its types
+(checked: an import of an absent module gave the other findings and no error, where golangci-lint
+reports a typecheck error), so findings that need them can be missed. It also uses `git` for `--new`, `--new-from-rev` and the other diff modes.
+
+**GitHub Actions**: golangci-lint-action downloads golangci-lint's own releases, so use the
+composite action in this repository instead, with the same common inputs (`version`, `args`,
+`working-directory`, `only-new-issues`, `install-only`, `problem-matchers`, `github-token`):
+
+```diff
+   - uses: actions/setup-go@v6
+     with:
+       go-version: stable
+-  - uses: golangci/golangci-lint-action@v8
++  - uses: vu0tran/vu/golint/action@vgolint-v0.1.0
+     with:
+-      version: v2.5
++      version: v0.1.0
+       args: --timeout=5m
+```
+
+It installs the release on `PATH` (`vgolint` and `golangci-lint`), runs `go mod download`
+(`go-mod-download: false` skips it), and runs `vgolint run ARGS`. `only-new-issues` takes the pull
+request's diff (or a push's) from the GitHub API and passes it as `--new-from-patch`, as
+golangci-lint-action does. Not supported: golangci-lint-action's caching inputs (`skip-cache`,
+`skip-save-cache`, `cache-invalidation-interval`), `install-mode`, `verify` (vgolint doesn't check
+configs against golangci-lint's JSON schema) and Windows runners.
+
+**Homebrew**: each release carries `vgolint.rb`, a formula for it (`packaging/homebrew/vgolint_formula.sh`
+writes it); it isn't published. It installs `vgolint` only, since a `golangci-lint` command would
+clash with Homebrew's golangci-lint.
+
+Releasing: `RELEASING.md`.
+
+Platform notes: packages are matched for linux/amd64 on every platform (as above), so on macOS
+files with `_darwin.go` suffixes or `//go:build darwin` lines are skipped where golangci-lint on a
+Mac would lint them. On macOS the result cache is off (it is keyed by `/proc/self/exe`).
+
 ## Drop-in status
 
 ### Commands
