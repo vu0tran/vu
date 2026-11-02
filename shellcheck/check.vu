@@ -856,6 +856,9 @@ fn run_checks(var a: An):
   check_array_assignment_indices(&a)
   check_use_before_definition(&a)
   check_alias_used_in_same_unit(&a)
+  check_array_value_used_as_index(&a)
+  if opt_enabled(a, "check-set-e-suppressed"): check_set_e_suppressed(&a)
+  if opt_enabled(a, "check-extra-masked-returns"): check_extra_masked_returns(&a)
   let nodes = preorder(a.t, a.root)
   for n in nodes:
     node_checks(&a, n)
@@ -959,6 +962,17 @@ fn node_checks2(var a: An, n: Int):
     check_unnecessary_arith_index(&a, n)
     check_plus_equals_number(&a, n)
   if k == T_DollarArithmetic or k == T_ForArithmetic or k == T_Assignment or k == T_Arithmetic or k == TA_Parenthesis: check_unnecessary_parens(&a, n)
+  shell_support_checks(&a, n)
+  if k == T_Subshell: check_subshell_as_test(&a, n)
+  if k == T_WhileExpression: check_while_read_pitfalls(&a, n)
+  if k == TC_Nullary and opt_enabled(a, "avoid-nullary-conditions"): check_nullary_expansion_test(&a, n)
+  if (k == TC_Unary or k == T_Banged) and opt_enabled(a, "avoid-negated-conditions"): check_unnecessarily_inverted_test(&a, n)
+  if k == T_CaseExpression and opt_enabled(a, "add-default-case"): check_default_case(&a, n)
+  if k == T_DollarBraced and opt_enabled(a, "require-variable-braces"): check_variable_braces(&a, n)
+  if k == T_Condition and opt_enabled(a, "require-double-brackets"): check_require_double_bracket(&a, n)
+  if k == T_SimpleCommand:
+    check_equals_in_command(&a, n)
+    check_command_with_trailing_symbol(&a, n)
   if k == TC_Unary and a.t.s[n] == "-a":
     let f = [rep_start(a, n, 2, "-e")]
     style_fix(&a, n, 2331, "For file existence, prefer standard -e over legacy -a.", f)
@@ -1147,6 +1161,10 @@ fn quotes_may_conflict_2281(a: An, n: Int) -> Bool:
 # ---------------------------------------------------------------- SC2086, SC2223
 
 fn check_spacefulness(var a: An, n: Int):
+  check_spacefulness2(&a, n, true)
+  if opt_enabled(a, "quote-safe-variables"): check_spacefulness2(&a, n, false)
+
+fn check_spacefulness2(var a: An, n: Int, dirty: Bool):
   let s = oversimp(a.t, a.t.a[n])
   let name = braced_reference(s)
   if is_array_expansion(a, n) or is_counting_reference(a, n) or is_quote_free(a, n) or is_quoted_alternative_reference(a, n) or used_as_command_name(a, n): return
@@ -1154,8 +1172,12 @@ fn check_spacefulness(var a: An, n: Int):
   if st = incoming_state(&a, n):
     let v = dfa.var_state(a.res, st, name)
     if v >= 0: clean = dfa.all_have(dfa.vs_props(v), cfg.VP_INTEGER) or dfa.vs_space(v) == dfa.SP_CLEAN
-  if clean: return
+  if dirty == clean: return
   if name in data.special_variables_without_spaces() or quotes_may_conflict_2281(a, n): return
+  if not dirty:
+    let f = surround(a, n, "\"")
+    style_fix(&a, n, 2248, "Prefer double quoting even when variables don't contain special characters.", f)
+    return
   let m = braced_modifier(s)
   if (m.startswith("=") or m.startswith(":=")) and is_param_to(a, n, ":"):
     info(&a, n, 2223, "This default assignment may cause DoS due to globbing. Quote it.")
@@ -1258,6 +1280,10 @@ fn has_lower(s: Str) -> Bool:
   return false
 
 fn check_unassigned_references(var a: An):
+  check_unassigned_references2(&a, false)
+  if opt_enabled(a, "check-unassigned-uppercase"): check_unassigned_references2(&a, true)
+
+fn check_unassigned_references2(var a: An, globals: Bool):
   var read: {Str: Int} = {}
   var written: {Str: Bool} = {}
   for f in a.flow:
@@ -1275,7 +1301,7 @@ fn check_unassigned_references(var a: An):
     if v in written or v in defaults: continue
     if not is_variable_name(v): continue
     if is_exception(a, v, place) or is_guarded(a, place): continue
-    if has_lower(v):
+    if globals or has_lower(v):
       var tip = ""
       if parse.is_common_command(v): tip = " (for output from commands, use \"$(" + v + " ..." + ")\" )"
       elif m = best_match(v, wv): tip = " (did you mean '" + m + "'?)"
@@ -5593,3 +5619,593 @@ fn check_plus_equals_number(var a: An, n: Int):
   let v = dfa.var_state(a.res, st, a.t.s[n])
   if v >= 0 and dfa.any_has(dfa.vs_props(v), cfg.VP_INTEGER): return
   warn(&a, n, 2324, "var+=1 will append, not increment. Use (( var += 1 )), typeset -i var, or quote number to silence.")
+
+# ---------------------------------------------------------------- more of Checks/ShellSupport.hs
+
+fn brace_lit(t: ast.Ast, n: Int, var out: Str):
+  let k = t.k[n]
+  if k == T_DoubleQuoted or k == T_DollarDoubleQuoted or k == T_NormalWord or k == TA_Expansion:
+    for i in 0..t.n1[n]: brace_lit(t, ast.at1(t, n, i), &out)
+  elif k == T_SingleQuoted or k == T_Literal or k == T_ParamSubSpecialChar: out += t.s[n]
+  elif k == T_DollarSingleQuoted: out += astlib.decode_escapes(t.s[n])
+  elif k == T_DollarBraced or k == T_DollarExpansion or k == T_DollarArithmetic: out += "$"
+  else: out += "-"
+
+# ^\[.*\]\[.*\] on some line
+fn multi_dim(s: Str) -> Bool:
+  for l in s.split("\n"):
+    if not l.startswith("["): continue
+    var i = 1
+    while true:
+      let c = l.find("][", i)
+      if c < 0: break
+      if l.find("]", c + 2) >= 0: return true
+      i = c + 1
+  return false
+
+fn shell_support_checks(var a: An, n: Int):
+  let k = a.t.k[n]
+  let sh = a.shell
+  if k == TA_Expansion and (sh == SH_SH or sh == SH_DASH or sh == SH_BUSYBOX or sh == SH_BASH):
+    if s = get_literal(a.t, n):
+      if s.len > 0 and s[0] >= '0' and s[0] <= '9' and s[1..s.len].find(".") >= 0: err(&a, n, 2079, "(( )) doesn't support decimals. Use bc or awk.")
+  if sh == SH_BASH:
+    if k == T_BraceExpansion:
+      for i in 0..a.t.n1[n]:
+        let e = ast.at1(a.t, n, i)
+        var s = ""
+        brace_lit(a.t, e, &s)
+        if s.find("$..") >= 0 or s.find("..$") >= 0:
+          let c = closest_command(a, e)
+          if c >= 0 and is_unqualified_command(a.t, c, "eval"): style(&a, n, 2175, "Quote this invalid brace expansion since it should be passed literally to eval.")
+          else: warn(&a, n, 2051, "Bash doesn't support variables in brace range expansions.")
+    elif (k == T_Assignment or k == T_IndexedElement) and a.t.n1[n] >= 2:
+      warn(&a, ast.at1(a.t, n, 1), 2180, "Bash does not support multidimensional arrays. Use 1D or associative arrays.")
+    elif k == T_DollarBraced and multi_dim(braced_modifier(oversimp(a.t, a.t.a[n]))):
+      warn(&a, n, 2180, "Bash does not support multidimensional arrays. Use 1D or associative arrays.")
+    elif k == T_Assignment: check_ps1_assignments(&a, n)
+    elif k == TC_Unary and a.t.f[n] == SINGLE and a.t.s[n] == "!":
+      let x = a.t.a[n]
+      if x >= 0 and a.t.k[x] == TC_Unary:
+        if a.t.s[x] == "-o": err(&a, n, 2332, "[ ! -o opt ] is always true because -o becomes logical OR. Use [[ ]] or ! [ -o opt ].")
+        elif a.t.s[x] == "-a": err(&a, n, 2332, "[ ! -a file ] is always true because -a becomes logical AND. Use -e instead.")
+  if (sh == SH_DASH or sh == SH_BUSYBOX or sh == SH_SH) and k == T_Banged and a.t.k[a.t.a[n]] == T_Banged:
+    err(&a, n, 2325, "Multiple ! in front of pipelines are a bash/ksh extension. Use only 0 or 1.")
+  if (sh == SH_DASH or sh == SH_BUSYBOX or sh == SH_SH or sh == SH_BASH) and k == T_Pipeline:
+    for i in 0..a.t.n2[n]:
+      let c = ast.at2(a.t, n, i)
+      if a.t.k[c] == T_Banged: err(&a, c, 2326, "! is not allowed in the middle of pipelines. Use command group as in cmd | {{ ! cmd; }} if necessary.")
+
+# ---------------------------------------------------------------- SC2270-SC2282 (checkEqualsInCommand)
+
+fn assign0_msg(var a: An, id: Int, own fix: [ast.Rep]):
+  if a.shell == SH_BASH: err_fix(&a, id, 2277, "Use BASH_ARGV0 to assign to $0 in bash (or use [ ] to compare).", fix)
+  elif a.shell == SH_KSH: err(&a, id, 2278, "$0 can't be assigned in Ksh (but it does reflect the current function).")
+  elif a.shell == SH_DASH: err(&a, id, 2279, "$0 can't be assigned in Dash. This becomes a command name.")
+  elif a.shell == SH_BUSYBOX: err(&a, id, 2279, "$0 can't be assigned in Busybox Ash. This becomes a command name.")
+  else: err(&a, id, 2280, "$0 can't be assigned this way, and there is no portable alternative.")
+
+fn equals_generic(var a: An, id: Int):
+  err(&a, id, 2276, "This is interpreted as a command name containing '='. Bad assignment or comparison?")
+
+fn equals_positional(var a: An, id: Int):
+  err(&a, id, 2270, "To assign positional parameters, use 'set -- first second ..' (or use [ ] to compare).")
+
+fn equals_indirection(var a: An, id: Int):
+  err(&a, id, 2271, "For indirection, use arrays, declare \"var$n=value\", or (for sh) read/eval.")
+
+fn is_leading_number_var(s: Str) -> Bool:
+  var e = s.find("=")
+  if e < 0: e = s.len
+  let lead = s[0..e]
+  if lead.len == 0 or lead[0] < '0' or lead[0] > '9': return false
+  for k in 0..lead.len:
+    if not is_var_char_c(lead[k]): return false
+  return not all_digits_str(lead)
+
+fn check_equals_in_command(var a: An, n: Int):
+  if a.t.n2[n] == 0: return
+  let cmd = ast.at2(a.t, n, 0)
+  if a.t.k[cmd] != T_NormalWord: return
+  var eqi = -1
+  for i in 0..a.t.n1[cmd]:
+    let p = ast.at1(a.t, cmd, i)
+    if a.t.k[p] == T_Literal and a.t.s[p].find("=") >= 0:
+      eqi = i
+      break
+  if eqi < 0: return
+  var leading: [Int] = []
+  for i in 0..eqi: leading.push(ast.at1(a.t, cmd, i))
+  if leading.len > 0:
+    let l = leading[leading.len - 1]
+    if a.t.k[l] == T_Literal and a.t.s[l] == "+": leading.pop()
+  let lit = ast.at1(a.t, cmd, eqi)
+  let s = a.t.s[lit]
+  if leading.len == 0 and s.startswith("-"): return
+  if leading.len == 0 and s.startswith("="):
+    if a.t.n1[n] == 0 and a.t.n2[n] == 1:
+      if u = cfg.unquoted_literal(a.t, cmd):
+        var all_eq = true
+        for k in 0..u.len:
+          if u[k] != '=': all_eq = false
+        if all_eq and u.len >= 4 and u.len <= 12:
+          err(&a, n, 2273, "Sequence of ===s found. Merge conflict or intended as a commented border?")
+          return
+    if s.startswith("==="): err(&a, n, 2274, "Command name starts with ===. Intended as a commented border?")
+    else: err(&a, cmd, 2275, "Command name starts with =. Bad line break?")
+    return
+  if s.find("==") >= 0:
+    err(&a, cmd, 2272, "Command name contains ==. For comparison, use [ \"$var\" = value ].")
+    return
+  if leading.len == 1 and a.t.k[leading[0]] == T_DollarBraced and s.startswith("="):
+    let id = leading[0]
+    let vs = oversimp(a.t, a.t.a[id])
+    let vref = braced_reference(vs)
+    let vmod = braced_modifier(vs)
+    let plain = is_variable_name(vs)
+    let is_arr = vref.len > 0 and vmod.startswith("[") and vmod.endswith("]")
+    if vs.len == 0 or vs.startswith("#"): equals_generic(&a, cmd)
+    elif vs == "0": assign0_msg(&a, id, [rep_token(a, id, "BASH_ARGV0")])
+    elif all_digits_str(vs): equals_positional(&a, id)
+    elif is_arr or plain:
+      let braced = a.t.f[id] == 1
+      if braced:
+        let f = [rep_start(a, id, 2, ""), rep_end(a, id, 1, "")]
+        err_fix(&a, id, 2281, "Don't use ${{}} on the left side of assignments.", f)
+      else:
+        let f = [rep_start(a, id, 1, "")]
+        err_fix(&a, id, 2281, "Don't use $ on the left side of assignments.", f)
+    else: equals_indirection(&a, id)
+    return
+  if leading.len == 0:
+    var posmatch = false
+    for line in s.split("\n"):
+      if line.len >= 2 and line[0] >= '0' and line[0] <= '9':
+        if line[1] == '=' or (line.len >= 3 and line[1] >= '0' and line[1] <= '9' and line[2] == '='): posmatch = true
+    if posmatch:
+      if s.startswith("0="): assign0_msg(&a, lit, [rep_start(a, lit, 1, "BASH_ARGV0")])
+      else: equals_positional(&a, lit)
+      return
+    if is_leading_number_var(s):
+      err(&a, cmd, 2282, "Variable names can't start with numbers, so this is interpreted as a command.")
+      return
+  if leading.len > 0:
+    var ok = true
+    var str = ""
+    for p in leading:
+      let k = a.t.k[p]
+      if k == T_DoubleQuoted or k == T_SingleQuoted or cfg.will_become_multiple(a.t, p): ok = false
+      if not lit_def(a.t, p, "x", &str):
+        pass_()
+    var e = s.find("=")
+    if e < 0: e = s.len
+    var allvc = true
+    for k in 0..e:
+      if not is_var_char_c(s[k]): allvc = false
+    if ok and is_variable_name(str) and allvc:
+      equals_indirection(&a, cmd)
+      return
+  equals_generic(&a, cmd)
+
+# SC2286-SC2289
+fn check_command_with_trailing_symbol(var a: An, n: Int):
+  if a.t.n2[n] == 0: return
+  let cmd = ast.at2(a.t, n, 0)
+  let s = lit_or(a.t, cmd, "x")
+  if s == "." or s == ":" or s == " " or s == "//": return
+  if s.len == 0:
+    err(&a, cmd, 2286, "This empty string is interpreted as a command name. Double check syntax (or use 'true' as a no-op).")
+    return
+  let cs = s.codes()
+  let last = cs[cs.len - 1]
+  if last == 47:
+    err(&a, cmd, 2287, "This is interpreted as a command name ending with '/'. Double check syntax.")
+    return
+  if last < 128 and "\\.,([{{<>}})]#\"'% ".find(str([byte(last)])) >= 0:
+    var f = "'" + str([byte(last)]) + "'"
+    if last == 32: f = "space"
+    elif last == 39: f = "apostrophe"
+    elif last == 34: f = "doublequote"
+    warn(&a, cmd, 2288, "This is interpreted as a command name ending with " + f + ". Double check syntax.")
+    return
+  if s.find("\t") >= 0: err(&a, cmd, 2289, "This is interpreted as a command name containing a tab. Double check syntax.")
+  elif s.find("\n") >= 0: err(&a, cmd, 2289, "This is interpreted as a command name containing a linefeed. Double check syntax.")
+
+# SC2204, SC2205
+fn check_subshell_as_test(var a: An, n: Int):
+  if a.t.n1[n] != 1: return
+  var w = ast.at1(a.t, n, 0)
+  while true:
+    let k = a.t.k[w]
+    if k == T_Banged or k == T_AndIf or k == T_OrIf: w = a.t.a[w]
+    else: break
+  if a.t.k[w] != T_Pipeline or a.t.n2[w] != 1: return
+  let r = ast.at2(a.t, w, 0)
+  if a.t.k[r] != T_Redirecting: return
+  let sc = a.t.a[r]
+  if a.t.k[sc] != T_SimpleCommand or a.t.n1[sc] != 0 or a.t.n2[sc] < 2: return
+  if f = get_literal(a.t, ast.at2(a.t, sc, 0)):
+    if f in ["!", "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-L", "-k", "-p", "-r", "-s", "-S", "-t", "-u", "-w", "-x", "-O", "-G", "-N", "-z", "-n", "-o", "-v", "-R"]: err(&a, n, 2204, "(..) is a subshell. Did you mean [ .. ], a test expression?")
+  if s = get_literal(a.t, ast.at2(a.t, sc, 1)):
+    if s in ["-nt", "-ot", "-ef", "==", "!=", "<=", ">=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "=~", ">", "<", "=", "\\<", "\\>", "\\<=", "\\>="]: warn(&a, n, 2205, "(..) is a subshell. Did you mean [ .. ], a test expression?")
+
+# SC2302, SC2303
+fn array_name_of(a: An, w: Int) -> Str?:
+  let ps = word_parts(a.t, w)
+  if ps.len != 1 or a.t.k[ps[0]] != T_DollarBraced: return nil
+  let s = oversimp(a.t, a.t.a[ps[0]])
+  if braced_modifier(s) != "[@]" or s.startswith("!"): return nil
+  return braced_reference(s)
+
+fn array_used_as_index(a: An, name: Str, t: Int, var aref: Int) -> Str?:
+  let k = a.t.k[t]
+  if k == T_DollarBraced:
+    if braced_reference(oversimp(a.t, a.t.a[t])) != name: return nil
+    let list = a.parent[t]
+    if list < 0 or a.t.k[list] != T_NormalWord: return nil
+    let db = a.parent[list]
+    if db < 0 or a.t.k[db] != T_DollarBraced: return nil
+    let ps = word_parts(a.t, a.t.a[db])
+    if ps.len < 3 or a.t.k[ps[0]] != T_Literal or a.t.k[ps[2]] != T_Literal or ps[1] != t: return nil
+    let s = oversimp(a.t, list)
+    if not braced_modifier(s).startswith("[${{VAR}}]"): return nil
+    aref = t
+    return braced_reference(s)
+  if k == T_NormalWord:
+    let p = a.parent[t]
+    if p < 0 or a.t.k[p] != T_DollarBraced: return nil
+    let s = oversimp(a.t, t)
+    if not braced_modifier(s).startswith("[" + name + "]"): return nil
+    aref = p
+    return braced_reference(s)
+  if k == TA_Variable and a.t.n1[t] == 0 and a.t.s[t] == name:
+    let sq = a.parent[t]
+    if sq < 0 or a.t.k[sq] != TA_Sequence or a.t.n1[sq] != 1 or ast.at1(a.t, sq, 0) != t: return nil
+    let p = a.parent[sq]
+    if p < 0 or a.t.k[p] != TA_Variable or a.t.n1[p] != 1 or ast.at1(a.t, p, 0) != sq: return nil
+    aref = p
+    return a.t.s[p] + ""
+  return nil
+
+fn check_array_value_used_as_index(var a: An):
+  # name -> (loop, [(word, array name)])
+  var loops: {Str: Int} = {}
+  var words: {Str: [Int]} = {}
+  var arrs: {Str: [Str]} = {}
+  var flows: [Flow] = []
+  for f0 in a.flow: flows.push(Flow(f0.kind, f0.base, f0.tok, f0.name + "", f0.arr, f0.src, f0.from, f0.nfrom))
+  for f in flows:
+    if f.kind == F_ASSIGN:
+      if a.t.k[f.base] == T_ForIn and f.src == SRC_FROM and not f.arr:
+        var ws: [Int] = []
+        var ns: [Str] = []
+        for q in f.from..f.from + f.nfrom:
+          let w = a.srcs[q]
+          if an = array_name_of(a, w):
+            ws.push(w)
+            ns.push(an)
+        loops[f.name + ""] = f.base
+        words[f.name + ""] = ws
+        arrs[f.name + ""] = ns
+      elif f.name in loops:
+        loops.remove(f.name)
+    elif f.kind == F_REF:
+      if not (f.name in loops): continue
+      var aref = -1
+      let an = array_used_as_index(a, f.name, f.tok, &aref) else continue
+      var lw = -1
+      let ns = arrs[f.name]
+      for q in 0..ns.len:
+        if ns[q] == an:
+          lw = words[f.name][q]
+          break
+      if lw < 0: continue
+      let loop = loops[f.name]
+      var inside = false
+      var x = f.tok
+      while x >= 0:
+        if x == loop: inside = true
+        x = a.parent[x]
+      if not inside: continue
+      warn(&a, lw, 2302, "This loops over values. To loop over keys, use \"${{!array[@]}}\".")
+      warn(&a, aref, 2303, parse.e4m(f.name) + " is an array value, not a key. Use directly or loop over keys instead.")
+
+# ---------------------------------------------------------------- optional checks
+
+# SC2243, SC2244 (avoid-nullary-conditions)
+fn check_nullary_expansion_test(var a: An, n: Int):
+  let w = a.t.a[n]
+  let ps = word_parts(a.t, w)
+  let f = [rep_start(a, w, 0, "-n ")]
+  if ps.len == 1 and (a.t.k[ps[0]] == T_DollarExpansion or a.t.k[ps[0]] == T_DollarBraceCommandExpansion or a.t.k[ps[0]] == T_Backticked):
+    style_fix(&a, w, 2243, "Prefer explicit -n to check for output (or run command without [/[[ to check for success).", f)
+    return
+  for p in ps:
+    if is_constant(a.t, p): return
+  style_fix(&a, w, 2244, "Prefer explicit -n to check non-empty string (or use =/-ne to check boolean/integer).", f)
+
+fn inverted_op(op: Str) -> Str:
+  if op == "=" or op == "==": return "!="
+  if op == "!=": return "="
+  if op == "-eq": return "-ne"
+  if op == "-ne": return "-eq"
+  if op == "-le": return "-gt"
+  if op == "-gt": return "-le"
+  if op == "-ge": return "-lt"
+  if op == "-lt": return "-ge"
+  return ""
+
+fn suggest_rewrite(var a: An, inside: Bool, style_: Int, id: Int, op: Str):
+  let nop = inverted_op(op)
+  if nop.len == 0: return
+  let old = "a " + op + " b"
+  let new = "a " + nop + " b"
+  if inside: style(&a, id, 2335, "Use " + new + " instead of ! " + old + ".")
+  elif style_ == SINGLE: style(&a, id, 2335, "Use [ " + new + " ] instead of ! [ " + old + " ].")
+  else: style(&a, id, 2335, "Use [[ " + new + " ]] instead of ! [[ " + old + " ]].")
+
+# SC2236, SC2237, SC2335 (avoid-negated-conditions)
+fn check_unnecessarily_inverted_test(var a: An, n: Int):
+  let k = a.t.k[n]
+  if k == TC_Unary and a.t.s[n] == "!":
+    let x = a.t.a[n]
+    if x < 0: return
+    if a.t.k[x] == TC_Unary:
+      if a.t.s[x] == "-n": style(&a, n, 2236, "Use -z instead of ! -n.")
+      elif a.t.s[x] == "-z": style(&a, n, 2236, "Use -n instead of ! -z.")
+    elif a.t.k[x] == TC_Binary:
+      let op = a.t.s[x] + ""
+      suggest_rewrite(&a, true, a.t.f[x], n, op)
+  elif k == T_Banged:
+    let p = a.t.a[n]
+    if a.t.k[p] != T_Pipeline or a.t.n2[p] != 1: return
+    let r = ast.at2(a.t, p, 0)
+    if a.t.k[r] != T_Redirecting or a.t.k[a.t.a[r]] != T_Condition: return
+    let x = a.t.a[a.t.a[r]]
+    if a.t.k[x] == TC_Unary:
+      if a.t.s[x] == "-n": style(&a, n, 2237, "Use [ -z .. ] instead of ! [ -n .. ].")
+      elif a.t.s[x] == "-z": style(&a, n, 2237, "Use [ -n .. ] instead of ! [ -z .. ].")
+    elif a.t.k[x] == TC_Binary:
+      let op = a.t.s[x] + ""
+      suggest_rewrite(&a, false, a.t.f[x], n, op)
+
+# SC2249 (add-default-case)
+fn check_default_case(var a: An, n: Int):
+  let meta = ast.list2(a.t, n)
+  var pos = 0
+  var i = 0
+  while i + 2 < meta.len:
+    for j in 0..meta[i + 1]:
+      var g: [Int] = []
+      if word_pg(a.t, ast.at1(a.t, n, pos + j), true, &g):
+        if pg_superset(g, 0, [PG_MANY], 0): return
+    pos += meta[i + 1] + meta[i + 2]
+    i += 3
+  info(&a, n, 2249, "Consider adding a default *) case, even if it just exits with error.")
+
+# SC2250 (require-variable-braces)
+fn check_variable_braces(var a: An, n: Int):
+  if a.t.f[n] == 1: return
+  let name = braced_reference(oversimp(a.t, a.t.a[n]))
+  if name in data.unbraced_variables() or quotes_may_conflict_2281(a, n): return
+  let f = [rep_start(a, n, 1, "${{"), rep_end(a, n, 0, "}}")]
+  style_fix(&a, n, 2250, "Prefer putting braces around variable references even when not strictly required.", f)
+
+fn is_simple_cond(a: An, x: Int) -> Bool:
+  let k = a.t.k[x]
+  if k == T_Condition: return is_simple_cond(a, a.t.a[x])
+  if k == TC_Binary: return a.t.s[x].find("<") < 0 and a.t.s[x].find(">") < 0
+  return k == TC_Unary or k == TC_Nullary
+
+# SC2292 (require-double-brackets)
+fn check_require_double_bracket(var a: An, n: Int):
+  if not (a.shell == SH_BASH or a.shell == SH_KSH or a.shell == SH_BUSYBOX): return
+  if a.t.f[n] != SINGLE: return
+  var f: [ast.Rep] = []
+  if is_simple_cond(a, n): f = [rep_start(a, n, 0, "["), rep_end(a, n, 0, "]")]
+  style_fix(&a, n, 2292, "Prefer [[ ]] over [ ] for tests in Bash/Ksh/Busybox.", f)
+
+fn subtree_has_set_e(a: An, n: Int) -> Bool:
+  for x in preorder(a.t, n):
+    if a.t.k[x] == T_SimpleCommand and is_unqualified_command(a.t, x, "set"):
+      var ws: [Str] = []
+      astlib.oversimplify(a.t, x, &ws)
+      if "errexit" in ws or "e" in flag_strs(a.t, x): return true
+  return false
+
+# SC2310, SC2311 (check-set-e-suppressed)
+fn check_set_e_suppressed(var a: An):
+  if not a.set_e: return
+  let nodes = preorder(a.t, a.root)
+  var funcs: [Str] = []
+  for x in nodes:
+    if a.t.k[x] == T_Function: funcs.push(a.t.s[x] + "")
+  var inherit = true
+  if a.shell == SH_BASH: inherit = is_option_set(a, "inherit_errexit")
+  elif a.shell == SH_KSH: inherit = false
+  for x in nodes:
+    if a.t.k[x] != T_SimpleCommand or a.t.n2[x] == 0: continue
+    let cmd = ast.at2(a.t, x, 0)
+    let lit = cfg.unquoted_literal(a.t, cmd) else continue
+    if not (lit in funcs): continue
+    var child = cmd
+    var parent = a.parent[child]
+    while parent >= 0:
+      let k = a.t.k[parent]
+      var ct = ""
+      if k == T_Banged and a.t.a[parent] == child: ct = "a ! condition"
+      elif k == T_AndIf and a.t.a[parent] == child: ct = "an && condition"
+      elif k == T_OrIf and a.t.a[parent] == child: ct = "an || condition"
+      elif k == T_IfExpression:
+        let lens = ast.list2(a.t, parent)
+        var pos = 0
+        var q = 0
+        while q + 1 < lens.len:
+          for i in 0..lens[q]:
+            if ast.at1(a.t, parent, pos + i) == child: ct = "an 'if' condition"
+          pos += lens[q] + lens[q + 1]
+          q += 2
+      elif k == T_UntilExpression and child in ast.list1(a.t, parent): ct = "an 'until' condition"
+      elif k == T_WhileExpression and child in ast.list1(a.t, parent): ct = "a 'while' condition"
+      if ct.len > 0: info(&a, cmd, 2310, "This function is invoked in " + ct + " so set -e will be disabled. Invoke separately if failures should cause the script to exit.")
+      elif (k == T_DollarExpansion or k == T_Backticked) and not (inherit or subtree_has_set_e(a, parent)):
+        info(&a, cmd, 2311, "Bash implicitly disabled set -e for this function invocation because it's inside a command substitution. Add set -e; before it or enable inherit_errexit.")
+      child = parent
+      parent = a.parent[child]
+
+# ---- SC2312 (check-extra-masked-returns): "time" words are skipped (removeTransparentCommands)
+
+fn is_time_cmd(a: An, n: Int) -> Bool:
+  return a.t.k[n] == T_SimpleCommand and opt_is(command_basename(a.t, n), "time")
+
+# the words of a simple command after removeTransparentCommands
+fn eff_words(a: An, n: Int) -> [Int]:
+  var w = ast.list2(a.t, n)
+  if is_time_cmd(a, n):
+    var o: [Int] = []
+    for i in 1..w.len: o.push(w[i])
+    return o
+  return w
+
+fn eff_basename(a: An, n: Int) -> Str?:
+  let k = a.t.k[n]
+  if k == T_SimpleCommand and is_time_cmd(a, n):
+    let w = eff_words(a, n)
+    if w.len == 0: return nil
+    let s = get_literal(a.t, w[0]) else return nil
+    return parse.basename(s)
+  if k == T_Redirecting or k == T_Annotation:
+    let c = astlib.get_command(a.t, n)
+    if c >= 0 and is_time_cmd(a, c): return eff_basename(a, c)
+  return command_basename(a.t, n)
+
+fn contains_simple_command(a: An, n: Int) -> Bool:
+  for x in preorder(a.t, n):
+    if a.t.k[x] == T_SimpleCommand: return true
+  return false
+
+fn all_but_last_simple(a: An, xs: [Int]) -> [Int]:
+  var o: [Int] = []
+  for x in xs:
+    if contains_simple_command(a, x): o.push(x)
+  if o.len > 0: o.pop()
+  return o
+
+fn masked_node(a: An, t: Int) -> Bool:
+  if b = eff_basename(a, t):
+    if b in ["echo", "basename", "dirname", "printf", "set", "shopt"]: return false
+  var x = a.parent[t]
+  while x >= 0:
+    let c = astlib.get_command(a.t, x)
+    if c >= 0:
+      if b = eff_basename(a, c):
+        let skip = b == "local" and "r" in flag_strs(a.t, c)
+        if not skip and b in ["local", "declare", "export", "readonly", "typeset", "let"]: return false
+    x = a.parent[x]
+  x = t
+  while x >= 0 and a.parent[x] >= 0:
+    if a.t.k[x] == T_OrIf:
+      let p = a.t.b[x]
+      if a.t.k[p] == T_Pipeline and a.t.n2[p] == 1:
+        let r = ast.at2(a.t, p, 0)
+        if a.t.k[r] == T_Redirecting:
+          let b = eff_basename(a, a.t.a[r])
+          if opt_is(b, "true") or opt_is(b, ":"): return false
+    x = a.parent[x]
+  return true
+
+fn find_masked(var a: An, roots: [Int]):
+  for r in roots:
+    for t in preorder(a.t, r):
+      let k = a.t.k[t]
+      if (k == T_SimpleCommand and eff_words(a, t).len > 0) or k == T_Condition:
+        if masked_node(a, t): info(&a, t, 2312, "Consider invoking this command separately to avoid masking its return value (or use '|| true' to ignore).")
+
+fn check_extra_masked_returns(var a: An):
+  var pipefail = true
+  if a.shell == SH_BASH or a.shell == SH_BUSYBOX or a.shell == SH_KSH: pipefail = is_option_set(a, "pipefail")
+  for t in preorder(a.t, a.root):
+    let k = a.t.k[t]
+    if k == T_Arithmetic: find_masked(&a, [a.t.a[t]])
+    elif k == T_Array or k == T_DoubleQuoted or k == T_NormalWord: find_masked(&a, all_but_last_simple(a, ast.list1(a.t, t)))
+    elif k == T_Condition: find_masked(&a, [a.t.a[t]])
+    elif k == T_HereDoc or k == T_ProcSub: find_masked(&a, ast.list1(a.t, t))
+    elif k == T_HereString: find_masked(&a, [a.t.a[t]])
+    elif k == T_Pipeline and not pipefail: find_masked(&a, all_but_last_simple(a, ast.list2(a.t, t)))
+    elif k == T_SimpleCommand:
+      let ws = eff_words(a, t)
+      if ws.len > 0:
+        var l = ast.list1(a.t, t)
+        for i in 1..ws.len: l.push(ws[i])
+        find_masked(&a, l)
+      else: find_masked(&a, all_but_last_simple(a, ast.list1(a.t, t)))
+
+# SC2095
+fn stdin_redirect(t: ast.Ast, r: Int) -> Bool:
+  if t.k[r] != T_FdRedirect: return false
+  let fd = t.s[r]
+  if fd == "0": return true
+  if fd.len > 0: return false
+  let op = t.a[r]
+  let k = t.k[op]
+  if k == T_IoFile: return t.k[t.a[op]] == T_Less
+  if k == T_IoDuplicate: return t.k[t.a[op]] == T_LESSAND
+  return k == T_HereString or k == T_HereDoc
+
+fn check_muncher(var a: An, wid: Int, x: Int):
+  if a.t.k[x] == T_Backgrounded:
+    check_muncher(&a, wid, a.t.a[x])
+    return
+  if a.t.k[x] != T_Pipeline or a.t.n2[x] == 0: return
+  let r = ast.at2(a.t, x, 0)
+  if a.t.k[r] != T_Redirecting: return
+  let cmd = a.t.a[r]
+  if a.t.k[cmd] == T_SimpleCommand:
+    var ws: [Int] = []
+    for v in ast.list1(a.t, cmd): ws.push(v)
+    for v in ast.list2(a.t, cmd): ws.push(v)
+    for w in ws:
+      var parts: [Int] = []
+      if a.t.k[w] == T_Assignment:
+        if a.t.a[w] >= 0: parts = word_parts(a.t, a.t.a[w])
+      else: parts = word_parts(a.t, w)
+      for p in parts:
+        for seq in command_sequences(a.t, p):
+          for c in seq: check_muncher(&a, wid, c)
+  for i in 0..a.t.n1[r]:
+    if stdin_redirect(a.t, ast.at1(a.t, r, i)): return
+  for seq in command_sequences(a.t, cmd):
+    for c in seq: check_muncher(&a, wid, c)
+  let name = command_basename(a.t, cmd) else return
+  var flag = ""
+  var redirect = false
+  if name == "ssh":
+    flag = "-n"
+    if astlib.has_flag(a.t, cmd, "n"): return
+  elif name == "ffmpeg":
+    flag = "-nostdin"
+    if "-nostdin" in lits(a.t, args_from(a.t, astlib.get_command(a.t, cmd), 1)): return
+  elif name == "mplayer":
+    flag = "-noconsolecontrols"
+    if "-noconsolecontrols" in lits(a.t, args_from(a.t, astlib.get_command(a.t, cmd), 1)): return
+  elif name == "HandBrakeCLI":
+    flag = "< /dev/null"
+    redirect = true
+  else: return
+  info(&a, wid, 2095, name + " may swallow stdin, preventing this loop from working properly.")
+  var f: [ast.Rep] = []
+  if redirect: f = [rep_end(a, cmd, 0, " " + flag)]
+  else: f = [rep_end(a, command_token(a.t, cmd), 0, " " + flag)]
+  warn_fix(&a, cmd, 2095, "Use " + name + " " + flag + " to prevent " + name + " from swallowing stdin.", f)
+
+fn check_while_read_pitfalls(var a: An, n: Int):
+  if a.t.n1[n] != 1: return
+  let c = ast.at1(a.t, n, 0)
+  if a.t.k[c] != T_Pipeline or a.t.n2[c] != 1: return
+  let r = ast.at2(a.t, c, 0)
+  if a.t.k[r] != T_Redirecting: return
+  let plain = oversimple_list(a.t, a.t.a[r])
+  if plain.len == 0 or plain[0] != "read" or "-u" in plain: return
+  for i in 0..a.t.n1[r]:
+    if stdin_redirect(a.t, ast.at1(a.t, r, i)): return
+  for x in ast.list2(a.t, n): check_muncher(&a, n, x)
