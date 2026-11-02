@@ -41,6 +41,7 @@ type Note:
   sev: Int
   code: Int
   msg: Str
+  fix: [ast.Rep]
 
 const CX_NAME = 1
 const CX_ANN = 2
@@ -87,6 +88,13 @@ type P:
   sv: Str           # a string result of the last string parser
   t: ast.Ast
   assoc: [Str]      # associative arrays, for reparsing indices
+  cs: Bool          # --check-sourced: keep notes from sourced files
+  files: [Str]      # file names by position file index (0: the script)
+  texts: [Str]      # their contents
+  rd: fn(Int, [Str], Str) -> ast.SrcRes   # resolve and read a sourced file (external, paths, name)
+  rc: [Ann]         # the .shellcheckrc annotations
+  rc_err: Str       # SC1134 for an rc file that didn't parse
+  shell_flag: Bool  # --shell given: the shebang is not checked
 
 fn ctype(single: Bool) -> Int:
   if single: return SINGLE
@@ -100,7 +108,11 @@ fn pk(line: Int, col: Int) -> Int:
   return (line << 32) | col
 
 fn pline(pos: Int) -> Int:
-  return pos >> 32
+  return (pos >> 32) & 0xFFFFF
+
+# the file a position is in: 0 the checked script, k > 0 the k-th sourced file (Spec.files)
+fn pfile(pos: Int) -> Int:
+  return pos >> 52
 
 fn pcol(pos: Int) -> Int:
   return pos & 0xffffffff
@@ -131,10 +143,10 @@ fn adv(var p: P) -> Int:
   let d = dec(p.src, p.i)
   let c = d & 0xFFFFFF
   p.i += d >> 24
-  if c == 10: p.pos = pk(pline(p.pos) + 1, 1)
+  if c == 10: p.pos = (((p.pos >> 32) + 1) << 32) | 1
   elif c == 9:
     let col = pcol(p.pos)
-    p.pos = pk(pline(p.pos), col + 8 - ((col - 1) % 8))
+    p.pos = p.pos - col + col + 8 - ((col - 1) % 8)
   else: p.pos += 1
   p.epos = p.pos
   p.ene = false
@@ -227,12 +239,12 @@ fn ignored(p: P, code: Int) -> Bool:
     if c.kind == CX_ANN:
       for a in p.t.anns[c.ann]:
         if a.kind == ANN_DISABLE and code >= a.lo and code < a.hi: return true
-    elif c.kind == CX_SOURCE: return true
+    elif c.kind == CX_SOURCE and not p.cs: return true
   return false
 
 fn problem_at(var p: P, sp: Int, ep: Int, sev: Int, code: Int, msg: Str):
   if ignored(p, code): return
-  p.probs.push(Note(sp, ep, sev, code, msg))
+  p.probs.push(Note(sp, ep, sev, code, msg, []))
 
 fn problem(var p: P, sev: Int, code: Int, msg: Str):
   problem_at(&p, p.pos, p.pos, sev, code, msg)
@@ -242,7 +254,7 @@ fn problem_id(var p: P, id: Int, sev: Int, code: Int, msg: Str):
 
 fn note_at(var p: P, sp: Int, ep: Int, sev: Int, code: Int, msg: Str):
   if ignored(p, code): return
-  p.notes.push(Note(sp, ep, sev, code, msg))
+  p.notes.push(Note(sp, ep, sev, code, msg, []))
 
 fn note(var p: P, sev: Int, code: Int, msg: Str):
   note_at(&p, p.pos, p.pos, sev, code, msg)
@@ -621,12 +633,12 @@ fn sub_end(var p: P, var s: Sub):
   p.pos = s.pos
 
 fn ncopy(n: Note) -> Note:
-  return Note(n.sp, n.ep, n.sev, n.code, n.msg + "")
+  return Note(n.sp, n.ep, n.sev, n.code, n.msg + "", ast.reps_copy(n.fix))
 
 fn err_note(e: Err) -> Note:
   var m = ""
   if e.msg.len > 0: m = e.msg + "."
-  return Note(e.pos, e.pos, ERR, 1072, m + " Fix any mentioned problems and try again.")
+  return Note(e.pos, e.pos, ERR, 1072, m + " Fix any mentioned problems and try again.", [])
 
 fn context_notes(ctx: [Ctx]) -> [Note]:
   var r: [Note] = []
@@ -634,8 +646,8 @@ fn context_notes(ctx: [Ctx]) -> [Note]:
   while k >= 0 and r.len < 2:
     let c = ctx[k]
     if c.kind == CX_NAME:
-      if r.len == 0: r.push(Note(c.pos, c.pos, ERR, 1073, "Couldn't parse this " + c.s + ". Fix to allow more checks."))
-      else: r.push(Note(c.pos, c.pos, INFO, 1009, "The mentioned syntax error was in this " + c.s + "."))
+      if r.len == 0: r.push(Note(c.pos, c.pos, ERR, 1073, "Couldn't parse this " + c.s + ". Fix to allow more checks.", []))
+      else: r.push(Note(c.pos, c.pos, INFO, 1009, "The mentioned syntax error was in this " + c.s + ".", []))
     k -= 1
   return r
 
@@ -1891,7 +1903,7 @@ fn check_trailing_spaces(var p: P, pos: Int):
     while k < j:
       let d = dec(p.src, k)
       let c = d & 0xFFFFFF
-      if c == 9: q = pk(pline(q), pcol(q) + 8 - ((pcol(q) - 1) % 8))
+      if c == 9: q = q + 8 - ((pcol(q) - 1) % 8)
       else: q += 1
       k += d >> 24
     problem_at(&p, q, q, ERR, 1017, "Literal carriage return. Run script through tr -d '\\r' .")
@@ -3833,17 +3845,84 @@ fn read_source(var p: P, red: Int) -> Int:
   if not have:
     note_id(&p, file_id, WARN, 1090, "ShellCheck can't follow non-constant source. Use a directive to specify location.")
     return red
-  if name == "/dev/null":
-    let inc = ast.add(&p.t, ast.T_Include, p.t.sp[sc], p.t.ep[sc])
-    let scr = ast.add(&p.t, T_Script, p.t.sp[sc], p.t.ep[sc])
-    p.t.a[scr] = ast.add(&p.t, T_Literal, p.t.sp[sc], p.t.sp[sc])
-    p.t.a[inc] = scr
-    let r = ast.add(&p.t, ast.T_SourceCommand, p.t.sp[sc], p.t.ep[sc])
-    p.t.a[r] = red
-    p.t.b[r] = inc
-    return r
-  note_id(&p, file_id, INFO, 1091, "Not following: " + name + " was not specified as input (see shellcheck -x).")
+  if not should_follow(&p, name):
+    note_id(&p, file_id, INFO, 1093, "This file appears to be recursively sourced. Ignoring.")
+    return red
+  var res = ast.SrcRes(true, name + "", "")
+  if name != "/dev/null":
+    # getCurrentAnnotations True: every annotation on the stack, innermost first
+    var paths: [Str] = []
+    var ext = -1
+    var k = p.ctx.len - 1
+    while k >= 0:
+      let c = p.ctx[k]
+      if c.kind == CX_ANN:
+        for a in p.t.anns[c.ann]:
+          if a.kind == ANN_SOURCEPATH: paths.push(a.s + "")
+          if a.kind == ANN_EXTERNAL and ext < 0: ext = a.lo
+      k -= 1
+    res = p.rd(ext, paths, name)
+  if not res.ok:
+    note_id(&p, file_id, INFO, 1091, "Not following: " + res.text)
+    return red
+  let r = sub_read(&p, red, res.path, res.text)
+  if r >= 0: return r
+  note_id(&p, file_id, WARN, 1094, "Parsing of sourced file failed. Ignoring it.")
   return red
+
+fn should_follow(var p: P, name: Str) -> Bool:
+  var n = 0
+  for c in p.ctx:
+    if c.kind == CX_SOURCE:
+      if c.s == name: return false
+      n += 1
+  if n >= 100:
+    problem(&p, ERR, 1092, "Stopping at 100 'source' frames :O")
+    return false
+  return true
+
+# subRead: parse a sourced file in its own context; its problems are forgotten, its notes kept
+# (they're dropped unless --check-sourced, by the source context)
+fn sub_read(var p: P, red: Int, name: Str, own text: Str) -> Int:
+  if p.files.len >= 2047: return -1
+  let fi = p.files.len
+  p.files.push(name + "")
+  p.texts.push(text + "")
+  let nprobs = p.probs.len
+  let nnotes = p.notes.len
+  let e = esave(p)
+  var oldctx = copy_ctx(p.ctx)
+  var pend: [Int] = []
+  swap(&pend, &p.pend)
+  var pends: [Pend] = []
+  swap(&pends, &p.pends)
+  let oplo = p.plo
+  p.plo = 0
+  var assoc: [Str] = []
+  swap(&assoc, &p.assoc)
+  p.ctx.push(Ctx(CX_SOURCE, 0, name + "", -1))
+  var s = sub_begin(&p, (fi << 52) | pk(1, 1), text)
+  let root = read_script_file(&p, true)
+  sub_end(&p, &s)
+  swap(&p.ctx, &oldctx)
+  swap(&pend, &p.pend)
+  swap(&pends, &p.pends)
+  p.plo = oplo
+  swap(&assoc, &p.assoc)
+  p.probs.truncate(nprobs)
+  p.epos = e.pos
+  p.ene = e.ne
+  p.emsg = e.msg + ""
+  if root < 0:
+    p.notes.truncate(nnotes)
+    return -1
+  let sc = p.t.a[red]
+  let inc = ast.add(&p.t, ast.T_Include, p.t.sp[sc], p.t.ep[sc])
+  p.t.a[inc] = root
+  let r = ast.add(&p.t, ast.T_SourceCommand, p.t.sp[sc], p.t.ep[sc])
+  p.t.a[r] = red
+  p.t.b[r] = inc
+  return r
 
 # ---------------------------------------------------------------- pipelines and lists
 
@@ -5022,8 +5101,27 @@ type Parsed:
   t: ast.Ast
   root: Int          # -1 when the script didn't parse
   notes: [Note]
+  files: [Str]       # file names by position file index
+  texts: [Str]
 
-fn read_script(var p: P) -> Int:
+fn read_script_file(var p: P, sourced: Bool) -> Int:
+  var rc: [Ann] = []
+  if not sourced:
+    let rce = p.rc_err + ""
+    if rce.len > 0: problem(&p, ERR, 1134, rce)
+    for a in p.rc: rc.push(Ann(a.kind, a.lo, a.hi, a.s + ""))
+  let has_rc = rc.len > 0
+  var rci = -1
+  if has_rc:
+    var c2: [Ann] = []
+    for a in rc: c2.push(Ann(a.kind, a.lo, a.hi, a.s + ""))
+    rci = add_anns(&p, c2)
+    p.ctx.push(Ctx(CX_ANN, 0, "", rci))
+  let r = read_script_body(&p, rc)
+  if has_rc and r >= 0: pop_ctx(&p)
+  return r
+
+fn read_script_body(var p: P, rc: [Ann]) -> Int:
   let sp = p.pos
   let pos = p.pos
   var has_bom = false
@@ -5042,11 +5140,17 @@ fn read_script(var p: P) -> Int:
   let asp = p.pos
   var anns: [Ann] = []
   if read_annotations(&p, &anns) < 0: return -1
-  var shell_ann = false
+  var shell_ann = p.shell_flag
   for a in anns:
     if a.kind == ANN_SHELL: shell_ann = true
+  for a in rc:
+    if a.kind == ANN_SHELL: shell_ann = true
   let has = anns.len > 0
+  var all: [Ann] = []
+  for a in anns: all.push(Ann(a.kind, a.lo, a.hi, a.s + ""))
+  for a in rc: all.push(Ann(a.kind, a.lo, a.hi, a.s + ""))
   let ai = add_anns(&p, anns)
+  let aall = add_anns(&p, all)
   if has: p.ctx.push(Ctx(CX_ANN, 0, "", ai))
   if has_bom: problem_at(&p, pos, pos, ERR, 1082, "This file has a UTF-8 BOM. Remove it with: LC_CTYPE=C sed '1s/^...//' < yourscript .")
   let aid_ep = p.pos
@@ -5065,7 +5169,7 @@ fn read_script(var p: P) -> Int:
     p.t.a[scr] = sb
     ast.set1(&p.t, scr, cmds)
     let root = ast.add(&p.t, T_Annotation, asp, aid_ep)
-    p.t.f[root] = ai
+    p.t.f[root] = aall
     p.t.a[root] = scr
     if has: pop_ctx(&p)
     p.assoc = associative_arrays(p.t, root)
@@ -5152,9 +5256,22 @@ fn reparse(var p: P, n: Int) -> Int:
 fn note_eq(a: Note, b: Note) -> Bool:
   return a.sp == b.sp and a.ep == b.ep and a.sev == b.sev and a.code == b.code and a.msg == b.msg
 
-fn parse_script(own src: Str) -> Parsed:
-  var p = P(src, 0, pk(1, 1), pk(1, 1), false, "", [], [], [], [], 0, [], "", ast.new_ast(), [])
-  let root = read_script(&p)
+# The options of a parse (ParseSpec, and the rc file the parser reads).
+type PSpec:
+  fname: Str
+  cs: Bool
+  shell_flag: Bool
+  rc: [Ann]
+  rc_err: Str
+
+fn no_source(ext: Int, paths: [Str], name: Str) -> ast.SrcRes:
+  return ast.SrcRes(false, name + "", name + " was not specified as input (see shellcheck -x).")
+
+fn parse_script(own src: Str, own ps: PSpec, own rd: fn(Int, [Str], Str) -> ast.SrcRes) -> Parsed:
+  let text = src + ""
+  var p = P(src, 0, pk(1, 1), pk(1, 1), false, "", [], [], [], [], 0, [], "", ast.new_ast(), [], ps.cs, [ps.fname + ""], [text], rd, [], ps.rc_err + "", ps.shell_flag)
+  swap(&p.rc, &ps.rc)
+  let root = read_script_file(&p, false)
   var out: [Note] = []
   if root >= 0:
     for n in p.notes: out.push(ncopy(n))
@@ -5168,7 +5285,11 @@ fn parse_script(own src: Str) -> Parsed:
     for n in p.probs: out.push(ncopy(n))
   var t = ast.new_ast()
   swap(&t, &p.t)
-  return Parsed(t, root, out)
+  var files: [Str] = []
+  swap(&files, &p.files)
+  var texts: [Str] = []
+  swap(&texts, &p.texts)
+  return Parsed(t, root, out, files, texts)
 
 fn ignored_final(p: P, code: Int) -> Bool:
   for c in p.ctx:
@@ -5176,3 +5297,43 @@ fn ignored_final(p: P, code: Int) -> Bool:
       for a in p.t.anns[c.ann]:
         if a.kind == ANN_DISABLE and code >= a.lo and code < a.hi: return true
   return false
+
+# ---------------------------------------------------------------- .shellcheckrc
+
+type RcRes:
+  anns: [Ann]
+  err: Str          # the SC1134 message when it didn't parse, else ""
+
+# anySpacingOrComment = many (allspacingOrFail <|> readAnyComment)
+fn any_spacing_or_comment(var p: P) -> Int:
+  while true:
+    let m = mark(p)
+    if allspacing_or_fail(&p) >= 0: continue
+    if p.i != m.i: return -1
+    reset(&p, m)
+    if read_any_comment(&p) >= 0: continue
+    if p.i != m.i: return -1
+    reset(&p, m)
+    return 0
+  return 0
+
+fn read_config_kvs(var p: P, var anns: [Ann]) -> Int:
+  if any_spacing_or_comment(&p) < 0: return -1
+  while true:
+    let m = mark(p)
+    let n = anns.len
+    if read_annotation_without_prefix(&p, false, &anns) < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      anns.truncate(n)
+      break
+    if any_spacing_or_comment(&p) < 0: return -1
+  return eof(&p)
+
+fn parse_rc(own src: Str, fname: Str) -> RcRes:
+  var p = P(src, 0, pk(1, 1), pk(1, 1), false, "", [], [], [], [], 0, [], "", ast.new_ast(), [], false, [fname + ""], [""], no_source, [], "", false)
+  var anns: [Ann] = []
+  if read_config_kvs(&p, &anns) >= 0: return RcRes(anns, "")
+  var m = ""
+  if p.emsg.len > 0: m = p.emsg + "."
+  return RcRes([], "Failed to process " + e4m(fname) + ", line {pline(p.epos)}: " + m + " Fix any mentioned problems and try again.")

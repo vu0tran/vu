@@ -1,91 +1,601 @@
-# vsc: a shell script linter that prints what ShellCheck prints (`shellcheck -f gcc`), for the
-# checks it implements.
+# vsc: a drop-in replacement for shellcheck 0.11.0 (shellcheck.hs): the same options, formats,
+# .shellcheckrc lookup, exit codes and messages.
 #
-#   vsc [--jobs N] FILE...
+#   vsc [OPTIONS...] FILES...      (vsc --help)
+#
+# One extension: `--jobs N` (or --jobs=N) checks files on N threads (0: one per CPU); the output
+# is the same.
 
 import ast
 import astlib
 import parse
 import check
+import fmt
+from fmt import PC, FRep
 
-type Res:
-  idx: Int
-  out: Str
+extern "sys_glue.c":
+  fn sc_isatty(ffi: Ffi, fd: Int) -> Int
+  fn sc_getcwd(ffi: Ffi) -> Str
+  fn sc_realpath(ffi: Ffi, p: Str) -> Str
+  fn sc_is_file(ffi: Ffi, p: Str) -> Int
 
-fn severity_name(sev: Int) -> Str:
-  if sev == 0: return "error"
-  if sev == 1: return "warning"
-  return "note"
+# ---------------------------------------------------------------- options (System.Console.GetOpt)
 
-# removeTabStops: a Parsec column (tabs to multiples of 8) to a character column on that line
-fn real_col(lines: [Str], line: Int, col: Int) -> Int:
-  if line < 1 or line > lines.len: return col
-  let s = lines[line - 1]
-  var r = 0
-  var v = 0
-  var j = 0
-  while true:
-    if col <= v: return r
-    if j >= s.len: return r + (col - v)
-    let d = astlib.dec(s, j)
-    let c = d & 0xFFFFFF
-    j += d >> 24
-    r += 1
-    if c == 9: v = v + 8 - (v % 8)
-    else: v += 1
+const NOARG = 0
+const REQARG = 1
+const OPTARG = 2
+
+type OptD:
+  short: Str
+  long: Str
+  kind: Int
+  argname: Str
+  flag: Str
+  desc: Str
+
+fn opt_descrs() -> [OptD]:
+  return [
+    OptD("a", "check-sourced", NOARG, "", "sourced", "Include warnings from sourced files"),
+    OptD("C", "color", OPTARG, "WHEN", "color", "Use color (auto, always, never)"),
+    OptD("i", "include", REQARG, "CODE1,CODE2..", "include", "Consider only given types of warnings"),
+    OptD("e", "exclude", REQARG, "CODE1,CODE2..", "exclude", "Exclude types of warnings"),
+    OptD("", "extended-analysis", REQARG, "bool", "extended-analysis", "Perform dataflow analysis (default true)"),
+    OptD("f", "format", REQARG, "FORMAT", "format", "Output format (checkstyle, diff, gcc, json, json1, quiet, tty)"),
+    OptD("", "list-optional", NOARG, "", "list-optional", "List checks disabled by default"),
+    OptD("", "norc", NOARG, "", "norc", "Don't look for .shellcheckrc files"),
+    OptD("", "rcfile", REQARG, "RCFILE", "rcfile", "Prefer the specified configuration file over searching for one"),
+    OptD("o", "enable", REQARG, "check1,check2..", "enable", "List of optional checks to enable (or 'all')"),
+    OptD("P", "source-path", REQARG, "SOURCEPATHS", "source-path", "Specify path when looking for sourced files (\"SCRIPTDIR\" for script's dir)"),
+    OptD("s", "shell", REQARG, "SHELLNAME", "shell", "Specify dialect (sh, bash, dash, ksh, busybox)"),
+    OptD("S", "severity", REQARG, "SEVERITY", "severity", "Minimum severity of errors to consider (error, warning, info, style)"),
+    OptD("V", "version", NOARG, "", "version", "Print version information"),
+    OptD("W", "wiki-link-count", REQARG, "NUM", "wiki-link-count", "The number of wiki links to show, when applicable"),
+    OptD("x", "external-sources", NOARG, "", "externals", "Allow 'source' outside of FILES"),
+    OptD("", "help", NOARG, "", "help", "Show this usage summary and exit")]
+
+fn pad_right(s: Str, n: Int) -> Str:
+  if s.len >= n: return s + ""
+  return s + fmt.rep(" ", n - s.len)
+
+# usageInfo
+fn usage_info(header: Str, ds: [OptD]) -> Str:
+  var ss: [Str] = []
+  var ls: [Str] = []
+  var w1 = 0
+  var w2 = 0
+  for d in ds:
+    var s = ""
+    var l = ""
+    if d.short.len > 0:
+      if d.kind == NOARG: s = "-" + d.short
+      elif d.kind == REQARG: s = "-" + d.short + " " + d.argname
+      else: s = "-" + d.short + "[" + d.argname + "]"
+    if d.kind == NOARG: l = "--" + d.long
+    elif d.kind == REQARG: l = "--" + d.long + "=" + d.argname
+    else: l = "--" + d.long + "[=" + d.argname + "]"
+    w1 = max(w1, s.len)
+    w2 = max(w2, l.len)
+    ss.push(s)
+    ls.push(l)
+  var o = header + "\n"
+  for k in 0..ds.len:
+    o += "  " + pad_right(ss[k], w1) + "  " + pad_right(ls[k], w2) + "  " + ds[k].desc + "\n"
+  return o
+
+fn usage() -> Str:
+  return usage_info("Usage: shellcheck [OPTIONS...] FILES...", opt_descrs())
+
+type Flag:
+  name: Str
+  val: Str
+
+type GetOpt:
+  flags: [Flag]
+  files: [Str]
+  errs: [Str]
+  unrec: [Str]
+
+# getOpt Permute
+fn getopt(argv: [Str]) -> GetOpt:
+  let ds = opt_descrs()
+  var g = GetOpt([], [], [], [])
+  var rest: [Str] = []
+  for a in argv: rest.push(a + "")
+  var i = 0
+  while i < rest.len:
+    let a = rest[i] + ""
+    i += 1
+    if a == "--":
+      while i < rest.len:
+        g.files.push(rest[i] + "")
+        i += 1
+      break
+    if a.startswith("--"):
+      let body = a[2..a.len]
+      var name = body + ""
+      var arg = ""
+      var has_eq = false
+      let e = body.find("=")
+      if e >= 0:
+        name = body[0..e]
+        arg = body[e + 1..body.len]
+        has_eq = true
+      var cands: [Int] = []
+      for k in 0..ds.len:
+        if ds[k].long == name: cands.push(k)
+      if cands.len == 0:
+        for k in 0..ds.len:
+          if ds[k].long.startswith(name): cands.push(k)
+      let os = "--" + name
+      if cands.len > 1:
+        var sub: [OptD] = []
+        for k in cands: sub.push(OptD(ds[k].short + "", ds[k].long + "", ds[k].kind, ds[k].argname + "", ds[k].flag + "", ds[k].desc + ""))
+        g.errs.push(usage_info("option `" + os + "' is ambiguous; could be one of:", sub))
+        continue
+      if cands.len == 0:
+        g.unrec.push("--" + body)
+        continue
+      let d = ds[cands[0]]
+      if d.kind == NOARG:
+        if has_eq: g.errs.push("option `" + os + "' doesn't allow an argument\n")
+        else: g.flags.push(Flag(d.flag + "", "true"))
+      elif d.kind == REQARG:
+        if has_eq: g.flags.push(Flag(d.flag + "", arg))
+        elif i < rest.len:
+          g.flags.push(Flag(d.flag + "", rest[i] + ""))
+          i += 1
+        else: g.errs.push("option `" + os + "' requires an argument " + d.argname + "\n")
+      else:
+        if has_eq: g.flags.push(Flag(d.flag + "", arg))
+        else: g.flags.push(Flag(d.flag + "", "always"))
+      continue
+    if a.startswith("-") and a.len > 1:
+      let d0 = astlib.dec(a, 1)
+      let ch = a[1..1 + (d0 >> 24)]
+      let tail = a[1 + (d0 >> 24)..a.len]
+      var k = -1
+      for q in 0..ds.len:
+        if ds[q].short == ch: k = q
+      let os = "-" + ch
+      if k < 0:
+        g.unrec.push(os)
+        if tail.len > 0:
+          i -= 1
+          rest[i] = "-" + tail
+        continue
+      let d = ds[k]
+      if d.kind == NOARG:
+        if d.flag == "help" or d.flag == "list-optional" or d.flag == "norc": g.flags.push(Flag(d.flag + "", "true"))
+        else: g.flags.push(Flag(d.flag + "", "true"))
+        if tail.len > 0:
+          i -= 1
+          rest[i] = "-" + tail
+      elif d.kind == REQARG:
+        if tail.len > 0: g.flags.push(Flag(d.flag + "", tail))
+        elif i < rest.len:
+          g.flags.push(Flag(d.flag + "", rest[i] + ""))
+          i += 1
+        else: g.errs.push("option `" + os + "' requires an argument " + d.argname + "\n")
+      else:
+        if tail.len > 0: g.flags.push(Flag(d.flag + "", tail))
+        else: g.flags.push(Flag(d.flag + "", "always"))
+      continue
+    g.files.push(a)
+  return g
+
+# ---------------------------------------------------------------- option values
+
+type Opts:
+  shell: Str
+  includes: [Int]
+  has_inc: Bool
+  excludes: [Int]
+  min_sev: Int
+  color: Int         # 0 auto, 1 always, 2 never
+  wiki: Int
+  externals: Bool
+  source_paths: [Str]
+  cs: Bool
+  norc: Bool
+  rcfile: Str
+  has_rcfile: Bool
+  optional: [Str]
+  extended: Int
+  format: Str
+  jobs: Int
+
+# exit statuses, ordered as ShellCheck's Status
+const ST_OK = 0
+const ST_PROBLEMS = 1
+const ST_SUPPORT = 2
+const ST_SYNTAX = 3
+const ST_RUNTIME = 4
+
+fn status_code(s: Int) -> Int:
+  if s == ST_OK: return 0
+  if s == ST_PROBLEMS: return 1
+  if s == ST_SUPPORT: return 4
+  if s == ST_SYNTAX: return 3
+  return 2
+
+fn split_on(s: Str, c: Str) -> [Str]:
+  return s.split(c)
+
+fn all_digits(s: Str) -> Bool:
+  for k in 0..s.len:
+    if s[k] < '0' or s[k] > '9': return false
+  return true
+
+# parseNum: strips any number of leading "SC"; exits 3 on a non-number
+fn parse_num(s: Str) -> Int:
+  var x = s + ""
+  while x.startswith("SC"): x = x[2..x.len]
+  if not all_digits(x):
+    eprint("Invalid number: " + x)
+    exit(3)
+  if x.len == 0:
+    eprint("shellcheck: Prelude.read: no parse")
+    exit(1)
+  var n = 0
+  for k in 0..x.len:
+    if n < 100000000000000: n = n * 10 + int(x[k]) - 48
+  return n
+
+fn enum_error(name: Str, valid: Str):
+  eprint("Unknown value for --" + name + ". Valid options are: " + valid)
+  exit(4)
+
+# splitSearchPath: blank items become "."
+fn split_search_path(s: Str) -> [Str]:
+  var o: [Str] = []
+  for x in s.split(":"):
+    if x.len == 0: o.push(".")
+    else: o.push(x + "")
+  return o
+
+fn print_version():
+  print("ShellCheck - shell script analysis tool")
+  print("version: 0.11.0")
+  print("license: GNU General Public License, version 3")
+  print("website: https://www.shellcheck.net")
+
+fn apply_flag(var o: Opts, f: Flag):
+  let v = f.val
+  if f.name == "shell":
+    if check.shell_for(v) < 0:
+      eprint("Unknown shell: " + v)
+      exit(4)
+    o.shell = v + ""
+  elif f.name == "exclude":
+    var new: [Int] = []
+    for x in v.split(","):
+      if x.len > 0: new.push(parse_num(x))
+    for x in o.excludes: new.push(x)
+    o.excludes = new
+  elif f.name == "include":
+    var new: [Int] = []
+    for x in v.split(","):
+      if x.len > 0: new.push(parse_num(x))
+    if new.len > 0:
+      for x in o.includes: new.push(x)
+      o.includes = new
+      o.has_inc = true
+  elif f.name == "version":
+    print_version()
+    exit(0)
+  elif f.name == "list-optional":
+    write(list_optional_text())
+    exit(0)
+  elif f.name == "help":
+    print(usage())
+    exit(0)
+  elif f.name == "externals": o.externals = true
+  elif f.name == "color":
+    if v == "auto": o.color = 0
+    elif v == "always": o.color = 1
+    elif v == "never": o.color = 2
+    else: enum_error("color", "auto, always, never")
+  elif f.name == "source-path":
+    for x in split_search_path(v): o.source_paths.push(x)
+  elif f.name == "sourced": o.cs = true
+  elif f.name == "severity":
+    if v == "error": o.min_sev = 0
+    elif v == "warning": o.min_sev = 1
+    elif v == "info": o.min_sev = 2
+    elif v == "style": o.min_sev = 3
+    else: enum_error("severity", "error, warning, info, style")
+  elif f.name == "wiki-link-count": o.wiki = parse_num(v)
+  elif f.name == "norc": o.norc = true
+  elif f.name == "rcfile":
+    o.rcfile = v + ""
+    o.has_rcfile = true
+  elif f.name == "enable":
+    for x in v.split(","): o.optional.push(x + "")
+  elif f.name == "extended-analysis":
+    if v == "true": o.extended = 1
+    elif v == "false": o.extended = 0
+    else:
+      eprint("Invalid boolean, expected true/false: " + v)
+      exit(3)
+
+# ---------------------------------------------------------------- paths
+
+# canonicalizePath: absolute, links resolved for the part that exists, "." and repeated "/" removed
+fn simplify(p: Str) -> Str:
+  var parts: [Str] = []
+  for x in p.split("/"):
+    if x.len == 0 or x == ".": continue
+    parts.push(x + "")
+  return "/" + "/".join(parts)
+
+fn canonicalize(ffi: Ffi, cwd: Str, path: Str) -> Str:
+  var abs = path + ""
+  if not path.startswith("/"): abs = cwd + "/" + path
+  let r = sc_realpath(ffi, abs)
+  if r.len > 0: return r
+  let parts = simplify(abs).split("/")
+  var k = parts.len - 1
+  while k >= 1:
+    var hp: [Str] = []
+    for q in 0..k: hp.push(parts[q] + "")
+    let head = "/".join(hp)
+    var rp = ""
+    if head.len == 0: rp = "/"
+    else: rp = sc_realpath(ffi, head)
+    if rp.len > 0:
+      var o = rp + ""
+      for q in k..parts.len: o += "/" + parts[q]
+      return simplify(o)
+    k -= 1
+  return simplify(abs)
+
+fn rfind(s: Str, sub: Str) -> Int:
+  var r = -1
+  var at = s.find(sub)
+  while at >= 0:
+    r = at
+    at = s.find(sub, at + 1)
   return r
 
-type Out:
-  line: Int
-  col: Int
-  sev: Int
-  code: Int
-  msg: Str
-  eline: Int
-  ecol: Int
+fn take_directory(p: Str) -> Str:
+  if p == "/": return "/"
+  var q = p + ""
+  while q.len > 1 and q.endswith("/"): q = q[0..q.len - 1]
+  let i = rfind(q, "/")
+  if i >= 0:
+    if i == 0: return "/"
+    return q[0..i]
+  return "."
 
-fn out_less(a: Out, b: Out) -> Bool:
+fn path_join(a: Str, b: Str) -> Str:
+  if b.startswith("/"): return b + ""
+  if a.len == 0: return b + ""
+  if a.endswith("/"): return a + b
+  return a + "/" + b
+
+# dropFileName: the directory part with its trailing slash, "" for a bare name
+fn drop_file_name(p: Str) -> Str:
+  let i = rfind(p, "/")
+  if i >= 0: return p[0..i + 1]
+  return ""
+
+# ---------------------------------------------------------------- .shellcheckrc
+
+type Rc:
+  anns: [ast.Ann]
+  err: Str
+
+fn read_config(fs: Fs, ffi: Ffi, file: Str, var found: Bool) -> Rc:
+  found = false
+  if sc_is_file(ffi, file) == 0: return Rc([], "")
+  found = true
+  var text = ""
+  match fs.read(file):
+    ok(s): text = s
+    err(e): eprint(file + ": " + io_error(file, e))
+  var r = parse.parse_rc(text, file)
+  var anns: [ast.Ann] = []
+  swap(&anns, &r.anns)
+  return Rc(anns, r.err + "")
+
+fn home_paths(os: Os) -> [Str]:
+  let home = os.env("HOME")
+  if home.len == 0: return []
+  var xdg = os.env("XDG_CONFIG_HOME")
+  if not xdg.startswith("/"): xdg = home + "/.config"
+  return [home + "/.shellcheckrc", xdg + "/shellcheckrc"]
+
+fn find_config(fs: Fs, ffi: Ffi, os: Os, dir: Str) -> Rc:
+  var d = dir + ""
+  while true:
+    for name in [".shellcheckrc", "shellcheckrc"]:
+      var found = false
+      let r = read_config(fs, ffi, path_join(d, name), &found)
+      if found: return r
+    let next = take_directory(d)
+    if next == d: break
+    d = next
+  for p in home_paths(os):
+    var found = false
+    let r = read_config(fs, ffi, p, &found)
+    if found: return r
+  return Rc([], "")
+
+# ---------------------------------------------------------------- reading files
+
+# the message of an IOException from openBinaryFile, from Vu's "can't read 'x': strerror"
+fn io_error(file: Str, e: Str) -> Str:
+  var se = e + ""
+  let i = rfind(e, ": ")
+  if i >= 0: se = e[i + 2..e.len]
+  var kind = "failed"
+  if se == "No such file or directory" or se == "Not a directory": kind = "does not exist"
+  elif se == "Permission denied" or se == "Operation not permitted": kind = "permission denied"
+  elif se == "Is a directory": return file + ": openBinaryFile: inappropriate type (is a directory)"
+  elif se == "Too many levels of symbolic links" or se == "File name too long": kind = "invalid argument"
+  elif se == "Resource busy" or se == "Device or resource busy": kind = "resource busy"
+  return file + ": openBinaryFile: " + kind + " (" + se + ")"
+
+# ---------------------------------------------------------------- checking one file
+
+type Ctx:
+  inputs: [Str]      # canonical paths of the files given
+  externals: Bool
+  source_paths: [Str]
+  cwd: Str
+  shell: Str
+  cs: Bool
+  extended: Int
+  optional: [Str]
+  includes: [Int]
+  has_inc: Bool
+  excludes: [Int]
+  min_sev: Int
+
+fn ctx_copy(c: Ctx) -> Ctx:
+  var inputs: [Str] = []
+  for x in c.inputs: inputs.push(x + "")
+  var sp: [Str] = []
+  for x in c.source_paths: sp.push(x + "")
+  var op: [Str] = []
+  for x in c.optional: op.push(x + "")
+  var inc: [Int] = []
+  for x in c.includes: inc.push(x)
+  var exc: [Int] = []
+  for x in c.excludes: exc.push(x)
+  return Ctx(inputs, c.externals, sp, c.cwd + "", c.shell + "", c.cs, c.extended, op, inc, c.has_inc, exc, c.min_sev)
+
+type FileRes:
+  ok: Bool
+  err: Str
+  pcs: [PC]
+  names: [Str]
+  texts: [Str]
+
+fn allowable(ffi: Ffi, c: Ctx, ext: Int, x: Str) -> Bool:
+  if ext == 1: return true
+  if ext < 0 and c.externals: return true
+  return canonicalize(ffi, c.cwd, x) in c.inputs
+
+fn adjust_path(script: Str, p: Str) -> Str:
+  if p == "SCRIPTDIR" or p.startswith("SCRIPTDIR/"):
+    var rest = ""
+    if p.len > 10: rest = p[10..p.len]
+    while rest.startswith("/"): rest = rest[1..rest.len]
+    let d = drop_file_name(script)
+    if rest.len == 0: return d
+    return path_join(d, rest)
+  return p + ""
+
+# siFindSource + siReadFile
+fn resolve_source(fs: Fs, ffi: Ffi, c: Ctx, script: Str, ext: Int, paths: [Str], original: Str) -> ast.SrcRes:
+  var filename = original + ""
+  while filename.startswith("/"): filename = filename[1..filename.len]
+  if not original.startswith("/"): filename = original + ""
+  var cands: [Str] = [adjust_path(script, filename)]
+  for p in c.source_paths: cands.push(path_join(adjust_path(script, p), filename))
+  for p in paths: cands.push(path_join(adjust_path(script, p), filename))
+  var resolved = original + ""
+  for x in cands:
+    if allowable(ffi, c, ext, x) and sc_is_file(ffi, x) == 1:
+      resolved = x
+      break
+  if not allowable(ffi, c, ext, resolved):
+    if ext == 0: return ast.SrcRes(false, resolved, resolved + " was not specified as input, and external files were disabled via directive.")
+    return ast.SrcRes(false, resolved, resolved + " was not specified as input (see shellcheck -x).")
+  match fs.read(resolved):
+    ok(s): return ast.SrcRes(true, resolved, s)
+    err(e): return ast.SrcRes(false, resolved, io_error(resolved, e))
+
+fn pc_less(a: PC, b: PC) -> Bool:
+  if a.file != b.file: return a.file < b.file
   if a.line != b.line: return a.line < b.line
   if a.col != b.col: return a.col < b.col
   if a.sev != b.sev: return a.sev < b.sev
   if a.code != b.code: return a.code < b.code
   return a.msg < b.msg
 
-fn lint(path: Str, own src: Str) -> Str:
-  var lines = src.split("\n")
-  if lines.len > 0 and lines[lines.len - 1].len == 0: lines.pop()
-  var pr = parse.parse_script(src)
-  var notes: [parse.Note] = []
-  for n in pr.notes: notes.push(parse.Note(n.sp, n.ep, n.sev, n.code, n.msg + ""))
-  if pr.root >= 0:
-    for n in check.analyze(&pr.t, pr.root, path): notes.push(parse.ncopy(n))
-  var outs: [Out] = []
-  for n in notes:
-    let l = parse.pline(n.sp)
-    let el = parse.pline(n.ep)
-    outs.push(Out(l, real_col(lines, l, parse.pcol(n.sp)), n.sev, n.code, n.msg.replace("\n", ""), el, real_col(lines, el, parse.pcol(n.ep))))
-  outs.sort(by: fn(a, b) => out_less(a, b))
-  var res = ""
-  var k = 0
-  while k < outs.len:
-    let o = outs[k]
-    # nub: drop exact duplicates (same start, end, severity, code and message)
-    var dup = false
-    var q = k - 1
-    while q >= 0 and outs[q].line == o.line and outs[q].col == o.col:
-      let x = outs[q]
-      if x.sev == o.sev and x.code == o.code and x.msg == o.msg and x.eline == o.eline and x.ecol == o.ecol: dup = true
-      q -= 1
-    if not dup:
-      res += "{path}:{o.line}:{o.col}: {severity_name(o.sev)}: {o.msg} [SC{o.code}]\n"
-    k += 1
-  return res
+fn reps_eq(x: [FRep], y: [FRep]) -> Bool:
+  if x.len != y.len: return false
+  for k in 0..x.len:
+    let a = x[k]
+    let b = y[k]
+    if a.file != b.file or a.line != b.line or a.col != b.col or a.eline != b.eline or a.ecol != b.ecol or a.s != b.s or a.prec != b.prec or a.after != b.after: return false
+  return true
 
-fn worker(fs: Fs, own files: [Str], own jobs: Chan[Int], own res: Chan[Res]):
+fn pc_eq(a: PC, b: PC) -> Bool:
+  return a.file == b.file and a.line == b.line and a.col == b.col and a.eline == b.eline and a.ecol == b.ecol and a.sev == b.sev and a.code == b.code and a.msg == b.msg and reps_eq(a.fix, b.fix)
+
+fn to_pc(n: parse.Note, files: [Str]) -> PC:
+  var fix: [FRep] = []
+  for r in n.fix:
+    fix.push(FRep(files[parse.pfile(r.sp)] + "", parse.pline(r.sp), parse.pcol(r.sp), parse.pline(r.ep), parse.pcol(r.ep), r.s + "", r.prec, r.after))
+  return PC(files[parse.pfile(n.sp)] + "", parse.pline(n.sp), parse.pcol(n.sp), parse.pline(n.ep), parse.pcol(n.ep), n.sev, n.code, n.msg + "", fix)
+
+fn lint(fs: Fs, ffi: Ffi, path: Str, own src: Str, c: Ctx, rc: Rc) -> FileRes:
+  var rcanns: [ast.Ann] = []
+  for a in rc.anns: rcanns.push(ast.Ann(a.kind, a.lo, a.hi, a.s + ""))
+  let ps = parse.PSpec(path + "", c.cs, c.shell.len > 0, rcanns, rc.err + "")
+  let cc = ctx_copy(c)
+  let script = path + ""
+  var pr = parse.parse_script(src, ps, own fn(ext: Int, paths: [Str], name: Str) -> ast.SrcRes => resolve_source(fs, ffi, cc, script, ext, paths, name))
+  var notes: [parse.Note] = []
+  for n in pr.notes: notes.push(parse.ncopy(n))
+  if pr.root >= 0:
+    var opt: [Str] = []
+    for o in c.optional: opt.push(o + "")
+    let asp = check.ASpec(c.shell + "", c.cs, c.extended, opt)
+    for n in check.analyze(&pr.t, pr.root, path, asp): notes.push(parse.ncopy(n))
+  var pcs: [PC] = []
+  for n in notes:
+    if n.sev > c.min_sev: continue
+    if c.has_inc:
+      if not (n.code in c.includes): continue
+    elif n.code in c.excludes: continue
+    pcs.push(to_pc(n, pr.files))
+  pcs.sort(by: fn(a, b) => pc_less(a, b))
+  var out: [PC] = []
+  for k in 0..pcs.len:
+    let o = pcs[k]
+    var dup = false
+    var q = out.len - 1
+    while q >= 0 and out[q].file == o.file and out[q].line == o.line and out[q].col == o.col:
+      if pc_eq(out[q], o):
+        dup = true
+        break
+      q -= 1
+    if not dup: out.push(fmt.pc_copy(o))
+  var names: [Str] = []
+  swap(&names, &pr.files)
+  var texts: [Str] = []
+  swap(&texts, &pr.texts)
+  return FileRes(true, "", out, names, texts)
+
+type Job:
+  idx: Int
+  path: Str
+  src: Str
+  have: Bool        # src already read (stdin)
+
+type Res:
+  idx: Int
+  r: FileRes
+
+fn run_one(fs: Fs, ffi: Ffi, j: Job, c: Ctx, rc: Rc) -> FileRes:
+  if j.have: return lint(fs, ffi, j.path, j.src + "", c, rc)
+  match fs.read(j.path):
+    ok(s): return lint(fs, ffi, j.path, s, c, rc)
+    err(e): return FileRes(false, io_error(j.path, e), [], [], [])
+
+fn rc_copy(r: Rc) -> Rc:
+  var a: [ast.Ann] = []
+  for x in r.anns: a.push(ast.Ann(x.kind, x.lo, x.hi, x.s + ""))
+  return Rc(a, r.err + "")
+
+fn worker(fs: Fs, ffi: Ffi, own jobs: [Job], own rcs: [Rc], own c: Ctx, own next: Chan[Int], own res: Chan[Res]):
   while true:
-    let i = jobs.recv() else return
-    let src = fs.read(files[i]) else ""
-    res.send(Res(i, lint(files[i], src)))
+    let i = next.recv() else return
+    res.send(Res(i, run_one(fs, ffi, jobs[i], c, rcs[i])))
 
 fn cpu_count(fs: Fs) -> Int:
   let info = fs.read("/proc/cpuinfo") else ""
@@ -95,41 +605,311 @@ fn cpu_count(fs: Fs) -> Int:
   if n < 1: return 1
   return n
 
-fn main(fs: Fs, os: Os) throws:
-  var files: [Str] = []
+# ---------------------------------------------------------------- formatting results
+
+type Out:
+  fmt: Str
+  color: Bool
+  wiki: Int
+  w: [fmt.Wiki]
+  json: [Str]          # json/json1 entries, newest file first
+  found: Bool          # diff: some file had comments
+  reported: Bool       # diff: some file had fixes
+
+fn file_text(r: FileRes, name: Str) -> Str:
+  for k in 0..r.names.len:
+    if r.names[k] == name: return r.texts[k] + ""
+  return ""
+
+fn groups(r: FileRes) -> [Str]:
+  var g: [Str] = []
+  for c in r.pcs:
+    if g.len == 0 or g[g.len - 1] != c.file: g.push(c.file + "")
+  return g
+
+fn diff_err(color: Bool, msg: Str):
+  eprint(fmt.dcol(color, 1, fmt.dcol(color, 31, msg)))
+
+fn on_failure(var o: Out, file: Str, msg: Str):
+  if o.fmt == "tty": eprint(fmt.tcol(o.color, "error", file + ": " + msg))
+  elif o.fmt == "checkstyle": write(fmt.checkstyle_error(file, msg))
+  elif o.fmt == "quiet": exit(1)
+  elif o.fmt == "diff": diff_err(o.color, file + ": " + msg)
+  else: eprint(file + ": " + msg)
+
+fn on_result(var o: Out, r: FileRes, path: Str):
+  if o.fmt == "tty":
+    var res = fmt.tty_result(r.pcs, r.names, r.texts, o.color)
+    write(res)
+    fmt.wiki_merge(&o.w, r.pcs, o.wiki)
+  elif o.fmt == "gcc":
+    var res = ""
+    for g in groups(r):
+      let lines = fmt.hlines(file_text(r, g))
+      for c in r.pcs:
+        if c.file == g: res += fmt.gcc_line(fmt.non_virtual(c, lines))
+    write(res)
+  elif o.fmt == "checkstyle":
+    if r.pcs.len == 0:
+      write(fmt.checkstyle_file(path, []))
+      return
+    var res = ""
+    for g in groups(r):
+      let lines = fmt.hlines(file_text(r, g))
+      var cs: [PC] = []
+      for c in r.pcs:
+        if c.file == g: cs.push(fmt.non_virtual(c, lines))
+      res += fmt.checkstyle_file(g, cs)
+    write(res)
+  elif o.fmt == "json" or o.fmt == "json1":
+    for g in groups(r):
+      var es: [Str] = []
+      if o.fmt == "json1":
+        let lines = fmt.hlines(file_text(r, g))
+        for c in r.pcs: es.push(fmt.json_comment(fmt.non_virtual(c, lines)))
+      else:
+        for c in r.pcs: es.push(fmt.json_comment(c))
+      for e in o.json: es.push(e + "")
+      o.json = es
+  elif o.fmt == "quiet":
+    if r.pcs.len > 0: exit(1)
+  elif o.fmt == "diff":
+    if r.pcs.len > 0: o.found = true
+    var all: [FRep] = []
+    for c in r.pcs:
+      if c.fix.len > 0: fmt.fix_append(&all, c.fix)
+    # splitFixByFile, then fromListWith mappend: a later run of a file goes first
+    var names: [Str] = []
+    var fixes: [[FRep]] = []
+    var k = 0
+    while k < all.len:
+      var run: [FRep] = []
+      let f = all[k].file + ""
+      while k < all.len and all[k].file == f:
+        run.push(fmt.frep_copy(all[k]))
+        k += 1
+      var at = -1
+      for q in 0..names.len:
+        if names[q] == f: at = q
+      if at < 0:
+        names.push(f)
+        fixes.push(run)
+      else:
+        fmt.fix_append(&run, fixes[at])
+        fixes[at] = run
+    var order: [Int] = []
+    for q in 0..names.len: order.push(q)
+    order.sort(by: fn(a, b) => names[a] < names[b])
+    for q in order:
+      write(fmt.diff_doc(o.color, names[q], file_text(r, names[q]), fixes[q]) + "\n")
+      o.reported = true
+
+fn header(o: Out):
+  if o.fmt == "checkstyle": write("<?xml version='1.0' encoding='UTF-8'?>\n<checkstyle version='4.3'>\n")
+
+fn footer(o: Out):
+  if o.fmt == "tty": write(fmt.wiki_footer(o.w))
+  elif o.fmt == "checkstyle": write("</checkstyle>\n")
+  elif o.fmt == "json": write("[" + ",".join(o.json) + "]\n")
+  elif o.fmt == "json1": write("{{\"comments\":[" + ",".join(o.json) + "]}}\n")
+  elif o.fmt == "diff":
+    if o.found and not o.reported: diff_err(o.color, "Issues were detected, but none were auto-fixable. Use another format to see them.")
+
+# ---------------------------------------------------------------- main
+
+fn main(fs: Fs, os: Os, ffi: Ffi) throws:
+  var argv: [Str] = []
+  for x in os.env("SHELLCHECK_OPTS").split(" "):
+    if x.len > 0: argv.push(x + "")
+  let av = args()
   var jobs = 1
-  let argv = args()
   var i = 1
-  while i < argv.len:
-    let a = argv[i]
-    if a == "--jobs" and i + 1 < argv.len:
-      jobs = int(argv[i + 1]) else 1
+  while i < av.len:
+    let a = av[i]
+    if a == "--jobs" and i + 1 < av.len:
+      jobs = int(av[i + 1]) else 1
       i += 2
       continue
-    if a == "-f" and i + 1 < argv.len:
-      i += 2
+    if a.startswith("--jobs="):
+      jobs = int(a[7..a.len]) else 1
+      i += 1
       continue
-    files.push(a + "")
+    argv.push(a + "")
     i += 1
-  if jobs == 0: jobs = cpu_count(fs)
-  if jobs > files.len: jobs = files.len
-  if jobs < 1: jobs = 1
-  var results: [Str] = []
-  for k in 0..files.len: results.push("")
-  if jobs == 1:
-    for k in 0..files.len:
-      let src = fs.read(files[k]) else ""
-      results[k] = lint(files[k], src)
+  let g = getopt(argv)
+  var errs = ""
+  for e in g.errs: errs += e
+  for u in g.unrec: errs += "unrecognized option `" + u + "'\n"
+  if errs.len > 0:
+    eprint(errs + "\n" + usage())
+    exit(3)
+  var o = Opts("", [], false, [], 3, 0, 3, false, [], false, false, "", false, [], -1, "tty", jobs)
+  for f in g.flags: apply_flag(&o, f)
+  if g.files.len == 0:
+    eprint("No files specified.\n")
+    eprint(usage())
+    exit(3)
+  for f in g.flags:
+    if f.name == "format":
+      o.format = f.val + ""
+      break
+  let formats = ["checkstyle", "diff", "gcc", "json", "json1", "quiet", "tty"]
+  if not (o.format in formats):
+    eprint("Unknown format " + o.format)
+    eprint("Supported formats:")
+    for f in formats: eprint("  " + f)
+    exit(4)
+  var color = false
+  if o.color == 1: color = true
+  elif o.color == 0:
+    let term = os.env("TERM")
+    color = sc_isatty(ffi, 1) == 1 and term.len > 0 and term != "dumb"
+  let cwd = sc_getcwd(ffi)
+  var inputs: [Str] = []
+  for f in g.files: inputs.push(canonicalize(ffi, cwd, f))
+  var c = Ctx(inputs, o.externals, [], cwd, o.shell, o.cs, o.extended, [], [], o.has_inc, [], o.min_sev)
+  for x in o.source_paths: c.source_paths.push(x + "")
+  for x in o.optional: c.optional.push(x + "")
+  for x in o.includes: c.includes.push(x)
+  for x in o.excludes: c.excludes.push(x)
+  # the rc file of each input (getConfig, cached by directory)
+  var rcs: [Rc] = []
+  var last_dir = "\0"
+  var last = Rc([], "")
+  var rc_fixed = false
+  for k in 0..g.files.len:
+    if o.norc:
+      rcs.push(Rc([], ""))
+      continue
+    if o.has_rcfile:
+      if not rc_fixed:
+        var found = false
+        last = read_config(fs, ffi, o.rcfile, &found)
+        if not found: eprint("Warning: unable to read --rcfile " + o.rcfile)
+        rc_fixed = true
+      rcs.push(rc_copy(last))
+      continue
+    let dir = take_directory(c.inputs[k])
+    if dir != last_dir:
+      last = find_config(fs, ffi, os, dir)
+      last_dir = dir
+    rcs.push(rc_copy(last))
+  var job_list: [Job] = []
+  var stdin_text = ""
+  var stdin_read = false
+  for k in 0..g.files.len:
+    let f = g.files[k]
+    if f == "-":
+      if not stdin_read:
+        stdin_text = os.read_stdin() else ""
+        stdin_read = true
+      job_list.push(Job(k, f + "", stdin_text + "", true))
+    else: job_list.push(Job(k, f + "", "", false))
+  var out = Out(o.format + "", color, o.wiki, [], [], false, false)
+  header(out)
+  var status = ST_OK
+  var nj = o.jobs
+  if nj == 0: nj = cpu_count(fs)
+  if nj > job_list.len: nj = job_list.len
+  if nj <= 1:
+    for k in 0..job_list.len:
+      let r = run_one(fs, ffi, job_list[k], c, rcs[k])
+      if not r.ok:
+        on_failure(&out, job_list[k].path, r.err)
+        status = max(status, ST_RUNTIME)
+      else:
+        on_result(&out, r, job_list[k].path)
+        if r.pcs.len > 0: status = max(status, ST_PROBLEMS)
   else:
-    let jc: Chan[Int] = chan(files.len + 1)
-    let rc: Chan[Res] = chan(files.len + 1)
-    for k in 0..files.len: jc.send(k)
+    let jc: Chan[Int] = chan(job_list.len + 1)
+    let rc: Chan[Res] = chan(job_list.len + 1)
+    for k in 0..job_list.len: jc.send(k)
     jc.close()
-    for k in 0..jobs:
-      var fc: [Str] = []
-      for x in files: fc.push(x + "")
-      spawn worker(fs, fc, jc, rc)
-    for k in 0..files.len:
+    for w in 0..nj:
+      var jl: [Job] = []
+      for j in job_list: jl.push(Job(j.idx, j.path + "", j.src + "", j.have))
+      var rl: [Rc] = []
+      for r in rcs: rl.push(rc_copy(r))
+      spawn worker(fs, ffi, jl, rl, ctx_copy(c), jc, rc)
+    var results: [FileRes?] = []
+    for k in 0..job_list.len: results.push(nil)
+    var next = 0
+    for k in 0..job_list.len:
       var r = rc.recv()?
-      swap(&results[r.idx], &r.out)
-  for k in 0..files.len: write(results[k])
+      var fr0: FileRes? = nil
+      var x0 = FileRes(false, "", [], [], [])
+      swap(&x0, &r.r)
+      fr0 = x0
+      swap(&results[r.idx], &fr0)
+      while next < job_list.len and results[next] != nil:
+        var x: FileRes? = nil
+        swap(&x, &results[next])
+        if fr = x:
+          if not fr.ok:
+            on_failure(&out, job_list[next].path, fr.err)
+            status = max(status, ST_RUNTIME)
+          else:
+            on_result(&out, fr, job_list[next].path)
+            if fr.pcs.len > 0: status = max(status, ST_PROBLEMS)
+        next += 1
+  footer(out)
+  exit(status_code(status))
+
+fn list_optional_text() -> Str:
+  var o = ""
+  o += "name:    add-default-case\n"
+  o += "desc:    Suggest adding a default case in `case` statements\n"
+  o += "example: case $? in 0) echo 'Success';; esac\n"
+  o += "fix:     case $? in 0) echo 'Success';; *) echo 'Fail' ;; esac\n"
+  o += "\n"
+  o += "name:    avoid-negated-conditions\n"
+  o += "desc:    Suggest removing unnecessary comparison negations\n"
+  o += "example: [ ! \"$var\" -eq 1 ]\n"
+  o += "fix:     [ \"$var\" -ne 1 ]\n"
+  o += "\n"
+  o += "name:    avoid-nullary-conditions\n"
+  o += "desc:    Suggest explicitly using -n in `[ $var ]`\n"
+  o += "example: [ \"$var\" ]\n"
+  o += "fix:     [ -n \"$var\" ]\n"
+  o += "\n"
+  o += "name:    check-extra-masked-returns\n"
+  o += "desc:    Check for additional cases where exit codes are masked\n"
+  o += "example: rm -r \"$(get_chroot_dir)/home\"\n"
+  o += "fix:     set -e; dir=\"$(get_chroot_dir)\"; rm -r \"$dir/home\"\n"
+  o += "\n"
+  o += "name:    check-set-e-suppressed\n"
+  o += "desc:    Notify when set -e is suppressed during function invocation\n"
+  o += "example: set -e; func() {{ cp *.txt ~/backup; rm *.txt; }}; func && echo ok\n"
+  o += "fix:     set -e; func() {{ cp *.txt ~/backup; rm *.txt; }}; func; echo ok\n"
+  o += "\n"
+  o += "name:    check-unassigned-uppercase\n"
+  o += "desc:    Warn when uppercase variables are unassigned\n"
+  o += "example: echo $VAR\n"
+  o += "fix:     VAR=hello; echo $VAR\n"
+  o += "\n"
+  o += "name:    deprecate-which\n"
+  o += "desc:    Suggest 'command -v' instead of 'which'\n"
+  o += "example: which javac\n"
+  o += "fix:     command -v javac\n"
+  o += "\n"
+  o += "name:    quote-safe-variables\n"
+  o += "desc:    Suggest quoting variables without metacharacters\n"
+  o += "example: var=hello; echo $var\n"
+  o += "fix:     var=hello; echo \"$var\"\n"
+  o += "\n"
+  o += "name:    require-double-brackets\n"
+  o += "desc:    Require [[ and warn about [ in Bash/Ksh\n"
+  o += "example: [ -e /etc/issue ]\n"
+  o += "fix:     [[ -e /etc/issue ]]\n"
+  o += "\n"
+  o += "name:    require-variable-braces\n"
+  o += "desc:    Suggest putting braces around all variable references\n"
+  o += "example: var=hello; echo $var\n"
+  o += "fix:     var=hello; echo ${{var}}\n"
+  o += "\n"
+  o += "name:    useless-use-of-cat\n"
+  o += "desc:    Check for Useless Use Of Cat (UUOC)\n"
+  o += "example: cat foo | grep bar\n"
+  o += "fix:     grep bar foo\n"
+  o += "\n"
+  return o
