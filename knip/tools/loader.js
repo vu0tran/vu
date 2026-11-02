@@ -153,6 +153,37 @@ for (const r of reqs) {
       }
       v = { config: cfg, appDir, routes };
     }
+    if (r.mode === 'rsbuild') {
+      const params = [{ env: 'development', command: 'dev', envMode: 'development' }, { env: 'production', command: 'build', envMode: 'production' }];
+      const configs = typeof v === 'function' ? await Promise.all(params.map(pp => v(pp))) : [v];
+      const isProd = r.args[0] === true;
+      const evalTools = async (local, top) => {
+        const out = { ...local };
+        const rspack = local?.tools?.rspack;
+        if (!rspack) return out;
+        const target = local.output?.target ?? top.output?.target ?? 'web';
+        const mode = local.mode ?? top.mode;
+        const passes = mode ? [mode === 'production'] : isProd ? [true] : [false, true];
+        const results = [];
+        for (const rs of [rspack].flat()) {
+          for (const prod of typeof rs === 'function' ? passes : [isProd]) {
+            const base = { mode: mode ?? (prod ? 'production' : 'development'), entry: {}, resolve: { alias: {} }, module: { rules: [] }, plugins: [] };
+            const utils = { env: process.env.NODE_ENV ?? '', isDev: base.mode === 'development', isProd: base.mode === 'production', target, isServer: target === 'node', isWebWorker: target === 'web-worker' };
+            const resolved = typeof rs === 'function' ? await rs(base, utils) : rs;
+            results.push(...(await webpackPasses(resolved ?? base, isProd || prod)));
+          }
+        }
+        out.tools = { ...local.tools, rspack: results };
+        return out;
+      };
+      const all = [];
+      for (const c of configs) {
+        const envs = [];
+        for (const e of Object.values(c?.environments ?? {})) envs.push(await evalTools(e, c));
+        all.push({ ...(await evalTools(c, c)), environments: envs });
+      }
+      v = all;
+    }
     if (r.mode === 'karma') {
       if (typeof v !== 'function') v = null;
       else { const mem = { config: undefined, set(c) { this.config = c; } }; await v(mem); v = mem.config ?? {}; }

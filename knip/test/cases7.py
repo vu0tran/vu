@@ -176,3 +176,24 @@ case("p7_react_router", {
     "web/routes.ts": "export default [{ file: 'routes/home.tsx' }, { file: 'routes/parent.tsx', children: [{ file: 'routes/child.tsx' }] }];\n",
     "web/root.tsx": "export default 1;\n", "web/routes/home.tsx": "export default 1;\n", "web/routes/parent.tsx": "export default 1;\n", "web/routes/child.tsx": "export default 1;\n", "web/routes/unused.tsx": "export default 1;\n",
 }, PROD)
+
+case("p7_vite_plus_laravel", {
+    "package.json": pkg(dev=["vite", "vite-plus", "laravel-vite-plugin", "tsx", "eslint"]), **mods("vite", "vite-plus", "laravel-vite-plugin", "tsx", "eslint"),
+    "vite.config.ts": "import laravel from 'laravel-vite-plugin';\nexport default { plugins: [laravel({ input: ['resources/js/app.ts'], ssr: 'resources/js/ssr.ts' })], run: { tasks: { gen: { command: 'tsx scripts/gen.ts' } } }, staged: { '*.ts': 'eslint --fix' } };\n",
+    "resources/js/app.ts": "export {};\n", "resources/js/ssr.ts": "export {};\n", "resources/js/other.ts": "export {};\n", "scripts/gen.ts": "export {};\n",
+}, PROD)
+case("p7_cucumber_rsbuild", {
+    "package.json": pkg(dev=["@cucumber/cucumber", "@rsbuild/core", "cucumber-html-formatter", "less-loader", "unused-dev"]), **mods("@cucumber/cucumber", "@rsbuild/core", "cucumber-html-formatter", "less-loader", "unused-dev"),
+    "cucumber.json": json.dumps({"default": {"import": ["steps/**/*.ts"], "format": ["cucumber-html-formatter:out.html", "progress"]}}),
+    "steps/a.ts": "export {};\n", "features/x.js": "",
+    "rsbuild.config.ts": "export default { source: { entry: { index: './src/index.ts', admin: ['./src/admin.ts'] } }, resolve: { alias: { '@': './src' } }, tools: { rspack: (config) => { config.module.rules.push({ test: /\\.less$/, loader: 'less-loader' }); return config; } } };\n",
+    "src/index.ts": "import { u } from '@/u';\nconsole.log(u);\n", "src/admin.ts": "export {};\n", "src/u.ts": "export const u = 1;\nexport const w = 2;\n", "src/other.ts": "export {};\n",
+}, PROD)
+case("p7_cz_mdlint_convex_cspell_nextmdx", {
+    "package.json": pkg(deps=["next", "@next/mdx", "convex", "remark-gfm"], dev=["commitizen", "cz-conventional-changelog", "markdownlint-cli", "markdownlint-rule-x", "cspell", "@cspell/dict-de", "unused-dev"], scripts={"lint:md": "markdownlint --rules markdownlint-rule-x ."}, extra={"config": {"commitizen": {"path": "cz-conventional-changelog"}}}),
+    **mods("next", "@next/mdx", "convex", "remark-gfm", "commitizen", "cz-conventional-changelog", "markdownlint-cli", "markdownlint-rule-x", "cspell", "@cspell/dict-de", "unused-dev"),
+    ".markdownlint.json": json.dumps({"default": True}), "cspell.json": json.dumps({"import": ["@cspell/dict-de/cspell-ext.json"]}),
+    "convex.json": json.dumps({"functions": "backend/"}), "backend/f.ts": "export {};\n", "convex/old.ts": "export {};\n",
+    "next.config.mjs": "import createMDX from '@next/mdx';\nconst withMDX = createMDX({ options: { remarkPlugins: ['remark-gfm'] } });\nexport default withMDX({});\n",
+    "mdx-components.tsx": "export function useMDXComponents() {}\n", "app/page.tsx": "export default 1;\n",
+})
