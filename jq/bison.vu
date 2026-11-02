@@ -9,8 +9,11 @@
 
 import jv
 import lang
+import run
+import nat
 import bisontab
-from jv import St
+from jv import St, V, vnull, vint
+from run import It
 
 # symbol numbers (bison's yysymbol_kind_t)
 const S_EOF = 0
@@ -61,7 +64,10 @@ type Lx:
 type BRes:
   msgs: [Str]
   locs: [Int]
-  uncertain: Bool    # an action's message depends on a constant vjq can't fold here
+  has_main: Bool     # Module Imports Exp (not only definitions)
+  meta: V            # the module directive's constant (null without one)
+  imeta: [V]         # each import's metadata constant (null without one), in order
+
 
 fn ints(s: Str) -> [Int]:
   var r: [Int] = []
@@ -344,49 +350,49 @@ fn lex(var lx: Lx, var r: BRes, var st: St) -> Int:
     if sym >= 0: return sym
   return S_EOF
 
-# Constness, as jq's block_is_const sees the code an action built: ck is the constant's kind
-# (K_*), -1 for not a constant, -2 for a constant vjq doesn't fold (folded arithmetic). cl counts
-# the constants of a list `a, b, c` that gen_const_array turns into one constant (-1: unknown).
-const C_NO = -1
-const C_MAYBE = -2
-const K_NULL = 0
-const K_BOOL = 1
-const K_NUM = 2
-const K_STR = 3
-const K_ARR = 4
-const K_OBJ = 5
+# Constness, as jq's block_is_const sees the code an action built (its constant folding, and
+# gen_const_array/gen_const_object): C_NO not a constant, C_NOOP the empty block (`.`), C_ONE a
+# single constant (cv holds it), C_LIST a list `a, b, c` of single constants (cv: their array),
+# which `[...]` makes one constant.
+const C_NO = 0
+const C_NOOP = 1
+const C_ONE = 2
+const C_LIST = 3
 
-fn single(k: Int) -> Int:
-  if k >= 0: return 1
-  if k == C_MAYBE: return -1
-  return 0
+# The constant a literal written at src[s..e] stands for (a number, a string without
+# interpolation, true/false/null), read by vjq's parser.
+fn leaf(var it: It, src: Str, s: Int, e: Int) -> V:
+  var a = s
+  if a < e and src[a] == '@':
+    while a < e and src[a] != '"': a += 1
+  var p = lang.new_parser(src[a..e], "<top-level>")
+  let root = lang.parse_postfix(&p, &it.st, false)
+  if p.err != "" or root < 0: return vnull()
+  let nd = p.ast.ns[root]
+  if nd.k == lang.N_LIT: return nd.v
+  return vnull()
 
-fn fold(rule: Int, a: Int, b: Int) -> Int:
-  if a == C_NO or b == C_NO: return C_NO
-  if a == C_MAYBE or b == C_MAYBE: return C_MAYBE
-  if rule >= 41 and rule <= 46: return K_BOOL
-  if rule == 30:
-    if a == K_NULL: return b
-    if b == K_NULL: return a
-    if a == b and a != K_BOOL: return a
-    return C_MAYBE
-  if (rule == 33 or rule == 35) and a == K_NUM and b == K_NUM: return K_NUM
-  return C_MAYBE
+fn loc_obj(var it: It, fname: Str, src: Str, at: Int) -> V:
+  var line = 1
+  var i = 0
+  while i < at and i < src.len:
+    if src[i] == '\n': line += 1
+    i += 1
+  let start = it.st.tk.len
+  it.st.tk.push(jv.intern_str(&it.st, "file"))
+  it.st.tw.push(nat.mkstr(&it, fname))
+  it.st.tk.push(jv.intern_str(&it.st, "line"))
+  it.st.tw.push(vint(line))
+  return jv.end_obj(&it.st, start)
 
-# The message check_object_key gives for a constant key of kind k written at src[s..e], or ""
-# for none; "?" when vjq can't tell.
-fn key_error(src: Str, s: Int, e: Int, k: Int, var st: St) -> Str:
-  if k == C_NO or k == K_STR: return ""
-  if k == C_MAYBE: return "?"
-  var p = lang.new_parser(src[s..e], "<top-level>")
-  let root = lang.parse_pipe(&p, &st)
-  if p.err != "" or p.tk != lang.T_EOF: return "?"
-  let m = lang.key_error_msg(p, &st, root)
-  if m == "": return "?"
-  return m
+fn one_key(var it: It, k: V, v: V) -> V:
+  let start = it.st.tk.len
+  it.st.tk.push(jv.intern_id(&it.st, k.k >> 4))
+  it.st.tw.push(v)
+  return jv.end_obj(&it.st, start)
 
-fn check(src: Str, var st: St) -> BRes:
-  var r = BRes([], [], false)
+fn check(src: Str, var it: It, fname: Str) -> BRes:
+  var r = BRes([], [], false, vnull(), [])
   let pact = ints(bisontab.YYPACT)
   let defact = ints(bisontab.YYDEFACT)
   let pgoto = ints(bisontab.YYPGOTO)
@@ -406,7 +412,7 @@ fn check(src: Str, var st: St) -> BRes:
   var sl: [Int] = [0]
   var se: [Int] = [0]
   var ck: [Int] = [C_NO]
-  var cl: [Int] = [0]
+  var cv: [V] = [vnull()]
   var state = 0
   var yychar = S_EMPTY
   var errstatus = 0
@@ -425,7 +431,7 @@ fn check(src: Str, var st: St) -> BRes:
       yyn = defact[state]
       if yyn == 0: act = 2
     else:
-      if yychar == S_EMPTY: yychar = lex(&lx, &r, &st)
+      if yychar == S_EMPTY: yychar = lex(&lx, &r, &it.st)
       let i = yyn + yychar
       if i < 0 or i > last or chk[i] != yychar:
         yyn = defact[state]
@@ -443,7 +449,7 @@ fn check(src: Str, var st: St) -> BRes:
       sl.push(lx.ls)
       se.push(lx.le)
       ck.push(C_NO)
-      cl.push(0)
+      cv.push(vnull())
       state = yyn
       yychar = S_EMPTY
       continue
@@ -456,70 +462,122 @@ fn check(src: Str, var st: St) -> BRes:
       if len > 0:
         ls = sl[top - len + 1]
       var k = C_NO
-      var l = 0
+      var kv = vnull()
       let b = top - len + 1     # the first right-hand symbol
       if rule == bisontab.R_TERM_LIT:
-        k = K_NUM
+        k = C_ONE
+        kv = leaf(&it, src, sl[b], se[b])
       elif rule == bisontab.R_QQ_EMPTY:
-        k = K_STR
+        k = C_ONE
       elif rule == bisontab.R_QQ_TEXT:
-        if ck[b] == K_STR: k = K_STR
+        k = ck[b]
       elif rule == bisontab.R_STR:
-        k = ck[b + 1]
-      elif rule == bisontab.R_TERM_STR or rule == 71:
-        k = ck[b]
-      elif rule == bisontab.R_EXP_TERM:
-        k = ck[b]
-        l = cl[b]
+        if ck[b + 1] == C_ONE:
+          k = C_ONE
+          kv = leaf(&it, src, ls, le)
+      elif rule == bisontab.R_TERM_STR or rule == 71 or rule == bisontab.R_EXP_TERM or rule == 10 or rule == 156:
+        k = ck[b + len - 1]
+        kv = cv[b + len - 1]
       elif rule == bisontab.R_TERM_PAREN:
         k = ck[b + 1]
-        l = cl[b + 1]
+        kv = cv[b + 1]
+      elif rule == 72:
+        k = C_NOOP
+      elif rule == 28 or rule == 69:
+        if ck[b] == C_NOOP:
+          k = ck[b + 2]
+          kv = cv[b + 2]
+        elif ck[b + 2] == C_NOOP:
+          k = ck[b]
+          kv = cv[b]
       elif rule == 105:
-        k = K_ARR
+        k = C_ONE
+        kv = nat.mkarr(&it, [])
       elif rule == 104:
-        let c = cl[b + 1]
-        if c > 0: k = K_ARR
-        elif c < 0: k = C_MAYBE
+        if ck[b + 1] == C_ONE:
+          k = C_ONE
+          kv = nat.mkarr(&it, [cv[b + 1]])
+        elif ck[b + 1] == C_LIST:
+          k = C_ONE
+          kv = cv[b + 1]
       elif rule == 109:
-        k = K_OBJ
+        k = C_ONE
+        kv = loc_obj(&it, fname, src, ls)
       elif rule == 110:
         let t = src[sl[b]..se[b]]
-        if t == "true" or t == "false": k = K_BOOL
-        elif t == "null": k = K_NULL
+        if t == "true":
+          k = C_ONE
+          kv = V(jv.K_TRUE, 0.0)
+        elif t == "false":
+          k = C_ONE
+          kv = V(jv.K_FALSE, 0.0)
+        elif t == "null":
+          k = C_ONE
       elif rule == 30 or rule == 33 or rule == 35 or rule == 37 or rule == 38 or (rule >= 41 and rule <= 46):
-        k = fold(rule, ck[b], ck[b + 2])
+        if ck[b] == C_ONE and ck[b + 2] == C_ONE:
+          var op = lang.OP_ADD
+          if rule == 33: op = lang.OP_SUB
+          elif rule == 35: op = lang.OP_MUL
+          elif rule == 37: op = lang.OP_DIV
+          elif rule == 38: op = lang.OP_MOD
+          elif rule == 41: op = lang.OP_EQ
+          elif rule == 42: op = lang.OP_NE
+          elif rule == 43: op = lang.OP_LT
+          elif rule == 44: op = lang.OP_GT
+          elif rule == 45: op = lang.OP_LE
+          elif rule == 46: op = lang.OP_GE
+          let was = it.bad
+          it.bad = false
+          let x = run.binop(&it, op, cv[b], cv[b + 2])
+          if not it.bad:
+            k = C_ONE
+            kv = x
+          it.bad = was
       elif rule == 29:
-        # a, b: a list of constants when a is one and b is a single constant
-        let x = cl[b]
-        let y = cl[b + 2]
-        if x != 0 and y != 0:
-          if x > 0 and y == 1: l = x + 1
-          elif x < 0 or y < 0: l = -1
+        # gen_const_array: a left-nested list of single constants
+        if ck[b + 2] == C_ONE:
+          if ck[b] == C_ONE:
+            k = C_LIST
+            kv = nat.mkarr(&it, [cv[b], cv[b + 2]])
+          elif ck[b] == C_LIST:
+            var xs: [V] = []
+            let n = jv.alen(it.st, cv[b])
+            for i in 0..n: xs.push(jv.aget(it.st, cv[b], i))
+            xs.push(cv[b + 2])
+            k = C_LIST
+            kv = nat.mkarr(&it, xs)
       elif rule == 155:
-        k = K_OBJ        # an object of constant pairs so far (MkDict carries this)
-      elif rule == 156:
-        k = ck[b]
+        k = C_ONE
+        kv = jv.end_obj(&it.st, it.st.tk.len)
       elif rule == 157:
-        k = obj_and(ck[b], ck[b + 2])
-      elif rule == 158:
-        k = ck[b + 2]
+        if ck[b] == C_ONE and ck[b + 2] == C_ONE:
+          k = C_ONE
+          kv = run.binop(&it, lang.OP_ADD, cv[b], cv[b + 2])
       elif rule == 159 or rule == 160:
-        k = pair_val(ck[b + 2])
+        if ck[b + 2] == C_ONE:
+          k = C_ONE
+          let _hk = nat.mkstr(&it, src[sl[b]..se[b]])
+          kv = one_key(&it, _hk, cv[b + 2])
       elif rule == 161:
-        if ck[b] == K_STR: k = pair_val(ck[b + 2])
-        elif ck[b] == C_MAYBE: k = C_MAYBE
+        if ck[b] == C_ONE and ck[b + 2] == C_ONE and jv.kind(cv[b]) == jv.K_STR:
+          k = C_ONE
+          kv = one_key(&it, cv[b], cv[b + 2])
       elif rule == 166:
-        k = K_OBJ
+        k = C_ONE
+        let _hl = loc_obj(&it, fname, src, ls)
+        let _hk2 = nat.mkstr(&it, "__loc__")
+        kv = one_key(&it, _hk2, _hl)
       elif rule == bisontab.R_DICT_KEY or rule == bisontab.R_OBJPAT_KEY:
-        let m = key_error(src, sl[b + 1], se[b + 1], ck[b + 1], &st)
-        if m == "?": r.uncertain = true
-        elif m != "": berr(&r, ls, m)
-        if rule == bisontab.R_DICT_KEY:
-          if ck[b + 1] == K_STR: k = pair_val(ck[b + 4])
-          elif ck[b + 1] == C_MAYBE: k = C_MAYBE
+        if ck[b + 1] == C_ONE and jv.kind(cv[b + 1]) != jv.K_STR:
+          let kx = cv[b + 1]
+          berr(&r, ls, "Cannot use " + run.kname(kx) + " (" + run.trunc_dump(&it, kx, 15) + ") as object key")
+        elif rule == bisontab.R_DICT_KEY and ck[b + 1] == C_ONE and ck[b + 4] == C_ONE:
+          k = C_ONE
+          kv = one_key(&it, cv[b + 1], cv[b + 4])
       elif rule == 106:
-        if ck[b + 1] == K_OBJ: k = K_OBJ
-        elif ck[b + 1] == C_MAYBE: k = C_MAYBE
+        if ck[b + 1] == C_ONE:
+          k = C_ONE
+          kv = cv[b + 1]
       elif rule == bisontab.R_IF_ERR:
         berr(&r, ls, "Possibly unterminated 'if' statement")
       elif rule == bisontab.R_TRY_ERR:
@@ -531,18 +589,23 @@ fn check(src: Str, var st: St) -> BRes:
       elif rule == bisontab.R_OBJPAT_ERR or rule == bisontab.R_DICT_ERR:
         berr(&r, ls, "May need parentheses around object key expression")
       elif rule == bisontab.R_MODULE or rule == bisontab.R_IMPORT_META:
-        let m = ck[b + 1]
-        if m == C_MAYBE: r.uncertain = true
-        elif m == C_NO: berr(&r, ls, "Module metadata must be constant")
-        elif m != K_OBJ: berr(&r, ls, "Module metadata must be an object")
+        if ck[b + 1] != C_ONE: berr(&r, ls, "Module metadata must be constant")
+        elif jv.kind(cv[b + 1]) != jv.K_OBJ: berr(&r, ls, "Module metadata must be an object")
+        elif rule == bisontab.R_MODULE: r.meta = cv[b + 1]
+        if rule == bisontab.R_IMPORT_META:
+          if ck[b + 1] == C_ONE and jv.kind(cv[b + 1]) == jv.K_OBJ: r.imeta.push(cv[b + 1])
+          else: r.imeta.push(vnull())
+      elif rule == 48:
+        r.imeta.push(vnull())
+      elif rule == 2:
+        r.has_main = true
       elif rule == bisontab.R_IMPORT_FROM:
-        if ck[b] != K_STR: berr(&r, ls, "Import path must be constant")
-      if l == 0 and rule != 29: l = single(k)
+        if ck[b] != C_ONE: berr(&r, ls, "Import path must be constant")
       ss.truncate(ss.len - len)
       sl.truncate(sl.len - len)
       se.truncate(se.len - len)
       ck.truncate(ck.len - len)
-      cl.truncate(cl.len - len)
+      cv.truncate(cv.len - len)
       let lhs = r1[rule] - ntok
       let st0 = ss[ss.len - 1]
       let gi = pgoto[lhs] + st0
@@ -552,7 +615,7 @@ fn check(src: Str, var st: St) -> BRes:
       sl.push(ls)
       se.push(le)
       ck.push(k)
-      cl.push(l)
+      cv.push(kv)
       continue
     # yyerrlab
     if errstatus == 0:
@@ -578,27 +641,16 @@ fn check(src: Str, var st: St) -> BRes:
       sl.pop()
       se.pop()
       ck.pop()
-      cl.pop()
+      cv.pop()
       state = ss[ss.len - 1]
     if not found: break
     ss.push(yyn)
     sl.push(er1)
     se.push(lx.le)
     ck.push(C_NO)
-    cl.push(0)
+    cv.push(vnull())
     state = yyn
   return r
-
-fn obj_and(a: Int, b: Int) -> Int:
-  if a == C_NO or b == C_NO: return C_NO
-  if a == C_MAYBE or b == C_MAYBE: return C_MAYBE
-  return K_OBJ
-
-# A pair `key: value` with a constant string key: constant when the value is a single constant.
-fn pair_val(v: Int) -> Int:
-  if v >= 0: return K_OBJ
-  if v == C_MAYBE: return C_MAYBE
-  return C_NO
 
 fn syntax_message(names: [Str], pact: [Int], table: [Int], chk: [Int], state: Int, tok: Int, last: Int, ninf: Int, tninf: Int, ntok: Int) -> Str:
   if tok == S_EMPTY: return "syntax error"
@@ -621,3 +673,20 @@ fn syntax_message(names: [Str], pact: [Int], table: [Int], chk: [Int], state: In
     else: msg += " or "
     msg += names[exp[i]]
   return msg
+
+# jq's locfile_locate: the message, where it is (file and line), the line, and spaces up to its
+# column.
+fn located(msg: Str, src: Str, at: Int, fname: Str) -> Str:
+  var pos = at
+  if pos < 0: pos = 0
+  if pos > src.len: pos = src.len
+  var ls = pos
+  while ls > 0 and src[ls - 1] != '\n': ls -= 1
+  var le = pos
+  while le < src.len and src[le] != '\n': le += 1
+  var line = 1
+  for i in 0..ls:
+    if src[i] == '\n': line += 1
+  var pad = ""
+  for i in ls..pos: pad += " "
+  return "jq: error: " + msg + " at " + fname + ", line {line}:\n" + src[ls..le] + pad

@@ -354,3 +354,62 @@ int64_t vjq_fleft(void *p) {
     if (pos < 0) return -1;
     return (int64_t)sb.st_size - pos;
 }
+
+#include <limits.h>
+/* realpath, or the path itself when it can't be resolved (as jq's jq_realpath) */
+vu_str vjq_realpath(const vu_str *p) {
+    char *z = vu_cstr(p);
+    char buf[PATH_MAX];
+    char *r = z ? realpath(z, buf) : NULL;
+    vu_str out = r ? vu_str_from(r, (int64_t)strlen(r)) : vu_str_from(p->data ? (const char *)p->data : "", p->len);
+    free(z);
+    return out;
+}
+
+#include <libgen.h>
+#include <fcntl.h>
+#include <unistd.h>
+/* C's dirname (as jq uses it for $ORIGIN and a module's folder) */
+vu_str vjq_dirname(const vu_str *p) {
+    char *z = vu_cstr(p);
+    char *d = dirname(z ? z : (char *)".");
+    vu_str out = vu_str_from(d, (int64_t)strlen(d));
+    free(z);
+    return out;
+}
+
+/* stat's errno for a path (0 when it exists) */
+int64_t vjq_stat_errno(const vu_str *p) {
+    char *z = vu_cstr(p);
+    struct stat sb;
+    int r = z ? stat(z, &sb) : -1;
+    int e = r == 0 ? 0 : errno;
+    free(z);
+    return e;
+}
+
+/* jv_load_file's message when it can't open the file, or "" */
+vu_str vjq_load_err(const vu_str *p) {
+    char *z = vu_cstr(p);
+    char buf[8192];
+    buf[0] = 0;
+    int fd = z ? open(z, O_RDONLY) : -1;
+    if (fd == -1) {
+        snprintf(buf, sizeof buf, "Could not open %s: %s", z ? z : "", strerror(errno));
+    } else {
+        struct stat sb;
+        if (fstat(fd, &sb) == -1 || S_ISDIR(sb.st_mode))
+            snprintf(buf, sizeof buf, "Could not open %s: %s", z, "It's a directory");
+        close(fd);
+    }
+    free(z);
+    return vu_str_from(buf, (int64_t)strlen(buf));
+}
+
+/* whether an environment variable is set (even to "") */
+int64_t vjq_has_env(const vu_str *p) {
+    char *z = vu_cstr(p);
+    int r = z && getenv(z) != NULL;
+    free(z);
+    return r;
+}

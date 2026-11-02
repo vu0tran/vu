@@ -1,142 +1,316 @@
-# mods: jq's module system: import "path" as name; import "path" as $data; include "path";
-# Modules are found on the search path (-L, else ~/.jq, $ORIGIN/../lib/jq, $ORIGIN/../lib), or on
-# the paths in an import's {search: ...} metadata, relative to the importing file's folder.
+# mods: jq's module system (a port of its src/linker.c): import "path" as name;
+# import "path" as $data; include "path"; ~/.jq; modulemeta. Imports are processed as jq does
+# (last first), found on the same search chain (an import's {search: ...} metadata, else "."
+# then the library path: -L, or ~/.jq, $ORIGIN/../lib/jq, $ORIGIN/../lib), with jq's three
+# candidate files, its path checks and its messages. Inside a module, what it imports is seen
+# before its own definitions (jq binds the imports into it first).
 
 import jv
 import lang
+import bison
 import run
 import nat
-from jv import V, vnull, vstr, kind, K_STR, K_ARR, K_OBJ
+from jv import V, vnull, vstr, kind, K_STR, K_ARR, K_OBJ, K_TRUE
 from run import It, Scope
 
+const ENOENT = 2
+
 type Mods:
-  path: [Str]
-  dir: [Str]
+  path: [Str]           # resolved paths of the libraries loaded (code and data)
   is_data: [Bool]
-  frame: [Int]          # data module: the global frame holding its value
-  defs_start: [Int]     # code module: its top-level functions in ast.topdefs
+  frame: [Int]          # data library: the global frame holding its value
+  defs_start: [Int]     # code library: its top-level functions in ast.topdefs
   defs_end: [Int]
   imp_start: [Int]      # its imports in ast.imports (pairs) / ast.imeta
   imp_end: [Int]
-  imp_mod: [Int]        # per import (indexed like ast.imeta): the module it resolved to
-  state: [Int]          # 0 loaded, 1 resolving, 2 resolved
-  err: Str
+  state: [Int]          # -1 loading, 0 loaded, 1 resolving, 2 resolved
+  fidx: [Int]           # its entry in it.ftext/it.fpath (-1 for data)
+  imp_mod: [Int]        # per import (indexed like ast.imeta): the library bound, or -1
+  imv: [V]              # per import: its metadata constant (null without one)
+  err: Str              # the messages reported so far, as jq prints them
+  libdirs: [Str]
+  jq_origin: Str
+  home: Str
+  has_home: Bool
+  home_mod: Int         # ~/.jq as an included library, or -1
 
-fn new_mods() -> Mods:
-  return Mods([], [], [], [], [], [], [], [], [], [], "")
+fn new_mods(libdirs: [Str], jq_origin: Str, home: Str, has_home: Bool) -> Mods:
+  var ds: [Str] = []
+  for d in libdirs: ds.push(d + "")
+  return Mods([], [], [], [], [], [], [], [], [], [], [], "", ds, jq_origin, home, has_home, -1)
 
-fn dirname(p: Str) -> Str:
-  var i = p.len - 1
-  while i >= 0 and p[i] != '/': i -= 1
-  if i < 0: return "."
-  if i == 0: return "/"
-  return p[0..i]
+fn report(var m: Mods, msg: Str):
+  m.err += msg + "\n"
 
-fn join_path(d: Str, p: Str) -> Str:
-  if p.startswith("/"): return p
-  if d == "" or d == ".": return p
-  if d.endswith("/"): return d + p
-  return d + "/" + p
+fn mget(it: It, o: V, key: Str) -> V?:
+  if kind(o) != K_OBJ: return nil
+  let n = jv.olen(it.st, o)
+  for i in 0..n:
+    let k = jv.okey(it.st, o, i)
+    if jv.sid_str(it.st, k) == key: return jv.oval(it.st, o, i)
+  return nil
 
-fn last_part(p: Str) -> Str:
-  var i = p.len - 1
-  while i >= 0 and p[i] != '/': i -= 1
-  return p[i + 1..p.len]
+fn is_true(it: It, o: V, key: Str) -> Bool:
+  let v = mget(it, o, key) else vnull()
+  return kind(v) == K_TRUE
 
-# The search directories for an import (metadata node meta, -1 for none) in a file in dir.
-fn search_dirs(var it: It, meta: Int, dir: Str, libdirs: [Str], home: Str) -> [Str]:
-  var out: [Str] = []
-  if meta >= 0:
-    let was_bad = it.bad
-    it.bad = false
-    let mv = run.sev(&it, meta, vnull(), -1)
-    if it.bad: eprint("vjq: bad module metadata")
-    it.bad = was_bad
-    if kind(mv) == K_OBJ:
-      let sk = jv.intern_str(&it.st, "search")
-      let pos = jv.ofind(it.st, mv, sk)
-      if pos >= 0:
-        let sv = jv.oval(it.st, mv, pos)
-        var xs: [V] = []
-        if kind(sv) == K_STR: xs.push(sv)
-        elif kind(sv) == K_ARR:
-          let n = jv.alen(it.st, sv)
-          for i in 0..n: xs.push(jv.aget(it.st, sv, i))
-        for x in xs:
-          if kind(x) == K_STR: out.push(join_path(dir, jv.str_of(it.st, x)))
-        return out
-  for d in libdirs:
-    if d.startswith("~/"): out.push(join_path(home, d[2..d.len]))
-    elif d == "~": out.push(home)
-    else: out.push(d)
+# validate_relpath: "" when the module name is acceptable, else jq's message.
+fn relpath_error(name: Str) -> Str:
+  if name.find("\\") >= 0: return "Modules must be named by relative paths using '/', not '\\' (" + name + ")"
+  if name == "": return ""
+  let parts = name.split("/")
+  for i in 0..parts.len:
+    if parts[i] == "..": return "Relative paths to modules may not traverse to parent directories (" + name + ")"
+    if i > 0 and parts[i] == parts[i - 1]: return "module names must not have equal consecutive components: " + name
+  return ""
+
+# find_lib: the path of the library rel (suffix .jq or .json) on the search list, or "" with
+# err[0] set to jq's message.
+fn find_lib(var it: It, m: Mods, rel: Str, search: [V], suffix: Str, lib_origin: Str, has_origin: Bool, var err: [Str]) -> Str:
+  let re = relpath_error(rel)
+  if re != "":
+    err[0] = re
+    return ""
+  # build_lib_search_chain
+  var chain: [Str] = []
+  var xerr = ""
+  for sv in search:
+    if kind(sv) != K_STR: continue
+    var p = jv.str_of(it.st, sv)
+    if p.len > 1 and p[0] == '~' and p[1] == '/':
+      if not m.has_home:
+        xerr = "Could not expand " + p + ". (Could not find home directory.)"
+        continue
+      p = m.home + "/" + p[2..p.len]
+    if p == ".": chain.push(p)
+    elif p.startswith("$ORIGIN/"): chain.push(m.jq_origin + "/" + p[8..p.len])
+    elif has_origin and not p.startswith("/"): chain.push(lib_origin + "/" + p)
+    else: chain.push(p)
+  var bname = rel
+  var sl = rel.len - 1
+  while sl >= 0 and rel[sl] != '/': sl -= 1
+  if sl >= 0: bname = rel[sl..rel.len]
+  for sp in chain:
+    if sp == "": continue
+    var t = nat.vjq_realpath(it.ffi, sp + "/" + rel + suffix)
+    var e = nat.vjq_stat_errno(it.ffi, t)
+    if e == ENOENT:
+      t = nat.vjq_realpath(it.ffi, sp + "/" + rel + "/jq/main" + suffix)
+      e = nat.vjq_stat_errno(it.ffi, t)
+    if e == ENOENT:
+      t = nat.vjq_realpath(it.ffi, sp + "/" + rel + "/" + bname + suffix)
+      e = nat.vjq_stat_errno(it.ffi, t)
+    if e == 0: return t
+  if xerr != "": err[0] = "module not found: " + rel + " (" + xerr + ")"
+  else: err[0] = "module not found: " + rel
+  return ""
+
+# An import's search list (default_search): its metadata's search (an array, or one value made
+# an array), else "." and the library path.
+fn search_list(var it: It, m: Mods, meta: V) -> [V]:
+  var out: [V] = []
+  let sv = mget(it, meta, "search") else vnull()
+  if mget(it, meta, "search") == nil:
+    out.push(nat.mkstr(&it, "."))
+    for di in 0..m.libdirs.len:
+      let d = m.libdirs[di] + ""
+      out.push(nat.mkstr(&it, d))
+    return out
+  if kind(sv) == K_ARR:
+    let n = jv.alen(it.st, sv)
+    for i in 0..n: out.push(jv.aget(it.st, sv, i))
+  else:
+    out.push(sv)
   return out
 
-# Loads the module path (and, recursively, what it imports). Returns its index, or -1 with m.err.
-fn load(var it: It, var m: Mods, fs: Fs, path: Str, is_data: Bool, meta: Int, dir: Str, libdirs: [Str], home: Str) -> Int:
-  let dirs = search_dirs(&it, meta, dir, libdirs, home)
-  var ext = ".jq"
-  if is_data: ext = ".json"
-  var found = ""
-  for d in dirs:
-    let c1 = join_path(d, path + ext)
-    if fs.exists(c1):
-      found = c1
-      break
-    let c2 = join_path(d, path + "/" + last_part(path) + ext)
-    if fs.exists(c2):
-      found = c2
-      break
-  if found == "":
-    m.err = "module not found: " + path
-    return -1
-  for i in 0..m.path.len:
-    if m.path[i] == found and m.is_data[i] == is_data: return i
-  let text = fs.read(found) else ""
+# process_dependencies: loads what the imports ast.imeta[a..b] of one file name (last first,
+# as jq). Returns the number of errors (1 when one isn't found: jq stops there).
+fn process_deps(var it: It, var m: Mods, fs: Fs, a: Int, b: Int, lib_origin: Str, with_home: Bool) -> Int:
+  var nerr = 0
+  var i = b
+  while i > a:
+    i -= 1
+    while m.imp_mod.len <= i: m.imp_mod.push(-1)
+    let rel = it.ast.imports[2 * i] + ""
+    let alias = it.ast.imports[2 * i + 1] + ""
+    let is_data = alias.startswith("$")
+    var meta = vnull()
+    if i < m.imv.len: meta = m.imv[i]
+    let optional = is_true(it, meta, "optional")
+    let raw = is_true(it, meta, "raw")
+    let search = search_list(&it, m, meta)
+    var suffix = ".jq"
+    if is_data: suffix = ".json"
+    var er = [""]
+    let found = find_lib(&it, m, rel, search, suffix, lib_origin, true, &er)
+    if found == "":
+      if optional: continue
+      report(&m, "jq: error: " + er[0] + "\n")
+      return 1
+    if is_data:
+      var ne = 0
+      let idx = load_data(&it, &m, found, raw, optional, &ne)
+      nerr += ne
+      if nerr == 0: m.imp_mod[i] = idx
+      continue
+    var idx = -1
+    for q in 0..m.path.len:
+      if not m.is_data[q] and m.path[q] == found:
+        idx = q
+        break
+    if idx >= 0 and m.state[idx] == -1:
+      # jq recurses here without end (and crashes); vjq says why
+      report(&m, "jq: error: module import cycle: " + found + "\n")
+      nerr += 1
+      continue
+    if idx < 0:
+      var ne = 0
+      idx = load_code(&it, &m, fs, found, optional, &ne)
+      nerr += ne
+    if nerr == 0: m.imp_mod[i] = idx
+  # the program's first import is ~/.jq (jq adds it): processed last
+  if with_home: nerr += load_home(&it, &m, fs, nerr)
+  return nerr
+
+fn add_lib(var m: Mods, path: Str, is_data: Bool) -> Int:
   let idx = m.path.len
-  m.path.push(found)
-  m.dir.push(dirname(found))
+  m.path.push(path + "")
   m.is_data.push(is_data)
-  m.state.push(0)
-  if is_data:
-    let sv = jv.new_str(&it.st, text)
-    let v = slurp_values(&it, sv)
-    if it.bad:
-      it.bad = false
-      m.err = "Bad JSON in module " + found
-      return -1
-    m.frame.push(run.frpush(&it, -1, run.FR_VAR, v, -1, -1))
-    m.defs_start.push(0)
-    m.defs_end.push(0)
-    m.imp_start.push(0)
-    m.imp_end.push(0)
-    return idx
   m.frame.push(-1)
+  m.defs_start.push(0)
+  m.defs_end.push(0)
+  m.imp_start.push(0)
+  m.imp_end.push(0)
+  m.state.push(0)
+  m.fidx.push(-1)
+  return idx
+
+# A data library: all the JSON values of the file, in an array (raw: its text).
+fn load_data(var it: It, var m: Mods, path: Str, raw: Bool, optional: Bool, var nerr: Int) -> Int:
+  let le = nat.vjq_load_err(it.ffi, path)
+  var v = vnull()
+  var msg = le
+  if le == "":
+    let text = read_text(&it, path)
+    if raw: v = nat.mkstr(&it, text)
+    else:
+      msg = json_check(&it, text)
+      if msg == "":
+        let sv = jv.new_str(&it.st, text)
+        v = slurp_values(&it, sv)
+  if msg != "":
+    if not optional:
+      report(&m, "jq: error loading data file " + path + ": " + msg + "\n")
+      nerr = 1
+    return -1
+  let idx = add_lib(&m, path, true)
+  m.frame[idx] = run.frpush(&it, -1, run.FR_VAR, v, -1, -1)
+  return idx
+
+# A code library: checked by jq's parser (bison.vu), parsed, then its own imports loaded.
+fn load_code(var it: It, var m: Mods, fs: Fs, path: Str, optional: Bool, var nerr: Int) -> Int:
+  let le = nat.vjq_load_err(it.ffi, path)
+  if le != "":
+    if not optional:
+      report(&m, "jq: error loading data file " + path + ": " + le + "\n")
+      nerr = 1
+    return -1
+  let text = read_text(&it, path)
+  let idx = add_lib(&m, path, false)
+  m.state[idx] = -1
+  let br = bison.check(text, &it, path)
+  if br.msgs.len > 0:
+    for i in 0..br.msgs.len: report(&m, bison.located(br.msgs[i], text, br.locs[i], path))
+    nerr = br.msgs.len
+    return idx
+  if br.has_main:
+    report(&m, "jq: error: jq: error: library should only have function definitions, not a main expression\n<unknown location>")
+    nerr = 1
+    return idx
+  it.ftext.push(text + "")
+  it.fpath.push(path + "")
+  m.fidx[idx] = it.ftext.len - 1
   let ds = it.ast.topdefs.len
   let is0 = it.ast.imeta.len
-  var p = lang.new_parser(text, found)
+  var p = lang.new_parser(text, path)
   swap(&p.ast, &it.ast)
-  # the module's own imports and metadata belong to it, not to the program
+  # the module's own metadata belongs to it, not to the program
   let saved_meta = it.ast.modmeta
   lang.parse_program(&p, &it.st, true)
   it.ast.modmeta = saved_meta
   swap(&p.ast, &it.ast)
   if p.err != "":
-    m.err = p.err + " at " + found + ", line {p.errline + 1}"
-    return -1
-  m.defs_start.push(ds)
-  m.defs_end.push(it.ast.topdefs.len)
-  m.imp_start.push(is0)
-  m.imp_end.push(it.ast.imeta.len)
-  let mydir = dirname(found)
-  for i in is0..it.ast.imeta.len:
-    let ip = it.ast.imports[2 * i] + ""
-    let alias = it.ast.imports[2 * i + 1] + ""
-    let _h46801 = it.ast.imeta[i]
-    let r = load(&it, &m, fs, ip, alias.startswith("$"), _h46801, mydir, libdirs, home)
-    if r < 0: return -1
-    while m.imp_mod.len <= i: m.imp_mod.push(-1)
-    m.imp_mod[i] = r
+    report(&m, "jq: error: " + p.err + " at " + path + ", line {p.errline + 1}")
+    nerr = 1
+    return idx
+  m.defs_start[idx] = ds
+  m.defs_end[idx] = it.ast.topdefs.len
+  m.imp_start[idx] = is0
+  m.imp_end[idx] = it.ast.imeta.len
+  while m.imv.len < is0: m.imv.push(vnull())
+  for x in br.imeta: m.imv.push(x)
+  let _hd = nat.vjq_dirname(it.ffi, path)
+  nerr = process_deps(&it, &m, fs, is0, it.ast.imeta.len, _hd, false)
+  m.state[idx] = 0
   return idx
+
+# The ~/.jq file: included (as a library named "") when it exists, before everything else.
+fn load_home(var it: It, var m: Mods, fs: Fs, before: Int) -> Int:
+  if not m.has_home: return 0
+  var er = [""]
+  let hs = [nat.mkstr(&it, m.home)]
+  let found = find_lib(&it, m, "", hs, ".jq", "", true, &er)
+  if found == "": return 0
+  var ne = 0
+  var idx = -1
+  for q in 0..m.path.len:
+    if not m.is_data[q] and m.path[q] == found: idx = q
+  if idx < 0: idx = load_code(&it, &m, fs, found, true, &ne)
+  if ne == 0 and before == 0: m.home_mod = idx
+  return ne
+
+# A file's text as jv_load_file reads it: bad UTF-8 replaced (U+FFFD).
+fn read_text(var it: It, path: Str) -> Str:
+  let t = it.fs.read(path) else ""
+  let off = it.st.b.len
+  for i in 0..t.len: it.st.b.push(t[i])
+  if jv.valid_utf8(it.st, off, t.len):
+    it.st.b.truncate(off)
+    return t
+  let r = jv.repair_utf8(&it.st, off, t.len)
+  var bs: [Byte] = []
+  for i in r..it.st.b.len: bs.push(it.st.b[i])
+  it.st.b.truncate(off)
+  return str(bs)
+
+# jv_load_file's message for text that isn't a series of JSON values, or "".
+fn json_check(var it: It, t: Str) -> Str:
+  let off = it.st.b.len
+  for i in 0..t.len: it.st.b.push(t[i])
+  let spp = it.st.pp
+  let spend = it.st.pend
+  it.st.pp = off
+  it.st.pend = it.st.b.len
+  it.st.perr = ""
+  it.st.pline = 1
+  it.st.plinestart = off
+  var msg = ""
+  while true:
+    jv.skip_ws(&it.st)
+    if it.st.pp >= it.st.pend: break
+    let vs = it.st.pp
+    let vline = it.st.pline
+    let vcol = vs - it.st.plinestart
+    jv.parse_value(&it.st)
+    if it.st.perr != "":
+      msg = jv.json_error(it.st, vs, it.st.pend, vline, vcol)
+      if msg == "": msg = it.st.perr + " at line {vline}, column {vcol}"
+      break
+  it.st.b.truncate(off)
+  it.st.pp = spp
+  it.st.pend = spend
+  it.st.perr = ""
+  return msg
 
 fn slurp_values(var it: It, sv: V) -> V:
   let id = sv.k >> 4
@@ -170,29 +344,106 @@ fn copy_scope(sc: Scope) -> Scope:
     c.fid.push(sc.fid[i])
   return c
 
-# Adds to sc what the imports ast.imeta[a..b] bring (resolving code modules first).
+# Adds to sc what one library brings under alias (resolving a code library first).
+fn add_lib_names(var it: It, var m: Mods, var sc: Scope, base: Scope, mi: Int, alias: Str):
+  if mi < 0: return
+  if m.is_data[mi]:
+    let nm = alias[1..alias.len]
+    run.sc_push(&sc, run.SC_GVAR, nm, 0, m.frame[mi])
+    run.sc_push(&sc, run.SC_GVAR, nm + "::" + nm, 0, m.frame[mi])
+    return
+  resolve_mod(&it, &m, base, mi)
+  for q in m.defs_start[mi]..m.defs_end[mi]:
+    let fid = it.ast.topdefs[q]
+    var nm = it.ast.fdefs[fid].name + ""
+    if alias != "": nm = alias + "::" + nm
+    run.sc_push(&sc, run.SC_SFUNC, nm, it.ast.fdefs[fid].params.len, fid)
+
+# Adds to sc what the imports ast.imeta[a..b] bring; the last import is seen first, as jq binds
+# the last one first.
 fn add_imports(var it: It, var m: Mods, var sc: Scope, base: Scope, a: Int, b: Int):
   for i in a..b:
     let alias = it.ast.imports[2 * i + 1] + ""
-    let mi = m.imp_mod[i]
-    if m.is_data[mi]:
-      let nm = alias[1..alias.len]
-      run.sc_push(&sc, run.SC_GVAR, nm, 0, m.frame[mi])
-      run.sc_push(&sc, run.SC_GVAR, nm + "::" + nm, 0, m.frame[mi])
-      continue
-    resolve_mod(&it, &m, base, mi)
-    for q in m.defs_start[mi]..m.defs_end[mi]:
-      let fid = it.ast.topdefs[q]
-      var nm = it.ast.fdefs[fid].name + ""
-      if alias != "": nm = alias + "::" + nm
-      run.sc_push(&sc, run.SC_SFUNC, nm, it.ast.fdefs[fid].params.len, fid)
+    var mi = -1
+    if i < m.imp_mod.len: mi = m.imp_mod[i]
+    add_lib_names(&it, &m, &sc, base, mi, alias)
 
+# Resolves a code library's definitions: each sees the builtins, the library's earlier
+# definitions, then (before those) what the library imports, then itself.
 fn resolve_mod(var it: It, var m: Mods, base: Scope, mi: Int):
   if m.state[mi] != 0: return
   m.state[mi] = 1
-  var sc = copy_scope(base)
-  add_imports(&it, &m, &sc, base, m.imp_start[mi], m.imp_end[mi])
+  var own = copy_scope(base)
+  let saved_file = it.cur_file
   for q in m.defs_start[mi]..m.defs_end[mi]:
-    let _h46802 = it.ast.topdefs[q]
-    run.resolve_def(&it, _h46802, &sc)
+    var sc = copy_scope(own)
+    add_imports(&it, &m, &sc, base, m.imp_start[mi], m.imp_end[mi])
+    it.cur_file = m.fidx[mi]
+    let fid = it.ast.topdefs[q]
+    # each definition is checked only if something calls it (jq drops the others)
+    let sv = run.ctx_push(&it)
+    it.cdef[it.cctx] = fid
+    run.resolve_def(&it, fid, &sc)
+    it.cctx = sv
+    # the definition itself, as resolve_def left it on top of sc
+    let t = sc.kind.len - 1
+    run.sc_push(&own, sc.kind[t], sc.name[t] + "", sc.ar[t], sc.fid[t])
+  it.cur_file = saved_file
   m.state[mi] = 2
+
+# modulemeta: the library's metadata with its imports ("deps") and definitions ("defs"); null
+# when it can't be read or parsed (its syntax errors are reported, as jq does).
+fn modulemeta(var it: It, name: Str) -> V:
+  var m = new_mods(it.libdirs, it.jq_origin, it.home, it.has_home)
+  var ds: [V] = []
+  for di in 0..it.libdirs.len:
+    let d = it.libdirs[di] + ""
+    ds.push(nat.mkstr(&it, d))
+  var er = [""]
+  let found = find_lib(&it, m, name, ds, ".jq", "", false, &er)
+  if found == "": return run.sfail(&it, er[0])
+  if nat.vjq_load_err(it.ffi, found) != "": return vnull()
+  let text = read_text(&it, found)
+  let br = bison.check(text, &it, found)
+  if br.msgs.len > 0:
+    for i in 0..br.msgs.len: eprint(bison.located(br.msgs[i], text, br.locs[i], found))
+    return vnull()
+  if br.has_main:
+    eprint("jq: error: jq: error: library should only have function definitions, not a main expression\n<unknown location>")
+    return vnull()
+  var p = lang.new_parser(text, found)
+  lang.parse_program(&p, &it.st, true)
+  if p.err != "": return vnull()
+  var meta = br.meta
+  if kind(meta) != K_OBJ: meta = jv.end_obj(&it.st, it.st.tk.len)
+  var deps: [V] = []
+  for i in 0..p.ast.imports.len / 2:
+    var alias = p.ast.imports[2 * i + 1] + ""
+    let is_data = alias.startswith("$")
+    if is_data: alias = alias[1..alias.len]
+    let s0 = it.st.tk.len
+    if p.ast.imports[2 * i + 1] != "":
+      it.st.tk.push(jv.intern_str(&it.st, "as"))
+      it.st.tw.push(nat.mkstr(&it, alias))
+    it.st.tk.push(jv.intern_str(&it.st, "is_data"))
+    it.st.tw.push(jv.vbool(is_data))
+    it.st.tk.push(jv.intern_str(&it.st, "relpath"))
+    let _hr = p.ast.imports[2 * i] + ""
+    it.st.tw.push(nat.mkstr(&it, _hr))
+    let d = jv.end_obj(&it.st, s0)
+    var mv = vnull()
+    if i < br.imeta.len: mv = br.imeta[i]
+    if kind(mv) == K_OBJ: deps.push(run.binop(&it, lang.OP_ADD, mv, d))
+    else: deps.push(d)
+  var defs: [V] = []
+  for q in 0..p.ast.topdefs.len:
+    let f = p.ast.topdefs[q]
+    let _hn = p.ast.fdefs[f].name + "/{p.ast.fdefs[f].params.len}"
+    defs.push(nat.mkstr(&it, _hn))
+  let s1 = it.st.tk.len
+  it.st.tk.push(jv.intern_str(&it.st, "deps"))
+  it.st.tw.push(nat.mkarr(&it, deps))
+  it.st.tk.push(jv.intern_str(&it.st, "defs"))
+  it.st.tw.push(nat.mkarr(&it, defs))
+  let extra = jv.end_obj(&it.st, s1)
+  return run.binop(&it, lang.OP_ADD, meta, extra)

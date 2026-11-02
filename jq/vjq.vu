@@ -361,27 +361,15 @@ fn compile_error(it: It, src: Str) -> Str:
   if it.cerrline == -3: return it.cerr
   return located(it.cerr, src, it.cerrline)
 
-# jq's locfile_locate: the message, where it is, the line, and spaces up to its column.
 fn located(msg: Str, src: Str, at: Int) -> Str:
-  var pos = at
-  if pos < 0: pos = 0
-  if pos > src.len: pos = src.len
-  var ls = pos
-  while ls > 0 and src[ls - 1] != '\n': ls -= 1
-  var le = pos
-  while le < src.len and src[le] != '\n': le += 1
-  var line = 1
-  for i in 0..ls:
-    if src[i] == '\n': line += 1
-  var pad = ""
-  for i in ls..pos: pad += " "
-  return "jq: error: " + msg + " at <top-level>, line {line}:\n" + src[ls..le] + pad
+  return bison.located(msg, src, at, "<top-level>")
 
 # Builds the interpreter: globals, builtins, modules and the program. Returns the program's root
 # node, or -1 with it.cerr set.
 fn compile(var it: It, fs: Fs, src: Str, names: [Str], vals: [V], libdirs: [Str], home: Str) -> Int:
   for d in libdirs: it.libdirs.push(d)
   it.home = home
+  it.has_home = nat.vjq_has_env(it.ffi, "HOME") != 0
   # globals ($ENV, then the named arguments) are frames at fixed places, not on any chain
   var sc = run.Scope([], [], [], [], 0)
   let envv = nat.env_obj(&it)
@@ -401,8 +389,8 @@ fn compile(var it: It, fs: Fs, src: Str, names: [Str], vals: [V], libdirs: [Str]
     return -1
   swap(&it.ast, &bp.ast)
   # the program: bison's verdict and messages first (all of them), then vjq's parser
-  let br = bison.check(src, &it.st)
-  if br.msgs.len > 0 and not br.uncertain:
+  let br = bison.check(src, &it, "<top-level>")
+  if br.msgs.len > 0:
     var text = ""
     for i in 0..br.msgs.len:
       text += located(br.msgs[i], src, br.locs[i]) + "\n"
@@ -424,19 +412,21 @@ fn compile(var it: It, fs: Fs, src: Str, names: [Str], vals: [V], libdirs: [Str]
     it.cerr = "Top-level program not given (try \".\")"
     it.cerrline = -1
     return -1
-  # modules (data modules become global frames too)
-  var m = mods.new_mods()
+  # modules (data modules become global frames too), as jq's linker loads them: ~/.jq is
+  # included first, the imports are processed last first
+  var m = mods.new_mods(libdirs, it.jq_origin, home, it.has_home)
   let mi1 = it.ast.imeta.len
-  for i in mi0..mi1:
-    let ip = it.ast.imports[2 * i] + ""
-    let alias = it.ast.imports[2 * i + 1] + ""
-    let _h80301 = it.ast.imeta[i]
-    let r = mods.load(&it, &m, fs, ip, alias.startswith("$"), _h80301, ".", libdirs, home)
-    if r < 0:
-      it.cerr = m.err
-      return -1
-    while m.imp_mod.len <= i: m.imp_mod.push(-1)
-    m.imp_mod[i] = r
+  while m.imv.len < mi0: m.imv.push(vnull())
+  for x in br.imeta: m.imv.push(x)
+  let po = it.prog_origin + ""
+  let nerr = mods.process_deps(&it, &m, fs, mi0, mi1, po, true)
+  if nerr > 0:
+    var et = m.err
+    if nerr == 1: et += "jq: 1 compile error"
+    else: et += "jq: {nerr} compile errors"
+    it.cerr = et
+    it.cerrline = -3
+    return -1
   it.nglobals = it.fr.len
   for f in bdefs:
     run.resolve_def(&it, f, &sc)
@@ -449,6 +439,7 @@ fn compile(var it: It, fs: Fs, src: Str, names: [Str], vals: [V], libdirs: [Str]
     else:
       it.builtin_fids.push(f)
   let base = mods.copy_scope(sc)
+  if m.home_mod >= 0: mods.add_lib_names(&it, &m, &sc, base, m.home_mod, "")
   mods.add_imports(&it, &m, &sc, base, mi0, mi1)
   if it.cerr != "": return -1
   run.resolve(&it, root, &sc)
@@ -457,7 +448,10 @@ fn compile(var it: It, fs: Fs, src: Str, names: [Str], vals: [V], libdirs: [Str]
   if it.rerr.len > 0: order = run.undefined_report(it)
   if order.len > 0:
     var text = ""
-    for i in order: text += located(it.rerr[i], src, it.rpos[i]) + "\n"
+    for i in order:
+      let f = it.rfile[i]
+      if f < 0: text += located(it.rerr[i], src, it.rpos[i]) + "\n"
+      else: text += bison.located(it.rerr[i], it.ftext[f], it.rpos[i], it.fpath[f]) + "\n"
     if order.len == 1: text += "jq: 1 compile error"
     else: text += "jq: {order.len} compile errors"
     it.cerr = text
@@ -520,7 +514,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       if t == "--skip" or t == "--take": j += 1
       else: path = t
       j += 1
-    let code = run_tests(fs, os, ffi, path, lib_dirs(o, os))
+    let code = run_tests(fs, os, ffi, path, lib_dirs(o, ffi))
     exit(code)
   var src = o.filter
   if not o.have_filter:
@@ -534,6 +528,12 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     let t = fs.read(src) else ""
     src = skip_shebang(t)
   var it = run.new_it(ffi, fs, os)
+  it.jq_origin = nat.vjq_dirname(ffi, argv[0])
+  if o.from_file:
+    let _hd = nat.vjq_dirname(ffi, o.filter)
+    it.prog_origin = nat.vjq_realpath(ffi, _hd)
+  else:
+    it.prog_origin = nat.vjq_realpath(ffi, ".")
   it.null_input = o.null_input
   it.raw_input = o.raw_input
   it.slurp = o.slurp
@@ -638,7 +638,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   if not has_name(o, "JQ_BUILD_CONFIGURATION"):
     names.push("JQ_BUILD_CONFIGURATION")
     vals.push(jv.new_str(&it.st, BUILD_CONFIG))
-  let root = compile(&it, fs, src, names, vals, lib_dirs(o, os), os.env("HOME"))
+  let root = compile(&it, fs, src, names, vals, lib_dirs(o, ffi), os.env("HOME"))
   if root < 0:
     eprint(compile_error(it, src))
     if it.cerrline != -3: eprint("jq: 1 compile error")
@@ -891,16 +891,12 @@ fn has_bom(t: Str) -> Bool:
   return t.len >= 3 and t[0] == 0xEF and t[1] == 0xBB and t[2] == 0xBF
 
 # The module search path: -L directories, else jq's default.
-fn lib_dirs(o: Opts, os: Os) -> [Str]:
+fn lib_dirs(o: Opts, ffi: Ffi) -> [Str]:
   var ds: [Str] = []
-  for d in o.libdirs: ds.push(d)
-  if ds.len == 0:
+  for d in o.libdirs: ds.push(nat.vjq_realpath(ffi, d))
+  if not o.have_libdirs:
     ds.push("~/.jq")
-    let origin = exe_dir()
-    ds.push(origin + "/../lib/jq")
-    ds.push(origin + "/../lib")
+    ds.push("$ORIGIN/../lib/jq")
+    ds.push("$ORIGIN/../lib")
   return ds
 
-fn exe_dir() -> Str:
-  let a0 = args()[0]
-  return mods.dirname(a0)

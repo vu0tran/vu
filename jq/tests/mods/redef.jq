@@ -1,0 +1,3 @@
+def a: 1;
+def a: 2;
+def b: a;
