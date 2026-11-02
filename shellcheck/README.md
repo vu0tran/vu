@@ -1,27 +1,82 @@
-# vsc: a ShellCheck-compatible shell linter in Vu
+# vsc: a drop-in replacement for ShellCheck, in Vu
 
-`vsc` lints shell scripts and prints what ShellCheck 0.11.0 prints with `-f gcc`
-(`file:line:col: severity: message [SCxxxx]`), for the checks it implements. It is a port of
-ShellCheck's own design, about 11,000 lines of Vu in this directory:
+`vsc` is ShellCheck 0.11.0 rewritten in Vu: the same command line, the same output in every
+format (byte for byte, fixes included), the same `.shellcheckrc` lookup and directives, the same
+exit codes, and all of ShellCheck's checks: the 511 codes in its source (SC1000-SC1146 parse
+messages, SC2000-SC2335, SC3001-SC3067 bashisms) and its 11 optional checks. It uses 30 times less
+CPU (below). It is a port of ShellCheck's own design, about 17,000 lines of Vu in this directory:
 
 | file | what | ShellCheck source |
 |---|---|---|
-| `parse.vu` | the parser, with every SC1xxx parse warning and error | `Parser.hs` |
+| `parse.vu` | the parser, with every SC1xxx parse warning and error, `.shellcheckrc` parsing, following sourced files | `Parser.hs` |
 | `ast.vu`, `astlib.vu` | the syntax tree (flat arrays) and its helpers | `AST.hs`, `ASTLib.hs` |
-| `check.vu` | variable flow, the checks, `# shellcheck disable=` filtering | `AnalyzerLib.hs`, `Analytics.hs`, `Checks/*.hs` |
+| `check.vu` | variable flow, every check, fixes, `# shellcheck disable=` filtering, post-dominators | `AnalyzerLib.hs`, `Analytics.hs`, `Checks/*.hs` |
 | `cfg.vu`, `dfa.vu` | control flow graph and the data flow analysis over it | `CFG.hs`, `CFGAnalysis.hs` |
 | `data.vu` | variable lists | `Data.hs` |
-| `vsc.vu` | command line, output, `--jobs N` workers | `Formatter/GCC.hs` |
-| `test/` | corpus collection, reference runs, comparison, attack generator, benchmark | |
+| `fmt.vu` | the output formats, applying fixes, the diff | `Formatter/*.hs`, `Fixer.hs`, the Diff package |
+| `vsc.vu` | command line (GetOpt), rc file lookup, reading files, `--jobs N` workers | `shellcheck.hs` |
+| `sys_glue.c` | isatty, getcwd, realpath (for `--color=auto`, rc lookup, `-x`) | |
+| `test/` | corpus collection, reference runs, comparisons, attack generator, command line cases, benchmark | |
 
 ```
 ./vu build --release shellcheck/vsc.vu -o vsc
-./vsc [--jobs N] FILE...        # -f gcc is accepted and ignored: it's the only format
+./vsc [OPTIONS...] FILES...       # exactly shellcheck's options; see ./vsc --help
 ```
 
-Default options only: no `-x` (sourced files are reported as SC1091 like ShellCheck does), no
-optional checks, no `.shellcheckrc`. Shebangs, `# shellcheck shell=`, file extensions and
-`disable=`/`enable=`/`source=` directives are read as ShellCheck reads them.
+## Drop-in status
+
+**Command line.** Every option of `shellcheck --help`, parsed as GHC's GetOpt parses them
+(bundled short options, `-fgcc`, `--format=gcc`, unique prefixes of long options, `--`, the same
+messages for unknown, ambiguous and missing arguments, exit 3), and `SHELLCHECK_OPTS`:
+
+| option | status |
+|---|---|
+| `-a`, `--check-sourced` | supported |
+| `-C[WHEN]`, `--color[=WHEN]` | supported (auto: stdout is a terminal and `TERM` isn't empty or `dumb`) |
+| `-i`, `--include` / `-e`, `--exclude` | supported (`SC` prefixes, repeated options, `Invalid number`) |
+| `--extended-analysis=bool` | supported |
+| `-f`, `--format` | supported: `tty` (default), `gcc`, `checkstyle`, `diff`, `json`, `json1`, `quiet` |
+| `--list-optional` | supported (same text) |
+| `--norc`, `--rcfile=RCFILE` | supported |
+| `-o`, `--enable` | supported (`all` or names) |
+| `-P`, `--source-path` | supported (`SCRIPTDIR`, `:`-separated) |
+| `-s`, `--shell` | supported |
+| `-S`, `--severity` | supported |
+| `-V`, `--version` | supported (prints 0.11.0's text) |
+| `-W`, `--wiki-link-count` | supported |
+| `-x`, `--external-sources` | supported |
+| `--help` | supported |
+| `-` (stdin) | supported |
+| `--jobs N` | vsc only: check files on N threads (0: one per CPU); same output |
+
+Exit codes as ShellCheck: 0 no comments, 1 comments (and `-f quiet` stops at the first file with
+any), 2 a file couldn't be read (`file: openBinaryFile: does not exist (No such file or
+directory)` and the like, in each format's way: stderr, or a checkstyle error element), 3 bad
+usage, 4 bad option values.
+
+**Output.** All seven formats, including their quirks: tty and json print columns with tabs counted
+to the next multiple of 8 while gcc, checkstyle and json1 count characters; json and json1 list
+newer files first and repeat a file's comments once per file they mention; the tty format's code
+excerpts, `^--` markers, "Did you mean:" with the fixes applied, the "For more information"
+footer (`-W`) and colors; the `diff` format's unified diffs of all fixes, with three lines of
+context, `\ No newline at end of file` and "none were auto-fixable".
+
+**Fixes.** Every fix ShellCheck suggests (SC2006, SC2086, SC2164, SC2268, SC2295, SC2250,
+SC2292, ... 26 codes), with the same replacements, precedences and insertion points, applied the
+same way (Fixer.hs: overlapping fixes dropped, multi-line replacements, precedence order).
+
+**Configuration.** `.shellcheckrc` (or `shellcheckrc`) in the file's directory and every parent,
+then `~/.shellcheckrc` and `$XDG_CONFIG_HOME/shellcheckrc` (`~/.config/shellcheckrc`); `--rcfile`
+replaces the search, `--norc` turns it off; an rc file that doesn't parse gives SC1134 as
+ShellCheck does. Its keys and the `# shellcheck` directives: `disable` (codes, ranges, `all`),
+`enable`, `source`, `source-path` (with `SCRIPTDIR`), `shell`, `external-sources` (rc file only,
+SC1144 in scripts), `extended-analysis`, and the messages for unknown keys and values (SC1107,
+SC1103, SC1145, SC1146, SC1125).
+
+**Sourced files.** `source`/`.` are followed as ShellCheck follows them: when the file was also
+given as input, with `-x`, or with `external-sources=true`, looked up relative to the current
+directory, then `-P` paths, then `source-path` directives; their variables and functions count,
+their own comments are dropped unless `-a`, and SC1090/SC1091/SC1093/SC1094 come out the same.
 
 ## How it's tested: parity with ShellCheck
 
@@ -42,12 +97,10 @@ shellcheck 919d37c, Bash-Snippets 581a6b4, LinuxGSM 6c2e06a, bash-it 72ea9e2, gi
 oh-my-bash 94c2977, termux-packages 8d09238. `test/collect.py` picks the files, `test/runref.sh`
 runs the reference (one file at a time, 120 s and 3 GB limits).
 
-**Result** (`test/runall.sh`, `test/cmp.py`): on the 5353 files, for every code vsc implements,
-vsc prints exactly the lines ShellCheck prints: same position, severity, code and message,
-**zero missing and zero extra**. Codes vsc doesn't implement are not counted as matches. Of all
-41,717 lines ShellCheck prints on the corpus, vsc prints 41,608 (99.74%); the other 109 belong
-to 39 codes vsc doesn't implement (listed at the end). vsc implements 315 codes; 140 of them
-occur on the corpus, with these counts (ShellCheck = vsc, every line identical):
+**Result on the corpus** (`test/cmpj.py`, reference `shellcheck -f json1` per file, vsc on all
+files at once): all 5353 files identical, every field of every comment (position, end position,
+severity, code, message, and the fix with its replacements, precedences and insertion points):
+**41,717 of 41,717 comments, 4,432 of them with fixes**. 179 codes occur on the corpus:
 
 | code | lines | code | lines | code | lines | code | lines |
 |---|--:|---|--:|---|--:|---|--:|
@@ -71,24 +124,51 @@ occur on the corpus, with these counts (ShellCheck = vsc, every line identical):
 | SC2120 | 12 | SC2209 | 12 | SC3003 | 12 | SC1072 | 11 |
 | SC1073 | 11 | SC2235 | 11 | SC2254 | 11 | SC2089 | 10 |
 | SC3010 | 10 | SC3062 | 10 | SC2012 | 9 | SC2021 | 9 |
-| SC2199 | 9 | SC1001 | 8 | SC2013 | 8 | SC2296 | 8 |
-| SC1009 | 7 | SC1054 | 7 | SC2044 | 7 | SC2098 | 7 |
-| SC2125 | 7 | SC2269 | 7 | SC3044 | 7 | SC2010 | 6 |
-| SC2043 | 6 | SC2061 | 6 | SC2091 | 6 | SC2240 | 6 |
+| SC2199 | 9 | SC1001 | 8 | SC2003 | 8 | SC2013 | 8 |
+| SC2296 | 8 | SC1009 | 7 | SC1054 | 7 | SC2044 | 7 |
+| SC2098 | 7 | SC2125 | 7 | SC2269 | 7 | SC3044 | 7 |
+| SC2010 | 6 | SC2043 | 6 | SC2061 | 6 | SC2091 | 6 |
+| SC2115 | 6 | SC2194 | 6 | SC2218 | 6 | SC2240 | 6 |
 | SC2327 | 6 | SC2328 | 6 | SC2009 | 5 | SC2097 | 5 |
-| SC3037 | 5 | SC1050 | 4 | SC1071 | 4 | SC1078 | 4 |
-| SC1079 | 4 | SC3054 | 4 | SC1089 | 3 | SC2041 | 3 |
-| SC2179 | 3 | SC3045 | 3 | SC1010 | 2 | SC1036 | 2 |
-| SC1049 | 2 | SC1088 | 2 | SC2011 | 2 | SC3030 | 2 |
-| SC3057 | 2 | SC3061 | 2 | SC1008 | 1 | SC1011 | 1 |
-| SC1019 | 1 | SC1020 | 1 | SC1035 | 1 | SC1055 | 1 |
-| SC1058 | 1 | SC1064 | 1 | SC1065 | 1 | SC1102 | 1 |
-| SC2045 | 1 | SC2082 | 1 | SC2144 | 1 | SC2198 | 1 |
-| SC3006 | 1 | SC3009 | 1 | SC3014 | 1 | SC3020 | 1 |
-| SC3026 | 1 | SC3060 | 1 | SC3066 | 1 | SC3067 | 1 |
+| SC2219 | 5 | SC2221 | 5 | SC2222 | 5 | SC2294 | 5 |
+| SC2309 | 5 | SC3037 | 5 | SC1050 | 4 | SC1071 | 4 |
+| SC1078 | 4 | SC1079 | 4 | SC2121 | 4 | SC2320 | 4 |
+| SC3054 | 4 | SC1089 | 3 | SC2041 | 3 | SC2070 | 3 |
+| SC2103 | 3 | SC2157 | 3 | SC2179 | 3 | SC2184 | 3 |
+| SC2185 | 3 | SC2210 | 3 | SC2215 | 3 | SC2319 | 3 |
+| SC3045 | 3 | SC1010 | 2 | SC1036 | 2 | SC1049 | 2 |
+| SC1088 | 2 | SC2000 | 2 | SC2011 | 2 | SC2017 | 2 |
+| SC2062 | 2 | SC2142 | 2 | SC2163 | 2 | SC2321 | 2 |
+| SC3030 | 2 | SC3057 | 2 | SC3061 | 2 | SC1008 | 1 |
+| SC1011 | 1 | SC1019 | 1 | SC1020 | 1 | SC1035 | 1 |
+| SC1055 | 1 | SC1058 | 1 | SC1064 | 1 | SC1065 | 1 |
+| SC1102 | 1 | SC2045 | 1 | SC2077 | 1 | SC2082 | 1 |
+| SC2093 | 1 | SC2100 | 1 | SC2144 | 1 | SC2152 | 1 |
+| SC2156 | 1 | SC2190 | 1 | SC2198 | 1 | SC2213 | 1 |
+| SC2220 | 1 | SC2253 | 1 | SC2305 | 1 | SC2316 | 1 |
+| SC2318 | 1 | SC2324 | 1 | SC2333 | 1 | SC3006 | 1 |
+| SC3009 | 1 | SC3014 | 1 | SC3020 | 1 | SC3026 | 1 |
+| SC3060 | 1 | SC3066 | 1 | SC3067 | 1 |  |  |
 
-The other implemented codes (most of the SC1xxx parse errors and the bashism codes) don't occur
-on the corpus; they're covered by the attack rounds below.
+**Formats** (`test/cmpfmt.sh`): on a random sample of 400 corpus files (150 + 250), each run alone
+in `tty`, `diff`, `checkstyle` and `json`: stdout, stderr and exit status identical for all 400 in
+each format. One invocation over 40 files in each of the seven formats and with `-W 10`:
+identical (this checks the json file order, the checkstyle wrapper and the tty footer across files).
+
+**Optional checks** (`-o all -f json1`, a separate random sample of 700 corpus files): 17,711 of
+17,711 comments identical, among them SC2250 8,519, SC2312 1,493, SC2292 1,300, SC2154 (uppercase)
+1,033, SC2248 408, SC2244 108, SC2249 66, SC2243 32, SC2310 16, SC2002 11, SC2230 9, SC2335 2,
+SC2236 2.
+
+**Command line, configuration and sourcing** (`test/cases.py`): 79 small cases, each a directory
+of files and an argument list (rc files in the directory, a parent, home and XDG; `--norc`,
+`--rcfile` (also missing), parse errors in rc files, every key; `-x`, `-a`, `-P`, `SCRIPTDIR`,
+source directives, missing, recursive and broken sourced files in every format; directives in
+scripts; `-s`, `-S`, `-i`, `-e`, `-o`, `-W`, `--color`, `SHELLCHECK_OPTS`, stdin, missing files,
+directories, `--`, BOM, CRLF, Latin-1 and UTF-8 text, tabs, a file without a final newline, a
+multi-line fix): stdout, stderr and exit status identical in all 79 (one, Latin-1 bytes in a tty
+excerpt, differed at first and was fixed: ShellCheck reads bytes that aren't UTF-8 as Latin-1
+characters and prints them in UTF-8).
 
 **Attack rounds** (`test/attack.py`): generated scripts compared with ShellCheck in the codes vsc
 implements. Four generators: a grammar of shell features (expansions, tests, redirections,
@@ -106,6 +186,11 @@ operators dropped into corpus files).
 Adding checks also found one bug on the corpus itself, not by an attack round: SC2043 was given
 for `for x in 'single'`, where ShellCheck's earlier clause gives SC2041 instead (fixed by
 implementing SC2041 and SC2066 in the same order). vsc gives 180 distinct codes on round 3's generated files.
+
+Round 5 (after the command line, fixes and the remaining codes; `test/attack.py` now compares
+`-f json1`, so fixes and end positions too, and its grammar has the new checks' constructs):
+1500 generated, 1500 generated with `-o all`, 1000 mutated, 600 spliced with `-o all`, 600
+token-inserted: nothing. The generated files give 333 distinct codes.
 
 ## Speed
 
@@ -131,11 +216,27 @@ On the two files ShellCheck runs out of memory on, vsc takes 1.45 s CPU and 433 
 (`acme.sh/acme.sh`, 9931 lines) and 2.15 s and 148 MB (`nvm/nvm.sh`, 6742 lines); both hit the data
 flow step budget.
 
-## Not done
+## Known differences and limits
 
-- Unimplemented codes (each found on the corpus, with its count): SC2003 (8), SC2115 (6), SC2194 (6), SC2218 (6), SC2219 (5), SC2221 (5), SC2222 (5), SC2294 (5), SC2309 (5), SC2121 (4), SC2320 (4), SC2070 (3), SC2103 (3), SC2157 (3), SC2184 (3), SC2185 (3), SC2210 (3), SC2215 (3), SC2319 (3), SC2000 (2), SC2017 (2), SC2062 (2), SC2142 (2), SC2163 (2), SC2321 (2), SC2077 (1), SC2093 (1), SC2100 (1), SC2152 (1), SC2156 (1), SC2190 (1), SC2213 (1), SC2220 (1), SC2253 (1), SC2305 (1), SC2316 (1), SC2318 (1), SC2324 (1), SC2333 (1).
-- Optional checks (`--enable`), `-x` (following sourced files), `.shellcheckrc`, formats other
-  than gcc, fix suggestions.
-- The data flow analysis has a step budget; past it a function's analysis is abandoned (the two
-  big files above hit it). ShellCheck has no budget there and runs out of memory on the same
-  files, so their output was never compared.
+- **The data flow step budget.** vsc stops a data flow analysis after 4,000,000 steps in one file
+  (or 1,000,000 iterations of one loop, where ShellCheck itself stops with "DFA did not reach fix
+  point"); ShellCheck has no total budget. Measured on the whole corpus with the budget lifted:
+  the most any file needs is 163,296 steps (`acme.sh/acme.sh`) and 7,257 iterations of one loop
+  (`nvm/nvm.sh`), so the budget is 24 times what the largest file needs and no corpus file
+  reaches it. Those two files are the ones ShellCheck runs out of memory on (over 5 GB); no
+  file ShellCheck can finish comes near the budget. Like ShellCheck, vsc turns off the analysis
+  cache when 10,000 iterations of a loop are left (it used to do it after 10,000 iterations;
+  no corpus file comes near either point).
+- **Paths.** `canonicalizePath` (deciding whether a sourced file was given as input, and where
+  to start looking for `.shellcheckrc`) is realpath for paths that exist and the existing prefix
+  plus the rest otherwise, as the directory package does; not tested on case-insensitive or
+  unusual file systems.
+- **Locale.** vsc always writes UTF-8. ShellCheck writes in the locale's encoding, so under a
+  non-UTF-8 locale it may print non-ASCII text differently (or fail to); compared under UTF-8.
+- **Read errors** other than "does not exist", "is a directory" and "permission denied" are
+  mapped to GHC's wording by errno and weren't all compared (the tests run as root, so
+  "permission denied" wasn't either).
+- **Not compared:** parse problems inside a `.shellcheckrc` other than its SC1134 (e.g. a
+  carriage return in the rc file, reported by ShellCheck at a position in the rc file and dropped
+  by vsc).
+- `--jobs N` is an addition; ShellCheck rejects it.

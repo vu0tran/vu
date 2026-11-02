@@ -5,7 +5,8 @@ import sys, os, time, subprocess, resource
 W = os.environ['SCW']
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 tool, reps = sys.argv[1], int(sys.argv[2])
-cmd = {'sc': [W + '/shellcheck', '-f', 'gcc'], 'vsc1': [W + '/vsc'], 'vsc2': [W + '/vsc', '--jobs', '2']}[tool]
+cmd = {'sc': [W + '/shellcheck', '-f', 'gcc'], 'vsc1': [W + '/vsc', '-f', 'gcc'], 'vsc2': [W + '/vsc', '-f', 'gcc', '--jobs', '2'],
+       'sctty': [W + '/shellcheck'], 'vsctty': [W + '/vsc']}[tool]
 for r in range(reps):
     for c, d, lst in ((1, 'corpus', 'bench1.txt'), (2, 'corpus2', 'files2.txt')):
         files = [l.rstrip('\n') for l in open(W + '/' + lst)]

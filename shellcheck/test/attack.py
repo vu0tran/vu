@@ -1,11 +1,14 @@
-# attack.py DIR MODE N SEED: writes N generated scripts into DIR, runs shellcheck and vsc on them,
-# and prints every difference in the codes vsc implements.
+# attack.py DIR MODE N SEED [ARGS...]: writes N generated scripts into DIR, runs shellcheck and vsc
+# on them with -f json1 (and ARGS, e.g. -o all), and prints every comment that differs in any
+# field, the fix included.
 # MODE: gen (snippets from a grammar of shell features) or mut (mutated corpus files)
 import sys, os, random, subprocess, re, collections
 # SCW: the work directory (shellcheck, vsc, corpus/, corpus2/, files.txt, ...)
 W = os.environ['SCW']
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 d, mode, n, seed = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+extra_args = sys.argv[5:]
+import json
 rnd = random.Random(seed)
 src = open(HERE + '/check.vu').read() + open(HERE + '/parse.vu').read()
 codes = set(re.findall(r'\b([123]\d{3}), "', src)) | set('2034 2154 2031 2120 3014 3015 3018 3028 3045 1072 1137 2144 2245'.split())
@@ -27,7 +30,7 @@ def word():
     if r < 0.65: return rnd.choice(['-n', '-e', '-x', '-o', '-r', '-p', '--', '-E', '-ne', '-s', '-v', '-a', '-L', '-f'])
     if r < 0.75: return "'" + rnd.choice(['$x', 'a b', "it's", '`x`', '\\n', '~/f']) + "'"
     return rnd.choice(['foo', 'bar', 'x', '1', '0', '42', 'file', 'ls', '=', 'a"b"c', '"a""b"', '"a"b"c"', "'a'b", 'z=1'])
-cmds = ['echo', 'printf', 'read', 'cd', 'local', 'declare', 'export', 'readonly', 'trap', 'set', 'test', 'let', 'source', '.',
+cmds = ['expr', 'mv', 'cp', 'ln', 'chmod', 'rm -rf', 'su', 'mkdir -pm 700', 'time', 'egrep', 'which', 'tempfile', 'echo', 'printf', 'read', 'cd', 'local', 'declare', 'export', 'readonly', 'trap', 'set', 'test', 'let', 'source', '.',
         'exec', 'unset', 'eval', 'grep', 'ls', 'find', 'xargs', 'tr', 'sed', 'cat', 'rm', 'wait', 'type', 'hash', 'ulimit', 'umask',
         'jobs', 'mapfile', 'shopt', 'typeset', 'pushd', 'kill', 'command', 'builtin', 'exit', 'return', 'sudo', 'ssh', 'alias', 'getopts']
 def simple():
@@ -69,11 +72,45 @@ def stmt(depth=0):
         'case $x in $y) :;; "$z") :;; *$w*) :;; esac', '[ -e *.txt ]', '[[ -e *.txt ]]', '[ -v x* ]', '[ $a -eq 2*3 ]', '[ "${a[@]}" = x ]',
         '[[ $@ == x ]]', '[ {a,b} = a ]', '[[ x == {a,b} ]]', '[ *.c ]', '[[ *.c ]]', '[[ $x = $y ]]'])
     return simple()
+
+extras = [
+    'expr 1 + 2', 'expr $a \\* 2', 'expr "$x" : *.c', 'expr length "$s"', 'expr match $a b', 'expr 1', 'x=$(expr $a + 1)',
+    'while getopts "ab:c" opt; do\n  case $opt in\n    a) :;;\n    d) :;;\n  esac\ndone',
+    'while getopts ":ab" o; do case "$o" in a) :;; b) :;; \\?) :;; esac; done',
+    'rm -rf "$dir/"', 'rm -rf /usr/local', 'rm -r "$x"/*', 'rm -rf ${a:?}/', 'mv "$f"', 'cp -t dir f', 'ln -s x',
+    'sudo echo x > /etc/f', 'sudo cd /', 'chmod -r 644 f', 'xargs -i echo {}', 'eval "${arr[@]}"', 'eval "${arr[@]@Q}"',
+    'time -p ls', 'time ls | grep x', 'local x=1', 'function f { :; }', 'function g() { :; }', 'PATH=/my/bin', 'PATH="~/bin:$PATH"',
+    "IFS='\\n'", 'IFS="\\t"', 'for i in a; do for i in b; do :; done; done', 'for ((i=0;i<2;i++)); do for i in x; do :; done; done',
+    'echo x ]', 'echo [ x ]]', 'cd foo\nls\ncd ..', 'break', 'f() { continue; }', 'echo $[1+2]', 'ssh host <<EOF\necho $x\nEOF',
+    "alias ll='ls -l'; ll", 'alias a=b\na', '[ -f x ]; echo $?', 'test -d y\nexit $?', 'echo hi; echo $?', 'printf x; r=$?',
+    'later\nlater() { :; }', 'n=1; n+=1', 'n=1; m+=$n', 'declare -i k; k+=1', 'arr=(a=1 2=b)', 'declare -A m; m=(x y)', 'a=([1]= x)',
+    'a[$((i+1))]=1', 'echo $(( (x) ))', 'echo $(( ((x)) ))', 'for (((i)=0;;)); do :; done', '[ -a file ]', '[ ! -a file ]', '[ ! -o x ]',
+    '! ! true', 'true | ! false', 'f() { f; }', 'f() { f x & }', '[ x ] | [ y ]', '[ x ] &', '[[ $x != a ]] || [[ $x != b ]]',
+    '[ "$x" = a ] && [ "$x" = b ]', '(( x == 1 && x == 2 ))', '(( x != 1 || x != 2 ))', '[ $x != a -o $x != b ]', '[ $x = a -a $x = b ]',
+    '[ x -foo y ]', '[ -Q x ]', 'test 1 > 2', 'PS1="\\e[31m$ "', 'echo {1..$n}', 'eval echo {$a..3}', 'a[1][2]=x', 'echo ${a[1][2]}',
+    '[ "$(ls)" ]', '[ "$var" ]', '[ ! -n "$x" ]', '! [ -z "$x" ]', '[[ ! $a -eq 1 ]]', '! [ "$a" = b ]', 'case $x in a) :;; esac',
+    'cat file | grep x', 'cat "$f" | wc', 'set -e\nf() { :; }\nf && echo\nx=$(f)\nif f; then :; fi', 'set -e\n! true\ntrue',
+    'v=$(false) ; local y=$(false)', 'echo "$(false)" "$(true)"', 'x=$(a) y=$(b)', 'echo $(a | b)', 'set -o pipefail; a | b | c',
+    '$x=1', '${y}=2', '$0=x', '0=x', '2=x', '9foo=1', 'a${b}c=1', 'a==b', '===', '=foo', '====', 'echo= 1', '"" x', 'foo/ x',
+    'foo, x', 'foo# x', "$'a\\tb' x", 'f() { local a=1 b=$a; }', 'declare x=1 y=$x', 'export a=1 a=2', 'local declare x',
+    'echo   a   b', 'echo a     b > f', 'grep -E *.c f', 'grep "a*" f', 'grep x* f', 'grep -F a* f', 'unset arr[1]', 'find -name x',
+    'find . -exec sh -c "echo {}" \\;', 'find . -exec "echo {} |" \\;', 'find . -name a -o -name b -exec rm {} +', 'find . -exec echo $(x)',
+    'return 300', 'exit -1', 'exit 1 2', 'return $x', 'trap "" 9', 'trap x 20', 'trap - kill', 'set x y', 'set a=b', 'export $x',
+    'read $v', 'read -a arr[1]', 'alias x="echo $1"', 'echo hi | sleep 1', 'ls < f', 'echo x | cmd > f', 'cmd < a < b', 'a | b > f | c',
+    'x=1 > f', 'echo ${#}', 'echo "$x"; x+=$x', 'echo $((012 + 09))', 'echo $((a/b*c))', '[ 1 -lt 2.5 ]', '[[ $x < 3 ]]', '[ $a \\> 1 ]',
+    '[ x -lt y ]', '[[ x -gt y ]]', 'q=1; [[ q -gt 2 ]]', '[ "$x" -eq "1" ]', '[ 0 ]', '[ true ]', '[ "x" ]', '[ x = y ]', '[ a = b* ]',
+    '[[ x=y ]]', '[ -n "a$x" ]', '[ -z "foo" ]', '[ -n $x ]', '[ $a = $b ]', '[ 1 -eq "$x" ]', '([ -f x ])', '(-f x)', '(x = y)',
+    'case $x in a|b) ;; a) ;; esac', 'case x in a) ;; esac', 'case $x in *) ;; a) ;; esac', 'case "$x" in "$y") ;; esac',
+    'for f in "${arr[@]}"; do echo ${arr[$f]}; done', 'for k in "${a[@]}"; do (( b[k]++ )); done', '((a = 1))', 'echo ${x:?} > f',
+    'f() { :; }; sudo f', 'g() { :; }; xargs g', 'while read l; do ssh h; done < f', 'while read l; do ffmpeg -i x; done',
+    'while read l; do HandBrakeCLI; done < f', 'exec foo\necho bar', 'exec 3>f\necho x', 'if x; then exec a; fi\necho', 'cmd |& cat',
+    'echo "${x}" >&2 2>&1', 'ls 2>&1 >f', 'echo $"x"', 'echo $"$v"', 'x=1\necho $"x"', 'echo $"(ls)"',
+]
 def gen():
     lines = [rnd.choice(shebangs)]
     if rnd.random() < 0.1: lines.append('# shellcheck disable=SC' + rnd.choice(sorted(codes)))
     if rnd.random() < 0.1: lines.append('# shellcheck shell=' + rnd.choice(['sh', 'bash', 'dash', 'ksh']))
-    for _ in range(rnd.randint(1, 8)): lines.append(stmt())
+    for _ in range(rnd.randint(1, 8)): lines.append(stmt() if rnd.random() < 0.6 else rnd.choice(extras))
     return '\n'.join(lines) + '\n'
 corpus = [l.strip() for l in open(W + '/files.txt')] + [l.strip() for l in open(W + '/files2.txt')]
 def mut():
@@ -130,20 +167,19 @@ for k in range(n):
     data = gen().encode() if mode == 'gen' else mut() if mode == 'mut' else splice() if mode == 'splice' else tok()
     open(p, 'wb').write(data)
     names.append(p)
-pat = re.compile(r'^(.*?):(\d+):(\d+): (\w+): (.*) \[SC(\d+)\]$')
 def run(cmd, chunk):
     out = collections.defaultdict(list)
     for i in range(0, len(names), chunk):
         r = subprocess.run(cmd + names[i:i + chunk], capture_output=True, timeout=3000)
-        for l in r.stdout.decode('utf-8', 'surrogateescape').split('\n'):
-            m = pat.match(l)
-            if m and m.group(6) in codes: out[m.group(1)].append(l)
+        try: cs = json.loads(r.stdout.decode('utf-8', 'surrogateescape'))['comments']
+        except Exception: cs = []
+        for c in cs: out[c['file']].append(json.dumps(c, ensure_ascii=False))
     return out
-ref = run([W + '/shellcheck', '-f', 'gcc'], 200)
-vsc = run([W + '/vsc'], 2000)
+ref = run([W + '/shellcheck', '-f', 'json1'] + extra_args, 200)
+vsc = run([W + '/vsc', '-f', 'json1'] + extra_args, 2000)
 bad = 0
 for p in names:
-    a, b = ref.get(p, []), vsc.get(p, [])
+    a, b = sorted(ref.get(p, [])), sorted(vsc.get(p, []))
     if a != b:
         bad += 1
         print('==', p)
@@ -152,5 +188,5 @@ for p in names:
             if l not in sb: print('  miss', l)
         for l in b:
             if l not in sa: print('  extra', l)
-        if sa == sb: print('  (order/dup differs)')
+        if sa == sb: print('  (dup differs)')
 print(f'{bad} of {n} files differ', file=sys.stderr)
