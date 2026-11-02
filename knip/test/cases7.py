@@ -147,3 +147,32 @@ case("p7_mdx_tsconfig", {
     "tsconfig.json": json.dumps({"compilerOptions": {}, "mdx": {"plugins": ["remark-gfm", ["remark-toc", {}]]}}),
     "src/pages/index.astro": "---\n---\n<div/>\n",
 })
+
+case("p7_sveltekit", {
+    "package.json": pkg(dev=["@sveltejs/kit", "svelte", "vite"]), **mods("@sveltejs/kit", "svelte", "vite"),
+    "svelte.config.js": "export default { kit: { files: { lib: 'src/library' } } };\n",
+    "src/routes/+page.svelte": "<script>\nimport { x } from '$lib/x';\nimport { env } from '$env/static/public';\nimport { goto } from '$app/navigation';\n</script>\n",
+    "src/routes/about/+page.ts": "export const load = () => ({});\n", "src/library/x.ts": "export const x = 1;\nexport const y = 2;\n", "src/hooks.server.ts": "export {};\n", "src/other.ts": "export {};\n",
+}, PROD)
+case("p7_sveltekit_vite", {
+    "package.json": pkg(dev=["@sveltejs/kit", "vite"]), **mods("@sveltejs/kit", "vite"),
+    "vite.config.ts": "import { sveltekit } from '@sveltejs/kit/vite';\nexport default { plugins: [sveltekit({ files: { lib: 'src/l' } })] };\n",
+    "svelte.config.js": "export default {};\n", "src/routes/+layout.ts": "import '$lib/a';\n", "src/l/a.ts": "export {};\n", "src/lib/b.ts": "export {};\n",
+})
+case("p7_stryker_tauri_buf_orval", {
+    "package.json": pkg(dev=["@stryker-mutator/core", "@stryker-mutator/jest-runner", "@stryker-mutator/typescript-checker", "@tauri-apps/cli", "@bufbuild/buf", "@bufbuild/protoc-gen-es", "orval", "unused-dev"], scripts={"x": "echo"}),
+    **mods("@stryker-mutator/core", "@stryker-mutator/jest-runner", "@stryker-mutator/typescript-checker", "@tauri-apps/cli", "@bufbuild/buf", "@bufbuild/protoc-gen-es", "orval", "unused-dev"),
+    "node_modules/@bufbuild/protoc-gen-es/package.json": json.dumps({"name": "@bufbuild/protoc-gen-es", "version": "1.0.0", "bin": {"protoc-gen-es": "bin.js"}}),
+    "stryker.config.json": json.dumps({"testRunner": "jest", "checkers": ["typescript"]}),
+    "src-tauri/tauri.conf.json": json.dumps({"build": {"beforeDevCommand": "node scripts/dev.js", "beforeBuildCommand": {"script": "node build.js", "cwd": "tools"}}}),
+    "scripts/dev.js": "", "tools/build.js": "", "scripts/other.js": "",
+    "buf.gen.yaml": "version: v2\nplugins:\n  - local: protoc-gen-es\n    out: gen\n",
+    "orval.config.ts": "export default { api: { input: './spec.yaml', output: { target: './src/api.ts', override: { transformer: './src/transform.ts' } } } };\n",
+    "src/transform.ts": "export default 1;\n", "src/x.ts": "export {};\n",
+})
+case("p7_react_router", {
+    "package.json": pkg(deps=["@react-router/dev", "@react-router/node", "isbot", "react-router"]), **mods("@react-router/dev", "@react-router/node", "isbot", "react-router"),
+    "react-router.config.ts": "export default { appDirectory: 'web' };\n",
+    "web/routes.ts": "export default [{ file: 'routes/home.tsx' }, { file: 'routes/parent.tsx', children: [{ file: 'routes/child.tsx' }] }];\n",
+    "web/root.tsx": "export default 1;\n", "web/routes/home.tsx": "export default 1;\n", "web/routes/parent.tsx": "export default 1;\n", "web/routes/child.tsx": "export default 1;\n", "web/routes/unused.tsx": "export default 1;\n",
+}, PROD)

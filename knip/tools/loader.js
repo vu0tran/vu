@@ -142,6 +142,17 @@ for (const r of reqs) {
       const root = path.dirname(path.resolve(cwd, r.file));
       v = await v({ projectRoot: root, staticConfigPath: null, packageJsonPath: path.join(root, 'package.json'), config: { plugins: [] } });
     }
+    if (r.mode === 'react-router') {
+      const cfg = v ?? {};
+      const appDir = path.resolve(path.dirname(path.resolve(cwd, r.file)), cfg.appDirectory ?? 'app');
+      globalThis.__reactRouterAppDirectory = appDir;
+      let routes = [];
+      for (const f of ['routes.ts', 'routes.js']) {
+        const rf = path.join(appDir, f);
+        if (fs.existsSync(rf)) { routes = await settle(await load(rf), 0); break; }
+      }
+      v = { config: cfg, appDir, routes };
+    }
     if (r.mode === 'karma') {
       if (typeof v !== 'function') v = null;
       else { const mem = { config: undefined, set(c) { this.config = c; } }; await v(mem); v = mem.config ?? {}; }
