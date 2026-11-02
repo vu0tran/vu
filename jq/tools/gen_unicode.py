@@ -68,4 +68,19 @@ for a, b in pairs:
     fl.append(b36(a - prev) + "." + ("-" + b36(-diff) if diff < 0 else b36(diff)))
     prev = a
 out.append('const FOLDS = "' + ",".join(fl) + '"   # each: code point (delta from the last), its fold (delta from it)\n')
+# multi-character folds (OnigUnicodeFolds2, OnigUnicodeFolds3): the folded sequence and the code
+# points folding to it, in Oniguruma's order
+for nm, k in (("OnigUnicodeFolds2", 2), ("OnigUnicodeFolds3", 3)):
+    body = re.search(nm + r"\[\] = \{(.*?)\};", fold, re.S).group(1)
+    body = body.split("/* ----- LOCALE")[0]
+    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    body = re.sub(r"^#.*$", "", body, flags=re.M)
+    nums = [int(x, 0) for x in re.findall(r"0x[0-9a-fA-F]+|\b\d+\b", body)]
+    ents = []
+    i = 0
+    while i < len(nums):
+        t = nums[i:i + k]; n = nums[i + k]; us = nums[i + k + 1:i + k + 1 + n]
+        i += k + 1 + n
+        ents.append(" ".join("%x" % x for x in t) + ":" + " ".join("%x" % x for x in us))
+    out.append("const FOLDS%d = \"" % k + ";".join(ents) + "\"\n")
 sys.stdout.write("".join(out))
