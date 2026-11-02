@@ -633,7 +633,10 @@ fn call_val(var it: It, id: Int, n: Int, v: V) -> V:
     if not jv.is_num(b): return type_err(&it, b, "number required")
     if not jv.is_num(c): return type_err(&it, c, "number required")
     return vnum(vjq_m3(it.ffi, 0, a.n, b.n, c.n))
-  if id == I.input_line_number: return vint(fed_lines(&it))
+  if id == I.input_line_number:
+    # once jq has closed the last file (a read after the one that found its end), the count is 0
+    if it.ieof_n >= 2: return vint(0)
+    return vint(fed_lines(&it))
   if id == I.stderr:
     # strings as they are, other values as compact JSON, no newline
     var s = ""
@@ -2209,14 +2212,27 @@ fn read_value(var it: It) -> V:
     it.lc_end = off
     it.st.plinestart = off
     if it.seq and not it.raw_input: seq_prepare(&it)
+  if it.bom == 255 and not it.seq and not it.raw_input:
+    it.ierr = "Malformed BOM"
+    return sfail(&it, "Malformed BOM")
   if it.ierr != "":
     return sfail(&it, "break")
   if it.raw_input:
+    # a line: read on (file after file, as jq) until its newline or the end of the input
+    var scanned = 0
+    var e = it.ipos
+    while true:
+      e = it.ipos + scanned
+      while e < it.iend and it.st.b[e] != '\n': e += 1
+      if e < it.iend or not it.stdin_stream: break
+      scanned = e - it.ipos
+      if not more_input(&it):
+        e = it.iend
+        break
+    it.chunk = 65536
     if it.ipos >= it.iend:
       eof_seen(&it, it.ipos)
       return sfail(&it, "break")
-    var e = it.ipos
-    while e < it.iend and it.st.b[e] != '\n': e += 1
     let off = it.ipos
     var len = e - off
     it.ipos = e + 1
@@ -2229,6 +2245,9 @@ fn read_value(var it: It) -> V:
   var vline = 0
   var vcol = 0
   while true:
+    if it.bom == 255 and not it.seq:
+      it.ierr = "Malformed BOM"
+      return sfail(&it, "Malformed BOM")
     it.st.pp = it.ipos
     it.st.pend = it.iend
     it.st.perr = ""
@@ -2252,17 +2271,28 @@ fn read_value(var it: It) -> V:
     vs = it.st.pp
     vline = it.st.pline
     vcol = vs - it.st.plinestart
-    let blen0 = it.st.b.len
+    let ends0 = jv.ends(it.st)
     v = jv.parse_value(&it.st)
     let kd = kind(v)
     # what's buffered may end inside this value (or a number may go on): read more and retry
     let short = it.st.perr != "" or (it.st.pp >= it.iend and kd != K_ARR and kd != K_OBJ and kd != K_STR)
     # (strings this attempt decoded go: the value is parsed again)
-    if short and it.stdin_stream: it.st.b.truncate(blen0)
-    if short and more_input(&it):
-      it.st.pline = line0
-      it.st.plinestart = ls0
-      continue
+    if short and it.stdin_stream: jv.undo_to(&it.st, ends0)
+    if short and it.stdin_stream:
+      # read on without parsing again until the value can be complete (a scan finds where it
+      # ends), the part buffered has doubled, or the input ends: reading a big value stays linear
+      let rel = vs - it.ipos
+      let tried = it.iend - vs
+      var sc = [0, 0, 0, 0]
+      var got = false
+      while more_input(&it):
+        got = true
+        let vs2 = it.ipos + rel
+        if value_end_seen(it, vs2, &sc) or it.iend - vs2 >= 2 * tried: break
+      if got:
+        it.st.pline = line0
+        it.st.plinestart = ls0
+        continue
     break
   it.chunk = 65536
   if it.st.perr != "":
@@ -2288,6 +2318,57 @@ fn read_value(var it: It) -> V:
   it.ipos = it.st.pp
   while it.ifile + 1 < it.istarts.len and it.ipos > it.istarts[it.ifile + 1]: it.ifile += 1
   return v
+
+# Whether b[vs..iend) holds the end of the JSON text that starts at vs (a container closing, a
+# string's closing quote, a scalar's delimiter), scanning on from where sc (offset, depth, in a
+# string, after a backslash) left off.
+fn value_end_seen(it: It, vs: Int, var sc: [Int]) -> Bool:
+  let b = it.st.b
+  let e = it.iend
+  if vs >= e: return false
+  let c0 = b[vs]
+  var i = vs + sc[0]
+  var depth = sc[1]
+  var instr = sc[2] != 0
+  var esc = sc[3] != 0
+  var done = false
+  if c0 == '{' or c0 == '[' or c0 == '"':
+    if sc[0] == 0:
+      if c0 == '"': instr = true
+      else: depth = 1
+      i = vs + 1
+    while i < e:
+      let c = b[i]
+      i += 1
+      if instr:
+        if esc: esc = false
+        elif c == '\\': esc = true
+        elif c == '"':
+          instr = false
+          if depth == 0:
+            done = true
+            break
+      elif c == '"': instr = true
+      elif c == '{' or c == '[': depth += 1
+      elif c == '}' or c == ']':
+        depth -= 1
+        if depth <= 0:
+          done = true
+          break
+  else:
+    while i < e:
+      let c = b[i]
+      if not ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '.' or c == '+' or c == '-'):
+        done = true
+        break
+      i += 1
+  sc[0] = i - vs
+  sc[1] = depth
+  sc[2] = 0
+  if instr: sc[2] = 1
+  sc[3] = 0
+  if esc: sc[3] = 1
+  return done
 
 # The line number jq reports for the input read so far: it reads each file in pieces of a line
 # (at most 4095 bytes), counting the pieces that end a line, and has read the piece holding the
@@ -2612,7 +2693,10 @@ fn more_input(var it: It) -> Bool:
       it.stdin_started = false
     var chunk = ""
     if it.cur_src == 1:
-      chunk = it.os.read_stdin(it.chunk) else ""
+      # a pipe gives what has arrived (64 KB at most at a time): ask for a bounded piece
+      var n = it.chunk
+      if n > 1048576: n = 1048576
+      chunk = it.os.read_stdin(n) else ""
     else:
       var bad = [0]
       var n = it.chunk
@@ -2631,9 +2715,20 @@ fn more_input(var it: It) -> Bool:
       continue
     if it.chunk < 67108864: it.chunk *= 2
     var start = 0
-    if not it.stdin_started:
-      it.stdin_started = true
-      if chunk.len >= 3 and chunk[0] == 0xEF and chunk[1] == 0xBB and chunk[2] == 0xBF: start = 3
+    it.stdin_started = true
+    # jq's parser drops a byte order mark at the start of all its input (not of each file); a
+    # part of one is "Malformed BOM". Raw input has no parser: nothing is dropped.
+    while start < chunk.len and it.bom < 3 and not it.raw_input:
+      var want = 0xEF
+      if it.bom == 1: want = 0xBB
+      if it.bom == 2: want = 0xBF
+      if int(chunk[start]) == want:
+        start += 1
+        it.bom += 1
+      elif it.bom == 0:
+        it.bom = 3
+      else:
+        it.bom = 255
     it.st.b.reserve(chunk.len)
     for i in start..chunk.len: it.st.b.push(chunk[i])
     it.iend = it.st.b.len
