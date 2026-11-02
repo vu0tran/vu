@@ -22,3 +22,9 @@ bool gl_is_dir(const vu_str *path) {
   free(p);
   return r == 0 && S_ISDIR(st.st_mode);
 }
+
+// The online CPUs, where /proc/cpuinfo isn't there (macOS).
+int64_t gl_ncpu(void) {
+  long n = sysconf(_SC_NPROCESSORS_ONLN);
+  return n > 0 ? (int64_t)n : 1;
+}

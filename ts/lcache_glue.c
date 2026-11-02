@@ -1,6 +1,11 @@
 // vlint's result cache: a file's size, modification and change times (ns) and inode, and the clock.
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#define st_mtim st_mtimespec
+#define st_ctim st_ctimespec
+#endif
 
 bool vl_stat(const vu_str *path, int64_t *out, int64_t n) {
   if (n < 4) return false;
@@ -27,4 +32,10 @@ int64_t vl_now_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+// The online CPUs, where /proc/cpuinfo isn't there (macOS).
+int64_t vl_ncpu(void) {
+  long n = sysconf(_SC_NPROCESSORS_ONLN);
+  return n > 0 ? (int64_t)n : 1;
 }
