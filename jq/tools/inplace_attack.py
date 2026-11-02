@@ -10,9 +10,10 @@ N = int(sys.argv[3]) if len(sys.argv) > 3 else 500
 rnd = random.Random(int(sys.argv[4]) if len(sys.argv) > 4 else 1)
 
 def key():
-    return rnd.choice(['"a"', '"b"', '"k\\($i % 3)"', '"k\\($i % 60)"', '($i % 4 | tostring)', '"x"'])
+    return rnd.choice(['"a"', '"b"', '"k\\($i % 3)"', '"k\\($i % 60)"', '($i % 4 | tostring)', '"x"',
+                       '(length % 3 | tostring)', '(keys_unsorted[0] // "a")', '([$i] | tojson)'])
 def idx():
-    return rnd.choice(['0', '1', '$i', '($i % 3)', '($i % 70)', '-1', '($i + 2)', '5'])
+    return rnd.choice(['0', '1', '$i', '($i % 3)', '($i % 70)', '-1', '($i + 2)', '5', '(length % 4)', '([$i, 2] | min)'])
 def path(d=0):
     p = "."
     for _ in range(rnd.randint(0 if d else 1, 3)):
@@ -20,7 +21,7 @@ def path(d=0):
         else: p += "[" + idx() + "]"
     return p
 def val():
-    return rnd.choice(['$i', '[$i]', '{"v": $i}', '"s\\($i)"', 'null', '[$i, [$i]]', '$x', '$x[0]',
+    return rnd.choice(['($x | .[0])', '($i | [.] | .[0])', '$i', '[$i]', '{"v": $i}', '"s\\($i)"', 'null', '[$i, [$i]]', '$x', '$x[0]',
                        '[]', '{}', '($i * 2)', '{"k\\($i % 50)": $i}', '[range($i % 5)]'])
 def upd():
     if rnd.random() < 0.15:
@@ -33,7 +34,7 @@ def upd():
     op = rnd.choice(["=", "+=", "|=", "//=", "-=", "*="])
     if op == "|=":
         rhs = rnd.choice(['. + 1', '. + [$i]', '. + "z"', '$i', '[$i]', '. + {"q": $i}', '(. // 0) + 1',
-                          '. + $x', '-(. // 0)', '"\\(.)"', '[., .]', '{"w": .}'])
+                          '. + $x', '-(. // 0)', '"\\(.)"', '[., .]', '{"w": .}', '($i | [., .])', '($x | .[0])'])
     elif op in ("-=", "*="):
         rhs = rnd.choice(['1', '2', '[$i]', '{"q": 1}', '$x'])
     else:
