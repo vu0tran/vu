@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /* ---- math: one entry point per arity, op chosen by number (see run.vu's math table) */
 double vjq_m1(int64_t op, double x) {
@@ -300,9 +302,33 @@ vu_str vjq_re_names(void *p) {
     return acc;
 }
 
+/* standard error, written at once (vjq keeps standard output in its own buffer, flushed where
+   jq's stdio would have written it: see run.vu's flush_err) */
+static void vjq_write_fd(int fd, const uint8_t *p, int64_t n) {
+    while (n > 0) {
+        ssize_t k = write(fd, p, (size_t)n);
+        if (k < 0) { if (errno == EINTR) continue; return; }
+        p += k; n -= k;
+    }
+}
 void vjq_ewrite(const vu_str *s) {
-    fflush(stdout);
-    fwrite(s->data, 1, (size_t)s->len, stderr);
+    vjq_write_fd(2, s->data, s->len);
+}
+/* the first n bytes of b to standard output */
+void vjq_owrite(uint8_t *b, int64_t nb, int64_t n) {
+    if (n > nb) n = nb;
+    vjq_write_fd(1, b, n);
+}
+/* how glibc buffers standard output (jq 1.7.1's release binaries are linked with it): 0 for a
+   terminal (line buffered), else the buffer size (st_blksize when below BUFSIZ) */
+int64_t vjq_stdout_blk(void) {
+    struct stat st;
+    int64_t size = BUFSIZ;
+    if (fstat(1, &st) == 0) {
+        if (S_ISCHR(st.st_mode) && isatty(1)) return 0;
+        if (st.st_blksize > 0 && st.st_blksize < BUFSIZ) size = st.st_blksize;
+    }
+    return size;
 }
 
 #include <unistd.h>
