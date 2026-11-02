@@ -1741,7 +1741,19 @@ fn gen(var it: It, id: Int, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
     let rp_ = run.vp(&it, p, r, v)
     return run.emit(&it, k, r, rp_)
   if id == I.inputs:
+    # (see "compaction inside a run")
+    let can_gc = p == -1 and it.stdin_stream and not it.stream and not it.collect
+    let gm = jv.ends(it.st)
+    let u0 = store_units(it.st)
+    var live = 0
+    var factor = 3
     while true:
+      if can_gc:
+        let grown = store_units(it.st) - u0
+        if grown > it.gc_units and grown > factor * live:
+          live = gc_compact(&it, gm) - u0
+          # little garbage (the program keeps what it reads): compact less and less often
+          if live * 10 > grown * 6: factor *= 2
       let r = read_input(&it)
       if it.bad:
         it.bad = false
@@ -2732,7 +2744,7 @@ fn more_input(var it: It) -> Bool:
         it.bom = 3
       else:
         it.bom = 255
-    it.st.b.reserve(chunk.len)
+    if chunk.len > it.st.b.len: it.st.b.reserve(chunk.len)
     for i in start..chunk.len: it.st.b.push(chunk[i])
     it.iend = it.st.b.len
     if start < chunk.len: return true
@@ -2761,3 +2773,199 @@ fn compact_input(var it: It):
     if it.istarts[k] >= d: it.istarts[k] -= drop
     else: it.istarts[k] = base
   it.st.mb = it.iend
+
+# ---------------------------------------------------------------- compaction inside a run
+#
+# A program that reads its inputs itself (`-n` with `inputs`) is one run, and the store only
+# grows during a run. So `inputs` compacts it now and then: when the next input is to be read,
+# the previous one's work is over, and what can still be reached from what the program made since
+# `inputs` began is only in the interpreter's own stacks (continuation frames, variables, the
+# value stacks of arrays and objects being built, the path stacks...). Those values are copied
+# down to where the store stood when `inputs` began (sharing kept), everything else made since is
+# dropped, and the input not parsed yet moves after them. Native code that called `inputs`
+# holds only values made before it began, which don't move.
+
+type Gc:
+  m: [Int]          # jv.ends() when inputs began
+  fs: [Int]         # forwarding: new string id per string made since (-1: not reached)
+  fa: [Int]
+  fo: [Int]
+  nb: [Byte]        # the copied strings' bytes (they go at m[0])
+  pso: [Int]        # new strings: absolute offset, length and flags, interned
+  psl: [Int]
+  pint: [Bool]
+  pav: [V]          # new arrays' elements, offsets and lengths
+  pao: [Int]
+  pan: [Int]
+  pok: [Int]        # new objects' keys, values, offsets and lengths
+  pov: [V]
+  poo: [Int]
+  pon: [Int]
+
+fn store_units(st: St) -> Int:
+  return st.b.len + 16 * (st.av.len + st.ok.len + st.so.len + st.ao.len + st.oo.len)
+
+fn gc_str(var it: It, var g: Gc, id: Int) -> Int:
+  if id < g.m[1]: return id
+  let r = id - g.m[1]
+  if g.fs[r] >= 0: return g.fs[r]
+  let nid = g.m[1] + g.pso.len
+  g.fs[r] = nid
+  let off = it.st.so[id]
+  let n = it.st.sl[id] >> jv.SF_SHIFT
+  if off + n <= g.m[0]:
+    g.pso.push(off)
+  else:
+    g.pso.push(g.m[0] + g.nb.len)
+    for i in off..off + n: g.nb.push(it.st.b[i])
+  g.psl.push(it.st.sl[id])
+  g.pint.push(it.st.knext[id] != -2)
+  return nid
+
+fn gc_v(var it: It, var g: Gc, v: V) -> V:
+  let k = v.k & 15
+  let id = v.k >> 4
+  if k == jv.K_STR or k == jv.K_LIT:
+    if id < g.m[1]: return v
+    let nid = gc_str(&it, &g, id)
+    return V(k + (nid << 4), v.n)
+  if k == jv.K_ARR:
+    if id < g.m[3]: return v
+    let r = id - g.m[3]
+    if g.fa[r] >= 0: return varr(g.fa[r])
+    let nid = g.m[3] + g.pao.len
+    g.fa[r] = nid
+    let n = it.st.an[id]
+    let src = it.st.ao[id]
+    let at = g.pav.len
+    g.pao.push(g.m[2] + at)
+    g.pan.push(n)
+    for i in 0..n: g.pav.push(vnull())
+    for i in 0..n:
+      let x = it.st.av[src + i]
+      let y = gc_v(&it, &g, x)
+      g.pav[at + i] = y
+    return varr(nid)
+  if k == jv.K_OBJ:
+    if id < g.m[5]: return v
+    let r = id - g.m[5]
+    if g.fo[r] >= 0: return vobj(g.fo[r])
+    let nid = g.m[5] + g.poo.len
+    g.fo[r] = nid
+    let n = it.st.on[id]
+    let src = it.st.oo[id]
+    let at = g.pok.len
+    g.poo.push(g.m[4] + at)
+    g.pon.push(n)
+    for i in 0..n:
+      g.pok.push(0)
+      g.pov.push(vnull())
+    for i in 0..n:
+      let kid = it.st.ok[src + i]
+      let nk = gc_str(&it, &g, kid)
+      g.pok[at + i] = nk
+      let x = it.st.ov[src + i]
+      let y = gc_v(&it, &g, x)
+      g.pov[at + i] = y
+    return vobj(nid)
+  return v
+
+# Copies what the interpreter can still reach down to the marks m, drops the rest. Returns the
+# store's size after.
+fn gc_compact(var it: It, m: [Int]) -> Int:
+  fed_lines(&it)
+  var mc: [Int] = []
+  for x in m: mc.push(x)
+  var g = Gc(mc, [-1] * (it.st.so.len - m[1]), [-1] * (it.st.ao.len - m[3]), [-1] * (it.st.oo.len - m[5]), [], [], [], [], [], [], [], [], [], [], [])
+  # the roots
+  for i in 0..it.ks.len:
+    let _g1 = it.ks[i].v
+    let a = gc_v(&it, &g, _g1)
+    it.ks[i].v = a
+    let _g2 = it.ks[i].w
+    let b = gc_v(&it, &g, _g2)
+    it.ks[i].w = b
+    let _g3 = it.ks[i].u
+    let c = gc_v(&it, &g, _g3)
+    it.ks[i].u = c
+  for i in 0..it.fr.len:
+    let _g4 = it.fr[i].v
+    let a = gc_v(&it, &g, _g4)
+    it.fr[i].v = a
+  for i in 0..it.st.tv.len:
+    let _g5 = it.st.tv[i]
+    let a = gc_v(&it, &g, _g5)
+    it.st.tv[i] = a
+  for i in 0..it.st.tw.len:
+    let _g6 = it.st.tw[i]
+    let a = gc_v(&it, &g, _g6)
+    it.st.tw[i] = a
+  for i in 0..it.st.tk.len:
+    let _g7 = it.st.tk[i]
+    let a = gc_str(&it, &g, _g7)
+    it.st.tk[i] = a
+  for i in 0..it.pk.len:
+    let _g8 = it.pk[i]
+    let a = gc_v(&it, &g, _g8)
+    it.pk[i] = a
+  for i in 0..it.prv.len:
+    let _g9 = it.prv[i]
+    let a = gc_v(&it, &g, _g9)
+    it.prv[i] = a
+  for i in 0..it.argv.len:
+    let _g10 = it.argv[i]
+    let a = gc_v(&it, &g, _g10)
+    it.argv[i] = a
+  for i in 0..it.dels.len:
+    for j in 0..it.dels[i].len:
+      let _g11 = it.dels[i][j]
+      let a = gc_v(&it, &g, _g11)
+      it.dels[i][j] = a
+  let _g12 = it.err
+  let e0 = gc_v(&it, &g, _g12)
+  it.err = e0
+  let _g13 = it.last_output
+  let lo = gc_v(&it, &g, _g13)
+  it.last_output = lo
+  # the input not parsed yet
+  var tail: [Byte] = []
+  let old = it.ipos
+  for i in it.ipos..it.iend: tail.push(it.st.b[i])
+  # drop everything made since the marks
+  jv.undo_to(&it.st, m)
+  if it.aown.len > m[3]: it.aown.truncate(m[3])
+  if it.oown.len > m[5]: it.oown.truncate(m[5])
+  # the copies, at the ids the forwarding gave them
+  for x in g.nb: it.st.b.push(x)
+  for i in 0..g.pso.len:
+    let id = it.st.so.len
+    it.st.so.push(g.pso[i])
+    it.st.sl.push(g.psl[i])
+    it.st.knext.push(-2)
+    if g.pint[i]:
+      let h = jv.hash_span(it.st, g.pso[i], g.psl[i] >> jv.SF_SHIFT) & it.st.hmask
+      it.st.knext[id] = it.st.heads[h]
+      it.st.heads[h] = id
+      it.st.ilog.push(id)
+      it.st.nint += 1
+      if it.st.nint > it.st.heads.len * 2: jv.grow_heads(&it.st)
+  for x in g.pav: it.st.av.push(x)
+  for i in 0..g.pao.len:
+    it.st.ao.push(g.pao[i])
+    it.st.an.push(g.pan[i])
+  for x in g.pok: it.st.ok.push(x)
+  for x in g.pov: it.st.ov.push(x)
+  for i in 0..g.poo.len:
+    it.st.oo.push(g.poo[i])
+    it.st.on.push(g.pon[i])
+  # the unparsed input after them (positions in it move with it, as more_input does)
+  let shift = it.st.b.len - old
+  for x in tail: it.st.b.push(x)
+  it.st.plinestart += shift
+  if it.lc_end >= old: it.lc_end += shift
+  if it.ivend >= old: it.ivend += shift
+  for k in 0..it.istarts.len:
+    if it.istarts[k] >= old: it.istarts[k] += shift
+  it.ipos += shift
+  it.iend = it.st.b.len
+  return store_units(it.st)
