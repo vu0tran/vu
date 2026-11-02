@@ -11,6 +11,10 @@ from run import It, Kf, ST_OK, ST_ERR, ST_BREAK, ST_HALT, sfail, type_err, type_
 
 extern "glue.c":
   type Re drop vjq_re_free
+  type Fh drop vjq_fclose
+  fn vjq_fopen(ffi: Ffi, path: Str) -> Fh throws
+  fn vjq_fread(ffi: Ffi, f: Fh, n: Int, var bad: [Int]) -> Str
+  fn vjq_strerror(ffi: Ffi, e: Int) -> Str
   fn vjq_m1(ffi: Ffi, op: Int, x: Float) -> Float
   fn vjq_m2(ffi: Ffi, op: Int, x: Float, y: Float) -> Float
   fn vjq_m3(ffi: Ffi, op: Int, x: Float, y: Float, z: Float) -> Float
@@ -2096,6 +2100,11 @@ fn line_col(it: It, a: Int, i: Int) -> [Int]:
 # end; from then on error positions are "<unknown>". That is this read when the last line has no
 # newline and was read already (the last value ended in it), else the next one.
 fn eof_seen(var it: It, last_end: Int):
+  # positions name the last file jq tried to open
+  if it.ifiles.len > 0: it.ifile = it.ifiles.len - 1
+  if it.istarts.len == 0:
+    it.ieof_n += 1
+    return
   if it.ieof_n == 0:
     let s = it.istarts[0]
     var fls = s
@@ -2186,10 +2195,14 @@ fn read_input(var it: It) -> V:
     vs = it.st.pp
     vline = it.st.pline
     vcol = vs - it.st.plinestart
+    let blen0 = it.st.b.len
     v = jv.parse_value(&it.st)
     let kd = kind(v)
     # what's buffered may end inside this value (or a number may go on): read more and retry
-    if (it.st.perr != "" or (it.st.pp >= it.iend and kd != K_ARR and kd != K_OBJ and kd != K_STR)) and more_input(&it):
+    let short = it.st.perr != "" or (it.st.pp >= it.iend and kd != K_ARR and kd != K_OBJ and kd != K_STR)
+    # (strings this attempt decoded go: the value is parsed again)
+    if short and it.stdin_stream: it.st.b.truncate(blen0)
+    if short and more_input(&it):
       it.st.pline = line0
       it.st.plinestart = ls0
       continue
@@ -2220,6 +2233,7 @@ fn read_input(var it: It) -> V:
 # last byte its parser used.
 fn fed_lines(var it: It) -> Int:
   let c = it.ivend
+
   while it.lc_end < c:
     # the file the next piece is in
     var f = 0
@@ -2234,6 +2248,9 @@ fn fed_lines(var it: It) -> Int:
     if lim > fend: lim = fend
     var i = start
     while i < lim and it.st.b[i] != '\n': i += 1
+    if i == lim and lim == it.iend and lim < start + 4095 and f + 1 >= it.istarts.len and it.st.b.len == it.iend and more_input(&it):
+      # jq reads its piece of the line whole: the rest of it is still to come
+      continue
     if i < lim:
       it.lc_end = i + 1
       it.lc_lines += 1
@@ -2342,27 +2359,100 @@ fn passes_input(var it: It, id: Int) -> Bool:
   let I = it.nid
   return id == I.ltrimstr or id == I.rtrimstr or id == I.tostring or id == I.debug or id == I.stderr or id == I.format
 
-# Standard input is read as it arrives (so vjq can follow a stream): appends the next piece to
-# the buffer, doubling the piece size while one value keeps needing more. False at its end.
+# Input is read as it arrives, file after file (standard input for "-"), as jq reads it: appends
+# the next piece to the buffer, doubling the piece size while one value keeps needing more. A file
+# is opened when the input before it is used up, so its errors come where jq reports them. False
+# at the end of the last one.
 fn more_input(var it: It) -> Bool:
   if not it.stdin_stream or it.stdin_eof: return false
   if it.st.b.len != it.iend:
-    # strings made at run time follow the input: move the unparsed rest after them
+    # strings made at run time follow the input: move the unparsed rest after them (and the
+    # positions in it; lines are counted up to it first)
+    fed_lines(&it)
+    let old = it.ipos
     let shift = it.st.b.len - it.ipos
     for i in it.ipos..it.iend: it.st.b.push(it.st.b[i])
     it.st.plinestart += shift
+    if it.lc_end >= old: it.lc_end += shift
+    if it.ivend >= old: it.ivend += shift
+    for k in 0..it.istarts.len:
+      if it.istarts[k] >= old: it.istarts[k] += shift
     it.ipos += shift
     it.iend = it.st.b.len
-  let chunk = it.os.read_stdin(it.chunk) else ""
-  if chunk.len == 0:
-    it.stdin_eof = true
-    return false
-  if it.chunk < 67108864: it.chunk *= 2
-  var start = 0
-  if not it.stdin_started:
-    it.stdin_started = true
-    if chunk.len >= 3 and chunk[0] == 0xEF and chunk[1] == 0xBB and chunk[2] == 0xBF: start = 3
-  it.st.b.reserve(chunk.len)
-  for i in start..chunk.len: it.st.b.push(chunk[i])
-  it.iend = it.st.b.len
-  return true
+  while true:
+    if it.cur_src == 0:
+      if it.src_i >= it.srcs.len:
+        it.stdin_eof = true
+        return false
+      let name = it.srcs[it.src_i] + ""
+      it.src_i += 1
+      if it.src_err != 0:
+        run.flush_out(&it)
+        eprint("jq: error: " + vjq_strerror(it.ffi, it.src_err))
+        it.src_err = 0
+      if name == "-":
+        it.cur_src = 1
+      else:
+        match vjq_fopen(it.ffi, name):
+          ok(f):
+            it.fhs.push(f)
+            it.cur_src = 2
+          err(e):
+            run.flush_out(&it)
+            eprint("jq: error: Could not open file " + name + ": " + e)
+            it.ifail += 1
+            it.ifiles.push(name)
+            it.istarts.push(it.iend)
+            continue
+      if name == "-": it.ifiles.push("<stdin>")
+      else: it.ifiles.push(name)
+      it.istarts.push(it.iend)
+      it.stdin_started = false
+    var chunk = ""
+    if it.cur_src == 1:
+      chunk = it.os.read_stdin(it.chunk) else ""
+    else:
+      var bad = [0]
+      chunk = vjq_fread(it.ffi, it.fhs[0], it.chunk, &bad)
+      if bad[0] != 0:
+        it.ifail += 1
+        it.src_err = bad[0]
+    if chunk.len == 0:
+      # this file is done: on to the next one
+      if it.cur_src == 2: it.fhs.truncate(0)
+      it.cur_src = 0
+      continue
+    if it.chunk < 67108864: it.chunk *= 2
+    var start = 0
+    if not it.stdin_started:
+      it.stdin_started = true
+      if chunk.len >= 3 and chunk[0] == 0xEF and chunk[1] == 0xBB and chunk[2] == 0xBF: start = 3
+    it.st.b.reserve(chunk.len)
+    for i in start..chunk.len: it.st.b.push(chunk[i])
+    it.iend = it.st.b.len
+    if start < chunk.len: return true
+  return false
+
+# After an input is done (the store reset): drops the input already read, so memory stays the
+# size of what is in use, not of all the input. Positions into the buffer move down with it.
+fn compact_input(var it: It):
+  if not it.stdin_stream or it.istarts.len == 0: return
+  let base = it.istarts[0]
+  fed_lines(&it)
+  var d = it.ipos
+  if it.lc_end < d: d = it.lc_end
+  let drop = d - base
+  if drop < 1048576 or 2 * drop < it.iend - base: return
+  if it.st.b.len != it.iend: return
+  let n = it.iend - d
+  it.st.b.copy_within(base, d, n)
+  it.st.b.truncate(base + n)
+  it.ipos -= drop
+  it.iend -= drop
+  it.ivend -= drop
+  it.lc_end -= drop
+  it.st.plinestart -= drop
+  for k in 0..it.istarts.len:
+    if it.istarts[k] >= d: it.istarts[k] -= drop
+    else: it.istarts[k] = base
+  it.st.mb = it.iend

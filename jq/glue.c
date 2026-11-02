@@ -7,6 +7,8 @@
 #include <math.h>
 #include <time.h>
 #include <string.h>
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
 
@@ -305,3 +307,39 @@ void vjq_ewrite(const vu_str *s) {
 
 #include <unistd.h>
 bool vjq_isatty(int64_t fd) { return isatty((int)fd) != 0; }
+
+/* Input files, read in pieces as jq reads them (so input needn't be held whole). */
+void vjq_fclose(void *p) {
+    if (p) fclose((FILE *)p);
+}
+
+bool vjq_fopen(const vu_str *path, void **out, vu_str *err) {
+    char *z = vu_cstr(path);
+    FILE *f = z ? fopen(z, "r") : NULL;
+    int e = errno;
+    free(z);
+    if (!f) {
+        const char *m = strerror(e);
+        *err = vu_str_from(m, (int64_t)strlen(m));
+        return false;
+    }
+    *out = f;
+    return true;
+}
+
+/* up to n bytes; "" at the end. A read error (a directory...) is "" too, with bad[0] set to
+   the errno. */
+vu_str vjq_strerror(int64_t e) {
+    const char *m = strerror((int)e);
+    return vu_str_from(m, (int64_t)strlen(m));
+}
+
+vu_str vjq_fread(void *p, int64_t n, int64_t *bad, int64_t nb) {
+    FILE *f = p;
+    char *buf = malloc(n > 0 ? (size_t)n : 1);
+    size_t got = fread(buf, 1, (size_t)n, f);
+    if (nb > 0) bad[0] = (got == 0 && ferror(f)) ? errno : 0;
+    vu_str r = vu_str_from(buf, (int64_t)got);
+    free(buf);
+    return r;
+}
