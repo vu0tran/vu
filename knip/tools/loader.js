@@ -3,9 +3,11 @@ import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
-const [outFile, reqFile] = process.argv.slice(1);
+const [outFile, reqFile, rootArg] = process.argv.slice(1);
 const reqs = JSON.parse(fs.readFileSync(reqFile, 'utf8'));
 const cwd = process.cwd();
+// absolute paths inside the project come back project-relative, as "/x" (vknip's convention)
+const absRoot = path.resolve(cwd, rootArg || '.');
 let jiti = null;
 // jiti as knip has it: the project's, else the one next to its knip, else any in node_modules/.pnpm
 const findJiti = () => {
@@ -37,7 +39,8 @@ const load = async file => {
 };
 const enc = (v, depth, seen) => {
   if (v === undefined || typeof v === 'symbol') return undefined;
-  if (v === null || typeof v === 'string' || typeof v === 'boolean') return v;
+  if (typeof v === 'string') return v === absRoot ? '/' : v.startsWith(absRoot + '/') ? v.slice(absRoot.length) : v;
+  if (v === null || typeof v === 'boolean') return v;
   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
   if (typeof v === 'bigint') return String(v);
   if (typeof v === 'function') return { '__vknip_fn': v.name || '' };
@@ -88,8 +91,12 @@ const viteConfigs = async local => {
   return configs;
 };
 const out = {};
+// the globals plugins define before loading their configs (setup)
+const setups = { nuxt: 'defineNuxtConfig', nitro: 'defineNitroConfig' };
 for (const r of reqs) {
   try {
+    const g = setups[r.mode];
+    if (g && !(g in globalThis)) Object.defineProperty(globalThis, g, { value: id => id, writable: true, configurable: true });
     let v = await settle(await load(r.file), 0);
     if (r.mode === 'vite') v = await viteConfigs(v);
     if (r.mode === 'call') {
