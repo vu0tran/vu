@@ -210,6 +210,35 @@ instead of hash maps for node-keyed data and a name-chained scope table; the sou
 parser rather than copied; and an 8-bytes-at-a-time scan for irregular whitespace. Together these
 cut instructions by 24% and CPU time by about 25%.
 
+### Cold runs, later (2026-11-01)
+
+A second round cut instructions by 25% (callgrind, zod, one C file: 678.4M -> 508.0M;
+vscode/src/vs/editor/common 393.9M -> 305.3M), output byte-identical throughout:
+
+- The scope walk is gone: the parser records scopes, declarations and references as it reads
+  (`ast.Sev`, "scope events" in `parse.vu`), and `scope.vu` replays them (-7%). The rules' walk is
+  the only walk over the tree; it dispatches on a per-kind table and skips absent children (-10%).
+- Index checks: hot loops on a local index bounded by the string's own length, entries and events
+  as lists of structs, a node read once per visit (-4%). Of the checks left, removing all of them
+  (in a copy of the C, to measure) would save 8%: they index lists by values read from other lists
+  (node, symbol and slot ids), which only a language feature could prove in range.
+- Scanner: literal values as source ranges instead of copies, names of up to 7 bytes interned as
+  one word, one-character punctuators by table (-8%); no-dupe-keys by name id (-2%).
+
+CPU, best of 9 interleaved runs on the same loaded 2-core VM (load average 4 to 9); oxlint is
+started through node (`node -e 0` alone takes 0.04 s):
+
+| | lc/ts, 1 thread | lc/ts, all cores | vscode/src, 1 thread | vscode/src, all cores |
+|---|---|---|---|---|
+| vlint before | 0.49 | 0.50 | 6.39 | 6.70 |
+| vlint now | 0.37 | 0.40 | 5.19 | 5.23 |
+| oxlint 1.90.0 | 0.55 | 0.62 | 6.23 | 6.74 |
+
+Measured but not done: a node list with 32-bit fields would need an integer type Vu doesn't have
+(node writes cause 0.7M of zod's 3.9M first-level cache misses: at most 1 to 2% of CPU); building
+without gcc's default stack protector (`-fno-stack-protector`, a Vu compiler flag) saves 5% of the
+instructions.
+
 ## `--fix`
 
 `vlint --fix` rewrites each file exactly as `oxlint --fix` does and prints the diagnostics that are

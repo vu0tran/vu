@@ -28,6 +28,20 @@ type Parser:
   jsx: Bool         # '<' in an expression starts JSX (not a type assertion)
   decos: [Int]      # decorator expressions (kept in the linter's mode)
   pool: [[Int]]     # item lists to reuse (take_list, lst_put)
+  # the linter's mode records scope events (ast.Sev) as it goes: see "scope events" below
+  ds: Int           # the scope declarations go to (and new scopes' parent)
+  rs: Int           # the scope references are looked up from
+  sfn: Int          # the function (or file, namespace) scope around, where var goes
+  loops: Int        # loops around, in the current function
+  wexpr: Int        # the assignment whose right side this is (its position), else -1
+  amb: Int          # inside declare ... (a class, a namespace, a declare module "x")
+  gaug: Int         # inside declare global { }
+  modstr: Int       # inside declare module "x" { }
+  mode: Int         # MODE_* (0: everything recorded)
+  pfn: Int          # parameters being read belong to: a function node, or PFN_TYPE, PFN_INDEX
+  vkind: Int        # the declarators being read: 0 var, 1 let, 2 const, 3 using
+  vmods: Int        # ... and their statement's modifiers
+  ta_ev0: Int       # the references recorded before the last type arguments in an expression
 
 # A saved scanner position, for looking ahead.
 type Save:
@@ -38,6 +52,8 @@ type Save:
   nl: Bool
   tval: Str
   tvs: Bool
+  vs: Int
+  ve: Int
   bad: Str
   bad_at: Int
   ndiags: Int
@@ -46,7 +62,9 @@ type Save:
 fn save(p: Parser) -> Save:
   var tv = ""
   if not p.sc.tvs: tv = p.sc.tval + ""
-  return Save(p.sc.i, p.sc.tok, p.sc.ts, p.sc.te, p.sc.nl, tv, p.sc.tvs, p.sc.bad + "", p.sc.bad_at, p.diags.len, p.sc.pe)
+  var bd = ""
+  if p.sc.bad.len > 0: bd = p.sc.bad + ""
+  return Save(p.sc.i, p.sc.tok, p.sc.ts, p.sc.te, p.sc.nl, tv, p.sc.tvs, p.sc.vs, p.sc.ve, bd, p.sc.bad_at, p.diags.len, p.sc.pe)
 
 # (restore_copy leaves s as it was, for restoring it again)
 fn restore_copy(var p: Parser, s: Save):
@@ -57,6 +75,8 @@ fn restore_copy(var p: Parser, s: Save):
   p.sc.nl = s.nl
   p.sc.tval = s.tval + ""
   p.sc.tvs = s.tvs
+  p.sc.vs = s.vs
+  p.sc.ve = s.ve
   p.sc.bad = s.bad + ""
   p.sc.bad_at = s.bad_at
   p.sc.pe = s.pe
@@ -71,6 +91,8 @@ fn restore(var p: Parser, var s: Save):
   p.sc.nl = s.nl
   swap(&p.sc.tval, &s.tval)
   p.sc.tvs = s.tvs
+  p.sc.vs = s.vs
+  p.sc.ve = s.ve
   swap(&p.sc.bad, &s.bad)
   p.sc.bad_at = s.bad_at
   p.sc.pe = s.pe
@@ -178,11 +200,28 @@ fn name_id(var p: Parser, s: Str) -> Int:
 # The current token's text, interned.
 fn tok_name(var p: Parser) -> Int:
   if p.sc.tvs:
-    var src = ""
-    swap(&src, &p.sc.src)
-    let id = ast.intern_at(&p.t, src, p.sc.ts, p.sc.te)
-    swap(&src, &p.sc.src)
-    return id
+    # a short name: found by its word (ast.short_key), made into a string only when it's new
+    let a = p.sc.vs
+    let len = p.sc.ve - a
+    if len <= 7 and a + 8 <= p.sc.n:
+      let w = (p.sc.src.read_le(a, 8) & ((1 << (len * 8)) - 1)) | (len << 56)
+      let found = ast.find_key(p.t, w)
+      if found >= 0: return found
+      let s = p.sc.src[a..p.sc.ve]
+      return ast.add_key(&p.t, s, w)
+    return tok_name_range(&p)
+  return tok_name_val(&p)
+
+# tok_name for a name in the source of 8 bytes or more (or at its very end).
+fn tok_name_range(var p: Parser) -> Int:
+  var src = ""
+  swap(&src, &p.sc.src)
+  let id = ast.intern_at(&p.t, src, p.sc.vs, p.sc.ve)
+  swap(&src, &p.sc.src)
+  return id
+
+# tok_name for a value that isn't in the source (a string with escapes...).
+fn tok_name_val(var p: Parser) -> Int:
   # (the text moved out and back rather than copied)
   var v = ""
   swap(&v, &p.sc.tval)
@@ -208,6 +247,204 @@ fn semi(var p: Parser):
   if p.sc.tok == T_RBRACE or p.sc.tok == T_EOF or p.sc.nl: return
   err(&p, p.sc.ts, 1005, "';' expected.")
 
+# ---- scope events (the linter's mode)
+#
+# The parser records what scope.vu needs as it reads the file: scopes as they open, declarations as
+# they're met, and references (each in the scope it's looked up from), in the order a walk over the
+# finished tree would meet them. scope.vu replays the declarations, then the references. An
+# identifier's reference is recorded when the identifier is read as an expression; when it turns out
+# to be written (an assignment's target, a for-of's left side) or counted otherwise, its event is
+# changed in place: the event's index waits in the identifier's c field (and an assignment's or an
+# update's in its own c, an assignment's right side's end in d) until the replay puts back -1.
+# Rolling the tree back (ast.reset) drops the events recorded after the mark. In vtsc's mode
+# (not exact) nothing is recorded.
+
+const MODE_MUTE = 1     # nothing recorded (a parameter's name and default in a signature in a type)
+const MODE_NOREFS = 2   # declarations and scopes but no references (an index signature's parameter)
+const MODE_NODECL = 3   # references only, all from the current scope (variable types, decorators)
+const PFN_TYPE = -1     # parameters of a signature in a type (nothing bound)
+const PFN_INDEX = -2    # parameters of an index signature
+
+# The mode for a part read in mode want inside mode cur.
+fn mode_with(cur: Int, want: Int) -> Int:
+  if cur == 0: return want
+  if cur == want or want == 0: return cur
+  return MODE_MUTE
+
+# The scopes around, saved while a scope is open (sv_close puts them back).
+type Sc:
+  ds: Int
+  rs: Int
+  sfn: Int
+
+fn sv_open(var p: Parser, kind: Int) -> Sc:
+  let old = Sc(p.ds, p.rs, p.sfn)
+  if not p.exact or p.mode == MODE_MUTE or p.mode == MODE_NODECL: return old
+  let id = p.t.sv.nscopes
+  p.t.sv.nscopes = id + 1
+  p.t.sv.d.push(ast.Ev(ast.D_SCOPE, -1, p.ds, kind))
+  if kind == ast.S_FUNC or kind == ast.S_FILE or kind == ast.S_NS or kind == ast.S_GLOBAL_AUG or kind == ast.S_MODSTR: p.sfn = id
+  p.ds = id
+  p.rs = id
+  return old
+
+fn sv_close(var p: Parser, old: Sc):
+  p.ds = old.ds
+  p.rs = old.rs
+  p.sfn = old.sfn
+
+# The context bits for a declaration here.
+fn sv_ctx(p: Parser) -> Int:
+  var x = 0
+  if p.amb > 0: x = ast.C_AMB
+  if p.gaug > 0: x = x | ast.C_GAUG
+  if p.modstr > 0: x = x | ast.C_MODSTR
+  return x
+
+fn sv_decl(var p: Parser, k: Int, n: Int, s: Int, x: Int):
+  if not p.exact or p.mode == MODE_MUTE or p.mode == MODE_NODECL: return
+  p.t.sv.d.push(ast.Ev(k, n, s, x))
+
+# A reference from identifier (or shorthand property) n.
+fn sv_ref(var p: Parser, n: Int, flags: Int):
+  if not p.exact or p.mode == MODE_MUTE or p.mode == MODE_NOREFS: return
+  p.t.nd[n].c = p.t.sv.q.len
+  p.t.sv.q.push(ast.Ev(flags, n, p.rs, -1))
+
+# Another event; its index (-1 if none is recorded).
+fn sv_ev(var p: Parser, k: Int, n: Int, x: Int) -> Int:
+  if not p.exact or p.mode == MODE_MUTE or p.mode == MODE_NOREFS: return -1
+  let i = p.t.sv.q.len
+  p.t.sv.q.push(ast.Ev(k, n, p.rs, x))
+  return i
+
+fn sv_unparen(p: Parser, n: Int) -> Int:
+  var x = n
+  while x > 0 and p.t.nd[x].k == ast.N_PAREN: x = p.t.nd[x].a
+  return x
+
+# An entity name's leftmost identifier, referenced (with R_QUAL too in a type when it's qualified).
+fn sv_entity(var p: Parser, n: Int, ty: Bool):
+  if not p.exact or n <= 0: return
+  var x = n
+  var qualified = false
+  while p.t.nd[x].k == ast.N_QNAME:
+    x = p.t.nd[x].a
+    qualified = true
+  if p.t.nd[x].k != ast.N_ID: return
+  if ty and qualified: sv_ref(&p, x, ast.R_TYPE | ast.R_QUAL)
+  elif ty: sv_ref(&p, x, ast.R_TYPE)
+  else: sv_ref(&p, x, ast.R_READ)
+
+# An assignment's target: its names become writes (we: the assignment's position, for the write).
+fn sv_target(var p: Parser, n: Int, we: Int):
+  if n <= 0: return
+  let kd = p.t.nd[n].k
+  if kd == ast.N_ID or kd == ast.N_SHORTHAND:
+    let i = p.t.nd[n].c
+    if i >= 0:
+      p.t.sv.q[i].k = ast.R_WRITE
+      p.t.sv.q[i].x = we
+  elif kd == ast.N_PAREN or kd == ast.N_AS or kd == ast.N_SATISFIES or kd == ast.N_NONNULL or kd == ast.N_TYPEASSERT:
+    sv_target(&p, p.t.nd[n].a, we)
+  elif kd == ast.N_ARRAY or kd == ast.N_OBJECT:
+    let lst = p.t.nd[n].a
+    for i in 0..ast.count(p.t, lst):
+      let e = ast.item(p.t, lst, i)
+      let ke = p.t.nd[e].k
+      if kd == ast.N_ARRAY or ke == ast.N_SHORTHAND: sv_target(&p, e, we)
+      elif ke == ast.N_PROPASSIGN: sv_target(&p, p.t.nd[e].b, we)
+      elif ke == ast.N_SPREAD: sv_target(&p, p.t.nd[e].a, we)
+  elif kd == ast.N_SPREAD:
+    sv_target(&p, p.t.nd[n].a, we)
+  elif kd == ast.N_BINARY and p.t.nd[n].f == T_ASSIGN:
+    # a default in a pattern: its name is written (not an assignment of its own)
+    let qa = p.t.nd[n].c
+    if qa >= 0:
+      let ul = sv_unparen(p, p.t.nd[n].a)
+      p.t.sv.q[qa].k = ast.R_WRITE
+      p.t.sv.q[qa].n = ul
+      p.t.nd[ul].c = qa
+      p.t.sv.q[p.t.nd[n].d].k = ast.Q_DEAD
+      p.t.nd[n].c = -1
+      p.t.nd[n].d = -1
+    sv_target(&p, p.t.nd[n].a, we)
+
+# The left side of an assignment just read (node id, operator op, at pos): a name's reference becomes
+# the assignment's event; a pattern's names become writes.
+fn sv_assign(var p: Parser, id: Int, left: Int, op: Int, pos: Int):
+  let ul = sv_unparen(p, left)
+  if p.t.nd[ul].k == ast.N_ID:
+    let i = p.t.nd[ul].c
+    if i >= 0:
+      p.t.sv.q[i].k = ast.Q_ASSIGN
+      p.t.sv.q[i].n = id
+      p.t.sv.q[i].x = p.loops * 2
+      p.t.nd[ul].c = -1
+      p.t.nd[id].c = i
+  elif op == T_ASSIGN: sv_target(&p, left, pos)
+
+# ++x / x-- (node id, operand x).
+fn sv_update(var p: Parser, id: Int, x0: Int):
+  let x = sv_unparen(p, x0)
+  if p.t.nd[x].k != ast.N_ID: return
+  let i = p.t.nd[x].c
+  if i < 0: return
+  p.t.sv.q[i].k = ast.Q_UPDATE
+  p.t.sv.q[i].n = id
+  p.t.sv.q[i].x = p.loops * 2
+  p.t.nd[x].c = -1
+  p.t.nd[id].c = i
+
+# An expression whose value is unused (a statement's): its assignments and updates are marked so.
+fn sv_unused(var p: Parser, e: Int):
+  if e <= 0: return
+  let kd = p.t.nd[e].k
+  if kd == ast.N_BINARY:
+    let op = p.t.nd[e].f
+    if is_assign_op(op):
+      let i = p.t.nd[e].c
+      if i >= 0: p.t.sv.q[i].x = p.t.sv.q[i].x | 1
+      return
+    if op == T_COMMA:
+      sv_unused(&p, p.t.nd[e].a)
+      sv_unused(&p, p.t.nd[e].b)
+    return
+  if kd == ast.N_PREFIX or kd == ast.N_POSTFIX:
+    if p.t.nd[e].f == scan.T_INC or p.t.nd[e].f == scan.T_DEC:
+      let i = p.t.nd[e].c
+      if i >= 0: p.t.sv.q[i].x = p.t.sv.q[i].x | 1
+    return
+  if kd == ast.N_PAREN: sv_unused(&p, p.t.nd[e].a)
+
+# export default x / export = x: the name's reference becomes that event.
+fn sv_expdef(var p: Parser, a: Int):
+  let e = sv_unparen(p, a)
+  if e <= 0 or p.t.nd[e].k != ast.N_ID: return
+  let i = p.t.nd[e].c
+  if i < 0: return
+  p.t.sv.q[i].k = ast.Q_EXPDEF
+  p.t.sv.q[i].x = 0
+  p.t.nd[e].c = -1
+
+# A JSX element's name: a reference unless it's an intrinsic element (div, my-element, svg:rect).
+fn sv_jsx_name(var p: Parser, nm: Int):
+  if nm <= 0: return
+  let kd = p.t.nd[nm].k
+  if kd == ast.N_ID:
+    let s0 = p.t.names[p.t.nd[nm].s]
+    if s0.len > 0 and not (s0[0] >= 'a' and s0[0] <= 'z') and s0.find("-") < 0 and s0.find(":") < 0: sv_ref(&p, nm, ast.R_READ)
+  elif kd == ast.N_PROPACCESS:
+    var x = nm
+    while p.t.nd[x].k == ast.N_PROPACCESS: x = p.t.nd[x].a
+    if p.t.nd[x].k == ast.N_ID: sv_ref(&p, x, ast.R_READ)
+
+# Drops the events recorded since (dl, ql) (a part of the tree that's thrown away).
+fn sv_drop(var p: Parser, dl: Int, ql: Int, nsc: Int):
+  if not p.exact: return
+  ast.sev_reset(&p.t.sv, dl, ql)
+  p.t.sv.nscopes = nsc
+
 # ---- the file
 
 fn parse_file(var t: ast.Ast, own src: Str, file: Int, var kw: {Str: Int}) -> [Diag]:
@@ -225,9 +462,11 @@ fn parse_file_v(var t: ast.Ast, var src: Str, file: Int, var kw: {Str: Int}, exa
   swap(&km, &kw)
   var s0 = ""
   swap(&s0, &src)
-  var p = Parser(scan.scanner(s0, km), ast.blank(), file, [], 0, false, false, false, exact, jsx, [], [])
+  var p = Parser(scan.scanner(s0, km), ast.blank(), file, [], 0, false, false, false, exact, jsx, [], [], -1, -1, -1, 0, -1, 0, 0, 0, 0, PFN_TYPE, 0, 0, 0)
   p.sc.strict_ids = exact
   swap(&p.t, &t)
+  # the file's scope (0)
+  sv_open(&p, ast.S_FILE)
   next(&p)
   var stmts = take_list(&p)
   while p.sc.tok != T_EOF:
@@ -265,14 +504,20 @@ fn parse_file_v(var t: ast.Ast, var src: Str, file: Int, var kw: {Str: Int}, exa
 fn body(var p: Parser, gen: Bool) -> Int:
   let was = p.gen
   p.gen = gen
-  let b = block(&p)
+  let b = block_s(&p, false)
   p.gen = was
   return b
 
 fn block(var p: Parser) -> Int:
+  return block_s(&p, true)
+
+# A block; own: it opens a scope (a function's body and a catch block use the one opened for them).
+fn block_s(var p: Parser, own: Bool) -> Int:
   let pos = p.sc.ts
   let id = n(&p, ast.N_BLOCK, pos)
   expect(&p, T_LBRACE)
+  var sc0 = Sc(p.ds, p.rs, p.sfn)
+  if own and p.exact: sc0 = sv_open(&p, ast.S_BLOCK)
   var stmts = take_list(&p)
   while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
     let before = p.sc.ts
@@ -281,6 +526,7 @@ fn block(var p: Parser) -> Int:
       err(&p, p.sc.ts, 1128, "Declaration or statement expected.")
       next(&p)
   p.t.nd[id].a = lst_put(&p, stmts, pos)
+  if p.exact: sv_close(&p, sc0)
   expect(&p, T_RBRACE)
   return fin(&p, id)
 
@@ -328,9 +574,25 @@ fn next_on_same_line_is_decl(var p: Parser) -> Bool:
   return ok
 
 fn decorators(var p: Parser):
+  if p.sc.tok == T_AT: decorator_list(&p)
+
+fn decorator_list(var p: Parser):
   while p.sc.tok == T_AT:
     next(&p)
+    # (their references are looked up in the file's scope; nothing in them is declared)
+    let m = p.mode
+    let rs = p.rs
+    let lp = p.loops
+    let we = p.wexpr
+    p.mode = mode_with(m, MODE_NODECL)
+    p.rs = 0
+    p.loops = 0
+    p.wexpr = -1
     let d = lhs(&p)
+    p.mode = m
+    p.rs = rs
+    p.loops = lp
+    p.wexpr = we
     if p.exact: p.decos.push(d)
 
 fn statement(var p: Parser) -> Int:
@@ -377,20 +639,24 @@ fn statement(var p: Parser) -> Int:
   if k == scan.W_WHILE:
     next(&p)
     let id = n(&p, ast.N_WHILE, pos)
+    p.loops += 1
     expect(&p, T_LPAREN)
     p.t.nd[id].a = expression(&p)
     expect(&p, T_RPAREN)
     p.t.nd[id].b = statement(&p)
+    p.loops -= 1
     return fin(&p, id)
   if k == scan.W_DO:
     next(&p)
     let id = n(&p, ast.N_DO, pos)
+    p.loops += 1
     p.t.nd[id].a = statement(&p)
     expect(&p, scan.W_WHILE)
     expect(&p, T_LPAREN)
     p.t.nd[id].b = expression(&p)
     expect(&p, T_RPAREN)
     eat(&p, T_SEMI)
+    p.loops -= 1
     return fin(&p, id)
   if k == scan.W_FOR: return for_stmt(&p)
   if k == scan.W_BREAK or k == scan.W_CONTINUE:
@@ -415,13 +681,21 @@ fn statement(var p: Parser) -> Int:
     p.t.nd[id].a = block(&p)
     if p.sc.tok == scan.W_CATCH:
       next(&p)
+      # the catch block's scope holds the binding too
+      let cs0 = sv_open(&p, ast.S_BLOCK)
       if eat(&p, T_LPAREN):
         let d = n(&p, ast.N_DECL, p.sc.ts)
         p.t.nd[d].a = binding_name(&p)
-        if eat(&p, T_COLON): p.t.nd[d].b = type_(&p)
+        sv_decl(&p, ast.D_CATCH, d, p.ds, 0)
+        if eat(&p, T_COLON):
+          let m = p.mode
+          p.mode = mode_with(m, MODE_NODECL)
+          p.t.nd[d].b = type_(&p)
+          p.mode = m
         expect(&p, T_RPAREN)
         p.t.nd[id].b = fin(&p, d)
-      p.t.nd[id].c = block(&p)
+      p.t.nd[id].c = block_s(&p, false)
+      sv_close(&p, cs0)
     if eat(&p, scan.W_FINALLY): p.t.nd[id].d = block(&p)
     return fin(&p, id)
   if k == scan.W_SWITCH:
@@ -431,6 +705,7 @@ fn statement(var p: Parser) -> Int:
     p.t.nd[id].a = expression(&p)
     expect(&p, T_RPAREN)
     expect(&p, T_LBRACE)
+    let ss0 = sv_open(&p, ast.S_BLOCK)
     var cases = take_list(&p)
     while p.sc.tok == scan.W_CASE or p.sc.tok == scan.W_DEFAULT:
       let cpos = p.sc.ts
@@ -446,6 +721,7 @@ fn statement(var p: Parser) -> Int:
       p.t.nd[c].b = lst_put(&p, body, cpos)
       cases.push(fin(&p, c))
     p.t.nd[id].b = lst_put(&p, cases, pos)
+    sv_close(&p, ss0)
     expect(&p, T_RBRACE)
     return fin(&p, id)
   if k == scan.W_DEBUGGER:
@@ -471,6 +747,7 @@ fn statement(var p: Parser) -> Int:
     return fin(&p, id)
   let id = n(&p, ast.N_EXPRSTMT, pos)
   p.t.nd[id].a = expression(&p)
+  if p.exact: sv_unused(&p, p.t.nd[id].a)
   semi(&p)
   return fin(&p, id)
 
@@ -510,6 +787,7 @@ fn declaration(var p: Parser, mods: Int, pos: Int) -> Int:
   if (mods & ast.M_DEFAULT) != 0:
     let id = n(&p, ast.N_EXPORTDEFAULT, pos)
     p.t.nd[id].a = assignment(&p)
+    if p.exact: sv_expdef(&p, p.t.nd[id].a)
     semi(&p)
     return fin(&p, id)
   err(&p, p.sc.ts, 1128, "Declaration or statement expected.")
@@ -523,6 +801,7 @@ fn export_stmt(var p: Parser) -> Int:
     next(&p)
     let id = n(&p, ast.N_EXPORTASSIGN, pos)
     p.t.nd[id].a = expression(&p)
+    if p.exact: sv_expdef(&p, p.t.nd[id].a)
     semi(&p)
     return fin(&p, id)
   if p.sc.tok == scan.W_AS:
@@ -549,6 +828,9 @@ fn export_stmt(var p: Parser) -> Int:
       p.t.nd[id].b = specifiers(&p)
     if eat(&p, scan.W_FROM):
       p.t.nd[id].a = string_lit(&p)
+    elif p.exact:
+      let sp = p.t.nd[id].b
+      for i in 0..ast.count(p.t, sp): sv_ev(&p, ast.Q_EXPSPEC, ast.item(p.t, sp, i), 0)
     attributes(&p)
     semi(&p)
     return fin(&p, id)
@@ -588,7 +870,12 @@ fn attributes(var p: Parser):
   # with { type: "json" }
   if (p.sc.tok == scan.W_WITH or (p.sc.tok == T_IDENT and scan.text(p.sc) == "assert")) and not p.sc.nl:
     next(&p)
+    # (thrown away: nothing in it is recorded)
+    let dl = p.t.sv.d.len
+    let ql = p.t.sv.q.len
+    let nsc = p.t.sv.nscopes
     object_literal(&p)
+    sv_drop(&p, dl, ql, nsc)
 
 fn specifiers(var p: Parser) -> Int:
   let pos = p.sc.ts
@@ -623,6 +910,7 @@ fn import_stmt(var p: Parser) -> Int:
   if is_ident(p.sc.tok) and next_is(&p, T_ASSIGN):
     let id = n(&p, ast.N_IMPORTEQ, pos)
     p.t.nd[id].s = tok_name(&p)
+    sv_decl(&p, ast.D_IMPORTEQ, id, p.ds, 0)
     next(&p)
     next(&p)
     if p.sc.tok == scan.W_REQUIRE and next_is(&p, T_LPAREN):
@@ -634,6 +922,7 @@ fn import_stmt(var p: Parser) -> Int:
       p.t.nd[id].a = r
     else:
       p.t.nd[id].a = entity_name(&p)
+      sv_entity(&p, p.t.nd[id].a, false)
     semi(&p)
     return fin(&p, id)
   let id = n(&p, ast.N_IMPORT, pos)
@@ -653,6 +942,7 @@ fn import_stmt(var p: Parser) -> Int:
     p.t.nd[id].d = specifiers(&p)
   expect(&p, scan.W_FROM)
   p.t.nd[id].a = string_lit(&p)
+  sv_decl(&p, ast.D_IMPORT, id, p.ds, 0)
   attributes(&p)
   semi(&p)
   return fin(&p, id)
@@ -666,6 +956,8 @@ fn var_stmt(var p: Parser, mods: Int) -> Int:
   elif k == scan.W_USING: p.t.nd[id].f = 3
   next(&p)
   p.t.nd[id].d = mods
+  p.vkind = p.t.nd[id].f
+  p.vmods = mods
   p.t.nd[id].a = declarators(&p)
   semi(&p)
   return fin(&p, id)
@@ -673,14 +965,49 @@ fn var_stmt(var p: Parser, mods: Int) -> Int:
 fn declarators(var p: Parser) -> Int:
   let pos = p.sc.ts
   var ds = take_list(&p)
+  let vk = p.vkind
+  let vm = p.vmods
   while true:
     let d = n(&p, ast.N_DECL, p.sc.ts)
-    p.t.nd[d].a = binding_name(&p)
+    if not p.exact:
+      p.t.nd[d].a = binding_name(&p)
+    else:
+      # (functions in a var pattern's defaults are in the scope the names go to)
+      let ds0 = p.ds
+      if vk == 0: p.ds = p.sfn
+      let tg = binding_name(&p)
+      p.ds = ds0
+      p.t.nd[d].a = tg
+      var vx = vk
+      if (vm & ast.M_EXPORT) != 0: vx = vx | ast.V_EXPORT
+      if (vm & ast.M_DECLARE) != 0 or p.amb > 0: vx = vx | ast.V_AMB
+      if p.gaug > 0: vx = vx | ast.V_GAUG
+      sv_decl(&p, ast.D_VAR, d, p.ds, vx)
+      if p.t.nd[tg].k == ast.N_ID: sv_ev(&p, ast.Q_SETLOOP, tg, p.loops)
     if p.sc.tok == T_BANG:
       next(&p)
       p.t.nd[d].f = ast.M_EXCL
-    if eat(&p, T_COLON): p.t.nd[d].b = type_(&p)
-    if eat(&p, T_ASSIGN): p.t.nd[d].c = assignment(&p)
+    if eat(&p, T_COLON):
+      # (a variable's type is looked up from here, with nothing in it declared)
+      let m = p.mode
+      p.mode = mode_with(m, MODE_NODECL)
+      p.t.nd[d].b = type_(&p)
+      p.mode = m
+    if eat(&p, T_ASSIGN):
+      # a function or class initializer: references to the variable inside are its own (an event
+      # before the initializer's, filled in after)
+      let tg = p.t.nd[d].a
+      var ph = -1
+      if p.exact and p.t.nd[tg].k == ast.N_ID: ph = sv_ev(&p, ast.Q_DEAD, -1, 0)
+      let init = assignment(&p)
+      p.t.nd[d].c = init
+      if ph >= 0:
+        let ui = sv_unparen(p, init)
+        let ki = p.t.nd[ui].k
+        if ki == ast.N_FUNCEXPR or ki == ast.N_ARROW or ki == ast.N_CLASSEXPR:
+          p.t.sv.q[ph].k = ast.Q_VARFN
+          p.t.sv.q[ph].n = tg
+          p.t.sv.q[ph].s = ui
     ds.push(fin(&p, d))
     if not eat(&p, T_COMMA): break
   return lst_put(&p, ds, pos)
@@ -741,6 +1068,12 @@ fn for_stmt(var p: Parser) -> Int:
   expect(&p, T_LPAREN)
   var init = -1
   p.no_in = true
+  # (the loop's scope holds its header and body)
+  p.loops += 1
+  let fs0 = sv_open(&p, ast.S_BLOCK)
+  let dl0 = p.t.sv.d.len
+  let ql0 = p.t.sv.q.len
+  var decl = false
   if p.sc.tok == T_SEMI:
     init = -1
   elif p.sc.tok == scan.W_VAR or p.sc.tok == scan.W_CONST or (p.sc.tok == scan.W_LET and let_starts_decl(&p)) or (p.sc.tok == scan.W_USING and next_is_ident_same_line(&p)):
@@ -751,8 +1084,12 @@ fn for_stmt(var p: Parser) -> Int:
     elif k == scan.W_CONST: p.t.nd[v].f = 2
     elif k == scan.W_USING: p.t.nd[v].f = 3
     next(&p)
+    p.vkind = p.t.nd[v].f
+    # (a for header's declaration has no modifiers field: -1, every bit, as scope.vu has always read it)
+    p.vmods = p.t.nd[v].d
     p.t.nd[v].a = declarators(&p)
     init = fin(&p, v)
+    decl = true
   else:
     init = expression(&p)
   p.no_in = false
@@ -763,10 +1100,17 @@ fn for_stmt(var p: Parser) -> Int:
       if await_: p.t.nd[id].f = 2
     next(&p)
     p.t.nd[id].a = init
+    if p.exact:
+      if decl: sv_forin_decls(&p, init, dl0, ql0)
+      else: sv_target(&p, init, p.wexpr)
     if p.t.nd[id].f >= 1: p.t.nd[id].b = assignment(&p)
     else: p.t.nd[id].b = expression(&p)
     expect(&p, T_RPAREN)
     p.t.nd[id].c = statement(&p)
+    # for (x in o) return ...: x counts as used
+    if p.exact and sv_body_returns(p, p.t.nd[id].c): sv_ev(&p, ast.Q_LOOPVAR, init, 0)
+    sv_close(&p, fs0)
+    p.loops -= 1
     return fin(&p, id)
   let id = n(&p, ast.N_FOR, pos)
   p.t.nd[id].a = init
@@ -776,7 +1120,32 @@ fn for_stmt(var p: Parser) -> Int:
   if p.sc.tok != T_RPAREN: p.t.nd[id].c = expression(&p)
   expect(&p, T_RPAREN)
   p.t.nd[id].d = statement(&p)
+  sv_close(&p, fs0)
+  p.loops -= 1
   return fin(&p, id)
+
+# A for-in/of's declarations (recorded as a plain declaration's from dl0, ql0): bound by the loop,
+# without the variables' other events.
+fn sv_forin_decls(var p: Parser, v: Int, dl0: Int, ql0: Int):
+  let lst = p.t.nd[v].a
+  let cnt = ast.count(p.t, lst)
+  for i in dl0..p.t.sv.d.len:
+    if p.t.sv.d[i].k == ast.D_VAR:
+      for j in 0..cnt:
+        if ast.item(p.t, lst, j) == p.t.sv.d[i].n: p.t.sv.d[i].x = p.t.sv.d[i].x | ast.V_FORIN
+  for i in ql0..p.t.sv.q.len:
+    let k = p.t.sv.q[i].k
+    if k == ast.Q_SETLOOP or k == ast.Q_VARFN:
+      for j in 0..cnt:
+        if p.t.nd[ast.item(p.t, lst, j)].a == p.t.sv.q[i].n: p.t.sv.q[i].k = ast.Q_DEAD
+
+fn sv_body_returns(p: Parser, body: Int) -> Bool:
+  var x = body
+  if x > 0 and p.t.nd[x].k == ast.N_BLOCK:
+    let l = p.t.nd[x].a
+    if ast.count(p.t, l) == 0: return false
+    x = ast.item(p.t, l, 0)
+  return x > 0 and p.t.nd[x].k == ast.N_RETURN
 
 fn function_decl(var p: Parser, mods: Int, pos: Int) -> Int:
   expect(&p, scan.W_FUNCTION)
@@ -787,13 +1156,44 @@ fn function_decl(var p: Parser, mods: Int, pos: Int) -> Int:
   if is_ident(p.sc.tok) or p.sc.tok == scan.W_YIELD or p.sc.tok == scan.W_AWAIT:
     p.t.npos[id] = p.sc.ts
     p.t.nd[id].s = tok_name(&p)
+    sv_decl(&p, ast.D_FUNC, id, p.ds, sv_ctx(p))
     next(&p)
   elif (mods & ast.M_DEFAULT) == 0:
     err(&p, p.sc.ts, 1003, "Identifier expected.")
+  let fs = sv_fn_open(&p, id)
   signature_into(&p, id, T_COLON)
   if p.sc.tok == T_LBRACE: p.t.nd[id].d = body(&p, (f & ast.M_GENERATOR) != 0)
   else: semi(&p)
+  sv_fn_close(&p, fs)
   return fin(&p, id)
+
+# A function's scope (node id): its parameters are bound in it, and loops outside don't count.
+type Fsc:
+  sc: Sc
+  loops: Int
+  pfn: Int
+
+fn sv_fn_open(var p: Parser, id: Int) -> Fsc:
+  let f = Fsc(sv_open(&p, ast.S_FUNC), p.loops, p.pfn)
+  p.loops = 0
+  p.pfn = id
+  return f
+
+fn sv_fn_close(var p: Parser, f: Fsc):
+  sv_close(&p, f.sc)
+  p.loops = f.loops
+  p.pfn = f.pfn
+
+# A signature in a type (a function type, a call or construct signature): its own scope, and its
+# parameters bind nothing (only their types are looked at).
+fn type_signature(var p: Parser, ret_tok: Int) -> Int:
+  let s0 = sv_open(&p, ast.S_TYPE)
+  let pf = p.pfn
+  p.pfn = PFN_TYPE
+  let r = signature(&p, ret_tok)
+  p.pfn = pf
+  sv_close(&p, s0)
+  return r
 
 # Type parameters, parameters and return type into a, b, c of node id.
 fn signature_into(var p: Parser, id: Int, ret_tok: Int):
@@ -832,16 +1232,32 @@ fn param(var p: Parser) -> Int:
     else: f = f | ast.M_OVERRIDE
     next(&p)
   if eat(&p, T_DOTS): f = f | ast.M_REST
+  # (what's recorded for the name and default: the parameters of a signature in a type bind
+  # nothing and have nothing looked up; an index signature's have only their declarations)
+  let m = p.mode
+  var m2 = m
+  if p.exact:
+    if p.pfn == PFN_TYPE: m2 = mode_with(m, MODE_MUTE)
+    elif p.pfn == PFN_INDEX: m2 = mode_with(m, MODE_NOREFS)
   if p.sc.tok == scan.W_THIS:
     let tid = n(&p, ast.N_ID, p.sc.ts)
     p.t.nd[tid].s = name_id(&p, "this")
     next(&p)
     p.t.nd[id].a = tid
+    # (a this parameter's default is looked up with nothing declared)
+    if p.exact and p.pfn >= 0: m2 = mode_with(m, MODE_NODECL)
   else:
+    if p.exact and p.pfn >= 0: sv_decl(&p, ast.D_PARAM0, -1, p.ds, 0)
+    p.mode = m2
     p.t.nd[id].a = binding_name(&p)
+    p.mode = m
+    if p.exact and p.pfn >= 0: sv_decl(&p, ast.D_PARAM, id, p.ds, p.pfn * 8 + sv_ctx(p))
   if eat(&p, T_Q): f = f | ast.M_OPTIONAL
   if eat(&p, T_COLON): p.t.nd[id].b = type_(&p)
-  if eat(&p, T_ASSIGN): p.t.nd[id].c = assignment(&p)
+  if eat(&p, T_ASSIGN):
+    p.mode = m2
+    p.t.nd[id].c = assignment(&p)
+    p.mode = m
   p.t.nd[id].f = f
   return fin(&p, id)
 
@@ -868,6 +1284,7 @@ fn type_params(var p: Parser) -> Int:
       next(&p)
     p.t.nd[id].f = f
     p.t.nd[id].s = tok_name(&p)
+    sv_decl(&p, ast.D_TPARAM, id, p.ds, sv_ctx(p))
     if is_name(p.sc.tok): next(&p)
     else: err(&p, p.sc.ts, 1003, "Identifier expected.")
     if eat(&p, scan.W_EXTENDS): p.t.nd[id].a = type_(&p)
@@ -895,35 +1312,63 @@ fn class_decl(var p: Parser, mods: Int, pos: Int, is_expr: Bool) -> Int:
     p.t.npos[id] = p.sc.ts
     p.t.nd[id].s = tok_name(&p)
     next(&p)
+  # the class's scope (a declaration's name is outside, an expression's inside)
+  let ods = p.ds
+  let ors = p.rs
+  if not is_expr and p.t.nd[id].s > 0: sv_decl(&p, ast.D_CLASS, id, p.ds, sv_ctx(p))
+  let cs0 = sv_open(&p, ast.S_CLASS)
+  let cs = p.rs
+  if is_expr and p.t.nd[id].s > 0: sv_decl(&p, ast.D_CLASSNAME, id, p.ds, 0)
+  let amb0 = p.amb
+  if (mods & ast.M_DECLARE) != 0: p.amb += 1
   if p.sc.tok == T_LT: p.t.nd[id].a = type_params(&p)
   while p.sc.tok == scan.W_EXTENDS or p.sc.tok == scan.W_IMPLEMENTS:
     if eat(&p, scan.W_EXTENDS):
-      p.t.nd[id].b = heritage(&p, false)
+      # (the base is outside the class; its type arguments are declared outside, looked up inside)
+      let cds = p.ds
+      p.ds = ods
+      p.rs = ors
+      p.t.nd[id].b = heritage(&p, false, cs)
+      p.ds = cds
+      p.rs = cs
     else:
       next(&p)
       let hpos = p.sc.ts
       var hs = take_list(&p)
       while true:
-        hs.push(heritage(&p, true))
+        hs.push(heritage(&p, true, -1))
         if not eat(&p, T_COMMA): break
       p.t.nd[id].c = lst_put(&p, hs, hpos)
   p.t.nd[id].d = class_members(&p)
+  p.amb = amb0
+  sv_close(&p, cs0)
   return fin(&p, id)
 
 # A class's extends expression or an implements / interface extends type: name with type arguments.
-fn heritage(var p: Parser, is_type: Bool) -> Int:
+# (cs: for a class's extends, the class's scope, where its type arguments are looked up from)
+fn heritage(var p: Parser, is_type: Bool, cs: Int) -> Int:
   let id = n(&p, ast.N_EXPRTARGS, p.sc.ts)
-  if is_type: p.t.nd[id].a = entity_name(&p)
+  if is_type:
+    p.t.nd[id].a = entity_name(&p)
+    sv_entity(&p, p.t.nd[id].a, true)
   else:
+    p.ta_ev0 = -1
     let e = lhs(&p)
     # a trailing instantiation (Base<T> parsed as an expression with type arguments) is the clause's
     if p.t.nd[e].k == ast.N_EXPRTARGS:
       p.t.nd[id].a = p.t.nd[e].a
       p.t.nd[id].b = p.t.nd[e].b
+      if p.exact and p.ta_ev0 >= 0:
+        for i in p.ta_ev0..p.t.sv.q.len:
+          if p.t.sv.q[i].s == p.rs: p.t.sv.q[i].s = cs
       return fin(&p, id)
     p.t.nd[id].a = e
   scan.rescan_lt(&p.sc)
-  if p.sc.tok == T_LT: p.t.nd[id].b = type_args(&p)
+  if p.sc.tok == T_LT:
+    let rs0 = p.rs
+    if not is_type: p.rs = cs
+    p.t.nd[id].b = type_args(&p)
+    p.rs = rs0
   return fin(&p, id)
 
 fn class_members(var p: Parser) -> Int:
@@ -993,13 +1438,17 @@ fn member(var p: Parser, in_class: Bool) -> Int:
   # call and construct signatures
   if not in_class and (p.sc.tok == T_LPAREN or p.sc.tok == T_LT):
     let id = n(&p, ast.N_CALLSIG, pos)
-    p.t.nd[id].b = signature(&p, T_COLON)
+    let s0 = sv_open(&p, ast.S_TYPE)
+    p.t.nd[id].b = type_signature(&p, T_COLON)
+    sv_close(&p, s0)
     member_end(&p)
     return fin(&p, id)
   if not in_class and p.sc.tok == scan.W_NEW and (next_is(&p, T_LPAREN) or next_is(&p, T_LT)):
     next(&p)
     let id = n(&p, ast.N_CTORSIG, pos)
-    p.t.nd[id].b = signature(&p, T_COLON)
+    let s0 = sv_open(&p, ast.S_TYPE)
+    p.t.nd[id].b = type_signature(&p, T_COLON)
+    sv_close(&p, s0)
     member_end(&p)
     return fin(&p, id)
   # an index signature [k: T]: U
@@ -1008,9 +1457,12 @@ fn member(var p: Parser, in_class: Bool) -> Int:
     let id = n(&p, ast.N_INDEXSIG, pos)
     p.t.nd[id].f = mods
     var ps = take_list(&p)
+    let pf = p.pfn
+    p.pfn = PFN_INDEX
     while p.sc.tok != T_RBRACK and p.sc.tok != T_EOF:
       ps.push(param(&p))
       if not eat(&p, T_COMMA): break
+    p.pfn = pf
     p.t.nd[id].a = lst_put(&p, ps, pos)
     expect(&p, T_RBRACK)
     if eat(&p, T_COLON): p.t.nd[id].b = type_(&p)
@@ -1024,17 +1476,21 @@ fn member(var p: Parser, in_class: Bool) -> Int:
     let id = n(&p, kind, pos)
     p.t.nd[id].f = mods
     p.t.nd[id].a = property_name(&p)
+    let fs = sv_fn_open(&p, id)
     p.t.nd[id].b = signature(&p, T_COLON)
     if p.sc.tok == T_LBRACE: p.t.nd[id].c = body(&p, false)
     else: member_end(&p)
+    sv_fn_close(&p, fs)
     return fin(&p, id)
   if in_class and p.sc.tok == scan.W_CONSTRUCTOR and (next_is(&p, T_LPAREN) or next_is(&p, T_LT)):
     next(&p)
     let id = n(&p, ast.N_CTOR, pos)
     p.t.nd[id].f = mods
+    let fs = sv_fn_open(&p, id)
     p.t.nd[id].b = signature(&p, T_COLON)
     if p.sc.tok == T_LBRACE: p.t.nd[id].c = body(&p, false)
     else: member_end(&p)
+    sv_fn_close(&p, fs)
     return fin(&p, id)
   var f = mods
   if in_class and eat(&p, T_STAR): f = f | ast.M_GENERATOR
@@ -1047,9 +1503,11 @@ fn member(var p: Parser, in_class: Bool) -> Int:
     let id = n(&p, ast.N_METHOD, pos)
     p.t.nd[id].f = f
     p.t.nd[id].a = name
+    let fs = sv_fn_open(&p, id)
     p.t.nd[id].b = signature(&p, T_COLON)
     if in_class and p.sc.tok == T_LBRACE: p.t.nd[id].c = body(&p, (f & ast.M_GENERATOR) != 0)
     else: member_end(&p)
+    sv_fn_close(&p, fs)
     return fin(&p, id)
   let id = n(&p, ast.N_PROP, pos)
   p.t.nd[id].f = f
@@ -1127,6 +1585,9 @@ fn interface_decl(var p: Parser, mods: Int, pos: Int) -> Int:
   p.t.nd[id].d = mods
   if is_name(p.sc.tok): p.t.npos[id] = p.sc.ts
   p.t.nd[id].s = tok_name(&p)
+  sv_decl(&p, ast.D_IFACE, id, p.ds, sv_ctx(p))
+  sv_ev(&p, ast.Q_IFACE, id, 0)
+  let ts0 = sv_open(&p, ast.S_TYPE)
   if is_name(p.sc.tok): next(&p)
   else: err(&p, p.sc.ts, 1003, "Identifier expected.")
   if p.sc.tok == T_LT: p.t.nd[id].a = type_params(&p)
@@ -1134,10 +1595,11 @@ fn interface_decl(var p: Parser, mods: Int, pos: Int) -> Int:
     let hpos = p.sc.ts
     var hs = take_list(&p)
     while true:
-      hs.push(heritage(&p, true))
+      hs.push(heritage(&p, true, -1))
       if not eat(&p, T_COMMA): break
     p.t.nd[id].b = lst_put(&p, hs, hpos)
   p.t.nd[id].c = type_members(&p)
+  sv_close(&p, ts0)
   return fin(&p, id)
 
 fn type_members(var p: Parser) -> Int:
@@ -1161,10 +1623,13 @@ fn type_alias(var p: Parser, mods: Int, pos: Int) -> Int:
   p.t.nd[id].d = mods
   if is_name(p.sc.tok): p.t.npos[id] = p.sc.ts
   p.t.nd[id].s = tok_name(&p)
+  sv_decl(&p, ast.D_IFACE, id, p.ds, sv_ctx(p))
+  let ts0 = sv_open(&p, ast.S_TYPE)
   if is_name(p.sc.tok): next(&p)
   if p.sc.tok == T_LT: p.t.nd[id].a = type_params(&p)
   expect(&p, T_ASSIGN)
   p.t.nd[id].b = type_(&p)
+  sv_close(&p, ts0)
   semi(&p)
   return fin(&p, id)
 
@@ -1174,6 +1639,8 @@ fn enum_decl(var p: Parser, mods: Int, pos: Int) -> Int:
   p.t.nd[id].f = mods
   if is_name(p.sc.tok): p.t.npos[id] = p.sc.ts
   p.t.nd[id].s = tok_name(&p)
+  sv_decl(&p, ast.D_ENUM, id, p.ds, sv_ctx(p))
+  let es0 = sv_open(&p, ast.S_ENUM)
   if is_name(p.sc.tok): next(&p)
   let lpos = p.sc.ts
   expect(&p, T_LBRACE)
@@ -1181,28 +1648,44 @@ fn enum_decl(var p: Parser, mods: Int, pos: Int) -> Int:
   while p.sc.tok != T_RBRACE and p.sc.tok != T_EOF:
     let m = n(&p, ast.N_ENUMMEMBER, p.sc.ts)
     p.t.nd[m].a = property_name(&p)
+    sv_decl(&p, ast.D_MEMBER, m, p.ds, 0)
     if eat(&p, T_ASSIGN): p.t.nd[m].b = assignment(&p)
     ms.push(fin(&p, m))
     if not eat(&p, T_COMMA): break
   expect(&p, T_RBRACE)
+  sv_close(&p, es0)
   p.t.nd[id].a = lst_put(&p, ms, lpos)
   return fin(&p, id)
 
 fn module_decl(var p: Parser, mods: Int, pos: Int) -> Int:
   let id = n(&p, ast.N_MODULE, pos)
   var f = mods
+  let amb0 = p.amb
+  let gaug0 = p.gaug
+  let modstr0 = p.modstr
+  if (mods & ast.M_DECLARE) != 0: p.amb += 1
+  var kind = ast.S_NS
   if p.sc.tok == scan.W_GLOBAL:
     f = f | ast.MOD_GLOBAL
     let gid = n(&p, ast.N_ID, p.sc.ts)
     p.t.nd[gid].s = name_id(&p, "global")
     next(&p)
     p.t.nd[id].a = gid
+    p.gaug += 1
+    kind = ast.S_GLOBAL_AUG
   else:
     if p.sc.tok == scan.W_NAMESPACE: f = f | ast.MOD_NAMESPACE
     next(&p)
-    if p.sc.tok == T_STR: p.t.nd[id].a = string_lit(&p)
-    else: p.t.nd[id].a = entity_name(&p)
+    if p.sc.tok == T_STR:
+      p.t.nd[id].a = string_lit(&p)
+      p.amb += 1
+      p.modstr += 1
+      kind = ast.S_MODSTR
+    else:
+      p.t.nd[id].a = entity_name(&p)
+      sv_decl(&p, ast.D_NAMESPACE, id, p.ds, sv_ctx(p))
   p.t.nd[id].f = f
+  let ms0 = sv_open(&p, kind)
   if p.sc.tok == T_LBRACE:
     let bpos = p.sc.ts
     next(&p)
@@ -1217,6 +1700,10 @@ fn module_decl(var p: Parser, mods: Int, pos: Int) -> Int:
     p.t.nd[id].b = lst_put(&p, stmts, bpos)
   else:
     semi(&p)
+  sv_close(&p, ms0)
+  p.amb = amb0
+  p.gaug = gaug0
+  p.modstr = modstr0
   return fin(&p, id)
 
 fn entity_name(var p: Parser) -> Int:
@@ -1259,14 +1746,18 @@ fn return_type_inner(var p: Parser) -> Int:
     let id = n(&p, ast.N_TPRED, pos)
     p.t.nd[id].f = 1
     if p.sc.tok == scan.W_THIS: p.t.nd[id].s = -1
-    else: p.t.nd[id].s = tok_name(&p)
+    else:
+      p.t.nd[id].s = tok_name(&p)
+      if p.t.nd[id].s > 0: sv_ev(&p, ast.Q_TPRED, id, 0)
     next(&p)
     if eat(&p, scan.W_IS): p.t.nd[id].a = type_(&p)
     return fin(&p, id)
   if (is_ident(p.sc.tok) or p.sc.tok == scan.W_THIS) and next_is(&p, scan.W_IS):
     let id = n(&p, ast.N_TPRED, pos)
     if p.sc.tok == scan.W_THIS: p.t.nd[id].s = -1
-    else: p.t.nd[id].s = tok_name(&p)
+    else:
+      p.t.nd[id].s = tok_name(&p)
+      if p.t.nd[id].s > 0: sv_ev(&p, ast.Q_TPRED, id, 0)
     next(&p)
     next(&p)
     p.t.nd[id].a = type_(&p)
@@ -1301,6 +1792,8 @@ fn type_inner(var p: Parser) -> Int:
     next(&p)
     let id = n(&p, ast.N_TCOND, pos)
     p.t.nd[id].a = t
+    # (the extends clause and the true branch have a scope, for infer's names)
+    let ts0 = sv_open(&p, ast.S_TYPE)
     let was = p.no_cond
     p.no_cond = true
     p.t.nd[id].b = type_inner(&p)
@@ -1309,6 +1802,7 @@ fn type_inner(var p: Parser) -> Int:
     let was2 = p.no_cond
     p.no_cond = false
     p.t.nd[id].c = type_inner(&p)
+    sv_close(&p, ts0)
     expect(&p, T_COLON)
     p.t.nd[id].d = type_inner(&p)
     p.no_cond = was2
@@ -1320,7 +1814,9 @@ fn function_type(var p: Parser, kind: Int) -> Int:
   p.t.nd[id].f = kind
   let was = p.no_cond
   p.no_cond = false
-  p.t.nd[id].b = signature(&p, T_ARROW)
+  let s0 = sv_open(&p, ast.S_TYPE)
+  p.t.nd[id].b = type_signature(&p, T_ARROW)
+  sv_close(&p, s0)
   p.no_cond = was
   return fin(&p, id)
 
@@ -1420,6 +1916,7 @@ fn operator_type(var p: Parser) -> Int:
     let id = n(&p, ast.N_TINFER, pos)
     let tp = n(&p, ast.N_TPARAM, p.sc.ts)
     p.t.nd[tp].s = tok_name(&p)
+    sv_decl(&p, ast.D_TPARAM_K, tp, p.ds, 0)
     if is_name(p.sc.tok): next(&p)
     # infer X extends C (only where it can't be a conditional type's extends)
     if p.sc.tok == scan.W_EXTENDS:
@@ -1531,6 +2028,7 @@ fn primary_type(var p: Parser) -> Int:
     if p.sc.tok == scan.W_IMPORT: return import_type(&p, true, pos)
     let id = n(&p, ast.N_TQUERY, pos)
     p.t.nd[id].a = typeof_name(&p)
+    sv_entity(&p, p.t.nd[id].a, false)
     if p.sc.tok == T_LT and not p.sc.nl: p.t.nd[id].b = type_args(&p)
     return fin(&p, id)
   if k == scan.W_IMPORT: return import_type(&p, false, pos)
@@ -1542,6 +2040,7 @@ fn primary_type(var p: Parser) -> Int:
   if is_name(k) and k != scan.W_FUNCTION:
     let id = n(&p, ast.N_TREF, pos)
     p.t.nd[id].a = entity_name(&p)
+    sv_entity(&p, p.t.nd[id].a, true)
     if (p.sc.tok == T_LT or p.sc.tok == scan.T_SHL) and not p.sc.nl: p.t.nd[id].b = type_args(&p)
     return fin(&p, id)
   err(&p, pos, 1110, "Type expected.")
@@ -1576,7 +2075,13 @@ fn import_type(var p: Parser, is_typeof: Bool, pos: Int) -> Int:
   if is_typeof: p.t.nd[id].f = 1
   expect(&p, T_LPAREN)
   p.t.nd[id].a = string_lit(&p)
-  if eat(&p, T_COMMA): object_literal(&p)
+  if eat(&p, T_COMMA):
+    # (thrown away: nothing in it is recorded)
+    let dl = p.t.sv.d.len
+    let ql = p.t.sv.q.len
+    let nsc = p.t.sv.nscopes
+    object_literal(&p)
+    sv_drop(&p, dl, ql, nsc)
   expect(&p, T_RPAREN)
   if eat(&p, T_DOT): p.t.nd[id].b = entity_name(&p)
   if p.sc.tok == T_LT and not p.sc.nl: p.t.nd[id].c = type_args(&p)
@@ -1651,8 +2156,10 @@ fn mapped_type(var p: Parser) -> Int:
     else: f = f | ast.MAP_READONLY
   elif eat(&p, scan.W_READONLY): f = f | ast.MAP_READONLY
   expect(&p, T_LBRACK)
+  let ts0 = sv_open(&p, ast.S_TYPE)
   let tp = n(&p, ast.N_TPARAM, p.sc.ts)
   p.t.nd[tp].s = tok_name(&p)
+  sv_decl(&p, ast.D_TPARAM_K, tp, p.ds, 0)
   next(&p)
   expect(&p, scan.W_IN)
   p.t.nd[tp].a = type_(&p)
@@ -1667,6 +2174,7 @@ fn mapped_type(var p: Parser) -> Int:
     else: f = f | ast.MAP_OPTIONAL
   elif eat(&p, T_Q): f = f | ast.MAP_OPTIONAL
   if eat(&p, T_COLON): p.t.nd[id].c = type_(&p)
+  sv_close(&p, ts0)
   eat(&p, T_SEMI)
   eat(&p, T_COMMA)
   expect(&p, T_RBRACE)
@@ -1731,9 +2239,8 @@ fn is_assign_op(k: Int) -> Bool:
 # Whether the current token is a whole expression: the next character (after spaces and line breaks)
 # ends it (, ) ; ] }), so no operator, call, member, arrow or assignment can follow.
 fn leaf_follows(p: Parser) -> Bool:
-  var j = p.sc.te
+  let j = scan.space_end(p.sc.src, p.sc.te)
   let n0 = p.sc.n
-  while j < n0 and (p.sc.src[j] == ' ' or p.sc.src[j] == '\n' or p.sc.src[j] == '\t' or p.sc.src[j] == '\r'): j += 1
   if j >= n0: return false
   let c = p.sc.src[j]
   return c == ',' or c == ')' or c == ';' or c == ']' or c == '}'
@@ -1747,6 +2254,7 @@ fn assignment(var p: Parser) -> Int:
     if k0 == T_IDENT:
       let id = n(&p, ast.N_ID, pos)
       p.t.nd[id].s = tok_name(&p)
+      sv_ref(&p, id, ast.R_READ)
       next(&p)
       return id
     return primary(&p)
@@ -1762,9 +2270,20 @@ fn assignment(var p: Parser) -> Int:
     let id = n(&p, ast.N_BINARY, pos)
     p.t.nd[id].f = op
     p.t.nd[id].a = left
-    p.t.nd[id].b = assignment(&p)
+    if p.exact: assignment_right(&p, id, left, op, pos)
+    else: p.t.nd[id].b = assignment(&p)
     return fin(&p, id)
   return left
+
+# An assignment's right side, with its events (the linter's mode).
+fn assignment_right(var p: Parser, id: Int, left: Int, op: Int, pos: Int):
+  sv_assign(&p, id, left, op, pos)
+  let we = p.wexpr
+  p.wexpr = pos
+  let right = assignment(&p)
+  p.wexpr = we
+  p.t.nd[id].b = right
+  if p.t.nd[id].c >= 0: p.t.nd[id].d = sv_ev(&p, ast.Q_ASSIGN_END, right, 0)
 
 fn yield_here(var p: Parser) -> Bool:
   # 'yield' as an expression when what follows can start one (otherwise it's a name)
@@ -1807,12 +2326,16 @@ fn try_arrow(var p: Parser) -> Int:
   if is_ident(k) and next_is_arrow_same_line(&p):
     let id = n(&p, ast.N_ARROW, pos)
     if is_async: p.t.nd[id].f = ast.M_ASYNC
+    let fs = sv_fn_open(&p, id)
     let pp = n(&p, ast.N_PARAM, p.sc.ts)
     p.t.nd[pp].a = ident(&p)
     let ppid = fin(&p, pp)
+    sv_decl(&p, ast.D_PARAM0, -1, p.ds, 0)
+    sv_decl(&p, ast.D_PARAM, ppid, p.ds, id * 8 + sv_ctx(p))
     p.t.nd[id].b = lst(&p, [ppid], pos)
     expect(&p, T_ARROW)
     p.t.nd[id].d = arrow_body(&p)
+    sv_fn_close(&p, fs)
     return fin(&p, id)
   if (k != T_LPAREN and k != T_LT) or (k == T_LPAREN and not paren_may_be_arrow(&p)):
     ast.reset(&p.t, m0)
@@ -1822,16 +2345,19 @@ fn try_arrow(var p: Parser) -> Int:
   let id = n(&p, ast.N_ARROW, pos)
   if is_async: p.t.nd[id].f = ast.M_ASYNC
   let nd = p.diags.len
+  let fs = sv_fn_open(&p, id)
   if p.sc.tok == T_LT: p.t.nd[id].a = type_params(&p)
   if p.sc.tok == T_LPAREN:
     p.t.nd[id].b = params(&p)
     if eat(&p, T_COLON): p.t.nd[id].c = return_type(&p)
   if p.sc.tok != T_ARROW or p.diags.len > nd or p.t.nd[id].b < 0:
+    sv_fn_close(&p, fs)
     ast.reset(&p.t, m0)
     restore(&p, &s0)
     return -1
   next(&p)
   p.t.nd[id].d = arrow_body(&p)
+  sv_fn_close(&p, fs)
   return fin(&p, id)
 
 fn next_is_newline(var p: Parser) -> Bool:
@@ -1939,6 +2465,7 @@ fn binary(var p: Parser, min: Int) -> Int:
         let c = n(&p, ast.N_TREF, p.sc.ts)
         let cid = n(&p, ast.N_ID, p.sc.ts)
         p.t.nd[cid].s = name_id(&p, "const")
+        sv_ref(&p, cid, ast.R_TYPE)
         p.t.nd[c].a = cid
         next(&p)
         p.t.nd[id].b = c
@@ -1963,6 +2490,7 @@ fn unary(var p: Parser) -> Int:
     let id = n(&p, ast.N_PREFIX, pos)
     p.t.nd[id].f = k
     p.t.nd[id].a = unary(&p)
+    if p.exact and (k == scan.T_INC or k == scan.T_DEC): sv_update(&p, id, p.t.nd[id].a)
     return fin(&p, id)
   if k == scan.W_TYPEOF or k == scan.W_VOID or k == scan.W_DELETE:
     next(&p)
@@ -1991,6 +2519,7 @@ fn unary(var p: Parser) -> Int:
     let id = n(&p, ast.N_POSTFIX, pos)
     p.t.nd[id].f = p.sc.tok
     p.t.nd[id].a = e
+    if p.exact: sv_update(&p, id, e)
     next(&p)
     return fin(&p, id)
   return e
@@ -2085,6 +2614,7 @@ fn call_tail(var p: Parser, e0: Int) -> Int:
       p.t.nd[id].c = call_args(&p)
       e = fin(&p, id)
     elif k == T_LT or k == scan.T_SHL:
+      p.ta_ev0 = p.t.sv.q.len
       let ta = try_type_args(&p)
       if ta < 0: return e
       if p.sc.tok == T_LPAREN:
@@ -2256,11 +2786,14 @@ fn primary(var p: Parser) -> Int:
     next(&p)
     let id = n(&p, ast.N_FUNCEXPR, pos)
     if eat(&p, T_STAR): p.t.nd[id].f = ast.M_GENERATOR
+    let fs = sv_fn_open(&p, id)
     if is_ident(p.sc.tok):
       p.t.nd[id].s = tok_name(&p)
+      sv_decl(&p, ast.D_FNNAME, id, p.ds, 0)
       next(&p)
     signature_into(&p, id, T_COLON)
     p.t.nd[id].d = body(&p, (p.t.nd[id].f & ast.M_GENERATOR) != 0)
+    sv_fn_close(&p, fs)
     return fin(&p, id)
   if k == scan.W_ASYNC and next_is(&p, scan.W_FUNCTION):
     next(&p)
@@ -2296,6 +2829,7 @@ fn primary(var p: Parser) -> Int:
   if is_ident(k):
     let id = n(&p, ast.N_ID, pos)
     p.t.nd[id].s = tok_name(&p)
+    sv_ref(&p, id, ast.R_READ)
     next(&p)
     return id
   err(&p, pos, 1109, "Expression expected.")
@@ -2349,8 +2883,10 @@ fn object_literal(var p: Parser) -> Int:
       next(&p)
       let g = n(&p, kind, ppos)
       p.t.nd[g].a = property_name(&p)
+      let fs = sv_fn_open(&p, g)
       p.t.nd[g].b = signature(&p, T_COLON)
       p.t.nd[g].c = body(&p, false)
+      sv_fn_close(&p, fs)
       props.push(fin(&p, g))
     else:
       var f = 0
@@ -2364,8 +2900,10 @@ fn object_literal(var p: Parser) -> Int:
         let m = n(&p, ast.N_METHOD, ppos)
         p.t.nd[m].f = f
         p.t.nd[m].a = name
+        let fs = sv_fn_open(&p, m)
         p.t.nd[m].b = signature(&p, T_COLON)
         p.t.nd[m].c = body(&p, (f & ast.M_GENERATOR) != 0)
+        sv_fn_close(&p, fs)
         props.push(fin(&p, m))
       elif eat(&p, T_COLON):
         let pa = n(&p, ast.N_PROPASSIGN, ppos)
@@ -2376,6 +2914,7 @@ fn object_literal(var p: Parser) -> Int:
         # shorthand: x, or x = default (only valid when the object is a pattern)
         let sh = n(&p, ast.N_SHORTHAND, ppos)
         p.t.nd[sh].s = p.t.nd[name].s
+        sv_ref(&p, sh, ast.R_READ)
         if not is_ident(name_tok) and name_tok != T_IDENT: err(&p, p.sc.ts, 1005, "':' expected.")
         if eat(&p, T_ASSIGN): p.t.nd[sh].b = assignment(&p)
         props.push(fin(&p, sh))
@@ -2435,6 +2974,7 @@ fn jsx_member(var p: Parser, e0: Int) -> Int:
 fn jsx_element(var p: Parser, in_children: Bool) -> Int:
   let pos = p.sc.ts
   let id = n(&p, ast.N_JSXELEM, pos)
+  if p.exact: p.t.sv.jsx = true
   next(&p)
   var frag = false
   if p.sc.tok == T_GT:
@@ -2442,6 +2982,7 @@ fn jsx_element(var p: Parser, in_children: Bool) -> Int:
     p.t.nd[id].f = 1
   else:
     p.t.nd[id].a = jsx_name(&p)
+    if p.exact: sv_jsx_name(&p, p.t.nd[id].a)
     if p.sc.tok == T_LT:
       let w = n(&p, ast.N_EXPRTARGS, pos + 1)
       p.t.nd[w].a = p.t.nd[id].a
