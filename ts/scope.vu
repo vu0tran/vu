@@ -4,6 +4,9 @@
 import scan
 import ast
 from scan import T_ASSIGN, T_COMMA, T_INC, T_DEC
+from ast import R_READ, R_WRITE, R_TYPE, R_SELF, R_EXPORT, R_QUAL
+from ast import Q_ASSIGN, Q_ASSIGN_END, Q_UPDATE, Q_SETLOOP, Q_VARFN, Q_LOOPVAR, Q_IFACE, Q_EXPSPEC, Q_EXPDEF, Q_TPRED, Q_DEAD
+from ast import S_FILE, S_FUNC, S_BLOCK, S_CLASS, S_NS, S_TYPE, S_ENUM, S_GLOBAL_AUG, S_MODSTR
 
 # symbol kinds
 const Y_VAR = 1
@@ -38,35 +41,23 @@ const F_POSITIONAL = 256  # a parameter that's a plain name (or default or rest)
 const F_NSIMPORT = 512    # import * as x
 const F_TYPED = 1024      # a value merged with a type of the same name
 
-# reference flags
-const R_READ = 1
-const R_WRITE = 2
-const R_TYPE = 4
-const R_SELF = 8          # inside its own declaration, or reading itself to update itself
-const R_EXPORT = 16       # export { x } or export default x
-const R_QUAL = 32         # the left of a qualified name A.B (not a self reference)
+# (reference flags R_*, event kinds Q_* and scope kinds S_* are in ast.vu: the parser records them)
 
-# scope kinds
-const S_FILE = 1
-const S_FUNC = 2
-const S_BLOCK = 3
-const S_CLASS = 4
-const S_NS = 5
-const S_TYPE = 6
-const S_ENUM = 7
-const S_GLOBAL_AUG = 8   # declare global { }
-const S_MODSTR = 9       # declare module "x" { }
+# A name's meaning in one scope: the scope and the meaning (s * 2, + 1 for a type), the symbol, and
+# the name's next entry (-1). One list of them: reading an entry checks the index once.
+type Ent:
+  key: Int
+  y: Int
+  next: Int
 
 type Scopes:
   sk: [Int]
   sp: [Int]
   sfn: [Int]            # each scope's nearest function (or file / namespace) scope, for var
-  scope_of: [Int]       # node -> the scope it opens (-1)
-  nhead: {Int: Int}     # name -> its first (scope, meaning) entry; entries map to a symbol
-  es: [Int]
-  et: [Bool]
-  ey: [Int]
-  enext: [Int]          # the name's next entry
+  hk: [Int]             # name -> its first (scope, meaning) entry, as a hash table: keys (-1 empty)
+  hv: [Int]             # ... and values; entries map to a symbol
+  hn: Int               # names in it
+  ents: [Ent]
   yn: [Int]             # name id
   ypos: [Int]           # where the name is
   yk: [Int]
@@ -96,7 +87,7 @@ type Scopes:
   ambient_file: Bool
 
 fn new_scopes() -> Scopes:
-  return Scopes([], [], [], [], {}, [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], {}, [], [], false, false)
+  return Scopes([], [], [], [], [], 0, [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], {}, [], [], false, false)
 
 # What identifier node n refers to: a symbol, -1 for a global, -2 if it isn't a reference.
 fn res_of(sc: Scopes, n: Int) -> Int:
@@ -110,14 +101,13 @@ fn sym_of(sc: Scopes, n: Int) -> Int:
   if y < -1: return -1
   return y
 
-fn new_scope(var sc: Scopes, kind: Int, parent: Int, node: Int) -> Int:
+fn new_scope(var sc: Scopes, kind: Int, parent: Int) -> Int:
   let id = sc.sk.len
   sc.sk.push(kind)
   sc.sp.push(parent)
   var f = id
   if kind != S_FUNC and kind != S_FILE and kind != S_NS and kind != S_GLOBAL_AUG and kind != S_MODSTR and parent >= 0: f = sc.sfn[parent]
   sc.sfn.push(f)
-  if node >= 0: sc.scope_of[node] = id
   return id
 
 fn value_meaning(kind: Int) -> Bool:
@@ -127,27 +117,69 @@ fn type_meaning(kind: Int) -> Bool:
   return kind == Y_TYPE or kind == Y_INTERFACE or kind == Y_TPARAM or kind == Y_CLASS or kind == Y_ENUM or kind == Y_IMPORT or kind == Y_IMPORTTYPE or kind == Y_NAMESPACE or kind == Y_CLASSNAME
 
 # Declares a name; a second declaration of a mergeable kind in the same scope reuses the symbol.
+# The first entry for a name, or -1.
+fn nhead(sc: Scopes, name: Int) -> Int:
+  if sc.hn == 0: return -1
+  let mask = sc.hk.len - 1
+  var j = ((name *% -7046029254386353131) >>> 40) & mask
+  while true:
+    let k = sc.hk[j]
+    if k == name: return sc.hv[j]
+    if k < 0: return -1
+    j = (j + 1) & mask
+  return -1
+
+fn set_nhead(var sc: Scopes, name: Int, e: Int):
+  if (sc.hn + 1) * 2 > sc.hk.len:
+    var size = sc.hk.len * 2
+    if size < 64: size = 64
+    var ok: [Int] = []
+    var ov: [Int] = []
+    swap(&ok, &sc.hk)
+    swap(&ov, &sc.hv)
+    for i in 0..size:
+      sc.hk.push(-1)
+      sc.hv.push(-1)
+    let m2 = size - 1
+    for i in 0..ok.len:
+      if ok[i] >= 0:
+        var j2 = ((ok[i] *% -7046029254386353131) >>> 40) & m2
+        while sc.hk[j2] >= 0: j2 = (j2 + 1) & m2
+        sc.hk[j2] = ok[i]
+        sc.hv[j2] = ov[i]
+  let mask = sc.hk.len - 1
+  var j = ((name *% -7046029254386353131) >>> 40) & mask
+  while sc.hk[j] >= 0 and sc.hk[j] != name: j = (j + 1) & mask
+  if sc.hk[j] < 0:
+    sc.hk[j] = name
+    sc.hn += 1
+  sc.hv[j] = e
+
 # The symbol a name means in scope s itself (as a type or a value), or -1.
+fn ekey(s: Int, ty: Bool) -> Int:
+  if ty: return s * 2 + 1
+  return s * 2
+
 fn tab_get(sc: Scopes, s: Int, name: Int, ty: Bool) -> Int:
-  var e = sc.nhead.get(name, -1)
+  let key = ekey(s, ty)
+  var e = nhead(sc, name)
   while e >= 0:
-    if sc.es[e] == s and sc.et[e] == ty: return sc.ey[e]
-    e = sc.enext[e]
+    let en = sc.ents[e]
+    if en.key == key: return en.y
+    e = en.next
   return -1
 
 fn tab_set(var sc: Scopes, s: Int, name: Int, ty: Bool, y: Int):
-  let h = sc.nhead.get(name, -1)
+  let key = ekey(s, ty)
+  let h = nhead(sc, name)
   var e = h
   while e >= 0:
-    if sc.es[e] == s and sc.et[e] == ty:
-      sc.ey[e] = y
+    if sc.ents[e].key == key:
+      sc.ents[e].y = y
       return
-    e = sc.enext[e]
-  sc.nhead[name] = sc.es.len
-  sc.es.push(s)
-  sc.et.push(ty)
-  sc.ey.push(y)
-  sc.enext.push(h)
+    e = sc.ents[e].next
+  set_nhead(&sc, name, sc.ents.len)
+  sc.ents.push(Ent(key, y, h))
 
 fn declare(var sc: Scopes, s: Int, name: Int, pos: Int, kind: Int, flags: Int) -> Int:
   # (the table changes only just before a return)
@@ -222,413 +254,258 @@ fn lexical(a: Int, b: Int) -> Bool:
   return true
 
 fn lookup(sc: Scopes, s0: Int, name: Int, ty: Bool) -> Int:
-  let e0 = sc.nhead.get(name, -1)
+  let e0 = nhead(sc, name)
   if e0 < 0: return -1
   var s = s0
   while s >= 0:
+    let key = ekey(s, ty)
     var e = e0
     while e >= 0:
-      if sc.es[e] == s and sc.et[e] == ty: return sc.ey[e]
-      e = sc.enext[e]
+      let en = sc.ents[e]
+      if en.key == key: return en.y
+      e = en.next
     s = sc.sp[s]
   return -1
 
-# ---- pass 1: declarations
+# ---- building the scopes
+#
+# The parser recorded what's needed as it read the file (ast.Sev; see "scope events" in parse.vu):
+# the scopes and declarations in the order a walk over the tree would meet them, and every
+# reference, with the context it needs, as an event. The declarations are replayed first, then the
+# references, when every scope's declarations are complete (var and function hoisting, names
+# declared later in a block). No walk over the tree is needed.
 
 type B:
   t: ast.Ast
   sc: Scopes
-  wexpr: Int       # the assignment or update being resolved (for write positions)
-  loops: Int       # loops around the current position, in the current function
-  modstr: Int      # >0 inside declare module "x" { }
-  ambient: Int     # >0 inside declare ... / declare module / .d.ts
-  global_aug: Int  # >0 inside declare global { }
+  q: [ast.Ev]      # the reference events (lent by the tree): kind (a reference's flags), node, scope, extra
 
 fn build(own t: ast.Ast, root: Int, dts: Bool) -> B:
-  var b = B(t, new_scopes(), -1, 0, 0, 0, 0)
-  let nn = b.t.k.len
-  b.sc.res.reserve(nn)
-  b.sc.scope_of.reserve(nn)
-  for i in 0..nn:
-    b.sc.res.push(-2)
-    b.sc.scope_of.push(-1)
-  if dts: b.ambient = 1
+  var b = B(t, new_scopes(), [])
+  let nn = b.t.nd.len
+  b.sc.res = [-2] * nn
+  # (room for every declaration and scope up front: the tables don't grow while they fill)
+  let nd = b.t.sv.d.len
+  reserve_syms(&b.sc, nd, b.t.sv.nscopes)
   b.sc.ambient_file = dts
   # a module if it imports or exports anything
   for i in 0..ast.count(b.t, root):
     let st = ast.item(b.t, root, i)
-    let kd = b.t.k[st]
+    let kd = b.t.nd[st].k
     if kd == ast.N_IMPORT or kd == ast.N_EXPORT or kd == ast.N_EXPORTDEFAULT or kd == ast.N_EXPORTASSIGN or kd == ast.N_IMPORTEQ: b.sc.module = true
     if has_export_mod(b.t, st): b.sc.module = true
-  let fs = new_scope(&b.sc, S_FILE, -1, root)
-  decl_list(&b, root, fs)
-  resolve_list(&b, root, fs)
-  # decorators (resolved in the file's scope)
-  if -1000001 in b.t.dirs:
-    var ds: [Int] = []
-    for x in b.t.dirs[-1000001]: ds.push(x)
-    for x in ds: resolve(&b, x, fs, false)
+  run_decls(&b, dts)
+  # (the parser's reference events, lent to run_events and given back to the tree)
+  lend_events(&b)
+  run_events(&b)
+  lend_events(&b)
   # JSX uses React (the classic runtime)
-  var has_jsx = false
-  for x in 0..b.t.k.len:
-    if b.t.k[x] == ast.N_JSXELEM:
-      has_jsx = true
-      break
-  if has_jsx:
+  if b.t.sv.jsx:
     for pragma in ["React", "h"]:
       let rid = ast.find(b.t, pragma)
       if rid >= 0:
-        let y = lookup(b.sc, fs, rid, false)
+        let y = lookup(b.sc, 0, rid, false)
         if y >= 0 and (pragma == "React" or b.sc.yk[y] == Y_IMPORT): b.sc.reads[y] += 1
   # a .d.ts file that isn't a module declares globals
   if dts and not b.sc.module:
     for y in 0..b.sc.yn.len:
-      if b.sc.ys[y] == fs: b.sc.yf[y] = b.sc.yf[y] | F_KEEP
+      if b.sc.ys[y] == 0: b.sc.yf[y] = b.sc.yf[y] | F_KEEP
   return b
+
+# Swaps the tree's reference events with b's (b.t and b's own lists can't be swapped directly).
+fn lend_events(var b: B):
+  var tmp: [ast.Ev] = []
+  swap(&tmp, &b.t.sv.q)
+  swap(&tmp, &b.q)
+  swap(&tmp, &b.t.sv.q)
+
+fn reserve_syms(var sc: Scopes, n: Int, nscopes: Int):
+  sc.yn.reserve(n)
+  sc.ypos.reserve(n)
+  sc.yk.reserve(n)
+  sc.yf.reserve(n)
+  sc.ys.reserve(n)
+  sc.yfn.reserve(n)
+  sc.ylo.reserve(n)
+  sc.yhi.reserve(n)
+  sc.reads.reserve(n)
+  sc.writes.reserve(n)
+  sc.anyref.reserve(n)
+  sc.ywrite_at.reserve(n)
+  sc.treads.reserve(n)
+  sc.yloop.reserve(n)
+  sc.ents.reserve(n)
+  sc.sk.reserve(nscopes)
+  sc.sp.reserve(nscopes)
+  sc.sfn.reserve(nscopes)
+
+# A declaration's base flags from its modifiers and the context bits it was recorded with.
+fn cflags(mods: Int, x: Int) -> Int:
+  var f = 0
+  if (mods & ast.M_EXPORT) != 0: f = f | F_EXPORTED
+  if (mods & ast.M_DECLARE) != 0 or (x & ast.C_AMB) != 0: f = f | F_AMBIENT
+  if (x & ast.C_GAUG) != 0: f = f | F_KEEP
+  return f
+
+fn own_range(var b: B, y: Int, n: Int):
+  b.sc.ylo[y] = b.t.nd[n].pos
+  b.sc.yhi[y] = b.t.nd[n].end
+
+# Replays the parser's declaration events in order: scopes and the names declared in them.
+fn run_decls(var b: B, dts: Bool):
+  var pstart: [Int] = []    # parameters being read: the symbols before each
+  for i in 0..b.t.sv.d.len:
+    let e = b.t.sv.d[i]
+    let k = e.k
+    let n = e.n
+    let s = e.s
+    var x = e.x
+    if k == ast.D_SCOPE:
+      new_scope(&b.sc, x, s)
+      continue
+    if k == ast.D_PARAM0:
+      pstart.push(b.sc.yn.len)
+      continue
+    if dts and k != ast.D_VAR: x = x | ast.C_AMB
+    let nd = b.t.nd[n]
+    if k == ast.D_VAR:
+      let vk = x & 3
+      var kind = Y_VAR
+      var target = b.sc.sfn[s]
+      if vk == 1: kind = Y_LET
+      elif vk == 2: kind = Y_CONST
+      elif vk == 3: kind = Y_USING
+      if vk != 0: target = s
+      var f = F_FORIN
+      if (x & ast.V_FORIN) == 0:
+        f = 0
+        if (x & ast.V_EXPORT) != 0: f = F_EXPORTED
+        if (x & ast.V_AMB) != 0 or dts: f = f | F_AMBIENT
+        if (x & ast.V_GAUG) != 0: f = f | F_KEEP
+        if nd.c > 0: f = f | F_INIT
+      bind(&b, nd.a, target, kind, f)
+    elif k == ast.D_PARAM:
+      let fnode = x >> 3
+      let fk = b.t.nd[fnode].k
+      var body = b.t.nd[fnode].d
+      if fk == ast.N_METHOD or fk == ast.N_GET or fk == ast.N_SET or fk == ast.N_CTOR: body = b.t.nd[fnode].c
+      var f = F_POSITIONAL
+      if (nd.f & (ast.M_PUBLIC | ast.M_PRIVATE | ast.M_PROTECTED | ast.M_READONLY | ast.M_OVERRIDE)) != 0: f = f | F_KEEP
+      if body <= 0 or (x & (ast.C_AMB | ast.C_GAUG)) != 0 or fk == ast.N_SET or (fk == ast.N_METHOD and (b.t.nd[fnode].f & ast.M_OVERRIDE) != 0 and (nd.f & ast.M_REST) == 0): f = f | F_KEEP
+      # (the parameter's names, and what its defaults declared, belong to the function)
+      var y = pstart.pop()
+      bind(&b, nd.a, s, Y_PARAM, f)
+      while y < b.sc.yn.len:
+        b.sc.yfn[y] = fnode
+        y += 1
+    elif k == ast.D_TPARAM:
+      let y = declare(&b.sc, s, nd.s, nd.pos, Y_TPARAM, 0)
+      # (a use in its own constraint or default isn't a use)
+      own_range(&b, y, n)
+      if (x & (ast.C_AMB | ast.C_GAUG)) != 0: b.sc.yf[y] = b.sc.yf[y] | F_KEEP
+    elif k == ast.D_FUNC:
+      var f = cflags(nd.f, x)
+      if nd.d <= 0: f = f | F_BODYLESS
+      if (nd.f & ast.M_DEFAULT) != 0: f = f | F_EXPORTED
+      let y = declare(&b.sc, s, nd.s, b.t.npos.get(n, nd.pos), Y_FUNC, f)
+      if nd.d > 0: b.sc.fsym[n] = y
+      if b.sc.ylo[y] < 0 and nd.d > 0: own_range(&b, y, n)
+    elif k == ast.D_FNNAME:
+      let y = declare(&b.sc, s, nd.s, b.t.npos.get(n, nd.pos), Y_FNNAME, F_KEEP)
+      own_range(&b, y, n)
+    elif k == ast.D_CATCH:
+      bind(&b, nd.a, s, Y_CATCH, 0)
+    elif k == ast.D_CLASS:
+      var f = cflags(nd.f, x)
+      if (nd.f & ast.M_DEFAULT) != 0: f = f | F_EXPORTED
+      let y = declare(&b.sc, s, nd.s, b.t.npos.get(n, nd.pos), Y_CLASS, f)
+      own_range(&b, y, n)
+    elif k == ast.D_CLASSNAME:
+      let y = declare(&b.sc, s, nd.s, b.t.npos.get(n, nd.pos), Y_CLASSNAME, F_KEEP)
+      own_range(&b, y, n)
+    elif k == ast.D_IFACE:
+      var kind = Y_TYPE
+      if nd.k == ast.N_INTERFACE: kind = Y_INTERFACE
+      var fl = cflags(nd.d, x)
+      if nd.k == ast.N_INTERFACE and (x & ast.C_MODSTR) != 0: fl = fl | F_KEEP
+      let y = declare(&b.sc, s, nd.s, b.t.npos.get(n, nd.pos), kind, fl)
+      if b.sc.ylo[y] < 0: own_range(&b, y, n)
+    elif k == ast.D_ENUM:
+      let y = declare(&b.sc, s, nd.s, b.t.npos.get(n, nd.pos), Y_ENUM, cflags(nd.f, x))
+      if b.sc.ylo[y] < 0: own_range(&b, y, n)
+    elif k == ast.D_MEMBER:
+      let nm = nd.a
+      if nm > 0 and (b.t.nd[nm].k == ast.N_ID or b.t.nd[nm].k == ast.N_STR):
+        declare(&b.sc, s, b.t.nd[nm].s, b.t.nd[nm].pos, Y_MEMBER, F_KEEP)
+    elif k == ast.D_NAMESPACE:
+      var first = nd.a
+      while b.t.nd[first].k == ast.N_QNAME: first = b.t.nd[first].a
+      let y = declare(&b.sc, s, b.t.nd[first].s, b.t.nd[first].pos, Y_NAMESPACE, cflags(nd.f, x))
+      if b.sc.ylo[y] < 0: own_range(&b, y, n)
+    elif k == ast.D_IMPORT:
+      import_names(&b, n, s)
+    elif k == ast.D_IMPORTEQ:
+      var f = 0
+      if has_export_mod(b.t, n): f = F_EXPORTED
+      declare(&b.sc, s, nd.s, nd.pos + 7, Y_IMPORT, f)
+    elif k == ast.D_TPARAM_K:
+      declare(&b.sc, s, nd.s, nd.pos, Y_TPARAM, F_KEEP)
+
+fn import_names(var b: B, n: Int, s: Int):
+  var kind = Y_IMPORT
+  if (b.t.nd[n].f & ast.M_TYPEONLY) != 0: kind = Y_IMPORTTYPE
+  let df = b.t.nd[n].b
+  if df > 0: b.sc.res[df] = declare(&b.sc, s, b.t.nd[df].s, b.t.nd[df].pos, kind, 0)
+  let nsn = b.t.nd[n].c
+  if nsn > 0: b.sc.res[nsn] = declare(&b.sc, s, b.t.nd[nsn].s, b.t.nd[nsn].pos, kind, F_NSIMPORT)
+  let sp = b.t.nd[n].d
+  for i in 0..ast.count(b.t, sp):
+    let x = ast.item(b.t, sp, i)
+    var k2 = kind
+    if (b.t.nd[x].f & ast.M_TYPEONLY) != 0: k2 = Y_IMPORTTYPE
+    let nm = b.t.nd[x].s
+    let at = b.t.nd[x].end - b.t.names[nm].len
+    declare(&b.sc, s, nm, at, k2, 0)
+
+# Binds the names in a binding target (a name or a pattern); what's in its defaults and computed
+# keys was recorded on its own.
+fn bind(var b: B, n: Int, s: Int, kind: Int, flags: Int):
+  if n <= 0: return
+  let kd = b.t.nd[n].k
+  if kd == ast.N_ID:
+    let y = declare(&b.sc, s, b.t.nd[n].s, b.t.nd[n].pos, kind, flags)
+    b.sc.res[n] = y
+  elif kd == ast.N_OBJPAT:
+    let lst = b.t.nd[n].a
+    var rest = false
+    for i in 0..ast.count(b.t, lst):
+      let e = ast.item(b.t, lst, i)
+      if (b.t.nd[e].f & ast.M_REST) != 0: rest = true
+    for i in 0..ast.count(b.t, lst):
+      let e = ast.item(b.t, lst, i)
+      var f2 = flags | F_PATTERN
+      if rest and (b.t.nd[e].f & ast.M_REST) == 0: f2 = f2 | F_REST_SIB
+      bind(&b, b.t.nd[e].b, s, kind, f2 & (65535 - F_POSITIONAL))
+  elif kd == ast.N_ARRPAT:
+    let lst = b.t.nd[n].a
+    for i in 0..ast.count(b.t, lst):
+      let e = ast.item(b.t, lst, i)
+      if b.t.nd[e].k == ast.N_BINDEL:
+        bind(&b, b.t.nd[e].b, s, kind, (flags | F_PATTERN) & (65535 - F_POSITIONAL))
 
 fn has_export_mod(t: ast.Ast, st: Int) -> Bool:
   return (mods_of(t, st) & ast.M_EXPORT) != 0
 
 fn mods_of(t: ast.Ast, n: Int) -> Int:
-  let kd = t.k[n]
-  if kd == ast.N_VAR or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS: return t.d[n]
-  if kd == ast.N_FUNC or kd == ast.N_CLASS or kd == ast.N_ENUM or kd == ast.N_MODULE or kd == ast.N_IMPORTEQ: return t.f[n]
+  let kd = t.nd[n].k
+  if kd == ast.N_VAR or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS: return t.nd[n].d
+  if kd == ast.N_FUNC or kd == ast.N_CLASS or kd == ast.N_ENUM or kd == ast.N_MODULE or kd == ast.N_IMPORTEQ: return t.nd[n].f
   return 0
 
-fn decl_list(var b: B, l: Int, s: Int):
-  if l <= 0: return
-  for i in 0..b.t.b[l]:
-    let x = b.t.L[b.t.a[l] + i]
-    decl(&b, x, s)
+# ---- the references
 
-fn decl_kids(var b: B, n: Int, s: Int):
-  let kd = b.t.k[n]
-  let a = b.t.a[n]
-  let bb = b.t.b[n]
-  let c = b.t.c[n]
-  decl(&b, a, s)
-  decl(&b, bb, s)
-  decl(&b, c, s)
-  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS:
-    let d = b.t.d[n]
-    decl(&b, d, s)
-
-fn base_flags(b: B, mods: Int) -> Int:
-  var f = 0
-  if (mods & ast.M_EXPORT) != 0: f = f | F_EXPORTED
-  if (mods & ast.M_DECLARE) != 0 or b.ambient > 0: f = f | F_AMBIENT
-  if b.global_aug > 0: f = f | F_KEEP
-  return f
-
-# Binds the names in a binding target (a name or a pattern).
-fn bind_target(var b: B, n: Int, s: Int, kind: Int, flags: Int):
-  if n <= 0: return
-  let kd = b.t.k[n]
-  if kd == ast.N_ID:
-    let y = declare(&b.sc, s, b.t.s[n], b.t.pos[n], kind, flags)
-    b.sc.res[n] = y
-  elif kd == ast.N_OBJPAT:
-    let lst = b.t.a[n]
-    var rest = false
-    for i in 0..ast.count(b.t, lst):
-      let e = ast.item(b.t, lst, i)
-      if (b.t.f[e] & ast.M_REST) != 0: rest = true
-    for i in 0..ast.count(b.t, lst):
-      let e = ast.item(b.t, lst, i)
-      var f2 = flags | F_PATTERN
-      if rest and (b.t.f[e] & ast.M_REST) == 0: f2 = f2 | F_REST_SIB
-      bind_target(&b, b.t.b[e], s, kind, f2 & (65535 - F_POSITIONAL))
-      # computed keys and defaults are expressions
-      decl(&b, b.t.a[e], s)
-      decl(&b, b.t.c[e], s)
-  elif kd == ast.N_ARRPAT:
-    let lst = b.t.a[n]
-    for i in 0..ast.count(b.t, lst):
-      let e = ast.item(b.t, lst, i)
-      if b.t.k[e] == ast.N_BINDEL:
-        bind_target(&b, b.t.b[e], s, kind, (flags | F_PATTERN) & (65535 - F_POSITIONAL))
-        decl(&b, b.t.c[e], s)
-
-fn decl(var b: B, n: Int, s: Int):
-  if n <= 0: return
-  let kd = b.t.k[n]
-  if kd == ast.N_LIST:
-    decl_list(&b, n, s)
-    return
-  if kd == ast.N_VAR:
-    let f = b.t.f[n]
-    var kind = Y_VAR
-    var target = b.sc.sfn[s]
-    if f == 1: kind = Y_LET
-    elif f == 2: kind = Y_CONST
-    elif f == 3: kind = Y_USING
-    if f != 0: target = s
-    let flags = base_flags(b, b.t.d[n])
-    let lst = b.t.a[n]
-    for i in 0..ast.count(b.t, lst):
-      let d = ast.item(b.t, lst, i)
-      var f2 = flags
-      if b.t.c[d] > 0: f2 = f2 | F_INIT
-      bind_target(&b, b.t.a[d], target, kind, f2)
-      decl(&b, b.t.c[d], s)
-    return
-  if kd == ast.N_FUNC:
-    if b.t.s[n] > 0:
-      var f = base_flags(b, b.t.f[n])
-      if b.t.d[n] <= 0: f = f | F_BODYLESS
-      if (b.t.f[n] & ast.M_DEFAULT) != 0: f = f | F_EXPORTED
-      let y = declare(&b.sc, s, b.t.s[n], b.t.npos.get(n, b.t.pos[n]), Y_FUNC, f)
-      if b.t.d[n] > 0: b.sc.fsym[n] = y
-      if b.sc.ylo[y] < 0 and b.t.d[n] > 0:
-        b.sc.ylo[y] = b.t.pos[n]
-        b.sc.yhi[y] = b.t.end[n]
-    decl_function(&b, n, s)
-    return
-  if kd == ast.N_FUNCEXPR or kd == ast.N_ARROW or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
-    decl_function(&b, n, s)
-    return
-  if kd == ast.N_CLASS or kd == ast.N_CLASSEXPR:
-    if kd == ast.N_CLASS and b.t.s[n] > 0:
-      var f = base_flags(b, b.t.f[n])
-      if (b.t.f[n] & ast.M_DEFAULT) != 0: f = f | F_EXPORTED
-      let y = declare(&b.sc, s, b.t.s[n], b.t.npos.get(n, b.t.pos[n]), Y_CLASS, f)
-      b.sc.ylo[y] = b.t.pos[n]
-      b.sc.yhi[y] = b.t.end[n]
-    let cs = new_scope(&b.sc, S_CLASS, s, n)
-    if kd == ast.N_CLASSEXPR and b.t.s[n] > 0:
-      let y = declare(&b.sc, cs, b.t.s[n], b.t.npos.get(n, b.t.pos[n]), Y_CLASSNAME, F_KEEP)
-      b.sc.ylo[y] = b.t.pos[n]
-      b.sc.yhi[y] = b.t.end[n]
-    let was = b.ambient
-    if (b.t.f[n] & ast.M_DECLARE) != 0: b.ambient += 1
-    decl_tparams(&b, b.t.a[n], cs)
-    decl(&b, b.t.b[n], s)
-    decl(&b, b.t.c[n], cs)
-    decl(&b, b.t.d[n], cs)
-    b.ambient = was
-    return
-  if kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS:
-    var kind = Y_TYPE
-    if kd == ast.N_INTERFACE: kind = Y_INTERFACE
-    var fl = base_flags(b, b.t.d[n])
-    if kd == ast.N_INTERFACE and b.modstr > 0: fl = fl | F_KEEP
-    let y = declare(&b.sc, s, b.t.s[n], b.t.npos.get(n, b.t.pos[n]), kind, fl)
-    if b.sc.ylo[y] < 0:
-      b.sc.ylo[y] = b.t.pos[n]
-      b.sc.yhi[y] = b.t.end[n]
-    let ts = new_scope(&b.sc, S_TYPE, s, n)
-    decl_tparams(&b, b.t.a[n], ts)
-    decl(&b, b.t.b[n], ts)
-    decl(&b, b.t.c[n], ts)
-    return
-  if kd == ast.N_ENUM:
-    let y = declare(&b.sc, s, b.t.s[n], b.t.npos.get(n, b.t.pos[n]), Y_ENUM, base_flags(b, b.t.f[n]))
-    if b.sc.ylo[y] < 0:
-      b.sc.ylo[y] = b.t.pos[n]
-      b.sc.yhi[y] = b.t.end[n]
-    let es = new_scope(&b.sc, S_ENUM, s, n)
-    let lst = b.t.a[n]
-    for i in 0..ast.count(b.t, lst):
-      let m = ast.item(b.t, lst, i)
-      let nm = b.t.a[m]
-      if nm > 0 and (b.t.k[nm] == ast.N_ID or b.t.k[nm] == ast.N_STR):
-        declare(&b.sc, es, b.t.s[nm], b.t.pos[nm], Y_MEMBER, F_KEEP)
-      decl(&b, b.t.b[m], es)
-    return
-  if kd == ast.N_MODULE:
-    let nm = b.t.a[n]
-    let f = b.t.f[n]
-    let was = b.ambient
-    let wasg = b.global_aug
-    if (f & ast.M_DECLARE) != 0: b.ambient += 1
-    var kind = S_NS
-    if (f & ast.MOD_GLOBAL) != 0:
-      b.global_aug += 1
-      kind = S_GLOBAL_AUG
-    elif nm > 0 and b.t.k[nm] == ast.N_STR:
-      b.ambient += 1
-      b.modstr += 1
-      kind = S_MODSTR
-    elif nm > 0:
-      var first = nm
-      while b.t.k[first] == ast.N_QNAME: first = b.t.a[first]
-      let y = declare(&b.sc, s, b.t.s[first], b.t.pos[first], Y_NAMESPACE, base_flags(b, f))
-      if b.sc.ylo[y] < 0:
-        b.sc.ylo[y] = b.t.pos[n]
-        b.sc.yhi[y] = b.t.end[n]
-    let ns = new_scope(&b.sc, kind, s, n)
-    decl(&b, b.t.b[n], ns)
-    if kind == S_MODSTR: b.modstr -= 1
-    b.ambient = was
-    b.global_aug = wasg
-    return
-  if kd == ast.N_IMPORT:
-    var kind = Y_IMPORT
-    if (b.t.f[n] & ast.M_TYPEONLY) != 0: kind = Y_IMPORTTYPE
-    let df = b.t.b[n]
-    if df > 0: b.sc.res[df] = declare(&b.sc, s, b.t.s[df], b.t.pos[df], kind, 0)
-    let nsn = b.t.c[n]
-    if nsn > 0: b.sc.res[nsn] = declare(&b.sc, s, b.t.s[nsn], b.t.pos[nsn], kind, F_NSIMPORT)
-    let sp = b.t.d[n]
-    for i in 0..ast.count(b.t, sp):
-      let x = ast.item(b.t, sp, i)
-      var k2 = kind
-      if (b.t.f[x] & ast.M_TYPEONLY) != 0: k2 = Y_IMPORTTYPE
-      let nm = b.t.s[x]
-      let at = b.t.end[x] - b.t.names[nm].len
-      declare(&b.sc, s, nm, at, k2, 0)
-    return
-  if kd == ast.N_IMPORTEQ:
-    var f = 0
-    if has_export_mod(b.t, n): f = F_EXPORTED
-    declare(&b.sc, s, b.t.s[n], b.t.pos[n] + 7, Y_IMPORT, f)
-    return
-  if kd == ast.N_BLOCK:
-    let bs = new_scope(&b.sc, S_BLOCK, s, n)
-    decl(&b, b.t.a[n], bs)
-    return
-  if kd == ast.N_FOR or kd == ast.N_FORIN:
-    let fs = new_scope(&b.sc, S_BLOCK, s, n)
-    let init = b.t.a[n]
-    if kd == ast.N_FORIN and init > 0 and b.t.k[init] == ast.N_VAR:
-      # the loop variable is bound by the loop, not an initializer
-      let f = b.t.f[init]
-      var kind = Y_VAR
-      var target = b.sc.sfn[fs]
-      if f == 1: kind = Y_LET
-      elif f == 2: kind = Y_CONST
-      elif f == 3: kind = Y_USING
-      if f != 0: target = fs
-      let lst = b.t.a[init]
-      for i in 0..ast.count(b.t, lst):
-        let d = ast.item(b.t, lst, i)
-        bind_target(&b, b.t.a[d], target, kind, F_FORIN)
-      decl(&b, b.t.b[n], fs)
-      decl(&b, b.t.c[n], fs)
-      return
-    decl_kids(&b, n, fs)
-    return
-  if kd == ast.N_SWITCH:
-    decl(&b, b.t.a[n], s)
-    let ss = new_scope(&b.sc, S_BLOCK, s, n)
-    decl(&b, b.t.b[n], ss)
-    return
-  if kd == ast.N_TRY:
-    decl(&b, b.t.a[n], s)
-    let cd = b.t.b[n]
-    let cb = b.t.c[n]
-    if cb > 0:
-      let cs = new_scope(&b.sc, S_BLOCK, s, cb)
-      if cd > 0:
-        bind_target(&b, b.t.a[cd], cs, Y_CATCH, 0)
-      # the block's own declarations share the catch scope
-      decl(&b, b.t.a[cb], cs)
-    decl(&b, b.t.d[n], s)
-    return
-  if kd == ast.N_TFUNC or kd == ast.N_CALLSIG or kd == ast.N_CTORSIG or kd == ast.N_SIG:
-    let ts = new_scope(&b.sc, S_TYPE, s, n)
-    if kd == ast.N_SIG: decl_tparams(&b, b.t.a[n], ts)
-    decl_kids_noparams(&b, n, ts)
-    return
-  if kd == ast.N_TMAPPED:
-    let ts = new_scope(&b.sc, S_TYPE, s, n)
-    let tp = b.t.a[n]
-    if tp > 0:
-      declare(&b.sc, ts, b.t.s[tp], b.t.pos[tp], Y_TPARAM, F_KEEP)
-      decl(&b, b.t.a[tp], ts)
-    decl(&b, b.t.b[n], ts)
-    decl(&b, b.t.c[n], ts)
-    return
-  if kd == ast.N_TCOND:
-    decl(&b, b.t.a[n], s)
-    let ts = new_scope(&b.sc, S_TYPE, s, n)
-    decl(&b, b.t.b[n], ts)
-    decl(&b, b.t.c[n], ts)
-    decl(&b, b.t.d[n], s)
-    return
-  if kd == ast.N_TINFER:
-    let tp = b.t.a[n]
-    if tp > 0:
-      declare(&b.sc, s, b.t.s[tp], b.t.pos[tp], Y_TPARAM, F_KEEP)
-      decl(&b, b.t.a[tp], s)
-    return
-  decl_kids(&b, n, s)
-
-fn decl_kids_noparams(var b: B, n: Int, s: Int):
-  # a signature in a type: parameters aren't bindings anyone can use (their types are walked)
-  let kd = b.t.k[n]
-  if kd == ast.N_SIG:
-    let ps = b.t.b[n]
-    for i in 0..ast.count(b.t, ps):
-      let p = ast.item(b.t, ps, i)
-      decl(&b, b.t.b[p], s)
-    decl(&b, b.t.c[n], s)
-    return
-  decl(&b, b.t.b[n], s)
-
-fn decl_tparams(var b: B, l: Int, s: Int):
-  for i in 0..ast.count(b.t, l):
-    let tp = ast.item(b.t, l, i)
-    let y = declare(&b.sc, s, b.t.s[tp], b.t.pos[tp], Y_TPARAM, 0)
-    # (a use in its own constraint or default isn't a use)
-    b.sc.ylo[y] = b.t.pos[tp]
-    b.sc.yhi[y] = b.t.end[tp]
-    if b.ambient > 0 or b.global_aug > 0: b.sc.yf[y] = b.sc.yf[y] | F_KEEP
-    decl(&b, b.t.a[tp], s)
-    decl(&b, b.t.b[tp], s)
-
-fn decl_function(var b: B, n: Int, s: Int):
-  let kd = b.t.k[n]
-  let fs = new_scope(&b.sc, S_FUNC, s, n)
-  var sig = n
-  var body = b.t.d[n]
-  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
-    sig = b.t.b[n]
-    body = b.t.c[n]
-    # a computed key is outside
-    if kd != ast.N_CTOR: decl(&b, b.t.a[n], s)
-  if kd == ast.N_FUNCEXPR and b.t.s[n] > 0:
-    let y = declare(&b.sc, fs, b.t.s[n], b.t.npos.get(n, b.t.pos[n]), Y_FNNAME, F_KEEP)
-    b.sc.ylo[y] = b.t.pos[n]
-    b.sc.yhi[y] = b.t.end[n]
-  if sig > 0: decl_tparams(&b, b.t.a[sig], fs)
-  let bodyless = body <= 0
-  # parameters
-  let ps = b.t.b[sig]
-  for i in 0..ast.count(b.t, ps):
-    let p = ast.item(b.t, ps, i)
-    let tg = b.t.a[p]
-    if tg > 0 and b.t.k[tg] == ast.N_ID and b.t.names[b.t.s[tg]] == "this":
-      decl(&b, b.t.b[p], fs)
-      continue
-    var f = F_POSITIONAL
-    if (b.t.f[p] & (ast.M_PUBLIC | ast.M_PRIVATE | ast.M_PROTECTED | ast.M_READONLY | ast.M_OVERRIDE)) != 0: f = f | F_KEEP
-    if bodyless or b.ambient > 0 or b.global_aug > 0 or kd == ast.N_SET or (kd == ast.N_METHOD and (b.t.f[n] & ast.M_OVERRIDE) != 0 and (b.t.f[p] & ast.M_REST) == 0): f = f | F_KEEP
-    let before = b.sc.yn.len
-    bind_target(&b, tg, fs, Y_PARAM, f)
-    var y = before
-    while y < b.sc.yn.len:
-      b.sc.yfn[y] = n
-      y += 1
-    decl(&b, b.t.b[p], fs)
-    decl(&b, b.t.c[p], fs)
-  if sig > 0: decl(&b, b.t.c[sig], fs)
-  if body > 0:
-    if b.t.k[body] == ast.N_BLOCK:
-      b.sc.scope_of[body] = fs
-      decl(&b, b.t.a[body], fs)
-    else: decl(&b, body, fs)
-
-# ---- pass 2: references
-
-fn resolve_list(var b: B, l: Int, s: Int):
-  if l <= 0: return
-  for i in 0..b.t.b[l]:
-    let x = b.t.L[b.t.a[l] + i]
-    resolve(&b, x, s, false)
-
-fn ref(var b: B, n: Int, s: Int, flags: Int):
-  let name = b.t.s[n]
+fn do_ref(var b: B, n: Int, s: Int, flags: Int, wexpr: Int):
+  let name = b.t.nd[n].s
   let ty = (flags & R_TYPE) != 0
   var y = lookup(b.sc, s, name, ty)
   if y < 0 and ty: y = lookup(b.sc, s, name, false)
@@ -636,15 +513,15 @@ fn ref(var b: B, n: Int, s: Int, flags: Int):
   b.sc.res[n] = y
   if (flags & R_WRITE) != 0:
     b.sc.wsym.push(y)
-    b.sc.wat.push(b.t.pos[n])
+    b.sc.wat.push(b.t.nd[n].pos)
     b.sc.wname.push(name)
-    var we = b.wexpr
-    if we < 0: we = b.t.pos[n]
+    var we = wexpr
+    if we < 0: we = b.t.nd[n].pos
     b.sc.wexpr.push(we)
   if y < 0: return
   b.sc.anyref[y] += 1
   var f = flags
-  let p = b.t.pos[n]
+  let p = b.t.nd[n].pos
   if b.sc.ylo[y] >= 0 and p >= b.sc.ylo[y] and p < b.sc.yhi[y] and (f & R_QUAL) == 0: f = f | R_SELF
   if (f & R_WRITE) != 0:
     b.sc.writes[y] += 1
@@ -653,181 +530,83 @@ fn ref(var b: B, n: Int, s: Int, flags: Int):
     if (f & (R_READ | R_EXPORT)) != 0 or ((f & R_TYPE) != 0 and (type_meaning(b.sc.yk[y]) or (b.sc.yf[y] & F_TYPED) != 0)): b.sc.reads[y] += 1
     elif (f & R_TYPE) != 0: b.sc.treads[y] += 1
 
-# An assignment target: names are written (and read too for compound operators).
-fn target(var b: B, n: Int, s: Int, flags: Int):
-  if n <= 0: return
-  let kd = b.t.k[n]
-  if kd == ast.N_ID:
-    ref(&b, n, s, flags)
-  elif kd == ast.N_PAREN or kd == ast.N_AS or kd == ast.N_SATISFIES or kd == ast.N_NONNULL or kd == ast.N_TYPEASSERT:
-    target(&b, b.t.a[n], s, flags)
-    if kd != ast.N_PAREN and kd != ast.N_NONNULL: resolve(&b, b.t.b[n], s, true)
-  elif kd == ast.N_ARRAY:
-    let lst = b.t.a[n]
-    for i in 0..ast.count(b.t, lst):
-      let e = ast.item(b.t, lst, i)
-      target(&b, e, s, R_WRITE)
-  elif kd == ast.N_OBJECT:
-    let lst = b.t.a[n]
-    for i in 0..ast.count(b.t, lst):
-      let e = ast.item(b.t, lst, i)
-      let ke = b.t.k[e]
-      if ke == ast.N_PROPASSIGN:
-        let key = b.t.a[e]
-        if b.t.k[key] == ast.N_COMPUTED: resolve(&b, key, s, false)
-        target(&b, b.t.b[e], s, R_WRITE)
-      elif ke == ast.N_SHORTHAND:
-        ref(&b, e, s, R_WRITE)
-        resolve(&b, b.t.b[e], s, false)
-      elif ke == ast.N_SPREAD: target(&b, b.t.a[e], s, R_WRITE)
-  elif kd == ast.N_SPREAD:
-    target(&b, b.t.a[n], s, R_WRITE)
-  elif kd == ast.N_BINARY and b.t.f[n] == T_ASSIGN:
-    # a default in a pattern
-    target(&b, b.t.a[n], s, R_WRITE)
-    resolve(&b, b.t.b[n], s, false)
-  else:
-    resolve(&b, n, s, false)
-
-fn resolve_kids(var b: B, n: Int, s: Int, ty: Bool):
-  let kd = b.t.k[n]
-  let a = b.t.a[n]
-  let bb = b.t.b[n]
-  let c = b.t.c[n]
-  resolve(&b, a, s, ty)
-  resolve(&b, bb, s, ty)
-  resolve(&b, c, s, ty)
-  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS:
-    let d = b.t.d[n]
-    resolve(&b, d, s, ty)
-
-fn sc_of(b: B, n: Int, s: Int) -> Int:
-  if n >= 0 and n < b.sc.scope_of.len and b.sc.scope_of[n] >= 0: return b.sc.scope_of[n]
-  return s
-
-# Whether the value of expression n is unused (an expression statement, or not the last of a
-# comma sequence whose value is unused).
-fn unused_value(b: B, n: Int, par: Int) -> Bool:
-  return par == 1
-
-fn resolve(var b: B, n: Int, s: Int, ty: Bool):
-  if n <= 0: return
-  let kd = b.t.k[n]
-  if kd == ast.N_LIST:
-    for i in 0..b.t.b[n]:
-      let x = b.t.L[b.t.a[n] + i]
-      resolve(&b, x, s, ty)
-    return
-  if kd == ast.N_ID:
-    if ty: ref(&b, n, s, R_TYPE)
-    else: ref(&b, n, s, R_READ)
-    return
-  if kd == ast.N_EXPRSTMT:
-    stmt_expr(&b, b.t.a[n], s)
-    return
-  if kd == ast.N_BINARY:
-    let op = b.t.f[n]
-    if op == T_ASSIGN or (op >= scan.T_PLUSEQ and op <= scan.T_QQEQ):
-      assign(&b, n, s, false)
-      return
-  if kd == ast.N_PREFIX or kd == ast.N_POSTFIX:
-    let op = b.t.f[n]
-    if op == T_INC or op == T_DEC:
-      update(&b, n, s, false)
-      return
-  if kd == ast.N_VAR:
-    let lst = b.t.a[n]
-    for i in 0..ast.count(b.t, lst):
-      let d = ast.item(b.t, lst, i)
-      let tg = b.t.a[d]
-      set_loop(&b, tg)
-      pattern_exprs(&b, tg, s)
-      resolve(&b, b.t.b[d], s, true)
-      let init = b.t.c[d]
-      if init > 0:
-        # a function or class initializer: references to the variable inside it are its own
-        let ui = unparen(b.t, init)
-        let ki = b.t.k[ui]
-        if b.t.k[tg] == ast.N_ID and (ki == ast.N_FUNCEXPR or ki == ast.N_ARROW or ki == ast.N_CLASSEXPR):
-          let y = sym_of(b.sc, tg)
-          if y >= 0:
-            b.sc.ylo[y] = b.t.pos[ui]
-            b.sc.yhi[y] = b.t.end[ui]
-            if ki != ast.N_CLASSEXPR: b.sc.fsym[ui] = y
-        resolve(&b, init, s, false)
-    return
-  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
-    resolve_function(&b, n, s)
-    return
-  if kd == ast.N_CLASS or kd == ast.N_CLASSEXPR:
-    let cs = sc_of(b, n, s)
-    resolve(&b, b.t.a[n], cs, true)
-    let h = b.t.b[n]
-    if h > 0:
-      resolve(&b, b.t.a[h], s, false)
-      resolve(&b, b.t.b[h], cs, true)
-    let im = b.t.c[n]
-    for i in 0..ast.count(b.t, im):
-      let x = ast.item(b.t, im, i)
-      resolve(&b, b.t.a[x], cs, true)
-      resolve(&b, b.t.b[x], cs, true)
-    resolve(&b, b.t.d[n], cs, false)
-    return
-  if kd == ast.N_PROP:
-    let key = b.t.a[n]
-    if b.t.k[key] == ast.N_COMPUTED: resolve(&b, key, s, false)
-    resolve(&b, b.t.b[n], s, true)
-    resolve(&b, b.t.c[n], s, false)
-    return
-  if kd == ast.N_INTERFACE:
-    let ts = sc_of(b, n, s)
-    if b.sc.sk[s] == S_MODSTR:
+# Runs the recorded events in order.
+fn run_events(var b: B):
+  var sy: [Int] = []       # assignments being resolved: the symbol (-1 unless selfish), its reads before
+  var sr: [Int] = []
+  for i in 0..b.q.len:
+    let e = b.q[i]
+    let k = e.k
+    let n = e.n
+    let s = e.s
+    if k < 64:
+      do_ref(&b, n, s, k, e.x)
+      # (the parser kept the event's index there)
+      b.t.nd[n].c = -1
+    elif k == Q_DEAD:
+      continue
+    elif k == Q_ASSIGN:
+      b.t.nd[n].c = -1
+      b.t.nd[n].d = -1
+      let unused = (e.x & 1) != 0
+      let loops = e.x >> 1
+      let op = b.t.nd[n].f
+      let ul = unparen(b.t, b.t.nd[n].a)
+      var f = R_WRITE
+      if op != T_ASSIGN: f = R_WRITE | R_READ
+      # an assignment statement to a variable of this function: reading it to compute its own new
+      # value isn't a use (a = a + 1, a += 1)
+      let y0 = lookup(b.sc, s, b.t.nd[ul].s, false)
+      var selfish = unused and y0 >= 0
+      if selfish and op == T_ASSIGN:
+        # (a = a + 1 in another function, or in a loop, uses the old value)
+        selfish = b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops == 0
+      elif selfish and b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops > 0: selfish = false
+      if selfish and op != T_ASSIGN: f = f | R_SELF
+      do_ref(&b, ul, s, f, b.t.nd[n].pos)
+      if selfish:
+        sy.push(y0)
+        sr.push(b.sc.reads[y0])
+      else:
+        sy.push(-1)
+        sr.push(0)
+    elif k == Q_ASSIGN_END:
+      let y = sy.pop()
+      let before = sr.pop()
+      # take back the reads (not inside a function within the right side) that only compute y
+      if y >= 0 and b.sc.reads[y] != before: b.sc.reads[y] -= self_reads(b, n, y, false)
+    elif k == Q_UPDATE:
+      let unused = (e.x & 1) != 0
+      let loops = e.x >> 1
+      let x = unparen(b.t, b.t.nd[n].a)
+      var f = R_WRITE | R_READ
+      let y0 = lookup(b.sc, s, b.t.nd[x].s, false)
+      if unused and y0 >= 0 and not (b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops > 0): f = f | R_SELF
+      do_ref(&b, x, s, f, b.t.nd[n].pos)
+      b.t.nd[n].c = -1
+    elif k == Q_SETLOOP:
+      let y = sym_of(b.sc, n)
+      if y >= 0 and b.sc.yk[y] != Y_PARAM: b.sc.yloop[y] = e.x
+    elif k == Q_VARFN:
+      # a function or class initializer: references to the variable inside it are its own
+      let y = sym_of(b.sc, n)
+      if y >= 0:
+        b.sc.ylo[y] = b.t.nd[s].pos
+        b.sc.yhi[y] = b.t.nd[s].end
+        if b.t.nd[s].k != ast.N_CLASSEXPR: b.sc.fsym[s] = y
+    elif k == Q_LOOPVAR:
+      loop_var_used(&b, n)
+    elif k == Q_IFACE:
       # an interface augmenting a module: an import of the same name counts as used
-      let y = lookup(b.sc, 0, b.t.s[n], true)
+      if b.sc.sk[s] != S_MODSTR: continue
+      let y = lookup(b.sc, 0, b.t.nd[n].s, true)
       if y >= 0 and (b.sc.yk[y] == Y_IMPORT or b.sc.yk[y] == Y_IMPORTTYPE): b.sc.reads[y] += 1
-    resolve(&b, b.t.a[n], ts, true)
-    let ex = b.t.b[n]
-    for i in 0..ast.count(b.t, ex):
-      let x = ast.item(b.t, ex, i)
-      resolve(&b, b.t.a[x], ts, true)
-      resolve(&b, b.t.b[x], ts, true)
-    resolve(&b, b.t.c[n], ts, true)
-    return
-  if kd == ast.N_TYPEALIAS:
-    let ts = sc_of(b, n, s)
-    resolve(&b, b.t.a[n], ts, true)
-    resolve(&b, b.t.b[n], ts, true)
-    return
-  if kd == ast.N_TPARAM:
-    resolve(&b, b.t.a[n], s, true)
-    resolve(&b, b.t.b[n], s, true)
-    return
-  if kd == ast.N_ENUM:
-    let es = sc_of(b, n, s)
-    let lst = b.t.a[n]
-    for i in 0..ast.count(b.t, lst):
-      let m = ast.item(b.t, lst, i)
-      resolve(&b, b.t.b[m], es, false)
-    return
-  if kd == ast.N_MODULE:
-    let ms = sc_of(b, n, s)
-    resolve(&b, b.t.b[n], ms, false)
-    return
-  if kd == ast.N_IMPORT: return
-  if kd == ast.N_IMPORTEQ:
-    let r = b.t.a[n]
-    if r > 0 and b.t.k[r] != ast.N_EXTERNALREF: resolve_entity(&b, r, s, false)
-    return
-  if kd == ast.N_EXPORT:
-    if b.t.a[n] > 0: return    # export ... from "x"
-    let sp = b.t.b[n]
-    for i in 0..ast.count(b.t, sp):
-      let x = ast.item(b.t, sp, i)
-      var nm = b.t.s[x]
-      var at = x
-      if b.t.b[x] > 0:
-        nm = b.t.s[b.t.b[x]]
-        at = b.t.b[x]
+    elif k == Q_EXPSPEC:
+      var nm = b.t.nd[n].s
+      var at = n
+      if b.t.nd[n].b > 0:
+        nm = b.t.nd[b.t.nd[n].b].s
+        at = b.t.nd[n].b
       var y = lookup(b.sc, s, nm, false)
       if y < 0: y = lookup(b.sc, s, nm, true)
       if y >= 0:
@@ -835,202 +614,29 @@ fn resolve(var b: B, n: Int, s: Int, ty: Bool):
         b.sc.anyref[y] += 1
         b.sc.yf[y] = b.sc.yf[y] | F_EXPORTED
         b.sc.res[at] = y
-    return
-  if kd == ast.N_EXPORTDEFAULT or kd == ast.N_EXPORTASSIGN:
-    let e = unparen(b.t, b.t.a[n])
-    if b.t.k[e] == ast.N_ID:
-      var y = lookup(b.sc, s, b.t.s[e], false)
-      if y < 0: y = lookup(b.sc, s, b.t.s[e], true)
-      b.sc.res[e] = y
+    elif k == Q_EXPDEF:
+      var y = lookup(b.sc, s, b.t.nd[n].s, false)
+      if y < 0: y = lookup(b.sc, s, b.t.nd[n].s, true)
+      b.sc.res[n] = y
       if y >= 0:
         b.sc.reads[y] += 1
         b.sc.anyref[y] += 1
         b.sc.yf[y] = b.sc.yf[y] | F_EXPORTED
-      return
-    resolve(&b, b.t.a[n], s, false)
-    return
-  if kd == ast.N_BLOCK:
-    resolve(&b, b.t.a[n], sc_of(b, n, s), false)
-    return
-  if kd == ast.N_WHILE or kd == ast.N_DO:
-    b.loops += 1
-    resolve_kids(&b, n, s, false)
-    b.loops -= 1
-    return
-  if kd == ast.N_FOR:
-    b.loops += 1
-    let fs = sc_of(b, n, s)
-    let init = b.t.a[n]
-    resolve(&b, init, fs, false)
-    resolve(&b, b.t.b[n], fs, false)
-    let upd = b.t.c[n]
-    resolve(&b, upd, fs, false)
-    resolve(&b, b.t.d[n], fs, false)
-    b.loops -= 1
-    return
-  if kd == ast.N_FORIN:
-    b.loops += 1
-    let fs = sc_of(b, n, s)
-    let left = b.t.a[n]
-    let before = b.sc.yn.len
-    if left > 0 and b.t.k[left] == ast.N_VAR:
-      let lst = b.t.a[left]
-      for i in 0..ast.count(b.t, lst):
-        let d = ast.item(b.t, lst, i)
-        pattern_exprs(&b, b.t.a[d], fs)
-        resolve(&b, b.t.b[d], fs, true)
-    else: target(&b, left, fs, R_WRITE)
-    if body_returns(b, b.t.c[n]): loop_var_used(&b, left)
-    resolve(&b, b.t.b[n], fs, false)
-    resolve(&b, b.t.c[n], fs, false)
-    let unused_b = before
-    b.loops -= 1
-    return
-  if kd == ast.N_SWITCH:
-    resolve(&b, b.t.a[n], s, false)
-    resolve(&b, b.t.b[n], sc_of(b, n, s), false)
-    return
-  if kd == ast.N_TRY:
-    resolve(&b, b.t.a[n], s, false)
-    let cd = b.t.b[n]
-    let cb = b.t.c[n]
-    if cb > 0:
-      let cs = sc_of(b, cb, s)
-      if cd > 0:
-        pattern_exprs(&b, b.t.a[cd], cs)
-        resolve(&b, b.t.b[cd], cs, true)
-      resolve(&b, b.t.a[cb], cs, false)
-    resolve(&b, b.t.d[n], s, false)
-    return
-  if kd == ast.N_PROPACCESS:
-    resolve(&b, b.t.a[n], s, ty)
-    return
-  if kd == ast.N_QNAME:
-    resolve_entity(&b, n, s, ty)
-    return
-  if kd == ast.N_PROPASSIGN or kd == ast.N_BINDEL or kd == ast.N_ENUMMEMBER:
-    let key = b.t.a[n]
-    if key > 0 and b.t.k[key] == ast.N_COMPUTED: resolve(&b, key, s, false)
-    resolve(&b, b.t.b[n], s, ty)
-    resolve(&b, b.t.c[n], s, ty)
-    return
-  if kd == ast.N_SHORTHAND:
-    ref(&b, n, s, R_READ)
-    resolve(&b, b.t.b[n], s, false)
-    return
-  if kd == ast.N_LABEL:
-    resolve(&b, b.t.a[n], s, false)
-    return
-  if kd == ast.N_BREAK or kd == ast.N_CONTINUE or kd == ast.N_METAPROP or kd == ast.N_PRIVNAME or kd == ast.N_SPEC: return
-  if kd == ast.N_TREF:
-    resolve_entity(&b, b.t.a[n], s, true)
-    resolve(&b, b.t.b[n], s, true)
-    return
-  if kd == ast.N_TQUERY:
-    resolve_entity(&b, b.t.a[n], s, false)
-    resolve(&b, b.t.b[n], s, true)
-    return
-  if kd == ast.N_TIMPORT:
-    resolve(&b, b.t.c[n], s, true)
-    return
-  if kd == ast.N_TFUNC or kd == ast.N_CALLSIG or kd == ast.N_CTORSIG:
-    resolve(&b, b.t.b[n], sc_of(b, n, s), true)
-    return
-  if kd == ast.N_SIG:
-    let ts = sc_of(b, n, s)
-    resolve(&b, b.t.a[n], ts, true)
-    let ps = b.t.b[n]
-    for i in 0..ast.count(b.t, ps):
-      let p = ast.item(b.t, ps, i)
-      resolve(&b, b.t.b[p], ts, true)
-    resolve(&b, b.t.c[n], ts, true)
-    return
-  if kd == ast.N_INDEXSIG:
-    let ps = b.t.a[n]
-    for i in 0..ast.count(b.t, ps):
-      let p = ast.item(b.t, ps, i)
-      resolve(&b, b.t.b[p], s, true)
-    resolve(&b, b.t.b[n], s, true)
-    return
-  if kd == ast.N_TMAPPED or kd == ast.N_TCOND:
-    let ts = sc_of(b, n, s)
-    if kd == ast.N_TMAPPED:
-      let tp = b.t.a[n]
-      if tp > 0: resolve(&b, b.t.a[tp], ts, true)
-      resolve(&b, b.t.b[n], ts, true)
-      resolve(&b, b.t.c[n], ts, true)
-    else:
-      resolve(&b, b.t.a[n], s, true)
-      resolve(&b, b.t.b[n], ts, true)
-      resolve(&b, b.t.c[n], ts, true)
-      resolve(&b, b.t.d[n], s, true)
-    return
-  if kd == ast.N_TINFER:
-    let tp = b.t.a[n]
-    if tp > 0: resolve(&b, b.t.a[tp], s, true)
-    return
-  if kd == ast.N_TPRED:
-    if b.t.s[n] > 0:
-      let y = lookup(b.sc, s, b.t.s[n], false)
+    elif k == Q_TPRED:
+      let y = lookup(b.sc, s, b.t.nd[n].s, false)
       if y >= 0:
         b.sc.anyref[y] += 1
         b.sc.treads[y] += 1
-    resolve(&b, b.t.a[n], s, true)
-    return
-  if kd == ast.N_AS or kd == ast.N_SATISFIES or kd == ast.N_TYPEASSERT:
-    resolve(&b, b.t.a[n], s, false)
-    resolve(&b, b.t.b[n], s, true)
-    return
-  if kd == ast.N_CALL or kd == ast.N_NEW or kd == ast.N_TAGGED or kd == ast.N_EXPRTARGS:
-    resolve(&b, b.t.a[n], s, false)
-    resolve(&b, b.t.b[n], s, true)
-    resolve(&b, b.t.c[n], s, false)
-    return
-  if kd == ast.N_TTUPLEEL or kd == ast.N_TOP or kd == ast.N_TARRAY or kd == ast.N_TUNION or kd == ast.N_TINTER or kd == ast.N_TPAREN or kd == ast.N_TOBJ or kd == ast.N_TTUPLE or kd == ast.N_TINDEXED or kd == ast.N_TOPTIONAL or kd == ast.N_TREST:
-    resolve_kids(&b, n, s, true)
-    return
-  if kd == ast.N_TTEMPLATE:
-    resolve(&b, b.t.a[n], s, true)
-    return
-  if kd == ast.N_TLIT or kd == ast.N_TKW or kd == ast.N_TTHIS: return
-  if kd == ast.N_JSXELEM:
-    var nm = b.t.a[n]
-    if nm > 0 and b.t.k[nm] == ast.N_EXPRTARGS:
-      resolve(&b, b.t.b[nm], s, true)
-      nm = b.t.a[nm]
-    if nm > 0:
-      if b.t.k[nm] == ast.N_ID:
-        let s0 = b.t.names[b.t.s[nm]]
-        # an intrinsic element (div, my-element, svg:rect) isn't a reference
-        if s0.len > 0 and not (s0[0] >= 'a' and s0[0] <= 'z') and s0.find("-") < 0 and s0.find(":") < 0: ref(&b, nm, s, R_READ)
-      else: resolve(&b, nm, s, false)
-    resolve(&b, b.t.b[n], s, false)
-    resolve(&b, b.t.c[n], s, false)
-    return
-  if kd == ast.N_JSXATTR:
-    resolve(&b, b.t.b[n], s, false)
-    return
-  if kd == ast.N_JSXTEXT: return
-  resolve_kids(&b, n, s, ty)
-
-# for (x in o) return ... / for (x in o) { return ...; ... }: ESLint counts x as used.
-fn body_returns(b: B, body: Int) -> Bool:
-  var x = body
-  if x > 0 and b.t.k[x] == ast.N_BLOCK:
-    let l = b.t.a[x]
-    if ast.count(b.t, l) == 0: return false
-    x = ast.item(b.t, l, 0)
-  return x > 0 and b.t.k[x] == ast.N_RETURN
 
 fn loop_var_used(var b: B, left: Int):
   if left <= 0: return
-  let kd = b.t.k[left]
+  let kd = b.t.nd[left].k
   if kd == ast.N_VAR:
-    let lst = b.t.a[left]
+    let lst = b.t.nd[left].a
     for i in 0..ast.count(b.t, lst):
       let d = ast.item(b.t, lst, i)
-      let tg = b.t.a[d]
-      if b.t.k[tg] == ast.N_ID:
+      let tg = b.t.nd[d].a
+      if b.t.nd[tg].k == ast.N_ID:
         let y = sym_of(b.sc, tg)
         if y >= 0: b.sc.reads[y] += 1
   elif kd == ast.N_ID:
@@ -1039,172 +645,31 @@ fn loop_var_used(var b: B, left: Int):
 
 fn unparen(t: ast.Ast, n: Int) -> Int:
   var x = n
-  while x > 0 and t.k[x] == ast.N_PAREN: x = t.a[x]
+  while x > 0 and t.nd[x].k == ast.N_PAREN: x = t.nd[x].a
   return x
-
-# An entity name: its leftmost identifier is the reference.
-fn resolve_entity(var b: B, n: Int, s: Int, ty: Bool):
-  if n <= 0: return
-  var x = n
-  var qualified = false
-  while b.t.k[x] == ast.N_QNAME:
-    x = b.t.a[x]
-    qualified = true
-  if b.t.k[x] == ast.N_ID:
-    # A.B in a type position: A is a namespace (or an enum, a class...): look it up as either
-    if ty and qualified: ref(&b, x, s, R_TYPE | R_QUAL)
-    elif ty: ref(&b, x, s, R_TYPE)
-    else: ref(&b, x, s, R_READ)
-  else: resolve(&b, x, s, ty)
-
-# Default values and computed keys inside a binding pattern.
-fn pattern_exprs(var b: B, n: Int, s: Int):
-  if n <= 0: return
-  let kd = b.t.k[n]
-  if kd == ast.N_OBJPAT or kd == ast.N_ARRPAT:
-    let lst = b.t.a[n]
-    for i in 0..ast.count(b.t, lst):
-      let e = ast.item(b.t, lst, i)
-      if b.t.k[e] != ast.N_BINDEL: continue
-      let key = b.t.a[e]
-      if key > 0 and b.t.k[key] == ast.N_COMPUTED: resolve(&b, key, s, false)
-      pattern_exprs(&b, b.t.b[e], s)
-      resolve(&b, b.t.c[e], s, false)
-
-fn set_loop(var b: B, tg: Int):
-  if tg > 0 and b.t.k[tg] == ast.N_ID:
-    let y = sym_of(b.sc, tg)
-    if y >= 0 and b.sc.yk[y] != Y_PARAM: b.sc.yloop[y] = b.loops
-
-fn resolve_function(var b: B, n: Int, s: Int):
-  let was = b.loops
-  b.loops = 0
-  resolve_function2(&b, n, s)
-  b.loops = was
-
-fn resolve_function2(var b: B, n: Int, s: Int):
-  let kd = b.t.k[n]
-  let fs = sc_of(b, n, s)
-  var sig = n
-  var body = b.t.d[n]
-  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
-    sig = b.t.b[n]
-    body = b.t.c[n]
-    if kd != ast.N_CTOR:
-      let key = b.t.a[n]
-      if key > 0 and b.t.k[key] == ast.N_COMPUTED: resolve(&b, key, s, false)
-  if sig > 0:
-    resolve(&b, b.t.a[sig], fs, true)
-    let ps = b.t.b[sig]
-    for i in 0..ast.count(b.t, ps):
-      let p = ast.item(b.t, ps, i)
-      pattern_exprs(&b, b.t.a[p], fs)
-      resolve(&b, b.t.b[p], fs, true)
-      resolve(&b, b.t.c[p], fs, false)
-    resolve(&b, b.t.c[sig], fs, true)
-  if body > 0:
-    if b.t.k[body] == ast.N_BLOCK: resolve(&b, b.t.a[body], fs, false)
-    else: resolve(&b, body, fs, false)
-
-# An expression whose value is unused (a statement, a for header's init or update).
-fn stmt_expr(var b: B, e: Int, s: Int):
-  if e <= 0: return
-  let kd = b.t.k[e]
-  if kd == ast.N_BINARY:
-    let op = b.t.f[e]
-    if op == T_ASSIGN or (op >= scan.T_PLUSEQ and op <= scan.T_QQEQ):
-      assign(&b, e, s, true)
-      return
-    if op == T_COMMA:
-      stmt_expr(&b, b.t.a[e], s)
-      stmt_expr(&b, b.t.b[e], s)
-      return
-  if (kd == ast.N_PREFIX or kd == ast.N_POSTFIX) and (b.t.f[e] == T_INC or b.t.f[e] == T_DEC):
-    update(&b, e, s, true)
-    return
-  if kd == ast.N_PAREN:
-    stmt_expr(&b, b.t.a[e], s)
-    return
-  resolve(&b, e, s, false)
-
-fn assign(var b: B, n: Int, s: Int, unused: Bool):
-  let was = b.wexpr
-  b.wexpr = b.t.pos[n]
-  assign2(&b, n, s, unused)
-  b.wexpr = was
-
-fn assign2(var b: B, n: Int, s: Int, unused: Bool):
-  let op = b.t.f[n]
-  let left = b.t.a[n]
-  let right = b.t.b[n]
-  let ul = unparen(b.t, left)
-  if b.t.k[ul] == ast.N_ID:
-    var f = R_WRITE
-    if op != T_ASSIGN: f = R_WRITE | R_READ
-    # an assignment statement to a variable of this function: reading it to compute its own new
-    # value isn't a use (a = a + 1, a += 1)
-    let y0 = lookup(b.sc, s, b.t.s[ul], false)
-    var selfish = unused and y0 >= 0
-    if selfish and op == T_ASSIGN:
-      # (a = a + 1 in another function, or in a loop, uses the old value)
-      selfish = b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops == 0
-    elif selfish and b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops > 0: selfish = false
-    if selfish and op != T_ASSIGN: f = f | R_SELF
-    ref(&b, ul, s, f)
-    if selfish: resolve_self(&b, right, s, y0)
-    else: resolve(&b, right, s, false)
-    return
-  if op == T_ASSIGN: target(&b, left, s, R_WRITE)
-  else: resolve(&b, left, s, false)
-  resolve(&b, right, s, false)
-
-fn update(var b: B, n: Int, s: Int, unused: Bool):
-  let was = b.wexpr
-  b.wexpr = b.t.pos[n]
-  update2(&b, n, s, unused)
-  b.wexpr = was
-
-fn update2(var b: B, n: Int, s: Int, unused: Bool):
-  let x = unparen(b.t, b.t.a[n])
-  if b.t.k[x] == ast.N_ID:
-    var f = R_WRITE | R_READ
-    let y0 = lookup(b.sc, s, b.t.s[x], false)
-    if unused and y0 >= 0 and not (b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and b.loops > 0): f = f | R_SELF
-    ref(&b, x, s, f)
-    return
-  resolve(&b, b.t.a[n], s, false)
-
-# Resolves n, with reads of symbol y (outside functions inside n) counted as self references.
-fn resolve_self(var b: B, n: Int, s: Int, y: Int):
-  let before = b.sc.reads[y]
-  resolve(&b, n, s, false)
-  if b.sc.reads[y] == before: return
-  # take back the reads not inside a function within n
-  let cnt = self_reads(b, n, y, false)
-  b.sc.reads[y] -= cnt
 
 # The reads of y in n that only compute a new value for y (call arguments and values stored
 # elsewhere are uses).
 fn self_reads(b: B, n: Int, y: Int, in_fn: Bool) -> Int:
   if n <= 0: return 0
-  let kd = b.t.k[n]
+  let kd = b.t.nd[n].k
   if kd == ast.N_LIST:
     var c = 0
-    for i in 0..b.t.b[n]: c += self_reads(b, b.t.L[b.t.a[n] + i], y, in_fn)
+    for i in 0..b.t.nd[n].b: c += self_reads(b, b.t.L[b.t.nd[n].a + i], y, in_fn)
     return c
   if kd == ast.N_ID or kd == ast.N_SHORTHAND:
     if res_of(b.sc, n) == y and not self_ref_at(b, n, y): return 1
     return 0
   if kd == ast.N_CALL or kd == ast.N_NEW:
-    return self_reads(b, b.t.a[n], y, in_fn)
+    return self_reads(b, b.t.nd[n].a, y, in_fn)
   if kd == ast.N_BINARY:
-    let op = b.t.f[n]
+    let op = b.t.nd[n].f
     if op == T_ASSIGN or (op >= scan.T_PLUSEQ and op <= scan.T_QQEQ): return 0
-  var c = self_reads(b, b.t.a[n], y, in_fn) + self_reads(b, b.t.b[n], y, in_fn) + self_reads(b, b.t.c[n], y, in_fn)
-  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS: c += self_reads(b, b.t.d[n], y, in_fn)
+  var c = self_reads(b, b.t.nd[n].a, y, in_fn) + self_reads(b, b.t.nd[n].b, y, in_fn) + self_reads(b, b.t.nd[n].c, y, in_fn)
+  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS: c += self_reads(b, b.t.nd[n].d, y, in_fn)
   return c
 
 # Whether a reference already didn't count as a use (inside the symbol's own declaration).
 fn self_ref_at(b: B, n: Int, y: Int) -> Bool:
-  let p = b.t.pos[n]
+  let p = b.t.nd[n].pos
   return b.sc.ylo[y] >= 0 and p >= b.sc.ylo[y] and p < b.sc.yhi[y]

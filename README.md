@@ -497,6 +497,11 @@ lower is better. (Earlier rounds measured on another VM, where every time was hi
 not checked rather than guessing. Its parser handles the same 2.0 MB in 52 ms. Details, caveats
 and how it's tested against tsc: `ts/README.md`.
 
+The same directory holds vlint, a linter that prints exactly what oxlint prints for its 96
+default rules (every warning matched on date-fns, zod, vscode, preact, excalidraw and more). It
+takes about as much CPU as oxlint (Rust), 13 times less than Biome and 130 times less than ESLint
+(measured on a loaded 2-core VM; `ts/README.md`).
+
 ## A ShellCheck-compatible linter in Vu
 
 `shellcheck/` holds vsc, a port of ShellCheck 0.11.0 (parser, variable flow, control flow and

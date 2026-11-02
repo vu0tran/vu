@@ -1,0 +1,176 @@
+# vlint's result cache (`--cache`): each file's output lines, keyed by its path, size and a 64-bit
+# hash of its content, under a key for the vlint binary itself (a hash of its executable, the
+# version and the options that change what it prints). A file whose size, modification and change
+# times and inode are what they were is a hit without being read; otherwise its content hash decides.
+#
+# The file: one header line, then the records:
+#   vlintcache1 CFG NREC BODYLEN BODYHASH\n
+#   PATHLEN SIZE MTIME CTIME INO HASH NLINES TEXTLEN\nPATH TEXT     (TEXT: the lines joined by \n)
+# A header that doesn't match (another binary or options), a short file or a body whose hash is
+# wrong is ignored, and the cache is rebuilt. It's written to a temporary file and renamed.
+
+extern "lcache_glue.c":
+  fn vl_stat(ffi: Ffi, path: Str, var out: [Int]) -> Bool
+  fn vl_now_ns(ffi: Ffi) -> Int
+
+const VERSION = "vlint-cache-1"
+const P1 = -7046029288634856825
+const P2 = -4417276706812531889
+const P3 = 1609587929392839161
+const P4 = -8796714831421723037
+const P5 = 2870177450012600261
+
+fn mix(h: Int, w: Int) -> Int:
+  var k = w *% P2
+  k = (k << 31) | (k >>> 33)
+  k = k *% P1
+  var x = h ^ k
+  x = (x << 27) | (x >>> 37)
+  return x *% P1 +% P4
+
+# A 64-bit hash of a string's bytes (xxHash64's word step and finish, one lane).
+fn hash64(s: Str) -> Int:
+  let n = s.len
+  var h = P5 +% n
+  var i = 0
+  while i + 8 <= n:
+    h = mix(h, s.read_le(i, 8))
+    i += 8
+  if i < n: h = mix(h, s.read_le(i, n - i) ^ ((n - i) << 56))
+  h = h ^ (h >>> 33)
+  h = h *% P2
+  h = h ^ (h >>> 29)
+  h = h *% P3
+  return h ^ (h >>> 32)
+
+fn hex16(x: Int) -> Str:
+  let digits = "0123456789abcdef"
+  var s = ""
+  var i = 15
+  while i >= 0:
+    let d = (x >>> (i * 4)) & 15
+    s += digits[d..d + 1]
+    i -= 1
+  return s
+
+type Cache:
+  paths: [Str]
+  size: [Int]
+  mt: [Int]
+  ct: [Int]
+  ino: [Int]
+  hash: [Int]
+  nl: [Int]
+  text: [Str]
+  at: {Str: Int}
+
+fn empty() -> Cache:
+  return Cache([], [], [], [], [], [], [], [], {})
+
+fn add(var c: Cache, path: Str, size: Int, mt: Int, ct: Int, ino: Int, hash: Int, nl: Int, text: Str):
+  c.at[path] = c.paths.len
+  c.paths.push(path)
+  c.size.push(size)
+  c.mt.push(mt)
+  c.ct.push(ct)
+  c.ino.push(ino)
+  c.hash.push(hash)
+  c.nl.push(nl)
+  c.text.push(text)
+
+# The key for this binary and these options; 0 when the executable can't be read (no cache then).
+fn config_key(fs: Fs, opts: Str) -> Int:
+  let exe = fs.read("/proc/self/exe") else return 0
+  if exe.len == 0: return 0
+  var h = hash64(exe) ^ hash64(VERSION + "\n" + opts)
+  if h == 0: h = 1
+  return h
+
+# A decimal number at s[i] (an optional minus), followed by one separator byte; ok turns false on
+# anything else.
+fn num(s: Str, var i: Int, var ok: Bool) -> Int:
+  let n = s.len
+  var neg = false
+  if i < n and s[i] == '-':
+    neg = true
+    i += 1
+  var lim = 7
+  if neg: lim = 8
+  var v = 0                     # minus the number, so that the smallest Int fits
+  var digits = 0
+  while i < n:
+    let b = int(s[i])
+    if b < 48 or b > 57: break
+    let d = b - 48
+    if v < -922337203685477580 or (v == -922337203685477580 and d > lim):
+      ok = false
+      return 0
+    v = v * 10 - d
+    digits += 1
+    i += 1
+  if digits == 0 or i >= n:
+    ok = false
+    return 0
+  i += 1
+  if neg: return v
+  return 0 - v
+
+fn load(fs: Fs, loc: Str, cfg: Int) -> Cache:
+  var c = empty()
+  let data = fs.read(loc) else return c
+  let nl = data.find("\n")
+  if nl < 0 or nl > 200: return c
+  let head = data[0..nl].split(" ")
+  if head.len != 5 or head[0] != "vlintcache1" or head[1] != hex16(cfg): return c
+  let nrec = int(head[2]) else return c
+  let blen = int(head[3]) else return c
+  let bstart = nl + 1
+  if blen != data.len - bstart or nrec < 0: return c
+  let body = data[bstart..data.len]
+  if hex16(hash64(body)) != head[4]: return c
+  var i = 0
+  var ok = true
+  for r in 0..nrec:
+    let pl = num(body, &i, &ok)
+    let size = num(body, &i, &ok)
+    let mt = num(body, &i, &ok)
+    let ct = num(body, &i, &ok)
+    let ino = num(body, &i, &ok)
+    let h = num(body, &i, &ok)
+    let lines = num(body, &i, &ok)
+    let tl = num(body, &i, &ok)
+    if not ok or pl < 0 or tl < 0 or lines < 0 or pl > body.len - i or tl > body.len - i - pl:
+      return empty()
+    let path = body[i..i + pl]
+    let text = body[i + pl..i + pl + tl]
+    i += pl + tl
+    if c.at.get(path, -1) < 0: add(&c, path, size, mt, ct, ino, h, lines, text)
+  if i != body.len: return empty()
+  return c
+
+fn encode(c: Cache, cfg: Int) -> Str:
+  var body = ""
+  var total = 0
+  for k in 0..c.paths.len: total += c.paths[k].len + c.text[k].len + 64
+  body.reserve(total)
+  for k in 0..c.paths.len:
+    body += "{c.paths[k].len} {c.size[k]} {c.mt[k]} {c.ct[k]} {c.ino[k]} {c.hash[k]} {c.nl[k]} {c.text[k].len}\n"
+    body += c.paths[k]
+    body += c.text[k]
+  return "vlintcache1 {hex16(cfg)} {c.paths.len} {body.len} {hex16(hash64(body))}\n" + body
+
+# Writes the cache to a temporary file beside it and renames it into place, so a reader (or another
+# run writing at the same time) sees a whole file, the old one or the new one. Failures are ignored.
+fn save(fs: Fs, ffi: Ffi, loc: Str, data: Str):
+  let tmp = loc + ".tmp" + hex16(hash64(loc + "{vl_now_ns(ffi)}") ^ hash64(data))
+  fs.write(tmp, data) else return
+  var moved = true
+  fs.rename(tmp, loc) else moved = false
+  if not moved: fs.remove(tmp) else 0
+
+# Size, modification and change times (ns) and inode into st[0..4]; false when it isn't a file.
+fn stat(ffi: Ffi, path: Str, var st: [Int]) -> Bool:
+  return vl_stat(ffi, path, &st)
+
+fn now_ns(ffi: Ffi) -> Int:
+  return vl_now_ns(ffi)
