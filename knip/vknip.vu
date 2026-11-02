@@ -1,0 +1,2331 @@
+# vknip: finds unused files, dependencies and exports in a JavaScript or TypeScript project, and
+# prints what knip (https://knip.dev, version 6.44.1) prints for them:
+#
+#   vknip [--directory DIR] [--reporter symbols|json] [--include-entry-exports] [--jobs N]
+#
+# It follows knip's own logic (entry files from package.json, its default patterns and plugins,
+# the import graph from them, then what nothing reaches or uses), with vtsc's parser for the files.
+
+import json
+import scan
+import ast
+import glob
+import pkg
+import resolve
+import extract
+import scripts
+from json import Value
+from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT
+from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC
+from resolve import Resolver, Res, R_UNRESOLVED, R_FILE, R_EXTERNAL, R_BUILTIN
+
+const EXTS_GLOB = "js,mjs,cjs,jsx,ts,tsx,mts,cts"
+
+# ---- issues
+
+type Issue:
+  typ: Str          # files, dependencies, devDependencies, unlisted, binaries, unresolved, exports, types, enumMembers, namespaceMembers, duplicates
+  file: Str
+  symbol: Str
+  display: Str      # what the symbol column shows
+  stype: Str        # symbol type ("" none)
+  parent: Str
+  line: Int         # 0: none
+  col: Int
+  pos: Int
+  extra: Str        # duplicates: their names and positions as JSON
+
+type Issues:
+  list: [Issue]
+  seen: {Str: Bool}
+
+fn add_issue(var is: Issues, own i: Issue):
+  var sym = i.symbol + ""
+  if i.parent != "": sym = i.parent + "." + i.symbol
+  let key = i.typ + "\0" + i.file + "\0" + sym
+  if key in is.seen: return
+  is.seen[key] = true
+  is.list.push(i)
+
+fn issue(typ: Str, file: Str, symbol: Str) -> Issue:
+  return Issue(typ + "", file + "", symbol + "", symbol + "", "", "", 0, 0, 0, "")
+
+# ---- ICU-like string order (Intl.Collator's root collation for ASCII: punctuation, digits, letters
+# without case first, then lowercase before uppercase)
+
+const COLL = " _-,;:!?.'\"()[]{{}}@*/\\&#%`^+<=>|~$0123456789aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ"
+
+fn coll_table() -> [Int]:
+  var prim = [0] * 256
+  var tert = [0] * 256
+  var rank = 1
+  var i = 0
+  while i < COLL.len:
+    let c = int(COLL[i])
+    if c >= 97 and c <= 122:
+      prim[c] = rank
+      prim[c - 32] = rank
+      tert[c] = 0
+      tert[c - 32] = 1
+      rank += 1
+      i += 2
+      continue
+    prim[c] = rank
+    rank += 1
+    i += 1
+  for b in 128..256: prim[b] = 1000 + b
+  for b in 0..32: prim[b] = b - 32
+  var out: [Int] = []
+  for b in 0..256: out.push(prim[b])
+  for b in 0..256: out.push(tert[b])
+  return out
+
+fn coll_cmp(t: [Int], a: Str, b: Str) -> Int:
+  let n = min(a.len, b.len)
+  for i in 0..n:
+    let pa = t[int(a[i])]
+    let pb = t[int(b[i])]
+    if pa != pb:
+      if pa < pb: return -1
+      return 1
+  if a.len != b.len:
+    if a.len < b.len: return -1
+    return 1
+  for i in 0..n:
+    let ta = t[256 + int(a[i])]
+    let tb = t[256 + int(b[i])]
+    if ta != tb:
+      if ta < tb: return -1
+      return 1
+  return 0
+
+# ---- the project
+
+type Dep:
+  bins: [Str]
+  peers: [Str]
+  types: Bool
+  installed: Bool
+
+type Proj:
+  root: Str                  # prefix for the file system ("" or "dir/")
+  manifest: Value
+  manifest_str: Str
+  name: Str
+  deps: [Str]
+  dev_deps: [Str]
+  peer_deps: [Str]
+  opt_deps: [Str]
+  opt_peer: {Str: Bool}
+  all_deps: {Str: Bool}
+  engines: {Str: Bool}
+  scripts: {Str: Str}
+  bins: {Str: [Str]}         # installed binary -> packages
+  hosts: {Str: [Str]}        # package -> the packages that have it as a peer dependency
+  types_included: {Str: Bool}
+  uninstalled_opt: [Str]
+  referenced: {Str: Bool}
+  files: [Str]               # project files found by the walk (not ignored)
+  file_set: {Str: Bool}
+  ign: [glob.Pat]
+  unign: [glob.Pat]
+  ign_exact: [glob.Pat]       # "*" and "**": not extended to what's below a match
+  unign_exact: [glob.Pat]
+  plugins: {Str: Bool}
+  inputs: [Input]
+  issues: Issues
+  rs: Resolver
+  coll: [Int]
+  tsc_types: [Str]
+  dts_entries: [Str]
+  src_dir: Str               # tsconfig source mapping (outDir -> srcDir)
+  out_dir: Str
+  config_files: {Str: Bool}  # plugin config files seen
+
+fn new_proj(root: Str) -> Proj:
+  return Proj(root, json.Null, "", "", [], [], [], [], {}, {}, {}, {}, {}, {}, {}, [], {}, [], {}, [], [], [], [], {}, [], Issues([], {}), resolve.new_resolver(root), coll_table(), [], [], "", "", {})
+
+fn fspath(p: Proj, rel: Str) -> Str:
+  if rel == "":
+    if p.root == "": return "."
+    return p.root[0..p.root.len - 1]
+  return p.root + rel
+
+fn exists_file(p: Proj, fs: Fs, rel: Str) -> Bool:
+  return fs.exists(fspath(p, rel)) and not fs.exists(fspath(p, rel) + "/")
+
+# ---- .gitignore
+
+fn convert_gitignore(line0: Str) -> Str:
+  var pattern = line0
+  if pattern.startswith("!"): pattern = pattern[1..pattern.len]
+  if pattern.endswith("/"): pattern = pattern[0..pattern.len - 1]
+  if pattern.startswith("*/**/"): pattern = pattern[5..pattern.len]
+  if pattern == "*" or pattern == "**": return pattern
+  if pattern.startswith("/"): return pattern[1..pattern.len]
+  if not pattern.startswith("**/"): return "**/" + pattern
+  return pattern
+
+fn add_gitignore(var p: Proj, text: Str, base: Str):
+  for raw in text.split("\n"):
+    var line = raw
+    if line.endswith("\r"): line = line[0..line.len - 1]
+    if line.strip() == "" or line.startswith("#"): continue
+    if line.startswith("\\#"): line = line[1..line.len]
+    line = line.strip()
+    let neg = line.startswith("!")
+    var pat = convert_gitignore(line)
+    let exact = pat == "*" or pat == "**"
+    if base != "": pat = resolve.norm(base + "/" + pat)
+    if exact and base == "":
+      if neg: p.unign_exact.push(glob.compile(pat))
+      else: p.ign_exact.push(glob.compile(pat))
+    elif neg: p.unign.push(glob.compile(pat))
+    else: p.ign.push(glob.compile(pat))
+
+fn matches_any(pats: [glob.Pat], path: Str, dot: Bool) -> Bool:
+  return glob.matches_any(pats, path, dot)
+
+# ignored: a pattern matches the path or one of its folders
+fn is_ignored_path(p: Proj, path: Str, dot: Bool) -> Bool:
+  if p.ign.len == 0 and p.ign_exact.len == 0: return false
+  var hit = matches_any(p.ign_exact, path, dot)
+  var cur = path
+  while not hit and cur != "":
+    if matches_any(p.ign, cur, dot): hit = true
+    cur = resolve.dirname(cur)
+  if not hit: return false
+  if p.unign.len == 0 and p.unign_exact.len == 0: return true
+  if matches_any(p.unign_exact, path, dot): return false
+  var c2 = path
+  while c2 != "":
+    if matches_any(p.unign, c2, dot): return false
+    c2 = resolve.dirname(c2)
+  return true
+
+# (in the walk, the folders above a path aren't ignored, so only the path itself is checked)
+fn is_ignored_here(p: Proj, path: Str) -> Bool:
+  if not matches_any(p.ign, path, true) and not matches_any(p.ign_exact, path, true): return false
+  if p.unign.len == 0 and p.unign_exact.len == 0: return true
+  return not matches_any(p.unign, path, true) and not matches_any(p.unign_exact, path, true)
+
+fn walk(var p: Proj, fs: Fs, dir: Str):
+  let names = fs.list(fspath(p, dir)) else return
+  if ".gitignore" in names:
+    let text = fs.read(fspath(p, resolve.join(dir, ".gitignore"))) else ""
+    if dir != "": add_gitignore(&p, text, dir)
+  for nm in names:
+    if nm.endswith("/"):
+      let name = nm[0..nm.len - 1]
+      if name == "node_modules" or name == ".git": continue
+      let sub = resolve.join(dir, name)
+      if is_ignored_here(p, sub): continue
+      walk(&p, fs, sub)
+    else:
+      let f = resolve.join(dir, nm)
+      if is_ignored_here(p, f): continue
+      p.files.push(f)
+
+# ---- globs
+
+fn glob_files(p: Proj, patterns: [Str]) -> [Str]:
+  var pos: [glob.Pat] = []
+  var neg: [glob.Pat] = []
+  for pt in patterns:
+    var s = pt
+    if s.startswith("./"): s = s[2..s.len]
+    if s.startswith("!"): neg.push(glob.compile(s[1..s.len]))
+    else: pos.push(glob.compile(s))
+  var out: [Str] = []
+  if pos.len == 0: return out
+  for f in p.files:
+    if matches_any(pos, f, true) and not matches_any(neg, f, true): out.push(f + "")
+  return out
+
+# A glob that doesn't skip ignored files (only node_modules and .git): it walks the file system.
+fn glob_fs(p: Proj, fs: Fs, patterns: [Str]) -> [Str]:
+  var out: [Str] = []
+  var neg: [glob.Pat] = []
+  for pt in patterns:
+    if pt.startswith("!"): neg.push(glob.compile(pt[1..pt.len]))
+  var seen: {Str: Bool} = {}
+  for pt in patterns:
+    if pt.startswith("!"): continue
+    for e in glob.expand(pt):
+      var segs: [Str] = []
+      var s = e
+      if s.startswith("./"): s = s[2..s.len]
+      for x in s.split("/"): segs.push(x + "")
+      var found: [Str] = []
+      glob_walk(p, fs, "", segs, 0, &found)
+      for f in found:
+        if not (f in seen) and not matches_any(neg, f, true):
+          seen[f] = true
+          out.push(f)
+  return out
+
+fn glob_walk(p: Proj, fs: Fs, dir: Str, segs: [Str], i: Int, var out: [Str]):
+  if i >= segs.len: return
+  let seg = segs[i]
+  let last = i == segs.len - 1
+  if not glob.is_dynamic(seg):
+    let path = resolve.join(dir, seg)
+    if last:
+      if exists_file(p, fs, path): out.push(path)
+    elif fs.exists(fspath(p, path) + "/"):
+      glob_walk(p, fs, path, segs, i + 1, &out)
+    return
+  let names = fs.list(fspath(p, dir)) else return
+  if seg == "**":
+    glob_walk(p, fs, dir, segs, i + 1, &out)
+    for nm in names:
+      if nm.endswith("/"):
+        let name = nm[0..nm.len - 1]
+        if name == "node_modules" or name == ".git": continue
+        glob_walk(p, fs, resolve.join(dir, name), segs, i, &out)
+    return
+  let pt = glob.compile(seg)
+  for nm in names:
+    let isdir = nm.endswith("/")
+    var name = nm
+    if isdir: name = nm[0..nm.len - 1]
+    if name == "node_modules" or name == ".git": continue
+    if not glob.matches(pt, name, true): continue
+    let path = resolve.join(dir, name)
+    if last:
+      if not isdir: out.push(path)
+    elif isdir: glob_walk(p, fs, path, segs, i + 1, &out)
+
+# ---- package names
+
+fn starts_like_pkg(s: Str) -> Bool:
+  if s == "": return false
+  let c = s[0]
+  if c == '@':
+    if s.len < 2: return false
+    let d = s[1]
+    return is_alnum(d) or d == '.' or d == '_' or d == '~'
+  return is_alnum(c) and not (s.len > 1 and s[1] == ':')
+
+fn is_alnum(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')
+
+fn pkg_from_spec(s: Str) -> Str:
+  let tilde = s.len > 1 and s[0] == '~' and is_alnum(s[1])
+  if not starts_like_pkg(s) and not tilde: return ""
+  var start = 0
+  if s[0] == '@':
+    let sl = s.find("/", 1)
+    if sl < 0: return s + ""
+    start = sl + 1
+  for i in start..s.len:
+    if s[i] == '/' or s[i] == '@': return s[0..i]
+  return s + ""
+
+fn pkg_from_any(s: Str) -> Str:
+  if resolve.in_node_modules(s): return resolve.pkg_from_path(s)
+  return pkg_from_spec(s)
+
+fn dt_for(name: Str) -> Str:
+  if name.startswith("@types/"): return name + ""
+  if name.startswith("@"): return "@types/" + name[1..name.len].replace("/", "__")
+  return "@types/" + name
+
+fn pkg_from_dt(typed: Str) -> Str:
+  let i = typed.find("__")
+  if i >= 0: return "@" + typed[0..i] + "/" + typed[i + 2..typed.len]
+  return typed + ""
+
+# ---- dependencies (DependencyDeputy)
+
+fn reference(var p: Proj, name: Str):
+  p.referenced[name] = true
+
+fn host_in_deps(p: Proj, name: Str) -> Bool:
+  if not (name in p.hosts): return false
+  for h in p.hosts[name]:
+    if h in p.all_deps: return true
+  return false
+
+fn maybe_add_external(var p: Proj, name: Str, spec: Str, dev_only: Bool, type_only: Bool, resolved: Bool) -> Bool:
+  if spec.startswith("node:") or spec.startswith("cloudflare:") or resolve.is_builtin(spec): return true
+  if name == "node" or name == "bun" or name == "deno": return true
+  if name == p.name: return true
+  let in_deps = name in p.all_deps
+  var types_pkg = ""
+  if not name.startswith("@types/"): types_pkg = dt_for(name)
+  let types_in = types_pkg != "" and types_pkg in p.all_deps
+  if types_in and not (name in p.types_included): reference(&p, types_pkg)
+  if in_deps:
+    reference(&p, name)
+    return true
+  if types_in and type_only: return true
+  if name in p.engines: return true
+  if resolved and host_in_deps(p, name):
+    reference(&p, name)
+    return true
+  reference(&p, name)
+  return false
+
+fn is_referenced_dep(p: Proj, dep: Str, var visited: {Str: Bool}) -> Bool:
+  if dep in p.referenced: return true
+  if dep in visited: return false
+  visited[dep] = true
+  if dep.startswith("@types/"):
+    let typed = pkg_from_dt(dep[7..dep.len])
+    if typed == "node" or typed == "bun" or typed == "jest": return true
+    if typed in p.types_included: return false
+    var hs: [Str] = []
+    if dep in p.hosts:
+      for h in p.hosts[dep]: hs.push(h + "")
+    if typed in p.hosts:
+      for h in p.hosts[typed]: hs.push(h + "")
+    if hs.len > 0:
+      for h in hs:
+        if is_referenced_dep(p, h, &visited): return true
+      return false
+    return false
+  if dep in p.hosts:
+    for h in p.hosts[dep]:
+      if is_referenced_dep(p, h, &visited): return true
+  return false
+
+# where a dependency is listed (PackagePeeker)
+fn dep_location(p: Proj, section: Str, name: Str) -> [Int]:
+  let lines = p.manifest_str.split("\n")
+  var start = -1
+  var spos = 0
+  var pos = 0
+  for i in 0..lines.len:
+    let l = lines[i]
+    var sec = ""
+    if l.find("\"dependencies\"") >= 0: sec = "dependencies"
+    elif l.find("\"devDependencies\"") >= 0: sec = "devDependencies"
+    elif l.find("\"optionalPeerDependencies\"") >= 0: sec = "optionalPeerDependencies"
+    if sec == section:
+      start = i
+      spos = pos
+    pos += extract.u16(l, 0, l.len) + 1
+  if start < 0: return []
+  var q = spos + extract.u16(lines[start], 0, lines[start].len) + 1
+  for i in start + 1..lines.len:
+    let l = lines[i]
+    if l.find("\"" + name + "\"") >= 0:
+      let col = extract.u16(l, 0, l.find(name))
+      return [i + 1, col + 1, q + col]
+    q += extract.u16(l, 0, l.len) + 1
+  return []
+
+# ---- tsconfig
+
+fn tsconfig_chain(var p: Proj, fs: Fs, path: Str, var opts: {Str: Value}, var top: {Str: Value}, depth: Int):
+  if depth > 8: return
+  let v = pkg.read_json(fs, fspath(p, path))
+  if not pkg.is_obj(v): return
+  let dir = resolve.dirname(path)
+  # extends first (its settings are overridden by this file's)
+  let ex = pkg.get(v, "extends")
+  for e in pkg.strs(ex):
+    var target = ""
+    if e.startswith("./") or e.startswith("../") or e.startswith("/"):
+      target = resolve.join(dir, e)
+      if not target.endswith(".json") and not exists_file(p, fs, target): target = target + ".json"
+    else:
+      let name = resolve.pkg_name(e)
+      let pdir = resolve.find_package(&p.rs, fs, name, dir)
+      if pdir != "":
+        let sub = e[name.len..e.len]
+        if sub == "":
+          let m = pkg.read_json(fs, fspath(p, resolve.join(pdir, "package.json")))
+          var tsc = pkg.str_of(pkg.get(m, "tsconfig"))
+          if tsc == "": tsc = "tsconfig.json"
+          target = resolve.join(pdir, tsc)
+        else:
+          target = resolve.join(pdir, sub[1..sub.len])
+          if not exists_file(p, fs, target) and not target.endswith(".json"): target = target + ".json"
+    if target != "": tsconfig_chain(&p, fs, target, &opts, &top, depth + 1)
+  let co = pkg.get(v, "compilerOptions")
+  for k in pkg.keys(co):
+    var val = pkg.get(co, k)
+    # path-valued options are relative to the file that sets them
+    if k == "outDir" or k == "rootDir" or k == "baseUrl":
+      let s = pkg.str_of(val)
+      if s != "": val = json.Text(resolve.join(dir, s))
+    if k == "paths":
+      opts["\0pathsdir"] = json.Text(dir + "")
+    opts[k] = val
+  for k in ["include", "exclude", "files"]:
+    if json.has(v, k):
+      top[k] = pkg.get(v, k)
+      top["\0" + k + "dir"] = json.Text(dir + "")
+
+fn load_tsconfig(var p: Proj, fs: Fs):
+  if not exists_file(p, fs, "tsconfig.json"): return
+  var opts: {Str: Value} = {}
+  var top: {Str: Value} = {}
+  tsconfig_chain(&p, fs, "tsconfig.json", &opts, &top, 0)
+  # paths (relative to baseUrl, else to the file that sets them)
+  var base = ""
+  if "baseUrl" in opts:
+    base = pkg.str_of(opts["baseUrl"])
+  if "paths" in opts:
+    var pdir = base
+    if pdir == "" and "\0pathsdir" in opts: pdir = pkg.str_of(opts["\0pathsdir"])
+    let pm = opts["paths"]
+    for key in pkg.keys(pm):
+      var vals: [Str] = []
+      for t in pkg.strs(pkg.get(pm, key)): vals.push(resolve.join(pdir, t))
+      let st = key.find("*")
+      if st >= 0: p.rs.paths.push(resolve.PathMap(key[0..st], true, vals))
+      else: p.rs.paths.push(resolve.PathMap(key + "", false, vals))
+  if "types" in opts: p.tsc_types = pkg.strs(opts["types"])
+  # source mapping: outDir -> rootDir, else src (when it exists), else the folder
+  if "outDir" in opts:
+    let out = pkg.str_of(opts["outDir"])
+    var src = ""
+    if "rootDir" in opts: src = pkg.str_of(opts["rootDir"])
+    elif fs.exists(fspath(p, resolve.join(out, "src")) + "/"): src = ""
+    elif fs.exists(fspath(p, "src") + "/"): src = "src"
+    p.out_dir = out + ""
+    p.src_dir = src + ""
+  # the declaration files it includes are entry files
+  var include: [Str] = ["**/*"]
+  var has_include = "include" in top
+  var files: [Str] = []
+  if "files" in top:
+    for f in pkg.strs(top["files"]): files.push(f + "")
+  if has_include:
+    include = []
+    for x in pkg.strs(top["include"]): include.push(rel_pattern(x))
+  elif files.len > 0: include = []
+  var exclude: [Str] = []
+  if "exclude" in top:
+    for x in pkg.strs(top["exclude"]): exclude.push(rel_pattern(x))
+  exclude.push("node_modules/**")
+  if p.out_dir != "": exclude.push(p.out_dir + "/**")
+  var dts: [Str] = []
+  for f in files:
+    if is_dts(f): dts.push(resolve.norm(f))
+  if include.len > 0:
+    var pats: [Str] = []
+    for x in include: pats.push(x)
+    for x in exclude: pats.push("!" + x)
+    for f in glob_fs(p, fs, pats):
+      if is_dts(f): dts.push(f)
+  p.dts_entries = dts
+
+fn sc(xs: [Str]) -> [Str]:
+  var out: [Str] = []
+  for x in xs: out.push(x + "")
+  return out
+
+fn rel_pattern(x: Str) -> Str:
+  var s = x
+  if s.startswith("./"): s = s[2..s.len]
+  let has_glob = s.find("*") >= 0 or s.find("?") >= 0
+  let b = resolve.basename(s)
+  let has_ext = b != "." and b != ".." and b.find(".") >= 0
+  if has_glob or has_ext: return s
+  if s == "" or s == ".": return "**/*"
+  return s + "/**/*"
+
+fn is_dts(f: Str) -> Bool:
+  return f.endswith(".d.ts") or f.endswith(".d.mts") or f.endswith(".d.cts")
+
+# ---- the manifest
+
+fn load_manifest(var p: Proj, fs: Fs) -> Bool:
+  let src = fs.read(fspath(p, "package.json")) else return false
+  p.manifest_str = src
+  p.manifest = pkg.parse_json(src)
+  p.name = pkg.str_of(pkg.get(p.manifest, "name"))
+  p.deps = pkg.keys(pkg.get(p.manifest, "dependencies"))
+  p.dev_deps = pkg.keys(pkg.get(p.manifest, "devDependencies"))
+  p.peer_deps = pkg.keys(pkg.get(p.manifest, "peerDependencies"))
+  p.opt_deps = pkg.keys(pkg.get(p.manifest, "optionalDependencies"))
+  let meta = pkg.get(p.manifest, "peerDependenciesMeta")
+  for d in sc(p.peer_deps):
+    if pkg.truthy(pkg.get(pkg.get(meta, d), "optional")): p.opt_peer[d] = true
+  for d in sc(p.deps): p.all_deps[d] = true
+  for d in sc(p.dev_deps): p.all_deps[d] = true
+  for d in sc(p.peer_deps): p.all_deps[d] = true
+  for d in sc(p.opt_deps): p.all_deps[d] = true
+  for e in pkg.keys(pkg.get(p.manifest, "engines")): p.engines[e] = true
+  let sc = pkg.get(p.manifest, "scripts")
+  for k in pkg.keys(sc): p.scripts[k] = pkg.str_of(pkg.get(sc, k))
+  p.rs.self_name = p.name + ""
+  let ex = pkg.get(p.manifest, "exports")
+  match ex:
+    Null: p.rs.has_exports = false
+    _:
+      p.rs.has_exports = true
+      p.rs.self_exports = json.copy(ex)
+  p.rs.imports_map = pkg.get(p.manifest, "imports")
+  return true
+
+# what node_modules says about the listed packages (manifest/index.js)
+fn load_dep_meta(var p: Proj, fs: Fs):
+  var names: [Str] = []
+  for d in sc(p.deps): names.push(d + "")
+  for d in sc(p.peer_deps): names.push(d + "")
+  for d in sc(p.opt_deps): names.push(d + "")
+  for d in sc(p.dev_deps): names.push(d + "")
+  for name in names:
+    let dir = resolve.find_package(&p.rs, fs, name, "")
+    var m = json.Null
+    if dir != "": m = pkg.read_json(fs, fspath(p, resolve.join(dir, "package.json")))
+    if not pkg.is_obj(m):
+      if name in p.opt_deps: p.uninstalled_opt.push(name + "")
+      continue
+    let bin = pkg.get(m, "bin")
+    var bnames: [Str] = []
+    if pkg.is_text(bin): bnames.push(name + "")
+    else:
+      for k in pkg.keys(bin): bnames.push(k + "")
+    for b0 in bnames:
+      var b = b0
+      if b.startswith("@") and b.find("/") > 0: b = b[b.find("/") + 1..b.len]
+      if b in p.bins:
+        if not (name in p.bins[b]): p.bins[b].push(name + "")
+      else: p.bins[b] = [name + ""]
+    for peer in pkg.keys(pkg.get(m, "peerDependencies")):
+      if peer in p.hosts: p.hosts[peer].push(name + "")
+      else: p.hosts[peer] = [name + ""]
+    if not name.startswith("@types/") and (pkg.truthy(pkg.get(m, "types")) or pkg.truthy(pkg.get(m, "typings"))): p.types_included[name] = true
+
+fn manifest_entries(p: Proj) -> [Str]:
+  var out: [Str] = []
+  let m = p.manifest
+  for k in ["main", "module", "browser"]:
+    let s = pkg.str_of(pkg.get(m, k))
+    if s != "": add_uniq(&out, s)
+  let bin = pkg.get(m, "bin")
+  if pkg.is_text(bin):
+    let s = pkg.str_of(bin)
+    if s != "": add_uniq(&out, s)
+  else:
+    for v in pkg.values(bin):
+      let s = pkg.str_of(v)
+      if s != "": add_uniq(&out, s)
+  for k in ["types", "typings"]:
+    let s = pkg.str_of(pkg.get(m, k))
+    if s != "": add_uniq(&out, s)
+  let ex = pkg.get(m, "exports")
+  var targets: [Str] = []
+  pkg.export_targets(ex, &targets)
+  for t in targets:
+    if t == "./*" or t.strip() == "": continue
+    add_uniq(&out, expand_wildcards(t))
+  let im = pkg.get(m, "imports")
+  for k in pkg.keys(im):
+    if not k.startswith("#"): continue
+    var ts: [Str] = []
+    pkg.export_targets(pkg.get(im, k), &ts)
+    for t in ts:
+      if t.startswith(".") and t.find("*") < 0: add_uniq(&out, t)
+  return out
+
+fn add_uniq(var xs: [Str], s: Str):
+  for x in xs:
+    if x == s: return
+  xs.push(s + "")
+
+fn expand_wildcards(s: Str) -> Str:
+  var t = s + ""
+  if t.endswith("/*"): t = t[0..t.len - 1] + "**"
+  let a = t.find("/*.")
+  if a >= 0: t = t[0..a] + "/**/*." + t[a + 3..t.len]
+  let b = t.find("/*/")
+  if b >= 0: t = t[0..b] + "/**/" + t[b + 3..t.len]
+  return t
+
+# dist/x.js -> src/x.{exts} (tsconfig outDir)
+fn source_map_pattern(p: Proj, spec: Str) -> Str:
+  if p.out_dir == "" or p.out_dir == p.src_dir: return spec + ""
+  var s = resolve.norm(spec)
+  if s != p.out_dir and not s.startswith(p.out_dir + "/"): return spec + ""
+  var rest = s[p.out_dir.len..s.len]
+  # (\.d)?\.(m|c)?(j|t)sx?$ -> .{exts}
+  let ext_at = js_ext_at(rest)
+  if ext_at >= 0: rest = rest[0..ext_at] + ".{{" + EXTS_GLOB + "}}"
+  var src = p.src_dir
+  if src == "": return resolve.norm(rest)
+  return src + rest
+
+fn js_ext_at(s: Str) -> Int:
+  for e in [".d.ts", ".d.mts", ".d.cts", ".d.tsx", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx", ".js", ".ts"]:
+    if s.endswith(e): return s.len - e.len
+  return -1
+
+# ---- inputs (create-input-handler.js)
+
+fn is_joinable(s: Str) -> Bool:
+  if s == "": return false
+  let c = s[0]
+  return c != '#' and c != '~' and c != '@' and c != '/'
+
+const IGNORED_GLOBAL_BINARIES = " amplify aws az base64 basename bash bun bundle bunx cargo cat cd chmod chown cksum claude clear cmd cmd.exe code code-insiders codesign comm command corepack cp curl cut date defaults deno devtunnel df dir dirname docker dotnet echo env exec exit expand export expr factor false find fuser gem getconf gh git grep groups gzip head hg id join kill launchctl ln logname ls lsof md5sum mkdir mknod mv nc nice nl node nohup npm nproc npx nub nubx open osascript paste pnpm pnpx powershell powershell.exe pr printenv printf ps pulumi pwd python python3 raft railway rm rmdir rsync scp security sed seq set sh sha1sum sha512sum shred shuf sleep sort split ssh stat stty sudo sw_vers sync sysctl systemctl tac tar taskkill tee test time timeout tmux tmuxinator touch trap tr true tsort tty uname unexpand uniq unzip wc which who whoami xargs xcodebuild xcrun xvfb-run yarn yes zip zsh zstd "
+
+# Returns a file the input resolves to (an entry file), or "".
+fn handle_input(var p: Proj, fs: Fs, inp: Input) -> Str:
+  let spec = inp.spec
+  if inp.file == "": return ""
+  if inp.kind == I_BIN:
+    if spec in p.bins:
+      for d in sc(p.bins[spec]): reference(&p, d)
+      return ""
+    var found = false
+    for d in sc(p.uninstalled_opt):
+      var b = d
+      if b.startswith("@") and b.find("/") > 0: b = b[b.find("/") + 1..b.len]
+      if b == spec:
+        reference(&p, d)
+        found = true
+    if found: return ""
+    if inp.optional or IGNORED_GLOBAL_BINARIES.find(" " + spec + " ") >= 0: return ""
+    add_issue(&p.issues, issue("binaries", inp.file, spec))
+    return ""
+  if spec == "node" or spec == "bun" or spec == "deno": return ""
+  let name = pkg_from_any(spec)
+  if name != "" and (inp.kind == I_DEP or inp.kind == I_DEFER or (inp.kind == I_DEFER_ENTRY and resolve.in_node_modules(spec)) or inp.kind == I_CONFIG):
+    let handled = maybe_add_external(&p, name, spec, inp.kind == I_CONFIG, inp.type_only, true)
+    if inp.kind == I_DEP:
+      if not handled:
+        if not inp.optional: add_issue(&p.issues, issue("unlisted", inp.file, name))
+        return ""
+      return ""
+    if handled: return ""
+  var base = inp.dir
+  if base == "": base = resolve.dirname(inp.file)
+  if base == ".": base = ""
+  var target = spec + ""
+  if is_joinable(spec): target = resolve.join(base, spec)
+  var r = resolve.resolve(&p.rs, fs, rel_spec(target), "file.ts")
+  if not is_joinable(spec): r = resolve.resolve(&p.rs, fs, spec, resolve.join(base, "file.ts"))
+  if r.kind == R_FILE:
+    if is_ignored_path(p, r.path, false): return ""
+    return r.path
+  if inp.optional: return ""
+  if not scripts.is_internal(target) and not is_joinable(spec):
+    var sym = name
+    if sym == "": sym = spec + ""
+    add_issue(&p.issues, issue("unlisted", inp.file, sym))
+  elif not is_ignored_path(p, target, false):
+    if inp.kind != I_DEFER_ENTRY and inp.kind != I_CONFIG:
+      add_issue(&p.issues, issue("unresolved", inp.file, spec))
+  return ""
+
+# a project-relative path as a specifier the resolver reads relative to the project folder
+fn rel_spec(path: Str) -> Str:
+  if path.startswith("../"): return path
+  return "./" + path
+
+# ---- plugins
+
+fn has_dep(p: Proj, name: Str) -> Bool:
+  for d in sc(p.deps):
+    if d == name: return true
+  for d in sc(p.dev_deps):
+    if d == name: return true
+  return false
+
+fn has_dep_prefix(p: Proj, prefix: Str) -> Bool:
+  for d in sc(p.deps):
+    if d.startswith(prefix): return true
+  for d in sc(p.dev_deps):
+    if d.startswith(prefix): return true
+  return false
+
+fn add_inp(var p: Proj, kind: Int, spec: Str, file: Str, skip: Bool):
+  var i = scripts.inp(kind, spec)
+  i.file = file + ""
+  i.skip_exports = skip
+  p.inputs.push(i)
+
+fn add_entries(var p: Proj, pats: [Str], file: Str):
+  for x in pats: add_inp(&p, I_ENTRY, x, file, true)
+
+fn add_prod_entries(var p: Proj, pats: [Str], file: Str):
+  for x in pats:
+    var i = scripts.inp(I_ENTRY, x)
+    i.file = file + ""
+    i.production = true
+    i.skip_exports = true
+    p.inputs.push(i)
+
+fn new_ctx(p: Proj, optional: Bool) -> Ctx:
+  var names: {Str: Str} = {}
+  for k, v in p.scripts: names[k] = v + ""
+  return Ctx(names, false, optional, {}, false)
+
+fn add_script_inputs(var p: Proj, scs: [Str], file: Str, optional: Bool, dir: Str, production: Bool):
+  for x in scripts.inputs_from_scripts(scs, new_ctx(p, optional)):
+    var y = scripts.cp(x)
+    y.file = file + ""
+    if dir != "": y.dir = dir + ""
+    y.production = production
+    if y.kind == I_ENTRY or y.kind == I_DEFER_ENTRY or y.kind == I_DEFER: y.skip_exports = true
+    p.inputs.push(y)
+
+# The config files of a plugin that exist (gitignore not applied).
+fn find_configs(p: Proj, fs: Fs, pats: [Str]) -> [Str]:
+  return glob_fs(p, fs, pats)
+
+fn non_manifest(files: [Str]) -> Bool:
+  for f in files:
+    if resolve.basename(f) != "package.json": return true
+  return false
+
+fn enable(var p: Proj, key: Str):
+  p.plugins[key] = true
+
+fn enabled_plugins(var p: Proj, fs: Fs):
+  enable(&p, "node")
+  if has_dep(p, "typescript") or has_dep(p, "@typescript/native") or has_dep(p, "@typescript/native-preview"): enable(&p, "typescript")
+  if has_dep(p, "vitest") or has_dep(p, "vite-plus"): enable(&p, "vitest")
+  if has_dep(p, "vite") or has_dep(p, "vitest") or has_dep(p, "vite-plus"): enable(&p, "vite")
+  if has_dep(p, "jest"): enable(&p, "jest")
+  if has_dep(p, "mocha"): enable(&p, "mocha")
+  if has_dep(p, "ava"): enable(&p, "ava")
+  if has_dep(p, "xo"): enable(&p, "xo")
+  if has_dep(p, "tsx"): enable(&p, "tsx")
+  if has_dep(p, "eslint") or has_dep(p, "@eslint/js") or p.name.startswith("eslint-config") or p.name.find("/eslint-config") >= 0: enable(&p, "eslint")
+  if has_dep(p, "prettier"): enable(&p, "prettier")
+  if has_dep(p, "changelogen"): enable(&p, "changelogen")
+  if has_dep(p, "oxlint") or has_dep(p, "vite-plus"): enable(&p, "oxlint")
+  if has_dep(p, "oxfmt"): enable(&p, "oxfmt")
+  if has_dep(p, "unbuild"): enable(&p, "unbuild")
+  if has_dep(p, "esbuild"): enable(&p, "esbuild")
+  if has_dep(p, "typedoc"): enable(&p, "typedoc")
+  if has_dep(p, "nyc"): enable(&p, "nyc")
+  if has_dep(p, "husky"): enable(&p, "husky")
+  if has_dep(p, "lint-staged"): enable(&p, "lint-staged")
+  if has_dep(p, "tsd"): enable(&p, "tsd")
+  if has_dep(p, "c8"): enable(&p, "c8")
+  if has_dep(p, "@playwright/test"): enable(&p, "playwright")
+  if has_dep(p, "borp"): enable(&p, "borp")
+  for f in [".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"]:
+    if exists_file(p, fs, f): enable(&p, "mcp")
+  let pm = pkg.str_of(pkg.get(p.manifest, "packageManager"))
+  if pm.startswith("pnpm@") or exists_file(p, fs, "pnpm-lock.yaml") or exists_file(p, fs, "pnpm-workspace.yaml"): enable(&p, "pnpm")
+  # GitHub Actions: a .yml or .yaml in .github/workflows
+  let wf = fs.list(fspath(p, ".github/workflows")) else []
+  for f in wf:
+    if f.endswith(".yml") or f.endswith(".yaml"):
+      enable(&p, "github-actions")
+      break
+
+fn c12(name: Str) -> [Str]:
+  return ["." + name + "rc", ".config/" + name + "rc", "." + name + "rc.{{json,jsonc,json5,yaml,yml,js,ts,mjs,cjs,mts,cts,toml}}", ".config/" + name + "rc.{{json,jsonc,json5,yaml,yml,js,ts,mjs,cjs,mts,cts,toml}}", name + ".config.{{js,ts,mjs,cjs,mts,cts}}"]
+
+# A plugin's entry patterns go in when it has no way to read its config, or found no config file.
+fn plugin_std(var p: Proj, fs: Fs, has_resolver: Bool, config: [Str], entry: [Str], production: [Str]) -> [Str]:
+  let found = find_configs(p, fs, config)
+  if not has_resolver or not non_manifest(found):
+    add_entries(&p, entry, "package.json")
+    add_prod_entries(&p, production, "package.json")
+  return found
+
+# a config file with an extension is an entry file itself
+fn config_entry(var p: Proj, f: Str):
+  if resolve.basename(f) == "package.json": return
+  p.config_files[f] = true
+  if resolve.extname(f) != "": add_inp(&p, I_ENTRY, f, f, true)
+
+fn run_plugins(var p: Proj, fs: Fs):
+  # package.json scripts (start is a production script)
+  var dev: [Str] = []
+  var prod: [Str] = []
+  for k, v in p.scripts:
+    if k == "" or not (is_alnum(k[0]) or k[0] == '_'): continue
+    if k == "start": prod.push(v + "")
+    else: dev.push(v + "")
+  add_script_inputs(&p, dev, "package.json", false, "", false)
+  add_script_inputs(&p, prod, "package.json", false, "", true)
+  # config files named in scripts are read by their plugin even when it isn't enabled
+  if not ("typescript" in p.plugins):
+    let qs = script_configs(p, "typescript")
+    if qs.len > 0: typescript_configs(&p, fs, qs)
+  for key in bool_keys(p.plugins):
+    if key == "node":
+      add_prod_entries(&p, ["server.js"], "package.json")
+      if node_test_script(p):
+        add_entries(&p, ["**/*{{.,-,_}}test.{{cjs,mjs,js,cts,mts,ts}}", "**/test-*.{{cjs,mjs,js,cts,mts,ts}}", "**/test.{{cjs,mjs,js,cts,mts,ts}}", "**/test/**/*.{{cjs,mjs,js,cts,mts,ts}}"], "package.json")
+    elif key == "typescript":
+      var queue = find_configs(p, fs, ["tsconfig.json"])
+      for c in script_configs(p, "typescript"): queue.push(c)
+      typescript_configs(&p, fs, queue)
+    elif key == "vitest":
+      let found = plugin_std(&p, fs, true, ["vitest.config.{{js,mjs,ts,cjs,mts,cts}}", "vitest.{{workspace,projects}}.{{js,mjs,ts,cjs,mts,cts,json}}"], ["**/*.{{bench,test,test-d,spec,spec-d}}.?(c|m)[jt]s?(x)", "**/__mocks__/**/*.?(c|m)[jt]s?(x)"], [])
+      for f in found: config_entry(&p, f)
+    elif key == "vite":
+      let found = find_configs(p, fs, ["vite.config.{{js,mjs,ts,cjs,mts,cts}}"])
+      for f in found: config_entry(&p, f)
+    elif key == "jest":
+      let found = plugin_std(&p, fs, true, ["jest.config.{{js,ts,mjs,cjs,json}}", "package.json"], ["**/__tests__/**/*.[jt]s?(x)", "**/?(*.)+(spec|test).[jt]s?(x)", "**/__mocks__/**/*.[jt]s?(x)"], [])
+      for f in found: config_entry(&p, f)
+    elif key == "mocha":
+      let found = find_configs(p, fs, [".mocharc.{{js,cjs,mjs,json,jsonc,yml,yaml}}", "package.json"])
+      mocha_config(&p, fs, found)
+    elif key == "ava":
+      ava_config(&p, fs)
+    elif key == "xo":
+      let found = plugin_std(&p, fs, true, ["package.json", ".xo-config", ".xo-config.{{js,cjs,json}}", "xo.config.{{js,cjs,mjs,ts,cts,mts}}"], [".xo-config.{{js,cjs}}", "xo.config.{{js,cjs,mjs,ts,cts,mts}}"], [])
+      for f in found: config_entry(&p, f)
+    elif key == "tsx":
+      for v in script_vals(p):
+        if tsx_test(v):
+          add_entries(&p, ["**/*{{.,-,_}}test.?(c|m)(j|t)s", "**/test-*.?(c|m)(j|t)s", "**/test.?(c|m)(j|t)s", "**/test/**/*.?(c|m)(j|t)s"], "package.json")
+          break
+    elif key == "eslint":
+      let found = find_configs(p, fs, ["eslint.config.{{js,cjs,mjs,ts,cts,mts}}", ".eslintrc", ".eslintrc.{{js,json,cjs}}", ".eslintrc.{{yml,yaml}}", "package.json"])
+      eslint_config(&p, fs, found)
+    elif key == "prettier":
+      let found = find_configs(p, fs, [".prettierrc", ".prettierrc.{{json,js,cjs,mjs,ts,cts,mts,yml,yaml,toml,json5}}", "prettier.config.{{js,cjs,mjs,ts,cts,mts}}", "package.{{json,yaml}}"])
+      prettier_config(&p, fs, found)
+    elif key == "changelogen":
+      var pats: [Str] = ["package.json"]
+      for x in c12("changelog"): pats.push(x)
+      add_entries(&p, pats, "package.json")
+    elif key == "oxlint":
+      let found = find_configs(p, fs, [".oxlintrc.{{json,jsonc}}", "oxlint.config.{{ts,mts}}"])
+      for f in found: config_entry(&p, f)
+    elif key == "oxfmt":
+      add_entries(&p, [".oxfmtrc.json", ".oxfmtrc.jsonc", "oxfmt.config.{{ts,mts}}"], "package.json")
+    elif key == "unbuild":
+      let found = find_configs(p, fs, ["build.config.{{js,cjs,mjs,ts,mts,cts,json}}"])
+      for f in found: config_entry(&p, f)
+    elif key == "esbuild":
+      let found = find_configs(p, fs, ["esbuild.config.{{js,mjs,cjs,ts,mts,cts}}", "esbuild.{{js,mjs,cjs,ts,mts,cts}}"])
+      for f in found: config_entry(&p, f)
+    elif key == "typedoc":
+      let found = find_configs(p, fs, ["typedoc.{{js,cjs,json,jsonc}}", "typedoc.config.{{js,cjs}}", ".config/typedoc.{{js,cjs,json,jsonc}}", ".config/typedoc.config.{{js,cjs}}", "package.json", "tsconfig.json"])
+      typedoc_config(&p, fs, found)
+    elif key == "nyc":
+      let found = find_configs(p, fs, [".nycrc", ".nycrc.{{json,yml,yaml}}", "nyc.config.{{js,cjs,mjs}}", "package.json"])
+      for f in found: config_entry(&p, f)
+    elif key == "tsd":
+      add_entries(&p, ["index.test-d.ts", "test-d/**/*.test-d.ts"], "package.json")
+    elif key == "playwright":
+      let found = plugin_std(&p, fs, true, ["playwright.config.{{js,cjs,mjs,ts,cts,mts}}"], ["**/*.@(spec|test).?(c|m)[jt]s?(x)"], [])
+      for f in found: config_entry(&p, f)
+    elif key == "borp":
+      let found = plugin_std(&p, fs, true, [".borp.yaml", ".borp.yml"], ["**/*.test.{{js,mjs,cjs,ts,mts,cts}}"], [])
+      for f in found:
+        config_entry(&p, f)
+        let text = fs.read(fspath(p, f)) else ""
+        for r in yaml_list(text, "reporters"):
+          let ri = scripts.borp_reporter(r)
+          if ri != "": add_defer(&p, ri, f)
+        var files = yaml_list(text, "files")
+        if files.len == 0: files = ["**/*.test.{{js,mjs,cjs,ts,mts,cts}}"]
+        add_entries(&p, files, f)
+    elif key == "mcp":
+      let found = find_configs(p, fs, [".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"])
+      for f in found:
+        config_entry(&p, f)
+        let v = pkg.read_json(fs, fspath(p, f))
+        var scs: [Str] = []
+        for sect in ["mcpServers", "servers", "mcp_servers"]:
+          let m = pkg.get(v, sect)
+          for name in pkg.keys(m):
+            let srv = pkg.get(m, name)
+            let cmd = pkg.str_of(pkg.get(srv, "command"))
+            if cmd == "": continue
+            var parts: [Str] = [cmd]
+            for a in pkg.strs(pkg.get(srv, "args")): parts.push(a + "")
+            scs.push(project_dir_var(" ".join(parts)))
+        add_script_inputs(&p, scs, f, true, ".", false)
+    elif key == "pnpm":
+      add_entries(&p, [".pnpmfile.{{cjs,mjs}}"], "package.json")
+    elif key == "github-actions":
+      let found = find_configs(p, fs, [".github/workflows/*.{{yml,yaml}}", ".github/**/action.{{yml,yaml}}"])
+      for f in found:
+        github_workflow(&p, fs, f)
+        config_entry(&p, f)
+    elif key == "husky":
+      let found = find_configs(p, fs, [".husky/commit-msg", ".husky/pre-*", ".husky/post-*", ".husky/prepare-commit-msg", "package.json"])
+      for f in found:
+        if resolve.basename(f) == "package.json": continue
+        let text = fs.read(fspath(p, f)) else ""
+        add_script_inputs(&p, [text], f, false, "", false)
+    elif key == "lint-staged":
+      let ls = pkg.get(p.manifest, "lint-staged")
+      var scs: [Str] = []
+      for k in pkg.keys(ls):
+        for s in pkg.strs(pkg.get(ls, k)): scs.push(s + "")
+      add_script_inputs(&p, scs, "package.json", false, "", false)
+
+fn bool_keys(m: {Str: Bool}) -> [Str]:
+  var out: [Str] = []
+  for k, _ in m: out.push(k + "")
+  return out
+
+fn script_vals(p: Proj) -> [Str]:
+  var out: [Str] = []
+  for _, v in p.scripts: out.push(v + "")
+  return out
+
+# config files named in scripts for a plugin (tsc -p x, vitest --config y), as paths
+fn script_configs(p: Proj, plugin: Str) -> [Str]:
+  var out: [Str] = []
+  for i in p.inputs:
+    if i.kind == I_CONFIG and i.plugin == plugin:
+      var base = i.dir
+      if base == "": base = resolve.dirname(i.file)
+      if base == ".": base = ""
+      out.push(resolve.join(base, i.spec))
+  return out
+
+# The TypeScript plugin: each tsconfig file (raw, as knip loads it): extends, references, types,
+# plugins, importHelpers and jsxImportSource.
+fn typescript_configs(var p: Proj, fs: Fs, queue0: [Str]):
+  var queue = sc(queue0)
+  var seen: {Str: Bool} = {}
+  var k = 0
+  while k < queue.len:
+    let f = queue[k] + ""
+    k += 1
+    if f in seen: continue
+    seen[f] = true
+    if not exists_file(p, fs, f): continue
+    config_entry(&p, f)
+    let v = pkg.read_json(fs, fspath(p, f))
+    if not pkg.is_obj(v): continue
+    let dir = resolve.dirname(f)
+    for e in pkg.strs(pkg.get(v, "extends")):
+      if e.startswith(".") or e.startswith("/"):
+        var target = resolve.join(dir, e)
+        if not exists_file(p, fs, target) and exists_file(p, fs, target + ".json"): target = target + ".json"
+        queue.push(target)
+      else:
+        var i = scripts.inp(I_CONFIG, e)
+        i.file = f + ""
+        i.plugin = "typescript"
+        p.inputs.push(i)
+    for r in pkg.items(pkg.get(v, "references")):
+      let rp = pkg.str_of(pkg.get(r, "path"))
+      if rp == "": continue
+      if rp.endswith(".json"): queue.push(resolve.join(dir, rp))
+      else: queue.push(resolve.join(dir, rp + "/tsconfig.json"))
+    let co = pkg.get(v, "compilerOptions")
+    if not pkg.is_obj(co): continue
+    for t in pkg.strs(pkg.get(co, "types")):
+      var i = scripts.inp(I_DEFER, t)
+      i.type_only = true
+      i.file = f + ""
+      i.also_owner = true
+      p.inputs.push(i)
+    var names: [Str] = []
+    for pl in pkg.items(pkg.get(co, "plugins")):
+      let n = pkg.str_of(pkg.get(pl, "name"))
+      names.push(n)
+    if pkg.truthy(pkg.get(co, "importHelpers")): names.push("tslib")
+    for n in names:
+      if n == "": continue
+      var i = scripts.inp(I_DEFER, n)
+      i.file = f + ""
+      p.inputs.push(i)
+    let jsx = pkg.str_of(pkg.get(co, "jsxImportSource"))
+    if jsx != "":
+      var i = scripts.inp(I_DEP, jsx)
+      i.file = f + ""
+      i.production = true
+      p.inputs.push(i)
+
+# ${workspaceFolder} and ${CLAUDE_PROJECT_DIR} are the project folder
+fn project_dir_var(s: Str) -> Str:
+  var out = s.replace("${{workspaceFolder}}", ".")
+  var i = out.find("${{CLAUDE_PROJECT_DIR")
+  while i >= 0:
+    let e = out.find("}}", i)
+    if e < 0: break
+    out = out[0..i] + "." + out[e + 1..out.len]
+    i = out.find("${{CLAUDE_PROJECT_DIR")
+  return out
+
+fn node_test_script(p: Proj) -> Bool:
+  for _, v in p.scripts:
+    for c in scripts.parse_script(v):
+      let b = scripts.extract_binary(c.name.value)
+      if b == "node" or b == "nub":
+        for a in c.args:
+          if a.value == "--test": return true
+  return false
+
+fn tsx_test(s: Str) -> Bool:
+  # /(?<=^|\s)tsx\s(.*)--test/
+  var i = s.find("tsx")
+  while i >= 0:
+    let before_ok = i == 0 or s[i - 1] == ' ' or s[i - 1] == '\t' or s[i - 1] == '\n'
+    if before_ok and i + 3 < s.len and (s[i + 3] == ' ' or s[i + 3] == '\t') and s.find("--test", i + 4) >= 0: return true
+    i = s.find("tsx", i + 1)
+  return false
+
+fn mocha_config(var p: Proj, fs: Fs, found: [Str]):
+  var spec: [Str] = []
+  var had = false
+  for f in found:
+    var v = json.Null
+    if resolve.basename(f) == "package.json": v = pkg.get(p.manifest, "mocha")
+    elif f.endswith(".json") or f.endswith(".jsonc"): v = pkg.read_json(fs, fspath(p, f))
+    config_entry(&p, f)
+    if pkg.is_obj(v):
+      had = true
+      for s in pkg.strs(pkg.get(v, "spec")): spec.push(s + "")
+      for r in pkg.strs(pkg.get(v, "require")):
+        var i = scripts.inp(I_DEFER, r)
+        i.file = f + ""
+        p.inputs.push(i)
+  if not non_manifest(found) or not had:
+    if spec.len == 0: add_entries(&p, ["**/test/*.{{js,cjs,mjs}}"], "package.json")
+  if spec.len > 0: add_entries(&p, spec, "package.json")
+
+fn ava_config(var p: Proj, fs: Fs):
+  let found = find_configs(p, fs, ["ava.config.{{js,cjs,mjs}}", "package.json"])
+  let entry = ["test.{{js,cjs,mjs,ts}}", "{{src,source}}/test.{{js,cjs,mjs,ts}}", "**/__tests__/**/*.{{js,cjs,mjs,ts}}", "**/*.spec.{{js,cjs,mjs,ts}}", "**/*.test.{{js,cjs,mjs,ts}}", "**/test-*.{{js,cjs,mjs,ts}}", "**/test/**/*.{{js,cjs,mjs,ts}}", "**/tests/**/*.{{js,cjs,mjs,ts}}", "!**/__tests__/**/__{{helper,fixture}}?(s)__/**/*", "!**/test?(s)/**/{{helper,fixture}}?(s)/**/*"]
+  if not non_manifest(found): add_entries(&p, entry, "package.json")
+  let c = pkg.get(p.manifest, "ava")
+  if pkg.is_obj(c):
+    var files = pkg.strs(pkg.get(c, "files"))
+    if files.len == 0:
+      for e in entry: files.push(e + "")
+    add_entries(&p, files, "package.json")
+    var args: [Str] = []
+    for a in pkg.strs(pkg.get(c, "nodeArguments")): args.push(a + "")
+    for r in pkg.strs(pkg.get(c, "require")): args.push("--require " + r)
+    let cmd = "node " + " ".join(args)
+    add_script_inputs(&p, [cmd], "package.json", true, "", false)
+  for f in found:
+    if resolve.basename(f) != "package.json": config_entry(&p, f)
+
+# ESLint's legacy configs (JSON / package.json eslintConfig): extends, plugins, parser
+fn eslint_config(var p: Proj, fs: Fs, found: [Str]):
+  for f in found:
+    var v = json.Null
+    if resolve.basename(f) == "package.json": v = pkg.get(p.manifest, "eslintConfig")
+    elif f.endswith(".json") or resolve.basename(f) == ".eslintrc":
+      let text = fs.read(fspath(p, f)) else ""
+      v = pkg.parse_jsonc(text)
+    config_entry(&p, f)
+    if pkg.is_obj(v): eslint_inputs(&p, v, f)
+
+fn rfind(s: Str, sub: Str) -> Int:
+  var i = s.find(sub)
+  var last = -1
+  while i >= 0:
+    last = i
+    i = s.find(sub, i + 1)
+  return last
+
+fn eslint_name(spec: Str, kind: Str) -> Str:
+  # the package an ESLint shorthand names (config: eslint-config-x, plugin: eslint-plugin-x)
+  if spec.startswith(".") or spec.startswith("/"): return spec + ""
+  if spec.startswith("eslint:"): return ""
+  if spec.startswith("plugin:"):
+    var rest = spec[7..spec.len]
+    let sl = rfind(rest, "/")
+    if sl > 0: rest = rest[0..sl]
+    return eslint_name(rest, "plugin")
+  let prefix = "eslint-" + kind
+  if spec.startswith("@"):
+    let sl = spec.find("/")
+    if sl < 0: return spec + "/" + prefix
+    let scope = spec[0..sl]
+    let rest = spec[sl + 1..spec.len]
+    if rest.startswith(prefix): return spec + ""
+    return scope + "/" + prefix + "-" + rest
+  if spec.startswith(prefix): return spec + ""
+  return prefix + "-" + spec
+
+fn eslint_inputs(var p: Proj, v: Value, f: Str):
+  for e in pkg.strs(pkg.get(v, "extends")):
+    let n = eslint_name(e, "config")
+    if n != "": add_defer(&p, n, f)
+  for pl in pkg.strs(pkg.get(v, "plugins")):
+    add_defer(&p, eslint_name(pl, "plugin"), f)
+  let parser = pkg.str_of(pkg.get(v, "parser"))
+  if parser != "": add_defer(&p, parser, f)
+  for o in pkg.items(pkg.get(v, "overrides")):
+    if pkg.is_obj(o): eslint_inputs(&p, o, f)
+
+fn add_defer(var p: Proj, spec: Str, file: Str):
+  var i = scripts.inp(I_DEFER, spec)
+  i.file = file + ""
+  p.inputs.push(i)
+
+fn prettier_config(var p: Proj, fs: Fs, found: [Str]):
+  for f in found:
+    var v = json.Null
+    let b = resolve.basename(f)
+    if b == "package.json": v = pkg.get(p.manifest, "prettier")
+    elif b == ".prettierrc" or f.endswith(".json") or f.endswith(".json5"):
+      let text = fs.read(fspath(p, f)) else ""
+      v = pkg.parse_jsonc(text)
+    config_entry(&p, f)
+    if pkg.is_text(v): add_defer(&p, pkg.str_of(v), f)
+    elif pkg.is_obj(v):
+      for pl in pkg.strs(pkg.get(v, "plugins")):
+        var i = scripts.inp(I_DEP, pl)
+        i.file = f + ""
+        p.inputs.push(i)
+
+fn typedoc_config(var p: Proj, fs: Fs, found: [Str]):
+  for f in found:
+    var v = json.Null
+    let b = resolve.basename(f)
+    if b == "package.json": v = pkg.get(p.manifest, "typedocOptions")
+    elif b == "tsconfig.json": v = pkg.get(pkg.read_json(fs, fspath(p, f)), "typedocOptions")
+    elif f.endswith(".json") or f.endswith(".jsonc"): v = pkg.read_json(fs, fspath(p, f))
+    if b != "tsconfig.json": config_entry(&p, f)
+    if pkg.is_obj(v):
+      for pl in pkg.strs(pkg.get(v, "plugin")): add_defer(&p, pl, f)
+      let th = pkg.str_of(pkg.get(v, "theme"))
+      if th != "": add_defer(&p, th, f)
+
+# The run: scripts of a GitHub workflow (a small reader for the YAML they're written in): each step's
+# run, with its working-directory.
+# The items of a top-level list in a simple YAML file (key:, then - item lines).
+fn yaml_list(text: Str, key: Str) -> [Str]:
+  var out: [Str] = []
+  var on = false
+  for raw in text.split("\n"):
+    var l = raw
+    if l.endswith("\r"): l = l[0..l.len - 1]
+    let t = l.strip()
+    if t == "" or t.startswith("#"): continue
+    if indent_of(l) == 0:
+      on = t.startswith(key + ":")
+      if on:
+        let rest = t[key.len + 1..t.len].strip()
+        if rest.startswith("[") and rest.endswith("]"):
+          for x in rest[1..rest.len - 1].split(","):
+            let v = yaml_scalar(x)
+            if v != "": out.push(v)
+          on = false
+      continue
+    if on and t.startswith("- "): out.push(yaml_scalar(t[2..t.len]))
+  return out
+
+fn indent_of(l: Str) -> Int:
+  var i = 0
+  while i < l.len and l[i] == ' ': i += 1
+  return i
+
+fn yaml_scalar(v0: Str) -> Str:
+  var v = v0.strip()
+  if (v.startswith("\"") and v.endswith("\"") and v.len >= 2) or (v.startswith("'") and v.endswith("'") and v.len >= 2): v = v[1..v.len - 1]
+  return v
+
+# the value of a key at line i (key at column col): a plain scalar or a | / > block; returns the
+# value and moves i past it
+fn yaml_value(lines: [Str], var i: Int, col: Int, rest: Str) -> Str:
+  let v = rest.strip()
+  if v.startswith("|") or v.startswith(">"):
+    let folded = v.startswith(">")
+    var body: [Str] = []
+    i += 1
+    var block_indent = -1
+    while i < lines.len:
+      var bl = lines[i]
+      if bl.endswith("\r"): bl = bl[0..bl.len - 1]
+      if bl.strip() == "":
+        body.push("")
+        i += 1
+        continue
+      let ind = indent_of(bl)
+      if ind <= col: break
+      if block_indent < 0: block_indent = ind
+      body.push(bl[min(block_indent, ind)..bl.len])
+      i += 1
+    while body.len > 0 and body[body.len - 1] == "": body.pop()
+    if folded: return " ".join(body)
+    return "\n".join(body)
+  i += 1
+  return yaml_scalar(v)
+
+fn github_workflow(var p: Proj, fs: Fs, f: Str):
+  let text = fs.read(fspath(p, f)) else return
+  let lines = text.split("\n")
+  var runs: [Str] = []
+  var dirs: [Str] = []
+  # the current step: its indent (of the '-'), run and working-directory
+  var step_ind = -1
+  var run = ""
+  var has_run = false
+  var wd = ""
+  var i = 0
+  while i < lines.len:
+    var l = lines[i]
+    if l.endswith("\r"): l = l[0..l.len - 1]
+    let t = l.strip()
+    if t == "" or t.startswith("#"):
+      i += 1
+      continue
+    let ind = indent_of(l)
+    var key_col = ind
+    var body = t
+    if t.startswith("- "):
+      # a new list item (a step when it holds run: or uses:)
+      if has_run:
+        runs.push(run)
+        dirs.push(wd)
+      if ind <= step_ind or step_ind < 0 or true:
+        step_ind = ind
+        has_run = false
+        run = ""
+        wd = ""
+      key_col = ind + 2
+      body = t[2..t.len].strip()
+    elif step_ind >= 0 and ind <= step_ind:
+      if has_run:
+        runs.push(run)
+        dirs.push(wd)
+      has_run = false
+      run = ""
+      wd = ""
+      step_ind = -1
+    if step_ind >= 0 and key_col == step_ind + 2:
+      if body.startswith("run:"):
+        run = yaml_value(lines, &i, key_col, body[4..body.len])
+        has_run = true
+        continue
+      if body.startswith("working-directory:"):
+        wd = yaml_value(lines, &i, key_col, body[18..body.len])
+        continue
+    i += 1
+  if has_run:
+    runs.push(run)
+    dirs.push(wd)
+  for k in 0..runs.len:
+    var d = "."
+    if dirs[k] != "": d = resolve.norm(dirs[k])
+    if d == "": d = "."
+    add_script_inputs(&p, [runs[k]], f, true, d, false)
+
+# ---- the graph
+
+type IM:
+  refs: {Str: Bool}
+  enumerated: {Str: Bool}
+  imp: {Str: [Int]}
+  imp_as: {Str: {Str: [Int]}}
+  imp_ns: {Str: [Int]}
+  rex: {Str: [Int]}
+  rex_as: {Str: {Str: [Int]}}
+  rex_ns: {Str: [Int]}
+
+fn new_im() -> IM:
+  return IM({}, {}, {}, {}, {}, {}, {}, {})
+
+type Ext:
+  spec: Str
+  pkg: Str
+  line: Int
+  col: Int
+  pos: Int
+  type_only: Bool
+  resolved: Bool
+
+type Node:
+  path: Str
+  analyzed: Bool
+  skip_exports: Bool
+  raw: Raw
+  imby: IM
+  has_by: Bool
+  exts: [Ext]
+  unresolved: [Ext]
+
+type Graph:
+  ids: {Str: Int}
+  nodes: [Node]
+
+fn empty_raw(path: Str) -> Raw:
+  return Raw(path + "", true, [], [], [], [], [], 0, [0], false, "")
+
+fn node_id(var g: Graph, path: Str) -> Int:
+  if path in g.ids: return g.ids[path]
+  let id = g.nodes.len
+  g.ids[path] = id
+  g.nodes.push(Node(path + "", false, false, empty_raw(path), new_im(), false, [], []))
+  return id
+
+fn add_val(var m: {Str: [Int]}, key: Str, v: Int):
+  if key in m:
+    if not (v in m[key]): m[key].push(v)
+  else:
+    m[key] = [v]
+
+fn add_ns_val(var m: {Str: {Str: [Int]}}, key: Str, alias: Str, v: Int):
+  if not (key in m): m[key] = {}
+  add_val(&m[key], alias, v)
+
+fn accepted_ext(path: Str) -> Bool:
+  let e = resolve.extname(path)
+  return e == ".js" or e == ".mjs" or e == ".cjs" or e == ".jsx" or e == ".ts" or e == ".tsx" or e == ".mts" or e == ".cts"
+
+type Job:
+  idx: Int
+  path: Str
+
+type Done:
+  idx: Int
+  raw: Raw
+
+fn read_file(fs: Fs, root: Str, path: Str, var kw: {Str: Int}, var t: ast.Ast) -> Raw:
+  let src = fs.read(root + path) else return empty_raw(path)
+  return extract.analyze(path, src, &kw, &t)
+
+fn worker(fs: Fs, own root: Str, own jobs: Chan[Job], own res: Chan[Done]):
+  var kw = scan.keywords()
+  var t = ast.new_ast()
+  while true:
+    let j = jobs.recv() else return
+    res.send(Done(j.idx, read_file(fs, root, j.path, &kw, &t)))
+
+# Reads a batch of files (on all cores when there are several).
+fn read_batch(fs: Fs, root: Str, paths: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast) -> [Raw]:
+  var out: [Raw] = []
+  if jobs_n <= 1 or paths.len < 8:
+    for p in paths: out.push(read_file(fs, root, p, &kw, &t))
+    return out
+  let jc: Chan[Job] = chan(paths.len + 1)
+  let rc: Chan[Done] = chan(paths.len + 1)
+  for i in 0..paths.len: jc.send(Job(i, paths[i] + ""))
+  jc.close()
+  var n = jobs_n
+  if n > paths.len: n = paths.len
+  for k in 0..n: spawn worker(fs, root + "", jc, rc)
+  var slots: [Raw] = []
+  for i in 0..paths.len: slots.push(empty_raw(""))
+  for i in 0..paths.len:
+    var d = rc.recv() else break
+    swap(&slots[d.idx], &d.raw)
+  return slots
+
+type Build:
+  g: Graph
+  entries: {Int: Bool}
+  skip: {Int: Bool}
+  include: {Int: Bool}
+  project: {Str: Bool}
+  visited: {Int: Bool}
+  order: [Int]
+
+fn add_entry(var b: Build, path: Str, skip: Bool, explicit: Bool):
+  if resolve.in_node_modules(path) or not accepted_ext(path): return
+  let id = node_id(&b.g, path)
+  b.entries[id] = true
+  b.project[path] = true
+  if explicit:
+    if skip:
+      if not (id in b.include): b.skip[id] = true
+    else:
+      b.include[id] = true
+      b.skip.remove(id)
+  visit(&b, id)
+
+fn visit_path(var b: Build, path: Str):
+  let id = node_id(&b.g, path)
+  visit(&b, id)
+
+fn visit(var b: Build, id: Int):
+  if id in b.visited: return
+  b.visited[id] = true
+  b.order.push(id)
+
+# Applies one file's imports to the graph (addImport / addInternalImport in knip).
+fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
+  let path = b.g.nodes[id].path + ""
+  let is_dts = path.endswith(".d.ts") or path.endswith(".d.mts") or path.endswith(".d.cts")
+  var imps: [Imp] = []
+  swap(&imps, &b.g.nodes[id].raw.imps)
+  var targets: {Str: Int} = {}    # specifier -> internal file id (-1: not internal)
+  var exts: [Ext] = []
+  var unres: [Ext] = []
+  for im in imps:
+    let r = resolve.resolve(&p.rs, fs, im.spec, path)
+    let type_only = is_dts or (im.flags & F_TYPEONLY) != 0
+    var spos = im.spos
+    if spos < 0: spos = im.pos
+    if r.kind == R_BUILTIN:
+      if not (im.spec in targets): targets[im.spec] = -1
+      continue
+    if (im.flags & F_AUGMENT) != 0 and (r.kind != R_FILE):
+      if not (im.spec in targets): targets[im.spec] = -1
+      continue
+    if r.kind == R_FILE or r.kind == R_EXTERNAL:
+      let internal = r.kind == R_FILE
+      if internal:
+        if (im.flags & F_ENTRY) != 0: add_entry(&b, r.path, true, true)
+        if (im.flags & F_BRIDGE) != 0 and accepted_ext(r.path): visit_path(&b, r.path)
+        let tid = node_id(&b.g, r.path)
+        targets[im.spec] = tid
+        add_internal(&b, tid, id, im)
+        if accepted_ext(r.path): visit(&b, tid)
+      else:
+        if not (im.spec in targets): targets[im.spec] = -1
+        var spec = resolve.sanitize(im.spec)
+        if r.pkg != "" and starts_like_pkg(r.pkg) and pkg_from_spec(spec) != r.pkg: spec = r.pkg + ""
+        if starts_like_pkg(spec):
+          let l = extract.loc(b.g.nodes[id].raw, spos)
+          exts.push(Ext(spec, pkg_from_spec(spec), l[0], l[1], l[2], type_only, true))
+      continue
+    # not resolved
+    if not (im.spec in targets): targets[im.spec] = -1
+    if im.spec.startswith("virtual:"): continue
+    if (im.flags & F_OPTIONAL) != 0:
+      let pp = resolve.join(resolve.dirname(path), im.spec)
+      if accepted_ext(pp): visit_path(&b, pp)
+      continue
+    let l = extract.loc(b.g.nodes[id].raw, spos)
+    unres.push(Ext(im.spec + "", "", l[0], l[1], l[2], type_only, false))
+  # the operations on resolved internal imports
+  var ops: [Op] = []
+  swap(&ops, &b.g.nodes[id].raw.ops)
+  let skip_exp = b.g.nodes[id].skip_exports
+  for o in ops:
+    if o.exp and skip_exp: continue
+    if not (o.spec in targets): continue
+    let tid = targets[o.spec]
+    if tid < 0: continue
+    apply_op(&b, tid, id, o)
+  # unresolved imports that look like packages are external; the rest are reported
+  for u in unres:
+    if u.spec.startswith("http"): continue
+    let s = resolve.sanitize(u.spec)
+    if starts_like_pkg(s):
+      exts.push(Ext(s, pkg_from_spec(s), u.line, u.col, u.pos, u.type_only, false))
+      continue
+    let cand = resolve.join(resolve.dirname(path), s)
+    let ext = resolve.extname(s)
+    var ignored = is_ignored_path(p, cand, false)
+    if not ignored:
+      let al = resolve.alias_exts(ext)
+      if al.len > 0:
+        let base = cand[0..cand.len - ext.len]
+        for a in al:
+          if a != ext and is_ignored_path(p, base + a, false): ignored = true
+    if not ignored and (ext == "" or (ext != ".json" and not foreign_ext(ext))):
+      b.g.nodes[id].unresolved.push(Ext(u.spec + "", "", u.line, u.col, u.pos, u.type_only, false))
+  swap(&b.g.nodes[id].exts, &exts)
+  # shell commands the file runs
+  var scs: [Str] = []
+  swap(&scs, &b.g.nodes[id].raw.scripts)
+  if scs.len > 0:
+    for x in scripts.inputs_from_scripts(scs, new_ctx(p, false)):
+      var y = scripts.cp(x)
+      y.file = path + ""
+      if y.dir == "": y.dir = resolve.dirname(path)
+      if y.dir == "": y.dir = "."
+      let f = handle_input(&p, fs, y)
+      if f != "": add_entry(&b, f, true, true)
+
+fn foreign_ext(e: Str) -> Bool:
+  return " .avif .css .eot .gif .html .ico .jpeg .jpg .less .mp3 .otf .png .sass .scss .sh .styl .stylus .svg .ttf .webp .woff .woff2 .yaml .yml ".find(" " + e + " ") >= 0
+
+fn add_internal(var b: Build, tid: Int, src: Int, im: Imp):
+  var ident = im.ident + ""
+  if ident == "":
+    if (im.flags & F_OPAQUE) != 0: ident = "__opaque"
+    elif (im.flags & extract.F_LOADER) != 0: ident = "__loader-default"
+    else: ident = "__side-effects"
+  b.g.nodes[tid].has_by = true
+  if (im.flags & F_REEXPORT) != 0:
+    if ident == "*" and im.ns != "": add_val(&b.g.nodes[tid].imby.rex_ns, im.ns, src)
+    elif im.alias != "": add_ns_val(&b.g.nodes[tid].imby.rex_as, ident, im.alias, src)
+    else: add_val(&b.g.nodes[tid].imby.rex, ident, src)
+  else:
+    if im.alias != "" and im.alias != ident:
+      if ident == "*": add_val(&b.g.nodes[tid].imby.imp_ns, im.alias, src)
+      else: add_ns_val(&b.g.nodes[tid].imby.imp_as, ident, im.alias, src)
+    elif ident != "*":
+      add_val(&b.g.nodes[tid].imby.imp, ident, src)
+
+fn apply_op(var b: Build, tid: Int, src: Int, o: Op):
+  b.g.nodes[tid].has_by = true
+  let k = o.kind
+  if k == extract.OP_REF: b.g.nodes[tid].imby.refs[o.a] = true
+  elif k == extract.OP_IMPORT: add_val(&b.g.nodes[tid].imby.imp, o.a, src)
+  elif k == extract.OP_ENUM: b.g.nodes[tid].imby.enumerated[o.a] = true
+  elif k == extract.OP_REEXPORT: add_val(&b.g.nodes[tid].imby.rex, o.a, src)
+  elif k == extract.OP_REEXPORTAS: add_ns_val(&b.g.nodes[tid].imby.rex_as, o.a, o.b, src)
+  elif k == extract.OP_REEXPORTNS: add_val(&b.g.nodes[tid].imby.rex_ns, o.a, src)
+
+# ---- the explorer (graph-explorer/operations)
+
+fn has_only_ns_refs(im: IM) -> Bool:
+  if im.imp_ns.len == 0: return false
+  for ns, _ in im.imp_ns:
+    if not (ns in im.refs): return false
+    for r, _ in im.refs:
+      if r.startswith(ns + "."): return false
+  return true
+
+fn has_export(g: Graph, path: Int, name: Str) -> Bool:
+  for e in g.nodes[path].raw.exps:
+    if e.name == name: return true
+  return false
+
+fn split_first(id: Str) -> [Str]:
+  let d = id.find(".")
+  if d < 0: return [id + "", ""]
+  return [id[0..d], id[d + 1..id.len]]
+
+type RefState:
+  seen: {Str: Bool}
+  referenced: Bool
+  reexp_entry: Int
+  traverse: Bool
+  star_at_entry: Bool
+
+fn complete(s: RefState) -> Bool:
+  return s.referenced and (s.traverse or s.reexp_entry >= 0)
+
+fn is_referenced(g: Graph, entries: {Int: Bool}, skip: {Int: Bool}, file: Int, id: Str, traverse: Bool, star_at_entry: Bool) -> [Int]:
+  var s = RefState({}, false, -1, traverse, star_at_entry)
+  walk_down(g, entries, skip, &s, file, id, false)
+  var r = 0
+  if s.referenced: r = 1
+  return [r, s.reexp_entry]
+
+fn walk_down(g: Graph, entries: {Int: Bool}, skip: {Int: Bool}, var s: RefState, path: Int, id: Str, via_star: Bool) -> Bool:
+  let is_entry = path in entries
+  if is_entry and s.reexp_entry < 0: s.reexp_entry = path
+  if complete(s): return true
+  let parts = split_first(id)
+  let ident = parts[0]
+  let rest = parts[1]
+  let key = "{path}:{ident}"
+  if key in s.seen: return false
+  s.seen[key] = true
+  if s.star_at_entry and is_entry and via_star and rest != "":
+    s.referenced = true
+    return complete(s)
+  if ident == "": return false
+  if is_entry and path in skip:
+    s.referenced = true
+    return complete(s)
+  if not g.nodes[path].has_by: return false
+  let f = g.nodes[path].imby
+  if not s.referenced:
+    var direct = false
+    let loader = "__loader-default" in f.imp
+    if ("__opaque" in f.imp or (loader and not has_export(g, path, "default"))) and not has_only_ns_refs(f): direct = true
+    if loader and ident == "default": direct = true
+    if (ident == id or (ident != id and id in f.refs)) and (ident in f.imp or ident in f.imp_as): direct = true
+    if direct:
+      s.referenced = true
+      if complete(s): return true
+  if not s.referenced:
+    if ident in f.imp_as:
+      for alias, _ in f.imp_as[ident]:
+        var aref = alias + ""
+        if rest != "": aref = alias + "." + rest
+        if aref in f.refs:
+          s.referenced = true
+          break
+    if complete(s): return true
+  for ns, _ in f.imp_ns:
+    if not s.referenced and (ns + "." + id) in f.refs:
+      s.referenced = true
+      if complete(s): return true
+    if ns in f.rex_as:
+      for alias, srcs in f.rex_as[ns]:
+        for x in srcs:
+          if walk_down(g, entries, skip, &s, x, alias + "." + id, via_star): return true
+    if ns in f.rex_ns:
+      for x in f.rex_ns[ns]:
+        if walk_down(g, entries, skip, &s, x, ns + "." + id, via_star): return true
+  if is_entry and not s.traverse: return false
+  if ident in f.rex_as:
+    for alias, srcs in f.rex_as[ident]:
+      var nid = alias + ""
+      if rest != "": nid = alias + "." + rest
+      for x in srcs:
+        if walk_down(g, entries, skip, &s, x, nid, via_star): return true
+  if ident in f.rex:
+    for x in f.rex[ident]:
+      if walk_down(g, entries, skip, &s, x, id, via_star): return true
+  elif "*" in f.rex:
+    for x in f.rex["*"]:
+      if walk_down(g, entries, skip, &s, x, id, true): return true
+  for ns, srcs in f.rex_ns:
+    for x in srcs:
+      if walk_down(g, entries, skip, &s, x, ns + "." + id, true): return true
+  return false
+
+# hasStrictlyNsReferences: [1 if only namespace references, namespace name]
+type NsRes:
+  only: Bool
+  ns: Str
+  has: Bool
+
+fn strictly_ns(g: Graph, file: Int, id: Str) -> NsRes:
+  var seen: {Int: Bool} = {}
+  if not g.nodes[file].has_by: return NsRes(false, "", false)
+  return ns_walk(g, &seen, file, id)
+
+fn ns_walk(g: Graph, var seen: {Int: Bool}, path: Int, id: Str) -> NsRes:
+  if not g.nodes[path].has_by: return NsRes(false, "", false)
+  if path in seen: return NsRes(false, "", false)
+  seen[path] = true
+  let m = g.nodes[path].imby
+  var namespace = ""
+  for ns, _ in m.imp_ns:
+    if not (ns in m.refs): return NsRes(false, ns + "", true)
+    for r, _ in m.refs:
+      if r.startswith(ns + "."): return NsRes(false, ns + "", true)
+    namespace = ns + ""
+    if ns in m.rex_as:
+      for alias, srcs in m.rex_as[ns]:
+        let r = ns_follow(g, &seen, srcs, alias, &namespace)
+        if r.has: return r
+  if id in m.rex:
+    let r = ns_follow(g, &seen, m.rex[id], id, &namespace)
+    if r.has: return r
+  if "*" in m.rex:
+    let r = ns_follow(g, &seen, m.rex["*"], id, &namespace)
+    if r.has: return r
+  let parts = split_first(id)
+  if parts[0] in m.rex_as:
+    for alias, srcs in m.rex_as[parts[0]]:
+      var nid = alias + ""
+      if parts[1] != "": nid = alias + "." + parts[1]
+      let r = ns_follow(g, &seen, srcs, nid, &namespace)
+      if r.has: return r
+  for ns, srcs in m.rex_ns:
+    let r = ns_follow(g, &seen, srcs, ns + "." + id, &namespace)
+    if r.has: return r
+  if id in m.imp:
+    let r = ns_follow(g, &seen, m.imp[id], id, &namespace)
+    if r.has: return r
+  if id in m.imp_as:
+    for alias, srcs in m.imp_as[id]:
+      let r = ns_follow(g, &seen, srcs, alias, &namespace)
+      if r.has: return r
+  if namespace != "": return NsRes(true, namespace, true)
+  return NsRes(false, "", false)
+
+# (a result that settles it: not only namespace references, with a namespace)
+fn ns_follow(g: Graph, var seen: {Int: Bool}, srcs: [Int], nid: Str, var namespace: Str) -> NsRes:
+  for x in srcs:
+    if not g.nodes[x].has_by: continue
+    let r = ns_walk(g, &seen, x, nid)
+    if not r.only and r.ns != "": return NsRes(false, r.ns + "", true)
+    if r.ns != "" and namespace == "": namespace = r.ns + ""
+  return NsRes(false, "", false)
+
+fn is_enumerated(g: Graph, file: Int, id: Str) -> Bool:
+  var seen: {Int: Bool} = {}
+  return enum_walk(g, &seen, file, id)
+
+fn enum_walk(g: Graph, var seen: {Int: Bool}, path: Int, id: Str) -> Bool:
+  if not g.nodes[path].has_by or path in seen: return false
+  seen[path] = true
+  let m = g.nodes[path].imby
+  if id in m.enumerated: return true
+  if id in m.rex:
+    for x in m.rex[id]:
+      if enum_walk(g, &seen, x, id): return true
+  if "*" in m.rex:
+    for x in m.rex["*"]:
+      if enum_walk(g, &seen, x, id): return true
+  if id in m.rex_as:
+    for alias, srcs in m.rex_as[id]:
+      for x in srcs:
+        if enum_walk(g, &seen, x, alias): return true
+  return false
+
+fn strictly_enum_refs(m: IM, id: Str) -> Bool:
+  if not (id in m.refs): return false
+  for r, _ in m.refs:
+    if r.startswith(id + "."): return false
+  return true
+
+# ---- analysis (graph/analyze.js)
+
+fn in_used_export(g: Graph, entries: {Int: Bool}, skip: {Int: Bool}, file: Int, ex: Exp, inc_entry: Bool, var visited: {Str: Bool}) -> Bool:
+  if ex.ref_in.len == 0: return false
+  let raw = g.nodes[file].raw
+  for c in ex.ref_in:
+    var ci = -1
+    for k in 0..raw.exps.len:
+      if raw.exps[k].name == c:
+        ci = k
+        break
+    if ci < 0: continue
+    let inx = raw.exps[ci]
+    if inx.typ == "type" or inx.typ == "interface" or inx.typ == "enum": continue
+    if inx.in_file: return true
+    if is_referenced(g, entries, skip, file, c, inc_entry, false)[0] == 1: return true
+    if inx.ref_in.len > 0 and not (c in visited):
+      visited[c] = true
+      if in_used_export(g, entries, skip, file, inx, inc_entry, &visited): return true
+  return false
+
+fn analyze_exports(var p: Proj, b: Build, inc_entry: Bool):
+  let g = b.g
+  for fid in b.order:
+    let node = g.nodes[fid]
+    if not node.analyzed: continue
+    if node.raw.exps.len == 0: continue
+    let is_entry = fid in b.entries
+    if not inc_entry and is_entry: continue
+    for ex in node.raw.exps:
+      if (ex.tags & (extract.TAG_PUBLIC | extract.TAG_BETA | extract.TAG_ALIAS)) != 0: continue
+      if node.has_by:
+        let r = is_referenced(g, b.entries, b.skip, fid, ex.name, inc_entry, false)
+        if r[1] >= 0 and not inc_entry: continue
+        if r[0] == 1:
+          member_issues(&p, b, fid, ex)
+          continue
+      let ns = strictly_ns(g, fid, ex.name)
+      let is_type = ex.typ == "enum" or ex.typ == "type" or ex.typ == "interface"
+      if ex.in_file: continue
+      var vis: {Str: Bool} = {}
+      if in_used_export(g, b.entries, b.skip, fid, ex, inc_entry, &vis): continue
+      if ns.only: continue
+      var typ = "exports"
+      if is_type: typ = "types"
+      var i = issue(typ, node.path, ex.name)
+      if ex.typ != "unknown": i.stype = ex.typ + ""
+      i.parent = ns.ns + ""
+      let l = extract.loc(node.raw, ex.pos)
+      i.line = l[0]
+      i.col = l[1]
+      i.pos = l[2]
+      add_issue(&p.issues, i)
+
+fn member_issues(var p: Proj, b: Build, fid: Int, ex: Exp):
+  let g = b.g
+  let is_enum = ex.typ == "enum"
+  let is_ns = ex.members.len > 0 and ex.typ != "enum"
+  if not is_enum and not is_ns: return
+  if ex.members.len == 0: return
+  if is_enumerated(g, fid, ex.name): return
+  let byf = g.nodes[fid].imby
+  if ex.name in byf.refs: return
+  if is_enum and strictly_enum_refs(byf, ex.name): return
+  var typ = "namespaceMembers"
+  if is_enum: typ = "enumMembers"
+  for m in ex.members:
+    if (m.tags & (extract.TAG_PUBLIC | extract.TAG_BETA | extract.TAG_ALIAS)) != 0: continue
+    if m.in_file: continue
+    let r = is_referenced(g, b.entries, b.skip, fid, ex.name + "." + m.name, true, true)
+    if r[0] == 1: continue
+    var i = issue(typ, g.nodes[fid].path, m.name)
+    i.parent = ex.name + ""
+    let l = extract.loc(g.nodes[fid].raw, m.pos)
+    i.line = l[0]
+    i.col = l[1]
+    i.pos = l[2]
+    add_issue(&p.issues, i)
+
+fn analyze_imports(var p: Proj, b: Build):
+  let g = b.g
+  for fid in b.order:
+    let node = g.nodes[fid]
+    if not node.analyzed: continue
+    # duplicate exports
+    for d in node.raw.dups:
+      if d.names.len > 1:
+        var i = issue("duplicates", node.path, "|".join(d.names))
+        var ds: [Str] = []
+        for k in 0..d.names.len:
+          let l = extract.loc(node.raw, d.pos[k])
+          ds.push("{{\"name\":" + json_str(d.names[k]) + ",\"line\":{l[0]},\"col\":{l[1]},\"pos\":{l[2]}}}")
+        i.extra = "[" + ",".join(ds) + "]"
+        add_issue(&p.issues, i)
+    for e in node.exts:
+      let name = e.pkg
+      var handled = false
+      if name != "": handled = maybe_add_external(&p, name, e.spec, false, e.type_only, e.resolved)
+      if not handled:
+        var sym = name
+        if sym == "": sym = e.spec + ""
+        var i = issue("unlisted", node.path, sym)
+        i.display = display_of(e.spec, sym)
+        i.line = e.line
+        i.col = e.col
+        i.pos = e.pos
+        add_issue(&p.issues, i)
+    for u in node.unresolved:
+      var i = issue("unresolved", node.path, u.spec)
+      i.line = u.line
+      i.col = u.col
+      i.pos = u.pos
+      add_issue(&p.issues, i)
+
+# the symbol column shows the specifier when it contains the symbol (highlightSymbol)
+fn display_of(spec: Str, sym: Str) -> Str:
+  if spec != "" and spec != sym and spec.find(sym) >= 0: return spec + ""
+  return sym + ""
+
+fn settle_deps(var p: Proj):
+  for d in sc(p.deps):
+    var v: {Str: Bool} = {}
+    if not is_referenced_dep(p, d, &v):
+      var i = issue("dependencies", "package.json", d)
+      let l = dep_location(p, "dependencies", d)
+      if l.len == 3:
+        i.line = l[0]
+        i.col = l[1]
+        i.pos = l[2]
+      add_issue(&p.issues, i)
+  for d in sc(p.dev_deps):
+    var v: {Str: Bool} = {}
+    let in_prod = d in p.deps
+    if not in_prod and is_referenced_dep(p, d, &v): continue
+    var i = issue("devDependencies", "package.json", d)
+    let l = dep_location(p, "devDependencies", d)
+    if l.len == 3:
+      i.line = l[0]
+      i.col = l[1]
+      i.pos = l[2]
+    add_issue(&p.issues, i)
+  for d in sc(p.peer_deps):
+    if not (d in p.opt_peer) or not (d in p.referenced): continue
+    var listed = false
+    for x in p.deps:
+      if x == d: listed = true
+    for x in p.dev_deps:
+      if x == d: listed = true
+    if listed: continue
+    var i = issue("optionalPeerDependencies", "package.json", d)
+    let l = dep_location(p, "optionalPeerDependencies", d)
+    if l.len == 3:
+      i.line = l[0]
+      i.col = l[1]
+      i.pos = l[2]
+    add_issue(&p.issues, i)
+  # knip and typescript are never reported (removeIgnoredIssues)
+  var kept: [Issue] = []
+  for i in p.issues.list:
+    let t = i.typ
+    if t == "dependencies" or t == "devDependencies" or t == "optionalPeerDependencies" or t == "unlisted" or t == "unresolved":
+      let name = pkg_from_spec(i.symbol)
+      if name == "knip" or name == "typescript":
+        if not (t == "devDependencies" and name in p.deps): continue
+    kept.push(copy_issue(i))
+  p.issues.list = kept
+
+# ---- reporting
+
+fn types_order() -> [Str]:
+  return ["files", "dependencies", "devDependencies", "optionalPeerDependencies", "unlisted", "binaries", "unresolved", "exports", "types", "enumMembers", "namespaceMembers", "duplicates"]
+
+fn title_of(t: Str) -> Str:
+  if t == "files": return "Unused files"
+  if t == "dependencies": return "Unused dependencies"
+  if t == "devDependencies": return "Unused devDependencies"
+  if t == "optionalPeerDependencies": return "Referenced optional peerDependencies"
+  if t == "unlisted": return "Unlisted dependencies"
+  if t == "binaries": return "Unlisted binaries"
+  if t == "unresolved": return "Unresolved imports"
+  if t == "exports": return "Unused exports"
+  if t == "types": return "Unused exported types"
+  if t == "enumMembers": return "Unused exported enum members"
+  if t == "namespaceMembers": return "Unused exported namespace members"
+  if t == "duplicates": return "Duplicate exports"
+  return t
+
+fn issue_before(c: [Int], a: Issue, b: Issue) -> Bool:
+  if a.file != b.file: return coll_cmp(c, a.file, b.file) < 0
+  if a.line != b.line: return a.line < b.line
+  return a.col < b.col
+
+fn sorted_issues(c: [Int], xs: [Issue]) -> [Issue]:
+  # stable merge sort
+  var out: [Issue] = []
+  for x in xs: out.push(copy_issue(x))
+  out.sort(by: fn(a, b) => issue_before(c, a, b))
+  return out
+
+fn copy_issue(i: Issue) -> Issue:
+  return Issue(i.typ + "", i.file + "", i.symbol + "", i.display + "", i.stype + "", i.parent + "", i.line, i.col, i.pos, i.extra + "")
+
+# text width in characters (UTF-8 code points)
+fn width(s: Str) -> Int:
+  var n = 0
+  for i in 0..s.len:
+    if (s[i] & 0xC0) != 0x80: n += 1
+  return n
+
+fn pad_end(s: Str, w: Int) -> Str:
+  var out = s + ""
+  var n = width(s)
+  while n < w:
+    out += " "
+    n += 1
+  return out
+
+fn chars(s: Str) -> [Str]:
+  return s.chars()
+
+fn truncate_end(s: Str, w: Int) -> Str:
+  if width(s) <= w: return s + ""
+  let cs = chars(s)
+  var out = ""
+  for i in 0..(w - 1):
+    if i < cs.len: out += cs[i]
+  return out + "…"
+
+fn truncate_start(s: Str, w: Int) -> Str:
+  if width(s) <= w: return s + ""
+  let cs = chars(s)
+  let keep = w - 1
+  var out = "…"
+  for i in (cs.len - keep)..cs.len: out += cs[i]
+  return out
+
+fn table(rows: [[Str]], present: [Bool], modes: [Int]) -> [Str]:
+  # columns: modes 0 end, 1 start, 2 none
+  var cols: [Int] = []
+  for c in 0..present.len:
+    if present[c]: cols.push(c)
+  var widths: [Int] = []
+  for c in cols:
+    var m = 0
+    for r in rows:
+      let w = width(r[c])
+      if w > m: m = w
+    widths.push(m)
+  let sep = (cols.len - 1) * 2
+  var total = sep
+  for w in widths: total += w
+  let max_width = 120
+  if total > max_width:
+    # distributeWidths
+    var reserved = 0
+    var trunc: [Int] = []
+    for k in 0..cols.len:
+      if modes[cols[k]] == 2: reserved += widths[k]
+      else: trunc.push(k)
+    if trunc.len > 0:
+      var budget = max_width - sep - reserved
+      if budget < 0: budget = 0
+      var orig: [Int] = []
+      for k in 0..cols.len: orig.push(widths[k])
+      var unresolved: [Int] = []
+      for k in trunc: unresolved.push(k)
+      var remaining = budget
+      var changed = true
+      while changed and unresolved.len > 0:
+        changed = false
+        let share = remaining / unresolved.len
+        var next: [Int] = []
+        for k in unresolved:
+          if orig[k] <= share:
+            widths[k] = orig[k]
+            remaining -= orig[k]
+            changed = true
+          else: next.push(k)
+        unresolved = next
+      if unresolved.len > 0:
+        var over = 0
+        for k in unresolved: over += orig[k] - 4
+        var excess = remaining - unresolved.len * 4
+        if excess < 0: excess = 0
+        var dist = 0
+        for k in unresolved:
+          var share = 0
+          if over > 0: share = (orig[k] - 4) * excess / over
+          widths[k] = 4 + share
+          dist += share
+        let left = excess - dist
+        if left > 0: widths[unresolved[0]] += left
+  var out: [Str] = []
+  for r in rows:
+    var line = ""
+    for k in 0..cols.len:
+      let c = cols[k]
+      let padded = pad_end(r[c], widths[k])
+      var cell = padded
+      if modes[c] == 1: cell = truncate_start(padded, widths[k])
+      elif modes[c] == 0: cell = truncate_end(padded, widths[k])
+      if k > 0: line += "  "
+      line += cell
+    out.push(line)
+  return out
+
+fn report_symbols(p: Proj) -> Int:
+  var lines: [Str] = []
+  var total = 0
+  for t in types_order():
+    var xs: [Issue] = []
+    for i in p.issues.list:
+      if i.typ == t: xs.push(copy_issue(i))
+    if xs.len == 0: continue
+    total += xs.len
+    lines.push(title_of(t) + " ({xs.len})")
+    let sorted = sorted_issues(p.coll, xs)
+    var rows: [[Str]] = []
+    var present = [false, false, false, false]
+    for i in sorted:
+      var sym = ""
+      if t != "files":
+        sym = i.display + ""
+        present[0] = true
+      var par = ""
+      if i.parent != "":
+        par = i.parent + ""
+        present[1] = true
+      var st = ""
+      if i.stype != "":
+        st = i.stype + ""
+        present[2] = true
+      var fp = i.file + ""
+      if t != "files" and i.line > 0: fp = fp + ":{i.line}:{i.col}"
+      present[3] = true
+      rows.push([sym, par, st, fp])
+    for l in table(rows, present, [0, 0, 2, 1]): lines.push(l)
+  if lines.len > 0: print("\n".join(lines))
+  return total
+
+fn json_str(s: Str) -> Str:
+  return json.quote(s)
+
+type Owner:
+  pats: [glob.Pat]
+  owners: [Str]
+
+# .github/CODEOWNERS rules (the last matching rule gives a file's owners)
+fn codeowners(p: Proj, fs: Fs) -> [Owner]:
+  var out: [Owner] = []
+  let text = fs.read(fspath(p, ".github/CODEOWNERS")) else return out
+  for raw in text.split("\n"):
+    var l = raw
+    if l.endswith("\r"): l = l[0..l.len - 1]
+    if l == "" or l.startswith("#"): continue
+    var parts: [Str] = []
+    for x in l.split():
+      parts.push(x + "")
+    if parts.len == 0: continue
+    let pat = convert_gitignore(parts[0])
+    var pats: [glob.Pat] = [glob.compile(pat)]
+    if pat != "*" and pat != "**" and not pat.endswith("/*"): pats.push(glob.compile(pat + "/**"))
+    var owners: [Str] = []
+    for k in 1..parts.len: owners.push(parts[k] + "")
+    out.push(Owner(pats, owners))
+  return out
+
+fn owners_of(rules: [Owner], file: Str) -> [Str]:
+  var i = rules.len - 1
+  while i >= 0:
+    if matches_any(rules[i].pats, file, false): return sc(rules[i].owners)
+    i -= 1
+  return []
+
+fn report_json(p: Proj, fs: Fs) -> Int:
+  let rules = codeowners(p, fs)
+  let has_owners = fs.exists(fspath(p, ".github/CODEOWNERS"))
+  var files: [Str] = []
+  var byf: {Str: [Issue]} = {}
+  for i in p.issues.list:
+    if not (i.file in byf):
+      byf[i.file] = []
+      files.push(i.file + "")
+    byf[i.file].push(copy_issue(i))
+  var parts: [Str] = []
+  let cats = ["binaries", "catalog", "catalogReferences", "dependencies", "devDependencies", "duplicates", "enumMembers", "exports", "files", "namespaceMembers", "optionalPeerDependencies", "types", "unlisted", "unresolved"]
+  for f in files:
+    var row = "{{\"file\":" + json_str(f)
+    if has_owners:
+      var os_: [Str] = []
+      for o in owners_of(rules, f): os_.push("{{\"name\":" + json_str(o) + "}}")
+      row += ",\"owners\":[" + ",".join(os_) + "]"
+    for c in cats:
+      var items: [Str] = []
+      for i in byf[f]:
+        if i.typ != c: continue
+        if c == "files": items.push("{{\"name\":" + json_str(i.symbol) + "}}")
+        elif c == "binaries": items.push("{{\"name\":" + json_str(i.symbol) + "}}")
+        elif c == "duplicates": items.push(i.extra + "")
+        else:
+          var o = "{{"
+          if i.parent != "": o += "\"namespace\":" + json_str(i.parent) + ","
+          o += "\"name\":" + json_str(i.symbol)
+          if i.line > 0: o += ",\"line\":{i.line},\"col\":{i.col},\"pos\":{i.pos}"
+          o += "}}"
+          items.push(o)
+      row += ",\"" + c + "\":[" + ",".join(items) + "]"
+    row += "}}"
+    parts.push(row)
+  print("{{\"issues\":[" + ",".join(parts) + "]}}")
+  return p.issues.list.len
+
+# ---- main
+
+fn cpu_count(fs: Fs) -> Int:
+  let info = fs.read("/proc/cpuinfo") else ""
+  var n = 0
+  for l in info.split("\n"):
+    if l.startswith("processor"): n += 1
+  if n < 1: return 1
+  return n
+
+fn main(fs: Fs, os: Os):
+  let argv = args()
+  var dir = ""
+  var reporter = "symbols"
+  var inc_entry = false
+  var jobs = 0
+  var debug = false
+  var i = 1
+  while i < argv.len:
+    let a = argv[i]
+    if (a == "--directory" or a == "-d") and i + 1 < argv.len:
+      dir = argv[i + 1] + ""
+      i += 2
+      continue
+    if a == "--reporter" and i + 1 < argv.len:
+      reporter = argv[i + 1] + ""
+      i += 2
+      continue
+    if a == "--jobs" and i + 1 < argv.len:
+      jobs = int(argv[i + 1]) else 1
+      i += 2
+      continue
+    if a == "--include-entry-exports": inc_entry = true
+    if a == "--debug-inputs": debug = true
+    i += 1
+  var root = ""
+  if dir != "" and dir != ".":
+    root = dir + ""
+    if not root.endswith("/"): root += "/"
+  var p = new_proj(root)
+  if not load_manifest(&p, fs):
+    eprint("vknip: no package.json in " + fspath(p, ""))
+    exit(2)
+  # .gitignore files: .git/info/exclude and the root's first (the walk adds the nested ones)
+  p.ign.push(glob.compile("**/node_modules"))
+  p.ign.push(glob.compile(".git"))
+  let excl = fs.read(fspath(p, ".git/info/exclude")) else ""
+  add_gitignore(&p, excl, "")
+  let gi = fs.read(fspath(p, ".gitignore")) else ""
+  add_gitignore(&p, gi, "")
+  walk(&p, fs, "")
+  var fset: {Str: Bool} = {}
+  for f in p.files: fset[f] = true
+  swap(&p.file_set, &fset)
+  load_dep_meta(&p, fs)
+  enabled_plugins(&p, fs)
+  load_tsconfig(&p, fs)
+  run_plugins(&p, fs)
+  if debug:
+    for x in p.inputs: eprint("input {x.kind} {x.spec} ({x.file}) opt={x.optional}")
+  # entry and project files
+  var b = Build(Graph({}, []), {}, {}, {}, {}, {}, [])
+  for f in p.dts_entries:
+    if not is_ignored_path(p, f, false): add_entry(&b, f, false, false)
+  var mpats: [Str] = []
+  for s in manifest_entries(p):
+    if s.startswith("!"): continue
+    mpats.push(source_map_pattern(p, s))
+  for f in glob_files(p, mpats):
+    if not is_ignored_path(p, f, false): add_entry(&b, f, false, false)
+  # plugin and script inputs
+  var entry_pats: [Str] = []
+  var entry_pats_prod_skip: [Str] = []
+  var project_pats: [Str] = []
+  var inputs: [Input] = []
+  swap(&inputs, &p.inputs)
+  for inp in inputs:
+    if inp.kind == I_ENTRY:
+      var s = inp.spec + ""
+      if inp.plugin.startswith("mocha-dir:"):
+        var base = inp.dir
+        if base == "." : base = ""
+        var d = resolve.join(base, s)
+        while d.endswith("/"): d = d[0..d.len - 1]
+        if fs.exists(fspath(p, d) + "/"): s = d + "/" + inp.plugin[10..inp.plugin.len]
+      if inp.dir != "" and not s.startswith("!"): s = resolve.join(inp.dir, s)
+      if inp.production: entry_pats_prod_skip.push(s)
+      else: entry_pats.push(s)
+    elif inp.kind == I_PROJECT: project_pats.push(inp.spec + "")
+    elif inp.kind == I_CONFIG:
+      if not scripts.is_internal(inp.spec) and pkg_from_spec(inp.spec) != "":
+        let f = handle_input(&p, fs, inp)
+        if f != "": add_entry(&b, f, true, true)
+      elif inp.plugin != "typescript":
+        # a config file named on a command line: an entry file when it exists
+        var base = inp.dir
+        if base == "": base = resolve.dirname(inp.file)
+        if base == ".": base = ""
+        let f = resolve.join(base, inp.spec)
+        if exists_file(p, fs, f): add_entry(&b, f, true, true)
+    else:
+      let f = handle_input(&p, fs, inp)
+      if f != "": add_entry(&b, f, true, true)
+  var all_pats: [Str] = []
+  for x in entry_pats: all_pats.push(x + "")
+  for x in entry_pats_prod_skip: all_pats.push(x + "")
+  for f in glob_files(p, all_pats): add_entry(&b, f, true, true)
+  # the default entry files
+  for f in glob_fs(p, fs, ["{{index,cli,main}}.{{" + EXTS_GLOB + "}}", "src/{{index,cli,main}}.{{" + EXTS_GLOB + "}}"]):
+    add_entry(&b, f, false, false)
+  # project files
+  var ppats: [Str] = ["**/*.{{" + EXTS_GLOB + "}}"]
+  for x in entry_pats_prod_skip: ppats.push(x + "")
+  for x in project_pats: ppats.push(x + "")
+  for f in glob_files(p, ppats):
+    if accepted_ext(f) and not resolve.in_node_modules(f): b.project[f] = true
+  # the graph: read the files reached from the entries, in waves (each on all cores)
+  if jobs == 0: jobs = cpu_count(fs)
+  var kw = scan.keywords()
+  var t = ast.new_ast()
+  var done = 0
+  while done < b.order.len:
+    var wave: [Int] = []
+    var paths: [Str] = []
+    for k in done..b.order.len:
+      wave.push(b.order[k])
+      paths.push(b.g.nodes[b.order[k]].path + "")
+    done = b.order.len
+    var raws = read_batch(fs, root, paths, jobs, &kw, &t)
+    for k in 0..wave.len:
+      let id = wave[k]
+      swap(&b.g.nodes[id].raw, &raws[k])
+      let path = b.g.nodes[id].path
+      if path in b.project:
+        b.g.nodes[id].analyzed = true
+        b.g.nodes[id].skip_exports = id in b.skip
+        if id in b.skip:
+          b.g.nodes[id].raw.exps = []
+          b.g.nodes[id].raw.dups = []
+        link_file(&p, fs, &b, id)
+      else:
+        # not a project file: only followed
+        link_follow(&p, fs, &b, id)
+  # unused files
+  for f in sc(p.files):
+    if not (f in b.project): continue
+    var used = false
+    if f in b.g.ids:
+      if b.g.ids[f] in b.visited: used = true
+    if used: continue
+    if is_dts(f):
+      let src = fs.read(fspath(p, f)) else ""
+      var t2 = ast.new_ast()
+      var kw2 = scan.keywords()
+      let r = extract.analyze(f, src, &kw2, &t2)
+      if r.ok and r.n_static_exports == 0: continue
+    add_issue(&p.issues, issue("files", f, f))
+  analyze_exports(&p, b, inc_entry)
+  analyze_imports(&p, b)
+  settle_deps(&p)
+  var n = 0
+  if reporter == "json": n = report_json(p, fs)
+  else: n = report_symbols(p)
+  if n > 0: exit(1)
+
+# A file outside the project: its imports are followed, nothing else is recorded.
+fn link_follow(var p: Proj, fs: Fs, var b: Build, id: Int):
+  let path = b.g.nodes[id].path + ""
+  var imps: [Imp] = []
+  swap(&imps, &b.g.nodes[id].raw.imps)
+  for im in imps:
+    let r = resolve.resolve(&p.rs, fs, im.spec, path)
+    if r.kind == R_FILE and accepted_ext(r.path) and not resolve.in_node_modules(r.path): visit_path(&b, r.path)

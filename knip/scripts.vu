@@ -1,0 +1,990 @@
+# package.json scripts (and other shell commands) read as knip reads them (binaries/*.js): each command
+# gives the binary it runs, files it runs (node x.js, tsx x.ts), packages it loads (-r, --import),
+# config files (tsc -p x) and the commands it wraps (cross-env, c8, npm run, npx...).
+
+# input kinds (knip's util/input.js)
+const I_ENTRY = 1
+const I_DEP = 2
+const I_BIN = 3
+const I_DEFER = 4         # deferResolve: a file or a package
+const I_DEFER_ENTRY = 5   # deferResolveEntry
+const I_CONFIG = 6
+const I_PROJECT = 7
+const I_IGNORE = 8
+
+type Input:
+  kind: Int
+  spec: Str
+  file: Str          # the file it came from ("" none)
+  dir: Str           # folder the specifier is relative to ("" the file's folder)
+  optional: Bool
+  type_only: Bool
+  production: Bool
+  skip_exports: Bool
+  plugin: Str        # for configs
+  also_owner: Bool
+
+fn cp(i: Input) -> Input:
+  return Input(i.kind, i.spec + "", i.file + "", i.dir + "", i.optional, i.type_only, i.production, i.skip_exports, i.plugin + "", i.also_owner)
+
+fn inp(kind: Int, spec: Str) -> Input:
+  return Input(kind, spec + "", "", "", false, false, false, false, "", false)
+
+type Word:
+  value: Str     # unquoted
+  text: Str      # as written
+
+type Cmd:
+  prefix: [Word]   # VAR=value assignments
+  name: Word
+  args: [Word]
+  has_name: Bool
+
+type Ctx:
+  script_names: {Str: Str}     # the manifest's scripts
+  is_forwarded: Bool
+  optional_bins: Bool
+  expanded: {Str: Bool}
+  reset_opt: Bool              # nested commands (through a package manager) aren't optional
+
+# ---- the shell
+
+fn is_space(c: Byte) -> Bool:
+  return c == ' ' or c == '\t'
+
+# Splits a script into commands (and parses the commands in $(...) and `...` too).
+fn parse_script(s: Str) -> [Cmd]:
+  var cmds: [Cmd] = []
+  var subs: [Str] = []
+  var words: [Word] = []
+  var i = 0
+  let n = s.len
+  var skip_next = false   # the word after a redirection
+  while i <= n:
+    var c: Byte = 0
+    if i < n: c = s[i]
+    if i == n or c == '\n' or c == ';' or c == '|' or c == '&' or c == '(' or c == ')':
+      if c == '&' and i + 1 < n and s[i + 1] == '>':
+        # &> file
+        i += 2
+        skip_next = true
+        continue
+      flush(&cmds, &words)
+      if i == n: break
+      i += 1
+      continue
+    if is_space(c) or c == '\r':
+      i += 1
+      continue
+    if c == '#' :
+      # a comment to the end of the line
+      while i < n and s[i] != '\n': i += 1
+      continue
+    if c == '>' or c == '<':
+      i += 1
+      if i < n and (s[i] == '>' or s[i] == '&'): i += 1
+      while i < n and s[i] >= '0' and s[i] <= '9': i += 1
+      if i < n and s[i] == '-': i += 1
+      skip_next = true
+      continue
+    if c >= '0' and c <= '9' and i + 1 < n and (s[i + 1] == '>' or s[i + 1] == '<'):
+      i += 1
+      continue
+    # a word
+    var value = ""
+    let start = i
+    while i < n:
+      let d = s[i]
+      if is_space(d) or d == '\n' or d == ';' or d == '|' or d == '&' or d == '(' or d == ')' or d == '<' or d == '>' or d == '\r': break
+      if d == '\'':
+        let e = s.find("'", i + 1)
+        if e < 0:
+          value += s[i + 1..n]
+          i = n
+          break
+        value += s[i + 1..e]
+        i = e + 1
+        continue
+      if d == '"':
+        var j = i + 1
+        while j < n and s[j] != '"':
+          if s[j] == '\\' and j + 1 < n:
+            value += s[j + 1..j + 2]
+            j += 2
+            continue
+          if s[j] == '$' and j + 1 < n and s[j + 1] == '(':
+            let e = close_paren(s, j + 1)
+            subs.push(s[j + 2..e])
+            value += s[j..e + 1]
+            j = e + 1
+            continue
+          value += s[j..j + 1]
+          j += 1
+        i = j + 1
+        continue
+      if d == '\\' and i + 1 < n:
+        value += s[i + 1..i + 2]
+        i += 2
+        continue
+      if d == '$' and i + 1 < n and s[i + 1] == '(':
+        let e = close_paren(s, i + 1)
+        subs.push(s[i + 2..e])
+        value += s[i..e + 1]
+        i = e + 1
+        continue
+      if d == '`':
+        let e = s.find("`", i + 1)
+        var end = n
+        if e >= 0: end = e
+        subs.push(s[i + 1..end])
+        value += s[i..min(end + 1, n)]
+        i = end + 1
+        continue
+      value += s[i..i + 1]
+      i += 1
+    let text = s[start..min(i, n)]
+    if skip_next:
+      skip_next = false
+      continue
+    words.push(Word(value, text))
+  for sub in subs:
+    for c in parse_script(sub): cmds.push(copy_cmd(c))
+  return cmds
+
+fn cw(w: Word) -> Word:
+  return Word(w.value + "", w.text + "")
+
+fn copy_words(ws: [Word]) -> [Word]:
+  var out: [Word] = []
+  for w in ws: out.push(Word(w.value + "", w.text + ""))
+  return out
+
+fn copy_cmd(c: Cmd) -> Cmd:
+  return Cmd(copy_words(c.prefix), Word(c.name.value + "", c.name.text + ""), copy_words(c.args), c.has_name)
+
+fn close_paren(s: Str, open: Int) -> Int:
+  var depth = 0
+  var j = open
+  while j < s.len:
+    if s[j] == '(': depth += 1
+    elif s[j] == ')':
+      depth -= 1
+      if depth == 0: return j
+    elif s[j] == '\'':
+      let e = s.find("'", j + 1)
+      if e < 0: return s.len - 1
+      j = e
+    j += 1
+  return s.len - 1
+
+const RESERVED = " if then else elif fi do done for while until case esac in function {{ }} ! time "
+
+fn is_assignment(w: Word) -> Bool:
+  let eq = w.text.find("=")
+  if eq <= 0: return false
+  for i in 0..eq:
+    let c = w.text[i]
+    if not ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'): return false
+  return true
+
+fn flush(var cmds: [Cmd], var words: [Word]):
+  if words.len == 0: return
+  var i = 0
+  # compound command keywords
+  while i < words.len and RESERVED.find(" " + words[i].text + " ") >= 0 and words[i].text != "!":
+    if words[i].text == "for" or words[i].text == "case":
+      # for x in ...: skip to the end of the list (the commands follow 'do')
+      i = words.len
+      break
+    i += 1
+  var prefix: [Word] = []
+  while i < words.len and is_assignment(words[i]):
+    prefix.push(Word(words[i].value + "", words[i].text + ""))
+    i += 1
+  if i >= words.len:
+    words.truncate(0)
+    return
+  let name = Word(words[i].value + "", words[i].text + "")
+  var args: [Word] = []
+  for k in i + 1..words.len: args.push(Word(words[k].value + "", words[k].text + ""))
+  cmds.push(Cmd(prefix, name, args, true))
+  words.truncate(0)
+
+# ---- arguments (util/parse-args.js: options take the next positional unless boolean)
+
+type Opt:
+  name: Str
+  value: Str
+  flag: Bool       # no value
+  neg: Bool        # --no-x
+
+type Parsed:
+  pos: [Str]
+  pos_ix: [Int]     # index in the words of each positional
+  opts: [Opt]
+  dd: [Str]         # after --
+
+type ArgSpec:
+  strings: [Str]
+  booleans: [Str]
+  aliases: [Str]    # pairs: alias name, canonical name
+  dd: Bool
+
+fn canon(sp: ArgSpec, name: Str) -> Str:
+  var i = 0
+  while i < sp.aliases.len:
+    if sp.aliases[i] == name: return sp.aliases[i + 1] + ""
+    i += 2
+  return name + ""
+
+fn is_bool(sp: ArgSpec, name: Str) -> Bool:
+  let c = canon(sp, name)
+  for b in sp.booleans:
+    if b == name or b == c or canon(sp, b) == c: return true
+  return false
+
+fn parse_args(words: [Str], sp: ArgSpec) -> Parsed:
+  var out = Parsed([], [], [], [])
+  var terminated = false
+  var i = 0
+  # tokens: (kind, name, value, index) built on the fly
+  var toks_kind: [Int] = []     # 0 positional, 1 option, 2 terminator
+  var toks_name: [Str] = []
+  var toks_val: [Str] = []
+  var toks_has: [Bool] = []
+  var toks_ix: [Int] = []
+  var toks_neg: [Bool] = []
+  while i < words.len:
+    var a = words[i]
+    if a.len >= 3 and a[0] == '-' and a[1] != '-' and a[2] == '=': a = "-" + a
+    if terminated:
+      toks_kind.push(0)
+      toks_name.push("")
+      toks_val.push(a)
+      toks_has.push(true)
+      toks_ix.push(i)
+      toks_neg.push(false)
+    elif a == "--":
+      terminated = true
+      toks_kind.push(2)
+      toks_name.push("")
+      toks_val.push("")
+      toks_has.push(false)
+      toks_ix.push(i)
+      toks_neg.push(false)
+    elif a.startswith("--") and a.len > 2:
+      let eq = a.find("=")
+      var name = a[2..a.len]
+      var val = ""
+      var has = false
+      if eq > 0:
+        name = a[2..eq]
+        val = a[eq + 1..a.len]
+        has = true
+      toks_kind.push(1)
+      toks_name.push(name)
+      toks_val.push(val)
+      toks_has.push(has)
+      toks_ix.push(i)
+      toks_neg.push(not has and a.startswith("--no-"))
+    elif a.startswith("-") and a.len > 1:
+      # short options; -abc is a, b, c
+      if a.len == 2:
+        toks_kind.push(1)
+        toks_name.push(a[1..2])
+        toks_val.push("")
+        toks_has.push(false)
+        toks_ix.push(i)
+        toks_neg.push(false)
+      elif a[2] == '=':
+        toks_kind.push(1)
+        toks_name.push(a[1..2])
+        toks_val.push(a[3..a.len])
+        toks_has.push(true)
+        toks_ix.push(i)
+        toks_neg.push(false)
+      else:
+        for k in 1..a.len:
+          toks_kind.push(1)
+          toks_name.push(a[k..k + 1])
+          toks_val.push("")
+          toks_has.push(false)
+          toks_ix.push(i)
+          toks_neg.push(false)
+    else:
+      toks_kind.push(0)
+      toks_name.push("")
+      toks_val.push(a)
+      toks_has.push(true)
+      toks_ix.push(i)
+      toks_neg.push(false)
+    i += 1
+  var consumed: {Int: Bool} = {}
+  var after_term = false
+  for t in 0..toks_kind.len:
+    let k = toks_kind[t]
+    if k == 2:
+      after_term = true
+      continue
+    if k == 0:
+      if after_term and sp.dd: out.dd.push(toks_val[t])
+      elif not (t in consumed):
+        out.pos.push(toks_val[t])
+        out.pos_ix.push(toks_ix[t])
+      continue
+    let name = toks_name[t]
+    if toks_neg[t]:
+      out.opts.push(Opt(canon(sp, name[3..name.len]), "false", false, true))
+      continue
+    if is_bool(sp, name):
+      out.opts.push(Opt(canon(sp, name), toks_val[t], not toks_has[t], false))
+      continue
+    if toks_has[t]:
+      out.opts.push(Opt(canon(sp, name), toks_val[t], false, false))
+      continue
+    if t + 1 < toks_kind.len and toks_kind[t + 1] == 0 and not ((t + 1) in consumed) and not after_term:
+      consumed[t + 1] = true
+      out.opts.push(Opt(canon(sp, name), toks_val[t + 1], false, false))
+      continue
+    out.opts.push(Opt(canon(sp, name), "", true, false))
+  return out
+
+fn opt_vals(p: Parsed, name: Str) -> [Str]:
+  var out: [Str] = []
+  for o in p.opts:
+    if o.name == name and not o.flag and not o.neg: out.push(o.value + "")
+  return out
+
+fn has_opt(p: Parsed, name: Str) -> Bool:
+  for o in p.opts:
+    if o.name == name and not o.neg:
+      if o.value == "false": return false
+      return true
+  return false
+
+fn values_of(ws: [Word]) -> [Str]:
+  var out: [Str] = []
+  for w in ws: out.push(w.value + "")
+  return out
+
+fn to_script(ws: [Word]) -> Str:
+  var parts: [Str] = []
+  for w in ws:
+    if w.value != "--": parts.push(w.text + "")
+  return " ".join(parts)
+
+fn words_from(ws: [Word], from: Str) -> [Word]:
+  var out: [Word] = []
+  var on = false
+  for w in ws:
+    if not on and w.value == from: on = true
+    if on: out.push(Word(w.value + "", w.text + ""))
+  return out
+
+fn words_after(ws: [Word], tok: Str) -> [Word]:
+  var out: [Word] = []
+  var on = false
+  for w in ws:
+    if on:
+      if w.value != "--": out.push(Word(w.value + "", w.text + ""))
+    elif w.value == tok: on = true
+  return out
+
+# ---- binaries
+
+fn strip_version(s: Str) -> Str:
+  # (\S+)@.* -> $1 (greedy: the last '@' that leaves something before it)
+  var i = s.len - 1
+  while i > 0:
+    if s[i] == '@':
+      var ok = true
+      for k in 0..i:
+        if s[k] == ' ': ok = false
+      if ok: return s[0..i]
+    i -= 1
+  return s + ""
+
+fn extract_binary(cmd: Str) -> Str:
+  var s = cmd + ""
+  # (?:\.{0,2}\/)*node_modules\/
+  let nm = s.find("node_modules/")
+  if nm >= 0:
+    var ok = true
+    var k = 0
+    while k < nm:
+      if s[k] == '.' or s[k] == '/': k += 1
+      else:
+        ok = false
+        break
+    if ok: s = s[nm + 13..s.len]
+  if s.startswith(".bin/"): s = s[5..s.len]
+  return strip_version(s)
+
+fn valid_binary(s: Str) -> Bool:
+  for i in 0..s.len:
+    let c = s[i]
+    if c == '*' or c == ':' or c == '!' or c == '(' or c == ')': return false
+  return true
+
+fn word_start(s: Str) -> Bool:
+  if s == "": return false
+  let c = s[0]
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c >= 128
+
+fn is_internal(spec: Str) -> Bool:
+  return spec.startswith(".") or spec.startswith("/")
+
+fn bin_input(name: Str, ctx: Ctx) -> Input:
+  var i = inp(I_BIN, name)
+  i.optional = ctx.optional_bins
+  return i
+
+# ---- commands
+
+fn deps_from_script(script: Str, ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  if script == "": return out
+  let cmds = parse_script(script)
+  # functions defined in the script aren't binaries
+  for c in cmds:
+    for x in deps_from_command(c, ctx): out.push(cp(x))
+  return out
+
+fn from_args(ws: [Word], ctx: Ctx) -> [Input]:
+  if ws.len == 0: return []
+  let first = ws[0].value
+  var head = first
+  let sp = first.find(" ")
+  if sp >= 0: head = first[0..sp]
+  if not valid_binary(head): return []
+  var c = nested(ctx)
+  c.is_forwarded = false
+  return deps_from_script(to_script(ws), c)
+
+fn ctx_copy(c: Ctx) -> Ctx:
+  var names: {Str: Str} = {}
+  for k, v in c.script_names: names[k] = v + ""
+  var ex: {Str: Bool} = {}
+  for k, _ in c.expanded: ex[k] = true
+  return Ctx(names, c.is_forwarded, c.optional_bins, ex, c.reset_opt)
+
+# the context for commands nested in this one (fromArgs)
+fn nested(c: Ctx) -> Ctx:
+  var n = ctx_copy(c)
+  if n.reset_opt:
+    n.optional_bins = false
+    n.reset_opt = false
+  return n
+
+fn from_words(ws: [Word], ctx: Ctx) -> [Input]:
+  var parts: [Str] = []
+  for w in ws:
+    if w.text != "--": parts.push(w.text + "")
+  return deps_from_script(" ".join(parts), ctx)
+
+fn is_pm(b: Str) -> Bool:
+  return b == "bun" or b == "bunx" or b == "nub" or b == "nubx" or b == "npm" or b == "npx" or b == "pnpm" or b == "pn" or b == "pnpx" or b == "pnx" or b == "yarn"
+
+fn node_options_inputs(c: Cmd) -> [Input]:
+  var out: [Input] = []
+  for p in c.prefix:
+    if p.text.startswith("NODE_OPTIONS="):
+      let v = p.value[13..p.value.len]
+      let pa = parse_args(v.split(" "), ArgSpec(["r"], [], ["r", "require", "loader", "require", "experimental-loader", "require", "test-reporter", "require", "watch", "require", "import", "require"], false))
+      for x in opt_vals(pa, "require"): out.push(inp(I_DEFER, x))
+  return out
+
+fn deps_from_command(c: Cmd, ctx0: Ctx) -> [Input]:
+  var out: [Input] = []
+  let text = c.name.value
+  if text == "": return out
+  let binary = extract_binary(text)
+  if binary == "" or binary == "." or binary == "source" or binary == "[": return out
+  if binary.startswith("-") or binary.startswith(".."): return out
+  var ctx = ctx_copy(ctx0)
+  let explicit = text.find("node_modules/.bin/") >= 0 or text.startswith(".bin/")
+  if ctx.optional_bins and (explicit or is_pm(binary)):
+    ctx.optional_bins = not explicit
+    ctx.reset_opt = true
+  if binary == "!" or binary == "test": return from_args(c.args, ctx)
+  let fno = node_options_inputs(c)
+  var res: [Input] = []
+  if binary == "npm": res = resolve_npm(c.args, ctx)
+  elif binary == "npx": res = resolve_npx(c.args, ctx)
+  elif binary == "pnpm" or binary == "pn": res = resolve_pnpm(c.args, ctx)
+  elif binary == "pnpx" or binary == "pnx": res = resolve_dlx(c.args, ctx)
+  elif binary == "yarn": res = resolve_yarn(c.args, ctx)
+  elif binary == "bun" or binary == "nub": res = resolve_bun(c.args, ctx)
+  elif binary == "bunx" or binary == "nubx": res = resolve_dlx(c.args, ctx)
+  elif binary == "find": res = []
+  elif has_plugin_args(binary): res = resolve_plugin(binary, c.args, ctx)
+  elif binary == "cross-env" or binary == "retry-cli":
+    res.push(bin_input(binary, ctx))
+    for x in from_words(c.args, ctx): res.push(cp(x))
+  elif is_plugin_name(binary):
+    res = resolve_fallback(binary, c.args, ctx)
+    if ctx.is_forwarded:
+      for k in 0..res.len: res[k].optional = true
+  else:
+    if ctx.is_forwarded and not text.startswith(".") and not is_rel_bin(text): return out
+    res = resolve_fallback(binary, c.args, ctx)
+  for x in res: out.push(cp(x))
+  for x in fno: out.push(cp(x))
+  return out
+
+fn is_rel_bin(text: Str) -> Bool:
+  var k = 0
+  while k + 3 <= text.len and (text[k..k + 3] == "../"): k += 3
+  while k + 2 <= text.len and text[k..k + 2] == "./": k += 2
+  return text[k..text.len].startswith("node_modules/.bin/")
+
+fn resolve_fallback(binary: Str, ws: [Word], ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  let end_of_cmd = binary == "dotenvx" or binary == "env-cmd" or binary == "op"
+  let pa = parse_args(values_of(ws), ArgSpec([], ["quiet", "verbose"], [], end_of_cmd))
+  if binary.startswith(".") or (binary.find("/") >= 0 and not binary.startswith("/")):
+    out.push(inp(I_ENTRY, binary))
+  elif valid_binary(binary):
+    out.push(bin_input(binary, ctx))
+  let positionals = binary == "babel-node" or binary == "esbuild" or binary == "execa" or binary == "jiti" or binary == "oxnode" or binary == "vite-node" or binary == "zx"
+  if positionals and pa.pos.len > 0: out.push(inp(I_DEFER, pa.pos[0]))
+  if pa.dd.len > 0:
+    for x in from_args(words_after(ws, "--"), ctx): out.push(cp(x))
+  if binary == "concurrently":
+    for p in pa.pos:
+      for x in from_args([Word(p, p)], ctx): out.push(cp(x))
+  return out
+
+# ---- package managers
+
+const NPM_RUN = " run run-script rum urn "
+
+fn expand_script(name: Str, fwd: [Word], ctx: Ctx) -> [Input]:
+  # only with forwarded arguments (the script itself is read on its own)
+  var out: [Input] = []
+  if not (name in ctx.script_names) or fwd.len == 0: return out
+  if name in ctx.expanded: return out
+  var c = nested(ctx)
+  c.expanded[name] = true
+  var ws: [Word] = [Word(ctx.script_names[name] + "", ctx.script_names[name] + "")]
+  for w in fwd: ws.push(Word(w.value + "", w.text + ""))
+  c.is_forwarded = false
+  return deps_from_script(to_script(ws), c)
+
+fn resolve_npm(ws: [Word], ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  let pa = parse_args(values_of(ws), ArgSpec(["package", "call"], ["yes", "no", "parseable"], ["y", "yes", "p", "parseable", "c", "call"], true))
+  if pa.pos.len == 0: return out
+  let command = pa.pos[0]
+  if command == "exec" or command == "x":
+    var args: [Word] = []
+    for k in 1..pa.pos_ix.len: args.push(cw(ws[pa.pos_ix[k]]))
+    var sep = -1
+    for k in 0..ws.len:
+      if ws[k].value == "--":
+        sep = k
+        break
+    if sep >= 0:
+      for k in sep + 1..ws.len: args.push(cw(ws[k]))
+    let pkgs = opt_vals(pa, "package")
+    for p in pkgs:
+      var d = inp(I_DEP, strip_version(p))
+      d.optional = true
+      out.push(d)
+    if args.len == 0: return out
+    let spec = args[0].value
+    var no_install = has_opt(pa, "no")
+    var lim = ws.len
+    if sep >= 0: lim = sep
+    for k in 0..lim:
+      if ws[k].value == "--yes=false" or ws[k].value == "--no-yes": no_install = true
+    let opt = not (no_install and pkgs.len == 0)
+    var r = from_args([Word(to_script(args), to_script(args))], ctx)
+    let is_package = pkgs.len == 0 and spec.find("@") >= 0 and not is_internal(spec)
+    if is_package and spec.startswith("@"):
+      var d = inp(I_DEP, strip_version(spec))
+      d.optional = opt
+      out.push(d)
+      return out
+    if r.len > 0 and r[0].kind == I_BIN and r[0].spec == extract_binary(spec):
+      if is_package:
+        var d = inp(I_DEP, strip_version(spec))
+        d.optional = opt
+        r[0] = d
+      elif opt: r[0].optional = true
+    elif is_package or (not is_internal(spec) and spec.find("/") < 0 and valid_binary(spec)):
+      var first = inp(I_BIN, extract_binary(spec))
+      if is_package: first = inp(I_DEP, strip_version(spec))
+      first.optional = opt
+      out.push(first)
+    for x in r: out.push(cp(x))
+    return out
+  var fwd: [Input] = []
+  if pa.dd.len > 0:
+    var c = ctx_copy(ctx)
+    c.is_forwarded = true
+    let after = words_after(ws, "--")
+    if after.len > 0:
+      fwd = from_args_fwd(after, c)
+  var name = ""
+  if NPM_RUN.find(" " + command + " ") >= 0:
+    if pa.pos.len > 1: name = pa.pos[1] + ""
+  elif command == "start" or command == "stop" or command == "restart" or command == "test": name = command + ""
+  elif command == "t" or command == "tst": name = "test"
+  if name != "" and name in ctx.script_names:
+    let after = words_after(ws, "--")
+    if after.len > 0 and not (name in ctx.expanded): return expand_script(name, after, ctx)
+    return fwd
+  return out
+
+fn from_args_fwd(ws: [Word], ctx: Ctx) -> [Input]:
+  if ws.len == 0: return []
+  var c = nested(ctx)
+  c.is_forwarded = ctx.is_forwarded
+  return deps_from_script(to_script(ws), c)
+
+fn resolve_npx(ws: [Word], ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  let pa = parse_args(values_of(ws), ArgSpec([], ["yes", "no", "quiet"], ["y", "yes", "p", "package", "c", "call"], false))
+  var spec = ""
+  var pspec = ""
+  if pa.pos.len > 0:
+    pspec = pa.pos[0] + ""
+    spec = strip_version(pspec)
+  var cmd_ix = ws.len
+  if pa.pos_ix.len > 0: cmd_ix = pa.pos_ix[0]
+  var no_install = false
+  for k in 0..cmd_ix:
+    let v = ws[k].value
+    if v == "--no" or v == "--no-install" or v == "--yes=false" or v == "--no-yes": no_install = true
+  if spec != "":
+    let is_bin = pspec.find("@") < 0 and not is_internal(spec)
+    var d = inp(I_DEP, spec)
+    if is_bin: d = inp(I_BIN, spec)
+    d.optional = not no_install
+    out.push(d)
+  for p in opt_vals(pa, "package"):
+    var d = inp(I_DEP, strip_version(p))
+    d.optional = true
+    out.push(d)
+  for c in opt_vals(pa, "call"):
+    for x in from_args([Word(c, c)], ctx): out.push(cp(x))
+  if pspec != "":
+    let r = from_args(words_from(ws, pspec), ctx)
+    for k in 1..r.len: out.push(cp(r[k]))
+  return out
+
+fn resolve_dlx(ws: [Word], ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  let pa = parse_args(values_of(ws), ArgSpec([], ["quiet"], ["p", "package", "q", "quiet"], false))
+  for p in opt_vals(pa, "package"):
+    var d = inp(I_DEP, strip_version(p))
+    d.optional = true
+    out.push(d)
+  if pa.pos.len > 0:
+    var args: [Word] = []
+    for k in pa.pos_ix: args.push(cw(ws[k]))
+    for x in from_args(args, ctx):
+      var y = cp(x)
+      if y.kind == I_DEP or y.kind == I_BIN: y.optional = true
+      out.push(y)
+  return out
+
+const PNPM_COMMANDS = " add approve-builds audit bin cache cat-file cat-index ci clean-install clean config create dedupe deploy dlx docs doctor env fetch find-hash home i ic ignored-builds import info init install-clean install-test install it la licenses link list ll ln login logout ls outdated pack-app pack patch-commit patch-remove patch peers ping pkg pm prepare prune publish purge rb rebuild remove rm root rt run runtime sbom self-update server setup stage start store t test token tst un uninstall unlink up update upgrade version view why with "
+
+fn resolve_pnpm(ws: [Word], ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  let spec = ArgSpec([], ["aggregate-output", "if-present", "parallel", "recursive", "reverse", "shell-mode", "silent", "stream"], ["r", "recursive", "s", "silent", "c", "shell-mode", "F", "filter"], true)
+  let pa = parse_args(values_of(ws), spec)
+  if pa.pos.len == 0: return out
+  let command = pa.pos[0]
+  if command == "dlx":
+    var rest: [Word] = []
+    for w in ws:
+      if w.value != "dlx": rest.push(Word(w.value + "", w.text + ""))
+    return resolve_dlx(rest, ctx)
+  if command == "recursive" or command == "multi" or command == "m":
+    return resolve_pnpm(words_after(ws, command), ctx)
+  if command == "exec":
+    let ci = pa.pos_ix[0]
+    if ci > 0:
+      var pre: [Str] = []
+      for k in 0..ci: pre.push(ws[k].value + "")
+      let po = parse_args(pre, spec)
+      if has_opt(po, "filter") and not has_opt(po, "recursive"): return out
+    var index = ci + 1
+    if index < ws.len and ws[index].value == "--": index += 1
+    var rest: [Word] = []
+    for k in index..ws.len: rest.push(Word(ws[k].value + "", ws[k].text + ""))
+    if rest.len == 1: return from_args([Word(rest[0].value + "", rest[0].value + "")], ctx)
+    return from_args([Word(to_script(rest), to_script(rest))], ctx)
+  if has_opt(pa, "filter") and not has_opt(pa, "recursive"): return out
+  var child: [Input] = []
+  if pa.dd.len > 0:
+    var c = ctx_copy(ctx)
+    c.is_forwarded = true
+    child = from_args_fwd(words_after(ws, "--"), c)
+  if command == "run" or command == "run-script":
+    if pa.pos.len > 1:
+      let script = pa.pos[1]
+      if script in ctx.script_names:
+        let fwd = words_after(ws, script)
+        if fwd.len > 0 and not (script in ctx.expanded): return expand_script(script, fwd, ctx)
+    return child
+  var name = command + ""
+  if command == "t" or command == "tst": name = "test"
+  if name in ctx.script_names:
+    let fwd = words_after(ws, command)
+    if fwd.len > 0 and not (name in ctx.expanded): return expand_script(name, fwd, ctx)
+    return child
+  if PNPM_COMMANDS.find(" " + command + " ") >= 0: return child
+  if command != "" and valid_binary(command): out.push(inp(I_BIN, command))
+  return out
+
+const YARN_COMMANDS = " add bin cache config constraints dedupe dlx explain global info init install link pack patch-commit patch plugin publish rebuild remove search set stage unlink unplug up upgrade-interactive upgrade version why workspace workspaces "
+
+fn resolve_yarn(ws: [Word], ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  let pa = parse_args(values_of(ws), ArgSpec(["cwd"], ["top-level"], [], true))
+  if pa.pos.len == 0: return out
+  let command = pa.pos[0]
+  var child: [Input] = []
+  if pa.dd.len > 0:
+    var c = ctx_copy(ctx)
+    c.is_forwarded = true
+    child = from_args_fwd(words_after(ws, "--"), c)
+  if command == "run":
+    if pa.pos.len > 1:
+      let script = pa.pos[1]
+      if script in ctx.script_names: return child
+      return from_args(words_from(ws, script), ctx)
+    return child
+  if command == "dlx":
+    var rest: [Word] = []
+    for w in ws:
+      if w.value != "dlx": rest.push(Word(w.value + "", w.text + ""))
+    return resolve_dlx(rest, ctx)
+  if command == "exec":
+    return from_args(words_after(ws, "exec"), ctx)
+  if command in ctx.script_names: return child
+  if YARN_COMMANDS.find(" " + command + " ") >= 0: return child
+  if valid_binary(command):
+    out.push(inp(I_BIN, command))
+    let r = from_args(words_from(ws, command), ctx)
+    for k in 1..r.len: out.push(cp(r[k]))
+  return out
+
+fn resolve_bun(ws: [Word], ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  let pa = parse_args(values_of(ws), ArgSpec([], [], [], true))
+  if pa.pos.len == 0: return out
+  let command = pa.pos[0]
+  if command == "run":
+    if pa.pos.len > 1:
+      let script = pa.pos[1]
+      if script in ctx.script_names: return out
+      if is_internal(script) or script.endswith(".ts") or script.endswith(".js"): out.push(inp(I_ENTRY, script))
+      else: out.push(inp(I_BIN, script))
+    return out
+  if command == "x": return resolve_dlx(words_after(ws, "x"), ctx)
+  if command in ctx.script_names: return out
+  if command == "test" or command == "install" or command == "add" or command == "remove" or command == "build" or command == "i" or command == "pm" or command == "update" or command == "link" or command == "publish": return out
+  if is_internal(command) or command.endswith(".ts") or command.endswith(".js") or command.endswith(".mjs"):
+    out.push(inp(I_DEFER_ENTRY, command))
+  return out
+
+# ---- plugin binaries with their own arguments
+
+fn plugin_of(binary: Str) -> Str:
+  if binary == "tsc" or binary == "tsgo": return "typescript"
+  if binary == "borp": return "borp"
+  if binary == "node" or binary == "tsx" or binary == "ts-node" or binary == "c8" or binary == "mocha" or binary == "vitest" or binary == "eslint" or binary == "prettier" or binary == "oxlint" or binary == "oxfmt" or binary == "jest" or binary == "playwright" or binary == "typedoc" or binary == "nodemon" or binary == "tsup" or binary == "rollup" or binary == "vite" or binary == "tsd" or binary == "tsdown": return binary + ""
+  return ""
+
+fn has_plugin_args(binary: Str) -> Bool:
+  return plugin_of(binary) != ""
+
+# binaries that are plugin names (they go through the fallback)
+fn is_plugin_name(b: Str) -> Bool:
+  return " ava xo nyc esbuild changelogen unbuild husky biome commitlint semantic-release webpack lefthook knip ".find(" " + b + " ") >= 0
+
+fn resolve_plugin(binary: Str, ws: [Word], ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  let plugin = plugin_of(binary)
+  var strings: [Str] = []
+  var booleans: [Str] = ["quiet", "verbose", "watch"]
+  var aliases: [Str] = []
+  var positional = false
+  var node_import = false
+  var config_keys: [Str] = []
+  var resolve_keys: [Str] = []
+  var vals = values_of(ws)
+  if plugin == "node":
+    positional = true
+    node_import = true
+    strings.push("test-reporter")
+    for b in ["deprecation", "enable-source-maps", "experimental-detect-module", "experimental-json-modules", "experimental-strip-types", "experimental-transform-types", "experimental-vm-modules", "expose-gc", "harmony", "inspect-brk", "inspect-wait", "inspect", "openssl-legacy-provider", "test-only", "test", "warnings", "watch"]: booleans.push(b)
+    resolve_keys.push("test-reporter")
+    var kept: [Str] = []
+    var skip = false
+    for k in 0..vals.len:
+      let v = vals[k]
+      if skip:
+        skip = false
+        continue
+      if v.startswith("--test-reporter=") and (v.endswith("=spec") or v.endswith("=tap") or v.endswith("=dot") or v.endswith("=junit") or v.endswith("=lcov")): continue
+      kept.push(v)
+    vals = kept
+  elif plugin == "typescript":
+    strings.push("project")
+    aliases = ["p", "project"]
+    config_keys.push("project")
+  elif plugin == "tsx":
+    positional = true
+    node_import = true
+    var kept: [Str] = []
+    for v in vals:
+      if v != "watch": kept.push(v)
+    vals = kept
+  elif plugin == "ts-node":
+    positional = true
+    node_import = true
+    for b in ["transpileOnly", "compilerHost", "ignoreDiagnostics", "swc", "preferTsExts"]: booleans.push(b)
+    aliases = ["T", "transpileOnly", "H", "compilerHost", "D", "ignoreDiagnostics"]
+  elif plugin == "c8":
+    var kept: [Str] = []
+    for v in vals:
+      if v != "check-coverage": kept.push(v)
+    vals = kept
+    for b in ["all", "check-coverage", "clean", "exclude-after-remap", "per-file", "skip-full"]: booleans.push(b)
+  elif plugin == "mocha":
+    node_import = true
+    for b in ["allow-uncaught", "async-only", "bail", "check-leaks", "colors", "delay", "diff", "dry-run", "exit", "forbid-only", "forbid-pending", "inline-diffs", "invert", "parallel", "recursive", "sort", "watch"]: booleans.push(b)
+    aliases = ["A", "async-only", "b", "bail", "c", "colors", "f", "fgrep", "g", "grep", "i", "invert", "j", "jobs", "n", "node-option", "p", "parallel", "R", "reporter", "O", "reporter-option", "s", "slow", "S", "sort", "t", "timeout", "u", "ui", "w", "watch"]
+    for x in ["config", "extension", "fgrep", "file", "grep", "ignore", "package", "reporter", "spec", "ui"]: strings.push(x)
+    config_keys.push("config")
+  elif plugin == "vitest" or plugin == "eslint" or plugin == "oxlint" or plugin == "oxfmt" or plugin == "jest" or plugin == "tsd":
+    strings.push("config")
+    aliases = ["c", "config"]
+    config_keys.push("config")
+    if plugin == "eslint":
+      aliases = ["c", "config", "f", "format"]
+      booleans.push("inspect-config")
+  elif plugin == "prettier":
+    config_keys.push("config")
+  elif plugin == "playwright":
+    positional = true
+    strings.push("config")
+    aliases = ["c", "config"]
+    config_keys.push("config")
+    var kept: [Str] = []
+    for v in vals:
+      if v != "install" and v != "test": kept.push(v)
+    vals = kept
+  elif plugin == "typedoc":
+    resolve_keys = ["plugin", "theme"]
+  elif plugin == "borp":
+    for b in ["coverage", "watch", "only", "no-timeout", "expose-gc", "check-coverage", "coverage-html"]: booleans.push(b)
+    aliases = ["C", "coverage", "w", "watch", "o", "only", "r", "reporter", "p", "pattern", "i", "ignore", "t", "timeout", "c", "concurrency", "X", "coverage-exclude"]
+  elif plugin == "tsup" or plugin == "rollup" or plugin == "vite" or plugin == "tsdown" or plugin == "nodemon":
+    strings.push("config")
+    aliases = ["c", "config"]
+    config_keys.push("config")
+  if node_import:
+    strings.push("import")
+    for a in ["r", "experimental-loader", "require", "loader"]:
+      aliases.push(a)
+      aliases.push("import")
+  let pa = parse_args(vals, ArgSpec(strings, booleans, aliases, true))
+  out.push(bin_input(binary, ctx))
+  if positional and pa.pos.len > 0:
+    let id = pa.pos[0]
+    if glob_like(id): out.push(inp(I_ENTRY, id))
+    elif id.find("node_modules/.bin/") >= 0: out.push(inp(I_BIN, extract_binary(id)))
+    else:
+      var e = inp(I_DEFER_ENTRY, id)
+      e.optional = true
+      out.push(e)
+  for k in resolve_keys:
+    for v in opt_vals(pa, k): out.push(inp(I_DEFER, v))
+  if node_import:
+    for v in opt_vals(pa, "import"): out.push(inp(I_DEFER, v))
+  if plugin == "c8":
+    if pa.pos.len > 0:
+      for x in from_args(words_from(ws, pa.pos[0]), ctx): out.push(cp(x))
+    elif pa.dd.len > 0:
+      var ww: [Word] = []
+      for d in pa.dd: ww.push(Word(d + "", d + ""))
+      for x in from_args(ww, ctx): out.push(cp(x))
+  for k in config_keys:
+    for v in opt_vals(pa, k):
+      var c = inp(I_CONFIG, v)
+      if plugin == "typescript" and not v.endswith(".json"): c.spec = v + "/tsconfig.json"
+      c.plugin = plugin + ""
+      out.push(c)
+  if plugin == "borp":
+    for r in opt_vals(pa, "reporter"):
+      let ri = borp_reporter(r)
+      if ri != "": out.push(inp(I_DEFER, ri))
+    for x in pa.pos: out.push(inp(I_ENTRY, x))
+    for x in opt_vals(pa, "pattern"): out.push(inp(I_ENTRY, x))
+  if plugin == "mocha":
+    var exts: [Str] = []
+    for v in opt_vals(pa, "extension"):
+      for e in v.split(","):
+        var x = e
+        if x.startswith("."): x = x[1..x.len]
+        exts.push(x)
+    if exts.len == 0: exts = ["js", "cjs", "mjs"]
+    var suffix = "*." + exts[0]
+    if exts.len > 1: suffix = "*.{{" + ",".join(exts) + "}}"
+    if has_opt(pa, "recursive"): suffix = "**/" + suffix
+    var vals2: [Str] = []
+    for x in pa.pos: vals2.push(x + "")
+    for x in opt_vals(pa, "spec"): vals2.push(x)
+    for x in opt_vals(pa, "file"): vals2.push(x)
+    for v in vals2:
+      var e = inp(I_ENTRY, v)
+      e.plugin = "mocha-dir:" + suffix
+      out.push(e)
+    for v in opt_vals(pa, "ignore"): out.push(inp(I_ENTRY, "!" + v))
+  if plugin == "vitest":
+    if has_opt(pa, "ui"):
+      var d = inp(I_DEP, "@vitest/ui")
+      d.optional = true
+      out.push(d)
+    if has_opt(pa, "coverage"):
+      var d = inp(I_DEP, "@vitest/coverage-v8")
+      d.optional = true
+      out.push(d)
+  return out
+
+fn borp_reporter(r: Str) -> Str:
+  var name = r + ""
+  let c = r.find(":")
+  if c >= 0: name = r[0..c]
+  if name == "spec" or name == "tap" or name == "dot" or name == "junit" or name == "lcov" or name == "gh": return ""
+  return name
+
+fn glob_like(v: Str) -> Bool:
+  if v.startswith("!"): return true
+  for i in 0..v.len:
+    let c = v[i]
+    if c == '*' or c == '+' or c == '\\' or c == '(' or c == '|' or c == '{' or c == '^' or c == '$': return true
+  return false
+
+# getInputsFromScripts: the inputs of a list of scripts, without duplicates and noise
+fn inputs_from_scripts(scripts: [Str], ctx: Ctx) -> [Input]:
+  var out: [Input] = []
+  var seen: {Str: Bool} = {}
+  for s in scripts:
+    for x in deps_from_script(s, ctx):
+      if x.spec == "": continue
+      if x.spec.find("$__knip__") >= 0: continue
+      if x.kind == I_DEP and x.spec.startswith("http"): continue
+      if x.kind == I_BIN and not word_start(x.spec): continue
+      let key = "{x.kind}:{x.spec}:{x.optional}"
+      if key in seen: continue
+      seen[key] = true
+      out.push(cp(x))
+  return out

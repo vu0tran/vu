@@ -1,0 +1,305 @@
+# Glob patterns as picomatch reads them (the subset knip's patterns use): '**' segments, '*', '?',
+# [classes], {a,b} alternatives (nested) and the extglobs ?(..) *(..) +(..) @(..) !(..).
+# A compiled pattern is a list of brace-free alternatives, each split into its '/' segments.
+
+type Pat:
+  alts: [[Str]]    # each alternative's segments
+  neg: Bool        # the pattern started with '!'
+  fast: Int        # 1: "**/name" (the last part is name), 2: "**/*suffix", 0: anything else
+  lit: Str
+
+# The pattern with its {a,b} groups expanded into every combination.
+fn expand(p: Str) -> [Str]:
+  var out: [Str] = []
+  # the first top-level '{' that has a matching '}' with a ',' inside it
+  var i = 0
+  while i < p.len:
+    let c = p[i]
+    if c == '\\':
+      i += 2
+      continue
+    if c == '{':
+      var depth = 0
+      var j = i
+      var commas: [Int] = []
+      var close = -1
+      while j < p.len:
+        let d = p[j]
+        if d == '\\':
+          j += 2
+          continue
+        if d == '{': depth += 1
+        elif d == '}':
+          depth -= 1
+          if depth == 0:
+            close = j
+            break
+        elif d == ',' and depth == 1: commas.push(j)
+        j += 1
+      if close >= 0 and commas.len > 0:
+        let head = p[0..i]
+        let tail = p[close + 1..p.len]
+        var starts: [Int] = [i + 1]
+        for k in commas: starts.push(k + 1)
+        var ends: [Int] = []
+        for k in commas: ends.push(k)
+        ends.push(close)
+        for k in 0..starts.len:
+          let mid = p[starts[k]..ends[k]]
+          for e in expand(head + mid + tail): out.push(e)
+        return out
+      if close >= 0:
+        # {x} without a comma stays as it is
+        i = close + 1
+        continue
+    i += 1
+  out.push(p + "")
+  return out
+
+fn compile(pattern: Str) -> Pat:
+  var p = pattern
+  var neg = false
+  if p.startswith("!") and not p.startswith("!("):
+    neg = true
+    p = p[1..p.len]
+  if p.startswith("./"): p = p[2..p.len]
+  var alts: [[Str]] = []
+  for e in expand(p):
+    var segs: [Str] = []
+    for s in e.split("/"):
+      if s == "" and segs.len > 0: continue
+      segs.push(s + "")
+    alts.push(segs)
+  var fast = 0
+  var lit = ""
+  if alts.len == 1 and alts[0].len == 2 and alts[0][0] == "**":
+    let last = alts[0][1]
+    if not is_dynamic(last) and last != "":
+      fast = 1
+      lit = last + ""
+    elif last.startswith("*") and last.len > 1 and not is_dynamic(last[1..last.len]):
+      fast = 2
+      lit = last[1..last.len]
+  return Pat(alts, neg, fast, lit)
+
+fn matches(pt: Pat, path: Str, dot: Bool) -> Bool:
+  if pt.fast != 0: return fast_match(pt, path, dot)
+  let parts = path.split("/")
+  return matches_parts(pt, parts, dot)
+
+# "**/name" and "**/*suffix": only the last part matters (without dot, no folder above it may start
+# with '.', and "*suffix" doesn't match a name starting with '.')
+fn fast_match(pt: Pat, path: Str, dot: Bool) -> Bool:
+  var b = path.len
+  while b > 0 and path[b - 1] != '/': b -= 1
+  if not if_last(pt, path, b): return false
+  if dot: return true
+  if pt.fast == 2 and b < path.len and path[b] == '.': return false
+  if b == 0: return true
+  if path[0] == '.': return false
+  let d = path.find("/.")
+  return d < 0 or d >= b - 1
+
+fn matches_parts(pt: Pat, parts: [Str], dot: Bool) -> Bool:
+  for a in pt.alts:
+    if match_segs(a, 0, parts, 0, dot): return true
+  return false
+
+# Whether any of the patterns matches (the path split once).
+fn matches_any(pats: [Pat], path: Str, dot: Bool) -> Bool:
+  var parts: [Str] = []
+  var split = false
+  for pt in pats:
+    if pt.fast != 0:
+      if fast_match(pt, path, dot): return true
+      continue
+    if not split:
+      parts = path.split("/")
+      split = true
+    if matches_parts(pt, parts, dot): return true
+  return false
+
+fn if_last(pt: Pat, path: Str, b: Int) -> Bool:
+  let n = path.len - b
+  if pt.fast == 1:
+    if n != pt.lit.len: return false
+    for i in 0..n:
+      if path[b + i] != pt.lit[i]: return false
+    return true
+  if n < pt.lit.len: return false
+  let off = path.len - pt.lit.len
+  for i in 0..pt.lit.len:
+    if path[off + i] != pt.lit[i]: return false
+  return true
+
+fn match_str(pattern: Str, path: Str, dot: Bool) -> Bool:
+  return matches(compile(pattern), path, dot)
+
+fn match_segs(pat: [Str], pi: Int, parts: [Str], si: Int, dot: Bool) -> Bool:
+  if pi == pat.len: return si == parts.len
+  let seg = pat[pi]
+  if seg == "**":
+    # zero or more segments (dot segments only with dot)
+    if match_segs(pat, pi + 1, parts, si, dot): return true
+    var k = si
+    while k < parts.len:
+      if not dot and parts[k].startswith("."): return false
+      if match_segs(pat, pi + 1, parts, k + 1, dot): return true
+      k += 1
+    return false
+  if si >= parts.len: return false
+  let part = parts[si]
+  if not dot and part.startswith(".") and not seg.startswith("."):
+    # a leading '.' must be matched explicitly
+    return false
+  if not match_seg(seg, 0, seg.len, part, 0, part.len): return false
+  return match_segs(pat, pi + 1, parts, si + 1, dot)
+
+# The index of the ')' closing the '(' at i.
+fn close_paren(p: Str, i: Int, end: Int) -> Int:
+  var depth = 0
+  var j = i
+  while j < end:
+    let c = p[j]
+    if c == '\\':
+      j += 2
+      continue
+    if c == '(': depth += 1
+    elif c == ')':
+      depth -= 1
+      if depth == 0: return j
+    j += 1
+  return -1
+
+# The '|'-separated alternatives inside p[a..b] (top level only), as start/end pairs.
+fn split_alts(p: Str, a: Int, b: Int) -> [Int]:
+  var out: [Int] = []
+  var depth = 0
+  var start = a
+  var j = a
+  while j < b:
+    let c = p[j]
+    if c == '\\':
+      j += 2
+      continue
+    if c == '(': depth += 1
+    elif c == ')': depth -= 1
+    elif c == '|' and depth == 0:
+      out.push(start)
+      out.push(j)
+      start = j + 1
+    j += 1
+  out.push(start)
+  out.push(b)
+  return out
+
+# Whether p[pi..pe] matches s[si..se] whole.
+fn match_seg(p: Str, pi: Int, pe: Int, s: Str, si: Int, se: Int) -> Bool:
+  var i = pi
+  var k = si
+  while i < pe:
+    let c = p[i]
+    # extglob
+    if (c == '?' or c == '*' or c == '+' or c == '@' or c == '!') and i + 1 < pe and p[i + 1] == '(':
+      let cl = close_paren(p, i + 1, pe)
+      if cl >= 0:
+        let alts = split_alts(p, i + 2, cl)
+        return ext_match(c, p, alts, cl + 1, pe, s, k, se)
+    if c == '*':
+      # collapse runs of '*'
+      var j = i
+      while j < pe and p[j] == '*': j += 1
+      if j == pe: return true
+      var t = k
+      while t <= se:
+        if match_seg(p, j, pe, s, t, se): return true
+        t += 1
+      return false
+    if k >= se: return false
+    if c == '?':
+      i += 1
+      k += 1
+      continue
+    if c == '[':
+      let r = class_match(p, i, pe, s[k])
+      if r == -2:
+        # not a class: a literal '['
+        if s[k] != '[': return false
+        i += 1
+        k += 1
+        continue
+      if r < 0: return false
+      i = r
+      k += 1
+      continue
+    if c == '\\' and i + 1 < pe:
+      if s[k] != p[i + 1]: return false
+      i += 2
+      k += 1
+      continue
+    if s[k] != c: return false
+    i += 1
+    k += 1
+  return k == se
+
+# Matches byte b against the class starting at p[i] == '['. Returns the index after the class when it
+# matches, -1 when it doesn't, -2 when p[i..] isn't a class.
+fn class_match(p: Str, i: Int, pe: Int, b: Byte) -> Int:
+  var j = i + 1
+  var neg = false
+  if j < pe and (p[j] == '!' or p[j] == '^'):
+    neg = true
+    j += 1
+  var found = false
+  var first = true
+  while j < pe:
+    let c = p[j]
+    if c == ']' and not first:
+      if found != neg: return j + 1
+      return -1
+    first = false
+    var lo = c
+    if c == '\\' and j + 1 < pe:
+      lo = p[j + 1]
+      j += 1
+    if j + 2 < pe and p[j + 1] == '-' and p[j + 2] != ']':
+      let hi = p[j + 2]
+      if b >= lo and b <= hi: found = true
+      j += 3
+      continue
+    if b == lo: found = true
+    j += 1
+  return -2
+
+fn ext_match(kind: Byte, p: Str, alts: [Int], rest: Int, pe: Int, s: Str, k: Int, se: Int) -> Bool:
+  if kind == '!':
+    # any text that none of the alternatives matches, then the rest
+    var t = k
+    while t <= se:
+      var any = false
+      var a = 0
+      while a < alts.len:
+        if match_seg(p, alts[a], alts[a + 1], s, k, t): any = true
+        a += 2
+      if not any and match_seg(p, rest, pe, s, t, se): return true
+      t += 1
+    return false
+  # zero allowed for ? and *, then one or more for * and +, exactly one for @ and ?
+  if (kind == '?' or kind == '*') and match_seg(p, rest, pe, s, k, se): return true
+  var t = k + 1
+  while t <= se:
+    var a = 0
+    while a < alts.len:
+      if match_seg(p, alts[a], alts[a + 1], s, k, t):
+        if match_seg(p, rest, pe, s, t, se): return true
+        if (kind == '*' or kind == '+') and ext_match('*', p, alts, rest, pe, s, t, se): return true
+      a += 2
+    t += 1
+  return false
+
+# Whether the pattern has glob characters (else it names one path).
+fn is_dynamic(p: Str) -> Bool:
+  for i in 0..p.len:
+    let c = p[i]
+    if c == '*' or c == '?' or c == '[' or c == '{' or c == '(' or c == '!': return true
+  return false
