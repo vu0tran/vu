@@ -64,6 +64,7 @@ type An:
   oid: [Int]
   path: Str
   trange: {Int: Int}
+  tr: [Int]          # trange as a list by node (-1: none)
   res: dfa.Result
   cfg_ok: Bool
   cs: Bool           # --check-sourced
@@ -76,6 +77,8 @@ type An:
   pdom_done: Bool
   cfg_run: Bool
   nodes: [Int]       # every node of the tree, in pre-order
+  cname: [Str]       # per node: astlib.command_name (see cstate)
+  cstate: [Int]
   cmask: [Int]       # per node: 1 its subtree may consume stdin, 2 may produce stdout (empty until needed)
   optional: [Str]    # enabled optional checks (--enable and enable= directives)
 
@@ -779,7 +782,7 @@ fn ann_extended(t: ast.Ast, root: Int) -> Int:
   return -1
 
 fn analyze(var t: ast.Ast, root: Int, path: Str, sp: ASpec) -> [Note]:
-  var a = An(ast.new_ast(), root, [], SH_BASH, false, false, [], [], [], [], path + "", {}, dfa.new_result(), false, sp.cs, false, false, cfg.empty_g(), [], [], [], false, false, [], [], [])
+  var a = An(ast.new_ast(), root, [], SH_BASH, false, false, [], [], [], [], path + "", {}, [], dfa.new_result(), false, sp.cs, false, false, cfg.empty_g(), [], [], [], false, false, [], [], [], [], [])
   for o in sp.optional: a.optional.push(o + "")
   if t.k[root] == T_Annotation:
     for an in t.anns[t.f[root]]:
@@ -787,6 +790,18 @@ fn analyze(var t: ast.Ast, root: Int, path: Str, sp: ASpec) -> [Note]:
   swap(&a.t, &t)
   build_parents(&a)
   a.nodes = preorder(a.t, root)
+  var cn: [Str] = []
+  var cst = [1] * a.t.k.len
+  cn.reserve(a.t.k.len)
+  for i in 0..a.t.k.len: cn.push("")
+  for x in a.nodes:
+    let k = a.t.k[x]
+    if k == T_SimpleCommand or k == T_Redirecting or k == T_Annotation:
+      if nm = astlib.command_name(a.t, x):
+        cn[x] = nm
+        cst[x] = 2
+  a.cname = cn
+  a.cstate = cst
   if sp.shell.len > 0: a.shell = shell_for(sp.shell)
   else: a.shell = determine_shell(a.t, root, path)
   a.shell_specified = sp.shell.len > 0 or fallback_shell(path) >= 0
@@ -844,11 +859,11 @@ fn is_command(t: ast.Ast, n: Int, name: Str) -> Bool:
 fn is_option_set(a: An, opt: Str) -> Bool:
   for n in all_nodes(a):
     if a.t.k[n] == T_SimpleCommand:
-      if is_unqualified_command(a.t, n, "shopt"):
+      if is_ucmd(a, n, "shopt"):
         var ws: [Str] = []
         astlib.oversimplify(a.t, n, &ws)
         if opt in ws: return true
-      if is_unqualified_command(a.t, n, "set"):
+      if is_ucmd(a, n, "set"):
         var ws: [Str] = []
         astlib.oversimplify(a.t, n, &ws)
         if opt in ws or "o" in flag_strs(a.t, n): return true
@@ -1026,6 +1041,32 @@ fn node_checks2(var a: An, n: Int):
   elif k == TA_Expansion: check_arithmetic_bad_octal(&a, n)
   elif k == T_CaseExpression: check_unmatchable_cases(&a, n)
 
+
+# command names from the cache (astlib.command_name): cstate 0 not cached, 1 nil, 2 cname
+fn cmd_name(a: An, n: Int) -> Str?:
+  if n < a.cstate.len:
+    if a.cstate[n] == 2: return a.cname[n] + ""
+    if a.cstate[n] == 1: return nil
+  return astlib.command_name(a.t, n)
+
+fn is_cmd(a: An, n: Int, name: Str) -> Bool:
+  if n < a.cstate.len:
+    if a.cstate[n] == 1: return false
+    if a.cstate[n] == 2:
+      let s = a.cname[n]
+      return s == name or (s.len > name.len and s.endswith(name) and s[s.len - name.len - 1] == '/')
+  return is_command(a.t, n, name)
+
+fn is_ucmd(a: An, n: Int, name: Str) -> Bool:
+  if n < a.cstate.len:
+    if a.cstate[n] == 1: return false
+    if a.cstate[n] == 2: return a.cname[n] == name
+  return is_unqualified_command(a.t, n, name)
+
+fn cmd_basename(a: An, n: Int) -> Str?:
+  let s = cmd_name(a, n) else return nil
+  return parse.basename(s)
+
 # ---------------------------------------------------------------- control flow
 
 fn run_cfg(var a: An):
@@ -1037,15 +1078,19 @@ fn run_cfg(var a: An):
   var res = dfa.new_result()
   dfa.analyze(&g, a.root, &res)
   swap(&a.t, &g.t)
-  for id, r in g.trange: a.trange[id] = r
+  swap(&a.trange, &g.trange)
+  var tr = [-1] * a.t.k.len
+  for id, r in a.trange:
+    if id >= 0 and id < tr.len: tr[id] = r
+  a.tr = tr
   a.cfg_ok = res.ok
   a.res = res
   a.g = g
 
 # getIncomingState: the state at the start of a token's range; nil when it has none
 fn incoming_state(var a: An, id: Int) -> dfa.St?:
-  if not (id in a.trange): return nil
-  return dfa.incoming(&a.res, cfg.rs(a.trange[id]))
+  if id < 0 or id >= a.tr.len or a.tr[id] < 0: return nil
+  return dfa.incoming(&a.res, cfg.rs(a.tr[id]))
 
 fn is_unreachable(var a: An, id: Int) -> Bool:
   if s = incoming_state(&a, id): return not dfa.reachable(s)
@@ -1139,7 +1184,7 @@ fn is_param_to(a: An, n: Int, cmd: Str) -> Bool:
     if k == T_SingleQuoted or k == T_DoubleQuoted or k == T_NormalWord:
       x = a.parent[x]
       continue
-    if k == T_SimpleCommand or k == T_Redirecting: return is_command(a.t, x, cmd)
+    if k == T_SimpleCommand or k == T_Redirecting: return is_cmd(a, x, cmd)
     return false
   return false
 
@@ -1402,7 +1447,7 @@ fn check_single_quoted_variables(var a: An, n: Int):
   var name = ""
   let cmd = closest_command(a, n)
   if cmd >= 0:
-    if b = command_basename(a.t, cmd):
+    if b = cmd_basename(a, cmd):
       name = b
       let sc = a.t.a[cmd]
       if b == "find":
@@ -1604,7 +1649,7 @@ fn contains_set_e(a: An) -> Bool:
         if sb[j] == 'e': return true
         j += 1
   for n in all_nodes(a):
-    if a.t.k[n] == T_SimpleCommand and is_unqualified_command(a.t, n, "set"):
+    if a.t.k[n] == T_SimpleCommand and is_ucmd(a, n, "set"):
       var ws: [Str] = []
       astlib.oversimplify(a.t, n, &ws)
       if "errexit" in ws or "e" in flag_strs(a.t, n): return true
@@ -1630,7 +1675,7 @@ fn check_unchecked_cd(var a: An):
   if contains_set_e(a): return
   for n in all_nodes(a):
     if a.t.k[n] != T_SimpleCommand: continue
-    let name = astlib.command_name(a.t, n) else continue
+    let name = cmd_name(a, n) else continue
     if not (name == "cd" or name == "pushd" or name == "popd"): continue
     var ws: [Str] = []
     astlib.oversimplify(a.t, n, &ws)
@@ -1684,7 +1729,7 @@ fn check_unquoted_expansions(var a: An, n: Int):
   if a.t.n1[n] == 1:
     let c = ast.at1(a.t, n, 0)
     if a.t.k[c] == T_Pipeline and a.t.n2[c] == 1:
-      if nm = astlib.command_name(a.t, ast.at2(a.t, c, 0)):
+      if nm = cmd_name(a, ast.at2(a.t, c, 0)):
         if nm == "seq" or nm == "pgrep": return
   if is_quote_free(a, n) or used_as_command_name(a, n): return
   warn(&a, n, 2046, "Quote this to prevent word splitting.")
@@ -1759,7 +1804,7 @@ fn check_return_against_zero(var a: An, n: Int):
 # ---------------------------------------------------------------- SC2162
 
 fn check_read_without_r(var a: An, n: Int):
-  if not is_unqualified_command(a.t, n, "read"): return
+  if not is_ucmd(a, n, "read"): return
   if "r" in flag_strs(a.t, n): return
   let ls: [Str] = []
   let la: [Bool] = []
@@ -1796,7 +1841,7 @@ fn check_shorthand_if(var a: An, n: Int):
   if a.t.n2[r] == 1:
     let t = ast.at2(a.t, r, 0)
     if is_assignment(a.t, t): return
-    if nm = command_basename(a.t, t):
+    if nm = cmd_basename(a, t):
       if nm in ["echo", "exit", "return", "printf", "true", ":"]: return
   if is_condition(a, n): return
   if is_test_command(a.t, b): return
@@ -1845,7 +1890,7 @@ fn check_redirected_nowhere(var a: An, n: Int):
 # ---------------------------------------------------------------- SC2035
 
 fn check_globs_as_options(var a: An, n: Int):
-  if b = command_basename(a.t, n):
+  if b = cmd_basename(a, n):
     if b == "echo" or b == "printf": return
   for i in 1..a.t.n2[n]:
     let w = ast.at2(a.t, n, i)
@@ -1973,7 +2018,7 @@ fn harmless_or_assign(a: An, n: Int, assign_only: Bool) -> Bool:
   let cmd = closest_command(a, n)
   if cmd < 0: return false
   if assign_only: return is_assignment(a.t, cmd)
-  if nm = command_basename(a.t, cmd): return nm in ["echo", "mapfile", "printf", "sponge"]
+  if nm = cmd_basename(a, cmd): return nm in ["echo", "mapfile", "printf", "sponge"]
   return false
 
 fn check_redirect_to_same(var a: An, n: Int):
@@ -2205,7 +2250,7 @@ fn basename_checks(var a: An, n: Int, name: Str, first: Int):
           warn(&a, args[i + 1], 2061, "Quote the parameter to " + l + " so the shell won't interpret it.")
 
 fn check_masked_returns(var a: An, n: Int, args: [Int]):
-  let name = astlib.command_name(a.t, n) else return
+  let name = cmd_name(a, n) else return
   let flags = flag_strs(a.t, n)
   let dash_r = "r" in flags
   let dash_g = "g" in flags
@@ -2427,7 +2472,7 @@ fn check_char_range_glob(var a: An, n: Int):
   if not (str.startswith("[") and str.endswith("]")): return
   let cmd = closest_command(a, n)
   if cmd >= 0:
-    if nm = astlib.command_name(a.t, cmd):
+    if nm = cmd_name(a, cmd):
       if nm == "tr" or nm == "read": return
   var x = n
   while x >= 0:
@@ -2669,7 +2714,7 @@ fn check_uuoe_var(var a: An, n: Int):
   if a.t.k[r] != T_Redirecting: return
   let c = a.t.a[r]
   if a.t.k[c] != T_SimpleCommand or a.t.n2[c] == 0: return
-  if not is_unqualified_command(a.t, c, "echo"): return
+  if not is_ucmd(a, c, "echo"): return
   let vars = arg_words(a.t, c)
   if vars.len == 0: return
   if vars.len == 1 and token_is_just_command_output(a.t, vars[0]): return
@@ -2923,7 +2968,7 @@ fn bashism(var a: An, n: Int):
   elif k == T_Backticked:
     if a.t.n1[n] == 1 and is_only_redirection(a.t, ast.at1(a.t, n, 0)): bw(&a, n, 3035, "`<file` to read files is")
   elif k == T_SourceCommand:
-    if nm = astlib.command_name(a.t, a.t.a[n]):
+    if nm = cmd_name(a, a.t.a[n]):
       if nm == "source" and not busy: bw(&a, n, 3051, "'source' in place of '.' is")
   elif k == TA_Expansion:
     if a.t.n1[n] > 0:
@@ -2960,7 +3005,7 @@ fn bashism_command(var a: An, n: Int):
     if op = get_literal(a.t, ws[1]):
       bashism_test_op(&a, false, op, n)
       return
-  if ws.len >= 2 and is_command(a.t, n, "echo"):
+  if ws.len >= 2 and is_cmd(a, n, "echo"):
     let arg = oversimp(a.t, ws[1])
     if is_echo_flags(arg, "eEsn"):
       if busy:
@@ -2975,10 +3020,10 @@ fn bashism_command(var a: An, n: Int):
     if is_exec and oversimp(a.t, ws[1]).startswith("-"):
       bw(&a, ws[1], 3038, "exec flags are")
       return
-  if is_command(a.t, n, "let"):
+  if is_cmd(a, n, "let"):
     bw(&a, n, 3039, "'let' is")
     return
-  if is_command(a.t, n, "set"):
+  if is_cmd(a, n, "set"):
     if not dash:
       var lits: [LitArg] = []
       for i in 1..ws.len:
@@ -2986,7 +3031,7 @@ fn bashism_command(var a: An, n: Int):
         lits.push(LitArg(ws[i], l))
       set_options(&a, lits, 0)
     return
-  let name = astlib.command_name(a.t, n) else ""
+  let name = cmd_name(a, n) else ""
   let flags = astlib.leading_flags(a.t, n)
   if name == "local" and not dash: bw(&a, n, 3043, "'local' is")
   if name in ["let", "caller", "builtin", "complete", "compgen", "declare", "dirs", "disown", "enable", "mapfile", "readarray", "pushd", "popd", "shopt", "suspend", "typeset"]:
@@ -3221,7 +3266,7 @@ fn check_for_in_cat(var a: An, n: Int):
       for c in ast.list2(a.t, pl):
         var lb = false
         for nm in ["grep", "fgrep", "egrep", "sed", "cat", "awk", "cut", "sort"]:
-          if is_command(a.t, c, nm): lb = true
+          if is_cmd(a, c, nm): lb = true
         if not lb: all = false
       if all: info(&a, x, 2013, "To read lines rather than words, pipe/redirect to a 'while read' loop.")
 
@@ -4136,7 +4181,7 @@ fn check_uuoc(var a: An, n: Int):
   let r = ast.at2(a.t, n, 0)
   if a.t.k[r] != T_Redirecting: return
   let cmd = a.t.a[r]
-  if a.t.k[cmd] != T_SimpleCommand or not is_command(a.t, cmd, "cat"): return
+  if a.t.k[cmd] != T_SimpleCommand or not is_cmd(a, cmd, "cat"): return
   if a.t.n2[cmd] != 2: return
   let w = ast.at2(a.t, cmd, 1)
   if may_become_multiple(a.t, w) or only_literal(a.t, w).startswith("-"): return
@@ -4144,7 +4189,7 @@ fn check_uuoc(var a: An, n: Int):
 
 # SC2014, SC2067
 fn check_find_exec(var a: An, n: Int):
-  if a.t.n2[n] == 0 or not is_command(a.t, n, "find"): return
+  if a.t.n2[n] == 0 or not is_cmd(a, n, "find"): return
   var v = false
   for i in 1..a.t.n2[n]:
     let w = ast.at2(a.t, n, i)
@@ -4593,7 +4638,7 @@ fn check_valid_cond_ops(var a: An, n: Int):
 # SC2065
 fn check_test_redirects(var a: An, n: Int):
   let cmd = a.t.a[n]
-  if cmd < 0 or not is_command(a.t, cmd, "test"): return
+  if cmd < 0 or not is_cmd(a, cmd, "test"): return
   for i in 0..a.t.n1[n]:
     let r = ast.at1(a.t, n, i)
     if a.t.k[r] != T_FdRedirect or a.t.s[r] == "2": continue
@@ -4626,7 +4671,7 @@ fn check_ps1_assignments(var a: An, n: Int):
 
 # SC2083
 fn check_lonely_dot_dash(var a: An, n: Int):
-  if is_unqualified_command(a.t, n, "./"): err(&a, n, 2083, "Don't add spaces after the slash in './file'.")
+  if is_ucmd(a, n, "./"): err(&a, n, 2083, "Don't add spaces after the slash in './file'.")
 
 fn exec_cleanup(t: ast.Ast, x: Int) -> Bool:
   if t.k[x] != T_Pipeline or t.n2[x] != 1: return false
@@ -4667,7 +4712,7 @@ fn check_spurious_exec(var a: An, n: Int):
 # SC2087
 fn check_ssh_heredoc(var a: An, n: Int):
   let cmd = a.t.a[n]
-  if cmd < 0 or not is_command(a.t, cmd, "ssh"): return
+  if cmd < 0 or not is_cmd(a, cmd, "ssh"): return
   for i in 0..a.t.n1[n]:
     let r = ast.at1(a.t, n, i)
     if a.t.k[r] != T_FdRedirect: continue
@@ -4687,7 +4732,7 @@ fn check_functions_used_externally(var a: An):
     if a.t.k[x] == T_Function and not (a.t.s[x] in defs): defs[a.t.s[x] + ""] = x
   var adefs: {Str: Int} = {}
   for x in nodes:
-    if a.t.k[x] == T_SimpleCommand and is_unqualified_command(a.t, x, "alias"):
+    if a.t.k[x] == T_SimpleCommand and is_ucmd(a, x, "alias"):
       for i in 1..a.t.n2[x]:
         let w = ast.at2(a.t, x, i)
         let s = only_literal(a.t, w)
@@ -4744,7 +4789,7 @@ fn check_cd_and_back(var a: An, n: Int):
       while a.t.k[x] == T_Annotation: x = a.t.a[x]
       if a.t.k[x] == T_Pipeline and a.t.n2[x] == 1:
         let c = ast.at2(a.t, x, 0)
-        if is_command(a.t, c, "cd"): cands.push(c)
+        if is_cmd(a, c, "cd"): cands.push(c)
     for i in 0..cands.len - 1:
       if cd_revert(a.t, cands[i + 1]) and not cd_revert(a.t, cands[i]):
         info(&a, cands[i + 1], 2103, "Use a ( subshell ) to avoid having to cd back.")
@@ -4755,7 +4800,7 @@ fn is_loop(k: Int) -> Bool:
 
 # SC2104, SC2105, SC2106
 fn check_loop_keyword_scope(var a: An, n: Int):
-  let name = astlib.command_name(a.t, n) else return
+  let name = cmd_name(a, n) else return
   if not (name == "continue" or name == "break"): return
   var path: [Int] = []
   var x = n
@@ -5018,7 +5063,7 @@ fn check_pipe_to_nowhere(var a: An, n: Int):
       let producers = tree_contains_kind(&a, stage, false)
       let cmd = astlib.get_command(a.t, stage)
       if cmd >= 0:
-        if name = command_basename(a.t, cmd):
+        if name = cmd_basename(a, cmd):
           if non_reading(name) and not consumers and input != 0:
             var exc = false
             if name == "du":
@@ -5068,7 +5113,7 @@ fn check_pipe_to_nowhere(var a: An, n: Int):
         if 0 in fl: stdin = true
     if not stdin: return
     let cmd = a.t.a[n]
-    let name = command_basename(a.t, cmd) else return
+    let name = cmd_basename(a, cmd) else return
     if not non_reading(name) or tree_contains_kind(&a, cmd, true): return
     if name in ["cp", "mv", "rm"] and interactive_flag(a.t, cmd): return
     var sug = "Bad quoting, wrong command or missing xargs?"
@@ -5099,9 +5144,9 @@ fn add_edge(var outs: [[Int]], var ins: [[Int]], u: Int, v: Int):
 fn compute_pdom(var a: An):
   a.pdom_done = true
   let root = a.root
-  if not (root in a.trange): return
+  if root >= a.tr.len or a.tr[root] < 0: return
   let nn = a.g.lab.len
-  let main_exit = cfg.re(a.trange[root])
+  let main_exit = cfg.re(a.tr[root])
   # the real edges (flow and exit) as adjacency lists
   var outs: [[Int]] = []
   var ins: [[Int]] = []
@@ -5243,9 +5288,9 @@ fn compute_pdom(var a: An):
 fn post_dominates(var a: An, target: Int, base: Int) -> Bool:
   if not a.pdom_done: compute_pdom(&a)
   if a.pdom.len == 0: return false
-  if not (base in a.trange) or not (target in a.trange): return false
-  let be = cfg.re(a.trange[base])
-  let ts = cfg.rs(a.trange[target])
+  if base >= a.tr.len or target >= a.tr.len or a.tr[base] < 0 or a.tr[target] < 0: return false
+  let be = cfg.re(a.tr[base])
+  let ts = cfg.rs(a.tr[target])
   if a.pdom[be] < 0 or a.pdom_pre[ts] < 0: return false
   return a.pdom_pre[ts] <= a.pdom_pre[be] and a.pdom_post[be] <= a.pdom_post[ts]
 
@@ -5279,9 +5324,9 @@ fn check_overwritten_exit_code(var a: An, n: Int):
   var all_print = true
   for id in st.ec:
     let k = a.t.k[id]
-    let cond = k == T_Condition or (k == T_SimpleCommand and opt_is(astlib.command_name(a.t, id), "test"))
+    let cond = k == T_Condition or (k == T_SimpleCommand and opt_is(cmd_name(a, id), "test"))
     if not cond: all_cond = false
-    if not (opt_is(command_basename(a.t, id), "echo") or opt_is(command_basename(a.t, id), "printf")): all_print = false
+    if not (opt_is(cmd_basename(a, id), "echo") or opt_is(cmd_basename(a, id), "printf")): all_print = false
   if all_cond:
     var uncond = true
     for id in st.ec:
@@ -5617,9 +5662,9 @@ fn check_while_getopts_case(var a: An, n: Int):
 fn cfg_reads(a: An, toks: [Int]) -> [Str]:
   var o: [Str] = []
   for t in toks:
-    if not (t in a.g.tnodes): continue
-    for r in a.g.tnodes[t]:
-      for nd in cfg.rs(r)..cfg.re(r):
+    if t >= a.g.tlo.len or a.g.tlo[t] < 0: continue
+    if true:
+      for nd in a.g.tlo[t]..a.g.thi[t]:
         if a.g.lab[nd] != cfg.N_EFFECTS: continue
         for e in a.g.nef[nd]..a.g.nef[nd] + a.g.nen[nd]:
           if a.g.effs[e].kind == cfg.X_READ: o.push(a.g.effs[e].name + "")
@@ -5709,7 +5754,7 @@ fn shell_support_checks(var a: An, n: Int):
         brace_lit(a.t, e, &s)
         if s.find("$..") >= 0 or s.find("..$") >= 0:
           let c = closest_command(a, e)
-          if c >= 0 and is_unqualified_command(a.t, c, "eval"): style(&a, n, 2175, "Quote this invalid brace expansion since it should be passed literally to eval.")
+          if c >= 0 and is_ucmd(a, c, "eval"): style(&a, n, 2175, "Quote this invalid brace expansion since it should be passed literally to eval.")
           else: warn(&a, n, 2051, "Bash doesn't support variables in brace range expansions.")
     elif (k == T_Assignment or k == T_IndexedElement) and a.t.n1[n] >= 2:
       warn(&a, ast.at1(a.t, n, 1), 2180, "Bash does not support multidimensional arrays. Use 1D or associative arrays.")
@@ -6059,7 +6104,7 @@ fn check_require_double_bracket(var a: An, n: Int):
 
 fn subtree_has_set_e(a: An, n: Int) -> Bool:
   for x in preorder(a.t, n):
-    if a.t.k[x] == T_SimpleCommand and is_unqualified_command(a.t, x, "set"):
+    if a.t.k[x] == T_SimpleCommand and is_ucmd(a, x, "set"):
       var ws: [Str] = []
       astlib.oversimplify(a.t, x, &ws)
       if "errexit" in ws or "e" in flag_strs(a.t, x): return true
@@ -6108,7 +6153,7 @@ fn check_set_e_suppressed(var a: An):
 # ---- SC2312 (check-extra-masked-returns): "time" words are skipped (removeTransparentCommands)
 
 fn is_time_cmd(a: An, n: Int) -> Bool:
-  return a.t.k[n] == T_SimpleCommand and opt_is(command_basename(a.t, n), "time")
+  return a.t.k[n] == T_SimpleCommand and opt_is(cmd_basename(a, n), "time")
 
 # the words of a simple command after removeTransparentCommands
 fn eff_words(a: An, n: Int) -> [Int]:
@@ -6129,7 +6174,7 @@ fn eff_basename(a: An, n: Int) -> Str?:
   if k == T_Redirecting or k == T_Annotation:
     let c = astlib.get_command(a.t, n)
     if c >= 0 and is_time_cmd(a, c): return eff_basename(a, c)
-  return command_basename(a.t, n)
+  return cmd_basename(a, n)
 
 fn contains_simple_command(a: An, n: Int) -> Bool:
   for x in preorder(a.t, n):
@@ -6228,7 +6273,7 @@ fn check_muncher(var a: An, wid: Int, x: Int):
     if stdin_redirect(a.t, ast.at1(a.t, r, i)): return
   for seq in command_sequences(a.t, cmd):
     for c in seq: check_muncher(&a, wid, c)
-  let name = command_basename(a.t, cmd) else return
+  let name = cmd_basename(a, cmd) else return
   var flag = ""
   var redirect = false
   if name == "ssh":
