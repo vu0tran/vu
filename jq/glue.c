@@ -400,6 +400,15 @@ int64_t vjq_fleft(void *p) {
     return (int64_t)sb.st_size - pos;
 }
 
+/* what is left of standard input when it is a regular file (-1 otherwise) */
+int64_t vjq_stdin_left(void) {
+    struct stat sb;
+    if (fstat(0, &sb) != 0 || !S_ISREG(sb.st_mode)) return -1;
+    off_t pos = lseek(0, 0, SEEK_CUR);
+    if (pos < 0) return -1;
+    return (int64_t)sb.st_size - pos;
+}
+
 #include <limits.h>
 /* realpath, or the path itself when it can't be resolved (as jq's jq_realpath) */
 vu_str vjq_realpath(const vu_str *p) {
