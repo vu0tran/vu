@@ -136,14 +136,37 @@ an export, arrow functions' expression bodies in exported signatures, the Borp p
 CPU time (user + system, so both of vknip's threads count) and wall time, best of 5 runs (best of 2
 for knip on vscode), on a 2-core machine shared with other jobs (load average around 8, so wall
 times are noisy; CPU times are the fair comparison). knip runs on Node 22 and parses with oxc
-(native code); its startup alone (`knip --version`) costs about 0.5 s of CPU.
+(native code); its startup alone (`knip --version`) costs 0.72 s of CPU (`node -e 0`: 0.04 s), which is most of its time
+on the small projects.
 
 | project | files | knip CPU s | vknip CPU s | CPU ratio | knip wall s | vknip wall s |
 |---|---:|---:|---:|---:|---:|---:|
-BENCH_ROWS
+| express | 142 | 1.44 | 0.030 | 48x | 3.86 | 0.076 |
+| fastify | 304 | 3.08 | 0.107 | 29x | 7.71 | 0.275 |
+| got | 98 | 2.40 | 0.102 | 24x | 6.29 | 0.255 |
+| koa | 82 | 1.42 | 0.017 | 83x | 3.62 | 0.057 |
+| node-glob | 59 | 1.10 | 0.009 | 128x | 3.53 | 0.024 |
+| node-tar | 73 | 1.22 | 0.017 | 73x | 3.69 | 0.056 |
+| chalk | 20 | 1.00 | 0.007 | 144x | 2.76 | 0.020 |
+| defu | 9 | 1.01 | 0.005 | 196x | 3.13 | 0.005 |
+| dequal | 9 | 0.97 | 0.003 | 351x | 2.86 | 0.003 |
+| execa | 639 | 1.44 | 0.027 | 54x | 4.54 | 0.060 |
+| kleur | 13 | 0.92 | 0.003 | 315x | 2.65 | 0.003 |
+| klona | 37 | 0.91 | 0.003 | 276x | 2.73 | 0.008 |
+| ky | 98 | 1.97 | 0.052 | 38x | 6.10 | 0.155 |
+| mitt | 3 | 0.96 | 0.006 | 173x | 2.93 | 0.015 |
+| node-lru-cache | 49 | 1.06 | 0.008 | 125x | 2.55 | 0.016 |
+| p-queue | 17 | 1.26 | 0.016 | 78x | 3.30 | 0.049 |
+| scule | 4 | 1.01 | 0.006 | 173x | 3.03 | 0.014 |
+| superjson | 20 | 1.05 | 0.009 | 119x | 2.57 | 0.020 |
+| uncrypto | 5 | 0.94 | 0.007 | 141x | 2.07 | 0.007 |
+| uvu | 93 | 0.95 | 0.006 | 147x | 1.40 | 0.006 |
+| vscode | 15571 | 46.27 | 10.31 | 4.5x | 160.79 | 25.15 |
 
-vknip spends about half its time in vtsc's parser; the rest is the walk over each tree, resolution and
-the `.gitignore` matching of the file walk.
+On vscode vknip takes 10.3 s of CPU with one thread or two (`--jobs 1`: 10.36 s), so its wall time
+halves on an idle 2-core machine; knip's work there is mostly on one thread. About half of vknip's
+time is vtsc's parser; the rest is the walk over each tree, module resolution, and the file walk with
+its `.gitignore` matching.
 
 ## Not done
 
