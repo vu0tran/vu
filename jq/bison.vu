@@ -1,0 +1,623 @@
+# bison: replays jq 1.7.1's parser on a program, the way its bison-generated parser.c runs, to
+# report syntax errors word for word: the "unexpected X, expecting Y or Z" lists, bison's error
+# recovery (the grammar's `error` rules, so one program can give several errors), and the
+# messages the grammar's actions add on the way ("May need parentheses around object key
+# expression", "Possibly unterminated 'if' statement"...). It has its own port of jq's flex
+# lexer (src/lexer.l), since token boundaries and locations decide the messages. The tables
+# come from parser.c (bisontab.vu, made by tools/gen_bison.py). The program is still parsed for
+# running by lang.vu; this only decides whether it has errors and what jq says about them.
+
+import jv
+import lang
+import bisontab
+from jv import St
+
+# symbol numbers (bison's yysymbol_kind_t)
+const S_EOF = 0
+const S_ERROR = 1
+const S_INVALID = 3
+const S_IDENT = 4
+const S_FIELD = 5
+const S_BINDING = 6
+const S_LITERAL = 7
+const S_FORMAT = 8
+const S_REC = 9
+const S_SETMOD = 10
+const S_EQ = 11
+const S_NEQ = 12
+const S_DEFINEDOR = 13
+const S_LOC = 32
+const S_SETPIPE = 33
+const S_SETPLUS = 34
+const S_SETMINUS = 35
+const S_SETMULT = 36
+const S_SETDIV = 37
+const S_SETDEFINEDOR = 38
+const S_LESSEQ = 39
+const S_GREATEREQ = 40
+const S_ALTERNATION = 41
+const S_QQSTART = 42
+const S_QQTEXT = 43
+const S_QQINTERP = 44
+const S_QQINTERP_END = 45
+const S_QQEND = 46
+const S_EMPTY = -2
+
+# lexer start conditions
+const L_INITIAL = 0
+const L_PAREN = 1
+const L_BRACKET = 2
+const L_BRACE = 3
+const L_QQINTERP = 4
+const L_QQSTRING = 5
+
+type Lx:
+  src: Str
+  pos: Int
+  states: [Int]
+  ls: Int        # yylloc: the last matched rule's span (whitespace and comments included)
+  le: Int
+
+type BRes:
+  msgs: [Str]
+  locs: [Int]
+  uncertain: Bool    # an action's message depends on a constant vjq can't fold here
+
+fn ints(s: Str) -> [Int]:
+  var r: [Int] = []
+  var i = 0
+  let n = s.len
+  while i < n:
+    var neg = false
+    if s[i] == '-':
+      neg = true
+      i += 1
+    var v = 0
+    while i < n and s[i] != ',':
+      v = v * 10 + int(s[i] - '0')
+      i += 1
+    if neg: v = -v
+    r.push(v)
+    i += 1
+  return r
+
+fn keyword_sym(t: Str) -> Int:
+  if t.len < 2 or t.len > 7: return S_IDENT
+  if t == "as": return 14
+  if t == "def": return 15
+  if t == "module": return 16
+  if t == "import": return 17
+  if t == "include": return 18
+  if t == "if": return 19
+  if t == "then": return 20
+  if t == "else": return 21
+  if t == "elif": return 22
+  if t == "reduce": return 23
+  if t == "foreach": return 24
+  if t == "end": return 25
+  if t == "and": return 26
+  if t == "or": return 27
+  if t == "try": return 28
+  if t == "catch": return 29
+  if t == "label": return 30
+  if t == "break": return 31
+  return S_IDENT
+
+fn id_start(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'
+
+fn id_char(c: Byte) -> Bool:
+  return id_start(c) or (c >= '0' and c <= '9')
+
+fn digit(c: Byte) -> Bool:
+  return c >= '0' and c <= '9'
+
+# ([a-zA-Z_][a-zA-Z_0-9]*::)*[a-zA-Z_][a-zA-Z_0-9]* from i (s[i] starts a name); returns the end
+fn scan_name(s: Str, i: Int, colons: Bool) -> Int:
+  var e = i + 1
+  let n = s.len
+  while e < n and id_char(s[e]): e += 1
+  if colons:
+    while e + 2 < n and s[e] == ':' and s[e + 1] == ':' and id_start(s[e + 2]):
+      e += 3
+      while e < n and id_char(s[e]): e += 1
+  return e
+
+fn scan_number(s: Str, i: Int) -> Int:
+  var e = i
+  let n = s.len
+  if s[e] == '.':
+    e += 1
+    while e < n and digit(s[e]): e += 1
+  else:
+    while e < n and digit(s[e]): e += 1
+    if e < n and s[e] == '.':
+      e += 1
+      while e < n and digit(s[e]): e += 1
+  if e < n and (s[e] == 'e' or s[e] == 'E'):
+    var j = e + 1
+    if j < n and (s[j] == '+' or s[j] == '-'): j += 1
+    if j < n and digit(s[j]):
+      while j < n and digit(s[j]): j += 1
+      e = j
+  return e
+
+fn try_exit(var lx: Lx, c: Byte) -> Int:
+  let top = lx.states[lx.states.len - 1]
+  var m: Byte = '?'
+  var ret = 0
+  if top == L_PAREN:
+    m = ')'
+    ret = 62
+  elif top == L_BRACKET:
+    m = ']'
+    ret = 66
+  elif top == L_BRACE:
+    m = '}'
+    ret = 68
+  elif top == L_QQINTERP:
+    m = ')'
+    ret = S_QQINTERP_END
+  else:
+    return S_INVALID
+  if m != c: return S_INVALID
+  lx.states.pop()
+  return ret
+
+fn berr(var r: BRes, loc: Int, msg: Str):
+  if msg.find("unexpected") >= 0:
+    r.msgs.push(msg + " (Unix shell quoting issues?)")
+  else:
+    r.msgs.push(msg)
+  r.locs.push(loc)
+
+# One token, as jq_yylex returns it (a symbol number), with its span in lx.ls..lx.le. A string
+# escape that jq's JSON parser rejects is reported here, as jq's yylex does.
+fn lex(var lx: Lx, var r: BRes, var st: St) -> Int:
+  let s = lx.src
+  let n = s.len
+  while true:
+    let i = lx.pos
+    if i >= n: return S_EOF
+    let top = lx.states[lx.states.len - 1]
+    let c = s[i]
+    var e = i + 1
+    var sym = -1
+    if top == L_QQSTRING:
+      if c == '"':
+        lx.states.pop()
+        sym = S_QQEND
+      elif c == '\\':
+        if e < n and s[e] == '(':
+          e += 1
+          lx.states.push(L_QQINTERP)
+          sym = S_QQINTERP
+        elif e >= n:
+          sym = S_INVALID
+        else:
+          e = i
+          while e + 1 < n and s[e] == '\\' and s[e + 1] != '(':
+            if s[e + 1] == 'u':
+              e += 2
+              var k = 0
+              while k < 4 and e < n and (digit(s[e]) or (s[e] >= 'a' and s[e] <= 'z') or (s[e] >= 'A' and s[e] <= 'Z')):
+                e += 1
+                k += 1
+            else:
+              e += 2
+          sym = S_QQTEXT
+          let text = "\"" + s[i..e] + "\""
+          let off = st.b.len
+          for j in 0..text.len: st.b.push(text[j])
+          var m = jv.json_error(st, off, st.b.len, 1, 0)
+          st.b.truncate(off)
+          if m != "":
+            lx.ls = i
+            lx.le = e
+            lx.pos = e
+            berr(&r, i, m + " (while parsing '" + text + "')")
+            return sym
+      else:
+        while e < n and s[e] != '\\' and s[e] != '"': e += 1
+        sym = S_QQTEXT
+      lx.ls = i
+      lx.le = e
+      lx.pos = e
+      return sym
+    if c == '#':
+      while e < n and s[e] != '\n': e += 1
+    elif c == ' ' or c == '\n' or c == '\t':
+      while e < n and (s[e] == ' ' or s[e] == '\n' or s[e] == '\t'): e += 1
+    elif id_start(c):
+      e = scan_name(s, i, true)
+      sym = keyword_sym(s[i..e])
+    elif c == '.':
+      if e < n and s[e] == '.':
+        e += 1
+        sym = S_REC
+      elif e < n and digit(s[e]):
+        e = scan_number(s, i)
+        sym = S_LITERAL
+      elif e < n and id_start(s[e]):
+        e = scan_name(s, e, false)
+        sym = S_FIELD
+      else:
+        sym = 64
+    elif digit(c):
+      e = scan_number(s, i)
+      sym = S_LITERAL
+    elif c == '$':
+      if e < n and id_start(s[e]):
+        e = scan_name(s, e, true)
+        sym = S_BINDING
+        if e - i == 8 and s[i..e] == "$__loc__": sym = S_LOC
+      else:
+        sym = 69
+    elif c == '@':
+      while e < n and id_char(s[e]): e += 1
+      if e == i + 1: sym = S_INVALID
+      else: sym = S_FORMAT
+    elif c == '"':
+      lx.states.push(L_QQSTRING)
+      sym = S_QQSTART
+    elif c == '(':
+      lx.states.push(L_PAREN)
+      sym = 61
+    elif c == '[':
+      lx.states.push(L_BRACKET)
+      sym = 65
+    elif c == '{':
+      lx.states.push(L_BRACE)
+      sym = 67
+    elif c == ')' or c == ']' or c == '}':
+      sym = try_exit(&lx, c)
+    elif c == '!':
+      if e < n and s[e] == '=':
+        e += 1
+        sym = S_NEQ
+      else:
+        sym = S_INVALID
+    elif c == '=':
+      sym = 50
+      if e < n and s[e] == '=':
+        e += 1
+        sym = S_EQ
+    elif c == '|':
+      sym = 48
+      if e < n and s[e] == '=':
+        e += 1
+        sym = S_SETPIPE
+    elif c == '+':
+      sym = 53
+      if e < n and s[e] == '=':
+        e += 1
+        sym = S_SETPLUS
+    elif c == '-':
+      sym = 54
+      if e < n and s[e] == '=':
+        e += 1
+        sym = S_SETMINUS
+    elif c == '*':
+      sym = 55
+      if e < n and s[e] == '=':
+        e += 1
+        sym = S_SETMULT
+    elif c == '%':
+      sym = 57
+      if e < n and s[e] == '=':
+        e += 1
+        sym = S_SETMOD
+    elif c == '/':
+      sym = 56
+      if e < n and s[e] == '/':
+        e += 1
+        sym = S_DEFINEDOR
+        if e < n and s[e] == '=':
+          e += 1
+          sym = S_SETDEFINEDOR
+      elif e < n and s[e] == '=':
+        e += 1
+        sym = S_SETDIV
+    elif c == '<':
+      sym = 51
+      if e < n and s[e] == '=':
+        e += 1
+        sym = S_LESSEQ
+    elif c == '>':
+      sym = 52
+      if e < n and s[e] == '=':
+        e += 1
+        sym = S_GREATEREQ
+    elif c == '?':
+      sym = 59
+      if e + 1 < n and s[e] == '/' and s[e + 1] == '/':
+        e += 2
+        sym = S_ALTERNATION
+    elif c == ';': sym = 60
+    elif c == ',': sym = 49
+    elif c == ':': sym = 63
+    else:
+      sym = S_INVALID
+    lx.ls = i
+    lx.le = e
+    lx.pos = e
+    if sym >= 0: return sym
+  return S_EOF
+
+# Constness, as jq's block_is_const sees the code an action built: ck is the constant's kind
+# (K_*), -1 for not a constant, -2 for a constant vjq doesn't fold (folded arithmetic). cl counts
+# the constants of a list `a, b, c` that gen_const_array turns into one constant (-1: unknown).
+const C_NO = -1
+const C_MAYBE = -2
+const K_NULL = 0
+const K_BOOL = 1
+const K_NUM = 2
+const K_STR = 3
+const K_ARR = 4
+const K_OBJ = 5
+
+fn single(k: Int) -> Int:
+  if k >= 0: return 1
+  if k == C_MAYBE: return -1
+  return 0
+
+fn fold(rule: Int, a: Int, b: Int) -> Int:
+  if a == C_NO or b == C_NO: return C_NO
+  if a == C_MAYBE or b == C_MAYBE: return C_MAYBE
+  if rule >= 41 and rule <= 46: return K_BOOL
+  if rule == 30:
+    if a == K_NULL: return b
+    if b == K_NULL: return a
+    if a == b and a != K_BOOL: return a
+    return C_MAYBE
+  if (rule == 33 or rule == 35) and a == K_NUM and b == K_NUM: return K_NUM
+  return C_MAYBE
+
+# The message check_object_key gives for a constant key of kind k written at src[s..e], or ""
+# for none; "?" when vjq can't tell.
+fn key_error(src: Str, s: Int, e: Int, k: Int, var st: St) -> Str:
+  if k == C_NO or k == K_STR: return ""
+  if k == C_MAYBE: return "?"
+  var p = lang.new_parser(src[s..e], "<top-level>")
+  let root = lang.parse_pipe(&p, &st)
+  if p.err != "" or p.tk != lang.T_EOF: return "?"
+  let m = lang.key_error_msg(p, &st, root)
+  if m == "": return "?"
+  return m
+
+fn check(src: Str, var st: St) -> BRes:
+  var r = BRes([], [], false)
+  let pact = ints(bisontab.YYPACT)
+  let defact = ints(bisontab.YYDEFACT)
+  let pgoto = ints(bisontab.YYPGOTO)
+  let defgoto = ints(bisontab.YYDEFGOTO)
+  let table = ints(bisontab.YYTABLE)
+  let chk = ints(bisontab.YYCHECK)
+  let r1 = ints(bisontab.YYR1)
+  let r2 = ints(bisontab.YYR2)
+  let names = bisontab.TNAMES.split("\t")
+  let last = bisontab.YYLAST
+  let ninf = bisontab.YYPACT_NINF
+  let tninf = bisontab.YYTABLE_NINF
+  let ntok = bisontab.YYNTOKENS
+  var lx = Lx(src, 0, [L_INITIAL], 0, 0)
+  # the stacks: state, location start and end, constness
+  var ss: [Int] = [0]
+  var sl: [Int] = [0]
+  var se: [Int] = [0]
+  var ck: [Int] = [C_NO]
+  var cl: [Int] = [0]
+  var state = 0
+  var yychar = S_EMPTY
+  var errstatus = 0
+  var er1 = 0          # yyerror_range[1].start
+  var yyn = 0
+  while true:
+    # yysetstate
+    if state == bisontab.YYFINAL: break
+    if ss.len >= 10000:
+      berr(&r, lx.ls, "memory exhausted")
+      break
+    # yybackup: 0 shift (yyn: the new state), 1 reduce (yyn: the rule), 2 error
+    var act = 1
+    yyn = pact[state]
+    if yyn == ninf:
+      yyn = defact[state]
+      if yyn == 0: act = 2
+    else:
+      if yychar == S_EMPTY: yychar = lex(&lx, &r, &st)
+      let i = yyn + yychar
+      if i < 0 or i > last or chk[i] != yychar:
+        yyn = defact[state]
+        if yyn == 0: act = 2
+      else:
+        yyn = table[i]
+        if yyn <= 0:
+          if yyn == tninf: act = 2
+          else: yyn = -yyn
+        else:
+          act = 0
+    if act == 0:
+      if errstatus > 0: errstatus -= 1
+      ss.push(yyn)
+      sl.push(lx.ls)
+      se.push(lx.le)
+      ck.push(C_NO)
+      cl.push(0)
+      state = yyn
+      yychar = S_EMPTY
+      continue
+    if act == 1:
+      let rule = yyn
+      let len = r2[rule]
+      let top = ss.len - 1
+      var ls = se[top]
+      var le = se[top]
+      if len > 0:
+        ls = sl[top - len + 1]
+      var k = C_NO
+      var l = 0
+      let b = top - len + 1     # the first right-hand symbol
+      if rule == bisontab.R_TERM_LIT:
+        k = K_NUM
+      elif rule == bisontab.R_QQ_EMPTY:
+        k = K_STR
+      elif rule == bisontab.R_QQ_TEXT:
+        if ck[b] == K_STR: k = K_STR
+      elif rule == bisontab.R_STR:
+        k = ck[b + 1]
+      elif rule == bisontab.R_TERM_STR or rule == 71:
+        k = ck[b]
+      elif rule == bisontab.R_EXP_TERM:
+        k = ck[b]
+        l = cl[b]
+      elif rule == bisontab.R_TERM_PAREN:
+        k = ck[b + 1]
+        l = cl[b + 1]
+      elif rule == 105:
+        k = K_ARR
+      elif rule == 104:
+        let c = cl[b + 1]
+        if c > 0: k = K_ARR
+        elif c < 0: k = C_MAYBE
+      elif rule == 109:
+        k = K_OBJ
+      elif rule == 110:
+        let t = src[sl[b]..se[b]]
+        if t == "true" or t == "false": k = K_BOOL
+        elif t == "null": k = K_NULL
+      elif rule == 30 or rule == 33 or rule == 35 or rule == 37 or rule == 38 or (rule >= 41 and rule <= 46):
+        k = fold(rule, ck[b], ck[b + 2])
+      elif rule == 29:
+        # a, b: a list of constants when a is one and b is a single constant
+        let x = cl[b]
+        let y = cl[b + 2]
+        if x != 0 and y != 0:
+          if x > 0 and y == 1: l = x + 1
+          elif x < 0 or y < 0: l = -1
+      elif rule == 155:
+        k = K_OBJ        # an object of constant pairs so far (MkDict carries this)
+      elif rule == 156:
+        k = ck[b]
+      elif rule == 157:
+        k = obj_and(ck[b], ck[b + 2])
+      elif rule == 158:
+        k = ck[b + 2]
+      elif rule == 159 or rule == 160:
+        k = pair_val(ck[b + 2])
+      elif rule == 161:
+        if ck[b] == K_STR: k = pair_val(ck[b + 2])
+        elif ck[b] == C_MAYBE: k = C_MAYBE
+      elif rule == 166:
+        k = K_OBJ
+      elif rule == bisontab.R_DICT_KEY or rule == bisontab.R_OBJPAT_KEY:
+        let m = key_error(src, sl[b + 1], se[b + 1], ck[b + 1], &st)
+        if m == "?": r.uncertain = true
+        elif m != "": berr(&r, ls, m)
+        if rule == bisontab.R_DICT_KEY:
+          if ck[b + 1] == K_STR: k = pair_val(ck[b + 4])
+          elif ck[b + 1] == C_MAYBE: k = C_MAYBE
+      elif rule == 106:
+        if ck[b + 1] == K_OBJ: k = K_OBJ
+        elif ck[b + 1] == C_MAYBE: k = C_MAYBE
+      elif rule == bisontab.R_IF_ERR:
+        berr(&r, ls, "Possibly unterminated 'if' statement")
+      elif rule == bisontab.R_TRY_ERR:
+        berr(&r, ls, "Possibly unterminated 'try' statement")
+      elif rule == bisontab.R_BREAK_ERR:
+        berr(&r, ls, "break requires a label to break to")
+      elif rule == bisontab.R_DOT_ERR or rule == bisontab.R_DOT_IDENT_ERR:
+        berr(&r, ls, "try .[\"field\"] instead of .field for unusually named fields")
+      elif rule == bisontab.R_OBJPAT_ERR or rule == bisontab.R_DICT_ERR:
+        berr(&r, ls, "May need parentheses around object key expression")
+      elif rule == bisontab.R_MODULE or rule == bisontab.R_IMPORT_META:
+        let m = ck[b + 1]
+        if m == C_MAYBE: r.uncertain = true
+        elif m == C_NO: berr(&r, ls, "Module metadata must be constant")
+        elif m != K_OBJ: berr(&r, ls, "Module metadata must be an object")
+      elif rule == bisontab.R_IMPORT_FROM:
+        if ck[b] != K_STR: berr(&r, ls, "Import path must be constant")
+      if l == 0 and rule != 29: l = single(k)
+      ss.truncate(ss.len - len)
+      sl.truncate(sl.len - len)
+      se.truncate(se.len - len)
+      ck.truncate(ck.len - len)
+      cl.truncate(cl.len - len)
+      let lhs = r1[rule] - ntok
+      let st0 = ss[ss.len - 1]
+      let gi = pgoto[lhs] + st0
+      if gi >= 0 and gi <= last and chk[gi] == st0: state = table[gi]
+      else: state = defgoto[lhs]
+      ss.push(state)
+      sl.push(ls)
+      se.push(le)
+      ck.push(k)
+      cl.push(l)
+      continue
+    # yyerrlab
+    if errstatus == 0:
+      berr(&r, lx.ls, syntax_message(names, pact, table, chk, state, yychar, last, ninf, tninf, ntok))
+    er1 = lx.ls
+    if errstatus == 3:
+      if yychar == S_EOF: break
+      if yychar != S_EMPTY: yychar = S_EMPTY
+    errstatus = 3
+    var found = false
+    while true:
+      yyn = pact[state]
+      if yyn != ninf:
+        yyn += S_ERROR
+        if yyn >= 0 and yyn <= last and chk[yyn] == S_ERROR:
+          yyn = table[yyn]
+          if yyn > 0:
+            found = true
+            break
+      if ss.len == 1: break
+      er1 = sl[sl.len - 1]
+      ss.pop()
+      sl.pop()
+      se.pop()
+      ck.pop()
+      cl.pop()
+      state = ss[ss.len - 1]
+    if not found: break
+    ss.push(yyn)
+    sl.push(er1)
+    se.push(lx.le)
+    ck.push(C_NO)
+    cl.push(0)
+    state = yyn
+  return r
+
+fn obj_and(a: Int, b: Int) -> Int:
+  if a == C_NO or b == C_NO: return C_NO
+  if a == C_MAYBE or b == C_MAYBE: return C_MAYBE
+  return K_OBJ
+
+# A pair `key: value` with a constant string key: constant when the value is a single constant.
+fn pair_val(v: Int) -> Int:
+  if v >= 0: return K_OBJ
+  if v == C_MAYBE: return C_MAYBE
+  return C_NO
+
+fn syntax_message(names: [Str], pact: [Int], table: [Int], chk: [Int], state: Int, tok: Int, last: Int, ninf: Int, tninf: Int, ntok: Int) -> Str:
+  if tok == S_EMPTY: return "syntax error"
+  var msg = "syntax error, unexpected " + names[tok]
+  var exp: [Int] = []
+  let n = pact[state]
+  if n != ninf:
+    var xb = 0
+    if n < 0: xb = -n
+    var xe = last - n + 1
+    if xe > ntok: xe = ntok
+    var x = xb
+    while x < xe:
+      if chk[x + n] == x and x != S_ERROR and table[x + n] != tninf:
+        if exp.len == 4: return msg
+        exp.push(x)
+      x += 1
+  for i in 0..exp.len:
+    if i == 0: msg += ", expecting "
+    else: msg += " or "
+    msg += names[exp[i]]
+  return msg
