@@ -83,6 +83,8 @@ type Rx:
   lead: Int            # a code point every match starts with (-1: unknown)
   anchored: Bool       # starts with \A
   endanc: Int          # Oniguruma's end anchor for a zero-width pattern: 0 none, 1 \z, 2 \Z or $
+  slot_mem: [[Int]]    # per empty-check slot: the groups Oniguruma's EMPTY_CHECK_END_MEMST looks at
+  anyml: Bool          # begins with a greedy unbounded multi-line .* (after zero-width items)
 
 type Ps:
   p: Str
@@ -509,6 +511,7 @@ fn parse_quantified(var ps: Ps, var u: Uni, first: Bool) -> Int:
     if at_end(ps) or peek(ps) == int(')') or peek(ps) == int('|'): return node(&ps, N_EMPTY, 0, 0, 0)
     return -1
   let quantifiable = t >= 0 and not invalid_target(ps, t)
+  var qcat = -1
   while ps.err == "" and not ps.unsupported:
     skip_extended(&ps)
     if at_end(ps): break
@@ -563,6 +566,9 @@ fn parse_quantified(var ps: Ps, var u: Uni, first: Bool) -> Int:
       ps.nodes[r].kids = [last]
       ps.nodes[t].kids[nk - 1] = r
       ps.nodes[t].c = 0
+      # (a further quantifier applies to this one, as in Oniguruma)
+      qcat = t
+      t = r
       continue
     # Oniguruma's assign_quantifier_body: x{1} is x; a quantifier of a quantifier is reduced
     if mn == 1 and mx == 1: continue
@@ -575,6 +581,10 @@ fn parse_quantified(var ps: Ps, var u: Uni, first: Bool) -> Int:
     ps.nodes[r].kids = [t]
     t = r
   if start == ps.i and t < 0: return -1
+  if qcat >= 0:
+    let nk2 = ps.nodes[qcat].kids.len
+    ps.nodes[qcat].kids[nk2 - 1] = t
+    return qcat
   return t
 
 # quantifier_type_num: ? * + ?? *? +? as 0..5, -1 for others
@@ -587,7 +597,7 @@ fn qtype(mn: Int, mx: Int, greedy: Bool) -> Int:
   return t
 
 # ReduceTypeTable[child][parent]: 0 as is, 1 del, 2 a, 3 p, 4 aq, 5 qq, 6 p_qq
-const RQ_TABLE = "121154" + "111661" + "221061" + "144144" + "111111" + "023441"
+const RQ_TABLE = "122540" + "111661" + "221061" + "144144" + "111111" + "023441"
 
 # The quantifier {mn,mx} (mode as in N_REP) applied to the quantifier node t, as Oniguruma
 # reduces it (onig_reduce_nested_quantifier, and (?:a*){n,m} taken as {n,n}).
@@ -727,6 +737,12 @@ fn esc_set(var ps: Ps, own r: [Int]) -> Int:
   ps.sets.push(r)
   return node(&ps, N_SET, ps.sets.len - 1, 0, 0)
 
+# A negative one (\W, \S, \D, \P{..}, \N, \O): Oniguruma's negated type matches a byte inside a
+# character (where a search restarted), as a negated bracket class does (b: 4).
+fn esc_nset(var ps: Ps, own r: [Int]) -> Int:
+  ps.sets.push(r)
+  return node(&ps, N_SET, ps.sets.len - 1, 4, 0)
+
 fn parse_atom(var ps: Ps, var u: Uni) -> Int:
   let c = peek(ps)
   if c == int('('): return parse_group(&ps, &u)
@@ -769,7 +785,8 @@ fn parse_escape(var ps: Ps, var u: Uni) -> Int:
     perr(&ps, "end pattern at escape")
     return -1
   let c = next_cp(&ps)
-  if c == int('w') or c == int('W') or c == int('s') or c == int('S') or c == int('d') or c == int('D'):
+  if c == int('W') or c == int('S') or c == int('D'): return esc_nset(&ps, class_escape(&u, c))
+  if c == int('w') or c == int('s') or c == int('d'):
     return esc_set(&ps, class_escape(&u, c))
   if c == int('b'): return node(&ps, N_ANCHOR, A_WORDB, 0, 0)
   if c == int('B'): return node(&ps, N_ANCHOR, A_NWORDB, 0, 0)
@@ -778,8 +795,8 @@ fn parse_escape(var ps: Ps, var u: Uni) -> Int:
   if c == int('z'): return node(&ps, N_ANCHOR, A_ENDBUF, 0, 0)
   if c == int('G'): return node(&ps, N_ANCHOR, A_BEGPOS, 0, 0)
   if c == int('K'): return node(&ps, N_KEEP, 0, 0, 0)
-  if c == int('N'): return esc_set(&ps, negate([10, 10]))
-  if c == int('O'): return esc_set(&ps, [0, 0x10FFFF])
+  if c == int('N'): return esc_nset(&ps, negate([10, 10]))
+  if c == int('O'): return node(&ps, N_ANY, 0, 1, 0)
   if c == int('R'):
     # (?>\r\n|[\n\v\f\r\x85  ])
     let a = node(&ps, N_CAT, 0, 0, 0)
@@ -795,8 +812,11 @@ fn parse_escape(var ps: Ps, var u: Uni) -> Int:
     unsup(&ps)
     return -1
   if c == int('p') or c == int('P'):
+    var negp = c == int('P')
+    if ps.i + 1 < ps.p.len and ps.p[ps.i] == '{' and ps.p[ps.i + 1] == '^': negp = not negp
     let r = parse_property(&ps, &u, c == int('P'))
     if ps.err != "" or ps.unsupported: return -1
+    if negp: return esc_nset(&ps, r)
     return esc_set(&ps, r)
   if c == int('Q'):
     # quoted to \E (or the end)
@@ -1198,6 +1218,10 @@ fn parse_class(var ps: Ps, var u: Uni) -> [Int]:
       let pr = posix_bracket(&ps, &u)
       if ps.err != "" or ps.unsupported: return []
       if pr.len > 0 or ps.p[ps.i - 1] == ']':
+        if peek(ps) == int('-') and not (ps.i + 1 < ps.p.len and ps.p[ps.i + 1] == ']'):
+          # Oniguruma: a class can't start a range
+          perr(&ps, "unmatched range specifier in char-class")
+          return []
         add_ranges(&r, pr)
         prev = -1
         continue
@@ -1240,8 +1264,8 @@ fn parse_class(var ps: Ps, var u: Uni) -> [Int]:
     else:
       lo = next_cp(&ps)
     if is_multi:
-      if peek(ps) == int('-') and ps.i + 1 < ps.p.len and ps.p[ps.i + 1] != ']':
-        unsup(&ps)
+      if peek(ps) == int('-') and not (ps.i + 1 < ps.p.len and ps.p[ps.i + 1] == ']'):
+        perr(&ps, "unmatched range specifier in char-class")
         return []
       add_ranges(&r, multi)
       prev = -1
@@ -1252,6 +1276,18 @@ fn parse_class(var ps: Ps, var u: Uni) -> [Int]:
       var hi = -1
       let c2 = peek(ps)
       if c2 == int('['):
+        if ps.i + 1 < ps.p.len and ps.p[ps.i + 1] == ':':
+          let i0 = ps.i
+          let pr = posix_bracket(&ps, &u)
+          if ps.err != "" or ps.unsupported: return []
+          if pr.len > 0 or ps.p[ps.i - 1] == ']':
+            perr(&ps, "char-class value at end of range")
+            return []
+          ps.i = i0
+        if lo > int('['):
+          # '[' is the range's end then
+          perr(&ps, "empty range in char class")
+          return []
         unsup(&ps)
         return []
       if c2 == int('\\'):
@@ -1261,12 +1297,21 @@ fn parse_class(var ps: Ps, var u: Uni) -> [Int]:
           return []
         let e2 = next_cp(&ps)
         if e2 == int('w') or e2 == int('W') or e2 == int('s') or e2 == int('S') or e2 == int('d') or e2 == int('D') or e2 == int('p') or e2 == int('P'):
-          unsup(&ps)
+          perr(&ps, "char-class value at end of range")
           return []
         if e2 == int('b'): hi = 8
         elif e2 >= int('0') and e2 <= int('7'):
-          unsup(&ps)
-          return []
+          ps.i -= 1
+          var v = 0
+          var n = 0
+          while n < 3 and ps.i < ps.p.len and ps.p[ps.i] >= '0' and ps.p[ps.i] <= '7':
+            v = v * 8 + int(ps.p[ps.i] - '0')
+            ps.i += 1
+            n += 1
+          if v >= 0x80:
+            unsup(&ps)
+            return []
+          hi = v
         else:
           hi = escape_value(&ps, e2)
           if hi < 0: return []
@@ -1335,7 +1380,7 @@ fn posix_bracket(var ps: Ps, var u: Uni) -> [Int]:
 fn compile_rx(pat: Str, opts: Int, var u: Uni) -> Rx:
   var ps = Ps(pat, 0, opts | O_SINGLELINE, [], [], [], [], [], 0, [""], "", false, 0, false)
   let root = parse_alt(&ps, &u, true)
-  var rx = Rx([], [], [], 0, [], 0, opts | O_SINGLELINE, "", false, -1, false, 0)
+  var rx = Rx([], [], [], 0, [], 0, opts | O_SINGLELINE, "", false, -1, false, 0, [], false)
   if ps.err == "" and not ps.unsupported and not at_end(ps):
     perr(&ps, "unmatched close parenthesis")
   if ps.err == "" and not ps.unsupported:
@@ -1353,7 +1398,13 @@ fn compile_rx(pat: Str, opts: Int, var u: Uni) -> Rx:
   for nm in ps.names: rx.names.push(nm)
   swap(&rx.sets, &ps.sets)
   swap(&rx.brefs, &ps.brefs)
-  var cs = Cs([], 0, false, 0)
+  var cs = Cs([], 0, false, 0, [false] * (ps.ncap + 1), [], [], [])
+  mark_pushed(ps, root, false, &cs.pushed)
+  for i in 0..ps.nodes.len: cs.rep_mem.push([])
+  mark_memst(ps, rx.brefs, root, &cs.rep_mem)
+  for gs in rx.brefs:
+    for g in gs:
+      if g < cs.pushed.len: cs.pushed[g] = true
   emit(&cs, ps, u, root)
   if cs.bad:
     rx.unsupported = true
@@ -1363,19 +1414,24 @@ fn compile_rx(pat: Str, opts: Int, var u: Uni) -> Rx:
   cs.code.push(0)
   swap(&rx.code, &cs.code)
   rx.nslots = cs.nslots
+  swap(&rx.slot_mem, &cs.slot_mem)
   rx.lead = lead_char(ps, root)
   rx.anchored = starts_anchored(ps, root)
   let ai = anc_info(ps, root)
+  # Oniguruma then tries the search's start only (unless another anchor decides)
+  rx.anyml = (ai & 32) != 0 and (ai & 64) == 0
   if (ai & 3) == 0 and (ai & 16) != 0:
     if (ai & 4) != 0: rx.endanc = 1
     elif (ai & 8) != 0: rx.endanc = 2
   return rx
 
 # Oniguruma's optimizer's anchors for node n (optimize_nodes): bits 1 \A or ^ at the left, 2 \G
-# at the left, 4 \z at the right, 8 \Z or $ at the right, 16 when it can only match empty.
+# at the left, 4 \z at the right, 8 \Z or $ at the right, 16 when it can only match empty, 32
+# a greedy unbounded multi-line `.*` at the left (ANYCHAR_INF_ML), 64 a look-behind at the left.
 fn anc_info(ps: Ps, n: Int) -> Int:
   let nd = ps.nodes[n]
   let k = nd.k
+  if k == N_LOOK and nd.a == 2: return 16 | 64
   if k == N_EMPTY or k == N_LOOK or k == N_KEEP: return 16
   if k == N_ANCHOR:
     if nd.a == A_BEGBUF: return 16 | 1
@@ -1390,20 +1446,22 @@ fn anc_info(ps: Ps, n: Int) -> Int:
       if acc < 0:
         acc = b
         continue
-      var l = acc & 3
-      if (acc & 16) != 0: l = l | (b & 3)
+      var l = acc & 99
+      if (acc & 16) != 0: l = l | (b & 99)
       var r = b & 12
       if (b & 16) != 0: r = r | (acc & 12)
       acc = l | r | (acc & b & 16)
     if acc < 0: return 16
     return acc
   if k == N_ALT:
-    var acc = 31
+    var acc = 127
     for x in nd.kids: acc = acc & anc_info(ps, x)
     return acc
   if k == N_CAP or k == N_ATOMIC: return anc_info(ps, nd.kids[0])
   if k == N_REP:
     if nd.b == 0: return 16
+    let bn = ps.nodes[nd.kids[0]]
+    if nd.b == -1 and nd.c != 0 and bn.k == N_ANY and bn.b == 1: return 32
     let b = anc_info(ps, nd.kids[0])
     if nd.a > 0: return b
     return b & 16
@@ -1416,6 +1474,75 @@ type Cs:
   nslots: Int
   bad: Bool
   in_lb: Int        # inside look-behinds
+  pushed: [Bool]    # groups Oniguruma saves on its stack (backreferenced, or in an alternative, a
+                    # negative look-around or a quantifier of variable count): entering one again
+                    # voids its end for backrefs
+  rep_mem: [[Int]]  # per node: for a quantifier, the groups its empty check compares (MEMST)
+  memq: [Int]       # (the quantifier being emitted: its rep_mem)
+  slot_mem: [[Int]]
+
+# Oniguruma's empty checks that compare captures (USE_STUBBORN_CHECK_CAPTURES_IN_EMPTY_REPEAT):
+# a group's innermost enclosing quantifier whose body can match empty, when a backreference
+# to the group isn't found inside that quantifier going up Oniguruma's parent links, checks the
+# group too (rep_mem of the quantifier).
+fn mark_memst(ps: Ps, brefs: [[Int]], root: Int, var rep_mem: [[Int]]):
+  var ern = [-1] * (ps.ncap + 1)
+  var refs: [Int] = []        # backreference nodes
+  var anc: [[Int]] = []       # their ancestors
+  var path: [Int] = []
+  memst_walk(ps, root, -1, &path, &ern, &refs, &anc)
+  for i in 0..refs.len:
+    let gs = brefs[ps.nodes[refs[i]].a]
+    for g in gs:
+      if g < ern.len and ern[g] >= 0:
+        var inside = false
+        for x in anc[i]:
+          if x == ern[g]: inside = true
+        if not inside:
+          var dup = false
+          for y in rep_mem[ern[g]]:
+            if y == g: dup = true
+          if not dup: rep_mem[ern[g]].push(g)
+
+fn memst_walk(ps: Ps, n: Int, rep0: Int, var path: [Int], var ern: [Int], var refs: [Int], var anc: [[Int]]):
+  let nd = ps.nodes[n]
+  var rep = rep0
+  if nd.k == N_REP and nd.b != 0 and nullable(ps, nd.kids[0]) and has_cap(ps, nd.kids[0]): rep = n
+  # (a positive look-around's body starts afresh)
+  if nd.k == N_LOOK and (nd.a == 0 or nd.a == 2): rep = -1
+  if nd.k == N_CAP and nd.a < ern.len: ern[nd.a] = rep
+  if nd.k == N_BREF:
+    refs.push(n)
+    var a: [Int] = []
+    for x in path: a.push(x)
+    anc.push(a)
+  # Oniguruma's parent links (is_ancestor_node): lists and alternations are chains of cells and
+  # only the first cell links to the node, so from a later element nothing above is reached
+  for i in 0..nd.kids.len:
+    if i > 0 and (nd.k == N_CAT or nd.k == N_ALT):
+      var p2: [Int] = []
+      memst_walk(ps, nd.kids[i], rep, &p2, &ern, &refs, &anc)
+    else:
+      path.push(n)
+      memst_walk(ps, nd.kids[i], rep, &path, &ern, &refs, &anc)
+      path.pop()
+
+fn has_cap(ps: Ps, n: Int) -> Bool:
+  let nd = ps.nodes[n]
+  if nd.k == N_CAP: return true
+  for x in nd.kids:
+    if has_cap(ps, x): return true
+  return false
+
+fn mark_pushed(ps: Ps, n: Int, inside: Bool, var out: [Bool]):
+  let nd = ps.nodes[n]
+  var st = inside
+  if nd.k == N_ALT and nd.kids.len > 1: st = true
+  if nd.k == N_COND: st = true
+  if nd.k == N_LOOK and (nd.a == 1 or nd.a == 3): st = true
+  if nd.k == N_REP and nd.a != nd.b: st = true
+  if nd.k == N_CAP and inside and nd.a < out.len: out[nd.a] = true
+  for x in nd.kids: mark_pushed(ps, x, st, &out)
 
 fn ins(var cs: Cs, op: Int, a: Int, b: Int) -> Int:
   let pc = cs.code.len
@@ -1520,7 +1647,9 @@ fn emit(var cs: Cs, ps: Ps, u: Uni, n: Int):
     for j in jumps: cs.code[j + 1] = cs.code.len
     return
   if k == N_CAP:
-    ins(&cs, I_SAVE, 2 * nd.a, 0)
+    var pu = 0
+    if nd.a < cs.pushed.len and cs.pushed[nd.a]: pu = 1
+    ins(&cs, I_SAVE, 2 * nd.a, pu)
     emit(&cs, ps, u, nd.kids[0])
     ins(&cs, I_SAVE, 2 * nd.a + 1, 0)
     return
@@ -1562,6 +1691,9 @@ fn emit(var cs: Cs, ps: Ps, u: Uni, n: Int):
     cs.code[j + 1] = cs.code.len
     return
   if k == N_REP:
+    var mq: [Int] = []
+    for g in cs.rep_mem[n]: mq.push(g)
+    swap(&cs.memq, &mq)
     if nd.c == 2:
       # possessive: atomic greedy
       let pc = ins(&cs, I_ATOMIC, 0, 0)
@@ -1824,6 +1956,8 @@ fn olen(ps: Ps, u: Uni, n: Int) -> Int:
 # don't): the body repeated (no check), a loop that checks the iterations after the required
 # ones, or (a bigger body, or a lazy range) a counted loop where any empty iteration ends it.
 fn emit_rep(var cs: Cs, ps: Ps, u: Uni, body: Int, mn: Int, mx: Int, greedy: Bool):
+  var ms: [Int] = []
+  swap(&ms, &cs.memq)
   let tl = olen(ps, u, body)
   if tl == 0: return
   let check = nullable(ps, body)
@@ -1831,19 +1965,19 @@ fn emit_rep(var cs: Cs, ps: Ps, u: Uni, body: Int, mn: Int, mx: Int, greedy: Boo
   if mx == -1 and (mn <= 1 or tl * mn <= 10):
     if mn == 1 and tl > 10:
       # Oniguruma jumps into its loop: the first iteration is checked too
-      emit_loop(&cs, ps, u, body, greedy, check, -1, true)
+      emit_loop(&cs, ps, u, body, greedy, check, -1, true, ms)
       return
     for i in 0..mn:
       emit(&cs, ps, u, body)
       if cs.bad: return
-    emit_loop(&cs, ps, u, body, greedy, check, -1, false)
+    emit_loop(&cs, ps, u, body, greedy, check, -1, false, ms)
     return
   if mx != -1 and ((greedy and (mx == 1 or (tl + 1) * mx <= 10)) or (not greedy and mn == 0 and mx == 1)) or not check:
     for i in 0..mn:
       emit(&cs, ps, u, body)
       if cs.bad: return
     if mx == -1:
-      emit_loop(&cs, ps, u, body, greedy, check, -1, false)
+      emit_loop(&cs, ps, u, body, greedy, check, -1, false, ms)
       return
     var splits: [Int] = []
     for i in mn..mx:
@@ -1864,6 +1998,7 @@ fn emit_rep(var cs: Cs, ps: Ps, u: Uni, body: Int, mn: Int, mx: Int, greedy: Boo
   # OP_REPEAT: every iteration checked; an empty one leaves the loop, however many are required
   let slot = cs.nslots
   cs.nslots += 1
+  slot_mem_set(&cs, slot, ms)
   var exits: [Int] = []
   var splits: [Int] = []
   var n = mx
@@ -1878,7 +2013,7 @@ fn emit_rep(var cs: Cs, ps: Ps, u: Uni, body: Int, mn: Int, mx: Int, greedy: Boo
     if cs.bad: return
     exits.push(ins(&cs, I_ECHK_E, slot, 0))
   if mx == -1:
-    emit_loop(&cs, ps, u, body, greedy, true, slot, false)
+    emit_loop(&cs, ps, u, body, greedy, true, slot, false, ms)
     exits.push(-1)
     if cs.bad: return
   let out = cs.code.len
@@ -1895,7 +2030,11 @@ fn emit_rep(var cs: Cs, ps: Ps, u: Uni, body: Int, mn: Int, mx: Int, greedy: Boo
 # body* (or body*?): each iteration checked for matching empty when check is set (an empty one
 # leaves the loop); slot0 >= 0 reuses that slot, -1 takes a new one. enter: the first iteration
 # is required (Oniguruma jumps into the loop's body).
-fn emit_loop(var cs: Cs, ps: Ps, u: Uni, body: Int, greedy: Bool, check: Bool, slot0: Int, enter: Bool):
+fn slot_mem_set(var cs: Cs, slot: Int, ms: [Int]):
+  while cs.slot_mem.len <= slot: cs.slot_mem.push([])
+  for g in ms: cs.slot_mem[slot].push(g)
+
+fn emit_loop(var cs: Cs, ps: Ps, u: Uni, body: Int, greedy: Bool, check: Bool, slot0: Int, enter: Bool, ms: [Int]):
   var j = -1
   if enter: j = ins(&cs, I_JMP, 0, 0)
   let top = ins(&cs, I_SPLIT, 0, 0)
@@ -1906,6 +2045,7 @@ fn emit_loop(var cs: Cs, ps: Ps, u: Uni, body: Int, greedy: Bool, check: Bool, s
     if slot < 0:
       slot = cs.nslots
       cs.nslots += 1
+      slot_mem_set(&cs, slot, ms)
     ins(&cs, I_ECHK_S, slot, 0)
   emit(&cs, ps, u, body)
   var ec = -1
@@ -1955,6 +2095,7 @@ const BT_ALT = 1
 const BT_CAP = 2
 const BT_SLOT = 3
 const BT_KEEP = 4
+const BT_CAPE = 5      # a saved group's end voided at its start (undone as BT_CAP)
 
 fn is_word(var u: Uni, s: Str, i: Int) -> Bool:
   let c = int(s[i])
@@ -1974,7 +2115,7 @@ fn assert_ok(var m: Mx, var u: Uni, kind: Int, pos: Int) -> Bool:
   if kind == A_BEGBUF: return pos == 0
   if kind == A_ENDBUF: return pos == n
   if kind == A_SEMIEND: return pos == n or (pos == n - 1 and s[pos] == '\n')
-  if kind == A_BEGLINE: return pos == 0 or s[pos - 1] == '\n'
+  if kind == A_BEGLINE: return pos == 0 or (s[pos - 1] == '\n' and pos < n)   # (not at the end: Oniguruma)
   if kind == A_ENDLINE: return pos == n or s[pos] == '\n'
   if kind == A_BEGPOS: return pos == m.search_start
   let a = pos > 0 and is_word(&u, s, prev_start(s, pos))
@@ -2035,8 +2176,13 @@ fn run(var m: Mx, rx: Rx, var u: Uni, pc0: Int, pos0: Int, start: Int) -> Int:
       if pos < n:
         let d = dec(s, pos)
         let fl = code[pc + 2]
-        let has = set_has(u, rx.sets[code[pc + 1]], d >> 3, (fl & 2) != 0)
-        if has != ((fl & 1) != 0) and pos + (d & 7) <= n:
+        # (a byte inside a character, where a search restarted: Oniguruma reads it as a
+        # one-byte code that no class holds, so only negated classes match it)
+        var ok2 = false
+        if (d & 7) != 1 or (d >> 3) < 0x80:
+          ok2 = set_has(u, rx.sets[code[pc + 1]], d >> 3, (fl & 2) != 0) != ((fl & 1) != 0)
+        else: ok2 = (fl & 5) != 0
+        if ok2 and pos + (d & 7) <= n:
           pos += d & 7
           pc += 3
           continue
@@ -2056,6 +2202,12 @@ fn run(var m: Mx, rx: Rx, var u: Uni, pc0: Int, pos0: Int, start: Int) -> Int:
       m.stk.push(k)
       m.stk.push(m.caps[k])
       m.caps[k] = pos
+      if code[pc + 2] != 0:
+        # (Oniguruma's MEM_START_PUSH: the group's end is void until it closes again)
+        m.stk.push(BT_CAPE)
+        m.stk.push(k + 1)
+        m.stk.push(m.caps[k + 1])
+        m.caps[k + 1] = -1
       pc += 3
       continue
     elif op == I_ASSERT:
@@ -2079,7 +2231,14 @@ fn run(var m: Mx, rx: Rx, var u: Uni, pc0: Int, pos0: Int, start: Int) -> Int:
       pc += 3
       continue
     elif op == I_ECHK_E:
-      if m.slots[code[pc + 1]] == pos: pc = code[pc + 2]
+      let sl = code[pc + 1]
+      if m.slots[sl] != pos:
+        pc += 3
+        continue
+      if sl >= rx.slot_mem.len or rx.slot_mem[sl].len == 0:
+        pc = code[pc + 2]
+        continue
+      if memst(m, rx.slot_mem[sl], sl, pos) == 1: pc = code[pc + 2]
       else: pc += 3
       continue
     elif op == I_BREF:
@@ -2180,7 +2339,7 @@ fn run(var m: Mx, rx: Rx, var u: Uni, pc0: Int, pos0: Int, start: Int) -> Int:
           pos = b
           resumed = true
           break
-        if kind == BT_CAP: m.caps[a] = b
+        if kind == BT_CAP or kind == BT_CAPE: m.caps[a] = b
         elif kind == BT_SLOT: m.slots[a] = b
         elif kind == BT_KEEP: m.keep = a
       if not resumed: return -1
@@ -2188,6 +2347,50 @@ fn run(var m: Mx, rx: Rx, var u: Uni, pc0: Int, pos0: Int, start: Int) -> Int:
 
 # Drops the choice points above h, keeping what undoes captures (for atomic groups and
 # look-arounds that succeeded).
+# Oniguruma's STACK_EMPTY_CHECK_MEM (regexec.c) for an iteration that ended where it began:
+# 1 empty, 0 not. For each checked group closed in the iteration (its last close there), with
+# the group's first entry in the iteration: not empty when the capture before had no end, or
+# when it changed and isn't empty both before and after.
+fn memst(m: Mx, gs: [Int], sl: Int, pos: Int) -> Int:
+  var t = m.stk.len - 3
+  while t >= 0 and not (m.stk[t] == BT_SLOT and m.stk[t + 1] == sl): t -= 3
+  # the value each record set (the next record's previous value, or the current one)
+  let lo = t + 3
+  let nrec = (m.stk.len - lo) / 3
+  var newv = [0] * nrec
+  var nxt: [Int] = []
+  for x in m.caps: nxt.push(x)
+  var i = nrec - 1
+  while i >= 0:
+    let at = lo + 3 * i
+    let kind = m.stk[at]
+    if kind == BT_CAP or kind == BT_CAPE:
+      let a = m.stk[at + 1]
+      newv[i] = nxt[a]
+      nxt[a] = m.stk[at + 2]
+    i -= 1
+  for g in gs:
+    # the last close of g in the iteration
+    var k = nrec - 1
+    while k >= 0 and not (m.stk[lo + 3 * k] == BT_CAP and m.stk[lo + 3 * k + 1] == 2 * g + 1): k -= 1
+    if k < 0: continue
+    let e_new = newv[k]
+    # the group's start then: the last record of its start before k, else its value before
+    var s_new = -1
+    var j = k - 1
+    while j >= 0 and not ((m.stk[lo + 3 * j] == BT_CAP) and m.stk[lo + 3 * j + 1] == 2 * g): j -= 1
+    if j >= 0: s_new = newv[j]
+    else: s_new = nxt[2 * g]
+    # the first entry of g in the iteration (a start record followed by its end voided)
+    var kk = 0
+    while kk < k and not (m.stk[lo + 3 * kk] == BT_CAP and m.stk[lo + 3 * kk + 1] == 2 * g and kk + 1 < nrec and m.stk[lo + 3 * kk + 3] == BT_CAPE): kk += 1
+    if kk >= k: continue
+    let s_old = m.stk[lo + 3 * kk + 2]
+    let e_old = m.stk[lo + 3 * kk + 5]
+    if e_old < 0: return 0
+    if (e_old != e_new or s_old != s_new) and (s_new != e_new or s_old != e_old): return 0
+  return 1
+
 fn keep_undo(var m: Mx, h: Int):
   var w = h
   var i = h
@@ -2207,13 +2410,15 @@ fn unwind(var m: Mx, h: Int):
     let a = m.stk[t + 1]
     let b = m.stk[t + 2]
     m.stk.truncate(t)
-    if kind == BT_CAP: m.caps[a] = b
+    if kind == BT_CAP or kind == BT_CAPE: m.caps[a] = b
     elif kind == BT_SLOT: m.slots[a] = b
     elif kind == BT_KEEP: m.keep = a
 
 fn bref_at(s: Str, var u: Uni, b0: Int, e0: Int, pos: Int, icase: Bool, lim: Int) -> Int:
   if not icase:
     let len = e0 - b0
+    # (a group re-entered refers to its new start and old end: Oniguruma compares nothing)
+    if len < 0: return pos
     if pos + len > lim: return -1
     for i in 0..len:
       if s[b0 + i] != s[pos + i]: return -1
@@ -2273,6 +2478,10 @@ fn search(rx: Rx, var u: Uni, s: Str, from: Int, var out: [Int]) -> Bool:
     if longest and m.best >= 0 and (st + m.best >= s.len):
       break
     if rx.anchored: break
+    if rx.anyml and rx.endanc == 0 and n > 0:
+      # the range is the start and one byte past it: a one-byte first character lets the
+      # next start be tried too (onig_search's "s == range" try)
+      if not (st == from and st < n and (dec(s, st) & 7) == 1): break
     if st >= s.len: break
     st += dec(s, st) & 7
   if longest and m.best >= 0:

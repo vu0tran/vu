@@ -1,7 +1,7 @@
 # Regex differential fuzzing in batches: many [pattern, flags, string] cases run by one jq and
 # one vjq process (each case in try/catch), so tens of thousands of patterns are cheap.
 #   python3 rxbatch.py JQ VJQ N SEED [BATCH]
-import json, os, random, subprocess, sys
+import json, os, random, subprocess, sys, tempfile
 J, V, N, SEED = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 BATCH = int(sys.argv[5]) if len(sys.argv) > 5 else 500
 rnd = random.Random(SEED)
@@ -89,7 +89,8 @@ while done < N:
     a = run(J, data); b = run(V, data, env)
     if len(a) != len(b):
         print("batch length differs", len(a), len(b), last_err[:300])
-        open("/tmp/rxbatch_bad.json" if False else os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rxbatch_bad.json"), "wb").write(data)
+        bad = os.path.join(tempfile.gettempdir(), f"rxbatch_bad_{SEED}.json")
+        open(bad, "wb").write(data); print("  batch written to", bad)
         fails += n; continue
     for c, x, y in zip(cases, a, b):
         tot += 1
