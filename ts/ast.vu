@@ -263,6 +263,7 @@ type Ast:
   names: [Str]
   ht: [Int]          # the names' hash table: slots hold a name's id, or -1
   hh: [Int]          # each name's hash
+  hw: [Int]          # each name of up to 7 bytes as one word (short_key), else -1
   npos: {Int: Int}    # declaration node -> where its name starts (classes, functions...)
   dirs: {Int: [Int]}  # file -> its comment directives (start, end, kind triples)
   nocheck: {Int: Bool}
@@ -270,10 +271,10 @@ type Ast:
 
 # An empty tree with nothing in it, not even name 0 or node 0 (a placeholder to swap with).
 fn blank() -> Ast:
-  return Ast([], [], [], [], [], {}, {}, {}, new_sev())
+  return Ast([], [], [], [], [], [], {}, {}, {}, new_sev())
 
 fn new_ast() -> Ast:
-  var t = Ast([], [], [], [], [], {}, {}, {}, new_sev())
+  var t = Ast([], [], [], [], [], [], {}, {}, {}, new_sev())
   intern(&t, "")          # name 0 is ""
   node(&t, N_EMPTY, 0, 0, 0)    # node 0 is unused, so 0 never means a real child
   return t
@@ -310,8 +311,30 @@ fn range_hash(s: Str, a: Int, b: Int) -> Int:
   h = (h ^ s.read_le(b - 8, 8)) *% 1099511628211
   return h ^ (h >>> 31)
 
+# A name of up to 7 bytes as one word: its bytes (little-endian) and its length in the top byte. Two
+# such names are the same exactly when their words are.
+fn short_key(s: Str, a: Int, len: Int) -> Int:
+  var w = 0
+  if a + 8 <= s.len:
+    if len > 0: w = s.read_le(a, 8) & ((1 << (len * 8)) - 1)
+  else:
+    var k = len - 1
+    while k >= 0:
+      w = (w << 8) | int(s[a + k])
+      k -= 1
+  return w | (len << 56)
+
+fn key_hash(w: Int) -> Int:
+  let h = w *% -7046029254386353131
+  return h ^ (h >>> 29)
+
+# A name's hash: by its word if it's short, else range_hash.
+fn text_hash(s: Str, a: Int, b: Int) -> Int:
+  if b - a <= 7: return key_hash(short_key(s, a, b - a))
+  return range_hash(s, a, b)
+
 fn name_hash(s: Str) -> Int:
-  return range_hash(s, 0, s.len)
+  return text_hash(s, 0, s.len)
 
 # Whether x is the text src[a..a + x.len] (the same way: words for 8 bytes or more).
 fn same_text(x: Str, src: Str, a: Int) -> Bool:
@@ -342,6 +365,7 @@ fn grow_names(var t: Ast):
 fn keep_names(var t: Ast, k: Int, room: Int):
   t.names.truncate(k)
   t.hh.truncate(k)
+  t.hw.truncate(k)
   var size = 1024
   while size < (k + room) * 2: size = size * 2
   t.ht = [-1] * size
@@ -364,21 +388,57 @@ fn find(t: Ast, s: Str) -> Int:
     j = (j + 1) & mask
   return -1
 
-# intern(src[a..b]) without making the string unless the name is new.
+# intern(src[a..b]) without making the string unless the name is new. (A name of up to 7 bytes is
+# found by its word alone: no string is read.)
 fn intern_at(var t: Ast, src: Str, a: Int, b: Int) -> Int:
   if t.names.len * 2 >= t.ht.len: grow_names(&t)
-  let h = range_hash(src, a, b)
-  let mask = t.ht.len - 1
   let len = b - a
+  let mask = t.ht.len - 1
+  if len <= 7:
+    let w = short_key(src, a, len)
+    let h = key_hash(w)
+    var j = h & mask
+    while true:
+      let found = t.ht[j]
+      if found < 0: break
+      if t.hw[found] == w: return found
+      j = (j + 1) & mask
+    return add_name(&t, src[a..b], h, w, j)
+  let h = range_hash(src, a, b)
   var j = h & mask
   while true:
     let found = t.ht[j]
     if found < 0: break
     if t.hh[found] == h and t.names[found].len == len and same_text(t.names[found], src, a): return found
     j = (j + 1) & mask
+  return add_name(&t, src[a..b], h, -1, j)
+
+# The id of the name of up to 7 bytes whose word is w, or -1.
+fn find_key(t: Ast, w: Int) -> Int:
+  if t.ht.len == 0: return -1
+  let mask = t.ht.len - 1
+  var j = key_hash(w) & mask
+  while true:
+    let found = t.ht[j]
+    if found < 0: return -1
+    if t.hw[found] == w: return found
+    j = (j + 1) & mask
+  return -1
+
+# Adds the name s (of up to 7 bytes, word w) that find_key didn't find.
+fn add_key(var t: Ast, own s: Str, w: Int) -> Int:
+  if t.names.len * 2 >= t.ht.len: grow_names(&t)
+  let h = key_hash(w)
+  let mask = t.ht.len - 1
+  var j = h & mask
+  while t.ht[j] >= 0: j = (j + 1) & mask
+  return add_name(&t, s, h, w, j)
+
+fn add_name(var t: Ast, own s: Str, h: Int, w: Int, j: Int) -> Int:
   let id = t.names.len
-  t.names.push(src[a..b])
+  t.names.push(s)
   t.hh.push(h)
+  t.hw.push(w)
   t.ht[j] = id
   return id
 
@@ -392,11 +452,9 @@ fn intern(var t: Ast, s: Str) -> Int:
     if found < 0: break
     if t.hh[found] == h and t.names[found] == s: return found
     j = (j + 1) & mask
-  let id = t.names.len
-  t.names.push(s + "")
-  t.hh.push(h)
-  t.ht[j] = id
-  return id
+  var w = -1
+  if s.len <= 7: w = short_key(s, 0, s.len)
+  return add_name(&t, s + "", h, w, j)
 
 fn node(var t: Ast, k: Int, pos: Int, end: Int, file: Int) -> Int:
   let id = t.nd.len
