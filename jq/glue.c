@@ -343,3 +343,14 @@ vu_str vjq_fread(void *p, int64_t n, int64_t *bad, int64_t nb) {
     free(buf);
     return r;
 }
+
+#include <sys/stat.h>
+/* bytes left in a regular file, or -1 */
+int64_t vjq_fleft(void *p) {
+    FILE *f = p;
+    struct stat sb;
+    if (fstat(fileno(f), &sb) != 0 || !S_ISREG(sb.st_mode)) return -1;
+    long pos = ftell(f);
+    if (pos < 0) return -1;
+    return (int64_t)sb.st_size - pos;
+}
