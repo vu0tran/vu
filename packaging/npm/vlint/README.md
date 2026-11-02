@@ -42,7 +42,8 @@ no JavaScript API (oxlint's `defineConfig` and JS plugins aren't there).
   span).
 - `eslint-disable` / `oxlint-disable` comments.
 - With no paths it lints the current folder. The exit code is 1 when there are errors (parse
-  errors; the default rules warn) and 0 otherwise.
+  errors; the default rules warn) or no files to lint, and 0 otherwise. Paths are printed as
+  oxlint prints them.
 - The CPU time: about the same as oxlint's on those corpora (measured on a loaded 2-core VM).
 
 ## What's not there yet
