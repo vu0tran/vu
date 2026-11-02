@@ -505,7 +505,7 @@ vu_str sc_read(const vu_str *name, const vu_str *os, int64_t use_cache) {
   if (is_stdin) fd = 0;
   else {
     char *c = vu_cstr(os);
-    if (!c) { sc_set_err(sc_ioe_n(name->data, name->len, "openBinaryFile", "invalid argument", "Invalid argument")); return vu_str_from("", 0); }
+    if (!c) { sc_set_err(sc_ioe_n(name->data, name->len, "openBinaryFile", "invalid argument", "FilePaths must not contain internal NUL code units.")); return vu_str_from("", 0); }
     do fd = open(c, O_RDONLY | O_NOCTTY | O_NONBLOCK); while (fd < 0 && errno == EINTR);
     free(c);
     if (fd < 0) { int e = errno; sc_set_err(sc_ioe_n(name->data, name->len, "openBinaryFile", sc_ghc_type(e), sc_musl_strerror(e))); return vu_str_from("", 0); }

@@ -189,6 +189,10 @@ def more():
         ('cli_xdg_trailing', {'x/shellcheckrc': 'disable=SC2086\n', 'f/a.sh': A}, [], {'XDG_CONFIG_HOME': '@/x//'}, {'sh': 'cd x && exec TOOL ../f/a.sh'}),
         # (with stdin closed, ShellCheck reads "-" from a descriptor of its own runtime and hangs)
         ('cli_stdin_dir', {'a.sh': A}, ['-', 'a.sh'], {}, {'sh': 'exec TOOL - a.sh < .'}),
+        ('cli_pty', {'a.sh': A, 'u.sh': U, 'b.sh': B}, [], {'TERM': 'xterm'}, {'sh': "script -qec 'TOOL a.sh nope.sh u.sh b.sh' /dev/null"}),
+        ('cli_pty_diff', {'a.sh': A, 'b.sh': B}, [], {'TERM': 'xterm'}, {'sh': "script -qec 'TOOL -f diff a.sh nope.sh b.sh' /dev/null"}),
+        ('cli_pty_dumb', {'a.sh': A}, [], {'TERM': 'dumb'}, {'sh': "script -qec 'TOOL a.sh' /dev/null"}),
+        ('cli_pty_C', {'a.sh': A, 'u.sh': U}, [], {'TERM': 'xterm', 'LC_ALL': 'C'}, {'sh': "script -qec 'TOOL a.sh u.sh a.sh' /dev/null"}),
         ('cli_stdout_full', {'a.sh': A}, ['a.sh'], {}, {'sh': 'exec TOOL a.sh > /dev/full'}),
         ('cli_stdout_full_json', {'a.sh': A}, ['-f', 'json', 'a.sh'], {}, {'sh': 'exec TOOL -f json a.sh > /dev/full'}),
         ('cli_stdout_full_version', {}, ['-V'], {}, {'sh': 'exec TOOL -V > /dev/full'}),
