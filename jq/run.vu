@@ -241,9 +241,15 @@ type It:
   out_w: Int        # bytes written to standard output so far
   gc_units: Int     # store growth inside a run before `inputs` compacts (VJQ_GC_UNITS, for tests)
   bom: Int           # jq's parser's BOM check over the whole input: 0-2 bytes of it seen, 3 done, 255 malformed
+  olog: [Int]        # containers owned by the running updates (array id * 2, object id * 2 + 1)
+  red_ok: [Int]      # per node: reduce bodies changing their state in place (see red_check)
+  red_n: [Int]       # the running in-place reduces, innermost last: node, owner
+  red_op: [Int]
+  acap: [Int]        # per array: room for its elements from ao (0: just its length), arrays an update owns
+  ocap: [Int]        # the same for objects
 
 fn new_it(ffi: Ffi, fs: Fs, os: Os) -> It:
-  return It(jv.new_store(), lang.new_ast(), ffi, fs, os, false, false, false, false, false, 65536, [], [], "", [], [], [], [], [], [], [], [], vnull(), false, 0, -1, 1, 1, [-1], [vnull()], [], [], -1, 0, "", 0, 0, 0, [], [], 0, 0, 0, 0, 0, 0, "", false, false, false, [], false, false, false, false, false, false, false, false, 0, vnull(), false, "<stdin>", [], [], [], vnull(), nat.ids(), nat_kinds(), [], [], [], [], 0, false, 0, regex.empty_uni(), [], [], [], [], [-1], 0, [-1], [], [], [], [], 0, 0, [], 0, 0, 0, 0, 0, false, [], 0, "", false, [], [], [], -1, ".", ".", false, 4096, 0, 4194304, 0)
+  return It(jv.new_store(), lang.new_ast(), ffi, fs, os, false, false, false, false, false, 65536, [], [], "", [], [], [], [], [], [], [], [], vnull(), false, 0, -1, 1, 1, [-1], [vnull()], [], [], -1, 0, "", 0, 0, 0, [], [], 0, 0, 0, 0, 0, 0, "", false, false, false, [], false, false, false, false, false, false, false, false, 0, vnull(), false, "<stdin>", [], [], [], vnull(), nat.ids(), nat_kinds(), [], [], [], [], 0, false, 0, regex.empty_uni(), [], [], [], [], [-1], 0, [-1], [], [], [], [], 0, 0, [], 0, 0, 0, 0, 0, false, [], 0, "", false, [], [], [], -1, ".", ".", false, 4096, 0, 4194304, 0, [], [], [], [], [], [])
 
 fn nat_kinds() -> [Int]:
   var ks: [Int] = []
@@ -385,6 +391,13 @@ fn track(var it: It):
   while it.aown.len < it.st.ao.len: it.aown.push(0)
   while it.oown.len < it.st.oo.len: it.oown.push(0)
 
+# Never owned by an update (so never changed in place): may be extended by a new view.
+fn unowned_a(it: It, id: Int) -> Bool:
+  return not (id < it.aown.len and it.aown[id] != 0)
+
+fn unowned_o(it: It, id: Int) -> Bool:
+  return not (id < it.oown.len and it.oown[id] != 0)
+
 fn num_add(var it: It, a: V, b: V) -> V:
   let ka = a.k & 15
   let kb = b.k & 15
@@ -392,22 +405,42 @@ fn num_add(var it: It, a: V, b: V) -> V:
   if ka == K_NULL: return b
   if kb == K_NULL: return a
   if ka == K_STR and kb == K_STR:
-    let start = it.st.b.len
     let ia = a.k >> 4
     let ib = b.k >> 4
     let oa = it.st.so[ia]
     let na = it.st.sl[ia] >> 2
     let ob = it.st.so[ib]
     let nb = it.st.sl[ib] >> 2
+    let f = it.st.sl[ia] & it.st.sl[ib] & 3
+    if oa + na == it.st.b.len and na > 0 and oa >= it.iend:
+      # a's bytes end the buffer: b's go after them (a stays a prefix), no copy of a
+      for i in ob..ob + nb: it.st.b.push(it.st.b[i])
+      return vstr(jv.add_span(&it.st, oa, na + nb, f))
+    let start = it.st.b.len
     for i in oa..oa + na: it.st.b.push(it.st.b[i])
     for i in ob..ob + nb: it.st.b.push(it.st.b[i])
-    let f = it.st.sl[ia] & it.st.sl[ib] & 3
     return vstr(jv.add_span(&it.st, start, na + nb, f))
   if ka == K_ARR and kb == K_ARR:
     let na = jv.alen(it.st, a)
     let nb = jv.alen(it.st, b)
     if nb == 0: return a
     if na == 0: return b
+    let ida = a.k >> 4
+    if it.st.ao[ida] + na == it.st.av.len and unowned_a(it, ida):
+      # a's elements end the store: b's go after them, a new array over both (a stays a prefix)
+      let oa = it.st.ao[ida]
+      for i in 0..nb: it.st.av.push(jv.aget(it.st, b, i))
+      let id = it.st.ao.len
+      it.st.ao.push(oa)
+      it.st.an.push(na + nb)
+      return varr(id)
+    let idb = b.k >> 4
+    if it.st.ao[ida] + na == it.st.ao[idb] and unowned_a(it, ida) and unowned_a(it, idb):
+      # b's elements right after a's (b was made after a): a new array over both
+      let id = it.st.ao.len
+      it.st.ao.push(it.st.ao[ida])
+      it.st.an.push(na + nb)
+      return varr(id)
     let start = it.st.tv.len
     for i in 0..na: it.st.tv.push(jv.aget(it.st, a, i))
     for i in 0..nb: it.st.tv.push(jv.aget(it.st, b, i))
@@ -416,6 +449,35 @@ fn num_add(var it: It, a: V, b: V) -> V:
     let start = it.st.tk.len
     let na = jv.olen(it.st, a)
     let nb = jv.olen(it.st, b)
+    let ida = a.k >> 4
+    let idb = b.k >> 4
+    if na > 0 and nb > 0 and it.st.oo[ida] + na == it.st.oo[idb] and unowned_o(it, ida) and unowned_o(it, idb):
+      # b's entries right after a's: a new object over both when b's keys are new
+      var fresh = true
+      for i in 0..nb:
+        if jv.ofind(it.st, a, jv.okey(it.st, b, i)) >= 0: fresh = false
+      if fresh:
+        let id = it.st.oo.len
+        it.st.oo.push(it.st.oo[ida])
+        it.st.on.push(na + nb)
+        jv.oextend(&it.st, ida, id)
+        return vobj(id)
+    if na > 0 and nb > 0 and it.st.oo[ida] + na == it.st.ok.len and unowned_o(it, ida):
+      # new keys after a's entries at the end of the store: a new object over them
+      var fresh = true
+      for i in 0..nb:
+        if jv.ofind(it.st, a, jv.okey(it.st, b, i)) >= 0: fresh = false
+      # (and b's own keys distinct: an object's keys are)
+      if fresh:
+        let oa = it.st.oo[ida]
+        for i in 0..nb:
+          it.st.ok.push(jv.okey(it.st, b, i))
+          it.st.ov.push(jv.oval(it.st, b, i))
+        let id = it.st.oo.len
+        it.st.oo.push(oa)
+        it.st.on.push(na + nb)
+        jv.oextend(&it.st, ida, id)
+        return vobj(id)
     for i in 0..na:
       it.st.tk.push(jv.okey(it.st, a, i))
       it.st.tw.push(jv.oval(it.st, a, i))
@@ -1203,6 +1265,14 @@ fn str_step(var it: It, n: Int, i: Int, v: V, env: Int, k: Int, chain: Int, p: I
   return s
 
 fn ev(var it: It, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
+  if p == -1 and n < it.red_ok.len and it.red_ok[n] >= 4 and it.ast.ns[n].k == lang.N_BIN and it.red_n.len > 0 and it.red_n[it.red_n.len - 1] == it.red_ok[n] - 4:
+    # `. + x`, a step of an in-place reduce
+    let nd = it.ast.ns[n]
+    let b = sev(&it, nd.b, v, env)
+    if it.bad: return bad_status(&it)
+    let r = add_owned(&it, v, b, it.red_op[it.red_op.len - 1])
+    if it.bad: return bad_status(&it)
+    return emit(&it, k, r, -1)
   if p == -1 and it.simple[n]:
     let r = sev(&it, n, v, env)
     if it.bad: return bad_status(&it)
@@ -1528,17 +1598,133 @@ fn bind_and_run(var it: It, n: Int, x: V, v: V, p: Int, env: Int, k: Int) -> Int
   it.fr.truncate(base)
   return s
 
+# A reduce whose body is a chain of updates of `.` (`.a.b[$k] += $v | .c |= . + 1`) that can't
+# keep a second reference to any part of the state changes the state in place: the containers
+# its updates copy stay owned by the reduce from one step to the next, as the only holder of
+# the state (jq's refcount of 1). The updates' right sides may not read `.` (`=`, `+=`, ...)
+# or read it once, in arithmetic only (`|=`); paths are fields and indexes of `.` by keys
+# that don't read it. Each update node is marked with its reduce (red_ok: 2 + reduce node).
+fn red_check(var it: It, n: Int) -> Bool:
+  while it.red_ok.len < it.ast.ns.len: it.red_ok.push(0)
+  if it.red_ok[n] == 0:
+    it.red_ok[n] = 1
+    if red_chain(it, it.ast.ns[n].d):
+      it.red_ok[n] = 3
+      red_mark(&it, it.ast.ns[n].d, n)
+  return it.red_ok[n] == 3
+
+fn red_mark(var it: It, x: Int, r: Int):
+  let nd = it.ast.ns[x]
+  if nd.k == lang.N_PIPE:
+    red_mark(&it, nd.a, r)
+    red_mark(&it, nd.b, r)
+  else: it.red_ok[x] = 4 + r
+
+fn red_chain(it: It, x: Int) -> Bool:
+  let nd = it.ast.ns[x]
+  if nd.k == lang.N_PIPE: return red_chain(it, nd.a) and red_chain(it, nd.b)
+  if nd.k == lang.N_BIN:
+    # `. + x` (as `. += x`)
+    return nd.x == lang.OP_ADD and it.ast.ns[nd.a].k == lang.N_ID and it.simple[nd.b] and red_dots(it, nd.b) == 0
+  if nd.k != lang.N_UPD or not red_path(it, nd.a): return false
+  if nd.x == lang.OP_UPDATE: return red_dots(it, nd.b) <= 1
+  return red_dots(it, nd.b) == 0
+
+# a + b, appending in place to a when op owns it (else to a copy that op then owns)
+fn add_owned(var it: It, a0: V, b: V, op: Int) -> V:
+  var a = a0
+  let ka = kind(a)
+  let kb = kind(b)
+  if ka == K_ARR and kb == K_ARR and jv.alen(it.st, a) > 0 and jv.alen(it.st, b) > 0:
+    if not owned_arr(it, a, op):
+      let s0 = it.st.tv.len
+      for i in 0..jv.alen(it.st, a):
+        let _h1 = jv.aget(it.st, a, i)
+        it.st.tv.push(_h1)
+      a = jv.end_arr(&it.st, s0)
+      own_arr(&it, a, op)
+    let nb = jv.alen(it.st, b)
+    let id = a.k >> 4
+    let na = it.st.an[id]
+    arr_room(&it, id, na + nb)
+    let o = it.st.ao[id]
+    for i in 0..nb:
+      let _h2 = jv.aget(it.st, b, i)
+      it.st.av[o + na + i] = _h2
+    it.st.an[id] = na + nb
+    return a
+  if ka == K_OBJ and kb == K_OBJ and jv.olen(it.st, a) > 0 and jv.olen(it.st, b) > 0:
+    if not owned_obj(it, a, op):
+      let s0 = it.st.tk.len
+      for i in 0..jv.olen(it.st, a):
+        let _h3 = jv.okey(it.st, a, i)
+        it.st.tk.push(_h3)
+        let _h4 = jv.oval(it.st, a, i)
+        it.st.tw.push(_h4)
+      a = end_obj_nodup(&it, s0)
+      own_obj(&it, a, op)
+    for i in 0..jv.olen(it.st, b):
+      let kid = jv.okey(it.st, b, i)
+      let x = jv.oval(it.st, b, i)
+      a = set_key(&it, a, vstr(kid), x, op)
+    return a
+  return binop(&it, lang.OP_ADD, a, b)
+
+fn red_path(it: It, x: Int) -> Bool:
+  let nd = it.ast.ns[x]
+  if nd.k == lang.N_ID: return true
+  if nd.k == lang.N_FIELD: return red_path(it, nd.a)
+  if nd.k == lang.N_INDEX: return red_path(it, nd.a) and red_dots(it, nd.b) == 0
+  return false
+
+# How many times x reads `.` when it is a plain value expression (variables, literals,
+# arithmetic, strings, constructors of those; a constructor may not hold `.`); 99: not one.
+fn red_dots(it: It, x: Int) -> Int:
+  if x < 0: return 0
+  let nd = it.ast.ns[x]
+  let k = nd.k
+  if k == lang.N_ID: return 1
+  if k == lang.N_LIT or k == lang.N_VAR: return 0
+  if k == lang.N_NEG: return red_dots(it, nd.a)
+  if k == lang.N_BIN: return red_dots(it, nd.a) + red_dots(it, nd.b)
+  if k == lang.N_FIELD:
+    if it.ast.ns[nd.a].k == lang.N_ID: return 99
+    return red_dots(it, nd.a)
+  if k == lang.N_INDEX:
+    if it.ast.ns[nd.a].k == lang.N_ID: return 99
+    return red_dots(it, nd.a) + red_dots(it, nd.b)
+  if k == lang.N_STR or k == lang.N_ARR or k == lang.N_OBJ:
+    var t = 0
+    if k == lang.N_ARR: t = red_dots(it, nd.a)
+    else:
+      var m = nd.c
+      if k == lang.N_OBJ: m = 2 * nd.c
+      for i in 0..m: t += red_dots(it, it.ast.kids[nd.b + i])
+    if t > 0 and k != lang.N_STR: return 99
+    return t
+  return 99
+
 # reduce and foreach, as jq runs them: the init's path steps count (it isn't a subexpression),
 # then the source runs on the input with the path the init left; the body runs on the state with
 # the path the source left; the result of reduce is checked against the init's path.
 fn reduce_run(var it: It, n: Int, v: V, env: Int, k: Int, init: V, pinit: Int) -> Int:
   let nd = it.ast.ns[n]
+  let inplace = pinit == -1 and red_check(&it, n)
+  let rl = it.olog.len
+  if inplace:
+    it.red_n.push(n)
+    let _h0 = new_owner(&it)
+    it.red_op.push(_h0)
   let k2 = kpush(&it, K_REDSRC, n, env, k)
   it.ks[k2].w = init
   let rp_ = vp(&it, pinit, v, init)
   let s = ev(&it, nd.a, v, rp_, env, k2)
   let acc = it.ks[k2].w
   it.ks.truncate(k2)
+  if inplace:
+    it.red_n.pop()
+    it.red_op.pop()
+    disown(&it, rl)
   if s != ST_OK: return s
   let rp2_ = vp(&it, pinit, acc, init)
   return emit(&it, k, acc, rp2_)
@@ -1731,6 +1917,63 @@ fn getpath(var it: It, t: V, path: V) -> V:
     if it.bad: return vnull()
   return cur
 
+# getpath and setpath with the path p (its array is path, or null for a one-key path)
+fn get1(var it: It, t: V, key: V) -> V:
+  if kind(t) == K_NULL:
+    let kk = kind(key)
+    if kk == K_STR or kk == K_NUM or kk == K_LIT or kk == K_OBJ: return t
+    return sfail(&it, "Cannot index null with " + kname(key))
+  return index_val(&it, t, key)
+
+fn setp(var it: It, t: V, p: Int, path: V, val: V, op: Int) -> V:
+  if kind(path) == K_ARR: return setpath(&it, t, path, 0, val, op)
+  let key = it.pk[p]
+  let _ = index_val(&it, t, key)
+  if it.bad: return vnull()
+  if kind(key) == K_OBJ: return set_slice(&it, t, key, val)
+  return set_key(&it, t, key, val, op)
+
+# Makes room for m elements in array id (owned by the running operation: no other value has
+# its elements): in place when they end the store or fit its room, else moved to the end of
+# the store with room for twice as many (appends one at a time stay linear).
+fn arr_room(var it: It, id: Int, m: Int):
+  let o = it.st.ao[id]
+  let n = it.st.an[id]
+  if o + n == it.st.av.len:
+    for i in n..m: it.st.av.push(vnull())
+    return
+  if id < it.acap.len and it.acap[id] >= m: return
+  let o2 = it.st.av.len
+  for i in 0..n:
+    let x = it.st.av[o + i]
+    it.st.av.push(x)
+  for i in n..2 * m: it.st.av.push(vnull())
+  it.st.ao[id] = o2
+  while it.acap.len <= id: it.acap.push(0)
+  it.acap[id] = 2 * m
+
+fn obj_room(var it: It, id: Int, m: Int):
+  let o = it.st.oo[id]
+  let n = it.st.on[id]
+  if o + n == it.st.ok.len:
+    for i in n..m:
+      it.st.ok.push(0)
+      it.st.ov.push(vnull())
+    return
+  if id < it.ocap.len and it.ocap[id] >= m: return
+  let o2 = it.st.ok.len
+  for i in 0..n:
+    let x = it.st.ok[o + i]
+    it.st.ok.push(x)
+    let y = it.st.ov[o + i]
+    it.st.ov.push(y)
+  for i in n..2 * m:
+    it.st.ok.push(0)
+    it.st.ov.push(vnull())
+  it.st.oo[id] = o2
+  while it.ocap.len <= id: it.ocap.push(0)
+  it.ocap[id] = 2 * m
+
 fn owned_arr(it: It, v: V, op: Int) -> Bool:
   let id = v.k >> 4
   return id < it.aown.len and it.aown[id] == op
@@ -1777,6 +2020,36 @@ fn set_key(var it: It, t: V, key: V, val: V, op: Int) -> V:
       if pos >= 0:
         it.st.ov[it.st.oo[t.k >> 4] + pos] = val
         return t
+      let tid = t.k >> 4
+      if true:
+        # a new key of an object this operation owns: added in place
+        let n0 = it.st.on[tid]
+        obj_room(&it, tid, n0 + 1)
+        let o = it.st.oo[tid]
+        it.st.ok[o + n0] = kid
+        it.st.ov[o + n0] = val
+        let nn2 = n0 + 1
+        it.st.on[tid] = nn2
+        if nn2 == jv.OIX_MIN + 1: jv.oindex(&it.st, tid)
+        elif nn2 > jv.OIX_MIN + 1:
+          if tid < it.st.oix_at.len and it.st.oix_at[tid] >= 0:
+            let at = it.st.oix_at[tid]
+            if 2 * nn2 + 2 > it.st.oix[at] + 1: jv.oindex(&it.st, tid)
+            else: jv.oindex_add(&it.st, at, kid, nn2 - 1)
+          else:
+            jv.oindex(&it.st, tid)
+        return t
+    let tid0 = t.k >> 4
+    if pos < 0 and it.st.oo[tid0] + it.st.on[tid0] == it.st.ok.len and unowned_o(it, tid0):
+      # a new key after t's entries at the end of the store: a new object over them (not
+      # owned: t shares its entries)
+      it.st.ok.push(kid)
+      it.st.ov.push(val)
+      let id = it.st.oo.len
+      it.st.oo.push(it.st.oo[tid0])
+      it.st.on.push(it.st.on[tid0] + 1)
+      jv.oextend(&it.st, tid0, id)
+      return vobj(id)
     let start = it.st.tk.len
     let nn = jv.olen(it.st, t)
     for i in 0..nn:
@@ -1802,7 +2075,24 @@ fn set_key(var it: It, t: V, key: V, val: V, op: Int) -> V:
     if tk == K_ARR and idx < len and op != 0 and owned_arr(it, t, op):
       it.st.av[it.st.ao[t.k >> 4] + idx] = val
       return t
+    if tk == K_ARR and idx >= len and idx <= 100000000 and op != 0 and owned_arr(it, t, op):
+      # past the end of an array this operation owns: grown in place
+      let tid = t.k >> 4
+      arr_room(&it, tid, idx + 1)
+      let o = it.st.ao[tid]
+      for i in len..idx: it.st.av[o + i] = vnull()
+      it.st.av[o + idx] = val
+      it.st.an[tid] = idx + 1
+      return t
     if idx > 100000000: return sfail(&it, "Array index too large")
+    if tk == K_ARR and idx >= len and it.st.ao[t.k >> 4] + len == it.st.av.len and unowned_a(it, t.k >> 4):
+      # past the end of t, its elements at the end of the store: a new array over them
+      for i in len..idx: it.st.av.push(vnull())
+      it.st.av.push(val)
+      let id = it.st.ao.len
+      it.st.ao.push(it.st.ao[t.k >> 4])
+      it.st.an.push(idx + 1)
+      return varr(id)
     let start = it.st.tv.len
     for i in 0..len:
       if i == idx: it.st.tv.push(val)
@@ -1824,11 +2114,27 @@ fn own_arr(var it: It, a: V, op: Int):
   if op == 0: return
   track(&it)
   it.aown[a.k >> 4] = op
+  if a.k >> 4 < it.acap.len: it.acap[a.k >> 4] = 0
+  it.olog.push((a.k >> 4) * 2)
 
 fn own_obj(var it: It, o: V, op: Int):
   if op == 0: return
   track(&it)
   it.oown[o.k >> 4] = op
+  if o.k >> 4 < it.ocap.len: it.ocap[o.k >> 4] = 0
+  it.olog.push((o.k >> 4) * 2 + 1)
+
+# An update is over: what it owned is an ordinary value again (may be extended by new views).
+fn disown(var it: It, from: Int):
+  var i = it.olog.len - 1
+  while i >= from:
+    let e = it.olog[i]
+    let id = e >> 1
+    if e & 1 == 0:
+      if id < it.aown.len: it.aown[id] = 0
+    elif id < it.oown.len: it.oown[id] = 0
+    i -= 1
+  it.olog.truncate(from)
 
 fn set_slice(var it: It, t: V, key: V, val: V) -> V:
   var arr = t
@@ -1960,7 +2266,13 @@ fn ev_update(var it: It, n: Int, v: V, p: Int, env: Int, k: Int) -> Int:
 fn update_run(var it: It, n: Int, v: V, p: Int, env: Int, k: Int, rhs: V) -> Int:
   let nd = it.ast.ns[n]
   let tracked = p != -1 and nd.x != lang.OP_SET
-  let op = new_owner(&it)
+  var op = 0
+  var ol = it.olog.len
+  if p == -1 and n < it.red_ok.len and it.red_ok[n] >= 4 and it.red_n.len > 0 and it.red_n[it.red_n.len - 1] == it.red_ok[n] - 4:
+    # a step of an in-place reduce: its containers stay owned (until the reduce ends)
+    op = it.red_op[it.red_op.len - 1]
+    ol = -1
+  else: op = new_owner(&it)
   let d = it.dels.len
   it.dels.push([])
   let k2 = kpush(&it, K_UPDPATH, n, env, k)
@@ -1977,6 +2289,7 @@ fn update_run(var it: It, n: Int, v: V, p: Int, env: Int, k: Int, rhs: V) -> Int
   var dl: [V] = []
   swap(&dl, &it.dels[d])
   it.dels.pop()
+  if ol >= 0: disown(&it, ol)
   if s != ST_OK: return s
   let start = it.st.tv.len
   for x in dl: it.st.tv.push(x)
@@ -2002,19 +2315,27 @@ fn update_path(var it: It, k: Int, kf: Kf, x: V, p: Int) -> Int:
     let d = trunc_dump(&it, x, 30)
     return rfail(&it, "Invalid path expression with result " + d)
   let nd = it.ast.ns[kf.n]
-  let path = path_arr(&it, p)
+  # a one-key path isn't made into an array (it would sit after the values an update grows)
+  let one = p > 0 and it.pp[p] <= 0
+  var path = vnull()
+  if not one: path = path_arr(&it, p)
   var root = it.ks[k].v
   var op = kf.i
   if nd.x == lang.OP_SET:
-    let r = setpath(&it, root, path, 0, kf.w, op)
+    let r = setp(&it, root, p, path, kf.w, op)
     if it.bad: return bad_status(&it)
     it.ks[k].v = r
     return ST_OK
-  let cur = getpath(&it, root, path)
+  var cur = vnull()
+  if one:
+    let k1 = it.pk[p]
+    cur = get1(&it, root, k1)
+  else: cur = getpath(&it, root, path)
   if it.bad: return bad_status(&it)
   # the update sees cur: if this operation made it, it must not change in place any more
   let ck = kind(cur)
-  if (ck == K_ARR and owned_arr(it, cur, op)) or (ck == K_OBJ and owned_obj(it, cur, op)):
+  # (`=`, `+=`, `//=` ... don't keep cur's parts twice: their result replaces it)
+  if nd.x == lang.OP_UPDATE and ((ck == K_ARR and owned_arr(it, cur, op)) or (ck == K_OBJ and owned_obj(it, cur, op))):
     op = new_owner(&it)
     it.ks[k].i = op
   var nv = vnull()
@@ -2031,22 +2352,42 @@ fn update_path(var it: It, k: Int, kf: Kf, x: V, p: Int) -> Int:
     it.ks.truncate(k2)
     if s == ST_BREAK and it.brk == id:
       let _h13 = it.ks[k].v
-      let r = setpath(&it, _h13, path, 0, nv, op)
+      let r = setp(&it, _h13, p, path, nv, op)
       if it.bad: return bad_status(&it)
       it.ks[k].v = r
       return ST_OK
     if s != ST_OK: return s
     # no output: the path is deleted at the end
+    if one: path = path_arr(&it, p)
     it.dels[kf.j].push(path)
     return ST_OK
   if nd.x == lang.OP_ALTSET:
     if truthy(cur): nv = cur
     else: nv = kf.w
+  elif nd.x == lang.OP_ADD and ck == K_ARR and kind(kf.w) == K_ARR and op != 0 and jv.alen(it.st, kf.w) > 0 and jv.alen(it.st, cur) > 0:
+    # += of arrays appends in place to a copy this operation owns (kept by a reduce's steps)
+    let nb = jv.alen(it.st, kf.w)
+    if not owned_arr(it, cur, op):
+      let s0 = it.st.tv.len
+      for i in 0..jv.alen(it.st, cur):
+        let _h16 = jv.aget(it.st, cur, i)
+        it.st.tv.push(_h16)
+      cur = jv.end_arr(&it.st, s0)
+      own_arr(&it, cur, op)
+    let cid = cur.k >> 4
+    let na = it.st.an[cid]
+    arr_room(&it, cid, na + nb)
+    let o = it.st.ao[cid]
+    for i in 0..nb:
+      let _h15 = jv.aget(it.st, kf.w, i)
+      it.st.av[o + na + i] = _h15
+    it.st.an[cid] = na + nb
+    nv = cur
   else:
     nv = binop(&it, nd.x, cur, kf.w)
     if it.bad: return bad_status(&it)
   let _h14 = it.ks[k].v
-  let r = setpath(&it, _h14, path, 0, nv, op)
+  let r = setp(&it, _h14, p, path, nv, op)
   if it.bad: return bad_status(&it)
   it.ks[k].v = r
   return ST_OK

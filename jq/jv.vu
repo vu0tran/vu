@@ -73,6 +73,9 @@ type St:
   colors: [Str]      # escape sequences: null, false, true, numbers, strings, arrays, objects, keys
   lit_ok: Bool       # keep number literals (on unless --no-literals)
   nanv: V
+  oix_at: [Int]      # big objects (more than OIX_MIN keys): where their key index is in oix (-1 none)
+  oix: [Int]         # key indexes: a mask, then slots holding an entry's position + 1 (0 empty)
+  mix: Int           # (mark)
   maxdepth: Int      # jq's parser stack limit (256: an array takes one place, an object two
                      # while a value of it is read); its streaming parser has none
   keepdups: Bool     # keep repeated keys (--stream: the streaming parser sends each)
@@ -80,7 +83,7 @@ type St:
                      # id (in V.k above the kind), as each of jq's literal numbers is its own value
 
 fn new_store() -> St:
-  var st = St(b: [], so: [], sl: [], knext: [], heads: [0] * 1024, hmask: 1023, nint: 0, ilog: [], av: [], ao: [], an: [], ok: [], ov: [], oo: [], on: [], tv: [], tk: [], tw: [], seen: [], seenat: [], stamp: 1, mb: 0, ms: 0, mav: 0, ma: 0, mok: 0, mo: 0, mil: 0, pp: 0, pend: 0, perr: "", pline: 1, plinestart: 0, depth: 0, out: [], indent: 2, tab: false, sortkeys: false, ascii: false, color: false, colors: [], lit_ok: true, nanv: V(K_NUM, 0.0 / 0.0), maxdepth: 256, keepdups: false, numid: 0)
+  var st = St(b: [], so: [], sl: [], knext: [], heads: [0] * 1024, hmask: 1023, nint: 0, ilog: [], av: [], ao: [], an: [], ok: [], ov: [], oo: [], on: [], tv: [], tk: [], tw: [], seen: [], seenat: [], stamp: 1, mb: 0, ms: 0, mav: 0, ma: 0, mok: 0, mo: 0, mil: 0, pp: 0, pend: 0, perr: "", pline: 1, plinestart: 0, depth: 0, out: [], indent: 2, tab: false, sortkeys: false, ascii: false, color: false, colors: [], lit_ok: true, nanv: V(K_NUM, 0.0 / 0.0), oix_at: [], oix: [], mix: 0, maxdepth: 256, keepdups: false, numid: 0)
   for i in 0..1024: st.heads[i] = -1
   return st
 
@@ -129,11 +132,12 @@ fn set_mark(var st: St):
   st.mok = st.ok.len
   st.mo = st.oo.len
   st.mil = st.ilog.len
+  st.mix = st.oix.len
 
 # Where the store ends now (for undo_to): bytes, strings, array elements, arrays, object
 # entries, objects, interned keys.
 fn ends(st: St) -> [Int]:
-  return [st.b.len, st.so.len, st.av.len, st.ao.len, st.ok.len, st.oo.len, st.ilog.len]
+  return [st.b.len, st.so.len, st.av.len, st.ao.len, st.ok.len, st.oo.len, st.ilog.len, st.oix.len]
 
 # Drops everything made since ends() gave e (a parse attempt that needs more input).
 fn undo_to(var st: St, e: [Int]):
@@ -159,6 +163,8 @@ fn undo_to(var st: St, e: [Int]):
   st.ov.truncate(e[4])
   st.oo.truncate(e[5])
   st.on.truncate(e[5])
+  if st.oix_at.len > e[5]: st.oix_at.truncate(e[5])
+  st.oix.truncate(e[7])
 
 fn reset(var st: St):
   # un-intern the keys made since the mark, newest first: each is the head of its chain
@@ -184,6 +190,8 @@ fn reset(var st: St):
   st.ov.truncate(st.mok)
   st.oo.truncate(st.mo)
   st.on.truncate(st.mo)
+  if st.oix_at.len > st.mo: st.oix_at.truncate(st.mo)
+  st.oix.truncate(st.mix)
 
 # ---------------------------------------------------------------- strings
 
@@ -442,13 +450,64 @@ fn oval(st: St, v: V, i: Int) -> V:
   return st.ov[st.oo[v.k >> 4] + i]
 
 # The position of key (an interned id) in object v, or -1.
+const OIX_MIN = 48
+
 fn ofind(st: St, v: V, key: Int) -> Int:
   let id = v.k >> 4
   let o = st.oo[id]
   let n = st.on[id]
+  if n > OIX_MIN and id < st.oix_at.len and st.oix_at[id] >= 0:
+    # a big object's key index (open addressing by the key's id)
+    let at = st.oix_at[id]
+    let mask = st.oix[at]
+    var h = ((key *% -7046029254386353131) >>> 20) & mask
+    while true:
+      let e = st.oix[at + 1 + h]
+      if e == 0: return -1
+      if st.ok[o + e - 1] == key:
+        # (the index may be shared with longer objects over the same entries)
+        if e - 1 < n: return e - 1
+        return -1
+      h = (h + 1) & mask
   for i in 0..n:
     if st.ok[o + i] == key: return i
   return -1
+
+# Builds the key index of object id when it is big.
+fn oindex(var st: St, id: Int):
+  let n = st.on[id]
+  if n <= OIX_MIN: return
+  while st.oix_at.len <= id: st.oix_at.push(-1)
+  var size = 1
+  while size < 2 * n + 2: size *= 2
+  let at = st.oix.len
+  st.oix.push(size - 1)
+  for i in 0..size: st.oix.push(0)
+  st.oix_at[id] = at
+  let o = st.oo[id]
+  for i in 0..n: oindex_add(&st, at, st.ok[o + i], i)
+
+# Object id was made over the entries of object old and more after them: it shares old's
+# index when that has room (entries past an object's length aren't its own).
+fn oextend(var st: St, old: Int, id: Int):
+  let n = st.on[id]
+  if n <= OIX_MIN: return
+  let n0 = st.on[old]
+  if old < st.oix_at.len and st.oix_at[old] >= 0 and n0 > OIX_MIN:
+    let at = st.oix_at[old]
+    if 2 * n + 2 <= st.oix[at] + 1:
+      while st.oix_at.len <= id: st.oix_at.push(-1)
+      st.oix_at[id] = at
+      let o = st.oo[id]
+      for i in n0..n: oindex_add(&st, at, st.ok[o + i], i)
+      return
+  oindex(&st, id)
+
+fn oindex_add(var st: St, at: Int, key: Int, pos: Int):
+  let mask = st.oix[at]
+  var h = ((key *% -7046029254386353131) >>> 20) & mask
+  while st.oix[at + 1 + h] != 0: h = (h + 1) & mask
+  st.oix[at + 1 + h] = pos + 1
 
 fn mark_seen(var st: St):
   while st.seen.len < st.so.len:
@@ -488,6 +547,7 @@ fn end_obj(var st: St, start: Int) -> V:
     st.ov.push(st.tw[i])
   st.tk.truncate(start)
   st.tw.truncate(start)
+  if m > OIX_MIN: oindex(&st, id)
   return vobj(id)
 
 fn dedup(var st: St, start: Int):
