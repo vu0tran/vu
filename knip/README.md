@@ -180,6 +180,11 @@ its `.gitignore` matching.
 
 ## Tests
 
+The corpus (repositories and commits) is listed in `test/corpus.txt`; dependencies were installed with
+`pnpm install --ignore-scripts`, which also adds a `pnpm-lock.yaml` (so knip enables its pnpm plugin
+there, and vknip too).
+
+
 `test/` has the scripts: `run_cases.py` writes the generated projects and saves knip's output
 (`KNIP=.../knip/bin/knip.js CASES=cases.py python3 run_cases.py OUT REF`), `cmp_cases.sh` compares
 vknip with it, `parity.py` and `catdiff.py` compare real projects per issue type, `bench.py` times
