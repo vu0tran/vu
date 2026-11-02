@@ -2138,7 +2138,52 @@ fn seq_errors(var it: It, upto: Int) -> Bool:
     eprint("jq: ignoring parse error: " + m)
   return false
 
+# The next input; with --stream, the next event (jq's streaming parser's events: those of a
+# value with a parse error come before the error).
 fn read_input(var it: It) -> V:
+  if not it.stream: return read_value(&it)
+  while true:
+    if it.sq_i < it.sq.len:
+      let e = it.sq[it.sq_i]
+      it.sq_i += 1
+      return e
+    it.sq.truncate(0)
+    it.sq_i = 0
+    if it.sq_err != "":
+      let em = it.sq_err + ""
+      it.ierr = em
+      it.sq_err = ""
+      return sfail(&it, em)
+    let v = read_value(&it)
+    if it.bad:
+      if it.ierr == "": return v
+      it.bad = false
+      var evs: [V] = []
+      var ep: [V] = []
+      let m = stream_replay(&it, it.ierr_at, it.iend, it.ierr_line, it.ierr_col, &evs, &ep)
+      var msg = it.ierr + ""
+      if m != "": msg = m
+      it.ierr = ""
+      for e in evs: it.sq.push(e)
+      if it.stream_errors:
+        # the error is an event too, and reading goes on after it
+        let msv = jv.new_str(&it.st, msg)
+        let ev = mkarr(&it, [msv, ep[0]])
+        it.sq.push(ev)
+      else:
+        it.sq_err = msg
+      continue
+    var path: [V] = []
+    var evs: [V] = []
+    stream_events(&it, v, &path, &evs)
+    for e in evs: it.sq.push(e)
+  return vnull()
+
+# Whether --stream events of the last value are still waiting (the store keeps them).
+fn events_pending(it: It) -> Bool:
+  return it.stream and (it.sq_i < it.sq.len or it.sq_err != "")
+
+fn read_value(var it: It) -> V:
   if it.collect: return sfail(&it, "break")
   it.iread = true
   if it.stdin_pending:
@@ -2214,12 +2259,16 @@ fn read_input(var it: It) -> V:
     var m = jv.json_error(it.st, vs, it.iend, vline, vcol)
     if m == "": m = it.st.perr + " at line {vline}, column {vcol}"
     it.ierr = m
+    it.ierr_at = vs
+    it.ierr_line = vline
+    it.ierr_col = vcol
     # jq has read (by lines) up to the end of the line where it found the error
     var le = it.st.pp
     while le < it.iend and it.st.b[le] != '\n': le += 1
     if le < it.iend: le += 1
     it.ivend = le
-    it.ipos = it.iend
+    # jq drops the rest of the piece it was parsing: what follows (the next line) can still be read
+    it.ipos = le
     return sfail(&it, m)
   # jq's parser takes a scalar at the byte after it (a delimiter), a string or container at its end
   var consumed = it.st.pp
@@ -2356,6 +2405,211 @@ fn stream_events(var it: It, v: V, var path: [V], var out: [V]):
   let pa = mkarr(&it, path)
   path.pop()
   out.push(mkarr(&it, [pa]))
+
+# --stream on input with a parse error: jq's streaming parser (jv_parse.c's stream_token) has
+# handed out the events before the error, and words some errors its own way. This replays it on
+# b[vs..end] (where the bad value starts, at line, column): the events into out; returns the
+# message ("" if none), and the path at the error in errpath[0].
+fn stream_replay(var it: It, vs: Int, end: Int, line0: Int, col0: Int, var out: [V], var errpath: [V]) -> Str:
+  var path: [V] = []
+  var last = 0          # 0 none, 1 open array, 2 open object, 3 colon, 4 comma, 5 value
+  var next = vnull()
+  var has_next = false
+  var line = line0
+  var col = col0
+  var tok = -1          # where a literal token starts (-1 none)
+  var i = vs
+  var instr = false
+  var sstart = 0
+  var esc = false
+  var err = ""
+  var last_ev = -1
+  while i < end:
+    let ch = it.st.b[i]
+    col += 1
+    if ch == '\n':
+      line += 1
+      col = 0
+    if instr:
+      if ch == '"' and not esc:
+        instr = false
+        let m = jv.json_error(it.st, sstart, i + 1, line, col - (i + 1 - sstart))
+        if m != "":
+          err = m
+          break
+        it.st.pp = sstart
+        it.st.pend = i + 1
+        it.st.perr = ""
+        let sv0 = jv.parse_value(&it.st)
+        if has_next or last == 5:
+          err = "Expected separator between values at line {line}, column {col}"
+          break
+        if path.len > 0: last = 5
+        else: last = 0
+        next = sv0
+        has_next = true
+        if path.len == 0:
+          last_ev = i
+          out.push(ev_leaf(&it, path, next))
+          has_next = false
+      elif ch == '\\' and not esc:
+        esc = true
+      else:
+        esc = false
+      i += 1
+      continue
+    let ws = ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n'
+    let structure = ch == '[' or ch == ',' or ch == ']' or ch == '{' or ch == ':' or ch == '}'
+    if ch == '"' or ws or structure:
+      if tok >= 0:
+        let m = jv.literal_error(it.st, tok, i)
+        if m != "":
+          err = m + " at line {line}, column {col}"
+          break
+        it.st.pp = tok
+        it.st.pend = i
+        it.st.perr = ""
+        let lv = jv.parse_value(&it.st)
+        tok = -1
+        if has_next or last == 5:
+          err = "Expected separator between values at line {line}, column {col}"
+          break
+        if path.len > 0: last = 5
+        else: last = 0
+        next = lv
+        has_next = true
+        if path.len == 0:
+          last_ev = i
+          out.push(ev_leaf(&it, path, next))
+          has_next = false
+    if ch == '"':
+      instr = true
+      sstart = i
+      esc = false
+    elif structure:
+      var m = ""
+      let top = path.len - 1
+      if ch == '[':
+        if has_next: m = "Expected a separator between values"
+        elif last == 2: m = "Expected string key after '{{', not '['"
+        elif last == 4 and kind(path[top]) != K_NUM: m = "Expected string key after ',' in object, not '['"
+        else:
+          path.push(vint(0))
+          last = 1
+      elif ch == '{':
+        if last == 5: m = "Expected a separator between values"
+        elif last == 2: m = "Expected string key after '{{', not '{{'"
+        elif last == 4 and kind(path[top]) != K_NUM: m = "Expected string key after ',' in object, not '{{'"
+        else:
+          path.push(vnull())
+          last = 2
+      elif ch == ':':
+        if path.len == 0 or kind(path[top]) == K_NUM: m = "':' not as part of an object"
+        elif not has_next or last == 0: m = "Expected string key before ':'"
+        elif kind(next) != K_STR: m = "Object keys must be strings"
+        elif last != 5: m = "':' should follow a key"
+        else:
+          last = 3
+          path[top] = next
+          has_next = false
+      elif ch == ',':
+        if last != 5: m = "Expected value before ','"
+        elif path.len == 0: m = "',' not as part of an object or array"
+        else:
+          let k = kind(path[top])
+          if k == K_NUM:
+            if has_next:
+              last_ev = i
+              out.push(ev_leaf(&it, path, next))
+              has_next = false
+            path[top] = vint(int(path[top].n) + 1)
+            last = 4
+          elif k == K_STR:
+            if has_next:
+              last_ev = i
+              out.push(ev_leaf(&it, path, next))
+              has_next = false
+            path[top] = vnull()
+            last = 4
+          else:
+            m = "Objects must consist of key:value pairs"
+      elif ch == ']':
+        if path.len == 0: m = "Unmatched ']' at the top-level"
+        elif last == 4: m = "Expected another array element"
+        elif kind(path[top]) != K_NUM: m = "Unmatched ']' in the middle of an object"
+        else:
+          if has_next:
+            last_ev = i
+            out.push(ev_leaf(&it, path, next))
+            has_next = false
+            last_ev = i
+            out.push(ev_end(&it, path))
+          elif last != 1:
+            last_ev = i
+            out.push(ev_end(&it, path))
+          let was_open = last == 1
+          path.pop()
+          if was_open:
+            let ea = mkarr(&it, [])
+            last_ev = i
+            out.push(ev_leaf(&it, path, ea))
+          if path.len == 0: last = 0
+          else: last = 5
+      else:
+        if path.len == 0: m = "Unmatched '}}' at the top-level"
+        elif last == 4: m = "Expected another key:value pair"
+        elif kind(path[top]) == K_NUM: m = "Unmatched '}}' in the middle of an array"
+        elif has_next:
+          if kind(path[top]) != K_STR: m = "Objects must consist of key:value pairs"
+          else:
+            last_ev = i
+            out.push(ev_leaf(&it, path, next))
+            has_next = false
+            last_ev = i
+            out.push(ev_end(&it, path))
+        elif last == 3: m = "Missing value in key:value pair"
+        elif last == 1: m = "Unmatched '}}' in the middle of an array"
+        elif last != 5 and last != 2: m = "Unmatched '}}'"
+        elif last != 2:
+          last_ev = i
+          out.push(ev_end(&it, path))
+        if m == "":
+          let was_open = last == 2
+          path.pop()
+          if was_open:
+            let s0 = it.st.tk.len
+            let eo = jv.end_obj(&it.st, s0)
+            last_ev = i
+            out.push(ev_leaf(&it, path, eo))
+          if path.len == 0: last = 0
+          else: last = 5
+      if m != "":
+        err = m + " at line {line}, column {col}"
+        break
+    elif not ws:
+      if tok < 0: tok = i
+    i += 1
+  if err == "":
+    if instr: err = "Unfinished string at EOF at line {line}, column {col}"
+    elif tok >= 0:
+      let m = jv.literal_error(it.st, tok, end)
+      if m != "": err = m + " at EOF at line {line}, column {col}"
+      elif path.len != 0: err = "Unfinished JSON term at EOF at line {line}, column {col}"
+    elif path.len != 0:
+      err = "Unfinished JSON term at EOF at line {line}, column {col}"
+  let ep = mkarr(&it, path)
+  errpath.push(ep)
+  # an event handed out at the last byte: jq's next read found the end and closed the input
+  if last_ev == end - 1 and err.find(" at EOF at line ") >= 0: it.ieof_n = 2
+  return err
+
+fn ev_leaf(var it: It, path: [V], v: V) -> V:
+  let pa = mkarr(&it, path)
+  return mkarr(&it, [pa, v])
+
+fn ev_end(var it: It, path: [V]) -> V:
+  let pa = mkarr(&it, path)
+  return mkarr(&it, [pa])
 
 fn passes_input(var it: It, id: Int) -> Bool:
   let I = it.nid
