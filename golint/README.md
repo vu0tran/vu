@@ -94,9 +94,11 @@ The per-linter and same-text limits keep the first issues in golangci-lint's pro
 which vgolint reproduces as golangci-lint has it with a warm cache: packages in `go list -deps
 -test` order (untested packages by dependencies, then each tested package's test variant and
 external test package), then linter by linter (those with their own reporters first), each in its
-report order (errcheck's sorted by file name). Cold golangci-lint runs order issues by which
-package finishes first, so their limited output differs from run to run; and some analyzers
-(staticcheck's ST1006) report in map order.
+report order (errcheck's sorted by file name). golangci-lint itself isn't deterministic here:
+a cold run orders packages by which finishes first, a warm one by iterating a Go map of packages
+(`loadIssuesFromCache`), and some analyzers (staticcheck's ST1006, unconvert) report in map order,
+so where the limits cut across packages its own output changes from run to run. Without limits
+(or where they don't cut) the output is the same.
 
 ## Coverage
 
@@ -149,9 +151,13 @@ Enabled linters that vgolint doesn't implement are skipped with one stderr warni
   copyloopvar, unconvert and nolintlint, which the corpus barely exercises, also on a synthetic
   module: 26 of 26.
 - Each corpus repo with its own config and golangci-lint's default flags (limits on), comparing
-  the printed blocks of implemented linters: identical on 13 repos; config errors (three v1
-  configs) identical on stderr and exit code; the rest differ only by the unimplemented SSA checks
-  and by which same-text issues the limits keep where golangci-lint's own order isn't stable.
+  the printed blocks of implemented linters (`tools/own_cmp.py`): identical on 12 of 21 repos
+  (279 of 732 blocks are in those repos); the three v1 configs (gin, goleveldb, otto) give the same
+  error on stderr and exit code 3; bolt, gopher-lua and synth differ by SA4006/SA4009/SA5011/SA4017,
+  testify and websocket by which errcheck issues the 50-per-linter limit keeps; the rest differ only by the unimplemented SSA checks,
+  by which issues the limits keep where golangci-lint's own order isn't stable (above), and on
+  cobra by a `//nolint:gosec` that golangci-lint reports as unused and vgolint, which doesn't run
+  gosec, leaves alone.
 - 16 command-line scenarios (subfolders, path prefix/abs, stats, json/checkstyle/sarif with
   severities, exit code, enable-only, groups, limits, `linters`, tests off, tab) and the diff modes
   (`--new`, `--new-from-rev`, `--whole-files`) against golangci-lint: identical but json's

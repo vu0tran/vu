@@ -508,9 +508,9 @@ takes about as much CPU as oxlint (Rust), 13 times less than Biome and 130 times
 the same `.golangci.yml/.yaml/.toml/.json` (v2 schema: linter sets and settings, exclusions and
 presets, `//nolint`, limits, severities, diffs against git), takes the same flags and prints the
 same nine output formats byte for byte, with the same exit codes. It implements the five default
-linters (1744 of golangci-lint's 1754 findings on 21 modules) and nine of the most enabled
+linters (1744 of golangci-lint's 1754 findings on 21 modules) and ten of the most enabled
 optional ones (misspell, unconvert, whitespace, nolintlint, copyloopvar, nakedret, asciicheck,
-dogsled, predeclared, gocyclo: 1860 of 1861 findings), using about half golangci-lint's CPU time
+dogsled, predeclared, gocyclo: 1860 of 1861 findings over three configs), using about half golangci-lint's CPU time
 against its warm cache (loaded 2-core VM). What it does and doesn't do yet: `golint/README.md`.
 
 ## Built for the model that writes it
