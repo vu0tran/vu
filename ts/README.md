@@ -92,11 +92,13 @@ parameter constrained to `{}` against a union.
 96 default rules (the correctness rules that need no type information: `eslint/*`, `typescript/*`,
 `unicorn/*`, `oxc/*`) and prints each diagnostic the way `oxlint -f unix` does. It reuses vtsc's
 scanner and parser, plus a scope builder (`scope.vu`), a regular-expression parser (`regex.vu`)
-and the rules (`rules.vu`): about 5,900 lines of Vu.
+the rules (`rules.vu`) and, for `--fix`, a printer of expressions as oxc prints them
+(`fixgen.vu`): about 7,700 lines of Vu.
 
 ```
 cd ts && ../vu build --release vlint.vu -o vlint
 ./vlint [--jobs N] [--cache] [--cache-location PATH] src/   # files, or folders searched for the extensions above
+./vlint --fix src/             # rewrites the files as `oxlint --fix` does (see below)
 ```
 
 It honors `eslint-disable`/`oxlint-disable` comments, and reports parse errors with oxc's
@@ -207,3 +209,93 @@ table (no string per identifier); a small name table per file, which stays in th
 instead of hash maps for node-keyed data and a name-chained scope table; the source lent to the
 parser rather than copied; and an 8-bytes-at-a-time scan for irregular whitespace. Together these
 cut instructions by 24% and CPU time by about 25%.
+
+## `--fix`
+
+`vlint --fix` rewrites each file exactly as `oxlint --fix` does and prints the diagnostics that are
+left. What oxlint does, read from its source (oxc `oxlint_v1.90.0`, `crates/oxc_linter/src/fixer`,
+`context/mod.rs`, `service/runtime.rs`) and checked against it:
+
+- Each fix has a kind. `--fix` applies only plain safe fixes; `--fix-suggestions` applies only
+  suggestions; `--fix-dangerously` applies everything (safe, suggestions, dangerous). vlint
+  implements `--fix` only and refuses the other two.
+- Of the 96 default rules, 19 produce safe fixes: `eslint/no-compare-neg-zero` (not for `===`),
+  `no-extra-boolean-cast` (`Boolean(x)` calls, not `!!x`), `no-unsafe-negation`, `no-unused-labels`,
+  `no-useless-escape`, `no-useless-rename`, `use-isnan` (`==`-style comparisons), `valid-typeof`
+  (`undefined`), `typescript/no-extra-non-null-assertion`, `no-useless-empty-export`,
+  `no-wrapper-object-types` (type references), `prefer-as-const`, `prefer-namespace-keyword`,
+  `unicorn/no-single-promise-in-promise-methods`, `no-unnecessary-await`,
+  `no-useless-fallback-in-spread`, `no-useless-spread` (declared "dangerous" but its fixes are made
+  as safe ones, and applied), `prefer-set-size`, `prefer-string-starts-ends-with`. Many of these
+  only fix some cases (oxlint's conditions are mirrored rule by rule). The others' fixes
+  (`no-unused-vars`, `no-debugger`, `for-direction`, `erasing-op`, ...) are suggestions or dangerous.
+- One pass: the fixes are sorted by their span and applied left to right; a fix that starts at or
+  before the end of the last applied one (touching counts) is skipped. The file isn't linted
+  again, so a fix that uncovers a new problem leaves it for the next run, and two adjacent escapes
+  (`"\-\."`) need two runs.
+- The output lists the diagnostics whose fix wasn't applied (no fix, a skipped one, or one
+  disabled by a comment), at their positions in the original text. Files that don't parse are left
+  alone. With an agent detected (as here) oxlint prints one line per diagnostic and no summary,
+  which is what vlint prints.
+
+Two `no-useless-spread` fixes (`{...{a: 1}}` and `[...[a], ...[b]]`) print new code with oxc's code
+generator rather than copying text, so `fixgen.vu` prints expressions the way `oxc_codegen` does
+(single quotes and its escapes, numbers like `1e3` and `.5`, parentheses from precedence, objects
+of two or more properties on separate lines with tabs, oxc's `pife` parentheses, comments dropped).
+It covers expressions, simple functions and arrow functions (return, expression and variable
+statements), object methods and the simpler TypeScript types; for anything else (classes, JSX,
+other statements) it gives up and that one fix is left out.
+
+**Parity.** Each corpus copied twice to `/dev/shm`, `oxlint --fix` on one copy and `vlint --fix` on
+the other (`fix-work/fixdiff.sh`), every file compared with `diff -r` and the printed lines
+compared sorted:
+
+| corpus | files | changed by oxlint | files that differ | printed lines that differ |
+|---|---|---|---|---|
+| date-fns, zod, ... (TypeScript) | 3,445 | 17 | 0 | 0 |
+| JavaScript from `node_modules` | 730 | 22 | 0 | 0 |
+| preact | 249 | 1 | 0 | 0 |
+| excalidraw | 723 | 12 | 0 | 0 |
+| vscode | 15,572 | 538 | 4 | 130 (all known parse-error differences) |
+| probe files (`lint/p`) | 53 | 11 | 0 | 25 (a known parse-error difference) |
+| fix probes (overlaps, CRLF, BOM, disable comments, parse errors, the code printer) | 17 | 14 | 0 | 9 (two error wordings, a tie, a `module A.B` warning) |
+| generated files (`genfix.py`, 6 seeds of 300 JS files, 3 of 300 TS files) | 2,700 | 2,292 | 152 (149 that oxc rejects, 3 others, below) | |
+
+2,553 fixes were applied across the real corpora: `no-useless-escape` 1,973, `no-useless-spread`
+173, `prefer-string-starts-ends-with` 138, `no-useless-fallback-in-spread` 103,
+`no-wrapper-object-types` 90, `prefer-as-const` 18, `no-extra-boolean-cast` 14,
+`no-single-promise-in-promise-methods` 8, `no-extra-non-null-assertion` 7, `no-unnecessary-await`
+6, then `prefer-namespace-keyword`, `no-useless-rename`, `no-useless-empty-export`,
+`no-unused-labels`, `use-isnan`, `valid-typeof`, `no-compare-neg-zero`, `prefer-set-size` and
+`no-unsafe-negation` (1 to 4 each): every one of the 19 rules was exercised.
+
+What still differs: the 4 vscode files are fixtures oxc rejects (duplicate parameters in strict
+code) and vlint lints and fixes; the generated files oxc rejects for invalid assignment targets or
+`-a ** b`, which vlint's parser accepts; when two fixes have exactly the same span (`NaN == NaN`, two spreads
+in one array), oxlint's unstable sort picks one of them, which vlint matches in small files but
+not always in files with many diagnostics; and one oxc code-generator oddity (an identifier
+statement in an arrow body printed with a label) isn't reproduced.
+
+Running the corpora found and fixed these in the plain linter as well (its output on all corpora
+is unchanged): keyword literals (`true`, `this`, ...) and `debugger`/empty statements had no
+length in the exact tree; `eslint-enable` without rules ended a rule-specific `eslint-disable`
+(oxc pairs them only by kind); `x!?.y` wasn't reported by `no-extra-non-null-assertion`;
+`no-wrapper-object-types` missed `implements`/`extends` lists; `no-unnecessary-await` used a
+different list of non-promise expressions; and a `>` glued to `=` or `>` was taken as the end of
+type arguments (`a < b >= c`).
+
+**Speed.** CPU seconds (user + sys), best of 5 (vscode: 3), fresh copies for each run, on the
+2-core VM heavily loaded by other jobs (load average 10 to 17), so the numbers are noisy:
+
+| corpus | oxlint `--fix` | vlint `--fix` | oxlint `--fix`, 1 thread | vlint `--fix`, 1 thread | oxlint (no fix) | vlint (no fix) |
+|---|---|---|---|---|---|---|
+| TypeScript (3,445 files) | 0.61 | 0.49 | 0.62 | 0.48 | 0.59 | 0.51 |
+| JavaScript (730 files) | 5.13 | 2.69 | 4.93 | 2.58 | 4.94 | 2.59 |
+| excalidraw | 0.38 | 0.32 | 0.34 | 0.32 | 0.35 | 0.32 |
+| vscode (15,572 files) | 9.28 | 9.07 | 9.67 | 8.47 | 9.02 | 8.41 |
+
+Fixing costs nothing measurable over linting for either tool. The plain path didn't get slower: on
+zod (`VU_MARCH=x86-64-v2` build, callgrind) it went from 706.5M to 674.1M instructions (-4.6%),
+because the unused-label report and its string building moved out of `visit`, the function called
+for every node, which was paying for that branch's string temporaries on each call.
+
