@@ -550,7 +550,11 @@ fn call_val(var it: It, id: Int, n: Int, v: V) -> V:
     if it.bad: return vnull()
     if id == I.indices: return r
     if kind(r) == K_NULL: return r
-    if kind(r) != K_ARR: return run.index_val(&it, r, vint(0))
+    if kind(r) != K_ARR:
+      if id == I.index: return run.index_val(&it, r, vint(0))
+      # rindex is .[-1:][0]: a slice first
+      if kind(r) == K_STR: return sfail(&it, "Cannot index string with number")
+      return sfail(&it, "Cannot index " + kname(r) + " with object")
     let nn = jv.alen(it.st, r)
     if nn == 0: return vnull()
     if id == I.index: return jv.aget(it.st, r, 0)
@@ -558,7 +562,8 @@ fn call_val(var it: It, id: Int, n: Int, v: V) -> V:
   if id == I.flatten0: return flatten(&it, v, -1.0)
   if id == I.flatten1:
     let d = varg(it, 0)
-    if jv.is_num(d) and d.n < 0.0: return sfail(&it, "flatten depth must not be negative")
+    # ($x < 0 in jq's order: NaN sorts below every number)
+    if jv.is_num(d) and jv.vcmp(it.st, d, vint(0)) < 0: return sfail(&it, "flatten depth must not be negative")
     if not jv.is_num(d):
       # jq compares $x < 0 for any type; non-numbers sort above numbers
       if jv.vcmp(it.st, d, vint(0)) < 0: return sfail(&it, "flatten depth must not be negative")
@@ -2198,7 +2203,12 @@ fn read_input(var it: It) -> V:
       it.ierr = em
       it.sq_err = ""
       return sfail(&it, em)
+    # jq's streaming parser has no depth limit and sends every key, repeated ones too
+    it.st.maxdepth = 1 << 40
+    it.st.keepdups = true
     let v = read_value(&it)
+    it.st.maxdepth = 256
+    it.st.keepdups = false
     if it.bad:
       if it.ierr == "": return v
       it.bad = false
@@ -2269,12 +2279,14 @@ fn read_value(var it: It) -> V:
     it.ipos = e + 1
     if e >= it.iend: it.ipos = it.iend
     it.ivend = it.ipos
-    let f = jv.scan_flags(it.st, off, len)
-    return vstr(jv.add_span(&it.st, off, len, f))
+    var nl = 0
+    if e < it.iend: nl = 1
+    return raw_text(&it, off, off + len, nl)
   var v = vnull()
   var vs = 0
   var vline = 0
   var vcol = 0
+  var at_eof = false
   while true:
     if it.bom == 255 and not it.seq:
       it.ierr = "Malformed BOM"
@@ -2307,9 +2319,10 @@ fn read_value(var it: It) -> V:
     let kd = kind(v)
     # what's buffered may end inside this value (or a number may go on): read more and retry
     let short = it.st.perr != "" or (it.st.pp >= it.iend and kd != K_ARR and kd != K_OBJ and kd != K_STR)
-    # (strings this attempt decoded go: the value is parsed again)
-    if short and it.stdin_stream: jv.undo_to(&it.st, ends0)
-    if short and it.stdin_stream:
+    # (what this attempt made goes: the value is parsed again, with more input or knowing
+    # there is none)
+    if short and it.stdin_stream and not at_eof: jv.undo_to(&it.st, ends0)
+    if short and it.stdin_stream and not at_eof:
       # read on without parsing again until the value can be complete (a scan finds where it
       # ends), the part buffered has doubled, or the input ends: reading a big value stays linear
       let rel = vs - it.ipos
@@ -2320,10 +2333,10 @@ fn read_value(var it: It) -> V:
         got = true
         let vs2 = it.ipos + rel
         if value_end_seen(it, vs2, &sc) or it.iend - vs2 >= 2 * tried: break
-      if got:
-        it.st.pline = line0
-        it.st.plinestart = ls0
-        continue
+      if not got: at_eof = true
+      it.st.pline = line0
+      it.st.plinestart = ls0
+      continue
     break
   it.chunk = 65536
   if it.st.perr != "":
@@ -2338,8 +2351,25 @@ fn read_value(var it: It) -> V:
     while le < it.iend and it.st.b[le] != '\n': le += 1
     if le < it.iend: le += 1
     it.ivend = le
-    # jq drops the rest of the piece it was parsing: what follows (the next line) can still be read
+    # jq drops the rest of the piece it was parsing: what follows (the next line) can still be read;
+    # its line and column counts go on from the error's (what was dropped isn't counted)
     it.ipos = le
+    let li = last_index(m, "at line ")
+    if li >= 0:
+      var q = li + 8
+      var ln = 0
+      while q < m.len and m[q] >= '0' and m[q] <= '9':
+        ln = ln * 10 + int(m[q] - '0')
+        q += 1
+      let ci = last_index(m, "column ")
+      if ci > li:
+        var cn = 0
+        var q2 = ci + 7
+        while q2 < m.len and m[q2] >= '0' and m[q2] <= '9':
+          cn = cn * 10 + int(m[q2] - '0')
+          q2 += 1
+        it.st.pline = ln
+        it.st.plinestart = le - cn
     return sfail(&it, m)
   # jq's parser takes a scalar at the byte after it (a delimiter), a string or container at its end
   var consumed = it.st.pp
@@ -2349,6 +2379,76 @@ fn read_value(var it: It) -> V:
   it.ipos = it.st.pp
   while it.ifile + 1 < it.istarts.len and it.ipos > it.istarts[it.ifile + 1]: it.ifile += 1
   return v
+
+fn last_index(s: Str, sub: Str) -> Int:
+  var r = -1
+  var from = 0
+  while from <= s.len:
+    let i = s[from..s.len].find(sub)
+    if i < 0: break
+    r = from + i
+    from = r + 1
+  return r
+
+# Raw input text b[a..e) (nl: 1 when a newline follows it, read with it) as jq has it: it reads
+# with fgets, so in pieces that end at a newline, after 4095 bytes, or at the end of a file, and
+# each piece's bad UTF-8 is replaced (U+FFFD) on its own; a character cut by a piece's end is
+# replaced too. One span of the buffer when there is nothing to replace.
+fn raw_text(var it: It, a: Int, e: Int, nl: Int) -> V:
+  var hi = false
+  for i in a..e:
+    if it.st.b[i] >= 0x80:
+      hi = true
+      break
+  if not hi:
+    let f = jv.scan_flags(it.st, a, e - a)
+    return vstr(jv.add_span(&it.st, a, e - a, f))
+  # the pieces
+  var cuts: [Int] = []
+  var p = a
+  let full = e + nl
+  while p < full:
+    var q = p + 4095
+    # a file starting inside this piece ends it
+    for k in 0..it.istarts.len:
+      let fs = it.istarts[k]
+      if fs > p and fs < q: q = fs
+    # so does a newline (read with it)
+    var j = p
+    while j < q and j < full:
+      if it.st.b[j] == '\n':
+        q = j + 1
+        break
+      j += 1
+    if q > full: q = full
+    cuts.push(q)
+    p = q
+  var ok = true
+  var s0 = a
+  for c in cuts:
+    var c2 = c
+    if c2 > e: c2 = e
+    if c2 > s0 and not jv.valid_utf8(it.st, s0, c2 - s0): ok = false
+    s0 = c
+  if ok:
+    let f = jv.scan_flags(it.st, a, e - a)
+    return vstr(jv.add_span(&it.st, a, e - a, f))
+  var out: [Byte] = []
+  s0 = a
+  for c in cuts:
+    var c2 = c
+    if c2 > e: c2 = e
+    if c2 > s0:
+      if jv.valid_utf8(it.st, s0, c2 - s0):
+        for i in s0..c2: out.push(it.st.b[i])
+      else:
+        let r = jv.repair_utf8(&it.st, s0, c2 - s0)
+        for i in r..it.st.b.len: out.push(it.st.b[i])
+        it.st.b.truncate(r)
+    s0 = c
+  let start = it.st.b.len
+  for x in out: it.st.b.push(x)
+  return jv.end_str(&it.st, start)
 
 # Whether b[vs..iend) holds the end of the JSON text that starts at vs (a container closing, a
 # string's closing quote, a scalar's delimiter), scanning on from where sc (offset, depth, in a
