@@ -1,0 +1,648 @@
+# govet's printf analyzer: calls to fmt.Printf-like and Print-like functions (and functions in the
+# package that forward to them), checked against their format strings.
+
+import ast
+import scan
+import tc
+import pkg
+import format
+import vet
+import errcheck
+from scan import T_ASSIGN, T_DEFINE, T_AND, T_STRING
+
+const K_PRINT = 1
+const K_PRINTF = 2
+const K_ERRORF = 3
+
+fn is_print_name(s: Str) -> Bool:
+  return s in ["fmt.Appendf", "fmt.Append", "fmt.Appendln", "fmt.Errorf", "fmt.Fprint", "fmt.Fprintf", "fmt.Fprintln", "fmt.Print", "fmt.Printf", "fmt.Println", "fmt.Sprint", "fmt.Sprintf", "fmt.Sprintln", "runtime/trace.Logf", "log.Print", "log.Printf", "log.Println", "log.Fatal", "log.Fatalf", "log.Fatalln", "log.Panic", "log.Panicf", "log.Panicln", "(*log.Logger).Fatal", "(*log.Logger).Fatalf", "(*log.Logger).Fatalln", "(*log.Logger).Panic", "(*log.Logger).Panicf", "(*log.Logger).Panicln", "(*log.Logger).Print", "(*log.Logger).Printf", "(*log.Logger).Println", "(*testing.common).Error", "(*testing.common).Errorf", "(*testing.common).Fatal", "(*testing.common).Fatalf", "(*testing.common).Log", "(*testing.common).Logf", "(*testing.common).Skip", "(*testing.common).Skipf", "(testing.TB).Error", "(testing.TB).Errorf", "(testing.TB).Fatal", "(testing.TB).Fatalf", "(testing.TB).Log", "(testing.TB).Logf", "(testing.TB).Skip", "(testing.TB).Skipf"]
+
+type P:
+  kinds: {Int: Int}      # local wrapper function object -> kind
+  parent: [Int]          # node -> parent
+
+# [kind, callee object] of a call.
+fn name_and_kind(var g: tc.Prog, fs: Fs, pi: Int, p: P, call: Int) -> [Int]:
+  let o = vet.callee(g, pi, call)
+  if o < 0: return [0, -1]
+  let o2 = g.oorig[o]
+  let full = errcheck.full_name(&g, fs, o2)
+  if is_print_name(full):
+    if full == "fmt.Errorf": return [K_ERRORF, o2]
+    if g.oname[o2].endswith("f"): return [K_PRINTF, o2]
+    return [K_PRINT, o2]
+  return [p.kinds.get(o2, 0), o2]
+
+fn empty_iface(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  if t <= 0: return false
+  if g.tk[t] == tc.TY_NAMED: return false
+  return g.tk[t] == tc.TY_IFACE and g.tlen[t] == 0 and g.tb[t] <= 0 and g.ta[t] == 0
+
+type W:
+  obj: Int
+  decl: Int
+  format: Int     # parameter object (-1)
+  args: Int
+  callers: [Int]  # pairs: wrapper index, call node
+  failed: Bool
+
+fn param_obj(g: tc.Prog, pi: Int, f: Int) -> Int:
+  let names = g.pk[pi].t.a[f]
+  if names < 0 or ast.count(g.pk[pi].t, names) == 0: return -1
+  let ns = ast.items(g.pk[pi].t, names)
+  return g.pk[pi].use[ns[ns.len - 1]]
+
+fn find_wrappers(var g: tc.Prog, fs: Fs, pi: Int, var p: P, roots: [Int]):
+  var ws: [W] = []
+  var byobj: {Int: Int} = {}
+  for root in roots:
+    for d in ast.items(g.pk[pi].t, g.pk[pi].t.c[root]):
+      if g.pk[pi].t.k[d] != ast.N_FUNCDECL or g.pk[pi].t.d[d] < 0: continue
+      let o = g.pk[pi].use[g.pk[pi].t.b[d]]
+      if o < 0: continue
+      let ft = tc.obj_type(&g, fs, o)
+      if not tc.is_variadic(g, ft): continue
+      let ps = tc.tlist(g, g.ta[ft])
+      let last = ps[ps.len - 1]
+      if g.tk[last] != tc.TY_SLICE or not empty_iface(&g, fs, g.ta[last]): continue
+      # the parameter objects: the last field's last name, and the one before
+      let fields = ast.items(g.pk[pi].t, g.pk[pi].t.b[g.pk[pi].t.c[d]])
+      if fields.len == 0: continue
+      let args = param_obj(g, pi, fields[fields.len - 1])
+      if args < 0: continue
+      var fmt_o = -1
+      if ps.len >= 2 and ps[ps.len - 2] == tc.B_STRING:
+        # the parameter before the variadic one
+        let lf = fields[fields.len - 1]
+        let ln = ast.items(g.pk[pi].t, g.pk[pi].t.a[lf])
+        if ln.len >= 2: fmt_o = g.pk[pi].use[ln[ln.len - 2]]
+        elif fields.len >= 2:
+          let pf = fields[fields.len - 2]
+          fmt_o = param_obj(g, pi, pf)
+      byobj[o] = ws.len
+      ws.push(W(o, d, fmt_o, args, [], false))
+  for wi in 0..ws.len:
+    let body = g.pk[pi].t.d[ws[wi].decl]
+    let nodes = vet.preorder(g.pk[pi].t, [body])
+    for n in nodes:
+      if ws[wi].failed: break
+      let k = g.pk[pi].t.k[n]
+      if k == ast.N_ASSIGN:
+        for l in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
+          if matches(g, pi, l, ws[wi].format) or matches(g, pi, l, ws[wi].args): ws[wi].failed = true
+        if ws[wi].failed: break
+      if k == ast.N_UNARY and g.pk[pi].t.f[n] == T_AND:
+        let x = g.pk[pi].t.a[n]
+        if matches(g, pi, x, ws[wi].format) or matches(g, pi, x, ws[wi].args):
+          ws[wi].failed = true
+          break
+      if k != ast.N_CALL: continue
+      let cargs = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+      if cargs.len == 0 or not matches(g, pi, cargs[cargs.len - 1], ws[wi].args): continue
+      let nk = name_and_kind(&g, fs, pi, p, n)
+      if nk[0] != 0:
+        fwd(&g, fs, pi, &p, &ws, wi, n, nk[0])
+        continue
+      if nk[1] >= 0 and nk[1] in byobj:
+        let ci = byobj[nk[1]]
+        ws[ci].callers.push(wi)
+        ws[ci].callers.push(n)
+
+fn matches(g: tc.Prog, pi: Int, x: Int, param: Int) -> Bool:
+  if param < 0 or g.pk[pi].t.k[x] != ast.N_IDENT: return false
+  return g.pk[pi].use[x] == param
+
+fn fwd(var g: tc.Prog, fs: Fs, pi: Int, var p: P, var ws: [W], wi: Int, call: Int, kind: Int):
+  let cargs = ast.items(g.pk[pi].t, g.pk[pi].t.b[call])
+  let matched = kind == K_PRINT or (kind != 0 and cargs.len >= 2 and matches(g, pi, cargs[cargs.len - 2], ws[wi].format))
+  if not matched: return
+  if g.pk[pi].t.f[call] == 0:
+    let ft = vet.ty(g, pi, g.pk[pi].t.a[call])
+    if ft <= 0 or g.tk[ft] != tc.TY_FUNC: return
+    if cargs.len > g.tlen[g.ta[ft]]: return
+    var desc = "printf"
+    if kind == K_PRINT: desc = "print"
+    p.kinds[0 - 1 - call] = 1
+    return
+  let o = ws[wi].obj
+  if o in p.kinds: return
+  p.kinds[o] = kind
+  var callers: [Int] = []
+  for x in ws[wi].callers: callers.push(x)
+  var i = 0
+  while i < callers.len:
+    fwd(&g, fs, pi, &p, &ws, callers[i], callers[i + 1], kind)
+    i += 2
+
+# ---- format strings
+
+type Op:
+  text: Str
+  start: Int        # offset of the % in the format
+  flags: Str
+  verb: Int         # the verb's code point
+  argidx: Int       # the call argument the verb formats
+  vindex: Int       # an explicit [n] index of the verb, else -1
+  wdyn: Int         # argument giving the width (*), else -1
+  windex: Int
+  pdyn: Int
+  pindex: Int
+
+type FP:
+  s: Str
+  n: Int          # bytes consumed in the operation's text
+  first: Int
+  argnum: Int
+  index: Int
+  pending: Bool
+  err: Str
+
+fn scan_num(var f: FP) -> Int:
+  let st = f.n
+  while f.n < f.s.len and f.s[f.n] >= '0' and f.s[f.n] <= '9': f.n += 1
+  if f.n > st and f.n < f.s.len: return int(f.s[st..f.n]) else -1
+  if f.n > st: return -2
+  return -1
+
+fn parse_index(var f: FP):
+  if f.n >= f.s.len or f.s[f.n] != '[': return
+  f.n += 1
+  let start = f.n
+  let num = scan_num(&f)
+  if num >= 0: f.index = num
+  var ok = true
+  if f.n >= f.s.len or f.n == start or f.s[f.n] != ']':
+    ok = false
+    let j = f.s[start..f.s.len].find("]")
+    if j < 0:
+      f.err = "format " + f.s + " is missing closing ]"
+      return
+    f.n = start + j
+  let txt = f.s[start..f.n]
+  let v = int(txt) else -1
+  if not ok or v <= 0:
+    f.err = "format has invalid argument index [" + txt + "]"
+    return
+  f.n += 1
+  f.argnum = v + f.first - 1
+  f.pending = true
+
+# Parses the operations of a format string; the error text is "" if it parses.
+fn parse_format(s: Str, idx: Int, var ops: [Op]) -> Str:
+  let first = idx + 1
+  var argnum = first
+  var i = 0
+  while i < s.len:
+    if s[i] != '%':
+      i += 1
+      continue
+    var f = FP(s[i..s.len], 1, first, argnum, 0, false, "")
+    var op = Op("", i, "", 0, 0, -1, -1, -1, -1, -1)
+    # flags
+    let fst = f.n
+    while f.n < f.s.len and (f.s[f.n] == '#' or f.s[f.n] == '0' or f.s[f.n] == '+' or f.s[f.n] == '-' or f.s[f.n] == ' '): f.n += 1
+    op.flags = f.s[fst..f.n]
+    parse_index(&f)
+    if f.err.len > 0: return f.err
+    # width
+    parse_size(&f, &op, false)
+    # precision
+    if f.n < f.s.len and f.s[f.n] == '.':
+      f.n += 1
+      parse_index(&f)
+      if f.err.len > 0: return f.err
+      parse_size(&f, &op, true)
+    if not f.pending:
+      parse_index(&f)
+      if f.err.len > 0: return f.err
+    if f.n == f.s.len: return "format " + f.s + " is missing verb at end of string"
+    let rest = f.s[f.n..f.s.len]
+    let cs = rest.codes()
+    var verb = 65533
+    var w = 1
+    if cs.len > 0:
+      verb = cs[0]
+      w = bytes(chr(verb)).len
+      if not rest.is_utf8() and int(rest[0]) >= 128:
+        verb = 65533
+        w = 1
+    op.verb = verb
+    op.argidx = f.argnum
+    if f.pending: op.vindex = f.index
+    f.n += w
+    op.text = f.s[0..f.n]
+    ops.push(op)
+    i += f.n
+    if verb != 37: argnum = f.argnum + 1
+  return ""
+
+fn parse_size(var f: FP, var op: Op, prec: Bool):
+  if f.n < f.s.len and f.s[f.n] == '*':
+    f.n += 1
+    var index = -1
+    if f.pending:
+      f.pending = false
+      index = f.index
+    if prec:
+      op.pdyn = f.argnum
+      op.pindex = index
+    else:
+      op.wdyn = f.argnum
+      op.windex = index
+    f.argnum += 1
+  else:
+    scan_num(&f)
+
+# The source offset of byte offset off of a string literal's value.
+fn pos_in_lit(lit: Str, off: Int) -> Int:
+  if lit[0] == '`':
+    # raw strings: carriage returns are dropped from the value
+    var i = 0
+    var p = 1
+    while i < off and p < lit.len - 1:
+      if lit[p] != '\r': i += 1
+      p += 1
+    return p
+  var i = 0
+  var p = 1
+  while i < off and p < lit.len - 1:
+    let c = lit[p]
+    if c != '\\':
+      p += 1
+      i += 1
+      continue
+    let e = lit[p + 1]
+    if e == 'x':
+      p += 4
+      i += 1
+    elif e >= '0' and e <= '7':
+      p += 4
+      i += 1
+    elif e == 'u':
+      let v = tc.hexval(lit[p + 2]) * 4096 + tc.hexval(lit[p + 3]) * 256 + tc.hexval(lit[p + 4]) * 16 + tc.hexval(lit[p + 5])
+      p += 6
+      i += bytes(chr(v)).len
+    elif e == 'U':
+      p += 10
+      i += 4
+    else:
+      p += 2
+      i += 1
+  return p
+
+# ---- argument types
+
+const A_BOOL = 1
+const A_INT = 2
+const A_RUNE = 4
+const A_STRING = 8
+const A_FLOAT = 16
+const A_COMPLEX = 32
+const A_POINTER = 64
+const A_ERROR = 128
+const A_ANY = 255
+
+fn verb_info(verb: Int) -> [Str]:
+  # flags, type mask (as text), or [] when unknown
+  if verb == 37: return ["", "0"]
+  if verb == 98: return [" -+.0#", "{A_INT + A_FLOAT + A_COMPLEX + A_POINTER}"]
+  if verb == 99: return ["-", "{A_RUNE + A_INT}"]
+  if verb == 100: return [" -+.0", "{A_INT + A_POINTER}"]
+  if verb == 101 or verb == 69 or verb == 102 or verb == 70 or verb == 103 or verb == 71: return [" -+.0#", "{A_FLOAT + A_COMPLEX}"]
+  if verb == 111 or verb == 79: return [" -+.0#", "{A_INT + A_POINTER}"]
+  if verb == 112: return ["-#", "{A_POINTER}"]
+  if verb == 113: return [" -+.0#", "{A_RUNE + A_INT + A_STRING}"]
+  if verb == 115: return [" -+.0", "{A_STRING}"]
+  if verb == 116: return ["-", "{A_BOOL}"]
+  if verb == 84: return ["-", "{A_ANY}"]
+  if verb == 85: return ["-#", "{A_RUNE + A_INT}"]
+  if verb == 118: return [" -+.0#", "{A_ANY}"]
+  if verb == 119: return [" -+.0#", "{A_ERROR}"]
+  if verb == 120 or verb == 88: return [" -+.0#", "{A_RUNE + A_INT + A_STRING + A_POINTER + A_FLOAT + A_COMPLEX}"]
+  return []
+
+fn is_formatter(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  if t <= 0: return false
+  let u = tc.under(&g, fs, t)
+  if u > 0 and g.tk[u] == tc.TY_IFACE and g.tk[t] != tc.TY_TPARAM: return true
+  let r = tc.method_in_set(&g, fs, t, "Format")
+  if r.len == 0: return false
+  let mt = r[1]
+  if mt <= 0 or g.tk[mt] != tc.TY_FUNC: return false
+  let ps = tc.tlist(g, g.ta[mt])
+  if ps.len != 2 or g.tlen[g.tb[mt]] != 0: return false
+  let p0 = ps[0]
+  if p0 <= 0 or g.tk[p0] != tc.TY_NAMED: return false
+  let o = g.ta[p0]
+  return g.oname[o] == "State" and g.opkg[o] >= 0 and g.pk[g.opkg[o]].path == "fmt" and ps[1] == tc.B_INT32
+
+fn convertible_to_error(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return tc.implements_error(&g, fs, t)
+
+fn convertible_to_string(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  if t == tc.B_UNIL: return false
+  if convertible_to_error(&g, fs, t): return true
+  let r = tc.method_in_set(&g, fs, t, "String")
+  if r.len == 0: return false
+  let mt = r[1]
+  if mt <= 0 or g.tk[mt] != tc.TY_FUNC or g.tlen[g.ta[mt]] != 0: return false
+  let rs = tc.tlist(g, g.tb[mt])
+  return rs.len == 1 and rs[0] == tc.B_STRING
+
+fn match_arg(var g: tc.Prog, fs: Fs, mask: Int, t: Int, top: Bool, var seen: {Int: Bool}) -> Bool:
+  if mask == A_ERROR: return convertible_to_error(&g, fs, t)
+  if is_formatter(&g, fs, t): return true
+  if mask & A_STRING != 0 and convertible_to_string(&g, fs, t): return true
+  if t > 0 and g.tk[t] == tc.TY_TPARAM: return true
+  let u = tc.under(&g, fs, t)
+  if u <= 0: return true
+  if u in seen: return true
+  seen[u] = true
+  let k = g.tk[u]
+  if k == tc.TY_FUNC: return mask == A_POINTER
+  if k == tc.TY_MAP:
+    if mask == A_POINTER: return true
+    return match_arg(&g, fs, mask, g.ta[u], false, &seen) and match_arg(&g, fs, mask, g.tb[u], false, &seen)
+  if k == tc.TY_CHAN: return mask & A_POINTER != 0
+  if k == tc.TY_ARRAY:
+    if tc.under(&g, fs, g.ta[u]) == tc.B_UINT8 and mask & A_STRING != 0: return true
+    return match_arg(&g, fs, mask, g.ta[u], false, &seen)
+  if k == tc.TY_SLICE:
+    if tc.under(&g, fs, g.ta[u]) == tc.B_UINT8 and mask & A_STRING != 0: return true
+    if mask == A_POINTER: return true
+    return match_arg(&g, fs, mask, g.ta[u], false, &seen)
+  if k == tc.TY_PTR:
+    let e = g.ta[u]
+    if e <= 0: return true
+    if mask == A_POINTER: return true
+    if g.tk[e] == tc.TY_TPARAM: return true
+    let eu = tc.under(&g, fs, e)
+    if eu <= 0: return true
+    let ek = g.tk[eu]
+    if not (ek == tc.TY_STRUCT or ek == tc.TY_ARRAY or ek == tc.TY_SLICE or ek == tc.TY_MAP): return mask & A_POINTER != 0
+    if not top: return false
+    return match_arg(&g, fs, mask, eu, false, &seen)
+  if k == tc.TY_STRUCT:
+    for f in tc.tlist(g, u):
+      let ft = tc.obj_type(&g, fs, f)
+      if not match_arg(&g, fs, mask, ft, false, &seen): return false
+      if mask & A_STRING != 0 and not vet.exported(g.oname[f]) and convertible_to_string(&g, fs, ft): return false
+    return true
+  if k == tc.TY_IFACE: return true
+  if k == tc.TY_BASIC:
+    if u == tc.B_BOOL or u == tc.B_UBOOL: return mask & A_BOOL != 0
+    if (u >= tc.B_INT and u <= tc.B_UINTPTR) or u == tc.B_UINT_: return mask & A_INT != 0
+    if u == tc.B_FLOAT32 or u == tc.B_FLOAT64 or u == tc.B_UFLOAT: return mask & A_FLOAT != 0
+    if u == tc.B_COMPLEX64 or u == tc.B_COMPLEX128 or u == tc.B_UCOMPLEX: return mask & A_COMPLEX != 0
+    if u == tc.B_STRING or u == tc.B_USTRING: return mask & A_STRING != 0
+    if u == tc.B_UNSAFEPTR: return mask & (A_POINTER + A_INT) != 0
+    if u == tc.B_URUNE: return mask & (A_INT + A_RUNE) != 0
+    if u == tc.B_UNIL: return false
+    return true
+  return false
+
+fn count_s(n: Int, what: Str) -> Str:
+  if n == 1: return "1 " + what
+  return "{n} " + what + "s"
+
+fn arg_type(g: tc.Prog, pi: Int, a: Int) -> Int:
+  let t = vet.ty(g, pi, a)
+  if t == tc.B_UNIL: return t
+  return tc.default_type(t)
+
+# recursiveStringer: the arg is the receiver of the String (or Error) method it's inside.
+fn recursive_stringer(var g: tc.Prog, fs: Fs, pi: Int, p: P, e0: Int) -> Str:
+  let t = arg_type(g, pi, e0)
+  if t <= 0 or is_formatter(&g, fs, t): return ""
+  let sm = tc.method_in_set(&g, fs, t, "String")
+  let em = tc.method_in_set(&g, fs, t, "Error")
+  var fd = p.parent[e0]
+  while fd > 0 and g.pk[pi].t.k[fd] != ast.N_FUNCDECL: fd = p.parent[fd]
+  if fd <= 0: return ""
+  let fo = g.pk[pi].use[g.pk[pi].t.b[fd]]
+  var m = -1
+  if sm.len > 0 and g.opkg[sm[0]] == pi and g.oorig[sm[0]] == fo: m = fo
+  elif em.len > 0 and g.opkg[em[0]] == pi and g.oorig[em[0]] == fo: m = fo
+  if m < 0: return ""
+  let mt = tc.obj_type(&g, fs, m)
+  if mt <= 0 or g.tlen[g.ta[mt]] != 0: return ""
+  let rs = tc.tlist(g, g.tb[mt])
+  if rs.len != 1 or rs[0] != tc.B_STRING: return ""
+  var e = e0
+  if g.pk[pi].t.k[e] == ast.N_UNARY and g.pk[pi].t.f[e] == T_AND: e = g.pk[pi].t.a[e]
+  if g.pk[pi].t.k[e] != ast.N_IDENT: return ""
+  let recv = g.pk[pi].t.a[fd]
+  if recv < 0 or ast.count(g.pk[pi].t, recv) == 0: return ""
+  let rf = ast.item(g.pk[pi].t, recv, 0)
+  let ro = param_obj(g, pi, rf)
+  if ro < 0 or g.pk[pi].use[e] != ro: return ""
+  return errcheck.full_name(&g, fs, m)
+
+fn is_func_value(g: tc.Prog, pi: Int, a: Int) -> Bool:
+  let t = vet.ty(g, pi, a)
+  return t > 0 and g.tk[t] == tc.TY_FUNC
+
+fn check_printf(var g: tc.Prog, fs: Fs, var v: vet.V, pi: Int, p: P, kind: Int, call: Int, name: Str, gover: Int):
+  let ft = vet.ty(g, pi, g.pk[pi].t.a[call])
+  if ft <= 0 or g.tk[ft] != tc.TY_FUNC or not tc.is_variadic(g, ft): return
+  let idx = g.tlen[g.ta[ft]] - 2
+  let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[call])
+  if idx < 0 or idx >= args.len: return
+  let farg = args[idx]
+  let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[call], farg, -1, 0)
+  if cv.k != 2:
+    if idx == args.len - 1 and gover >= 24:
+      vet.report(g, &v, farg, "printf", "non-constant format string in call to " + name)
+    return
+  let fmts = cv.s
+  let first = idx + 1
+  if not ("%" in fmts):
+    if args.len > first: vet.report(g, &v, args[first], "printf", name + " call has arguments but no formatting directives")
+    return
+  var ops: [Op] = []
+  let err = parse_format(fmts, idx, &ops)
+  if err.len > 0:
+    vet.report(g, &v, farg, "printf", name + " " + err)
+    return
+  var maxarg = first - 1
+  var any_index = false
+  let lit = g.pk[pi].t.k[farg] == ast.N_BASICLIT
+  for op in ops:
+    if op.pindex != -1 or op.windex != -1 or op.vindex != -1: any_index = true
+    var at = g.pk[pi].t.pos[farg]
+    let fi = g.pk[pi].t.file[farg]
+    if lit: at = g.pk[pi].t.pos[farg] + pos_in_lit(g.pk[pi].t.names[g.pk[pi].t.s[farg]], op.start)
+    if not ok_arg(&g, fs, &v, pi, p, call, args, fi, at, &maxarg, first, name, op): return
+    if op.verb == 119 and kind != K_ERRORF:
+      vet.report_at(g, &v, fi, at, "printf", name + " does not support error-wrapping directive %w")
+      return
+  if g.pk[pi].t.f[call] == 1 and maxarg >= args.len - 2: return
+  if any_index: return
+  if maxarg + 1 < args.len:
+    let expect = maxarg + 1 - first
+    let num = args.len - first
+    vet.report(g, &v, call, "printf", name + " call needs " + count_s(expect, "arg") + " but has " + count_s(num, "arg"))
+
+fn can_check(g: tc.Prog, var v: vet.V, pi: Int, call: Int, args: [Int], fi: Int, at: Int, ai: Int, first: Int, op: Op, name: Str) -> Bool:
+  if ai < args.len - 1: return true
+  if g.pk[pi].t.f[call] == 1: return false
+  if ai < args.len: return true
+  let n = ai - first + 1
+  vet.report_at(g, &v, fi, at, "printf", name + " format " + op.text + " reads arg #{n}, but call has " + count_s(args.len - first, "arg"))
+  return false
+
+fn ok_arg(var g: tc.Prog, fs: Fs, var v: vet.V, pi: Int, p: P, call: Int, args: [Int], fi: Int, at: Int, var maxarg: Int, first: Int, name: Str, op: Op) -> Bool:
+  let vi = verb_info(op.verb)
+  let found = vi.len > 0
+  var mask = 0
+  var flags = ""
+  if found:
+    flags = vi[0] + ""
+    mask = int(vi[1]) else 0
+  var formatter = false
+  if mask != A_ERROR and op.argidx < args.len:
+    formatter = is_formatter(&g, fs, arg_type(g, pi, args[op.argidx]))
+  if not formatter:
+    if not found:
+      vet.report_at(g, &v, fi, at, "printf", name + " format " + op.text + " has unknown verb " + chr(op.verb))
+      return false
+    for i in 0..op.flags.len:
+      let fl = op.flags[i]
+      if fl == '0': continue
+      if flags.find(str([fl])) < 0:
+        vet.report_at(g, &v, fi, at, "printf", name + " format " + op.text + " has unrecognized flag " + str([fl]))
+        return false
+  var idxs: [Int] = []
+  if op.wdyn != -1: idxs.push(op.wdyn)
+  if op.pdyn != -1: idxs.push(op.pdyn)
+  for ai in idxs:
+    if not can_check(g, &v, pi, call, args, fi, at, ai, first, op, name): return false
+    let a = args[ai]
+    var seen: {Int: Bool} = {}
+    if not match_arg(&g, fs, A_INT, arg_type(g, pi, a), true, &seen):
+      vet.report_at(g, &v, fi, at, "printf", name + " format " + op.text + " uses non-int " + format.expr(g.pk[pi].t, a) + " as argument of *")
+      return false
+  if op.argidx != -1 and op.verb != 37: idxs.push(op.argidx)
+  for ai in idxs:
+    if ai > maxarg: maxarg = ai
+  if op.verb == 37 or formatter: return true
+  if not can_check(g, &v, pi, call, args, fi, at, op.argidx, first, op, name): return false
+  let a = args[op.argidx]
+  if is_func_value(g, pi, a) and op.verb != 112 and op.verb != 84:
+    vet.report_at(g, &v, fi, at, "printf", name + " format " + op.text + " arg " + format.expr(g.pk[pi].t, a) + " is a func value, not called")
+    return false
+  var seen: {Int: Bool} = {}
+  let at_t = arg_type(g, pi, a)
+  if mask != A_ANY and not match_arg(&g, fs, mask, at_t, true, &seen):
+    let ts = tc.type_str(&g, fs, at_t, "")
+    vet.report_at(g, &v, fi, at, "printf", name + " format " + op.text + " has arg " + format.expr(g.pk[pi].t, a) + " of wrong type " + ts)
+    return false
+  if mask & A_STRING != 0 and op.verb != 84 and (op.flags.find("#") < 0 or op.verb == 113 or op.verb == 120 or op.verb == 88):
+    let mn = recursive_stringer(&g, fs, pi, p, a)
+    if mn.len > 0:
+      vet.report_at(g, &v, fi, at, "printf", name + " format " + op.text + " with arg " + format.expr(g.pk[pi].t, a) + " causes recursive " + mn + " method call")
+      return false
+  return true
+
+fn is_hex(c: Byte) -> Bool:
+  return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+
+# printFormatRE's first match in s (or "").
+fn possible_directive(s: Str) -> Str:
+  var i = 0
+  while i < s.len:
+    if s[i] != '%':
+      i += 1
+      continue
+    let m = match_directive(s, i)
+    if m.len > 0:
+      if m.len >= 3 and is_hex(m[1]) and is_hex(m[2]):
+        i += m.len
+        continue
+      return m
+    i += 1
+  return ""
+
+fn match_num_opt(s: Str, at: Int) -> Int:
+  # ([0-9]+|(\[[0-9]+\])?\*)? : returns the end
+  var j = at
+  while j < s.len and s[j] >= '0' and s[j] <= '9': j += 1
+  if j > at: return j
+  var k = at
+  if k < s.len and s[k] == '[':
+    var m = k + 1
+    while m < s.len and s[m] >= '0' and s[m] <= '9': m += 1
+    if m > k + 1 and m < s.len and s[m] == ']': k = m + 1
+  if k < s.len and s[k] == '*': return k + 1
+  return at
+
+fn match_directive(s: Str, at: Int) -> Str:
+  var j = at + 1
+  while j < s.len and (s[j] == '+' or s[j] == '-' or s[j] == '#'): j += 1
+  j = match_num_opt(s, j)
+  if j < s.len and s[j] == '.': j += 1
+  j = match_num_opt(s, j)
+  if j < s.len and s[j] == '[':
+    var m = j + 1
+    while m < s.len and s[m] >= '0' and s[m] <= '9': m += 1
+    if m > j + 1 and m < s.len and s[m] == ']': j = m + 1
+  if j < s.len and "bcdefgopqstvxEFGTUX".find(str([s[j]])) >= 0: return s[at..j + 1]
+  return ""
+
+fn check_print(var g: tc.Prog, fs: Fs, var v: vet.V, pi: Int, p: P, call: Int, name: Str):
+  var first = 0
+  let ft = vet.ty(g, pi, g.pk[pi].t.a[call])
+  if ft <= 0: return
+  let fu = tc.under(&g, fs, ft)
+  if fu > 0 and g.tk[fu] == tc.TY_FUNC:
+    if not tc.is_variadic(g, fu): return
+    let ps = tc.tlist(g, g.ta[fu])
+    first = ps.len - 1
+    let last = ps[first]
+    if g.tk[last] != tc.TY_SLICE or not empty_iface(&g, fs, g.ta[last]): return
+  let all = ast.items(g.pk[pi].t, g.pk[pi].t.b[call])
+  if all.len <= first: return
+  var args: [Int] = []
+  for i in first..all.len: args.push(all[i])
+  if first == 0:
+    let a0 = all[0]
+    if g.pk[pi].t.k[a0] == ast.N_SELECTOR:
+      let x = g.pk[pi].t.a[a0]
+      if g.pk[pi].t.k[x] == ast.N_IDENT and g.pk[pi].t.names[g.pk[pi].t.s[x]] == "os" and g.pk[pi].t.names[g.pk[pi].t.s[g.pk[pi].t.b[a0]]].startswith("Std"):
+        vet.report(g, &v, call, "printf", name + " does not take io.Writer but has first arg " + format.expr(g.pk[pi].t, a0))
+  let fi = g.pk[pi].t.file[call]
+  let c0 = tc.const_val(&g, fs, pi, fi, args[0], -1, 0)
+  if c0.k == 2:
+    var s = c0.s + ""
+    if s.endswith("%"): s = s[0..s.len - 1]
+    if "%" in s:
+      let m = possible_directive(s)
+      if m.len > 0: vet.report(g, &v, call, "printf", name + " call has possible Printf formatting directive " + m)
+  if name.endswith("ln"):
+    let cl = tc.const_val(&g, fs, pi, fi, args[args.len - 1], -1, 0)
+    if cl.k == 2 and cl.s.endswith("\n"): vet.report(g, &v, call, "printf", name + " arg list ends with redundant newline")
+  for a in args:
+    if is_func_value(g, pi, a): vet.report(g, &v, call, "printf", name + " arg " + format.expr(g.pk[pi].t, a) + " is a func value, not called")
+    let mn = recursive_stringer(&g, fs, pi, p, a)
+    if mn.len > 0: vet.report(g, &v, call, "printf", name + " arg " + format.expr(g.pk[pi].t, a) + " causes recursive call to " + mn + " method")
+
+fn run(var g: tc.Prog, fs: Fs, var v: vet.V, pi: Int, roots: [Int], nodes: [Int], gover: Int, var parent: [Int]):
+  var p = P({}, [])
+  swap(&p.parent, &parent)
+  find_wrappers(&g, fs, pi, &p, roots)
+  # missing ... reports come from the wrapper search
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_CALL: continue
+    if (0 - 1 - n) in p.kinds:
+      let nk0 = name_and_kind(&g, fs, pi, p, n)
+      var desc = "printf"
+      if nk0[0] == K_PRINT: desc = "print"
+      vet.report(g, &v, n, "printf", "missing ... in args forwarded to " + desc + "-like function")
+  for n in nodes:
+    if g.pk[pi].t.k[n] != ast.N_CALL: continue
+    let nk = name_and_kind(&g, fs, pi, p, n)
+    if nk[0] == 0: continue
+    let name = errcheck.full_name(&g, fs, nk[1])
+    if nk[0] == K_PRINTF or nk[0] == K_ERRORF: check_printf(&g, fs, &v, pi, p, nk[0], n, name, gover)
+    else: check_print(&g, fs, &v, pi, p, n, name)
+  swap(&p.parent, &parent)

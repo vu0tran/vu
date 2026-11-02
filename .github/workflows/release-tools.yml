@@ -1,0 +1,282 @@
+# Releases of the drop-in tools, separate from Vu's own (release.yml, v* tags):
+#   vlint-vX.Y.Z    vlint (oxlint):         GitHub release archives + npm (@vu0tran/vlint and its platform packages)
+#   vgolint-vX.Y.Z  vgolint (golangci-lint): GitHub release archives named as golangci-lint's, for golint/install.sh
+#                   and the golint/action composite action, plus a Homebrew formula file
+# Each tool is built on each platform's own runner (packaging/tools/build.sh: a portable -march, Linux
+# binaries static, macOS 12 or later, stripped), smoke-tested there against the original tool's saved
+# output (packaging/tools/smoke.sh), and summed in SHA256SUMS. The tool releases are never marked
+# "latest", so github.com/vu0tran/vu/releases/latest stays Vu's (install.sh relies on it).
+#
+# Actions, release-tools, Run workflow: with no tag, a dry run that builds, smoke-tests and packs
+# everything (npm tarballs included, installed and run in a scratch project) and uploads it as the
+# run's artifacts, publishing nothing; with a tag that exists (vlint-vX.Y.Z or vgolint-vX.Y.Z), that
+# release again (what is already published is skipped). Publishing to npm needs the NPM_TOKEN secret.
+name: release-tools
+on:
+  push:
+    tags: ['vlint-v*', 'vgolint-v*']
+  workflow_dispatch:
+    inputs:
+      tool:
+        description: 'Dry run: which tool to build'
+        type: choice
+        options: [both, vlint, vgolint]
+        default: both
+      tag:
+        description: 'A tag to release (again), e.g. vlint-v0.1.0; empty: a dry run that publishes nothing'
+        required: false
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: release-tools-${{ inputs.tag || github.ref }}
+env:
+  NPM_SCOPE: '@vu0tran'     # the npm scope of vlint's packages (make.mjs --scope)
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      tools: ${{ steps.p.outputs.tools }}
+      version: ${{ steps.p.outputs.version }}
+      tag: ${{ steps.p.outputs.tag }}
+      publish: ${{ steps.p.outputs.publish }}
+    steps:
+      - id: p
+        env:
+          IN_TAG: ${{ inputs.tag }}
+          IN_TOOL: ${{ inputs.tool }}
+        run: |
+          tag="$IN_TAG"
+          if [ -z "$tag" ] && [ "$GITHUB_REF_TYPE" = tag ]; then tag="$GITHUB_REF_NAME"; fi
+          if [ -n "$tag" ]; then
+            tool="${tag%%-v*}"; version="${tag#*-v}"
+            case "$tool" in vlint | vgolint) ;; *) echo "::error::$tag isn't a vlint-v* or vgolint-v* tag"; exit 1 ;; esac
+            echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || { echo "::error::$version (from $tag) isn't a semver version"; exit 1; }
+            tools="[\"$tool\"]"; publish=true
+          else
+            case "$IN_TOOL" in both | "") tools='["vlint","vgolint"]' ;; *) tools="[\"$IN_TOOL\"]" ;; esac
+            version="0.0.0-dev.$GITHUB_RUN_NUMBER"; publish=false
+          fi
+          { echo "tools=$tools"; echo "version=$version"; echo "tag=$tag"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
+          echo "tools $tools, version $version, tag '${tag}', publish $publish"
+
+  build:
+    needs: plan
+    name: ${{ matrix.tool }} ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: ${{ fromJSON(needs.plan.outputs.tools) }}
+        platform: [linux-x64, linux-arm64, darwin-arm64, darwin-x64]
+        include:
+          - platform: linux-x64
+            os: ubuntu-24.04
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            os: macos-15
+          - platform: darwin-x64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    env:
+      TOOL: ${{ matrix.tool }}
+      PLATFORM: ${{ matrix.platform }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.tag || github.ref }}
+      # vgolint's smoke test reads the standard library's source, as golangci-lint does
+      - uses: actions/setup-go@v6
+        if: matrix.tool == 'vgolint'
+        with:
+          go-version: stable
+          cache: false
+      - name: Build
+        run: sh packaging/tools/build.sh "$TOOL" "$VERSION" "$PLATFORM"
+      - name: Smoke test (the archive unpacked elsewhere, on a fixture, against the original's output)
+        run: |
+          mkdir -p "$RUNNER_TEMP/u"
+          tar xzf dist/*.tar.gz -C "$RUNNER_TEMP/u"
+          d=$(ls -d "$RUNNER_TEMP"/u/*/)
+          ls -l "$d"
+          sh packaging/tools/smoke.sh "$TOOL" "$d$TOOL"
+      - name: Smoke test on musl (Alpine), the static binary as it is
+        if: runner.os == 'Linux' && matrix.tool == 'vlint'
+        run: |
+          d=$(ls -d "$RUNNER_TEMP"/u/*/)
+          docker run --rm -v "$PWD/packaging/tools":/t:ro -v "$d":/b:ro alpine:3.22 sh /t/smoke.sh vlint /b/vlint
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.tool }}-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/sums-*.txt
+          if-no-files-found: error
+
+  # the npm packages: made and checked on every run, published for a vlint tag
+  npm:
+    needs: [plan, build, release]
+    if: ${{ !cancelled() && needs.build.result == 'success' && needs.release.result != 'failure' && contains(fromJSON(needs.plan.outputs.tools), 'vlint') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write    # npm provenance
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      PUBLISH: ${{ needs.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.tag || github.ref }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: vlint-*
+          merge-multiple: true
+          path: dist
+      - name: Make the packages
+        run: node packaging/npm/vlint/make.mjs --version "$VERSION" --dist dist --out npm --scope "$NPM_SCOPE"
+      - name: Pack them, install the tarballs in a scratch project, run `npx oxlint` and `npx vlint`
+        run: |
+          mkdir -p tarballs
+          for d in npm/vlint-* npm/vlint; do (cd "$d" && npm pack --pack-destination ../../tarballs); done
+          ls -l tarballs
+          p="$RUNNER_TEMP/proj"; mkdir -p "$p"; cp -R packaging/tools/fixtures/vlint/. "$p/"
+          cd "$p"
+          npm init -y >/dev/null
+          # the platform package from its tarball (the registry doesn't have this version yet), then the main one
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE"/tarballs/*vlint-linux-x64-*.tgz "$(ls "$GITHUB_WORKSPACE"/tarballs/*vlint-[0-9]*.tgz)"
+          npx --no-install oxlint a.ts b.jsx | sort | diff "$GITHUB_WORKSPACE/packaging/tools/fixtures/vlint.expected" -
+          npx --no-install vlint a.ts b.jsx | sort | diff "$GITHUB_WORKSPACE/packaging/tools/fixtures/vlint.expected" -
+          npx --no-install vlint --version
+      - uses: actions/upload-artifact@v5
+        with:
+          name: npm-tarballs
+          path: tarballs/*.tgz
+      - name: Publish (the platform packages first, then the main one); a dry run only checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # (a prerelease, 0.2.0-rc.1, goes out under the dist-tag next, so latest stays the last release)
+          tag=latest; case "$VERSION" in *-*) tag=next ;; esac
+          if [ "$PUBLISH" != true ]; then
+            for d in npm/vlint-* npm/vlint; do (cd "$d" && npm publish --dry-run --access public --tag "$tag"); done
+            exit 0
+          fi
+          [ -n "$NODE_AUTH_TOKEN" ] || { echo "::error::the NPM_TOKEN secret isn't set (see RELEASING.md)"; exit 1; }
+          for d in npm/vlint-* npm/vlint; do
+            name=$(node -p "require('./$d/package.json').name")
+            if [ "$(npm view "$name@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then echo "$name@$VERSION is already published"; continue; fi
+            (cd "$d" && npm publish --provenance --access public --tag "$tag")
+          done
+
+  release:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TOOL: ${{ fromJSON(needs.plan.outputs.tools)[0] }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: ${{ fromJSON(needs.plan.outputs.tools)[0] }}-*
+          merge-multiple: true
+          path: dist
+      - name: Release
+        run: |
+          cd dist
+          cat sums-*.txt > SHA256SUMS
+          cat SHA256SUMS
+          files="$(ls -- *.tar.gz) SHA256SUMS"
+          if [ "$TOOL" = vlint ]; then
+            title="vlint $VERSION"
+            cat > notes.md <<EOF
+          vlint $VERSION: oxlint 1.90.0's default rules, written in Vu ([ts/README.md](https://github.com/$GITHUB_REPOSITORY/tree/$TAG/ts)).
+
+          ## Install
+
+          \`\`\`
+          npm install --save-dev $NPM_SCOPE/vlint@$VERSION
+          \`\`\`
+
+          or in place of oxlint, keeping \`oxlint\` in your scripts: \`"oxlint": "npm:$NPM_SCOPE/vlint@$VERSION"\` in devDependencies.
+          The archives hold the binary alone: Linux x64 and ARM64 (static: any glibc or musl), macOS 12 or later on Apple silicon and Intel. Check them against SHA256SUMS.
+          EOF
+          else
+            title="vgolint $VERSION"
+            sh ../packaging/homebrew/vgolint_formula.sh "$VERSION" SHA256SUMS > vgolint.rb
+            cp ../golint/install.sh install.sh
+            files="$files vgolint.rb install.sh"
+            cat > notes.md <<EOF
+          vgolint $VERSION: \`golangci-lint run\` (2.5.0) written in Vu ([golint/README.md](https://github.com/$GITHUB_REPOSITORY/tree/$TAG/golint)). It needs Go where it runs, as golangci-lint does.
+
+          ## Install
+
+          \`\`\`
+          curl -sSfL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/golint/install.sh | sh -s -- -b \$(go env GOPATH)/bin v$VERSION
+          \`\`\`
+
+          It installs \`vgolint\` and a \`golangci-lint\` link to it. In GitHub Actions: \`uses: $GITHUB_REPOSITORY/golint/action@$TAG\` (see golint/README.md). Archives for Linux amd64 and arm64 (static) and macOS 12 or later (arm64, amd64); check them against SHA256SUMS. vgolint.rb is a Homebrew formula for this release (not published).
+          EOF
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # shellcheck disable=SC2086
+            gh release upload "$TAG" --clobber $files
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" --verify-tag --latest=false --title "$title" --notes-file notes.md $files
+          fi
+
+  # what a user does, against what was published: install.sh / npm from the registry, then the fixture
+  check:
+    needs: [plan, release, npm]
+    if: ${{ !cancelled() && needs.plan.outputs.publish == 'true' && needs.release.result == 'success' && needs.npm.result != 'failure' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TOOL: ${{ fromJSON(needs.plan.outputs.tools)[0] }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.tag }}
+      - uses: actions/setup-go@v6
+        if: env.TOOL == 'vgolint'
+        with:
+          go-version: stable
+          cache: false
+      - uses: actions/setup-node@v5
+        if: env.TOOL == 'vlint'
+        with:
+          node-version: 22
+      - name: vgolint through install.sh
+        if: env.TOOL == 'vgolint'
+        run: |
+          sh golint/install.sh -b "$RUNNER_TEMP/bin" "v$VERSION"
+          test -L "$RUNNER_TEMP/bin/golangci-lint"
+          sh packaging/tools/smoke.sh vgolint "$RUNNER_TEMP/bin/golangci-lint"
+      - name: vlint from npm
+        if: env.TOOL == 'vlint'
+        run: |
+          p="$RUNNER_TEMP/proj"; mkdir -p "$p"; cp -R packaging/tools/fixtures/vlint/. "$p/"
+          cd "$p" && npm init -y >/dev/null
+          # (the registry can take a minute to serve a new version)
+          for _ in 1 2 3 4 5 6; do npm install --no-audit --no-fund "oxlint@npm:$NPM_SCOPE/vlint@$VERSION" && break; sleep 20; done
+          npx --no-install oxlint a.ts b.jsx | sort | diff "$GITHUB_WORKSPACE/packaging/tools/fixtures/vlint.expected" -

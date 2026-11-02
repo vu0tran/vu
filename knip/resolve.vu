@@ -21,6 +21,21 @@ type PathMap:
   prefix: Str
   wildcard: Bool
   values: [Str]      # targets, relative to the project folder
+  scope: Str         # the folder (a workspace) whose files it applies to ("" all)
+
+# a workspace package: its folder, name, exports and imports
+type WsInfo:
+  dir: Str
+  name: Str
+  exports: Value
+  has_exports: Bool
+  imports: Value
+
+# a workspace's tsconfig outDir -> source folder mapping
+type SrcMap:
+  ws_dir: Str
+  src: Str
+  out: Str
 
 type Tsc:
   paths: [PathMap]
@@ -36,18 +51,25 @@ type Resolver:
   tscs: [Tsc]                  # tsconfig files met (paths, baseUrl)
   tsc_of_dir: {Str: Int}       # folder -> its nearest tsconfig.json (index in tscs, -1 none)
   tsc_of_file: {Str: Int}
-  self_name: Str
-  self_exports: Value
-  has_exports: Bool
-  imports_map: Value
+  wsi: [WsInfo]                # the workspaces, deepest first
+  ws_pkgs: {Str: Str}          # workspace package name -> folder
+  srcmaps: [SrcMap]
+  extra_exts: [Str]            # the compilers' extensions (.vue...)
   cache: {Str: Res}
   pkgs: {Str: Value}           # package.json by folder (node_modules lookups)
 
 fn exts() -> [Str]:
   return [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".d.mts", ".d.cts", ".json", ".jsonc"]
 
+fn all_exts(r: Resolver) -> [Str]:
+  if r.extra_exts.len == 0: return exts()
+  var out: [Str] = [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts"]
+  for e in r.extra_exts: out.push(e + "")
+  for e in [".d.ts", ".d.mts", ".d.cts", ".json", ".jsonc"]: out.push(e + "")
+  return out
+
 fn new_resolver(root: Str) -> Resolver:
-  return Resolver(root + "", {}, [], "", false, [], {}, {}, "", json.Null, false, json.Null, {}, {})
+  return Resolver(root + "", {}, [], "", false, [], {}, {}, [], {}, [], [], {}, {})
 
 const BUILTINS = "_http_agent _http_client _http_common _http_incoming _http_outgoing _http_server _stream_duplex _stream_passthrough _stream_readable _stream_transform _stream_wrap _stream_writable _tls_common _tls_wrap assert assert/strict async_hooks buffer child_process cluster console constants crypto dgram diagnostics_channel dns dns/promises domain events fs fs/promises http http2 https inspector inspector/promises module net os path path/posix path/win32 perf_hooks process punycode querystring readline readline/promises repl stream stream/consumers stream/promises stream/web string_decoder sys timers timers/promises tls trace_events tty url util util/types v8 vm wasi worker_threads zlib"
 
@@ -159,7 +181,7 @@ fn load_file(var r: Resolver, fs: Fs, p: Str) -> Str:
     for a in al:
       if real_file(&r, fs, base + a): return base + a
   elif real_file(&r, fs, p): return p + ""
-  for e in exts():
+  for e in all_exts(r):
     if real_file(&r, fs, p + e): return p + e
   return ""
 
@@ -179,7 +201,7 @@ fn load_dir(var r: Resolver, fs: Fs, p: Str) -> Str:
 
 fn load_index(var r: Resolver, fs: Fs, p: Str) -> Str:
   if not is_dir(&r, fs, p): return ""
-  for e in exts():
+  for e in all_exts(r):
     let f = join(p, "index" + e)
     if real_file(&r, fs, f): return f
   return ""
@@ -254,7 +276,9 @@ fn find_package(var r: Resolver, fs: Fs, name: Str, from_dir: Str) -> Str:
   var d = from_dir
   while true:
     let cand = join(d, "node_modules/" + name)
-    if is_dir(&r, fs, cand): return cand
+    if is_dir(&r, fs, cand):
+      if name in r.ws_pkgs: return r.ws_pkgs[name] + ""
+      return cand
     if d == "" or d == ".": break
     if d.startswith("..") and basename(d) == "..":
       # outside the project: keep going up a few levels
@@ -280,6 +304,14 @@ fn resolve_bare(var r: Resolver, fs: Fs, spec: Str, from_dir: Str) -> Res:
   let name = pkg_name(spec)
   let pdir = find_package(&r, fs, name, from_dir)
   if pdir == "": return Res(R_UNRESOLVED, "", "")
+  if not in_node_modules(pdir) and name in r.ws_pkgs:
+    # a workspace package (linked into node_modules): its files are the project's
+    let b = resolve_in_pkg(&r, fs, spec, name, pdir)
+    if b.kind == R_EXTERNAL: return file_res(to_source(&r, fs, b.path))
+    return b
+  return resolve_in_pkg(&r, fs, spec, name, pdir)
+
+fn resolve_in_pkg(var r: Resolver, fs: Fs, spec: Str, name: Str, pdir: Str) -> Res:
   let sub = spec[name.len..spec.len]
   let m = manifest_of(&r, fs, pdir)
   let ex = pkg.get(m, "exports")
@@ -338,6 +370,71 @@ fn resolve(var r: Resolver, fs: Fs, spec0: Str, from: Str) -> Res:
   let res = resolve_uncached(&r, fs, spec, dir)
   r.cache[key] = Res(res.kind, res.path + "", res.pkg + "")
   return res
+
+fn is_dts_name(f: Str) -> Bool:
+  return f.endswith(".d.ts") or f.endswith(".d.mts") or f.endswith(".d.cts")
+
+# the workspace a folder is in (index in wsi, -1 none)
+fn ws_for(r: Resolver, dir: Str) -> Int:
+  for k in 0..r.wsi.len:
+    let d = r.wsi[k].dir
+    if d == "" or dir == d or dir.startswith(d + "/"): return k
+  return -1
+
+# A built file mapped to its source (getModuleSourcePathHandler): dist/x.js -> src/x.ts when the
+# file's workspace maps outDir to a source folder.
+fn to_source(var r: Resolver, fs: Fs, f: Str) -> Str:
+  if r.srcmaps.len == 0 or in_node_modules(f) or f.startswith(".."): return f + ""
+  if (f.endswith(".ts") or f.endswith(".tsx") or f.endswith(".mts") or f.endswith(".cts")) and not is_dts_name(f): return f + ""
+  # (the deepest workspace with maps)
+  var best = ""
+  var found = false
+  for m in r.srcmaps:
+    if m.ws_dir == "" or f.startswith(m.ws_dir + "/"):
+      if not found or m.ws_dir.len > best.len:
+        best = m.ws_dir + ""
+        found = true
+  if not found: return f + ""
+  var pairs: [Str] = []
+  for m in r.srcmaps:
+    if m.ws_dir != best: continue
+    pairs.push(m.src + "")
+    pairs.push(m.out + "")
+  var q = 0
+  while q < pairs.len:
+    let msrc = pairs[q] + ""
+    let mout = pairs[q + 1] + ""
+    q += 2
+    if not (f == mout or f.startswith(mout + "/") or msrc == mout): continue
+    var rest = f[mout.len..f.len]
+    for e in [".d.ts", ".d.mts", ".d.cts", ".d.tsx", ".d.jsx", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx", ".js", ".ts"]:
+      if rest.endswith(e):
+        rest = rest[0..rest.len - e.len]
+        break
+    var basep = msrc + rest
+    if msrc == "": basep = norm(rest)
+    for e in [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts"]:
+      if real_file(&r, fs, basep + e):
+        if basep + e != f: return basep + e
+        break
+  return f + ""
+
+# knip's path mappings whose scope holds the folder, the most specific scope first
+fn scoped_paths(pm: [PathMap], spec: Str, dir: Str) -> [Str]:
+  var idx: [Int] = []
+  for k in 0..pm.len:
+    let m = pm[k]
+    if m.scope != "" and dir != m.scope and not dir.startswith(m.scope + "/"): continue
+    idx.push(k)
+  idx.sort(by: fn(x, y) => pm[x].scope.len > pm[y].scope.len)
+  var out: [Str] = []
+  for k in idx:
+    var one: [PathMap] = []
+    var vals: [Str] = []
+    for v in pm[k].values: vals.push(v + "")
+    one.push(PathMap(pm[k].prefix + "", pm[k].wildcard, vals, ""))
+    for c in mapped_paths(one, spec): out.push(c)
+  return out
 
 fn file_res(p: Str) -> Res:
   if in_node_modules(p): return Res(R_EXTERNAL, p, pkg_from_path(p))
@@ -405,8 +502,8 @@ fn load_tsc(var r: Resolver, fs: Fs, f: Str) -> Int:
       var vals: [Str] = []
       for v in pkg.strs(pkg.get(pm, key)): vals.push(join(pdir, v))
       let st = key.find("*")
-      if st >= 0: t.paths.push(PathMap(key[0..st], true, vals))
-      else: t.paths.push(PathMap(key + "", false, vals))
+      if st >= 0: t.paths.push(PathMap(key[0..st], true, vals, ""))
+      else: t.paths.push(PathMap(key + "", false, vals, ""))
   let i = r.tscs.len
   r.tscs.push(t)
   r.tsc_of_file[f] = i
@@ -460,31 +557,49 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
   if ti >= 0:
     let f = try_paths(&r, fs, ti, spec)
     if f != "": return file_res(f)
-  if spec.startswith("#") and pkg.is_obj(r.imports_map):
-    for tg in map_targets(r.imports_map, spec):
+  let wk = ws_for(r, dir)
+  if spec.startswith("#") and wk >= 0 and pkg.is_obj(r.wsi[wk].imports):
+    let wdir = r.wsi[wk].dir + ""
+    for tg in map_targets(r.wsi[wk].imports, spec):
       if tg.startswith("./"):
-        let f = load_path(&r, fs, norm(tg))
-        if f != "": return file_res(f)
+        let f = load_path(&r, fs, join(wdir, tg))
+        if f != "": return file_res(to_source(&r, fs, f))
       else:
         let b = resolve_bare(&r, fs, tg, dir)
         if b.kind != R_UNRESOLVED: return b
   # the package itself, through its exports
   let name = pkg_name(spec)
-  if r.has_exports and name == r.self_name:
+  if wk >= 0 and r.wsi[wk].has_exports and name == r.wsi[wk].name:
+    let wdir = r.wsi[wk].dir + ""
     let sub = spec[name.len..spec.len]
     var key = "."
     if sub != "": key = "." + sub
-    for tg in map_targets(r.self_exports, key):
-      let f = norm(tg)
-      if real_file(&r, fs, f): return file_res(f)
+    for tg in map_targets(r.wsi[wk].exports, key):
+      let f = join(wdir, tg)
+      if real_file(&r, fs, f): return file_res(to_source(&r, fs, f))
   let b = resolve_bare(&r, fs, spec, dir)
   if b.kind != R_UNRESOLVED: return b
-  # the project's tsconfig paths (knip's own path mappings)
+  # the project's tsconfig paths (knip's own path mappings, per workspace)
   if r.paths.len > 0:
-    var cands = mapped_paths(r.paths, spec)
+    var cands = scoped_paths(r.paths, spec, dir)
     for c in cands:
       let f = load_path(&r, fs, c)
       if f != "": return file_res(f)
+  # a workspace package whose exports point to files not built yet: their sources
+  if name in r.ws_pkgs:
+    let wdir = r.ws_pkgs[name] + ""
+    let m = manifest_of(&r, fs, wdir)
+    let ex = pkg.get(m, "exports")
+    if pkg.is_obj(ex) or pkg.is_text(ex):
+      let sub = spec[name.len..spec.len]
+      var key = "."
+      if sub != "": key = "." + sub
+      for tg in map_targets(ex, key):
+        if not tg.startswith("./"): continue
+        let f = join(wdir, tg)
+        let srcf = to_source(&r, fs, f)
+        if srcf != f: return file_res(srcf)
+        if real_file(&r, fs, f) and not is_dts_name(f): return file_res(f)
   # a path relative to the importing file that exists (knip's last resort)
   let cand = join(dir, spec)
   if real_file(&r, fs, cand) or is_dir(&r, fs, cand): return Res(R_FILE, cand, "")

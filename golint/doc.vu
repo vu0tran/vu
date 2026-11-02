@@ -1,0 +1,895 @@
+# Config documents: YAML, TOML and JSON read into one tree (what viper hands golangci-lint), with
+# lookups by key that ignore case as viper's do.
+#
+# A node is an index into Doc's arrays: kind (K_NULL, K_SCALAR, K_SEQ, K_MAP), text (a scalar's text),
+# kids (a sequence's items or a map's values) and keys (a map's keys, as written).
+
+const K_NULL = 0
+const K_SCALAR = 1
+const K_SEQ = 2
+const K_MAP = 3
+
+type Doc:
+  kind: [Int]
+  text: [Str]
+  quoted: [Bool]
+  kids: [[Int]]
+  keys: [[Str]]
+  err: Str
+  root: Int
+
+fn new_doc() -> Doc:
+  return Doc([], [], [], [], [], "", -1)
+
+fn add(var d: Doc, kind: Int, text: Str) -> Int:
+  d.kind.push(kind)
+  d.text.push(text)
+  d.quoted.push(false)
+  d.kids.push([])
+  d.keys.push([])
+  return d.kind.len - 1
+
+fn lower(s: Str) -> Str:
+  var b = bytes(s)
+  for i in 0..b.len:
+    if b[i] >= 'A' and b[i] <= 'Z': b[i] = b[i] + 32
+  return b.take_str()
+
+# The value under key in map n (keys compared without case), or -1.
+fn get(d: Doc, n: Int, key: Str) -> Int:
+  if n < 0 or d.kind[n] != K_MAP: return -1
+  let lk = lower(key)
+  var found = -1
+  for i in 0..d.keys[n].len:
+    if lower(d.keys[n][i]) == lk: found = d.kids[n][i]
+  return found
+
+# A dotted path of keys ("linters.settings.govet").
+fn at(d: Doc, n: Int, path: Str) -> Int:
+  var cur = n
+  for k in path.split("."):
+    cur = get(d, cur, k)
+    if cur < 0: return -1
+  return cur
+
+fn is_set(d: Doc, n: Int) -> Bool:
+  return n >= 0 and d.kind[n] != K_NULL
+
+fn str_of(d: Doc, n: Int, dflt: Str) -> Str:
+  if n < 0 or d.kind[n] != K_SCALAR: return dflt
+  return d.text[n] + ""
+
+fn bool_of(d: Doc, n: Int, dflt: Bool) -> Bool:
+  if n < 0 or d.kind[n] != K_SCALAR: return dflt
+  let t = lower(d.text[n])
+  if t == "true" or t == "1" or t == "t" or t == "yes" or t == "on": return true
+  if t == "false" or t == "0" or t == "f" or t == "no" or t == "off" or t == "": return false
+  return dflt
+
+fn int_of(d: Doc, n: Int, dflt: Int) -> Int:
+  if n < 0 or d.kind[n] != K_SCALAR: return dflt
+  let v = int(d.text[n].strip()) else dflt
+  return v
+
+# A list of strings as mapstructure decodes one with viper's hooks: a sequence's scalars, or one
+# scalar split at commas.
+fn strs_of(d: Doc, n: Int) -> [Str]:
+  var out: [Str] = []
+  if n < 0: return out
+  if d.kind[n] == K_SEQ:
+    for c in d.kids[n]:
+      if d.kind[c] == K_SCALAR: out.push(d.text[c] + "")
+  elif d.kind[n] == K_SCALAR:
+    if d.text[n].len == 0: return out
+    for p in d.text[n].split(","): out.push(p + "")
+  return out
+
+# Sets path (dotted, created as needed) under the root to a scalar or a list of scalars, as a
+# command-line flag overrides the file.
+fn set_path(var d: Doc, path: Str, val: Str):
+  let n = ensure_path(&d, path)
+  d.kind[n] = K_SCALAR
+  d.text[n] = val + ""
+  d.kids[n] = []
+  d.keys[n] = []
+
+fn set_list(var d: Doc, path: Str, vals: [Str]):
+  let n = ensure_path(&d, path)
+  d.kind[n] = K_SEQ
+  d.keys[n] = []
+  var ks: [Int] = []
+  for v in vals:
+    let c = add(&d, K_SCALAR, v + "")
+    ks.push(c)
+  d.kids[n] = ks
+
+fn ensure_path(var d: Doc, path: Str) -> Int:
+  if d.root < 0 or d.kind[d.root] != K_MAP:
+    d.root = add(&d, K_MAP, "")
+  var cur = d.root
+  for k in path.split("."):
+    var nx = get(d, cur, k)
+    if nx < 0:
+      nx = add(&d, K_NULL, "")
+      if d.kind[cur] != K_MAP:
+        d.kind[cur] = K_MAP
+        d.kids[cur] = []
+        d.keys[cur] = []
+      d.kids[cur].push(nx)
+      d.keys[cur].push(k + "")
+    cur = nx
+  return cur
+
+# ---- YAML
+
+type Y:
+  lines: [Str]
+  ind: [Int]       # indentation of each line, -1 when blank or only a comment
+  li: Int          # current line
+  anchors: {Str: Int}
+  err: Str
+
+fn yaml_comment_at(s: Str, i: Int) -> Bool:
+  return s[i] == '#' and (i == 0 or s[i - 1] == ' ' or s[i - 1] == '\t')
+
+fn y_init(src: Str) -> Y:
+  var lines: [Str] = []
+  var ind: [Int] = []
+  for l0 in src.split("\n"):
+    var l = l0 + ""
+    if l.endswith("\r"): l = l[0..l.len - 1]
+    var i = 0
+    while i < l.len and l[i] == ' ': i += 1
+    var blank = i >= l.len or l[i] == '#'
+    if not blank and i < l.len and l[i] == '\t':
+      var j = i
+      while j < l.len and (l[j] == ' ' or l[j] == '\t'): j += 1
+      if j >= l.len or l[j] == '#': blank = true
+    if l == "---" or l.startswith("--- ") or l == "..." : blank = true
+    if l.startswith("%"): blank = true
+    lines.push(l)
+    if blank: ind.push(-1)
+    else: ind.push(i)
+  return Y(lines, ind, 0, {}, "")
+
+fn y_skip(var y: Y):
+  while y.li < y.lines.len and y.ind[y.li] < 0: y.li += 1
+
+# Where a plain scalar or key ends on line l from col: before " #", and the end of the line.
+fn plain_end(s: Str, from: Int) -> Int:
+  var e = s.len
+  var i = from
+  while i < s.len:
+    if yaml_comment_at(s, i):
+      e = i
+      break
+    i += 1
+  while e > from and (s[e - 1] == ' ' or s[e - 1] == '\t'): e -= 1
+  return e
+
+# The column of the ':' that makes line l (from col) a mapping entry, or -1.
+fn key_colon(s: Str, col: Int) -> Int:
+  var i = col
+  if i < s.len and (s[i] == '"' or s[i] == '\''):
+    let q = s[i]
+    i += 1
+    while i < s.len:
+      if s[i] == '\\' and q == '"':
+        i += 2
+        continue
+      if s[i] == q:
+        if q == '\'' and i + 1 < s.len and s[i + 1] == '\'':
+          i += 2
+          continue
+        break
+      i += 1
+    i += 1
+    while i < s.len and s[i] == ' ': i += 1
+    if i < s.len and s[i] == ':' and (i + 1 >= s.len or s[i + 1] == ' ' or s[i + 1] == '\t'): return i
+    return -1
+  if i < s.len and (s[i] == '[' or s[i] == '{'): return -1
+  while i < s.len:
+    if yaml_comment_at(s, i): return -1
+    if s[i] == ':' and (i + 1 >= s.len or s[i + 1] == ' ' or s[i + 1] == '\t'): return i
+    i += 1
+  return -1
+
+fn unquote_key(s: Str) -> Str:
+  let t = s.strip()
+  if t.len >= 2 and t[0] == '"' and t[t.len - 1] == '"': return dq_unescape(t[1..t.len - 1])
+  if t.len >= 2 and t[0] == '\'' and t[t.len - 1] == '\'': return t[1..t.len - 1].replace("''", "'")
+  return t
+
+fn hexv(c: Byte) -> Int:
+  if c >= '0' and c <= '9': return int(c) - 48
+  if c >= 'a' and c <= 'f': return int(c) - 87
+  if c >= 'A' and c <= 'F': return int(c) - 55
+  return -1
+
+fn dq_unescape(s: Str) -> Str:
+  if s.find("\\") < 0: return s + ""
+  var out = ""
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if c != '\\' or i + 1 >= s.len:
+      out += s[i..i + 1]
+      i += 1
+      continue
+    let e = s[i + 1]
+    i += 2
+    if e == 'n': out += "\n"
+    elif e == 't': out += "\t"
+    elif e == 'r': out += "\r"
+    elif e == '0': out += "\0"
+    elif e == '\\': out += "\\"
+    elif e == '"': out += "\""
+    elif e == '/': out += "/"
+    elif e == ' ': out += " "
+    elif e == 'x' or e == 'u' or e == 'U':
+      var n = 2
+      if e == 'u': n = 4
+      if e == 'U': n = 8
+      var v = 0
+      var k = 0
+      while k < n and i < s.len and hexv(s[i]) >= 0:
+        v = v * 16 + hexv(s[i])
+        i += 1
+        k += 1
+      if v >= 0 and v <= 0x10FFFF and not (v >= 0xD800 and v <= 0xDFFF): out += chr(v)
+    else:
+      out += "\\"
+      out += s[i - 1..i]
+  return out
+
+fn parse_yaml(src: Str) -> Doc:
+  var d = new_doc()
+  var y = y_init(src)
+  y_skip(&y)
+  if y.li >= y.lines.len:
+    d.root = add(&d, K_NULL, "")
+    return d
+  d.root = y_block(&y, &d, y.li, y.ind[y.li], -1)
+  y_skip(&y)
+  if y.err.len == 0 and y.li < y.lines.len:
+    y.err = "yaml: line {y.li + 1}: did not find expected key"
+  d.err = y.err + ""
+  return d
+
+# A node starting at line l, column col; parent is the indentation of the enclosing block (lines
+# indented more than it belong to this node).
+fn y_block(var y: Y, var d: Doc, l: Int, col: Int, parent: Int) -> Int:
+  let s = y.lines[l]
+  var c = col
+  # anchors and tags before the node
+  var anchor = ""
+  while c < s.len and (s[c] == '&' or s[c] == '!'):
+    var e = c
+    while e < s.len and s[e] != ' ': e += 1
+    if s[c] == '&': anchor = s[c + 1..e]
+    c = e
+    while c < s.len and s[c] == ' ': c += 1
+  if c >= s.len or yaml_comment_at(s, c):
+    # the node is on the following lines
+    y.li = l + 1
+    y_skip(&y)
+    var n = -1
+    if y.li < y.lines.len and y.ind[y.li] > parent:
+      n = y_block(&y, &d, y.li, y.ind[y.li], parent)
+    else: n = add(&d, K_NULL, "")
+    if anchor.len > 0: y.anchors[anchor] = n
+    return n
+  var n = -1
+  if s[c] == '-' and (c + 1 >= s.len or s[c + 1] == ' '):
+    n = y_seq(&y, &d, l, c, parent)
+  elif s[c] == '*':
+    let name = s[c + 1..plain_end(s, c)]
+    n = y.anchors.get(name, -1)
+    if n < 0:
+      y.err = "yaml: unknown anchor '{name}' referenced"
+      n = add(&d, K_NULL, "")
+    y.li = l + 1
+  elif key_colon(s, c) >= 0:
+    n = y_map(&y, &d, l, c, parent)
+  elif s[c] == '[' or s[c] == '{':
+    var p = c
+    var li = l
+    n = y_flow(&y, &d, &li, &p)
+    y.li = li + 1
+  elif s[c] == '|' or s[c] == '>':
+    n = y_blockscalar(&y, &d, l, c, parent)
+  elif s[c] == '"' or s[c] == '\'':
+    n = y_quoted(&y, &d, l, c)
+  else:
+    let e = plain_end(s, c)
+    var text = s[c..e]
+    y.li = l + 1
+    # continuation lines of a plain scalar
+    while y.li < y.lines.len and y.ind[y.li] > parent and key_colon(y.lines[y.li], y.ind[y.li]) < 0:
+      let t = y.lines[y.li]
+      if y.ind[y.li] < 0:
+        y.li += 1
+        continue
+      text += " " + t[y.ind[y.li]..plain_end(t, y.ind[y.li])]
+      y.li += 1
+    n = add(&d, K_SCALAR, text)
+    if text == "~" or text == "null" or text == "Null" or text == "NULL": d.kind[n] = K_NULL
+  if anchor.len > 0: y.anchors[anchor] = n
+  return n
+
+fn y_quoted(var y: Y, var d: Doc, l: Int, c: Int) -> Int:
+  let q = y.lines[l][c]
+  var text = ""
+  var li = l
+  var i = c + 1
+  var done = false
+  while not done and li < y.lines.len:
+    let s = y.lines[li]
+    while i < s.len:
+      if q == '"' and s[i] == '\\' and i + 1 < s.len:
+        text += s[i..i + 2]
+        i += 2
+        continue
+      if s[i] == q:
+        if q == '\'' and i + 1 < s.len and s[i + 1] == '\'':
+          text += "'"
+          i += 2
+          continue
+        done = true
+        break
+      text += s[i..i + 1]
+      i += 1
+    if not done:
+      li += 1
+      if li < y.lines.len:
+        text += " "
+        i = 0
+        while i < y.lines[li].len and y.lines[li][i] == ' ': i += 1
+  if not done:
+    y.err = "yaml: line {l + 1}: found unexpected end of stream"
+  y.li = li + 1
+  var t = text
+  if q == '"': t = dq_unescape(text)
+  let n = add(&d, K_SCALAR, t)
+  d.quoted[n] = true
+  return n
+
+fn y_blockscalar(var y: Y, var d: Doc, l: Int, c: Int, parent: Int) -> Int:
+  let s = y.lines[l]
+  let folded = s[c] == '>'
+  var chomp = 0      # 0 clip, 1 strip, 2 keep
+  var i = c + 1
+  var explicit = 0
+  while i < s.len and s[i] != ' ' and s[i] != '#':
+    if s[i] == '-': chomp = 1
+    elif s[i] == '+': chomp = 2
+    elif s[i] >= '1' and s[i] <= '9': explicit = int(s[i]) - 48
+    i += 1
+  var li = l + 1
+  var bind = -1
+  if explicit > 0: bind = parent + explicit
+  var parts: [Str] = []
+  while li < y.lines.len:
+    let t = y.lines[li]
+    var k = 0
+    while k < t.len and t[k] == ' ': k += 1
+    if k >= t.len:
+      parts.push("")
+      li += 1
+      continue
+    if bind < 0:
+      if k <= parent: break
+      bind = k
+    if k < bind: break
+    parts.push(t[bind..t.len])
+    li += 1
+  # trailing blank lines
+  var nblank = 0
+  while parts.len > 0 and parts[parts.len - 1].len == 0:
+    parts.pop()
+    nblank += 1
+  var text = ""
+  if folded:
+    var prev_blank = false
+    for pi in 0..parts.len:
+      let p = parts[pi]
+      if pi > 0:
+        if p.len == 0: text += "\n"
+        elif prev_blank or p.startswith(" ") or parts[pi - 1].startswith(" "): text += ""
+        else: text += " "
+      text += p
+      prev_blank = p.len == 0
+  else: text = "\n".join(parts)
+  if parts.len > 0:
+    if chomp == 0: text += "\n"
+    elif chomp == 2:
+      text += "\n"
+      for k in 0..nblank: text += "\n"
+  y.li = li
+  let n = add(&d, K_SCALAR, text)
+  d.quoted[n] = true
+  return n
+
+fn y_seq(var y: Y, var d: Doc, l: Int, col: Int, parent: Int) -> Int:
+  let n = add(&d, K_SEQ, "")
+  var li = l
+  while true:
+    let s = y.lines[li]
+    var c = col + 1
+    while c < s.len and s[c] == ' ': c += 1
+    var item = -1
+    if c >= s.len or yaml_comment_at(s, c):
+      y.li = li + 1
+      y_skip(&y)
+      if y.li < y.lines.len and y.ind[y.li] > col: item = y_block(&y, &d, y.li, y.ind[y.li], col)
+      else: item = add(&d, K_NULL, "")
+    else:
+      item = y_block(&y, &d, li, c, col)
+    d.kids[n].push(item)
+    y_skip(&y)
+    if y.li >= y.lines.len or y.ind[y.li] != col: break
+    let t = y.lines[y.li]
+    if not (t[col] == '-' and (col + 1 >= t.len or t[col + 1] == ' ')): break
+    li = y.li
+  return n
+
+fn y_map(var y: Y, var d: Doc, l: Int, col: Int, parent: Int) -> Int:
+  let n = add(&d, K_MAP, "")
+  var li = l
+  while true:
+    let s = y.lines[li]
+    let kc = key_colon(s, col)
+    if kc < 0:
+      y.err = "yaml: line {li + 1}: could not find expected ':'"
+      y.li = li + 1
+      break
+    let key = unquote_key(s[col..kc])
+    var c = kc + 1
+    while c < s.len and (s[c] == ' ' or s[c] == '\t'): c += 1
+    var val = -1
+    if c >= s.len or yaml_comment_at(s, c):
+      y.li = li + 1
+      y_skip(&y)
+      if y.li < y.lines.len and y.ind[y.li] > col:
+        val = y_block(&y, &d, y.li, y.ind[y.li], col)
+      elif y.li < y.lines.len and y.ind[y.li] == col and y.lines[y.li][col] == '-' and (col + 1 >= y.lines[y.li].len or y.lines[y.li][col + 1] == ' '):
+        val = y_seq(&y, &d, y.li, col, col - 1)
+      else: val = add(&d, K_NULL, "")
+    else:
+      val = y_block(&y, &d, li, c, col)
+    if key == "<<" and d.kind[val] == K_MAP:
+      for i in 0..d.keys[val].len:
+        d.keys[n].push(d.keys[val][i] + "")
+        d.kids[n].push(d.kids[val][i])
+    else:
+      d.keys[n].push(key)
+      d.kids[n].push(val)
+    y_skip(&y)
+    if y.li >= y.lines.len or y.ind[y.li] != col: break
+    let t = y.lines[y.li]
+    if t[col] == '-' and (col + 1 >= t.len or t[col + 1] == ' '): break
+    li = y.li
+  return n
+
+# Flow collections, possibly over several lines; li and p are advanced past the closing bracket.
+fn y_flow_ws(var y: Y, var li: Int, var p: Int):
+  while li < y.lines.len:
+    let s = y.lines[li]
+    while p < s.len and (s[p] == ' ' or s[p] == '\t'): p += 1
+    if p < s.len and not (s[p] == '#' and (p == 0 or s[p - 1] == ' ' or s[p - 1] == '\t')): return
+    li += 1
+    p = 0
+
+fn y_flow(var y: Y, var d: Doc, var li: Int, var p: Int) -> Int:
+  y_flow_ws(&y, &li, &p)
+  if li >= y.lines.len:
+    y.err = "yaml: found unexpected end of stream"
+    return add(&d, K_NULL, "")
+  let s = y.lines[li]
+  let open = s[p]
+  if open == '[' or open == '{':
+    var n = add(&d, K_SEQ, "")
+    if open == '{': d.kind[n] = K_MAP
+    var close: Byte = ']'
+    if open == '{': close = '}'
+    p += 1
+    while true:
+      y_flow_ws(&y, &li, &p)
+      if li >= y.lines.len:
+        y.err = "yaml: did not find expected ',' or '{chr(int(close))}'"
+        return n
+      if y.lines[li][p] == close:
+        p += 1
+        return n
+      let item = y_flow(&y, &d, &li, &p)
+      y_flow_ws(&y, &li, &p)
+      if li < y.lines.len and y.lines[li][p] == ':':
+        p += 1
+        let val = y_flow(&y, &d, &li, &p)
+        if open == '{':
+          d.keys[n].push(d.text[item] + "")
+          d.kids[n].push(val)
+        else:
+          let m = add(&d, K_MAP, "")
+          d.keys[m].push(d.text[item] + "")
+          d.kids[m].push(val)
+          d.kids[n].push(m)
+      else:
+        if open == '{':
+          d.keys[n].push(d.text[item] + "")
+          d.kids[n].push(add(&d, K_NULL, ""))
+        else: d.kids[n].push(item)
+      y_flow_ws(&y, &li, &p)
+      if li < y.lines.len and y.lines[li][p] == ',': p += 1
+    return n
+  if open == '"' or open == '\'':
+    # a quoted scalar inside a flow collection (one line)
+    var i = p + 1
+    var text = ""
+    while i < s.len:
+      if open == '"' and s[i] == '\\' and i + 1 < s.len:
+        text += s[i..i + 2]
+        i += 2
+        continue
+      if s[i] == open:
+        if open == '\'' and i + 1 < s.len and s[i + 1] == '\'':
+          text += "'"
+          i += 2
+          continue
+        break
+      text += s[i..i + 1]
+      i += 1
+    p = i + 1
+    var t = text
+    if open == '"': t = dq_unescape(text)
+    let n = add(&d, K_SCALAR, t)
+    d.quoted[n] = true
+    return n
+  # a plain scalar: up to , ] } or ": "
+  var i = p
+  while i < s.len:
+    let ch = s[i]
+    if ch == ',' or ch == ']' or ch == '}': break
+    if ch == ':' and (i + 1 >= s.len or s[i + 1] == ' ' or s[i + 1] == ',' or s[i + 1] == ']' or s[i + 1] == '}'): break
+    if ch == '#' and i > 0 and s[i - 1] == ' ': break
+    i += 1
+  let text = s[p..i].strip()
+  p = i
+  let n = add(&d, K_SCALAR, text)
+  if text == "~" or text == "null": d.kind[n] = K_NULL
+  return n
+
+# ---- JSON
+
+type J:
+  s: Str
+  i: Int
+  err: Str
+
+fn j_ws(var j: J):
+  while j.i < j.s.len and (j.s[j.i] == ' ' or j.s[j.i] == '\t' or j.s[j.i] == '\n' or j.s[j.i] == '\r'): j.i += 1
+
+fn j_value(var j: J, var d: Doc) -> Int:
+  j_ws(&j)
+  if j.i >= j.s.len:
+    j.err = "unexpected end of JSON input"
+    return add(&d, K_NULL, "")
+  let c = j.s[j.i]
+  if c == '{':
+    let n = add(&d, K_MAP, "")
+    j.i += 1
+    j_ws(&j)
+    if j.i < j.s.len and j.s[j.i] == '}':
+      j.i += 1
+      return n
+    while j.err.len == 0:
+      j_ws(&j)
+      let k = j_value(&j, &d)
+      j_ws(&j)
+      if j.i >= j.s.len or j.s[j.i] != ':':
+        j.err = "invalid character after object key"
+        return n
+      j.i += 1
+      let v = j_value(&j, &d)
+      d.keys[n].push(d.text[k] + "")
+      d.kids[n].push(v)
+      j_ws(&j)
+      if j.i < j.s.len and j.s[j.i] == ',':
+        j.i += 1
+        continue
+      if j.i < j.s.len and j.s[j.i] == '}':
+        j.i += 1
+        return n
+      j.err = "invalid character after object key:value pair"
+    return n
+  if c == '[':
+    let n = add(&d, K_SEQ, "")
+    j.i += 1
+    j_ws(&j)
+    if j.i < j.s.len and j.s[j.i] == ']':
+      j.i += 1
+      return n
+    while j.err.len == 0:
+      let v = j_value(&j, &d)
+      d.kids[n].push(v)
+      j_ws(&j)
+      if j.i < j.s.len and j.s[j.i] == ',':
+        j.i += 1
+        continue
+      if j.i < j.s.len and j.s[j.i] == ']':
+        j.i += 1
+        return n
+      j.err = "invalid character after array element"
+    return n
+  if c == '"':
+    var i = j.i + 1
+    while i < j.s.len and j.s[i] != '"':
+      if j.s[i] == '\\': i += 1
+      i += 1
+    let raw = j.s[j.i + 1..min(i, j.s.len)]
+    j.i = i + 1
+    let n = add(&d, K_SCALAR, dq_unescape(raw))
+    d.quoted[n] = true
+    return n
+  var i = j.i
+  while i < j.s.len and not (j.s[i] == ',' or j.s[i] == '}' or j.s[i] == ']' or j.s[i] == ' ' or j.s[i] == '\n' or j.s[i] == '\t' or j.s[i] == '\r'): i += 1
+  let text = j.s[j.i..i]
+  j.i = i
+  if text.len == 0:
+    j.err = "invalid character '{j.s[j.i..j.i + 1]}' looking for beginning of value"
+    j.i += 1
+    return add(&d, K_NULL, "")
+  if text == "null": return add(&d, K_NULL, "")
+  return add(&d, K_SCALAR, text)
+
+fn parse_json(src: Str) -> Doc:
+  var d = new_doc()
+  var j = J(src + "", 0, "")
+  d.root = j_value(&j, &d)
+  j_ws(&j)
+  if j.err.len == 0 and j.i < j.s.len: j.err = "invalid character after top-level value"
+  d.err = j.err + ""
+  return d
+
+# ---- TOML
+
+type T:
+  s: Str
+  i: Int
+  line: Int
+  err: Str
+
+fn t_ws(var t: T):
+  while t.i < t.s.len and (t.s[t.i] == ' ' or t.s[t.i] == '\t'): t.i += 1
+
+# Spaces, newlines and comments (inside arrays).
+fn t_wsnl(var t: T):
+  while t.i < t.s.len:
+    let c = t.s[t.i]
+    if c == ' ' or c == '\t' or c == '\r': t.i += 1
+    elif c == '\n':
+      t.i += 1
+      t.line += 1
+    elif c == '#':
+      while t.i < t.s.len and t.s[t.i] != '\n': t.i += 1
+    else: return
+
+fn t_key_part(var t: T) -> Str:
+  t_ws(&t)
+  if t.i < t.s.len and (t.s[t.i] == '"' or t.s[t.i] == '\''):
+    let q = t.s[t.i]
+    var i = t.i + 1
+    while i < t.s.len and t.s[i] != q and t.s[i] != '\n':
+      if q == '"' and t.s[i] == '\\': i += 1
+      i += 1
+    var k = t.s[t.i + 1..min(i, t.s.len)]
+    if q == '"': k = dq_unescape(k)
+    t.i = i + 1
+    return k
+  let st = t.i
+  while t.i < t.s.len:
+    let c = t.s[t.i]
+    if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-': t.i += 1
+    else: break
+  if t.i == st: t.err = "toml: line {t.line}: expected a key"
+  return t.s[st..t.i]
+
+fn t_key(var t: T) -> [Str]:
+  var parts: [Str] = []
+  parts.push(t_key_part(&t))
+  while true:
+    t_ws(&t)
+    if t.i < t.s.len and t.s[t.i] == '.':
+      t.i += 1
+      parts.push(t_key_part(&t))
+    else: break
+  return parts
+
+# The map under keys from n, creating maps as needed; for an array of tables, its last element.
+fn t_descend(var d: Doc, n: Int, keys: [Str], cnt: Int) -> Int:
+  var cur = n
+  for ki in 0..cnt:
+    let k = keys[ki]
+    var nx = get(d, cur, k)
+    if nx < 0:
+      nx = add(&d, K_MAP, "")
+      d.keys[cur].push(k + "")
+      d.kids[cur].push(nx)
+    if d.kind[nx] == K_SEQ and d.kids[nx].len > 0: nx = d.kids[nx][d.kids[nx].len - 1]
+    cur = nx
+  return cur
+
+fn t_string(var t: T) -> Str:
+  let q = t.s[t.i]
+  # multi-line forms
+  if t.i + 2 < t.s.len and t.s[t.i + 1] == q and t.s[t.i + 2] == q:
+    var st = t.i + 3
+    if st < t.s.len and t.s[st] == '\n': st += 1
+    elif st + 1 < t.s.len and t.s[st] == '\r' and t.s[st + 1] == '\n': st += 2
+    var close = "\"\"\""
+    if q == '\'': close = "'''"
+    let e = t.s.find(close, st)
+    if e < 0:
+      t.err = "toml: unterminated string"
+      t.i = t.s.len
+      return ""
+    var en = e
+    while en + 3 < t.s.len and t.s[en + 3] == q: en += 1
+    let raw = t.s[st..en]
+    t.line += raw.count("\n")
+    t.i = en + 3
+    if q == '\'': return raw
+    # line-ending backslashes
+    var out = ""
+    var i = 0
+    while i < raw.len:
+      if raw[i] == '\\':
+        var j = i + 1
+        while j < raw.len and (raw[j] == ' ' or raw[j] == '\t' or raw[j] == '\r'): j += 1
+        if j < raw.len and raw[j] == '\n':
+          while j < raw.len and (raw[j] == ' ' or raw[j] == '\t' or raw[j] == '\n' or raw[j] == '\r'): j += 1
+          i = j
+          continue
+      out += raw[i..i + 1]
+      if raw[i] == '\\' and i + 1 < raw.len:
+        out += raw[i + 1..i + 2]
+        i += 2
+        continue
+      i += 1
+    return dq_unescape(out)
+  var i = t.i + 1
+  while i < t.s.len and t.s[i] != q and t.s[i] != '\n':
+    if q == '"' and t.s[i] == '\\': i += 1
+    i += 1
+  let raw = t.s[t.i + 1..min(i, t.s.len)]
+  t.i = i + 1
+  if q == '\'': return raw
+  return dq_unescape(raw)
+
+fn t_value(var t: T, var d: Doc) -> Int:
+  t_ws(&t)
+  if t.i >= t.s.len:
+    t.err = "toml: expected a value"
+    return add(&d, K_NULL, "")
+  let c = t.s[t.i]
+  if c == '"' or c == '\'':
+    let n = add(&d, K_SCALAR, t_string(&t))
+    d.quoted[n] = true
+    return n
+  if c == '[':
+    let n = add(&d, K_SEQ, "")
+    t.i += 1
+    while t.err.len == 0:
+      t_wsnl(&t)
+      if t.i >= t.s.len:
+        t.err = "toml: unterminated array"
+        return n
+      if t.s[t.i] == ']':
+        t.i += 1
+        return n
+      let v = t_value(&t, &d)
+      d.kids[n].push(v)
+      t_wsnl(&t)
+      if t.i < t.s.len and t.s[t.i] == ',': t.i += 1
+    return n
+  if c == '{':
+    let n = add(&d, K_MAP, "")
+    t.i += 1
+    while t.err.len == 0:
+      t_ws(&t)
+      if t.i >= t.s.len:
+        t.err = "toml: unterminated inline table"
+        return n
+      if t.s[t.i] == '}':
+        t.i += 1
+        return n
+      let keys = t_key(&t)
+      t_ws(&t)
+      if t.i >= t.s.len or t.s[t.i] != '=':
+        t.err = "toml: line {t.line}: expected '='"
+        return n
+      t.i += 1
+      let v = t_value(&t, &d)
+      var parent = n
+      if keys.len > 1: parent = t_descend(&d, n, keys, keys.len - 1)
+      d.keys[parent].push(keys[keys.len - 1] + "")
+      d.kids[parent].push(v)
+      t_ws(&t)
+      if t.i < t.s.len and t.s[t.i] == ',': t.i += 1
+    return n
+  let st = t.i
+  while t.i < t.s.len:
+    let ch = t.s[t.i]
+    if ch == ',' or ch == ']' or ch == '}' or ch == '\n' or ch == '#' or ch == '\r': break
+    t.i += 1
+  var text = t.s[st..t.i].strip()
+  text = text.replace("_", "")
+  return add(&d, K_SCALAR, text)
+
+fn parse_toml(src: Str) -> Doc:
+  var d = new_doc()
+  d.root = add(&d, K_MAP, "")
+  var t = T(src + "", 0, 1, "")
+  var cur = d.root
+  while t.err.len == 0:
+    t_wsnl(&t)
+    if t.i >= t.s.len: break
+    if t.s[t.i] == '[':
+      let arr = t.i + 1 < t.s.len and t.s[t.i + 1] == '['
+      if arr: t.i += 2
+      else: t.i += 1
+      let keys = t_key(&t)
+      t_ws(&t)
+      if arr:
+        if t.i + 1 < t.s.len and t.s[t.i] == ']' and t.s[t.i + 1] == ']': t.i += 2
+        else: t.err = "toml: line {t.line}: expected ']]'"
+        let parent = t_descend(&d, d.root, keys, keys.len - 1)
+        var a = get(d, parent, keys[keys.len - 1])
+        if a < 0:
+          a = add(&d, K_SEQ, "")
+          d.keys[parent].push(keys[keys.len - 1] + "")
+          d.kids[parent].push(a)
+        let m = add(&d, K_MAP, "")
+        d.kids[a].push(m)
+        cur = m
+      else:
+        if t.i < t.s.len and t.s[t.i] == ']': t.i += 1
+        else: t.err = "toml: line {t.line}: expected ']'"
+        cur = t_descend(&d, d.root, keys, keys.len)
+      continue
+    let keys = t_key(&t)
+    t_ws(&t)
+    if t.i >= t.s.len or t.s[t.i] != '=':
+      if t.err.len == 0: t.err = "toml: line {t.line}: expected '=' after a key"
+      break
+    t.i += 1
+    let v = t_value(&t, &d)
+    var parent = cur
+    if keys.len > 1: parent = t_descend(&d, cur, keys, keys.len - 1)
+    d.keys[parent].push(keys[keys.len - 1] + "")
+    d.kids[parent].push(v)
+    t_ws(&t)
+    if t.i < t.s.len and t.s[t.i] == '#':
+      while t.i < t.s.len and t.s[t.i] != '\n': t.i += 1
+    if t.i < t.s.len and t.s[t.i] != '\n' and t.s[t.i] != '\r':
+      t.err = "toml: line {t.line}: expected a newline after a value"
+  d.err = t.err + ""
+  return d
+
+# A config file by its extension (none: YAML, as golangci-lint assumes).
+fn parse_file(path: Str, src: Str) -> Doc:
+  if path.endswith(".json"): return parse_json(src)
+  if path.endswith(".toml"): return parse_toml(src)
+  return parse_yaml(src)
+
+# The tree as JSON-ish text, for tests.
+fn dump(d: Doc, n: Int) -> Str:
+  if n < 0: return "-"
+  if d.kind[n] == K_NULL: return "null"
+  if d.kind[n] == K_SCALAR: return "\"" + d.text[n].replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
+  var parts: [Str] = []
+  if d.kind[n] == K_SEQ:
+    for c in d.kids[n]: parts.push(dump(d, c))
+    return "[" + ", ".join(parts) + "]"
+  for i in 0..d.keys[n].len: parts.push("\"" + d.keys[n][i] + "\": " + dump(d, d.kids[n][i]))
+  return "{{" + ", ".join(parts) + "}}"

@@ -1,0 +1,543 @@
+# Issues and knip's reporters (reporters/*.js) as they print when standard output isn't a terminal:
+# symbols (the default), compact, json, markdown, codeowners, disclosure; and the configuration hints
+# (on standard error).
+
+import json
+import glob
+import opts
+
+type Issue:
+  typ: Str          # an issue type (opts.issue_types)
+  file: Str         # project-relative path
+  symbol: Str
+  display: Str      # what the symbol column shows
+  stype: Str        # symbol type ("" none)
+  parent: Str
+  line: Int         # 0: none
+  col: Int
+  pos: Int
+  extra: Str        # duplicates: their names and positions as JSON
+  ws: Str           # workspace name
+  severity: Str
+  fix: [Int]        # what --fix removes (start, end, flags), empty: nothing
+  fixed: Bool
+
+fn issue(typ: Str, file: Str, symbol: Str) -> Issue:
+  return Issue(typ + "", file + "", symbol + "", symbol + "", "", "", 0, 0, 0, "", ".", "error", [], false)
+
+fn copy_issue(i: Issue) -> Issue:
+  var fix: [Int] = []
+  for x in i.fix: fix.push(x)
+  return Issue(i.typ + "", i.file + "", i.symbol + "", i.display + "", i.stype + "", i.parent + "", i.line, i.col, i.pos, i.extra + "", i.ws + "", i.severity + "", fix, i.fixed)
+
+type Hint:
+  typ: Str
+  identifier: Str
+  ws: Str          # workspace name ("" none)
+  file: Str        # project-relative ("" none: the config file or ".")
+  size: Int
+
+# ---- ICU-like string order (Intl.Collator's root collation for ASCII: punctuation, digits, letters
+# without case first, then lowercase before uppercase)
+
+const COLL = " _-,;:!?.'\"()[]{{}}@*/\\&#%`^+<=>|~$0123456789aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ"
+
+fn coll_table() -> [Int]:
+  var prim = [0] * 256
+  var tert = [0] * 256
+  var rank = 1
+  var i = 0
+  while i < COLL.len:
+    let c = int(COLL[i])
+    if c >= 97 and c <= 122:
+      prim[c] = rank
+      prim[c - 32] = rank
+      tert[c] = 0
+      tert[c - 32] = 1
+      rank += 1
+      i += 2
+      continue
+    prim[c] = rank
+    rank += 1
+    i += 1
+  for b in 128..256: prim[b] = 1000 + b
+  for b in 0..32: prim[b] = b - 32
+  var out: [Int] = []
+  for b in 0..256: out.push(prim[b])
+  for b in 0..256: out.push(tert[b])
+  return out
+
+fn coll_cmp(t: [Int], a: Str, b: Str) -> Int:
+  let n = min(a.len, b.len)
+  for i in 0..n:
+    let pa = t[int(a[i])]
+    let pb = t[int(b[i])]
+    if pa != pb:
+      if pa < pb: return -1
+      return 1
+  if a.len != b.len:
+    if a.len < b.len: return -1
+    return 1
+  for i in 0..n:
+    let ta = t[256 + int(a[i])]
+    let tb = t[256 + int(b[i])]
+    if ta != tb:
+      if ta < tb: return -1
+      return 1
+  return 0
+
+fn issue_before(c: [Int], a: Issue, b: Issue) -> Bool:
+  if a.file != b.file: return coll_cmp(c, a.file, b.file) < 0
+  if a.line != b.line: return a.line < b.line
+  return a.col < b.col
+
+fn sorted_issues(c: [Int], xs: [Issue]) -> [Issue]:
+  var out: [Issue] = []
+  for x in xs: out.push(copy_issue(x))
+  out.sort(by: fn(a, b) => issue_before(c, a, b))
+  return out
+
+# ---- the table (util/table.js)
+
+# text width in characters (UTF-8 code points)
+fn width(s: Str) -> Int:
+  var n = 0
+  for i in 0..s.len:
+    if (s[i] & 0xC0) != 0x80: n += 1
+  return n
+
+fn pad_end(s: Str, w: Int) -> Str:
+  var out = s + ""
+  var n = width(s)
+  while n < w:
+    out += " "
+    n += 1
+  return out
+
+fn truncate_end(s: Str, w: Int) -> Str:
+  if width(s) <= w: return s + ""
+  let cs = s.chars()
+  var out = ""
+  for i in 0..(w - 1):
+    if i < cs.len: out += cs[i]
+  return out + "…"
+
+fn truncate_start(s: Str, w: Int) -> Str:
+  if width(s) <= w: return s + ""
+  let cs = s.chars()
+  let keep = w - 1
+  var out = "…"
+  for i in (cs.len - keep)..cs.len: out += cs[i]
+  return out
+
+# rows of cells; present: which columns have a value in some row; modes 0 end, 1 start, 2 none
+fn table(rows: [[Str]], present: [Bool], modes: [Int]) -> [Str]:
+  var cols: [Int] = []
+  for c in 0..present.len:
+    if present[c]: cols.push(c)
+  var widths: [Int] = []
+  for c in cols:
+    var m = 0
+    for r in rows:
+      let w = width(r[c])
+      if w > m: m = w
+    widths.push(m)
+  var sep = 0
+  if cols.len > 1: sep = (cols.len - 1) * 2
+  var total = sep
+  for w in widths: total += w
+  let max_width = 120
+  if total > max_width:
+    var reserved = 0
+    var trunc: [Int] = []
+    for k in 0..cols.len:
+      if modes[cols[k]] == 2: reserved += widths[k]
+      else: trunc.push(k)
+    if trunc.len > 0:
+      var budget = max_width - sep - reserved
+      if budget < 0: budget = 0
+      var orig: [Int] = []
+      for k in 0..cols.len: orig.push(widths[k])
+      var unresolved: [Int] = []
+      for k in trunc: unresolved.push(k)
+      var remaining = budget
+      var changed = true
+      while changed and unresolved.len > 0:
+        changed = false
+        let share = remaining / unresolved.len
+        var next: [Int] = []
+        for k in unresolved:
+          if orig[k] <= share:
+            widths[k] = orig[k]
+            remaining -= orig[k]
+            changed = true
+          else: next.push(k)
+        unresolved = next
+      if unresolved.len > 0:
+        var over = 0
+        for k in unresolved: over += orig[k] - 4
+        var excess = remaining - unresolved.len * 4
+        if excess < 0: excess = 0
+        var dist = 0
+        for k in unresolved:
+          var share = 0
+          if over > 0: share = (orig[k] - 4) * excess / over
+          widths[k] = 4 + share
+          dist += share
+        let left = excess - dist
+        if left > 0: widths[unresolved[0]] += left
+  var out: [Str] = []
+  for r in rows:
+    var line = ""
+    for k in 0..cols.len:
+      let c = cols[k]
+      let padded = pad_end(r[c], widths[k])
+      var cell = padded
+      if modes[c] == 1: cell = truncate_start(padded, widths[k])
+      elif modes[c] == 0: cell = truncate_end(padded, widths[k])
+      if k > 0: line += "  "
+      line += cell
+    out.push(line)
+  return out
+
+# the issues of a type, grouped by file (in the order each file's first issue came), as knip keeps them
+fn of_type(xs: [Issue], t: Str) -> [Issue]:
+  var order: {Str: Int} = {}
+  var groups: [[Issue]] = []
+  for i in xs:
+    if i.typ != t: continue
+    if not (i.file in order):
+      order[i.file] = groups.len
+      groups.push([])
+    groups[order[i.file]].push(copy_issue(i))
+  var out: [Issue] = []
+  for g in groups:
+    for i in g: out.push(copy_issue(i))
+  return out
+
+fn type_table(c: [Int], xs: [Issue], t: Str) -> [Str]:
+  let sorted = sorted_issues(c, xs)
+  var rows: [[Str]] = []
+  var present = [false, false, false, false, false]
+  for i in sorted:
+    var sym = ""
+    if t != "files":
+      sym = i.display + ""
+      present[0] = true
+    var par = ""
+    if i.parent != "":
+      par = i.parent + ""
+      present[1] = true
+    var st = ""
+    if i.stype != "":
+      st = i.stype + ""
+      present[2] = true
+    var fp = i.file + ""
+    if t != "files" and i.line > 0: fp = fp + ":{i.line}:{i.col}"
+    present[3] = true
+    var fx = ""
+    if i.fixed:
+      fx = "(removed)"
+      present[4] = true
+    rows.push([sym, par, st, fp, fx])
+  return table(rows, present, [0, 0, 2, 1, 0])
+
+# ---- reporters (each returns the text written to standard output, "" for none)
+
+fn symbols(c: [Int], on: {Str: Bool}, xs: [Issue], max_show: Int) -> Str:
+  var lines: [Str] = []
+  for t in opts.issue_types():
+    if not on[t]: continue
+    let all = of_type(xs, t)
+    if all.len == 0: continue
+    lines.push(opts.title_of(t) + " ({all.len})")
+    if max_show >= 0 and all.len > max_show:
+      var shown: [Issue] = []
+      for k in 0..max_show: shown.push(copy_issue(all[k]))
+      if shown.len > 0:
+        for l in type_table(c, shown, t): lines.push(l)
+      lines.push("…{all.len - max_show} more items")
+    else:
+      for l in type_table(c, all, t): lines.push(l)
+  return "\n".join(lines)
+
+fn disclosure(c: [Int], on: {Str: Bool}, xs: [Issue]) -> Str:
+  var groups = 0
+  for t in opts.issue_types():
+    if on[t]: groups += 1
+  var lines: [Str] = []
+  for t in opts.issue_types():
+    if not on[t]: continue
+    let all = of_type(xs, t)
+    if all.len == 0: continue
+    var head = "<details>\n"
+    if groups > 1: head += "<summary>" + opts.title_of(t) + " ({all.len})</summary>\n"
+    head += "\n```"
+    lines.push(head)
+    lines.push("\n".join(type_table(c, all, t)))
+    lines.push("```\n\n</details>\n")
+  return "\n".join(lines)
+
+# files in the order their first issue was added, with the issues of each
+fn by_file(xs: [Issue]) -> [[Issue]]:
+  var order: {Str: Int} = {}
+  var out: [[Issue]] = []
+  for i in xs:
+    if not (i.file in order):
+      order[i.file] = out.len
+      out.push([])
+    out[order[i.file]].push(copy_issue(i))
+  return out
+
+fn issue_line(owner: Str, file: Str, syms: Str, parent: Str) -> Str:
+  var s = ""
+  if owner != "": s = owner + " "
+  s += file
+  if syms != "": s += ": " + syms
+  if parent != "": s += " (" + parent + ")"
+  return s
+
+fn js_less(a: Str, b: Str) -> Bool:
+  return a < b
+
+fn compact(on: {Str: Bool}, xs: [Issue]) -> Str:
+  var lines: [Str] = []
+  for t in opts.issue_types():
+    if not on[t]: continue
+    let all = of_type(xs, t)
+    if all.len == 0: continue
+    # one line per file (duplicates: one per issue), sorted by path (JavaScript's sort with a > b ? 1 : -1)
+    var recs: [[Str]] = []
+    if t == "duplicates":
+      for i in all: recs.push([i.file + "", i.symbol.replace("|", ", "), i.parent + ""])
+    else:
+      for g in by_file(all):
+        var names: [Str] = []
+        for i in g: names.push(i.symbol + "")
+        recs.push([g[0].file + "", ", ".join(names), g[0].parent + ""])
+    recs.sort(by: fn(a, b) => js_less(a[0], b[0]))
+    lines.push(opts.title_of(t) + " ({recs.len})")
+    for r in recs: lines.push(issue_line("", r[0], r[1], r[2]))
+  return "\n".join(lines)
+
+fn md_symbol(i: Issue) -> Str:
+  return i.symbol.replace("|", "\\|")
+
+fn md_path(i: Issue) -> Str:
+  if i.line > 0 and i.col > 0: return i.file + ":{i.line}:{i.col}"
+  return i.file + ""
+
+fn markdown(on: {Str: Bool}, xs: [Issue]) -> Str:
+  var lines: [Str] = ["# Knip report\n"]
+  for t in opts.issue_types():
+    if not on[t]: continue
+    let all = of_type(xs, t)
+    if all.len == 0: continue
+    lines.push("## " + opts.title_of(t) + " ({all.len})\n")
+    var ls = 0
+    var lp = 0
+    for i in all:
+      ls = max(ls, md_symbol(i).len)
+    # (knip sorts by path length, longest first; JavaScript's sort is stable)
+    var sorted: [Issue] = []
+    for i in all: sorted.push(copy_issue(i))
+    sorted.sort(by: fn(a, b) => md_symbol(a).len > md_symbol(b).len)
+    sorted.sort(by: fn(a, b) => md_path(a).len > md_path(b).len)
+    lp = md_path(sorted[0]).len
+    let nw = max(ls, 4)
+    let lw = max(lp, 8)
+    lines.push("| " + rpad("Name", nw) + " | " + rpad("Location", lw) + " | Severity |")
+    lines.push("| :" + rep("-", nw - 1) + " | :" + rep("-", lw - 1) + " | :------- |")
+    for i in sorted:
+      lines.push("| " + rpad(md_symbol(i), nw) + " | " + rpad(md_path(i), lw) + " | " + rpad(i.severity, 8) + " |")
+    lines.push("")
+  return "\n".join(lines)
+
+fn rep(s: Str, n: Int) -> Str:
+  var out = ""
+  for k in 0..n: out += s
+  return out
+
+fn rpad(s: Str, n: Int) -> Str:
+  var out = s + ""
+  while out.len < n: out += " "
+  return out
+
+type Owner:
+  pats: [glob.Pat]
+  owners: [Str]
+
+fn convert_gitignore(line0: Str) -> Str:
+  var pattern = line0
+  if pattern.startswith("!"): pattern = pattern[1..pattern.len]
+  if pattern.endswith("/"): pattern = pattern[0..pattern.len - 1]
+  if pattern.startswith("*/**/"): pattern = pattern[5..pattern.len]
+  if pattern == "*" or pattern == "**": return pattern
+  if pattern.startswith("/"): return pattern[1..pattern.len]
+  if not pattern.startswith("**/"): return "**/" + pattern
+  return pattern
+
+# CODEOWNERS rules (the last matching rule gives a file's owners)
+fn codeowners(text: Str) -> [Owner]:
+  var out: [Owner] = []
+  for raw in text.split("\n"):
+    var l = raw
+    if l.endswith("\r"): l = l[0..l.len - 1]
+    if l == "" or l.startswith("#"): continue
+    var parts: [Str] = []
+    for x in l.split(): parts.push(x + "")
+    if parts.len == 0: continue
+    let pat = convert_gitignore(parts[0])
+    var pats: [glob.Pat] = [glob.compile(pat)]
+    if pat != "*" and pat != "**" and not pat.endswith("/*"): pats.push(glob.compile(pat + "/**"))
+    var owners: [Str] = []
+    for k in 1..parts.len: owners.push(parts[k] + "")
+    out.push(Owner(pats, owners))
+  return out
+
+fn owners_of(rules: [Owner], file: Str) -> [Str]:
+  var i = rules.len - 1
+  while i >= 0:
+    if glob.matches_any(rules[i].pats, file, false):
+      var out: [Str] = []
+      for o in rules[i].owners: out.push(o + "")
+      return out
+    i -= 1
+  return []
+
+fn codeowners_report(on: {Str: Bool}, xs: [Issue], rules: [Owner]) -> Str:
+  var groups = 0
+  for t in opts.issue_types():
+    if on[t]: groups += 1
+  let po = owners_of(rules, "package.json")
+  var dep_owner = "[no-owner]"
+  if po.len > 0: dep_owner = po[0] + ""
+  var lines: [Str] = []
+  var total = 0
+  for t in opts.issue_types():
+    if not on[t]: continue
+    let all = of_type(xs, t)
+    # [owner, file, symbols, parent]
+    var recs: [[Str]] = []
+    if t == "duplicates":
+      for i in all: recs.push([owner_for(rules, i.file, dep_owner), i.file + "", i.symbol.replace("|", ", "), i.parent + ""])
+    else:
+      for g in by_file(all):
+        var names: [Str] = []
+        for i in g: names.push(i.symbol + "")
+        recs.push([owner_for(rules, g[0].file, dep_owner), g[0].file + "", ", ".join(names), g[0].parent + ""])
+    if recs.len > 0:
+      if total > 0: lines.push("")
+      if groups > 1: lines.push(opts.title_of(t) + " ({recs.len})")
+      recs.sort(by: fn(a, b) => js_less(a[0], b[0]))
+      for r in recs: lines.push(issue_line(r[0], r[1], r[2], r[3]))
+    total += recs.len
+  return "\n".join(lines)
+
+fn owner_for(rules: [Owner], file: Str, dflt: Str) -> Str:
+  let os = owners_of(rules, file)
+  if os.len > 0: return os[0] + ""
+  return dflt + ""
+
+fn json_report(on: {Str: Bool}, xs: [Issue], rules: [Owner], has_owners: Bool) -> Str:
+  # rows keyed by file, in the order of the report's types and then the issues
+  var order: {Str: Int} = {}
+  var files: [Str] = []
+  for t in opts.issue_types():
+    if not on[t]: continue
+    for i in xs:
+      if i.typ != t: continue
+      if not (i.file in order):
+        order[i.file] = files.len
+        files.push(i.file + "")
+  let cats = ["binaries", "catalog", "catalogReferences", "cycles", "dependencies", "devDependencies", "duplicates", "enumMembers", "exports", "files", "namespaceMembers", "nsExports", "nsTypes", "optionalPeerDependencies", "types", "unlisted", "unresolved"]
+  var cells: [{Str: [Str]}] = []
+  for f in files: cells.push({})
+  for t in opts.issue_types():
+    if not on[t]: continue
+    for i in xs:
+      if i.typ != t: continue
+      let k = order[i.file]
+      var item = ""
+      if t == "duplicates" or t == "cycles": item = i.extra + ""
+      elif t == "binaries": item = "{{\"name\":" + json.quote(i.symbol) + "}}"
+      else:
+        item = "{{"
+        if i.parent != "": item += "\"namespace\":" + json.quote(i.parent) + ","
+        item += "\"name\":" + json.quote(i.symbol)
+        if i.line > 0:
+          item += ",\"line\":{i.line},\"col\":{i.col}"
+          if i.pos >= 0: item += ",\"pos\":{i.pos}"
+        item += "}}"
+      if t in cells[k]: cells[k][t].push(item)
+      else: cells[k][t] = [item]
+  var parts: [Str] = []
+  for k in 0..files.len:
+    let f = files[k]
+    var row = "{{\"file\":" + json.quote(f)
+    if has_owners:
+      var os_: [Str] = []
+      for o in owners_of(rules, f): os_.push("{{\"name\":" + json.quote(o) + "}}")
+      row += ",\"owners\":[" + ",".join(os_) + "]"
+    for c in cats:
+      if not on[c]: continue
+      var items: [Str] = []
+      if c in cells[k]:
+        for x in cells[k][c]: items.push(x + "")
+      row += ",\"" + c + "\":[" + ",".join(items) + "]"
+    row += "}}"
+    parts.push(row)
+  return "{{\"issues\":[" + ",".join(parts) + "]}}"
+
+# ---- configuration hints (reporters/util/configuration-hints.js)
+
+fn hint_order() -> [[Str]]:
+  return [["top-level-unconfigured", "workspace-unconfigured"], ["entry-top-level", "project-top-level"], ["workspaces"], ["ignore", "ignoreFiles"], ["ignoreWorkspaces"], ["ignoreDependencies"], ["ignoreBinaries"], ["ignoreUnresolved"], ["entry-empty", "project-empty", "entry-redundant", "project-redundant"], ["project-extension-unregistered", "project-extension-excluded"], ["package-entry"]]
+
+fn hint_message(h: Hint, config_file: Str) -> Str:
+  let t = h.typ
+  let first = t.split("-")[0]
+  if t == "ignore" or t == "ignoreFiles" or t == "ignoreBinaries" or t == "ignoreDependencies" or t == "ignoreUnresolved" or t == "workspaces" or t == "ignoreWorkspaces": return "Remove from " + first
+  if t == "entry-empty" or t == "project-empty": return "Refine " + first + " pattern (no matches)"
+  if t == "entry-redundant" or t == "project-redundant": return "Remove redundant " + first + " pattern"
+  if t == "entry-top-level" or t == "project-top-level": return "Remove, or move unused top-level " + first + " to one of \"workspaces\""
+  if t == "top-level-unconfigured":
+    if config_file != "": return "Add entry and/or refine project files ({h.size} unused files)"
+    return "Create knip.json configuration file, and add entry and/or refine project files ({h.size} unused files)"
+  if t == "workspace-unconfigured":
+    if config_file != "": return "Add entry and/or refine project files in workspaces[\"" + h.ws + "\"] ({h.size} unused files)"
+    return "Create knip.json configuration file with workspaces[\"" + h.ws + "\"] object ({h.size} unused files)"
+  if t == "package-entry": return "Package entry file not found"
+  if t == "project-extension-unregistered": return "Extension in project not registered as a compiler"
+  if t == "project-extension-excluded": return "Compiled extension excluded by project (imports not followed)"
+  return ""
+
+# The hints as rows [identifier, workspace, file, message], in knip's order (at most 10 of a type).
+fn hint_rows(hints: [Hint], config_file: Str) -> [[Str]]:
+  var rows: [[Str]] = []
+  for grp in hint_order():
+    for ht in grp:
+      var n = 0
+      var total = 0
+      for h in hints:
+        if h.typ != ht: continue
+        total += 1
+        if n >= 10: continue
+        n += 1
+        var ident = h.identifier + ""
+        if ident == ".": ident = ". (root)"
+        var wsn = ""
+        if h.ws != "" and h.ws != "." and ht != "top-level-unconfigured" and ht != "workspace-unconfigured" and ht != "package-entry": wsn = h.ws + ""
+        var f = h.file + ""
+        if f == "": f = config_file + ""
+        if f == "": f = "."
+        rows.push([ident, wsn, f, hint_message(h, config_file)])
+      if total > n: rows.push(["...{total - n} more similar hints", "", "", ""])
+  return rows
+
+fn hints_text(hints: [Hint], n_hints: Int, config_file: Str) -> Str:
+  let rows = hint_rows(hints, config_file)
+  if rows.len == 0: return ""
+  var lines: [Str] = ["Configuration hints ({n_hints})"]
+  for l in table(rows, [true, true, true, true], [1, 1, 1, 0]): lines.push(l)
+  return "\n".join(lines)

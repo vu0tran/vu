@@ -1,0 +1,456 @@
+# ineffassign (github.com/gordonklaus/ineffassign v0.2.0), ported: a block graph per function built
+# over go/parser's objects, then every assignment not followed by a use on some path is reported.
+
+import ast
+import resolve
+import pkg
+from scan import T_DEFINE, T_ASSIGN, T_ADD_ASSIGN, T_ANDNOT_ASSIGN, T_QUO_ASSIGN, T_REM_ASSIGN, T_AND, T_EQL, T_QUO, T_REM, T_INT, T_FLOAT, T_STRING
+from scan import K_VAR, K_BREAK, K_CONTINUE, K_GOTO, K_FALLTHROUGH
+
+type Br:
+  label: Int
+  srcs: [Int]
+  dst: Int
+
+type B:
+  t: ast.Ast
+  r: resolve.Res
+  children: [[Int]]
+  ops: [{Int: [Int]}]     # block -> object -> ops (ident * 2 + 1 for an assignment)
+  cur: Int                # current block (-1: none)
+  roots: [Int]
+  depth: Int
+  vdepth: {Int: Int}      # object -> depth when first seen
+  vesc: {Int: Bool}
+  results: [Int]          # result field lists (-1 for none)
+  defers: [Bool]
+  brs: [Br]
+  breaks: [Int]
+  continues: [Int]
+  gotos: [Int]
+  label_stmt: Int
+
+fn new_block(var b: B, parents: [Int]) -> Int:
+  let id = b.children.len
+  b.children.push([])
+  b.ops.push({})
+  for p in parents: b.children[p].push(id)
+  b.cur = id
+  return id
+
+fn add_child(var b: B, p: Int, c: Int):
+  b.children[p].push(c)
+
+fn add_child_cur(var b: B, c: Int):
+  let p = b.cur
+  b.children[p].push(c)
+
+fn new_block_cur(var b: B) -> Int:
+  let p = b.cur
+  return new_block(&b, [p])
+
+fn new_block_cur2(var b: B, first: Int) -> Int:
+  let p = b.cur
+  return new_block(&b, [first, p])
+
+fn br_add_source_cur(var b: B, br: Int):
+  let c = b.cur
+  br_add_source(&b, br, c)
+
+fn br_push(var b: B, stack: Int, label: Int) -> Int:
+  let id = b.brs.len
+  b.brs.push(Br(label, [], -1))
+  if stack == 0: b.breaks.push(id)
+  elif stack == 1: b.continues.push(id)
+  else: b.gotos.push(id)
+  return id
+
+fn br_get(var b: B, stack: Int, lbl: Int) -> Int:
+  var lobj = -1
+  if lbl > 0: lobj = b.r.obj[lbl]
+  var n = 0
+  if stack == 0: n = b.breaks.len
+  elif stack == 1: n = b.continues.len
+  else: n = b.gotos.len
+  var i = n - 1
+  while i >= 0:
+    var id = 0
+    if stack == 0: id = b.breaks[i]
+    elif stack == 1: id = b.continues[i]
+    else: id = b.gotos[i]
+    if lbl <= 0 or b.brs[id].label == lobj: return id
+    i -= 1
+  if lbl <= 0:
+    let id = b.brs.len
+    b.brs.push(Br(-2, [], -1))
+    return id
+  return br_push(&b, stack, lobj)
+
+fn br_add_source(var b: B, br: Int, src: Int):
+  b.brs[br].srcs.push(src)
+  let d = b.brs[br].dst
+  if d >= 0: b.children[src].push(d)
+
+fn br_set_dest(var b: B, br: Int, dst: Int):
+  b.brs[br].dst = dst
+  let n = b.brs[br].srcs.len
+  for i in 0..n:
+    let s = b.brs[br].srcs[i]
+    b.children[s].push(dst)
+
+fn stmt_label(b: B, s: Int) -> Int:
+  let ls = b.label_stmt
+  if ls > 0 and b.t.b[ls] == s: return b.r.obj[b.t.a[ls]]
+  return -1
+
+fn new_op(var b: B, id: Int, assign: Bool):
+  if b.t.names[b.t.s[id]] == "_": return
+  let o = b.r.obj[id]
+  if o < 0: return
+  if not (o in b.vdepth):
+    b.vdepth[o] = b.depth
+    b.vesc[o] = false
+  var esc = b.vesc[o] or b.depth - b.vdepth[o] > 0 or b.cur < 0
+  b.vesc[o] = esc
+  if b.cur >= 0 and not esc:
+    var op = id * 2
+    if assign: op += 1
+    let c = b.cur
+    if o in b.ops[c]: b.ops[c][o].push(op)
+    else: b.ops[c][o] = [op]
+
+fn use(var b: B, id: Int):
+  new_op(&b, id, false)
+
+fn assign(var b: B, id: Int):
+  new_op(&b, id, true)
+
+fn escape(var b: B, id: Int):
+  let o = b.r.obj[id]
+  if o >= 0 and o in b.vesc: b.vesc[o] = true
+
+fn ident(t: ast.Ast, x: Int) -> Int:
+  let y = resolve.unparen(t, x)
+  if y > 0 and t.k[y] == ast.N_IDENT: return y
+  return -1
+
+fn is_zero_init(b: B, x0: Int) -> Bool:
+  let t = b.t
+  var x = x0
+  if t.k[x] == ast.N_CALL:
+    var fun = t.a[x]
+    if t.k[fun] == ast.N_PAREN: fun = t.a[fun]
+    if t.k[fun] == ast.N_STAR: fun = t.a[fun]
+    let fk = t.k[fun]
+    if not (fk == ast.N_IDENT or fk == ast.N_SELECTOR or fk == ast.N_ARRAYTYPE or fk == ast.N_STRUCTTYPE or fk == ast.N_FUNCTYPE or fk == ast.N_IFACETYPE or fk == ast.N_MAPTYPE or fk == ast.N_CHANTYPE): return false
+    if ast.count(t, t.b[x]) != 1: return false
+    x = ast.item(t, t.b[x], 0)
+  if t.k[x] == ast.N_BASICLIT:
+    let v = t.names[t.s[x]]
+    return v == "0" or v == "0.0" or v == "0." or v == ".0" or v == "\"\""
+  if t.k[x] == ast.N_IDENT:
+    let v = t.names[t.s[x]]
+    return (v == "false" or v == "nil") and b.r.obj[x] < 0
+  return false
+
+fn maybe_panic(var b: B):
+  if b.defers.len == 0 or not b.defers[b.defers.len - 1]: return
+  if b.results.len == 0: return
+  let res = b.results[b.results.len - 1]
+  if res < 0: return
+  for f in ast.items(b.t, res):
+    for id in ast.items(b.t, b.t.a[f]): use(&b, id)
+
+fn fun(var b: B, recv: Int, typ: Int, body: Int):
+  b.depth += 1
+  b.results.push(b.t.c[typ])
+  b.defers.push(false)
+  let saved = b.cur
+  new_block(&b, [])
+  b.roots.push(b.cur)
+  if recv >= 0: walk(&b, recv)
+  walk(&b, typ)
+  walk(&b, body)
+  b.cur = saved
+  b.results.pop()
+  b.defers.pop()
+  b.depth -= 1
+
+fn walk(var b: B, n: Int):
+  if n < 0: return
+  if b.t.k[n] == ast.N_LIST:
+    for x in ast.items(b.t, n): walk(&b, x)
+    return
+  visit(&b, n)
+
+fn walk_kids(var b: B, n: Int):
+  for c in resolve.kids(b.t, n): walk(&b, c)
+
+fn swtch(var b: B, stmt: Int, cases: Int):
+  let brek = br_push(&b, 0, stmt_label(b, stmt))
+  let b0 = b.cur
+  var list = b0
+  var exits: [Int] = []
+  var dfault = -1
+  var fallthru = -1
+  for c in ast.items(b.t, cases):
+    let has_list = b.t.a[c] >= 0
+    if has_list:
+      list = new_block(&b, [list])
+      for x in ast.items(b.t, b.t.a[c]): walk(&b, x)
+    var parents: [Int] = []
+    if has_list: parents.push(list)
+    if fallthru >= 0:
+      parents.push(fallthru)
+      fallthru = -1
+    new_block(&b, parents)
+    if not has_list: dfault = b.cur
+    for s in ast.items(b.t, b.t.b[c]):
+      walk(&b, s)
+      if b.t.k[s] == ast.N_BRANCH and b.t.f[s] == K_FALLTHROUGH: fallthru = b.cur
+    if fallthru < 0: exits.push(b.cur)
+  if dfault >= 0: add_child(&b, list, dfault)
+  else: exits.push(b0)
+  let nb1 = new_block(&b, exits)
+  br_set_dest(&b, brek, nb1)
+  b.breaks.pop()
+
+fn visit(var b: B, n: Int):
+  let k = b.t.k[n]
+  if k == ast.N_FUNCDECL:
+    if b.t.d[n] >= 0: fun(&b, b.t.a[n], b.t.c[n], b.t.d[n])
+  elif k == ast.N_FUNCLIT:
+    fun(&b, -1, b.t.a[n], b.t.b[n])
+  elif k == ast.N_IF:
+    walk(&b, b.t.a[n])
+    walk(&b, b.t.b[n])
+    var b0 = b.cur
+    new_block(&b, [b0])
+    walk(&b, b.t.c[n])
+    let b1 = b.cur
+    if b.t.d[n] >= 0:
+      new_block(&b, [b0])
+      walk(&b, b.t.d[n])
+      b0 = b.cur
+    new_block(&b, [b0, b1])
+  elif k == ast.N_FOR:
+    let lbl = stmt_label(b, n)
+    let brek = br_push(&b, 0, lbl)
+    let continu = br_push(&b, 1, lbl)
+    walk(&b, b.t.a[n])
+    let start = new_block_cur(&b)
+    walk(&b, b.t.b[n])
+    let cond = b.cur
+    new_block(&b, [cond])
+    walk(&b, b.t.d[n])
+    let nb2 = new_block_cur(&b)
+    br_set_dest(&b, continu, nb2)
+    walk(&b, b.t.c[n])
+    add_child_cur(&b, start)
+    let nb3 = new_block(&b, [cond])
+    br_set_dest(&b, brek, nb3)
+    b.breaks.pop()
+    b.continues.pop()
+  elif k == ast.N_RANGE:
+    let lbl = stmt_label(b, n)
+    let brek = br_push(&b, 0, lbl)
+    let continu = br_push(&b, 1, lbl)
+    walk(&b, b.t.c[n])
+    let pre = new_block_cur(&b)
+    let start = new_block(&b, [pre])
+    if b.t.a[n] >= 0:
+      var lhs = [b.t.a[n]]
+      if b.t.b[n] >= 0: lhs.push(b.t.b[n])
+      assign_stmt(&b, lhs, -1, b.t.f[n], true)
+    walk(&b, b.t.d[n])
+    add_child_cur(&b, start)
+    br_set_dest(&b, continu, pre)
+    let nb4 = new_block_cur2(&b, pre)
+    br_set_dest(&b, brek, nb4)
+    b.breaks.pop()
+    b.continues.pop()
+  elif k == ast.N_SWITCH:
+    walk(&b, b.t.a[n])
+    walk(&b, b.t.b[n])
+    swtch(&b, n, b.t.c[n])
+  elif k == ast.N_TYPESWITCH:
+    walk(&b, b.t.a[n])
+    walk(&b, b.t.b[n])
+    swtch(&b, n, b.t.c[n])
+  elif k == ast.N_SELECT:
+    let brek = br_push(&b, 0, stmt_label(b, n))
+    let cases = ast.items(b.t, b.t.a[n])
+    for c in cases:
+      let comm = b.t.a[c]
+      if comm < 0: continue
+      if b.t.k[comm] == ast.N_ASSIGN: walk(&b, ast.item(b.t, b.t.b[comm], 0))
+      else: walk(&b, comm)
+    let b0 = b.cur
+    var exits: [Int] = []
+    var dfault = false
+    for c in cases:
+      new_block(&b, [b0])
+      walk(&b, c)
+      exits.push(b.cur)
+      if b.t.a[c] < 0: dfault = true
+    if not dfault: exits.push(b0)
+    let nb5 = new_block(&b, exits)
+    br_set_dest(&b, brek, nb5)
+    b.breaks.pop()
+  elif k == ast.N_DEFER:
+    let call = b.t.a[n]
+    if b.t.k[call] == ast.N_CALL:
+      walk(&b, b.t.a[call])
+      walk(&b, b.t.b[call])
+    else: walk(&b, call)
+    b.defers[b.defers.len - 1] = true
+  elif k == ast.N_LABELED:
+    let g = br_get(&b, 2, b.t.a[n])
+    let nb6 = new_block_cur(&b)
+    br_set_dest(&b, g, nb6)
+    b.label_stmt = n
+    walk(&b, b.t.b[n])
+  elif k == ast.N_BRANCH:
+    let tok = b.t.f[n]
+    if tok == K_BREAK:
+      let g7 = br_get(&b, 0, b.t.a[n])
+      br_add_source_cur(&b, g7)
+      new_block(&b, [])
+    elif tok == K_CONTINUE:
+      let g8 = br_get(&b, 1, b.t.a[n])
+      br_add_source_cur(&b, g8)
+      new_block(&b, [])
+    elif tok == K_GOTO:
+      let g9 = br_get(&b, 2, b.t.a[n])
+      br_add_source_cur(&b, g9)
+      new_block(&b, [])
+  elif k == ast.N_ASSIGN:
+    let tok = b.t.f[n]
+    if tok == T_QUO_ASSIGN or tok == T_REM_ASSIGN: maybe_panic(&b)
+    walk(&b, b.t.b[n])
+    assign_stmt(&b, ast.items(b.t, b.t.a[n]), b.t.b[n], tok, false)
+  elif k == ast.N_GENDECL:
+    if b.t.f[n] == K_VAR:
+      for sp in ast.items(b.t, b.t.a[n]):
+        walk(&b, b.t.c[sp])
+        let hasv = ast.count(b.t, b.t.c[sp]) > 0
+        for id in ast.items(b.t, b.t.a[sp]):
+          if hasv: assign(&b, id)
+          else: use(&b, id)
+  elif k == ast.N_INCDEC:
+    let id = ident(b.t, b.t.a[n])
+    if id > 0:
+      use(&b, id)
+      assign(&b, id)
+    else: walk(&b, b.t.a[n])
+  elif k == ast.N_IDENT:
+    use(&b, n)
+  elif k == ast.N_RETURN:
+    walk(&b, b.t.a[n])
+    let res = b.results[b.results.len - 1]
+    if res >= 0:
+      for f in ast.items(b.t, res):
+        for id in ast.items(b.t, b.t.a[f]):
+          if b.t.a[n] >= 0 and ast.count(b.t, b.t.a[n]) > 0: assign(&b, id)
+          use(&b, id)
+    new_block(&b, [])
+  elif k == ast.N_SEND:
+    maybe_panic(&b)
+    walk_kids(&b, n)
+  elif k == ast.N_BINARY:
+    let op = b.t.f[n]
+    if op == T_EQL or op == T_QUO or op == T_REM: maybe_panic(&b)
+    walk_kids(&b, n)
+  elif k == ast.N_CALL or k == ast.N_INDEX or k == ast.N_STAR or k == ast.N_TYPEASSERT:
+    maybe_panic(&b)
+    walk_kids(&b, n)
+  elif k == ast.N_UNARY:
+    let x = b.t.a[n]
+    var id = ident(b.t, x)
+    if b.t.k[x] == ast.N_INDEX: id = ident(b.t, b.t.a[x])
+    if id > 0 and b.t.f[n] == T_AND: escape(&b, id)
+    walk_kids(&b, n)
+  elif k == ast.N_SELECTOR or k == ast.N_SLICE:
+    maybe_panic(&b)
+    let id = ident(b.t, b.t.a[n])
+    if id > 0: escape(&b, id)
+    walk_kids(&b, n)
+  else:
+    walk_kids(&b, n)
+
+# The assignments of an assignment statement (or a range clause: rhs < 0 stands for one operand
+# that isn't a zero value).
+fn assign_stmt(var b: B, lhs: [Int], rhs: Int, tok: Int, is_range: Bool):
+  for i in 0..lhs.len:
+    let x = lhs[i]
+    let id = ident(b.t, x)
+    if id > 0:
+      if tok >= T_ADD_ASSIGN and tok <= T_ANDNOT_ASSIGN: use(&b, id)
+      var zero = false
+      if tok == T_DEFINE and not is_range and i < ast.count(b.t, rhs): zero = is_zero_init(b, ast.item(b.t, rhs, i))
+      if zero: use(&b, id)
+      else: assign(&b, id)
+    else: walk(&b, x)
+
+fn used(b: B, obj: Int, blk: Int, var seen: {Int: Bool}) -> Bool:
+  if blk in seen: return false
+  seen[blk] = true
+  if obj in b.ops[blk]:
+    let ops = b.ops[blk][obj]
+    if ops.len > 0: return ops[0] % 2 == 0
+  for c in b.children[blk]:
+    if used(b, obj, c, &seen): return true
+  return false
+
+fn check(b: B, blk: Int, var seen: {Int: Bool}, var out: [Int]):
+  if blk in seen: return
+  seen[blk] = true
+  for obj, ops in b.ops[blk]:
+    for i in 0..ops.len:
+      if ops[i] % 2 == 0: continue
+      if i + 1 < ops.len:
+        if ops[i + 1] % 2 == 1: out.push(ops[i] / 2)
+        continue
+      var s2: {Int: Bool} = {}
+      var u = false
+      for c in b.children[blk]:
+        if used(b, obj, c, &s2):
+          u = true
+          break
+      if not u and not b.vesc[obj]: out.push(ops[i] / 2)
+  for c in b.children[blk]: check(b, c, &seen, &out)
+
+fn run(var p: pkg.Pkg, var issues: [pkg.Issue]):
+  var r = resolve.new_res(p.t.k.len)
+  for fi in 0..p.roots.len:
+    resolve.resolve_file(p.t, &r, p.roots[fi])
+  var po: [Int] = []
+  for x in r.obj: po.push(x)
+  var pd: [Int] = []
+  for x in r.decl: pd.push(x)
+  swap(&po, &p.pobj)
+  swap(&pd, &p.pdecl)
+  var t = ast.new_ast()
+  swap(&t, &p.t)
+  var b = B(t, r, [], [], -1, [], 0, {}, {}, [], [], [], [], [], [], -1)
+  for fi in 0..p.roots.len:
+    if p.strict_gen[fi] or p.gen[fi]: continue
+    b.children = []
+    b.ops = []
+    b.cur = -1
+    b.roots = []
+    b.depth = 0
+    b.vdepth = {}
+    b.vesc = {}
+    b.brs = []
+    b.breaks = []
+    b.continues = []
+    b.gotos = []
+    b.label_stmt = -1
+    walk(&b, p.roots[fi])
+    var seen: {Int: Bool} = {}
+    var out: [Int] = []
+    for rt in b.roots: check(b, rt, &seen, &out)
+    for id in out:
+      issues.push(pkg.Issue(fi, b.t.pos[id], "ineffassign", "ineffectual assignment to " + b.t.names[b.t.s[id]], 5000))
+  swap(&b.t, &p.t)
