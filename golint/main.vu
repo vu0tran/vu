@@ -1,13 +1,14 @@
-# vgolint: a Go linter that prints what `golangci-lint run` prints with its default linters
-# (errcheck, govet, ineffassign, staticcheck, unused) for the checks it implements:
+# vgolint: a drop-in replacement for golangci-lint 2.5.0 (`golangci-lint run` and friends), with the
+# same config files, flags, output formats and exit codes, for the linters it implements:
 #
-#   vgolint [--jobs N] [--no-cache] [DIR[/...]]...      (default ./...)
+#   vgolint run [flags] [packages]     (default ./...)
+#   vgolint linters | help [linters|formatters] | version | config path | cache clean|status
 #
-# Packages are found as `go list` finds them for linux/amd64, and linted on all cores.
-# A run over the whole module (./...) caches its output under $XDG_CACHE_HOME/vgolint (or
-# ~/.cache/vgolint), keyed by a hash of every .go file in the module, go.mod, go.sum, the Go
-# version and the vgolint binary itself; a module whose go.mod replaces a module with a local
-# directory isn't cached (that directory's files aren't in the key).
+# Packages are found as `go list` finds them for linux/amd64, and linted on all cores. A run's
+# per-package results are cached under $XDG_CACHE_HOME/vgolint (or ~/.cache/vgolint), keyed by a
+# hash of every .go file linted, go.mod, go.sum, the Go version, the effective config and the
+# vgolint binary itself; a module whose go.mod replaces a module with a local directory isn't
+# cached (that directory's files aren't in the key). --no-cache turns it off.
 
 import scan
 import ast
@@ -19,6 +20,15 @@ import errcheck
 import unused
 import vet
 import sc
+import cfg
+import proc
+import printers
+import doc
+import lintersdb
+
+extern "sys_glue.c":
+  fn gl_getcwd(ffi: Ffi) -> Str
+  fn gl_isatty(ffi: Ffi, fd: Int) -> Bool
 
 type Spec:
   dir: Str
@@ -27,44 +37,108 @@ type Spec:
 
 type Res:
   idx: Int
-  lines: [Str]
+  issues: [proc.Iss]
+  cnt: proc.Counts
+  errs: [Str]
 
-fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int) -> [Str]:
+# staticcheck's enabled checks, from linters.settings.staticcheck.checks (golangci-lint's defaults
+# when unset).
+fn sc_enabled(c: cfg.Cfg, code: Str) -> Bool:
+  let s = cfg.lsettings(c, "staticcheck")
+  var checks = doc.strs_of(c.d, doc.get(c.d, s, "checks"))
+  if not doc.is_set(c.d, doc.get(c.d, s, "checks")): checks = ["all", "-ST1000", "-ST1003", "-ST1016", "-ST1020", "-ST1021", "-ST1022"]
+  var on = false
+  for ch0 in checks:
+    var ch = ch0 + ""
+    var b = true
+    if ch.len > 1 and ch[0] == '-':
+      b = false
+      ch = ch[1..ch.len]
+    if ch == "*" or ch == "all": on = b
+    elif ch.endswith("*"):
+      let prefix = ch[0..ch.len - 1]
+      var is_cat = true
+      for i in 0..prefix.len:
+        if prefix[i] >= '0' and prefix[i] <= '9': is_cat = false
+      if is_cat:
+        var k = 0
+        while k < code.len and not (code[k] >= '0' and code[k] <= '9'): k += 1
+        if code[0..k] == prefix: on = b
+      elif code.startswith(prefix): on = b
+    elif ch == code: on = b
+  return on
+
+fn vet_default(name: Str) -> Bool:
+  return name in ["appends", "asmdecl", "assign", "atomic", "bools", "buildtag", "cgocall", "composites", "copylocks", "defers", "directive", "errorsas", "framepointer", "httpresponse", "ifaceassert", "loopclosure", "lostcancel", "nilfunc", "printf", "shift", "sigchanyzer", "slog", "stdmethods", "stdversion", "stringintconv", "structtag", "testinggoroutine", "tests", "timeformat", "unmarshal", "unreachable", "unsafeptr", "unusedresult"]
+
+fn vet_enabled(c: cfg.Cfg, name: Str, gover: Int) -> Bool:
+  if name == "loopclosure" and gover >= 22: return false
+  let s = cfg.lsettings(c, "govet")
+  let en = doc.strs_of(c.d, doc.get(c.d, s, "enable"))
+  let dis = doc.strs_of(c.d, doc.get(c.d, s, "disable"))
+  if doc.bool_of(c.d, doc.get(c.d, s, "enable-all"), false): return not (name in dis)
+  if name in en: return true
+  if name in dis: return false
+  if doc.bool_of(c.d, doc.get(c.d, s, "disable-all"), false): return false
+  return vet_default(name)
+
+# Whether an issue's check is on in the config (issues of linters that are off never get here).
+fn check_on(c: cfg.Cfg, is: pkg.Issue, gover: Int) -> Bool:
+  if is.linter == "staticcheck":
+    let k = is.msg.find(":")
+    if k > 0: return sc_enabled(c, is.msg[0..k])
+  elif is.linter == "govet":
+    let k = is.msg.find(":")
+    if k > 0: return vet_enabled(c, is.msg[0..k], gover)
+  return true
+
+fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c: cfg.Cfg, rs: proc.Rxs, diff: Bool, ch: proc.Changed) -> Res:
   var p = pkg.new_pkg(sp.dir)
   for f in sp.files:
     let src = fs.read(f) else continue
     pkg.add_file(&p, f, src, &kw)
+  var cnt = proc.new_counts(c)
   var issues: [pkg.Issue] = []
-  var out: [Str] = []
-  for e in p.errs: out.push("PARSE ERROR " + e)
-  if p.errs.len > 0: return out
-  ineff.run(&p, &issues)
-  # type check
+  if p.errs.len > 0:
+    var es: [Str] = []
+    for e in p.errs: es.push(e + "")
+    return Res(0, [], cnt, es)
+  if c.gen_mode == "disable":
+    for f in 0..p.gen.len: p.gen[f] = false
+  if cfg.is_enabled(c, "ineffassign"): ineff.run(&p, &issues)
   var path = sp.path + ""
   var roots: [Int] = []
   for r in p.roots: roots.push(r)
   let pi = tc.add_target_ast(&g, fs, path, sp.dir, &p.t, roots)
-  errcheck.run(&g, fs, pi, p, &issues)
-  unused.run(&g, fs, pi, p, &issues)
-  var roots2: [Int] = []
-  for fi in 0..g.pk[pi].roots.len:
-    if not p.gen[fi]: roots2.push(g.pk[pi].roots[fi])
-  var w = vet.walk_pkg(g.pk[pi].t, roots2)
-  vet.run(&g, fs, pi, p, &issues, gover, &w)
-  sc.run(&g, fs, pi, p, &issues, gover, &w)
+  if cfg.is_enabled(c, "errcheck"): errcheck.run(&g, fs, pi, p, &issues)
+  if cfg.is_enabled(c, "unused"): unused.run(&g, fs, pi, p, &issues)
+  let want_vet = cfg.is_enabled(c, "govet")
+  let want_sc = cfg.is_enabled(c, "staticcheck")
+  if want_vet or want_sc:
+    var roots2: [Int] = []
+    for fi in 0..g.pk[pi].roots.len:
+      if not p.gen[fi]: roots2.push(g.pk[pi].roots[fi])
+    var w = vet.walk_pkg(g.pk[pi].t, roots2)
+    if want_vet: vet.run(&g, fs, pi, p, &issues, gover, &w)
+    if want_sc: sc.run(&g, fs, pi, p, &issues, gover, &w)
   swap(&p.t, &g.pk[pi].t)
-  for l in pkg.report(p, issues): out.push(l)
-  return out
+  var kept: [pkg.Issue] = []
+  for is in issues:
+    if check_on(c, is, gover): kept.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
+  let res = proc.process_pkg(c, rs, p, kept, &cnt, diff, ch)
+  return Res(0, res, cnt, [])
 
-fn worker(fs: Fs, own specs: Shared[[Spec]], own jobs: Chan[Int], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str):
+fn worker(fs: Fs, own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: Chan[Int], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str, gover: Int):
   var kw = scan.keywords()
   var g = tc.new_prog(goroot, modcache)
+  for t in conf.value.build_tags: g.tags.push(t + "")
   tc.read_gomod(fs, &g, modroot)
-  let gover = tc.go_minor(fs, modroot)
+  let rs = proc.compile_all(conf.value)
   while true:
     let i = jobs.recv() else return
-    let lines = lint_one(fs, specs.value[i], &g, &kw, gover)
-    res.send(Res(i, lines))
+    var r = lint_one(fs, specs.value[i], &g, &kw, gover, conf.value, rs, diff, chg.value)
+    r.idx = i
+    res.send(r)
 
 # Two 32-bit FNV-style lanes over s (four bytes at a time), then its length.
 fn hash_feed(var h: [Int], s: Str):
@@ -119,31 +193,361 @@ fn package_name(src: Str, var kw: {Str: Int}) -> Str:
   swap(&scn.kw, &kw)
   return name
 
-fn main(fs: Fs, os: Os) throws:
-  var roots: [Str] = []
-  var jobs = 0
-  var use_cache = true
-  let argv = args()
-  var i = 1
+fn gomod_go(fs: Fs) -> Str:
+  let text = fs.read("go.mod") else return ""
+  for raw in text.split("\n"):
+    let line = raw.strip()
+    if line.startswith("go "): return line[3..line.len].strip()
+  return ""
+
+fn minor_of(v: Str) -> Int:
+  var s = v + ""
+  if s.startswith("go"): s = s[2..s.len]
+  let parts = s.split(".")
+  if parts.len >= 2: return int(parts[1]) else 0
+  return 0
+
+fn fail_cmd(msg: Str):
+  eprint("Error: " + msg)
+  eprint("The command is terminated due to an error: " + msg)
+  exit(3)
+
+# ---- flags
+
+fn flag_key(name: Str) -> Str:
+  if name == "default": return "linters.default"
+  if name == "fast-only": return "linters.fast-only"
+  if name == "concurrency": return "run.concurrency"
+  if name == "modules-download-mode": return "run.modules-download-mode"
+  if name == "issues-exit-code": return "run.issues-exit-code"
+  if name == "timeout": return "run.timeout"
+  if name == "tests": return "run.tests"
+  if name == "allow-parallel-runners": return "run.allow-parallel-runners"
+  if name == "allow-serial-runners": return "run.allow-serial-runners"
+  if name == "path-prefix": return "output.path-prefix"
+  if name == "path-mode": return "output.path-mode"
+  if name == "show-stats": return "output.show-stats"
+  if name.startswith("output."): return "output.formats." + name[7..name.len]
+  if name == "max-issues-per-linter" or name == "max-same-issues" or name == "uniq-by-line" or name == "new" or name == "new-from-rev" or name == "new-from-patch" or name == "new-from-merge-base" or name == "whole-files" or name == "fix": return "issues." + name
+  return ""
+
+fn bool_flags() -> [Str]:
+  return ["no-config", "fast-only", "tests", "allow-parallel-runners", "allow-serial-runners", "show-stats", "output.text.print-linter-name", "output.text.print-issued-lines", "output.text.colors", "output.tab.print-linter-name", "output.tab.colors", "output.junit-xml.extended", "uniq-by-line", "new", "whole-files", "fix", "help", "verbose", "no-cache", "version"]
+
+fn int_flags() -> [Str]:
+  return ["concurrency", "issues-exit-code", "max-issues-per-linter", "max-same-issues", "jobs"]
+
+fn str_flags() -> [Str]:
+  return ["config", "default", "disable", "enable", "enable-only", "modules-download-mode", "build-tags", "timeout", "path-prefix", "path-mode", "output.text.path", "output.json.path", "output.tab.path", "output.html.path", "output.checkstyle.path", "output.code-climate.path", "output.junit-xml.path", "output.teamcity.path", "output.sarif.path", "new-from-rev", "new-from-patch", "new-from-merge-base", "cpu-profile-path", "mem-profile-path", "trace-path", "color"]
+
+fn short_flag(c: Str) -> Str:
+  if c == "c": return "config"
+  if c == "D": return "disable"
+  if c == "E": return "enable"
+  if c == "j": return "concurrency"
+  if c == "n": return "new"
+  if c == "h": return "help"
+  if c == "v": return "verbose"
+  return ""
+
+fn csv(v: Str) -> [Str]:
+  var out: [Str] = []
+  if v.len == 0: return out
+  for p in v.split(","): out.push(p.strip())
+  return out
+
+type Opts:
+  f: cfg.Flags
+  args: [Str]
+  color: Str
+  no_cache: Bool
+  jobs: Int
+  help: Bool
+  verbose: Bool
+
+# pflag's parsing: --name=value, --name value, -x value, -xvalue, bool flags without a value.
+fn parse_flags(argv: [Str], start: Int) -> Opts:
+  var o = Opts(cfg.new_flags(), [], "auto", false, 0, false, false)
+  var i = start
+  var only_args = false
   while i < argv.len:
     let a = argv[i]
-    if a == "--no-cache":
-      use_cache = false
+    i += 1
+    if only_args or a == "-" or not a.startswith("-"):
+      o.args.push(a + "")
+      continue
+    if a == "--":
+      only_args = true
+      continue
+    var name = ""
+    var val = ""
+    var has_val = false
+    if a.startswith("--"):
+      name = a[2..a.len]
+      let eq = name.find("=")
+      if eq >= 0:
+        val = name[eq + 1..name.len]
+        name = name[0..eq]
+        has_val = true
+    else:
+      name = short_flag(a[1..2])
+      if name.len == 0: fail_cmd("unknown shorthand flag: '" + a[1..2] + "' in " + a)
+      if a.len > 2:
+        val = a[2..a.len]
+        if val.startswith("="): val = val[1..val.len]
+        has_val = true
+    let is_bool = name in bool_flags()
+    if not is_bool and not (name in int_flags()) and not (name in str_flags()):
+      fail_cmd("unknown flag: --" + name)
+    if is_bool:
+      if not has_val: val = "true"
+      if not (val in ["true", "false", "1", "0", "t", "f", "T", "F", "TRUE", "FALSE", "True", "False"]):
+        fail_cmd("invalid argument \"" + val + "\" for \"--" + name + "\" flag: strconv.ParseBool: parsing \"" + val + "\": invalid syntax")
+      val = doc.lower(val)
+      if val == "1" or val == "t": val = "true"
+      if val == "0" or val == "f": val = "false"
+    elif not has_val:
+      if i >= argv.len: fail_cmd("flag needs an argument: --" + name)
+      val = argv[i] + ""
       i += 1
+    if name in int_flags():
+      let n = int(val) else -999999999
+      if n == -999999999: fail_cmd("invalid argument \"" + val + "\" for \"--" + name + "\" flag: strconv.ParseInt: parsing \"" + val + "\": invalid syntax")
+    if name == "config": o.f.config = val
+    elif name == "no-config": o.f.no_config = val == "true"
+    elif name == "enable":
+      for x in csv(val): o.f.enable.push(x)
+    elif name == "disable":
+      for x in csv(val): o.f.disable.push(x)
+    elif name == "enable-only":
+      o.f.has_enable_only = true
+      for x in csv(val): o.f.enable_only.push(x)
+    elif name == "build-tags":
+      for x in csv(val): o.f.build_tags.push(x)
+    elif name == "color":
+      if not (val in ["always", "auto", "never"]):
+        eprint("level=fatal msg=\"invalid value \\\"" + val + "\\\" for --color; must be 'always', 'auto', or 'never'\"")
+        exit(1)
+      o.color = val
+    elif name == "no-cache": o.no_cache = val == "true"
+    elif name == "jobs": o.jobs = int(val) else 0
+    elif name == "help": o.help = val == "true"
+    elif name == "verbose": o.verbose = val == "true"
+    elif name == "cpu-profile-path" or name == "mem-profile-path" or name == "trace-path" or name == "version": continue
+    else:
+      let key = flag_key(name)
+      if key.len > 0:
+        o.f.sets.push(key)
+        o.f.sets.push(val)
+        if name == "concurrency": o.jobs = int(val) else 0
+  if o.args.len > 0: o.f.first_arg = o.args[0] + ""
+  return o
+
+# ---- git diffs (--new, --new-from-rev, --new-from-merge-base, --new-from-patch)
+
+fn parse_patch(text: Str, var ch: proc.Changed):
+  var file = ""
+  var line = 0
+  var cur: [Int] = []
+  for l in text.split("\n"):
+    if l.startswith("+++ "):
+      if file.len > 0:
+        ch.files.push(file)
+        ch.lines.push(cur)
+      cur = []
+      file = l[4..l.len]
+      if file.startswith("b/"): file = file[2..file.len]
+      let tab = file.find("\t")
+      if tab >= 0: file = file[0..tab]
       continue
-    if a == "--jobs" and i + 1 < argv.len:
-      jobs = int(argv[i + 1]) else 1
-      i += 2
+    if l.startswith("@@ "):
+      let plus = l.find("+")
+      if plus >= 0:
+        var j = plus + 1
+        var n = 0
+        while j < l.len and l[j] >= '0' and l[j] <= '9':
+          n = n * 10 + int(l[j]) - 48
+          j += 1
+        line = n
       continue
+    if file.len == 0 or l.startswith("--- "): continue
+    if l.startswith("+"):
+      cur.push(line)
+      line += 1
+    elif l.startswith(" "): line += 1
+  if file.len > 0:
+    ch.files.push(file)
+    ch.lines.push(cur)
+
+fn git_changes(os: Os, c: cfg.Cfg, fs: Fs) -> proc.Changed:
+  var ch = proc.Changed([], [])
+  var patch = ""
+  if c.new_from_patch.len > 0:
+    patch = fs.read(c.new_from_patch) else ""
+  else:
+    var rev = c.new_from_rev + ""
+    if c.new_from_merge_base.len > 0:
+      let mb = os.output(["git", "merge-base", c.new_from_merge_base, "HEAD"]) else ""
+      rev = mb.strip()
+    if rev.len == 0:
+      # --new: uncommitted changes and untracked files, else the last commit
+      let st = os.output(["git", "status", "--porcelain", "--untracked-files=all"]) else ""
+      if st.strip().len > 0:
+        patch = os.output(["git", "diff", "--color=never", "--no-ext-diff", "--default-prefix", "--relative", "HEAD", "--"]) else ""
+        for l in st.split("\n"):
+          if l.startswith("?? "):
+            ch.files.push(l[3..l.len].strip())
+            ch.lines.push([-1])
+      else: rev = "HEAD~"
+    if rev.len > 0:
+      patch = os.output(["git", "diff", "--color=never", "--no-ext-diff", "--default-prefix", "--relative", rev, "--"]) else ""
+  parse_patch(patch, &ch)
+  if c.whole_files:
+    for i in 0..ch.lines.len: ch.lines[i] = [-1]
+  return ch
+
+# ---- commands
+
+fn print_help():
+  print("Smart, fast linters runner.")
+  print("")
+  print("Usage:")
+  print("  golangci-lint [flags]")
+  print("  golangci-lint [command]")
+  print("")
+  print("Available Commands:")
+  print("  cache       Cache control and information.")
+  print("  config      Configuration file information and verification.")
+  print("  help        Display extra help")
+  print("  linters     List current linters configuration.")
+  print("  run         Lint the code.")
+  print("  version     Display the golangci-lint version.")
+  print("")
+  print("Flags:")
+  print("      --color string   Use color when printing; can be 'always', 'auto', or 'never' (default \"auto\")")
+  print("  -h, --help           Help for a command")
+  print("  -v, --verbose        Verbose output")
+  print("      --version        Print version")
+  print("")
+  print("Use \"golangci-lint [command] --help\" for more information about a command.")
+
+fn cmd_linters(c: cfg.Cfg):
+  var en: [Str] = []
+  var dis: [Str] = []
+  for l in lintersdb.help_lines():
+    let k = l.find(":")
+    if k <= 0 or l.startswith("Enabled") or l.startswith("Disabled"): continue
+    var name = l[0..k]
+    if name.endswith(" [deprecated]"): name = name[0..name.len - 13]
+    if cfg.is_enabled(c, name): en.push(l + "")
+    else: dis.push(l + "")
+  print("Enabled by your configuration linters:")
+  for l in sorted(en): print(l)
+  print("")
+  print("Disabled by your configuration linters:")
+  for l in sorted(dis): print(l)
+
+fn main(fs: Fs, os: Os, ffi: Ffi) throws:
+  let argv = args()
+  if argv.len < 2:
+    print_help()
+    return
+  let cmd = argv[1]
+  if cmd == "version" or cmd == "--version":
+    print("golangci-lint has version 2.5.0 built with vgolint (Vu) from vu on 2026-11-01")
+    return
+  if cmd == "help" or cmd == "--help" or cmd == "-h":
+    if argv.len > 2 and argv[2] == "linters":
+      for l in lintersdb.help_lines(): print(l)
+      return
+    if argv.len > 2 and argv[2] == "formatters":
+      for l in lintersdb.formatter_lines(): print(l)
+      return
+    print_help()
+    return
+  if cmd == "cache":
+    var cdir = os.env("XDG_CACHE_HOME")
+    if cdir.len == 0: cdir = os.env("HOME") + "/.cache"
+    cdir += "/vgolint"
+    if argv.len > 2 and argv[2] == "clean":
+      let names = fs.list(cdir) else []
+      for n in names: fs.remove(cdir + "/" + n) else 0
+      return
+    print("Dir: " + cdir)
+    return
+  if not (cmd in ["run", "linters", "config"]):
+    fail_cmd("unknown command \"" + cmd + "\" for \"golangci-lint\"")
+  var start = 2
+  var sub = ""
+  if cmd == "config":
+    if argv.len > 2 and not argv[2].startswith("-"):
+      sub = argv[2] + ""
+      start = 3
+  var o = parse_flags(argv, start)
+  var c = cfg.new_cfg()
+  c.cwd = gl_getcwd(ffi)
+  let home = os.env("HOME")
+  let err = cfg.load(fs, &c, o.f, home, gomod_go(fs))
+  if err.len > 0:
+    if err.startswith("@"):
+      eprint("level=error msg=\"Running error: " + err[1..err.len] + "\"")
+      exit(3)
+    if err.startswith("!"): fail_cmd(err[1..err.len])
+    fail_cmd("can't load config: " + err)
+  if cmd == "config":
+    if sub == "path":
+      if c.cfg_file.len == 0:
+        eprint("level=warning msg=\"No config file detected\"")
+        exit(5)
+      print(c.cfg_file)
+      return
+    if sub == "verify":
+      if c.cfg_file.len == 0:
+        eprint("level=warning msg=\"No config file detected\"")
+        exit(5)
+      return
+    print("Config file information and verification.")
+    return
+  if cmd == "linters":
+    cmd_linters(c)
+    return
+  # base path modes that need the outside world
+  let rel_mode = doc.str_of(c.d, doc.at(c.d, c.d.root, "run.relative-path-mode"), "")
+  if rel_mode == "gitroot":
+    let r = os.output(["git", "rev-parse", "--show-toplevel"]) else ""
+    if r.strip().len > 0: c.base = r.strip()
+  elif rel_mode == "gomod":
+    let r = os.output(["go", "env", "GOMOD"]) else ""
+    if r.strip().len > 0 and r.strip() != "/dev/null": c.base = cfg.dir_of(r.strip())
+  var skipped: [Str] = []
+  for n in c.enabled:
+    if not (n in cfg.implemented()): skipped.push(n + "")
+  if skipped.len > 0 and os.env("VGOLINT_QUIET").len == 0:
+    eprint("level=warning msg=\"[vgolint] linters not implemented yet, skipped: " + ", ".join(skipped) + "\"")
+  let shc = share(c)
+  run_lint(fs, os, ffi, o, shc)?
+
+fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
+  let c = shc.value
+  # packages
+  var roots: [Str] = []
+  for a in o.args:
     var r = a + ""
     if r.endswith("/..."): r = r[0..r.len - 4]
     if r.len == 0: r = "."
     while r.len > 1 and r.endswith("/"): r = r[0..r.len - 1]
     if r.startswith("./") and r.len > 2: r = r[2..r.len]
     roots.push(r)
-    i += 1
   if roots.len == 0: roots.push(".")
-  if roots.len != 1 or roots[0] != ".": use_cache = false
+  for r in roots:
+    if not fs.exists(r):
+      print("0 issues.")
+      eprint("level=error msg=\"[linters_context] typechecking error: pattern " + r + "/...: lstat " + r + "/: no such file or directory\"")
+      exit(7)
+  let diff = c.new or c.new_from_rev.len > 0 or c.new_from_merge_base.len > 0 or c.new_from_patch.len > 0
+  var ch = proc.Changed([], [])
+  if diff: ch = git_changes(os, c, fs)
+  var use_cache = not o.no_cache and not diff
   var h = [2166136261, 84696351]
   if use_cache:
     let gm = fs.read("go.mod") else ""
@@ -156,6 +560,8 @@ fn main(fs: Fs, os: Os) throws:
     hash_feed(&h, gm)
     let gs = fs.read("go.sum") else ""
     hash_feed(&h, gs)
+    hash_feed(&h, doc.dump(c.d, c.d.root))
+    hash_feed(&h, c.cwd + "\n" + c.base + "\n" + ",".join(c.enabled) + "\n" + ",".join(roots))
   var dirs: [load.Dir] = []
   for r in roots: load.walk(fs, r, true, &dirs)
   var kw = scan.keywords()
@@ -181,13 +587,14 @@ fn main(fs: Fs, os: Os) throws:
     var pname = ""
     for nm in d.files:
       if not load.good_name(nm): continue
+      if not c.tests and nm.endswith("_test.go"): continue
       var path = d.path + "/" + nm
       if d.path == ".": path = nm + ""
       let src = fs.read(path) else continue
       if use_cache:
         hash_feed(&h, path)
         hash_feed(&h, src)
-      if not load.good_constraints(src): continue
+      if not load.good_constraints(src, c.build_tags): continue
       let name = package_name(src, &kw)
       if nm.endswith("_test.go") and name.endswith("_test") and name != pname:
         x_files.push(path)
@@ -198,6 +605,10 @@ fn main(fs: Fs, os: Os) throws:
     if d.path != ".": ip = modpath + "/" + d.path
     if main_files.len > 0: specs.push(Spec(d.path + "", main_files, ip + ""))
     if x_files.len > 0: specs.push(Spec(d.path + "", x_files, ip + "_test"))
+  var all: [proc.Iss] = []
+  var warnings: [Str] = []     # tag, text pairs
+  var perrs: [Str] = []
+  var have = false
   if use_cache:
     var cdir = os.env("XDG_CACHE_HOME")
     if cdir.len == 0: cdir = os.env("HOME") + "/.cache"
@@ -205,35 +616,138 @@ fn main(fs: Fs, os: Os) throws:
     cache_file = cdir + "/" + hex8(h[0]) + hex8(h[1])
     if fs.exists(cache_file):
       let text = fs.read(cache_file) else ""
-      if text.startswith("vgolint1\n"):
-        let body = text[9..text.len]
-        if body.len > 0:
-          for l in body.split("\n"): print(l)
-          exit(1)
-        return
-    fs.mkdir(cdir) else 0
-  if jobs == 0: jobs = cpu_count(fs)
-  if jobs > specs.len: jobs = specs.len
-  if jobs < 1: jobs = 1
-  let n = specs.len
-  var results: [[Str]] = []
-  for k in 0..n: results.push([])
-  let shared = share(specs)
-  let jc: Chan[Int] = chan(n + 1)
-  let rc: Chan[Res] = chan(n + 1)
-  for k in 0..n: jc.send(k)
-  jc.close()
-  for k in 0..jobs: spawn worker(fs, shared, jc, rc, ".", goroot + "", modcache + "")
-  for k in 0..n:
-    var r = rc.recv()?
-    swap(&results[r.idx], &r.lines)
-  var all: [Str] = []
-  for k in 0..n:
-    for l in results[k]: all.push(l)
-  let out = sorted(all)
-  for l in out: print(l)
-  if cache_file.len > 0:
-    let tmp = cache_file + ".tmp"
-    fs.write(tmp, "vgolint1\n" + "\n".join(out)) else 0
-    fs.rename(tmp, cache_file) else 0
-  if out.len > 0: exit(1)
+      if text.startswith("vgolint2\n"):
+        have = true
+        for l in text[9..text.len].split("\n"):
+          if l.len == 0: continue
+          if l.startswith("W" + proc.sep()):
+            let f = l.split(proc.sep())
+            if f.len == 3:
+              warnings.push(f[1] + "")
+              warnings.push(f[2] + "")
+            continue
+          let is = proc.from_record(l) else continue
+          all.push(is)
+    if not have: fs.mkdir(cdir) else 0
+  if not have:
+    var jobs = o.jobs
+    if jobs == 0: jobs = c.concurrency
+    if jobs == 0: jobs = cpu_count(fs)
+    if jobs > specs.len: jobs = specs.len
+    if jobs < 1: jobs = 1
+    var gover = minor_of(c.go_ver)
+    let n = specs.len
+    var results: [[proc.Iss]] = []
+    for k in 0..n: results.push([])
+    var tot = proc.new_counts(c)
+    let shared = share(specs)
+    let sch = share(ch)
+    let jc: Chan[Int] = chan(n + 1)
+    let rc: Chan[Res] = chan(n + 1)
+    for k in 0..n: jc.send(k)
+    jc.close()
+    for k in 0..jobs: spawn worker(fs, shared, shc, sch, diff, jc, rc, ".", goroot + "", modcache + "", gover)
+    for k in 0..n:
+      var r = rc.recv()?
+      swap(&results[r.idx], &r.issues)
+      for e in r.errs: perrs.push(e + "")
+      for q in 0..tot.rules.len: tot.rules[q] += r.cnt.rules[q]
+      for q in 0..tot.paths.len: tot.paths[q] += r.cnt.paths[q]
+      for q in 0..tot.pexc.len: tot.pexc[q] += r.cnt.pexc[q]
+      for u in r.cnt.unknown:
+        if not (u in tot.unknown): tot.unknown.push(u + "")
+    for k in 0..n:
+      for is in results[k]: all.push(proc.dup(is))
+    let cc = c
+    # warnings, as the processors' Finish methods log them
+    if cc.warn_unused:
+      for q in 0..cc.paths.len:
+        if tot.paths[q] == 0:
+          warnings.push("runner/exclusion_paths")
+          warnings.push("The pattern \"" + cc.paths[q] + "\" match no issues")
+      for q in 0..cc.paths_except.len:
+        if tot.pexc[q] == 0:
+          warnings.push("runner/exclusion_paths")
+          warnings.push("The pattern \"" + cc.paths_except[q] + "\" match no issues")
+      for q in 0..cc.rules.len:
+        if cc.rules[q].internal or tot.rules[q] > 0: continue
+        let ru = cc.rules[q]
+        var parts: [Str] = []
+        if ru.text.len > 0: parts.push("Text: " + go_quote(ru.text))
+        if ru.source.len > 0: parts.push("Source: " + go_quote(ru.source))
+        if ru.path.len > 0: parts.push("Path: " + go_quote(ru.path))
+        if ru.path_except.len > 0: parts.push("Path Except: " + go_quote(ru.path_except))
+        if ru.linters.len > 0: parts.push("Linters: " + go_quote(", ".join(ru.linters)))
+        warnings.push("runner/exclusion_rules")
+        warnings.push("Skipped 0 issues by rules: [" + ", ".join(parts) + "]")
+    if tot.unknown.len > 0:
+      warnings.push("runner/nolint_filter")
+      warnings.push("Found unknown linters in //nolint directives: " + ", ".join(sorted(tot.unknown)))
+    if cache_file.len > 0 and perrs.len == 0:
+      var lines: [Str] = []
+      var wi = 0
+      while wi + 1 < warnings.len:
+        lines.push("W" + proc.sep() + warnings[wi] + proc.sep() + warnings[wi + 1])
+        wi += 2
+      for is in all: lines.push(proc.to_record(is))
+      let tmp = cache_file + ".tmp"
+      fs.write(tmp, "vgolint2\n" + "\n".join(lines)) else 0
+      fs.rename(tmp, cache_file) else 0
+  for e in perrs: eprint("level=error msg=\"[linters_context] typechecking error: " + e + "\"")
+  var wi = 0
+  while wi + 1 < warnings.len:
+    eprint("level=warning msg=\"[" + warnings[wi] + "] " + warnings[wi + 1].replace("\\", "\\\\").replace("\"", "\\\"") + "\"")
+    wi += 2
+  # run-wide limits, display paths, sorting
+  var shown = proc.limit(&all, c)
+  for k in 0..shown.len:
+    if c.path_mode == "abs": shown[k].path = cfg.abs_path(c.cwd, shown[k].path)
+    elif c.path_prefix.len > 0: shown[k].path = cfg.clean_path(c.path_prefix + "/" + shown[k].rel)
+    else: shown[k].path = shown[k].rel + ""
+  proc.sort_issues(&shown, c.sort_order)
+  # colors: fatih/color's rule (a terminal, TERM not dumb, NO_COLOR unset) unless --color says
+  var colors = gl_isatty(ffi, 1) and os.env("TERM") != "dumb" and os.env("NO_COLOR").len == 0
+  if o.color == "always": colors = true
+  if o.color == "never": colors = false
+  var any_fmt = c.json_path.len > 0 or c.tab_path.len > 0 or c.html_path.len > 0 or c.checkstyle_path.len > 0 or c.cc_path.len > 0 or c.junit_path.len > 0 or c.teamcity_path.len > 0 or c.sarif_path.len > 0
+  var text_path = c.text_path + ""
+  if text_path.len == 0 and not any_fmt: text_path = "stdout"
+  if text_path.len > 0: emit(fs, c, text_path, printers.text(shown, c, colors))
+  if c.json_path.len > 0: emit(fs, c, c.json_path, printers.json(shown, c, warnings))
+  if c.tab_path.len > 0: emit(fs, c, c.tab_path, printers.tab(shown, c, colors))
+  if c.html_path.len > 0: emit(fs, c, c.html_path, printers.html(shown))
+  if c.checkstyle_path.len > 0: emit(fs, c, c.checkstyle_path, printers.checkstyle(shown))
+  if c.cc_path.len > 0: emit(fs, c, c.cc_path, printers.code_climate(shown))
+  if c.junit_path.len > 0: emit(fs, c, c.junit_path, printers.junit(shown, c.junit_ext))
+  if c.teamcity_path.len > 0: emit(fs, c, c.teamcity_path, printers.teamcity(shown))
+  if c.sarif_path.len > 0: emit(fs, c, c.sarif_path, printers.sarif(shown))
+  if c.show_stats:
+    if shown.len == 0: print("0 issues.")
+    else:
+      print("{shown.len} issues:")
+      var names: [Str] = []
+      for is in shown:
+        if not (is.linter in names): names.push(is.linter + "")
+      for nm in sorted(names):
+        var k = 0
+        for is in shown:
+          if is.linter == nm: k += 1
+        print("* " + nm + ": {k}")
+  if shown.len > 0: exit(c.issues_exit)
+  if perrs.len > 0: exit(7)
+
+fn go_quote(s: Str) -> Str:
+  return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+# Writes one format's output where its path says: stdout, stderr or a file (relative to the base path).
+fn emit(fs: Fs, c: cfg.Cfg, path: Str, text: Str):
+  if path == "stdout":
+    write(text)
+    return
+  if path == "stderr":
+    eprint(text.rstrip("\n"))
+    return
+  var p = path + ""
+  if not p.startswith("/"): p = cfg.clean_path(c.base + "/" + p)
+  fs.mkdir(cfg.dir_of(p)) else 0
+  fs.write(p, text) else 0

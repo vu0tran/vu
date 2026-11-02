@@ -1,0 +1,495 @@
+# What golangci-lint does with the issues the linters found, in its order: exclusion paths, the
+# generated-file filter, exclusion rules (and presets), //nolint (with nolintlint's unused
+# directives), the diff filter, one issue per line, then (over the whole run) the per-linter and
+# same-text limits, severities and sorting.
+
+import pkg
+import cfg
+import rx
+import doc
+
+# One issue as it is printed.
+type Iss:
+  path: Str        # as the loader names the file (relative to the working directory)
+  rel: Str         # relative to the base path (what rules match and what is printed)
+  line: Int
+  col: Int
+  off: Int
+  linter: Str
+  msg: Str
+  src: Str         # the source line
+  sev: Str
+  expect: Str      # nolintlint: "" or the linter a directive names ("-" for all), for the JSON report
+  order: Int       # position in golangci-lint's processing order within the package
+
+# The compiled patterns of the config.
+type Rxs:
+  rpath: [rx.Rx]
+  rpexc: [rx.Rx]
+  rtext: [rx.Rx]
+  rsrc: [rx.Rx]
+  paths: [rx.Rx]
+  pexc: [rx.Rx]
+  spath: [rx.Rx]
+  spexc: [rx.Rx]
+  stext: [rx.Rx]
+  ssrc: [rx.Rx]
+
+fn opt_rx(p: Str) -> rx.Rx:
+  if p.len == 0: return rx.Rx(false, nil)
+  return rx.compile(p)
+
+fn compile_all(c: cfg.Cfg) -> Rxs:
+  var r = Rxs([], [], [], [], [], [], [], [], [], [])
+  for ru in c.rules:
+    r.rpath.push(opt_rx(ru.path))
+    r.rpexc.push(opt_rx(ru.path_except))
+    r.rtext.push(opt_rx(ru.text))
+    r.rsrc.push(opt_rx(ru.source))
+  for p in c.paths: r.paths.push(rx.compile(p))
+  for p in c.paths_except: r.pexc.push(rx.compile(p))
+  for ru in c.sev_rules:
+    r.spath.push(opt_rx(ru.path))
+    r.spexc.push(opt_rx(ru.path_except))
+    r.stext.push(opt_rx(ru.text))
+    r.ssrc.push(opt_rx(ru.source))
+  return r
+
+fn rule_match(ru: cfg.Rule, prx: rx.Rx, perx: rx.Rx, trx: rx.Rx, srx: rx.Rx, linter: Str, msg: Str, rel: Str, src: Str) -> Bool:
+  if ru.linters.len == 0 and ru.path.len == 0 and ru.path_except.len == 0 and ru.text.len == 0 and ru.source.len == 0: return false
+  if ru.text.len > 0 and not rx.matches(trx, msg): return false
+  if ru.path.len > 0 and not rx.matches(prx, rel): return false
+  if ru.path_except.len > 0 and rx.matches(perx, rel): return false
+  if ru.linters.len > 0 and not (linter in ru.linters): return false
+  if ru.source.len > 0 and not rx.matches(srx, src): return false
+  return true
+
+# ---- //nolint
+
+type Range:
+  from: Int
+  to: Int
+  col: Int
+  linters: [Str]    # empty: all
+  matched: [Str]    # linters whose issues it dropped
+  orig: Int         # the range it was expanded from, or -1
+
+fn known_name(n: Str) -> Bool:
+  if n == "typecheck": return true
+  return n in cfg.reg_names()
+
+fn lower_trim(s: Str) -> Str:
+  return pkg.lower_ascii(s.strip())
+
+# The //nolint ranges of file fi, expanded to the node that starts right after a comment group on
+# its own line (as golangci-lint's nolint filter does).
+fn nolint_ranges(p: pkg.Pkg, fi: Int, var unknown: [Str]) -> [Range]:
+  let cm = p.comments[fi]
+  let lines = p.lines[fi]
+  let src = p.srcs[fi]
+  var out: [Range] = []
+  var i = 0
+  while i < cm.len:
+    let gs = i
+    let prev_line = pkg.line_of(lines, cm[i + 2])
+    var n = 1
+    if cm[i + 2] > 0 and prev_line == pkg.line_of(lines, cm[i]): n = 0
+    var endl = pkg.line_of(lines, cm[i + 1])
+    var j = i + 3
+    while j < cm.len and cm[j + 2] == cm[gs + 2] and pkg.line_of(lines, cm[j]) <= endl + n:
+      endl = pkg.line_of(lines, cm[j + 1])
+      j += 3
+    let from = pkg.line_of(lines, cm[gs])
+    let col = pkg.col_of(lines, cm[gs])
+    var k = gs
+    while k < j:
+      var text = src[cm[k]..cm[k + 1]]
+      var a = 0
+      while a < text.len and (text[a] == '/' or text[a] == ' '): a += 1
+      text = text[a..text.len]
+      if text == "nolint" or text.startswith("nolint ") or text.startswith("nolint:"):
+        var linters: [Str] = []
+        if text.startswith("nolint:") and not text.startswith("nolint:all"):
+          var body = text[7..text.len]
+          let c = body.find("//")
+          if c >= 0: body = body[0..c]
+          var all = false
+          for item in body.split(","):
+            let nm = lower_trim(item)
+            if nm == "all":
+              all = true
+              break
+            if not known_name(nm) and not (nm in unknown): unknown.push(nm + "")
+            linters.push(nm)
+          if all:
+            linters = []
+            unknown.truncate(0)
+        out.push(Range(from, endl, col, linters, [], -1))
+      k += 3
+    i = j
+  if out.len == 0: return out
+  let t = p.t
+  let nin = out.len
+  for x in 1..t.k.len:
+    if t.file[x] != fi or t.k[x] == 1: continue
+    let sl = pkg.line_of(lines, t.pos[x])
+    for r in 0..nin:
+      if out[r].to == sl - 1 and pkg.col_of(lines, t.pos[x]) == out[r].col:
+        let el = pkg.line_of(lines, t.end[x])
+        var ls: [Str] = []
+        for s in out[r].linters: ls.push(s + "")
+        var to = out[r].to
+        if to < el: to = el
+        out.push(Range(out[r].from, to, out[r].col, ls, [], r))
+        break
+  return out
+
+# nolintlint's findings for one file: directive problems, and candidates for unused directives.
+type Cand:
+  pos: Int
+  msg: Str
+  expect: Str     # "" not a candidate, "-" all linters, else the linter
+
+fn is_word_byte(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+
+fn is_sp(c: Byte) -> Bool:
+  return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12
+
+# ^//\s*(nolint)(:\s*[\w-]+\s*(?:,\s*[\w-]+\s*)*)?\b
+fn nll_comment(t: Str) -> Bool:
+  if not t.startswith("//"): return false
+  var i = 2
+  while i < t.len and is_sp(t[i]): i += 1
+  if not t[i..t.len].startswith("nolint"): return false
+  i += 6
+  # \b after "nolint" (or after the optional list, which ends in a word char or spaces)
+  if i >= t.len or not is_word_byte(t[i]): return true
+  return false
+
+# ^//\s*nolint(?::(\s*[\w-]+\s*(?:,\s*[\w-]+\s*)*))?\s*(//.*)?\s*\n?$ ; returns ok, linters text, explanation
+fn nll_full(t: Str, var lt: Str, var expl: Str) -> Bool:
+  var i = 2
+  while i < t.len and is_sp(t[i]): i += 1
+  i += 6
+  lt = ""
+  expl = ""
+  if i < t.len and t[i] == ':':
+    let st = i + 1
+    var j = st
+    var ok = false
+    while true:
+      while j < t.len and is_sp(t[j]): j += 1
+      let ws = j
+      while j < t.len and (is_word_byte(t[j]) or t[j] == '-'): j += 1
+      if j == ws: break
+      ok = true
+      while j < t.len and is_sp(t[j]): j += 1
+      if j < t.len and t[j] == ',':
+        let save = j
+        j += 1
+        var k = j
+        while k < t.len and is_sp(t[k]): k += 1
+        if k < t.len and (is_word_byte(t[k]) or t[k] == '-'): continue
+        j = save
+        break
+      break
+    if ok:
+      # the group is greedy over trailing spaces
+      lt = t[st..j]
+      i = j
+    else: return false
+  while i < t.len and is_sp(t[i]): i += 1
+  if i + 1 < t.len and t[i] == '/' and t[i + 1] == '/':
+    expl = t[i..t.len]
+    return true
+  return i >= t.len
+
+fn nolintlint_file(p: pkg.Pkg, fi: Int, need_specific: Bool, need_expl: Bool, need_unused: Bool, expl_exclude: [Str]) -> [Cand]:
+  var out: [Cand] = []
+  let cm = p.comments[fi]
+  let src = p.srcs[fi]
+  var i = 0
+  while i < cm.len:
+    let st = cm[i]
+    let t = src[st..cm[i + 1]]
+    i += 3
+    if not nll_comment(t): continue
+    var ls = 2
+    while ls < t.len and is_sp(t[ls]): ls += 1
+    let lead = t[2..ls]
+    var dir = "//"
+    if lead.len > 0: dir += " "
+    let colon = t.find(":")
+    var head = t
+    if colon >= 0: head = t[0..colon]
+    let parts = head.split("//")
+    if parts.len > 1: dir += parts[1].strip()
+    if lead.len > 0:
+      var j = 2
+      while j < t.len and is_sp(t[j]): j += 1
+      out.push(Cand(st, "directive `" + t + "` should be written without leading space as `//" + t[j..t.len] + "`", ""))
+    var lt = ""
+    var expl = ""
+    if not nll_full(t, &lt, &expl):
+      out.push(Cand(st, "directive `" + t + "` should match `" + dir + "[:<comma-separated-linters>] [// <explanation>]`", ""))
+      continue
+    var linters: [Str] = []
+    if lt.len > 0 and not lt.startswith("all"):
+      for ll in lt.split(","):
+        let nm = ll.strip()
+        if nm.len > 0: linters.push(nm + "")
+    if need_specific and linters.len == 0:
+      out.push(Cand(st, "directive `" + t + "` should mention specific linter such as `" + dir + ":my-linter`", ""))
+    if need_unused:
+      if linters.len == 0: out.push(Cand(st, "directive `" + t + "` is unused", "-"))
+      else:
+        for l in linters: out.push(Cand(st, "directive `" + t + "` is unused for linter \"" + l + "\"", l + ""))
+    if need_expl and (expl.len == 0 or expl.strip() == "//"):
+      var needs = linters.len == 0
+      for l in linters:
+        if not (l in expl_exclude): needs = true
+      if needs:
+        # trailingBlankExplanation: \s*(//\s*)?$ removed
+        var e = t.len
+        while e > 0 and is_sp(t[e - 1]): e -= 1
+        if e >= 2 and t[e - 2] == '/' and t[e - 1] == '/':
+          e -= 2
+          while e > 0 and is_sp(t[e - 1]): e -= 1
+        out.push(Cand(st, "directive `" + t + "` should provide explanation such as `" + t[0..e] + " // this is why`", ""))
+  return out
+
+# ---- per package
+
+type Counts:
+  rules: [Int]
+  paths: [Int]
+  pexc: [Int]
+  unknown: [Str]
+
+fn new_counts(c: cfg.Cfg) -> Counts:
+  return Counts([0] * c.rules.len, [0] * c.paths.len, [0] * c.paths_except.len, [])
+
+fn line_text(p: pkg.Pkg, f: Int, line: Int) -> Str:
+  let ls = p.lines[f]
+  if line < 1 or line > ls.len: return ""
+  let st = ls[line - 1]
+  var en = p.srcs[f].len
+  if line < ls.len: en = ls[line] - 1
+  if en < st: return ""
+  var s = p.srcs[f][st..en]
+  if s.endswith("\r"): s = s[0..s.len - 1]
+  return s
+
+type Changed:
+  files: [Str]      # paths relative to the working directory
+  lines: [[Int]]    # sorted changed lines per file; [-1] for a whole (new) file
+
+fn in_diff(ch: Changed, path: Str, line: Int) -> Bool:
+  for i in 0..ch.files.len:
+    if ch.files[i] == path:
+      let ls = ch.lines[i]
+      if ls.len > 0 and ls[0] == -1: return true
+      for l in ls:
+        if l == line: return true
+      return false
+  return false
+
+# Everything golangci-lint does with one package's issues before the run-wide limits.
+fn process_pkg(c: cfg.Cfg, rs: Rxs, p: pkg.Pkg, issues: [pkg.Issue], var cnt: Counts, diff: Bool, ch: Changed) -> [Iss]:
+  var byfile: [[Int]] = []
+  for f in 0..p.paths.len: byfile.push([])
+  for i in 0..issues.len: byfile[issues[i].file].push(i)
+  let nll = cfg.is_enabled(c, "nolintlint")
+  var need_specific = false
+  var need_expl = false
+  var need_unused = true
+  var expl_ex: [Str] = []
+  if nll:
+    let s = cfg.lsettings(c, "nolintlint")
+    need_specific = doc.bool_of(c.d, doc.get(c.d, s, "require-specific"), false)
+    need_expl = doc.bool_of(c.d, doc.get(c.d, s, "require-explanation"), false)
+    need_unused = not doc.bool_of(c.d, doc.get(c.d, s, "allow-unused"), false)
+    expl_ex = doc.strs_of(c.d, doc.get(c.d, s, "allow-no-explanation"))
+  var out: [Iss] = []
+  for f in 0..p.paths.len:
+    var cands: [Cand] = []
+    if nll: cands = nolintlint_file(p, f, need_specific, need_expl, need_unused, expl_ex)
+    if byfile[f].len == 0 and cands.len == 0: continue
+    # generated files
+    if c.gen_mode == "strict" and p.strict_gen[f]: continue
+    if c.gen_mode == "lax" and (p.strict_gen[f] or p.lax_gen[f]): continue
+    let path = p.paths[f]
+    let rel = cfg.rel_path(c.base, cfg.abs_path(c.cwd, path))
+    # exclusion paths
+    var drop = false
+    for k in 0..rs.paths.len:
+      if rx.matches(rs.paths[k], rel):
+        cnt.paths[k] += 1
+        drop = true
+        break
+    if drop: continue
+    if rs.pexc.len > 0:
+      var any = false
+      for k in 0..rs.pexc.len:
+        if rx.matches(rs.pexc[k], rel):
+          cnt.pexc[k] += 1
+          any = true
+      if not any: continue
+    # in golangci-lint's order: by linter rank, then as reported; nolintlint's after the rest
+    var idx: [Int] = []
+    for x in byfile[f]: idx.push(x)
+    idx.sort(by: fn(a, b) => issues[a].rank < issues[b].rank)
+    var cand: [pkg.Issue] = []
+    for i in idx: cand.push(pkg.Issue(issues[i].file, issues[i].pos, issues[i].linter + "", issues[i].msg + "", issues[i].rank))
+    var cexp: [Str] = []
+    for q in 0..cand.len: cexp.push("")
+    for cd in cands:
+      cand.push(pkg.Issue(f, cd.pos, "nolintlint", cd.msg + "", 0))
+      cexp.push(cd.expect + "")
+    var ranges: [Range] = []
+    var ranges_done = false
+    var seen: {Int: Bool} = {}
+    for ci in 0..cand.len:
+      let is = cand[ci]
+      let line = pkg.line_of(p.lines[f], is.pos)
+      let src = line_text(p, f, line)
+      # exclusion rules
+      var excluded = false
+      for k in 0..c.rules.len:
+        if rule_match(c.rules[k], rs.rpath[k], rs.rpexc[k], rs.rtext[k], rs.rsrc[k], is.linter, is.msg, rel, src):
+          cnt.rules[k] += 1
+          excluded = true
+          break
+      if excluded: continue
+      # nolint
+      if not ranges_done:
+        ranges = nolint_ranges(p, f, &cnt.unknown)
+        ranges_done = true
+      let exp = cexp[ci]
+      if exp.len > 0 and exp != "-" and not cfg.is_enabled(c, exp): continue
+      var skip = false
+      for ri in 0..ranges.len:
+        if line < ranges[ri].from or line > ranges[ri].to: continue
+        var found = ranges[ri].linters.len == 0 and is.linter != "nolintlint"
+        if is.linter in ranges[ri].linters: found = true
+        if found:
+          if not (is.linter in ranges[ri].matched): ranges[ri].matched.push(is.linter + "")
+          let o = ranges[ri].orig
+          if o >= 0 and not (is.linter in ranges[o].matched): ranges[o].matched.push(is.linter + "")
+          skip = true
+          break
+        if is.linter == "nolintlint" and exp.len > 0:
+          if exp == "-":
+            if ranges[ri].matched.len > 0:
+              skip = true
+              break
+          elif exp in ranges[ri].matched:
+            skip = true
+            break
+      if skip: continue
+      if diff and not in_diff(ch, path, line): continue
+      if c.uniq:
+        if line in seen: continue
+        seen[line] = true
+      let col = pkg.col_of(p.lines[f], is.pos)
+      var sev = ""
+      if c.sev_default.len > 0 or c.sev_rules.len > 0:
+        var done = false
+        for k in 0..c.sev_rules.len:
+          if rule_match(c.sev_rules[k], rs.spath[k], rs.spexc[k], rs.stext[k], rs.ssrc[k], is.linter, is.msg, rel, src):
+            if c.sev_rules[k].severity != "@linter": sev = c.sev_rules[k].severity + ""
+            if sev.len == 0 and c.sev_default != "@linter": sev = c.sev_default + ""
+            done = true
+            break
+        if not done and c.sev_default != "@linter": sev = c.sev_default + ""
+      out.push(Iss(path + "", rel, line, col, is.pos, is.linter + "", is.msg + "", src, sev, exp, out.len))
+  return out
+
+# ---- the run-wide steps
+
+fn dup(is: Iss) -> Iss:
+  return Iss(is.path + "", is.rel + "", is.line, is.col, is.off, is.linter + "", is.msg + "", is.src + "", is.sev + "", is.expect + "", is.order)
+
+fn limit(var all: [Iss], c: cfg.Cfg) -> [Iss]:
+  var out: [Iss] = []
+  var same: {Str: Int} = {}
+  var per: {Str: Int} = {}
+  var fmt_file: {Str: Bool} = {}
+  for is in all:
+    # max-per-file-from-linter: formatters report once per file
+    if cfg.is_formatter(is.linter):
+      let k = is.linter + " " + is.path
+      if k in fmt_file: continue
+      fmt_file[k] = true
+    if c.max_same > 0:
+      let n = same.get(is.msg, 0) + 1
+      same[is.msg] = n
+      if n > c.max_same: continue
+    if c.max_per_linter > 0:
+      let n = per.get(is.linter, 0) + 1
+      per[is.linter] = n
+      if n > c.max_per_linter: continue
+    out.push(dup(is))
+  return out
+
+fn sev_rank(s: Str) -> Int:
+  let classic = ["low", "medium", "high", "warning", "error"]
+  for i in 0..classic.len:
+    if classic[i] == s: return i
+  return -1
+
+# -1, 0, 1 as golangci-lint's comparators (lines and columns <= 0 compare equal).
+fn cmp_iss(a: Iss, b: Iss, order: [Str]) -> Int:
+  for o in order:
+    if o == "file":
+      if a.rel < b.rel: return -1
+      if a.rel > b.rel: return 1
+      if a.line > 0 and b.line > 0:
+        if a.line < b.line: return -1
+        if a.line > b.line: return 1
+      if a.col > 0 and b.col > 0:
+        if a.col < b.col: return -1
+        if a.col > b.col: return 1
+    elif o == "linter":
+      if a.linter < b.linter: return -1
+      if a.linter > b.linter: return 1
+    elif o == "severity":
+      let ra = sev_rank(a.sev)
+      let rb = sev_rank(b.sev)
+      if ra >= 0 and rb >= 0:
+        if ra != rb:
+          if ra < rb: return -1
+          return 1
+      elif ra >= 0: return 1
+      elif rb >= 0: return -1
+      elif a.sev != b.sev:
+        if a.sev < b.sev: return -1
+        return 1
+  return 0
+
+fn sort_issues(var all: [Iss], order0: [Str]):
+  var order: [Str] = []
+  for o in order0: order.push(o + "")
+  if order.len == 0: order = ["linter", "file"]
+  all.sort(by: fn(a, b) => cmp_iss(a, b, order) < 0)
+
+# ---- the cache's record form
+
+fn sep() -> Str:
+  return chr(1)
+
+fn esc(s: Str) -> Str:
+  return s.replace(chr(1), "").replace(chr(2), "")
+
+fn to_record(is: Iss) -> Str:
+  return sep().join([esc(is.path), esc(is.rel), "{is.line}", "{is.col}", "{is.off}", esc(is.linter), esc(is.msg), esc(is.src), esc(is.sev), esc(is.expect), "{is.order}"])
+
+fn from_record(r: Str) -> Iss?:
+  let f = r.split(sep())
+  if f.len != 11: return nil
+  let line = int(f[2]) else 0
+  let col = int(f[3]) else 0
+  let off = int(f[4]) else 0
+  let order = int(f[10]) else 0
+  return Iss(f[0] + "", f[1] + "", line, col, off, f[5] + "", f[6] + "", f[7] + "", f[8] + "", f[9] + "", order)

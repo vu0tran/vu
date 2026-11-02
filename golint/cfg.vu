@@ -1,0 +1,457 @@
+# golangci-lint's configuration: the file found as `golangci-lint run` finds it (.golangci.json,
+# .toml, .yaml or .yml in the current folder, then from the first argument's folder up to the root,
+# then the home folder), command-line flags over it, its v2 schema read into Cfg with the same
+# defaults, and the same errors for what golangci-lint refuses.
+
+import doc
+import lintersdb
+import rx
+
+type Rule:
+  linters: [Str]
+  path: Str
+  path_except: Str
+  text: Str
+  source: Str
+  severity: Str
+  internal: Bool     # from a preset (never reported as unused)
+
+type Cfg:
+  cfg_file: Str      # the config file used ("" for none), as given or found
+  cfg_dir: Str       # its folder, absolute
+  base: Str          # what issue paths are relative to (run.relative-path-mode)
+  cwd: Str
+  version: Str
+  timeout: Str
+  concurrency: Int
+  go_ver: Str
+  build_tags: [Str]
+  issues_exit: Int
+  tests: Bool
+  text_path: Str
+  json_path: Str
+  tab_path: Str
+  html_path: Str
+  checkstyle_path: Str
+  cc_path: Str
+  junit_path: Str
+  teamcity_path: Str
+  sarif_path: Str
+  text_linter_name: Bool
+  text_lines: Bool
+  text_colors: Bool
+  tab_linter_name: Bool
+  tab_colors: Bool
+  junit_ext: Bool
+  sort_order: [Str]
+  show_stats: Bool
+  path_prefix: Str
+  path_mode: Str
+  enabled: [Str]       # the linters and formatters that run, sorted
+  gen_mode: Str
+  warn_unused: Bool
+  rules: [Rule]
+  paths: [Str]
+  paths_except: [Str]
+  max_per_linter: Int
+  max_same: Int
+  uniq: Bool
+  new_from_rev: Str
+  new_from_merge_base: Str
+  new_from_patch: Str
+  whole_files: Bool
+  new: Bool
+  fix: Bool
+  sev_default: Str
+  sev_rules: [Rule]
+  d: doc.Doc
+  settings: Int        # the linters.settings node
+  fsettings: Int       # the formatters.settings node
+
+fn new_cfg() -> Cfg:
+  return Cfg("", "", "", "", "", "", 0, "", [], 1, true, "", "", "", "", "", "", "", "", "", true, true, true, true, true, false, [], true, "", "", [], "strict", false, [], [], [], 50, 3, true, "", "", "", false, false, false, "", [], doc.new_doc(), -1, -1)
+
+# ---- the linter registry
+
+fn reg_names() -> [Str]:
+  return lintersdb.REG_ORDER.split()
+
+fn formatter_names() -> [Str]:
+  return ["gci", "gofmt", "gofumpt", "goimports", "golines", "swaggo"]
+
+fn is_formatter(n: Str) -> Bool:
+  return n in formatter_names()
+
+fn is_known(n: Str) -> Bool:
+  if n == "typecheck": return false
+  for x in reg_names():
+    if x == n: return true
+  return false
+
+# "name: description [fast, auto-fix]" lines of `help linters`, and formatters (all fast).
+fn is_fast(n: Str) -> Bool:
+  if is_formatter(n): return true
+  for l in lintersdb.help_lines():
+    if l.startswith(n + ": ") or l.startswith(n + " [deprecated]: "):
+      return l.endswith("[fast]") or "[fast," in l
+  return false
+
+fn standard() -> [Str]:
+  return ["errcheck", "govet", "ineffassign", "staticcheck", "unused"]
+
+# What vgolint implements.
+fn implemented() -> [Str]:
+  return ["errcheck", "govet", "ineffassign", "staticcheck", "unused", "nolintlint"]
+
+# ---- paths
+
+fn clean_path(p: Str) -> Str:
+  let abs = p.startswith("/")
+  var parts: [Str] = []
+  for s in p.split("/"):
+    if s.len == 0 or s == ".": continue
+    if s == "..":
+      if parts.len > 0 and parts[parts.len - 1] != "..":
+        parts.pop()
+        continue
+      if abs: continue
+    parts.push(s + "")
+  let j = "/".join(parts)
+  if abs: return "/" + j
+  if j.len == 0: return "."
+  return j
+
+fn abs_path(cwd: Str, p: Str) -> Str:
+  if p.startswith("/"): return clean_path(p)
+  return clean_path(cwd + "/" + p)
+
+fn rfind_slash(p: Str) -> Int:
+  var i = p.len - 1
+  while i >= 0 and p[i] != '/': i -= 1
+  return i
+
+fn dir_of(p: Str) -> Str:
+  let i = rfind_slash(p)
+  if i < 0: return "."
+  if i == 0: return "/"
+  return p[0..i]
+
+# filepath.Rel for absolute, clean paths.
+fn rel_path(base: Str, target: Str) -> Str:
+  if base == target: return "."
+  var b = base.split("/")
+  var t = target.split("/")
+  if base == "/": b = [""]
+  var i = 0
+  while i < b.len and i < t.len and b[i] == t[i]: i += 1
+  var parts: [Str] = []
+  for k in i..b.len: parts.push("..")
+  for k in i..t.len: parts.push(t[k] + "")
+  return "/".join(parts)
+
+fn shortest_rel(cwd: Str, p: Str) -> Str:
+  let a = abs_path(cwd, p)
+  let r = rel_path(cwd, a)
+  if r.len < a.len: return r
+  return a
+
+# ---- loading
+
+type Flags:
+  config: Str
+  no_config: Bool
+  sets: [Str]          # key, value pairs for flags bound to config keys
+  enable: [Str]
+  disable: [Str]
+  enable_only: [Str]
+  has_enable_only: Bool
+  build_tags: [Str]
+  first_arg: Str
+
+fn new_flags() -> Flags:
+  return Flags("", false, [], [], [], [], false, [], "")
+
+# Finds the config file as viper does for golangci-lint: name .golangci, extensions in viper's
+# order, in each search path.
+fn is_dir(fs: Fs, p: Str) -> Bool:
+  return fs.exists(p + "/.")
+
+fn find_config(fs: Fs, cwd: Str, home: Str, first_arg: Str) -> Str:
+  var fa = first_arg + ""
+  if fa.len == 0: fa = "./..."
+  let absp = abs_path(cwd, fa)
+  var cur = absp
+  if not is_dir(fs, absp): cur = dir_of(absp)
+  var paths: [Str] = [cwd + ""]
+  while true:
+    paths.push(cur + "")
+    let parent = dir_of(cur)
+    if parent == cur: break
+    cur = parent
+  if home.len > 0 and not (home in paths): paths.push(home + "")
+  for p in paths:
+    for ext in ["json", "toml", "yaml", "yml"]:
+      var f = p + "/.golangci." + ext
+      if p == "/": f = "/.golangci." + ext
+      if fs.exists(f) and not is_dir(fs, f): return f
+  return ""
+
+# time.ParseDuration's error, as mapstructure reports it ("" when s is fine).
+fn dur_err(s: Str) -> Str:
+  if s.len == 0 or s == "0": return ""
+  var i = 0
+  if s[0] == '+' or s[0] == '-': i = 1
+  if i >= s.len: return "time: invalid duration \"" + s + "\""
+  while i < s.len:
+    let st = i
+    while i < s.len and ((s[i] >= '0' and s[i] <= '9') or s[i] == '.'): i += 1
+    if i == st: return "time: invalid duration \"" + s + "\""
+    let us = i
+    while i < s.len and not ((s[i] >= '0' and s[i] <= '9') or s[i] == '.'): i += 1
+    let u = s[us..i]
+    if u.len == 0: return "time: missing unit in duration \"" + s + "\""
+    if not (u in ["ns", "us", "µs", "μs", "ms", "s", "m", "h"]): return "time: unknown unit"
+  return ""
+
+fn rules_from(d: doc.Doc, n: Int) -> [Rule]:
+  var out: [Rule] = []
+  if n < 0 or d.kind[n] != doc.K_SEQ: return out
+  for r in d.kids[n]:
+    out.push(Rule(doc.strs_of(d, doc.get(d, r, "linters")), doc.str_of(d, doc.get(d, r, "path"), ""), doc.str_of(d, doc.get(d, r, "path-except"), ""), doc.str_of(d, doc.get(d, r, "text"), ""), doc.str_of(d, doc.get(d, r, "source"), ""), doc.str_of(d, doc.get(d, r, "severity"), ""), false))
+  return out
+
+fn preset_rules(name: Str, var out: [Rule]):
+  if name == "comments":
+    out.push(Rule(["staticcheck"], "", "", "(ST1000|ST1020|ST1021|ST1022)", "", "", true))
+    out.push(Rule(["revive"], "", "", "exported (.+) should have comment( \\(or a comment on this block\\))? or be unexported", "", "", true))
+    out.push(Rule(["revive"], "", "", "package comment should be of the form \"(.+)...\"", "", "", true))
+    out.push(Rule(["revive"], "", "", "comment on exported (.+) should be of the form \"(.+)...\"", "", "", true))
+    out.push(Rule(["revive"], "", "", "should have a package comment", "", "", true))
+  elif name == "std-error-handling":
+    out.push(Rule(["errcheck"], "", "", "(?i)Error return value of .((os\\.)?std(out|err)\\..*|.*Close|.*Flush|os\\.Remove(All)?|.*print(f|ln)?|os\\.(Un)?Setenv). is not checked", "", "", true))
+  elif name == "common-false-positives":
+    out.push(Rule(["gosec"], "", "", "G103: Use of unsafe calls should be audited", "", "", true))
+    out.push(Rule(["gosec"], "", "", "G204: Subprocess launched with variable", "", "", true))
+    out.push(Rule(["gosec"], "", "", "G304: Potential file inclusion via variable", "", "", true))
+  elif name == "legacy":
+    out.push(Rule(["govet"], "", "", "(possible misuse of unsafe.Pointer|should have signature)", "", "", true))
+    out.push(Rule(["staticcheck"], "", "", "SA4011", "", "", true))
+    out.push(Rule(["gosec"], "", "", "G104", "", "", true))
+    out.push(Rule(["gosec"], "", "", "(G301|G302|G307): Expect (directory permissions to be 0750|file permissions to be 0600) or less", "", "", true))
+
+fn rule_conditions(r: Rule) -> Int:
+  var n = 0
+  if r.linters.len > 0: n += 1
+  if r.path.len > 0 or r.path_except.len > 0: n += 1
+  if r.text.len > 0: n += 1
+  if r.source.len > 0: n += 1
+  return n
+
+# Reads the config file (if any) and the flags into c; returns an error message golangci-lint would
+# print after "can't load config: " (or with its own prefix when it starts with "!").
+fn load(fs: Fs, var c: Cfg, f: Flags, home: Str, gomod_go: Str) -> Str:
+  if f.no_config and f.config.len > 0: return "can't parse --config option: can't combine option --config and --no-config"
+  var file = ""
+  if not f.no_config:
+    if f.config.len > 0:
+      file = f.config + ""
+      if file.startswith("~/"): file = home + file[1..file.len]
+    else: file = find_config(fs, c.cwd, home, f.first_arg)
+  var d = doc.new_doc()
+  if file.len > 0:
+    let src = fs.read(file) else ""
+    if not fs.exists(file):
+      return "can't read viper config: open " + file + ": no such file or directory"
+    d = doc.parse_file(file, src)
+    if d.err.len > 0:
+      var kind = "YAML"
+      if file.endswith(".json"): kind = "JSON"
+      elif file.endswith(".toml"): kind = "TOML"
+      return "can't read viper config: While parsing config: " + d.err
+    c.cfg_file = shortest_rel(c.cwd, file)
+    c.cfg_dir = dir_of(abs_path(c.cwd, file))
+  if d.root < 0: d.root = doc.add(&d, doc.K_MAP, "")
+  # flags bound to config keys override the file
+  var i = 0
+  while i + 1 < f.sets.len:
+    doc.set_path(&d, f.sets[i], f.sets[i + 1])
+    i += 2
+  let r = d.root
+  # string slices from flags are appended (golangci-lint's "string slice hack")
+  var enable = doc.strs_of(d, doc.at(d, r, "linters.enable"))
+  for x in f.enable: enable.push(x + "")
+  var disable = doc.strs_of(d, doc.at(d, r, "linters.disable"))
+  for x in f.disable: disable.push(x + "")
+  var tags = doc.strs_of(d, doc.at(d, r, "run.build-tags"))
+  for x in f.build_tags: tags.push(x + "")
+  c.build_tags = tags
+  c.gen_mode = doc.str_of(d, doc.at(d, r, "linters.exclusions.generated"), "")
+  if c.gen_mode.len == 0: c.gen_mode = "strict"
+  c.version = doc.str_of(d, doc.get(d, r, "version"), "")
+  if c.cfg_dir.len > 0 and c.version != "2":
+    return "unsupported version of the configuration: \"" + c.version + "\" See https://golangci-lint.run/docs/product/migration-guide for migration instructions"
+  for n in enable:
+    if n == "typecheck": return "typecheck is not a linter, it cannot be enabled or disabled"
+  for n in disable:
+    if n == "typecheck": return "typecheck is not a linter, it cannot be enabled or disabled"
+  var formatters = doc.strs_of(d, doc.at(d, r, "formatters.enable"))
+  # run
+  c.timeout = doc.str_of(d, doc.at(d, r, "run.timeout"), "")
+  c.concurrency = doc.int_of(d, doc.at(d, r, "run.concurrency"), 0)
+  c.go_ver = doc.str_of(d, doc.at(d, r, "run.go"), "")
+  if c.go_ver.len == 0: c.go_ver = gomod_go + ""
+  if c.go_ver.len == 0: c.go_ver = "1.22"
+  c.issues_exit = doc.int_of(d, doc.at(d, r, "run.issues-exit-code"), 1)
+  c.tests = doc.bool_of(d, doc.at(d, r, "run.tests"), true)
+  let rel_mode = doc.str_of(d, doc.at(d, r, "run.relative-path-mode"), "")
+  let mdm = doc.str_of(d, doc.at(d, r, "run.modules-download-mode"), "")
+  # output
+  let fm = doc.at(d, r, "output.formats")
+  c.text_path = doc.str_of(d, doc.at(d, fm, "text.path"), "")
+  c.json_path = doc.str_of(d, doc.at(d, fm, "json.path"), "")
+  c.tab_path = doc.str_of(d, doc.at(d, fm, "tab.path"), "")
+  c.html_path = doc.str_of(d, doc.at(d, fm, "html.path"), "")
+  c.checkstyle_path = doc.str_of(d, doc.at(d, fm, "checkstyle.path"), "")
+  c.cc_path = doc.str_of(d, doc.at(d, fm, "code-climate.path"), "")
+  c.junit_path = doc.str_of(d, doc.at(d, fm, "junit-xml.path"), "")
+  c.teamcity_path = doc.str_of(d, doc.at(d, fm, "teamcity.path"), "")
+  c.sarif_path = doc.str_of(d, doc.at(d, fm, "sarif.path"), "")
+  c.text_linter_name = doc.bool_of(d, doc.at(d, fm, "text.print-linter-name"), true)
+  c.text_lines = doc.bool_of(d, doc.at(d, fm, "text.print-issued-lines"), true)
+  c.text_colors = doc.bool_of(d, doc.at(d, fm, "text.colors"), true)
+  c.tab_linter_name = doc.bool_of(d, doc.at(d, fm, "tab.print-linter-name"), true)
+  c.tab_colors = doc.bool_of(d, doc.at(d, fm, "tab.colors"), true)
+  c.junit_ext = doc.bool_of(d, doc.at(d, fm, "junit-xml.extended"), false)
+  c.sort_order = doc.strs_of(d, doc.at(d, r, "output.sort-order"))
+  c.show_stats = doc.bool_of(d, doc.at(d, r, "output.show-stats"), true)
+  c.path_prefix = doc.str_of(d, doc.at(d, r, "output.path-prefix"), "")
+  c.path_mode = doc.str_of(d, doc.at(d, r, "output.path-mode"), "")
+  # issues
+  c.max_per_linter = doc.int_of(d, doc.at(d, r, "issues.max-issues-per-linter"), 50)
+  c.max_same = doc.int_of(d, doc.at(d, r, "issues.max-same-issues"), 3)
+  c.uniq = doc.bool_of(d, doc.at(d, r, "issues.uniq-by-line"), true)
+  c.new_from_rev = doc.str_of(d, doc.at(d, r, "issues.new-from-rev"), "")
+  c.new_from_merge_base = doc.str_of(d, doc.at(d, r, "issues.new-from-merge-base"), "")
+  c.new_from_patch = doc.str_of(d, doc.at(d, r, "issues.new-from-patch"), "")
+  c.whole_files = doc.bool_of(d, doc.at(d, r, "issues.whole-files"), false)
+  c.new = doc.bool_of(d, doc.at(d, r, "issues.new"), false)
+  c.fix = doc.bool_of(d, doc.at(d, r, "issues.fix"), false)
+  # exclusions
+  let ex = doc.at(d, r, "linters.exclusions")
+  c.warn_unused = doc.bool_of(d, doc.get(d, ex, "warn-unused"), false)
+  c.rules = rules_from(d, doc.get(d, ex, "rules"))
+  c.paths = doc.strs_of(d, doc.get(d, ex, "paths"))
+  c.paths_except = doc.strs_of(d, doc.get(d, ex, "paths-except"))
+  let presets = doc.strs_of(d, doc.get(d, ex, "presets"))
+  # formatters' exclusion paths become rules for the formatters
+  if formatters.len > 0:
+    for p in doc.strs_of(d, doc.at(d, r, "formatters.exclusions.paths")):
+      var ls: [Str] = []
+      for x in formatters: ls.push(x + "")
+      c.rules.push(Rule(ls, p + "", "", "", "", "", false))
+  # severity
+  c.sev_default = doc.str_of(d, doc.at(d, r, "severity.default"), "")
+  c.sev_rules = rules_from(d, doc.at(d, r, "severity.rules"))
+  c.settings = doc.at(d, r, "linters.settings")
+  c.fsettings = doc.at(d, r, "formatters.settings")
+  # base path
+  var mode = rel_mode + ""
+  if mode.len == 0: mode = "cfg"
+  if mode == "cfg":
+    if c.cfg_dir.len > 0: c.base = c.cfg_dir + ""
+    else: c.base = c.cwd + ""
+  elif mode == "wd": c.base = c.cwd + ""
+  elif mode == "gomod" or mode == "gitroot": c.base = c.cwd + ""   # resolved by the caller
+  else: return "get base path: unknown relative path mode: " + mode
+  # --enable-only
+  var dflt = doc.str_of(d, doc.at(d, r, "linters.default"), "standard")
+  if dflt.len == 0: dflt = "standard"
+  let fast_only = doc.bool_of(d, doc.at(d, r, "linters.fast-only"), false)
+  if f.has_enable_only and f.enable_only.len > 0:
+    dflt = "none"
+    enable = []
+    for x in f.enable_only: enable.push(x + "")
+    disable = []
+    formatters = []
+  # validation (Config.Validate, then the linters' names)
+  let de = dur_err(c.timeout)
+  if de.len > 0: return "can't unmarshal config by viper (flags, file): 1 error(s) decoding:\n\n* error decoding 'run.timeout': " + de
+  if mdm.len > 0 and not (mdm in ["mod", "readonly", "vendor"]): return "invalid modules download path " + mdm + ", only (mod|readonly|vendor) allowed"
+  if rel_mode.len > 0 and not (rel_mode in ["gomod", "gitroot", "cfg", "wd"]): return "invalid relative path mode " + rel_mode + ", only (gomod|gitroot|cfg|wd) allowed"
+  var seen_orders: [Str] = []
+  for o in c.sort_order:
+    if o in seen_orders: return "the sort-order name \"" + o + "\" is repeated several times"
+    if not (o in ["linter", "file", "severity"]): return "unsupported sort-order name \"" + o + "\""
+    seen_orders.push(o + "")
+  if c.path_mode.len > 0 and c.path_mode != "abs": return "unsupported output path mode \"" + c.path_mode + "\""
+  for ri in 0..c.rules.len:
+    let ru = c.rules[ri]
+    if ru.path.len > 0:
+      let e = rx.check(ru.path)
+      if e.len > 0: return "error in exclude rule #{ri}: invalid path regex: " + e
+    if ru.path_except.len > 0:
+      let e = rx.check(ru.path_except)
+      if e.len > 0: return "error in exclude rule #{ri}: invalid path-except regex: " + e
+    if ru.text.len > 0:
+      let e = rx.check(ru.text)
+      if e.len > 0: return "error in exclude rule #{ri}: invalid text regex: " + e
+    if ru.source.len > 0:
+      let e = rx.check(ru.source)
+      if e.len > 0: return "error in exclude rule #{ri}: invalid source regex: " + e
+    if ru.path.len > 0 and ru.path_except.len > 0: return "error in exclude rule #{ri}: path and path-except should not be set at the same time"
+    if rule_conditions(ru) < 2: return "error in exclude rule #{ri}: at least 2 of (text, source, path[-except], linters) should be set"
+  for p in presets:
+    if not (p in ["comments", "std-error-handling", "common-false-positives", "legacy"]): return "invalid preset: " + p
+  for n in enable:
+    if is_formatter(n): return n + " is a formatter"
+  for n in disable:
+    if is_formatter(n): return n + " is a formatter"
+  for ri in 0..c.sev_rules.len:
+    let ru = c.sev_rules[ri]
+    if ru.severity.len == 0: return "error in severity rule #{ri}: severity should be set"
+    if rule_conditions(ru) < 1: return "error in severity rule #{ri}: at least 1 of (text, source, path[-except], linters) should be set"
+  if c.sev_rules.len > 0 and c.sev_default.len == 0: return "can't set severity rule option: no default severity defined"
+  for p in presets:
+    preset_rules(p, &c.rules)
+  # the linters' names
+  var unknown: [Str] = []
+  for n in enable:
+    if not is_known(n): unknown.push(n + "")
+  for n in disable:
+    if not is_known(n): unknown.push(n + "")
+  if unknown.len > 0: return "!unknown linters: '" + ",".join(unknown) + "', run 'golangci-lint help linters' to see the list of supported linters"
+  # the set that runs
+  var set: [Str] = []
+  if dflt == "all":
+    for n in reg_names():
+      if n != "typecheck" and not is_formatter(n) and n != "wsl": set.push(n + "")
+  elif dflt == "fast":
+    for n in reg_names():
+      if n != "typecheck" and not is_formatter(n) and is_fast(n) and n != "wsl": set.push(n + "")
+  elif dflt == "standard":
+    for n in standard(): set.push(n + "")
+  elif dflt != "none": return "@unknown group: " + dflt
+  for n in enable:
+    if not (n in set): set.push(n + "")
+  for n in formatters:
+    if not (n in set): set.push(n + "")
+  var final: [Str] = []
+  for n in set:
+    if n in disable: continue
+    if fast_only and not is_fast(n): continue
+    final.push(n + "")
+  c.enabled = sorted(final)
+  swap(&c.d, &d)
+  return ""
+
+fn is_enabled(c: Cfg, n: Str) -> Bool:
+  for x in c.enabled:
+    if x == n: return true
+  return false
+
+# The settings node of a linter (formatters read formatters.settings when enabled as formatters).
+fn lsettings(c: Cfg, name: Str) -> Int:
+  if is_formatter(name) and c.fsettings >= 0:
+    let f = doc.get(c.d, c.fsettings, name)
+    if f >= 0: return f
+  return doc.get(c.d, c.settings, name)
