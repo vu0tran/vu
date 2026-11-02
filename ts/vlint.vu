@@ -24,12 +24,19 @@ fn want(name: Str) -> Bool:
   return false
 
 fn walk(fs: Fs, dir: Str, var out: [Str]):
+  walk_in(fs, dir, false, &out)
+
+# (deps: no node_modules folders, for the run without paths; files in "." are named without "./")
+fn walk_in(fs: Fs, dir: Str, deps: Bool, var out: [Str]):
   let names = fs.list(dir) else return
+  var pre = dir + "/"
+  if deps and dir == ".": pre = ""
   for nm in names:
     if nm == ".git/": continue
+    if deps and nm == "node_modules/": continue
     if nm.endswith("/"):
-      walk(fs, dir + "/" + nm[0..nm.len - 1], &out)
-    elif want(nm): out.push(dir + "/" + nm)
+      walk_in(fs, pre + nm[0..nm.len - 1], deps, &out)
+    elif want(nm): out.push(pre + nm)
 
 type Res:
   idx: Int
@@ -87,7 +94,8 @@ fn cworker(fs: Fs, own sj: Shared[CJobs], own jobs: Chan[Int], own res: Chan[CRe
     r.idx = i
     res.send(r)
 
-fn cached_run(fs: Fs, ffi: Ffi, files: [Str], jobs0: Int, phase: Int, loc: Str):
+# (whether it printed an error)
+fn cached_run(fs: Fs, ffi: Ffi, files: [Str], jobs0: Int, phase: Int, loc: Str) -> Bool:
   let cfg = lcache.config_key(fs, "phase={phase}")
   var old = lcache.empty()
   if cfg != 0: old = lcache.load(fs, loc, cfg)
@@ -159,6 +167,7 @@ fn cached_run(fs: Fs, ffi: Ffi, files: [Str], jobs0: Int, phase: Int, loc: Str):
   # The output, in file order, and the new cache.
   var nc = lcache.empty()
   var dirty = cfg != 0 and old.paths.len == 0
+  var errs = false
   for i in 0..n:
     let k = ki[i]
     var text = ""
@@ -182,14 +191,16 @@ fn cached_run(fs: Fs, ffi: Ffi, files: [Str], jobs0: Int, phase: Int, loc: Str):
       nl = res[i].lines.len
       size = res[i].size
       h = res[i].hash
-    if nl > 0: print(text)
+    if nl > 0:
+      print(text)
+      if not errs: errs = has_error(text)
     if nc.at.get(files[i], -1) >= 0: continue
     var mt = smt[i]
     if size != ssz[i]: mt = 0       # changed between the stat and the read
     if k < 0 or old.size[k] != size or old.hash[k] != h or old.mt[k] != mt or old.ct[k] != sct[i] or old.ino[k] != sino[i]:
       dirty = true
     lcache.add(&nc, files[i] + "", size, mt, sct[i], sino[i], h, nl, text)
-  if cfg == 0: return
+  if cfg == 0: return errs
   # Entries for files outside this run stay while the file exists.
   for k in 0..old.paths.len:
     if nc.at.get(old.paths[k], -1) >= 0: continue
@@ -198,13 +209,23 @@ fn cached_run(fs: Fs, ffi: Ffi, files: [Str], jobs0: Int, phase: Int, loc: Str):
       continue
     lcache.add(&nc, old.paths[k] + "", old.size[k], old.mt[k], old.ct[k], old.ino[k], old.hash[k], old.nl[k], old.text[k] + "")
   if dirty: lcache.save(fs, ffi, loc, lcache.encode(nc, cfg))
+  return errs
 
-fn cpu_count(fs: Fs) -> Int:
+# Whether a diagnostic line (or lines) is an error: "path:line:col: error ...".
+fn has_error(text: Str) -> Bool:
+  for l in text.split("\n"):
+    let e = l.find(": error ")
+    if e < 0: continue
+    let w = l.find(": warning ")
+    if w < 0 or e < w: return true
+  return false
+
+fn cpu_count(fs: Fs, ffi: Ffi) -> Int:
   let info = fs.read("/proc/cpuinfo") else ""
   var n = 0
   for l in info.split("\n"):
     if l.startswith("processor"): n += 1
-  if n < 1: return 1
+  if n < 1: return lcache.ncpu(ffi)
   return n
 
 fn main(fs: Fs, os: Os, ffi: Ffi) throws:
@@ -239,18 +260,24 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     if a == "--fix-suggestions" or a == "--fix-dangerously":
       eprint("vlint: {a} isn't supported (only --fix, oxlint's safe fixes)")
       exit(2)
+    if a.startswith("-") and a != "-":
+      eprint("vlint: unsupported option {a} (vlint runs oxlint's default rules; it takes --fix, --jobs N, --cache, --cache-location PATH and paths)")
+      exit(2)
     paths.push(a + "")
     i += 1
   var files: [Str] = []
+  # no paths: the current folder, as oxlint lints it, without node_modules (which oxlint skips
+  # through .gitignore, where projects list it; vlint doesn't read .gitignore)
+  if paths.len == 0: walk_in(fs, ".", true, &files)
   for p in paths:
     if want(p) and not fs.exists(p + "/"): files.push(p + "")
     else:
       var q = p + ""
       while q.len > 1 and q.endswith("/"): q = q[0..q.len - 1]
       walk(fs, q, &files)
-  if jobs == 0: jobs = cpu_count(fs)
+  if jobs == 0: jobs = cpu_count(fs, ffi)
   if cache and phase != 10:
-    cached_run(fs, ffi, files, jobs, phase, loc)
+    if cached_run(fs, ffi, files, jobs, phase, loc): exit(1)
     return
   if jobs > files.len: jobs = files.len
   if jobs < 1: jobs = 1
@@ -276,5 +303,10 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       var r = rc.recv()?
       total += r.nwarn
       swap(&results[r.idx], &r.lines)
+  var errs = false
   for k in 0..files.len:
-    for l in results[k]: print(l)
+    for l in results[k]:
+      print(l)
+      if not errs: errs = has_error(l)
+  # oxlint's exit code: 1 when there are errors (parse errors: the default rules only warn)
+  if errs: exit(1)
