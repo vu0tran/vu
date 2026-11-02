@@ -1,5 +1,6 @@
 # cases.py SHELLCHECK VSC WORKDIR [NAME...]: command line, .shellcheckrc and source-following cases,
-# each a small directory of files and an argument list; compares stdout, stderr and exit status.
+# each a small directory of files and an argument list (cases_more.py adds read errors, locales,
+# rc files and paths); compares stdout, stderr and exit status, then again with 2>&1.
 import os, shutil, subprocess, sys
 
 sc, vsc, work = sys.argv[1:4]
@@ -90,34 +91,56 @@ cases = [
     ('multiline_fix', {'a.sh': '#!/bin/sh\necho "$(\n  ls\n)" `\nls\n`\n'}, ['-f', 'diff', 'a.sh'], {}),
 ]
 
-def run(cmd, d, env, stdin):
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cases_more
+cases += cases_more.more()
+
+def run(cmd, d, env, stdin, x, merge):
     e = dict(os.environ)
     e.pop('SHELLCHECK_OPTS', None)
     e['HOME'] = os.path.join(d, 'nohome')
+    for k in x.get('unset', []): e.pop(k, None)
     for k, v in env.items():
         if k != 'STDIN': e[k] = v.replace('@', d)
     inp = open(os.path.join(d, stdin), 'rb').read() if stdin else b''
-    p = subprocess.run(cmd, cwd=d, env=e, input=inp, capture_output=True, timeout=60)
+    cmd = [a.replace('@/', d + '/') if isinstance(a, str) else a for a in cmd]
+    if x.get('nocaps'): cmd = ['setpriv', '--bounding-set=-all', '--inh-caps=-all'] + cmd
+    if 'sh' in x:
+        tool = cmd[0] if not x.get('nocaps') else ' '.join(cmd[:4])
+        cmd = ['sh', '-c', x['sh'].replace('TOOL', tool)]
+    try: p = subprocess.run(cmd, cwd=d, env=e, input=inp, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE, timeout=20)
+    except subprocess.TimeoutExpired: return b'', b'TIMEOUT', -1
     return p.stdout, p.stderr, p.returncode
 
-ok = bad = 0
-for name, files, args, env in cases:
-    if only and name not in only: continue
-    d = os.path.join(work, name)
+def setup(d, files, x):
+    if os.path.isdir(d):
+        subprocess.run(['chmod', '-R', 'u+rwx', d])
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d)
     for f, c in files.items():
-        p = os.path.join(d, f)
+        p = os.path.join(os.fsencode(d), f if isinstance(f, bytes) else f.encode())
         os.makedirs(os.path.dirname(p), exist_ok=True)
-        open(p, 'wb').write(c if isinstance(c, bytes) else c.encode())
-    r1 = run([sc] + args, d, env, env.get('STDIN'))
-    r2 = run([vsc] + args, d, env, env.get('STDIN'))
-    if r1 == r2: ok += 1
-    else:
-        bad += 1
-        print(f'--- DIFF {name} (exit {r1[2]} {r2[2]})')
-        for i, what in ((0, 'stdout'), (1, 'stderr')):
-            if r1[i] != r2[i]:
-                print(f'  {what} shellcheck:'); print('    ' + r1[i].decode(errors='replace').replace('\n', '\n    ')[:1500])
-                print(f'  {what} vsc:'); print('    ' + r2[i].decode(errors='replace').replace('\n', '\n    ')[:1500])
-print(f'{ok} same, {bad} differ')
+        open(p, 'wb').write(c if isinstance(c, bytes) else c.replace('@/', d + '/').encode())
+    if 'pre' in x: subprocess.run(['sh', '-c', x['pre']], cwd=d, check=True)
+
+ok = bad = 0
+for case in cases:
+    name, files, args, env = case[:4]
+    x = case[4] if len(case) > 4 else {}
+    if only and name not in only: continue
+    d = os.path.join(work, name)
+    for merge in (False, True):
+        setup(d, files, x)
+        r1 = run([sc] + args, d, env, env.get('STDIN'), x, merge)
+        setup(d, files, x)
+        r2 = run([vsc] + args, d, env, env.get('STDIN'), x, merge)
+        if r1 == r2: ok += 1
+        else:
+            bad += 1
+            print(f'--- DIFF {name}{" (2>&1)" if merge else ""} (exit {r1[2]} {r2[2]})')
+            for i, what in ((0, 'stdout'), (1, 'stderr')):
+                if r1[i] != r2[i]:
+                    print(f'  {what} shellcheck:'); print('    ' + r1[i].decode(errors='backslashreplace').replace('\n', '\n    ')[:1500])
+                    print(f'  {what} vsc:'); print('    ' + r2[i].decode(errors='backslashreplace').replace('\n', '\n    ')[:1500])
+    subprocess.run(['chmod', '-R', 'u+rwx', d])
+print(f'{ok} same, {bad} differ (each case run with separate and merged stdout/stderr)')
