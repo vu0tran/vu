@@ -1,13 +1,18 @@
 #!/bin/bash
 # fullcmp.sh VSC [JOBS]: vsc over each whole corpus in one invocation per format, against
 # ShellCheck's run of the same command (full/run.sh made them): stdout, stderr and exit status.
-# The two files ShellCheck can't finish are left out (bench1.txt is corpus 1 without them).
+# The files ShellCheck can't finish are left out (bench1.txt is corpus 1 without acme.sh and
+# nvm.sh, files3_ok.txt corpus 3 without 7 configure scripts). gcc: corpus 1 and 2 against the
+# per-file reference outputs concatenated, corpus 3 against one run.
 W=${SCW:?set SCW to the work directory}
 V=$1; J=${2:-1}
-for spec in "tty:" "checkstyle:" "diff:" "json:" "json1:-o all"; do
+for spec in "tty:" "checkstyle:" "diff:" "json:" "json1:-o all" "gcc:"; do
   f=${spec%%:*}; extra=${spec#*:}; tag=$f; [ -n "$extra" ] && tag=${f}_all
-  for c in 1 2; do
-    [ $c = 1 ] && { d=corpus; l=bench1.txt; } || { d=corpus2; l=files2.txt; }
+  for c in 1 2 3; do
+    [ $c = 1 ] && { d=corpus; l=bench1.txt; }
+    [ $c = 2 ] && { d=corpus2; l=files2.txt; }
+    [ $c = 3 ] && { d=corpus3; l=files3_ok.txt; }
+    [ $f = gcc ] && [ $c != 3 ] && continue
     o=$W/full/sc_${tag}_$c
     [ -e $o.st ] || { echo "$tag corpus$c: no reference"; continue; }
     cd $W/$d
