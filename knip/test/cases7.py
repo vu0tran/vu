@@ -197,3 +197,23 @@ case("p7_cz_mdlint_convex_cspell_nextmdx", {
     "next.config.mjs": "import createMDX from '@next/mdx';\nconst withMDX = createMDX({ options: { remarkPlugins: ['remark-gfm'] } });\nexport default withMDX({});\n",
     "mdx-components.tsx": "export function useMDXComponents() {}\n", "app/page.tsx": "export default 1;\n",
 })
+
+case("p7_docusaurus", {
+    "package.json": pkg(deps=["@docusaurus/core", "@docusaurus/preset-classic", "docusaurus-plugin-sass", "@docusaurus/plugin-ideal-image", "react", "unused-dep"], dev=["@docusaurus/module-type-aliases"]),
+    **mods("@docusaurus/core", "@docusaurus/preset-classic", "docusaurus-plugin-sass", "@docusaurus/plugin-ideal-image", "react", "unused-dep", "@docusaurus/module-type-aliases"),
+    "docusaurus.config.js": "module.exports = { presets: [['classic', { docs: { sidebarPath: './sidebars.js' } }]], plugins: ['sass', ['ideal-image', {}], './plugins/local', () => ({ name: 'x' })], scripts: ['/js/a.js', 'https://x.com/b.js'] };\n",
+    "sidebars.js": "module.exports = {};\n", "plugins/local.js": "module.exports = () => ({});\n", "static/js/a.js": "",
+    "src/pages/index.tsx": "import Link from '@docusaurus/Link';\nimport Layout from '@theme/Layout';\nimport x from '@site/src/x';\nexport default 1;\n", "src/x.ts": "export default 1;\n", "src/orphan.ts": "export {};\n",
+}, PROD)
+case("p7_forge_jasmine_sls_stencil", {
+    "package.json": pkg(deps=["@stencil/core"], dev=["@electron-forge/cli", "@electron-forge/maker-zip", "@electron-forge/plugin-vite", "jasmine", "serverless", "serverless-offline", "esbuild", "unused-dev"]),
+    **mods("@stencil/core", "@electron-forge/cli", "@electron-forge/maker-zip", "@electron-forge/plugin-vite", "jasmine", "serverless", "serverless-offline", "esbuild", "unused-dev"),
+    "forge.config.js": "module.exports = { makers: [{ name: '@electron-forge/maker-zip' }], plugins: [{ name: '@electron-forge/plugin-vite', config: { build: [{ entry: 'electron/main.ts', config: 'vite.main.config.ts' }] } }] };\n",
+    "electron/main.ts": "export {};\n", "vite.main.config.ts": "export default {};\n",
+    "spec/support/jasmine.json": json.dumps({"spec_dir": "tests", "spec_files": ["**/*.spec.js"], "helpers": ["helpers/**/*.js"]}),
+    "tests/a.spec.js": "", "tests/helpers/h.js": "", "tests/other.js": "",
+    "serverless.yml": "service: s\nplugins:\n  - serverless-offline\nfunctions:\n  - hello:\n      handler: handlers/hello.main\n  - ${file(./fns.yml)}\ncustom:\n  esbuild:\n    bundle: true\n",
+    "fns.yml": "world:\n  handler: handlers/world.ts.run\n", "handlers/hello.ts": "export const main = 1;\n", "handlers/world.ts": "export const run = 1;\n", "handlers/x.ts": "export {};\n",
+    "stencil.config.ts": "export const config = { srcDir: 'comp', globalScript: 'comp/global.ts', outputTargets: [] };\n",
+    "comp/my-el.tsx": "export {};\n", "comp/global.ts": "export {};\n", "comp/util.ts": "export {};\n",
+}, PROD)

@@ -184,6 +184,37 @@ for (const r of reqs) {
       }
       v = all;
     }
+    if (r.mode === 'docusaurus' && v && typeof v === 'object') {
+      const evalItems = async items => {
+        const out = [];
+        for (let item of items ?? []) {
+          if (typeof item === 'function') item = item();
+          if (item && !Array.isArray(item) && typeof item === 'object' && typeof item.configureWebpack === 'function') {
+            const cfg = item.configureWebpack({}, false, { getStyleLoaders: () => [], getJSLoader: () => null });
+            out.push({ __webpack: await webpackPasses(cfg, r.args[0] === true) });
+          } else out.push(item);
+        }
+        return out;
+      };
+      v = { ...v, themes: await evalItems(v.themes), plugins: await evalItems(v.plugins), presets: await evalItems(v.presets) };
+    }
+    if (r.mode === 'electron-forge' && v && typeof v === 'object') {
+      const mark = item => (item && typeof item === 'object' && !Array.isArray(item) ? { ...item, __plain: Object.getPrototypeOf(item) === Object.prototype, __name: item.name } : item);
+      const arr = x => (Array.isArray(x) ? x : x === undefined ? [] : [x]);
+      const forge = { ...v, makers: arr(v.makers).map(mark), publishers: arr(v.publishers).map(mark), plugins: arr(v.plugins).map(mark) };
+      for (const item of forge.plugins) {
+        const c = item && item.config;
+        if (c && typeof c === 'object') {
+          const wp = async x => (x && typeof x === 'object' ? { __webpack: await webpackPasses(x, r.args[0] === true) } : x);
+          c.mainConfig = await wp(c.mainConfig);
+          for (const rd of arr(c.renderer)) if (rd && typeof rd === 'object') {
+            rd.config = await wp(rd.config);
+            for (const ep of arr(rd.entryPoints)) if (ep && ep.preload && typeof ep.preload === 'object') ep.preload.config = await wp(ep.preload.config);
+          }
+        }
+      }
+      v = forge;
+    }
     if (r.mode === 'karma') {
       if (typeof v !== 'function') v = null;
       else { const mem = { config: undefined, set(c) { this.config = c; } }; await v(mem); v = mem.config ?? {}; }
