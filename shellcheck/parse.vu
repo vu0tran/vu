@@ -1,0 +1,5354 @@
+# The shell parser: a port of ShellCheck's Parser.hs (a Parsec parser) that keeps Parsec's
+# behaviour where it shows in the output:
+#
+# - A parser fails "empty" (nothing consumed: the caller may try something else) or "consumed"
+#   (the failure propagates up to the nearest try). Every function returns -1 on failure and leaves
+#   p.i where it started when the failure was empty.
+# - Parsec's error (position and message) is kept in p.epos/p.ene/p.emsg and merged as Parsec merges
+#   it, so a script that doesn't parse gets ShellCheck's SC1072 message at its position.
+# - Notes (parseNote) belong to the parser state and are undone by backtracking; problems
+#   (parseProblem) and the context stack live under Parsec and survive backtracking, as there.
+#
+# Positions are line << 32 | column, with tabs counted to the next multiple of 8 as Parsec does.
+
+import ast
+from ast import T_AND_IF, T_Bang, T_Case, TC_Empty, T_CLOBBER, T_DGREAT, T_DLESS, T_DLESSDASH, T_Do
+from ast import T_DollarSingleQuoted, T_Done, T_DSEMI, T_Elif, T_Else, T_EOF, T_Esac, T_Fi, T_For, T_Glob
+from ast import T_GREATAND, T_Greater, T_If, T_In, T_Lbrace, T_Less, T_LESSAND, T_LESSGREAT, T_Literal
+from ast import T_Lparen, T_OR_IF, T_ParamSubSpecialChar, T_Pipe, T_Rbrace, T_Rparen, T_Select, T_Semi
+from ast import T_SingleQuoted, T_Then, T_UnparsedIndex, T_Until, T_While, TA_Assignment, TA_Binary
+from ast import TA_Expansion, T_AndIf, T_Annotation, T_Arithmetic, T_Array, TA_Sequence, TA_Parenthesis
+from ast import T_Assignment, TA_Trinary, TA_Unary, TA_Variable, T_Backgrounded, T_Backticked, T_Banged
+from ast import T_BatsTest, T_BraceExpansion, T_BraceGroup, TC_And, T_CaseExpression, TC_Binary, TC_Group
+from ast import TC_Nullary, T_Condition, T_CoProcBody, T_CoProc, TC_Or, TC_Unary, T_DollarArithmetic
+from ast import T_DollarBraceCommandExpansion, T_DollarBraced, T_DollarBracket, T_DollarDoubleQuoted
+from ast import T_DollarExpansion, T_DoubleQuoted, T_Extglob, T_FdRedirect, T_ForArithmetic, T_ForIn
+from ast import T_Function, T_HereDoc, T_HereString, T_IfExpression, T_IndexedElement, T_IoDuplicate
+from ast import T_IoFile, T_NormalWord, T_OrIf, T_Pipeline, T_ProcSub, T_Redirecting, T_Script, T_SelectIn
+from ast import T_SimpleCommand, T_Subshell, T_UntilExpression, T_WhileExpression, SINGLE, DOUBLE
+import astlib
+import ucd
+from astlib import dec, put, cstr, only_literal, get_literal
+from ast import Ann, ANN_DISABLE, ANN_ENABLE, ANN_SOURCE, ANN_SHELL, ANN_SOURCEPATH, ANN_EXTERNAL, ANN_EXTENDED
+
+const ERR = 0
+const WARN = 1
+const INFO = 2
+const STYLE = 3
+
+type Note:
+  sp: Int
+  ep: Int
+  sev: Int
+  code: Int
+  msg: Str
+  fix: [ast.Rep]
+
+const CX_NAME = 1
+const CX_ANN = 2
+const CX_SOURCE = 3
+
+type Ctx:
+  kind: Int
+  pos: Int
+  s: Str
+  ann: Int        # CX_ANN: index into t.anns
+
+type Mark:
+  i: Int
+  pos: Int
+  nn: Int
+  plen: Int
+  plo: Int
+
+type Err:
+  pos: Int
+  ne: Bool
+  msg: Str
+
+type Pend:
+  node: Int
+  dashed: Bool
+  quoted: Bool
+  tok: Str
+  ctx: [Ctx]
+
+type P:
+  src: Str
+  i: Int
+  pos: Int
+  epos: Int
+  ene: Bool
+  emsg: Str
+  notes: [Note]
+  probs: [Note]
+  ctx: [Ctx]
+  pend: [Int]
+  plo: Int
+  pends: [Pend]
+  sv: Str           # a string result of the last string parser
+  t: ast.Ast
+  assoc: [Str]      # associative arrays, for reparsing indices
+  cs: Bool          # --check-sourced: keep notes from sourced files
+  files: [Str]      # file names by position file index (0: the script)
+  texts: [Str]      # their contents
+  rd: fn(Int, [Str], Str) -> ast.SrcRes   # resolve and read a sourced file (external, paths, name)
+  rc: [Ann]         # the .shellcheckrc annotations
+  rc_err: Str       # SC1134 for an rc file that didn't parse
+  shell_flag: Bool  # --shell given: the shebang is not checked
+
+fn ctype(single: Bool) -> Int:
+  if single: return SINGLE
+  return DOUBLE
+
+fn bint(b: Bool) -> Int:
+  if b: return 1
+  return 0
+
+fn pk(line: Int, col: Int) -> Int:
+  return (line << 32) | col
+
+fn pline(pos: Int) -> Int:
+  return (pos >> 32) & 0xFFFFF
+
+# the file a position is in: 0 the checked script, k > 0 the k-th sourced file (Spec.files)
+fn pfile(pos: Int) -> Int:
+  return pos >> 52
+
+fn pcol(pos: Int) -> Int:
+  return pos & 0xffffffff
+
+# ---------------------------------------------------------------- characters
+
+fn peek(p: P) -> Int:
+  if p.i >= p.src.len: return -1
+  let b = int(p.src[p.i])
+  if b < 0x80: return b
+  return dec(p.src, p.i) & 0xFFFFFF
+
+fn peek_at(p: P, k: Int) -> Int:
+  # the code point k characters ahead (k >= 0)
+  var j = p.i
+  var n = 0
+  while n < k:
+    let d = dec(p.src, j)
+    if d < 0: return -1
+    j += d >> 24
+    n += 1
+  let d = dec(p.src, j)
+  if d < 0: return -1
+  return d & 0xFFFFFF
+
+# Consumes one character.
+fn adv(var p: P) -> Int:
+  let d = dec(p.src, p.i)
+  let c = d & 0xFFFFFF
+  p.i += d >> 24
+  if c == 10: p.pos = (((p.pos >> 32) + 1) << 32) | 1
+  elif c == 9:
+    let col = pcol(p.pos)
+    p.pos = p.pos - col + col + 8 - ((col - 1) % 8)
+  else: p.pos += 1
+  p.epos = p.pos
+  p.ene = false
+  p.emsg = ""
+  return c
+
+# Consumes one character and returns the source bytes of it.
+fn adv_s(var p: P) -> Str:
+  let st = p.i
+  adv(&p)
+  return p.src[st..p.i]
+
+# ---------------------------------------------------------------- errors and state
+
+fn merr(var p: P, pos: Int, ne: Bool, msg: Str):
+  if not ne and p.ene: return
+  if ne and not p.ene:
+    p.epos = pos
+    p.ene = true
+    p.emsg = msg
+    return
+  if p.epos == pos:
+    p.ene = p.ene or ne
+    if msg.len > 0: p.emsg = msg
+    return
+  if p.epos > pos: return
+  p.epos = pos
+  p.ene = ne
+  p.emsg = msg
+
+# A failed character test here.
+# Parsec's many drops the error of an iteration that consumed input: the error becomes that of
+# the next (failing) attempt alone.
+fn eclr(var p: P):
+  p.epos = p.pos
+  p.ene = false
+  p.emsg = ""
+
+fn nomatch(var p: P) -> Int:
+  merr(&p, p.pos, true, "")
+  return -1
+
+fn pfail(var p: P, msg: Str) -> Int:
+  merr(&p, p.pos, true, msg)
+  return -1
+
+fn mzero(var p: P) -> Int:
+  merr(&p, p.pos, false, "")
+  return -1
+
+fn esave(p: P) -> Err:
+  return Err(p.epos, p.ene, p.emsg + "")
+
+fn erestore_merge(var p: P, e: Err):
+  # the error becomes merge(e, current)
+  let cp = p.epos
+  let cn = p.ene
+  let cm = p.emsg + ""
+  p.epos = e.pos
+  p.ene = e.ne
+  p.emsg = e.msg + ""
+  merr(&p, cp, cn, cm)
+
+fn mark(p: P) -> Mark:
+  return Mark(p.i, p.pos, p.notes.len, p.pend.len, p.plo)
+
+fn reset(var p: P, m: Mark):
+  p.i = m.i
+  p.pos = m.pos
+  p.notes.truncate(m.nn)
+  p.pend.truncate(m.plen)
+  p.plo = m.plo
+
+# After a failure under `try`: back to m, and the error merged as Parsec's try leaves it.
+fn try_fail(var p: P, m: Mark, e: Err) -> Int:
+  if p.i != m.i: erestore_merge(&p, e)
+  reset(&p, m)
+  return -1
+
+# After a lookAhead that succeeded: back to m (state included), error as before plus nothing.
+fn look_ok(var p: P, m: Mark, e: Err):
+  p.epos = e.pos
+  p.ene = e.ne
+  p.emsg = e.msg + ""
+  merr(&p, m.pos, false, "")
+  reset(&p, m)
+
+fn ignored(p: P, code: Int) -> Bool:
+  for c in p.ctx:
+    if c.kind == CX_ANN:
+      for a in p.t.anns[c.ann]:
+        if a.kind == ANN_DISABLE and code >= a.lo and code < a.hi: return true
+    elif c.kind == CX_SOURCE and not p.cs: return true
+  return false
+
+fn problem_at(var p: P, sp: Int, ep: Int, sev: Int, code: Int, msg: Str):
+  if ignored(p, code): return
+  p.probs.push(Note(sp, ep, sev, code, msg, []))
+
+fn problem(var p: P, sev: Int, code: Int, msg: Str):
+  problem_at(&p, p.pos, p.pos, sev, code, msg)
+
+fn problem_id(var p: P, id: Int, sev: Int, code: Int, msg: Str):
+  problem_at(&p, p.t.sp[id], p.t.ep[id], sev, code, msg)
+
+fn note_at(var p: P, sp: Int, ep: Int, sev: Int, code: Int, msg: Str):
+  if ignored(p, code): return
+  p.notes.push(Note(sp, ep, sev, code, msg, []))
+
+fn note(var p: P, sev: Int, code: Int, msg: Str):
+  note_at(&p, p.pos, p.pos, sev, code, msg)
+
+fn note_id(var p: P, id: Int, sev: Int, code: Int, msg: Str):
+  note_at(&p, p.t.sp[id], p.t.ep[id], sev, code, msg)
+
+fn push_name(var p: P, name: Str):
+  p.ctx.push(Ctx(CX_NAME, p.pos, name, -1))
+
+fn pop_ctx(var p: P):
+  if p.ctx.len > 0: p.ctx.pop()
+
+# The end of `called`/`withContext`: pops on success or on an empty failure (then fails with "").
+fn cend(var p: P, st: Int, r: Int) -> Int:
+  if r >= 0:
+    pop_ctx(&p)
+    return r
+  if p.i == st:
+    pop_ctx(&p)
+    pfail(&p, "")
+  return -1
+
+fn node(var p: P, kind: Int, sp: Int) -> Int:
+  return ast.add(&p.t, kind, sp, p.pos)
+
+fn lit(var p: P, sp: Int, s: Str) -> Int:
+  let n = ast.add(&p.t, T_Literal, sp, p.pos)
+  p.t.s[n] = s
+  return n
+
+fn nodes1(var p: P, kind: Int, sp: Int, items: [Int]) -> Int:
+  let n = ast.add(&p.t, kind, sp, p.pos)
+  ast.set1(&p.t, n, items)
+  return n
+
+# getNextIdSpanningTokenList
+fn span_list(var p: P, kind: Int, items: [Int]) -> Int:
+  if items.len == 0: return ast.add(&p.t, kind, p.pos, p.pos)
+  return ast.add(&p.t, kind, p.t.sp[items[0]], p.t.ep[items[items.len - 1]])
+
+# ---------------------------------------------------------------- character classes
+
+# Parsec's upper <|> lower (isUpper, isLower)
+fn is_upper_lower(c: Int) -> Bool:
+  if c < 128: return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+  return ucd.is_upper(c) or ucd.is_lower(c)
+
+# Parsec's letter (isAlpha)
+fn is_letter(c: Int) -> Bool:
+  if c < 128: return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+  return ucd.is_alpha(c)
+
+fn is_digit(c: Int) -> Bool:
+  return c >= 48 and c <= 57
+
+fn is_var_start(c: Int) -> Bool:
+  return c == 95 or is_upper_lower(c)
+
+fn is_var_char(c: Int) -> Bool:
+  return c == 95 or is_digit(c) or is_upper_lower(c)
+
+fn is_uspace(c: Int) -> Bool:
+  return c == 0xA0 or (c >= 0x2002 and c <= 0x2009) or c == 0x200B or c == 0x202F
+
+fn is_udq(c: Int) -> Bool:
+  return c == 0x201C or c == 0x201D or c == 0x2033 or c == 0x2036
+
+fn is_usq(c: Int) -> Bool:
+  return c == 0x2018 or c == 0x2019
+
+# quotableChars: |&;<>()\ '\t\n\r\xA0 and \"$`
+fn is_quotable_char(c: Int) -> Bool:
+  if c == 0xA0: return true
+  if c > 127 or c < 0: return false
+  return c == 124 or c == 38 or c == 59 or c == 60 or c == 62 or c == 40 or c == 41 or c == 92 or c == 32 or c == 39 or c == 9 or c == 10 or c == 13 or c == 34 or c == 36 or c == 96
+
+fn is_extglob_start(c: Int) -> Bool:
+  return c == 63 or c == 42 or c == 64 or c == 33 or c == 43
+
+fn in_str(c: Int, s: Str) -> Bool:
+  if c < 0: return false
+  if c < 128:
+    for k in 0..s.len:
+      if int(s[k]) == c: return true
+    return false
+  return s.find(cstr(c)) >= 0
+
+fn is_special_var(c: Int) -> Bool:
+  # specialVariables: - $ ? ! # @ *
+  return c == 45 or c == 36 or c == 63 or c == 33 or c == 35 or c == 64 or c == 42
+
+fn is_linews(c: Int) -> Bool:
+  return c == 32 or c == 9 or is_uspace(c)
+
+fn is_unicode_dash(c: Int) -> Bool:
+  return c == 0x058A or c == 0x05BE or (c >= 0x2010 and c <= 0x2015) or c == 0xFE63 or c == 0xFF0D
+
+# ---------------------------------------------------------------- primitives
+
+fn char_(var p: P, c: Int) -> Int:
+  if peek(p) == c:
+    adv(&p)
+    return 0
+  return nomatch(&p)
+
+fn eof(var p: P) -> Int:
+  if p.i >= p.src.len:
+    merr(&p, p.pos, false, "")
+    return 0
+  return nomatch(&p)
+
+fn at_eof(p: P) -> Bool:
+  return p.i >= p.src.len
+
+fn starts(p: P, s: Str) -> Bool:
+  if p.i + s.len > p.src.len: return false
+  for k in 0..s.len:
+    if p.src[p.i + k] != s[k]: return false
+  return true
+
+# Parsec's `string`: a mismatch after the first character is a consumed failure.
+fn string_(var p: P, s: Str) -> Int:
+  if starts(p, s):
+    let e = p.i + s.len
+    while p.i < e: adv(&p)
+    return 0
+  if p.i < p.src.len and p.src[p.i] == s[0]:
+    merr(&p, p.pos, true, "")
+    p.i += 1
+    return -1
+  return nomatch(&p)
+
+fn try_string(var p: P, s: Str) -> Int:
+  if starts(p, s):
+    let e = p.i + s.len
+    while p.i < e: adv(&p)
+    return 0
+  return nomatch(&p)
+
+# A ParseNote from the bit of state that a whitespace character may add.
+fn almost_space(var p: P) -> Bool:
+  let c = peek(p)
+  if not is_uspace(c): return false
+  note(&p, ERR, 1018, "This is a unicode space. Delete and retype it.")
+  adv(&p)
+  return true
+
+fn carriage_return(var p: P) -> Int:
+  if peek(p) != 13: return nomatch(&p)
+  let pos = p.pos
+  adv(&p)
+  problem_at(&p, pos, pos, ERR, 1017, "Literal carriage return. Run script through tr -d '\\r' .")
+  return 0
+
+# linefeed: an optional \r, a \n, then any pending here documents.
+fn linefeed(var p: P) -> Int:
+  let st = p.i
+  if peek(p) == 13:
+    carriage_return(&p)
+    if peek(p) != 10: return nomatch(&p)
+  elif peek(p) != 10: return nomatch(&p)
+  adv(&p)
+  if read_pending_heredocs(&p) < 0: return -1
+  return 0
+
+# whitespace = oneOf " \t" <|> carriageReturn <|> almostSpace <|> linefeed; sets p.sv to what it read
+fn whitespace(var p: P) -> Int:
+  let c = peek(p)
+  if c == 32 or c == 9:
+    adv(&p)
+    p.sv = cstr(c)
+    return 0
+  if c == 13:
+    carriage_return(&p)
+    p.sv = "\r"
+    return 0
+  if almost_space(&p):
+    p.sv = " "
+    return 0
+  if c == 10:
+    if linefeed(&p) < 0: return -1
+    p.sv = "\n"
+    return 0
+  return nomatch(&p)
+
+fn read_any_comment(var p: P) -> Int:
+  if peek(p) != 35: return nomatch(&p)
+  let st = p.i
+  adv(&p)
+  while true:
+    let c = peek(p)
+    if c < 0 or c == 13 or c == 10: break
+    adv(&p)
+  nomatch(&p)
+  p.sv = p.src[st + 1..p.i]
+  return 0
+
+# readAnnotationPrefix = char '#' >> many linewhitespace >> string "shellcheck"
+fn read_annotation_prefix(var p: P) -> Int:
+  if peek(p) != 35: return nomatch(&p)
+  adv(&p)
+  while true:
+    if not is_linews(peek(p)): break
+    if not almost_space(&p): adv(&p)
+  nomatch(&p)
+  return string_(&p, "shellcheck")
+
+# unexpecting s p = try ((try p >> fail ("Unexpected " ++ s)) <|> return ())
+fn unexpecting(var p: P, s: Str, f: fn(var P) -> Int) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  let r = f(&p)
+  if r < 0:
+    try_fail(&p, m, e)
+    return 0
+  let consumed = p.i != m.i
+  pfail(&p, "Unexpected " + s)
+  if consumed:
+    try_fail(&p, m, e)
+    return -1
+  reset(&p, m)
+  return 0
+
+fn read_comment(var p: P) -> Int:
+  if unexpecting(&p, "shellcheck annotation", read_annotation_prefix) < 0: return -1
+  return read_any_comment(&p)
+
+fn spacing(var p: P) -> Int:
+  var out = ""
+  while true:
+    let c = peek(p)
+    if c == 32 or c == 9:
+      put(&out, c)
+      adv(&p)
+    elif is_uspace(c):
+      almost_space(&p)
+      out += " "
+    elif c == 92 and peek_at(p, 1) == 10:
+      adv(&p)
+      adv(&p)
+      while true:
+        let d = peek(p)
+        if d == 32 or d == 9:
+          put(&out, d)
+          adv(&p)
+        elif is_uspace(d):
+          almost_space(&p)
+          out += " "
+        else: break
+      nomatch(&p)
+      let m = mark(p)
+      if read_comment(&p) >= 0:
+        if p.sv.endswith("\\"):
+          problem(&p, ERR, 1143, "This backslash is part of a comment and does not continue the line.")
+      else: reset(&p, m)
+    else: break
+  nomatch(&p)
+  let m = mark(p)
+  if read_comment(&p) < 0: reset(&p, m)
+  p.sv = out
+  return 0
+
+fn spacing1(var p: P) -> Int:
+  spacing(&p)
+  if p.sv.len == 0: return pfail(&p, "Expected whitespace")
+  return 0
+
+fn allspacing(var p: P) -> Int:
+  var out = ""
+  while true:
+    spacing(&p)
+    out += p.sv
+    let st = p.i
+    let m = mark(p)
+    if linefeed(&p) < 0:
+      if p.i != st: return -1
+      reset(&p, m)
+      break
+    out += "\n"
+  p.sv = out
+  return 0
+
+fn allspacing_or_fail(var p: P) -> Int:
+  if allspacing(&p) < 0: return -1
+  if p.sv.len == 0: return pfail(&p, "Expected whitespace")
+  return 0
+
+# ---------------------------------------------------------------- generic combinators
+
+# try . lookAhead p (and lookAhead . try p): did p match here? Nothing is consumed either way.
+fn look(var p: P, f: fn(var P) -> Int) -> Bool:
+  let m = mark(p)
+  let e = esave(p)
+  if f(&p) < 0:
+    try_fail(&p, m, e)
+    return false
+  look_ok(&p, m, e)
+  return true
+
+# try p
+fn try_(var p: P, f: fn(var P) -> Int) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  let r = f(&p)
+  if r < 0: return try_fail(&p, m, e)
+  return r
+
+# optional p: false only when p failed after consuming input
+fn optional_(var p: P, f: fn(var P) -> Int) -> Bool:
+  let m = mark(p)
+  if f(&p) < 0:
+    if p.i != m.i: return false
+    reset(&p, m)
+  return true
+
+# many p, collecting node results; false when an item failed after consuming input
+fn many_(var p: P, f: fn(var P) -> Int, var out: [Int]) -> Bool:
+  while true:
+    let m = mark(p)
+    let r = f(&p)
+    if r < 0:
+      if p.i != m.i: return false
+      reset(&p, m)
+      return true
+    out.push(r)
+    eclr(&p)
+
+fn copy_ctx(c: [Ctx]) -> [Ctx]:
+  var r: [Ctx] = []
+  for x in c: r.push(Ctx(x.kind, x.pos, x.s + "", x.ann))
+  return r
+
+# readStringForParser: the source text the parser would read here (its problems are forgotten).
+fn read_string_for(var p: P, f: fn(var P) -> Int) -> Int:
+  var saved = copy_ctx(p.ctx)
+  let np = p.probs.len
+  let m = mark(p)
+  let e = esave(p)
+  if f(&p) < 0:
+    try_fail(&p, m, e)
+    swap(&p.ctx, &saved)
+    p.probs.truncate(np)
+    return pfail(&p, "")
+  let end_i = p.i
+  look_ok(&p, m, e)
+  swap(&p.ctx, &saved)
+  p.probs.truncate(np)
+  let st = p.i
+  while p.i < end_i: adv(&p)
+  p.sv = p.src[st..p.i]
+  return 0
+
+# readLiteralForParser
+fn read_literal_for(var p: P, f: fn(var P) -> Int) -> Int:
+  let sp = p.pos
+  if read_string_for(&p, f) < 0: return -1
+  return lit(&p, sp, p.sv + "")
+
+type Sub:
+  src: Str
+  i: Int
+  pos: Int
+
+fn sub_begin(var p: P, pos: Int, own input: Str) -> Sub:
+  var s = Sub(input, p.i, p.pos)
+  swap(&p.src, &s.src)
+  p.i = 0
+  p.pos = pos
+  return s
+
+fn sub_end(var p: P, var s: Sub):
+  swap(&p.src, &s.src)
+  p.i = s.i
+  p.pos = s.pos
+
+fn ncopy(n: Note) -> Note:
+  return Note(n.sp, n.ep, n.sev, n.code, n.msg + "", ast.reps_copy(n.fix))
+
+fn err_note(e: Err) -> Note:
+  var m = ""
+  if e.msg.len > 0: m = e.msg + "."
+  return Note(e.pos, e.pos, ERR, 1072, m + " Fix any mentioned problems and try again.", [])
+
+fn context_notes(ctx: [Ctx]) -> [Note]:
+  var r: [Note] = []
+  var k = ctx.len - 1
+  while k >= 0 and r.len < 2:
+    let c = ctx[k]
+    if c.kind == CX_NAME:
+      if r.len == 0: r.push(Note(c.pos, c.pos, ERR, 1073, "Couldn't parse this " + c.s + ". Fix to allow more checks.", []))
+      else: r.push(Note(c.pos, c.pos, INFO, 1009, "The mentioned syntax error was in this " + c.s + ".", []))
+    k -= 1
+  return r
+
+# tryWithErrors: run f as a separate parse; on failure record its syntax error and fail (empty).
+fn try_with_errors(var p: P, f: fn(var P) -> Int) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  var oldctx = copy_ctx(p.ctx)
+  p.epos = p.pos
+  p.ene = false
+  p.emsg = ""
+  let r = f(&p)
+  if r >= 0:
+    p.epos = p.pos
+    p.ene = false
+    p.emsg = ""
+    return r
+  let ie = Err(p.epos, p.ene, p.emsg + "")
+  p.probs.push(err_note(ie))
+  for n in context_notes(p.ctx): p.probs.push(ncopy(n))
+  swap(&p.ctx, &oldctx)
+  reset(&p, m)
+  p.epos = e.pos
+  p.ene = e.ne
+  p.emsg = e.msg + ""
+  return pfail(&p, "")
+
+# ---------------------------------------------------------------- small readers
+
+fn read_variable_name(var p: P) -> Int:
+  if not is_var_start(peek(p)): return nomatch(&p)
+  let st = p.i
+  adv(&p)
+  while is_var_char(peek(p)): adv(&p)
+  nomatch(&p)
+  p.sv = p.src[st..p.i]
+  return 0
+
+fn read_unicode_quote(var p: P) -> Int:
+  let c = peek(p)
+  if not (is_usq(c) or is_udq(c)): return nomatch(&p)
+  let sp = p.pos
+  let s = adv_s(&p)
+  let id = lit(&p, sp, s)
+  problem_id(&p, id, WARN, 1110, "This is a unicode quote. Delete and retype it (or quote to make literal).")
+  return id
+
+fn is_common_command(s: Str) -> Bool:
+  return s in ["admin", "alias", "ar", "asa", "at", "awk", "basename", "batch", "bc", "bg", "break", "c99", "cal", "cat", "cd", "cflow", "chgrp", "chmod", "chown", "cksum", "cmp", "colon", "comm", "command", "compress", "continue", "cp", "crontab", "csplit", "ctags", "cut", "cxref", "date", "dd", "delta", "df", "diff", "dirname", "dot", "du", "echo", "ed", "env", "eval", "ex", "exec", "exit", "expand", "export", "expr", "fc", "fg", "file", "find", "fold", "fort77", "fuser", "gencat", "get", "getconf", "getopts", "grep", "hash", "head", "iconv", "ipcrm", "ipcs", "jobs", "join", "kill", "lex", "link", "ln", "locale", "localedef", "logger", "logname", "lp", "ls", "m4", "mailx", "make", "man", "mesg", "mkdir", "mkfifo", "more", "mv", "newgrp", "nice", "nl", "nm", "nohup", "od", "paste", "patch", "pathchk", "pax", "pr", "printf", "prs", "ps", "pwd", "qalter", "qdel", "qhold", "qmove", "qmsg", "qrerun", "qrls", "qselect", "qsig", "qstat", "qsub", "read", "readonly", "renice", "return", "rm", "rmdel", "rmdir", "sact", "sccs", "sed", "set", "sh", "shift", "sleep", "sort", "split", "strings", "strip", "stty", "tabs", "tail", "talk", "tee", "test", "time", "times", "touch", "tput", "tr", "trap", "tsort", "tty", "type", "ulimit", "umask", "unalias", "uname", "uncompress", "unexpand", "unget", "uniq", "unlink", "unset", "uucp", "uudecode", "uuencode", "uustat", "uux", "val", "vi", "wait", "wc", "what", "who", "write", "xargs", "yacc", "zcat"]
+
+# ---------------------------------------------------------------- [ ] and [[ ]]
+
+fn cond_spacing(var p: P, single: Bool, required: Bool) -> Int:
+  let pos = p.pos
+  if allspacing(&p) < 0: return -1
+  if required and p.sv.len == 0:
+    problem_at(&p, pos, pos, ERR, 1035, "You are missing a required space here.")
+  if single and p.sv.find("\n") >= 0:
+    problem_at(&p, pos, pos, ERR, 1080, "When breaking lines in [ ], you need \\ before the linefeed.")
+  return 0
+
+fn weird_dash(var p: P) -> Bool:
+  if not is_unicode_dash(peek(p)): return false
+  let pos = p.pos
+  adv(&p)
+  problem_at(&p, pos, pos, ERR, 1100, "This is a unicode dash. Delete and retype as ASCII minus.")
+  return true
+
+# readOp = try (char '-' <|> weirdDash; many1 letter <|> fail ...)
+fn read_test_op(var p: P) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  if peek(p) == 45: adv(&p)
+  elif not weird_dash(&p): return nomatch(&p)
+  let st = p.i
+  if not is_letter(peek(p)):
+    nomatch(&p)
+    pfail(&p, "Expected a test operator")
+    return try_fail(&p, m, e)
+  while is_letter(peek(p)): adv(&p)
+  nomatch(&p)
+  p.sv = "-" + p.src[st..p.i]
+  return 0
+
+fn guard_arithmetic(var p: P, single: Bool):
+  let c = peek(p)
+  if c == 43 or c == 42 or c == 47 or c == 37 or (c == 45 and peek_at(p, 1) == 32):
+    if single: problem(&p, ERR, 1076, "Trying to do math? Use e.g. [ $((i/2+7)) -ge 18 ].")
+    else: problem(&p, ERR, 1076, "Trying to do math? Use e.g. [[ $((i/2+7)) -ge 18 ]].")
+  else: nomatch(&p)
+
+fn escaped_op(s: Str) -> Str:
+  for k in 0..s.len:
+    let b = s[k]
+    if b == '<' or b == '>' or b == '(' or b == ')': return "\\" + s
+  return s
+
+# The operator of a binary test: flagOp <|> flaglessOp <|> fail
+fn any_op(var p: P) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  if read_test_op(&p) >= 0:
+    if p.sv == "-a" or p.sv == "-o":
+      pfail(&p, "Unexpected operator")
+      try_fail(&p, m, e)
+    else: return 0
+  for o in ["==", "!=", "<=", ">=", "=~", ">", "<", "="]:
+    if try_string(&p, o) >= 0:
+      p.sv = o
+      return 0
+  return pfail(&p, "Expected comparison operator (don't wrap commands in []/[[]])")
+
+fn paren_open(var p: P) -> Int:
+  if peek(p) == 40:
+    adv(&p)
+    p.sv = "("
+    return 0
+  return nomatch(&p)
+
+fn paren_close(var p: P) -> Int:
+  if peek(p) == 41:
+    adv(&p)
+    p.sv = ")"
+    return 0
+  return nomatch(&p)
+
+# readRegularOrEscaped p = readEscaped p <|> p
+fn regular_or_escaped(var p: P, f: fn(var P) -> Int) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  let c = peek(p)
+  if c == 92:
+    adv(&p)
+    if f(&p) >= 0:
+      p.sv = escaped_op(p.sv)
+      return 0
+    try_fail(&p, m, e)
+  elif c == 39 or c == 34:
+    adv(&p)
+    if f(&p) >= 0:
+      let s = escaped_op(p.sv)
+      if peek(p) == c:
+        adv(&p)
+        p.sv = s
+        return 0
+      nomatch(&p)
+    try_fail(&p, m, e)
+  else: nomatch(&p)
+  return f(&p)
+
+fn ended_with(p: P, x: Int, s: Str) -> Bool:
+  if p.t.k[x] != T_NormalWord or p.t.n1[x] == 0: return false
+  let l = ast.last1(p.t, x)
+  if p.t.k[l] != T_Literal: return false
+  return p.t.s[l].endswith(s)
+
+fn read_cond_word(var p: P, single: Bool) -> Int:
+  # notFollowedBy2 (try (spacing >> string "]"))
+  let m = mark(p)
+  let e = esave(p)
+  spacing(&p)
+  if peek(p) == 93:
+    adv(&p)
+    pfail(&p, "Unexpected ")
+    try_fail(&p, m, e)
+    return -1
+  nomatch(&p)
+  try_fail(&p, m, e)
+  let x = read_normal_word(&p)
+  if x < 0: return -1
+  let pos = p.pos
+  var not_array_index = true
+  if p.t.n1[x] >= 2:
+    let s1 = ast.at1(p.t, x, 1)
+    if p.t.k[s1] == T_Literal and p.t.s[s1] == "[": not_array_index = false
+  if not_array_index and ended_with(p, x, "]") and only_literal(p.t, x).find("[") < 0:
+    if single: problem_at(&p, pos, pos, ERR, 1020, "You need a space before the ].")
+    else: problem_at(&p, pos, pos, ERR, 1020, "You need a space before the ]].")
+    return pfail(&p, "Missing space before ]")
+  if single and ended_with(p, x, ")"):
+    problem_at(&p, pos, pos, ERR, 1021, "You need a space before the \\)")
+    return pfail(&p, "Missing space before )")
+  spacing(&p)
+  return x
+
+# readAndOrOp: an op node (TC_And or TC_Or) without operands, or -1
+fn read_and_or_op(var p: P, single: Bool, kind: Int, op: Str, req: Bool) -> Int:
+  let m0 = mark(p)
+  if weird_dash(&p): reset(&p, m0)
+  let sp = p.pos
+  if try_string(&p, op) < 0: return -1
+  let id = node(&p, kind, sp)
+  p.t.s[id] = op
+  p.t.f[id] = ctype(single)
+  if cond_spacing(&p, single, req) < 0: return -1
+  return id
+
+fn read_cond_and_op(var p: P, single: Bool) -> Int:
+  let st = p.i
+  let r = read_and_or_op(&p, single, TC_And, "&&", false)
+  if r >= 0 or p.i != st: return r
+  return read_and_or_op(&p, single, TC_And, "-a", true)
+
+fn read_cond_or_op(var p: P, single: Bool) -> Int:
+  guard_arithmetic(&p, single)
+  let st = p.i
+  let r = read_and_or_op(&p, single, TC_Or, "||", false)
+  if r >= 0 or p.i != st: return r
+  return read_and_or_op(&p, single, TC_Or, "-o", true)
+
+fn read_cond_or(var p: P, single: Bool) -> Int:
+  var x = read_cond_and(&p, single)
+  if x < 0: return -1
+  while true:
+    let m = mark(p)
+    let op = read_cond_and_op(&p, single)
+    if op < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      return x
+    let y = read_cond_and(&p, single)
+    if y < 0: return -1
+    p.t.a[op] = x
+    p.t.b[op] = y
+    x = op
+  return x
+
+fn read_cond_and(var p: P, single: Bool) -> Int:
+  var x = read_cond_term(&p, single)
+  if x < 0: return -1
+  while true:
+    let m = mark(p)
+    let op = read_cond_or_op(&p, single)
+    if op < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      return x
+    let y = read_cond_term(&p, single)
+    if y < 0: return -1
+    p.t.a[op] = x
+    p.t.b[op] = y
+    x = op
+  return x
+
+fn read_cond_term(var p: P, single: Bool) -> Int:
+  var term = -1
+  if peek(p) == 33:
+    let sp = p.pos
+    adv(&p)
+    let id = node(&p, TC_Unary, sp)
+    p.t.s[id] = "!"
+    p.t.f[id] = ctype(single)
+    if cond_spacing(&p, single, true) < 0: return -1
+    let ex = read_cond_expr(&p, single)
+    if ex < 0: return -1
+    p.t.a[id] = ex
+    term = id
+  else:
+    nomatch(&p)
+    term = read_cond_expr(&p, single)
+    if term < 0: return -1
+  if cond_spacing(&p, single, false) < 0: return -1
+  return term
+
+fn read_cond_expr(var p: P, single: Bool) -> Int:
+  let st = p.i
+  let m = mark(p)
+  var r = read_cond_group(&p, single)
+  if r >= 0 or p.i != st: return r
+  reset(&p, m)
+  r = read_cond_unary_exp(&p, single)
+  if r >= 0 or p.i != st: return r
+  reset(&p, m)
+  return read_cond_nullary_or_binary(&p, single)
+
+fn roe_paren_open(var p: P) -> Int:
+  return regular_or_escaped(&p, paren_open)
+
+fn read_cond_group(var p: P, single: Bool) -> Int:
+  let sp = p.pos
+  let pos = p.pos
+  if try_(&p, roe_paren_open) < 0: return -1
+  let lparen = p.sv + ""
+  if single and lparen == "(":
+    problem_at(&p, pos, pos, ERR, 1028, "In [..] you have to escape \\( \\) or preferably combine [..] expressions.")
+  if not single and lparen == "\\(":
+    problem_at(&p, pos, pos, ERR, 1029, "In [[..]] you shouldn't escape ( or ).")
+  if cond_spacing(&p, single, single) < 0: return -1
+  let x = read_cond_or(&p, single)
+  if x < 0: return -1
+  let cpos = p.pos
+  if regular_or_escaped(&p, paren_close) < 0: return -1
+  let rparen = p.sv + ""
+  let id = node(&p, TC_Group, sp)
+  p.t.f[id] = ctype(single)
+  p.t.a[id] = x
+  if cond_spacing(&p, single, single) < 0: return -1
+  if single and rparen == ")":
+    problem_at(&p, cpos, cpos, ERR, 1028, "In [..] you have to escape \\( \\) or preferably combine [..] expressions.")
+  if not single and rparen == "\\)":
+    problem_at(&p, cpos, cpos, ERR, 1029, "In [[..]] you shouldn't escape ( or ).")
+  return id
+
+fn read_cond_unary_exp(var p: P, single: Bool) -> Int:
+  # readCondUnaryOp = try (readOp; spacingOrLf)
+  let m = mark(p)
+  let e = esave(p)
+  let sp = p.pos
+  if read_test_op(&p) < 0: return -1
+  let id = node(&p, TC_Unary, sp)
+  p.t.s[id] = p.sv + ""
+  p.t.f[id] = ctype(single)
+  if cond_spacing(&p, single, true) < 0: return try_fail(&p, m, e)
+  let pos = p.pos
+  # liftM op readCondWord `orFail` ...
+  let m2 = mark(p)
+  let e2 = esave(p)
+  let w = read_cond_word(&p, single)
+  if w >= 0:
+    p.t.a[id] = w
+    return id
+  try_fail(&p, m2, e2)
+  problem_at(&p, pos, pos, ERR, 1019, "Expected this to be an argument to the unary condition.")
+  return pfail(&p, "Expected an argument for the unary operator")
+
+fn binary_test_ops() -> [Str]:
+  return ["-nt", "-ot", "-ef", "==", "!=", "<=", ">=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge", "=~", ">", "<", "=", "\\<", "\\>", "\\<=", "\\>="]
+
+fn read_cond_nullary_or_binary(var p: P, single: Bool) -> Int:
+  let sp = p.pos
+  # readCondWord `attempting` (lookAhead (char '[') >> problem 1026)
+  if peek(p) == 91:
+    if single: problem(&p, ERR, 1026, "If grouping expressions inside [..], use \\( ..\\).")
+    else: problem(&p, ERR, 1026, "If grouping expressions inside [[..]], use ( .. ).")
+  let x = read_cond_word(&p, single)
+  if x < 0: return -1
+  let idsp = sp
+  let idep = p.pos
+  # binary?
+  let m = mark(p)
+  let pos = p.pos
+  let is_regex = starts(p, "=~") or starts(p, "~=")
+  let op = read_cond_binary_op(&p, single)
+  if op >= 0:
+    var y = -1
+    if is_regex: y = read_regex(&p)
+    else:
+      let m2 = mark(p)
+      y = read_cond_word(&p, single)
+      if y < 0 and p.i == m2.i:
+        reset(&p, m2)
+        problem_at(&p, pos, pos, ERR, 1027, "Expected another argument for this operator.")
+        mzero(&p)
+    if y < 0: return -1
+    p.t.a[op] = x
+    p.t.b[op] = y
+    return op
+  if p.i != m.i: return -1
+  reset(&p, m)
+  check_trailing_op(&p, x)
+  let id = ast.add(&p.t, TC_Nullary, idsp, idep)
+  p.t.f[id] = ctype(single)
+  p.t.a[id] = x
+  return id
+
+fn read_cond_binary_op(var p: P, single: Bool) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  guard_arithmetic(&p, single)
+  let sp = p.pos
+  if regular_or_escaped(&p, any_op) < 0: return try_fail(&p, m, e)
+  let id = node(&p, TC_Binary, sp)
+  p.t.s[id] = p.sv + ""
+  p.t.f[id] = ctype(single)
+  if cond_spacing(&p, single, true) < 0: return try_fail(&p, m, e)
+  return id
+
+fn check_trailing_op(var p: P, x: Int):
+  if p.t.k[x] != T_NormalWord or p.t.n1[x] == 0: return
+  let l = ast.last1(p.t, x)
+  if p.t.k[l] != T_Literal: return
+  let s = p.t.s[l] + ""
+  for o in binary_test_ops():
+    if s.endswith(o):
+      problem_id(&p, l, ERR, 1108, "You need a space before and after the " + o + " .")
+      return
+
+fn read_regex(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "regex")
+  let sp = p.pos
+  var parts: [Int] = []
+  let r0 = regex_part(&p)
+  if r0 < 0: return cend(&p, st, -1)
+  parts.push(r0)
+  if not many_(&p, regex_part, &parts): return cend(&p, st, -1)
+  let id = nodes1(&p, T_NormalWord, sp, parts)
+  spacing(&p)
+  return cend(&p, st, id)
+
+fn rx_normal_literal(var p: P) -> Int:
+  return read_normal_literal(&p, "( ")
+
+fn regex_part(var p: P) -> Int:
+  let m = mark(p)
+  var r = regex_group(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_single_quoted(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_double_quoted(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_dollar_expression(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_literal_for(&p, rx_normal_literal)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  if peek(p) == 124:
+    let sp = p.pos
+    adv(&p)
+    return lit(&p, sp, "|")
+  nomatch(&p)
+  let c = peek(p)
+  if is_extglob_start(c) or c == 123 or c == 125 or c == 91 or c == 93 or c == 36:
+    let sp = p.pos
+    let s = adv_s(&p)
+    return lit(&p, sp, s)
+  return nomatch(&p)
+
+fn regex_group(var p: P) -> Int:
+  if peek(p) != 40: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "regex grouping")
+  let sp = p.pos
+  let p1sp = p.pos
+  adv(&p)
+  let p1 = lit(&p, p1sp, "(")
+  var parts: [Int] = [p1]
+  while true:
+    let m = mark(p)
+    var r = regex_part(&p)
+    if r < 0 and p.i == m.i:
+      reset(&p, m)
+      r = regex_literal(&p)
+    if r < 0:
+      if p.i != m.i: return cend(&p, st, -1)
+      reset(&p, m)
+      break
+    parts.push(r)
+    eclr(&p)
+  if peek(p) != 41:
+    nomatch(&p)
+    return cend(&p, st, -1)
+  let p2sp = p.pos
+  adv(&p)
+  parts.push(lit(&p, p2sp, ")"))
+  let id = nodes1(&p, T_NormalWord, sp, parts)
+  return cend(&p, st, id)
+
+fn regex_literal(var p: P) -> Int:
+  let sp = p.pos
+  if read_generic_literal1(&p, 1) < 0: return -1
+  return lit(&p, sp, p.sv + "")
+
+# readGenericLiteral1 endExp: escapes or any char, reluctantly until endExp (at least one).
+# ends: 1 = singleQuote <|> doubleQuotable <|> oneOf "()" ; 2 = oneOf "{}\"$'," <|> whitespace
+fn generic_end(var p: P, ends: Int) -> Bool:
+  let c = peek(p)
+  if c < 0: return false
+  if ends == 1: return c == 39 or c == 92 or c == 34 or c == 36 or c == 96 or c == 40 or c == 41
+  if c == 123 or c == 125 or c == 34 or c == 36 or c == 39 or c == 44: return true
+  if c == 32 or c == 9 or c == 10 or is_uspace(c): return true
+  if c == 13:
+    problem_at(&p, p.pos, p.pos, ERR, 1017, "Literal carriage return. Run script through tr -d '\\r' .")
+    return true
+  return false
+
+fn read_generic_literal1(var p: P, ends: Int) -> Int:
+  if generic_end(&p, ends):
+    let e = esave(p)
+    let m = mark(p)
+    adv(&p)
+    pfail(&p, "Unexpected ")
+    try_fail(&p, m, e)
+    return -1
+  var out = ""
+  var first = true
+  while true:
+    if not first:
+      if at_eof(p) or generic_end(&p, ends): break
+    first = false
+    let c = peek(p)
+    if c < 0: return nomatch(&p)
+    if c == 92:
+      adv(&p)
+      if at_eof(p): return nomatch(&p)
+      let x = adv(&p)
+      if x != 10:
+        out += "\\"
+        put(&out, x)
+    else: out += adv_s(&p)
+  p.sv = out
+  return 0
+
+# ---------------------------------------------------------------- arithmetic
+
+fn a_spacing(var p: P) -> Int:
+  while true:
+    let c = peek(p)
+    if c == 32 or c == 9 or c == 13 or c == 10 or is_uspace(c):
+      if whitespace(&p) < 0: return -1
+    elif c == 92 and peek_at(p, 1) == 10:
+      adv(&p)
+      adv(&p)
+    else: break
+  nomatch(&p)
+  return 0
+
+fn incomplete_op_follows(var p: P) -> Bool:
+  # notFollowedBy2 (oneOf "&|<>=") failing
+  let c = peek(p)
+  if c == 38 or c == 124 or c == 60 or c == 62 or c == 61:
+    let e = esave(p)
+    let m = mark(p)
+    adv(&p)
+    pfail(&p, "Unexpected ")
+    try_fail(&p, m, e)
+    return true
+  nomatch(&p)
+  return false
+
+# readComboOp: one of ops (each tried as try (string op >> failIfIncompleteOp)); a node of kind with s = op.
+fn combo_op(var p: P, ops: [Str], kind: Int) -> Int:
+  let sp = p.pos
+  for o in ops:
+    let m = mark(p)
+    let e = esave(p)
+    if try_string(&p, o) >= 0:
+      if not incomplete_op_follows(&p):
+        let id = node(&p, kind, sp)
+        p.t.s[id] = o
+        if a_spacing(&p) < 0: return -1
+        return id
+      try_fail(&p, m, e)
+  return -1
+
+fn read_arithmetic_contents(var p: P) -> Int:
+  return a_sequence(&p)
+
+fn a_sequence(var p: P) -> Int:
+  if a_spacing(&p) < 0: return -1
+  let sp = p.pos
+  var items: [Int] = []
+  let m = mark(p)
+  let x = a_assignment(&p)
+  if x >= 0:
+    items.push(x)
+    while true:
+      if peek(p) != 44:
+        nomatch(&p)
+        break
+      adv(&p)
+      if a_spacing(&p) < 0: return -1
+      let y = a_assignment(&p)
+      if y < 0: return -1
+      items.push(y)
+      eclr(&p)
+  elif p.i != m.i: return -1
+  else: reset(&p, m)
+  return nodes1(&p, TA_Sequence, sp, items)
+
+fn a_assignment(var p: P) -> Int:
+  let x = a_trinary(&p)
+  if x < 0: return -1
+  let m = mark(p)
+  let op = combo_op(&p, ["=", "*=", "/=", "%=", "+=", "-=", "<<=", ">>=", "&=", "^=", "|="], TA_Assignment)
+  if op < 0:
+    if p.i != m.i: return -1
+    reset(&p, m)
+    return x
+  let y = a_assignment(&p)
+  if y < 0: return -1
+  p.t.a[op] = x
+  p.t.b[op] = y
+  return op
+
+fn a_trinary(var p: P) -> Int:
+  let x = a_binary(&p, 0)
+  if x < 0: return -1
+  if peek(p) != 63:
+    nomatch(&p)
+    return x
+  let sp = p.pos
+  adv(&p)
+  if a_spacing(&p) < 0: return -1
+  let y = a_trinary(&p)
+  if y < 0: return -1
+  if string_(&p, ":") < 0: return -1
+  if a_spacing(&p) < 0: return -1
+  let z = a_trinary(&p)
+  if z < 0: return -1
+  let id = node(&p, TA_Trinary, sp)
+  p.t.a[id] = x
+  p.t.b[id] = y
+  p.t.c[id] = z
+  return id
+
+fn level_ops(level: Int) -> [Str]:
+  if level == 0: return ["||"]
+  if level == 1: return ["&&"]
+  if level == 2: return ["|"]
+  if level == 3: return ["^"]
+  if level == 4: return ["&"]
+  if level == 5: return ["==", "!="]
+  if level == 6: return ["<=", ">=", "<", ">"]
+  if level == 7: return ["<<", ">>"]
+  if level == 8: return ["+"]
+  if level == 9: return ["*", "/", "%"]
+  return ["**"]
+
+# The chainl1 levels: 0 logical or ... 10 exponent; below that readAnyNegated
+fn a_binary(var p: P, level: Int) -> Int:
+  if level > 10: return a_any_negated(&p)
+  var x = a_binary(&p, level + 1)
+  if x < 0: return -1
+  let ops = level_ops(level)
+  while true:
+    let m = mark(p)
+    var op = combo_op(&p, ops, TA_Binary)
+    if op < 0 and level == 8 and p.i == m.i:
+      reset(&p, m)
+      op = a_minus_op(&p)
+    if op < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      return x
+    let y = a_binary(&p, level + 1)
+    if y < 0: return -1
+    p.t.a[op] = x
+    p.t.b[op] = y
+    x = op
+  return x
+
+fn a_minus_op(var p: P) -> Int:
+  let sp = p.pos
+  let pos = p.pos
+  let m = mark(p)
+  let e = esave(p)
+  if peek(p) != 45: return nomatch(&p)
+  adv(&p)
+  if incomplete_op_follows(&p): return try_fail(&p, m, e)
+  # optional (lookAhead (choice tryOp) >> problem 1106)
+  let pairs = [["lt", "<"], ["gt", ">"], ["le", "<="], ["ge", ">="], ["eq", "=="], ["ne", "!="]]
+  for pr in pairs:
+    let m2 = mark(p)
+    let e2 = esave(p)
+    if try_string(&p, pr[0]) >= 0 and spacing1(&p) >= 0:
+      look_ok(&p, m2, e2)
+      problem_at(&p, pos, pos, ERR, 1106, "In arithmetic contexts, use " + pr[1] + " instead of -" + pr[0])
+      break
+    try_fail(&p, m2, e2)
+  let id = node(&p, TA_Binary, sp)
+  p.t.s[id] = "-"
+  if a_spacing(&p) < 0: return -1
+  return id
+
+fn a_any_negated(var p: P) -> Int:
+  let c = peek(p)
+  if c == 33 or c == 126:
+    let sp = p.pos
+    adv(&p)
+    let id = node(&p, TA_Unary, sp)
+    p.t.s[id] = cstr(c)
+    if a_spacing(&p) < 0: return -1
+    let x = a_any_negated(&p)
+    if x < 0: return -1
+    p.t.a[id] = x
+    return id
+  nomatch(&p)
+  # readSigned <|> readAnycremented
+  if (c == 43 or c == 45) and peek_at(p, 1) != c:
+    let sp = p.pos
+    adv(&p)
+    nomatch(&p)
+    if a_spacing(&p) < 0: return -1
+    let id = node(&p, TA_Unary, sp)
+    p.t.s[id] = cstr(c)
+    if a_spacing(&p) < 0: return -1
+    let x = a_anycremented(&p)
+    if x < 0: return -1
+    p.t.a[id] = x
+    return id
+  if c == 43 or c == 45:
+    # readSignOp's try fails: "Unexpected " after the second sign
+    let e = esave(p)
+    let m = mark(p)
+    adv(&p)
+    adv(&p)
+    pfail(&p, "Unexpected ")
+    try_fail(&p, m, e)
+  else: nomatch(&p)
+  return a_anycremented(&p)
+
+fn a_anycremented(var p: P) -> Int:
+  let m = mark(p)
+  let r = a_postfix(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  # readPrefixIncremented
+  let sp = p.pos
+  var op = ""
+  if starts(p, "++"): op = "++"
+  elif starts(p, "--"): op = "--"
+  else: return nomatch(&p)
+  adv(&p)
+  adv(&p)
+  let id = node(&p, TA_Unary, sp)
+  p.t.s[id] = op + "|"
+  if a_spacing(&p) < 0: return -1
+  let x = a_term(&p)
+  if x < 0: return -1
+  p.t.a[id] = x
+  return id
+
+fn a_postfix(var p: P) -> Int:
+  let x = a_term(&p)
+  if x < 0: return -1
+  if a_spacing(&p) < 0: return -1
+  let sp = p.pos
+  var op = ""
+  if starts(p, "++"): op = "++"
+  elif starts(p, "--"): op = "--"
+  else:
+    nomatch(&p)
+    return x
+  adv(&p)
+  adv(&p)
+  let id = node(&p, TA_Unary, sp)
+  p.t.s[id] = "|" + op
+  p.t.a[id] = x
+  if a_spacing(&p) < 0: return -1
+  return id
+
+fn a_term(var p: P) -> Int:
+  let m = mark(p)
+  let c = peek(p)
+  if c == 40:
+    let sp = p.pos
+    adv(&p)
+    let s = a_sequence(&p)
+    if s < 0: return -1
+    if char_(&p, 41) < 0: return -1
+    let id = node(&p, TA_Parenthesis, sp)
+    p.t.a[id] = s
+    if a_spacing(&p) < 0: return -1
+    return id
+  nomatch(&p)
+  if is_var_start(c):
+    let sp = p.pos
+    read_variable_name(&p)
+    let name = p.sv + ""
+    var idx: [Int] = []
+    while peek(p) == 91:
+      let r = a_array_index(&p)
+      if r < 0: return -1
+      idx.push(r)
+    nomatch(&p)
+    let id = nodes1(&p, TA_Variable, sp, idx)
+    p.t.s[id] = name
+    if a_spacing(&p) < 0: return -1
+    return id
+  nomatch(&p)
+  return a_expansion(&p)
+
+fn a_array_index(var p: P) -> Int:
+  let sp = p.pos
+  adv(&p)
+  let pos = p.pos
+  if read_string_for(&p, read_arithmetic_contents) < 0: return -1
+  let s = p.sv + ""
+  if char_(&p, 93) < 0: return -1
+  let id = node(&p, T_UnparsedIndex, sp)
+  p.t.f[id] = pos
+  p.t.s[id] = s
+  return id
+
+fn a_expansion(var p: P) -> Int:
+  let sp = p.pos
+  var pieces: [Int] = []
+  while true:
+    let m = mark(p)
+    let r = a_expansion_piece(&p)
+    if r < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      break
+    pieces.push(r)
+    if pieces.len > 1: eclr(&p)
+  if pieces.len == 0: return -1
+  let id = nodes1(&p, TA_Expansion, sp, pieces)
+  if a_spacing(&p) < 0: return -1
+  return id
+
+fn a_normal_literal(var p: P) -> Int:
+  return read_normal_literal(&p, "+-*/=%^,]?:")
+
+fn a_expansion_piece(var p: P) -> Int:
+  let m = mark(p)
+  var r = read_single_quoted(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_double_quoted(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_normal_dollar(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_braced(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_backticked(&p, false)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  if peek(p) == 35:
+    let sp = p.pos
+    adv(&p)
+    return lit(&p, sp, "#")
+  nomatch(&p)
+  return a_normal_literal(&p)
+
+# ---------------------------------------------------------------- annotations
+
+fn plain_or_quoted_start(var p: P) -> Int:
+  # returns the quote char if quoted (consumed it), 0 if plain
+  let c = peek(p)
+  if c == 39 or c == 34:
+    adv(&p)
+    return c
+  nomatch(&p)
+  return 0
+
+# quoted p: the text up to the closing quote (at least one char), for a sub-parse; -1 if not quoted
+fn read_quoted_text(var p: P, var text: Str, var tpos: Int) -> Int:
+  let c = peek(p)
+  if c != 39 and c != 34: return nomatch(&p)
+  adv(&p)
+  tpos = p.pos
+  let st = p.i
+  while true:
+    let d = peek(p)
+    if d < 0 or d == c or d == 10: break
+    adv(&p)
+  nomatch(&p)
+  if p.i == st: return -1
+  text = p.src[st..p.i]
+  if peek(p) != c: return pfail(&p, "Missing terminating quote for directive.")
+  adv(&p)
+  return 0
+
+fn read_code(var p: P, var out: Int) -> Int:
+  let m = mark(p)
+  if string_(&p, "SC") < 0:
+    if p.i != m.i: return -1
+    reset(&p, m)
+  if not is_digit(peek(p)): return nomatch(&p)
+  var n = 0
+  while is_digit(peek(p)):
+    let d = adv(&p) - 48
+    if n < 100000000000: n = n * 10 + d
+  nomatch(&p)
+  out = n
+  return 0
+
+# readElement `sepBy` char ',' for disable=
+fn read_disable_list(var p: P, var anns: [Ann]) -> Int:
+  var first = true
+  while true:
+    if not first:
+      if peek(p) != 44:
+        nomatch(&p)
+        return 0
+      adv(&p)
+    let st = p.i
+    let m = mark(p)
+    var lo = 0
+    var r = read_code(&p, &lo)
+    if r >= 0:
+      var hi = lo + 1
+      if peek(p) == 45:
+        adv(&p)
+        if read_code(&p, &hi) < 0: return -1
+      else: nomatch(&p)
+      anns.push(Ann(ANN_DISABLE, lo, hi, ""))
+    elif p.i != st: return -1
+    else:
+      reset(&p, m)
+      if string_(&p, "all") < 0:
+        if first and p.i == st:
+          reset(&p, m)
+          return 0
+        return -1
+      anns.push(Ann(ANN_DISABLE, 0, 1000000, ""))
+    if not first: eclr(&p)
+    first = false
+  return 0
+
+fn read_name_list(var p: P, var anns: [Ann]) -> Int:
+  var first = true
+  while true:
+    if not first:
+      if peek(p) != 44:
+        nomatch(&p)
+        return 0
+      adv(&p)
+    let st = p.i
+    while is_letter(peek(p)) or peek(p) == 45: adv(&p)
+    nomatch(&p)
+    if p.i == st:
+      if first: return 0
+      return -1
+    anns.push(Ann(ANN_ENABLE, 0, 0, p.src[st..p.i]))
+    first = false
+  return 0
+
+fn read_letters(var p: P) -> Int:
+  let st = p.i
+  while is_letter(peek(p)): adv(&p)
+  nomatch(&p)
+  if p.i == st: return -1
+  p.sv = p.src[st..p.i]
+  return 0
+
+# quoted (many1 anyChar) <|> many1 (noneOf " \n")
+fn read_directive_value(var p: P) -> Int:
+  let m = mark(p)
+  var text = ""
+  var tp = 0
+  let r = read_quoted_text(&p, &text, &tp)
+  if r >= 0:
+    p.sv = text
+    return 0
+  if p.i != m.i: return -1
+  reset(&p, m)
+  let st = p.i
+  while true:
+    let c = peek(p)
+    if c < 0 or c == 32 or c == 10: break
+    adv(&p)
+  nomatch(&p)
+  if p.i == st: return -1
+  p.sv = p.src[st..p.i]
+  return 0
+
+fn shell_known(s: Str) -> Bool:
+  return s in ["sh", "bash", "bats", "busybox", "busybox sh", "busybox ash", "dash", "ash", "ksh", "ksh88", "ksh93", "oksh"]
+
+# plainOrQuoted for disable=, enable=, and the true/false keys (kind 1, 2, 3)
+fn plain_or_quoted(var p: P, kind: Int, var anns: [Ann]) -> Int:
+  let m = mark(p)
+  var text = ""
+  var tp = 0
+  let r = read_quoted_text(&p, &text, &tp)
+  if r >= 0:
+    var s = sub_begin(&p, tp, text)
+    var rr = 0
+    if kind == 1: rr = read_disable_list(&p, &anns)
+    elif kind == 2: rr = read_name_list(&p, &anns)
+    else: rr = read_letters(&p)
+    sub_end(&p, &s)
+    return rr
+  if p.i != m.i: return -1
+  reset(&p, m)
+  if kind == 1: return read_disable_list(&p, &anns)
+  if kind == 2: return read_name_list(&p, &anns)
+  return read_letters(&p)
+
+fn read_key(var p: P, sandboxed: Bool, var anns: [Ann]) -> Int:
+  let key_pos = p.pos
+  let st = p.i
+  while is_letter(peek(p)) or peek(p) == 45: adv(&p)
+  nomatch(&p)
+  if p.i == st: return -1
+  let key = p.src[st..p.i]
+  if peek(p) != 61: return pfail(&p, "Expected '=' after directive key")
+  adv(&p)
+  if key == "disable":
+    if plain_or_quoted(&p, 1, &anns) < 0: return -1
+  elif key == "enable":
+    if plain_or_quoted(&p, 2, &anns) < 0: return -1
+  elif key == "source":
+    if read_directive_value(&p) < 0: return -1
+    anns.push(Ann(ANN_SOURCE, 0, 0, p.sv + ""))
+  elif key == "source-path":
+    if read_directive_value(&p) < 0: return -1
+    anns.push(Ann(ANN_SOURCEPATH, 0, 0, p.sv + ""))
+  elif key == "shell":
+    let pos = p.pos
+    if read_directive_value(&p) < 0: return -1
+    let sh = p.sv + ""
+    if not shell_known(sh): note_at(&p, pos, pos, ERR, 1103, "This shell type is unknown. Use e.g. sh or bash.")
+    anns.push(Ann(ANN_SHELL, 0, 0, sh))
+  elif key == "extended-analysis":
+    let pos = p.pos
+    var dummy: [Ann] = []
+    if plain_or_quoted(&p, 3, &dummy) < 0: return -1
+    if p.sv == "true": anns.push(Ann(ANN_EXTENDED, 1, 0, ""))
+    elif p.sv == "false": anns.push(Ann(ANN_EXTENDED, 0, 0, ""))
+    else: note_at(&p, pos, pos, ERR, 1146, "Unknown extended-analysis value. Expected true/false.")
+  elif key == "external-sources":
+    let pos = p.pos
+    var dummy: [Ann] = []
+    if plain_or_quoted(&p, 3, &dummy) < 0: return -1
+    if p.sv == "true":
+      if sandboxed: note_at(&p, pos, pos, ERR, 1144, "external-sources can only be enabled in .shellcheckrc, not in individual files.")
+      else: anns.push(Ann(ANN_EXTERNAL, 1, 0, ""))
+    elif p.sv == "false": anns.push(Ann(ANN_EXTERNAL, 0, 0, ""))
+    else: note_at(&p, pos, pos, ERR, 1145, "Unknown external-sources value. Expected true/false.")
+  else:
+    note_at(&p, key_pos, key_pos, WARN, 1107, "This directive is unknown. It will be ignored.")
+    # anyChar `reluctantlyTill` whitespace
+    while true:
+      let c = peek(p)
+      if c < 0 or c == 32 or c == 9 or c == 10 or is_uspace(c): break
+      if c == 13:
+        problem_at(&p, p.pos, p.pos, ERR, 1017, "Literal carriage return. Run script through tr -d '\\r' .")
+        break
+      adv(&p)
+  while is_linews(peek(p)):
+    if not almost_space(&p): adv(&p)
+  nomatch(&p)
+  return 0
+
+fn read_annotation_without_prefix(var p: P, sandboxed: Bool, var anns: [Ann]) -> Int:
+  if read_key(&p, sandboxed, &anns) < 0: return -1
+  while true:
+    let m = mark(p)
+    if read_key(&p, sandboxed, &anns) < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      break
+    eclr(&p)
+  let m = mark(p)
+  if read_any_comment(&p) < 0: reset(&p, m)
+  let st = p.i
+  let m2 = mark(p)
+  var r = linefeed(&p)
+  if r < 0:
+    if p.i != st: return -1
+    reset(&p, m2)
+    if eof(&p) < 0:
+      note(&p, ERR, 1125, "Invalid key=value pair? Ignoring the rest of this directive starting here.")
+      while peek(p) >= 0 and peek(p) != 10: adv(&p)
+      nomatch(&p)
+      let st2 = p.i
+      if linefeed(&p) < 0:
+        if p.i != st2: return -1
+        if eof(&p) < 0: return -1
+  while is_linews(peek(p)):
+    if not almost_space(&p): adv(&p)
+  nomatch(&p)
+  return 0
+
+fn read_annotation(var p: P, var anns: [Ann]) -> Int:
+  let st = p.i
+  push_name(&p, "shellcheck directive")
+  if try_(&p, read_annotation_prefix) < 0: return cend(&p, st, -1)
+  if not is_linews(peek(p)):
+    nomatch(&p)
+    return cend(&p, st, -1)
+  while is_linews(peek(p)):
+    if not almost_space(&p): adv(&p)
+  nomatch(&p)
+  let r = read_annotation_without_prefix(&p, true, &anns)
+  return cend(&p, st, r)
+
+# readAnnotations: an index into t.anns, or -1 when there were none
+fn read_annotations(var p: P, var out: [Ann]) -> Int:
+  while true:
+    let m = mark(p)
+    let n = out.len
+    if read_annotation(&p, &out) < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      out.truncate(n)
+      return 0
+    let m2 = mark(p)
+    if allspacing(&p) < 0:
+      if p.i != m2.i: return -1
+      reset(&p, m2)
+    eclr(&p)
+  return 0
+
+fn add_anns(var p: P, own anns: [Ann]) -> Int:
+  p.t.anns.push(anns)
+  return p.t.anns.len - 1
+
+# ---------------------------------------------------------------- words
+
+fn read_normal_word(var p: P) -> Int:
+  return read_normalish_word(&p, "", 1)
+
+fn read_pattern_word(var p: P) -> Int:
+  return read_normalish_word(&p, "", 2)
+
+fn read_normalish_word(var p: P, end: Str, terms: Int) -> Int:
+  let sp = p.pos
+  let pos = p.pos
+  var parts: [Int] = []
+  let r = read_normal_word_part(&p, end)
+  if r < 0: return -1
+  parts.push(r)
+  while true:
+    let m = mark(p)
+    let x = read_normal_word_part(&p, end)
+    if x < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      break
+    parts.push(x)
+    eclr(&p)
+  let id = nodes1(&p, T_NormalWord, sp, parts)
+  if parts.len == 1 and p.t.k[parts[0]] == T_Literal:
+    let s = p.t.s[parts[0]] + ""
+    var hit = false
+    if terms == 1: hit = s == "do" or s == "done" or s == "then" or s == "fi" or s == "esac"
+    else: hit = s == "esac"
+    if hit: problem_at(&p, pos, pos, WARN, 1010, "Use semicolon or linefeed before '" + s + "' (or quote to make it literal).")
+  return id
+
+fn read_normal_word_part(var p: P, end: Str) -> Int:
+  let c = peek(p)
+  # notFollowedBy2 $ oneOf end
+  if end.len > 0 and in_str(c, end):
+    let e = esave(p)
+    let m = mark(p)
+    adv(&p)
+    pfail(&p, "Unexpected ")
+    try_fail(&p, m, e)
+    return -1
+  if end.len > 0: nomatch(&p)
+  # checkForParenthesis
+  if c == 40:
+    problem(&p, ERR, 1036, "'(' is invalid here. Did you forget to escape it?")
+  let m = mark(p)
+  if c == 39: return read_single_quoted(&p)
+  if c == 34: return read_double_quoted(&p)
+  nomatch(&p)
+  if c == 42 or c == 63 or c == 64 or c == 33 or c == 43 or c == 91:
+    let r = read_glob(&p)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  if c == 36: return read_normal_dollar(&p)
+  if c == 123:
+    let r = read_braced(&p)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  if c == 96 or c == 0xB4:
+    let r = read_backticked(&p, false)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  if c == 60 or c == 62:
+    let r = read_proc_sub(&p)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  if is_usq(c) or is_udq(c): return read_unicode_quote(&p)
+  let r = read_normal_literal(&p, end)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  # readLiteralCurlyBraces
+  if c == 123 or c == 125:
+    let sp = p.pos
+    if c == 123 and peek_at(p, 1) == 125:
+      adv(&p)
+      adv(&p)
+      return lit(&p, sp, "{{}}")
+    let pos = p.pos
+    adv(&p)
+    problem_at(&p, pos, pos, WARN, 1083, "This " + cstr(c) + " is literal. Check expression (missing ;/\\n?) or quote it.")
+    return lit(&p, sp, cstr(c))
+  return nomatch(&p)
+
+fn standard_end(c: Int) -> Bool:
+  return c == 91 or c == 123 or c == 125 or is_quotable_char(c) or is_extglob_start(c) or is_udq(c) or is_usq(c)
+
+fn read_normal_literal(var p: P, end: Str) -> Int:
+  let sp = p.pos
+  var out = ""
+  var any = false
+  while true:
+    let c = peek(p)
+    if c < 0:
+      nomatch(&p)
+      break
+    if c == 92:
+      let st = p.i
+      let r = read_normal_escaped(&p)
+      if r < 0:
+        if p.i != st: return -1
+        break
+      out += p.sv
+      any = true
+    elif standard_end(c) or (end.len > 0 and in_str(c, end)):
+      nomatch(&p)
+      break
+    else:
+      out += adv_s(&p)
+      any = true
+  if not any: return -1
+  return lit(&p, sp, out)
+
+fn read_normal_escaped(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "escaped char")
+  let pos = p.pos
+  adv(&p)
+  let c = peek(p)
+  if is_uspace(c) or is_quotable_char(c) or in_str(c, "?*@!+[]{{}}.,~#"):
+    var next = c
+    if is_uspace(c):
+      almost_space(&p)
+      next = 32
+    else: adv(&p)
+    if next == 32: check_trailing_spaces(&p, pos)
+    if next == 10: p.sv = ""
+    else: p.sv = cstr(next)
+    return cend(&p, st, 0)
+  if c < 0:
+    nomatch(&p)
+    return cend(&p, st, -1)
+  let s = adv_s(&p)
+  if c == 110: note_at(&p, pos, pos, WARN, 1012, "\\n is just literal 'n' here. For line feed, use a quoted, literal line feed instead.")
+  elif c == 116: note_at(&p, pos, pos, WARN, 1012, "\\t is just literal 't' here. For tab, use \"$(printf '\\t')\" instead.")
+  elif c == 114: note_at(&p, pos, pos, WARN, 1012, "\\r is just literal 'r' here. For carriage return, use \"$(printf '\\r')\" instead.")
+  else: note_at(&p, pos, pos, INFO, 1001, "This \\" + s + " will be a regular '" + s + "' in this context.")
+  p.sv = s
+  return cend(&p, st, 0)
+
+fn check_trailing_spaces(var p: P, pos: Int):
+  var j = p.i
+  while true:
+    let d = dec(p.src, j)
+    if d < 0: break
+    let c = d & 0xFFFFFF
+    if c == 32 or c == 9 or is_uspace(c): j += d >> 24
+    else: break
+  if j < p.src.len and p.src[j] == '\r':
+    # carriageReturn inside the lookahead still records its problem
+    var q = p.pos
+    var k = p.i
+    while k < j:
+      let d = dec(p.src, k)
+      let c = d & 0xFFFFFF
+      if c == 9: q = q + 8 - ((pcol(q) - 1) % 8)
+      else: q += 1
+      k += d >> 24
+    problem_at(&p, q, q, ERR, 1017, "Literal carriage return. Run script through tr -d '\\r' .")
+    if j + 1 < p.src.len and p.src[j + 1] == '\n':
+      problem_at(&p, pos, pos, ERR, 1101, "Delete trailing spaces after \\ to break line (or use quotes for literal space).")
+    return
+  if j >= p.src.len or p.src[j] == '\n':
+    problem_at(&p, pos, pos, ERR, 1101, "Delete trailing spaces after \\ to break line (or use quotes for literal space).")
+
+fn read_glob(var p: P) -> Int:
+  let m = mark(p)
+  var r = read_extglob(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  let c = peek(p)
+  if c == 42 or c == 63:
+    let sp = p.pos
+    adv(&p)
+    let id = node(&p, T_Glob, sp)
+    p.t.s[id] = cstr(c)
+    return id
+  nomatch(&p)
+  r = read_glob_class(&p)
+  if r >= 0: return r
+  if is_extglob_start(c) or c == 91:
+    let sp = p.pos
+    adv(&p)
+    return lit(&p, sp, cstr(c))
+  return nomatch(&p)
+
+fn read_glob_class(var p: P) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  let sp = p.pos
+  if peek(p) != 91: return nomatch(&p)
+  adv(&p)
+  var s = "["
+  var neg = ""
+  let c = peek(p)
+  if c == 33 or c == 94:
+    adv(&p)
+    neg = cstr(c)
+  else: nomatch(&p)
+  s += neg
+  var lead = false
+  if peek(p) == 93:
+    adv(&p)
+    s += "]"
+    lead = true
+  else: nomatch(&p)
+  var any = false
+  while true:
+    let d = peek(p)
+    if d == 91 and peek_at(p, 1) == 58:
+      # predefined: try (string "[:"); many1 letter; string ":]"
+      adv(&p)
+      adv(&p)
+      let st = p.i
+      while is_letter(peek(p)): adv(&p)
+      if p.i == st:
+        nomatch(&p)
+        return try_fail(&p, m, e)
+      let name = p.src[st..p.i]
+      if string_(&p, ":]") < 0: return try_fail(&p, m, e)
+      s += "[:" + name + ":]"
+      any = true
+      continue
+    if d == 92:
+      let st = p.i
+      if read_normal_escaped(&p) < 0:
+        if p.i != st: return try_fail(&p, m, e)
+        break
+      s += p.sv
+      any = true
+      continue
+    if d >= 0 and not standard_end(d) and d != 93:
+      while true:
+        let x = peek(p)
+        if x < 0 or x == 92 or standard_end(x) or x == 93: break
+        s += adv_s(&p)
+      any = true
+      continue
+    if d == 33 or d == 91 or is_extglob_start(d):
+      s += adv_s(&p)
+      any = true
+      continue
+    break
+  nomatch(&p)
+  if not lead and not any:
+    mzero(&p)
+    return try_fail(&p, m, e)
+  if peek(p) != 93:
+    nomatch(&p)
+    return try_fail(&p, m, e)
+  adv(&p)
+  let id = node(&p, T_Glob, sp)
+  p.t.s[id] = s + "]"
+  return id
+
+fn read_extglob(var p: P) -> Int:
+  let c = peek(p)
+  if not is_extglob_start(c) or peek_at(p, 1) != 40: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "extglob")
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  var parts: [Int] = []
+  if extglob_parts(&p, &parts) < 0: return cend(&p, st, -1)
+  if char_(&p, 41) < 0: return cend(&p, st, -1)
+  let id = nodes1(&p, T_Extglob, sp, parts)
+  p.t.s[id] = cstr(c)
+  return cend(&p, st, id)
+
+# readExtglobPart `sepBy` char '|'
+fn extglob_parts(var p: P, var out: [Int]) -> Int:
+  let x = read_extglob_part(&p)
+  if x < 0: return -1
+  out.push(x)
+  while peek(p) == 124:
+    adv(&p)
+    let y = read_extglob_part(&p)
+    if y < 0: return -1
+    out.push(y)
+    eclr(&p)
+  nomatch(&p)
+  return 0
+
+fn read_extglob_part(var p: P) -> Int:
+  let sp = p.pos
+  var parts: [Int] = []
+  while true:
+    let m = mark(p)
+    let c = peek(p)
+    var r = -1
+    if c == 40:
+      adv(&p)
+      let gsp = p.pos
+      var inner: [Int] = []
+      if extglob_parts(&p, &inner) < 0: return -1
+      let gid = nodes1(&p, T_Extglob, gsp, inner)
+      if char_(&p, 41) < 0: return -1
+      r = gid
+    else:
+      nomatch(&p)
+      r = read_normal_word_part(&p, "")
+      if r < 0 and p.i == m.i:
+        reset(&p, m)
+        # readSpacePart
+        let ssp = p.pos
+        var ws = ""
+        while true:
+          let d = peek(p)
+          if not (d == 32 or d == 9 or d == 13 or d == 10 or is_uspace(d)): break
+          let st2 = p.i
+          if whitespace(&p) < 0: return -1
+          ws += p.sv
+        nomatch(&p)
+        if ws.len > 0: r = lit(&p, ssp, ws)
+        else:
+          let lsp = p.pos
+          let st3 = p.i
+          while in_str(peek(p), "<>#;&"): adv(&p)
+          nomatch(&p)
+          if p.i > st3: r = lit(&p, lsp, p.src[st3..p.i])
+    if r < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      break
+    parts.push(r)
+    eclr(&p)
+  return nodes1(&p, T_NormalWord, sp, parts)
+
+fn read_single_quoted(var p: P) -> Int:
+  if peek(p) != 39: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "single quoted string")
+  let sp = p.pos
+  let start_pos = p.pos
+  adv(&p)
+  var s = ""
+  while true:
+    let c = peek(p)
+    if c < 0 or c == 39:
+      nomatch(&p)
+      break
+    if c == 92:
+      let pos = p.pos
+      adv(&p)
+      let x = peek(p)
+      if x < 0:
+        nomatch(&p)
+        return cend(&p, st, -1)
+      if x == 39: problem_at(&p, pos, pos, INFO, 1003, "Want to escape a single quote? echo 'This is how it'\\''s done'.")
+      s += "\\"
+    elif is_usq(c):
+      let pos = p.pos
+      s += adv_s(&p)
+      problem_at(&p, pos, pos, WARN, 1112, "This is a unicode quote. Delete and retype it (or ignore/doublequote for literal).")
+    else:
+      while true:
+        let d = peek(p)
+        if d < 0 or d == 39 or d == 92 or is_usq(d): break
+        s += adv_s(&p)
+  let end_pos = p.pos
+  if peek(p) != 39:
+    pfail(&p, "Expected end of single quoted string")
+    return cend(&p, st, -1)
+  adv(&p)
+  let c = peek(p)
+  if is_var_char(c) or c == 37 or c == 39:
+    let lastc = last_char(s)
+    if s.len > 0 and is_letter(c) and is_letter(lastc):
+      problem_at(&p, end_pos, end_pos, WARN, 1011, "This apostrophe terminated the single quoted string!")
+    elif s.find("\n") >= 0 and not s.startswith("\n"):
+      suggest_forgot_closing_quote(&p, start_pos, end_pos, "single quoted string")
+  else: nomatch(&p)
+  let id = node(&p, T_SingleQuoted, sp)
+  p.t.s[id] = s
+  return cend(&p, st, id)
+
+fn last_char(s: Str) -> Int:
+  if s.len == 0: return -1
+  var j = s.len - 1
+  while j > 0 and (int(s[j]) & 0xC0) == 0x80: j -= 1
+  let d = dec(s, j)
+  if j + (d >> 24) != s.len: return int(s[s.len - 1])
+  return d & 0xFFFFFF
+
+fn suggest_forgot_closing_quote(var p: P, sp: Int, ep: Int, name: Str):
+  problem_at(&p, sp, sp, WARN, 1078, "Did you forget to close this " + name + "?")
+  problem_at(&p, ep, ep, INFO, 1079, "This is actually an end quote, but due to next char it looks suspect.")
+
+fn backtick(var p: P) -> Int:
+  let c = peek(p)
+  if c == 96:
+    adv(&p)
+    return 0
+  if c == 0xB4:
+    let pos = p.pos
+    adv(&p)
+    problem_at(&p, pos, pos, ERR, 1077, "For command expansion, the tick should slant left (` vs ´). Use $(..) instead.")
+    return 0
+  return nomatch(&p)
+
+# readGenericLiteral endChars: escapes kept (except \<newline>), up to one of endChars
+fn read_generic_literal(var p: P, endc: Str) -> Int:
+  var out = ""
+  while true:
+    let c = peek(p)
+    if c < 0:
+      nomatch(&p)
+      break
+    if c == 92:
+      adv(&p)
+      if at_eof(p): return nomatch(&p)
+      let x = adv(&p)
+      if x != 10:
+        out += "\\"
+        put(&out, x)
+    elif in_str(c, endc):
+      nomatch(&p)
+      break
+    else: out += adv_s(&p)
+  p.sv = out
+  return 0
+
+fn unescape_backtick(s: Str, quoted: Bool) -> Str:
+  var out = ""
+  var j = 0
+  while j < s.len:
+    let b = s[j]
+    if b == '\\' and j + 1 < s.len:
+      let x = s[j + 1]
+      if x == '"' and quoted:
+        out += "\""
+        j += 2
+        continue
+      if x == '$' or x == '`' or x == '\\':
+        out += str([x])
+        j += 2
+        continue
+      if x == '\n':
+        j += 2
+        continue
+    out += str([b])
+    j += 1
+  return out
+
+fn backtick_sub(var p: P) -> Int:
+  var cmds: [Int] = []
+  if read_compound_list_or_empty(&p, &cmds) < 0: return -1
+  verify_eof(&p)
+  p.sv = ""
+  let n = ast.add(&p.t, T_Backticked, 0, 0)
+  ast.set1(&p.t, n, cmds)
+  return n
+
+fn read_backticked(var p: P, quoted: Bool) -> Int:
+  let c = peek(p)
+  if c != 96 and c != 0xB4: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "backtick expansion")
+  let sp = p.pos
+  let start_pos = p.pos
+  backtick(&p)
+  let sub_start = p.pos
+  read_generic_literal(&p, "`´")
+  let sub_string = p.sv + ""
+  let end_pos = p.pos
+  if backtick(&p) < 0: return cend(&p, st, -1)
+  let id = node(&p, T_Backticked, sp)
+  let d = peek(p)
+  if is_var_char(d) or d == 37:
+    if sub_string.find("\n") >= 0 and not sub_string.startswith("\n"):
+      suggest_forgot_closing_quote(&p, start_pos, end_pos, "backtick expansion")
+  else: nomatch(&p)
+  var s = sub_begin(&p, sub_start, unescape_backtick(sub_string, quoted))
+  let tmp = try_with_errors(&p, backtick_sub)
+  sub_end(&p, &s)
+  if tmp >= 0:
+    p.t.l1[id] = p.t.l1[tmp]
+    p.t.n1[id] = p.t.n1[tmp]
+  return cend(&p, st, id)
+
+fn read_double_quoted(var p: P) -> Int:
+  if peek(p) != 34: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "double quoted string")
+  let sp = p.pos
+  let start_pos = p.pos
+  adv(&p)
+  var parts: [Int] = []
+  if not many_(&p, double_quoted_part, &parts): return cend(&p, st, -1)
+  let end_pos = p.pos
+  if peek(p) != 34:
+    pfail(&p, "Expected end of double quoted string")
+    return cend(&p, st, -1)
+  adv(&p)
+  let id = nodes1(&p, T_DoubleQuoted, sp, parts)
+  let c = peek(p)
+  if is_var_char(c) or c == 37 or c == 36 or c == 34:
+    var has_lf = false
+    for x in parts:
+      if p.t.k[x] == T_Literal and p.t.s[x].find("\n") >= 0: has_lf = true
+    var starts_lf = parts.len > 0 and p.t.k[parts[0]] == T_Literal and p.t.s[parts[0]].startswith("\n")
+    if has_lf and not starts_lf: suggest_forgot_closing_quote(&p, start_pos, end_pos, "double quoted string")
+  else: nomatch(&p)
+  return cend(&p, st, id)
+
+fn double_quoted_part(var p: P) -> Int:
+  let c = peek(p)
+  if c < 0: return nomatch(&p)
+  if c == 36: return read_double_quoted_dollar(&p)
+  if c == 96: return read_backticked(&p, true)
+  if is_udq(c):
+    let pos = p.pos
+    let sp = p.pos
+    let s = adv_s(&p)
+    let id = lit(&p, sp, s)
+    problem_at(&p, pos, pos, WARN, 1111, "This is a unicode quote. Delete and retype it (or ignore/singlequote for literal).")
+    return id
+  if c == 34: return nomatch(&p)
+  return read_double_literal(&p)
+
+fn read_double_literal(var p: P) -> Int:
+  let sp = p.pos
+  var out = ""
+  while true:
+    let c = peek(p)
+    if c < 0 or c == 34 or c == 36 or c == 96 or is_udq(c):
+      nomatch(&p)
+      break
+    if c == 92:
+      adv(&p)
+      let d = peek(p)
+      if d == 10 or d == 13:
+        let st = p.i
+        let m = mark(p)
+        if linefeed(&p) >= 0: continue
+        if p.i != st: return -1
+        reset(&p, m)
+      if d == 92 or d == 34 or d == 36 or d == 96:
+        adv(&p)
+        put(&out, d)
+        continue
+      if d < 0: return nomatch(&p)
+      out += "\\"
+      out += adv_s(&p)
+    else: out += adv_s(&p)
+  if p.pos == sp: return -1
+  return lit(&p, sp, out)
+
+fn read_double_quoted_dollar(var p: P) -> Int:
+  let m = mark(p)
+  let r = read_dollar_exp(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  return read_dollar_lonely(&p, true)
+
+fn read_normal_dollar(var p: P) -> Int:
+  if peek(p) != 36: return nomatch(&p)
+  let m = mark(p)
+  var r = read_dollar_exp(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_dollar_double_quote(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_dollar_single_quote(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  return read_dollar_lonely(&p, false)
+
+fn read_dollar_expression(var p: P) -> Int:
+  if peek(p) != 36: return nomatch(&p)
+  return read_dollar_exp(&p)
+
+fn read_dollar_exp(var p: P) -> Int:
+  let m = mark(p)
+  var r = -1
+  if starts(p, "$(("):
+    r = read_ambiguous_dollar(&p)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  r = read_dollar_expansion(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_dollar_bracket(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_dollar_brace_command_expansion(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  r = read_dollar_braced(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  return read_dollar_variable(&p)
+
+# parseForgettingContext False: on failure, forget what the parser recorded
+fn forget_on_failure(var p: P, f: fn(var P) -> Int) -> Int:
+  var saved = copy_ctx(p.ctx)
+  let np = p.probs.len
+  let m = mark(p)
+  let e = esave(p)
+  let r = f(&p)
+  if r >= 0: return r
+  try_fail(&p, m, e)
+  swap(&p.ctx, &saved)
+  p.probs.truncate(np)
+  return pfail(&p, "")
+
+# readAmbiguous "$((" readDollarArithmetic readDollarExpansion
+fn read_ambiguous_dollar(var p: P) -> Int:
+  let pos = p.pos
+  var r = try_(&p, read_dollar_arithmetic)
+  if r >= 0: return r
+  let m = mark(p)
+  let e = esave(p)
+  r = forget_on_failure(&p, read_dollar_expansion)
+  if r >= 0:
+    note_at(&p, pos, pos, ERR, 1102, "Shells disambiguate $(( differently or not at all. For $(command substitution), add space after $( . For $((arithmetics)), fix parsing errors.")
+    return r
+  try_fail(&p, m, e)
+  return read_dollar_arithmetic(&p)
+
+fn read_dollar_single_quote(var p: P) -> Int:
+  if not starts(p, "$'"): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "$'..' expression")
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  read_generic_literal(&p, "'")
+  let s = p.sv + ""
+  if char_(&p, 39) < 0: return cend(&p, st, -1)
+  let id = node(&p, T_DollarSingleQuoted, sp)
+  p.t.s[id] = s
+  return cend(&p, st, id)
+
+fn read_dollar_double_quote(var p: P) -> Int:
+  if not starts(p, "$\""): return nomatch(&p)
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  var parts: [Int] = []
+  if not many_(&p, double_quoted_part, &parts): return -1
+  if peek(p) != 34: return pfail(&p, "Expected end of translated double quoted string")
+  adv(&p)
+  return nodes1(&p, T_DollarDoubleQuoted, sp, parts)
+
+fn read_dollar_arithmetic(var p: P) -> Int:
+  if not starts(p, "$(("): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "$((..)) expression")
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  adv(&p)
+  let c = read_arithmetic_contents(&p)
+  if c < 0: return cend(&p, st, -1)
+  if char_(&p, 41) < 0: return cend(&p, st, -1)
+  if peek(p) != 41:
+    pfail(&p, "Expected a double )) to end the $((..))")
+    return cend(&p, st, -1)
+  adv(&p)
+  let id = node(&p, T_DollarArithmetic, sp)
+  p.t.a[id] = c
+  return cend(&p, st, id)
+
+fn read_dollar_bracket(var p: P) -> Int:
+  if not starts(p, "$["): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "$[..] expression")
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  let c = read_arithmetic_contents(&p)
+  if c < 0: return cend(&p, st, -1)
+  if string_(&p, "]") < 0: return cend(&p, st, -1)
+  let id = node(&p, T_DollarBracket, sp)
+  p.t.a[id] = c
+  return cend(&p, st, id)
+
+fn read_arithmetic_expression(var p: P) -> Int:
+  if not starts(p, "(("): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "((..)) command")
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  let c = read_arithmetic_contents(&p)
+  if c < 0: return cend(&p, st, -1)
+  if string_(&p, "))") < 0: return cend(&p, st, -1)
+  let id = node(&p, T_Arithmetic, sp)
+  p.t.a[id] = c
+  spacing(&p)
+  return cend(&p, st, id)
+
+fn read_dollar_brace_command_expansion(var p: P) -> Int:
+  if not starts(p, "${{"): return nomatch(&p)
+  let c = peek_at(p, 2)
+  if not (c == 124 or c == 32 or c == 9 or c == 13 or c == 10 or is_uspace(c)): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "ksh-style ${{ ..; }} command expansion")
+  let sp = p.pos
+  let m = mark(p)
+  let e = esave(p)
+  adv(&p)
+  adv(&p)
+  if c == 124: adv(&p)
+  elif whitespace(&p) < 0:
+    try_fail(&p, m, e)
+    return cend(&p, st, -1)
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  var term: [Int] = []
+  if read_term(&p, &term) < 0: return cend(&p, st, -1)
+  if peek(p) != 125:
+    pfail(&p, "Expected }} to end the ksh-style ${{ ..; }} command expansion")
+    return cend(&p, st, -1)
+  adv(&p)
+  let id = nodes1(&p, T_DollarBraceCommandExpansion, sp, term)
+  p.t.f[id] = bint(c == 124)
+  return cend(&p, st, id)
+
+fn read_dollar_braced(var p: P) -> Int:
+  if not starts(p, "${{"): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "parameter expansion")
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  let w = read_dollar_braced_word(&p)
+  if w < 0: return cend(&p, st, -1)
+  if char_(&p, 125) < 0: return cend(&p, st, -1)
+  let id = node(&p, T_DollarBraced, sp)
+  p.t.f[id] = 1
+  p.t.a[id] = w
+  return cend(&p, st, id)
+
+fn read_dollar_expansion(var p: P) -> Int:
+  if not starts(p, "$("): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "command expansion")
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  var cmds: [Int] = []
+  if read_compound_list_or_empty(&p, &cmds) < 0: return cend(&p, st, -1)
+  if peek(p) != 41:
+    pfail(&p, "Expected end of $(..) expression")
+    return cend(&p, st, -1)
+  adv(&p)
+  let rr_ = nodes1(&p, T_DollarExpansion, sp, cmds)
+  return cend(&p, st, rr_)
+
+# wrapString: T_NormalWord [T_Literal s] spanning sp..now
+fn wrap_string(var p: P, sp: Int, s: Str) -> Int:
+  let w = ast.add(&p.t, T_NormalWord, sp, p.pos)
+  let l = ast.add(&p.t, T_Literal, sp, p.pos)
+  p.t.s[l] = s
+  ast.set1(&p.t, w, [l])
+  return w
+
+fn read_dollar_variable(var p: P) -> Int:
+  if peek(p) != 36: return nomatch(&p)
+  let sp = p.pos
+  let pos = p.pos
+  let c = peek_at(p, 1)
+  if is_digit(c):
+    adv(&p)
+    let vsp = p.pos
+    adv(&p)
+    let w = wrap_string(&p, vsp, cstr(c))
+    let id = node(&p, T_DollarBraced, sp)
+    p.t.a[id] = w
+    if is_digit(peek(p)): note_at(&p, pos, pos, ERR, 1037, "Braces are required for positionals over 9, e.g. ${{10}}.")
+    else: nomatch(&p)
+    return id
+  if is_special_var(c):
+    adv(&p)
+    let vsp = p.pos
+    adv(&p)
+    let w = wrap_string(&p, vsp, cstr(c))
+    let id = node(&p, T_DollarBraced, sp)
+    p.t.a[id] = w
+    return id
+  if is_var_start(c):
+    adv(&p)
+    let vsp = p.pos
+    read_variable_name(&p)
+    let w = wrap_string(&p, vsp, p.sv + "")
+    let id = node(&p, T_DollarBraced, sp)
+    p.t.a[id] = w
+    if peek(p) == 91: note_at(&p, pos, pos, ERR, 1087, "Use braces when expanding arrays, e.g. ${{array[idx]}} (or ${{var}}[.. to quiet).")
+    else: nomatch(&p)
+    return id
+  return nomatch(&p)
+
+fn read_dollar_lonely(var p: P, quoted: Bool) -> Int:
+  if peek(p) != 36: return nomatch(&p)
+  let sp = p.pos
+  adv(&p)
+  let id = lit(&p, sp, "$")
+  if quoted:
+    # quoteForEscape
+    if peek(p) == 34:
+      var k = 1
+      if peek_at(p, 1) == 34: k = 2
+      let c = peek_at(p, k)
+      if (is_var_start(c) or is_digit(c) or is_special_var(c)) and c != 42 and c != 36:
+        problem_id(&p, id, STYLE, 1135, "Prefer escape over ending quote to make $ literal. Instead of \"It costs $\"5, use \"It costs \\$5\".")
+  return id
+
+fn read_dollar_braced_word(var p: P) -> Int:
+  let sp = p.pos
+  var parts: [Int] = []
+  if not many_(&p, read_dollar_braced_part, &parts): return -1
+  return nodes1(&p, T_NormalWord, sp, parts)
+
+fn is_braced_quotable(c: Int) -> Bool:
+  return c == 125 or c == 34 or c == 36 or c == 96 or c == 39
+
+fn read_dollar_braced_part(var p: P) -> Int:
+  let c = peek(p)
+  if c == 39: return read_single_quoted(&p)
+  if c == 34: return read_double_quoted(&p)
+  if in_str(c, "/:+-=%"):
+    let sp = p.pos
+    let st = p.i
+    while in_str(peek(p), "/:+-=%"): adv(&p)
+    nomatch(&p)
+    let id = node(&p, T_ParamSubSpecialChar, sp)
+    p.t.s[id] = p.src[st..p.i]
+    return id
+  let m = mark(p)
+  if is_extglob_start(c):
+    let r = read_extglob(&p)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  if c == 36:
+    let r = read_normal_dollar(&p)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  if c == 96 or c == 0xB4:
+    let r = read_backticked(&p, false)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  # readDollarBracedLiteral: (readBraceEscaped <|> anyChar) `reluctantlyTill1` bracedQuotable
+  if c < 0: return nomatch(&p)
+  if is_braced_quotable(c):
+    let e = esave(p)
+    adv(&p)
+    pfail(&p, "Unexpected ")
+    try_fail(&p, m, e)
+    return -1
+  let sp = p.pos
+  var out = ""
+  var first = true
+  while true:
+    let d = peek(p)
+    if not first and (d < 0 or is_braced_quotable(d)): break
+    first = false
+    if d < 0: return nomatch(&p)
+    if d == 92:
+      adv(&p)
+      let x = peek(p)
+      if x == 10 or x == 13:
+        let st = p.i
+        let m2 = mark(p)
+        if linefeed(&p) >= 0: continue
+        if p.i != st: return -1
+        reset(&p, m2)
+      if x >= 0 and is_braced_quotable(x):
+        put(&out, adv(&p))
+        continue
+      if x < 0: return nomatch(&p)
+      out += "\\"
+      out += adv_s(&p)
+    else: out += adv_s(&p)
+  return lit(&p, sp, out)
+
+fn read_proc_sub(var p: P) -> Int:
+  let c = peek(p)
+  if c == 60 or c == 62:
+    if peek_at(p, 1) != 40:
+      # try (oneOf "<>" >> char '('): the error is after the first character
+      merr(&p, p.pos + 1, true, "")
+      return -1
+  else: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "process substitution")
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  var cmds: [Int] = []
+  if read_compound_list_or_empty(&p, &cmds) < 0: return cend(&p, st, -1)
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  if char_(&p, 41) < 0: return cend(&p, st, -1)
+  let id = nodes1(&p, T_ProcSub, sp, cmds)
+  p.t.s[id] = cstr(c)
+  return cend(&p, st, id)
+
+# readBraced = try braceExpansion
+fn read_braced(var p: P) -> Int:
+  return try_(&p, brace_expansion)
+
+fn brace_expansion(var p: P) -> Int:
+  let sp = p.pos
+  if char_(&p, 123) < 0: return -1
+  var elems: [Int] = []
+  let x = braced_element(&p)
+  if x < 0: return -1
+  elems.push(x)
+  while peek(p) == 44:
+    adv(&p)
+    let y = braced_element(&p)
+    if y < 0: return -1
+    elems.push(y)
+    eclr(&p)
+  nomatch(&p)
+  var ok = elems.len >= 2
+  if elems.len == 1: ok = only_literal(p.t, elems[0]).find("..") >= 0
+  if not ok: return mzero(&p)
+  if char_(&p, 125) < 0: return -1
+  return nodes1(&p, T_BraceExpansion, sp, elems)
+
+fn braced_element(var p: P) -> Int:
+  let sp = p.pos
+  var parts: [Int] = []
+  while true:
+    let m = mark(p)
+    let c = peek(p)
+    var r = -1
+    if c == 123: r = brace_expansion(&p)
+    elif c == 36: r = read_dollar_expression(&p)
+    elif c == 39: r = read_single_quoted(&p)
+    elif c == 34: r = read_double_quoted(&p)
+    else:
+      nomatch(&p)
+      let lsp = p.pos
+      if read_generic_literal1(&p, 2) >= 0: r = lit(&p, lsp, p.sv + "")
+    if r < 0 and p.i == m.i and (c == 123 or c == 36):
+      reset(&p, m)
+      let lsp = p.pos
+      if read_generic_literal1(&p, 2) >= 0: r = lit(&p, lsp, p.sv + "")
+    if r < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      break
+    parts.push(r)
+    eclr(&p)
+  return nodes1(&p, T_NormalWord, sp, parts)
+
+
+# ---------------------------------------------------------------- here documents
+
+fn unquote_token(s: Str, var quoted: Bool) -> Str:
+  quoted = false
+  if s.len < 2: return s
+  let first = s[0]
+  let lastb = s[s.len - 1]
+  if (first == '"' or first == '\'') and lastb == first and s.len >= 2:
+    quoted = true
+    return s[1..s.len - 1]
+  if s.find("\\") >= 0:
+    quoted = true
+    return s.replace("\\", "")
+  return s
+
+fn read_here_doc(var p: P) -> Int:
+  if not starts(p, "<<"): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "here document")
+  let pos = p.pos
+  adv(&p)
+  adv(&p)
+  var dashed = false
+  if peek(p) == 45:
+    adv(&p)
+    dashed = true
+  else: nomatch(&p)
+  spacing(&p)
+  let sp = p.sv + ""
+  if peek(p) == 40:
+    problem_at(&p, pos, pos, ERR, 1038, "Shells are space sensitive. Use '< <(cmd)', not '<<" + sp + "(cmd)'.")
+  else: nomatch(&p)
+  let start = p.pos
+  if read_string_for(&p, read_normal_word) < 0: return cend(&p, st, -1)
+  var tok = p.sv + ""
+  if peek(p) == 13:
+    carriage_return(&p)
+    tok += "\r"
+  else: nomatch(&p)
+  var quoted = false
+  let endtok = unquote_token(tok, &quoted)
+  let hid = node(&p, T_HereDoc, start)
+  p.t.f[hid] = bint(dashed) | (2 * bint(quoted))
+  p.t.s[hid] = endtok
+  p.pends.push(Pend(hid, dashed, quoted, endtok + "", copy_ctx(p.ctx)))
+  p.pend.push(p.pends.len - 1)
+  return cend(&p, st, hid)
+
+fn read_pending_heredocs(var p: P) -> Int:
+  if p.plo >= p.pend.len: return 0
+  var docs: [Int] = []
+  for k in p.plo..p.pend.len: docs.push(p.pend[k])
+  p.plo = p.pend.len
+  for d in docs:
+    if read_doc(&p, d) < 0: return -1
+  return 0
+
+fn e4m(s: Str) -> Str:
+  var out = ""
+  var j = 0
+  while j < s.len:
+    let d = dec(s, j)
+    let c = d & 0xFFFFFF
+    j += d >> 24
+    if c == 92: out += "\\\\"
+    elif c == 10: out += "\\n"
+    elif c == 13: out += "\\r"
+    elif c == 9: out += "\\t"
+    elif c == 27: out += "\\e"
+    elif c < 32 or c == 127 or (c >= 128 and not is_letter(c)) or (c >= 128 and c < 160):
+      if c < 256:
+        out += "\\x"
+        out += hexpad(c, 2)
+      else:
+        out += "\\U"
+        out += hexpad(c, 4)
+    else: put(&out, c)
+  return out
+
+fn hexpad(c: Int, n: Int) -> Str:
+  let digits = "0123456789ABCDEF"
+  var r = ""
+  var x = c
+  while x > 0:
+    r = digits[x % 16..x % 16 + 1] + r
+    x = x / 16
+  while r.len < n: r = "0" + r
+  return r
+
+fn read_doc(var p: P, di: Int) -> Int:
+  var saved = copy_ctx(p.ctx)
+  var dctx = copy_ctx(p.pends[di].ctx)
+  swap(&p.ctx, &dctx)
+  let st = p.i
+  let hid = p.pends[di].node
+  let dashed = p.pends[di].dashed
+  let quoted = p.pends[di].quoted
+  let tok = p.pends[di].tok + ""
+  let doc_start = p.pos
+  var lines: [Str] = []
+  var terminated = false
+  var warned = false
+  while true:
+    let pos = p.pos
+    let ls = p.i
+    while peek(p) >= 0 and peek(p) != 10: adv(&p)
+    let line = p.src[ls..p.i]
+    if peek(p) == 10: adv(&p)
+    let is_eof = at_eof(p)
+    var w = false
+    let is_end = check_end(&p, pos, line, dashed, tok, &w)
+    if w: warned = true
+    if is_end:
+      terminated = true
+      break
+    lines.push(line)
+    if is_eof: break
+  let doc_end = p.pos
+  var data = ""
+  for l in lines:
+    data += l
+    data += "\n"
+  if not terminated:
+    if not warned: debug_heredoc(&p, hid, tok, data)
+    pfail(&p, "Here document was not correctly terminated")
+    if p.i == st: swap(&p.ctx, &saved)
+    return -1
+  var items: [Int] = []
+  if quoted:
+    let l = ast.add(&p.t, T_Literal, doc_start, doc_end)
+    p.t.s[l] = data
+    items.push(l)
+  else:
+    var s = sub_begin(&p, doc_start, data)
+    let ok = many_(&p, here_part, &items)
+    sub_end(&p, &s)
+    if not ok: return -1
+  ast.set1(&p.t, hid, items)
+  swap(&p.ctx, &saved)
+  return 0
+
+fn here_part(var p: P) -> Int:
+  let m = mark(p)
+  let r = double_quoted_part(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  let sp = p.pos
+  let st = p.i
+  while true:
+    let c = peek(p)
+    if c < 0 or c == 96 or c == 36 or c == 92: break
+    adv(&p)
+  nomatch(&p)
+  if p.i == st: return -1
+  return lit(&p, sp, p.src[st..p.i])
+
+fn check_end(var p: P, pos: Int, line: Str, dashed: Bool, tok: Str, var warned: Bool) -> Bool:
+  warned = false
+  let nn = p.notes.len
+  var s = sub_begin(&p, pos, line + "")
+  let lead_pos = p.pos
+  var lead = ""
+  while not starts(p, tok) and is_linews(peek(p)):
+    if almost_space(&p): lead += " "
+    else: put(&lead, adv(&p))
+  var r = false
+  let matched = starts(p, tok)
+  if matched:
+    let te = p.i + tok.len
+    while p.i < te: adv(&p)
+    let trail_sp_pos = p.pos
+    var trail_sp = ""
+    while is_linews(peek(p)):
+      if almost_space(&p): trail_sp += " "
+      else: put(&trail_sp, adv(&p))
+    let trailer_pos = p.pos
+    let trailer = p.src[p.i..p.src.len]
+    var tabs = true
+    for k in 0..lead.len:
+      if lead[k] != '\t': tabs = false
+    let leader_ok = lead.len == 0 or (dashed and tabs)
+    let no_trailer = trail_sp.len == 0 and trailer.len == 0
+    if leader_ok and no_trailer: r = true
+    else:
+      var ts = byte(0)
+      if trailer.len > 0: ts = trailer[0]
+      let has_ts = trail_sp.len > 0
+      let has_tr = trailer.len > 0
+      if ts == ')':
+        problem_at(&p, trailer_pos, trailer_pos, ERR, 1119, "Add a linefeed between end token and terminating ')'.")
+        warned = true
+      elif ts == '#':
+        problem_at(&p, trailer_pos, trailer_pos, ERR, 1120, "No comments allowed after here-doc token. Comment the next line instead.")
+        warned = true
+      elif ts == ';' or ts == '>' or ts == '|' or ts == '&':
+        problem_at(&p, trailer_pos, trailer_pos, ERR, 1121, "Add ;/& terminators (and other syntax) on the line with the <<, not here.")
+        warned = true
+      elif has_ts and has_tr:
+        problem_at(&p, trailer_pos, trailer_pos, ERR, 1122, "Nothing allowed after end token. To continue a command, put it on the line with the <<.")
+        warned = true
+      elif leader_ok and has_ts and not has_tr:
+        problem_at(&p, trail_sp_pos, trail_sp_pos, ERR, 1118, "Delete whitespace after the here-doc end token.")
+        r = true
+        warned = true
+      elif not has_ts and has_tr: r = false
+      elif not dashed and lead.len > 0:
+        problem_at(&p, lead_pos, lead_pos, ERR, 1039, "Remove indentation before end token (or use <<- and indent with tabs).")
+        warned = true
+      elif dashed and not tabs:
+        problem_at(&p, lead_pos, lead_pos, ERR, 1040, "When using <<-, you can only indent with tabs.")
+        warned = true
+  sub_end(&p, &s)
+  if not matched: p.notes.truncate(nn)
+  return r
+
+fn lines_of(s: Str) -> [Str]:
+  var r = s.split("\n")
+  if r.len > 0 and r[r.len - 1].len == 0: r.pop()
+  return r
+
+fn debug_heredoc(var p: P, hid: Int, tok: Str, doc: Str):
+  if doc.find(tok) >= 0:
+    problem_id(&p, hid, ERR, 1041, "Found '" + e4m(tok) + "' further down, but not on a separate line.")
+    for l in lines_of(doc):
+      if l.find(tok) >= 0:
+        problem_id(&p, hid, ERR, 1042, "Close matches include '" + e4m(l) + "' (!= '" + e4m(tok) + "').")
+  elif ucd.str_lower(doc).find(ucd.str_lower(tok)) >= 0:
+    problem_id(&p, hid, ERR, 1043, "Found " + e4m(tok) + " further down, but with wrong casing.")
+  else:
+    problem_id(&p, hid, ERR, 1044, "Couldn't find end token `" + e4m(tok) + "' in the here document.")
+
+# ---------------------------------------------------------------- redirections
+
+fn try_token(var p: P, s: Str, kind: Int) -> Int:
+  if not starts(p, s): return nomatch(&p)
+  let sp = p.pos
+  for k in 0..s.len: adv(&p)
+  let id = node(&p, kind, sp)
+  spacing(&p)
+  return id
+
+fn redir_token(var p: P, c: Int, kind: Int) -> Int:
+  if peek(p) != c: return nomatch(&p)
+  let m = mark(p)
+  let e = esave(p)
+  let sp = p.pos
+  adv(&p)
+  let id = node(&p, kind, sp)
+  if peek(p) == 40:
+    adv(&p)
+    pfail(&p, "Unexpected ")
+    return try_fail(&p, m, e)
+  nomatch(&p)
+  return id
+
+fn read_io_file_op(var p: P) -> Int:
+  let c = peek(p)
+  if c == 62 and peek_at(p, 1) == 62: return try_token(&p, ">>", T_DGREAT)
+  if c == 60 and peek_at(p, 1) == 62: return try_token(&p, "<>", T_LESSGREAT)
+  if c == 62 and peek_at(p, 1) == 38: return try_token(&p, ">&", T_GREATAND)
+  if c == 60 and peek_at(p, 1) == 38: return try_token(&p, "<&", T_LESSAND)
+  if c == 62 and peek_at(p, 1) == 124: return try_token(&p, ">|", T_CLOBBER)
+  if c == 60: return redir_token(&p, 60, T_Less)
+  if c == 62: return redir_token(&p, 62, T_Greater)
+  return nomatch(&p)
+
+fn read_io_variable(var p: P) -> Int:
+  if peek(p) != 123: return nomatch(&p)
+  let m = mark(p)
+  let e = esave(p)
+  adv(&p)
+  if read_variable_name(&p) < 0: return try_fail(&p, m, e)
+  let x = p.sv + ""
+  if char_(&p, 125) < 0: return try_fail(&p, m, e)
+  p.sv = "{{" + x + "}}"
+  return 0
+
+fn read_io_duplicate(var p: P) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  let sp = p.pos
+  var op = -1
+  if starts(p, ">&"): op = try_token(&p, ">&", T_GREATAND)
+  elif starts(p, "<&"): op = try_token(&p, "<&", T_LESSAND)
+  else: return nomatch(&p)
+  var target = ""
+  if read_io_variable(&p) >= 0: target = p.sv + ""
+  else:
+    let st = p.i
+    while is_digit(peek(p)): adv(&p)
+    nomatch(&p)
+    target = p.src[st..p.i]
+    if peek(p) == 45:
+      adv(&p)
+      target += "-"
+    elif target.len == 0:
+      nomatch(&p)
+      return try_fail(&p, m, e)
+    else: nomatch(&p)
+  let id = node(&p, T_IoDuplicate, sp)
+  p.t.a[id] = op
+  p.t.s[id] = target
+  return id
+
+fn read_io_file(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "redirection")
+  let sp = p.pos
+  let op = read_io_file_op(&p)
+  if op < 0: return cend(&p, st, -1)
+  spacing(&p)
+  let f = read_normal_word(&p)
+  if f < 0: return cend(&p, st, -1)
+  let id = node(&p, T_IoFile, sp)
+  p.t.a[id] = op
+  p.t.b[id] = f
+  return cend(&p, st, id)
+
+fn io_op_ahead(var p: P) -> Int:
+  if starts(p, "<<"):
+    adv(&p)
+    adv(&p)
+    return 0
+  return read_io_file_op(&p)
+
+fn read_io_source(var p: P) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  var x = ""
+  if peek(p) == 38:
+    adv(&p)
+    x = "&"
+  elif read_io_variable(&p) >= 0: x = p.sv + ""
+  else:
+    let st = p.i
+    while is_digit(peek(p)): adv(&p)
+    nomatch(&p)
+    x = p.src[st..p.i]
+  if not look(&p, io_op_ahead): return try_fail(&p, m, e)
+  p.sv = x
+  return 0
+
+fn read_here_string(var p: P) -> Int:
+  if not starts(p, "<<<"): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "here string")
+  let sp = p.pos
+  adv(&p)
+  adv(&p)
+  adv(&p)
+  let id = node(&p, ast.T_HereString, sp)
+  spacing(&p)
+  let w = read_normal_word(&p)
+  if w < 0: return cend(&p, st, -1)
+  p.t.a[id] = w
+  return cend(&p, st, id)
+
+fn read_io_redirect(var p: P) -> Int:
+  let sp = p.pos
+  if read_io_source(&p) < 0: return -1
+  let n = p.sv + ""
+  let m = mark(p)
+  var r = read_here_string(&p)
+  if r < 0 and p.i == m.i:
+    reset(&p, m)
+    r = read_here_doc(&p)
+  if r < 0 and p.i == m.i:
+    reset(&p, m)
+    r = read_io_duplicate(&p)
+  if r < 0 and p.i == m.i:
+    reset(&p, m)
+    r = read_io_file(&p)
+  if r < 0: return -1
+  let id = node(&p, T_FdRedirect, sp)
+  p.t.s[id] = n
+  p.t.a[id] = r
+  if skip_annotation_and_warn(&p) < 0: return -1
+  spacing(&p)
+  return id
+
+# ---------------------------------------------------------------- separators
+
+fn read_newline_list(var p: P) -> Int:
+  var n = 0
+  while true:
+    let st = p.i
+    let m = mark(p)
+    var r = linefeed(&p)
+    if r < 0 and p.i == st:
+      reset(&p, m)
+      r = carriage_return(&p)
+    if r < 0:
+      if p.i != st: return -1
+      reset(&p, m)
+      break
+    spacing(&p)
+    if n > 0: eclr(&p)
+    n += 1
+  if n == 0: return -1
+  # checkBadBreak
+  let c = peek(p)
+  if c == 124 or c == 38:
+    if not starts(p, "&>"):
+      problem(&p, ERR, 1133, "Unexpected start of line. If breaking lines, |/||/&& should be at the end of the previous one.")
+  else: nomatch(&p)
+  return 0
+
+fn read_line_break(var p: P) -> Int:
+  let m = mark(p)
+  if read_newline_list(&p) < 0:
+    if p.i != m.i: return -1
+    reset(&p, m)
+  return 0
+
+fn g_dsemi(var p: P) -> Int:
+  return try_token(&p, ";;", T_DSEMI)
+
+fn g_esac(var p: P) -> Int:
+  return try_word_token(&p, "esac", T_Esac)
+
+fn line_break_esac(var p: P) -> Int:
+  if read_line_break(&p) < 0: return -1
+  return g_esac(&p)
+
+# readCaseSeparator: 1 break, 2 fallthrough, 3 continue; -1
+fn read_case_separator(var p: P) -> Int:
+  if starts(p, ";;&"):
+    try_token(&p, ";;&", T_Semi)
+    return 3
+  if starts(p, ";&"):
+    try_token(&p, ";&", T_Semi)
+    return 2
+  if starts(p, ";;"):
+    g_dsemi(&p)
+    return 1
+  nomatch(&p)
+  if look(&p, line_break_esac): return 1
+  return -1
+
+fn and_if_or_case_sep(var p: P) -> Int:
+  if starts(p, "&&"): return try_token(&p, "&&", T_AND_IF)
+  nomatch(&p)
+  return read_case_separator(&p)
+
+fn amp_gt(var p: P) -> Int:
+  return string_(&p, "&>")
+
+# readSeparatorOp: the separator ('&' or ';'), its span in p.sep_sp/p.sv
+fn read_separator_op(var p: P, var sp: Int, var ep: Int) -> Int:
+  if unexpecting(&p, "", and_if_or_case_sep) < 0: return -1
+  if unexpecting(&p, "", amp_gt) < 0: return -1
+  sp = p.pos
+  var f = -1
+  if peek(p) == 38:
+    let m = mark(p)
+    let e = esave(p)
+    let pos = p.pos
+    adv(&p)
+    if starts(p, "amp;") or starts(p, "gt;") or starts(p, "lt;"):
+      problem_at(&p, pos, pos, ERR, 1109, "This is an unquoted HTML entity. Replace with corresponding character.")
+    elif is_var_start(peek(p)):
+      problem_at(&p, pos, pos, WARN, 1132, "This & terminates the command. Escape it or add space after & to silence.")
+    spacing(&p)
+    let pos2 = p.pos
+    if peek(p) == 59 and peek_at(p, 1) != 59:
+      adv(&p)
+      problem_at(&p, pos2, pos2, ERR, 1045, "It's not 'foo &; bar', just 'foo & bar'.")
+      f = 38
+    else:
+      if peek(p) == 59:
+        adv(&p)
+        adv(&p)
+        pfail(&p, "Unexpected ")
+      else: nomatch(&p)
+      try_fail(&p, m, e)
+      adv(&p)
+      f = 38
+  elif peek(p) == 59:
+    adv(&p)
+    f = 59
+  else: return nomatch(&p)
+  ep = p.pos
+  spacing(&p)
+  return f
+
+fn read_separator(var p: P, var sp: Int, var ep: Int) -> Int:
+  let m = mark(p)
+  let f = read_separator_op(&p, &sp, &ep)
+  if f >= 0:
+    if read_line_break(&p) < 0: return -1
+    return f
+  if p.i != m.i: return -1
+  reset(&p, m)
+  sp = p.pos
+  if read_newline_list(&p) < 0: return -1
+  ep = p.pos
+  return 10
+
+fn g_semi(var p: P) -> Int:
+  if starts(p, ";;"):
+    # notFollowedBy2 g_DSEMI
+    let e = esave(p)
+    let m = mark(p)
+    g_dsemi(&p)
+    pfail(&p, "Unexpected ")
+    try_fail(&p, m, e)
+    return -1
+  return try_token(&p, ";", T_Semi)
+
+fn read_sequential_sep(var p: P) -> Int:
+  let m = mark(p)
+  if g_semi(&p) >= 0: return read_line_break(&p)
+  if p.i != m.i: return -1
+  reset(&p, m)
+  return read_newline_list(&p)
+
+# ---------------------------------------------------------------- keywords
+
+fn keyword_separator(var p: P) -> Int:
+  if at_eof(p):
+    merr(&p, p.pos, false, "")
+    return 0
+  nomatch(&p)
+  let m = mark(p)
+  let e = esave(p)
+  if allspacing_or_fail(&p) >= 0: return 0
+  try_fail(&p, m, e)
+  let c = peek(p)
+  if c == 59 or c == 40 or c == 41 or c == 91 or c == 60 or c == 62 or c == 38 or c == 124:
+    adv(&p)
+    return 0
+  return nomatch(&p)
+
+fn lower_ascii(b: Int) -> Int:
+  if b >= 65 and b <= 90: return b + 32
+  return b
+
+# tryParseWordToken keyword `thenSkip` spacing
+fn try_word_token(var p: P, kw: Str, kind: Int) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  let pos = p.pos
+  let sp = p.pos
+  var exact = true
+  for k in 0..kw.len:
+    let c = peek(p)
+    let w = int(kw[k])
+    if c < 0 or lower_ascii(c) != w or c > 127:
+      nomatch(&p)
+      return try_fail(&p, m, e)
+    if c != w: exact = false
+    adv(&p)
+  let id = node(&p, kind, sp)
+  let c = peek(p)
+  if c == 91: problem(&p, ERR, 1069, "You need a space before the [.")
+  elif c == 35: problem(&p, ERR, 1099, "You need a space before the #.")
+  elif c == 33: problem(&p, ERR, 1129, "You need a space before the !.")
+  elif c == 58: problem(&p, ERR, 1130, "You need a space before the :.")
+  if not look(&p, keyword_separator): return try_fail(&p, m, e)
+  if not exact:
+    let st = p.src[m.i..p.i]
+    problem_at(&p, pos, pos, ERR, 1081, "Scripts are case sensitive. Use '" + kw + "', not '" + st + "' (or quote if literal).")
+    pfail(&p, "")
+    return try_fail(&p, m, e)
+  spacing(&p)
+  return id
+
+fn g_rbrace(var p: P) -> Int:
+  if peek(p) != 125: return nomatch(&p)
+  let sp = p.pos
+  adv(&p)
+  return node(&p, T_Rbrace, sp)
+
+fn g_then(var p: P) -> Int:
+  return try_word_token(&p, "then", T_Then)
+
+fn g_else(var p: P) -> Int:
+  return try_word_token(&p, "else", T_Else)
+
+fn g_elif(var p: P) -> Int:
+  return try_word_token(&p, "elif", T_Elif)
+
+fn g_fi(var p: P) -> Int:
+  return try_word_token(&p, "fi", T_Fi)
+
+fn g_do(var p: P) -> Int:
+  return try_word_token(&p, "do", T_Do)
+
+fn g_done(var p: P) -> Int:
+  return try_word_token(&p, "done", T_Done)
+
+fn g_if(var p: P) -> Int:
+  return try_word_token(&p, "if", T_If)
+
+fn g_lparen(var p: P) -> Int:
+  return try_token(&p, "(", T_Lparen)
+
+fn g_rparen(var p: P) -> Int:
+  return try_token(&p, ")", T_Rparen)
+
+fn g_in(var p: P) -> Int:
+  let r = try_word_token(&p, "in", T_In)
+  if r < 0: return -1
+  if skip_annotation_and_warn(&p) < 0: return -1
+  return r
+
+fn g_lbrace(var p: P) -> Int:
+  return try_word_token(&p, "{{", T_Lbrace)
+
+fn fi_elif_else(var p: P) -> Int:
+  let st = p.i
+  var r = g_fi(&p)
+  if r >= 0 or p.i != st: return r
+  r = g_elif(&p)
+  if r >= 0 or p.i != st: return r
+  return g_else(&p)
+
+fn read_keyword(var p: P) -> Int:
+  let c = peek(p)
+  let st = p.i
+  if c == 116 or c == 84:
+    return g_then(&p)
+  if c == 101 or c == 69:
+    var r = g_else(&p)
+    if r >= 0 or p.i != st: return r
+    r = g_elif(&p)
+    if r >= 0 or p.i != st: return r
+    return g_esac(&p)
+  if c == 102 or c == 70: return g_fi(&p)
+  if c == 100 or c == 68:
+    let r = g_do(&p)
+    if r >= 0 or p.i != st: return r
+    return g_done(&p)
+  if c == 125: return g_rbrace(&p)
+  if c == 41: return g_rparen(&p)
+  if c == 59: return g_dsemi(&p)
+  return nomatch(&p)
+
+fn skip_annotation_and_warn(var p: P) -> Int:
+  if look(&p, read_annotation_prefix):
+    problem(&p, ERR, 1126, "Place shellcheck directives before commands, not after.")
+    return read_any_comment(&p)
+  return 0
+
+# ---------------------------------------------------------------- assignments
+
+fn read_index_span(var p: P) -> Int:
+  let sp = p.pos
+  var parts: [Int] = []
+  while true:
+    let m = mark(p)
+    var r = read_normal_word_part(&p, "]")
+    if r < 0 and p.i == m.i:
+      reset(&p, m)
+      let ssp = p.pos
+      if spacing1(&p) >= 0: r = lit(&p, ssp, p.sv + "")
+      else:
+        reset(&p, m)
+        let st = p.i
+        while is_quotable_char(peek(p)): adv(&p)
+        nomatch(&p)
+        if p.i > st: r = lit(&p, ssp, p.src[st..p.i])
+    if r < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      break
+    parts.push(r)
+    eclr(&p)
+  return nodes1(&p, T_NormalWord, sp, parts)
+
+fn read_array_index(var p: P) -> Int:
+  if peek(p) != 91: return nomatch(&p)
+  let sp = p.pos
+  adv(&p)
+  let pos = p.pos
+  if read_string_for(&p, read_index_span) < 0: return -1
+  let s = p.sv + ""
+  if char_(&p, 93) < 0: return -1
+  let id = node(&p, T_UnparsedIndex, sp)
+  p.t.f[id] = pos
+  p.t.s[id] = s
+  return id
+
+fn read_array(var p: P) -> Int:
+  if peek(p) != 40: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "array assignment")
+  let sp = p.pos
+  let opening = p.pos
+  adv(&p)
+  if peek(p) == 40:
+    problem_at(&p, opening, opening, ERR, 1116, "Missing $ on a $((..)) expression? (or use ( ( for arrays).")
+  else: nomatch(&p)
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  var words: [Int] = []
+  while true:
+    if peek(p) == 41 or at_eof(p): break
+    let m = mark(p)
+    let r = read_array_element(&p)
+    if r < 0:
+      if p.i != m.i: return cend(&p, st, -1)
+      reset(&p, m)
+      break
+    words.push(r)
+  if peek(p) != 41:
+    pfail(&p, "Expected ) to close array assignment")
+    return cend(&p, st, -1)
+  adv(&p)
+  let rr_ = nodes1(&p, T_Array, sp, words)
+  return cend(&p, st, rr_)
+
+fn read_array_regular(var p: P) -> Int:
+  let m = mark(p)
+  let r = read_array(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  return read_normal_word(&p)
+
+fn read_array_element(var p: P) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  let sp = p.pos
+  var r = -1
+  # readIndexed: try (many1 readArrayIndex >> char '=')
+  var idx: [Int] = []
+  var ok = false
+  while peek(p) == 91:
+    let x = read_array_index(&p)
+    if x < 0: break
+    idx.push(x)
+  if idx.len > 0 and peek(p) == 61:
+    adv(&p)
+    ok = true
+  if ok:
+    let m2 = mark(p)
+    var v = read_array_regular(&p)
+    if v < 0:
+      if p.i != m2.i: return -1
+      reset(&p, m2)
+      v = ast.add(&p.t, T_Literal, p.pos, p.pos)
+    let id = nodes1(&p, T_IndexedElement, sp, idx)
+    p.t.a[id] = v
+    r = id
+  else:
+    nomatch(&p)
+    try_fail(&p, m, e)
+    r = read_array_regular(&p)
+    if r < 0: return -1
+  let m3 = mark(p)
+  if allspacing(&p) < 0:
+    if p.i != m3.i: return -1
+    reset(&p, m3)
+  return r
+
+fn bang_ws(var p: P) -> Int:
+  if char_(&p, 33) < 0: return -1
+  return whitespace(&p)
+
+fn is_end_of_command(var p: P) -> Bool:
+  let c = peek(p)
+  return c < 0 or c == 13 or c == 10 or c == 59 or c == 38 or c == 124 or c == 41
+
+fn assignment_op(var p: P) -> Int:
+  if starts(p, "==="):
+    let e = esave(p)
+    let m = mark(p)
+    adv(&p)
+    adv(&p)
+    adv(&p)
+    pfail(&p, "Unexpected ===")
+    try_fail(&p, m, e)
+    return -1
+  nomatch(&p)
+  if peek(p) == 43:
+    if string_(&p, "+=") < 0: return -1
+    return 1
+  if peek(p) == 61:
+    adv(&p)
+    return 0
+  return nomatch(&p)
+
+fn read_assignment_word(var p: P, lenient: Bool) -> Int:
+  let st = p.i
+  push_name(&p, "variable assignment")
+  let m = mark(p)
+  let e = esave(p)
+  let sp = p.pos
+  var has_dollar = false
+  var dl = 0
+  var dr = 0
+  if lenient and peek(p) == 36:
+    dl = p.pos
+    adv(&p)
+    dr = p.pos
+    has_dollar = true
+  if read_variable_name(&p) < 0:
+    try_fail(&p, m, e)
+    return cend(&p, st, -1)
+  let variable = p.sv + ""
+  var idx: [Int] = []
+  while peek(p) == 91:
+    let x = read_array_index(&p)
+    if x < 0:
+      try_fail(&p, m, e)
+      return cend(&p, st, -1)
+    idx.push(x)
+  nomatch(&p)
+  spacing(&p)
+  let has_left_space = p.sv.len > 0
+  let op_start = p.pos
+  let mode = assignment_op(&p)
+  if mode < 0:
+    try_fail(&p, m, e)
+    return cend(&p, st, -1)
+  if has_dollar or has_left_space:
+    let m2 = mark(p)
+    let e2 = esave(p)
+    spacing(&p)
+    let paren = peek(p) == 40
+    if paren: look_ok(&p, m2, e2)
+    else:
+      nomatch(&p)
+      try_fail(&p, m2, e2)
+    if paren and has_dollar:
+      problem_at(&p, dl, dr, ERR, 1066, "Don't use $ on the left side of assignments.")
+    pfail(&p, "")
+    try_fail(&p, m, e)
+    return cend(&p, st, -1)
+  let id = ast.add(&p.t, T_Assignment, sp, op_start)
+  p.t.f[id] = mode
+  p.t.s[id] = variable
+  ast.set1(&p.t, id, idx)
+  let rs = p.pos
+  spacing(&p)
+  let has_right_space = p.sv.len > 0
+  let re = p.pos
+  let is_end = is_end_of_command(&p)
+  if has_right_space or is_end:
+    if variable != "IFS" and has_right_space and not is_end:
+      problem_at(&p, rs, re, WARN, 1007, "Remove space after = if trying to assign a value (for empty string, use var='' ... ).")
+    p.t.a[id] = ast.add(&p.t, T_Literal, p.pos, p.pos)
+    return cend(&p, st, id)
+  if peek(p) == 61:
+    problem(&p, ERR, 1097, "Unexpected ==. For assignment, use =. For comparison, use [/[[. Or quote for literal string.")
+  else: nomatch(&p)
+  let v = read_array_regular(&p)
+  if v < 0: return cend(&p, st, -1)
+  spacing(&p)
+  p.t.a[id] = v
+  return cend(&p, st, id)
+
+fn read_assignment_lenient(var p: P) -> Int:
+  return read_assignment_word(&p, true)
+
+# ---------------------------------------------------------------- simple commands
+
+fn read_cmd_word(var p: P) -> Int:
+  if skip_annotation_and_warn(&p) < 0: return -1
+  let w = read_normal_word(&p)
+  if w < 0: return -1
+  spacing(&p)
+  return w
+
+fn read_cmd_name(var p: P) -> Int:
+  if peek(p) == 33: look(&p, bang_ws)
+  else: nomatch(&p)
+  if peek(p) == 92:
+    let c = peek_at(p, 1)
+    if is_var_char(c) or c == 58 or c == 46: adv(&p)
+  else: nomatch(&p)
+  return read_cmd_word(&p)
+
+fn word_is(t: ast.Ast, w: Int, names: [Str]) -> Bool:
+  if t.k[w] != T_NormalWord or t.n1[w] != 1: return false
+  let l = ast.at1(t, w, 0)
+  if t.k[l] != T_Literal: return false
+  return t.s[l] in names
+
+# The words of a command suffix: kind 0 plain, 1 modifier (declare...), 2 let, 3 eval
+fn read_suffix(var p: P, kind: Int, var out: [Int]) -> Int:
+  var n = 0
+  while true:
+    let m = mark(p)
+    var r = read_io_redirect(&p)
+    if r < 0 and p.i == m.i:
+      reset(&p, m)
+      if kind == 1:
+        r = read_assignment_word(&p, false)
+        if r < 0 and p.i == m.i:
+          reset(&p, m)
+          r = read_cmd_word(&p)
+      elif kind == 2:
+        r = try_(&p, read_let_expression)
+        if r < 0 and p.i == m.i:
+          reset(&p, m)
+          r = read_cmd_word(&p)
+      else:
+        r = read_cmd_word(&p)
+        if r < 0 and p.i == m.i and kind == 3:
+          reset(&p, m)
+          if peek(p) == 40:
+            problem(&p, WARN, 1098, "Quote/escape special characters when using eval, e.g. eval \"a=(b)\".")
+            pfail(&p, "Unexpected parentheses. Make sure to quote when eval'ing as shell parsers differ.")
+          else: nomatch(&p)
+    if r < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      break
+    out.push(r)
+    if n > 0: eclr(&p)
+    n += 1
+  if n == 0: return -1
+  return 0
+
+fn read_let_expression(var p: P) -> Int:
+  let start_pos = p.pos
+  if read_string_for(&p, read_cmd_word) < 0: return -1
+  var expr = p.sv + ""
+  var npos = start_pos
+  if expr.len >= 2:
+    let f = expr[0]
+    let l = expr[expr.len - 1]
+    if (f == '\'' or f == '"') and f == l:
+      expr = expr[1..expr.len - 1]
+      npos = start_pos + 1
+  var s = sub_begin(&p, npos, expr)
+  var r = read_arithmetic_contents(&p)
+  if r >= 0 and eof(&p) < 0: r = -1
+  sub_end(&p, &s)
+  return r
+
+fn read_time_suffix(var p: P, var out: [Int]) -> Int:
+  while peek(p) == 45:
+    let w = read_cmd_word(&p)
+    if w < 0: return -1
+    out.push(w)
+  nomatch(&p)
+  let pl = read_pipeline(&p)
+  if pl < 0: return -1
+  out.push(pl)
+  return 0
+
+fn validate_command(var p: P, cmd: Int):
+  if p.t.k[cmd] != T_NormalWord or p.t.n1[cmd] == 0: return
+  let first = ast.at1(p.t, cmd, 0)
+  if p.t.k[first] != T_Literal: return
+  let s = p.t.s[first] + ""
+  if p.t.n1[cmd] == 1 and s == "//":
+    problem_id(&p, cmd, ERR, 1127, "Was this intended as a comment? Use # in sh.")
+    return
+  if p.t.n1[cmd] >= 2 and s == "/":
+    let second = ast.at1(p.t, cmd, 1)
+    if p.t.k[second] == T_Glob and p.t.s[second] == "*":
+      problem_id(&p, cmd, ERR, 1127, "Was this intended as a comment? Use # in sh.")
+      return
+  var j = 0
+  var low = ""
+  while j < s.len:
+    let d = dec(s, j)
+    let c = d & 0xFFFFFF
+    if not is_letter(c): break
+    put(&low, ucd.to_lower(c))
+    j += d >> 24
+  if low == "elsif" or low == "elseif":
+    problem_id(&p, cmd, ERR, 1131, "Use 'elif' to start another branch.")
+
+fn astlib_lower(c: Int) -> Int:
+  if c >= 65 and c <= 90: return c + 32
+  return c
+
+fn make_simple_command(var p: P, prefix: [Int], cmd: Int, suffix: [Int]) -> Int:
+  var all: [Int] = []
+  for x in prefix: all.push(x)
+  if cmd >= 0: all.push(cmd)
+  for x in suffix: all.push(x)
+  var redirs: [Int] = []
+  var assigns: [Int] = []
+  var args: [Int] = []
+  for x in prefix:
+    if p.t.k[x] == T_Assignment: assigns.push(x)
+  for x in prefix:
+    if p.t.k[x] == T_FdRedirect: redirs.push(x)
+  for x in suffix:
+    if p.t.k[x] == T_FdRedirect: redirs.push(x)
+  if cmd >= 0: args.push(cmd)
+  for x in prefix:
+    if p.t.k[x] != T_Assignment and p.t.k[x] != T_FdRedirect: args.push(x)
+  for x in suffix:
+    if p.t.k[x] != T_FdRedirect: args.push(x)
+  let r = span_list(&p, T_Redirecting, all)
+  let sc = ast.add(&p.t, T_SimpleCommand, p.t.sp[r], p.t.ep[r])
+  ast.set1(&p.t, sc, assigns)
+  ast.set2(&p.t, sc, args)
+  ast.set1(&p.t, r, redirs)
+  p.t.a[r] = sc
+  return r
+
+fn read_simple_command(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "simple command")
+  var prefix: [Int] = []
+  while true:
+    let m = mark(p)
+    var r = read_io_redirect(&p)
+    if r < 0 and p.i == m.i:
+      reset(&p, m)
+      r = read_assignment_word(&p, true)
+    if r < 0:
+      if p.i != m.i: return cend(&p, st, -1)
+      reset(&p, m)
+      break
+    prefix.push(r)
+    if prefix.len > 1: eclr(&p)
+  if skip_annotation_and_warn(&p) < 0: return cend(&p, st, -1)
+  let m = mark(p)
+  var cmd = read_cmd_name(&p)
+  if cmd < 0:
+    if p.i != m.i: return cend(&p, st, -1)
+    reset(&p, m)
+  if prefix.len == 0 and cmd < 0:
+    pfail(&p, "Expected a command")
+    return cend(&p, st, -1)
+  if cmd < 0:
+    let empty: [Int] = []
+    let rr_ = make_simple_command(&p, prefix, -1, empty)
+    return cend(&p, st, rr_)
+  validate_command(&p, cmd)
+  # firstArgument <- ignoreProblemsOf . optionMaybe . try . lookAhead $ readCmdWord
+  var first_arg = -1
+  var saved = copy_ctx(p.ctx)
+  let np = p.probs.len
+  let m2 = mark(p)
+  let e2 = esave(p)
+  let fa = read_cmd_word(&p)
+  if fa >= 0:
+    first_arg = fa
+    look_ok(&p, m2, e2)
+  else: try_fail(&p, m2, e2)
+  swap(&p.ctx, &saved)
+  p.probs.truncate(np)
+  var disp = cmd
+  if word_is(p.t, cmd, ["builtin"]) and first_arg >= 0: disp = first_arg
+  var suffix: [Int] = []
+  let m3 = mark(p)
+  var sr = 0
+  if word_is(p.t, disp, ["declare", "export", "local", "readonly", "typeset"]): sr = read_suffix(&p, 1, &suffix)
+  elif word_is(p.t, disp, ["time"]): sr = read_time_suffix(&p, &suffix)
+  elif word_is(p.t, disp, ["let"]): sr = read_suffix(&p, 2, &suffix)
+  elif word_is(p.t, disp, ["eval"]): sr = read_suffix(&p, 3, &suffix)
+  else: sr = read_suffix(&p, 0, &suffix)
+  if sr < 0:
+    if p.i != m3.i: return cend(&p, st, -1)
+    reset(&p, m3)
+    suffix.truncate(0)
+  let result = make_simple_command(&p, prefix, cmd, suffix)
+  if word_is(p.t, cmd, ["source", "."]):
+    let rr_ = read_source(&p, result)
+    return cend(&p, st, rr_)
+  if word_is(p.t, cmd, ["trap"]): syntax_check_trap(&p, result)
+  return cend(&p, st, result)
+
+fn trap_sub(var p: P) -> Int:
+  var cmds: [Int] = []
+  if read_compound_list_or_empty(&p, &cmds) < 0: return -1
+  verify_eof(&p)
+  return 0
+
+fn syntax_check_trap(var p: P, red: Int):
+  let sc = p.t.a[red]
+  if p.t.n2[sc] < 2: return
+  let arg = ast.at2(p.t, sc, 1)
+  if s = get_literal(p.t, arg):
+    if s.startswith("-"): return
+    var sub = sub_begin(&p, p.t.sp[arg], s)
+    try_with_errors(&p, trap_sub)
+    sub_end(&p, &sub)
+
+fn is_string_expansion(t: ast.Ast, n: Int) -> Bool:
+  let k = t.k[n]
+  if k == T_DollarExpansion or k == T_DollarBraceCommandExpansion or k == T_Backticked or k == T_DollarArithmetic: return true
+  if k == T_DollarBraced: return not is_array_expansion(t, n)
+  return false
+
+fn is_array_expansion(t: ast.Ast, n: Int) -> Bool:
+  if t.k[n] != T_DollarBraced: return false
+  let s = astlib.oversimp(t, t.a[n])
+  return s.startswith("@") or (not s.startswith("#") and s.find("[@]") >= 0)
+
+fn word_parts(t: ast.Ast, n: Int, var out: [Int]):
+  let k = t.k[n]
+  if k == T_NormalWord or k == TA_Expansion:
+    for i in 0..t.n1[n]: word_parts(t, ast.at1(t, n, i), &out)
+  elif k == T_DoubleQuoted:
+    for i in 0..t.n1[n]: out.push(ast.at1(t, n, i))
+  else: out.push(n)
+
+fn source_override(p: P) -> Str?:
+  var k = p.ctx.len - 1
+  while k >= 0:
+    let c = p.ctx[k]
+    if c.kind == CX_SOURCE: return nil
+    if c.kind == CX_ANN:
+      for a in p.t.anns[c.ann]:
+        if a.kind == ANN_SOURCE: return a.s + ""
+    k -= 1
+  return nil
+
+fn read_source(var p: P, red: Int) -> Int:
+  let sc = p.t.a[red]
+  let cmd = ast.at2(p.t, sc, 0)
+  var file = -1
+  if p.t.n2[sc] >= 2:
+    let first = ast.at2(p.t, sc, 1)
+    var fs = get_literal(p.t, first) else "\0"
+    if fs == "--":
+      if p.t.n2[sc] >= 3: file = ast.at2(p.t, sc, 2)
+    elif fs == "-p":
+      if p.t.n2[sc] >= 4: file = ast.at2(p.t, sc, 3)
+    else: file = first
+  var name = ""
+  var have = false
+  if o = source_override(p):
+    name = o
+    have = true
+  elif file >= 0:
+    if s = get_literal(p.t, file):
+      name = s
+      have = true
+    else:
+      var parts: [Int] = []
+      word_parts(p.t, file, &parts)
+      if parts.len > 0 and is_string_expansion(p.t, parts[0]):
+        var rest = ""
+        var ok = true
+        for k in 1..parts.len:
+          if not astlib.lit_def(p.t, parts[k], "", &rest): ok = false
+        if ok and rest.startswith("/"):
+          name = "." + rest
+          have = true
+  if have and name.startswith("~/"): have = false
+  var file_id = cmd
+  if file >= 0: file_id = file
+  if not have:
+    note_id(&p, file_id, WARN, 1090, "ShellCheck can't follow non-constant source. Use a directive to specify location.")
+    return red
+  if not should_follow(&p, name):
+    note_id(&p, file_id, INFO, 1093, "This file appears to be recursively sourced. Ignoring.")
+    return red
+  var res = ast.SrcRes(true, name + "", "")
+  if name != "/dev/null":
+    # getCurrentAnnotations True: every annotation on the stack, innermost first
+    var paths: [Str] = []
+    var ext = -1
+    var k = p.ctx.len - 1
+    while k >= 0:
+      let c = p.ctx[k]
+      if c.kind == CX_ANN:
+        for a in p.t.anns[c.ann]:
+          if a.kind == ANN_SOURCEPATH: paths.push(a.s + "")
+          if a.kind == ANN_EXTERNAL and ext < 0: ext = a.lo
+      k -= 1
+    res = p.rd(ext, paths, name)
+  if not res.ok:
+    note_id(&p, file_id, INFO, 1091, "Not following: " + res.text)
+    return red
+  let r = sub_read(&p, red, res.path, res.text)
+  if r >= 0: return r
+  note_id(&p, file_id, WARN, 1094, "Parsing of sourced file failed. Ignoring it.")
+  return red
+
+fn should_follow(var p: P, name: Str) -> Bool:
+  var n = 0
+  for c in p.ctx:
+    if c.kind == CX_SOURCE:
+      if c.s == name: return false
+      n += 1
+  if n >= 100:
+    problem(&p, ERR, 1092, "Stopping at 100 'source' frames :O")
+    return false
+  return true
+
+# subRead: parse a sourced file in its own context; its problems are forgotten, its notes kept
+# (they're dropped unless --check-sourced, by the source context)
+fn sub_read(var p: P, red: Int, name: Str, own text: Str) -> Int:
+  if p.files.len >= 2047: return -1
+  let fi = p.files.len
+  p.files.push(name + "")
+  p.texts.push(text + "")
+  let nprobs = p.probs.len
+  let nnotes = p.notes.len
+  let e = esave(p)
+  var oldctx = copy_ctx(p.ctx)
+  var pend: [Int] = []
+  swap(&pend, &p.pend)
+  var pends: [Pend] = []
+  swap(&pends, &p.pends)
+  let oplo = p.plo
+  p.plo = 0
+  var assoc: [Str] = []
+  swap(&assoc, &p.assoc)
+  p.ctx.push(Ctx(CX_SOURCE, 0, name + "", -1))
+  var s = sub_begin(&p, (fi << 52) | pk(1, 1), text)
+  let root = read_script_file(&p, true)
+  sub_end(&p, &s)
+  swap(&p.ctx, &oldctx)
+  swap(&pend, &p.pend)
+  swap(&pends, &p.pends)
+  p.plo = oplo
+  swap(&assoc, &p.assoc)
+  p.probs.truncate(nprobs)
+  p.epos = e.pos
+  p.ene = e.ne
+  p.emsg = e.msg + ""
+  if root < 0:
+    p.notes.truncate(nnotes)
+    return -1
+  let sc = p.t.a[red]
+  let inc = ast.add(&p.t, ast.T_Include, p.t.sp[sc], p.t.ep[sc])
+  p.t.a[inc] = root
+  let r = ast.add(&p.t, ast.T_SourceCommand, p.t.sp[sc], p.t.ep[sc])
+  p.t.a[r] = red
+  p.t.b[r] = inc
+  return r
+
+# ---------------------------------------------------------------- pipelines and lists
+
+fn read_pipeline(var p: P) -> Int:
+  if unexpecting(&p, "keyword/token", read_keyword) < 0: return -1
+  return read_banged(&p, 0)
+
+# readBanged: kind 0 readPipeSequence, 1 readCommand
+fn read_banged(var p: P, kind: Int) -> Int:
+  if peek(p) == 33:
+    let sp = p.pos
+    adv(&p)
+    let id = node(&p, T_Banged, sp)
+    let m = mark(p)
+    if spacing1(&p) < 0:
+      reset(&p, m)
+      problem(&p, ERR, 1035, "You are missing a required space after the !.")
+    let next = read_banged(&p, kind)
+    if next < 0: return -1
+    p.t.a[id] = next
+    return id
+  nomatch(&p)
+  if kind == 0: return read_pipe_sequence(&p)
+  return read_command(&p)
+
+fn g_or_if(var p: P) -> Int:
+  return try_token(&p, "||", T_OR_IF)
+
+fn read_pipe(var p: P) -> Int:
+  if unexpecting(&p, "", g_or_if) < 0: return -1
+  if peek(p) != 124: return nomatch(&p)
+  let sp = p.pos
+  adv(&p)
+  var q = "|"
+  if peek(p) == 38:
+    adv(&p)
+    q = "|&"
+  else: nomatch(&p)
+  let id = node(&p, T_Pipe, sp)
+  p.t.s[id] = q
+  spacing(&p)
+  return id
+
+fn read_pipe_sequence(var p: P) -> Int:
+  let sp = p.pos
+  var cmds: [Int] = []
+  var pipes: [Int] = []
+  let c0 = read_banged(&p, 1)
+  if c0 < 0: return -1
+  cmds.push(c0)
+  while true:
+    let m = mark(p)
+    let pp = read_pipe(&p)
+    if pp < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      break
+    spacing(&p)
+    if read_line_break(&p) < 0: return -1
+    let c = read_banged(&p, 1)
+    if c < 0: return -1
+    pipes.push(pp)
+    cmds.push(c)
+  let id = node(&p, T_Pipeline, sp)
+  ast.set1(&p.t, id, pipes)
+  ast.set2(&p.t, id, cmds)
+  spacing(&p)
+  return id
+
+fn read_and_or(var p: P) -> Int:
+  let sp = p.pos
+  let apos = p.pos
+  var anns: [Ann] = []
+  if read_annotations(&p, &anns) < 0: return -1
+  let aep = p.pos
+  let has = anns.len > 0
+  var ai = -1
+  let st = p.i
+  if has:
+    if look(&p, read_keyword):
+      problem_at(&p, apos, apos, ERR, 1123, "ShellCheck directives are only valid in front of complete compound commands, like 'if', not e.g. individual 'elif' branches.")
+    ai = add_anns(&p, anns)
+    p.ctx.push(Ctx(CX_ANN, 0, "", ai))
+  var x = read_pipeline(&p)
+  if x < 0:
+    if has: return cend(&p, st, -1)
+    return -1
+  while true:
+    let m = mark(p)
+    var op = -1
+    if starts(p, "&&"): op = try_token(&p, "&&", T_AndIf)
+    elif starts(p, "||"): op = try_token(&p, "||", T_OrIf)
+    else: nomatch(&p)
+    if op < 0:
+      reset(&p, m)
+      break
+    if read_line_break(&p) < 0:
+      if has: return cend(&p, st, -1)
+      return -1
+    let y = read_pipeline(&p)
+    if y < 0:
+      if has: return cend(&p, st, -1)
+      return -1
+    p.t.a[op] = x
+    p.t.b[op] = y
+    x = op
+  if not has: return x
+  pop_ctx(&p)
+  let id = ast.add(&p.t, T_Annotation, sp, aep)
+  p.t.f[id] = ai
+  p.t.a[id] = x
+  return id
+
+fn read_term(var p: P, var out: [Int]) -> Int:
+  if allspacing(&p) < 0: return -1
+  var cur = read_and_or(&p)
+  if cur < 0: return -1
+  while true:
+    let m = mark(p)
+    var ssp = 0
+    var sep_ = 0
+    let sep = read_separator(&p, &ssp, &sep_)
+    if sep < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      out.push(cur)
+      return 0
+    var item = cur
+    if sep == 38:
+      item = ast.add(&p.t, T_Backgrounded, ssp, sep_)
+      p.t.a[item] = cur
+    let m2 = mark(p)
+    let more = read_and_or(&p)
+    if more < 0:
+      if p.i != m2.i: return -1
+      reset(&p, m2)
+      out.push(item)
+      return 0
+    out.push(item)
+    cur = more
+  return 0
+
+fn read_compound_list(var p: P, var out: [Int]) -> Int:
+  return read_term(&p, &out)
+
+fn read_compound_list_or_empty(var p: P, var out: [Int]) -> Int:
+  if allspacing(&p) < 0: return -1
+  let m = mark(p)
+  if read_term(&p, &out) < 0:
+    if p.i != m.i: return -1
+    reset(&p, m)
+    out.truncate(0)
+  return 0
+
+fn read_command(var p: P) -> Int:
+  let m = mark(p)
+  var r = read_compound_command(&p)
+  if r >= 0 or p.i != m.i: return r
+  reset(&p, m)
+  if peek(p) == 91:
+    r = read_condition_command(&p)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  else: nomatch(&p)
+  if starts(p, "coproc"):
+    r = read_coproc(&p)
+    if r >= 0 or p.i != m.i: return r
+    reset(&p, m)
+  else: nomatch(&p)
+  return read_simple_command(&p)
+
+# ---------------------------------------------------------------- compound commands
+
+fn orfail_msgs(var p: P, msg: Str) -> Int:
+  return pfail(&p, msg)
+
+fn accept_but_warn_semi(var p: P, code: Int, msg: Str):
+  let m = mark(p)
+  let pos = p.pos
+  if g_semi(&p) >= 0:
+    problem_at(&p, pos, pos, ERR, code, msg)
+  else: reset(&p, m)
+
+fn verify_not_empty_if(var p: P, s: Str):
+  let pos = p.pos
+  if look(&p, fi_elif_else):
+    problem_at(&p, pos, pos, ERR, 1048, "Can't have empty " + s + " clauses (use 'true' as a no-op).")
+
+fn read_if_part(var p: P, var cond: [Int], var action: [Int]) -> Int:
+  let pos = p.pos
+  if g_if(&p) < 0: return -1
+  if allspacing(&p) < 0: return -1
+  if read_term(&p, &cond) < 0: return -1
+  if look(&p, fi_elif_else):
+    problem_at(&p, pos, pos, ERR, 1049, "Did you forget the 'then' for this 'if'?")
+  let st = p.i
+  push_name(&p, "then clause")
+  let m = mark(p)
+  let e = esave(p)
+  if g_then(&p) < 0:
+    try_fail(&p, m, e)
+    problem(&p, ERR, 1050, "Expected 'then'.")
+    pfail(&p, "Expected 'then'")
+    return cend(&p, st, -1)
+  accept_but_warn_semi(&p, 1051, "Semicolons directly after 'then' are not allowed. Just remove it.")
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  verify_not_empty_if(&p, "then")
+  if read_term(&p, &action) < 0: return cend(&p, st, -1)
+  return cend(&p, st, 0)
+
+fn read_elif_part(var p: P, var cond: [Int], var action: [Int]) -> Int:
+  let st = p.i
+  push_name(&p, "elif clause")
+  let pos = p.pos
+  if g_elif(&p) < 0: return cend(&p, st, -1)
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  if read_term(&p, &cond) < 0: return cend(&p, st, -1)
+  if look(&p, fi_elif_else):
+    problem_at(&p, pos, pos, ERR, 1049, "Did you forget the 'then' for this 'elif'?")
+  if g_then(&p) < 0: return cend(&p, st, -1)
+  accept_but_warn_semi(&p, 1052, "Semicolons directly after 'then' are not allowed. Just remove it.")
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  verify_not_empty_if(&p, "then")
+  if read_term(&p, &action) < 0: return cend(&p, st, -1)
+  return cend(&p, st, 0)
+
+fn read_else_part(var p: P, var action: [Int]) -> Int:
+  let st = p.i
+  push_name(&p, "else clause")
+  let pos = p.pos
+  if g_else(&p) < 0: return cend(&p, st, -1)
+  if look(&p, g_if):
+    problem_at(&p, pos, pos, ERR, 1075, "Use 'elif' instead of 'else if' (or put 'if' on new line if nesting).")
+  accept_but_warn_semi(&p, 1053, "Semicolons directly after 'else' are not allowed. Just remove it.")
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  verify_not_empty_if(&p, "else")
+  if read_term(&p, &action) < 0: return cend(&p, st, -1)
+  return cend(&p, st, 0)
+
+fn read_if_clause(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "if expression")
+  let sp = p.pos
+  let pos = p.pos
+  var all: [Int] = []
+  var lens: [Int] = []
+  var c0: [Int] = []
+  var a0: [Int] = []
+  if read_if_part(&p, &c0, &a0) < 0: return cend(&p, st, -1)
+  lens.push(c0.len)
+  lens.push(a0.len)
+  for x in c0: all.push(x)
+  for x in a0: all.push(x)
+  while true:
+    let m = mark(p)
+    var c: [Int] = []
+    var a: [Int] = []
+    if read_elif_part(&p, &c, &a) < 0:
+      if p.i != m.i: return cend(&p, st, -1)
+      reset(&p, m)
+      break
+    lens.push(c.len)
+    lens.push(a.len)
+    for x in c: all.push(x)
+    for x in a: all.push(x)
+    eclr(&p)
+  var els: [Int] = []
+  let m = mark(p)
+  if read_else_part(&p, &els) < 0:
+    if p.i != m.i: return cend(&p, st, -1)
+    reset(&p, m)
+    els.truncate(0)
+  lens.push(els.len)
+  for x in els: all.push(x)
+  let m2 = mark(p)
+  let e2 = esave(p)
+  if g_fi(&p) < 0:
+    try_fail(&p, m2, e2)
+    problem_at(&p, pos, pos, ERR, 1046, "Couldn't find 'fi' for this 'if'.")
+    problem(&p, ERR, 1047, "Expected 'fi' matching previously mentioned 'if'.")
+    pfail(&p, "Expected 'fi'")
+    return cend(&p, st, -1)
+  let id = nodes1(&p, T_IfExpression, sp, all)
+  p.t.l2[id] = p.t.L.len
+  p.t.n2[id] = lens.len
+  for x in lens: p.t.L.push(x)
+  return cend(&p, st, id)
+
+fn read_subshell(var p: P) -> Int:
+  if peek(p) != 40: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "explicit subshell")
+  let sp = p.pos
+  adv(&p)
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  var l: [Int] = []
+  if read_compound_list(&p, &l) < 0: return cend(&p, st, -1)
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  if peek(p) != 41:
+    pfail(&p, "Expected ) closing the subshell")
+    return cend(&p, st, -1)
+  adv(&p)
+  let id = nodes1(&p, T_Subshell, sp, l)
+  spacing(&p)
+  return cend(&p, st, id)
+
+fn read_brace_group(var p: P) -> Int:
+  if peek(p) != 123: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "brace group")
+  let sp = p.pos
+  adv(&p)
+  let m = mark(p)
+  let e = esave(p)
+  if allspacing_or_fail(&p) < 0:
+    if p.i != m.i: return cend(&p, st, -1)
+    reset(&p, m)
+    let c = peek(p)
+    if c >= 0 and c != 40: problem(&p, ERR, 1054, "You need a space after the '{{'.")
+  if peek(p) == 125:
+    problem(&p, ERR, 1055, "You need at least one command here. Use 'true;' as a no-op.")
+  var l: [Int] = []
+  if read_term(&p, &l) < 0: return cend(&p, st, -1)
+  if peek(p) != 125:
+    problem(&p, ERR, 1056, "Expected a '}}'. If you have one, try a ; or \\n in front of it.")
+    pfail(&p, "Missing '}}'")
+    return cend(&p, st, -1)
+  adv(&p)
+  let id = nodes1(&p, T_BraceGroup, sp, l)
+  spacing(&p)
+  return cend(&p, st, id)
+
+fn read_bats_test(var p: P) -> Int:
+  if not starts(p, "@test "): return nomatch(&p)
+  let st = p.i
+  push_name(&p, "bats @test")
+  let sp = p.pos
+  for k in 0..6: adv(&p)
+  spacing(&p)
+  # readBatsName: everything before the last " {" on the line, trailing spaces dropped
+  var j = p.i
+  while j < p.src.len and p.src[j] != '\n': j += 1
+  let line = p.src[p.i..j]
+  var name = ""
+  var k = line.len - 2
+  while k >= 0:
+    if line[k] == ' ' and line[k + 1] == '{':
+      name = line[0..k].rstrip()
+      break
+    k -= 1
+  if line.len == 0:
+    nomatch(&p)
+    return cend(&p, st, -1)
+  if name.len > 0 and string_(&p, name) < 0: return cend(&p, st, -1)
+  spacing(&p)
+  let g = read_brace_group(&p)
+  if g < 0: return cend(&p, st, -1)
+  let id = node(&p, T_BatsTest, sp)
+  p.t.s[id] = name
+  p.t.a[id] = g
+  return cend(&p, st, id)
+
+fn read_do_group(var p: P, kw: Int, var out: [Int]) -> Int:
+  if look(&p, g_done):
+    problem_id(&p, kw, ERR, 1057, "Did you forget the 'do' for this loop?")
+  let m = mark(p)
+  let e = esave(p)
+  let dk = g_do(&p)
+  if dk < 0:
+    try_fail(&p, m, e)
+    problem(&p, ERR, 1058, "Expected 'do'.")
+    return pfail(&p, "Expected 'do'")
+  accept_but_warn_semi(&p, 1059, "Semicolon is not allowed directly after 'do'. You can just delete it.")
+  if allspacing(&p) < 0: return -1
+  if look(&p, g_done):
+    problem_id(&p, dk, ERR, 1060, "Can't have empty do clauses (use 'true' as a no-op).")
+  if read_compound_list(&p, &out) < 0: return -1
+  let m2 = mark(p)
+  let e2 = esave(p)
+  if g_done(&p) < 0:
+    try_fail(&p, m2, e2)
+    problem_id(&p, dk, ERR, 1061, "Couldn't find 'done' for this 'do'.")
+    problem(&p, ERR, 1062, "Expected 'done' matching previously mentioned 'do'.")
+    return pfail(&p, "Expected 'done'")
+  if starts(p, "<("):
+    problem(&p, ERR, 1142, "Use 'done < <(cmd)' to redirect from process substitution (currently missing one '<').")
+  else: nomatch(&p)
+  return 0
+
+fn read_while_clause(var p: P, until: Bool) -> Int:
+  let st = p.i
+  if until: push_name(&p, "until loop")
+  else: push_name(&p, "while loop")
+  let sp = p.pos
+  var kw = -1
+  if until: kw = try_word_token(&p, "until", T_Until)
+  else: kw = try_word_token(&p, "while", T_While)
+  if kw < 0: return cend(&p, st, -1)
+  var cond: [Int] = []
+  if read_term(&p, &cond) < 0: return cend(&p, st, -1)
+  var body: [Int] = []
+  if read_do_group(&p, kw, &body) < 0: return cend(&p, st, -1)
+  var kind = T_WhileExpression
+  if until: kind = T_UntilExpression
+  let id = node(&p, kind, sp)
+  ast.set1(&p.t, id, cond)
+  ast.set2(&p.t, id, body)
+  return cend(&p, st, id)
+
+fn arith_delim(var p: P, c: Int, msg: Str) -> Int:
+  if char_(&p, c) < 0: return -1
+  let sp = p.pos
+  spacing(&p)
+  let blank = p.sv.len == 0
+  let ep = p.pos
+  if peek(p) != c:
+    problem_at(&p, sp, sp, ERR, 1137, msg)
+    return pfail(&p, "")
+  adv(&p)
+  if not blank:
+    let cs = cstr(c)
+    problem_at(&p, sp, ep, ERR, 1138, "Remove spaces between " + cs + cs + " in arithmetic for loop.")
+  return 0
+
+# readBraced <|> readDoGroup
+fn loop_body(var p: P, kw: Int, var out: [Int]) -> Int:
+  let m = mark(p)
+  let g = read_brace_group(&p)
+  if g >= 0:
+    for i in 0..p.t.n1[g]: out.push(ast.at1(p.t, g, i))
+    return 0
+  if p.i != m.i: return -1
+  reset(&p, m)
+  return read_do_group(&p, kw, &out)
+
+fn read_for_clause(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "for loop")
+  let kw = try_word_token(&p, "for", T_For)
+  if kw < 0: return cend(&p, st, -1)
+  spacing(&p)
+  # readArithmetic
+  let st2 = p.i
+  push_name(&p, "arithmetic for condition")
+  if peek(p) == 40:
+    if arith_delim(&p, 40, "Missing second '(' to start arithmetic for ((;;)) loop") < 0:
+      cend(&p, st2, -1)
+      return cend(&p, st, -1)
+    let x = read_arithmetic_contents(&p)
+    if x < 0 or char_(&p, 59) < 0:
+      cend(&p, st2, -1)
+      return cend(&p, st, -1)
+    spacing(&p)
+    let y = read_arithmetic_contents(&p)
+    if y < 0 or char_(&p, 59) < 0:
+      cend(&p, st2, -1)
+      return cend(&p, st, -1)
+    spacing(&p)
+    let z = read_arithmetic_contents(&p)
+    if z < 0:
+      cend(&p, st2, -1)
+      return cend(&p, st, -1)
+    spacing(&p)
+    if arith_delim(&p, 41, "Missing second ')' to terminate 'for ((;;))' loop condition") < 0:
+      cend(&p, st2, -1)
+      return cend(&p, st, -1)
+    spacing(&p)
+    let m = mark(p)
+    if read_sequential_sep(&p) >= 0: spacing(&p)
+    elif p.i != m.i:
+      cend(&p, st2, -1)
+      return cend(&p, st, -1)
+    else: reset(&p, m)
+    var body: [Int] = []
+    if loop_body(&p, kw, &body) < 0:
+      cend(&p, st2, -1)
+      return cend(&p, st, -1)
+    let id = ast.add(&p.t, T_ForArithmetic, p.t.sp[kw], p.t.ep[kw])
+    p.t.a[id] = x
+    p.t.b[id] = y
+    p.t.c[id] = z
+    ast.set1(&p.t, id, body)
+    cend(&p, st2, id)
+    return cend(&p, st, id)
+  nomatch(&p)
+  cend(&p, st2, -1)
+  # readRegular
+  let m = mark(p)
+  let pos = p.pos
+  if peek(p) == 36:
+    adv(&p)
+    problem_at(&p, pos, pos, ERR, 1086, "Don't use $ on the iterator name in for loops.")
+  else: nomatch(&p)
+  if read_variable_name(&p) < 0: return cend(&p, st, -1)
+  let name = p.sv + ""
+  let m1 = mark(p)
+  if allspacing(&p) < 0:
+    if p.i != m1.i: return cend(&p, st, -1)
+    reset(&p, m1)
+  var values: [Int] = []
+  let m2 = mark(p)
+  if read_in_clause(&p, &values) < 0:
+    if p.i != m2.i: return cend(&p, st, -1)
+    reset(&p, m2)
+    values.truncate(0)
+    if read_sequential_sep(&p) < 0:
+      if p.i != m2.i: return cend(&p, st, -1)
+      reset(&p, m2)
+  var body: [Int] = []
+  if loop_body(&p, kw, &body) < 0: return cend(&p, st, -1)
+  let id = ast.add(&p.t, T_ForIn, p.t.sp[kw], p.t.ep[kw])
+  p.t.s[id] = name
+  ast.set1(&p.t, id, values)
+  ast.set2(&p.t, id, body)
+  return cend(&p, st, id)
+
+fn read_select_clause(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "select loop")
+  let kw = try_word_token(&p, "select", T_Select)
+  if kw < 0: return cend(&p, st, -1)
+  spacing(&p)
+  if read_variable_name(&p) < 0: return cend(&p, st, -1)
+  let name = p.sv + ""
+  spacing(&p)
+  var values: [Int] = []
+  let m = mark(p)
+  if read_in_clause(&p, &values) < 0:
+    if p.i != m.i: return cend(&p, st, -1)
+    reset(&p, m)
+    values.truncate(0)
+    if read_sequential_sep(&p) < 0: return cend(&p, st, -1)
+  var body: [Int] = []
+  if read_do_group(&p, kw, &body) < 0: return cend(&p, st, -1)
+  let id = ast.add(&p.t, T_SelectIn, p.t.sp[kw], p.t.ep[kw])
+  p.t.s[id] = name
+  ast.set1(&p.t, id, values)
+  ast.set2(&p.t, id, body)
+  return cend(&p, st, id)
+
+fn semi_lf_do(var p: P) -> Int:
+  let st = p.i
+  let m = mark(p)
+  if g_semi(&p) >= 0: return 0
+  if p.i != st: return -1
+  reset(&p, m)
+  if linefeed(&p) >= 0: return 0
+  if p.i != st: return -1
+  reset(&p, m)
+  return g_do(&p)
+
+fn read_in_clause(var p: P, var out: [Int]) -> Int:
+  if g_in(&p) < 0: return -1
+  while true:
+    if at_eof(p) or look(&p, semi_lf_do): break
+    let m = mark(p)
+    let w = read_cmd_word(&p)
+    if w < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      break
+    out.push(w)
+  if look(&p, g_do):
+    note(&p, ERR, 1063, "You need a line feed or semicolon before the 'do'.")
+  else:
+    let m = mark(p)
+    if g_semi(&p) < 0: reset(&p, m)
+    if allspacing(&p) < 0: return -1
+  return 0
+
+fn read_pattern(var p: P, var out: [Int]) -> Int:
+  let w = read_pattern_word(&p)
+  if w < 0: return -1
+  out.push(w)
+  spacing(&p)
+  while peek(p) == 124:
+    adv(&p)
+    spacing(&p)
+    let x = read_pattern_word(&p)
+    if x < 0: return -1
+    out.push(x)
+    spacing(&p)
+    eclr(&p)
+  nomatch(&p)
+  return 0
+
+fn read_case_item(var p: P, var pats: [Int], var body: [Int]) -> Int:
+  let st = p.i
+  push_name(&p, "case item")
+  # notFollowedBy2 g_Esac
+  if unexpecting(&p, "", g_esac) < 0: return cend(&p, st, -1)
+  if look(&p, read_annotation_prefix):
+    problem(&p, ERR, 1124, "ShellCheck directives are only valid in front of complete commands like 'case' statements, not individual case branches.")
+  let m = mark(p)
+  if g_lparen(&p) < 0: reset(&p, m)
+  spacing(&p)
+  if read_pattern(&p, &pats) < 0: return cend(&p, st, -1)
+  if g_rparen(&p) < 0:
+    problem(&p, ERR, 1085, "Did you forget to move the ;; after extending this case item?")
+    pfail(&p, "Expected ) to open a new case item")
+    return cend(&p, st, -1)
+  if read_line_break(&p) < 0: return cend(&p, st, -1)
+  let m2 = mark(p)
+  let e2 = esave(p)
+  if read_case_separator(&p) >= 0: look_ok(&p, m2, e2)
+  else:
+    try_fail(&p, m2, e2)
+    if read_compound_list(&p, &body) < 0: return cend(&p, st, -1)
+  if peek(p) == 41:
+    problem(&p, ERR, 1074, "Did you forget the ;; after the previous case item?")
+  else: nomatch(&p)
+  let sep = read_case_separator(&p)
+  if sep < 0: return cend(&p, st, -1)
+  if read_line_break(&p) < 0: return cend(&p, st, -1)
+  return cend(&p, st, sep)
+
+fn read_case_clause(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "case expression")
+  let sp = p.pos
+  if try_word_token(&p, "case", T_Case) < 0: return cend(&p, st, -1)
+  let w = read_normal_word(&p)
+  if w < 0: return cend(&p, st, -1)
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  if g_in(&p) < 0:
+    pfail(&p, "Expected 'in'")
+    return cend(&p, st, -1)
+  if read_line_break(&p) < 0: return cend(&p, st, -1)
+  var all: [Int] = []
+  var meta: [Int] = []
+  while true:
+    let m = mark(p)
+    var pats: [Int] = []
+    var body: [Int] = []
+    let sep = read_case_item(&p, &pats, &body)
+    if sep < 0:
+      if p.i != m.i: return cend(&p, st, -1)
+      reset(&p, m)
+      break
+    meta.push(sep)
+    meta.push(pats.len)
+    meta.push(body.len)
+    for x in pats: all.push(x)
+    for x in body: all.push(x)
+    eclr(&p)
+  if g_esac(&p) < 0:
+    pfail(&p, "Expected 'esac' to close the case statement")
+    return cend(&p, st, -1)
+  let id = nodes1(&p, T_CaseExpression, sp, all)
+  p.t.a[id] = w
+  p.t.l2[id] = p.t.L.len
+  p.t.n2[id] = meta.len
+  for x in meta: p.t.L.push(x)
+  return cend(&p, st, id)
+
+fn is_fn_start(c: Int) -> Bool:
+  return is_var_char(c) or in_str(c, ":+?-./^@,")
+
+fn is_fn_char(c: Int) -> Bool:
+  return is_var_char(c) or in_str(c, "#:+?-./^@,")
+
+fn is_ext_fn_start(c: Int) -> Bool:
+  return is_fn_start(c) or in_str(c, "[]*=!")
+
+fn read_parens(var p: P) -> Int:
+  if g_lparen(&p) < 0: return -1
+  spacing(&p)
+  let m = mark(p)
+  if g_rparen(&p) < 0:
+    reset(&p, m)
+    problem(&p, ERR, 1065, "Trying to declare parameters? Don't. Use () and refer to params as $1, $2..")
+    while true:
+      let c = peek(p)
+      if c < 0 or c == 10 or c == 41 or c == 123: break
+      adv(&p)
+    nomatch(&p)
+    if g_rparen(&p) < 0: return -1
+  return 0
+
+# readFunctionSignature: f flags (1 keyword, 2 parens) in p.sv's name; -1 on failure
+fn read_function_signature(var p: P, var flags: Int) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  if starts(p, "function"):
+    let m0 = mark(p)
+    for k in 0..8: adv(&p)
+    if whitespace(&p) >= 0:
+      spacing(&p)
+      if not is_ext_fn_start(peek(p)): return nomatch(&p)
+      let st = p.i
+      adv(&p)
+      while is_ext_fn_start(peek(p)): adv(&p)
+      nomatch(&p)
+      let name = p.src[st..p.i]
+      spacing(&p)
+      let no_space = p.sv.len == 0
+      let m2 = mark(p)
+      var parens = true
+      if read_parens(&p) < 0:
+        if p.i != m2.i: return -1
+        reset(&p, m2)
+        parens = false
+      if not parens and no_space:
+        let c = peek(p)
+        if c == 123 or c == 40:
+          problem(&p, ERR, 1095, "You need a space or linefeed between the function name and body.")
+      p.sv = name
+      flags = 1 | (2 * bint(parens))
+      return 0
+    try_fail(&p, m0, e)
+  else: nomatch(&p)
+  # readWithoutFunction = try (...)
+  if not is_fn_start(peek(p)): return nomatch(&p)
+  let st = p.i
+  adv(&p)
+  while is_fn_char(peek(p)): adv(&p)
+  nomatch(&p)
+  let name = p.src[st..p.i]
+  if name == "time":
+    mzero(&p)
+    return try_fail(&p, m, e)
+  spacing(&p)
+  if read_parens(&p) < 0: return try_fail(&p, m, e)
+  p.sv = name
+  flags = 2
+  return 0
+
+fn read_function_definition(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "function")
+  let sp = p.pos
+  let m = mark(p)
+  let e = esave(p)
+  var flags = 0
+  if read_function_signature(&p, &flags) < 0:
+    try_fail(&p, m, e)
+    return cend(&p, st, -1)
+  let name = p.sv + ""
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  let c = peek(p)
+  if c != 123 and c != 40: problem(&p, ERR, 1064, "Expected a {{ to open the function definition.")
+  let m2 = mark(p)
+  var g = read_brace_group(&p)
+  if g < 0 and p.i == m2.i:
+    reset(&p, m2)
+    g = read_subshell(&p)
+  if g < 0: return cend(&p, st, -1)
+  let id = node(&p, T_Function, sp)
+  p.t.f[id] = flags
+  p.t.s[id] = name
+  p.t.a[id] = g
+  return cend(&p, st, id)
+
+fn read_body(var p: P, compound: Bool) -> Int:
+  let sp = p.pos
+  var b = -1
+  if compound: b = read_compound_command(&p)
+  else: b = read_simple_command(&p)
+  if b < 0: return -1
+  let id = node(&p, T_CoProcBody, sp)
+  p.t.a[id] = b
+  return id
+
+fn read_coproc(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "coproc")
+  let sp = p.pos
+  let m0 = mark(p)
+  let e0 = esave(p)
+  if string_(&p, "coproc") < 0 or spacing1(&p) < 0:
+    try_fail(&p, m0, e0)
+    return cend(&p, st, -1)
+  # try readCompoundCoProc
+  let m = mark(p)
+  let e = esave(p)
+  var ok = false
+  if unexpecting(&p, "", read_assignment_lenient) >= 0:
+    let m1 = mark(p)
+    let e1 = esave(p)
+    var body = read_body(&p, true)
+    var name = -1
+    if body < 0:
+      try_fail(&p, m1, e1)
+      let m2 = mark(p)
+      let e2 = esave(p)
+      name = read_normal_word(&p)
+      if name >= 0:
+        spacing(&p)
+        body = read_body(&p, true)
+      if body < 0: try_fail(&p, m2, e2)
+    if body >= 0:
+      let id = node(&p, T_CoProc, sp)
+      p.t.a[id] = name
+      p.t.b[id] = body
+      return cend(&p, st, id)
+  try_fail(&p, m, e)
+  let body = read_body(&p, false)
+  if body < 0: return cend(&p, st, -1)
+  let id = node(&p, T_CoProc, sp)
+  p.t.b[id] = body
+  return cend(&p, st, id)
+
+fn or_and_ahead(var p: P) -> Int:
+  for s in ["-o", "-a", "or", "and"]:
+    if try_string(&p, s) >= 0:
+      p.sv = s
+      return 0
+  return -1
+
+fn read_condition_command(var p: P) -> Int:
+  let cmd = read_condition(&p)
+  if cmd < 0: return -1
+  var redirs: [Int] = []
+  if not many_(&p, read_io_redirect, &redirs): return -1
+  var items: [Int] = [cmd]
+  for x in redirs: items.push(x)
+  let id = span_list(&p, T_Redirecting, items)
+  ast.set1(&p.t, id, redirs)
+  p.t.a[id] = cmd
+  let pos = p.pos
+  var has_dash_ao = false
+  let m = mark(p)
+  let e = esave(p)
+  if or_and_ahead(&p) >= 0:
+    let c = p.sv + ""
+    let pe = p.pos
+    var alt = "|| or &&"
+    if c == "or" or c == "-o": alt = "||"
+    if c == "and" or c == "-a": alt = "&&"
+    problem_at(&p, pos, pe, ERR, 1139, "Use " + alt + " instead of '" + c + "' between test commands.")
+    has_dash_ao = true
+    look_ok(&p, m, e)
+  else: try_fail(&p, m, e)
+  let has_kw = look(&p, read_keyword)
+  let has_word = look(&p, read_normal_word)
+  if has_word and not (has_kw or has_dash_ao):
+    problem_at(&p, pos, p.pos, ERR, 1140, "Unexpected parameters after condition. Missing &&/||, or bad expression?")
+  return id
+
+fn kw_or_lbrace(var p: P) -> Int:
+  let st = p.i
+  let r = read_keyword(&p)
+  if r >= 0 or p.i != st: return r
+  return g_lbrace(&p)
+
+fn read_ambiguous_paren(var p: P) -> Int:
+  let pos = p.pos
+  var r = try_(&p, read_arithmetic_expression)
+  if r >= 0: return r
+  let m = mark(p)
+  let e = esave(p)
+  r = forget_on_failure(&p, read_subshell)
+  if r >= 0:
+    note_at(&p, pos, pos, ERR, 1105, "Shells disambiguate (( differently or not at all. For subshell, add spaces around ( . For ((, fix parsing errors.")
+    return r
+  try_fail(&p, m, e)
+  return read_arithmetic_expression(&p)
+
+fn read_compound_command(var p: P) -> Int:
+  let c = peek(p)
+  let lc = lower_ascii(c)
+  let m = mark(p)
+  var cmd = -1
+  if c == 123:
+    cmd = read_brace_group(&p)
+  elif c == 40:
+    if starts(p, "(("):
+      cmd = read_ambiguous_paren(&p)
+      if cmd < 0 and p.i == m.i:
+        reset(&p, m)
+        cmd = read_subshell(&p)
+    else: cmd = read_subshell(&p)
+  else:
+    nomatch(&p)
+    if lc == 119:
+      cmd = read_while_clause(&p, false)
+    elif lc == 117:
+      cmd = read_while_clause(&p, true)
+    elif lc == 105:
+      cmd = read_if_clause(&p)
+    elif lc == 102:
+      cmd = read_for_clause(&p)
+    elif lc == 115:
+      cmd = read_select_clause(&p)
+    elif lc == 99:
+      cmd = read_case_clause(&p)
+    elif c == 64:
+      cmd = read_bats_test(&p)
+    if cmd < 0 and p.i == m.i:
+      reset(&p, m)
+      cmd = read_function_definition(&p)
+  if cmd < 0: return -1
+  var redirs: [Int] = []
+  if not many_(&p, read_io_redirect, &redirs): return -1
+  var items: [Int] = [cmd]
+  for x in redirs: items.push(x)
+  let id = span_list(&p, T_Redirecting, items)
+  ast.set1(&p.t, id, redirs)
+  p.t.a[id] = cmd
+  # optional . lookAhead: words right after a compound command
+  let m2 = mark(p)
+  let e2 = esave(p)
+  if unexpecting(&p, "", kw_or_lbrace) >= 0:
+    let pos = p.pos
+    let w = read_normal_word(&p)
+    if w >= 0:
+      while true:
+        let m3 = mark(p)
+        if read_normal_word(&p) < 0:
+          if p.i != m3.i: return -1
+          reset(&p, m3)
+          break
+        eclr(&p)
+      problem_at(&p, pos, p.pos, ERR, 1141, "Unexpected tokens after compound command. Bad redirection or missing ;/&&/||/|?")
+      look_ok(&p, m2, e2)
+    elif p.i != m2.i: return -1
+    else: reset(&p, m2)
+  else: reset(&p, m2)
+  return id
+
+# ---------------------------------------------------------------- [ and [[ commands
+
+fn read_condition(var p: P) -> Int:
+  if peek(p) != 91: return nomatch(&p)
+  let st = p.i
+  push_name(&p, "test expression")
+  let opos = p.pos
+  let sp = p.pos
+  var single = true
+  if starts(p, "[["):
+    adv(&p)
+    adv(&p)
+    single = false
+  else: adv(&p)
+  let typ = ctype(single)
+  let pos = p.pos
+  if allspacing(&p) < 0: return cend(&p, st, -1)
+  let space = p.sv + ""
+  if space.len == 0:
+    if single: problem_at(&p, opos, pos, ERR, 1035, "You need a space after the [ and before the ].")
+    else: problem_at(&p, opos, pos, ERR, 1035, "You need a space after the [[ and before the ]].")
+  if single and space.find("\n") >= 0:
+    problem_at(&p, pos, pos, ERR, 1080, "You need \\ before line feeds to break lines in [ ].")
+  let m = mark(p)
+  var cond = read_condition_contents(&p, single)
+  if cond < 0:
+    if p.i != m.i: return cend(&p, st, -1)
+    reset(&p, m)
+    if space.len == 0 or peek(p) != 93:
+      if space.len == 0: mzero(&p)
+      else: nomatch(&p)
+      return cend(&p, st, -1)
+    cond = node(&p, TC_Empty, sp)
+    p.t.f[cond] = typ
+  let cpos = p.pos
+  var close = ""
+  if starts(p, "]]"):
+    adv(&p)
+    adv(&p)
+    close = "]]"
+  elif peek(p) == 93:
+    adv(&p)
+    close = "]"
+  else:
+    pfail(&p, "Expected test to end here (don't wrap commands in []/[[]])")
+    return cend(&p, st, -1)
+  let id = node(&p, T_Condition, sp)
+  p.t.f[id] = typ
+  p.t.a[id] = cond
+  if not single and close != "]]":
+    problem_at(&p, cpos, cpos, ERR, 1033, "Test expression was opened with double [[ but closed with single ]. Make sure they match.")
+  if single and close != "]":
+    problem_at(&p, opos, opos, ERR, 1034, "Test expression was opened with single [ but closed with double ]]. Make sure they match.")
+  spacing(&p)
+  return cend(&p, st, id)
+
+fn read_condition_contents(var p: P, single: Bool) -> Int:
+  let m = mark(p)
+  let e = esave(p)
+  let pos = p.pos
+  if read_variable_name(&p) >= 0:
+    let s = p.sv + ""
+    if spacing1(&p) >= 0:
+      if is_common_command(s):
+        problem_at(&p, pos, pos, WARN, 1014, "Use 'if cmd; then ..' to check exit code, or 'if [[ $(cmd) == .. ]]' to check output.")
+      look_ok(&p, m, e)
+    else: try_fail(&p, m, e)
+  else: try_fail(&p, m, e)
+  return read_cond_or(&p, single)
+
+# ---------------------------------------------------------------- the script
+
+fn verify_eof(var p: P):
+  if eof(&p) >= 0: return
+  if look(&p, g_lparen):
+    problem(&p, ERR, 1088, "Parsing stopped here. Invalid use of parentheses?")
+    return
+  if look(&p, read_keyword):
+    problem(&p, ERR, 1089, "Parsing stopped here. Is this keyword correctly matched up?")
+    return
+  problem(&p, ERR, 1070, "Parsing stopped here. Mismatched keywords or invalid parentheses?")
+
+fn skip_ws_flag(var p: P) -> Bool:
+  var any = false
+  while is_linews(peek(p)):
+    if not almost_space(&p): adv(&p)
+    any = true
+  nomatch(&p)
+  return any
+
+fn path_ahead(p: P) -> Bool:
+  var j = p.i
+  while true:
+    let d = dec(p.src, j)
+    if d < 0: return false
+    let c = d & 0xFFFFFF
+    if c == 32 or c == 9 or is_uspace(c):
+      j += d >> 24
+      continue
+    return c == 47
+
+# anyShebang: readCorrect, readSwapped, readTooManySpaces, readMissingHash (each in try)
+fn any_shebang(var p: P) -> Int:
+  if starts(p, "#!"):
+    adv(&p)
+    adv(&p)
+    return 0
+  if starts(p, "!#"):
+    let sp = p.pos
+    adv(&p)
+    adv(&p)
+    problem_at(&p, sp, p.pos, ERR, 1084, "Use #!, not !#, for the shebang.")
+    return 0
+  let m = mark(p)
+  let e = esave(p)
+  let start_pos = p.pos
+  let ss = skip_ws_flag(&p)
+  if peek(p) == 35:
+    adv(&p)
+    let mid = p.pos
+    let ms = skip_ws_flag(&p)
+    if peek(p) == 33:
+      adv(&p)
+      if ss: problem_at(&p, start_pos, start_pos, ERR, 1114, "Remove leading spaces before the shebang.")
+      if ms: problem_at(&p, mid, mid, ERR, 1115, "Remove spaces between # and ! in the shebang.")
+      return 0
+  nomatch(&p)
+  try_fail(&p, m, e)
+  if peek(p) == 33:
+    let pos = p.pos
+    let m2 = mark(p)
+    adv(&p)
+    if path_ahead(p):
+      problem_at(&p, pos, pos, ERR, 1104, "Use #!, not just !, for the shebang.")
+      return 0
+    nomatch(&p)
+    try_fail(&p, m2, e)
+    return -1
+  return nomatch(&p)
+
+fn header_line(var p: P) -> Int:
+  if unexpecting(&p, "", any_shebang) < 0: return -1
+  skip_ws_flag(&p)
+  let m = mark(p)
+  if read_any_comment(&p) < 0: reset(&p, m)
+  return linefeed(&p)
+
+fn read_shebang(var p: P) -> Int:
+  let sp = p.pos
+  let m = mark(p)
+  var r = any_shebang(&p)
+  if r < 0:
+    if p.i != m.i: return -1
+    reset(&p, m)
+    # try readMissingBang
+    let e = esave(p)
+    if peek(p) == 35:
+      adv(&p)
+      let pos = p.pos
+      if path_ahead(p):
+        problem_at(&p, pos, pos, ERR, 1113, "Use #!, not just #, for the shebang.")
+        r = 0
+      else:
+        nomatch(&p)
+        try_fail(&p, m, e)
+    else: nomatch(&p)
+  if r < 0:
+    # withHeader = try (many1 headerLine; pos; anyShebang <* problem 1128)
+    let e = esave(p)
+    var n = 0
+    var bad = false
+    while true:
+      let m2 = mark(p)
+      if header_line(&p) < 0:
+        if p.i != m2.i: bad = true
+        else: reset(&p, m2)
+        break
+      if n > 0: eclr(&p)
+      n += 1
+    if bad or n == 0:
+      try_fail(&p, m, e)
+      return -1
+    let pos = p.pos
+    if any_shebang(&p) < 0:
+      try_fail(&p, m, e)
+      return -1
+    problem_at(&p, pos, pos, ERR, 1128, "The shebang must be on the first line. Delete blanks and move comments.")
+  skip_ws_flag(&p)
+  let st = p.i
+  while true:
+    let c = peek(p)
+    if c < 0 or c == 13 or c == 10: break
+    adv(&p)
+  nomatch(&p)
+  let id = lit(&p, sp, p.src[st..p.i])
+  if peek(p) == 13: carriage_return(&p)
+  let m3 = mark(p)
+  if linefeed(&p) < 0:
+    if p.i != m3.i: return -1
+    reset(&p, m3)
+  return id
+
+fn basename(s: Str) -> Str:
+  var k = s.len - 1
+  while k >= 0 and s[k] != '/': k -= 1
+  return s[k + 1..s.len]
+
+fn words(s: Str) -> [Str]:
+  return ucd.hwords(s)
+
+fn from_env_args(args: [Str]) -> Str:
+  var k = 0
+  while k < args.len and args[k].startswith("-"): k += 1
+  while k < args.len:
+    if args[k].find("=") < 0: return args[k] + ""
+    k += 1
+  return ""
+
+fn executable_from_shebang(s: Str) -> Str:
+  # re = "/env +(-S|--split-string=?)? *(.*)"
+  var j = 0
+  while true:
+    let k = s.find("/env ", j)
+    if k < 0: break
+    var q = k + 4
+    while q < s.len and s[q] == ' ': q += 1
+    var rest = s[q..s.len]
+    if rest.startswith("--split-string="): rest = rest[15..rest.len]
+    elif rest.startswith("--split-string"): rest = rest[14..rest.len]
+    elif rest.startswith("-S"): rest = rest[2..rest.len]
+    return from_env_args(words(rest))
+  let w = words(s)
+  if w.len == 0: return ""
+  if w.len == 1: return basename(w[0])
+  if basename(w[0]) == "busybox":
+    let b = basename(w[1])
+    if b == "sh": return "busybox sh"
+    if b == "ash": return "busybox ash"
+    return b
+  if basename(w[0]) == "env":
+    var rest: [Str] = []
+    for k in 1..w.len: rest.push(w[k] + "")
+    return from_env_args(rest)
+  return basename(w[0])
+
+# isValidShell: 1 good, 0 bad, -1 unknown
+fn valid_shell(s: Str) -> Int:
+  if s.len == 0: return 1
+  for g in ["sh", "ash", "dash", "busybox sh", "bash", "bats", "ksh", "oksh"]:
+    if s.startswith(g): return 1
+  for b in ["awk", "csh", "expect", "fish", "perl", "python", "python3", "ruby", "tcsh", "zsh"]:
+    if s.startswith(b): return 0
+  return -1
+
+type Parsed:
+  t: ast.Ast
+  root: Int          # -1 when the script didn't parse
+  notes: [Note]
+  files: [Str]       # file names by position file index
+  texts: [Str]
+
+fn read_script_file(var p: P, sourced: Bool) -> Int:
+  var rc: [Ann] = []
+  if not sourced:
+    let rce = p.rc_err + ""
+    if rce.len > 0: problem(&p, ERR, 1134, rce)
+    for a in p.rc: rc.push(Ann(a.kind, a.lo, a.hi, a.s + ""))
+  let has_rc = rc.len > 0
+  var rci = -1
+  if has_rc:
+    var c2: [Ann] = []
+    for a in rc: c2.push(Ann(a.kind, a.lo, a.hi, a.s + ""))
+    rci = add_anns(&p, c2)
+    p.ctx.push(Ctx(CX_ANN, 0, "", rci))
+  let r = read_script_body(&p, rc)
+  if has_rc and r >= 0: pop_ctx(&p)
+  return r
+
+fn read_script_body(var p: P, rc: [Ann]) -> Int:
+  let sp = p.pos
+  let pos = p.pos
+  var has_bom = false
+  if peek(p) == 0xFEFF:
+    adv(&p)
+    has_bom = true
+  else: nomatch(&p)
+  let m = mark(p)
+  var sb = read_shebang(&p)
+  if sb < 0:
+    if p.i != m.i: return -1
+    reset(&p, m)
+    sb = ast.add(&p.t, T_Literal, p.pos, p.pos)
+  let shebang = p.t.s[sb] + ""
+  if allspacing(&p) < 0: return -1
+  let asp = p.pos
+  var anns: [Ann] = []
+  if read_annotations(&p, &anns) < 0: return -1
+  var shell_ann = p.shell_flag
+  for a in anns:
+    if a.kind == ANN_SHELL: shell_ann = true
+  for a in rc:
+    if a.kind == ANN_SHELL: shell_ann = true
+  let has = anns.len > 0
+  var all: [Ann] = []
+  for a in anns: all.push(Ann(a.kind, a.lo, a.hi, a.s + ""))
+  for a in rc: all.push(Ann(a.kind, a.lo, a.hi, a.s + ""))
+  let ai = add_anns(&p, anns)
+  let aall = add_anns(&p, all)
+  if has: p.ctx.push(Ctx(CX_ANN, 0, "", ai))
+  if has_bom: problem_at(&p, pos, pos, ERR, 1082, "This file has a UTF-8 BOM. Remove it with: LC_CTYPE=C sed '1s/^...//' < yourscript .")
+  let aid_ep = p.pos
+  let exe = executable_from_shebang(shebang)
+  if not shell_ann:
+    let v = valid_shell(exe)
+    if v == 0: problem_at(&p, pos, pos, ERR, 1071, "ShellCheck only supports sh/bash/dash/ksh/'busybox sh' scripts. Sorry!")
+    elif v < 0: problem_at(&p, pos, pos, ERR, 1008, "This shebang was unrecognized. ShellCheck only supports sh/bash/dash/ksh/'busybox sh'. Add a 'shell' directive to specify.")
+  if shell_ann or valid_shell(exe) != 0:
+    var cmds: [Int] = []
+    if read_compound_list_or_empty(&p, &cmds) < 0: return -1
+    let sep = p.pos
+    if read_pending_heredocs(&p) < 0: return -1
+    verify_eof(&p)
+    let scr = ast.add(&p.t, T_Script, sp, sep)
+    p.t.a[scr] = sb
+    ast.set1(&p.t, scr, cmds)
+    let root = ast.add(&p.t, T_Annotation, asp, aid_ep)
+    p.t.f[root] = aall
+    p.t.a[root] = scr
+    if has: pop_ctx(&p)
+    p.assoc = associative_arrays(p.t, root)
+    if reparse(&p, root) < 0: return -1
+    return root
+  while not at_eof(p): adv(&p)
+  let scr = ast.add(&p.t, T_Script, sp, p.pos)
+  p.t.a[scr] = sb
+  if has: pop_ctx(&p)
+  return scr
+
+fn associative_arrays(t: ast.Ast, root: Int) -> [Str]:
+  var out: [Str] = []
+  var stack: [Int] = [root]
+  while stack.len > 0:
+    let n = stack.pop()
+    if t.k[n] == T_SimpleCommand:
+      if name = astlib.command_name(t, n):
+        if name == "declare" or name == "local" or name == "typeset":
+          let flags = astlib.all_flags(t, n)
+          var has_a = false
+          for f in flags:
+            if f.f == "A": has_a = true
+          if has_a:
+            for f in flags:
+              if f.f.len == 0:
+                if t.k[f.tok] == T_Assignment:
+                  if not (t.s[f.tok] in out): out.push(t.s[f.tok] + "")
+                elif s = get_literal(t, f.tok):
+                  if not (s in out): out.push(s)
+    for c in ast.kids(t, n): stack.push(c)
+  return out
+
+fn idx_assoc(var p: P) -> Int:
+  push_name(&p, "associative array index")
+  let st = p.i
+  let rr_ = read_index_span(&p)
+  return cend(&p, st, rr_)
+
+fn idx_arith(var p: P) -> Int:
+  let st = p.i
+  push_name(&p, "arithmetic array index expression")
+  let c = peek(p)
+  if c == 32 or c == 9 or c == 10 or c == 13 or c == 11 or c == 12 or c == 0xA0: adv(&p)
+  let rr_ = read_arithmetic_contents(&p)
+  return cend(&p, st, rr_)
+
+fn fix_index(var p: P, name: Str, w: Int) -> Int:
+  if p.t.k[w] != T_UnparsedIndex: return w
+  let assoc = name in p.assoc
+  var s = sub_begin(&p, p.t.f[w], p.t.s[w] + "")
+  var r = -1
+  if assoc: r = idx_assoc(&p)
+  else: r = idx_arith(&p)
+  sub_end(&p, &s)
+  if r < 0: return -1
+  if reparse(&p, r) < 0: return -1
+  return r
+
+# reparseIndices: T_UnparsedIndex in assignments and arithmetic variables become trees
+fn reparse(var p: P, n: Int) -> Int:
+  for c in ast.kids(p.t, n):
+    if reparse(&p, c) < 0: return -1
+  let k = p.t.k[n]
+  if k == T_Assignment or k == TA_Variable:
+    let name = p.t.s[n] + ""
+    for i in 0..p.t.n1[n]:
+      let w = ast.at1(p.t, n, i)
+      let r = fix_index(&p, name, w)
+      if r < 0: return -1
+      p.t.L[p.t.l1[n] + i] = r
+    if k == T_Assignment and p.t.a[n] >= 0 and p.t.k[p.t.a[n]] == T_Array:
+      let arr = p.t.a[n]
+      for j in 0..p.t.n1[arr]:
+        let el = ast.at1(p.t, arr, j)
+        if p.t.k[el] == T_IndexedElement:
+          for i in 0..p.t.n1[el]:
+            let w = ast.at1(p.t, el, i)
+            let r = fix_index(&p, name, w)
+            if r < 0: return -1
+            p.t.L[p.t.l1[el] + i] = r
+  return 0
+
+fn note_eq(a: Note, b: Note) -> Bool:
+  return a.sp == b.sp and a.ep == b.ep and a.sev == b.sev and a.code == b.code and a.msg == b.msg
+
+# The options of a parse (ParseSpec, and the rc file the parser reads).
+type PSpec:
+  fname: Str
+  cs: Bool
+  shell_flag: Bool
+  rc: [Ann]
+  rc_err: Str
+  rc_probs: [Note]  # problems parsing the rc file (positions in file 0)
+  rc_path: Str
+  rc_text: Str
+
+fn no_source(ext: Int, paths: [Str], name: Str) -> ast.SrcRes:
+  return ast.SrcRes(false, name + "", name + " was not specified as input (see shellcheck -x).")
+
+fn parse_script(own src: Str, own ps: PSpec, own rd: fn(Int, [Str], Str) -> ast.SrcRes) -> Parsed:
+  let text = src + ""
+  var p = P(src, 0, pk(1, 1), pk(1, 1), false, "", [], [], [], [], 0, [], "", ast.new_ast(), [], ps.cs, [ps.fname + ""], [text], rd, [], ps.rc_err + "", ps.shell_flag)
+  swap(&p.rc, &ps.rc)
+  if ps.rc_probs.len > 0:
+    let fi = p.files.len
+    p.files.push(ps.rc_path + "")
+    p.texts.push(ps.rc_text + "")
+    for n in ps.rc_probs:
+      var m = ncopy(n)
+      m.sp = (fi << 52) | (m.sp & ((1 << 52) - 1))
+      m.ep = (fi << 52) | (m.ep & ((1 << 52) - 1))
+      p.probs.push(m)
+  let root = read_script_file(&p, false)
+  var out: [Note] = []
+  if root >= 0:
+    for n in p.notes: out.push(ncopy(n))
+    for n in p.probs: out.push(ncopy(n))
+  else:
+    var front: [Note] = []
+    for n in context_notes(p.ctx): front.push(ncopy(n))
+    front.push(err_note(Err(p.epos, p.ene, p.emsg + "")))
+    for n in front:
+      if not ignored_final(p, n.code): out.push(ncopy(n))
+    for n in p.probs: out.push(ncopy(n))
+  var t = ast.new_ast()
+  swap(&t, &p.t)
+  var files: [Str] = []
+  swap(&files, &p.files)
+  var texts: [Str] = []
+  swap(&texts, &p.texts)
+  return Parsed(t, root, out, files, texts)
+
+fn ignored_final(p: P, code: Int) -> Bool:
+  for c in p.ctx:
+    if c.kind == CX_ANN:
+      for a in p.t.anns[c.ann]:
+        if a.kind == ANN_DISABLE and code >= a.lo and code < a.hi: return true
+  return false
+
+# ---------------------------------------------------------------- .shellcheckrc
+
+type RcRes:
+  anns: [Ann]
+  err: Str          # the SC1134 message when it didn't parse, else ""
+  probs: [Note]     # its parse problems (they stay in ShellCheck's state, e.g. SC1017), file 0
+
+# anySpacingOrComment = many (allspacingOrFail <|> readAnyComment)
+fn any_spacing_or_comment(var p: P) -> Int:
+  while true:
+    let m = mark(p)
+    if allspacing_or_fail(&p) >= 0: continue
+    if p.i != m.i: return -1
+    reset(&p, m)
+    if read_any_comment(&p) >= 0: continue
+    if p.i != m.i: return -1
+    reset(&p, m)
+    return 0
+  return 0
+
+fn read_config_kvs(var p: P, var anns: [Ann]) -> Int:
+  if any_spacing_or_comment(&p) < 0: return -1
+  while true:
+    let m = mark(p)
+    let n = anns.len
+    if read_annotation_without_prefix(&p, false, &anns) < 0:
+      if p.i != m.i: return -1
+      reset(&p, m)
+      anns.truncate(n)
+      break
+    if any_spacing_or_comment(&p) < 0: return -1
+  return eof(&p)
+
+fn parse_rc(own src: Str, fname: Str) -> RcRes:
+  var p = P(src, 0, pk(1, 1), pk(1, 1), false, "", [], [], [], [], 0, [], "", ast.new_ast(), [], false, [fname + ""], [""], no_source, [], "", false)
+  var anns: [Ann] = []
+  let ok = read_config_kvs(&p, &anns) >= 0
+  var probs: [Note] = []
+  for n in p.probs: probs.push(ncopy(n))
+  if ok: return RcRes(anns, "", probs)
+  var m = ""
+  if p.emsg.len > 0: m = p.emsg + "."
+  return RcRes([], "Failed to process " + e4m(fname) + ", line {pline(p.epos)}: " + m + " Fix any mentioned problems and try again.", probs)

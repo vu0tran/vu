@@ -1,0 +1,345 @@
+# Helpers on the syntax tree, as ShellCheck's ASTLib.hs has them, and text helpers shared by the
+# parser and the checks.
+
+import ast
+from ast import T_Literal, T_NormalWord, T_DoubleQuoted, T_DollarDoubleQuoted, T_SingleQuoted, T_ParamSubSpecialChar
+from ast import T_DollarSingleQuoted, TA_Expansion, T_Glob
+
+# The character at byte i, decoded as ShellCheck decodes files (UTF-8, falling back to Latin-1 per
+# byte): the code point | length << 24, or -1 at the end.
+fn dec(s: Str, i: Int) -> Int:
+  if i >= s.len: return -1
+  let b0 = int(s[i])
+  if b0 < 0x80: return b0 | (1 << 24)
+  var x = 0
+  var n = 0
+  if b0 >= 0xF8: return b0 | (1 << 24)
+  elif b0 >= 0xF0:
+    x = b0 & 7
+    n = 3
+  elif b0 >= 0xE0:
+    x = b0 & 15
+    n = 2
+  elif b0 >= 0xC0:
+    x = b0 & 31
+    n = 1
+  else: return b0 | (1 << 24)
+  for k in 1..n + 1:
+    if i + k >= s.len: return b0 | (1 << 24)
+    let b = int(s[i + k])
+    if b < 0x80 or b > 0xBF: return b0 | (1 << 24)
+    x = (x << 6) | (b & 63)
+  if x > 0x10FFFF: return b0 | (1 << 24)
+  return x | ((n + 1) << 24)
+
+# Appends code point c to s as UTF-8 (a Latin-1 fallback byte stays one byte).
+fn put(var s: Str, c: Int):
+  if c < 0x80: s += str([byte(c)])
+  elif c < 0x800: s += str([byte(0xC0 | (c >> 6)), byte(0x80 | (c & 63))])
+  elif c < 0x10000: s += str([byte(0xE0 | (c >> 12)), byte(0x80 | ((c >> 6) & 63)), byte(0x80 | (c & 63))])
+  else: s += str([byte(0xF0 | (c >> 18)), byte(0x80 | ((c >> 12) & 63)), byte(0x80 | ((c >> 6) & 63)), byte(0x80 | (c & 63))])
+
+fn cstr(c: Int) -> Str:
+  var s = ""
+  put(&s, c)
+  return s
+
+# ---------------------------------------------------------------- literal strings of words
+
+# getLiteralStringExt with a default for non-literal parts: appends the text to out and says
+# whether every part was literal (getLiteralString is Just) .
+fn lit_def(t: ast.Ast, n: Int, d: Str, var out: Str) -> Bool:
+  let k = t.k[n]
+  if k == T_DoubleQuoted or k == T_DollarDoubleQuoted or k == T_NormalWord or k == TA_Expansion:
+    var ok = true
+    for i in 0..t.n1[n]:
+      if not lit_def(t, ast.at1(t, n, i), d, &out): ok = false
+    return ok
+  if k == T_SingleQuoted or k == T_Literal or k == T_ParamSubSpecialChar:
+    out += t.s[n]
+    return true
+  if k == T_DollarSingleQuoted:
+    out += decode_escapes(t.s[n])
+    return true
+  out += d
+  return false
+
+# getLiteralString
+fn get_literal(t: ast.Ast, n: Int) -> Str?:
+  var out = ""
+  if lit_def(t, n, "", &out): return out
+  return nil
+
+fn only_literal(t: ast.Ast, n: Int) -> Str:
+  var out = ""
+  lit_def(t, n, "", &out)
+  return out
+
+fn hexval(b: Byte) -> Int:
+  if b >= '0' and b <= '9': return int(b) - 48
+  if b >= 'a' and b <= 'f': return int(b) - 87
+  if b >= 'A' and b <= 'F': return int(b) - 55
+  return -1
+
+# Bash's $'..' decoding, as ShellCheck does it
+fn decode_escapes(s: Str) -> Str:
+  var out = ""
+  var j = 0
+  while j < s.len:
+    let b = s[j]
+    if b == '\\' and j + 1 < s.len:
+      let c = s[j + 1]
+      j += 2
+      if c == 'a': out += str([byte(7)])
+      elif c == 'b': out += str([byte(8)])
+      elif c == 'e': out += str([byte(27)])
+      elif c == 'f': out += str([byte(12)])
+      elif c == 'n': out += "\n"
+      elif c == 'r': out += "\r"
+      elif c == 't': out += "\t"
+      elif c == 'v': out += str([byte(11)])
+      elif c == '\'': out += "'"
+      elif c == '"': out += "\""
+      elif c == '\\': out += "\\"
+      elif c == 'x':
+        if j + 1 < s.len and hexval(s[j]) >= 0 and hexval(s[j + 1]) >= 0:
+          put(&out, 16 * hexval(s[j]) + hexval(s[j + 1]))
+          j += 2
+        elif j < s.len and hexval(s[j]) >= 0:
+          put(&out, hexval(s[j]))
+          j += 1
+        else: out += "\\x"
+      elif c >= '0' and c <= '7':
+        var n = int(c) - 48
+        var k = 1
+        while k < 3 and j < s.len and s[j] >= '0' and s[j] <= '7':
+          n = n * 8 + int(s[j]) - 48
+          j += 1
+          k += 1
+        put(&out, n % 256)
+      else:
+        out += "\\"
+        out += str([c])
+    else:
+      out += str([b])
+      j += 1
+  return out
+
+# oversimplify: a command or word as a list of strings, expansions as ${VAR}
+fn oversimplify(t: ast.Ast, n: Int, var out: [Str]):
+  let k = t.k[n]
+  if k == T_NormalWord or k == T_DoubleQuoted:
+    out.push(oversimp_parts(t, n))
+  elif k == T_SingleQuoted or k == T_Glob or k == T_Literal or k == T_ParamSubSpecialChar or k == T_DollarSingleQuoted:
+    out.push(t.s[n] + "")
+  elif k == ast.T_DollarBraced or k == ast.T_DollarArithmetic or k == ast.T_DollarExpansion or k == ast.T_Backticked:
+    out.push("${{VAR}}")
+  elif k == ast.T_Pipeline:
+    if t.n2[n] == 1: oversimplify(t, ast.at2(t, n, 0), &out)
+  elif k == ast.T_SimpleCommand:
+    for i in 0..t.n2[n]: oversimplify(t, ast.at2(t, n, i), &out)
+  elif k == ast.T_Redirecting or k == ast.T_Annotation:
+    oversimplify(t, t.a[n], &out)
+  elif k == ast.TA_Sequence:
+    if t.n1[n] == 1:
+      let x = ast.at1(t, n, 0)
+      if t.k[x] == TA_Expansion:
+        for i in 0..t.n1[x]: oversimplify(t, ast.at1(t, x, i), &out)
+
+fn oversimp_parts(t: ast.Ast, n: Int) -> Str:
+  var parts: [Str] = []
+  for i in 0..t.n1[n]: oversimplify(t, ast.at1(t, n, i), &parts)
+  var s = ""
+  for x in parts: s += x
+  return s
+
+# concat (oversimplify n)
+fn oversimp(t: ast.Ast, n: Int) -> Str:
+  var parts: [Str] = []
+  oversimplify(t, n, &parts)
+  var s = ""
+  for x in parts: s += x
+  return s
+
+type Flag:
+  tok: Int
+  f: Str
+
+# getFlagsUntil: stop 0 at "--" (getAllFlags), 1 at the first non-flag too (getLeadingFlags)
+fn flags_until(t: ast.Ast, cmd: Int, stop: Int) -> [Flag]:
+  var out: [Flag] = []
+  var stopped = false
+  for i in 1..t.n2[cmd]:
+    let x = ast.at2(t, cmd, i)
+    let s = oversimp(t, x)
+    if not stopped:
+      if s == "--" or (stop == 1 and not s.startswith("-")): stopped = true
+    if stopped:
+      out.push(Flag(x, ""))
+      continue
+    if s.startswith("--"):
+      let rest = s[2..s.len]
+      let k = rest.find("=")
+      if k >= 0: out.push(Flag(x, rest[0..k]))
+      else: out.push(Flag(x, rest))
+    elif s.startswith("-"):
+      var j = 1
+      while j < s.len:
+        let d = dec(s, j)
+        out.push(Flag(x, s[j..j + (d >> 24)]))
+        j += d >> 24
+    else: out.push(Flag(x, ""))
+  return out
+
+fn all_flags(t: ast.Ast, cmd: Int) -> [Flag]:
+  return flags_until(t, cmd, 0)
+
+fn leading_flags(t: ast.Ast, cmd: Int) -> [Flag]:
+  return flags_until(t, cmd, 1)
+
+fn has_flag(t: ast.Ast, cmd: Int, f: Str) -> Bool:
+  for x in all_flags(t, cmd):
+    if x.f == f: return true
+  return false
+
+# getCommand: the T_SimpleCommand (with a word) under wrappers, or -1
+fn get_command(t: ast.Ast, n: Int) -> Int:
+  var x = n
+  while true:
+    let k = t.k[x]
+    if k == ast.T_Redirecting or k == ast.T_Annotation: x = t.a[x]
+    elif k == ast.T_SimpleCommand:
+      if t.n2[x] > 0: return x
+      return -1
+    else: return -1
+  return -1
+
+fn word_parts_into(t: ast.Ast, n: Int, var out: [Int]):
+  let k = t.k[n]
+  if k == T_NormalWord or k == TA_Expansion:
+    for i in 0..t.n1[n]: word_parts_into(t, ast.at1(t, n, i), &out)
+  elif k == T_DoubleQuoted:
+    for i in 0..t.n1[n]: out.push(ast.at1(t, n, i))
+  else: out.push(n)
+
+fn word_parts(t: ast.Ast, n: Int) -> [Int]:
+  var out: [Int] = []
+  word_parts_into(t, n, &out)
+  return out
+
+# isFlag: the word starts with a literal dash
+fn is_flag(t: ast.Ast, n: Int) -> Bool:
+  let parts = word_parts(t, n)
+  if parts.len == 0: return false
+  return t.k[parts[0]] == T_Literal and t.s[parts[0]].startswith("-")
+
+type Opt:
+  name: Str
+  opt: Int
+  val: Int
+
+fn lit_or(t: ast.Ast, n: Int, d: Str) -> Str:
+  var out = ""
+  lit_def(t, n, d, &out)
+  return out
+
+# getOpts (gnu, arbitraryLongOpts) string longopts args; nil on failure
+fn get_opts(t: ast.Ast, gnu: Bool, arbitrary: Bool, spec: Str, longs: [Str], longargs: [Bool], args: [Int]) -> [Opt]?:
+  var out: [Opt] = []
+  var i = 0
+  while i < args.len:
+    let token = args[i]
+    let s = lit_or(t, token, "\0")
+    if s == "--":
+      for k in i + 1..args.len: out.push(Opt("", args[k], args[k]))
+      return out
+    if s.startswith("--"):
+      let word = s[2..s.len]
+      let eq = word.find("=")
+      var name = word
+      if eq >= 0: name = word[0..eq]
+      let has_arg = eq >= 0
+      var needs = false
+      var known = name.len == 0
+      if name.len == 1:
+        let k = spec.find(name)
+        if k >= 0:
+          known = true
+          needs = k + 1 < spec.len and spec[k + 1] == ':'
+      for li in 0..longs.len:
+        if longs[li] == name:
+          known = true
+          needs = longargs[li]
+      if not known and not arbitrary: return nil
+      if needs and not has_arg:
+        if i + 1 >= args.len: return nil
+        out.push(Opt(name, token, args[i + 1]))
+        i += 2
+        continue
+      out.push(Opt(name, token, token))
+      i += 1
+      continue
+    if s.startswith("-"):
+      # shortToOpts
+      var j = 1
+      var consumed_next = false
+      var done = false
+      while j < s.len and not done:
+        let c = s[j..j + 1]
+        var k = -1
+        if c != ":": k = spec.find(c)
+        if k < 0: return nil
+        let needs = k + 1 < spec.len and spec[k + 1] == ':'
+        if needs and j + 1 >= s.len:
+          if i + 1 >= args.len: return nil
+          out.push(Opt(c, token, args[i + 1]))
+          consumed_next = true
+          done = true
+        elif needs:
+          out.push(Opt(c, token, token))
+          done = true
+        else:
+          out.push(Opt(c, token, token))
+          j += 1
+      i += 1
+      if consumed_next: i += 1
+      continue
+    if gnu:
+      out.push(Opt("", token, token))
+      i += 1
+      continue
+    for k in i..args.len: out.push(Opt("", args[k], args[k]))
+    return out
+  return out
+
+# getCommandNameAndToken direct: the command's name (if literal) and its token
+fn command_name_token(t: ast.Ast, n: Int, direct: Bool, var tok: Int) -> Str?:
+  tok = n
+  let cmd = get_command(t, n)
+  if cmd < 0: return nil
+  let w = ast.at2(t, cmd, 0)
+  let s = get_literal(t, w) else return nil
+  tok = w
+  if direct: return s
+  var actual = -1
+  if s == "busybox" or s == "builtin" or s == "command" or s == "run":
+    if t.n2[cmd] >= 2:
+      let a = ast.at2(t, cmd, 1)
+      if not is_flag(t, a): actual = a
+  elif s == "exec":
+    var args: [Int] = []
+    for i in 1..t.n2[cmd]: args.push(ast.at2(t, cmd, i))
+    let ls: [Str] = []
+    let la: [Bool] = []
+    if opts = get_opts(t, false, false, "cla:", ls, la, args):
+      for o in opts:
+        if o.name.len == 0:
+          actual = o.opt
+          break
+  if actual < 0: return s
+  tok = actual
+  return get_literal(t, actual)
+
+fn command_name(t: ast.Ast, n: Int) -> Str?:
+  var tok = 0
+  return command_name_token(t, n, false, &tok)

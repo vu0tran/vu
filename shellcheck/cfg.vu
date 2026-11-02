@@ -1,0 +1,1232 @@
+# The control flow graph, as ShellCheck's CFG.hs builds it: nodes carry effects (variable reads and
+# writes, function definitions, exit codes), edges are flow, false flow (a fork that isn't taken
+# by the data), exit and errexit. Node numbers follow ShellCheck's, since the data flow processes
+# pending nodes in that order.
+
+import ast
+import astlib
+from ast import T_Literal, T_SingleQuoted, T_DoubleQuoted, T_NormalWord, T_DollarSingleQuoted, T_Glob
+from ast import TA_Assignment, TA_Binary, TA_Expansion, TA_Sequence, TA_Parenthesis, TA_Trinary, TA_Variable, TA_Unary
+from ast import TC_And, TC_Binary, TC_Empty, TC_Group, TC_Nullary, TC_Or, TC_Unary, T_Arithmetic, T_AndIf
+from ast import T_Array, T_Assignment, T_Backgrounded, T_Backticked, T_Banged, T_BatsTest, T_BraceExpansion
+from ast import T_BraceGroup, T_CaseExpression, T_Condition, T_CoProc, T_CoProcBody, T_DollarArithmetic
+from ast import T_DollarDoubleQuoted, T_DollarBracket, T_DollarBraced, T_DollarBraceCommandExpansion
+from ast import T_DollarExpansion, T_Extglob, T_FdRedirect, T_ForArithmetic, T_ForIn, T_Function
+from ast import T_HereString, T_HereDoc, T_IfExpression, T_Include, T_IndexedElement, T_IoDuplicate
+from ast import T_IoFile, T_OrIf, T_Pipeline, T_ProcSub, T_Redirecting, T_SelectIn, T_SimpleCommand
+from ast import T_SourceCommand, T_Subshell, T_UntilExpression, T_WhileExpression, T_Annotation, T_Script
+from ast import T_GREATAND, T_LESSAND, T_ParamSubSpecialChar, SINGLE, DOUBLE
+from astlib import oversimp, get_literal, Opt
+
+# node labels
+const N_STRUCT = 0
+const N_ENTRY = 1
+const N_DROPPREFIX = 2
+const N_EFFECTS = 3
+const N_EXEC = 4          # s: the command name ("" for none, f = 1 when known)
+const N_SUBSHELL = 5      # a: entry, b: exit
+const N_SETEXIT = 6       # a: token
+const N_IMPLIEDEXIT = 7
+const N_RESOLVEDEXIT = 8
+const N_UNRESOLVEDEXIT = 9
+const N_UNREACHABLE = 10
+const N_SETBGPID = 11
+
+# edges
+const E_ERREXIT = 0
+const E_FLOW = 1
+const E_FALSEFLOW = 2
+const E_EXIT = 3
+
+# effects
+const X_READ = 1
+const X_WRITE = 2
+const X_WGLOBAL = 3
+const X_WLOCAL = 4
+const X_WPREFIX = 5
+const X_SETPROPS = 6
+const X_UNSETPROPS = 7
+const X_DEFFN = 8
+const X_UNDEF = 9
+const X_UNDEFVAR = 10
+const X_UNDEFFN = 11
+const X_UNDEFNAMEREF = 12
+const X_HINTARRAY = 13
+
+# values
+const V_UNINIT = 0
+const V_ARRAY = 1
+const V_STRING = 2
+const V_INTEGER = 3
+const V_COMPUTED = 4
+
+# string parts
+const P_LIT = 1
+const P_VAR = 2
+const P_INT = 3
+const P_UNKNOWN = 4
+
+# variable properties (bits)
+const VP_EXPORT = 1
+const VP_ARRAY = 2
+const VP_ASSOC = 4
+const VP_INTEGER = 8
+
+# scopes
+const SC_NONE = -1
+const SC_GLOBAL = 0
+const SC_LOCAL = 1
+const SC_PREFIX = 2
+
+type Eff:
+  kind: Int
+  name: Str
+  id: Int
+  val: Int        # writes: index in G.vals
+  scope: Int
+  props: Int
+  fdef: Int       # X_DEFFN: index in G.fdefs
+
+type Val:
+  kind: Int
+  ps: Int         # parts start in G.parts
+  pn: Int
+
+type Part:
+  kind: Int
+  name: Str       # P_VAR
+  lit: Str        # P_LIT
+
+type FDef:
+  name: Str
+  id: Int
+  entry: Int
+  exit: Int
+
+type G:
+  t: ast.Ast
+  lab: [Int]
+  na: [Int]
+  nb: [Int]
+  ns: [Str]
+  nef: [Int]      # effects start
+  nen: [Int]      # effects count
+  effs: [Eff]
+  vals: [Val]
+  parts: [Part]
+  fdefs: [FDef]
+  efrom: [Int]
+  eto: [Int]
+  ekind: [Int]
+  trange: {Int: Int}    # token -> range (start << 32 | end)
+  tlo: [Int]            # token -> the first and last+1 node created while building it (-1: none)
+  thi: [Int]
+  # context
+  is_cond: Bool
+  is_func: Bool
+  exit_target: Int
+  return_target: Int
+  lastpipe: Bool
+
+fn rng(a: Int, b: Int) -> Int:
+  return (a << 32) | b
+
+fn rs(r: Int) -> Int:
+  return r >> 32
+
+fn re(r: Int) -> Int:
+  return r & 0xffffffff
+
+fn new_node(var g: G, label: Int) -> Int:
+  let n = g.lab.len
+  g.lab.push(label)
+  g.na.push(-1)
+  g.nb.push(-1)
+  g.ns.push("")
+  g.nef.push(0)
+  g.nen.push(0)
+  return n
+
+fn new_range(var g: G, label: Int) -> Int:
+  let n = new_node(&g, label)
+  return rng(n, n)
+
+fn none_(var g: G) -> Int:
+  return new_range(&g, N_STRUCT)
+
+fn effects_node(var g: G, own es: [Eff]) -> Int:
+  let n = new_node(&g, N_EFFECTS)
+  g.nef[n] = g.effs.len
+  g.nen[n] = es.len
+  for e in es: g.effs.push(Eff(e.kind, e.name + "", e.id, e.val, e.scope, e.props, e.fdef))
+  return rng(n, n)
+
+fn single(var g: G, e: Eff) -> Int:
+  return effects_node(&g, [Eff(e.kind, e.name + "", e.id, e.val, e.scope, e.props, e.fdef)])
+
+fn eread(id: Int, name: Str) -> Eff:
+  return Eff(X_READ, name, id, -1, SC_NONE, 0, -1)
+
+fn ewrite(kind: Int, id: Int, name: Str, val: Int) -> Eff:
+  return Eff(kind, name, id, val, SC_NONE, 0, -1)
+
+fn add_val(var g: G, kind: Int) -> Int:
+  g.vals.push(Val(kind, 0, 0))
+  return g.vals.len - 1
+
+fn computed(var g: G, own parts: [Part]) -> Int:
+  let st = g.parts.len
+  let n = parts.len
+  for p in parts: g.parts.push(Part(p.kind, p.name + "", p.lit + ""))
+  g.vals.push(Val(V_COMPUTED, st, n))
+  return g.vals.len - 1
+
+fn link(var g: G, a: Int, b: Int, kind: Int):
+  g.efrom.push(a)
+  g.eto.push(b)
+  g.ekind.push(kind)
+
+# linkRange: the edge mid1 -> mid2, the span start..end
+fn link_range(var g: G, x: Int, y: Int) -> Int:
+  link(&g, re(x), rs(y), E_FLOW)
+  return rng(rs(x), re(y))
+
+fn link_range_as(var g: G, kind: Int, x: Int, y: Int) -> Int:
+  link(&g, re(x), rs(y), kind)
+  return rng(rs(x), re(y))
+
+fn link_ranges(var g: G, rs_: [Int]) -> Int:
+  var cur = rs_[0]
+  for k in 1..rs_.len: cur = link_range(&g, cur, rs_[k])
+  return cur
+
+fn span_range(x: Int, y: Int) -> Int:
+  return rng(rs(x), re(y))
+
+fn register(var g: G, id: Int, r: Int):
+  g.trange[id] = r
+
+fn sequentially(var g: G, list: [Int]) -> Int:
+  var rr: [Int] = [none_(&g)]
+  for x in list: rr.push(build(&g, x))
+  return link_ranges(&g, rr)
+
+fn subshell(var g: G, id: Int, reason: Str, body: [Int], mode: Int) -> Int:
+  # mode 0: sequentially body, 1: build body[0]
+  let start = new_node(&g, N_ENTRY)
+  let end = new_node(&g, N_STRUCT)
+  let oe = g.exit_target
+  let orr = g.return_target
+  g.exit_target = end
+  g.return_target = end
+  var middle = 0
+  if mode == 0: middle = sequentially(&g, body)
+  else: middle = build(&g, body[0])
+  g.exit_target = oe
+  g.return_target = orr
+  link_ranges(&g, [rng(start, start), middle, rng(end, end)])
+  let n = new_node(&g, N_SUBSHELL)
+  g.na[n] = start
+  g.nb[n] = end
+  g.ns[n] = reason
+  return rng(n, n)
+
+fn empty_g() -> G:
+  return G(ast.new_ast(), [], [], [], [], [], [], [], [], [], [], [], [], [], {}, [], [], false, false, -1, -1, false)
+
+fn build_graph(own t: ast.Ast, root: Int, lastpipe: Bool, var out_t: ast.Ast) -> G:
+  var g = G(t, [], [], [], [], [], [], [], [], [], [], [], [], [], {}, [], [], false, false, -1, -1, lastpipe)
+  let entry = new_range(&g, N_ENTRY)
+  let implied = new_node(&g, N_IMPLIEDEXIT)
+  let end = new_node(&g, N_STRUCT)
+  g.exit_target = end
+  g.return_target = implied
+  let start = build(&g, root)
+  g.exit_target = -1
+  g.return_target = -1
+  let r = link_ranges(&g, [entry, start, rng(implied, implied), rng(end, end)])
+  register(&g, root, r)
+  return g
+
+fn build(var g: G, t: Int) -> Int:
+  let lo = g.lab.len
+  let r = build1(&g, t)
+  register(&g, t, r)
+  while g.tlo.len <= t:
+    g.tlo.push(-1)
+    g.thi.push(-1)
+  if g.tlo[t] < 0 or lo < g.tlo[t]: g.tlo[t] = lo
+  if g.lab.len > g.thi[t]: g.thi[t] = g.lab.len
+  return r
+
+fn indices_of(g: G, t: Int) -> [Int]:
+  return ast.list1(g.t, t)
+
+fn int_or_array_val(var g: G, has_idx: Bool) -> Int:
+  if has_idx: return add_val(&g, V_ARRAY)
+  return add_val(&g, V_INTEGER)
+
+fn build1(var g: G, t: Int) -> Int:
+  let k = g.t.k[t]
+  if k == T_Annotation: return build(&g, g.t.a[t])
+  if k == T_Script: return sequentially(&g, ast.list1(g.t, t))
+  if k == TA_Assignment:
+    let var_ = g.t.a[t]
+    if g.t.k[var_] == TA_Variable:
+      let name = g.t.s[var_] + ""
+      let idx = indices_of(g, var_)
+      let value = build(&g, g.t.b[t])
+      let subscript = sequentially(&g, idx)
+      var read = 0
+      if g.t.s[t] == "=": read = none_(&g)
+      else: read = single(&g, eread(t, name))
+      let v = int_or_array_val(&g, idx.len > 0)
+      let write = single(&g, ewrite(X_WRITE, t, name, v))
+      return link_ranges(&g, [value, subscript, read, write])
+    return sequentially(&g, [g.t.a[t], g.t.b[t]])
+  if k == TA_Binary: return sequentially(&g, [g.t.a[t], g.t.b[t]])
+  if k == TA_Expansion or k == TA_Sequence: return sequentially(&g, ast.list1(g.t, t))
+  if k == TA_Parenthesis: return build(&g, g.t.a[t])
+  if k == TA_Trinary:
+    let cond = build(&g, g.t.a[t])
+    let a = build(&g, g.t.b[t])
+    let b = build(&g, g.t.c[t])
+    let end = none_(&g)
+    link_ranges(&g, [cond, a, end])
+    return link_ranges(&g, [cond, b, end])
+  if k == TA_Variable:
+    let name = g.t.s[t] + ""
+    let idx = indices_of(g, t)
+    let subscript = sequentially(&g, idx)
+    var hint = 0
+    if idx.len == 0: hint = none_(&g)
+    else: hint = single(&g, Eff(X_HINTARRAY, name, t, -1, SC_NONE, 0, -1))
+    let read = single(&g, eread(t, name))
+    return link_ranges(&g, [subscript, hint, read])
+  if k == TA_Unary:
+    let arg = g.t.a[t]
+    let op = g.t.s[t]
+    if g.t.k[arg] == TA_Variable and (op.find("--") >= 0 or op.find("++") >= 0):
+      let name = g.t.s[arg] + ""
+      let idx = indices_of(g, arg)
+      let subscript = sequentially(&g, idx)
+      let read = single(&g, eread(t, name))
+      let v = int_or_array_val(&g, idx.len > 0)
+      let write = single(&g, ewrite(X_WRITE, t, name, v))
+      return link_ranges(&g, [subscript, read, write])
+    return build(&g, arg)
+  if k == TC_And or k == TC_Or:
+    if g.t.f[t] == SINGLE: return sequentially(&g, [g.t.a[t], g.t.b[t]])
+    let left = build(&g, g.t.a[t])
+    let right = build(&g, g.t.b[t])
+    let end = none_(&g)
+    link_ranges(&g, [left, right, end])
+    return link_range(&g, left, end)
+  if k == TC_Binary:
+    let left = build(&g, g.t.a[t])
+    let right = build(&g, g.t.b[t])
+    return link_range(&g, left, right)
+  if k == TC_Empty: return none_(&g)
+  if k == TC_Group or k == TC_Nullary or k == TC_Unary: return build(&g, g.t.a[t])
+  if k == T_Arithmetic:
+    let exe = build(&g, g.t.a[t])
+    let st = setexit(&g, t)
+    return link_range(&g, exe, st)
+  if k == T_AndIf or k == T_OrIf:
+    let left = build(&g, g.t.a[t])
+    let right = build(&g, g.t.b[t])
+    let end = none_(&g)
+    link_range(&g, left, right)
+    link_range(&g, right, end)
+    return link_range(&g, left, end)
+  if k == T_Array or k == T_BraceExpansion or k == T_BraceGroup or k == T_DollarDoubleQuoted or k == T_DoubleQuoted or k == T_Extglob or k == T_NormalWord or k == T_HereDoc or k == T_DollarBraceCommandExpansion:
+    return sequentially(&g, ast.list1(g.t, t))
+  if k == T_Assignment: return build_assignment(&g, SC_NONE, t)
+  if k == T_Backgrounded:
+    let start = none_(&g)
+    let fork = subshell(&g, t, "backgrounding '&'", [g.t.a[t]], 1)
+    let pid = new_range(&g, N_SETBGPID)
+    let st = setexit(&g, t)
+    link_range(&g, start, fork)
+    link_range_as(&g, E_FALSEFLOW, fork, pid)
+    return link_ranges(&g, [start, pid, st])
+  if k == T_Backticked: return subshell(&g, t, "`..` expansion", ast.list1(g.t, t), 0)
+  if k == T_Banged:
+    let main = build(&g, g.t.a[t])
+    let st = setexit(&g, t)
+    return link_range(&g, main, st)
+  if k == T_BatsTest:
+    let vv1_ = add_val(&g, V_INTEGER)
+    let status = single(&g, ewrite(X_WRITE, t, "status", vv1_))
+    let vv2_ = add_val(&g, V_STRING)
+    let output = single(&g, ewrite(X_WRITE, t, "output", vv2_))
+    let main = build(&g, g.t.a[t])
+    return link_ranges(&g, [status, output, main])
+  if k == T_CaseExpression: return build_case(&g, t)
+  if k == T_Condition:
+    let cond = build(&g, g.t.a[t])
+    let st = setexit(&g, t)
+    return link_range(&g, cond, st)
+  if k == T_CoProc:
+    var name: Str? = "COPROC"
+    if g.t.a[t] >= 0: name = get_literal(g.t, g.t.a[t])
+    let start = none_(&g)
+    var parent = 0
+    if nm = name:
+      let vv3_ = add_val(&g, V_ARRAY)
+      parent = single(&g, ewrite(X_WRITE, t, nm, vv3_))
+    else: parent = none_(&g)
+    let child = subshell(&g, t, "coproc", [g.t.b[t]], 1)
+    let end = setexit(&g, t)
+    link_range(&g, start, parent)
+    link_range(&g, start, child)
+    link_range(&g, parent, end)
+    link_range_as(&g, E_FALSEFLOW, child, end)
+    return span_range(start, end)
+  if k == T_CoProcBody or k == T_DollarArithmetic or k == T_DollarBracket or k == T_HereString or k == T_Include:
+    return build(&g, g.t.a[t])
+  if k == T_DollarSingleQuoted or k == T_Glob or k == T_Literal or k == T_SingleQuoted or k == T_ParamSubSpecialChar:
+    return none_(&g)
+  if k == T_DollarBraced:
+    let w = g.t.a[t]
+    let s = oversimp(g.t, w)
+    let modifier = braced_modifier(s)
+    let reference = braced_reference(s)
+    var others_names = index_references(s)
+    for x in offset_references(s): others_names.push(x)
+    let vals = build(&g, w)
+    var chain: [Int] = [vals]
+    for x in others_names: chain.push(single(&g, eread(t, x)))
+    let deps = link_ranges(&g, chain)
+    let read = single(&g, eread(t, reference))
+    let total = link_range(&g, deps, read)
+    if modifier.startswith("=") or modifier.startswith(":="):
+      let vv4_ = add_val(&g, V_STRING)
+      let opt = single(&g, ewrite(X_WRITE, t, reference, vv4_))
+      let result = none_(&g)
+      link_range(&g, opt, result)
+      return link_range(&g, total, result)
+    return total
+  if k == T_DollarExpansion: return subshell(&g, t, "$(..) expansion", ast.list1(g.t, t), 0)
+  if k == T_FdRedirect:
+    let v = g.t.s[t]
+    if v.startswith("{{"):
+      var e = v.find("}}")
+      if e < 0: e = v.len
+      let name = v[1..e]
+      let expr = build(&g, g.t.a[t])
+      var rw = 0
+      if is_closing_file_op(g.t, g.t.a[t]): rw = single(&g, eread(t, name))
+      else:
+        let vv5_ = add_val(&g, V_INTEGER)
+        rw = single(&g, ewrite(X_WRITE, t, name, vv5_))
+      return link_range(&g, expr, rw)
+    return build(&g, g.t.a[t])
+  if k == T_ForArithmetic:
+    let init = build(&g, g.t.a[t])
+    let cond = build(&g, g.t.b[t])
+    let body = sequentially(&g, ast.list1(g.t, t))
+    let inc = build(&g, g.t.c[t])
+    let end = none_(&g)
+    link_ranges(&g, [init, cond, body, inc])
+    link_range(&g, cond, end)
+    link_range(&g, inc, cond)
+    return span_range(init, end)
+  if k == T_ForIn or k == T_SelectIn: return for_in(&g, t)
+  if k == T_Function:
+    let oe = g.exit_target
+    g.exit_target = -1
+    let entry = new_range(&g, N_ENTRY)
+    # withFunctionScope
+    let end = new_node(&g, N_STRUCT)
+    let orr = g.return_target
+    let of_ = g.is_func
+    g.return_target = end
+    g.is_func = true
+    let body = build(&g, g.t.a[t])
+    g.return_target = orr
+    g.is_func = of_
+    let f = link_ranges(&g, [body, rng(end, end)])
+    let r = link_range(&g, entry, f)
+    g.exit_target = oe
+    g.fdefs.push(FDef(g.t.s[t] + "", t, rs(r), re(r)))
+    let def = single(&g, Eff(X_DEFFN, g.t.s[t] + "", t, -1, SC_NONE, 0, g.fdefs.len - 1))
+    let exe = setexit(&g, t)
+    return link_range(&g, def, exe)
+  if k == T_IfExpression: return build_if(&g, t)
+  if k == T_IndexedElement:
+    let idx = sequentially(&g, ast.list1(g.t, t))
+    let value = build(&g, g.t.a[t])
+    return link_range(&g, idx, value)
+  if k == T_IoDuplicate: return build(&g, g.t.a[t])
+  if k == T_IoFile:
+    let ex = build(&g, g.t.b[t])
+    let op = build(&g, g.t.a[t])
+    return link_range(&g, ex, op)
+  if k == T_Pipeline: return build_pipeline(&g, t)
+  if k == T_ProcSub:
+    let start = none_(&g)
+    let body = subshell(&g, t, g.t.s[t] + "() process substitution", ast.list1(g.t, t), 0)
+    let end = none_(&g)
+    link_range(&g, start, body)
+    link_range_as(&g, E_FALSEFLOW, body, end)
+    return link_range(&g, start, end)
+  if k == T_Redirecting:
+    let redir = sequentially(&g, ast.list1(g.t, t))
+    let body = build(&g, g.t.a[t])
+    return link_range(&g, redir, body)
+  if k == T_SimpleCommand:
+    if g.t.n2[t] == 0:
+      let assigns = sequentially(&g, ast.list1(g.t, t))
+      let st = setexit(&g, t)
+      return link_range(&g, assigns, st)
+    var args = ast.list2(g.t, t)
+    let vars = ast.list1(g.t, t)
+    return handle_command(&g, t, vars, args, unquoted_literal(g.t, args[0]))
+  if k == T_SourceCommand:
+    let cmd = build(&g, g.t.a[t])
+    let end = none_(&g)
+    let inline = build(&g, g.t.b[t])
+    link_range(&g, cmd, inline)
+    link_range(&g, inline, end)
+    return span_range(cmd, inline)
+  if k == T_Subshell:
+    let main = subshell(&g, t, "explicit (..) subshell", ast.list1(g.t, t), 0)
+    let st = setexit(&g, t)
+    return link_range(&g, main, st)
+  if k == T_UntilExpression or k == T_WhileExpression:
+    let oc = g.is_cond
+    g.is_cond = true
+    let cond = sequentially(&g, ast.list1(g.t, t))
+    g.is_cond = oc
+    let body = sequentially(&g, ast.list2(g.t, t))
+    let end = setexit(&g, t)
+    link_range(&g, cond, body)
+    link_range(&g, body, cond)
+    return link_range(&g, cond, end)
+  return none_(&g)
+
+fn setexit(var g: G, id: Int) -> Int:
+  let n = new_node(&g, N_SETEXIT)
+  g.na[n] = id
+  return rng(n, n)
+
+fn unquoted_literal(t: ast.Ast, w: Int) -> Str?:
+  if t.k[w] != T_NormalWord: return nil
+  var s = ""
+  for i in 0..t.n1[w]:
+    let x = ast.at1(t, w, i)
+    if t.k[x] != T_Literal: return nil
+    s += t.s[x]
+  return s
+
+fn build_case(var g: G, t: Int) -> Int:
+  let meta = ast.list2(g.t, t)
+  let items = ast.list1(g.t, t)
+  let w = g.t.a[t]
+  if meta.len == 0: return build(&g, w)
+  let start = none_(&g)
+  let token = build(&g, w)
+  var types: [Int] = []
+  var conds: [Int] = []
+  var bodies: [Int] = []
+  var catchall = false
+  var pos = 0
+  var k = 0
+  while k < meta.len:
+    let typ = meta[k]
+    let np = meta[k + 1]
+    let nb = meta[k + 2]
+    var pats: [Int] = []
+    for i in 0..np: pats.push(items[pos + i])
+    var body: [Int] = []
+    for i in 0..nb: body.push(items[pos + np + i])
+    pos += np + nb
+    for pt in pats:
+      if is_catch_all(g.t, pt): catchall = true
+    # buildCond
+    let cs = none_(&g)
+    var cr: [Int] = [cs]
+    var built: [Int] = []
+    for pt in pats:
+      let b = build(&g, pt)
+      built.push(b)
+      cr.push(b)
+    let ce = none_(&g)
+    link_ranges(&g, cr)
+    for b in built: link_range(&g, b, ce)
+    let c = span_range(cs, ce)
+    let b = sequentially(&g, body)
+    link_range(&g, c, b)
+    types.push(typ)
+    conds.push(c)
+    bodies.push(b)
+    k += 3
+  let end = none_(&g)
+  link_range(&g, start, token)
+  link_range(&g, token, conds[0])
+  for i in 0..conds.len - 1:
+    link_range(&g, conds[i], conds[i + 1])
+    if types[i] == 1: link_range(&g, bodies[i], end)
+    elif types[i] == 2: link_range(&g, bodies[i], bodies[i + 1])
+    else: link_range(&g, bodies[i], conds[i + 1])
+  link_range(&g, bodies[bodies.len - 1], end)
+  if not catchall: link_range(&g, token, end)
+  return span_range(start, end)
+
+# wordToExactPseudoGlob c is a superset of * (only globs of *, no literals)
+fn is_catch_all(t: ast.Ast, w: Int) -> Bool:
+  let parts = astlib.word_parts(t, w)
+  if t.k[w] == T_NormalWord and t.n1[w] > 0:
+    let l0 = ast.at1(t, w, 0)
+    if t.k[l0] == T_Literal and t.s[l0].startswith("~"): return false
+  var has_many = false
+  for p in parts:
+    let k = t.k[p]
+    if k == T_Literal or k == T_SingleQuoted:
+      if t.s[p].len > 0: return false
+    elif k == T_Glob:
+      if t.s[p] == "*": has_many = true
+      else: return false
+    else: return false
+  return has_many
+
+fn build_if(var g: G, t: Int) -> Int:
+  let items = ast.list1(g.t, t)
+  let lens = ast.list2(g.t, t)
+  let start = none_(&g)
+  var results: [Int] = []
+  var prev = start
+  var pos = 0
+  var k = 0
+  while k + 1 < lens.len:
+    var conds: [Int] = []
+    for i in 0..lens[k]: conds.push(items[pos + i])
+    pos += lens[k]
+    var thens: [Int] = []
+    for i in 0..lens[k + 1]: thens.push(items[pos + i])
+    pos += lens[k + 1]
+    let oc = g.is_cond
+    g.is_cond = true
+    let cond = sequentially(&g, conds)
+    g.is_cond = oc
+    let action = sequentially(&g, thens)
+    link_range(&g, prev, cond)
+    link_range(&g, cond, action)
+    results.push(action)
+    prev = cond
+    k += 2
+  var elses: [Int] = []
+  for i in 0..lens[lens.len - 1]: elses.push(items[pos + i])
+  var rest = 0
+  if elses.len == 0: rest = setexit(&g, t)
+  else: rest = sequentially(&g, elses)
+  link_range(&g, prev, rest)
+  results.push(rest)
+  let end = none_(&g)
+  # mapM_ over (rest : actions in reverse)
+  var i = results.len - 1
+  link_range(&g, results[i], end)
+  var j = 0
+  while j < results.len - 1:
+    link_range(&g, results[results.len - 2 - j], end)
+    j += 1
+  return span_range(start, end)
+
+fn will_split(t: ast.Ast, x: Int) -> Bool:
+  let k = t.k[x]
+  if k == T_DollarBraced or k == T_DollarExpansion or k == ast.T_Backticked or k == T_BraceExpansion or k == T_Glob or k == T_Extglob: return true
+  if k == T_DoubleQuoted:
+    for i in 0..t.n1[x]:
+      if will_become_multiple(t, ast.at1(t, x, i)): return true
+    return false
+  if k == T_NormalWord:
+    for i in 0..t.n1[x]:
+      if will_split(t, ast.at1(t, x, i)): return true
+  return false
+
+fn is_array_expansion(t: ast.Ast, x: Int) -> Bool:
+  if t.k[x] != T_DollarBraced: return false
+  let s = oversimp(t, t.a[x])
+  return s.startswith("@") or (not s.startswith("#") and s.find("[@]") >= 0)
+
+fn will_concat_in_assignment(t: ast.Ast, x: Int) -> Bool:
+  let k = t.k[x]
+  if k == T_DollarBraced: return is_array_expansion(t, x)
+  if k == T_DoubleQuoted or k == T_NormalWord:
+    for i in 0..t.n1[x]:
+      if will_concat_in_assignment(t, ast.at1(t, x, i)): return true
+  return false
+
+fn will_become_multiple(t: ast.Ast, x: Int) -> Bool:
+  return will_concat_in_assignment(t, x) or wbm_f(t, x)
+
+fn wbm_f(t: ast.Ast, x: Int) -> Bool:
+  let k = t.k[x]
+  if k == T_Extglob or k == T_Glob or k == T_BraceExpansion: return true
+  if k == T_NormalWord:
+    for i in 0..t.n1[x]:
+      if wbm_f(t, ast.at1(t, x, i)): return true
+  return false
+
+fn for_in(var g: G, t: Int) -> Int:
+  let name = g.t.s[t] + ""
+  let words = ast.list1(g.t, t)
+  let entry = none_(&g)
+  let expansion = sequentially(&g, words)
+  let choice = none_(&g)
+  var assigns: [Int] = []
+  var any_split = false
+  for w in words:
+    if will_split(g.t, w): any_split = true
+  if words.len == 0 or any_split:
+    let vv6_ = add_val(&g, V_STRING)
+    assigns.push(single(&g, ewrite(X_WRITE, t, name, vv6_)))
+  else:
+    for w in words:
+      let v = computed(&g, token_to_parts(g.t, w))
+      assigns.push(single(&g, ewrite(X_WRITE, t, name, v)))
+  let body = sequentially(&g, ast.list2(g.t, t))
+  let exit = none_(&g)
+  link_ranges(&g, [entry, expansion, choice])
+  for a in assigns: link_ranges(&g, [choice, a, body])
+  link_range(&g, body, exit)
+  link_range(&g, expansion, exit)
+  link_range(&g, body, choice)
+  return span_range(entry, exit)
+
+fn build_pipeline(var g: G, t: Int) -> Int:
+  let cmds = ast.list2(g.t, t)
+  if cmds.len == 1: return build(&g, cmds[0])
+  let start = none_(&g)
+  var leading: [Int] = []
+  var last: [Int] = []
+  for i in 0..cmds.len:
+    if g.lastpipe and i == cmds.len - 1: last.push(build(&g, cmds[i]))
+    else: leading.push(subshell(&g, t, "pipeline", [cmds[i]], 1))
+  let end = setexit(&g, t)
+  for l in leading: link_range(&g, start, l)
+  for l in leading: link_range_as(&g, E_FALSEFLOW, l, end)
+  var chain: [Int] = [start]
+  for l in last: chain.push(l)
+  chain.push(end)
+  return link_ranges(&g, chain)
+
+fn token_to_parts(t: ast.Ast, x: Int) -> [Part]:
+  var out: [Part] = []
+  ttp(t, x, &out)
+  return out
+
+fn ttp(t: ast.Ast, x: Int, var out: [Part]):
+  let k = t.k[x]
+  if k == T_NormalWord or k == T_DoubleQuoted:
+    for i in 0..t.n1[x]: ttp(t, ast.at1(t, x, i), &out)
+  elif k == T_SingleQuoted or k == T_Literal: out.push(Part(P_LIT, "", t.s[x] + ""))
+  elif k == T_DollarArithmetic or k == T_DollarBracket: out.push(Part(P_INT, "", ""))
+  elif k == T_DollarBraced and is_unmodified_param(t, x):
+    out.push(Part(P_VAR, braced_reference(oversimp(t, t.a[x])), ""))
+  elif s = get_literal(t, x): out.push(Part(P_LIT, "", s))
+  else: out.push(Part(P_UNKNOWN, "", ""))
+
+fn is_unmodified_param(t: ast.Ast, x: Int) -> Bool:
+  if t.f[x] == 0: return true
+  let s = oversimp(t, t.a[x])
+  return braced_reference(s) == s
+
+fn build_assignment(var g: G, scope: Int, t: Int) -> Int:
+  let name = g.t.s[t] + ""
+  let mode = g.t.f[t]
+  let value = g.t.a[t]
+  let idx = ast.list1(g.t, t)
+  let expand = build(&g, value)
+  let index = sequentially(&g, idx)
+  var read = 0
+  if mode == 1: read = single(&g, eread(t, name))
+  else: read = none_(&g)
+  var v = 0
+  if idx.len > 0: v = add_val(&g, V_ARRAY)
+  else:
+    let vk = g.t.k[value]
+    if vk == T_NormalWord or vk == T_Literal:
+      var parts: [Part] = []
+      if mode == 1: parts.push(Part(P_VAR, name + "", ""))
+      for p in token_to_parts(g.t, value): parts.push(Part(p.kind, p.name + "", p.lit + ""))
+      v = computed(&g, parts)
+    else: v = add_val(&g, V_ARRAY)
+  var wk = X_WRITE
+  if scope == SC_PREFIX: wk = X_WPREFIX
+  elif scope == SC_LOCAL: wk = X_WLOCAL
+  elif scope == SC_GLOBAL: wk = X_WGLOBAL
+  let write = single(&g, ewrite(wk, t, name, v))
+  let op = link_ranges(&g, [expand, index, read, write])
+  register(&g, t, op)
+  return op
+
+fn is_closing_file_op(t: ast.Ast, op: Int) -> Bool:
+  if t.k[op] != T_IoDuplicate or t.s[op] != "-": return false
+  let o = t.a[op]
+  return t.k[o] == T_GREATAND or t.k[o] == T_LESSAND
+
+# regularExpansion vars args p, with p's range given
+fn regular_expansion_begin(var g: G, vars: [Int], args: [Int]) -> [Int]:
+  var chain: [Int] = [sequentially(&g, args)]
+  for v in vars: chain.push(build_assignment(&g, SC_PREFIX, v))
+  return chain
+
+fn regular_expansion_end(var g: G, vars: [Int], var chain: [Int], exe: Int) -> Int:
+  chain.push(exe)
+  if vars.len > 0: chain.push(new_range(&g, N_DROPPREFIX))
+  return link_ranges(&g, chain)
+
+fn with_status(var g: G, initial: Int, cmd: Int) -> Int:
+  let st = setexit(&g, cmd)
+  return link_range(&g, initial, st)
+
+fn handle_command(var g: G, cmd: Int, vars: [Int], args: [Int], lit: Str?) -> Int:
+  let name = lit else ""
+  let known = lit != nil
+  if known and name == "exit":
+    var chain = regular_expansion_begin(&g, vars, args)
+    var exe = 0
+    if g.exit_target >= 0:
+      let ex = new_node(&g, N_RESOLVEDEXIT)
+      link(&g, ex, g.exit_target, E_EXIT)
+      let un = new_node(&g, N_UNREACHABLE)
+      exe = rng(ex, un)
+    else:
+      let ex = new_node(&g, N_UNRESOLVEDEXIT)
+      let un = new_node(&g, N_UNREACHABLE)
+      exe = rng(ex, un)
+    return regular_expansion_end(&g, vars, &chain, exe)
+  if known and name == "return":
+    var chain = regular_expansion_begin(&g, vars, args)
+    let ret = new_node(&g, N_STRUCT)
+    link(&g, ret, g.return_target, E_FLOW)
+    let un = new_node(&g, N_UNREACHABLE)
+    return regular_expansion_end(&g, vars, &chain, rng(ret, un))
+  if known and name == "unset":
+    var chain = regular_expansion_begin(&g, vars, args)
+    let exe = handle_unset(&g, args)
+    let ree = regular_expansion_end(&g, vars, &chain, exe)
+    return with_status(&g, ree, args[0])
+  if known and (name == "declare" or name == "local" or name == "typeset"): return handle_declare(&g, args)
+  if known and (name == "printf" or name == "wait" or name == "mapfile" or name == "readarray" or name == "read" or name == "DEFINE_boolean" or name == "DEFINE_float" or name == "DEFINE_integer" or name == "DEFINE_string"):
+    var chain = regular_expansion_begin(&g, vars, args)
+    var exe = 0
+    if name == "printf": exe = handle_printf(&g, args)
+    elif name == "wait": exe = handle_wait(&g, args)
+    elif name == "mapfile" or name == "readarray": exe = handle_mapfile(&g, args)
+    elif name == "read": exe = handle_read(&g, args)
+    else: exe = handle_define(&g, args)
+    let ree = regular_expansion_end(&g, vars, &chain, exe)
+    return with_status(&g, ree, args[0])
+  if known and name == "builtin" and args.len > 1:
+    var rest: [Int] = []
+    for i in 1..args.len: rest.push(args[i])
+    return handle_command(&g, cmd, vars, rest, get_literal(g.t, args[1]))
+  if known and name == "command" and args.len > 1:
+    var rest: [Int] = []
+    for i in 1..args.len: rest.push(args[i])
+    return handle_others(&g, args[1], vars, rest, get_literal(g.t, args[1]))
+  return handle_others(&g, cmd, vars, args, lit)
+
+fn handle_others(var g: G, id: Int, vars: [Int], args: [Int], lit: Str?) -> Int:
+  var chain = regular_expansion_begin(&g, vars, args)
+  let n = new_node(&g, N_EXEC)
+  if s = lit:
+    g.ns[n] = s
+    g.na[n] = 1
+  else: g.na[n] = 0
+  let st = setexit(&g, id)
+  let exe = link_range(&g, rng(n, n), st)
+  return regular_expansion_end(&g, vars, &chain, exe)
+
+fn rest_of(args: [Int]) -> [Int]:
+  var r: [Int] = []
+  for i in 1..args.len: r.push(args[i])
+  return r
+
+fn handle_unset(var g: G, args: [Int]) -> Int:
+  let rest = rest_of(args)
+  var names: [Int] = []
+  var flags: [Str] = []
+  let ls: [Str] = []
+  let la: [Bool] = []
+  if opts = astlib.get_opts(g.t, true, false, "vfn", ls, la, rest):
+    for o in opts:
+      if o.name.len == 0: names.push(o.opt)
+      else: flags.push(o.name + "")
+  else:
+    for x in rest: names.push(x)
+  var kind = X_UNDEF
+  if "n" in flags: kind = X_UNDEFNAMEREF
+  elif "v" in flags: kind = X_UNDEFVAR
+  elif "f" in flags: kind = X_UNDEFFN
+  var es: [Eff] = []
+  for nm in names:
+    if s = get_literal(g.t, nm): es.push(Eff(kind, s, nm, -1, SC_NONE, 0, -1))
+  return effects_node(&g, es)
+
+fn generic_opt_names(t: ast.Ast, args: [Int]) -> [Str]:
+  var r: [Str] = []
+  for o in generic_opts(t, args): r.push(o.name + "")
+  return r
+
+fn handle_declare(var g: G, args: [Int]) -> Int:
+  let cmd = args[0]
+  let rest = rest_of(args)
+  let opts = generic_opt_names(g.t, rest)
+  let assoc = "A" in opts
+  let array = "a" in opts or assoc
+  let integer = "i" in opts
+  let global = "g" in opts
+  let export = "x" in opts
+  var wkind = X_WRITE
+  var scope = SC_NONE
+  if global:
+    wkind = X_WGLOBAL
+    scope = SC_GLOBAL
+  elif g.is_func:
+    wkind = X_WLOCAL
+    scope = SC_LOCAL
+  var added = 0
+  if array: added = added | VP_ARRAY
+  if integer: added = added | VP_INTEGER
+  if export: added = added | VP_EXPORT
+  if assoc: added = added | VP_ASSOC
+  # unsetOptions: letters after + in literal arguments
+  var unset_opts = ""
+  for a in rest:
+    if s = get_literal(g.t, a):
+      if s.startswith("+"): unset_opts += s[1..s.len]
+  var removed = 0
+  if unset_opts.find("i") >= 0: removed = removed | VP_INTEGER
+  if unset_opts.find("e") >= 0: removed = removed | VP_EXPORT
+  var pre: [Int] = []
+  var assigns: [Eff] = []
+  var adds: [Eff] = []
+  var rems: [Eff] = []
+  for a in rest:
+    if g.t.k[a] == T_Assignment:
+      for x in ast.list1(g.t, a): pre.push(x)
+      let v = g.t.a[a]
+      pre.push(v)
+      let name = g.t.s[a] + ""
+      var parts: [Part] = []
+      if g.t.f[a] == 1: parts.push(Part(P_VAR, name + "", ""))
+      for p in token_to_parts(g.t, v): parts.push(Part(p.kind, p.name + "", p.lit + ""))
+      assigns.push(Eff(wkind, name + "", a, computed(&g, parts), SC_NONE, 0, -1))
+      if added != 0: adds.push(Eff(X_SETPROPS, name + "", a, -1, scope, added, -1))
+      if removed != 0: rems.push(Eff(X_UNSETPROPS, name + "", a, -1, scope, added, -1))
+    else:
+      pre.push(a)
+      let literal = astlib.lit_or(g.t, a, "\0")
+      let known = literal.find("\0") < 0
+      var name = literal
+      var has_match = false
+      # ^([_a-zA-Z][_a-zA-Z0-9]*)=
+      if literal.len > 0 and is_vstart(literal[0]):
+        var j = 1
+        while j < literal.len and is_vchar(literal[j]): j += 1
+        if j < literal.len and literal[j] == '=':
+          name = literal[0..j]
+          has_match = true
+      if not is_vname(name): continue
+      if has_match and known:
+        let eq = literal.find("=")
+        assigns.push(Eff(wkind, name + "", a, computed(&g, [Part(P_LIT, "", literal[eq + 1..literal.len])]), SC_NONE, 0, -1))
+      elif has_match:
+        assigns.push(Eff(wkind, name + "", a, add_val(&g, V_STRING), SC_NONE, 0, -1))
+      adds.push(Eff(X_SETPROPS, name + "", a, -1, scope, added, -1))
+      rems.push(Eff(X_UNSETPROPS, name + "", a, -1, scope, removed, -1))
+  let before = sequentially(&g, pre)
+  let an = effects_node(&g, assigns)
+  var ap = 0
+  if adds.len == 0: ap = none_(&g)
+  else: ap = effects_node(&g, adds)
+  var rp = 0
+  if rems.len == 0: rp = none_(&g)
+  else: rp = effects_node(&g, rems)
+  let result = setexit(&g, cmd)
+  return link_ranges(&g, [before, an, ap, rp, result])
+
+fn is_vstart(b: Byte) -> Bool:
+  return b == '_' or (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z')
+
+fn is_vchar(b: Byte) -> Bool:
+  return is_vstart(b) or (b >= '0' and b <= '9')
+
+fn is_vname(s: Str) -> Bool:
+  if s.len == 0 or not is_vstart(s[0]): return false
+  for k in 1..s.len:
+    if not is_vchar(s[k]): return false
+  return true
+
+fn handle_printf(var g: G, args: [Int]) -> Int:
+  var es: [Eff] = []
+  let ls: [Str] = []
+  let la: [Bool] = []
+  if opts = astlib.get_opts(g.t, false, false, "v:", ls, la, rest_of(args)):
+    for o in opts:
+      if o.name == "v":
+        if s = get_literal(g.t, o.val): es.push(ewrite(X_WRITE, o.val, s, add_val(&g, V_STRING)))
+        break
+  return effects_node(&g, es)
+
+fn handle_wait(var g: G, args: [Int]) -> Int:
+  var es: [Eff] = []
+  for o in generic_opts(g.t, rest_of(args)):
+    if o.name == "p":
+      if s = get_literal(g.t, o.val): es.push(ewrite(X_WRITE, o.val, s, add_val(&g, V_INTEGER)))
+      break
+  return effects_node(&g, es)
+
+fn handle_mapfile(var g: G, args: [Int]) -> Int:
+  let rest = rest_of(args)
+  var id = args[0]
+  var name = "MAPFILE"
+  var found = false
+  let ls: [Str] = []
+  let la: [Bool] = []
+  if opts = astlib.get_opts(g.t, true, false, "d:n:O:s:u:C:c:t", ls, la, rest):
+    for o in opts:
+      if o.name.len == 0:
+        if s = get_literal(g.t, o.val):
+          id = o.val
+          name = s
+          found = true
+        break
+  if not found:
+    var k = rest.len - 1
+    while k >= 0:
+      if s = get_literal(g.t, rest[k]):
+        if is_vname(s):
+          id = rest[k]
+          name = s
+          break
+      k -= 1
+  let vv7_ = add_val(&g, V_ARRAY)
+  return effects_node(&g, [ewrite(X_WRITE, id, name, vv7_)])
+
+fn handle_read(var g: G, args: [Int]) -> Int:
+  let rest = rest_of(args)
+  var es: [Eff] = []
+  let ls: [Str] = []
+  let la: [Bool] = []
+  if opts = astlib.get_opts(g.t, true, false, "sreu:n:N:i:p:a:t:", ls, la, rest):
+    var arr = -1
+    for o in opts:
+      if o.name == "a" and arr < 0: arr = o.val
+    if arr >= 0:
+      if s = get_literal(g.t, arr): es.push(ewrite(X_WRITE, arr, s, add_val(&g, V_ARRAY)))
+    else:
+      for o in opts:
+        if o.name.len == 0:
+          if s = get_literal(g.t, o.opt): es.push(ewrite(X_WRITE, o.opt, s, add_val(&g, V_STRING)))
+    return effects_node(&g, es)
+  # fallback: trailing literal names, else REPLY
+  var names: [Int] = []
+  var k = rest.len - 1
+  while k >= 0:
+    let s = get_literal(g.t, rest[k]) else break
+    names.push(rest[k])
+    k -= 1
+  var has_a = false
+  for o in generic_opts(g.t, rest):
+    if o.name == "a": has_a = true
+  var vk = V_STRING
+  if has_a: vk = V_ARRAY
+  if names.len == 0: es.push(ewrite(X_WRITE, args[0], "REPLY", add_val(&g, vk)))
+  else:
+    var i = names.len - 1
+    while i >= 0:
+      let nm = names[i]
+      es.push(ewrite(X_WRITE, nm, get_literal(g.t, nm) else "", add_val(&g, vk)))
+      i -= 1
+  return effects_node(&g, es)
+
+fn handle_define(var g: G, args: [Int]) -> Int:
+  var es: [Eff] = []
+  let rest = rest_of(args)
+  if rest.len >= 2:
+    if s = get_literal(g.t, rest[1]):
+      if is_vname(s): es.push(ewrite(X_WRITE, rest[1], s, add_val(&g, V_STRING)))
+  return effects_node(&g, es)
+
+# ---------------------------------------------------------------- shared helpers (as in check.vu)
+
+fn is_var_char_c(b: Byte) -> Bool:
+  return is_vchar(b)
+
+fn is_special_var_char(b: Byte) -> Bool:
+  return b == '*' or b == '@' or b == '#' or b == '?' or b == '-' or b == '$' or b == '!'
+
+fn braced_reference(s: Str) -> Str:
+  if s.len >= 2 and s[0] == '!' and is_vchar(s[1]):
+    var j = 2
+    while j < s.len and is_vchar(s[j]): j += 1
+    if j < s.len and (s[j] == '*' or s[j] == '?' or s[j] == '@'): return ""
+  var np = s
+  if s.len > 0 and (s[0] == '!' or s[0] == '#'): np = s[1..s.len]
+  var j = 0
+  while j < np.len and is_vchar(np[j]): j += 1
+  if j > 0: return np[0..j]
+  if np.len > 0 and is_special_var_char(np[0]): return np[0..1]
+  if s.len > 0 and is_special_var_char(s[0]): return s[0..1]
+  return s
+
+fn braced_modifier(s: Str) -> Str:
+  let v = braced_reference(s)
+  if s.len > 0 and (s[0] == '#' or s[0] == '!'):
+    let c = s[1..s.len]
+    if c.startswith(v): return c[v.len..c.len]
+  if s.startswith(v): return s[v.len..s.len]
+  return ""
+
+fn var_names_in(s: Str) -> [Str]:
+  var out: [Str] = []
+  var j = 0
+  while j < s.len:
+    if is_vstart(s[j]):
+      let st = j
+      while j < s.len and is_vchar(s[j]): j += 1
+      out.push(s[st..j])
+    else: j += 1
+  return out
+
+# getIndexReferences: "(\\[.*\\])" with '.' not matching a newline
+fn index_references(s: Str) -> [Str]:
+  var a = 0
+  while a < s.len:
+    if s[a] == '[':
+      var b = a + 1
+      var last = -1
+      while b < s.len and s[b] != '\n':
+        if s[b] == ']': last = b
+        b += 1
+      if last > a: return var_names_in(s[a..last + 1])
+    a += 1
+  let e: [Str] = []
+  return e
+
+fn offset_tail(m: Str, from: Int) -> Str?:
+  var j = from
+  while j < m.len and m[j] == ' ': j += 1
+  if j >= m.len or m[j] != ':': return nil
+  j += 1
+  if j >= m.len: return nil
+  let c = m[j]
+  if c == '-' or c == '=' or c == '?' or c == '+' or c == '\n': return nil
+  var e = j
+  while e < m.len and m[e] != '\n': e += 1
+  return m[j..e]
+
+fn offset_references(m: Str) -> [Str]:
+  let e: [Str] = []
+  if m.len > 0 and m[0] == '[':
+    var j = m.len - 1
+    while j > 1:
+      if m[j] == ']':
+        if s = offset_tail(m, j + 1): return var_names_in(s)
+      j -= 1
+    return e
+  if s = offset_tail(m, 0): return var_names_in(s)
+  return e
+
+fn generic_opts(t: ast.Ast, args: [Int]) -> [Opt]:
+  var out: [Opt] = []
+  var i = 0
+  while i < args.len:
+    let token = args[i]
+    let s = astlib.lit_or(t, token, "\0")
+    if s == "--":
+      for k in i + 1..args.len: out.push(Opt("", args[k], args[k]))
+      return out
+    if s.startswith("--"):
+      var j = 2
+      while j < s.len and s[j] != '\0' and s[j] != '=': j += 1
+      out.push(Opt(s[2..j], token, token))
+      i += 1
+      continue
+    if s.startswith("-"):
+      var j = 1
+      while j < s.len and s[j] != '\0': j += 1
+      let opts = s[1..j]
+      if i + 1 < args.len and astlib.lit_or(t, args[i + 1], "\0").startswith("-"):
+        for c in 0..opts.len: out.push(Opt(opts[c..c + 1], token, token))
+        i += 1
+        continue
+      if i + 1 < args.len:
+        if opts.len > 0:
+          for c in 0..opts.len - 1: out.push(Opt(opts[c..c + 1], token, token))
+          out.push(Opt(opts[opts.len - 1..opts.len], token, args[i + 1]))
+        i += 2
+        continue
+      for c in 0..opts.len: out.push(Opt(opts[c..c + 1], token, token))
+      i += 1
+      continue
+    out.push(Opt("", token, token))
+    i += 1
+  return out
+
+# ---------------------------------------------------------------- removeUnnecessaryStructuralNodes
+
+fn remap_of(m: {Int: Int}, n: Int) -> Int:
+  if n in m: return m[n]
+  return n
+
+fn simplify(var g: G):
+  let nn = g.lab.len
+  var outdeg = [0] * nn
+  var indeg = [0] * nn
+  for i in 0..g.efrom.len:
+    if g.ekind[i] == E_FLOW:
+      outdeg[g.efrom[i]] += 1
+      indeg[g.eto[i]] += 1
+  var cand = [false] * nn
+  for n in 0..nn:
+    cand[n] = g.lab[n] == N_STRUCT and outdeg[n] == 1 and indeg[n] == 1
+  # the edges to collapse, as a sorted set of (from, to)
+  var col: [Int] = []
+  for i in 0..g.efrom.len:
+    if g.ekind[i] == E_FLOW and cand[g.efrom[i]] and cand[g.eto[i]]:
+      col.push(g.efrom[i] * nn + g.eto[i])
+  col.sort()
+  var remap: {Int: Int} = {}
+  var prev = -1
+  for x in col:
+    if x == prev: continue
+    prev = x
+    let a = x / nn
+    let b = x % nn
+    if a < b: remap[b] = a
+    else: remap[a] = b
+  var rec: {Int: Int} = {}
+  for k, v in remap:
+    var x = v
+    while x in remap: x = remap[x]
+    rec[k] = x
+  var nf: [Int] = []
+  var nt: [Int] = []
+  var nk: [Int] = []
+  for i in 0..g.efrom.len:
+    let a = g.efrom[i]
+    let b = g.eto[i]
+    if g.ekind[i] == E_FLOW and cand[a] and cand[b]: continue
+    nf.push(remap_of(rec, a))
+    nt.push(remap_of(rec, b))
+    nk.push(g.ekind[i])
+  g.efrom = nf
+  g.eto = nt
+  g.ekind = nk
+  for k, v in rec: g.lab[k] = -1
+  var tr: {Int: Int} = {}
+  for id, r in g.trange: tr[id] = rng(remap_of(rec, rs(r)), remap_of(rec, re(r)))
+  g.trange = tr
+  for n in 0..nn:
+    if g.lab[n] == N_SUBSHELL:
+      g.na[n] = remap_of(rec, g.na[n])
+      g.nb[n] = remap_of(rec, g.nb[n])
+  for i in 0..g.fdefs.len:
+    g.fdefs[i].entry = remap_of(rec, g.fdefs[i].entry)
+    g.fdefs[i].exit = remap_of(rec, g.fdefs[i].exit)

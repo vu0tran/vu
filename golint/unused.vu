@@ -1,0 +1,697 @@
+# unused (honnef.co/go/tools/unused v0.6.1 with golangci-lint's default options): a graph of what
+# uses what in one package, rooted at exported names, init, main and the like; what isn't reached
+# is reported, except what belongs to something already reported (fields of an unused type...).
+
+import ast
+import tc
+import pkg
+import scan
+from scan import T_DEFINE, K_CONST, K_TYPE, K_VAR, K_IMPORT
+
+type U:
+  pi: Int
+  uses: {Int: [Int]}     # node -> nodes it uses (-1 is the root)
+  owns: {Int: [Int]}
+  edges: {Str: Bool}
+  nodes: {Int: Bool}
+  named: [Int]           # named type objects, in declaration order
+  ifaces: [Int]          # interface types with methods seen in the package
+  pkgmain: Bool
+  lines: [[Int]]
+  test: [Bool]
+
+fn ident_obj(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0 or n >= g.pk[pi].use.len: return -1
+  return g.pk[pi].use[n]
+
+fn mine(g: tc.Prog, u: U, o: Int) -> Bool:
+  return o >= 0 and g.opkg[o] == u.pi
+
+fn use(g: tc.Prog, var u: U, used0: Int, by0: Int):
+  if used0 < 0: return
+  if not mine(g, u, used0): return
+  if by0 >= 0 and not mine(g, u, by0): return
+  if g.ok[used0] == tc.O_PKGNAME: return
+  let used = g.oorig[used0]
+  var byo = -1
+  if by0 >= 0: byo = g.oorig[by0]
+  let key = "{byo}>{used}"
+  u.nodes[used] = true
+  if byo >= 0: u.nodes[byo] = true
+  if key in u.edges: return
+  u.edges[key] = true
+  if byo in u.uses: u.uses[byo].push(used)
+  else: u.uses[byo] = [used]
+
+fn see(g: tc.Prog, var u: U, obj0: Int, owner0: Int):
+  if obj0 < 0 or not mine(g, u, obj0): return
+  let obj = g.oorig[obj0]
+  u.nodes[obj] = true
+  if owner0 >= 0 and mine(g, u, owner0):
+    let owner = g.oorig[owner0]
+    u.nodes[owner] = true
+    let key = "{owner}o{obj}"
+    if key in u.edges: return
+    u.edges[key] = true
+    if owner in u.owns: u.owns[owner].push(obj)
+    else: u.owns[owner] = [obj]
+
+fn nm_of(g: tc.Prog, o: Int) -> Str:
+  if o < 0: return ""
+  return g.oname[o] + ""
+
+fn exported(name: Str) -> Bool:
+  return name.len > 0 and name[0] >= 'A' and name[0] <= 'Z'
+
+fn is_global(g: tc.Prog, pi: Int, o: Int) -> Bool:
+  return g.pk[pi].scope.get(g.oname[o], -1) == o
+
+# ---- reading expressions
+
+fn read(var g: tc.Prog, fs: Fs, var u: U, n: Int, byo: Int):
+  if n <= 0: return
+  let pi = u.pi
+  let k = g.pk[pi].t.k[n]
+  if k == ast.N_LIST:
+    for x in ast.items(g.pk[pi].t, n): read(&g, fs, &u, x, byo)
+  elif k == ast.N_IDENT: use(g, &u, ident_obj(g, pi, n), byo)
+  elif k == ast.N_BASICLIT: return
+  elif k == ast.N_SLICE or k == ast.N_UNARY or k == ast.N_PAREN or k == ast.N_STAR or k == ast.N_ARRAYTYPE or k == ast.N_INDEX or k == ast.N_BINARY or k == ast.N_KEYVALUE or k == ast.N_MAPTYPE or k == ast.N_CHANTYPE or k == ast.N_ELLIPSIS or k == ast.N_TYPEASSERT:
+    read(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    read(&g, fs, &u, g.pk[pi].t.b[n], byo)
+    read(&g, fs, &u, g.pk[pi].t.c[n], byo)
+    read(&g, fs, &u, g.pk[pi].t.d[n], byo)
+  elif k == ast.N_SELECTOR: read_selector(&g, fs, &u, n, byo)
+  elif k == ast.N_COMPOSITE:
+    read(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    let t = g.pk[pi].ety[n]
+    let ct = tc.core(&g, fs, t)
+    let elts = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if ct > 0 and g.tk[ct] == tc.TY_STRUCT:
+      if elts.len > 0 and g.pk[pi].t.k[elts[0]] != ast.N_KEYVALUE:
+        for f in tc.tlist(g, ct): use(g, &u, f, byo)
+    for e in elts: read(&g, fs, &u, e, byo)
+  elif k == ast.N_FUNCLIT:
+    read(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    block(&g, fs, &u, g.pk[pi].t.b[n], byo)
+  elif k == ast.N_FUNCTYPE:
+    read_fields(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    read_fields(&g, fs, &u, g.pk[pi].t.b[n], byo)
+    read_fields(&g, fs, &u, g.pk[pi].t.c[n], byo)
+  elif k == ast.N_STRUCTTYPE:
+    for f in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
+      let names = g.pk[pi].t.a[f]
+      if names < 0:
+        let fo = embedded_field(&g, fs, &u, g.pk[pi].t.b[f], byo)
+        use(g, &u, fo, byo)
+      else:
+        for id in ast.items(g.pk[pi].t, names):
+          let o = ident_obj(g, pi, id)
+          see(g, &u, o, byo)
+          use(g, &u, o, byo)
+          read(&g, fs, &u, g.pk[pi].t.b[f], o)
+  elif k == ast.N_IFACETYPE:
+    let elems = ast.items(g.pk[pi].t, g.pk[pi].t.a[n])
+    if elems.len > 0:
+      let it = g.pk[pi].ety[n]
+      if it > 0: u.ifaces.push(it)
+    for f in elems:
+      let names = g.pk[pi].t.a[f]
+      if names < 0: read(&g, fs, &u, g.pk[pi].t.b[f], byo)
+      else:
+        let o = ident_obj(g, pi, ast.item(g.pk[pi].t, names, 0))
+        see(g, &u, o, byo)
+        use(g, &u, o, byo)
+        read(&g, fs, &u, g.pk[pi].t.b[f], o)
+  elif k == ast.N_CALL:
+    let fun = g.pk[pi].t.a[n]
+    read(&g, fs, &u, fun, byo)
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    for a in args: read(&g, fs, &u, a, byo)
+    if args.len != 1 or g.pk[pi].t.f[n] != 0: return
+    if g.pk[pi].emd[fun] != tc.M_TYPE: return
+    let dst = g.pk[pi].ety[fun]
+    let src = g.pk[pi].ety[args[0]]
+    let dd = tc.deref(&g, fs, dst)
+    let td = tc.core(&g, fs, dd)
+    let sd0 = tc.deref(&g, fs, src)
+    let ts = tc.core(&g, fs, sd0)
+    let sd = td > 0 and g.tk[td] == tc.TY_STRUCT
+    let ss = ts > 0 and g.tk[ts] == tc.TY_STRUCT
+    if sd and ss:
+      let fd = tc.tlist(g, td)
+      let fsrc = tc.tlist(g, ts)
+      for i in 0..fd.len:
+        if i < fsrc.len:
+          use(g, &u, fd[i], fsrc[i])
+          use(g, &u, fsrc[i], fd[i])
+    elif ss and td == tc.B_UNSAFEPTR: use_all_fields(&g, fs, &u, ts, byo, 0)
+    elif sd and ts == tc.B_UNSAFEPTR: use_all_fields(&g, fs, &u, td, byo, 0)
+
+fn use_all_fields(var g: tc.Prog, fs: Fs, var u: U, t: Int, byo: Int, depth: Int):
+  if depth > 10: return
+  let ut = tc.under(&g, fs, t)
+  if ut <= 0: return
+  if g.tk[ut] == tc.TY_STRUCT:
+    for f in tc.tlist(g, ut):
+      use(g, &u, f, byo)
+      let ft = tc.obj_type(&g, fs, f)
+      use_all_fields(&g, fs, &u, ft, byo, depth + 1)
+  elif g.tk[ut] == tc.TY_ARRAY: use_all_fields(&g, fs, &u, g.ta[ut], byo, depth + 1)
+
+fn read_fields(var g: tc.Prog, fs: Fs, var u: U, l: Int, byo: Int):
+  if l < 0: return
+  let pi = u.pi
+  for f in ast.items(g.pk[pi].t, l):
+    let names = g.pk[pi].t.a[f]
+    if names < 0: read(&g, fs, &u, g.pk[pi].t.b[f], byo)
+    else:
+      for id in ast.items(g.pk[pi].t, names):
+        let o = ident_obj(g, pi, id)
+        use(g, &u, o, byo)
+        if o >= 0 and mine(g, u, o): read(&g, fs, &u, g.pk[pi].t.b[f], o)
+        else: read(&g, fs, &u, g.pk[pi].t.b[f], byo)
+
+fn read_selector(var g: tc.Prog, fs: Fs, var u: U, n: Int, byo: Int):
+  let pi = u.pi
+  read(&g, fs, &u, g.pk[pi].t.a[n], byo)
+  read(&g, fs, &u, g.pk[pi].t.b[n], byo)
+  let sk = g.pk[pi].skind.get(n, 0)
+  if sk == 0 or sk == tc.S_PKG: return
+  if n in g.pk[pi].spath:
+    var path: [Int] = []
+    for f in g.pk[pi].spath[n]: path.push(f)
+    for f in path: use(g, &u, f, byo)
+  use(g, &u, g.pk[pi].sobj.get(n, -1), byo)
+
+# The field an embedded field declares; its type is used by it.
+fn embedded_field(var g: tc.Prog, fs: Fs, var u: U, te: Int, byo: Int) -> Int:
+  let pi = u.pi
+  var x = te
+  var extra: [Int] = []
+  var guard = 0
+  while guard < 10:
+    guard += 1
+    let k = g.pk[pi].t.k[x]
+    if k == ast.N_IDENT:
+      let o = ident_obj(g, pi, x)
+      see(g, &u, o, byo)
+      for e in extra: read(&g, fs, &u, e, o)
+      let t = tc.deref(&g, fs, g.pk[pi].ety[x])
+      if t > 0 and g.tk[t] == tc.TY_NAMED: use(g, &u, g.ta[t], o)
+      return o
+    if k == ast.N_STAR: x = g.pk[pi].t.a[x]
+    elif k == ast.N_SELECTOR:
+      extra.push(g.pk[pi].t.a[x])
+      x = g.pk[pi].t.b[x]
+    elif k == ast.N_INDEX:
+      extra.push(g.pk[pi].t.b[x])
+      x = g.pk[pi].t.a[x]
+    elif k == ast.N_PAREN: x = g.pk[pi].t.a[x]
+    else: return -1
+  return -1
+
+fn write_(var g: tc.Prog, fs: Fs, var u: U, n: Int, byo: Int):
+  if n <= 0: return
+  let pi = u.pi
+  let k = g.pk[pi].t.k[n]
+  if k == ast.N_IDENT:
+    let o = ident_obj(g, pi, n)
+    if o < 0 or not mine(g, u, o): return
+    let fi = g.ofile[o]
+    if fi >= 0 and fi < u.test.len and u.test[fi] and is_global(g, pi, o): use(g, &u, o, byo)
+  elif k == ast.N_INDEX:
+    read(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    read(&g, fs, &u, g.pk[pi].t.b[n], byo)
+  elif k == ast.N_SELECTOR: read_selector(&g, fs, &u, n, byo)
+  elif k == ast.N_STAR: read(&g, fs, &u, g.pk[pi].t.a[n], byo)
+  elif k == ast.N_PAREN: write_(&g, fs, &u, g.pk[pi].t.a[n], byo)
+
+# ---- statements
+
+fn block(var g: tc.Prog, fs: Fs, var u: U, b: Int, byo: Int):
+  if b <= 0: return
+  stmts(&g, fs, &u, g.pk[u.pi].t.a[b], byo)
+
+fn stmts(var g: tc.Prog, fs: Fs, var u: U, l: Int, byo: Int):
+  if l < 0: return
+  for s in ast.items(g.pk[u.pi].t, l): stmt(&g, fs, &u, s, byo)
+
+fn stmt(var g: tc.Prog, fs: Fs, var u: U, n0: Int, byo: Int):
+  if n0 <= 0: return
+  let pi = u.pi
+  var n = n0
+  while g.pk[pi].t.k[n] == ast.N_LABELED: n = g.pk[pi].t.b[n]
+  let k = g.pk[pi].t.k[n]
+  if k == ast.N_ASSIGN:
+    for x in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]): write_(&g, fs, &u, x, byo)
+    for x in ast.items(g.pk[pi].t, g.pk[pi].t.b[n]): read(&g, fs, &u, x, byo)
+  elif k == ast.N_BLOCK: block(&g, fs, &u, n, byo)
+  elif k == ast.N_DECLSTMT: decl(&g, fs, &u, g.pk[pi].t.a[n], byo)
+  elif k == ast.N_DEFER or k == ast.N_GO or k == ast.N_EXPRSTMT: read(&g, fs, &u, g.pk[pi].t.a[n], byo)
+  elif k == ast.N_FOR:
+    stmt(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    read(&g, fs, &u, g.pk[pi].t.b[n], byo)
+    stmt(&g, fs, &u, g.pk[pi].t.c[n], byo)
+    block(&g, fs, &u, g.pk[pi].t.d[n], byo)
+  elif k == ast.N_IF:
+    stmt(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    read(&g, fs, &u, g.pk[pi].t.b[n], byo)
+    block(&g, fs, &u, g.pk[pi].t.c[n], byo)
+    stmt(&g, fs, &u, g.pk[pi].t.d[n], byo)
+  elif k == ast.N_INCDEC: write_(&g, fs, &u, g.pk[pi].t.a[n], byo)
+  elif k == ast.N_RANGE:
+    write_(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    write_(&g, fs, &u, g.pk[pi].t.b[n], byo)
+    read(&g, fs, &u, g.pk[pi].t.c[n], byo)
+    block(&g, fs, &u, g.pk[pi].t.d[n], byo)
+  elif k == ast.N_RETURN: read(&g, fs, &u, g.pk[pi].t.a[n], byo)
+  elif k == ast.N_SELECT:
+    for c in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
+      let comm = g.pk[pi].t.a[c]
+      if comm > 0:
+        let ck = g.pk[pi].t.k[comm]
+        if ck == ast.N_SEND:
+          read(&g, fs, &u, g.pk[pi].t.a[comm], byo)
+          read(&g, fs, &u, g.pk[pi].t.b[comm], byo)
+        elif ck == ast.N_EXPRSTMT:
+          var x = g.pk[pi].t.a[comm]
+          while g.pk[pi].t.k[x] == ast.N_PAREN: x = g.pk[pi].t.a[x]
+          read(&g, fs, &u, g.pk[pi].t.a[x], byo)
+        elif ck == ast.N_ASSIGN:
+          for x in ast.items(g.pk[pi].t, g.pk[pi].t.a[comm]): write_(&g, fs, &u, x, byo)
+          for x in ast.items(g.pk[pi].t, g.pk[pi].t.b[comm]): read(&g, fs, &u, x, byo)
+      stmts(&g, fs, &u, g.pk[pi].t.b[c], byo)
+  elif k == ast.N_SEND:
+    read(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    read(&g, fs, &u, g.pk[pi].t.b[n], byo)
+  elif k == ast.N_SWITCH:
+    stmt(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    read(&g, fs, &u, g.pk[pi].t.b[n], byo)
+    for c in ast.items(g.pk[pi].t, g.pk[pi].t.c[n]):
+      read(&g, fs, &u, g.pk[pi].t.a[c], byo)
+      stmts(&g, fs, &u, g.pk[pi].t.b[c], byo)
+  elif k == ast.N_TYPESWITCH:
+    stmt(&g, fs, &u, g.pk[pi].t.a[n], byo)
+    let guard = g.pk[pi].t.b[n]
+    if g.pk[pi].t.k[guard] == ast.N_ASSIGN:
+      for x in ast.items(g.pk[pi].t, g.pk[pi].t.b[guard]): read(&g, fs, &u, x, byo)
+    else: stmt(&g, fs, &u, guard, byo)
+    for c in ast.items(g.pk[pi].t, g.pk[pi].t.c[n]):
+      read(&g, fs, &u, g.pk[pi].t.a[c], byo)
+      stmts(&g, fs, &u, g.pk[pi].t.b[c], byo)
+
+# ---- declarations
+
+fn decl(var g: tc.Prog, fs: Fs, var u: U, d: Int, byo: Int):
+  let pi = u.pi
+  let k = g.pk[pi].t.k[d]
+  if k == ast.N_GENDECL:
+    let tok = g.pk[pi].t.f[d]
+    let specs = ast.items(g.pk[pi].t, g.pk[pi].t.a[d])
+    if tok == K_CONST:
+      for sp in specs:
+        let ids = ast.items(g.pk[pi].t, g.pk[pi].t.a[sp])
+        let vals = g.pk[pi].t.c[sp]
+        for i in 0..ids.len:
+          let o = ident_obj(g, pi, ids[i])
+          see(g, &u, o, byo)
+          read(&g, fs, &u, g.pk[pi].t.b[sp], o)
+          if vals >= 0 and i < ast.count(g.pk[pi].t, vals): read(&g, fs, &u, ast.item(g.pk[pi].t, vals, i), o)
+          let nm = nm_of(g, o)
+          if nm == "_": use(g, &u, o, byo)
+          elif exported(nm) and o >= 0 and is_global(g, pi, o): use(g, &u, o, -1)
+      # one used constant of a group (consecutive lines) uses them all
+      var gstart = 0
+      while gstart < specs.len:
+        var gend = gstart + 1
+        while gend < specs.len and spec_line(g, u, pi, g.pk[pi].t.pos[specs[gend]], specs[gend]) - 1 == spec_line(g, u, pi, g.pk[pi].t.end[specs[gend - 1]], specs[gend]): gend += 1
+        var first = -1
+        var prev = -1
+        var last = -1
+        for si in gstart..gend:
+          for id in ast.items(g.pk[pi].t, g.pk[pi].t.a[specs[si]]):
+            if g.pk[pi].t.names[g.pk[pi].t.s[id]] == "_": continue
+            let o = ident_obj(g, pi, id)
+            if first < 0: first = o
+            else: use(g, &u, o, prev)
+            prev = o
+            last = o
+        if first >= 0 and first != last: use(g, &u, first, last)
+        gstart = gend
+    elif tok == K_TYPE:
+      for sp in specs:
+        let o = ident_obj(g, pi, g.pk[pi].t.a[sp])
+        see(g, &u, o, byo)
+        if g.pk[pi].t.f[sp] == 0 and o >= 0: u.named.push(o)
+        let nm = nm_of(g, o)
+        if exported(nm) and o >= 0 and is_global(g, pi, o): use(g, &u, o, -1)
+        read_fields(&g, fs, &u, g.pk[pi].t.b[sp], o)
+        named_type(&g, fs, &u, o, g.pk[pi].t.c[sp])
+        if nm == "_": use(g, &u, o, byo)
+    elif tok == K_VAR:
+      for sp in specs:
+        let ids = ast.items(g.pk[pi].t, g.pk[pi].t.a[sp])
+        let vals = g.pk[pi].t.c[sp]
+        let nv = ast.count(g.pk[pi].t, vals)
+        for i in 0..ids.len:
+          let o = ident_obj(g, pi, ids[i])
+          see(g, &u, o, byo)
+          read(&g, fs, &u, g.pk[pi].t.b[sp], o)
+          if nv == ids.len: read(&g, fs, &u, ast.item(g.pk[pi].t, vals, i), o)
+          elif nv > 0: read(&g, fs, &u, ast.item(g.pk[pi].t, vals, 0), o)
+          let nm = nm_of(g, o)
+          if exported(nm) and o >= 0 and is_global(g, pi, o): use(g, &u, o, -1)
+          if nm == "_": use(g, &u, o, byo)
+  elif k == ast.N_FUNCDECL:
+    let o = ident_obj(g, pi, g.pk[pi].t.b[d])
+    see(g, &u, o, -1)
+    let nm = nm_of(g, o)
+    let recv = g.pk[pi].t.a[d]
+    if exported(nm):
+      if recv < 0: use(g, &u, o, -1)
+    elif nm == "init": use(g, &u, o, -1)
+    elif nm == "main" and u.pkgmain: use(g, &u, o, -1)
+    read_fields(&g, fs, &u, recv, o)
+    read(&g, fs, &u, g.pk[pi].t.c[d], o)
+    block(&g, fs, &u, g.pk[pi].t.d[d], o)
+    if nm == "_": use(g, &u, o, -1)
+
+fn named_type(var g: tc.Prog, fs: Fs, var u: U, typ: Int, spec: Int):
+  let pi = u.pi
+  if g.pk[pi].t.k[spec] != ast.N_STRUCTTYPE:
+    read(&g, fs, &u, spec, typ)
+    return
+  let st = g.pk[pi].ety[spec]
+  for f in ast.items(g.pk[pi].t, g.pk[pi].t.a[spec]):
+    let names = g.pk[pi].t.a[f]
+    if names < 0:
+      let fo = embedded_field(&g, fs, &u, g.pk[pi].t.b[f], typ)
+      if fo < 0: continue
+      if exported(g.oname[fo]): use(g, &u, fo, typ)
+      var seen: {Int: Bool} = {}
+      seen[st] = true
+      let fot = tc.obj_type(&g, fs, fo)
+      if has_exported_field(&g, fs, fot, &seen): use(g, &u, fo, typ)
+    else:
+      for id in ast.items(g.pk[pi].t, names):
+        let o = ident_obj(g, pi, id)
+        see(g, &u, o, typ)
+        read(&g, fs, &u, g.pk[pi].t.b[f], o)
+        let nm = nm_of(g, o)
+        if nm == "_": use(g, &u, o, typ)
+        elif exported(nm): use(g, &u, o, typ)
+        if o >= 0:
+          let ot = tc.obj_type(&g, fs, o)
+          if is_nocopy(&g, fs, ot): use(g, &u, o, typ)
+
+fn has_exported_field(var g: tc.Prog, fs: Fs, t0: Int, var seen: {Int: Bool}) -> Bool:
+  let t1 = tc.deref(&g, fs, t0)
+  let t = tc.under(&g, fs, t1)
+  if t <= 0 or g.tk[t] != tc.TY_STRUCT: return false
+  if t in seen: return false
+  seen[t] = true
+  for f in tc.tlist(g, t):
+    if exported(g.oname[f]): return true
+    if g.orecv[f] == 1:
+      let ft = tc.obj_type(&g, fs, f)
+      if has_exported_field(&g, fs, ft, &seen): return true
+  return false
+
+fn is_nocopy(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  if t <= 0 or g.tk[t] != tc.TY_NAMED: return false
+  let ut = tc.under(&g, fs, t)
+  if ut <= 0 or g.tk[ut] != tc.TY_STRUCT or g.tlen[ut] != 0: return false
+  let o = g.ta[t]
+  let pi = g.opkg[o]
+  if pi < 0: return false
+  let ms = tc.methods_of(&g, o)
+  if ms.len < 1 or ms.len > 2: return false
+  for m in ms:
+    if g.oname[m] != "Lock" and g.oname[m] != "Unlock": return false
+    let mt = tc.obj_type(&g, fs, m)
+    if mt <= 0 or g.tlen[g.ta[mt]] != 0 or g.tlen[g.tb[mt]] != 0: return false
+  return true
+
+fn spec_line(g: tc.Prog, u: U, pi: Int, pos: Int, node: Int) -> Int:
+  let fi = g.pk[pi].t.file[node]
+  return pkg.line_of(u.lines[fi], pos)
+
+# ---- method sets and interfaces
+
+# The method set of *T: each method name reachable, as [method, type, embedded fields...].
+fn method_set(var g: tc.Prog, fs: Fs, t: Int) -> [[Int]]:
+  var out: [[Int]] = []
+  var found: {Str: Bool} = {}
+  var cur: [Int] = [t]
+  var paths: [[Int]] = [[]]
+  var seen: {Int: Bool} = {}
+  var depth = 0
+  while cur.len > 0 and depth < 8:
+    var cand: {Str: [Int]} = {}
+    var count: {Str: Int} = {}
+    var next: [Int] = []
+    var npaths: [[Int]] = []
+    for ci in 0..cur.len:
+      let x = cur[ci]
+      if x <= 0: continue
+      if g.tk[x] == tc.TY_NAMED:
+        if x in seen: continue
+        seen[x] = true
+        let o = g.ta[x]
+        let pi = g.opkg[o]
+        if pi >= 0:
+          var names: [Str] = []
+          for m in tc.methods_of(&g, o): names.push(g.oname[m] + "")
+          for nm in names:
+            let r = tc.find_method(&g, fs, x, nm)
+            if r.len == 0: continue
+            count[nm] = count.get(nm, 0) + 1
+            var e = [r[0], r[1]]
+            for p in paths[ci]: e.push(p)
+            cand[nm] = e
+      let ut = tc.under(&g, fs, x)
+      if ut <= 0: continue
+      if g.tk[ut] == tc.TY_STRUCT:
+        for f in tc.tlist(g, ut):
+          let fnm = g.oname[f] + ""
+          count[fnm] = count.get(fnm, 0) + 1
+          cand[fnm] = [-1]
+          if g.orecv[f] == 1:
+            var ft = tc.obj_type(&g, fs, f)
+            if ft > 0 and g.tk[ft] == tc.TY_PTR: ft = g.ta[ft]
+            next.push(ft)
+            var np: [Int] = []
+            for p in paths[ci]: np.push(p)
+            np.push(f)
+            npaths.push(np)
+      elif g.tk[ut] == tc.TY_IFACE:
+        for m in all_methods(&g, fs, ut):
+          let mnm = g.oname[m] + ""
+          count[mnm] = count.get(mnm, 0) + 1
+          var e = [m, tc.obj_type(&g, fs, m)]
+          for p in paths[ci]: e.push(p)
+          cand[mnm] = e
+    var keys: [Str] = []
+    for nm in cand: keys.push(nm + "")
+    for nm in keys:
+      if nm in found: continue
+      found[nm] = true
+      if count[nm] != 1: continue
+      if cand[nm][0] < 0: continue
+      var e: [Int] = []
+      for x in cand[nm]: e.push(x)
+      out.push(e)
+    cur = next
+    swap(&paths, &npaths)
+    depth += 1
+  return out
+
+fn all_methods(var g: tc.Prog, fs: Fs, ut: Int) -> [Int]:
+  var out: [Int] = []
+  for m in tc.tlist(g, ut): out.push(m)
+  let emb = g.tb[ut]
+  if emb > 0:
+    for e in tc.tlist(g, emb):
+      let eu = tc.under(&g, fs, e)
+      if eu > 0 and g.tk[eu] == tc.TY_IFACE and eu != ut:
+        for m in all_methods(&g, fs, eu): out.push(m)
+  return out
+
+fn read_selection(g: tc.Prog, var u: U, e: [Int], byo: Int):
+  for i in 2..e.len: use(g, &u, e[i], byo)
+  use(g, &u, e[0], byo)
+
+fn process_named(var g: tc.Prog, fs: Fs, var u: U, o: Int):
+  let t = tc.obj_type(&g, fs, o)
+  if t <= 0: return
+  let ms = method_set(&g, fs, t)
+  for e in ms:
+    if exported(g.oname[e[0]]): read_selection(g, &u, e, o)
+  let ut = tc.under(&g, fs, t)
+  if ut > 0 and g.tk[ut] == tc.TY_IFACE: return
+  var done: {Int: Bool} = {}
+  var ifs: [Int] = []
+  for x in u.ifaces: ifs.push(x)
+  for it in ifs:
+    if it in done: continue
+    done[it] = true
+    let ims = all_methods(&g, fs, it)
+    if ims.len == 0: continue
+    var sels: [[Int]] = []
+    var ok = true
+    for m in ims:
+      let mnm = g.oname[m]
+      var hit = -1
+      for i in 0..ms.len:
+        if g.oname[ms[i][0]] == mnm:
+          if exported(mnm) or g.opkg[ms[i][0]] == g.opkg[m]: hit = i
+      if hit < 0:
+        ok = false
+        break
+      if ms[hit][1] != tc.obj_type(&g, fs, m):
+        ok = false
+        break
+      var e: [Int] = []
+      for x in ms[hit]: e.push(x)
+      sels.push(e)
+    if ok:
+      for e in sels: read_selection(g, &u, e, o)
+
+# ---- the analysis
+
+fn color(u: U, start: Int, var seen: {Int: Bool}):
+  var stack = [start]
+  while stack.len > 0:
+    let x = stack.pop()
+    if x in seen: continue
+    seen[x] = true
+    if x in u.uses:
+      for y in u.uses[x]: stack.push(y)
+
+fn quieten(u: U, start: Int, var q: {Int: Bool}):
+  var stack = [start]
+  while stack.len > 0:
+    let x = stack.pop()
+    if x in q: continue
+    q[x] = true
+    if x in u.owns:
+      for y in u.owns[x]: stack.push(y)
+
+fn obj_name(var g: tc.Prog, fs: Fs, o: Int) -> Str:
+  let pi = g.opkg[o]
+  let name = g.oname[o] + ""
+  let d = g.odecl[o]
+  if g.ok[o] == tc.O_FUNC and d >= 0 and g.pk[pi].t.k[d] == ast.N_FUNCDECL:
+    let recv = g.pk[pi].t.a[d]
+    if recv >= 0 and ast.count(g.pk[pi].t, recv) > 0:
+      var rt = g.pk[pi].t.b[ast.item(g.pk[pi].t, recv, 0)]
+      var star = false
+      if g.pk[pi].t.k[rt] == ast.N_PAREN: rt = g.pk[pi].t.a[rt]
+      if g.pk[pi].t.k[rt] == ast.N_STAR:
+        star = true
+        rt = g.pk[pi].t.a[rt]
+      var targs = ""
+      if g.pk[pi].t.k[rt] == ast.N_INDEX:
+        targs = "["
+        var first = true
+        for x in ast.items(g.pk[pi].t, g.pk[pi].t.b[rt]):
+          if not first: targs += ", "
+          first = false
+          targs += g.pk[pi].t.names[g.pk[pi].t.s[x]]
+        targs += "]"
+        rt = g.pk[pi].t.a[rt]
+      let tn = g.pk[pi].t.names[g.pk[pi].t.s[rt]] + targs
+      if star: return "(*" + tn + ")." + name
+      return tn + "." + name
+  return name
+
+fn kind_name(g: tc.Prog, o: Int) -> Str:
+  let k = g.ok[o]
+  if k == tc.O_FUNC: return "func"
+  if k == tc.O_CONST: return "const"
+  if k == tc.O_TYPE:
+    if g.otype[o] > 0 and g.tk[g.otype[o]] == tc.TY_TPARAM: return "type param"
+    return "type"
+  if k == tc.O_VAR:
+    if g.oaux[o] == 7: return "field"
+    return "var"
+  return "identifier"
+
+fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue]):
+  var u = U(pi, {}, {}, {}, {}, [], [], g.pk[pi].name == "main", [], [])
+  for l in p.lines:
+    var c: [Int] = []
+    for x in l: c.push(x)
+    u.lines.push(c)
+  for b in p.test: u.test.push(b)
+  # top-level declarations, in order; the locals of each are owned and used by it
+  var decl_lo: [Int] = []
+  var decl_hi: [Int] = []
+  var decl_file: [Int] = []
+  var decl_obj: [Int] = []
+  for fi in 0..g.pk[pi].roots.len:
+    let root = g.pk[pi].roots[fi]
+    for d in ast.items(g.pk[pi].t, g.pk[pi].t.c[root]):
+      decl(&g, fs, &u, d, -1)
+      let k = g.pk[pi].t.k[d]
+      var o = -1
+      if k == ast.N_FUNCDECL: o = ident_obj(g, pi, g.pk[pi].t.b[d])
+      elif k == ast.N_GENDECL and g.pk[pi].t.f[d] != K_IMPORT:
+        # locals inside a var's initializer belong to the var
+        let sp0 = ast.item(g.pk[pi].t, g.pk[pi].t.a[d], 0)
+        if ast.count(g.pk[pi].t, g.pk[pi].t.a[d]) > 0:
+          if g.pk[pi].t.k[sp0] == ast.N_VALUESPEC: o = ident_obj(g, pi, ast.item(g.pk[pi].t, g.pk[pi].t.a[sp0], 0))
+          else: o = ident_obj(g, pi, g.pk[pi].t.a[sp0])
+      decl_lo.push(g.pk[pi].t.pos[d])
+      decl_hi.push(g.pk[pi].t.end[d])
+      decl_file.push(fi)
+      decl_obj.push(o)
+  var locals: [Int] = []
+  for x in g.locals: locals.push(x)
+  for lo in locals:
+    if g.opkg[lo] != pi: continue
+    let id = g.onode[lo]
+    let fi = g.pk[pi].t.file[id]
+    let pos = g.pk[pi].t.pos[id]
+    # the last declaration starting at or before pos (declarations are sorted by file, then position)
+    var a = 0
+    var b = decl_lo.len - 1
+    var hit = -1
+    while a <= b:
+      let mid = (a + b) / 2
+      if decl_file[mid] < fi or (decl_file[mid] == fi and decl_lo[mid] <= pos):
+        hit = mid
+        a = mid + 1
+      else: b = mid - 1
+    if hit >= 0 and decl_file[hit] == fi and pos < decl_hi[hit]:
+      see(g, &u, lo, decl_obj[hit])
+      if g.ok[lo] == tc.O_VAR: use(g, &u, lo, decl_obj[hit])
+  # objects in generated files are used
+  var gen_objs: [Int] = []
+  for o in u.nodes:
+    let fi = g.ofile[o]
+    if fi >= 0 and fi < p.hgen.len and p.hgen[fi]: gen_objs.push(o)
+  for o in gen_objs: use(g, &u, o, -1)
+  # methods used through exported names and interfaces
+  var named: [Int] = []
+  for o in u.named: named.push(o)
+  for o in named: process_named(&g, fs, &u, o)
+  var seen: {Int: Bool} = {}
+  color(u, -1, &seen)
+  var q: {Int: Bool} = {}
+  var all: [Int] = []
+  for o in u.nodes: all.push(o)
+  for o in all:
+    if o in seen: continue
+    if o in u.owns:
+      for y in u.owns[o]: quieten(u, y, &q)
+  for o in all:
+    if o in seen or o in q: continue
+    let kn = kind_name(g, o)
+    if kn == "type param" or kn == "identifier": continue
+    let id = g.onode[o]
+    if id < 0: continue
+    let fi = g.pk[pi].t.file[id]
+    let msg = kn + " " + obj_name(&g, fs, o) + " is unused"
+    issues.push(pkg.Issue(fi, g.pk[pi].t.pos[id], "unused", msg, 1))
