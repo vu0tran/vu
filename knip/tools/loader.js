@@ -11,7 +11,8 @@ let jiti = null;
 const findJiti = () => {
   const req = createRequire(path.join(cwd, 'package.json'));
   try { return req.resolve('jiti'); } catch {}
-  try { return createRequire(req.resolve('knip/package.json')).resolve('jiti'); } catch {}
+  try { return createRequire(req.resolve('knip')).resolve('jiti'); } catch {}
+  try { return createRequire(fs.realpathSync(path.join(cwd, 'node_modules/knip/package.json'))).resolve('jiti'); } catch {}
   try {
     const pnpm = path.join(cwd, 'node_modules/.pnpm');
     const dirs = fs.readdirSync(pnpm).filter(d => /^jiti@2/.test(d)).sort().reverse();
@@ -23,12 +24,14 @@ try {
   const jp = findJiti();
   const j = createRequire(path.join(cwd, 'package.json'))(jp);
   const opts = { jsx: true, tsconfigPaths: true, interopDefault: true, alias: { '@rushstack/eslint-patch/modern-module-resolution': 'node:path', '@rushstack/eslint-config/patch/modern-module-resolution': 'node:path' } };
-  if (j.createJiti) { const inst = j.createJiti(path.join(cwd, 'x.js'), opts); jiti = f => inst.import(f, { default: true }); }
-  else if (typeof j === 'function') { const inst = j(path.join(cwd, 'x.js'), opts); jiti = async f => { const m = inst(f); return m && m.default !== undefined ? m.default : m; }; }
+  const create = j.createJiti || (j.default && j.default.createJiti) || (typeof j === 'function' ? j : null);
+  const inst = create(path.join(cwd, 'x.js'), opts);
+  if (typeof inst.import === 'function') jiti = f => inst.import(f, { default: true });
+  else jiti = async f => { const m = inst(f); return m && m.default !== undefined ? m.default : m; };
 } catch {}
 const load = async file => {
   const abs = path.resolve(cwd, file);
-  if (jiti) { try { return await jiti(abs); } catch (e) { try { const m = await import(pathToFileURL(abs).href); return m.default ?? m; } catch { throw e; } } }
+  if (jiti) return await jiti(abs);
   const m = await import(pathToFileURL(abs).href);
   return m.default ?? m;
 };
