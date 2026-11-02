@@ -7,6 +7,8 @@ import parse
 import regex
 import scope
 import fixgen
+import lout
+import lmeta
 from scan import T_ASSIGN, T_EQ2, T_EQ3, T_NE, T_NE2, T_LT, T_GT, T_LE, T_GE, T_AND, T_OR, T_QQ, T_BANG, T_MINUS, T_PLUS, T_INC, T_DEC, T_COMMA
 
 type D:
@@ -17,6 +19,13 @@ type D:
   fs: Int          # the fix oxlint --fix would apply: replace src[fs..fe] by ft (fs -1: none)
   fe: Int
   ft: Str
+  end: Int         # the end of the first label (-1: not given, the label is empty)
+  lab: Str         # its text (when haslab)
+  haslab: Bool
+  xs: [Int]        # more labels: start, end, primary (1 or 0)
+  xl: [Str]        # and their texts ("\0" for none)
+  on: Int          # the node oxc's rule runs on when it reports this (for the order of the output)
+  note: Str
 
 type L:
   t: ast.Ast
@@ -58,13 +67,67 @@ type L:
   fatal_at: Int
   parents_done: Bool  # parent_list is filled
   par: [Int]            # each node's parent (lists skipped), built only when a fix needs it
+  cur: Int              # the node being checked (oxc's rules report from the node they run on)
 
 fn add(var l: L, pos: Int, rule: Str, msg: Str, help: Str):
-  l.ds.push(D(pos, rule, msg, help, -1, 0, ""))
+  l.ds.push(D(pos, rule, msg, help, -1, 0, "", -1, "", false, [], [], l.cur, ""))
 
 # A diagnostic with the safe fix oxlint's --fix applies for it: src[fs..fe] becomes ft.
 fn add_fix(var l: L, pos: Int, rule: Str, msg: Str, help: Str, fs: Int, fe: Int, ft: Str):
-  l.ds.push(D(pos, rule, msg, help, fs, fe, ft))
+  l.ds.push(D(pos, rule, msg, help, fs, fe, ft, -1, "", false, [], [], l.cur, ""))
+
+# A diagnostic labelled with node n's span
+fn addn(var l: L, n: Int, rule: Str, msg: Str, help: Str):
+  l.ds.push(D(l.t.nd[n].pos, rule, msg, help, -1, 0, "", l.t.nd[n].end, "", false, [], [], l.cur, ""))
+
+fn addn_fix(var l: L, n: Int, rule: Str, msg: Str, help: Str, fs: Int, fe: Int, ft: Str):
+  l.ds.push(D(l.t.nd[n].pos, rule, msg, help, fs, fe, ft, l.t.nd[n].end, "", false, [], [], l.cur, ""))
+
+# The last diagnostic's first label ends at e (and says text, when given).
+fn span(var l: L, e: Int):
+  l.ds[l.ds.len - 1].end = e
+
+fn span_n(var l: L, n: Int):
+  l.ds[l.ds.len - 1].end = l.t.nd[n].end
+
+fn label(var l: L, e: Int, text: Str):
+  let i = l.ds.len - 1
+  l.ds[i].end = e
+  l.ds[i].lab = text
+  l.ds[i].haslab = true
+
+# One more label on the last diagnostic.
+fn more(var l: L, s: Int, e: Int, text: Str, has: Bool):
+  let i = l.ds.len - 1
+  l.ds[i].xs.push(s)
+  l.ds[i].xs.push(e)
+  l.ds[i].xs.push(0)
+  if has: l.ds[i].xl.push(text)
+  else: l.ds[i].xl.push("\0")
+
+fn note(var l: L, s: Str):
+  l.ds[l.ds.len - 1].note = s
+
+# The first label of the last diagnostic is its primary one (more labels: mark with primary)
+fn primary_more(var l: L):
+  let i = l.ds.len - 1
+  l.ds[i].xs[l.ds[i].xs.len - 1] = 1
+
+# The last diagnostic's label is the first n bytes of its span (a keyword, `...`)
+fn head(var l: L, n: Int):
+  let i = l.ds.len - 1
+  l.ds[i].end = l.ds[i].pos + n
+
+fn dots(var l: L):
+  head(&l, 3)
+
+# The last diagnostic is ordered as if reported from a node starting at p (outermost there)
+fn order_at(var l: L, p: Int):
+  l.ds[l.ds.len - 1].on = -2 - p
+
+# The node oxc's rule runs on for the last diagnostic (for the order of the output).
+fn on(var l: L, n: Int):
+  l.ds[l.ds.len - 1].on = n
 
 # The node n is a child of (list nodes skipped; 0 for the root). Built on first use: only some fixes need it.
 fn parent(var l: L, n: Int) -> Int:
@@ -198,24 +261,33 @@ fn new_tree() -> ast.Ast:
 fn hot(l: L, id: Int) -> Bool:
   return id >= 1 and id <= HOT_N
 
-fn lint(path: Str, src: Str, var kw: {Str: Int}) -> [Str]:
-  var t = new_tree()
-  return lint_upto(path, src, &kw, 9, &t)
+# What a run asks for: the output format and each rule's severity (0 off, 1 warning, 2 error; by
+# its index in lmeta), set per file by the configuration.
+type Cx:
+  o: lout.Opts
+  m: lmeta.Meta
 
 # phase (for timing): 1 parse only, 2 and scopes, 9 everything. t is a tree from new_tree,
 # reused from file to file (it keeps the names).
-fn lint_upto(path: Str, own src0: Str, var kw: {Str: Int}, phase: Int, var t: ast.Ast) -> [Str]:
+fn lint_upto(c: Cx, sev: [Int], path: Str, own src0: Str, var kw: {Str: Int}, phase: Int, var t: ast.Ast) -> [lout.Rec]:
   var fixed: [Str] = []
-  return lint_any(path, src0, &kw, phase, &t, false, &fixed)
+  return lint_any(c, sev, path, src0, &kw, phase, &t, false, &fixed)
 
 # As lint, applying the fixes `oxlint --fix` applies: fixed gets the new text (left empty if no fix applies)
 # and the diagnostics left are returned.
-fn lint_fix(path: Str, own src0: Str, var kw: {Str: Int}, var t: ast.Ast, var fixed: [Str]) -> [Str]:
-  return lint_any(path, src0, &kw, 9, &t, true, &fixed)
+fn lint_fix(c: Cx, sev: [Int], path: Str, own src0: Str, var kw: {Str: Int}, var t: ast.Ast, var fixed: [Str]) -> [lout.Rec]:
+  return lint_any(c, sev, path, src0, &kw, 9, &t, true, &fixed)
 
-fn lint_any(path: Str, own src0: Str, var kw: {Str: Int}, phase: Int, var t: ast.Ast, fixing: Bool, var fixed: [Str]) -> [Str]:
+# A diagnostic without a rule (a parse error): an error, labelled at [s, e)
+fn plain_error(c: Cx, path: Str, src: Str, s: Int, e: Int, msg: Str, labtext: Str) -> lout.Rec:
+  var labs: [lout.Lab] = []
+  if s >= 0: labs.push(lout.Lab(s, e, labtext, labtext != "", false))
+  let d = lout.Diag(2, "", "", msg, "", labs, "")
+  return lout.make_rec(c.o, path, src, lout.line_index(src), d)
+
+fn lint_any(c: Cx, sev: [Int], path: Str, own src0: Str, var kw: {Str: Int}, phase: Int, var t: ast.Ast, fixing: Bool, var fixed: [Str]) -> [lout.Rec]:
   var src = src0
-  var out: [Str] = []
+  var out: [lout.Rec] = []
   ast.clear_nodes(&t)
   # (vlint replays the parser's scope events: scope.build)
   t.sv.on = true
@@ -227,10 +299,11 @@ fn lint_any(path: Str, own src0: Str, var kw: {Str: Int}, phase: Int, var t: ast
     # oxc's wording where it's known; else this parser's own (marked vlint(parse))
     for d in pd:
       if d.msg.startswith("Invalid Character"):
-        out.push("{path}:{line_at(src, d.pos)}:{col_at(src, d.pos)}: error: {d.msg}")
+        out.push(plain_error(c, path, src, d.pos, d.pos + 1, d.msg, ""))
         return out
-    let lc = line_col(src, pd[0].pos)
-    out.push("{path}:{lc[0]}:{lc[1]}: error vlint(parse): {pd[0].msg}")
+    var r = plain_error(c, path, src, pd[0].pos, pd[0].pos, pd[0].msg, "")
+    r.code = "vlint(parse)"
+    out.push(r)
     return out
   let root = t.nd.len - 1
   if phase == 1: return out
@@ -243,16 +316,16 @@ fn lint_any(path: Str, own src0: Str, var kw: {Str: Int}, phase: Int, var t: ast
   if phase == 2: return out
   var t2 = ast.blank()
   swap(&t2, &t)
-  var l = L(t2, "", [], [], [], [], false, 0, {}, sc, {}, false, path.endswith(".ts") or path.endswith(".mts") or path.endswith(".cts"), path.endswith(".d.ts") or path.endswith(".d.mts") or path.endswith(".d.cts"), [], {}, {}, {}, {}, {}, {}, {}, {}, {}, [], [], [], 0, [], false, 0, false, [], "", -1, false, [])
+  var l = L(t2, "", [], [], [], [], false, 0, {}, sc, {}, false, path.endswith(".ts") or path.endswith(".mts") or path.endswith(".cts"), path.endswith(".d.ts") or path.endswith(".d.mts") or path.endswith(".d.cts"), [], {}, {}, {}, {}, {}, {}, {}, {}, {}, [], [], [], 0, [], false, 0, false, [], "", -1, false, [], 0)
   l.cont = [false] * l.t.nd.len
   l.tagged = [false] * l.t.nd.len
   swap(&l.src, &src)
-  let res = lint_l(&l, path, root, fixing, &fixed)
+  let res = lint_l(c, sev, &l, path, root, fixing, &fixed)
   swap(&t, &l.t)
   return res
 
-fn lint_l(var l: L, path: Str, root: Int, fixing: Bool, var fixed: [Str]) -> [Str]:
-  var out: [Str] = []
+fn lint_l(c: Cx, sev: [Int], var l: L, path: Str, root: Int, fixing: Bool, var fixed: [Str]) -> [lout.Rec]:
+  var out: [lout.Rec] = []
   collect_elses(&l)
   mark_directives(&l, root)
   l.jt.push(5)
@@ -267,51 +340,112 @@ fn lint_l(var l: L, path: Str, root: Int, fixing: Bool, var fixed: [Str]) -> [St
     es.sort(by: fn(a, b) => l.sc.redecl_pos[a] < l.sc.redecl_pos[b])
     for i in es:
       let p = l.sc.redecl_pos[i]
-      out.push("{path}:{line_at(l.src, p)}:{col_at(l.src, p)}: error: Identifier `{l.t.names[l.sc.redecl_name[i]]}` has already been declared")
+      out.push(plain_error(c, path, l.src, p, p, "Identifier `{l.t.names[l.sc.redecl_name[i]]}` has already been declared", ""))
     return out
   scope_rules(&l)
   file_rules(&l, root)
   if l.fatal != "":
-    let lc = line_col(l.src, l.fatal_at)
-    out.push("{path}:{lc[0]}:{lc[1]}: error: {l.fatal}")
+    out.push(plain_error(c, path, l.src, l.fatal_at, l.fatal_at, l.fatal, ""))
     return out
-  # sorted by position, then rule (stable for the rest)
+  # sorted by position, then rule (stable for the rest), for the lines and the disable comments
   var idx: [Int] = []
   for i in 0..l.ds.len: idx.push(i)
   idx.sort(by: fn(a, b) => l.ds[a].pos < l.ds[b].pos or (l.ds[a].pos == l.ds[b].pos and l.ds[a].rule < l.ds[b].rule))
   let dv = directives(l)
-  var oi: [Int] = []
+  var keep: [Int] = []
+  var dsev: [Int] = []
+  var mi: [Int] = []
+  for k in 0..l.ds.len:
+    dsev.push(0)
+    mi.push(-1)
   var line = 1
-  var col = 1
   var at = 0
-  var lstart = 0
   for i in idx:
     let d = l.ds[i]
-    # (positions only grow: line and column, in bytes as oxlint counts them, carried along; line
-    # breaks found by search)
-    if d.pos > at and at < l.src.len:
-      var stop = d.pos
-      if stop > l.src.len: stop = l.src.len
-      while true:
-        let nl = l.src.find("\n", at)
-        if nl < 0 or nl >= stop: break
-        line += 1
-        lstart = nl + 1
-        at = nl + 1
-      at = stop
-      col = at - lstart + 1
-    if dv.len > 0 and suppressed(dv, d, line): continue
-    var s = "{path}:{line}:{col}: warning {d.rule}: {squash(d.msg)}"
-    if d.help != "": s = s + " help: " + squash(d.help)
-    out.push(s)
+    let m = c.m.at.get(d.rule, -1)
+    var sv = 1
+    if m >= 0: sv = sev[m]
+    if sv == 0: continue
+    # (positions only grow: the line carried along, line breaks found by search)
+    if dv.len > 0:
+      if d.pos > at and at < l.src.len:
+        var stop = d.pos
+        if stop > l.src.len: stop = l.src.len
+        while true:
+          let nl = l.src.find("\n", at)
+          if nl < 0 or nl >= stop: break
+          line += 1
+          at = nl + 1
+        at = stop
+      if suppressed(dv, d, line): continue
+    dsev[i] = sv
+    mi[i] = m
+    keep.push(i)
+  # oxlint's order: the rules that run once per file first (by rule), then by the node each rule ran
+  # on (the order oxc visits nodes: by start, the outer first), then by rule
+  var ph: [Int] = []
+  var np: [Int] = []
+  var ne: [Int] = []
+  var rid: [Int] = []
+  for k in 0..l.ds.len:
+    ph.push(1)
+    np.push(0)
+    ne.push(0)
+    rid.push(0)
+  for i in keep:
+    let m = mi[i]
+    if m >= 0:
+      rid[i] = c.m.id[m]
+      if c.m.run[m] == 1 or c.m.run[m] == 2: ph[i] = 0
+    let on = l.ds[i].on
+    if on > 0 and on < l.t.nd.len:
+      np[i] = l.t.nd[on].pos
+      ne[i] = l.t.nd[on].end
+    elif on < -1:
+      np[i] = -(on + 2)
+      ne[i] = 1 << 60
+    else:
+      np[i] = l.ds[i].pos
+      ne[i] = l.ds[i].pos
+  var ord: [Int] = []
+  for i in keep: ord.push(i)
+  ord.sort(by: fn(x, y) => before(x, y, ph, rid, np, ne, l.ds[x].on, l.ds[y].on))
+  var ls: [Int] = []
+  if ord.len > 0: ls = lout.line_index(l.src)
+  var oi: [Int] = []
+  for i in ord:
+    let d = l.ds[i]
+    var labs: [lout.Lab] = []
+    var e = d.end
+    if e < d.pos: e = d.pos
+    labs.push(lout.Lab(d.pos, e, d.lab, d.haslab, false))
+    var j = 0
+    while j + 2 < d.xs.len:
+      let tx = d.xl[j / 3]
+      labs.push(lout.Lab(d.xs[j], d.xs[j + 1], tx, tx != "\0", d.xs[j + 2] == 1))
+      j += 3
+    var url = ""
+    let m = mi[i]
+    if m >= 0: url = lmeta.url(c.m, m)
+    let dg = lout.Diag(dsev[i], d.rule, url, d.msg, d.help, labs, d.note)
+    out.push(lout.make_rec(c.o, path, l.src, ls, dg))
     if fixing: oi.push(i)
   if fixing: return apply_fixes(l, out, oi, &fixed)
   return out
 
+# oxlint's order of two diagnostics (see lint_l)
+fn before(x: Int, y: Int, ph: [Int], rid: [Int], np: [Int], ne: [Int], onx: Int, ony: Int) -> Bool:
+  if ph[x] != ph[y]: return ph[x] < ph[y]
+  if ph[x] == 0: return rid[x] < rid[y]
+  if np[x] != np[y]: return np[x] < np[y]
+  if ne[x] != ne[y]: return ne[x] > ne[y]
+  if onx != ony: return onx > ony
+  return rid[x] < rid[y]
+
 # oxlint's Fixer: the fixes in order of their spans, each one skipped if it starts at or before the
 # end of the last one applied (touching counts as overlapping); one pass. The diagnostics whose fix
 # was applied are dropped; the rest keep their places in the original text.
-fn apply_fixes(l: L, own out: [Str], oi: [Int], var fixed: [Str]) -> [Str]:
+fn apply_fixes(l: L, own out: [lout.Rec], oi: [Int], var fixed: [Str]) -> [lout.Rec]:
   var cand: [Int] = []
   for i in oi:
     if l.ds[i].fs >= 0: cand.push(i)
@@ -331,9 +465,12 @@ fn apply_fixes(l: L, own out: [Str], oi: [Int], var fixed: [Str]) -> [Str]:
     done[i] = true
   parts.push(l.src[last..l.src.len])
   fixed.push("".join(parts))
-  var rest: [Str] = []
+  var rest: [lout.Rec] = []
   for j in 0..out.len:
-    if not done[oi[j]]: rest.push(out[j])
+    if not done[oi[j]]:
+      var e = lout.Rec(0, "", "", "", 0, 0, 0, 0, "")
+      swap(&e, &out[j])
+      rest.push(e)
   return rest
 
 # ---- eslint-disable comments
@@ -571,6 +708,7 @@ fn visit(var l: L, n: Int):
       let x = l.t.L[nd.a + i]
       if x > 0: visit(&l, x)
     return
+  l.cur = n
   check(&l, n, kd)
   if vk == 'c': return
   if vk == 'p':
@@ -638,7 +776,8 @@ fn visit_special(var l: L, n: Int, kd: Int):
 # no-unused-labels (the fix: the label's statement without the label)
 fn unused_label(var l: L, n: Int, body: Int):
   let lname = name_of(l, n)
-  add_fix(&l, l.t.nd[n].pos, "eslint(no-unused-labels)", "'{lname}:' is defined but never used.", "Replace `{text(l, n)}` with `{text(l, body)}`.", l.t.nd[n].pos, l.t.nd[n].end, text(l, body))
+  addn_fix(&l, n, "eslint(no-unused-labels)", "'{lname}:' is defined but never used.", "Replace `{text(l, n)}` with `{text(l, body)}`.", l.t.nd[n].pos, l.t.nd[n].end, text(l, body))
+  span(&l, l.t.nd[n].pos + lname.len)
 
 fn visit_function(var l: L, n: Int, kd: Int):
   let was_setter = l.setter
@@ -648,7 +787,8 @@ fn visit_function(var l: L, n: Int, kd: Int):
   if l.setter and kd == ast.N_ARROW:
     let bd = l.t.nd[n].d
     if bd > 0 and l.t.nd[bd].k != ast.N_BLOCK:
-      add(&l, l.t.nd[bd].pos, "eslint(no-setter-return)", "Setter cannot return a value", "Remove the return statement or ensure it does not return a value.")
+      addn(&l, bd, "eslint(no-setter-return)", "Setter cannot return a value", "Remove the return statement or ensure it does not return a value.")
+      on(&l, n)
   push_jt(&l, 5, -1)
   var body = l.t.nd[n].d
   if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR: body = l.t.nd[n].c
@@ -665,6 +805,8 @@ fn visit_function(var l: L, n: Int, kd: Int):
     if kd == ast.N_METHOD: at = l.t.nd[l.t.nd[n].b].pos
     elif np >= 0: at = np
     add(&l, at, "eslint(require-yield)", "This generator function does not have `yield`", "Add a `yield` expression inside the generator body, or convert it to a regular function if iteration behavior is not needed.")
+    span(&l, l.t.nd[n].end)
+    on(&l, n)
   l.setter = was_setter
   l.yields = was_yields
 
@@ -678,7 +820,7 @@ fn check(var l: L, n: Int, kd: Int):
       # a parameter of a signature in a type
       let nm = name_of(l, pn)
       if nm == "NaN" or nm == "Infinity" or nm == "eval" or nm == "arguments" or nm == "globalThis" or nm == "undefined":
-        add(&l, l.t.nd[pn].pos, "eslint(no-shadow-restricted-names)", "Shadowing of global properties such as `undefined` is not allowed.", "Rename '{nm}' to avoid shadowing the global property.")
+        addn(&l, pn, "eslint(no-shadow-restricted-names)", "Shadowing of global properties such as `undefined` is not allowed.", "Rename '{nm}' to avoid shadowing the global property.")
     return
   if kd == ast.N_ID or kd == ast.N_TKW or kd == ast.N_BLOCK or kd == ast.N_PROPASSIGN or kd == ast.N_VAR or kd == ast.N_THIS: return
   if kd == ast.N_PROPACCESS:
@@ -690,9 +832,9 @@ fn check(var l: L, n: Int, kd: Int):
     let pn = name_of(l, n)
     if pn == "callee" or pn == "caller":
       if id_is(l, l.t.nd[n].a, "arguments"):
-        add(&l, l.t.nd[n].d, "eslint(no-caller)", "Do not use `arguments.{pn}`.", "`caller`, `callee`, and `arguments` properties may not be accessed on strict mode functions or the arguments objects for calls to them.")
+        addn(&l, n, "eslint(no-caller)", "Do not use `arguments.{pn}`.", "`caller`, `callee`, and `arguments` properties may not be accessed on strict mode functions or the arguments objects for calls to them.")
     elif pn == "__iterator__":
-      add(&l, l.t.nd[n].pos, "eslint(no-iterator)", "Reserved name `__iterator__`", "Consider using [Symbol.iterator] instead")
+      addn(&l, n, "eslint(no-iterator)", "Reserved name `__iterator__`", "Consider using [Symbol.iterator] instead")
     if (l.t.nd[n].f & 1) == 0: unsafe_chain_obj(&l, l.t.nd[n].a)
     elif k(l, unparen(l, l.t.nd[n].a)) == ast.N_NONNULL: extra_nonnull(&l, unparen(l, l.t.nd[n].a))
     l.cont[l.t.nd[n].a] = true
@@ -713,9 +855,9 @@ fn check(var l: L, n: Int, kd: Int):
     check_expr_stmt(&l, n)
     missing_throw(&l, n)
   elif kd == ast.N_DEBUGGER:
-    add(&l, l.t.nd[n].pos, "eslint(no-debugger)", "`debugger` statement is not allowed", "Remove the debugger statement")
+    addn(&l, n, "eslint(no-debugger)", "`debugger` statement is not allowed", "Remove the debugger statement")
   elif kd == ast.N_WITH:
-    add(&l, l.t.nd[n].pos, "eslint(no-with)", "Unexpected use of `with` statement.", "Do not use the `with` statement.")
+    addn(&l, n, "eslint(no-with)", "Unexpected use of `with` statement.", "Do not use the `with` statement.")
   elif kd == ast.N_BINARY: check_binary(&l, n)
   elif kd == ast.N_PREFIX:
     if l.t.nd[n].f == T_BANG: bool_ctx(&l, l.t.nd[n].a, n)
@@ -724,7 +866,7 @@ fn check(var l: L, n: Int, kd: Int):
   elif kd == ast.N_DELETE:
     ns_import_write(&l, n, l.t.nd[n].a)
     if k(l, unparen(l, l.t.nd[n].a)) == ast.N_ID:
-      add(&l, l.t.nd[n].pos, "eslint(no-delete-var)", "Variables should not be deleted", "Assign `undefined` to the variable instead of using `delete`. The `delete` operator is intended for removing properties from objects, not for variables.")
+      addn(&l, n, "eslint(no-delete-var)", "Variables should not be deleted", "Assign `undefined` to the variable instead of using `delete`. The `delete` operator is intended for removing properties from objects, not for variables.")
   elif kd == ast.N_IF:
     let test = l.t.nd[n].a
     cond_assign(&l, test)
@@ -758,7 +900,7 @@ fn check(var l: L, n: Int, kd: Int):
   elif kd == ast.N_BREAK or kd == ast.N_CONTINUE: check_jump(&l, n, kd)
   elif kd == ast.N_RETURN:
     if l.setter and l.t.nd[n].a > 0:
-      add(&l, l.t.nd[n].pos, "eslint(no-setter-return)", "Setter cannot return a value", "Remove the return statement or ensure it does not return a value.")
+      addn(&l, n, "eslint(no-setter-return)", "Setter cannot return a value", "Remove the return statement or ensure it does not return a value.")
     unsafe_finally(&l, n, 0, -1)
   elif kd == ast.N_THROW: unsafe_finally(&l, n, 0, -1)
   elif kd == ast.N_YIELD: l.yields += 1
@@ -779,7 +921,7 @@ fn check(var l: L, n: Int, kd: Int):
     l.cont[l.t.nd[n].a] = true
     if k(l, ix) == ast.N_STR: args_method(&l, n, l.t.nd[ix].s)
     if k(l, ix) == ast.N_STR and name_of(l, ix) == "__iterator__":
-      add(&l, l.t.nd[n].pos, "eslint(no-iterator)", "Reserved name `__iterator__`", "Consider using [Symbol.iterator] instead")
+      addn(&l, n, "eslint(no-iterator)", "Reserved name `__iterator__`", "Consider using [Symbol.iterator] instead")
     if (l.t.nd[n].f & 1) == 0: unsafe_chain_obj(&l, l.t.nd[n].a)
     elif k(l, unparen(l, l.t.nd[n].a)) == ast.N_NONNULL: extra_nonnull(&l, unparen(l, l.t.nd[n].a))
   elif kd == ast.N_ARRAY:
@@ -787,7 +929,8 @@ fn check(var l: L, n: Int, kd: Int):
     for i in 0..ast.count(l.t, lst):
       let e = ast.item(l.t, lst, i)
       if l.t.nd[e].k == ast.N_OMIT and not (n in l.patterns):
-        add(&l, l.t.nd[e].pos, "eslint(no-sparse-arrays)", "Unexpected comma in middle of array", "remove the comma or insert `undefined`")
+        addn(&l, e, "eslint(no-sparse-arrays)", "Unexpected comma in middle of array", "remove the comma or insert `undefined`")
+        label(&l, l.t.nd[e].pos, "unexpected comma")
       elif l.t.nd[e].k == ast.N_SPREAD:
         unsafe_chain(&l, l.t.nd[e].a)
         if k(l, unparen(l, l.t.nd[e].a)) == ast.N_ARRAY and not (n in l.set_arg): array_in_array(&l, n, e)
@@ -806,12 +949,12 @@ fn check(var l: L, n: Int, kd: Int):
   elif kd == ast.N_STATICBLOCK:
     let blk = l.t.nd[n].a
     if ast.count(l.t, l.t.nd[blk].a) == 0 and not has_comment(l, l.t.nd[blk].pos + 1, l.t.nd[blk].end - 1):
-      add(&l, l.t.nd[n].pos, "eslint(no-empty-static-block)", "Unexpected empty static blocks", "Remove this empty block or add content to it.")
+      addn(&l, n, "eslint(no-empty-static-block)", "Unexpected empty static blocks", "Remove this empty block or add content to it.")
   elif kd == ast.N_OBJPAT or kd == ast.N_ARRPAT:
     if ast.count(l.t, l.t.nd[n].a) == 0:
       var what = "object"
       if kd == ast.N_ARRPAT: what = "array"
-      add(&l, l.t.nd[n].pos, "eslint(no-empty-pattern)", "Empty {what} binding pattern", empty_help(what))
+      addn(&l, n, "eslint(no-empty-pattern)", "Empty {what} binding pattern", empty_help(what))
   elif kd == ast.N_FORIN:
     if l.t.nd[n].f >= 0 and k(l, l.t.nd[n].a) != ast.N_VAR: mark_pattern(&l, unparen(l, l.t.nd[n].a))
     if l.t.nd[n].f >= 1:
@@ -819,7 +962,8 @@ fn check(var l: L, n: Int, kd: Int):
       let it = unparen(l, l.t.nd[n].b)
       if k(l, it) == ast.N_ARRAY and ast.count(l.t, l.t.nd[it].a) == 1 and k(l, ast.item(l.t, l.t.nd[it].a, 0)) == ast.N_SPREAD:
         l.set_arg[it] = true
-        add(&l, l.t.nd[ast.item(l.t, l.t.nd[it].a, 0)].pos, "unicorn(no-useless-spread)", "Using a spread operator here creates a new array unnecessarily.", "`for…of` can iterate over iterable, it's unnecessary to convert to an array.")
+        addn(&l, ast.item(l.t, l.t.nd[it].a, 0), "unicorn(no-useless-spread)", "Using a spread operator here creates a new array unnecessarily.", "`for…of` can iterate over iterable, it's unnecessary to convert to an array.")
+        dots(&l)
   elif kd == ast.N_TAGGED:
     unsafe_chain_obj(&l, l.t.nd[n].a)
     l.tagged[l.t.nd[n].c] = true
@@ -849,7 +993,7 @@ fn check_expr_stmt(var l: L, n: Int):
   if n in l.dirs: return
   let e = l.t.nd[n].a
   if disallowed(l, e):
-    add(&l, l.t.nd[n].pos, "eslint(no-unused-expressions)", "Expected expression to be used", "Consider using this expression or removing it")
+    addn(&l, n, "eslint(no-unused-expressions)", "Expected expression to be used", "Consider using this expression or removing it")
 
 fn disallowed(l: L, e: Int) -> Bool:
   let kd = k(l, e)
@@ -874,8 +1018,8 @@ fn check_binary(var l: L, n: Int):
       # (=== gets only a suggestion; for the others, -0 becomes 0)
       var nz = b
       if neg_zero(l, a): nz = a
-      if op == T_EQ3: add(&l, l.t.nd[n].pos, "eslint(no-compare-neg-zero)", "Do not use the {op_text(op)} operator to compare against -0.", "Use Object.is(x, -0) to test equality with -0 and use 0 for other cases")
-      else: add_fix(&l, l.t.nd[n].pos, "eslint(no-compare-neg-zero)", "Do not use the {op_text(op)} operator to compare against -0.", "Use Object.is(x, -0) to test equality with -0 and use 0 for other cases", l.t.nd[nz].pos, l.t.nd[nz].pos + 1, "")
+      if op == T_EQ3: addn(&l, n, "eslint(no-compare-neg-zero)", "Do not use the {op_text(op)} operator to compare against -0.", "Use Object.is(x, -0) to test equality with -0 and use 0 for other cases")
+      else: addn_fix(&l, n, "eslint(no-compare-neg-zero)", "Do not use the {op_text(op)} operator to compare against -0.", "Use Object.is(x, -0) to test equality with -0 and use 0 for other cases", l.t.nd[nz].pos, l.t.nd[nz].pos + 1, "")
     # use-isnan
     for si in 0..2:
       var side = a
@@ -889,8 +1033,8 @@ fn check_binary(var l: L, n: Int):
           if si == 1: other = a
           var bang = ""
           if op == T_NE or op == T_NE2: bang = "!"
-          add_fix(&l, l.t.nd[side].pos, "eslint(use-isnan)", msg, "Use the `isNaN` function to compare with NaN.", l.t.nd[n].pos, l.t.nd[n].end, "{bang}isNaN({text(l, other)})")
-        else: add(&l, l.t.nd[side].pos, "eslint(use-isnan)", msg, "Use the `isNaN` function to compare with NaN.")
+          addn_fix(&l, side, "eslint(use-isnan)", msg, "Use the `isNaN` function to compare with NaN.", l.t.nd[n].pos, l.t.nd[n].end, "{bang}isNaN({text(l, other)})")
+        else: addn(&l, side, "eslint(use-isnan)", msg, "Use the `isNaN` function to compare with NaN.")
   if is_eq_op(op):
     # valid-typeof
     let ua = unparen(l, a)
@@ -900,25 +1044,28 @@ fn check_binary(var l: L, n: Int):
   if op == scan.W_IN or op == scan.W_INSTANCEOF:
     if is_not(l, a):
       let ot = op_text(op)
-      add_fix(&l, l.t.nd[n].pos, "eslint(no-unsafe-negation)", "Unexpected negation of the left operand of '{ot}' operator.", "Use `()` to negate the whole expression, as '!' binds more closely than '{ot}'", l.t.nd[n].pos, l.t.nd[n].end, "!({text(l, l.t.nd[a].a)} {ot} {text(l, b)})")
+      addn_fix(&l, n, "eslint(no-unsafe-negation)", "Unexpected negation of the left operand of '{ot}' operator.", "Use `()` to negate the whole expression, as '!' binds more closely than '{ot}'", l.t.nd[n].pos, l.t.nd[n].end, "!({text(l, l.t.nd[a].a)} {ot} {text(l, b)})")
+      span(&l, l.t.nd[a].end)
   if op == T_ASSIGN or op == scan.T_ANDEQ or op == scan.T_OREQ or op == scan.T_QQEQ:
     self_assign(&l, a, b)
   if op == T_ASSIGN and l.ts and k(l, a) == ast.N_ID and k(l, unparen(l, b)) == ast.N_THIS:
-    add(&l, l.t.nd[a].pos, "typescript(no-this-alias)", "Unexpected aliasing of 'this' to local variable.", "Assigning a variable to this instead of properly using arrow lambdas may be a symptom of pre-ES2015 practices or not managing scope well.")
+    addn(&l, a, "typescript(no-this-alias)", "Unexpected aliasing of 'this' to local variable.", "Assigning a variable to this instead of properly using arrow lambdas may be a symptom of pre-ES2015 practices or not managing scope well.")
   if op == T_ASSIGN and is_pattern_expr(l, unparen(l, a)):
     unsafe_chain(&l, b)
     mark_pattern(&l, unparen(l, a))
   if (op == T_LT or op == T_GT) and same(l, unparen(l, a), unparen(l, b)):
     var w = "greater"
     if op == T_LT: w = "less"
-    add(&l, l.t.nd[n].pos, "oxc(const-comparisons)", "This comparison will always evaluate to false", "Because `{text(l, unparen(l, a))}` will never be {w} than itself")
+    addn(&l, n, "oxc(const-comparisons)", "This comparison will always evaluate to false", "Because `{text(l, unparen(l, a))}` will never be {w} than itself")
   if op == T_LT or op == T_GT or op == T_LE or op == T_GE:
     if is_literal(k(l, unparen(l, a))) and is_literal(k(l, unparen(l, b))):
-      add(&l, l.t.nd[n].pos, "eslint(no-constant-binary-expression)", "Unexpected constant relational comparison", "Both sides of the {op_text(op)} are literal values")
+      addn(&l, n, "eslint(no-constant-binary-expression)", "Unexpected constant relational comparison", "Both sides of the {op_text(op)} are literal values")
   if is_cmp_op(op):
     let ua2 = a
     if k(l, ua2) == ast.N_BINARY and is_cmp_op(l.t.nd[ua2].f) and is_eq_op(l.t.nd[ua2].f) == is_eq_op(op):
-      add(&l, l.t.nd[n].pos, "oxc(bad-comparison-sequence)", "Bad comparison sequence", "Comparison result should not be used directly as an operand of another comparison. If you need to compare three or more operands, you should connect each comparison operation with logical AND operator (`&&`)")
+      addn(&l, n, "oxc(bad-comparison-sequence)", "Bad comparison sequence", "Comparison result should not be used directly as an operand of another comparison. If you need to compare three or more operands, you should connect each comparison operation with logical AND operator (`&&`)")
+      label(&l, l.t.nd[ua2].end, "This comparison expression produces a boolean")
+      more(&l, l.t.nd[b].pos, l.t.nd[b].end, "That boolean is then compared with this operand", true)
   if is_eq_op(op):
     const_binary(&l, n, op, a, b)
     bad_literal_cmp(&l, n, op, a, b)
@@ -932,20 +1079,22 @@ fn check_binary(var l: L, n: Int):
     double_cmp(&l, n, op, a, b)
     if op == T_AND: const_cmp(&l, n, a, b)
     if same(l, unparen(l, a), unparen(l, b)) and not has_call(l, a):
-      add(&l, l.t.nd[n].pos, "oxc(const-comparisons)", "Both sides of the logical operator are the same", "This logical expression will always evaluate to the same value as the expression itself.")
+      addn(&l, n, "oxc(const-comparisons)", "Both sides of the logical operator are the same", "This logical expression will always evaluate to the same value as the expression itself.")
+      label(&l, l.t.nd[a].end, "If this expression evaluates to true")
+      more(&l, l.t.nd[b].pos, l.t.nd[b].end, "This expression will always evaluate to true", true)
     useless_length_check(&l, n, op, a, b)
     if is_constant(l, a, true):
-      add(&l, l.t.nd[n].pos, "eslint(no-constant-binary-expression)", "Unexpected constant truthiness on the left-hand side of a \"{op_text(op)}\" expression", "This expression always evaluates to the constant on the left-hand side")
+      addn(&l, n, "eslint(no-constant-binary-expression)", "Unexpected constant truthiness on the left-hand side of a \"{op_text(op)}\" expression", "This expression always evaluates to the constant on the left-hand side")
   if op == T_QQ:
     if const_nullish(l, a, false):
-      add(&l, l.t.nd[n].pos, "eslint(no-constant-binary-expression)", "Unexpected constant nullishness on the left-hand side of a \"??\" expression", "This expression always evaluates to the constant on the left-hand side")
+      addn(&l, n, "eslint(no-constant-binary-expression)", "Unexpected constant nullishness on the left-hand side of a \"??\" expression", "This expression always evaluates to the constant on the left-hand side")
   if is_assign_op(op): ns_import_write(&l, n, a)
   if op == T_ASSIGN:
     let ua = unparen(l, a)
     if (k(l, ua) == ast.N_OBJECT or k(l, ua) == ast.N_ARRAY) and ast.count(l.t, l.t.nd[ua].a) == 0:
       var what = "object"
       if k(l, ua) == ast.N_ARRAY: what = "array"
-      add(&l, l.t.nd[ua].pos, "eslint(no-empty-pattern)", "Empty {what} binding pattern", empty_help(what))
+      addn(&l, ua, "eslint(no-empty-pattern)", "Empty {what} binding pattern", empty_help(what))
 
 # A write to a member of a namespace import (ns.x = 1, ns.x++, delete ns.x).
 fn ns_import_write(var l: L, n: Int, target: Int):
@@ -956,7 +1105,7 @@ fn ns_import_write(var l: L, n: Int, target: Int):
   if k(l, o) != ast.N_ID: return
   let y = scope.sym_of(l.sc, o)
   if y >= 0 and (l.sc.yf[y] & scope.F_NSIMPORT) != 0:
-    add(&l, l.t.nd[n].pos, "eslint(no-import-assign)", "Do not assign to imported bindings", "Imported bindings are readonly")
+    addn(&l, n, "eslint(no-import-assign)", "Do not assign to imported bindings", "Imported bindings are readonly")
 
 fn mark_pattern(var l: L, n: Int):
   let kd = k(l, n)
@@ -990,7 +1139,7 @@ fn is_nan(l: L, n: Int) -> Bool:
 fn valid_typeof(var l: L, n: Int):
   let kd = k(l, n)
   if kd == ast.N_ID and name_of(l, n) == "undefined" and is_global(l, n):
-    add_fix(&l, l.t.nd[n].pos, "eslint(valid-typeof)", "Invalid `typeof` comparison value.", "Use `\"undefined\"` instead of `undefined`.", l.t.nd[n].pos, l.t.nd[n].end, "\"undefined\"")
+    addn_fix(&l, n, "eslint(valid-typeof)", "Invalid `typeof` comparison value.", "Use `\"undefined\"` instead of `undefined`.", l.t.nd[n].pos, l.t.nd[n].end, "\"undefined\"")
     return
   if kd != ast.N_STR and kd != ast.N_NOSUBTEMPL: return
   let v = name_of(l, n)
@@ -999,7 +1148,7 @@ fn valid_typeof(var l: L, n: Int):
   var help = ""
   let sug = typeof_suggestion(v)
   if sug != "": help = "Did you mean `\"{sug}\"`?"
-  add(&l, l.t.nd[n].pos, "eslint(valid-typeof)", "Invalid `typeof` comparison value.", help)
+  addn(&l, n, "eslint(valid-typeof)", "Invalid `typeof` comparison value.", help)
 
 fn typeof_suggestion(v: Str) -> Str:
   var best = ""
@@ -1090,7 +1239,7 @@ fn same_member(l: L, a: Int, b: Int) -> Bool:
   return false
 
 fn report_self(var l: L, n: Int):
-  add(&l, l.t.nd[n].pos, "eslint(no-self-assign)", "this expression is assigned to itself", "Remove the self-assignment or assign to a different variable.")
+  addn(&l, n, "eslint(no-self-assign)", "this expression is assigned to itself", "Remove the self-assignment or assign to a different variable.")
 
 # ---- conditions
 
@@ -1099,10 +1248,14 @@ fn cond_assign(var l: L, test: Int):
     let left = l.t.nd[test].a
     let at = skip_to_op(l, l.t.nd[left].end)
     add(&l, at, "eslint(no-cond-assign)", "Expected a conditional expression and instead saw an assignment", "Consider wrapping the assignment in additional parentheses")
+    var oe = at
+    while oe < l.src.len and l.src[oe] != '=': oe += 1
+    span(&l, oe + 1)
 
 fn const_cond(var l: L, test: Int):
   if is_constant(l, test, true):
-    add(&l, l.t.nd[test].pos, "eslint(no-constant-condition)", "Unexpected constant condition", "Update the condition to not be constant, or remove the condition entirely")
+    addn(&l, test, "eslint(no-constant-condition)", "Unexpected constant condition", "Update the condition to not be constant, or remove the condition entirely")
+    label(&l, l.t.nd[test].end, "this expression will always evaluate to the same value")
 
 fn is_literal(kd: Int) -> Bool:
   return kd == ast.N_NUM or kd == ast.N_BIGINT or kd == ast.N_STR or kd == ast.N_REGEX or kd == ast.N_TRUE or kd == ast.N_FALSE or kd == ast.N_NULL
@@ -1206,19 +1359,19 @@ fn logical_identity(l: L, n: Int, op: Int) -> Bool:
 fn bool_ctx(var l: L, n: Int, ctx: Int):
   let e = unparen(l, n)
   if is_not(l, e) and is_not(l, unparen(l, l.t.nd[e].a)):
-    add(&l, l.t.nd[e].pos, "eslint(no-extra-boolean-cast)", "Redundant double negation", "Remove the double negation as it will already be coerced to a boolean")
+    addn(&l, e, "eslint(no-extra-boolean-cast)", "Redundant double negation", "Remove the double negation as it will already be coerced to a boolean")
   elif k(l, e) == ast.N_CALL and id_is(l, l.t.nd[e].a, "Boolean"):
     let m = "Redundant Boolean call"
     let h = "Remove the Boolean call as it will already be coerced to a boolean"
     let args = l.t.nd[e].c
     let na = ast.count(l.t, args)
     if na == 0:
-      if is_not(l, ctx): add_fix(&l, l.t.nd[e].pos, "eslint(no-extra-boolean-cast)", m, h, l.t.nd[ctx].pos, l.t.nd[ctx].end, pad_token(l, l.t.nd[ctx].pos, l.t.nd[ctx].end, "true"))
-      else: add_fix(&l, l.t.nd[e].pos, "eslint(no-extra-boolean-cast)", m, h, l.t.nd[e].pos, l.t.nd[e].end, "false")
+      if is_not(l, ctx): addn_fix(&l, e, "eslint(no-extra-boolean-cast)", m, h, l.t.nd[ctx].pos, l.t.nd[ctx].end, pad_token(l, l.t.nd[ctx].pos, l.t.nd[ctx].end, "true"))
+      else: addn_fix(&l, e, "eslint(no-extra-boolean-cast)", m, h, l.t.nd[e].pos, l.t.nd[e].end, "false")
       return
     var a = ast.item(l.t, args, 0)
     if na != 1 or k(l, a) == ast.N_SPREAD:
-      add(&l, l.t.nd[e].pos, "eslint(no-extra-boolean-cast)", m, h)
+      addn(&l, e, "eslint(no-extra-boolean-cast)", m, h)
       return
     # !!x counts as x; then parentheses dropped, and put back where the call's place needs them
     let a1 = unparen(l, a)
@@ -1235,7 +1388,7 @@ fn bool_ctx(var l: L, n: Int, ctx: Int):
     if paren:
       let tt = t.strip()
       if not (tt.startswith("(") and tt.endswith(")")): t = "(" + t + ")"
-    add_fix(&l, l.t.nd[e].pos, "eslint(no-extra-boolean-cast)", m, h, l.t.nd[e].pos, l.t.nd[e].end, pad_token(l, l.t.nd[e].pos, l.t.nd[e].end, t))
+    addn_fix(&l, e, "eslint(no-extra-boolean-cast)", m, h, l.t.nd[e].pos, l.t.nd[e].end, pad_token(l, l.t.nd[e].pos, l.t.nd[e].end, t))
 
 # oxc's precedence of an expression (as get_precedence gives it; -1 for none)
 fn js_prec(l: L, x: Int) -> Int:
@@ -1355,7 +1508,9 @@ fn dupe_else_if(var l: L, n: Int):
       nl.push(kept)
     list = nl
     if empty:
-      add(&l, l.t.nd[l.t.nd[cur].a].pos, "eslint(no-dupe-else-if)", "Duplicate conditions in if-else-if chain", "Remove or modify the duplicate condition, as its branch will never be executed.")
+      addn(&l, l.t.nd[cur].a, "eslint(no-dupe-else-if)", "Duplicate conditions in if-else-if chain", "Remove or modify the duplicate condition, as its branch will never be executed.")
+      label(&l, l.t.nd[l.t.nd[cur].a].end, "condition first checked here")
+      more(&l, l.t.nd[l.t.nd[n].a].pos, l.t.nd[l.t.nd[n].a].end, "this branch will never be executed", true)
       return
 
 fn else_parent(l: L, n: Int) -> Int:
@@ -1382,7 +1537,7 @@ fn for_direction(var l: L, n: Int):
   if want == 0: return
   let dir = update_dir(l, unparen(l, upd), counter)
   if dir != 0 and dir != want:
-    add(&l, l.t.nd[l.t.nd[n].b].pos, "eslint(for-direction)", "The update clause in this loop moves the variable in the wrong direction", "Use `while` loop for intended infinite loop")
+    addn(&l, l.t.nd[n].b, "eslint(for-direction)", "The update clause in this loop moves the variable in the wrong direction", "Use `while` loop for intended infinite loop")
 
 fn update_dir(l: L, u: Int, counter: Int) -> Int:
   let kd = k(l, u)
@@ -1446,7 +1601,7 @@ fn unsafe_finally(var l: L, n: Int, kd: Int, label: Int):
     i -= 1
 
 fn report_finally(var l: L, n: Int):
-  add(&l, l.t.nd[n].pos, "eslint(no-unsafe-finally)", "Unsafe `finally` block.", "Control flow inside `try` or `catch` blocks will be overwritten by this statement.")
+  addn(&l, n, "eslint(no-unsafe-finally)", "Unsafe `finally` block.", "Control flow inside `try` or `catch` blocks will be overwritten by this statement.")
 
 # ---- calls
 
@@ -1456,7 +1611,8 @@ fn check_new(var l: L, n: Int):
   if k(l, cal) == ast.N_ID and hot(l, l.t.nd[cal].s):
     let nm = name_of(l, cal)
     if (nm == "Symbol" or nm == "BigInt") and is_global(l, cal):
-      add(&l, l.t.nd[n].pos, "eslint(no-new-native-nonconstructor)", "`{nm}` cannot be called as a constructor.", "Remove the `new` operator to call `{nm}` as a function.")
+      addn(&l, n, "eslint(no-new-native-nonconstructor)", "`{nm}` cannot be called as a constructor.", "Remove the `new` operator to call `{nm}` as a function.")
+      head(&l, 3)
     obj_call(&l, n, cal)
     if nm == "Promise" and is_global(l, cal):
       let args = l.t.nd[n].c
@@ -1464,7 +1620,8 @@ fn check_new(var l: L, n: Int):
         let a0 = unparen(l, ast.item(l.t, args, 0))
         let ka = k(l, a0)
         if (ka == ast.N_ARROW or ka == ast.N_FUNCEXPR) and (l.t.nd[a0].f & ast.M_ASYNC) != 0:
-          add(&l, l.t.nd[a0].pos, "eslint(no-async-promise-executor)", "Promise executor functions should not be `async`.", "Remove the `async` keyword from the Promise executor function.")
+          addn(&l, a0, "eslint(no-async-promise-executor)", "Promise executor functions should not be `async`.", "Remove the `async` keyword from the Promise executor function.")
+          head(&l, 5)
     if nm == "Boolean":
       let args = l.t.nd[n].c
       if ast.count(l.t, args) > 0: bool_ctx(&l, ast.item(l.t, args, 0), n)
@@ -1474,7 +1631,7 @@ fn obj_call(var l: L, n: Int, cal: Int):
   let nm = name_of(l, cal)
   if nm == "Math" or nm == "JSON" or nm == "Reflect" or nm == "Atomics" or nm == "Intl":
     if is_global(l, cal):
-      add(&l, l.t.nd[n].pos, "eslint(no-obj-calls)", "`{nm}` is not a function and cannot be called", "This call will throw a TypeError at runtime.")
+      addn(&l, n, "eslint(no-obj-calls)", "`{nm}` is not a function and cannot be called", "This call will throw a TypeError at runtime.")
 
 fn check_call(var l: L, n: Int):
   let cal = unparen(l, l.t.nd[n].a)
@@ -1485,13 +1642,13 @@ fn check_call(var l: L, n: Int):
     let nm = name_of(l, cal)
     obj_call(&l, n, cal)
     if nm == "eval" and is_global(l, cal):
-      add(&l, l.t.nd[cal].pos, "eslint(no-eval)", "eval can be harmful.", "Avoid eval(). For JSON parsing use JSON.parse(); for dynamic property access use bracket notation (obj[key]); for other cases refactor to avoid evaluating strings as code.")
+      addn(&l, cal, "eslint(no-eval)", "eval can be harmful.", "Avoid eval(). For JSON parsing use JSON.parse(); for dynamic property access use bracket notation (obj[key]); for other cases refactor to avoid evaluating strings as code.")
     if nm == "Boolean":
       let args = l.t.nd[n].c
       if ast.count(l.t, args) > 0: bool_ctx(&l, ast.item(l.t, args, 0), n)
     if nm == "RegExp" and is_global(l, cal): regexp_call(&l, n)
   elif is_bin(l, cal, T_COMMA) and id_is(l, last_of_seq(l, cal), "eval") and is_global(l, last_of_seq(l, cal)):
-    add(&l, l.t.nd[last_of_seq(l, cal)].pos, "eslint(no-eval)", "eval can be harmful.", "Avoid eval(). For JSON parsing use JSON.parse(); for dynamic property access use bracket notation (obj[key]); for other cases refactor to avoid evaluating strings as code.")
+    addn(&l, last_of_seq(l, cal), "eslint(no-eval)", "eval can be harmful.", "Avoid eval(). For JSON parsing use JSON.parse(); for dynamic property access use bracket notation (obj[key]); for other cases refactor to avoid evaluating strings as code.")
   elif k(l, cal) == ast.N_PROPACCESS and hot(l, l.t.nd[cal].s):
     let o = unparen(l, l.t.nd[cal].a)
     let mn = name_of(l, cal)
@@ -1507,7 +1664,7 @@ fn check_call(var l: L, n: Int):
     if id_is(l, o, "globalThis") and k(l, o) == ast.N_ID:
       let pn = name_of(l, cal)
       if pn == "Math" or pn == "JSON" or pn == "Reflect" or pn == "Atomics" or pn == "Intl":
-        add(&l, l.t.nd[n].pos, "eslint(no-obj-calls)", "`{pn}` is not a function and cannot be called", "This call will throw a TypeError at runtime.")
+        addn(&l, n, "eslint(no-obj-calls)", "`{pn}` is not a function and cannot be called", "This call will throw a TypeError at runtime.")
 
 fn descriptor(var l: L, n: Int):
   let o = unparen(l, n)
@@ -1532,7 +1689,7 @@ fn short_circuits(l: L, n: Int) -> Int:
   let x = unparen(l, n)
   let kd = k(l, x)
   if kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS or kd == ast.N_CALL or kd == ast.N_NONNULL:
-    if in_chain(l, x): return l.t.nd[x].pos
+    if in_chain(l, x): return x
     return -1
   if kd == ast.N_COND:
     let a = short_circuits(l, l.t.nd[x].b)
@@ -1567,7 +1724,7 @@ fn in_chain(l: L, n: Int) -> Bool:
 fn unsafe_chain(var l: L, n: Int):
   let p = short_circuits(l, n)
   if p >= 0:
-    add(&l, p, "eslint(no-unsafe-optional-chaining)", "Unsafe usage of optional chaining", "If this short-circuits with 'undefined' the evaluation will throw TypeError")
+    addn(&l, p, "eslint(no-unsafe-optional-chaining)", "Unsafe usage of optional chaining", "If this short-circuits with 'undefined' the evaluation will throw TypeError")
 
 # The object of a member access or the callee of a call: unsafe only when parenthesized (else the
 # chain continues through it).
@@ -1682,14 +1839,16 @@ fn dupe_keys(var l: L, n: Int):
       if kind != 1 and (pk & kind) == 0 and (pk & 1) == 0: dup = false
       if dup:
         let nm = l.t.names[id] + ""
-        add(&l, firsts[j], "eslint(no-dupe-keys)", "Duplicate key '{nm}'", "Consider removing the duplicated key")
+        addn(&l, firsts[j], "eslint(no-dupe-keys)", "Duplicate key '{nm}'", "Consider removing the duplicated key")
+        label(&l, l.t.nd[firsts[j]].end, "Key is first defined here")
+        more(&l, l.t.nd[key].pos, l.t.nd[key].end, "and duplicated here", true)
       kinds[j] = pk | kind
     else:
       if ids.len == 16:
         for q in 0..ids.len: at[ids[q]] = q
       if ids.len >= 16: at[id] = ids.len
       ids.push(id)
-      firsts.push(l.t.nd[key].pos)
+      firsts.push(key)
       kinds.push(kind)
 
 fn dupe_class_members(var l: L, n: Int):
@@ -1719,10 +1878,12 @@ fn dupe_class_members(var l: L, n: Int):
       var dup = true
       if kind != 1 and (pk & kind) == 0 and (pk & 1) == 0: dup = false
       if dup:
-        add(&l, seen[nm], "eslint(no-dupe-class-members)", "Duplicate class member: \"{shown}\"", "The last declaration overwrites previous ones, remove one of them or rename if both should be retained")
+        addn(&l, seen[nm], "eslint(no-dupe-class-members)", "Duplicate class member: \"{shown}\"", "The last declaration overwrites previous ones, remove one of them or rename if both should be retained")
+        label(&l, l.t.nd[seen[nm]].end, "\"{shown}\" is previously declared here")
+        more(&l, l.t.nd[key].pos, l.t.nd[key].end, "\"{shown}\" is re-declared here", true)
       kinds[nm] = pk | kind
     else:
-      seen[nm] = l.t.nd[key].pos
+      seen[nm] = key
       kinds[nm] = kind
 
 # ---- switch
@@ -1730,7 +1891,7 @@ fn dupe_class_members(var l: L, n: Int):
 fn check_switch(var l: L, n: Int):
   let disc = l.t.nd[n].a
   if is_nan(l, disc):
-    add(&l, l.t.nd[unparen(l, disc)].pos, "eslint(use-isnan)", "Checking `switch` discriminant against NaN will never match", "Use the `isNaN` function instead of the switch.")
+    addn(&l, unparen(l, disc), "eslint(use-isnan)", "Checking `switch` discriminant against NaN will never match", "Use the `isNaN` function instead of the switch.")
   let cs = l.t.nd[n].b
   let cnt = ast.count(l.t, cs)
   for i in 0..cnt:
@@ -1738,11 +1899,11 @@ fn check_switch(var l: L, n: Int):
     let test = l.t.nd[c].a
     if test <= 0: continue
     if is_nan(l, test):
-      add(&l, l.t.nd[unparen(l, test)].pos, "eslint(use-isnan)", "Checking for NaN in `case` clause will never match", "Use the `isNaN` function instead of the switch.")
+      addn(&l, unparen(l, test), "eslint(use-isnan)", "Checking for NaN in `case` clause will never match", "Use the `isNaN` function instead of the switch.")
     for j in 0..i:
       let t2 = l.t.nd[ast.item(l.t, cs, j)].a
       if t2 > 0 and same(l, t2, test):
-        add(&l, l.t.nd[t2].pos, "eslint(no-duplicate-case)", "Duplicate case label", "Remove the duplicated case")
+        addn(&l, t2, "eslint(no-duplicate-case)", "Duplicate case label", "Remove the duplicated case")
         break
 
 # ---- try
@@ -1760,9 +1921,13 @@ fn useless_catch(var l: L, n: Int):
   let e = l.t.nd[st].a
   if k(l, e) != ast.N_ID or l.t.nd[e].s != l.t.nd[tg].s: return
   if l.t.nd[n].d > 0:
-    add(&l, l.t.nd[tg].pos, "eslint(no-useless-catch)", "Unnecessary catch clause", "Remove the catch clause, since it does not provide any additional error handling or functionality beyond what the finalizer already provides.")
+    addn(&l, tg, "eslint(no-useless-catch)", "Unnecessary catch clause", "Remove the catch clause, since it does not provide any additional error handling or functionality beyond what the finalizer already provides.")
+    label(&l, l.t.nd[tg].end, "is caught here")
+    more(&l, l.t.nd[st].pos, l.t.nd[st].end, "and re-thrown here", true)
   else:
-    add(&l, l.t.nd[tg].pos, "eslint(no-useless-catch)", "Unnecessary try/catch wrapper", "Remove the try/catch wrapper, since it does not provide any additional error handling or functionality.")
+    addn(&l, tg, "eslint(no-useless-catch)", "Unnecessary try/catch wrapper", "Remove the try/catch wrapper, since it does not provide any additional error handling or functionality.")
+    label(&l, l.t.nd[tg].end, "is caught here")
+    more(&l, l.t.nd[st].pos, l.t.nd[st].end, "and re-thrown here", true)
 
 # ---- no-useless-rename
 
@@ -1776,13 +1941,15 @@ fn useless_rename(var l: L, n: Int, kd: Int):
       if l.in_import: lt = l.src[at..l.t.nd[n].end]
       if (l.t.nd[n].f & ast.M_TYPEONLY) != 0: lt = "type " + lt
       add_fix(&l, at, "eslint(no-useless-rename)", "Do not rename import, export, or destructured assignments to the same name", "Use the variable's original name or rename it to a different name", l.t.nd[n].pos, l.t.nd[n].end, lt)
+      span(&l, l.t.nd[n].end)
     return
   let key = l.t.nd[n].a
   let tg = l.t.nd[n].b
   if key > 0 and k(l, key) == ast.N_ID and k(l, tg) == ast.N_ID and l.t.nd[key].s == l.t.nd[tg].s:
     var rt = text(l, tg)
     if l.t.nd[n].c > 0: rt = rt + l.src[l.t.nd[tg].end..l.t.nd[l.t.nd[n].c].end]
-    add_fix(&l, l.t.nd[key].pos, "eslint(no-useless-rename)", "Do not rename import, export, or destructured assignments to the same name", "Use the variable's original name or rename it to a different name", l.t.nd[n].pos, l.t.nd[n].end, rt)
+    addn_fix(&l, key, "eslint(no-useless-rename)", "Do not rename import, export, or destructured assignments to the same name", "Use the variable's original name or rename it to a different name", l.t.nd[n].pos, l.t.nd[n].end, rt)
+    span(&l, l.t.nd[n].end)
 
 # ---- regular expressions
 
@@ -1838,6 +2005,9 @@ fn regex_rules(var l: L, r: regex.Rx, base: Int, map: [Int], literal: Bool):
   # no-control-regex
   var ctl = 0
   var ctl_at = -1
+  var cs: [Int] = []
+  var ce: [Int] = []
+  var cv: [Int] = []
   var i = 0
   while i < r.ch.len:
     let v = r.ch[i + 2]
@@ -1853,15 +2023,21 @@ fn regex_rules(var l: L, r: regex.Rx, base: Int, map: [Int], literal: Bool):
     if v <= 0x1F and (kd2 == 0 or kd2 == 5 or kd2 == 6 or kd2 == 8) and not (v >= 2 and v <= r.ngroups):
       if ctl == 0: ctl_at = rx_pos(base, map, r.ch[i])
       ctl += 1
+      cs.push(rx_pos(base, map, r.ch[i]))
+      ce.push(rx_pos(base, map, r.ch[i + 1] - 1) + 1)
+      cv.push(v)
     i += 6
   if ctl > 0:
     var m = "Unexpected control character"
     if ctl > 1: m = "Unexpected control characters"
     add(&l, ctl_at, "eslint(no-control-regex)", m, "Avoid matching control characters in regular expressions. If intentional, disable this rule for the expression.")
+    label(&l, ce[0], "'U+{hex4(cv[0])}' is a control character.")
+    for j in 1..cs.len: more(&l, cs[j], ce[j], "'U+{hex4(cv[j])}' is a control character.", true)
   if not literal: return
   # no-empty-character-class
   for e in r.empty:
     add(&l, base + e, "eslint(no-empty-character-class)", "Empty character class will not match anything", "Remove the empty character class: `[]`")
+    span(&l, base + e + 2)
   # no-useless-escape
   i = 0
   while i < r.ch.len:
@@ -1898,6 +2074,7 @@ fn report_escape(var l: L, at: Int, c: Str):
   var shown = c + ""
   if c == "'": shown = "\\'"
   add_fix(&l, at, "eslint(no-useless-escape)", "Unnecessary escape character '{shown}'", "Replace `\\{c}` with `{c}`.", at, at + 1 + c.len, c)
+  span(&l, at + 1 + c.len)
 
 fn useless_backref(var l: L, r: regex.Rx, b: Int, base: Int):
   let g = regex.ref_group(r, b)
@@ -1937,6 +2114,18 @@ fn useless_backref(var l: L, r: regex.Rx, b: Int, base: Int):
   let braw = r.src[r.ns[b]..r.ne[b]]
   let graw = r.src[r.ns[g]..r.ne[g]]
   add(&l, base + r.ns[b], "eslint(no-useless-backreference)", "Backreference '{braw}' will be ignored. It references group '{graw}' {why}", "Consider revising the pattern to remove or relocate the backreference so it points to a group that can be matched at the time of evaluation.")
+  span(&l, base + r.ne[b])
+
+# A code point as 4 or more uppercase hex digits
+fn hex4(v: Int) -> Str:
+  let digits = "0123456789ABCDEF"
+  var s = ""
+  var x = v
+  while x > 0 or s.len < 4:
+    let d = x & 15
+    s = digits[d..d + 1] + s
+    x = x >> 4
+  return s
 
 fn misleading_class(var l: L, r: regex.Rx, base: Int):
   # sequences of consecutive characters in each class (UTF-16 units without the u flag), split
@@ -1944,14 +2133,16 @@ fn misleading_class(var l: L, r: regex.Rx, base: Int):
   var i = 0
   var vals: [Int] = []
   var poss: [Int] = []
+  var pose: [Int] = []
   var cls = -2
   while i <= r.ch.len:
     var flush = i == r.ch.len
     if not flush and ((r.ch[i + 4] & 31) == 0 or r.ch[i + 5] != cls or r.ch[i + 3] == 99): flush = true
     if flush:
-      if vals.len > 1: misleading_seq(&l, r, vals, poss, base)
+      if vals.len > 1: misleading_seq(&l, r, vals, poss, pose, base)
       vals = []
       poss = []
+      pose = []
       if i < r.ch.len: cls = r.ch[i + 5]
     if i == r.ch.len: break
     if (r.ch[i + 4] & 31) > 0 and r.ch[i + 3] != 99:
@@ -1959,35 +2150,44 @@ fn misleading_class(var l: L, r: regex.Rx, base: Int):
       if v >= 0x10000 and not r.u:
         vals.push(0xD800 + ((v - 0x10000) >> 10))
         poss.push(r.ch[i])
+        pose.push(r.ch[i + 1])
         vals.push(0xDC00 + ((v - 0x10000) & 1023))
         poss.push(r.ch[i])
+        pose.push(r.ch[i + 1])
       else:
         vals.push(v)
         poss.push(r.ch[i])
+        pose.push(r.ch[i + 1])
       if (r.ch[i + 4] & 64) != 0:
-        if vals.len > 1: misleading_seq(&l, r, vals, poss, base)
+        if vals.len > 1: misleading_seq(&l, r, vals, poss, pose, base)
         vals = []
         poss = []
+        pose = []
     i += 6
 
 # oxlint's combining characters: the combining diacritical mark blocks and variation selectors.
 fn combining(c: Int) -> Bool:
   return (c >= 0x300 and c <= 0x36F) or (c >= 0x1AB0 and c <= 0x1AFF) or (c >= 0x1DC0 and c <= 0x1DFF) or (c >= 0x20D0 and c <= 0x20FF) or (c >= 0xFE20 and c <= 0xFE2F) or (c >= 0xFE00 and c <= 0xFE0F) or (c >= 0xE0100 and c <= 0xE01EF)
 
-fn misleading_seq(var l: L, r: regex.Rx, vals: [Int], poss: [Int], base: Int):
+fn misleading_seq(var l: L, r: regex.Rx, vals: [Int], poss: [Int], pose: [Int], base: Int):
   for i in 1..vals.len:
     let a = vals[i - 1]
     let b = vals[i]
     if not r.u and a >= 0xD800 and a <= 0xDBFF and b >= 0xDC00 and b <= 0xDFFF:
       add(&l, base + poss[i - 1], "eslint(no-misleading-character-class)", "Unexpected surrogate pair in character class.", "Add the Unicode flag 'u'.")
+      span(&l, base + pose[i])
     if combining(b) and not combining(a):
       add(&l, base + poss[i - 1], "eslint(no-misleading-character-class)", "Unexpected combining class in character class.", "Replace the character with its normalized form (NFC) or use Unicode code point escapes instead of combining sequences.")
+      span(&l, base + pose[i])
     if b >= 0x1F3FB and b <= 0x1F3FF and not (a >= 0x1F3FB and a <= 0x1F3FF):
       add(&l, base + poss[i - 1], "eslint(no-misleading-character-class)", "Unexpected modified Emoji in character class.", "Use Unicode code point escapes instead of emoji modifiers in character classes.")
+      span(&l, base + pose[i])
     if b >= 0x1F1E6 and b <= 0x1F1FF and a >= 0x1F1E6 and a <= 0x1F1FF:
       add(&l, base + poss[i - 1], "eslint(no-misleading-character-class)", "Unexpected regional indicator in character class.", "Use Unicode code point escapes (e.g., \\u{{1F1EF}} for the regional indicator symbol for 'J') instead of regional indicator symbol pairs in character classes.")
+      span(&l, base + pose[i])
     if a == 0x200D and i >= 2 and vals[i - 2] != 0x200D and b != 0x200D:
       add(&l, base + poss[i - 2], "eslint(no-misleading-character-class)", "Unexpected joined character sequence in character class.", "Use Unicode code point escapes (e.g., \\u{{1F468}}\\u200D\\u{{1F469}} for '👨‍👩') instead of zero-width joiner sequences in character classes.")
+      span(&l, base + pose[i])
 
 # RegExp(pattern, flags) with literal arguments
 fn regexp_call(var l: L, n: Int):
@@ -2131,6 +2331,7 @@ fn string_escapes(var l: L, n: Int):
     let c = l.src[i + 1]
     if c == '8' or c == '9':
       add(&l, i, "eslint(no-nonoctal-decimal-escape)", "Don't use '\\{l.src[i + 1..i + 2]}' escape sequence.", "Use the actual character or a valid escape sequence instead.")
+      span(&l, i + 2)
       i += 2
       continue
     if (c >= '0' and c <= '9') or c == '\\' or c == 'n' or c == 'r' or c == 'v' or c == 't' or c == 'b' or c == 'f' or c == 'u' or c == 'x' or c == '\n' or c == '\r' or c == q:
@@ -2202,22 +2403,39 @@ fn scope_rules(var l: L):
     if kind != scope.Y_MEMBER and kind != scope.Y_TPARAM and kind != scope.Y_TYPE and kind != scope.Y_INTERFACE and kind != scope.Y_IMPORTTYPE:
       if name == "NaN" or name == "Infinity" or name == "eval" or name == "arguments" or name == "globalThis" or (name == "undefined" and ((fl & scope.F_INIT) != 0 or l.sc.writes[y] > 0 or kind != scope.Y_VAR)):
         add(&l, at, "eslint(no-shadow-restricted-names)", "Shadowing of global properties such as `undefined` is not allowed.", "Rename '{name}' to avoid shadowing the global property.")
+        span(&l, at + name.len)
     # no-const-assign, no-class-assign
     if kind == scope.Y_CONST or kind == scope.Y_USING:
-      for i in 0..l.sc.writes[y]:
+      for i in 0..l.sc.wsym.len:
+        if l.sc.wsym[i] != y: continue
         add(&l, at, "eslint(no-const-assign)", "Unexpected re-assignment of `const` variable {name}.", "Use `let` instead of `const` if you need to reassign this variable.")
+        label(&l, at + name.len, "{name} is declared here as `const`.")
+        more(&l, l.sc.wat[i], l.sc.wat[i] + name.len, "{name} is re-assigned here.", true)
+        order_at(&l, at)
     if kind == scope.Y_CLASS:
-      for i in 0..l.sc.writes[y]:
+      for i in 0..l.sc.wsym.len:
+        if l.sc.wsym[i] != y: continue
         add(&l, at, "eslint(no-class-assign)", "Unexpected re-assignment of class {name}", "Use a different variable name instead of re-assigning the class declaration.")
+        label(&l, at + name.len, "{name} is declared here")
+        more(&l, l.sc.wat[i], l.sc.wat[i] + name.len, "{name} is re-assigned here", true)
+        order_at(&l, at)
     # no-unassigned-vars
     if (kind == scope.Y_LET or kind == scope.Y_VAR) and (fl & (scope.F_FORIN | scope.F_AMBIENT | scope.F_KEEP | scope.F_PATTERN)) == 0 and l.sc.writes[y] == 0 and l.sc.anyref[y] > 0:
-      if (fl & scope.F_INIT) == 0: add(&l, at, "eslint(no-unassigned-vars)", "'{name}' is always 'undefined' because it's never assigned.", "Variable declared without assignment. Either assign a value or remove the declaration.")
+      if (fl & scope.F_INIT) == 0:
+        add(&l, at, "eslint(no-unassigned-vars)", "'{name}' is always 'undefined' because it's never assigned.", "Variable declared without assignment. Either assign a value or remove the declaration.")
+        order_at(&l, at)
+        span(&l, at + name.len)
       for i in 0..l.sc.xsym.len:
-        if l.sc.xsym[i] == y and not l.sc.xinit[i]: add(&l, l.sc.xpos[i], "eslint(no-unassigned-vars)", "'{name}' is always 'undefined' because it's never assigned.", "Variable declared without assignment. Either assign a value or remove the declaration.")
+        if l.sc.xsym[i] == y and not l.sc.xinit[i]:
+          add(&l, l.sc.xpos[i], "eslint(no-unassigned-vars)", "'{name}' is always 'undefined' because it's never assigned.", "Variable declared without assignment. Either assign a value or remove the declaration.")
+          order_at(&l, l.sc.xpos[i])
+          span(&l, l.sc.xpos[i] + name.len)
     unused_var(&l, y)
     let rc = l.recur.get(y, 0)
     if kind == scope.Y_PARAM and rc > 0 and rc == l.sc.reads[y] and l.sc.treads[y] == 0:
       add(&l, at, "oxc(only-used-in-recursion)", "Parameter `{name}` is only used in recursive calls", "Remove the argument and its usage. Alternatively, use the argument in the function body.")
+      if l.sc.yfn[y] > 0: on(&l, l.sc.yfn[y])
+      span(&l, at + name.len)
   # writes: no-func-assign, no-ex-assign, no-import-assign, no-global-assign
   for i in 0..l.sc.wsym.len:
     let y = l.sc.wsym[i]
@@ -2226,13 +2444,19 @@ fn scope_rules(var l: L):
       let gname = l.t.names[l.sc.wname[i]] + ""
       if readonly_global(gname):
         add(&l, at, "eslint(no-global-assign)", "Read-only global '{gname}' should not be modified.", "Use a local variable instead of modifying the global '{gname}'.")
+        label(&l, at + gname.len, "Read-only global '{gname}' should not be modified.")
       continue
     let kind = l.sc.yk[y]
     let name = l.t.names[l.sc.yn[y]] + ""
     if kind == scope.Y_FUNC:
       add(&l, at, "eslint(no-func-assign)", "'{name}' is a function.", "Do not re-assign a function declared as a FunctionDeclaration.")
+      order_at(&l, l.sc.ypos[y])
+      label(&l, at + name.len, "{name} is re-assigned here")
     elif kind == scope.Y_CATCH:
       add(&l, at, "eslint(no-ex-assign)", "Do not assign to the exception parameter.", "Remove the assignment to the exception parameter, or refactor the code to use a different variable.")
+      order_at(&l, l.sc.ypos[y])
+      note(&l, "If code in a catch block assigns a value to the exception parameter, it becomes impossible to refer to the error. Since there is no alternative way to access to this data, assignment of the parameter is absolutely destructive.")
+      label(&l, at + name.len, "this assignment destroys access to the caught exception")
     elif kind == scope.Y_IMPORT or kind == scope.Y_IMPORTTYPE:
       add(&l, l.sc.wexpr[i], "eslint(no-import-assign)", "Do not assign to imported bindings", "Imported bindings are readonly")
 
@@ -2267,6 +2491,7 @@ fn unused_var(var l: L, y: Int):
       if kind == scope.Y_PARAM: hint = " Unused parameters should start with a '_'."
       elif what == "Variable": hint = " Unused variables should start with a '_'."
     add(&l, l.sc.ypos[y], "eslint(no-unused-vars)", "{what} '{name}' is declared but only used as a type.{hint}", help)
+    label(&l, l.sc.ypos[y] + name.len, "'{name}' is declared here")
     return
   if name.startswith("_") and kind != scope.Y_CATCH and not (name == "_" and kind == scope.Y_PARAM): return
   if kind == scope.Y_PARAM and (fl & scope.F_POSITIONAL) != 0:
@@ -2294,6 +2519,14 @@ fn unused_var(var l: L, y: Int):
   elif kind == scope.Y_INTERFACE: add(&l, at, rule, "Interface '{name}' is declared but never used.", "Consider removing this declaration.")
   elif kind == scope.Y_ENUM: add(&l, at, rule, "Enum '{name}' is declared but never used.", "Consider removing this declaration.")
   elif kind == scope.Y_NAMESPACE: add(&l, at, rule, "Variable '{name}' is declared but never used.", "Consider removing this declaration.")
+  else: return
+  if kind == scope.Y_IMPORT or kind == scope.Y_IMPORTTYPE: label(&l, at + name.len, "'{name}' is imported here")
+  else: label(&l, at + name.len, "'{name}' is declared here")
+  if (kind == scope.Y_VAR or kind == scope.Y_LET or kind == scope.Y_CONST or kind == scope.Y_USING) and l.sc.writes[y] > 0:
+    var last = -1
+    for i in 0..l.sc.wsym.len:
+      if l.sc.wsym[i] == y: last = l.sc.wat[i]
+    if last >= 0: more(&l, last, last + name.len, "it was last assigned here", true)
 
 # ---- flow: break targets
 
@@ -2406,7 +2639,7 @@ fn ur_stmt(var l: L, n: Int, st: Int) -> Int:
   let kd = l.t.nd[n].k
   if st != 1:
     if reportable(l, n):
-      add(&l, l.t.nd[n].pos, "eslint(no-unreachable)", "Unreachable code.", "Remove the unreachable code or fix the control flow to make it reachable.")
+      addn(&l, n, "eslint(no-unreachable)", "Unreachable code.", "Remove the unreachable code or fix the control flow to make it reachable.")
     if revives(&l, n, st): return 1
     if kd == ast.N_RETURN or kd == ast.N_THROW or kd == ast.N_BREAK or kd == ast.N_CONTINUE: return 2
     return st
@@ -2491,6 +2724,8 @@ fn getter_return(var l: L, n: Int, kd: Int, body: Int):
     var at = l.t.nd[n].pos
     if kd == ast.N_GET or kd == ast.N_METHOD: at = l.t.nd[l.t.nd[n].b].pos
     add(&l, at, "eslint(getter-return)", "Expected to always return a value in getter.", "Return a value from all code paths in getter.")
+    span(&l, l.t.nd[n].end)
+    on(&l, n)
   let unused = saved_k
 
 fn returns_undefined(l: L, ty: Int) -> Bool:
@@ -2598,6 +2833,7 @@ fn ctor_super(var l: L, cls: Int):
     let unused_e1 = e1
     if this_before:
       add(&l, at, "eslint(no-this-before-super)", "Expected to always call `super()` before `this`/`super` property access.", "Call `super()` before `this`/`super` property access.")
+      span(&l, l.t.nd[m].end)
     if null_base:
       let lst = l.t.nd[body].a
       var found = false
@@ -2605,21 +2841,26 @@ fn ctor_super(var l: L, cls: Int):
         let x = ast.item(l.t, lst, j)
         if k(l, x) == ast.N_EXPRSTMT and is_super_call(l, l.t.nd[x].a):
           found = true
-          add(&l, l.t.nd[l.t.nd[x].a].pos, "eslint(constructor-super)", "Unexpected `super()` because `super` is not a constructor.", "Remove the `super()` call or change the `extends` clause to a constructable superclass.")
+          addn(&l, l.t.nd[x].a, "eslint(constructor-super)", "Unexpected `super()` because `super` is not a constructor.", "Remove the `super()` call or change the `extends` clause to a constructable superclass.")
       if not found:
         add(&l, at, "eslint(constructor-super)", "Expected to call `super()`.", "Add a `super()` call to the constructor")
+        span(&l, l.t.nd[m].end)
       continue
     var dups: [Int] = []
     for d in l.cs_dup: dups.push(d)
     for d in dups:
       add(&l, d, "eslint(constructor-super)", "Unexpected duplicate `super()`.", "Remove the duplicate `super()` call")
     if l.cs_exits == 0:
-      if super_calls(l, body) == 0: add(&l, at, "eslint(constructor-super)", "Expected to call `super()`.", "Add a `super()` call to the constructor")
+      if super_calls(l, body) == 0:
+        add(&l, at, "eslint(constructor-super)", "Expected to call `super()`.", "Add a `super()` call to the constructor")
+        span(&l, l.t.nd[m].end)
       continue
     if (l.cs_exits & 2) == 0:
       add(&l, at, "eslint(constructor-super)", "Expected to call `super()`.", "Add a `super()` call to the constructor")
+      span(&l, l.t.nd[m].end)
     elif (l.cs_exits & 1) != 0:
       add(&l, at, "eslint(constructor-super)", "Lacked a call of `super()` in some code paths.", "Ensure `super()` is called in all code paths")
+      span(&l, l.t.nd[m].end)
 
 fn super_calls(l: L, body: Int) -> Int:
   var c = 0
@@ -2891,14 +3132,14 @@ fn constant_operand(l: L, a: Int, b: Int, op: Int) -> Bool:
 fn const_binary(var l: L, n: Int, op: Int, a: Int, b: Int):
   let ot = op_text(op)
   if constant_operand(l, a, b, op):
-    add(&l, l.t.nd[n].pos, "eslint(no-constant-binary-expression)", "Unexpected constant binary expression", "This compares constantly with the left-hand side of the {ot}")
+    addn(&l, n, "eslint(no-constant-binary-expression)", "Unexpected constant binary expression", "This compares constantly with the left-hand side of the {ot}")
   elif constant_operand(l, b, a, op):
-    add(&l, l.t.nd[n].pos, "eslint(no-constant-binary-expression)", "Unexpected constant binary expression", "This compares constantly with the right-hand side of the {ot}")
+    addn(&l, n, "eslint(no-constant-binary-expression)", "Unexpected constant binary expression", "This compares constantly with the right-hand side of the {ot}")
   elif op == T_EQ3 or op == T_NE2:
     if always_new(l, a) or always_new(l, b):
-      add(&l, l.t.nd[n].pos, "eslint(no-constant-binary-expression)", "Unexpected comparison to newly constructed object", "These two values can never be equal")
+      addn(&l, n, "eslint(no-constant-binary-expression)", "Unexpected comparison to newly constructed object", "These two values can never be equal")
   elif always_new(l, a) and always_new(l, b):
-    add(&l, l.t.nd[n].pos, "eslint(no-constant-binary-expression)", "Unexpected comparison of two newly constructed objects", "These two values can never be equal")
+    addn(&l, n, "eslint(no-constant-binary-expression)", "Unexpected comparison of two newly constructed objects", "These two values can never be equal")
 
 # oxc(bad-object-literal-comparison): comparing with {} or []
 fn bad_literal_cmp(var l: L, n: Int, op: Int, a: Int, b: Int):
@@ -2913,9 +3154,9 @@ fn bad_literal_cmp(var l: L, n: Int, op: Int, a: Int, b: Int):
   var res = "false"
   if op == T_NE or op == T_NE2: res = "true"
   if what == "object":
-    add(&l, l.t.nd[n].pos, "oxc(bad-object-literal-comparison)", "Unexpected object literal comparison.", "This comparison will always return {res} as object literals are never equal to each other. Consider using `Object.entries()` of `Object.keys()` and comparing their lengths.")
+    addn(&l, n, "oxc(bad-object-literal-comparison)", "Unexpected object literal comparison.", "This comparison will always return {res} as object literals are never equal to each other. Consider using `Object.entries()` of `Object.keys()` and comparing their lengths.")
   else:
-    add(&l, l.t.nd[n].pos, "oxc(bad-object-literal-comparison)", "Unexpected array literal comparison.", "This comparison will always return {res} as array literals are never equal to each other. Consider using `Array.length` if empty checking was intended.")
+    addn(&l, n, "oxc(bad-object-literal-comparison)", "Unexpected array literal comparison.", "This comparison will always return {res} as array literals are never equal to each other. Consider using `Array.length` if empty checking was intended.")
 
 # ---- no-irregular-whitespace
 
@@ -2970,7 +3211,9 @@ fn irregular_whitespace(var l: L):
       if r >= lo[j] and r < hi[j]:
         inside = true
         break
-    if not inside: add(&l, r, "eslint(no-irregular-whitespace)", "Unexpected irregular whitespace", "Try to remove the irregular whitespace")
+    if not inside:
+      add(&l, r, "eslint(no-irregular-whitespace)", "Unexpected irregular whitespace", "Try to remove the irregular whitespace")
+      span(&l, r + irregular_at(l.src, r))
 
 # ---- no-loss-of-precision
 
@@ -3009,7 +3252,8 @@ fn loss_of_precision(var l: L, n: Int):
     elif prec <= 15 and av >= 2.2250738585072014e-308 and av <= 1.7976931348623157e308: lost = false
     else: lost = norm != sci(to_precision(v, prec))
   if lost:
-    add(&l, l.t.nd[n].pos, "eslint(no-loss-of-precision)", "This number literal will lose precision at runtime.", "Use a number literal representable by a 64-bit floating-point number, or use a `BigInt` literal (for example, `9007199254740993n`) for exact large integers.")
+    addn(&l, n, "eslint(no-loss-of-precision)", "This number literal will lose precision at runtime.", "Use a number literal representable by a 64-bit floating-point number, or use a `BigInt` literal (for example, `9007199254740993n`) for exact large integers.")
+    note(&l, "In JavaScript, `Number` values exactly represent integers only in the range -9007199254740991 to 9007199254740991 (`Number.MIN_SAFE_INTEGER` to `Number.MAX_SAFE_INTEGER`). `BigInt` supports arbitrarily large integers.")
 
 fn legacy_octal_raw(raw: Str) -> Bool:
   for i in 1..raw.len:
@@ -3233,7 +3477,7 @@ fn private_members(var l: L, cls: Int):
     if not used:
       var name = l.t.names[nm] + ""
       if name.startswith("#"): name = name[1..name.len]
-      add(&l, l.t.nd[key].pos, "eslint(no-unused-private-class-members)", "'{name}' is defined but never used.", "Remove the declaration or use it in the code.")
+      addn(&l, key, "eslint(no-unused-private-class-members)", "'{name}' is defined but never used.", "Remove the declaration or use it in the code.")
 
 fn pm_bump(var m: {Int: Int}, k: Int):
   m[k] = m.get(k, 0) + 1
@@ -3357,6 +3601,7 @@ fn file_rules(var l: L, root: Int):
   if empty and has_triple_slash(l.src): empty = false
   if empty:
     add(&l, 0, "unicorn(no-empty-file)", "Empty files are not allowed.", "Delete this file or add some code to it.")
+    span(&l, min(l.src.len, 100))
   # typescript(triple-slash-reference): reference comments before the first statement
   var i = 0
   let n = l.src.len
@@ -3415,18 +3660,19 @@ fn triple_slash(var l: L, at: Int, line: Str, root: Int):
           if k(l, r) == ast.N_EXTERNALREF and name_of(l, l.t.nd[r].a) == name: report = true
     if report:
       add(&l, at, "typescript(triple-slash-reference)", "Do not use a triple slash reference for {name}, use `import` style instead.", "Use of triple-slash reference type directives is generally discouraged in favor of ECMAScript Module imports.")
+      span(&l, at + line.len)
 
 fn missing_throw(var l: L, n: Int):
   let e = l.t.nd[n].a
   if k(l, e) == ast.N_NEW and id_is(l, l.t.nd[e].a, "Error") and is_global(l, l.t.nd[e].a):
-    add(&l, l.t.nd[e].pos, "oxc(missing-throw)", "Missing throw", "The `throw` keyword seems to be missing in front of this 'new' expression")
+    addn(&l, e, "oxc(missing-throw)", "Missing throw", "The `throw` keyword seems to be missing in front of this 'new' expression")
 
 fn is_zero(l: L, n: Int) -> Bool:
   let x = unparen(l, n)
   return k(l, x) == ast.N_NUM and num_value(name_of(l, x)) == 0.0
 
 fn erasing(var l: L, n: Int):
-  add(&l, l.t.nd[n].pos, "oxc(erasing-op)", "Unexpected erasing operation. This expression will always evaluate to zero.", "This is most likely not the intended outcome. Consider removing the operation, or directly assigning zero to the variable")
+  addn(&l, n, "oxc(erasing-op)", "Unexpected erasing operation. This expression will always evaluate to zero.", "This is most likely not the intended outcome. Consider removing the operation, or directly assigning zero to the variable")
 
 # oxc(bad-char-at-comparison): x.charAt(i) compared with a string longer than one character
 fn char_at_cmp(var l: L, a: Int, b: Int):
@@ -3436,7 +3682,7 @@ fn char_at_cmp(var l: L, a: Int, b: Int):
   if k(l, m) != ast.N_PROPACCESS or name_of(l, m) != "charAt": return
   let s = unparen(l, b)
   if k(l, s) != ast.N_STR or name_of(l, s).char_count() <= 1: return
-  add(&l, l.t.nd[c].pos, "oxc(bad-char-at-comparison)", "Invalid character comparison", "Character access returns a string of length at most 1. If the return value is compared with a string of length greater than 1, the comparison will always be false.")
+  addn(&l, c, "oxc(bad-char-at-comparison)", "Invalid character comparison", "Character access returns a string of length at most 1. If the return value is compared with a string of length greater than 1, the comparison will always be false.")
 
 fn is_eq_strict_or_loose(op: Int) -> Bool:
   return op == T_EQ2 or op == T_EQ3
@@ -3465,7 +3711,7 @@ fn double_cmp(var l: L, n: Int, op: Int, a0: Int, b0: Int):
   else:
     if (o1 == T_LE and o2n == T_GE) or (o1 == T_GE and o2n == T_LE): sug = "=="
   if sug == "": return
-  add(&l, l.t.nd[n].pos, "oxc(double-comparisons)", "Unexpected double comparisons.", "This logical expression can be simplified. Try using the `{sug}` operator instead.")
+  addn(&l, n, "oxc(double-comparisons)", "Unexpected double comparisons.", "This logical expression can be simplified. Try using the `{sug}` operator instead.")
 
 # A comparison of something with a number: (thing, op as if the number is on the right, number node).
 fn bound(l: L, n0: Int) -> [Int]:
@@ -3503,7 +3749,7 @@ fn const_cmp(var l: L, n: Int, a: Int, b: Int):
     let o1 = l.t.nd[ua].f
     let o2 = l.t.nd[ub].f
     if ((o1 == T_NE2 and o2 == T_EQ3) or (o1 == T_EQ3 and o2 == T_NE2) or (o1 == T_NE and o2 == T_EQ2) or (o1 == T_EQ2 and o2 == T_NE)) and same(l, l.t.nd[ua].a, l.t.nd[ub].a) and same(l, l.t.nd[ua].b, l.t.nd[ub].b):
-      add(&l, l.t.nd[n].pos, "oxc(const-comparisons)", "Unexpected constant comparison", "This logical expression will always evaluate to false")
+      addn(&l, n, "oxc(const-comparisons)", "Unexpected constant comparison", "This logical expression will always evaluate to false")
       return
   let x = bound(l, a)
   let y = bound(l, b)
@@ -3525,9 +3771,9 @@ fn const_cmp(var l: L, n: Int, a: Int, b: Int):
     let ta = text(l, unparen(l, a))
     let tb = text(l, unparen(l, b))
     if left_stronger:
-      add(&l, l.t.nd[unparen(l, a)].pos, "oxc(const-comparisons)", "Right-hand side of `&&` operator has no effect.", "if `{ta}` evaluates to true, `{tb}` will always evaluate to true as well")
+      addn(&l, unparen(l, a), "oxc(const-comparisons)", "Right-hand side of `&&` operator has no effect.", "if `{ta}` evaluates to true, `{tb}` will always evaluate to true as well")
     else:
-      add(&l, l.t.nd[unparen(l, b)].pos, "oxc(const-comparisons)", "Left-hand side of `&&` operator has no effect.", "if `{tb}` evaluates to true, `{ta}` will always evaluate to true as well")
+      addn(&l, unparen(l, b), "oxc(const-comparisons)", "Left-hand side of `&&` operator has no effect.", "if `{tb}` evaluates to true, `{ta}` will always evaluate to true as well")
     return
   var lo = c1
   var lo_op = x[1]
@@ -3543,9 +3789,9 @@ fn const_cmp(var l: L, n: Int, a: Int, b: Int):
     hi_op = x[1]
     hi_n = x[2]
   if lo > hi:
-    add(&l, l.t.nd[n].pos, "oxc(const-comparisons)", "Unexpected constant comparison", "since `{text(l, unparen(l, lo_n))}` > `{text(l, unparen(l, hi_n))}`, the expression evaluates to false for any value of `{tx}`")
+    addn(&l, n, "oxc(const-comparisons)", "Unexpected constant comparison", "since `{text(l, unparen(l, lo_n))}` > `{text(l, unparen(l, hi_n))}`, the expression evaluates to false for any value of `{tx}`")
   elif lo == hi and not (lo_op == T_GE and hi_op == T_LE):
-    add(&l, l.t.nd[n].pos, "oxc(const-comparisons)", "Unexpected constant comparison", "`{tx}` cannot simultaneously be greater than and less than `{text(l, unparen(l, lo_n))}`")
+    addn(&l, n, "oxc(const-comparisons)", "Unexpected constant comparison", "`{tx}` cannot simultaneously be greater than and less than `{text(l, unparen(l, lo_n))}`")
 
 # unicorn(no-useless-length-check)
 fn length_of(l: L, n0: Int) -> Int:
@@ -3591,9 +3837,9 @@ fn length_pair(var l: L, op: Int, a: Int, b: Int):
   let cop = l.t.nd[a].f
   if not is_zero(l, l.t.nd[a].b): return
   if op == T_OR and mn == "every" and cop == T_EQ3:
-    add(&l, l.t.nd[a].pos, "unicorn(no-useless-length-check)", "Found a useless array length check", "The empty check is useless as `Array#every()` returns `true` for an empty array.")
+    addn(&l, a, "unicorn(no-useless-length-check)", "Found a useless array length check", "The empty check is useless as `Array#every()` returns `true` for an empty array.")
   elif op == T_AND and mn == "some" and (cop == T_NE2 or cop == T_GT):
-    add(&l, l.t.nd[a].pos, "unicorn(no-useless-length-check)", "Found a useless array length check", "The non-empty check is useless as `Array#some()` returns `false` for an empty array.")
+    addn(&l, a, "unicorn(no-useless-length-check)", "Found a useless array length check", "The non-empty check is useless as `Array#some()` returns `false` for an empty array.")
 
 # oxc(bad-array-method-on-arguments)
 fn args_method(var l: L, n: Int, name: Int):
@@ -3603,7 +3849,7 @@ fn args_method(var l: L, n: Int, name: Int):
   let nm = l.t.names[name] + ""
   for m in ["at", "concat", "copyWithin", "entries", "every", "fill", "filter", "find", "findIndex", "findLast", "findLastIndex", "flat", "flatMap", "forEach", "includes", "indexOf", "join", "keys", "lastIndexOf", "map", "pop", "push", "reduce", "reduceRight", "reverse", "shift", "slice", "some", "sort", "splice", "toReversed", "toSorted", "toSpliced", "unshift", "values", "with"]:
     if nm == m:
-      add(&l, l.t.nd[n].pos, "oxc(bad-array-method-on-arguments)", "Bad array method on `arguments`.", "The `arguments` object does not have a `{nm}()` method. If you intended to use an array method, consider using rest parameters instead or converting the `arguments` object to an array.")
+      addn(&l, n, "oxc(bad-array-method-on-arguments)", "Bad array method on `arguments`.", "The `arguments` object does not have a `{nm}()` method. If you intended to use an array method, consider using rest parameters instead or converting the `arguments` object to an array.")
       return
 
 fn in_plain_function(l: L) -> Bool:
@@ -3616,7 +3862,7 @@ fn wrapper_type(var l: L, n: Int):
   let s = name_of(l, nm)
   if s == "String" or s == "Number" or s == "Boolean" or s == "Object" or s == "Symbol" or s == "BigInt":
     if scope.sym_of(l.sc, nm) >= 0: return
-    add_fix(&l, l.t.nd[n].pos, "typescript(no-wrapper-object-types)", "Do not use wrapper object types.", "Replace `{s}` with `{s.lower()}`.", l.t.nd[nm].pos, l.t.nd[nm].end, s.lower())
+    addn_fix(&l, n, "typescript(no-wrapper-object-types)", "Do not use wrapper object types.", "Replace `{s}` with `{s.lower()}`.", l.t.nd[nm].pos, l.t.nd[nm].end, s.lower())
 
 # typescript(no-extra-non-null-assertion), typescript(no-non-null-asserted-optional-chain)
 fn non_null(var l: L, n: Int):
@@ -3628,12 +3874,31 @@ fn non_null(var l: L, n: Int):
   let x = unparen(l, inner)
   let kx = k(l, x)
   if (kx == ast.N_PROPACCESS or kx == ast.N_ELEMACCESS or kx == ast.N_CALL) and in_chain(l, x):
-    add(&l, l.t.nd[inner].end, "typescript(no-non-null-asserted-optional-chain)", "Optional chain expressions can return undefined by design: using a non-null assertion is unsafe and wrong.", "Remove the non-null assertion.")
+    add(&l, l.t.nd[n].end - 1, "typescript(no-non-null-asserted-optional-chain)", "Optional chain expressions can return undefined by design: using a non-null assertion is unsafe and wrong.", "Remove the non-null assertion.")
+    span(&l, l.t.nd[n].end)
+    label(&l, l.t.nd[n].end, "non-null assertion made after optional chain")
+    qdot(&l, x)
+
+# The `?` of the optional link of a chain (the outermost one), as a label
+fn qdot(var l: L, x0: Int):
+  var x = x0
+  while x > 0:
+    let kd = l.t.nd[x].k
+    if kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS or kd == ast.N_CALL:
+      if (l.t.nd[x].f & 1) != 0:
+        let q = l.t.nd[l.t.nd[x].a].end
+        more(&l, q, q + 1, "optional chain used", true)
+        return
+      x = l.t.nd[x].a
+    elif kd == ast.N_NONNULL: x = l.t.nd[x].a
+    else: return
 
 # x!! and x!?.y: the inner ! is reported (and deleted by the fix)
 fn extra_nonnull(var l: L, x: Int):
   let e = l.t.nd[x].end
   add_fix(&l, e - 1, "typescript(no-extra-non-null-assertion)", "extra non-null assertion", "Remove the redundant non-null assertion operator (`!`).", e - 1, e, "")
+  note(&l, "The non-null assertion operator in TypeScript, written as `!`, tells the compiler that an expression is definitely not `null` or `undefined` at that point. Chaining multiple non-null assertions on the same expression does not provide any additional safety and is redundant.")
+  span(&l, e)
 
 # typescript(no-duplicate-enum-values)
 fn dupe_enum_values(var l: L, n: Int):
@@ -3655,8 +3920,10 @@ fn dupe_enum_values(var l: L, n: Int):
     else: continue
     if key in seen:
       let mn = text(l, l.t.nd[m].a)
-      add(&l, seen[key], "typescript(no-duplicate-enum-values)", "Duplicate enum value `{shown}`", "Give {mn} a unique value")
-    else: seen[key] = l.t.nd[x].pos
+      addn(&l, seen[key], "typescript(no-duplicate-enum-values)", "Duplicate enum value `{shown}`", "Give {mn} a unique value")
+      label(&l, l.t.nd[seen[key]].end, "{shown} is first used as an initializer here")
+      more(&l, l.t.nd[x].pos, l.t.nd[x].end, "and is re-used here", true)
+    else: seen[key] = x
 
 # typescript(no-misused-new) in interfaces, no-unsafe-declaration-merging
 fn interface_rules(var l: L, n: Int):
@@ -3669,9 +3936,11 @@ fn interface_rules(var l: L, n: Int):
       let sig = l.t.nd[m].b
       let ret = l.t.nd[sig].c
       if k(l, ret) == ast.N_TREF and k(l, l.t.nd[ret].a) == ast.N_ID and l.t.nd[l.t.nd[ret].a].s == l.t.nd[n].s:
-        add(&l, l.t.nd[m].pos, "typescript(no-misused-new)", "Interfaces cannot be constructed, only classes.", "Consider removing this method from your interface.")
+        addn(&l, m, "typescript(no-misused-new)", "Interfaces cannot be constructed, only classes.", "Consider removing this method from your interface.")
+        head(&l, 3)
     elif km == ast.N_METHOD and key_name(l, l.t.nd[m].a) == "constructor":
-      add(&l, l.t.nd[m].pos, "typescript(no-misused-new)", "Interfaces cannot be constructed, only classes.", "Consider removing this method from your interface.")
+      addn(&l, m, "typescript(no-misused-new)", "Interfaces cannot be constructed, only classes.", "Consider removing this method from your interface.")
+      head(&l, 3)
   # a class of the same name in the same scope
   let y = scope.res_of(l.sc, n)
   let unused = y
@@ -3684,7 +3953,7 @@ fn heritage_wrappers(var l: L, lst: Int):
     if k(l, h) != ast.N_EXPRTARGS or k(l, e) != ast.N_ID: continue
     if id_is(l, e, "String") or id_is(l, e, "Number") or id_is(l, e, "Boolean") or id_is(l, e, "Object") or id_is(l, e, "Symbol") or id_is(l, e, "BigInt"):
       if scope.sym_of(l.sc, e) >= 0: continue
-      add(&l, l.t.nd[e].pos, "typescript(no-wrapper-object-types)", "Do not use wrapper object types.", "")
+      addn(&l, e, "typescript(no-wrapper-object-types)", "Do not use wrapper object types.", "")
 
 fn class_rules(var l: L, n: Int):
   heritage_wrappers(&l, l.t.nd[n].c)
@@ -3697,10 +3966,10 @@ fn class_rules(var l: L, n: Int):
     if km == ast.N_METHOD and l.t.nd[m].c <= 0 and key_name(l, key) == "new" and l.t.nd[n].s > 0:
       let ret = l.t.nd[l.t.nd[m].b].c
       if k(l, ret) == ast.N_TREF and k(l, l.t.nd[ret].a) == ast.N_ID and l.t.nd[l.t.nd[ret].a].s == l.t.nd[n].s:
-        add(&l, l.t.nd[key].pos, "typescript(no-misused-new)", "Class cannot have method named `new`.", "This method name is confusing, consider renaming the method to `constructor`")
+        addn(&l, key, "typescript(no-misused-new)", "Class cannot have method named `new`.", "This method name is confusing, consider renaming the method to `constructor`")
     # unicorn(no-thenable)
     if (km == ast.N_METHOD or km == ast.N_PROP or km == ast.N_GET or km == ast.N_SET) and (l.t.nd[m].f & ast.M_STATIC) == 0 and key_name(l, key) == "then":
-      add(&l, l.t.nd[key].pos, "unicorn(no-thenable)", "Do not add `then` to a class.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
+      addn(&l, key, "unicorn(no-thenable)", "Do not add `then` to a class.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
     # no-unnecessary-parameter-property-assignment
     if km == ast.N_CTOR and l.t.nd[m].c > 0: param_prop_assign(&l, m)
   # no-unsafe-declaration-merging: an interface of the same name in the same scope
@@ -3712,6 +3981,10 @@ fn class_rules(var l: L, n: Int):
         let at2 = l.t.npos.get(n, l.t.nd[n].pos)
         if at2 < at: at = at2
         add(&l, at, "typescript(no-unsafe-declaration-merging)", "Unsafe declaration merging between classes and interfaces.", "The TypeScript compiler doesn't check whether properties are initialized, which can lead to TypeScript not detecting code that will cause runtime errors.")
+        span(&l, at + l.t.names[l.t.nd[n].s].len)
+        var o2 = l.t.npos.get(n, l.t.nd[n].pos)
+        if o2 == at: o2 = l.t.npos.get(x, l.t.nd[x].pos)
+        more(&l, o2, o2 + l.t.names[l.t.nd[n].s].len, "", false)
 
 fn same_scope_parent(l: L, a: Int, b: Int) -> Bool:
   # both statements of the same list
@@ -3736,7 +4009,7 @@ fn param_prop_assign(var l: L, ctor: Int):
     let lhs = l.t.nd[e].a
     let rhs = unparen(l, l.t.nd[e].b)
     if k(l, lhs) == ast.N_PROPACCESS and k(l, l.t.nd[lhs].a) == ast.N_THIS and k(l, rhs) == ast.N_ID and l.t.nd[rhs].s == l.t.nd[lhs].s and l.t.nd[rhs].s in props:
-      add(&l, l.t.nd[e].pos, "typescript(no-unnecessary-parameter-property-assignment)", "Assignment of parameter property is unnecessary", "Remove the unnecessary assignment")
+      addn(&l, e, "typescript(no-unnecessary-parameter-property-assignment)", "Assignment of parameter property is unnecessary", "Remove the unnecessary assignment")
 
 # typescript(prefer-namespace-keyword)
 fn namespace_keyword(var l: L, n: Int):
@@ -3745,8 +4018,12 @@ fn namespace_keyword(var l: L, n: Int):
   let nm = l.t.nd[n].a
   if k(l, nm) == ast.N_STR: return
   let mk = find_code(l, l.t.nd[n].pos, l.t.nd[n].end, "module")
-  if mk < 0: add(&l, l.t.nd[n].pos, "typescript(prefer-namespace-keyword)", "Use `namespace` instead of `module` to declare custom TypeScript modules.", "Replace `module` with `namespace` for internal declarations.")
-  else: add_fix(&l, l.t.nd[n].pos, "typescript(prefer-namespace-keyword)", "Use `namespace` instead of `module` to declare custom TypeScript modules.", "Replace `module` with `namespace` for internal declarations.", mk, mk + 6, "namespace")
+  if mk < 0:
+    addn(&l, n, "typescript(prefer-namespace-keyword)", "Use `namespace` instead of `module` to declare custom TypeScript modules.", "Replace `module` with `namespace` for internal declarations.")
+    note(&l, "`module` for internal declarations is no longer supported: treat it as a hard error. Expect it to become a parse error in a future version of TypeScript and Oxlint. See: https://github.com/microsoft/TypeScript/issues/54500, https://github.com/microsoft/TypeScript/issues/62211, https://github.com/microsoft/TypeScript/pull/62876.")
+  else:
+    addn_fix(&l, n, "typescript(prefer-namespace-keyword)", "Use `namespace` instead of `module` to declare custom TypeScript modules.", "Replace `module` with `namespace` for internal declarations.", mk, mk + 6, "namespace")
+    note(&l, "`module` for internal declarations is no longer supported: treat it as a hard error. Expect it to become a parse error in a future version of TypeScript and Oxlint. See: https://github.com/microsoft/TypeScript/issues/54500, https://github.com/microsoft/TypeScript/issues/62211, https://github.com/microsoft/TypeScript/pull/62876.")
 
 # Where word first appears in src[a..b] outside comments (oxc's find_next_token_within), or -1.
 fn find_code(l: L, a: Int, b: Int, word: Str) -> Int:
@@ -3776,7 +4053,7 @@ fn empty_export(var l: L, n: Int):
     if st == n: continue
     let ks = k(l, st)
     if ks == ast.N_IMPORT or ks == ast.N_EXPORT or ks == ast.N_EXPORTDEFAULT or ks == ast.N_EXPORTASSIGN or (ks == ast.N_IMPORTEQ) or scope.has_export_mod(l.t, st):
-      add_fix(&l, l.t.nd[n].pos, "typescript(no-useless-empty-export)", "Empty exports do nothing in module files", "Remove this empty export.", l.t.nd[n].pos, l.t.nd[n].end, "")
+      addn_fix(&l, n, "typescript(no-useless-empty-export)", "Empty exports do nothing in module files", "Remove this empty export.", l.t.nd[n].pos, l.t.nd[n].end, "")
       return
 
 # typescript(no-this-alias), typescript(prefer-as-const), unicorn(no-thenable) for exports
@@ -3784,7 +4061,7 @@ fn decl_rules(var l: L, n: Int):
   let tg = l.t.nd[n].a
   let init = l.t.nd[n].c
   if init > 0 and k(l, tg) == ast.N_ID and k(l, unparen(l, init)) == ast.N_THIS and l.ts:
-    add(&l, l.t.nd[tg].pos, "typescript(no-this-alias)", "Unexpected aliasing of 'this' to local variable.", "Assigning a variable to this instead of properly using arrow lambdas may be a symptom of pre-ES2015 practices or not managing scope well.")
+    addn(&l, tg, "typescript(no-this-alias)", "Unexpected aliasing of 'this' to local variable.", "Assigning a variable to this instead of properly using arrow lambdas may be a symptom of pre-ES2015 practices or not managing scope well.")
   let ty = l.t.nd[n].b
   if ty > 0 and init > 0:
     if k(l, tg) == ast.N_ID: as_const(&l, ty, init, 1)
@@ -3792,7 +4069,7 @@ fn decl_rules(var l: L, n: Int):
   if k(l, tg) == ast.N_ID and name_of(l, tg) == "then":
     let y = scope.sym_of(l.sc, tg)
     if y >= 0 and (l.sc.yf[y] & scope.F_EXPORTED) != 0 and l.sc.ys[y] == 0:
-      add(&l, l.t.nd[tg].pos, "unicorn(no-thenable)", "Do not export `then`.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
+      addn(&l, tg, "unicorn(no-thenable)", "Do not export `then`.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
 
 # mode 0: x as 'a' (the type becomes const); 1: a fixable annotation (: 'a' = 'a' becomes = 'a' as const); 2: one that isn't
 fn as_const(var l: L, ty: Int, val: Int, mode: Int):
@@ -3804,7 +4081,7 @@ fn as_const(var l: L, ty: Int, val: Int, mode: Int):
   if (kl == ast.N_STR or kl == ast.N_NUM) and l.t.nd[lit].s == l.t.nd[v].s:
     let msg = "Expected a `const` assertion instead of a literal type annotation."
     let help = "You should use `as const` instead of type annotation."
-    if mode == 0: add_fix(&l, l.t.nd[ty].pos, "typescript(prefer-as-const)", msg, help, l.t.nd[lit].pos, l.t.nd[lit].end, "const")
+    if mode == 0: addn_fix(&l, ty, "typescript(prefer-as-const)", msg, help, l.t.nd[lit].pos, l.t.nd[lit].end, "const")
     elif mode == 1:
       # from the annotation's colon to the end of the value
       var c = l.t.nd[ty].pos
@@ -3814,8 +4091,8 @@ fn as_const(var l: L, ty: Int, val: Int, mode: Int):
           while c >= 2 and not (l.src[c - 2] == '/' and l.src[c - 1] == '*'): c -= 1
           c -= 2
         else: c -= 1
-      add_fix(&l, l.t.nd[ty].pos, "typescript(prefer-as-const)", msg, help, c - 1, l.t.nd[val].end, l.src[l.t.nd[ty].end..l.t.nd[val].end] + " as const")
-    else: add(&l, l.t.nd[ty].pos, "typescript(prefer-as-const)", msg, help)
+      addn_fix(&l, ty, "typescript(prefer-as-const)", msg, help, c - 1, l.t.nd[val].end, l.src[l.t.nd[ty].end..l.t.nd[val].end] + " as const")
+    else: addn(&l, ty, "typescript(prefer-as-const)", msg, help)
 
 # unicorn(no-unnecessary-await)
 fn unnecessary_await(var l: L, n: Int):
@@ -3834,8 +4111,12 @@ fn unnecessary_await(var l: L, n: Int):
         if kp == ast.N_PREFIX and ((pa == T_PLUS and ia == T_INC) or (pa == T_MINUS and ia == T_DEC)): fixable = false
       elif kp == ka and (ka != ast.N_PREFIX or (pa == ia and pa != T_INC and pa != T_DEC)): fixable = false
   let at = l.t.nd[n].pos
-  if fixable: add_fix(&l, at, "unicorn(no-unnecessary-await)", "Unexpected `await` on a non-Promise value", "Consider removing the `await`", at, l.t.nd[n].end, text(l, arg))
-  else: add(&l, at, "unicorn(no-unnecessary-await)", "Unexpected `await` on a non-Promise value", "Consider removing the `await`")
+  if fixable:
+    add_fix(&l, at, "unicorn(no-unnecessary-await)", "Unexpected `await` on a non-Promise value", "Consider removing the `await`", at, l.t.nd[n].end, text(l, arg))
+    span(&l, at + 5)
+  else:
+    add(&l, at, "unicorn(no-unnecessary-await)", "Unexpected `await` on a non-Promise value", "Consider removing the `await`")
+    span(&l, at + 5)
 
 # An expression that is certainly not a promise (oxc's list).
 fn not_promise(l: L, x: Int) -> Bool:
@@ -3857,9 +4138,9 @@ fn object_rules(var l: L, n: Int):
     let kp = k(l, p)
     if kp == ast.N_PROPASSIGN or kp == ast.N_METHOD or kp == ast.N_GET or kp == ast.N_SET:
       if key_name(l, l.t.nd[p].a) == "then":
-        add(&l, l.t.nd[l.t.nd[p].a].pos, "unicorn(no-thenable)", "Do not add `then` to an object.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
+        addn(&l, l.t.nd[p].a, "unicorn(no-thenable)", "Do not add `then` to an object.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
     elif kp == ast.N_SHORTHAND and name_of(l, p) == "then":
-      add(&l, l.t.nd[p].pos, "unicorn(no-thenable)", "Do not add `then` to an object.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
+      addn(&l, p, "unicorn(no-thenable)", "Do not add `then` to an object.", "If an object is defined as 'thenable', once it's accidentally used in an await expression, it may cause problems")
     elif kp == ast.N_SPREAD:
       let e = unparen(l, l.t.nd[p].a)
       if k(l, e) == ast.N_BINARY and (l.t.nd[e].f == T_OR or l.t.nd[e].f == T_QQ):
@@ -3868,8 +4149,8 @@ fn object_rules(var l: L, n: Int):
           let fm = "Empty fallbacks in spreads are unnecessary"
           let fh = "Spreading falsy values in object literals won't add any unexpected properties, so it's unnecessary to add an empty object as fallback."
           let left = l.t.nd[e].a
-          if fallback_fixable(l, left): add_fix(&l, l.t.nd[p].pos, "unicorn(no-useless-fallback-in-spread)", fm, fh, l.t.nd[p].pos, l.t.nd[p].end, "..." + text(l, left))
-          else: add(&l, l.t.nd[p].pos, "unicorn(no-useless-fallback-in-spread)", fm, fh)
+          if fallback_fixable(l, left): addn_fix(&l, p, "unicorn(no-useless-fallback-in-spread)", fm, fh, l.t.nd[p].pos, l.t.nd[p].end, "..." + text(l, left))
+          else: addn(&l, p, "unicorn(no-useless-fallback-in-spread)", fm, fh)
 
 # Promise.all([x]) and the like; oxc's fix looks at the call's ancestors.
 fn single_promise(var l: L, n: Int, c: Int, mn: Str, elem: Int):
@@ -3881,6 +4162,7 @@ fn single_promise(var l: L, n: Int, c: Int, mn: Str, elem: Int):
   if k(l, p) == ast.N_AWAIT: aw = p
   if aw < 0 and mn == "all":
     add(&l, l.t.nd[c].d, "unicorn(no-single-promise-in-promise-methods)", m, h)
+    span(&l, l.t.nd[c].end)
     return
   # fixable: no call, declarator, assignment or return above it (through awaits) before something else
   var fixable = true
@@ -3898,6 +4180,7 @@ fn single_promise(var l: L, n: Int, c: Int, mn: Str, elem: Int):
     break
   if not fixable:
     add(&l, l.t.nd[c].d, "unicorn(no-single-promise-in-promise-methods)", m, h)
+    span(&l, l.t.nd[c].end)
     return
   let et = text(l, elem)
   if aw > 0:
@@ -3907,9 +4190,15 @@ fn single_promise(var l: L, n: Int, c: Int, mn: Str, elem: Int):
       let q = up_ignorable(&l, aw)
       let kq = k(l, q)
       discarded = kq == ast.N_EXPRSTMT
-    if mn == "all" and not discarded: add_fix(&l, l.t.nd[c].d, "unicorn(no-single-promise-in-promise-methods)", m, h, l.t.nd[aw].pos, l.t.nd[aw].end, "[await {et}]")
-    else: add_fix(&l, l.t.nd[c].d, "unicorn(no-single-promise-in-promise-methods)", m, h, l.t.nd[n].pos, l.t.nd[n].end, et)
-  else: add_fix(&l, l.t.nd[c].d, "unicorn(no-single-promise-in-promise-methods)", m, h, l.t.nd[n].pos, l.t.nd[n].end, "Promise.resolve({et})")
+    if mn == "all" and not discarded:
+      add_fix(&l, l.t.nd[c].d, "unicorn(no-single-promise-in-promise-methods)", m, h, l.t.nd[aw].pos, l.t.nd[aw].end, "[await {et}]")
+      span(&l, l.t.nd[c].end)
+    else:
+      add_fix(&l, l.t.nd[c].d, "unicorn(no-single-promise-in-promise-methods)", m, h, l.t.nd[n].pos, l.t.nd[n].end, et)
+      span(&l, l.t.nd[c].end)
+  else:
+    add_fix(&l, l.t.nd[c].d, "unicorn(no-single-promise-in-promise-methods)", m, h, l.t.nd[n].pos, l.t.nd[n].end, "Promise.resolve({et})")
+    span(&l, l.t.nd[c].end)
 
 # oxc's "ignorable" wrappers: parentheses and type assertions
 fn ignorable(kd: Int) -> Bool:
@@ -3943,8 +4232,12 @@ fn set_size(var l: L, n: Int):
     let sm = "Use `Set#size` instead of converting a `Set` to an array and using its `length` property."
     let sh = "Replace array conversion with direct `Set.size` access"
     let st = l.t.nd[sp].a
-    if has_comment(l, l.t.nd[o].pos, l.t.nd[st].pos) or has_comment(l, l.t.nd[st].end, l.t.nd[o].end): add(&l, l.t.nd[n].d, "unicorn(prefer-set-size)", sm, "")
-    else: add_fix(&l, l.t.nd[n].d, "unicorn(prefer-set-size)", sm, sh, l.t.nd[o].pos, l.t.nd[n].end, text(l, st) + l.src[l.t.nd[o].end..l.t.nd[n].d] + "size")
+    if has_comment(l, l.t.nd[o].pos, l.t.nd[st].pos) or has_comment(l, l.t.nd[st].end, l.t.nd[o].end):
+      add(&l, l.t.nd[n].d, "unicorn(prefer-set-size)", sm, "")
+      span(&l, l.t.nd[n].end)
+    else:
+      add_fix(&l, l.t.nd[n].d, "unicorn(prefer-set-size)", sm, sh, l.t.nd[o].pos, l.t.nd[n].end, text(l, st) + l.src[l.t.nd[o].end..l.t.nd[n].d] + "size")
+      span(&l, l.t.nd[n].end)
 
 fn plugin_new(var l: L, n: Int):
   let c = l.t.nd[n].a
@@ -3953,7 +4246,7 @@ fn plugin_new(var l: L, n: Int):
   if k(l, c) != ast.N_ID or not is_global(l, c): return
   let nm = name_of(l, c)
   if nm == "Array" and na == 1:
-    add(&l, l.t.nd[n].pos, "unicorn(no-new-array)", "Do not use `new Array(singleArgument)`.", "It's not clear whether the argument is meant to be the length of the array or the only element. If the argument is the array's length, consider using `Array.from({{ length: n }})`. If the argument is the only element, use `[element]`.")
+    addn(&l, n, "unicorn(no-new-array)", "Do not use `new Array(singleArgument)`.", "It's not clear whether the argument is meant to be the length of the array or the only element. If the argument is the array's length, consider using `Array.from({{ length: n }})`. If the argument is the only element, use `[element]`.")
   if nm == "Request" and na >= 2: fetch_options(&l, ast.item(l.t, args, 1))
   if (nm == "Set" or nm == "Map" or nm == "WeakSet" or nm == "WeakMap") and na >= 1: iterable_spread(&l, ast.item(l.t, args, 0), "`{nm}` accepts an iterable, so it's unnecessary to convert the iterable to an array.", "Consider removing the spread operator.", true)
 
@@ -3965,8 +4258,12 @@ fn object_spreads(var l: L, n: Int):
     let e = unparen(l, l.t.nd[p].a)
     if k(l, e) == ast.N_OBJECT:
       let t = fixgen.merged_object(l.t, l.src, n, p, e)
-      if t == "": add(&l, l.t.nd[p].pos, "unicorn(no-useless-spread)", "Using a spread operator here creates a new object unnecessarily.", "Consider removing the spread operator.")
-      else: add_fix(&l, l.t.nd[p].pos, "unicorn(no-useless-spread)", "Using a spread operator here creates a new object unnecessarily.", "Consider removing the spread operator.", l.t.nd[n].pos, l.t.nd[n].end, t)
+      if t == "":
+        addn(&l, p, "unicorn(no-useless-spread)", "Using a spread operator here creates a new object unnecessarily.", "Consider removing the spread operator.")
+        dots(&l)
+      else:
+        addn_fix(&l, p, "unicorn(no-useless-spread)", "Using a spread operator here creates a new object unnecessarily.", "Consider removing the spread operator.", l.t.nd[n].pos, l.t.nd[n].end, t)
+        dots(&l)
     elif ast.count(l.t, lst) == 1 and k(l, e) == ast.N_COND and k(l, unparen(l, l.t.nd[e].b)) == ast.N_OBJECT and k(l, unparen(l, l.t.nd[e].c)) == ast.N_OBJECT:
       add_clone(&l, p, n, "Using a spread operator here creates a new object unnecessarily.", "{returns_text(l, e)} returns a new object. Spreading it into an object expression to create a new object is redundant.")
     elif ast.count(l.t, lst) == 1 and k(l, e) == ast.N_CALL and k(l, l.t.nd[e].a) == ast.N_PROPACCESS and name_of(l, l.t.nd[e].a) == "reduce" and ast.count(l.t, l.t.nd[e].c) == 2:
@@ -3996,15 +4293,21 @@ fn array_in_array(var l: L, n: Int, e: Int):
   let h = "Consider removing the spread operator."
   let lst = l.t.nd[n].a
   if ast.count(l.t, lst) == 1:
-    add_fix(&l, l.t.nd[e].pos, "unicorn(no-useless-spread)", m, h, l.t.nd[n].pos, l.t.nd[n].end, text(l, unparen(l, l.t.nd[e].a)))
+    addn_fix(&l, e, "unicorn(no-useless-spread)", m, h, l.t.nd[n].pos, l.t.nd[n].end, text(l, unparen(l, l.t.nd[e].a)))
+    dots(&l)
     return
   let t = fixgen.merged_array(l.t, l.src, n)
-  if t == "": add(&l, l.t.nd[e].pos, "unicorn(no-useless-spread)", m, h)
-  else: add_fix(&l, l.t.nd[e].pos, "unicorn(no-useless-spread)", m, h, l.t.nd[n].pos, l.t.nd[n].end, t)
+  if t == "":
+    addn(&l, e, "unicorn(no-useless-spread)", m, h)
+    dots(&l)
+  else:
+    addn_fix(&l, e, "unicorn(no-useless-spread)", m, h, l.t.nd[n].pos, l.t.nd[n].end, t)
+    dots(&l)
 
 # A useless clone ([...x.map(f)], {...(c ? {} : {})}): the literal becomes the spread's argument.
 fn add_clone(var l: L, sp: Int, lit: Int, msg: Str, help: Str):
-  add_fix(&l, l.t.nd[sp].pos, "unicorn(no-useless-spread)", msg, help, l.t.nd[lit].pos, l.t.nd[lit].end, text(l, l.t.nd[sp].a))
+  addn_fix(&l, sp, "unicorn(no-useless-spread)", msg, help, l.t.nd[lit].pos, l.t.nd[lit].end, text(l, l.t.nd[sp].a))
+  dots(&l)
 
 fn new_array_spread(var l: L, sp: Int, arr: Int):
   let c0 = unparen(l, l.t.nd[sp].a)
@@ -4041,7 +4344,8 @@ fn iterable_spread(var l: L, a: Int, msg: Str, help: Str, whole: Bool):
   l.set_arg[x] = true
   var r = x
   if whole: r = a
-  add_fix(&l, l.t.nd[sp].pos, "unicorn(no-useless-spread)", msg, help, l.t.nd[r].pos, l.t.nd[r].end, text(l, l.t.nd[sp].a))
+  addn_fix(&l, sp, "unicorn(no-useless-spread)", msg, help, l.t.nd[r].pos, l.t.nd[r].end, text(l, l.t.nd[sp].a))
+  dots(&l)
 
 fn fetch_options(var l: L, o0: Int):
   let o = unparen(l, o0)
@@ -4069,7 +4373,7 @@ fn fetch_options(var l: L, o0: Int):
           body = l.t.nd[p].a
         else: body = p
   if body > 0 and (method == "GET" or method == "HEAD"):
-    add(&l, l.t.nd[body].pos, "unicorn(no-invalid-fetch-options)", "\"body\" is not allowed when method is \"{method}\"", "")
+    addn(&l, body, "unicorn(no-invalid-fetch-options)", "\"body\" is not allowed when method is \"{method}\"", "")
 
 fn plugin_call(var l: L, n: Int):
   let c = l.t.nd[n].a
@@ -4085,7 +4389,8 @@ fn plugin_call(var l: L, n: Int):
       let ne = ast.count(l.t, el)
       var rt = ""
       if ne > 0: rt = l.src[l.t.nd[ast.item(l.t, el, 0)].pos..l.t.nd[ast.item(l.t, el, ne - 1)].end]
-      add_fix(&l, l.t.nd[a].pos, "unicorn(no-useless-spread)", "Using a spread operator here creates a new array unnecessarily.", "Pass arguments directly instead of spreading an array.", l.t.nd[a].pos, l.t.nd[a].end, rt)
+      addn_fix(&l, a, "unicorn(no-useless-spread)", "Using a spread operator here creates a new array unnecessarily.", "Pass arguments directly instead of spreading an array.", l.t.nd[a].pos, l.t.nd[a].end, rt)
+      dots(&l)
   if k(l, c) == ast.N_ID:
     if hot(l, l.t.nd[c].s) and name_of(l, c) == "fetch" and is_global(l, c) and na >= 2: fetch_options(&l, ast.item(l.t, args, 1))
     recursion_args(&l, n)
@@ -4096,13 +4401,26 @@ fn plugin_call(var l: L, n: Int):
   let obj = unparen(l, l.t.nd[c].a)
   if mn == "matchAll" or mn == "replaceAll":
     if na >= 1 and missing_g(l, ast.item(l.t, args, 0)):
-      if mn == "matchAll": add(&l, l.t.nd[c].d, "oxc(bad-match-all-arg)", "Global flag (g) is missing in the regular expression supplied to the `matchAll` method.", "Add the global flag (g) to the regular expression.")
-      else: add(&l, l.t.nd[c].d, "oxc(bad-replace-all-arg)", "Global flag (g) is missing in the regular expression supplied to the `replaceAll` method.", "To replace all occurrences of a string, use the `replaceAll` method with the global flag (g) in the regular expression.")
+      if mn == "matchAll":
+        add(&l, l.t.nd[c].d, "oxc(bad-match-all-arg)", "Global flag (g) is missing in the regular expression supplied to the `matchAll` method.", "Add the global flag (g) to the regular expression.")
+        label(&l, l.t.nd[c].end, "`matchAll` called here")
+        let ra = ast.item(l.t, args, 0)
+        more(&l, l.t.nd[ra].pos, l.t.nd[ra].end, "RegExp supplied here", true)
+        note(&l, "`matchAll` throws a `TypeError` when passed a non-global regular expression.")
+      else:
+        add(&l, l.t.nd[c].d, "oxc(bad-replace-all-arg)", "Global flag (g) is missing in the regular expression supplied to the `replaceAll` method.", "To replace all occurrences of a string, use the `replaceAll` method with the global flag (g) in the regular expression.")
+        label(&l, l.t.nd[c].end, "`replaceAll` called here")
+        let ra = ast.item(l.t, args, 0)
+        more(&l, l.t.nd[ra].pos, l.t.nd[ra].end, "RegExp supplied here", true)
+        note(&l, "Unlike `replace`, `replaceAll` throws a `TypeError` when passed a non-global regular expression instead of replacing only the first match.")
   if mn == "removeEventListener" and na >= 2:
     let f = unparen(l, ast.item(l.t, args, 1))
     var bad = k(l, f) == ast.N_ARROW or k(l, f) == ast.N_FUNCEXPR
     if k(l, f) == ast.N_CALL and k(l, l.t.nd[f].a) == ast.N_PROPACCESS and name_of(l, l.t.nd[f].a) == "bind": bad = true
-    if bad: add(&l, l.t.nd[c].d, "unicorn(no-invalid-remove-event-listener)", "Invalid `removeEventListener` call.", "The listener argument should be a function reference.")
+    if bad:
+      add(&l, l.t.nd[c].d, "unicorn(no-invalid-remove-event-listener)", "Invalid `removeEventListener` call.", "The listener argument should be a function reference.")
+      label(&l, l.t.nd[c].end, "`removeEventListener` called here.")
+      more(&l, l.t.nd[f].pos, l.t.nd[f].end, "Invalid argument here", true)
   if id_is(l, obj, "Promise") and is_global(l, obj) and (mn == "all" or mn == "allSettled" or mn == "any" or mn == "race") and na >= 1:
     iterable_spread(&l, ast.item(l.t, args, 0), "`Promise.{mn}` accepts an iterable, so it's unnecessary to convert the iterable to an array.", "Consider removing the spread operator.", false)
     let arr = unparen(l, ast.item(l.t, args, 0))
@@ -4113,7 +4431,8 @@ fn plugin_call(var l: L, n: Int):
       for i in 0..ast.count(l.t, el):
         let e = unparen(l, ast.item(l.t, el, i))
         if k(l, e) == ast.N_AWAIT:
-          add(&l, l.t.nd[e].pos, "unicorn(no-await-in-promise-methods)", "Promise in `Promise.{mn}()` should not be awaited.", "Remove the `await`")
+          addn(&l, e, "unicorn(no-await-in-promise-methods)", "Promise in `Promise.{mn}()` should not be awaited.", "Remove the `await`")
+          head(&l, 5)
   if id_is(l, obj, "Math") and is_global(l, obj) and (mn == "min" or mn == "max"): min_max(&l, n, mn)
   if (mn == "toFixed" or mn == "toString" or mn == "toPrecision" or mn == "toExponential") and na >= 1:
     let a = unparen(l, ast.item(l.t, args, 0))
@@ -4128,7 +4447,7 @@ fn plugin_call(var l: L, n: Int):
         lo = 1.0
         hi = 21.0
       if v < lo or v > hi:
-        add(&l, l.t.nd[n].pos, "oxc(number-arg-out-of-range)", "Radix or precision arguments of number-related functions should not exceed the limit", "The first argument of 'Number.prototype.{mn}' should be a number between {int(lo)} and {int(hi)}")
+        addn(&l, n, "oxc(number-arg-out-of-range)", "Radix or precision arguments of number-related functions should not exceed the limit", "The first argument of 'Number.prototype.{mn}' should be a number between {int(lo)} and {int(hi)}")
   # unicorn(prefer-string-starts-ends-with): /^lit/.test(s), /lit$/.test(s)
   if mn == "test" and na == 1 and k(l, obj) == ast.N_REGEX: starts_ends(&l, n, obj, ast.item(l.t, args, 0))
   # only-used-in-recursion is counted here
@@ -4182,7 +4501,7 @@ fn min_max(var l: L, n: Int, outer: Str):
   if not constant: return
   var shown = "{vo}"
   if vo == vo.floor() and vo < 1e16 and vo > -1e16: shown = "{int(vo)}.0"
-  add(&l, l.t.nd[n].pos, "oxc(bad-min-max-func)", "Math.min and Math.max combination leads to constant result", "This evaluates to {shown} because of the incorrect `Math.min`/`Math.max` combination")
+  addn(&l, n, "oxc(bad-min-max-func)", "Math.min and Math.max combination leads to constant result", "This evaluates to {shown} because of the incorrect `Math.min`/`Math.max` combination")
 
 fn starts_ends(var l: L, n: Int, re: Int, arg: Int):
   let raw = text(l, re)
@@ -4241,10 +4560,12 @@ fn starts_ends(var l: L, n: Int, re: Int, arg: Int):
     if v >= 0xD800 and v <= 0xDFFF: ok = false
     else: utf8_push(&bytes, v)
   if not ok:
-    add(&l, l.t.nd[n].pos, "unicorn(prefer-string-starts-ends-with)", msg, "")
+    addn(&l, n, "unicorn(prefer-string-starts-ends-with)", msg, "")
+    span(&l, l.t.nd[l.t.nd[n].a].end)
     return
   let content = "{text(l, tg)}.{meth}({js_quote(str(bytes))})"
-  add_fix(&l, l.t.nd[n].pos, "unicorn(prefer-string-starts-ends-with)", msg, replace_msg(text(l, n), content), l.t.nd[n].pos, l.t.nd[n].end, content)
+  addn_fix(&l, n, "unicorn(prefer-string-starts-ends-with)", msg, replace_msg(text(l, n), content), l.t.nd[n].pos, l.t.nd[n].end, content)
+  span(&l, l.t.nd[l.t.nd[n].a].end)
 
 fn utf8_push(var b: [Byte], v: Int):
   if v < 0x80: b.push(byte(v))
@@ -4268,7 +4589,7 @@ fn js_quote(s: Str) -> Str:
   while i < s.len:
     let c = s[i]
     if c == byte(0):
-      if i + 1 < s.len and s[i + 1] >= '0' and s[i + 1] <= '9': append(&b, "\\x00")
+      if i + 1 < s.len and s[i + 1] >= '0' and s[i + 1] <= '9': append(&b, "\\0")
       else: append(&b, "\\0")
     elif c == byte(7): append(&b, "\\x07")
     elif c == byte(8): append(&b, "\\b")

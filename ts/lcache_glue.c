@@ -28,3 +28,26 @@ int64_t vl_now_ns(void) {
   clock_gettime(CLOCK_REALTIME, &ts);
   return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
+
+// For the command line: whether a descriptor is a terminal, the working directory, a real path.
+#include <unistd.h>
+#include <limits.h>
+#include <stdlib.h>
+
+bool vl_isatty(int64_t fd) { return isatty((int)fd) == 1; }
+
+vu_str vl_cwd(void) {
+  char buf[PATH_MAX];
+  if (!getcwd(buf, sizeof buf)) return vu_str_from("", 0);
+  return vu_str_from(buf, (int64_t)strlen(buf));
+}
+
+vu_str vl_realpath(const vu_str *path) {
+  char *p = vu_cstr(path);
+  if (!p) return vu_str_from("", 0);
+  char buf[PATH_MAX];
+  char *r = realpath(p, buf);
+  free(p);
+  if (!r) return vu_str_from("", 0);
+  return vu_str_from(buf, (int64_t)strlen(buf));
+}
