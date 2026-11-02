@@ -160,33 +160,38 @@ node-tar) and 3 pnpm monorepos with JavaScript and TypeScript configs loaded thr
 7 workspaces, its own `knip.json`; changesets/changesets: 24 workspaces, 24 JS/TS config files;
 unjs/unhead: 28 workspaces, 57 config files, Vue, Svelte, React, Nuxt and Angular packages). knip ran with the project's own configuration.
 
+Baseline of this round (corpus fetched again with `test/fetch_corpus.sh`, knip 6.44.1 run again; its
+default output was the same as the cached one for all 23 projects):
+
 | reporter | identical runs |
 |---|---:|
 | default (symbols), stdout + stderr + exit code | 21/23 |
-| `--reporter json`, byte for byte | 21/23 |
+| `--reporter json` (issues compared as a set where knip's own order varies, see below) | 21/23 |
 
 | issue type | knip found | vknip: same | missing | extra |
 |---|---:|---:|---:|---:|
-| Unused files | 948 | 948 | 0 | 7 |
-| Unused dependencies | 19 | 19 | 0 | 7 |
+| Unused files | 948 | 948 | 0 | 4 |
+| Unused dependencies | 19 | 19 | 0 | 0 |
 | Unused devDependencies | 75 | 75 | 0 | 3 |
 | Referenced optional peerDependencies | 3 | 3 | 0 | 0 |
 | Unlisted dependencies | 58 | 58 | 0 | 0 |
-| Unlisted binaries | 7 | 6 | 1 | 0 |
+| Unlisted binaries | 7 | 7 | 0 | 0 |
 | Unresolved imports | 6 | 6 | 0 | 0 |
-| Unused exports | 262 | 182 | 80 | 5 |
-| Unused exported types | 170 | 163 | 7 | 2 |
+| Unused exports | 262 | 183 | 79 | 1 |
+| Unused exported types | 170 | 165 | 5 | 1 |
 | Duplicate exports | 11 | 11 | 0 | 0 |
+
+knip's JSON lists the files in the order its asynchronous directory crawler meets them, which changes
+from run to run (three runs on uvu gave three different orders); its default report sorts them. So
+JSON runs whose issues are the same but in another order count as identical (`cmp_corpus.py` says so).
 
 The two different projects:
 
-- **changesets**: every difference comes from files that use `await using` declarations, which the
-  shared TypeScript parser (`ts/parse.vu`) rejects; vknip then reads those files as having no
-  imports, so what they import looks unused (3 files, 8 dependencies, the `taskkill.exe` binary, a few
-  exports). It's a parser gap; the parser is shared with vtsc and vlint and was left alone here.
+- **changesets**: `@iconify-json/logos`, which knip's unplugin-icons plugin ignores (its `resolve()`).
+  The `await using` declarations that caused the other differences are parsed now (`ts/parse.vu`).
 - **unhead**: Nuxt's auto-imports (knip's Nuxt plugin registers a compiler that adds the imports Nuxt
-  generates) and Nuxt's config, which knip loads and vknip doesn't (79 of the 80 missing exports are
-  in Nuxt-facing packages), and the error knip prints when a Nuxt config fails to load.
+  generates) and Nuxt's config, which knip loads and vknip doesn't (79 missing exports, in Nuxt-facing
+  packages), and the error knip prints when a Nuxt config fails to load.
 
 The previous single-package corpus (the 20 libraries above plus microsoft/vscode, see git history of
 this file) is unchanged: vscode was 12,666 of 12,667 lines identical before this work; it wasn't re-run
@@ -261,8 +266,6 @@ seconds, on changesets 0.42 of 0.79, on knip 0.21 of 1.23. The single-package pr
 
 ## Gaps
 
-- **Parser**: `await using` declarations (and whatever else `ts/parse.vu` rejects) make a file read as
-  having no imports or exports; oxc, knip's parser, accepts them.
 - **resolveConfig** of 97 plugins (Next.js, Nuxt, webpack, SvelteKit, Docusaurus, Remix, Karma, ...):
   default entries are used instead of the config's; Nuxt's auto-import compiler.
 - `ignoreExportsUsedInFile`, fixes of enum and namespace members and of catalog entries, published type

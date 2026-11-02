@@ -6,6 +6,16 @@ W = os.environ.get('WORK', os.getcwd())
 KNIP = os.environ.get('KNIP', '/dev/shm/knip/ref/node_modules/knip/bin/knip.js')
 VK = os.environ.get('VKNIP', os.path.join(W, 'vknip'))
 def parse(text):
+    if text.startswith('{'):
+        try: j = json.loads(text)
+        except Exception: j = None
+        if j is not None:
+            cats = collections.OrderedDict()
+            for it in j.get('issues', []):
+                for k, v in it.items():
+                    if isinstance(v, list):
+                        for x in v: cats.setdefault(k, []).append(it['file'] + ' ' + json.dumps(x, sort_keys=True))
+            return cats
     cats = collections.OrderedDict(); cur = None
     for line in text.split('\n'):
         m = re.match(r'^([A-Z][A-Za-z ]+) \((\d+)\)$', line)
@@ -34,7 +44,15 @@ def main():
         ref = json.load(open(rp + '.json'))
         o, e, c = run([VK] + extra, d)
         same = o == ref['out'] and e == ref['err'] and c == ref['code']
-        same_n += same
+        # knip's JSON lists files in the order its asynchronous crawler meets them, which varies from
+        # run to run: the same issues in another order count as identical, labelled so
+        if not same and e == ref['err'] and c == ref['code'] and o.startswith('{') and ref['out'].startswith('{'):
+            try:
+                ja = json.loads(ref['out']); jb = json.loads(o)
+                key = lambda j: sorted(json.dumps(x, sort_keys=True) for x in j.get('issues', []))
+                if key(ja) == key(jb) and list(ja) == list(jb): same = 'order'
+            except Exception: pass
+        same_n += bool(same)
         A = parse(ref['out']); B = parse(o); det = []
         for k in sorted(set(A) | set(B)):
             ra = collections.Counter(A.get(k, [])); rb = collections.Counter(B.get(k, []))
@@ -46,7 +64,7 @@ def main():
         if ref['code'] != c: det.append(f"exit {ref['code']} vs {c}")
         if o == ref['out'] and not det: pass
         elif o != ref['out'] and not det: det.append('order/format')
-        print(f"{name:20} {'IDENTICAL' if same else 'DIFF'} {'; '.join(det)}", flush=True)
+        print(f"{name:20} {'IDENTICAL' if same is True else 'IDENTICAL (issues in another order; knip order varies)' if same else 'DIFF'} {'; '.join(det)}", flush=True)
         if verbose and not same:
             import difflib
             for l in difflib.unified_diff(ref['out'].split('\n'), o.split('\n'), 'knip', 'vknip', lineterm='', n=0): print('   ', l)
