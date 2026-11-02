@@ -1,0 +1,691 @@
+# Linters golangci-lint can enable beyond its standard set, ported from the versions golangci-lint
+# 2.5.0 pins: whitespace, nakedret, asciicheck, dogsled, predeclared, copyloopvar, gocyclo,
+# misspell. Each reports what the original reports, with golangci-lint's settings and defaults.
+
+import ast
+import pkg
+import tc
+import cfg
+import doc
+import rx
+import re
+import misspell_data
+from scan import T_DEFINE, T_LAND, T_LOR, K_CONST, K_VAR
+
+type L:
+  pi: Int
+  out: [pkg.Issue]
+
+fn report(g: tc.Prog, var l: L, n: Int, pos: Int, linter: Str, msg: Str):
+  let fi = g.pk[l.pi].t.file[n]
+  l.out.push(pkg.Issue(fi, pos, linter, msg, l.out.len))
+
+fn line(p: pkg.Pkg, fi: Int, pos: Int) -> Int:
+  return pkg.line_of(p.lines[fi], pos)
+
+fn sint(c: cfg.Cfg, linter: Str, key: Str, dflt: Int) -> Int:
+  return doc.int_of(c.d, doc.get(c.d, cfg.lsettings(c, linter), key), dflt)
+
+fn sbool(c: cfg.Cfg, linter: Str, key: Str, dflt: Bool) -> Bool:
+  return doc.bool_of(c.d, doc.get(c.d, cfg.lsettings(c, linter), key), dflt)
+
+# go/parser's comment groups of file fi: start, end pairs.
+fn comment_groups(p: pkg.Pkg, fi: Int) -> [Int]:
+  let cm = p.comments[fi]
+  let lines = p.lines[fi]
+  var out: [Int] = []
+  var i = 0
+  while i < cm.len:
+    let gs = i
+    var n = 1
+    if cm[i + 2] > 0 and pkg.line_of(lines, cm[i + 2]) == pkg.line_of(lines, cm[i]): n = 0
+    var endl = pkg.line_of(lines, cm[i + 1])
+    var j = i + 3
+    while j < cm.len and cm[j + 2] == cm[gs + 2] and pkg.line_of(lines, cm[j]) <= endl + n:
+      endl = pkg.line_of(lines, cm[j + 1])
+      j += 3
+    out.push(cm[gs])
+    out.push(cm[j - 2])
+    i = j
+  return out
+
+# ---- whitespace
+
+fn ws_block(g: tc.Prog, var l: L, p: pkg.Pkg, fi: Int, groups: [Int], n: Int, lbrace: Int, rbrace: Int, stmts: [Int], want: Bool):
+  let t = g.pk[l.pi].t
+  var opening = lbrace + 1
+  var fpos = -1
+  var lend = -1
+  if stmts.len > 0:
+    fpos = t.pos[stmts[0]]
+    lend = t.end[stmts[stmts.len - 1]]
+    if not want:
+      let ol = line(p, fi, opening)
+      let bl = line(p, fi, lbrace)
+      let el = line(p, fi, rbrace + 1)
+      var k = 0
+      while k < groups.len:
+        let cp = groups[k]
+        let ce = groups[k + 1]
+        k += 2
+        if line(p, fi, cp) == line(p, fi, opening) and cp > opening:
+          if line(p, fi, ce) != line(p, fi, opening): fpos = cp
+          else: opening = ce
+        if line(p, fi, cp) == bl or line(p, fi, ce) == el: continue
+        if cp < lbrace or ce > rbrace + 1: continue
+        if cp < fpos: fpos = cp
+        if ce > lend: lend = ce
+  var start_msg = false
+  if fpos >= 0 and line(p, fi, opening) + 1 < line(p, fi, fpos): start_msg = true
+  if want and not start_msg and stmts.len >= 1:
+    report(g, &l, n, opening, "whitespace", "multi-line statement should be followed by a newline")
+  elif not want and start_msg:
+    report(g, &l, n, opening, "whitespace", "unnecessary leading newline")
+  if lend >= 0 and line(p, fi, rbrace) - 1 > line(p, fi, lend):
+    report(g, &l, n, rbrace, "whitespace", "unnecessary trailing newline")
+
+fn ws_walk(g: tc.Prog, var l: L, p: pkg.Pkg, fi: Int, groups: [Int], n: Int, multi_if: Bool, multi_func: Bool, var want: [Int]):
+  let t = g.pk[l.pi].t
+  if n <= 0: return
+  let k = t.k[n]
+  if k == ast.N_LIST:
+    for x in ast.items(t, n): ws_walk(g, &l, p, fi, groups, x, multi_if, multi_func, &want)
+    return
+  if k == ast.N_IF and multi_if:
+    if line(p, fi, t.pos[t.b[n]]) < line(p, fi, t.end[t.b[n]]): want.push(t.c[n])
+  if k == ast.N_FUNCLIT and multi_func:
+    let ft = t.a[n]
+    if line(p, fi, t.pos[n]) < line(p, fi, t.end[ft]): want.push(t.b[n])
+  if k == ast.N_FUNCDECL and multi_func and t.d[n] > 0:
+    let ft = t.c[n]
+    if line(p, fi, t.pos[ft]) < line(p, fi, t.end[ft]): want.push(t.d[n])
+  if k == ast.N_BLOCK:
+    ws_block(g, &l, p, fi, groups, n, t.pos[n], t.end[n] - 1, ast.items(t, t.a[n]), n in want)
+  if k == ast.N_SWITCH or k == ast.N_TYPESWITCH:
+    let body = t.c[n]
+    if body > 0: ws_block(g, &l, p, fi, groups, body, t.pos[body], t.end[body] - 1, ast.items(t, body), false)
+  if k == ast.N_SELECT:
+    let body = t.a[n]
+    if body > 0: ws_block(g, &l, p, fi, groups, body, t.pos[body], t.end[body] - 1, ast.items(t, body), false)
+  var kids: [Int] = []
+  push_kids(t, n, &kids)
+  for x in kids: ws_walk(g, &l, p, fi, groups, x, multi_if, multi_func, &want)
+
+# The children of n in source order (go/ast's Walk order).
+fn push_kids(t: ast.Ast, n: Int, var out: [Int]):
+  let k = t.k[n]
+  if k == ast.N_IDENT or k == ast.N_BASICLIT or k == ast.N_EMPTY or k == ast.N_BAD: return
+  if k == ast.N_FUNCDECL:
+    for x in [t.a[n], t.b[n], t.c[n], t.d[n]]:
+      if x > 0: out.push(x)
+    return
+  if k == ast.N_GENDECL:
+    if t.a[n] > 0: out.push(t.a[n])
+    return
+  if k == ast.N_BRANCH or k == ast.N_INCDEC or k == ast.N_UNARY or k == ast.N_BINARY or k == ast.N_CHANTYPE:
+    if t.a[n] > 0: out.push(t.a[n])
+    if k == ast.N_BINARY and t.b[n] > 0: out.push(t.b[n])
+    return
+  if k == ast.N_RANGE:
+    for x in [t.a[n], t.b[n], t.c[n], t.d[n]]:
+      if x > 0: out.push(x)
+    return
+  for x in [t.a[n], t.b[n], t.c[n], t.d[n]]:
+    if x > 0: out.push(x)
+
+fn whitespace(g: tc.Prog, var l: L, p: pkg.Pkg, c: cfg.Cfg, roots: [Int]):
+  let t = g.pk[l.pi].t
+  let multi_if = sbool(c, "whitespace", "multi-if", false)
+  let multi_func = sbool(c, "whitespace", "multi-func", false)
+  for r in roots:
+    let fi = t.file[r]
+    let groups = comment_groups(p, fi)
+    for d in ast.items(t, t.c[r]):
+      if t.k[d] != ast.N_FUNCDECL or t.d[d] <= 0: continue
+      var want: [Int] = []
+      ws_walk(g, &l, p, fi, groups, d, multi_if, multi_func, &want)
+
+# ---- nakedret
+
+fn has_named_results(t: ast.Ast, ft: Int) -> Bool:
+  let res = t.c[ft]
+  if res < 0: return false
+  for f in ast.items(t, res):
+    if t.a[f] > 0 and ast.count(t, t.a[f]) > 0: return true
+  return false
+
+type Fn:
+  name: Str
+  len: Int
+  report: Bool
+
+fn nr_walk(g: tc.Prog, var l: L, p: pkg.Pkg, fi: Int, n: Int, max_len: Int, var stack: [Fn]):
+  let t = g.pk[l.pi].t
+  if n <= 0: return
+  let k = t.k[n]
+  var pushed = false
+  if k == ast.N_FUNCDECL or k == ast.N_FUNCLIT:
+    var ft = t.a[n]
+    var name = ""
+    if k == ast.N_FUNCDECL:
+      ft = t.c[n]
+      name = t.names[t.s[t.b[n]]] + ""
+    else: name = "<func():{line(p, fi, t.pos[n])}>"
+    var length = line(p, fi, t.end[n]) - line(p, fi, t.pos[n])
+    if length == 0: length = 1
+    stack.push(Fn(name, length, length > max_len and has_named_results(t, ft)))
+    pushed = true
+  if k == ast.N_RETURN and stack.len > 0:
+    let f = stack[stack.len - 1]
+    if f.report and ast.count(t, t.a[n]) == 0:
+      var names: [Str] = []
+      for s in stack: names.push(s.name + "")
+      report(g, &l, n, t.pos[n], "nakedret", "naked return in func `" + ".".join(names) + "` with {f.len} lines of code")
+  var kids: [Int] = []
+  if k == ast.N_LIST: kids = ast.items(t, n)
+  else: push_kids(t, n, &kids)
+  for x in kids: nr_walk(g, &l, p, fi, x, max_len, &stack)
+  if pushed: stack.pop()
+
+fn nakedret(g: tc.Prog, var l: L, p: pkg.Pkg, c: cfg.Cfg, roots: [Int]):
+  let t = g.pk[l.pi].t
+  let max_len = sint(c, "nakedret", "max-func-lines", 30)
+  for r in roots:
+    var stack: [Fn] = []
+    nr_walk(g, &l, p, t.file[r], r, max_len, &stack)
+
+# ---- asciicheck
+
+fn go_quote_rune(cp: Int) -> Str:
+  let hexs = "0123456789ABCDEF"
+  var h = ""
+  var v = cp
+  while v > 0:
+    h = hexs[v & 15..(v & 15) + 1] + h
+    v = v >> 4
+  while h.len < 4: h = "0" + h
+  return "U+" + h + " '" + chr(cp) + "'"
+
+fn go_strquote(s: Str) -> Str:
+  # strconv.Quote for identifiers: printable runes stay as they are
+  return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+fn ascii_ident(g: tc.Prog, var l: L, n: Int):
+  if n <= 0: return
+  let t = g.pk[l.pi].t
+  if t.k[n] != ast.N_IDENT: return
+  let name = t.names[t.s[n]]
+  var bad = -1
+  for i in 0..name.len:
+    if name[i] >= 128:
+      for cp in name.codes():
+        if cp > 127:
+          bad = cp
+          break
+      break
+  if bad < 0: return
+  report(g, &l, n, t.pos[n], "asciicheck", "identifier " + go_strquote(name) + " contain non-ASCII character: " + go_quote_rune(bad))
+
+fn ascii_fields(g: tc.Prog, var l: L, lst: Int):
+  if lst < 0: return
+  let t = g.pk[l.pi].t
+  for f in ast.items(t, lst):
+    if t.a[f] > 0:
+      for nm in ast.items(t, t.a[f]): ascii_ident(g, &l, nm)
+
+fn asciicheck(g: tc.Prog, var l: L, nodes: [Int]):
+  let t = g.pk[l.pi].t
+  for n in nodes:
+    let k = t.k[n]
+    if k == ast.N_FILE: ascii_ident(g, &l, t.a[n])
+    elif k == ast.N_IMPORT: ascii_ident(g, &l, t.a[n])
+    elif k == ast.N_TYPESPEC:
+      ascii_ident(g, &l, t.a[n])
+      ascii_fields(g, &l, t.b[n])
+    elif k == ast.N_VALUESPEC:
+      for nm in ast.items(t, t.a[n]): ascii_ident(g, &l, nm)
+    elif k == ast.N_FUNCDECL:
+      ascii_ident(g, &l, t.b[n])
+      ascii_fields(g, &l, t.a[n])
+    elif k == ast.N_STRUCTTYPE: ascii_fields(g, &l, t.a[n])
+    elif k == ast.N_FUNCTYPE:
+      ascii_fields(g, &l, t.a[n])
+      ascii_fields(g, &l, t.b[n])
+      ascii_fields(g, &l, t.c[n])
+    elif k == ast.N_IFACETYPE: ascii_fields(g, &l, t.a[n])
+    elif k == ast.N_LABELED: ascii_ident(g, &l, t.a[n])
+    elif k == ast.N_ASSIGN and t.f[n] == T_DEFINE:
+      for x in ast.items(t, t.a[n]): ascii_ident(g, &l, x)
+
+# ---- dogsled
+
+fn dogsled(g: tc.Prog, var l: L, c: cfg.Cfg, nodes: [Int]):
+  let t = g.pk[l.pi].t
+  let maxb = sint(c, "dogsled", "max-blank-identifiers", 2)
+  for n in nodes:
+    if t.k[n] != ast.N_FUNCDECL or t.d[n] <= 0: continue
+    for s in ast.items(t, t.a[t.d[n]]):
+      if t.k[s] != ast.N_ASSIGN: continue
+      var nb = 0
+      for x in ast.items(t, t.a[s]):
+        if t.k[x] == ast.N_IDENT and t.names[t.s[x]] == "_": nb += 1
+      if nb > maxb: report(g, &l, s, t.pos[s], "dogsled", "declaration has {nb} blank identifiers")
+
+# ---- predeclared
+
+fn is_predeclared(s: Str) -> Bool:
+  return s in ["any", "bool", "byte", "comparable", "complex64", "complex128", "error", "float32", "float64", "int", "int8", "int16", "int32", "int64", "rune", "string", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "append", "cap", "clear", "close", "complex", "copy", "delete", "imag", "len", "make", "max", "min", "new", "panic", "print", "println", "real", "recover", "false", "iota", "nil", "true"]
+
+fn pd_report(g: tc.Prog, var l: L, n: Int, kind: Str, ignore: [Str]):
+  if n <= 0: return
+  let t = g.pk[l.pi].t
+  if t.k[n] != ast.N_IDENT: return
+  let name = t.names[t.s[n]]
+  if name in ignore or not is_predeclared(name): return
+  report(g, &l, n, t.pos[n], "predeclared", kind + " " + name + " has same name as predeclared identifier")
+
+fn pd_fields(g: tc.Prog, var l: L, lst: Int, kind: Str, ignore: [Str]):
+  if lst < 0: return
+  let t = g.pk[l.pi].t
+  for f in ast.items(t, lst):
+    if t.a[f] > 0:
+      for nm in ast.items(t, t.a[f]): pd_report(g, &l, nm, kind, ignore)
+
+fn predeclared(g: tc.Prog, var l: L, c: cfg.Cfg, nodes: [Int]):
+  let t = g.pk[l.pi].t
+  let s = cfg.lsettings(c, "predeclared")
+  var ignore: [Str] = []
+  for x in doc.strs_of(c.d, doc.get(c.d, s, "ignore")): ignore.push(x.strip())
+  let qualified = doc.bool_of(c.d, doc.get(c.d, s, "qualified-name"), false)
+  for n in nodes:
+    let k = t.k[n]
+    if k == ast.N_FILE:
+      pd_report(g, &l, t.a[n], "package name", ignore)
+      for im in ast.items(t, t.b[n]): pd_report(g, &l, t.a[im], "import name", ignore)
+    elif k == ast.N_GENDECL and (t.f[n] == K_CONST or t.f[n] == K_VAR):
+      var kind = "variable"
+      if t.f[n] == K_CONST: kind = "const"
+      for sp in ast.items(t, t.a[n]):
+        for nm in ast.items(t, t.a[sp]): pd_report(g, &l, nm, kind, ignore)
+    elif k == ast.N_TYPESPEC: pd_report(g, &l, t.a[n], "type", ignore)
+    elif k == ast.N_STRUCTTYPE and qualified: pd_fields(g, &l, t.a[n], "field", ignore)
+    elif k == ast.N_IFACETYPE and qualified: pd_fields(g, &l, t.a[n], "method", ignore)
+    elif k == ast.N_FUNCDECL:
+      if t.a[n] < 0: pd_report(g, &l, t.b[n], "function", ignore)
+      elif qualified: pd_report(g, &l, t.b[n], "method", ignore)
+      if t.a[n] >= 0: pd_fields(g, &l, t.a[n], "receiver", ignore)
+    elif k == ast.N_FUNCTYPE:
+      pd_fields(g, &l, t.b[n], "param", ignore)
+      pd_fields(g, &l, t.c[n], "named return", ignore)
+    elif k == ast.N_LABELED: pd_report(g, &l, t.a[n], "label", ignore)
+    elif k == ast.N_ASSIGN and t.f[n] == T_DEFINE:
+      for x in ast.items(t, t.a[n]): pd_report(g, &l, x, "variable", ignore)
+
+# ---- copyloopvar
+
+fn cl_check(g: tc.Prog, var l: L, body: Int, names: [Str], alias: Bool):
+  let t = g.pk[l.pi].t
+  for s in ast.items(t, t.a[body]):
+    if t.k[s] != ast.N_ASSIGN or t.f[s] != T_DEFINE: continue
+    let lhs = ast.items(t, t.a[s])
+    let rhs = ast.items(t, t.b[s])
+    for i in 0..rhs.len:
+      let r = rhs[i]
+      if t.k[r] != ast.N_IDENT: continue
+      let rn = t.names[t.s[r]]
+      if not (rn in names): continue
+      if not alias:
+        if i >= lhs.len or t.k[lhs[i]] != ast.N_IDENT: continue
+        if t.names[t.s[lhs[i]]] != rn: continue
+      report(g, &l, s, t.pos[s], "copyloopvar", "The copy of the 'for' variable \"" + rn + "\" can be deleted (Go 1.22+)")
+
+fn copyloopvar(g: tc.Prog, var l: L, c: cfg.Cfg, nodes: [Int]):
+  let t = g.pk[l.pi].t
+  let alias = sbool(c, "copyloopvar", "check-alias", false)
+  for n in nodes:
+    let k = t.k[n]
+    if k == ast.N_RANGE:
+      let key = t.a[n]
+      if key <= 0 or t.k[key] != ast.N_IDENT: continue
+      var names = [t.names[t.s[key]] + ""]
+      let v = t.b[n]
+      if v > 0:
+        if t.k[v] != ast.N_IDENT: continue
+        names.push(t.names[t.s[v]] + "")
+      cl_check(g, &l, t.d[n], names, alias)
+    elif k == ast.N_FOR:
+      let init = t.a[n]
+      if init <= 0 or t.k[init] != ast.N_ASSIGN: continue
+      var names: [Str] = []
+      for x in ast.items(t, t.a[init]):
+        if t.k[x] == ast.N_IDENT: names.push(t.names[t.s[x]] + "")
+      cl_check(g, &l, t.d[n], names, alias)
+
+# ---- gocyclo
+
+fn cyclo(t: ast.Ast, n: Int) -> Int:
+  if n <= 0: return 0
+  var c = 0
+  let k = t.k[n]
+  if k == ast.N_IF or k == ast.N_FOR or k == ast.N_RANGE: c += 1
+  elif k == ast.N_CASE and t.a[n] >= 0: c += 1
+  elif k == ast.N_COMM and t.a[n] > 0: c += 1
+  elif k == ast.N_BINARY and (t.f[n] == T_LAND or t.f[n] == T_LOR): c += 1
+  var kids: [Int] = []
+  if k == ast.N_LIST: kids = ast.items(t, n)
+  else: push_kids(t, n, &kids)
+  for x in kids: c += cyclo(t, x)
+  return c
+
+fn recv_str(t: ast.Ast, n: Int) -> Str:
+  let k = t.k[n]
+  if k == ast.N_STAR: return "*" + recv_str(t, t.a[n])
+  if k == ast.N_IDENT: return t.names[t.s[n]] + ""
+  if k == ast.N_INDEX: return recv_str(t, t.a[n])
+  if k == ast.N_PAREN: return recv_str(t, t.a[n])
+  return "BADRECV"
+
+type Stat:
+  name: Str
+  cx: Int
+  node: Int
+  pos: Int
+
+fn gocyclo(g: tc.Prog, var l: L, p: pkg.Pkg, c: cfg.Cfg, roots: [Int]):
+  let t = g.pk[l.pi].t
+  let over = sint(c, "gocyclo", "min-complexity", 30)
+  var stats: [Stat] = []
+  for r in roots:
+    for d in ast.items(t, t.c[r]):
+      if t.k[d] == ast.N_FUNCDECL:
+        var name = t.names[t.s[t.b[d]]] + ""
+        let rv = t.a[d]
+        if rv >= 0 and ast.count(t, rv) > 0:
+          name = "(" + recv_str(t, t.b[ast.item(t, rv, 0)]) + ")." + name
+        if doc_ignore(p, t.file[d], t.pos[d]): continue
+        stats.push(Stat(name, 1 + cyclo(t, d), d, t.pos[d]))
+      elif t.k[d] == ast.N_GENDECL:
+        for sp in ast.items(t, t.a[d]):
+          if t.k[sp] != ast.N_VALUESPEC or t.c[sp] < 0: continue
+          for v in ast.items(t, t.c[sp]):
+            if t.k[v] != ast.N_FUNCLIT: continue
+            if doc_ignore(p, t.file[d], t.pos[d]): continue
+            let nm0 = ast.item(t, t.a[sp], 0)
+            stats.push(Stat(t.names[t.s[nm0]] + "", 1 + cyclo(t, v), v, t.pos[v]))
+  # sort.Stable with Less(i, j) = s[i] >= s[j]: equal complexities end up reversed
+  var idx: [Int] = []
+  for i in 0..stats.len: idx.push(i)
+  idx = stable_desc(stats, idx)
+  for i in idx:
+    if stats[i].cx <= over: break
+    report(g, &l, stats[i].node, stats[i].pos, "gocyclo", "cyclomatic complexity {stats[i].cx} of func `" + stats[i].name + "` is high (> {over})")
+
+# sort.Stable (insertion sort on small blocks then merges) with a non-strict Less behaves, for this
+# comparator, as an insertion sort that moves an element before every one it is >= to.
+fn stable_desc(stats: [Stat], idx0: [Int]) -> [Int]:
+  var idx: [Int] = []
+  for x in idx0: idx.push(x)
+  var i = 1
+  while i < idx.len:
+    var j = i
+    while j > 0 and stats[idx[j]].cx >= stats[idx[j - 1]].cx:
+      idx.swap(j, j - 1)
+      j -= 1
+    i += 1
+  return idx
+
+# Whether the doc comment just above pos holds //gocyclo:ignore.
+fn doc_ignore(p: pkg.Pkg, fi: Int, pos: Int) -> Bool:
+  let cm = p.comments[fi]
+  let lines = p.lines[fi]
+  let dl = pkg.line_of(lines, pos)
+  var i = 0
+  var found = false
+  # the comments ending on the lines right above the declaration
+  var want = dl - 1
+  var k = cm.len - 3
+  while k >= 0:
+    let el = pkg.line_of(lines, cm[k + 1])
+    if cm[k] < pos and el == want:
+      let txt = p.srcs[fi][cm[k]..cm[k + 1]]
+      if txt.startswith("//gocyclo:ignore"): found = true
+      want = pkg.line_of(lines, cm[k]) - 1
+    elif cm[k] < pos and el < want: break
+    k -= 3
+  return found
+
+# ---- misspell
+
+type Dict:
+  corr: {Str: Str}       # typo -> correction (the last one listed, as misspell's map keeps)
+  first: {Str: Str}      # typo -> correction the replacer picks (the first listed)
+  prio: {Str: Int}
+  rxs: [rx.Rx]           # url, email, host, backslash
+
+fn new_dict(c: cfg.Cfg) -> Dict:
+  var d = Dict({}, {}, {}, [])
+  let s = cfg.lsettings(c, "misspell")
+  let locale = doc.str_of(c.d, doc.get(c.d, s, "locale"), "").upper()
+  let ignore = doc.strs_of(c.d, doc.get(c.d, s, "ignore-rules"))
+  var lists = [misspell_data.dict_main()]
+  if locale == "US": lists.push(misspell_data.dict_us())
+  if locale == "UK" or locale == "GB": lists.push(misspell_data.dict_uk())
+  var extra = ""
+  let ew = doc.get(c.d, s, "extra-words")
+  if ew >= 0 and c.d.kind[ew] == doc.K_SEQ:
+    var parts: [Str] = []
+    for w in c.d.kids[ew]:
+      let typo = doc.str_of(c.d, doc.get(c.d, w, "typo"), "")
+      let corr = doc.str_of(c.d, doc.get(c.d, w, "correction"), "")
+      if typo.len > 0 and corr.len > 0: parts.push(doc.lower(typo) + "\t" + doc.lower(corr))
+    extra = "\n".join(parts)
+  if extra.len > 0: lists.push(extra)
+  var prio = 1000000000
+  for text in lists:
+    for ln in text.split("\n"):
+      let tab = ln.find("\t")
+      if tab <= 0: continue
+      let typo = ln[0..tab]
+      if typo in ignore: continue
+      let corr = ln[tab + 1..ln.len]
+      let lk = doc.lower(typo)
+      d.corr[typo] = corr
+      if not (lk in d.first):
+        d.first[lk] = corr
+        d.prio[lk] = prio
+      prio -= 1
+  d.rxs.push(rx.compile("(?i)(https?|ftp)://(-\\.)?([^\\s/?.#]+\\.?)+(/\\S*)?"))
+  d.rxs.push(rx.compile("[[:alnum:]_.%+-]+@[[:alnum:]-.]+\\.[[:alpha:]]{{2,6}}[^[:alpha:]]"))
+  d.rxs.push(rx.compile("([[:alnum:]-]+\\.)+[[:alpha:]]{{2,63}}"))
+  d.rxs.push(rx.compile("\\\\[[:lower:]]"))
+  return d
+
+fn blank_matches(x: rx.Rx, s: Str, host: Bool) -> Str:
+  if not x.ok: return s
+  var out = ""
+  var pos = 0
+  while pos <= s.len:
+    let rest = s[pos..s.len]
+    var found = false
+    var ms = 0
+    var me = 0
+    if r = x.r:
+      if m = re.search(r, rest):
+        found = true
+        ms = m.start
+        me = m.end
+    if not found: break
+    out += rest[0..ms]
+    let mt = rest[ms..me]
+    var keep = false
+    if host:
+      for ch in mt.chars():
+        if ch.is_upper(): keep = true
+    if keep: out += mt
+    else:
+      for q in 0..mt.len: out += " "
+    if me == ms:
+      if ms < rest.len: out += rest[ms..ms + 1]
+      pos += ms + 1
+    else: pos += me
+  if pos < s.len: out += s[pos..s.len]
+  return out
+
+fn remove_path(s0: Str) -> Str:
+  var s = s0 + ""
+  var out = ""
+  while s.len > 0:
+    var idx = s.find("/")
+    if idx == -1:
+      out += s
+      break
+    if idx > 0: idx -= 1
+    let ch = s[idx]
+    var cls = ""
+    if ch == '/' or ch == ' ' or ch == '\n' or ch == '\t' or ch == '\r': cls = " \n\r\t"
+    elif ch == '[': cls = "]\n"
+    elif ch == '(': cls = ")\n"
+    else:
+      out += s[0..idx + 2]
+      s = s[idx + 2..s.len]
+      continue
+    var endx = -1
+    var q = idx + 1
+    while q < s.len:
+      if cls.find(s[q..q + 1]) >= 0:
+        endx = q - (idx + 1)
+        break
+      q += 1
+    if endx != -1:
+      out += s[0..idx + 1]
+      for z in 0..endx: out += " "
+      s = s[idx + endx + 1..s.len]
+    else:
+      out += s
+      break
+  return out
+
+fn word_byte(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '\''
+
+fn case_style(w: Str) -> Int:
+  var up = 0
+  var lo = 0
+  for i in 0..w.len:
+    if w[i] >= 'a' and w[i] <= 'z': lo += 1
+    elif w[i] >= 'A' and w[i] <= 'Z': up += 1
+  if up != 0 and lo == 0: return 2
+  if up == 0 and lo != 0: return 1
+  if up == 1 and lo > 0 and w[0] >= 'A' and w[0] <= 'Z': return 3
+  return 0
+
+fn adapt(val: Str, style: Int) -> Str:
+  if style == 2: return val.upper()
+  if style == 1: return val.lower()
+  if style == 3:
+    if val.len < 2: return val.upper()
+    return val[0..1].upper() + val[1..val.len].lower()
+  return val
+
+# The replacer run over one word: at each position the highest-priority typo that starts there.
+fn replace_word(d: Dict, w: Str) -> Str:
+  let lw = doc.lower(w)
+  var out = ""
+  var i = 0
+  while i < w.len:
+    var best = -1
+    var bestlen = 0
+    var j = i + 1
+    while j <= w.len:
+      let k = lw[i..j]
+      let pr = d.prio.get(k, -1)
+      if pr > best:
+        best = pr
+        bestlen = j - i
+      j += 1
+    if best < 0:
+      out += w[i..i + 1]
+      i += 1
+      continue
+    let orig = w[i..i + bestlen]
+    let key = lw[i..i + bestlen]
+    out += adapt(d.first.get(key, ""), case_style(orig))
+    i += bestlen
+  return out
+
+fn eq_fold(a: Str, b: Str) -> Bool:
+  return a.lower() == b.lower()
+
+fn misspell_line(g: tc.Prog, var l: L, d: Dict, s: Str, start: Int, node: Int):
+  # quick test: any word (or a word after a backslash escape) that is a typo
+  var cand = false
+  var i = 0
+  while i < s.len and not cand:
+    if word_byte(s[i]):
+      var j = i
+      while j < s.len and word_byte(s[j]): j += 1
+      let lw = doc.lower(s[i..j])
+      if lw in d.first: cand = true
+      elif i > 0 and s[i - 1] == '\\' and j - i > 1 and (doc.lower(s[i + 1..j]) in d.first): cand = true
+      i = j
+    else: i += 1
+  if not cand: return
+  var red = blank_matches(d.rxs[0], s, false)
+  red = remove_path(red)
+  red = blank_matches(d.rxs[1], red, false)
+  red = blank_matches(d.rxs[2], red, true)
+  red = blank_matches(d.rxs[3], red, false)
+  i = 0
+  while i < red.len:
+    if not word_byte(red[i]):
+      i += 1
+      continue
+    var j = i
+    while j < red.len and word_byte(red[j]): j += 1
+    let word = s[i..j]
+    let lw = doc.lower(word)
+    if lw in d.first:
+      let nw = replace_word(d, word)
+      if nw != word and case_style(word) != 0 and eq_fold(d.corr.get(lw, ""), nw):
+        report(g, &l, node, start + i, "misspell", "`" + word + "` is a misspelling of `" + nw + "`")
+    i = j
+
+fn misspell(g: tc.Prog, var l: L, p: pkg.Pkg, d: Dict, c: cfg.Cfg, roots: [Int]):
+  let t = g.pk[l.pi].t
+  let mode = doc.lower(doc.str_of(c.d, doc.get(c.d, cfg.lsettings(c, "misspell"), "mode"), ""))
+  for r in roots:
+    let fi = t.file[r]
+    let src = p.srcs[fi]
+    if mode == "restricted":
+      let cm = p.comments[fi]
+      var k = 0
+      while k < cm.len:
+        let text = src[cm[k]..cm[k + 1]]
+        var off = 0
+        for ln in text.split("\n"):
+          misspell_line(g, &l, d, ln, cm[k] + off, r)
+          off += ln.len + 1
+        k += 3
+      continue
+    var pos = 0
+    while pos < src.len:
+      var e = src.find("\n", pos)
+      if e < 0: e = src.len
+      misspell_line(g, &l, d, src[pos..e], pos, r)
+      pos = e + 1
+
+# ---- running them
+
+fn run(var g: tc.Prog, pi: Int, p: pkg.Pkg, c: cfg.Cfg, var d: Dict, nodes: [Int], var issues: [pkg.Issue]):
+  var l = L(pi, [])
+  var roots: [Int] = []
+  for r in g.pk[pi].roots: roots.push(r)
+  if cfg.is_enabled(c, "asciicheck"): asciicheck(g, &l, nodes)
+  if cfg.is_enabled(c, "copyloopvar"): copyloopvar(g, &l, c, nodes)
+  if cfg.is_enabled(c, "dogsled"): dogsled(g, &l, c, nodes)
+  if cfg.is_enabled(c, "gocyclo"): gocyclo(g, &l, p, c, roots)
+  if cfg.is_enabled(c, "misspell"): misspell(g, &l, p, d, c, roots)
+  if cfg.is_enabled(c, "nakedret"): nakedret(g, &l, p, c, roots)
+  if cfg.is_enabled(c, "predeclared"): predeclared(g, &l, c, nodes)
+  if cfg.is_enabled(c, "whitespace"): whitespace(g, &l, p, c, roots)
+  for is in l.out: issues.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))

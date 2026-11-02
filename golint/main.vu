@@ -25,6 +25,7 @@ import proc
 import printers
 import doc
 import lintersdb
+import lints
 
 extern "sys_glue.c":
   fn gl_getcwd(ffi: Ffi) -> Str
@@ -92,7 +93,7 @@ fn check_on(c: cfg.Cfg, is: pkg.Issue, gover: Int) -> Bool:
     if k > 0: return vet_enabled(c, is.msg[0..k], gover)
   return true
 
-fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c: cfg.Cfg, rs: proc.Rxs, diff: Bool, ch: proc.Changed) -> Res:
+fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c: cfg.Cfg, rs: proc.Rxs, diff: Bool, ch: proc.Changed, var dict: lints.Dict) -> Res:
   var p = pkg.new_pkg(sp.dir)
   for f in sp.files:
     let src = fs.read(f) else continue
@@ -121,12 +122,54 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
     var w = vet.walk_pkg(g.pk[pi].t, roots2)
     if want_vet: vet.run(&g, fs, pi, p, &issues, gover, &w)
     if want_sc: sc.run(&g, fs, pi, p, &issues, gover, &w)
+  if any_lints(c):
+    var all_roots: [Int] = []
+    for r in g.pk[pi].roots: all_roots.push(r)
+    let w2 = vet.walk_pkg(g.pk[pi].t, all_roots)
+    lints.run(&g, pi, p, c, &dict, w2.nodes, &issues)
+  if cfg.is_enabled(c, "copyloopvar") and gover < 22: issues = drop_linter(issues, "copyloopvar")
   swap(&p.t, &g.pk[pi].t)
   var kept: [pkg.Issue] = []
-  for is in issues:
-    if check_on(c, is, gover): kept.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
+  var ord: [Int] = []
+  for i in 0..issues.len: ord.push(i)
+  ord.sort(by: fn(a, b) => errcheck_before(p, issues[a], issues[b]))
+  for i in ord:
+    let is = issues[i]
+    if check_on(c, is, gover): kept.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", rank_of(is)))
   let res = proc.process_pkg(c, rs, p, kept, &cnt, diff, ch)
   return Res(0, res, cnt, [])
+
+# errcheck's issues come sorted by file name, then position; everything else keeps its order.
+fn errcheck_before(p: pkg.Pkg, a: pkg.Issue, b: pkg.Issue) -> Bool:
+  if a.linter != "errcheck" or b.linter != "errcheck": return a.linter == "errcheck" and b.linter != "errcheck"
+  if a.file != b.file: return p.paths[a.file] < p.paths[b.file]
+  return a.pos < b.pos
+
+fn any_lints(c: cfg.Cfg) -> Bool:
+  for n in ["asciicheck", "copyloopvar", "dogsled", "gocyclo", "misspell", "nakedret", "predeclared", "whitespace"]:
+    if cfg.is_enabled(c, n): return true
+  return false
+
+fn drop_linter(issues: [pkg.Issue], name: Str) -> [pkg.Issue]:
+  var out: [pkg.Issue] = []
+  for is in issues:
+    if is.linter != name: out.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
+  return out
+
+# golangci-lint's order within a line: linters with their own issue reporters first (by name), then
+# the analyzers' diagnostics, linter by linter (by name), each in its own order.
+fn rank_of(is: pkg.Issue) -> Int:
+  let custom = ["dupl", "errcheck", "gochecksumtype", "gocognit", "goconst", "gocyclo", "gomoddirectives", "gomodguard", "gosec", "nolintlint", "promlinter", "revive", "unconvert", "unused"]
+  var local = is.rank
+  if is.linter == "govet": local = is.rank - 1000
+  elif is.linter == "ineffassign": local = is.rank - 5000
+  elif is.linter == "unused": local = is.rank - 1
+  for i in 0..custom.len:
+    if custom[i] == is.linter: return i * 100000 + local
+  let names = sorted(cfg.reg_names())
+  for i in 0..names.len:
+    if names[i] == is.linter: return 10000000 + i * 100000 + local
+  return 90000000 + local
 
 fn worker(fs: Fs, own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: Chan[Int], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str, gover: Int):
   var kw = scan.keywords()
@@ -134,9 +177,11 @@ fn worker(fs: Fs, own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg:
   for t in conf.value.build_tags: g.tags.push(t + "")
   tc.read_gomod(fs, &g, modroot)
   let rs = proc.compile_all(conf.value)
+  var dict = lints.Dict({}, {}, {}, [])
+  if cfg.is_enabled(conf.value, "misspell"): dict = lints.new_dict(conf.value)
   while true:
     let i = jobs.recv() else return
-    var r = lint_one(fs, specs.value[i], &g, &kw, gover, conf.value, rs, diff, chg.value)
+    var r = lint_one(fs, specs.value[i], &g, &kw, gover, conf.value, rs, diff, chg.value, &dict)
     r.idx = i
     res.send(r)
 
@@ -192,6 +237,94 @@ fn package_name(src: Str, var kw: {Str: Int}) -> Str:
     if scn.tok == scan.T_IDENT: name = scn.src[scn.ts..scn.te]
   swap(&scn.kw, &kw)
   return name
+
+# The import paths a file imports, read with the scanner.
+fn file_imports(src: Str, var kw: {Str: Int}) -> [Str]:
+  var k2: {Str: Int} = {}
+  swap(&k2, &kw)
+  var scn = scan.scanner(src + "", k2)
+  var out: [Str] = []
+  scan.next(&scn)
+  while scn.tok != scan.K_IMPORT and scn.tok != scan.T_EOF:
+    if scn.tok == scan.T_IDENT or scn.tok == scan.K_PACKAGE or scn.tok == scan.T_SEMI: scan.next(&scn)
+    else: break
+  while scn.tok == scan.K_IMPORT:
+    scan.next(&scn)
+    if scn.tok == scan.T_LPAREN:
+      scan.next(&scn)
+      while scn.tok != scan.T_RPAREN and scn.tok != scan.T_EOF:
+        if scn.tok == scan.T_STRING: out.push(scn.src[scn.ts + 1..scn.te - 1])
+        scan.next(&scn)
+      scan.next(&scn)
+    else:
+      while scn.tok != scan.T_STRING and scn.tok != scan.T_SEMI and scn.tok != scan.T_EOF: scan.next(&scn)
+      if scn.tok == scan.T_STRING: out.push(scn.src[scn.ts + 1..scn.te - 1])
+      scan.next(&scn)
+    while scn.tok == scan.T_SEMI: scan.next(&scn)
+  swap(&scn.kw, &kw)
+  return out
+
+fn gl_visit(i: Int, specs: [Spec], imps: [[Int]], var seen: [Bool], var out: [Int]):
+  if seen[i]: return
+  seen[i] = true
+  for j in imps[i]: gl_visit(j, specs, imps, &seen, &out)
+  out.push(i)
+
+# The order go/packages returns golangci-lint's packages in (go list -deps -test): packages without
+# tests in dependency order (roots by import path, imports sorted), then each tested package's
+# test variant and its external test package, by import path.
+fn golist_order(fs: Fs, own specs: [Spec], var kw: {Str: Int}) -> [Spec]:
+  let n = specs.len
+  var byip: {Str: Int} = {}
+  for i in 0..n:
+    if not specs[i].path.endswith("_test"): byip[specs[i].path] = i
+  var tested = [false] * n
+  var imps: [[Int]] = []
+  for i in 0..n:
+    var deps: [Str] = []
+    for f in specs[i].files:
+      if f.endswith("_test.go"):
+        tested[i] = true
+        continue
+      let src = fs.read(f) else continue
+      for ip in file_imports(src, &kw):
+        if not (ip in deps): deps.push(ip)
+    deps.sort()
+    var js: [Int] = []
+    for ip in deps:
+      let j = byip.get(ip, -1)
+      if j >= 0 and j != i: js.push(j)
+    imps.push(js)
+  for i in 0..n:
+    if specs[i].path.endswith("_test"):
+      tested[i] = true
+      let base = byip.get(specs[i].path[0..specs[i].path.len - 5], -1)
+      if base >= 0: tested[base] = true
+  var roots: [Int] = []
+  for i in 0..n:
+    if not specs[i].path.endswith("_test"): roots.push(i)
+  roots.sort(by: fn(a, b) => specs[a].path < specs[b].path)
+  var seen = [false] * n
+  var post: [Int] = []
+  for r in roots: gl_visit(r, specs, imps, &seen, &post)
+  var order: [Int] = []
+  for i in post:
+    if not tested[i]: order.push(i)
+  for r in roots:
+    if not tested[r]: continue
+    order.push(r)
+    let x = byip.get(specs[r].path + "_test", -2)
+    for i in 0..n:
+      if specs[i].path == specs[r].path + "_test": order.push(i)
+  var out: [Spec] = []
+  var taken = [false] * n
+  for i in order:
+    if taken[i]: continue
+    taken[i] = true
+    var fl: [Str] = []
+    for f in specs[i].files: fl.push(f + "")
+    out.push(Spec(specs[i].dir + "", fl, specs[i].path + ""))
+  return out
 
 fn gomod_go(fs: Fs) -> Str:
   let text = fs.read("go.mod") else return ""
@@ -603,8 +736,14 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
         main_files.push(path)
     var ip = modpath + ""
     if d.path != ".": ip = modpath + "/" + d.path
-    if main_files.len > 0: specs.push(Spec(d.path + "", main_files, ip + ""))
+    var ordered: [Str] = []
+    for f in main_files:
+      if not f.endswith("_test.go"): ordered.push(f + "")
+    for f in main_files:
+      if f.endswith("_test.go"): ordered.push(f + "")
+    if main_files.len > 0: specs.push(Spec(d.path + "", ordered, ip + ""))
     if x_files.len > 0: specs.push(Spec(d.path + "", x_files, ip + "_test"))
+  specs = golist_order(fs, specs, &kw)
   var all: [proc.Iss] = []
   var warnings: [Str] = []     # tag, text pairs
   var perrs: [Str] = []
