@@ -91,6 +91,43 @@ const viteConfigs = async local => {
   return configs;
 };
 const out = {};
+// webpack's config as plugins/webpack findWebpackDependenciesFromConfig sees it: functions called
+// (the config with env and argv, rule.use with the rule info, entry), ProvidePlugin definitions kept
+const ruleInfo = { compiler: '', issuer: '', realResource: '', resource: '', resourceQuery: '', dependency: '', descriptionData: {}, issuerLayer: '' };
+const evalRule = rule => {
+  if (!rule || typeof rule !== 'object') return rule;
+  const out = { ...rule };
+  if (typeof out.use === 'function') out.use = out.use(ruleInfo);
+  else if (out.use == null && typeof out.loader === 'function') out.loader = out.loader(ruleInfo);
+  if (Array.isArray(out.oneOf)) out.oneOf = out.oneOf.map(evalRule);
+  return out;
+};
+const evalWebpackOpts = async opts => {
+  if (!opts || typeof opts !== 'object') return opts;
+  const o = { ...opts };
+  if (o.module && Array.isArray(o.module.rules)) o.module = { ...o.module, rules: o.module.rules.map(evalRule) };
+  if (Array.isArray(o.plugins)) o.plugins = o.plugins.map(pl => (pl && pl.constructor && pl.constructor.name === 'ProvidePlugin' ? { __provide: pl.definitions ?? null } : null));
+  let entry = typeof o.entry === 'function' ? await o.entry() : o.entry;
+  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+    const e = {};
+    for (const [k, item] of Object.entries(entry)) e[k] = typeof item === 'function' ? item() : item;
+    entry = e;
+  }
+  o.entry = entry;
+  return o;
+};
+const webpackPasses = async (config, isProduction) => {
+  const passes = typeof config === 'function' ? [false, true] : [isProduction];
+  const out = [];
+  for (const prod of passes) {
+    const mode = prod ? 'production' : 'development';
+    const resolved = typeof config === 'function' ? await config({ production: prod, mode }, { mode }) : config;
+    const configs = [];
+    for (const opts of [resolved].flat()) configs.push(await evalWebpackOpts(opts));
+    out.push({ production: prod, configs });
+  }
+  return out;
+};
 // the globals plugins define before loading their configs (setup)
 const setups = { nuxt: 'defineNuxtConfig', nitro: 'defineNitroConfig' };
 for (const r of reqs) {
@@ -99,6 +136,13 @@ for (const r of reqs) {
     if (g && !(g in globalThis)) Object.defineProperty(globalThis, g, { value: id => id, writable: true, configurable: true });
     let v = await settle(await load(r.file), 0);
     if (r.mode === 'vite') v = await viteConfigs(v);
+    if (r.mode === 'next' && typeof v === 'function') v = await v('phase-production-build', { defaultConfig: {} });
+    if (r.mode === 'webpack') v = await webpackPasses(v, r.args[0] === true);
+    if (r.mode === 'vue' && v && v.configureWebpack) {
+      const base = { mode: 'development', entry: {}, resolve: {}, plugins: [], module: { rules: [] } };
+      const cw = typeof v.configureWebpack === 'function' ? v.configureWebpack(base) : v.configureWebpack;
+      v = { ...v, configureWebpack: await webpackPasses(cw ?? base, r.args[0] === true) };
+    }
     if (r.mode === 'call') {
       const results = [];
       for (const a of r.args) results.push(typeof v === 'function' ? await settle(v(a), 0) : v);

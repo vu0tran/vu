@@ -17,6 +17,8 @@ import opts
 import report
 import yaml
 import loader
+import asth
+import toml
 import plugins
 import compilers
 import re
@@ -1288,7 +1290,7 @@ fn run_plugin(var p: Proj, fs: Fs, os: Os, key: Str):
 
 # the plugins whose config files vknip reads (resolveConfig)
 fn has_resolver(key: Str) -> Bool:
-  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt ".find(" " + key + " ") >= 0
+  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt swc wrangler msw tanstack-router drizzle svgr biome github-action nitro metro prisma react-native oclif next webpack vue ".find(" " + key + " ") >= 0
 
 fn js_ext(f: Str) -> Bool:
   let e = resolve.extname(f)
@@ -1296,8 +1298,11 @@ fn js_ext(f: Str) -> Bool:
 
 fn load_mode(key: Str) -> Str:
   if key == "vitest" or key == "vite": return "vite"
-  if key == "nuxt" or key == "nitro": return key + ""
+  if key == "nuxt" or key == "nitro" or key == "next" or key == "webpack" or key == "vue": return key + ""
   return "plain"
+
+fn load_args(p: Proj) -> Value:
+  return json.Arr([json.Flag(p.production)])
 
 fn dotted_get(v: Value, path: Str) -> Value:
   var cur = json.copy(v)
@@ -1326,18 +1331,22 @@ fn load_cfg(var p: Proj, fs: Fs, os: Os, key: Str, f: Str) -> Value:
   if ext == ".json" or ext == ".jsonc" or ext == ".json5":
     let text = fs.read(fspath(p, f)) else return json.Null
     return pkg.parse_jsonc(text)
+  if ext == ".toml":
+    let text = fs.read(fspath(p, f)) else return json.Null
+    return toml.parse(text)
   if ext == "":
     let text = fs.read(fspath(p, f)) else return json.Null
     return json.Text(text)
   if not js_ext(f): return json.Null
   let ck = load_mode(key) + ":" + fspath(p, f)
   if not (ck in p.js):
-    var reqs: [loader.Req] = [loader.Req(fspath(p, f), load_mode(key), json.Arr([]))]
+    var reqs: [loader.Req] = [loader.Req(fspath(p, f), load_mode(key), load_args(p))]
     let res = loader.load_all(fs, os, reqs, fspath(p, ""))
     let fk = fspath(p, f)
     p.js[ck] = json.copy(res[fk])
   let r = json.copy(p.js[ck])
   if json.has(r, "error"):
+    if key == "next": return json.Null
     p.config_errors = true
     eprint("ERROR: Error loading " + f + " (" + pkg.str_of(pkg.get(r, "error")) + ")")
     eprint("ERROR: Please fix or visit https://knip.dev/reference/known-issues")
@@ -1362,14 +1371,14 @@ fn prefetch(var p: Proj, fs: Fs, os: Os):
         let ck = load_mode(key) + ":" + fspath(p, f)
         if ck in seen or ck in p.js: continue
         seen[ck] = true
-        reqs.push(loader.Req(fspath(p, f), load_mode(key), json.Arr([])))
+        reqs.push(loader.Req(fspath(p, f), load_mode(key), load_args(p)))
   p.cur = saved
   if reqs.len == 0: return
   # (one process per mode)
-  for mode in ["plain", "vite", "nuxt", "nitro"]:
+  for mode in ["plain", "vite", "nuxt", "nitro", "next", "webpack", "vue"]:
     var rs: [loader.Req] = []
     for r in reqs:
-      if r.mode == mode: rs.push(loader.Req(r.file + "", r.mode + "", json.Arr([])))
+      if r.mode == mode: rs.push(loader.Req(r.file + "", r.mode + "", json.copy(r.args)))
     if rs.len == 0: continue
     let res = loader.load_all(fs, os, rs, fspath(p, ""))
     for r in rs: p.js[mode + ":" + r.file] = json.copy(res[r.file])
@@ -1399,9 +1408,11 @@ fn plugin_files(var p: Proj, fs: Fs, os: Os, key: Str, found: [Str]):
     let sk = key + "\0" + f
     if sk in p.ws[p.cur].config_seen: continue
     p.ws[p.cur].config_seen[sk] = true
-    if pl.resolve_config and has_resolver(key) and load_wanted(p, key, f):
+    if pl.resolve_config and has_resolver(key) and load_wanted(p, key, f) and not external_reexports_only(p, fs, f):
       let v = load_cfg(&p, fs, os, key, f)
+      let before = p.inputs.len
       if not is_null(v): resolve_config(&p, fs, os, key, f, v)
+      if (key == "prettier" or key == "oxlint" or key == "metro" or key == "webpack") and resolve.basename(f) != "package.json": filter_transitive(&p, fs, f, before)
     if pl.resolve_ast and js_ext(f): resolve_ast(&p, fs, key, f)
     config_entry(&p, f)
 
@@ -1446,11 +1457,43 @@ fn pending_configs(var p: Proj, fs: Fs, os: Os):
 
 # resolveFromAST: what some plugins read from the config file's syntax tree (without running it)
 fn ast_ported(key: Str) -> Bool:
-  return key == "tsdown" or key == "tsup" or key == "rollup" or key == "rolldown" or key == "rslib" or key == "esbuild" or key == "astro" or key == "starlight"
+  return key == "tsdown" or key == "tsup" or key == "rollup" or key == "rolldown" or key == "rslib" or key == "esbuild" or key == "astro" or key == "starlight" or key == "next" or key == "eslint" or key == "vite"
+
+# isExternalReExportsOnly: a config that only re-exports packages (export { default } from "pkg") isn't loaded
+fn external_reexports_only(p: Proj, fs: Fs, f: Str) -> Bool:
+  if not js_ext(f): return false
+  let src = fs.read(fspath(p, f)) else return false
+  if src.find("export") < 0: return false
+  let x = asth.parse_src(f, src)
+  var n_exp = 0
+  for st in asth.body(x):
+    let k = asth.kind(x, st)
+    if k == ast.N_IMPORT or k == ast.N_IMPORTEQ: return false
+    if k == ast.N_EXPORT:
+      let m = asth.str_value(x, x.t.nd[st].a)
+      if m == "\0" or is_internal_spec(m): return false
+      n_exp += 1
+    elif k == ast.N_EXPORTDEFAULT or k == ast.N_EXPORTASSIGN: return false
+    elif k == ast.N_VAR:
+      if x.t.nd[st].d > 0 and (x.t.nd[st].d & ast.M_EXPORT) != 0: return false
+    elif k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_ENUM or k == ast.N_MODULE:
+      if (x.t.nd[st].f & ast.M_EXPORT) != 0: return false
+    elif k == ast.N_INTERFACE or k == ast.N_TYPEALIAS:
+      if x.t.nd[st].d > 0 and (x.t.nd[st].d & ast.M_EXPORT) != 0: return false
+  return n_exp > 0
 
 fn resolve_ast(var p: Proj, fs: Fs, key: Str, f: Str):
   if not ast_ported(key): return
   let src = fs.read(fspath(p, f)) else return
+  if key == "next":
+    next_ast(&p, fs, f, asth.parse_src(f, src + ""))
+    return
+  if key == "eslint":
+    if resolve.basename(f).startswith("eslint.config."): eslint_flat_ast(&p, f, asth.parse_src(f, src + ""))
+    return
+  if key == "vite":
+    vite_babel_ast(&p, f, asth.parse_src(f, src + ""))
+    return
   if key == "astro":
     var src_dir = "src"
     let sd = extract.property_values(f, src + "", "srcDir")
@@ -1721,6 +1764,95 @@ fn resolve_config(var p: Proj, fs: Fs, os: Os, key: Str, f: Str, v: Value):
   elif key == "storybook": storybook_config(&p, f, v)
   elif key == "cypress": cypress_config(&p, f, v)
   elif key == "nuxt": nuxt_config(&p, fs, f, v)
+  elif key == "swc":
+    for item in cfg_list(v):
+      let exp = pkg.get(pkg.get(item, "jsc"), "experimental")
+      for pl in pkg.items(pkg.get(exp, "plugins")):
+        let xs = pkg.items(pl)
+        if xs.len > 0 and pkg.is_text(xs[0]) and pkg.str_of(xs[0]) != "": in_dep(&p, pkg.str_of(xs[0]), f, false)
+      if pkg.truthy(pkg.get(pkg.get(item, "jsc"), "externalHelpers")): in_dep(&p, "@swc/helpers", f, false)
+  elif key == "wrangler":
+    let m = pkg.get(v, "main")
+    if pkg.is_text(m) and pkg.str_of(m) != "": in_prod_entry(&p, pkg.str_of(m), f)
+  elif key == "msw":
+    var dir = "."
+    let wd = pkg.get(v, "workerDirectory")
+    if pkg.is_text(wd) and pkg.str_of(wd) != "": dir = pkg.str_of(wd)
+    elif is_arr(wd):
+      let xs = pkg.items(wd)
+      if xs.len > 0 and pkg.is_text(xs[0]): dir = pkg.str_of(xs[0])
+    in_entry(&p, resolve.join(dir, "mockServiceWorker.js"), f, false, false)
+  elif key == "tanstack-router":
+    var gr = "./src/routeTree.gen.ts"
+    if pkg.is_text(pkg.get(v, "generatedRouteTree")): gr = pkg.str_of(pkg.get(v, "generatedRouteTree"))
+    in_prod_entry(&p, to_abs(gr, pabs(cfg_dir)), f)
+    in_prod_entry(&p, "src/{{router,start,client,server}}.{{js,jsx,ts,tsx}}", f)
+  elif key == "drizzle":
+    let sch = pkg.get(v, "schema")
+    for x in arrayify(sch): in_prod_entry(&p, x, f)
+  elif key == "svgr":
+    for x in pkg.items(pkg.get(v, "plugins")):
+      if pkg.is_text(x): in_dep(&p, pkg.str_of(x), f, false)
+  elif key == "biome":
+    for x in arrayify(pkg.get(v, "extends")):
+      if x == "//": in_config(&p, "biome", "/biome", f, "")
+      else: in_config(&p, "biome", x, f, "")
+  elif key == "github-action":
+    let b = resolve.basename(f)
+    let runs = pkg.get(v, "runs")
+    if (b == "action.yml" or b == "action.yaml") and pkg.str_of(pkg.get(runs, "using")).startswith("node"):
+      var seen: [Str] = []
+      for k in ["pre", "main", "post"]:
+        let sv = pkg.get(runs, k)
+        if not pkg.is_text(sv): continue
+        let rel = resolve.join(cfg_dir, pkg.str_of(sv))
+        var r = rel + ""
+        if wdir != "" and r.startswith(wdir + "/"): r = r[wdir.len + 1..r.len]
+        if opts.has(seen, r): continue
+        seen.push(r + "")
+        if r.startswith("dist/") or r.startswith("build/"):
+          var i = scripts.inp(I_PROJECT, "!" + r)
+          i.file = f + ""
+          p.inputs.push(i)
+        else: in_entry(&p, r, f, false, false)
+  elif key == "nitro":
+    var src = "."
+    if pkg.is_text(pkg.get(v, "srcDir")): src = pkg.str_of(pkg.get(v, "srcDir"))
+    for id in pkg.items(pkg.get(v, "modules")):
+      if is_arr(id):
+        let xs = pkg.items(id)
+        if xs.len > 0 and pkg.is_text(xs[0]): in_dep(&p, pkg.str_of(xs[0]), f, false)
+      elif pkg.is_text(id): in_dep(&p, pkg.str_of(id), f, false)
+    in_prod_entry(&p, ".nitro/types/*.d.ts", f)
+    var se = "server.{{js,mjs,ts}}"
+    if pkg.is_text(pkg.get(v, "serverEntry")): se = pkg.str_of(pkg.get(v, "serverEntry"))
+    var api = "api"
+    if pkg.is_text(pkg.get(v, "apiDir")): api = pkg.str_of(pkg.get(v, "apiDir"))
+    var routes = "routes"
+    if pkg.is_text(pkg.get(v, "routesDir")): routes = pkg.str_of(pkg.get(v, "routesDir"))
+    for x in [se, resolve.join(api, "**/*.ts"), resolve.join(routes, "**/*.ts"), "middleware/**/*.ts", "plugins/**/*.ts"]: in_prod_entry(&p, resolve.join(src, x), f)
+  elif key == "metro": metro_config(&p, f, v)
+  elif key == "prisma":
+    var seed = pkg.get(v, "seed")
+    if not pkg.truthy(seed): seed = pkg.get(pkg.get(v, "migrations"), "seed")
+    if pkg.is_text(seed) and pkg.str_of(seed) != "": add_script_inputs(&p, [pkg.str_of(seed)], f, false, "", false)
+    let sch = pkg.get(v, "schema")
+    if pkg.is_text(sch) and pkg.str_of(sch) != "": prisma_schema(&p, fs, pkg.str_of(sch), f)
+  elif key == "react-native":
+    for n in pkg.keys(pkg.get(v, "dependencies")): in_dep(&p, n, f, false)
+    for pl in pkg.values(pkg.get(v, "platforms")):
+      let np = pkg.str_of(pkg.get(pl, "npmPackageName"))
+      if np != "": in_dep(&p, np, f, false)
+  elif key == "oclif":
+    if is_null(v): return
+    in_prod_entry(&p, "{{,src/}}commands/**/*.{{js,mjs,cjs,jsx,ts,tsx,mts,cts}}", f)
+    for x in pkg.items(pkg.get(v, "plugins")):
+      if pkg.is_text(x): in_dep(&p, pkg.str_of(x), f, false)
+    for x in pkg.items(pkg.get(v, "devPlugins")):
+      if pkg.is_text(x): in_dep(&p, pkg.str_of(x), f, false)
+  elif key == "next": next_config(&p, fs, f, v)
+  elif key == "webpack": webpack_config(&p, f, v)
+  elif key == "vue": vue_config(&p, f, v)
   elif key == "remark" or key == "mdxlint":
     for pl in pkg.items(pkg.get(v, "plugins")):
       var id = pkg.str_of(pl)
@@ -1842,8 +1974,9 @@ fn nuxt_config(var p: Proj, fs: Fs, f: Str, v: Value):
     if not pkg.is_text(av): continue
     let prefix = nuxt_resolve_alias(pkg.str_of(av), src_dir, cwd)
     in_alias(&p, key, [prefix], wabs)
+    # (isDirectory of a relative prefix reads it from the working folder: the project's)
     var is_dir = prefix.endswith("/")
-    if not is_dir and prefix.startswith("/"): is_dir = exists_dir(p, fs, arel(prefix))
+    if not is_dir: is_dir = exists_dir(p, fs, arel(prefix))
     if is_dir: in_alias(&p, resolve.join(key, "*"), [ajoin(prefix, "*")], cwd)
   # layers
   let ext = pkg.get(v, "extends")
@@ -5350,3 +5483,370 @@ fn catalog_ref_loc(ms: Str, name: Str, cat: Str) -> [Int]:
       return [line, pos - ls + 1, pos]
     at = ms.find(prop, at + prop.len)
   return []
+
+# ---- more resolveConfig ports (plugins/<name>/index.js)
+
+fn metro_config(var p: Proj, f: Str, v: Value):
+  var plats: [Str] = ["ios", "android", "windows", "web", "native", "default"]
+  for x in pkg.items(pkg.get(pkg.get(v, "resolver"), "platforms")):
+    if pkg.truthy(x): plats.push(pkg.str_of(x))
+  var exts: [Str] = ["js", "jsx", "json", "ts", "tsx"]
+  let se = pkg.get(pkg.get(v, "resolver"), "sourceExts")
+  if not is_null(se): exts = arrayify(se)
+  let pattern = "src/**/*.{{" + ",".join(plats) + "}}.{{" + ",".join(exts) + "}}"
+  let pr = pkg.str_of(pkg.get(v, "projectRoot"))
+  if pr == "": in_prod_entry(&p, pattern, f)
+  else:
+    in_prod_entry(&p, cjoin_spec(pr, "index.{{js,jsx,ts,tsx}}"), f)
+    in_prod_entry(&p, cjoin_spec(pr, pattern), f)
+  var ids: [Str] = []
+  let tp = pkg.str_of(pkg.get(v, "transformerPath"))
+  if tp != "": ids.push(tp)
+  let tr = pkg.get(v, "transformer")
+  for x in pkg.strs(pkg.get(tr, "assetPlugins")): ids.push(x + "")
+  for k in ["minifierPath", "babelTransformerPath"]:
+    let x = pkg.str_of(pkg.get(tr, k))
+    if x != "": ids.push(x)
+  for id in ids: in_defer(&p, id, f, "", id == "metro-transform-worker" or id == "metro-minify-terser")
+
+# join(dir, x) for an input specifier: "/x" stays project-relative
+fn cjoin_spec(dir: Str, x: Str) -> Str:
+  if dir.startswith("/"): return ajoin(dir, x)
+  return resolve.join(dir, x)
+
+fn prisma_schema(var p: Proj, fs: Fs, path: Str, f: Str):
+  let wd = p.ws[p.cur].dir + ""
+  if exists_dir(p, fs, cjoin(wd, path)): in_entry(&p, cjoin_spec(path, "**/*.prisma"), f, false, false)
+  else: in_entry(&p, path, f, false, false)
+
+# ---- Next.js
+
+fn next_router_prefix(p: Proj, fs: Fs, dir: Str, name: Str) -> Str:
+  if exists_dir(p, fs, resolve.join(dir, name)): return ""
+  if exists_dir(p, fs, resolve.join(dir, "src/" + name)): return "src/"
+  return "{{,src/}}"
+
+fn next_inputs(var p: Proj, fs: Fs, f: Str, page_exts: [Str], loaders: [Str], targets: [Str]):
+  let dir = resolve.dirname(f)
+  var exts = sc(page_exts)
+  if exts.len == 0: exts = ["{{js,jsx,ts,tsx}}"]
+  var ext = exts[0] + ""
+  if exts.len > 1: ext = "{{" + ",".join(exts) + "}}"
+  let app = next_router_prefix(p, fs, dir, "app")
+  let pages = next_router_prefix(p, fs, dir, "pages")
+  var pats: [Str] = []
+  for x in ["app/{{,[(]*[)]/}}{{manifest,robots}}.{{js,ts}}", "app/**/sitemap.{{js,ts}}", "app/**/{{icon,apple-icon,opengraph-image,twitter-image}}.{{js,jsx,ts,tsx}}"]: pats.push(app + x)
+  pats.push("{{,src/}}{{instrumentation,instrumentation-client,middleware,proxy}}." + ext)
+  pats.push(app + "app/global-{{error,not-found}}." + ext)
+  pats.push(app + "app/**/{{default,error,forbidden,loading,not-found,unauthorized}}." + ext)
+  pats.push(app + "app/**/{{layout,page,route,template}}." + ext)
+  pats.push(pages + "pages/**/*." + ext)
+  pats.push("next-env.d.ts")
+  for x in pats: in_prod_entry(&p, "/" + resolve.join(dir, x), f)
+  for l in loaders: add_defer(&p, l, f)
+  for t in targets:
+    var i = scripts.inp(I_DEFER, t)
+    i.file = f + ""
+    i.dir = dir_of_input(dir)
+    i.production = true
+    p.inputs.push(i)
+
+fn next_add(var xs: [Str], v: Value):
+  if pkg.is_text(v):
+    let s = pkg.str_of(v)
+    if not resolve.in_node_modules(s): add_uniq(&xs, s)
+
+fn next_loaders(v: Value, var out: [Str]):
+  if is_arr(v):
+    for x in pkg.items(v): next_loaders(x, &out)
+  elif pkg.is_obj(v):
+    next_add(&out, pkg.get(v, "loader"))
+    next_loaders(pkg.get(v, "loaders"), &out)
+  else: next_add(&out, v)
+
+fn next_targets(v: Value, var out: [Str]):
+  if is_arr(v):
+    for x in pkg.items(v): next_targets(x, &out)
+  elif pkg.is_obj(v): next_targets(pkg.get(v, "browser"), &out)
+  else: next_add(&out, v)
+
+fn next_config(var p: Proj, fs: Fs, f: Str, v: Value):
+  var exts: [Str] = []
+  for x in pkg.items(pkg.get(v, "pageExtensions")):
+    if pkg.is_text(x): exts.push(pkg.str_of(x))
+  var loaders: [Str] = []
+  let tp = pkg.get(v, "turbopack")
+  for r in pkg.values(pkg.get(tp, "rules")): next_loaders(r, &loaders)
+  var targets: [Str] = []
+  for t in pkg.values(pkg.get(tp, "resolveAlias")): next_targets(t, &targets)
+  next_inputs(&p, fs, f, exts, loaders, targets)
+
+fn next_ast(var p: Proj, fs: Fs, f: Str, x: asth.Tree):
+  var exts: [Str] = []
+  var loaders: [Str] = []
+  var targets: [Str] = []
+  for o in asth.nodes_of(x, ast.N_OBJECT):
+    for e in asth.property_values(x, o, "pageExtensions"): add_uniq(&exts, e)
+    let tp = asth.find_prop(x, o, "turbopack")
+    if asth.kind(x, tp) == ast.N_COND:
+      next_ast_aliases(x, x.t.nd[tp].b, &targets)
+      next_ast_aliases(x, x.t.nd[tp].c, &targets)
+    else: next_ast_aliases(x, tp, &targets)
+    let rules = asth.find_prop(x, tp, "rules")
+    if asth.kind(x, rules) != ast.N_OBJECT: continue
+    for r in asth.props(x, rules):
+      if asth.kind(x, r) == ast.N_PROPASSIGN: next_ast_loaders(x, x.t.nd[r].b, &loaders)
+  next_inputs(&p, fs, f, exts, loaders, targets)
+
+fn next_ast_targets(x: asth.Tree, n: Int, var out: [Str]):
+  let s = asth.str_value(x, n)
+  if s != "\0" and s != "": add_uniq(&out, s)
+  elif asth.kind(x, n) == ast.N_ARRAY:
+    for e in asth.elements(x, n): next_ast_targets(x, e, &out)
+  elif asth.kind(x, n) == ast.N_OBJECT: next_ast_targets(x, asth.find_prop(x, n, "browser"), &out)
+
+fn next_ast_aliases(x: asth.Tree, tp: Int, var out: [Str]):
+  let al = asth.find_prop(x, tp, "resolveAlias")
+  if asth.kind(x, al) != ast.N_OBJECT: return
+  for a in asth.props(x, al):
+    if asth.kind(x, a) == ast.N_PROPASSIGN: next_ast_targets(x, x.t.nd[a].b, &out)
+
+fn next_ast_loaders(x: asth.Tree, n: Int, var out: [Str]):
+  if asth.kind(x, n) == ast.N_ARRAY:
+    for e in asth.elements(x, n): next_ast_loaders(x, e, &out)
+    return
+  var l = asth.str_value(x, n)
+  if l == "\0": l = asth.str_value(x, asth.find_prop(x, n, "loader"))
+  if l != "\0" and l != "": add_uniq(&out, l)
+  let nested = asth.find_prop(x, n, "loaders")
+  if asth.kind(x, nested) == ast.N_ARRAY: next_ast_loaders(x, nested, &out)
+
+# ---- webpack (plugins/webpack findWebpackDependenciesFromConfig; the loader called the functions)
+
+fn webpack_config(var p: Proj, f: Str, v: Value):
+  webpack_passes(&p, f, v)
+  in_dep(&p, "webpack-cli", f, true)
+  let ext = resolve.extname(f)
+  if ext == ".ts":
+    for l in ["ts-node", "sucrase", "@babel/register", "esbuild-register", "@swc/register"]: in_dep(&p, l, f, true)
+  elif ext == ".cts": in_dep(&p, "ts-node", f, true)
+
+fn webpack_passes(var p: Proj, f: Str, passes: Value):
+  let wdir = p.ws[p.cur].dir + ""
+  let cfg_dir = resolve.dirname(f)
+  for pass in pkg.items(passes):
+    let prod = pkg.truthy(pkg.get(pass, "production"))
+    for opts_ in pkg.items(pkg.get(pass, "configs")):
+      for rule in pkg.items(pkg.get(pkg.get(opts_, "module"), "rules")):
+        for l in webpack_rule_deps(rule):
+          var id = l + ""
+          let q = id.find("?")
+          if q >= 0: id = id[0..q]
+          add_defer(&p, id, f)
+      for pl in pkg.items(pkg.get(opts_, "plugins")):
+        for d in pkg.values(pkg.get(pl, "__provide")):
+          var spec = pkg.str_of(d)
+          if is_arr(d):
+            let xs = pkg.items(d)
+            if xs.len > 0: spec = pkg.str_of(xs[0])
+          if spec != "": add_defer(&p, spec, f)
+      var entries: [Str] = []
+      let e = pkg.get(opts_, "entry")
+      if pkg.is_text(e): entries.push(pkg.str_of(e))
+      elif is_arr(e): entries = arrayify(e)
+      elif pkg.is_obj(e):
+        for item in pkg.values(e):
+          if pkg.is_text(item): entries.push(pkg.str_of(item))
+          elif is_arr(item):
+            for y in arrayify(item): entries.push(y + "")
+          elif pkg.is_obj(item) and json.has(item, "import"):
+            for y in arrayify(pkg.get(item, "import")): entries.push(y + "")
+      let ctx = pkg.str_of(pkg.get(opts_, "context"))
+      if entries.len == 0 and ctx != "": entries.push("./src/index")
+      for en in entries:
+        if is_internal_spec(en) or en.startswith("#"):
+          var dir = wdir + ""
+          if ctx != "": dir = arel(ctx)
+          var i = scripts.inp(I_DEFER_ENTRY, en)
+          i.file = f + ""
+          i.dir = dir_of_input(dir)
+          i.skip_exports = true
+          i.production = prod
+          p.inputs.push(i)
+        else: add_defer(&p, en, f)
+      for which in ["resolve", "resolveLoader"]:
+        let al = pkg.get(pkg.get(opts_, which), "alias")
+        for key in pkg.keys(al):
+          let av = pkg.get(al, key)
+          if not pkg.truthy(av): continue
+          let prefixes = arrayify(av)
+          if key.endswith("$"): in_alias(&p, key[0..key.len - 1], prefixes, pabs(wdir))
+          else:
+            if key.len > 1: in_alias(&p, key, prefixes, pabs(wdir))
+            for pre in prefixes: in_alias(&p, add_star(key), [add_star(pre)], pabs(cfg_dir))
+
+fn webpack_babel_opts(u: Value) -> Bool:
+  return pkg.is_obj(u) and pkg.str_of(pkg.get(u, "loader")) == "babel-loader" and pkg.is_obj(pkg.get(u, "options"))
+
+fn webpack_rule_deps(rule: Value) -> [Str]:
+  var out: [Str] = []
+  if not pkg.is_obj(rule): return out
+  let use = pkg.get(rule, "use")
+  if pkg.is_text(use): return [pkg.str_of(use)]
+  var item = json.copy(use)
+  if is_null(item): item = json.copy(pkg.get(rule, "loader"))
+  if is_null(item): item = json.copy(rule)
+  if pkg.is_text(item) and webpack_babel_opts(rule):
+    out.push(pkg.str_of(item))
+    for d in babel_specs(pkg.get(rule, "options")): out.push(d)
+    return out
+  if pkg.is_text(item) and pkg.str_of(item) != "" and pkg.truthy(pkg.get(rule, "options")) and is_null(use):
+    var m: {Str: Value} = {}
+    m["loader"] = json.copy(item)
+    m["options"] = json.copy(pkg.get(rule, "options"))
+    item = json.Obj(m)
+  for it in cfg_list(item):
+    if not pkg.truthy(it): continue
+    if webpack_babel_opts(it):
+      for d in webpack_use_item(it): out.push(d)
+      for d in babel_specs(pkg.get(it, "options")): out.push(d)
+      continue
+    if pkg.is_obj(it) and json.has(it, "oneOf"):
+      for r in pkg.items(pkg.get(it, "oneOf")):
+        for d in webpack_rule_deps(r): out.push(d)
+      continue
+    for d in webpack_use_item(it): out.push(d)
+  return out
+
+fn webpack_use_item(u: Value) -> [Str]:
+  if pkg.is_text(u): return [pkg.str_of(u)]
+  let l = pkg.get(u, "loader")
+  if not pkg.is_text(l): return []
+  var out: [Str] = [pkg.str_of(l)]
+  let ls = pkg.str_of(l)
+  if pkg.is_obj(pkg.get(u, "options")) and (ls == "builtin:swc-loader" or ls.endswith("/swc-loader") or ls == "swc-loader"):
+    for pl in pkg.items(pkg.get(pkg.get(pkg.get(pkg.get(u, "options"), "jsc"), "experimental"), "plugins")):
+      if pkg.is_text(pl): out.push(pkg.str_of(pl))
+      elif is_arr(pl):
+        let xs = pkg.items(pl)
+        if xs.len > 0 and pkg.is_text(xs[0]): out.push(pkg.str_of(xs[0]))
+  return out
+
+# getDependenciesFromConfig(...).map(d => d.specifier)
+fn babel_specs(v: Value) -> [Str]:
+  var out: [Str] = []
+  for x in babel_names(pkg.get(v, "presets"), "preset"): out.push(x + "")
+  let pls = babel_names(pkg.get(v, "plugins"), "plugin")
+  for x in pls: out.push(x + "")
+  if opts.has(pls, "@babel/plugin-transform-runtime"): out.push("@babel/runtime")
+  for e in pkg.values(pkg.get(v, "env")):
+    for x in babel_specs(e): out.push(x)
+  for o in cfg_list(pkg.get(v, "overrides")):
+    if pkg.is_obj(o):
+      for x in babel_specs(o): out.push(x)
+  return out
+
+fn vue_config(var p: Proj, f: Str, v: Value):
+  let cw = pkg.get(v, "configureWebpack")
+  if not is_null(cw) and is_arr(cw): webpack_passes(&p, f, cw)
+  var lint = false
+  for _, sv in p.ws[p.cur].scripts:
+    if script_word_seq(sv, "vue-cli-service", "lint"): lint = true
+  if lint: in_dep(&p, "@vue/cli-plugin-eslint", f, false)
+
+# ---- resolveFromAST ports
+
+# eslint flat configs: getInputsFromFlatConfigAST
+fn eslint_flat_ast(var p: Proj, f: Str, x: asth.Tree):
+  for o in asth.nodes_of(x, ast.N_OBJECT):
+    let st = asth.find_prop(x, o, "settings")
+    if asth.kind(x, st) == ast.N_OBJECT:
+      for pr in asth.props(x, st):
+        if asth.kind(x, pr) != ast.N_PROPASSIGN and asth.kind(x, pr) != ast.N_SHORTHAND: continue
+        let k = asth.prop_key(x, pr)
+        var kind_ = ""
+        if k == "import/resolver" or k == "import-x/resolver" or k == "import-x/resolver-legacy": kind_ = "resolver"
+        elif k == "import/parsers" or k == "import-x/parsers": kind_ = "parsers"
+        if kind_ != "": eslint_ast_resolvers(&p, f, x, kind_, asth.prop_value(x, pr))
+    let parser = asth.find_prop(x, asth.find_prop(x, o, "parserOptions"), "parser")
+    if asth.kind(x, parser) == ast.N_OBJECT:
+      var is_parser = false
+      for pr in asth.props(x, parser):
+        if asth.kind(x, pr) == ast.N_SPREAD: is_parser = true
+        let k = asth.prop_key(x, pr)
+        if k == "parse" or k == "parseForESLint": is_parser = true
+      if is_parser: continue
+      for pr in asth.props(x, parser):
+        if asth.kind(x, pr) == ast.N_PROPASSIGN:
+          let s = asth.str_value(x, x.t.nd[pr].b)
+          if s != "\0" and s != "": in_defer(&p, s, f, "", s == "espree")
+    else:
+      let s = asth.str_value(x, parser)
+      if s != "\0" and s != "": in_defer(&p, s, f, "", s == "espree")
+  in_defer(&p, "eslint-import-resolver-typescript", f, "", true)
+
+fn eslint_ast_resolvers(var p: Proj, f: Str, x: asth.Tree, kind_: Str, n: Int):
+  let k = asth.kind(x, n)
+  if k == ast.N_ARRAY:
+    for e in asth.elements(x, n): eslint_ast_resolvers(&p, f, x, kind_, e)
+  elif k == ast.N_OBJECT:
+    if kind_ == "resolver" and asth.find_prop(x, n, "name") >= 0 and asth.find_prop(x, n, "resolver") >= 0: return
+    for pr in asth.props(x, n):
+      if asth.is_property(x, pr): eslint_ast_resolver(&p, f, kind_, asth.prop_key(x, pr))
+  else: eslint_ast_resolver(&p, f, kind_, asth.str_value(x, n))
+
+fn eslint_ast_resolver(var p: Proj, f: Str, kind_: Str, r: Str):
+  if r == "\0" or r == "" or r == "node" or is_internal_spec(r): return
+  var dep = r + ""
+  if kind_ == "resolver": dep = "eslint-import-resolver-" + r
+  in_defer(&p, dep, f, "", true)
+
+# vite: the babel options of @vitejs/plugin-react and other babel-wrapping plugins (getBabelInputs)
+fn vite_babel_ast(var p: Proj, f: Str, x: asth.Tree):
+  for c in asth.find_imported_calls(x, ["@rolldown/plugin-babel", "@vitejs/plugin-react", "vite-plugin-babel"], true):
+    let o = asth.arg0(x, c)
+    var pls: [Value] = []
+    var pres: [Value] = []
+    for cfg in [o, asth.find_prop(x, o, "babel"), asth.find_prop(x, o, "babelConfig")]:
+      for s in asth.string_values(x, asth.find_prop(x, cfg, "plugins")): pls.push(json.Text(s))
+      for s in asth.string_values(x, asth.find_prop(x, cfg, "presets")): pres.push(json.Text(s))
+    var m: {Str: Value} = {}
+    m["plugins"] = json.Arr(pls)
+    m["presets"] = json.Arr(pres)
+    babel_deps(&p, json.Obj(m), f)
+
+# filterTransitiveDependencies: a dependency the config file (or the local files it names) doesn't
+# mention as a string is optional
+fn filter_transitive(var p: Proj, fs: Fs, f: Str, from: Int):
+  var lits: [Str] = []
+  var seen: [Str] = []
+  collect_literals(p, fs, f, &lits, &seen)
+  for k in from..p.inputs.len:
+    let kd = p.inputs[k].kind
+    if p.inputs[k].optional or not (kd == I_DEP or kd == I_DEFER): continue
+    let name = pkg_from_spec(p.inputs[k].spec)
+    if name != "" and not opts.has(lits, name): p.inputs[k].optional = true
+
+fn collect_literals(p: Proj, fs: Fs, f: Str, var lits: [Str], var seen: [Str]):
+  if opts.has(seen, f): return
+  seen.push(f + "")
+  let src = fs.read(fspath(p, f)) else return
+  if src == "": return
+  var found: [Str] = []
+  let ext = resolve.extname(f)
+  if ext == ".json" or ext == ".jsonc" or ext == ".json5": json_strings(pkg.parse_jsonc(src), &found)
+  else:
+    let x = asth.parse_src(f, src)
+    found = asth.string_literals(x)
+  for l in found:
+    add_uniq(&lits, l)
+    if is_internal_spec(l): collect_literals(p, fs, resolve.join(resolve.dirname(f), l), &lits, &seen)
+
+fn json_strings(v: Value, var out: [Str]):
+  match v:
+    Text(s): add_uniq(&out, s)
+    Arr(xs):
+      for x in xs: json_strings(x, &out)
+    Obj(m):
+      for _, x in m: json_strings(x, &out)
+    _: return

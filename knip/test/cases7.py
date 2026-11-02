@@ -1,0 +1,108 @@
+# Generated projects for the plugins whose resolveConfig / resolveFromAST / resolve were ported in
+# the third round (knip3): Next.js, webpack, Nuxt, the flat ESLint config's AST, Vite's babel
+# options, and the smaller ones; each with a used and an unused file or dependency.
+import json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cases3 import pkg, mod
+
+CASES = {}
+
+def case(name, files, args=None):
+    files = dict(files)
+    if args: files["__args__"] = args
+    CASES[name] = files
+
+def mods(*names):
+    out = {}
+    for n in names: out.update(mod(n))
+    return out
+
+PROD = [[], ["--production"]]
+
+case("p7_next_basic", {
+    "package.json": pkg(deps=["next", "react"], dev=["@svgr/webpack", "unused-dev"]), **mods("next", "react", "@svgr/webpack", "unused-dev"),
+    "next.config.js": "module.exports = { pageExtensions: ['page.tsx', 'ts'], turbopack: { rules: { '*.svg': { loaders: ['@svgr/webpack'], as: '*.js' } }, resolveAlias: { underscore: './src/lodash-shim.ts' } } };\n",
+    "app/layout.page.tsx": "export default function L() { return null }\n", "app/page.page.tsx": "import { a } from '../lib/a';\nexport default function P() { return a }\n",
+    "app/api/route.ts": "export const GET = 1;\n", "lib/a.ts": "export const a = 1;\nexport const b = 2;\n", "lib/orphan.ts": "export {};\n",
+    "src/lodash-shim.ts": "export const x = 1;\n", "middleware.ts": "export function middleware() {}\n", "pages/old.tsx": "export {};\n",
+}, PROD)
+case("p7_next_fn_src", {
+    "package.json": pkg(deps=["next"]), **mods("next"),
+    "next.config.mjs": "export default (phase, { defaultConfig }) => ({ pageExtensions: phase === 'phase-production-build' ? ['tsx'] : ['jsx'] });\n",
+    "src/app/page.tsx": "export default function P() { return null }\n", "src/app/x.jsx": "export {};\n", "src/pages/index.tsx": "export {};\n",
+})
+case("p7_next_load_error", {
+    "package.json": pkg(deps=["next", "nonexistent-pkg"]), **mods("next"),
+    "next.config.ts": "import x from 'nonexistent-pkg';\nexport default { pageExtensions: ['tsx'], turbopack: { resolveAlias: { a: { browser: './shim.ts' } } }, x };\n",
+    "app/page.tsx": "export default 1;\n", "shim.ts": "export {};\n", "app/z.ts": "export {};\n",
+})
+case("p7_webpack", {
+    "package.json": pkg(dev=["webpack", "webpack-cli", "babel-loader", "@babel/preset-env", "css-loader", "style-loader", "ts-loader", "lodash", "unused-dev", "ts-node"]),
+    **mods("webpack", "webpack-cli", "babel-loader", "@babel/preset-env", "css-loader", "style-loader", "ts-loader", "lodash", "unused-dev", "ts-node"),
+    "webpack.config.js": "const path = require('path');\nmodule.exports = (env, argv) => ({\n  entry: { main: './src/main.js', admin: ['./src/admin.js'] },\n  module: { rules: [\n    { test: /\\.js$/, use: { loader: 'babel-loader', options: { presets: ['@babel/preset-env'] } } },\n    { test: /\\.css$/, use: ['style-loader', 'css-loader?modules'] },\n    { test: /\\.ts$/, loader: 'ts-loader' },\n  ] },\n  resolve: { alias: { '@lib': path.resolve(__dirname, 'src/lib') } },\n});\n",
+    "src/main.js": "import { x } from '@lib/x';\nconsole.log(x);\n", "src/admin.js": "", "src/lib/x.js": "export const x = 1;\nexport const y = 2;\n", "src/orphan.js": "",
+}, PROD)
+case("p7_webpack_ts_context", {
+    "package.json": pkg(dev=["webpack", "ts-node"]), **mods("webpack", "ts-node"),
+    "webpack.config.ts": "import * as path from 'path';\nexport default { context: path.resolve(__dirname, 'app') };\n",
+    "app/src/index.ts": "export {};\n", "app/other.ts": "export {};\n",
+})
+case("p7_nuxt", {
+    "package.json": pkg(deps=["nuxt", "@nuxt/ui", "vue"], dev=["unused-dev"]), **mods("nuxt", "@nuxt/ui", "vue", "unused-dev"),
+    "nuxt.config.ts": "export default defineNuxtConfig({ modules: ['@nuxt/ui', './modules/local'], css: ['~/assets/main.css'], alias: { '@utils': './utils' } });\n",
+    "app/app.vue": "<script setup lang=\"ts\">\nimport { u } from '@utils/u';\nconsole.log(u);\n</script>\n<template><div/></template>\n",
+    "app/pages/index.vue": "<template><div/></template>\n", "app/assets/main.css": "", "modules/local.ts": "export default {};\n",
+    "utils/u.ts": "export const u = 1;\nexport const v = 2;\n", "utils/orphan.ts": "export {};\n", "server/api/hello.ts": "export default 1;\n",
+    "shared/s.ts": "export const s = 1;\n", "components/C.vue": "<template><div/></template>\n",
+}, PROD)
+case("p7_eslint_flat", {
+    "package.json": pkg(dev=["eslint", "eslint-import-resolver-typescript", "eslint-import-resolver-webpack", "@typescript-eslint/parser", "unused-dev"]),
+    **mods("eslint", "eslint-import-resolver-typescript", "eslint-import-resolver-webpack", "@typescript-eslint/parser", "unused-dev"),
+    "eslint.config.js": "export default [{ settings: { 'import/resolver': { webpack: {}, node: {} } }, languageOptions: { parserOptions: { parser: '@typescript-eslint/parser' } } }];\n",
+    "index.js": "",
+})
+case("p7_vite_babel", {
+    "package.json": pkg(dev=["vite", "@vitejs/plugin-react", "babel-plugin-styled-components", "@babel/preset-flow", "unused-dev"]),
+    **mods("vite", "@vitejs/plugin-react", "babel-plugin-styled-components", "@babel/preset-flow", "unused-dev"),
+    "vite.config.ts": "import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\nexport default defineConfig({ plugins: [react({ babel: { plugins: ['babel-plugin-styled-components'], presets: [['@babel/preset-flow', {}]] } })] });\n",
+    "index.html": "<script type=\"module\" src=\"./src/main.ts\"></script>\n", "src/main.ts": "export {};\n",
+})
+case("p7_small", {
+    "package.json": pkg(deps=["@tanstack/react-router", "drizzle-orm", "react-native", "my-rn-lib", "oclif", "@oclif/plugin-help", "msw"], dev=["@swc/core", "@swc/plugin-emotion", "@swc/helpers", "drizzle-kit", "wrangler", "@svgr/cli", "@svgr/plugin-jsx", "unused-dev"], extra={"msw": {"workerDirectory": ["public"]}, "oclif": {"plugins": ["@oclif/plugin-help"]}}),
+    **mods("@tanstack/react-router", "drizzle-orm", "react-native", "my-rn-lib", "oclif", "@oclif/plugin-help", "msw", "@swc/core", "@swc/plugin-emotion", "@swc/helpers", "drizzle-kit", "wrangler", "@svgr/cli", "@svgr/plugin-jsx", "unused-dev"),
+    ".swcrc": json.dumps({"jsc": {"experimental": {"plugins": [["@swc/plugin-emotion", {}]]}, "externalHelpers": True}}),
+    "tsr.config.json": json.dumps({"generatedRouteTree": "./src/gen/routes.ts"}),
+    "src/gen/routes.ts": "export {};\n", "src/router.tsx": "export {};\n",
+    "drizzle.config.ts": "export default { schema: './db/schema.ts' };\n", "db/schema.ts": "export const t = 1;\n", "db/orphan.ts": "export {};\n",
+    "wrangler.toml": "name = \"w\"\nmain = \"worker/index.ts\"\n[vars]\nA = \"1\"\n", "worker/index.ts": "export default {};\n",
+    ".svgrrc": json.dumps({"plugins": ["@svgr/plugin-jsx"]}),
+    "react-native.config.js": "module.exports = { dependencies: { 'my-rn-lib': {} } };\n",
+    "public/mockServiceWorker.js": "", "commands/hello.ts": "export default 1;\n",
+}, PROD)
+case("p7_prisma_metro", {
+    "package.json": pkg(deps=["prisma", "@prisma/client", "metro", "react-native-svg-transformer", "unused-dep"], dev=["tsx"]), **mods("prisma", "@prisma/client", "metro", "react-native-svg-transformer", "unused-dep", "tsx"),
+    "prisma.config.ts": "export default { schema: 'db', migrations: { seed: 'tsx db/seed.ts' } };\n",
+    "db/a.prisma": "generator client { provider = \"prisma-client-js\" }\n", "db/seed.ts": "export {};\n",
+    "metro.config.js": "module.exports = { transformer: { babelTransformerPath: require.resolve('react-native-svg-transformer') }, resolver: { sourceExts: ['ts', 'svg'] } };\n",
+    "src/app.ios.ts": "export {};\n", "src/app.ts": "export {};\n",
+})
+case("p7_biome_nitro_icons", {
+    "package.json": pkg(deps=["nitropack", "unplugin-icons"], dev=["@biomejs/biome", "@iconify-json/mdi", "biome-shared"]), **mods("nitropack", "unplugin-icons", "@biomejs/biome", "@iconify-json/mdi", "biome-shared"),
+    "biome.json": json.dumps({"extends": ["biome-shared/biome.json"]}),
+    "nitro.config.ts": "export default defineNitroConfig({ srcDir: 'server', routesDir: 'r' });\n",
+    "server/r/a.ts": "import '#nitro-internal-virtual/x';\nimport Icon from '~icons/mdi/home';\nexport default Icon;\n", "server/api/b.ts": "export default 1;\n", "server/x.ts": "export {};\n",
+})
+case("p7_external_reexport", {
+    "package.json": pkg(dev=["prettier", "@acme/prettier-config", "prettier-plugin-x"]), **mods("prettier", "@acme/prettier-config", "prettier-plugin-x"),
+    "prettier.config.mjs": "export { default } from '@acme/prettier-config';\n",
+    "node_modules/@acme/prettier-config/index.js": "module.exports = { plugins: ['prettier-plugin-x'] };\n",
+})
+case("p7_prettier_transitive", {
+    "package.json": pkg(dev=["prettier", "@acme/prettier-config", "prettier-plugin-x", "prettier-plugin-y"]), **mods("prettier", "@acme/prettier-config", "prettier-plugin-x", "prettier-plugin-y"),
+    "prettier.config.mjs": "import base from '@acme/prettier-config';\nexport default { ...base, plugins: [...base.plugins, 'prettier-plugin-y'] };\n",
+    "node_modules/@acme/prettier-config/index.js": "module.exports = { plugins: ['prettier-plugin-x'] };\n",
+})
+case("p7_github_action", {
+    "package.json": pkg(), "action.yml": "name: a\nruns:\n  using: node20\n  main: dist/index.js\n  pre: src/pre.js\n",
+    "src/pre.js": "", "src/index.ts": "export {};\n", "src/orphan.ts": "export {};\n",
+})
