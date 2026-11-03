@@ -277,7 +277,84 @@ class DummyEleventyConfig {
 }
 // the globals plugins define before loading their configs (setup)
 const setups = { nuxt: 'defineNuxtConfig', nitro: 'defineNitroConfig' };
+// plugins/_vue/auto-import getVueSfc and collectTemplateInfo (template expressions kept as text)
+const vueSfcInfo = (root, files) => {
+  let sfc = null;
+  try { sfc = createRequire(path.join(path.resolve(cwd, root), 'package.json'))('vue/compiler-sfc'); } catch {}
+  const res = [];
+  for (const f of files) {
+    if (!sfc) { res.push(null); continue; }
+    try {
+      const abs = path.resolve(cwd, f);
+      const source = fs.readFileSync(abs, 'utf8');
+      let descriptor, compileTemplate = null;
+      if (typeof sfc.parseComponent === 'function') {
+        descriptor = sfc.parse({ source, filename: abs, sourceMap: false });
+        compileTemplate = (src, isTS, preprocessLang) => sfc.compileTemplate({ source: src, filename: abs, sourceMap: false, isProduction: true, prettify: false, isTS, preprocessLang });
+      } else descriptor = sfc.parse(source, { filename: abs, sourceMap: false }).descriptor;
+      const scripts = [];
+      if (descriptor.script?.content) scripts.push(descriptor.script.content);
+      if (descriptor.scriptSetup?.content) scripts.push(descriptor.scriptSetup.content);
+      const template = descriptor.template;
+      const isTS = ['ts', 'tsx'].includes(descriptor.script?.lang) || ['ts', 'tsx'].includes(descriptor.scriptSetup?.lang);
+      const compiled = template && !template.ast && compileTemplate ? compileTemplate(template.content, isTS, template.lang) : undefined;
+      const ast = template?.ast ?? compiled?.ast;
+      let tags = null;
+      const exprs = [];
+      if (ast) {
+        const t = new Set();
+        const visited = new Set();
+        const visit = node => {
+          if (!node || visited.has(node)) return;
+          visited.add(node);
+          if (node.tag) t.add(node.tag);
+          if (node.type === 5 && node.content && !node.content.isStatic) exprs.push(node.content.content);
+          if (node.props) for (const prop of node.props) if (prop.type === 7) {
+            if (prop.exp && !prop.exp.isStatic) exprs.push(prop.exp.content);
+            if (prop.arg && !prop.arg.isStatic) exprs.push(prop.arg.content);
+          }
+          if (node.children) for (const c of node.children) visit(c);
+          if (node.ifConditions) for (const c of node.ifConditions) visit(c.block);
+          if (node.scopedSlots) for (const n in node.scopedSlots) visit(node.scopedSlots[n]);
+        };
+        visit(ast);
+        tags = [...t];
+      }
+      res.push({ scripts, tags, exprs: exprs.map(String), code: compiled?.code ? String(compiled.code) : null });
+    } catch (e) {
+      res.push({ error: (e && e.message ? e.message : String(e)).split('\n')[0] });
+    }
+  }
+  return res;
+};
+// the configuration's compilers (normalizeCompilers), each file compiled with its extension's
+const customCompile = async (config, files) => {
+  if (typeof config === 'function') config = await config();
+  const compilers = new Map();
+  for (const ext in config?.compilers ?? {}) { const fn = config.compilers[ext]; if (typeof fn === 'function') compilers.set(ext.replace(/^\.*/, '.'), fn); }
+  for (const ext in config?.asyncCompilers ?? {}) compilers.set(ext.replace(/^\.*/, '.'), config.asyncCompilers[ext]);
+  const res = [];
+  for (const [ext, f] of files) {
+    const abs = path.resolve(cwd, f);
+    try {
+      const text = fs.readFileSync(abs, 'utf8');
+      let result = compilers.get(ext)(text, abs);
+      if (result !== null && (typeof result === 'object' || typeof result === 'function')) result = await result;
+      if (typeof result !== 'string') { res.push({ config: `Compiler for ${ext} returned ${result === null ? 'null' : typeof result} for ${abs}; expected a string or PromiseLike<string>` }); continue; }
+      res.push({ ok: result });
+    } catch (e) {
+      res.push({ error: `Compiler for ${ext} failed (${abs})`, reason: e && e.message !== undefined ? String(e.message) : String(e) });
+    }
+  }
+  return res;
+};
 for (const r of reqs) {
+  if (r.mode === 'vue-sfc') { out[r.file] = { ok: vueSfcInfo(r.file, r.args) }; continue; }
+  if (r.mode === 'compile') {
+    try { out[r.file] = { ok: await customCompile(await load(r.file), r.args) }; }
+    catch (e) { out[r.file] = { error: (e && e.message ? e.message : String(e)).split('\n')[0] }; }
+    continue;
+  }
   try {
     const g = setups[r.mode];
     if (g && !(g in globalThis)) Object.defineProperty(globalThis, g, { value: id => id, writable: true, configurable: true });

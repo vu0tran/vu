@@ -23,6 +23,7 @@ import plugins
 import compilers
 import re
 import varlock
+import autoimp
 from json import Value
 from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY, I_CATALOG
 from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC
@@ -114,16 +115,21 @@ type Ws:
   src_dir: Str               # tsconfig source mapping (outDir -> srcDir); "" none when out_dir is ""
   out_dir: Str
   has_srcmap: Bool
+  smaps: [Str]               # source maps (resolveSourceMap, tsconfig): src, out pairs, longest out first
+  tsc_file: Bool             # has a tsconfig.json
+  tsc_src: [Str]             # the files it includes that aren't declaration files
+  tsc_cpats: [Str]           # (--use-tsconfig-files) the compilers' files' patterns
   tsc_types: [Str]
   dts_entries: [Str]
   config_files: {Str: Bool}  # plugin config files seen
   config_seen: {Str: Bool}   # config files a plugin has read
   cexts: [Str]               # the extensions of its compilers
+  comp: {Str: Str}           # extension -> its compiler (compilers.vu's name; "fn": the configuration's)
 
 fn new_ws(name: Str) -> Ws:
   var dir = name + ""
   if name == ".": dir = ""
-  return Ws(name + "", dir, "", json.Null, "", resolve.join(dir, "package.json"), false, [], [], [], [], {}, {}, {}, false, {}, [], {}, {}, {}, [], {}, [], {}, [], json.Null, [], [], [], [], false, json.Flag(false), true, [], [], [], [], "", "", false, [], [], {}, {}, [])
+  return Ws(name + "", dir, "", json.Null, "", resolve.join(dir, "package.json"), false, [], [], [], [], {}, {}, {}, false, {}, [], {}, {}, {}, [], {}, [], {}, [], json.Null, [], [], [], [], false, json.Flag(false), true, [], [], [], [], "", "", false, [], false, [], [], [], [], {}, {}, [], {})
 
 type Proj:
   root: Str                  # prefix for the file system ("" or "dir/")
@@ -187,6 +193,9 @@ type Proj:
   git_remotes: [Str]         # (railway: git config remote urls of the project)
   catalog_used: {Str: Bool}  # catalog entries ("catalog:package") inputs refer to (pnpm dlx x@catalog:)
   abs_root: Str              # the project folder as an absolute path (for specifiers knip shows absolute)
+  comp_default: {Str: Str}   # extension -> the compiler first registered for it
+  amaps: {Str: AutoMaps}     # auto-import maps ("r:" + package folder, "n:" + Nuxt workspace)
+  tsc_mode: Bool             # --use-tsconfig-files
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -748,7 +757,15 @@ fn load_tsconfig(var p: Proj, fs: Fs):
   if "rootDirs" in co:
     let rds = pkg.strs(co["rootDirs"])
     if rds.len > 0: p.rs.rootdirs.push(resolve.RootDirs(dir + "", rds))
-  # source mapping: outDir -> rootDir, else src (when it exists), else the folder
+  # source mapping: the plugins' (resolveSourceMap), then outDir -> rootDir, else src (when it
+  # exists), else the folder
+  p.ws[w].smaps = []
+  if "sveltejs-package" in p.ws[w].plugins:
+    for pr in svelte_package_maps(p.ws[w]):
+      if not smap_seen(p.ws[w].smaps, pr[0], pr[1]):
+        p.ws[w].smaps.push(pr[0] + "")
+        p.ws[w].smaps.push(pr[1] + "")
+        p.rs.srcmaps.push(resolve.SrcMap(dir + "", pr[0] + "", pr[1] + ""))
   if "outDir" in co:
     let out = pkg.str_of(co["outDir"])
     var src = dir + ""
@@ -758,10 +775,54 @@ fn load_tsconfig(var p: Proj, fs: Fs):
     p.ws[w].out_dir = out + ""
     p.ws[w].src_dir = src + ""
     p.ws[w].has_srcmap = true
-    p.rs.srcmaps.push(resolve.SrcMap(dir + "", src + "", out + ""))
+    if not smap_seen(p.ws[w].smaps, src, out):
+      p.ws[w].smaps.push(src + "")
+      p.ws[w].smaps.push(out + "")
+      p.rs.srcmaps.push(resolve.SrcMap(dir + "", src + "", out + ""))
   elif "rootDir" in co or true:
     # (knip maps with srcDir = outDir = the source folder: nothing to rewrite)
     p.ws[w].has_srcmap = false
+  p.ws[w].smaps = sort_smaps(p.ws[w].smaps)
+  # the files the tsconfig.json includes (fileNames): declaration files are entry files; with
+  # --use-tsconfig-files the others are the project's files (and the references below it add theirs)
+  var names = tsc_expand(p, fs, file, co, top)
+  if p.tsc_mode:
+    var visited: {Str: Bool} = {}
+    visited[file] = true
+    for f in tsc_ref_names(&p, fs, file, &visited): names.push(f)
+  var dts: [Str] = []
+  var srcs: [Str] = []
+  for f in names:
+    if is_dts(f): dts.push(f + "")
+    else: srcs.push(f + "")
+  p.ws[w].dts_entries = dts
+  p.ws[w].tsc_file = true
+  p.ws[w].tsc_src = srcs
+  if p.tsc_mode and p.ws[w].cexts.len > 0:
+    # the compilers' files under the include patterns' folders (picomatch.scan base)
+    var ext_part = ""
+    if p.ws[w].cexts.len == 1: ext_part = p.ws[w].cexts[0] + ""
+    else:
+      var xs: [Str] = []
+      for e in p.ws[w].cexts: xs.push(e[1..e.len])
+      ext_part = ".{{" + ",".join(xs) + "}}"
+    let tdir = resolve.dirname(file)
+    var pats: [Str] = []
+    if "include" in top:
+      var idir = tdir + ""
+      if "\0includedir" in top: idir = pkg.str_of(top["\0includedir"])
+      for x in pkg.strs(top["include"]):
+        let pat = resolve.join(resolve.join(idir, scan_base(rel_pattern(x))), "**/*" + ext_part)
+        if not opts.has(pats, pat): pats.push(pat)
+    else: pats.push(resolve.join(dir, "**/*" + ext_part))
+    if "exclude" in top:
+      var edir = tdir + ""
+      if "\0excludedir" in top: edir = pkg.str_of(top["\0excludedir"])
+      for x in pkg.strs(top["exclude"]): pats.push("!" + resolve.join(edir, rel_pattern(x)))
+    p.ws[w].tsc_cpats = pats
+
+# expandFileNames: "files", then what "include" matches minus "exclude", node_modules and outDir
+fn tsc_expand(p: Proj, fs: Fs, file: Str, co: {Str: Value}, top: {Str: Value}) -> [Str]:
   var include: [Str] = ["**/*"]
   let tdir = resolve.dirname(file)
   var files: [Str] = []
@@ -782,17 +843,63 @@ fn load_tsconfig(var p: Proj, fs: Fs):
   if "\0filesdir" in top: fdir = pkg.str_of(top["\0filesdir"])
   if "\0includedir" in top: idir = pkg.str_of(top["\0includedir"])
   if "\0excludedir" in top: edir = pkg.str_of(top["\0excludedir"])
-  var dts: [Str] = []
-  for f in files:
-    if is_dts(f): dts.push(resolve.join(fdir, f))
+  var out: [Str] = []
+  for f in files: out.push(resolve.join(fdir, f))
   if include.len > 0:
     var pats: [Str] = []
     for x in include: pats.push(resolve.join(idir, x))
     for x in exclude: pats.push("!" + resolve.join(edir, x))
-    if p.ws[w].out_dir != "": pats.push("!" + p.ws[w].out_dir + "/**")
+    if "outDir" in co:
+      let od = pkg.str_of(co["outDir"])
+      if od != "": pats.push("!" + od + "/**")
     for f in glob_fs(p, fs, pats):
-      if is_dts(f): dts.push(f)
-  p.ws[w].dts_entries = dts
+      if is_dts(f) or tsc_relevant(f): out.push(f)
+  return out
+
+fn tsc_relevant(f: Str) -> Bool:
+  let e = resolve.extname(f)
+  return e == ".ts" or e == ".tsx" or e == ".mts" or e == ".cts" or e == ".js" or e == ".jsx" or e == ".mjs" or e == ".cjs"
+
+# loadTSConfig with isUseTscFiles: the file names of the references at or below the config's folder
+fn tsc_ref_names(var p: Proj, fs: Fs, file: Str, var visited: {Str: Bool}) -> [Str]:
+  var out: [Str] = []
+  let v = pkg.read_json(fs, fspath(p, file))
+  let dir = resolve.dirname(file)
+  for r in pkg.items(pkg.get(v, "references")):
+    let rp = pkg.str_of(pkg.get(r, "path"))
+    if rp == "": continue
+    var ref = resolve.join(dir, rp)
+    if not exists_file(p, fs, ref):
+      ref = resolve.join(ref, "tsconfig.json")
+      if not exists_file(p, fs, ref): continue
+    if ref.startswith("../") or (dir != "" and not ref.startswith(dir + "/")): continue
+    if ref in visited: continue
+    visited[ref] = true
+    var co: {Str: Value} = {}
+    var top: {Str: Value} = {}
+    tsconfig_chain(&p, fs, ref, &co, &top, 0)
+    for f in tsc_expand(p, fs, ref, co, top): out.push(f)
+    for f in tsc_ref_names(&p, fs, ref, &visited): out.push(f)
+  return out
+
+# picomatch.scan(pattern).base: the folders before the first glob segment (the pattern when it has none)
+fn scan_base(pat: Str) -> Str:
+  var s = pat + ""
+  if s.startswith("./"): s = s[2..s.len]
+  let segs = s.split("/")
+  var out: [Str] = []
+  var glob_seen = false
+  for g in segs:
+    var is_g = false
+    for k in 0..g.len:
+      let c = g[k]
+      if c == '*' or c == '?' or c == '[' or c == '{' or c == '(' or (c == '!' and k == 0) or ((c == '+' or c == '@') and k + 1 < g.len and g[k + 1] == '('): is_g = true
+    if is_g:
+      glob_seen = true
+      break
+    out.push(g + "")
+  if not glob_seen: return s
+  return "/".join(out)
 
 fn add_path_map(var p: Proj, key: Str, vals: [Str], scope: Str):
   let st = key.find("*")
@@ -933,17 +1040,65 @@ fn expand_wildcards(s: Str) -> Str:
   if b >= 0: t = t[0..b] + "/**/" + t[b + 3..t.len]
   return t
 
-# dist/x.js -> src/x.{exts} (a workspace's tsconfig outDir), on a project-relative pattern
+# dist/x.js -> src/x.{exts} (the workspace's source maps, the longest outDir first), on a
+# project-relative pattern
 fn source_map_pattern(w: Ws, spec: Str) -> Str:
-  if not w.has_srcmap or w.out_dir == w.src_dir: return spec + ""
   var s = resolve.norm(spec)
-  if s != w.out_dir and not s.startswith(w.out_dir + "/"): return spec + ""
-  var rest = s[w.out_dir.len..s.len]
-  let ext_at = js_ext_at(rest)
-  if ext_at >= 0: rest = rest[0..ext_at] + ".{{" + EXTS_GLOB + "}}"
-  let src = w.src_dir
-  if src == "": return resolve.norm(rest)
-  return src + rest
+  var q = 0
+  while q + 1 < w.smaps.len:
+    let src = w.smaps[q] + ""
+    let out = w.smaps[q + 1] + ""
+    q += 2
+    if src == out: continue
+    if s != out and not s.startswith(out + "/"): continue
+    var rest = s[out.len..s.len]
+    let ext_at = js_ext_at(rest)
+    if ext_at >= 0: rest = rest[0..ext_at] + ".{{" + EXTS_GLOB + "}}"
+    if src == "": return resolve.norm(rest)
+    return src + rest
+  return spec + ""
+
+fn smap_seen(xs: [Str], src: Str, out: Str) -> Bool:
+  var q = 0
+  while q + 1 < xs.len:
+    if xs[q] == src and xs[q + 1] == out: return true
+    q += 2
+  return false
+
+# (stable, by outDir length, longest first)
+fn sort_smaps(xs: [Str]) -> [Str]:
+  var ix: [Int] = []
+  var q = 0
+  while q + 1 < xs.len:
+    ix.push(q)
+    q += 2
+  ix.sort(by: fn(a, b) => xs[a + 1].len > xs[b + 1].len or (xs[a + 1].len == xs[b + 1].len and a < b))
+  var out: [Str] = []
+  for i in ix:
+    out.push(xs[i] + "")
+    out.push(xs[i + 1] + "")
+  return out
+
+# plugins/sveltejs-package resolveSourceMap: svelte-package -i/-o in the scripts (src/lib -> dist)
+fn svelte_package_maps(w: Ws) -> [[Str]]:
+  var ios: [[Str]] = []
+  for k in w.script_keys:
+    let v = w.scripts[k] + ""
+    if v.find("svelte-package") < 0: continue
+    for c in scripts.parse_script(v):
+      if not c.has_name or c.name.value != "svelte-package": continue
+      let pa = scripts.parse_args(scripts.values_of(c.args), scripts.ArgSpec(["i", "o", "input", "output"], [], ["i", "input", "o", "output"], false))
+      var input = "src/lib"
+      var output = "dist"
+      let iv = scripts.opt_vals(pa, "input")
+      let ov = scripts.opt_vals(pa, "output")
+      if iv.len > 0: input = iv[0] + ""
+      if ov.len > 0: output = ov[0] + ""
+      ios.push([input, output])
+  if ios.len == 0: ios.push(["src/lib", "dist"])
+  var out: [[Str]] = []
+  for io in ios: out.push([resolve.join(w.dir, io[0]), resolve.join(w.dir, io[1])])
+  return out
 
 fn js_ext_at(s: Str) -> Int:
   for e in [".d.ts", ".d.mts", ".d.cts", ".d.tsx", ".mjs", ".cjs", ".mts", ".cts", ".jsx", ".tsx", ".js", ".ts"]:
@@ -5117,17 +5272,28 @@ fn acc(b: Build, path: Str) -> Bool:
 type Job:
   idx: Int
   path: Str
+  comp: Str
+  pre: Str
 
 type Done:
   idx: Int
   raw: Raw
 
-fn read_file(fs: Fs, root: Str, path: Str, var kw: {Str: Int}, var t: ast.Ast, tags: [Str]) -> Raw:
+# comp: the file's compiler ("" none; "=": pre is the compiled text)
+fn read_file(fs: Fs, root: Str, path: Str, comp: Str, pre: Str, var kw: {Str: Int}, var t: ast.Ast, tags: [Str]) -> Raw:
+  if comp == "=":
+    var r = extract.analyze_t(path + ".ts", pre, &kw, &t, tags)
+    r.path = path + ""
+    return r
   let src = fs.read(root + path) else return empty_raw(path)
-  if not accepted_ext(path):
+  if comp != "":
     # a compiled file: the JavaScript its compiler gives, read as TypeScript
-    let js = compilers.compile(resolve.extname(path), src)
+    let js = compilers.compile(comp, src)
     var r = extract.analyze_t(path + ".ts", js, &kw, &t, tags)
+    r.path = path + ""
+    return r
+  if not accepted_ext(path):
+    var r = extract.analyze_t(path + ".ts", "", &kw, &t, tags)
     r.path = path + ""
     return r
   return extract.analyze_t(path, src, &kw, &t, tags)
@@ -5137,17 +5303,17 @@ fn worker(fs: Fs, own root: Str, own tags: [Str], own jobs: Chan[Job], own res: 
   var t = ast.new_ast()
   while true:
     let j = jobs.recv() else return
-    res.send(Done(j.idx, read_file(fs, root, j.path, &kw, &t, tags)))
+    res.send(Done(j.idx, read_file(fs, root, j.path, j.comp, j.pre, &kw, &t, tags)))
 
 # Reads a batch of files (on all cores when there are several).
-fn read_batch(fs: Fs, root: Str, paths: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str]) -> [Raw]:
+fn read_batch(fs: Fs, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str]) -> [Raw]:
   var out: [Raw] = []
   if jobs_n <= 1 or paths.len < 8:
-    for p in paths: out.push(read_file(fs, root, p, &kw, &t, tags))
+    for i in 0..paths.len: out.push(read_file(fs, root, paths[i], comps[i], pres[i], &kw, &t, tags))
     return out
   let jc: Chan[Job] = chan(paths.len + 1)
   let rc: Chan[Done] = chan(paths.len + 1)
-  for i in 0..paths.len: jc.send(Job(i, paths[i] + ""))
+  for i in 0..paths.len: jc.send(Job(i, paths[i] + "", comps[i] + "", pres[i] + ""))
   jc.close()
   var n = jobs_n
   if n > paths.len: n = paths.len
@@ -6254,51 +6420,393 @@ fn ignored_ws_for(p: Proj, name: Str) -> [Str]:
     if x != name and (name == "." or x.startswith(name)): out.push(x + "")
   return out
 
-# The compilers of a workspace (getIncludedCompilers, the plugins' registerCompilers): the built-in
-# ones whose package is a dependency (that package is then referenced), then the plugins'.
-fn register_compilers(var p: Proj, wi: Int):
-  var exts: [Str] = []
-  var refs: [Str] = []
-  let builtins = [[".mdx", "@mdx-js/esbuild @mdx-js/loader @mdx-js/mdx @mdx-js/node-loader @mdx-js/preact @mdx-js/react @mdx-js/rollup @mdx-js/vue remark-mdx"], [".sass .scss", "sass sass-embedded node-sass"]]
+# The compilers of a workspace (getIncludedCompilers, the plugins' registerCompilers): the
+# configuration's functions, the built-in ones the configuration turns on or whose package is a
+# dependency (each such package is then referenced), then the plugins' (the first for an extension
+# wins). A file is compiled by the compiler of its workspace, else by the first one registered.
+fn register_compilers(var p: Proj, fs: Fs, wi: Int):
+  var comp: {Str: Str} = {}
+  var order: [Str] = []
+  var raw: {Str: Str} = {}
+  for sect in ["compilers", "asyncCompilers"]:
+    let cv = pkg.get(p.cfg, sect)
+    for k in pkg.keys(cv):
+      var ext = k + ""
+      while ext.startswith("."): ext = ext[1..ext.len]
+      ext = "." + ext
+      let v = pkg.get(cv, k)
+      if loader.is_fn(v): raw[ext] = "fn"
+      elif is_true(v): raw[ext] = "true"
+      elif sect == "asyncCompilers": raw[ext] = "off"
+  for k in sc(map_keys(raw)):
+    if raw[k] == "fn": comp_set(&comp, &order, k, "fn", true)
+  let builtins = [[".mdx", "@mdx-js/esbuild @mdx-js/loader @mdx-js/mdx @mdx-js/node-loader @mdx-js/preact @mdx-js/react @mdx-js/rollup @mdx-js/vue remark-mdx", "mdx"], [".sass .scss", "sass sass-embedded node-sass", "scss"], [".less", "less", "less"], [".styl .stylus", "stylus", "stylus"], [".tsrx", "@tsrx/core @tsrx/react @tsrx/preact @tsrx/vue @tsrx/solid @tsrx/ripple", "tsrx"]]
   for bl in builtins:
     var hit = false
     for d in bl[1].split(" "):
       if has_dep(p.ws[wi], d):
         hit = true
-        refs.push(d + "")
-    if hit:
-      for e in bl[0].split(" "): add_uniq(&exts, e)
-  var plugin_exts: [[Str]] = []
-  if not plugin_cfg_off(p.ws[wi], "astro"):
-    if has_dep(p.ws[wi], "astro"): plugin_exts.push([".astro"])
-    if has_dep(p.ws[wi], "@astrojs/mdx") or has_dep(p.ws[wi], "@astrojs/starlight"): plugin_exts.push([".mdx"])
-  if not plugin_cfg_off(p.ws[wi], "prisma") and has_dep(p.ws[wi], "prisma"): plugin_exts.push([".prisma"])
-  if not plugin_cfg_off(p.ws[wi], "storybook") and (has_dep(p.ws[wi], "@storybook/addon-docs") or has_dep(p.ws[wi], "@storybook/addon-essentials")): plugin_exts.push([".mdx"])
-  if not plugin_cfg_off(p.ws[wi], "svelte") and has_dep(p.ws[wi], "svelte"): plugin_exts.push([".svelte"])
-  if not plugin_cfg_off(p.ws[wi], "stencil") and has_dep(p.ws[wi], "@stencil/core") and has_dep(p.ws[wi], "@stencil/sass"):
-    plugin_exts.push([".scss"])
-    plugin_exts.push([".sass"])
-  if not plugin_cfg_off(p.ws[wi], "tailwind"):
+        reference(&p, wi, d)
+    for e in bl[0].split(" "):
+      var ex = ""
+      if e in raw: ex = raw[e] + ""
+      if ex == "true" or (ex == "" and hit): comp_set(&comp, &order, e, bl[2], true)
+  if not early_cfg_off(p, wi, "astro"):
+    if hd(p, wi, "astro"): comp_set(&comp, &order, ".astro", "astro", false)
+    if hd(p, wi, "@astrojs/mdx") or hd(p, wi, "@astrojs/starlight"): comp_set(&comp, &order, ".mdx", "astro-mdx", false)
+  if not early_cfg_off(p, wi, "fumadocs") and hd(p, wi, "fumadocs-mdx"): comp_set(&comp, &order, ".mdx", "mdx", false)
+  if not early_cfg_off(p, wi, "nuxt") and (hd(p, wi, "nuxt") or hd(p, wi, "nuxt-nightly") or exists_dir(p, fs, resolve.join(p.ws[wi].dir, ".nuxt"))):
+    comp_set(&comp, &order, ".vue", "nuxt-vue:{wi}", false)
+    comp_set(&comp, &order, ".ts", "nuxt-ts:{wi}", false)
+  if not early_cfg_off(p, wi, "prisma") and hd(p, wi, "prisma"): comp_set(&comp, &order, ".prisma", "prisma", false)
+  if not early_cfg_off(p, wi, "qwik") and hd(p, wi, "@builder.io/qwik-city"): comp_set(&comp, &order, ".mdx", "mdx", false)
+  if not early_cfg_off(p, wi, "stencil") and hd(p, wi, "@stencil/sass"):
+    comp_set(&comp, &order, ".scss", "scss", false)
+    comp_set(&comp, &order, ".sass", "scss", false)
+  if not early_cfg_off(p, wi, "storybook") and (hd(p, wi, "@storybook/addon-docs") or hd(p, wi, "@storybook/addon-essentials")): comp_set(&comp, &order, ".mdx", "mdx", false)
+  if not early_cfg_off(p, wi, "svelte") and hd(p, wi, "svelte"): comp_set(&comp, &order, ".svelte", "svelte", false)
+  if not early_cfg_off(p, wi, "tailwind"):
     for d in ["tailwindcss", "@tailwindcss/vite", "@tailwindcss/webpack", "@tailwindcss/postcss", "@tailwindcss/cli"]:
-      if has_dep(p.ws[wi], d):
-        plugin_exts.push([".css"])
+      if hd(p, wi, d):
+        comp_set(&comp, &order, ".css", "tailwind", false)
         break
-  if not plugin_cfg_off(p.ws[wi], "vue"):
+  if not early_cfg_off(p, wi, "unplugin-auto-import") and hd(p, wi, "unplugin-auto-import"):
+    comp_set(&comp, &order, ".vue", "vue-auto", false)
+    comp_set(&comp, &order, ".ts", "ts-auto", false)
+  if not early_cfg_off(p, wi, "unplugin-vue-components") and hd(p, wi, "unplugin-vue-components"): comp_set(&comp, &order, ".vue", "vue-auto", false)
+  if not early_cfg_off(p, wi, "unplugin-vue-markdown") and hd(p, wi, "unplugin-vue-markdown"): comp_set(&comp, &order, ".md", "md-auto", false)
+  if not early_cfg_off(p, wi, "vue"):
     for d in ["vue", "nuxt", "unplugin-vue", "@vitejs/plugin-vue"]:
-      if has_dep(p.ws[wi], d):
-        plugin_exts.push([".vue"])
+      if hd(p, wi, d):
+        comp_set(&comp, &order, ".vue", "vue-auto", false)
         break
-  if not plugin_cfg_off(p.ws[wi], "nuxt") and (has_dep(p.ws[wi], "nuxt") or has_dep(p.ws[wi], "nuxt-nightly")): plugin_exts.push([".vue"])
-  for pe in plugin_exts: add_uniq(&exts, pe[0])
-  for r in refs: reference(&p, wi, r)
-  p.ws[wi].cexts = exts
+  for e in order:
+    if not (e in p.comp_default): p.comp_default[e] = comp[e] + ""
+  p.ws[wi].cexts = order
+  p.ws[wi].comp = comp
+
+fn hd(p: Proj, wi: Int, d: Str) -> Bool:
+  return has_dep(p.ws[wi], d)
+
+fn is_true(v: Value) -> Bool:
+  match v:
+    Flag(b): return b
+    _: return false
+
+fn map_keys(m: {Str: Str}) -> [Str]:
+  var out: [Str] = []
+  for k in m: out.push(k + "")
+  return out
+
+# (compilers.set / registerCompiler: a plugin's doesn't replace one already there)
+fn comp_set(var comp: {Str: Str}, var order: [Str], ext: Str, id: Str, replace: Bool):
+  if ext in comp:
+    if replace: comp[ext] = id + ""
+    return
+  comp[ext] = id + ""
+  order.push(ext + "")
+
+# a plugin turned off in the configuration, before the workspace's settings are applied
+fn early_cfg_off(p: Proj, wi: Int, key: Str) -> Bool:
+  let wc = ws_config(p, p.ws[wi].name)
+  var v = pkg.get(p.cfg, key)
+  if json.has(wc, key): v = pkg.get(wc, key)
+  match v:
+    Flag(b): return not b
+    _: return false
+
+# the compiler of a file: its workspace's for the extension, else the first registered ("" none)
+fn comp_for(p: Proj, path: Str) -> Str:
+  let ext = resolve.extname(path)
+  if not (ext in p.comp_default): return ""
+  let wi = ws_of(p, path)
+  if wi >= 0 and ext in p.ws[wi].comp: return p.ws[wi].comp[ext] + ""
+  return p.comp_default[ext] + ""
+
+# Compilers that need more than the file's text, run before a wave is read: the configuration's
+# functions (through Node.js), and the auto-import compilers (the generated declaration files'
+# maps, and the project's vue/compiler-sfc through Node.js). A compiled file gets comp "=" and its
+# JavaScript in pres; a TypeScript file the auto-import compiler leaves as it is gets comp "".
+fn precompile(var p: Proj, fs: Fs, os: Os, paths: [Str], var comps: [Str], var pres: [Str]):
+  var fn_ix: [Int] = []
+  var sfc_ix: [Int] = []
+  var sfc_key: [Str] = []
+  for k in 0..paths.len:
+    let c = comps[k] + ""
+    if c == "fn":
+      fn_ix.push(k)
+      continue
+    if not (c == "vue-auto" or c == "ts-auto" or c == "md-auto" or c.startswith("nuxt-")): continue
+    let key = auto_maps_key(&p, fs, c, paths[k])
+    let empty = key == "" or maps_empty(p.amaps[key])
+    if c == "ts-auto" or c.startswith("nuxt-ts"):
+      comps[k] = ""
+      if empty or paths[k].endswith(".d.ts") or paths[k].endswith(".config.ts"): continue
+      let src = fs.read(fspath(p, paths[k])) else ""
+      let js = auto_ts(p, paths[k], src, p.amaps[key])
+      if js != "\0":
+        comps[k] = "="
+        pres[k] = js
+    elif c == "md-auto":
+      let src = fs.read(fspath(p, paths[k])) else ""
+      comps[k] = "="
+      if empty: pres[k] = compilers.script_bodies(autoimp.md_strip(src))
+      else: pres[k] = auto_md(p, paths[k], src, p.amaps[key])
+    elif empty: comps[k] = "vue"
+    else:
+      sfc_ix.push(k)
+      sfc_key.push(key)
+  if sfc_ix.len > 0:
+    # (one Node.js run: the files of each package folder with its vue/compiler-sfc)
+    var roots: [Str] = []
+    var reqs: [loader.Req] = []
+    for q in 0..sfc_ix.len:
+      let root = auto_root(p, fs, paths[sfc_ix[q]])
+      if not opts.has(roots, root): roots.push(root + "")
+    for root in roots:
+      var files: [Value] = []
+      for q in 0..sfc_ix.len:
+        if auto_root(p, fs, paths[sfc_ix[q]]) == root: files.push(json.Text(fspath(p, paths[sfc_ix[q]])))
+      reqs.push(loader.Req(fspath(p, root), "vue-sfc", json.Arr(files)))
+    let res = loader.load_all(fs, os, reqs, fspath(p, ""))
+    var seen: {Str: Int} = {}
+    for q in 0..sfc_ix.len:
+      let k = sfc_ix[q]
+      let root = fspath(p, auto_root(p, fs, paths[k]))
+      var n = 0
+      if root in seen: n = seen[root]
+      seen[root] = n + 1
+      var info = json.Null
+      if root in res:
+        let arr = pkg.items(pkg.get(res[root], "ok"))
+        if n < arr.len: info = json.copy(arr[n])
+      if json.has(info, "error"):
+        let ad = abs_dir(&p, os)
+        compiler_failed(".vue", paths[k], pkg.str_of(pkg.get(info, "error")), ad)
+      let src = fs.read(fspath(p, paths[k])) else ""
+      comps[k] = "="
+      pres[k] = auto_vue(p, paths[k], src, p.amaps[sfc_key[q]], info)
+  if fn_ix.len > 0:
+    var args: [Value] = []
+    for k in fn_ix: args.push(json.Arr([json.Text(resolve.extname(paths[k])), json.Text(fspath(p, paths[k]))]))
+    let cf = fspath(p, p.config_file)
+    let res = loader.load_all(fs, os, [loader.Req(cf, "compile", json.Arr(args))], fspath(p, ""))
+    var r = json.Null
+    if cf in res: r = json.copy(res[cf])
+    if json.has(r, "error"):
+      eprint("ERROR: Error loading " + p.config_file + " (" + pkg.str_of(pkg.get(r, "error")) + ")")
+      exit(2)
+    let outs = pkg.items(pkg.get(r, "ok"))
+    for q in 0..fn_ix.len:
+      let k = fn_ix[q]
+      var o = json.Null
+      if q < outs.len: o = json.copy(outs[q])
+      if json.has(o, "config"): config_error(pkg.str_of(pkg.get(o, "config")))
+      if json.has(o, "error"):
+        eprint("ERROR: " + pkg.str_of(pkg.get(o, "error")))
+        eprint("Reason: " + pkg.str_of(pkg.get(o, "reason")))
+        exit(2)
+      comps[k] = "="
+      pres[k] = pkg.str_of(pkg.get(o, "ok"))
+
+
+# the project folder as the OS has it (computed once)
+fn abs_dir(var p: Proj, os: Os) -> Str:
+  if p.abs_root == "":
+    var d = fspath(p, "")
+    if d == "": d = "."
+    let out = os.output(["sh", "-c", "cd \"$1\" && pwd -P", "sh", d]) else ""
+    p.abs_root = out.strip()
+  return p.abs_root + ""
+
+fn debug_compiled(p: Proj, paths: [Str], comps: [Str], pres: [Str]):
+  if not p.debug: return
+  for k in 0..paths.len:
+    if comps[k] == "=": eprint("compiled " + paths[k] + ":\n" + pres[k])
+
+fn compiler_failed(ext: Str, path: Str, reason: Str, abs: Str):
+  eprint("ERROR: Compiler for " + ext + " failed (" + abs + "/" + path + ")")
+  eprint("Reason: " + reason)
+  exit(2)
+
+type AutoMaps:
+  inames: [Str]
+  ispecs: [Str]
+  iix: {Str: Int}
+  cnames: [Str]
+  cspecs: [[Str]]
+  cix: {Str: Int}
+
+fn maps_empty(m: AutoMaps) -> Bool:
+  return m.inames.len == 0 and m.cnames.len == 0
+
+fn maps_set_import(var m: AutoMaps, name: Str, spec: Str):
+  if name in m.iix:
+    m.ispecs[m.iix[name]] = spec + ""
+    return
+  m.iix[name] = m.inames.len
+  m.inames.push(name + "")
+  m.ispecs.push(spec + "")
+
+fn maps_add_comp(var m: AutoMaps, name: Str, spec: Str):
+  if name in m.cix:
+    let k = m.cix[name]
+    if not opts.has(m.cspecs[k], spec): m.cspecs[k].push(spec + "")
+    return
+  m.cix[name] = m.cnames.len
+  m.cnames.push(name + "")
+  m.cspecs.push([spec + ""])
+
+# buildAutoImportMap for one declaration file
+fn build_auto_map(var p: Proj, fs: Fs, var m: AutoMaps, file: Str, src: Str, is_components: Bool):
+  for e in autoimp.dts_entries(file, src, is_components):
+    let r = resolve.resolve(&p.rs, fs, e[2], file)
+    var spec = resolve.join(resolve.dirname(file), e[2])
+    if r.kind == R_FILE and resolve.extname(r.path) != "" and auto_ext(resolve.extname(r.path)): spec = r.path + ""
+    if e[0] == "c": maps_add_comp(&m, e[1], spec)
+    else: maps_set_import(&m, e[1], spec)
+
+# the resolver of auto-import.ts: the default extensions and .vue
+fn auto_ext(e: Str) -> Bool:
+  return accepted_ext("x" + e) or e == ".vue" or e == ".json"
+
+# findRoot: the closest folder with a package.json ("\0" none)
+fn auto_root(p: Proj, fs: Fs, path: Str) -> Str:
+  var d = resolve.dirname(path)
+  while true:
+    if exists_file(p, fs, resolve.join(d, "package.json")): return d
+    if d == "" or d == ".": return "\0"
+    d = resolve.dirname(d)
+  return "\0"
+
+# the maps a compiler uses for a file (built once): their key, "" none
+fn auto_maps_key(var p: Proj, fs: Fs, c: Str, path: Str) -> Str:
+  if c.startswith("nuxt-"):
+    let wi = int(c[c.find(":") + 1..c.len]) else 0
+    let key = "n:{wi}"
+    if key in p.amaps: return key
+    var m = AutoMaps([], [], {}, [], [], {})
+    for f in [".nuxt/imports.d.ts", ".nuxt/components.d.ts", ".nuxt/types/nitro-routes.d.ts", ".nuxt/types/nitro-imports.d.ts"]:
+      let file = resolve.join(p.ws[wi].dir, f)
+      let src = fs.read(fspath(p, file)) else ""
+      build_auto_map(&p, fs, &m, file, src, file.endswith("components.d.ts"))
+    p.amaps[key] = m
+    return key
+  let root = auto_root(p, fs, path)
+  if root == "\0": return ""
+  let key = "r:" + root
+  if key in p.amaps: return key
+  var m = AutoMaps([], [], {}, [], [], {})
+  var files = glob_fs(p, fs, [resolve.join(root, "*.d.ts"), resolve.join(root, "src/**/*.d.ts")])
+  files.sort()
+  for file in files:
+    let src = fs.read(fspath(p, file)) else ""
+    let head = src[0..min(300, src.len)]
+    if head.find("Generated by unplugin-vue-components") >= 0: build_auto_map(&p, fs, &m, file, src, true)
+    elif head.find("Generated by unplugin-auto-import") >= 0: build_auto_map(&p, fs, &m, file, src, false)
+  p.amaps[key] = m
+  return key
+
+# a specifier for a file, relative to the importing file's folder
+fn rel_spec_to(path: Str, target: Str) -> Str:
+  let r = rel_path(resolve.dirname(path), target)
+  if r.startswith("../"): return r
+  return "./" + r
+
+# getSyntheticImports (tags: the template's tags, has_tags false for none)
+fn auto_synthetic(m: AutoMaps, ids: {Str: Bool}, path: Str, tags: {Str: Bool}, has_tags: Bool) -> [Str]:
+  var out: [Str] = []
+  if m.inames.len == 0 and (not has_tags or m.cnames.len == 0): return out
+  for k in 0..m.inames.len:
+    if m.inames[k] in ids and m.ispecs[k] != path: out.push("import {{ " + m.inames[k] + " }} from '" + rel_spec_to(path, m.ispecs[k]) + "';")
+  if has_tags:
+    for k in 0..m.cnames.len:
+      let name = m.cnames[k] + ""
+      let kb = autoimp.kebab(name)
+      if name in tags or kb in tags or ("Lazy" + name) in tags or ("lazy-" + kb) in tags:
+        var targets: [Str] = []
+        for t in m.cspecs[k]:
+          if t != path: targets.push(t + "")
+        if targets.len == 0: continue
+        out.push("import {{ default as " + name + " }} from '" + rel_spec_to(path, targets[0]) + "';")
+        for i in 1..targets.len: out.push("import '" + rel_spec_to(path, targets[i]) + "';")
+  return out
+
+# getImportedComponentImports
+fn auto_imported(m: AutoMaps, names: [Str], path: Str) -> [Str]:
+  var out: [Str] = []
+  for nm0 in names:
+    var nm = nm0 + ""
+    if nm.startswith("Lazy"): nm = nm[4..nm.len]
+    if nm in m.cix:
+      for t in m.cspecs[m.cix[nm]]: out.push("import '" + rel_spec_to(path, t) + "';")
+  return out
+
+# compileVueSfc with maps (info: what vue/compiler-sfc gave, null when it isn't installed)
+fn auto_vue(p: Proj, path: Str, src: Str, m: AutoMaps, info: Value) -> Str:
+  var scr: [Str] = []
+  var exprs: [Str] = []
+  var tags: {Str: Bool} = {}
+  var has_tags = false
+  var code = ""
+  if is_null(info):
+    let sb = compilers.script_bodies(src)
+    if sb != "": scr.push(sb)
+  else:
+    for x in pkg.items(pkg.get(info, "scr")): scr.push(pkg.str_of(x))
+    for x in pkg.items(pkg.get(info, "exprs")): exprs.push(pkg.str_of(x))
+    let tv = pkg.get(info, "tags")
+    if not is_null(tv):
+      has_tags = true
+      for x in pkg.items(tv): tags[pkg.str_of(x)] = true
+    code = pkg.str_of(pkg.get(info, "code"))
+  var ids: {Str: Bool} = {}
+  var imported: [Str] = []
+  if scr.len > 0: autoimp.identifiers(path, "\n".join(scr), &ids, &imported)
+  var none: [Str] = []
+  for e in exprs: autoimp.identifiers("expr.ts", e, &ids, &none)
+  if code != "": autoimp.vm_identifiers(code, &ids)
+  var out = scr
+  for x in auto_synthetic(m, ids, path, tags, has_tags): out.push(x)
+  for x in auto_imported(m, imported, path): out.push(x)
+  let si = compilers.src_imports(src)
+  if si != "": out.push(si)
+  let st = compilers.style_imports(src)
+  if st != "": out.push(st)
+  return ";\n".join(out)
+
+# compileTs with maps: the source and the imports its names stand for ("\0": unchanged)
+fn auto_ts(p: Proj, path: Str, src: Str, m: AutoMaps) -> Str:
+  var ids: {Str: Bool} = {}
+  var imported: [Str] = []
+  autoimp.identifiers(path, src, &ids, &imported)
+  var none: {Str: Bool} = {}
+  var syn = auto_synthetic(m, ids, path, none, false)
+  for x in auto_imported(m, imported, path): syn.push(x)
+  if syn.len == 0: return "\0"
+  return src + "\n" + "\n".join(syn)
+
+# compileMarkdown with maps
+fn auto_md(p: Proj, path: Str, src: Str, m: AutoMaps) -> Str:
+  let code = autoimp.md_strip(src)
+  let scr = compilers.script_bodies(code)
+  var tags: {Str: Bool} = {}
+  autoimp.md_tags(code, &tags)
+  var ids: {Str: Bool} = {}
+  var imported: [Str] = []
+  if scr != "": autoimp.identifiers(path, scr, &ids, &imported)
+  var out: [Str] = []
+  if scr != "": out.push(scr)
+  for x in auto_synthetic(m, ids, path, tags, true): out.push(x)
+  return ";\n".join(out)
 
 # a workspace's settings (getConfigForWorkspace, getIgnores)
 fn apply_ws_config(var p: Proj, wi: Int):
   let name = p.ws[wi].name + ""
   let wc = ws_config(p, name)
   var eg = EXTS_GLOB + ""
-  for e in p.ws[wi].cexts: eg += "," + e[1..e.len]
+  for e in p.ws[wi].cexts:
+    if not accepted_ext("x" + e): eg += "," + e[1..e.len]
   var entry = ["{{index,cli,main}}.{{" + eg + "}}!", "src/{{index,cli,main}}.{{" + eg + "}}!"]
   if json.has(wc, "entry"): entry = arrayify(pkg.get(wc, "entry"))
   var project = ["**/*.{{" + eg + "}}!"]
@@ -6533,6 +7041,18 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
     else: add_entry(&b, f, false, false)
   # project files
   var ppats: [Str] = []
+  if p.tsc_mode and p.ws[wi].tsc_file:
+    # (--use-tsconfig-files: the tsconfig's files are read, the compilers' files are project files)
+    var listed: {Str: Bool} = {}
+    for f in p.files: listed[f] = true
+    for f in sc(p.ws[wi].tsc_src):
+      if f in listed and acc(b, f) and not resolve.in_node_modules(f):
+        b.project[f] = true
+        visit_path(&b, f)
+    if p.ws[wi].tsc_cpats.len > 0:
+      for f in glob_files(p, sorted_negated_last(p.ws[wi].tsc_cpats)):
+        if acc(b, f) and not resolve.in_node_modules(f): b.project[f] = true
+    return
   if p.production:
     if p.ws[wi].project.len == 0:
       for x in user: ppats.push(x + "")
@@ -6709,7 +7229,7 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "")
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false)
 
 fn config_error(msg: Str):
   eprint("ERROR: " + msg)
@@ -6741,6 +7261,7 @@ fn main(fs: Fs, os: Os):
   p.strict = opts.flag(a, "strict")
   p.production = opts.flag(a, "production") or p.strict
   p.ts_config = opts.str_opt(a, "tsConfig")
+  p.tsc_mode = opts.flag(a, "use-tsconfig-files")
   p.gitignore = not opts.flag(a, "no-gitignore")
   p.debug = opts.flag(a, "debug-inputs")
   let cerr = load_config(&p, fs, os, a, root_manifest)
@@ -6860,10 +7381,10 @@ fn main(fs: Fs, os: Os):
     p.cur = wi
     p.ws[wi].inc_entry = cli_inc_entry
     if p.report_deps: load_dep_meta(&p, fs)
-    register_compilers(&p, wi)
+    register_compilers(&p, fs, wi)
     for e in sc(p.ws[wi].cexts):
       b.cexts[e] = true
-      if not opts.has(p.rs.extra_exts, e): p.rs.extra_exts.push(e + "")
+      if not accepted_ext("x" + e) and not opts.has(p.rs.extra_exts, e): p.rs.extra_exts.push(e + "")
     apply_ws_config(&p, wi)
     determine_plugins(&p, fs)
   prefetch(&p, fs, os)
@@ -6901,7 +7422,14 @@ fn main(fs: Fs, os: Os):
     for w in p.ws:
       if pkg.truthy(w.ignore_in_file): want_refs = true
     if want_refs: utags.push("\0refs")
-    var raws = read_batch(fs, root, paths, jobs, &kw, &t, utags)
+    var comps: [Str] = []
+    var pres: [Str] = []
+    for x in paths:
+      comps.push(comp_for(p, x))
+      pres.push("")
+    precompile(&p, fs, os, paths, &comps, &pres)
+    debug_compiled(p, paths, comps, pres)
+    var raws = read_batch(fs, root, paths, comps, pres, jobs, &kw, &t, utags)
     for k in 0..wave.len:
       let id = wave[k]
       swap(&b.g.nodes[id].raw, &raws[k])
@@ -7001,12 +7529,7 @@ fn main(fs: Fs, os: Os):
   # (project-relative "/x" specifiers knip shows as absolute paths: the folder as the OS has it)
   for k in 0..p.issues.len:
     if p.issues[k].symbol.startswith("\t"):
-      if p.abs_root == "":
-        var d = fspath(p, "")
-        if d == "": d = "."
-        let out = os.output(["sh", "-c", "cd \"$1\" && pwd -P", "sh", d]) else ""
-        p.abs_root = out.strip()
-      let sym = p.abs_root + p.issues[k].symbol[1..p.issues[k].symbol.len]
+      let sym = abs_dir(&p, os) + p.issues[k].symbol[1..p.issues[k].symbol.len]
       p.issues[k].symbol = sym + ""
       if p.issues[k].display.startswith("\t"): p.issues[k].display = sym + ""
   # reporters
