@@ -371,6 +371,15 @@ for (const r of reqs) {
     }
     if (r.mode === 'storybook' && v && typeof v.stories === 'function') v = { ...v, stories: await v.stories(['**/*.@(mdx|stories.@(mdx|js|jsx|mjs|ts|tsx))']) };
     if (r.mode === 'rstest' && typeof v === 'function') v = await v({ env: 'test', command: 'run', envMode: 'test' });
+    if (r.mode === 'lint-staged') {
+      const cfg = typeof v === 'function' ? await v([]) : v;
+      const resolveEntry = async value => {
+        if (Array.isArray(value)) return (await Promise.all(value.map(resolveEntry))).flat();
+        if (typeof value === 'function') return [await value([])].flat().filter(item => typeof item === 'string');
+        return typeof value === 'string' ? [value] : [];
+      };
+      if (cfg && typeof cfg === 'object') { const o = {}; for (const [k, e] of Object.entries(cfg)) o[k] = await resolveEntry(e); v = o; } else v = cfg;
+    }
     if (r.mode === 'eleventy') {
       const dummy = new DummyEleventyConfig();
       if (typeof v === 'function') v = await v(dummy);
