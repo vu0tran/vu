@@ -371,6 +371,11 @@ for (const r of reqs) {
     }
     if (r.mode === 'storybook' && v && typeof v.stories === 'function') v = { ...v, stories: await v.stories(['**/*.@(mdx|stories.@(mdx|js|jsx|mjs|ts|tsx))']) };
     if (r.mode === 'rstest' && typeof v === 'function') v = await v({ env: 'test', command: 'run', envMode: 'test' });
+    if (r.mode === 'babel' && typeof v === 'function') {
+      const cacheFn = () => void 0;
+      cacheFn.forever = () => cacheFn; cacheFn.never = () => cacheFn; cacheFn.using = () => cacheFn; cacheFn.invalidate = () => cacheFn;
+      v = v({ assertVersion: () => true, cache: cacheFn, caller: () => true, env: env => (typeof env === 'string' ? true : 'development'), version: '0.0.0' });
+    }
     if (r.mode === 'lint-staged') {
       const cfg = typeof v === 'function' ? await v([]) : v;
       const resolveEntry = async value => {
