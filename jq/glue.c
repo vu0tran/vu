@@ -16,6 +16,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+/* macOS's libm has these under other names, or without a declaration */
+#define exp10(x) __exp10(x)
+#define drem(x, y) remainder(x, y)
+extern double lgamma_r(double, int *);
+static double vjq_significand(double x) {
+#define significand(x) vjq_significand(x)
+    if (x == 0 || !isfinite(x)) return x;
+    return scalbn(x, -ilogb(x));
+}
+#endif
+
 /* exp10 as the glibc jq 1.7.1's release binaries are linked with computes it (e_exp10.c before
    glibc 2.39: exp of the argument split in two parts times ln 10, not correctly rounded) */
 static double jq_exp10(double arg) {

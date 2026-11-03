@@ -101,6 +101,45 @@ int64_t sc_is_file(const vu_str *p) {
 #include <signal.h>
 #include <pthread.h>
 
+/* errno values Linux has and macOS doesn't: distinct values no call returns, so the switches
+   below compile everywhere and keep Linux's texts */
+#ifndef EBADFD
+#define EBADFD (-1000)
+#endif
+#ifndef ECOMM
+#define ECOMM (-1001)
+#endif
+#ifndef EKEYEXPIRED
+#define EKEYEXPIRED (-1002)
+#endif
+#ifndef EKEYREJECTED
+#define EKEYREJECTED (-1003)
+#endif
+#ifndef EKEYREVOKED
+#define EKEYREVOKED (-1004)
+#endif
+#ifndef EMEDIUMTYPE
+#define EMEDIUMTYPE (-1005)
+#endif
+#ifndef ENOKEY
+#define ENOKEY (-1006)
+#endif
+#ifndef ENOMEDIUM
+#define ENOMEDIUM (-1007)
+#endif
+#ifndef ENONET
+#define ENONET (-1008)
+#endif
+#ifndef EREMCHG
+#define EREMCHG (-1009)
+#endif
+#ifndef EREMOTEIO
+#define EREMOTEIO (-1010)
+#endif
+#ifndef ESRMNT
+#define ESRMNT (-1011)
+#endif
+
 static int sc_ascii = 0, sc_linebuf = 0;
 static uint8_t sc_ob[8192];
 static int64_t sc_on = 0;
