@@ -982,6 +982,10 @@ fn handle_input(var p: Proj, fs: Fs, inp: Input) -> Str:
   if is_joinable(spec): target = resolve.join(base, spec)
   var r = resolve.resolve(&p.rs, fs, rel_spec(target), "file.ts")
   if not is_joinable(spec): r = resolve.resolve(&p.rs, fs, spec, resolve.join(base, "file.ts"))
+  # ("/x": a project-relative path, as loaded configs give absolute paths inside the project)
+  if r.kind != R_FILE and spec.startswith("/") and spec.len > 1:
+    let r2 = resolve.resolve(&p.rs, fs, rel_spec(resolve.norm(spec[1..spec.len])), "file.ts")
+    if r2.kind == R_FILE: r = r2
   if r.kind == R_FILE:
     if is_ignored_path(p, r.path, false): return ""
     return r.path
@@ -1037,10 +1041,13 @@ fn new_ctx(w: Ws, optional: Bool) -> Ctx:
 fn expand_tries(var p: Proj, fs: Fs, own inputs: [Input]) -> [Input]:
   var any = false
   for x in inputs:
-    if x.kind == I_TRY: any = true
+    if x.kind == I_TRY or x.plugin.startswith("@"): any = true
   if not any: return inputs
   var out: [Input] = []
   for x in inputs:
+    if x.kind != I_TRY and x.plugin.startswith("@"):
+      expand_marker(&p, x, &out)
+      continue
     if x.kind != I_TRY:
       out.push(scripts.cp(x))
       continue
@@ -1071,6 +1078,48 @@ fn expand_tries(var p: Proj, fs: Fs, own inputs: [Input]) -> [Input]:
         if z.kind == I_ENTRY or z.kind == I_DEFER_ENTRY or z.kind == I_DEFER: z.skip_exports = true
         out.push(z)
   return expand_tries(&p, fs, out)
+
+# inputs of plugin arguments that need the workspace (knip's resolveInputs with the manifest)
+fn expand_marker(var p: Proj, x: Input, var out: [Input]):
+  var y = scripts.cp(x)
+  y.plugin = ""
+  let wi = input_ws(p, x)
+  let m = x.plugin
+  if m == "@eslint-formatter":
+    let f = x.spec
+    var major = dep_major(p.ws[wi], "eslint")
+    if major < 0: major = 9
+    let builtin = " html json-with-metadata json stylish ".find(" " + f + " ") >= 0 or (major < 9 and " checkstyle compact jslint-xml junit tap unix visualstudio ".find(" " + f + " ") >= 0)
+    var n = f + ""
+    if not f.startswith("@"):
+      if not f.startswith("eslint-formatter-"): n = "eslint-formatter-" + f
+    else:
+      let sl = f.find("/")
+      if sl < 0: n = f + "/eslint-formatter"
+      else:
+        let id = f[sl + 1..f.len]
+        if not (id == "eslint-formatter" or id.startswith("eslint-formatter-")): n = f[0..sl] + "/eslint-formatter-" + id
+    y.spec = n
+    y.optional = builtin
+    out.push(y)
+  elif m == "@react-email":
+    var major = dep_major(p.ws[wi], "react-email")
+    if major < 0: major = 6
+    if major >= 6: y.spec = "@react-email/ui"
+    else: y.spec = "@react-email/preview-server"
+    out.push(y)
+  elif m == "@textlint-rule" or m == "@textlint-plugin":
+    let man = json.copy(p.ws[wi].manifest)
+    var t = textlint_module("textlint-plugin-", x.spec, man)
+    if m == "@textlint-rule": t = textlint_rule(x.spec, man)
+    if t.startswith("\t"):
+      y.kind = I_DEFER_ENTRY
+      y.spec = t[1..t.len]
+    else: y.spec = t
+    out.push(y)
+  elif m == "@varlock-path" or m == "@varlock-env":
+    for z in varlock_inputs(p, x): out.push(scripts.cp(z))
+  else: out.push(y)
 
 fn add_script_inputs(var p: Proj, scs: [Str], file: Str, optional: Bool, dir: Str, production: Bool):
   # (the scripts a command can run are those of the workspace of its folder: getManifest(dir))
@@ -1362,6 +1411,17 @@ fn run_plugin(var p: Proj, fs: Fs, os: Os, key: Str):
       if d == "": d = "."
       add_script_inputs(&p, scs, f, true, d, false)
     return
+  if key == "lefthook":
+    var pats: [Str] = []
+    for b in ["lefthook", ".lefthook", ".config/lefthook", "lefthook-local", ".lefthook-local", ".config/lefthook-local"]: pats.push(b + ".{{yml,yaml,json,jsonc,toml}}")
+    let hooks = git_hooks_dir(p, os)
+    if hooks != "\0":
+      for h in git_hook_names(): pats.push(resolve.join(hooks, h))
+    for f in find_configs(p, fs, pats):
+      let v = load_cfg(&p, fs, os, key, f)
+      if not is_null(v): lefthook_config(&p, os, f, v)
+      config_entry(&p, f)
+    return
   if key == "github-actions":
     let found = find_configs(p, fs, [".github/workflows/*.{{yml,yaml}}", ".github/**/action.{{yml,yaml}}"])
     for f in found:
@@ -1387,9 +1447,119 @@ fn run_plugin(var p: Proj, fs: Fs, os: Os, key: Str):
     return
   generic_plugin(&p, fs, os, key)
 
+fn git_hook_names() -> [Str]:
+  return ["prepare-commit-msg", "commit-msg", "pre-{{applypatch,commit,merge-commit,push,rebase,receive}}", "post-{{checkout,commit,merge,rewrite}}"]
+
+# getGitHooksPath: `git rev-parse --git-path hooks` in the workspace folder, relative to it ("\0" when
+# it's outside the project; ".git/hooks" when git fails)
+fn git_hooks_dir(p: Proj, os: Os) -> Str:
+  var d = fspath(p, p.ws[p.cur].dir)
+  if d == "": d = "."
+  let out = os.output(["git", "-C", d, "rev-parse", "--git-path", "hooks"]) else ".git/hooks"
+  var h = out.strip()
+  if h == "" or h.startswith("fatal") or h.startswith("error"): h = ".git/hooks"
+  if h.startswith("/"):
+    let pwd = os.env("PWD")
+    var root = resolve.join(pwd, fspath(p, ""))
+    if p.root.startswith("/"): root = resolve.norm(fspath(p, ""))
+    let wroot = resolve.join(root, p.ws[p.cur].dir)
+    if h.startswith(wroot + "/"): return h[wroot.len + 1..h.len]
+    return "\0"
+  return h
+
+# findByKeyDeep: the objects (at any depth, arrays searched) that have the key
+fn by_key_deep(v: Value, key: Str, var out: [Value]):
+  if pkg.is_obj(v):
+    if json.has(v, key): out.push(json.copy(v))
+    for k in pkg.keys(v):
+      let x = pkg.get(v, k)
+      if is_arr(x):
+        for y in pkg.items(x): by_key_deep(y, key, &out)
+      elif pkg.is_obj(x): by_key_deep(x, key, &out)
+  elif is_arr(v):
+    for y in pkg.items(v): by_key_deep(y, key, &out)
+
+fn lefthook_config(var p: Proj, os: Os, f: Str, v: Value):
+  if p.production: return
+  let wdir = p.ws[p.cur].dir + ""
+  var devs: {Str: Bool} = {}
+  for d in pkg.keys(pkg.get(p.ws[p.cur].manifest, "devDependencies")): devs[d] = true
+  if resolve.extname(f) != "":
+    var cmds: [Value] = []
+    by_key_deep(v, "run", &cmds)
+    for c in cmds:
+      let run = pkg.get(c, "run")
+      if not pkg.is_text(run): continue
+      var dir = dir_of_input(wdir)
+      let root = pkg.str_of(pkg.get(c, "root"))
+      if root != "": dir = dir_of_input(resolve.join("", root))
+      add_script_inputs(&p, [pkg.str_of(run)], f, true, dir, false)
+    if os.env("CI") != "":
+      for e in ["lefthook", "@arkweid/lefthook", "@evilmartians/lefthook"]:
+        if e in devs: in_dep(&p, e, f, false)
+    return
+  if not pkg.is_text(v): return
+  let text = pkg.str_of(v)
+  if text == "": return
+  for x in scripts.inputs_from_scripts([text], new_ctx(p.ws[p.cur], false)):
+    if x.spec in devs:
+      var y = scripts.cp(x)
+      y.file = f + ""
+      p.inputs.push(y)
+      return
+
+# textlint's package names (plugins/textlint/helpers): "\tname" is a local file (deferResolveEntry)
+fn textlint_full(prefix: Str, name: Str) -> Str:
+  if name.startswith("@"):
+    let sl = name.find("/")
+    let scoped = name[sl + 1..name.len]
+    if scoped != prefix and not scoped.startswith(prefix + "-"):
+      if sl > 1: return name[0..sl + 1] + prefix + scoped
+  return prefix + name
+
+fn textlint_has_prefix(prefix: Str, name: Str) -> Bool:
+  var n = name
+  if name.startswith("@"): n = name[name.find("/") + 1..name.len]
+  return n.startswith(prefix)
+
+fn textlint_declared(m: Value, name: Str) -> Bool:
+  for sect in ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"]:
+    let x = pkg.get(pkg.get(m, sect), name)
+    if pkg.truthy(x): return true
+  return false
+
+fn textlint_pkg(prefix: Str, name: Str, cands: [Str], m: Value) -> Str:
+  for c in cands:
+    if textlint_declared(m, c): return c + ""
+  if textlint_has_prefix(prefix, name): return name + ""
+  return textlint_full(prefix, name)
+
+fn textlint_module(prefix: Str, key: Str, m: Value) -> Str:
+  if scripts.is_internal(key): return "\t" + key
+  return textlint_pkg(prefix, key, [textlint_full(prefix, key), key + ""], m)
+
+fn textlint_rule(key: Str, m: Value) -> Str:
+  if scripts.is_internal(key): return "\t" + key
+  let preset = key.startswith("preset-") or key.startswith("textlint-rule-preset-") or (key.startswith("@") and (key.find("/preset-") >= 0 or key.find("/textlint-rule-preset-") >= 0))
+  if not preset: return textlint_module("textlint-rule-", key, m)
+  var name = key + ""
+  if name.startswith("preset-"): name = name[7..name.len]
+  if name.startswith("@"):
+    let sl = name.find("/")
+    if sl > 0 and name[sl + 1..name.len].startswith("preset-"): name = name[0..sl + 1] + name[sl + 8..name.len]
+  let pp = "textlint-rule-preset-"
+  return textlint_pkg(pp, name, [pp + name, name + "", textlint_full(pp, name), key + ""], m)
+
+fn textlint_input(var p: Proj, x: Str, f: Str):
+  if x.startswith("\t"): in_defer_entry(&p, x[1..x.len], f, dir_of_input(p.ws[p.cur].dir))
+  else: in_dep(&p, x, f, false)
+
+fn varlock_inputs(p: Proj, x: Input) -> [Input]:
+  return []
+
 # the plugins whose config files vknip reads (resolveConfig)
 fn has_resolver(key: Str) -> Bool:
-  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt swc wrangler msw tanstack-router drizzle svgr biome github-action nitro metro prisma react-native oclif next webpack vue expo expo-router rspack mdx graphql-codegen knex vite-plugin-pwa pm2 karma stryker tauri react-router buf cucumber rsbuild commitizen markdownlint convex cspell docusaurus electron-forge jasmine serverless-framework parcel electron-vite webdriver-io payload netlify simple-git-hooks wxt panda-css tsd yorkie travis yarn pnpm wireit nano-staged preconstruct bun ".find(" " + key + " ") >= 0
+  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt swc wrangler msw tanstack-router drizzle svgr biome github-action nitro metro prisma react-native oclif next webpack vue expo expo-router rspack mdx graphql-codegen knex vite-plugin-pwa pm2 karma stryker tauri react-router buf cucumber rsbuild commitizen markdownlint convex cspell docusaurus electron-forge jasmine serverless-framework parcel electron-vite webdriver-io payload netlify simple-git-hooks wxt panda-css tsd yorkie travis yarn pnpm wireit nano-staged preconstruct bun gatsby relay textlint ".find(" " + key + " ") >= 0
 
 fn js_ext(f: Str) -> Bool:
   let e = resolve.extname(f)
@@ -1401,6 +1571,7 @@ fn load_mode(key: Str) -> Str:
   if key == "expo-router": return "expo"
   if key == "react-router" or key == "rsbuild" or key == "docusaurus" or key == "electron-forge" or key == "electron-vite": return key + ""
   if key == "simple-git-hooks": return "call0"
+  if key == "gatsby": return "gatsby"
   if key == "rspack": return "webpack"
   return "plain"
 
@@ -1478,7 +1649,7 @@ fn prefetch(var p: Proj, fs: Fs, os: Os):
   p.cur = saved
   if reqs.len == 0: return
   # (one process per mode)
-  for mode in ["plain", "vite", "nuxt", "nitro", "next", "webpack", "vue", "expo", "karma", "react-router", "rsbuild", "docusaurus", "electron-forge", "electron-vite", "call0"]:
+  for mode in ["plain", "vite", "nuxt", "nitro", "next", "webpack", "vue", "expo", "karma", "react-router", "rsbuild", "docusaurus", "electron-forge", "electron-vite", "call0", "gatsby"]:
     var rs: [loader.Req] = []
     for r in reqs:
       if r.mode == mode: rs.push(loader.Req(r.file + "", r.mode + "", json.copy(r.args)))
@@ -1846,6 +2017,37 @@ fn resolve_config(var p: Proj, fs: Fs, os: Os, key: Str, f: Str, v: Value):
   let wdir = p.ws[p.cur].dir + ""
   if key == "vite" or key == "vitest": vite_config(&p, fs, key, f, v)
   elif key == "jest": jest_config(&p, fs, f, v)
+  elif key == "relay":
+    var projects: [Value] = [json.copy(v)]
+    if pkg.is_obj(v) and json.has(v, "projects"):
+      projects = []
+      let ps = pkg.get(v, "projects")
+      for k in pkg.keys(ps): projects.push(pkg.get(ps, k))
+    for pr in projects:
+      let ad = pkg.get(pr, "artifactDirectory")
+      if is_null(ad) or not json.has(pr, "artifactDirectory"): in_prod_entry(&p, "**/__generated__/*", f)
+      else: in_prod_entry(&p, resolve.join(pkg.str_of(ad), "**"), f)
+  elif key == "textlint":
+    let m = json.copy(p.ws[p.cur].manifest)
+    let rules = pkg.get(v, "rules")
+    for k in pkg.keys(rules):
+      if pkg.truthy(pkg.get(rules, k)): textlint_input(&p, textlint_rule(k, m), f)
+    for k in pkg.keys(pkg.get(v, "filters")): textlint_input(&p, textlint_module("textlint-filter-rule-", k, m), f)
+    let pls = pkg.get(v, "plugins")
+    var names: [Str] = []
+    if is_arr(pls):
+      for x in pkg.items(pls): names.push(pkg.str_of(x))
+    else: names = pkg.keys(pls)
+    for k in names: textlint_input(&p, textlint_module("textlint-plugin-", k, m), f)
+  elif key == "gatsby":
+    let b = resolve.basename(f)
+    for e in ["gatsby-{{browser,ssr}}.{{js,jsx,ts,tsx}}", "src/api/**/*.{{js,ts}}", "src/pages/**/*.{{js,jsx,ts,tsx}}", "src/templates/**/*.{{js,jsx,ts,tsx}}", "src/html.{{js,jsx,ts,tsx}}", "plugins/**/gatsby-{{browser,ssr}}.{{js,jsx,ts,tsx}}"]: in_prod_entry(&p, e, f)
+    if b.find("gatsby-config") >= 0:
+      for pl in pkg.items(pkg.get(v, "plugins")):
+        if pkg.is_text(pl): add_defer(&p, pkg.str_of(pl), f)
+        else: add_defer(&p, pkg.str_of(pkg.get(pl, "resolve")), f)
+    elif b.find("gatsby-node") >= 0:
+      for n in pkg.items(pkg.get(v, "__babelPlugins")): in_dep(&p, pkg.str_of(n), f, false)
   elif key == "bun":
     for x in arrayify(pkg.get(pkg.get(v, "test"), "preload")): add_defer(&p, x, f)
   elif key == "mocha":

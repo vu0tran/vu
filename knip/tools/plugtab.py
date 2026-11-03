@@ -7,7 +7,7 @@ hr=set(re.search(r'fn has_resolver.*?return " (.*?) "\.find',src,re.S).group(1).
 ast=set(re.findall(r'key == "([a-z0-9-]+)"', re.search(r'fn ast_ported.*?\n\n',src,re.S).group(0)))
 rs_block=re.search(r'fn plugin_resolve\(.*?\n\n# /',src,re.S).group(0)
 res=set(re.findall(r'key == "([a-z0-9-]+)"', rs_block))
-hand=set("node typescript tsx husky mcp github-actions borp typedoc tsrs".split())
+hand=set("node typescript tsx husky mcp github-actions borp typedoc tsrs lefthook".split())
 vis_done=set("jest vitest rstest execa zx nano-spawn vite webpack rspack node pino knex".split())
 cases=''.join(open(f).read() for f in glob.glob(K+'/test/cases*.py'))
 corp={}

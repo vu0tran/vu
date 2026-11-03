@@ -37,6 +37,7 @@ const load = async file => {
   const m = await import(pathToFileURL(abs).href);
   return m.default ?? m;
 };
+const relKey = k => (k === absRoot ? '/' : k.startsWith(absRoot + '/') ? k.slice(absRoot.length) : k);
 const enc = (v, depth, seen) => {
   if (v === undefined || typeof v === 'symbol') return undefined;
   if (typeof v === 'string') return v === absRoot ? '/' : v.startsWith(absRoot + '/') ? v.slice(absRoot.length) : v;
@@ -52,7 +53,7 @@ const enc = (v, depth, seen) => {
   if (Array.isArray(v) || v instanceof Set) out = Array.from(v, x => { const e = enc(x, depth + 1, seen); return e === undefined ? null : e; });
   else if (v instanceof Map) { out = {}; for (const [k, x] of v) { const e = enc(x, depth + 1, seen); if (e !== undefined) out[String(k)] = e; } }
   else if (v instanceof URL) out = v.href;
-  else { out = {}; let n = 0; for (const k of Object.keys(v)) { if (++n > 400) break; let x; try { x = v[k]; } catch { continue; } const e = enc(x, depth + 1, seen); if (e !== undefined) out[k] = e; } }
+  else { out = {}; let n = 0; for (const k of Object.keys(v)) { if (++n > 400) break; let x; try { x = v[k]; } catch { continue; } const e = enc(x, depth + 1, seen); if (e !== undefined) out[relKey(k)] = e; } }
   seen.delete(v);
   return out;
 };
@@ -223,6 +224,11 @@ for (const r of reqs) {
       v = out;
     }
     if (r.mode === 'call0' && typeof v === 'function') v = await v();
+    if (r.mode === 'gatsby' && v && typeof v.onCreateBabelConfig === 'function') {
+      const names = new Set();
+      v.onCreateBabelConfig({ actions: { setBabelPlugin: plugin => names.add(plugin.name) } });
+      v = { ...v, __babelPlugins: [...names] };
+    }
     if (r.mode === 'karma') {
       if (typeof v !== 'function') v = null;
       else { const mem = { config: undefined, set(c) { this.config = c; } }; await v(mem); v = mem.config ?? {}; }
