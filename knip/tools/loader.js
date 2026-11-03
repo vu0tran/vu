@@ -129,6 +129,152 @@ const webpackPasses = async (config, isProduction) => {
   }
   return out;
 };
+// plugins/eleventy/helpers DummyEleventyConfig (what a config function receives)
+class DummyEleventyConfig {
+  constructor() {
+    this._uniqueId = {};
+    this.events = {};
+    this.benchmarkManager = {};
+    this.benchmarks = {};
+    this.collections = {};
+    this.precompiledCollections = {};
+    this.templateFormats = {};
+    this.liquidOptions = {};
+    this.liquidTags = {};
+    this.liquidFilters = {};
+    this.liquidShortcodes = {};
+    this.liquidPairedShortcodes = {};
+    this.nunjucksEnvironmentOptions = {};
+    this.nunjucksPrecompiledTemplates = {};
+    this.nunjucksFilters = {};
+    this.nunjucksAsyncFilters = {};
+    this.nunjucksTags = {};
+    this.nunjucksGlobals = {};
+    this.nunjucksShortcodes = {};
+    this.nunjucksAsyncShortcodes = {};
+    this.nunjucksPairedShortcodes = {};
+    this.nunjucksAsyncPairedShortcodes = {};
+    this.javascriptFunctions = {};
+    this.markdownHighlighter = null;
+    this.libraryOverrides = {};
+    this.passthroughCopies = {};
+    this.layoutAliases = {};
+    this.layoutResolution = true;
+    this.linters = {};
+    this.transforms = {};
+    this.activeNamespace = '';
+    this.DateTime = {};
+    this.dynamicPermalinks = true;
+    this.useGitIgnore = true;
+    this.ignores = new Set();
+    this.watchIgnores = new Set();
+    this.dataDeepMerge = true;
+    this.extensionMap = new Set();
+    this.watchJavaScriptDependencies = true;
+    this.additionalWatchTargets = [];
+    this.serverOptions = {};
+    this.globalData = {};
+    this.chokidarConfig = {};
+    this.watchThrottleWaitTime = 0;
+    this.dataExtensions = new Map();
+    this.quietMode = false;
+    this.plugins = [];
+    this._pluginExecution = false;
+    this.useTemplateCache = true;
+    this.dataFilterSelectors = new Set();
+    this.libraryAmendments = {};
+    this.serverPassthroughCopyBehavior = '';
+    this.urlTransforms = [];
+    this.dataFileSuffixesOverride = false;
+    this.dataFileDirBaseNameOverride = false;
+    this.templateFormatsAdded = {};
+    this.frontMatterParsingOptions = { engines: {} };
+  }
+  _getUniqueId() {}
+  reset() {}
+  versionCheck() {}
+  on() {}
+  emit() {}
+  _enablePluginExecution() {}
+  addMarkdownHighlighter() {}
+  addLiquidTag() {}
+  addLiquidFilter() {}
+  addNunjucksAsyncFilter() {}
+  addNunjucksFilter() {}
+  addHandlebarsHelper() {}
+  addFilter() {}
+  addAsyncFilter() {}
+  getFilter() {}
+  addNunjucksTag() {}
+  addGlobalData() {}
+  addNunjucksGlobal() {}
+  addTransform() {}
+  addLinter() {}
+  addLayoutAlias() {}
+  setLayoutResolution() {}
+  enableLayoutResolution() {}
+  getCollections() {}
+  addCollection() {}
+  addPlugin() {}
+  _getPluginName() {}
+  _executePlugin() {}
+  getNamespacedName() {}
+  namespace() {}
+  _normalizeTemplateFormats() {}
+  setTemplateFormats() {}
+  addTemplateFormats() {}
+  setLibrary() {}
+  amendLibrary() {}
+  setPugOptions() {}
+  setLiquidOptions() {}
+  setNunjucksEnvironmentOptions() {}
+  setNunjucksPrecompiledTemplates() {}
+  setEjsOptions() {}
+  setDynamicPermalinks() {}
+  setUseGitIgnore() {}
+  addShortcode() {}
+  addAsyncShortcode() {}
+  addNunjucksAsyncShortcode() {}
+  addNunjucksShortcode() {}
+  addLiquidShortcode() {}
+  addHandlebarsShortcode() {}
+  addPairedShortcode() {}
+  addPairedAsyncShortcode() {}
+  addPairedNunjucksAsyncShortcode() {}
+  addPairedNunjucksShortcode() {}
+  addPairedLiquidShortcode() {}
+  addPairedHandlebarsShortcode() {}
+  addJavaScriptFunction() {}
+  setDataDeepMerge() {}
+  isDataDeepMergeModified() {}
+  addWatchTarget() {}
+  setWatchJavaScriptDependencies() {}
+  setServerOptions() {}
+  setBrowserSyncConfig() {}
+  setChokidarConfig() {}
+  setWatchThrottleWaitTime() {}
+  setFrontMatterParsingOptions() {}
+  setQuietMode() {}
+  addExtension() {}
+  addDataExtension() {}
+  setUseTemplateCache() {}
+  setPrecompiledCollections() {}
+  setServerPassthroughCopyBehavior() {}
+  addUrlTransform() {}
+  setDataFileSuffixes() {}
+  setDataFileBaseName() {}
+  getMergingConfigObject() {}
+  isVirtualTemplate() {}
+  setInputDirectory() {}
+  setOutputDirectory() {}
+  setDataDirectory() {}
+  setIncludesDirectory() {}
+  setLayoutsDirectory() {}
+  setFreezeReservedData() {}
+  addDateParsing() {}
+  addBundle() {}
+  addPassthroughCopy(input) { if (typeof input === 'string') this.passthroughCopies[input] = {}; else for (const [p] of Object.entries(input)) this.passthroughCopies[p] = {}; }
+}
 // the globals plugins define before loading their configs (setup)
 const setups = { nuxt: 'defineNuxtConfig', nitro: 'defineNitroConfig' };
 for (const r of reqs) {
@@ -222,6 +368,12 @@ for (const r of reqs) {
       const out = { ...(cfg ?? {}) };
       for (const name of ['main', 'preload', 'renderer']) if (typeof out[name] === 'function') out[name] = await out[name](env);
       v = out;
+    }
+    if (r.mode === 'storybook' && v && typeof v.stories === 'function') v = { ...v, stories: await v.stories(['**/*.@(mdx|stories.@(mdx|js|jsx|mjs|ts|tsx))']) };
+    if (r.mode === 'eleventy') {
+      const dummy = new DummyEleventyConfig();
+      if (typeof v === 'function') v = await v(dummy);
+      v = { config: v ?? null, passthrough: Object.keys(dummy.passthroughCopies) };
     }
     if (r.mode === 'call0' && typeof v === 'function') v = await v();
     if (r.mode === 'gatsby' && v && typeof v.onCreateBabelConfig === 'function') {
