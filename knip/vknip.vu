@@ -26,6 +26,7 @@ import varlock
 import autoimp
 import marko
 import kcache
+import perf
 from json import Value
 from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY, I_CATALOG
 from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC, F_LOADER
@@ -200,6 +201,8 @@ type Proj:
   tsc_mode: Bool             # --use-tsconfig-files
   mlibs: {Int: MarkoLib}     # each workspace's Marko taglibs (tag -> packages)
   pre_inputs: [Str]          # the preprocessors referenced ("/x" a local file, else a package)
+  pf: perf.Perf              # --performance, --memory, --duration
+  clk: fn() -> Float         # os.clock (for --performance)
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -1662,6 +1665,11 @@ fn expand_marker(var p: Proj, fs: Fs, x: Input, var out: [Input]):
   else: out.push(y)
 
 fn add_script_inputs(var p: Proj, scs: [Str], file: Str, optional: Bool, dir: Str, production: Bool):
+  let t0 = pt(p)
+  add_script_inputs_(&p, scs, file, optional, dir, production)
+  pe(&p, "getInputsFromScripts", t0)
+
+fn add_script_inputs_(var p: Proj, scs: [Str], file: Str, optional: Bool, dir: Str, production: Bool):
   # (the scripts a command can run are those of the workspace of its folder: getManifest(dir))
   var wi = p.cur
   if dir != "":
@@ -1897,7 +1905,9 @@ fn run_plugins(var p: Proj, fs: Fs, os: Os):
       p.has_override = true
       p.cfg_override = plugin_config_files(p.ws[p.cur], pfind(p, key))
     let before = p.inputs.len
+    let t_pl = pt(p)
     run_plugin(&p, fs, os, key)
+    if p.pf.plugins: plugin_perf(&p, fs, key, t_pl)
     p.no_entries = false
     p.has_override = false
     # a plugin that returns negated patterns has its own group (its patterns are globbed apart)
@@ -1908,6 +1918,34 @@ fn run_plugins(var p: Proj, fs: Fs, os: Os):
       for k in before..p.inputs.len:
         if not (p.inputs[k].spec in p.ws[p.cur].config_files): p.inputs[k].group = key + ""
   pending_configs(&p, fs, os)
+
+# (--performance) the calls of a plugin's resolveConfig, resolveFromAST and resolve knip would make: one
+# per config file of the plugin (resolveFromAST for JavaScript and TypeScript ones), resolve once; the
+# time is vknip's for the whole plugin, shared among them. A config file that isn't package.json is
+# loaded (knip's load).
+fn plugin_perf(var p: Proj, fs: Fs, key: Str, t0: Float):
+  let pl = pfind(p, key)
+  if not (pl.resolve_config or pl.resolve_ast or pl.resolve): return
+  var files: [Str] = []
+  if pl.resolve_config or pl.resolve_ast:
+    for f in find_configs(p, fs, pl.config):
+      if resolve.basename(f) == "package.json":
+        var field = pl.pkg_path + ""
+        if field == "": field = key + ""
+        if not pkg.truthy(pkg.get(p.ws[p.cur].manifest, field)): continue
+      files.push(f + "")
+  var calls: [Str] = []
+  var loads = 0
+  for f in files:
+    if resolve.basename(f) != "package.json": loads += 1
+    if pl.resolve_config: calls.push("resolveConfig (" + pl.title + ")")
+    let e = resolve.extname(f)
+    if pl.resolve_ast and (e == ".js" or e == ".mjs" or e == ".cjs" or e == ".ts" or e == ".mts" or e == ".cts"): calls.push("resolveFromAST (" + pl.title + ")")
+  if pl.resolve: calls.push("resolve (" + pl.title + ")")
+  if calls.len == 0: return
+  let each = (p.clk() - t0) * 1000.0 / float(calls.len + loads)
+  for _ in 0..loads: perf.add(&p.pf, "load", each)
+  for c in calls: perf.add(&p.pf, c, each)
 
 fn run_plugin(var p: Proj, fs: Fs, os: Os, key: Str):
   let mp = p.ws[p.cur].manifest_path + ""
@@ -5580,39 +5618,50 @@ type Job:
 type Done:
   idx: Int
   raw: Raw
+  tm: [Float]     # (--performance) start, parsed, walk start, walk end, done
 
 # comp: the file's compiler ("" none; "=": pre is the compiled text)
 fn read_file(fs: Fs, root: Str, path: Str, comp: Str, pre: Str, var kw: {Str: Int}, var t: ast.Ast, tags: [Str]) -> Raw:
+  var tm: [Float] = []
+  return read_file_t(fs, root, path, comp, pre, &kw, &t, tags, fn() => 0.0, &tm)
+
+fn read_file_t(fs: Fs, root: Str, path: Str, comp: Str, pre: Str, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], clk: fn() -> Float, var tm: [Float]) -> Raw:
   if comp == "=":
-    var r = extract.analyze_t(path + ".ts", pre, &kw, &t, tags)
+    var r = extract.analyze_tc(path + ".ts", pre, &kw, &t, tags, clk, &tm)
     r.path = path + ""
     return r
   let src = fs.read(root + path) else return empty_raw(path)
   if comp != "":
     # a compiled file: the JavaScript its compiler gives, read as TypeScript
     let js = compilers.compile(comp, src)
-    var r = extract.analyze_t(path + ".ts", js, &kw, &t, tags)
+    var r = extract.analyze_tc(path + ".ts", js, &kw, &t, tags, clk, &tm)
     r.path = path + ""
     return r
   if not accepted_ext(path):
-    var r = extract.analyze_t(path + ".ts", "", &kw, &t, tags)
+    var r = extract.analyze_tc(path + ".ts", "", &kw, &t, tags, clk, &tm)
     r.path = path + ""
     return r
-  return extract.analyze_t(path, src, &kw, &t, tags)
+  return extract.analyze_tc(path, src, &kw, &t, tags, clk, &tm)
 
-fn worker(fs: Fs, own root: Str, own tags: [Str], own jobs: Chan[Job], own res: Chan[Done]):
+fn worker(fs: Fs, os: Os, timed: Bool, own root: Str, own tags: [Str], own jobs: Chan[Job], own res: Chan[Done]):
   var kw = scan.keywords()
   var t = ast.new_ast()
   while true:
     let j = jobs.recv() else return
-    res.send(Done(j.idx, read_file(fs, root, j.path, j.comp, j.pre, &kw, &t, tags)))
+    var tm: [Float] = []
+    if timed:
+      tm.push(os.clock())
+      let r = read_file_t(fs, root, j.path, j.comp, j.pre, &kw, &t, tags, fn() => os.clock(), &tm)
+      tm.push(os.clock())
+      res.send(Done(j.idx, r, tm))
+    else: res.send(Done(j.idx, read_file(fs, root, j.path, j.comp, j.pre, &kw, &t, tags), tm))
 
 # Reads a batch of files (on all cores when there are several), from the cache where it has them.
-fn read_batch_c(fs: Fs, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], var c: kcache.Cache) -> [Raw]:
-  if not c.on: return read_batch(fs, root, paths, comps, pres, jobs_n, &kw, &t, tags)
+fn read_batch_c(fs: Fs, os: Os, timed: Bool, var tms: [[Float]], root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], var c: kcache.Cache) -> [Raw]:
+  if not c.on: return read_batch(fs, os, timed, root, paths, comps, pres, jobs_n, &kw, &t, tags, &tms)
   var base = c.base + ""
   if base == "": base = "."
-  let d = kcache.open_dir(fs, base) else return read_batch(fs, root, paths, comps, pres, jobs_n, &kw, &t, tags)
+  let d = kcache.open_dir(fs, base) else return read_batch(fs, os, timed, root, paths, comps, pres, jobs_n, &kw, &t, tags, &tms)
   var out: [Raw] = []
   var stamps: [[Str]] = []
   var ctxs: [Str] = []
@@ -5645,7 +5694,7 @@ fn read_batch_c(fs: Fs, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs
     stamps.push(st)
     ctxs.push(ctx)
   if mp.len == 0: return out
-  var raws = read_batch(fs, root, mp, mc, mpre, jobs_n, &kw, &t, tags)
+  var raws = read_batch(fs, os, timed, root, mp, mc, mpre, jobs_n, &kw, &t, tags, &tms)
   for k in 0..mix.len:
     let i = mix[k]
     let st = stamps[i]
@@ -5655,11 +5704,17 @@ fn read_batch_c(fs: Fs, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs
     swap(&out[i], &raws[k])
   return out
 
-# Reads a batch of files (on all cores when there are several).
-fn read_batch(fs: Fs, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str]) -> [Raw]:
+# Reads a batch of files (on all cores when there are several). timed: each file's timings go to tms.
+fn read_batch(fs: Fs, os: Os, timed: Bool, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], var tms: [[Float]]) -> [Raw]:
   var out: [Raw] = []
   if jobs_n <= 1 or paths.len < 8:
-    for i in 0..paths.len: out.push(read_file(fs, root, paths[i], comps[i], pres[i], &kw, &t, tags))
+    for i in 0..paths.len:
+      if timed:
+        var tm: [Float] = [os.clock()]
+        out.push(read_file_t(fs, root, paths[i], comps[i], pres[i], &kw, &t, tags, fn() => os.clock(), &tm))
+        tm.push(os.clock())
+        tms.push(tm)
+      else: out.push(read_file(fs, root, paths[i], comps[i], pres[i], &kw, &t, tags))
     return out
   let jc: Chan[Job] = chan(paths.len + 1)
   let rc: Chan[Done] = chan(paths.len + 1)
@@ -5667,12 +5722,21 @@ fn read_batch(fs: Fs, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n
   jc.close()
   var n = jobs_n
   if n > paths.len: n = paths.len
-  for k in 0..n: spawn worker(fs, root + "", sc(tags), jc, rc)
+  for k in 0..n: spawn worker(fs, os, timed, root + "", sc(tags), jc, rc)
   var slots: [Raw] = []
-  for i in 0..paths.len: slots.push(empty_raw(""))
+  var tslots: [[Float]] = []
+  for i in 0..paths.len:
+    slots.push(empty_raw(""))
+    tslots.push([])
   for i in 0..paths.len:
     var d = rc.recv() else break
     swap(&slots[d.idx], &d.raw)
+    swap(&tslots[d.idx], &d.tm)
+  if timed:
+    for i in 0..tslots.len:
+      var x: [Float] = []
+      swap(&x, &tslots[i])
+      tms.push(x)
   return slots
 
 type Build:
@@ -5726,7 +5790,9 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
   var ws_exts: [Ext] = []
   var unres: [Ext] = []
   for im in imps:
+    let t_rs = pt(p)
     let r = resolve.resolve(&p.rs, fs, im.spec, path)
+    pe(&p, "resolveModuleName", t_rs)
     let type_only = is_dts or (im.flags & F_TYPEONLY) != 0
     var spos = im.spos
     if spos < 0: spos = im.pos
@@ -5895,7 +5961,9 @@ fn link_follow(var p: Proj, fs: Fs, var b: Build, id: Int):
   var imps: [Imp] = []
   swap(&imps, &b.g.nodes[id].raw.imps)
   for im in imps:
+    let t_rs = pt(p)
     let r = resolve.resolve(&p.rs, fs, im.spec, path)
+    pe(&p, "resolveModuleName", t_rs)
     if r.kind == R_FILE and acc(b, r.path) and not resolve.in_node_modules(r.path): visit_path(&b, r.path)
 
 # ---- the explorer (graph-explorer/operations)
@@ -8200,7 +8268,16 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [])
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0)
+
+fn pt(p: Proj) -> Float:
+  if p.pf.timerify: return p.clk()
+  return 0.0
+
+fn pe(var p: Proj, name: Str, t0: Float):
+  if p.pf.timerify:
+    let now = p.clk()
+    perf.add(&p.pf, name, (now - t0) * 1000.0)
 
 fn config_error(msg: Str):
   eprint("ERROR: " + msg)
@@ -8225,6 +8302,13 @@ fn main(fs: Fs, os: Os):
     root = dir + ""
     if not root.endswith("/"): root += "/"
   var p = new_proj(root)
+  p.clk = own fn() => os.clock()
+  var pfn: [Str] = []
+  if opts.has_str(a, "performance-fn"): pfn.push(opts.str_opt(a, "performance-fn"))
+  p.pf = perf.new_perf(opts.flag(a, "performance"), pfn, opts.flag(a, "memory"), opts.flag(a, "memory-realtime"), opts.flag(a, "duration"), os.clock())
+  p.pf.plugins = opts.flag(a, "performance")
+  perf.log_head(p.pf)
+  perf.mark(&p.pf, fs, "start")
   for k in 0..p.ptab.len: p.pidx[p.ptab[k].name] = k
   let msrc = fs.read(fspath(p, "package.json")) else ""
   let root_manifest = pkg.parse_json(msrc)
@@ -8352,7 +8436,9 @@ fn main(fs: Fs, os: Os):
     add_gitignore(&p, excl_f, "")
     let gi = fs.read(fspath(p, ".gitignore")) else ""
     add_gitignore(&p, gi, "")
+  let t_walk = pt(p)
   walk(&p, fs, "")
+  if p.gitignore: pe(&p, "findAndParseGitignores", t_walk)
   var dws: {Str: Int} = {}
   for f in p.files:
     let d = resolve.dirname(f)
@@ -8367,7 +8453,10 @@ fn main(fs: Fs, os: Os):
     if not p.ws[wi].has_manifest: continue
     p.cur = wi
     p.ws[wi].inc_entry = cli_inc_entry
-    if p.report_deps: load_dep_meta(&p, fs)
+    if p.report_deps:
+      let t_meta = pt(p)
+      load_dep_meta(&p, fs)
+      pe(&p, "getMetaDataFromPackageJson", t_meta)
     register_compilers(&p, fs, wi)
     for e in sc(p.ws[wi].cexts):
       b.cexts[e] = true
@@ -8379,6 +8468,8 @@ fn main(fs: Fs, os: Os):
     if not p.ws[wi].has_manifest: continue
     p.cur = wi
     build_ws(&p, fs, os, &b)
+    let wsn = p.ws[wi].name + ""
+    perf.mark(&p.pf, fs, wsn)
   if p.debug:
     for f in b.order: eprint("entry " + b.g.nodes[f].path)
   # the graph: read the files reached from the entries, in waves (each on all cores)
@@ -8393,6 +8484,7 @@ fn main(fs: Fs, os: Os):
     var loc = opts.str_opt(a, "cache-location")
     if loc == "": loc = fspath(p, "node_modules/.cache/knip")
     cache = kcache.open_cache(fs, loc, p.production, root)
+  let t_walk_an = pt(p)
   var done = 0
   while done < b.order.len:
     var wave: [Int] = []
@@ -8421,7 +8513,15 @@ fn main(fs: Fs, os: Os):
       pres.push("")
     precompile(&p, fs, os, paths, &comps, &pres)
     debug_compiled(p, paths, comps, pres)
-    var raws = read_batch_c(fs, root, paths, comps, pres, jobs, &kw, &t, utags, &cache)
+    var tms: [[Float]] = []
+    var raws = read_batch_c(fs, os, p.pf.timerify, &tms, root, paths, comps, pres, jobs, &kw, &t, utags, &cache)
+    for tm in tms:
+      # (start, parsed, walk start, walk end, done; a file that didn't parse has no walk)
+      if tm.len >= 3:
+        perf.add(&p.pf, "parseFile", (tm[1] - tm[0]) * 1000.0)
+        if tm.len >= 5:
+          perf.add(&p.pf, "getImportsAndExports", (tm[tm.len - 1] - tm[1]) * 1000.0)
+          perf.add(&p.pf, "walkAST", (tm[tm.len - 2] - tm[tm.len - 3]) * 1000.0)
     for k in 0..wave.len:
       let id = wave[k]
       swap(&b.g.nodes[id].raw, &raws[k])
@@ -8448,6 +8548,8 @@ fn main(fs: Fs, os: Os):
       else:
         link_follow(&p, fs, &b, id)
   kcache.save_cache(fs, &cache)
+  pe(&p, "walkAndAnalyze", t_walk_an)
+  perf.mark(&p.pf, fs, "build")
   # ignoreExportsUsedInFile: an export referenced in its own file (hasRefsInFile)
   var ids_: [Int] = []
   for id in b.order: ids_.push(id)
@@ -8505,12 +8607,23 @@ fn main(fs: Fs, os: Os):
     n_unused += 1
     add_file_issue(&p, f)
   analyze_exports(&p, b)
-  if p.on["cycles"]: find_cycles(&p, b)
+  if p.on["cycles"]:
+    let t_cy = pt(p)
+    find_cycles(&p, b)
+    pe(&p, "findAllCycles", t_cy)
   analyze_imports(&p, b)
   settle_deps(&p)
   catalog_issues(&p, fs, root_manifest)
   # configuration hints
+  let t_hints = pt(p)
   configured_ws_hints(&p, fs)
+  if p.pf.timerify and not p.production:
+    # (knip's getConfigurationHints runs twice per workspace: entry and project files)
+    var nws = 0
+    for w in p.ws:
+      if w.has_manifest: nws += 1
+    let each = (p.clk() - t_hints) * 1000.0 / float(2 * nws + 1)
+    for _ in 0..2 * nws: perf.add(&p.pf, "getConfigurationHints", each)
   if p.on["files"]:
     for k in 0..p.ign_pats.len:
       if not p.ign_used[k]:
@@ -8531,6 +8644,7 @@ fn main(fs: Fs, os: Os):
         ident += "]"
         add_hint(&p, key + "-top-level", ident, "", "")
   unconfigured_hints(&p, n_analyzed, n_unused)
+  perf.mark(&p.pf, fs, "analyze")
   # (project-relative "/x" specifiers knip shows as absolute paths: the folder as the OS has it)
   for k in 0..p.issues.len:
     if p.issues[k].symbol.startswith("\t"):
@@ -8625,6 +8739,7 @@ fn main(fs: Fs, os: Os):
       for h in p.tag_hints:
         let parts = h.split("\0")
         eprint("Unused tag in " + parts[0] + ": " + parts[1] + " → " + parts[2])
+  perf.finish(&p.pf, fs, os.clock())
   # the exit code
   if p.config_errors: exit(2)
   var errors = 0
