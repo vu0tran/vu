@@ -98,6 +98,7 @@ const out = {};
 // (the config with env and argv, rule.use with the rule info, entry), ProvidePlugin definitions kept
 const ruleInfo = { compiler: '', issuer: '', realResource: '', resource: '', resourceQuery: '', dependency: '', descriptionData: {}, issuerLayer: '' };
 const evalRule = rule => {
+  if (typeof rule === 'function') { const r = rule(ruleInfo); return typeof r === 'string' ? { loader: r } : r; }
   if (!rule || typeof rule !== 'object') return rule;
   const out = { ...rule };
   if (typeof out.use === 'function') out.use = out.use(ruleInfo);
