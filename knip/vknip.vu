@@ -5353,6 +5353,10 @@ type Build:
   cycles_on: Bool            # (--cycles) internal imports kept, graph order recorded
   gorder: [Int]              # the module graph's order (a file after the files it imports first)
   gseen: {Int: Bool}
+  trace_on: Bool             # (--trace*) the pairs' refs and re-exports, the exports kept
+  prefs: {Str: [Str]}        # "importer:file" -> the refs of the importer's imports of the file
+  prex: {Str: {Str: Bool}}   # "importer:file" -> "a:" + reExportAs keys, "n:" + reExportNs keys
+  texps: {Int: [[Str]]}      # file -> its exports: [name, members...]
 
 fn add_entry(var b: Build, path: Str, skip: Bool, explicit: Bool):
   if resolve.in_node_modules(path) or not acc(b, path): return
@@ -5518,6 +5522,11 @@ fn add_internal(var b: Build, tid: Int, src: Int, im: Imp):
     elif (im.flags & extract.F_LOADER) != 0: ident = "__loader-default"
     else: ident = "__side-effects"
   b.g.nodes[tid].has_by = true
+  if b.trace_on and (im.flags & F_REEXPORT) != 0:
+    let key = "{src}:{tid}"
+    if not (key in b.prex): b.prex[key] = {}
+    if ident == "*" and im.ns != "": b.prex[key]["n:" + im.ns] = true
+    elif im.alias != "": b.prex[key]["a:" + ident] = true
   if (im.flags & F_REEXPORT) != 0:
     if ident == "*" and im.ns != "": add_val(&b.g.nodes[tid].imby.rex_ns, im.ns, src)
     elif im.alias != "": add_ns_val(&b.g.nodes[tid].imby.rex_as, ident, im.alias, src)
@@ -5532,6 +5541,11 @@ fn add_internal(var b: Build, tid: Int, src: Int, im: Imp):
 fn apply_op(var b: Build, tid: Int, src: Int, o: Op):
   b.g.nodes[tid].has_by = true
   let k = o.kind
+  if k == extract.OP_REF and b.trace_on:
+    let key = "{src}:{tid}"
+    if key in b.prefs:
+      if not opts.has(b.prefs[key], o.a): b.prefs[key].push(o.a + "")
+    else: b.prefs[key] = [o.a + ""]
   if k == extract.OP_REF: b.g.nodes[tid].imby.refs[o.a] = true
   elif k == extract.OP_IMPORT: add_val(&b.g.nodes[tid].imby.imp, o.a, src)
   elif k == extract.OP_ENUM: b.g.nodes[tid].imby.enumerated[o.a] = true
@@ -7331,6 +7345,316 @@ fn import_kind(cs: [Cyc], tid: Int, c: Cyc) -> Str:
   if ident != "" and imp_as: return "importAs"
   return "import"
 
+# ---- --trace, --trace-export, --trace-file, --trace-dependency (reporters/trace.ts)
+
+type TNode:
+  file: Int
+  ident: Str
+  orig: Str          # "" none
+  via: Str           # "" for the root
+  refs: [Str]
+  entry: Bool
+  children: [Int]
+
+type Tree:
+  nodes: [TNode]
+  keys: {Str: Int}
+
+# filterRefs
+fn filter_refs(refs: [Str], id: Str) -> [Str]:
+  var out: [Str] = []
+  for r in refs:
+    if id == r or id.startswith(r + ".") or r.startswith(id + "."): out.push(r + "")
+  return out
+
+fn tree_reaches(t: Tree, n: Int, target: Int) -> Bool:
+  if n == target: return true
+  for c in t.nodes[n].children:
+    if tree_reaches(t, c, target): return true
+  return false
+
+# the visitor of buildExportTree
+fn trace_visit(b: Build, var t: Tree, src: Int, src_id: Str, importer: Int, id: Str, via: Str):
+  let pk = "{importer}:{src}"
+  var prefs: [Str] = []
+  if pk in b.prefs: prefs = sc(b.prefs[pk])
+  var ns = id + ""
+  let dot = id.find(".")
+  if dot >= 0: ns = id[0..dot]
+  if via == "importNS":
+    var relevant = false
+    for r in prefs:
+      if r == id or r.startswith(id + "."): relevant = true
+    var ns_rex = false
+    if pk in b.prex: ns_rex = ("a:" + ns) in b.prex[pk] or ("n:" + ns) in b.prex[pk]
+    if not relevant and not ns_rex: return
+  let key = "{importer}:" + id
+  let renamed = via.endswith("As") and src_id != ns
+  var child = -1
+  var existing = false
+  if key in t.keys:
+    child = t.keys[key]
+    existing = true
+  else:
+    var orig = ""
+    if renamed: orig = src_id + ""
+    t.nodes.push(TNode(importer, id + "", orig, via + "", filter_refs(prefs, id), importer in b.entries, []))
+    child = t.nodes.len - 1
+    t.keys[key] = child
+  var parent = -1
+  let pkey = "{src}:" + src_id
+  if pkey in t.keys: parent = t.keys[pkey]
+  else:
+    for k, v in t.keys:
+      if parent < 0 and (k.startswith(pkey + ".") or k == pkey): parent = v
+  if parent < 0: parent = 0
+  if existing and tree_reaches(t, child, parent): return
+  t.nodes[parent].children.push(child)
+
+# walkDown (the visitor never stops it)
+fn trace_walk(b: Build, var t: Tree, file: Int, identifier: Str, var visited: {Str: Bool}):
+  let key = "{file}:" + identifier
+  if key in visited: return
+  visited[key] = true
+  if not b.g.nodes[file].has_by: return
+  let parts = identifier.split(".")
+  let id = parts[0] + ""
+  if id == "": return
+  var rest: [Str] = []
+  for k in 1..parts.len: rest.push(parts[k] + "")
+  let im = b.g.nodes[file].imby
+  if id in im.imp:
+    for f in im.imp[id]: trace_visit(b, &t, file, id, f, id, "import")
+  if id in im.imp_as:
+    for alias, fs_ in im.imp_as[id]:
+      for f in fs_: trace_visit(b, &t, file, id, f, alias, "importAs")
+  for ns, fs_ in im.imp_ns:
+    for f in fs_: trace_visit(b, &t, file, identifier, f, ns + "." + identifier, "importNS")
+  if id in im.rex:
+    for f in sc_ints(im.rex[id]):
+      trace_visit(b, &t, file, id, f, id, "reExport")
+      trace_walk(b, &t, f, identifier, &visited)
+  if id in im.rex_as:
+    for alias, fs_ in im.rex_as[id]:
+      for f in sc_ints(fs_):
+        trace_visit(b, &t, file, id, f, alias, "reExportAs")
+        var ids: [Str] = [alias + ""]
+        for r in rest: ids.push(r + "")
+        trace_walk(b, &t, f, ".".join(ids), &visited)
+  for ns, fs_ in im.rex_ns:
+    for f in sc_ints(fs_):
+      trace_visit(b, &t, file, identifier, f, ns + "." + identifier, "reExportNS")
+      trace_walk(b, &t, f, ns + "." + identifier, &visited)
+  if "*" in im.rex:
+    for f in sc_ints(im.rex["*"]):
+      trace_visit(b, &t, file, id, f, id, "reExportStar")
+      trace_walk(b, &t, f, identifier, &visited)
+
+fn sc_ints(xs: [Int]) -> [Int]:
+  var out: [Int] = []
+  for x in xs: out.push(x)
+  return out
+
+fn has_non_star(t: Tree, n: Int) -> Bool:
+  if t.nodes[n].via != "" and t.nodes[n].via != "reExportStar": return true
+  for c in t.nodes[n].children:
+    if has_non_star(t, c): return true
+  return false
+
+fn prune_star(var t: Tree, n: Int):
+  var kept: [Int] = []
+  for c in t.nodes[n].children:
+    if has_non_star(t, c): kept.push(c)
+  t.nodes[n].children = sc_ints(kept)
+  for c in kept: prune_star(&t, c)
+
+# buildExportTree: the tree of one export (node 0)
+fn trace_tree(b: Build, file: Int, identifier: Str) -> Tree:
+  var t = Tree([TNode(file, identifier + "", "", "", [], file in b.entries, [])], {})
+  t.keys["{file}:" + identifier] = 0
+  var visited: {Str: Bool} = {}
+  trace_walk(b, &t, file, identifier, &visited)
+  prune_star(&t, 0)
+  return t
+
+fn trace_exports(b: Build, file: Int) -> [Str]:
+  var out: [Str] = []
+  if file in b.texps:
+    for row in b.texps[file]: out.push(row[0] + "")
+  return out
+
+fn trace_has_export(b: Build, file: Int, name: Str) -> Bool:
+  for x in trace_exports(b, file):
+    if x == name: return true
+  return false
+
+fn trace_members(b: Build, file: Int, name: Str) -> [Str]:
+  var out: [Str] = []
+  if file in b.texps:
+    for row in b.texps[file]:
+      if row[0] == name:
+        for k in 1..row.len: out.push(row[k] + "")
+  return out
+
+# buildExportsTree
+fn trace_trees(b: Build, file: Int, identifier: Str) -> [Tree]:
+  var out: [Tree] = []
+  var files: [Int] = []
+  if file >= 0: files.push(file)
+  else: files = sc_ints(b.gorder)
+  for f in files:
+    var ids: [Str] = []
+    if identifier != "":
+      if trace_has_export(b, f, identifier): ids.push(identifier + "")
+    else: ids = trace_exports(b, f)
+    for id in ids: out.push(trace_tree(b, f, id))
+  return out
+
+fn trace_report(p: Proj, b: Build, a: opts.Args):
+  let dep = opts.str_opt(a, "trace-dependency")
+  if opts.has_str(a, "trace-dependency"):
+    trace_dependency(p, b, dep)
+    return
+  let tfile_arg = opts.str_opt(a, "trace-file")
+  let texp = opts.str_opt(a, "trace-export")
+  var tfile = ""
+  if tfile_arg != "": tfile = resolve.norm(tfile_arg)
+  var fid = -1
+  if tfile != "" and tfile in b.g.ids:
+    let cand = b.g.ids[tfile]
+    if cand in b.gseen: fid = cand
+  var trees: [Tree] = []
+  if tfile == "" or fid >= 0: trees = trace_trees(b, fid, texp)
+  # (a dotted name as a namespace member: Fruits.apple -> Fruits)
+  if trees.len == 0 and texp.find(".") >= 0 and (tfile == "" or fid >= 0): trees = trace_trees(b, fid, texp[0..texp.find(".")])
+  if trees.len == 0 and texp != "":
+    var member = texp + ""
+    let ld = texp.rfind(".")
+    if ld >= 0: member = texp[ld + 1..texp.len]
+    for f in b.gorder:
+      if tfile != "" and f != fid: continue
+      if f in b.texps:
+        for row in b.texps[f]:
+          var hit = false
+          for k in 1..row.len:
+            if row[k] == texp or row[k] == member or row[k].endswith("." + member): hit = true
+          if hit: trees.push(trace_tree(b, f, row[0]))
+  trees.sort(by: fn(x, y) => trace_less(p, b, x, y))
+  if trees.len == 0:
+    if tfile != "" and fid < 0:
+      print("File not found in module graph: " + tfile)
+    else:
+      var what = "exports"
+      if texp != "": what = "export " + texp
+      var where = ""
+      if tfile != "": where = " in " + tfile
+      print("No " + what + " found" + where)
+    return
+  var reported: {Str: Bool} = {}
+  var members: {Str: Bool} = {}
+  for i in p.issues:
+    if i.typ == "exports" or i.typ == "types" or i.typ == "nsExports" or i.typ == "nsTypes": reported[i.file + ":" + i.symbol] = true
+    if i.typ == "enumMembers" or i.typ == "namespaceMembers": members[i.file + ":" + i.parent + "." + i.symbol] = true
+  for t in trees:
+    let root = t.nodes[0]
+    let fpath = b.g.nodes[root.file].path + ""
+    let referenced = not ((fpath + ":" + root.ident) in reported)
+    var lines: [Str] = []
+    var mk = ""
+    if root.entry: mk = " ⎆"
+    lines.push(fpath + ":" + root.ident + mk)
+    for k in 0..root.children.len: trace_line(b, t, root.children[k], "", k == root.children.len - 1, referenced, &lines)
+    if root.children.len == 0:
+      if referenced: lines.push("└── (no imports found) ✓")
+      else: lines.push("└── (no imports found) ✗")
+    let ms = trace_members(b, root.file, root.ident)
+    if ms.len > 0:
+      var parts: [Str] = []
+      for m in ms:
+        if (fpath + ":" + root.ident + "." + m) in members: parts.push(m + " ✗")
+        else: parts.push(m + " ✓")
+      lines.push("    members: [" + ", ".join(parts) + "]")
+    print("\n".join(lines))
+
+fn trace_less(p: Proj, b: Build, x: Tree, y: Tree) -> Bool:
+  let c = report.coll_cmp(p.coll, b.g.nodes[x.nodes[0].file].path, b.g.nodes[y.nodes[0].file].path)
+  if c != 0: return c < 0
+  return report.coll_cmp(p.coll, x.nodes[0].ident, y.nodes[0].ident) < 0
+
+# formatTrace's lines for a child
+fn trace_line(b: Build, t: Tree, n: Int, prefix: Str, last: Bool, referenced: Bool, var lines: [Str]):
+  let nd = t.nodes[n]
+  var conn = "├── "
+  var cpre = "│   "
+  if last:
+    conn = "└── "
+    cpre = "    "
+  var mk = ""
+  if nd.entry: mk = " ⎆"
+  let leaf = nd.children.len == 0
+  var lm = ""
+  if leaf:
+    if referenced: lm = " ✓"
+    else: lm = " ✗"
+  var via = nd.ident + ""
+  if nd.via != "":
+    let parts = nd.ident.split(".")
+    let name = parts[0] + ""
+    var rest: [Str] = []
+    for k in 1..parts.len: rest.push(parts[k] + "")
+    var nm = name
+    if nd.orig != "": nm = nd.orig + " → " + name
+    via = nd.via + "[" + nm
+    if rest.len > 0: via += "." + ".".join(rest)
+    via += "]"
+  lines.push(prefix + conn + b.g.nodes[nd.file].path + ":" + via + mk + lm)
+  if nd.refs.len > 0:
+    var rp = "│"
+    if leaf: rp = " "
+    lines.push(prefix + cpre + rp + " refs: [" + ", ".join(nd.refs) + "]")
+  for k in 0..nd.children.len: trace_line(b, t, nd.children[k], prefix + cpre, k == nd.children.len - 1, referenced, &lines)
+
+# --trace-dependency: the imports of matching packages (a string, or a regular expression when it
+# looks like one)
+fn trace_dependency(p: Proj, b: Build, pat: Str):
+  let m = matcher(json.Text(pat))
+  var rows: [[Str]] = []
+  var keys: [Str] = []
+  var by_pkg: {Str: [[Str]]} = {}
+  for f in b.gorder:
+    let path = b.g.nodes[f].path + ""
+    for e in b.g.nodes[f].exts:
+      let pn = pkg_from_spec(e.spec)
+      if pn == "": continue
+      if not m_hit(m, pn): continue
+      var pos = ""
+      if e.line > 0: pos = ":{e.line}:{e.col}"
+      if not (pn in by_pkg):
+        by_pkg[pn] = []
+        keys.push(pn + "")
+      by_pkg[pn].push([path, pos, "{e.line}"])
+  var seen: {Str: Bool} = {}
+  for pn in keys:
+    var xs: [[Str]] = []
+    for x in by_pkg[pn]: xs.push([x[0] + "", x[1] + "", x[2] + ""])
+    xs.sort(by: fn(x, y) => trace_dep_less(p, x, y))
+    for x in xs:
+      let key = x[0] + x[1] + ":" + pn
+      if key in seen: continue
+      seen[key] = true
+      rows.push([x[0] + x[1], pn + ""])
+  if rows.len == 0:
+    print("No imports found matching " + pat)
+    return
+  for l in report.table(rows, [true, true], [1, 0]): print(l)
+
+fn trace_dep_less(p: Proj, x: [Str], y: [Str]) -> Bool:
+  let c = report.coll_cmp(p.coll, x[0], y[0])
+  if c != 0: return c < 0
+  let lx = int(x[2]) else 0
+  let ly = int(y[2]) else 0
+  return lx < ly
+
 fn negate(s: Str) -> Str:
   if s.startswith("!"): return s + ""
   return "!" + s
@@ -7696,7 +8020,8 @@ fn main(fs: Fs, os: Os):
     if not (d in dws): dws[d] = ws_of_slow(p, f)
   swap(&p.dir_ws, &dws)
   # the workspaces, each with its entry and project files
-  var b = Build({}, Graph({}, []), {}, {}, {}, {}, {}, [], p.on["cycles"], [], {})
+  let trace_on = opts.flag(a, "trace") or opts.has_str(a, "trace-file") or opts.has_str(a, "trace-export") or opts.has_str(a, "trace-dependency")
+  var b = Build({}, Graph({}, []), {}, {}, {}, {}, {}, [], p.on["cycles"] or trace_on, [], {}, trace_on, {}, {}, {})
   if p.config_file != "": add_entry(&b, p.config_file, true, true)
   let cli_inc_entry = opts.flag(a, "include-entry-exports")
   for wi in 0..p.ws.len:
@@ -7760,6 +8085,18 @@ fn main(fs: Fs, os: Os):
       if path in b.project and ws_of(p, path) >= 0:
         b.g.nodes[id].analyzed = true
         b.g.nodes[id].skip_exports = id in b.skip
+        if b.trace_on:
+          var tx: [[Str]] = []
+          for e in b.g.nodes[id].raw.exps:
+            var row: [Str] = [e.name + ""]
+            for m in e.members:
+              # (a nested namespace is shown by its members, as knip's members are)
+              var parent = false
+              for m2 in e.members:
+                if m2.name.startswith(m.name + "."): parent = true
+              if not parent: row.push(m.name + "")
+            tx.push(row)
+          b.texps[id] = tx
         if id in b.skip or not p.report_exports:
           b.g.nodes[id].raw.exps = []
           b.g.nodes[id].raw.dups = []
@@ -7855,6 +8192,10 @@ fn main(fs: Fs, os: Os):
       let sym = abs_dir(&p, os) + p.issues[k].symbol[1..p.issues[k].symbol.len]
       p.issues[k].symbol = sym + ""
       if p.issues[k].display.startswith("\t"): p.issues[k].display = sym + ""
+  if trace_on:
+    # (these modes have their own output, and no reporters)
+    trace_report(p, b, a)
+    exit(0)
   # the results as knip's reporters and preprocessors get them (ReporterOptions)
   let need_data = pre_mods.len > 0 or has_custom_reporter(opts.strs_opt(a, "reporter"))
   var data = json.Null
@@ -7872,7 +8213,8 @@ fn main(fs: Fs, os: Os):
       var r = json.Null
       if "@preprocess" in res: r = json.copy(res["@preprocess"])
       node_failed(r)
-      data = json.copy(pkg.get(r, "ok"))
+      print_captured(pkg.get(r, "ok"), "out", "err")
+      data = json.copy(pkg.get(pkg.get(r, "ok"), "data"))
       pre_counters = json.copy(pkg.get(data, "counters"))
       data_to_proj(&p, data, ad)
   apply_fixes(&p, fs, a)
@@ -7921,12 +8263,7 @@ fn main(fs: Fs, os: Os):
       if "@reporter" in res: rr = json.copy(res["@reporter"])
       node_failed(rr)
       let o = pkg.get(rr, "ok")
-      let so = pkg.str_of(pkg.get(o, "out"))
-      let se = pkg.str_of(pkg.get(o, "err"))
-      if so != "": write(so)
-      if se != "":
-        if se.endswith("\n"): eprint(se[0..se.len - 1])
-        else: eprint(se)
+      print_captured(o, "out", "err")
       if target != "":
         fs.write(fspath(p, target), strip_vt(pkg.str_of(pkg.get(o, "file")))) else config_error("Option --output-file failed to write: " + target)
       continue
@@ -8002,9 +8339,19 @@ fn strip_vt(s: Str) -> Str:
     i += 1
   return out + s[at..s.len]
 
+# what a module printed in Node.js
+fn print_captured(o: Value, ko: Str, ke: Str):
+  let so = pkg.str_of(pkg.get(o, ko))
+  let se = pkg.str_of(pkg.get(o, ke))
+  if so != "": write(so)
+  if se != "":
+    if se.endswith("\n"): eprint(se[0..se.len - 1])
+    else: eprint(se)
+
 # a preprocessor or reporter that failed in Node.js: knip's LoaderError, else the thrown error
 fn node_failed(r: Value):
   if not json.has(r, "error"): return
+  print_captured(r, "out", "errOut")
   if pkg.truthy(pkg.get(r, "loader")):
     eprint("ERROR: " + pkg.str_of(pkg.get(r, "error")))
     eprint("Reason: " + pkg.str_of(pkg.get(r, "reason")))

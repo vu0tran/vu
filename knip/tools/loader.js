@@ -1,6 +1,6 @@
 // The source of loader.vu's LOADER_JS (tools/gen_loader.py writes it into loader.vu).
 import { createRequire } from 'node:module';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 const [outFile, reqFile, rootArg] = process.argv.slice(1);
@@ -352,37 +352,52 @@ const customCompile = async (config, files) => {
 // knip's _load does; a module that fails to load is a LoaderError
 const loadModule = async spec => {
   const isLocal = spec.startsWith('.') || spec.startsWith('/');
-  let file = isLocal ? path.resolve(cwd, spec) : spec;
-  if (!isLocal) { try { file = createRequire(path.join(cwd, 'package.json')).resolve(spec); } catch {} }
-  try { return await load(file); }
+  const file = isLocal ? path.resolve(cwd, spec) : spec;
+  try {
+    if (isLocal) return await load(file);
+    // (a package: as knip's jiti.import, relative to the folder)
+    if (jiti) return await jiti(file);
+    const m = await import(file);
+    return m.default ?? m;
+  }
   catch (e) { const err = new Error(`Error loading ${file}`); err.reason = e && e.message !== undefined ? String(e.message) : String(e); err.notFound = !!(e && e.code === 'MODULE_NOT_FOUND'); throw err; }
 };
 const toPlain = data => JSON.parse(JSON.stringify(data, (k, v) => (v instanceof Set ? [...v] : v instanceof Map ? Object.fromEntries(v) : v instanceof RegExp ? { __vknip_re: v.source, flags: v.flags } : v)));
 const fromPlain = data => ({ ...data, tagHints: new Set(data.tagHints ?? []), configurationHints: (data.configurationHints ?? []).map(h => (h && h.identifier && h.identifier.__vknip_re !== undefined ? { ...h, identifier: new RegExp(h.identifier.__vknip_re, h.identifier.flags) } : h)) });
+// (what a module prints is captured, and printed by vknip in its place)
+const captured = async f => {
+  let out = '', err = '';
+  const ow = process.stdout.write.bind(process.stdout), ew = process.stderr.write.bind(process.stderr);
+  process.stdout.write = c => { out += String(c); return true; };
+  process.stderr.write = c => { err += String(c); return true; };
+  try { const value = await f(t => { out += t; }); return { value, out, err }; }
+  catch (e) { e.out = out; e.errOut = err; throw e; }
+  finally { process.stdout.write = ow; process.stderr.write = ew; }
+};
 const runPreprocessors = async (mods, data) => {
-  let d = fromPlain(data);
   const fns = [];
   for (const m of mods) fns.push(await loadModule(m));
-  for (const fn of fns) d = await fn(d);
-  return toPlain(d);
+  const r = await captured(async () => {
+    let d = fromPlain(data);
+    for (const fn of fns) d = await fn(d);
+    return toPlain(d);
+  });
+  return { data: r.value, out: r.out, err: r.err };
 };
 const runReporter = async (mod, data, toFile) => {
   const fn = await loadModule(mod);
-  let out = '', err = '', file = '';
-  const ow = process.stdout.write.bind(process.stdout), ew = process.stderr.write.bind(process.stderr);
-  process.stdout.write = (c, ...rest) => { out += String(c); return true; };
-  process.stderr.write = (c, ...rest) => { err += String(c); return true; };
-  try {
-    const write = toFile ? text => { if (text) file += `${text}\n`; } : text => { if (text) out += `${text}\n`; };
+  let file = '';
+  const r = await captured(async add => {
+    const write = toFile ? text => { if (text) file += `${text}\n`; } : text => { if (text) add(`${text}\n`); };
     await fn({ ...fromPlain(data), write });
-  } finally { process.stdout.write = ow; process.stderr.write = ew; }
-  return { out, err, file };
+  });
+  return { out: r.out, err: r.err, file };
 };
 for (const r of reqs) {
   if (r.mode === 'preprocess' || r.mode === 'reporter') {
     try {
       out[r.file] = { ok: r.mode === 'preprocess' ? await runPreprocessors(r.args.mods, r.args.data) : await runReporter(r.args.mod, r.args.data, r.args.toFile) };
-    } catch (e) { out[r.file] = { error: e && e.message ? e.message.split('\n')[0] : String(e), reason: e && e.reason !== undefined ? e.reason : '', loader: !!(e && e.reason !== undefined), notFound: !!(e && e.notFound), stack: e && e.stack ? String(e.stack) : String(e) }; }
+    } catch (e) { out[r.file] = { error: e && e.message ? e.message.split('\n')[0] : String(e), reason: e && e.reason !== undefined ? e.reason : '', loader: !!(e && e.reason !== undefined), notFound: !!(e && e.notFound), out: (e && e.out) || '', errOut: (e && e.errOut) || '', stack: e && e.stack ? String(e.stack) : String(e) }; }
     continue;
   }
   if (r.mode === 'vue-sfc') { out[r.file] = { ok: vueSfcInfo(r.file, r.args) }; continue; }
