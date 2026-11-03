@@ -417,9 +417,22 @@ fn glob_fs(p: Proj, fs: Fs, patterns: [Str]) -> [Str]:
       var segs: [Str] = []
       var s = e
       if s.startswith("./"): s = s[2..s.len]
-      for x in s.split("/"): segs.push(x + "")
       var found: [Str] = []
-      glob_walk(p, fs, "", segs, 0, &found, false)
+      if glob.has_slash_ext(s):
+        # (an extglob spanning folders: every file below the static part, matched whole)
+        let cp_ = glob.compile(s)
+        for x in s.split("/"):
+          if glob.is_dynamic(x): break
+          segs.push(x + "")
+        segs.push("**")
+        segs.push("*")
+        var all: [Str] = []
+        glob_walk(p, fs, "", segs, 0, &all, false)
+        for f in all:
+          if glob.matches(cp_, f, false): found.push(f)
+      else:
+        for x in s.split("/"): segs.push(x + "")
+        glob_walk(p, fs, "", segs, 0, &found, false)
       for f in found:
         if not (f in seen) and not neg_hit(neg, f):
           seen[f] = true
@@ -440,9 +453,20 @@ fn glob_dirs(p: Proj, fs: Fs, patterns: [Str]) -> [Str]:
       var s = e
       if s.startswith("./"): s = s[2..s.len]
       while s.endswith("/"): s = s[0..s.len - 1]
-      for x in s.split("/"): segs.push(x + "")
       var found: [Str] = []
-      glob_walk(p, fs, "", segs, 0, &found, true)
+      if glob.has_slash_ext(s):
+        let cp_ = glob.compile(s)
+        for x in s.split("/"):
+          if glob.is_dynamic(x): break
+          segs.push(x + "")
+        segs.push("**")
+        var all: [Str] = []
+        glob_walk(p, fs, "", segs, 0, &all, true)
+        for f in all:
+          if glob.matches(cp_, f, false): found.push(f)
+      else:
+        for x in s.split("/"): segs.push(x + "")
+        glob_walk(p, fs, "", segs, 0, &found, true)
       for f in found:
         if not (f in seen) and not matches_any(neg, f, false):
           seen[f] = true
@@ -1132,6 +1156,40 @@ fn expand_marker(var p: Proj, fs: Fs, x: Input, var out: [Input]):
       y.spec = t[1..t.len]
     else: y.spec = t
     out.push(y)
+  elif m.startswith("@yarn-dir:"):
+    let parts = m[10..m.len].split("\t")
+    var dir = ""
+    if parts[0] != "^": dir = resolve.join(input_base(x), parts[0])
+    let name = parts[1]
+    let fwd = parts[2]
+    let command = parts[3]
+    var wn = dir + ""
+    if wn == "": wn = "."
+    var scripts_: {Str: Str} = {}
+    if wn in p.all_pkgs:
+      let sv = pkg.get(p.all_pkgs[wn], "scripts")
+      for k in pkg.keys(sv): scripts_[k] = pkg.str_of(pkg.get(sv, k))
+    if name in scripts_:
+      if fwd != "":
+        let src = scripts_[name] + " " + fwd
+        var c = Ctx(scripts_, false, false, {}, false, 0)
+        c.expanded[name] = true
+        for z in scripts.inputs_from_scripts([src], c):
+          var y2 = scripts.cp(z)
+          y2.file = x.file + ""
+          y2.dir = dir_of_input(dir)
+          y2.production = x.production
+          out.push(y2)
+    elif command == "run" or not (wn in p.all_pkgs):
+      y.dir = dir_of_input(dir)
+      out.push(y)
+    else:
+      # (yarn --cwd x <binary>: the command from that folder)
+      for z in scripts.inputs_from_scripts([name + " " + fwd], Ctx(scripts_, false, false, {}, false, 0)):
+        var y2 = scripts.cp(z)
+        y2.file = x.file + ""
+        y2.dir = dir_of_input(dir)
+        out.push(y2)
   elif m == "@varlock-path" or m == "@varlock-env":
     for z in varlock_inputs(p, fs, x): out.push(scripts.cp(z))
   else: out.push(y)
@@ -1401,11 +1459,20 @@ fn run_plugin(var p: Proj, fs: Fs, os: Os, key: Str):
     if hit: add_entries(&p, ["**/*{{.,-,_}}test.?(c|m)(j|t)s", "**/test-*.?(c|m)(j|t)s", "**/test.?(c|m)(j|t)s", "**/test/**/*.?(c|m)(j|t)s"], mp)
     return
   if key == "husky":
-    let found = find_configs(p, fs, [".husky/commit-msg", ".husky/pre-*", ".husky/post-*", ".husky/prepare-commit-msg", "package.json"])
+    let found = find_configs(p, fs, [".husky/prepare-commit-msg", ".husky/commit-msg", ".husky/pre-{{applypatch,commit,merge-commit,push,rebase,receive}}", ".husky/post-{{checkout,commit,merge,rewrite}}", "package.json"])
     for f in found:
-      if resolve.basename(f) == "package.json": continue
+      if resolve.basename(f) == "package.json":
+        let hk = pkg.get(pkg.get(p.ws[p.cur].manifest, "husky"), "hooks")
+        if pkg.truthy(hk) and not p.production:
+          in_dep(&p, "husky", f, false)
+          var scs: [Str] = []
+          for k in pkg.keys(hk): scs.push(pkg.str_of(pkg.get(hk, k)))
+          add_script_inputs(&p, scs, f, false, "", false)
+        continue
+      config_entry(&p, f)
+      if p.production: continue
       let text = fs.read(fspath(p, f)) else ""
-      add_script_inputs(&p, [text], f, false, "", false)
+      if text != "": add_script_inputs(&p, [text], f, true, "", false)
     return
   if key == "mcp":
     let found = find_configs(p, fs, [".mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"])
@@ -4797,27 +4864,72 @@ fn typedoc_config(var p: Proj, fs: Fs, found: [Str]):
 fn github_workflow(var p: Proj, fs: Fs, f: Str):
   let text = fs.read(fspath(p, f)) else return
   let v = yaml.parse(text)
-  var runs: [Str] = []
-  var dirs: [Str] = []
-  collect_steps(v, &runs, &dirs)
-  for k in 0..runs.len:
-    var d = "."
-    if dirs[k] != "": d = resolve.norm(dirs[k])
-    if d == "": d = "."
-    add_script_inputs(&p, [runs[k]], f, true, d, false)
+  let cdir = resolve.dirname(f)
+  var jobs: [Value] = []
+  by_key_deep(v, "steps", &jobs)
+  for job in jobs:
+    let steps = pkg.get(job, "steps")
+    if not is_arr(steps): continue
+    var path = ""
+    for st in pkg.items(steps):
+      if path != "": break
+      let uses = pkg.str_of(pkg.get(st, "uses"))
+      let w = pkg.get(st, "with")
+      if uses.startswith("actions/checkout@") and pkg.is_text(pkg.get(w, "path")) and not pkg.truthy(pkg.get(w, "repository")): path = pkg.str_of(pkg.get(w, "path"))
+    for st in pkg.items(steps):
+      let wd = pkg.str_of(pkg.get(st, "working-directory"))
+      var rel = "."
+      if path != "" and wd != "": rel = rel_path(resolve.norm(path), resolve.norm(wd))
+      elif wd != "": rel = wd + ""
+      var dir = resolve.norm(rel)
+      let run = pkg.get(st, "run")
+      if not pkg.truthy(run): continue
+      var ap = rel_path(dir, cdir)
+      var apv = "."
+      if ap != "": apv = "./" + ap
+      let script = gha_action_path(pkg.str_of(run), apv)
+      let before = p.inputs.len
+      add_script_inputs(&p, [script], f, true, dir_of_input(dir), false)
+      for k in before..p.inputs.len:
+        if p.inputs[k].kind == I_DEFER_ENTRY and path != "" and wd == "":
+          p.inputs[k].spec = rel_path(resolve.join(dir, path), resolve.norm(p.inputs[k].spec))
+        if p.production: p.inputs[k].optional = true
+  let b = resolve.basename(f)
+  if b == "action.yml" or b == "action.yaml":
+    let runs = pkg.get(v, "runs")
+    if pkg.str_of(pkg.get(runs, "using")).startswith("node"):
+      for k in ["pre", "main", "post"]:
+        let x = pkg.get(runs, k)
+        if pkg.is_text(x): in_entry(&p, "/" + resolve.join(cdir, pkg.str_of(x)), f, false, false)
 
-# the run: commands of a workflow's (or an action's) steps, with their working-directory
-fn collect_steps(v: Value, var runs: [Str], var dirs: [Str]):
-  for job in pkg.values(pkg.get(v, "jobs")):
-    step_runs(pkg.get(job, "steps"), &runs, &dirs)
-  step_runs(pkg.get(pkg.get(v, "runs"), "steps"), &runs, &dirs)
-
-fn step_runs(steps: Value, var runs: [Str], var dirs: [Str]):
-  for s in pkg.items(steps):
-    let r = pkg.get(s, "run")
-    if pkg.is_text(r):
-      runs.push(pkg.str_of(r))
-      dirs.push(pkg.str_of(pkg.get(s, "working-directory")))
+# ACTION_PATH_VAR: ${{ github.action_path }}, ${GITHUB_ACTION_PATH}, $GITHUB_ACTION_PATH
+fn gha_action_path(s: Str, rep: Str) -> Str:
+  var out = ""
+  var i = 0
+  while i < s.len:
+    if s[i] == '$':
+      let rest = s[i..s.len]
+      if rest.startswith("${{GITHUB_ACTION_PATH}}"):
+        out += rep
+        i += 21
+        continue
+      if rest.startswith("$GITHUB_ACTION_PATH"):
+        out += rep
+        i += 19
+        continue
+      if rest.startswith("${{{{"):
+        var j = i + 3
+        while j < s.len and (s[j] == ' ' or s[j] == '\t' or s[j] == '\n' or s[j] == '\r'): j += 1
+        if s[j..s.len].startswith("github.action_path"):
+          var k = j + 18
+          while k < s.len and (s[k] == ' ' or s[k] == '\t' or s[k] == '\n' or s[k] == '\r'): k += 1
+          if s[k..s.len].startswith("}}}}"):
+            out += rep
+            i = k + 2
+            continue
+    out += s[i..i + 1]
+    i += 1
+  return out
 
 # ---- the graph
 
