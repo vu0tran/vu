@@ -70,7 +70,9 @@ for (const command of ['serve', 'build'])
 const projectEnv = { command: 'serve', mode: 'test', isPreview: false, isSsrBuild: false };
 const projectConfigs = async (config, callFns) => {
   const out = [];
-  for (const project of config?.test?.projects ?? []) {
+  if (!config?.test?.projects) return out;
+  // (the expression knip iterates, so a value that isn't iterable fails with the same message)
+  for (const project of config.test.projects) {
     if (typeof project === 'function') { if (callFns) out.push(await project(projectEnv)); }
     else if (typeof project !== 'string') out.push(await project);
   }
