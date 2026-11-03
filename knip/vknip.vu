@@ -607,12 +607,15 @@ fn ws_chain(p: Proj, wi: Int) -> [Int]:
   return out
 
 fn maybe_add_external(var p: Proj, wi: Int, name: Str, spec: Str, dev_only: Bool, type_only: Bool, resolved: Bool) -> Bool:
+  return maybe_add_external_x(&p, wi, name, spec, dev_only or type_only, type_only, resolved)
+
+# (dev_or_type: a reference devDependencies satisfy; a published type is type-only but production)
+fn maybe_add_external_x(var p: Proj, wi: Int, name: Str, spec: Str, dev_or_type: Bool, type_only: Bool, resolved: Bool) -> Bool:
   if not p.report_deps: return true
   if spec.startswith("node:") or spec.startswith("cloudflare:") or resolve.is_builtin(spec): return true
   if name == "node" or name == "bun" or name == "deno": return true
   if name == p.ws[wi].pkg_name: return true
   let chain = ws_chain(p, wi)
-  let dev_or_type = dev_only or type_only
   var closest = -1
   for c in chain:
     if closest < 0 and in_deps(p, c, name, dev_or_type): closest = c
@@ -834,7 +837,7 @@ fn tsc_expand(p: Proj, fs: Fs, file: Str, co: {Str: Value}, top: {Str: Value}) -
   if "include" in top:
     include = []
     for x in pkg.strs(top["include"]): include.push(rel_pattern(x))
-  elif files.len > 0: include = []
+  elif "files" in top: include = []
   var exclude: [Str] = []
   if "exclude" in top:
     for x in pkg.strs(top["exclude"]): exclude.push(rel_pattern(x))
@@ -1014,6 +1017,287 @@ fn manifest_entries(m: Value) -> [Str]:
     pkg.export_targets(pkg.get(im, k), &ts)
     for t in ts:
       if t.startswith(".") and t.find("*") < 0: add_uniq(&out, t)
+  # (targets of a pattern that a null subpath hides are negated, unless another entry names them)
+  if not is_null(ex):
+    var plain: [Str] = []
+    for e in out: plain.push(without_dot_slash(e))
+    for t in hidden_export_targets(ex):
+      let hidden = expand_wildcards(t)
+      let gp = glob.compile(without_dot_slash(hidden))
+      var named = false
+      for e in plain:
+        if glob.matches(gp, e, true): named = true
+      if not named: out.push("!" + hidden)
+  return out
+
+# toDeclarationSpecifier ("" none)
+fn to_decl_spec(s: Str) -> Str:
+  if s.endswith(".js"): return s[0..s.len - 3] + ".d.ts"
+  if s.endswith(".mjs"): return s[0..s.len - 4] + ".d.mts"
+  if s.endswith(".cjs"): return s[0..s.len - 4] + ".d.cts"
+  if is_dts(s): return s + ""
+  return ""
+
+fn local_type_target(t: Str) -> Bool:
+  if t.startswith("/"): return false
+  for seg in t.split("/"):
+    if seg == ".." or seg == "node_modules": return false
+  return true
+
+# collectPublishedTypeTargets: the declaration targets of the types conditions (else of all)
+fn type_targets(v: Value, var out: [Str]):
+  if pkg.is_text(v):
+    let sp = to_decl_spec(pkg.str_of(v))
+    if sp != "" and local_type_target(sp): add_uniq(&out, sp)
+    return
+  if is_arr(v):
+    for x in pkg.items(v): type_targets(x, &out)
+    return
+  if not pkg.is_obj(v): return
+  var typed: [Str] = []
+  for k in pkg.keys(v):
+    if k == "types" or k.startswith("types@"): typed.push(k + "")
+  if typed.len > 0:
+    for k in typed: type_targets(pkg.get(v, k), &out)
+  else:
+    for k in pkg.keys(v): type_targets(pkg.get(v, k), &out)
+
+# getDeclarationPaths: patterns globbed, declaration files that exist
+fn decl_paths(p: Proj, fs: Fs, specs: [Str], dir: Str) -> [Str]:
+  var out: [Str] = []
+  var pats: [Str] = []
+  for sp in specs:
+    let star = sp.find("*")
+    if star >= 0: pats.push(resolve.join(dir, sp[0..star] + "**/*" + sp[star + 1..sp.len].replace("*", "**")))
+    elif is_dts(sp):
+      let f = resolve.join(dir, sp)
+      if exists_file(p, fs, f): add_uniq(&out, f)
+  if pats.len > 0:
+    for f in glob_fs(p, fs, pats):
+      if is_dts(f): add_uniq(&out, f)
+  return out
+
+# matchPublishedTypeTarget: [matched, the star's match ("\0" none)]
+fn match_type_target(pattern: Str, cand: Str) -> [Str]:
+  let pat = without_dot_slash(pattern)
+  let c = without_dot_slash(cand)
+  let star = pat.find("*")
+  if star < 0:
+    if pat == c: return ["1", "\0"]
+    return []
+  let pre = pat[0..star]
+  let suf = pat[star + 1..pat.len]
+  if c.startswith(pre) and c.endswith(suf) and c.len >= pre.len + suf.len: return ["1", c[pre.len..c.len - suf.len]]
+  return []
+
+# isPublishedTypeExportTarget
+fn is_type_export_target(p: Proj, ex: Value, cand: Str) -> Bool:
+  if is_null(ex): return false
+  for e in export_entries(ex):
+    let sub = pkg.str_of(e[0])
+    var pats: [Str] = []
+    type_targets(e[1], &pats)
+    for pt in pats:
+      let m = match_type_target(pt, cand)
+      if m.len == 0: continue
+      var public = sub + ""
+      if m[1] != "\0": public = sub.replace("*", m[1])
+      let r = package_map_target(ex, public)
+      if r.len == 0: continue
+      var sel: [Str] = []
+      type_targets(r[0], &sel)
+      for x in sel:
+        if match_type_target(x, cand).len > 0: return true
+  return false
+
+# getPackageMapTarget: [target] or []
+fn package_map_target(m: Value, key: Str) -> [Value]:
+  if not pkg.is_obj(m):
+    if key == ".": return [json.copy(m)]
+    return []
+  var has_sub = false
+  for k in pkg.keys(m):
+    if not k.startswith(".") and not k.startswith("#"): continue
+    has_sub = true
+    if k == key: return [json.copy(pkg.get(m, k))]
+  if not has_sub:
+    if key == ".": return [json.copy(m)]
+    return []
+  var best = ""
+  var best_pre = -1
+  var found = false
+  for k in pkg.keys(m):
+    let star = k.find("*")
+    if star < 0: continue
+    let pre = k[0..star]
+    let suf = k[star + 1..k.len]
+    if not key.startswith(pre) or not key.endswith(suf) or key.len < pre.len + suf.len: continue
+    if not found or pre.len > best_pre or (pre.len == best_pre and k.len > best.len):
+      best = k + ""
+      best_pre = pre.len
+      found = true
+  if found: return [json.copy(pkg.get(m, best))]
+  return []
+
+fn published_manifest(m: Value) -> Value:
+  let pc = pkg.get(m, "publishConfig")
+  if not pkg.is_obj(pc): return json.copy(m)
+  var out: {Str: Value} = {}
+  for k in pkg.keys(m): out[k] = json.copy(pkg.get(m, k))
+  for k in ["main", "exports", "types", "typings", "typesVersions"]:
+    if json.has(pc, k): out[k] = json.copy(pkg.get(pc, k))
+  return json.Obj(out)
+
+# getPublishedTypeEntryPaths
+fn published_entry_paths(p: Proj, fs: Fs, m: Value, dir: Str) -> [Str]:
+  var versioned: [Str] = []
+  for k in pkg.keys(pkg.get(m, "typesVersions")):
+    let paths = pkg.get(pkg.get(m, "typesVersions"), k)
+    for pk in pkg.keys(paths):
+      for t in pkg.items(pkg.get(paths, pk)):
+        let ts = pkg.str_of(t)
+        if pkg.is_text(t) and local_type_target(ts): add_uniq(&versioned, ts)
+  var out = decl_paths(p, fs, versioned, dir)
+  var cands: [Str] = []
+  for k in ["types", "typings", "main"]:
+    let v = pkg.get(m, k)
+    if not pkg.is_text(v): continue
+    let sp = to_decl_spec(pkg.str_of(v))
+    if sp != "" and local_type_target(sp): add_uniq(&cands, sp)
+  add_uniq(&cands, "index.d.ts")
+  for c in cands:
+    let f = resolve.join(dir, c)
+    if exists_file(p, fs, f):
+      add_uniq(&out, f)
+      break
+  let ex = pkg.get(m, "exports")
+  var specs: [Str] = []
+  if not is_null(ex): type_targets(ex, &specs)
+  for f in decl_paths(p, fs, specs, dir):
+    if is_type_export_target(p, ex, "./" + rel_path(dir, f)): add_uniq(&out, f)
+  return out
+
+# toDeclarationPath of a resolved relative specifier ("" none)
+fn decl_path_for(p: Proj, fs: Fs, base: Str) -> Str:
+  if is_dts(base) and exists_file(p, fs, base): return base + ""
+  let d = to_decl_spec(base)
+  if d != "" and exists_file(p, fs, d): return d
+  for e in [".d.ts", "/index.d.ts"]:
+    if exists_file(p, fs, base + e): return base + e
+  if exists_file(p, fs, base) and not is_dts(base):
+    let d2 = to_decl_spec(base)
+    if d2 != "" and exists_file(p, fs, d2): return d2
+  return ""
+
+# the declarations a package provides: [name, resolved ("1"/"")] (getExternalDependency)
+fn external_types(var p: Proj, fs: Fs, name: Str, file: Str, declared: [Str]) -> [Str]:
+  let pdir = resolve.find_package(&p.rs, fs, name, resolve.dirname(file))
+  if name.startswith("@types/"):
+    if pdir != "": return [name + "", "1"]
+    return [name + "", ""]
+  if pdir != "":
+    let m = pkg.read_json(fs, fspath(p, resolve.join(pdir, "package.json")))
+    let installed = pkg.str_of(pkg.get(m, "name"))
+    if installed.startswith("@types/"): return [installed, "1"]
+    var main_ = pkg.str_of(pkg.get(m, "main"))
+    if main_ == "": main_ = "index.js"
+    let dp = to_decl_spec(resolve.join(pdir, main_))
+    if (dp != "" and exists_file(p, fs, dp)) or pkg.truthy(pkg.get(m, "types")) or pkg.truthy(pkg.get(m, "typings")) or pkg.truthy(pkg.get(m, "typesVersions")) or exists_file(p, fs, resolve.join(pdir, "index.d.ts")): return [name + "", "1"]
+  let tp = dt_for(name)
+  if resolve.find_package(&p.rs, fs, tp, resolve.dirname(file)) != "" or opts.has(declared, tp): return [tp, "1"]
+  if pdir != "": return [name + "", "1"]
+  return [name + "", ""]
+
+fn published_types(var p: Proj, fs: Fs, wi: Int):
+  let dir = p.ws[wi].dir + ""
+  var declared: [Str] = []
+  for f in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]:
+    for k in pkg.keys(pkg.get(p.ws[wi].manifest, f)): add_uniq(&declared, k)
+  var files = published_entry_paths(p, fs, published_manifest(p.ws[wi].manifest), dir)
+  var kw = scan.keywords()
+  var t = ast.new_ast()
+  var k = 0
+  while k < files.len:
+    let file = files[k] + ""
+    k += 1
+    let src = fs.read(fspath(p, file)) else continue
+    let r = extract.analyze(file, src, &kw, &t)
+    for im in r.imps:
+      if resolve.is_builtin(im.spec) or (im.flags & F_OPTIONAL) != 0 or (im.flags & F_AUGMENT) != 0 or im.spec.startswith("virtual:"): continue
+      let spec = resolve.sanitize(im.spec)
+      var name = ""
+      if starts_like_pkg(spec): name = pkg_from_spec(spec)
+      if name == "" or name == p.ws[wi].pkg_name:
+        if name == "" and not spec.startswith("."): continue
+        if spec.startswith("."):
+          let d = decl_path_for(p, fs, resolve.join(resolve.dirname(file), spec))
+          if d != "" and (dir == "" or d.startswith(dir + "/")) and not opts.has(files, d): files.push(d)
+        continue
+      let ext = external_types(&p, fs, name, file, declared)
+      var spos = im.spos
+      if spos < 0: spos = im.pos
+      let l = extract.loc(r, spos)
+      let handled = maybe_add_external_x(&p, wi, ext[0], spec, false, true, ext[1] == "1")
+      if not handled:
+        var i = issue("unlisted", file, ext[0])
+        i.display = display_of(spec, ext[0])
+        i.line = l[0]
+        i.col = l[1]
+        i.pos = l[2]
+        i.ws = p.ws[wi].name + ""
+        add_issue(&p, i)
+
+fn without_dot_slash(s: Str) -> Str:
+  if s.startswith("./"): return s[2..s.len]
+  return s + ""
+
+# getExportEntries: [subpath, target] pairs (the subpaths starting with ".", else "." for all)
+fn export_entries(ex: Value) -> [[Value]]:
+  var out: [[Value]] = []
+  if pkg.is_obj(ex):
+    var has_dot = false
+    for k in pkg.keys(ex):
+      if k.startswith("."): has_dot = true
+    if has_dot:
+      for k in pkg.keys(ex):
+        if k.startswith("."): out.push([json.Text(k + ""), json.copy(pkg.get(ex, k))])
+      return out
+  out.push([json.Text("."), json.copy(ex)])
+  return out
+
+# getHiddenPatternMatch ("\0" none)
+fn hidden_match(null_sub: Str, key: Str) -> Str:
+  let star = key.find("*")
+  let prefix = key[0..star]
+  let suffix = key[star + 1..key.len]
+  let ns = null_sub.find("*")
+  if ns < 0:
+    if null_sub.startswith(prefix) and null_sub.endswith(suffix) and null_sub.len >= key.len: return null_sub[prefix.len..null_sub.len - suffix.len]
+    return "\0"
+  let head = null_sub[0..ns]
+  let tail = null_sub[ns + 1..null_sub.len]
+  let more = head.startswith(prefix) and (head.len > prefix.len or null_sub.len > key.len)
+  if not more: return "\0"
+  if tail.endswith(suffix): return head[prefix.len..head.len] + "*" + tail[0..tail.len - suffix.len]
+  if suffix.endswith(tail): return head[prefix.len..head.len] + "*"
+  return "\0"
+
+# getHiddenExportTargets
+fn hidden_export_targets(ex: Value) -> [Str]:
+  var out: [Str] = []
+  let entries = export_entries(ex)
+  for e in entries:
+    let ns = pkg.str_of(e[0])
+    if not is_null(e[1]) or ns == ".": continue
+    for f in entries:
+      let key = pkg.str_of(f[0])
+      if is_null(f[1]) or key.find("*") < 0: continue
+      let pm = hidden_match(ns, key)
+      if pm == "\0": continue
+      var ts: [Str] = []
+      pkg.export_targets(f[1], &ts)
+      for t in ts:
+        if t.find("*") >= 0: out.push(t.replace("*", pm))
   return out
 
 fn manifest_import_deps(m: Value) -> [Str]:
@@ -7028,8 +7312,8 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
   let mentries = manifest_entries(p.ws[wi].manifest)
   var mpats: [Str] = []
   for s in mentries:
-    if s.startswith("!"): continue
-    mpats.push(source_map_pattern(p.ws[wi], prepend(dir, s)))
+    if s.startswith("!"): mpats.push("!" + source_map_pattern(p.ws[wi], prepend(dir, s[1..s.len])))
+    else: mpats.push(source_map_pattern(p.ws[wi], prepend(dir, s)))
   for f in glob_files(p, mpats):
     if not is_ignored_path(p, f, false): add_entry(&b, f, false, false)
   if not p.production:
@@ -7047,6 +7331,8 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
         exists = fs.exists(fspath(p, abs)) or (mapped != abs and glob_fs(p, fs, [mapped]).len > 0)
       if not exists: add_hint(&p, "package-entry", s, name, mp)
   for d in manifest_import_deps(p.ws[wi].manifest): reference(&p, wi, d)
+  # the dependencies of the published type declarations (getPublishedTypeDependencies)
+  if p.report_deps and not pkg.truthy(pkg.get(p.ws[wi].manifest, "private")) and is_null(pkg.get(pkg.get(p.ws[wi].manifest, "publishConfig"), "directory")): published_types(&p, fs, wi)
   # configured paths
   let cpaths = pkg.get(p.ws[wi].wcfg, "paths")
   for key in pkg.keys(cpaths):
