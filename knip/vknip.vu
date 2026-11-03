@@ -22,6 +22,7 @@ import toml
 import plugins
 import compilers
 import re
+import varlock
 from json import Value
 from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY, I_CATALOG
 from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC
@@ -985,7 +986,9 @@ fn handle_input(var p: Proj, fs: Fs, inp: Input) -> Str:
   if inp.kind == I_DEFER and p.production and not inp.production: return ""
   let base = input_base(inp)
   var target = spec + ""
-  if is_joinable(spec): target = resolve.join(base, spec)
+  if is_joinable(spec):
+    target = resolve.join(base, spec)
+    if spec.endswith("/") and target != "": target = target + "/"
   var r = resolve.resolve(&p.rs, fs, rel_spec(target), "file.ts")
   if not is_joinable(spec): r = resolve.resolve(&p.rs, fs, spec, resolve.join(base, "file.ts"))
   # ("/x": a project-relative path, as loaded configs give absolute paths inside the project)
@@ -1054,7 +1057,7 @@ fn expand_tries(var p: Proj, fs: Fs, own inputs: [Input]) -> [Input]:
   var out: [Input] = []
   for x in inputs:
     if x.kind != I_TRY and x.plugin.startswith("@"):
-      expand_marker(&p, x, &out)
+      expand_marker(&p, fs, x, &out)
       continue
     if x.kind != I_TRY:
       out.push(scripts.cp(x))
@@ -1088,7 +1091,7 @@ fn expand_tries(var p: Proj, fs: Fs, own inputs: [Input]) -> [Input]:
   return expand_tries(&p, fs, out)
 
 # inputs of plugin arguments that need the workspace (knip's resolveInputs with the manifest)
-fn expand_marker(var p: Proj, x: Input, var out: [Input]):
+fn expand_marker(var p: Proj, fs: Fs, x: Input, var out: [Input]):
   var y = scripts.cp(x)
   y.plugin = ""
   let wi = input_ws(p, x)
@@ -1126,7 +1129,7 @@ fn expand_marker(var p: Proj, x: Input, var out: [Input]):
     else: y.spec = t
     out.push(y)
   elif m == "@varlock-path" or m == "@varlock-env":
-    for z in varlock_inputs(p, x): out.push(scripts.cp(z))
+    for z in varlock_inputs(p, fs, x): out.push(scripts.cp(z))
   else: out.push(y)
 
 fn add_script_inputs(var p: Proj, scs: [Str], file: Str, optional: Bool, dir: Str, production: Bool):
@@ -1571,11 +1574,76 @@ fn textlint_input(var p: Proj, x: Str, f: Str):
   if x.startswith("\t"): in_defer_entry(&p, x[1..x.len], f, dir_of_input(p.ws[p.cur].dir))
   else: in_dep(&p, x, f, false)
 
-fn varlock_inputs(p: Proj, x: Input) -> [Input]:
-  return []
+fn varlock_inputs(p: Proj, fs: Fs, x: Input) -> [Input]:
+  var paths: [Str] = [x.spec + ""]
+  if x.plugin == "@varlock-env":
+    let lp = arrayify(dotted_get(p.ws[input_ws(p, x)].manifest, "varlock.loadPath"))
+    if lp.len > 0: paths = lp
+  return varlock_scan(p, fs, paths, input_base(x))
+
+fn varlock_expand(p: Proj, fs: Fs, path: Str) -> [Str]:
+  if not exists_dir(p, fs, path): return [path + ""]
+  var out: [Str] = []
+  let names = fs.list(fspath(p, path)) else return out
+  var ns: [Str] = []
+  for n in names: ns.push(n + "")
+  ns.sort()
+  for n in ns:
+    if n == ".env" or n.startswith(".env."): out.push(resolve.join(path, n))
+  return out
+
+fn varlock_local(d: Str) -> Bool:
+  return d.startswith("~/") or ((d.startswith(".") or d.startswith("/")) and not resolve.in_node_modules(d))
+
+# scanVarlockFiles (paths relative to cwd, project-relative; ~/ paths outside the project are skipped)
+fn varlock_scan(p: Proj, fs: Fs, paths: [Str], cwd: Str) -> [Input]:
+  var out: [Input] = []
+  var queue: [Str] = []
+  for pt in paths:
+    if pt.startswith("~/"): continue
+    for q in varlock_expand(p, fs, arel(to_abs(pt, pabs(cwd)))): queue.push(q)
+  var visited: {Str: Bool} = {}
+  var qi = 0
+  while qi < queue.len:
+    let path = queue[qi] + ""
+    qi += 1
+    if not exists_file(p, fs, path) or is_ignored_path(p, path, false): continue
+    if path in visited: continue
+    visited[path] = true
+    let src = fs.read(fspath(p, path)) else continue
+    let pr = varlock.parse(src)
+    if pr.disabled: continue
+    for d in pr.directives:
+      let ds = d.descriptor
+      if ds == "" or ds.find("$") >= 0 or ds.startswith("//") or has_scheme(ds) or d.enabled == 0: continue
+      if d.name == "plugin":
+        if varlock_local(ds):
+          if ds.startswith("~/"): continue
+          var e = scripts.inp(I_DEFER_ENTRY, ds)
+          e.file = path + ""
+          e.production = true
+          e.skip_exports = true
+          out.push(e)
+        else:
+          let pn = pkg_from_spec(ds)
+          if pn != "":
+            var dep = scripts.inp(I_DEP, pn)
+            dep.file = path + ""
+            dep.production = true
+            out.push(dep)
+        continue
+      if not varlock_local(ds) or ds.startswith("~/"): continue
+      let ip = arel(to_abs(ds, pabs(resolve.dirname(path))))
+      if exists_file(p, fs, ip) or exists_dir(p, fs, ip):
+        for q in varlock_expand(p, fs, ip): queue.push(q)
+      elif d.allow_missing != 1 and d.allow_missing != -1 and d.enabled != -1:
+        var r = scripts.inp(I_DEFER, ds)
+        r.file = path + ""
+        out.push(r)
+  return out
 
 fn moon_expand(v: Str) -> Str:
-  return replace_first(replace_first(v, "$workspaceRoot", ""), "$projectRoot", ".")
+  return replace_first(replace_first(v, "$workspaceRoot", "."), "$projectRoot", ".")
 
 # String.replace with a string pattern: the first occurrence
 fn replace_first(s: Str, a: Str, b: Str) -> Str:
@@ -2635,6 +2703,31 @@ fn plugin_resolve(var p: Proj, fs: Fs, key: Str):
     for n in ["pre-commit", "@fastify/pre-commit"]:
       if has_dep(p.ws[p.cur], n): in_dep(&p, n, mp, false)
   elif key == "bun": bun_resolve(&p)
+  elif key == "nx":
+    for pair in [["generators", "schematics"], ["executors", "builders"]]:
+      var fv = dotted_get(p.ws[p.cur].manifest, pair[0])
+      if is_null(fv): fv = dotted_get(p.ws[p.cur].manifest, pair[1])
+      if not pkg.is_text(fv): continue
+      let fp = resolve.join(dir, pkg.str_of(fv))
+      if not exists_file(p, fs, fp): continue
+      let col = pkg.read_json(fs, fspath(p, fp))
+      for k in [pair[0], pair[1]]:
+        let es = pkg.get(col, k)
+        for ek in pkg.keys(es):
+          let e = pkg.get(es, ek)
+          if not pkg.is_obj(e): continue
+          var impl = pkg.get(e, "implementation")
+          if not pkg.truthy(impl): impl = pkg.get(e, "factory")
+          for id in [impl, pkg.get(e, "batchImplementation")]:
+            if pkg.is_text(id) and pkg.str_of(id) != "":
+              var sid = pkg.str_of(id)
+              let h = sid.find("#")
+              if h >= 0: sid = sid[0..h]
+              in_defer_entry(&p, sid, mp, dir_of_input(resolve.dirname(fp)))
+  elif key == "varlock":
+    var lp = arrayify(dotted_get(p.ws[p.cur].manifest, "varlock.loadPath"))
+    if lp.len == 0: lp = ["."]
+    for z in varlock_scan(p, fs, lp, dir): p.inputs.push(scripts.cp(z))
   elif key == "size-limit":
     var all = sc(p.ws[p.cur].deps)
     for d in p.ws[p.cur].dev_deps: all.push(d + "")
@@ -4041,6 +4134,8 @@ fn nx_config(var p: Proj, f: Str, v: Value):
     var ex_cmds: [Str] = []
     for c in cmds: ex_cmds.push(c.replace("{{projectRoot}}", rel_path(d, cdir)).replace("{{workspaceRoot}}", rel_path(d, "")))
     if ex_cmds.len > 0: add_script_inputs(&p, ex_cmds, f, false, dir_of_input(d), false)
+  for t in pkg.values(pkg.get(v, "targets")):
+    let o = pkg.get(t, "options")
     for pair in [["eslintConfig", "eslint"], ["jestConfig", "jest"], ["karmaConfig", "karma"], ["tsConfig", "typescript"], ["vitestConfig", "vitest"], ["webpackConfig", "webpack"]]:
       let s = pkg.str_of(pkg.get(o, pair[0]))
       if s != "": in_config(&p, pair[1], resolve.norm(s.replace("{{projectRoot}}", cdir).replace("{{workspaceRoot}}", "")), f, ".")
