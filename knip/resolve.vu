@@ -5,6 +5,7 @@
 
 import json
 import pkg
+import glob
 from json import Value
 
 const R_UNRESOLVED = 0
@@ -41,6 +42,15 @@ type Tsc:
   paths: [PathMap]
   base_url: Str
   has_base: Bool
+  refs: [Str]          # its references (tsconfig files), when it has some
+  rootdirs: [Str]
+  # the files it includes (oxc-resolver applies a referenced tsconfig to the files it includes)
+  inc: [glob.Pat]
+  inc_exact: [Str]
+  excl: [glob.Pat]
+  excl_exact: [Str]
+  has_inc: Bool        # include or files given (else **/*)
+  allow_js: Bool
 
 type Resolver:
   root: Str                    # what to put before a path for the file system ("" or "dir/")
@@ -51,6 +61,8 @@ type Resolver:
   tscs: [Tsc]                  # tsconfig files met (paths, baseUrl)
   tsc_of_dir: {Str: Int}       # folder -> its nearest tsconfig.json (index in tscs, -1 none)
   tsc_of_file: {Str: Int}
+  tsc_sel: {Str: Int}          # a source file -> the tsconfig applied to it (references)
+  sel: Int                     # (during one resolution: the selected tsconfig, -2 the folder's)
   wsi: [WsInfo]                # the workspaces, deepest first
   ws_pkgs: {Str: Str}          # workspace package name -> folder
   srcmaps: [SrcMap]
@@ -74,7 +86,7 @@ type RootDirs:
   dirs: [Str]
 
 fn new_resolver(root: Str) -> Resolver:
-  return Resolver(root + "", {}, [], "", false, [], {}, {}, [], {}, [], [], {}, {}, [])
+  return Resolver(root + "", {}, [], "", false, [], {}, {}, {}, -2, [], {}, [], [], {}, {}, [])
 
 const BUILTINS = "_http_agent _http_client _http_common _http_incoming _http_outgoing _http_server _stream_duplex _stream_passthrough _stream_readable _stream_transform _stream_wrap _stream_writable _tls_common _tls_wrap assert assert/strict async_hooks buffer child_process cluster console constants crypto dgram diagnostics_channel dns dns/promises domain events fs fs/promises http http2 https inspector inspector/promises module net os path path/posix path/win32 perf_hooks process punycode querystring readline readline/promises repl stream stream/consumers stream/promises stream/web string_decoder sys timers timers/promises tls trace_events tty url util util/types v8 vm wasi worker_threads zlib"
 
@@ -364,7 +376,12 @@ fn is_relative(spec: Str) -> Bool:
 
 fn resolve(var r: Resolver, fs: Fs, spec0: Str, from: Str) -> Res:
   let dir = dirname(from)
-  let key = dir + "\0" + spec0
+  var key = dir + "\0" + spec0
+  r.sel = -2
+  let ti = tsc_for_dir(&r, fs, dir)
+  if ti >= 0 and r.tscs[ti].refs.len > 0:
+    r.sel = tsc_for_file(&r, fs, from)
+    key = "{r.sel}\0" + key
   if key in r.cache:
     let c = r.cache[key]
     return Res(c.kind, c.path + "", c.pkg + "")
@@ -499,7 +516,7 @@ fn tsc_for_dir(var r: Resolver, fs: Fs, dir: Str) -> Int:
 
 fn load_tsc(var r: Resolver, fs: Fs, f: Str) -> Int:
   if f in r.tsc_of_file: return r.tsc_of_file[f] + 0
-  var t = Tsc([], "", false)
+  var t = Tsc([], "", false, [], [], [], [], [], [], false, false)
   var paths_dir = ""
   var has_paths = false
   var pm = json.Null
@@ -513,10 +530,63 @@ fn load_tsc(var r: Resolver, fs: Fs, f: Str) -> Int:
       let st = key.find("*")
       if st >= 0: t.paths.push(PathMap(key[0..st], true, vals, ""))
       else: t.paths.push(PathMap(key + "", false, vals, ""))
+  let top = pkg.read_json(fs, r.root + f)
+  let fdir = dirname(f)
+  for rf in pkg.items(pkg.get(top, "references")):
+    let rp = pkg.str_of(pkg.get(rf, "path"))
+    if rp == "": continue
+    let abs = join(fdir, rp)
+    if real_file(&r, fs, abs): t.refs.push(abs)
+    elif real_file(&r, fs, join(abs, "tsconfig.json")): t.refs.push(join(abs, "tsconfig.json"))
   let i = r.tscs.len
   r.tscs.push(t)
   r.tsc_of_file[f] = i
   return i
+
+# include, exclude and files patterns: a folder (no wildcard, no extension) stands for its files
+fn tsc_pats(dir: Str, xs: [Str], var pats: [glob.Pat], var exact: [Str]):
+  pats = []
+  exact = []
+  for x in xs:
+    let pth = norm(join(dir, x))
+    let wild = x.find("*") >= 0 or x.find("?") >= 0
+    let b = basename(pth)
+    if wild: pats.push(glob.compile(pth))
+    elif b.find(".") > 0: exact.push(pth)
+    else: pats.push(glob.compile(pth + "/**/*"))
+
+# whether a tsconfig includes a file (as oxc-resolver decides for references)
+fn tsc_includes(r: Resolver, ti: Int, f: Str) -> Bool:
+  let t = r.tscs[ti]
+  let e = extname(f)
+  let is_js = e == ".js" or e == ".jsx" or e == ".mjs" or e == ".cjs"
+  let is_ts = e == ".ts" or e == ".tsx" or e == ".mts" or e == ".cts"
+  if is_js and not t.allow_js: return false
+  for x in t.excl_exact:
+    if x == f: return false
+  if glob.matches_any(t.excl, f, true): return false
+  for x in t.inc_exact:
+    if x == f: return true
+  if not t.has_inc: return is_ts or is_js
+  return (is_ts or is_js) and glob.matches_any(t.inc, f, true)
+
+# the tsconfig applied to a source file: the nearest tsconfig.json, or, when it has references, the
+# first referenced one that includes the file, else itself if it does (-1 none)
+fn tsc_for_file(var r: Resolver, fs: Fs, from: Str) -> Int:
+  if from in r.tsc_sel: return r.tsc_sel[from] + 0
+  let ti = tsc_for_dir(&r, fs, dirname(from))
+  var res = ti
+  if ti >= 0 and r.tscs[ti].refs.len > 0:
+    res = -1
+    let refs = sc_strs(r.tscs[ti].refs)
+    for rf in refs:
+      let ri = load_tsc(&r, fs, rf)
+      if tsc_includes(r, ri, from):
+        res = ri
+        break
+    if res < 0 and tsc_includes(r, ti, from): res = ti
+  r.tsc_sel[from] = res
+  return res
 
 fn tsc_chain(var r: Resolver, fs: Fs, f: Str, var t: Tsc, var paths_dir: Str, var has_paths: Bool, var pm: Value, depth: Int):
   if depth > 8: return
@@ -547,6 +617,25 @@ fn tsc_chain(var r: Resolver, fs: Fs, f: Str, var t: Tsc, var paths_dir: Str, va
   if bu != "":
     t.base_url = join(dir, bu)
     t.has_base = true
+  if json.has(v, "include") or json.has(v, "files"):
+    var ps: [glob.Pat] = []
+    var ex: [Str] = []
+    tsc_pats(dir, pkg.strs(pkg.get(v, "include")), &ps, &ex)
+    for x in pkg.strs(pkg.get(v, "files")): ex.push(norm(join(dir, x)))
+    t.inc = ps
+    t.inc_exact = ex
+    t.has_inc = true
+  if json.has(v, "exclude"):
+    var ps: [glob.Pat] = []
+    var ex: [Str] = []
+    tsc_pats(dir, pkg.strs(pkg.get(v, "exclude")), &ps, &ex)
+    t.excl = ps
+    t.excl_exact = ex
+  if json.has(co, "rootDirs"):
+    var rds: [Str] = []
+    for d in pkg.strs(pkg.get(co, "rootDirs")): rds.push(norm(join(dir, d)))
+    t.rootdirs = rds
+  if json.has(co, "allowJs"): t.allow_js = pkg.truthy(pkg.get(co, "allowJs"))
   if json.has(co, "paths"):
     pm = pkg.get(co, "paths")
     paths_dir = dir + ""
@@ -561,9 +650,13 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
       return Res(R_UNRESOLVED, "", "")
     let f = load_path(&r, fs, join(dir, spec))
     if f != "": return file_res(f)
-    # tsconfig rootDirs: the same relative place under another of the roots
+    # tsconfig rootDirs: the same relative place under another of the roots (a referenced
+    # tsconfig's first, as oxc-resolver applies it)
     var cands: [Str] = []
-    for rd in r.rootdirs:
+    var rds: [RootDirs] = []
+    if r.sel >= 0 and r.tscs[r.sel].rootdirs.len > 1: rds.push(RootDirs("", sc_strs(r.tscs[r.sel].rootdirs)))
+    for rd in r.rootdirs: rds.push(RootDirs(rd.scope + "", sc_strs(rd.dirs)))
+    for rd in rds:
       if dir != rd.scope and rd.scope != "" and not dir.startswith(rd.scope + "/"): continue
       for root in rd.dirs:
         if dir != root and root != "" and not dir.startswith(root + "/"): continue
@@ -582,7 +675,8 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
   if spec.startswith("/"):
     return Res(R_UNRESOLVED, "", "")
   # the nearest tsconfig.json's paths, then its baseUrl
-  let ti = tsc_for_dir(&r, fs, dir)
+  var ti = r.sel
+  if ti == -2: ti = tsc_for_dir(&r, fs, dir)
   if ti >= 0:
     let f = try_paths(&r, fs, ti, spec)
     if f != "": return file_res(f)
@@ -633,3 +727,8 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
   let cand = join(dir, spec)
   if real_file(&r, fs, cand) or is_dir(&r, fs, cand): return Res(R_FILE, cand, "")
   return Res(R_UNRESOLVED, "", "")
+
+fn sc_strs(xs: [Str]) -> [Str]:
+  var out: [Str] = []
+  for x in xs: out.push(x + "")
+  return out
