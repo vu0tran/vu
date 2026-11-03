@@ -13,6 +13,33 @@ modules; `vjq.vu` the command line) plus `glue.c` for libm, time functions and f
     ../vu build --release vjq.vu -o vjq
     vjq -c 'map(select(.x > 5))' data.json
 
+## Install
+
+Releases are tagged `vjq-vX.Y.Z` (vjq's own versions; every one behaves as jq 1.7.1). Linux x86-64
+and ARM64 (static binaries: any distribution, glibc or musl) and macOS 12 or later (Apple silicon,
+Intel). The release has bare binaries named as jq's release assets, so a line that downloads jq
+changes only its URL:
+
+```sh
+curl -fsSL -o /usr/local/bin/jq https://github.com/vu0tran/vu/releases/download/vjq-v0.1.0/jq-linux-amd64
+chmod +x /usr/local/bin/jq          # (jq-linux-arm64, jq-macos-amd64, jq-macos-arm64)
+
+# or vjq and jq (a link) into ~/.local/bin, checked against the release's SHA256SUMS (-b DIR elsewhere)
+curl -fsSL https://raw.githubusercontent.com/vu0tran/vu/main/packaging/tools/install.sh | sh -s -- vjq
+
+# npm: the commands vjq and jq
+npm install --save-dev @vu0tran/vjq
+```
+
+GitHub Actions, in place of `dcarbone/install-jq-action`: `- uses: vu0tran/vu/jq/action@vjq-v0.1.0`
+puts `jq` (vjq) and `vjq` first on PATH. The archives `vjq-0.1.0-linux-amd64.tar.gz` (and
+`linux-arm64`, `macos-amd64`, `macos-arm64`) hold `vjq` and `jq`.
+
+The release binaries never load Oniguruma on Linux (they are static; on macOS a libonig is found
+only in dyld's default paths): the few regex constructs vjq leaves to it (below, Regular expressions)
+are then an error, everything else is vjq's own engine. A binary built from source
+(`../vu build --release vjq.vu`, not static) still uses `libonig.so.5` when it is installed.
+
 ## What it does
 
 - The whole jq 1.7.1 language: paths and assignment (`|=`, `+=`, `del`, `paths`, `getpath`,

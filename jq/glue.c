@@ -16,6 +16,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+/* macOS's libm has these under other names, or without a declaration */
+#define exp10(x) __exp10(x)
+#define drem(x, y) remainder(x, y)
+extern double lgamma_r(double, int *);
+static double vjq_significand(double x) {
+#define significand(x) vjq_significand(x)
+    if (x == 0 || !isfinite(x)) return x;
+    return scalbn(x, -ilogb(x));
+}
+#endif
+
 /* exp10 as the glibc jq 1.7.1's release binaries are linked with computes it (e_exp10.c before
    glibc 2.39: exp of the argument split in two parts times ln 10, not correctly rounded) */
 static double jq_exp10(double arg) {
@@ -196,8 +208,15 @@ vu_str vjq_environ(void) {
 }
 
 /* ---- Oniguruma, loaded at the first regex (dlopen), so vjq runs without it until a regex is
-   used. Its declarations are written out here (from oniguruma.h, BSD licensed). */
+   used. Its declarations are written out here (from oniguruma.h, BSD licensed).
+   A static Linux binary (the release binaries: vu build --static) never loads it: glibc's dlopen
+   in a static program needs the shared libraries of the glibc it was linked with, and musl's
+   can't load anything; there (no _DYNAMIC, which the linker defines only in dynamic programs) the
+   constructs regex.vu leaves to Oniguruma are an error, as when Oniguruma isn't installed. */
 #include <dlfcn.h>
+#ifdef __linux__
+extern char _DYNAMIC[] __attribute__((weak));
+#endif
 typedef unsigned char OnigUChar;
 typedef unsigned int OnigOptionType;
 typedef struct OnigEncodingTypeST OnigEncodingType;
@@ -222,6 +241,9 @@ static int (*p_onig_error_code_to_str)(OnigUChar *, int, ...);
 static int onig_load(void) {
     static int state = 0;   /* 0 not tried, 1 loaded, -1 unavailable */
     if (state) return state;
+#ifdef __linux__
+    if (!_DYNAMIC) { state = -1; return state; }
+#endif
     const char *names[] = {"libonig.so.5", "libonig.so", "libonig.5.dylib", "libonig.dylib", NULL};
     void *h = NULL;
     for (int i = 0; names[i] && !h; i++) h = dlopen(names[i], RTLD_NOW);

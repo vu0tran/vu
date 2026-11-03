@@ -501,8 +501,7 @@ The same directory holds vlint, a linter that prints exactly what oxlint prints 
 default rules (every warning matched on date-fns, zod, vscode, preact, excalidraw and more). It
 takes about as much CPU as oxlint (Rust), 13 times less than Biome and 130 times less than ESLint
 (measured on a loaded 2-core VM; `ts/README.md`). It's on npm as `@vu0tran/vlint`, laid out as
-oxlint is, with an `oxlint` command too (`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`; not published
-yet: `RELEASING.md`).
+oxlint is, with an `oxlint` command too (`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`).
 
 ## A golangci-lint replacement in Vu
 
@@ -534,6 +533,27 @@ byte-identical stdout, stderr and exit status on 2980 of 3000 random filter/docu
 fuzzed against jq. On 100 MB of JSON it pretty-prints in 1.7 s of CPU where jq takes 7.5 s, gojq
 4.7 s and jaq 4.0 s, and runs `map(select(.x > 5))` in 1.4 s (jq 4.5 s, jaq 1.9 s), measured on a
 loaded 2-core VM. Details and what's not done: `jq/README.md`.
+
+## Installing the drop-in tools
+
+Each tool installs the way the original does, under the original's command name too, so switching
+is one line (`RELEASING.md` has how they are released; Linux x86-64 and ARM64 static binaries, macOS
+12 or later):
+
+| tool | replaces | npm (one line in package.json) | elsewhere |
+|---|---|---|---|
+| vlint | oxlint 1.90.0 | `"oxlint": "npm:@vu0tran/vlint@^0.1.0"` | release archives |
+| vgolint | golangci-lint 2.5.0 | | `golint/install.sh` (golangci-lint's installer's interface), `golint/action` |
+| vsc | ShellCheck 0.11.0 | `"shellcheck": "npm:@vu0tran/vsc@^0.1.0"` | archives named as ShellCheck's, `install.sh`, `shellcheck/action` (ludeeus/action-shellcheck's inputs), pre-commit hook |
+| vjq | jq 1.7.1 | `@vu0tran/vjq` (`jq` and `vjq`) | binaries named as jq's (`jq-linux-amd64`, ...), `install.sh`, `jq/action` |
+| vknip | knip 6.44.1 | `"knip": "npm:@vu0tran/vknip@^0.1.0"` | release archives, `install.sh` |
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vu0tran/vu/main/packaging/tools/install.sh | sh -s -- vsc   # or vjq, vknip, vlint
+```
+
+Each tool's README has an Install section: `shellcheck/README.md`, `jq/README.md`, `knip/README.md`,
+`golint/README.md`, `packaging/npm/vlint/README.md`.
 
 ## Built for the model that writes it
 

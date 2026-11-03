@@ -14,6 +14,29 @@ vknip --directory DIR --reporter json --workspace packages/x --production --stri
 vknip --fix --allow-remove-files              # knip's --fix, file for file
 ```
 
+## Install
+
+Releases are tagged `vknip-vX.Y.Z` (vknip's own versions; every one behaves as knip 6.44.1). knip is
+an npm package, and so is vknip: `@vu0tran/vknip` has the commands `vknip` and `knip`, so switching
+a project is one line in package.json:
+
+```diff
+   "devDependencies": {
+-    "knip": "^6.44.1"
++    "knip": "npm:@vu0tran/vknip@^0.1.0"
+   }
+```
+
+(or `npm install --save-dev @vu0tran/vknip`). The package also has the types of `import type {
+KnipConfig } from "knip"`, `defineConfig` from `knip/config` and knip's `schema.json`, written for
+vknip (the types by hand, looser than knip's), and depends on jiti, which vknip's node process uses
+for JavaScript and TypeScript configs when the project has none. Linux x86-64 and ARM64 (static
+binaries), macOS 12 or later; Node.js where it runs, as for knip. For machines without npm, the
+release archives (`vknip-0.1.0-linux-x64.tar.gz`, ...: `vknip` and `knip`) install with
+`curl -fsSL https://raw.githubusercontent.com/vu0tran/vu/main/packaging/tools/install.sh | sh -s -- vknip`;
+TypeScript configs then load with the project's jiti, or Node's own type stripping (which rejects
+enums and namespaces).
+
 It follows knip's own code (graph/build.js, graph/analyze.js, the graph explorer, the import and
 export visitors, DependencyDeputy, the script parser, the plugins), reading files with vtsc's
 parser (`ts/scan.vu`, `ts/parse.vu`, `ts/ast.vu`, linked into this folder unchanged; exact mode keeps

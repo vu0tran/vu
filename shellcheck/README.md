@@ -26,6 +26,66 @@ a generated Unicode table):
 ./vsc [OPTIONS...] FILES...       # exactly shellcheck's options; see ./vsc --help
 ```
 
+## Install
+
+Releases are tagged `vsc-vX.Y.Z` (vsc's own versions; every one checks as ShellCheck 0.11.0 does).
+Each channel installs `vsc` and `shellcheck` (the same program), so scripts and editors that call
+`shellcheck` keep working. Linux x86-64 and ARM64 (static binaries: any distribution, glibc or musl)
+and macOS 12 or later (Apple silicon, Intel).
+
+```sh
+# into ~/.local/bin (-b DIR elsewhere; a version as the last argument, else the latest release)
+curl -fsSL https://raw.githubusercontent.com/vu0tran/vu/main/packaging/tools/install.sh | sh -s -- vsc
+
+# npm: in place of the `shellcheck` npm package, one line in package.json
+#   "shellcheck": "npm:@vu0tran/vsc@^0.1.0"
+npm install --save-dev @vu0tran/vsc
+```
+
+The release archives are named as ShellCheck's, with `vsc` for `shellcheck`:
+`vsc-v0.1.0.linux.x86_64.tar.xz` (`linux.aarch64`, `darwin.x86_64`, `darwin.aarch64`), holding
+`vsc-v0.1.0/vsc` and `vsc-v0.1.0/shellcheck`, so a Dockerfile line that unpacks ShellCheck's archive
+changes only its URL and names:
+
+```sh
+curl -fsSL https://github.com/vu0tran/vu/releases/download/vsc-v0.1.0/vsc-v0.1.0.linux.x86_64.tar.xz | tar -xJf -
+cp vsc-v0.1.0/vsc /usr/local/bin/shellcheck
+```
+
+**GitHub Actions**, in place of `ludeeus/action-shellcheck` with the same inputs (`scandir`,
+`severity`, `format`, `ignore_paths`, `ignore_names`, `additional_files`, `check_together`), the same
+file discovery and outputs; `version` names a vsc release:
+
+```yaml
+- uses: vu0tran/vu/shellcheck/action@vsc-v0.1.0     # was: ludeeus/action-shellcheck@master
+  with:
+    scandir: ./scripts
+    severity: warning
+```
+
+**pre-commit**: in place of `shellcheck-py/shellcheck-py` or `koalaman/shellcheck-precommit` (the
+hook runs the vsc on PATH, so install it first):
+
+```yaml
+- repo: https://github.com/vu0tran/vu
+  rev: vsc-v0.1.0
+  hooks:
+    - id: shellcheck
+```
+
+or, with nothing installed beforehand, pre-commit's own node environment fetches a pinned vsc from npm:
+
+```yaml
+- repo: local
+  hooks:
+    - id: shellcheck
+      name: shellcheck (vsc)
+      language: node
+      additional_dependencies: ['@vu0tran/vsc@0.1.0']
+      entry: shellcheck
+      types: [shell]
+```
+
 ## Drop-in status
 
 **Nothing known differs.** On every file ShellCheck finishes, vsc's stdout, stderr and exit status
