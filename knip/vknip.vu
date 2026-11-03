@@ -23,7 +23,7 @@ import plugins
 import compilers
 import re
 from json import Value
-from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE
+from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY
 from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC
 from resolve import Resolver, Res, R_UNRESOLVED, R_FILE, R_EXTERNAL, R_BUILTIN
 from report import Issue, Hint, issue, copy_issue
@@ -1033,6 +1033,45 @@ fn new_ctx(w: Ws, optional: Bool) -> Ctx:
   for k, v in w.scripts: names[k] = v + ""
   return Ctx(names, false, optional, {}, false)
 
+# I_TRY inputs (bun x.ts): the file when it resolves, else what the rest of the command runs
+fn expand_tries(var p: Proj, fs: Fs, own inputs: [Input]) -> [Input]:
+  var any = false
+  for x in inputs:
+    if x.kind == I_TRY: any = true
+  if not any: return inputs
+  var out: [Input] = []
+  for x in inputs:
+    if x.kind != I_TRY:
+      out.push(scripts.cp(x))
+      continue
+    let base = input_base(x)
+    let r = resolve.resolve(&p.rs, fs, rel_spec(resolve.join(base, x.spec)), "file.ts")
+    if r.kind == R_FILE:
+      var e = scripts.cp(x)
+      e.kind = I_ENTRY
+      e.spec = "/" + r.path
+      e.skip_exports = true
+      e.plugin = ""
+      out.push(e)
+      continue
+    if x.plugin.startswith("B:"):
+      var b = scripts.cp(x)
+      b.kind = I_BIN
+      b.spec = x.plugin[2..x.plugin.len]
+      b.optional = true
+      b.plugin = ""
+      out.push(b)
+    elif x.plugin.startswith("S:"):
+      var wi = input_ws(p, x)
+      for y in scripts.inputs_from_scripts([x.plugin[2..x.plugin.len]], new_ctx(p.ws[wi], x.optional)):
+        var z = scripts.cp(y)
+        z.file = x.file + ""
+        z.dir = x.dir + ""
+        z.production = x.production
+        if z.kind == I_ENTRY or z.kind == I_DEFER_ENTRY or z.kind == I_DEFER: z.skip_exports = true
+        out.push(z)
+  return expand_tries(&p, fs, out)
+
 fn add_script_inputs(var p: Proj, scs: [Str], file: Str, optional: Bool, dir: Str, production: Bool):
   # (the scripts a command can run are those of the workspace of its folder: getManifest(dir))
   var wi = p.cur
@@ -1140,9 +1179,67 @@ fn plugin_enabled(p: Proj, fs: Fs, pl: plugins.Plugin) -> Bool:
 
 fn bun_test(w: Ws) -> Bool:
   for _, v in w.scripts:
-    var i = v.find("bun test")
-    if i >= 0: return true
+    let pa = scripts.bun_test_args(v)
+    if pa.pos.len > 0: return true
   return false
+
+fn bun_pats() -> [Str]:
+  return ["**/*.{{test,spec}}.{{js,jsx,ts,tsx}}", "**/*_{{test,spec}}.{{js,jsx,ts,tsx}}"]
+
+fn is_js_file_suffix(s: Str) -> Bool:
+  # /\.[cm]?[jt]sx?$/
+  for e in [".js", ".ts", ".jsx", ".tsx", ".cjs", ".mjs", ".cts", ".mts", ".cjsx", ".mjsx", ".ctsx", ".mtsx"]:
+    if s.endswith(e): return true
+  return false
+
+# bun's test targets as patterns (toPatterns)
+fn bun_patterns(arg: Str) -> [Str]:
+  var out: [Str] = []
+  if arg.find("*") >= 0 or arg.find("{{") >= 0 or arg.find("?") >= 0: return [arg + ""]
+  let is_path = arg.startswith("/") or arg.startswith("./") or arg.startswith("../")
+  if not is_path:
+    if arg == ".": return bun_pats()
+    if is_js_file_suffix(arg): return ["**/*" + arg]
+    for pt in bun_pats(): out.push("**/*" + arg + "*/" + pt)
+    for pt in bun_pats(): out.push("**/*" + arg + "*" + pt[4..pt.len])
+    return out
+  # /\.\w+$/
+  let dot = rfind(arg, ".")
+  if dot >= 0 and dot < arg.len - 1:
+    var word = true
+    for k in dot + 1..arg.len:
+      if not (is_alnum(arg[k]) or arg[k] == '_'): word = false
+    if word: return [arg + ""]
+  var d = arg + ""
+  while d.endswith("/"): d = d[0..d.len - 1]
+  for pt in bun_pats(): out.push(d + "/" + pt)
+  return out
+
+fn bun_resolve(var p: Proj):
+  let mp = p.ws[p.cur].manifest_path + ""
+  in_ignore(&p, "bun", "dependencies", mp)
+  var keys: [Str] = []
+  var vals: {Str: Str} = {}
+  if "." in p.all_pkgs:
+    let rm = p.all_pkgs["."]
+    let rs = pkg.get(rm, "scripts")
+    for k in pkg.keys(rs):
+      if pkg.is_text(pkg.get(rs, k)):
+        if not (k in vals): keys.push(k + "")
+        vals[k] = pkg.str_of(pkg.get(rs, k))
+  for k in sc(p.ws[p.cur].script_keys):
+    if not (k in vals): keys.push(k + "")
+    vals[k] = p.ws[p.cur].scripts[k] + ""
+  for k in keys:
+    let pa = scripts.bun_test_args(vals[k])
+    if pa.pos.len == 0: continue
+    var pats: [Str] = []
+    if pa.pos.len == 1: pats = bun_pats()
+    else:
+      for t in pa.pos[1..pa.pos.len]:
+        for x in bun_patterns(t): pats.push(x)
+    for x in pats: in_entry(&p, x, mp, false, false)
+    for x in scripts.opt_vals(pa, "preload"): add_defer(&p, x, mp)
 
 fn c12(name: Str) -> [Str]:
   return ["." + name + "rc", ".config/" + name + "rc", "." + name + "rc.{{json,jsonc,json5,yaml,yml,js,ts,mjs,cjs,mts,cts,toml}}", ".config/" + name + "rc.{{json,jsonc,json5,yaml,yml,js,ts,mjs,cjs,mts,cts,toml}}", name + ".config.{{js,ts,mjs,cjs,mts,cts}}"]
@@ -1292,7 +1389,7 @@ fn run_plugin(var p: Proj, fs: Fs, os: Os, key: Str):
 
 # the plugins whose config files vknip reads (resolveConfig)
 fn has_resolver(key: Str) -> Bool:
-  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt swc wrangler msw tanstack-router drizzle svgr biome github-action nitro metro prisma react-native oclif next webpack vue expo expo-router rspack mdx graphql-codegen knex vite-plugin-pwa pm2 karma stryker tauri react-router buf cucumber rsbuild commitizen markdownlint convex cspell docusaurus electron-forge jasmine serverless-framework parcel electron-vite webdriver-io payload netlify simple-git-hooks wxt panda-css tsd yorkie travis yarn pnpm wireit nano-staged preconstruct ".find(" " + key + " ") >= 0
+  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt swc wrangler msw tanstack-router drizzle svgr biome github-action nitro metro prisma react-native oclif next webpack vue expo expo-router rspack mdx graphql-codegen knex vite-plugin-pwa pm2 karma stryker tauri react-router buf cucumber rsbuild commitizen markdownlint convex cspell docusaurus electron-forge jasmine serverless-framework parcel electron-vite webdriver-io payload netlify simple-git-hooks wxt panda-css tsd yorkie travis yarn pnpm wireit nano-staged preconstruct bun ".find(" " + key + " ") >= 0
 
 fn js_ext(f: Str) -> Bool:
   let e = resolve.extname(f)
@@ -1675,6 +1772,7 @@ fn plugin_resolve(var p: Proj, fs: Fs, key: Str):
   elif key == "pre-commit":
     for n in ["pre-commit", "@fastify/pre-commit"]:
       if has_dep(p.ws[p.cur], n): in_dep(&p, n, mp, false)
+  elif key == "bun": bun_resolve(&p)
   elif key == "size-limit":
     var all = sc(p.ws[p.cur].deps)
     for d in p.ws[p.cur].dev_deps: all.push(d + "")
@@ -1748,6 +1846,8 @@ fn resolve_config(var p: Proj, fs: Fs, os: Os, key: Str, f: Str, v: Value):
   let wdir = p.ws[p.cur].dir + ""
   if key == "vite" or key == "vitest": vite_config(&p, fs, key, f, v)
   elif key == "jest": jest_config(&p, fs, f, v)
+  elif key == "bun":
+    for x in arrayify(pkg.get(pkg.get(v, "test"), "preload")): add_defer(&p, x, f)
   elif key == "mocha":
     var specs = arrayify(pkg.get(v, "spec"))
     if not json.has(v, "spec"): specs = ["**/test/*.{{js,cjs,mjs}}"]
@@ -3678,12 +3778,19 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
   if scs.len > 0 and wi >= 0:
     let saved = p.cur
     p.cur = wi
+    var raw_in: [Input] = []
     for x in scripts.inputs_from_scripts(scs, new_ctx(p.ws[wi], false)):
       var y = scripts.cp(x)
       y.file = path + ""
       if y.dir == "": y.dir = resolve.dirname(path)
       if y.dir == "": y.dir = "."
       if p.production: y.production = true
+      raw_in.push(y)
+    for y in expand_tries(&p, fs, raw_in):
+      if y.kind == I_ENTRY and y.spec.startswith("/"):
+        let rp = y.spec[1..y.spec.len]
+        if not is_ignored_path(p, rp, false): add_entry(&b, rp, true, true)
+        continue
       let f = handle_input(&p, fs, y)
       if f != "": add_entry(&b, f, true, true)
     p.cur = saved
@@ -4800,8 +4907,9 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
   # plugins
   p.inputs = []
   run_plugins(&p, fs, os)
-  var inputs: [Input] = []
-  swap(&inputs, &p.inputs)
+  var inputs0: [Input] = []
+  swap(&inputs0, &p.inputs)
+  var inputs = expand_tries(&p, fs, inputs0)
   var pt = Patterns([], [], [], [], [], ["default"])
   for inp in inputs:
     if inp.group != "" and not opts.has(pt.groups, inp.group): pt.groups.push(inp.group + "")
