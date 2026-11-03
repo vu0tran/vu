@@ -217,3 +217,20 @@ case("p7_forge_jasmine_sls_stencil", {
     "stencil.config.ts": "export const config = { srcDir: 'comp', globalScript: 'comp/global.ts', outputTargets: [] };\n",
     "comp/my-el.tsx": "export {};\n", "comp/global.ts": "export {};\n", "comp/util.ts": "export {};\n",
 }, PROD)
+
+case("p7_batch8", {
+    "package.json": pkg(deps=["payload", "wxt", "@wxt-dev/module-react", "sst"], dev=["parcel", "@parcel/transformer-sass", "@parcel/config-default", "electron-vite", "@wdio/cli", "@wdio/mocha-framework", "@wdio/spec-reporter", "netlify-cli", "@netlify/plugin-nextjs", "sharp", "simple-git-hooks", "lint-staged", "@pandacss/dev", "@pandacss/preset-panda", "postcss", "tsd", "unused-dev"],
+        extra={"simple-git-hooks": {"pre-commit": "npx lint-staged"}, "tsd": {"directory": "types-test"}}),
+    **mods("payload", "wxt", "@wxt-dev/module-react", "sst", "parcel", "@parcel/transformer-sass", "@parcel/config-default", "electron-vite", "@wdio/cli", "@wdio/mocha-framework", "@wdio/spec-reporter", "netlify-cli", "@netlify/plugin-nextjs", "sharp", "simple-git-hooks", "lint-staged", "@pandacss/dev", "@pandacss/preset-panda", "postcss", "tsd", "unused-dev"),
+    ".parcelrc": json.dumps({"extends": "@parcel/config-default", "transformers": {"*.scss": ["@parcel/transformer-sass"]}}),
+    "electron.vite.config.ts": "export default ({ command }) => ({ main: { build: { lib: { entry: 'app/main.ts' } } }, renderer: () => ({ build: { rollupOptions: { input: { index: 'app/index.html' } } } }) });\n",
+    "app/main.ts": "export {};\n", "app/index.html": "<script type=\"module\" src=\"./renderer.ts\"></script>\n", "app/renderer.ts": "export {};\n", "src/preload/index.ts": "export {};\n", "app/x.ts": "export {};\n",
+    "wdio.conf.ts": "export const config = { framework: 'mocha', runner: 'local', reporters: ['spec'] };\n",
+    "payload.config.ts": "export default { routes: { admin: '/cms' } };\n", "app/(payload)/cms/importMap.js": "export const importMap = {};\n",
+    "netlify.toml": "[functions]\ndirectory = \"fns\"\nexternal_node_modules = [\"sharp\"]\n[[plugins]]\npackage = \"@netlify/plugin-nextjs\"\n", "fns/hello.ts": "export {};\n",
+    "wxt.config.ts": "export default { modules: ['@wxt-dev/module-react'] };\n", "entrypoints/popup.ts": "export {};\n",
+    "panda.config.ts": "export default { presets: ['@pandacss/preset-panda'] };\n",
+    "types-test/a.test-d.ts": "export {};\n",
+    "sst.config.ts": "export default { stacks(app) { app.stack(Api); } };\nimport { Api } from './stacks/Api';\n",
+    "stacks/Api.ts": "export function Api() { return { handler: 'functions/lambda.main' }; }\n", "functions/lambda.ts": "export const main = 1;\n", "functions/other.ts": "export {};\n",
+}, PROD)

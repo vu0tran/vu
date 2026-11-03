@@ -215,6 +215,14 @@ for (const r of reqs) {
       }
       v = forge;
     }
+    if (r.mode === 'electron-vite') {
+      const env = { command: 'build', mode: 'production' };
+      const cfg = typeof v === 'function' ? await v(env) : v;
+      const out = { ...(cfg ?? {}) };
+      for (const name of ['main', 'preload', 'renderer']) if (typeof out[name] === 'function') out[name] = await out[name](env);
+      v = out;
+    }
+    if (r.mode === 'call0' && typeof v === 'function') v = await v();
     if (r.mode === 'karma') {
       if (typeof v !== 'function') v = null;
       else { const mem = { config: undefined, set(c) { this.config = c; } }; await v(mem); v = mem.config ?? {}; }
