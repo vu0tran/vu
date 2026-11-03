@@ -47,7 +47,7 @@ const enc = (v, depth, seen) => {
   if (typeof v === 'function') return { '__vknip_fn': v.name || '' };
   if (v instanceof RegExp) return { '__vknip_re': v.source, flags: v.flags };
   if (v instanceof Promise) return { '__vknip_promise': 1 };
-  if (depth > 9 || seen.has(v)) return { '__vknip_cycle': 1 };
+  if (depth > 40 || seen.has(v)) return { '__vknip_cycle': 1 };
   seen.add(v);
   let out;
   if (Array.isArray(v) || v instanceof Set) out = Array.from(v, x => { const e = enc(x, depth + 1, seen); return e === undefined ? null : e; });
