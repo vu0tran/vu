@@ -5,8 +5,9 @@
 #     VERSION   0.1.0 (a leading v or TOOL-v is dropped)
 #     PLATFORM  linux-x64, linux-arm64, darwin-x64 or darwin-arm64
 #     MARCH     the CPU to build for (default: x86-64-v2 for x64, armv8-a for arm64), never native
-# into dist/ (each archive holds one folder, named as the archive, with the binary, LICENSE, NOTICE
-# and README.md; the original's name is a symbolic link to the binary):
+# into dist/ (each archive holds one folder, named as the archive, or for vsc vsc-vVERSION as in
+# ShellCheck's archives, with the binary, LICENSE, NOTICE and README.md; the original's name is a
+# symbolic link to the binary):
 #   vlint:    vlint-VERSION-PLATFORM.tar.gz               vlint
 #   vgolint:  vgolint-VERSION-GOOS-GOARCH.tar.gz          vgolint (golangci-lint's names: linux-amd64, darwin-arm64, ...)
 #   vsc:      vsc-vVERSION.OS.ARCH.tar.xz                 vsc, shellcheck -> vsc (ShellCheck's names:
@@ -47,7 +48,7 @@ rm -rf "$out"; mkdir -p "$out"
 static=""
 if [ "$os" = linux ]; then static="--static"; else export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"; fi
 export VU_MARCH="$march"
-alias=""; ext=tar.gz; bare=""
+alias=""; ext=tar.gz; bare=""; folder=""
 case "$tool" in
   vlint)
     # one C file (VU_SPLIT=off): the fastest binary
@@ -58,7 +59,7 @@ case "$tool" in
     name="vgolint-$v-$goname"; readme=golint/README.md ;;
   vsc)
     ./vu build --release $static shellcheck/vsc.vu -o "$out/vsc"
-    name="vsc-v$v.$scname"; readme=shellcheck/README.md; alias=shellcheck; ext=tar.xz ;;
+    name="vsc-v$v.$scname"; folder="vsc-v$v"; readme=shellcheck/README.md; alias=shellcheck; ext=tar.xz ;;
   vjq)
     (cd jq && VU_SPLIT=off ../vu build --release $static vjq.vu -o "$out/vjq")
     name="vjq-$v-$jqname"; readme=jq/README.md; alias=jq; bare="jq-$jqname" ;;
@@ -81,7 +82,8 @@ else
   fi
 fi
 
-d="$out/$name"
+[ -n "$folder" ] || folder="$name"
+d="$out/$folder"
 mkdir -p "$d"
 cp "$out/$bin" "$d/"
 [ -n "$alias" ] && ln -s "$bin" "$d/$alias"
@@ -89,11 +91,11 @@ cp LICENSE "$d/"
 [ -f NOTICE ] && cp NOTICE "$d/"
 cp "$readme" "$d/README.md"
 case "$ext" in
-  tar.gz) (cd "$out" && tar czf "$root/dist/$name.$ext" "$name") ;;
+  tar.gz) (cd "$out" && tar czf "$root/dist/$name.$ext" "$folder") ;;
   tar.xz)
     # (xz where it's installed; else tar's own: macOS's bsdtar has liblzma built in)
-    if command -v xz >/dev/null; then (cd "$out" && tar cf - "$name" | xz -9 > "$root/dist/$name.$ext")
-    else (cd "$out" && tar cJf "$root/dist/$name.$ext" "$name"); fi ;;
+    if command -v xz >/dev/null; then (cd "$out" && tar cf - "$folder" | xz -9 > "$root/dist/$name.$ext")
+    else (cd "$out" && tar cJf "$root/dist/$name.$ext" "$folder"); fi ;;
 esac
 files="$name.$ext"
 if [ -n "$bare" ]; then

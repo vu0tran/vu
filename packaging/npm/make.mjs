@@ -29,7 +29,8 @@ const PLATFORMS = [
 ];
 const repo = "https://github.com/vu0tran/vu";
 
-// archive(version, platform): the archive's folder name (and file name without the extension)
+// archive(version, platform): the archive's file name without the extension, and the name of the
+// folder in it unless folder(version, platform) says otherwise
 // launcher: the launcher template (one file per command, bin/COMMAND.js, unless `shared`, vlint's
 // one file for both); extra: more files for the main package, from packaging/npm/TOOL/
 const TOOLS = {
@@ -46,6 +47,7 @@ const TOOLS = {
   },
   vsc: {
     archive: (v, p) => `vsc-v${v}.${p.sc}`,
+    folder: (v) => `vsc-v${v}`,
     ext: "tar.xz",
     dir: "shellcheck",
     homepage: `${repo}/tree/main/shellcheck#readme`,
@@ -150,7 +152,7 @@ for (const p of PLATFORMS) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `${tool}-npm-`));
   execFileSync("tar", ["xf", path.resolve(archive), "-C", tmp]);
   const bin = path.join(dir, "bin", tool);
-  fs.copyFileSync(path.join(tmp, folder, tool), bin);
+  fs.copyFileSync(path.join(tmp, t.folder ? t.folder(version, p) : folder, tool), bin);
   fs.chmodSync(bin, 0o755);
   fs.rmSync(tmp, { recursive: true, force: true });
   fs.copyFileSync(license, path.join(dir, "LICENSE"));

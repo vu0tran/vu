@@ -28,9 +28,9 @@ Outside npm: release binaries named as jq's (`jq-linux-amd64`, `jq-macos-arm64`,
 - Regular expressions: vjq has its own engine, written to behave as the Oniguruma jq 1.7.1
   bundles. A few constructs (absent groups `(?~...)`, callouts, subexpression calls `\g<name>`,
   `\X`, `\y`, variable-length look-behind, raw `\xHH` bytes above 0x7F, some nested classes) are
-  left to Oniguruma, which the binaries in these packages never load (they are static): such a
-  pattern is an error (`not supported by vjq's regex engine`). Everything else matched jq's
-  Oniguruma on 250,000 fuzzed patterns.
+  left to Oniguruma, which the Linux binaries never load (they are static; the macOS ones look
+  for it only in dyld's default paths): such a pattern is then an error (`not supported by vjq's
+  regex engine`). Everything else matched jq's Oniguruma on 250,000 fuzzed patterns.
 - `--debug-dump-disasm` and `--debug-trace` are accepted but print nothing.
 - Platforms: Linux x64 and ARM64 (static binaries: any glibc or musl), macOS 12 or later on Apple
   silicon and Intel. No Windows build.

@@ -107,11 +107,11 @@ case "$v" in
 esac
 tag="$tool-v$v"
 
-# the archive's name, as build.sh makes it (the originals' naming schemes)
+# the archive's name, as build.sh makes it (the originals' naming schemes), and its folder's
 case "$tool" in
   vsc)
     case "$arch" in x64) a=x86_64 ;; *) a=aarch64 ;; esac
-    name="vsc-v$v.$os.$a"; file="$name.tar.xz" ;;
+    name="vsc-v$v"; file="$name.$os.$a.tar.xz" ;;
   vjq)
     o=$os; [ "$os" = darwin ] && o=macos
     case "$arch" in x64) a=amd64 ;; *) a=arm64 ;; esac
