@@ -208,6 +208,9 @@ type Proj:
   tty: Bool                  # standard output is a terminal (and --no-progress isn't given): isShowProgress
   cols: Int                  # the tables' width (the terminal's, else 120)
   caught_now: Bool           # (the external import being checked is caught)
+  links: {Str: Bool}         # the project's symbolic links (paths)
+  list_links: fn(Str) -> [Str]
+  realp: fn(Str) -> Str
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -247,13 +250,19 @@ fn in_selected(p: Proj, path: Str) -> Bool:
 fn ignored_issue_file(var p: Proj, rel: Str) -> Bool:
   var hit = false
   var neg = false
+  var pos = 0
+  var negs = 0
   for k in 0..p.ign_pats.len:
     if p.ign_ids[k].startswith("!"):
+      negs += 1
       if glob.match_str(p.ign_ids_full[k], rel, true): neg = true
       continue
+    pos += 1
     if glob.matches(p.ign_pats[k], rel, true):
       hit = true
       p.ign_used[k] = true
+  # (only negated patterns: what they don't match is ignored, as picomatch(negated))
+  if pos == 0 and negs > 0: return not neg
   return hit and not neg
 
 fn should_ignore_issue(p: Proj, rel: Str, typ: Str) -> Bool:
@@ -354,17 +363,42 @@ fn walk(var p: Proj, fs: Fs, dir: Str):
   if ".gitignore" in names and p.gitignore:
     let text = fs.read(fspath(p, resolve.join(dir, ".gitignore"))) else ""
     if dir != "" and relevant_dir(p, dir): add_gitignore(&p, text, dir)
+  # (symbolic links aren't followed or listed: knip's glob has followSymbolicLinks false; imports
+  # through them resolve to the real path)
+  var links: {Str: Bool} = {}
+  for x in p.list_links(fspath(p, dir)):
+    links[x] = true
+    p.links[resolve.join(dir, x)] = true
   for nm in names:
     if nm.endswith("/"):
       let name = nm[0..nm.len - 1]
       if name == "node_modules" or name == ".git": continue
+      if name in links: continue
       let sub = resolve.join(dir, name)
       if p.gitignore and is_ignored_here(p, sub): continue
       walk(&p, fs, sub)
     else:
+      if nm in links: continue
       let f = resolve.join(dir, nm)
       if p.gitignore and is_ignored_here(p, f): continue
       p.files.push(f)
+
+# a resolved file whose path goes through a symbolic link: its real path in the project
+fn real_path(p: Proj, f: Str) -> Str:
+  if p.links.len == 0: return f + ""
+  var cur = f
+  var through = false
+  while cur != "":
+    if cur in p.links:
+      through = true
+      break
+    cur = resolve.dirname(cur)
+  if not through: return f + ""
+  let abs = p.realp(fspath(p, f))
+  let base = p.realp(fspath(p, "."))
+  if abs == "" or base == "": return f + ""
+  if abs.startswith(base + "/"): return abs[base.len + 1..abs.len]
+  return f + ""
 
 # ---- globs
 
@@ -5875,7 +5909,7 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
   var unres: [Ext] = []
   for im in imps:
     let t_rs = pt(p)
-    let r = resolve.resolve(&p.rs, fs, im.spec, path)
+    var r = resolve.resolve(&p.rs, fs, im.spec, path)
     pe(&p, "resolveModuleName", t_rs)
     let type_only = is_dts or (im.flags & F_TYPEONLY) != 0
     var spos = im.spos
@@ -5886,6 +5920,7 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
     if (im.flags & F_AUGMENT) != 0 and (r.kind != R_FILE):
       if not (im.spec in targets): targets[im.spec] = -1
       continue
+    if r.kind == R_FILE and p.links.len > 0: r.path = real_path(p, r.path)
     if r.kind == R_FILE or r.kind == R_EXTERNAL:
       let internal = r.kind == R_FILE
       if internal:
@@ -6249,7 +6284,7 @@ fn strictly_enum_refs(m: IM, id: Str) -> Bool:
 
 # ---- analysis (graph/analyze.js)
 
-fn in_used_export(g: Graph, entries: {Int: Bool}, skip: {Int: Bool}, file: Int, ex: Exp, inc_entry: Bool, var visited: {Str: Bool}) -> Bool:
+fn in_used_export(g: Graph, entries: {Int: Bool}, skip: {Int: Bool}, file: Int, ex: Exp, inc_entry: Bool, var visited: {Str: Bool}, opt: Value) -> Bool:
   if ex.ref_in.len == 0: return false
   let raw = g.nodes[file].raw
   for c in ex.ref_in:
@@ -6260,12 +6295,12 @@ fn in_used_export(g: Graph, entries: {Int: Bool}, skip: {Int: Bool}, file: Int, 
         break
     if ci < 0: continue
     let inx = raw.exps[ci]
-    if inx.typ == "type" or inx.typ == "interface" or inx.typ == "enum": continue
+    if (inx.typ == "type" or inx.typ == "interface" or inx.typ == "enum") and not count_refs(opt, inx.typ): continue
     if inx.in_file: return true
     if is_referenced(g, entries, skip, file, c, inc_entry, false)[0] == 1: return true
     if inx.ref_in.len > 0 and not (c in visited):
       visited[c] = true
-      if in_used_export(g, entries, skip, file, inx, inc_entry, &visited): return true
+      if in_used_export(g, entries, skip, file, inx, inc_entry, &visited, opt): return true
   return false
 
 # ---- analysis (graph/analyze.js)
@@ -6296,7 +6331,7 @@ fn analyze_exports(var p: Proj, b: Build):
           var used = r[0] == 1
           if not used:
             var vis0: {Str: Bool} = {}
-            used = in_used_export(g, b.entries, b.skip, fid, ex, inc_entry, &vis0)
+            used = in_used_export(g, b.entries, b.skip, fid, ex, inc_entry, &vis0, p.ws[wi].ignore_in_file)
           if used:
             var unused_members = 0
             if r[0] == 1: unused_members = member_issues(&p, b, fid, ex, wi, false)
@@ -6312,7 +6347,7 @@ fn analyze_exports(var p: Proj, b: Build):
       let is_type = ex.typ == "enum" or ex.typ == "type" or ex.typ == "interface"
       if ex.in_file: continue
       var vis: {Str: Bool} = {}
-      if in_used_export(g, b.entries, b.skip, fid, ex, inc_entry, &vis): continue
+      if in_used_export(g, b.entries, b.skip, fid, ex, inc_entry, &vis, p.ws[wi].ignore_in_file): continue
       if ns.only and ((not p.on["nsTypes"] and is_type) or not (p.on["nsExports"] or is_type)): continue
       var typ = "exports"
       if ns.only:
@@ -8370,7 +8405,7 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false)
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false, {}, own fn(d: Str) => [], own fn(x: Str) => "")
 
 # standard output and error with knip's colors, or without them
 fn out(p: Proj, s: Str):
@@ -8414,6 +8449,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     if not root.endswith("/"): root += "/"
   var p = new_proj(root)
   p.clk = own fn() => os.clock()
+  p.list_links = own fn(d: Str) => term.links(ffi, d)
+  p.realp = own fn(x: Str) => term.realpath(ffi, x)
   let is_tty = term.isatty(ffi, 1)
   p.color = os.env("NO_COLOR") == "" and (os.env("FORCE_COLOR") == "1" or is_tty)
   if is_tty:
@@ -9157,13 +9194,18 @@ fn add_file_issue(var p: Proj, f: Str):
   if ignored_issue_file(&p, f): return
   var hit = false
   var neg = false
+  var pos = 0
+  var negs = 0
   for k in 0..p.ignf_pats.len:
     if p.ignf_ids[k].startswith("!"):
+      negs += 1
       if glob.match_str(p.ignf_ids_full[k], f, true): neg = true
       continue
+    pos += 1
     if glob.matches(p.ignf_pats[k], f, true):
       hit = true
       p.ignf_used[k] = true
+  if pos == 0 and negs > 0: hit = true
   if hit and not neg: return
   if should_ignore_issue(p, f, "files"): return
   var i = issue("files", f, f)

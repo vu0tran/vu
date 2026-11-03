@@ -158,12 +158,13 @@ type St:
   vi_mocks: {Int: Int}      # vi.mock(import("x"), factory): the import call -> vi's node
   caught: Int               # try blocks with a catch around the node (in this function)
   caught_ix: {Int: Bool}    # import calls awaited inside them
+  node_module: Bool         # module or node:module is imported
   stmt_tags: Int            # the JSDoc tags of the statement being read (its imports carry them)
 
 fn new_st(own src: Str, path: Str) -> St:
   let is_js = path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")
   let is_dts = path.endswith(".d.ts") or path.endswith(".d.cts") or path.endswith(".d.mts")
-  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [], {}, {}, false, false, [], false, [], [], [], {}, [], [], {}, 0, {}, 0)
+  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [], {}, {}, false, false, [], false, [], [], [], {}, [], [], {}, 0, {}, false, 0)
 
 fn nm(t: Ast, n: Int) -> Str:
   let s = t.nd[n].s
@@ -634,6 +635,16 @@ fn enum_members(var s: St, t: Ast, n: Int) -> [Member]:
     let id = t.nd[m].a
     var name = ""
     if id >= 0: name = nm(t, id)
+    # (a string literal: its raw text without the quotes, as knip's stripQuotes(raw))
+    if id >= 0 and t.nd[id].k == ast.N_STR:
+      let a = t.nd[id].pos
+      if a < s.src.len and (s.src[a] == '\'' or s.src[a] == '"'):
+        let q = s.src[a]
+        var e = a + 1
+        while e < s.src.len and s.src[e] != q:
+          if s.src[e] == '\\': e += 1
+          e += 1
+        if e < s.src.len: name = s.src[a + 1..e]
     # (--fix: the member, its comma and its line break)
     out.push(Member(name, t.nd[id].pos, tags_at(s, t.nd[m].pos), name == "", [t.nd[m].pos, t.nd[m].end, 5]))
   return out
@@ -1539,6 +1550,22 @@ fn handle_call(var s: St, t: Ast, n: Int):
       if arg >= 0:
         add_imp(&s, nm(t, arg), "", "", "", t.nd[arg].pos, F_ENTRY, -1)
         return
+  # module.register('x', import.meta.url) and module.findPackageJSON('pkg', ...) (node:module)
+  if s.node_module and is_str(t, call_arg(t, n, 0)):
+    var meth = ""
+    if is_id(t, callee): meth = nm(t, callee)
+    elif plain_access(t, callee) and is_id(t, t.nd[callee].a) and nm(t, t.nd[callee].a) == "module": meth = nm(t, callee)
+    let a0 = call_arg(t, n, 0)
+    let spec = nm(t, a0)
+    let a1 = call_arg(t, n, 1)
+    var hit = false
+    if meth == "register" and spec != "":
+      let meta_url = kind(t, a1) == ast.N_PROPACCESS and plain_access(t, a1) and kind(t, t.nd[a1].a) == ast.N_METAPROP and nm(t, a1) == "url"
+      hit = not spec.startswith(".") or meta_url
+    if meth == "findPackageJSON" and starts_like_pkg_name(spec) and not can_parse_url(spec): hit = true
+    if hit:
+      add_imp(&s, spec, "", "", "", t.nd[a0].pos, F_ENTRY, -1)
+      return
   if (s.cp_ns.len > 0 or s.cp_methods.len > 0) and ast.count(t, t.nd[n].c) >= 1:
     var method = ""
     let cname = nm(t, callee)
@@ -1895,9 +1922,8 @@ fn walk_kids(var s: St, t: Ast, n: Int):
 
 # a function body: its statements, not a block scope
 fn walk_body(var s: St, t: Ast, b: Int):
-  if b < 0: return
-  if t.nd[b].k == ast.N_BLOCK: walk_list(&s, t, t.nd[b].a)
-  else: walk(&s, t, b)
+  # (a function's body is a block, a scope, as in oxc's ESTree)
+  walk(&s, t, b)
 
 fn is_exported_decl(t: Ast, n: Int) -> Bool:
   let k = t.nd[n].k
@@ -2167,6 +2193,7 @@ fn static_imports(var s: St, t: Ast, root: Int):
     let c = t.nd[st].c
     let d = t.nd[st].d
     let is_cp = spec == "child_process" or spec == "node:child_process"
+    if spec == "module" or spec == "node:module": s.node_module = true
     let is_path = spec == "path" or spec == "node:path"
     if is_cp:
       if b >= 0: s.cp_ns[nm(t, b)] = true
@@ -2251,7 +2278,7 @@ fn has_module_syntax(t: Ast, root: Int, src: Str) -> Bool:
 
 # imports written in comments (extractImportsFromComments)
 fn comment_imports(var s: St, first_stmt: Int):
-  if s.src.find("import(") < 0 and s.src.find("@jsxImportSource") < 0 and s.src.find("-environment") < 0 and s.src.find("<reference") < 0: return
+  if s.src.find("import(") < 0 and s.src.find("@import") < 0 and s.src.find("@jsxImportSource") < 0 and s.src.find("-environment") < 0 and s.src.find("<reference") < 0: return
   let cm = comments(s.src)
   var i = 0
   while i < cm.len:
@@ -2286,6 +2313,13 @@ fn comment_imports(var s: St, first_stmt: Int):
               member = text[m + 1..e]
             if in_jsdoc_type(text, k): add_imp(&s, spec, member, "", "", start + k, F_TYPEONLY, -1)
         k = text.find("import(", k + 7)
+      # @import tags (TypeScript's JSDoc imports)
+      var ix = text.find("@import")
+      while ix >= 0:
+        let nx = ix + 7
+        if jsdoc_tag_start(text, ix) and nx < text.len and is_space_c(text[nx]):
+          jsdoc_import(&s, jsdoc_import_source(text, ix), start + ix)
+        ix = text.find("@import", nx)
     let jx = text.find("@jsxImportSource")
     if jx >= 0:
       var j = jx + 16
@@ -2340,6 +2374,161 @@ fn comment_imports(var s: St, first_stmt: Int):
                 var f = F_TYPEONLY
                 if kind_ == "path": f = f | F_OPTIONAL
                 add_imp(&s, text[j + 1..q], "", "", "", start, f, -1)
+
+fn pkg_start_c(c: Byte) -> Bool:
+  return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9')
+
+# isStartsLikePackageName
+fn starts_like_pkg_name(x: Str) -> Bool:
+  if x.len == 0: return false
+  if x[0] == '@': return x.len > 1 and (pkg_start_c(x[1]) or x[1] == '.' or x[1] == '_' or x[1] == '~')
+  return pkg_start_c(x[0]) and not (x.len > 1 and x[1] == ':')
+
+# URL.canParse (a scheme, then a colon)
+fn can_parse_url(x: Str) -> Bool:
+  if x.len == 0 or not ((x[0] >= 'a' and x[0] <= 'z') or (x[0] >= 'A' and x[0] <= 'Z')): return false
+  var k = 1
+  while k < x.len and (pkg_start_c(x[k]) or x[k] == '+' or x[k] == '.' or x[k] == '-'): k += 1
+  return k < x.len and x[k] == ':' and k + 1 < x.len
+
+fn is_space_c(c: Byte) -> Bool:
+  return c == 9 or c == 10 or c == 13 or c == 32
+
+fn is_hspace_c(c: Byte) -> Bool:
+  return c == 9 or c == 13 or c == 32
+
+# isJsDocTagStart: only whitespace and a '*' before it on its line
+fn jsdoc_tag_start(text: Str, index: Int) -> Bool:
+  var p = index
+  while p > 0 and text[p - 1] != '\n': p -= 1
+  while p < text.len and is_space_c(text[p]): p += 1
+  if p < text.len and text[p] == '*':
+    p += 1
+    while p < text.len and is_space_c(text[p]): p += 1
+  return p == index
+
+# getJsDocImportSource: the tag's text to the next line that starts with a tag (without the '*'s)
+fn jsdoc_import_source(text: Str, index: Int) -> Str:
+  var src = ""
+  var pos = index + 7
+  while pos < text.len:
+    let le = text.find("\n", pos)
+    if le < 0: return src + text[pos..text.len]
+    src += text[pos..le]
+    var nl = le + 1
+    while nl < text.len and is_hspace_c(text[nl]): nl += 1
+    if nl < text.len and text[nl] == '*':
+      nl += 1
+      while nl < text.len and is_hspace_c(text[nl]): nl += 1
+    if nl < text.len and text[nl] == '@': return src
+    src += "\n"
+    pos = nl
+  return src
+
+fn jd_ws(t: Str, i: Int) -> Int:
+  var k = i
+  while k < t.len and is_space_c(t[k]): k += 1
+  return k
+
+fn jd_ident(t: Str, i: Int) -> Int:
+  var k = i
+  while k < t.len and (is_word(t[k]) or t[k] >= 128): k += 1
+  return k
+
+# "import type" + the tag's text, read as an import declaration: its entries (addJsDocImport)
+fn jsdoc_import(var s: St, src: Str, pos: Int):
+  var i = jd_ws(src, 0)
+  var names: [Str] = []      # imported, local pairs
+  var ns = false
+  var any = false
+  # a default import first (then , and named or namespace imports)
+  let de = jd_ident(src, i)
+  var clause = true
+  if de > i and src[i..de] != "from":
+    names.push("default")
+    names.push(src[i..de])
+    any = true
+    i = jd_ws(src, de)
+    clause = false
+    if i < src.len and src[i] == ',':
+      i = jd_ws(src, i + 1)
+      clause = true
+      if i >= src.len or (src[i] != '{' and src[i] != '*'): return
+  if clause and i < src.len and src[i] == '{':
+    any = true
+    i += 1
+    while true:
+      i = jd_ws(src, i)
+      if i < src.len and src[i] == '}':
+        i += 1
+        break
+      var e = jd_ident(src, i)
+      if e == i: return
+      var imported = src[i..e]
+      if imported == "type":
+        let j = jd_ws(src, e)
+        let e2 = jd_ident(src, j)
+        if e2 > j and src[j..e2] != "as" and src[j..e2] != "from":
+          i = j
+          e = e2
+          imported = src[i..e]
+      var local = imported + ""
+      i = jd_ws(src, e)
+      let ae = jd_ident(src, i)
+      if ae > i and src[i..ae] == "as":
+        let j = jd_ws(src, ae)
+        let le = jd_ident(src, j)
+        if le == j: return
+        local = src[j..le]
+        i = jd_ws(src, le)
+      names.push(imported + "")
+      names.push(local + "")
+      if i < src.len and src[i] == ',':
+        i += 1
+        continue
+      if i < src.len and src[i] == '}':
+        i += 1
+        break
+      return
+  elif clause and i < src.len and src[i] == '*':
+    i = jd_ws(src, i + 1)
+    let ae = jd_ident(src, i)
+    if ae == i or src[i..ae] != "as": return
+    let j = jd_ws(src, ae)
+    let le = jd_ident(src, j)
+    if le == j: return
+    ns = true
+    any = true
+    i = le
+  if not any: return
+  i = jd_ws(src, i)
+  let fe = jd_ident(src, i)
+  if fe == i or src[i..fe] != "from": return
+  i = jd_ws(src, fe)
+  if i >= src.len or (src[i] != '\'' and src[i] != '"'): return
+  let q = src[i]
+  var e = i + 1
+  while e < src.len and src[e] != q and src[e] != '\n': e += 1
+  if e >= src.len or src[e] != q or e == i + 1: return
+  let spec = src[i + 1..e]
+  var k0 = 0
+  while k0 < names.len and ns:
+    var alias = ""
+    if names[k0 + 1] != names[k0]: alias = names[k0 + 1] + ""
+    add_imp(&s, spec, names[k0], alias, "", pos, F_TYPEONLY, -1)
+    k0 += 2
+  if ns:
+    add_imp(&s, spec, "", "", "", pos, F_TYPEONLY | F_OPAQUE, -1)
+    return
+  if names.len == 0:
+    add_imp(&s, spec, "", "", "", pos, F_TYPEONLY, -1)
+    return
+  var k = 0
+  while k < names.len:
+    var alias = ""
+    if names[k + 1] != names[k]: alias = names[k + 1] + ""
+    add_imp(&s, spec, names[k], alias, "", pos, F_TYPEONLY, -1)
+    k += 2
 
 fn in_jsdoc_type(text: Str, index: Int) -> Bool:
   var depth = 0
@@ -2983,10 +3172,11 @@ fn local_refs(s: St, t: Ast) -> [Str]:
         if not (root in s.li) and not shadowed(s, root, t.nd[left].pos): refs[root] = true
     elif k == ast.N_TREF or k == ast.N_TQUERY:
       if is_id(t, a) and not (nm(t, a) in s.li): lref(s, t, a, &refs, &imported)
-  # an imported name re-exported: its export names
+  # an imported name referenced in the file: the names it's exported as (localToExports)
   for name, _ in imported:
-    for e in s.exps:
-      if e.name == name: refs[e.name] = true
+    let key = "\0" + name
+    if key in s.ref_in:
+      for e in s.ref_in[key]: refs[e + ""] = true
   var out: [Str] = []
   for name, _ in refs: out.push(name + "")
   return out

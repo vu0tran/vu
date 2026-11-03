@@ -75,3 +75,51 @@ vu_str vk_watch_read(int64_t fd, int64_t timeout_ms) {
     return vu_str_from("", 0);
 #endif
 }
+
+/* The names of a folder's entries that are symbolic links, one per line ("" none or unreadable). */
+#include <dirent.h>
+#include <sys/stat.h>
+#include <limits.h>
+vu_str vk_links(const vu_str *path) {
+    char buf[4096];
+    if (path->len >= (int64_t)sizeof buf - 1) return vu_str_from("", 0);
+    memcpy(buf, path->data, path->len);
+    buf[path->len] = 0;
+    if (path->len == 0) { buf[0] = '.'; buf[1] = 0; }
+    DIR *d = opendir(buf);
+    if (!d) return vu_str_from("", 0);
+    size_t cap = 256, len = 0;
+    char *out = malloc(cap);
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        bool link = e->d_type == DT_LNK;
+        if (e->d_type == DT_UNKNOWN) {
+            char full[8192];
+            struct stat st;
+            snprintf(full, sizeof full, "%s/%s", buf, e->d_name);
+            link = lstat(full, &st) == 0 && S_ISLNK(st.st_mode);
+        }
+        if (!link) continue;
+        size_t nl = strlen(e->d_name);
+        if (len + nl + 2 > cap) { while (len + nl + 2 > cap) cap *= 2; out = realloc(out, cap); }
+        memcpy(out + len, e->d_name, nl);
+        len += nl;
+        out[len++] = '\n';
+    }
+    closedir(d);
+    vu_str r = vu_str_from(out, (int64_t)len);
+    free(out);
+    return r;
+}
+
+/* The path with symbolic links resolved (absolute), "" when it doesn't exist. */
+vu_str vk_realpath(const vu_str *path) {
+    char buf[4096];
+    if (path->len >= (int64_t)sizeof buf - 1) return vu_str_from("", 0);
+    memcpy(buf, path->data, path->len);
+    buf[path->len] = 0;
+    if (path->len == 0) { buf[0] = '.'; buf[1] = 0; }
+    char res[PATH_MAX];
+    if (!realpath(buf, res)) return vu_str_from("", 0);
+    return vu_str_from(res, (int64_t)strlen(res));
+}
