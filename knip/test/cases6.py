@@ -45,3 +45,23 @@ case("tags", {
     "lib.ts": "export const used = 1;\n/** @lintignore */\nexport const usedIgnored = 2;\n/** @lintignore */\nexport const unusedIgnored = 3;\n/** @custom */\nexport const unusedCustom = 4;\nexport const plain = 5;\nexport enum E { A, /** @lintignore */ B, /** @lintignore */ C, D }\n",
     "knip.json": json.dumps({"tags": ["-lintignore"]}),
 }, args=[[], ["--tags", "custom"], ["--tags=-lintignore,-custom"], ["--treat-tag-hints-as-errors"], ["--no-tag-hints"]])
+
+case("c6_ignore_used_in_file", {
+    "package.json": json.dumps({"name": "app", "version": "1.0.0", "main": "src/index.ts"}),
+    "knip.json": json.dumps({"ignoreExportsUsedInFile": True}),
+    "src/index.ts": "import { a } from './lib';\nconsole.log(a);\n",
+    "src/lib.ts": "export const a = 1;\nexport const b = 2;\nexport const c = 3;\nexport function f() { return b; }\nexport type T = { x: number };\nexport const t: T = { x: c };\nexport class K {}\nexport class L extends K {}\nexport enum E { A }\nconsole.log(E.A);\nexport interface I {}\nexport interface J extends I {}\n",
+})
+case("c6_ignore_used_in_file_obj", {
+    "package.json": json.dumps({"name": "app", "version": "1.0.0", "main": "src/index.ts"}),
+    "knip.json": json.dumps({"ignoreExportsUsedInFile": {"interface": True, "type": True}}),
+    "src/index.ts": "import { a } from './lib';\nconsole.log(a);\n",
+    "src/lib.ts": "export const a = 1;\nexport const b = 2;\nexport function f() { return b; }\nexport type T = { x: number };\nexport const t: T = { x: 1 };\nexport interface I {}\nexport interface J extends I {}\nexport type U = I | T;\n",
+})
+case("c6_ignore_used_in_file_ctx", {
+    "package.json": json.dumps({"name": "app", "version": "1.0.0", "main": "src/index.tsx"}),
+    "knip.json": json.dumps({"ignoreExportsUsedInFile": True}),
+    "src/index.tsx": "import { z } from './lib';\nconsole.log(z);\n",
+    "src/lib.tsx": "export const z = 1;\nexport const a1 = 1; export const a2 = 2; export const a3 = 3; export const a4 = 4; export const a5 = 5; export const a6 = 6; export const a7 = 7; export const a8 = 8; export const a9 = 9; export const b1 = 1; export const b2 = 2; export const b3 = 3; export const b4 = 4; export const C1 = () => null;\n"
+      "export const s1 = 1;\nfunction g(s1: number) { return s1; }\nlet q = 0; q++; ++a9;\nconst o = { a1, k: a2 };\nconst arr = [a3];\nconst tpl = `${a4}`;\nconst m = a5.toString();\nconst n = !a6;\nif (a7) {}\nconst w = typeof a8;\nconst el = <C1 x={b1} {...b2} />;\nexport type TT = typeof b3;\nconst e = (b4 as any);\nconsole.log(o, arr, tpl, m, n, w, el, e, g);\n",
+})
