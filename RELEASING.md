@@ -22,35 +22,33 @@ with the commands, naming the others as optionalDependencies). They are publishe
 
 ## Once: npm publishing rights (vlint, vsc, vjq, vknip)
 
-**What happened with vlint 0.1.0:** the account requires two-factor authentication for publishing,
-and the `NPM_TOKEN` secret was a token without the 2FA bypass, so the workflow's publish step
-failed (npm asks for a one-time password CI can't give). The packages the run had built (its
-`npm-tarballs` artifact) were then published by hand from a Mac with an OTP, as in "By hand" below.
-That path keeps working for every tool; the token below makes it unnecessary.
+The workflow **stages** each npm version (`npm stage publish`, [staged
+publishing](https://docs.npmjs.com/staged-publishing), npm 11.15 or later, installed in the npm
+job): staging needs no 2FA, and nothing goes live until you approve it with 2FA. So the token
+needs no 2FA bypass.
 
-1. On npmjs.com, signed in as the account that owns the scope in `NPM_SCOPE` at the top of
-   `.github/workflows/release-tools.yml` (`@vu0tran`: the user `vu0tran`). To use another scope,
-   change `NPM_SCOPE` (the packages' READMEs follow it when they are made).
-2. Access Tokens, Generate New Token, **Granular Access Token**:
-   - Packages and scopes: permission **Read and write**, for **All packages** (a token limited to
-     selected packages can't create new ones: each tool's first release creates five). After the
-     first release of every tool you can narrow it to the 20 packages.
-   - **Check "Bypass two-factor authentication (2FA)"**. Without it, every publish from CI fails
-     with `EOTP` (or `E403`) on an account that requires 2FA, which is what happened to vlint 0.1.0.
-   - npm limits how long write tokens live (90 days at most when this was written; not checked
-     against your account): renew the secret before it expires.
-3. In the GitHub repository: Settings, Secrets and variables, Actions, New repository secret,
-   name **`NPM_TOKEN`**, the token as the value.
+1. **The token, once:** npmjs.com (signed in as `vu0tran`, the owner of the `@vu0tran` scope in
+   `NPM_SCOPE` at the top of `.github/workflows/release-tools.yml`), Access Tokens, Generate New
+   Token, Granular Access Token: **Read and write** on **All packages** (a token limited to selected
+   packages can't create new ones). In the GitHub repository: Settings, Secrets and variables,
+   Actions, secret **`NPM_TOKEN`**. npm limits how long write tokens live: renew it before it expires.
+2. **Each release:** push the tag; the run builds, tests, creates the GitHub release and stages the
+   five npm packages (its log ends with a notice saying so). Then approve them, with your 2FA code:
+   npmjs.com, your account, **Staged Packages**, Approve on each (platform packages first, the main
+   one last); or from a terminal: `npm stage list`, then `npm stage approve ID` for each.
+3. **Then check:** Actions, release-tools, Run workflow with the tag (e.g. `vsc-v0.1.0`): it skips
+   what is published and installs each tool from npm on the four platforms. Until the approval, the
+   run's check job tests the GitHub release only and says the npm check is waiting.
 
-If the publish step still fails, it says which package and why; publish the run's tarballs by hand
-(below) and re-run the workflow for the tag, which skips what is published and runs the checks.
+**Trusted publishing** (OIDC, no token: [docs](https://docs.npmjs.com/trusted-publishers)) can
+replace the token for packages that exist: on each package's settings on npmjs.com, Trusted
+Publisher, GitHub Actions, user `vu0tran`, repository `vu`, workflow `release-tools.yml`. The npm
+job has `id-token: write` and npm 11.15 or later, so the workflow uses it when it's set up, and the
+token otherwise. Staging still waits for your approval.
 
-Later, npm's trusted publishing (OIDC, no token) can replace the secret: it can only be set up on a
-package that exists, so after a tool's first release, on each of its five packages' settings on
-npmjs.com, add this repository and `release-tools.yml` as a trusted publisher (the workflow already
-has `id-token: write`). It needs npm 11.5.1 or later in the npm job (Node 22 comes with npm 10:
-add `npm install -g npm@11` before publishing) and the job's check for `NPM_TOKEN` relaxed; neither
-is done yet (not tested).
+**What happened with vlint 0.1.0** (before staging): the account requires 2FA for publishing and the
+token had no 2FA bypass, so publishing from CI failed; the run's tarballs were published by hand
+from a Mac with an OTP ("By hand", below). That path still works.
 
 vgolint needs no secret, nor do the GitHub releases of the others (the workflow's own token).
 
