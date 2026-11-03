@@ -24,6 +24,7 @@ import compilers
 import re
 import varlock
 import autoimp
+import marko
 from json import Value
 from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY, I_CATALOG
 from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC
@@ -196,6 +197,7 @@ type Proj:
   comp_default: {Str: Str}   # extension -> the compiler first registered for it
   amaps: {Str: AutoMaps}     # auto-import maps ("r:" + package folder, "n:" + Nuxt workspace)
   tsc_mode: Bool             # --use-tsconfig-files
+  mlibs: {Int: MarkoLib}     # each workspace's Marko taglibs (tag -> packages)
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -6455,6 +6457,7 @@ fn register_compilers(var p: Proj, fs: Fs, wi: Int):
     if hd(p, wi, "astro"): comp_set(&comp, &order, ".astro", "astro", false)
     if hd(p, wi, "@astrojs/mdx") or hd(p, wi, "@astrojs/starlight"): comp_set(&comp, &order, ".mdx", "astro-mdx", false)
   if not early_cfg_off(p, wi, "fumadocs") and hd(p, wi, "fumadocs-mdx"): comp_set(&comp, &order, ".mdx", "mdx", false)
+  if not early_cfg_off(p, wi, "marko") and hd(p, wi, "marko"): comp_set(&comp, &order, ".marko", "marko:{wi}", false)
   if not early_cfg_off(p, wi, "nuxt") and (hd(p, wi, "nuxt") or hd(p, wi, "nuxt-nightly") or exists_dir(p, fs, resolve.join(p.ws[wi].dir, ".nuxt"))):
     comp_set(&comp, &order, ".vue", "nuxt-vue:{wi}", false)
     comp_set(&comp, &order, ".ts", "nuxt-ts:{wi}", false)
@@ -6535,6 +6538,13 @@ fn precompile(var p: Proj, fs: Fs, os: Os, paths: [Str], var comps: [Str], var p
     let c = comps[k] + ""
     if c == "fn":
       fn_ix.push(k)
+      continue
+    if c.startswith("marko:"):
+      let wi = int(c[6..c.len]) else 0
+      if not (wi in p.mlibs): p.mlibs[wi] = marko_lib(p, fs, wi)
+      let src = fs.read(fspath(p, paths[k])) else ""
+      comps[k] = "="
+      pres[k] = marko.compile(src, p.mlibs[wi].tags, p.mlibs[wi].fallback)
       continue
     if not (c == "vue-auto" or c == "ts-auto" or c == "md-auto" or c.startswith("nuxt-")): continue
     let key = auto_maps_key(&p, fs, c, paths[k])
@@ -6628,6 +6638,71 @@ fn compiler_failed(ext: Str, path: Str, reason: Str, abs: Str):
   eprint("ERROR: Compiler for " + ext + " failed (" + abs + "/" + path + ")")
   eprint("Reason: " + reason)
   exit(2)
+
+type MarkoLib:
+  tags: {Str: [Str]}
+  fallback: [Str]
+
+# plugins/marko/taglibs getTaglibDependencies: the dependencies with a marko.json in node_modules and
+# the tags of its tags folder ("exports" or "tags-dir"); one without is a fallback (always imported)
+fn marko_lib(p: Proj, fs: Fs, wi: Int) -> MarkoLib:
+  var lib = MarkoLib({}, [])
+  var names: [Str] = []
+  for f in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]:
+    for k in pkg.keys(pkg.get(p.ws[wi].manifest, f)):
+      if not opts.has(names, k): names.push(k + "")
+  for name in names:
+    var cfg = ""
+    var d = p.ws[wi].dir + ""
+    while true:
+      let f = resolve.join(d, "node_modules/" + name + "/marko.json")
+      if exists_file(p, fs, f):
+        cfg = f
+        break
+      if d == "" or d == ".": break
+      d = resolve.dirname(d)
+    if cfg == "": continue
+    let v = pkg.read_json(fs, fspath(p, cfg))
+    var tags_dir = ""
+    if pkg.is_obj(v):
+      if pkg.is_text(pkg.get(v, "exports")): tags_dir = pkg.str_of(pkg.get(v, "exports"))
+      elif pkg.is_text(pkg.get(v, "tags-dir")): tags_dir = pkg.str_of(pkg.get(v, "tags-dir"))
+    if tags_dir == "":
+      lib.fallback.push(name + "")
+      continue
+    for t in marko_tags(p, fs, resolve.join(resolve.dirname(cfg), tags_dir)):
+      if t in lib.tags: lib.tags[t].push(name + "")
+      else: lib.tags[t] = [name + ""]
+  return lib
+
+fn list_dir(p: Proj, fs: Fs, dir: Str) -> [Str]:
+  let xs = fs.list(fspath(p, dir)) else []
+  return xs
+
+fn marko_is_tag_dir(p: Proj, fs: Fs, dir: Str, name: Str) -> Bool:
+  return exists_file(p, fs, resolve.join(dir, "index.marko")) or exists_file(p, fs, resolve.join(dir, name + ".marko"))
+
+# getTags
+fn marko_tags(p: Proj, fs: Fs, dir: Str) -> [Str]:
+  var out: [Str] = []
+  for e in list_dir(p, fs, dir):
+    if e.startswith("."): continue
+    if not e.endswith("/"):
+      if e.endswith(".marko"): add_uniq(&out, e[0..e.len - 6])
+      continue
+    let n = e[0..e.len - 1]
+    let sub = resolve.join(dir, n)
+    if marko_is_tag_dir(p, fs, sub, n):
+      add_uniq(&out, n)
+      continue
+    if n == "tags" or n == "components": continue
+    for c in list_dir(p, fs, sub):
+      if not c.endswith("/"):
+        if c.endswith(".marko"): add_uniq(&out, c[0..c.len - 6])
+      else:
+        let cn = c[0..c.len - 1]
+        if marko_is_tag_dir(p, fs, resolve.join(sub, cn), cn): add_uniq(&out, cn)
+  return out
 
 type AutoMaps:
   inames: [Str]
@@ -7213,6 +7288,62 @@ fn pattern_hints(var p: Proj, typ: Str, config: [Str], patterns: [Str], paths: [
     for r in rel:
       if not hit and glob.matches(gp, r, false): hit = true
     if not hit: add_hint(&p, typ + "-empty", pt, name, "")
+  if typ == "project":
+    # (extensions the patterns name that no compiler handles, and compilers' they leave out)
+    var seen: [Str] = []
+    var pexts: [Str] = []
+    for pt in user:
+      for e in pattern_exts(pt):
+        add_uniq(&pexts, e)
+        if opts.has(seen, e) or accepted_ext("x" + e) or opts.has(p.ws[w].cexts, e): continue
+        seen.push(e + "")
+        add_hint(&p, "project-extension-unregistered", e, name, "")
+    if pexts.len > 0:
+      for e in sc(p.ws[w].cexts):
+        if not opts.has(pexts, e): add_hint(&p, "project-extension-excluded", e, name, "")
+
+fn simple_ext(t: Str) -> Bool:
+  if t == "": return false
+  for k in 0..t.len:
+    let c = t[k]
+    if not ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')): return false
+  return true
+
+# extractPatternExtensions: the extensions a pattern's last segment ends with (.x, .{a,b}, .@(a|b))
+fn pattern_exts(pattern: Str) -> [Str]:
+  var out: [Str] = []
+  var end = pattern.len
+  if pattern.endswith("!"): end -= 1
+  var sl = -1
+  for k in 0..end:
+    if pattern[k] == '/': sl = k
+  let seg = pattern[sl + 1..end]
+  if seg == "": return out
+  let last = seg[seg.len - 1]
+  if last == '}':
+    # /\.\{([^{}]+)\}$/
+    let o = seg.rfind("{{")
+    if o > 0 and seg[o - 1] == '.' and seg[o + 1..seg.len - 1].find("}}") < 0:
+      for t in seg[o + 1..seg.len - 1].split(","):
+        let x = t.strip()
+        if simple_ext(x): out.push("." + x)
+    return out
+  if last == ')':
+    # /\.[@+*?]?\(([^()]+)\)$/
+    let o = seg.rfind("(")
+    if o > 0 and seg[o + 1..seg.len - 1].find(")") < 0:
+      var d = o - 1
+      if seg[d] == '@' or seg[d] == '+' or seg[d] == '*' or seg[d] == '?': d -= 1
+      if d >= 0 and seg[d] == '.':
+        for t in seg[o + 1..seg.len - 1].split("|"):
+          let x = t.strip()
+          if simple_ext(x): out.push("." + x)
+    return out
+  # /\.([a-zA-Z0-9]+)$/
+  var k = seg.len
+  while k > 0 and simple_ext(seg[k - 1..k]): k -= 1
+  if k < seg.len and k > 0 and seg[k - 1] == '.': out.push(seg[k - 1..seg.len])
+  return out
 
 # ---- main
 
@@ -7229,7 +7360,7 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false)
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {})
 
 fn config_error(msg: Str):
   eprint("ERROR: " + msg)
