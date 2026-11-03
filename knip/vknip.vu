@@ -183,6 +183,7 @@ type Proj:
   resolved_cfg: Bool         # (reading a config file another input named)
   cfg_override: [Str]        # (a plugin with config file patterns in the configuration)
   has_override: Bool
+  git_remotes: [Str]         # (railway: git config remote urls of the project)
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -1447,6 +1448,15 @@ fn run_plugin(var p: Proj, fs: Fs, os: Os, key: Str):
     let found = find_configs(p, fs, ["typedoc.{{js,cjs,json,jsonc}}", "typedoc.config.{{js,cjs}}", ".config/typedoc.{{js,cjs,json,jsonc}}", ".config/typedoc.config.{{js,cjs}}", "package.json", "tsconfig.json"])
     typedoc_config(&p, fs, found)
     return
+  if key == "railway" and p.git_remotes.len == 0:
+    # (getGitRemoteUrls: git config --local --get-regexp ^remote\..*\.url$ in the project folder)
+    var d = fspath(p, "")
+    if d == "": d = "."
+    let out = os.output(["git", "-C", d, "config", "--local", "--get-regexp", "^remote\\..*\\.url$"]) else ""
+    for line in out.strip().split("\n"):
+      let sp = line.find(" ")
+      if sp >= 0: p.git_remotes.push(line[sp + 1..line.len])
+    if p.git_remotes.len == 0: p.git_remotes.push("")
   generic_plugin(&p, fs, os, key)
 
 fn git_hook_names() -> [Str]:
@@ -1567,6 +1577,196 @@ fn replace_first(s: Str, a: Str, b: Str) -> Str:
   let i = s.find(a)
   if i < 0: return s + ""
   return s[0..i] + b + s[i + a.len..s.len]
+
+fn oc_entries(v: Value, var out: [Str]):
+  var xs: [Value] = [json.copy(v)]
+  if is_arr(v): xs = pkg.items(v)
+  for x in xs:
+    if pkg.is_text(x): out.push(pkg.str_of(x))
+
+# quasar's getConfigObject: export default (or module.exports =) of an object or a call with one
+fn quasar_config_object(x: asth.Tree) -> Int:
+  for st in asth.body(x):
+    if asth.kind(x, st) == ast.N_EXPORTDEFAULT:
+      let d = x.t.nd[st].a
+      if asth.kind(x, d) == ast.N_CALL: return asth.resolve_object_arg(x, asth.arg0(x, d))
+      return asth.resolve_object_arg(x, d)
+    if asth.kind(x, st) == ast.N_EXPRSTMT:
+      let e = x.t.nd[st].a
+      if asth.kind(x, e) == ast.N_BINARY and x.t.nd[e].f == scan.T_ASSIGN:
+        let l = x.t.nd[e].a
+        if asth.kind(x, l) == ast.N_PROPACCESS and asth.kind(x, x.t.nd[l].a) == ast.N_ID and asth.name(x, x.t.nd[l].a) == "module" and asth.name(x, l) == "exports":
+          let r = x.t.nd[e].b
+          if asth.kind(x, r) == ast.N_CALL: return asth.resolve_object_arg(x, asth.arg0(x, r))
+          return asth.resolve_object_arg(x, r)
+  return -1
+
+fn quasar_ext(id: Str) -> Str:
+  if id.find(".") >= 0: return id + ""
+  return id + ".{{js,ts}}"
+
+# railway's getGitHubRepository ("" none)
+fn gh_repo(v0: Str) -> Str:
+  var v = v0.strip()
+  if v.startswith("git+"): v = v[4..v.len]
+  if v.endswith(".git/"): v = v[0..v.len - 5]
+  elif v.endswith(".git"): v = v[0..v.len - 4]
+  if v.endswith("/"): v = v[0..v.len - 1]
+  # (?:^|github(?:\.com)?[/:])([^/:]+\/[^/]+)$
+  let parts = v.split("/")
+  if parts.len < 2: return ""
+  let last = parts[parts.len - 1]
+  var owner = parts[parts.len - 2]
+  if last == "" or last.find(":") >= 0: return ""
+  let pre = v[0..v.len - last.len - 1 - owner.len]
+  let col = owner.rfind(":")
+  var pre2 = pre
+  if col >= 0:
+    pre2 = pre + owner[0..col + 1]
+    owner = owner[col + 1..owner.len]
+  if owner == "": return ""
+  let lp = pre2.lower()
+  var ok = pre2 == ""
+  for g in ["github/", "github:", "github.com/", "github.com:"]:
+    if lp.endswith(g): ok = true
+  if not ok: return ""
+  return (owner + "/" + last).lower()
+
+fn railway_ast(var p: Proj, fs: Fs, f: Str, x: asth.Tree):
+  var services: {Str: Bool} = {}
+  var stypes: {Str: Str} = {}
+  var bindings: {Str: Int} = {}
+  var local: {Str: Bool} = {}
+  var repos: [Value] = [pkg.get(p.ws[p.cur].manifest, "repository")]
+  if "." in p.all_pkgs: repos.push(pkg.get(p.all_pkgs["."], "repository"))
+  for r in repos:
+    var u = pkg.str_of(r)
+    if pkg.is_obj(r): u = pkg.str_of(pkg.get(r, "url"))
+    let n = gh_repo(u)
+    if n != "": local[n] = true
+  for u in p.git_remotes:
+    let n = gh_repo(u)
+    if n != "": local[n] = true
+  for st in asth.body(x):
+    let k = asth.kind(x, st)
+    if k == ast.N_IMPORT and asth.str_value(x, x.t.nd[st].a) == "railway/iac":
+      for sp in asth.items(x, x.t.nd[st].d):
+        let loc = asth.name(x, sp)
+        var imported = loc + ""
+        let pn = x.t.nd[sp].b
+        if pn >= 0:
+          if asth.kind(x, pn) != ast.N_ID: continue
+          imported = asth.name(x, pn)
+        if imported == "service": services[loc] = true
+        if imported == "github" or imported == "image" or imported == "template": stypes[loc] = imported + ""
+    elif k == ast.N_VAR:
+      for d in asth.items(x, x.t.nd[st].a):
+        let id = x.t.nd[d].a
+        if asth.kind(x, id) == ast.N_ID and x.t.nd[d].c >= 0: bindings[asth.name(x, id)] = x.t.nd[d].c
+  if services.len == 0: return
+  for c in asth.nodes_of(x, ast.N_CALL):
+    let callee = x.t.nd[c].a
+    if asth.kind(x, callee) != ast.N_ID or not (asth.name(x, callee) in services): continue
+    let args = asth.call_args(x, c)
+    if args.len < 2 or asth.kind(x, args[1]) != ast.N_OBJECT: continue
+    let sc_ = args[1]
+    var source = asth.find_prop(x, sc_, "source")
+    var seen: {Str: Bool} = {}
+    while source >= 0 and asth.kind(x, source) == ast.N_ID:
+      let bn = asth.name(x, source)
+      if not (bn in bindings) or bn in seen: break
+      seen[bn] = true
+      source = bindings[bn]
+    let repo = first_pv(x, source, "repo")
+    let image = first_pv(x, source, "image")
+    let tmpl = first_pv(x, source, "template")
+    var stype = ""
+    if asth.kind(x, source) == ast.N_CALL and asth.kind(x, x.t.nd[source].a) == ast.N_ID:
+      let cn = asth.name(x, x.t.nd[source].a)
+      if cn in stypes: stype = stypes[cn] + ""
+    if stype == "": stype = first_pv(x, source, "type")
+    if stype == "":
+      if repo != "": stype = "github"
+      elif image != "": stype = "image"
+      elif tmpl != "": stype = "template"
+    var srepo = ""
+    if asth.kind(x, source) == ast.N_CALL:
+      let a0 = asth.str_value(x, asth.arg0(x, source))
+      if a0 != "\0": srepo = gh_repo(a0)
+    else: srepo = gh_repo(repo)
+    if stype == "image" or stype == "template" or (stype == "github" and srepo != "" and local.len > 0 and not (srepo in local)): continue
+    var scfg = source
+    if asth.kind(x, source) == ast.N_CALL:
+      scfg = -1
+      if asth.call_args(x, source).len > 1: scfg = asth.call_args(x, source)[1]
+    var rd = first_pv(x, scfg, "rootDirectory")
+    if rd == "": rd = first_pv(x, sc_, "root")
+    if rd == "": rd = first_pv(x, sc_, "rootDirectory")
+    var cwd = p.ws[p.cur].dir + ""
+    if rd != "": cwd = resolve.join(cwd, rd)
+    let build = asth.find_prop(x, sc_, "build")
+    var cmds: [Str] = []
+    for n in [build, asth.find_prop(x, build, "buildCommand"), asth.find_prop(x, sc_, "start"), asth.find_prop(x, sc_, "preDeploy"), asth.find_prop(x, asth.find_prop(x, sc_, "deploy"), "preDeployCommand")]:
+      let one = asth.str_value(x, n)
+      if one != "\0" and one != "": cmds.push(one)
+      else:
+        for y in asth.string_values(x, n): cmds.push(y)
+    add_script_inputs(&p, cmds, f, true, dir_of_input(cwd), false)
+
+# getFirstPropertyValue ("" none)
+fn first_pv(x: asth.Tree, n: Int, key: Str) -> Str:
+  let v = asth.property_values(x, n, key)
+  if v.len == 0: return ""
+  return v[0] + ""
+
+fn solid_ast(var p: Proj, fs: Fs, f: Str, x: asth.Tree):
+  let root = vite_root(x, pabs(p.ws[p.cur].dir))
+  let exts = "tsx,jsx,ts,js,mjs,tsrx"
+  var conv: {Str: Str} = {}
+  conv["entryServer"] = "src/entry-server.{{" + exts + "}}"
+  conv["entryClient"] = "src/entry-client.{{" + exts + "}}"
+  conv["app"] = "src/{{App,app}}.{{tsx,jsx,ts,js,tsrx}}"
+  conv["document"] = "src/Document.{{tsx,jsx,tsrx}}"
+  conv["env"] = "env.{{ts,js}}"
+  var patterns: [Str] = []
+  var paths: [Str] = []
+  for c in asth.find_imported_calls(x, ["@solidjs/vite-plugin"], false):
+    let arg = asth.arg0(x, c)
+    if asth.kind(x, arg) != ast.N_OBJECT: continue
+    let cfgr = asth.str_value(x, asth.find_prop(x, asth.find_prop(x, arg, "serverFunctions"), "configure"))
+    if cfgr != "\0" and cfgr != "": add_uniq(&paths, cfgr)
+    let start = asth.find_prop(x, arg, "start")
+    if start < 0 or asth.kind(x, start) == ast.N_FALSE: continue
+    var vals: {Str: Int} = {}
+    for nm in ["app", "document", "entryServer", "entryClient", "middleware", "instrument", "setup", "env"]:
+      vals[nm] = -1
+      if asth.kind(x, start) == ast.N_OBJECT: vals[nm] = asth.find_prop(x, start, nm)
+    let ssr = asth.find_prop(x, arg, "ssr")
+    var skip: {Str: Bool} = {}
+    if ssr < 0 or asth.kind(x, ssr) == ast.N_FALSE:
+      skip["entryServer"] = true
+      skip["setup"] = true
+      if solid_authored(p, fs, x, vals, root, "entryClient"): skip["app"] = true
+    elif asth.kind(x, ssr) == ast.N_TRUE and solid_authored(p, fs, x, vals, root, "entryServer") and solid_authored(p, fs, x, vals, root, "entryClient"):
+      skip["app"] = true
+      skip["document"] = true
+    for nm in ["app", "document", "entryServer", "entryClient", "middleware", "instrument", "setup", "env"]:
+      if nm in skip: continue
+      let v = vals[nm]
+      let path = asth.str_value(x, v)
+      if path != "\0" and path != "": add_uniq(&paths, path)
+      elif nm in conv and not (nm == "env" and asth.kind(x, v) == ast.N_FALSE): add_uniq(&patterns, conv[nm])
+  for pt in patterns: in_prod_entry(&p, ajoin(root, pt), f)
+  for id in paths: in_prod_entry(&p, to_abs(id, root), f)
+
+fn solid_authored(p: Proj, fs: Fs, x: asth.Tree, vals: {Str: Int}, root: Str, nm: Str) -> Bool:
+  let v = asth.str_value(x, vals[nm])
+  if v != "\0" and v != "": return true
+  var stem = "src/entry-server"
+  if nm == "entryClient": stem = "src/entry-client"
+  for e in ["tsx", "jsx", "ts", "js", "mjs", "tsrx"]:
+    if exists_file(p, fs, resolve.join(arel(root), stem + "." + e)): return true
+  return false
 
 # findImportedCallArg: the object argument of the first call of a name imported from the modules
 fn imported_call_arg(x: asth.Tree, mods: [Str]) -> Int:
@@ -1760,7 +1960,7 @@ fn tsdown_entries(e: Value) -> [Str]:
 
 # the plugins whose config files vknip reads (resolveConfig)
 fn has_resolver(key: Str) -> Bool:
-  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt swc wrangler msw tanstack-router drizzle svgr biome github-action nitro metro prisma react-native oclif next webpack vue expo expo-router rspack mdx graphql-codegen knex vite-plugin-pwa pm2 karma stryker tauri react-router buf cucumber rsbuild commitizen markdownlint convex cspell docusaurus electron-forge jasmine serverless-framework parcel electron-vite webdriver-io payload netlify simple-git-hooks wxt panda-css tsd yorkie travis yarn pnpm wireit nano-staged preconstruct bun gatsby relay textlint eleventy tsdown rstest astro-markdoc capacitor ladle linthtml moonrepo nest npm-package-json-lint osls playwright-ct lunaria raycast react-cosmos typescript-content-mapper ".find(" " + key + " ") >= 0
+  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt swc wrangler msw tanstack-router drizzle svgr biome github-action nitro metro prisma react-native oclif next webpack vue expo expo-router rspack mdx graphql-codegen knex vite-plugin-pwa pm2 karma stryker tauri react-router buf cucumber rsbuild commitizen markdownlint convex cspell docusaurus electron-forge jasmine serverless-framework parcel electron-vite webdriver-io payload netlify simple-git-hooks wxt panda-css tsd yorkie travis yarn pnpm wireit nano-staged preconstruct bun gatsby relay textlint eleventy tsdown rstest astro-markdoc capacitor ladle linthtml moonrepo nest npm-package-json-lint osls playwright-ct lunaria raycast react-cosmos typescript-content-mapper openclaw ".find(" " + key + " ") >= 0
 
 fn js_ext(f: Str) -> Bool:
   let e = resolve.extname(f)
@@ -1889,7 +2089,7 @@ fn plugin_files(var p: Proj, fs: Fs, os: Os, key: Str, found: [Str]):
       let before = p.inputs.len
       if not is_null(v): resolve_config(&p, fs, os, key, f, v)
       if (key == "prettier" or key == "oxlint" or key == "metro" or key == "webpack") and resolve.basename(f) != "package.json": filter_transitive(&p, fs, f, before)
-    if pl.resolve_ast and js_ext(f): resolve_ast(&p, fs, key, f)
+    if pl.resolve_ast and (js_ext(f) or key == "openclaw"): resolve_ast(&p, fs, key, f)
     config_entry(&p, f)
 
 # Config files that inputs name (toConfig: vitest projects, eslint extends, nx targets...) are read by
@@ -1933,7 +2133,7 @@ fn pending_configs(var p: Proj, fs: Fs, os: Os):
 
 # resolveFromAST: what some plugins read from the config file's syntax tree (without running it)
 fn ast_ported(key: Str) -> Bool:
-  return key == "filesystem-routing" or key == "flue" or key == "vite-plugin-pages" or key == "vite-plugin-vue-layouts-next" or key == "storybook" or key == "xo" or key == "tsdown" or key == "tsup" or key == "rollup" or key == "rolldown" or key == "rslib" or key == "esbuild" or key == "astro" or key == "starlight" or key == "next" or key == "eslint" or key == "vite" or key == "vite-plugin-pwa" or key == "sveltekit" or key == "orval" or key == "vite-plus" or key == "laravel-vite-plugin" or key == "next-mdx" or key == "stencil" or key == "sst"
+  return key == "quasar" or key == "qwik" or key == "openclaw" or key == "railway" or key == "solidjs-vite-plugin" or key == "filesystem-routing" or key == "flue" or key == "vite-plugin-pages" or key == "vite-plugin-vue-layouts-next" or key == "storybook" or key == "xo" or key == "tsdown" or key == "tsup" or key == "rollup" or key == "rolldown" or key == "rslib" or key == "esbuild" or key == "astro" or key == "starlight" or key == "next" or key == "eslint" or key == "vite" or key == "vite-plugin-pwa" or key == "sveltekit" or key == "orval" or key == "vite-plus" or key == "laravel-vite-plugin" or key == "next-mdx" or key == "stencil" or key == "sst"
 
 # isExternalReExportsOnly: a config that only re-exports packages (export { default } from "pkg") isn't loaded
 fn external_reexports_only(p: Proj, fs: Fs, f: Str) -> Bool:
@@ -2053,6 +2253,62 @@ fn resolve_ast(var p: Proj, fs: Fs, key: Str, f: Str):
       if got.len > 0: dirs = got
     if dirs.len == 0: dirs = [dd]
     for d in dirs: in_prod_entry(&p, "/" + resolve.join(cdir, d + suffix), f)
+    return
+  if key == "quasar":
+    let x = asth.parse_src(f, src + "")
+    let cdir = resolve.dirname(f)
+    let cfg = quasar_config_object(x)
+    let sfo = asth.find_prop(x, cfg, "sourceFiles")
+    let entries = [["rootComponent", "src/App.vue"], ["router", "src/router/index.{{js,ts}}"], ["store", "src/stores/index.{{js,ts}}", "src/store/index.{{js,ts}}"], ["pwaRegisterServiceWorker", "src-pwa/register-service-worker.{{js,ts}}", "src-pwa/register-sw.{{js,ts}}"], ["pwaServiceWorker", "src-pwa/custom-service-worker.{{js,ts}}", "src-pwa/sw/custom-sw.{{js,ts}}"], ["electronMain", "src-electron/electron-main.{{js,ts}}"]]
+    for e in entries:
+      let ov = asth.property_values(x, sfo, e[0])
+      if ov.len > 0 and ov[0] != "": in_prod_entry(&p, "/" + resolve.join(cdir, quasar_ext(ov[0])), f)
+      else:
+        for k in 1..e.len: in_prod_entry(&p, "/" + resolve.join(cdir, e[k]), f)
+    for e in ["src-electron/electron-preload.{{js,ts}}", "src-ssr/server.{{js,ts}}", "src-ssr/middlewares/*.{{js,ts}}", "src-bex/**/*.{{js,ts}}"]: in_prod_entry(&p, "/" + resolve.join(cdir, e), f)
+    let boot = asth.find_prop(x, cfg, "boot")
+    if asth.kind(x, boot) == ast.N_ARRAY:
+      for el in asth.elements(x, boot):
+        var id = asth.str_value(x, el)
+        if id == "\0":
+          let pv = asth.property_values(x, el, "path")
+          id = ""
+          if pv.len > 0: id = pv[0] + ""
+        if id != "": in_prod_entry(&p, "/" + resolve.join(cdir, "src/boot/" + quasar_ext(id)), f)
+    for id in asth.string_values(x, asth.find_prop(x, cfg, "css")):
+      if id.startswith("~"): add_defer(&p, id[1..id.len], f)
+      else: in_prod_entry(&p, "/" + resolve.join(cdir, "src/css/" + id), f)
+    return
+  if key == "qwik":
+    let x = asth.parse_src(f, src + "")
+    var src_dir = "src"
+    let qa = asth.find_call_arg(x, "qwikVite")
+    if qa >= 0:
+      let v = asth.property_values(x, qa, "srcDir")
+      if v.len > 0 and v[0] != "": src_dir = v[0] + ""
+    var routes: [Str] = []
+    let ca = asth.find_call_arg(x, "qwikCity")
+    if ca >= 0:
+      for v in asth.property_values(x, ca, "routesDir"):
+        if v != "": routes.push(v + "")
+    if routes.len == 0: routes = [src_dir + "/routes"]
+    in_entry(&p, src_dir + "/entry.dev.tsx", f, false, false)
+    for e in ["/root.tsx", "/entry.*.tsx"]: in_prod_entry(&p, src_dir + e, f)
+    for r in routes: in_prod_entry(&p, r + "/**/*.{{tsx,ts,md,mdx}}", f)
+    for n in ["@qwik-city-plan", "@qwik-city-sw-register", "@qwik-client-manifest"]: in_ignore(&p, n, "unlisted", f)
+    return
+  if key == "openclaw":
+    if resolve.basename(f) != "openclaw.plugin.json": return
+    var text = src + ""
+    if text.startswith(chr(65279)): text = text[3..text.len]
+    let x = asth.parse_src(f + ".ts", "(" + text + "\n)")
+    for e in asth.collect_property_values(x, "providerCatalogEntry"): in_prod_entry(&p, e, f)
+    return
+  if key == "railway":
+    railway_ast(&p, fs, f, asth.parse_src(f, src + ""))
+    return
+  if key == "solidjs-vite-plugin":
+    solid_ast(&p, fs, f, asth.parse_src(f, src + ""))
     return
   if key == "vite-plus":
     let x = asth.parse_src(f, src + "")
@@ -2203,6 +2459,7 @@ fn load_wanted(p: Proj, key: Str, f: Str) -> Bool:
     if has_dep(p.ws[p.cur], "eslint-config-next") and dep_major(p.ws[p.cur], "eslint") == 9: return false
   if key == "tsup" or key == "tsdown": return b == "package.json" or b.endswith(".json")
   if key == "xo": return not xo_flat(p.ws[p.cur])
+  if key == "openclaw": return b == "package.json"
   return true
 
 # xo@1+ uses flat configs (read from the AST); xo@0 configs are loaded (manifest.getMajor('xo') ?? 1)
@@ -2382,6 +2639,36 @@ fn resolve_config(var p: Proj, fs: Fs, os: Os, key: Str, f: Str, v: Value):
   elif key == "npm-package-json-lint":
     for x in arrayify(pkg.get(v, "extends")): in_dep(&p, x, f, false)
   elif key == "osls": serverless_config(&p, fs, f, v)
+  elif key == "openclaw":
+    var ents: [Str] = []
+    for k in ["extensions", "runtimeExtensions", "setupEntry", "runtimeSetupEntry", "providerCatalogEntry"]: oc_entries(pkg.get(v, k), &ents)
+    let ch = pkg.get(v, "channel")
+    oc_entries(pkg.get(pkg.get(ch, "configuredState"), "specifier"), &ents)
+    oc_entries(pkg.get(pkg.get(ch, "persistedAuthState"), "specifier"), &ents)
+    for x in ents: in_prod_entry(&p, x, f)
+    for h in pkg.items(json.Arr([json.copy(pkg.get(v, "hooks"))])):
+      var hs: [Value] = [json.copy(h)]
+      if is_arr(h): hs = pkg.items(h)
+      for e in hs:
+        if not pkg.is_text(e): continue
+        var d = pkg.str_of(e).strip()
+        while d.endswith("/"): d = d[0..d.len - 1]
+        if d != "": in_prod_entry(&p, d + "/{{handler,index}}.{{ts,js}}", f)
+    var srcs: [Value] = []
+    let sa = pkg.get(pkg.get(v, "build"), "staticAssets")
+    if is_arr(sa):
+      for a in pkg.items(sa): srcs.push(pkg.get(a, "source"))
+      var e2: [Str] = []
+      oc_entries(json.Arr(srcs), &e2)
+      for x in e2: in_prod_entry(&p, x, f)
+    var scs: [Str] = []
+    for k in ["build", "copy"]:
+      let x = pkg.get(pkg.get(v, "assetScripts"), k)
+      if pkg.is_text(x): scs.push(pkg.str_of(x))
+    let before = p.inputs.len
+    add_script_inputs(&p, scs, f, false, "", false)
+    for k in before..p.inputs.len:
+      if p.inputs[k].kind == I_ENTRY or p.inputs[k].kind == I_DEFER_ENTRY: p.inputs[k].production = true
   elif key == "lunaria":
     var ids: [Str] = []
     for x in pkg.items(pkg.get(v, "files")): ids.push(pkg.str_of(pkg.get(x, "location")))
@@ -5826,7 +6113,7 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false)
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [])
 
 fn config_error(msg: Str):
   eprint("ERROR: " + msg)
