@@ -27,7 +27,7 @@ import autoimp
 import marko
 from json import Value
 from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY, I_CATALOG
-from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC
+from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC, F_LOADER
 from resolve import Resolver, Res, R_UNRESOLVED, R_FILE, R_EXTERNAL, R_BUILTIN
 from report import Issue, Hint, issue, copy_issue
 
@@ -5237,6 +5237,19 @@ type Node:
   has_by: Bool
   exts: [Ext]
   unresolved: [Ext]
+  cyc: [Cyc]                 # (--cycles) its internal imports, in order
+
+# an internal import, for cycles (knip's Import: identifier, alias, namespace, flags, position)
+type Cyc:
+  tid: Int
+  flags: Int
+  ident: Str
+  alias: Str
+  ns: Str
+  spec: Str
+  line: Int
+  col: Int
+  pos: Int
 
 type Graph:
   ids: {Str: Int}
@@ -5249,7 +5262,7 @@ fn node_id(var g: Graph, path: Str) -> Int:
   if path in g.ids: return g.ids[path]
   let id = g.nodes.len
   g.ids[path] = id
-  g.nodes.push(Node(path + "", false, false, empty_raw(path), new_im(), false, [], []))
+  g.nodes.push(Node(path + "", false, false, empty_raw(path), new_im(), false, [], [], []))
   return id
 
 fn add_val(var m: {Str: [Int]}, key: Str, v: Int):
@@ -5337,6 +5350,9 @@ type Build:
   project: {Str: Bool}
   visited: {Int: Bool}
   order: [Int]
+  cycles_on: Bool            # (--cycles) internal imports kept, graph order recorded
+  gorder: [Int]              # the module graph's order (a file after the files it imports first)
+  gseen: {Int: Bool}
 
 fn add_entry(var b: Build, path: Str, skip: Bool, explicit: Bool):
   if resolve.in_node_modules(path) or not acc(b, path): return
@@ -5390,6 +5406,14 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
         let tid = node_id(&b.g, r.path)
         targets[im.spec] = tid
         add_internal(&b, tid, id, im)
+        if b.cycles_on:
+          let l = extract.loc(b.g.nodes[id].raw, im.pos)
+          var fl = im.flags
+          if is_dts: fl = fl | F_TYPEONLY
+          b.g.nodes[id].cyc.push(Cyc(tid, fl, im.ident + "", im.alias + "", im.ns + "", im.spec + "", l[0], l[1], l[2]))
+          if not (tid in b.gseen):
+            b.gseen[tid] = true
+            b.gorder.push(tid)
         if acc(b, r.path): visit(&b, tid)
         # an import of a workspace package (or of a listed dependency through a path alias) also
         # counts as a use of that package
@@ -5415,6 +5439,9 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
       continue
     let l = extract.loc(b.g.nodes[id].raw, spos)
     unres.push(Ext(im.spec + "", "", l[0], l[1], l[2], type_only, false))
+  if b.cycles_on and not (id in b.gseen):
+    b.gseen[id] = true
+    b.gorder.push(id)
   # the operations on resolved internal imports
   var ops: [Op] = []
   swap(&ops, &b.g.nodes[id].raw.ops)
@@ -7170,6 +7197,140 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
     for f in ppaths:
       if acc(b, f) and not resolve.in_node_modules(f) and not dev_match(p, dev_pats, f): b.project[f] = true
 
+# getRuntimeSuccessors: the internal files a node imports at runtime (not type-only, not ignored)
+fn runtime_succ(n: Node, ignored: Int) -> [Int]:
+  var out: [Int] = []
+  for c in n.cyc:
+    if (c.flags & F_TYPEONLY) != 0 or (c.flags & ignored) != 0: continue
+    if not opts_has_int(out, c.tid): out.push(c.tid)
+  return out
+
+fn opts_has_int(xs: [Int], x: Int) -> Bool:
+  for y in xs:
+    if y == x: return true
+  return false
+
+# findAllCycles: a depth-first search from each node in the graph's order, one cycle per edge back
+# to a node on the path; then the cycle issues (cycles.allow and cycles.dynamicImports apply)
+fn find_cycles(var p: Proj, b: Build):
+  let cfg = pkg.get(p.cfg, "cycles")
+  var ignored = F_ENTRY | F_DYNAMIC
+  if pkg.truthy(pkg.get(cfg, "dynamicImports")): ignored = F_ENTRY
+  var allowed: {Str: Bool} = {}
+  for path in pkg.items(pkg.get(cfg, "allow")):
+    let xs = pkg.strs(path)
+    if xs.len == 0: continue
+    var n = xs.len
+    if n > 1 and xs[0] == xs[n - 1]: n -= 1
+    var ys: [Str] = []
+    for k in 0..n: ys.push(xs[k] + "")
+    allowed["\0".join(ys)] = true
+  var state: {Int: Int} = {}
+  for root in b.gorder:
+    if root in state: continue
+    var path: [Int] = []
+    var on_path: {Int: Int} = {}
+    var succs: [[Int]] = []
+    var next: [Int] = []
+    state[root] = 1
+    on_path[root] = 0
+    path.push(root)
+    succs.push(runtime_succ(b.g.nodes[root], ignored))
+    next.push(0)
+    while path.len > 0:
+      let top = path.len - 1
+      let cur = path[top]
+      if next[top] >= succs[top].len:
+        state[cur] = 2
+        on_path.remove(cur)
+        path.pop()
+        succs.pop()
+        next.pop()
+        continue
+      let sn = succs[top][next[top]]
+      next[top] += 1
+      if sn in state:
+        if state[sn] == 1:
+          var cyc: [Int] = []
+          for k in on_path[sn]..path.len: cyc.push(path[k])
+          cyc.push(sn)
+          cycle_issue(&p, b, cyc, ignored, allowed)
+        continue
+      state[sn] = 1
+      on_path[sn] = path.len
+      path.push(sn)
+      succs.push(runtime_succ(b.g.nodes[sn], ignored))
+      next.push(0)
+
+fn cycle_issue(var p: Proj, b: Build, cyc: [Int], ignored: Int, allowed: {Str: Bool}):
+  let file = b.g.nodes[cyc[0]].path + ""
+  let wi = ws_of(p, file)
+  if wi < 0: return
+  var names: [Str] = []
+  var items: [Str] = []
+  for k in 0..cyc.len - 1:
+    let n = cyc[k]
+    let name = b.g.nodes[n].path + ""
+    names.push(name)
+    # getRuntimeImport: the first runtime import of the next file
+    var best = -1
+    for q in 0..b.g.nodes[n].cyc.len:
+      let c = b.g.nodes[n].cyc[q]
+      if c.tid != cyc[k + 1] or (c.flags & F_TYPEONLY) != 0 or (c.flags & ignored) != 0: continue
+      if best < 0: best = q
+      else:
+        let bc = b.g.nodes[n].cyc[best]
+        if c.line < bc.line or (c.line == bc.line and c.col < bc.col): best = q
+    if best < 0:
+      items.push("{{\"name\":" + json.quote(name) + "}}")
+      continue
+    let c = b.g.nodes[n].cyc[best]
+    let kind = import_kind(b.g.nodes[n].cyc, cyc[k + 1], c)
+    items.push("{{\"name\":" + json.quote(name) + ",\"kind\":" + json.quote(kind) + ",\"specifier\":" + json.quote(c.spec) + ",\"line\":{c.line},\"col\":{c.col},\"pos\":{c.pos}}}")
+  if "\0".join(names) in allowed: return
+  var i = issue("cycles", file, " → ".join(names))
+  i.extra = "[" + ",".join(items) + "]"
+  i.ws = p.ws[wi].name + ""
+  add_issue(&p, i)
+
+# getImportKind with the import maps of the node's imports of that file
+fn import_kind(cs: [Cyc], tid: Int, c: Cyc) -> Str:
+  if (c.flags & F_DYNAMIC) != 0: return "dynamicImport"
+  var ident = c.ident + ""
+  if c.ns != "": ident = c.ns + ""
+  var re_ns = false
+  var re_as = false
+  var re_ = false
+  var star_re = false
+  var imp_ns = false
+  var imp_as = false
+  for x in cs:
+    if x.tid != tid: continue
+    var xid = x.ident + ""
+    if xid == "":
+      if (x.flags & F_OPAQUE) != 0: xid = "\0opaque"
+      elif (x.flags & F_LOADER) != 0: xid = "\0loader"
+      else: xid = "\0side"
+    if (x.flags & F_REEXPORT) != 0:
+      if xid == "*" and x.ns != "":
+        if x.ns == ident: re_ns = true
+      elif x.alias != "":
+        if xid == ident: re_as = true
+      else:
+        if xid == ident and ident != "": re_ = true
+        if xid == "*": star_re = true
+    else:
+      if x.alias != "" and x.alias != xid:
+        if xid == "*": imp_ns = true
+        elif xid == ident: imp_as = true
+  if ident == "*" and star_re: return "reExportStar"
+  if ident != "" and re_ns: return "reExportNS"
+  if ident != "" and re_as: return "reExportAs"
+  if ident != "" and re_: return "reExport"
+  if ident == "*" and imp_ns: return "importNS"
+  if ident != "" and imp_as: return "importAs"
+  return "import"
+
 fn negate(s: Str) -> Str:
   if s.startswith("!"): return s + ""
   return "!" + s
@@ -7535,7 +7696,7 @@ fn main(fs: Fs, os: Os):
     if not (d in dws): dws[d] = ws_of_slow(p, f)
   swap(&p.dir_ws, &dws)
   # the workspaces, each with its entry and project files
-  var b = Build({}, Graph({}, []), {}, {}, {}, {}, {}, [])
+  var b = Build({}, Graph({}, []), {}, {}, {}, {}, {}, [], p.on["cycles"], [], {})
   if p.config_file != "": add_entry(&b, p.config_file, true, true)
   let cli_inc_entry = opts.flag(a, "include-entry-exports")
   for wi in 0..p.ws.len:
@@ -7662,6 +7823,7 @@ fn main(fs: Fs, os: Os):
     n_unused += 1
     add_file_issue(&p, f)
   analyze_exports(&p, b)
+  if p.on["cycles"]: find_cycles(&p, b)
   analyze_imports(&p, b)
   settle_deps(&p)
   catalog_issues(&p, fs, root_manifest)
@@ -7730,6 +7892,7 @@ fn main(fs: Fs, os: Os):
     elif r == "github-actions": text = report.github_actions(p.coll, p.on, p.issues, collected_hints(p), p.tag_hints, not no_hints, not no_tag_hints, treat_hints, treat_tag_hints, p.config_file)
     elif r == "codeclimate": text = report.codeclimate(p.on, p.issues)
     elif r == "sarif": text = report.sarif(p.coll, p.on, p.issues, "6.44.1")
+    elif r == "cycles": text = report.cycles_report(p.coll, p.issues)
     elif r == "codeowners":
       # (knip reads the file relative to the working folder, and throws when it's missing)
       let cf = codeowners_path(a, "path")
@@ -7955,9 +8118,8 @@ fn issue_json(p: Proj, i: Issue, ad: Str) -> Value:
     for x in pkg.items(xs):
       var s: {Str: Value} = {}
       s["symbol"] = json.copy(pkg.get(x, "name"))
-      s["line"] = json.copy(pkg.get(x, "line"))
-      s["col"] = json.copy(pkg.get(x, "col"))
-      s["pos"] = json.copy(pkg.get(x, "pos"))
+      for k in ["kind", "specifier", "pos", "line", "col"]:
+        if json.has(x, k): s[k] = json.copy(pkg.get(x, k))
       syms.push(json.Obj(s))
     m["symbols"] = json.Arr(syms)
   if i.stype != "": m["symbolType"] = jtext(i.stype)
@@ -8008,7 +8170,14 @@ fn data_to_proj(var p: Proj, data: Value, ad: Str):
         let syms2 = pkg.items(pkg.get(v, "symbols"))
         if syms2.len > 0:
           var ds: [Str] = []
-          for x in syms2: ds.push("{{\"name\":" + json.quote(pkg.str_of(pkg.get(x, "symbol"))) + ",\"line\":{int_of(pkg.get(x, "line"))},\"col\":{int_of(pkg.get(x, "col"))},\"pos\":{int_of(pkg.get(x, "pos"))}}}")
+          for x in syms2:
+            # (in the JSON reporter's order: name, kind, specifier, line, col, pos)
+            var d = "{{\"name\":" + json.quote(pkg.str_of(pkg.get(x, "symbol")))
+            if json.has(x, "kind"): d += ",\"kind\":" + json.quote(pkg.str_of(pkg.get(x, "kind")))
+            if json.has(x, "specifier"): d += ",\"specifier\":" + json.quote(pkg.str_of(pkg.get(x, "specifier")))
+            for k in ["line", "col", "pos"]:
+              if json.has(x, k): d += ",\"" + k + "\":{int_of(pkg.get(x, k))}"
+            ds.push(d + "}}")
           i.extra = "[" + ",".join(ds) + "]"
         let ok = t + "\0" + file + "\0" + issue_key(i)
         if ok in orig:
