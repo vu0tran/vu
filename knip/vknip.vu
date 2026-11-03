@@ -25,6 +25,7 @@ import re
 import varlock
 import autoimp
 import marko
+import kcache
 from json import Value
 from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY, I_CATALOG
 from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC, F_LOADER
@@ -5606,6 +5607,54 @@ fn worker(fs: Fs, own root: Str, own tags: [Str], own jobs: Chan[Job], own res: 
     let j = jobs.recv() else return
     res.send(Done(j.idx, read_file(fs, root, j.path, j.comp, j.pre, &kw, &t, tags)))
 
+# Reads a batch of files (on all cores when there are several), from the cache where it has them.
+fn read_batch_c(fs: Fs, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], var c: kcache.Cache) -> [Raw]:
+  if not c.on: return read_batch(fs, root, paths, comps, pres, jobs_n, &kw, &t, tags)
+  var base = c.base + ""
+  if base == "": base = "."
+  let d = kcache.open_dir(fs, base) else return read_batch(fs, root, paths, comps, pres, jobs_n, &kw, &t, tags)
+  var out: [Raw] = []
+  var stamps: [[Str]] = []
+  var ctxs: [Str] = []
+  var mp: [Str] = []
+  var mc: [Str] = []
+  var mpre: [Str] = []
+  var mix: [Int] = []
+  for i in 0..paths.len:
+    let st = kcache.file_stamp(d, paths[i])
+    let ctx = kcache.cache_ctx(comps[i], pres[i], tags)
+    var got = false
+    if st.len == 2 and paths[i] in c.old:
+      var e = kcache.CEnt(0, "", "", "")
+      swap(&e, &c.old[paths[i]])
+      c.old.remove(paths[i])
+      if "{e.size}" == st[0] and e.mtime == st[1] and e.ctx == ctx:
+        var r = from_json(e.data, Raw) else empty_raw("\0")
+        if r.path != "\0":
+          r.path = paths[i] + ""
+          out.push(r)
+          c.now[paths[i]] = e
+          got = true
+      if not got: c.dirty = true
+    if not got:
+      out.push(empty_raw(""))
+      mp.push(paths[i] + "")
+      mc.push(comps[i] + "")
+      mpre.push(pres[i] + "")
+      mix.push(i)
+    stamps.push(st)
+    ctxs.push(ctx)
+  if mp.len == 0: return out
+  var raws = read_batch(fs, root, mp, mc, mpre, jobs_n, &kw, &t, tags)
+  for k in 0..mix.len:
+    let i = mix[k]
+    let st = stamps[i]
+    if st.len == 2:
+      c.now[paths[i]] = kcache.CEnt(int(st[0]) else 0, st[1] + "", ctxs[i] + "", to_json(raws[k]))
+      c.dirty = true
+    swap(&out[i], &raws[k])
+  return out
+
 # Reads a batch of files (on all cores when there are several).
 fn read_batch(fs: Fs, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str]) -> [Raw]:
   var out: [Raw] = []
@@ -8339,6 +8388,11 @@ fn main(fs: Fs, os: Os):
   if jobs == 0: jobs = cpu_count(fs)
   var kw = scan.keywords()
   var t = ast.new_ast()
+  var cache = kcache.no_cache()
+  if opts.flag(a, "cache"):
+    var loc = opts.str_opt(a, "cache-location")
+    if loc == "": loc = fspath(p, "node_modules/.cache/knip")
+    cache = kcache.open_cache(fs, loc, p.production, root)
   var done = 0
   while done < b.order.len:
     var wave: [Int] = []
@@ -8367,7 +8421,7 @@ fn main(fs: Fs, os: Os):
       pres.push("")
     precompile(&p, fs, os, paths, &comps, &pres)
     debug_compiled(p, paths, comps, pres)
-    var raws = read_batch(fs, root, paths, comps, pres, jobs, &kw, &t, utags)
+    var raws = read_batch_c(fs, root, paths, comps, pres, jobs, &kw, &t, utags, &cache)
     for k in 0..wave.len:
       let id = wave[k]
       swap(&b.g.nodes[id].raw, &raws[k])
@@ -8393,6 +8447,7 @@ fn main(fs: Fs, os: Os):
         link_file(&p, fs, &b, id)
       else:
         link_follow(&p, fs, &b, id)
+  kcache.save_cache(fs, &cache)
   # ignoreExportsUsedInFile: an export referenced in its own file (hasRefsInFile)
   var ids_: [Int] = []
   for id in b.order: ids_.push(id)
