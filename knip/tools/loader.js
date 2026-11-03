@@ -370,6 +370,7 @@ for (const r of reqs) {
       v = out;
     }
     if (r.mode === 'storybook' && v && typeof v.stories === 'function') v = { ...v, stories: await v.stories(['**/*.@(mdx|stories.@(mdx|js|jsx|mjs|ts|tsx))']) };
+    if (r.mode === 'rstest' && typeof v === 'function') v = await v({ env: 'test', command: 'run', envMode: 'test' });
     if (r.mode === 'eleventy') {
       const dummy = new DummyEleventyConfig();
       if (typeof v === 'function') v = await v(dummy);
