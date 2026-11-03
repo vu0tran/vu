@@ -132,10 +132,29 @@ bool vjq_brokendown(double t, bool local, double *out, int64_t n) {
     return true;
 }
 
+/* timegm as glibc computes it, for any year (macOS's timegm gives -1 before 1900): the fields
+   are normalized the same way (months outside 0..11 carried into the year, the rest added up) */
+static int64_t vjq_days_from_civil(int64_t y, int64_t m, int64_t d) {
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
 double vjq_timegm(const double *p, int64_t n) {
     struct tm tm;
     to_tm(p, n, &tm);
+#ifdef __APPLE__
+    int64_t mon = tm.tm_mon, year = (int64_t)tm.tm_year + 1900;
+    year += mon / 12; mon %= 12;
+    if (mon < 0) { mon += 12; year -= 1; }
+    int64_t days = vjq_days_from_civil(year, mon + 1, 1) + (int64_t)tm.tm_mday - 1;
+    return (double)(days * 86400 + (int64_t)tm.tm_hour * 3600 + (int64_t)tm.tm_min * 60 + tm.tm_sec);
+#else
     return (double)timegm(&tm);
+#endif
 }
 
 /* strftime of a broken-down time, as jq does it (zone fields left zero); "" when strftime
