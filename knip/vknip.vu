@@ -211,6 +211,7 @@ type Proj:
   links: {Str: Bool}         # the project's symbolic links (paths)
   list_links: fn(Str) -> [Str]
   realp: fn(Str) -> Str
+  xdev: {Int: [Str]}         # (production) development entry patterns other workspaces gave
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -311,6 +312,39 @@ fn add_gitignore(var p: Proj, text: Str, base: Str):
       else: p.ign_exact.push(glob.compile(pat))
     elif neg: p.unign.push(glob.compile(pat))
     else: p.ign.push(glob.compile(pat))
+
+# an ancestor folder's .gitignore read from the project folder (parseAndConvertGitignorePatterns
+# with ancestor): patterns under the project lose the prefix, other anchored ones are dropped
+fn ancestor_gitignore(text: Str, anc: Str) -> Str:
+  var out: [Str] = []
+  for raw in text.split("\n"):
+    var line = raw
+    if line.endswith("\r"): line = line[0..line.len - 1]
+    if line.strip() == "" or line.startswith("#"): continue
+    var pat = line
+    if pat.startswith("\\#"): pat = pat[1..pat.len]
+    pat = pat.strip()
+    var pre = ""
+    var rest = pat
+    if rest.startswith("!"):
+      pre = "!"
+      rest = rest[1..rest.len]
+    var slash = ""
+    if rest.startswith("/"):
+      slash = "/"
+      rest = rest[1..rest.len]
+    if rest.startswith(anc):
+      out.push(pre + slash + rest[anc.len..rest.len])
+      continue
+    if pat.startswith("/**/"):
+      out.push(pat[1..pat.len])
+      continue
+    if pat.startswith("!/**/"):
+      out.push("!" + pat[2..pat.len])
+      continue
+    if pat.startswith("/") or pat.startswith("!/"): continue
+    out.push(pat + "")
+  return "\n".join(out)
 
 # tinyglobby's escapePath: glob characters of a folder name taken literally
 fn glob_escape(s: Str) -> Str:
@@ -811,21 +845,21 @@ fn tsconfig_chain(var p: Proj, fs: Fs, path: Str, var opts_: {Str: Value}, var t
 
 # walkReferences: each referenced tsconfig's paths (its own references too, unless it has both
 # outDir and rootDir)
-fn ref_paths(var p: Proj, fs: Fs, file: Str, scope: Str, var visited: {Str: Bool}):
+fn ref_paths(var p: Proj, fs: Fs, file: Str, scope: Str, var visited: {Str: Bool}, var pairs: [Str], var target: {Str: Value}):
   let v = pkg.read_json(fs, fspath(p, file))
   let fdir = resolve.dirname(file)
   for rf in pkg.items(pkg.get(v, "references")):
     let rp = pkg.str_of(pkg.get(rf, "path"))
     if rp == "": continue
-    var target = resolve.join(fdir, rp)
-    if not exists_file(p, fs, target):
-      target = resolve.join(target, "tsconfig.json")
-      if not exists_file(p, fs, target): continue
-    if target in visited: continue
-    visited[target] = true
+    var target_f = resolve.join(fdir, rp)
+    if not exists_file(p, fs, target_f):
+      target_f = resolve.join(target_f, "tsconfig.json")
+      if not exists_file(p, fs, target_f): continue
+    if target_f in visited: continue
+    visited[target_f] = true
     var co: {Str: Value} = {}
     var top: {Str: Value} = {}
-    tsconfig_chain(&p, fs, target, &co, &top, 0)
+    tsconfig_chain(&p, fs, target_f, &co, &top, 0)
     if "paths" in co:
       var pdir = ""
       if "baseUrl" in co: pdir = pkg.str_of(co["baseUrl"])
@@ -835,7 +869,18 @@ fn ref_paths(var p: Proj, fs: Fs, file: Str, scope: Str, var visited: {Str: Bool
         var vals: [Str] = []
         for t in pkg.strs(pkg.get(pm, key)): vals.push(resolve.join(pdir, t))
         add_path_map(&p, key, vals, scope)
-    if not ("outDir" in co and "rootDir" in co): ref_paths(&p, fs, target, scope, &visited)
+    # (a reference with outDir and rootDir maps one to the other; its outDir and rootDir are the
+    # config's when it has none)
+    var rout = ""
+    var rroot = ""
+    if "outDir" in co: rout = pkg.str_of(co["outDir"])
+    if "rootDir" in co: rroot = pkg.str_of(co["rootDir"])
+    if rout != "" and rroot != "" and rout != rroot:
+      pairs.push(rroot + "")
+      pairs.push(rout + "")
+    if rout != "" and not ("outDir" in target): target["outDir"] = json.Text(rout + "")
+    if rroot != "" and not ("rootDir" in target): target["rootDir"] = json.Text(rroot + "")
+    if not ("outDir" in co and "rootDir" in co): ref_paths(&p, fs, target_f, scope, &visited, &pairs, &target)
 
 # a workspace's tsconfig.json: paths, types, the outDir source mapping, and the declaration files it
 # includes (entry files)
@@ -862,7 +907,8 @@ fn load_tsconfig(var p: Proj, fs: Fs):
   # (and its references' paths, as load-tsconfig's walkReferences collects them)
   var rvisited: {Str: Bool} = {}
   rvisited[file] = true
-  ref_paths(&p, fs, file, dir, &rvisited)
+  var rpairs: [Str] = []
+  ref_paths(&p, fs, file, dir, &rvisited, &rpairs, &co)
   if "types" in co: p.ws[w].tsc_types = pkg.strs(co["types"])
   if "rootDirs" in co:
     let rds = pkg.strs(co["rootDirs"])
@@ -876,6 +922,13 @@ fn load_tsconfig(var p: Proj, fs: Fs):
         p.ws[w].smaps.push(pr[0] + "")
         p.ws[w].smaps.push(pr[1] + "")
         p.rs.srcmaps.push(resolve.SrcMap(dir + "", pr[0] + "", pr[1] + ""))
+  var rk = 0
+  while rk < rpairs.len:
+    if not smap_seen(p.ws[w].smaps, rpairs[rk], rpairs[rk + 1]):
+      p.ws[w].smaps.push(rpairs[rk] + "")
+      p.ws[w].smaps.push(rpairs[rk + 1] + "")
+      p.rs.srcmaps.push(resolve.SrcMap(dir + "", rpairs[rk] + "", rpairs[rk + 1] + ""))
+    rk += 2
   if "outDir" in co:
     let out = pkg.str_of(co["outDir"])
     var src = dir + ""
@@ -1980,8 +2033,15 @@ fn run_plugins(var p: Proj, fs: Fs, os: Os):
     var kept: [Input] = []
     var all: [Input] = []
     swap(&all, &p.inputs)
+    var marks: [Input] = []
     for x in all:
       if x.production or x.kind == I_CONFIG: kept.push(scripts.cp(x))
+      elif x.plugin.startswith("@yarn-dir:"): marks.push(scripts.cp(x))
+    # (another folder's scripts: the config files they name still count, as knip stores every
+    # script's config inputs)
+    if marks.len > 0:
+      for y in expand_tries(&p, fs, marks):
+        if y.kind == I_CONFIG: kept.push(scripts.cp(y))
     p.inputs = kept
   # config files named in scripts are read by their plugin even when it isn't enabled
   if not ("typescript" in p.ws[p.cur].plugins):
@@ -2124,7 +2184,7 @@ fn run_plugin(var p: Proj, fs: Fs, os: Os, key: Str):
   if key == "github-actions":
     let found = find_configs(p, fs, [".github/workflows/*.{{yml,yaml}}", ".github/**/action.{{yml,yaml}}"])
     for f in found:
-      github_workflow(&p, fs, f)
+      github_workflow(&p, fs, os, f)
       config_entry(&p, f)
     return
   if key == "borp":
@@ -2132,7 +2192,7 @@ fn run_plugin(var p: Proj, fs: Fs, os: Os, key: Str):
     for f in found:
       config_entry(&p, f)
       let text = fs.read(fspath(p, f)) else ""
-      let v = yaml.parse(text)
+      let v = cfg_yaml(&p, fs, os, f, text)
       for r in pkg.strs(pkg.get(v, "reporters")):
         let ri = scripts.borp_reporter(r)
         if ri != "": add_defer(&p, ri, f)
@@ -2885,7 +2945,7 @@ fn load_cfg(var p: Proj, fs: Fs, os: Os, key: Str, f: Str) -> Value:
     return pkg.parse_jsonc(text)
   if ext == ".yaml" or ext == ".yml":
     let text = fs.read(fspath(p, f)) else return json.Null
-    return yaml.parse(text)
+    return cfg_yaml(&p, fs, os, f, text)
   if ext == ".json" or ext == ".jsonc" or ext == ".json5":
     let text = fs.read(fspath(p, f)) else return json.Null
     return pkg.parse_jsonc(text)
@@ -2910,6 +2970,25 @@ fn load_cfg(var p: Proj, fs: Fs, os: Os, key: Str, f: Str) -> Value:
     eout(p, report.red("ERROR") + ": " + "Please fix or visit https://knip.dev/reference/known-issues")
     return json.Null
   return pkg.get(r, "ok")
+
+# A plugin's YAML config (loadYAML): vknip's reader, or, for something it isn't sure about, the yaml
+# package in node (knip's parser), with knip's error when that rejects it
+fn cfg_yaml(var p: Proj, fs: Fs, os: Os, f: Str, text: Str) -> Value:
+  if not yaml.irregular(text): return yaml.parse(text)
+  let yk = "yaml:" + fspath(p, f)
+  if not (yk in p.js):
+    var yreqs: [loader.Req] = [loader.Req(fspath(p, f), "yaml", json.Null)]
+    let yres = loader.load_all(fs, os, yreqs, fspath(p, ""))
+    let yfk = fspath(p, f)
+    p.js[yk] = json.copy(yres[yfk])
+  let yr = json.copy(p.js[yk])
+  if json.has(yr, "error"):
+    p.config_errors = true
+    eout(p, report.red("ERROR") + ": " + "Error loading " + f + " (" + pkg.str_of(pkg.get(yr, "error")) + ")")
+    eout(p, report.red("ERROR") + ": " + "Please fix or visit https://knip.dev/reference/known-issues")
+    return json.Null
+  if json.has(yr, "ok"): return pkg.get(yr, "ok")
+  return yaml.parse(text)
 
 # Loads the JavaScript config files the enabled plugins will read, all in one Node.js process.
 fn prefetch(var p: Proj, fs: Fs, os: Os):
@@ -4460,7 +4539,8 @@ fn storybook_config(var p: Proj, f: Str, v: Value):
     elif pkg.is_obj(x):
       var files = pkg.str_of(pkg.get(x, "files"))
       if files == "": files = stories0 + ""
-      story.push(resolve.join(abs_in(cdir, pkg.str_of(pkg.get(x, "directory"))), files))
+      let sd = abs_in(cdir, pkg.str_of(pkg.get(x, "directory")))
+      story.push("/" + resolve.join(sd[1..sd.len], files))
   let setting = plugin_setting(p.ws[p.cur], "storybook")
   var rest: [Str] = [".{{storybook,rnstorybook}}/{{manager,preview,index,vitest.setup}}.{{js,jsx,ts,tsx}}"]
   if pkg.is_obj(setting) and json.has(setting, "entry"): rest = pkg.strs(pkg.get(setting, "entry"))
@@ -5347,6 +5427,9 @@ fn typescript_configs(var p: Proj, fs: Fs, queue0: [Str]):
         i.file = f + ""
         i.plugin = "typescript"
         p.inputs.push(i)
+        # (a workspace package's tsconfig is read as well: the input handler resolves it internally)
+        let rr = resolve.resolve(&p.rs, fs, e, f)
+        if rr.kind == R_FILE and not resolve.in_node_modules(rr.path) and not is_ignored_path(p, rr.path, false): queue.push(rr.path + "")
     for r in pkg.items(pkg.get(v, "references")):
       let rp = pkg.str_of(pkg.get(r, "path"))
       if rp == "": continue
@@ -5374,10 +5457,13 @@ fn typescript_configs(var p: Proj, fs: Fs, queue0: [Str]):
           p.inputs.push(e)
     let co = pkg.get(v, "compilerOptions")
     if not pkg.is_obj(co): continue
+    # (resolved from the workspace that reads the config, dir: options.cwd, and referenced there)
+    let wsd = dir_of_input(p.ws[p.cur].dir)
     for t in pkg.strs(pkg.get(co, "types")):
       var i = scripts.inp(I_DEFER, t)
       i.type_only = true
       i.file = f + ""
+      i.dir = wsd + ""
       i.also_owner = true
       p.inputs.push(i)
     var names: [Str] = []
@@ -5389,11 +5475,15 @@ fn typescript_configs(var p: Proj, fs: Fs, queue0: [Str]):
       if n == "": continue
       var i = scripts.inp(I_DEFER, n)
       i.file = f + ""
+      i.dir = wsd + ""
+      i.also_owner = true
       p.inputs.push(i)
     let jsx = pkg.str_of(pkg.get(co, "jsxImportSource"))
     if jsx != "":
       var i = scripts.inp(I_DEP, jsx)
       i.file = f + ""
+      i.dir = wsd + ""
+      i.also_owner = true
       i.production = true
       p.inputs.push(i)
 
@@ -5574,9 +5664,9 @@ fn typedoc_config(var p: Proj, fs: Fs, os: Os, found: [Str]):
         let x = pkg.get(v, k)
         if pkg.truthy(x): in_entry(&p, "/" + resolve.join(resolve.dirname(f), pkg.str_of(x)), f, false, false)
 
-fn github_workflow(var p: Proj, fs: Fs, f: Str):
+fn github_workflow(var p: Proj, fs: Fs, os: Os, f: Str):
   let text = fs.read(fspath(p, f)) else return
-  let v = yaml.parse(text)
+  let v = cfg_yaml(&p, fs, os, f, text)
   let cdir = resolve.dirname(f)
   var jobs: [Value] = []
   by_key_deep(v, "steps", &jobs)
@@ -6117,20 +6207,28 @@ type RefState:
   reexp_entry: Int
   traverse: Bool
   star_at_entry: Bool
+  reexp_ids: [Str]          # the ids the re-exporting entry file was reached with
 
 fn complete(s: RefState) -> Bool:
   return s.referenced and (s.traverse or s.reexp_entry >= 0)
 
 fn is_referenced(g: Graph, entries: {Int: Bool}, skip: {Int: Bool}, file: Int, id: Str, traverse: Bool, star_at_entry: Bool) -> [Int]:
-  var s = RefState({}, false, -1, traverse, star_at_entry)
+  var s = RefState({}, false, -1, traverse, star_at_entry, [])
   walk_down(g, entries, skip, &s, file, id, false)
   var r = 0
   if s.referenced: r = 1
   return [r, s.reexp_entry]
 
+# the ids a re-exporting entry file was reached with (isReferenced's reExportedIds)
+fn reexported_ids(g: Graph, entries: {Int: Bool}, skip: {Int: Bool}, file: Int, id: Str, traverse: Bool) -> [Str]:
+  var s = RefState({}, false, -1, traverse, false, [])
+  walk_down(g, entries, skip, &s, file, id, false)
+  return sc(s.reexp_ids)
+
 fn walk_down(g: Graph, entries: {Int: Bool}, skip: {Int: Bool}, var s: RefState, path: Int, id: Str, via_star: Bool) -> Bool:
   let is_entry = path in entries
   if is_entry and s.reexp_entry < 0: s.reexp_entry = path
+  if path == s.reexp_entry and not opts.has(s.reexp_ids, id): s.reexp_ids.push(id + "")
   if complete(s): return true
   let parts = split_first(id)
   let ident = parts[0]
@@ -6339,6 +6437,13 @@ fn analyze_exports(var p: Proj, b: Build):
               for tg in tag_names(p, ex.tags): p.tag_hints.push(node.path + "\0" + ex.name + "\0" + tg)
           continue
         if r[1] >= 0 and not inc_entry: continue
+        # (re-exported from an entry file that tags it: skipped)
+        if r[1] >= 0 and r[0] == 0:
+          var tagged = false
+          for rid in reexported_ids(g, b.entries, b.skip, fid, ex.name, inc_entry):
+            for ee in g.nodes[r[1]].raw.exps:
+              if ee.name == rid and ((ee.tags & (extract.TAG_PUBLIC | extract.TAG_BETA | extract.TAG_ALIAS)) != 0 or (p.production and (ee.tags & extract.TAG_INTERNAL) != 0) or tag_excluded(p, ee.tags)): tagged = true
+          if tagged: continue
         if r[0] == 1:
           member_issues(&p, b, fid, ex, wi, true)
           continue
@@ -6406,6 +6511,12 @@ fn member_issues(var p: Proj, b: Build, fid: Int, ex: Exp, wi: Int, emit: Bool) 
   return n_unused
 
 # shouldIgnore: an included tag missing, or an excluded tag present
+# hasTag(options.tags[1]): one of the excluded tags
+fn tag_excluded(p: Proj, bits: Int) -> Bool:
+  for k in 0..p.tags_excl.len:
+    if (bits & (256 << (p.tags_incl.len + k))) != 0: return true
+  return false
+
 fn tag_ignored(p: Proj, bits: Int) -> Bool:
   if p.tags_incl.len > 0:
     var any = false
@@ -6762,7 +6873,7 @@ fn ws_config(p: Proj, name: Str) -> Value:
     k -= 1
   return json.Obj({})
 
-fn setup_workspaces(var p: Proj, fs: Fs, root_manifest: Value, ws_args: [Str]) -> Str:
+fn setup_workspaces(var p: Proj, fs: Fs, os: Os, root_manifest: Value, ws_args: [Str]) -> Str:
   let listed = listed_workspaces(p, fs, root_manifest)
   var ign_pats: [Str] = []
   for x in listed:
@@ -6801,7 +6912,12 @@ fn setup_workspaces(var p: Proj, fs: Fs, root_manifest: Value, ws_args: [Str]) -
     let src = fs.read(fspath(p, mt)) else continue
     let man = pkg.parse_json(src)
     if not pkg.is_obj(man):
-      eout(p, report.yellow("WARNING") + ": " + "Skipping workspace " + name + ": invalid JSON in " + fspath(p, mt))
+      # (knip's message: the absolute path and V8's JSON.parse error, asked of node)
+      let absf = abs_dir(&p, os) + "/" + mt
+      let why = os.output(["node", "-e", "try {{ JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8')); }} catch (e) {{ process.stdout.write(e.message); }}", absf]) else ""
+      var tail = ""
+      if why != "": tail = " (" + why + ")"
+      eout(p, report.yellow("WARNING") + ": " + "Skipping workspace " + name + ": invalid JSON in " + absf + tail)
       continue
     var pname = pkg.str_of(pkg.get(man, "name"))
     if pname == "" and name != ".":
@@ -6831,8 +6947,8 @@ fn setup_workspaces(var p: Proj, fs: Fs, root_manifest: Value, ws_args: [Str]) -
     rev.push(deep[k] + "")
     k -= 1
   p.avail_by_depth = rev
-  # --workspace
-  var included = sc(avail)
+  # --workspace (knip's availableWorkspaceNames is the reversed depth order: sorted and reversed in place)
+  var included = sc(p.avail_by_depth)
   if ws_args.len > 0:
     p.has_selected = true
     let sel = select_workspaces(p, fs, ws_args)
@@ -7488,11 +7604,13 @@ fn apply_ws_config(var p: Proj, wi: Int):
   var ibins: [Value] = pkg.items(pkg.get(wc, "ignoreBinaries"))
   var iunres: [Value] = pkg.items(pkg.get(wc, "ignoreUnresolved"))
   if name == ".":
-    let root_is_ws = json.has(pkg.get(p.cfg, "workspaces"), ".")
-    if root_is_ws:
-      for x in pkg.items(pkg.get(p.cfg, "ignoreDependencies")): ideps.push(json.copy(x))
-      for x in pkg.items(pkg.get(p.cfg, "ignoreBinaries")): ibins.push(json.copy(x))
-      for x in pkg.items(pkg.get(p.cfg, "ignoreUnresolved")): iunres.push(json.copy(x))
+    # (getIgnores: the root workspace has the configuration's top-level ignores too)
+    for x in pkg.items(pkg.get(p.cfg, "ignoreDependencies")):
+      if not has_value(ideps, x): ideps.push(json.copy(x))
+    for x in pkg.items(pkg.get(p.cfg, "ignoreBinaries")):
+      if not has_value(ibins, x): ibins.push(json.copy(x))
+    for x in pkg.items(pkg.get(p.cfg, "ignoreUnresolved")):
+      if not has_value(iunres, x): iunres.push(json.copy(x))
   for x in ideps:
     if loader.is_re(x): p.ws[wi].ign_deps.push(matcher(x))
     else:
@@ -7509,6 +7627,12 @@ fn apply_ws_config(var p: Proj, wi: Int):
       elif s != "": p.ws[wi].ign_bins.push(matcher(x))
   for x in iunres: p.ws[wi].ign_unres.push(matcher(x))
 
+fn has_value(xs: [Value], x: Value) -> Bool:
+  let t = json.stringify(x)
+  for y in xs:
+    if json.stringify(y) == t: return true
+  return false
+
 # ---- building the graph (graph/build.js)
 
 type Patterns:
@@ -7518,6 +7642,16 @@ type Patterns:
   prod_skip: [Str]
   project: [Str]
   groups: [Str]
+
+fn xws_dev(var p: Proj, wi: Int, pat: Str):
+  var k = 0
+  while k < pat.len and pat[k] != '*' and pat[k] != '{' and pat[k] != '?' and pat[k] != '[' and pat[k] != '(' and pat[k] != '!': k += 1
+  let stat = pat[0..k]
+  if stat == "" or pat.startswith("!"): return
+  let owner = ws_of(p, stat + "x")
+  if owner < 0 or owner == wi: return
+  if owner in p.xdev: p.xdev[owner].push(pat + "")
+  else: p.xdev[owner] = [pat + ""]
 
 fn add_pat(var xs: [Str], group: Str, pat: Str):
   let s = group + "\0" + pat
@@ -7612,11 +7746,14 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
   if p.debug:
     for x in inputs: eprint("input {x.kind} {x.spec} file={x.file} dir={x.dir} opt={x.optional} prod={x.production} plugin={x.plugin}")
   var pt = Patterns([], [], [], [], [], ["default"])
-  # (knip handles a package config input as soon as a plugin returns it, before other inputs)
+  # (knip handles a package config input as soon as a plugin returns it, before other inputs; a
+  # config file is a development entry: in production its path only keeps it out of the project)
   for inp in inputs:
     if inp.kind == I_CONFIG and not scripts.is_internal(inp.spec) and pkg_from_spec(inp.spec) != "":
       let f = handle_input(&p, fs, inp)
-      if f != "" and not p.production: add_entry(&b, f, true, true)
+      if f != "":
+        if p.production: add_pat(&pt.entry_skip, "default", f)
+        else: add_entry(&b, f, true, true)
   for inp in inputs:
     if inp.group != "" and inp.group != "@abs" and not opts.has(pt.groups, inp.group): pt.groups.push(inp.group + "")
     if inp.kind == I_ENTRY:
@@ -7643,6 +7780,9 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
       else:
         if skip: add_pat(&pt.entry_skip, group, pat)
         else: add_pat(&pt.entry, group, pat)
+        # (in production, a development entry in another workspace keeps its files out of that
+        # workspace's project files: knip runs the config there)
+        if p.production: xws_dev(&p, wi, pat)
     elif inp.kind == I_PROJECT: add_uniq(&pt.project, prepend(dir, inp.spec))
     elif inp.kind == I_CATALOG: handle_input(&p, fs, inp)
     elif inp.kind == I_IGNORE:
@@ -7658,7 +7798,9 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
         # a config file named on a command line: an entry file when it exists
         # (a plain entry: not in production)
         let f = resolve.join(input_base(inp), inp.spec)
-        if not p.production and exists_file(p, fs, f): add_entry(&b, f, true, true)
+        if exists_file(p, fs, f):
+          if p.production: add_pat(&pt.entry_skip, "default", f)
+          else: add_entry(&b, f, true, true)
     else:
       let f = handle_input(&p, fs, inp)
       if f != "":
@@ -7667,6 +7809,8 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
         else: add_entry(&b, f, true, true)
   # production: files the development entry patterns match aren't project files
   var dev_pats: [Str] = []
+  if p.production and wi in p.xdev:
+    for x in p.xdev[wi]: dev_pats.push(x + "")
   if p.production:
     for x in pt.entry:
       dev_pats.push(x[x.find("\0") + 1..x.len])
@@ -8405,7 +8549,7 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false, {}, own fn(d: Str) => [], own fn(x: Str) => "")
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false, {}, own fn(d: Str) => [], own fn(x: Str) => "", {})
 
 # standard output and error with knip's colors, or without them
 fn out(p: Proj, s: Str):
@@ -8554,7 +8698,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       if t in p.ignore_issues: p.ignore_issues[t].push(glob.compile(pat))
       else: p.ignore_issues[t] = [glob.compile(pat)]
   # workspaces
-  let werr = setup_workspaces(&p, fs, root_manifest, opts.strs_opt(a, "workspace"))
+  let werr = setup_workspaces(&p, fs, os, root_manifest, opts.strs_opt(a, "workspace"))
   if werr != "": config_error(p, werr)
   for wi in 0..p.ws.len:
     let wc = ws_config(p, p.ws[wi].name)
@@ -8586,6 +8730,21 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   p.ign.push(glob.compile("**/node_modules"))
   p.ign.push(glob.compile(".git"))
   if p.gitignore:
+    # (the .gitignore files of the folders above, to the git root: findAncestorGitignoreFiles)
+    if not fs.exists(fspath(p, ".git")):
+      let absr = abs_dir(&p, os)
+      var d = resolve.dirname_abs(absr)
+      while d != "":
+        let gf = d + "/.gitignore"
+        let gtext = fs.read(gf) else ""
+        if gtext != "":
+          var anc = absr[d.len + 1..absr.len] + "/"
+          if d == "/": anc = absr[1..absr.len] + "/"
+          add_gitignore(&p, ancestor_gitignore(gtext, anc), "")
+        if fs.exists(d + "/.git"): break
+        let up = resolve.dirname_abs(d)
+        if up == d: break
+        d = up
     let excl_f = fs.read(fspath(p, ".git/info/exclude")) else ""
     add_gitignore(&p, excl_f, "")
     let gi = fs.read(fspath(p, ".gitignore")) else ""
