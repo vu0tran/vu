@@ -23,7 +23,7 @@ import plugins
 import compilers
 import re
 from json import Value
-from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY
+from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY, I_CATALOG
 from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC
 from resolve import Resolver, Res, R_UNRESOLVED, R_FILE, R_EXTERNAL, R_BUILTIN
 from report import Issue, Hint, issue, copy_issue
@@ -184,6 +184,7 @@ type Proj:
   cfg_override: [Str]        # (a plugin with config file patterns in the configuration)
   has_override: Bool
   git_remotes: [Str]         # (railway: git config remote urls of the project)
+  catalog_used: {Str: Bool}  # catalog entries ("catalog:package") inputs refer to (pnpm dlx x@catalog:)
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -946,6 +947,10 @@ fn maybe_add_binary(var p: Proj, wi: Int, name: Str) -> Bool:
 # Returns a file the input resolves to (an entry file), or "".
 fn handle_input(var p: Proj, fs: Fs, inp: Input) -> Str:
   let spec = inp.spec
+  if inp.kind == I_CATALOG:
+    let tb = spec.find("\t")
+    if tb > 0: p.catalog_used[spec[tb + 1..spec.len] + ":" + spec[0..tb]] = true
+    return ""
   if inp.file == "": return ""
   let iw = input_ws(p, inp)
   if inp.kind == I_BIN:
@@ -1038,7 +1043,7 @@ fn add_prod_entries(var p: Proj, pats: [Str], file: Str):
 fn new_ctx(w: Ws, optional: Bool) -> Ctx:
   var names: {Str: Str} = {}
   for k, v in w.scripts: names[k] = v + ""
-  return Ctx(names, false, optional, {}, false)
+  return Ctx(names, false, optional, {}, false, 0)
 
 # I_TRY inputs (bun x.ts): the file when it resolves, else what the rest of the command runs
 fn expand_tries(var p: Proj, fs: Fs, own inputs: [Input]) -> [Input]:
@@ -1578,6 +1583,94 @@ fn replace_first(s: Str, a: Str, b: Str) -> Str:
   if i < 0: return s + ""
   return s[0..i] + b + s[i + a.len..s.len]
 
+# mise's getConfigRoot (project-relative)
+fn mise_root(f: Str) -> Str:
+  let cdir = resolve.dirname(f)
+  let frag = resolve.basename(cdir) == "conf.d"
+  var grouped = cdir + ""
+  if frag: grouped = resolve.dirname(cdir)
+  let nm = resolve.basename(grouped)
+  var root = cdir + ""
+  if (frag or resolve.basename(f).startswith("config.")) and (nm == "mise" or nm == ".mise"): root = resolve.dirname(grouped)
+  if resolve.basename(root) == ".config": root = resolve.dirname(root)
+  if root == ".": root = ""
+  return root
+
+fn has_template(v: Str) -> Bool:
+  return v.find("{{{{") >= 0 or v.find("{{%") >= 0
+
+# mise's resolvePath: "/x", or "\0" for templates, ~ and $
+fn mise_path(v: Str, root: Str) -> Str:
+  var e = ""
+  var i = 0
+  while i < v.len:
+    if v[i] == '{' and i + 1 < v.len and v[i + 1] == '{':
+      var j = i + 2
+      while j < v.len and (v[j] == ' ' or v[j] == '\t'): j += 1
+      if v[j..v.len].startswith("config_root"):
+        var k = j + 11
+        while k < v.len and (v[k] == ' ' or v[k] == '\t'): k += 1
+        if k + 1 < v.len and v[k] == '}' and v[k + 1] == '}':
+          e += pabs(root)
+          i = k + 2
+          continue
+    e += v[i..i + 1]
+    i += 1
+  if has_template(e) or e.startswith("~") or e.find("$") >= 0: return "\0"
+  return to_abs(e, pabs(root))
+
+fn mise_config(var p: Proj, f: Str, v: Value):
+  let root = mise_root(f)
+  let tasks = pkg.get(v, "tasks")
+  for tk in pkg.keys(tasks):
+    let task = pkg.get(tasks, tk)
+    var tc = json.copy(task)
+    if pkg.is_text(task) or is_arr(task):
+      var m: {Str: Value} = {}
+      m["run"] = json.copy(task)
+      tc = json.Obj(m)
+    var dv = "."
+    if pkg.is_text(pkg.get(tc, "dir")): dv = pkg.str_of(pkg.get(tc, "dir"))
+    elif pkg.is_text(pkg.get(pkg.get(v, "task_config"), "dir")): dv = pkg.str_of(pkg.get(pkg.get(v, "task_config"), "dir"))
+    let dir = mise_path(dv, root)
+    if dir == "\0": continue
+    var local = false
+    var envs: [Value] = []
+    for src in [pkg.get(v, "env"), pkg.get(tc, "env")]:
+      if is_arr(src):
+        for e in pkg.items(src): envs.push(json.copy(e))
+      elif pkg.is_obj(src): envs.push(json.copy(src))
+    for env in envs:
+      if json.has(env, "PATH"): local = false
+      let paths = pkg.get(pkg.get(env, "_"), "path")
+      var ps: [Value] = []
+      if pkg.is_text(paths): ps = [json.copy(paths)]
+      elif is_arr(paths): ps = pkg.items(paths)
+      for pv in ps:
+        if pkg.is_text(pv) and mise_path(pkg.str_of(pv), root) == ajoin(dir, "node_modules/.bin"): local = true
+    let rdir = arel(dir)
+    var wi = p.cur
+    var wn = rdir + ""
+    if wn == "": wn = "."
+    if wn in p.ws_ix: wi = p.ws_ix[wn]
+    var runs: [Value] = []
+    for k in ["run", "run_windows"]:
+      let r = pkg.get(tc, k)
+      if is_arr(r):
+        for x in pkg.items(r): runs.push(json.copy(x))
+      elif not is_null(r): runs.push(json.copy(r))
+    for r in runs:
+      if not pkg.is_text(r): continue
+      let sc_ = pkg.str_of(r)
+      if has_template(sc_): continue
+      for x in scripts.mise_script(sc_, new_ctx(p.ws[wi], false), local):
+        var y = scripts.cp(x)
+        y.file = f + ""
+        if p.production: y.optional = true
+        if y.dir == "": y.dir = dir_of_input(rdir)
+        if y.kind == I_ENTRY or y.kind == I_DEFER_ENTRY or y.kind == I_DEFER: y.skip_exports = true
+        p.inputs.push(y)
+
 fn task_scripts(t: Value) -> [Str]:
   var out: [Str] = []
   if pkg.is_text(t): return [pkg.str_of(t)]
@@ -1986,7 +2079,7 @@ fn tsdown_entries(e: Value) -> [Str]:
 
 # the plugins whose config files vknip reads (resolveConfig)
 fn has_resolver(key: Str) -> Bool:
-  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt swc wrangler msw tanstack-router drizzle svgr biome github-action nitro metro prisma react-native oclif next webpack vue expo expo-router rspack mdx graphql-codegen knex vite-plugin-pwa pm2 karma stryker tauri react-router buf cucumber rsbuild commitizen markdownlint convex cspell docusaurus electron-forge jasmine serverless-framework parcel electron-vite webdriver-io payload netlify simple-git-hooks wxt panda-css tsd yorkie travis yarn pnpm wireit nano-staged preconstruct bun gatsby relay textlint eleventy tsdown rstest astro-markdoc capacitor ladle linthtml moonrepo nest npm-package-json-lint osls playwright-ct lunaria raycast react-cosmos typescript-content-mapper openclaw taskfile ".find(" " + key + " ") >= 0
+  return " vitest vite jest mocha ava eslint prettier playwright changesets commitlint semantic-release postcss babel release-it stylelint tsup lint-staged nx xo nyc oxlint remark mdxlint unbuild angular storybook cypress nuxt swc wrangler msw tanstack-router drizzle svgr biome github-action nitro metro prisma react-native oclif next webpack vue expo expo-router rspack mdx graphql-codegen knex vite-plugin-pwa pm2 karma stryker tauri react-router buf cucumber rsbuild commitizen markdownlint convex cspell docusaurus electron-forge jasmine serverless-framework parcel electron-vite webdriver-io payload netlify simple-git-hooks wxt panda-css tsd yorkie travis yarn pnpm wireit nano-staged preconstruct bun gatsby relay textlint eleventy tsdown rstest astro-markdoc capacitor ladle linthtml moonrepo nest npm-package-json-lint osls playwright-ct lunaria raycast react-cosmos typescript-content-mapper openclaw taskfile mise ".find(" " + key + " ") >= 0
 
 fn js_ext(f: Str) -> Bool:
   let e = resolve.extname(f)
@@ -2670,6 +2763,7 @@ fn resolve_config(var p: Proj, fs: Fs, os: Os, key: Str, f: Str, v: Value):
   elif key == "npm-package-json-lint":
     for x in arrayify(pkg.get(v, "extends")): in_dep(&p, x, f, false)
   elif key == "osls": serverless_config(&p, fs, f, v)
+  elif key == "mise": mise_config(&p, f, v)
   elif key == "taskfile":
     let inc = pkg.get(v, "includes")
     if pkg.is_obj(inc):
@@ -5890,6 +5984,8 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
   var inputs0: [Input] = []
   swap(&inputs0, &p.inputs)
   var inputs = expand_tries(&p, fs, inputs0)
+  if p.debug:
+    for x in inputs: eprint("input {x.kind} {x.spec} file={x.file} dir={x.dir} opt={x.optional} prod={x.production} plugin={x.plugin}")
   var pt = Patterns([], [], [], [], [], ["default"])
   for inp in inputs:
     if inp.group != "" and not opts.has(pt.groups, inp.group): pt.groups.push(inp.group + "")
@@ -5918,6 +6014,7 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
         if skip: add_pat(&pt.entry_skip, group, pat)
         else: add_pat(&pt.entry, group, pat)
     elif inp.kind == I_PROJECT: add_uniq(&pt.project, prepend(dir, inp.spec))
+    elif inp.kind == I_CATALOG: handle_input(&p, fs, inp)
     elif inp.kind == I_IGNORE:
       # (a plugin's ignores get no "remove from" hints)
       var m = matcher(json.Text(inp.spec))
@@ -6163,7 +6260,7 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [])
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {})
 
 fn config_error(msg: Str):
   eprint("ERROR: " + msg)
@@ -6918,6 +7015,7 @@ fn catalog_issues(var p: Proj, fs: Fs, root_manifest: Value):
   var referenced: {Str: Bool} = {}
   let orefs = override_refs(overrides)
   for r in orefs: referenced[r[0]] = true
+  for k, _ in p.catalog_used: referenced[k] = true
   # references in every workspace's manifest
   var ref_issues: [Issue] = []
   for name in sc(p.avail):

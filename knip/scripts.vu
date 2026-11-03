@@ -12,6 +12,7 @@ const I_CONFIG = 6
 const I_PROJECT = 7
 const I_IGNORE = 8
 const I_TRY = 9           # a file if it resolves, else a fallback (bun x.ts)
+const I_CATALOG = 10      # a catalog reference: spec "package\tcatalog"
 
 type Input:
   kind: Int
@@ -49,6 +50,7 @@ type Ctx:
   optional_bins: Bool
   expanded: {Str: Bool}
   reset_opt: Bool              # nested commands (through a package manager) aren't optional
+  mise: Int                    # (mise scripts: 0 no, 1 yes, 2 yes with node_modules/.bin on PATH)
 
 # ---- the shell
 
@@ -455,6 +457,14 @@ fn deps_from_script(script: Str, ctx: Ctx) -> [Input]:
 
 fn from_args(ws: [Word], ctx: Ctx) -> [Input]:
   if ws.len == 0: return []
+  if ctx.mise > 0:
+    # (in a mise script, nested commands are read as mise scripts, their inputs marked)
+    var out: [Input] = []
+    for x in mise_script(to_script(ws), ctx, ctx.mise == 2):
+      var y = cp(x)
+      y.group = "@mise"
+      out.push(y)
+    return out
   let first = ws[0].value
   var head = first
   let sp = first.find(" ")
@@ -469,7 +479,7 @@ fn ctx_copy(c: Ctx) -> Ctx:
   for k, v in c.script_names: names[k] = v + ""
   var ex: {Str: Bool} = {}
   for k, _ in c.expanded: ex[k] = true
-  return Ctx(names, c.is_forwarded, c.optional_bins, ex, c.reset_opt)
+  return Ctx(names, c.is_forwarded, c.optional_bins, ex, c.reset_opt, c.mise)
 
 # the context for commands nested in this one (fromArgs)
 fn nested(c: Ctx) -> Ctx:
@@ -483,6 +493,13 @@ fn from_words(ws: [Word], ctx: Ctx) -> [Input]:
   var parts: [Str] = []
   for w in ws:
     if w.text != "--": parts.push(w.text + "")
+  if ctx.mise > 0:
+    var out: [Input] = []
+    for x in mise_script(" ".join(parts), ctx, ctx.mise == 2):
+      var y = cp(x)
+      y.group = "@mise"
+      out.push(y)
+    return out
   return deps_from_script(" ".join(parts), ctx)
 
 fn is_pm(b: Str) -> Bool:
@@ -678,20 +695,40 @@ fn resolve_npx(ws: [Word], ctx: Ctx) -> [Input]:
     for k in 1..r.len: out.push(cp(r[k]))
   return out
 
+# pnpx and pnpm dlx (resolveDlx): the package (and its catalog reference), --package, -c commands
 fn resolve_dlx(ws: [Word], ctx: Ctx) -> [Input]:
   var out: [Input] = []
-  let pa = parse_args(values_of(ws), ArgSpec([], ["quiet"], ["p", "package", "q", "quiet"], false))
-  for p in opt_vals(pa, "package"):
-    var d = inp(I_DEP, strip_version(p))
-    d.optional = true
-    out.push(d)
+  let pa = parse_args(values_of(ws), ArgSpec([], ["silent"], ["p", "package", "c", "shell-mode"], false))
   if pa.pos.len > 0:
-    var args: [Word] = []
-    for k in pa.pos_ix: args.push(cw(ws[k]))
-    for x in from_args(args, ctx):
-      var y = cp(x)
-      if y.kind == I_DEP or y.kind == I_BIN: y.optional = true
-      out.push(y)
+    for x in dlx_deps(pa.pos[0]): out.push(cp(x))
+  if not has_opt(pa, "yes"):
+    for x in opt_vals(pa, "package"):
+      for y in dlx_deps(x): out.push(cp(y))
+  for c in opt_vals(pa, "shell-mode"):
+    for x in from_args([Word(c + "", c + "")], ctx): out.push(cp(x))
+  return out
+
+fn dlx_deps(ps: Str) -> [Input]:
+  var d = inp(I_DEP, strip_version(ps))
+  d.optional = true
+  var out: [Input] = [d]
+  let pi = ps.rfind("@catalog:")
+  if pi > 0:
+    let name = ps[0..pi]
+    var cat = ps[pi + 9..ps.len]
+    if cat == "": cat = "default"
+    var n2 = name + ""
+    if name.startswith("@"):
+      let sl = name.find("/", 1)
+      if sl > 0:
+        let sl2 = name.find("/", sl + 1)
+        if sl2 > 0: n2 = name[0..sl2]
+    else:
+      let sl = name.find("/")
+      if sl > 0: n2 = name[0..sl]
+    if n2 == name:
+      var c = inp(I_CATALOG, name + "\t" + cat)
+      out.push(c)
   return out
 
 const PNPM_COMMANDS = " add approve-builds audit bin cache cat-file cat-index ci clean-install clean config create dedupe deploy dlx docs doctor env fetch find-hash home i ic ignored-builds import info init install-clean install-test install it la licenses link list ll ln login logout ls outdated pack-app pack patch-commit patch-remove patch peers ping pkg pm prepare prune publish purge rb rebuild remove rm root rt run runtime sbom self-update server setup stage start store t test token tst un uninstall unlink up update upgrade version view why with "
@@ -752,30 +789,58 @@ fn resolve_yarn(ws: [Word], ctx: Ctx) -> [Input]:
   let pa = parse_args(values_of(ws), ArgSpec(["cwd"], ["top-level"], [], true))
   if pa.pos.len == 0: return out
   let command = pa.pos[0]
+  var binary = ""
+  if pa.pos.len > 1: binary = pa.pos[1] + ""
   var child: [Input] = []
   if pa.dd.len > 0:
     var c = ctx_copy(ctx)
     c.is_forwarded = true
     child = from_args_fwd(words_after(ws, "--"), c)
   if command == "run":
-    if pa.pos.len > 1:
-      let script = pa.pos[1]
-      if script in ctx.script_names: return child
-      return from_args(words_from(ws, script), ctx)
-    return child
+    if binary in ctx.script_names:
+      let fwd = words_after(ws, binary)
+      if fwd.len > 0 and not (binary in ctx.expanded): return expand_script(binary, fwd, ctx)
+      return child
+    if binary != "":
+      var b = inp(I_BIN, binary)
+      b.optional = true
+      out.push(b)
+    for x in child: out.push(cp(x))
+    return out
+  if command == "node": return from_args(word_args(copy_strs(pa.pos), ws), ctx)
   if command == "dlx":
     var rest: [Word] = []
     for w in ws:
-      if w.value != "dlx": rest.push(Word(w.value + "", w.text + ""))
-    return resolve_dlx(rest, ctx)
-  if command == "exec":
-    return from_args(words_after(ws, "exec"), ctx)
-  if command in ctx.script_names: return child
+      if w.value != "dlx": rest.push(cw(w))
+    let pd = parse_args(values_of(rest), ArgSpec([], ["quiet"], ["p", "package", "q", "quiet"], false))
+    var res: [Input] = []
+    if not has_opt(pd, "yes"):
+      for x in opt_vals(pd, "package"): res.push(inp(I_DEP, strip_version(x)))
+    if pd.pos.len > 0:
+      for x in from_args(word_args(copy_strs(pd.pos), rest), ctx): res.push(cp(x))
+    for k in 0..res.len:
+      if res[k].kind == I_DEP or res[k].kind == I_BIN: res[k].optional = true
+    return res
+  if command in ctx.script_names:
+    let fwd = words_after(ws, command)
+    if fwd.len > 0 and not (command in ctx.expanded): return expand_script(command, fwd, ctx)
+    return child
   if YARN_COMMANDS.find(" " + command + " ") >= 0: return child
-  if valid_binary(command):
-    out.push(inp(I_BIN, command))
-    let r = from_args(words_from(ws, command), ctx)
-    for k in 1..r.len: out.push(cp(r[k]))
+  if command == "exec":
+    let rest = args_from_words(ws, binary)
+    if rest.len == 1: return from_args([Word(rest[0].value + "", rest[0].value + "")], ctx)
+    return from_args(rest, ctx)
+  return from_args(args_from_words(ws, command), ctx)
+
+# argsFrom(words, value): from the first word that is value (the last word when none is)
+fn args_from_words(ws: [Word], from: Str) -> [Word]:
+  var ix = -1
+  for k in 0..ws.len:
+    if ix < 0 and ws[k].value == from: ix = k
+  if ix < 0: ix = ws.len - 1
+  var out: [Word] = []
+  if ix < 0: return out
+  for k in ix..ws.len: out.push(cw(ws[k]))
   return out
 
 const BUN_COMMANDS = " add audit auth build c check ci cloud completions config create dedupe deploy discord exec feedback fmt fuzzilli getcompletes help i info init install link list login logout outdated patch patch-commit pm prune publish r remove repl rm run test unlink uninstall update upgrade use whoami why x "
@@ -1161,7 +1226,7 @@ fn resolve_plugin(binary: Str, ws: [Word], ctx: Ctx) -> [Input]:
   if plugin == "c8" or plugin == "dotenv":
     has_fa = true
     if pa.pos.len > 0: fa = args_from(vals, pa.pos[0])
-    else: fa = sc(pa.dd)
+    else: fa = copy_strs(pa.dd)
   elif plugin == "nx":
     has_fa = true
     if pa.pos.len > 0 and pa.pos[0] == "exec":
@@ -1169,7 +1234,7 @@ fn resolve_plugin(binary: Str, ws: [Word], ctx: Ctx) -> [Input]:
       for x in pa.dd: fa.push(x + "")
   elif plugin == "varlock":
     has_fa = true
-    if pa.pos.len > 0 and pa.pos[0] == "run": fa = sc(pa.dd)
+    if pa.pos.len > 0 and pa.pos[0] == "run": fa = copy_strs(pa.dd)
   if has_fa:
     for x in from_args(word_args(fa, ws), ctx): out.push(cp(x))
   for k in from_keys:
@@ -1409,3 +1474,108 @@ fn bun_test_args(script: Str) -> Parsed:
     let pa = parse_args(rest, ArgSpec(["timeout", "rerun-each", "preload"], [], [], true))
     if pa.pos.len > 0 and pa.pos[0] == "test": return pa
   return Parsed([], [], [], [])
+
+# ---- mise tasks (plugins/mise/scripts: getInputsFromMiseScript)
+
+const MARK = "$__knip__"
+
+# a text with its command substitutions replaced by the interpolation marker
+fn mark_subs(t: Str) -> Str:
+  var out = ""
+  var i = 0
+  while i < t.len:
+    if t[i] == '$' and i + 1 < t.len and t[i + 1] == '(':
+      let e = close_paren(t, i + 1)
+      out += MARK
+      i = e + 1
+      continue
+    if t[i] == '`':
+      var e = t.find("`", i + 1)
+      if e < 0: e = t.len - 1
+      out += MARK
+      i = e + 1
+      continue
+    out += t[i..i + 1]
+    i += 1
+  return out
+
+fn marked_word(w: Word) -> Word:
+  let t = mark_subs(w.text)
+  if t == w.text: return cw(w)
+  return Word(mark_subs(w.value), t)
+
+fn is_wrapper(b: Str) -> Bool:
+  if b == "cross-env" or b == "retry-cli" or b == "dotenvx" or b == "env-cmd" or b == "op" or b == "concurrently": return true
+  return b == "c8" or b == "dotenv" or b == "nx" or b == "varlock" or b == "glob" or b == "nodemon" or b == "rollup"
+
+fn mise_script(script: Str, ctx0: Ctx, local: Bool) -> [Input]:
+  var out: [Input] = []
+  var ctx = ctx_copy(ctx0)
+  ctx.mise = 0
+  for c0 in parse_script(script):
+    if not c0.has_name: continue
+    # (! and time [-p] start a pipeline; braces group commands)
+    var c = copy_cmd(c0)
+    var guard = 0
+    while guard < 8 and c.has_name and (c.name.value == "!" or c.name.value == "time" or c.name.value == "-p" or c.name.value == "{{"):
+      guard += 1
+      var rest: [Word] = []
+      var k = 0
+      if c.name.value == "time":
+        while k < c.args.len and c.args[k].value == "-p": k += 1
+      for q in k..c.args.len: rest.push(cw(c.args[q]))
+      if rest.len == 0:
+        c.has_name = false
+        break
+      var tail: [Word] = []
+      for q in 1..rest.len: tail.push(cw(rest[q]))
+      c = Cmd(copy_words(c.prefix), cw(rest[0]), tail, true)
+    if not c.has_name: continue
+    let name = c.name.value
+    if name == "" or name == "}}": continue
+    let binary = extract_binary(name)
+    let pm = is_pm(binary)
+    let explicit = pm or name.startswith("./") or is_rel_bin(name)
+    var has_path = false
+    for pw in c.prefix:
+      if pw.text.startswith("PATH="): has_path = true
+    let is_local = local and not has_path
+    let wrapper = not pm and is_wrapper(binary)
+    if not explicit and not is_local and not wrapper and binary != "node" and binary != "find": continue
+    var margs: [Word] = []
+    for w in c.args: margs.push(marked_word(w))
+    var mpre: [Word] = []
+    for w in c.prefix: mpre.push(marked_word(w))
+    let mc = Cmd(copy_words(mpre), marked_word(c.name), copy_words(margs), true)
+    var ci: [Input] = []
+    if wrapper or binary == "find":
+      var mctx = ctx_copy(ctx)
+      mctx.mise = 1
+      if is_local: mctx.mise = 2
+      for x in deps_from_command(mc, mctx):
+        if x.group == "@mise":
+          var y = cp(x)
+          y.group = ""
+          out.push(y)
+        else: ci.push(cp(x))
+    else:
+      var parts: [Str] = []
+      for w in mpre: parts.push(w.text + "")
+      parts.push(mc.name.text + "")
+      for w in margs: parts.push(w.text + "")
+      for x in deps_from_script(" ".join(parts), ctx): ci.push(cp(x))
+    if not explicit and not is_local and binary != "node" and binary != "find": continue
+    var bix = -1
+    for k in 0..ci.len:
+      if bix < 0 and ci[k].kind == I_BIN and ci[k].spec == binary: bix = k
+    if not explicit and is_local and bix >= 0: ci[bix].optional = true
+    for k in 0..ci.len:
+      if ci[k].spec == "" or ci[k].spec.find(MARK) >= 0: continue
+      if not explicit and not is_local and k == bix: continue
+      out.push(cp(ci[k]))
+  return out
+
+fn copy_strs(xs: [Str]) -> [Str]:
+  var out: [Str] = []
+  for x in xs: out.push(x + "")
+  return out
