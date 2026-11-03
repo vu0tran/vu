@@ -2266,6 +2266,7 @@ fn analyze_t(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags:
   if s.vis.len > 0: plugin_visitors(&s, t, root)
   walk_list(&s, t, root)
   run_pending(&s, t)
+  if tname(t, "define") or tname(t, "defineAsync") or tname(t, "Component") or tname(t, "customElement") or tname(t, "controller"): custom_elements(&s, t, root)
   # members referenced in the file
   var i = 0
   while i + 1 < s.mref.len:
@@ -2835,3 +2836,228 @@ fn tname(t: Ast, x: Str) -> Bool:
     if t.hh[found] == h and t.names[found] == x: return true
     j = (j + 1) & mask
   return false
+
+# ---- custom elements (calls.ts getRegisteredCustomElement, plugins/_custom-elements, _component-style-urls)
+
+fn ce_registry_expr(s: St, t: Ast, e: Int) -> Bool:
+  let k = kind(t, e)
+  if k == ast.N_ID: return nm(t, e) == "customElements" and not shadowed(s, "customElements", t.nd[e].pos)
+  if k == ast.N_PROPACCESS: return nm(t, e) == "customElements"
+  if k == ast.N_NEW: return is_id(t, t.nd[e].a) and nm(t, t.nd[e].a) == "CustomElementRegistry"
+  return false
+
+# the decorators of a class (those right before it: only whitespace, comments, export/default/abstract/declare between)
+fn class_decorators(s: St, t: Ast, decos: [Int], c: Int) -> [Int]:
+  var out: [Int] = []
+  var cur = t.nd[c].pos
+  var k = decos.len - 1
+  while k >= 0 and t.nd[decos[k]].end > cur: k -= 1
+  while k >= 0:
+    let d = decos[k]
+    let gap = s.src[t.nd[d].end..cur]
+    if not deco_gap(gap): break
+    out.push(d)
+    cur = t.nd[d].pos
+    # (the '@' before the expression)
+    while cur > 0 and s.src[cur - 1] != '@': cur -= 1
+    if cur > 0: cur -= 1
+    k -= 1
+  return out
+
+fn deco_gap(g: Str) -> Bool:
+  var rest = g.strip()
+  while rest != "":
+    var hit = false
+    for w in ["export", "default", "abstract", "declare"]:
+      if rest.startswith(w):
+        rest = rest[w.len..rest.len].strip()
+        hit = true
+    if rest.startswith("//"):
+      let nl = rest.find("\n")
+      if nl < 0: rest = ""
+      else: rest = rest[nl..rest.len].strip()
+      hit = true
+    elif rest.startswith("/*"):
+      let e = rest.find("*/")
+      if e < 0: return false
+      rest = rest[e + 2..rest.len].strip()
+      hit = true
+    if not hit: return false
+  return true
+
+fn ce_decorated(t: Ast, ds: [Int], names: {Str: Bool}, nss: {Str: Bool}, dname: Str) -> Bool:
+  for d in ds:
+    let k = kind(t, d)
+    if k == ast.N_ID:
+      if nm(t, d) in names: return true
+      continue
+    if k != ast.N_CALL: continue
+    let callee = t.nd[d].a
+    if kind(t, callee) == ast.N_ID:
+      if nm(t, callee) in names: return true
+    elif kind(t, callee) == ast.N_PROPACCESS and is_id(t, t.nd[callee].a) and nm(t, callee) == dname and nm(t, t.nd[callee].a) in nss: return true
+  return false
+
+fn ce_spec(plugin: Str, spec: Str) -> Bool:
+  if plugin == "lit": return spec == "lit/decorators.js" or spec == "lit/decorators" or spec == "@lit/reactive-element/decorators.js" or spec == "@lit/reactive-element/decorators" or spec.startswith("lit/decorators/") or spec.startswith("@lit/reactive-element/decorators/") or spec == "lit-element" or spec == "lit-element/decorators.js" or spec == "lit-element/decorators" or spec.startswith("lit-element/decorators/")
+  if plugin == "catalyst": return spec == "@github/catalyst"
+  if plugin == "fast": return spec == "@microsoft/fast-element"
+  if plugin == "stencil": return spec == "@stencil/core"
+  if plugin == "angular": return spec == "@angular/core"
+  return false
+
+fn custom_elements(var s: St, t: Ast, root: Int):
+  var registered: [Str] = []
+  var regs: {Str: Bool} = {}
+  var classes: [Int] = []
+  var statics: [Int] = []
+  var calls: [Int] = []
+  for n in 0..t.nd.len:
+    let k = t.nd[n].k
+    if k == ast.N_CLASS or k == ast.N_CLASSEXPR: classes.push(n)
+    elif k == ast.N_STATICBLOCK: statics.push(n)
+    elif k == ast.N_CALL: calls.push(n)
+    elif k == ast.N_DECL:
+      let id = t.nd[n].a
+      let init = t.nd[n].c
+      if is_id(t, id) and init >= 0 and ce_registry_expr(s, t, init): regs[nm(t, id)] = true
+  # customElements.define('tag', Class)
+  for c in calls:
+    let callee = t.nd[c].a
+    if kind(t, callee) != ast.N_PROPACCESS or nm(t, callee) != "define": continue
+    let args = ast.items(t, t.nd[c].c)
+    if args.len < 2: continue
+    let obj = t.nd[callee].a
+    var is_reg = false
+    if kind(t, obj) == ast.N_ID: is_reg = (nm(t, obj) == "customElements" or nm(t, obj) in regs) and not shadowed(s, nm(t, obj), t.nd[obj].pos)
+    else: is_reg = kind(t, obj) == ast.N_PROPACCESS and nm(t, obj) == "customElements"
+    if not is_reg: continue
+    let a1 = args[1]
+    if is_id(t, a1):
+      if not shadowed(s, nm(t, a1), t.nd[a1].pos): registered.push(nm(t, a1))
+    elif kind(t, a1) == ast.N_THIS:
+      # (this in a static block: the innermost enclosing class)
+      let pos = t.nd[c].pos
+      var in_static = false
+      for sb in statics:
+        if t.nd[sb].pos <= pos and pos < t.nd[sb].end: in_static = true
+      if in_static:
+        var best = -1
+        for cl in classes:
+          if t.nd[cl].pos <= pos and pos < t.nd[cl].end:
+            if best < 0 or t.nd[cl].pos >= t.nd[best].pos: best = cl
+        if best >= 0 and t.nd[best].s >= 0:
+          let cn = t.names[t.nd[best].s] + ""
+          if cn != "": registered.push(cn)
+  # the plugins' decorators (Lit, Catalyst, Stencil: customElement/controller/Component; FAST: FASTElement subclasses defined)
+  var decos: [Int] = []
+  if -1000001 in t.dirs:
+    for d in t.dirs[-1000001]: decos.push(d)
+  let top = ast.items(t, root)
+  for pl in ["lit", "catalyst", "fast", "stencil"]:
+    if not (pl in s.vis): continue
+    var dname = "customElement"
+    if pl == "catalyst": dname = "controller"
+    if pl == "stencil": dname = "Component"
+    var base = ""
+    if pl == "fast": base = "FASTElement"
+    var names: {Str: Bool} = {}
+    var nss: {Str: Bool} = {}
+    var bases: {Str: Bool} = {}
+    for st in top:
+      if kind(t, st) != ast.N_IMPORT or not ce_spec(pl, nm(t, t.nd[st].a)): continue
+      if t.nd[st].c >= 0: nss[nm(t, t.nd[st].c)] = true
+      for sp in ast.items(t, t.nd[st].d):
+        let loc = nm(t, sp)
+        var imported = loc + ""
+        let pn = t.nd[sp].b
+        if pn >= 0:
+          if kind(t, pn) != ast.N_ID: continue
+          imported = nm(t, pn)
+        if imported == dname: names[loc] = true
+        elif base != "" and imported == base: bases[loc] = true
+    var defined: {Str: Bool} = {}
+    for st in top:
+      var c = -1
+      var is_default = false
+      if kind(t, st) == ast.N_CLASS: c = st
+      elif kind(t, st) == ast.N_EXPORTDEFAULT and (kind(t, t.nd[st].a) == ast.N_CLASS or kind(t, t.nd[st].a) == ast.N_CLASSEXPR):
+        c = t.nd[st].a
+        is_default = true
+      if c < 0: continue
+      let ds = class_decorators(s, t, decos, c)
+      if is_default:
+        if ce_decorated(t, ds, names, nss, dname): registered.push("default")
+        continue
+      if t.nd[c].s < 0: continue
+      let cn = t.names[t.nd[c].s] + ""
+      if ce_decorated(t, ds, names, nss, dname): registered.push(cn)
+      elif base != "" and t.nd[c].b >= 0:
+        let sup = t.nd[t.nd[c].b].a
+        if is_id(t, sup) and nm(t, sup) in bases: defined[cn] = true
+        elif kind(t, sup) == ast.N_CALL:
+          for a in ast.items(t, t.nd[sup].c):
+            if is_id(t, a) and nm(t, a) in bases: defined[cn] = true
+    if base != "":
+      for c in calls:
+        let callee = t.nd[c].a
+        if kind(t, callee) == ast.N_PROPACCESS and is_id(t, t.nd[callee].a) and (nm(t, callee) == "define" or nm(t, callee) == "defineAsync") and nm(t, t.nd[callee].a) in defined: registered.push(nm(t, t.nd[callee].a))
+  # styleUrl(s) of @Component({...}) (Angular, Stencil)
+  for pl in ["angular", "stencil"]:
+    if not (pl in s.vis): continue
+    var comps: {Str: Bool} = {}
+    for st in top:
+      if kind(t, st) != ast.N_IMPORT or not ce_spec(pl, nm(t, t.nd[st].a)): continue
+      for sp in ast.items(t, t.nd[st].d):
+        let loc = nm(t, sp)
+        var imported = loc + ""
+        let pn = t.nd[sp].b
+        if pn >= 0:
+          if kind(t, pn) != ast.N_ID: continue
+          imported = nm(t, pn)
+        if imported == "Component": comps[loc] = true
+    if comps.len == 0: continue
+    for c in classes:
+      if t.nd[c].k != ast.N_CLASS: continue
+      for d in class_decorators(s, t, decos, c):
+        if kind(t, d) != ast.N_CALL or not is_id(t, t.nd[d].a) or not (nm(t, t.nd[d].a) in comps): continue
+        let args = ast.items(t, t.nd[d].c)
+        if args.len == 0 or kind(t, args[0]) != ast.N_OBJECT: continue
+        for key in ["styleUrl", "styleUrls"]:
+          for url in obj_prop_strings(t, args[0], key):
+            var spec = url + ""
+            while spec.startswith("/"): spec = spec[1..spec.len]
+            if not (spec.startswith("./") or spec.startswith("../")): spec = "./" + spec
+            add_imp(&s, spec, "", "", "", t.nd[args[0]].pos, 0, -1)
+  # (registered exports count as used, through local aliases too)
+  for name in registered:
+    if name in s.exp_ix:
+      let ix = s.exp_ix[name] + 0
+      s.exps[ix].in_file = true
+    let key = "\0" + name
+    if key in s.ref_in:
+      var xs: [Str] = []
+      for x in s.ref_in[key]: xs.push(x + "")
+      for x in xs:
+        if x in s.exp_ix:
+          let ix = s.exp_ix[x] + 0
+          s.exps[ix].in_file = true
+
+# getPropertyValues(obj, key): strings of the key (a string, an array's strings, an object's string values)
+fn obj_prop_strings(t: Ast, obj: Int, key: Str) -> [Str]:
+  var out: [Str] = []
+  for pr in ast.items(t, t.nd[obj].a):
+    if kind(t, pr) != ast.N_PROPASSIGN: continue
+    let kn = t.nd[pr].a
+    var k = ""
+    if is_id(t, kn) or is_str(t, kn): k = nm(t, kn)
+    if k != key: continue
+    let v = t.nd[pr].b
+    if kind(t, v) == ast.N_ARRAY:
+      for el in ast.items(t, t.nd[v].a):
+        if is_str(t, el) and not (nm(t, el) in out): out.push(nm(t, el))
+    elif kind(t, v) == ast.N_OBJECT:
+      for p2 in ast.items(t, t.nd[v].a):
+        if kind(t, p2) == ast.N_PROPASSIGN and is_str(t, t.nd[p2].b) and not (nm(t, t.nd[p2].b) in out): out.push(nm(t, t.nd[p2].b))
+    elif is_str(t, v) and not (nm(t, v) in out): out.push(nm(t, v))
+  return out
