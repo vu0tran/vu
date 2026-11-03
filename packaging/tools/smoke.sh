@@ -13,6 +13,7 @@
 # (shellcheck 0.11.0, jq 1.7.1, knip 6.44.1's bin/knip.js) writes that file instead.
 set -eu
 tool="$1"; bin="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+[ -x "$bin" ] || { echo "smoke: $tool: no program $bin" >&2; exit 1; }
 here="$(cd "$(dirname "$0")" && pwd)"
 fx="$here/fixtures"
 tmp=$(mktemp -d)
@@ -88,6 +89,7 @@ case "$tool" in
     t jq --tab -S .users[2] users.json
     t jq -r '.users[] | [.name, .age] | @tsv' users.json
     VJQ_SMOKE=yes; export VJQ_SMOKE
+    # shellcheck disable=SC2016
     t jq -nr --arg a 1 --argjson b '{"x":[2]}' '"\($a) \($b.x[0])", $ENV.VJQ_SMOKE, ([$a, $b.x[0]] | @csv)'
     t jq -e '.users[5]' users.json
     t jq -s 'map(.meta.count)' users.json users.json

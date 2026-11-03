@@ -90,7 +90,10 @@ cp LICENSE "$d/"
 cp "$readme" "$d/README.md"
 case "$ext" in
   tar.gz) (cd "$out" && tar czf "$root/dist/$name.$ext" "$name") ;;
-  tar.xz) (cd "$out" && tar cf - "$name" | xz -9 > "$root/dist/$name.$ext") ;;
+  tar.xz)
+    # (xz where it's installed; else tar's own: macOS's bsdtar has liblzma built in)
+    if command -v xz >/dev/null; then (cd "$out" && tar cf - "$name" | xz -9 > "$root/dist/$name.$ext")
+    else (cd "$out" && tar cJf "$root/dist/$name.$ext" "$name"); fi ;;
 esac
 files="$name.$ext"
 if [ -n "$bare" ]; then
