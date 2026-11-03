@@ -27,7 +27,7 @@ try {
   const j = createRequire(path.join(cwd, 'package.json'))(jp);
   const opts = { jsx: true, tsconfigPaths: true, interopDefault: true, alias: { '@rushstack/eslint-patch/modern-module-resolution': 'node:path', '@rushstack/eslint-config/patch/modern-module-resolution': 'node:path' } };
   const create = j.createJiti || (j.default && j.default.createJiti) || (typeof j === 'function' ? j : null);
-  const inst = create(path.join(cwd, 'x.js'), opts);
+  const inst = create(cwd, opts);
   if (typeof inst.import === 'function') jiti = f => inst.import(f, { default: true });
   else jiti = async f => { const m = inst(f); return m && m.default !== undefined ? m.default : m; };
 } catch {}
@@ -348,7 +348,43 @@ const customCompile = async (config, files) => {
   }
   return res;
 };
+// preprocessors and custom reporters (util/preprocessor.ts, util/reporter.ts): modules loaded as
+// knip's _load does; a module that fails to load is a LoaderError
+const loadModule = async spec => {
+  const isLocal = spec.startsWith('.') || spec.startsWith('/');
+  let file = isLocal ? path.resolve(cwd, spec) : spec;
+  if (!isLocal) { try { file = createRequire(path.join(cwd, 'package.json')).resolve(spec); } catch {} }
+  try { return await load(file); }
+  catch (e) { const err = new Error(`Error loading ${file}`); err.reason = e && e.message !== undefined ? String(e.message) : String(e); err.notFound = !!(e && e.code === 'MODULE_NOT_FOUND'); throw err; }
+};
+const toPlain = data => JSON.parse(JSON.stringify(data, (k, v) => (v instanceof Set ? [...v] : v instanceof Map ? Object.fromEntries(v) : v instanceof RegExp ? { __vknip_re: v.source, flags: v.flags } : v)));
+const fromPlain = data => ({ ...data, tagHints: new Set(data.tagHints ?? []), configurationHints: (data.configurationHints ?? []).map(h => (h && h.identifier && h.identifier.__vknip_re !== undefined ? { ...h, identifier: new RegExp(h.identifier.__vknip_re, h.identifier.flags) } : h)) });
+const runPreprocessors = async (mods, data) => {
+  let d = fromPlain(data);
+  const fns = [];
+  for (const m of mods) fns.push(await loadModule(m));
+  for (const fn of fns) d = await fn(d);
+  return toPlain(d);
+};
+const runReporter = async (mod, data, toFile) => {
+  const fn = await loadModule(mod);
+  let out = '', err = '', file = '';
+  const ow = process.stdout.write.bind(process.stdout), ew = process.stderr.write.bind(process.stderr);
+  process.stdout.write = (c, ...rest) => { out += String(c); return true; };
+  process.stderr.write = (c, ...rest) => { err += String(c); return true; };
+  try {
+    const write = toFile ? text => { if (text) file += `${text}\n`; } : text => { if (text) out += `${text}\n`; };
+    await fn({ ...fromPlain(data), write });
+  } finally { process.stdout.write = ow; process.stderr.write = ew; }
+  return { out, err, file };
+};
 for (const r of reqs) {
+  if (r.mode === 'preprocess' || r.mode === 'reporter') {
+    try {
+      out[r.file] = { ok: r.mode === 'preprocess' ? await runPreprocessors(r.args.mods, r.args.data) : await runReporter(r.args.mod, r.args.data, r.args.toFile) };
+    } catch (e) { out[r.file] = { error: e && e.message ? e.message.split('\n')[0] : String(e), reason: e && e.reason !== undefined ? e.reason : '', loader: !!(e && e.reason !== undefined), notFound: !!(e && e.notFound), stack: e && e.stack ? String(e.stack) : String(e) }; }
+    continue;
+  }
   if (r.mode === 'vue-sfc') { out[r.file] = { ok: vueSfcInfo(r.file, r.args) }; continue; }
   if (r.mode === 'compile') {
     try { out[r.file] = { ok: await customCompile(await load(r.file), r.args) }; }

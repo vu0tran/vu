@@ -198,6 +198,7 @@ type Proj:
   amaps: {Str: AutoMaps}     # auto-import maps ("r:" + package folder, "n:" + Nuxt workspace)
   tsc_mode: Bool             # --use-tsconfig-files
   mlibs: {Int: MarkoLib}     # each workspace's Marko taglibs (tag -> packages)
+  pre_inputs: [Str]          # the preprocessors referenced ("/x" a local file, else a package)
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -7012,7 +7013,22 @@ fn build_ws(var p: Proj, fs: Fs, os: Os, var b: Build):
   run_plugins(&p, fs, os)
   var inputs0: [Input] = []
   swap(&inputs0, &p.inputs)
-  var inputs = expand_tries(&p, fs, inputs0)
+  var inputs: [Input] = []
+  # (the preprocessors: a local one in the workspace holding it, a package in the root)
+  for sp in sc(p.pre_inputs):
+    if sp.startswith("\t"): continue
+    let local = sp.startswith("/")
+    var owner = -1
+    if local: owner = ws_of(p, sp[1..sp.len])
+    if owner < 0 and "." in p.ws_ix: owner = p.ws_ix["."]
+    if owner != wi: continue
+    var x = scripts.inp(I_DEP, sp)
+    if local: x.kind = I_DEFER_ENTRY
+    else: x.optional = true
+    x.file = p.config_file + ""
+    if x.file == "": x.file = "package.json"
+    inputs.push(x)
+  for x in expand_tries(&p, fs, inputs0): inputs.push(scripts.cp(x))
   if p.debug:
     for x in inputs: eprint("input {x.kind} {x.spec} file={x.file} dir={x.dir} opt={x.optional} prod={x.production} plugin={x.plugin}")
   var pt = Patterns([], [], [], [], [], ["default"])
@@ -7360,7 +7376,7 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {})
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [])
 
 fn config_error(msg: Str):
   eprint("ERROR: " + msg)
@@ -7452,6 +7468,21 @@ fn main(fs: Fs, os: Os):
   if not treat_tag_hints: treat_tag_hints = pkg.truthy(pkg.get(p.cfg, "treatTagHintsAsErrors"))
   var treat_hints = opts.flag(a, "treat-config-hints-as-errors")
   if not treat_hints: treat_hints = pkg.truthy(pkg.get(p.cfg, "treatConfigHintsAsErrors"))
+  # preprocessors (the configuration's, or --preprocessor's; a configured one stays referenced)
+  var pre_cfg: [Str] = []
+  var pre_ad = ""
+  if json.has(p.cfg, "preprocessor") or opts.has_str(a, "preprocessor"): pre_ad = abs_dir(&p, os)
+  for x in arrayify(pkg.get(p.cfg, "preprocessor")): pre_cfg.push(pre_spec(x, pre_ad))
+  var pre_mods = sc(pre_cfg)
+  let pre_cli = opts.strs_opt(a, "preprocessor")
+  if opts.has_str(a, "preprocessor"):
+    pre_mods = []
+    for x in pre_cli: pre_mods.push(pre_spec(x, pre_ad))
+    p.pre_inputs = sc(pre_cfg)
+    for x in pre_mods: add_uniq(&p.pre_inputs, x)
+  else: p.pre_inputs = sc(pre_mods)
+  var pre_opts = opts.str_opt(a, "preprocessor-options")
+  if pre_opts == "" and json.has(p.cfg, "preprocessorOptions"): pre_opts = json.stringify(pkg.get(p.cfg, "preprocessorOptions"))
   # ignore patterns and ignoreIssues
   for x in arrayify(pkg.get(p.cfg, "ignore")): add_ignore_pat(&p, x, x, ".", false)
   for x in arrayify(pkg.get(p.cfg, "ignoreFiles")): add_ignore_pat(&p, x, x, ".", true)
@@ -7656,13 +7687,33 @@ fn main(fs: Fs, os: Os):
         ident += "]"
         add_hint(&p, key + "-top-level", ident, "", "")
   unconfigured_hints(&p, n_analyzed, n_unused)
-  apply_fixes(&p, fs, a)
   # (project-relative "/x" specifiers knip shows as absolute paths: the folder as the OS has it)
   for k in 0..p.issues.len:
     if p.issues[k].symbol.startswith("\t"):
       let sym = abs_dir(&p, os) + p.issues[k].symbol[1..p.issues[k].symbol.len]
       p.issues[k].symbol = sym + ""
       if p.issues[k].display.startswith("\t"): p.issues[k].display = sym + ""
+  # the results as knip's reporters and preprocessors get them (ReporterOptions)
+  let need_data = pre_mods.len > 0 or has_custom_reporter(opts.strs_opt(a, "reporter"))
+  var data = json.Null
+  var pre_counters = json.Null
+  if need_data:
+    let ad = abs_dir(&p, os)
+    data = reporter_data(p, ad, n_analyzed, n_unused, opts.str_opt(a, "reporter-options"), pre_opts, no_hints, no_tag_hints, treat_hints, treat_tag_hints, max_show)
+    if pre_mods.len > 0:
+      var mods: [Value] = []
+      for m in pre_mods: mods.push(json.Text(pre_module_path(m, ad)))
+      var args_: {Str: Value} = {}
+      args_["mods"] = json.Arr(mods)
+      args_["data"] = data
+      let res = loader.load_all(fs, os, [loader.Req("@preprocess", "preprocess", json.Obj(args_))], fspath(p, ""))
+      var r = json.Null
+      if "@preprocess" in res: r = json.copy(res["@preprocess"])
+      node_failed(r)
+      data = json.copy(pkg.get(r, "ok"))
+      pre_counters = json.copy(pkg.get(data, "counters"))
+      data_to_proj(&p, data, ad)
+  apply_fixes(&p, fs, a)
   # reporters
   var reporters = opts.strs_opt(a, "reporter")
   if reporters.len == 0: reporters = ["symbols"]
@@ -7691,14 +7742,31 @@ fn main(fs: Fs, os: Os):
         eprint("Error: ENOENT: no such file or directory, open '" + shown + "'")
         exit(1)
       text = report.codeowners_report(p.on, p.issues, report.codeowners(ctext))
-    else:
-      eprint("ERROR: Unknown reporter: " + r + " (vknip has symbols, compact, json, markdown, codeowners, disclosure, github-actions, codeclimate, sarif)")
-      exit(2)
     var target = ""
     for o in outs:
       let eq = o.find("=")
       if eq >= 0 and o[0..eq] == r: target = o[eq + 1..o.len]
       elif eq < 0 and reporters.len == 1: target = o + ""
+    if not builtin_reporter(r):
+      # a custom reporter module, run in Node.js with the (preprocessed) results
+      var args_: {Str: Value} = {}
+      args_["mod"] = json.Text(r)
+      args_["data"] = json.copy(data)
+      args_["toFile"] = json.Flag(target != "")
+      let res = loader.load_all(fs, os, [loader.Req("@reporter", "reporter", json.Obj(args_))], fspath(p, ""))
+      var rr = json.Null
+      if "@reporter" in res: rr = json.copy(res["@reporter"])
+      node_failed(rr)
+      let o = pkg.get(rr, "ok")
+      let so = pkg.str_of(pkg.get(o, "out"))
+      let se = pkg.str_of(pkg.get(o, "err"))
+      if so != "": write(so)
+      if se != "":
+        if se.endswith("\n"): eprint(se[0..se.len - 1])
+        else: eprint(se)
+      if target != "":
+        fs.write(fspath(p, target), strip_vt(pkg.str_of(pkg.get(o, "file")))) else config_error("Option --output-file failed to write: " + target)
+      continue
     if target != "":
       var body = ""
       if text != "": body = text + "\n"
@@ -7715,11 +7783,248 @@ fn main(fs: Fs, os: Os):
   # the exit code
   if p.config_errors: exit(2)
   var errors = 0
-  for i in p.issues:
-    if p.on[i.typ] and p.rules[i.typ] == "error" and not i.fixed: errors += 1
+  if not is_null(pre_counters):
+    # (knip counts the preprocessed counters of the reported error types)
+    for ty in opts.issue_types():
+      if p.on[ty] and p.rules[ty] == "error": errors += int_of(pkg.get(pre_counters, ty))
+  else:
+    for i in p.issues:
+      if p.on[i.typ] and p.rules[i.typ] == "error" and not i.fixed: errors += 1
   if opts.flag(a, "no-exit-code"): exit(0)
   if errors > max_issues or (not no_hints and treat_hints and p.hints.len > 0) or (not no_tag_hints and treat_tag_hints and p.tag_hints.len > 0): exit(1)
   exit(0)
+
+fn builtin_reporter(r: Str) -> Bool:
+  return r == "symbols" or r == "compact" or r == "json" or r == "markdown" or r == "disclosure" or r == "github-actions" or r == "codeclimate" or r == "sarif" or r == "codeowners" or r == "cycles"
+
+fn has_custom_reporter(rs: [Str]) -> Bool:
+  for r in rs:
+    if not builtin_reporter(r): return true
+  return false
+
+# toPreprocessor: a local specifier as a project path ("/x"; "\t" + an absolute path outside the
+# project), a package as it is
+fn pre_spec(x: Str, ad: Str) -> Str:
+  if x.startswith("/"):
+    if x.startswith(ad + "/"): return x[ad.len..x.len]
+    return "\t" + x
+  if x.startswith("."): return "/" + resolve.norm(x)
+  return x + ""
+
+fn pre_module_path(m: Str, ad: Str) -> Str:
+  if m.startswith("/"): return ad + m
+  if m.startswith("\t"): return m[1..m.len]
+  return m + ""
+
+fn int_of(v: Value) -> Int:
+  match v:
+    Whole(n): return n
+    Num(n): return int(n)
+    _: return 0
+
+# stripVTControlCharacters
+fn strip_vt(s: Str) -> Str:
+  var out = ""
+  var at = 0
+  var i = 0
+  while i < s.len:
+    if s[i] == 27 and i + 1 < s.len and s[i + 1] == '[':
+      var k = i + 2
+      while k < s.len and ((s[k] >= '0' and s[k] <= '9') or s[k] == ';' or s[k] == '?'): k += 1
+      if k < s.len:
+        out += s[at..i]
+        at = k + 1
+        i = at
+        continue
+    i += 1
+  return out + s[at..s.len]
+
+# a preprocessor or reporter that failed in Node.js: knip's LoaderError, else the thrown error
+fn node_failed(r: Value):
+  if not json.has(r, "error"): return
+  if pkg.truthy(pkg.get(r, "loader")):
+    eprint("ERROR: " + pkg.str_of(pkg.get(r, "error")))
+    eprint("Reason: " + pkg.str_of(pkg.get(r, "reason")))
+    if pkg.truthy(pkg.get(r, "notFound")): print("Module load error? Visit https://knip.dev/reference/known-issues")
+    print("Configuration file load error? Visit https://knip.dev/reference/known-issues")
+    exit(2)
+  eprint(pkg.str_of(pkg.get(r, "stack")))
+  exit(1)
+
+fn jtext(s: Str) -> Value:
+  return json.Text(s + "")
+
+fn abs_of(ad: Str, rel: Str) -> Str:
+  if rel == "": return ad + ""
+  if rel.startswith("/"): return rel + ""
+  return ad + "/" + rel
+
+# ReporterOptions (util/preprocessor.ts toReporterOptions) as JSON
+fn reporter_data(p: Proj, ad: Str, n_analyzed: Int, n_unused: Int, rep_opts: Str, pre_opts: Str, no_hints: Bool, no_tag_hints: Bool, treat_hints: Bool, treat_tag_hints: Bool, max_show: Int) -> Value:
+  var d: {Str: Value} = {}
+  var report_: {Str: Value} = {}
+  var issues: {Str: Value} = {}
+  var counters: {Str: Value} = {}
+  var by_type: {Str: {Str: {Str: Value}}} = {}
+  for t in opts.issue_types():
+    report_[t] = json.Flag(p.on[t])
+    counters[t] = json.Whole(0)
+    by_type[t] = {}
+  var n_files = 0
+  for i in p.issues:
+    if not (i.typ in by_type): continue
+    let key = issue_key(i)
+    var rel = i.file + ""
+    if not (rel in by_type[i.typ]): by_type[i.typ][rel] = {}
+    if key in by_type[i.typ][rel]: continue
+    by_type[i.typ][rel][key] = issue_json(p, i, ad)
+    counters[i.typ] = json.Whole(int_of(counters[i.typ]) + 1)
+    if i.typ == "files": n_files += 1
+  for t in opts.issue_types():
+    var files: {Str: Value} = {}
+    for rel, syms in by_type[t]:
+      var m: {Str: Value} = {}
+      for k, v in syms: m[k] = json.copy(v)
+      files[rel] = json.Obj(m)
+    issues[t] = json.Obj(files)
+  counters["processed"] = json.Whole(n_analyzed + n_files)
+  counters["total"] = json.Whole(n_analyzed + n_unused)
+  var tags: [Value] = []
+  for h in p.tag_hints:
+    let parts = h.split("\0")
+    var m: {Str: Value} = {}
+    m["type"] = jtext("tag")
+    m["filePath"] = jtext(abs_of(ad, parts[0]))
+    m["identifier"] = jtext(parts[1])
+    m["tagName"] = jtext(parts[2])
+    tags.push(json.Obj(m))
+  var hints: [Value] = []
+  for h in p.hints:
+    var m: {Str: Value} = {}
+    m["type"] = jtext(h.typ)
+    m["identifier"] = jtext(h.identifier)
+    if h.file != "": m["filePath"] = jtext(abs_of(ad, h.file))
+    if h.ws != "": m["workspaceName"] = jtext(h.ws)
+    if h.size > 0: m["size"] = json.Whole(h.size)
+    hints.push(json.Obj(m))
+  var plugins_: {Str: Value} = {}
+  var dirs: [Value] = []
+  for w in p.ws:
+    if not w.has_manifest: continue
+    var names: [Value] = []
+    for k in w.plugin_order:
+      if k in w.plugins: names.push(jtext(k))
+    plugins_[w.name] = json.Arr(names)
+    dirs.push(jtext(abs_of(ad, w.dir)))
+  d["issues"] = json.Obj(issues)
+  d["counters"] = json.Obj(counters)
+  d["tagHints"] = json.Arr(tags)
+  d["configurationHints"] = json.Arr(hints)
+  d["hasConfigLoadErrors"] = json.Flag(p.config_errors)
+  d["enabledPlugins"] = json.Obj(plugins_)
+  d["includedWorkspaceDirs"] = json.Arr(dirs)
+  d["report"] = json.Obj(report_)
+  d["cwd"] = jtext(ad)
+  if p.config_file != "": d["configFilePath"] = jtext(abs_of(ad, p.config_file))
+  d["isDisableConfigHints"] = json.Flag(no_hints)
+  d["isDisableTagHints"] = json.Flag(no_tag_hints)
+  d["isProduction"] = json.Flag(p.production)
+  d["isShowProgress"] = json.Flag(false)
+  d["isTreatConfigHintsAsErrors"] = json.Flag(treat_hints)
+  d["isTreatTagHintsAsErrors"] = json.Flag(treat_tag_hints)
+  if max_show >= 0: d["maxShowIssues"] = json.Whole(max_show)
+  d["options"] = jtext(rep_opts)
+  d["preprocessorOptions"] = jtext(pre_opts)
+  return json.Obj(d)
+
+# (IssueCollector: a member's key has its parent)
+fn issue_key(i: Issue) -> Str:
+  if i.parent != "": return i.parent + "." + i.symbol
+  return i.symbol + ""
+
+fn issue_json(p: Proj, i: Issue, ad: Str) -> Value:
+  var m: {Str: Value} = {}
+  m["type"] = jtext(i.typ)
+  m["filePath"] = jtext(abs_of(ad, i.file))
+  if i.typ == "files": m["workspace"] = jtext("")
+  else: m["workspace"] = jtext(i.ws)
+  m["symbol"] = jtext(i.symbol)
+  if i.extra != "":
+    let xs = json.parse(i.extra) else json.Null
+    var syms: [Value] = []
+    for x in pkg.items(xs):
+      var s: {Str: Value} = {}
+      s["symbol"] = json.copy(pkg.get(x, "name"))
+      s["line"] = json.copy(pkg.get(x, "line"))
+      s["col"] = json.copy(pkg.get(x, "col"))
+      s["pos"] = json.copy(pkg.get(x, "pos"))
+      syms.push(json.Obj(s))
+    m["symbols"] = json.Arr(syms)
+  if i.stype != "": m["symbolType"] = jtext(i.stype)
+  if i.parent != "": m["parentSymbol"] = jtext(i.parent)
+  if i.display != i.symbol: m["specifier"] = jtext(i.display)
+  m["severity"] = jtext(i.severity)
+  if i.line > 0:
+    m["pos"] = json.Whole(i.pos)
+    m["line"] = json.Whole(i.line)
+    m["col"] = json.Whole(i.col)
+  m["fixes"] = json.Arr([])
+  if i.fixed: m["isFixed"] = json.Flag(true)
+  return json.Obj(m)
+
+fn rel_of(ad: Str, f: Str) -> Str:
+  if f == ad: return ""
+  if f.startswith(ad + "/"): return f[ad.len + 1..f.len]
+  return f + ""
+
+# The preprocessed results back: the issues (keeping what --fix removes), hints and tag hints
+fn data_to_proj(var p: Proj, data: Value, ad: Str):
+  var orig: {Str: Int} = {}
+  for k in 0..p.issues.len:
+    orig[p.issues[k].typ + "\0" + p.issues[k].file + "\0" + issue_key(p.issues[k])] = k
+  var out: [Issue] = []
+  let iss = pkg.get(data, "issues")
+  for t in opts.issue_types():
+    let byf = pkg.get(iss, t)
+    for rel in pkg.keys(byf):
+      let syms = pkg.get(byf, rel)
+      for key in pkg.keys(syms):
+        let v = pkg.get(syms, key)
+        var file = rel_of(ad, pkg.str_of(pkg.get(v, "filePath")))
+        if file == "": file = rel + ""
+        var i = issue(t, file, pkg.str_of(pkg.get(v, "symbol")))
+        let spec = pkg.str_of(pkg.get(v, "specifier"))
+        if spec != "": i.display = spec
+        i.stype = pkg.str_of(pkg.get(v, "symbolType"))
+        i.parent = pkg.str_of(pkg.get(v, "parentSymbol"))
+        i.line = int_of(pkg.get(v, "line"))
+        i.col = int_of(pkg.get(v, "col"))
+        i.pos = int_of(pkg.get(v, "pos"))
+        let w = pkg.str_of(pkg.get(v, "workspace"))
+        if w != "": i.ws = w
+        let sev = pkg.str_of(pkg.get(v, "severity"))
+        if sev != "": i.severity = sev
+        i.fixed = pkg.truthy(pkg.get(v, "isFixed"))
+        let syms2 = pkg.items(pkg.get(v, "symbols"))
+        if syms2.len > 0:
+          var ds: [Str] = []
+          for x in syms2: ds.push("{{\"name\":" + json.quote(pkg.str_of(pkg.get(x, "symbol"))) + ",\"line\":{int_of(pkg.get(x, "line"))},\"col\":{int_of(pkg.get(x, "col"))},\"pos\":{int_of(pkg.get(x, "pos"))}}}")
+          i.extra = "[" + ",".join(ds) + "]"
+        let ok = t + "\0" + file + "\0" + issue_key(i)
+        if ok in orig:
+          for x in p.issues[orig[ok]].fix: i.fix.push(x)
+        out.push(i)
+  p.issues = out
+  var hints: [Hint] = []
+  for h in pkg.items(pkg.get(data, "configurationHints")):
+    var ident = pkg.str_of(pkg.get(h, "identifier"))
+    if json.has(pkg.get(h, "identifier"), "__vknip_re"): ident = pkg.str_of(pkg.get(pkg.get(h, "identifier"), "__vknip_re"))
+    hints.push(Hint(pkg.str_of(pkg.get(h, "type")), ident, pkg.str_of(pkg.get(h, "workspaceName")), rel_of(ad, pkg.str_of(pkg.get(h, "filePath"))), int_of(pkg.get(h, "size"))))
+  p.hints = hints
+  var tags: [Str] = []
+  for h in pkg.items(pkg.get(data, "tagHints")):
+    tags.push(rel_of(ad, pkg.str_of(pkg.get(h, "filePath"))) + "\0" + pkg.str_of(pkg.get(h, "identifier")) + "\0" + pkg.str_of(pkg.get(h, "tagName")))
+  p.tag_hints = tags
 
 fn all_digits(s: Str) -> Bool:
   if s == "": return false
