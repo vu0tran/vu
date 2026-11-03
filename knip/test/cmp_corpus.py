@@ -52,6 +52,11 @@ def main():
                 key = lambda j: sorted(json.dumps(x, sort_keys=True) for x in j.get('issues', []))
                 if key(ja) == key(jb) and list(ja) == list(jb): same = 'order'
             except Exception: pass
+        # (codeclimate: a JSON array of the same entries)
+        if not same and e == ref['err'] and c == ref['code'] and o.startswith('[') and ref['out'].startswith('['):
+            try:
+                if sorted(json.dumps(x, sort_keys=True) for x in json.loads(o)) == sorted(json.dumps(x, sort_keys=True) for x in json.loads(ref['out'])): same = 'order'
+            except Exception: pass
         # the markdown report lists unused files in that order too (sorted by path length only)
         if not same and e == ref['err'] and c == ref['code'] and not o.startswith('{') and sorted(o.split('\n')) == sorted(ref['out'].split('\n')) and '--reporter markdown' in ' '.join(extra):
             same = 'order'

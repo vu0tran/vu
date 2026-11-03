@@ -234,3 +234,12 @@ case("p7_batch8", {
     "sst.config.ts": "export default { stacks(app) { app.stack(Api); } };\nimport { Api } from './stacks/Api';\n",
     "stacks/Api.ts": "export function Api() { return { handler: 'functions/lambda.main' }; }\n", "functions/lambda.ts": "export const main = 1;\n", "functions/other.ts": "export {};\n",
 }, PROD)
+
+case("p7_small2", {
+    "package.json": pkg(deps=["react-native", "@react-native-community/cli", "@preconstruct/cli"], dev=["yorkie", "wireit", "nano-staged", "tsx", "eslint", "prettier", "peer-x", "unused-dev"],
+        extra={"gitHooks": {"pre-commit": "tsx scripts/hook.ts"}, "wireit": {"build": {"command": "tsx scripts/build.ts"}}, "nano-staged": {"*.js": "prettier --write"}, "preconstruct": {"entrypoints": ["index.ts", "extra.ts"]}}),
+    **mods("react-native", "@react-native-community/cli", "@preconstruct/cli", "yorkie", "wireit", "nano-staged", "tsx", "eslint", "prettier", "peer-x", "unused-dev"),
+    ".travis.yml": "language: node_js\nbefore_script:\n  - eslint .\n", ".yarnrc.yml": "yarnPath: .yarn/releases/yarn.cjs\npackageExtensions:\n  'some-pkg@*':\n    peerDependencies:\n      peer-x: '*'\n",
+    ".yarn/releases/yarn.cjs": "", "yarn.lock": "", "scripts/hook.ts": "export {};\n", "scripts/build.ts": "export {};\n", "scripts/other.ts": "export {};\n",
+    "src/index.ts": "export const a = 1;\n", "src/extra.ts": "export const b = 1;\n", "src/x.ts": "export {};\n",
+}, PROD)
