@@ -5867,6 +5867,7 @@ fn member_issues(var p: Proj, b: Build, fid: Int, ex: Exp, wi: Int, emit: Bool) 
     if not emit: continue
     var i = issue(typ, g.nodes[fid].path, m.name)
     i.parent = ex.name + ""
+    for x in m.fix: i.fix.push(x)
     let l = extract.loc(g.nodes[fid].raw, m.pos)
     i.line = l[0]
     i.col = l[1]
@@ -8814,6 +8815,90 @@ fn apply_fixes(var p: Proj, fs: Fs, a: opts.Args):
         m[key] = val
       let out = (pretty_json(json.Obj(m), ind, "") + "\n").replace("\n", nl)
       fs.write(fspath(p, f), out) else 0
+  # unused catalog entries: their lines in YAML, their keys in package.json
+  let fix_cat = fix_types.len == 0 or opts.has(fix_types, "catalog")
+  if fix_cat:
+    var cfiles: [Str] = []
+    for i in p.issues:
+      if i.typ == "catalog" and not opts.has(cfiles, i.file): cfiles.push(i.file + "")
+    for f in cfiles:
+      let src = fs.read(fspath(p, f)) else continue
+      if f.endswith(".yml") or f.endswith(".yaml"):
+        var drop: {Int: Bool} = {}
+        for q in 0..p.issues.len:
+          if p.issues[q].typ == "catalog" and p.issues[q].file == f and p.issues[q].line > 0:
+            drop[p.issues[q].line] = true
+            p.issues[q].fixed = true
+        var kept: [Str] = []
+        let lines = src.split("\n")
+        for k in 0..lines.len:
+          if not ((k + 1) in drop): kept.push(lines[k] + "")
+        fs.write(fspath(p, f), "\n".join(kept)) else 0
+        continue
+      var txt = src + ""
+      if txt.len >= 3 and txt[0] == 0xEF and txt[1] == 0xBB and txt[2] == 0xBF: txt = txt[3..txt.len]
+      let v = json.parse(txt) else continue
+      let fmt = json_format(txt)
+      var cat_in_ws = not json.has(v, "catalog") and pkg.is_obj(pkg.get(v, "workspaces"))
+      var cats_in_ws = not json.has(v, "catalogs") and pkg.is_obj(pkg.get(v, "workspaces"))
+      var m: {Str: Value} = {}
+      for key in pkg.keys(v):
+        var val = pkg.get(v, key)
+        if key == "catalog" or key == "catalogs": val = drop_catalog(&p, f, key, val)
+        elif key == "workspaces" and pkg.is_obj(val) and (cat_in_ws or cats_in_ws):
+          var wm: {Str: Value} = {}
+          for wk in pkg.keys(val):
+            var wv = pkg.get(val, wk)
+            if (wk == "catalog" and cat_in_ws) or (wk == "catalogs" and cats_in_ws): wv = drop_catalog(&p, f, wk, wv)
+            wm[wk] = wv
+          val = json.Obj(wm)
+        m[key] = val
+      let out = (pretty_json(json.Obj(m), fmt[1], "") + "\n").replace("\n", fmt[0])
+      fs.write(fspath(p, f), out) else 0
+
+# a catalog (key "catalog": the default one) or the catalogs without the unused entries
+fn drop_catalog(var p: Proj, f: Str, key: Str, val: Value) -> Value:
+  if not pkg.is_obj(val): return json.copy(val)
+  var m: {Str: Value} = {}
+  for name in pkg.keys(val):
+    var x = pkg.get(val, name)
+    if key == "catalogs" and pkg.is_obj(x):
+      var inner: {Str: Value} = {}
+      for d in pkg.keys(x):
+        if not catalog_unused(&p, f, name, d): inner[d] = pkg.get(x, d)
+      x = json.Obj(inner)
+      m[name] = x
+    elif key == "catalog":
+      if not catalog_unused(&p, f, "default", name): m[name] = x
+    else: m[name] = x
+  return json.Obj(m)
+
+fn catalog_unused(var p: Proj, f: Str, cat: Str, name: Str) -> Bool:
+  var hit = false
+  for q in 0..p.issues.len:
+    if p.issues[q].typ == "catalog" and p.issues[q].file == f and p.issues[q].parent == cat and p.issues[q].symbol == name:
+      p.issues[q].fixed = true
+      hit = true
+  return hit
+
+# a JSON file's format: [newline, indentation] after its first bracket
+fn json_format(txt: Str) -> [Str]:
+  var nl = "\n"
+  var ind = "  "
+  var k = 0
+  while k < txt.len and is_space_byte(txt[k]): k += 1
+  if k < txt.len and (txt[k] == '{' or txt[k] == '['):
+    var e = k + 1
+    var nls = ""
+    while e < txt.len and (txt[e] == '\n' or txt[e] == '\r'):
+      nls += txt[e..e + 1]
+      e += 1
+    if nls != "":
+      var e2 = e
+      while e2 < txt.len and (txt[e2] == ' ' or txt[e2] == '\t'): e2 += 1
+      nl = nls
+      ind = txt[e..e2]
+  return [nl, ind]
 
 # ---- catalogs (CatalogCounselor: pnpm/yarn/bun catalogs)
 
@@ -8930,6 +9015,8 @@ fn catalog_issues(var p: Proj, fs: Fs, root_manifest: Value):
     if is_null(cat): cat = pkg.get(wsv, "catalog")
     if is_null(cats): cats = pkg.get(wsv, "catalogs")
   var overrides = json.Null
+  # (included files of pnpm-workspace.yaml are catalogs too)
+  var inc_files: [Str] = []
   if exists_file(p, fs, "pnpm-workspace.yaml"):
     file = "pnpm-workspace.yaml"
     text = fs.read(fspath(p, file)) else ""
@@ -8937,19 +9024,44 @@ fn catalog_issues(var p: Proj, fs: Fs, root_manifest: Value):
     if json.has(y, "catalog"): cat = pkg.get(y, "catalog")
     if json.has(y, "catalogs"): cats = pkg.get(y, "catalogs")
     overrides = pkg.get(y, "overrides")
+    for src in pkg.keys(pkg.get(y, "include")):
+      if src.startswith(".") and exists_file(p, fs, resolve.norm(src)): inc_files.push(resolve.norm(src))
   elif exists_file(p, fs, ".yarnrc.yml"):
     file = ".yarnrc.yml"
     text = fs.read(fspath(p, file)) else ""
     let y = yaml.parse(text)
     if json.has(y, "catalog"): cat = pkg.get(y, "catalog")
     if json.has(y, "catalogs"): cats = pkg.get(y, "catalogs")
+  # each source: its file, text, entries and override references
+  var s_files: [Str] = [file + ""]
+  var s_texts: [Str] = [text + ""]
+  var s_entries: [[Str]] = [catalog_entries(cat, cats)]
+  var s_orefs: [[[Str]]] = [override_refs(overrides)]
+  for f in inc_files:
+    let t2 = fs.read(fspath(p, f)) else ""
+    let y = yaml.parse(t2)
+    s_files.push(f + "")
+    s_texts.push(t2)
+    s_entries.push(catalog_entries(pkg.get(y, "catalog"), pkg.get(y, "catalogs")))
+    s_orefs.push(override_refs(pkg.get(y, "overrides")))
   var entries: [Str] = []
-  for k in pkg.keys(cat): entries.push("default:" + k)
-  for c in pkg.keys(cats):
-    for k in pkg.keys(pkg.get(cats, c)): add_uniq(&entries, c + ":" + k)
+  for es in s_entries:
+    for e in es: add_uniq(&entries, e)
   var referenced: {Str: Bool} = {}
-  let orefs = override_refs(overrides)
-  for r in orefs: referenced[r[0]] = true
+  for os_ in s_orefs:
+    for r in os_: referenced[r[0]] = true
+  # (the catalog references of the scripts of the workspaces not included)
+  for name in sc(p.avail):
+    if name in p.ws_ix or not (name in p.all_pkgs): continue
+    var scr: {Str: Str} = {}
+    let sv = pkg.get(p.all_pkgs[name], "scripts")
+    for k in pkg.keys(sv): scr[k] = pkg.str_of(pkg.get(sv, k))
+    var vals: [Str] = []
+    for k, v in scr: vals.push(v + "")
+    for x in scripts.inputs_from_scripts(vals, Ctx(scr, false, false, {}, false, 0)):
+      if x.kind == I_CATALOG:
+        let tb = x.spec.find("\t")
+        if tb > 0: p.catalog_used[x.spec[tb + 1..x.spec.len] + ":" + x.spec[0..tb]] = true
   for k, _ in p.catalog_used: referenced[k] = true
   # references in every workspace's manifest
   var ref_issues: [Issue] = []
@@ -8974,28 +9086,59 @@ fn catalog_issues(var p: Proj, fs: Fs, root_manifest: Value):
           i.pos = loc[2]
         ref_issues.push(i)
   var found: [Issue] = []
-  let yaml_src = file.endswith(".yml") or file.endswith(".yaml")
-  for e in entries:
-    if e in referenced: continue
-    let c = e[0..e.find(":")]
-    let sym = e[e.find(":") + 1..e.len]
-    var i = issue("catalog", file, sym)
-    i.parent = c + ""
-    var loc: [Int] = []
-    if yaml_src: loc = yaml_catalog_loc(text, c, sym)
-    else: loc = json_catalog_loc(text, c, sym)
-    i.pos = -1
-    if loc.len == 2:
-      i.line = loc[0]
-      i.col = loc[1]
-    found.push(i)
+  var oref_issues: [Issue] = []
+  for q in 0..s_files.len:
+    let sf = s_files[q] + ""
+    if s_entries[q].len == 0 and s_orefs[q].len == 0: continue
+    let yaml_src = sf.endswith(".yml") or sf.endswith(".yaml")
+    for e in s_entries[q]:
+      if e in referenced: continue
+      let c = e[0..e.find(":")]
+      let sym = e[e.find(":") + 1..e.len]
+      var i = issue("catalog", sf, sym)
+      i.parent = c + ""
+      var loc: [Int] = []
+      if yaml_src: loc = yaml_catalog_loc(s_texts[q], c, sym)
+      else: loc = json_catalog_loc(s_texts[q], c, sym)
+      i.pos = -1
+      if loc.len == 2:
+        i.line = loc[0]
+        i.col = loc[1]
+      found.push(i)
+    for r in s_orefs[q]:
+      if opts.has(entries, r[0]): continue
+      var i = issue("catalogReferences", sf, r[1])
+      i.parent = r[2] + ""
+      if yaml_src:
+        let l = yaml_override_loc(s_texts[q], r[3])
+        if l.len == 2:
+          i.line = l[0]
+          i.col = l[1]
+          i.pos = -1
+      oref_issues.push(i)
   for i in ref_issues: found.push(copy_issue(i))
-  for r in orefs:
-    if opts.has(entries, r[0]): continue
-    var i = issue("catalogReferences", file, r[1])
-    i.parent = r[2] + ""
-    found.push(i)
+  for i in oref_issues: found.push(copy_issue(i))
   for i in found: add_issue(&p, copy_issue(i))
+
+# YamlCatalogPeeker getOverrideCatalogReferenceLocation: [line, col] or []
+fn yaml_override_loc(text: Str, sel: Str) -> [Int]:
+  let lines = text.split("\n")
+  var start = -1
+  for i in 0..lines.len:
+    if lines[i].startswith("overrides:"): start = i
+  if start < 0: return []
+  for i in start + 1..lines.len:
+    let l = lines[i]
+    if not l.startswith("  "): break
+    if l.startswith("  " + sel + ":") or l.startswith("  \"" + sel + "\":") or l.startswith("  '" + sel + "':"): return [i + 1, l.find(sel) + 1]
+  return []
+
+fn catalog_entries(cat: Value, cats: Value) -> [Str]:
+  var entries: [Str] = []
+  for k in pkg.keys(cat): entries.push("default:" + k)
+  for c in pkg.keys(cats):
+    for k in pkg.keys(pkg.get(cats, c)): add_uniq(&entries, c + ":" + k)
+  return entries
 
 fn catalog_ref_loc(ms: Str, name: Str, cat: Str) -> [Int]:
   let prop = "\"" + name + "\""

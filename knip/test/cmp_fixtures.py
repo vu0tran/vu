@@ -42,7 +42,7 @@ def flags_of(opts):
         for x in re.findall(r"'([^']*)'", w.group(1)): add(['--workspace', x])
     t = re.search(r"tags:\s*\[([^\]]*)\]", opts)
     if t:
-        add(['--tags', ','.join(re.findall(r"'([^']*)'", t.group(1)))])
+        add(['--tags=' + ','.join(re.findall(r"'([^']*)'", t.group(1)))])
     it = re.search(r"includedIssueTypes:\s*\[([^\]]*)\]", opts)
     if it:
         xs = re.findall(r"'([^']*)'", it.group(1))

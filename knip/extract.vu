@@ -56,6 +56,7 @@ type Member:
   pos: Int
   tags: Int
   in_file: Bool
+  fix: [Int]        # what --fix removes (start, end, flags), empty: nothing
 
 type Exp:
   name: Str
@@ -440,7 +441,7 @@ fn add_export(var s: St, name: Str, typ: Str, pos: Int, own members: [Member], r
   if name in s.exp_ix:
     s.fix_next = []
     let i = s.exp_ix[name]
-    for m in members: s.exps[i].members.push(Member(m.name + "", m.pos, m.tags, m.in_file))
+    for m in members: s.exps[i].members.push(Member(m.name + "", m.pos, m.tags, m.in_file, copy_ints(m.fix)))
     s.exps[i].tags = s.exps[i].tags | tags
     s.exps[i].reexport = reexport
     return
@@ -627,7 +628,8 @@ fn enum_members(var s: St, t: Ast, n: Int) -> [Member]:
     let id = t.nd[m].a
     var name = ""
     if id >= 0: name = nm(t, id)
-    out.push(Member(name, t.nd[id].pos, tags_at(s, t.nd[m].pos), name == ""))
+    # (--fix: the member, its comma and its line break)
+    out.push(Member(name, t.nd[id].pos, tags_at(s, t.nd[m].pos), name == "", [t.nd[m].pos, t.nd[m].end, 5]))
   return out
 
 fn handle_var_export(var s: St, t: Ast, v: Int, start: Int):
@@ -647,6 +649,7 @@ fn handle_var_export(var s: St, t: Ast, v: Int, start: Int):
           name = nm(t, target)
           pos = t.nd[target].pos
         if name == "": continue
+        s.fix_next = [t.nd[e].pos, t.nd[e].end, 1]
         add_export(&s, name, "unknown", pos, [], false, tags)
         if init >= 0: refs_in(&s, t, init, name, false)
         s.destructured[name] = true
@@ -656,6 +659,7 @@ fn handle_var_export(var s: St, t: Ast, v: Int, start: Int):
         let target = t.nd[e].b
         if not is_id(t, target): continue
         let name = nm(t, target)
+        s.fix_next = [t.nd[e].pos, t.nd[e].end, 0]
         add_export(&s, name, "unknown", t.nd[target].pos, [], false, tags)
         if init >= 0: refs_in(&s, t, init, name, false)
         s.destructured[name] = true
@@ -764,20 +768,24 @@ fn ns_members(var s: St, t: Ast, n: Int, prefix: Str) -> [Member]:
     if not exported: continue
     let start = stmt_start(s, t.nd[st].pos)
     let tags = tags_at(s, start)
+    # (--fix removes the whole statement, a declaration list only when it declares one name)
+    let one = k != ast.N_VAR or ast.count(t, t.nd[st].a) == 1
+    var fx: [Int] = []
+    if one: fx = [start, t.nd[st].end, 5]
     if k == ast.N_VAR:
       for d in ast.items(t, t.nd[st].a):
         let id = t.nd[d].a
-        if is_id(t, id): ns_add(&out, prefix, nm(t, id), t.nd[id].pos, tags)
+        if is_id(t, id): ns_add(&out, prefix, nm(t, id), t.nd[id].pos, tags, fx)
     elif k == ast.N_MODULE:
       let id = t.nd[st].a
       if is_id(t, id):
-        ns_add(&out, prefix, nm(t, id), t.nd[id].pos, tags)
+        ns_add(&out, prefix, nm(t, id), t.nd[id].pos, tags, [])
         var p2 = nm(t, id)
         if prefix != "": p2 = prefix + "." + p2
-        for m in ns_members(&s, t, st, p2): out.push(Member(m.name + "", m.pos, m.tags, m.in_file))
+        for m in ns_members(&s, t, st, p2): out.push(Member(m.name + "", m.pos, m.tags, m.in_file, copy_ints(m.fix)))
     else:
       let name = nm(t, st)
-      if name != "": ns_add(&out, prefix, name, decl_name_pos(t, st), tags)
+      if name != "": ns_add(&out, prefix, name, decl_name_pos(t, st), tags, fx)
   return out
 
 # Members of a namespace that other declarations in it refer to (markNamespaceMemberRefs).
@@ -951,7 +959,20 @@ fn ns_visit(t: Ast, var m: NsMark, n: Int, var hits: {Int: Bool}):
   if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW:
     for p in ast.items(t, nd.b): binding_names(t, p, &shadow)
     if k == ast.N_FUNCEXPR and nm(t, n) != "": shadow[nm(t, n)] = true
+    # (var declarations anywhere in the body are the function's)
+    hoisted_vars(t, nd.d, &shadow)
     has_shadow = shadow.len > 0
+  elif k == ast.N_TRY:
+    # (the catch binding shadows in the catch block)
+    ns_visit(t, &m, nd.a, &hits)
+    var cs: {Str: Bool} = {}
+    if nd.b >= 0: binding_names(t, t.nd[nd.b].a, &cs)
+    let has_cs = cs.len > 0
+    if has_cs: m.scopes.push(NsScope("", cs, {}, true))
+    ns_visit(t, &m, nd.c, &hits)
+    if has_cs: m.scopes.pop()
+    ns_visit(t, &m, nd.d, &hits)
+    return
   elif k == ast.N_BLOCK:
     for st in ast.items(t, nd.a): decl_names_of(t, st, &shadow)
     has_shadow = shadow.len > 0
@@ -965,14 +986,48 @@ fn ns_visit(t: Ast, var m: NsMark, n: Int, var hits: {Int: Bool}):
   if k != ast.N_VAR and k != ast.N_INTERFACE and k != ast.N_TYPEALIAS and k != ast.N_PROPACCESS: ns_visit(t, &m, nd.d, &hits)
   if has_shadow: m.scopes.pop()
 
-fn ns_add(var out: [Member], prefix: Str, name: Str, pos: Int, tags: Int):
+# the names var declares in a function body (blocks and statements, not nested functions)
+fn hoisted_vars(t: Ast, n: Int, var names: {Str: Bool}):
+  if n < 0: return
+  let k = t.nd[n].k
+  let nd = t.nd[n]
+  if k == ast.N_LIST:
+    for x in ast.items(t, n): hoisted_vars(t, x, &names)
+  elif k == ast.N_VAR:
+    if nd.f == 0:
+      for d in ast.items(t, nd.a): binding_names(t, t.nd[d].a, &names)
+  elif k == ast.N_BLOCK: hoisted_vars(t, nd.a, &names)
+  elif k == ast.N_IF:
+    hoisted_vars(t, nd.b, &names)
+    hoisted_vars(t, nd.c, &names)
+  elif k == ast.N_FOR:
+    hoisted_vars(t, nd.a, &names)
+    hoisted_vars(t, nd.d, &names)
+  elif k == ast.N_FORIN:
+    hoisted_vars(t, nd.a, &names)
+    hoisted_vars(t, nd.c, &names)
+  elif k == ast.N_WHILE or k == ast.N_WITH: hoisted_vars(t, nd.b, &names)
+  elif k == ast.N_DO or k == ast.N_LABEL: hoisted_vars(t, nd.a, &names)
+  elif k == ast.N_TRY:
+    hoisted_vars(t, nd.a, &names)
+    hoisted_vars(t, nd.c, &names)
+    hoisted_vars(t, nd.d, &names)
+  elif k == ast.N_SWITCH:
+    for c in ast.items(t, nd.b): hoisted_vars(t, t.nd[c].b, &names)
+
+fn ns_add(var out: [Member], prefix: Str, name: Str, pos: Int, tags: Int, fix: [Int]):
   var full = name + ""
   if prefix != "": full = prefix + "." + name
   for i in 0..out.len:
     if out[i].name == full:
       out[i].tags = out[i].tags | tags
       return
-  out.push(Member(full, pos, tags, false))
+  out.push(Member(full, pos, tags, false, copy_ints(fix)))
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var out: [Int] = []
+  for x in xs: out.push(x)
+  return out
 
 fn handle_export_specs(var s: St, t: Ast, n: Int):
   # export { a, b as c } (no module)
@@ -1055,16 +1110,34 @@ fn handle_export_default(var s: St, t: Ast, n: Int, decl: Int):
       if name in s.exp_ix:
         let ex = exp_get(s, name)
         add_dup(&s, name, ex.pos, "default", t.nd[decl].pos)
+  var kw = start + 6
+  while kw < s.src.len and is_ws(s.src[kw]): kw += 1
+  if s.src[kw..min(kw + 7, s.src.len)] == "default": kw += 7
+  while kw < s.src.len and is_ws(s.src[kw]): kw += 1
   if (k == ast.N_FUNC or k == ast.N_CLASS) and nm(t, decl) != "":
     # export default function f / class C: "export default " goes
-    var kw = start + 6
-    while kw < s.src.len and is_ws(s.src[kw]): kw += 1
-    if s.src[kw..min(kw + 7, s.src.len)] == "default": kw += 7
-    while kw < s.src.len and is_ws(s.src[kw]): kw += 1
     s.fix_next = [start, kw, 0]
   else:
-    s.fix_next = [start, t.nd[n].end + 1, 0]
+    # (an anonymous class or function is at its keyword; a class goes with its decorators)
+    if (k == ast.N_FUNC or k == ast.N_CLASS) and s.src[start..min(start + 6, s.src.len)] == "export": pos = kw
+    var fs_ = start
+    if k == ast.N_CLASS: fs_ = decorators_start(s.src, start)
+    s.fix_next = [fs_, t.nd[n].end + 1, 0]
   add_export(&s, "default", typ, pos, [], false, tags)
+
+# where the decorators on the lines before a statement start (the statement's start when none)
+fn decorators_start(src: Str, start: Int) -> Int:
+  var at = start
+  while true:
+    var e = at
+    while e > 0 and (src[e - 1] == ' ' or src[e - 1] == '\t'): e -= 1
+    if e == 0 or src[e - 1] != '\n': return at
+    var ls = e - 1
+    while ls > 0 and src[ls - 1] != '\n': ls -= 1
+    var f = ls
+    while f < e - 1 and (src[f] == ' ' or src[f] == '\t'): f += 1
+    if f >= e - 1 or src[f] != '@': return at
+    at = f
 
 fn handle_export_assign(var s: St, t: Ast, n: Int):
   if in_ns(s, t.nd[n].pos, t.nd[n].end): return
@@ -1102,6 +1175,7 @@ fn handle_expr_stmt(var s: St, t: Ast, n: Int):
   if lk != ast.N_PROPACCESS and lk != ast.N_ELEMACCESS: return
   let obj = t.nd[left].a
   if lk == ast.N_PROPACCESS and is_id(t, obj) and nm(t, obj) == "exports":
+    s.fix_next = [t.nd[n].pos, t.nd[n].end, 0]
     add_export(&s, nm(t, left), "unknown", prop_pos(s, t, left), [], false, 0)
     return
   if kind(t, obj) == ast.N_PROPACCESS and is_id(t, t.nd[obj].a) and nm(t, t.nd[obj].a) == "module" and nm(t, obj) == "exports":
@@ -1127,6 +1201,7 @@ fn handle_expr_stmt(var s: St, t: Ast, n: Int):
           if name != member: alias = name
           add_imp(&s, spec, member, alias, "", t.nd[arg].pos, F_REEXPORT, -1)
           reexport = true
+      s.fix_next = [t.nd[n].pos, t.nd[n].end, 0]
       add_export(&s, name, "unknown", npos, [], reexport, 0)
     return
   if lk == ast.N_PROPACCESS and is_id(t, obj) and nm(t, obj) == "module" and nm(t, left) == "exports":
@@ -1137,7 +1212,9 @@ fn handle_expr_stmt(var s: St, t: Ast, n: Int):
       for p in props:
         if t.nd[p].k != ast.N_SHORTHAND: all_short = false
       if all_short:
-        for p in props: add_export(&s, nm(t, p), "unknown", t.nd[p].pos, [], false, 0)
+        for p in props:
+          s.fix_next = [t.nd[p].pos, t.nd[p].end, 0]
+          add_export(&s, nm(t, p), "unknown", t.nd[p].pos, [], false, 0)
       else:
         add_export(&s, "default", "unknown", t.nd[right].pos, [], false, 0)
       for p in props:
