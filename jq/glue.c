@@ -196,8 +196,15 @@ vu_str vjq_environ(void) {
 }
 
 /* ---- Oniguruma, loaded at the first regex (dlopen), so vjq runs without it until a regex is
-   used. Its declarations are written out here (from oniguruma.h, BSD licensed). */
+   used. Its declarations are written out here (from oniguruma.h, BSD licensed).
+   A static Linux binary (the release binaries: vu build --static) never loads it: glibc's dlopen
+   in a static program needs the shared libraries of the glibc it was linked with, and musl's
+   can't load anything; there (no _DYNAMIC, which the linker defines only in dynamic programs) the
+   constructs regex.vu leaves to Oniguruma are an error, as when Oniguruma isn't installed. */
 #include <dlfcn.h>
+#ifdef __linux__
+extern char _DYNAMIC[] __attribute__((weak));
+#endif
 typedef unsigned char OnigUChar;
 typedef unsigned int OnigOptionType;
 typedef struct OnigEncodingTypeST OnigEncodingType;
@@ -222,6 +229,9 @@ static int (*p_onig_error_code_to_str)(OnigUChar *, int, ...);
 static int onig_load(void) {
     static int state = 0;   /* 0 not tried, 1 loaded, -1 unavailable */
     if (state) return state;
+#ifdef __linux__
+    if (!_DYNAMIC) { state = -1; return state; }
+#endif
     const char *names[] = {"libonig.so.5", "libonig.so", "libonig.5.dylib", "libonig.dylib", NULL};
     void *h = NULL;
     for (int i = 0; names[i] && !h; i++) h = dlopen(names[i], RTLD_NOW);
