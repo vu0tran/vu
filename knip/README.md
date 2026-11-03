@@ -47,6 +47,11 @@ node ends). Files are parsed on all cores, wave by wave as the import graph reac
   calls), exports of entry files skipped, JSDoc `@public`/`@beta`/`@alias` skipped, enum members (with
   `E.A`, `E['A']`, whole-enum reads), namespace members (and their references to each other), duplicate
   exports.
+- **Plugin visitors** (knip's `registerVisitors`, for the plugins enabled in any workspace):
+  `jest.mock()` and the other module methods of Jest (virtual mocks skipped), `vi.mock(import())` /
+  `rs.mock(import())` with a factory, scripts run by execa, zx and nano-spawn, `import.meta.glob`
+  (Vite; `?raw` globs as program files), `require.context` (webpack, Rspack), `fs/promises` `glob`
+  (Node.js), pino transports, knex clients.
 - **Dependencies**: imports, script binaries (through the `bin` of installed packages), `@types/x`
   for used or typed packages, peer dependencies of used packages (host dependencies), `engines`,
   `optionalDependencies` that aren't installed; knip and typescript never reported.
@@ -79,8 +84,12 @@ The schema: `entry`, `project`, `paths`, `ignore`, `ignoreFiles`, `ignoreDepende
 globs: `packages/*` settings apply to each matching workspace), `treatConfigHintsAsErrors`, and each
 plugin's settings: `false` (off), `true` (on), a config file
 pattern or list (`"vitest": "config/vitest.ts"`), or an object with `config`, `entry` and `project`.
-Strings or regular expressions where knip takes both. Not read: `ignoreExportsUsedInFile` (accepted,
-no effect; see Gaps) and `compilers` (custom compiler functions).
+Strings or regular expressions where knip takes both. `ignoreExportsUsedInFile` (`true` or per symbol
+type) counts an export referenced in its own file as used, from the same reference positions knip's
+localRefs visitor reads. Not read: `compilers` (custom compiler functions), `cycles` (see Gaps).
+Absolute paths in a loaded JavaScript config (`path.resolve(__dirname, ...)`) come back
+project-relative, so aliases and entries built from them work. TOML configs (`wrangler.toml`,
+`netlify.toml`, `Tauri.toml`) are read by a small TOML reader (`toml.vu`).
 
 ## Workspaces
 
@@ -110,10 +119,11 @@ error messages and the help text). What they do:
 | `--include-entry-exports`, `--tags`, `--no-tag-hints`, `--treat-tag-hints-as-errors` | as knip (`@tag` and `-tag`, member tags) |
 | `--no-exit-code`, `--max-issues`, `--max-show-issues` | as knip (exit code 1 when error-level issues exceed the maximum, 2 on errors) |
 | `--no-config-hints`, `--treat-config-hints-as-errors` | as knip; hints are printed on stderr in knip's table |
-| `--reporter` (repeatable), `--output-file` | `symbols` (default), `compact`, `json`, `markdown`, `codeowners`, `disclosure` |
+| `--reporter` (repeatable), `--output-file` | `symbols` (default), `compact`, `json`, `markdown`, `codeowners`, `disclosure`, `github-actions`, `codeclimate`, `sarif`; not `cycles`, nor a path to a custom reporter module |
 | `--fix`, `--fix-type`, `--allow-remove-files`, `--format` | as knip for exports, types, default exports, dependencies (package.json rewritten in its own indentation) and files; `--format` accepted, no formatter run |
 | `--no-progress`, `--debug`, `--performance`, `--memory`, `--trace*`, `--duration` | accepted, no output |
-| `--cache`, `--cache-location`, `--watch`, `--use-tsconfig-files`, `--preprocessor`, `--cycles` | accepted, no effect |
+| `--cache`, `--cache-location` | accepted; vknip has no cache (its full run is faster than knip's cached one) |
+| `--watch`, `--use-tsconfig-files`, `--preprocessor`, `--cycles` | accepted, no effect (see Gaps) |
 | `--jobs N` | vknip only: parser threads |
 
 knip 6 has no `--include-libs` (it was removed upstream), so there is nothing to port.
@@ -127,19 +137,21 @@ each plugin and writes its enablers, config file patterns, entry, production and
 and contributes its config files, entry, production and project patterns. What a plugin finds by
 running its `resolveConfig` (reading the loaded config) is ported plugin by plugin:
 
-- **Ported** (config read, as knip's resolveConfig/resolveFromAST does): Vitest and Vite (projects,
-  workspaces, setup files, environments, coverage providers, `index.html` scripts, `resolve.alias`
-  into paths), Jest (presets, transforms, setup files, reporters, projects), Mocha, Ava, ESLint (legacy
-  configs, `extends`, plugins, parsers, settings), Prettier, Playwright, Storybook, Cypress, Changesets,
-  commitlint, semantic-release, PostCSS, Babel, release-it, Stylelint, tsup, tsdown, Rollup, Rolldown,
-  Rslib, esbuild, lint-staged, Nx (project.json targets, executors, commands), xo, nyc, Oxlint, remark,
-  mdxlint, unbuild, Angular (angular.json builders, options, files), Astro and Starlight, Turbo, plus
-  the hand-written ones: Node.js, TypeScript (each tsconfig: `extends`, `references`, `types`,
-  `plugins`, `importHelpers`, `jsxImportSource`), tsx, husky, MCP, GitHub Actions, Borp, TypeDoc.
-- **Patterns only** (97 plugins, among them Next.js, Nuxt, webpack, Svelte/SvelteKit, Docusaurus,
-  Remix, Karma, Gatsby, Expo): resolveConfig isn't ported; when such a plugin has a config file vknip
-  uses the plugin's default entry and production patterns instead (knip would use what the config
-  says, which for most projects is the default).
+- **Ported**: what 160 of the 202 plugins do (resolveConfig, resolveFromAST, resolve and visitors,
+  as far as each has them), among them Vite/Vitest, Next.js (config functions called with the build
+  phase; read from the AST when the config doesn't load), Nuxt (srcDir/app entries, modules, layers,
+  aliases, `.nuxt` types and paths), webpack and Rspack and Rsbuild (config, rule and entry functions
+  called by the node process, loaders, ProvidePlugin, aliases), Docusaurus, SvelteKit, React Router
+  (routes.ts loaded), Expo and Expo Router, Storybook, Jest, ESLint (legacy and flat configs), Karma,
+  Electron Forge, Serverless, GraphQL Codegen, Prisma, Metro, Tauri, Netlify, Wrangler, Drizzle and
+  the small ones; `filterTransitiveDependencies` (Prettier, Oxlint, Metro,
+  webpack); configs that only re-export a package aren't loaded (`isExternalReExportsOnly`).
+- **Partly ported** (42): some part isn't, listed in the coverage table at the end: the custom
+  element and `styleUrls` visitors (Angular, Lit, Stencil, FAST, Catalyst, which need decorators the
+  parser keeps only in the linter's mode), and the resolveConfig of Lefthook, tsdown, Bun, Eleventy,
+  Gatsby, textlint, Relay, rstest, Storybook's AST part, xo's AST part, Quasar, Qwik, Marko, mise,
+  moonrepo, Taskfile, Nx's executors, and a dozen rarely used ones. Where resolveConfig isn't ported
+  and the plugin has a config file, its default entry patterns are used.
 - **Compilers**: `.vue` (scripts, `src` imports, scss `<style>` imports), `.svelte`, `.astro`
   (frontmatter, scripts, styles), `.mdx`, `.css` with Tailwind (`@import`, `@plugin`, `@config`,
   `@source`...) and `.scss`/`.sass` (`@use`, `@import`, `@forward`, `url()`), `.prisma`, each enabled
@@ -160,38 +172,55 @@ node-tar) and 3 pnpm monorepos with JavaScript and TypeScript configs loaded thr
 7 workspaces, its own `knip.json`; changesets/changesets: 24 workspaces, 24 JS/TS config files;
 unjs/unhead: 28 workspaces, 57 config files, Vue, Svelte, React, Nuxt and Angular packages). knip ran with the project's own configuration.
 
-Baseline of this round (corpus fetched again with `test/fetch_corpus.sh`, knip 6.44.1 run again; its
-default output was the same as the cached one for all 23 projects):
+After this round (knip3; baseline in parentheses: the corpus fetched again with
+`test/fetch_corpus.sh`, knip 6.44.1 run again, its default output the same as the cached one):
 
 | reporter | identical runs |
 |---|---:|
-| default (symbols), stdout + stderr + exit code | 21/23 |
-| `--reporter json` (issues compared as a set where knip's own order varies, see below) | 21/23 |
+| default (symbols), stdout + stderr + exit code | 23/23 (21) |
+| `--reporter json` | 23/23 (21) |
+| `--reporter compact` | 23/23 (21) |
+| `--reporter markdown` | 23/23 (21) |
+| `--reporter disclosure` | 23/23 (20) |
+| `--reporter github-actions` | 23/23 (not implemented) |
+| `--reporter sarif` | 23/23 (not implemented) |
+| `--reporter codeclimate` | 23/23 (not implemented) |
+| `--reporter codeowners` | 1/23 (stderr is knip's crash; stdout and exit code 22/23, see below) |
 
 | issue type | knip found | vknip: same | missing | extra |
 |---|---:|---:|---:|---:|
-| Unused files | 948 | 948 | 0 | 4 |
+| Unused files | 948 | 948 | 0 (0) | 0 (4) |
 | Unused dependencies | 19 | 19 | 0 | 0 |
-| Unused devDependencies | 75 | 75 | 0 | 3 |
+| Unused devDependencies | 75 | 75 | 0 | 0 (3) |
 | Referenced optional peerDependencies | 3 | 3 | 0 | 0 |
 | Unlisted dependencies | 58 | 58 | 0 | 0 |
 | Unlisted binaries | 7 | 7 | 0 | 0 |
 | Unresolved imports | 6 | 6 | 0 | 0 |
-| Unused exports | 262 | 183 | 79 | 1 |
-| Unused exported types | 170 | 165 | 5 | 1 |
+| Unused exports | 262 | 262 | 0 (79) | 0 (1) |
+| Unused exported types | 170 | 170 | 0 (5) | 0 (1) |
 | Duplicate exports | 11 | 11 | 0 | 0 |
 
-knip's JSON lists the files in the order its asynchronous directory crawler meets them, which changes
-from run to run (three runs on uvu gave three different orders); its default report sorts them. So
-JSON runs whose issues are the same but in another order count as identical (`cmp_corpus.py` says so).
+What the baseline differences were:
 
-The two different projects:
+- **unhead** (79 exports, 5 types, 4 files, 2 devDependencies): a Vitest project config
+  (`bench/vitest.config.ts`) aliased `@unhead/schema-org` to `path.resolve(__dirname, ...)`; the
+  absolute path was joined as if it were relative, so the alias never matched, the schema-org and vue
+  sources it reached looked unused, and their exports weren't reported. Absolute paths in loaded
+  configs are now made project-relative by the loader. The rest was Nuxt: its resolveConfig (ported:
+  `app/app.vue` of a fixture was an entry) and the load error knip prints for a Nuxt config whose
+  tsconfig extends a `.nuxt` file that doesn't exist.
+- **changesets** (1 devDependency): unplugin-icons' `resolve()` ignores `@iconify-json/*`; the
+  `await using` declarations that caused the rest before were already parsed by `ts/parse.vu`.
 
-- **changesets**: `@iconify-json/logos`, which knip's unplugin-icons plugin ignores (its `resolve()`).
-  The `await using` declarations that caused the other differences are parsed now (`ts/parse.vu`).
-- **unhead**: Nuxt's auto-imports (knip's Nuxt plugin registers a compiler that adds the imports Nuxt
-  generates) and Nuxt's config, which knip loads and vknip doesn't (79 missing exports, in Nuxt-facing
-  packages), and the error knip prints when a Nuxt config fails to load.
+Orders knip doesn't keep: its JSON, markdown and codeclimate reports list unused files in the order
+its asynchronous directory crawler meets them, which changes from run to run (three runs on uvu gave
+three different orders); its default report sorts them. Runs whose issues are the same but in another
+order count as identical (`cmp_corpus.py` labels them). The compact and codeowners reporters sort with
+comparators that aren't consistent for equal paths (`a > b ? 1 : -1`), so the order they print depends
+on V8's TimSort steps: `jssort.vu` reproduces V8's algorithm (checked against node on 300 arrays of up
+to 3,000 items). codeowners: knip crashes with a stack trace when `.github/CODEOWNERS` is missing (21
+projects) and with a TypeError on changesets (an empty issue group); vknip prints the same
+`Error: ENOENT ...` line and exit code for the first, and the report for the second.
 
 The previous single-package corpus (the 20 libraries above plus microsoft/vscode, see git history of
 this file) is unchanged: vscode was 12,666 of 12,667 lines identical before this work; it wasn't re-run
@@ -202,10 +231,12 @@ this file) is unchanged: vscode was 12,666 of 12,667 lines identical before this
 | set | what | identical |
 |---|---|---:|
 | `cases.py`, `cases2.py`, `random_cases.py` | the graph, exports, dependencies, scripts (first rewrite) | 82/82 |
-| `cases3.py` | configuration files (JSON, JSONC, package.json, TS and JS configs, functions), the schema, workspaces (npm, yarn, pnpm, nested, ignored), `--workspace` selectors and their errors, the flags, every reporter, rules, hints, exit codes | 84/84 runs |
-| `cases4.py` | plugins: Vitest projects and workspaces, Jest, ESLint, Playwright, Storybook, Cypress, Nx, commitlint, lint-staged, Babel, PostCSS, Next.js (fallback), config load errors | 25/25 runs |
-| `cases5.py` | `--fix` and `--fix-type` on fresh copies, the files compared byte for byte after the fix | 21/21 runs |
-| `cases6.py` | catalogs, compilers (Vue, Svelte, MDX, CSS/Tailwind, SCSS), yarn nested globs, `ignoreWorkspaces`, tags | 15/15 runs |
+| `cases3.py` | configuration files, the schema, workspaces, `--workspace`, the flags, every reporter, rules, hints, exit codes | 84/84 runs |
+| `cases4.py` | plugins (first ports), config load errors | 25/25 runs |
+| `cases5.py` | `--fix` and `--fix-type`, files compared after the fix | 21/21 runs |
+| `cases6.py` | catalogs, compilers, yarn globs, `ignoreWorkspaces`, tags, `ignoreExportsUsedInFile` | 18/18 runs |
+| `cases7.py` | the plugins ported in this round (Next.js, webpack, Nuxt, flat ESLint, Expo, Docusaurus, SvelteKit, React Router, Rsbuild, Karma, Serverless, 40 more), with `--production` | 46/46 runs |
+| `cases8.py` | the visitors: mocks, execa/zx/nano-spawn, `import.meta.glob`, `require.context`, fs glob, pino, knex | 9/9 runs |
 
 Attack rounds (each a new set of cases or a new real project, then fixes until it passed):
 
@@ -225,55 +256,89 @@ Attack rounds (each a new set of cases or a new real project, then fixes until i
    added no entries at all; it now uses its default entries; Storybook and Cypress ported. This
    round found nothing else.
 
+7. Corpus again (knip3 baseline): absolute paths from loaded configs (79 missing exports in unhead);
+   Nuxt's resolveConfig; plugin `resolve()` ignores; a plugin's own ignores gave "Remove from
+   ignoreUnresolved" hints.
+8. Reporters on the corpus: compact and codeowners orders (V8 TimSort), duplicates joined with ", " in
+   disclosure, codeowners with no CODEOWNERS file; then github-actions (the unconfigured hints are the
+   symbols reporter's own), codeclimate (exports analyzed in the graph's order), sarif.
+9. Plugins (cases7, written per plugin from knip's sources, 46 runs): a workspace's own package name
+   in a plugin input resolved through vknip's workspace map where node's resolver (knip's) doesn't;
+   Nuxt `alias` folders are checked from the working folder; an Astro frontmatter of two `---` lines
+   crashed vknip (slice out of bounds); a YAML config knip can't parse loads in vknip (see Gaps).
+10. Visitors (cases8): `?raw` `import.meta.glob` files are program files (used, exports analyzed).
+11. `ignoreExportsUsedInFile` (3 cases with every reference position): found nothing.
+12. Speed: the new code showed in callgrind (see Benchmark); fixed, then the corpus, reporters and
+    all generated sets again: nothing.
+
 ## Benchmark
 
 CPU time (user + system of the process and everything it waited for, so vknip's node process that
-loads JavaScript configs counts, and so do both of its threads) and wall time, best of 3 runs each,
-release build (`./vu build`, -O3), knip 6.44.1 on Node 22. The machine has 2 cores shared with other
-jobs and its load average was 24 to 27 during the run, so **wall times are inflated about tenfold and
-noisy**; CPU times are the fair comparison. knip's startup alone costs about 0.7 s of CPU.
+loads JavaScript configs counts, and both of its threads), best of 3 runs for knip 6.44.1 (Node 22),
+best of 5 for vknip (release build), measured in this round on the 2-core machine shared with other
+jobs (load average 1.1 to 1.5 during the runs). "before" is vknip at the start of the round (e9b2fe3),
+run interleaved with the current one.
 
-| project | files | knip CPU s | vknip CPU s | CPU ratio | knip wall s | vknip wall s |
-|---|---:|---:|---:|---:|---:|---:|
-| chalk | 20 | 1.09 | 0.011 | 98x | 8.60 | 0.098 |
-| defu | 9 | 1.14 | 0.011 | 108x | 10.85 | 0.108 |
-| dequal | 9 | 1.04 | 0.008 | 130x | 9.98 | 0.082 |
-| execa | 639 | 1.62 | 0.035 | 46x | 17.50 | 0.364 |
-| express | 142 | 1.80 | 0.042 | 43x | 18.65 | 0.380 |
-| fastify | 304 | 3.75 | 0.116 | 32x | 37.35 | 1.340 |
-| got | 98 | 2.73 | 0.126 | 22x | 28.86 | 1.248 |
-| kleur | 13 | 1.17 | 0.009 | 134x | 12.46 | 0.077 |
-| klona | 37 | 1.15 | 0.008 | 139x | 11.40 | 0.081 |
-| koa | 82 | 1.80 | 0.024 | 76x | 19.32 | 0.200 |
-| ky | 98 | 2.17 | 0.058 | 38x | 16.83 | 0.541 |
-| mitt | 3 | 1.06 | 0.011 | 100x | 7.32 | 0.100 |
-| node-glob | 59 | 1.25 | 0.015 | 84x | 9.69 | 0.143 |
-| node-lru-cache | 49 | 1.20 | 0.013 | 89x | 10.14 | 0.086 |
-| node-tar | 73 | 1.53 | 0.025 | 61x | 14.79 | 0.248 |
-| p-queue | 17 | 1.51 | 0.021 | 71x | 14.68 | 0.217 |
-| scule | 4 | 1.11 | 0.012 | 94x | 9.38 | 0.078 |
-| superjson | 20 | 1.24 | 0.015 | 83x | 9.82 | 0.136 |
-| uncrypto | 5 | 1.03 | 0.009 | 110x | 7.25 | 0.079 |
-| uvu | 93 | 1.17 | 0.012 | 94x | 9.38 | 0.124 |
-| knip | 4678 | 6.02 | 0.633 | 10x | 50.99 | 5.264 |
-| changesets | 164 | 3.35 | 0.570 | 6x | 24.68 | 4.594 |
-| unhead | 860 | 12.59 | 6.397 | 2x | 103.23 | 56.700 |
+| project | files | knip CPU s | vknip CPU s | CPU ratio | vknip before CPU s |
+|---|---:|---:|---:|---:|---:|
+| chalk | 20 | 1.00 | 0.011 | 91x | 0.010 |
+| defu | 9 | 1.02 | 0.010 | 102x | 0.010 |
+| dequal | 9 | 0.89 | 0.007 | 127x | 0.007 |
+| execa | 639 | 1.34 | 0.036 | 37x | 0.035 |
+| kleur | 13 | 0.93 | 0.009 | 103x | 0.009 |
+| klona | 37 | 0.97 | 0.008 | 121x | 0.008 |
+| ky | 98 | 1.71 | 0.053 | 32x | 0.056 |
+| mitt | 3 | 0.96 | 0.010 | 96x | 0.010 |
+| node-lru-cache | 49 | 1.01 | 0.013 | 78x | 0.013 |
+| p-queue | 17 | 1.29 | 0.021 | 61x | 0.020 |
+| scule | 4 | 0.95 | 0.011 | 86x | 0.012 |
+| superjson | 20 | 1.10 | 0.014 | 79x | 0.015 |
+| uncrypto | 5 | 0.96 | 0.010 | 96x | 0.010 |
+| uvu | 93 | 0.98 | 0.012 | 82x | 0.012 |
+| express | 142 | 1.57 | 0.035 | 45x | 0.036 |
+| fastify | 304 | 3.00 | 0.114 | 26x | 0.118 |
+| got | 98 | 2.40 | 0.096 | 25x | 0.101 |
+| koa | 82 | 1.34 | 0.022 | 61x | 0.023 |
+| node-glob | 59 | 1.14 | 0.013 | 88x | 0.013 |
+| node-tar | 73 | 1.21 | 0.023 | 53x | 0.023 |
+| changesets | 164 | 2.96 | 0.521 | 6x | 0.508 |
+| knip | 4678 | 4.24 | 0.590 | 7x | 0.565 |
+| unhead | 860 | 9.26 | 5.165 | 2x | 5.039 |
 
-On the monorepos much of vknip's time is node, which loads the JavaScript and TypeScript configs
-(measured in one separate run with a wrapper around `node`): on unhead its node processes (57 config
-files imported through jiti, with vite, nuxt and vitest behind them) took 5.9 of vknip's 6.7 CPU
-seconds, on changesets 0.42 of 0.79, on knip 0.21 of 1.23. The single-package projects load none.
+Against the start of the round the CPU time is the same within noise (total 6.65 s before, 6.80 s
+after; unhead, which now loads its Nuxt configs through node as knip does, 5.04 to 5.17 s). Instructions
+(callgrind, builds with `VU_MARCH=x86-64-v2`, one run each): node-glob 55.70 M before, 55.88 M after
+(+0.3%), fastify 548.4 M to 550.1 M (+0.3%), changesets 1,048.6 M to 1,057.6 M (+0.9%), knip
+2,259.5 M to 2,265.3 M (+0.3%); what was added is the visitors and the config reading this round
+ported. Two regressions the first measurement showed were fixed: the visitors searched each file's
+source with memmem for a dozen names (now they look the names up in the parser's interned names), and
+filterTransitiveDependencies read the JSON schema an `.oxlintrc.json` names on every run (now only
+when a dependency could become optional), which had made node-glob 2.5 times slower.
 
 ## Gaps
 
-- **resolveConfig** of 97 plugins (Next.js, Nuxt, webpack, SvelteKit, Docusaurus, Remix, Karma, ...):
-  default entries are used instead of the config's; Nuxt's auto-import compiler.
-- `ignoreExportsUsedInFile`, fixes of enum and namespace members and of catalog entries, published type
-  dependencies of non-private packages, less and stylus compilers, custom `compilers` in the
-  configuration, cycles (`--cycles`).
-- `--cache`, `--watch`, `--trace*`, `--performance`, the `github-actions`, `sarif` and `codeclimate`
-  reporters, custom reporter and preprocessor modules.
-- vscode wasn't re-measured after the workspace rewrite.
+- **Plugins**: 42 of 202 have a part not ported (the coverage table lists which): the custom element
+  and `styleUrls` visitors (Angular, Lit, Stencil, FAST, Catalyst: the parser keeps decorators only in
+  vlint's mode), and the resolveConfig or resolveFromAST of Lefthook, tsdown, Bun, Eleventy, Gatsby,
+  textlint, Relay, rstest, Storybook (AST part), xo (AST part), Quasar, Qwik, Marko, mise, moonrepo,
+  Taskfile, Nx executors, Astro Markdoc, Capacitor, filesystem-routing, Flue, Ladle, LintHTML,
+  Lunaria, Nest, npm-package-json-lint, OpenClaw, osls, Playwright CT, Railway, Raycast, React Cosmos,
+  @solidjs/vite-plugin, TypeScript Content Mapper, Varlock, vite-plugin-pages and
+  vite-plugin-vue-layouts-next. Their default entry patterns are used.
+- **Nuxt and Vue auto-imports**: knip's compilers that add the imports Nuxt (`.nuxt/imports.d.ts`,
+  `components.d.ts`) and unplugin-auto-import / unplugin-vue-components generate, including template
+  tags and identifiers read with `vue/compiler-sfc`. Without `.nuxt` (as in the corpus, installed
+  with `--ignore-scripts`) knip's compilers add nothing, so the corpus doesn't show it.
+- `--cycles` and the `cycles` reporter and config; custom `compilers`; less and stylus compilers;
+  custom reporter and preprocessor modules; `--watch`; `--trace*` and `--performance` output;
+  fixes of enum and namespace members and of catalog entries; published type dependencies of
+  non-private packages.
+- A YAML config knip's parser rejects (say an implicit map key) loads in vknip instead of giving
+  knip's "Error loading ..." message.
+- The JSON, markdown and codeclimate reporters list unused files in vknip's crawl order (by depth,
+  folder by folder, names sorted), knip in its asynchronous crawler's order, which varies.
+- vscode wasn't re-measured: with the 23-project corpus installed the disk had about 1.4 GB free, and
+  its checkout with dependencies wasn't fetched (how much it needs wasn't measured).
 
 ## Tests
 
@@ -286,211 +351,212 @@ YAML reader against the `yaml` package (102 files of the corpus, identical).
 
 ## Plugin coverage
 
-"tested on" names the generated cases and the corpus projects whose dependencies enable the plugin
-(plugins enabled by files aren't detected this way: GitHub Actions ran on all 23 projects, which all have
-workflows).
+Generated from knip's plugin list and vknip's code (`tools/plugtab.py`): what each
+plugin has (resolveConfig, resolveFromAST, resolve, visitors) and whether vknip ports it. "tested on"
+names the generated cases and the corpus projects whose dependencies enable the plugin. 160 plugins
+are complete, 42 have a part not ported.
 
 | plugin | status | tested on |
 |---|---|---|
-| Angular (`angular`) | ported | unhead |
-| Astro (`astro`) | ported | knip |
+| Angular (`angular`) | resolveConfig ported; visitors NOT ported | unhead |
+| Astro (`astro`) | resolveFromAST ported; resolve ported | generated; knip |
 | Astro DB (`astro-db`) | complete (static plugin) |  |
-| Astro Markdoc (`astro-markdoc`) | patterns; resolveConfig not ported (default entries used) |  |
-| astro-og-canvas (`astro-og-canvas`) | patterns; resolve() not ported |  |
-| Ava (`ava`) | ported | ky, uvu |
-| Babel (`babel`) | ported | generated; uvu |
-| Biome (`biome`) | patterns; resolveConfig not ported (default entries used) |  |
+| Astro Markdoc (`astro-markdoc`) | resolveConfig NOT ported |  |
+| astro-og-canvas (`astro-og-canvas`) | resolve ported |  |
+| Ava (`ava`) | resolveConfig ported | ky, uvu |
+| Babel (`babel`) | resolveConfig ported | generated; uvu |
+| Biome (`biome`) | resolveConfig ported |  |
 | Borp (`borp`) | ported (hand-written) | fastify |
-| Buf (`buf`) | patterns; resolveConfig not ported (default entries used) |  |
+| Buf (`buf`) | resolveConfig ported |  |
 | bumpp (`bumpp`) | complete (static plugin) | unhead |
-| Bun (`bun`) | patterns; resolveConfig not ported (default entries used) |  |
-| c8 (`c8`) | complete (static plugin) |  |
-| Capacitor (`capacitor`) | patterns; resolveConfig not ported (default entries used) |  |
-| Catalyst (`catalyst`) | complete (static plugin) |  |
+| Bun (`bun`) | resolveConfig NOT ported; resolve NOT ported |  |
+| c8 (`c8`) | complete (static plugin) | generated |
+| Capacitor (`capacitor`) | resolveConfig NOT ported |  |
+| Catalyst (`catalyst`) | visitors NOT ported |  |
 | Changelogen (`changelogen`) | complete (static plugin) | defu, scule, uncrypto |
 | Changelogithub (`changelogithub`) | complete (static plugin) |  |
-| Changesets (`changesets`) | ported | generated; changesets |
-| Commitizen (`commitizen`) | patterns; resolveConfig not ported (default entries used) |  |
-| commitlint (`commitlint`) | ported | generated |
-| Convex (`convex`) | patterns; resolveConfig not ported (default entries used) |  |
+| Changesets (`changesets`) | resolveConfig ported | generated; changesets |
+| Commitizen (`commitizen`) | resolveConfig ported | generated |
+| commitlint (`commitlint`) | resolveConfig ported | generated |
+| Convex (`convex`) | resolveConfig ported | generated |
 | create-typescript-app (`create-typescript-app`) | complete (static plugin) |  |
-| CSpell (`cspell`) | patterns; resolveConfig not ported (default entries used) |  |
-| Cucumber (`cucumber`) | patterns; resolveConfig not ported (default entries used) |  |
-| Cypress (`cypress`) | ported | generated |
+| CSpell (`cspell`) | resolveConfig ported | generated |
+| Cucumber (`cucumber`) | resolveConfig ported |  |
+| Cypress (`cypress`) | resolveConfig ported | generated |
 | Danger (`danger`) | complete (static plugin) |  |
 | dependency-cruiser (`dependency-cruiser`) | complete (static plugin) |  |
-| Docusaurus (`docusaurus`) | patterns; resolveConfig not ported (default entries used) |  |
-| dotenv (`dotenv`) | complete (static plugin) |  |
-| Drizzle (`drizzle`) | patterns; resolveConfig not ported (default entries used) |  |
-| Electron Forge (`electron-forge`) | patterns; resolveConfig not ported (default entries used) |  |
-| electron-vite (`electron-vite`) | patterns; resolveConfig not ported (default entries used) |  |
-| Eleventy (`eleventy`) | patterns; resolveConfig not ported (default entries used) |  |
-| esbuild (`esbuild`) | ported | node-glob, node-lru-cache, node-tar, unhead +1 |
-| ESLint (`eslint`) | ported | generated; changesets, express, fastify, mitt +3 |
+| Docusaurus (`docusaurus`) | resolveConfig ported; resolve ported | generated |
+| dotenv (`dotenv`) | complete (static plugin) | generated |
+| Drizzle (`drizzle`) | resolveConfig ported |  |
+| Electron Forge (`electron-forge`) | resolveConfig ported |  |
+| electron-vite (`electron-vite`) | resolveConfig ported | generated |
+| Eleventy (`eleventy`) | resolveConfig NOT ported |  |
+| esbuild (`esbuild`) | resolveFromAST ported | generated; node-glob, node-lru-cache, node-tar, unhead +1 |
+| ESLint (`eslint`) | resolveConfig ported; resolveFromAST ported | generated; changesets, express, fastify, mitt +3 |
 | eve (`eve`) | complete (static plugin) |  |
-| execa (`execa`) | complete (static plugin) | chalk |
-| Expo (`expo`) | patterns; resolveConfig not ported (default entries used) |  |
-| Expo Router (`expo-router`) | patterns; resolveConfig not ported (default entries used) |  |
+| execa (`execa`) | visitors ported | generated; chalk |
+| Expo (`expo`) | resolveConfig ported; resolve ported | generated |
+| Expo Router (`expo-router`) | resolveConfig ported | generated |
 | Expressive Code (`expressive-code`) | complete (static plugin) | knip |
-| FAST (`fast`) | complete (static plugin) |  |
-| filesystem-routing (`filesystem-routing`) | patterns; resolveConfig not ported (default entries used) |  |
-| Flue (`flue`) | patterns; resolveConfig not ported (default entries used) |  |
+| FAST (`fast`) | visitors NOT ported |  |
+| filesystem-routing (`filesystem-routing`) | resolveFromAST NOT ported |  |
+| Flue (`flue`) | resolveFromAST NOT ported |  |
 | Fumadocs (`fumadocs`) | complete (static plugin) |  |
-| Gatsby (`gatsby`) | patterns; resolveConfig not ported (default entries used) |  |
-| GitHub Action (`github-action`) | patterns; resolveConfig not ported (default entries used) |  |
-| GitHub Actions (`github-actions`) | ported (hand-written) | all 23 corpus projects |
+| Gatsby (`gatsby`) | resolveConfig NOT ported |  |
+| GitHub Action (`github-action`) | resolveConfig ported | generated |
+| GitHub Actions (`github-actions`) | ported (hand-written) |  |
 | glob (`glob`) | complete (static plugin) |  |
-| GraphQL Codegen (`graphql-codegen`) | patterns; resolveConfig not ported (default entries used) |  |
-| Hardhat (`hardhat`) | patterns; resolve() not ported |  |
-| husky (`husky`) | ported (hand-written) |  |
+| GraphQL Codegen (`graphql-codegen`) | resolveConfig ported |  |
+| Hardhat (`hardhat`) | resolve ported |  |
+| husky (`husky`) | ported (hand-written) | generated |
 | i18next Parser (`i18next-parser`) | complete (static plugin) |  |
-| Jasmine (`jasmine`) | patterns; resolveConfig not ported (default entries used) |  |
-| Jest (`jest`) | ported | generated; uvu |
-| Karma (`karma`) | patterns; resolveConfig not ported (default entries used) |  |
-| Knex (`knex`) | patterns; resolveConfig not ported (default entries used) |  |
+| Jasmine (`jasmine`) | resolveConfig ported | generated |
+| Jest (`jest`) | resolveConfig ported; visitors ported | generated; uvu |
+| Karma (`karma`) | resolveConfig ported | generated |
+| Knex (`knex`) | resolveConfig ported; visitors ported | generated |
 | kysely-codegen (`kysely-codegen`) | complete (static plugin) |  |
-| Ladle (`ladle`) | patterns; resolveConfig not ported (default entries used) |  |
-| laravel-vite-plugin (`laravel-vite-plugin`) | patterns; resolveConfig not ported (default entries used) |  |
-| Lefthook (`lefthook`) | patterns; resolveConfig not ported (default entries used) |  |
+| Ladle (`ladle`) | resolveConfig NOT ported |  |
+| laravel-vite-plugin (`laravel-vite-plugin`) | resolveFromAST ported | generated |
+| Lefthook (`lefthook`) | resolveConfig NOT ported |  |
 | Lingui (`lingui`) | complete (static plugin) |  |
-| lint-staged (`lint-staged`) | ported | generated; changesets |
-| LintHTML (`linthtml`) | patterns; resolveConfig not ported (default entries used) |  |
-| Lit (`lit`) | complete (static plugin) |  |
+| lint-staged (`lint-staged`) | resolveConfig ported | generated; changesets |
+| LintHTML (`linthtml`) | resolveConfig NOT ported |  |
+| Lit (`lit`) | visitors NOT ported |  |
 | lockfile-lint (`lockfile-lint`) | complete (static plugin) |  |
 | Lost Pixel (`lost-pixel`) | complete (static plugin) |  |
-| Lunaria (`lunaria`) | patterns; resolveConfig not ported (default entries used) |  |
-| markdownlint (`markdownlint`) | patterns; resolveConfig not ported (default entries used) | generated; fastify |
-| Marko (`marko`) | patterns; resolveConfig not ported (default entries used) |  |
+| Lunaria (`lunaria`) | resolveConfig NOT ported |  |
+| markdownlint (`markdownlint`) | resolveConfig ported | generated; fastify |
+| Marko (`marko`) | resolveConfig NOT ported |  |
 | Mastra (`mastra`) | complete (static plugin) |  |
 | MCP (`mcp`) | ported (hand-written) |  |
-| MDX (`mdx`) | patterns; resolveConfig not ported (default entries used) | knip |
-| mdxlint (`mdxlint`) | ported | knip |
-| Metro (`metro`) | patterns; resolveConfig not ported (default entries used) |  |
-| mise (`mise`) | patterns; resolveConfig not ported (default entries used) |  |
-| Mocha (`mocha`) | ported | generated; express, mitt, uvu |
-| moonrepo (`moonrepo`) | patterns; resolveConfig not ported (default entries used) |  |
-| Mock Service Worker (`msw`) | patterns; resolveConfig not ported (default entries used) |  |
-| nano-spawn (`nano-spawn`) | complete (static plugin) |  |
-| Nano Staged (`nano-staged`) | patterns; resolveConfig not ported (default entries used) |  |
-| Nest (`nest`) | patterns; resolveConfig not ported (default entries used) |  |
-| Netlify (`netlify`) | patterns; resolveConfig not ported (default entries used) |  |
-| Next.js (`next`) | patterns; resolveConfig not ported (default entries used) | generated |
+| MDX (`mdx`) | resolveConfig ported | generated; knip |
+| mdxlint (`mdxlint`) | resolveConfig ported | knip |
+| Metro (`metro`) | resolveConfig ported | generated |
+| mise (`mise`) | resolveConfig NOT ported |  |
+| Mocha (`mocha`) | resolveConfig ported | generated; express, mitt, uvu |
+| moonrepo (`moonrepo`) | resolveConfig NOT ported |  |
+| Mock Service Worker (`msw`) | resolveConfig ported | generated |
+| nano-spawn (`nano-spawn`) | visitors ported | generated |
+| Nano Staged (`nano-staged`) | resolveConfig ported | generated |
+| Nest (`nest`) | resolveConfig NOT ported |  |
+| Netlify (`netlify`) | resolveConfig ported |  |
+| Next.js (`next`) | resolveConfig ported; resolveFromAST ported | generated |
 | next-intl (`next-intl`) | complete (static plugin) |  |
-| Next.js MDX (`next-mdx`) | patterns; resolveConfig not ported (default entries used) |  |
-| Nitro (`nitro`) | patterns; resolveConfig not ported (default entries used) |  |
-| Node.js (`node`) | ported |  |
+| Next.js MDX (`next-mdx`) | resolveFromAST ported |  |
+| Nitro (`nitro`) | resolveConfig ported; resolve ported |  |
+| Node.js (`node`) | ported (hand-written); visitors ported |  |
 | node-modules-inspector (`node-modules-inspector`) | complete (static plugin) |  |
 | nodemon (`nodemon`) | complete (static plugin) |  |
-| npm-package-json-lint (`npm-package-json-lint`) | patterns; resolveConfig not ported (default entries used) |  |
-| Nuxt (`nuxt`) | patterns; resolveConfig not ported (default entries used) | unhead |
+| npm-package-json-lint (`npm-package-json-lint`) | resolveConfig NOT ported |  |
+| Nuxt (`nuxt`) | resolveConfig ported; resolve ported | generated; unhead |
 | @nuxtjs/i18n (`nuxtjs-i18n`) | complete (static plugin) |  |
-| Nx (`nx`) | ported | generated |
-| nyc (`nyc`) | ported | express |
-| oclif (`oclif`) | patterns; resolveConfig not ported (default entries used) |  |
+| Nx (`nx`) | resolveConfig ported; resolve NOT ported | generated |
+| nyc (`nyc`) | resolveConfig ported | express |
+| oclif (`oclif`) | resolveConfig ported | generated |
 | openapi-ts (`openapi-ts`) | complete (static plugin) |  |
-| OpenClaw (`openclaw`) | patterns; resolveConfig not ported (default entries used) |  |
-| orval (`orval`) | patterns; resolveConfig not ported (default entries used) |  |
-| osls (`osls`) | patterns; resolveConfig not ported (default entries used) |  |
+| OpenClaw (`openclaw`) | resolveConfig NOT ported; resolveFromAST NOT ported |  |
+| orval (`orval`) | resolveFromAST ported | generated |
+| osls (`osls`) | resolveConfig NOT ported |  |
 | Oxfmt (`oxfmt`) | complete (static plugin) | changesets, defu, knip |
-| Oxlint (`oxlint`) | ported | defu, knip, node-glob, node-lru-cache +1 |
-| Panda CSS (`panda-css`) | patterns; resolveConfig not ported (default entries used) |  |
-| Parcel (`parcel`) | patterns; resolveConfig not ported (default entries used) |  |
-| Payload CMS (`payload`) | patterns; resolveConfig not ported (default entries used) |  |
-| pino (`pino`) | complete (static plugin) | fastify |
-| Playwright (`playwright`) | ported | generated; unhead |
-| Playwright for components (`playwright-ct`) | patterns; resolveConfig not ported (default entries used) |  |
+| Oxlint (`oxlint`) | resolveConfig ported | defu, knip, node-glob, node-lru-cache +1 |
+| Panda CSS (`panda-css`) | resolveConfig ported |  |
+| Parcel (`parcel`) | resolveConfig ported | generated |
+| Payload CMS (`payload`) | resolveConfig ported | generated |
+| pino (`pino`) | visitors ported | generated; fastify |
+| Playwright (`playwright`) | resolveConfig ported | generated; unhead |
+| Playwright for components (`playwright-ct`) | resolveConfig NOT ported |  |
 | playwright-test (`playwright-test`) | complete (static plugin) |  |
 | Plop (`plop`) | complete (static plugin) |  |
-| pm2 (`pm2`) | patterns; resolveConfig not ported (default entries used) |  |
-| pnpm (`pnpm`) | patterns; resolveConfig not ported (default entries used) | generated |
-| PostCSS (`postcss`) | ported | generated |
-| pre-commit (`pre-commit`) | patterns; resolve() not ported |  |
-| Preconstruct (`preconstruct`) | patterns; resolveConfig not ported (default entries used) |  |
-| Prettier (`prettier`) | ported | generated; knip, mitt, node-glob, node-lru-cache +3 |
-| Prisma (`prisma`) | patterns; resolveConfig not ported (default entries used) |  |
+| pm2 (`pm2`) | resolveConfig ported | generated |
+| pnpm (`pnpm`) | resolveConfig ported | generated |
+| PostCSS (`postcss`) | resolveConfig ported | generated |
+| pre-commit (`pre-commit`) | resolve ported | generated |
+| Preconstruct (`preconstruct`) | resolveConfig ported | generated |
+| Prettier (`prettier`) | resolveConfig ported | generated; knip, mitt, node-glob, node-lru-cache +3 |
+| Prisma (`prisma`) | resolveConfig ported | generated |
 | PurgeCSS (`purgecss`) | complete (static plugin) |  |
-| Quasar (`quasar`) | patterns; resolveConfig not ported (default entries used) |  |
-| Qwik (`qwik`) | patterns; resolveConfig not ported (default entries used) |  |
-| Railway (`railway`) | patterns; resolveConfig not ported (default entries used) |  |
-| Raycast (`raycast`) | patterns; resolveConfig not ported (default entries used) |  |
-| React Cosmos (`react-cosmos`) | patterns; resolveConfig not ported (default entries used) |  |
+| Quasar (`quasar`) | resolveFromAST NOT ported |  |
+| Qwik (`qwik`) | resolveFromAST NOT ported |  |
+| Railway (`railway`) | resolveFromAST NOT ported |  |
+| Raycast (`raycast`) | resolveConfig NOT ported |  |
+| React Cosmos (`react-cosmos`) | resolveConfig NOT ported |  |
 | React Email (`react-email`) | complete (static plugin) |  |
-| React Native (`react-native`) | patterns; resolveConfig not ported (default entries used) |  |
-| React Router (`react-router`) | patterns; resolveConfig not ported (default entries used) |  |
-| Relay (`relay`) | patterns; resolveConfig not ported (default entries used) |  |
-| Release It! (`release-it`) | ported | generated; knip |
-| Remark (`remark`) | ported | knip |
+| React Native (`react-native`) | resolveConfig ported; resolve ported | generated |
+| React Router (`react-router`) | resolveConfig ported | generated |
+| Relay (`relay`) | resolveConfig NOT ported |  |
+| Release It! (`release-it`) | resolveConfig ported | generated; knip |
+| Remark (`remark`) | resolveConfig ported | knip |
 | Remix (`remix`) | complete (static plugin) |  |
-| Rolldown (`rolldown`) | ported | knip, unhead |
-| Rollup (`rollup`) | ported | unhead |
-| Rsbuild (`rsbuild`) | patterns; resolveConfig not ported (default entries used) |  |
-| Rslib (`rslib`) | ported |  |
-| Rspack (`rspack`) | patterns; resolveConfig not ported (default entries used) |  |
-| Rstest (`rstest`) | patterns; resolveConfig not ported (default entries used) |  |
+| Rolldown (`rolldown`) | resolveFromAST ported | knip, unhead |
+| Rollup (`rollup`) | resolveFromAST ported | unhead |
+| Rsbuild (`rsbuild`) | resolveConfig ported |  |
+| Rslib (`rslib`) | resolveFromAST ported |  |
+| Rspack (`rspack`) | resolveConfig ported; visitors ported | generated |
+| Rstest (`rstest`) | resolveConfig NOT ported; visitors ported |  |
 | Sanity (`sanity`) | complete (static plugin) |  |
-| Semantic Release (`semantic-release`) | ported | generated |
+| Semantic Release (`semantic-release`) | resolveConfig ported | generated |
 | Sentry (`sentry`) | complete (static plugin) |  |
-| Serverless Framework (`serverless-framework`) | patterns; resolveConfig not ported (default entries used) |  |
-| simple-git-hooks (`simple-git-hooks`) | patterns; resolveConfig not ported (default entries used) |  |
-| size-limit (`size-limit`) | patterns; resolve() not ported |  |
-| @solidjs/vite-plugin (`solidjs-vite-plugin`) | patterns; resolveConfig not ported (default entries used) |  |
-| SST (`sst`) | patterns; resolveConfig not ported (default entries used) |  |
-| Starlight (`starlight`) | ported | knip |
-| Stencil (`stencil`) | patterns; resolveConfig not ported (default entries used) |  |
-| Storybook (`storybook`) | ported | generated |
-| Stryker (`stryker`) | patterns; resolveConfig not ported (default entries used) |  |
-| Stylelint (`stylelint`) | ported | generated |
+| Serverless Framework (`serverless-framework`) | resolveConfig ported |  |
+| simple-git-hooks (`simple-git-hooks`) | resolveConfig ported | generated |
+| size-limit (`size-limit`) | resolve ported |  |
+| @solidjs/vite-plugin (`solidjs-vite-plugin`) | resolveFromAST NOT ported |  |
+| SST (`sst`) | resolveFromAST ported | generated |
+| Starlight (`starlight`) | resolveFromAST ported | knip |
+| Stencil (`stencil`) | resolveFromAST ported; visitors NOT ported |  |
+| Storybook (`storybook`) | resolveConfig ported; resolveFromAST NOT ported | generated |
+| Stryker (`stryker`) | resolveConfig ported |  |
+| Stylelint (`stylelint`) | resolveConfig ported | generated |
 | Svelte (`svelte`) | complete (static plugin) | generated; unhead, uvu |
 | @sveltejs/package (`sveltejs-package`) | complete (static plugin) |  |
-| SvelteKit (`sveltekit`) | patterns; resolveConfig not ported (default entries used) |  |
+| SvelteKit (`sveltekit`) | resolveFromAST ported | generated |
 | SVGO (`svgo`) | complete (static plugin) |  |
-| SVGR (`svgr`) | patterns; resolveConfig not ported (default entries used) |  |
-| SWC (`swc`) | patterns; resolveConfig not ported (default entries used) |  |
+| SVGR (`svgr`) | resolveConfig ported |  |
+| SWC (`swc`) | resolveConfig ported |  |
 | Syncpack (`syncpack`) | complete (static plugin) |  |
 | Tailwind (`tailwind`) | complete (static plugin) | unhead |
-| TanStack Router (`tanstack-router`) | patterns; resolveConfig not ported (default entries used) |  |
-| Taskfile (`taskfile`) | patterns; resolveConfig not ported (default entries used) |  |
-| Tauri (`tauri`) | patterns; resolveConfig not ported (default entries used) |  |
+| TanStack Router (`tanstack-router`) | resolveConfig ported |  |
+| Taskfile (`taskfile`) | resolveConfig NOT ported |  |
+| Tauri (`tauri`) | resolveConfig ported |  |
 | Temporal.io (`temporal`) | complete (static plugin) |  |
-| textlint (`textlint`) | patterns; resolveConfig not ported (default entries used) |  |
-| Travis CI (`travis`) | patterns; resolveConfig not ported (default entries used) |  |
-| ts-node (`ts-node`) | complete (static plugin) |  |
-| tsd (`tsd`) | patterns; resolveConfig not ported (default entries used) |  |
-| tsdown (`tsdown`) | patterns; resolveConfig not ported (default entries used) | changesets |
-| tsrs (`tsrs`) | patterns; resolveConfig not ported (default entries used) |  |
-| tsup (`tsup`) | ported | generated |
-| tsx (`tsx`) | ported (hand-written) |  |
-| Turborepo (`turbo`) | ported |  |
+| textlint (`textlint`) | resolveConfig NOT ported |  |
+| Travis CI (`travis`) | resolveConfig ported |  |
+| ts-node (`ts-node`) | complete (static plugin) | generated |
+| tsd (`tsd`) | resolveConfig ported | generated |
+| tsdown (`tsdown`) | resolveConfig NOT ported; resolveFromAST ported | changesets |
+| tsrs (`tsrs`) | ported (hand-written) |  |
+| tsup (`tsup`) | resolveConfig ported; resolveFromAST ported | generated |
+| tsx (`tsx`) | ported (hand-written) | generated |
+| Turborepo (`turbo`) | resolve ported |  |
 | TypeDoc (`typedoc`) | ported (hand-written) | node-glob, node-lru-cache, node-tar |
 | TypeScript (`typescript`) | ported (hand-written) | generated; chalk, changesets, defu, execa +10 |
-| TypeScript Content Mapper (`typescript-content-mapper`) | patterns; resolveConfig not ported (default entries used) |  |
-| unbuild (`unbuild`) | ported | defu, scule, uncrypto, unhead |
+| TypeScript Content Mapper (`typescript-content-mapper`) | resolveConfig NOT ported |  |
+| unbuild (`unbuild`) | resolveConfig ported | defu, scule, uncrypto, unhead |
 | UnoCSS (`unocss`) | complete (static plugin) |  |
 | unplugin-auto-import (`unplugin-auto-import`) | complete (static plugin) | unhead |
-| unplugin-icons (`unplugin-icons`) | patterns; resolve() not ported | changesets |
+| unplugin-icons (`unplugin-icons`) | resolve ported | generated; changesets |
 | unplugin-vue-components (`unplugin-vue-components`) | complete (static plugin) | unhead |
 | @intlify/unplugin-vue-i18n (`unplugin-vue-i18n`) | complete (static plugin) |  |
 | unplugin-vue-markdown (`unplugin-vue-markdown`) | complete (static plugin) |  |
 | unplugin-vue-router (`unplugin-vue-router`) | complete (static plugin) | unhead |
-| Varlock (`varlock`) | patterns; resolve() not ported |  |
+| Varlock (`varlock`) | resolve NOT ported |  |
 | Vercel (`vercel`) | complete (static plugin) |  |
 | Vercel OG (`vercel-og`) | complete (static plugin) |  |
 | Vike (`vike`) | complete (static plugin) |  |
-| Vite (`vite`) | ported | generated; changesets, defu, scule, superjson +2 |
-| vite-plugin-pages (`vite-plugin-pages`) | patterns; resolveConfig not ported (default entries used) |  |
-| vite-plugin-pwa (`vite-plugin-pwa`) | patterns; resolveConfig not ported (default entries used) |  |
-| vite-plugin-vue-layouts-next (`vite-plugin-vue-layouts-next`) | patterns; resolveConfig not ported (default entries used) |  |
-| vite-plus (`vite-plus`) | patterns; resolveConfig not ported (default entries used) |  |
+| Vite (`vite`) | resolveConfig ported; resolveFromAST ported; resolve ported; visitors ported | generated; changesets, defu, scule, superjson +2 |
+| vite-plugin-pages (`vite-plugin-pages`) | resolveFromAST NOT ported; resolve ported |  |
+| vite-plugin-pwa (`vite-plugin-pwa`) | resolveFromAST ported | generated |
+| vite-plugin-vue-layouts-next (`vite-plugin-vue-layouts-next`) | resolveFromAST NOT ported |  |
+| vite-plus (`vite-plus`) | resolveFromAST ported | generated |
 | @vite-pwa/assets-generator (`vite-pwa-assets-generator`) | complete (static plugin) |  |
 | VitePress (`vitepress`) | complete (static plugin) | changesets |
-| Vitest (`vitest`) | ported | generated; changesets, defu, scule, superjson +2 |
-| Vue (`vue`) | patterns; resolveConfig not ported (default entries used) | generated; changesets, unhead |
-| WebdriverIO (`webdriver-io`) | patterns; resolveConfig not ported (default entries used) |  |
-| webpack (`webpack`) | patterns; resolveConfig not ported (default entries used) | knip, unhead |
-| Wireit (`wireit`) | patterns; resolveConfig not ported (default entries used) |  |
-| Wrangler (`wrangler`) | patterns; resolveConfig not ported (default entries used) |  |
-| WXT (`wxt`) | patterns; resolveConfig not ported (default entries used) |  |
-| xo (`xo`) | ported | chalk, execa, got, ky +1 |
-| Yarn (`yarn`) | patterns; resolveConfig not ported (default entries used) |  |
-| yorkie (`yorkie`) | patterns; resolveConfig not ported (default entries used) |  |
-| zx (`zx`) | complete (static plugin) |  |
+| Vitest (`vitest`) | resolveConfig ported; visitors ported | generated; changesets, defu, scule, superjson +2 |
+| Vue (`vue`) | resolveConfig ported | generated; changesets, unhead |
+| WebdriverIO (`webdriver-io`) | resolveConfig ported |  |
+| webpack (`webpack`) | resolveConfig ported; visitors ported | generated; knip, unhead |
+| Wireit (`wireit`) | resolveConfig ported | generated |
+| Wrangler (`wrangler`) | resolveConfig ported | generated |
+| WXT (`wxt`) | resolveConfig ported | generated |
+| xo (`xo`) | resolveConfig ported; resolveFromAST NOT ported | chalk, execa, got, ky +1 |
+| Yarn (`yarn`) | resolveConfig ported |  |
+| yorkie (`yorkie`) | resolveConfig ported | generated |
+| zx (`zx`) | visitors ported | generated |
