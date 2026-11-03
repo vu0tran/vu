@@ -186,6 +186,7 @@ type Proj:
   has_override: Bool
   git_remotes: [Str]         # (railway: git config remote urls of the project)
   catalog_used: {Str: Bool}  # catalog entries ("catalog:package") inputs refer to (pnpm dlx x@catalog:)
+  abs_root: Str              # the project folder as an absolute path (for specifiers knip shows absolute)
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -1009,7 +1010,10 @@ fn handle_input(var p: Proj, fs: Fs, inp: Input) -> Str:
     add_issue(&p, i)
   elif not is_ignored_path(p, target, false):
     if inp.kind != I_DEFER_ENTRY and inp.kind != I_CONFIG:
-      var i = issue("unresolved", inp.file, spec)
+      var shown = spec + ""
+      # ("/x" is project-relative here; knip shows the absolute path)
+      if spec.startswith("/") and not fs.exists(spec): shown = "\t" + spec
+      var i = issue("unresolved", inp.file, shown)
       i.ws = p.ws[p.cur].name + ""
       add_issue(&p, i)
   return ""
@@ -2160,6 +2164,7 @@ fn load_mode(key: Str) -> Str:
   if key == "react-router" or key == "rsbuild" or key == "docusaurus" or key == "electron-forge" or key == "electron-vite": return key + ""
   if key == "simple-git-hooks": return "call0"
   if key == "gatsby" or key == "eleventy" or key == "storybook" or key == "rstest": return key + ""
+  if key == "jest": return "call0"
   if key == "rspack": return "webpack"
   return "plain"
 
@@ -2800,7 +2805,7 @@ fn resolve_config(var p: Proj, fs: Fs, os: Os, key: Str, f: Str, v: Value):
   let cfg_dir = resolve.dirname(f)
   let wdir = p.ws[p.cur].dir + ""
   if key == "vite" or key == "vitest": vite_config(&p, fs, key, f, v)
-  elif key == "jest": jest_config(&p, fs, f, v)
+  elif key == "jest": jest_config(&p, fs, os, f, v)
   elif key == "rstest": rstest_config(&p, fs, os, f, v)
   elif key == "astro-markdoc":
     var items: [Value] = []
@@ -3132,9 +3137,7 @@ fn resolve_config(var p: Proj, fs: Fs, os: Os, key: Str, f: Str, v: Value):
   elif key == "nyc":
     for e in arrayify(pkg.get(v, "extends")): in_dep(&p, e, f, false)
     for r in arrayify(pkg.get(v, "require")): in_defer(&p, r, f, "", false)
-  elif key == "oxlint":
-    for e in arrayify(pkg.get(v, "extends")):
-      if is_internal_spec(e): in_config(&p, "oxlint", e, f, "")
+  elif key == "oxlint": oxlint_ext(&p, v, f)
   elif key == "angular": angular_config(&p, fs, f, v)
   elif key == "storybook": storybook_config(&p, f, v)
   elif key == "cypress": cypress_config(&p, f, v)
@@ -3966,6 +3969,25 @@ fn eslint_settings(v: Value) -> [Str]:
         for n in pkg.keys(s): out.push(n + "")
   return out
 
+# plugins/oxlint resolveExtendedConfig
+fn oxlint_ext(var p: Proj, v: Value, f: Str):
+  let dir = resolve.dirname(f)
+  for e in pkg.items(pkg.get(v, "extends")):
+    if pkg.is_text(e): in_config(&p, "oxlint", to_abs(pkg.str_of(e), pabs(dir)), f, "")
+    else: oxlint_ext(&p, e, f)
+  oxlint_js_plugins(&p, pkg.get(v, "jsPlugins"), f)
+  for o in pkg.items(pkg.get(v, "overrides")):
+    oxlint_js_plugins(&p, pkg.get(o, "jsPlugins"), f)
+    for d in eslint_settings(pkg.get(o, "settings")): in_defer(&p, d, f, "", true)
+  for d in eslint_settings(pkg.get(v, "settings")): in_defer(&p, d, f, "", true)
+
+fn oxlint_js_plugins(var p: Proj, v: Value, f: Str):
+  for pl in pkg.items(v):
+    var spec = pkg.str_of(pl)
+    if pkg.is_obj(pl): spec = pkg.str_of(pkg.get(pl, "specifier"))
+    if not is_internal_spec(spec): in_dep(&p, spec, f, false)
+    else: in_entry(&p, to_abs(spec, pabs(resolve.dirname(f))), f, false, false)
+
 fn resolver_names(v: Value) -> [Str]:
   if pkg.is_text(v): return [pkg.str_of(v)]
   if is_arr(v):
@@ -4011,91 +4033,175 @@ fn playwright_config(var p: Proj, f: Str, v: Value):
     if sc_ != "": d = resolve.join(cdir, sc_)
     add_script_inputs(&p, [cmd], f, true, dir_of_input(d), false)
 
-fn jest_config(var p: Proj, fs: Fs, f: Str, v: Value):
+fn jest_config(var p: Proj, fs: Fs, os: Os, f: Str, v: Value):
   let cdir = resolve.dirname(f)
-  var root = cdir + ""
+  var root = pabs(cdir)
   let rd = pkg.str_of(pkg.get(v, "rootDir"))
-  if rd != "": root = resolve.join(cdir, rd)
-  let tm = arrayify(pkg.get(v, "testMatch"))
+  if rd != "": root = to_abs(rd, pabs(cdir))
+  let before = p.inputs.len
+  jest_deps(&p, fs, os, v, root, f)
+  var deps: [Input] = []
+  while p.inputs.len > before:
+    deps.push(scripts.cp(p.inputs[p.inputs.len - 1]))
+    p.inputs.truncate(p.inputs.len - 1)
   if json.has(v, "testMatch"):
-    for t in tm: in_entry(&p, jest_root(t, root), f, false, false)
+    for t in arrayify(pkg.get(v, "testMatch")): in_entry(&p, jest_rr(t, root), f, false, false)
     if not p.no_entries:
       in_entry(&p, "**/__mocks__/**/*.[jt]s?(x)", f, false, false)
   else:
-    for t in pentry(p, "jest"): in_entry(&p, t, f, false, false)
-  jest_deps(&p, v, root, f)
+    for t in ["**/__tests__/**/*.?(c|m)[jt]s?(x)", "**/?(*.)+(spec|test).?(c|m)[jt]s?(x)", "**/__mocks__/**/*.[jt]s?(x)"]: in_entry(&p, t, f, false, false)
+  var k = deps.len - 1
+  while k >= 0:
+    var d = scripts.cp(deps[k])
+    d.spec = jest_norm(jest_rr(d.spec, root))
+    p.inputs.push(d)
+    k -= 1
 
-fn jest_root(s: Str, root: Str) -> Str:
-  if s.find("<rootDir>") < 0: return s + ""
-  return "/" + resolve.norm(s.replace("<rootDir>", root))
+# replaceRootDir (the first <rootDir>) with an absolute ("/x") root
+fn jest_rr(s: Str, root: Str) -> Str:
+  let i = s.find("<rootDir>")
+  if i < 0: return s + ""
+  var r = root + ""
+  if r == "/": r = ""
+  return s[0..i] + r + s[i + 9..s.len]
 
-fn jest_prefixed(prefix: Str, name: Str) -> Str:
-  if name.startswith(".") or name.startswith("/") or name.startswith("<rootDir>"): return name + ""
-  if name.startswith(prefix) or name.find("/" + prefix) >= 0: return name + ""
-  return prefix + name
+# path.posix.normalize
+fn jest_norm(s: Str) -> Str:
+  if s == "": return "."
+  let abs = s.startswith("/")
+  let trail = s.endswith("/")
+  var parts: [Str] = []
+  for x in s.split("/"):
+    if x == "" or x == ".": continue
+    if x == "..":
+      if parts.len > 0 and parts[parts.len - 1] != "..": parts.truncate(parts.len - 1)
+      elif not abs: parts.push("..")
+      continue
+    parts.push(x + "")
+  var out = "/".join(parts)
+  if abs: out = "/" + out
+  if out == "": out = "."
+  if trail and out != "/": out = out + "/"
+  return out
 
-fn jest_deps(var p: Proj, v: Value, root: Str, f: Str):
+# resolveWithPrefix: prefix + id when that resolves from rootDir
+fn jest_prefixed(var p: Proj, fs: Fs, prefix: Str, id: Str, root: Str) -> Str:
+  let r = resolve.resolve(&p.rs, fs, prefix + id, resolve.join(arel(root), "file.ts"))
+  if r.kind != R_UNRESOLVED: return prefix + id
+  return id + ""
+
+fn first_of(v: Value) -> Str:
+  if is_arr(v):
+    let xs = pkg.items(v)
+    if xs.len > 0: return pkg.str_of(xs[0])
+    return ""
+  return pkg.str_of(v)
+
+fn jest_deps(var p: Proj, fs: Fs, os: Os, v0: Value, root: Str, f: Str):
+  let cdir = resolve.dirname(f)
+  var v = json.copy(v0)
+  let preset0 = pkg.str_of(pkg.get(v, "preset"))
+  if preset0 != "" and is_internal_spec(preset0):
+    let pc = jest_preset_config(&p, fs, os, arel(to_abs(preset0, pabs(cdir))), 0)
+    if pkg.is_obj(pc): v = obj_merge(pc, v)
   var ids: [Str] = []
   let preset = pkg.str_of(pkg.get(v, "preset"))
   if preset != "":
     if is_internal_spec(preset): ids.push(preset)
     else: ids.push(resolve.join(preset, "jest-preset"))
+  for d in ids: add_defer(&p, d, f)
+  ids = []
   for pr in pkg.items(pkg.get(v, "projects")):
-    if pkg.is_obj(pr): jest_deps(&p, pr, root, f)
+    if pkg.is_text(pr):
+      let pat = arel(jest_rr(pkg.str_of(pr), root))
+      let wdir = p.ws[p.cur].dir + ""
+      for file in glob_fs(p, fs, [prepend(wdir, pat), prepend(wdir, resolve.join(pat, "jest.config.{{js,ts,mjs,mts,cjs,cts,json}}"))]):
+        let e = resolve.extname(file)
+        if e == ".js" or e == ".ts" or e == ".mjs" or e == ".mts" or e == ".cjs" or e == ".cts" or e == ".json": in_config(&p, "jest", "/" + file, f, "")
+    elif pkg.is_obj(pr): jest_deps(&p, fs, os, pr, root, f)
   let runner = pkg.get(v, "runner")
-  if pkg.is_text(runner): ids.push(jest_prefixed("jest-runner-", pkg.str_of(runner)))
+  if pkg.truthy(runner): ids.push(jest_prefixed(&p, fs, "jest-runner-", first_of(runner), root))
   let rt = pkg.str_of(pkg.get(v, "runtime"))
   if rt != "" and rt != "jest-circus": ids.push(rt)
+  for d in ids: add_defer(&p, d, f)
+  ids = []
   let env = pkg.str_of(pkg.get(v, "testEnvironment"))
   if env == "node": in_dep(&p, "jest-environment-node", f, true)
-  elif env == "jsdom": ids.push("jest-environment-jsdom")
-  elif env != "": ids.push(jest_prefixed("jest-environment-", env))
+  elif env == "jsdom": add_defer(&p, "jest-environment-jsdom", f)
+  elif env != "":
+    let je = jest_prefixed(&p, fs, "jest-environment-", env, root)
+    add_defer(&p, je, f)
   let res = pkg.str_of(pkg.get(v, "resolver"))
   if res != "": ids.push(res)
+  var junit: [Str] = []
   for r in pkg.items(pkg.get(v, "reporters")):
-    var n = pkg.str_of(r)
-    if is_arr(r):
-      let xs = pkg.items(r)
-      if xs.len > 0: n = pkg.str_of(xs[0])
-    if n != "" and n != "default" and n != "github-actions" and n != "summary": ids.push(n)
-  for w in pkg.items(pkg.get(v, "watchPlugins")):
-    var n = pkg.str_of(w)
-    if is_arr(w):
-      let xs = pkg.items(w)
-      if xs.len > 0: n = pkg.str_of(xs[0])
-    if n != "": ids.push(jest_prefixed("jest-watch-", n))
+    if not pkg.is_text(r) and first_of(r) == "jest-junit":
+      let o = pkg.items(r)
+      if o.len > 1:
+        let c = o[1]
+        if pkg.truthy(pkg.get(c, "testCasePropertiesFile")):
+          var fname = "junitProperties.js"
+          if pkg.is_text(pkg.get(c, "testCasePropertiesFile")): fname = pkg.str_of(pkg.get(c, "testCasePropertiesFile"))
+          var dir = "/"
+          if pkg.is_text(pkg.get(c, "testCasePropertiesDirectory")): dir = pkg.str_of(pkg.get(c, "testCasePropertiesDirectory"))
+          junit.push(jest_norm(dir + "/" + fname))
+        if pkg.truthy(pkg.get(c, "testSuitePropertiesFile")):
+          var fname = "junitTestCaseProperties.js"
+          if pkg.is_text(pkg.get(c, "testSuitePropertiesFile")): fname = pkg.str_of(pkg.get(c, "testSuitePropertiesFile"))
+          var dir = "/"
+          if pkg.is_text(pkg.get(c, "testSuitePropertiesDirectory")): dir = pkg.str_of(pkg.get(c, "testSuitePropertiesDirectory"))
+          junit.push(jest_norm(dir + "/" + fname))
+  for r in pkg.items(pkg.get(v, "reporters")):
+    let n = first_of(r)
+    if n != "default" and n != "github-actions" and n != "summary": ids.push(n)
+  for x in junit: ids.push(x)
+  for w in pkg.items(pkg.get(v, "watchPlugins")): ids.push(jest_prefixed(&p, fs, "jest-watch-", first_of(w), root))
   for s in arrayify(pkg.get(v, "setupFiles")): ids.push(s)
   for s in arrayify(pkg.get(v, "setupFilesAfterEnv")): ids.push(s)
+  for d in ids: add_defer(&p, d, f)
+  ids = []
   for t in pkg.values(pkg.get(v, "transform")):
-    if pkg.is_text(t): ids.push(pkg.str_of(t))
+    if pkg.is_text(t): add_defer(&p, pkg.str_of(t), f)
     elif is_arr(t):
       let xs = pkg.items(t)
       if xs.len > 0:
         let n = pkg.str_of(xs[0])
-        ids.push(n)
-        if n == "babel-jest" and xs.len > 1: babel_deps(&p, xs[1], f)
+        add_defer(&p, n, f)
+        if n == "babel-jest" and xs.len > 1:
+          babel_deps(&p, xs[1], f)
+          let cf = pkg.get(xs[1], "configFile")
+          if pkg.is_text(cf):
+            let c = pkg.str_of(cf)
+            if c.find("<rootDir>") >= 0: in_config(&p, "babel", c, f, "")
+            else: in_config(&p, "babel", to_abs(c, pabs(p.ws[p.cur].dir)), f, "")
   for m in pkg.values(pkg.get(v, "moduleNameMapper")):
-    var n = pkg.str_of(m)
-    if is_arr(m):
-      let xs = pkg.items(m)
-      if xs.len > 0: n = pkg.str_of(xs[0])
-    if n == "" or has_dollar_digit(n): continue
+    let n = first_of(m)
+    if has_dollar_digit(n): continue
     ids.push(n)
   for k in ["testResultsProcessor", "snapshotResolver"]:
     let s = pkg.str_of(pkg.get(v, k))
     if s != "": ids.push(s)
   for s in arrayify(pkg.get(v, "snapshotSerializers")): ids.push(s)
   let ts = pkg.str_of(pkg.get(v, "testSequencer"))
-  if ts != "": ids.push(jest_prefixed("jest-sequencer-", ts))
+  if ts != "": ids.push(jest_prefixed(&p, fs, "jest-sequencer-", ts, root))
   for k in ["globalSetup", "globalTeardown"]:
     let s = pkg.str_of(pkg.get(v, k))
     if s != "": ids.push(s)
-  for id in ids:
-    var s = id + ""
-    if s.find("<rootDir>") >= 0: s = "/" + resolve.norm(s.replace("<rootDir>", root))
-    if s.startswith("/"):
-      in_defer(&p, "./" + s[1..s.len], f, ".", false)
-    else: add_defer(&p, resolve.norm(s), f)
+  for d in ids: add_defer(&p, d, f)
+
+# resolveExtensibleConfig: a preset file and the presets it extends
+fn jest_preset_config(var p: Proj, fs: Fs, os: Os, f: Str, depth: Int) -> Value:
+  if depth > 8: return json.Null
+  var c = json.Null
+  if f.endswith(".json"):
+    let text = fs.read(fspath(p, f)) else return json.Null
+    c = pkg.parse_jsonc(text)
+  else: c = quiet_load(&p, fs, os, "plain", f)
+  let pr = pkg.str_of(pkg.get(c, "preset"))
+  if pr != "" and is_internal_spec(pr):
+    let pc = jest_preset_config(&p, fs, os, arel(to_abs(pr, pabs(resolve.dirname(f)))), depth + 1)
+    if pkg.is_obj(pc): c = obj_merge(pc, c)
+  return c
 
 fn has_dollar_digit(s: Str) -> Bool:
   for k in 0..s.len - 1:
@@ -4190,8 +4296,10 @@ fn vite_config(var p: Proj, fs: Fs, key: Str, f: Str, v: Value):
           in_config(&p, "vitest", "/" + hit, f, ".")
           break
   var seen_roots: [Str] = []
+  var lints: [Value] = []
   for cfg in configs:
     let test = pkg.get(cfg, "test")
+    if pkg.truthy(pkg.get(cfg, "lint")) and "oxlint" in p.ws[p.cur].plugins: lints.push(pkg.get(cfg, "lint"))
     var vroot = wdir + ""
     let croot = pkg.str_of(pkg.get(cfg, "root"))
     if croot != "": vroot = resolve.join(wdir, croot)
@@ -4266,6 +4374,10 @@ fn vite_config(var p: Proj, fs: Fs, key: Str, f: Str, v: Value):
       for x in pkg.values(le):
         for y in pkg.strs(x): les.push(y + "")
     for s in les: in_entry(&p, "/" + resolve.join(vroot, s), f, false, false)
+  if lints.len > 0:
+    let before = p.inputs.len
+    for l in lints: oxlint_ext(&p, l, f)
+    if p.inputs.len > before: filter_transitive(&p, fs, f, before)
 
 fn vitest_deps(var p: Proj, cfg: Value, vroot: Str, f: Str):
   let t = pkg.get(cfg, "test")
@@ -6367,7 +6479,7 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {})
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "")
 
 fn config_error(msg: Str):
   eprint("ERROR: " + msg)
@@ -6656,6 +6768,17 @@ fn main(fs: Fs, os: Os):
         add_hint(&p, key + "-top-level", ident, "", "")
   unconfigured_hints(&p, n_analyzed, n_unused)
   apply_fixes(&p, fs, a)
+  # (project-relative "/x" specifiers knip shows as absolute paths: the folder as the OS has it)
+  for k in 0..p.issues.len:
+    if p.issues[k].symbol.startswith("\t"):
+      if p.abs_root == "":
+        var d = fspath(p, "")
+        if d == "": d = "."
+        let out = os.output(["sh", "-c", "cd \"$1\" && pwd -P", "sh", d]) else ""
+        p.abs_root = out.strip()
+      let sym = p.abs_root + p.issues[k].symbol[1..p.issues[k].symbol.len]
+      p.issues[k].symbol = sym + ""
+      if p.issues[k].display.startswith("\t"): p.issues[k].display = sym + ""
   # reporters
   var reporters = opts.strs_opt(a, "reporter")
   if reporters.len == 0: reporters = ["symbols"]
