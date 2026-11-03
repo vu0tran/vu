@@ -58,6 +58,13 @@ case "$tool" in
     ./vu build --release $static golint/main.vu -o "$out/vgolint"
     name="vgolint-$v-$goname"; readme=golint/README.md ;;
   vsc)
+    # Apple clang 17 crashes (a segfault in the compiler itself) on vsc's one big C file, on both
+    # macOS runners; Linux's clang 18 and gcc build it. On macOS, without CC set, vsc is built with
+    # Homebrew's gcc when the runner has one.
+    if [ "$os" = darwin ] && [ -z "${CC:-}" ]; then
+      for g in gcc-15 gcc-14 gcc-13; do command -v "$g" >/dev/null 2>&1 && { export CC="$g"; break; }; done
+      echo "build.sh: vsc on macOS with CC=${CC:-cc}"
+    fi
     ./vu build --release $static shellcheck/vsc.vu -o "$out/vsc"
     name="vsc-v$v.$scname"; folder="vsc-v$v"; readme=shellcheck/README.md; alias=shellcheck; ext=tar.xz ;;
   vjq)
