@@ -28,6 +28,7 @@ import marko
 import kcache
 import perf
 import term
+import stdio
 from json import Value
 from scripts import Input, Ctx, I_ENTRY, I_DEP, I_BIN, I_DEFER, I_DEFER_ENTRY, I_CONFIG, I_PROJECT, I_IGNORE, I_TRY, I_CATALOG
 from extract import Raw, Imp, Op, Exp, F_REEXPORT, F_TYPEONLY, F_ENTRY, F_BRIDGE, F_OPTIONAL, F_SIDEEFFECTS, F_OPAQUE, F_AUGMENT, F_DYNAMIC, F_LOADER
@@ -212,6 +213,7 @@ type Proj:
   list_links: fn(Str) -> [Str]
   realp: fn(Str) -> Str
   xdev: {Int: [Str]}         # (production) development entry patterns other workspaces gave
+  link_dirs: {Str: Bool}     # folder -> it's below a symbolic link
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -418,16 +420,26 @@ fn walk(var p: Proj, fs: Fs, dir: Str):
       p.files.push(f)
 
 # a resolved file whose path goes through a symbolic link: its real path in the project
-fn real_path(p: Proj, f: Str) -> Str:
+fn real_path(var p: Proj, f: Str) -> Str:
   if p.links.len == 0: return f + ""
-  var cur = f
+  if f in p.links: return real_path_of(p, f)
+  # (whether a folder is below a link, remembered per folder)
+  let d = resolve.dirname(f)
+  if d in p.link_dirs:
+    if not p.link_dirs[d]: return f + ""
+    return real_path_of(p, f)
+  var cur = d
   var through = false
   while cur != "":
     if cur in p.links:
       through = true
       break
     cur = resolve.dirname(cur)
+  p.link_dirs[d] = through
   if not through: return f + ""
+  return real_path_of(p, f)
+
+fn real_path_of(p: Proj, f: Str) -> Str:
   let abs = p.realp(fspath(p, f))
   let base = p.realp(fspath(p, "."))
   if abs == "" or base == "": return f + ""
@@ -498,10 +510,12 @@ fn crawl_order(own xs: [Str]) -> [Str]:
   if depth_sorted: return xs
   var back: {Str: Str} = {}
   for f in xs:
-    let parts = f.split("/")
-    var d = "{parts.len}"
-    while d.len < 6: d = "0" + d
-    let k = d + "\t" + "\t".join(parts)
+    var d = 1
+    for i in 0..f.len:
+      if f[i] == '/': d += 1
+    var ds = "{d}"
+    while ds.len < 6: ds = "0" + ds
+    let k = ds + "\t" + f.replace("/", "\t")
     keys.push(k + "")
     back[k] = f + ""
   keys.sort()
@@ -5396,6 +5410,10 @@ fn script_configs(p: Proj, plugin: Str) -> [Str]:
   var out: [Str] = []
   for i in p.inputs:
     if i.kind == I_CONFIG and i.plugin == plugin:
+      # (a package specifier a dependency handles isn't a file: webpack --config webpack/x.js)
+      if not is_internal_spec(i.spec) and is_joinable(i.spec):
+        let pn = pkg_from_spec(i.spec)
+        if pn != "" and has_dep(p.ws[input_ws(p, i)], pn): continue
       out.push(resolve.join(input_base(i), i.spec))
   return out
 
@@ -5963,6 +5981,8 @@ type Build:
   prefs: {Str: [Str]}        # "importer:file" -> the refs of the importer's imports of the file
   prex: {Str: {Str: Bool}}   # "importer:file" -> "a:" + reExportAs keys, "n:" + reExportNs keys
   texps: {Int: [[Str]]}      # file -> its exports: [name, members...]
+  tbind: {Int: [Str]}        # file -> its exports' bindings (extract's binds rows)
+  text: {Int: [[Str]]}       # file -> its re-exports of packages and builtins: [specifier, identifier, alias, type-only]
 
 fn add_entry(var b: Build, path: Str, skip: Bool, explicit: Bool):
   if resolve.in_node_modules(path) or not acc(b, path): return
@@ -5997,11 +6017,13 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
   var exts: [Ext] = []
   var ws_exts: [Ext] = []
   var unres: [Ext] = []
+  var xspec: [Str] = []           # (--trace) specifier \t how knip names a package or builtin
   for im in imps:
     let t_rs = pt(p)
     var r = resolve.resolve(&p.rs, fs, im.spec, path)
     pe(&p, "resolveModuleName", t_rs)
     let type_only = is_dts or (im.flags & F_TYPEONLY) != 0
+    if b.trace_on and r.kind != R_FILE: trace_ext(p, &b, id, im, r, type_only, &xspec)
     var spos = im.spos
     if spos < 0: spos = im.pos
     if r.kind == R_BUILTIN:
@@ -6010,7 +6032,7 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
     if (im.flags & F_AUGMENT) != 0 and (r.kind != R_FILE):
       if not (im.spec in targets): targets[im.spec] = -1
       continue
-    if r.kind == R_FILE and p.links.len > 0: r.path = real_path(p, r.path)
+    if r.kind == R_FILE and p.links.len > 0: r.path = real_path(&p, r.path)
     if r.kind == R_FILE or r.kind == R_EXTERNAL:
       let internal = r.kind == R_FILE
       if internal:
@@ -6066,7 +6088,17 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
     if o.exp and skip_exp: continue
     if not (o.spec in targets): continue
     let tid = targets[o.spec]
-    if tid < 0: continue
+    if tid < 0:
+      # (an imported binding exported again is a re-export of the package: oxc's indirect exports)
+      if b.trace_on and (o.kind == extract.OP_REEXPORT or o.kind == extract.OP_REEXPORTAS):
+        var xs = ""
+        for pair in xspec:
+          let f = pair.split("\t")
+          if f[0] == o.spec: xs = f[1] + ""
+        if xs != "":
+          if not (id in b.text): b.text[id] = []
+          b.text[id].push([xs, o.a + "", o.b + "", "0"])
+      continue
     apply_op(&b, tid, id, o)
   # unresolved imports that look like packages are external; the rest are reported
   for u in unres:
@@ -6096,6 +6128,7 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
   if gls.len > 0 and wi >= 0:
     let wdir = p.ws[wi].dir + ""
     for g in gls:
+      if g.startswith("\0"): continue
       # (addEntryPath with skipExportsAnalysis; the analyzed ones are program paths: reached, exports checked)
       let analyzed = g.startswith("analyze\t")
       for f in import_glob_files(p, fs, g, path, wdir):
@@ -6128,6 +6161,29 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
       let f = handle_input(&p, fs, y)
       if f != "": add_entry(&b, f, true, true)
     p.cur = saved
+
+# (--trace) a re-export of a package or a builtin, as knip's external and builtin import records
+fn trace_ext(p: Proj, var b: Build, id: Int, im: Imp, r: resolve.Res, type_only: Bool, var xspec: [Str]):
+  var spec = ""
+  var ident = im.ident + ""
+  var alias = im.alias + ""
+  if r.kind == R_BUILTIN:
+    spec = im.spec + ""
+    if not spec.startswith("node:"): spec = "node:" + spec
+    if ident == "": ident = "__side-effects"
+    if im.ns != "": alias = im.ns + ""
+  else:
+    if p.strict and type_only: return
+    spec = resolve.sanitize(im.spec)
+    if r.kind == R_EXTERNAL and r.pkg != "" and starts_like_pkg(r.pkg) and pkg_from_spec(spec) != r.pkg: spec = r.pkg + ""
+    if not starts_like_pkg(spec): return
+    if im.ns != "": alias = ""
+  xspec.push(im.spec + "\t" + spec)
+  if (im.flags & F_REEXPORT) == 0: return
+  var t = "0"
+  if type_only: t = "1"
+  if not (id in b.text): b.text[id] = []
+  b.text[id].push([spec, ident, alias, t])
 
 fn foreign_ext(e: Str) -> Bool:
   return " .avif .css .eot .gif .html .ico .jpeg .jpg .less .mp3 .otf .png .sass .scss .sh .styl .stylus .svg .ttf .webp .woff .woff2 .yaml .yml ".find(" " + e + " ") >= 0
@@ -8031,6 +8087,248 @@ fn import_kind(cs: [Cyc], tid: Int, c: Cyc) -> Str:
   if ident != "" and imp_as: return "importAs"
   return "import"
 
+# ---- resolveExportOrigins (graph-explorer/operations/resolve-export-origins.ts): where an export of a
+# file comes from through its re-exports and export stars; origins are "path \t identifier"
+
+type XR:
+  fwd_done: Bool
+  f_srcs: {Int: [Int]}        # file -> the files it imports, in order
+  f_rex: {Str: [Str]}         # "file \t source" -> names re-exported as they are ("*": a star)
+  f_rexas: {Str: [Str]}       # "file \t source" -> identifier \t alias
+  f_rexns: {Str: [Str]}       # "file \t source" -> namespaces
+  info: {Str: Bool}
+  i_node: {Str: Bool}
+  i_exps: {Str: [Str]}        # path -> its export names
+  i_exp: {Str: Bool}          # path \t name
+  i_bind: {Str: Str}
+  i_bre: {Str: Bool}
+  i_refs: {Str: [Str]}        # path \t name -> origins
+  i_terms: {Str: [Str]}
+  i_tnames: {Str: [Str]}      # path -> its terminal names, in order
+  i_stars: {Str: [Str]}
+  st_ix: {Str: Int}
+  st_path: [Str]
+  st_all: [Bool]
+  st_names: {Str: Bool}       # state \t name
+  ent: {Str: [Str]}           # state \t name -> origins
+  ent_x: {Str: Bool}          # state \t name -> hasExplicitExport
+  deps: {Int: [Int]}
+  e_star: {Str: Bool}         # source \t target
+  e_alias: {Str: [Str]}       # source \t target \t name -> target names
+  pend: {Int: [Str]}
+  upd: [Int]
+  dq_s: [Int]
+  dq_n: [Str]                 # "\0": all names
+
+fn new_xr() -> XR:
+  return XR(false, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, {}, {}, [], [], [])
+
+fn xr_push(var m: {Str: [Str]}, key: Str, v: Str):
+  if key in m:
+    if not opts.has(m[key], v): m[key].push(v + "")
+  else:
+    m[key] = [v + ""]
+
+# the files' internal re-exports, forward (knip's node.imports.internal), from the importers' maps
+fn xr_forward(b: Build, var x: XR):
+  x.fwd_done = true
+  for tid in 0..b.g.nodes.len:
+    if not b.g.nodes[tid].has_by: continue
+    let im = b.g.nodes[tid].imby
+    for name, srcs in im.rex:
+      for s in srcs: xr_push(&x.f_rex, "{s}\t{tid}", name)
+    for ident, m in im.rex_as:
+      for alias, srcs in m:
+        for s in srcs: xr_push(&x.f_rexas, "{s}\t{tid}", ident + "\t" + alias)
+    for ns, srcs in im.rex_ns:
+      for s in srcs: xr_push(&x.f_rexns, "{s}\t{tid}", ns)
+  for id in 0..b.g.nodes.len:
+    var seen: {Int: Bool} = {}
+    var out: [Int] = []
+    for c in b.g.nodes[id].cyc:
+      if not (c.tid in seen):
+        seen[c.tid] = true
+        out.push(c.tid)
+    if out.len > 0: x.f_srcs[id] = out
+
+fn xr_info(b: Build, var x: XR, path: Str):
+  if path in x.info: return
+  x.info[path] = true
+  if not (path in b.g.ids): return
+  let id = b.g.ids[path]
+  if not (id in b.texps): return
+  if not x.fwd_done: xr_forward(b, &x)
+  x.i_node[path] = true
+  var names: [Str] = []
+  for row in b.texps[id]:
+    names.push(row[0] + "")
+    x.i_exp[path + "\t" + row[0]] = true
+  x.i_exps[path] = names
+  if id in b.tbind:
+    for row in b.tbind[id]:
+      let f = row.split("\t")
+      if f.len < 3: continue
+      if f[1] != f[0]: x.i_bind[path + "\t" + f[0]] = f[1] + ""
+      if f[2] == "1": x.i_bre[path + "\t" + f[0]] = true
+  var tnames: [Str] = []
+  if id in x.f_srcs:
+    for tid in sc_ints(x.f_srcs[id]):
+      let sp = b.g.nodes[tid].path + ""
+      let k = "{id}\t{tid}"
+      if k in x.f_rex:
+        if opts.has(x.f_rex[k], "*"): xr_push(&x.i_stars, path, sp)
+      if k in x.f_rexns:
+        for ns in sc(x.f_rexns[k]):
+          let ek = path + "\t" + ns
+          if not (ek in x.i_exp) or ek in x.i_bre:
+            xr_push(&x.i_terms, ek, sp + "\t*")
+            if not opts.has(tnames, ns): tnames.push(ns + "")
+      if k in x.f_rex:
+        for name in sc(x.f_rex[k]):
+          if name != "*" and (path + "\t" + name) in x.i_bre: xr_push(&x.i_refs, path + "\t" + name, sp + "\t" + name)
+      if k in x.f_rexas:
+        for pair in sc(x.f_rexas[k]):
+          let f = pair.split("\t")
+          if (path + "\t" + f[1]) in x.i_bre: xr_push(&x.i_refs, path + "\t" + f[1], sp + "\t" + f[0])
+  if id in b.text:
+    for rec in b.text[id]:
+      let ident = rec[1] + ""
+      if ident == "": continue
+      var name = ident + ""
+      if rec[2] != "": name = rec[2] + ""
+      let ek = path + "\t" + name
+      let has_exp = ek in x.i_exp
+      if not has_exp and not (ident == "*" and rec[2] != ""): continue
+      if rec[3] == "1" and has_exp and not (ek in x.i_bre): continue
+      if ek in x.i_refs: continue
+      xr_push(&x.i_terms, ek, rec[0] + "\t" + ident)
+      if not opts.has(tnames, name): tnames.push(name + "")
+  x.i_tnames[path] = tnames
+
+fn xr_explicit(x: XR, path: Str, name: Str) -> Bool:
+  let k = path + "\t" + name
+  return k in x.i_exp or k in x.i_terms
+
+fn xr_request(b: Build, var x: XR, path: Str, name: Str) -> Int:
+  var si = -1
+  if path in x.st_ix: si = x.st_ix[path]
+  else:
+    xr_info(b, &x, path)
+    si = x.st_path.len
+    x.st_ix[path] = si
+    x.st_path.push(path + "")
+    x.st_all.push(false)
+  if x.st_all[si]: return si
+  if name != "\0" and ("{si}\t" + name) in x.st_names: return si
+  if name == "\0": x.st_all[si] = true
+  else: x.st_names["{si}\t" + name] = true
+  x.dq_s.push(si)
+  x.dq_n.push(name + "")
+  return si
+
+fn xr_merge(var x: XR, si: Int, name: Str, origins: [Str]):
+  let k = "{si}\t" + name
+  var changed = false
+  if not (k in x.ent):
+    x.ent[k] = sc(origins)
+    if xr_explicit(x, x.st_path[si], name): x.ent_x[k] = true
+    changed = origins.len > 0
+  else:
+    for o in origins:
+      if not opts.has(x.ent[k], o):
+        x.ent[k].push(o + "")
+        changed = true
+  if changed:
+    if not (si in x.pend) or x.pend[si].len == 0:
+      x.upd.push(si)
+      x.pend[si] = []
+    if not opts.has(x.pend[si], name): x.pend[si].push(name + "")
+
+fn xr_connect(var x: XR, src: Int, target: Int, sname: Str, tname: Str):
+  if src in x.deps:
+    if not (target in x.deps[src]): x.deps[src].push(target)
+  else:
+    x.deps[src] = [target]
+  if sname == "\0" or tname == "\0": x.e_star["{src}\t{target}"] = true
+  else: xr_push(&x.e_alias, "{src}\t{target}\t" + sname, tname)
+
+fn xr_seed(b: Build, var x: XR, si: Int, id: Str):
+  let path = x.st_path[si] + ""
+  let k = path + "\t" + id
+  if k in x.i_terms or k in x.i_exp:
+    var origins: [Str] = []
+    if k in x.i_terms: origins = sc(x.i_terms[k])
+    elif not (k in x.i_bre):
+      var bind = id + ""
+      if k in x.i_bind: bind = x.i_bind[k] + ""
+      origins.push(path + "\t" + bind)
+    xr_merge(&x, si, id, origins)
+  if k in x.i_refs:
+    for o in sc(x.i_refs[k]):
+      let f = o.split("\t")
+      let s2 = xr_request(b, &x, f[0], f[1])
+      xr_connect(&x, s2, si, f[1], id)
+
+fn xr_build(b: Build, var x: XR, path: Str, identifier: Str):
+  xr_request(b, &x, path, identifier)
+  var di = 0
+  while di < x.dq_s.len:
+    let si = x.dq_s[di]
+    let name = x.dq_n[di] + ""
+    di += 1
+    let sp = x.st_path[si] + ""
+    if name == "\0":
+      if sp in x.i_exps:
+        for id in sc(x.i_exps[sp]): xr_seed(b, &x, si, id)
+      if sp in x.i_tnames:
+        for id in sc(x.i_tnames[sp]):
+          if not ((sp + "\t" + id) in x.i_exp): xr_seed(b, &x, si, id)
+      if sp in x.i_stars:
+        for src in sc(x.i_stars[sp]):
+          let s2 = xr_request(b, &x, src, "\0")
+          xr_connect(&x, s2, si, "\0", "\0")
+    else:
+      xr_seed(b, &x, si, name)
+      if xr_explicit(x, sp, name) or name == "default": continue
+      if sp in x.i_stars:
+        for src in sc(x.i_stars[sp]):
+          let s2 = xr_request(b, &x, src, name)
+          xr_connect(&x, s2, si, "\0", "\0")
+  var ui = 0
+  while ui < x.upd.len:
+    let si = x.upd[ui]
+    ui += 1
+    var names: [Str] = []
+    if si in x.pend: names = sc(x.pend[si])
+    x.pend[si] = []
+    if not (si in x.deps): continue
+    for target in sc_ints(x.deps[si]):
+      for name in names:
+        let k = "{si}\t" + name
+        if not (k in x.ent): continue
+        let origins = sc(x.ent[k])
+        let tp = x.st_path[target] + ""
+        if ("{si}\t{target}") in x.e_star and name != "default" and not xr_explicit(x, tp, name) and (x.st_all[target] or ("{target}\t" + name) in x.st_names):
+          xr_merge(&x, target, name, origins)
+        let ak = "{si}\t{target}\t" + name
+        if ak in x.e_alias:
+          for alias in sc(x.e_alias[ak]): xr_merge(&x, target, alias, origins)
+
+# resolveExportOrigins: the origins and whether the file has the export itself
+fn export_origins(b: Build, path: Str, identifier: Str) -> [Str]:
+  var x = new_xr()
+  xr_build(b, &x, path, identifier)
+  var out: [Str] = []
+  let si = x.st_ix[path]
+  let k = "{si}\t" + identifier
+  if k in x.ent:
+    if k in x.ent_x: out.push("1")
+    else: out.push("0")
+    for o in x.ent[k]: out.push(o + "")
+  else:
+    out.push("0")
+  return out
+
 # ---- --trace, --trace-export, --trace-file, --trace-dependency (reporters/trace.ts)
 
 type TNode:
@@ -8169,6 +8467,39 @@ fn trace_exports(b: Build, file: Int) -> [Str]:
     for row in b.texps[file]: out.push(row[0] + "")
   return out
 
+# the exports' bindings from extract's set_bind events (knip's addExport: the binding is the first
+# one given, isBindingReExport the last): name \t binding \t 1 or 0
+fn bind_rows(evs: [Str]) -> [Str]:
+  var names: [Str] = []
+  var bind: {Str: Str} = {}
+  var bre: {Str: Bool} = {}
+  for e in evs:
+    if not e.startswith("\0"): continue
+    let f = e[1..e.len].split("\t")
+    let name = f[0] + ""
+    if not (name in bind):
+      bind[name] = name + ""
+      names.push(name + "")
+    if f.len < 4:
+      bre.remove(name)
+      continue
+    if f[3] == "1": bind[name] = f[1] + ""
+    if f[2] == "1": bre[name] = true
+  var out: [Str] = []
+  for n in names:
+    var fl = "0"
+    if n in bre: fl = "1"
+    out.push(n + "\t" + bind[n] + "\t" + fl)
+  return out
+
+# an export's local binding (knip's binding: the name unless extract recorded another)
+fn export_binding(b: Build, file: Int, name: Str) -> Str:
+  if file in b.tbind:
+    for row in b.tbind[file]:
+      let f = row.split("\t")
+      if f[0] == name: return f[1] + ""
+  return name + ""
+
 fn trace_has_export(b: Build, file: Int, name: Str) -> Bool:
   for x in trace_exports(b, file):
     if x == name: return true
@@ -8211,6 +8542,37 @@ fn trace_report(p: Proj, b: Build, a: opts.Args):
     if cand in b.gseen: fid = cand
   var trees: [Tree] = []
   if tfile == "" or fid >= 0: trees = trace_trees(b, fid, texp)
+  # (an export the file only has through export stars: its origins, ambiguous when several)
+  var rte = texp + ""
+  if texp.find(".") >= 0: rte = texp[0..texp.find(".")]
+  if tfile != "" and rte != "" and fid >= 0:
+    let res = export_origins(b, tfile, rte)
+    var orgs: [Str] = []
+    for k in 1..res.len: orgs.push(res[k] + "")
+    if rte != "default" and res[0] == "0" and orgs.len >= 2:
+      # (sorted by path, stably)
+      var sorted: [Str] = []
+      for o in orgs:
+        sorted.push(o + "")
+        var at = sorted.len - 1
+        while at > 0 and report.coll_cmp(p.coll, sorted[at].split("\t")[0], sorted[at - 1].split("\t")[0]) < 0:
+          sorted.swap(at, at - 1)
+          at -= 1
+      out(p, tfile + ":" + report.cyan_bright(rte) + " [ambiguous]")
+      for k in 0..sorted.len:
+        var conn = "├──"
+        if k == sorted.len - 1: conn = "└──"
+        let f = sorted[k].split("\t")
+        out(p, report.dim_(conn) + " " + f[0] + ":" + report.cyan_bright(f[1]))
+      return
+    if trees.len == 0 and res[0] == "0" and orgs.len == 1:
+      let f = orgs[0].split("\t")
+      if f[0] in b.g.ids and f[1] != "*" and f[1] != "default":
+        let ofid = b.g.ids[f[0]]
+        if ofid in b.texps:
+          for name in trace_exports(b, ofid):
+            if export_binding(b, ofid, name) == f[1]:
+              if trace_has_export(b, ofid, name): trees.push(trace_tree(b, ofid, name))
   # (a dotted name as a namespace member: Fruits.apple -> Fruits)
   if trees.len == 0 and texp.find(".") >= 0 and (tfile == "" or fid >= 0): trees = trace_trees(b, fid, texp[0..texp.find(".")])
   if trees.len == 0 and texp != "":
@@ -8549,7 +8911,7 @@ fn cpu_count(fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false, {}, own fn(d: Str) => [], own fn(x: Str) => "", {})
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false, {}, own fn(d: Str) => [], own fn(x: Str) => "", {}, {})
 
 # standard output and error with knip's colors, or without them
 fn out(p: Proj, s: Str):
@@ -8601,6 +8963,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     let w = term.columns(ffi, 1)
     if w > 0: p.cols = w
   p.tty = is_tty and not opts.flag(a, "no-progress") and not opts.flag(a, "debug")
+  # --watch: this process watches the files; each analysis runs in a child (VKNIP_WATCH_RUN)
+  if opts.flag(a, "watch") and os.env("VKNIP_WATCH_RUN") == "": watch_loop(&p, fs, os, ffi, opts.flag(a, "debug"))
   var pfn: [Str] = []
   if opts.has_str(a, "performance-fn"): pfn.push(opts.str_opt(a, "performance-fn"))
   p.pf = perf.new_perf(opts.flag(a, "performance"), pfn, opts.flag(a, "memory"), opts.flag(a, "memory-realtime"), opts.flag(a, "duration"), os.clock())
@@ -8759,7 +9123,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   swap(&p.dir_ws, &dws)
   # the workspaces, each with its entry and project files
   let trace_on = opts.flag(a, "trace") or opts.has_str(a, "trace-file") or opts.has_str(a, "trace-export") or opts.has_str(a, "trace-dependency")
-  var b = Build({}, Graph({}, []), {}, {}, {}, {}, {}, [], p.on["cycles"] or trace_on, [], {}, trace_on, {}, {}, {})
+  var b = Build({}, Graph({}, []), {}, {}, {}, {}, {}, [], p.on["cycles"] or trace_on, [], {}, trace_on, {}, {}, {}, {}, {})
   if p.config_file != "": add_entry(&b, p.config_file, true, true)
   let cli_inc_entry = opts.flag(a, "include-entry-exports")
   for wi in 0..p.ws.len:
@@ -8819,6 +9183,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     for w in p.ws:
       if pkg.truthy(w.ignore_in_file): want_refs = true
     if want_refs: utags.push("\0refs")
+    # (--trace: the exports' bindings, for resolveExportOrigins)
+    if trace_on: utags.push("\0binds")
     var comps: [Str] = []
     var pres: [Str] = []
     for x in paths:
@@ -8854,6 +9220,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
               if not parent: row.push(m.name + "")
             tx.push(row)
           b.texps[id] = tx
+          b.tbind[id] = bind_rows(b.g.nodes[id].raw.globs)
         if id in b.skip or not p.report_exports:
           b.g.nodes[id].raw.exps = []
           b.g.nodes[id].raw.dups = []
@@ -8989,6 +9356,11 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       data = json.copy(pkg.get(pkg.get(r, "ok"), "data"))
       pre_counters = json.copy(pkg.get(data, "counters"))
       data_to_proj(&p, data, ad)
+  # (an analysis of --watch: the watch reporter's lines, and the analyzed files' hashes)
+  let wstate = os.env("VKNIP_WATCH_RUN")
+  if wstate != "":
+    watch_report(&p, fs, b, n_analyzed, wstate)
+    exit(0)
   apply_fixes(&p, fs, os, a)
   # reporters
   var reporters = opts.strs_opt(a, "reporter")
@@ -9078,6 +9450,145 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   if opts.flag(a, "no-exit-code"): exit(0)
   if errors > max_issues or (not no_hints and treat_hints and p.hints.len > 0) or (not no_tag_hints and treat_tag_hints and p.tag_hints.len > 0): exit(1)
   exit(0)
+
+# ---- --watch (session/watch.js, reporters/watch.js)
+
+# FNV-1a of a file's text (hasChanged compares contents)
+fn text_hash(s: Str) -> Str:
+  var h = -3750763034362895579
+  var i = 0
+  while i + 8 <= s.len:
+    h = (h ^ s.read_le(i, 8)) *% 1099511628211
+    i += 8
+  while i < s.len:
+    h = (h ^ int(s[i])) *% 1099511628211
+    i += 1
+  return "{h}"
+
+# the watch reporter: each issue type's table (titled when several types are reported), then the
+# number of files and the time taken; the hashes of the analyzed files after a line "\0"
+fn watch_report(var p: Proj, fs: Fs, b: Build, n_analyzed: Int, state: Str):
+  var lines: [Str] = []
+  let multi = report.n_groups(p.on) > 1
+  var total = 0
+  for t in opts.issue_types():
+    if not p.on[t]: continue
+    let xs = report.of_type(p.issues, t)
+    if xs.len == 0: continue
+    if multi: lines.push(report.colored_title(opts.title_of(t), xs.len))
+    for l in report.type_table(p.coll, xs, t, p.cols): lines.push(l)
+    total += xs.len
+  let st = "\n" + (fs.read("/proc/self/status") else "")
+  let mem = perf.fixed(perf.mb_of(perf.status_kb(st, "RssAnon")), 2)
+  let ms = (p.clk() - p.pf.t0) * 1000.0
+  let summary = report.gray("{n_analyzed} files (" + perf.pretty_ms(ms) + " • " + mem + "MB)")
+  var out: [Str] = []
+  if total == 0:
+    out.push("✂️  Excellent, Knip found no issues.")
+    out.push("")
+    out.push(summary)
+  else:
+    for l in lines: out.push(l)
+    out.push("")
+    out.push(summary)
+  var body = "\n".join(out) + "\n\0\n"
+  for id in b.order:
+    if not b.g.nodes[id].analyzed: continue
+    let path = b.g.nodes[id].path
+    let text = fs.read(fspath(p, path)) else continue
+    body += path + "\t" + text_hash(text) + "\n"
+  fs.write(state, body) else return
+
+fn watch_add_dirs(p: Proj, fs: Fs, ffi: Ffi, fd: Int, dir: Str, var wds: {Int: Str}):
+  let wd = term.watch_add(ffi, fd, fspath(p, dir))
+  if wd >= 0: wds[wd] = dir + ""
+  let names = fs.list(fspath(p, dir)) else return
+  var links: {Str: Bool} = {}
+  for x in p.list_links(fspath(p, dir)): links[x] = true
+  for nm in names:
+    if not nm.endswith("/"): continue
+    let name = nm[0..nm.len - 1]
+    if name == "node_modules" or name == ".git" or name in links: continue
+    watch_add_dirs(p, fs, ffi, fd, resolve.join(dir, name), &wds)
+
+fn watch_skip(path: Str) -> Bool:
+  for seg in path.split("/"):
+    if seg == "node_modules" or seg == ".git": return true
+  return false
+
+# knip's project files are source files: an added file of another kind changes nothing
+fn watch_source_ext(path: Str) -> Bool:
+  let e = resolve.extname(path)
+  return " .js .mjs .cjs .jsx .ts .tsx .mts .cts .vue .svelte .astro .mdx .md .css .scss .less .json ".find(" " + e + " ") >= 0
+
+# one analysis: the child's report on a cleared screen when knip shows progress (isShowProgress),
+# printed with --debug, nothing otherwise; the analyzed files' hashes
+fn watch_run(p: Proj, fs: Fs, os: Os, cmd: [Str], state: Str, debug: Bool, var hashes: {Str: Str}):
+  fs.remove(state) else 0
+  os.run(cmd) else 1
+  let body = fs.read(state) else return
+  let cut = body.find("\n\0\n")
+  if cut < 0: return
+  let report_text = body[0..cut + 1]
+  var hs: {Str: Str} = {}
+  for line in body[cut + 3..body.len].split("\n"):
+    let tab = line.find("\t")
+    if tab > 0: hs[line[0..tab]] = line[tab + 1..line.len]
+  swap(&hashes, &hs)
+  if debug: print(report_text[0..report_text.len - 1])
+  elif p.tty: write(report.esc() + "[2J" + report.esc() + "[1;1f" + report_text)
+  stdio.flush()
+
+fn watch_loop(var p: Proj, fs: Fs, os: Os, ffi: Ffi, debug: Bool):
+  var self_exe = term.realpath(ffi, "/proc/self/exe")
+  if self_exe == "": self_exe = args()[0] + ""
+  let tmp = fs.temp_dir() else ""
+  let state = tmp + "/watch-state"
+  var cmd: [Str] = ["env", "VKNIP_WATCH_RUN=" + state, self_exe]
+  let av = args()
+  for k in 1..av.len: cmd.push(av[k] + "")
+  var hashes: {Str: Str} = {}
+  watch_run(p, fs, os, cmd, state, debug, &hashes)
+  let fd = term.watch_open(ffi)
+  var wds: {Int: Str} = {}
+  if fd >= 0: watch_add_dirs(p, fs, ffi, fd, "", &wds)
+  while true:
+    if fd < 0:
+      os.sleep(3600.0)
+      continue
+    var ev = term.watch_read(ffi, fd, 1000)
+    if ev == "": continue
+    # (the events that come together are handled together)
+    while true:
+      let more = term.watch_read(ffi, fd, 40)
+      if more == "": break
+      ev += more
+    var relevant = false
+    for line in ev.split("\n"):
+      let parts = line.split("\t")
+      if parts.len < 3: continue
+      let wd = int(parts[0]) else -1
+      if not (wd in wds): continue
+      let path = resolve.join(wds[wd], parts[2])
+      if parts[2] == "" or watch_skip(path): continue
+      let kind = parts[1]
+      if kind == "D":
+        # (a new folder, and the files already in it: knip's watcher sees a folder event too)
+        watch_add_dirs(p, fs, ffi, fd, path, &wds)
+        relevant = true
+        continue
+      if kind == "X" or kind == "d":
+        relevant = true
+        continue
+      if kind == "c":
+        if watch_source_ext(path) or path in hashes: relevant = true
+        continue
+      # (modified: only when its contents changed, for a file knip has read)
+      if path in hashes:
+        let text = fs.read(fspath(p, path)) else ""
+        if text_hash(text) == hashes[path]: continue
+      relevant = true
+    if relevant: watch_run(p, fs, os, cmd, state, debug, &hashes)
 
 fn builtin_reporter(r: Str) -> Bool:
   return r == "symbols" or r == "compact" or r == "json" or r == "markdown" or r == "disclosure" or r == "github-actions" or r == "codeclimate" or r == "sarif" or r == "codeowners" or r == "cycles"

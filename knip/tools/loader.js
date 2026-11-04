@@ -396,7 +396,31 @@ const runReporter = async (mod, data, toFile) => {
   });
   return { out: r.out, err: r.err, file };
 };
+// the yaml package (knip's YAML parser): the project's, the one next to its knip, else any in .pnpm
+const findYaml = () => {
+  const tries = [
+    () => createRequire(path.join(cwd, 'package.json'))('yaml'),
+    () => createRequire(createRequire(path.join(cwd, 'package.json')).resolve('knip'))('yaml'),
+    () => createRequire(fs.realpathSync(path.join(cwd, 'node_modules/knip/package.json')))('yaml'),
+    () => {
+      const pnpm = path.join(cwd, 'node_modules/.pnpm');
+      const dirs = fs.readdirSync(pnpm).filter(d => /^yaml@2/.test(d)).sort().reverse();
+      for (const d of dirs) { const f = path.join(pnpm, d, 'node_modules/yaml/package.json'); if (fs.existsSync(f)) return createRequire(f)('yaml'); }
+      return null;
+    },
+  ];
+  for (const t of tries) { try { const y = t(); if (y && typeof y.parse === 'function') return y; } catch {} }
+  return null;
+};
 for (const r of reqs) {
+  // a YAML file vknip's reader isn't sure about: parsed as knip parses it (loadYAML)
+  if (r.mode === 'yaml') {
+    const Y = findYaml();
+    if (!Y) { out[r.file] = { noyaml: true }; continue; }
+    try { out[r.file] = { ok: enc(Y.parse(fs.readFileSync(path.resolve(cwd, r.file), 'utf8'), { logLevel: 'error' }), 0, new Set()) ?? null }; }
+    catch (e) { out[r.file] = { error: (e && e.message ? e.message : String(e)).split('\n')[0] }; }
+    continue;
+  }
   if (r.mode === 'preprocess' || r.mode === 'reporter') {
     try {
       out[r.file] = { ok: r.mode === 'preprocess' ? await runPreprocessors(r.args.mods, r.args.data) : await runReporter(r.args.mod, r.args.data, r.args.toFile) };

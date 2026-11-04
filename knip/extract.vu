@@ -160,12 +160,46 @@ type St:
   caught_ix: {Int: Bool}    # import calls awaited inside them
   node_module: Bool         # module or node:module is imported
   worker_threads: Bool
+  exp_new: Bool             # the last add_export created the export
+  want_binds: Bool          # (--trace) the exports' bindings are recorded (set_bind)
+  at_bits: Int              # the JSDoc words in the file (at_scan)
   stmt_tags: Int            # the JSDoc tags of the statement being read (its imports carry them)
 
 fn new_st(own src: Str, path: Str) -> St:
   let is_js = path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")
   let is_dts = path.endswith(".d.ts") or path.endswith(".d.cts") or path.endswith(".d.mts")
-  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [], {}, {}, false, false, [], false, [], [], [], {}, [], [], {}, 0, {}, false, false, 0)
+  let ab = at_scan(src)
+  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [], {}, {}, false, false, [], false, [], [], [], {}, [], [], {}, 0, {}, false, false, false, false, ab, 0)
+
+# the JSDoc words a file has, in one pass over its '@'s (each a bit: AT_PUBLIC...)
+const AT_PUBLIC = 1
+const AT_BETA = 2
+const AT_ALIAS = 4
+const AT_INTERNAL = 8
+const AT_IMPORT = 16
+const AT_JSX = 32
+const AT_ENV = 64
+
+fn at_word(src: Str, i: Int, w: Str) -> Bool:
+  if i + w.len > src.len: return false
+  for k in 0..w.len:
+    if src[i + k] != w[k]: return false
+  return true
+
+fn at_scan(src: Str) -> Int:
+  var bits = 0
+  var i = src.find("@")
+  while i >= 0:
+    let r = i + 1
+    if at_word(src, r, "public"): bits = bits | AT_PUBLIC
+    elif at_word(src, r, "beta"): bits = bits | AT_BETA
+    elif at_word(src, r, "alias"): bits = bits | AT_ALIAS
+    elif at_word(src, r, "internal"): bits = bits | AT_INTERNAL
+    elif at_word(src, r, "import"): bits = bits | AT_IMPORT
+    elif at_word(src, r, "jsxImportSource"): bits = bits | AT_JSX
+    elif at_word(src, r, "vitest-environment") or at_word(src, r, "jest-environment"): bits = bits | AT_ENV
+    i = src.find("@", r)
+  return bits
 
 fn nm(t: Ast, n: Int) -> Str:
   let s = t.nd[n].s
@@ -316,7 +350,7 @@ fn build_tags(var s: St):
   var any_user = false
   for u in s.user_tags:
     if s.src.find(u) >= 0: any_user = true
-  if not any_user and s.src.find("@public") < 0 and s.src.find("@beta") < 0 and s.src.find("@alias") < 0 and s.src.find("@internal") < 0: return
+  if not any_user and (s.at_bits & (AT_PUBLIC | AT_BETA | AT_ALIAS | AT_INTERNAL)) == 0: return
   let cm = comments(s.src)
   let n = s.src.len
   var reach = n
@@ -452,11 +486,25 @@ fn add_export(var s: St, name: Str, typ: Str, pos: Int, own members: [Member], r
     for m in members: s.exps[i].members.push(Member(m.name + "", m.pos, m.tags, m.in_file, copy_ints(m.fix)))
     s.exps[i].tags = s.exps[i].tags | tags
     s.exps[i].reexport = reexport
+    s.exp_new = false
+    if s.want_binds: s.globs.push("\0" + name)
     return
+  s.exp_new = true
   s.exp_ix[name] = s.exps.len
   var fix: [Int] = []
   swap(&fix, &s.fix_next)
   s.exps.push(Exp(name + "", typ + "", pos, members, tags, false, reexport, [], fix))
+
+# the binding and isBindingReExport of the export just added (knip's addExport arguments)
+fn set_bind(var s: St, name: Str, binding: Str, bre: Bool):
+  if not s.want_binds: return
+  if binding == name and not bre: return
+  var f = "0"
+  if bre: f = "1"
+  var nw = "0"
+  if s.exp_new: nw = "1"
+  # (kept with the globs, "\0" first: name \t binding \t isBindingReExport \t new; "\0" name: reset)
+  s.globs.push("\0" + name + "\t" + binding + "\t" + f + "\t" + nw)
 
 fn add_ref_in_export(var s: St, name: Str, exp: Str):
   if name in s.ref_in:
@@ -1060,9 +1108,11 @@ fn handle_export_specs(var s: St, t: Ast, n: Int):
     var typ = "unknown"
     if is_type: typ = "type"
     var reexport = false
+    var bre = false
     if local in s.li:
       reexport = true
       let l = li_get(s, local)
+      bre = not l.is_dyn
       if l.is_ns: op(&s, l.spec, OP_REEXPORTNS, exported, "")
       elif l.imported != exported: op(&s, l.spec, OP_REEXPORTAS, l.imported, exported)
       else: op(&s, l.spec, OP_REEXPORT, l.imported, "")
@@ -1070,6 +1120,7 @@ fn handle_export_specs(var s: St, t: Ast, n: Int):
     let pos = name_after_as(s, t, sp)
     s.fix_next = [t.nd[sp].pos, t.nd[sp].end, 3]
     add_export(&s, exported, typ, pos, [], reexport, tags)
+    set_bind(&s, exported, local, bre)
     s.spec_names[exported] = true
     add_local_to_export(&s, local, exported)
 
@@ -1142,6 +1193,8 @@ fn handle_export_default(var s: St, t: Ast, n: Int, decl: Int):
     if k == ast.N_CLASS: fs_ = decorators_start(s.src, start)
     s.fix_next = [fs_, t.nd[n].end + 1, 0]
   add_export(&s, "default", typ, pos, [], false, tags)
+  if k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_INTERFACE:
+    if nm(t, decl) != "": set_bind(&s, "default", nm(t, decl), false)
 
 # where the decorators on the lines before a statement start (the statement's start when none)
 fn decorators_start(src: Str, start: Int) -> Int:
@@ -2099,6 +2152,7 @@ fn walk_node(var s: St, t: Ast, n: Int):
         let pos = name_after_as(s, t, sp)
         s.fix_next = [t.nd[sp].pos, t.nd[sp].end, 3]
         add_export(&s, exported, typ, pos, [], true, tags | tags_at(s, t.nd[sp].pos))
+        set_bind(&s, exported, exported, true)
     return
   if k == ast.N_EXPORTDEFAULT:
     s.in_export = true
@@ -2286,7 +2340,7 @@ fn has_module_syntax(t: Ast, root: Int, src: Str) -> Bool:
 
 # imports written in comments (extractImportsFromComments)
 fn comment_imports(var s: St, first_stmt: Int):
-  if s.src.find("import(") < 0 and s.src.find("@import") < 0 and s.src.find("@jsxImportSource") < 0 and s.src.find("-environment") < 0 and s.src.find("<reference") < 0: return
+  if (s.at_bits & (AT_IMPORT | AT_JSX | AT_ENV)) == 0 and s.src.find("import(") < 0 and s.src.find("<reference") < 0: return
   let cm = comments(s.src)
   var i = 0
   while i < cm.len:
@@ -2591,6 +2645,7 @@ fn analyze_tc(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags
   for u in user_tags:
     if u.startswith("\0"): s.vis[u[1..u.len]] = true
     else: s.user_tags.push(u + "")
+  s.want_binds = "binds" in s.vis
   let pd = parse.parse_file_v(&t, &s.src, 1, &kw, true, jsx)
   tm.push(clk())
   let lines = line_starts(s.src)
