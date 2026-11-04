@@ -133,6 +133,9 @@ fn seq(var y: Y, ind: Int) -> Value:
     if rest.startswith("|") or rest.startswith(">"):
       out.push(json.Text(block_scalar(&y, ind, rest)))
       continue
+    if quote_open(rest):
+      out.push(json.Text(unquote(quoted_lines(&y, rest))))
+      continue
     y.i += 1
     out.push(value_of(&y, rest))
   return json.Arr(out)
@@ -168,6 +171,8 @@ fn mapping(var y: Y, ind: Int) -> Value:
         elif nind == ind and (ntext == "-" or ntext.startswith("- ")): v = seq(&y, ind)
     elif rest.startswith("|") or rest.startswith(">"):
       v = json.Text(block_scalar(&y, ind, rest))
+    elif quote_open(rest):
+      v = json.Text(unquote(quoted_lines(&y, rest)))
     else:
       y.i += 1
       # a plain scalar may continue on more-indented lines
@@ -357,3 +362,246 @@ fn flow_word(s: Str, var k: Int, is_key: Bool) -> Str:
     if is_key and c == ':' and (k + 1 >= s.len or s[k + 1] == ' ' or s[k + 1] == ','): break
     k += 1
   return s[st..k].strip()
+
+# a quoted scalar that doesn't close on its line
+fn quote_open(s: Str) -> Bool:
+  if s == "" or (s[0] != '\'' and s[0] != '"'): return false
+  let q = s[0]
+  var k = 1
+  while k < s.len:
+    if q == '"' and s[k] == '\\':
+      k += 2
+      continue
+    if s[k] == q:
+      if q == '\'' and k + 1 < s.len and s[k + 1] == '\'':
+        k += 2
+        continue
+      return false
+    k += 1
+  return true
+
+# the lines of a quoted scalar folded (a line break is a space, an empty line a newline), from the
+# current line (whose value starts with first) to the line that closes the quote
+fn quoted_lines(var y: Y, first: Str) -> Str:
+  var out = first + ""
+  y.i += 1
+  var blanks = 0
+  while y.i < y.lines.len:
+    let t = y.lines[y.i].raw.strip()
+    y.i += 1
+    if t == "":
+      blanks += 1
+      continue
+    if blanks > 0:
+      for b in 0..blanks: out += "\n"
+      blanks = 0
+    else: out += " "
+    out += t
+    if not quote_open(out): break
+  return out
+
+# Whether a document has something this reader doesn't read the way the yaml package does, or
+# that package rejects: tabs in indentation, indentation that matches no open block, a plain line
+# where a key or an item belongs, duplicate keys, flow collections or quotes over several lines,
+# anchors, aliases, tags, directives, several documents. (The caller then asks the yaml package.)
+fn irregular(src: Str) -> Bool:
+  return irregular_line(src) >= 0
+
+# the line (from 1) irregular() stops at, -1 none
+fn irregular_line(src: Str) -> Int:
+  var inds: [Int] = []         # open block levels (indentation)
+  var kinds: [Byte] = []       # 'm' mapping, 's' sequence
+  var keys: [{Str: Bool}] = []
+  var opener = false           # the previous line opened a block ("key:" or "-")
+  var opener_ind = -1
+  var bs_ind = -1              # in a block scalar: lines deeper than this are its content
+  var bs_first = -1
+  var anchors: {Str: Bool} = {}
+  var docs = 0
+  var seen_content = false
+  var ln = 0
+  for raw0 in src.split("\n"):
+    ln += 1
+    var raw = raw0
+    if raw.endswith("\r"): raw = raw[0..raw.len - 1]
+    var ind = 0
+    while ind < raw.len and raw[ind] == ' ': ind += 1
+    if bs_ind >= 0:
+      if raw.strip() == "":
+        if raw.find("\t") >= 0: return ln
+        continue
+      if ind > bs_ind:
+        # (no line less indented than the first)
+        if bs_first < 0: bs_first = ind
+        elif ind < bs_first: return ln
+        continue
+      bs_ind = -1
+      bs_first = -1
+    if ind < raw.len and raw[ind] == '\t': return ln
+    if raw.startswith("%"): return ln
+    if raw.startswith("---"):
+      docs += 1
+      if seen_content or docs > 1: return ln
+      if raw[3..raw.len].strip() != "": return ln
+      continue
+    if raw.startswith("..."): return ln
+    let t = strip_comment(raw[ind..raw.len])
+    if t == "": continue
+    seen_content = true
+    # (a plain scalar document has nothing after it)
+    if kinds.len > 0 and kinds[0] == 'v': return ln
+    if t.find("\t") >= 0 and not quoted_ok(t): return ln
+    # (the levels this line closes)
+    if opener and ind > opener_ind:
+      inds.push(ind)
+      kinds.push(0)
+      keys.push({})
+    elif opener and ind == opener_ind and (t == "-" or t.startswith("- ")) and kinds.len > 0 and kinds[kinds.len - 1] == 'm':
+      # key:\n- item (a sequence at the key's indentation)
+      inds.push(ind)
+      kinds.push('s')
+      keys.push({})
+    else:
+      while inds.len > 0 and inds[inds.len - 1] > ind:
+        inds.pop()
+        kinds.pop()
+        keys.pop()
+      if inds.len == 0:
+        if ind != 0: return ln
+        inds.push(0)
+        kinds.push(0)
+        keys.push({})
+      elif inds[inds.len - 1] != ind: return ln
+      # (a key after "key:\n- item" at the same indentation closes the sequence)
+      if not (t == "-" or t.startswith("- ")) and kinds.len > 1 and kinds[kinds.len - 1] == 's' and inds[inds.len - 2] == ind:
+        inds.pop()
+        kinds.pop()
+        keys.pop()
+    opener = false
+    var rest = t + ""
+    var cur_ind = ind
+    # sequence items (and "- key: v", "- - x")
+    while rest == "-" or rest.startswith("- "):
+      let lv = inds.len - 1
+      if kinds[lv] == 'm': return ln
+      kinds[lv] = 's'
+      if rest == "-":
+        opener = true
+        opener_ind = cur_ind
+        rest = ""
+        break
+      var k = 2
+      while k < rest.len and rest[k] == ' ': k += 1
+      cur_ind = cur_ind + k
+      rest = rest[k..rest.len]
+      if not (rest == "-" or rest.startswith("- ")) and key_colon(rest) < 0:
+        # (an item's scalar)
+        if rest.startswith("|") or rest.startswith(">"):
+          if not block_header_ok(rest): return ln
+          bs_ind = cur_ind - k
+          rest = ""
+          break
+        if bad_scalar(rest) or plain_has_colon(rest) or not alias_ok(rest, &anchors): return ln
+        rest = ""
+        break
+      inds.push(cur_ind)
+      kinds.push(0)
+      keys.push({})
+    if rest == "": continue
+    let lv = inds.len - 1
+    let c = key_colon(rest)
+    if c >= 0:
+      if kinds[lv] == 's' and cur_ind == inds[lv]: return ln
+      kinds[lv] = 'm'
+      let key = rest[0..c].strip()
+      if key == "" or key.startswith("?"): return ln
+      if bad_scalar(key): return ln
+      if key in keys[lv] and key != "<<": return ln
+      keys[lv][key] = true
+      var v = rest[c + 1..rest.len].strip()
+      if not alias_ok(v, &anchors): return ln
+      # (an anchor alone: the value follows on the next lines)
+      if v.startswith("&") and v.find(" ") < 0: v = ""
+      if v == "":
+        opener = true
+        opener_ind = cur_ind
+        continue
+      if v.startswith("|") or v.startswith(">"):
+        if not block_header_ok(v): return ln
+        bs_ind = cur_ind
+        continue
+      if bad_scalar(v) or plain_has_colon(v): return ln
+      continue
+    # a plain value where a key or an item belongs (a scalar document is fine on its own)
+    if lv == 0 and inds.len == 1 and kinds[0] == 0:
+      if bad_scalar(rest): return ln
+      kinds[0] = 'v'
+      continue
+    return ln
+  return -1
+
+# a block scalar header: | or >, then an indentation digit and a chomping sign, in either order
+fn block_header_ok(v: Str) -> Bool:
+  var k = 1
+  var n = 0
+  while k < v.len and n < 2 and (v[k] == '-' or v[k] == '+' or (v[k] >= '1' and v[k] <= '9')):
+    k += 1
+    n += 1
+  return v[k..v.len].strip() == ""
+
+# a plain scalar with ": " or a final ':' (a nested mapping, which the yaml package rejects)
+fn plain_has_colon(v: Str) -> Bool:
+  if v.startswith("\"") or v.startswith("'") or v.startswith("[") or v.startswith("{{"): return false
+  return v.find(": ") >= 0 or v.endswith(":") or v.find(":\t") >= 0
+
+# an anchor is remembered; an alias needs one set before it
+fn alias_ok(v: Str, var anchors: {Str: Bool}) -> Bool:
+  if v.startswith("&"):
+    var e = 1
+    while e < v.len and v[e] != ' ': e += 1
+    anchors[v[1..e]] = true
+    return true
+  if v.startswith("*"):
+    return v[1..v.len].strip() in anchors
+  return true
+
+# quotes on one line (a tab inside them is fine)
+fn quoted_ok(t: Str) -> Bool:
+  let a = t.find("\"")
+  let b = t.find("'")
+  return a >= 0 or b >= 0
+
+# a value this reader may read differently: anchors, aliases, tags, flow collections or quotes not
+# closed on their line
+fn bad_scalar(v: Str) -> Bool:
+  if v.startswith("!") or v.startswith("@") or v.startswith("`"): return true
+  if v.startswith("\"") or v.startswith("'"):
+    let q = v[0]
+    var k = 1
+    while k < v.len:
+      if q == '"' and v[k] == '\\':
+        k += 2
+        continue
+      if v[k] == q:
+        if q == '\'' and k + 1 < v.len and v[k + 1] == '\'':
+          k += 2
+          continue
+        # (after the closing quote: nothing but spaces)
+        return v[k + 1..v.len].strip() != ""
+      k += 1
+    return true
+  if v.startswith("[") or v.startswith("{{"):
+    var depth = 0
+    var q: Byte = 0
+    for k in 0..v.len:
+      let c = v[k]
+      if q != 0:
+        if c == q: q = 0
+        continue
+      if c == '"' or c == '\'': q = c
+      elif c == '[' or c == '{': depth += 1
+      elif c == ']' or c == '}':
+        depth -= 1
+        if depth == 0: return v[k + 1..v.len].strip() != ""
+    return true
+  return false

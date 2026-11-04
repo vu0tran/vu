@@ -1,0 +1,234 @@
+# plugins/varlock/parse: the @import and @plugin directives in the root comments of a .env file
+
+type Directive:
+  name: Str
+  descriptor: Str
+  enabled: Int        # 1 true, 0 false, -1 null, -2 not given
+  allow_missing: Int
+
+type Parsed:
+  directives: [Directive]
+  disabled: Bool
+
+fn closer(c: Str) -> Str:
+  if c == "(": return ")"
+  if c == "[": return "]"
+  if c == "{{": return "}}"
+  return ""
+
+fn ch(v: Str, i: Int) -> Str:
+  if i < 0 or i >= v.len: return ""
+  return v[i..i + 1]
+
+fn trim_start(s: Str) -> Str:
+  var i = 0
+  while i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\r' or s[i] == '\n'): i += 1
+  return s[i..s.len]
+
+fn root_comments(source: Str) -> Str:
+  var src = source
+  if src.startswith(chr(65279)): src = src[3..src.len]
+  var comments: [Str] = []
+  var block: [Str] = []
+  var has_item = false
+  for line0 in src.split("\n"):
+    var line = line0
+    if line.endswith("\r"): line = line[0..line.len - 1]
+    if line.strip() == "":
+      for b in block: comments.push(b + "")
+      block = []
+      continue
+    var k = 0
+    while k < line.len and (line[k] == ' ' or line[k] == '\t'): k += 1
+    if k >= line.len or line[k] != '#':
+      has_item = true
+      break
+    let content = trim_start(line[k + 1..line.len])
+    var sep = content.len >= 3
+    if sep:
+      for q in 0..3:
+        let c = content[q]
+        if not (c == '-' or c == '=' or c == '*' or c == '#'): sep = false
+    if sep:
+      for b in block: comments.push(b + "")
+      block = []
+    else: block.push(content)
+  if not has_item:
+    for b in block: comments.push(b + "")
+  return "\n".join(comments)
+
+# readQuoted: the text and the end, or end -1 when it isn't closed
+type Quoted:
+  value: Str
+  end: Int
+
+fn read_quoted(v: Str, start: Int) -> Quoted:
+  let q = ch(v, start)
+  var out = ""
+  var i = start + 1
+  while i < v.len:
+    let c = ch(v, i)
+    if c == q: return Quoted(out, i + 1)
+    if c == "\\" and ch(v, i + 1) == q:
+      out += q
+      i += 1
+    else: out += c
+    i += 1
+  return Quoted("", -1)
+
+type Args:
+  args: [Str]
+  end: Int
+
+fn read_arguments(v: Str, start: Int) -> Args:
+  var args: [Str] = []
+  var stack: [Str] = [closer(ch(v, start))]
+  var arg = ""
+  var i = start + 1
+  while i < v.len:
+    let c = ch(v, i)
+    if c == "\"" or c == "'" or c == "`":
+      let q = read_quoted(v, i)
+      if q.end < 0: return Args([], -1)
+      arg += v[i..q.end]
+      i = q.end
+      continue
+    elif c == "#":
+      let nl = v.find("\n", i)
+      if nl < 0: return Args([], -1)
+      i = nl
+      arg += " "
+    elif closer(c) != "":
+      stack.push(closer(c))
+      arg += c
+    elif c == stack[stack.len - 1]:
+      stack.truncate(stack.len - 1)
+      if stack.len == 0:
+        args.push(arg.strip())
+        return Args(args, i + 1)
+      arg += c
+    elif c == "," and stack.len == 1:
+      args.push(arg.strip())
+      arg = ""
+    else: arg += c
+    i += 1
+  return Args([], -1)
+
+fn read_value_end(v: Str, start: Int) -> Int:
+  var i = start
+  while i < v.len:
+    let c = ch(v, i)
+    if c == " " or c == "\t" or c == "\n" or c == "\r" or c == "#" or c == chr(11) or c == chr(12): break
+    if c == "\"" or c == "'" or c == "`":
+      let q = read_quoted(v, i)
+      if q.end < 0: return v.len
+      i = q.end
+    elif closer(c) != "":
+      let a = read_arguments(v, i)
+      if a.end < 0: return v.len
+      i = a.end
+    else: i += 1
+  return i
+
+fn is_alpha(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+
+fn is_canonical_number(t: Str) -> Bool:
+  var i = 0
+  if t.startswith("-"): i = 1
+  if i >= t.len: return false
+  if t[i] == '0':
+    i += 1
+  elif t[i] >= '1' and t[i] <= '9':
+    while i < t.len and t[i] >= '0' and t[i] <= '9': i += 1
+  else: return false
+  if i == t.len: return t != "-0"
+  if t[i] != '.': return false
+  i += 1
+  if i >= t.len: return false
+  while i < t.len and t[i] >= '0' and t[i] <= '9': i += 1
+  return i == t.len and not t.endswith("0")
+
+# getStaticString ("\0" undefined)
+fn static_string(v: Str) -> Str:
+  let t = v.strip()
+  let q = ch(t, 0)
+  if q == "\"" or q == "'" or q == "`":
+    let r = read_quoted(t, 0)
+    if r.end == t.len: return r.value
+    return "\0"
+  if t == "": return "\0"
+  for i in 0..t.len:
+    let c = t[i]
+    if c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == ',' or c == ')': return "\0"
+  if t.find("$") >= 0: return "\0"
+  if is_alpha(t[0]):
+    var k = 1
+    while k < t.len and (is_alpha(t[k]) or (t[k] >= '0' and t[k] <= '9') or t[k] == '_'): k += 1
+    if k < t.len and t[k] == '(': return "\0"
+  let l = t.lower()
+  if l == "true" or l == "false" or l == "undefined": return "\0"
+  if is_canonical_number(t): return "\0"
+  return t + ""
+
+fn boolean(v: Str) -> Int:
+  let t = v.strip()
+  if t == "true": return 1
+  if t == "false": return 0
+  return -1
+
+fn is_name_byte(c: Byte) -> Bool:
+  return is_alpha(c) or (c >= '0' and c <= '9') or c == '_'
+
+fn parse(source: Str) -> Parsed:
+  var out = Parsed([], false)
+  let v = root_comments(source)
+  var i = 0
+  while i < v.len:
+    while i < v.len and (v[i] == ' ' or v[i] == '\t'): i += 1
+    if i >= v.len or v[i] != '@':
+      let nl = v.find("\n", i)
+      if nl < 0: i = v.len
+      else: i = nl + 1
+      continue
+    var stop = false
+    while i < v.len and v[i] != '\n' and v[i] != '#' and not stop:
+      if v[i] != '@' or i + 1 >= v.len or not is_alpha(v[i + 1]):
+        i += 1
+        continue
+      var ne = i + 2
+      while ne < v.len and is_name_byte(v[ne]): ne += 1
+      let name = v[i + 1..ne]
+      var cur = ne
+      while cur < v.len and (v[cur] == ' ' or v[cur] == '\t'): cur += 1
+      if cur < v.len and v[cur] == '(':
+        let r = read_arguments(v, cur)
+        if r.end < 0:
+          stop = true
+          continue
+        if name == "plugin" or name == "import":
+          var a0 = ""
+          if r.args.len > 0: a0 = r.args[0] + ""
+          let d = static_string(a0)
+          if d != "\0":
+            var dir = Directive(name + "", d, -2, -2)
+            for k in 1..r.args.len:
+              let a = r.args[k]
+              let sep = a.find("=")
+              if sep < 0: continue
+              let key = a[0..sep].strip()
+              if key == "enabled": dir.enabled = boolean(a[sep + 1..a.len])
+              if key == "allowMissing": dir.allow_missing = boolean(a[sep + 1..a.len])
+            out.directives.push(dir)
+        i = r.end
+      elif cur < v.len and v[cur] == '=':
+        let e = read_value_end(v, cur + 1)
+        if name == "disable" and boolean(v[cur + 1..e]) == 1: out.disabled = true
+        i = e
+      else:
+        if name == "disable": out.disabled = true
+        i = ne
+    let nl = v.find("\n", i)
+    if nl < 0: i = v.len
+    else: i = nl + 1
+  return out

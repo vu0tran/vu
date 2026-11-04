@@ -81,7 +81,8 @@ const TOOLS = {
     // jiti loads JavaScript and TypeScript configs (knip depends on it too); the types and
     // `knip/config`'s defineConfig, so `import type { KnipConfig } from "knip"` and
     // `import { defineConfig } from "knip/config"` keep working; knip's JSON schema
-    dependencies: { jiti: "^2.7.0" },
+    // (and yaml, knip's YAML parser, for the YAML configs vknip's own reader isn't sure about)
+    dependencies: { jiti: "^2.7.0", yaml: "^2.9.1" },
     extra: ["index.mjs", "types.d.ts", "config.mjs", "config.d.ts", "schema.json", "schema-jsonc.json", "LICENSE.knip"],
     fields: {
       types: "./types.d.ts",

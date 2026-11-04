@@ -5,6 +5,7 @@
 
 import json
 import pkg
+import glob
 from json import Value
 
 const R_UNRESOLVED = 0
@@ -41,6 +42,15 @@ type Tsc:
   paths: [PathMap]
   base_url: Str
   has_base: Bool
+  refs: [Str]          # its references (tsconfig files), when it has some
+  rootdirs: [Str]
+  # the files it includes (oxc-resolver applies a referenced tsconfig to the files it includes)
+  inc: [glob.Pat]
+  inc_exact: [Str]
+  excl: [glob.Pat]
+  excl_exact: [Str]
+  has_inc: Bool        # include or files given (else **/*)
+  allow_js: Bool
 
 type Resolver:
   root: Str                    # what to put before a path for the file system ("" or "dir/")
@@ -51,12 +61,16 @@ type Resolver:
   tscs: [Tsc]                  # tsconfig files met (paths, baseUrl)
   tsc_of_dir: {Str: Int}       # folder -> its nearest tsconfig.json (index in tscs, -1 none)
   tsc_of_file: {Str: Int}
+  tsc_sel: {Str: Int}          # a source file -> the tsconfig applied to it (references)
+  sel: Int                     # (during one resolution: the selected tsconfig, -2 the folder's)
+  any_refs: Bool               # a tsconfig with references was loaded
   wsi: [WsInfo]                # the workspaces, deepest first
   ws_pkgs: {Str: Str}          # workspace package name -> folder
   srcmaps: [SrcMap]
   extra_exts: [Str]            # the compilers' extensions (.vue...)
   cache: {Str: Res}
   pkgs: {Str: Value}           # package.json by folder (node_modules lookups)
+  rootdirs: [RootDirs]         # tsconfig rootDirs per workspace (SvelteKit's ./$types)
 
 fn exts() -> [Str]:
   return [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".d.mts", ".d.cts", ".json", ".jsonc"]
@@ -68,8 +82,12 @@ fn all_exts(r: Resolver) -> [Str]:
   for e in [".d.ts", ".d.mts", ".d.cts", ".json", ".jsonc"]: out.push(e + "")
   return out
 
+type RootDirs:
+  scope: Str
+  dirs: [Str]
+
 fn new_resolver(root: Str) -> Resolver:
-  return Resolver(root + "", {}, [], "", false, [], {}, {}, [], {}, [], [], {}, {})
+  return Resolver(root + "", {}, [], "", false, [], {}, {}, {}, -2, false, [], {}, [], [], {}, {}, [])
 
 const BUILTINS = "_http_agent _http_client _http_common _http_incoming _http_outgoing _http_server _stream_duplex _stream_passthrough _stream_readable _stream_transform _stream_wrap _stream_writable _tls_common _tls_wrap assert assert/strict async_hooks buffer child_process cluster console constants crypto dgram diagnostics_channel dns dns/promises domain events fs fs/promises http http2 https inspector inspector/promises module net os path path/posix path/win32 perf_hooks process punycode querystring readline readline/promises repl stream stream/consumers stream/promises stream/web string_decoder sys timers timers/promises tls trace_events tty url util util/types v8 vm wasi worker_threads zlib"
 
@@ -229,6 +247,104 @@ fn pick_target(v: Value, star: Str) -> [Str]:
     _: return out
   return out
 
+# the value a key matches in an exports or imports map (star: what '*' stood for), Null none
+fn map_value(m: Value, key: Str, var star: Str) -> Value:
+  if not pkg.is_obj(m): return json.Null
+  if json.has(m, key): return json.copy(pkg.get(m, key))
+  var best = ""
+  for k in pkg.keys(m):
+    let st = k.find("*")
+    if st < 0: continue
+    let pre = k[0..st]
+    let suf = k[st + 1..k.len]
+    if key.startswith(pre) and key.endswith(suf) and key.len >= pre.len + suf.len:
+      if best == "" or pre.len > best.find("*"):
+        best = k + ""
+        star = key[pre.len..key.len - suf.len]
+  if best == "": return json.Null
+  return json.copy(pkg.get(m, best))
+
+# expandPackageTarget: "./" targets without ".", "..", "%2e" or node_modules segments, '*' filled
+fn expand_target(tg: Str, star: Str, has_star: Bool) -> Str:
+  if not tg.startswith("./") or bad_segments(tg[2..tg.len]): return ""
+  if tg.find("*") < 0: return tg + ""
+  if not has_star or bad_segments(star): return ""
+  return tg.replace("*", star)
+
+fn bad_segments(x: Str) -> Bool:
+  for seg in x.replace("\\", "/").split("/"):
+    let l = seg.lower()
+    if l == "." or l == ".." or l == "%2e" or l == "%2e%2e" or l == ".%2e" or l == "%2e." or l == "node_modules": return true
+  return false
+
+# findWorkspacePackageTarget's use in the resolver: the plain target's source file, else the first
+# condition's target that exists (not a declaration file, a module extension)
+fn ws_target(var r: Resolver, fs: Fs, m: Value, key: Str, wdir: Str) -> Str:
+  var star = ""
+  let tv = map_value(m, key, &star)
+  if is_null_v(tv): return ""
+  let has_star = star != "" or map_key_has_star(m, key)
+  let first = expand_target(string_target(tv), star, has_star)
+  if first != "":
+    let f = join(wdir, first)
+    let srcf = to_source(&r, fs, f)
+    if srcf != f and real_file(&r, fs, srcf): return srcf
+  for tg0 in cond_targets(tv):
+    let tg = expand_target(tg0, star, has_star)
+    if tg == "" or is_dts_name(tg): continue
+    let e = extname(tg)
+    if not (opts_has(all_exts(r), e)) : continue
+    let f = join(wdir, tg)
+    if real_file(&r, fs, f): return f
+  return ""
+
+fn opts_has(xs: [Str], x: Str) -> Bool:
+  for y in xs:
+    if y == x: return true
+  return false
+
+fn is_null_v(v: Value) -> Bool:
+  match v:
+    Null: return true
+    _: return false
+
+fn map_key_has_star(m: Value, key: Str) -> Bool:
+  return not json.has(m, key)
+
+# pickStringTarget: a string, or the first of default, node, import, require (in the map's order)
+fn string_target(v: Value) -> Str:
+  match v:
+    Text(s): return s + ""
+    Arr(xs):
+      for x in xs:
+        let t = string_target(x)
+        if t != "": return t
+    Obj(fields):
+      for k, x in fields:
+        if k == "default" or k == "node" or k == "import" or k == "require":
+          let t = string_target(x)
+          if t != "": return t
+      for k, x in fields:
+        let t = string_target(x)
+        if t != "": return t
+    _: return ""
+  return ""
+
+# pickExistingPackageTarget's candidates: every condition's target but types
+fn cond_targets(v: Value) -> [Str]:
+  var out: [Str] = []
+  match v:
+    Text(s): out.push(s + "")
+    Arr(xs):
+      for x in xs:
+        for t in cond_targets(x): out.push(t)
+    Obj(fields):
+      for k, x in fields:
+        if k != "types":
+          for t in cond_targets(x): out.push(t)
+    _: return out
+  return out
+
 # The targets of key ("." or "./sub") in an exports map.
 fn map_targets(m: Value, key: Str) -> [Str]:
   var out: [Str] = []
@@ -359,7 +475,17 @@ fn is_relative(spec: Str) -> Bool:
 
 fn resolve(var r: Resolver, fs: Fs, spec0: Str, from: Str) -> Res:
   let dir = dirname(from)
-  let key = dir + "\0" + spec0
+  var key = dir + "\0" + spec0
+  r.sel = -2
+  # (a folder whose tsconfig.json has references resolves per file: the cache key has the
+  # tsconfig chosen; until such a tsconfig is met, a cached result is the folder's)
+  if not r.any_refs and key in r.cache:
+    let c0 = r.cache[key]
+    return Res(c0.kind, c0.path + "", c0.pkg + "")
+  let ti = tsc_for_dir(&r, fs, dir)
+  if ti >= 0 and r.tscs[ti].refs.len > 0:
+    r.sel = tsc_for_file(&r, fs, from)
+    key = "{r.sel}\0" + key
   if key in r.cache:
     let c = r.cache[key]
     return Res(c.kind, c.path + "", c.pkg + "")
@@ -396,10 +522,14 @@ fn to_source(var r: Resolver, fs: Fs, f: Str) -> Str:
         found = true
   if not found: return f + ""
   var pairs: [Str] = []
-  for m in r.srcmaps:
-    if m.ws_dir != best: continue
-    pairs.push(m.src + "")
-    pairs.push(m.out + "")
+  # (the longest outDir first; stable)
+  var ms: [Int] = []
+  for k in 0..r.srcmaps.len:
+    if r.srcmaps[k].ws_dir == best: ms.push(k)
+  ms.sort(by: fn(a, b) => r.srcmaps[a].out.len > r.srcmaps[b].out.len or (r.srcmaps[a].out.len == r.srcmaps[b].out.len and a < b))
+  for k in ms:
+    pairs.push(r.srcmaps[k].src + "")
+    pairs.push(r.srcmaps[k].out + "")
   var q = 0
   while q < pairs.len:
     let msrc = pairs[q] + ""
@@ -413,7 +543,10 @@ fn to_source(var r: Resolver, fs: Fs, f: Str) -> Str:
         break
     var basep = msrc + rest
     if msrc == "": basep = norm(rest)
-    for e in [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts"]:
+    # (the default extensions, then the compilers')
+    var sexts: [Str] = [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts"]
+    for e in r.extra_exts: sexts.push(e + "")
+    for e in sexts:
       if real_file(&r, fs, basep + e):
         if basep + e != f: return basep + e
         break
@@ -460,7 +593,8 @@ fn mapped_paths(pm: [PathMap], spec: Str) -> [Str]:
     if hit:
       for v in m.values:
         let st = v.find("*")
-        var mapped = v + captured
+        # (a target without '*' is used as it is)
+        var mapped = v + ""
         if st >= 0: mapped = v[0..st] + captured + v[st + 1..v.len]
         if not m.wildcard: mapped = v + ""
         cands.push(norm(mapped))
@@ -490,7 +624,7 @@ fn tsc_for_dir(var r: Resolver, fs: Fs, dir: Str) -> Int:
 
 fn load_tsc(var r: Resolver, fs: Fs, f: Str) -> Int:
   if f in r.tsc_of_file: return r.tsc_of_file[f] + 0
-  var t = Tsc([], "", false)
+  var t = Tsc([], "", false, [], [], [], [], [], [], false, false)
   var paths_dir = ""
   var has_paths = false
   var pm = json.Null
@@ -504,10 +638,64 @@ fn load_tsc(var r: Resolver, fs: Fs, f: Str) -> Int:
       let st = key.find("*")
       if st >= 0: t.paths.push(PathMap(key[0..st], true, vals, ""))
       else: t.paths.push(PathMap(key + "", false, vals, ""))
+  let top = pkg.read_json(fs, r.root + f)
+  let fdir = dirname(f)
+  for rf in pkg.items(pkg.get(top, "references")):
+    let rp = pkg.str_of(pkg.get(rf, "path"))
+    if rp == "": continue
+    let abs = join(fdir, rp)
+    if real_file(&r, fs, abs): t.refs.push(abs)
+    elif real_file(&r, fs, join(abs, "tsconfig.json")): t.refs.push(join(abs, "tsconfig.json"))
+  if t.refs.len > 0: r.any_refs = true
   let i = r.tscs.len
   r.tscs.push(t)
   r.tsc_of_file[f] = i
   return i
+
+# include, exclude and files patterns: a folder (no wildcard, no extension) stands for its files
+fn tsc_pats(dir: Str, xs: [Str], var pats: [glob.Pat], var exact: [Str]):
+  pats = []
+  exact = []
+  for x in xs:
+    let pth = norm(join(dir, x))
+    let wild = x.find("*") >= 0 or x.find("?") >= 0
+    let b = basename(pth)
+    if wild: pats.push(glob.compile(pth))
+    elif b.find(".") > 0: exact.push(pth)
+    else: pats.push(glob.compile(pth + "/**/*"))
+
+# whether a tsconfig includes a file (as oxc-resolver decides for references)
+fn tsc_includes(r: Resolver, ti: Int, f: Str) -> Bool:
+  let t = r.tscs[ti]
+  let e = extname(f)
+  let is_js = e == ".js" or e == ".jsx" or e == ".mjs" or e == ".cjs"
+  let is_ts = e == ".ts" or e == ".tsx" or e == ".mts" or e == ".cts"
+  if is_js and not t.allow_js: return false
+  for x in t.excl_exact:
+    if x == f: return false
+  if glob.matches_any(t.excl, f, true): return false
+  for x in t.inc_exact:
+    if x == f: return true
+  if not t.has_inc: return is_ts or is_js
+  return (is_ts or is_js) and glob.matches_any(t.inc, f, true)
+
+# the tsconfig applied to a source file: the nearest tsconfig.json, or, when it has references, the
+# first referenced one that includes the file, else itself if it does (-1 none)
+fn tsc_for_file(var r: Resolver, fs: Fs, from: Str) -> Int:
+  if from in r.tsc_sel: return r.tsc_sel[from] + 0
+  let ti = tsc_for_dir(&r, fs, dirname(from))
+  var res = ti
+  if ti >= 0 and r.tscs[ti].refs.len > 0:
+    res = -1
+    let refs = sc_strs(r.tscs[ti].refs)
+    for rf in refs:
+      let ri = load_tsc(&r, fs, rf)
+      if tsc_includes(r, ri, from):
+        res = ri
+        break
+    if res < 0 and tsc_includes(r, ti, from): res = ti
+  r.tsc_sel[from] = res
+  return res
 
 fn tsc_chain(var r: Resolver, fs: Fs, f: Str, var t: Tsc, var paths_dir: Str, var has_paths: Bool, var pm: Value, depth: Int):
   if depth > 8: return
@@ -538,6 +726,25 @@ fn tsc_chain(var r: Resolver, fs: Fs, f: Str, var t: Tsc, var paths_dir: Str, va
   if bu != "":
     t.base_url = join(dir, bu)
     t.has_base = true
+  if json.has(v, "include") or json.has(v, "files"):
+    var ps: [glob.Pat] = []
+    var ex: [Str] = []
+    tsc_pats(dir, pkg.strs(pkg.get(v, "include")), &ps, &ex)
+    for x in pkg.strs(pkg.get(v, "files")): ex.push(norm(join(dir, x)))
+    t.inc = ps
+    t.inc_exact = ex
+    t.has_inc = true
+  if json.has(v, "exclude"):
+    var ps: [glob.Pat] = []
+    var ex: [Str] = []
+    tsc_pats(dir, pkg.strs(pkg.get(v, "exclude")), &ps, &ex)
+    t.excl = ps
+    t.excl_exact = ex
+  if json.has(co, "rootDirs"):
+    var rds: [Str] = []
+    for d in pkg.strs(pkg.get(co, "rootDirs")): rds.push(norm(join(dir, d)))
+    t.rootdirs = rds
+  if json.has(co, "allowJs"): t.allow_js = pkg.truthy(pkg.get(co, "allowJs"))
   if json.has(co, "paths"):
     pm = pkg.get(co, "paths")
     paths_dir = dir + ""
@@ -545,20 +752,51 @@ fn tsc_chain(var r: Resolver, fs: Fs, f: Str, var t: Tsc, var paths_dir: Str, va
 
 fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
   if is_relative(spec):
+    # (a trailing slash names a folder)
+    if spec.endswith("/"):
+      let fd = load_dir(&r, fs, join(dir, spec))
+      if fd != "": return file_res(fd)
+      return Res(R_UNRESOLVED, "", "")
     let f = load_path(&r, fs, join(dir, spec))
-    if f != "": return file_res(f)
+    # (knip's resolver maps a built file to its source: toSourcePath)
+    if f != "": return file_res(to_source(&r, fs, f))
+    # tsconfig rootDirs: the same relative place under another of the roots (a referenced
+    # tsconfig's first, as oxc-resolver applies it)
+    var cands: [Str] = []
+    var rds: [RootDirs] = []
+    if r.sel >= 0 and r.tscs[r.sel].rootdirs.len > 1: rds.push(RootDirs("", sc_strs(r.tscs[r.sel].rootdirs)))
+    for rd in r.rootdirs: rds.push(RootDirs(rd.scope + "", sc_strs(rd.dirs)))
+    for rd in rds:
+      if dir != rd.scope and rd.scope != "" and not dir.startswith(rd.scope + "/"): continue
+      for root in rd.dirs:
+        if dir != root and root != "" and not dir.startswith(root + "/"): continue
+        var relp = ""
+        if dir != root:
+          if root == "": relp = dir + ""
+          else: relp = dir[root.len + 1..dir.len]
+        for target in rd.dirs:
+          if target != root: cands.push(join(join(target, relp), spec))
+    for c in cands:
+      let rf = load_path(&r, fs, c)
+      if rf != "": return file_res(rf)
     let cand = join(dir, spec)
     if real_file(&r, fs, cand) or is_dir(&r, fs, cand): return Res(R_FILE, cand, "")
     return Res(R_UNRESOLVED, "", "")
   if spec.startswith("/"):
     return Res(R_UNRESOLVED, "", "")
   # the nearest tsconfig.json's paths, then its baseUrl
-  let ti = tsc_for_dir(&r, fs, dir)
+  var ti = r.sel
+  if ti == -2: ti = tsc_for_dir(&r, fs, dir)
   if ti >= 0:
     let f = try_paths(&r, fs, ti, spec)
     if f != "": return file_res(f)
   let wk = ws_for(r, dir)
+  var bad_star = false
   if spec.startswith("#") and wk >= 0 and pkg.is_obj(r.wsi[wk].imports):
+    var st0 = ""
+    let mv0 = map_value(r.wsi[wk].imports, spec, &st0)
+    bad_star = st0 != "" and bad_segments(st0)
+  if spec.startswith("#") and wk >= 0 and pkg.is_obj(r.wsi[wk].imports) and not bad_star:
     let wdir = r.wsi[wk].dir + ""
     for tg in map_targets(r.wsi[wk].imports, spec):
       if tg.startswith("./"):
@@ -567,6 +805,11 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
       else:
         let b = resolve_bare(&r, fs, tg, dir)
         if b.kind != R_UNRESOLVED: return b
+    # (knip's workspace package target: the first plain target's source file, else any
+    # condition's target that exists)
+    let imv = json.copy(r.wsi[wk].imports)
+    let wt = ws_target(&r, fs, imv, spec, wdir)
+    if wt != "": return file_res(wt)
   # the package itself, through its exports
   let name = pkg_name(spec)
   if wk >= 0 and r.wsi[wk].has_exports and name == r.wsi[wk].name:
@@ -583,8 +826,8 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
   if r.paths.len > 0:
     var cands = scoped_paths(r.paths, spec, dir)
     for c in cands:
-      let f = load_path(&r, fs, c)
-      if f != "": return file_res(f)
+      let rf = load_path(&r, fs, c)
+      if rf != "": return file_res(rf)
   # a workspace package whose exports point to files not built yet: their sources
   if name in r.ws_pkgs:
     let wdir = r.ws_pkgs[name] + ""
@@ -600,7 +843,22 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
         let srcf = to_source(&r, fs, f)
         if srcf != f: return file_res(srcf)
         if real_file(&r, fs, f) and not is_dts_name(f): return file_res(f)
+      let wt = ws_target(&r, fs, ex, key, wdir)
+      if wt != "": return file_res(wt)
   # a path relative to the importing file that exists (knip's last resort)
   let cand = join(dir, spec)
   if real_file(&r, fs, cand) or is_dir(&r, fs, cand): return Res(R_FILE, cand, "")
   return Res(R_UNRESOLVED, "", "")
+
+fn sc_strs(xs: [Str]) -> [Str]:
+  var out: [Str] = []
+  for x in xs: out.push(x + "")
+  return out
+
+# the parent of an absolute folder ("/" has none: "")
+fn dirname_abs(p: Str) -> Str:
+  if p == "/" or p == "": return ""
+  var i = p.len - 1
+  while i > 0 and p[i] != '/': i -= 1
+  if i == 0: return "/"
+  return p[0..i]

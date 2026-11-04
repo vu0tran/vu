@@ -83,7 +83,7 @@ node ends). Files are parsed on all cores, wave by wave as the import graph reac
   npx, pnpm (`run`, `exec`, `dlx`, `--filter`), pnpx, yarn, bun, cross-env, c8, node, tsx, ts-node,
   tsc (`-p` reads that tsconfig), mocha, vitest, eslint, prettier, oxlint, oxfmt, jest, playwright,
   typedoc, borp, and the fallback (positional files for esbuild, zx..., `concurrently` commands).
-- **Report**: the symbols reporter as knip prints it when stdout isn't a terminal: sections in
+- **Report**: the symbols reporter as knip prints it (colors and widths of a terminal too): sections in
   knip's order, rows sorted with ICU's collation order (punctuation, digits, letters, lowercase
   first), the table's column widths, and its truncation to 120 columns (paths from the start,
   names from the end, with `…`). `--reporter json` writes knip's JSON,
@@ -109,7 +109,7 @@ plugin's settings: `false` (off), `true` (on), a config file
 pattern or list (`"vitest": "config/vitest.ts"`), or an object with `config`, `entry` and `project`.
 Strings or regular expressions where knip takes both. `ignoreExportsUsedInFile` (`true` or per symbol
 type) counts an export referenced in its own file as used, from the same reference positions knip's
-localRefs visitor reads. Not read: `compilers` (custom compiler functions), `cycles` (see Gaps).
+localRefs visitor reads. `compilers` (functions run in node) and `cycles` are read too.
 Absolute paths in a loaded JavaScript config (`path.resolve(__dirname, ...)`) come back
 project-relative, so aliases and entries built from them work. TOML configs (`wrangler.toml`,
 `netlify.toml`, `Tauri.toml`) are read by a small TOML reader (`toml.vu`).
@@ -136,20 +136,26 @@ error messages and the help text). What they do:
 
 | option | status |
 |---|---|
-| `--config`, `--directory`, `--workspace`, `--tsConfig`, `--no-gitignore` | as knip |
-| `--production`, `--strict` | as knip (production entries and dependencies only; strict ownership) |
-| `--include`, `--exclude`, `--dependencies`, `--exports`, `--files` | as knip, with the rules from the configuration |
+| `--config`, `--directory`, `--workspace`, `--tsConfig`, `--no-gitignore`, `--use-tsconfig-files` | as knip |
+| `--production`, `--strict` | as knip (production entries and dependencies only; strict ownership, type-only imports skipped, caught optional peers) |
+| `--include`, `--exclude`, `--dependencies`, `--exports`, `--files`, `--cycles` | as knip, with the rules from the configuration; `--cycles` is knip's findAllCycles (graph order, `cycles.allow`, `cycles.dynamicImports`) |
 | `--include-entry-exports`, `--tags`, `--no-tag-hints`, `--treat-tag-hints-as-errors` | as knip (`@tag` and `-tag`, member tags) |
 | `--no-exit-code`, `--max-issues`, `--max-show-issues` | as knip (exit code 1 when error-level issues exceed the maximum, 2 on errors) |
 | `--no-config-hints`, `--treat-config-hints-as-errors` | as knip; hints are printed on stderr in knip's table |
-| `--reporter` (repeatable), `--output-file` | `symbols` (default), `compact`, `json`, `markdown`, `codeowners`, `disclosure`, `github-actions`, `codeclimate`, `sarif`; not `cycles`, nor a path to a custom reporter module |
-| `--fix`, `--fix-type`, `--allow-remove-files`, `--format` | as knip for exports, types, default exports, dependencies (package.json rewritten in its own indentation) and files; `--format` accepted, no formatter run |
-| `--no-progress`, `--debug`, `--performance`, `--memory`, `--trace*`, `--duration` | accepted, no output |
-| `--cache`, `--cache-location` | accepted; vknip has no cache (its full run is faster than knip's cached one) |
-| `--watch`, `--use-tsconfig-files`, `--preprocessor`, `--cycles` | accepted, no effect (see Gaps) |
-| `--jobs N` | vknip only: parser threads |
+| `--reporter` (repeatable), `--reporter-options`, `--output-file` | `symbols` (default), `compact`, `json`, `markdown`, `codeowners`, `cycles`, `disclosure`, `github-actions`, `codeclimate`, `sarif`, and a path to a custom reporter module (run in node with knip's ReporterOptions) |
+| `--preprocessor`, `--preprocessor-options` | as knip (modules run in node, their output passed on) |
+| `--fix`, `--fix-type`, `--allow-remove-files`, `--format` | as knip for exports, types, default exports, enum and namespace members, dependencies (package.json rewritten in its own indentation), catalog entries and files; `--format` runs the formatter knip's formatly would pick |
+| `--watch` | as knip: inotify on the project's folders, each change reanalyzed, the watch reporter's screen redrawn (see Gaps for how it differs inside) |
+| `--cache`, `--cache-location` | as knip's FileEntryCache (a file's analysis reused while its size and mtime stay the same) |
+| `--trace`, `--trace-export`, `--trace-file`, `--trace-dependency` | knip's trees (buildExportsTree, formatTrace), and for a name a file has only through `export *` its origins as knip's resolveExportOrigins finds them (`[ambiguous]` when several, the origin's tree when one) |
+| `--performance`, `--performance-fn`, `--memory`, `--memory-realtime`, `--duration` | knip's tables and formats, vknip's work timed under knip's function names |
+| `--no-progress` | as knip (it, `--debug` and CI turn off the terminal's progress and redraws) |
+| `--debug` | accepted; knip's debug output isn't printed (see Gaps) |
+| `--jobs N`, `--debug-inputs` | vknip only: parser threads; the inputs each plugin and compiler gave |
 
-knip 6 has no `--include-libs` (it was removed upstream), so there is nothing to port.
+Colors follow knip's: `FORCE_COLOR`, `NO_COLOR`, a terminal (node's styleText codes in titles, tables,
+hints, compact and codeowners lines), tables as wide as the terminal. knip 6 has no `--include-libs`
+(it was removed upstream), so there is nothing to port.
 
 ## Plugins
 
@@ -158,82 +164,96 @@ each plugin and writes its enablers, config file patterns, entry, production and
 `tools/gen_plugins.py` turns that into `plugins.vu`). So every plugin is enabled when knip enables it
 (dependencies, regular-expression enablers, root-only plugins, `isEnabled` checks that look at files)
 and contributes its config files, entry, production and project patterns. What a plugin finds by
-running its `resolveConfig` (reading the loaded config) is ported plugin by plugin:
+running its `resolveConfig`, `resolveFromAST`, `resolve` and visitors is ported plugin by plugin, and
+all 202 are complete: the coverage table at the end (generated by `tools/plugtab.py` from knip's
+plugin list and vknip's code) lists what each has and which tests reach it. Among them Vite/Vitest,
+Next.js (config functions called with the build phase; read from the AST when the config doesn't
+load), Nuxt (srcDir/app entries, modules, layers, aliases, `.nuxt` types and paths), webpack, Rspack
+and Rsbuild (config, rule and entry functions called by the node process, loaders, ProvidePlugin,
+aliases), Docusaurus, SvelteKit, React Router (routes.ts loaded), Expo and Expo Router, Storybook,
+Jest, ESLint (legacy and flat configs), Angular, Lit, Stencil, FAST and Catalyst (custom element and
+`styleUrls` visitors, from the parser's decorator list), Lefthook, Bun, Eleventy, Gatsby, Nx, mise,
+Taskfile and the small ones; `filterTransitiveDependencies` (Prettier, Oxlint, Metro, webpack);
+configs that only re-export a package aren't loaded (`isExternalReExportsOnly`).
 
-- **Ported**: what 160 of the 202 plugins do (resolveConfig, resolveFromAST, resolve and visitors,
-  as far as each has them), among them Vite/Vitest, Next.js (config functions called with the build
-  phase; read from the AST when the config doesn't load), Nuxt (srcDir/app entries, modules, layers,
-  aliases, `.nuxt` types and paths), webpack and Rspack and Rsbuild (config, rule and entry functions
-  called by the node process, loaders, ProvidePlugin, aliases), Docusaurus, SvelteKit, React Router
-  (routes.ts loaded), Expo and Expo Router, Storybook, Jest, ESLint (legacy and flat configs), Karma,
-  Electron Forge, Serverless, GraphQL Codegen, Prisma, Metro, Tauri, Netlify, Wrangler, Drizzle and
-  the small ones; `filterTransitiveDependencies` (Prettier, Oxlint, Metro,
-  webpack); configs that only re-export a package aren't loaded (`isExternalReExportsOnly`).
-- **Partly ported** (42): some part isn't, listed in the coverage table at the end: the custom
-  element and `styleUrls` visitors (Angular, Lit, Stencil, FAST, Catalyst, which need decorators the
-  parser keeps only in the linter's mode), and the resolveConfig of Lefthook, tsdown, Bun, Eleventy,
-  Gatsby, textlint, Relay, rstest, Storybook's AST part, xo's AST part, Quasar, Qwik, Marko, mise,
-  moonrepo, Taskfile, Nx's executors, and a dozen rarely used ones. Where resolveConfig isn't ported
-  and the plugin has a config file, its default entry patterns are used.
-- **Compilers**: `.vue` (scripts, `src` imports, scss `<style>` imports), `.svelte`, `.astro`
-  (frontmatter, scripts, styles), `.mdx`, `.css` with Tailwind (`@import`, `@plugin`, `@config`,
-  `@source`...) and `.scss`/`.sass` (`@use`, `@import`, `@forward`, `url()`), `.prisma`, each enabled
-  as knip enables it.
+**Compilers**: `.vue` (scripts through `vue/compiler-sfc` in node, `src` imports, scss `<style>`
+imports), `.svelte`, `.astro` (frontmatter, scripts, styles), `.mdx`, `.css` with Tailwind (`@import`,
+`@plugin`, `@config`, `@source`...), `.scss`/`.sass` (`@use`, `@import`, `@forward`, `url()`), less,
+stylus, `.prisma`, Marko, tsrx, and the configuration's own `compilers` functions (run in node), each
+enabled per workspace as knip enables it. **Auto-imports**: the imports Nuxt (`.nuxt/imports.d.ts`,
+`components.d.ts`) and unplugin-auto-import / unplugin-vue-components generate, template tags and
+identifiers included, as knip's compilers add them. They need the generated files: after
+`nuxt prepare` (see the framework apps below).
 
-The coverage table is at the end of this file.
+**YAML configs** (GitHub workflows, Lefthook, mocharc, pnpm-workspace, borp...) are read by vknip's own
+reader (`yaml.vu`). A file that reader could read differently from the `yaml` package knip uses, or
+that `yaml` rejects (`yaml.irregular`: indentation that matches no open block, tabs, duplicate keys,
+nested compact mappings, block scalar headers, anchors and aliases, tags, directives, several
+documents, flow collections and quotes over several lines), is parsed by the `yaml` package in node
+instead (the project's, the one next to its knip, or the npm package's own dependency), with knip's
+`Error loading FILE (message)` when it rejects it.
 
 ## Parity
 
 The whole output (stdout, stderr, exit code) of each run was compared with knip 6.44.1's
-(`test/cmp_corpus.py` for real projects, `test/gen_cmp.py` and `test/cmp_cases.sh` for generated ones),
-then the issues per type.
+(`test/cmp_corpus.py` for real projects, `test/gen_cmp.py` and `test/cmp_cases.sh` for generated ones,
+`test/cmp_fixtures.py` for knip's own test fixtures), then the issues per type.
+
+**knip's own tests**: every fixture knip's tests use (packages/knip/test/**/*.test.ts of the knip repo,
+with the options each test passes mapped to flags): **957/957** identical (688 at 98acf53, 904 at
+the start of this round). The `exec('knip ...')` command lines of knip's tests (`test/cmp_cli.py`,
+commands that write files skipped): 118/118 (95 at the start of this round: the other 23 were
+`--trace-export` of names re-exported with `export *`).
 
 **Real projects** (23, listed with their commits in `test/corpus.txt`, dependencies installed with
 `pnpm install --ignore-scripts`): 20 libraries (chalk, defu, dequal, execa, kleur, klona, ky, mitt,
 node-lru-cache, p-queue, scule, superjson, uncrypto, uvu, express, fastify, got, koa, node-glob,
 node-tar) and 3 pnpm monorepos with JavaScript and TypeScript configs loaded through node (webpro-nl/knip:
 7 workspaces, its own `knip.json`; changesets/changesets: 24 workspaces, 24 JS/TS config files;
-unjs/unhead: 28 workspaces, 57 config files, Vue, Svelte, React, Nuxt and Angular packages). knip ran with the project's own configuration.
+unjs/unhead: 28 workspaces, 57 config files, Vue, Svelte, React, Nuxt and Angular packages). knip ran
+with the project's own configuration.
 
-After this round (knip3; baseline in parentheses: the corpus fetched again with
-`test/fetch_corpus.sh`, knip 6.44.1 run again, its default output the same as the cached one):
-
-| reporter | identical runs |
+| run | identical |
 |---|---:|
-| default (symbols), stdout + stderr + exit code | 23/23 (21) |
-| `--reporter json` | 23/23 (21) |
-| `--reporter compact` | 23/23 (21) |
-| `--reporter markdown` | 23/23 (21) |
-| `--reporter disclosure` | 23/23 (20) |
-| `--reporter github-actions` | 23/23 (not implemented) |
-| `--reporter sarif` | 23/23 (not implemented) |
-| `--reporter codeclimate` | 23/23 (not implemented) |
+| default (symbols), stdout + stderr + exit code | 23/23 |
+| `--production` | 23/23 |
+| `--strict` | 23/23 |
+| `--reporter json`, `compact`, `markdown`, `disclosure`, `github-actions`, `sarif`, `codeclimate` | 23/23 each |
 | `--reporter codeowners` | 1/23 (stderr is knip's crash; stdout and exit code 22/23, see below) |
+| `FORCE_COLOR=1` (symbols, compact, disclosure, github-actions; `test/cmp_env.py`) | 23/23 each |
+| `--cache`, 36 edit steps on fastify (`test/cmp_cache.py`: knip, vknip `--cache`, vknip) | 36/36 |
 
 | issue type | knip found | vknip: same | missing | extra |
 |---|---:|---:|---:|---:|
-| Unused files | 948 | 948 | 0 (0) | 0 (4) |
+| Unused files | 948 | 948 | 0 | 0 |
 | Unused dependencies | 19 | 19 | 0 | 0 |
-| Unused devDependencies | 75 | 75 | 0 | 0 (3) |
+| Unused devDependencies | 75 | 75 | 0 | 0 |
 | Referenced optional peerDependencies | 3 | 3 | 0 | 0 |
 | Unlisted dependencies | 58 | 58 | 0 | 0 |
 | Unlisted binaries | 7 | 7 | 0 | 0 |
 | Unresolved imports | 6 | 6 | 0 | 0 |
-| Unused exports | 262 | 262 | 0 (79) | 0 (1) |
-| Unused exported types | 170 | 170 | 0 (5) | 0 (1) |
+| Unused exports | 262 | 262 | 0 | 0 |
+| Unused exported types | 170 | 170 | 0 | 0 |
 | Duplicate exports | 11 | 11 | 0 | 0 |
 
-What the baseline differences were:
+**Framework apps** (14, also in `test/corpus.txt` with pinned commits, the folder knip runs in, the
+generator run after the install, and `test/fetch_corpus.sh` fetches them), each compared in 8 runs: no
+flags, `--production`, `--strict`, `--reporter json`, `--reporter compact`, `--include-entry-exports`,
+`--dependencies`, `--reporter markdown`. All 112 runs identical.
 
-- **unhead** (79 exports, 5 types, 4 files, 2 devDependencies): a Vitest project config
-  (`bench/vitest.config.ts`) aliased `@unhead/schema-org` to `path.resolve(__dirname, ...)`; the
-  absolute path was joined as if it were relative, so the alias never matched, the schema-org and vue
-  sources it reached looked unused, and their exports weren't reported. Absolute paths in loaded
-  configs are now made project-relative by the loader. The rest was Nuxt: its resolveConfig (ported:
-  `app/app.vue` of a fixture was an entry) and the load error knip prints for a Nuxt config whose
-  tsconfig extends a `.nuxt` file that doesn't exist.
-- **changesets** (1 devDependency): unplugin-icons' `resolve()` ignores `@iconify-json/*`; the
-  `await using` declarations that caused the rest before were already parsed by `ts/parse.vu`.
+| app | repository @ commit | setup |
+|---|---|---|
+| Nuxt | nuxt-ui-templates/starter @ 9deb447 | `nuxt prepare` |
+| Nuxt | nuxt-ui-templates/dashboard @ 82afa8d | `nuxt prepare` (auto-imported components and composables: without `.nuxt`, 16 files are reported unused) |
+| Next.js | nextjs/saas-starter @ 6e33e58 | |
+| SvelteKit | sveltejs/realworld @ df79670 | `svelte-kit sync` (its lockfile is broken upstream: installed without it) |
+| React Router | remix-run/react-router-templates @ 067adb3: default, node-custom-server, unstable_rsc-framework-mode, unstable_rsc-data-mode-vite | `react-router typegen` (not in the last) |
+| Astro | satnaing/astro-paper @ befb05d | `astro sync` |
+| Angular | gothinkster/angular-realworld-example-app @ d426ec8 | |
+| Expo | obytes/react-native-template-obytes @ fd9b358 | |
+| Storybook | storybookjs/design-system @ 0c4c043 | |
+| Docusaurus | facebook/docusaurus @ 2a89055, examples/classic | installed in that folder alone |
+| webpack | wbkd/webpack-starter @ 493d511 | |
 
 Orders knip doesn't keep: its JSON, markdown and codeclimate reports list unused files in the order
 its asynchronous directory crawler meets them, which changes from run to run (three runs on uvu gave
@@ -244,6 +264,14 @@ on V8's TimSort steps: `jssort.vu` reproduces V8's algorithm (checked against no
 to 3,000 items). codeowners: knip crashes with a stack trace when `.github/CODEOWNERS` is missing (21
 projects) and with a TypeError on changesets (an empty issue group); vknip prints the same
 `Error: ENOENT ...` line and exit code for the first, and the report for the second.
+
+**--watch** (`test/cmp_watch.py`): knip `--watch` and vknip `--watch` run in a terminal (a pty) on a
+generated project through 12 edits (exports, new, imported and deleted files, the same contents written
+again, a README, package.json, knip.json, a new folder with a file); the screen after each step and
+whether it was redrawn: 13/13 identical (the time and memory of the summary line left out).
+
+**YAML**: `test/yamlirr.vu` on 4,260 mutants of the corpus' 206 YAML files: none that the `yaml`
+package rejects is read by vknip's reader (6 of the 206 originals are handed to `yaml`).
 
 The previous single-package corpus (the 20 libraries above plus microsoft/vscode, see git history of
 this file) is unchanged: vscode was 12,666 of 12,667 lines identical before this work; it wasn't re-run
@@ -258,8 +286,11 @@ this file) is unchanged: vscode was 12,666 of 12,667 lines identical before this
 | `cases4.py` | plugins (first ports), config load errors | 25/25 runs |
 | `cases5.py` | `--fix` and `--fix-type`, files compared after the fix | 21/21 runs |
 | `cases6.py` | catalogs, compilers, yarn globs, `ignoreWorkspaces`, tags, `ignoreExportsUsedInFile` | 18/18 runs |
-| `cases7.py` | the plugins ported in this round (Next.js, webpack, Nuxt, flat ESLint, Expo, Docusaurus, SvelteKit, React Router, Rsbuild, Karma, Serverless, 40 more), with `--production` | 46/46 runs |
+| `cases7.py` | plugins (Next.js, webpack, Nuxt, flat ESLint, Expo, Docusaurus, SvelteKit, React Router, Rsbuild, Karma, Serverless, 40 more), with `--production` | 46/46 runs |
 | `cases8.py` | the visitors: mocks, execa/zx/nano-spawn, `import.meta.glob`, `require.context`, fs glob, pino, knex | 9/9 runs |
+| `cases9.py` | tsconfig `references` (paths, baseUrl and rootDirs of the referenced config that includes the file), with `--strict` and `--production` | 11/11 runs |
+| `cases10.py` | YAML configs knip's parser rejects or vknip's reader isn't sure about | 8/8 runs |
+| `cases11.py` | what the framework apps showed: config files under folders named like a dependency (`webpack --config webpack/x.js`) | 5/5 runs |
 
 Attack rounds (each a new set of cases or a new real project, then fixes until it passed):
 
@@ -278,113 +309,149 @@ Attack rounds (each a new set of cases or a new real project, then fixes until i
 6. Unported resolvers (cases4 additions): a plugin with a config file but no ported resolveConfig
    added no entries at all; it now uses its default entries; Storybook and Cypress ported. This
    round found nothing else.
-
 7. Corpus again (knip3 baseline): absolute paths from loaded configs (79 missing exports in unhead);
    Nuxt's resolveConfig; plugin `resolve()` ignores; a plugin's own ignores gave "Remove from
    ignoreUnresolved" hints.
 8. Reporters on the corpus: compact and codeowners orders (V8 TimSort), duplicates joined with ", " in
-   disclosure, codeowners with no CODEOWNERS file; then github-actions (the unconfigured hints are the
-   symbols reporter's own), codeclimate (exports analyzed in the graph's order), sarif.
-9. Plugins (cases7, written per plugin from knip's sources, 46 runs): a workspace's own package name
-   in a plugin input resolved through vknip's workspace map where node's resolver (knip's) doesn't;
-   Nuxt `alias` folders are checked from the working folder; an Astro frontmatter of two `---` lines
-   crashed vknip (slice out of bounds); a YAML config knip can't parse loads in vknip (see Gaps).
+   disclosure, codeowners with no CODEOWNERS file; then github-actions, codeclimate, sarif.
+9. Plugins (cases7, 46 runs): a workspace's own package name in a plugin input resolved through
+   vknip's workspace map where node's resolver (knip's) doesn't; Nuxt `alias` folders; an Astro
+   frontmatter of two `---` lines crashed vknip (slice out of bounds).
 10. Visitors (cases8): `?raw` `import.meta.glob` files are program files (used, exports analyzed).
 11. `ignoreExportsUsedInFile` (3 cases with every reference position): found nothing.
-12. Speed: the new code showed in callgrind (see Benchmark); fixed, then the corpus, reporters and
-    all generated sets again: nothing.
+12. Speed: the new code showed in callgrind; fixed, then everything again: nothing.
+
+This round (from 0bae240):
+
+13. knip's own fixtures, 904/957 to 957/957, each difference fixed in knip's way: glob results in
+    knip's crawl order (a folder's files before its subfolders'); Vite inline module scripts read after
+    comments are removed; `vi.mock` in a scope that shadows `vi`; webpack rules that are functions;
+    expanded scripts run in their workspace's folder; JSDoc `@import` tags; `node:module` `register`
+    and `findPackageJSON`; `new Worker(path.join(__dirname, ...))`; symbolic links neither listed nor
+    followed (imports through them resolve to the real path); function bodies as scopes; knip's
+    localToExports; negated-only ignore patterns; enum string members by their raw text; subpath
+    imports and workspace exports as knip's findWorkspacePackageTarget; tsconfig types, plugins and
+    jsxImportSource resolved from the workspace reading the config; tsconfig `extends` of workspace
+    packages; built files a relative import reaches mapped to their source; the root workspace always
+    has the top-level ignores; workspaces in knip's order; invalid manifests reported with V8's
+    JSON.parse message; the `.gitignore` files above the project up to the git root; entry
+    re-exports tagged `@public`; config files other workspaces' scripts name are development entries
+    in production.
+14. `--production` and `--strict` on the corpus (now 23/23 each): optional peers imported in a
+    `try` block (IMPORT_FLAGS.CAUGHT) count in `--strict`; package entries without the development
+    entry files in production; config inputs aren't production entries.
+15. Framework apps (the 14 above): a Nuxt tsconfig's gitignored `.nuxt` references are skipped (knip's
+    input handler); `--strict` drops type-only imports of packages (skipTypeOnly); tsconfig
+    `references` as oxc-resolver's `references: 'auto'` applies them, with rootDirs (React Router's
+    `+types`); `webpack --config webpack/x.js` read `webpack/x.js` as a package path. Then cases9 and
+    cases11, written from these: found nothing.
+16. YAML: the first mutant runs found files the `yaml` package rejects that `yaml.irregular` let
+    through to vknip's reader; fixed until none passed. cases10 found only a mistake in my own test
+    (a `run:` list that knip itself crashes on).
+17. `--watch`: a folder created after the start wasn't watched (a file in it gave no redraw); fixed.
+18. `--trace-export` through `export *` (knip's CLI tests, 95/118): knip's resolveExportOrigins
+    ported (the origins of a name through star re-exports, pass-through and aliased re-exports,
+    namespace re-exports and re-exports of packages and builtins as terminals, explicit exports
+    first, cycles); extract records each export's binding and isBindingReExport. 118/118.
+19. Speed: the first measurement of this round's code showed +0.7% to +2.6% instructions (prefilters
+    over the source for `@` tags, the resolver's tsconfig selection, the link checks, the crawl order's
+    path keys); fixed (one pass over the `@` characters, a cache fast path when no tsconfig has
+    references, a cached set of link folders, a cheaper sort key). After the `--trace` work,
+    +0.17% on node-glob, from bigger structures copied by value (see Benchmark); fixed. Then
+    everything again: nothing.
 
 ## Benchmark
 
 CPU time (user + system of the process and everything it waited for, so vknip's node process that
-loads JavaScript configs counts, and both of its threads), best of 3 runs for knip 6.44.1 (Node 22),
-best of 5 for vknip (release build), measured in this round on the 2-core machine shared with other
-jobs (load average 1.1 to 1.5 during the runs). "before" is vknip at the start of the round (e9b2fe3),
-run interleaved with the current one.
+loads JavaScript configs counts, and both of its threads), best of 3 runs each, knip 6.44.1 (Node 22)
+and vknip (release build), measured in this round on the 2-core machine shared with other jobs.
 
-| project | files | knip CPU s | vknip CPU s | CPU ratio | vknip before CPU s |
-|---|---:|---:|---:|---:|---:|
-| chalk | 20 | 1.00 | 0.011 | 91x | 0.010 |
-| defu | 9 | 1.02 | 0.010 | 102x | 0.010 |
-| dequal | 9 | 0.89 | 0.007 | 127x | 0.007 |
-| execa | 639 | 1.34 | 0.036 | 37x | 0.035 |
-| kleur | 13 | 0.93 | 0.009 | 103x | 0.009 |
-| klona | 37 | 0.97 | 0.008 | 121x | 0.008 |
-| ky | 98 | 1.71 | 0.053 | 32x | 0.056 |
-| mitt | 3 | 0.96 | 0.010 | 96x | 0.010 |
-| node-lru-cache | 49 | 1.01 | 0.013 | 78x | 0.013 |
-| p-queue | 17 | 1.29 | 0.021 | 61x | 0.020 |
-| scule | 4 | 0.95 | 0.011 | 86x | 0.012 |
-| superjson | 20 | 1.10 | 0.014 | 79x | 0.015 |
-| uncrypto | 5 | 0.96 | 0.010 | 96x | 0.010 |
-| uvu | 93 | 0.98 | 0.012 | 82x | 0.012 |
-| express | 142 | 1.57 | 0.035 | 45x | 0.036 |
-| fastify | 304 | 3.00 | 0.114 | 26x | 0.118 |
-| got | 98 | 2.40 | 0.096 | 25x | 0.101 |
-| koa | 82 | 1.34 | 0.022 | 61x | 0.023 |
-| node-glob | 59 | 1.14 | 0.013 | 88x | 0.013 |
-| node-tar | 73 | 1.21 | 0.023 | 53x | 0.023 |
-| changesets | 164 | 2.96 | 0.521 | 6x | 0.508 |
-| knip | 4678 | 4.24 | 0.590 | 7x | 0.565 |
-| unhead | 860 | 9.26 | 5.165 | 2x | 5.039 |
+| project | files | knip CPU s | vknip CPU s | CPU ratio | knip wall s | vknip wall s |
+|---|---:|---:|---:|---:|---:|---:|
+| chalk | 20 | 0.80 | 0.010 | 81x | 0.62 | 0.010 |
+| defu | 9 | 0.84 | 0.009 | 96x | 0.66 | 0.009 |
+| dequal | 9 | 0.75 | 0.007 | 105x | 0.61 | 0.007 |
+| execa | 639 | 1.10 | 0.046 | 24x | 0.85 | 0.039 |
+| kleur | 13 | 0.67 | 0.007 | 102x | 0.55 | 0.007 |
+| klona | 37 | 0.68 | 0.006 | 107x | 0.55 | 0.007 |
+| ky | 98 | 1.40 | 0.058 | 24x | 0.96 | 0.040 |
+| mitt | 3 | 0.69 | 0.008 | 86x | 0.56 | 0.008 |
+| node-lru-cache | 49 | 0.76 | 0.011 | 68x | 0.60 | 0.011 |
+| p-queue | 17 | 0.91 | 0.016 | 58x | 0.68 | 0.012 |
+| scule | 4 | 0.70 | 0.008 | 88x | 0.55 | 0.008 |
+| superjson | 20 | 0.72 | 0.012 | 61x | 0.57 | 0.011 |
+| uncrypto | 5 | 0.69 | 0.007 | 96x | 0.54 | 0.007 |
+| uvu | 93 | 0.73 | 0.010 | 74x | 0.59 | 0.010 |
+| express | 142 | 1.23 | 0.029 | 42x | 0.89 | 0.023 |
+| fastify | 304 | 2.19 | 0.089 | 25x | 1.44 | 0.062 |
+| got | 98 | 1.68 | 0.081 | 21x | 1.13 | 0.051 |
+| koa | 82 | 1.08 | 0.017 | 62x | 0.81 | 0.014 |
+| node-glob | 59 | 0.80 | 0.011 | 75x | 0.65 | 0.011 |
+| node-tar | 73 | 0.88 | 0.019 | 45x | 0.68 | 0.017 |
+| changesets | 164 | 2.25 | 0.474 | 5x | 1.57 | 0.458 |
+| knip | 4678 | 3.12 | 0.478 | 7x | 2.07 | 0.402 |
+| unhead | 860 | 6.60 | 3.670 | 2x | 4.68 | 3.047 |
 
-Against the start of the round the CPU time is the same within noise (total 6.65 s before, 6.80 s
-after; unhead, which now loads its Nuxt configs through node as knip does, 5.04 to 5.17 s). Instructions
-(callgrind, builds with `VU_MARCH=x86-64-v2`, one run each): node-glob 55.70 M before, 55.88 M after
-(+0.3%), fastify 548.4 M to 550.1 M (+0.3%), changesets 1,048.6 M to 1,057.6 M (+0.9%), knip
-2,259.5 M to 2,265.3 M (+0.3%); what was added is the visitors and the config reading this round
-ported. Two regressions the first measurement showed were fixed: the visitors searched each file's
-source with memmem for a dozen names (now they look the names up in the parser's interned names), and
-filterTransitiveDependencies read the JSON schema an `.oxlintrc.json` names on every run (now only
-when a dependency could become optional), which had made node-glob 2.5 times slower.
+Against the start of the round (0bae240, built from `git archive` and run on the same machine): CPU
+5.32 s in total before, 5.17 s after. Instructions (callgrind, `--jobs 1`, builds with
+`VU_MARCH=x86-64-v2`, both binaries measured one after the other; the baseline's own runs differed by
+up to 18,000 instructions on node-glob and 350,000 on knip):
+
+| project | 0bae240 | now | change |
+|---|---:|---:|---:|
+| node-glob | 56,346,670 | 56,371,669 | +0.04% |
+| fastify | 563,353,451 | 548,291,002 | -2.7% |
+| changesets | 1,053,080,934 | 1,049,131,502 | -0.4% |
+| knip | 2,002,175,639 | 2,002,327,543 | +0.01% |
+
+node-glob and knip are slightly above the baseline: 9,000 and 78,000 instructions above its highest
+run, about half and a quarter of the spread between its own runs. The export bindings that
+`--trace` needs first cost +0.17% on node-glob: their maps and a field made each file's parse state
+and result bigger, and those are copied by value. They are now recorded only under `--trace`, in
+lists the parse state already has.
 
 ## Gaps
 
-- **Plugins**: 42 of 202 have a part not ported (the coverage table lists which): the custom element
-  and `styleUrls` visitors (Angular, Lit, Stencil, FAST, Catalyst: the parser keeps decorators only in
-  vlint's mode), and the resolveConfig or resolveFromAST of Lefthook, tsdown, Bun, Eleventy, Gatsby,
-  textlint, Relay, rstest, Storybook (AST part), xo (AST part), Quasar, Qwik, Marko, mise, moonrepo,
-  Taskfile, Nx executors, Astro Markdoc, Capacitor, filesystem-routing, Flue, Ladle, LintHTML,
-  Lunaria, Nest, npm-package-json-lint, OpenClaw, osls, Playwright CT, Railway, Raycast, React Cosmos,
-  @solidjs/vite-plugin, TypeScript Content Mapper, Varlock, vite-plugin-pages and
-  vite-plugin-vue-layouts-next. Their default entry patterns are used.
-- **Nuxt and Vue auto-imports**: knip's compilers that add the imports Nuxt (`.nuxt/imports.d.ts`,
-  `components.d.ts`) and unplugin-auto-import / unplugin-vue-components generate, including template
-  tags and identifiers read with `vue/compiler-sfc`. Without `.nuxt` (as in the corpus, installed
-  with `--ignore-scripts`) knip's compilers add nothing, so the corpus doesn't show it.
-- `--cycles` and the `cycles` reporter and config; custom `compilers`; less and stylus compilers;
-  custom reporter and preprocessor modules; `--watch`; `--trace*` and `--performance` output;
-  fixes of enum and namespace members and of catalog entries; published type dependencies of
-  non-private packages.
-- A YAML config knip's parser rejects (say an implicit map key) loads in vknip instead of giving
-  knip's "Error loading ..." message.
-- The JSON, markdown and codeclimate reporters list unused files in vknip's crawl order (by depth,
-  folder by folder, names sorted), knip in its asynchronous crawler's order, which varies.
-- vscode wasn't re-measured: with the 23-project corpus installed the disk had about 1.4 GB free, and
-  its checkout with dependencies wasn't fetched (how much it needs wasn't measured).
+- **`--debug`**: knip's debug output (the options, workspaces, plugins, inputs and files it found) isn't
+  printed; `--debug-inputs` prints vknip's own list.
+- **`--watch`** gives knip's screens, but works differently inside: each change reruns the whole
+  analysis in a child process (knip updates its graph for the changed files), an added file counts
+  by its extension alone, and an added file that is gitignored still redraws the screen.
+- **YAML**: when no `yaml` package can be found (neither the project's, knip's nor the npm package's),
+  the files `yaml.irregular` flags are read by vknip's own reader, which accepts some that knip's
+  parser rejects.
+- The JSON, markdown and codeclimate reporters list unused files in knip's crawl order as it comes out
+  when the crawler's reads finish in order; knip's own order varies from run to run.
+- vscode wasn't re-measured: its checkout with dependencies wasn't fetched (how much disk it needs
+  wasn't measured; the machine had about 2 GB free).
 
 ## Tests
 
 `test/` has the scripts: `cmp_corpus.py` compares real projects with knip (`WORK=dir`, knip's output
-cached in `dir/ref`), `gen_cmp.py CASES OUT` writes the generated projects of a cases file, runs knip
-once (cached) and vknip on each command line, and compares stdout, stderr, exit code and, for `--fix`
-cases, the files left behind; `run_cases.py` and `cmp_cases.sh` do the same for the first sets;
-`bench.py` times both; `globtest.vu` checks the glob matcher against picomatch, `yamltest.vu` the
-YAML reader against the `yaml` package (102 files of the corpus, identical).
+cached in `dir/ref`), `fetch_corpus.sh` clones `corpus.txt` (and installs and sets up the framework
+apps), `gen_cmp.py CASES OUT` writes the generated projects of a cases file, runs knip once (cached)
+and vknip on each command line, and compares stdout, stderr, exit code and, for `--fix` cases, the
+files left behind; `run_cases.py` and `cmp_cases.sh` do the same for the first sets;
+`cmp_fixtures.py` runs knip's own test fixtures, `cmp_cli.py` the command lines of knip's tests,
+`cmp_env.py` runs with environment variables (`FORCE_COLOR=1`), `cmp_cache.py` edits a project step
+by step under `--cache`, `cmp_watch.py` drives `--watch` in a pty; `bench.py` times both;
+`globtest.vu` checks the glob matcher against picomatch, `yamltest.vu` the YAML reader against the
+`yaml` package (102 files of the corpus, identical), `yamlirr.vu` which YAML files go to the `yaml`
+package.
 
 ## Plugin coverage
 
 Generated from knip's plugin list and vknip's code (`tools/plugtab.py`): what each
 plugin has (resolveConfig, resolveFromAST, resolve, visitors) and whether vknip ports it. "tested on"
-names the generated cases and the corpus projects whose dependencies enable the plugin. 160 plugins
-are complete, 42 have a part not ported.
+names the generated cases and the corpus projects whose dependencies enable the plugin. All 202
+plugins are complete.
 
 | plugin | status | tested on |
 |---|---|---|
-| Angular (`angular`) | resolveConfig ported; visitors NOT ported | unhead |
+| Angular (`angular`) | resolveConfig ported; visitors ported | unhead |
 | Astro (`astro`) | resolveFromAST ported; resolve ported | generated; knip |
 | Astro DB (`astro-db`) | complete (static plugin) |  |
-| Astro Markdoc (`astro-markdoc`) | resolveConfig NOT ported |  |
+| Astro Markdoc (`astro-markdoc`) | resolveConfig ported |  |
 | astro-og-canvas (`astro-og-canvas`) | resolve ported |  |
 | Ava (`ava`) | resolveConfig ported | ky, uvu |
 | Babel (`babel`) | resolveConfig ported | generated; uvu |
@@ -392,10 +459,10 @@ are complete, 42 have a part not ported.
 | Borp (`borp`) | ported (hand-written) | fastify |
 | Buf (`buf`) | resolveConfig ported |  |
 | bumpp (`bumpp`) | complete (static plugin) | unhead |
-| Bun (`bun`) | resolveConfig NOT ported; resolve NOT ported |  |
+| Bun (`bun`) | resolveConfig ported; resolve ported |  |
 | c8 (`c8`) | complete (static plugin) | generated |
-| Capacitor (`capacitor`) | resolveConfig NOT ported |  |
-| Catalyst (`catalyst`) | visitors NOT ported |  |
+| Capacitor (`capacitor`) | resolveConfig ported |  |
+| Catalyst (`catalyst`) | visitors ported |  |
 | Changelogen (`changelogen`) | complete (static plugin) | defu, scule, uncrypto |
 | Changelogithub (`changelogithub`) | complete (static plugin) |  |
 | Changesets (`changesets`) | resolveConfig ported | generated; changesets |
@@ -413,7 +480,7 @@ are complete, 42 have a part not ported.
 | Drizzle (`drizzle`) | resolveConfig ported |  |
 | Electron Forge (`electron-forge`) | resolveConfig ported |  |
 | electron-vite (`electron-vite`) | resolveConfig ported | generated |
-| Eleventy (`eleventy`) | resolveConfig NOT ported |  |
+| Eleventy (`eleventy`) | resolveConfig ported |  |
 | esbuild (`esbuild`) | resolveFromAST ported | generated; node-glob, node-lru-cache, node-tar, unhead +1 |
 | ESLint (`eslint`) | resolveConfig ported; resolveFromAST ported | generated; changesets, express, fastify, mitt +3 |
 | eve (`eve`) | complete (static plugin) |  |
@@ -421,11 +488,11 @@ are complete, 42 have a part not ported.
 | Expo (`expo`) | resolveConfig ported; resolve ported | generated |
 | Expo Router (`expo-router`) | resolveConfig ported | generated |
 | Expressive Code (`expressive-code`) | complete (static plugin) | knip |
-| FAST (`fast`) | visitors NOT ported |  |
-| filesystem-routing (`filesystem-routing`) | resolveFromAST NOT ported |  |
-| Flue (`flue`) | resolveFromAST NOT ported |  |
+| FAST (`fast`) | visitors ported |  |
+| filesystem-routing (`filesystem-routing`) | resolveFromAST ported |  |
+| Flue (`flue`) | resolveFromAST ported |  |
 | Fumadocs (`fumadocs`) | complete (static plugin) |  |
-| Gatsby (`gatsby`) | resolveConfig NOT ported |  |
+| Gatsby (`gatsby`) | resolveConfig ported |  |
 | GitHub Action (`github-action`) | resolveConfig ported | generated |
 | GitHub Actions (`github-actions`) | ported (hand-written) |  |
 | glob (`glob`) | complete (static plugin) |  |
@@ -438,30 +505,30 @@ are complete, 42 have a part not ported.
 | Karma (`karma`) | resolveConfig ported | generated |
 | Knex (`knex`) | resolveConfig ported; visitors ported | generated |
 | kysely-codegen (`kysely-codegen`) | complete (static plugin) |  |
-| Ladle (`ladle`) | resolveConfig NOT ported |  |
+| Ladle (`ladle`) | resolveConfig ported |  |
 | laravel-vite-plugin (`laravel-vite-plugin`) | resolveFromAST ported | generated |
-| Lefthook (`lefthook`) | resolveConfig NOT ported |  |
+| Lefthook (`lefthook`) | ported (hand-written) | generated |
 | Lingui (`lingui`) | complete (static plugin) |  |
 | lint-staged (`lint-staged`) | resolveConfig ported | generated; changesets |
-| LintHTML (`linthtml`) | resolveConfig NOT ported |  |
-| Lit (`lit`) | visitors NOT ported |  |
+| LintHTML (`linthtml`) | resolveConfig ported |  |
+| Lit (`lit`) | visitors ported |  |
 | lockfile-lint (`lockfile-lint`) | complete (static plugin) |  |
 | Lost Pixel (`lost-pixel`) | complete (static plugin) |  |
-| Lunaria (`lunaria`) | resolveConfig NOT ported |  |
+| Lunaria (`lunaria`) | resolveConfig ported |  |
 | markdownlint (`markdownlint`) | resolveConfig ported | generated; fastify |
-| Marko (`marko`) | resolveConfig NOT ported |  |
+| Marko (`marko`) | resolveConfig ported |  |
 | Mastra (`mastra`) | complete (static plugin) |  |
 | MCP (`mcp`) | ported (hand-written) |  |
 | MDX (`mdx`) | resolveConfig ported | generated; knip |
 | mdxlint (`mdxlint`) | resolveConfig ported | knip |
 | Metro (`metro`) | resolveConfig ported | generated |
-| mise (`mise`) | resolveConfig NOT ported |  |
+| mise (`mise`) | resolveConfig ported |  |
 | Mocha (`mocha`) | resolveConfig ported | generated; express, mitt, uvu |
-| moonrepo (`moonrepo`) | resolveConfig NOT ported |  |
+| moonrepo (`moonrepo`) | resolveConfig ported |  |
 | Mock Service Worker (`msw`) | resolveConfig ported | generated |
 | nano-spawn (`nano-spawn`) | visitors ported | generated |
 | Nano Staged (`nano-staged`) | resolveConfig ported | generated |
-| Nest (`nest`) | resolveConfig NOT ported |  |
+| Nest (`nest`) | resolveConfig ported |  |
 | Netlify (`netlify`) | resolveConfig ported |  |
 | Next.js (`next`) | resolveConfig ported; resolveFromAST ported | generated |
 | next-intl (`next-intl`) | complete (static plugin) |  |
@@ -470,16 +537,16 @@ are complete, 42 have a part not ported.
 | Node.js (`node`) | ported (hand-written); visitors ported |  |
 | node-modules-inspector (`node-modules-inspector`) | complete (static plugin) |  |
 | nodemon (`nodemon`) | complete (static plugin) |  |
-| npm-package-json-lint (`npm-package-json-lint`) | resolveConfig NOT ported |  |
+| npm-package-json-lint (`npm-package-json-lint`) | resolveConfig ported |  |
 | Nuxt (`nuxt`) | resolveConfig ported; resolve ported | generated; unhead |
 | @nuxtjs/i18n (`nuxtjs-i18n`) | complete (static plugin) |  |
-| Nx (`nx`) | resolveConfig ported; resolve NOT ported | generated |
+| Nx (`nx`) | resolveConfig ported; resolve ported | generated |
 | nyc (`nyc`) | resolveConfig ported | express |
 | oclif (`oclif`) | resolveConfig ported | generated |
 | openapi-ts (`openapi-ts`) | complete (static plugin) |  |
-| OpenClaw (`openclaw`) | resolveConfig NOT ported; resolveFromAST NOT ported |  |
+| OpenClaw (`openclaw`) | resolveConfig ported; resolveFromAST ported |  |
 | orval (`orval`) | resolveFromAST ported | generated |
-| osls (`osls`) | resolveConfig NOT ported |  |
+| osls (`osls`) | resolveConfig ported |  |
 | Oxfmt (`oxfmt`) | complete (static plugin) | changesets, defu, knip |
 | Oxlint (`oxlint`) | resolveConfig ported | defu, knip, node-glob, node-lru-cache +1 |
 | Panda CSS (`panda-css`) | resolveConfig ported |  |
@@ -487,7 +554,7 @@ are complete, 42 have a part not ported.
 | Payload CMS (`payload`) | resolveConfig ported | generated |
 | pino (`pino`) | visitors ported | generated; fastify |
 | Playwright (`playwright`) | resolveConfig ported | generated; unhead |
-| Playwright for components (`playwright-ct`) | resolveConfig NOT ported |  |
+| Playwright for components (`playwright-ct`) | resolveConfig ported |  |
 | playwright-test (`playwright-test`) | complete (static plugin) |  |
 | Plop (`plop`) | complete (static plugin) |  |
 | pm2 (`pm2`) | resolveConfig ported | generated |
@@ -498,15 +565,15 @@ are complete, 42 have a part not ported.
 | Prettier (`prettier`) | resolveConfig ported | generated; knip, mitt, node-glob, node-lru-cache +3 |
 | Prisma (`prisma`) | resolveConfig ported | generated |
 | PurgeCSS (`purgecss`) | complete (static plugin) |  |
-| Quasar (`quasar`) | resolveFromAST NOT ported |  |
-| Qwik (`qwik`) | resolveFromAST NOT ported |  |
-| Railway (`railway`) | resolveFromAST NOT ported |  |
-| Raycast (`raycast`) | resolveConfig NOT ported |  |
-| React Cosmos (`react-cosmos`) | resolveConfig NOT ported |  |
+| Quasar (`quasar`) | resolveFromAST ported |  |
+| Qwik (`qwik`) | resolveFromAST ported |  |
+| Railway (`railway`) | resolveFromAST ported |  |
+| Raycast (`raycast`) | resolveConfig ported |  |
+| React Cosmos (`react-cosmos`) | resolveConfig ported |  |
 | React Email (`react-email`) | complete (static plugin) |  |
 | React Native (`react-native`) | resolveConfig ported; resolve ported | generated |
 | React Router (`react-router`) | resolveConfig ported | generated |
-| Relay (`relay`) | resolveConfig NOT ported |  |
+| Relay (`relay`) | resolveConfig ported |  |
 | Release It! (`release-it`) | resolveConfig ported | generated; knip |
 | Remark (`remark`) | resolveConfig ported | knip |
 | Remix (`remix`) | complete (static plugin) |  |
@@ -515,18 +582,18 @@ are complete, 42 have a part not ported.
 | Rsbuild (`rsbuild`) | resolveConfig ported |  |
 | Rslib (`rslib`) | resolveFromAST ported |  |
 | Rspack (`rspack`) | resolveConfig ported; visitors ported | generated |
-| Rstest (`rstest`) | resolveConfig NOT ported; visitors ported |  |
+| Rstest (`rstest`) | resolveConfig ported; visitors ported |  |
 | Sanity (`sanity`) | complete (static plugin) |  |
 | Semantic Release (`semantic-release`) | resolveConfig ported | generated |
 | Sentry (`sentry`) | complete (static plugin) |  |
 | Serverless Framework (`serverless-framework`) | resolveConfig ported |  |
 | simple-git-hooks (`simple-git-hooks`) | resolveConfig ported | generated |
 | size-limit (`size-limit`) | resolve ported |  |
-| @solidjs/vite-plugin (`solidjs-vite-plugin`) | resolveFromAST NOT ported |  |
+| @solidjs/vite-plugin (`solidjs-vite-plugin`) | resolveFromAST ported |  |
 | SST (`sst`) | resolveFromAST ported | generated |
 | Starlight (`starlight`) | resolveFromAST ported | knip |
-| Stencil (`stencil`) | resolveFromAST ported; visitors NOT ported |  |
-| Storybook (`storybook`) | resolveConfig ported; resolveFromAST NOT ported | generated |
+| Stencil (`stencil`) | resolveFromAST ported; visitors ported |  |
+| Storybook (`storybook`) | resolveConfig ported; resolveFromAST ported | generated |
 | Stryker (`stryker`) | resolveConfig ported |  |
 | Stylelint (`stylelint`) | resolveConfig ported | generated |
 | Svelte (`svelte`) | complete (static plugin) | generated; unhead, uvu |
@@ -538,21 +605,21 @@ are complete, 42 have a part not ported.
 | Syncpack (`syncpack`) | complete (static plugin) |  |
 | Tailwind (`tailwind`) | complete (static plugin) | unhead |
 | TanStack Router (`tanstack-router`) | resolveConfig ported |  |
-| Taskfile (`taskfile`) | resolveConfig NOT ported |  |
+| Taskfile (`taskfile`) | resolveConfig ported |  |
 | Tauri (`tauri`) | resolveConfig ported |  |
 | Temporal.io (`temporal`) | complete (static plugin) |  |
-| textlint (`textlint`) | resolveConfig NOT ported |  |
+| textlint (`textlint`) | resolveConfig ported |  |
 | Travis CI (`travis`) | resolveConfig ported |  |
 | ts-node (`ts-node`) | complete (static plugin) | generated |
 | tsd (`tsd`) | resolveConfig ported | generated |
-| tsdown (`tsdown`) | resolveConfig NOT ported; resolveFromAST ported | changesets |
+| tsdown (`tsdown`) | resolveConfig ported; resolveFromAST ported | changesets |
 | tsrs (`tsrs`) | ported (hand-written) |  |
 | tsup (`tsup`) | resolveConfig ported; resolveFromAST ported | generated |
 | tsx (`tsx`) | ported (hand-written) | generated |
 | Turborepo (`turbo`) | resolve ported |  |
 | TypeDoc (`typedoc`) | ported (hand-written) | node-glob, node-lru-cache, node-tar |
 | TypeScript (`typescript`) | ported (hand-written) | generated; chalk, changesets, defu, execa +10 |
-| TypeScript Content Mapper (`typescript-content-mapper`) | resolveConfig NOT ported |  |
+| TypeScript Content Mapper (`typescript-content-mapper`) | resolveConfig ported |  |
 | unbuild (`unbuild`) | resolveConfig ported | defu, scule, uncrypto, unhead |
 | UnoCSS (`unocss`) | complete (static plugin) |  |
 | unplugin-auto-import (`unplugin-auto-import`) | complete (static plugin) | unhead |
@@ -561,14 +628,14 @@ are complete, 42 have a part not ported.
 | @intlify/unplugin-vue-i18n (`unplugin-vue-i18n`) | complete (static plugin) |  |
 | unplugin-vue-markdown (`unplugin-vue-markdown`) | complete (static plugin) |  |
 | unplugin-vue-router (`unplugin-vue-router`) | complete (static plugin) | unhead |
-| Varlock (`varlock`) | resolve NOT ported |  |
+| Varlock (`varlock`) | resolve ported |  |
 | Vercel (`vercel`) | complete (static plugin) |  |
 | Vercel OG (`vercel-og`) | complete (static plugin) |  |
 | Vike (`vike`) | complete (static plugin) |  |
 | Vite (`vite`) | resolveConfig ported; resolveFromAST ported; resolve ported; visitors ported | generated; changesets, defu, scule, superjson +2 |
-| vite-plugin-pages (`vite-plugin-pages`) | resolveFromAST NOT ported; resolve ported |  |
+| vite-plugin-pages (`vite-plugin-pages`) | resolveFromAST ported; resolve ported |  |
 | vite-plugin-pwa (`vite-plugin-pwa`) | resolveFromAST ported | generated |
-| vite-plugin-vue-layouts-next (`vite-plugin-vue-layouts-next`) | resolveFromAST NOT ported |  |
+| vite-plugin-vue-layouts-next (`vite-plugin-vue-layouts-next`) | resolveFromAST ported |  |
 | vite-plus (`vite-plus`) | resolveFromAST ported | generated |
 | @vite-pwa/assets-generator (`vite-pwa-assets-generator`) | complete (static plugin) |  |
 | VitePress (`vitepress`) | complete (static plugin) | changesets |
@@ -579,7 +646,7 @@ are complete, 42 have a part not ported.
 | Wireit (`wireit`) | resolveConfig ported | generated |
 | Wrangler (`wrangler`) | resolveConfig ported | generated |
 | WXT (`wxt`) | resolveConfig ported | generated |
-| xo (`xo`) | resolveConfig ported; resolveFromAST NOT ported | chalk, execa, got, ky +1 |
+| xo (`xo`) | resolveConfig ported; resolveFromAST ported | chalk, execa, got, ky +1 |
 | Yarn (`yarn`) | resolveConfig ported |  |
 | yorkie (`yorkie`) | resolveConfig ported | generated |
 | zx (`zx`) | visitors ported | generated |

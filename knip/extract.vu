@@ -20,6 +20,7 @@ const F_OPAQUE = 64
 const F_AUGMENT = 128
 const F_DYNAMIC = 256
 const F_LOADER = 512
+const F_CAUGHT = 1024     # a dynamic import awaited in a try block that has a catch
 
 # JSDoc tags that matter
 const TAG_PUBLIC = 1
@@ -43,6 +44,7 @@ type Imp:
   pos: Int        # byte offset (for the import's own position)
   spos: Int       # byte offset of the specifier (-1: pos)
   flags: Int
+  tags: Int       # its statement's JSDoc tags
 
 type Op:
   spec: Str
@@ -56,6 +58,7 @@ type Member:
   pos: Int
   tags: Int
   in_file: Bool
+  fix: [Int]        # what --fix removes (start, end, flags), empty: nothing
 
 type Exp:
   name: Str
@@ -151,11 +154,52 @@ type St:
   fix_next: [Int]           # the fix of the next export added
   vis: {Str: Bool}          # the plugins whose visitors run (registerVisitors)
   globs: [Str]
+  jest_calls: [Int]         # jest.mock(...) calls, read after the walk (their jest may be shadowed)
+  vi_mocks: {Int: Int}      # vi.mock(import("x"), factory): the import call -> vi's node
+  caught: Int               # try blocks with a catch around the node (in this function)
+  caught_ix: {Int: Bool}    # import calls awaited inside them
+  node_module: Bool         # module or node:module is imported
+  worker_threads: Bool
+  exp_new: Bool             # the last add_export created the export
+  want_binds: Bool          # (--trace) the exports' bindings are recorded (set_bind)
+  at_bits: Int              # the JSDoc words in the file (at_scan)
+  stmt_tags: Int            # the JSDoc tags of the statement being read (its imports carry them)
 
 fn new_st(own src: Str, path: Str) -> St:
   let is_js = path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")
   let is_dts = path.endswith(".d.ts") or path.endswith(".d.cts") or path.endswith(".d.mts")
-  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [], {}, {}, false, false, [], false, [], [], [], {}, [])
+  let ab = at_scan(src)
+  return St(src, is_js, is_dts, false, [], [], [], {}, [], {}, {}, {}, [], [], 0, [], {}, {}, {}, {}, {}, {}, [], [], {}, {}, {}, {}, {}, [], [], {}, -1, 0, [], [], {}, {}, false, false, [], false, [], [], [], {}, [], [], {}, 0, {}, false, false, false, false, ab, 0)
+
+# the JSDoc words a file has, in one pass over its '@'s (each a bit: AT_PUBLIC...)
+const AT_PUBLIC = 1
+const AT_BETA = 2
+const AT_ALIAS = 4
+const AT_INTERNAL = 8
+const AT_IMPORT = 16
+const AT_JSX = 32
+const AT_ENV = 64
+
+fn at_word(src: Str, i: Int, w: Str) -> Bool:
+  if i + w.len > src.len: return false
+  for k in 0..w.len:
+    if src[i + k] != w[k]: return false
+  return true
+
+fn at_scan(src: Str) -> Int:
+  var bits = 0
+  var i = src.find("@")
+  while i >= 0:
+    let r = i + 1
+    if at_word(src, r, "public"): bits = bits | AT_PUBLIC
+    elif at_word(src, r, "beta"): bits = bits | AT_BETA
+    elif at_word(src, r, "alias"): bits = bits | AT_ALIAS
+    elif at_word(src, r, "internal"): bits = bits | AT_INTERNAL
+    elif at_word(src, r, "import"): bits = bits | AT_IMPORT
+    elif at_word(src, r, "jsxImportSource"): bits = bits | AT_JSX
+    elif at_word(src, r, "vitest-environment") or at_word(src, r, "jest-environment"): bits = bits | AT_ENV
+    i = src.find("@", r)
+  return bits
 
 fn nm(t: Ast, n: Int) -> Str:
   let s = t.nd[n].s
@@ -183,7 +227,7 @@ fn str_val(t: Ast, n: Int) -> Str:
 
 fn add_imp(var s: St, spec: Str, ident: Str, alias: Str, ns: Str, pos: Int, flags: Int, spos: Int):
   if spec == "": return
-  s.imps.push(Imp(spec + "", ident + "", alias + "", ns + "", pos, spos, flags))
+  s.imps.push(Imp(spec + "", ident + "", alias + "", ns + "", pos, spos, flags, s.stmt_tags))
 
 fn op_li(var s: St, local: Str, k: Int, a: Str, b: Str):
   let spec = s.li[local].spec + ""
@@ -306,7 +350,7 @@ fn build_tags(var s: St):
   var any_user = false
   for u in s.user_tags:
     if s.src.find(u) >= 0: any_user = true
-  if not any_user and s.src.find("@public") < 0 and s.src.find("@beta") < 0 and s.src.find("@alias") < 0 and s.src.find("@internal") < 0: return
+  if not any_user and (s.at_bits & (AT_PUBLIC | AT_BETA | AT_ALIAS | AT_INTERNAL)) == 0: return
   let cm = comments(s.src)
   let n = s.src.len
   var reach = n
@@ -439,14 +483,28 @@ fn add_export(var s: St, name: Str, typ: Str, pos: Int, own members: [Member], r
   if name in s.exp_ix:
     s.fix_next = []
     let i = s.exp_ix[name]
-    for m in members: s.exps[i].members.push(Member(m.name + "", m.pos, m.tags, m.in_file))
+    for m in members: s.exps[i].members.push(Member(m.name + "", m.pos, m.tags, m.in_file, copy_ints(m.fix)))
     s.exps[i].tags = s.exps[i].tags | tags
     s.exps[i].reexport = reexport
+    s.exp_new = false
+    if s.want_binds: s.globs.push("\0" + name)
     return
+  s.exp_new = true
   s.exp_ix[name] = s.exps.len
   var fix: [Int] = []
   swap(&fix, &s.fix_next)
   s.exps.push(Exp(name + "", typ + "", pos, members, tags, false, reexport, [], fix))
+
+# the binding and isBindingReExport of the export just added (knip's addExport arguments)
+fn set_bind(var s: St, name: Str, binding: Str, bre: Bool):
+  if not s.want_binds: return
+  if binding == name and not bre: return
+  var f = "0"
+  if bre: f = "1"
+  var nw = "0"
+  if s.exp_new: nw = "1"
+  # (kept with the globs, "\0" first: name \t binding \t isBindingReExport \t new; "\0" name: reset)
+  s.globs.push("\0" + name + "\t" + binding + "\t" + f + "\t" + nw)
 
 fn add_ref_in_export(var s: St, name: Str, exp: Str):
   if name in s.ref_in:
@@ -626,7 +684,18 @@ fn enum_members(var s: St, t: Ast, n: Int) -> [Member]:
     let id = t.nd[m].a
     var name = ""
     if id >= 0: name = nm(t, id)
-    out.push(Member(name, t.nd[id].pos, tags_at(s, t.nd[m].pos), name == ""))
+    # (a string literal: its raw text without the quotes, as knip's stripQuotes(raw))
+    if id >= 0 and t.nd[id].k == ast.N_STR:
+      let a = t.nd[id].pos
+      if a < s.src.len and (s.src[a] == '\'' or s.src[a] == '"'):
+        let q = s.src[a]
+        var e = a + 1
+        while e < s.src.len and s.src[e] != q:
+          if s.src[e] == '\\': e += 1
+          e += 1
+        if e < s.src.len: name = s.src[a + 1..e]
+    # (--fix: the member, its comma and its line break)
+    out.push(Member(name, t.nd[id].pos, tags_at(s, t.nd[m].pos), name == "", [t.nd[m].pos, t.nd[m].end, 5]))
   return out
 
 fn handle_var_export(var s: St, t: Ast, v: Int, start: Int):
@@ -646,6 +715,7 @@ fn handle_var_export(var s: St, t: Ast, v: Int, start: Int):
           name = nm(t, target)
           pos = t.nd[target].pos
         if name == "": continue
+        s.fix_next = [t.nd[e].pos, t.nd[e].end, 1]
         add_export(&s, name, "unknown", pos, [], false, tags)
         if init >= 0: refs_in(&s, t, init, name, false)
         s.destructured[name] = true
@@ -655,6 +725,7 @@ fn handle_var_export(var s: St, t: Ast, v: Int, start: Int):
         let target = t.nd[e].b
         if not is_id(t, target): continue
         let name = nm(t, target)
+        s.fix_next = [t.nd[e].pos, t.nd[e].end, 0]
         add_export(&s, name, "unknown", t.nd[target].pos, [], false, tags)
         if init >= 0: refs_in(&s, t, init, name, false)
         s.destructured[name] = true
@@ -763,20 +834,24 @@ fn ns_members(var s: St, t: Ast, n: Int, prefix: Str) -> [Member]:
     if not exported: continue
     let start = stmt_start(s, t.nd[st].pos)
     let tags = tags_at(s, start)
+    # (--fix removes the whole statement, a declaration list only when it declares one name)
+    let one = k != ast.N_VAR or ast.count(t, t.nd[st].a) == 1
+    var fx: [Int] = []
+    if one: fx = [start, t.nd[st].end, 5]
     if k == ast.N_VAR:
       for d in ast.items(t, t.nd[st].a):
         let id = t.nd[d].a
-        if is_id(t, id): ns_add(&out, prefix, nm(t, id), t.nd[id].pos, tags)
+        if is_id(t, id): ns_add(&out, prefix, nm(t, id), t.nd[id].pos, tags, fx)
     elif k == ast.N_MODULE:
       let id = t.nd[st].a
       if is_id(t, id):
-        ns_add(&out, prefix, nm(t, id), t.nd[id].pos, tags)
+        ns_add(&out, prefix, nm(t, id), t.nd[id].pos, tags, [])
         var p2 = nm(t, id)
         if prefix != "": p2 = prefix + "." + p2
-        for m in ns_members(&s, t, st, p2): out.push(Member(m.name + "", m.pos, m.tags, m.in_file))
+        for m in ns_members(&s, t, st, p2): out.push(Member(m.name + "", m.pos, m.tags, m.in_file, copy_ints(m.fix)))
     else:
       let name = nm(t, st)
-      if name != "": ns_add(&out, prefix, name, decl_name_pos(t, st), tags)
+      if name != "": ns_add(&out, prefix, name, decl_name_pos(t, st), tags, fx)
   return out
 
 # Members of a namespace that other declarations in it refer to (markNamespaceMemberRefs).
@@ -950,7 +1025,20 @@ fn ns_visit(t: Ast, var m: NsMark, n: Int, var hits: {Int: Bool}):
   if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW:
     for p in ast.items(t, nd.b): binding_names(t, p, &shadow)
     if k == ast.N_FUNCEXPR and nm(t, n) != "": shadow[nm(t, n)] = true
+    # (var declarations anywhere in the body are the function's)
+    hoisted_vars(t, nd.d, &shadow)
     has_shadow = shadow.len > 0
+  elif k == ast.N_TRY:
+    # (the catch binding shadows in the catch block)
+    ns_visit(t, &m, nd.a, &hits)
+    var cs: {Str: Bool} = {}
+    if nd.b >= 0: binding_names(t, t.nd[nd.b].a, &cs)
+    let has_cs = cs.len > 0
+    if has_cs: m.scopes.push(NsScope("", cs, {}, true))
+    ns_visit(t, &m, nd.c, &hits)
+    if has_cs: m.scopes.pop()
+    ns_visit(t, &m, nd.d, &hits)
+    return
   elif k == ast.N_BLOCK:
     for st in ast.items(t, nd.a): decl_names_of(t, st, &shadow)
     has_shadow = shadow.len > 0
@@ -964,14 +1052,48 @@ fn ns_visit(t: Ast, var m: NsMark, n: Int, var hits: {Int: Bool}):
   if k != ast.N_VAR and k != ast.N_INTERFACE and k != ast.N_TYPEALIAS and k != ast.N_PROPACCESS: ns_visit(t, &m, nd.d, &hits)
   if has_shadow: m.scopes.pop()
 
-fn ns_add(var out: [Member], prefix: Str, name: Str, pos: Int, tags: Int):
+# the names var declares in a function body (blocks and statements, not nested functions)
+fn hoisted_vars(t: Ast, n: Int, var names: {Str: Bool}):
+  if n < 0: return
+  let k = t.nd[n].k
+  let nd = t.nd[n]
+  if k == ast.N_LIST:
+    for x in ast.items(t, n): hoisted_vars(t, x, &names)
+  elif k == ast.N_VAR:
+    if nd.f == 0:
+      for d in ast.items(t, nd.a): binding_names(t, t.nd[d].a, &names)
+  elif k == ast.N_BLOCK: hoisted_vars(t, nd.a, &names)
+  elif k == ast.N_IF:
+    hoisted_vars(t, nd.b, &names)
+    hoisted_vars(t, nd.c, &names)
+  elif k == ast.N_FOR:
+    hoisted_vars(t, nd.a, &names)
+    hoisted_vars(t, nd.d, &names)
+  elif k == ast.N_FORIN:
+    hoisted_vars(t, nd.a, &names)
+    hoisted_vars(t, nd.c, &names)
+  elif k == ast.N_WHILE or k == ast.N_WITH: hoisted_vars(t, nd.b, &names)
+  elif k == ast.N_DO or k == ast.N_LABEL: hoisted_vars(t, nd.a, &names)
+  elif k == ast.N_TRY:
+    hoisted_vars(t, nd.a, &names)
+    hoisted_vars(t, nd.c, &names)
+    hoisted_vars(t, nd.d, &names)
+  elif k == ast.N_SWITCH:
+    for c in ast.items(t, nd.b): hoisted_vars(t, t.nd[c].b, &names)
+
+fn ns_add(var out: [Member], prefix: Str, name: Str, pos: Int, tags: Int, fix: [Int]):
   var full = name + ""
   if prefix != "": full = prefix + "." + name
   for i in 0..out.len:
     if out[i].name == full:
       out[i].tags = out[i].tags | tags
       return
-  out.push(Member(full, pos, tags, false))
+  out.push(Member(full, pos, tags, false, copy_ints(fix)))
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var out: [Int] = []
+  for x in xs: out.push(x)
+  return out
 
 fn handle_export_specs(var s: St, t: Ast, n: Int):
   # export { a, b as c } (no module)
@@ -986,9 +1108,11 @@ fn handle_export_specs(var s: St, t: Ast, n: Int):
     var typ = "unknown"
     if is_type: typ = "type"
     var reexport = false
+    var bre = false
     if local in s.li:
       reexport = true
       let l = li_get(s, local)
+      bre = not l.is_dyn
       if l.is_ns: op(&s, l.spec, OP_REEXPORTNS, exported, "")
       elif l.imported != exported: op(&s, l.spec, OP_REEXPORTAS, l.imported, exported)
       else: op(&s, l.spec, OP_REEXPORT, l.imported, "")
@@ -996,6 +1120,7 @@ fn handle_export_specs(var s: St, t: Ast, n: Int):
     let pos = name_after_as(s, t, sp)
     s.fix_next = [t.nd[sp].pos, t.nd[sp].end, 3]
     add_export(&s, exported, typ, pos, [], reexport, tags)
+    set_bind(&s, exported, local, bre)
     s.spec_names[exported] = true
     add_local_to_export(&s, local, exported)
 
@@ -1054,16 +1179,36 @@ fn handle_export_default(var s: St, t: Ast, n: Int, decl: Int):
       if name in s.exp_ix:
         let ex = exp_get(s, name)
         add_dup(&s, name, ex.pos, "default", t.nd[decl].pos)
+  var kw = start + 6
+  while kw < s.src.len and is_ws(s.src[kw]): kw += 1
+  if s.src[kw..min(kw + 7, s.src.len)] == "default": kw += 7
+  while kw < s.src.len and is_ws(s.src[kw]): kw += 1
   if (k == ast.N_FUNC or k == ast.N_CLASS) and nm(t, decl) != "":
     # export default function f / class C: "export default " goes
-    var kw = start + 6
-    while kw < s.src.len and is_ws(s.src[kw]): kw += 1
-    if s.src[kw..min(kw + 7, s.src.len)] == "default": kw += 7
-    while kw < s.src.len and is_ws(s.src[kw]): kw += 1
     s.fix_next = [start, kw, 0]
   else:
-    s.fix_next = [start, t.nd[n].end + 1, 0]
+    # (an anonymous class or function is at its keyword; a class goes with its decorators)
+    if (k == ast.N_FUNC or k == ast.N_CLASS) and s.src[start..min(start + 6, s.src.len)] == "export": pos = kw
+    var fs_ = start
+    if k == ast.N_CLASS: fs_ = decorators_start(s.src, start)
+    s.fix_next = [fs_, t.nd[n].end + 1, 0]
   add_export(&s, "default", typ, pos, [], false, tags)
+  if k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_INTERFACE:
+    if nm(t, decl) != "": set_bind(&s, "default", nm(t, decl), false)
+
+# where the decorators on the lines before a statement start (the statement's start when none)
+fn decorators_start(src: Str, start: Int) -> Int:
+  var at = start
+  while true:
+    var e = at
+    while e > 0 and (src[e - 1] == ' ' or src[e - 1] == '\t'): e -= 1
+    if e == 0 or src[e - 1] != '\n': return at
+    var ls = e - 1
+    while ls > 0 and src[ls - 1] != '\n': ls -= 1
+    var f = ls
+    while f < e - 1 and (src[f] == ' ' or src[f] == '\t'): f += 1
+    if f >= e - 1 or src[f] != '@': return at
+    at = f
 
 fn handle_export_assign(var s: St, t: Ast, n: Int):
   if in_ns(s, t.nd[n].pos, t.nd[n].end): return
@@ -1101,6 +1246,7 @@ fn handle_expr_stmt(var s: St, t: Ast, n: Int):
   if lk != ast.N_PROPACCESS and lk != ast.N_ELEMACCESS: return
   let obj = t.nd[left].a
   if lk == ast.N_PROPACCESS and is_id(t, obj) and nm(t, obj) == "exports":
+    s.fix_next = [t.nd[n].pos, t.nd[n].end, 0]
     add_export(&s, nm(t, left), "unknown", prop_pos(s, t, left), [], false, 0)
     return
   if kind(t, obj) == ast.N_PROPACCESS and is_id(t, t.nd[obj].a) and nm(t, t.nd[obj].a) == "module" and nm(t, obj) == "exports":
@@ -1126,6 +1272,7 @@ fn handle_expr_stmt(var s: St, t: Ast, n: Int):
           if name != member: alias = name
           add_imp(&s, spec, member, alias, "", t.nd[arg].pos, F_REEXPORT, -1)
           reexport = true
+      s.fix_next = [t.nd[n].pos, t.nd[n].end, 0]
       add_export(&s, name, "unknown", npos, [], reexport, 0)
     return
   if lk == ast.N_PROPACCESS and is_id(t, obj) and nm(t, obj) == "module" and nm(t, left) == "exports":
@@ -1136,7 +1283,9 @@ fn handle_expr_stmt(var s: St, t: Ast, n: Int):
       for p in props:
         if t.nd[p].k != ast.N_SHORTHAND: all_short = false
       if all_short:
-        for p in props: add_export(&s, nm(t, p), "unknown", t.nd[p].pos, [], false, 0)
+        for p in props:
+          s.fix_next = [t.nd[p].pos, t.nd[p].end, 0]
+          add_export(&s, nm(t, p), "unknown", t.nd[p].pos, [], false, 0)
       else:
         add_export(&s, "default", "unknown", t.nd[right].pos, [], false, 0)
       for p in props:
@@ -1197,7 +1346,7 @@ fn bindel_key_pos(t: Ast, e: Int) -> Int:
   if key >= 0: return t.nd[key].pos
   return t.nd[e].pos
 
-fn handle_dyn_binding(var s: St, t: Ast, id: Int, call: Int, awaited: Bool):
+fn handle_dyn_binding(var s: St, t: Ast, id: Int, call: Int, awaited: Bool, cf: Int):
   s.handled_ix[call] = true
   let arg = first_str_arg(t, call)
   if arg < 0: return
@@ -1207,22 +1356,22 @@ fn handle_dyn_binding(var s: St, t: Ast, id: Int, call: Int, awaited: Bool):
     for e in ast.items(t, t.nd[id].a):
       if t.nd[e].k != ast.N_BINDEL: continue
       if (t.nd[e].f & ast.M_REST) != 0:
-        if is_id(t, t.nd[e].b): add_imp(&s, spec, "*", nm(t, t.nd[e].b), "", t.nd[e].pos, F_DYNAMIC, -1)
+        if is_id(t, t.nd[e].b): add_imp(&s, spec, "*", nm(t, t.nd[e].b), "", t.nd[e].pos, F_DYNAMIC | cf, -1)
         continue
       let imported = bindel_key(t, e)
       var local = imported
       if is_id(t, t.nd[e].b): local = nm(t, t.nd[e].b)
       var alias = ""
       if local != imported: alias = local
-      add_imp(&s, spec, imported, alias, "", bindel_key_pos(t, e), F_DYNAMIC, -1)
+      add_imp(&s, spec, imported, alias, "", bindel_key_pos(t, e), F_DYNAMIC | cf, -1)
   elif k == ast.N_ID:
     if awaited:
-      add_imp(&s, spec, "default", nm(t, id), "", t.nd[arg].pos, F_DYNAMIC, -1)
+      add_imp(&s, spec, "default", nm(t, id), "", t.nd[arg].pos, F_DYNAMIC | cf, -1)
       li_set(&s, nm(t, id), spec, "*", true, true)
     else:
-      add_imp(&s, spec, "", "", "", t.nd[arg].pos, F_DYNAMIC | F_OPAQUE, -1)
+      add_imp(&s, spec, "", "", "", t.nd[arg].pos, F_DYNAMIC | F_OPAQUE | cf, -1)
   else:
-    add_imp(&s, spec, "", "", "", t.nd[arg].pos, F_DYNAMIC | F_OPAQUE, -1)
+    add_imp(&s, spec, "", "", "", t.nd[arg].pos, F_DYNAMIC | F_OPAQUE | cf, -1)
 
 # Promise.all([...]) elements
 fn promise_all(t: Ast, n: Int) -> Int:
@@ -1264,7 +1413,9 @@ fn handle_declarator(var s: St, t: Ast, d: Int):
     awaited = true
   elif ik == ast.N_IMPORTCALL: call = init
   if call >= 0 and first_str_arg(t, call) >= 0:
-    handle_dyn_binding(&s, t, id, call, awaited)
+    var cf = 0
+    if awaited and s.caught > 0: cf = F_CAUGHT
+    handle_dyn_binding(&s, t, id, call, awaited, cf)
     return
   if is_require(t, init):
     let arg = ast.item(t, t.nd[init].c, 0)
@@ -1301,15 +1452,17 @@ fn handle_declarator(var s: St, t: Ast, d: Int):
           s.handled_ix[imp] = true
           let arg = first_str_arg(t, imp)
           let spec = nm(t, arg)
+          var cf = 0
+          if s.caught > 0: cf = F_CAUGHT
           if kind(t, b) == ast.N_OBJPAT:
             for e in ast.items(t, t.nd[b].a):
               if t.nd[e].k == ast.N_BINDEL and (t.nd[e].f & ast.M_REST) == 0:
-                add_imp(&s, spec, bindel_key(t, e), "", "", bindel_key_pos(t, e), 0, -1)
+                add_imp(&s, spec, bindel_key(t, e), "", "", bindel_key_pos(t, e), cf, -1)
           elif is_id(t, b):
-            add_imp(&s, spec, "default", nm(t, b), "", t.nd[arg].pos, F_DYNAMIC, -1)
+            add_imp(&s, spec, "default", nm(t, b), "", t.nd[arg].pos, F_DYNAMIC | cf, -1)
             li_set(&s, nm(t, b), spec, "*", true, true)
           else:
-            add_imp(&s, spec, "", "", "", t.nd[arg].pos, F_DYNAMIC | F_SIDEEFFECTS, -1)
+            add_imp(&s, spec, "", "", "", t.nd[arg].pos, F_DYNAMIC | F_SIDEEFFECTS | cf, -1)
   if is_id(t, id):
     let alias_name = nm(t, id)
     if ik == ast.N_COND:
@@ -1435,7 +1588,9 @@ fn handle_call(var s: St, t: Ast, n: Int):
             var param = ast.item(t, ps, 0)
             if t.nd[param].k == ast.N_PARAM: param = t.nd[param].a
             let pk = kind(t, param)
-            if pk == ast.N_ID or pk == ast.N_OBJPAT: handle_dyn_binding(&s, t, param, ic, true)
+            var cf = 0
+            if ic in s.caught_ix: cf = F_CAUGHT
+            if pk == ast.N_ID or pk == ast.N_OBJPAT: handle_dyn_binding(&s, t, param, ic, true, cf)
   if is_require(t, n):
     let arg = ast.item(t, t.nd[n].c, 0)
     add_imp(&s, nm(t, arg), "default", "", "", t.nd[arg].pos, 0, -1)
@@ -1449,6 +1604,22 @@ fn handle_call(var s: St, t: Ast, n: Int):
       if arg >= 0:
         add_imp(&s, nm(t, arg), "", "", "", t.nd[arg].pos, F_ENTRY, -1)
         return
+  # module.register('x', import.meta.url) and module.findPackageJSON('pkg', ...) (node:module)
+  if s.node_module and is_str(t, call_arg(t, n, 0)):
+    var meth = ""
+    if is_id(t, callee): meth = nm(t, callee)
+    elif plain_access(t, callee) and is_id(t, t.nd[callee].a) and nm(t, t.nd[callee].a) == "module": meth = nm(t, callee)
+    let a0 = call_arg(t, n, 0)
+    let spec = nm(t, a0)
+    let a1 = call_arg(t, n, 1)
+    var hit = false
+    if meth == "register" and spec != "":
+      let meta_url = kind(t, a1) == ast.N_PROPACCESS and plain_access(t, a1) and kind(t, t.nd[a1].a) == ast.N_METAPROP and nm(t, a1) == "url"
+      hit = not spec.startswith(".") or meta_url
+    if meth == "findPackageJSON" and starts_like_pkg_name(spec) and not can_parse_url(spec): hit = true
+    if hit:
+      add_imp(&s, spec, "", "", "", t.nd[a0].pos, F_ENTRY, -1)
+      return
   if (s.cp_ns.len > 0 or s.cp_methods.len > 0) and ast.count(t, t.nd[n].c) >= 1:
     var method = ""
     let cname = nm(t, callee)
@@ -1567,6 +1738,12 @@ fn handle_new(var s: St, t: Ast, n: Int):
       let a1 = ast.item(t, args, 1)
       if is_str(t, a0) and kind(t, a1) == ast.N_PROPACCESS and nm(t, a1) == "url" and kind(t, t.nd[a1].a) == ast.N_METAPROP:
         add_imp(&s, nm(t, a0), "", "", "", t.nd[a0].pos, F_ENTRY | F_OPTIONAL, -1)
+        return
+  # new Worker(path.join(__dirname, ...)) (worker_threads imported)
+  if s.worker_threads and is_id(t, callee) and nm_eq(t, callee, "Worker") and ast.count(t, t.nd[n].c) >= 1:
+    let a0 = ast.item(t, t.nd[n].c, 0)
+    let sp = dirname_path(s, t, a0)
+    if sp != "": add_imp(&s, sp, "", "", "", t.nd[a0].pos, F_ENTRY, -1)
 
 fn is_member(t: Ast, n: Int) -> Bool:
   let k = kind(t, n)
@@ -1805,9 +1982,8 @@ fn walk_kids(var s: St, t: Ast, n: Int):
 
 # a function body: its statements, not a block scope
 fn walk_body(var s: St, t: Ast, b: Int):
-  if b < 0: return
-  if t.nd[b].k == ast.N_BLOCK: walk_list(&s, t, t.nd[b].a)
-  else: walk(&s, t, b)
+  # (a function's body is a block, a scope, as in oxc's ESTree)
+  walk(&s, t, b)
 
 fn is_exported_decl(t: Ast, n: Int) -> Bool:
   let k = t.nd[n].k
@@ -1828,6 +2004,17 @@ fn export_decl(var s: St, t: Ast, n: Int):
 
 fn walk(var s: St, t: Ast, n: Int):
   if n < 0: return
+  let k = t.nd[n].k
+  if k >= ast.N_VAR and k <= ast.N_NSEXPORT and k != ast.N_DECL and k != ast.N_PARAM and k != ast.N_CASE and k != ast.N_SPEC and k != ast.N_BLOCK:
+    # (a statement: the imports in it carry its JSDoc tags)
+    let saved = s.stmt_tags
+    s.stmt_tags = tags_at(s, stmt_start(s, t.nd[n].pos))
+    walk_node(&s, t, n)
+    s.stmt_tags = saved
+    return
+  walk_node(&s, t, n)
+
+fn walk_node(var s: St, t: Ast, n: Int):
   let k = t.nd[n].k
   if k == ast.N_LIST:
     walk_list(&s, t, n)
@@ -1888,24 +2075,33 @@ fn walk(var s: St, t: Ast, n: Int):
       if s.depth > 0: add_shadow(&s, name)
     add_param_shadows(&s, t, t.nd[n].b, t.nd[n].d)
     export_decl(&s, t, n)
+    let cs = s.caught
+    s.caught = 0
     walk(&s, t, t.nd[n].a)
     walk(&s, t, t.nd[n].b)
     walk(&s, t, t.nd[n].c)
     walk_body(&s, t, t.nd[n].d)
+    s.caught = cs
     return
   if k == ast.N_FUNCEXPR or k == ast.N_ARROW:
     add_param_shadows(&s, t, t.nd[n].b, t.nd[n].d)
+    let cs = s.caught
+    s.caught = 0
     walk(&s, t, t.nd[n].a)
     walk(&s, t, t.nd[n].b)
     walk(&s, t, t.nd[n].c)
     walk_body(&s, t, t.nd[n].d)
+    s.caught = cs
     return
   if k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET or k == ast.N_CTOR:
     let sig = t.nd[n].b
     if sig >= 0: add_param_shadows(&s, t, t.nd[sig].b, t.nd[n].c)
+    let cs = s.caught
+    s.caught = 0
     walk(&s, t, t.nd[n].a)
     walk(&s, t, sig)
     walk_body(&s, t, t.nd[n].c)
+    s.caught = cs
     return
   if k == ast.N_CLASS or k == ast.N_CLASSEXPR:
     let name = nm(t, n)
@@ -1956,6 +2152,7 @@ fn walk(var s: St, t: Ast, n: Int):
         let pos = name_after_as(s, t, sp)
         s.fix_next = [t.nd[sp].pos, t.nd[sp].end, 3]
         add_export(&s, exported, typ, pos, [], true, tags | tags_at(s, t.nd[sp].pos))
+        set_bind(&s, exported, exported, true)
     return
   if k == ast.N_EXPORTDEFAULT:
     s.in_export = true
@@ -1974,9 +2171,17 @@ fn walk(var s: St, t: Ast, n: Int):
     walk_kids(&s, t, n)
     return
   if k == ast.N_IMPORTCALL:
+    if n in s.vi_mocks:
+      let mobj = s.vi_mocks[n]
+      if not shadowed(s, nm(t, mobj), t.nd[mobj].pos):
+        s.handled_ix[n] = true
+        let srcn = first_str_arg(t, n)
+        add_imp(&s, str_val(t, srcn), "", "", "", t.nd[srcn].pos, F_SIDEEFFECTS, -1)
     if not (n in s.handled_ix):
       let arg = first_str_arg(t, n)
-      if arg >= 0: add_imp(&s, nm(t, arg), "", "", "", t.nd[arg].pos, F_DYNAMIC | F_OPAQUE, -1)
+      var cf = 0
+      if n in s.caught_ix: cf = F_CAUGHT
+      if arg >= 0: add_imp(&s, nm(t, arg), "", "", "", t.nd[arg].pos, F_DYNAMIC | F_OPAQUE | cf, -1)
     walk_kids(&s, t, n)
     return
   if k == ast.N_NEW:
@@ -1988,6 +2193,21 @@ fn walk(var s: St, t: Ast, n: Int):
     let c = t.nd[n].c
     if b >= 0 and c >= 0 and is_id(t, t.nd[b].a):
       add_shadow_range(&s, nm(t, t.nd[b].a), t.nd[c].pos, t.nd[c].end)
+    if c >= 0: s.caught += 1
+    walk(&s, t, t.nd[n].a)
+    if c >= 0: s.caught -= 1
+    walk(&s, t, b)
+    walk(&s, t, c)
+    walk(&s, t, t.nd[n].d)
+    return
+  if k == ast.N_AWAIT and s.caught > 0:
+    let arg = t.nd[n].a
+    if kind(t, arg) == ast.N_IMPORTCALL: s.caught_ix[arg] = true
+    else:
+      let arr = promise_all(t, arg)
+      if arr >= 0:
+        for e in ast.items(t, t.nd[arr].a):
+          if t.nd[e].k == ast.N_IMPORTCALL: s.caught_ix[e] = true
     walk_kids(&s, t, n)
     return
   if k == ast.N_FORIN:
@@ -2022,6 +2242,7 @@ fn walk(var s: St, t: Ast, n: Int):
 fn static_imports(var s: St, t: Ast, root: Int):
   for st in ast.items(t, root):
     if t.nd[st].k != ast.N_IMPORT: continue
+    s.stmt_tags = tags_at(s, t.nd[st].pos)
     let str = t.nd[st].a
     if not is_str(t, str): continue
     let spec = nm(t, str)
@@ -2033,6 +2254,8 @@ fn static_imports(var s: St, t: Ast, root: Int):
     let c = t.nd[st].c
     let d = t.nd[st].d
     let is_cp = spec == "child_process" or spec == "node:child_process"
+    if spec == "module" or spec == "node:module": s.node_module = true
+    elif spec == "worker_threads" or spec == "node:worker_threads": s.worker_threads = true
     let is_path = spec == "path" or spec == "node:path"
     if is_cp:
       if b >= 0: s.cp_ns[nm(t, b)] = true
@@ -2072,6 +2295,7 @@ fn static_imports(var s: St, t: Ast, root: Int):
 fn static_reexports(var s: St, t: Ast, root: Int):
   for st in ast.items(t, root):
     if t.nd[st].k != ast.N_EXPORT: continue
+    s.stmt_tags = tags_at(s, t.nd[st].pos)
     let str = t.nd[st].a
     if str < 0 or not is_str(t, str): continue
     let spec = nm(t, str)
@@ -2116,7 +2340,7 @@ fn has_module_syntax(t: Ast, root: Int, src: Str) -> Bool:
 
 # imports written in comments (extractImportsFromComments)
 fn comment_imports(var s: St, first_stmt: Int):
-  if s.src.find("import(") < 0 and s.src.find("@jsxImportSource") < 0 and s.src.find("-environment") < 0 and s.src.find("<reference") < 0: return
+  if (s.at_bits & (AT_IMPORT | AT_JSX | AT_ENV)) == 0 and s.src.find("import(") < 0 and s.src.find("<reference") < 0: return
   let cm = comments(s.src)
   var i = 0
   while i < cm.len:
@@ -2151,6 +2375,13 @@ fn comment_imports(var s: St, first_stmt: Int):
               member = text[m + 1..e]
             if in_jsdoc_type(text, k): add_imp(&s, spec, member, "", "", start + k, F_TYPEONLY, -1)
         k = text.find("import(", k + 7)
+      # @import tags (TypeScript's JSDoc imports)
+      var ix = text.find("@import")
+      while ix >= 0:
+        let nx = ix + 7
+        if jsdoc_tag_start(text, ix) and nx < text.len and is_space_c(text[nx]):
+          jsdoc_import(&s, jsdoc_import_source(text, ix), start + ix)
+        ix = text.find("@import", nx)
     let jx = text.find("@jsxImportSource")
     if jx >= 0:
       var j = jx + 16
@@ -2181,8 +2412,9 @@ fn comment_imports(var s: St, first_stmt: Int):
               add_imp(&s, id, "", "", "", start + k, f, -1)
           k = text.find(tag, k + 1)
     if line:
+      # (referenceRe /\s*<reference\s+(types|path)\s*=\s*"([^"]+)"[^/]*\/>/ isn't anchored: "/// <reference" too)
       let r = text.find("<reference")
-      if r >= 0 and text[0..r].strip() == "":
+      if r >= 0:
         var j = r + 10
         while j < text.len and is_ws(text[j]): j += 1
         var kind_ = ""
@@ -2196,10 +2428,169 @@ fn comment_imports(var s: St, first_stmt: Int):
             while j < text.len and is_ws(text[j]): j += 1
             if j < text.len and text[j] == '"':
               let q = text.find("\"", j + 1)
-              if q > j + 1 and text.find("/>", q) >= 0:
+              var ok_end = false
+              var z = q + 1
+              while z < text.len and text[z] != '/': z += 1
+              if z + 1 < text.len and text[z + 1] == '>': ok_end = true
+              if q > j + 1 and ok_end:
                 var f = F_TYPEONLY
                 if kind_ == "path": f = f | F_OPTIONAL
                 add_imp(&s, text[j + 1..q], "", "", "", start, f, -1)
+
+fn pkg_start_c(c: Byte) -> Bool:
+  return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9')
+
+# isStartsLikePackageName
+fn starts_like_pkg_name(x: Str) -> Bool:
+  if x.len == 0: return false
+  if x[0] == '@': return x.len > 1 and (pkg_start_c(x[1]) or x[1] == '.' or x[1] == '_' or x[1] == '~')
+  return pkg_start_c(x[0]) and not (x.len > 1 and x[1] == ':')
+
+# URL.canParse (a scheme, then a colon)
+fn can_parse_url(x: Str) -> Bool:
+  if x.len == 0 or not ((x[0] >= 'a' and x[0] <= 'z') or (x[0] >= 'A' and x[0] <= 'Z')): return false
+  var k = 1
+  while k < x.len and (pkg_start_c(x[k]) or x[k] == '+' or x[k] == '.' or x[k] == '-'): k += 1
+  return k < x.len and x[k] == ':' and k + 1 < x.len
+
+fn is_space_c(c: Byte) -> Bool:
+  return c == 9 or c == 10 or c == 13 or c == 32
+
+fn is_hspace_c(c: Byte) -> Bool:
+  return c == 9 or c == 13 or c == 32
+
+# isJsDocTagStart: only whitespace and a '*' before it on its line
+fn jsdoc_tag_start(text: Str, index: Int) -> Bool:
+  var p = index
+  while p > 0 and text[p - 1] != '\n': p -= 1
+  while p < text.len and is_space_c(text[p]): p += 1
+  if p < text.len and text[p] == '*':
+    p += 1
+    while p < text.len and is_space_c(text[p]): p += 1
+  return p == index
+
+# getJsDocImportSource: the tag's text to the next line that starts with a tag (without the '*'s)
+fn jsdoc_import_source(text: Str, index: Int) -> Str:
+  var src = ""
+  var pos = index + 7
+  while pos < text.len:
+    let le = text.find("\n", pos)
+    if le < 0: return src + text[pos..text.len]
+    src += text[pos..le]
+    var nl = le + 1
+    while nl < text.len and is_hspace_c(text[nl]): nl += 1
+    if nl < text.len and text[nl] == '*':
+      nl += 1
+      while nl < text.len and is_hspace_c(text[nl]): nl += 1
+    if nl < text.len and text[nl] == '@': return src
+    src += "\n"
+    pos = nl
+  return src
+
+fn jd_ws(t: Str, i: Int) -> Int:
+  var k = i
+  while k < t.len and is_space_c(t[k]): k += 1
+  return k
+
+fn jd_ident(t: Str, i: Int) -> Int:
+  var k = i
+  while k < t.len and (is_word(t[k]) or t[k] >= 128): k += 1
+  return k
+
+# "import type" + the tag's text, read as an import declaration: its entries (addJsDocImport)
+fn jsdoc_import(var s: St, src: Str, pos: Int):
+  var i = jd_ws(src, 0)
+  var names: [Str] = []      # imported, local pairs
+  var ns = false
+  var any = false
+  # a default import first (then , and named or namespace imports)
+  let de = jd_ident(src, i)
+  var clause = true
+  if de > i and src[i..de] != "from":
+    names.push("default")
+    names.push(src[i..de])
+    any = true
+    i = jd_ws(src, de)
+    clause = false
+    if i < src.len and src[i] == ',':
+      i = jd_ws(src, i + 1)
+      clause = true
+      if i >= src.len or (src[i] != '{' and src[i] != '*'): return
+  if clause and i < src.len and src[i] == '{':
+    any = true
+    i += 1
+    while true:
+      i = jd_ws(src, i)
+      if i < src.len and src[i] == '}':
+        i += 1
+        break
+      var e = jd_ident(src, i)
+      if e == i: return
+      var imported = src[i..e]
+      if imported == "type":
+        let j = jd_ws(src, e)
+        let e2 = jd_ident(src, j)
+        if e2 > j and src[j..e2] != "as" and src[j..e2] != "from":
+          i = j
+          e = e2
+          imported = src[i..e]
+      var local = imported + ""
+      i = jd_ws(src, e)
+      let ae = jd_ident(src, i)
+      if ae > i and src[i..ae] == "as":
+        let j = jd_ws(src, ae)
+        let le = jd_ident(src, j)
+        if le == j: return
+        local = src[j..le]
+        i = jd_ws(src, le)
+      names.push(imported + "")
+      names.push(local + "")
+      if i < src.len and src[i] == ',':
+        i += 1
+        continue
+      if i < src.len and src[i] == '}':
+        i += 1
+        break
+      return
+  elif clause and i < src.len and src[i] == '*':
+    i = jd_ws(src, i + 1)
+    let ae = jd_ident(src, i)
+    if ae == i or src[i..ae] != "as": return
+    let j = jd_ws(src, ae)
+    let le = jd_ident(src, j)
+    if le == j: return
+    ns = true
+    any = true
+    i = le
+  if not any: return
+  i = jd_ws(src, i)
+  let fe = jd_ident(src, i)
+  if fe == i or src[i..fe] != "from": return
+  i = jd_ws(src, fe)
+  if i >= src.len or (src[i] != '\'' and src[i] != '"'): return
+  let q = src[i]
+  var e = i + 1
+  while e < src.len and src[e] != q and src[e] != '\n': e += 1
+  if e >= src.len or src[e] != q or e == i + 1: return
+  let spec = src[i + 1..e]
+  var k0 = 0
+  while k0 < names.len and ns:
+    var alias = ""
+    if names[k0 + 1] != names[k0]: alias = names[k0 + 1] + ""
+    add_imp(&s, spec, names[k0], alias, "", pos, F_TYPEONLY, -1)
+    k0 += 2
+  if ns:
+    add_imp(&s, spec, "", "", "", pos, F_TYPEONLY | F_OPAQUE, -1)
+    return
+  if names.len == 0:
+    add_imp(&s, spec, "", "", "", pos, F_TYPEONLY, -1)
+    return
+  var k = 0
+  while k < names.len:
+    var alias = ""
+    if names[k + 1] != names[k]: alias = names[k + 1] + ""
+    add_imp(&s, spec, names[k], alias, "", pos, F_TYPEONLY, -1)
+    k += 2
 
 fn in_jsdoc_type(text: Str, index: Int) -> Bool:
   var depth = 0
@@ -2241,6 +2632,11 @@ fn analyze(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast) -> Raw:
   return analyze_t(path, src, &kw, &t, [])
 
 fn analyze_t(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags: [Str]) -> Raw:
+  var tm: [Float] = []
+  return analyze_tc(path, src, &kw, &t, user_tags, fn() => 0.0, &tm)
+
+# (tm gets the clock's time after parsing, before the walk and after it: --performance)
+fn analyze_tc(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags: [Str], clk: fn() -> Float, var tm: [Float]) -> Raw:
   ast.clear_nodes(&t)
   ast.keep_names(&t, 1, src.len / 40)
   ast.reserve_nodes(&t, src.len / 6 + 16)
@@ -2249,23 +2645,47 @@ fn analyze_t(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags:
   for u in user_tags:
     if u.startswith("\0"): s.vis[u[1..u.len]] = true
     else: s.user_tags.push(u + "")
+  s.want_binds = "binds" in s.vis
   let pd = parse.parse_file_v(&t, &s.src, 1, &kw, true, jsx)
+  tm.push(clk())
   let lines = line_starts(s.src)
   let wide = has_wide(s.src)
   if pd.len > 0:
-    # knip parses with oxc, which recovers; a file this parser rejects is read as having nothing
+    # knip parses with oxc: on an error it can't recover from, the program is empty but the module
+    # record keeps the static imports before it. Here: the static imports of the lines before the
+    # first error (when those parse), nothing else.
+    var cut = pd[0].pos
+    for d in pd:
+      if d.pos < cut: cut = d.pos
+    if cut > s.src.len: cut = s.src.len
+    while cut > 0 and s.src[cut - 1] != '\n': cut -= 1
+    var imps: [Imp] = []
+    if cut > 0 and cut < s.src.len and s.src[0..cut].find("import") >= 0:
+      var ut: [Str] = ["\0static-only"]
+      var pre = analyze_t(path, s.src[0..cut], &kw, &t, ut)
+      if pre.ok: swap(&imps, &pre.imps)
     var keep = ""
     if wide: swap(&keep, &s.src)
-    return Raw(path + "", false, [], [], [], [], [], 0, lines, wide, keep, [], [])
+    return Raw(path + "", false, [], imps, [], [], [], 0, lines, wide, keep, [], [])
   let root = t.nd.len - 1
   build_tags(&s)
   s.module_file = has_module_syntax(t, root, s.src)
   s.n_static_exports = count_exports(t, root)
   static_imports(&s, t, root)
+  s.stmt_tags = 0
+  if "static-only" in s.vis:
+    var si: [Imp] = []
+    swap(&si, &s.imps)
+    return Raw(path + "", true, [], si, [], [], [], 0, lines, false, "", [], [])
   static_reexports(&s, t, root)
+  s.stmt_tags = 0
   if s.vis.len > 0: plugin_visitors(&s, t, root)
+  tm.push(clk())
   walk_list(&s, t, root)
+  tm.push(clk())
   run_pending(&s, t)
+  if s.jest_calls.len > 0: jest_post(&s, t)
+  if tname(t, "define") or tname(t, "defineAsync") or tname(t, "Component") or tname(t, "customElement") or tname(t, "controller"): custom_elements(&s, t, root)
   # members referenced in the file
   var i = 0
   while i + 1 < s.mref.len:
@@ -2526,6 +2946,9 @@ fn plugin_visitors(var s: St, t: Ast, root: Int):
   if "jest" in s.vis and tname(t, "jest"): any_call = true
   if "execa" in s.vis and (tname(t, "execa") or tname(t, "$")): any_call = true
   if "zx" in s.vis and s.src.startswith("#!/usr/bin/env zx"): any_call = true
+  # (Bun's shell, $`...`, is read in every file: ProjectPrincipal's createBunShellVisitor)
+  let v_bun = tname(t, "$")
+  if v_bun: any_call = true
   if "nano-spawn" in s.vis and tname(t, "spawn"): any_call = true
   if "vite" in s.vis and tname(t, "glob"): any_call = true
   if ("webpack" in s.vis or "rspack" in s.vis) and tname(t, "context"): any_call = true
@@ -2542,9 +2965,6 @@ fn plugin_visitors(var s: St, t: Ast, root: Int):
   let v_pino = "pino" in s.vis
   let v_knex = "knex" in s.vis
   let zx_file = s.src.startswith("#!/usr/bin/env zx")
-  var mock_lookups: [Int] = []
-  var virtual: [Str] = []
-  var virtual_esm: [Str] = []
   for n in 0..t.nd.len:
     let k = t.nd[n].k
     if k == ast.N_TAGGED:
@@ -2559,6 +2979,9 @@ fn plugin_visitors(var s: St, t: Ast, root: Int):
           if tname == "execaNode": s.scripts.push("node " + sc)
           else: s.scripts.push(sc)
       if v_zx and zx_file and is_id(t, tag) and tname == "$":
+        let sc = script_from_arg(t, tpl)
+        if sc != "": s.scripts.push(sc)
+      if v_bun and is_id(t, tag) and tname == "$":
         let sc = script_from_arg(t, tpl)
         if sc != "": s.scripts.push(sc)
       continue
@@ -2580,24 +3003,14 @@ fn plugin_visitors(var s: St, t: Ast, root: Int):
           for pp in ast.items(t, t.nd[t.nd[body].a].a):
             if t.nd[pp].k == ast.N_SPREAD: spread = true
           if not spread:
-            s.handled_ix[a0] = true
-            add_imp(&s, str_val(t, srcn), "", "", "", t.nd[srcn].pos, F_SIDEEFFECTS, -1)
+            # (decided when the walk reaches it: the scopes it's in may shadow vi)
+            s.vi_mocks[a0] = t.nd[callee].a
             continue
     # jest.mock("x") and the other module methods (rs.mock for rstest)
     if v_jest and is_str(t, a0) and member_of(t, callee, jest, ""):
       let m = nm(t, callee)
-      let spec = str_val(t, a0)
       if " mock doMock requireActual requireMock createMockFromModule unmock dontMock deepUnmock setMock unstable_mockModule unstable_unmockModule ".find(" " + m + " ") >= 0:
-        let o = call_arg(t, n, 2)
-        if (m == "mock" or m == "doMock" or m == "unstable_mockModule") and kind(t, o) == ast.N_OBJECT:
-          let vv = obj_prop(t, o, "virtual")
-          if kind(t, vv) == ast.N_TRUE:
-            if m == "unstable_mockModule": virtual_esm.push(spec)
-            else: virtual.push(spec)
-            continue
-        if m == "requireActual": add_imp(&s, spec, "", "", "", t.nd[a0].pos, F_OPAQUE, -1)
-        elif m == "createMockFromModule": add_imp(&s, spec, "", "", "", t.nd[a0].pos, F_SIDEEFFECTS, -1)
-        else: mock_lookups.push(n)
+        s.jest_calls.push(n)
         continue
     if v_execa and is_id(t, callee):
       let fname = nm(t, callee)
@@ -2694,6 +3107,31 @@ fn plugin_visitors(var s: St, t: Ast, root: Int):
         let c = obj_prop(t, a0, "client")
         if is_str(t, c):
           for pk in knex_packages(str_val(t, c)): add_imp(&s, pk, "", "", "", t.nd[a0].pos, 0, -1)
+
+# plugins/jest/visitors/mock (after the walk, which knows the scopes that shadow jest)
+fn jest_post(var s: St, t: Ast):
+  var mock_lookups: [Int] = []
+  var virtual: [Str] = []
+  var virtual_esm: [Str] = []
+  var calls: [Int] = []
+  for x in s.jest_calls: calls.push(x)
+  for n in calls:
+    let callee = t.nd[n].a
+    let obj = t.nd[callee].a
+    if shadowed(s, nm(t, obj), t.nd[obj].pos): continue
+    let m = nm(t, callee)
+    let a0 = call_arg(t, n, 0)
+    let spec = str_val(t, a0)
+    let o = call_arg(t, n, 2)
+    if (m == "mock" or m == "doMock" or m == "unstable_mockModule") and kind(t, o) == ast.N_OBJECT:
+      let vv = obj_prop(t, o, "virtual")
+      if kind(t, vv) == ast.N_TRUE:
+        if m == "unstable_mockModule": virtual_esm.push(spec)
+        else: virtual.push(spec)
+        continue
+    if m == "requireActual": add_imp(&s, spec, "", "", "", t.nd[a0].pos, F_OPAQUE, -1)
+    elif m == "createMockFromModule": add_imp(&s, spec, "", "", "", t.nd[a0].pos, F_SIDEEFFECTS, -1)
+    else: mock_lookups.push(n)
   for n in mock_lookups:
     let callee = t.nd[n].a
     let m = nm(t, callee)
@@ -2797,10 +3235,11 @@ fn local_refs(s: St, t: Ast) -> [Str]:
         if not (root in s.li) and not shadowed(s, root, t.nd[left].pos): refs[root] = true
     elif k == ast.N_TREF or k == ast.N_TQUERY:
       if is_id(t, a) and not (nm(t, a) in s.li): lref(s, t, a, &refs, &imported)
-  # an imported name re-exported: its export names
+  # an imported name referenced in the file: the names it's exported as (localToExports)
   for name, _ in imported:
-    for e in s.exps:
-      if e.name == name: refs[e.name] = true
+    let key = "\0" + name
+    if key in s.ref_in:
+      for e in s.ref_in[key]: refs[e + ""] = true
   var out: [Str] = []
   for name, _ in refs: out.push(name + "")
   return out
@@ -2829,3 +3268,228 @@ fn tname(t: Ast, x: Str) -> Bool:
     if t.hh[found] == h and t.names[found] == x: return true
     j = (j + 1) & mask
   return false
+
+# ---- custom elements (calls.ts getRegisteredCustomElement, plugins/_custom-elements, _component-style-urls)
+
+fn ce_registry_expr(s: St, t: Ast, e: Int) -> Bool:
+  let k = kind(t, e)
+  if k == ast.N_ID: return nm(t, e) == "customElements" and not shadowed(s, "customElements", t.nd[e].pos)
+  if k == ast.N_PROPACCESS: return nm(t, e) == "customElements"
+  if k == ast.N_NEW: return is_id(t, t.nd[e].a) and nm(t, t.nd[e].a) == "CustomElementRegistry"
+  return false
+
+# the decorators of a class (those right before it: only whitespace, comments, export/default/abstract/declare between)
+fn class_decorators(s: St, t: Ast, decos: [Int], c: Int) -> [Int]:
+  var out: [Int] = []
+  var cur = t.nd[c].pos
+  var k = decos.len - 1
+  while k >= 0 and t.nd[decos[k]].end > cur: k -= 1
+  while k >= 0:
+    let d = decos[k]
+    let gap = s.src[t.nd[d].end..cur]
+    if not deco_gap(gap): break
+    out.push(d)
+    cur = t.nd[d].pos
+    # (the '@' before the expression)
+    while cur > 0 and s.src[cur - 1] != '@': cur -= 1
+    if cur > 0: cur -= 1
+    k -= 1
+  return out
+
+fn deco_gap(g: Str) -> Bool:
+  var rest = g.strip()
+  while rest != "":
+    var hit = false
+    for w in ["export", "default", "abstract", "declare"]:
+      if rest.startswith(w):
+        rest = rest[w.len..rest.len].strip()
+        hit = true
+    if rest.startswith("//"):
+      let nl = rest.find("\n")
+      if nl < 0: rest = ""
+      else: rest = rest[nl..rest.len].strip()
+      hit = true
+    elif rest.startswith("/*"):
+      let e = rest.find("*/")
+      if e < 0: return false
+      rest = rest[e + 2..rest.len].strip()
+      hit = true
+    if not hit: return false
+  return true
+
+fn ce_decorated(t: Ast, ds: [Int], names: {Str: Bool}, nss: {Str: Bool}, dname: Str) -> Bool:
+  for d in ds:
+    let k = kind(t, d)
+    if k == ast.N_ID:
+      if nm(t, d) in names: return true
+      continue
+    if k != ast.N_CALL: continue
+    let callee = t.nd[d].a
+    if kind(t, callee) == ast.N_ID:
+      if nm(t, callee) in names: return true
+    elif kind(t, callee) == ast.N_PROPACCESS and is_id(t, t.nd[callee].a) and nm(t, callee) == dname and nm(t, t.nd[callee].a) in nss: return true
+  return false
+
+fn ce_spec(plugin: Str, spec: Str) -> Bool:
+  if plugin == "lit": return spec == "lit/decorators.js" or spec == "lit/decorators" or spec == "@lit/reactive-element/decorators.js" or spec == "@lit/reactive-element/decorators" or spec.startswith("lit/decorators/") or spec.startswith("@lit/reactive-element/decorators/") or spec == "lit-element" or spec == "lit-element/decorators.js" or spec == "lit-element/decorators" or spec.startswith("lit-element/decorators/")
+  if plugin == "catalyst": return spec == "@github/catalyst"
+  if plugin == "fast": return spec == "@microsoft/fast-element"
+  if plugin == "stencil": return spec == "@stencil/core"
+  if plugin == "angular": return spec == "@angular/core"
+  return false
+
+fn custom_elements(var s: St, t: Ast, root: Int):
+  var registered: [Str] = []
+  var regs: {Str: Bool} = {}
+  var classes: [Int] = []
+  var statics: [Int] = []
+  var calls: [Int] = []
+  for n in 0..t.nd.len:
+    let k = t.nd[n].k
+    if k == ast.N_CLASS or k == ast.N_CLASSEXPR: classes.push(n)
+    elif k == ast.N_STATICBLOCK: statics.push(n)
+    elif k == ast.N_CALL: calls.push(n)
+    elif k == ast.N_DECL:
+      let id = t.nd[n].a
+      let init = t.nd[n].c
+      if is_id(t, id) and init >= 0 and ce_registry_expr(s, t, init): regs[nm(t, id)] = true
+  # customElements.define('tag', Class)
+  for c in calls:
+    let callee = t.nd[c].a
+    if kind(t, callee) != ast.N_PROPACCESS or nm(t, callee) != "define": continue
+    let args = ast.items(t, t.nd[c].c)
+    if args.len < 2: continue
+    let obj = t.nd[callee].a
+    var is_reg = false
+    if kind(t, obj) == ast.N_ID: is_reg = (nm(t, obj) == "customElements" or nm(t, obj) in regs) and not shadowed(s, nm(t, obj), t.nd[obj].pos)
+    else: is_reg = kind(t, obj) == ast.N_PROPACCESS and nm(t, obj) == "customElements"
+    if not is_reg: continue
+    let a1 = args[1]
+    if is_id(t, a1):
+      if not shadowed(s, nm(t, a1), t.nd[a1].pos): registered.push(nm(t, a1))
+    elif kind(t, a1) == ast.N_THIS:
+      # (this in a static block: the innermost enclosing class)
+      let pos = t.nd[c].pos
+      var in_static = false
+      for sb in statics:
+        if t.nd[sb].pos <= pos and pos < t.nd[sb].end: in_static = true
+      if in_static:
+        var best = -1
+        for cl in classes:
+          if t.nd[cl].pos <= pos and pos < t.nd[cl].end:
+            if best < 0 or t.nd[cl].pos >= t.nd[best].pos: best = cl
+        if best >= 0 and t.nd[best].s >= 0:
+          let cn = t.names[t.nd[best].s] + ""
+          if cn != "": registered.push(cn)
+  # the plugins' decorators (Lit, Catalyst, Stencil: customElement/controller/Component; FAST: FASTElement subclasses defined)
+  var decos: [Int] = []
+  if -1000001 in t.dirs:
+    for d in t.dirs[-1000001]: decos.push(d)
+  let top = ast.items(t, root)
+  for pl in ["lit", "catalyst", "fast", "stencil"]:
+    if not (pl in s.vis): continue
+    var dname = "customElement"
+    if pl == "catalyst": dname = "controller"
+    if pl == "stencil": dname = "Component"
+    var base = ""
+    if pl == "fast": base = "FASTElement"
+    var names: {Str: Bool} = {}
+    var nss: {Str: Bool} = {}
+    var bases: {Str: Bool} = {}
+    for st in top:
+      if kind(t, st) != ast.N_IMPORT or not ce_spec(pl, nm(t, t.nd[st].a)): continue
+      if t.nd[st].c >= 0: nss[nm(t, t.nd[st].c)] = true
+      for sp in ast.items(t, t.nd[st].d):
+        let loc = nm(t, sp)
+        var imported = loc + ""
+        let pn = t.nd[sp].b
+        if pn >= 0:
+          if kind(t, pn) != ast.N_ID: continue
+          imported = nm(t, pn)
+        if imported == dname: names[loc] = true
+        elif base != "" and imported == base: bases[loc] = true
+    var defined: {Str: Bool} = {}
+    for st in top:
+      var c = -1
+      var is_default = false
+      if kind(t, st) == ast.N_CLASS: c = st
+      elif kind(t, st) == ast.N_EXPORTDEFAULT and (kind(t, t.nd[st].a) == ast.N_CLASS or kind(t, t.nd[st].a) == ast.N_CLASSEXPR):
+        c = t.nd[st].a
+        is_default = true
+      if c < 0: continue
+      let ds = class_decorators(s, t, decos, c)
+      if is_default:
+        if ce_decorated(t, ds, names, nss, dname): registered.push("default")
+        continue
+      if t.nd[c].s < 0: continue
+      let cn = t.names[t.nd[c].s] + ""
+      if ce_decorated(t, ds, names, nss, dname): registered.push(cn)
+      elif base != "" and t.nd[c].b >= 0:
+        let sup = t.nd[t.nd[c].b].a
+        if is_id(t, sup) and nm(t, sup) in bases: defined[cn] = true
+        elif kind(t, sup) == ast.N_CALL:
+          for a in ast.items(t, t.nd[sup].c):
+            if is_id(t, a) and nm(t, a) in bases: defined[cn] = true
+    if base != "":
+      for c in calls:
+        let callee = t.nd[c].a
+        if kind(t, callee) == ast.N_PROPACCESS and is_id(t, t.nd[callee].a) and (nm(t, callee) == "define" or nm(t, callee) == "defineAsync") and nm(t, t.nd[callee].a) in defined: registered.push(nm(t, t.nd[callee].a))
+  # styleUrl(s) of @Component({...}) (Angular, Stencil)
+  for pl in ["angular", "stencil"]:
+    if not (pl in s.vis): continue
+    var comps: {Str: Bool} = {}
+    for st in top:
+      if kind(t, st) != ast.N_IMPORT or not ce_spec(pl, nm(t, t.nd[st].a)): continue
+      for sp in ast.items(t, t.nd[st].d):
+        let loc = nm(t, sp)
+        var imported = loc + ""
+        let pn = t.nd[sp].b
+        if pn >= 0:
+          if kind(t, pn) != ast.N_ID: continue
+          imported = nm(t, pn)
+        if imported == "Component": comps[loc] = true
+    if comps.len == 0: continue
+    for c in classes:
+      if t.nd[c].k != ast.N_CLASS: continue
+      for d in class_decorators(s, t, decos, c):
+        if kind(t, d) != ast.N_CALL or not is_id(t, t.nd[d].a) or not (nm(t, t.nd[d].a) in comps): continue
+        let args = ast.items(t, t.nd[d].c)
+        if args.len == 0 or kind(t, args[0]) != ast.N_OBJECT: continue
+        for key in ["styleUrl", "styleUrls"]:
+          for url in obj_prop_strings(t, args[0], key):
+            var spec = url + ""
+            while spec.startswith("/"): spec = spec[1..spec.len]
+            if not (spec.startswith("./") or spec.startswith("../")): spec = "./" + spec
+            add_imp(&s, spec, "", "", "", t.nd[args[0]].pos, 0, -1)
+  # (registered exports count as used, through local aliases too)
+  for name in registered:
+    if name in s.exp_ix:
+      let ix = s.exp_ix[name] + 0
+      s.exps[ix].in_file = true
+    let key = "\0" + name
+    if key in s.ref_in:
+      var xs: [Str] = []
+      for x in s.ref_in[key]: xs.push(x + "")
+      for x in xs:
+        if x in s.exp_ix:
+          let ix = s.exp_ix[x] + 0
+          s.exps[ix].in_file = true
+
+# getPropertyValues(obj, key): strings of the key (a string, an array's strings, an object's string values)
+fn obj_prop_strings(t: Ast, obj: Int, key: Str) -> [Str]:
+  var out: [Str] = []
+  for pr in ast.items(t, t.nd[obj].a):
+    if kind(t, pr) != ast.N_PROPASSIGN: continue
+    let kn = t.nd[pr].a
+    var k = ""
+    if is_id(t, kn) or is_str(t, kn): k = nm(t, kn)
+    if k != key: continue
+    let v = t.nd[pr].b
+    if kind(t, v) == ast.N_ARRAY:
+      for el in ast.items(t, t.nd[v].a):
+        if is_str(t, el) and not (nm(t, el) in out): out.push(nm(t, el))
+    elif kind(t, v) == ast.N_OBJECT:
+      for p2 in ast.items(t, t.nd[v].a):
+        if kind(t, p2) == ast.N_PROPASSIGN and is_str(t, t.nd[p2].b) and not (nm(t, t.nd[p2].b) in out): out.push(nm(t, t.nd[p2].b))
+    elif is_str(t, v) and not (nm(t, v) in out): out.push(nm(t, v))
+  return out

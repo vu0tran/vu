@@ -1,6 +1,6 @@
 // The source of loader.vu's LOADER_JS (tools/gen_loader.py writes it into loader.vu).
 import { createRequire } from 'node:module';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
 const [outFile, reqFile, rootArg] = process.argv.slice(1);
@@ -27,7 +27,7 @@ try {
   const j = createRequire(path.join(cwd, 'package.json'))(jp);
   const opts = { jsx: true, tsconfigPaths: true, interopDefault: true, alias: { '@rushstack/eslint-patch/modern-module-resolution': 'node:path', '@rushstack/eslint-config/patch/modern-module-resolution': 'node:path' } };
   const create = j.createJiti || (j.default && j.default.createJiti) || (typeof j === 'function' ? j : null);
-  const inst = create(path.join(cwd, 'x.js'), opts);
+  const inst = create(cwd, opts);
   if (typeof inst.import === 'function') jiti = f => inst.import(f, { default: true });
   else jiti = async f => { const m = inst(f); return m && m.default !== undefined ? m.default : m; };
 } catch {}
@@ -37,6 +37,7 @@ const load = async file => {
   const m = await import(pathToFileURL(abs).href);
   return m.default ?? m;
 };
+const relKey = k => (k === absRoot ? '/' : k.startsWith(absRoot + '/') ? k.slice(absRoot.length) : k);
 const enc = (v, depth, seen) => {
   if (v === undefined || typeof v === 'symbol') return undefined;
   if (typeof v === 'string') return v === absRoot ? '/' : v.startsWith(absRoot + '/') ? v.slice(absRoot.length) : v;
@@ -46,13 +47,13 @@ const enc = (v, depth, seen) => {
   if (typeof v === 'function') return { '__vknip_fn': v.name || '' };
   if (v instanceof RegExp) return { '__vknip_re': v.source, flags: v.flags };
   if (v instanceof Promise) return { '__vknip_promise': 1 };
-  if (depth > 9 || seen.has(v)) return { '__vknip_cycle': 1 };
+  if (depth > 40 || seen.has(v)) return { '__vknip_cycle': 1 };
   seen.add(v);
   let out;
   if (Array.isArray(v) || v instanceof Set) out = Array.from(v, x => { const e = enc(x, depth + 1, seen); return e === undefined ? null : e; });
   else if (v instanceof Map) { out = {}; for (const [k, x] of v) { const e = enc(x, depth + 1, seen); if (e !== undefined) out[String(k)] = e; } }
   else if (v instanceof URL) out = v.href;
-  else { out = {}; let n = 0; for (const k of Object.keys(v)) { if (++n > 400) break; let x; try { x = v[k]; } catch { continue; } const e = enc(x, depth + 1, seen); if (e !== undefined) out[k] = e; } }
+  else { out = {}; let n = 0; for (const k of Object.keys(v)) { if (++n > 400) break; let x; try { x = v[k]; } catch { continue; } const e = enc(x, depth + 1, seen); if (e !== undefined) out[relKey(k)] = e; } }
   seen.delete(v);
   return out;
 };
@@ -69,7 +70,9 @@ for (const command of ['serve', 'build'])
 const projectEnv = { command: 'serve', mode: 'test', isPreview: false, isSsrBuild: false };
 const projectConfigs = async (config, callFns) => {
   const out = [];
-  for (const project of config?.test?.projects ?? []) {
+  if (!config?.test?.projects) return out;
+  // (the expression knip iterates, so a value that isn't iterable fails with the same message)
+  for (const project of config.test.projects) {
     if (typeof project === 'function') { if (callFns) out.push(await project(projectEnv)); }
     else if (typeof project !== 'string') out.push(await project);
   }
@@ -95,6 +98,7 @@ const out = {};
 // (the config with env and argv, rule.use with the rule info, entry), ProvidePlugin definitions kept
 const ruleInfo = { compiler: '', issuer: '', realResource: '', resource: '', resourceQuery: '', dependency: '', descriptionData: {}, issuerLayer: '' };
 const evalRule = rule => {
+  if (typeof rule === 'function') { const r = rule(ruleInfo); return typeof r === 'string' ? { loader: r } : r; }
   if (!rule || typeof rule !== 'object') return rule;
   const out = { ...rule };
   if (typeof out.use === 'function') out.use = out.use(ruleInfo);
@@ -128,9 +132,307 @@ const webpackPasses = async (config, isProduction) => {
   }
   return out;
 };
+// plugins/eleventy/helpers DummyEleventyConfig (what a config function receives)
+class DummyEleventyConfig {
+  constructor() {
+    this._uniqueId = {};
+    this.events = {};
+    this.benchmarkManager = {};
+    this.benchmarks = {};
+    this.collections = {};
+    this.precompiledCollections = {};
+    this.templateFormats = {};
+    this.liquidOptions = {};
+    this.liquidTags = {};
+    this.liquidFilters = {};
+    this.liquidShortcodes = {};
+    this.liquidPairedShortcodes = {};
+    this.nunjucksEnvironmentOptions = {};
+    this.nunjucksPrecompiledTemplates = {};
+    this.nunjucksFilters = {};
+    this.nunjucksAsyncFilters = {};
+    this.nunjucksTags = {};
+    this.nunjucksGlobals = {};
+    this.nunjucksShortcodes = {};
+    this.nunjucksAsyncShortcodes = {};
+    this.nunjucksPairedShortcodes = {};
+    this.nunjucksAsyncPairedShortcodes = {};
+    this.javascriptFunctions = {};
+    this.markdownHighlighter = null;
+    this.libraryOverrides = {};
+    this.passthroughCopies = {};
+    this.layoutAliases = {};
+    this.layoutResolution = true;
+    this.linters = {};
+    this.transforms = {};
+    this.activeNamespace = '';
+    this.DateTime = {};
+    this.dynamicPermalinks = true;
+    this.useGitIgnore = true;
+    this.ignores = new Set();
+    this.watchIgnores = new Set();
+    this.dataDeepMerge = true;
+    this.extensionMap = new Set();
+    this.watchJavaScriptDependencies = true;
+    this.additionalWatchTargets = [];
+    this.serverOptions = {};
+    this.globalData = {};
+    this.chokidarConfig = {};
+    this.watchThrottleWaitTime = 0;
+    this.dataExtensions = new Map();
+    this.quietMode = false;
+    this.plugins = [];
+    this._pluginExecution = false;
+    this.useTemplateCache = true;
+    this.dataFilterSelectors = new Set();
+    this.libraryAmendments = {};
+    this.serverPassthroughCopyBehavior = '';
+    this.urlTransforms = [];
+    this.dataFileSuffixesOverride = false;
+    this.dataFileDirBaseNameOverride = false;
+    this.templateFormatsAdded = {};
+    this.frontMatterParsingOptions = { engines: {} };
+  }
+  _getUniqueId() {}
+  reset() {}
+  versionCheck() {}
+  on() {}
+  emit() {}
+  _enablePluginExecution() {}
+  addMarkdownHighlighter() {}
+  addLiquidTag() {}
+  addLiquidFilter() {}
+  addNunjucksAsyncFilter() {}
+  addNunjucksFilter() {}
+  addHandlebarsHelper() {}
+  addFilter() {}
+  addAsyncFilter() {}
+  getFilter() {}
+  addNunjucksTag() {}
+  addGlobalData() {}
+  addNunjucksGlobal() {}
+  addTransform() {}
+  addLinter() {}
+  addLayoutAlias() {}
+  setLayoutResolution() {}
+  enableLayoutResolution() {}
+  getCollections() {}
+  addCollection() {}
+  addPlugin() {}
+  _getPluginName() {}
+  _executePlugin() {}
+  getNamespacedName() {}
+  namespace() {}
+  _normalizeTemplateFormats() {}
+  setTemplateFormats() {}
+  addTemplateFormats() {}
+  setLibrary() {}
+  amendLibrary() {}
+  setPugOptions() {}
+  setLiquidOptions() {}
+  setNunjucksEnvironmentOptions() {}
+  setNunjucksPrecompiledTemplates() {}
+  setEjsOptions() {}
+  setDynamicPermalinks() {}
+  setUseGitIgnore() {}
+  addShortcode() {}
+  addAsyncShortcode() {}
+  addNunjucksAsyncShortcode() {}
+  addNunjucksShortcode() {}
+  addLiquidShortcode() {}
+  addHandlebarsShortcode() {}
+  addPairedShortcode() {}
+  addPairedAsyncShortcode() {}
+  addPairedNunjucksAsyncShortcode() {}
+  addPairedNunjucksShortcode() {}
+  addPairedLiquidShortcode() {}
+  addPairedHandlebarsShortcode() {}
+  addJavaScriptFunction() {}
+  setDataDeepMerge() {}
+  isDataDeepMergeModified() {}
+  addWatchTarget() {}
+  setWatchJavaScriptDependencies() {}
+  setServerOptions() {}
+  setBrowserSyncConfig() {}
+  setChokidarConfig() {}
+  setWatchThrottleWaitTime() {}
+  setFrontMatterParsingOptions() {}
+  setQuietMode() {}
+  addExtension() {}
+  addDataExtension() {}
+  setUseTemplateCache() {}
+  setPrecompiledCollections() {}
+  setServerPassthroughCopyBehavior() {}
+  addUrlTransform() {}
+  setDataFileSuffixes() {}
+  setDataFileBaseName() {}
+  getMergingConfigObject() {}
+  isVirtualTemplate() {}
+  setInputDirectory() {}
+  setOutputDirectory() {}
+  setDataDirectory() {}
+  setIncludesDirectory() {}
+  setLayoutsDirectory() {}
+  setFreezeReservedData() {}
+  addDateParsing() {}
+  addBundle() {}
+  addPassthroughCopy(input) { if (typeof input === 'string') this.passthroughCopies[input] = {}; else for (const [p] of Object.entries(input)) this.passthroughCopies[p] = {}; }
+}
 // the globals plugins define before loading their configs (setup)
 const setups = { nuxt: 'defineNuxtConfig', nitro: 'defineNitroConfig' };
+// plugins/_vue/auto-import getVueSfc and collectTemplateInfo (template expressions kept as text)
+const vueSfcInfo = (root, files) => {
+  let sfc = null;
+  try { sfc = createRequire(path.join(path.resolve(cwd, root), 'package.json'))('vue/compiler-sfc'); } catch {}
+  const res = [];
+  for (const f of files) {
+    if (!sfc) { res.push(null); continue; }
+    try {
+      const abs = path.resolve(cwd, f);
+      const source = fs.readFileSync(abs, 'utf8');
+      let descriptor, compileTemplate = null;
+      if (typeof sfc.parseComponent === 'function') {
+        descriptor = sfc.parse({ source, filename: abs, sourceMap: false });
+        compileTemplate = (src, isTS, preprocessLang) => sfc.compileTemplate({ source: src, filename: abs, sourceMap: false, isProduction: true, prettify: false, isTS, preprocessLang });
+      } else descriptor = sfc.parse(source, { filename: abs, sourceMap: false }).descriptor;
+      const scripts = [];
+      if (descriptor.script?.content) scripts.push(descriptor.script.content);
+      if (descriptor.scriptSetup?.content) scripts.push(descriptor.scriptSetup.content);
+      const template = descriptor.template;
+      const isTS = ['ts', 'tsx'].includes(descriptor.script?.lang) || ['ts', 'tsx'].includes(descriptor.scriptSetup?.lang);
+      const compiled = template && !template.ast && compileTemplate ? compileTemplate(template.content, isTS, template.lang) : undefined;
+      const ast = template?.ast ?? compiled?.ast;
+      let tags = null;
+      const exprs = [];
+      if (ast) {
+        const t = new Set();
+        const visited = new Set();
+        const visit = node => {
+          if (!node || visited.has(node)) return;
+          visited.add(node);
+          if (node.tag) t.add(node.tag);
+          if (node.type === 5 && node.content && !node.content.isStatic) exprs.push(node.content.content);
+          if (node.props) for (const prop of node.props) if (prop.type === 7) {
+            if (prop.exp && !prop.exp.isStatic) exprs.push(prop.exp.content);
+            if (prop.arg && !prop.arg.isStatic) exprs.push(prop.arg.content);
+          }
+          if (node.children) for (const c of node.children) visit(c);
+          if (node.ifConditions) for (const c of node.ifConditions) visit(c.block);
+          if (node.scopedSlots) for (const n in node.scopedSlots) visit(node.scopedSlots[n]);
+        };
+        visit(ast);
+        tags = [...t];
+      }
+      res.push({ scripts, tags, exprs: exprs.map(String), code: compiled?.code ? String(compiled.code) : null });
+    } catch (e) {
+      res.push({ error: (e && e.message ? e.message : String(e)).split('\n')[0] });
+    }
+  }
+  return res;
+};
+// the configuration's compilers (normalizeCompilers), each file compiled with its extension's
+const customCompile = async (config, files) => {
+  if (typeof config === 'function') config = await config();
+  const compilers = new Map();
+  for (const ext in config?.compilers ?? {}) { const fn = config.compilers[ext]; if (typeof fn === 'function') compilers.set(ext.replace(/^\.*/, '.'), fn); }
+  for (const ext in config?.asyncCompilers ?? {}) compilers.set(ext.replace(/^\.*/, '.'), config.asyncCompilers[ext]);
+  const res = [];
+  for (const [ext, f] of files) {
+    const abs = path.resolve(cwd, f);
+    try {
+      const text = fs.readFileSync(abs, 'utf8');
+      let result = compilers.get(ext)(text, abs);
+      if (result !== null && (typeof result === 'object' || typeof result === 'function')) result = await result;
+      if (typeof result !== 'string') { res.push({ config: `Compiler for ${ext} returned ${result === null ? 'null' : typeof result} for ${abs}; expected a string or PromiseLike<string>` }); continue; }
+      res.push({ ok: result });
+    } catch (e) {
+      res.push({ error: `Compiler for ${ext} failed (${abs})`, reason: e && e.message !== undefined ? String(e.message) : String(e) });
+    }
+  }
+  return res;
+};
+// preprocessors and custom reporters (util/preprocessor.ts, util/reporter.ts): modules loaded as
+// knip's _load does; a module that fails to load is a LoaderError
+const loadModule = async spec => {
+  const isLocal = spec.startsWith('.') || spec.startsWith('/');
+  const file = isLocal ? path.resolve(cwd, spec) : spec;
+  try {
+    if (isLocal) return await load(file);
+    // (a package: as knip's jiti.import, relative to the folder)
+    if (jiti) return await jiti(file);
+    const m = await import(file);
+    return m.default ?? m;
+  }
+  catch (e) { const err = new Error(`Error loading ${file}`); err.reason = e && e.message !== undefined ? String(e.message) : String(e); err.notFound = !!(e && e.code === 'MODULE_NOT_FOUND'); throw err; }
+};
+const toPlain = data => JSON.parse(JSON.stringify(data, (k, v) => (v instanceof Set ? [...v] : v instanceof Map ? Object.fromEntries(v) : v instanceof RegExp ? { __vknip_re: v.source, flags: v.flags } : v)));
+const fromPlain = data => ({ ...data, tagHints: new Set(data.tagHints ?? []), configurationHints: (data.configurationHints ?? []).map(h => (h && h.identifier && h.identifier.__vknip_re !== undefined ? { ...h, identifier: new RegExp(h.identifier.__vknip_re, h.identifier.flags) } : h)) });
+// (what a module prints is captured, and printed by vknip in its place)
+const captured = async f => {
+  let out = '', err = '';
+  const ow = process.stdout.write.bind(process.stdout), ew = process.stderr.write.bind(process.stderr);
+  process.stdout.write = c => { out += String(c); return true; };
+  process.stderr.write = c => { err += String(c); return true; };
+  try { const value = await f(t => { out += t; }); return { value, out, err }; }
+  catch (e) { e.out = out; e.errOut = err; throw e; }
+  finally { process.stdout.write = ow; process.stderr.write = ew; }
+};
+const runPreprocessors = async (mods, data) => {
+  const fns = [];
+  for (const m of mods) fns.push(await loadModule(m));
+  const r = await captured(async () => {
+    let d = fromPlain(data);
+    for (const fn of fns) d = await fn(d);
+    return toPlain(d);
+  });
+  return { data: r.value, out: r.out, err: r.err };
+};
+const runReporter = async (mod, data, toFile) => {
+  const fn = await loadModule(mod);
+  let file = '';
+  const r = await captured(async add => {
+    const write = toFile ? text => { if (text) file += `${text}\n`; } : text => { if (text) add(`${text}\n`); };
+    await fn({ ...fromPlain(data), write });
+  });
+  return { out: r.out, err: r.err, file };
+};
+// the yaml package (knip's YAML parser): the project's, the one next to its knip, else any in .pnpm
+const findYaml = () => {
+  const tries = [
+    () => createRequire(path.join(cwd, 'package.json'))('yaml'),
+    () => createRequire(createRequire(path.join(cwd, 'package.json')).resolve('knip'))('yaml'),
+    () => createRequire(fs.realpathSync(path.join(cwd, 'node_modules/knip/package.json')))('yaml'),
+    () => {
+      const pnpm = path.join(cwd, 'node_modules/.pnpm');
+      const dirs = fs.readdirSync(pnpm).filter(d => /^yaml@2/.test(d)).sort().reverse();
+      for (const d of dirs) { const f = path.join(pnpm, d, 'node_modules/yaml/package.json'); if (fs.existsSync(f)) return createRequire(f)('yaml'); }
+      return null;
+    },
+  ];
+  for (const t of tries) { try { const y = t(); if (y && typeof y.parse === 'function') return y; } catch {} }
+  return null;
+};
 for (const r of reqs) {
+  // a YAML file vknip's reader isn't sure about: parsed as knip parses it (loadYAML)
+  if (r.mode === 'yaml') {
+    const Y = findYaml();
+    if (!Y) { out[r.file] = { noyaml: true }; continue; }
+    try { out[r.file] = { ok: enc(Y.parse(fs.readFileSync(path.resolve(cwd, r.file), 'utf8'), { logLevel: 'error' }), 0, new Set()) ?? null }; }
+    catch (e) { out[r.file] = { error: (e && e.message ? e.message : String(e)).split('\n')[0] }; }
+    continue;
+  }
+  if (r.mode === 'preprocess' || r.mode === 'reporter') {
+    try {
+      out[r.file] = { ok: r.mode === 'preprocess' ? await runPreprocessors(r.args.mods, r.args.data) : await runReporter(r.args.mod, r.args.data, r.args.toFile) };
+    } catch (e) { out[r.file] = { error: e && e.message ? e.message.split('\n')[0] : String(e), reason: e && e.reason !== undefined ? e.reason : '', loader: !!(e && e.reason !== undefined), notFound: !!(e && e.notFound), out: (e && e.out) || '', errOut: (e && e.errOut) || '', stack: e && e.stack ? String(e.stack) : String(e) }; }
+    continue;
+  }
+  if (r.mode === 'vue-sfc') { out[r.file] = { ok: vueSfcInfo(r.file, r.args) }; continue; }
+  if (r.mode === 'compile') {
+    try { out[r.file] = { ok: await customCompile(await load(r.file), r.args) }; }
+    catch (e) { out[r.file] = { error: (e && e.message ? e.message : String(e)).split('\n')[0] }; }
+    continue;
+  }
   try {
     const g = setups[r.mode];
     if (g && !(g in globalThis)) Object.defineProperty(globalThis, g, { value: id => id, writable: true, configurable: true });
@@ -222,7 +524,33 @@ for (const r of reqs) {
       for (const name of ['main', 'preload', 'renderer']) if (typeof out[name] === 'function') out[name] = await out[name](env);
       v = out;
     }
+    if (r.mode === 'storybook' && v && typeof v.stories === 'function') v = { ...v, stories: await v.stories(['**/*.@(mdx|stories.@(mdx|js|jsx|mjs|ts|tsx))']) };
+    if (r.mode === 'rstest' && typeof v === 'function') v = await v({ env: 'test', command: 'run', envMode: 'test' });
+    if (r.mode === 'babel' && typeof v === 'function') {
+      const cacheFn = () => void 0;
+      cacheFn.forever = () => cacheFn; cacheFn.never = () => cacheFn; cacheFn.using = () => cacheFn; cacheFn.invalidate = () => cacheFn;
+      v = v({ assertVersion: () => true, cache: cacheFn, caller: () => true, env: env => (typeof env === 'string' ? true : 'development'), version: '0.0.0' });
+    }
+    if (r.mode === 'lint-staged') {
+      const cfg = typeof v === 'function' ? await v([]) : v;
+      const resolveEntry = async value => {
+        if (Array.isArray(value)) return (await Promise.all(value.map(resolveEntry))).flat();
+        if (typeof value === 'function') return [await value([])].flat().filter(item => typeof item === 'string');
+        return typeof value === 'string' ? [value] : [];
+      };
+      if (cfg && typeof cfg === 'object') { const o = {}; for (const [k, e] of Object.entries(cfg)) o[k] = await resolveEntry(e); v = o; } else v = cfg;
+    }
+    if (r.mode === 'eleventy') {
+      const dummy = new DummyEleventyConfig();
+      if (typeof v === 'function') v = await v(dummy);
+      v = { config: v ?? null, passthrough: Object.keys(dummy.passthroughCopies) };
+    }
     if (r.mode === 'call0' && typeof v === 'function') v = await v();
+    if (r.mode === 'gatsby' && v && typeof v.onCreateBabelConfig === 'function') {
+      const names = new Set();
+      v.onCreateBabelConfig({ actions: { setBabelPlugin: plugin => names.add(plugin.name) } });
+      v = { ...v, __babelPlugins: [...names] };
+    }
     if (r.mode === 'karma') {
       if (typeof v !== 'function') v = null;
       else { const mem = { config: undefined, set(c) { this.config = c; } }; await v(mem); v = mem.config ?? {}; }

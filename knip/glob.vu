@@ -1,12 +1,17 @@
 # Glob patterns as picomatch reads them (the subset knip's patterns use): '**' segments, '*', '?',
 # [classes], {a,b} alternatives (nested) and the extglobs ?(..) *(..) +(..) @(..) !(..).
-# A compiled pattern is a list of brace-free alternatives, each split into its '/' segments.
+# A compiled pattern is a list of brace-free alternatives, each split into its '/' segments; an
+# extglob whose alternatives contain '/' (+(a/*/|b/*/)) is matched as a whole with a regular expression.
+
+import re
 
 type Pat:
   alts: [[Str]]    # each alternative's segments
   neg: Bool        # the pattern started with '!'
   fast: Int        # 1: "**/name" (the last part is name), 2: "**/*suffix", 0: anything else
   lit: Str
+  rxs: [re.Regex]  # (patterns with an extglob spanning '/': each alternative as a regex)
+  dot_lit: Bool    # (such a pattern names a segment starting with '.')
 
 # The pattern with its {a,b} groups expanded into every combination.
 fn expand(p: Str) -> [Str]:
@@ -64,6 +69,12 @@ fn compile(pattern: Str) -> Pat:
     p = p[1..p.len]
   if p.startswith("./"): p = p[2..p.len]
   var alts: [[Str]] = []
+  if has_slash_ext(p):
+    var rxs: [re.Regex] = []
+    for e in expand(p):
+      let r = re.compile("^" + to_regex(e) + "$") else continue
+      rxs.push(r)
+    return Pat([], neg, 0, "", rxs, p.startswith(".") or p.find("/.") >= 0)
   for e in expand(p):
     var segs: [Str] = []
     for s in e.split("/"):
@@ -80,9 +91,10 @@ fn compile(pattern: Str) -> Pat:
     elif last.startswith("*") and last.len > 1 and not is_dynamic(last[1..last.len]):
       fast = 2
       lit = last[1..last.len]
-  return Pat(alts, neg, fast, lit)
+  return Pat(alts, neg, fast, lit, [], false)
 
 fn matches(pt: Pat, path: Str, dot: Bool) -> Bool:
+  if pt.rxs.len > 0: return rx_match(pt, path, dot)
   if pt.fast != 0: return fast_match(pt, path, dot)
   let parts = path.split("/")
   return matches_parts(pt, parts, dot)
@@ -101,6 +113,7 @@ fn fast_match(pt: Pat, path: Str, dot: Bool) -> Bool:
   return d < 0 or d >= b - 1
 
 fn matches_parts(pt: Pat, parts: [Str], dot: Bool) -> Bool:
+  if pt.rxs.len > 0: return rx_match(pt, "/".join(parts), dot)
   for a in pt.alts:
     if match_segs(a, 0, parts, 0, dot): return true
   return false
@@ -152,7 +165,7 @@ fn match_segs(pat: [Str], pi: Int, parts: [Str], si: Int, dot: Bool) -> Bool:
   if not dot and part.startswith(".") and not seg.startswith("."):
     # a leading '.' must be matched explicitly
     return false
-  if not match_seg(seg, 0, seg.len, part, 0, part.len): return false
+  if part != seg and not match_seg(seg, 0, seg.len, part, 0, part.len): return false
   return match_segs(pat, pi + 1, parts, si + 1, dot)
 
 # The index of the ')' closing the '(' at i.
@@ -205,6 +218,12 @@ fn match_seg(p: Str, pi: Int, pe: Int, s: Str, si: Int, se: Int) -> Bool:
       if cl >= 0:
         let alts = split_alts(p, i + 2, cl)
         return ext_match(c, p, alts, cl + 1, pe, s, k, se)
+    # a bare (a|b) is a regex group in picomatch: one of the alternatives
+    if c == '(':
+      let cl = close_paren(p, i, pe)
+      if cl >= 0:
+        let alts = split_alts(p, i + 1, cl)
+        return ext_match('@', p, alts, cl + 1, pe, s, k, se)
     if c == '*':
       # collapse runs of '*'
       var j = i
@@ -303,3 +322,90 @@ fn is_dynamic(p: Str) -> Bool:
     let c = p[i]
     if c == '*' or c == '?' or c == '[' or c == '{' or c == '(' or c == '!': return true
   return false
+
+# ---- extglobs spanning folders
+
+fn rx_match(pt: Pat, path: Str, dot: Bool) -> Bool:
+  if not dot and not pt.dot_lit:
+    if path.startswith(".") or path.find("/.") >= 0: return false
+  for r in pt.rxs:
+    if m = re.fullmatch(r, path): return true
+  return false
+
+# an extglob group ?( *( +( @( !( whose text has a '/'
+fn has_slash_ext(p: Str) -> Bool:
+  var i = 0
+  while i + 1 < p.len:
+    let c = p[i]
+    if (c == '?' or c == '*' or c == '+' or c == '@' or c == '!') and p[i + 1] == '(':
+      let e = close_paren(p, i + 1, p.len)
+      if e > 0 and p[i + 2..e].find("/") >= 0: return true
+    i += 1
+  return false
+
+fn rx_escape(c: Byte) -> Str:
+  let s = chr(int(c))
+  if ".+^$(){{}}|\\".find(s) >= 0: return "\\" + s
+  return s
+
+# picomatch's translation of a brace-free glob (dot handling is checked apart)
+fn to_regex(p: Str) -> Str:
+  var out = ""
+  var i = 0
+  while i < p.len:
+    let c = p[i]
+    let seg_start = i == 0 or p[i - 1] == '/'
+    if c == '*' and i + 1 < p.len and p[i + 1] == '*' and seg_start and (i + 2 == p.len or p[i + 2] == '/'):
+      if i + 2 == p.len: out += ".*"
+      else: out += "(?:[^/]*/)*"
+      i += 3
+      continue
+    if (c == '?' or c == '*' or c == '+' or c == '@' or c == '!') and i + 1 < p.len and p[i + 1] == '(':
+      let e = close_paren(p, i + 1, p.len)
+      if e > 0:
+        var parts: [Str] = []
+        let al = split_alts(p, i + 2, e)
+        var k = 0
+        while k < al.len:
+          parts.push(to_regex(p[al[k]..al[k + 1]]))
+          k += 2
+        let grp = "(?:" + "|".join(parts) + ")"
+        if c == '!': out += "[^/]*"
+        elif c == '@': out += grp
+        else: out += grp + chr(int(c))
+        i = e + 1
+        continue
+    if c == '*':
+      out += "[^/]*"
+    elif c == '?':
+      out += "[^/]"
+    elif c == '[':
+      var j = i + 1
+      if j < p.len and (p[j] == '!' or p[j] == '^'): j += 1
+      if j < p.len and p[j] == ']': j += 1
+      while j < p.len and p[j] != ']': j += 1
+      if j < p.len:
+        var cls = p[i + 1..j]
+        if cls.startswith("!"): cls = "^" + cls[1..cls.len]
+        out += "[" + cls.replace("\\", "\\\\") + "]"
+        i = j + 1
+        continue
+      out += "\\["
+    elif c == '(' and close_paren(p, i, p.len) > 0:
+      let e = close_paren(p, i, p.len)
+      var parts: [Str] = []
+      let al = split_alts(p, i + 1, e)
+      var k = 0
+      while k < al.len:
+        parts.push(to_regex(p[al[k]..al[k + 1]]))
+        k += 2
+      out += "(?:" + "|".join(parts) + ")"
+      i = e + 1
+      continue
+    elif c == '\\' and i + 1 < p.len:
+      out += rx_escape(p[i + 1])
+      i += 2
+      continue
+    else: out += rx_escape(c)
+    i += 1
+  return out
