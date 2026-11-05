@@ -39,3 +39,64 @@ int64_t vl_ncpu(void) {
   long n = sysconf(_SC_NPROCESSORS_ONLN);
   return n > 0 ? (int64_t)n : 1;
 }
+
+// For the command line: whether a descriptor is a terminal, the working directory, a real path.
+#include <unistd.h>
+#include <limits.h>
+#include <stdlib.h>
+
+bool vl_isatty(int64_t fd) { return isatty((int)fd) == 1; }
+
+vu_str vl_cwd(void) {
+  char buf[PATH_MAX];
+  if (!getcwd(buf, sizeof buf)) return vu_str_from("", 0);
+  return vu_str_from(buf, (int64_t)strlen(buf));
+}
+
+vu_str vl_realpath(const vu_str *path) {
+  char *p = vu_cstr(path);
+  if (!p) return vu_str_from("", 0);
+  char buf[PATH_MAX];
+  char *r = realpath(p, buf);
+  free(p);
+  if (!r) return vu_str_from("", 0);
+  return vu_str_from(buf, (int64_t)strlen(buf));
+}
+
+// A folder's entries in the order the file system gives them (as oxlint's walker sees them), each
+// followed by "\n"; folders end with "/" (symbolic links are followed). "" when it can't be read.
+#include <dirent.h>
+vu_str vl_readdir(const vu_str *path) {
+  char *p = vu_cstr(path);
+  if (!p) return vu_str_from("", 0);
+  DIR *d = opendir(p);
+  if (!d) { free(p); return vu_str_from("", 0); }
+  size_t cap = 4096, len = 0;
+  char *buf = malloc(cap);
+  size_t plen = strlen(p);
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL) {
+    const char *nm = e->d_name;
+    if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+    int is_dir = 0;
+    if (e->d_type == DT_DIR) is_dir = 1;
+    else if (e->d_type == DT_LNK || e->d_type == DT_UNKNOWN) {
+      size_t n = plen + 1 + strlen(nm) + 1;
+      char *full = malloc(n);
+      snprintf(full, n, "%s/%s", p, nm);
+      struct stat st;
+      if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) is_dir = 1;
+      free(full);
+    }
+    size_t nl = strlen(nm);
+    while (len + nl + 3 > cap) { cap *= 2; buf = realloc(buf, cap); }
+    memcpy(buf + len, nm, nl); len += nl;
+    if (is_dir) buf[len++] = '/';
+    buf[len++] = '\n';
+  }
+  closedir(d);
+  free(p);
+  vu_str r = vu_str_from(buf, (int64_t)len);
+  free(buf);
+  return r;
+}

@@ -1,0 +1,949 @@
+# vlint's output: oxlint's reporters (oxc_diagnostics' graphical and JSON handlers and oxlint's
+# output formatters, oxlint 1.90.0), byte for byte.
+#
+# A diagnostic (Diag) is rendered in the worker that linted its file (it needs the source for code
+# frames and positions) into a Rec: its severity, the fields the aggregate formats need, and the
+# text for the per-diagnostic formats. The main thread joins them (lout.finish).
+
+type Lab:
+  s: Int
+  e: Int
+  text: Str
+  has: Bool        # a label with text ("" may be a real, empty label)
+  primary: Bool
+
+type Diag:
+  sev: Int          # 1 warning, 2 error
+  code: Str         # eslint(no-debugger); "" for parse errors
+  url: Str
+  msg: Str
+  help: Str
+  labs: [Lab]
+  note: Str
+
+type Rec:
+  sev: Int
+  code: Str
+  msg: Str          # the message as Info has it (empty when the first label is out of range)
+  file: Str
+  line: Int         # the first label's start and end (0 when there is none)
+  col: Int
+  eline: Int
+  ecol: Int
+  text: Str         # rendered for the format (graphical, unix, agent, github, json object)
+
+# Output formats
+const F_DEFAULT = 0
+const F_AGENT = 1
+const F_UNIX = 2
+const F_JSON = 3
+const F_GITHUB = 4
+const F_GITLAB = 5
+const F_CHECKSTYLE = 6
+const F_JUNIT = 7
+const F_STYLISH = 8
+const F_SARIF = 9
+
+fn format_of(s: Str) -> Int:
+  if s == "default": return F_DEFAULT
+  if s == "agent": return F_AGENT
+  if s == "unix": return F_UNIX
+  if s == "json": return F_JSON
+  if s == "github": return F_GITHUB
+  if s == "gitlab": return F_GITLAB
+  if s == "checkstyle": return F_CHECKSTYLE
+  if s == "junit": return F_JUNIT
+  if s == "stylish": return F_STYLISH
+  if s == "sarif": return F_SARIF
+  return -1
+
+# The graphical theme: 0 ASCII without colors (not a terminal), 1 Unicode with colors, 2 Unicode
+# without colors (NO_COLOR).
+type Opts:
+  fmt: Int
+  theme: Int
+  links: Bool
+
+# ---- positions (oxc's Info::line_column: \r, \n and \r\n end lines; columns in bytes)
+
+fn line_col(src: Str, ls: [Int], off0: Int) -> [Int]:
+  var off = off0
+  if off > src.len: return [0, 0]
+  if off > 0 and off < src.len and src[off - 1] == '\r' and src[off] == '\n': off -= 1
+  let k = line_of(ls, off)
+  return [k + 1, off - ls[k] + 1]
+
+# The start of each line (after \r, \n or \r\n)
+fn line_index(src: Str) -> [Int]:
+  var ls = [0]
+  if src.find("\r") < 0:
+    var i = src.find("\n")
+    while i >= 0:
+      ls.push(i + 1)
+      i = src.find("\n", i + 1)
+    return ls
+  var i = 0
+  let n = src.len
+  while i < n:
+    let c = src[i]
+    if c == '\n': ls.push(i + 1)
+    elif c == '\r':
+      if i + 1 < n and src[i + 1] == '\n':
+        ls.push(i + 2)
+        i += 1
+      else: ls.push(i + 1)
+    i += 1
+  return ls
+
+# The index of the last line start at or before off.
+fn line_of(ls: [Int], off: Int) -> Int:
+  var lo = 0
+  var hi = ls.len - 1
+  while lo < hi:
+    let mid = (lo + hi + 1) / 2
+    if ls[mid] <= off: lo = mid
+    else: hi = mid - 1
+  return lo
+
+# Collapse white-space runs to one space and trim (the agent format's compact_message).
+fn compact(s: Str) -> Str:
+  var need = false
+  if s.len > 0 and (is_ws(s[0]) or is_ws(s[s.len - 1])): need = true
+  if not need:
+    for i in 0..s.len:
+      let c = s[i]
+      if c == '\n' or c == '\t' or c == '\r' or c == 11 or c == 12 or (c == ' ' and i + 1 < s.len and s[i + 1] == ' '):
+        need = true
+        break
+  if not need: return s
+  var words: [Str] = []
+  for w in s.split(): words.push(w)
+  return " ".join(words)
+
+fn is_ws(c: Byte) -> Bool:
+  return c == ' ' or c == '\n' or c == '\t' or c == '\r' or c == 11 or c == 12
+
+# ---- one diagnostic to a record
+
+fn sev_word(sev: Int) -> Str:
+  if sev == 1: return "warning"
+  return "error"
+
+fn first_ok(d: Diag, n: Int) -> Bool:
+  if d.labs.len == 0: return false
+  let a = d.labs[0]
+  return a.s >= 0 and a.e >= a.s and a.e <= n
+
+fn make_rec(o: Opts, path: Str, src: Str, ls: [Int], d: Diag) -> Rec:
+  var r = Rec(d.sev, d.code, "", path, 0, 0, 0, 0, "")
+  if first_ok(d, src.len):
+    let a = line_col(src, ls, d.labs[0].s)
+    let b = line_col(src, ls, d.labs[0].e)
+    r.line = a[0]
+    r.col = a[1]
+    r.eline = b[0]
+    r.ecol = b[1]
+    r.msg = d.msg + ""
+  if o.fmt == F_DEFAULT: r.text = graphical(o, path, src, ls, d)
+  elif o.fmt == F_AGENT: r.text = agent_line(path, d, r)
+  elif o.fmt == F_UNIX:
+    var rule = ""
+    if d.code != "": rule = "/" + d.code
+    var sv = "Warning"
+    if d.sev == 2: sv = "Error"
+    r.text = "{path}:{r.line}:{r.col}: {r.msg} [{sv}{rule}]\n"
+  elif o.fmt == F_GITHUB: r.text = github_line(path, d, r)
+  elif o.fmt == F_JSON: r.text = json_diag(path, src, ls, d)
+  return r
+
+fn agent_line(path: Str, d: Diag, r: Rec) -> Str:
+  var rule = ""
+  if d.code != "": rule = " " + d.code
+  var msg = r.msg
+  if msg == "": msg = d.msg
+  var help = ""
+  if d.help != "": help = " help: " + compact(d.help)
+  var loc = ""
+  if r.line != 0: loc = ":{r.line}:{r.col}"
+  return "{path}{loc}: {sev_word(d.sev)}{rule}: {compact(msg)}{help}\n"
+
+fn esc_data(s: Str) -> Str:
+  if s.find("%") < 0 and s.find("\r") < 0 and s.find("\n") < 0: return s
+  return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+fn esc_prop(s: Str) -> Str:
+  return esc_data(s).replace(":", "%3A").replace(",", "%2C")
+
+fn github_line(path: Str, d: Diag, r: Rec) -> Str:
+  var title = d.code
+  if title == "": title = "oxlint"
+  return "::{sev_word(d.sev)} file={esc_prop(path)},line={r.line},endLine={r.eline},col={r.col},endColumn={r.ecol},title={title}::{esc_data(path)}:{r.line}:{r.col}: {esc_data(r.msg)}\n"
+
+# ---- JSON (oxc's JSONReportHandler)
+
+fn json_esc(s: Str) -> Str:
+  var need = false
+  for i in 0..s.len:
+    let c = s[i]
+    if c < 32 or c == '"' or c == '\\':
+      need = true
+      break
+  if not need: return s
+  var b: [Byte] = []
+  for i in 0..s.len:
+    let c = s[i]
+    if c == '\\': append(&b, "\\\\")
+    elif c == '"': append(&b, "\\\"")
+    elif c == '\r': append(&b, "\\r")
+    elif c == '\n': append(&b, "\\n")
+    elif c == '\t': append(&b, "\\t")
+    elif c == 8: append(&b, "\\b")
+    elif c == 12: append(&b, "\\f")
+    elif c < 32: append(&b, "\\u{int(c):04x}")
+    else: b.push(c)
+  return b.take_str()
+
+fn append(var b: [Byte], s: Str):
+  for i in 0..s.len: b.push(s[i])
+
+fn json_diag(path: Str, src: Str, ls: [Int], d: Diag) -> Str:
+  var parts: [Str] = []
+  parts.push("{{\"message\": \"{json_esc(d.msg)}\",")
+  if d.code != "": parts.push("\"code\": \"{json_esc(d.code)}\",")
+  parts.push("\"severity\": \"{sev_word(d.sev)}\",")
+  if d.url != "": parts.push("\"url\": \"{json_esc(d.url)}\",")
+  if d.help != "": parts.push("\"help\": \"{json_esc(d.help)}\",")
+  if d.note != "": parts.push("\"note\": \"{json_esc(d.note)}\",")
+  parts.push("\"filename\": \"{json_esc(path)}\",")
+  parts.push("\"labels\": [")
+  for i in 0..d.labs.len:
+    let a = d.labs[i]
+    if i > 0: parts.push(",")
+    parts.push("{{")
+    if a.has: parts.push("\"label\": \"{json_esc(a.text)}\",")
+    parts.push("\"span\": {{\"offset\": {a.s},\"length\": {a.e - a.s},")
+    if a.s <= src.len and a.e <= src.len:
+      let lc = line_col(src, ls, a.s)
+      parts.push("\"line\": {lc[0]},\"column\": {lc[1]}")
+    else: parts.push("\"line\": null,\"column\": null")
+    parts.push("}}}}")
+  parts.push("]}}")
+  return "".join(parts)
+
+# ---- the graphical report (oxc_diagnostics/src/handlers/graphical)
+
+fn reset() -> Str:
+  return "{chr(27)}[0m"
+
+# Styles: 0 plain, 1 error, 2 warning, 3 info, 4 link, 5 line number, 6 7 8 highlights
+fn prefix(st: Int) -> Str:
+  if st == 1: return "{chr(27)}[38;2;225;80;80;1m"
+  if st == 2: return "{chr(27)}[38;2;244;191;117;1m"
+  if st == 3: return "{chr(27)}[38;2;106;159;181m"
+  if st == 4: return "{chr(27)}[38;2;92;157;255;1m"
+  if st == 5: return "{chr(27)}[2m"
+  if st == 6: return "{chr(27)}[38;2;246;87;248m"
+  if st == 7: return "{chr(27)}[38;2;30;201;212m"
+  if st == 8: return "{chr(27)}[38;2;145;246;111m"
+  return ""
+
+fn sty(st: Int, s: Str) -> Str:
+  if st == 0: return s
+  return prefix(st) + s + reset()
+
+# The theme's characters, by name
+type Chars:
+  hbar: Str
+  vbar: Str
+  vbar_break: Str
+  uarrow: Str
+  rarrow: Str
+  ltop: Str
+  lbot: Str
+  lcross: Str
+  rcross: Str
+  underbar: Str
+  underline: Str
+  error: Str
+  warning: Str
+  advice: Str
+
+fn chars(theme: Int) -> Chars:
+  if theme == 0: return Chars("-", "|", ":", "^", ">", ",", "`", "|", "|", "|", "^", "x", "!", ">")
+  return Chars("─", "│", "·", "▲", "▶", "╭", "╰", "├", "┤", "┬", "─", "×", "⚠", "☞")
+
+type G:
+  ch: Chars
+  color: Bool
+  links: Bool
+
+fn rep(s: Str, n: Int) -> Str:
+  if n <= 0: return ""
+  var parts: [Str] = []
+  for i in 0..n: parts.push(s)
+  return "".join(parts)
+
+fn graphical(o: Opts, path: Str, src: Str, ls: [Int], d: Diag) -> Str:
+  let g = G(chars(o.theme), o.theme == 1, o.links)
+  var f: [Str] = ["\n"]
+  render_title(g, src, ls, &f, d)
+  render_snippets(g, src, ls, &f, d, path)
+  render_footer(g, src, ls, &f, d)
+  return "".join(f)
+
+fn render_title(g: G, src: Str, ls: [Int], var f: [Str], d: Diag):
+  var st = 1
+  var icon = g.ch.error
+  if d.sev == 1:
+    st = 2
+    icon = g.ch.warning
+  if not g.color: st = 0
+  let width = 400 - 2
+  var title = ""
+  if g.links and d.url != "" and d.code != "":
+    title = "{chr(27)}]8;;" + d.url + "{chr(27)}\\" + sty(st, d.code) + "{chr(27)}]8;;{chr(27)}\\" + ": " + sty(st, d.msg)
+  elif d.code != "": title = sty(st, d.code + ": " + d.msg)
+  else: title = sty(st, d.msg)
+  if title.find("\n") < 0 and icon.len + title.len + 3 <= width:
+    f.push("  ")
+    f.push(sty(st, icon))
+    f.push(" ")
+    f.push(title.rstrip(" "))
+  else:
+    f.push(fill(title, width, "  " + sty(st, icon) + " ", "  " + sty(st, g.ch.vbar) + " "))
+  f.push("\n")
+
+fn render_footer(g: G, src: Str, ls: [Int], var f: [Str], d: Diag):
+  render_help(g, &f, d)
+  if d.note != "":
+    var st = 3
+    if not g.color: st = 0
+    f.push(fill(d.note, 400 - 4, sty(st, "  note: "), "           "))
+    f.push("\n")
+
+fn render_help(g: G, var f: [Str], d: Diag):
+  if d.help == "": return
+  var st = 3
+  if not g.color: st = 0
+  let width = 400 - 4
+  let pre = "  help: "
+  if d.help.find("\n") < 0 and pre.len + d.help.len <= width:
+    f.push(sty(st, pre))
+    f.push(d.help.rstrip(" "))
+  else:
+    f.push(fill(d.help, width, sty(st, pre), "        "))
+  f.push("\n")
+
+# textwrap::fill for the rare text that doesn't fit on one line (greedy; textwrap's optimal fit can
+# break lines elsewhere in long paragraphs).
+fn fill(text: Str, width: Int, first: Str, rest: Str) -> Str:
+  if text.find("\n") < 0 and first.len + text.len <= width: return first + text.rstrip(" ")
+  var lines: [Str] = []
+  for para in text.split("\n"):
+    var cur = ""
+    var ind = first
+    if lines.len > 0: ind = rest
+    # (a line's leading white space stays, as textwrap keeps it)
+    var lead = 0
+    while lead < para.len and para[lead] == ' ': lead += 1
+    var started = false
+    for w in para[lead..para.len].split(" "):
+      if not started:
+        cur = para[0..lead] + w
+        started = true
+      elif disp_width(ind) + disp_width(cur) + 1 + disp_width(w) <= width: cur = cur + " " + w
+      else:
+        lines.push(ind + cur)
+        ind = rest
+        cur = w
+    lines.push(ind + cur)
+  return "\n".join(lines)
+
+fn disp_width(s: Str) -> Int:
+  var w = 0
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if c == 27:
+      i += 1
+      if i < s.len and s[i] == '[':
+        i += 1
+        while i < s.len:
+          let b = s[i]
+          i += 1
+          if b >= '@' and b <= '~': break
+      elif i < s.len and s[i] == ']':
+        i += 1
+        while i < s.len:
+          if s[i] == 7:
+            i += 1
+            break
+          if s[i] == 27 and i + 1 < s.len and s[i + 1] == '\\':
+            i += 2
+            break
+          i += 1
+      continue
+    if c < 0x80:
+      if c >= ' ' and c <= '~': w += 1
+      i += 1
+    else:
+      let n = utf8_len(c)
+      w += cp_width(cp_at(s, i))
+      i += n
+  return w
+
+fn utf8_len(c: Byte) -> Int:
+  if c >= 0xF0: return 4
+  if c >= 0xE0: return 3
+  if c >= 0xC0: return 2
+  return 1
+
+fn cp_at(s: Str, i: Int) -> Int:
+  let c = int(s[i])
+  if c < 0x80: return c
+  let n = utf8_len(s[i])
+  if i + n > s.len: return 0xFFFD
+  if n == 2: return ((c & 0x1F) << 6) | (int(s[i + 1]) & 0x3F)
+  if n == 3: return ((c & 0x0F) << 12) | ((int(s[i + 1]) & 0x3F) << 6) | (int(s[i + 2]) & 0x3F)
+  if n == 4: return ((c & 0x07) << 18) | ((int(s[i + 1]) & 0x3F) << 12) | ((int(s[i + 2]) & 0x3F) << 6) | (int(s[i + 3]) & 0x3F)
+  return 0xFFFD
+
+# unicode-width's East Asian Wide and zero-width code points (the common ranges)
+fn cp_width(cp: Int) -> Int:
+  if cp == 0x200B or cp == 0x200C or cp == 0x200D or cp == 0x2060 or cp == 0xFEFF: return 0
+  if (cp >= 0x300 and cp <= 0x36F) or (cp >= 0x483 and cp <= 0x489) or (cp >= 0x591 and cp <= 0x5BD): return 0
+  if (cp >= 0x610 and cp <= 0x61A) or (cp >= 0x64B and cp <= 0x65F) or (cp >= 0x1AB0 and cp <= 0x1AFF): return 0
+  if (cp >= 0x1DC0 and cp <= 0x1DFF) or (cp >= 0x20D0 and cp <= 0x20FF) or (cp >= 0xFE00 and cp <= 0xFE0F) or (cp >= 0xFE20 and cp <= 0xFE2F): return 0
+  if cp >= 0xE0100 and cp <= 0xE01EF: return 0
+  if (cp >= 0x1100 and cp <= 0x115F) or (cp >= 0x2E80 and cp <= 0x303E) or (cp >= 0x3041 and cp <= 0x33FF): return 2
+  if (cp >= 0x3400 and cp <= 0x4DBF) or (cp >= 0x4E00 and cp <= 0x9FFF) or (cp >= 0xA000 and cp <= 0xA4CF): return 2
+  if (cp >= 0xAC00 and cp <= 0xD7A3) or (cp >= 0xF900 and cp <= 0xFAFF) or (cp >= 0xFE30 and cp <= 0xFE4F): return 2
+  if (cp >= 0xFF00 and cp <= 0xFF60) or (cp >= 0xFFE0 and cp <= 0xFFE6): return 2
+  if (cp >= 0x1F300 and cp <= 0x1F64F) or (cp >= 0x1F900 and cp <= 0x1F9FF) or (cp >= 0x1F680 and cp <= 0x1F6FF): return 2
+  if (cp >= 0x20000 and cp <= 0x2FFFD) or (cp >= 0x30000 and cp <= 0x3FFFD): return 2
+  if cp == 0x2614 or cp == 0x2615 or (cp >= 0x2648 and cp <= 0x2653) or cp == 0x26A1 or cp == 0x26AA or cp == 0x26AB or cp == 0x26BD or cp == 0x26BE: return 2
+  if cp == 0x26C4 or cp == 0x26C5 or cp == 0x26CE or cp == 0x26D4 or cp == 0x26EA or cp == 0x26F2 or cp == 0x26F3 or cp == 0x26F5 or cp == 0x26FA or cp == 0x26FD: return 2
+  if cp == 0x2705 or cp == 0x270A or cp == 0x270B or cp == 0x2728 or cp == 0x274C or cp == 0x274E or (cp >= 0x2753 and cp <= 0x2755) or cp == 0x2757 or (cp >= 0x2795 and cp <= 0x2797) or cp == 0x27B0 or cp == 0x27BF: return 2
+  if cp == 0x231A or cp == 0x231B or cp == 0x2329 or cp == 0x232A or (cp >= 0x23E9 and cp <= 0x23EC) or cp == 0x23F0 or cp == 0x23F3 or cp == 0x25FD or cp == 0x25FE or cp == 0x2B1B or cp == 0x2B1C or cp == 0x2B50 or cp == 0x2B55: return 2
+  if (cp >= 0x1F004 and cp <= 0x1F0CF) or (cp >= 0x1F18E and cp <= 0x1F19A) or (cp >= 0x1F200 and cp <= 0x1F2FF) or (cp >= 0x1FA70 and cp <= 0x1FAFF): return 2
+  return 1
+
+# SpanScanner::read_span with one line of context before and after: the window [s, e) of whole
+# lines around the span, its first line (0-based) and the number of line breaks up to its end;
+# [] when the span can't be read.
+fn read_span(src: Str, ls: [Int], off: Int, len: Int) -> [Int]:
+  let n = src.len
+  var pe = off - 1
+  if pe < 0: pe = 0
+  if pe > n: pe = n
+  if pe > 0 and src[pe - 1] == '\r': pe -= 1
+  # the prefix: line breaks before pe, the start of the line pe is on and of the one before
+  let lcount = line_of(ls, pe)
+  var cur = ls[lcount]
+  var prev = -1
+  if lcount > 0: prev = ls[lcount - 1]
+  var start_line = lcount - 1
+  if start_line < 0: start_line = 0
+  var lead = prev        # LeadingContext::one
+  var offset = pe
+  var active = false
+  var saw = false
+  var tcount = 0
+  var endt = off + len - 1
+  if endt < 0: endt = 0
+  var tbt = off + len - 1
+  if len == 0: tbt = off
+  var line_count = lcount
+  while offset < n:
+    let b = src[offset]
+    if b == '\r' or b == '\n':
+      var e = offset
+      if b == '\r' and offset + 1 < n and src[offset + 1] == '\n': e = offset + 1
+      # consume_line_break
+      line_count += 1
+      var done = false
+      if e < off:
+        if lead >= 0: start_line += 1
+        lead = cur
+      elif e >= tbt and active:
+        if saw: tcount += 1
+        else: saw = true
+        if tcount >= 1: done = true
+      if done:
+        offset = e + 1
+        break
+      cur = e + 1
+      offset = e
+    if offset >= endt:
+      active = true
+      if tcount >= 1:
+        offset += 1
+        break
+    offset += 1
+  if offset < endt: return []
+  var st = 0
+  if lead >= 0: st = lead
+  if offset > n or st > offset: return []
+  return [st, offset, start_line, line_count]
+
+type Line:
+  number: Int
+  offset: Int
+  length: Int
+  ts: Int          # the text, src[ts..te] (no line break)
+  te: Int
+
+fn get_lines(src: Str, s: Int, e: Int, line0: Int) -> [Line]:
+  var out: [Line] = []
+  var line = line0
+  var start = s
+  var i = src.find("\n", s)
+  while i >= 0 and i < e:
+    var te = i
+    if i > start and src[i - 1] == '\r': te = i - 1
+    line += 1
+    out.push(Line(line, start, i + 1 - start, start, te))
+    start = i + 1
+    i = src.find("\n", start)
+  if start < e:
+    if src[e - 1] != '\r': line += 1
+    out.push(Line(line, start, e - start, start, e))
+  return out
+
+# A label as drawn (FancySpan): its span, text and style
+type FS:
+  s: Int
+  len: Int
+  text: Str
+  has: Bool
+  style: Int
+
+fn fs_eq(a: FS, b: FS) -> Bool:
+  return a.s == b.s and a.len == b.len and a.has == b.has and a.text == b.text
+
+fn line_only(l: Line, h: FS) -> Bool:
+  return h.s >= l.offset and h.s + h.len <= l.offset + l.length
+
+fn applies(l: Line, h: FS) -> Bool:
+  var sl = h.len
+  if sl < 1: sl = 1
+  let se = h.s + sl
+  let le = l.offset + l.length
+  return (h.s >= l.offset and h.s < le) or (h.s < l.offset and se > le) or (se > l.offset and se <= le)
+
+fn applies_gutter(l: Line, h: FS) -> Bool:
+  var sl = h.len
+  if sl < 1: sl = 1
+  let se = h.s + sl
+  let le = l.offset + l.length
+  let starts = h.s >= l.offset and h.s < le
+  let ends = se > l.offset and se <= le
+  return applies(l, h) and not (starts and ends)
+
+fn flyby(l: Line, h: FS) -> Bool:
+  return h.s < l.offset and h.s + h.len > l.offset + l.length
+
+fn starts(l: Line, h: FS) -> Bool:
+  return h.s >= l.offset
+
+fn ends(l: Line, h: FS) -> Bool:
+  return h.s + h.len >= l.offset and h.s + h.len <= l.offset + l.length
+
+fn render_snippets(g: G, src: Str, ls: [Int], var f: [Str], d: Diag, path: Str):
+  if d.labs.len == 0: return
+  if d.labs.len == 1:
+    let a = d.labs[0]
+    let w = read_span(src, ls, a.s, a.e - a.s)
+    if w.len == 0: return
+    render_context(g, src, ls, &f, a.s, a.e, w, [0], d, path)
+    return
+  var order: [Int] = []
+  for i in 0..d.labs.len: order.push(i)
+  order.sort(by: fn(x, y) => d.labs[x].s < d.labs[y].s)
+  # contexts: span start, end, and the window read for it
+  var cs: [Int] = []
+  var ce: [Int] = []
+  var cw: [[Int]] = []
+  for i in order:
+    let r = d.labs[i]
+    let rw = read_span(src, ls, r.s, r.e - r.s)
+    if rw.len == 0: return
+    if cs.len == 0:
+      cs.push(r.s)
+      ce.push(r.e)
+      cw.push(rw)
+      continue
+    let k = cs.len - 1
+    if cw[k][2] + cw[k][3] >= rw[2]:
+      var ne = ce[k]
+      if r.e > ne: ne = r.e
+      let nw = read_span(src, ls, cs[k], ne - cs[k])
+      if nw.len > 0:
+        ce[k] = ne
+        cw[k] = nw
+        continue
+    cs.push(r.s)
+    ce.push(r.e)
+    cw.push(rw)
+  for k in 0..cs.len:
+    render_context(g, src, ls, &f, cs[k], ce[k], cw[k], order, d, path)
+
+fn digits(n: Int) -> Int:
+  var w = 1
+  var x = n
+  while x >= 10:
+    x = x / 10
+    w += 1
+  return w
+
+fn render_context(g: G, src: Str, ls: [Int], var f: [Str], cs: Int, ce: Int, w: [Int], order: [Int], d: Diag, path: Str):
+  let lines = get_lines(src, w[0], w[1], w[2])
+  # the primary label: the first marked primary in this context, else its first
+  var prim = -1
+  for i in order:
+    let a = d.labs[i]
+    if a.s >= cs and a.e <= ce:
+      if a.primary:
+        prim = i
+        break
+  if prim < 0:
+    for i in order:
+      let a = d.labs[i]
+      if a.s >= cs and a.e <= ce:
+        prim = i
+        break
+  var hls: [FS] = []
+  var k = 0
+  for i in order:
+    let a = d.labs[i]
+    var st = 6 + k % 3
+    if not g.color: st = 0
+    hls.push(FS(a.s, a.e - a.s, a.text, a.has, st))
+    k += 1
+  var max_gutter = 0
+  for ln in lines:
+    var nh = 0
+    for h in hls:
+      if not line_only(ln, h) and applies_gutter(ln, h): nh += 1
+    if nh > max_gutter: max_gutter = nh
+  var lw = 1
+  if lines.len > 0: lw = digits(lines[lines.len - 1].number)
+  f.push(rep(" ", lw + 2))
+  f.push(g.ch.ltop)
+  f.push(g.ch.hbar)
+  # the primary label's line and column (line_column_at)
+  var pl = w[2]
+  var pc = 0
+  if prim >= 0:
+    let lc = col_at(src, w[0], w[2], d.labs[prim].s)
+    pl = lc[0]
+    pc = lc[1]
+  if g.color: f.push("[" + sty(4, path) + ":{pl + 1}:{pc + 1}]\n")
+  else: f.push("[{path}:{pl + 1}:{pc + 1}]\n")
+  for ln in lines:
+    write_linum(g, src, ls, &f, lw, ln.number)
+    render_line_gutter(g, src, ls, &f, max_gutter, ln, hls)
+    render_line_text(g, src, ls, &f, ln)
+    var single: [Int] = []
+    var multi: [Int] = []
+    for i in 0..hls.len:
+      if applies(ln, hls[i]):
+        if line_only(ln, hls[i]): single.push(i)
+        else: multi.push(i)
+    if single.len > 0:
+      write_no_linum(g, src, ls, &f, lw)
+      render_highlight_gutter(g, src, ls, &f, max_gutter, ln, hls, 0)
+      render_single_line_highlights(g, src, ls, &f, ln, lw, max_gutter, single, hls)
+    for i in multi:
+      let h = hls[i]
+      if h.has and ends(ln, h) and not starts(ln, h):
+        render_multi_line_end(g, src, ls, &f, hls, max_gutter, lw, ln, h)
+  f.push(rep(" ", lw + 2))
+  f.push(g.ch.lbot)
+  f.push(rep(g.ch.hbar, 4))
+  f.push("\n")
+
+# SpanContents::line_column_at (the window starts at a line start: column 0)
+fn col_at(src: Str, ws: Int, line0: Int, off: Int) -> [Int]:
+  var rel = off - ws
+  if rel < 0: rel = 0
+  if rel > 0 and ws + rel < src.len and src[ws + rel - 1] == '\r' and src[ws + rel] == '\n': rel -= 1
+  var line = line0
+  var ls = -1
+  var i = ws
+  let stop = ws + rel
+  while i < stop:
+    let c = src[i]
+    if c == '\r' or c == '\n':
+      if c == '\n' and i > ws and src[i - 1] == '\r':
+        i += 1
+        continue
+      var e = i
+      if c == '\r' and i + 1 < stop and src[i + 1] == '\n': e = i + 1
+      line += 1
+      ls = e + 1 - ws
+      i = e + 1
+      continue
+    i += 1
+  if ls >= 0: return [line, rel - ls]
+  return [line, rel]
+
+fn write_linum(g: G, src: Str, ls: [Int], var f: [Str], width: Int, num: Int):
+  f.push(" ")
+  let s = "{num}"
+  if g.color: f.push(sty(5, rep(" ", width - s.len) + s))
+  else:
+    f.push(rep(" ", width - s.len))
+    f.push(s)
+  f.push(" ")
+  f.push(g.ch.vbar)
+  f.push(" ")
+
+fn write_no_linum(g: G, src: Str, ls: [Int], var f: [Str], width: Int):
+  f.push(rep(" ", width + 2))
+  f.push(g.ch.vbar_break)
+  f.push(" ")
+
+fn cstyle(g: G, src: Str, ls: [Int], st: Int, s: Str) -> Str:
+  if not g.color: return s
+  return sty(st, s)
+
+fn render_line_gutter(g: G, src: Str, ls: [Int], var f: [Str], max_gutter: Int, ln: Line, hls: [FS]):
+  if max_gutter == 0: return
+  var gut = ""
+  var arrow = false
+  var i = 0
+  for h in hls:
+    if not applies_gutter(ln, h): continue
+    if starts(ln, h):
+      gut += cstyle(g, src, ls, h.style, g.ch.ltop)
+      gut += cstyle(g, src, ls, h.style, rep(g.ch.hbar, max_gutter - i))
+      gut += cstyle(g, src, ls, h.style, g.ch.rarrow)
+      arrow = true
+      break
+    elif ends(ln, h):
+      if h.has: gut += cstyle(g, src, ls, h.style, g.ch.lcross)
+      else: gut += cstyle(g, src, ls, h.style, g.ch.lbot)
+      gut += cstyle(g, src, ls, h.style, rep(g.ch.hbar, max_gutter - i))
+      gut += cstyle(g, src, ls, h.style, g.ch.rarrow)
+      arrow = true
+      break
+    elif flyby(ln, h): gut += cstyle(g, src, ls, h.style, g.ch.vbar)
+    else: gut += " "
+    i += 1
+  var pad = 3
+  if arrow: pad = 1
+  var extra = max_gutter - gut.char_count()
+  if extra < 0: extra = 0
+  f.push(gut)
+  f.push(rep(" ", pad + extra))
+
+# render_highlight_gutter; mode 0 single line, 1 block first, 2 block rest
+fn render_highlight_gutter(g: G, src: Str, ls: [Int], var f: [Str], max_gutter: Int, ln: Line, hls: [FS], mode: Int):
+  if max_gutter == 0: return
+  var cols = 0
+  var i = 0
+  for h in hls:
+    if not applies_gutter(ln, h): continue
+    if not line_only(ln, h) and ends(ln, h):
+      if mode == 2:
+        let hs = max_gutter - i + 2
+        f.push(rep(" ", hs))
+        cols += hs + 1
+      else:
+        let nr = max_gutter - i + 2
+        f.push(cstyle(g, src, ls, h.style, g.ch.lbot))
+        var r = nr
+        if mode == 1: r -= 1
+        f.push(cstyle(g, src, ls, h.style, rep(g.ch.hbar, r)))
+        cols += nr + 1
+      break
+    f.push(cstyle(g, src, ls, h.style, g.ch.vbar))
+    cols += 1
+    i += 1
+  var ns = max_gutter + 3 - cols
+  if ns > 0: f.push(rep(" ", ns))
+
+fn render_line_text(g: G, src: Str, ls: [Int], var f: [Str], ln: Line):
+  let t = src[ln.ts..ln.te]
+  if t.find("\t") < 0:
+    f.push(t)
+    f.push("\n")
+    return
+  let ws = char_widths(t)
+  var b: [Byte] = []
+  var k = 0
+  var i = 0
+  while i < t.len:
+    let n = utf8_len(t[i])
+    if t[i] == '\t':
+      for j in 0..ws[k]: b.push(byte(32))
+    else:
+      for j in 0..n:
+        if i + j < t.len: b.push(t[i + j])
+    k += 1
+    i += n
+  f.push(b.take_str())
+  f.push("\n")
+
+# The width of each character of a line (CharWidthIterator): tabs to the next multiple of 4,
+# escape sequences none, a grapheme's width on its first character.
+fn char_widths(t: Str) -> [Int]:
+  var out: [Int] = []
+  var col = 0
+  var esc = false
+  var i = 0
+  let ascii = is_ascii(t)
+  while i < t.len:
+    let c = t[i]
+    let n = utf8_len(c)
+    var w = 0
+    if not esc:
+      if c == '\t': w = 4 - col % 4
+      elif c == 27:
+        esc = true
+        w = 0
+      elif ascii: w = 1
+      else:
+        let cp = cp_at(t, i)
+        if is_extend(cp): w = 0
+        else: w = cp_width(cp)
+    elif c == 'm': esc = false
+    col += w
+    out.push(w)
+    i += n
+  return out
+
+fn is_ascii(t: Str) -> Bool:
+  for i in 0..t.len:
+    if t[i] >= 0x80: return false
+  return true
+
+# Characters that continue a grapheme (they add no width of their own)
+fn is_extend(cp: Int) -> Bool:
+  return cp_width(cp) == 0 or (cp >= 0x1F3FB and cp <= 0x1F3FF)
+
+fn visual_offset(g: G, src: Str, ls: [Int], ln: Line, off: Int, start: Bool) -> Int:
+  var ti = off - ln.offset
+  let tl = ln.te - ln.ts
+  while ti <= tl and ti > 0 and ti < tl and (src[ln.ts + ti] & 0xC0) == 0x80:
+    if start: ti -= 1
+    else: ti += 1
+  var upto = ti
+  if upto > tl: upto = tl
+  let t = src[ln.ts..ln.ts + upto]
+  var w = 0
+  if is_ascii(t) and t.find("\t") < 0 and t.find("{chr(27)}") < 0: w = t.len
+  else:
+    for x in char_widths(t): w += x
+  if ti > tl: return w + 1
+  return w
+
+fn render_single_line_highlights(g: G, src: Str, ls: [Int], var f: [Str], ln: Line, lw: Int, max_gutter: Int, single: [Int], hls: [FS]):
+  var highest = 0
+  var vb: [Int] = []
+  for i in single:
+    let h = hls[i]
+    var st = visual_offset(g, src, ls, ln, h.s, true)
+    if st < highest: st = highest
+    var en = st + 1
+    if h.len != 0:
+      en = visual_offset(g, src, ls, ln, h.s + h.len, false)
+      if en < st + 1: en = st + 1
+    let vo = (st + en) / 2
+    let nl = vo - st
+    let nr = en - vo - 1
+    var width = st - highest
+    if width < 0: width = 0
+    if width > 65535: width = 65535
+    var marker = g.ch.underline
+    if h.len == 0: marker = g.ch.uarrow
+    elif h.has: marker = g.ch.underbar
+    let u = rep(" ", width) + rep(g.ch.underline, nl) + marker + rep(g.ch.underline, nr)
+    f.push(cstyle(g, src, ls, h.style, u))
+    if en > highest: highest = en
+    vb.push(i)
+    vb.push(vo)
+  f.push("\n")
+  var j = single.len - 1
+  while j >= 0:
+    let h = hls[single[j]]
+    if h.has:
+      let parts = h.text.split("\n")
+      for p in 0..parts.len:
+        var mode = 0
+        if p == 0 and parts.len > 1: mode = 1
+        elif p > 0: mode = 2
+        write_label_text(g, src, ls, &f, ln, lw, max_gutter, hls, vb, h, parts[p], mode)
+    j -= 1
+
+fn write_label_text(g: G, src: Str, ls: [Int], var f: [Str], ln: Line, lw: Int, max_gutter: Int, hls: [FS], vb: [Int], h: FS, label: Str, mode: Int):
+  write_no_linum(g, src, ls, &f, lw)
+  render_highlight_gutter(g, src, ls, &f, max_gutter, ln, hls, 0)
+  var cur = 1
+  var k = 0
+  while k + 1 < vb.len:
+    let oh = hls[vb[k]]
+    let vo = vb[k + 1]
+    var pad = vo + 1 - cur
+    if pad < 0: pad = 0
+    f.push(rep(" ", pad))
+    cur += pad
+    if fs_eq(oh, h):
+      var txt = ""
+      if mode == 0: txt = g.ch.lbot + g.ch.hbar + g.ch.hbar + " " + cstyle(g, src, ls, h.style, label)
+      elif mode == 1: txt = g.ch.lbot + g.ch.hbar + g.ch.rcross + " " + cstyle(g, src, ls, h.style, label)
+      else: txt = "  " + g.ch.vbar + " " + cstyle(g, src, ls, h.style, label)
+      f.push(cstyle(g, src, ls, h.style, txt))
+      f.push("\n")
+      break
+    f.push(cstyle(g, src, ls, oh.style, g.ch.vbar))
+    cur += 1
+    k += 2
+
+fn render_multi_line_end(g: G, src: Str, ls: [Int], var f: [Str], hls: [FS], max_gutter: Int, lw: Int, ln: Line, h: FS):
+  write_no_linum(g, src, ls, &f, lw)
+  if h.has:
+    let parts = h.text.split("\n")
+    var mode = 0
+    if parts.len > 1: mode = 1
+    render_highlight_gutter(g, src, ls, &f, max_gutter, ln, hls, mode)
+    multi_end_single(g, src, ls, &f, parts[0], h.style, mode)
+    for p in 1..parts.len:
+      write_no_linum(g, src, ls, &f, lw)
+      render_highlight_gutter(g, src, ls, &f, max_gutter, ln, hls, 2)
+      multi_end_single(g, src, ls, &f, parts[p], h.style, 2)
+  else:
+    render_highlight_gutter(g, src, ls, &f, max_gutter, ln, hls, 0)
+    f.push(cstyle(g, src, ls, h.style, g.ch.hbar))
+    f.push("\n")
+
+fn multi_end_single(g: G, src: Str, ls: [Int], var f: [Str], label: Str, st: Int, mode: Int):
+  var c = g.ch.hbar
+  if mode == 1: c = g.ch.rcross
+  elif mode == 2: c = g.ch.vbar
+  f.push(cstyle(g, src, ls, st, c) + " " + cstyle(g, src, ls, st, label) + "\n")
+
+# ---- the end of a run
+
+fn plural(n: Int, w: Str) -> Str:
+  if n == 1: return "{n} {w}"
+  return "{n} {w}s"
+
+fn result_summary(warnings: Int, errors: Int, exceeded: Bool) -> Str:
+  var s = ""
+  if warnings + errors > 0: s = "\n"
+  s += "Found {plural(warnings, "warning")} and {plural(errors, "error")}.\n"
+  if exceeded: s += "Exceeded maximum number of warnings. Found {warnings}.\n"
+  return s
+
+fn exec_time(secs: Float) -> Str:
+  let ms = int(secs * 1000.0)
+  if ms < 1000: return "{ms}ms"
+  return "{secs:.1}s"
+
+fn exec_summary(secs: Float, nfiles: Int, nrules: Int, threads: Int) -> Str:
+  var s = "s"
+  if nfiles == 1: s = ""
+  if nrules < 0: return "Finished in {exec_time(secs)} on {nfiles} file{s} using {threads} threads.\n"
+  return "Finished in {exec_time(secs)} on {nfiles} file{s} with {nrules} rules using {threads} threads.\n"
