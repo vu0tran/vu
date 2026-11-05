@@ -40,6 +40,7 @@ const F_BODYLESS = 128    # only overload signatures (or declare function) so fa
 const F_POSITIONAL = 256  # a parameter that's a plain name (or default or rest) at the top level
 const F_NSIMPORT = 512    # import * as x
 const F_TYPED = 1024      # a value merged with a type of the same name
+const F_IMPORTEQ = 2048   # import x = require(...) (or = a.b)
 
 # (reference flags R_*, event kinds Q_* and scope kinds S_* are in ast.vu: the parser records them)
 
@@ -280,6 +281,46 @@ type B:
   sc: Scopes
   q: [ast.Ev]      # the reference events (lent by the tree): kind (a reference's flags), node, scope, extra
 
+# (is_in_return_statement, from the update: up through expressions, expression statements and
+# function expressions to the first statement; a return, or an arrow's expression body, says yes)
+fn in_return(var b: B, var par: [Int], n: Int) -> Bool:
+  if par.len == 0:
+    par.push(0)
+    for x in 1..b.t.nd.len: par.push(0)
+    for x in 1..b.t.nd.len:
+      let kd = b.t.nd[x].k
+      # (leaves: an identifier's c holds its scope event here)
+      if kd == ast.N_LIST or (kd >= ast.N_ID and kd <= ast.N_SUPER): continue
+      var nk = 4
+      if kd == ast.N_VAR or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS or kd == ast.N_PROPACCESS: nk = 3
+      for j in 0..nk:
+        var c = b.t.nd[x].a
+        if j == 1: c = b.t.nd[x].b
+        elif j == 2: c = b.t.nd[x].c
+        elif j == 3: c = b.t.nd[x].d
+        if c <= 0 or c >= b.t.nd.len: continue
+        if b.t.nd[c].k == ast.N_LIST:
+          for i in 0..b.t.nd[c].b:
+            let y = b.t.L[b.t.nd[c].a + i]
+            if y > 0: par[y] = x
+        else: par[c] = x
+  var x = par[n]
+  var steps = 0
+  while x > 0 and steps < 10000:
+    steps += 1
+    # (parents point outward: a child that starts before its parent means a stale field)
+    if b.t.nd[x].pos > b.t.nd[n].pos or b.t.nd[x].end < b.t.nd[n].end: return false
+    let kd = b.t.nd[x].k
+    if kd == ast.N_RETURN: return true
+    if kd == ast.N_ARROW and b.t.nd[b.t.nd[x].d].k != ast.N_BLOCK: return true
+    if kd == ast.N_BLOCK:
+      let p = par[x]
+      let pk = b.t.nd[p].k
+      if not (pk == ast.N_FUNC or pk == ast.N_FUNCEXPR or pk == ast.N_ARROW or pk == ast.N_METHOD or pk == ast.N_GET or pk == ast.N_SET or pk == ast.N_CTOR): return false
+    elif kd == ast.N_VAR or kd == ast.N_IF or kd == ast.N_FOR or kd == ast.N_FORIN or kd == ast.N_WHILE or kd == ast.N_DO or kd == ast.N_SWITCH or kd == ast.N_TRY or kd == ast.N_THROW or kd == ast.N_LABEL or kd == ast.N_FUNC or kd == ast.N_CLASS or kd == ast.N_IMPORT or kd == ast.N_EXPORT or kd == ast.N_EXPORTDEFAULT or kd == ast.N_WITH or kd == ast.N_MODULE or kd == ast.N_STATICBLOCK: return false
+    x = par[x]
+  return false
+
 fn build(own t: ast.Ast, root: Int, dts: Bool) -> B:
   var b = B(t, new_scopes(), [])
   let nn = b.t.nd.len
@@ -447,7 +488,7 @@ fn run_decls(var b: B, dts: Bool):
     elif k == ast.D_IMPORTEQ:
       var f = 0
       if has_export_mod(b.t, n): f = F_EXPORTED
-      declare(&b.sc, s, nd.s, nd.pos + 7, Y_IMPORT, f)
+      declare(&b.sc, s, nd.s, nd.pos + 7, Y_IMPORT, f | F_IMPORTEQ)
     elif k == ast.D_TPARAM_K:
       declare(&b.sc, s, nd.s, nd.pos, Y_TPARAM, F_KEEP)
 
@@ -532,6 +573,7 @@ fn do_ref(var b: B, n: Int, s: Int, flags: Int, wexpr: Int):
 
 # Runs the recorded events in order.
 fn run_events(var b: B):
+  var rets: [Int] = []    # return statements' ranges, for updates (in_return)
   var sy: [Int] = []       # assignments being resolved: the symbol (-1 unless selfish), its reads before
   var sr: [Int] = []
   for i in 0..b.q.len:
@@ -558,10 +600,11 @@ fn run_events(var b: B):
       # value isn't a use (a = a + 1, a += 1)
       let y0 = lookup(b.sc, s, b.t.nd[ul].s, false)
       var selfish = unused and y0 >= 0
-      if selfish and op == T_ASSIGN:
+      # (an assignment, compound or not, in another function counts as a use: oxc compares the
+      # variable scopes)
+      if selfish:
         # (a = a + 1 in another function, or in a loop, uses the old value)
         selfish = b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops == 0
-      elif selfish and b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops > 0: selfish = false
       if selfish and op != T_ASSIGN: f = f | R_SELF
       do_ref(&b, ul, s, f, b.t.nd[n].pos)
       if selfish:
@@ -581,7 +624,10 @@ fn run_events(var b: B):
       let x = unparen(b.t, b.t.nd[n].a)
       var f = R_WRITE | R_READ
       let y0 = lookup(b.sc, s, b.t.nd[x].s, false)
-      if unused and y0 >= 0 and not (b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops > 0): f = f | R_SELF
+      var self_upd = unused and y0 >= 0 and not (b.sc.sfn[s] == b.sc.sfn[b.sc.ys[y0]] and loops > 0)
+      # (x++ in another function inside a return statement, return () => { x++ }, is a use)
+      if self_upd and b.sc.sfn[s] != b.sc.sfn[b.sc.ys[y0]] and in_return(&b, &rets, n): self_upd = false
+      if self_upd: f = f | R_SELF
       do_ref(&b, x, s, f, b.t.nd[n].pos)
       b.t.nd[n].c = -1
     elif k == Q_SETLOOP:

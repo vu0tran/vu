@@ -88,31 +88,105 @@ parameter constrained to `{}` against a union.
 
 # vlint: an oxlint-compatible linter written in Vu
 
-`vlint` checks JavaScript and TypeScript (`.js .mjs .cjs .jsx .ts .mts .cts .tsx`) with oxlint's
-96 default rules (the correctness rules that need no type information: `eslint/*`, `typescript/*`,
-`unicorn/*`, `oxc/*`) and prints each diagnostic on one line, as oxlint 1.90.0 prints them when it
-runs under an AI agent (`file:line:col: warning eslint(rule): message help: ...`; not `-f unix`'s
-`[Warning/eslint(rule)]` form, checked). It reuses vtsc's
-scanner and parser, plus a scope builder (`scope.vu`), a regular-expression parser (`regex.vu`)
-the rules (`rules.vu`) and, for `--fix`, a printer of expressions as oxc prints them
-(`fixgen.vu`): about 7,700 lines of Vu.
+`vlint` is meant as a drop-in replacement for oxlint 1.90.0: the same command line, the same
+configuration files, the same output bytes and exit codes. It checks `.js .mjs .cjs .jsx .ts .mts
+.cts .tsx` and the script sections of `.vue`, `.astro` and `.svelte` files. It reuses vtsc's
+scanner and parser, plus a scope builder (`scope.vu`), a regular-expression parser (`regex.vu`),
+the rules (`rules.vu`), configuration (`lconf.vu`, `lglob.vu`, `lmatch.vu`), output (`lout.vu`),
+the rule table (`lmeta.vu`, `lrules.vu`), partial files (`lpart.vu`), tsgolint (`ltsgo.vu`) and,
+for `--fix`, a printer of expressions as oxc prints them (`fixgen.vu`).
 
 ```
 cd ts && VU_SPLIT=off ../vu build --release vlint.vu -o vlint   # one C file: the fastest binary
-./vlint [--jobs N] [--cache] [--cache-location PATH] src/   # files, or folders searched for the extensions above
-./vlint --fix src/             # rewrites the files as `oxlint --fix` does (see below)
+./vlint [options] [paths]      # as oxlint; plus --jobs N, --cache, --cache-location PATH
 ```
 
-It honors `eslint-disable`/`oxlint-disable` comments, and reports parse errors with oxc's
-messages where they're known (redeclarations, invalid characters).
+## Drop-in status (checked against oxlint 1.90.0)
 
-With no paths it lints the current folder, skipping `node_modules` folders (oxlint skips them
-through `.gitignore`; vlint reads no ignore files). Options it doesn't have are refused (exit code
-2) rather than read as paths, and the exit code is 1 when it printed an error (a parse error), as
-oxlint's is. Paths are printed as oxlint prints them (`./src` gives `src/a.ts`), and when there is
-nothing to lint it prints oxlint's "No files found to lint" line and exits with 1. (Checked against
-oxlint 1.90.0 for `./src`, `src/`, `./src/a.js`, a missing file and an empty folder; `.` differs only
-by the files oxlint's `.gitignore` handling skips.)
+**Command line** (every flag of `oxlint --help`, plus its hidden ones):
+
+| flag | status |
+|---|---|
+| `-c/--config`, `--disable-nested-config`, `--tsconfig` (accepted) | yes |
+| `-A/-W/-D` (rules, categories, `all`), `--*-plugin`, `--disable-{unicorn,oxc,typescript}-plugin` | yes |
+| `--deny-warnings`, `--max-warnings`, `--quiet`, `--silent`, `--no-error-on-unmatched-pattern` | yes |
+| `-f default/agent/json/unix/github/gitlab/junit/checkstyle/stylish/sarif` | yes (checkstyle/stylish group files in oxlint's hash order: file order can differ) |
+| `--ignore-path`, `--ignore-pattern`, `--no-ignore` | yes |
+| `--threads`, `-h`, `-V`, `--debug files` | yes (`--debug timings` accepted, prints no table) |
+| `--fix` | yes (oxlint's safe fixes, for the rules vlint has) |
+| `--type-aware`, `--type-check`, `options.typeAware/typeCheck` | yes: runs tsgolint (`oxlint-tsgolint`) as oxlint does |
+| `--report-unused-disable-directives[-severity]` | yes |
+| `--rules` | yes (the table, `-f json`) |
+| `--init` | yes |
+| `--print-config` | not yet (refused with an error) |
+| `--fix-suggestions`, `--fix-dangerously` | not yet (refused, exit 2) |
+| `--lsp` | no (refused) |
+| `--type-check-only`, `--suppress-all`, `--prune-suppressions` (hidden) | not yet; `oxlint-suppressions.json` isn't read |
+
+**Configuration**: `.oxlintrc.json`/`.jsonc` discovery and `-c`, nested configs, `extends`
+(with oxlint's error messages for missing files, named configs and cycles), `overrides`, rules
+with severities and options, `categories`, `plugins`, `env`/`globals` (globals read by
+`jsx-no-undef`), `settings` (parsed), `ignorePatterns`, `options` (`typeAware`, `typeCheck`,
+`denyWarnings`, `maxWarnings`, `reportUnusedDisableDirectives`, `respectEslintDisableDirectives`),
+JSON errors as serde words them. `oxlint.config.ts` is reported as needing a JavaScript runtime.
+`jsPlugins`: a missing package gets oxlint's "Failed to load JS plugin" error; an installed one
+is refused (vlint can't run JavaScript). Ignore files: `.gitignore` (and the folders above, up
+to the repository root, and `.git/info/exclude`), `.eslintignore`/`--ignore-path`.
+
+**Output**: oxlint's graphical report (themes, links, summary lines), the agent format, and all
+`-f` formats, byte-identical in the cases checked.
+
+**Rules**: oxlint's default rules, plus (chosen by how often 629 `.oxlintrc.json` files from
+GitHub enable them, and by the categories configs turn on): `prefer-const`,
+`no-restricted-imports`, `no-console`, `no-var`, `eqeqeq`, `prefer-rest-params`, `no-empty`,
+`no-array-constructor`, `no-case-declarations`, `no-prototype-builtins`, `prefer-spread`, `curly`,
+`no-new`, `no-unneeded-ternary`, `no-useless-concat`; `typescript/` `no-explicit-any`,
+`no-require-imports`, `no-unnecessary-type-constraint`, `no-namespace`, `no-unsafe-function-type`,
+`no-non-null-assertion`, `ban-ts-comment`, `no-empty-object-type`; `unicorn/`
+`prefer-node-protocol`, `require-module-specifiers`, `no-array-sort`, `no-array-reverse`;
+`oxc/misrefactored-assign-op`; `react/` `jsx-key`, `no-this-in-sfc`, `no-children-prop`,
+`no-find-dom-node`, `jsx-no-duplicate-props`, `jsx-no-undef`, `jsx-props-no-spread-multi`,
+`no-danger-with-children`, `no-did-mount-set-state`, `no-did-update-set-state`,
+`no-will-update-set-state`, `no-direct-mutation-state`, `no-is-mounted`,
+`no-render-return-value`, `no-string-refs`, `no-unsafe`, `void-dom-elements-no-children`,
+`forward-ref-uses-ref`, `react-hooks/rules-of-hooks` (each with its options, oxc's messages,
+spans, labels and fixes). All 61 type-aware rules through tsgolint. A rule vlint doesn't have
+is accepted in the configuration and reports nothing.
+
+**Not at 100%**:
+- The React Compiler rules that oxlint 1.90.0 turns on with the react plugin's `correctness`
+  category (`react/globals`, `immutability`, `refs`, `purity`, `set-state-in-effect`,
+  `static-components`, `preserve-manual-memoization`, ...: a port of the React Compiler, 62k lines
+  of Rust in oxc) and `react-hooks/exhaustive-deps`: missing.
+- The other ~650 non-default rules (jsx-a11y, import, jest/vitest, most of unicorn's, eslint's
+  pedantic and style rules...): missing. On kimi-code (which turns on pedantic, perf, vitest,
+  import) vlint finds 435 of oxlint's 10,599 diagnostics.
+- `--print-config`, `--fix-suggestions`, `--fix-dangerously`, suppression files, JS plugins.
+- Parse errors: some of oxc's messages differ, and vlint accepts some files oxc rejects.
+
+**Parity** (`ljson_diff.py`: every diagnostic's rule, message, help, severity, labels and order):
+
+| corpus | config | files with diagnostics identical |
+|---|---|---|
+| lc: date-fns, zod, remeda, ... + node_modules JS | defaults | 308 / 308 |
+| lc | all added rules on | 1570 / 1570 vlint files (oxlint's 3 more: React Compiler) |
+| preact, excalidraw | defaults | 230 / 230 |
+| preact, excalidraw | all added rules + react plugin | 488 / 574 (the rest: React Compiler, exhaustive-deps) |
+| vscode | defaults | 2764 / 2783 (the rest: files oxc can't parse) |
+| config cases (`cfgtest`, 54 cases, as an agent and as a person) | | 108 / 108 |
+| zod, `--type-aware`, 5 typed rules | | 1282 / 1285 diagnostics (tsgolint prints 3 types differently run to run) |
+
+Real projects with their own `.oxlintrc.json` (15 cloned from GitHub; JS plugins removed from
+their configs where the plugin isn't installed): identical on agents, leaflet-geoman, logtape,
+mcp, OpenFrontIO (type-aware), react-element-to-jsx-string, react-starter-kit,
+typescript-nextjs-starter, yak; FigmaToCode, Tracearr, difit and next-shadcn-dashboard-starter
+differ only by React Compiler, exhaustive-deps and jsx-a11y diagnostics; kimi-code by rules vlint
+doesn't have.
+
+**Speed** (lc corpus, 1 thread, user+sys CPU, best of 5, loaded 2-core VM): vlint 2.28 s, the
+vlint before this work 2.29-2.33 s, oxlint 4.54 s. Instructions (callgrind, x86-64-v2 builds):
+zod 540M against 508M before (+6%: the oxlint output and configuration work and the rule table
+loaded at start), vscode/src/vs/editor/common 332M against 305M.
 
 ## Install
 
@@ -121,10 +195,10 @@ npm install --save-dev @vu0tran/vlint      # the vlint and oxlint commands
 ```
 
 or, to replace oxlint in a project without touching its scripts, one line in `package.json`:
-`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`. The npm packages are laid out as oxlint's are (a Node
+`"oxlint": "npm:@vu0tran/vlint@^0.2.0"`. The npm packages are laid out as oxlint's are (a Node
 launcher and one optional dependency per platform with the binary: Linux x64/ARM64, static; macOS
-12+ on Apple silicon and Intel; no Windows). What works and what doesn't as a drop-in (no config
-files, no ignore files, one output format): `packaging/npm/vlint/README.md`, which is also the
+12+ on Apple silicon and Intel; no Windows). What works and what doesn't as a drop-in:
+`packaging/npm/vlint/README.md`, which is also the
 package's README. Each `vlint-vX.Y.Z` tag also puts the bare binaries on the GitHub release
 (`vlint-X.Y.Z-<platform>.tar.gz`). Releasing: `RELEASING.md`.
 
