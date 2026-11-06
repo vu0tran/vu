@@ -45,13 +45,16 @@ case "$tool" in
   vlint)
     cp -R "$fx/vlint" "$tmp/p"
     cd "$tmp/p"
-    # named files, then no paths (the current folder, as oxlint does); oxlint's order isn't fixed
+    # named files, then no paths (the current folder, as oxlint does); oxlint's order isn't fixed.
+    # The expected text is oxlint's agent format, which oxlint (and vlint) print when the
+    # environment shows an AI agent; AI_AGENT makes CI runs print it too.
+    export AI_AGENT=1
     "$bin" a.ts b.jsx > "$tmp/out1" || fail "exit code $? on named files"
     sort "$tmp/out1" | diff "$fx/vlint.expected" - || fail "output differs (named files)"
     "$bin" > "$tmp/out2" || fail "exit code $? with no paths"
     sort "$tmp/out2" | diff "$fx/vlint.expected" - || fail "output differs (no paths)"
     # (an option it doesn't have is refused, not read as a path)
-    if "$bin" --deny-warnings >/dev/null 2>&1; then fail "accepted an unknown option"; fi
+    if "$bin" --no-such-option >/dev/null 2>&1; then fail "accepted an unknown option"; fi
     ;;
   vgolint)
     cp -R "$fx/vgolint" "$tmp/m"
