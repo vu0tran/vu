@@ -61,10 +61,11 @@ static bool vl_write(int fd, const char *p, size_t n) {
         p += w; n -= (size_t)w;
     }
     if (!ok) {
-        struct timespec zero = { 0, 0 };
+        /* a SIGPIPE left pending by the failed write is consumed (sigwait returns at once for a
+           pending signal; sigtimedwait isn't on macOS) */
         sigset_t pend;
         sigpending(&pend);
-        if (sigismember(&pend, SIGPIPE)) sigtimedwait(&set, NULL, &zero);
+        if (sigismember(&pend, SIGPIPE)) { int sig; sigwait(&set, &sig); }
     }
     pthread_sigmask(SIG_SETMASK, &old, NULL);
     return ok;
