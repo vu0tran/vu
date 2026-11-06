@@ -3,37 +3,175 @@ import { createRequire } from 'node:module';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
-const [outFile, reqFile, rootArg] = process.argv.slice(1);
-const reqs = JSON.parse(fs.readFileSync(reqFile, 'utf8'));
+import { StringDecoder } from 'node:string_decoder';
+// One process serves the whole run: each line vknip writes to fd 3 is a request {root, reqs}, and
+// the answer (the value of each file) is a line on fd 4. The process ends when fd 3 closes.
 const cwd = process.cwd();
 // absolute paths inside the project come back project-relative, as "/x" (vknip's convention)
-const absRoot = path.resolve(cwd, rootArg || '.');
+let absRoot = cwd;
 let jiti = null;
+let jitiInst = null;
 // jiti as knip has it: the project's, else the one next to its knip, else any in node_modules/.pnpm
+// (looked for from the project's folder, then from the working one: they differ with --directory)
 const findJiti = () => {
-  const req = createRequire(path.join(cwd, 'package.json'));
-  try { return req.resolve('jiti'); } catch {}
-  try { return createRequire(req.resolve('knip')).resolve('jiti'); } catch {}
-  try { return createRequire(fs.realpathSync(path.join(cwd, 'node_modules/knip/package.json'))).resolve('jiti'); } catch {}
-  try {
-    const pnpm = path.join(cwd, 'node_modules/.pnpm');
-    const dirs = fs.readdirSync(pnpm).filter(d => /^jiti@2/.test(d)).sort().reverse();
-    for (const d of dirs) { const f = path.join(pnpm, d, 'node_modules/jiti'); if (fs.existsSync(f)) return createRequire(path.join(f, 'package.json')).resolve('jiti'); }
-  } catch {}
+  for (const base of new Set([absRoot, cwd])) {
+    const req = createRequire(path.join(base, 'package.json'));
+    try { return req.resolve('jiti'); } catch {}
+    try { return createRequire(req.resolve('knip')).resolve('jiti'); } catch {}
+    try { return createRequire(fs.realpathSync(path.join(base, 'node_modules/knip/package.json'))).resolve('jiti'); } catch {}
+    try {
+      const pnpm = path.join(base, 'node_modules/.pnpm');
+      const dirs = fs.readdirSync(pnpm).filter(d => /^jiti@2/.test(d)).sort().reverse();
+      for (const d of dirs) { const f = path.join(pnpm, d, 'node_modules/jiti'); if (fs.existsSync(f)) return createRequire(path.join(f, 'package.json')).resolve('jiti'); }
+    } catch {}
+  }
   return null;
 };
-try {
-  const jp = findJiti();
-  const j = createRequire(path.join(cwd, 'package.json'))(jp);
-  const opts = { jsx: true, tsconfigPaths: true, interopDefault: true, alias: { '@rushstack/eslint-patch/modern-module-resolution': 'node:path', '@rushstack/eslint-config/patch/modern-module-resolution': 'node:path' } };
-  const create = j.createJiti || (j.default && j.default.createJiti) || (typeof j === 'function' ? j : null);
-  const inst = create(cwd, opts);
-  if (typeof inst.import === 'function') jiti = f => inst.import(f, { default: true });
-  else jiti = async f => { const m = inst(f); return m && m.default !== undefined ? m.default : m; };
-} catch {}
+// (made at the first request, which names the project's folder; as knip's, for the working folder)
+let jitiReady = false;
+const initJiti = () => {
+  if (jitiReady) return;
+  jitiReady = true;
+  try {
+    const jp = findJiti();
+    const j = createRequire(path.join(cwd, 'package.json'))(jp);
+    const opts = { jsx: true, tsconfigPaths: true, interopDefault: true, alias: { '@rushstack/eslint-patch/modern-module-resolution': 'node:path', '@rushstack/eslint-config/patch/modern-module-resolution': 'node:path' } };
+    const create = j.createJiti || (j.default && j.default.createJiti) || (typeof j === 'function' ? j : null);
+    const inst = create(cwd, opts);
+    if (typeof inst.import === 'function') { jiti = f => inst.import(f, { default: true }); jitiInst = inst; }
+    else jiti = async f => { const m = inst(f); return m && m.default !== undefined ? m.default : m; };
+  } catch {}
+};
+// Configs often import a package only for its define helper (defineConfig from vite, defineBuildConfig
+// from unbuild), an identity function or nearly, and loading the package for it can take most of a
+// run (vite or unbuild: half a second each). In a TypeScript config, the leading imports of nothing
+// but such helpers become the helpers themselves, when the specifier resolves as jiti resolves it (so
+// a package that's missing fails as before), to the package itself (its package.json names its
+// repository) at a version that has them, and its entry file names each helper. A helper called in a
+// way it doesn't cover (BAIL), or anything else, loads the file as it is.
+const BAIL = new Error('vknip: load the file as it is');
+const one = f => (...a) => { if (a.length !== 1) throw BAIL; return f(a[0]); };
+const identity = () => one(c => c);
+const PURE = {
+  vite: { repo: 'vitejs/vite', min: 2, helpers: { defineConfig: identity } },
+  'vitest/config': { repo: 'vitest-dev/vitest', min: 0, helpers: { defineConfig: identity, defineProject: identity, defineWorkspace: identity } },
+  // (unbuild 2 made it return a list)
+  unbuild: { repo: 'unjs/unbuild', min: 1, helpers: { defineBuildConfig: major => (major >= 2 ? one(c => (Array.isArray(c) ? c : [c]).filter(Boolean)) : identity()) } },
+  tsdown: { repo: 'rolldown/tsdown', min: 0, helpers: { defineConfig: identity } },
+  'tsdown/config': { repo: 'rolldown/tsdown', min: 0, helpers: { defineConfig: identity } },
+  'astro/config': { repo: 'withastro/astro', min: 2, helpers: { defineConfig: identity } },
+  vitepress: { repo: 'vuejs/vitepress', min: 1, helpers: { defineConfig: identity, defineConfigWithTheme: identity } },
+  // (its entry re-exports playwright/test; with one config, defineConfig returns it, marked with a symbol)
+  '@playwright/test': { repo: 'microsoft/playwright', min: 1, minor: 40, reexports: true, helpers: { defineConfig: identity } },
+};
+// the file's leading import declarations of only such helpers: [start, end, specifier, [[name, local]]]
+const pureImports = src => {
+  const out = [];
+  let i = 0;
+  const n = src.length;
+  const skip = () => {
+    for (;;) {
+      while (i < n && /\s/.test(src[i])) i++;
+      if (src.startsWith('//', i)) { const e = src.indexOf('\n', i); i = e < 0 ? n : e + 1; }
+      else if (src.startsWith('/*', i)) { const e = src.indexOf('*/', i + 2); if (e < 0) return false; i = e + 2; }
+      else return i < n;
+    }
+  };
+  const named = /import\s*\{([^}'"`]*)\}\s*from\s*(['"])([^'"\n]+)\2[ \t]*;?/y;
+  const other = /import(\s+[\w$]+\s*(,\s*\{[^}'"`]*\}|,\s*\*\s*as\s+[\w$]+)?|\s+type\s+[^'"`;]*?|\s*\*\s*as\s+[\w$]+)\s+from\s*(['"])[^'"\n]+\3[ \t]*;?|import\s*(['"])[^'"\n]+\4[ \t]*;?/y;
+  while (skip()) {
+    named.lastIndex = i;
+    const m = named.exec(src);
+    if (m) {
+      const start = i;
+      i = named.lastIndex;
+      const helpers = PURE[m[3]]?.helpers;
+      if (!helpers) continue;
+      const names = [];
+      let ok = true;
+      for (let item of m[1].replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ').split(',')) {
+        item = item.trim();
+        if (item === '' || /^type\s/.test(item)) continue;
+        const mm = /^([\w$]+)(?:\s+as\s+([\w$]+))?$/.exec(item);
+        if (!mm || !Object.hasOwn(helpers, mm[1])) { ok = false; break; }
+        names.push([mm[1], mm[2] || mm[1]]);
+      }
+      if (ok && names.length > 0) out.push([start, i, m[3], names]);
+      continue;
+    }
+    other.lastIndex = i;
+    if (other.exec(src)) { i = other.lastIndex; continue; }
+    break;
+  }
+  return out;
+};
+// the package.json of the package a resolved file belongs to
+const pkgOf = (file, spec) => {
+  const name = spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0];
+  for (let d = path.dirname(file); ; d = path.dirname(d)) {
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(d, 'package.json'), 'utf8'));
+      if (j.name === name) return j;
+    } catch {}
+    if (path.dirname(d) === d) return null;
+  }
+};
+let shimN = 0;
+const NOT = Symbol('not');
+const loadPure = async abs => {
+  // (VKNIP_NO_PURE=1 loads every file as it is: for comparing)
+  if (!jitiInst || process.env.VKNIP_NO_PURE || typeof jitiInst.evalModule !== 'function' || typeof jitiInst.esmResolve !== 'function') return NOT;
+  const ext = path.extname(abs);
+  if (!/^\.[cm]?tsx?$/.test(ext) || jitiInst.cache?.[abs]) return NOT;
+  let src;
+  try { src = fs.readFileSync(abs, 'utf8'); } catch { return NOT; }
+  const found = pureImports(src);
+  if (found.length === 0) return NOT;
+  const key = `__vknip_pure${shimN++}`;
+  const vals = [];
+  let text = src;
+  for (let k = found.length - 1; k >= 0; k--) {
+    const [start, end, spec, names] = found[k];
+    let file;
+    try {
+      const r = jitiInst.esmResolve(spec, { parentURL: pathToFileURL(abs).href, try: true });
+      file = r && (r.startsWith('file:') ? fileURLToPath(r) : r);
+    } catch {}
+    if (!file || !fs.existsSync(file)) continue;
+    const pure = PURE[spec];
+    const pj = pkgOf(file, spec);
+    const repo = pj && (typeof pj.repository === 'string' ? pj.repository : pj.repository?.url);
+    const major = pj ? parseInt(String(pj.version), 10) : NaN;
+    if (typeof repo !== 'string' || !repo.includes(pure.repo) || !(major >= pure.min)) continue;
+    if (pure.minor !== undefined && major === pure.min && !(parseInt(String(pj.version).split('.')[1], 10) >= pure.minor)) continue;
+    let entry = '';
+    try { entry = fs.readFileSync(file, 'utf8'); } catch {}
+    if (!pure.reexports && !names.every(([name]) => new RegExp(`\\b${name}\\b`).test(entry))) continue;
+    const helpers = {};
+    for (const [name] of names) helpers[name] = pure.helpers[name](major);
+    vals.push(helpers);
+    const decl = `const { ${names.map(([a, b]) => `${a}: ${b}`).join(', ')} } = globalThis.${key}[${vals.length - 1}];`;
+    // (the declaration in the import's place, its lines kept)
+    const lines = src.slice(start, end).split('\n').length - 1;
+    text = text.slice(0, start) + decl + '\n'.repeat(lines) + text.slice(end);
+  }
+  if (vals.length === 0) return NOT;
+  globalThis[key] = vals;
+  try {
+    const m = await jitiInst.evalModule(text, { id: abs, filename: abs, ext, async: true });
+    return m?.default ?? m;
+  } catch (e) {
+    if (e !== BAIL) throw e;
+    if (jitiInst.cache) delete jitiInst.cache[abs];
+    return NOT;
+  } finally { delete globalThis[key]; }
+};
 const load = async file => {
   const abs = path.resolve(cwd, file);
-  if (jiti) return await jiti(abs);
+  if (jiti) {
+    const v = await loadPure(abs);
+    return v === NOT ? await jiti(abs) : v;
+  }
   const m = await import(pathToFileURL(abs).href);
   return m.default ?? m;
 };
@@ -93,7 +231,6 @@ const viteConfigs = async local => {
   }
   return configs;
 };
-const out = {};
 // webpack's config as plugins/webpack findWebpackDependenciesFromConfig sees it: functions called
 // (the config with env and argv, rule.use with the rule info, entry), ProvidePlugin definitions kept
 const ruleInfo = { compiler: '', issuer: '', realResource: '', resource: '', resourceQuery: '', dependency: '', descriptionData: {}, issuerLayer: '' };
@@ -398,20 +535,25 @@ const runReporter = async (mod, data, toFile) => {
 };
 // the yaml package (knip's YAML parser): the project's, the one next to its knip, else any in .pnpm
 const findYaml = () => {
-  const tries = [
-    () => createRequire(path.join(cwd, 'package.json'))('yaml'),
-    () => createRequire(createRequire(path.join(cwd, 'package.json')).resolve('knip'))('yaml'),
-    () => createRequire(fs.realpathSync(path.join(cwd, 'node_modules/knip/package.json')))('yaml'),
+  const tries = [];
+  for (const base of new Set([absRoot, cwd])) tries.push(
+    () => createRequire(path.join(base, 'package.json'))('yaml'),
+    () => createRequire(createRequire(path.join(base, 'package.json')).resolve('knip'))('yaml'),
+    () => createRequire(fs.realpathSync(path.join(base, 'node_modules/knip/package.json')))('yaml'),
     () => {
-      const pnpm = path.join(cwd, 'node_modules/.pnpm');
+      const pnpm = path.join(base, 'node_modules/.pnpm');
       const dirs = fs.readdirSync(pnpm).filter(d => /^yaml@2/.test(d)).sort().reverse();
       for (const d of dirs) { const f = path.join(pnpm, d, 'node_modules/yaml/package.json'); if (fs.existsSync(f)) return createRequire(f)('yaml'); }
       return null;
     },
-  ];
+  );
   for (const t of tries) { try { const y = t(); if (y && typeof y.parse === 'function') return y; } catch {} }
   return null;
 };
+const handle = async reqs => {
+const out = {};
+// (the globals a request's setup defines are gone after it, as when each mode had its own process)
+const defined = [];
 for (const r of reqs) {
   // a YAML file vknip's reader isn't sure about: parsed as knip parses it (loadYAML)
   if (r.mode === 'yaml') {
@@ -433,9 +575,15 @@ for (const r of reqs) {
     catch (e) { out[r.file] = { error: (e && e.message ? e.message : String(e)).split('\n')[0] }; }
     continue;
   }
+  // (what the config prints goes back with its value: vknip prints it where knip loads the file)
+  let cout = '', cerr = '';
+  const ow = process.stdout.write, ew = process.stderr.write;
+  const grab = add => (c, ...rest) => { add(typeof c === 'string' ? c : Buffer.from(c).toString()); const cb = rest.find(x => typeof x === 'function'); if (cb) cb(); return true; };
+  process.stdout.write = grab(t => { cout += t; });
+  process.stderr.write = grab(t => { cerr += t; });
   try {
     const g = setups[r.mode];
-    if (g && !(g in globalThis)) Object.defineProperty(globalThis, g, { value: id => id, writable: true, configurable: true });
+    if (g && !(g in globalThis)) { Object.defineProperty(globalThis, g, { value: id => id, writable: true, configurable: true }); defined.push(g); }
     let v = await settle(await load(r.file), 0);
     if (r.mode === 'vite') v = await viteConfigs(v);
     if (r.mode === 'next' && typeof v === 'function') v = await v('phase-production-build', { defaultConfig: {} });
@@ -569,8 +717,47 @@ for (const r of reqs) {
   } catch (e) {
     let root = e;
     while (root && root.cause instanceof Error) root = root.cause;
-    out[r.file] = { error: (root && root.message ? root.message : String(root)).split('\n')[0].replace(cwd + '/', '') };
+    // (knip's formatCauseMessage: paths in the project's folder relative to it)
+    out[r.file] = { error: (root && root.message ? root.message : String(root)).split('\n')[0].replace(absRoot + '/', '') };
+  } finally {
+    process.stdout.write = ow;
+    process.stderr.write = ew;
   }
+  if (cout !== '') out[r.file].out = cout;
+  if (cerr !== '') out[r.file].err = cerr;
 }
-fs.writeFileSync(outFile, JSON.stringify(out));
+for (const g of defined) delete globalThis[g];
+return out;
+};
+// (requests are read synchronously: while one is handled nothing of the loader's keeps node alive, so
+// a config whose promise never settles ends the process, as it ended the one-shot loader)
+const inBuf = Buffer.alloc(65536);
+const decoder = new StringDecoder('utf8');
+let pending = '';
+const readLine = () => {
+  for (;;) {
+    const nl = pending.indexOf('\n');
+    if (nl >= 0) { const l = pending.slice(0, nl); pending = pending.slice(nl + 1); return l; }
+    let n;
+    try { n = fs.readSync(3, inBuf, 0, inBuf.length, null); }
+    catch (e) { if (e.code === 'EAGAIN' || e.code === 'EINTR') continue; if (e.code === 'EOF') return null; throw e; }
+    if (n === 0) return null;
+    pending += decoder.write(inBuf.subarray(0, n));
+  }
+};
+for (let line; (line = readLine()) !== null;) {
+  let res;
+  try {
+    const q = JSON.parse(line);
+    absRoot = path.resolve(cwd, q.root || '.');
+    initJiti();
+    if (q.warm) {
+      // (getting ready while vknip reads the project: jiti's TypeScript transform)
+      try { jitiInst?.transform?.({ source: 'export default {} as {}', filename: path.join(cwd, 'vknip-warm.ts'), ts: true }); } catch {}
+      res = {};
+    } else res = await handle(q.reqs);
+  } catch (e) { res = { __vknip_error: e && e.message ? String(e.message).split('\n')[0] : String(e) }; }
+  const buf = Buffer.from(JSON.stringify(res) + '\n');
+  for (let off = 0; off < buf.length;) off += fs.writeSync(4, buf, off);
+}
 process.exit(0);
