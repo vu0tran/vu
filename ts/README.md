@@ -237,14 +237,15 @@ same span sorted inner first); all fixed.
 
 **Coverage of real configurations** (the 1,830 `.oxlintrc.json` files collected from GitHub in an
 earlier round, `vlint4-work/cov.py` and `cov2.py`): of the rules those files turn on by name
-(12,227 enables, type-aware ones counted as covered), vlint now has 70.2% (64.3% at the start of
-the latest round); counting the rules their categories and plugins turn on as well (233,108
-enables, type-aware excluded), 84.0% (79.3%). The largest missing share is the React Compiler
-rules (about 1,030 enables each, 12,300 together), then `no-unmodified-loop-condition` (314),
-`no-shadow` (265), `unicorn/consistent-function-scoping` (202), `prefer-array-find` (194),
-`prefer-set-has` (193), `oxc/no-accumulating-spread` (178), `typescript/consistent-type-imports`
-(165), `no-fallthrough` and `promise/no-callback-in-promise` (156 each), `jsx-a11y/lang` (145),
-and the vue plugin (about 35 rules enabled by about 116 configs each).
+(12,227 enables, type-aware ones counted as covered), vlint now has 71.7% (70.2% at the start of
+this round, 64.3% two rounds ago); counting the rules their categories and plugins turn on as
+well (233,108 enables, type-aware excluded), 84.6% (84.0%). The largest missing share is the React
+Compiler rules (about 1,030 enables each, 12,300 together), then `no-unmodified-loop-condition`
+(314), `no-shadow` (265), `unicorn/consistent-function-scoping` (202), `prefer-set-has` (193),
+`oxc/no-accumulating-spread` (178), `typescript/consistent-type-imports` (165), `no-fallthrough`
+(156), `jsx-a11y/lang` (145), `oxc/no-map-spread` (130), `no-regex-spaces` (126),
+`react/no-unstable-nested-components` (123), and the vue plugin (about 35 rules enabled by about
+119 configs each).
 
 **The module graph** (`lmod.vu`, `lresolve.vu`, `rimport.vu`): when a rule that reads it is on,
 vlint builds the graph oxlint builds before linting: every linted file's module record (as oxc's

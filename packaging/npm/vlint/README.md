@@ -84,9 +84,9 @@ Check that your project doesn't depend on these before switching:
   (`expect-expect`, `valid-expect`, `valid-title`, ...), ...; the list is in the source's README).
   A rule it doesn't have is accepted in the configuration and reports nothing. Missing, notably:
   the React Compiler rules oxlint turns on with the react plugin (`react/refs`, `react/purity`,
-  `react/set-state-in-effect`, ...); vue, nextjs; `no-shadow`, `no-unmodified-loop-condition`;
-  many pedantic and style rules. Counted on 1,830 real `.oxlintrc.json` files, vlint has 70% of the
-  rules they turn on by name and 84% counting what their categories turn on.
+  `react/set-state-in-effect`, ...); vue, nextjs; `no-shadow`, `no-unmodified-loop-condition`, `prefer-set-has`, `no-fallthrough`;
+  many pedantic and style rules. Counted on 1,830 real `.oxlintrc.json` files, vlint has 72% of the
+  rules they turn on by name and 85% counting what their categories turn on.
 - **JavaScript config files** (`oxlint.config.ts`, a `vite.config.ts` `lint` field): refused. With
   several `jsPlugins` entries, `--print-config` can list them in another order than oxlint.
 - **Options**: `--lsp` isn't supported. `--fix-suggestions`/`--fix-dangerously` don't apply the
