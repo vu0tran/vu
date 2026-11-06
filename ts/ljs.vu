@@ -1,0 +1,403 @@
+# JS plugins (`jsPlugins` in .oxlintrc.json): oxlint runs them in Node.js on an ESTree view of its
+# tree, with an ESLint-compatible context. vlint does the same: a Node process runs the host
+# (lhost.vu: oxlint's own plugin runtime, MIT, with the raw-transfer reads replaced) and
+# jsplug/estree.js turns vlint's tree, sent as flat arrays, into oxc's ESTree. This file makes the
+# requests and reads the answers.
+
+import ast
+import lout
+import lconf
+import lmeta
+import lhost
+import lcache
+
+extern "ljs_glue.c":
+  fn vl_node_setup(ffi: Ffi, script: Str, args: Str, slots: Int)
+  fn vl_node_prelude(ffi: Ffi, lines: Str)
+  fn vl_node_call(ffi: Ffi, req: Str) -> Str
+  fn vl_node_stop(ffi: Ffi)
+
+# The run's JS plugins: the requests each node process is sent first (plugin loads, the options),
+# and the plugin files registered.
+type Js:
+  on: Bool
+  prelude: [Str]
+  paths: {Str: Bool}
+  opts: [Str]         # options by id (0: none), as JSON arrays
+  orule: [Int]        # and the rule each is for
+  oid: {Str: Int}     # "rule\toptions" -> id
+
+fn new_js() -> Js:
+  return Js(false, [], {}, ["[]"], [0], {})
+
+# Where the host script is: written once to the user's cache folder (or the temporary one).
+fn host_path(fs: Fs, os: Os) -> Str:
+  # (VLINT_JS_HOST: another host script, for developing it)
+  if os.env("VLINT_JS_HOST") != "": return os.env("VLINT_JS_HOST")
+  var dir = os.env("XDG_CACHE_HOME")
+  if dir == "" and os.env("HOME") != "": dir = os.env("HOME") + "/.cache"
+  var candidates: [Str] = []
+  if dir != "": candidates.push(dir + "/vlint")
+  var tmp = os.env("TMPDIR")
+  if tmp == "": tmp = "/tmp"
+  candidates.push(tmp + "/vlint-" + os.env("USER"))
+  for d in candidates:
+    let f = d + "/host-" + lhost.HOST_HASH + ".mjs"
+    if fs.exists(f): return f
+    fs.mkdir(d) else continue
+    let part = f + ".part" + "{os.clock()}"
+    fs.write(part, lhost.HOST_JS) else continue
+    fs.rename(part, f) else continue
+    return f
+  return ""
+
+# Starts the plugin host (nothing runs until the first request).
+fn start(fs: Fs, os: Os, ffi: Ffi, var js: Js, slots: Int) -> Str:
+  if js.on: return ""
+  let p = host_path(fs, os)
+  if p == "": return "Failed to write the JS plugin host"
+  vl_node_setup(ffi, p, "\n".join(args()), slots)
+  js.on = true
+  return ""
+
+# ---- resolving a plugin's specifier as oxlint's oxc_resolver does (conditions module-sync, node,
+# import; extensions .js .json .node; symlinks followed)
+
+fn is_file(fs: Fs, p: Str) -> Bool:
+  return fs.exists(p) and not fs.exists(p + "/")
+
+fn is_dir(fs: Fs, p: Str) -> Bool:
+  return fs.exists(p + "/")
+
+fn load_file(fs: Fs, p: Str) -> Str:
+  if is_file(fs, p): return p + ""
+  for e in [".js", ".json", ".node"]:
+    if is_file(fs, p + e): return p + e
+  return ""
+
+fn load_dir(fs: Fs, p: Str) -> Str:
+  if not is_dir(fs, p): return ""
+  let txt = fs.read(p + "/package.json") else ""
+  if txt != "":
+    let pj = lconf.parse_json(txt)
+    if pj.err == "" and pj.v.len > 0:
+      let m = lconf.get(pj, 0, "main")
+      if m >= 0 and pj.v[m].k == lconf.J_STR and pj.v[m].s != "":
+        let t = lconf.norm_path(p + "/" + pj.v[m].s)
+        let f = load_file(fs, t)
+        if f != "": return f
+        let g = load_index(fs, t)
+        if g != "": return g
+  return load_index(fs, p)
+
+fn load_index(fs: Fs, p: Str) -> Str:
+  for e in [".js", ".json", ".node"]:
+    if is_file(fs, p + "/index" + e): return p + "/index" + e
+  return ""
+
+fn cond_target(js: lconf.Json, v: Int, star: Str) -> Str:
+  let kv = js.v[v].k
+  if kv == lconf.J_STR: return js.v[v].s.replace("*", star)
+  if kv == lconf.J_ARR:
+    for c in js.v[v].kids:
+      let t = cond_target(js, c, star)
+      if t != "": return t
+    return ""
+  if kv == lconf.J_OBJ:
+    for i in 0..js.v[v].keys.len:
+      let key = js.v[v].keys[i]
+      if key == "module-sync" or key == "node" or key == "import" or key == "default":
+        let t = cond_target(js, js.v[v].kids[i], star)
+        if t != "": return t
+  return ""
+
+fn exports_target(js: lconf.Json, ex: Int, sub: Str) -> Str:
+  var is_map = false
+  if js.v[ex].k == lconf.J_OBJ:
+    for key in js.v[ex].keys:
+      if key.startswith("."): is_map = true
+  if not is_map:
+    if sub == ".": return cond_target(js, ex, "")
+    return ""
+  for i in 0..js.v[ex].keys.len:
+    if js.v[ex].keys[i] == sub: return cond_target(js, js.v[ex].kids[i], "")
+  var best = -1
+  var best_pre = -1
+  var star = ""
+  for i in 0..js.v[ex].keys.len:
+    let key = js.v[ex].keys[i]
+    let st = key.find("*")
+    if st < 0: continue
+    let pre = key[0..st]
+    let post = key[st + 1..key.len]
+    if sub.startswith(pre) and sub.endswith(post) and sub.len >= pre.len + post.len and pre.len > best_pre:
+      best = i
+      best_pre = pre.len
+      star = sub[pre.len..sub.len - post.len]
+  if best < 0: return ""
+  return cond_target(js, js.v[ex].kids[best], star)
+
+# The plugin's file ("" not found) and, for a package, its name
+fn resolve_plugin(fs: Fs, ffi: Ffi, dir: Str, spec: Str, var pkg: [Str]) -> Str:
+  var found = ""
+  if spec.startswith("/") or spec.startswith("./") or spec.startswith("../") or spec == "." or spec == "..":
+    var p = spec + ""
+    if not spec.startswith("/"): p = lconf.norm_path(dir + "/" + spec)
+    found = load_file(fs, p)
+    if found == "": found = load_dir(fs, p)
+  else:
+    # a package: its name, then the rest
+    var name = spec + ""
+    var sub = ""
+    var parts = spec.split("/")
+    if spec.startswith("@") and parts.len >= 2: name = parts[0] + "/" + parts[1]
+    else: name = parts[0] + ""
+    if spec.len > name.len: sub = spec[name.len..spec.len]
+    var d = dir + ""
+    while d != "" and found == "":
+      let base = d + "/node_modules/" + name
+      if is_dir(fs, base):
+        let txt = fs.read(base + "/package.json") else ""
+        var done = false
+        if txt != "":
+          let pj = lconf.parse_json(txt)
+          if pj.err == "" and pj.v.len > 0:
+            let ex = lconf.get(pj, 0, "exports")
+            if ex >= 0 and pj.v[ex].k != lconf.J_NULL:
+              var key = "."
+              if sub != "": key = "." + sub
+              let t = exports_target(pj, ex, key)
+              if t != "": found = load_file(fs, lconf.norm_path(base + "/" + t))
+              done = true
+        if not done:
+          if sub == "": found = load_dir(fs, base)
+          else:
+            found = load_file(fs, base + sub)
+            if found == "": found = load_dir(fs, base + sub)
+      if d == "/": break
+      d = lconf.dir_of(d)
+  if found == "": return ""
+  let real = lcache.realpath(ffi, found)
+  if real != "": found = real
+  if not (spec.startswith(".") or spec.startswith("/")):
+    # the package's name: the package.json nearest to the file
+    var d = lconf.dir_of(found)
+    while d != "":
+      let txt = fs.read(d + "/package.json") else ""
+      if txt != "":
+        let pj = lconf.parse_json(txt)
+        let nm = lconf.get(pj, 0, "name")
+        if nm >= 0 and pj.v[nm].k == lconf.J_STR: pkg.push(pj.v[nm].s + "")
+        break
+      if d == "/": break
+      d = lconf.dir_of(d)
+  return found
+
+fn file_url(p: Str) -> Str:
+  var b: [Byte] = []
+  push_str(&b, "file://")
+  for i in 0..p.len:
+    let c = p[i]
+    if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '/' or c == '-' or c == '_' or c == '.' or c == '~' or c == '@' or c == '+' or c == ':' or c == '!' or c == '$' or c == '&' or c == '\'' or c == '(' or c == ')' or c == '*' or c == ',' or c == ';' or c == '=':
+      b.push(c)
+    else:
+      let hx = "0123456789ABCDEF"
+      b.push('%')
+      b.push(hx[int(c) >> 4])
+      b.push(hx[int(c) & 15])
+  return b.take_str()
+
+# Loads a plugin (once per file): "" or the message of oxlint's "Failed to load JS plugin" error
+fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: Str, alias: Str) -> Str:
+  var pkg: [Str] = []
+  let path = resolve_plugin(fs, ffi, dir, spec, &pkg)
+  if path == "": return "Cannot find module '{spec}'"
+  if path in js.paths: return ""
+  var name = ""
+  var has_name = false
+  if alias != "":
+    if lconf.normalize_plugin(alias) != alias: return "Plugin alias '{alias}' is not valid. Strip plugin package prefixes, e.g. use 'foo' or '@scope/foo'."
+    name = alias + ""
+    has_name = true
+  elif pkg.len > 0:
+    name = lconf.normalize_plugin(pkg[0])
+    has_name = true
+  if has_name and lconf.plugin_flag(name) >= 0: return "!reserved:" + name
+  var req = "{{\"op\":\"load\",\"url\":\"" + lout.json_esc(file_url(path)) + "\",\"name\":"
+  if has_name: req += "\"" + lout.json_esc(name) + "\""
+  else: req += "null"
+  req += ",\"alias\":"
+  if alias != "": req += "true}}"
+  else: req += "false}}"
+  let ans = vl_node_call(ffi, req)
+  if ans == "!" or ans == "": return "vlint: the JS plugin host (node) could not be started or stopped"
+  # the answer is a JSON string holding oxlint's {"Success": ...} or {"Failure": message}
+  var outer = lconf.parse_json(ans)
+  if outer.err != "" or outer.v.len == 0 or outer.v[0].k != lconf.J_STR: return "vlint: bad answer from the JS plugin host"
+  let res = lconf.parse_json(outer.v[0].s)
+  let failure = lconf.get(res, 0, "Failure")
+  if failure >= 0: return res.v[failure].s + ""
+  let ok = lconf.get(res, 0, "Success")
+  if ok < 0: return "vlint: bad answer from the JS plugin host"
+  let nm = lconf.get(res, ok, "name")
+  let pname = res.v[nm].s + ""
+  if lconf.plugin_flag(pname) >= 0: return "!reserved:" + pname
+  let rn = lconf.get(res, ok, "ruleNames")
+  for r in res.v[rn].kids:
+    let full = pname + "/" + res.v[r].s
+    m.xrid[full] = m.xname.len
+    m.xname.push(full)
+  m.xplug[pname] = true
+  js.paths[path] = true
+  js.prelude.push(req)
+  vl_node_prelude(ffi, "\n".join(js.prelude))
+  return ""
+
+# The tree of a file as one JSON object: the nodes (9 numbers each: kind, start, end, a, b, c, d,
+# flags, name), the item lists, the names, the decorators, the file root.
+fn tree_json(t: ast.Ast, root: Int, file: Int) -> Str:
+  var b: [Byte] = []
+  push_str(&b, "{{\"nd\":[")
+  for i in 0..t.nd.len:
+    let x = t.nd[i]
+    if i > 0: b.push(',')
+    push_int(&b, x.k)
+    b.push(',')
+    push_int(&b, x.pos)
+    b.push(',')
+    push_int(&b, x.end)
+    b.push(',')
+    push_int(&b, x.a)
+    b.push(',')
+    push_int(&b, x.b)
+    b.push(',')
+    push_int(&b, x.c)
+    b.push(',')
+    push_int(&b, x.d)
+    b.push(',')
+    push_int(&b, x.f)
+    b.push(',')
+    push_int(&b, x.s)
+  push_str(&b, "],\"L\":[")
+  for i in 0..t.L.len:
+    if i > 0: b.push(',')
+    push_int(&b, t.L[i])
+  push_str(&b, "],\"nm\":[")
+  for i in 0..t.names.len:
+    if i > 0: b.push(',')
+    b.push('"')
+    push_str(&b, lout.json_esc(t.names[i]))
+    b.push('"')
+  push_str(&b, "],\"deco\":[")
+  let dk = -1000000 - file
+  if dk in t.dirs:
+    let ds = t.dirs[dk]
+    for i in 0..ds.len:
+      if i > 0: b.push(',')
+      push_int(&b, ds[i])
+  push_str(&b, "],\"np\":[")
+  var first = true
+  for k, v in t.npos:
+    if not first: b.push(',')
+    first = false
+    push_int(&b, k)
+    b.push(',')
+    push_int(&b, v)
+  push_str(&b, "],\"root\":")
+  push_int(&b, root)
+  b.push('}')
+  return b.take_str()
+
+fn push_str(var b: [Byte], s: Str):
+  for i in 0..s.len: b.push(s[i])
+
+fn push_int(var b: [Byte], x: Int):
+  if x < 0:
+    b.push('-')
+    push_int(&b, -x)
+    return
+  if x < 10:
+    b.push(byte(48 + x))
+    return
+  var tmp: [Byte] = []
+  var v = x
+  while v > 0:
+    tmp.push(byte(48 + v % 10))
+    v = v / 10
+  var k = tmp.len - 1
+  while k >= 0:
+    b.push(tmp[k])
+    k -= 1
+
+# The options id of a rule's options ("" none: 0), adding them to the store
+fn options_id(var js: Js, rule: Int, opts: Str) -> Int:
+  if opts == "": return 0
+  let key = "{rule}\t{opts}"
+  let k = js.oid.get(key, -1)
+  if k >= 0: return k
+  let id = js.opts.len
+  js.oid[key] = id
+  js.opts.push(opts + "")
+  js.orule.push(rule)
+  return id
+
+# Sends the rules' options (every configuration's) to the host: "" or the error to print
+fn setup(ffi: Ffi, var js: Js, cwd: Str) -> Str:
+  var ids: [Str] = []
+  for r in js.orule: ids.push("{r}")
+  let body = "{{\"cwd\":\"" + lout.json_esc(cwd) + "\",\"workspaceUri\":null,\"ruleIds\":[" + ",".join(ids) + "],\"options\":[" + ",".join(js.opts) + "]}}"
+  let req = "{{\"op\":\"setup\",\"json\":\"" + lout.json_esc(body) + "\"}}"
+  let ans = vl_node_call(ffi, req)
+  if ans == "!" or ans == "": return "vlint: the JS plugin host (node) could not be started"
+  js.prelude.push(req)
+  vl_node_prelude(ffi, "\n".join(js.prelude))
+  if ans == "null": return ""
+  let v = lconf.parse_json(ans)
+  if v.err == "" and v.v.len > 0 and v.v[0].k == lconf.J_STR: return v.v[0].s + ""
+  return ans
+
+# One file's request. src: the text the plugins see (no BOM; a .vue/.svelte/.astro section);
+# base: where it starts in vlint's text (positions in the tree are vlint's).
+fn lint_request(path: Str, src: Str, bom: Bool, jsx: Bool, source_type: Str, base: Int, tree: Str, rules: [Int], opts: [Int], settings: Str, globals: Str) -> Str:
+  var b: [Byte] = []
+  push_str(&b, "{{\"op\":\"lint\",\"path\":\"")
+  push_str(&b, lout.json_esc(path))
+  push_str(&b, "\",\"src\":\"")
+  push_str(&b, json_text(src))
+  push_str(&b, "\",\"bom\":")
+  if bom: push_str(&b, "true")
+  else: push_str(&b, "false")
+  push_str(&b, ",\"jsx\":")
+  if jsx: push_str(&b, "true")
+  else: push_str(&b, "false")
+  push_str(&b, ",\"sourceType\":\"")
+  push_str(&b, source_type)
+  push_str(&b, "\",\"base\":")
+  push_int(&b, base)
+  push_str(&b, ",\"rules\":[")
+  for i in 0..rules.len:
+    if i > 0: b.push(',')
+    push_int(&b, rules[i])
+  push_str(&b, "],\"opts\":[")
+  for i in 0..opts.len:
+    if i > 0: b.push(',')
+    push_int(&b, opts[i])
+  push_str(&b, "],\"settings\":\"")
+  push_str(&b, lout.json_esc(settings))
+  push_str(&b, "\",\"globals\":\"")
+  push_str(&b, lout.json_esc(globals))
+  push_str(&b, "\",\"tree\":")
+  push_str(&b, tree)
+  b.push('}')
+  return b.take_str()
+
+# a source text as a JSON string's contents (control characters, quotes, backslashes; invalid
+# UTF-8 as U+FFFD, which JSON can't carry otherwise)
+fn json_text(s: Str) -> Str:
+  return lout.json_esc(s)
+
+fn call(ffi: Ffi, req: Str) -> Str:
+  return vl_node_call(ffi, req)
+
+fn stop(ffi: Ffi):
+  vl_node_stop(ffi)

@@ -24,6 +24,7 @@ import lconf
 import lprint
 import lsupp
 import lglob
+import ljs
 
 const HELP = """
   Usage: [-c=<./.oxlintrc.json>] [PATH]...
@@ -459,12 +460,19 @@ fn js_plugin_found(fs: Fs, dir: Str, sp: Str) -> Bool:
     d = parent_dir(d)
   return false
 
-fn load_conf(fs: Fs, o: lout.Opts, m: lmeta.Meta, path: Str, a: Args, root: Bool) -> lconf.Conf:
-  let rc = load_rc(fs, o, m, path, root)
+# the context JS plugins load in: the run's plugin host and the threads it may use
+type Jx:
+  os: Os
+  ffi: Ffi
+  js: ljs.Js
+  threads: Int
+
+fn load_conf(fs: Fs, var jx: Jx, o: lout.Opts, var m: lmeta.Meta, path: Str, a: Args, root: Bool) -> lconf.Conf:
+  let rc = load_rc(fs, &jx, o, &m, path, root)
   return build_conf(o, m, rc, a, root)
 
 # the configuration file as written, merged with what it extends
-fn load_rc(fs: Fs, o: lout.Opts, m: lmeta.Meta, path: Str, root: Bool) -> lconf.Rc:
+fn load_rc(fs: Fs, var jx: Jx, o: lout.Opts, var m: lmeta.Meta, path: Str, root: Bool) -> lconf.Rc:
   var rc = lconf.empty_rc()
   if path != "":
     if path.endswith(".ts") or path.endswith(".mts") or path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".cts"): js_config_error(o, path)
@@ -478,12 +486,25 @@ fn load_rc(fs: Fs, o: lout.Opts, m: lmeta.Meta, path: Str, root: Bool) -> lconf.
     if err.len > 0:
       if root: config_error(o, "Failed to parse oxlint configuration file.\n", err[0])
       config_error(o, "Failed to build configuration from {path}.\n", err[0])
-    # JS plugins: oxlint runs them with Node; vlint can't
+    # JS plugins: loaded in the plugin host (Node.js), in oxlint's order (by specifier, name, folder)
+    var entries: [Str] = []
     for tagged in rc.js_plugins:
-      let tab = tagged.find("\t")
-      let sp = tagged[tab + 1..tagged.len]
-      var msg = "Failed to load JS plugin: {sp}\n  Cannot find module '{sp}'"
-      if js_plugin_found(fs, tagged[0..tab], sp): msg = "Failed to load JS plugin: {sp}\n  vlint doesn't run JS plugins (oxlint runs them with Node.js)"
+      let f = tagged.split("\t")
+      if f.len < 3: continue
+      let ent = f[1] + "\t" + f[2] + "\t" + f[0]
+      if not (ent in entries): entries.push(ent)
+    entries.sort()
+    for ent in entries:
+      let f = ent.split("\t")
+      let sp = f[0] + ""
+      let st = ljs.start(fs, jx.os, jx.ffi, &jx.js, jx.threads)
+      var perr = st
+      if perr == "": perr = ljs.load_plugin(fs, jx.ffi, &jx.js, &m, f[2], sp, f[1])
+      if perr == "": continue
+      var msg = "Failed to load JS plugin: {sp}\n  {perr}"
+      if perr.startswith("!reserved:"):
+        let pn = perr[10..perr.len]
+        msg = "Plugin name '{pn}' is reserved, and cannot be used for JS plugins.\n\nThe '{pn}' plugin is already implemented natively in Rust within oxlint.\nUsing both the native and JS versions would create ambiguity about which rules to use.\n\nTo use an external '{pn}' plugin instead, provide a custom alias:\n\n\"jsPlugins\": [{{ \"name\": \"{pn}-js\", \"specifier\": \"eslint-plugin-{pn}\" }}]\n\nThen reference rules using your alias:\n\n\"rules\": {{\n  \"{pn}-js/rule-name\": \"error\"\n}}\n\nSee: https://oxc.rs/docs/guide/usage/linter/js-plugins.html"
       if root: config_error(o, "Failed to parse oxlint configuration file.\n", msg)
       config_error(o, "Failed to build configuration from {path}.\n", msg)
   return rc
@@ -499,10 +520,16 @@ fn build_conf(o: lout.Opts, m: lmeta.Meta, rc: lconf.Rc, a: Args, root: Bool) ->
   let c = lconf.build(m, rc, a.filters, on, off, &err)
   if c.nrules < 0:
     var parts: [Str] = []
-    for e in err:
+    var in_build = false
+    for e0 in err:
+      var e = e0 + ""
+      if e.startswith("!build:"):
+        e = e[7..e.len]
+        in_build = true
       let d = lout.Diag(2, "", "", e, "", [], "")
       parts.push(lout.graphical(o, "", "", [0], d))
-    if root: write("Failed to parse oxlint configuration file.\n" + "".join(parts) + "\n")
+    if root and in_build: write("Failed to build configuration.\n" + "".join(parts) + "\n")
+    elif root: write("Failed to parse oxlint configuration file.\n" + "".join(parts) + "\n")
     else: write("Failed to build configuration from {path}.\n" + "".join(parts) + "\n")
     exit(1)
   return c
@@ -528,11 +555,11 @@ fn lint_one(fs: Fs, w: Work, i: Int, var kw: {Str: Int}, phase: Int, var t: ast.
   let sev = w.sevs[w.sev_of[i]]
   if phase == 10:
     var fixed: [Str] = []
-    var recs = rules.lint_fix(w.cx, sev, w.optss[w.sev_of[i]], w.shown[i], src, &kw, &t, &fixed)
+    var recs = rules.lint_fix(w.cx, sev, w.optss[w.sev_of[i]], w.shown[i], w.files[i], src, &kw, &t, &fixed)
     if fixed.len > 0:
       fs.write(w.files[i], fixed[0]) else recs.push(rules.plain_error(w.cx, w.shown[i], "", -1, -1, "Failed to write file {w.shown[i]}", ""))
     return recs
-  return rules.lint_upto(w.cx, sev, w.optss[w.sev_of[i]], w.shown[i], src, &kw, phase, &t)
+  return rules.lint_upto(w.cx, sev, w.optss[w.sev_of[i]], w.shown[i], w.files[i], src, &kw, phase, &t)
 
 fn worker(fs: Fs, own w: Shared[Work], own jobs: Chan[Int], own res: Chan[Res], phase: Int):
   var kw = scan.keywords()
@@ -577,7 +604,7 @@ fn check_one(fs: Fs, w: Work, i: Int, esize: Int, ehash: Int, var kw: {Str: Int}
   let h = lcache.hash64(src)
   if size == esize and h == ehash: return CRes(0, true, [], size, h)
   if phase == 0: return CRes(0, false, [], size, h)
-  return CRes(0, false, rules.lint_upto(w.cx, w.sevs[w.sev_of[i]], w.optss[w.sev_of[i]], w.shown[i], src, &kw, phase, &t), size, h)
+  return CRes(0, false, rules.lint_upto(w.cx, w.sevs[w.sev_of[i]], w.optss[w.sev_of[i]], w.shown[i], w.files[i], src, &kw, phase, &t), size, h)
 
 fn cworker(fs: Fs, own sj: Shared[CJobs], own jobs: Chan[Int], own res: Chan[CRes], phase: Int):
   var kw = scan.keywords()
@@ -1060,8 +1087,52 @@ fn sarif(rs: [lout.Rec]) -> Str:
   s += "\n    }}\n  ]\n}}"
   return s
 
-fn work_copy(w: Work, o: lout.Opts) -> Work:
-  var c = Work([], [], [], [], [], rules.Cx(o, lmeta.load(), 1, lmod.new_graph()))
+# The globals and environments a file's JS plugins see (GlobalsAndEnvs), as JSON text: the
+# configuration's maps, with the overrides that apply inserted (FxHashMap order)
+fn globals_json(c: lconf.Conf, rel: Str) -> Str:
+  var gb: [Str] = []
+  var gx: [Str] = []
+  var gv: {Str: Str} = {}
+  var eb: [Str] = []
+  var ex: [Str] = []
+  var ev: {Str: Bool} = {}
+  var i = 0
+  while i + 1 < c.globals.len:
+    gb.push(c.globals[i] + "")
+    gv[c.globals[i]] = c.globals[i + 1] + ""
+    i += 2
+  if c.has_env:
+    i = 0
+    while i + 1 < c.env.len:
+      eb.push(c.env[i] + "")
+      ev[c.env[i]] = c.env[i + 1] == "1"
+      i += 2
+  else:
+    eb.push("builtin")
+    ev["builtin"] = true
+  for o in c.overrides:
+    if not (lglob.globset_match(o.files, rel) and not lglob.globset_match(o.exclude, rel)): continue
+    if o.has_env:
+      i = 0
+      while i + 1 < o.env.len:
+        ex.push(o.env[i] + "")
+        ev[o.env[i]] = o.env[i + 1] == "1"
+        i += 2
+    if o.has_globals:
+      i = 0
+      while i + 1 < o.globals.len:
+        gx.push(o.globals[i] + "")
+        gv[o.globals[i]] = o.globals[i + 1] + ""
+        i += 2
+  var gp: [Str] = []
+  for k in lprint.fx_keys(gb, gx): gp.push(json_str(k) + ":\"" + gv[k] + "\"")
+  var ep: [Str] = []
+  for k in lprint.fx_keys(eb, ex):
+    if ev[k]: ep.push(json_str(k) + ":true")
+  return "{{\"globals\":{{" + ",".join(gp) + "}},\"envs\":{{" + ",".join(ep) + "}}}}"
+
+fn work_copy(w: Work, o: lout.Opts, ffi: Ffi) -> Work:
+  var c = Work([], [], [], [], [], rules.Cx(o, lmeta.load(), 1, lmod.new_graph(), false, ffi))
   for x in w.files: c.files.push(x + "")
   for x in w.shown: c.shown.push(x + "")
   for t in w.sevs:
@@ -1195,10 +1266,11 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   elif os.env("NO_COLOR") != "" and os.env("NO_COLOR") != "0": theme = 2
   else: theme = 1
   let o = lout.Opts(lout.format_of(fmt), theme, tty)
-  let m = lmeta.load()
+  var m = lmeta.load()
   let cwd = lcache.cwd(ffi)
   var threads = a.threads
   if threads == 0: threads = cpu_count(fs, ffi)
+  var jx = Jx(os, ffi, ljs.new_js(), threads)
   # the paths: explicit files that an ignore pattern matches are dropped
   var w = Walker([], lglob.gi_new(cwd), not a.no_ignore, a.ignore_path)
   for p in a.ignore_patterns: lglob.gi_add(&w.over, p)
@@ -1254,13 +1326,17 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
         break
       d = parent_dir(d)
   if a.print_config:
-    let prc = load_rc(fs, o, m, root_path, true)
+    var prc = load_rc(fs, &jx, o, &m, root_path, true)
+    # (oxlint prints the configuration before ConfigStoreBuilder::build checks overrides' rules)
+    prc.lenient = true
     let pc = build_conf(o, m, prc, a, true)
     var raw = ""
     if root_path != "": raw = fs.read(root_path) else ""
-    write(lprint.print_config(m, prc, pc, lconf.strip_comments(raw)) + "\n")
+    var own = lconf.empty_rc()
+    if root_path != "": let _ = lconf.read_file(fs, root_path, &own)
+    write(lprint.print_config(m, prc, pc, lconf.strip_comments(raw), own) + "\n")
     return
-  var cf = Cfgs([""], [load_conf(fs, o, m, root_path, a, true)])
+  var cf = Cfgs([""], [load_conf(fs, &jx, o, &m, root_path, a, true)])
   let root_dir = cf.confs[0].dir + ""
   # --rules: the rules and which the configuration turns on (the default format's table, or JSON)
   if a.rules:
@@ -1287,7 +1363,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
         if c != "" and c != root_path:
           found = cf.dirs.len
           cf.dirs.push(d + "")
-          cf.confs.push(load_conf(fs, o, m, c, a, false))
+          cf.confs.push(load_conf(fs, &jx, o, &m, c, a, false))
           seen[d] = found
           break
         if c != "" and c == root_path:
@@ -1330,6 +1406,18 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   if a.debug_files:
     for f in kept: print(display(cwd, f))
     return
+  # JS plugins: every configuration's rule options go to the host before linting
+  if jx.js.on:
+    for cc in cf.confs:
+      for i in 0..m.xname.len:
+        if cc.xr.b[i] != -9: ljs.options_id(&jx.js, i, cc.xr.o[i])
+      for k in 0..cc.overrides.len:
+        let ox = lconf.override_xr(m, cc, k)
+        for i in ox.ord: ljs.options_id(&jx.js, i, ox.o[i])
+    let se = ljs.setup(ffi, &jx.js, cwd)
+    if se != "":
+      write("Failed to setup JS plugin options:\n{se}\n")
+      exit(1)
   if kept.len == 0:
     if not a.no_error_unmatched: write("No files found to lint. Please check your paths and ignore patterns.\n")
     finish_info(o, os.clock() - t0, 0, nrules, threads, false, "")
@@ -1392,6 +1480,17 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       ob.push("\n".join(goff))
       # (and one more: the settings object)
       ob.push(cc.settings + "")
+      # (JS plugins: the file's rules, "id options-id severity" each, and its globals as JSON)
+      var xo: [Str] = []
+      let xs = lconf.resolve_js(m, cc, rel, &xo)
+      var xparts: [Str] = []
+      var q = 0
+      while q + 1 < xs.len:
+        xparts.push("{xs[q]} {ljs.options_id(&jx.js, xs[q], xo[q / 2])} {xs[q + 1]}")
+        q += 2
+      ob.push(" ".join(xparts))
+      if xparts.len > 0: ob.push(globals_json(cc, rel))
+      else: ob.push("")
       optss.push(ob)
     sev_of.push(sev_at[key])
     shown.push(display(cwd, kept[i]))
@@ -1423,7 +1522,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     for tb in sevs:
       if tb.len >= m.name.len and tb[lmeta.M_IMPORT_NO_CYCLE] > 0: need_cycle = true
     if need_cycle: rimport.cycle_components(&mg)
-  let cx = rules.Cx(o, m, fixmask, mg)
+  let cx = rules.Cx(o, m, fixmask, mg, os.env("VLINT_ESTREE") != "", ffi)
   # (the cache's key covers the tables)
   var tkey: [Str] = []
   for k in 0..sevs.len:
@@ -1436,8 +1535,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   let nsevs = lcache.hex16(lcache.hash64(";".join(tkey)))
   var work = Work(kept, shown, sevs, optss, sev_of, cx)
   # (tsgolint's run reads its own copy: work goes to the workers)
-  var work_ta = Work([], [], [], [], [], rules.Cx(o, lmeta.Meta([], [], [], [], [], [], [], [], [], [], {}, {}), 1, lmod.new_graph()))
-  if type_aware: work_ta = work_copy(work, o)
+  var work_ta = Work([], [], [], [], [], rules.Cx(o, lmeta.Meta([], [], [], [], [], [], [], [], [], [], {}, {}, [], {}, {}), 1, lmod.new_graph(), false, ffi))
+  if type_aware: work_ta = work_copy(work, o, ffi)
   var shown2: [Str] = []
   for s in work.shown: shown2.push(s + "")
   if a.cache and phase != 10:

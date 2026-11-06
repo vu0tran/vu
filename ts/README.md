@@ -118,7 +118,7 @@ cd ts && VU_SPLIT=off ../vu build --release vlint.vu -o vlint   # one C file: th
 | `--report-unused-disable-directives[-severity]` | yes |
 | `--rules` | yes (the table, `-f json`) |
 | `--init` | yes |
-| `--print-config` | yes (`lprint.vu`; byte-identical on 14 of the 15 real projects and 8 hand-written configs, the 15th uses a JS plugin) |
+| `--print-config` | yes (`lprint.vu`; byte-identical on the 15 real projects and 8 hand-written configs; several `jsPlugins` entries can come out in another order, see below) |
 | `--fix-suggestions`, `--fix-dangerously` | yes for the rules that have them in vlint (see below); not yet: `no-unused-vars`', `no-new-array`'s and `no-extra-boolean-cast`'s suggestions |
 | `--lsp` | no (refused) |
 | `--suppress-all`, `--prune-suppressions` (hidden), `oxlint-suppressions.json` | yes (`lsupp.vu`) |
@@ -130,9 +130,35 @@ with severities and options, `categories`, `plugins`, `env`/`globals` (globals r
 `jsx-no-undef`), `settings` (parsed), `ignorePatterns`, `options` (`typeAware`, `typeCheck`,
 `denyWarnings`, `maxWarnings`, `reportUnusedDisableDirectives`, `respectEslintDisableDirectives`),
 JSON errors as serde words them. `oxlint.config.ts` is reported as needing a JavaScript runtime.
-`jsPlugins`: a missing package gets oxlint's "Failed to load JS plugin" error; an installed one
-is refused (vlint can't run JavaScript). Ignore files: `.gitignore` (and the folders above, up
+`jsPlugins` (in the config and in overrides): run in Node as oxlint runs them (see "JS plugins"
+below). Ignore files: `.gitignore` (and the folders above, up
 to the repository root, and `.git/info/exclude`), `.eslintignore`/`--ignore-path`.
+
+**JS plugins** (`ljs.vu`, `ljs_glue.c`, `jsplug/`): vlint runs ESLint-style plugins with
+oxlint 1.90.0's own plugin runtime (its `dist`, MIT, embedded by `jsplug/gen_host.py` into
+`lhost.vu` and written once to `~/.cache/vlint`): the same `context`, `sourceCode`, scope manager,
+selectors and `:exit` visitors, CFG events, options validation, fixes and suggestions, message
+ids, disable comments for plugin rules. What oxlint hands that runtime from Rust (raw transfer of
+oxc's AST) vlint builds in JavaScript from its own tree: `jsplug/estree.js` turns vlint's flat
+node arrays into oxc's ESTree (the same node types and fields in oxc's order, UTF-16 offsets,
+`loc`, oxc's quirks: TS fields on JS nodes, `ChainExpression` around non-null chains, decorated
+classes, `export import`, `sourceType` decided as oxc decides it), and `jsplug/tokens.js` makes
+oxc's tokens and comments (kinds as `oxc_estree_tokens` sets them). Plugins resolve as oxc_resolver
+is set up for them (`exports` conditions, extensions, realpath), with oxlint's errors for missing
+packages, invalid aliases and reserved names. Each linting thread drives one long-lived `node`
+process (requests on fd 3, answers on fd 4; the plugin's own `console.log` goes to vlint's
+output); a JS rule's diagnostics follow the native ones as in oxlint. Checked against oxlint with
+a dumping plugin: identical ASTs on about 16,000 real files, tokens and comments on 4,577 of
+4,580; oxlint's JS plugin fixtures (`apps/oxlint/test/fixtures`): 81 of 94 identical (the rest:
+`vite.config`/`oxlint.config.ts` configurations, a vue rule and parse-error wording); 21 real
+plugins with every rule on (eslint-plugin-react, react-hooks, sonarjs, perfectionist, @stylistic,
+playwright, storybook, testing-library, security, unused-imports, simple-import-sort,
+@tanstack/query, @next/next, react-native, react-you-might-not-need-an-effect, no-only-tests,
+oxlint-plugin-eslint, oxlint-tailwindcss, oxlint-plugin-complexity, oxlint-plugin-react-doctor,
+@shadcn/lint) on excalidraw: 632 of 632 files identical. CPU with those plugins on excalidraw
+(best of 3, loaded 2-core machine): one thread oxlint 93 s, vlint 102 s; two threads oxlint
+92 s CPU and 71 s wall, vlint 114 s CPU and 59 s wall (oxlint runs JS on one thread, vlint on
+one Node process per thread).
 
 **Output**: oxlint's graphical report (themes, links, summary lines), the agent format, and all
 `-f` formats, byte-identical in the cases checked.
@@ -184,7 +210,14 @@ env globals, `lglobals.vu`, generated from the `javascript-globals` crate), `no-
 `prefer-array-flat-map`, `no-confusing-array-with`, `no-instanceof-array`, `prefer-string-slice`,
 `prefer-date-now`; `import/` `no-absolute-path`, `no-empty-named-blocks`, `no-unassigned-import`;
 `react/` `jsx-no-script-url`, `no-namespace`, `iframe-missing-sandbox`, `style-prop-object`;
-`node/no-exports-assign`; `oxc/no-async-endpoint-handlers` (`rmore3.vu`, `rmore4.vu`). All 61
+`node/no-exports-assign`; `oxc/no-async-endpoint-handlers` (`rmore3.vu`, `rmore4.vu`). Added this
+round (`rmore5.vu`, `rmore6.vu`, kimi-code's most frequent missing ones): `unicorn/`
+`prefer-single-call`, `explicit-length-check`, `prefer-top-level-await`, `prefer-string-replace-all`,
+`no-typeof-undefined`, `prefer-math-min-max`, `new-for-builtins`, `prefer-type-error`,
+`no-unnecessary-array-splice-count`, `consistent-assert`, `prefer-array-find`,
+`prefer-import-meta-properties`, `prefer-at`; `no-promise-executor-return`, `no-lonely-if`,
+`prefer-promise-reject-errors`, `no-inner-declarations`; `promise/` `no-promise-in-callback`,
+`no-callback-in-promise`. All 61
 type-aware rules through tsgolint. A rule
 vlint doesn't have is accepted in the configuration and reports nothing. The rules added in these
 rounds are in `rhooks.vu` (exhaustive-deps), `rmore.vu`, `rmore2.vu` and `ra11y.vu`; each runs only
@@ -252,11 +285,12 @@ categories, env, globals and settings maps.
   approximation was considered and not shipped: it would trade missing diagnostics for wrong ones.
 - The other ~540 non-default rules: missing (the vue plugin, nextjs, the rest of import's
   syntactic rules, jest/vitest style rules, most of unicorn's and eslint's pedantic and style
-  rules). On kimi-code (which turns on pedantic, perf, vitest, import) vlint now finds 10,185 of
-  oxlint's 10,599 diagnostics (9,021 at the start of the latest round, 435 three rounds ago), with
-  none extra and the order identical; the rest are `unicorn/prefer-single-call` (169),
-  `explicit-length-check` (54), `no-promise-executor-return` (32), `prefer-string-replace-all`
-  (25), `prefer-at` (24), `prefer-top-level-await` (21) and 22 other rules with fewer.
+  rules). On kimi-code (which turns on pedantic, perf, vitest, import) vlint now finds 10,558 of
+  oxlint's 10,599 diagnostics (10,185 at the start of this round, 435 four rounds ago), with
+  none extra and the order identical; the rest are `unicorn/no-immediate-mutation` (14),
+  `no-loop-func` (10), `no-unmodified-loop-condition` (8) and 6 rules with 1 or 2
+  (`no-fallthrough`, `prefer-set-has`, `prefer-dom-node-dataset`, `no-else-return`,
+  `prefer-native-coercion-functions`, `prefer-query-selector`).
 - `jsx-a11y/lang` (needs the IANA language subtag registry) and `jsx-a11y/anchor-ambiguous-text`
   (13 enables): missing.
 - `prefer-snapshot-hint`'s diagnostics in two excalidraw files come out in another order: oxc groups
@@ -267,14 +301,13 @@ categories, env, globals and settings maps.
 - Fixes not yet ported: the suggestions of `no-unused-vars`, `no-new-array` and
   `no-extra-boolean-cast` (so `--fix-suggestions`/`--fix-dangerously` leave those), and the fix of
   `no-negated-condition` (`--fix` leaves it).
-- `--print-config` with a config that uses `jsPlugins`; JS plugins themselves (see below).
-- JS plugins (`jsPlugins`): a missing package gets oxlint's "Failed to load JS plugin" error, an
-  installed one is refused. Running them needs an ESTree view of vlint's tree (every node type with
-  ranges and `loc`, tokens and comments), oxlint's plugin context (`report` with messages, message
-  ids, data, fixes and suggestions; `sourceCode` with its scope manager), selectors and `:exit`
-  visitors, run in a Node process as vknip runs JavaScript configs: not done. This is the largest
-  drop-in gap after the React Compiler rules: 190 of the 2,559 collected config files (about 10%)
-  name a JS plugin, and vlint refuses those configurations.
+- JS plugins: `--print-config` prints several `jsPlugins` entries in oxlint's `FxHashSet` order,
+  which hashes each entry's folder as Rust's `Path` hashes it; vlint's emulation of that hash is
+  wrong (a single entry prints identically; an 11-entry config prints in another order: checked
+  with a Rust program, whose order is oxlint's). JavaScript configuration files (`oxlint.config.ts`,
+  Vite+'s `vite.config.ts` `lint` field) are still refused, so the fixtures that use them differ.
+  A stack trace printed for a crashing plugin shows the host file's path and line where oxlint
+  shows `lint.js`'s. Node must be on `PATH`.
 - Parse errors: on oxc's own fixtures (`tasks/coverage/misc`, 257 failing and 112 passing files)
   vlint's output is identical for 109 of 369 (102 before this round). vlint reports only the first
   syntax error, in TypeScript's wording under the code `vlint(parse)` where it doesn't know oxc's
@@ -311,11 +344,16 @@ categories, env, globals and settings maps.
 | excalidraw, mantine, kimi-code, preact | `react/only-export-components`, defaults and every option | 3,059 and 958 diagnostics, all identical; 7 attack files identical |
 | excalidraw, mantine, preact, Tracearr, kimi-code, next-shadcn-dashboard-starter | the 16 jsx-a11y rules | 145 diagnostics, all identical; attack files with and without options and settings identical, fixes included |
 | lc, kimi-code | three configurations whose overrides add plugins and rules | every file's order identical for every rule whose diagnostics match |
-| kimi-code | its own configuration | 10,185 of oxlint's 10,599 diagnostics, none extra, order identical (9,021 at the start of the latest round) |
+| kimi-code | its own configuration | 10,558 of oxlint's 10,599 diagnostics, none extra, order identical (10,185 at the start of this round) |
+| oxc's test cases of this round's 19 rules | defaults (1,773 cases), and each case with its own options (655 cases, `optcases.py`: one folder and config each) | identical: all 751 and 358 files with diagnostics, and the files `--fix`, `--fix-suggestions`, `--fix-dangerously` write |
+| lc, preact, excalidraw, vscode, kimi-code, the 15 real projects | this round's rules, each batch on its own and all together | all identical (about 15,000 diagnostics: 3,449 `explicit-length-check`, 2,725 `prefer-single-call`, 2,091 `no-lonely-if`, 1,416 `no-inner-declarations` with "both", 1,293 `prefer-at` and 45,618 with `checkAllIndexAccess`, ...); the only differences are files oxlint rejects with early errors vlint doesn't make |
+| JS plugins: oxlint's fixtures | as the fixtures run them | 81 / 94 |
+| JS plugins: 21 real plugins, every rule on | excalidraw | 632 / 632 files identical |
+| JS plugins: ESTree | a dumping plugin, every file of lc, preact, excalidraw, kimi-code, the 15 projects | ASTs identical on about 16,000 files; tokens and comments on 4,577 of 4,580 |
 | oxc's own test cases of the rules added in the latest round | defaults and every option configuration in the tests | jest/vitest 2,357, jsx-a11y 3,875, the others about 700: identical except parse-error wording, with `--fix`, `--fix-suggestions`, `--fix-dangerously` |
 | oxc's import fixtures (`tasks/coverage` import plugin fixtures) | the graph rules | 72 / 74 files (a lone surrogate, a parse error) |
 | lc, preact, excalidraw, mantine, the 15 real projects | each rule added in the latest round on its own | all identical (2,922 `block-scoped-var` on lc, 526 `no-cycle` in excalidraw and 145 in OpenFrontIO with their notes, 568 `import/extensions` and 61 `no-duplicates` in kimi-code; `no-duplicates` fixes identical) except `prefer-snapshot-hint`'s order in 2 excalidraw files |
-| `--print-config` | 15 real projects, 8 configs | 22 / 23 identical (the 23rd uses a JS plugin) |
+| `--print-config` | 15 real projects, 8 configs, 3 jsPlugins configs | 23 / 23 identical (evolu newly: with `extends`, oxlint prints the root file's own categories and rule options only, and prints even when an override names an unknown plugin); jsPlugins: 1 / 3 (one entry identical, 10 and 11 entries in another order) |
 | suppressions | a 21-step scenario, all output formats | identical except `-f sarif` |
 | zod, `--type-aware`, 5 typed rules | | 1282 / 1285 diagnostics (tsgolint prints 3 types differently run to run) |
 
@@ -325,7 +363,17 @@ mcp, OpenFrontIO (type-aware), react-element-to-jsx-string, react-starter-kit,
 typescript-nextjs-starter, yak; FigmaToCode, Tracearr, difit and next-shadcn-dashboard-starter
 differ only by React Compiler diagnostics, jsx-a11y (Tracearr) and `react/no-unstable-nested-components`
 (next-shadcn-dashboard-starter); their `react-hooks/exhaustive-deps` diagnostics are now identical;
-kimi-code by rules vlint doesn't have (10,185 of 10,599 found, none extra).
+kimi-code by rules vlint doesn't have (10,558 of 10,599 found, none extra).
+
+**Speed this round**: with the default rules nothing changed (callgrind, x86-64-v2 builds, one
+thread: zod 542.6M instructions against 542.9M at the round's start, vscode/src/vs/editor/common
+334.1M against 334.7M). kimi-code with its own configuration, which turns on 19 of this round's
+rules: 2.73 s and 2.41 s of CPU against 2.53 s and 2.50 s for the round's start (best of 5, two
+runs each alternating, load average about 0.9: the difference is within the noise; callgrind on
+its agent-core-v2 package: +5.5% instructions; oxlint 2.02 s), for 373 more diagnostics. The rules' first
+version cost +18% there; most of it was copying names to compare them (`rules.name_is` compares
+in place), the comment list rebuilt for each `prefer-single-call` candidate, and `rjest.refs_of`'s
+map of reference lists (now two arrays).
 
 **Speed** (lc corpus, defaults, 1 thread, user+sys CPU, best of 5, 2-core VM, load average
 about 0.6): vlint 0.99 s, oxlint 3.83 s; the previous round's vlint takes 2.42 s on the same run.

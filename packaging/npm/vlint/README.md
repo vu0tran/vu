@@ -31,7 +31,7 @@ The `oxlint` command is there so scripts don't change. The trade-off: it takes o
 Don't install `@vu0tran/vlint` next to the real `oxlint` in one project (both would claim
 `node_modules/.bin/oxlint`, and which one wins depends on the order npm links them), or globally
 next to a global oxlint. With the alias above, `require("oxlint")` gets this package, which has
-no JavaScript API (oxlint's `defineConfig` and JS plugins aren't there).
+no JavaScript API (oxlint's `defineConfig` isn't there; JS plugins in the configuration work, see below).
 
 ## What's the same
 
@@ -57,6 +57,12 @@ no JavaScript API (oxlint's `defineConfig` and JS plugins aren't there).
   remeda, immer, jotai, ky, mitt, p-queue, redux, reselect, preact, excalidraw and vscode, and on
   real projects with their own configs, for every rule vlint has.
 - `eslint-disable` / `oxlint-disable` comments, as oxc reads them.
+- **JS plugins** (`jsPlugins`, in the config and in overrides): run in Node (which must be on
+  `PATH`) with oxlint's own plugin runtime, on an ESTree view of vlint's tree that matches oxc's
+  (same nodes, spans, tokens and comments); same context, `sourceCode`, scope manager, selectors,
+  fixes and suggestions, and oxlint's errors for missing or misnamed plugins. 21 real plugins
+  (eslint-plugin-react, react-hooks, sonarjs, perfectionist, @stylistic, playwright, storybook,
+  testing-library, ...) with every rule on gave identical output on excalidraw.
 - **Import plugin**: the module graph oxlint builds (oxc_resolver's resolution as oxlint sets it
   up, tsconfig `paths`/`baseUrl`/`extends`/`references`), for `import/namespace`, `default`,
   `named`, `no-cycle`, `no-duplicates`, `extensions`, `no-self-import`, `no-named-as-default`,
@@ -70,7 +76,7 @@ no JavaScript API (oxlint's `defineConfig` and JS plugins aren't there).
 
 Check that your project doesn't depend on these before switching:
 
-- **Rules**: vlint has all of oxlint's defaults plus about 180 more (`prefer-const`,
+- **Rules**: vlint has all of oxlint's defaults plus about 200 more (`prefer-const`,
   `no-restricted-imports`, `react-hooks/rules-of-hooks`, `react-hooks/exhaustive-deps`,
   `react/only-export-components`, `no-console`, `eqeqeq`, `curly`, `no-redeclare`,
   `import/first`, the import graph rules, `typescript/no-explicit-any`,
@@ -81,8 +87,8 @@ Check that your project doesn't depend on these before switching:
   `react/set-state-in-effect`, ...); vue, nextjs; `no-shadow`, `no-unmodified-loop-condition`;
   many pedantic and style rules. Counted on 1,830 real `.oxlintrc.json` files, vlint has 70% of the
   rules they turn on by name and 84% counting what their categories turn on.
-- **JS plugins** (`jsPlugins`): refused (vlint runs no JavaScript); about 10% of real configs use
-  one. `oxlint.config.ts` too.
+- **JavaScript config files** (`oxlint.config.ts`, a `vite.config.ts` `lint` field): refused. With
+  several `jsPlugins` entries, `--print-config` can list them in another order than oxlint.
 - **Options**: `--lsp` isn't supported. `--fix-suggestions`/`--fix-dangerously` don't apply the
   suggestions of `no-unused-vars`, `no-new-array` and `no-extra-boolean-cast` yet.
 - Parse errors: some files that oxc rejects are accepted by vlint (several of oxc's early
