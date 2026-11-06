@@ -2,7 +2,7 @@
 
 An oxlint-compatible linter written in [Vu](https://github.com/vu0tran/vu), meant as a drop-in
 replacement for oxlint 1.90.0: the same command line, configuration files, output and exit codes.
-It runs oxlint's default rules and about 50 of the rules projects most often turn on, reads
+It runs oxlint's default rules and about 180 of the rules projects most often turn on, reads
 `.oxlintrc.json`, and checks `.js .mjs .cjs .jsx .ts .mts .cts .tsx` plus the scripts in `.vue`,
 `.astro` and `.svelte` files.
 
@@ -57,23 +57,32 @@ no JavaScript API (oxlint's `defineConfig` and JS plugins aren't there).
   remeda, immer, jotai, ky, mitt, p-queue, redux, reselect, preact, excalidraw and vscode, and on
   real projects with their own configs, for every rule vlint has.
 - `eslint-disable` / `oxlint-disable` comments, as oxc reads them.
-- Speed: less CPU time than oxlint on a single thread (2.28 s against 3.40 s on a 3,445-file TypeScript corpus, best of 5, measured on a loaded 2-core VM).
+- **Import plugin**: the module graph oxlint builds (oxc_resolver's resolution as oxlint sets it
+  up, tsconfig `paths`/`baseUrl`/`extends`/`references`), for `import/namespace`, `default`,
+  `named`, `no-cycle`, `no-duplicates`, `extensions`, `no-self-import`, `no-named-as-default`,
+  `no-named-as-default-member`.
+- Speed: less CPU time than oxlint on a single thread with the default rules (0.99 s against
+  3.83 s on a 3,445-file corpus of TypeScript and bundled JavaScript, best of 5, measured on a
+  2-core VM); with a large configuration that turns on the import graph and the vitest rules
+  (kimi-code), a little more (2.34 s against 2.02 s).
 
 ## What's not there yet
 
 Check that your project doesn't depend on these before switching:
 
-- **Rules**: vlint has all of oxlint's defaults plus about 100 more (`prefer-const`,
+- **Rules**: vlint has all of oxlint's defaults plus about 180 more (`prefer-const`,
   `no-restricted-imports`, `react-hooks/rules-of-hooks`, `react-hooks/exhaustive-deps`,
   `react/only-export-components`, `no-console`, `eqeqeq`, `curly`, `no-redeclare`,
-  `no-underscore-dangle`, `import/first`, `typescript/no-explicit-any`,
-  `typescript/ban-ts-comment`, 16 jsx-a11y rules, ...; the list is in the source's README). A
-  rule it doesn't have is accepted in the configuration and reports nothing. Missing, notably: the
-  React Compiler rules oxlint turns on with the react plugin (`react/refs`, `react/purity`,
-  `react/set-state-in-effect`, ...); most of jsx-a11y, import, jest, vitest, nextjs; many pedantic
-  and style rules. Counted on 1,830 real `.oxlintrc.json` files, vlint has 64% of the rules they
-  turn on by name and 79% counting what their categories turn on.
-- **JS plugins** (`jsPlugins`): refused (vlint runs no JavaScript). `oxlint.config.ts` too.
+  `import/first`, the import graph rules, `typescript/no-explicit-any`,
+  `typescript/ban-ts-comment`, 34 jsx-a11y rules, the jest and vitest rules that run on test calls
+  (`expect-expect`, `valid-expect`, `valid-title`, ...), ...; the list is in the source's README).
+  A rule it doesn't have is accepted in the configuration and reports nothing. Missing, notably:
+  the React Compiler rules oxlint turns on with the react plugin (`react/refs`, `react/purity`,
+  `react/set-state-in-effect`, ...); vue, nextjs; `no-shadow`, `no-unmodified-loop-condition`;
+  many pedantic and style rules. Counted on 1,830 real `.oxlintrc.json` files, vlint has 70% of the
+  rules they turn on by name and 84% counting what their categories turn on.
+- **JS plugins** (`jsPlugins`): refused (vlint runs no JavaScript); about 10% of real configs use
+  one. `oxlint.config.ts` too.
 - **Options**: `--lsp` isn't supported. `--fix-suggestions`/`--fix-dangerously` don't apply the
   suggestions of `no-unused-vars`, `no-new-array` and `no-extra-boolean-cast` yet.
 - Parse errors: some files that oxc rejects are accepted by vlint (several of oxc's early

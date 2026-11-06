@@ -26,12 +26,16 @@ type Ic:
   ext_pg_pat: [Str]
   ext_pg_act: [Int]     # 0 enforce, 1 ignore
   ns_computed: Bool     # namespace: allowComputed
+  nd_inline: Bool       # no-duplicates: preferInline, considerQueryString
+  nd_query: Bool
+  cy_depth: Int         # no-cycle: maxDepth (-1 unbounded), ignoreTypes
+  cy_types: Bool
 
 fn new_ic() -> Ic:
-  return Ic(false, -1, false, false, [], [], [], [], false)
+  return Ic(false, -1, false, false, [], [], [], [], false, false, false, -1, true)
 
 fn graph_rules() -> [Int]:
-  return [lmeta.M_IMPORT_NO_SELF_IMPORT, lmeta.M_IMPORT_DEFAULT, lmeta.M_IMPORT_NAMED, lmeta.M_IMPORT_NAMESPACE, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT_MEMBER, lmeta.M_IMPORT_EXTENSIONS]
+  return [lmeta.M_IMPORT_NO_SELF_IMPORT, lmeta.M_IMPORT_DEFAULT, lmeta.M_IMPORT_NAMED, lmeta.M_IMPORT_NAMESPACE, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT_MEMBER, lmeta.M_IMPORT_EXTENSIONS, lmeta.M_IMPORT_NO_DUPLICATES, lmeta.M_IMPORT_NO_CYCLE]
 
 fn any_on(sev: [Int]) -> Bool:
   for m in graph_rules():
@@ -107,6 +111,20 @@ fn setup(var l: L, sev: [Int], opts: [Str]):
     var js = lconf.Json([], "", "")
     let o = rmore.first_obj(opts[lmeta.M_IMPORT_NAMESPACE], &js)
     c.ns_computed = rmore.obool(js, o, "allowComputed", false)
+  if sev[lmeta.M_IMPORT_NO_DUPLICATES] > 0:
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_IMPORT_NO_DUPLICATES], &js)
+    c.nd_inline = rmore.obool(js, o, "preferInline", rmore.obool(js, o, "prefer-inline", false))
+    c.nd_query = rmore.obool(js, o, "considerQueryString", false)
+  if sev[lmeta.M_IMPORT_NO_CYCLE] > 0:
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_IMPORT_NO_CYCLE], &js)
+    c.cy_types = rmore.obool(js, o, "ignoreTypes", true)
+    if o >= 0:
+      let d = lconf.get(js, o, "maxDepth")
+      if d >= 0 and js.v[d].k == lconf.J_NUM:
+        let f = float(js.v[d].s) else -1.0
+        if f >= 0.0 and f < 4294967295.0: c.cy_depth = int(f)
   l.mc.ic = c
 
 # Rust's {:?} of a string
@@ -168,6 +186,8 @@ fn file_end(var l: L, g: Graph, root: Int, path: Str):
   if on(l, lmeta.M_IMPORT_NAMESPACE): namespace(&l, &q, g, ri)
   if on(l, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT): named_as_default(&l, &q, g, ri)
   if on(l, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT_MEMBER): named_as_default_member(&l, &q, g, ri)
+  if on(l, lmeta.M_IMPORT_NO_DUPLICATES): no_duplicates(&l, &q, g, ri, root)
+  if on(l, lmeta.M_IMPORT_NO_CYCLE): no_cycle(&l, &q, g, ri)
   if on(l, lmeta.M_IMPORT_EXTENSIONS):
     extensions(&l, &q, g, ri)
     extension_requires(&l, g, ri)
@@ -583,3 +603,573 @@ fn extension_requires(var l: L, g: Graph, ri: Int):
       if k(l, a) != ast.N_STR: continue
       var q = Seq(1000000 + l.t.nd[n].pos)
       ext_check(&l, &q, g, ri, name_of(l, a), l.t.nd[n].pos, l.t.nd[n].end, false, true)
+
+# ---- import(no-duplicates)
+
+# the import declaration with this statement span (-1 none)
+fn decl_at(l: L, root: Int, ss: Int) -> Int:
+  for x in ast.items(l.t, root):
+    if l.t.nd[x].k == ast.N_IMPORT and l.t.nd[x].pos == ss: return x
+  return -1
+
+fn skip_ws_comments(src: Str, i0: Int, e: Int) -> Int:
+  var i = i0
+  while i < e:
+    let c = src[i]
+    if c == ' ' or c == '\t' or c == '\n' or c == '\r': i += 1
+    elif c == '/' and i + 1 < e and src[i + 1] == '/':
+      while i < e and src[i] != '\n': i += 1
+    elif c == '/' and i + 1 < e and src[i + 1] == '*':
+      let j = src.find("*/", i + 2)
+      if j < 0 or j + 2 > e: return e
+      i = j + 2
+    else: return i
+  return i
+
+fn word_at(src: Str, i0: Int, e: Int) -> Str:
+  var i = i0
+  while i < e and (src[i] == '_' or src[i] == '$' or src[i] >= 0x80 or (src[i] >= 'a' and src[i] <= 'z') or (src[i] >= 'A' and src[i] <= 'Z') or (src[i] >= '0' and src[i] <= '9')): i += 1
+  return src[i0..i]
+
+fn quoted_at(src: Str, i0: Int, e: Int) -> Str:
+  let qc = src[i0]
+  var i = i0 + 1
+  while i < e and src[i] != qc:
+    if src[i] == '\\': i += 1
+    i += 1
+  return src[i0 + 1..min(i, e)]
+
+# the declaration's with clause: "\0" for none, else its entries (key, value) sorted, joined
+fn attrs_of(l: L, d: Int) -> Str:
+  let so = l.t.nd[d].a
+  let e = l.t.nd[d].end
+  var i = skip_ws_comments(l.src, l.t.nd[so].end, e)
+  let w = word_at(l.src, i, e)
+  if w != "with" and w != "assert": return "\0"
+  i = skip_ws_comments(l.src, i + w.len, e)
+  if i >= e or l.src[i] != '{': return "\0"
+  i += 1
+  var ps: [Str] = []
+  while true:
+    i = skip_ws_comments(l.src, i, e)
+    if i >= e or l.src[i] == '}': break
+    var key = ""
+    if l.src[i] == '"' or l.src[i] == '\'':
+      key = quoted_at(l.src, i, e)
+      i += key.len + 2
+    else:
+      key = word_at(l.src, i, e)
+      if key == "": break
+      i += key.len
+    i = skip_ws_comments(l.src, i, e)
+    if i >= e or l.src[i] != ':': break
+    i = skip_ws_comments(l.src, i + 1, e)
+    if i >= e or (l.src[i] != '"' and l.src[i] != '\''): break
+    let v = quoted_at(l.src, i, e)
+    i += v.len + 2
+    ps.push(key + "\0" + v)
+    i = skip_ws_comments(l.src, i, e)
+    if i < e and l.src[i] == ',': i += 1
+  ps.sort()
+  return chr(1).join(ps)
+
+fn nd_decl_named(l: L, d: Int) -> Bool:
+  let sp = l.t.nd[d].d
+  return sp > 0 and ast.items(l.t, sp).len > 0
+
+fn nd_decl_ns(l: L, d: Int) -> Bool:
+  return l.t.nd[d].c > 0
+
+fn nd_default(l: L, d: Int) -> Str:
+  let b = l.t.nd[d].b
+  if b > 0: return name_of(l, b)
+  return "\0"
+
+fn nl_count(s: Str) -> Int:
+  return s.count("\n")
+
+fn problematic_comments(l: L, cs: [Int], d: Int) -> Bool:
+  let s = l.t.nd[d].pos
+  let e = l.t.nd[d].end
+  var before = -1
+  var after = -1
+  var i = 0
+  while i + 1 < cs.len:
+    if cs[i + 1] <= s and (before < 0 or cs[i + 1] > cs[before + 1]): before = i
+    if cs[i] >= e and (after < 0 or cs[i] < cs[after]): after = i
+    i += 2
+  if before >= 0 and nl_count(l.src[cs[before + 1]..s]) <= 1: return true
+  if after >= 0 and nl_count(l.src[e..cs[after]]) == 0: return true
+  let ob = rmore3.next_token_cs(l, cs, s, e, "{{")
+  let cb = rmore3.next_token_cs(l, cs, s, e, "}}")
+  i = 0
+  while i + 1 < cs.len:
+    if cs[i] > s and cs[i + 1] < e:
+      if ob < 0 or cb < 0: return true
+      if cs[i + 1] <= ob or cs[i] >= cb: return true
+    i += 2
+  return false
+
+fn line_comment_end(t: Str) -> Bool:
+  var j = t.len - 1
+  while j >= 0 and t[j] != '\n': j -= 1
+  return t[j + 1..t.len].find("//") >= 0
+
+fn strip_inline_ws(t: Str) -> Str:
+  var i = 0
+  while i < t.len and (t[i] == ' ' or t[i] == '\t' or t[i] == '\r' or t[i] == 0x0B or t[i] == 0x0C): i += 1
+  return t[i..t.len]
+
+type Ed:
+  s: Int
+  e: Int
+  t: Str
+
+# merge_imports_fix: the edits (none: no fix)
+fn merge_fix(l: L, cs: [Int], inline: Bool, decls: [Int]) -> [Ed]:
+  var out: [Ed] = []
+  let first = decls[0]
+  let fsrc = name_of(l, l.t.nd[first].a)
+  for d in decls:
+    if name_of(l, l.t.nd[d].a) != fsrc or attrs_of(l, d) != "\0": return []
+  if nd_decl_ns(l, first) or problematic_comments(l, cs, first): return []
+  var dnames: [Str] = []
+  for d in decls:
+    let dn = nd_default(l, d)
+    if dn != "\0" and not (dn in dnames): dnames.push(dn)
+  if dnames.len > 1: return []
+  var mergeable: [Int] = []
+  for i in 1..decls.len:
+    let d = decls[i]
+    if not nd_decl_ns(l, d) and not problematic_comments(l, cs, d): mergeable.push(d)
+  # specifiers to merge: (decl, identifiers, empty, type)
+  var sp_d: [Int] = []
+  var sp_ids: [[Str]] = []
+  var sp_empty: [Bool] = []
+  var sp_type: [Bool] = []
+  for d in mergeable:
+    let o = rmore3.next_token_cs(l, cs, l.t.nd[d].pos, l.t.nd[d].end, "{{")
+    let c = rmore3.next_token_cs(l, cs, l.t.nd[d].pos, l.t.nd[d].end, "}}")
+    if o < 0 or c < 0: continue
+    if c < o + 1: continue
+    sp_d.push(d)
+    sp_ids.push(l.src[o + 1..c].split(","))
+    sp_empty.push(not nd_decl_named(l, d))
+    sp_type.push((l.t.nd[d].f & ast.M_TYPEONLY) != 0)
+  var unnecessary: [Int] = []
+  for d in mergeable:
+    if not nd_decl_named(l, d) and not nd_decl_ns(l, d) and not (d in sp_d): unnecessary.push(d)
+  let add_default = nd_default(l, first) == "\0" and dnames.len == 1
+  let add_specs = sp_d.len > 0
+  if not (add_default or add_specs or unnecessary.len > 0): return []
+  let fs = l.t.nd[first].pos
+  let fe = l.t.nd[first].end
+  let ob = rmore3.next_token_cs(l, cs, fs, fe, "{{")
+  var cb = -1
+  if ob >= 0: cb = rmore3.next_token_cs(l, cs, ob + 1, fe, "}}")
+  let kw_end = fs + 6
+  let first_empty = not nd_decl_named(l, first)
+  var content = ""
+  if ob >= 0 and cb >= 0: content = l.src[ob + 1..cb]
+  let trailing_comma = not first_empty and content.rstrip().endswith(",")
+  var existing: [Str] = []
+  if not first_empty:
+    for id in content.split(","): existing.push(id.strip())
+  let ftype = (l.t.nd[first].f & ast.M_TYPEONLY) != 0
+  var inline_types = inline or not ftype
+  for t in sp_type:
+    if not t: inline_types = true
+  # build_specifiers_text
+  var text = ""
+  var needs_comma = not trailing_comma and not first_empty
+  for si in 0..sp_d.len:
+    var st = ""
+    for cur in sp_ids[si]:
+      let trimmed = cur.strip()
+      if trimmed == "": continue
+      var wt = ""
+      if inline_types and sp_type[si]:
+        if line_comment_end(trimmed): wt = "type " + trimmed + "\n"
+        else: wt = "type " + trimmed
+      elif line_comment_end(trimmed): wt = trimmed + "\n"
+      elif cur.find("\n") >= 0: wt = strip_inline_ws(cur.rstrip())
+      else: wt = trimmed + ""
+      if trimmed in existing: continue
+      existing.push(trimmed + "")
+      if st == "": st = wt
+      else: st = st + "," + wt
+    if needs_comma and not sp_empty[si] and st != "": text += ","
+    text += st
+    if not sp_empty[si]: needs_comma = true
+  if add_specs and inline_types and ftype:
+    let tp = rmore3.next_token_cs(l, cs, fs, fe, "type")
+    if tp >= 0:
+      var te = tp + 4
+      if te < l.src.len and l.src[te] == ' ': te += 1
+      out.push(Ed(tp, te, ""))
+    let fsp = l.t.nd[first].d
+    if fsp > 0:
+      for x in ast.items(l.t, fsp): out.push(Ed(l.t.nd[x].pos, l.t.nd[x].pos, "type "))
+  var dn = ""
+  if dnames.len > 0: dn = dnames[0]
+  if add_default and ob < 0 and add_specs:
+    out.push(Ed(kw_end, kw_end, " {dn}, {{{text}}} from"))
+  elif add_default and ob < 0:
+    out.push(Ed(kw_end, kw_end, " {dn} from"))
+  elif add_default and ob >= 0 and cb >= 0:
+    out.push(Ed(kw_end, kw_end, " {dn},"))
+    if add_specs: out.push(into_braces(l, ob, cb, text))
+  elif not add_default and ob < 0 and add_specs:
+    let b = l.t.nd[first].b
+    if b <= 0 and l.t.nd[first].c <= 0 and not nd_decl_named(l, first):
+      out.push(Ed(kw_end, kw_end, " {{{text}}} from"))
+    elif b > 0:
+      out.push(Ed(l.t.nd[b].end, l.t.nd[b].end, ", {{{text}}}"))
+  elif not add_default and ob >= 0 and cb >= 0:
+    out.push(into_braces(l, ob, cb, text))
+  for d in sp_d: out.push(removal(l, d))
+  for d in unnecessary: out.push(removal(l, d))
+  return out
+
+fn into_braces(l: L, o: Int, c: Int, text: Str) -> Ed:
+  let content = l.src[o + 1..c]
+  let tw = content.len - content.rstrip().len
+  if content.strip() == "": return Ed(o + 1, c, text)
+  if tw > 0: return Ed(c - tw, c + 1, text + content[content.len - tw..content.len] + "}}")
+  return Ed(c, c, text)
+
+fn removal(l: L, d: Int) -> Ed:
+  var e = l.t.nd[d].end
+  if e < l.src.len and l.src[e] == '\n': e += 1
+  return Ed(l.t.nd[d].pos, e, "")
+
+# the edits merged into one (fs -1: none, or overlapping)
+fn merge_edits(l: L, own es: [Ed]) -> Ed:
+  if es.len == 0: return Ed(-1, 0, "")
+  if es.len == 1: return Ed(es[0].s, es[0].e, es[0].t + "")
+  es.sort(by: fn(a, b) => a.s < b.s or (a.s == b.s and a.e < b.e))
+  let start = es[0].s
+  var last = start
+  var out = ""
+  for x in es:
+    if x.s > x.e or last > x.s: return Ed(-1, 0, "")
+    out += l.src[last..x.s] + x.t
+    last = x.e
+  return Ed(start, last, out)
+
+fn nd_check(var l: L, var q: Seq, root: Int, inline: Bool, ms: [Int], r: Rec):
+  # ms: requested module entries (indexes into re_*)
+  if ms.len <= 1: return
+  let s0 = r.re_s[ms[0]]
+  let e0 = r.re_e[ms[0]]
+  let mname = l.src[s0..e0].strip("'").strip("\"")
+  var msg = "Module '{mname}' is imported more than once in this file"
+  if mname.len > 16: msg = "Modules should not be imported multiple times in the same file"
+  diag(&l, &q, s0, e0, "import(no-duplicates)", msg, "Merge these imports into a single import statement")
+  rules.label(&l, e0, "It is first imported here")
+  rules.primary(&l)
+  for i in 1..ms.len: rules.more(&l, r.re_s[ms[i]], r.re_e[ms[i]], "", false)
+  var decls: [Int] = []
+  for m in ms:
+    let d = decl_at(l, root, r.re_ss[m])
+    if d >= 0: decls.push(d)
+  if decls.len != ms.len: return
+  let cs = rjest.all_comments(l)
+  let f = merge_edits(l, merge_fix(l, cs, inline, decls))
+  if f.s < 0: return
+  let i = l.ds.len - 1
+  l.ds[i].fs = f.s
+  l.ds[i].fe = f.e
+  l.ds[i].ft = f.t
+  l.ds[i].fk = 1
+
+fn no_duplicates(var l: L, var q: Seq, g: Graph, ri: Int, root: Int):
+  let r = g.recs[ri]
+  let inline = l.mc.ic.nd_inline
+  let order = request_order(r)
+  var keys: [Str] = []
+  for j in order:
+    var key = r.rq[j] + ""
+    let x = r.rq_res[j]
+    if x >= 0 and g.recs[x].ok: key = g.recs[x].path + ""
+    if l.mc.ic.nd_query:
+      let qp = r.rq[j].find("?")
+      if qp >= 0: key = key + r.rq[j][qp..r.rq[j].len]
+    keys.push(key)
+  var gi = 0
+  while gi < order.len:
+    var gj = gi + 1
+    while gj < order.len and keys[gj] == keys[gi]: gj += 1
+    # the group's import requests, in order
+    var ms: [Int] = []
+    for t in gi..gj:
+      for e in 0..r.re_n.len:
+        if r.re_n[e] == order[t] and (r.re_f[e] & 2) != 0: ms.push(e)
+    gi = gj
+    if ms.len <= 1: continue
+    # by attributes, sorted
+    var akeys: [Str] = []
+    for m in ms:
+      let d = decl_at(l, root, r.re_ss[m])
+      var ak = ""
+      if d >= 0:
+        ak = attrs_of(l, d)
+        if ak == "\0": ak = ""
+      if not (ak in akeys): akeys.push(ak)
+    akeys.sort()
+    for ak in akeys:
+      var maps: [[Int]] = [[], [], [], []]
+      var k0_side: [Int] = []
+      var k0_type: [Int] = []
+      var k0_runtime = false
+      for m in ms:
+        let d = decl_at(l, root, r.re_ss[m])
+        var mk = ""
+        if d >= 0:
+          mk = attrs_of(l, d)
+          if mk == "\0": mk = ""
+        if mk != ak: continue
+        let mtype = (r.re_f[m] & 1) != 0
+        var ents: [Int] = []
+        for x in 0..r.ie_n.len:
+          if r.ie_ss[x] == r.re_ss[m] and r.ie_n[x] == r.re_n[m]: ents.push(x)
+        if ents.len == 0:
+          var key = 0
+          if mtype and not inline: key = 1
+          maps[key].push(m)
+          if key == 0:
+            if mtype: k0_type.push(m)
+            else: k0_side.push(m)
+          continue
+        var flags = [true, true, true, true]
+        var to0 = false
+        for x in ents:
+          var key = 0
+          if r.ie_t[x]:
+            if r.ie_k[x] == 0:
+              if not inline: key = 1
+            elif r.ie_k[x] == 1: key = 2
+            else: key = 3
+          elif r.ie_k[x] == 1: key = 2
+          if flags[key]:
+            flags[key] = false
+            maps[key].push(m)
+            if key == 0: to0 = true
+        if to0:
+          if mtype: k0_type.push(m)
+          else: k0_runtime = true
+      for i in 0..4:
+        if i == 0 and not k0_runtime:
+          nd_check(&l, &q, root, inline, k0_side, r)
+          nd_check(&l, &q, root, inline, k0_type, r)
+          continue
+        nd_check(&l, &q, root, inline, maps[i], r)
+
+# ---- import(no-cycle)
+
+# loaded_modules of record ri: request indexes sorted by specifier
+fn loaded_sorted(g: Graph, ri: Int) -> [Int]:
+  var out: [Int] = []
+  let r = g.recs[ri]
+  for j in 0..r.rq.len:
+    let x = r.rq_res[j]
+    if x >= 0 and g.recs[x].ok: out.push(j)
+  out.sort(by: fn(a, b) => r.rq[a] < r.rq[b])
+  return out
+
+fn has_node_modules(p: Str) -> Bool:
+  return p.startswith("node_modules/") or p.find("/node_modules/") >= 0 or p.endswith("/node_modules") or p == "node_modules"
+
+# should_traverse_module: request j of record pi
+fn cy_traverse(g: Graph, types: Bool, pi: Int, j: Int) -> Bool:
+  let p = g.recs[pi]
+  let x = p.rq_res[j]
+  let m = g.recs[x]
+  if has_node_modules(m.path): return false
+  if types:
+    var any = false
+    var all = true
+    for e in 0..p.ie_n.len:
+      if p.ie_n[e] == j:
+        any = true
+        if not p.ie_t[e]: all = false
+    for e in 0..p.ind_rq.len:
+      if p.ind_rq[e] == j:
+        any = true
+        if not p.ind_t[e]: all = false
+    if any and all: return false
+  if m.path == p.path:
+    let key = p.rq[j]
+    for e in 0..m.ind_rq.len:
+      if m.ind_rq[e] >= 0 and m.rq[m.ind_rq[e]] == key:
+        return m.ind_ek[e] != 0
+  return true
+
+# the edges the rule follows, and their strongly connected components (Tarjan's, iteratively):
+# can_be_in_cycle is a record in a component with a cycle
+fn cycle_components(var g: Graph):
+  g.scc = []
+  g.cyc = []
+  for ti in 0..2:
+    let types = ti == 1
+    let n = g.recs.len
+    var adj: [[Int]] = []
+    var selfl: [Bool] = []
+    for i in 0..n:
+      var es: [Int] = []
+      var sl = false
+      if g.recs[i].ok:
+        for j in 0..g.recs[i].rq.len:
+          let x = g.recs[i].rq_res[j]
+          if x < 0 or not g.recs[x].ok: continue
+          if not cy_traverse(g, types, i, j): continue
+          if x == i: sl = true
+          es.push(x)
+      adj.push(es)
+      selfl.push(sl)
+    var index: [Int] = []
+    var low: [Int] = []
+    var on: [Bool] = []
+    var comp: [Int] = []
+    for i in 0..n:
+      index.push(-1)
+      low.push(0)
+      on.push(false)
+      comp.push(-1)
+    var st: [Int] = []
+    var counter = 0
+    var ncomp = 0
+    var csize: [Int] = []
+    for v0 in 0..n:
+      if index[v0] >= 0: continue
+      var cs: [Int] = [v0]      # call stack: node, next edge
+      var ce: [Int] = [0]
+      index[v0] = counter
+      low[v0] = counter
+      counter += 1
+      st.push(v0)
+      on[v0] = true
+      while cs.len > 0:
+        let v = cs[cs.len - 1]
+        let ei = ce[ce.len - 1]
+        if ei < adj[v].len:
+          ce[ce.len - 1] = ei + 1
+          let w = adj[v][ei]
+          if index[w] < 0:
+            index[w] = counter
+            low[w] = counter
+            counter += 1
+            st.push(w)
+            on[w] = true
+            cs.push(w)
+            ce.push(0)
+          elif on[w] and index[w] < low[v]: low[v] = index[w]
+        else:
+          if low[v] == index[v]:
+            var size = 0
+            while true:
+              let w = st.pop()
+              on[w] = false
+              comp[w] = ncomp
+              size += 1
+              if w == v: break
+            csize.push(size)
+            ncomp += 1
+          let _ = cs.pop()
+          let _ = ce.pop()
+          if cs.len > 0:
+            let u = cs[cs.len - 1]
+            if low[v] < low[u]: low[u] = low[v]
+    var cyc: [Bool] = []
+    for i in 0..n: cyc.push(comp[i] >= 0 and (csize[comp[i]] > 1 or selfl[i]))
+    g.scc.push(comp)
+    g.cyc.push(cyc)
+
+type Cv:
+  traversed: {Str: Bool}
+  depth: Int
+  max: Int          # (-1 unbounded)
+  stack: [Int]      # (record, request) pairs entered
+  found: Bool
+  stop: Bool
+
+fn cy_visit(g: Graph, types: Bool, var v: Cv, mi: Int, needle: Str, comp: Int):
+  var ti = 0
+  if types: ti = 1
+  for j in loaded_sorted(g, mi):
+    if v.max >= 0 and v.depth > v.max:
+      v.stop = true
+      return
+    let x = g.recs[mi].rq_res[j]
+    # (unbounded: what can't reach the file can't change the answer or the path found)
+    if v.max < 0 and g.scc[ti][x] != comp: continue
+    if not cy_traverse(g, types, mi, j): continue
+    let path = g.recs[x].path
+    if path in v.traversed: continue
+    v.traversed[path + ""] = true
+    v.depth += 1
+    v.stack.push(mi)
+    v.stack.push(j)
+    if path == needle:
+      v.found = true
+      v.stop = true
+      return
+    cy_visit(g, types, &v, x, needle, comp)
+    if v.stop: return
+    let _ = v.stack.pop()
+    let _ = v.stack.pop()
+    v.depth -= 1
+
+fn rel_path(g: Graph, p: Str) -> Str:
+  if g.cwd != "" and p.startswith(g.cwd + "/"): return p[g.cwd.len + 1..p.len]
+  if p == g.cwd: return ""
+  return p
+
+fn no_cycle(var l: L, var q: Seq, g: Graph, ri: Int):
+  let types = l.mc.ic.cy_types
+  let maxd = l.mc.ic.cy_depth
+  var ti = 0
+  if types: ti = 1
+  if g.scc.len < 2: return
+  if maxd < 0 and not g.cyc[ti][ri]: return
+  let comp = g.scc[ti][ri]
+  let r = g.recs[ri]
+  let needle = r.path
+  for j in loaded_sorted(g, ri):
+    if not cy_traverse(g, types, ri, j): continue
+    # (the first request entry of this specifier)
+    var e0 = -1
+    for e in 0..r.re_n.len:
+      if r.re_n[e] == j:
+        e0 = e
+        break
+    if e0 < 0: continue
+    let s = r.re_s[e0]
+    let e = r.re_e[e0]
+    let x = r.rq_res[j]
+    if g.recs[x].path == needle:
+      var help = "Remove the self-referencing export and consider using a named export instead."
+      if (r.re_f[e0] & 2) != 0: help = "Remove the self-referencing import."
+      diag(&l, &q, s, e, "import(no-cycle)", "Dependency cycle detected", help)
+      rules.label(&l, e, "this module references itself")
+      rules.primary(&l)
+      continue
+    var md = -1
+    if maxd >= 0:
+      md = maxd - 1
+      if md < 0: md = 0
+    if md < 0 and g.scc[ti][x] != comp: continue
+    var v = Cv({}, 0, md, [], false, false)
+    cy_visit(g, types, &v, x, needle, comp)
+    if not v.found: continue
+    var lines = "╭──▶ {r.rq[j]} ({rel_path(g, g.recs[x].path)})"
+    var i = 0
+    while i + 1 < v.stack.len:
+      let pm = v.stack[i]
+      let pj = v.stack[i + 1]
+      let y = g.recs[pm].rq_res[pj]
+      lines += "\n│         ⬇ imports\n│    {g.recs[pm].rq[pj]} ({rel_path(g, g.recs[y].path)})"
+      i += 2
+    lines += "\n╰─────────╯ imports the current file"
+    diag(&l, &q, s, e, "import(no-cycle)", "Dependency cycle detected", "Refactor to remove the cycle. Consider extracting shared code into a separate module that both files can import.")
+    rules.note(&l, "These paths form a cycle:\n" + lines)

@@ -166,7 +166,26 @@ and in the restart round: `no-useless-constructor`, `no-unexpected-multiline`, `
 `role-has-required-aria-props`, `role-supports-aria-props`, `heading-has-content`,
 `anchor-has-content`, `mouse-events-have-key-events` (with the plugin's `polymorphicPropName` and
 `components` settings, and oxc's role and ARIA tables). Each comes with its options, oxc's messages,
-spans, labels, fixes (and their kinds) and order. All 61 type-aware rules through tsgolint. A rule
+spans, labels, fixes (and their kinds) and order. Added in the latest round: the import
+plugin's rules that read the module graph (`import/namespace`, `default`, `named`,
+`no-self-import`, `no-named-as-default`, `no-named-as-default-member`, `extensions`,
+`no-duplicates`, `no-cycle`; see "The module graph" below); 21 jest/vitest rules that run on test
+calls (`rjest.vu`: `no-focused-tests`, `no-disabled-tests`, `valid-describe-callback`,
+`valid-expect`, `no-standalone-expect`, `expect-expect`, `valid-title`, `no-conditional-expect`,
+`require-to-throw-message`, `prefer-snapshot-hint`, `no-identical-title`,
+`no-commented-out-tests`, `valid-expect-in-promise`, and vitest's `warn-todo`,
+`no-conditional-tests`, `require-local-test-context-for-concurrent-snapshots`,
+`require-awaited-expect-poll`, `hoisted-apis-on-top`, `require-mock-type-parameters`), with
+oxc's `parse_jest_fn_call` and its list of possible jest calls; 18 more jsx-a11y rules
+(`ra11y2.vu`: all but `lang` and `anchor-ambiguous-text`); and `no-implied-eval` (with oxlint's
+env globals, `lglobals.vu`, generated from the `javascript-globals` crate), `no-useless-call`,
+`no-await-in-loop`, `preserve-caught-error`, `block-scoped-var`, `no-throw-literal`,
+`no-new-wrappers`; `promise/valid-params`, `no-new-statics`; `unicorn/` `prefer-add-event-listener`,
+`prefer-array-flat-map`, `no-confusing-array-with`, `no-instanceof-array`, `prefer-string-slice`,
+`prefer-date-now`; `import/` `no-absolute-path`, `no-empty-named-blocks`, `no-unassigned-import`;
+`react/` `jsx-no-script-url`, `no-namespace`, `iframe-missing-sandbox`, `style-prop-object`;
+`node/no-exports-assign`; `oxc/no-async-endpoint-handlers` (`rmore3.vu`, `rmore4.vu`). All 61
+type-aware rules through tsgolint. A rule
 vlint doesn't have is accepted in the configuration and reports nothing. The rules added in these
 rounds are in `rhooks.vu` (exhaustive-deps), `rmore.vu`, `rmore2.vu` and `ra11y.vu`; each runs only
 when the configuration turns it on.
@@ -185,14 +204,29 @@ same span sorted inner first); all fixed.
 
 **Coverage of real configurations** (the 1,830 `.oxlintrc.json` files collected from GitHub in an
 earlier round, `vlint4-work/cov.py` and `cov2.py`): of the rules those files turn on by name
-(12,227 enables, type-aware ones counted as covered), vlint now has 64.3% (58.4% at the start of
-the previous round); counting the rules their categories and plugins turn on as well (233,108
-enables, type-aware excluded), 79.3% (74.8%). The largest missing share is the React Compiler
-rules (about 1,030 enables each, 12,300 together), then `import/namespace` and `import/default`
-(which need the module graph), the rest of jsx-a11y (20 rules, about 2,800), the jest/vitest rules
-that run on test calls (`expect-expect`, `valid-expect`, ...; about 2,400), and eslint's
-`preserve-caught-error`, `block-scoped-var`, `no-implied-eval`, `no-unmodified-loop-condition`
-and `no-shadow` (about 320 each).
+(12,227 enables, type-aware ones counted as covered), vlint now has 70.2% (64.3% at the start of
+the latest round); counting the rules their categories and plugins turn on as well (233,108
+enables, type-aware excluded), 84.0% (79.3%). The largest missing share is the React Compiler
+rules (about 1,030 enables each, 12,300 together), then `no-unmodified-loop-condition` (314),
+`no-shadow` (265), `unicorn/consistent-function-scoping` (202), `prefer-array-find` (194),
+`prefer-set-has` (193), `oxc/no-accumulating-spread` (178), `typescript/consistent-type-imports`
+(165), `no-fallthrough` and `promise/no-callback-in-promise` (156 each), `jsx-a11y/lang` (145),
+and the vue plugin (about 35 rules enabled by about 116 configs each).
+
+**The module graph** (`lmod.vu`, `lresolve.vu`, `rimport.vu`): when a rule that reads it is on,
+vlint builds the graph oxlint builds before linting: every linted file's module record (as oxc's
+`ModuleRecordBuilder` makes it: requested modules, import entries, local, indirect and star
+exports, exported bindings, `export default`, module syntax), each request resolved as oxlint
+configures `oxc_resolver` (extensions `.js .mjs .cjs .jsx .ts .mts .cts .tsx`, main fields
+`module` and `main`, the `module`/`import`/`default` conditions, extension aliases, and the
+tsconfig that includes the importing file: `paths`, `baseUrl`, `extends` including packages,
+`references`; an `extends` that can't be found makes every request of the files it covers
+unresolved, as `oxc_resolver` does), and the records of what they load, transitively and in
+parallel. The rules that iterate oxc's `FxHashMap` of requested modules emulate its order (two
+maps: the parser's, then the collected one). `no-cycle` finds the components with a cycle once per
+run (Tarjan's algorithm), so files outside one cost nothing, and then walks the graph as oxc's
+`ModuleGraphVisitor` does (sorted keys, one traversed set, `maxDepth`), so the path in the note is
+oxc's.
 
 `react-hooks/exhaustive-deps` follows oxc's port closely, including the order of the names in
 "missing dependencies: 'a', 'b', and 'c'" and of the diagnostics of one call: oxc keeps
@@ -216,12 +250,20 @@ categories, env, globals and settings maps.
   compiler bails out on (unsupported syntax, an `eslint-disable` of the hooks rules, `"use no
   memo"`) reports nothing. A port is roughly 35,000 to 45,000 lines of Vu. A syntactic
   approximation was considered and not shipped: it would trade missing diagnostics for wrong ones.
-- The other ~620 non-default rules: missing (jsx-a11y, the rest of import, jest/vitest, most of
-  unicorn's and eslint's pedantic and style rules). On kimi-code (which turns on pedantic, perf,
-  vitest, import) vlint now finds 9,021 of oxlint's 10,599 diagnostics (435 two rounds ago), with
-  none extra and the order identical; the rest are mostly `import/extensions` (568), the vitest
-  rules that run on test calls (`no-conditional-expect` 190, `require-to-throw-message` 185,
-  `expect-expect` 153) and `unicorn/prefer-single-call` (169).
+- The other ~540 non-default rules: missing (the vue plugin, nextjs, the rest of import's
+  syntactic rules, jest/vitest style rules, most of unicorn's and eslint's pedantic and style
+  rules). On kimi-code (which turns on pedantic, perf, vitest, import) vlint now finds 10,185 of
+  oxlint's 10,599 diagnostics (9,021 at the start of the latest round, 435 three rounds ago), with
+  none extra and the order identical; the rest are `unicorn/prefer-single-call` (169),
+  `explicit-length-check` (54), `no-promise-executor-return` (32), `prefer-string-replace-all`
+  (25), `prefer-at` (24), `prefer-top-level-await` (21) and 22 other rules with fewer.
+- `jsx-a11y/lang` (needs the IANA language subtag registry) and `jsx-a11y/anchor-ambiguous-text`
+  (13 enables): missing.
+- `prefer-snapshot-hint`'s diagnostics in two excalidraw files come out in another order: oxc groups
+  snapshot calls in an `FxHashMap` keyed by its own node ids, which vlint doesn't number the same.
+- The module graph covers files whose whole text is JavaScript or TypeScript (`.vue`, `.svelte` and
+  `.astro` sections are not read as records), and a lone surrogate in an import name (`\uD800`)
+  is shown as U+FFFD where oxc shows the escape.
 - Fixes not yet ported: the suggestions of `no-unused-vars`, `no-new-array` and
   `no-extra-boolean-cast` (so `--fix-suggestions`/`--fix-dangerously` leave those), and the fix of
   `no-negated-condition` (`--fix` leaves it).
@@ -230,7 +272,9 @@ categories, env, globals and settings maps.
   installed one is refused. Running them needs an ESTree view of vlint's tree (every node type with
   ranges and `loc`, tokens and comments), oxlint's plugin context (`report` with messages, message
   ids, data, fixes and suggestions; `sourceCode` with its scope manager), selectors and `:exit`
-  visitors, run in a Node process as vknip runs JavaScript configs: not done.
+  visitors, run in a Node process as vknip runs JavaScript configs: not done. This is the largest
+  drop-in gap after the React Compiler rules: 190 of the 2,559 collected config files (about 10%)
+  name a JS plugin, and vlint refuses those configurations.
 - Parse errors: on oxc's own fixtures (`tasks/coverage/misc`, 257 failing and 112 passing files)
   vlint's output is identical for 109 of 369 (102 before this round). vlint reports only the first
   syntax error, in TypeScript's wording under the code `vlint(parse)` where it doesn't know oxc's
@@ -267,7 +311,10 @@ categories, env, globals and settings maps.
 | excalidraw, mantine, kimi-code, preact | `react/only-export-components`, defaults and every option | 3,059 and 958 diagnostics, all identical; 7 attack files identical |
 | excalidraw, mantine, preact, Tracearr, kimi-code, next-shadcn-dashboard-starter | the 16 jsx-a11y rules | 145 diagnostics, all identical; attack files with and without options and settings identical, fixes included |
 | lc, kimi-code | three configurations whose overrides add plugins and rules | every file's order identical for every rule whose diagnostics match |
-| kimi-code | its own configuration | 9,021 of oxlint's 10,599 diagnostics, none extra, order identical |
+| kimi-code | its own configuration | 10,185 of oxlint's 10,599 diagnostics, none extra, order identical (9,021 at the start of the latest round) |
+| oxc's own test cases of the rules added in the latest round | defaults and every option configuration in the tests | jest/vitest 2,357, jsx-a11y 3,875, the others about 700: identical except parse-error wording, with `--fix`, `--fix-suggestions`, `--fix-dangerously` |
+| oxc's import fixtures (`tasks/coverage` import plugin fixtures) | the graph rules | 72 / 74 files (a lone surrogate, a parse error) |
+| lc, preact, excalidraw, mantine, the 15 real projects | each rule added in the latest round on its own | all identical (2,922 `block-scoped-var` on lc, 526 `no-cycle` in excalidraw and 145 in OpenFrontIO with their notes, 568 `import/extensions` and 61 `no-duplicates` in kimi-code; `no-duplicates` fixes identical) except `prefer-snapshot-hint`'s order in 2 excalidraw files |
 | `--print-config` | 15 real projects, 8 configs | 22 / 23 identical (the 23rd uses a JS plugin) |
 | suppressions | a 21-step scenario, all output formats | identical except `-f sarif` |
 | zod, `--type-aware`, 5 typed rules | | 1282 / 1285 diagnostics (tsgolint prints 3 types differently run to run) |
@@ -278,12 +325,21 @@ mcp, OpenFrontIO (type-aware), react-element-to-jsx-string, react-starter-kit,
 typescript-nextjs-starter, yak; FigmaToCode, Tracearr, difit and next-shadcn-dashboard-starter
 differ only by React Compiler diagnostics, jsx-a11y (Tracearr) and `react/no-unstable-nested-components`
 (next-shadcn-dashboard-starter); their `react-hooks/exhaustive-deps` diagnostics are now identical;
-kimi-code by rules vlint doesn't have (5,667 of 10,599 found, none extra).
+kimi-code by rules vlint doesn't have (10,185 of 10,599 found, none extra).
 
-**Speed** (lc corpus, 1 thread, user+sys CPU, best of 5, loaded 2-core VM, load average 2 to 3):
-vlint 2.28 s, oxlint 3.40 s (the previous round measured 2.28 s against 4.54 s). Instructions
-(callgrind, x86-64-v2 builds, one thread, against a build of the round's starting commit made the
-same way): zod 550.9M against 545.4M (+1.0%: the semantic checks for private names, exports and
+**Speed** (lc corpus, defaults, 1 thread, user+sys CPU, best of 5, 2-core VM, load average
+about 0.6): vlint 0.99 s, oxlint 3.83 s; the previous round's vlint takes 2.42 s on the same run.
+The difference is `scope.vu`: it kept each name's declarations in one chain across all scopes, so
+resolving a reference walked the chain once per enclosing scope, quadratic in minified bundles
+(one-letter names declared in thousands of scopes); it's now one hash table keyed by (name,
+scope, meaning), with the same answers (a 4 MB bundle in kimi-code: 4.3 s before, 0.46 s now,
+oxlint 0.28 s). kimi-code with its own configuration (import graph with `no-cycle`, vitest,
+pedantic): vlint 2.34 s CPU, oxlint 2.02 s (1.68 s against 1.61 s without the import plugin: the
+graph parses every file a second time, and the jest rules on its large test suite are the other
+big share). The previous round measured 2.28 s against 4.54 s for lc. Instructions (callgrind, x86-64-v2 builds, one thread) in the latest round: zod 543.8M against
+the round's start 550.9M (-1.3%), vscode/src/vs/editor/common 335.0M against 337.9M (-0.9%): the
+new rules' per-file tables are made only when one of them is on, and the scope table is sized
+once. The round before: zod 550.9M against 545.4M (+1.0%: the semantic checks for private names, exports and
 tagged templates, which first cost +4.7% while they walked every node and copied the text, and
 now use lists the walk fills; the per-file tables of the new rules; the `new Array(n).map` check
 on calls), vscode/src/vs/editor/common 338.0M against 335.1M (+0.9%). With only exhaustive-deps on, mantine
