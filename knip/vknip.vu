@@ -212,6 +212,9 @@ type Proj:
   links: {Str: Bool}         # the project's symbolic links (paths)
   list_links: fn(Str) -> [Str]
   realp: fn(Str) -> Str
+  node: fn(Str) -> Str       # a request to the node process that loads JavaScript configs (loader.vu)
+  node_par: fn(Str, Int) -> Str  # independent requests, spread over node processes
+  node_workers: Int          # how many (--jobs, else the cores; at most 4)
   xdev: {Int: [Str]}         # (production) development entry patterns other workspaces gave
   link_dirs: {Str: Bool}     # folder -> it's below a symbolic link
 
@@ -2241,7 +2244,8 @@ fn git_hooks_dir(p: Proj, os: Os) -> Str:
   var h = out.strip()
   if h == "" or h.startswith("fatal") or h.startswith("error"): h = ".git/hooks"
   if h.startswith("/"):
-    let pwd = os.env("PWD")
+    # (git's absolute paths have links resolved, as the working folder's realpath does)
+    let pwd = p.realp(".")
     var root = resolve.join(pwd, fspath(p, ""))
     if p.root.startswith("/"): root = resolve.norm(fspath(p, ""))
     let wroot = resolve.join(root, p.ws[p.cur].dir)
@@ -2765,12 +2769,27 @@ fn quiet_load(var p: Proj, fs: Fs, os: Os, mode: Str, f: Str) -> Value:
   let ck = mode + ":" + fspath(p, f)
   if not (ck in p.js):
     var reqs: [loader.Req] = [loader.Req(fspath(p, f), mode, load_args(p))]
-    let res = loader.load_all(fs, os, reqs, fspath(p, ""))
+    let res = loader.load_all(p.node, reqs, fspath(p, ""))
     let fk = fspath(p, f)
     p.js[ck] = json.copy(res[fk])
+  relay_output(&p, ck)
   let r = json.copy(p.js[ck])
   if json.has(r, "error"): return json.Null
   return pkg.get(r, "ok")
+
+# what a config printed while node loaded it, printed (once) where knip would load it
+fn relay_output(var p: Proj, ck: Str):
+  let o = pkg.str_of(pkg.get(p.js[ck], "out"))
+  let e = pkg.str_of(pkg.get(p.js[ck], "err"))
+  if o == "" and e == "": return
+  if o != "": write(o)
+  if e != "":
+    if e.endswith("\n"): eprint(e[0..e.len - 1])
+    else: eprint(e)
+  var m: {Str: Value} = {}
+  for k in ["ok", "error"]:
+    if json.has(p.js[ck], k): m[k] = json.copy(pkg.get(p.js[ck], k))
+  p.js[ck] = json.Obj(m)
 
 # the folder of the package.json nearest to a folder (project-relative; "\0" none)
 fn nearest_manifest_dir(p: Proj, fs: Fs, dir: Str) -> Str:
@@ -2973,9 +2992,10 @@ fn load_cfg(var p: Proj, fs: Fs, os: Os, key: Str, f: Str) -> Value:
   let ck = load_mode(key) + ":" + fspath(p, f)
   if not (ck in p.js):
     var reqs: [loader.Req] = [loader.Req(fspath(p, f), load_mode(key), load_args(p))]
-    let res = loader.load_all(fs, os, reqs, fspath(p, ""))
+    let res = loader.load_all(p.node, reqs, fspath(p, ""))
     let fk = fspath(p, f)
     p.js[ck] = json.copy(res[fk])
+  relay_output(&p, ck)
   let r = json.copy(p.js[ck])
   if json.has(r, "error"):
     if key == "next": return json.Null
@@ -2992,7 +3012,7 @@ fn cfg_yaml(var p: Proj, fs: Fs, os: Os, f: Str, text: Str) -> Value:
   let yk = "yaml:" + fspath(p, f)
   if not (yk in p.js):
     var yreqs: [loader.Req] = [loader.Req(fspath(p, f), "yaml", json.Null)]
-    let yres = loader.load_all(fs, os, yreqs, fspath(p, ""))
+    let yres = loader.load_all(p.node, yreqs, fspath(p, ""))
     let yfk = fspath(p, f)
     p.js[yk] = json.copy(yres[yfk])
   let yr = json.copy(p.js[yk])
@@ -3025,14 +3045,48 @@ fn prefetch(var p: Proj, fs: Fs, os: Os):
         reqs.push(loader.Req(fspath(p, f), load_mode(key), load_args(p)))
   p.cur = saved
   if reqs.len == 0: return
-  # (one process per mode)
+  # (a request per mode, a mode with many files in up to one part per process, the largest first;
+  # the node processes load them at the same time)
+  let workers = p.node_workers
+  var groups: [[loader.Req]] = []
   for mode in ["plain", "vite", "nuxt", "nitro", "next", "webpack", "vue", "expo", "karma", "react-router", "rsbuild", "docusaurus", "electron-forge", "electron-vite", "call0", "gatsby", "eleventy", "storybook", "rstest", "lint-staged", "babel"]:
     var rs: [loader.Req] = []
     for r in reqs:
       if r.mode == mode: rs.push(loader.Req(r.file + "", r.mode + "", json.copy(r.args)))
     if rs.len == 0: continue
-    let res = loader.load_all(fs, os, rs, fspath(p, ""))
-    for r in rs: p.js[mode + ":" + r.file] = json.copy(res[r.file])
+    var parts = rs.len / 2
+    if parts > workers: parts = workers
+    if parts < 1: parts = 1
+    let size = (rs.len + parts - 1) / parts
+    var k = 0
+    while k < rs.len:
+      var g: [loader.Req] = []
+      var q = k
+      while q < rs.len and q < k + size:
+        g.push(loader.Req(rs[q].file + "", rs[q].mode + "", json.copy(rs[q].args)))
+        q += 1
+      groups.push(g)
+      k = q
+  # (largest first: a stable sort by size)
+  var order: [Int] = []
+  for gi in 0..groups.len: order.push(gi)
+  var x = 1
+  while x < order.len:
+    var y = x
+    while y > 0 and groups[order[y - 1]].len < groups[order[y]].len:
+      let tmp = order[y - 1]
+      order[y - 1] = order[y]
+      order[y] = tmp
+      y -= 1
+    x += 1
+  var sorted: [[loader.Req]] = []
+  for gi in order:
+    var g: [loader.Req] = []
+    for r in groups[gi]: g.push(loader.Req(r.file + "", r.mode + "", json.copy(r.args)))
+    sorted.push(g)
+  let res = loader.load_par(p.node_par, sorted, fspath(p, ""), workers)
+  for gi in 0..sorted.len:
+    for r in sorted[gi]: p.js[r.mode + ":" + r.file] = json.copy(res[gi][r.file])
 
 # knip's runPlugin: config files (found by the plugin's patterns, or named on a command line), the
 # plugin's entry patterns when it can't read a config or found none, what it reads from each config.
@@ -6770,7 +6824,7 @@ fn load_config_file(var p: Proj, fs: Fs, os: Os, f: Str, call_args: Value) -> Va
     let text = fs.read(path) else return json.Null
     return yaml.parse(text)
   var reqs: [loader.Req] = [loader.Req(path, "call", json.Arr([json.copy(call_args)]))]
-  let res = loader.load_all(fs, os, reqs, fspath(p, ""))
+  let res = loader.load_all(p.node, reqs, fspath(p, ""))
   let r = pkg.get(res[path], "ok")
   if json.has(res[path], "error"):
     p.config_errors = true
@@ -7325,7 +7379,7 @@ fn precompile(var p: Proj, fs: Fs, os: Os, paths: [Str], var comps: [Str], var p
       for q in 0..sfc_ix.len:
         if auto_root(p, fs, paths[sfc_ix[q]]) == root: files.push(json.Text(fspath(p, paths[sfc_ix[q]])))
       reqs.push(loader.Req(fspath(p, root), "vue-sfc", json.Arr(files)))
-    let res = loader.load_all(fs, os, reqs, fspath(p, ""))
+    let res = loader.load_all(p.node, reqs, fspath(p, ""))
     var seen: {Str: Int} = {}
     for q in 0..sfc_ix.len:
       let k = sfc_ix[q]
@@ -7347,7 +7401,7 @@ fn precompile(var p: Proj, fs: Fs, os: Os, paths: [Str], var comps: [Str], var p
     var args: [Value] = []
     for k in fn_ix: args.push(json.Arr([json.Text(resolve.extname(paths[k])), json.Text(fspath(p, paths[k]))]))
     let cf = fspath(p, p.config_file)
-    let res = loader.load_all(fs, os, [loader.Req(cf, "compile", json.Arr(args))], fspath(p, ""))
+    let res = loader.load_all(p.node, [loader.Req(cf, "compile", json.Arr(args))], fspath(p, ""))
     var r = json.Null
     if cf in res: r = json.copy(res[cf])
     if json.has(r, "error"):
@@ -8902,16 +8956,23 @@ fn pfind(p: Proj, name: Str) -> plugins.Plugin:
   if name in p.pidx: return plugins.copy(p.ptab[p.pidx[name]])
   return plugins.Plugin(name + "", "", [], false, [], [], [], [], "", false, false, false)
 
-fn cpu_count(fs: Fs) -> Int:
-  let info = fs.read("/proc/cpuinfo") else ""
+# the TypeScript and JavaScript config files at the top of the workspaces (vite.config.ts, knip.ts,
+# .eslintrc.cjs...), up to 4
+fn likely_js_configs(p: Proj, fs: Fs) -> Int:
   var n = 0
-  for l in info.split("\n"):
-    if l.startswith("processor"): n += 1
-  if n < 1: return 1
+  for w in p.ws:
+    let names = fs.list(fspath(p, w.dir)) else continue
+    for x in names:
+      if n >= 4: return n
+      # (eslint's are read without node)
+      if x.find("eslint") >= 0: continue
+      if x.find(".config.") > 0 or x.startswith("knip.") or x.startswith(".") and x.find("rc.") > 0:
+        for e in [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]:
+          if x.endswith(e): n += 1
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false, {}, own fn(d: Str) => [], own fn(x: Str) => "", {}, {})
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false, {}, own fn(d: Str) => [], own fn(x: Str) => "", own fn(x: Str) => "!", own fn(x: Str, n: Int) => "", 1, {}, {})
 
 # standard output and error with knip's colors, or without them
 fn out(p: Proj, s: Str):
@@ -8957,6 +9018,17 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   p.clk = own fn() => os.clock()
   p.list_links = own fn(d: Str) => term.links(ffi, d)
   p.realp = own fn(x: Str) => term.realpath(ffi, x)
+  p.node = own fn(x: Str) => term.node(ffi, loader.LOADER_JS, x)
+  p.node_par = own fn(x: Str, n: Int) => term.node_par(ffi, loader.LOADER_JS, x, n)
+  # --jobs: the threads that read files (all the cores by default), and the node processes that load
+  # configs (at most 4)
+  var jobs = 0
+  let js = opts.str_opt(a, "jobs")
+  if js != "": jobs = int(js) else 1
+  if jobs == 0: jobs = term.cpus(ffi)
+  p.node_workers = jobs
+  if p.node_workers > 4: p.node_workers = 4
+  if p.node_workers < 1: p.node_workers = 1
   let is_tty = term.isatty(ffi, 1)
   p.color = os.env("NO_COLOR") == "" and (os.env("FORCE_COLOR") == "1" or is_tty)
   if is_tty:
@@ -9064,6 +9136,14 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   # workspaces
   let werr = setup_workspaces(&p, fs, os, root_manifest, opts.strs_opt(a, "workspace"))
   if werr != "": config_error(p, werr)
+  # (workspaces with JavaScript configs, likely: node processes start now, one per two configs (up to
+  # the workers, 2 at most), and get ready while vknip reads the project; one that isn't needed is
+  # stopped at the end)
+  if not opts.flag(a, "watch") or os.env("VKNIP_WATCH_RUN") != "":
+    var warm = (likely_js_configs(p, fs) + 1) / 2
+    if warm > p.node_workers: warm = p.node_workers
+    if warm > 2: warm = 2
+    if warm > 0: term.node_warm(ffi, loader.LOADER_JS, loader.warm_request(fspath(p, "")), warm)
   for wi in 0..p.ws.len:
     let wc = ws_config(p, p.ws[wi].name)
     let wii = pkg.get(wc, "ignoreIssues")
@@ -9150,10 +9230,6 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   if p.debug:
     for f in b.order: eprint("entry " + b.g.nodes[f].path)
   # the graph: read the files reached from the entries, in waves (each on all cores)
-  var jobs = 0
-  let js = opts.str_opt(a, "jobs")
-  if js != "": jobs = int(js) else 1
-  if jobs == 0: jobs = cpu_count(fs)
   var kw = scan.keywords()
   var t = ast.new_ast()
   var cache = kcache.no_cache()
@@ -9348,7 +9424,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       var args_: {Str: Value} = {}
       args_["mods"] = json.Arr(mods)
       args_["data"] = data
-      let res = loader.load_all(fs, os, [loader.Req("@preprocess", "preprocess", json.Obj(args_))], fspath(p, ""))
+      let res = loader.load_all(p.node, [loader.Req("@preprocess", "preprocess", json.Obj(args_))], fspath(p, ""))
       var r = json.Null
       if "@preprocess" in res: r = json.copy(res["@preprocess"])
       node_failed(p, r)
@@ -9372,7 +9448,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     elif r == "compact": text = report.compact(p.on, p.issues)
     elif r == "json":
       let co = codeowners_rules(p, fs, a, "codeowners")
-      text = report.json_report(p.on, p.issues, co, co.len > 0 or fs.exists(fspath(p, codeowners_path(a, "codeowners"))))
+      text = report.json_report(p.on, p.issues, co, co.len > 0 or fs.exists(codeowners_path(a, "codeowners")))
     elif r == "markdown": text = report.markdown(p.on, p.issues)
     elif r == "disclosure": text = report.disclosure(p.coll, p.on, p.issues, p.cols)
     elif r == "github-actions": text = report.github_actions(p.coll, p.on, p.issues, collected_hints(p), p.tag_hints, not no_hints, not no_tag_hints, treat_hints, treat_tag_hints, p.config_file)
@@ -9386,8 +9462,9 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       if not fs.exists(cf):
         var shown = cf + ""
         if not cf.startswith("/"):
-          let pwd = os.env("PWD")
-          if pwd != "": shown = pwd + "/" + resolve.norm(cf)
+          # (node's process.cwd(): the working folder with its links resolved, not $PWD)
+          let wd = p.realp(".")
+          if wd != "": shown = wd + "/" + resolve.norm(cf)
         eprint("Error: ENOENT: no such file or directory, open '" + shown + "'")
         exit(1)
       text = report.codeowners_report(p.on, p.issues, report.codeowners(ctext))
@@ -9402,7 +9479,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       args_["mod"] = json.Text(r)
       args_["data"] = json.copy(data)
       args_["toFile"] = json.Flag(target != "")
-      let res = loader.load_all(fs, os, [loader.Req("@reporter", "reporter", json.Obj(args_))], fspath(p, ""))
+      let res = loader.load_all(p.node, [loader.Req("@reporter", "reporter", json.Obj(args_))], fspath(p, ""))
       var rr = json.Null
       if "@reporter" in res: rr = json.copy(res["@reporter"])
       node_failed(p, rr)
@@ -9855,8 +9932,9 @@ fn codeowners_path(a: opts.Args, key: Str) -> Str:
   if f == "": f = ".github/CODEOWNERS"
   return f
 
+# (knip's json reporter reads the file relative to the working folder, as the codeowners one does)
 fn codeowners_rules(p: Proj, fs: Fs, a: opts.Args, key: Str) -> [report.Owner]:
-  let text = fs.read(fspath(p, codeowners_path(a, key))) else ""
+  let text = fs.read(codeowners_path(a, key)) else ""
   return report.codeowners(text)
 
 fn add_file_issue(var p: Proj, f: Str):

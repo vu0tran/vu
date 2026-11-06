@@ -12,6 +12,9 @@
 
 bool vk_isatty(int64_t fd) { return isatty((int)fd) == 1; }
 
+/* the processors online (Linux and macOS alike) */
+int64_t vk_cpus(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n < 1 ? 1 : (int64_t)n; }
+
 int64_t vk_columns(int64_t fd) {
     struct winsize w;
     if (ioctl((int)fd, TIOCGWINSZ, &w) == 0 && w.ws_col > 0) return w.ws_col;
@@ -122,4 +125,241 @@ vu_str vk_realpath(const vu_str *path) {
     char res[PATH_MAX];
     if (!realpath(buf, res)) return vu_str_from("", 0);
     return vu_str_from(res, (int64_t)strlen(res));
+}
+
+/* Long-lived node processes that load the JavaScript configs of a run (loader.vu). vknip writes a
+   request (one line of JSON) to a process's fd 3 and reads the answer (one line) from its fd 4. Its
+   standard output and error go to an unlinked temporary file, read back when it dies before
+   answering. Process 0 serves requests one at a time (vk_node); a batch of independent requests
+   (vk_node_par) is spread over up to VK_MAXW processes. Each is started when first needed and ends
+   when its fd 3 closes: at vknip's exit, which waits for them (so their time is vknip's). */
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <errno.h>
+#include <sys/wait.h>
+#include <pthread.h>
+#include <time.h>
+extern char **environ;
+#define VK_MAXW 4
+/* (warm: the answer to vk_node_warm's request is still to be read; used: it has answered a request) */
+typedef struct { pid_t pid; int in, out, log; off_t from; char *buf; size_t len, cap; bool warm, used; } vk_worker;
+static vk_worker vkw[VK_MAXW] = { { -1, -1, -1, -1, 0, NULL, 0, 0, false, false }, { -1, -1, -1, -1, 0, NULL, 0, 0, false, false }, { -1, -1, -1, -1, 0, NULL, 0, 0, false, false }, { -1, -1, -1, -1, 0, NULL, 0, 0, false, false } };
+
+static void vk_node_stop(vk_worker *w) {
+    if (w->pid < 0) return;
+    /* (one that was only warmed up is stopped rather than waited for) */
+    if (!w->used) kill(w->pid, SIGKILL);
+    close(w->in);
+    close(w->out);
+    int st;
+    while (waitpid(w->pid, &st, 0) < 0 && errno == EINTR) {}
+    if (w->log >= 0) close(w->log);
+    w->pid = -1; w->in = w->out = w->log = -1;
+    w->warm = w->used = false;
+}
+
+static void vk_node_atexit(void) { for (int i = 0; i < VK_MAXW; i++) vk_node_stop(&vkw[i]); }
+
+static bool vk_node_start(vk_worker *w, const vu_str *js) {
+    static bool registered = false;
+    if (!registered) { registered = true; atexit(vk_node_atexit); }
+    int a[2], b[2];
+    if (pipe(a) != 0) return false;
+    if (pipe(b) != 0) { close(a[0]); close(a[1]); return false; }
+    const char *tmp = getenv("TMPDIR");
+    char lp[4096];
+    snprintf(lp, sizeof lp, "%s/vknip-node-XXXXXX", tmp && *tmp ? tmp : "/tmp");
+    int lf = mkstemp(lp);
+    if (lf >= 0) unlink(lp);
+    /* every descriptor moves above 10 and closes on exec; the child gets its copies by dup2 */
+    int r3 = fcntl(a[0], F_DUPFD_CLOEXEC, 10), wp = fcntl(a[1], F_DUPFD_CLOEXEC, 10);
+    int rp = fcntl(b[0], F_DUPFD_CLOEXEC, 10), w4 = fcntl(b[1], F_DUPFD_CLOEXEC, 10);
+    int lg = lf >= 0 ? fcntl(lf, F_DUPFD_CLOEXEC, 10) : -1;
+    close(a[0]); close(a[1]); close(b[0]); close(b[1]);
+    if (lf >= 0) close(lf);
+    lf = lg;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    if (lf >= 0) { posix_spawn_file_actions_adddup2(&fa, lf, 1); posix_spawn_file_actions_adddup2(&fa, lf, 2); }
+    else { posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0); posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0); }
+    posix_spawn_file_actions_adddup2(&fa, r3, 3);
+    posix_spawn_file_actions_adddup2(&fa, w4, 4);
+    char *src = vu_cstr(js);
+    if (!src) { posix_spawn_file_actions_destroy(&fa); close(r3); close(w4); close(wp); close(rp); if (lf >= 0) close(lf); return false; }
+    char *argv[] = { "node", "--no-warnings", "--input-type=module", "-e", src, NULL };
+    pid_t pid;
+    int rc = posix_spawnp(&pid, "node", &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    free(src);
+    close(r3); close(w4);
+    if (rc != 0) { close(wp); close(rp); if (lf >= 0) close(lf); return false; }
+#ifdef F_SETNOSIGPIPE
+    fcntl(wp, F_SETNOSIGPIPE, 1);
+#endif
+    w->pid = pid; w->in = wp; w->out = rp; w->log = lf;
+    return true;
+}
+
+/* (a write to a node that died must not kill vknip with SIGPIPE) */
+static bool vk_node_write(int fd, const char *p, size_t n) {
+#ifndef F_SETNOSIGPIPE
+    sigset_t set, old;
+    sigemptyset(&set);
+    sigaddset(&set, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &set, &old);
+#endif
+    bool ok = true;
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) { ok = false; break; }
+        p += w; n -= (size_t)w;
+    }
+#ifndef F_SETNOSIGPIPE
+    if (!ok) {
+        struct timespec zero = { 0, 0 };
+        sigset_t pend;
+        sigpending(&pend);
+        if (sigismember(&pend, SIGPIPE)) sigtimedwait(&set, NULL, &zero);
+    }
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+#endif
+    return ok;
+}
+
+static int vk_node_recv(vk_worker *w);
+
+/* sends a request (starting the process if needed); false when that fails */
+static bool vk_node_send(vk_worker *w, const vu_str *js, const char *req, size_t n) {
+    if (w->warm) {
+        w->warm = false;
+        w->len = 0;
+        int r;
+        while ((r = vk_node_recv(w)) == 0) {}
+    }
+    if (w->pid < 0 && !vk_node_start(w, js)) return false;
+    w->used = true;
+    w->from = w->log >= 0 ? lseek(w->log, 0, SEEK_END) : 0;
+    w->len = 0;
+    if (vk_node_write(w->in, req, n) && vk_node_write(w->in, "\n", 1)) return true;
+    vk_node_stop(w);
+    return false;
+}
+
+/* reads what's there of the answer: 1 when it's complete (in w->buf, w->len, without the newline),
+   0 when more is to come, -1 when the process died (then w->buf holds "!" and the first line it
+   printed since the request) */
+static int vk_node_recv(vk_worker *w) {
+    if (w->cap - w->len < 65536) { w->cap = w->cap ? w->cap * 2 : 131072; w->buf = realloc(w->buf, w->cap); }
+    ssize_t r;
+    do r = read(w->out, w->buf + w->len, w->cap - w->len); while (r < 0 && errno == EINTR);
+    if (r > 0) {
+        size_t start = w->len;
+        w->len += (size_t)r;
+        char *nl = memchr(w->buf + start, '\n', (size_t)r);
+        if (!nl) return 0;
+        w->len = (size_t)(nl - w->buf);
+        return 1;
+    }
+    w->len = 0;
+    w->buf[w->len++] = '!';
+    if (w->log >= 0 && w->from >= 0) {
+        char tmp[4096];
+        ssize_t k = pread(w->log, tmp, sizeof tmp, w->from);
+        size_t m = 0;
+        /* (the first line that isn't empty) */
+        while (k > 0 && m < (size_t)k && (tmp[m] == '\n' || tmp[m] == ' ' || tmp[m] == '\t' || tmp[m] == '\r')) m++;
+        while (k > 0 && m < (size_t)k && tmp[m] != '\n') w->buf[w->len++] = tmp[m++];
+    }
+    vk_node_stop(w);
+    return -1;
+}
+
+/* Starts `workers` processes (if they aren't running) on a request that gets jiti ready, while vknip
+   reads the project; the first real request reads its answer first. */
+void vk_node_warm(const vu_str *js, const vu_str *req, int64_t workers) {
+    for (int i = 0; i < workers && i < VK_MAXW; i++) {
+        vk_worker *w = &vkw[i];
+        if (w->pid >= 0 || !vk_node_start(w, js)) continue;
+        w->from = w->log >= 0 ? lseek(w->log, 0, SEEK_END) : 0;
+        if (vk_node_write(w->in, req->data, (size_t)req->len) && vk_node_write(w->in, "\n", 1)) w->warm = true;
+        else vk_node_stop(w);
+    }
+}
+
+/* The answer to one request (a line of JSON), or "!" and the first line node printed when it died
+   before answering. An empty request stops the processes. */
+vu_str vk_node(const vu_str *js, const vu_str *req) {
+    vk_worker *w = &vkw[0];
+    if (req->len == 0) { vk_node_atexit(); return vu_str_from("", 0); }
+    if (!vk_node_send(w, js, req->data, (size_t)req->len)) return vu_str_from("!", 1);
+    int r;
+    while ((r = vk_node_recv(w)) == 0) {}
+    return vu_str_from(w->buf, (int64_t)w->len);
+}
+
+/* Independent requests, one per line, spread over up to `workers` processes (each takes the next
+   request when it has answered one); their answers, one per line in the same order. */
+vu_str vk_node_par(const vu_str *js, const vu_str *reqs, int64_t workers) {
+    size_t n = 0;
+    const char *p = reqs->data, *e = reqs->data + reqs->len;
+    for (const char *q = p; q < e; q++) if (*q == '\n') n++;
+    if (reqs->len > 0 && e[-1] != '\n') n++;
+    if (n == 0) return vu_str_from("", 0);
+    const char **rs = malloc(n * sizeof *rs);
+    size_t *rl = malloc(n * sizeof *rl);
+    char **ans = calloc(n, sizeof *ans);
+    size_t *al = calloc(n, sizeof *al);
+    size_t k = 0;
+    for (const char *q = p; q < e && k < n;) {
+        const char *nl = memchr(q, '\n', (size_t)(e - q));
+        if (!nl) nl = e;
+        rs[k] = q; rl[k] = (size_t)(nl - q); k++;
+        q = nl + 1;
+    }
+    int W = (int)(workers < 1 ? 1 : workers > VK_MAXW ? VK_MAXW : workers);
+    if ((size_t)W > n) W = (int)n;
+    long cur[VK_MAXW];
+    for (int i = 0; i < W; i++) cur[i] = -1;
+    size_t next = 0, done = 0;
+    while (done < n) {
+        /* each idle process takes the next request */
+        for (int i = 0; i < W && next < n; i++) {
+            if (cur[i] >= 0) continue;
+            size_t j = next++;
+            if (vk_node_send(&vkw[i], js, rs[j], rl[j])) cur[i] = (long)j;
+            else { ans[j] = strdup("!"); al[j] = 1; done++; }
+        }
+        struct pollfd pf[VK_MAXW];
+        int idx[VK_MAXW], np = 0;
+        for (int i = 0; i < W; i++) if (cur[i] >= 0) { pf[np].fd = vkw[i].out; pf[np].events = POLLIN; pf[np].revents = 0; idx[np++] = i; }
+        if (np == 0) continue;
+        if (poll(pf, (nfds_t)np, -1) < 0) { if (errno == EINTR) continue; break; }
+        for (int m = 0; m < np; m++) {
+            if (!pf[m].revents) continue;
+            int i = idx[m];
+            int r = vk_node_recv(&vkw[i]);
+            if (r == 0) continue;
+            size_t j = (size_t)cur[i];
+            ans[j] = malloc(vkw[i].len + 1);
+            memcpy(ans[j], vkw[i].buf, vkw[i].len);
+            al[j] = vkw[i].len;
+            cur[i] = -1;
+            done++;
+        }
+    }
+    size_t tot = 0;
+    for (size_t j = 0; j < n; j++) tot += (ans[j] ? al[j] : 1) + 1;
+    char *out = malloc(tot + 1);
+    size_t o = 0;
+    for (size_t j = 0; j < n; j++) {
+        if (ans[j]) { memcpy(out + o, ans[j], al[j]); o += al[j]; free(ans[j]); }
+        else out[o++] = '!';
+        out[o++] = '\n';
+    }
+    vu_str res = vu_str_from(out, (int64_t)o);
+    free(out); free(ans); free(al); free(rs); free(rl);
+    return res;
 }

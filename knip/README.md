@@ -29,7 +29,7 @@ a project is one line in package.json:
 
 (or `npm install --save-dev @vu0tran/vknip`). The package also has the types of `import type {
 KnipConfig } from "knip"`, `defineConfig` from `knip/config` and knip's `schema.json`, written for
-vknip (the types by hand, looser than knip's), and depends on jiti, which vknip's node process uses
+vknip (the types by hand, looser than knip's), and depends on jiti, which vknip's node processes use
 for JavaScript and TypeScript configs when the project has none. Linux x86-64 and ARM64 (static
 binaries), macOS 12 or later; Node.js where it runs, as for knip. For machines without npm, the
 release archives (`vknip-0.1.0-linux-x64.tar.gz`, ...: `vknip` and `knip`) install with
@@ -95,11 +95,22 @@ node ends). Files are parsed on all cores, wave by wave as the import graph reac
 vknip reads the configuration knip reads, from the same places, in the same order: `knip.json`,
 `knip.jsonc`, `.knip.json`, `.knip.jsonc`, `knip.ts`, `knip.js`, `knip.config.ts`, `knip.config.js`
 (and the other extensions knip accepts), the `knip` field of package.json, or `--config FILE`. A
-JavaScript or TypeScript configuration runs in node, as in knip: vknip starts one node process, which
-imports the file with the project's jiti (or the one installed next to its knip, or any `jiti@2` in
-`node_modules/.pnpm`; native `import()` without one) and writes the result back as JSON. A config that
-exports a function is called (with knip's argument), and a promise is awaited. Load errors are
-reported as knip reports them.
+JavaScript or TypeScript configuration runs in node, as in knip: vknip keeps node processes for the
+whole run, which import each file with the project's jiti (or the one installed next to its knip, or
+any `jiti@2` in `node_modules/.pnpm`, looked for from the project's folder, then the working one;
+native `import()` without one) and send the result back as JSON. A config that exports a function is
+called (with knip's argument), and a promise is awaited. Load errors are reported as knip reports
+them, and what a config prints is printed where knip would load it. The configs found up front are
+loaded by up to 4 processes at once (`--jobs`, else the cores), started while vknip reads the project
+when its workspaces have JavaScript configs; the ones found later go to the first process, whose
+module cache already holds what earlier configs imported. A TypeScript config whose leading imports
+take only a define helper from its package (`defineConfig` from `vite` and `vitest/config`,
+`defineProject`, `defineWorkspace`, `defineBuildConfig` from `unbuild`, `defineConfig` from `tsdown`,
+`astro/config`, `vitepress` and `@playwright/test`) gets the helper without the package being loaded,
+when the import resolves to that package (its package.json names the package's repository, at a
+version that has the helper, and its entry file names it): loading vite or unbuild for an identity
+function took half a second each. Any other import, or a helper called in a way it doesn't cover
+(`defineConfig(a, b)`), loads the file as it is.
 
 The schema: `entry`, `project`, `paths`, `ignore`, `ignoreFiles`, `ignoreDependencies`,
 `ignoreBinaries`, `ignoreMembers`, `ignoreUnresolved`, `ignoreWorkspaces`, `ignoreIssues`,
@@ -151,7 +162,7 @@ error messages and the help text). What they do:
 | `--performance`, `--performance-fn`, `--memory`, `--memory-realtime`, `--duration` | knip's tables and formats, vknip's work timed under knip's function names |
 | `--no-progress` | as knip (it, `--debug` and CI turn off the terminal's progress and redraws) |
 | `--debug` | accepted; knip's debug output isn't printed (see Gaps) |
-| `--jobs N`, `--debug-inputs` | vknip only: parser threads; the inputs each plugin and compiler gave |
+| `--jobs N`, `--debug-inputs` | vknip only: parser threads (all the cores by default) and node processes for configs (at most 4); the inputs each plugin and compiler gave |
 
 Colors follow knip's: `FORCE_COLOR`, `NO_COLOR`, a terminal (node's styleText codes in titles, tables,
 hints, compact and codeowners lines), tables as wide as the terminal. knip 6 has no `--include-libs`
@@ -409,6 +420,73 @@ run, about half and a quarter of the spread between its own runs. The export bin
 `--trace` needs first cost +0.17% on node-glob: their maps and a field made each file's parse state
 and result bigger, and those are copied by value. They are now recorded only under `--trace`, in
 lists the parse state already has.
+
+### Monorepos and workspaces
+
+Issue #2 measured vknip 0.1.0 slower than knip on a monorepo with one workspace selected
+(`-D <root> -W <workspace> --reporter compact`). On the corpus monorepo with JavaScript configs
+(unhead) it was too: `-W packages/vue` took 2.95 s against knip's 2.75 s. Without node that run takes
+0.12 s; the rest was node. vknip started a node process per config mode, and then one per
+config found later (the projects a root `vitest.config.ts` lists): 9 processes for `-W packages/vue`,
+each importing vite, unbuild and the rest again. Now (counted with strace) 2 processes serve the run:
+they stay up, the configs found up front are spread over them, and the ones found later go to the
+first, whose module cache already holds what earlier configs imported. TypeScript configs that
+import only a define helper don't load its package (see Configuration): unbuild's
+`defineBuildConfig` had cost 0.8 s, `@playwright/test`'s `defineConfig` 0.3 s, `vitest/config`'s
+`defineConfig` about 0.15 s.
+
+Running from another folder with `--directory` also failed before: jiti and the `yaml` package were
+looked for from the working folder only, so every TypeScript config of a project whose jiti is in
+its own `node_modules` failed to load (`__dirname is not defined in ES module scope`, extra errors in
+the report). On the 100 `-W`/`-D` command lines of the parity check below, 0.1.0 matched knip on 80;
+now on 97 (the other 3: knip's uncaught-error stack trace for a missing CODEOWNERS file, which vknip
+prints as its first line). `test/cases12.py` (31 command lines, identical) attacks the loading:
+define helpers with real vite, vitest, unbuild and @playwright/test (two arguments, aliases, type
+imports, `.mts`/`.cts`/`.js`, a missing package, a fake `vite` that isn't vite, a helper the version
+lacks), a config imported by another, large answers, a config that prints (knip prints that output;
+vknip discarded it, now it prints it where knip loads the file), and a monorepo of 6 workspaces with
+`-W`, `-D` and `--production`.
+
+Wall and CPU seconds (CPU includes the node processes), best of 5 after a warm-up run, each tool's
+runs together (taking turns, one tool's writes to the shared jiti cache slowed the other's next
+run), knip 6.44.1 and vknip on Node 22, Linux, the shared 2-core machine (load average 2 to 4 during
+these runs, so differences under about 0.05 s are noise). "vknip 0.1.0" is the released npm binary;
+"before" is 1af38b4 (0.1.0 and the issue #1 fix); "now, npm launcher" runs this build through the npm
+package's `bin/vknip.js` as `node bin/vknip.js`, as the issue did. mono1 is a generated pnpm monorepo
+(150 workspaces of 20 files, no configs: `test/genmono.py mono1 150 20`); "subdir" runs in a
+workspace's folder without `-W`.
+
+| case | knip wall | knip CPU | vknip 0.1.0 | before (1af38b4) | now wall | now CPU | now, npm launcher | knip / now |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| changesets | 1.891 | 1.650 | 0.368 | 0.315 | 0.317 | 0.350 | 0.316 | 6.0x |
+| changesets -W cli | 1.129 | 1.557 | 0.266 | 0.265 | 0.322 | 0.318 | 0.477 | 3.5x |
+| changesets -W types | 1.120 | 1.560 | 0.265 | 0.315 | 0.319 | 0.274 | 0.318 | 3.5x |
+| changesets -D -W cli compact | 1.626 | 1.575 | 0.265 | 0.318 | 0.324 | 0.290 | 0.319 | 5.0x |
+| changesets --production | 1.330 | 1.263 | 0.377 | 0.370 | 0.324 | 0.298 | 0.367 | 4.1x |
+| changesets subdir packages/cli | 0.631 | 0.595 | 0.016 | 0.016 | 0.016 | 0.017 | 0.064 | 39.4x |
+| knip | 1.740 | 2.583 | 0.317 | 0.375 | 0.319 | 0.305 | 0.321 | 5.5x |
+| knip -W knip | 1.742 | 2.567 | 0.373 | 0.315 | 0.318 | 0.364 | 0.316 | 5.5x |
+| knip -W docs | 0.618 | 0.788 | 0.215 | 0.215 | 0.165 | 0.212 | 0.165 | 3.7x |
+| knip -W vscode-knip | 1.575 | 2.425 | 0.315 | 0.316 | 0.265 | 0.321 | 0.268 | 5.9x |
+| knip -D -W docs compact | 0.576 | 0.784 | 0.265 | 0.265 | 0.165 | 0.203 | 0.215 | 3.5x |
+| knip --production | 1.386 | 2.030 | 0.321 | 0.315 | 0.266 | 0.319 | 0.268 | 5.2x |
+| knip subdir packages/docs | 0.575 | 0.596 | 0.016 | 0.016 | 0.037 | 0.029 | 0.115 | 15.5x |
+| mono1 (synthetic, 150 ws) | 2.689 | 2.651 | 0.670 | 0.669 | 0.720 | 0.710 | 0.818 | 3.7x |
+| mono1 -W p140 | 1.488 | 1.397 | 0.216 | 0.216 | 0.167 | 0.140 | 0.272 | 8.9x |
+| unhead | 3.401 | 4.753 | 2.328 | 2.290 | 1.177 | 1.984 | 1.176 | 2.9x |
+| unhead -W unhead | 3.218 | 4.585 | 2.081 | 2.141 | 0.973 | 1.357 | 0.974 | 3.3x |
+| unhead -W vue | 2.750 | 3.783 | 2.833 | 2.950 | 0.875 | 1.260 | 0.972 | 3.1x |
+| unhead -W schema-org | 2.758 | 3.882 | 2.082 | 2.295 | 1.026 | 1.627 | 1.124 | 2.7x |
+| unhead -W examples/vite-ssr-vue | 2.446 | 3.545 | 1.829 | 1.897 | 0.622 | 0.916 | 0.671 | 3.9x |
+| unhead -D -W vue compact | 2.710 | 3.796 | 2.855 | 2.745 | 0.971 | 1.365 | 1.028 | 2.8x |
+| unhead --production | 3.256 | 4.416 | 2.541 | 2.482 | 1.236 | 2.201 | 1.275 | 2.6x |
+| unhead subdir packages/vue | 1.036 | 0.732 | 0.050 | 0.044 | 0.027 | 0.023 | 0.064 | 38.4x |
+
+Every case is now at least 2.6 times faster than knip in wall time; the unhead cases went from about
+knip's time to a third of it. Where vknip needs no node (changesets, knip, mono1) nothing changed
+beyond noise; mono1's 0.72 s against 0.67 s before is within the spread of its runs. The launcher adds
+about 0.03 to 0.05 s (node's start). Not measured: macOS (the issue's machine), and the private
+monorepo of the report.
 
 ## Gaps
 
