@@ -1,0 +1,2148 @@
+# oxlint's jest and vitest rules that work on test calls (oxc_linter/src/utils/jest.rs and
+# parse_jest_fn.rs, rules/shared/jest_vitest, rules/vitest). The calls that may be jest calls are
+# found as oxc finds them (references to names imported from jest's or vitest's modules, then the
+# root scope's unresolved references to jest's global names, in oxc's map order), each parsed once
+# into its chain (`describe.only.each`, `expect(x).not.toBe`), and the rules run on them: the
+# rules oxc runs per jest call (in that order, after every other rule's diagnostics), and those
+# that run once per file over the same calls.
+
+import ast
+import scan
+import scope
+import lmeta
+import lconf
+import lmatch
+import rules
+import rmore
+import rmore2
+import rhooks
+import lfx
+import rmore3
+from rules import L, k, name_of, parent, text
+
+# kinds (JestFnKind / JestGeneralFnKind)
+const K_UNKNOWN = 0
+const K_EXPECT = 1
+const K_EXPECTTYPEOF = 2
+const K_HOOK = 3
+const K_DESCRIBE = 4
+const K_TEST = 5
+const K_JEST = 6
+const K_VITEST = 7
+const K_BENCH = 8
+const K_FIXTURE = 9
+
+# parent kinds (KnownMemberExpressionParentKind)
+const PK_NONE = 0
+const PK_MEMBER = 1
+const PK_CALL = 2
+const PK_TAGGED = 3
+
+# expect errors
+const E_NONE = 0
+const E_MODIFIER = 1
+const E_NOTFOUND = 2
+const E_NOTCALLED = 3
+
+# diagnostics of jest rules are ordered by D.on = JBASE + a key (rules.lint_l)
+const JBASE = 1099511627776
+
+# A parsed jest call: the chain (the head, then the members), each element's name ("\0": none),
+# span, parent expression, parent and grandparent kinds, and whether it's a property name
+type Jp:
+  ok: Bool
+  ty: Int          # 0 general, 1 expect, 2 expectTypeOf, 3 fixture
+  kind: Int
+  name: Str
+  local: Str
+  nm: [Str]
+  s: [Int]
+  e: [Int]
+  par: [Int]
+  pk: [Int]
+  gk: [Int]
+  prop: [Bool]
+  matcher: Int     # chain index (-1)
+  mods: [Int]      # chain indices
+  err: Int
+
+fn no_jp() -> Jp:
+  return Jp(false, 0, K_UNKNOWN, "", "", [], [], [], [], [], [], [], -1, [], E_NONE)
+
+# each rule's options, for jest (0) and vitest (1)
+type Opt:
+  ve_async: [Str]      # valid-expect
+  ve_min: Int
+  ve_max: Int
+  ve_await: Bool
+  ee_names: [Str]      # expect-expect: assertFunctionNames (given)
+  ee_given: Bool
+  ee_extra: [Str]      # additionalTestBlockFunctions (expect-expect)
+  se_extra: [Str]      # no-standalone-expect
+  vt_ign_test: Bool    # valid-title
+  vt_ign_desc: Bool
+  vt_args: Bool
+  vt_spaces: Bool
+  vt_words: [Str]
+  vt_mm: [Str]         # mustMatch: describe, test, it patterns ("" none) and messages
+  vt_mmm: [Str]
+  vt_mn: [Str]
+  vt_mnm: [Str]
+  sh_always: Bool      # prefer-snapshot-hint: "always"
+  mt_imports: Bool     # require-mock-type-parameters: checkImportFunctions
+
+fn cp(xs: [Str]) -> [Str]:
+  var out: [Str] = []
+  for x in xs: out.push(x + "")
+  return out
+
+fn copt(o: Opt) -> Opt:
+  return Opt(cp(o.ve_async), o.ve_min, o.ve_max, o.ve_await, cp(o.ee_names), o.ee_given, cp(o.ee_extra), cp(o.se_extra), o.vt_ign_test, o.vt_ign_desc, o.vt_args, o.vt_spaces, cp(o.vt_words), cp(o.vt_mm), cp(o.vt_mmm), cp(o.vt_mn), cp(o.vt_mnm), o.sh_always, o.mt_imports)
+
+fn new_opt() -> Opt:
+  return Opt(["toResolve", "toReject"], 1, 1, false, [], false, [], [], false, false, false, false, [], ["", "", ""], ["", "", ""], ["", "", ""], ["", "", ""], false, false)
+
+type Jc:
+  on: Bool
+  o: [Opt]
+  vt_typecheck: Bool
+  stamp: [Int]         # expect-expect's visited expressions (by generation)
+  gen: Int
+  fdecl: {Int: Int}    # symbol -> its function declaration (built on first use)
+  fdecl_done: Bool
+  refs: {Int: [Int]}   # symbol -> its references (built on first use)
+  refs_done: Bool
+  roots: [Int]         # the file's statements
+  pc: {Int: Int}       # parse cache: call node -> index in pcs (calls parsed with no imported name)
+  pcs: [Jp]
+  av_done: [Bool]      # expect-expect's assertion matchers (jest/vitest x jest/vitest names), built once
+  avs: [Av]
+
+fn new_jc() -> Jc:
+  return Jc(false, [new_opt(), new_opt()], false, [], 0, {}, false, {}, false, [], {}, [], [false, false, false, false], [Av([], [], [], false), Av([], [], [], false), Av([], [], [], false), Av([], [], [], false)])
+
+# the shared rules: their jest and vitest ids
+fn pairs() -> [Int]:
+  return [lmeta.M_JEST_NO_FOCUSED_TESTS, lmeta.M_VITEST_NO_FOCUSED_TESTS, lmeta.M_JEST_NO_DISABLED_TESTS, lmeta.M_VITEST_NO_DISABLED_TESTS, lmeta.M_JEST_VALID_DESCRIBE_CALLBACK, lmeta.M_VITEST_VALID_DESCRIBE_CALLBACK, lmeta.M_JEST_VALID_EXPECT, lmeta.M_VITEST_VALID_EXPECT, lmeta.M_JEST_NO_STANDALONE_EXPECT, lmeta.M_VITEST_NO_STANDALONE_EXPECT, lmeta.M_JEST_EXPECT_EXPECT, lmeta.M_VITEST_EXPECT_EXPECT, lmeta.M_JEST_VALID_TITLE, lmeta.M_VITEST_VALID_TITLE, lmeta.M_JEST_NO_CONDITIONAL_EXPECT, lmeta.M_VITEST_NO_CONDITIONAL_EXPECT, lmeta.M_JEST_REQUIRE_TO_THROW_MESSAGE, lmeta.M_VITEST_REQUIRE_TO_THROW_MESSAGE, lmeta.M_JEST_PREFER_SNAPSHOT_HINT, lmeta.M_VITEST_PREFER_SNAPSHOT_HINT, lmeta.M_JEST_NO_IDENTICAL_TITLE, lmeta.M_VITEST_NO_IDENTICAL_TITLE, lmeta.M_JEST_NO_COMMENTED_OUT_TESTS, lmeta.M_VITEST_NO_COMMENTED_OUT_TESTS, lmeta.M_JEST_VALID_EXPECT_IN_PROMISE, lmeta.M_VITEST_VALID_EXPECT_IN_PROMISE]
+
+fn vitest_only() -> [Int]:
+  return [lmeta.M_VITEST_WARN_TODO, lmeta.M_VITEST_NO_CONDITIONAL_TESTS, lmeta.M_VITEST_REQUIRE_LOCAL_TEST_CONTEXT_FOR_CONCURRENT_SNAPSHOTS, lmeta.M_VITEST_REQUIRE_AWAITED_EXPECT_POLL, lmeta.M_VITEST_HOISTED_APIS_ON_TOP, lmeta.M_VITEST_REQUIRE_MOCK_TYPE_PARAMETERS]
+
+fn any_on(sev: [Int]) -> Bool:
+  for m in pairs():
+    if sev[m] > 0: return true
+  for m in vitest_only():
+    if sev[m] > 0: return true
+  return false
+
+fn on(l: L, m: Int) -> Bool:
+  return l.en.len > 0 and l.en[m]
+
+fn js_first(text0: Str, var js: lconf.Json) -> Int:
+  if text0 == "": return -1
+  js = lconf.parse_json(text0)
+  if js.err != "" or js.v.len == 0 or js.v[0].k != lconf.J_ARR or js.v[0].kids.len == 0: return -1
+  return js.v[0].kids[0]
+
+fn onum(js: lconf.Json, o: Int, key: Str, d: Int) -> Int:
+  if o < 0 or js.v[o].k != lconf.J_OBJ: return d
+  let v = lconf.get(js, o, key)
+  if v < 0 or js.v[v].k != lconf.J_NUM: return d
+  let x = int(js.v[v].s) else -1
+  if x < 0 or x > 4294967295: return d
+  return x
+
+fn setup(var l: L, sev: [Int], opts: [Str]):
+  if not any_on(sev): return
+  l.mc.jc.on = true
+  for fw in 0..2:
+    var o = new_opt()
+    var m = lmeta.M_JEST_VALID_EXPECT
+    if fw == 1: m = lmeta.M_VITEST_VALID_EXPECT
+    if sev[m] > 0:
+      var js = lconf.Json([], "", "")
+      let x = js_first(opts[m], &js)
+      if x >= 0 and js.v[x].k == lconf.J_OBJ:
+        let a = lconf.get(js, x, "asyncMatchers")
+        if a >= 0 and js.v[a].k == lconf.J_ARR: o.ve_async = rmore.ostrs(js, x, "asyncMatchers")
+        o.ve_min = onum(js, x, "minArgs", 1)
+        o.ve_max = onum(js, x, "maxArgs", 1)
+        o.ve_await = rmore.obool(js, x, "alwaysAwait", false)
+    m = lmeta.M_JEST_EXPECT_EXPECT
+    if fw == 1: m = lmeta.M_VITEST_EXPECT_EXPECT
+    if sev[m] > 0:
+      var js = lconf.Json([], "", "")
+      let x = js_first(opts[m], &js)
+      if x >= 0 and js.v[x].k == lconf.J_OBJ:
+        let a = lconf.get(js, x, "assertFunctionNames")
+        if a >= 0 and js.v[a].k == lconf.J_ARR:
+          o.ee_given = true
+          o.ee_names = rmore.ostrs(js, x, "assertFunctionNames")
+        o.ee_extra = rmore.ostrs(js, x, "additionalTestBlockFunctions")
+    m = lmeta.M_JEST_NO_STANDALONE_EXPECT
+    if fw == 1: m = lmeta.M_VITEST_NO_STANDALONE_EXPECT
+    if sev[m] > 0:
+      var js = lconf.Json([], "", "")
+      let x = js_first(opts[m], &js)
+      if x >= 0 and js.v[x].k == lconf.J_OBJ: o.se_extra = rmore.ostrs(js, x, "additionalTestBlockFunctions")
+    m = lmeta.M_JEST_VALID_TITLE
+    if fw == 1: m = lmeta.M_VITEST_VALID_TITLE
+    if sev[m] > 0:
+      var js = lconf.Json([], "", "")
+      let x = js_first(opts[m], &js)
+      if x >= 0 and js.v[x].k == lconf.J_OBJ:
+        o.vt_ign_test = rmore.obool(js, x, "ignoreTypeOfTestName", false)
+        o.vt_ign_desc = rmore.obool(js, x, "ignoreTypeOfDescribeName", false)
+        o.vt_args = rmore.obool(js, x, "allowArguments", false)
+        o.vt_spaces = rmore.obool(js, x, "ignoreSpaces", false)
+        o.vt_words = rmore.ostrs(js, x, "disallowedWords")
+        var pm = title_patterns(js, lconf.get(js, x, "mustMatch"))
+        o.vt_mm = [pm[0], pm[1], pm[2]]
+        o.vt_mmm = [pm[3], pm[4], pm[5]]
+        pm = title_patterns(js, lconf.get(js, x, "mustNotMatch"))
+        o.vt_mn = [pm[0], pm[1], pm[2]]
+        o.vt_mnm = [pm[3], pm[4], pm[5]]
+    m = lmeta.M_JEST_PREFER_SNAPSHOT_HINT
+    if fw == 1: m = lmeta.M_VITEST_PREFER_SNAPSHOT_HINT
+    if sev[m] > 0:
+      var js = lconf.Json([], "", "")
+      let x = js_first(opts[m], &js)
+      if x >= 0 and js.v[x].k == lconf.J_STR and js.v[x].s == "always": o.sh_always = true
+    if fw == 1 and sev[lmeta.M_VITEST_REQUIRE_MOCK_TYPE_PARAMETERS] > 0:
+      var js = lconf.Json([], "", "")
+      let x = js_first(opts[lmeta.M_VITEST_REQUIRE_MOCK_TYPE_PARAMETERS], &js)
+      o.mt_imports = rmore.obool(js, x, "checkImportFunctions", false)
+    l.mc.jc.o[fw] = o
+
+# mustMatch / mustNotMatch: a pattern string, [pattern, message], or {describe|test|it: pattern}
+fn title_patterns(js: lconf.Json, v: Int) -> [Str]:
+  var out = tp(js, v)
+  return out
+
+fn tp(js: lconf.Json, v: Int) -> [Str]:
+  var pats = ["", "", ""]
+  var msgs = ["", "", ""]
+  tp_fill(js, v, &pats, &msgs)
+  return [pats[0], pats[1], pats[2], msgs[0], msgs[1], msgs[2]]
+
+fn tp_fill(js: lconf.Json, v: Int, var pats: [Str], var msgs: [Str]):
+  if v < 0: return
+  let kd = js.v[v].k
+  if kd == lconf.J_ARR:
+    if js.v[v].kids.len == 0: return
+    let p0 = js.v[v].kids[0]
+    if js.v[p0].k != lconf.J_STR: return
+    let p = rust_pattern(js.v[p0].s)
+    var msg = "\0"
+    if js.v[v].kids.len > 1:
+      let m1 = js.v[v].kids[1]
+      if js.v[m1].k == lconf.J_STR: msg = js.v[m1].s + ""
+    for i in 0..3:
+      pats[i] = p + ""
+      msgs[i] = msg + ""
+  elif kd == lconf.J_OBJ:
+    for i in 0..js.v[v].kids.len:
+      let c = js.v[v].kids[i]
+      if js.v[c].k != lconf.J_STR: continue
+      let key = js.v[v].keys[i]
+      var at = -1
+      if key == "describe": at = 0
+      elif key == "test": at = 1
+      elif key == "it": at = 2
+      if at >= 0:
+        pats[at] = rust_pattern(js.v[c].s)
+        msgs[at] = "\0"
+  elif kd == lconf.J_STR:
+    let p = rust_pattern(js.v[v].s)
+    for i in 0..3:
+      pats[i] = p + ""
+      msgs[i] = "\0"
+
+# "/pat/flags" -> pat (flags dropped, as oxc does); else "(?u)" + the text (shown so in messages)
+fn rust_pattern(s: Str) -> Str:
+  if s.startswith("/"):
+    let rest = s[1..s.len]
+    var e = rest.len - 1
+    while e >= 0 and rest[e] != '/': e -= 1
+    if e >= 0: return rest[0..e]
+  return "(?u)" + s
+
+# ---- the possible jest calls
+
+fn method_name(nm: Str) -> Bool:
+  for x in ["afterAll", "afterEach", "beforeAll", "beforeEach", "bench", "describe", "expect", "expectTypeOf", "fdescribe", "fit", "it", "jest", "pending", "suite", "test", "vi", "xdescribe", "xit", "xtest"]:
+    if x == nm: return true
+  return false
+
+fn kind_from(nm: Str) -> Int:
+  if nm == "expect": return K_EXPECT
+  if nm == "expectTypeOf": return K_EXPECTTYPEOF
+  if nm == "vi" or nm == "vitest": return K_VITEST
+  if nm == "bench": return K_BENCH
+  if nm == "jest": return K_JEST
+  if nm == "describe" or nm == "fdescribe" or nm == "xdescribe" or nm == "suite": return K_DESCRIBE
+  if nm == "fit" or nm == "it" or nm == "test" or nm == "xit" or nm == "xtest": return K_TEST
+  if nm == "beforeAll" or nm == "beforeEach" or nm == "afterAll" or nm == "afterEach": return K_HOOK
+  return K_UNKNOWN
+
+fn jest_module(m: Str) -> Bool:
+  return m == "@jest/globals" or m == "vitest" or m == "vite-plus/test" or m == "@effect/vitest"
+
+# The calls (and each one's imported name, "" for none) in oxc's order (iter_possible_jest_call_node)
+fn jest_nodes(var l: L, root: Int, var orig: [Str]) -> [Int]:
+  var out: [Int] = []
+  # names imported from the jest modules: by symbol (declaration order), each symbol's references
+  var syms: {Int: Str} = {}
+  var spos: {Int: Int} = {}
+  var ranges: [Int] = []
+  if k(l, root) == ast.N_LIST:
+    for st in ast.items(l.t, root):
+      if k(l, st) != ast.N_IMPORT: continue
+      let src = l.t.nd[st].a
+      if src <= 0 or not jest_module(name_of(l, src)): continue
+      ranges.push(st)
+  var refs: [Int] = []
+  if ranges.len > 0:
+    for x in 1..l.t.nd.len:
+      if l.t.nd[x].k != ast.N_ID: continue
+      if x >= l.sc.res.len: continue
+      let y = l.sc.res[x]
+      if y < 0 or l.sc.yk[y] != scope.Y_IMPORT: continue
+      let yp = l.sc.ypos[y]
+      for st in ranges:
+        if yp >= l.t.nd[st].pos and yp < l.t.nd[st].end:
+          if not (y in syms):
+            syms[y] = original_of(l, st, l.t.names[l.sc.yn[y]])
+            spos[y] = yp
+          # (the declaration itself is not a reference)
+          if l.t.nd[x].pos != yp: refs.push(x)
+          break
+    refs.sort(by: fn(a, b) => spos[l.sc.res[a]] < spos[l.sc.res[b]] or (spos[l.sc.res[a]] == spos[l.sc.res[b]] and l.t.nd[a].pos < l.t.nd[b].pos))
+  for x in refs: climb(&l, x, syms[l.sc.res[x]], &out, &orig)
+  # the root scope's unresolved references to jest's names (none: skip oxc's map order)
+  var any = false
+  let nres = l.sc.res.len
+  for x in 1..nres:
+    if x < l.t.nd.len and l.sc.res[x] == -1 and l.t.nd[x].k == ast.N_ID and method_name(l.t.names[l.t.nd[x].s]):
+      any = true
+      break
+  if not any: return out
+  for x in rmore2.root_unresolved(&l):
+    if x < 0: continue
+    if not method_name(name_of(l, x)): continue
+    climb(&l, x, "", &out, &orig)
+  return out
+
+fn original_of(l: L, st: Int, local: Str) -> Str:
+  let sp = l.t.nd[st].d
+  for i in 0..ast.count(l.t, sp):
+    let x = ast.item(l.t, sp, i)
+    if l.t.names[l.t.nd[x].s] == local:
+      let pn = l.t.nd[x].b
+      if pn > 0: return name_of(l, pn)
+      return local + ""
+  return ""
+
+fn climb(var l: L, x0: Int, orig0: Str, var out: [Int], var orig: [Str]):
+  var x = x0
+  while true:
+    let p = parent(&l, x)
+    if p <= 0: return
+    let pk = l.t.nd[p].k
+    if pk == ast.N_CALL and l.t.nd[p].a == x:
+      out.push(p)
+      orig.push(orig0 + "")
+      x = p
+    elif pk == ast.N_PROPACCESS or pk == ast.N_ELEMACCESS or (pk == ast.N_TAGGED and l.t.nd[p].a == x): x = p
+    else: return
+
+# ---- parse_jest_fn_call
+
+fn first_ident(l: L, e: Int) -> Int:
+  var x = e
+  while x > 0:
+    let kd = l.t.nd[x].k
+    if kd == ast.N_ID: return x
+    if kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS or kd == ast.N_CALL or kd == ast.N_TAGGED: x = l.t.nd[x].a
+    else: return -1
+  return -1
+
+fn push_el(var j: Jp, nm: Str, s: Int, e: Int, par: Int, pk: Int, gk: Int, prop: Bool):
+  j.nm.push(nm)
+  j.s.push(s)
+  j.e.push(e)
+  j.par.push(par)
+  j.pk.push(pk)
+  j.gk.push(gk)
+  j.prop.push(prop)
+
+fn chain(l: L, var j: Jp, e: Int, par: Int, pk: Int, gk: Int):
+  let kd = k(l, e)
+  if kd == ast.N_PROPACCESS:
+    chain(l, &j, l.t.nd[e].a, e, PK_MEMBER, pk)
+    if (l.t.nd[e].f & 4) == 0:
+      let nm = name_of(l, e)
+      push_el(&j, nm, l.t.nd[e].end - nm.len, l.t.nd[e].end, e, PK_MEMBER, pk, true)
+  elif kd == ast.N_ELEMACCESS:
+    chain(l, &j, l.t.nd[e].a, e, PK_MEMBER, pk)
+    let ix = l.t.nd[e].b
+    let ik = k(l, ix)
+    if ik == ast.N_STR or ik == ast.N_NOSUBTEMPL: push_el(&j, name_of(l, ix), l.t.nd[ix].pos, l.t.nd[ix].end, e, PK_MEMBER, pk, false)
+  elif kd == ast.N_ID or kd == ast.N_STR or kd == ast.N_NOSUBTEMPL:
+    push_el(&j, name_of(l, e), l.t.nd[e].pos, l.t.nd[e].end, par, pk, gk, false)
+  elif kd == ast.N_CALL: chain(l, &j, l.t.nd[e].a, e, PK_CALL, pk)
+  elif kd == ast.N_TAGGED: chain(l, &j, l.t.nd[e].a, e, PK_TAGGED, pk)
+
+fn parent_kind(var l: L, n: Int) -> Int:
+  let p = parent(&l, n)
+  return k(l, p)
+
+fn is_call_or_member(kd: Int) -> Bool:
+  return kd == ast.N_CALL or kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS
+
+# VALID_JEST_FN_CALL_CHAINS, compared on the first (up to) 4 names: every prefix of every chain
+# (padded with empty names to 4), between bars
+const JEST_KEYS = "|afterAll|afterAll.|afterAll..|afterAll...|afterEach|afterEach.|afterEach..|afterEach...|beforeAll|beforeAll.|beforeAll..|beforeAll...|beforeEach|beforeEach.|beforeEach..|beforeEach...|bench|bench.|bench..|bench...|describe|describe.|describe..|describe...|describe.each|describe.each.|describe.each..|describe.only|describe.only.|describe.only..|describe.only.each|describe.only.each.|describe.skip|describe.skip.|describe.skip..|describe.skip.each|describe.skip.each.|fdescribe|fdescribe.|fdescribe..|fdescribe...|fdescribe.each|fdescribe.each.|fdescribe.each..|fit|fit.|fit..|fit...|fit.each|fit.each.|fit.each..|fit.failing|fit.failing.|fit.failing..|fit.fails|fit.fails.|fit.fails..|it|it.|it..|it...|it.concurrent|it.concurrent.|it.concurrent..|it.concurrent.each|it.concurrent.each.|it.concurrent.only|it.concurrent.only.each|it.concurrent.skip|it.concurrent.skip.each|it.each|it.each.|it.each..|it.failing|it.failing.|it.failing..|it.fails|it.fails.|it.fails..|it.only|it.only.|it.only..|it.only.each|it.only.each.|it.only.failing|it.only.failing.|it.only.fails|it.only.fails.|it.skip|it.skip.|it.skip..|it.skip.each|it.skip.each.|it.skip.failing|it.skip.failing.|it.skip.fails|it.skip.fails.|it.todo|it.todo.|it.todo..|test|test.|test..|test...|test.concurrent|test.concurrent.|test.concurrent..|test.concurrent.each|test.concurrent.each.|test.concurrent.only|test.concurrent.only.each|test.concurrent.skip|test.concurrent.skip.each|test.each|test.each.|test.each..|test.failing|test.failing.|test.failing..|test.fails|test.fails.|test.fails..|test.only|test.only.|test.only..|test.only.each|test.only.each.|test.only.failing|test.only.failing.|test.only.fails|test.only.fails.|test.skip|test.skip.|test.skip..|test.skip.each|test.skip.each.|test.skip.failing|test.skip.failing.|test.skip.fails|test.skip.fails.|test.todo|test.todo.|test.todo..|xdescribe|xdescribe.|xdescribe..|xdescribe...|xdescribe.each|xdescribe.each.|xdescribe.each..|xit|xit.|xit..|xit...|xit.each|xit.each.|xit.each..|xit.failing|xit.failing.|xit.failing..|xit.fails|xit.fails.|xit.fails..|xtest|xtest.|xtest..|xtest...|xtest.each|xtest.each.|xtest.each..|xtest.failing|xtest.failing.|xtest.failing..|xtest.fails|xtest.fails.|xtest.fails..|"
+
+fn jest_chain_ok(parts: [Str]) -> Bool:
+  var n = parts.len
+  if n > 4: n = 4
+  var key = ""
+  for i in 0..n:
+    let p = parts[i]
+    if p.find(".") >= 0 or p.find("|") >= 0: return false
+    if i > 0: key += "."
+    key += p
+  return JEST_KEYS.find("|" + key + "|") >= 0
+
+fn no_dups(ms: [Str]) -> Bool:
+  for i in 0..ms.len:
+    for j in i + 1..ms.len:
+      if ms[i] == ms[j]: return false
+  return true
+
+fn vitest_chain_ok(parts: [Str]) -> Bool:
+  let h = parts[0]
+  var ms: [Str] = []
+  for i in 1..parts.len: ms.push(parts[i])
+  if h == "afterAll" or h == "afterEach" or h == "beforeAll" or h == "beforeEach": return parts.len == 1
+  if h == "bench":
+    for m in ms:
+      if not (m == "only" or m == "runIf" or m == "skip" or m == "skipIf" or m == "todo"): return false
+    return no_dups(ms)
+  if h == "describe" or h == "suite":
+    for i in 0..ms.len:
+      let m = ms[i]
+      if m == "each" or m == "for":
+        if i != ms.len - 1: return false
+      elif not (m == "concurrent" or m == "only" or m == "runIf" or m == "sequential" or m == "shuffle" or m == "skip" or m == "skipIf" or m == "todo"): return false
+    return no_dups(ms)
+  if h == "it" or h == "test":
+    for i in 0..ms.len:
+      let m = ms[i]
+      if m == "each" or m == "for":
+        if i != ms.len - 1: return false
+      elif m == "extend":
+        if i != 0: return false
+      elif not (m == "concurrent" or m == "fails" or m == "only" or m == "runIf" or m == "sequential" or m == "skip" or m == "skipIf" or m == "todo"): return false
+    return no_dups(ms)
+  return false
+
+fn frameworks(var l: L) -> Int:
+  return rmore.frameworks(&l)
+
+fn parse(var l: L, n: Int, orig: Str) -> Jp:
+  if orig != "": return parse0(&l, n, orig)
+  let c = l.mc.jc.pc.get(n, -1)
+  if c >= 0: return copy_jp(l.mc.jc.pcs[c])
+  let j = parse0(&l, n, orig)
+  l.mc.jc.pc[n] = l.mc.jc.pcs.len
+  l.mc.jc.pcs.push(copy_jp(j))
+  return j
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var out: [Int] = []
+  for x in xs: out.push(x)
+  return out
+
+fn copy_jp(j: Jp) -> Jp:
+  var nm: [Str] = []
+  for x in j.nm: nm.push(x + "")
+  var pr: [Bool] = []
+  for x in j.prop: pr.push(x)
+  return Jp(j.ok, j.ty, j.kind, j.name + "", j.local + "", nm, copy_ints(j.s), copy_ints(j.e), copy_ints(j.par), copy_ints(j.pk), copy_ints(j.gk), pr, j.matcher, copy_ints(j.mods), j.err)
+
+fn parse0(var l: L, n: Int, orig: Str) -> Jp:
+  var j = no_jp()
+  let ce = l.t.nd[n].a
+  let id = first_ident(l, ce)
+  if id < 0: return j
+  let local = name_of(l, id)
+  var name = local + ""
+  if orig != "": name = orig + ""
+  let fw = frameworks(&l)
+  let cek = k(l, ce)
+  if fw == 0 and cek == ast.N_ID and name != "each" and kind_from(name) == K_UNKNOWN and not method_name(name):
+    if is_call_or_member(parent_kind(&l, n)): return j
+    j.ok = true
+    j.name = name
+    j.local = local
+    return j
+  chain(l, &j, ce, -1, PK_CALL, PK_NONE)
+  let cl = j.nm.len
+  if cl == 0: return j
+  var all_member = true
+  for i in 0..cl - 1:
+    if j.pk[i] != PK_MEMBER: all_member = false
+  let last = j.nm[cl - 1]
+  if last == "each" and cek != ast.N_CALL and cek != ast.N_TAGGED: return j
+  if cek == ast.N_TAGGED and last != "each": return j
+  let kind = kind_from(name)
+  j.name = name
+  j.local = local
+  j.kind = kind
+  if kind == K_EXPECT or kind == K_EXPECTTYPEOF:
+    j.ty = 1
+    if kind == K_EXPECTTYPEOF: j.ty = 2
+    return parse_expect(&l, n, j)
+  if is_call_or_member(parent_kind(&l, n)): return no_jp()
+  if kind == K_JEST or kind == K_VITEST:
+    let lw = name.lower()
+    if not (lw == "jest" or lw == "vi" or lw == "vitest"): return no_jp()
+    j.kind = K_VITEST
+    if lw == "jest": j.kind = K_JEST
+    j.ok = true
+    return j
+  if not all_member: return no_jp()
+  if fw != 0:
+    var parts: [Str] = [name]
+    for i in 1..cl:
+      if j.nm[i] == "\0": return no_jp()
+      parts.push(j.nm[i])
+    let jv = (fw & 1) != 0 and jest_chain_ok(parts)
+    let vv = (fw & 2) != 0 and vitest_chain_ok(parts)
+    if not (jv or vv): return no_jp()
+    if (fw & 2) != 0 and parts.len > 1 and parts[1] == "extend":
+      j.ty = 3
+      j.kind = K_FIXTURE
+  j.ok = true
+  return j
+
+fn parse_expect(var l: L, n: Int, own j0: Jp) -> Jp:
+  var j = j0
+  # find_modifiers_and_matcher (over the members: chain indices 1..)
+  var err = E_NOTFOUND
+  for i in 1..j.nm.len:
+    if j.pk[i] == PK_MEMBER and j.gk[i] == PK_CALL:
+      j.matcher = i
+      err = E_NONE
+      break
+    let nm = j.nm[i]
+    let mod = nm == "not" or nm == "resolves" or nm == "rejects"
+    if j.mods.len == 0:
+      if not mod:
+        err = E_MODIFIER
+        break
+    elif j.mods.len == 1:
+      if nm != "not":
+        err = E_MODIFIER
+        break
+      let f = j.nm[j.mods[0]]
+      if not (f == "resolves" or f == "rejects"):
+        err = E_MODIFIER
+        break
+    else:
+      err = E_MODIFIER
+      break
+    j.mods.push(i)
+  if err != E_NONE:
+    j.mods = []
+    j.matcher = -1
+    if not top_most_call(&l, n): return no_jp()
+    if err == E_NOTFOUND:
+      let pk = parent_kind(&l, n)
+      if pk == ast.N_PROPACCESS or pk == ast.N_ELEMACCESS: err = E_NOTCALLED
+  j.err = err
+  j.ok = true
+  return j
+
+fn top_most_call(var l: L, n: Int) -> Bool:
+  var x = n
+  while true:
+    let p = parent(&l, x)
+    let pk = k(l, p)
+    if pk == ast.N_CALL: return false
+    if pk == ast.N_PROPACCESS or pk == ast.N_ELEMACCESS: x = p
+    else: return true
+  return true
+
+fn is_general(j: Jp) -> Bool:
+  return j.ok and (j.ty == 0 or j.ty == 3)
+
+fn is_expect(j: Jp) -> Bool:
+  return j.ok and j.ty == 1
+
+fn has_member(j: Jp, nm: Str) -> Bool:
+  for i in 1..j.nm.len:
+    if j.nm[i] == nm: return true
+  return false
+
+# the expect call's arguments (head.parent when it's a call), -1 for none
+fn expect_args(l: L, j: Jp) -> Int:
+  if j.nm.len == 0: return -1
+  let p = j.par[0]
+  if p > 0 and l.t.nd[p].k == ast.N_CALL: return p
+  return -1
+
+fn nargs(l: L, call: Int) -> Int:
+  let c = l.t.nd[call].c
+  if c <= 0: return 0
+  return ast.count(l.t, c)
+
+fn argn(l: L, call: Int, i: Int) -> Int:
+  return ast.item(l.t, l.t.nd[call].c, i)
+
+# get_node_name: the names along an expression, joined with dots
+fn node_name(l: L, e: Int) -> Str:
+  var parts: [Str] = []
+  name_parts(l, e, &parts)
+  return ".".join(parts)
+
+fn name_parts(l: L, e: Int, var parts: [Str]):
+  let kd = k(l, e)
+  if kd == ast.N_ID or kd == ast.N_STR or kd == ast.N_NOSUBTEMPL: parts.push(name_of(l, e))
+  elif kd == ast.N_TAGGED or kd == ast.N_CALL or kd == ast.N_NEW: name_parts(l, l.t.nd[e].a, &parts)
+  elif kd == ast.N_PROPACCESS:
+    name_parts(l, l.t.nd[e].a, &parts)
+    if (l.t.nd[e].f & 4) == 0: parts.push(name_of(l, e))
+  elif kd == ast.N_ELEMACCESS:
+    name_parts(l, l.t.nd[e].a, &parts)
+    let ix = l.t.nd[e].b
+    if k(l, ix) == ast.N_STR or k(l, ix) == ast.N_NOSUBTEMPL: parts.push(name_of(l, ix))
+
+# a member expression's static property name ("\0": none)
+fn static_prop(l: L, e: Int) -> Str:
+  let kd = k(l, e)
+  if kd == ast.N_PROPACCESS:
+    if (l.t.nd[e].f & 4) != 0: return "\0"
+    return name_of(l, e)
+  if kd == ast.N_ELEMACCESS:
+    let ix = l.t.nd[e].b
+    if k(l, ix) == ast.N_STR or k(l, ix) == ast.N_NOSUBTEMPL: return name_of(l, ix)
+  return "\0"
+
+fn is_member(l: L, e: Int) -> Bool:
+  let kd = k(l, e)
+  return kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS
+
+# a call's callee_name(): an identifier's name or a member's static property name
+fn callee_name(l: L, call: Int) -> Str:
+  let ce = l.t.nd[call].a
+  if k(l, ce) == ast.N_ID: return name_of(l, ce)
+  if is_member(l, ce): return static_prop(l, ce)
+  return "\0"
+
+# ---- diagnostics
+
+fn jd(var l: L, s: Int, e: Int, code: Str, msg: Str, help: Str, key: Int):
+  l.ds.push(rules.D(s, code, msg, help, -1, 0, "", e, "", false, [], [], JBASE + key, "", false, 1))
+
+fn code(m: Int, name: Str) -> Str:
+  if m == 0: return "jest(" + name + ")"
+  return "vitest(" + name + ")"
+
+# ---- the walk at the end of the file
+
+type Run:
+  seq: Int     # emission counter for the rules that run once
+
+fn file_end(var l: L, root: Int, path: Str):
+  if not l.mc.jc.on: return
+  var orig: [Str] = []
+  let jn = jest_nodes(&l, root, &orig)
+  if k(l, root) == ast.N_LIST: l.mc.jc.roots = ast.items(l.t, root)
+  var r = Run(0)
+  # rules that run once per file
+  for fw in 0..2:
+    if on(l, pick(fw, lmeta.M_JEST_VALID_EXPECT, lmeta.M_VITEST_VALID_EXPECT)): valid_expect(&l, &r, jn, orig, fw)
+    if on(l, pick(fw, lmeta.M_JEST_NO_STANDALONE_EXPECT, lmeta.M_VITEST_NO_STANDALONE_EXPECT)): standalone_expect(&l, &r, jn, orig, fw)
+    if on(l, pick(fw, lmeta.M_JEST_PREFER_SNAPSHOT_HINT, lmeta.M_VITEST_PREFER_SNAPSHOT_HINT)): snapshot_hint(&l, &r, jn, orig, fw)
+    if on(l, pick(fw, lmeta.M_JEST_NO_IDENTICAL_TITLE, lmeta.M_VITEST_NO_IDENTICAL_TITLE)): identical_title(&l, &r, jn, orig, fw)
+    if on(l, pick(fw, lmeta.M_JEST_NO_COMMENTED_OUT_TESTS, lmeta.M_VITEST_NO_COMMENTED_OUT_TESTS)): commented_out(&l, &r, fw)
+  # rules that run on each jest call, in a test file
+  if frameworks(&l) == 0: return
+  let any_node_rule = node_rules_on(l)
+  if not any_node_rule: return
+  for i in 0..jn.len:
+    let n = jn[i]
+    let j = parse(&l, n, orig[i])
+    for fw in 0..2:
+      if on(l, pick(fw, lmeta.M_JEST_NO_FOCUSED_TESTS, lmeta.M_VITEST_NO_FOCUSED_TESTS)): focused(&l, n, j, fw, i)
+      if on(l, pick(fw, lmeta.M_JEST_NO_DISABLED_TESTS, lmeta.M_VITEST_NO_DISABLED_TESTS)): disabled(&l, n, j, fw, i)
+      if on(l, pick(fw, lmeta.M_JEST_VALID_DESCRIBE_CALLBACK, lmeta.M_VITEST_VALID_DESCRIBE_CALLBACK)): describe_callback(&l, n, j, fw, i)
+      if on(l, pick(fw, lmeta.M_JEST_EXPECT_EXPECT, lmeta.M_VITEST_EXPECT_EXPECT)): expect_expect(&l, n, j, fw, i)
+      if on(l, pick(fw, lmeta.M_JEST_VALID_TITLE, lmeta.M_VITEST_VALID_TITLE)): valid_title(&l, n, j, fw, i)
+      if on(l, pick(fw, lmeta.M_JEST_NO_CONDITIONAL_EXPECT, lmeta.M_VITEST_NO_CONDITIONAL_EXPECT)): conditional_expect(&l, n, j, fw, i)
+      if on(l, pick(fw, lmeta.M_JEST_REQUIRE_TO_THROW_MESSAGE, lmeta.M_VITEST_REQUIRE_TO_THROW_MESSAGE)): throw_message(&l, n, j, fw, i)
+      if on(l, pick(fw, lmeta.M_JEST_VALID_EXPECT_IN_PROMISE, lmeta.M_VITEST_VALID_EXPECT_IN_PROMISE)): expect_in_promise(&l, n, j, fw, i)
+    if on(l, lmeta.M_VITEST_WARN_TODO): warn_todo(&l, n, j, i)
+    if on(l, lmeta.M_VITEST_NO_CONDITIONAL_TESTS): conditional_tests(&l, n, j, i)
+    if on(l, lmeta.M_VITEST_REQUIRE_LOCAL_TEST_CONTEXT_FOR_CONCURRENT_SNAPSHOTS): concurrent_snapshots(&l, n, j, i)
+    if on(l, lmeta.M_VITEST_REQUIRE_AWAITED_EXPECT_POLL): expect_poll(&l, n, j, i)
+    if on(l, lmeta.M_VITEST_HOISTED_APIS_ON_TOP): hoisted_apis(&l, n, j, i)
+    if on(l, lmeta.M_VITEST_REQUIRE_MOCK_TYPE_PARAMETERS) and (path.endswith("ts") or path.endswith("tsx")): mock_type_params(&l, n, j, i)
+
+fn pick(fw: Int, a: Int, b: Int) -> Int:
+  if fw == 0: return a
+  return b
+
+fn node_rules_on(l: L) -> Bool:
+  for m in [lmeta.M_JEST_NO_FOCUSED_TESTS, lmeta.M_VITEST_NO_FOCUSED_TESTS, lmeta.M_JEST_NO_DISABLED_TESTS, lmeta.M_VITEST_NO_DISABLED_TESTS, lmeta.M_JEST_VALID_DESCRIBE_CALLBACK, lmeta.M_VITEST_VALID_DESCRIBE_CALLBACK, lmeta.M_JEST_EXPECT_EXPECT, lmeta.M_VITEST_EXPECT_EXPECT, lmeta.M_JEST_VALID_TITLE, lmeta.M_VITEST_VALID_TITLE, lmeta.M_JEST_NO_CONDITIONAL_EXPECT, lmeta.M_VITEST_NO_CONDITIONAL_EXPECT, lmeta.M_JEST_REQUIRE_TO_THROW_MESSAGE, lmeta.M_VITEST_REQUIRE_TO_THROW_MESSAGE, lmeta.M_JEST_VALID_EXPECT_IN_PROMISE, lmeta.M_VITEST_VALID_EXPECT_IN_PROMISE]:
+    if on(l, m): return true
+  for m in vitest_only():
+    if on(l, m): return true
+  return false
+
+# ---- no-focused-tests
+
+fn focused(var l: L, n: Int, j: Jp, fw: Int, key: Int):
+  if not is_general(j): return
+  if not (j.kind == K_DESCRIBE or j.kind == K_TEST): return
+  let c = code(fw, "no-focused-tests")
+  let p = l.t.nd[n].pos
+  if j.name.startswith("f"):
+    jd(&l, p, p + j.name.len, c, "Unexpected focused test.", "Remove focus from test.", key)
+    rules.fix_of(&l, p, p + 1, "", 2)
+    return
+  for i in 1..j.nm.len:
+    if j.nm[i] == "only":
+      jd(&l, j.s[i], j.e[i], c, "Unexpected focused test.", "Remove focus from test.", key)
+      var e = j.e[i]
+      if not j.prop[i]: e += 1
+      rules.fix_of(&l, j.s[i] - 1, e, "", 2)
+      return
+
+# ---- no-disabled-tests
+
+fn disabled(var l: L, n: Int, j: Jp, fw: Int, key: Int):
+  let c = code(fw, "no-disabled-tests")
+  let p = l.t.nd[n].pos
+  let e = l.t.nd[n].end
+  if not is_general(j):
+    if j.ok: return
+    let ce = l.t.nd[n].a
+    if rules.id_is(l, ce, "pending") and rules.is_global(l, ce): jd(&l, p, e, c, "Call to pending()", "Remove pending() call", key)
+    return
+  let kind = j.kind
+  if kind == K_EXPECT or kind == K_EXPECTTYPEOF or kind == K_UNKNOWN or kind == K_FIXTURE: return
+  if kind == K_TEST and nargs(l, n) < 2 and not has_member(j, "todo"):
+    jd(&l, p, e, c, "Test is missing function argument", "Add function argument", key)
+    return
+  let ce = l.t.nd[n].a
+  if j.name.startswith("x"):
+    if kind == K_DESCRIBE: jd(&l, l.t.nd[ce].pos, l.t.nd[ce].end, c, "Disabled test suite", "Remove x prefix", key)
+    else: jd(&l, l.t.nd[ce].pos, l.t.nd[ce].end, c, "Disabled test", "Remove x prefix", key)
+    return
+  if has_member(j, "skip"):
+    if kind == K_DESCRIBE: jd(&l, l.t.nd[ce].pos, l.t.nd[ce].end, c, "Disabled test suite", "Remove the appending `.skip`", key)
+    else: jd(&l, l.t.nd[ce].pos, l.t.nd[ce].end, c, "Disabled test", "Remove the appending `.skip`", key)
+
+# ---- valid-describe-callback
+
+fn is_fn_arg(l: L, a: Int) -> Bool:
+  let kd = k(l, a)
+  return kd == ast.N_FUNCEXPR or kd == ast.N_ARROW
+
+fn param_count(l: L, f: Int) -> Int:
+  var ps = l.t.nd[f].b
+  let kd = k(l, f)
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
+    let sg = l.t.nd[f].b
+    if sg <= 0: return 0
+    ps = l.t.nd[sg].b
+  if ps <= 0: return 0
+  var n = 0
+  for x in ast.items(l.t, ps):
+    if k(l, x) == ast.N_PARAM:
+      let nm = l.t.nd[x].a
+      if k(l, nm) == ast.N_THIS or (k(l, nm) == ast.N_ID and name_of(l, nm) == "this"): continue
+    n += 1
+  return n
+
+fn fbody(l: L, f: Int) -> Int:
+  let kd = k(l, f)
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW: return l.t.nd[f].d
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR: return l.t.nd[f].c
+  return -1
+
+fn first_return(l: L, body: Int) -> Int:
+  if k(l, body) != ast.N_BLOCK: return -1
+  for st in ast.items(l.t, l.t.nd[body].a):
+    if k(l, st) == ast.N_RETURN: return st
+  return -1
+
+fn dcb(var l: L, x: Int, fw: Int, msg: Str, help: Str, key: Int):
+  jd(&l, l.t.nd[x].pos, l.t.nd[x].end, code(fw, "valid-describe-callback"), msg, help, key)
+
+fn describe_callback(var l: L, n: Int, j: Jp, fw: Int, key: Int):
+  if not is_general(j) or j.kind != K_DESCRIBE: return
+  let na = nargs(l, n)
+  let ce = l.t.nd[n].a
+  if (frameworks(&l) & 2) != 0 and na == 1 and is_member(l, ce):
+    let pn = static_prop(l, ce)
+    if pn == "\0" or pn == "todo": return
+  if na == 0:
+    dcb(&l, n, fw, "Describe requires name and callback arguments", "Add name as first argument and callback as second argument", key)
+    return
+  if na == 1:
+    dcb(&l, argn(l, n, 0), fw, "Describe requires name and callback arguments", "Add name as first argument and callback as second argument", key)
+    return
+  var cb = argn(l, n, 1)
+  if fw == 1 and na > 2 and not is_fn_arg(l, cb) and is_fn_arg(l, argn(l, n, 2)): cb = argn(l, n, 2)
+  let ck = k(l, cb)
+  if ck == ast.N_FUNCEXPR or ck == ast.N_ARROW:
+    if (l.t.nd[cb].f & ast.M_ASYNC) != 0 and fw == 0: dcb(&l, cb, fw, "No async describe callback", "Remove `async` keyword", key)
+    if not has_member(j, "each") and not has_member(j, "for") and param_count(l, cb) > 0: dcb(&l, cb, fw, "Unexpected argument(s) in describe callback", "Remove argument(s) of describe callback", key)
+    let body = fbody(l, cb)
+    if ck == ast.N_ARROW and k(l, body) != ast.N_BLOCK:
+      if k(l, body) == ast.N_CALL: dcb(&l, body, fw, "Unexpected return statement in describe callback", "Remove return statement in your describe callback", key)
+      return
+    let r = first_return(l, body)
+    if r > 0: dcb(&l, r, fw, "Unexpected return statement in describe callback", "Remove return statement in your describe callback", key)
+    return
+  if ck == ast.N_SPREAD:
+    # (a spread argument: its span)
+    dcb(&l, cb, fw, "Second argument must be a function", "Replace second argument with a function", key)
+    return
+  dcb(&l, cb, fw, "Second argument must be a function", "Replace second argument with a function", key)
+
+# ---- require-to-throw-message
+
+fn throw_message(var l: L, n: Int, j: Jp, fw: Int, key: Int):
+  if not is_expect(j) or j.matcher < 0: return
+  let mn = j.nm[j.matcher]
+  if mn == "\0": return
+  for i in j.mods:
+    if j.nm[i] == "not": return
+  if nargs(l, n) == 0 and (mn == "toThrow" or mn == "toThrowError"):
+    jd(&l, j.s[j.matcher], j.e[j.matcher], code(fw, "require-to-throw-message"), "Require a message for \"{mn}\".", "Add an error message to \"{mn}\"", key)
+
+# ---- warn-todo (vitest)
+
+fn warn_todo(var l: L, n: Int, j: Jp, key: Int):
+  if not j.ok or not (j.kind == K_DESCRIBE or j.kind == K_TEST): return
+  if not is_general(j): return
+  for i in 1..j.nm.len:
+    if j.nm[i] == "todo":
+      jd(&l, j.s[i], j.e[i], "vitest(warn-todo)", "The use of `.todo` is not recommended.", "Write an actual test and remove the `.todo` modifier before pushing/merging your changes.", key)
+      return
+
+# ---- no-conditional-tests (vitest)
+
+fn conditional_tests(var l: L, n: Int, j: Jp, key: Int):
+  if not j.ok or not (j.kind == K_DESCRIBE or j.kind == K_TEST): return
+  var x = parent(&l, n)
+  while x > 0:
+    if l.t.nd[x].k == ast.N_IF:
+      jd(&l, l.t.nd[x].pos, l.t.nd[x].end, "vitest(no-conditional-tests)", "Avoid having conditionals in tests", "Remove the surrounding if statement.", key)
+      return
+    x = parent(&l, x)
+
+# ---- require-local-test-context-for-concurrent-snapshots (vitest)
+
+fn concurrent_snapshots(var l: L, n: Int, j: Jp, key: Int):
+  if not j.ok or j.kind != K_EXPECT: return
+  let ce = l.t.nd[n].a
+  if not is_member(l, ce): return
+  let pn = static_prop(l, ce)
+  if not (pn == "toMatchSnapshot" or pn == "toMatchInlineSnapshot" or pn == "toMatchFileSnapshot" or pn == "toThrowErrorMatchingSnapshot" or pn == "toThrowErrorMatchingInlineSnapshot"): return
+  var x = parent(&l, n)
+  while x > 0:
+    if l.t.nd[x].k == ast.N_CALL:
+      let m = l.t.nd[x].a
+      if is_member(l, m):
+        let o = l.t.nd[m].a
+        if k(l, o) == ast.N_ID:
+          let kk = kind_from(name_of(l, o))
+          if (kk == K_DESCRIBE or kk == K_TEST) and static_prop(l, m) == "concurrent":
+            jd(&l, l.t.nd[n].pos, l.t.nd[n].end, "vitest(require-local-test-context-for-concurrent-snapshots)", "Require local Test Context for concurrent snapshot tests", "Use local Test Context instead", key)
+            return
+    x = parent(&l, x)
+
+# ---- require-awaited-expect-poll (vitest)
+
+fn is_comma(l: L, x: Int) -> Bool:
+  return k(l, x) == ast.N_BINARY and l.t.nd[x].f == scan.T_COMMA
+
+fn expect_poll(var l: L, n: Int, j: Jp, key: Int):
+  if not j.ok or not (j.ty == 1 or j.ty == 2): return
+  if j.nm.len < 2 or not (j.nm[1] == "poll" or j.nm[1] == "element"): return
+  # skip matchers and modifiers
+  var cur = n
+  while true:
+    let p = parent(&l, cur)
+    let pk = k(l, p)
+    if pk == ast.N_PROPACCESS or pk == ast.N_ELEMACCESS or pk == ast.N_CALL: cur = p
+    else: break
+  # skip parentheses and sequences (when last)
+  while true:
+    let p = parent(&l, cur)
+    let pk = k(l, p)
+    if pk == ast.N_PAREN: cur = p
+    elif is_comma(l, p):
+      if l.t.nd[p].b != cur: break
+      # the whole sequence: up through the commas this one is the left operand of
+      var top = p
+      while true:
+        let tp2 = parent(&l, top)
+        if is_comma(l, tp2) and l.t.nd[tp2].a == top: top = tp2
+        else: break
+      if top != p: break
+      cur = p
+    else: break
+  let pk = parent_kind(&l, cur)
+  if pk == ast.N_RETURN or pk == ast.N_AWAIT: return
+  let mn = j.nm[1]
+  jd(&l, l.t.nd[n].pos, l.t.nd[n].end, "vitest(require-awaited-expect-poll)", "`expect.{mn}` must be awaited or returned", "Add `await` to the `expect.{mn}` call.", key)
+
+# ---- hoisted-apis-on-top (vitest)
+
+fn hoisted_apis(var l: L, n: Int, j: Jp, key: Int):
+  if not is_general(j) or j.kind != K_VITEST: return
+  if j.nm.len < 2: return
+  let mn = j.nm[1]
+  if not (mn == "mock" or mn == "hoisted" or mn == "unmock"): return
+  let p = parent(&l, n)
+  if mn == "hoisted":
+    var pp = p
+    if k(l, pp) == ast.N_AWAIT: pp = parent(&l, pp)
+    if k(l, pp) == ast.N_DECL: pp = parent(&l, pp)
+    let gp = parent(&l, pp)
+    if (k(l, pp) == ast.N_EXPRSTMT or k(l, pp) == ast.N_VAR) and top_level(l, gp): return
+  else:
+    let gp = parent(&l, p)
+    if k(l, p) == ast.N_EXPRSTMT and top_level(l, gp): return
+  jd(&l, l.t.nd[n].pos, l.t.nd[n].end, "vitest(hoisted-apis-on-top)", "Hoisted API cannot be used in a runtime location in this file.", "Move this hoisted API to the top of the file to better reflect its behavior.\nYou may alternatively replace `vi.mock()` with `vi.doMock`, which is not hoisted.", key)
+  # (the first suggestion: move it to the top, after the last import)
+  let ns = l.t.nd[n].pos
+  let ne = l.t.nd[n].end
+  var rep = "undefined"
+  if k(l, p) == ast.N_EXPRSTMT: rep = ""
+  var at = -1
+  var nc = text(l, n) + ";\n"
+  for st in l.mc.jc.roots:
+    if k(l, st) != ast.N_IMPORT: continue
+    if l.t.nd[st].b > 0 or l.t.nd[st].c > 0 or (l.t.nd[st].d > 0 and ast.count(l.t, l.t.nd[st].d) > 0): at = l.t.nd[st].end
+  if at >= 0: nc = "\n" + nc
+  else: at = 0
+  if at <= ns: rules.fix_of(&l, at, ne, nc + l.src[at..ns] + rep, 2)
+  else: rules.fix_of(&l, ns, at, rep + l.src[ne..at] + nc, 2)
+
+# the program (vlint's parent of a top-level statement is 0)
+fn top_level(l: L, x: Int) -> Bool:
+  return x == 0
+
+# ---- require-mock-type-parameters (vitest)
+
+fn mock_type_params(var l: L, n: Int, j: Jp, key: Int):
+  if not is_general(j) or j.kind != K_VITEST: return
+  let imp = l.mc.jc.o[1].mt_imports
+  var mi = -1
+  for i in 1..j.nm.len:
+    let nm = j.nm[i]
+    if nm == "fn" or (imp and (nm == "importMock" or nm == "importActual")):
+      mi = i
+      break
+  if mi < 0: return
+  if member_call_typed(l, n, j.s[mi], j.e[mi]) != 0: return
+  var mn = j.nm[mi]
+  if mn == "\0": mn = "fn"
+  jd(&l, j.s[mi], j.e[mi], "vitest(require-mock-type-parameters)", "Missing type parameters on mock function call", "Add a type parameter to the mock function, e.g. `vi.{mn}<() => void>()`.", key)
+
+# 1 typed (or not found), 0 not
+fn member_call_typed(l: L, call: Int, s: Int, e: Int) -> Int:
+  let ce = l.t.nd[call].a
+  if is_member(l, ce):
+    if static_prop(l, ce) != "\0" and prop_span_is(l, ce, s, e):
+      if l.t.nd[call].b > 0: return 1
+      return 0
+    return typed_in(l, l.t.nd[ce].a, s, e)
+  return typed_in(l, ce, s, e)
+
+fn prop_span_is(l: L, m: Int, s: Int, e: Int) -> Bool:
+  if k(l, m) == ast.N_PROPACCESS: return l.t.nd[m].end == e and l.t.nd[m].end - name_of(l, m).len == s
+  let ix = l.t.nd[m].b
+  return l.t.nd[ix].pos == s and l.t.nd[ix].end == e
+
+fn typed_in(l: L, e0: Int, s: Int, e: Int) -> Int:
+  let x = rmore.inner(l, e0)
+  if k(l, x) == ast.N_CALL: return member_call_typed(l, x, s, e)
+  if is_member(l, x): return typed_in(l, l.t.nd[x].a, s, e)
+  return 1
+
+# ---- expect-expect
+
+fn expect_expect(var l: L, n: Int, j: Jp, fw: Int, key: Int):
+  let test = j.ok and j.kind == K_TEST
+  if not test:
+    if l.mc.jc.o[fw].ee_extra.len == 0: return
+    let nm = node_name(l, l.t.nd[n].a)
+    if not (nm in l.mc.jc.o[fw].ee_extra): return
+  let vitest = fw == 1 or (frameworks(&l) & 2) != 0
+  let ce = l.t.nd[n].a
+  if is_member(l, ce):
+    let pn = static_prop(l, ce)
+    if pn == "\0" or pn == "todo": return
+    if pn == "skip" and vitest: return
+  var vi = 0
+  if vitest: vi = 1
+  if l.mc.jc.av_done[fw * 2 + vi] == false:
+    l.mc.jc.av_done[fw * 2 + vi] = true
+    var names: [Str] = []
+    if l.mc.jc.o[fw].ee_given:
+      for x in l.mc.jc.o[fw].ee_names: names.push(x + "")
+    elif vitest:
+      for x in ["expect", "expectTypeOf", "assert", "assertType"]: names.push(x)
+    else: names.push("expect")
+    var pats: [lmatch.Re] = []
+    var exact: [Bool] = []
+    for x in names:
+      var ex = true
+      for i in 0..x.len:
+        let c = x[i]
+        if not ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.'): ex = false
+      exact.push(ex)
+      if ex: pats.push(lmatch.compile("", ""))
+      else: pats.push(lmatch.compile(convert_pattern(x), "i"))
+    l.mc.jc.avs[fw * 2 + vi] = Av(names, exact, pats, false)
+  var v = Av([], [], [], false)
+  swap(&v, &l.mc.jc.avs[fw * 2 + vi])
+  if l.mc.jc.stamp.len != l.t.nd.len: l.mc.jc.stamp = [0] * l.t.nd.len
+  l.mc.jc.gen += 1
+  var found = false
+  for a in args_of(l, n):
+    if k(l, a) == ast.N_SPREAD: continue
+    if check_e(&l, &v, a):
+      found = true
+      break
+  swap(&v, &l.mc.jc.avs[fw * 2 + vi])
+  if found: return
+  jd(&l, l.t.nd[ce].pos, l.t.nd[ce].end, code(fw, "expect-expect"), "Test has no assertions", "Add assertion(s) in this Test", key)
+
+fn args_of(l: L, call: Int) -> [Int]:
+  let c = l.t.nd[call].c
+  if c <= 0: return []
+  return ast.items(l.t, c)
+
+# convert_pattern: `request.*.expect` -> ^request\.[a-z\d]*\.expect(\.|$)
+fn convert_pattern(p: Str) -> Str:
+  var segs: [Str] = []
+  for s in p.split("."):
+    if s == "**": segs.push("[a-z\\d\\.]*")
+    else: segs.push(s.replace("*", "[a-z\\d]*"))
+  return "^" + "\\.".join(segs) + "(\\.|$)"
+
+type Av:
+  names: [Str]
+  exact: [Bool]
+  pats: [lmatch.Re]
+  found: Bool
+
+fn eq_icase(a: Str, b: Str) -> Bool:
+  if a.len != b.len: return false
+  for i in 0..a.len:
+    var x = int(a[i])
+    var y = int(b[i])
+    if x >= 65 and x <= 90: x += 32
+    if y >= 65 and y <= 90: y += 32
+    if x != y: return false
+  return true
+
+fn assert_name(v: Av, nm: Str) -> Bool:
+  for i in 0..v.names.len:
+    let ex = v.names[i]
+    if v.exact[i]:
+      if nm.len == ex.len:
+        if eq_icase(nm, ex): return true
+      elif nm.len > ex.len and nm[ex.len] == '.' and eq_icase(nm[0..ex.len], ex): return true
+    elif lmatch.test(v.pats[i], nm): return true
+  return false
+
+# AssertionVisitor::check_expression (each expression once)
+fn check_e(var l: L, var v: Av, e: Int) -> Bool:
+  if e <= 0: return false
+  if l.mc.jc.stamp[e] == l.mc.jc.gen: return false
+  l.mc.jc.stamp[e] = l.mc.jc.gen
+  let kd = l.t.nd[e].k
+  if kd == ast.N_FUNCEXPR: return walk(&l, &v, l.t.nd[e].d)
+  if kd == ast.N_ARROW:
+    let b = l.t.nd[e].d
+    if k(l, b) == ast.N_BLOCK: return walk(&l, &v, b)
+    return check_e(&l, &v, b) or walk(&l, &v, b)
+  if kd == ast.N_CALL: return visit_call(&l, &v, e)
+  if kd == ast.N_ID:
+    let f = fdecl(&l, e)
+    if f > 0: return walk(&l, &v, l.t.nd[f].d)
+    return false
+  if kd == ast.N_AWAIT: return check_e(&l, &v, l.t.nd[e].a)
+  if kd == ast.N_ARRAY:
+    for x in ast.items(l.t, l.t.nd[e].a):
+      let xk = k(l, x)
+      if xk == ast.N_SPREAD or xk == ast.N_OMIT: continue
+      if check_e(&l, &v, x): return true
+  return false
+
+fn visit_call(var l: L, var v: Av, c: Int) -> Bool:
+  if assert_name(v, node_name(l, l.t.nd[c].a)): return true
+  let args = args_of(l, c)
+  for a in args:
+    if k(l, a) == ast.N_SPREAD: continue
+    if check_e(&l, &v, a): return true
+  if walk(&l, &v, l.t.nd[c].a): return true
+  for a in args:
+    if walk(&l, &v, a): return true
+  return false
+
+# the visitor's walk (VisitJs with its overrides): whether an assertion is found
+fn walk(var l: L, var v: Av, x: Int) -> Bool:
+  if x <= 0 or x >= l.t.nd.len: return false
+  let kd = l.t.nd[x].k
+  if kd == ast.N_LIST:
+    for i in 0..l.t.nd[x].b:
+      let y = l.t.L[l.t.nd[x].a + i]
+      if y > 0 and walk(&l, &v, y): return true
+    return false
+  if kd == ast.N_CALL: return visit_call(&l, &v, x)
+  if kd == ast.N_EXPRSTMT:
+    let e = l.t.nd[x].a
+    return check_e(&l, &v, e) or walk(&l, &v, e)
+  if kd == ast.N_IF:
+    let b = l.t.nd[x].b
+    if k(l, b) == ast.N_BLOCK and walk(&l, &v, b): return true
+    return walk(&l, &v, l.t.nd[x].c)
+  if kd == ast.N_FUNC: return walk(&l, &v, l.t.nd[x].d)
+  if kd == ast.N_FUNCEXPR or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR or kd == ast.N_PARAM: return false
+  if kd == ast.N_ARROW:
+    let b = l.t.nd[x].d
+    if k(l, b) == ast.N_BLOCK: return walk(&l, &v, b)
+    return check_e(&l, &v, b) or walk(&l, &v, b)
+  # types are not visited
+  if kd >= ast.N_TREF and kd <= ast.N_TREST: return false
+  var nk = 4
+  if kd == ast.N_VAR or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS or kd == ast.N_PROPACCESS: nk = 3
+  for i in 0..nk:
+    var c = l.t.nd[x].a
+    if i == 1: c = l.t.nd[x].b
+    elif i == 2: c = l.t.nd[x].c
+    elif i == 3: c = l.t.nd[x].d
+    if c > 0 and walk(&l, &v, c): return true
+  return false
+
+# the function declaration an identifier refers to (-1)
+fn fdecl(var l: L, id: Int) -> Int:
+  if not l.mc.jc.fdecl_done:
+    l.mc.jc.fdecl_done = true
+    var fs: [Int] = []
+    var ys: [Int] = []
+    for f, y in l.sc.fsym:
+      if k(l, f) == ast.N_FUNC:
+        fs.push(f)
+        ys.push(y)
+    for i in 0..fs.len:
+      if not (ys[i] in l.mc.jc.fdecl): l.mc.jc.fdecl[ys[i]] = fs[i]
+  let y = scope.sym_of(l.sc, id)
+  if y < 0: return -1
+  let f = l.mc.jc.fdecl.get(y, -1)
+  if f > 0 and l.t.nd[f].d > 0: return f
+  return -1
+
+# ---- no-conditional-expect
+
+fn is_test_call(var l: L, call: Int) -> Bool:
+  let j = parse(&l, call, "")
+  return j.ok and j.kind == K_TEST
+
+fn conditional_expect(var l: L, n: Int, j: Jp, fw: Int, key: Int):
+  if not is_expect(j): return
+  var seen: {Int: Bool} = {}
+  if check_parents(&l, n, false, &seen):
+    jd(&l, j.s[0], j.e[0], code(fw, "no-conditional-expect"), "Unexpected conditional expect", "Avoid calling `expect` conditionally", key)
+
+fn check_parents(var l: L, x0: Int, cond0: Bool, var seen: {Int: Bool}) -> Bool:
+  var x = x0
+  var cond = cond0
+  while true:
+    if x in seen: return false
+    seen[x] = true
+    let p = parent(&l, x)
+    if p <= 0: return false
+    let pk = l.t.nd[p].k
+    if pk == ast.N_CALL:
+      if is_test_call(&l, p): return cond
+      let ce = l.t.nd[p].a
+      if is_member(l, ce) and static_prop(l, ce) == "catch": cond = true
+    elif pk == ast.N_TRY:
+      if x == l.t.nd[p].c or x == l.t.nd[p].b: cond = true
+    elif pk == ast.N_SWITCH or pk == ast.N_IF or pk == ast.N_COND: cond = true
+    elif pk == ast.N_BINARY:
+      let op = l.t.nd[p].f
+      if op == scan.T_AND or op == scan.T_OR or op == scan.T_QQ: cond = true
+    elif pk == ast.N_FUNC:
+      # a function declaration: used in a test?
+      let y = fn_symbol(l, p)
+      if y < 0: return false
+      for r in refs_of(&l, y):
+        let rp = parent(&l, r)
+        if k(l, rp) == ast.N_CALL and is_test_call(&l, rp): return cond
+        if in_test_context(&l, rp): return cond
+      return false
+    x = p
+  return false
+
+fn fn_symbol(l: L, f: Int) -> Int:
+  return l.sc.fsym.get(f, -1)
+
+fn refs_of(var l: L, y: Int) -> [Int]:
+  if not l.mc.jc.refs_done:
+    l.mc.jc.refs_done = true
+    let n = l.sc.res.len
+    for x in 1..n:
+      if x >= l.t.nd.len or l.t.nd[x].k != ast.N_ID: continue
+      let s = l.sc.res[x]
+      if s < 0: continue
+      if l.t.nd[x].pos == l.sc.ypos[s]: continue
+      if not (s in l.mc.jc.refs): l.mc.jc.refs[s] = []
+      l.mc.jc.refs[s].push(x)
+  var out: [Int] = []
+  if y in l.mc.jc.refs:
+    for x in l.mc.jc.refs[y]: out.push(x)
+  return out
+
+fn in_test_context(var l: L, x0: Int) -> Bool:
+  var x = x0
+  while x > 0:
+    x = parent(&l, x)
+    if k(l, x) == ast.N_CALL and is_test_call(&l, x): return true
+  return false
+
+# ---- valid-title
+
+fn valid_title(var l: L, n: Int, j: Jp, fw: Int, key: Int):
+  if not is_general(j): return
+  let o = copt(l.mc.jc.o[fw])
+  var report = false
+  if j.kind == K_TEST: report = not o.vt_ign_test
+  elif j.kind == K_DESCRIBE: report = not o.vt_ign_desc
+  else: return
+  if j.nm.len > 1 and j.nm[1] == "extend": return
+  if nargs(l, n) == 0: return
+  let a = argn(l, n, 0)
+  if l.mc.jc.vt_typecheck and j.kind == K_DESCRIBE: return
+  let ak = k(l, a)
+  if o.vt_args and ak == ast.N_ID: return
+  let c = code(fw, "valid-title")
+  if ak == ast.N_STR:
+    validate_title(&l, name_of(l, a), l.t.nd[a].pos, l.t.nd[a].end, o, j.name, c, key)
+  elif ak == ast.N_TAGGED:
+    let tag = l.t.nd[a].a
+    if not string_raw(l, tag):
+      if report: jd(&l, l.t.nd[a].pos, l.t.nd[a].end, c, "Title must be a string", "Replace your title with a string", key)
+      return
+    let q = l.t.nd[a].c
+    if k(l, q) == ast.N_NOSUBTEMPL: validate_title(&l, l.src[l.t.nd[q].pos + 1..l.t.nd[q].end - 1], l.t.nd[q].pos, l.t.nd[q].end, o, j.name, c, key)
+  elif ak == ast.N_NOSUBTEMPL:
+    validate_title(&l, name_of(l, a), l.t.nd[a].pos, l.t.nd[a].end, o, j.name, c, key)
+  elif ak == ast.N_TEMPL: return
+  elif ak == ast.N_BINARY and not rules.is_assign_op(l.t.nd[a].f) and not logical_op(l.t.nd[a].f) and l.t.nd[a].f != scan.T_COMMA:
+    if binary_has_string(l, a): return
+    if report: jd(&l, l.t.nd[a].pos, l.t.nd[a].end, c, "Title must be a string", "Replace your title with a string", key)
+  else:
+    if report: jd(&l, l.t.nd[a].pos, l.t.nd[a].end, c, "Title must be a string", "Replace your title with a string", key)
+
+fn logical_op(op: Int) -> Bool:
+  return op == scan.T_AND or op == scan.T_OR or op == scan.T_QQ
+
+fn string_raw(l: L, tag: Int) -> Bool:
+  if k(l, tag) != ast.N_PROPACCESS: return false
+  let o = l.t.nd[tag].a
+  return name_of(l, tag) == "raw" and rules.id_is(l, o, "String") and rules.is_global(l, o)
+
+fn is_str_lit(l: L, x: Int) -> Bool:
+  let kd = k(l, x)
+  return kd == ast.N_STR or kd == ast.N_NOSUBTEMPL or kd == ast.N_TEMPL
+
+fn binary_has_string(l: L, b: Int) -> Bool:
+  let a = l.t.nd[b].a
+  if is_str_lit(l, a) or is_str_lit(l, l.t.nd[b].b): return true
+  if k(l, a) == ast.N_BINARY and not rules.is_assign_op(l.t.nd[a].f) and not logical_op(l.t.nd[a].f) and l.t.nd[a].f != scan.T_COMMA: return binary_has_string(l, a)
+  return false
+
+# Unicode White_Space at byte i: its length (0: not)
+fn ws_len(s: Str, i: Int) -> Int:
+  let c = s[i]
+  if c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12: return 1
+  if c == 0xC2 and i + 1 < s.len and (s[i + 1] == 0x85 or s[i + 1] == 0xA0): return 2
+  if c == 0xE1 and i + 2 < s.len and s[i + 1] == 0x9A and s[i + 2] == 0x80: return 3
+  if c == 0xE2 and i + 2 < s.len:
+    let c1 = s[i + 1]
+    let c2 = s[i + 2]
+    if c1 == 0x80 and ((c2 >= 0x80 and c2 <= 0x8A) or c2 == 0xA8 or c2 == 0xA9 or c2 == 0xAF): return 3
+    if c1 == 0x81 and c2 == 0x9F: return 3
+  if c == 0xE3 and i + 2 < s.len and s[i + 1] == 0x80 and s[i + 2] == 0x80: return 3
+  return 0
+
+fn starts_ws(s: Str) -> Bool:
+  return s.len > 0 and ws_len(s, 0) > 0
+
+fn ends_ws(s: Str) -> Bool:
+  if s.len == 0: return false
+  var i = s.len - 1
+  while i > 0 and (s[i] & 0xC0) == 0x80: i -= 1
+  return ws_len(s, i) > 0
+
+# (leading, trailing) whitespace bytes
+fn ws_lens(s: Str) -> [Int]:
+  var lead = 0
+  var trail = 0
+  var other = false
+  var i = 0
+  while i < s.len:
+    let w = ws_len(s, i)
+    if w > 0:
+      trail += w
+      if not other: lead += w
+      i += w
+    else:
+      other = true
+      trail = 0
+      i += 1
+      while i < s.len and (s[i] & 0xC0) == 0x80: i += 1
+  return [lead, trail]
+
+fn can_trim(cooked: Str, raw: Str) -> Bool:
+  let a = ws_lens(cooked)
+  let b = ws_lens(raw)
+  return a[0] == b[0] and a[1] == b[1]
+
+fn trim_ws(s: Str) -> Str:
+  var a = 0
+  while a < s.len and ws_len(s, a) > 0: a += ws_len(s, a)
+  var b = s.len
+  while b > a:
+    var i = b - 1
+    while i > a and (s[i] & 0xC0) == 0x80: i -= 1
+    if ws_len(s, i) > 0: b = i
+    else: break
+  return s[a..b]
+
+fn validate_title(var l: L, title: Str, s: Int, e: Int, o: Opt, name: Str, c: Str, key: Int):
+  if title.len == 0:
+    jd(&l, s, e, c, "Should not have an empty title", "Write a meaningful title for your test", key)
+    return
+  let lone = has_lone(title) or (title.find(chr(0xFFFD)) >= 0 and rmore3.lone_display_span(l, s, e) != "")
+  if o.vt_words.len > 0 and not lone:
+    let w = disallowed(title, o.vt_words)
+    if w != "":
+      jd(&l, s, e, c, "{w} is not allowed in test title", "It is included in the `disallowedWords` of your config file, try to remove it from your title", key)
+      return
+  if not o.vt_spaces and (starts_ws(title) or ends_ws(title)):
+    let raw = l.src[s + 1..e - 1]
+    jd(&l, s, e, c, "Should not have leading or trailing spaces", "Remove the leading or trailing spaces", key)
+    if can_trim(title, raw): rules.fix_of(&l, s + 1, e - 1, trim_ws(raw), 1)
+  var un = name + ""
+  while un.len > 0 and (un[0] == 'f' or un[0] == 'x'): un = un[1..un.len]
+  var fw_len = title.find(" ")
+  if fw_len < 0: fw_len = title.len
+  if fw_len == un.len and title.startswith(un):
+    let raw = l.src[s + 1..e - 1]
+    jd(&l, s, e, c, "Should not have duplicate prefix", "The function name already has the prefix, try to remove the duplicate prefix", key)
+    if raw.startswith(un + " ") and fw_len < title.len:
+      let rest = raw[un.len + 1..raw.len]
+      if can_trim(title[un.len + 1..title.len], rest): rules.fix_of(&l, s + 1, e - 1, trim_ws(rest), 1)
+    return
+  var at = -1
+  if un == "describe": at = 0
+  elif un == "test": at = 1
+  elif un == "it": at = 2
+  if at < 0: return
+  if o.vt_mm[at] != "":
+    let re = lmatch.compile(strip_u(o.vt_mm[at]), "u")
+    if re.ok and (lone or not lmatch.test(re, title)):
+      var msg = o.vt_mmm[at]
+      if msg == "\0": msg = "{un} should match {o.vt_mm[at]}"
+      jd(&l, s, e, c, msg, "Make sure the title matches the `mustMatch` of your config file", key)
+  if o.vt_mn[at] != "":
+    let re = lmatch.compile(strip_u(o.vt_mn[at]), "u")
+    if re.ok and not lone and lmatch.test(re, title):
+      var msg = o.vt_mnm[at]
+      if msg == "\0": msg = "{un} should not match {o.vt_mn[at]}"
+      jd(&l, s, e, c, msg, "Make sure the title does not match the `mustNotMatch` of your config file", key)
+
+# a lone surrogate (WTF-8): the title isn't UTF-8 text
+fn has_lone(s: Str) -> Bool:
+  for i in 0..s.len - 1:
+    if s[i] == 0xED and s[i + 1] >= 0xA0: return true
+  return false
+
+fn strip_u(p: Str) -> Str:
+  if p.startswith("(?u)"): return p[4..p.len]
+  return p
+
+fn word_byte(s: Str, i: Int) -> Bool:
+  if i < 0 or i >= s.len: return false
+  let c = s[i]
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c >= 0x80
+
+# (?iu)\b(?:w1|w2|...)\b: the first match's text ("" none)
+fn disallowed(title: Str, words: [Str]) -> Str:
+  let lt = title.lower()
+  for i in 0..title.len:
+    if word_byte(title, i - 1) and word_byte(title, i): continue
+    for w in words:
+      if w.len == 0: continue
+      let lw = w.lower()
+      if lw.len == w.len and i + lw.len <= lt.len and lt[i..i + lw.len] == lw:
+        let e = i + lw.len
+        let wb_start = word_byte(title, i - 1) != word_byte(title, i)
+        let wb_end = word_byte(title, e - 1) != word_byte(title, e)
+        if wb_start and wb_end: return title[i..e]
+  return ""
+
+# ---- valid-expect (once per file, calls in node order)
+
+fn ancestor_fn(var l: L, n: Int) -> Int:
+  var x = parent(&l, n)
+  while x > 0:
+    if rules.is_func(l.t.nd[x].k): return x
+    x = parent(&l, x)
+  return -1
+
+fn by_node_order(l: L, jn: [Int]) -> [Int]:
+  var ix: [Int] = []
+  for i in 0..jn.len: ix.push(i)
+  # (node ids are given in visit order: by start, the outer first)
+  ix.sort(by: fn(a, b) => l.t.nd[jn[a]].pos < l.t.nd[jn[b]].pos or (l.t.nd[jn[a]].pos == l.t.nd[jn[b]].pos and l.t.nd[jn[a]].end > l.t.nd[jn[b]].end))
+  return ix
+
+fn valid_expect(var l: L, var r: Run, jn: [Int], orig: [Str], fw: Int):
+  let o = copt(l.mc.jc.o[fw])
+  let c = code(fw, "valid-expect")
+  var fixed: {Int: Bool} = {}
+  for i in by_node_order(l, jn):
+    let n = jn[i]
+    let j = parse(&l, n, orig[i])
+    if not is_expect(j): continue
+    if j.err != E_NONE:
+      var sp = n
+      let top = top_member(&l, n)
+      if top > 0: sp = top
+      var msg = "Expect must have a corresponding matcher call."
+      var help = "Did you forget to add a matcher, e.g. `toBe`, `toBeDefined`"
+      if j.err == E_NOTCALLED:
+        msg = "Matchers must be called to assert."
+        help = "You need to call your matcher, e.g. `expect(true).toBe(true)`."
+      elif j.err == E_MODIFIER:
+        msg = "Expect has an unknown modifier."
+        help = "Is it a spelling mistake?"
+      jd(&l, l.t.nd[sp].pos, l.t.nd[sp].end, c, msg, help, r.seq)
+      r.seq += 1
+      continue
+    let ec = expect_args(l, j)
+    if ec < 0: continue
+    let na = nargs(l, ec)
+    var allow_msg = false
+    if fw == 1 and na == 2:
+      let a1 = argn(l, ec, 1)
+      let a1k = k(l, a1)
+      allow_msg = a1k == ast.N_STR or a1k == ast.N_NOSUBTEMPL or a1k == ast.N_TEMPL
+    if na > o.ve_max and not allow_msg:
+      var s = ""
+      if o.ve_max > 1: s = "s"
+      jd(&l, l.t.nd[ec].pos, l.t.nd[ec].end, c, "Expect takes at most {o.ve_max} argument{s} ", "Remove the extra arguments.", r.seq)
+      r.seq += 1
+      continue
+    if na < o.ve_min:
+      var s = ""
+      if o.ve_min > 1: s = "s"
+      jd(&l, l.t.nd[ec].pos, l.t.nd[ec].end, c, "Expect requires at least {o.ve_min} argument{s} ", "Add the missing arguments.", r.seq)
+      r.seq += 1
+      continue
+    if j.matcher < 0: continue
+    let mn = j.nm[j.matcher]
+    if mn == "\0": continue
+    var should = mn in o.ve_async
+    for mi in j.mods:
+      if j.nm[mi] != "not": should = true
+    if not should: continue
+    let target = thenable_parent(&l, n)
+    let fin = promise_call(&l, n, target)
+    if fin < 0: continue
+    let fp = parent(&l, fin)
+    if not acceptable_return(&l, fp, fin, not o.ve_await):
+      var sp = fin
+      var msg = "Promises which return async assertions must be awaited."
+      if target == fin: msg = "Async assertions must be awaited."
+      jd(&l, l.t.nd[sp].pos, l.t.nd[sp].end, c, msg, "Add `await` to your assertion.", r.seq)
+      r.seq += 1
+      # (the suggestion: `await ` before the call, and `async ` on the function once)
+      let f = ancestor_fn(&l, n)
+      if f > 0:
+        let need_async = not (f in fixed) and (l.t.nd[f].f & ast.M_ASYNC) == 0
+        var at = l.t.nd[f].pos
+        let fk = k(l, f)
+        if fk == ast.N_METHOD or fk == ast.N_GET or fk == ast.N_SET or fk == ast.N_CTOR:
+          let fpar = parent(&l, f)
+          if k(l, fpar) != ast.N_OBJECT:
+            let sg = l.t.nd[f].b
+            if sg > 0: at = l.t.nd[sg].pos
+        else:
+          let fpar = parent(&l, f)
+          if k(l, fpar) == ast.N_PROPASSIGN: at = l.t.nd[fpar].pos
+        var es: [Int] = []
+        var et: [Str] = []
+        if need_async:
+          fixed[f] = true
+          es.push(at)
+          es.push(at)
+          et.push("async ")
+        if o.ve_await and k(l, fp) == ast.N_RETURN:
+          es.push(l.t.nd[fp].pos)
+          es.push(l.t.nd[fp].end)
+          et.push(text(l, fp).replace("return", "await"))
+        else:
+          es.push(l.t.nd[fin].pos)
+          es.push(l.t.nd[fin].pos)
+          et.push("await ")
+        # (one fix: the edits joined by the text between them)
+        var fs = es[0]
+        var fe = es[1]
+        var ft = et[0]
+        var ok = true
+        if es.len == 4:
+          if es[2] >= fe:
+            ft = ft + l.src[fe..es[2]] + et[1]
+            fe = es[3]
+          elif es[3] <= fs:
+            ft = et[1] + l.src[es[3]..fs] + ft
+            fs = es[2]
+          else: ok = false
+        if ok: rules.fix_of(&l, fs, fe, ft, 2)
+
+fn top_member(var l: L, n: Int) -> Int:
+  var top = -1
+  var x = n
+  while x > 0:
+    let p = parent(&l, x)
+    if is_member(l, x): top = x
+    elif not is_member(l, p): break
+    x = p
+  return top
+
+# is_acceptable_return_node, from the node above the call (x is the node it was reached from)
+fn acceptable_return(var l: L, p0: Int, from0: Int, allow_return: Bool) -> Bool:
+  var p = p0
+  var from = from0
+  while true:
+    let pk = k(l, p)
+    if allow_return and pk == ast.N_RETURN: return true
+    if pk == ast.N_COND or pk == ast.N_EXPRSTMT:
+      from = p
+      p = parent(&l, p)
+    elif pk == ast.N_BLOCK and rules.is_func(parent_kind(&l, p)):
+      from = p
+      p = parent(&l, p)
+    elif pk == ast.N_ARROW: return l.t.nd[p].d == from and k(l, from) != ast.N_BLOCK
+    elif pk == ast.N_AWAIT: return true
+    else: return false
+  return false
+
+fn thenable_parent(var l: L, n: Int) -> Int:
+  let p1 = parent(&l, n)
+  let gp = parent(&l, p1)
+  if k(l, gp) != ast.N_CALL: return n
+  let ce = l.t.nd[gp].a
+  if not is_member(l, ce): return n
+  let nm = static_prop(l, ce)
+  if nm == "then" or nm == "catch": return thenable_parent(&l, gp)
+  return n
+
+fn promise_obj(l: L, call: Int) -> Bool:
+  let ce = l.t.nd[call].a
+  return is_member(l, ce) and rules.id_is(l, l.t.nd[ce].a, "Promise")
+
+fn is_arg_of(l: L, call: Int, x: Int) -> Bool:
+  let c = l.t.nd[call].c
+  if c <= 0: return false
+  for a in ast.items(l.t, c):
+    if l.t.nd[a].pos == l.t.nd[x].pos and l.t.nd[a].end == l.t.nd[x].end: return true
+  return false
+
+# get_parent_with_ignore: [parent, first item (1/0)]
+fn parent_ignoring(var l: L, n: Int) -> [Int]:
+  var x = n
+  while true:
+    let p = parent(&l, x)
+    if p <= 0: return [p, 1]
+    let pk = l.t.nd[p].k
+    var skip = false
+    if pk == ast.N_CALL: skip = not promise_obj(l, p) and is_arg_of(l, p, x)
+    elif pk == ast.N_NEW: skip = is_arg_of(l, p, x)
+    if not skip:
+      var first = 1
+      if pk == ast.N_ARRAY:
+        let els = ast.items(l.t, l.t.nd[p].a)
+        if els.len == 0: return [-1, 0]
+        let f0 = els[0]
+        if not (f0 > 0 and l.t.nd[f0].pos == l.t.nd[x].pos and l.t.nd[f0].end == l.t.nd[x].end): first = 0
+      return [p, first]
+    x = p
+  return [-1, 0]
+
+fn promise_call(var l: L, n: Int, dflt: Int) -> Int:
+  let pi = parent_ignoring(&l, n)
+  var p = pi[0]
+  if p < 0: return -1
+  let pk = k(l, p)
+  if pk != ast.N_CALL and pk != ast.N_ARRAY: return dflt
+  let gi = parent_ignoring(&l, p)
+  let gp = gi[0]
+  if gp < 0: return -1
+  if pk == ast.N_ARRAY and k(l, gp) == ast.N_CALL: p = gp
+  if k(l, p) == ast.N_CALL and promise_obj(l, p):
+    if pi[1] == 1: return p
+    return -1
+  return dflt
+
+# ---- no-standalone-expect
+
+fn standalone_expect(var l: L, var r: Run, jn: [Int], orig: [Str], fw: Int):
+  let extra = cp(l.mc.jc.o[fw].se_extra)
+  var at: {Int: Int} = {}
+  for i in 0..jn.len:
+    if not (jn[i] in at): at[jn[i]] = i
+  for i in 0..jn.len:
+    let n = jn[i]
+    let j = parse(&l, n, orig[i])
+    if not is_expect(j): continue
+    if j.nm.len == 2 and j.nm[1] != "assertions" and j.nm[1] != "hasAssertions" and j.pk[0] == PK_MEMBER: continue
+    if not correct_place(&l, n, extra, at, jn, orig):
+      jd(&l, j.s[0], j.e[0], code(fw, "no-standalone-expect"), "`expect` must be inside of a test block.", "Did you forget to wrap `expect` in a `test` or `it` block?", r.seq)
+      r.seq += 1
+
+fn correct_place(var l: L, n: Int, extra: [Str], at: {Int: Int}, jn: [Int], orig: [Str]) -> Bool:
+  var cur = n
+  while true:
+    # the closest function body (or arrow function)
+    var x = cur
+    var fnode = -1
+    while true:
+      let p = parent(&l, x)
+      if p <= 0: return false
+      let pk = l.t.nd[p].k
+      if pk == ast.N_ARROW:
+        fnode = p
+        break
+      if rules.is_func(pk) and fbody(l, p) == x:
+        fnode = p
+        break
+      x = p
+    let fk = k(l, fnode)
+    if fk == ast.N_FUNC: return true
+    var gp = parent(&l, fnode)
+    if (fk == ast.N_METHOD or fk == ast.N_GET or fk == ast.N_SET) and k(l, gp) == ast.N_OBJECT: gp = fnode
+    elif fk == ast.N_METHOD or fk == ast.N_GET or fk == ast.N_SET or fk == ast.N_CTOR: gp = -1
+    if gp > 0 and var_or_test_block(&l, gp, extra, at, jn, orig): return true
+    cur = fnode
+  return false
+
+fn is_objprop(l: L, x: Int) -> Bool:
+  let kd = k(l, x)
+  if kd == ast.N_PROPASSIGN or kd == ast.N_SHORTHAND: return true
+  return (kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET) and false
+
+fn var_or_test_block(var l: L, x: Int, extra: [Str], at: {Int: Int}, jn: [Int], orig: [Str]) -> Bool:
+  let kd = k(l, x)
+  if kd == ast.N_DECL: return true
+  if kd == ast.N_CALL:
+    if node_name(l, l.t.nd[x].a) in extra: return true
+    let i = at.get(x, -1)
+    if i >= 0:
+      let j = parse(&l, x, orig[i])
+      if is_general(j): return j.kind == K_TEST
+    let p = parent(&l, x)
+    if k(l, p) == ast.N_CALL: return var_or_test_block(&l, p, extra, at, jn, orig)
+    return false
+  let objlike = kd == ast.N_ARRAY or kd == ast.N_OBJECT or kd == ast.N_PROPASSIGN or kd == ast.N_SHORTHAND or ((kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET) and parent_kind(&l, x) == ast.N_OBJECT)
+  if objlike:
+    var cur = x
+    while true:
+      let p = parent(&l, cur)
+      let pk = k(l, p)
+      if pk == ast.N_CALL or pk == ast.N_DECL: return var_or_test_block(&l, p, extra, at, jn, orig)
+      if pk == ast.N_ARRAY or pk == ast.N_OBJECT or pk == ast.N_PROPASSIGN or pk == ast.N_SHORTHAND: cur = p
+      else: break
+  return false
+
+# ---- prefer-snapshot-hint
+
+fn snapshot_hint(var l: L, var r: Run, jn: [Int], orig: [Str], fw: Int):
+  let always = l.mc.jc.o[fw].sh_always
+  var owners: [Int] = []
+  var groups: {Int: [Int]} = {}
+  for i in by_node_order(l, jn):
+    let n = jn[i]
+    let j = parse(&l, n, orig[i])
+    if not is_expect(j): continue
+    if not (has_member(j, "toMatchSnapshot") or has_member(j, "toThrowErrorMatchingSnapshot")): continue
+    let ow = scope_owner(&l, n)
+    if not (ow in groups):
+      groups[ow] = []
+      owners.push(ow)
+    groups[ow].push(n)
+  # (oxc iterates an FxHashMap keyed by node id; vlint goes by position)
+  owners.sort()
+  let c = code(fw, "prefer-snapshot-hint")
+  for ow in owners:
+    let g = groups[ow]
+    if not always and g.len < 2: continue
+    for call in g:
+      let na = nargs(l, call)
+      if na == 2: continue
+      let cn = callee_name(l, call)
+      if cn == "\0": continue
+      let s = l.t.nd[call].pos
+      let e = l.t.nd[call].end
+      if na == 0:
+        jd(&l, s, e, c, "Snapshot is missing a hint.", "Include a hint string to identify this snapshot in the snapshot file.", r.seq)
+        r.seq += 1
+        continue
+      if cn == "toMatchSnapshot" and na > 2:
+        jd(&l, s, e, c, "`toMatchSnapshot` takes at most two arguments.", "Pass a hint string, or a property matcher object followed by a hint string.", r.seq)
+        r.seq += 1
+        continue
+      let a0 = argn(l, call, 0)
+      if not is_str_lit(l, a0):
+        jd(&l, s, e, c, "Snapshot hint must be a string literal.", "Provide a string literal as the hint, or pass a property matcher object as the first argument and the hint string as the second.", r.seq)
+        r.seq += 1
+
+fn scope_owner(var l: L, n: Int) -> Int:
+  var last = -1
+  var x = parent(&l, n)
+  while x > 0:
+    let kd = l.t.nd[x].k
+    if kd == ast.N_ARROW or kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
+      last = x
+      let p = parent(&l, x)
+      if k(l, p) == ast.N_CALL and kind_from(callee_name(l, p)) == K_TEST: return x
+    x = parent(&l, x)
+  if last > 0: return last
+  return 0
+
+# ---- no-identical-title
+
+fn closest_block(var l: L, n: Int) -> Int:
+  var x = n
+  while x > 0:
+    let kd = l.t.nd[x].k
+    if kd == ast.N_BLOCK: return x
+    x = parent(&l, x)
+  return 0
+
+fn identical_title(var l: L, var r: Run, jn: [Int], orig: [Str], fw: Int):
+  var titles: [Str] = []
+  var tix: {Str: Int} = {}
+  var members: [[Int]] = []     # per title: (span start, span end, kind, block) quads
+  for i in 0..jn.len:
+    let n = jn[i]
+    let j = parse(&l, n, orig[i])
+    if not is_general(j) or not (j.kind == K_DESCRIBE or j.kind == K_TEST): continue
+    if has_member(j, "each"): continue
+    let blk = closest_block(&l, n)
+    if nargs(l, n) == 0: continue
+    let a = argn(l, n, 0)
+    let ak = k(l, a)
+    if not (ak == ast.N_STR or ak == ast.N_NOSUBTEMPL): continue
+    let t = name_of(l, a)
+    var ti = tix.get(t, -1)
+    if ti < 0:
+      ti = titles.len
+      tix[t] = ti
+      titles.push(t)
+      members.push([])
+    members[ti].push(l.t.nd[a].pos)
+    members[ti].push(l.t.nd[a].end)
+    members[ti].push(j.kind)
+    members[ti].push(blk)
+  # the titles in the order of oxc's FxHashMap
+  var st = rhooks.new_set()
+  for i in 0..titles.len:
+    let h = rhooks.rotl(rhooks.write_str(0, titles[i]), 26)
+    let _ = rhooks.set_insert(&st, rhooks.Dep(titles[i] + "", -1, [], i, 0, 0, h))
+  let c = code(fw, "no-identical-title")
+  for jx in rhooks.set_order(st):
+    let ti = st.ds[jx].s
+    let q = members[ti]
+    var ix: [Int] = []
+    var i = 0
+    while i < q.len:
+      ix.push(i)
+      i += 4
+    ix.sort(by: fn(a, b) => q[a + 3] < q[b + 3])
+    for m in 1..ix.len:
+      let a = ix[m]
+      let b = ix[m - 1]
+      if q[a + 2] == q[b + 2] and q[a + 3] == q[b + 3]:
+        if q[a + 2] == K_DESCRIBE: jd(&l, q[a], q[a + 1], c, "Describe block title is used multiple times in the same describe block.", "Change the title of describe block.", r.seq)
+        else: jd(&l, q[a], q[a + 1], c, "Test title is used multiple times in the same describe block.", "Change the title of test.", r.seq)
+        r.seq += 1
+
+# ---- no-commented-out-tests
+
+fn commented_out(var l: L, var r: Run, fw: Int):
+  let cs = all_comments(l)
+  var i = 0
+  while i + 1 < cs.len:
+    let a = cs[i]
+    let b = cs[i + 1]
+    i += 2
+    var s = a + 2
+    var e = b
+    if l.src[a + 1] == '*': e = b - 2
+    if e < s: continue
+    let t = l.src[s..e]
+    if might_test(t) and commented_test(t):
+      jd(&l, s, e, code(fw, "no-commented-out-tests"), "Some tests appear to be inside comments.", "Remove or uncomment this test.", r.seq)
+      r.seq += 1
+
+fn might_test(t: Str) -> Bool:
+  return t.find("test") >= 0 or t.find("it") >= 0 or t.find("describe") >= 0
+
+fn rx_word(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+
+fn next_line(t: Str, from: Int) -> Int:
+  let p = t.find("\n", from)
+  if p < 0: return t.len + 1
+  return p + 1
+
+fn ascii_ws(c: Byte) -> Bool:
+  return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 12
+
+fn commented_test(t: Str) -> Bool:
+  let n = t.len
+  var ls = 0
+  while ls <= n:
+    var i = ls
+    while i < n and (t[i] == ' ' or t[i] == '\t' or t[i] == '\r'): i += 1
+    if i >= n: break
+    if t[i] == '\n':
+      ls = i + 1
+      continue
+    let start = i
+    if t[i] == 'x' or t[i] == 'f':
+      if rules.has_at(t, i + 1, "test") or rules.has_at(t, i + 1, "it") or rules.has_at(t, i + 1, "describe"): i += 1
+    var kl = 0
+    if rules.has_at(t, i, "describe"): kl = 8
+    elif rules.has_at(t, i, "test"): kl = 4
+    elif rules.has_at(t, i, "it"): kl = 2
+    if kl == 0:
+      ls = next_line(t, start)
+      continue
+    i += kl
+    if i < n and (rx_word(t[i]) or t[i] == '$'):
+      ls = next_line(t, start)
+      continue
+    if i < n and t[i] == '.':
+      i += 1
+      if i >= n or not rx_word(t[i]):
+        ls = next_line(t, start)
+        continue
+      i += 1
+      while i < n and rx_word(t[i]): i += 1
+    elif i < n and t[i] == '[':
+      i += 1
+      if i >= n or not (t[i] == '\'' or t[i] == '"'):
+        ls = next_line(t, start)
+        continue
+      let q = t[i]
+      i += 1
+      let ms = i
+      while i < n and rx_word(t[i]): i += 1
+      if i == ms or i >= n or t[i] != q:
+        ls = next_line(t, start)
+        continue
+      i += 1
+      if i >= n or t[i] != ']':
+        ls = next_line(t, start)
+        continue
+      i += 1
+    while i < n and ascii_ws(t[i]): i += 1
+    if i < n and t[i] == '(': return true
+    ls = next_line(t, start)
+  return false
+
+# Every comment's outer span (start, end pairs), found by scanning the text outside string,
+# template, regular-expression and JSX text literals.
+fn all_comments(l: L) -> [Int]:
+  var lits: [Int] = []
+  for x in 1..l.t.nd.len:
+    let kd = l.t.nd[x].k
+    if kd == ast.N_STR or kd == ast.N_NOSUBTEMPL or kd == ast.N_TEMPL or kd == ast.N_REGEX or kd == ast.N_JSXTEXT:
+      if l.t.nd[x].end > l.t.nd[x].pos: lits.push(x)
+  lits.sort(by: fn(a, b) => l.t.nd[a].pos < l.t.nd[b].pos)
+  var out: [Int] = []
+  let s = l.src
+  let n = s.len
+  var li = 0
+  var i = 0
+  # (a hashbang line is not a comment)
+  if n > 1 and s[0] == '#' and s[1] == '!':
+    while i < n and s[i] != '\n': i += 1
+  while i < n:
+    while li < lits.len and l.t.nd[lits[li]].end <= i: li += 1
+    if li < lits.len and l.t.nd[lits[li]].pos <= i:
+      i = l.t.nd[lits[li]].end
+      continue
+    let c = s[i]
+    if c == '/' and i + 1 < n:
+      if s[i + 1] == '/':
+        var e = i + 2
+        while e < n and s[e] != '\n' and s[e] != '\r' and not (s[e] == 0xE2 and e + 2 < n and s[e + 1] == 0x80 and (s[e + 2] == 0xA8 or s[e + 2] == 0xA9)): e += 1
+        out.push(i)
+        out.push(e)
+        i = e
+        continue
+      if s[i + 1] == '*':
+        var e = s.find("*/", i + 2)
+        if e < 0: e = n
+        else: e += 2
+        out.push(i)
+        out.push(e)
+        i = e
+        continue
+    i += 1
+  return out
+
+# ---- valid-expect-in-promise
+
+type Ps:
+  in_chain: Bool
+  in_await: Bool
+  found: Bool
+  resolved: [Str]
+
+fn ps_new() -> Ps:
+  return Ps(false, false, false, [])
+
+fn resolve_ident(l: L, var p: Ps, e: Int):
+  if k(l, e) == ast.N_ID:
+    let nm = name_of(l, e)
+    if not (nm in p.resolved): p.resolved.push(nm)
+
+# find_expect_args: the arguments of the innermost `expect(...)` call of a chain (-1: none)
+fn find_expect_call(l: L, c: Int) -> Int:
+  let ce = l.t.nd[c].a
+  if rules.id_is(l, ce, "expect"): return c
+  return find_inner_expect(l, ce)
+
+fn find_inner_expect(l: L, e: Int) -> Int:
+  if k(l, e) == ast.N_CALL: return find_expect_call(l, e)
+  if is_member(l, e): return find_inner_expect(l, l.t.nd[e].a)
+  return -1
+
+fn promise_method(l: L, c: Int) -> Bool:
+  let ce = l.t.nd[c].a
+  if not is_member(l, ce): return false
+  let nm = static_prop(l, ce)
+  return nm == "then" or nm == "catch" or nm == "finally"
+
+fn ps_call(var l: L, var p: Ps, c: Int):
+  var parts: [Str] = []
+  name_parts(l, l.t.nd[c].a, &parts)
+  let is_expect = parts.len > 0 and parts[0] == "expect"
+  if is_expect and ("resolves" in parts or "rejects" in parts):
+    let ec = find_expect_call(l, c)
+    if ec > 0 and nargs(l, ec) > 0:
+      let a0 = argn(l, ec, 0)
+      if k(l, a0) != ast.N_SPREAD: resolve_ident(l, &p, a0)
+  # Promise.all([...]) and the like
+  let ce = l.t.nd[c].a
+  if is_member(l, ce) and rules.id_is(l, l.t.nd[ce].a, "Promise") and nargs(l, c) > 0:
+    let a0 = argn(l, c, 0)
+    let pn = static_prop(l, ce)
+    if pn == "all" or pn == "allSettled" or pn == "race" or pn == "any":
+      if k(l, a0) == ast.N_ARRAY:
+        for x in ast.items(l.t, l.t.nd[a0].a): resolve_ident(l, &p, x)
+    elif (pn == "resolve" or pn == "reject") and k(l, a0) != ast.N_SPREAD: resolve_ident(l, &p, a0)
+  if promise_method(l, c):
+    let was = p.in_chain
+    p.in_chain = not p.in_await
+    ps_walk(&l, &p, ce)
+    let args = args_of(l, c)
+    var i = 0
+    for a in args:
+      if i >= 2: break
+      ps_walk(&l, &p, a)
+      i += 1
+    p.in_chain = was
+    return
+  if p.in_chain and is_expect:
+    p.found = true
+    return
+  ps_walk(&l, &p, ce)
+  for a in args_of(l, c): ps_walk(&l, &p, a)
+
+fn ps_walk(var l: L, var p: Ps, x: Int):
+  if x <= 0 or x >= l.t.nd.len: return
+  let kd = l.t.nd[x].k
+  if kd == ast.N_LIST:
+    for i in 0..l.t.nd[x].b:
+      let y = l.t.L[l.t.nd[x].a + i]
+      if y > 0: ps_walk(&l, &p, y)
+    return
+  if kd == ast.N_CALL:
+    ps_call(&l, &p, x)
+    return
+  if kd == ast.N_AWAIT:
+    resolve_ident(l, &p, l.t.nd[x].a)
+    let was = p.in_await
+    p.in_await = true
+    ps_walk(&l, &p, l.t.nd[x].a)
+    p.in_await = was
+    return
+  if kd >= ast.N_TREF and kd <= ast.N_TREST: return
+  var nk = 4
+  if kd == ast.N_VAR or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS or kd == ast.N_PROPACCESS: nk = 3
+  for i in 0..nk:
+    var c = l.t.nd[x].a
+    if i == 1: c = l.t.nd[x].b
+    elif i == 2: c = l.t.nd[x].c
+    elif i == 3: c = l.t.nd[x].d
+    if c > 0: ps_walk(&l, &p, c)
+
+fn contains_ident(l: L, x: Int, name: Str) -> Bool:
+  if x <= 0 or x >= l.t.nd.len: return false
+  let kd = l.t.nd[x].k
+  if kd == ast.N_LIST:
+    for i in 0..l.t.nd[x].b:
+      let y = l.t.L[l.t.nd[x].a + i]
+      if y > 0 and contains_ident(l, y, name): return true
+    return false
+  if kd == ast.N_ID:
+    if name_of(l, x) != name: return false
+    if x < l.sc.res.len:
+      let y = l.sc.res[x]
+      if y == -2: return false
+      if y >= 0 and l.sc.ypos[y] == l.t.nd[x].pos: return false
+    return true
+  if kd == ast.N_SHORTHAND and l.t.names[l.t.nd[x].s] == name: return true
+  if kd >= ast.N_TREF and kd <= ast.N_TREST: return false
+  var nk = 4
+  if kd == ast.N_VAR or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS or kd == ast.N_PROPACCESS: nk = 3
+  for i in 0..nk:
+    var c = l.t.nd[x].a
+    if i == 1: c = l.t.nd[x].b
+    elif i == 2: c = l.t.nd[x].c
+    elif i == 3: c = l.t.nd[x].d
+    if c > 0 and contains_ident(l, c, name): return true
+  return false
+
+# the pending promises: an FxHashMap<CompactStr, Span> (names by id, their spans)
+type Pend:
+  f: lfx.Fm
+  names: [Str]
+  s: [Int]
+  e: [Int]
+
+fn pend_id(var pd: Pend, nm: Str) -> Int:
+  for i in 0..pd.names.len:
+    if pd.names[i] == nm: return i
+  pd.names.push(nm + "")
+  pd.s.push(0)
+  pd.e.push(0)
+  let id = pd.names.len - 1
+  pd.f.hm[id] = rhooks.rotl(rhooks.write_str(0, nm), 26)
+  return id
+
+fn pend_has(pd: Pend, id: Int) -> Bool:
+  return lfx.find(pd.f, id) >= 0
+
+fn vep_diag(var l: L, s: Int, e: Int, fw: Int, after: Bool, key: Int):
+  let c = code(fw, "valid-expect-in-promise")
+  if after: jd(&l, s, e, c, "Expect in a promise chain is unreachable after a `return` statement", "Move the promise before the `return` and ensure it is awaited or returned.", key)
+  else: jd(&l, s, e, c, "Expect in a promise chain must be awaited or returned", "Either `await` the promise, `return` it, or use `expect().resolves`/`expect().rejects`.", key)
+
+fn expect_in_promise(var l: L, n: Int, j: Jp, fw: Int, key: Int):
+  if nargs(l, n) < 2: return
+  if not is_general(j) or j.kind != K_TEST: return
+  let cb = argn(l, n, 1)
+  let ck = k(l, cb)
+  if ck != ast.N_ARROW and ck != ast.N_FUNCEXPR: return
+  let body = l.t.nd[cb].d
+  if k(l, body) != ast.N_BLOCK: return
+  let ps = l.t.nd[cb].b
+  if ps > 0:
+    for x in ast.items(l.t, ps):
+      if k(l, x) != ast.N_PARAM: return
+      if (l.t.nd[x].f & ast.M_REST) != 0: continue
+      let nm = l.t.nd[x].a
+      if k(l, nm) == ast.N_THIS or (k(l, nm) == ast.N_ID and name_of(l, nm) == "this"): continue
+      return
+  var pd = Pend(lfx.new_fm(), [], [], [])
+  var ret = false
+  vep_stmts(&l, &pd, &ret, l.t.nd[body].a, fw, key)
+  for id in lfx.order(pd.f): vep_diag(&l, pd.s[id], pd.e[id], fw, false, key)
+
+fn vep_stmts(var l: L, var pd: Pend, var ret: Bool, lst: Int, fw: Int, key: Int):
+  for st in ast.items(l.t, lst):
+    var sc = ps_new()
+    ps_walk(&l, &sc, st)
+    if ret:
+      if sc.found: vep_diag(&l, l.t.nd[st].pos, l.t.nd[st].end, fw, true, key)
+      continue
+    let kd = k(l, st)
+    var is_assign = false
+    if kd == ast.N_EXPRSTMT:
+      let e = l.t.nd[st].a
+      is_assign = k(l, e) == ast.N_BINARY and rules.is_assign_op(l.t.nd[e].f)
+    if not is_assign and kd != ast.N_BLOCK:
+      for nm in sc.resolved:
+        let id = pend_id(&pd, nm)
+        lfx.remove(&pd.f, id)
+    if kd == ast.N_VAR:
+      for d in ast.items(l.t, l.t.nd[st].a):
+        let init = l.t.nd[d].c
+        let id0 = l.t.nd[d].a
+        if init <= 0 or k(l, id0) != ast.N_ID: continue
+        var s2 = ps_new()
+        ps_walk(&l, &s2, init)
+        if s2.found:
+          let id = pend_id(&pd, name_of(l, id0))
+          lfx.insert(&pd.f, id)
+          pd.s[id] = l.t.nd[d].pos
+          pd.e[id] = l.t.nd[d].end
+    elif kd == ast.N_EXPRSTMT:
+      let e = l.t.nd[st].a
+      if is_assign:
+        let left = l.t.nd[e].a
+        if k(l, left) == ast.N_ID:
+          let nm = name_of(l, left)
+          let id = pend_id(&pd, nm)
+          if not contains_ident(l, l.t.nd[e].b, nm) and pend_has(pd, id):
+            let os = pd.s[id]
+            let oe = pd.e[id]
+            lfx.remove(&pd.f, id)
+            vep_diag(&l, os, oe, fw, false, key)
+          if sc.found:
+            lfx.insert(&pd.f, id)
+            pd.s[id] = l.t.nd[st].pos
+            pd.e[id] = l.t.nd[st].end
+        elif sc.found: vep_diag(&l, l.t.nd[st].pos, l.t.nd[st].end, fw, false, key)
+      elif sc.found and k(l, e) == ast.N_CALL and promise_method(l, e): vep_diag(&l, l.t.nd[st].pos, l.t.nd[st].end, fw, false, key)
+    elif kd == ast.N_RETURN:
+      let a = l.t.nd[st].a
+      if k(l, a) == ast.N_ID:
+        let id = pend_id(&pd, name_of(l, a))
+        lfx.remove(&pd.f, id)
+      ret = true
+    elif kd == ast.N_BLOCK: vep_stmts(&l, &pd, &ret, l.t.nd[st].a, fw, key)

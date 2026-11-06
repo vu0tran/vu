@@ -1,0 +1,420 @@
+# The module graph oxlint builds for its import plugin: each file's module record (oxc_parser's
+# ModuleRecordBuilder: requested modules, import entries, local, indirect and star export entries,
+# exported bindings, the default export) and, through lresolve, the modules its requests load.
+# Built before linting when a rule that needs it is on; the files linted and the files they import
+# (followed transitively, as oxlint does) each get a record.
+
+import ast
+import scan
+import parse
+import lresolve
+
+type Rec:
+  path: Str
+  ok: Bool            # read and parsed (a module oxlint would load)
+  msyn: Bool          # has_module_syntax
+  rq: [Str]           # requested module names, in order of first appearance
+  rq_res: [Int]       # each: the record it loads (-1 none)
+  rq_path: [Str]      # each: the resolved path ("" unresolved)
+  re_n: [Int]         # requested module entries in source order: name (index in rq), statement span,
+  re_ss: [Int]        # source span, flags (1 type, 2 import)
+  re_se: [Int]
+  re_s: [Int]
+  re_e: [Int]
+  re_f: [Int]
+  ie_n: [Int]         # import entries: request, kind (0 name, 1 namespace, 2 default), imported name,
+  ie_k: [Int]         # local name and span, the specifier's span, type-only, statement span
+  ie_name: [Str]
+  ie_local: [Str]
+  ie_ls: [Int]
+  ie_le: [Int]
+  ie_ds: [Int]
+  ie_de: [Int]
+  ie_t: [Bool]
+  ie_ss: [Int]
+  ie_se: [Int]
+  ex_name: [Str]      # exported bindings, in insertion order
+  ex_s: [Int]
+  ex_e: [Int]
+  def: Bool           # export_default
+  ind_ek: [Int]       # indirect export entries: export name (0 name, 1 default, 2 null) and text,
+  ind_en: [Str]       # import name (0 name, 1 all, 2 all but default, 3 null) and text, request
+  ind_ik: [Int]
+  ind_in: [Str]
+  ind_rq: [Int]
+  ind_ss: [Int]       # (and the statement's span, the entry's span, the import name's span)
+  ind_se: [Int]
+  ind_s: [Int]
+  ind_e: [Int]
+  ind_is: [Int]
+  ind_ie: [Int]
+  star_rq: [Int]      # star export entries: request
+  le_ek: [Int]        # local export entries: export name kind and text, local name, span
+  le_en: [Str]
+  le_ln: [Str]
+  le_s: [Int]
+  le_e: [Int]
+
+fn new_rec(path: Str) -> Rec:
+  return Rec(path, false, false, [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], false, [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [])
+
+type Graph:
+  on: Bool
+  recs: [Rec]
+  at: {Str: Int}      # absolute path -> record
+  shown: {Str: Int}   # a linted file as shown -> record
+
+fn new_graph() -> Graph:
+  return Graph(false, [], {}, {})
+
+fn valid_ext(p: Str) -> Bool:
+  for e in [".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"]:
+    if p.endswith(e): return true
+  return false
+
+# ---- the record of a parsed file
+
+fn nm(t: ast.Ast, n: Int) -> Str:
+  return t.names[t.nd[n].s] + ""
+
+fn req_index(var r: Rec, name: Str) -> Int:
+  for i in 0..r.rq.len:
+    if r.rq[i] == name: return i
+  r.rq.push(name + "")
+  r.rq_res.push(-1)
+  r.rq_path.push("")
+  return r.rq.len - 1
+
+fn add_request(var r: Rec, name: Str, ss: Int, se: Int, s: Int, e: Int, flags: Int) -> Int:
+  let i = req_index(&r, name)
+  r.re_n.push(i)
+  r.re_ss.push(ss)
+  r.re_se.push(se)
+  r.re_s.push(s)
+  r.re_e.push(e)
+  r.re_f.push(flags)
+  return i
+
+fn add_binding(var r: Rec, name: Str, s: Int, e: Int):
+  for i in 0..r.ex_name.len:
+    if r.ex_name[i] == name:
+      r.ex_s[i] = s
+      r.ex_e[i] = e
+      return
+  r.ex_name.push(name + "")
+  r.ex_s.push(s)
+  r.ex_e.push(e)
+
+fn ind_spans(var r: Rec, ss: Int, se: Int, s: Int, e: Int, is: Int, ie: Int):
+  r.ind_ss.push(ss)
+  r.ind_se.push(se)
+  r.ind_s.push(s)
+  r.ind_e.push(e)
+  r.ind_is.push(is)
+  r.ind_ie.push(ie)
+
+# a pending export entry (resolved against the import entries at the end)
+type Pe:
+  ek: Int
+  en: Str
+  ln: Str        # local name ("\0" none)
+  lname_kind: Int  # 0 Name, 1 Default (an identifier after export default), 2 null
+  s: Int
+  e: Int
+
+fn binding_names(t: ast.Ast, n: Int, var out: [Int]):
+  if n <= 0: return
+  let k = t.nd[n].k
+  if k == ast.N_ID: out.push(n)
+  elif k == ast.N_OBJPAT or k == ast.N_ARRPAT:
+    for x in ast.items(t, t.nd[n].a):
+      if t.nd[x].k == ast.N_BINDEL: binding_names(t, t.nd[x].b, &out)
+      elif t.nd[x].k == ast.N_ID: out.push(x)
+  elif k == ast.N_BINDEL: binding_names(t, t.nd[n].b, &out)
+
+fn kw_at(src: Str, from: Int, w: Str) -> Int:
+  let i = src.find(w, from)
+  return i
+
+fn build_record(t: ast.Ast, src: Str, root: Int, path: Str) -> Rec:
+  var r = new_rec(path)
+  r.ok = true
+  var pend: [Pe] = []
+  for x in ast.items(t, root):
+    let k = t.nd[x].k
+    let ss = t.nd[x].pos
+    let se = t.nd[x].end
+    if k == ast.N_IMPORT:
+      r.msyn = true
+      let so = t.nd[x].a
+      if so <= 0: continue
+      let spec = nm(t, so)
+      let dtype = (t.nd[x].f & ast.M_TYPEONLY) != 0
+      let ri = req_index(&r, spec)
+      let df = t.nd[x].b
+      if df > 0:
+        r.ie_n.push(ri)
+        r.ie_k.push(2)
+        r.ie_name.push("default")
+        r.ie_local.push(nm(t, df))
+        r.ie_ls.push(t.nd[df].pos)
+        r.ie_le.push(t.nd[df].end)
+        r.ie_ds.push(t.nd[df].pos)
+        r.ie_de.push(t.nd[df].end)
+        r.ie_t.push(dtype)
+        r.ie_ss.push(ss)
+        r.ie_se.push(se)
+      let ns = t.nd[x].c
+      if ns > 0:
+        r.ie_n.push(ri)
+        r.ie_k.push(1)
+        r.ie_name.push("*")
+        r.ie_local.push(nm(t, ns))
+        r.ie_ls.push(t.nd[ns].pos)
+        r.ie_le.push(t.nd[ns].end)
+        r.ie_ds.push(t.nd[ns].pos)
+        r.ie_de.push(t.nd[ns].end)
+        r.ie_t.push(dtype)
+        r.ie_ss.push(ss)
+        r.ie_se.push(se)
+      let sp = t.nd[x].d
+      if sp > 0:
+        for s in ast.items(t, sp):
+          let local = nm(t, s)
+          var imported = local + ""
+          let pn = t.nd[s].b
+          if pn > 0: imported = nm(t, pn)
+          r.ie_n.push(ri)
+          r.ie_k.push(0)
+          r.ie_name.push(imported)
+          r.ie_local.push(local)
+          r.ie_ls.push(t.nd[s].end - local.len)
+          r.ie_le.push(t.nd[s].end)
+          r.ie_ds.push(t.nd[s].pos)
+          r.ie_de.push(t.nd[s].end)
+          r.ie_t.push(dtype or (t.nd[s].f & ast.M_TYPEONLY) != 0)
+          r.ie_ss.push(ss)
+          r.ie_se.push(se)
+      var fl = 2
+      if dtype: fl = 3
+      let _ = add_request(&r, spec, ss, se, t.nd[so].pos, t.nd[so].end, fl)
+    elif k == ast.N_EXPORT:
+      r.msyn = true
+      let so = t.nd[x].a
+      let dtype = (t.nd[x].f & ast.M_TYPEONLY) != 0
+      var fl = 0
+      if dtype: fl = 1
+      if so > 0:
+        let spec = nm(t, so)
+        if t.nd[x].b < 0 or t.nd[x].b == 0:
+          let ns = t.nd[x].c
+          if ns > 0:
+            add_binding(&r, nm(t, ns), t.nd[ns].pos, t.nd[ns].end)
+            let ri = add_request(&r, spec, ss, se, t.nd[so].pos, t.nd[so].end, fl)
+            r.ind_ek.push(0)
+            r.ind_en.push(nm(t, ns))
+            r.ind_ik.push(1)
+            r.ind_in.push("")
+            r.ind_rq.push(ri)
+            ind_spans(&r, ss, se, ss, se, ss, se)
+          else:
+            let ri = add_request(&r, spec, ss, se, t.nd[so].pos, t.nd[so].end, fl)
+            r.star_rq.push(ri)
+        else:
+          for s in ast.items(t, t.nd[x].b): add_binding(&r, nm(t, s), t.nd[s].pos, t.nd[s].end)
+          let ri = add_request(&r, spec, ss, se, t.nd[so].pos, t.nd[so].end, fl)
+          for s in ast.items(t, t.nd[x].b):
+            var local = nm(t, s)
+            let pn = t.nd[s].b
+            if pn > 0: local = nm(t, pn)
+            let en = nm(t, s)
+            r.ind_ek.push(0)
+            r.ind_en.push(en)
+            r.ind_ik.push(0)
+            r.ind_in.push(local)
+            r.ind_rq.push(ri)
+            var is = t.nd[s].pos
+            var ie = t.nd[s].pos + local.len
+            if pn > 0:
+              is = t.nd[pn].pos
+              ie = t.nd[pn].end
+            ind_spans(&r, ss, se, t.nd[s].pos, t.nd[s].end, is, ie)
+      elif t.nd[x].b > 0:
+        for s in ast.items(t, t.nd[x].b):
+          var local = nm(t, s)
+          let pn = t.nd[s].b
+          if pn > 0: local = nm(t, pn)
+          let en = nm(t, s)
+          pend.push(Pe(0, en, local, 0, t.nd[s].pos, t.nd[s].end))
+          add_binding(&r, en, t.nd[s].end - en.len, t.nd[s].end)
+    elif k == ast.N_EXPORTASSIGN or k == ast.N_NSEXPORT:
+      r.msyn = true
+    elif k == ast.N_EXPORTDEFAULT:
+      r.msyn = true
+      let e = t.nd[x].a
+      if e > 0 and t.nd[e].k == ast.N_ID: pend.push(Pe(1, "default", nm(t, e), 1, t.nd[e].pos, t.nd[e].end))
+      else: pend.push(Pe(1, "default", "\0", 2, ss, se))
+    else:
+      var mods = 0
+      if k == ast.N_VAR or k == ast.N_INTERFACE or k == ast.N_TYPEALIAS: mods = t.nd[x].d
+      elif k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_ENUM or k == ast.N_MODULE or k == ast.N_IMPORTEQ: mods = t.nd[x].f
+      else:
+        continue
+      if (mods & ast.M_EXPORT) == 0: continue
+      r.msyn = true
+      if (mods & ast.M_DEFAULT) != 0:
+        var ln = "\0"
+        var lk = 2
+        if t.nd[x].s >= 0 and (k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_INTERFACE):
+          ln = nm(t, x)
+          lk = 0
+        pend.push(Pe(1, "default", ln, lk, ss, se))
+        continue
+      var names: [Int] = []
+      if k == ast.N_VAR:
+        for d in ast.items(t, t.nd[x].a): binding_names(t, t.nd[d].a, &names)
+        for n in names:
+          pend.push(Pe(0, nm(t, n), nm(t, n), 0, t.nd[n].pos, t.nd[n].end))
+          add_binding(&r, nm(t, n), t.nd[n].pos, t.nd[n].end)
+      elif k == ast.N_MODULE:
+        let a = t.nd[x].a
+        if a > 0 and t.nd[a].k == ast.N_ID:
+          pend.push(Pe(0, nm(t, a), nm(t, a), 0, t.nd[a].pos, t.nd[a].end))
+          add_binding(&r, nm(t, a), t.nd[a].pos, t.nd[a].end)
+      elif t.nd[x].s >= 0:
+        let n0 = nm(t, x)
+        pend.push(Pe(0, n0, n0, 0, ss, se))
+        add_binding(&r, n0, ss, se)
+  # resolve_export_entries
+  for p in pend:
+    var found = -1
+    if p.lname_kind == 0:
+      for i in 0..r.ie_local.len:
+        if r.ie_local[i] == p.ln:
+          found = i
+          break
+    if found >= 0 and r.ie_k[found] != 1:
+      r.ind_ek.push(p.ek)
+      r.ind_en.push(p.en)
+      r.ind_ik.push(0)
+      if r.ie_k[found] == 2: r.ind_in.push(r.ie_local[found] + "")
+      else: r.ind_in.push(r.ie_name[found] + "")
+      r.ind_rq.push(r.ie_n[found])
+      ind_spans(&r, r.ie_ss[found], r.ie_se[found], p.s, p.e, r.ie_ds[found], r.ie_de[found])
+    else:
+      r.le_ek.push(p.ek)
+      r.le_en.push(p.en)
+      r.le_ln.push(p.ln)
+      r.le_s.push(p.s)
+      r.le_e.push(p.e)
+  for i in 0..r.le_ek.len:
+    if r.le_ek[i] == 1 or (r.le_ek[i] == 0 and r.le_en[i] == "default"): r.def = true
+  for i in 0..r.ind_ek.len:
+    if r.ind_ek[i] == 1 or (r.ind_ek[i] == 0 and r.ind_en[i] == "default"): r.def = true
+  # import.meta
+  if not r.msyn:
+    for x in 1..t.nd.len:
+      if t.nd[x].k == ast.N_METAPROP and t.nd[x].f == scan.W_IMPORT:
+        r.msyn = true
+        break
+  return r
+
+# ---- the graph
+
+fn find_root(t: ast.Ast) -> Int:
+  var root = -1
+  for x in 1..t.nd.len:
+    if t.nd[x].k == ast.N_LIST and t.nd[x].d == -2: root = x
+  return root
+
+fn parse_record(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast) -> Rec:
+  let src0 = fs.read(path) else return new_rec(path)
+  var src = src0 + ""
+  ast.clear_nodes(&t)
+  let jsx = not (path.endswith(".ts") or path.endswith(".mts") or path.endswith(".cts"))
+  let _ = parse.parse_file_v(&t, &src, 1, &kw, true, jsx)
+  let root = find_root(t)
+  if root < 0: return new_rec(path)
+  return build_record(t, src, root, path)
+
+type GRes:
+  idx: Int
+  rec: Rec
+
+fn gworker(fs: Fs, own paths: Shared[[Str]], own jobs: Chan[Int], own res: Chan[GRes]):
+  var kw = scan.keywords()
+  var t = new_tree()
+  while true:
+    let i = jobs.recv() else return
+    let r = parse_record(fs, paths.value[i], &kw, &t)
+    res.send(GRes(i, r))
+
+fn new_tree() -> ast.Ast:
+  var t = ast.new_ast()
+  return t
+
+# the records of these paths, parsed by `threads` workers
+fn parse_all(fs: Fs, own paths: [Str], threads: Int, var kw: {Str: Int}, var t: ast.Ast) -> [Rec]:
+  var out: [Rec] = []
+  let n = paths.len
+  if threads <= 1 or n < 8:
+    for p in paths: out.push(parse_record(fs, p, &kw, &t))
+    return out
+  for i in 0..n: out.push(new_rec(""))
+  let jc: Chan[Int] = chan(n + 1)
+  let rc: Chan[GRes] = chan(n + 1)
+  for i in 0..n: jc.send(i)
+  jc.close()
+  let sp = share(paths)
+  var jobs = threads
+  if jobs > n: jobs = n
+  for w in 0..jobs: spawn gworker(fs, sp, jc, rc)
+  for i in 0..n:
+    var g = rc.recv() else break
+    swap(&out[g.idx], &g.rec)
+  return out
+
+fn build(fs: Fs, files: [Str], shown: [Str], threads: Int, var kw: {Str: Int}, var t: ast.Ast) -> Graph:
+  var g = new_graph()
+  g.on = true
+  var rv = lresolve.new_rv()
+  var frontier: [Str] = []
+  for i in 0..files.len:
+    if not valid_ext(files[i]): continue
+    if not (files[i] in g.at):
+      g.at[files[i]] = g.recs.len
+      g.recs.push(new_rec(files[i]))
+      frontier.push(files[i] + "")
+    g.shown[shown[i]] = g.at[files[i]]
+  while frontier.len > 0:
+    var batch: [Str] = []
+    swap(&batch, &frontier)
+    var idxs: [Int] = []
+    for p in batch: idxs.push(g.at[p])
+    var recs = parse_all(fs, batch, threads, &kw, &t)
+    for bi in 0..recs.len:
+      var r = new_rec("")
+      swap(&r, &recs[bi])
+      let p = g.recs[idxs[bi]].path + ""
+      if r.path == "": r.path = p
+      for j in 0..r.rq.len:
+        let target = lresolve.resolve(&rv, fs, p, r.rq[j])
+        r.rq_path[j] = target
+        if target != "" and valid_ext(target):
+          if not (target in g.at):
+            g.at[target] = g.recs.len
+            g.recs.push(new_rec(target))
+            frontier.push(target + "")
+          r.rq_res[j] = g.at[target]
+      swap(&g.recs[idxs[bi]], &r)
+  return g
+
+# the record a request of record ri loads (-1 none, or not read)
+fn loaded(g: Graph, ri: Int, name: Str) -> Int:
+  let r = g.recs[ri]
+  for j in 0..r.rq.len:
+    if r.rq[j] == name:
+      let x = r.rq_res[j]
+      if x >= 0 and g.recs[x].ok: return x
+      return -1
+  return -1

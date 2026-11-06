@@ -1,0 +1,585 @@
+# oxlint's import rules that read the module graph (lmod.vu): no-self-import, default, named,
+# namespace, no-named-as-default, no-named-as-default-member, extensions. They run once per file,
+# after the walk, on the file's module record and the records its requests load.
+
+import ast
+import scope
+import lmeta
+import lconf
+import lmod
+import lresolve
+import rules
+import rmore
+import rhooks
+import rjest
+import rmore3
+from rules import L, k, name_of, parent, text
+from lmod import Graph, Rec
+
+type Ic:
+  on: Bool
+  ext_def: Int          # extensions: require_extension (-1 none, 0 always, 1 never), ignorePackages,
+  ext_ignore: Bool      # checkTypeImports, per-extension rules, path group overrides
+  ext_types: Bool
+  ext_keys: [Str]
+  ext_vals: [Int]
+  ext_pg_pat: [Str]
+  ext_pg_act: [Int]     # 0 enforce, 1 ignore
+  ns_computed: Bool     # namespace: allowComputed
+
+fn new_ic() -> Ic:
+  return Ic(false, -1, false, false, [], [], [], [], false)
+
+fn graph_rules() -> [Int]:
+  return [lmeta.M_IMPORT_NO_SELF_IMPORT, lmeta.M_IMPORT_DEFAULT, lmeta.M_IMPORT_NAMED, lmeta.M_IMPORT_NAMESPACE, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT_MEMBER, lmeta.M_IMPORT_EXTENSIONS]
+
+fn any_on(sev: [Int]) -> Bool:
+  for m in graph_rules():
+    if sev[m] > 0: return true
+  return false
+
+fn on(l: L, m: Int) -> Bool:
+  return l.en.len > 0 and l.en[m]
+
+fn rule_of(s: Str) -> Int:
+  if s == "always": return 0
+  if s == "never": return 1
+  if s == "ignorePackages": return 2
+  return -1
+
+fn setup(var l: L, sev: [Int], opts: [Str]):
+  if not any_on(sev): return
+  var c = new_ic()
+  c.on = true
+  if sev[lmeta.M_IMPORT_EXTENSIONS] > 0:
+    let txt = opts[lmeta.M_IMPORT_EXTENSIONS]
+    if txt != "":
+      let js = lconf.parse_json(txt)
+      if js.err == "" and js.v.len > 0:
+        let top = 0
+        var root = -1
+        var dflt = -1
+        if js.v[top].k == lconf.J_ARR and js.v[top].kids.len > 0:
+          let a0 = js.v[top].kids[0]
+          if js.v[a0].k == lconf.J_STR:
+            dflt = rule_of(js.v[a0].s)
+            if js.v[top].kids.len > 1:
+              let v1 = js.v[top].kids[1]
+              let pat = lconf.get(js, v1, "pattern")
+              if pat >= 0: root = pat
+              else: root = v1
+            else: root = top
+          else: root = a0
+        else: root = top
+        var ign_default = false
+        if dflt == 2:
+          dflt = 0
+          ign_default = true
+        c.ext_def = dflt
+        c.ext_ignore = ign_default
+        if root >= 0 and js.v[root].k == lconf.J_OBJ:
+          c.ext_ignore = rmore.obool(js, root, "ignorePackages", ign_default)
+          c.ext_types = rmore.obool(js, root, "checkTypeImports", false)
+          let pg = lconf.get(js, root, "pathGroupOverrides")
+          if pg >= 0 and js.v[pg].k == lconf.J_ARR:
+            for o in js.v[pg].kids:
+              if js.v[o].k != lconf.J_OBJ: continue
+              let pt = rmore.ostr(js, o, "pattern", "\0")
+              let ac = rmore.ostr(js, o, "action", "")
+              if pt == "\0" or (ac != "enforce" and ac != "ignore"): continue
+              c.ext_pg_pat.push(pt)
+              if ac == "ignore": c.ext_pg_act.push(1)
+              else: c.ext_pg_act.push(0)
+          for i in 0..js.v[root].keys.len:
+            let key = js.v[root].keys[i]
+            if key == "ignorePackages" or key == "checkTypeImports" or key == "pattern" or key == "pathGroupOverrides": continue
+            let v = js.v[root].kids[i]
+            if js.v[v].k == lconf.J_STR and rule_of(js.v[v].s) >= 0:
+              var found = false
+              for j in 0..c.ext_keys.len:
+                if c.ext_keys[j] == key:
+                  c.ext_vals[j] = rule_of(js.v[v].s)
+                  found = true
+              if not found:
+                c.ext_keys.push(key + "")
+                c.ext_vals.push(rule_of(js.v[v].s))
+  if sev[lmeta.M_IMPORT_NAMESPACE] > 0:
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_IMPORT_NAMESPACE], &js)
+    c.ns_computed = rmore.obool(js, o, "allowComputed", false)
+  l.mc.ic = c
+
+# Rust's {:?} of a string
+fn dbg(s: Str) -> Str:
+  var out = "\""
+  for i in 0..s.len:
+    let c = s[i]
+    if c == '"': out += "\\\""
+    elif c == '\\': out += "\\\\"
+    elif c == '\n': out += "\\n"
+    elif c == '\r': out += "\\r"
+    elif c == '\t': out += "\\t"
+    else: out += s[i..i + 1]
+  return out + "\""
+
+type Seq:
+  n: Int
+
+fn diag(var l: L, var q: Seq, s: Int, e: Int, code: Str, msg: Str, help: Str):
+  l.ds.push(rules.D(s, code, msg, help, -1, 0, "", e, "", false, [], [], rjest.JBASE + q.n, "", false, 1))
+  q.n += 1
+
+# ---- the file's record and what it loads
+
+fn rec_of(g: Graph, path: Str) -> Int:
+  return g.shown.get(path, -1)
+
+fn has_binding(r: Rec, name: Str) -> Bool:
+  return name in r.ex_name
+
+# exported_bindings_from_star_export: names from the star exports, transitively
+fn star_names(g: Graph, ri: Int) -> [Str]:
+  var out: [Str] = []
+  var seen: [Int] = [ri]
+  for rq in g.recs[ri].star_rq:
+    let x = g.recs[ri].rq_res[rq]
+    if x < 0 or not g.recs[x].ok: continue
+    for nm in g.recs[x].ex_name: out.push(nm + "")
+    collect_star(g, x, &seen, &out)
+  return out
+
+fn collect_star(g: Graph, ri: Int, var seen: [Int], var out: [Str]):
+  for rq in g.recs[ri].star_rq:
+    let x = g.recs[ri].rq_res[rq]
+    if x < 0 or not g.recs[x].ok: continue
+    if x in seen: continue
+    seen.push(x)
+    for nm in g.recs[x].ex_name: out.push(nm + "")
+    collect_star(g, x, &seen, &out)
+
+fn file_end(var l: L, g: Graph, root: Int, path: Str):
+  if not l.mc.ic.on or not g.on: return
+  let ri = rec_of(g, path)
+  if ri < 0: return
+  var q = Seq(0)
+  if on(l, lmeta.M_IMPORT_NO_SELF_IMPORT): self_import(&l, &q, g, ri)
+  if on(l, lmeta.M_IMPORT_DEFAULT): default_rule(&l, &q, g, ri)
+  if on(l, lmeta.M_IMPORT_NAMED) and not l.ts: named(&l, &q, g, ri)
+  if on(l, lmeta.M_IMPORT_NAMESPACE): namespace(&l, &q, g, ri)
+  if on(l, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT): named_as_default(&l, &q, g, ri)
+  if on(l, lmeta.M_IMPORT_NO_NAMED_AS_DEFAULT_MEMBER): named_as_default_member(&l, &q, g, ri)
+  if on(l, lmeta.M_IMPORT_EXTENSIONS):
+    extensions(&l, &q, g, ri)
+    extension_requires(&l, g, ri)
+
+# requested_modules in the order of oxc's FxHashMap<CompactStr, _> (built with room for all)
+fn request_order(r: Rec) -> [Int]:
+  # (the parser's map, filled in source order as it grows, then collected into one with room for all)
+  var st1 = rhooks.new_set()
+  for i in 0..r.rq.len:
+    let h = rhooks.rotl(rhooks.write_str(0, r.rq[i]), 26)
+    let _ = rhooks.set_insert(&st1, rhooks.Dep(r.rq[i] + "", -1, [], i, 0, 0, h))
+  var st = rhooks.new_set()
+  if r.rq.len > 0: rhooks.resize(&st, r.rq.len)
+  for j1 in rhooks.set_order(st1):
+    let i = st1.ds[j1].s
+    let h = rhooks.rotl(rhooks.write_str(0, r.rq[i]), 26)
+    let _ = rhooks.set_insert(&st, rhooks.Dep(r.rq[i] + "", -1, [], i, 0, 0, h))
+  var out: [Int] = []
+  for j in rhooks.set_order(st): out.push(st.ds[j].s)
+  return out
+
+# ---- import(no-self-import)
+
+fn self_import(var l: L, var q: Seq, g: Graph, ri: Int):
+  let r = g.recs[ri]
+  for j in request_order(r):
+    let x = r.rq_res[j]
+    if x < 0 or not g.recs[x].ok: continue
+    if g.recs[x].path != r.path: continue
+    for e in 0..r.re_n.len:
+      if r.re_n[e] == j: diag(&l, &q, r.re_s[e], r.re_e[e], "import(no-self-import)", "A module importing itself is not allowed", "Remove this import. A module should not import itself.")
+
+# ---- import(default)
+
+fn default_rule(var l: L, var q: Seq, g: Graph, ri: Int):
+  let r = g.recs[ri]
+  for i in 0..r.ie_k.len:
+    if r.ie_k[i] != 2: continue
+    let spec = r.rq[r.ie_n[i]]
+    let x = lmod.loaded(g, ri, spec)
+    if x < 0: continue
+    if not g.recs[x].msyn: continue
+    if not lmod.valid_ext(g.recs[x].path): continue
+    if not g.recs[x].def and not has_binding(g.recs[x], "default"):
+      diag(&l, &q, r.ie_ds[i], r.ie_de[i], "import(default)", "No default export found in imported module {dbg(spec)}", "Does {dbg(spec)} have the default export?")
+
+# ---- import(named)
+
+fn named(var l: L, var q: Seq, g: Graph, ri: Int):
+  let r = g.recs[ri]
+  for i in 0..r.ie_k.len:
+    if r.ie_k[i] != 0: continue
+    let spec = r.rq[r.ie_n[i]]
+    let x = lmod.loaded(g, ri, spec)
+    if x < 0 or not g.recs[x].msyn: continue
+    let name = r.ie_name[i]
+    if name == "default" and g.recs[x].def: continue
+    if has_binding(g.recs[x], name): continue
+    if name in star_names(g, x): continue
+    let ds = r.ie_ds[i]
+    diag(&l, &q, ds, ds + name.len, "import(named)", "named import {dbg(name)} not found", "Does {dbg(spec)} have the export {dbg(name)}?")
+  for i in 0..r.ind_ik.len:
+    if r.ind_ik[i] != 0: continue
+    let spec = r.rq[r.ind_rq[i]]
+    let x = lmod.loaded(g, ri, spec)
+    if x < 0 or not g.recs[x].msyn: continue
+    let name = r.ind_in[i]
+    let has_def = g.recs[x].def or has_binding(g.recs[x], "default")
+    if name == "default" and has_def: continue
+    # (a re-export of a default import)
+    let synth = not (r.ind_ss[i] <= r.ind_s[i] and r.ind_e[i] <= r.ind_se[i])
+    if synth and has_def:
+      var reexp = false
+      for j in 0..r.ie_k.len:
+        if r.ie_k[j] == 2 and r.rq[r.ie_n[j]] == spec and r.ie_local[j] == name: reexp = true
+      if reexp: continue
+    if has_binding(g.recs[x], name): continue
+    diag(&l, &q, r.ind_is[i], r.ind_ie[i], "import(named)", "named import {dbg(name)} not found", "Does {dbg(spec)} have the export {dbg(name)}?")
+
+# ---- import(no-named-as-default)
+
+fn same_reexport(rr: Rec, name: Str) -> Bool:
+  var di = -1
+  var ni = -1
+  for i in 0..rr.ind_ek.len:
+    if di < 0 and rr.ind_ek[i] == 0 and rr.ind_en[i] == "default": di = i
+  for i in 0..rr.ind_ek.len:
+    if ni < 0 and rr.ind_ek[i] == 0 and rr.ind_en[i] == name: ni = i
+  if di < 0 or ni < 0: return false
+  if rr.rq[rr.ind_rq[di]] != rr.rq[rr.ind_rq[ni]]: return false
+  if rr.ind_ik[di] != 0 or rr.ind_ik[ni] != 0: return false
+  var dsrc = rr.ind_in[di] + ""
+  for j in 0..rr.ie_k.len:
+    if rr.ie_k[j] == 2 and rr.rq[rr.ie_n[j]] == rr.rq[rr.ind_rq[di]] and rr.ie_local[j] == rr.ind_in[di]: dsrc = "default"
+  return dsrc == rr.ind_in[ni]
+
+fn named_as_default(var l: L, var q: Seq, g: Graph, ri: Int):
+  let r = g.recs[ri]
+  for i in 0..r.ie_k.len:
+    if r.ie_t[i] or r.ie_k[i] != 2: continue
+    let spec = r.rq[r.ie_n[i]]
+    let x = lmod.loaded(g, ri, spec)
+    if x < 0: continue
+    let name = r.ie_local[i]
+    if not has_binding(g.recs[x], name): continue
+    if same_reexport(g.recs[x], name): continue
+    diag(&l, &q, r.ie_ds[i], r.ie_de[i], "import(no-named-as-default)", "Module {dbg(spec)} has named export {dbg(name)}", "Using default import as {dbg(name)} can be confusing. Use another name for default import to avoid confusion.")
+
+# ---- import(no-named-as-default-member)
+
+fn root_symbol(l: L, name: Str) -> Int:
+  let n = l.sc.yn.len
+  for y in 0..n:
+    if l.sc.ys[y] == 0 and l.t.names[l.sc.yn[y]] == name and (l.sc.yk[y] == scope.Y_IMPORT or l.sc.yk[y] == scope.Y_IMPORTTYPE): return y
+  return -1
+
+fn named_as_default_member(var l: L, var q: Seq, g: Graph, ri: Int):
+  let r = g.recs[ri]
+  var syms: [Int] = []
+  var remote: [Int] = []
+  var specs: [Str] = []
+  for i in 0..r.ie_k.len:
+    if r.ie_k[i] != 2: continue
+    let spec = r.rq[r.ie_n[i]]
+    let x = lmod.loaded(g, ri, spec)
+    if x < 0 or g.recs[x].ex_name.len == 0: continue
+    let y = root_symbol(l, r.ie_local[i])
+    if y < 0: return
+    syms.push(y)
+    remote.push(x)
+    specs.push(spec + "")
+  if syms.len == 0: return
+  for n in 1..l.t.nd.len:
+    let kd = l.t.nd[n].k
+    if kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS:
+      let o = l.t.nd[n].a
+      if k(l, o) != ast.N_ID: continue
+      let pn = rjest.static_prop(l, n)
+      if pn == "\0": continue
+      let y = scope.sym_of(l.sc, o)
+      for j in 0..syms.len:
+        if syms[j] == y and has_binding(g.recs[remote[j]], pn):
+          diag(&l, &q, l.t.nd[n].pos, l.t.nd[n].end, "import(no-named-as-default-member)", "{dbg(name_of(l, o))} also has a named export {dbg(pn)}", "Check if you meant to write `import {{ {pn} }} from {dbg(specs[j])}`")
+    elif kd == ast.N_DECL:
+      let init = l.t.nd[n].c
+      let pat = l.t.nd[n].a
+      if k(l, init) != ast.N_ID or k(l, pat) != ast.N_OBJPAT: continue
+      let y = scope.sym_of(l.sc, init)
+      for el in ast.items(l.t, l.t.nd[pat].a):
+        if k(l, el) != ast.N_BINDEL or (l.t.nd[el].f & ast.M_REST) != 0: continue
+        var key = l.t.nd[el].a
+        var nm = "\0"
+        if key > 0:
+          let kk = k(l, key)
+          if kk == ast.N_ID or kk == ast.N_STR: nm = name_of(l, key)
+          elif kk == ast.N_NUM: nm = text(l, key)
+        else:
+          let b = l.t.nd[el].b
+          if k(l, b) == ast.N_ID: nm = name_of(l, b)
+        if nm == "\0": continue
+        for j in 0..syms.len:
+          if syms[j] == y and has_binding(g.recs[remote[j]], nm):
+            diag(&l, &q, l.t.nd[n].pos, l.t.nd[n].end, "import(no-named-as-default-member)", "{dbg(name_of(l, init))} also has a named export {dbg(nm)}", "Check if you meant to write `import {{ {nm} }} from {dbg(specs[j])}`")
+
+# ---- import(namespace)
+
+# get_module_request_name: the module a namespace member re-exports ("\0" none)
+fn module_request_name(g: Graph, x: Int, name: Str) -> Str:
+  let rr = g.recs[x]
+  for i in 0..rr.ind_ik.len:
+    if rr.ind_ik[i] == 1 and rr.ind_ek[i] == 0 and rr.ind_en[i] == name: return rr.rq[rr.ind_rq[i]] + ""
+    if rr.ind_ik[i] == 0 and rr.ind_in[i] == name:
+      for j in 0..rr.ie_k.len:
+        if rr.ie_local[j] == name and rr.ie_k[j] == 1: return rr.rq[rr.ind_rq[i]] + ""
+  for j in 0..rr.ie_k.len:
+    if rr.ie_local[j] == name and rr.ie_k[j] == 1: return rr.rq[rr.ie_n[j]] + ""
+  return "\0"
+
+fn binding_exported(g: Graph, x: Int, name: Str) -> Bool:
+  if has_binding(g.recs[x], name): return true
+  if name == "default" and g.recs[x].def: return true
+  return name in star_names(g, x)
+
+fn ns_missing(var l: L, var q: Seq, s: Int, e: Int, name: Str, source: Str, spaces: [Str]):
+  if spaces.len > 1: diag(&l, &q, s, e, "import(namespace)", "{dbg(name)} not found in deeply imported namespace {dbg(".".join(spaces))}.", "")
+  else: diag(&l, &q, s, e, "import(namespace)", "{dbg(name)} not found in imported namespace {dbg(source)}.", "")
+
+fn prop_span(l: L, m: Int) -> [Int]:
+  if k(l, m) == ast.N_PROPACCESS:
+    let nm = name_of(l, m)
+    return [l.t.nd[m].end - nm.len, l.t.nd[m].end]
+  let ix = l.t.nd[m].b
+  return [l.t.nd[ix].pos, l.t.nd[ix].end]
+
+fn deep_node(var l: L, var q: Seq, g: Graph, node: Int, source: Str, spaces: [Str], x: Int):
+  let kd = k(l, node)
+  if kd != ast.N_PROPACCESS and kd != ast.N_ELEMACCESS: return
+  let name = rjest.static_prop(l, node)
+  if name == "\0": return
+  let sp = prop_span(l, node)
+  let ms = module_request_name(g, x, name)
+  if ms != "\0":
+    let p = parent(&l, node)
+    let nx = lmod.loaded(g, x, ms)
+    if nx < 0: return
+    var ns2: [Str] = []
+    for s in spaces: ns2.push(s + "")
+    ns2.push(name)
+    deep_node(&l, &q, g, p, source, ns2, nx)
+  elif not binding_exported(g, x, name): ns_missing(&l, &q, sp[0], sp[1], name, source, spaces)
+
+fn deep_pattern(var l: L, var q: Seq, g: Graph, pat: Int, source: Str, spaces: [Str], x: Int):
+  for el in ast.items(l.t, l.t.nd[pat].a):
+    if k(l, el) != ast.N_BINDEL or (l.t.nd[el].f & ast.M_REST) != 0: continue
+    let key = l.t.nd[el].a
+    var name = "\0"
+    var ks = 0
+    var ke = 0
+    if key > 0:
+      let kk = k(l, key)
+      if kk == ast.N_ID or kk == ast.N_STR: name = name_of(l, key)
+      elif kk == ast.N_NUM: name = text(l, key)
+      ks = l.t.nd[key].pos
+      ke = l.t.nd[key].end
+    else:
+      let b = l.t.nd[el].b
+      if k(l, b) == ast.N_ID:
+        name = name_of(l, b)
+        ks = l.t.nd[b].pos
+        ke = l.t.nd[b].end
+    if name == "\0": continue
+    let val = l.t.nd[el].b
+    if k(l, val) == ast.N_OBJPAT:
+      let ms = module_request_name(g, x, name)
+      if ms != "\0":
+        let nx = lmod.loaded(g, x, ms)
+        if nx < 0: continue
+        var ns2: [Str] = []
+        for s in spaces: ns2.push(s + "")
+        ns2.push(name)
+        deep_pattern(&l, &q, g, val, source, ns2, nx)
+        continue
+    if not binding_exported(g, x, name): ns_missing(&l, &q, ks, ke, name, source, spaces)
+
+fn namespace(var l: L, var q: Seq, g: Graph, ri: Int):
+  let r = g.recs[ri]
+  if not r.msyn: return
+  for i in 0..r.ie_k.len:
+    var source = ""
+    var x = -1
+    if r.ie_k[i] == 1:
+      source = r.rq[r.ie_n[i]] + ""
+      x = lmod.loaded(g, ri, source)
+      if x < 0: continue
+    elif r.ie_k[i] == 0:
+      let lm = lmod.loaded(g, ri, r.rq[r.ie_n[i]])
+      if lm < 0: continue
+      let src = module_request_name(g, lm, r.ie_name[i])
+      if src == "\0": continue
+      let x2 = lmod.loaded(g, lm, src)
+      if x2 < 0: continue
+      source = src
+      x = x2
+    else: continue
+    if not g.recs[x].msyn: continue
+    let local = r.ie_local[i]
+    let y = root_symbol(l, local)
+    if y < 0: continue
+    for ref in rjest.refs_of(&l, y):
+      let p = parent(&l, ref)
+      let pk = k(l, p)
+      if pk == ast.N_PROPACCESS or pk == ast.N_ELEMACCESS:
+        if l.t.nd[p].a != ref: continue
+        # (a JSX element's name: a JSXMemberExpression)
+        let gp = parent(&l, p)
+        if k(l, gp) == ast.N_JSXELEM and pk == ast.N_PROPACCESS and (l.t.nd[gp].a == p or l.t.nd[gp].d == p):
+          let pn = name_of(l, p)
+          if not binding_exported(g, x, pn):
+            let sp = prop_span(l, p)
+            diag(&l, &q, sp[0], sp[1], "import(namespace)", "{dbg(pn)} not found in imported namespace {dbg(source)}.", "")
+          continue
+        let gk = k(l, gp)
+        var assign = false
+        if gk == ast.N_BINARY and rules.is_assign_op(l.t.nd[gp].f) and l.t.nd[gp].a == p: assign = true
+        if assign: diag(&l, &q, l.t.nd[p].pos, l.t.nd[p].end, "import(namespace)", "Assignment to member of namespace {dbg(local)}.'", "Imported namespace members are read-only. Assign to a local variable instead.")
+        if not l.mc.ic.ns_computed and pk == ast.N_ELEMACCESS:
+          diag(&l, &q, l.t.nd[p].pos, l.t.nd[p].end, "import(namespace)", "Unable to validate computed reference to imported namespace {dbg(local)}.", "Use a static property access (e.g. `namespace.name`) instead of a computed one.")
+          continue
+        deep_node(&l, &q, g, p, source, [local], x)
+      elif pk == ast.N_DECL and l.t.nd[p].c == ref:
+        let pat = l.t.nd[p].a
+        if k(l, pat) == ast.N_OBJPAT: deep_pattern(&l, &q, g, pat, source, [local], x)
+
+
+# ---- import(extensions)
+
+fn standard_ext(e: Str) -> Bool:
+  return e == "js" or e == "jsx" or e == "ts" or e == "tsx" or e == "mjs" or e == "cjs" or e == "json"
+
+fn ext_rule(l: L, e: Str) -> Int:
+  for i in 0..l.mc.ic.ext_keys.len:
+    if l.mc.ic.ext_keys[i] == e: return l.mc.ic.ext_vals[i]
+  return -1
+
+fn any_never(l: L) -> Bool:
+  if l.mc.ic.ext_def == 1: return true
+  for e in ["js", "jsx", "ts", "tsx", "mjs", "cjs", "json"]:
+    if ext_rule(l, e) == 1: return true
+  return false
+
+fn should_flag(l: L, e: Str, written: Bool, has_resolved: Bool, req: Int) -> Bool:
+  if written and req == 1: return ext_rule(l, e) != 0
+  if written: return ext_rule(l, e) == 1
+  if req == 0:
+    if has_resolved: return ext_rule(l, e) != 1
+    return not any_never(l)
+  return ext_rule(l, e) == 0
+
+fn package_import(m: Str) -> Bool:
+  if m.startswith(".") or m.startswith("/"): return false
+  if m.startswith("@"):
+    let rest = m[1..m.len]
+    if rest.startswith("/"): return false
+    return rest.find("/") >= 0
+  if m.len >= 2 and m[1] == '/' and m[0] != '.' and m[0] != '@': return false
+  return true
+
+fn root_package_import(m: Str) -> Bool:
+  if not package_import(m): return false
+  if m.startswith("@"): return m.count("/") == 1
+  return m.find("/") < 0
+
+fn written_ext(m: Str) -> Str:
+  var p = m
+  let qi = p.find("?")
+  if qi >= 0: p = p[0..qi]
+  var fname = p
+  var i = p.len - 1
+  while i >= 0 and p[i] != '/': i -= 1
+  fname = p[i + 1..p.len]
+  var d = fname.len - 1
+  while d >= 0 and fname[d] != '.': d -= 1
+  if d < 0: return ""
+  let e = fname[d + 1..fname.len]
+  return e.lower()
+
+fn node_builtin(m: Str) -> Bool:
+  if m.startswith("node:"): return true
+  for x in ["assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster", "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns", "dns/promises", "domain", "events", "fs", "fs/promises", "http", "http2", "https", "inspector", "inspector/promises", "module", "net", "os", "path", "path/posix", "path/win32", "perf_hooks", "process", "punycode", "querystring", "readline", "readline/promises", "repl", "stream", "stream/consumers", "stream/promises", "stream/web", "string_decoder", "sys", "timers", "timers/promises", "tls", "trace_events", "tty", "url", "util", "util/types", "v8", "vm", "wasi", "worker_threads", "zlib"]:
+    if x == m: return true
+  return false
+
+fn ext_check(var l: L, var q: Seq, g: Graph, ri: Int, m: Str, s: Int, e: Int, is_type: Bool, is_import: Bool):
+  let c = l.mc.ic.ext_def
+  if c < 0 and l.mc.ic.ext_keys.len == 0 and l.mc.ic.ext_pg_pat.len == 0: return
+  if is_type and not l.mc.ic.ext_types: return
+  var pga = -1
+  for i in 0..l.mc.ic.ext_pg_pat.len:
+    if rmore3_glob(l.mc.ic.ext_pg_pat[i], m):
+      pga = l.mc.ic.ext_pg_act[i]
+      break
+  if pga == 1: return
+  if node_builtin(m) or m in l.globals: return
+  if l.mc.ic.ext_ignore and package_import(m) and c == 0: return
+  var resolved = ""
+  var has_res = false
+  if ri >= 0:
+    let x = lmod.loaded(g, ri, m)
+    if x >= 0:
+      resolved = lresolve.extname(g.recs[x].path).lower()
+      if resolved.startswith("."): resolved = resolved[1..resolved.len]
+      has_res = resolved != ""
+  var written = ""
+  if not (root_package_import(m) and pga != 0): written = written_ext(m)
+  var io = "export"
+  if is_import: io = "import"
+  let genuine = written != "" and (not has_res or resolved != written) and (standard_ext(written) or ext_rule(l, written) >= 0)
+  var check = ""
+  if genuine: check = written
+  elif has_res: check = resolved
+  else: check = written
+  if check != "":
+    if c < 0 and not standard_ext(check) and ext_rule(l, check) < 0: return
+    var is_written = false
+    if genuine: is_written = true
+    elif has_res: is_written = written == resolved
+    else: is_written = written != ""
+    if should_flag(l, check, is_written, has_res, c):
+      if is_written: diag(&l, &q, s, e, "import(extensions)", "File extension \"{check}\" should not be included in the {io} declaration.", "Remove the file extension from this {io}.")
+      else: diag(&l, &q, s, e, "import(extensions)", "Missing file extension in {io} declaration.", "Add a file extension to this {io}.")
+  elif c == 0 and not any_never(l):
+    diag(&l, &q, s, e, "import(extensions)", "Missing file extension in {io} declaration.", "Add a file extension to this {io}.")
+
+fn rmore3_glob(p: Str, s: Str) -> Bool:
+  return rmore3.rmore3_glob(p, s)
+
+fn extensions(var l: L, var q: Seq, g: Graph, ri: Int):
+  let r = g.recs[ri]
+  for j in request_order(r):
+    for e in 0..r.re_n.len:
+      if r.re_n[e] != j: continue
+      ext_check(&l, &q, g, ri, r.rq[j], r.re_ss[e], r.re_se[e], (r.re_f[e] & 1) != 0, (r.re_f[e] & 2) != 0)
+
+# require("x") calls (the rule's run on call expressions): after the requests, by position
+fn extension_requires(var l: L, g: Graph, ri: Int):
+  for n in 1..l.t.nd.len:
+    if l.t.nd[n].k != ast.N_CALL: continue
+    let ce = l.t.nd[n].a
+    if not rules.id_is(l, ce, "require"): continue
+    let c = l.t.nd[n].c
+    if c <= 0: continue
+    for a in ast.items(l.t, c):
+      if k(l, a) != ast.N_STR: continue
+      var q = Seq(1000000 + l.t.nd[n].pos)
+      ext_check(&l, &q, g, ri, name_of(l, a), l.t.nd[n].pos, l.t.nd[n].end, false, true)
