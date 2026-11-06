@@ -1,0 +1,253 @@
+# An FxHashMap<usize, _>'s layout (std's hashbrown with SSE2 groups of 16, rustc-hash 2's FxHasher),
+# enough to know its iteration order: inserts, entry().or_insert(), removes (tombstones), growth and
+# rehashing in place. oxlint's per-file rule list, when an override applies, is the iteration order
+# of such a map keyed by rule id (Config::apply_overrides), and that is the order its rules run in.
+
+type Fm:
+  ctrl: [Int]      # each bucket: -1 empty, -2 deleted, else the tag (the hash's top 7 bits)
+  keys: [Int]
+  items: Int
+  growth: Int
+  hm: {Int: Int}   # keys' hashes when given (an IdentHashMap), else FxHasher's of the key
+
+fn new_fm() -> Fm:
+  return Fm([], [], 0, 0, {})
+
+fn hof(f: Fm, k: Int) -> Int:
+  let h = f.hm.get(k, -1)
+  if h != -1: return h
+  return hash_of(k)
+
+fn hash_of(k: Int) -> Int:
+  let x = k *% ((0xf1357aea *% 0x100000000) +% 0x2e62a9c5)
+  return (x << 26) | (x >>> 38)
+
+fn tag(h: Int) -> Int:
+  return (h >>> 57) & 0x7f
+
+# the control byte at offset j of a group load: the table, then (a table under 16 buckets) empty
+# bytes up to 16 and a copy, or (a larger one) a copy of its first 16
+fn at(f: Fm, j: Int) -> Int:
+  let nb = f.ctrl.len
+  if j < nb: return f.ctrl[j]
+  if nb >= 16: return f.ctrl[j - nb]
+  if j < 16: return -1
+  return f.ctrl[j - 16]
+
+fn cap_of(mask: Int) -> Int:
+  if mask < 8: return mask
+  return (mask + 1) / 8 * 7
+
+fn buckets_for(cap: Int) -> Int:
+  if cap < 15:
+    var c = cap
+    if c < 3: c = 3
+    if c < 4: return 4
+    if c < 8: return 8
+    return 16
+  let adj = cap * 8 / 7
+  var b = 1
+  while b < adj: b = b * 2
+  return b
+
+fn find(f: Fm, k: Int) -> Int:
+  let nb = f.ctrl.len
+  if nb == 0: return -1
+  let mask = nb - 1
+  let h = hof(f, k)
+  let t = tag(h)
+  var pos = h & mask
+  var stride = 0
+  while true:
+    var empty = false
+    for bit in 0..16:
+      let c = at(f, pos + bit)
+      if c == -1: empty = true
+      elif c == t:
+        let idx = (pos + bit) & mask
+        if f.keys[idx] == k: return idx
+    if empty: return -1
+    stride += 16
+    pos = (pos + stride) & mask
+  return -1
+
+fn fix_slot(f: Fm, idx: Int) -> Int:
+  if f.ctrl[idx] >= 0:
+    for z in 0..f.ctrl.len:
+      if f.ctrl[z] < 0: return z
+  return idx
+
+fn insert_slot(f: Fm, h: Int) -> Int:
+  let mask = f.ctrl.len - 1
+  var pos = h & mask
+  var stride = 0
+  while true:
+    for bit in 0..16:
+      if at(f, pos + bit) < 0: return fix_slot(f, (pos + bit) & mask)
+    stride += 16
+    pos = (pos + stride) & mask
+  return -1
+
+# find_or_find_insert_slot without the reserve: the bucket (>= 0), or -2 - the slot to insert at
+fn find_or_slot(f: Fm, k: Int) -> Int:
+  let mask = f.ctrl.len - 1
+  let h = hof(f, k)
+  let t = tag(h)
+  var pos = h & mask
+  var stride = 0
+  var slot = -1
+  while true:
+    var empty = false
+    for bit in 0..16:
+      let c = at(f, pos + bit)
+      if c == t and f.keys[(pos + bit) & mask] == k: return (pos + bit) & mask
+    for bit in 0..16:
+      let c = at(f, pos + bit)
+      if c < 0 and slot < 0: slot = (pos + bit) & mask
+      if c == -1: empty = true
+    if slot >= 0 and empty: return -2 - fix_slot(f, slot)
+    stride += 16
+    pos = (pos + stride) & mask
+  return -1
+
+fn resize(var f: Fm, cap: Int):
+  let nb = buckets_for(cap)
+  var oc: [Int] = [-1] * nb
+  var ok: [Int] = [0] * nb
+  swap(&oc, &f.ctrl)
+  swap(&ok, &f.keys)
+  for i in 0..oc.len:
+    if oc[i] >= 0:
+      let h = hof(f, ok[i])
+      let s = insert_slot(f, h)
+      f.ctrl[s] = tag(h)
+      f.keys[s] = ok[i]
+  f.growth = cap_of(nb - 1) - f.items
+
+fn same_group(f: Fm, i: Int, j: Int, h: Int) -> Bool:
+  let mask = f.ctrl.len - 1
+  let p = h & mask
+  return ((i - p) & mask) / 16 == ((j - p) & mask) / 16
+
+fn rehash_in_place(var f: Fm):
+  for i in 0..f.ctrl.len:
+    if f.ctrl[i] >= 0: f.ctrl[i] = -2
+    else: f.ctrl[i] = -1
+  for i in 0..f.ctrl.len:
+    if f.ctrl[i] != -2: continue
+    while true:
+      let h = hof(f, f.keys[i])
+      let ni = insert_slot(f, h)
+      if same_group(f, i, ni, h):
+        f.ctrl[i] = tag(h)
+        break
+      let prev = f.ctrl[ni]
+      f.ctrl[ni] = tag(h)
+      if prev == -1:
+        f.ctrl[i] = -1
+        f.keys[ni] = f.keys[i]
+        break
+      let tk = f.keys[i]
+      f.keys[i] = f.keys[ni]
+      f.keys[ni] = tk
+  f.growth = cap_of(f.ctrl.len - 1) - f.items
+
+fn reserve1(var f: Fm):
+  if f.growth >= 1: return
+  let need = f.items + 1
+  var mask = 0
+  if f.ctrl.len > 0: mask = f.ctrl.len - 1
+  let full = cap_of(mask)
+  if need <= full / 2:
+    rehash_in_place(&f)
+    return
+  var c = need
+  if full + 1 > c: c = full + 1
+  resize(&f, c)
+
+fn put_at(var f: Fm, s: Int, k: Int):
+  if f.ctrl[s] == -1: f.growth -= 1
+  f.ctrl[s] = tag(hof(f, k))
+  f.keys[s] = k
+  f.items += 1
+
+# HashMap::insert (an existing key keeps its bucket)
+fn insert(var f: Fm, k: Int):
+  reserve1(&f)
+  let r = find_or_slot(f, k)
+  if r >= 0: return
+  put_at(&f, -2 - r, k)
+
+# entry(k).or_insert(..)
+fn entry_insert(var f: Fm, k: Int):
+  if find(f, k) >= 0: return
+  reserve1(&f)
+  put_at(&f, insert_slot(f, hof(f, k)), k)
+
+fn empty_bits(f: Fm, from: Int) -> Int:
+  var b = 0
+  for j in 0..16:
+    if at(f, from + j) == -1: b = b | (1 << j)
+  return b
+
+fn lead16(b: Int) -> Int:
+  var n = 0
+  var j = 15
+  while j >= 0 and (b & (1 << j)) == 0:
+    n += 1
+    j -= 1
+  return n
+
+fn trail16(b: Int) -> Int:
+  var n = 0
+  while n < 16 and (b & (1 << n)) == 0: n += 1
+  return n
+
+fn remove(var f: Fm, k: Int):
+  let idx = find(f, k)
+  if idx < 0: return
+  let mask = f.ctrl.len - 1
+  let before = (idx - 16) & mask
+  if lead16(empty_bits(f, before)) + trail16(empty_bits(f, idx)) >= 16:
+    f.ctrl[idx] = -2
+  else:
+    f.growth += 1
+    f.ctrl[idx] = -1
+  f.items -= 1
+
+fn order(f: Fm) -> [Int]:
+  var out: [Int] = []
+  for i in 0..f.ctrl.len:
+    if f.ctrl[i] >= 0: out.push(f.keys[i])
+  return out
+
+# oxc_str's IdentHasher: ident_hash over the bytes, packed with the length (the state hashbrown sees)
+fn mix32(a: Int, b: Int) -> Int:
+  let m = (a & 0xFFFFFFFF) *% (b & 0xFFFFFFFF)
+  return (m & 0xFFFFFFFF) ^ ((m >>> 32) & 0xFFFFFFFF)
+
+fn u32_at(s: Str, i: Int) -> Int:
+  return int(s[i]) | (int(s[i + 1]) << 8) | (int(s[i + 2]) << 16) | (int(s[i + 3]) << 24)
+
+fn ident_hash(s: Str) -> Int:
+  let s1 = 0x9E3779B9
+  let s2 = 0x85EBCA6B
+  let n = s.len
+  if n == 0: return 0
+  if n < 4:
+    let p = (int(s[0]) << 16) | (int(s[n >> 1]) << 8) | int(s[n - 1])
+    return mix32(p ^ s1, p ^ s2)
+  if n <= 8: return mix32(u32_at(s, 0) ^ s1, u32_at(s, n - 4) ^ s2)
+  if n <= 16: return mix32(u32_at(s, 0) ^ u32_at(s, (n >> 1) - 2) ^ s1, u32_at(s, n - 4) ^ s2)
+  return mix32(u32_at(s, 0) ^ u32_at(s, n / 3) ^ s1, u32_at(s, 2 * n / 3) ^ u32_at(s, n - 4) ^ s2)
+
+fn ident_state(s: Str) -> Int:
+  let h = ident_hash(s)
+  let len = s.len & 0xFFFFFFFF
+  let rot = ((len << 16) | (len >>> 16)) & 0xFFFFFFFF
+  return ((h ^ rot) & 0xFFFFFFFF) | (h << 32)
+
+# entry(k).or_insert for a key with a given hash
+fn entry_h(var f: Fm, k: Int, h: Int):
+  f.hm[k] = h
+  entry_insert(&f, k)

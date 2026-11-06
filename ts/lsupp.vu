@@ -1,0 +1,229 @@
+# Bulk suppressions (oxlint-suppressions.json in the current folder), as oxc_linter's suppression
+# module does them: a count of errors per file and rule; --suppress-all writes it, --prune-suppressions
+# (and any --fix) lowers it to what's left, and a normal run hides the errors it covers and reports
+# when there are more of them, or fewer.
+
+import lconf
+import lout
+
+const A_NONE = 0
+const A_EXISTS = 1
+const A_CREATED = 2
+const A_UPDATED = 3
+const A_UNPRUNED = 4
+const A_MALFORMED = 5
+
+type Sup:
+  exists: Bool
+  action: Int
+  message: Str          # for A_MALFORMED and failed writes
+  files: [Str]          # the file's entries: file, rule, count (in the file's order)
+  rules: [Str]
+  counts: [Int]
+  at: {Str: Int}        # file \t rule -> entry
+  has_file: {Str: Bool}
+  rfiles: [Str]         # this run's counts (errors only), files seen
+  rrules: [Str]
+  rcounts: [Int]
+  rat: {Str: Int}
+  rseen: {Str: Bool}
+  rseen_list: [Str]
+  suppress_all: Bool
+  prune: Bool
+
+fn load(fs: Fs, cwd: Str, suppress_all: Bool, prune: Bool) -> Sup:
+  var s = Sup(false, A_NONE, "", [], [], [], {}, {}, [], [], [], {}, {}, [], suppress_all, prune)
+  let path = cwd + "/oxlint-suppressions.json"
+  if not fs.exists(path):
+    if suppress_all: s.action = A_CREATED
+    return s
+  s.exists = true
+  let text = fs.read(path) else ""
+  let js = lconf.parse_json(text)
+  if js.err != "":
+    s.action = A_MALFORMED
+    s.message = "Failed to parse oxlint config oxlint-suppressions.json.\n{js.err}"
+    return s
+  if js.v.len == 0 or js.v[0].k != lconf.J_OBJ:
+    s.action = A_MALFORMED
+    s.message = "Failed to parse rules suppression file with error Error(\"invalid type: expected a map\", line: 0, column: 0)"
+    return s
+  let root = js.v[0]
+  for i in 0..root.keys.len:
+    let fo = js.v[root.kids[i]]
+    if fo.k != lconf.J_OBJ: continue
+    let f = root.keys[i] + ""
+    s.has_file[f] = true
+    for j in 0..fo.keys.len:
+      let ro = fo.kids[j]
+      var n = 0
+      let c = lconf.get(js, ro, "count")
+      if c >= 0 and js.v[c].k == lconf.J_NUM: n = int(js.v[c].s) else 0
+      let key = f + "\t" + fo.keys[j]
+      if s.at.get(key, -1) >= 0: s.counts[s.at[key]] = n
+      else:
+        s.at[key] = s.files.len
+        s.files.push(f + "")
+        s.rules.push(fo.keys[j] + "")
+        s.counts.push(n)
+  s.action = A_EXISTS
+  return s
+
+# (the diff is skipped unless the file is being created, updated, or exists)
+fn ignored(s: Sup) -> Bool:
+  return s.action != A_CREATED and s.action != A_UPDATED and s.action != A_EXISTS
+
+# oxc_code_short_canonical_name: eslint(x) -> x, p(x) -> p/x; "" for a code without a scope
+fn short_name(code: Str) -> Str:
+  let i = code.find("(")
+  if i <= 0 or not code.endswith(")"): return ""
+  let scope = code[0..i]
+  let nm = code[i + 1..code.len - 1]
+  if scope == "eslint": return nm
+  return scope + "/" + nm
+
+# One file's diagnostics: the ones to show (the rest are suppressed), and this run's counts kept.
+fn filter(var s: Sup, file: Str, own recs: [lout.Rec]) -> [lout.Rec]:
+  if ignored(s): return recs
+  # this run's errors by rule
+  var names: [Str] = []
+  var cnt: {Str: Int} = {}
+  for r in recs:
+    if r.sev != 2: continue
+    let k = short_name(r.code)
+    if k == "": continue
+    if cnt.get(k, -1) < 0:
+      names.push(k + "")
+      cnt[k] = 0
+    cnt[k] = cnt[k] + 1
+  if not s.rseen.get(file, false):
+    s.rseen[file] = true
+    s.rseen_list.push(file + "")
+  for k in names:
+    let key = file + "\t" + k
+    let e = s.rat.get(key, -1)
+    if e >= 0: s.rcounts[e] = s.rcounts[e] + cnt[k]
+    else:
+      s.rat[key] = s.rfiles.len
+      s.rfiles.push(file + "")
+      s.rrules.push(k + "")
+      s.rcounts.push(cnt[k])
+  var keep: [Bool] = []
+  for r in recs:
+    var kp = true
+    if r.sev == 2:
+      let k = short_name(r.code)
+      if s.suppress_all: kp = false
+      elif k != "":
+        let e = s.at.get(file + "\t" + k, -1)
+        if e >= 0 and s.counts[e] >= cnt.get(k, 0): kp = false
+    keep.push(kp)
+  var all = recs
+  var out: [lout.Rec] = []
+  for i in 0..all.len:
+    if not keep[i]: continue
+    var r = lout.Rec(0, "", "", "", 0, 0, 0, 0, "")
+    swap(&r, &all[i])
+    out.push(r)
+  return out
+
+fn run_count(s: Sup, file: Str, rule: Str) -> Int:
+  let e = s.rat.get(file + "\t" + rule, -1)
+  if e < 0: return -1
+  return s.rcounts[e]
+
+# After linting: write the file (suppress-all, prune), or the diagnostics about it (as messages)
+fn finish(fs: Fs, cwd: Str, var s: Sup) -> [Str]:
+  var out: [Str] = []
+  if s.action == A_MALFORMED or (not s.exists and not s.suppress_all): return out
+  if s.suppress_all or s.prune:
+    var nf: [Str] = []
+    var nr: [Str] = []
+    var nc: [Int] = []
+    if s.suppress_all:
+      # the file's entries, with this run's for every file that has errors now
+      var replaced: {Str: Bool} = {}
+      for i in 0..s.rfiles.len: replaced[s.rfiles[i]] = true
+      for i in 0..s.files.len:
+        if replaced.get(s.files[i], false): continue
+        nf.push(s.files[i] + "")
+        nr.push(s.rules[i] + "")
+        nc.push(s.counts[i])
+      for i in 0..s.rfiles.len:
+        nf.push(s.rfiles[i] + "")
+        nr.push(s.rrules[i] + "")
+        nc.push(s.rcounts[i])
+    else:
+      for i in 0..s.files.len:
+        let f = s.files[i]
+        if s.rseen.get(f, false):
+          let rc = run_count(s, f, s.rules[i])
+          if rc > 0:
+            var c = s.counts[i]
+            if rc < c: c = rc
+            if c > 0:
+              nf.push(f + "")
+              nr.push(s.rules[i] + "")
+              nc.push(c)
+        elif fs.exists(cwd + "/" + f):
+          nf.push(f + "")
+          nr.push(s.rules[i] + "")
+          nc.push(s.counts[i])
+    let text = render(nf, nr, nc)
+    var ok = true
+    fs.write(cwd + "/oxlint-suppressions.json", text) else ok = false
+    if not ok:
+      s.action = A_MALFORMED
+      s.message = "Failed to write suppression file: Permission denied (os error 13)"
+      return out
+    if s.action == A_EXISTS: s.action = A_UPDATED
+    return out
+  # compare
+  var unused = false
+  var new = false
+  var seen_rule: {Str: Bool} = {}
+  for i in 0..s.files.len:
+    let f = s.files[i]
+    seen_rule[f + "\t" + s.rules[i]] = true
+    if s.rseen.get(f, false):
+      let rc = run_count(s, f, s.rules[i])
+      if rc < 0: unused = true
+      elif s.counts[i] > rc: unused = true
+      elif s.counts[i] < rc: new = true
+  for i in 0..s.rfiles.len:
+    if not seen_rule.get(s.rfiles[i] + "\t" + s.rrules[i], false): new = true
+  if unused:
+    out.push("There are suppressions that do not occur anymore.\tRun `oxlint --prune-suppressions` to remove unused suppressions.")
+    s.action = A_UNPRUNED
+  if new: out.push("There are new violations not covered by the suppressions file.\tRun `oxlint --suppress-all` to update the suppressions file.")
+  return out
+
+# serde_json's pretty printing of the sorted map
+fn render(fs0: [Str], rs: [Str], cs: [Int]) -> Str:
+  var ix: [Int] = []
+  for i in 0..fs0.len: ix.push(i)
+  ix.sort(by: fn(a, b) => fs0[a] < fs0[b] or (fs0[a] == fs0[b] and rs[a] < rs[b]))
+  if ix.len == 0: return "{{}}"
+  var b: [Str] = ["{{"]
+  var i = 0
+  while i < ix.len:
+    let f = fs0[ix[i]]
+    var rows: [Str] = []
+    while i < ix.len and fs0[ix[i]] == f:
+      rows.push("    {esc(rs[ix[i]])}: {{\n      \"count\": {cs[ix[i]]}\n    }}")
+      i += 1
+    var sep = ","
+    if i >= ix.len: sep = ""
+    b.push("\n  {esc(f)}: {{\n" + ",\n".join(rows) + "\n  }}" + sep)
+  b.push("\n}}")
+  return "".join(b)
+
+fn esc(s: Str) -> Str:
+  return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+# the summary line's prefix
+fn action_text(s: Sup) -> Str:
+  if s.action == A_CREATED: return "Created 'oxlint-suppressions.json' in the root folder.\n"
+  if s.action == A_UPDATED: return "Updated 'oxlint-suppressions.json'.\n"
+  if s.action == A_MALFORMED: return s.message + "\n"
+  return ""

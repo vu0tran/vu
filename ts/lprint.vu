@@ -1,0 +1,349 @@
+# oxlint --print-config: the configuration that would be used, as oxlint prints it (serde_json's
+# pretty printer: two spaces): plugins in oxlint's order, categories, the resulting rules (sorted,
+# "allow"/"warn"/"deny", options as [severity, [options...]]), settings with their defaults, env,
+# globals, overrides (globs without a slash get "**/"), ignorePatterns and extends.
+
+import lconf
+import lmeta
+import rhooks
+
+fn esc(s: Str) -> Str:
+  var b: [Str] = []
+  var start = 0
+  for i in 0..s.len:
+    let c = s[i]
+    var r = ""
+    if c == '"': r = "\\\""
+    elif c == '\\': r = "\\\\"
+    elif c == '\n': r = "\\n"
+    elif c == '\r': r = "\\r"
+    elif c == '\t': r = "\\t"
+    elif int(c) == 8: r = "\\b"
+    elif int(c) == 12: r = "\\f"
+    elif int(c) < 32:
+      let h = "0123456789abcdef"
+      r = "\\u00" + h[int(c) / 16..int(c) / 16 + 1] + h[int(c) % 16..int(c) % 16 + 1]
+    if r != "":
+      b.push(s[start..i])
+      b.push(r)
+      start = i + 1
+  b.push(s[start..s.len])
+  return "\"" + "".join(b) + "\""
+
+fn pad(n: Int) -> Str:
+  var b: [Str] = []
+  for i in 0..n: b.push("  ")
+  return "".join(b)
+
+# a parsed JSON value, pretty-printed at indentation level ind
+fn dump(js: lconf.Json, v: Int, ind: Int) -> Str:
+  let x = js.v[v]
+  if x.k == lconf.J_NULL: return "null"
+  if x.k == lconf.J_TRUE: return "true"
+  if x.k == lconf.J_FALSE: return "false"
+  if x.k == lconf.J_NUM: return x.s + ""
+  if x.k == lconf.J_STR: return esc(x.s)
+  if x.kids.len == 0:
+    if x.k == lconf.J_ARR: return "[]"
+    return "{{}}"
+  var parts: [Str] = []
+  for i in 0..x.kids.len:
+    if x.k == lconf.J_ARR: parts.push(pad(ind + 1) + dump(js, x.kids[i], ind + 1))
+    else: parts.push(pad(ind + 1) + esc(x.keys[i]) + ": " + dump(js, x.kids[i], ind + 1))
+  if x.k == lconf.J_ARR: return "[\n" + ",\n".join(parts) + "\n" + pad(ind) + "]"
+  return "{{\n" + ",\n".join(parts) + "\n" + pad(ind) + "}}"
+
+# an object from (key, already printed value) pairs
+fn obj(keys: [Str], vals: [Str], ind: Int) -> Str:
+  if keys.len == 0: return "{{}}"
+  var parts: [Str] = []
+  for i in 0..keys.len: parts.push(pad(ind + 1) + esc(keys[i]) + ": " + vals[i])
+  return "{{\n" + ",\n".join(parts) + "\n" + pad(ind) + "}}"
+
+fn arr(vals: [Str], ind: Int) -> Str:
+  if vals.len == 0: return "[]"
+  var parts: [Str] = []
+  for v in vals: parts.push(pad(ind + 1) + v)
+  return "[\n" + ",\n".join(parts) + "\n" + pad(ind) + "]"
+
+fn strs(xs: [Str], ind: Int) -> Str:
+  var vals: [Str] = []
+  for x in xs: vals.push(esc(x))
+  return arr(vals, ind)
+
+fn sev_name(s: Int) -> Str:
+  if s == 0: return "allow"
+  if s == 1: return "warn"
+  return "deny"
+
+fn plugin_names(mask: Int) -> [Str]:
+  var out: [Str] = []
+  var f = 1
+  while f <= lconf.PL_VUE:
+    if (mask & f) != 0: out.push(lconf.flag_name(f))
+    f = f * 2
+  return out
+
+# a rule's value: "sev", or [sev, [options...]] (opts: the options after the severity as JSON text)
+fn rule_val(sev: Int, opts: Str, ind: Int) -> Str:
+  if opts == "": return esc(sev_name(sev))
+  let js = lconf.parse_json(opts)
+  if js.err != "" or js.v.len == 0: return esc(sev_name(sev))
+  var inner = dump(js, 0, ind + 1)
+  if js.v[0].k != lconf.J_ARR: inner = "[\n" + pad(ind + 2) + dump(js, 0, ind + 2) + "\n" + pad(ind + 1) + "]"
+  return "[\n" + pad(ind + 1) + esc(sev_name(sev)) + ",\n" + pad(ind + 1) + inner + "\n" + pad(ind) + "]"
+
+# sorted by plugin, then name (the bare eslint names are plugin "eslint")
+fn sort_key(k: Str) -> Str:
+  if k.find("/") < 0: return "eslint\t" + k
+  return k.replace("/", "\t")
+
+fn sorted_pairs(var keys: [Str], var vals: [Str]):
+  var ix: [Int] = []
+  var sk: [Str] = []
+  for i in 0..keys.len:
+    ix.push(i)
+    sk.push(sort_key(keys[i]))
+  ix.sort(by: fn(a, b) => sk[a] < sk[b])
+  var k2: [Str] = []
+  var v2: [Str] = []
+  for i in ix:
+    k2.push(keys[i] + "")
+    v2.push(vals[i] + "")
+  keys = k2
+  vals = v2
+
+fn rule_key(plugin: Str, name: Str) -> Str:
+  if plugin == "eslint": return name
+  return plugin + "/" + name
+
+# (key, value) pairs in the order an FxHashMap<String, _> iterates them
+fn fx_order(var ks: [Str], var vs: [Str]):
+  var st = rhooks.new_set()
+  # (built from an iterator of known length: room for all of them first)
+  if ks.len > 0: rhooks.resize(&st, ks.len)
+  for i in 0..ks.len:
+    let h = rhooks.rotl(rhooks.write_str(0, ks[i]), 26)
+    let _ = rhooks.set_insert(&st, rhooks.Dep(ks[i] + "", -1, [], i, 0, 0, h))
+  var k2: [Str] = []
+  var v2: [Str] = []
+  for j in rhooks.set_order(st):
+    k2.push(ks[st.ds[j].s] + "")
+    v2.push(vs[st.ds[j].s] + "")
+  ks = k2
+  vs = v2
+
+fn env_obj(env: [Str], ind: Int) -> Str:
+  var ks: [Str] = []
+  var vs: [Str] = []
+  var i = 0
+  while i + 1 < env.len:
+    ks.push(env[i] + "")
+    if env[i + 1] == "1": vs.push("true")
+    else: vs.push("false")
+    i += 2
+  fx_order(&ks, &vs)
+  return obj(ks, vs, ind)
+
+fn globals_obj(gl: [Str], ind: Int) -> Str:
+  var ks: [Str] = []
+  var vs: [Str] = []
+  var i = 0
+  while i + 1 < gl.len:
+    ks.push(gl[i] + "")
+    vs.push(esc(gl[i + 1]))
+    i += 2
+  fx_order(&ks, &vs)
+  return obj(ks, vs, ind)
+
+fn version3(v: Str) -> Str:
+  let parts = v.split(".")
+  if parts.len == 1: return v + ".0.0"
+  if parts.len == 2: return v + ".0"
+  return v
+
+# settings: oxlint's defaults, with what the configuration gives for the keys it knows
+fn settings(text: Str, ind: Int) -> Str:
+  let js = lconf.parse_json(text)
+  var root = -1
+  if js.err == "" and js.v.len > 0 and js.v[0].k == lconf.J_OBJ: root = 0
+  let names = ["jsx-a11y", "next", "react", "jsdoc", "vitest", "jest"]
+  var outs: [Str] = []
+  for sec in names:
+    var ks: [Str] = []
+    var dv: [Str] = []
+    if sec == "jsx-a11y":
+      ks = ["polymorphicPropName", "components", "attributes"]
+      dv = ["null", "{{}}", "{{}}"]
+    elif sec == "next":
+      ks = ["rootDir"]
+      dv = ["[]"]
+    elif sec == "react":
+      ks = ["formComponents", "linkComponents", "version", "componentWrapperFunctions"]
+      dv = ["[]", "[]", "null", "[]"]
+    elif sec == "jsdoc":
+      ks = ["ignorePrivate", "ignoreInternal", "ignoreReplacesDocs", "overrideReplacesDocs", "augmentsExtendsReplacesDocs", "implementsReplacesDocs", "exemptDestructuredRootsFromChecks", "tagNamePreference"]
+      dv = ["false", "false", "true", "true", "false", "false", "false", "{{}}"]
+    elif sec == "vitest":
+      ks = ["typecheck"]
+      dv = ["false"]
+    else:
+      ks = ["version"]
+      dv = ["null"]
+    let so = lconf.get(js, root, sec)
+    var vals: [Str] = []
+    for i in 0..ks.len:
+      var v = dv[i] + ""
+      let g = lconf.get(js, so, ks[i])
+      if g >= 0:
+        if sec == "react" and ks[i] == "version" and js.v[g].k == lconf.J_STR: v = esc(version3(js.v[g].s))
+        elif js.v[g].k == lconf.J_OBJ and (ks[i] == "components" or ks[i] == "attributes" or ks[i] == "tagNamePreference"):
+          # (maps: in hash order)
+          var mk: [Str] = []
+          var mv: [Str] = []
+          for z in 0..js.v[g].keys.len:
+            mk.push(js.v[g].keys[z] + "")
+            mv.push(dump(js, js.v[g].kids[z], ind + 3))
+          fx_order(&mk, &mv)
+          v = obj(mk, mv, ind + 2)
+        else: v = dump(js, g, ind + 2)
+      vals.push(v)
+    outs.push(obj(ks, vals, ind + 1))
+  return obj(names, outs, ind)
+
+fn glob_files(fs: [Str]) -> [Str]:
+  var out: [Str] = []
+  for f in fs:
+    if f.find("/") < 0: out.push("**/" + f)
+    else: out.push(f + "")
+  return out
+
+# the categories in the order oxc's FxHashMap<RuleCategory, _> iterates them (inserted in the order
+# the file gives them)
+fn cat_order(given: [Int]) -> [Int]:
+  var st = rhooks.new_set()
+  for d in given:
+    let h = rhooks.rotl(rhooks.add_to(0, d), 26)
+    let _ = rhooks.set_insert(&st, rhooks.Dep("{d}", -1, [], d, 0, 0, h))
+  var out: [Int] = []
+  for i in rhooks.set_order(st): out.push(st.ds[i].s)
+  return out
+
+fn print_config(m: lmeta.Meta, rc: lconf.Rc, c: lconf.Conf, raw: Str) -> Str:
+  var ks: [Str] = []
+  var vs: [Str] = []
+  let rj = lconf.parse_json(raw)
+  var root = -1
+  if rj.err == "" and rj.v.len > 0 and rj.v[0].k == lconf.J_OBJ: root = 0
+  let sch = lconf.get(rj, root, "$schema")
+  if sch >= 0 and rj.v[sch].k == lconf.J_STR:
+    ks.push("$schema")
+    vs.push(esc(rj.v[sch].s))
+  ks.push("plugins")
+  vs.push(strs(plugin_names(c.plugins), 1))
+  var cks: [Str] = []
+  var cvs: [Str] = []
+  let cn = lconf.cats()
+  var given: [Int] = []
+  let co = lconf.get(rj, root, "categories")
+  if co >= 0 and rj.v[co].k == lconf.J_OBJ:
+    for key in rj.v[co].keys:
+      let ci = lconf.cat_index(key)
+      if ci >= 0 and rc.cats[ci] >= 0:
+        var dup = false
+        for g in given:
+          if g == ci: dup = true
+        if not dup: given.push(ci)
+  for i in 0..cn.len:
+    if rc.cats[i] >= 0:
+      var dup = false
+      for g in given:
+        if g == i: dup = true
+      if not dup: given.push(i)
+  for i in cat_order(given):
+    cks.push(cn[i] + "")
+    cvs.push(esc(sev_name(rc.cats[i])))
+  ks.push("categories")
+  vs.push(obj(cks, cvs, 1))
+  var rks: [Str] = []
+  var rvs: [Str] = []
+  for i in 0..m.name.len:
+    if c.base[i] < 0: continue
+    rks.push(rule_key(m.plugin[i], m.name[i]))
+    # (the options as the configuration writes them under the rule's own name, else none)
+    var op = ""
+    for r in rc.rules:
+      let pn = lconf.rule_key(m, r.key)
+      if pn[0] == m.plugin[i] and pn[1] == m.name[i]: op = r.opts + ""
+    rvs.push(rule_val(c.base[i], op, 2))
+  sorted_pairs(&rks, &rvs)
+  ks.push("rules")
+  vs.push(obj(rks, rvs, 1))
+  ks.push("settings")
+  vs.push(settings(rc.settings, 1))
+  ks.push("env")
+  if rc.env.len == 0: vs.push("{{\n    \"builtin\": true\n  }}")
+  else: vs.push(env_obj(rc.env, 1))
+  ks.push("globals")
+  vs.push(globals_obj(rc.globals, 1))
+  if rc.overrides.len > 0:
+    var ovs: [Str] = []
+    for ov in rc.overrides:
+      var oks: [Str] = ["files"]
+      var ovv: [Str] = [strs(glob_files(ov.files), 3)]
+      if ov.exclude.len > 0:
+        oks.push("excludeFiles")
+        ovv.push(strs(glob_files(ov.exclude), 3))
+      oks.push("env")
+      if ov.has_env: ovv.push(env_obj(ov.env, 3))
+      else: ovv.push("null")
+      oks.push("globals")
+      if ov.has_globals: ovv.push(globals_obj(ov.globals, 3))
+      else: ovv.push("null")
+      oks.push("plugins")
+      if ov.has_plugins: ovv.push(strs(plugin_names(ov.plugins), 3))
+      else: ovv.push("null")
+      var orks: [Str] = []
+      var orvs: [Str] = []
+      for r in ov.rules:
+        let pn = lconf.rule_key(m, r.key)
+        orks.push(rule_key(pn[0], pn[1]))
+        orvs.push(rule_val(r.sev, r.opts, 4))
+      oks.push("rules")
+      ovv.push(obj(orks, orvs, 3))
+      ovs.push(obj(oks, ovv, 2))
+    ks.push("overrides")
+    vs.push(arr(ovs, 1))
+  var oks: [Str] = []
+  var ovs: [Str] = []
+  if rc.type_aware >= 0:
+    oks.push("typeAware")
+    ovs.push(bool_text(rc.type_aware == 1))
+  if rc.type_check >= 0:
+    oks.push("typeCheck")
+    ovs.push(bool_text(rc.type_check == 1))
+  if rc.deny_warnings >= 0:
+    oks.push("denyWarnings")
+    ovs.push(bool_text(rc.deny_warnings == 1))
+  if rc.max_warnings >= 0:
+    oks.push("maxWarnings")
+    ovs.push("{rc.max_warnings}")
+  if rc.report_unused >= 0:
+    oks.push("reportUnusedDisableDirectives")
+    ovs.push(esc(sev_name(rc.report_unused)))
+  if rc.respect_eslint >= 0:
+    oks.push("respectEslintDisableDirectives")
+    ovs.push(bool_text(rc.respect_eslint == 1))
+  if oks.len > 0:
+    ks.push("options")
+    vs.push(obj(oks, ovs, 1))
+  ks.push("ignorePatterns")
+  vs.push(strs(rc.ignore, 1))
+  if rc.extends.len > 0:
+    ks.push("extends")
+    vs.push(strs(rc.extends, 1))
+  return obj(ks, vs, 0)
+
+fn bool_text(b: Bool) -> Str:
+  if b: return "true"
+  return "false"

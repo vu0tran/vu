@@ -1,0 +1,1048 @@
+# react-hooks(exhaustive-deps): oxc's port of eslint-plugin-react-hooks' ExhaustiveDeps
+# (crates/oxc_linter/src/rules/react/exhaustive_deps.rs, oxlint 1.90.0). The dependencies are kept
+# in sets that iterate as oxc's FxHashSet does (rustc-hash 2 over std's hashbrown table), because the
+# order of the names in a message and of the diagnostics follows it; the hash takes oxc's symbol ids,
+# which are the declarations' order in the file.
+
+import ast
+import scan
+import scope
+import lmeta
+import lconf
+import lmatch
+import fixgen
+import rules
+from rules import L, k, name_of, parent, add, more, primary_more, label, span
+
+const RULE = "react-hooks(exhaustive-deps)"
+
+# ---- rustc-hash 2's FxHasher (64-bit)
+
+fn big(hi: Int, lo: Int) -> Int:
+  return (hi *% 0x100000000) +% lo
+
+fn fx_k() -> Int:
+  return big(0xf1357aea, 0x2e62a9c5)
+
+fn add_to(h: Int, x: Int) -> Int:
+  return (h +% x) *% fx_k()
+
+fn rotl(x: Int, r: Int) -> Int:
+  return (x << r) | (x >>> (64 - r))
+
+# the high 64 bits of the unsigned 128-bit product, xored with the low ones
+fn mul_mix(x: Int, y: Int) -> Int:
+  let m = 0xFFFFFFFF
+  let a = x >>> 32
+  let b = x & m
+  let c = y >>> 32
+  let d = y & m
+  let bd = b *% d
+  let ad = a *% d
+  let bc = b *% c
+  let ac = a *% c
+  let mid = (bd >>> 32) + (ad & m) + (bc & m)
+  let hi = ac +% (ad >>> 32) +% (bc >>> 32) +% (mid >>> 32)
+  let lo = x *% y
+  return lo ^ hi
+
+fn le(s: Str, at: Int, n: Int) -> Int:
+  var v = 0
+  var i = n - 1
+  while i >= 0:
+    v = (v << 8) | int(s[at + i])
+    i -= 1
+  return v
+
+fn hash_bytes(s: Str) -> Int:
+  let n = s.len
+  var s0 = big(0x243f6a88, 0x85a308d3)
+  var s1 = big(0x13198a2e, 0x03707344)
+  if n <= 16:
+    if n >= 8:
+      s0 = s0 ^ le(s, 0, 8)
+      s1 = s1 ^ le(s, n - 8, 8)
+    elif n >= 4:
+      s0 = s0 ^ le(s, 0, 4)
+      s1 = s1 ^ le(s, n - 4, 4)
+    elif n > 0:
+      s0 = s0 ^ int(s[0])
+      s1 = s1 ^ ((int(s[n - 1]) << 8) | int(s[n / 2]))
+  else:
+    let ptzc = big(0xa4093822, 0x299f31d0)
+    var at = 0
+    while at + 16 <= n - 1:
+      let x = le(s, at, 8)
+      let y = le(s, at + 8, 8)
+      let t = mul_mix(s0 ^ x, ptzc ^ y)
+      s0 = s1
+      s1 = t
+      at += 16
+    s0 = s0 ^ le(s, n - 16, 8)
+    s1 = s1 ^ le(s, n - 8, 8)
+  return mul_mix(s0, s1) ^ n
+
+fn write_str(h: Int, s: Str) -> Int:
+  return add_to(add_to(h, hash_bytes(s)), 0xff)
+
+# ---- a dependency and a set of them
+
+type Dep:
+  name: Str
+  sym: Int         # vlint's symbol (-1: a global)
+  chain: [Str]
+  s: Int           # span
+  e: Int
+  ref: Int         # the identifier node it starts from
+  h: Int           # its hash
+
+fn dep_hash(var l: L, var c: Cx, name: Str, sym: Int, chain: [Str]) -> Int:
+  var h = write_str(0, name)
+  if sym < 0: h = add_to(h, 0)
+  else:
+    h = add_to(h, 1)
+    h = add_to(h, oxc_sym(&l, &c, sym) ^ 0xFFFFFFFF)
+  h = add_to(h, chain.len)
+  for p in chain: h = write_str(h, p)
+  return rotl(h, 26)
+
+fn mk(var l: L, var c: Cx, name: Str, sym: Int, own chain: [Str], s: Int, e: Int, ref: Int) -> Dep:
+  let h = dep_hash(&l, &c, name, sym, chain)
+  return Dep(name, sym, chain, s, e, ref, h)
+
+fn dep_str(d: Dep) -> Str:
+  if d.chain.len == 0: return d.name
+  return d.name + "." + ".".join(d.chain)
+
+fn same_chain(a: [Str], b: [Str]) -> Bool:
+  if a.len != b.len: return false
+  for i in 0..a.len:
+    if a[i] != b[i]: return false
+  return true
+
+fn dep_eq(a: Dep, b: Dep) -> Bool:
+  return a.name == b.name and same_chain(a.chain, b.chain)
+
+# a contains b: same name, b's chain a prefix of a's
+fn contains(a: Dep, b: Dep) -> Bool:
+  if a.name != b.name: return false
+  for i in 0..b.chain.len:
+    if i >= a.chain.len or a.chain[i] != b.chain[i]: return false
+  return true
+
+# hashbrown's table (SSE2 groups of 16), no deletions: ctrl -1 empty, else an index into ds
+type Set:
+  ds: [Dep]
+  ctrl: [Int]
+  tag: [Int]
+  cap: Int
+
+fn new_set() -> Set:
+  return Set([], [], [], 0)
+
+fn h2(h: Int) -> Int:
+  return (h >>> 57) & 0x7f
+
+# the control byte at offset j of a group load (-1 empty, else the bucket)
+fn byte_at(st: Set, j: Int) -> Int:
+  let nb = st.ctrl.len
+  if j < nb: return j
+  if nb >= 16: return j - nb
+  if j < 16: return -1
+  return j - 16
+
+fn is_full(st: Set, b: Int) -> Bool:
+  return b >= 0 and st.ctrl[b] >= 0
+
+# find_insert_slot: the first empty bucket in the probe sequence
+fn insert_slot(st: Set, h: Int) -> Int:
+  let mask = st.ctrl.len - 1
+  var pos = h & mask
+  var stride = 0
+  while true:
+    for bit in 0..16:
+      let b = byte_at(st, pos + bit)
+      if not is_full(st, b):
+        var idx = (pos + bit) & mask
+        if st.ctrl[idx] >= 0:
+          # (a small table: take the first empty bucket of the aligned group)
+          for z in 0..st.ctrl.len:
+            if st.ctrl[z] < 0:
+              idx = z
+              break
+        return idx
+    stride += 16
+    pos = (pos + stride) & mask
+  return -1
+
+fn set_find(st: Set, d: Dep) -> Int:
+  if st.ctrl.len == 0: return -1
+  let mask = st.ctrl.len - 1
+  let t = h2(d.h)
+  var pos = d.h & mask
+  var stride = 0
+  while true:
+    var empty = false
+    for bit in 0..16:
+      let b = byte_at(st, pos + bit)
+      if b < 0 or st.ctrl[b] < 0:
+        empty = true
+        continue
+      if st.tag[b] == t and dep_eq(st.ds[st.ctrl[b]], d): return st.ctrl[b]
+    if empty: return -1
+    stride += 16
+    pos = (pos + stride) & mask
+  return -1
+
+fn buckets_for(cap: Int) -> Int:
+  if cap < 8:
+    if cap < 4: return 4
+    return 8
+  let adj = cap * 8 / 7
+  var b = 1
+  while b < adj: b = b * 2
+  return b
+
+fn cap_of(nb: Int) -> Int:
+  if nb < 8: return nb - 1
+  return nb / 8 * 7
+
+fn resize(var st: Set, want: Int):
+  let nb = buckets_for(want)
+  var old: [Int] = [-1] * nb
+  swap(&old, &st.ctrl)
+  st.tag = [0] * nb
+  st.cap = cap_of(nb)
+  for b in 0..old.len:
+    let i = old[b]
+    if i < 0: continue
+    let at = insert_slot(st, st.ds[i].h)
+    st.ctrl[at] = i
+    st.tag[at] = h2(st.ds[i].h)
+
+# HashSet::insert: false when an equal one is there (reserve(1) runs first either way)
+fn set_insert(var st: Set, own d: Dep) -> Bool:
+  if st.ds.len + 1 > st.cap:
+    var w = st.ds.len + 1
+    if st.cap + 1 > w: w = st.cap + 1
+    resize(&st, w)
+  if set_find(st, d) >= 0: return false
+  let at = insert_slot(st, d.h)
+  st.ctrl[at] = st.ds.len
+  st.tag[at] = h2(d.h)
+  st.ds.push(d)
+  return true
+
+fn set_has(st: Set, d: Dep) -> Bool:
+  return set_find(st, d) >= 0
+
+# the members in iteration order (indexes into ds)
+fn set_order(st: Set) -> [Int]:
+  var out: [Int] = []
+  for b in 0..st.ctrl.len:
+    if st.ctrl[b] >= 0: out.push(st.ctrl[b])
+  return out
+
+# ---- per-file context
+
+type Cx:
+  oxid: [Int]           # vlint symbol -> oxc's symbol id (-2: not computed)
+  refs: [[Int]]         # symbol -> its reference nodes (filled on first use)
+  refs_done: Bool
+  decl_at: {Int: Int}   # binding name position -> its node (N_ID or the N_FUNC / N_CLASS)
+  decl_done: Bool
+  extra: Bool           # additionalHooks given
+  re: lmatch.Re
+
+fn new_cx() -> Cx:
+  return Cx([], [], false, {}, false, false, lmatch.Re([], [], [], [], [], false, false))
+
+fn in_type_sig(var l: L, p: Int) -> Bool:
+  # a parameter of a function type, a method or call signature, or a function without a body
+  let q = parent(&l, p)
+  if q <= 0: return false
+  let qk = k(l, q)
+  if qk == ast.N_SIG:
+    let r = parent(&l, q)
+    if r <= 0: return true
+    let rk = k(l, r)
+    if rk == ast.N_METHOD: return l.t.nd[r].c <= 0
+    if rk == ast.N_CTOR or rk == ast.N_GET or rk == ast.N_SET: return l.t.nd[r].c <= 0
+    return true
+  if qk == ast.N_FUNC or qk == ast.N_FUNCEXPR: return l.t.nd[q].d <= 0
+  return false
+
+fn bind_names(var l: L, n: Int, var out: [Int]):
+  let kd = k(l, n)
+  if kd == ast.N_ID: out.push(l.t.nd[n].pos)
+  elif kd == ast.N_OBJPAT or kd == ast.N_ARRPAT:
+    for x in ast.items(l.t, l.t.nd[n].a): bind_names(&l, x, &out)
+  elif kd == ast.N_BINDEL:
+    let tg = l.t.nd[n].b
+    if tg > 0: bind_names(&l, tg, &out)
+    elif l.t.nd[n].a > 0 and k(l, l.t.nd[n].a) == ast.N_ID: out.push(l.t.nd[l.t.nd[n].a].pos)
+
+# The declarator or parameter whose pattern binds the name at node n (its start), else -1
+fn binder_pos(var l: L, n: Int) -> Int:
+  var x = n
+  while true:
+    let p = parent(&l, x)
+    if p <= 0: return -1
+    let pk = k(l, p)
+    if pk == ast.N_OBJPAT or pk == ast.N_ARRPAT or pk == ast.N_BINDEL:
+      x = p
+      continue
+    if (pk == ast.N_DECL or pk == ast.N_PARAM) and l.t.nd[p].a == x: return l.t.nd[p].pos
+    return -1
+  return -1
+
+# oxc numbers symbols in the order it declares them: a declarator's or parameter's names all when it
+# starts, the others where they are. Parameters of type signatures are symbols in oxc but not in
+# vlint; they're counted in.
+fn oxc_sym(var l: L, var c: Cx, y: Int) -> Int:
+  if c.oxid.len == 0:
+    var ps: [Int] = []
+    var ks: [Int] = []
+    var seen: {Int: Bool} = {}
+    let _ = decl_of(&l, &c, -1)
+    for i in 0..l.sc.ypos.len:
+      let p = l.sc.ypos[i]
+      seen[p] = true
+      var o = p
+      let nd = c.decl_at.get(p, 0)
+      if nd > 0 and k(l, nd) == ast.N_ID:
+        let bp = binder_pos(&l, nd)
+        if bp >= 0 and bp < p: o = bp
+      ks.push(o)
+      ps.push(p)
+    let nsym = ps.len
+    for x in 1..l.t.nd.len:
+      if l.t.nd[x].k == ast.N_PARAM and in_type_sig(&l, x):
+        var bs: [Int] = []
+        bind_names(&l, l.t.nd[x].a, &bs)
+        for p in bs:
+          if not seen.get(p, false):
+            seen[p] = true
+            ks.push(l.t.nd[x].pos)
+            ps.push(p)
+    var ix: [Int] = []
+    for i in 0..ps.len: ix.push(i)
+    ix.sort(by: fn(a, b) => ks[a] < ks[b] or (ks[a] == ks[b] and ps[a] < ps[b]))
+    c.oxid = [-1] * nsym
+    for r in 0..ix.len:
+      if ix[r] < nsym: c.oxid[ix[r]] = r
+  if y < 0 or y >= c.oxid.len: return 0
+  return c.oxid[y]
+
+fn sym_refs(var l: L, var c: Cx, y: Int) -> [Int]:
+  if not c.refs_done:
+    c.refs_done = true
+    for i in 0..l.sc.ypos.len: c.refs.push([])
+    for x in 1..l.t.nd.len:
+      let kd = l.t.nd[x].k
+      if kd != ast.N_ID and kd != ast.N_SHORTHAND: continue
+      let r = scope.res_of(l.sc, x)
+      if r >= 0 and r < c.refs.len: c.refs[r].push(x)
+  var out: [Int] = []
+  if y < 0 or y >= c.refs.len: return out
+  for x in c.refs[y]: out.push(x)
+  return out
+
+# The node oxc's symbol_declaration gives: N_DECL (a declarator), N_PARAM, N_FUNC, N_CLASS, N_TRY (a
+# catch parameter), or another declaring node; 0 when not found.
+fn decl_of(var l: L, var c: Cx, y: Int) -> Int:
+  if not c.decl_done:
+    c.decl_done = true
+    for x in 1..l.t.nd.len:
+      let kd = l.t.nd[x].k
+      if kd == ast.N_ID: c.decl_at[l.t.nd[x].pos] = x
+      elif kd == ast.N_FUNC or kd == ast.N_CLASS or kd == ast.N_FUNCEXPR or kd == ast.N_CLASSEXPR:
+        let np = l.t.npos.get(x, -1)
+        if np >= 0: c.decl_at[np] = x
+  if y < 0 or y >= l.sc.ypos.len: return 0
+  let n = c.decl_at.get(l.sc.ypos[y], 0)
+  if n <= 0: return 0
+  let kd = k(l, n)
+  if kd != ast.N_ID: return n
+  var x = n
+  while true:
+    let p = parent(&l, x)
+    if p <= 0: return 0
+    let pk = k(l, p)
+    if pk == ast.N_OBJPAT or pk == ast.N_ARRPAT or pk == ast.N_BINDEL:
+      x = p
+      continue
+    if pk == ast.N_DECL:
+      let q = parent(&l, p)
+      if q > 0 and k(l, q) == ast.N_TRY: return q
+      return p
+    return p
+  return 0
+
+fn fn_like(kd: Int) -> Bool:
+  return kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR
+
+# oxc's Function or ArrowFunctionExpression (methods are functions there)
+fn enclosing_fn(var l: L, n: Int) -> Int:
+  var a = n
+  while a > 0:
+    if fn_like(k(l, a)): return a
+    a = parent(&l, a)
+  return 0
+
+# The node whose scope node n is in (0: the file): oxc's node.scope_id()
+fn owner(var l: L, n: Int) -> Int:
+  var x = n
+  var p = parent(&l, n)
+  while p > 0:
+    let pk = k(l, p)
+    if fn_like(pk): return p
+    if pk == ast.N_BLOCK:
+      let q = parent(&l, p)
+      if q > 0 and fn_like(k(l, q)): return q
+      return p
+    if pk == ast.N_FOR or pk == ast.N_FORIN or pk == ast.N_CLASS or pk == ast.N_CLASSEXPR or pk == ast.N_STATICBLOCK or pk == ast.N_MODULE: return p
+    if pk == ast.N_SWITCH and l.t.nd[p].a != x: return p
+    if pk == ast.N_TRY and l.t.nd[p].b == x: return p
+    x = p
+    p = parent(&l, p)
+  return 0
+
+fn fn_owner(var l: L, n: Int) -> Int:
+  var o = owner(&l, n)
+  while o > 0 and not fn_like(k(l, o)) and k(l, o) != ast.N_MODULE: o = owner(&l, o)
+  return o
+
+# the scope of a symbol (its declaration's, or for var the function's)
+fn sym_scope(var l: L, var c: Cx, y: Int) -> Int:
+  let d = decl_of(&l, &c, y)
+  if d <= 0: return 0
+  if l.sc.yk[y] == scope.Y_VAR: return fn_owner(&l, d)
+  return owner(&l, d)
+
+# scope_is_descendant_of(comp, s): s is a scope strictly around comp's
+fn outer_of(var l: L, comp: Int, s: Int) -> Bool:
+  var o = owner(&l, comp)
+  while true:
+    if o == s: return true
+    if o <= 0: return false
+    o = owner(&l, o)
+  return false
+
+fn inner(l: L, n: Int) -> Int:
+  var x = n
+  while x > 0:
+    let kd = k(l, x)
+    if kd == ast.N_PAREN or kd == ast.N_AS or kd == ast.N_SATISFIES or kd == ast.N_NONNULL or kd == ast.N_TYPEASSERT: x = l.t.nd[x].a
+    elif kd == ast.N_EXPRTARGS: x = l.t.nd[x].a
+    else: return x
+  return x
+
+fn is_ref(l: L, n: Int) -> Bool:
+  return scope.res_of(l.sc, n) != -2
+
+# a declaration's name (vlint resolves those to their own symbol)
+fn binding(var l: L, n: Int) -> Bool:
+  let y = scope.res_of(l.sc, n)
+  if y >= 0 and l.sc.ypos[y] == l.t.nd[n].pos: return true
+  let p = parent(&l, n)
+  if p <= 0: return false
+  let pk = k(l, p)
+  if pk == ast.N_DECL or pk == ast.N_PARAM: return l.t.nd[p].a == n
+  if pk == ast.N_BINDEL: return l.t.nd[p].b == n
+  return false
+
+fn id_end(l: L, n: Int) -> Int:
+  if k(l, n) == ast.N_SHORTHAND: return l.t.nd[n].pos + name_of(l, n).len
+  return l.t.nd[n].end
+
+# analyze_property_chain: 1 a dependency (in out), 0 none (JSX), -1 can't be analyzed
+fn chain_of(var l: L, var c: Cx, n: Int, var out: Dep) -> Int:
+  let x = inner(l, n)
+  let kd = k(l, x)
+  if kd == ast.N_ID:
+    out = mk(&l, &c, name_of(l, x), scope.sym_of(l.sc, x), [], l.t.nd[x].pos, l.t.nd[x].end, x)
+    return 1
+  if kd == ast.N_JSXELEM and l.t.nd[x].a > 0: return 0
+  if kd == ast.N_PROPACCESS and (l.t.nd[x].f & 4) == 0:
+    var src = Dep("", -1, [], 0, 0, 0, 0)
+    let r = chain_of(&l, &c, l.t.nd[x].a, &src)
+    if r <= 0: return r
+    var ch: [Str] = []
+    for p in src.chain: ch.push(p)
+    ch.push(name_of(l, x))
+    out = mk(&l, &c, src.name, src.sym, ch, l.t.nd[x].pos, l.t.nd[x].end, src.ref)
+    return 1
+  return -1
+
+# func_call_without_react_namespace: the called name, "" for none
+fn call_name(l: L, call: Int) -> Str:
+  let ce = inner(l, l.t.nd[call].a)
+  if k(l, ce) == ast.N_ID: return name_of(l, ce)
+  if k(l, ce) == ast.N_PROPACCESS and (l.t.nd[ce].f & 4) == 0:
+    let o = inner(l, l.t.nd[ce].a)
+    if k(l, o) == ast.N_ID and name_of(l, o) == "React": return name_of(l, ce)
+  return ""
+
+# ---- the visitor that collects dependencies
+
+type V:
+  found: Set
+  skip: Bool
+  callee: Bool
+  set_state: Bool
+  fns: Int          # functions entered
+  cleanup: Int      # functions entered that a return statement returns
+  cleanups: [Int]   # .current member accesses inside cleanups
+
+fn new_v() -> V:
+  return V(new_set(), false, false, false, 0, 0, [])
+
+fn put(var v: V, own d: Dep):
+  let _ = set_insert(&v.found, d)
+
+fn v_ident(var l: L, var c: Cx, var v: V, n: Int):
+  if v.skip: return
+  let y = scope.sym_of(l.sc, n)
+  put(&v, mk(&l, &c, name_of(l, n), y, [], l.t.nd[n].pos, id_end(l, n), n))
+  if y < 0 or v.fns > 0: return
+  let d = decl_of(&l, &c, y)
+  if d <= 0 or k(l, d) != ast.N_DECL: return
+  let init = l.t.nd[d].c
+  if k(l, init) != ast.N_CALL: return
+  let nm = call_name(l, init)
+  if nm != "useState" and nm != "useReducer": return
+  let pat = l.t.nd[d].a
+  if k(l, pat) != ast.N_ARRPAT or ast.count(l.t, l.t.nd[pat].a) < 2: return
+  let el = ast.item(l.t, l.t.nd[pat].a, 1)
+  if k(l, el) != ast.N_BINDEL or l.t.nd[el].c > 0 or (l.t.nd[el].f & ast.M_REST) != 0: return
+  let tg = l.t.nd[el].b
+  if k(l, tg) == ast.N_ID and name_of(l, tg) == name_of(l, n): v.set_state = true
+
+fn v_list(var l: L, var c: Cx, var v: V, lst: Int):
+  if lst <= 0: return
+  for x in ast.items(l.t, lst): v_node(&l, &c, &v, x)
+
+fn v_member(var l: L, var c: Cx, var v: V, n: Int):
+  if v.cleanup > 0 and name_of(l, n) == "current": v.cleanups.push(n)
+  let o = l.t.nd[n].a
+  if k(l, inner(l, o)) == ast.N_CALL or v.skip:
+    v_node(&l, &c, &v, o)
+    return
+  let was_callee = v.callee
+  var src = Dep("", -1, [], 0, 0, 0, 0)
+  let r = chain_of(&l, &c, o, &src)
+  if r >= 0:
+    if r > 0:
+      if was_callee: put(&v, src)
+      else:
+        let pn = name_of(l, n)
+        if pn == "current":
+          var base: [Str] = []
+          for p in src.chain: base.push(p)
+          put(&v, mk(&l, &c, src.name, src.sym, base, src.s, src.e, src.ref))
+        var ch: [Str] = []
+        for p in src.chain: ch.push(p)
+        ch.push(pn)
+        put(&v, mk(&l, &c, src.name, src.sym, ch, src.s, src.e, src.ref))
+    let sk = v.skip
+    v.skip = true
+    v.callee = false
+    v_node(&l, &c, &v, o)
+    v.skip = sk
+  else:
+    v.callee = false
+    v_node(&l, &c, &v, o)
+
+fn v_fn(var l: L, var c: Cx, var v: V, n: Int, kd: Int):
+  let was = v.callee
+  v.callee = false
+  v.fns += 1
+  var cl = false
+  var p = parent(&l, n)
+  if p > 0 and k(l, p) == ast.N_RETURN: cl = true
+  if cl: v.cleanup += 1
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW:
+    v_node(&l, &c, &v, l.t.nd[n].b)
+    v_node(&l, &c, &v, l.t.nd[n].d)
+  else:
+    if kd != ast.N_CTOR and k(l, l.t.nd[n].a) == ast.N_COMPUTED: v_node(&l, &c, &v, l.t.nd[n].a)
+    v_node(&l, &c, &v, fn_params(l, n))
+    v_node(&l, &c, &v, l.t.nd[n].c)
+  if cl: v.cleanup -= 1
+  v.fns -= 1
+  v.callee = was
+
+fn jsx_name(var l: L, var c: Cx, var v: V, x: Int):
+  if x <= 0: return
+  let kx = k(l, x)
+  if kx == ast.N_ID:
+    let s = name_of(l, x)
+    if s.len == 0 or (s[0] >= 'a' and s[0] <= 'z') or s.find("-") >= 0 or s.find(":") >= 0: return
+    v_ident(&l, &c, &v, x)
+  elif kx == ast.N_PROPACCESS:
+    var b = x
+    while k(l, b) == ast.N_PROPACCESS: b = l.t.nd[b].a
+    if k(l, b) == ast.N_ID: v_ident(&l, &c, &v, b)
+
+fn v_node(var l: L, var c: Cx, var v: V, n: Int):
+  if n <= 0: return
+  let kd = l.t.nd[n].k
+  if kd == ast.N_LIST:
+    v_list(&l, &c, &v, n)
+    return
+  if kd == ast.N_ID:
+    if is_ref(l, n) and not binding(&l, n): v_ident(&l, &c, &v, n)
+    return
+  if kd == ast.N_SHORTHAND:
+    if is_ref(l, n): v_ident(&l, &c, &v, n)
+    v_node(&l, &c, &v, l.t.nd[n].b)
+    return
+  if kd == ast.N_CALL:
+    v.callee = true
+    v_node(&l, &c, &v, l.t.nd[n].a)
+    v.callee = false
+    v_list(&l, &c, &v, l.t.nd[n].c)
+    return
+  if kd == ast.N_PROPACCESS:
+    if (l.t.nd[n].f & 4) != 0: v_node(&l, &c, &v, l.t.nd[n].a)
+    else: v_member(&l, &c, &v, n)
+    return
+  if fn_like(kd):
+    v_fn(&l, &c, &v, n, kd)
+    return
+  if kd == ast.N_JSXELEM:
+    jsx_name(&l, &c, &v, l.t.nd[n].a)
+    v_list(&l, &c, &v, l.t.nd[n].b)
+    v_list(&l, &c, &v, l.t.nd[n].c)
+    jsx_name(&l, &c, &v, l.t.nd[n].d)
+    return
+  if kd == ast.N_JSXATTR:
+    v_node(&l, &c, &v, l.t.nd[n].b)
+    return
+  # (oxc's VisitJs: the JavaScript parts only, no types)
+  if kd >= ast.N_TREF and kd <= ast.N_TREST and kd != ast.N_TSPAN: return
+  if kd == ast.N_AS or kd == ast.N_SATISFIES or kd == ast.N_TYPEASSERT or kd == ast.N_NONNULL or kd == ast.N_EXPRTARGS:
+    v_node(&l, &c, &v, l.t.nd[n].a)
+    return
+  if kd == ast.N_DECL or kd == ast.N_PARAM or kd == ast.N_NEW or kd == ast.N_TAGGED:
+    v_node(&l, &c, &v, l.t.nd[n].a)
+    v_node(&l, &c, &v, l.t.nd[n].c)
+    return
+  if kd == ast.N_CLASS or kd == ast.N_CLASSEXPR:
+    v_node(&l, &c, &v, l.t.nd[n].b)
+    v_node(&l, &c, &v, l.t.nd[n].d)
+    return
+  if kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS or kd == ast.N_SIG or kd == ast.N_INDEXSIG or kd == ast.N_CALLSIG or kd == ast.N_CTORSIG: return
+  if kd == ast.N_PROPASSIGN:
+    let key = l.t.nd[n].a
+    if k(l, key) == ast.N_COMPUTED: v_node(&l, &c, &v, key)
+    v_node(&l, &c, &v, l.t.nd[n].b)
+    return
+  if kd == ast.N_PROP:
+    let key = l.t.nd[n].a
+    if k(l, key) == ast.N_COMPUTED: v_node(&l, &c, &v, key)
+    v_node(&l, &c, &v, l.t.nd[n].c)
+    return
+  if kd == ast.N_BINDEL:
+    let key = l.t.nd[n].a
+    if k(l, key) == ast.N_COMPUTED: v_node(&l, &c, &v, key)
+    v_node(&l, &c, &v, l.t.nd[n].b)
+    v_node(&l, &c, &v, l.t.nd[n].c)
+    return
+  if kd == ast.N_STR or kd == ast.N_NUM or kd == ast.N_JSXTEXT or kd == ast.N_TKW or kd == ast.N_QNAME: return
+  var nk = 4
+  if kd == ast.N_VAR or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS: nk = 3
+  if kd == ast.N_MODULE or kd == ast.N_IMPORT or kd == ast.N_EXPORT or kd == ast.N_BREAK or kd == ast.N_CONTINUE: return
+  v_node(&l, &c, &v, l.t.nd[n].a)
+  v_node(&l, &c, &v, l.t.nd[n].b)
+  v_node(&l, &c, &v, l.t.nd[n].c)
+  if nk == 4: v_node(&l, &c, &v, l.t.nd[n].d)
+
+# the body of a function (or an arrow's expression)
+fn fn_body(l: L, f: Int) -> Int:
+  let kd = k(l, f)
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW: return l.t.nd[f].d
+  return l.t.nd[f].c
+
+fn fn_params(l: L, f: Int) -> Int:
+  let kd = k(l, f)
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW: return l.t.nd[f].b
+  let sg = l.t.nd[f].b
+  if sg > 0 and k(l, sg) == ast.N_SIG: return l.t.nd[sg].b
+  return -1
+
+fn is_async(l: L, f: Int) -> Bool:
+  return (l.t.nd[f].f & ast.M_ASYNC) != 0
+
+# ---- is_identifier_a_dependency
+
+fn is_dep(var l: L, var c: Cx, d: Dep, comp: Int, var seen: {Int: Bool}) -> Bool:
+  if d.sym < 0: return false
+  let decl = decl_of(&l, &c, d.sym)
+  if decl <= 0: return false
+  if owner(&l, decl) != comp: return false
+  let ds = l.t.nd[decl].pos
+  var de = l.t.nd[decl].end
+  if ds <= d.s and d.e <= de: return false
+  if stable(&l, &c, decl, d, comp, &seen): return false
+  return true
+
+fn lit_kind(kd: Int) -> Bool:
+  return kd == ast.N_TRUE or kd == ast.N_FALSE or kd == ast.N_NULL or kd == ast.N_NUM or kd == ast.N_BIGINT or kd == ast.N_STR
+
+fn decl_kind(var l: L, d: Int) -> Int:
+  let p = parent(&l, d)
+  if p > 0 and k(l, p) == ast.N_VAR: return l.t.nd[p].f
+  return -1
+
+fn stable(var l: L, var c: Cx, decl: Int, d: Dep, comp: Int, var seen: {Int: Bool}) -> Bool:
+  if d.sym >= 0:
+    if seen.get(d.sym, false): return true
+    seen[d.sym] = true
+  let kd = k(l, decl)
+  if kd == ast.N_DECL:
+    let init = l.t.nd[decl].c
+    if init <= 0: return false
+    let ii = inner(l, init)
+    let ik = k(l, ii)
+    if ik == ast.N_ARROW or ik == ast.N_FUNCEXPR:
+      var own_sym = -1
+      if k(l, l.t.nd[decl].a) == ast.N_ID:
+        own_sym = sym_at(&l, l.t.nd[l.t.nd[decl].a].pos)
+      return fn_stable(&l, &c, ii, own_sym, comp, &seen)
+    if decl_kind(&l, decl) == 2 and lit_kind(ik): return true
+    if ik != ast.N_CALL: return false
+    let nm = call_name(l, ii)
+    if nm == "": return false
+    if nm == "useRef" or nm == "useEffectEvent": return true
+    let pat = l.t.nd[decl].a
+    if k(l, pat) != ast.N_ARRPAT or ast.count(l.t, l.t.nd[pat].a) < 2: return false
+    let el = ast.item(l.t, l.t.nd[pat].a, 1)
+    if k(l, el) != ast.N_BINDEL or l.t.nd[el].c > 0 or (l.t.nd[el].f & ast.M_REST) != 0: return false
+    let tg = l.t.nd[el].b
+    if k(l, tg) != ast.N_ID: return false
+    if (nm == "useState" or nm == "useReducer" or nm == "useTransition" or nm == "useActionState") and name_of(l, tg) == d.name:
+      for r in sym_refs(&l, &c, d.sym):
+        let p = parent(&l, r)
+        if p > 0 and k(l, p) == ast.N_BINARY and rules.is_assign_op(l.t.nd[p].f) and l.t.nd[p].a == r: return false
+      return true
+    return false
+  if kd == ast.N_FUNC:
+    if l.t.nd[decl].d <= 0: return false
+    return fn_stable(&l, &c, decl, -1, comp, &seen)
+  return false
+
+fn sym_at(var l: L, pos: Int) -> Int:
+  for i in 0..l.sc.ypos.len:
+    if l.sc.ypos[i] == pos: return i
+  return -1
+
+fn fn_stable(var l: L, var c: Cx, f: Int, own_sym: Int, comp: Int, var seen: {Int: Bool}) -> Bool:
+  var v = new_v()
+  let body = fn_body(l, f)
+  v_node(&l, &c, &v, body)
+  for i in set_order(v.found):
+    let d = v.found.ds[i]
+    if own_sym >= 0 and d.sym == own_sym: return false
+    if is_dep(&l, &c, d, comp, &seen): return false
+  return true
+
+fn is_dep0(var l: L, var c: Cx, d: Dep, comp: Int) -> Bool:
+  var seen: {Int: Bool} = {}
+  return is_dep(&l, &c, d, comp, &seen)
+
+# ---- the rule
+
+fn diag(var l: L, s: Int, e: Int, msg: Str, help: Str):
+  add(&l, s, RULE, msg, help)
+  span(&l, e)
+
+fn hook_index(var l: L, var c: Cx, nm: Str) -> Int:
+  if nm == "useEffect" or nm == "useLayoutEffect" or nm == "useCallback" or nm == "useMemo": return 0
+  if nm == "useImperativeHandle": return 1
+  if c.extra and lmatch.test(c.re, nm): return 0
+  return -1
+
+fn callee_name(l: L, call: Int) -> Str:
+  let ce = l.t.nd[call].a
+  if k(l, ce) == ast.N_ID: return name_of(l, ce)
+  if k(l, ce) == ast.N_PROPACCESS and (l.t.nd[ce].f & 4) == 0:
+    let o = inner(l, l.t.nd[ce].a)
+    if k(l, o) == ast.N_ID and name_of(l, o) == "React": return name_of(l, ce)
+  return ""
+
+fn setup(var c: Cx, opts: Str):
+  if opts == "": return
+  let js = lconf.parse_json(opts)
+  if js.err != "" or js.v.len == 0 or js.v[0].k != lconf.J_ARR or js.v[0].kids.len == 0: return
+  let o = js.v[0].kids[0]
+  let a = lconf.get(js, o, "additionalHooks")
+  if a >= 0 and js.v[a].k == lconf.J_STR and js.v[a].s != "":
+    c.extra = true
+    c.re = lmatch.compile(js.v[a].s, "")
+
+fn quote_list(names: [Str]) -> Str:
+  if names.len == 1: return "'{names[0]}'"
+  var b: [Str] = []
+  for i in 0..names.len - 1: b.push("'{names[i]}'")
+  return ", ".join(b) + ", and '{names[names.len - 1]}'"
+
+fn check(var l: L, var c: Cx, call: Int):
+  let hook = callee_name(l, call)
+  let ci = hook_index(&l, &c, hook)
+  if ci < 0: return
+  let comp = enclosing_fn(&l, call)
+  if comp <= 0: return
+  let args = l.t.nd[call].c
+  let na = ast.count(l.t, args)
+  if ci >= na:
+    diag(&l, l.t.nd[call].pos, l.t.nd[call].end, "React hook {hook} requires an effect callback.", "Did you forget to pass a callback to the hook?")
+    return
+  let cb0 = ast.item(l.t, args, ci)
+  var deps0 = -1
+  if ci + 1 < na: deps0 = ast.item(l.t, args, ci + 1)
+  let is_effect = hook.find("Effect") >= 0
+  if deps0 < 0 and not is_effect:
+    if hook == "useCallback" or hook == "useMemo":
+      rules.add_fix(&l, l.t.nd[call].pos, RULE, "React Hook {hook} does nothing when called with only one argument.", "Did you forget to pass an array of dependencies?", l.t.nd[cb0].end, l.t.nd[cb0].end, ", []")
+      span(&l, l.t.nd[call].end)
+    return
+  let ce = l.t.nd[call].a
+  var cb = -1
+  if k(l, cb0) == ast.N_SPREAD:
+    diag(&l, l.t.nd[ce].pos, l.t.nd[ce].end, "React Hook {hook} received a function whose dependencies are unknown.", "Pass an inline function instead.")
+  else:
+    let x = inner(l, cb0)
+    let xk = k(l, x)
+    if xk == ast.N_ARROW or xk == ast.N_FUNCEXPR: cb = x
+    elif xk == ast.N_ID:
+      if deps0 < 0: return
+      let di = inner(l, deps0)
+      if k(l, di) == ast.N_ARRAY and k(l, deps0) != ast.N_SPREAD:
+        for el in ast.items(l.t, l.t.nd[di].a):
+          if k(l, el) == ast.N_SPREAD or k(l, el) == ast.N_OMIT: continue
+          let ei = inner(l, el)
+          if k(l, ei) == ast.N_ID and name_of(l, ei) == name_of(l, x): return
+      let y = scope.sym_of(l.sc, x)
+      if y < 0: return
+      let decl = decl_of(&l, &c, y)
+      if decl <= 0: return
+      let dow = owner(&l, decl)
+      if outer_of(&l, comp, dow): return
+      let dk = k(l, decl)
+      if dk == ast.N_DECL:
+        let init = l.t.nd[decl].c
+        if init <= 0: return
+        if k(l, init) == ast.N_FUNCEXPR or k(l, init) == ast.N_ARROW: cb = init
+        else:
+          missing1(&l, hook, name_of(l, x), l.t.nd[x].pos, l.t.nd[x].end, deps0)
+          return
+      elif dk == ast.N_FUNC: cb = decl
+      elif dk == ast.N_PARAM:
+        missing1(&l, hook, name_of(l, x), l.t.nd[x].pos, l.t.nd[x].end, deps0)
+        return
+      else: return
+    else:
+      diag(&l, l.t.nd[ce].pos, l.t.nd[ce].end, "React Hook {hook} received a function whose dependencies are unknown.", "Pass an inline function instead.")
+  if cb <= 0: return
+  if is_async(l, cb) and is_effect:
+    diag(&l, l.t.nd[cb].pos, l.t.nd[cb].end, "Effect callbacks are synchronous to prevent race conditions.", "Consider putting the asynchronous code inside a function and calling it from the effect.")
+  var deps = -1
+  if deps0 > 0:
+    if k(l, deps0) == ast.N_SPREAD:
+      not_array(&l, hook, deps0)
+    else:
+      let di = inner(l, deps0)
+      if k(l, di) == ast.N_ARRAY: deps = di
+      elif k(l, di) == ast.N_ID and name_of(l, di) == "undefined" and scope.res_of(l.sc, di) == -1: deps = -1
+      else: not_array(&l, hook, deps0)
+  var v = new_v()
+  v_node(&l, &c, &v, fn_params(l, cb))
+  v_node(&l, &c, &v, fn_body(l, cb))
+  if is_effect:
+    for m in v.cleanups:
+      let o = inner(l, l.t.nd[m].a)
+      if k(l, o) == ast.N_ID:
+        let y = scope.sym_of(l.sc, o)
+        var skipit = false
+        if y >= 0:
+          for r in sym_refs(&l, &c, y):
+            let p = parent(&l, r)
+            if p <= 0 or k(l, p) != ast.N_PROPACCESS or (l.t.nd[p].f & 4) != 0 or name_of(l, p) != "current" or l.t.nd[p].a != r: continue
+            let g = parent(&l, p)
+            if g > 0 and k(l, g) == ast.N_BINARY and rules.is_assign_op(l.t.nd[g].f): skipit = true
+          let decl = decl_of(&l, &c, y)
+          if decl > 0 and owner(&l, decl) != comp: skipit = true
+        if skipit: continue
+      diag(&l, l.t.nd[m].pos, l.t.nd[m].end, "The ref's value `.current` is accessed directly in the effect cleanup function.", "The ref value will likely have changed by the time this effect cleanup function runs. If this ref points to a node rendered by react, copy it to a variable inside the effect and use that variable in the cleanup function.")
+  if deps < 0:
+    if is_effect and v.set_state:
+      diag(&l, l.t.nd[ce].pos, l.t.nd[ce].end, "React Hook {hook} contains a call to setState. Without a list of dependencies, this can lead to an infinite chain of updates.", "Consider adding an empty list of dependencies to make it clear which values are intended to be stable.")
+    return
+  # the declared dependencies
+  var dset = new_set()
+  for el in ast.items(l.t, l.t.nd[deps].a):
+    let ek = k(l, el)
+    if ek == ast.N_OMIT: continue
+    if ek == ast.N_SPREAD:
+      diag(&l, l.t.nd[el].pos, l.t.nd[el].end, "React Hook {hook} has a complex expression in the dependency array.", "Extract the expression to a separate variable so it can be statically checked.")
+      continue
+    let ei = inner(l, el)
+    var d = Dep("", -1, [], 0, 0, 0, 0)
+    let r = chain_of(&l, &c, ei, &d)
+    if r == 0: continue
+    if r < 0:
+      let eik = k(l, ei)
+      if lit_kind(eik) or eik == ast.N_REGEX:
+        diag(&l, l.t.nd[ei].pos, l.t.nd[ei].end, "The literal is not a valid dependency because it never changes.", "Remove the literal from the array.")
+      else:
+        diag(&l, l.t.nd[ei].pos, l.t.nd[ei].end, "React Hook {hook} has a complex expression in the dependency array.", "Extract the expression to a separate variable so it can be statically checked.")
+      continue
+    let ds = d.s
+    let de = d.e
+    if not set_insert(&dset, d):
+      diag(&l, ds, de, "This dependency is specified more than once in the dependency array.", "Remove the duplicate dependency from the array.")
+  let dord = set_order(dset)
+  for i in dord:
+    let d = dset.ds[i]
+    if d.sym >= 0:
+      let ss = sym_scope(&l, &c, d.sym)
+      var refcur = false
+      if d.chain.len == 1 and d.chain[0] == "current" and not is_dep0(&l, &c, d, comp): refcur = true
+      if not (outer_of(&l, comp, ss) or refcur): continue
+    diag(&l, d.s, d.e, "React Hook {hook} has an unnecessary dependency: {d.name}.", "Consider removing it from the dependency array. Outer scope values aren't valid dependencies because mutating them doesn't re-render the component.")
+    let ft = without(&l, deps, d.s, d.e)
+    if ft != "":
+      let j = l.ds.len - 1
+      l.ds[j].fs = l.t.nd[deps].pos
+      l.ds[j].fe = l.t.nd[deps].end
+      l.ds[j].ft = ft
+  # missing ones
+  var und: [Int] = []
+  let ford = set_order(v.found)
+  for i in ford:
+    let d = v.found.ds[i]
+    if set_has(dset, d): continue
+    if d.chain.len > 0 and d.chain[d.chain.len - 1] == "current":
+      var bc: [Str] = []
+      for z in 0..d.chain.len - 1: bc.push(d.chain[z])
+      let base = mk(&l, &c, d.name, d.sym, bc, d.s, d.e, d.ref)
+      if set_has(v.found, base): continue
+    var covered = false
+    for j in dord:
+      if contains(d, dset.ds[j]): covered = true
+    if covered: continue
+    if not is_dep0(&l, &c, d, comp): continue
+    und.push(i)
+  if und.len > 0:
+    var names: [Str] = []
+    for i in und: names.push(dep_str(v.found.ds[i]))
+    var mref = ""
+    for j in dord:
+      let dd = dset.ds[j]
+      if dd.chain.len == 0 or dd.chain[dd.chain.len - 1] != "current": continue
+      var bc: [Str] = []
+      for z in 0..dd.chain.len - 1: bc.push(dd.chain[z])
+      var hit = false
+      for i in und:
+        let u = v.found.ds[i]
+        if u.name == dd.name and same_chain(u.chain, bc): hit = true
+      if hit:
+        mref = dep_str(dd)
+        break
+    var msg = "React Hook {hook} has a missing dependency: {quote_list(names)}"
+    if und.len > 1: msg = "React Hook {hook} has missing dependencies: {quote_list(names)}"
+    if mref != "": msg = msg + ". Mutable values like '{mref}' aren't valid dependencies because mutating them doesn't re-render the component."
+    let u0 = v.found.ds[und[0]]
+    add(&l, u0.s, RULE, msg, "Either include it or remove the dependency array.")
+    if und.len == 1: label(&l, u0.e, "{hook} uses `{names[0]}` here")
+    else:
+      span(&l, u0.e)
+      for z in 1..und.len:
+        let u = v.found.ds[und[z]]
+        more(&l, u.s, u.e, "", false)
+    more(&l, l.t.nd[deps].pos, l.t.nd[deps].end, "", false)
+    primary_more(&l)
+    let ft = fixgen.array_with(l.t, l.src, deps, names)
+    if ft != "": rules.fix_of(&l, l.t.nd[deps].pos, l.t.nd[deps].end, ft, 6)
+  for i in dord:
+    let d = dset.ds[i]
+    if d.sym < 0: continue
+    let decl = decl_of(&l, &c, d.sym)
+    if decl > 0 and k(l, decl) == ast.N_DECL:
+      let init = l.t.nd[decl].c
+      if k(l, init) == ast.N_CALL and call_name(l, init) == "useEffectEvent":
+        diag(&l, d.s, d.e, "Functions returned from `useEffectEvent` must not be included in the dependency array.", "Remove the dependency from the dependency array.")
+  if not is_effect:
+    for x in 0..dord.len:
+      for z in x + 1..dord.len:
+        let a = dset.ds[dord[x]]
+        let b = dset.ds[dord[z]]
+        if contains(a, b): unneeded(&l, hook, dep_str(a), deps)
+        elif contains(b, a): unneeded(&l, hook, dep_str(b), deps)
+    for i in dord:
+      let d = dset.ds[i]
+      if set_has(v.found, d): continue
+      var skipit = false
+      for j in ford:
+        if contains(v.found.ds[j], d): skipit = true
+      for j in und:
+        if contains(d, v.found.ds[j]): skipit = true
+      for j in dord:
+        if j != i and not dep_eq(dset.ds[j], d) and contains(d, dset.ds[j]): skipit = true
+      if skipit: continue
+      unneeded(&l, hook, dep_str(d), deps)
+  for i in dord:
+    let d = dset.ds[i]
+    if d.sym < 0 or d.chain.len > 0: continue
+    if unique_decl(&l, &c, d.sym):
+      let decl = decl_of(&l, &c, d.sym)
+      let np = l.sc.ypos[d.sym]
+      diag(&l, d.s, d.e, "React hook {hook} depends on `{d.name}`, which changes every render", "Try memoizing this variable with `useRef` or `useCallback`.")
+      let j = l.ds.len - 1
+      l.ds[j].lab = "it will always cause this hook to re-evaluate"
+      l.ds[j].haslab = true
+      l.ds[j].p0 = true
+      more(&l, np, np + d.name.len, "`{d.name}` is declared here", true)
+      let ft = without(&l, deps, d.s, d.e)
+      if ft != "": rules.fix_of(&l, l.t.nd[deps].pos, l.t.nd[deps].end, ft, 6)
+
+fn unneeded(var l: L, hook: Str, nm: Str, deps: Int):
+  diag(&l, l.t.nd[deps].pos, l.t.nd[deps].end, "React Hook {hook} has unnecessary dependency: {nm}", "Either include it or remove the dependency array.")
+
+fn not_array(var l: L, hook: Str, n: Int):
+  diag(&l, l.t.nd[n].pos, l.t.nd[n].end, "React Hook {hook} was passed a dependency list that is not an array literal. This means we can't statically verify whether you've passed the correct dependencies.", "Use an array literal as the second argument.")
+
+fn missing1(var l: L, hook: Str, nm: Str, s: Int, e: Int, deps: Int):
+  add(&l, s, RULE, "React Hook {hook} has a missing dependency: '{nm}'", "Either include it or remove the dependency array.")
+  label(&l, e, "{hook} uses `{nm}` here")
+  more(&l, l.t.nd[deps].pos, l.t.nd[deps].end, "", false)
+  primary_more(&l)
+
+fn unique_expr(l: L, n: Int) -> Bool:
+  let x = inner(l, n)
+  let kd = k(l, x)
+  if kd == ast.N_ARRAY or kd == ast.N_OBJECT or kd == ast.N_ARROW or kd == ast.N_FUNCEXPR or kd == ast.N_CLASSEXPR or kd == ast.N_NEW or kd == ast.N_REGEX or kd == ast.N_JSXELEM: return true
+  if kd == ast.N_COND: return unique_expr(l, l.t.nd[x].b) or unique_expr(l, l.t.nd[x].c)
+  if kd == ast.N_BINARY:
+    let op = l.t.nd[x].f
+    if op == scan.T_AND or op == scan.T_OR or op == scan.T_QQ: return unique_expr(l, l.t.nd[x].a) or unique_expr(l, l.t.nd[x].b)
+    if rules.is_assign_op(op): return unique_expr(l, l.t.nd[x].b)
+  return false
+
+fn unique_decl(var l: L, var c: Cx, y: Int) -> Bool:
+  let decl = decl_of(&l, &c, y)
+  if decl <= 0: return false
+  let kd = k(l, decl)
+  if kd == ast.N_CLASS or kd == ast.N_FUNC: return true
+  if kd == ast.N_DECL:
+    if k(l, l.t.nd[decl].a) != ast.N_ID: return false
+    let init = l.t.nd[decl].c
+    if init <= 0: return false
+    return unique_expr(l, init)
+  return false
+
+# The dependency array printed without the element at s..e (oxc's codegen), "" if it can't be
+fn without(var l: L, deps: Int, s: Int, e: Int) -> Str:
+  return fixgen.array_without(l.t, l.src, deps, s, e)
