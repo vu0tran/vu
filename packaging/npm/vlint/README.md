@@ -43,9 +43,12 @@ no JavaScript API (oxlint's `defineConfig` and JS plugins aren't there).
   `--no-ignore`.
 - **Options**: `-A/-W/-D`, the plugin flags, `--deny-warnings`, `--max-warnings`, `--quiet`,
   `--silent`, `-f` with every format (`default`, `agent`, `json`, `unix`, `github`, `gitlab`,
-  `junit`, `checkstyle`, `stylish`, `sarif`), `--fix`, `--threads`, `--rules`, `--init`,
-  `--report-unused-disable-directives`, `--no-error-on-unmatched-pattern`, `--debug files`,
-  exit codes and messages for bad usage.
+  `junit`, `checkstyle`, `stylish`, `sarif`), `--fix`, `--fix-suggestions` and
+  `--fix-dangerously` (for the fixes vlint has), `--threads`, `--rules`, `--init`,
+  `--print-config`, `--report-unused-disable-directives`, `--no-error-on-unmatched-pattern`,
+  `--debug files`, exit codes and messages for bad usage.
+- **Bulk suppressions**: `oxlint-suppressions.json`, `--suppress-all`, `--prune-suppressions`
+  (and pruning on `--fix`), as oxlint does them.
 - **Type-aware linting**: `--type-aware` / `--type-check` run `oxlint-tsgolint` (install it as you
   would for oxlint), with all 61 type-aware rules.
 - **Output**: oxlint's report for terminals, its one-line agent format and every `-f` format,
@@ -54,24 +57,28 @@ no JavaScript API (oxlint's `defineConfig` and JS plugins aren't there).
   remeda, immer, jotai, ky, mitt, p-queue, redux, reselect, preact, excalidraw and vscode, and on
   real projects with their own configs, for every rule vlint has.
 - `eslint-disable` / `oxlint-disable` comments, as oxc reads them.
-- Speed: about half oxlint's CPU time on a single thread (measured on a loaded 2-core VM).
+- Speed: less CPU time than oxlint on a single thread (2.28 s against 3.40 s on a 3,445-file TypeScript corpus, best of 5, measured on a loaded 2-core VM).
 
 ## What's not there yet
 
 Check that your project doesn't depend on these before switching:
 
-- **Rules**: vlint has oxlint's defaults plus about 50 more (`prefer-const`,
-  `no-restricted-imports`, `react-hooks/rules-of-hooks`, `no-console`, `eqeqeq`, `curly`,
-  `typescript/no-explicit-any`, `typescript/ban-ts-comment`, ...; the list is in the source's
-  README). A rule it doesn't have is accepted in the configuration and reports nothing. Missing,
-  notably: `react-hooks/exhaustive-deps`; the React Compiler rules oxlint turns on with the react
-  plugin (`react/refs`, `react/purity`, `react/set-state-in-effect`, ...); jsx-a11y, import,
-  jest, vitest, nextjs; most pedantic and style rules.
+- **Rules**: vlint has all of oxlint's defaults plus about 100 more (`prefer-const`,
+  `no-restricted-imports`, `react-hooks/rules-of-hooks`, `react-hooks/exhaustive-deps`,
+  `react/only-export-components`, `no-console`, `eqeqeq`, `curly`, `no-redeclare`,
+  `no-underscore-dangle`, `import/first`, `typescript/no-explicit-any`,
+  `typescript/ban-ts-comment`, 16 jsx-a11y rules, ...; the list is in the source's README). A
+  rule it doesn't have is accepted in the configuration and reports nothing. Missing, notably: the
+  React Compiler rules oxlint turns on with the react plugin (`react/refs`, `react/purity`,
+  `react/set-state-in-effect`, ...); most of jsx-a11y, import, jest, vitest, nextjs; many pedantic
+  and style rules. Counted on 1,830 real `.oxlintrc.json` files, vlint has 64% of the rules they
+  turn on by name and 79% counting what their categories turn on.
 - **JS plugins** (`jsPlugins`): refused (vlint runs no JavaScript). `oxlint.config.ts` too.
-- **Options**: `--print-config`, `--fix-suggestions`, `--fix-dangerously`, `--lsp`, and the
-  suppression file (`oxlint-suppressions.json`) are not supported yet.
-- Parse errors: a few files that oxc rejects are accepted by vlint, and the parse error messages
-  don't always use oxc's wording.
+- **Options**: `--lsp` isn't supported. `--fix-suggestions`/`--fix-dangerously` don't apply the
+  suggestions of `no-unused-vars`, `no-new-array` and `no-extra-boolean-cast` yet.
+- Parse errors: some files that oxc rejects are accepted by vlint (several of oxc's early
+  errors aren't made), vlint reports only the first syntax error, and its messages don't always
+  use oxc's wording (109 of oxc's 369 parser fixtures give identical output).
 - Platforms: Linux x64 and ARM64 (static binaries: any glibc or musl), macOS 12 or later on Apple
   silicon and Intel. No Windows build (Vu doesn't target Windows yet). On macOS, `--cache` caches
   nothing (it keys the cache by `/proc/self/exe`, which macOS doesn't have).

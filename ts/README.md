@@ -118,10 +118,11 @@ cd ts && VU_SPLIT=off ../vu build --release vlint.vu -o vlint   # one C file: th
 | `--report-unused-disable-directives[-severity]` | yes |
 | `--rules` | yes (the table, `-f json`) |
 | `--init` | yes |
-| `--print-config` | not yet (refused with an error) |
-| `--fix-suggestions`, `--fix-dangerously` | not yet (refused, exit 2) |
+| `--print-config` | yes (`lprint.vu`; byte-identical on 14 of the 15 real projects and 8 hand-written configs, the 15th uses a JS plugin) |
+| `--fix-suggestions`, `--fix-dangerously` | yes for the rules that have them in vlint (see below); not yet: `no-unused-vars`', `no-new-array`'s and `no-extra-boolean-cast`'s suggestions |
 | `--lsp` | no (refused) |
-| `--type-check-only`, `--suppress-all`, `--prune-suppressions` (hidden) | not yet; `oxlint-suppressions.json` isn't read |
+| `--suppress-all`, `--prune-suppressions` (hidden), `oxlint-suppressions.json` | yes (`lsupp.vu`) |
+| `--type-check-only` (hidden) | yes (tsgolint's type check only, oxlint's messages for invalid combinations) |
 
 **Configuration**: `.oxlintrc.json`/`.jsonc` discovery and `-c`, nested configs, `extends`
 (with oxlint's error messages for missing files, named configs and cycles), `overrides`, rules
@@ -136,57 +137,157 @@ to the repository root, and `.git/info/exclude`), `.eslintignore`/`--ignore-path
 **Output**: oxlint's graphical report (themes, links, summary lines), the agent format, and all
 `-f` formats, byte-identical in the cases checked.
 
-**Rules**: oxlint's default rules, plus (chosen by how often 629 `.oxlintrc.json` files from
-GitHub enable them, and by the categories configs turn on): `prefer-const`,
+**Rules**: oxlint's default rules (all of them since this round: `oxc/uninvoked-array-callback`
+was the one missing), plus, chosen by how often real configurations enable them: `prefer-const`,
 `no-restricted-imports`, `no-console`, `no-var`, `eqeqeq`, `prefer-rest-params`, `no-empty`,
 `no-array-constructor`, `no-case-declarations`, `no-prototype-builtins`, `prefer-spread`, `curly`,
-`no-new`, `no-unneeded-ternary`, `no-useless-concat`; `typescript/` `no-explicit-any`,
-`no-require-imports`, `no-unnecessary-type-constraint`, `no-namespace`, `no-unsafe-function-type`,
-`no-non-null-assertion`, `ban-ts-comment`, `no-empty-object-type`; `unicorn/`
-`prefer-node-protocol`, `require-module-specifiers`, `no-array-sort`, `no-array-reverse`;
-`oxc/misrefactored-assign-op`; `react/` `jsx-key`, `no-this-in-sfc`, `no-children-prop`,
-`no-find-dom-node`, `jsx-no-duplicate-props`, `jsx-no-undef`, `jsx-props-no-spread-multi`,
-`no-danger-with-children`, `no-did-mount-set-state`, `no-did-update-set-state`,
-`no-will-update-set-state`, `no-direct-mutation-state`, `no-is-mounted`,
+`no-new`, `no-unneeded-ternary`, `no-useless-concat`, `no-redeclare`, `no-self-compare`,
+`no-nested-ternary`, `no-negated-condition`, `require-unicode-regexp`, `no-underscore-dangle`,
+`no-extra-bind`; `typescript/` `no-explicit-any`, `no-require-imports`,
+`no-unnecessary-type-constraint`, `no-namespace`, `no-unsafe-function-type`,
+`no-non-null-assertion`, `ban-ts-comment`, `no-empty-object-type`, `no-confusing-non-null-assertion`,
+`no-extraneous-class`; `unicorn/` `prefer-node-protocol`, `require-module-specifiers`,
+`no-array-sort`, `no-array-reverse`, `no-negated-condition`, `catch-error-name`;
+`oxc/misrefactored-assign-op`; `import/first`; `react/` `jsx-key`, `no-this-in-sfc`,
+`no-children-prop`, `no-find-dom-node`, `jsx-no-duplicate-props`, `jsx-no-undef`,
+`jsx-props-no-spread-multi`, `no-danger-with-children`, `no-did-mount-set-state`,
+`no-did-update-set-state`, `no-will-update-set-state`, `no-direct-mutation-state`, `no-is-mounted`,
 `no-render-return-value`, `no-string-refs`, `no-unsafe`, `void-dom-elements-no-children`,
-`forward-ref-uses-ref`, `react-hooks/rules-of-hooks` (each with its options, oxc's messages,
-spans, labels and fixes). All 61 type-aware rules through tsgolint. A rule vlint doesn't have
-is accepted in the configuration and reports nothing.
+`forward-ref-uses-ref`, `jsx-no-comment-textnodes`, `no-unescaped-entities`,
+`react-hooks/rules-of-hooks`, `react-hooks/exhaustive-deps`, `react/only-export-components`;
+and in the restart round: `no-useless-constructor`, `no-unexpected-multiline`, `no-extend-native`;
+`unicorn/` `no-instanceof-builtins`, `prefer-math-trunc`, `prefer-code-point`,
+`no-object-as-default-parameter`, `prefer-number-coercion`, `escape-case`, `no-hex-escape`,
+`no-array-fill-with-reference-type`, `no-accessor-recursion`,
+`require-post-message-target-origin`; `oxc/` `approx-constant`, `no-this-in-exported-function`;
+`jest/` and `vitest/no-conditional-in-test`; `jsx-a11y/` `aria-props`,
+`aria-unsupported-elements`, `aria-role`, `alt-text`, `html-has-lang`, `iframe-has-title`,
+`no-access-key`, `tabindex-no-positive`, `no-distracting-elements`, `scope`, `no-autofocus`,
+`role-has-required-aria-props`, `role-supports-aria-props`, `heading-has-content`,
+`anchor-has-content`, `mouse-events-have-key-events` (with the plugin's `polymorphicPropName` and
+`components` settings, and oxc's role and ARIA tables). Each comes with its options, oxc's messages,
+spans, labels, fixes (and their kinds) and order. All 61 type-aware rules through tsgolint. A rule
+vlint doesn't have is accepted in the configuration and reports nothing. The rules added in these
+rounds are in `rhooks.vu` (exhaustive-deps), `rmore.vu`, `rmore2.vu` and `ra11y.vu`; each runs only
+when the configuration turns it on.
+
+**Rule order when an override applies** (`lfx.vu`, `lconf.rule_rank`): oxlint then runs a file's
+rules in the iteration order of an `FxHashMap` keyed by rule id (`Config::apply_overrides`: the
+base rules inserted in id order, the categories of plugins an override adds, each override's rules
+removed and inserted again), so diagnostics that two rules report on one node come out in that
+order, not by rule id. `lfx.vu` emulates the map (inserts, `entry().or_insert`, removes with
+tombstones, growth, rehashing in place; identical to Rust's on 15,000 random operation sequences),
+and the same table with oxc's `IdentHasher` gives the order of the root scope's unresolved
+references, which `no-extend-native` reports in (identical to Rust's on 400 random name sets).
+Checking this order on three override configurations found four rules reporting from a different
+node than oxc's (`no-func-assign`, `no-useless-spread`, `no-extra-boolean-cast`, and nodes with the
+same span sorted inner first); all fixed.
+
+**Coverage of real configurations** (the 1,830 `.oxlintrc.json` files collected from GitHub in an
+earlier round, `vlint4-work/cov.py` and `cov2.py`): of the rules those files turn on by name
+(12,227 enables, type-aware ones counted as covered), vlint now has 64.3% (58.4% at the start of
+the previous round); counting the rules their categories and plugins turn on as well (233,108
+enables, type-aware excluded), 79.3% (74.8%). The largest missing share is the React Compiler
+rules (about 1,030 enables each, 12,300 together), then `import/namespace` and `import/default`
+(which need the module graph), the rest of jsx-a11y (20 rules, about 2,800), the jest/vitest rules
+that run on test calls (`expect-expect`, `valid-expect`, ...; about 2,400), and eslint's
+`preserve-caught-error`, `block-scoped-var`, `no-implied-eval`, `no-unmodified-loop-condition`
+and `no-shadow` (about 320 each).
+
+`react-hooks/exhaustive-deps` follows oxc's port closely, including the order of the names in
+"missing dependencies: 'a', 'b', and 'c'" and of the diagnostics of one call: oxc keeps
+dependencies in an `FxHashSet`, so vlint emulates rustc-hash 2's FxHasher and std's hashbrown table
+(insertion, growth, probing; checked against a Rust program on 400 random sets) and hashes with
+oxc's symbol ids (oxc numbers symbols as it declares them: a declarator's or parameter's names when
+it starts; parameters of type signatures are symbols in oxc and are counted in). The dependency
+visitor follows oxc's `VisitJs` (no types). The same emulation orders `--print-config`'s
+categories, env, globals and settings maps.
 
 **Not at 100%**:
 - The React Compiler rules that oxlint 1.90.0 turns on with the react plugin's `correctness`
   category (`react/globals`, `immutability`, `refs`, `purity`, `set-state-in-effect`,
-  `static-components`, `preserve-manual-memoization`, ...: a port of the React Compiler, 62k lines
-  of Rust in oxc) and `react-hooks/exhaustive-deps`: missing.
-- The other ~650 non-default rules (jsx-a11y, import, jest/vitest, most of unicorn's, eslint's
-  pedantic and style rules...): missing. On kimi-code (which turns on pedantic, perf, vitest,
-  import) vlint finds 435 of oxlint's 10,599 diagnostics.
-- `--print-config`, `--fix-suggestions`, `--fix-dangerously`, suppression files, JS plugins.
-- Parse errors: some of oxc's messages differ, and vlint accepts some files oxc rejects.
+  `set-state-in-render`, `static-components`, `preserve-manual-memoization`, `use-memo`,
+  `void-use-memo`, `incompatible-library`, `error-boundaries`, plus `exhaustive-effect-dependencies`
+  and `no-deriving-state-in-effects`): missing. They come from `oxc_react_compiler`, 61,109 lines
+  of Rust: lowering to HIR (build_hir alone is 6,837 lines), SSA, type inference,
+  mutation/aliasing inference, reactive scopes and 14 validation passes; the validations read the
+  inferred types and effects (`set-state-in-effect` follows setState functions through local
+  functions and skips ref-controlled branches with post-dominator frontiers), and a function the
+  compiler bails out on (unsupported syntax, an `eslint-disable` of the hooks rules, `"use no
+  memo"`) reports nothing. A port is roughly 35,000 to 45,000 lines of Vu. A syntactic
+  approximation was considered and not shipped: it would trade missing diagnostics for wrong ones.
+- The other ~620 non-default rules: missing (jsx-a11y, the rest of import, jest/vitest, most of
+  unicorn's and eslint's pedantic and style rules). On kimi-code (which turns on pedantic, perf,
+  vitest, import) vlint now finds 9,021 of oxlint's 10,599 diagnostics (435 two rounds ago), with
+  none extra and the order identical; the rest are mostly `import/extensions` (568), the vitest
+  rules that run on test calls (`no-conditional-expect` 190, `require-to-throw-message` 185,
+  `expect-expect` 153) and `unicorn/prefer-single-call` (169).
+- Fixes not yet ported: the suggestions of `no-unused-vars`, `no-new-array` and
+  `no-extra-boolean-cast` (so `--fix-suggestions`/`--fix-dangerously` leave those), and the fix of
+  `no-negated-condition` (`--fix` leaves it).
+- `--print-config` with a config that uses `jsPlugins`; JS plugins themselves (see below).
+- JS plugins (`jsPlugins`): a missing package gets oxlint's "Failed to load JS plugin" error, an
+  installed one is refused. Running them needs an ESTree view of vlint's tree (every node type with
+  ranges and `loc`, tokens and comments), oxlint's plugin context (`report` with messages, message
+  ids, data, fixes and suggestions; `sourceCode` with its scope manager), selectors and `:exit`
+  visitors, run in a Node process as vknip runs JavaScript configs: not done.
+- Parse errors: on oxc's own fixtures (`tasks/coverage/misc`, 257 failing and 112 passing files)
+  vlint's output is identical for 109 of 369 (102 before this round). vlint reports only the first
+  syntax error, in TypeScript's wording under the code `vlint(parse)` where it doesn't know oxc's
+  ("Expected `)` but found `;`" with its "Opened here" label is the commonest), and it doesn't make
+  many of oxc's early errors (escaped keywords, mixed `??` and `||`, `await`/`yield` contexts,
+  modifiers in the wrong place, jumps across functions, and others: 142 of those fixtures get no
+  error from vlint). Added this round: redeclaration errors now carry oxc's two labels (vlint gave
+  one, empty: `-f json` differed), private names not declared in an enclosing class (with oxc's
+  "Did you mean" suggestion) or used outside a class, duplicated exports and multiple default
+  exports in JavaScript files, and tagged templates in optional chains; a crash on `<!--` in a
+  module (`index -1 out of bounds` in `parse.vu`) is fixed (oxc's "HTML comments are not allowed in
+  modules" is still not reported). Fixed in the previous round: vlint rejected valid TypeScript with
+  a conditional type inside a mapped type inside a conditional type's `extends` clause.
+- `-f sarif` puts the suppression file's errors into oxlint's `notifications`; vlint doesn't.
+  `-f checkstyle` groups files in oxlint's hash order (unchanged).
 
 **Parity** (`ljson_diff.py`: every diagnostic's rule, message, help, severity, labels and order):
 
 | corpus | config | files with diagnostics identical |
 |---|---|---|
 | lc: date-fns, zod, remeda, ... + node_modules JS | defaults | 308 / 308 |
-| lc | all added rules on | 1570 / 1570 vlint files (oxlint's 3 more: React Compiler) |
+| lc | the previous round's added rules on | 1570 / 1570 vlint files (oxlint's 3 more: React Compiler) |
 | preact, excalidraw | defaults | 230 / 230 |
-| preact, excalidraw | all added rules + react plugin | 488 / 574 (the rest: React Compiler, exhaustive-deps) |
+| preact, excalidraw | the previous round's added rules + react plugin | 488 / 574 (the rest: React Compiler, exhaustive-deps, now added) |
 | vscode | defaults | 2764 / 2783 (the rest: files oxc can't parse) |
 | config cases (`cfgtest`, 54 cases, as an agent and as a person) | | 108 / 108 |
+| mantine (+ preact, Tracearr, next-shadcn-dashboard-starter, difit) | `react-hooks/exhaustive-deps` | 237 + 41 + 5 + 2 diagnostics, all identical |
+| 900 generated components (`gen_hooks.py`, 3 seeds) | exhaustive-deps with `additionalHooks` | 4,101 / 4,101 diagnostics; `--fix` and `--fix-dangerously` files identical |
+| lc and kimi-code | the 7 rules of `rmore.vu`'s first batch | 48,000 diagnostics identical |
+| lc and kimi-code | `no-redeclare` | 756 + 708 identical |
+| lc, kimi-code, preact, excalidraw, mantine, vscode | the second batch, `import/first` (both options) | all identical (1,338 `import/first` on kimi-code) |
+| lc, kimi-code, vscode, mantine, excalidraw | `no-useless-constructor`, `no-instanceof-builtins`, `no-conditional-in-test` | all identical (78 + 9 + 7 useless constructors; 3,230 conditionals in kimi-code's tests) |
+| lc, kimi-code, excalidraw, mantine, preact | `rmore2.vu`'s unicorn and oxc rules, `no-unexpected-multiline`, `no-extend-native` | all identical (about 9,000 diagnostics), and an attack file for each identical with `--fix`, `--fix-suggestions`, `--fix-dangerously` |
+| excalidraw, mantine, kimi-code, preact | `react/only-export-components`, defaults and every option | 3,059 and 958 diagnostics, all identical; 7 attack files identical |
+| excalidraw, mantine, preact, Tracearr, kimi-code, next-shadcn-dashboard-starter | the 16 jsx-a11y rules | 145 diagnostics, all identical; attack files with and without options and settings identical, fixes included |
+| lc, kimi-code | three configurations whose overrides add plugins and rules | every file's order identical for every rule whose diagnostics match |
+| kimi-code | its own configuration | 9,021 of oxlint's 10,599 diagnostics, none extra, order identical |
+| `--print-config` | 15 real projects, 8 configs | 22 / 23 identical (the 23rd uses a JS plugin) |
+| suppressions | a 21-step scenario, all output formats | identical except `-f sarif` |
 | zod, `--type-aware`, 5 typed rules | | 1282 / 1285 diagnostics (tsgolint prints 3 types differently run to run) |
 
 Real projects with their own `.oxlintrc.json` (15 cloned from GitHub; JS plugins removed from
 their configs where the plugin isn't installed): identical on agents, leaflet-geoman, logtape,
 mcp, OpenFrontIO (type-aware), react-element-to-jsx-string, react-starter-kit,
 typescript-nextjs-starter, yak; FigmaToCode, Tracearr, difit and next-shadcn-dashboard-starter
-differ only by React Compiler, exhaustive-deps and jsx-a11y diagnostics; kimi-code by rules vlint
-doesn't have.
+differ only by React Compiler diagnostics, jsx-a11y (Tracearr) and `react/no-unstable-nested-components`
+(next-shadcn-dashboard-starter); their `react-hooks/exhaustive-deps` diagnostics are now identical;
+kimi-code by rules vlint doesn't have (5,667 of 10,599 found, none extra).
 
-**Speed** (lc corpus, 1 thread, user+sys CPU, best of 5, loaded 2-core VM): vlint 2.28 s, the
-vlint before this work 2.29-2.33 s, oxlint 4.54 s. Instructions (callgrind, x86-64-v2 builds):
-zod 540M against 508M before (+6%: the oxlint output and configuration work and the rule table
-loaded at start), vscode/src/vs/editor/common 332M against 305M.
+**Speed** (lc corpus, 1 thread, user+sys CPU, best of 5, loaded 2-core VM, load average 2 to 3):
+vlint 2.28 s, oxlint 3.40 s (the previous round measured 2.28 s against 4.54 s). Instructions
+(callgrind, x86-64-v2 builds, one thread, against a build of the round's starting commit made the
+same way): zod 550.9M against 545.4M (+1.0%: the semantic checks for private names, exports and
+tagged templates, which first cost +4.7% while they walked every node and copied the text, and
+now use lists the walk fills; the per-file tables of the new rules; the `new Array(n).map` check
+on calls), vscode/src/vs/editor/common 338.0M against 335.1M (+0.9%). With only exhaustive-deps on, mantine
+takes 0.31 s of CPU (0.27 s with no rules) against oxlint's 0.25 s (0.23 s).
 
 ## Install
 
