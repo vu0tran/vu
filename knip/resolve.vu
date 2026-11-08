@@ -71,6 +71,10 @@ type Resolver:
   cache: {Str: Res}
   pkgs: {Str: Value}           # package.json by folder (node_modules lookups)
   rootdirs: [RootDirs]         # tsconfig rootDirs per workspace (SvelteKit's ./$types)
+  in_pkg: {Str: Res}           # (package folder, specifier) -> resolve_in_pkg's result
+  memo: {Str: Str}             # (find_package, to_source and ws_for answers, by their arguments)
+  lister: fn(Str) -> [Str] throws  # fs.list (vknip's: each folder read once per run)
+  kind: fn(Str) -> Int         # 0 nothing there, 1 a file, 2 a folder
 
 fn exts() -> [Str]:
   return [".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".d.ts", ".d.mts", ".d.cts", ".json", ".jsonc"]
@@ -87,7 +91,7 @@ type RootDirs:
   dirs: [Str]
 
 fn new_resolver(root: Str) -> Resolver:
-  return Resolver(root + "", {}, [], "", false, [], {}, {}, {}, -2, false, [], {}, [], [], {}, {}, [])
+  return Resolver(root + "", {}, [], "", false, [], {}, {}, {}, -2, false, [], {}, [], [], {}, {}, [], {}, {}, own fn(d: Str) => [], own fn(x: Str) => 0)
 
 const BUILTINS = "_http_agent _http_client _http_common _http_incoming _http_outgoing _http_server _stream_duplex _stream_passthrough _stream_readable _stream_transform _stream_wrap _stream_writable _tls_common _tls_wrap assert assert/strict async_hooks buffer child_process cluster console constants crypto dgram diagnostics_channel dns dns/promises domain events fs fs/promises http http2 https inspector inspector/promises module net os path path/posix path/win32 perf_hooks process punycode querystring readline readline/promises repl stream stream/consumers stream/promises stream/web string_decoder sys timers timers/promises tls trace_events tty url util util/types v8 vm wasi worker_threads zlib"
 
@@ -109,6 +113,18 @@ fn is_builtin(spec: Str) -> Bool:
 # ---- paths
 
 fn norm(p: Str) -> Str:
+  # (nothing to do when no segment is empty, "." or "..")
+  var plain = p.len > 0
+  var j = 0
+  while plain and j < p.len:
+    let c = p[j]
+    if c == '/': plain = false
+    elif c == '.' and (j + 1 == p.len or p[j + 1] == '/' or (p[j + 1] == '.' and (j + 2 == p.len or p[j + 2] == '/'))): plain = false
+    else:
+      while j < p.len and p[j] != '/': j += 1
+      if j == p.len - 1: plain = false
+      j += 1
+  if plain: return p + ""
   var out: [Str] = []
   var ups = 0
   for part in p.split("/"):
@@ -159,7 +175,7 @@ fn load_listing(var r: Resolver, fs: Fs, dir: Str):
   var d = r.root + dir
   if d == "": d = "."
   if dir == "" and r.root != "": d = r.root[0..r.root.len - 1]
-  let names = fs.list(d) else []
+  let names = r.lister(d) else []
   for n in names: m[n] = true
   r.dirs[dir] = m
 
@@ -176,7 +192,7 @@ fn is_dir(var r: Resolver, fs: Fs, p: Str) -> Bool:
   let d = dirname(p)
   let b = basename(p)
   if has_name(&r, fs, d, b + "/"): return true
-  if has_name(&r, fs, d, b): return fs.exists(r.root + p + "/")
+  if has_name(&r, fs, d, b): return r.kind(r.root + p) == 2
   return false
 
 fn real_file(var r: Resolver, fs: Fs, p: Str) -> Bool:
@@ -389,6 +405,13 @@ fn pkg_name(spec: Str) -> Str:
 
 # The folder of package name as seen from dir (node_modules here or above), or "".
 fn find_package(var r: Resolver, fs: Fs, name: Str, from_dir: Str) -> Str:
+  let key = "p\0{r.ws_pkgs.len}\0" + from_dir + "\0" + name
+  if key in r.memo: return r.memo[key] + ""
+  let res = find_package_u(&r, fs, name, from_dir)
+  r.memo[key] = res + ""
+  return res
+
+fn find_package_u(var r: Resolver, fs: Fs, name: Str, from_dir: Str) -> Str:
   var d = from_dir
   while true:
     let cand = join(d, "node_modules/" + name)
@@ -406,7 +429,7 @@ fn find_package(var r: Resolver, fs: Fs, name: Str, from_dir: Str) -> Str:
   var up = ".."
   for i in 0..6:
     let cand = join(up, "node_modules/" + name)
-    if fs.exists(r.root + cand + "/"): return cand
+    if r.kind(r.root + cand) == 2: return cand
     up = up + "/.."
   return ""
 
@@ -427,7 +450,17 @@ fn resolve_bare(var r: Resolver, fs: Fs, spec: Str, from_dir: Str) -> Res:
     return b
   return resolve_in_pkg(&r, fs, spec, name, pdir)
 
+# (one package's answer for a specifier is the same from every folder that finds that package)
 fn resolve_in_pkg(var r: Resolver, fs: Fs, spec: Str, name: Str, pdir: Str) -> Res:
+  let key = "{r.extra_exts.len}\0" + pdir + "\0" + name + "\0" + spec
+  if key in r.in_pkg:
+    let c = r.in_pkg[key]
+    return Res(c.kind, c.path + "", c.pkg + "")
+  let res = resolve_in_pkg_u(&r, fs, spec, name, pdir)
+  r.in_pkg[key] = Res(res.kind, res.path + "", res.pkg + "")
+  return res
+
+fn resolve_in_pkg_u(var r: Resolver, fs: Fs, spec: Str, name: Str, pdir: Str) -> Res:
   let sub = spec[name.len..spec.len]
   let m = manifest_of(&r, fs, pdir)
   let ex = pkg.get(m, "exports")
@@ -501,6 +534,13 @@ fn is_dts_name(f: Str) -> Bool:
   return f.endswith(".d.ts") or f.endswith(".d.mts") or f.endswith(".d.cts")
 
 # the workspace a folder is in (index in wsi, -1 none)
+fn ws_for_c(var r: Resolver, dir: Str) -> Int:
+  let key = "w\0{r.wsi.len}\0" + dir
+  if key in r.memo: return int(r.memo[key]) else -1
+  let k = ws_for(r, dir)
+  r.memo[key] = "{k}"
+  return k
+
 fn ws_for(r: Resolver, dir: Str) -> Int:
   for k in 0..r.wsi.len:
     let d = r.wsi[k].dir
@@ -511,6 +551,13 @@ fn ws_for(r: Resolver, dir: Str) -> Int:
 # file's workspace maps outDir to a source folder.
 fn to_source(var r: Resolver, fs: Fs, f: Str) -> Str:
   if r.srcmaps.len == 0 or in_node_modules(f) or f.startswith(".."): return f + ""
+  let key = "s\0{r.srcmaps.len}\0{r.extra_exts.len}\0" + f
+  if key in r.memo: return r.memo[key] + ""
+  let res = to_source_u(&r, fs, f)
+  r.memo[key] = res + ""
+  return res
+
+fn to_source_u(var r: Resolver, fs: Fs, f: Str) -> Str:
   if (f.endswith(".ts") or f.endswith(".tsx") or f.endswith(".mts") or f.endswith(".cts")) and not is_dts_name(f): return f + ""
   # (the deepest workspace with maps)
   var best = ""
@@ -790,7 +837,7 @@ fn resolve_uncached(var r: Resolver, fs: Fs, spec: Str, dir: Str) -> Res:
   if ti >= 0:
     let f = try_paths(&r, fs, ti, spec)
     if f != "": return file_res(f)
-  let wk = ws_for(r, dir)
+  let wk = ws_for_c(&r, dir)
   var bad_star = false
   if spec.startswith("#") and wk >= 0 and pkg.is_obj(r.wsi[wk].imports):
     var st0 = ""

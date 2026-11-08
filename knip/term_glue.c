@@ -79,40 +79,163 @@ vu_str vk_watch_read(int64_t fd, int64_t timeout_ms) {
 #endif
 }
 
-/* The names of a folder's entries that are symbolic links, one per line ("" none or unreadable). */
+/* A cache of the file system for one run: each folder is read once (its names as fs.list gives
+   them, sorted by bytes with "/" after folders, and which of them are symbolic links) and each path
+   is stat-ed once. vknip writes files only after the analysis (--fix, --cache), and nothing it
+   reads is looked at again after that. */
 #include <dirent.h>
 #include <sys/stat.h>
 #include <limits.h>
-vu_str vk_links(const vu_str *path) {
-    char buf[4096];
-    if (path->len >= (int64_t)sizeof buf - 1) return vu_str_from("", 0);
+#include <pthread.h>
+typedef struct { char *key; size_t klen; int kind; bool listed, list_ok; char *list; size_t list_len; char *links; size_t links_len; } vk_fent;
+static vk_fent *vkf_tab = NULL;
+static size_t vkf_cap = 0, vkf_n = 0;
+static pthread_mutex_t vkf_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t vkf_hash(const char *p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) { h ^= (uint8_t)p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+static vk_fent *vkf_get(const char *p, size_t n) {
+    if (vkf_n * 2 >= vkf_cap) {
+        size_t nc = vkf_cap ? vkf_cap * 2 : 4096;
+        vk_fent *nt = calloc(nc, sizeof(vk_fent));
+        for (size_t i = 0; i < vkf_cap; i++) {
+            if (!vkf_tab[i].key) continue;
+            size_t h = (size_t)vkf_hash(vkf_tab[i].key, vkf_tab[i].klen) & (nc - 1);
+            while (nt[h].key) h = (h + 1) & (nc - 1);
+            nt[h] = vkf_tab[i];
+        }
+        free(vkf_tab);
+        vkf_tab = nt;
+        vkf_cap = nc;
+    }
+    size_t h = (size_t)vkf_hash(p, n) & (vkf_cap - 1);
+    while (vkf_tab[h].key) {
+        if (vkf_tab[h].klen == n && memcmp(vkf_tab[h].key, p, n) == 0) return &vkf_tab[h];
+        h = (h + 1) & (vkf_cap - 1);
+    }
+    vk_fent *e = &vkf_tab[h];
+    e->key = malloc(n + 1);
+    memcpy(e->key, p, n);
+    e->key[n] = 0;
+    e->klen = n;
+    e->kind = -1;
+    vkf_n++;
+    return e;
+}
+typedef struct { char *s; size_t n; } vkf_name;
+static int vkf_cmp(const void *a, const void *b) {
+    const vkf_name *x = a, *y = b;
+    size_t n = x->n < y->n ? x->n : y->n;
+    int c = n ? memcmp(x->s, y->s, n) : 0;
+    return c ? c : (x->n < y->n ? -1 : x->n > y->n);
+}
+/* (the folder's names, "\0" after each, and its links, "\n" after each) */
+static void vkf_list(vk_fent *e, const char *path) {
+    e->listed = true;
+    DIR *d = opendir(path);
+    if (!d) return;
+    e->list_ok = true;
+    size_t n = 0, cap = 64, lcap = 64, llen = 0;
+    vkf_name *names = malloc(cap * sizeof(vkf_name));
+    char *links = malloc(lcap);
+    struct dirent *ent;
+    size_t plen = strlen(path);
+    while ((ent = readdir(d))) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        size_t nl = strlen(ent->d_name);
+        bool dir = ent->d_type == DT_DIR;
+        bool link = ent->d_type == DT_LNK;
+        if (ent->d_type == DT_UNKNOWN || ent->d_type == DT_LNK) {
+            char *full = malloc(plen + nl + 2);
+            memcpy(full, path, plen);
+            full[plen] = '/';
+            memcpy(full + plen + 1, ent->d_name, nl + 1);
+            struct stat st;
+            dir = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+            if (ent->d_type == DT_UNKNOWN) link = lstat(full, &st) == 0 && S_ISLNK(st.st_mode);
+            free(full);
+        }
+        if (n == cap) { cap *= 2; names = realloc(names, cap * sizeof(vkf_name)); }
+        names[n].s = malloc(nl + 2);
+        memcpy(names[n].s, ent->d_name, nl);
+        if (dir) names[n].s[nl++] = '/';
+        names[n].s[nl] = 0;
+        names[n].n = nl;
+        n++;
+        if (link) {
+            size_t ln = strlen(ent->d_name);
+            while (llen + ln + 1 > lcap) { lcap *= 2; links = realloc(links, lcap); }
+            memcpy(links + llen, ent->d_name, ln);
+            llen += ln;
+            links[llen++] = '\n';
+        }
+    }
+    closedir(d);
+    qsort(names, n, sizeof(vkf_name), vkf_cmp);
+    size_t tot = 0;
+    for (size_t i = 0; i < n; i++) tot += names[i].n + 1;
+    e->list = malloc(tot + 1);
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) { memcpy(e->list + k, names[i].s, names[i].n); k += names[i].n; e->list[k++] = 0; free(names[i].s); }
+    free(names);
+    e->list_len = k;
+    e->links = links;
+    e->links_len = llen;
+}
+static bool vkf_cpath(const vu_str *path, char *buf, size_t size) {
+    if (path->len >= (int64_t)size - 1) return false;
     memcpy(buf, path->data, path->len);
     buf[path->len] = 0;
     if (path->len == 0) { buf[0] = '.'; buf[1] = 0; }
-    DIR *d = opendir(buf);
-    if (!d) return vu_str_from("", 0);
-    size_t cap = 256, len = 0;
-    char *out = malloc(cap);
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        bool link = e->d_type == DT_LNK;
-        if (e->d_type == DT_UNKNOWN) {
-            char full[8192];
-            struct stat st;
-            snprintf(full, sizeof full, "%s/%s", buf, e->d_name);
-            link = lstat(full, &st) == 0 && S_ISLNK(st.st_mode);
-        }
-        if (!link) continue;
-        size_t nl = strlen(e->d_name);
-        if (len + nl + 2 > cap) { while (len + nl + 2 > cap) cap *= 2; out = realloc(out, cap); }
-        memcpy(out + len, e->d_name, nl);
-        len += nl;
-        out[len++] = '\n';
+    return true;
+}
+/* fs.list, cached: "1" then each name and "\0", or "0" when the folder can't be read */
+vu_str vk_list(const vu_str *path) {
+    char buf[4096];
+    if (!vkf_cpath(path, buf, sizeof buf)) return vu_str_from("0", 1);
+    pthread_mutex_lock(&vkf_mu);
+    vk_fent *e = vkf_get(path->data, (size_t)path->len);
+    if (!e->listed) vkf_list(e, buf);
+    vu_str r;
+    if (!e->list_ok) r = vu_str_from("0", 1);
+    else {
+        char *t = malloc(e->list_len + 1);
+        t[0] = '1';
+        memcpy(t + 1, e->list, e->list_len);
+        r = vu_str_from(t, (int64_t)e->list_len + 1);
+        free(t);
     }
-    closedir(d);
-    vu_str r = vu_str_from(out, (int64_t)len);
-    free(out);
+    pthread_mutex_unlock(&vkf_mu);
     return r;
+}
+/* The names of a folder's entries that are symbolic links, one per line ("" none or unreadable). */
+vu_str vk_links(const vu_str *path) {
+    char buf[4096];
+    if (!vkf_cpath(path, buf, sizeof buf)) return vu_str_from("", 0);
+    pthread_mutex_lock(&vkf_mu);
+    vk_fent *e = vkf_get(path->data, (size_t)path->len);
+    if (!e->listed) vkf_list(e, buf);
+    vu_str r = e->list_ok ? vu_str_from(e->links, (int64_t)e->links_len) : vu_str_from("", 0);
+    pthread_mutex_unlock(&vkf_mu);
+    return r;
+}
+/* stat, cached: 0 nothing there, 1 a file (or anything but a folder), 2 a folder */
+int64_t vk_kind(const vu_str *path) {
+    char buf[4096];
+    if (path->len >= (int64_t)sizeof buf - 1) return 0;
+    memcpy(buf, path->data, path->len);
+    buf[path->len] = 0;
+    pthread_mutex_lock(&vkf_mu);
+    vk_fent *e = vkf_get(path->data, (size_t)path->len);
+    if (e->kind < 0) {
+        struct stat st;
+        e->kind = stat(buf, &st) != 0 ? 0 : S_ISDIR(st.st_mode) ? 2 : 1;
+    }
+    int64_t k = e->kind;
+    pthread_mutex_unlock(&vkf_mu);
+    return k;
 }
 
 /* The path with symbolic links resolved (absolute), "" when it doesn't exist. */

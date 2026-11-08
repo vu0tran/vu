@@ -158,8 +158,8 @@ type Proj:
   ignored_ws: [Str]          # ignored workspace patterns
   cur: Int
   files: [Str]               # project files found by the walk (not ignored)
-  ign: [glob.Pat]
-  unign: [glob.Pat]
+  ign: glob.PatSet
+  unign: glob.PatSet
   ign_exact: [glob.Pat]
   unign_exact: [glob.Pat]
   inputs: [Input]
@@ -211,12 +211,20 @@ type Proj:
   caught_now: Bool           # (the external import being checked is caught)
   links: {Str: Bool}         # the project's symbolic links (paths)
   list_links: fn(Str) -> [Str]
+  list_dir: fn(Str) -> [Str] throws   # fs.list, each folder read once
+  kind: fn(Str) -> Int       # 0 nothing there, 1 a file, 2 a folder (stat once per path)
   realp: fn(Str) -> Str
   node: fn(Str) -> Str       # a request to the node process that loads JavaScript configs (loader.vu)
   node_par: fn(Str, Int) -> Str  # independent requests, spread over node processes
   node_workers: Int          # how many (--jobs, else the cores; at most 4)
   xdev: {Int: [Str]}         # (production) development entry patterns other workspaces gave
   link_dirs: {Str: Bool}     # folder -> it's below a symbolic link
+  fkeys: [Str]               # the project files sorted (path, then "\0" and the index in files)
+  fkix: [Int]                # (the index in files of each fkeys entry)
+  fix: {Str: Int}            # project file -> its index in files
+  froot: [Int]               # (the files of the project's folder)
+  erx: [re.Regex]            # the plugins' enabler regexes
+  erx_ix: {Str: Int}
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -225,10 +233,10 @@ fn fspath(p: Proj, rel: Str) -> Str:
   return p.root + rel
 
 fn exists_file(p: Proj, fs: Fs, rel: Str) -> Bool:
-  return fs.exists(fspath(p, rel)) and not fs.exists(fspath(p, rel) + "/")
+  return p.kind(fspath(p, rel)) == 1
 
 fn exists_dir(p: Proj, fs: Fs, rel: Str) -> Bool:
-  return fs.exists(fspath(p, rel) + "/")
+  return p.kind(fspath(p, rel)) == 2
 
 # the included workspace a project file belongs to (-1: none)
 fn ws_of(p: Proj, path: Str) -> Int:
@@ -315,8 +323,8 @@ fn add_gitignore(var p: Proj, text: Str, base: Str):
     if exact and base == "":
       if neg: p.unign_exact.push(glob.compile(pat))
       else: p.ign_exact.push(glob.compile(pat))
-    elif neg: p.unign.push(glob.compile(pat))
-    else: p.ign.push(glob.compile(pat))
+    elif neg: glob.set_add(&p.unign, pat)
+    else: glob.set_add(&p.ign, pat)
 
 # an ancestor folder's .gitignore read from the project folder (parseAndConvertGitignorePatterns
 # with ancestor): patterns under the project lose the prefix, other anchored ones are dropped
@@ -366,26 +374,26 @@ fn matches_any(pats: [glob.Pat], path: Str, dot: Bool) -> Bool:
 # ignored: a pattern matches the path or one of its folders
 fn is_ignored_path(p: Proj, path: Str, dot: Bool) -> Bool:
   if not p.gitignore: return false
-  if p.ign.len == 0 and p.ign_exact.len == 0: return false
+  if glob.set_len(p.ign) == 0 and p.ign_exact.len == 0: return false
   var hit = matches_any(p.ign_exact, path, dot)
   var cur = path
   while not hit and cur != "":
-    if matches_any(p.ign, cur, dot): hit = true
+    if glob.set_any(p.ign, cur, dot): hit = true
     cur = resolve.dirname(cur)
   if not hit: return false
-  if p.unign.len == 0 and p.unign_exact.len == 0: return true
+  if glob.set_len(p.unign) == 0 and p.unign_exact.len == 0: return true
   if matches_any(p.unign_exact, path, dot): return false
   var c2 = path
   while c2 != "":
-    if matches_any(p.unign, c2, dot): return false
+    if glob.set_any(p.unign, c2, dot): return false
     c2 = resolve.dirname(c2)
   return true
 
 # (in the walk, the folders above a path aren't ignored, so only the path itself is checked)
 fn is_ignored_here(p: Proj, path: Str) -> Bool:
-  if not matches_any(p.ign, path, true) and not matches_any(p.ign_exact, path, true): return false
-  if p.unign.len == 0 and p.unign_exact.len == 0: return true
-  return not matches_any(p.unign, path, true) and not matches_any(p.unign_exact, path, true)
+  if not glob.set_any(p.ign, path, true) and not matches_any(p.ign_exact, path, true): return false
+  if glob.set_len(p.unign) == 0 and p.unign_exact.len == 0: return true
+  return not glob.set_any(p.unign, path, true) and not matches_any(p.unign_exact, path, true)
 
 # With workspaces in folders, knip reads .gitignore files only in the workspaces and the folders
 # above them.
@@ -398,10 +406,11 @@ fn relevant_dir(p: Proj, dir: Str) -> Bool:
   return not nested
 
 fn walk(var p: Proj, fs: Fs, dir: Str):
-  let names = fs.list(fspath(p, dir)) else return
-  if ".gitignore" in names and p.gitignore:
+  let names = p.list_dir(fspath(p, dir)) else return
+  # (each .gitignore is read and compiled once, here; the root's before the walk)
+  if ".gitignore" in names and p.gitignore and dir != "" and relevant_dir(p, dir):
     let text = fs.read(fspath(p, resolve.join(dir, ".gitignore"))) else ""
-    if dir != "" and relevant_dir(p, dir): add_gitignore(&p, text, dir)
+    add_gitignore(&p, text, dir)
   # (symbolic links aren't followed or listed: knip's glob has followSymbolicLinks false; imports
   # through them resolve to the real path)
   var links: {Str: Bool} = {}
@@ -472,19 +481,59 @@ fn prepend_all(dir: Str, pats: [Str]) -> [Str]:
 
 # The project files (gitignore applied) a list of project-relative patterns matches (knip's _glob
 # with gitignore: a first pattern that is negated gives nothing).
+# The project files the patterns match (in the crawler's order). Each positive pattern is tried only
+# on the files below its literal folders (a range of the sorted files), a pattern without glob
+# characters is looked up, and negated ones are kept by prefix (glob.PatSet).
 fn glob_files(p: Proj, patterns: [Str]) -> [Str]:
-  var pos: [glob.Pat] = []
-  var neg: [glob.Pat] = []
-  var prefixes: [Str] = []
+  var neg = glob.new_set()
+  var pos: [Str] = []
   for pt in patterns:
     var s = pt
     if s.startswith("./"): s = s[2..s.len]
-    if s.startswith("!"): neg.push(glob.compile(s[1..s.len]))
-    else:
-      pos.push(glob.compile(s))
-      prefixes.push(static_prefix(s))
+    if s.startswith("!"): glob.set_add(&neg, s[1..s.len])
+    else: pos.push(s)
   var out: [Str] = []
   if pos.len == 0: return out
+  if p.fkeys.len != p.files.len: return glob_files_slow(p, pos, neg)
+  var cand: [Int] = []
+  for s in pos:
+    let pt = glob.compile(s)
+    let lit = glob.literal_path(pt, s)
+    if lit != "":
+      if lit in p.fix:
+        let k = p.fix[lit]
+        if glob.matches(pt, p.files[k], true): cand.push(k)
+      continue
+    if glob.one_segment(pt):
+      for k in p.froot:
+        if glob.matches(pt, p.files[k], true): cand.push(k)
+      continue
+    let pre = glob.safe_prefix(s)
+    var lo = 0
+    if pre != "": lo = lower_bound(p.fkeys, pre)
+    var parts: [Str] = []
+    var split = false
+    while lo < p.fkeys.len:
+      if pre != "" and not p.fkeys[lo].startswith(pre): break
+      let k = p.fkix[lo]
+      split = false
+      if glob.try_one(pt, p.files[k], true, &parts, &split): cand.push(k)
+      lo += 1
+  if cand.len > 1: cand.sort()
+  var last = -1
+  for k in cand:
+    if k == last: continue
+    last = k
+    if not neg_hit(neg, p.files[k]): out.push(p.files[k] + "")
+  return crawl_order(out)
+
+fn glob_files_slow(p: Proj, pos_s: [Str], neg: glob.PatSet) -> [Str]:
+  var pos: [glob.Pat] = []
+  var prefixes: [Str] = []
+  for s in pos_s:
+    pos.push(glob.compile(s))
+    prefixes.push(static_prefix(s))
+  var out: [Str] = []
   var any_prefix = true
   for x in prefixes:
     if x == "": any_prefix = false
@@ -496,6 +545,35 @@ fn glob_files(p: Proj, patterns: [Str]) -> [Str]:
       if not ok: continue
     if matches_any(pos, f, true) and not neg_hit(neg, f): out.push(f + "")
   return crawl_order(out)
+
+# the first index of the sorted keys that isn't below x
+fn lower_bound(keys: [Str], x: Str) -> Int:
+  var lo = 0
+  var hi = keys.len
+  while lo < hi:
+    let m = (lo + hi) / 2
+    if keys[m] < x: lo = m + 1
+    else: hi = m
+  return lo
+
+# (after the walk) the project files sorted, for glob_files
+fn index_files(var p: Proj):
+  var keys: [Str] = []
+  var fix: {Str: Int} = {}
+  for k in 0..p.files.len:
+    keys.push(p.files[k] + "\0{k}")
+    fix[p.files[k]] = k
+  keys.sort()
+  var ix: [Int] = []
+  for x in keys:
+    let z = x.find("\0")
+    ix.push(int(x[z + 1..x.len]) else 0)
+  swap(&p.fkeys, &keys)
+  swap(&p.fkix, &ix)
+  swap(&p.fix, &fix)
+  p.froot = []
+  for k in 0..p.files.len:
+    if p.files[k].find("/") < 0: p.froot.push(k)
 
 # paths in the order knip's crawler (tinyglobby) gives them: a folder's files before its subfolders'
 # (by depth, then folder by folder)
@@ -527,12 +605,12 @@ fn crawl_order(own xs: [Str]) -> [Str]:
   return out
 
 # a negated pattern matches the path or one of its folders
-fn neg_hit(neg: [glob.Pat], f: Str) -> Bool:
-  if neg.len == 0: return false
-  if matches_any(neg, f, true): return true
+fn neg_hit(neg: glob.PatSet, f: Str) -> Bool:
+  if glob.set_len(neg) == 0: return false
+  if glob.set_any(neg, f, true): return true
   var d = resolve.dirname(f)
   while d != "":
-    if matches_any(neg, d, true): return true
+    if glob.set_any(neg, d, true): return true
     d = resolve.dirname(d)
   return false
 
@@ -549,9 +627,9 @@ fn static_prefix(s: Str) -> Str:
 # A glob that doesn't skip ignored files (only node_modules and .git): it walks the file system.
 fn glob_fs(p: Proj, fs: Fs, patterns: [Str]) -> [Str]:
   var out: [Str] = []
-  var neg: [glob.Pat] = []
+  var neg = glob.new_set()
   for pt in patterns:
-    if pt.startswith("!"): neg.push(glob.compile(pt[1..pt.len]))
+    if pt.startswith("!"): glob.set_add(&neg, pt[1..pt.len])
   var seen: {Str: Bool} = {}
   for pt in patterns:
     if pt.startswith("!"): continue
@@ -616,6 +694,18 @@ fn glob_dirs(p: Proj, fs: Fs, patterns: [Str]) -> [Str]:
   return out
 
 fn glob_walk(p: Proj, fs: Fs, dir: Str, segs: [Str], i: Int, var out: [Str], dirs: Bool):
+  # (each segment's pattern compiled once; a folder listed once for '**' and the segment after it)
+  var pats: [glob.Pat] = []
+  for x in segs:
+    if glob.is_dynamic(x) and x != "**": pats.push(glob.compile(x))
+    else: pats.push(glob.compile("-"))
+  glob_walk_c(p, fs, dir, segs, pats, i, &out, dirs)
+
+fn sub_path(dir: Str, name: Str) -> Str:
+  if dir == "": return name + ""
+  return dir + "/" + name
+
+fn glob_walk_c(p: Proj, fs: Fs, dir: Str, segs: [Str], pats: [glob.Pat], i: Int, var out: [Str], dirs: Bool):
   if i >= segs.len: return
   let seg = segs[i]
   let last = i == segs.len - 1
@@ -626,20 +716,28 @@ fn glob_walk(p: Proj, fs: Fs, dir: Str, segs: [Str], i: Int, var out: [Str], dir
         if exists_dir(p, fs, path): out.push(path)
       elif exists_file(p, fs, path): out.push(path)
     elif exists_dir(p, fs, path):
-      glob_walk(p, fs, path, segs, i + 1, &out, dirs)
+      glob_walk_c(p, fs, path, segs, pats, i + 1, &out, dirs)
     return
-  let names = fs.list(fspath(p, dir)) else return
+  let names = p.list_dir(fspath(p, dir)) else return
+  glob_walk_n(p, fs, dir, segs, pats, i, &out, dirs, names)
+
+# (segment i is dynamic; names: the folder's listing)
+fn glob_walk_n(p: Proj, fs: Fs, dir: Str, segs: [Str], pats: [glob.Pat], i: Int, var out: [Str], dirs: Bool, names: [Str]):
+  let seg = segs[i]
+  let last = i == segs.len - 1
   if seg == "**":
     if last and dirs and dir != "": out.push(dir + "")
-    glob_walk(p, fs, dir, segs, i + 1, &out, dirs)
+    if i + 1 < segs.len:
+      if glob.is_dynamic(segs[i + 1]): glob_walk_n(p, fs, dir, segs, pats, i + 1, &out, dirs, names)
+      else: glob_walk_c(p, fs, dir, segs, pats, i + 1, &out, dirs)
     for nm in names:
       if nm.endswith("/"):
         let name = nm[0..nm.len - 1]
         if name == "node_modules" or name == ".git": continue
         if dirs and name.startswith("."): continue
-        glob_walk(p, fs, resolve.join(dir, name), segs, i, &out, dirs)
+        glob_walk_c(p, fs, sub_path(dir, name), segs, pats, i, &out, dirs)
     return
-  let pt = glob.compile(seg)
+  let pt = pats[i]
   for nm in names:
     let isdir = nm.endswith("/")
     var name = nm
@@ -647,12 +745,12 @@ fn glob_walk(p: Proj, fs: Fs, dir: Str, segs: [Str], i: Int, var out: [Str], dir
     if name == "node_modules" or name == ".git": continue
     # (picomatch matches a name equal to the pattern itself)
     if name != seg and not glob.matches(pt, name, not dirs): continue
-    let path = resolve.join(dir, name)
+    let path = sub_path(dir, name)
     if last:
       if dirs:
         if isdir: out.push(path)
       elif not isdir: out.push(path)
-    elif isdir: glob_walk(p, fs, path, segs, i + 1, &out, dirs)
+    elif isdir: glob_walk_c(p, fs, path, segs, pats, i + 1, &out, dirs)
 
 # ---- package names
 
@@ -1908,7 +2006,8 @@ fn plugin_enabled(p: Proj, fs: Fs, pl: plugins.Plugin) -> Bool:
   let w = p.ws[p.cur]
   for e in pl.enablers:
     if e.startswith("/"):
-      let rx = re.compile(e[1..e.len]) else continue
+      if not (e in p.erx_ix): continue
+      let rx = p.erx[p.erx_ix[e]]
       for d in w.deps:
         if hit = re.search(rx, d): return true
       for d in w.dev_deps:
@@ -1921,7 +2020,7 @@ fn plugin_enabled(p: Proj, fs: Fs, pl: plugins.Plugin) -> Bool:
   if k == "jest": return w.pkg_name.startswith("jest-presets")
   if k == "bun": return exists_file(p, fs, wpath(p, "bun.lock")) or exists_file(p, fs, wpath(p, "bun.lockb")) or bun_test(w)
   if k == "github-actions":
-    let wf = fs.list(fspath(p, wpath(p, ".github/workflows"))) else return false
+    let wf = p.list_dir(fspath(p, wpath(p, ".github/workflows"))) else return false
     for f in wf:
       if f.endswith(".yml") or f.endswith(".yaml"): return true
     return false
@@ -2350,7 +2449,7 @@ fn varlock_inputs(p: Proj, fs: Fs, x: Input) -> [Input]:
 fn varlock_expand(p: Proj, fs: Fs, path: Str) -> [Str]:
   if not exists_dir(p, fs, path): return [path + ""]
   var out: [Str] = []
-  let names = fs.list(fspath(p, path)) else return out
+  let names = p.list_dir(fspath(p, path)) else return out
   var ns: [Str] = []
   for n in names: ns.push(n + "")
   ns.sort()
@@ -6060,6 +6159,33 @@ fn visit(var b: Build, id: Int):
   b.visited[id] = true
   b.order.push(id)
 
+# One file of a wave, once read: its result goes to its node, then its imports into the graph.
+fn link_one(var p: Proj, fs: Fs, var b: Build, id: Int, var raw: Raw):
+  swap(&b.g.nodes[id].raw, &raw)
+  let path = b.g.nodes[id].path
+  if path in b.project and ws_of(p, path) >= 0:
+    b.g.nodes[id].analyzed = true
+    b.g.nodes[id].skip_exports = id in b.skip
+    if b.trace_on:
+      var tx: [[Str]] = []
+      for e in b.g.nodes[id].raw.exps:
+        var row: [Str] = [e.name + ""]
+        for m in e.members:
+          # (a nested namespace is shown by its members, as knip's members are)
+          var parent = false
+          for m2 in e.members:
+            if m2.name.startswith(m.name + "."): parent = true
+          if not parent: row.push(m.name + "")
+        tx.push(row)
+      b.texps[id] = tx
+      b.tbind[id] = bind_rows(b.g.nodes[id].raw.globs)
+    if id in b.skip or not p.report_exports:
+      b.g.nodes[id].raw.exps = []
+      b.g.nodes[id].raw.dups = []
+    link_file(&p, fs, &b, id)
+  else:
+    link_follow(&p, fs, &b, id)
+
 # Applies one file's imports to the graph (addImport / addInternalImport in knip).
 fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
   let path = b.g.nodes[id].path + ""
@@ -7477,7 +7603,7 @@ fn marko_lib(p: Proj, fs: Fs, wi: Int) -> MarkoLib:
   return lib
 
 fn list_dir(p: Proj, fs: Fs, dir: Str) -> [Str]:
-  let xs = fs.list(fspath(p, dir)) else []
+  let xs = p.list_dir(fspath(p, dir)) else []
   return xs
 
 fn marko_is_tag_dir(p: Proj, fs: Fs, dir: Str, name: Str) -> Bool:
@@ -8844,11 +8970,16 @@ fn add_ignore_pat(var p: Proj, pat: Str, id: Str, ws: Str, files: Bool):
 # configuration hints about entry and project patterns (WorkspaceWorker.getConfigurationHints)
 fn entry_hints(var p: Proj, b: Build, patterns: [Str], paths: [Str]):
   let w = p.cur
+  # (pattern_hints looks up the path each pattern names: whether it's an entry)
   var included: {Str: Bool} = {}
-  for id, _ in b.entries:
-    let path = b.g.nodes[id].path
-    if p.ws[w].inc_entry and id in b.skip: continue
-    included[path] = true
+  let dir = p.ws[w].dir + ""
+  for pt in patterns:
+    var id = pt + ""
+    if id.endswith("!"): id = id[0..id.len - 1]
+    let k = resolve.join(dir, id)
+    if k in b.g.ids:
+      let nid = b.g.ids[k]
+      if nid in b.entries and not (p.ws[w].inc_entry and nid in b.skip): included[k] = true
   pattern_hints(&p, "entry", sc(p.ws[w].entry), patterns, paths, included)
 
 fn project_hints(var p: Proj, b: Build, paths: [Str]):
@@ -8961,7 +9092,7 @@ fn pfind(p: Proj, name: Str) -> plugins.Plugin:
 fn likely_js_configs(p: Proj, fs: Fs) -> Int:
   var n = 0
   for w in p.ws:
-    let names = fs.list(fspath(p, w.dir)) else continue
+    let names = p.list_dir(fspath(p, w.dir)) else continue
     for x in names:
       if n >= 4: return n
       # (eslint's are read without node)
@@ -8972,7 +9103,7 @@ fn likely_js_configs(p: Proj, fs: Fs) -> Int:
   return n
 
 fn new_proj(root: Str) -> Proj:
-  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], [], [], [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false, {}, own fn(d: Str) => [], own fn(x: Str) => "", own fn(x: Str) => "!", own fn(x: Str, n: Int) => "", 1, {}, {})
+  return Proj(root, false, false, {}, {}, true, true, json.Obj({}), false, "", [], [], [], {}, {}, {}, [], false, [], 0, [], glob.new_set(), glob.new_set(), [], [], [], [], {}, [], {}, resolve.new_resolver(root), report.coll_table(), [], [], [], [], [], [], [], [], [], [], {}, {}, {}, plugins.table(), {}, false, "", true, false, [], [], [], false, false, [], false, [], {}, "", {}, {}, false, {}, [], perf.new_perf(false, [], false, false, false, 0.0), own fn() => 0.0, false, false, 120, false, {}, own fn(d: Str) => [], own fn(d: Str) => [], own fn(x: Str) => 0, own fn(x: Str) => "", own fn(x: Str) => "!", own fn(x: Str, n: Int) => "", 1, {}, {}, [], [], {}, [], [], {})
 
 # standard output and error with knip's colors, or without them
 fn out(p: Proj, s: Str):
@@ -8997,7 +9128,36 @@ fn config_error(p: Proj, msg: Str):
   print("\nRun `knip --help` or visit https://knip.dev for help")
   exit(2)
 
+# What the files of a wave are read with: the --tags, and the visitors and extras the run needs
+fn wave_tags(p: Proj, trace_on: Bool) -> [Str]:
+  var utags: [Str] = sc(p.tags_incl)
+  for x in p.tags_excl: utags.push(x + "")
+  # the visitors of the plugins enabled in any workspace (registerVisitors)
+  for v in ["jest", "vitest", "rstest", "execa", "zx", "nano-spawn", "vite", "webpack", "rspack", "node", "pino", "knex", "lit", "catalyst", "fast", "stencil", "angular"]:
+    var on = false
+    for w in p.ws:
+      if v in w.plugins: on = true
+    if on: utags.push("\0" + v)
+  # (ignoreExportsUsedInFile in some workspace: the files' local references are collected)
+  var want_refs = false
+  for w in p.ws:
+    if pkg.truthy(w.ignore_in_file): want_refs = true
+  if want_refs: utags.push("\0refs")
+  # (--trace: the exports' bindings, for resolveExportOrigins)
+  if trace_on: utags.push("\0binds")
+  return utags
+
+fn same_strs(a: [Str], b: [Str]) -> Bool:
+  if a.len != b.len: return false
+  for i in 0..a.len:
+    if a[i] != b[i]: return false
+  return true
+
+fn ph(os: Os, name: Str):
+  if os.env("VKNIP_PHASES") != "": eprint("PHASE {os.clock()} " + name)
+
 fn main(fs: Fs, os: Os, ffi: Ffi):
+  ph(os, "start")
   let a = opts.parse(args())
   if a.err != "":
     eprint(a.err)
@@ -9017,6 +9177,10 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   var p = new_proj(root)
   p.clk = own fn() => os.clock()
   p.list_links = own fn(d: Str) => term.links(ffi, d)
+  p.list_dir = own fn(d: Str) => term.list(ffi, d)?
+  p.kind = own fn(x: Str) => term.kind(ffi, x)
+  p.rs.lister = own fn(d: Str) => term.list(ffi, d)?
+  p.rs.kind = own fn(x: Str) => term.kind(ffi, x)
   p.realp = own fn(x: Str) => term.realpath(ffi, x)
   p.node = own fn(x: Str) => term.node(ffi, loader.LOADER_JS, x)
   p.node_par = own fn(x: Str, n: Int) => term.node_par(ffi, loader.LOADER_JS, x, n)
@@ -9044,6 +9208,16 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   perf.log_head(p.pf)
   perf.mark(&p.pf, fs, "start")
   for k in 0..p.ptab.len: p.pidx[p.ptab[k].name] = k
+  # (the plugins' enabler regexes, compiled once)
+  var erx_src: [Str] = []
+  for pl in p.ptab:
+    for e in pl.enablers:
+      if e.startswith("/"): erx_src.push(e + "")
+  for e in erx_src:
+    if e in p.erx_ix: continue
+    let rx = re.compile(e[1..e.len]) else continue
+    p.erx_ix[e] = p.erx.len
+    p.erx.push(rx)
   let msrc = fs.read(fspath(p, "package.json")) else ""
   let root_manifest = pkg.parse_json(msrc)
   if msrc == "" or not pkg.is_obj(root_manifest): config_error(p, "Unable to find package.json")
@@ -9054,6 +9228,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   p.gitignore = not opts.flag(a, "no-gitignore")
   p.debug = opts.flag(a, "debug-inputs")
   let cerr = load_config(&p, fs, os, a, root_manifest)
+  ph(os, "load_config")
   if cerr == "\0":
     print("Configuration file load error? Visit https://knip.dev/reference/known-issues")
     exit(2)
@@ -9135,6 +9310,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       else: p.ignore_issues[t] = [glob.compile(pat)]
   # workspaces
   let werr = setup_workspaces(&p, fs, os, root_manifest, opts.strs_opt(a, "workspace"))
+  ph(os, "setup_workspaces")
   if werr != "": config_error(p, werr)
   # (workspaces with JavaScript configs, likely: node processes start now, one per two configs (up to
   # the workers, 2 at most), and get ready while vknip reads the project; one that isn't needed is
@@ -9171,8 +9347,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     let ex = pkg.get(m, "exports")
     p.rs.wsi.push(resolve.WsInfo(d, pkg.str_of(pkg.get(m, "name")), json.copy(ex), not is_null(ex), pkg.get(m, "imports")))
   # .gitignore files: .git/info/exclude and the root's first (the walk adds the nested ones)
-  p.ign.push(glob.compile("**/node_modules"))
-  p.ign.push(glob.compile(".git"))
+  glob.set_add(&p.ign, "**/node_modules")
+  glob.set_add(&p.ign, ".git")
   if p.gitignore:
     # (the .gitignore files of the folders above, to the git root: findAncestorGitignoreFiles)
     if not fs.exists(fspath(p, ".git")):
@@ -9195,12 +9371,15 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     add_gitignore(&p, gi, "")
   let t_walk = pt(p)
   walk(&p, fs, "")
+  index_files(&p)
+  ph(os, "walk")
   if p.gitignore: pe(&p, "findAndParseGitignores", t_walk)
   var dws: {Str: Int} = {}
   for f in p.files:
     let d = resolve.dirname(f)
     if not (d in dws): dws[d] = ws_of_slow(p, f)
   swap(&p.dir_ws, &dws)
+  ph(os, "dir_ws")
   # the workspaces, each with its entry and project files
   let trace_on = opts.flag(a, "trace") or opts.has_str(a, "trace-file") or opts.has_str(a, "trace-export") or opts.has_str(a, "trace-dependency")
   var b = Build({}, Graph({}, []), {}, {}, {}, {}, {}, [], p.on["cycles"] or trace_on, [], {}, trace_on, {}, {}, {}, {}, {})
@@ -9220,13 +9399,46 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       if not accepted_ext("x" + e) and not opts.has(p.rs.extra_exts, e): p.rs.extra_exts.push(e + "")
     apply_ws_config(&p, wi)
     determine_plugins(&p, fs)
+  ph(os, "determine_plugins")
+  # (the project's JavaScript and TypeScript files are read on the other cores now, while node loads
+  # the configs and the workspaces' entries are found; a wave takes a file's result from here when
+  # it was read the way the wave reads it)
+  var spec_on = not opts.flag(a, "cache") and not p.pf.timerify and jobs > 1
+  var spec_ix: {Str: Int} = {}
+  var spec_tags: [Str] = []
+  let sjc: Chan[Job] = chan(p.files.len + 1)
+  let spec_rc: Chan[Done] = chan(p.files.len + 1)
+  var spec_slots: [Raw] = []
+  var spec_have: [Bool] = []
+  # (only the included workspaces' files, and only in a large project: in a small one, reading files
+  # the graph doesn't reach and starting the threads cost more than the overlap gives; not in
+  # production mode, where the graph reaches far fewer of them)
+  if p.production: spec_on = false
+  var spec_files: [Str] = []
+  if spec_on:
+    for f in p.files:
+      if accepted_ext(f) and comp_for(p, f) == "" and not resolve.in_node_modules(f) and ws_of(p, f) >= 0: spec_files.push(f + "")
+    if spec_files.len < 1000: spec_on = false
+  if spec_on:
+    spec_tags = wave_tags(p, trace_on)
+    for f in spec_files:
+      let n = spec_slots.len
+      spec_ix[f] = n
+      sjc.send(Job(n, f + "", "", ""))
+      spec_slots.push(empty_raw(""))
+      spec_have.push(false)
+  sjc.close()
+  if spec_on:
+    for _ in 0..jobs: spawn worker(fs, os, false, root + "", sc(spec_tags), sjc, spec_rc)
   prefetch(&p, fs, os)
+  ph(os, "prefetch")
   for wi in 0..p.ws.len:
     if not p.ws[wi].has_manifest: continue
     p.cur = wi
     build_ws(&p, fs, os, &b)
     let wsn = p.ws[wi].name + ""
     perf.mark(&p.pf, fs, wsn)
+  ph(os, "build_ws")
   if p.debug:
     for f in b.order: eprint("entry " + b.g.nodes[f].path)
   # the graph: read the files reached from the entries, in waves (each on all cores)
@@ -9240,36 +9452,65 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   let t_walk_an = pt(p)
   var done = 0
   while done < b.order.len:
+    ph(os, "wave")
     var wave: [Int] = []
     var paths: [Str] = []
     for k in done..b.order.len:
       wave.push(b.order[k])
       paths.push(b.g.nodes[b.order[k]].path + "")
     done = b.order.len
-    var utags: [Str] = sc(p.tags_incl)
-    for x in p.tags_excl: utags.push(x + "")
-    # the visitors of the plugins enabled in any workspace (registerVisitors)
-    for v in ["jest", "vitest", "rstest", "execa", "zx", "nano-spawn", "vite", "webpack", "rspack", "node", "pino", "knex", "lit", "catalyst", "fast", "stencil", "angular"]:
-      var on = false
-      for w in p.ws:
-        if v in w.plugins: on = true
-      if on: utags.push("\0" + v)
-    # (ignoreExportsUsedInFile in some workspace: the files' local references are collected)
-    var want_refs = false
-    for w in p.ws:
-      if pkg.truthy(w.ignore_in_file): want_refs = true
-    if want_refs: utags.push("\0refs")
-    # (--trace: the exports' bindings, for resolveExportOrigins)
-    if trace_on: utags.push("\0binds")
+    let utags = wave_tags(p, trace_on)
     var comps: [Str] = []
     var pres: [Str] = []
     for x in paths:
       comps.push(comp_for(p, x))
       pres.push("")
     precompile(&p, fs, os, paths, &comps, &pres)
+    ph(os, "precompile {paths.len}")
     debug_compiled(p, paths, comps, pres)
+    let streaming = not cache.on and not p.pf.timerify and jobs > 1
+    if streaming:
+      # (the files are linked in the wave's order as the workers finish them, while they read the rest)
+      let use_spec = spec_on and same_strs(utags, spec_tags)
+      var from_spec: [Int] = []
+      var nmiss = 0
+      let jc: Chan[Job] = chan(paths.len + 1)
+      let rc: Chan[Done] = chan(paths.len + 1)
+      for i in 0..paths.len:
+        if use_spec and comps[i] == "" and pres[i] == "" and paths[i] in spec_ix:
+          from_spec.push(spec_ix[paths[i]])
+        else:
+          from_spec.push(-1)
+          jc.send(Job(i, paths[i] + "", comps[i] + "", pres[i] + ""))
+          nmiss += 1
+      jc.close()
+      var nw = jobs
+      if nw > nmiss: nw = nmiss
+      for _ in 0..nw: spawn worker(fs, os, false, root + "", sc(utags), jc, rc)
+      var slots: [Raw] = []
+      var have: [Bool] = []
+      for _ in 0..paths.len:
+        slots.push(empty_raw(""))
+        have.push(false)
+      for k in 0..wave.len:
+        let si = from_spec[k]
+        if si >= 0:
+          while not spec_have[si]:
+            var d = spec_rc.recv() else break
+            swap(&spec_slots[d.idx], &d.raw)
+            spec_have[d.idx] = true
+          link_one(&p, fs, &b, wave[k], &spec_slots[si])
+          continue
+        while not have[k]:
+          var d = rc.recv() else break
+          swap(&slots[d.idx], &d.raw)
+          have[d.idx] = true
+        link_one(&p, fs, &b, wave[k], &slots[k])
+      ph(os, "read+link")
+      continue
     var tms: [[Float]] = []
     var raws = read_batch_c(fs, os, p.pf.timerify, &tms, root, paths, comps, pres, jobs, &kw, &t, utags, &cache)
+    ph(os, "read_batch")
     for tm in tms:
       # (start, parsed, walk start, walk end, done; a file that didn't parse has no walk)
       if tm.len >= 3:
@@ -9277,33 +9518,9 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
         if tm.len >= 5:
           perf.add(&p.pf, "getImportsAndExports", (tm[tm.len - 1] - tm[1]) * 1000.0)
           perf.add(&p.pf, "walkAST", (tm[tm.len - 2] - tm[tm.len - 3]) * 1000.0)
-    for k in 0..wave.len:
-      let id = wave[k]
-      swap(&b.g.nodes[id].raw, &raws[k])
-      let path = b.g.nodes[id].path
-      if path in b.project and ws_of(p, path) >= 0:
-        b.g.nodes[id].analyzed = true
-        b.g.nodes[id].skip_exports = id in b.skip
-        if b.trace_on:
-          var tx: [[Str]] = []
-          for e in b.g.nodes[id].raw.exps:
-            var row: [Str] = [e.name + ""]
-            for m in e.members:
-              # (a nested namespace is shown by its members, as knip's members are)
-              var parent = false
-              for m2 in e.members:
-                if m2.name.startswith(m.name + "."): parent = true
-              if not parent: row.push(m.name + "")
-            tx.push(row)
-          b.texps[id] = tx
-          b.tbind[id] = bind_rows(b.g.nodes[id].raw.globs)
-        if id in b.skip or not p.report_exports:
-          b.g.nodes[id].raw.exps = []
-          b.g.nodes[id].raw.dups = []
-        link_file(&p, fs, &b, id)
-      else:
-        link_follow(&p, fs, &b, id)
+    for k in 0..wave.len: link_one(&p, fs, &b, wave[k], &raws[k])
   kcache.save_cache(fs, &cache)
+  ph(os, "link")
   pe(&p, "walkAndAnalyze", t_walk_an)
   perf.mark(&p.pf, fs, "build")
   # ignoreExportsUsedInFile: an export referenced in its own file (hasRefsInFile)
@@ -9362,14 +9579,19 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     if not p.on["files"]: continue
     n_unused += 1
     add_file_issue(&p, f)
+  ph(os, "unused_files")
   analyze_exports(&p, b)
+  ph(os, "analyze_exports")
   if p.on["cycles"]:
     let t_cy = pt(p)
     find_cycles(&p, b)
     pe(&p, "findAllCycles", t_cy)
   analyze_imports(&p, b)
+  ph(os, "analyze_imports")
   settle_deps(&p)
+  ph(os, "settle_deps")
   catalog_issues(&p, fs, root_manifest)
+  ph(os, "catalog")
   # configuration hints
   let t_hints = pt(p)
   configured_ws_hints(&p, fs)
@@ -9514,6 +9736,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
         eout(p, report.gray("Unused tag in " + parts[0] + ":") + " " + parts[1] + " → " + parts[2])
     if after != "" and target == "": print(after)
   perf.finish(&p.pf, fs, os.clock())
+  ph(os, "finish")
   # the exit code
   if p.config_errors: exit(2)
   var errors = 0
@@ -9579,7 +9802,7 @@ fn watch_report(var p: Proj, fs: Fs, b: Build, n_analyzed: Int, state: Str):
 fn watch_add_dirs(p: Proj, fs: Fs, ffi: Ffi, fd: Int, dir: Str, var wds: {Int: Str}):
   let wd = term.watch_add(ffi, fd, fspath(p, dir))
   if wd >= 0: wds[wd] = dir + ""
-  let names = fs.list(fspath(p, dir)) else return
+  let names = p.list_dir(fspath(p, dir)) else return
   var links: {Str: Bool} = {}
   for x in p.list_links(fspath(p, dir)): links[x] = true
   for nm in names:
@@ -10245,7 +10468,7 @@ fn apply_fixes(var p: Proj, fs: Fs, os: Os, a: opts.Args):
 # else the one a package.json script runs, else prettier when package.json has a prettier key; run
 # from node_modules/.bin when installed, else through the package manager
 fn format_files(var p: Proj, fs: Fs, os: Os, files: [Str]):
-  let names = fs.list(fspath(p, "")) else []
+  let names = p.list_dir(fspath(p, "")) else []
   let order = ["biome", "deno", "dprint", "oxfmt", "prettier"]
   var chosen = ""
   for f in order:

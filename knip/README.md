@@ -40,7 +40,9 @@ enums and namespaces).
 It follows knip's own code (graph/build.js, graph/analyze.js, the graph explorer, the import and
 export visitors, DependencyDeputy, the script parser, the plugins), reading files with vtsc's
 parser (`ts/scan.vu`, `ts/parse.vu`, `ts/ast.vu`, linked into this folder unchanged; exact mode keeps
-node ends). Files are parsed on all cores, wave by wave as the import graph reaches them.
+node ends). Files are parsed on all cores, wave by wave as the import graph reaches them, and linked
+in order as they come in; in a large project the workspaces' files are parsed ahead, while node loads
+the configs (see n8n under Benchmark).
 
 ## What it does
 
@@ -487,6 +489,66 @@ knip's time to a third of it. Where vknip needs no node (changesets, knip, mono1
 beyond noise; mono1's 0.72 s against 0.67 s before is within the spread of its runs. The launcher adds
 about 0.03 to 0.05 s (node's start). Not measured: macOS (the issue's machine), and the private
 monorepo of the report.
+
+### n8n: a large monorepo
+
+n8n is the largest public repository that uses knip: 109 workspaces, 33,236 files in the project
+after `.gitignore`, 26,206 of them analyzed. It was cloned with its dependencies installed (pnpm;
+one change: `packages/frontend/editor-ui/package.json` points `wa-sqlite` to a local copy, as the
+machine's proxy blocks codeload.github.com; n8n's packages weren't built, so knip and vknip both fail
+to load about 150 vitest and oxlint configs and print the same 318 lines of errors). Run in the
+repository's folder with no arguments (and the arguments shown), wall and CPU seconds (user + system
+of vknip, its threads and its node processes) and the largest resident set, best of 3 runs for
+vknip, one run for knip 6.44.1 (Node 22), on the shared 2-core machine (load average about 1 to 2).
+"before" is 6d92970.
+
+| case | knip wall | knip CPU | knip MB | before wall | before CPU | now wall | now CPU | now MB | knip / now |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| (whole repo) | 114.2 | 123.5 | 1656 | 34.63 | 38.27 | 7.14 | 11.58 | 463 | 16.0x |
+| -W packages/cli | 107.1 | 116.6 | 1620 | 31.13 | 34.11 | 6.80 | 10.99 | 453 | 15.7x |
+| -W packages/nodes-base | 91.2 | 98.3 | 1050 | 15.60 | 17.26 | 4.03 | 6.20 | 310 | 22.6x |
+| -W packages/frontend/editor-ui | 91.3 | 98.2 | 1271 | 19.49 | 21.68 | 4.75 | 7.60 | 264 | 19.2x |
+| --production | 84.6 | 89.5 | 978 | 12.64 | 14.98 | 4.78 | 7.05 | 246 | 17.7x |
+
+Output is identical in every case: stdout byte for byte (empty: no issues), stderr the same lines
+(sorted; knip prints the config errors in another order).
+
+Where the time went (vknip's sampling profiler, `vu build --profile`, and timestamps at each phase:
+`VKNIP_PHASES=1` prints them on stderr), and what changed, in order of size:
+
+1. **Glob matching: 72% of the CPU.** Every `glob_files` call tested every project file against
+   every pattern (68 million path-pattern tests on n8n, the path split into parts for each), and
+   every `.gitignore` pattern of every workspace was tried on every folder of each path checked
+   (each import of a workspace package, each unresolved import). Now the project files are sorted
+   once after the walk; a pattern is tried only on the range of files below its literal folders,
+   a pattern without glob characters is looked up, one with a single segment sees only the root's
+   files; `.gitignore` and negated patterns are kept by their literal prefix, and a path looks up
+   its own prefixes; and a pattern alternative first checks that its literal segments are among the
+   path's parts and that its last segment matches the last part. 32.9 s -> 10.9 s wall.
+2. **Repeated directory listings and stats.** 122,331 directory opens for 19,787 folders (strace):
+   the walk listed each folder twice (names, then its symbolic links), every `glob_fs` pattern
+   (tsconfig `include`, the configuration's entries, each plugin's config files) walked the folders
+   again, and `**` listed each folder twice. The listings and stats now come from a cache for the
+   run (`term_glue.c`: each folder read once, each path stat-ed once; the resolver uses it too), and
+   segment patterns are compiled once per glob. With a cache of package resolutions (each package
+   folder and specifier once, and each folder's package lookup and source mapping once), and an
+   `entry_hints` that looked through all entries for each workspace: 10.9 s -> 8.5 s.
+3. **One core idle.** `strace -f` counted 13 to 17 s of futex: that is node's idle helper threads
+   and vknip's first thread waiting for its main one, not contention. The real gap was that files
+   were read only after all workspaces' entries were known, and linked only after all were read. Now
+   the included workspaces' JavaScript and TypeScript files are read on the other cores while node
+   loads the configs and the entries are found (a wave takes a file's result when it was read with
+   the same tags and no compiler), and each file is linked as soon as its result arrives. Not in
+   `--production` (the graph reaches far fewer files) or projects under 1,000 such files (the
+   threads and unreached files cost more than the overlap gives). 8.5 s -> 7.1 s.
+
+The corpus didn't get slower: best of 5 against 6d92970, the 23 projects' CPU 3.70 s -> 3.39 s and wall 2.44 s -> 2.07 s in total (knip 0.317 -> 0.199 s wall, changesets 0.329 -> 0.256, unhead 1.466 -> 1.292; the small ones within 1 ms either way, the machine's noise). Instructions
+(callgrind, `--jobs 1`, `VU_MARCH=x86-64-v2` builds): node-glob 56.4 M -> 55.4 M, fastify 548 M ->
+527 M, changesets 1,049 M -> 380 M, knip 2,003 M -> 979 M.
+
+What's left on n8n (7.1 s): node loading the configs (2.5 s of wall, shared with the reading
+threads), the workspaces' entries and plugins on one core (1.8 s), and linking (resolution, 2 s),
+which stays on one core because the resolver's caches and tsconfig state are one value.
 
 ## Gaps
 

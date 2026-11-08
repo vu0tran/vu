@@ -12,6 +12,8 @@ type Pat:
   lit: Str
   rxs: [re.Regex]  # (patterns with an extglob spanning '/': each alternative as a regex)
   dot_lit: Bool    # (such a pattern names a segment starting with '.')
+  need: [[Str]]    # each alternative's literal segments: a path it matches has each of them
+  tail: [Bool]     # each alternative's last segment is one name (not '**'): the path's last part matches it
 
 # The pattern with its {a,b} groups expanded into every combination.
 fn expand(p: Str) -> [Str]:
@@ -74,7 +76,7 @@ fn compile(pattern: Str) -> Pat:
     for e in expand(p):
       let r = re.compile("^" + to_regex(e) + "$") else continue
       rxs.push(r)
-    return Pat([], neg, 0, "", rxs, p.startswith(".") or p.find("/.") >= 0)
+    return Pat([], neg, 0, "", rxs, p.startswith(".") or p.find("/.") >= 0, [], [])
   for e in expand(p):
     var segs: [Str] = []
     for s in e.split("/"):
@@ -91,7 +93,15 @@ fn compile(pattern: Str) -> Pat:
     elif last.startswith("*") and last.len > 1 and not is_dynamic(last[1..last.len]):
       fast = 2
       lit = last[1..last.len]
-  return Pat(alts, neg, fast, lit, [], false)
+  var need: [[Str]] = []
+  var tail: [Bool] = []
+  for a in alts:
+    var n: [Str] = []
+    for seg in a:
+      if seg != "" and seg != "**" and not is_dynamic(seg) and seg.find("\\") < 0: n.push(seg + "")
+    need.push(n)
+    tail.push(a.len > 0 and a[a.len - 1] != "**")
+  return Pat(alts, neg, fast, lit, [], false, need, tail)
 
 fn matches(pt: Pat, path: Str, dot: Bool) -> Bool:
   if pt.rxs.len > 0: return rx_match(pt, path, dot)
@@ -114,9 +124,29 @@ fn fast_match(pt: Pat, path: Str, dot: Bool) -> Bool:
 
 fn matches_parts(pt: Pat, parts: [Str], dot: Bool) -> Bool:
   if pt.rxs.len > 0: return rx_match(pt, "/".join(parts), dot)
-  for a in pt.alts:
-    if match_segs(a, 0, parts, 0, dot): return true
+  for k in 0..pt.alts.len:
+    if alt_matches(pt, k, parts, dot): return true
   return false
+
+# alternative k against the parts: the cheap necessary checks (its literal segments are there, its
+# last segment matches the last part) before the full match
+fn alt_matches(pt: Pat, k: Int, parts: [Str], dot: Bool) -> Bool:
+  if parts.len == 0: return match_segs(pt.alts[k], 0, parts, 0, dot)
+  for n in pt.need[k]:
+    var found = false
+    for x in parts:
+      if x == n:
+        found = true
+        break
+    if not found: return false
+  if pt.tail[k]:
+    let a = pt.alts[k]
+    let seg = a[a.len - 1]
+    let part = parts[parts.len - 1]
+    if part != seg:
+      if not dot and part.startswith(".") and not seg.startswith("."): return false
+      if not match_seg(seg, 0, seg.len, part, 0, part.len): return false
+  return match_segs(pt.alts[k], 0, parts, 0, dot)
 
 # Whether any of the patterns matches (the path split once).
 fn matches_any(pats: [Pat], path: Str, dot: Bool) -> Bool:
@@ -409,3 +439,91 @@ fn to_regex(p: Str) -> Str:
     else: out += rx_escape(c)
     i += 1
   return out
+
+# ---- pattern sets indexed by their static prefix
+
+# A set of patterns where each is tried only on paths it can match: a pattern's literal folders
+# before its first glob character ("packages/x/" in "packages/x/**/dist") must start the path (or
+# the path followed by '/'), so the set keeps the patterns by that prefix and looks up the path's
+# own prefixes. Patterns whose prefix is unsafe to compare as text (escapes, empty segments) are
+# tried on every path.
+type PatSet:
+  pats: [Pat]
+  by_pre: {Str: [Int]}
+  every: [Int]
+
+fn new_set() -> PatSet:
+  return PatSet([], {}, [])
+
+# the literal folders the pattern starts with ("" when there are none or they aren't plain text)
+fn safe_prefix(pattern: Str) -> Str:
+  var s = pattern
+  if s.startswith("!") and not s.startswith("!("): s = s[1..s.len]
+  if s.startswith("./"): s = s[2..s.len]
+  var last = -1
+  for k in 0..s.len:
+    let c = s[k]
+    if c == '*' or c == '?' or c == '{' or c == '[' or c == '(' or c == ']' or c == '}' or c == ')' or c == '|': break
+    if (c == '!' or c == '@' or c == '+') and k + 1 < s.len and s[k + 1] == '(': break
+    if c == '\\': return ""
+    if c == '/':
+      if k == 0 or s[k - 1] == '/': return ""
+      last = k
+  if last < 0: return ""
+  return s[0..last + 1]
+
+fn set_add(var st: PatSet, pattern: Str):
+  let k = st.pats.len
+  st.pats.push(compile(pattern))
+  let pre = safe_prefix(pattern)
+  if pre == "": st.every.push(k)
+  elif pre in st.by_pre: st.by_pre[pre].push(k)
+  else: st.by_pre[pre] = [k]
+
+fn set_len(st: PatSet) -> Int:
+  return st.pats.len
+
+fn try_one(pt: Pat, path: Str, dot: Bool, var parts: [Str], var split: Bool) -> Bool:
+  if pt.rxs.len > 0: return rx_match(pt, path, dot)
+  if pt.fast != 0: return fast_match(pt, path, dot)
+  if not split:
+    parts = path.split("/")
+    split = true
+  for k in 0..pt.alts.len:
+    if alt_matches(pt, k, parts, dot): return true
+  return false
+
+# Whether any pattern of the set matches the path.
+fn set_any(st: PatSet, path: Str, dot: Bool) -> Bool:
+  var parts: [Str] = []
+  var split = false
+  for k in st.every:
+    if try_one(st.pats[k], path, dot, &parts, &split): return true
+  if st.by_pre.len == 0: return false
+  for j in 0..path.len:
+    if path[j] == '/':
+      let key = path[0..j + 1]
+      if key in st.by_pre:
+        for k in st.by_pre[key]:
+          if try_one(st.pats[k], path, dot, &parts, &split): return true
+  let whole = path + "/"
+  if whole in st.by_pre:
+    for k in st.by_pre[whole]:
+      if try_one(st.pats[k], path, dot, &parts, &split): return true
+  return false
+
+# The one path a pattern without glob characters names ("" when it has any, or escapes).
+fn literal_path(pt: Pat, src: Str) -> Str:
+  if pt.rxs.len > 0 or pt.fast != 0 or pt.alts.len != 1: return ""
+  if src.find("\\") >= 0: return ""
+  for seg in pt.alts[0]:
+    if seg == "" or seg == "**" or is_dynamic(seg) or seg.find("]") >= 0: return ""
+  return "/".join(pt.alts[0])
+
+# Whether every alternative of the pattern is one segment without '**' (it can only match a file of
+# the project's folder).
+fn one_segment(pt: Pat) -> Bool:
+  if pt.rxs.len > 0 or pt.fast != 0 or pt.alts.len == 0: return false
+  for a in pt.alts:
+    if a.len != 1 or a[0] == "**": return false
+  return true
