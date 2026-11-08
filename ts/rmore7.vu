@@ -1,0 +1,3145 @@
+# More of oxlint's rules, ported from oxc's sources (this round's batch, by how often real
+# configurations enable them): eslint(no-unmodified-loop-condition), ...
+
+import ast
+import scan
+import lmeta
+import rules
+import rmore
+import rjest
+import rmore6
+import rmore5
+import rmore3
+import scope
+import lconf
+import lglobals
+import lmatch
+from rules import L, k, text, parent
+
+# an Int -> Int table (open addressing; keys >= 0), cheaper than a map for many entries
+type Itab:
+  k: [Int]
+  v: [Int]
+  n: Int
+
+fn itab_new(cap: Int) -> Itab:
+  var size = 16
+  while size < cap * 2: size = size * 2
+  return Itab([-1] * size, [0] * size, 0)
+
+fn itab_put(var t: Itab, key: Int, val: Int, keep: Bool):
+  let mask = t.k.len - 1
+  var j = ((key *% -7046029254386353131) >>> 32) & mask
+  while t.k[j] >= 0 and t.k[j] != key: j = (j + 1) & mask
+  if t.k[j] == key:
+    if not keep: t.v[j] = val
+    return
+  t.k[j] = key
+  t.v[j] = val
+  t.n += 1
+
+fn itab_get(t: Itab, key: Int) -> Int:
+  if t.k.len == 0: return -1
+  let mask = t.k.len - 1
+  var j = ((key *% -7046029254386353131) >>> 32) & mask
+  while t.k[j] >= 0:
+    if t.k[j] == key: return t.v[j]
+    j = (j + 1) & mask
+  return -1
+
+type C7:
+  on: Bool
+  ul_cond: Bool         # no-unmodified-loop-condition: checkConditionalExpressions
+  # the collector of no-unmodified-loop-condition: symbols, reference nodes, group (-1), independent
+  us_sym: [Int]
+  us_ref: [Int]
+  us_grp: [Int]
+  us_ind: [Bool]
+  ug_stack: [Int]
+  ug_dyn: [Int]
+  ucd: Int
+  sh_hoist: Int         # no-shadow: hoist (0 all, 1 functions, 2 functions-and-types, 3 never, 4 types)
+  sh_allow: [Str]
+  sh_tv: Bool           # ... ignoreTypeValueShadow
+  sh_ftp: Bool          # ... ignoreFunctionTypeParameterNameValueShadow
+  sh_builtin: Bool      # ... builtinGlobals
+  sh_init: Bool         # ... ignoreOnInitialization
+  envs: [Str]
+  at: Itab              # a declared name's position -> its node (built on first use)
+  at_done: Bool
+  exp_names: [Bool]     # names exported (by name id), built on first use
+  sp: [Int]             # no-shadow: each symbol's name position and declaring node (oxc's first declaration)
+  sd: [Int]
+  nsv: {Int: Bool}      # ... (name, scope) of instantiated namespaces
+  fs_arrow: Bool        # consistent-function-scoping: checkArrowFunctions
+  ti_ann: Bool          # consistent-type-imports: disallowTypeAnnotations, fixStyle inline, prefer no-type-imports
+  ti_inline: Bool
+  ti_no: Bool
+  ft_re: [lmatch.Re]    # no-fallthrough: commentPattern, allowEmptyCase, reportUnusedFallthroughComment
+  ft_empty: Bool
+  ft_unused: Bool
+  cms: [Int]            # the file's comments (start, end), -1 first when not found yet
+  qs_vars: Bool         # prefer-query-selector: allowWithVariables
+  er_elseif: Bool       # no-else-return: allowElseIf
+  wsc: {Int: Int}       # no-loop-func: a write's identifier -> its scope (built on first use)
+  im_lst: Int           # no-immediate-mutation: the statement list last looked at, and its items
+  im_items: [Int]
+  im_pos: Int
+  rs_start: [Int]       # each symbol's reference events (indices into the tree's events), built on first use
+  rs_ev: [Int]
+  xs_ev: [Int]          # the export specifier events
+  ypm: Itab             # a symbol's position -> the symbol (built on first use)
+  ysx: [Int]            # each symbol's scope as oxc has it (Annex B moves sloppy block functions)
+
+fn new_c7() -> C7:
+  return C7(false, false, [], [], [], [], [], [], 0, 2, [], true, true, false, false, [], Itab([], [], 0), false, [], [], [], {}, true, true, false, false, [], false, false, [-1], false, true, {}, -1, [], 0, [], [], [], Itab([], [], 0), [])
+
+fn mine() -> [Int]:
+  return [lmeta.M_ESLINT_NO_UNMODIFIED_LOOP_CONDITION, lmeta.M_ESLINT_NO_SHADOW, lmeta.M_UNICORN_CONSISTENT_FUNCTION_SCOPING, lmeta.M_UNICORN_PREFER_SET_HAS, lmeta.M_OXC_NO_ACCUMULATING_SPREAD, lmeta.M_TYPESCRIPT_CONSISTENT_TYPE_IMPORTS, lmeta.M_ESLINT_NO_FALLTHROUGH, lmeta.M_ESLINT_NO_LOOP_FUNC, lmeta.M_UNICORN_NO_IMMEDIATE_MUTATION, lmeta.M_UNICORN_PREFER_QUERY_SELECTOR, lmeta.M_UNICORN_PREFER_NATIVE_COERCION_FUNCTIONS, lmeta.M_UNICORN_PREFER_DOM_NODE_DATASET, lmeta.M_ESLINT_NO_ELSE_RETURN]
+
+fn any_on(sev: [Int]) -> Bool:
+  for m in mine():
+    if sev[m] > 0: return true
+  return false
+
+fn on(l: L, m: Int) -> Bool:
+  return l.en.len > 0 and l.en[m]
+
+fn want(var nk: [Bool], kinds: [Int]):
+  for x in kinds: nk[x] = true
+
+fn setup(var l: L, sev: [Int], opts: [Str], var nk: [Bool]) -> Bool:
+  if not any_on(sev): return false
+  var c = new_c7()
+  c.on = true
+  if sev[lmeta.M_ESLINT_NO_UNMODIFIED_LOOP_CONDITION] > 0:
+    want(&nk, [ast.N_WHILE, ast.N_DO, ast.N_FOR])
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_ESLINT_NO_UNMODIFIED_LOOP_CONDITION], &js)
+    c.ul_cond = rmore.obool(js, o, "checkConditionalExpressions", false)
+  if sev[lmeta.M_ESLINT_NO_SHADOW] > 0:
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_ESLINT_NO_SHADOW], &js)
+    let h = rmore.ostr(js, o, "hoist", "functions-and-types")
+    if h == "all": c.sh_hoist = 0
+    elif h == "functions": c.sh_hoist = 1
+    elif h == "never": c.sh_hoist = 3
+    elif h == "types": c.sh_hoist = 4
+    c.sh_allow = rmore.ostrs(js, o, "allow")
+    c.sh_tv = rmore.obool(js, o, "ignoreTypeValueShadow", true)
+    c.sh_ftp = rmore.obool(js, o, "ignoreFunctionTypeParameterNameValueShadow", true)
+    c.sh_builtin = rmore.obool(js, o, "builtinGlobals", false)
+    c.sh_init = rmore.obool(js, o, "ignoreOnInitialization", false)
+    if opts.len >= 4:
+      let e = opts[opts.len - 3]
+      if e != "": c.envs = e.split("\n")
+  if sev[lmeta.M_UNICORN_CONSISTENT_FUNCTION_SCOPING] > 0:
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_UNICORN_CONSISTENT_FUNCTION_SCOPING], &js)
+    c.fs_arrow = rmore.obool(js, o, "checkArrowFunctions", true)
+  if sev[lmeta.M_UNICORN_PREFER_SET_HAS] > 0: want(&nk, [ast.N_DECL])
+  if sev[lmeta.M_OXC_NO_ACCUMULATING_SPREAD] > 0: want(&nk, [ast.N_SPREAD])
+  if sev[lmeta.M_ESLINT_NO_ELSE_RETURN] > 0:
+    want(&nk, [ast.N_IF])
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_ESLINT_NO_ELSE_RETURN], &js)
+    c.er_elseif = rmore.obool(js, o, "allowElseIf", true)
+  if sev[lmeta.M_UNICORN_PREFER_DOM_NODE_DATASET] > 0: want(&nk, [ast.N_CALL])
+  if sev[lmeta.M_UNICORN_PREFER_NATIVE_COERCION_FUNCTIONS] > 0: want(&nk, [ast.N_ARROW, ast.N_FUNC, ast.N_FUNCEXPR, ast.N_METHOD, ast.N_GET, ast.N_SET, ast.N_CTOR])
+  if sev[lmeta.M_UNICORN_PREFER_QUERY_SELECTOR] > 0:
+    want(&nk, [ast.N_CALL])
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_UNICORN_PREFER_QUERY_SELECTOR], &js)
+    c.qs_vars = rmore.obool(js, o, "allowWithVariables", false)
+  if sev[lmeta.M_UNICORN_NO_IMMEDIATE_MUTATION] > 0: want(&nk, [ast.N_EXPRSTMT])
+  if sev[lmeta.M_ESLINT_NO_LOOP_FUNC] > 0: want(&nk, [ast.N_WHILE, ast.N_DO, ast.N_FOR, ast.N_FORIN])
+  if sev[lmeta.M_ESLINT_NO_FALLTHROUGH] > 0:
+    want(&nk, [ast.N_SWITCH])
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_ESLINT_NO_FALLTHROUGH], &js)
+    let cp = rmore.ostr(js, o, "commentPattern", "\0")
+    if cp != "\0": c.ft_re.push(lmatch.compile(cp, "iu"))
+    c.ft_empty = rmore.obool(js, o, "allowEmptyCase", false)
+    c.ft_unused = rmore.obool(js, o, "reportUnusedFallthroughComment", false)
+  if sev[lmeta.M_TYPESCRIPT_CONSISTENT_TYPE_IMPORTS] > 0:
+    want(&nk, [ast.N_IMPORT, ast.N_TIMPORT])
+    var js = lconf.Json([], "", "")
+    let o = rmore.first_obj(opts[lmeta.M_TYPESCRIPT_CONSISTENT_TYPE_IMPORTS], &js)
+    c.ti_ann = rmore.obool(js, o, "disallowTypeAnnotations", true)
+    c.ti_inline = rmore.ostr(js, o, "fixStyle", "") == "inline-type-imports"
+    c.ti_no = rmore.ostr(js, o, "prefer", "") == "no-type-imports"
+  l.mc.c7 = c
+  return true
+
+fn node(var l: L, n: Int, kd: Int):
+  if kd == ast.N_IF:
+    if on(l, lmeta.M_ESLINT_NO_ELSE_RETURN): else_return(&l, n)
+  if is_fn(kd):
+    if on(l, lmeta.M_UNICORN_PREFER_NATIVE_COERCION_FUNCTIONS): native_coercion(&l, n, kd)
+  if kd == ast.N_CALL:
+    if on(l, lmeta.M_UNICORN_PREFER_QUERY_SELECTOR): query_selector(&l, n)
+    if on(l, lmeta.M_UNICORN_PREFER_DOM_NODE_DATASET): dom_dataset(&l, n)
+  if kd == ast.N_EXPRSTMT:
+    if on(l, lmeta.M_UNICORN_NO_IMMEDIATE_MUTATION): immediate_mutation(&l, n)
+  if kd == ast.N_WHILE or kd == ast.N_DO or kd == ast.N_FOR or kd == ast.N_FORIN:
+    if on(l, lmeta.M_ESLINT_NO_LOOP_FUNC): loop_func(&l, n, kd)
+  if kd == ast.N_SWITCH:
+    if on(l, lmeta.M_ESLINT_NO_FALLTHROUGH): fallthrough(&l, n)
+  if kd == ast.N_IMPORT or kd == ast.N_TIMPORT:
+    if on(l, lmeta.M_TYPESCRIPT_CONSISTENT_TYPE_IMPORTS) and l.ts and l.jend < 0: type_imports(&l, n, kd)
+  if kd == ast.N_SPREAD:
+    if on(l, lmeta.M_OXC_NO_ACCUMULATING_SPREAD): acc_spread(&l, n)
+  if kd == ast.N_DECL:
+    if on(l, lmeta.M_UNICORN_PREFER_SET_HAS): set_has(&l, n)
+  if kd == ast.N_WHILE:
+    if on(l, lmeta.M_ESLINT_NO_UNMODIFIED_LOOP_CONDITION): loop_cond(&l, n, l.t.nd[n].a, -1)
+  elif kd == ast.N_DO:
+    if on(l, lmeta.M_ESLINT_NO_UNMODIFIED_LOOP_CONDITION): loop_cond(&l, n, l.t.nd[n].b, -1)
+  elif kd == ast.N_FOR:
+    if on(l, lmeta.M_ESLINT_NO_UNMODIFIED_LOOP_CONDITION) and l.t.nd[n].b > 0: loop_cond(&l, n, l.t.nd[n].b, l.t.nd[n].a)
+
+fn file_end(var l: L, root: Int, path: Str):
+  if on(l, lmeta.M_ESLINT_NO_SHADOW): no_shadow(&l, path)
+  if on(l, lmeta.M_UNICORN_CONSISTENT_FUNCTION_SCOPING) and not l.dts: fn_scoping(&l)
+
+fn is_fn(kd: Int) -> Bool:
+  return kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR
+
+fn pkind(var l: L, n: Int) -> Int:
+  let p = parent(&l, n)
+  return k(l, p)
+
+fn list_of(l: L, lst: Int) -> [Int]:
+  if lst <= 0: return []
+  return ast.items(l.t, lst)
+
+# a member access or call in an optional chain (a ?. on its spine of objects and callees)
+fn in_chain(l: L, n: Int) -> Bool:
+  var x = n
+  while x > 0:
+    let kd = l.t.nd[x].k
+    if kd == ast.N_CALL or kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS:
+      if (l.t.nd[x].f & 1) != 0: return true
+    elif kd != ast.N_NONNULL: return false
+    x = l.t.nd[x].a
+  return false
+
+# ---- no-unmodified-loop-condition
+
+fn ul_push(var l: L, n: Int):
+  let y = scope.res_of(l.sc, n)
+  if y < 0: return
+  var g = -1
+  if l.mc.c7.ug_stack.len > 0: g = l.mc.c7.ug_stack[0]
+  l.mc.c7.us_sym.push(y)
+  l.mc.c7.us_ref.push(n)
+  l.mc.c7.us_grp.push(g)
+  l.mc.c7.us_ind.push(l.mc.c7.ucd > 0)
+
+fn ul_logical(op: Int) -> Bool:
+  return op == scan.T_AND or op == scan.T_OR or op == scan.T_QQ or op == scan.T_COMMA or rules.is_assign_op(op)
+
+fn ul_walk(var l: L, n: Int):
+  if n <= 0: return
+  let kd = l.t.nd[n].k
+  if kd == ast.N_ID:
+    ul_push(&l, n)
+    return
+  if kd == ast.N_SHORTHAND:
+    ul_push(&l, n)
+    ul_walk(&l, l.t.nd[n].b)
+    return
+  let ckc = l.mc.c7.ul_cond and kd == ast.N_COND
+  let grp = (kd == ast.N_BINARY and not ul_logical(l.t.nd[n].f)) or (kd == ast.N_COND and not ckc)
+  if (kd == ast.N_CALL or kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS) and in_chain(l, n):
+    # the top of an optional chain: oxc visits a ChainExpression's element without visit_expression
+    ul_member(&l, n)
+    return
+  if kd == ast.N_CALL or kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS or kd == ast.N_NEW or kd == ast.N_TAGGED or kd == ast.N_YIELD:
+    ul_dyn(&l)
+    return
+  if kd == ast.N_FUNCEXPR or kd == ast.N_ARROW or kd == ast.N_CLASSEXPR: return
+  if grp: l.mc.c7.ug_stack.push(n)
+  if ckc: l.mc.c7.ucd += 1
+  if kd == ast.N_BINARY and rules.is_assign_op(l.t.nd[n].f):
+    ul_target(&l, l.t.nd[n].a)
+    ul_walk(&l, l.t.nd[n].b)
+  elif (kd == ast.N_PREFIX or kd == ast.N_POSTFIX) and (l.t.nd[n].f == scan.T_INC or l.t.nd[n].f == scan.T_DEC):
+    ul_target(&l, l.t.nd[n].a)
+  elif kd == ast.N_BINARY or kd == ast.N_COND:
+    ul_walk(&l, l.t.nd[n].a)
+    ul_walk(&l, l.t.nd[n].b)
+    if kd == ast.N_COND: ul_walk(&l, l.t.nd[n].c)
+  elif kd == ast.N_PAREN or kd == ast.N_NONNULL or kd == ast.N_AS or kd == ast.N_SATISFIES or kd == ast.N_TYPEASSERT or kd == ast.N_TYPEOF or kd == ast.N_VOIDEXPR or kd == ast.N_DELETE or kd == ast.N_AWAIT or kd == ast.N_PREFIX or kd == ast.N_POSTFIX or kd == ast.N_SPREAD or kd == ast.N_EXPRTARGS or kd == ast.N_COMPUTED:
+    ul_walk(&l, l.t.nd[n].a)
+  elif kd == ast.N_ARRAY:
+    for x in list_of(l, l.t.nd[n].a): ul_walk(&l, x)
+  elif kd == ast.N_OBJECT:
+    for x in list_of(l, l.t.nd[n].a):
+      let xk = k(l, x)
+      if xk == ast.N_PROPASSIGN:
+        if k(l, l.t.nd[x].a) == ast.N_COMPUTED: ul_walk(&l, l.t.nd[x].a)
+        ul_walk(&l, l.t.nd[x].b)
+      elif xk == ast.N_SHORTHAND or xk == ast.N_SPREAD: ul_walk(&l, x)
+      elif xk == ast.N_METHOD or xk == ast.N_GET or xk == ast.N_SET:
+        if k(l, l.t.nd[x].a) == ast.N_COMPUTED: ul_walk(&l, l.t.nd[x].a)
+  elif kd == ast.N_TEMPL:
+    for x in list_of(l, l.t.nd[n].a): ul_walk(&l, l.t.nd[x].a)
+  elif kd == ast.N_IMPORTCALL:
+    for x in list_of(l, l.t.nd[n].c): ul_walk(&l, x)
+  if ckc: l.mc.c7.ucd -= 1
+  if grp: l.mc.c7.ug_stack.pop()
+
+fn ul_dyn(var l: L):
+  if l.mc.c7.ug_stack.len > 0:
+    let g = l.mc.c7.ug_stack[0]
+    if not (g in l.mc.c7.ug_dyn): l.mc.c7.ug_dyn.push(g)
+
+# a member's (or call's) parts, the member itself not counting as dynamic (the rest of a chain does)
+fn ul_member(var l: L, n: Int):
+  let kd = l.t.nd[n].k
+  let o = l.t.nd[n].a
+  let ok = k(l, o)
+  if (ok == ast.N_CALL or ok == ast.N_PROPACCESS or ok == ast.N_ELEMACCESS) and in_chain(l, o): ul_dyn(&l)
+  else: ul_walk(&l, o)
+  if kd == ast.N_ELEMACCESS: ul_walk(&l, l.t.nd[n].b)
+  elif kd == ast.N_CALL:
+    for x in list_of(l, l.t.nd[n].c): ul_walk(&l, x)
+
+# an assignment target: oxc visits a member target without visit_expression
+fn ul_target(var l: L, n: Int):
+  if n <= 0: return
+  let kd = l.t.nd[n].k
+  if kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS: ul_member(&l, n)
+  elif kd == ast.N_PAREN: ul_target(&l, l.t.nd[n].a)
+  elif kd == ast.N_ARRAY:
+    for x in list_of(l, l.t.nd[n].a): ul_target(&l, x)
+  elif kd == ast.N_OBJECT:
+    for x in list_of(l, l.t.nd[n].a):
+      let xk = k(l, x)
+      if xk == ast.N_PROPASSIGN:
+        if k(l, l.t.nd[x].a) == ast.N_COMPUTED: ul_walk(&l, l.t.nd[x].a)
+        ul_target(&l, l.t.nd[x].b)
+      elif xk == ast.N_SPREAD: ul_target(&l, l.t.nd[x].a)
+      else: ul_walk(&l, x)
+  elif kd == ast.N_SPREAD: ul_target(&l, l.t.nd[n].a)
+  elif kd == ast.N_BINARY and l.t.nd[n].f == scan.T_ASSIGN:
+    ul_target(&l, l.t.nd[n].a)
+    ul_walk(&l, l.t.nd[n].b)
+  else: ul_walk(&l, n)
+
+fn ul_in_loop(var l: L, lp: Int, init: Int, r: Int) -> Bool:
+  let p = l.t.nd[r].pos
+  let e = l.t.nd[r].end
+  if p < l.t.nd[lp].pos or e > l.t.nd[lp].end: return false
+  if init > 0 and p >= l.t.nd[init].pos and e <= l.t.nd[init].end: return false
+  var a = parent(&l, r)
+  while a > 0:
+    if a == lp: return true
+    if is_fn(k(l, a)): return false
+    a = parent(&l, a)
+  return true
+
+fn ul_called(var l: L, lp: Int, init: Int, w: Int) -> Bool:
+  var a = parent(&l, w)
+  while a > 0:
+    if k(l, a) == ast.N_FUNC:
+      if l.t.nd[a].s < 0 or not (a in l.sc.fsym): return false
+      let fy = l.sc.fsym[a]
+      for r in rjest.refs_of(&l, fy):
+        if not ul_in_loop(&l, lp, init, r): continue
+        let p = parent(&l, r)
+        let pk = k(l, p)
+        if (pk == ast.N_CALL or pk == ast.N_NEW or pk == ast.N_TAGGED) and l.t.nd[p].a == r: return true
+      return false
+    a = parent(&l, a)
+  return false
+
+fn ul_modified(var l: L, y: Int, lp: Int, init: Int, var cache: {Int: Bool}) -> Bool:
+  if y in cache: return cache[y]
+  var m = false
+  for w in rules.sym_writes(&l, y):
+    if ul_in_loop(&l, lp, init, w) or ul_called(&l, lp, init, w):
+      m = true
+      break
+  cache[y] = m
+  return m
+
+fn loop_cond(var l: L, lp: Int, cond: Int, init: Int):
+  l.mc.c7.us_sym = []
+  l.mc.c7.us_ref = []
+  l.mc.c7.us_grp = []
+  l.mc.c7.us_ind = []
+  l.mc.c7.ug_stack = []
+  l.mc.c7.ug_dyn = []
+  l.mc.c7.ucd = 0
+  ul_walk(&l, cond)
+  let cnt = l.mc.c7.us_sym.len
+  if cnt == 0: return
+  # standalone symbols, and each group's (groups in the order they first appear)
+  var sa: [Int] = []
+  var seen: {Int: Bool} = {}
+  var gorder: [Int] = []
+  var gitems: {Int: [Int]} = {}
+  var gseen: {Int: {Int: Bool}} = {}
+  for i in 0..cnt:
+    let y = l.mc.c7.us_sym[i]
+    let g = l.mc.c7.us_grp[i]
+    let ind = l.mc.c7.us_ind[i]
+    if g >= 0:
+      if not (g in gitems):
+        gitems[g] = []
+        gseen[g] = {}
+        gorder.push(g)
+      if ind or not (y in gseen[g]):
+        gseen[g][y] = true
+        gitems[g].push(i)
+    elif ind or not (y in seen):
+      seen[y] = true
+      sa.push(i)
+  var cache: {Int: Bool} = {}
+  var out: [Int] = []
+  var reported: {Int: Bool} = {}
+  for i in sa:
+    let y = l.mc.c7.us_sym[i]
+    if ul_modified(&l, y, lp, init, &cache): continue
+    if l.mc.c7.us_ind[i] or not (y in reported):
+      reported[y] = true
+      out.push(l.mc.c7.us_ref[i])
+  for g in gorder:
+    if g in l.mc.c7.ug_dyn: continue
+    let its = gitems[g]
+    var any = false
+    for i in its:
+      if ul_modified(&l, l.mc.c7.us_sym[i], lp, init, &cache):
+        any = true
+        break
+    if any: continue
+    for i in its:
+      let y = l.mc.c7.us_sym[i]
+      if l.mc.c7.us_ind[i] or not (y in reported):
+        reported[y] = true
+        out.push(l.mc.c7.us_ref[i])
+  for r in out:
+    if k(l, r) != ast.N_ID: continue
+    rules.addn(&l, r, "eslint(no-unmodified-loop-condition)", "'{text(l, r)}' is not modified in this loop.", "")
+
+# ---- symbols' scopes
+
+# a JavaScript file is a module as oxc decides it: .mjs, not .cjs, else module syntax at the top
+# level or import.meta anywhere
+fn js_module(var l: L) -> Bool:
+  let p = l.abs.lower()
+  if p.endswith(".mjs"): return true
+  if p.endswith(".cjs"): return false
+  let root = rmore5.file_root(&l)
+  for st in list_of(l, root):
+    let kd = l.t.nd[st].k
+    if kd == ast.N_IMPORT or kd == ast.N_EXPORT or kd == ast.N_EXPORTDEFAULT or kd == ast.N_EXPORTASSIGN: return true
+    if kd == ast.N_VAR and (l.t.nd[st].d & ast.M_EXPORT) != 0: return true
+    if (kd == ast.N_FUNC or kd == ast.N_CLASS) and (l.t.nd[st].f & ast.M_EXPORT) != 0: return true
+  if l.src.find("import") < 0: return false
+  for x in 1..l.t.nd.len:
+    if l.t.nd[x].k == ast.N_METAPROP and l.t.nd[x].f == scan.W_IMPORT: return true
+  return false
+
+# oxc's scope for each symbol: as vlint's, except that a plain function declared in a block of
+# sloppy JavaScript moves to the var scope (Annex B.3.2.1) when that has no binding of the name yet
+fn sym_scopes(var l: L):
+  if l.mc.c7.ysx.len == l.sc.ys.len: return
+  var out: [Int] = []
+  for s in l.sc.ys: out.push(s)
+  if not l.ts and not js_module(&l):
+    for y in 0..out.len:
+      if l.sc.yk[y] != scope.Y_FUNC: continue
+      let s = out[y]
+      if s < 0 or l.sc.sk[s] != ast.S_BLOCK: continue
+      let d = decl_at(&l, l.sc.ypos[y])
+      if d <= 0 or k(l, d) != ast.N_FUNC or l.t.nd[d].d <= 0: continue
+      if (l.t.nd[d].f & (ast.M_ASYNC | ast.M_GENERATOR)) != 0: continue
+      let vs = l.sc.sfn[s]
+      let v = scope.tab_get(l.sc, vs, l.sc.yn[y], false)
+      if v >= 0 and l.sc.ypos[v] < l.sc.ypos[y]: continue
+      let t = scope.tab_get(l.sc, vs, l.sc.yn[y], true)
+      if t >= 0 and l.sc.ypos[t] < l.sc.ypos[y]: continue
+      if rmore6.strict_at(&l, d): continue
+      out[y] = vs
+  l.mc.c7.ysx = out
+
+# ---- eslint(no-shadow)
+
+# the node that declares the name at pos (a binding identifier, a declaration with its name at pos,
+# a type parameter, an import specifier, a string enum member's name)
+fn decl_at(var l: L, pos: Int) -> Int:
+  if not l.mc.c7.at_done:
+    l.mc.c7.at_done = true
+    var m = itab_new(l.t.nd.len / 2 + 16)
+    var strs: [Int] = []
+    var specs: [Int] = []
+    for x in 1..l.t.nd.len:
+      let xk = l.t.nd[x].k
+      if xk == ast.N_ID or xk == ast.N_TPARAM: itab_put(&m, l.t.nd[x].pos, x, true)
+      elif xk == ast.N_SPEC: specs.push(x)
+      elif xk == ast.N_STR or xk == ast.N_FUNCEXPR or xk == ast.N_CLASSEXPR: strs.push(x)
+    for x in specs:
+      let nm = l.t.nd[x].s
+      if nm >= 0: itab_put(&m, l.t.nd[x].end - l.t.names[nm].len, x, false)
+    for x, p in l.t.npos: itab_put(&m, p, x, false)
+    for x in strs: itab_put(&m, l.t.nd[x].pos, x, true)
+    l.mc.c7.at = m
+  if pos < 0: return -1
+  return itab_get(l.mc.c7.at, pos)
+
+# each scope's function or class node (-1 for the others)
+fn scope_nodes(l: L) -> [Int]:
+  var out: [Int] = []
+  for e in l.t.sv.d:
+    if e.k == ast.D_SCOPE: out.push(e.n)
+  return out
+
+# where the name is (a function or class expression's symbol is at its node)
+fn name_pos(l: L, y: Int) -> Int:
+  let p = l.sc.ypos[y]
+  let kd = l.sc.yk[y]
+  if kd != scope.Y_FNNAME and kd != scope.Y_CLASSNAME: return p
+  let nm = l.t.names[l.sc.yn[y]]
+  if l.src.find(nm, p) == p: return p
+  var kw = "function"
+  if kd == scope.Y_CLASSNAME: kw = "class"
+  var i = l.src.find(kw, p)
+  if i < 0: return p
+  i += kw.len
+  let n = l.src.len
+  while i < n:
+    let c = l.src[i]
+    if c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '*': i += 1
+    elif c == '/' and i + 1 < n and l.src[i + 1] == '*':
+      let e = l.src.find("*/", i + 2)
+      if e < 0: return p
+      i = e + 2
+    elif c == '/' and i + 1 < n and l.src[i + 1] == '/':
+      let e = l.src.find("\n", i)
+      if e < 0: return p
+      i = e + 1
+    else: return i
+  return p
+
+fn sym_name(l: L, y: Int) -> Str:
+  return l.t.names[l.sc.yn[y]]
+
+fn sym_end(var l: L, y: Int) -> Int:
+  let d = l.mc.c7.sd[y]
+  if d > 0 and l.t.nd[d].k == ast.N_STR: return l.t.nd[d].end
+  return l.mc.c7.sp[y] + l.t.names[l.sc.yn[y]].len
+
+fn ns_instantiated(l: L, m: Int) -> Bool:
+  let body = l.t.nd[m].b
+  if body <= 0:
+    let b = l.t.nd[m].b
+    return false
+  for st in list_of(l, body):
+    let sk = l.t.nd[st].k
+    if sk == ast.N_INTERFACE or sk == ast.N_TYPEALIAS or sk == ast.N_EMPTY: continue
+    if sk == ast.N_IMPORT or sk == ast.N_EXPORT:
+      if (l.t.nd[st].f & ast.M_TYPEONLY) != 0: continue
+      return true
+    if sk == ast.N_MODULE:
+      if ns_instantiated(l, st): return true
+      continue
+    return true
+  return false
+
+fn sh_is_value(var l: L, y: Int) -> Bool:
+  let kd = l.sc.yk[y]
+  if (kd == scope.Y_TYPE or kd == scope.Y_INTERFACE or kd == scope.Y_NAMESPACE) and l.mc.c7.nsv.len > 0:
+    if ((l.sc.yn[y] << 24) | l.sc.ys[y]) in l.mc.c7.nsv: return true
+  if kd == scope.Y_TYPE or kd == scope.Y_INTERFACE or kd == scope.Y_TPARAM or kd == scope.Y_IMPORTTYPE: return false
+  if kd == scope.Y_NAMESPACE: return false
+  return true
+
+fn sh_by_type(l: L, y: Int) -> Bool:
+  let kd = l.sc.yk[y]
+  if (l.sc.yf[y] & scope.F_TYPED) != 0: return true
+  return kd == scope.Y_TYPE or kd == scope.Y_INTERFACE or kd == scope.Y_TPARAM or kd == scope.Y_IMPORTTYPE or kd == scope.Y_IMPORT or kd == scope.Y_CLASS or kd == scope.Y_CLASSNAME or kd == scope.Y_ENUM or kd == scope.Y_MEMBER or kd == scope.Y_NAMESPACE
+
+fn sh_type_only(var l: L, y: Int) -> Bool:
+  return sh_by_type(l, y) and not sh_is_value(&l, y)
+
+fn is_sentinel(kd: Int) -> Bool:
+  return is_fn(kd) or kd == ast.N_CLASS or kd == ast.N_CLASSEXPR or kd == ast.N_TRY or kd == ast.N_IMPORT or kd == ast.N_EXPORT or kd == ast.N_EXPORTDEFAULT
+
+fn bodyless(l: L, f: Int) -> Bool:
+  let kd = l.t.nd[f].k
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR: return l.t.nd[f].d <= 0
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR: return l.t.nd[f].c <= 0
+  return false
+
+# the declaration is inside a type's signature, or a function without a body
+fn fn_type_param(var l: L, y: Int) -> Bool:
+  var a = l.mc.c7.sd[y]
+  if a <= 0: return false
+  a = parent(&l, a)
+  while a > 0:
+    let kd = l.t.nd[a].k
+    if kd == ast.N_CALLSIG or kd == ast.N_CTORSIG or kd == ast.N_TFUNC: return true
+    if kd == ast.N_METHOD:
+      let pa = parent(&l, a)
+      let pk = k(l, pa)
+      if pk == ast.N_INTERFACE or pk == ast.N_TOBJ: return true
+    if is_fn(kd) and bodyless(l, a): return true
+    a = parent(&l, a)
+  return false
+
+fn static_method_generic(var l: L, y: Int) -> Bool:
+  if l.sc.yk[y] != scope.Y_TPARAM: return false
+  let d = l.mc.c7.sd[y]
+  if d <= 0: return false
+  var a = parent(&l, d)
+  # (the type parameter list's owner: a function, then the method)
+  while a > 0 and k(l, a) == ast.N_SIG: a = parent(&l, a)
+  if k(l, a) == ast.N_METHOD: return (l.t.nd[a].f & ast.M_STATIC) != 0
+  return false
+
+fn in_dts_declare(var l: L, y: Int) -> Bool:
+  var a = l.mc.c7.sd[y]
+  if a <= 0: return false
+  while a > 0:
+    let kd = l.t.nd[a].k
+    if kd == ast.N_VAR or kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS:
+      if (l.t.nd[a].d & ast.M_DECLARE) != 0: return true
+    elif kd == ast.N_FUNC or kd == ast.N_FUNCEXPR:
+      if (l.t.nd[a].f & ast.M_DECLARE) != 0 or l.t.nd[a].d <= 0: return true
+    elif kd == ast.N_CLASS or kd == ast.N_CLASSEXPR or kd == ast.N_ENUM or kd == ast.N_MODULE:
+      if (l.t.nd[a].f & ast.M_DECLARE) != 0: return true
+    a = parent(&l, a)
+  return false
+
+fn in_global_aug(var l: L, y: Int) -> Bool:
+  var a = l.mc.c7.sd[y]
+  while a > 0:
+    if l.t.nd[a].k == ast.N_MODULE and (l.t.nd[a].f & ast.MOD_GLOBAL) != 0: return true
+    a = parent(&l, a)
+  return false
+
+fn sh_find(l: L, y: Int) -> Int:
+  let nm = l.sc.yn[y]
+  var s = l.sc.sp[l.sc.ys[y]]
+  while s >= 0:
+    let v = scope.tab_get(l.sc, s, nm, false)
+    if v >= 0: return v
+    let t = scope.tab_get(l.sc, s, nm, true)
+    if t >= 0: return t
+    s = l.sc.sp[s]
+  return -1
+
+fn is_fn_decl(var l: L, y: Int) -> Bool:
+  let d = l.mc.c7.sd[y]
+  return d > 0 and k(l, d) == ast.N_FUNC and l.t.nd[d].d > 0
+
+fn is_hoisted_type(l: L, y: Int) -> Bool:
+  let d = l.mc.c7.sd[y]
+  return d > 0 and (l.t.nd[d].k == ast.N_INTERFACE or l.t.nd[d].k == ast.N_TYPEALIAS)
+
+fn in_tdz(var l: L, y: Int, o: Int) -> Bool:
+  if sym_end(&l, y) >= l.mc.c7.sp[o]: return false
+  let h = l.mc.c7.sh_hoist
+  if h == 0: return false
+  if h == 3: return true
+  if h == 1: return not is_fn_decl(&l, o)
+  if h == 4: return not is_hoisted_type(l, o)
+  return not is_fn_decl(&l, o) and not is_hoisted_type(l, o)
+
+fn ambient(var l: L, n: Int) -> Bool:
+  if l.dts: return true
+  var a = n
+  while a > 0:
+    let kd = l.t.nd[a].k
+    if (kd == ast.N_CLASS or kd == ast.N_MODULE or kd == ast.N_FUNC or kd == ast.N_ENUM) and (l.t.nd[a].f & ast.M_DECLARE) != 0: return true
+    if kd == ast.N_VAR and (l.t.nd[a].d & ast.M_DECLARE) != 0: return true
+    a = parent(&l, a)
+  return false
+
+# a reference in a type (oxc's Type references: type annotations, typeof in types, implements and
+# interface heritage, computed keys of type members)
+fn ref_is_type(var l: L, x: Int) -> Bool:
+  var c = x
+  var a = parent(&l, x)
+  while a > 0:
+    let kd = l.t.nd[a].k
+    if kd == ast.N_TSPAN:
+      let pa = parent(&l, a)
+      return k(l, pa) == ast.N_TTEMPLATE
+    if kd == ast.N_QNAME or kd == ast.N_PROPACCESS:
+      c = a
+      a = parent(&l, a)
+      continue
+    if kd >= ast.N_TREF and kd <= ast.N_TREST and kd != ast.N_TSPAN: return true
+    if kd == ast.N_EXPRTARGS:
+      let p = parent(&l, a)
+      let pk = k(l, p)
+      if pk == ast.N_INTERFACE: return true
+      if (pk == ast.N_CLASS or pk == ast.N_CLASSEXPR) and l.t.nd[p].b != a: return true
+      # (extends in an ambient class: a value used as a type)
+      if pk == ast.N_CLASS and l.t.nd[p].b == a: return ambient(&l, p)
+      return false
+    if kd == ast.N_COMPUTED:
+      let p = parent(&l, a)
+      let pp = parent(&l, p)
+      let ppk = k(l, pp)
+      if ppk == ast.N_INTERFACE or ppk == ast.N_TOBJ: return true
+      let pk = k(l, p)
+      if (ppk == ast.N_CLASS or ppk == ast.N_CLASSEXPR) and (pk == ast.N_METHOD or pk == ast.N_GET or pk == ast.N_SET or pk == ast.N_PROP):
+        if (l.t.nd[p].f & ast.M_ABSTRACT) != 0: return true
+        if pk == ast.N_PROP and (l.t.nd[p].f & ast.M_DECLARE) != 0: return true
+        return ambient(&l, pp)
+      return false
+    return false
+  return false
+
+fn import_type_only_uses(var l: L, y: Int, o: Int) -> Bool:
+  if l.sc.yk[o] != scope.Y_IMPORT or sh_type_only(&l, y): return false
+  let rs = rjest.refs_of(&l, o)
+  if rs.len == 0: return false
+  for r in rs:
+    if not ref_is_type(&l, r): return false
+  return true
+
+fn ignore_shadow(var l: L, y: Int, o: Int) -> Bool:
+  if l.mc.c7.sh_tv:
+    let a = sh_is_value(&l, y)
+    let b = l.sc.yk[o] != scope.Y_IMPORTTYPE and sh_is_value(&l, o)
+    if a != b: return true
+  if l.mc.c7.sh_ftp and fn_type_param(&l, y): return true
+  if static_method_generic(&l, y): return true
+  return import_type_only_uses(&l, y, o)
+
+fn import_source(var l: L, y: Int) -> Str:
+  var a = l.mc.c7.sd[y]
+  while a > 0:
+    if k(l, a) == ast.N_IMPORT:
+      let m = l.t.nd[a].a
+      if k(l, m) == ast.N_STR: return rules.name_of(l, m)
+      return "\0"
+    a = parent(&l, a)
+  return "\0"
+
+fn external_merge(var l: L, y: Int, o: Int) -> Bool:
+  if not is_hoisted_type(l, y) or l.sc.yk[o] != scope.Y_IMPORTTYPE: return false
+  let src = import_source(&l, o)
+  if src == "\0": return false
+  var a = l.mc.c7.sd[y]
+  while a > 0:
+    if k(l, a) == ast.N_MODULE and (l.t.nd[a].f & ast.M_DECLARE) != 0 and k(l, l.t.nd[a].a) == ast.N_STR:
+      return rules.name_of(l, l.t.nd[a].a) == src
+    a = parent(&l, a)
+  return false
+
+# find_initializer_expression: from a binding up to its default or initializer (-1)
+fn sh_initializer(var l: L, d: Int) -> Int:
+  var a = d
+  var from = d
+  while a > 0:
+    let kd = l.t.nd[a].k
+    if kd == ast.N_PARAM:
+      if l.t.nd[a].c > 0 and from == l.t.nd[a].a: return l.t.nd[a].c
+    elif kd == ast.N_BINDEL:
+      if l.t.nd[a].c > 0 and from == l.t.nd[a].b: return l.t.nd[a].c
+    elif kd == ast.N_DECL and pkind(&l, a) == ast.N_VAR:
+      return l.t.nd[a].c
+    elif is_sentinel(kd): return -1
+    from = a
+    a = parent(&l, a)
+  return -1
+
+fn is_param_binding(var l: L, d: Int) -> Bool:
+  var a = d
+  while a > 0:
+    let kd = l.t.nd[a].k
+    if kd == ast.N_PARAM: return true
+    if is_sentinel(kd): return false
+    a = parent(&l, a)
+  return false
+
+fn is_logical(op: Int) -> Bool:
+  return op == scan.T_AND or op == scan.T_OR or op == scan.T_QQ
+
+fn fn_name_init(var l: L, y: Int, o: Int) -> Bool:
+  let yk = l.sc.yk[y]
+  if yk != scope.Y_FNNAME and yk != scope.Y_CLASSNAME: return false
+  let fx = l.mc.c7.sd[y]
+  if fx <= 0: return false
+  let od = l.mc.c7.sd[o]
+  if od <= 0: return false
+  let init = sh_initializer(&l, od)
+  if init <= 0: return false
+  if l.t.nd[init].pos > l.t.nd[fx].pos or l.t.nd[fx].end > l.t.nd[init].end: return false
+  if is_param_binding(&l, od):
+    var cur = fx
+    while true:
+      let p = parent(&l, cur)
+      let pk = k(l, p)
+      if pk == ast.N_PAREN or (pk == ast.N_BINARY and is_logical(l.t.nd[p].f)): cur = p
+      elif pk == ast.N_COND:
+        if l.t.nd[p].a == cur: break
+        cur = p
+      else: break
+    return cur == init
+  return l.sc.sp[l.sc.ys[y]] == l.sc.ys[o]
+
+# pattern_initializer_contains_location and the checks of ignoreOnInitialization
+fn pat_init_has(var l: L, pat: Int, sym: Int, loc: Int) -> Bool:
+  if pat <= 0: return false
+  let kd = l.t.nd[pat].k
+  if kd == ast.N_OBJPAT or kd == ast.N_ARRPAT:
+    for e in list_of(l, l.t.nd[pat].a):
+      if k(l, e) != ast.N_BINDEL: continue
+      let c = l.t.nd[e].c
+      if c > 0 and rules.contains(l, l.t.nd[e].b, sym) and l.t.nd[c].pos <= loc and loc <= l.t.nd[c].end: return true
+      if pat_init_has(&l, l.t.nd[e].b, sym, loc): return true
+  return false
+
+fn init_pattern(var l: L, y: Int, o: Int, snode: [Int]) -> Bool:
+  let vs = l.sc.ys[y]
+  let sn = snode[vs]
+  if sn <= 0: return false
+  let sk = k(l, sn)
+  if sk != ast.N_FUNCEXPR and sk != ast.N_ARROW: return false
+  if l.sc.sp[vs] != l.sc.ys[o]: return false
+  var ce = -1
+  var a = parent(&l, sn)
+  while a > 0:
+    if k(l, a) == ast.N_CALL:
+      ce = l.t.nd[a].end
+      break
+    a = parent(&l, a)
+  if ce < 0: return false
+  let od = l.mc.c7.sd[o]
+  if od <= 0: return false
+  var x = od
+  var from = od
+  while x > 0:
+    let kd = l.t.nd[x].k
+    if kd == ast.N_DECL and pkind(&l, x) == ast.N_VAR:
+      let c = l.t.nd[x].c
+      if c > 0 and l.t.nd[c].pos <= ce and ce <= l.t.nd[c].end: return true
+      if pat_init_has(&l, l.t.nd[x].a, od, ce): return true
+      let px = parent(&l, x)
+      let fo = parent(&l, px)
+      if k(l, fo) == ast.N_FORIN:
+        let r = l.t.nd[fo].b
+        if l.t.nd[r].pos <= ce and ce <= l.t.nd[r].end: return true
+      return false
+    if kd == ast.N_PARAM:
+      let c = l.t.nd[x].c
+      if from == l.t.nd[x].a and c > 0 and l.t.nd[c].pos <= ce and ce <= l.t.nd[c].end: return true
+    elif kd == ast.N_BINDEL:
+      let c = l.t.nd[x].c
+      if from == l.t.nd[x].b and c > 0 and l.t.nd[c].pos <= ce and ce <= l.t.nd[c].end: return true
+    elif is_sentinel(kd): return false
+    from = x
+    x = parent(&l, x)
+  return false
+
+fn builtin_global(l: L, nm: Str) -> Bool:
+  if nm in l.globals: return true
+  return lglobals.env_value(l.mc.c7.envs, nm) >= 0
+
+# oxc's symbol order: a declarator's or parameter's names when it starts, the others where they are
+fn sym_key(var l: L, y: Int) -> Int:
+  let p = l.mc.c7.sp[y]
+  var a = l.mc.c7.sd[y]
+  if a <= 0 or k(l, a) != ast.N_ID: return p
+  var x = parent(&l, a)
+  while x > 0:
+    let kd = l.t.nd[x].k
+    if kd == ast.N_DECL or kd == ast.N_PARAM: return l.t.nd[x].pos
+    if kd != ast.N_OBJPAT and kd != ast.N_ARRPAT and kd != ast.N_BINDEL: return p
+    x = parent(&l, x)
+  return p
+
+fn sh_report(var l: L, y: Int, s0: Int, e0: Int, member: Bool):
+  let nm = sym_name(l, y) + ""
+  let s = l.mc.c7.sp[y]
+  rules.add(&l, s, "eslint(no-shadow)", "'{nm}' is already declared in the upper scope.", "Consider renaming '{nm}' to avoid shadowing the variable from the outer scope.")
+  let e = sym_end(&l, y)
+  rules.label(&l, e, "'{nm}' is declared here")
+  rules.more(&l, s0, e0, "shadowed declaration is here", true)
+  if member: rules.note(&l, "Enum members are added to the enum scope, so references to '{nm}' in enum member initializers resolve to this member instead of the declaration in the upper scope.")
+  rules.order_at(&l, 0)
+
+# each symbol's name position and declaring node; a value merged into an earlier type keeps the type's
+fn sh_prep(var l: L):
+  let ny = l.sc.yn.len
+  var sp: [Int] = []
+  var sd: [Int] = []
+  for y in 0..ny:
+    let p = name_pos(l, y)
+    sp.push(p)
+    if l.sc.yk[y] == scope.Y_FNNAME or l.sc.yk[y] == scope.Y_CLASSNAME: sd.push(decl_at(&l, l.sc.ypos[y]))
+    else: sd.push(decl_at(&l, p))
+  var first: {Int: Int} = {}
+  var nsv: {Int: Bool} = {}
+  for e in l.t.sv.d:
+    if e.k == ast.D_NAMESPACE and e.n > 0 and k(l, e.n) == ast.N_MODULE and ns_instantiated(l, e.n):
+      var fn0 = l.t.nd[e.n].a
+      while fn0 > 0 and k(l, fn0) == ast.N_QNAME: fn0 = l.t.nd[fn0].a
+      if k(l, fn0) == ast.N_ID: nsv[(l.t.nd[fn0].s << 24) | e.s] = true
+    if e.k == ast.D_IFACE and e.n > 0:
+      let nn = l.t.nd[e.n]
+      let key = (nn.s << 24) | e.s
+      let np = l.t.npos.get(e.n, nn.pos)
+      if not (key in first) or np < first[key]: first[key] = np
+  if first.len > 0:
+    for y in 0..ny:
+      if (l.sc.yf[y] & scope.F_TYPED) == 0: continue
+      let key = (l.sc.yn[y] << 24) | l.sc.ys[y]
+      if key in first and first[key] < sp[y]:
+        sp[y] = first[key]
+        sd[y] = decl_at(&l, sp[y])
+  l.mc.c7.sp = sp
+  l.mc.c7.sd = sd
+  l.mc.c7.nsv = nsv
+
+fn no_shadow(var l: L, path: Str):
+  let ny = l.sc.yn.len
+  if ny == 0: return
+  sh_prep(&l)
+  let snode = scope_nodes(l)
+  var ys: [Int] = []
+  var keys: [Int] = []
+  for y in 0..ny:
+    ys.push(y)
+    keys.push(sym_key(&l, y))
+  var yp: [Int] = []
+  for x in l.mc.c7.sp: yp.push(x)
+  ys.sort(by: fn(a, b) => keys[a] < keys[b] or (keys[a] == keys[b] and yp[a] < yp[b]))
+  for y in ys:
+    if l.sc.ys[y] < 0: continue
+    let nm = sym_name(l, y) + ""
+    if nm in l.mc.c7.sh_allow: continue
+    if l.dts and in_dts_declare(&l, y): continue
+    if in_global_aug(&l, y): continue
+    let o = sh_find(l, y)
+    if o >= 0:
+      if fn_name_init(&l, y, o): continue
+      if l.mc.c7.sh_init and init_pattern(&l, y, o, snode): continue
+      if l.mc.c7.sh_hoist != 0 and in_tdz(&l, y, o): continue
+      if ignore_shadow(&l, y, o): continue
+      if external_merge(&l, y, o): continue
+      let oe = sym_end(&l, o)
+      sh_report(&l, y, l.mc.c7.sp[o], oe, l.sc.yk[y] == scope.Y_MEMBER)
+      continue
+    # a function or class expression's name, shadowed by a name in its own scope
+    let sn = snode[l.sc.ys[y]]
+    if sn > 0 and (k(l, sn) == ast.N_FUNCEXPR or k(l, sn) == ast.N_CLASSEXPR) and l.t.nd[sn].s >= 0 and l.t.names[l.t.nd[sn].s] == nm:
+      let yk = l.sc.yk[y]
+      if yk != scope.Y_FNNAME and yk != scope.Y_CLASSNAME:
+        var np = l.t.npos.get(sn, l.t.nd[sn].pos)
+        for y2 in 0..l.sc.yn.len:
+          if l.sc.ys[y2] == l.sc.ys[y] and (l.sc.yk[y2] == scope.Y_FNNAME or l.sc.yk[y2] == scope.Y_CLASSNAME): np = l.mc.c7.sp[y2]
+        sh_report(&l, y, np, np + nm.len, false)
+        continue
+    if l.mc.c7.sh_builtin and builtin_global(l, nm):
+      if l.mc.c7.sh_tv and sh_type_only(&l, y): continue
+      if l.mc.c7.sh_ftp and fn_type_param(&l, y): continue
+      if static_method_generic(&l, y): continue
+      rules.add(&l, l.mc.c7.sp[y], "eslint(no-shadow)", "'{nm}' is already a global variable.", "Consider renaming '{nm}' to avoid shadowing the global variable.")
+      let ye = sym_end(&l, y)
+      rules.span(&l, ye)
+      rules.order_at(&l, 0)
+
+# ---- unicorn(consistent-function-scoping)
+
+type Fsc7:
+  snode: [Int]          # each scope's node (functions, classes, switches; -2 - pos for a for loop)
+  sfun: [Bool]          # oxc's function scopes (functions and arrows)
+  refsc: [Int]          # a reference's scope, by node (-1)
+  nscope: {Int: Int}    # a function or class node -> its scope
+  eval_at: [Int]        # positions of direct eval calls
+  checked: {Int: Int}   # last_checked_in
+  rscopes: {Int: [Int]} # a symbol's references' scopes
+
+# the first ancestor that isn't a parenthesis, as oxc's tree has it (a function's body block is its
+# FunctionBody: -1 - the function node stands for it)
+fn paren_parent(var l: L, n: Int) -> Int:
+  if n < -1:
+    return -2 - n
+  var p = parent(&l, n)
+  while p > 0 and k(l, p) == ast.N_PAREN: p = parent(&l, p)
+  if p > 0 and k(l, p) == ast.N_BLOCK:
+    let pp = parent(&l, p)
+    if pp > 0 and is_fn(k(l, pp)) and fn_body(l, pp) == p: return -2 - pp
+  return p
+
+fn fn_body(l: L, f: Int) -> Int:
+  let kd = l.t.nd[f].k
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR: return l.t.nd[f].c
+  return l.t.nd[f].d
+
+fn scope_anc(l: L, s: Int, a: Int) -> Bool:
+  var x = l.sc.sp[s]
+  while x >= 0:
+    if x == a: return true
+    x = l.sc.sp[x]
+  return false
+
+fn is_top_or_ns(l: L, s: Int) -> Bool:
+  let kd = l.sc.sk[s]
+  return kd == ast.S_FILE or kd == ast.S_NS or kd == ast.S_GLOBAL_AUG or kd == ast.S_MODSTR
+
+fn decl_binding(var l: L, f: Int) -> Int:
+  # get_function_like_declaration: the declarator's name (a plain identifier)
+  let p = paren_parent(&l, f)
+  if p > 0 and k(l, p) == ast.N_DECL:
+    let pp = parent(&l, p)
+    if k(l, pp) == ast.N_VAR and k(l, l.t.nd[p].a) == ast.N_ID: return l.t.nd[p].a
+  return -1
+
+fn fs_refs(var l: L, f: Int, var refs: [Int], var privs: [Int], var lex: Bool):
+  # params and body (types included), not names of JSX elements; this/super/new.target outside
+  # nested functions, class field initializers and static blocks
+  let kd = l.t.nd[f].k
+  var ps = l.t.nd[f].b
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
+    let sg = l.t.nd[f].b
+    if sg > 0: ps = l.t.nd[sg].b
+  for x in list_of(l, ps): fs_walk(&l, x, 0, &refs, &privs, &lex)
+  fs_walk(&l, fn_body(l, f), 0, &refs, &privs, &lex)
+
+fn fs_walk(var l: L, n: Int, depth: Int, var refs: [Int], var privs: [Int], var lex: Bool):
+  if n <= 0: return
+  let nd = l.t.nd[n]
+  let kd = nd.k
+  if kd == ast.N_LIST:
+    for i in 0..nd.b:
+      let x = l.t.L[nd.a + i]
+      if x > 0: fs_walk(&l, x, depth, &refs, &privs, &lex)
+    return
+  if kd == ast.N_ID or kd == ast.N_SHORTHAND:
+    let y = scope.res_of(l.sc, n)
+    if y >= 0 and l.sc.ypos[y] != nd.pos: refs.push(n)
+    if kd == ast.N_SHORTHAND: fs_walk(&l, nd.b, depth, &refs, &privs, &lex)
+    return
+  if kd == ast.N_THIS or kd == ast.N_SUPER:
+    if depth == 0: lex = true
+    return
+  if kd == ast.N_METAPROP:
+    if depth == 0 and nd.f == scan.W_NEW: lex = true
+    return
+  if kd == ast.N_PRIVNAME:
+    privs.push(n)
+    return
+  if kd == ast.N_PROPACCESS:
+    if (nd.f & 4) != 0: privs.push(n)
+    fs_walk(&l, nd.a, depth, &refs, &privs, &lex)
+    return
+  if kd == ast.N_JSXELEM:
+    fs_walk(&l, nd.b, depth, &refs, &privs, &lex)
+    fs_walk(&l, nd.c, depth, &refs, &privs, &lex)
+    return
+  if kd == ast.N_JSXATTR:
+    fs_walk(&l, nd.b, depth, &refs, &privs, &lex)
+    return
+  var d2 = depth
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR or kd == ast.N_STATICBLOCK: d2 = depth + 1
+  if kd == ast.N_PROP:
+    fs_walk(&l, nd.a, depth, &refs, &privs, &lex)
+    fs_walk(&l, nd.b, depth, &refs, &privs, &lex)
+    fs_walk(&l, nd.c, depth + 1, &refs, &privs, &lex)
+    return
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET:
+    # (the key is outside the method's function)
+    fs_walk(&l, nd.a, depth, &refs, &privs, &lex)
+    fs_walk(&l, nd.b, d2, &refs, &privs, &lex)
+    fs_walk(&l, nd.c, d2, &refs, &privs, &lex)
+    return
+  fs_walk(&l, nd.a, d2, &refs, &privs, &lex)
+  fs_walk(&l, nd.b, d2, &refs, &privs, &lex)
+  fs_walk(&l, nd.c, d2, &refs, &privs, &lex)
+  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS: fs_walk(&l, nd.d, d2, &refs, &privs, &lex)
+
+# the identifier a reference event is about (-1): a reference, or an assignment's or update's name
+fn ev_ref(l: L, e: ast.Ev) -> Int:
+  if e.n <= 0 or e.n >= l.t.nd.len: return -1
+  if e.k < 64 or e.k == ast.Q_EXPDEF: return e.n
+  if e.k == ast.Q_ASSIGN or e.k == ast.Q_UPDATE:
+    let x = scope.unparen(l.t, l.t.nd[e.n].a)
+    if x > 0 and l.t.nd[x].k == ast.N_ID: return x
+  return -1
+
+fn ref_index(var l: L):
+  if l.mc.c7.rs_start.len > 0: return
+  let ny = l.sc.ypos.len
+  var cnt = [0] * (ny + 1)
+  var ys: [Int] = []
+  var xs: [Int] = []
+  let nq = l.t.sv.q.len
+  for i in 0..nq:
+    let e = l.t.sv.q[i]
+    if e.k == ast.Q_EXPSPEC and e.n > 0: xs.push(i)
+    var y = -1
+    let x = ev_ref(l, e)
+    if x > 0:
+      y = scope.res_of(l.sc, x)
+      if y >= 0 and l.t.nd[x].pos == l.sc.ypos[y]: y = -1
+    ys.push(y)
+    if y >= 0: cnt[y + 1] += 1
+  for i in 1..ny + 1: cnt[i] += cnt[i - 1]
+  var fill = [0] * (ny + 1)
+  var ev = [0] * cnt[ny]
+  for i in 0..nq:
+    let y = ys[i]
+    if y < 0: continue
+    ev[cnt[y] + fill[y]] = i
+    fill[y] += 1
+  l.mc.c7.rs_start = cnt
+  l.mc.c7.rs_ev = ev
+  l.mc.c7.xs_ev = xs
+
+# a symbol's reference events, in order
+fn sym_events(var l: L, y: Int) -> [Int]:
+  ref_index(&l)
+  var out: [Int] = []
+  if y < 0 or y + 1 >= l.mc.c7.rs_start.len: return out
+  for i in l.mc.c7.rs_start[y]..l.mc.c7.rs_start[y + 1]: out.push(l.mc.c7.rs_ev[i])
+  return out
+
+fn exp_events(var l: L) -> [Int]:
+  ref_index(&l)
+  var out: [Int] = []
+  for i in l.mc.c7.xs_ev: out.push(i)
+  return out
+
+fn fs_prep(var l: L) -> Fsc7:
+  var f = Fsc7([], [], [], {}, [], {}, {})
+  for e in l.t.sv.d:
+    if e.k == ast.D_SCOPE:
+      let sid = f.snode.len
+      f.snode.push(e.n)
+      var fun = false
+      if e.n > 0:
+        let kd = l.t.nd[e.n].k
+        fun = is_fn(kd)
+        if fun or kd == ast.N_CLASS or kd == ast.N_CLASSEXPR: f.nscope[e.n] = sid
+      f.sfun.push(fun)
+  f.refsc = [-1] * l.t.nd.len
+  for e in l.t.sv.q:
+    let x = ev_ref(l, e)
+    if x > 0 and x < l.t.nd.len: f.refsc[x] = e.s
+  for x in 1..l.t.nd.len:
+    if l.t.nd[x].k == ast.N_CALL and (l.t.nd[x].f & 1) == 0:
+      let c = l.t.nd[x].a
+      if k(l, c) == ast.N_ID and rules.name_is(l, c, "eval"): f.eval_at.push(l.t.nd[x].pos)
+  return f
+
+fn fs_referenced_in(var l: L, var f: Fsc7, y: Int, s: Int) -> Bool:
+  for i in sym_events(&l, y):
+    let e = l.t.sv.q[i]
+    let x = ev_ref(l, e)
+    if e.s == s and not in_type_scope(&l, x, f.snode[s]): return true
+  return false
+
+# a reference inside a type that has a scope of its own in oxc (vlint's parser makes none for types
+# inside declarations' annotations)
+fn in_type_scope(var l: L, x: Int, stop: Int) -> Bool:
+  var from = x
+  var a = parent(&l, x)
+  while a > 0 and a != stop:
+    let kd = l.t.nd[a].k
+    # (a class's extends clause is in the class's scope in oxc; vlint looks it up outside)
+    if (kd == ast.N_CLASS or kd == ast.N_CLASSEXPR) and l.t.nd[a].b == from: return true
+    if kd == ast.N_TFUNC or kd == ast.N_CALLSIG or kd == ast.N_CTORSIG or kd == ast.N_TMAPPED or kd == ast.N_TCOND or kd == ast.N_TYPEALIAS or kd == ast.N_INTERFACE: return true
+    if kd == ast.N_METHOD:
+      let pa = parent(&l, a)
+      let pk = k(l, pa)
+      if pk == ast.N_TOBJ or pk == ast.N_INTERFACE: return true
+    if is_fn(kd) or kd == ast.N_CLASS or kd == ast.N_CLASSEXPR: return false
+    from = a
+    a = parent(&l, a)
+  return false
+
+fn has_eval(l: L, f: Fsc7, s: Int) -> Bool:
+  let n = f.snode[s]
+  if n <= 0: return false
+  for p in f.eval_at:
+    if p >= l.t.nd[n].pos and p < l.t.nd[n].end: return true
+  return false
+
+# the class (its scope) that declares private name nm for a reference at node r
+fn priv_class_scope(var l: L, f: Fsc7, r: Int, nm: Int) -> Int:
+  var a = parent(&l, r)
+  while a > 0:
+    let kd = l.t.nd[a].k
+    if kd == ast.N_CLASS or kd == ast.N_CLASSEXPR:
+      for m in list_of(l, l.t.nd[a].d):
+        let mn = l.t.nd[m].a
+        if mn > 0 and k(l, mn) == ast.N_PRIVNAME and l.t.nd[mn].s == nm: return f.nscope.get(a, -1)
+    a = parent(&l, a)
+  return -1
+
+fn private_capture(var l: L, f: Fsc7, privs: [Int], fscope: Int, pscope: Int) -> Bool:
+  if privs.len == 0: return false
+  var dest = 0
+  var x = l.sc.sp[pscope]
+  while x >= 0:
+    let sn = f.snode[x]
+    if not (sn > 0 and (k(l, sn) == ast.N_CLASS or k(l, sn) == ast.N_CLASSEXPR)):
+      dest = x
+      break
+    x = l.sc.sp[x]
+  for r in privs:
+    let cs = priv_class_scope(&l, f, r, l.t.nd[r].s)
+    if cs < 0: continue
+    if not scope_anc(l, cs, fscope) and dest != cs and not scope_anc(l, dest, cs): return true
+  return false
+
+fn fs_iife(var l: L, n: Int) -> Bool:
+  let p1 = paren_parent(&l, n)
+  if p1 == 0: return false
+  let p2 = paren_parent(&l, p1)
+  if p2 <= 0: return false
+  let k2 = k(l, p2)
+  if k2 != ast.N_FUNC and k2 != ast.N_FUNCEXPR and k2 != ast.N_ARROW: return false
+  let c = paren_parent(&l, p2)
+  if c <= 0 or k(l, c) != ast.N_CALL: return false
+  var callee = l.t.nd[c].a
+  while k(l, callee) == ast.N_PAREN: callee = l.t.nd[callee].a
+  return l.t.nd[callee].pos <= l.t.nd[p2].pos and l.t.nd[p2].end <= l.t.nd[callee].end
+
+fn fs_hook(var l: L, f: Fsc7, n: Int, fscope: Int) -> Bool:
+  let p = parent(&l, n)
+  if k(l, p) == ast.N_CALL and rules.hook_callee(l, p) != "": return true
+  let ps = l.sc.sp[fscope]
+  if ps < 0: return false
+  let pn = f.snode[ps]
+  if pn > 0 and (k(l, pn) == ast.N_FUNC or k(l, pn) == ast.N_FUNCEXPR or k(l, pn) == ast.N_ARROW):
+    let g = parent(&l, pn)
+    if k(l, g) == ast.N_CALL: return rules.hook_callee(l, g) != ""
+  return false
+
+fn fs_short(var l: L, f: Fsc7, s: Int, var sp: Int, var se: Int) -> Str:
+  let n = f.snode[s]
+  if n < -1:
+    sp = -2 - n
+    se = sp + 3
+    return "for loop"
+  if n <= 0: return ""
+  let kd = l.t.nd[n].k
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR:
+    if l.t.nd[n].s < 0: return ""
+    var y2 = -1
+    if kd == ast.N_FUNC:
+      sp = l.t.npos.get(n, l.t.nd[n].pos)
+    else:
+      sp = fn_name_pos(l, n)
+    se = sp + l.t.names[l.t.nd[n].s].len
+    return "function"
+  if kd == ast.N_ARROW:
+    let p = parent(&l, n)
+    if k(l, p) == ast.N_DECL and pkind(&l, p) == ast.N_VAR:
+      let id = l.t.nd[p].a
+      sp = l.t.nd[id].pos
+      se = l.t.nd[id].end
+      return "arrow function"
+    if k(l, p) == ast.N_BINARY and l.t.nd[p].f == scan.T_ASSIGN:
+      let lf = l.t.nd[p].a
+      sp = l.t.nd[lf].pos
+      se = l.t.nd[lf].end
+      return "arrow function"
+    return ""
+  if kd == ast.N_CLASS or kd == ast.N_CLASSEXPR:
+    if l.t.nd[n].s < 0: return ""
+    sp = l.t.npos.get(n, l.t.nd[n].pos)
+    se = sp + l.t.names[l.t.nd[n].s].len
+    return "class"
+  if kd == ast.N_SWITCH:
+    sp = l.t.nd[n].pos
+    se = sp + 6
+    return "switch statement"
+  return ""
+
+# a function expression's name position
+fn fn_name_pos(l: L, n: Int) -> Int:
+  let nm = l.t.names[l.t.nd[n].s]
+  var i = l.src.find("function", l.t.nd[n].pos)
+  if i < 0: return l.t.nd[n].pos
+  i += 8
+  while i < l.src.len and (l.src[i] == ' ' or l.src[i] == '*' or l.src[i] == '\t' or l.src[i] == '\n' or l.src[i] == '\r'): i += 1
+  return i
+
+fn fn_scoping(var l: L):
+  var f = fs_prep(&l)
+  for s in 0..f.snode.len:
+    if not f.sfun[s]: continue
+    fs_check(&l, &f, f.snode[s], s)
+
+fn fs_check(var l: L, var f: Fsc7, n: Int, fscope: Int):
+  let kd = l.t.nd[n].k
+  var fsym = -1
+  var name = ""
+  var rs = -1
+  var re = -1
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR:
+    if fn_body(l, n) <= 0 or (l.t.nd[n].f & ast.M_DECLARE) != 0: return
+    let ps0 = l.sc.sp[fscope]
+    if ps0 >= 0 and is_top_or_ns(l, ps0): return
+    let b = decl_binding(&l, n)
+    if b > 0:
+      fsym = scope.sym_of(l.sc, b)
+      name = rules.name_of(l, b)
+      if l.t.nd[n].s >= 0:
+        if kd == ast.N_FUNC: rs = l.t.npos.get(n, l.t.nd[n].pos)
+        else: rs = fn_name_pos(l, n)
+        re = rs + l.t.names[l.t.nd[n].s].len
+      else:
+        rs = l.t.nd[n].pos
+        re = rs + 8
+    elif l.t.nd[n].s >= 0:
+      name = l.t.names[l.t.nd[n].s] + ""
+      if kd == ast.N_FUNC:
+        rs = l.t.npos.get(n, l.t.nd[n].pos)
+        fsym = l.sc.fsym.get(n, -1)
+      else:
+        rs = fn_name_pos(l, n)
+        fsym = scope.tab_get(l.sc, fscope, l.t.nd[n].s, false)
+      re = rs + name.len
+    else: return
+  elif kd == ast.N_ARROW and l.mc.c7.fs_arrow:
+    let b = decl_binding(&l, n)
+    if b <= 0: return
+    fsym = scope.sym_of(l.sc, b)
+    name = rules.name_of(l, b)
+    rs = l.t.nd[b].pos
+    re = l.t.nd[b].end
+  else: return
+  if fsym < 0: return
+  sym_scopes(&l)
+  let ss = l.mc.c7.ysx[fsym]
+  if is_top_or_ns(l, ss): return
+  let pp = paren_parent(&l, n)
+  if pp > 0 and k(l, pp) == ast.N_RETURN: return
+  let par = parent(&l, n)
+  let pk = k(l, par)
+  if (pk == ast.N_CALL or pk == ast.N_NEW) and l.t.nd[par].a != n: return
+  if fs_iife(&l, n) or fs_hook(&l, f, n, fscope): return
+  var refs: [Int] = []
+  var privs: [Int] = []
+  var lex = false
+  fs_refs(&l, n, &refs, &privs, &lex)
+  if lex and kd == ast.N_ARROW: return
+  let pscope = l.sc.sp[fscope]
+  if private_capture(&l, f, privs, fscope, pscope): return
+  let pfun = f.sfun[pscope]
+  for r in refs:
+    let y = scope.res_of(l.sc, r)
+    if y < 0: continue
+    let yk = l.sc.yk[y]
+    if yk == scope.Y_IMPORT or yk == scope.Y_IMPORTTYPE: continue
+    if f.checked.get(y, -1) == fscope: continue
+    f.checked[y] = fscope
+    let ys = l.mc.c7.ysx[y]
+    if not scope_anc(l, fscope, ys): continue
+    if y == fsym and (yk == scope.Y_FUNC or yk == scope.Y_FNNAME): continue
+    if yk == scope.Y_CLASS or yk == scope.Y_CLASSNAME:
+      var cn = decl_at(&l, l.sc.ypos[y])
+      if yk == scope.Y_CLASSNAME:
+        var a = parent(&l, r)
+        while a > 0 and not (k(l, a) == ast.N_CLASSEXPR and l.sc.ypos[y] >= l.t.nd[a].pos and l.sc.ypos[y] < l.t.nd[a].end): a = parent(&l, a)
+        cn = a
+      if cn > 0 and (k(l, cn) == ast.N_CLASS or k(l, cn) == ast.N_CLASSEXPR):
+        let cs = f.nscope.get(cn, -2)
+        if pscope >= 0 and l.sc.sp[pscope] == cs: return
+    if pfun and not has_eval(l, f, pscope) and ys != pscope:
+      var own_fn = false
+      if yk == scope.Y_FUNC or yk == scope.Y_FNNAME:
+        let dn = decl_at(&l, l.sc.ypos[y])
+        if dn > 0 and f.nscope.get(dn, -2) == pscope: own_fn = true
+        if yk == scope.Y_FNNAME and f.snode[ys] == f.snode[pscope]: own_fn = true
+      if not own_fn and not fs_referenced_in(&l, &f, y, pscope): continue
+    return
+  var ps = -1
+  var pe = -1
+  var s2 = ss
+  if l.sc.yk[fsym] == scope.Y_FNNAME and ((pk == ast.N_BINARY and rules.is_assign_op(l.t.nd[par].f)) or pk == ast.N_PROPASSIGN) and l.sc.sp[ss] >= 0: s2 = l.sc.sp[ss]
+  let kind = fs_short(&l, f, s2, &ps, &pe)
+  let msg = "Function `{name}` does not capture any variables from its parent scope"
+  let help = "Move `{name}` to the outer scope to avoid recreating it on every call."
+  if kind != "":
+    rules.add(&l, ps, "unicorn(consistent-function-scoping)", msg, help)
+    rules.label(&l, pe, "Outer scope where this function is defined")
+    rules.more(&l, rs, re, "This function does not use any variables from the parent {kind}", true)
+    rules.primary_more(&l)
+  else:
+    rules.add(&l, rs, "unicorn(consistent-function-scoping)", msg, help)
+    rules.span(&l, re)
+  rules.order_at(&l, 0)
+
+# ---- unicorn(prefer-set-has)
+
+fn array_kind(l: L, e: Int) -> Bool:
+  let kd = k(l, e)
+  if kd == ast.N_ARRAY: return true
+  if kd == ast.N_NEW: return k(l, l.t.nd[e].a) == ast.N_ID and rules.name_is(l, l.t.nd[e].a, "Array")
+  if kd == ast.N_CALL:
+    var c = l.t.nd[e].a
+    while k(l, c) == ast.N_PAREN: c = l.t.nd[c].a
+    let ck = k(l, c)
+    if ck == ast.N_PROPACCESS:
+      if (l.t.nd[c].f & 5) != 0: return false
+      let nm = rules.name_of(l, c)
+      if (nm == "of" or nm == "from") and k(l, l.t.nd[c].a) == ast.N_ID and rules.name_is(l, l.t.nd[c].a, "Array"): return true
+      for m in ["concat", "copyWithin", "fill", "filter", "flat", "flatMap", "map", "reverse", "slice", "sort", "splice", "toReversed", "toSorted", "toSpliced", "with"]:
+        if nm == m: return true
+      return false
+    if ck == ast.N_ELEMACCESS: return false
+    return ck == ast.N_ID and rules.name_is(l, c, "Array")
+  return false
+
+fn exported_name(var l: L, d: Int, nm: Int) -> Bool:
+  let v = parent(&l, d)
+  if k(l, v) == ast.N_VAR and (l.t.nd[v].d & ast.M_EXPORT) != 0: return true
+  if l.mc.c7.exp_names.len == 0:
+    var ex = [false] * (l.t.names.len + 1)
+    for x in 1..l.t.nd.len:
+      if l.t.nd[x].k == ast.N_EXPORT:
+        # (oxc looks the name up among the exported names: export { other as name } counts)
+        let c = l.t.nd[x].c
+        if c > 0 and l.t.nd[c].s >= 0: ex[l.t.nd[c].s] = true
+        for sp in list_of(l, l.t.nd[x].b):
+          if l.t.nd[sp].s >= 0: ex[l.t.nd[sp].s] = true
+    l.mc.c7.exp_names = ex
+  return nm >= 0 and nm < l.mc.c7.exp_names.len and l.mc.c7.exp_names[nm]
+
+fn set_has(var l: L, d: Int):
+  let v = parent(&l, d)
+  if k(l, v) != ast.N_VAR or l.t.nd[v].f == 0: return
+  let init = l.t.nd[d].c
+  if init <= 0 or not array_kind(l, init): return
+  let id = l.t.nd[d].a
+  if k(l, id) != ast.N_ID: return
+  let y = scope.sym_of(l.sc, id)
+  if y < 0: return
+  let nm = l.t.nd[id].s
+  if exported_name(&l, d, nm): return
+  # the references (identifiers and shorthand properties)
+  var refs: [Int] = []
+  for i in sym_events(&l, y): refs.push(ev_ref(l, l.t.sv.q[i]))
+  # (export { name as other } refers to it too)
+  for i in exp_events(&l):
+    let e = l.t.sv.q[i]
+    if true:
+      var ln = l.t.nd[e.n].s
+      let b = l.t.nd[e.n].b
+      if b > 0: ln = l.t.nd[b].s
+      if ln == nm and scope.lookup(l.sc, e.s, nm, false) == y: return
+  if refs.len == 0: return
+  if refs.len == 1:
+    # is_multiple_calls: a loop or function between the reference and the declaration's scope
+    var owner = parent(&l, v)
+    while owner > 0:
+      let ok = k(l, owner)
+      if ok == ast.N_BLOCK or ok == ast.N_FOR or ok == ast.N_FORIN or ok == ast.N_SWITCH or ok == ast.N_STATICBLOCK or ok == ast.N_MODULE: break
+      owner = parent(&l, owner)
+    var multi = false
+    var a = parent(&l, refs[0])
+    while a > 0 and a != owner:
+      let ak = k(l, a)
+      if ak == ast.N_FOR or ak == ast.N_FORIN or ak == ast.N_WHILE or ak == ast.N_DO or is_fn(ak):
+        multi = true
+        break
+      a = parent(&l, a)
+    if not multi: return
+  for r in refs:
+    if k(l, r) != ast.N_ID: return
+    let m = parent(&l, r)
+    if k(l, m) != ast.N_PROPACCESS or l.t.nd[m].a != r or (l.t.nd[m].f & 5) != 0: return
+    let c = parent(&l, m)
+    if k(l, c) != ast.N_CALL or l.t.nd[c].a != m or (l.t.nd[c].f & 1) != 0: return
+    let args = list_of(l, l.t.nd[c].c)
+    if args.len != 1 or k(l, args[0]) == ast.N_SPREAD: return
+    if not rules.name_is(l, m, "includes"): return
+  # the fix: the initializer becomes a Set, each includes a has (merged into one edit)
+  var es: [Int] = []
+  var ee: [Int] = []
+  var et: [Str] = []
+  let ip = l.t.nd[init].pos
+  let ie = l.t.nd[init].end
+  let ik = k(l, init)
+  if ik == ast.N_ARRAY or (ik == ast.N_CALL and k(l, l.t.nd[init].a) != ast.N_ID):
+    es.push(ip)
+    ee.push(ip)
+    et.push("new Set(")
+    es.push(ie)
+    ee.push(ie)
+    et.push(")")
+  elif ik == ast.N_CALL:
+    es.push(ip)
+    ee.push(ip + 6)
+    et.push("new Set([")
+    es.push(ie - 1)
+    ee.push(ie)
+    et.push("])")
+  else:
+    es.push(ip + 4)
+    ee.push(ip + 10)
+    et.push("Set([")
+    es.push(ie - 1)
+    ee.push(ie)
+    et.push("])")
+  for r in refs:
+    let m = parent(&l, r)
+    let pe = l.t.nd[m].end
+    es.push(pe - 8)
+    ee.push(pe)
+    et.push("has")
+  var idx: [Int] = []
+  for i in 0..es.len: idx.push(i)
+  idx.sort(by: fn(a, b) => es[a] < es[b] or (es[a] == es[b] and ee[a] < ee[b]))
+  let fs = es[idx[0]]
+  var fe = 0
+  for i in idx:
+    if ee[i] > fe: fe = ee[i]
+  var out = ""
+  var at = fs
+  for i in idx:
+    if es[i] > at: out = out + l.src[at..es[i]]
+    out = out + et[i]
+    if ee[i] > at: at = ee[i]
+  out = out + l.src[at..fe]
+  rules.addn(&l, d, "unicorn(prefer-set-has)", "should be a `Set`, and use `.has()` to check existence or non-existence.", "Switch to `Set`")
+  rules.fix_of(&l, fs, fe, out, 5)
+
+# ---- oxc(no-accumulating-spread)
+
+# an array or object literal that is an assignment's target (its spreads are rests)
+fn is_target(var l: L, n: Int) -> Bool:
+  let p = parent(&l, n)
+  let pk = k(l, p)
+  if pk == ast.N_BINARY and rules.is_assign_op(l.t.nd[p].f) and l.t.nd[p].a == n: return true
+  if pk == ast.N_FORIN and l.t.nd[p].a == n: return true
+  if pk == ast.N_PAREN: return is_target(&l, p)
+  if pk == ast.N_ARRAY or pk == ast.N_OBJECT or pk == ast.N_SPREAD: return is_target(&l, p)
+  if pk == ast.N_PROPASSIGN and l.t.nd[p].b == n: return is_target(&l, p)
+  if pk == ast.N_BINARY and l.t.nd[p].f == scan.T_ASSIGN and l.t.nd[p].a == n: return is_target(&l, p)
+  return false
+
+# a member's static property: its name and span (name "" when none)
+fn static_member(l: L, m: Int, var ps: Int, var pe: Int) -> Str:
+  let kd = k(l, m)
+  if kd == ast.N_PROPACCESS:
+    if (l.t.nd[m].f & 4) != 0: return ""
+    let nm = rules.name_of(l, m)
+    pe = l.t.nd[m].end
+    ps = pe - nm.len
+    return nm
+  if kd == ast.N_ELEMACCESS:
+    let b = l.t.nd[m].b
+    if k(l, b) == ast.N_STR or k(l, b) == ast.N_NOSUBTEMPL:
+      ps = l.t.nd[b].pos
+      pe = l.t.nd[b].end
+      return rules.name_of(l, b)
+  return ""
+
+fn acc_spread(var l: L, n: Int):
+  let a = l.t.nd[n].a
+  if k(l, a) != ast.N_ID: return
+  let cont = parent(&l, n)
+  let ck = k(l, cont)
+  if (ck == ast.N_ARRAY or ck == ast.N_OBJECT) and is_target(&l, cont): return
+  let y = scope.sym_of(l.sc, a)
+  if y < 0: return
+  let kd = l.sc.yk[y]
+  let sp = l.t.nd[n].pos
+  let se = l.t.nd[n].end
+  if kd == scope.Y_PARAM:
+    let d = decl_at(&l, l.sc.ypos[y])
+    if d <= 0: return
+    let prm = parent(&l, d)
+    if k(l, prm) != ast.N_PARAM or l.t.nd[prm].a != d: return
+    let f = parent(&l, prm)
+    if not is_fn(k(l, f)): return
+    var plist = l.t.nd[f].b
+    let fk = k(l, f)
+    if fk == ast.N_METHOD or fk == ast.N_GET or fk == ast.N_SET or fk == ast.N_CTOR:
+      let sg = l.t.nd[f].b
+      if sg > 0: plist = l.t.nd[sg].b
+    var ps: [Int] = []
+    # (a TypeScript `this` parameter isn't one)
+    for q in list_of(l, plist):
+      if not (l.ts and k(l, l.t.nd[q].a) == ast.N_ID and rules.name_is(l, l.t.nd[q].a, "this")): ps.push(q)
+    if ps.len != 2 or ps[0] != prm: return
+    # the spread's functions up to the one declaring the parameters
+    var x = parent(&l, n)
+    while x > 0 and x != f:
+      if is_fn(k(l, x)): return
+      x = parent(&l, x)
+    var c = parent(&l, f)
+    while c > 0:
+      if k(l, c) == ast.N_CALL:
+        let args = list_of(l, l.t.nd[c].c)
+        if args.len >= 1 and args.len <= 2:
+          let m = rmore.inner(l, l.t.nd[c].a)
+          var rs = -1
+          var re = -1
+          let nm = static_member(l, m, &rs, &re)
+          if nm == "reduce" or nm == "reduceRight":
+            var help = "Consider using `Object.assign()` or `Array.prototype.push()` to mutate the accumulator instead."
+            if args.len > 1:
+              let s2 = rmore.inner(l, args[1])
+              if k(l, s2) == ast.N_OBJECT: help = "It looks like you're spreading an `Object`. Consider using the `Object.assign` or assignment operators to mutate the accumulator instead."
+              elif k(l, s2) == ast.N_ARRAY: help = "It looks like you're spreading an `Array`. Consider using the `Array.push` or `Array.concat` methods to mutate the accumulator instead."
+            rules.add(&l, sp, "oxc(no-accumulating-spread)", "Do not spread accumulators in Array.prototype.reduce()", help)
+            rules.label(&l, se, "From this spread")
+            rules.more(&l, rs, re, "For this reduce", true)
+            rules.note(&l, "Using spreads within accumulators leads to `O(n^2)` time complexity.")
+            return
+      c = parent(&l, c)
+    return
+  if kd != scope.Y_LET: return
+  let d = decl_at(&l, l.sc.ypos[y])
+  if d <= 0: return
+  var dl = parent(&l, d)
+  while dl > 0 and k(l, dl) != ast.N_DECL: dl = parent(&l, dl)
+  if dl <= 0: return
+  let vd = parent(&l, dl)
+  if k(l, vd) != ast.N_VAR or l.t.nd[vd].f != 1: return
+  # the first write: an assignment to the name itself
+  var w = -1
+  for i in sym_events(&l, y):
+    let e = l.t.sv.q[i]
+    if e.k == ast.Q_ASSIGN or e.k == ast.Q_UPDATE or (e.k < 64 and (e.k & ast.R_WRITE) != 0):
+      w = e.n
+      if e.k != ast.Q_ASSIGN: return
+      break
+  if w <= 0 or k(l, l.t.nd[w].a) != ast.N_ID: return
+  let r = rmore.inner(l, l.t.nd[w].b)
+  let rk = k(l, r)
+  if rk != ast.N_ARRAY and rk != ast.N_OBJECT: return
+  if l.t.nd[r].pos > sp or se > l.t.nd[r].end: return
+  let dp = l.t.nd[vd].pos
+  let de = l.t.nd[vd].end
+  var x = parent(&l, n)
+  while x > 0:
+    let xk = k(l, x)
+    var kw = 0
+    if xk == ast.N_FOR or xk == ast.N_FORIN: kw = 3
+    elif xk == ast.N_WHILE: kw = 5
+    elif xk == ast.N_DO: kw = 2
+    if kw > 0 and not (l.t.nd[x].pos <= dp and de <= l.t.nd[x].end):
+      var help = "Consider using `Object.assign()` to mutate the accumulator instead."
+      if rk == ast.N_ARRAY: help = "Consider using `Array.prototype.push()` to mutate the accumulator instead."
+      let id = l.t.nd[dl].a
+      rules.add(&l, l.t.nd[id].pos, "oxc(no-accumulating-spread)", "Do not spread accumulators in loops", help)
+      rules.label(&l, l.t.nd[id].end, "From this accumulator")
+      rules.more(&l, sp, se, "From this spread", true)
+      rules.more(&l, l.t.nd[x].pos, l.t.nd[x].pos + kw, "For this loop", true)
+      rules.primary_more(&l)
+      rules.note(&l, "Using spreads within accumulators leads to `O(n^2)` time complexity.")
+      return
+    x = parent(&l, x)
+
+# ---- typescript(consistent-type-imports)
+
+# edits merged into one fix as oxc merges a multi-part fix (sorted by span; overlapping: no fix)
+type Ed:
+  s: [Int]
+  e: [Int]
+  t: [Str]
+  bad: Bool
+
+fn ed_new() -> Ed:
+  return Ed([], [], [], false)
+
+fn ed_add(var d: Ed, s: Int, e: Int, t: Str):
+  d.s.push(s)
+  d.e.push(e)
+  d.t.push(t)
+
+fn ed_apply(var l: L, d: Ed, fk: Int):
+  if d.bad or d.s.len == 0: return
+  var idx: [Int] = []
+  for i in 0..d.s.len: idx.push(i)
+  idx.sort(by: fn(a, b) => d.s[a] < d.s[b] or (d.s[a] == d.s[b] and d.e[a] < d.e[b]))
+  let fs = d.s[idx[0]]
+  let fe = d.e[idx[idx.len - 1]]
+  var out = ""
+  var at = fs
+  for i in idx:
+    if at > d.s[i]: return
+    out = out + l.src[at..d.s[i]] + d.t[i]
+    at = d.e[i]
+  if at > fe: return
+  out = out + l.src[at..fe]
+  rules.fix_of(&l, fs, fe, out, fk)
+
+fn prev_token(l: L, s: Int, e: Int, tok: Str) -> Int:
+  var last = -1
+  var at = rmore3.next_token(l, s, e, tok)
+  while at >= 0:
+    last = at
+    at = rmore3.next_token(l, at + 1, e, tok)
+  return last
+
+# an import's specifiers in oxc's order: kind (0 default, 1 namespace, 2 named), node, span
+type Isp:
+  kind: Int
+  n: Int
+  ps: Int
+  pe: Int
+  name: Str
+  typ: Bool
+
+fn import_specs(l: L, n: Int) -> [Isp]:
+  var out: [Isp] = []
+  let d = l.t.nd[n].b
+  if d > 0: out.push(Isp(0, d, l.t.nd[d].pos, l.t.nd[d].end, rules.name_of(l, d), false))
+  let c = l.t.nd[n].c
+  if c > 0:
+    let st = prev_token(l, l.t.nd[n].pos, l.t.nd[c].pos, "*")
+    out.push(Isp(1, c, st, l.t.nd[c].end, rules.name_of(l, c), false))
+  for x in list_of(l, l.t.nd[n].d): out.push(Isp(2, x, l.t.nd[x].pos, l.t.nd[x].end, rules.name_of(l, x), (l.t.nd[x].f & ast.M_TYPEONLY) != 0))
+  return out
+
+fn imported_start(l: L, sp: Isp) -> Int:
+  let b = l.t.nd[sp.n].b
+  if b > 0: return l.t.nd[b].pos
+  return sp.pe - sp.name.len
+
+fn sym_at_pos(var l: L, p: Int) -> Int:
+  if l.mc.c7.ypm.k.len == 0:
+    var m = itab_new(l.sc.ypos.len + 16)
+    for y in 0..l.sc.ypos.len: itab_put(&m, l.sc.ypos[y], y, false)
+    l.mc.c7.ypm = m
+  if p < 0: return -1
+  return itab_get(l.mc.c7.ypm, p)
+
+fn word_list(ws: [Str]) -> Str:
+  if ws.len == 0: return ""
+  if ws.len == 1: return ws[0]
+  if ws.len == 2: return "{ws[0]} and {ws[1]}"
+  var out = ""
+  for i in 0..ws.len:
+    if i == ws.len - 1: out = out + "and " + ws[i]
+    else: out = out + ws[i] + ", "
+  return out
+
+# every reference is in a type (and there is one)
+fn only_type_refs(var l: L, y: Int, nm: Int) -> Bool:
+  var any = false
+  var evs: [Int] = exp_events(&l)
+  for i in sym_events(&l, y): evs.push(i)
+  for i in evs:
+    let e = l.t.sv.q[i]
+    if e.k == ast.Q_EXPSPEC and e.n > 0:
+      var ln = l.t.nd[e.n].s
+      let b = l.t.nd[e.n].b
+      if b > 0: ln = l.t.nd[b].s
+      if ln != nm or scope.lookup(l.sc, e.s, nm, false) != y: continue
+      let ex = parent(&l, e.n)
+      if (l.t.nd[e.n].f & ast.M_TYPEONLY) == 0 and not (k(l, ex) == ast.N_EXPORT and (l.t.nd[ex].f & ast.M_TYPEONLY) != 0): return false
+      any = true
+      continue
+    let x = ev_ref(l, e)
+    if x <= 0 or scope.res_of(l.sc, x) != y or l.t.nd[x].pos == l.sc.ypos[y]: continue
+    if e.k == ast.Q_EXPDEF or k(l, x) != ast.N_ID or not ref_is_type(&l, x): return false
+    any = true
+  return any
+
+fn has_with_clause(l: L, n: Int) -> Bool:
+  let m = l.t.nd[n].a
+  if m <= 0: return false
+  let tail = l.src[l.t.nd[m].end..l.t.nd[n].end]
+  return tail.find("with") >= 0 or tail.find("assert") >= 0
+
+fn type_imports(var l: L, n: Int, kd: Int):
+  if kd == ast.N_TIMPORT:
+    if not l.mc.c7.ti_ann: return
+    var p = l.t.nd[n].pos
+    if (l.t.nd[n].f & 1) != 0:
+      let q = rmore3.next_token(l, p, l.t.nd[n].end, "import")
+      if q >= 0: p = q
+    rules.add(&l, p, "typescript(consistent-type-imports)", "`import()` type annotations are forbidden.", "Replace `import()` type annotations with a regular type import. For example, change `type T = import('module').Type` to `import type {{ Type }} from 'module'; type T = Type`.")
+    rules.span(&l, l.t.nd[n].end)
+    return
+  let ip = l.t.nd[n].pos
+  let ie = l.t.nd[n].end
+  let specs = import_specs(l, n)
+  let decl_type = (l.t.nd[n].f & ast.M_TYPEONLY) != 0
+  if l.mc.c7.ti_no:
+    let avoid = "Use an `import` instead of an `import type`."
+    let ahelp = "Replace the `import type` declaration with a regular `import` declaration. For example, `import type {{ Type }} from 'module'` would become `import {{ Type }} from 'module'`."
+    if decl_type:
+      rules.add(&l, ip, "typescript(consistent-type-imports)", avoid, ahelp)
+      rules.span(&l, ie)
+      var txt = l.src[ip..ie]
+      if txt.startswith("import"):
+        let rest = txt[6..txt.len].lstrip()
+        if rest.startswith("type"): txt = "import" + rest[4..rest.len]
+      rules.fix_of(&l, ip, ie, txt, 1)
+    for sp in specs:
+      if not sp.typ: continue
+      rules.add(&l, sp.ps, "typescript(consistent-type-imports)", avoid, ahelp)
+      rules.span(&l, sp.pe)
+      rules.on(&l, sp.n)
+      var t = l.src[sp.ps..sp.pe]
+      if t.startswith("type "): t = t[5..t.len]
+      rules.fix_of(&l, sp.ps, sp.pe, t, 1)
+    return
+  var tnames: [Str] = []
+  var tspec: [Bool] = []
+  for sp in specs:
+    tspec.push(false)
+    if sp.kind != 2 and sp.name == "React": continue
+    if sp.kind == 2 and sp.typ: continue
+    let nn = l.t.nd[sp.n]
+    var y = -1
+    if sp.kind == 2: y = sym_at_pos(&l, sp.pe - sp.name.len)
+    else: y = scope.sym_of(l.sc, sp.n)
+    if y < 0 or l.sc.ypos[y] < sp.ps or l.sc.ypos[y] >= sp.pe: continue
+    if only_type_refs(&l, y, nn.s):
+      tnames.push(sp.name + "")
+      tspec[tspec.len - 1] = true
+  if decl_type or tnames.len == 0: return
+  let all = tnames.len == specs.len
+  if all:
+    if has_with_clause(l, n): return
+    rules.add(&l, ip, "typescript(consistent-type-imports)", "All imports in the declaration are only used as types. Use `import type`.", "Replace the `import` declaration with `import type`. For example, change `import {{ Type }} from 'module'` would become `import type {{ Type }} from 'module'`.")
+    rules.span(&l, ie)
+    rules.note(&l, "Using `import type` for type-only imports helps with tree-shaking, makes it clear that these imports don't affect runtime code, and can improve build performance by allowing bundlers to eliminate unused type imports.")
+  else:
+    rules.add(&l, ip, "typescript(consistent-type-imports)", "Imports {word_list(tnames)} are only used as type.", "")
+    rules.span(&l, ie)
+  let fm = ti_fix(&l, n, specs, tnames)
+  let di = l.ds.len - 1
+  if fm != "" and l.ds[di].help == "": l.ds[di].help = fm
+
+fn in_names(ns: [Str], s: Str) -> Bool:
+  for x in ns:
+    if x == s: return true
+  return false
+
+fn ti_fix(var l: L, n: Int, specs: [Isp], tnames: [Str]) -> Str:
+  let ip = l.t.nd[n].pos
+  let m = l.t.nd[n].a
+  let msrc = l.src[l.t.nd[m].pos..l.t.nd[m].end]
+  var nsi = -1
+  var dfi = -1
+  var named: [Int] = []
+  for i in 0..specs.len:
+    if specs[i].kind == 0: dfi = i
+    elif specs[i].kind == 1: nsi = i
+    else: named.push(i)
+  let inline = l.mc.c7.ti_inline
+  if nsi >= 0 and dfi < 0 and not has_with_clause(l, n):
+    return ti_insert_type(&l, n, specs, false)
+  if dfi >= 0:
+    let dt = in_names(tnames, specs[dfi].name)
+    if dt and named.len == 0 and nsi < 0:
+      return ti_insert_type(&l, n, specs, true)
+    if inline and not dt and named.len > 0 and nsi < 0:
+      return ti_inline(&l, specs, tnames)
+  elif nsi < 0:
+    var anyt = false
+    var allt = true
+    for i in named:
+      if in_names(tnames, specs[i].name): anyt = true
+      else: allt = false
+    if inline and anyt:
+      return ti_inline(&l, specs, tnames)
+    if allt:
+      return ti_insert_type(&l, n, specs, false)
+  var sub: [Int] = []
+  for i in named:
+    if in_names(tnames, specs[i].name): sub.push(i)
+  var d = ed_new()
+  var after = ed_new()
+  var removes = ed_new()
+  var text = ""
+  # get_fixes_named_specifiers
+  if named.len > 0:
+    var parts: [Str] = []
+    if sub.len == named.len:
+      let ob = rmore3.next_token(l, ip, l.t.nd[n].end, "{{")
+      let cb = rmore3.next_token(l, ip, l.t.nd[n].end, "}}")
+      if ob < 0 or cb < 0: return ""
+      let cm = prev_token(l, ip, ob, ",")
+      if cm < 0: return ""
+      ed_add(&removes, cm, cb + 1, "")
+      parts.push(l.src[ob + 1..cb])
+    else:
+      var groups: [[Int]] = []
+      var g: [Int] = []
+      for i in named:
+        if in_names(tnames, specs[i].name): g.push(i)
+        elif g.len > 0:
+          groups.push(g)
+          g = []
+      if g.len > 0: groups.push(g)
+      let ob = rmore3.next_token(l, ip, l.t.nd[n].end, "{{")
+      if ob < 0: return ""
+      for grp in groups:
+        let f0 = specs[grp[0]]
+        let l0 = specs[grp[grp.len - 1]]
+        var rs = f0.ps
+        var re = l0.pe
+        var ts = f0.ps
+        var te = l0.pe
+        let cm = prev_token(l, ob, f0.ps, ",")
+        if cm >= 0:
+          rs = cm
+          ts = rs + 1
+        else:
+          rs = ob + 1
+          ts = rs
+        let is_first = specs[named[0]].ps == f0.ps
+        let is_last = specs[named[named.len - 1]].pe == l0.pe
+        var j = l0.pe
+        let ie = l.t.nd[n].end
+        while j < ie and (l.src[j] == ' ' or l.src[j] == '\t' or l.src[j] == '\n' or l.src[j] == '\r'): j += 1
+        if j < ie:
+          te = j
+          if (is_first or is_last) and l.src[j] == ',': re = te + 1
+        ed_add(&removes, rs, re, "")
+        parts.push(l.src[ts..te])
+    text = ",".join(parts)
+  if sub.len > 0:
+    let msv = rules.name_of(l, m)
+    let other = type_only_import(&l, msv)
+    if other > 0:
+      let cb = rmore3.next_token(l, l.t.nd[other].pos, l.t.nd[other].end, "}}")
+      if cb < 0: return ""
+      var last_end = -1
+      for x in list_of(l, l.t.nd[other].d): last_end = l.t.nd[x].end
+      var ins = text
+      if last_end >= 0 and rmore3.next_token(l, last_end, cb, ",") < 0: ins = "," + text
+      if l.t.nd[other].end <= ip: ed_add(&d, cb, cb, ins)
+      else: ed_add(&after, cb, cb, ins)
+    elif inline:
+      var ts: [Str] = []
+      for i in sub: ts.push("type " + l.src[specs[i].ps..specs[i].pe])
+      ed_add(&d, ip, ip, "import {{{", ".join(ts)}}} from {msrc};\n")
+    else:
+      ed_add(&d, ip, ip, "import type {{{text}}} from {msrc};\n")
+  var nsrm = ed_new()
+  if nsi >= 0 and in_names(tnames, specs[nsi].name):
+    let cm = rmore3.next_token(l, ip, l.t.nd[n].end, ",")
+    if cm < 0: return ""
+    ed_add(&nsrm, cm, specs[nsi].pe, "")
+    ed_add(&d, ip, ip, "import type {l.src[specs[nsi].ps..specs[nsi].pe]} from {msrc};\n")
+  if dfi >= 0 and in_names(tnames, specs[dfi].name):
+    if tnames.len == specs.len:
+      ed_add(&d, ip + 6, ip + 6, " type")
+    else:
+      let cm = rmore3.next_token(l, ip, l.t.nd[n].end, ",")
+      if cm < 0: return ""
+      ed_add(&d, ip, ip, "import type {l.src[specs[dfi].ps..cm]} from {msrc};\n")
+      var j = cm + 1
+      let ie = l.t.nd[n].end
+      while j < ie and (l.src[j] == ' ' or l.src[j] == '\t' or l.src[j] == '\n' or l.src[j] == '\r'): j += 1
+      if j < ie: ed_add(&d, specs[dfi].ps, j, "")
+  for i in 0..removes.s.len: ed_add(&d, removes.s[i], removes.e[i], removes.t[i])
+  for i in 0..nsrm.s.len: ed_add(&d, nsrm.s[i], nsrm.e[i], nsrm.t[i])
+  for i in 0..after.s.len: ed_add(&d, after.s[i], after.e[i], after.t[i])
+  ed_apply(&l, d, 1)
+  return "Mark all type-only imports with the type specifier"
+
+# get_type_only_named_import: among the leading imports, an `import type { ... }` of the source
+fn type_only_import(var l: L, src: Str) -> Int:
+  let root = rmore5.file_root(&l)
+  for st in list_of(l, root):
+    if k(l, st) != ast.N_IMPORT: return -1
+    if (l.t.nd[st].f & ast.M_TYPEONLY) == 0: continue
+    let m = l.t.nd[st].a
+    if m <= 0 or rules.name_of(l, m) != src: continue
+    if l.t.nd[st].b > 0 or l.t.nd[st].c > 0 or l.t.nd[st].d <= 0: continue
+    return st
+  return -1
+
+fn ti_inline(var l: L, specs: [Isp], tnames: [Str]) -> Str:
+  var d = ed_new()
+  for sp in specs:
+    if sp.kind == 2 and in_names(tnames, sp.name): ed_add(&d, sp.ps, sp.pe, "type " + l.src[sp.ps..sp.pe])
+  ed_apply(&l, d, 1)
+  return "Add type specifier to imported types"
+
+fn ti_insert_type(var l: L, n: Int, specs: [Isp], is_default: Bool) -> Str:
+  let ip = l.t.nd[n].pos
+  let m = l.t.nd[n].a
+  let ms = l.t.nd[m].pos
+  var d = ed_new()
+  ed_add(&d, ip, ip + 6, "import type")
+  if is_default and rmore3.next_token(l, ip, ms, "{{") >= 0:
+    let cm = rmore3.next_token(l, ip, ms, ",")
+    let cb = rmore3.next_token(l, ip, ms, "}}")
+    if cm < 0 or cb < 0: return ""
+    ed_add(&d, cm, cb + 1, "")
+    if specs.len > 1:
+      ed_add(&d, l.t.nd[n].end, l.t.nd[n].end, "\nimport type {l.src[cm + 1..cb]} from {l.src[ms..l.t.nd[m].end]}")
+  for sp in specs:
+    if sp.kind == 2 and sp.typ: ed_add(&d, sp.ps, imported_start(l, sp), "")
+  ed_apply(&l, d, 1)
+  return "Add type specifier to this import declaration"
+
+# ---- eslint(no-fallthrough)
+
+fn comments(var l: L) -> [Int]:
+  if l.mc.c7.cms.len == 1 and l.mc.c7.cms[0] == -1: l.mc.c7.cms = rjest.all_comments(l)
+  var out: [Int] = []
+  for x in l.mc.c7.cms: out.push(x)
+  return out
+
+# a discriminant whose evaluation branches (oxc's switch analysis gives up on those)
+fn branches(l: L, n: Int) -> Bool:
+  if n <= 0: return false
+  let nd = l.t.nd[n]
+  let kd = nd.k
+  if kd == ast.N_LIST:
+    for i in 0..nd.b:
+      if branches(l, l.t.L[nd.a + i]): return true
+    return false
+  if kd == ast.N_COND: return true
+  if kd == ast.N_BINARY and (nd.f == scan.T_AND or nd.f == scan.T_OR or nd.f == scan.T_QQ or nd.f == scan.T_ANDEQ or nd.f == scan.T_OREQ or nd.f == scan.T_QQEQ): return true
+  if (kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS or kd == ast.N_CALL) and (nd.f & 1) != 0: return true
+  if is_fn(kd) or kd == ast.N_CLASSEXPR: return false
+  if branches(l, nd.a) or branches(l, nd.b) or branches(l, nd.c): return true
+  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS: return branches(l, nd.d)
+  return false
+
+# whether a statement can complete normally as oxc's control flow graph has it (loops always can);
+# brk: breaks seen, by target (the switch being checked is 0)
+fn ft_completes(var l: L, n: Int, var tg: [Int], var tl: [Int], var hit: [Bool]) -> Bool:
+  if n <= 0: return true
+  let kd = l.t.nd[n].k
+  if kd == ast.N_RETURN or kd == ast.N_THROW or kd == ast.N_CONTINUE: return false
+  if kd == ast.N_BREAK:
+    let lab = l.t.nd[n].s
+    var i = tg.len - 1
+    while i >= 0:
+      if (lab < 0 and tg[i] != 3) or (lab >= 0 and tg[i] == 3 and tl[i] == lab):
+        hit[i] = true
+        break
+      i -= 1
+    return false
+  if kd == ast.N_BLOCK: return ft_list(&l, list_of(l, l.t.nd[n].a), &tg, &tl, &hit)
+  if kd == ast.N_IF:
+    let t = ft_completes(&l, l.t.nd[n].b, &tg, &tl, &hit)
+    if l.t.nd[n].c <= 0: return true
+    let e = ft_completes(&l, l.t.nd[n].c, &tg, &tl, &hit)
+    return t or e
+  if kd == ast.N_WHILE or kd == ast.N_DO or kd == ast.N_FOR or kd == ast.N_FORIN:
+    var body = l.t.nd[n].b
+    if kd == ast.N_DO: body = l.t.nd[n].a
+    elif kd == ast.N_FOR: body = l.t.nd[n].d
+    elif kd == ast.N_FORIN: body = l.t.nd[n].c
+    tg.push(1)
+    tl.push(-1)
+    hit.push(false)
+    let bc = ft_completes(&l, body, &tg, &tl, &hit)
+    tg.pop()
+    tl.pop()
+    let h = hit.pop()
+    # (a do-while runs its body first: it completes if the body can reach the test or breaks)
+    if kd == ast.N_DO: return bc or h or has_continue(l, body)
+    return true
+  if kd == ast.N_LABEL:
+    tg.push(3)
+    tl.push(l.t.nd[n].s)
+    hit.push(false)
+    let b = ft_completes(&l, l.t.nd[n].a, &tg, &tl, &hit)
+    tg.pop()
+    tl.pop()
+    let h = hit.pop()
+    return b or h
+  if kd == ast.N_SWITCH:
+    tg.push(2)
+    tl.push(-1)
+    hit.push(false)
+    var r = true
+    var dflt = false
+    for c in list_of(l, l.t.nd[n].b):
+      if l.t.nd[c].a <= 0: dflt = true
+      r = ft_list(&l, list_of(l, l.t.nd[c].b), &tg, &tl, &hit)
+    tg.pop()
+    tl.pop()
+    let h = hit.pop()
+    return h or not dflt or r
+  if kd == ast.N_TRY:
+    var tc = ft_completes(&l, l.t.nd[n].a, &tg, &tl, &hit)
+    if l.t.nd[n].c > 0:
+      let c = ft_completes(&l, l.t.nd[n].c, &tg, &tl, &hit)
+      tc = tc or c
+    if l.t.nd[n].d > 0:
+      if not ft_completes(&l, l.t.nd[n].d, &tg, &tl, &hit): return false
+    return tc
+  if kd == ast.N_WITH: return ft_completes(&l, l.t.nd[n].b, &tg, &tl, &hit)
+  return true
+
+# a continue that targets this loop (not inside a nested loop or function)
+fn has_continue(l: L, n: Int) -> Bool:
+  if n <= 0: return false
+  let nd = l.t.nd[n]
+  let kd = nd.k
+  if kd == ast.N_LIST:
+    for i in 0..nd.b:
+      if has_continue(l, l.t.L[nd.a + i]): return true
+    return false
+  if kd == ast.N_CONTINUE: return nd.s < 0
+  if kd == ast.N_WHILE or kd == ast.N_DO or kd == ast.N_FOR or kd == ast.N_FORIN or is_fn(kd) or kd == ast.N_CLASS or kd == ast.N_CLASSEXPR: return false
+  if kd < ast.N_VAR or kd > ast.N_LABEL: return false
+  return has_continue(l, nd.a) or has_continue(l, nd.b) or has_continue(l, nd.c) or has_continue(l, nd.d)
+
+fn ft_list(var l: L, sts: [Int], var tg: [Int], var tl: [Int], var hit: [Bool]) -> Bool:
+  for x in sts:
+    if not ft_completes(&l, x, &tg, &tl, &hit): return false
+  return true
+
+fn ft_comment_ok(l: L, txt: Str) -> Bool:
+  if txt.startswith("oxlint-") or txt.startswith("eslint-"): return false
+  if l.mc.c7.ft_re.len > 0: return lmatch.test(l.mc.c7.ft_re[0], txt)
+  let c = txt.strip().lower()
+  return c == "falls through" or c == "fall through" or c == "fallsthrough" or c == "fallthrough"
+
+# the last comment in [s, e) says fallthrough
+fn ft_comment_in(l: L, cs: [Int], s: Int, e: Int) -> Bool:
+  var last = -1
+  var i = 0
+  while i + 1 < cs.len:
+    if cs[i] >= s and cs[i + 1] <= e: last = i
+    i += 2
+  if last < 0: return false
+  let a = cs[last]
+  let b = cs[last + 1]
+  var txt = ""
+  if l.src[a + 1] == '/': txt = l.src[a + 2..b]
+  else: txt = l.src[a + 2..b - 2]
+  return ft_comment_ok(l, txt.strip())
+
+# maybe_allow_fallthrough_trivia: the span of the comment's range, or -1
+fn ft_trivia(var l: L, c: Int, next: Int, var te: Int) -> Int:
+  let cs = comments(&l)
+  let body = list_of(l, l.t.nd[c].b)
+  var s = l.t.nd[c].end
+  var e = -1
+  if body.len == 1 and k(l, body[0]) == ast.N_BLOCK:
+    let bl = list_of(l, l.t.nd[body[0]].a)
+    if bl.len > 0: s = l.t.nd[bl[bl.len - 1]].end
+    else: s = l.t.nd[body[0]].pos
+    e = l.t.nd[body[0]].end
+  elif body.len > 0: s = l.t.nd[body[body.len - 1]].end
+  if e >= 0 and ft_comment_in(l, cs, s, e):
+    te = e
+    return s
+  let np = l.t.nd[next].pos
+  if ft_comment_in(l, cs, s, np):
+    te = np
+    return s
+  return -1
+
+fn fallthrough(var l: L, n: Int):
+  if branches(l, l.t.nd[n].a): return
+  let cases = list_of(l, l.t.nd[n].b)
+  for i in 0..cases.len - 1:
+    let c = cases[i]
+    let nx = cases[i + 1]
+    var tg: [Int] = [2]
+    var tl: [Int] = [-1]
+    var hit: [Bool] = [false]
+    let falls = ft_list(&l, list_of(l, l.t.nd[c].b), &tg, &tl, &hit)
+    var te = -1
+    if not falls:
+      if l.mc.c7.ft_unused:
+        let ts = ft_trivia(&l, c, nx, &te)
+        if ts >= 0:
+          rules.add(&l, ts, "eslint(no-fallthrough)", "Found a comment that would permit fallthrough, but case cannot fall through.", "Remove the fallthrough comment or add code that allows fallthrough (e.g. remove `break`).")
+          rules.span(&l, te)
+      continue
+    var is_ft = list_of(l, l.t.nd[c].b).len > 0
+    if not is_ft and not l.mc.c7.ft_empty:
+      var nl = 0
+      for j in l.t.nd[c].end..l.t.nd[nx].pos:
+        if l.src[j] == '\n': nl += 1
+      is_ft = nl >= 2
+    if is_ft and ft_trivia(&l, c, nx, &te) < 0:
+      var w = "case"
+      if l.t.nd[nx].a <= 0: w = "default"
+      rules.addn(&l, nx, "eslint(no-fallthrough)", "Expected a `break` statement before `{w}`.", "Use a `break` statement to prevent fallthrough, or add a comment to indicate intentional fallthrough.")
+
+# ---- eslint(no-loop-func)
+
+fn loop_body(l: L, n: Int) -> Int:
+  let kd = l.t.nd[n].k
+  if kd == ast.N_WHILE: return l.t.nd[n].b
+  if kd == ast.N_DO: return l.t.nd[n].a
+  if kd == ast.N_FOR: return l.t.nd[n].d
+  return l.t.nd[n].c
+
+# the functions in a loop body (not inside them, not in nested loops' bodies)
+fn lf_collect(l: L, n: Int, var out: [Int]):
+  if n <= 0: return
+  let nd = l.t.nd[n]
+  let kd = nd.k
+  if kd == ast.N_LIST:
+    for i in 0..nd.b: lf_collect(l, l.t.L[nd.a + i], &out)
+    return
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
+    if not bodyless(l, n): out.push(n)
+    elif kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET: lf_collect(l, nd.a, &out)
+    if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET:
+      if not bodyless(l, n): lf_collect(l, nd.a, &out)
+    return
+  if kd == ast.N_WHILE:
+    lf_collect(l, nd.a, &out)
+    return
+  if kd == ast.N_DO:
+    lf_collect(l, nd.b, &out)
+    return
+  if kd == ast.N_FOR:
+    lf_collect(l, nd.a, &out)
+    lf_collect(l, nd.b, &out)
+    lf_collect(l, nd.c, &out)
+    return
+  if kd == ast.N_FORIN:
+    lf_collect(l, nd.a, &out)
+    lf_collect(l, nd.b, &out)
+    return
+  if kd >= ast.N_TREF and kd <= ast.N_TREST and kd != ast.N_TSPAN: return
+  if kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS: return
+  lf_collect(l, nd.a, &out)
+  lf_collect(l, nd.b, &out)
+  lf_collect(l, nd.c, &out)
+  if kd != ast.N_VAR and kd != ast.N_PROPACCESS: lf_collect(l, nd.d, &out)
+
+fn is_async_gen(l: L, f: Int) -> Bool:
+  let kd = l.t.nd[f].k
+  if kd == ast.N_ARROW: return (l.t.nd[f].f & ast.M_ASYNC) != 0
+  return (l.t.nd[f].f & (ast.M_ASYNC | ast.M_GENERATOR)) != 0
+
+# the function's span as oxc has it (a method's function starts at its parameters)
+fn fn_span_start(l: L, f: Int) -> Int:
+  let kd = l.t.nd[f].k
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
+    let sg = l.t.nd[f].b
+    if sg > 0: return l.t.nd[sg].pos
+  var p = l.t.nd[f].pos
+  if kd == ast.N_FUNC:
+    # (export and default belong to the export declaration around the function)
+    for w in ["export", "default"]:
+      if p + w.len <= l.src.len and rmore6.word_at(l.src, p, w):
+        p += w.len
+        while p < l.src.len and is_ws(l.src[p]): p += 1
+  return p
+
+fn safe_iife(var l: L, f: Int) -> Bool:
+  let c = paren_parent(&l, f)
+  if c <= 0 or k(l, c) != ast.N_CALL: return false
+  let callee = l.t.nd[c].a
+  let fs = fn_span_start(l, f)
+  if not (l.t.nd[callee].pos <= fs and l.t.nd[f].end <= l.t.nd[callee].end): return false
+  if k(l, f) == ast.N_FUNCEXPR and l.t.nd[f].s >= 0:
+    let y = fn_own_symbol(&l, f)
+    if y >= 0:
+      for r in rjest.refs_of(&l, y):
+        if l.t.nd[r].pos >= fs and l.t.nd[r].end <= l.t.nd[f].end: return false
+  return true
+
+fn fn_own_symbol(var l: L, f: Int) -> Int:
+  for y in 0..l.sc.yk.len:
+    if l.sc.yk[y] == scope.Y_FNNAME and l.sc.ypos[y] == l.t.nd[f].pos: return y
+  return -1
+
+fn nested_fn(var l: L, n: Int, root: Int) -> Bool:
+  if n <= 0: return false
+  let nd = l.t.nd[n]
+  let kd = nd.k
+  if kd == ast.N_LIST:
+    for i in 0..nd.b:
+      if nested_fn(&l, l.t.L[nd.a + i], root): return true
+    return false
+  if n != root and is_fn(kd) and not bodyless(l, n):
+    if is_async_gen(l, n): return true
+    if not safe_iife(&l, n): return true
+  if kd >= ast.N_TREF and kd <= ast.N_TREST and kd != ast.N_TSPAN: return false
+  if nested_fn(&l, nd.a, root) or nested_fn(&l, nd.b, root) or nested_fn(&l, nd.c, root): return true
+  if kd != ast.N_VAR and kd != ast.N_INTERFACE and kd != ast.N_TYPEALIAS and kd != ast.N_PROPACCESS: return nested_fn(&l, nd.d, root)
+  return false
+
+# the references (identifiers, shorthands) inside node n, types left out
+fn lf_refs(l: L, n: Int, var out: [Int]):
+  if n <= 0: return
+  let nd = l.t.nd[n]
+  let kd = nd.k
+  if kd == ast.N_LIST:
+    for i in 0..nd.b: lf_refs(l, l.t.L[nd.a + i], &out)
+    return
+  if kd == ast.N_ID or kd == ast.N_SHORTHAND:
+    let y = scope.res_of(l.sc, n)
+    if y >= 0 and l.sc.ypos[y] != nd.pos: out.push(n)
+    if kd == ast.N_SHORTHAND: lf_refs(l, nd.b, &out)
+    return
+  if kd >= ast.N_TREF and kd <= ast.N_TREST and kd != ast.N_TSPAN: return
+  if kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS: return
+  if kd == ast.N_AS or kd == ast.N_SATISFIES or kd == ast.N_TYPEASSERT:
+    lf_refs(l, nd.a, &out)
+    return
+  if kd == ast.N_DECL or kd == ast.N_PARAM:
+    lf_refs(l, nd.a, &out)
+    lf_refs(l, nd.c, &out)
+    return
+  if kd == ast.N_PROP:
+    lf_refs(l, nd.a, &out)
+    lf_refs(l, nd.c, &out)
+    return
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW:
+    lf_refs(l, nd.b, &out)
+    lf_refs(l, nd.d, &out)
+    return
+  if kd == ast.N_SIG:
+    lf_refs(l, nd.b, &out)
+    return
+  if kd == ast.N_CALL or kd == ast.N_NEW:
+    lf_refs(l, nd.a, &out)
+    lf_refs(l, nd.c, &out)
+    return
+  lf_refs(l, nd.a, &out)
+  lf_refs(l, nd.b, &out)
+  lf_refs(l, nd.c, &out)
+  if kd != ast.N_VAR and kd != ast.N_PROPACCESS: lf_refs(l, nd.d, &out)
+
+# a symbol's declaration node span as oxc has it: the declarator, parameter or catch parameter
+fn lf_decl_span(var l: L, y: Int, var ds: Int, var de: Int):
+  ds = l.sc.ypos[y]
+  de = ds + l.t.names[l.sc.yn[y]].len
+  var a = decl_at(&l, l.sc.ypos[y])
+  if a <= 0: return
+  ds = l.t.nd[a].pos
+  de = l.t.nd[a].end
+  while a > 0:
+    let kd = k(l, a)
+    if kd == ast.N_DECL or kd == ast.N_PARAM:
+      ds = l.t.nd[a].pos
+      de = l.t.nd[a].end
+      if kd == ast.N_DECL and pkind(&l, a) == ast.N_TRY:
+        # a catch parameter: its pattern (and type)
+        de = l.t.nd[a].end
+      return
+    if kd != ast.N_OBJPAT and kd != ast.N_ARRPAT and kd != ast.N_BINDEL: return
+    a = parent(&l, a)
+
+fn containing_loop(var l: L, n: Int) -> Int:
+  var cur = n
+  while true:
+    let p = parent(&l, cur)
+    if p <= 0: return -1
+    let pk = k(l, p)
+    if pk == ast.N_WHILE or pk == ast.N_DO: return p
+    if pk == ast.N_FOR:
+      let ini = l.t.nd[p].a
+      if ini <= 0 or not (l.t.nd[ini].pos <= l.t.nd[cur].pos and l.t.nd[cur].end <= l.t.nd[ini].end): return p
+    if pk == ast.N_FORIN:
+      let r = l.t.nd[p].b
+      if not (l.t.nd[r].pos <= l.t.nd[cur].pos and l.t.nd[cur].end <= l.t.nd[r].end): return p
+    if is_fn(pk): return -1
+    cur = p
+  return -1
+
+fn top_loop(var l: L, lp: Int, border: Int) -> Int:
+  var top = lp
+  var c = lp
+  while c > 0:
+    if l.t.nd[c].pos < border: break
+    top = c
+    c = containing_loop(&l, c)
+  return top
+
+fn var_scope(l: L, s: Int) -> Int:
+  if s < 0: return s
+  return l.sc.sfn[s]
+
+fn unsafe_writes(var l: L, y: Int, border: Int) -> Bool:
+  sym_scopes(&l)
+  let vs = var_scope(l, l.mc.c7.ysx[y])
+  for i in sym_events(&l, y):
+    let e = l.t.sv.q[i]
+    if not (e.k == ast.Q_ASSIGN or e.k == ast.Q_UPDATE or (e.k < 64 and (e.k & ast.R_WRITE) != 0)): continue
+    let w = ev_ref(l, e)
+    if l.t.nd[w].pos >= border or var_scope(l, e.s) != vs: return true
+  return false
+
+fn in_span(l: L, a: Int, ds: Int, de: Int) -> Bool:
+  return a > 0 and l.t.nd[a].pos <= ds and de <= l.t.nd[a].end
+
+fn let_unsafe(var l: L, y: Int, lp: Int, ds: Int, de: Int) -> Bool:
+  if in_span(l, loop_body(l, lp), ds, de): return false
+  var cur = lp
+  while cur > 0:
+    let ck = k(l, cur)
+    if ck == ast.N_FOR and in_span(l, l.t.nd[cur].a, ds, de): return false
+    if ck == ast.N_FORIN and in_span(l, l.t.nd[cur].a, ds, de): return false
+    let p = parent(&l, cur)
+    if p <= 0 or is_fn(k(l, p)): break
+    cur = p
+  let tl = top_loop(&l, lp, de)
+  let border = l.t.nd[tl].pos
+  return unsafe_writes(&l, y, border)
+
+fn var_unsafe(var l: L, y: Int, lp: Int, ds: Int, de: Int) -> Bool:
+  if l.t.nd[lp].pos <= ds and de <= l.t.nd[lp].end: return true
+  var cur = parent(&l, lp)
+  while cur > 0:
+    let ck = k(l, cur)
+    if ck == ast.N_FORIN and in_span(l, l.t.nd[cur].a, ds, de): return true
+    if ck == ast.N_FOR and in_span(l, l.t.nd[cur].a, ds, de) and l.t.nd[cur].c > 0: return true
+    if is_fn(ck): break
+    cur = parent(&l, cur)
+  let tl = top_loop(&l, lp, 0)
+  let border = l.t.nd[tl].pos
+  return unsafe_writes(&l, y, border)
+
+fn unsafe_ref(var l: L, y: Int, lp: Int, ds: Int, de: Int) -> Bool:
+  let yk = l.sc.yk[y]
+  if yk == scope.Y_CONST or yk == scope.Y_USING or yk == scope.Y_IMPORT or yk == scope.Y_IMPORTTYPE: return false
+  if yk == scope.Y_CATCH or yk == scope.Y_LET: return let_unsafe(&l, y, lp, ds, de)
+  if yk == scope.Y_VAR or yk == scope.Y_PARAM: return var_unsafe(&l, y, lp, ds, de)
+  return false
+
+fn loop_func(var l: L, lp: Int, kd: Int):
+  var fns: [Int] = []
+  lf_collect(l, loop_body(l, lp), &fns)
+  for f in fns:
+    if not is_async_gen(l, f) and safe_iife(&l, f) and not nested_fn(&l, f, f): continue
+    let fs = fn_span_start(l, f)
+    let fe = l.t.nd[f].end
+    var refs: [Int] = []
+    let fk = k(l, f)
+    if fk == ast.N_METHOD or fk == ast.N_GET or fk == ast.N_SET or fk == ast.N_CTOR:
+      lf_refs(l, l.t.nd[f].b, &refs)
+      lf_refs(l, l.t.nd[f].c, &refs)
+    else: lf_refs(l, f, &refs)
+    var seen: {Int: Bool} = {}
+    var bad = false
+    for r in refs:
+      let y = scope.res_of(l.sc, r)
+      if y < 0 or y in seen: continue
+      seen[y] = true
+      if sh_type_only(&l, y): continue
+      var ds = 0
+      var de = 0
+      lf_decl_span(&l, y, &ds, &de)
+      if fs <= ds and de <= fe: continue
+      if unsafe_ref(&l, y, lp, ds, de):
+        bad = true
+        break
+    if bad:
+      rules.add(&l, fs, "eslint(no-loop-func)", "Function declared in a loop contains unsafe references to variable(s)", "Variables declared with 'var' are function-scoped, not block-scoped. Consider using 'let' or 'const' for block-scoped variables, or move the function outside the loop.")
+      rules.span(&l, fe)
+      rules.on(&l, lp)
+
+# ---- unicorn(no-immediate-mutation)
+
+fn im_inner(l: L, n: Int) -> Int:
+  var x = n
+  while x > 0:
+    let kd = l.t.nd[x].k
+    if kd == ast.N_PAREN or kd == ast.N_AS or kd == ast.N_SATISFIES or kd == ast.N_NONNULL or kd == ast.N_TYPEASSERT or kd == ast.N_EXPRTARGS: x = l.t.nd[x].a
+    else: return x
+  return x
+
+fn id_named(l: L, n: Int, nm: Int) -> Bool:
+  return k(l, n) == ast.N_ID and l.t.nd[n].s == nm
+
+# a simple parameter with that name
+fn params_shadow(l: L, f: Int, nm: Int) -> Bool:
+  for p in list_of(l, l.t.nd[f].b):
+    let a = l.t.nd[p].a
+    if id_named(l, a, nm): return true
+  return false
+
+fn body_refs(l: L, body: Int, nm: Int) -> Bool:
+  for st in list_of(l, l.t.nd[body].a):
+    let sk = k(l, st)
+    if sk == ast.N_EXPRSTMT and refs_var(l, l.t.nd[st].a, nm): return true
+    if sk == ast.N_RETURN and l.t.nd[st].a > 0 and refs_var(l, l.t.nd[st].a, nm): return true
+  return false
+
+fn args_refs(l: L, lst: Int, nm: Int) -> Bool:
+  for a in list_of(l, lst):
+    if k(l, a) != ast.N_SPREAD and refs_var(l, a, nm): return true
+  return false
+
+# expression_references_variable
+fn refs_var(l: L, e0: Int, nm: Int) -> Bool:
+  let e = im_inner(l, e0)
+  if e <= 0: return false
+  let nd = l.t.nd[e]
+  let kd = nd.k
+  if kd == ast.N_ID: return nd.s == nm
+  if (kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS or kd == ast.N_CALL) and in_chain(l, e): return false
+  if kd == ast.N_PROPACCESS:
+    if (nd.f & 4) != 0: return false
+    return refs_var(l, nd.a, nm)
+  if kd == ast.N_ELEMACCESS: return refs_var(l, nd.a, nm) or refs_var(l, nd.b, nm)
+  if kd == ast.N_CALL: return refs_var(l, nd.a, nm) or args_refs(l, nd.c, nm)
+  if kd == ast.N_NEW: return refs_var(l, nd.a, nm) or args_refs(l, nd.c, nm)
+  if kd == ast.N_ARRAY:
+    for x in list_of(l, nd.a):
+      if k(l, x) == ast.N_SPREAD:
+        if refs_var(l, l.t.nd[x].a, nm): return true
+      elif k(l, x) != ast.N_OMIT and refs_var(l, x, nm): return true
+    return false
+  if kd == ast.N_OBJECT:
+    for x in list_of(l, nd.a):
+      let xk = k(l, x)
+      if xk == ast.N_PROPASSIGN:
+        if refs_var(l, l.t.nd[x].b, nm): return true
+        let key = l.t.nd[x].a
+        if k(l, key) == ast.N_COMPUTED and refs_var(l, l.t.nd[key].a, nm): return true
+      elif xk == ast.N_SHORTHAND:
+        if l.t.nd[x].s == nm: return true
+      elif xk == ast.N_SPREAD:
+        if refs_var(l, l.t.nd[x].a, nm): return true
+      elif xk == ast.N_METHOD or xk == ast.N_GET or xk == ast.N_SET:
+        # (the value is a function expression)
+        let key = l.t.nd[x].a
+        let sg = l.t.nd[x].b
+        var shadow = false
+        if sg > 0:
+          for p in list_of(l, l.t.nd[sg].b):
+            if id_named(l, l.t.nd[p].a, nm): shadow = true
+        if not shadow and l.t.nd[x].c > 0 and body_refs(l, l.t.nd[x].c, nm): return true
+        if k(l, key) == ast.N_COMPUTED and refs_var(l, l.t.nd[key].a, nm): return true
+    return false
+  if kd == ast.N_ARROW:
+    if params_shadow(l, e, nm): return false
+    let b = nd.d
+    if k(l, b) == ast.N_BLOCK: return body_refs(l, b, nm)
+    return refs_var(l, b, nm)
+  if kd == ast.N_FUNCEXPR:
+    if params_shadow(l, e, nm): return false
+    if nd.d <= 0: return false
+    return body_refs(l, nd.d, nm)
+  if kd == ast.N_BINARY:
+    if rules.is_assign_op(nd.f):
+      let lt = nd.a
+      var lr = false
+      let lk = k(l, lt)
+      if lk == ast.N_ID: lr = l.t.nd[lt].s == nm
+      elif lk == ast.N_PROPACCESS and (l.t.nd[lt].f & 4) == 0: lr = refs_var(l, l.t.nd[lt].a, nm)
+      elif lk == ast.N_ELEMACCESS: lr = refs_var(l, l.t.nd[lt].a, nm) or refs_var(l, l.t.nd[lt].b, nm)
+      return lr or refs_var(l, nd.b, nm)
+    return refs_var(l, nd.a, nm) or refs_var(l, nd.b, nm)
+  if kd == ast.N_COND: return refs_var(l, nd.a, nm) or refs_var(l, nd.b, nm) or refs_var(l, nd.c, nm)
+  if kd == ast.N_PREFIX or kd == ast.N_POSTFIX:
+    if nd.f == scan.T_INC or nd.f == scan.T_DEC: return id_named(l, nd.a, nm)
+    return refs_var(l, nd.a, nm)
+  if kd == ast.N_TYPEOF or kd == ast.N_VOIDEXPR or kd == ast.N_DELETE or kd == ast.N_AWAIT: return refs_var(l, nd.a, nm)
+  if kd == ast.N_YIELD: return nd.a > 0 and refs_var(l, nd.a, nm)
+  if kd == ast.N_TEMPL:
+    for sp in list_of(l, nd.a):
+      if refs_var(l, l.t.nd[sp].a, nm): return true
+    return false
+  if kd == ast.N_TAGGED:
+    if refs_var(l, nd.a, nm): return true
+    let q = nd.c
+    if k(l, q) == ast.N_TEMPL:
+      for sp in list_of(l, l.t.nd[q].a):
+        if refs_var(l, l.t.nd[sp].a, nm): return true
+    return false
+  return false
+
+# (name, kind) of the previous statement's initialization: 1 array, 2 object, 3 set, 4 map; 0 none
+fn init_kind(l: L, e0: Int) -> Int:
+  let e = im_inner(l, e0)
+  let kd = k(l, e)
+  if kd == ast.N_ARRAY: return 1
+  if kd == ast.N_OBJECT: return 2
+  if kd == ast.N_NEW:
+    let c = im_inner(l, l.t.nd[e].a)
+    if k(l, c) != ast.N_ID or scope.res_of(l.sc, c) != -1: return 0
+    let nm = rules.name_of(l, c)
+    if nm == "Set" or nm == "WeakSet": return 3
+    if nm == "Map" or nm == "WeakMap": return 4
+  return 0
+
+fn prev_decl(l: L, st: Int, var nm: Int) -> Int:
+  let sk = k(l, st)
+  if sk == ast.N_VAR:
+    # (export const x = ...: an export declaration in oxc)
+    if (l.t.nd[st].d & ast.M_EXPORT) != 0: return 0
+    let ds = list_of(l, l.t.nd[st].a)
+    if ds.len == 0: return 0
+    let d = ds[ds.len - 1]
+    let id = l.t.nd[d].a
+    if k(l, id) != ast.N_ID or l.t.nd[d].c <= 0: return 0
+    nm = l.t.nd[id].s
+    return init_kind(l, l.t.nd[d].c)
+  if sk == ast.N_EXPRSTMT:
+    let a = l.t.nd[st].a
+    if k(l, a) != ast.N_BINARY or l.t.nd[a].f != scan.T_ASSIGN: return 0
+    let lt = l.t.nd[a].a
+    if k(l, lt) != ast.N_ID: return 0
+    let r = im_inner(l, l.t.nd[a].b)
+    if k(l, r) == ast.N_BINARY and rules.is_assign_op(l.t.nd[r].f): return 0
+    nm = l.t.nd[lt].s
+    return init_kind(l, r)
+  return 0
+
+fn immediate_mutation(var l: L, n: Int):
+  let p = parent(&l, n)
+  let pk = k(l, p)
+  var lst = -1
+  if pk == ast.N_BLOCK or pk == ast.N_STATICBLOCK: lst = l.t.nd[p].a
+  elif pk == ast.N_CASE: lst = l.t.nd[p].b
+  elif p == 0: lst = rmore5.file_root(&l)
+  if pk == ast.N_STATICBLOCK: lst = l.t.nd[l.t.nd[p].a].a
+  if lst <= 0: return
+  if l.mc.c7.im_lst != lst:
+    l.mc.c7.im_lst = lst
+    l.mc.c7.im_items = list_of(l, lst)
+    l.mc.c7.im_pos = 0
+  var prev = -1
+  let nit = l.mc.c7.im_items.len
+  # (statements are met in order: the search goes on from the last one found)
+  var ii = l.mc.c7.im_pos
+  var tries = 0
+  while tries < nit:
+    if ii >= nit: ii = 0
+    if l.mc.c7.im_items[ii] == n:
+      if ii > 0: prev = l.mc.c7.im_items[ii - 1]
+      l.mc.c7.im_pos = ii
+      break
+    ii += 1
+    tries += 1
+  if prev <= 0: return
+  let e = im_inner(l, l.t.nd[n].a)
+  let ek = k(l, e)
+  var vn = -1
+  if ek == ast.N_CALL:
+    if (l.t.nd[e].f & 1) != 0 or in_chain(l, e): return
+    let m = im_inner(l, l.t.nd[e].a)
+    let mk = k(l, m)
+    if mk != ast.N_PROPACCESS and mk != ast.N_ELEMACCESS: return
+    if (l.t.nd[m].f & 1) != 0: return
+    var ps = 0
+    var pe = 0
+    let meth = static_member(l, m, &ps, &pe)
+    let obj = im_inner(l, l.t.nd[m].a)
+    let args = list_of(l, l.t.nd[e].c)
+    if meth == "assign" and id_named(l, obj, ast.find(l.t, "Object")) and scope.res_of(l.sc, obj) == -1:
+      if args.len == 0: return
+      let a0 = im_inner(l, args[0])
+      if k(l, args[0]) == ast.N_SPREAD or k(l, a0) != ast.N_ID: return
+      let ik = prev_decl(l, prev, &vn)
+      if ik != 2 or vn != l.t.nd[a0].s: return
+      if args.len < 2 or k(l, args[1]) == ast.N_SPREAD: return
+      for i in 1..args.len:
+        if k(l, args[i]) != ast.N_SPREAD and refs_var(l, args[i], vn): return
+      rules.addn(&l, e, "unicorn(no-immediate-mutation)", "Do not call `Object.assign()` immediately after initializing an object.", "Move the properties from `Object.assign()` into the object initializer.")
+      return
+    if meth == "" or k(l, obj) != ast.N_ID: return
+    let ik = prev_decl(l, prev, &vn)
+    if ik == 0 or vn != l.t.nd[obj].s: return
+    if args_refs(l, l.t.nd[e].c, vn): return
+    if ik == 1 and (meth == "push" or meth == "unshift"):
+      if args.len == 0: return
+      rules.addn(&l, e, "unicorn(no-immediate-mutation)", "Do not call `{meth}()` immediately after initializing an array.", "Move the elements from `{meth}()` into the array initializer.")
+    elif ik == 3 and meth == "add":
+      if args.len != 1 or k(l, args[0]) == ast.N_SPREAD: return
+      rules.addn(&l, e, "unicorn(no-immediate-mutation)", "Do not call `.add()` immediately after initializing a Set.", "Add the element to the Set initializer array.")
+    elif ik == 4 and meth == "set":
+      if args.len != 2 or k(l, args[0]) == ast.N_SPREAD or k(l, args[1]) == ast.N_SPREAD: return
+      rules.addn(&l, e, "unicorn(no-immediate-mutation)", "Do not call `.set()` immediately after initializing a Map.", "Add the entry to the Map initializer array.")
+    return
+  if ek == ast.N_BINARY and l.t.nd[e].f == scan.T_ASSIGN:
+    let lt = l.t.nd[e].a
+    let lk = k(l, lt)
+    var obj = -1
+    if lk == ast.N_PROPACCESS and (l.t.nd[lt].f & 4) == 0: obj = im_inner(l, l.t.nd[lt].a)
+    elif lk == ast.N_ELEMACCESS:
+      obj = im_inner(l, l.t.nd[lt].a)
+      if k(l, obj) == ast.N_ID and refs_var(l, l.t.nd[lt].b, l.t.nd[obj].s): return
+    if obj <= 0 or k(l, obj) != ast.N_ID: return
+    let ik = prev_decl(l, prev, &vn)
+    if ik != 2 or vn != l.t.nd[obj].s: return
+    if refs_var(l, l.t.nd[e].b, vn): return
+    rules.addn(&l, e, "unicorn(no-immediate-mutation)", "Do not assign a property immediately after initializing an object literal.", "Move the property into the object initializer.")
+
+# ---- unicorn(prefer-query-selector)
+
+fn not_dom_node(l: L, e: Int) -> Bool:
+  let kd = k(l, e)
+  return kd == ast.N_ARRAY or kd == ast.N_ARROW or kd == ast.N_CLASSEXPR or kd == ast.N_FUNCEXPR or kd == ast.N_OBJECT or kd == ast.N_TEMPL or kd == ast.N_NOSUBTEMPL or kd == ast.N_STR
+
+fn is_ws(c: Byte) -> Bool:
+  return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0B or c == 0x0C
+
+fn split_ws(s: Str) -> [Str]:
+  var out: [Str] = []
+  var i = 0
+  while i < s.len:
+    while i < s.len and is_ws(s[i]): i += 1
+    let st = i
+    while i < s.len and not is_ws(s[i]): i += 1
+    if i > st: out.push(s[st..i])
+  return out
+
+fn query_selector(var l: L, n: Int):
+  if (l.t.nd[n].f & 1) != 0: return
+  let m0 = l.t.nd[n].a
+  if k(l, m0) != ast.N_PROPACCESS or l.t.nd[m0].s < 0: return
+  let nm0 = l.t.names[l.t.nd[m0].s]
+  if not nm0.startswith("getElement"): return
+  let args = list_of(l, l.t.nd[n].c)
+  if args.len != 1 or k(l, args[0]) == ast.N_SPREAD: return
+  let m = l.t.nd[n].a
+  if k(l, m) != ast.N_PROPACCESS or (l.t.nd[m].f & 5) != 0 or in_chain(l, m): return
+  if not_dom_node(l, l.t.nd[m].a): return
+  let pn = rules.name_of(l, m)
+  let pe = l.t.nd[m].end
+  let ps = pe - pn.len
+  var pref = ""
+  if pn == "getElementById": pref = "querySelector"
+  elif pn == "getElementsByClassName" or pn == "getElementsByTagName" or pn == "getElementsByName": pref = "querySelectorAll"
+  else: return
+  let a = args[0]
+  let ak = k(l, a)
+  if l.mc.c7.qs_vars and (pn == "getElementById" or pn == "getElementsByClassName"):
+    let ai = im_inner(l, a)
+    let aik = k(l, ai)
+    var nonlit = true
+    if aik == ast.N_NULL or aik == ast.N_STR or aik == ast.N_NOSUBTEMPL or (aik == ast.N_BINARY and not rules.is_assign_op(l.t.nd[ai].f) and not is_logical(l.t.nd[ai].f) and l.t.nd[ai].f != scan.T_COMMA): nonlit = false
+    elif aik == ast.N_TEMPL:
+      nonlit = rules.name_of(l, ai).strip() == ""
+      for sp in list_of(l, l.t.nd[ai].a):
+        if l.t.names[l.t.nd[sp].s].strip() != "": nonlit = false
+    if nonlit: return
+  let msg = "Prefer `.{pref}()` over `.{pn}()`."
+  let help = "It's better to use the same method to query DOM elements. This helps keep consistency and it lends itself to future improvements (e.g. more specific selectors)."
+  rules.add(&l, ps, "unicorn(prefer-query-selector)", msg, help)
+  rules.span(&l, pe)
+  if ak == ast.N_NULL:
+    rules.fix_of(&l, ps, pe, pref, 1)
+    return
+  var lit = "\0"
+  if ak == ast.N_STR or ak == ast.N_NOSUBTEMPL: lit = rules.name_of(l, a).strip()
+  if lit != "\0":
+    if lit == "":
+      rules.fix_of(&l, ps, pe, pref, 1)
+      return
+    let src = l.src[l.t.nd[a].pos..l.t.nd[a].end]
+    let q = src[0..1]
+    var arg = lit
+    if pn == "getElementById": arg = "#" + lit
+    elif pn == "getElementsByClassName": arg = "." + ".".join(split_ws(lit))
+    elif pn == "getElementsByName":
+      var iq = "'"
+      if q == "'": iq = "\""
+      arg = "[name=" + iq + lit + iq + "]"
+    rules.fix_of(&l, ps, l.t.nd[a].end, pref + "(" + q + arg + q, 1)
+    return
+  if pn == "getElementById" and ak == ast.N_ID:
+    rules.fix_of(&l, ps, l.t.nd[a].end, pref + "(`#${{" + text(l, a) + "}}`", 1)
+
+# ---- unicorn(prefer-native-coercion-functions)
+
+fn first_param_name(l: L, plist: Int) -> Int:
+  var ps = list_of(l, plist)
+  if ps.len > 0 and l.ts and k(l, l.t.nd[ps[0]].a) == ast.N_ID and rules.name_is(l, l.t.nd[ps[0]].a, "this"):
+    var rest: [Int] = []
+    for i in 1..ps.len: rest.push(ps[i])
+    ps = rest
+  if ps.len == 0: return -2
+  let p = ps[0]
+  if (l.t.nd[p].f & ast.M_REST) != 0: return -2
+  # (a TypeScript `this` parameter isn't one)
+  let a = l.t.nd[p].a
+  if k(l, a) != ast.N_ID: return -1
+  return l.t.nd[a].s
+
+fn coercion_call(l: L, e: Int, pn: Int) -> Str:
+  if pn < 0 or k(l, e) != ast.N_CALL or (l.t.nd[e].f & 1) != 0: return ""
+  let args = list_of(l, l.t.nd[e].c)
+  if args.len == 0: return ""
+  let c = l.t.nd[e].a
+  if k(l, c) != ast.N_ID: return ""
+  let nm = rules.name_of(l, c)
+  if nm != "BigInt" and nm != "Boolean" and nm != "Number" and nm != "String" and nm != "Symbol": return ""
+  if k(l, args[0]) == ast.N_ID and l.t.nd[args[0]].s == pn: return nm
+  return ""
+
+fn single_return_call(l: L, body: Int, pn: Int) -> Str:
+  if pn < 0 or k(l, body) != ast.N_BLOCK: return ""
+  let sts = list_of(l, l.t.nd[body].a)
+  if sts.len != 1 or k(l, sts[0]) != ast.N_RETURN or l.t.nd[sts[0]].a <= 0: return ""
+  return coercion_call(l, l.t.nd[sts[0]].a, pn)
+
+fn returned_id(l: L, st: Int) -> Int:
+  let sk = k(l, st)
+  if sk == ast.N_BLOCK:
+    let sts = list_of(l, l.t.nd[st].a)
+    if sts.len != 1: return -1
+    return returned_id(l, sts[0])
+  if sk == ast.N_RETURN and l.t.nd[st].a > 0:
+    let e = rules.unparen(l, l.t.nd[st].a)
+    if k(l, e) == ast.N_ID: return l.t.nd[e].s
+  return -1
+
+fn native_coercion(var l: L, n: Int, kd: Int):
+  let nd = l.t.nd[n]
+  var plist = nd.b
+  var ret = nd.c
+  var body = nd.d
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
+    let sg = nd.b
+    if sg <= 0: return
+    plist = l.t.nd[sg].b
+    ret = l.t.nd[sg].c
+    body = nd.c
+  if kd == ast.N_ARROW:
+    if (nd.f & ast.M_ASYNC) != 0: return
+  elif (nd.f & (ast.M_ASYNC | ast.M_GENERATOR)) != 0: return
+  let pn = first_param_name(l, plist)
+  if pn == -2: return
+  if ret > 0 and k(l, ret) == ast.N_TPRED: return
+  if kd == ast.N_SET and pkind(&l, n) == ast.N_OBJECT: return
+  let fs = fn_span_start(l, n)
+  if kd != ast.N_ARROW:
+    if body <= 0: return
+    let c = single_return_call(l, body, pn)
+    if c != "":
+      rules.add(&l, fs, "unicorn(prefer-native-coercion-functions)", "The function is equivalent to `{c}`. Call `{c}` directly.", "")
+      rules.span(&l, nd.end)
+    return
+  var c = ""
+  var rid = -1
+  if k(l, body) != ast.N_BLOCK:
+    c = coercion_call(l, body, pn)
+    let e = rules.unparen(l, body)
+    if k(l, e) == ast.N_ID: rid = l.t.nd[e].s
+  else:
+    c = single_return_call(l, body, pn)
+    let sts = list_of(l, l.t.nd[body].a)
+    if sts.len > 0: rid = returned_id(l, sts[0])
+  if c != "":
+    rules.add(&l, fs, "unicorn(prefer-native-coercion-functions)", "The function is equivalent to `{c}`. Call `{c}` directly.", "")
+    rules.span(&l, nd.end)
+  let p = parent(&l, n)
+  if k(l, p) != ast.N_CALL or (l.t.nd[p].f & 1) != 0: return
+  let args = list_of(l, l.t.nd[p].c)
+  if args.len == 0 or args[0] != n: return
+  let m = l.t.nd[p].a
+  if (k(l, m) != ast.N_PROPACCESS and k(l, m) != ast.N_ELEMACCESS) or (l.t.nd[m].f & 1) != 0: return
+  var a0 = 0
+  var a1 = 0
+  let mn = static_member(l, m, &a0, &a1)
+  if mn != "every" and mn != "filter" and mn != "find" and mn != "findIndex" and mn != "findLast" and mn != "findLastIndex" and mn != "some": return
+  if pn < 0 or rid != pn: return
+  rules.add(&l, fs, "unicorn(prefer-native-coercion-functions)", "The arrow function in the callback of the array is equivalent to `Boolean`. Replace the callback with `Boolean`.", "")
+  rules.span(&l, nd.end)
+
+# ---- early errors: duplicate parameters
+
+fn bound_names(l: L, n: Int, var out: [Int]):
+  if n <= 0: return
+  let kd = l.t.nd[n].k
+  if kd == ast.N_ID: out.push(n)
+  elif kd == ast.N_OBJPAT or kd == ast.N_ARRPAT:
+    for e in list_of(l, l.t.nd[n].a):
+      if k(l, e) == ast.N_BINDEL: bound_names(l, l.t.nd[e].b, &out)
+
+# oxc's redeclaration errors for duplicate parameters where they aren't allowed: arrows and methods,
+# lists that aren't simple, strict code (JavaScript modules, "use strict", classes). The scopes
+# recorded each parameter declared again in its list.
+fn dup_params(var l: L):
+  if l.sc.pdup_y.len == 0: return
+  var module = -1
+  var done: {Int: Bool} = {}
+  for i in 0..l.sc.pdup_y.len:
+    let f = l.sc.yfn[l.sc.pdup_y[i]]
+    if f <= 0 or f in done: continue
+    done[f] = true
+    let kd = l.t.nd[f].k
+    var plist = l.t.nd[f].b
+    var body = l.t.nd[f].d
+    if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
+      let sg = l.t.nd[f].b
+      if sg <= 0: continue
+      plist = l.t.nd[sg].b
+      body = l.t.nd[f].c
+    let ps = list_of(l, plist)
+    var ids: [Int] = []
+    var simple = true
+    for p in ps:
+      let a = l.t.nd[p].a
+      if k(l, a) != ast.N_ID or l.t.nd[p].c > 0 or (l.t.nd[p].f & ast.M_REST) != 0: simple = false
+      bound_names(l, a, &ids)
+    var bad = not simple or kd != ast.N_FUNC and kd != ast.N_FUNCEXPR
+    if not bad:
+      if not l.ts:
+        if module < 0:
+          module = 0
+          if js_module(&l): module = 1
+        if module == 1: bad = true
+      if not bad and body > 0 and k(l, body) == ast.N_BLOCK and rmore6.has_use_strict(l, l.t.nd[body].a): bad = true
+      if not bad and rmore6.strict_at(&l, f): bad = true
+    if not bad: continue
+    var first: {Int: Int} = {}
+    for x in ids:
+      let nm = l.t.nd[x].s
+      if nm in first:
+        l.sc.redecl_pos.push(l.t.nd[first[nm]].pos)
+        l.sc.redecl_name.push(nm)
+        l.sc.redecl_at.push(l.t.nd[x].pos)
+      else: first[nm] = x
+
+# ---- unicorn(prefer-dom-node-dataset)
+
+fn uses_opt(l: L, e0: Int) -> Bool:
+  let e = im_inner(l, e0)
+  let kd = k(l, e)
+  if kd == ast.N_PROPACCESS or kd == ast.N_ELEMACCESS or kd == ast.N_CALL:
+    if (l.t.nd[e].f & 1) != 0: return true
+    return uses_opt(l, l.t.nd[e].a)
+  return false
+
+fn ident_name_ok(s: Str) -> Bool:
+  if s.len == 0: return false
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if int(c) >= 128:
+      var cp = int(c)
+      var n = 1
+      if cp >= 0xF0 and i + 3 < s.len:
+        cp = ((cp & 7) << 18) | ((int(s[i + 1]) & 63) << 12) | ((int(s[i + 2]) & 63) << 6) | (int(s[i + 3]) & 63)
+        n = 4
+      elif cp >= 0xE0 and i + 2 < s.len:
+        cp = ((cp & 15) << 12) | ((int(s[i + 1]) & 63) << 6) | (int(s[i + 2]) & 63)
+        n = 3
+      elif cp >= 0xC0 and i + 1 < s.len:
+        cp = ((cp & 31) << 6) | (int(s[i + 1]) & 63)
+        n = 2
+      if not scan.id_char(cp): return false
+      i += n
+      continue
+    let ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$' or (i > 0 and c >= '0' and c <= '9')
+    if not ok: return false
+    i += 1
+  return true
+
+fn js_string(s: Str) -> Str:
+  var out = "\""
+  for i in 0..s.len:
+    let c = s[i]
+    if c == '"': out = out + "\\\""
+    elif c == '\\': out = out + "\\\\"
+    elif c == '\n': out = out + "\\n"
+    elif c == '\r': out = out + "\\r"
+    elif c == '\t': out = out + "\\t"
+    else: out = out + s[i..i + 1]
+  return out + "\""
+
+fn camel(s: Str) -> Str:
+  let low = s.lower()
+  var out = ""
+  var up = false
+  for i in 0..low.len:
+    let c = low[i]
+    if c == '-': up = true
+    elif up:
+      out = out + low[i..i + 1].upper()
+      up = false
+    else: out = out + low[i..i + 1]
+  return out
+
+fn dataset_prop(name: Str) -> Str:
+  if ident_name_ok(name): return "." + name
+  return "[" + js_string(name) + "]"
+
+# truncated as oxc's fixer truncates snippets in its messages (256 characters)
+fn snippet(s: Str) -> Str:
+  var n = 0
+  var i = 0
+  while i < s.len:
+    if n == 256: return s[0..i] + "..."
+    let c = int(s[i])
+    if c < 128: i += 1
+    elif c < 224: i += 2
+    elif c < 240: i += 3
+    else: i += 4
+    n += 1
+  return s
+
+# a single replacement's fix with oxc's automatic message as the help when the diagnostic has none
+fn replace_fix(var l: L, fs: Int, fe: Int, ft: Str):
+  rules.fix_of(&l, fs, fe, ft, 1)
+  let i = l.ds.len - 1
+  if l.ds[i].help == "":
+    let tt = snippet(l.src[fs..fe])
+    if ft == "": l.ds[i].help = "Remove `{tt}`."
+    else: l.ds[i].help = "Replace `{tt}` with `{snippet(ft)}`."
+
+# a JavaScript string's value has a lone surrogate (vlint decodes it to U+FFFD)
+fn lone_surrogate(l: L, n: Int) -> Bool:
+  let v = rules.name_of(l, n)
+  return v.find("�") >= 0 and text(l, n).find("�") < 0
+
+fn dom_dataset(var l: L, n: Int):
+  let m = im_inner(l, l.t.nd[n].a)
+  if k(l, m) != ast.N_PROPACCESS or (l.t.nd[m].f & 4) != 0 or l.t.nd[m].s < 0: return
+  if not l.t.names[l.t.nd[m].s].endswith("Attribute"): return
+  let meth = rules.name_of(l, m)
+  let pe = l.t.nd[m].end
+  let ps = pe - meth.len
+  let args = list_of(l, l.t.nd[n].c)
+  var want_args = 1
+  if meth == "setAttribute": want_args = 2
+  elif meth != "removeAttribute" and meth != "hasAttribute" and meth != "getAttribute": return
+  if args.len != want_args: return
+  let par = parent(&l, n)
+  if meth == "getAttribute" and k(l, par) == ast.N_AWAIT: return
+  let a0 = args[0]
+  if k(l, a0) != ast.N_STR: return
+  let v = rules.name_of(l, a0)
+  if not v.startswith("data-") and not v.startswith("DATA-"): return
+  let prop = camel(v[5..v.len])
+  let lone = lone_surrogate(l, a0)
+  let obj = l.t.nd[m].a
+  let ot = l.src[l.t.nd[obj].pos..l.t.nd[obj].end]
+  let cs = l.t.nd[n].pos
+  let ce = l.t.nd[n].end
+  let usable_not = k(l, par) == ast.N_EXPRSTMT
+  let mopt = (l.t.nd[m].f & 1) != 0
+  var acc = "."
+  if mopt: acc = "?."
+  if meth == "setAttribute":
+    rules.add(&l, ps, "unicorn(prefer-dom-node-dataset)", "Prefer using `dataset` over `setAttribute`.", "")
+    rules.span(&l, pe)
+    if not lone and (l.t.nd[n].f & 1) == 0 and not uses_opt(l, l.t.nd[n].a) and usable_not:
+      replace_fix(&l, cs, ce, ot + ".dataset" + dataset_prop(prop) + " = " + text(l, args[1]))
+  elif meth == "getAttribute":
+    rules.add(&l, ps, "unicorn(prefer-dom-node-dataset)", "Prefer using `dataset` over `getAttribute`.", "")
+    rules.span(&l, pe)
+    if not lone and (l.t.nd[n].f & 1) == 0: replace_fix(&l, cs, ce, ot + acc + "dataset" + dataset_prop(prop))
+  elif meth == "removeAttribute":
+    rules.addn(&l, a0, "unicorn(prefer-dom-node-dataset)", "Prefer using `dataset` over `removeAttribute`.", "")
+    if not lone and (l.t.nd[n].f & 1) == 0 and usable_not: replace_fix(&l, cs, ce, "delete " + ot + acc + "dataset" + dataset_prop(prop))
+  else:
+    rules.add(&l, ps, "unicorn(prefer-dom-node-dataset)", "Prefer using `dataset` over `hasAttribute`.", "")
+    rules.span(&l, pe)
+    if not lone and (l.t.nd[n].f & 1) == 0 and not uses_opt(l, l.t.nd[n].a): replace_fix(&l, cs, ce, "Object.hasOwn(" + ot + ".dataset, " + js_string(prop) + ")")
+
+# ---- eslint(no-else-return)
+
+fn naive_return(l: L, st: Int) -> Int:
+  let sk = k(l, st)
+  if sk == ast.N_BLOCK:
+    let sts = list_of(l, l.t.nd[st].a)
+    if sts.len > 0 and k(l, sts[sts.len - 1]) == ast.N_RETURN: return sts[sts.len - 1]
+    return -1
+  if sk == ast.N_RETURN: return st
+  return -1
+
+fn return_or_if(l: L, st: Int) -> Int:
+  let sk = k(l, st)
+  if sk == ast.N_RETURN: return st
+  if sk == ast.N_IF:
+    let alt = l.t.nd[st].c
+    if alt <= 0: return -1
+    if naive_return(l, alt) > 0 and naive_return(l, l.t.nd[st].b) > 0: return st
+  return -1
+
+fn always_returns(l: L, st: Int) -> Int:
+  if k(l, st) == ast.N_BLOCK:
+    for x in list_of(l, l.t.nd[st].a):
+      let r = return_or_if(l, x)
+      if r > 0: return r
+    return -1
+  return return_or_if(l, st)
+
+# the declarations directly in a block clash with other bindings of the scope around it
+fn collides(var l: L, blk: Int) -> Bool:
+  for st in list_of(l, l.t.nd[blk].a):
+    var names: [Int] = []
+    let sk = k(l, st)
+    if sk == ast.N_VAR and l.t.nd[st].f != 0:
+      for d in list_of(l, l.t.nd[st].a): bound_names(l, l.t.nd[d].a, &names)
+      for x in names:
+        let y = sym_at_pos(&l, l.t.nd[x].pos)
+        if y >= 0 and clash(l, y): return true
+    elif sk == ast.N_FUNC or sk == ast.N_CLASS or sk == ast.N_INTERFACE or sk == ast.N_TYPEALIAS or sk == ast.N_ENUM:
+      let y = sym_at_pos(&l, l.t.npos.get(st, l.t.nd[st].pos))
+      if y >= 0 and clash(l, y): return true
+  return false
+
+fn clash(l: L, y: Int) -> Bool:
+  let ps = l.sc.sp[l.sc.ys[y]]
+  if ps < 0: return false
+  let v = scope.tab_get(l.sc, ps, l.sc.yn[y], false)
+  if v >= 0 and v != y: return true
+  let t = scope.tab_get(l.sc, ps, l.sc.yn[y], true)
+  return t >= 0 and t != y
+
+fn else_return(var l: L, n: Int):
+  let p = parent(&l, n)
+  let pk = k(l, p)
+  if not (p == 0 or pk == ast.N_BLOCK or pk == ast.N_STATICBLOCK or pk == ast.N_CASE): return
+  var prev = -1
+  var alt = -1
+  var ret = -1
+  if l.mc.c7.er_elseif:
+    var cur = n
+    while true:
+      let a = l.t.nd[cur].c
+      if a <= 0: return
+      let r = always_returns(l, l.t.nd[cur].b)
+      if r <= 0: return
+      prev = l.t.nd[cur].b
+      alt = a
+      ret = r
+      if k(l, a) == ast.N_IF: cur = a
+      else: break
+  else:
+    alt = l.t.nd[n].c
+    if alt <= 0: return
+    ret = always_returns(l, l.t.nd[n].b)
+    if ret <= 0: return
+    prev = l.t.nd[n].b
+  let es = l.t.nd[prev].end
+  let ce = l.t.nd[alt].end
+  rules.add(&l, l.t.nd[ret].pos, "eslint(no-else-return)", "Unnecessary `else` after `return`.", "Remove the `else` block, moving its contents outside of the `if` statement.")
+  rules.label(&l, l.t.nd[ret].end, "This consequent block always returns,")
+  rules.more(&l, es, l.t.nd[alt].pos, "Making this `else` block unnecessary.", true)
+  rules.primary_more(&l)
+  let ak = k(l, alt)
+  if ak == ast.N_FUNC: return
+  if ak == ast.N_BLOCK and collides(&l, alt): return
+  var rs = l.t.nd[alt].pos
+  var re = ce
+  if ak == ast.N_BLOCK:
+    rs += 1
+    re -= 1
+  let pk2 = k(l, prev)
+  var nl = false
+  if pk2 == ast.N_EXPRSTMT or pk2 == ast.N_RETURN: nl = not l.src[l.t.nd[prev].pos..l.t.nd[prev].end].endswith(";")
+  var semi = false
+  var last = alt
+  if ak == ast.N_BLOCK:
+    let sts = list_of(l, l.t.nd[alt].a)
+    if sts.len > 0: last = sts[sts.len - 1]
+    else: last = -1
+  if last > 0:
+    let lt = l.src[l.t.nd[last].pos..l.t.nd[last].end].rstrip()
+    if not lt.endswith(";") and not lt.endswith("}}"):
+      var i = ce
+      while i < l.src.len:
+        let c = l.src[i]
+        if c == '\n' or c == '\r' or c == '}' or c == ';': break
+        if c == 0xE2 and i + 2 < l.src.len and l.src[i + 1] == 0x80 and (l.src[i + 2] == 0xA8 or l.src[i + 2] == 0xA9): break
+        if not is_ws(c):
+          semi = true
+          break
+        i += 1
+  var txt = l.src[rs..re]
+  if nl: txt = "\n" + txt
+  if semi: txt = txt + ";"
+  rules.fix_of(&l, es, ce, txt, 1)

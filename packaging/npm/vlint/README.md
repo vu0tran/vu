@@ -2,7 +2,7 @@
 
 An oxlint-compatible linter written in [Vu](https://github.com/vu0tran/vu), meant as a drop-in
 replacement for oxlint 1.90.0: the same command line, configuration files, output and exit codes.
-It runs oxlint's default rules and about 180 of the rules projects most often turn on, reads
+It runs oxlint's default rules and about 215 of the rules projects most often turn on, reads
 `.oxlintrc.json`, and checks `.js .mjs .cjs .jsx .ts .mts .cts .tsx` plus the scripts in `.vue`,
 `.astro` and `.svelte` files.
 
@@ -21,7 +21,7 @@ scripts, change one line in `package.json`:
 ```diff
    "devDependencies": {
 -    "oxlint": "^1.90.0"
-+    "oxlint": "npm:@vu0tran/vlint@^0.2.0"
++    "oxlint": "npm:@vu0tran/vlint@^0.4.0"
    }
 ```
 
@@ -70,13 +70,13 @@ no JavaScript API (oxlint's `defineConfig` isn't there; JS plugins in the config
 - Speed: less CPU time than oxlint on a single thread with the default rules (0.99 s against
   3.83 s on a 3,445-file corpus of TypeScript and bundled JavaScript, best of 5, measured on a
   2-core VM); with a large configuration that turns on the import graph and the vitest rules
-  (kimi-code), a little more (2.34 s against 2.02 s).
+  (kimi-code), more (2.9 s against 2.2 s).
 
 ## What's not there yet
 
 Check that your project doesn't depend on these before switching:
 
-- **Rules**: vlint has all of oxlint's defaults plus about 200 more (`prefer-const`,
+- **Rules**: vlint has all of oxlint's defaults plus about 215 more (`prefer-const`, `no-shadow`,
   `no-restricted-imports`, `react-hooks/rules-of-hooks`, `react-hooks/exhaustive-deps`,
   `react/only-export-components`, `no-console`, `eqeqeq`, `curly`, `no-redeclare`,
   `import/first`, the import graph rules, `typescript/no-explicit-any`,
@@ -84,16 +84,17 @@ Check that your project doesn't depend on these before switching:
   (`expect-expect`, `valid-expect`, `valid-title`, ...), ...; the list is in the source's README).
   A rule it doesn't have is accepted in the configuration and reports nothing. Missing, notably:
   the React Compiler rules oxlint turns on with the react plugin (`react/refs`, `react/purity`,
-  `react/set-state-in-effect`, ...); vue, nextjs; `no-shadow`, `no-unmodified-loop-condition`, `prefer-set-has`, `no-fallthrough`;
-  many pedantic and style rules. Counted on 1,830 real `.oxlintrc.json` files, vlint has 72% of the
-  rules they turn on by name and 85% counting what their categories turn on.
+  `react/set-state-in-effect`, ...); vue, nextjs; `no-regex-spaces`, `oxc/no-map-spread`,
+  `react/no-unstable-nested-components`; many pedantic and style rules. Counted on 1,830 real
+  `.oxlintrc.json` files, vlint has 74% of the rules they turn on by name and 85% counting what
+  their categories turn on.
 - **JavaScript config files** (`oxlint.config.ts`, a `vite.config.ts` `lint` field): refused. With
   several `jsPlugins` entries, `--print-config` can list them in another order than oxlint.
 - **Options**: `--lsp` isn't supported. `--fix-suggestions`/`--fix-dangerously` don't apply the
   suggestions of `no-unused-vars`, `no-new-array` and `no-extra-boolean-cast` yet.
 - Parse errors: some files that oxc rejects are accepted by vlint (several of oxc's early
   errors aren't made), vlint reports only the first syntax error, and its messages don't always
-  use oxc's wording (109 of oxc's 369 parser fixtures give identical output).
+  use oxc's wording (89 of oxc's 369 parser fixtures give identical output).
 - Platforms: Linux x64 and ARM64 (static binaries: any glibc or musl), macOS 12 or later on Apple
   silicon and Intel. No Windows build (Vu doesn't target Windows yet). On macOS, `--cache` caches
   nothing (it keys the cache by `/proc/self/exe`, which macOS doesn't have).

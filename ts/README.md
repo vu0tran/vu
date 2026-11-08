@@ -217,7 +217,16 @@ round (`rmore5.vu`, `rmore6.vu`, kimi-code's most frequent missing ones): `unico
 `no-unnecessary-array-splice-count`, `consistent-assert`, `prefer-array-find`,
 `prefer-import-meta-properties`, `prefer-at`; `no-promise-executor-return`, `no-lonely-if`,
 `prefer-promise-reject-errors`, `no-inner-declarations`; `promise/` `no-promise-in-callback`,
-`no-callback-in-promise`. All 61
+`no-callback-in-promise`. Added in round 7 (`rmore7.vu`, by how often configurations enable them,
+then kimi-code's last missing ones): `no-unmodified-loop-condition`, `no-shadow` (every option),
+`unicorn/consistent-function-scoping`, `unicorn/prefer-set-has` (with its dangerous fix),
+`oxc/no-accumulating-spread`, `typescript/consistent-type-imports` (its fixes in both fix styles,
+and `prefer: no-type-imports`), `no-fallthrough` (oxc's control-flow notion of a case that can
+complete: loops always can, a `do`-`while` only through its body), `jsx-a11y/lang` (the IANA subtag
+registry of the `language-tags` crate oxc uses, `llang.vu`: identical to the crate on 115,000
+generated tags), `no-loop-func`, `unicorn/no-immediate-mutation`, `unicorn/prefer-query-selector`,
+`unicorn/prefer-native-coercion-functions`, `unicorn/prefer-dom-node-dataset`, `no-else-return`
+(their fixes, with oxc's automatic fix messages as help where the rule gives none). All 61
 type-aware rules through tsgolint. A rule
 vlint doesn't have is accepted in the configuration and reports nothing. The rules added in these
 rounds are in `rhooks.vu` (exhaustive-deps), `rmore.vu`, `rmore2.vu` and `ra11y.vu`; each runs only
@@ -237,15 +246,13 @@ same span sorted inner first); all fixed.
 
 **Coverage of real configurations** (the 1,830 `.oxlintrc.json` files collected from GitHub in an
 earlier round, `vlint4-work/cov.py` and `cov2.py`): of the rules those files turn on by name
-(12,227 enables, type-aware ones counted as covered), vlint now has 71.7% (70.2% at the start of
-this round, 64.3% two rounds ago); counting the rules their categories and plugins turn on as
-well (233,108 enables, type-aware excluded), 84.6% (84.0%). The largest missing share is the React
-Compiler rules (about 1,030 enables each, 12,300 together), then `no-unmodified-loop-condition`
-(314), `no-shadow` (265), `unicorn/consistent-function-scoping` (202), `prefer-set-has` (193),
-`oxc/no-accumulating-spread` (178), `typescript/consistent-type-imports` (165), `no-fallthrough`
-(156), `jsx-a11y/lang` (145), `oxc/no-map-spread` (130), `no-regex-spaces` (126),
-`react/no-unstable-nested-components` (123), and the vue plugin (about 35 rules enabled by about
-119 configs each).
+(12,227 enables, type-aware ones counted as covered), vlint now has 73.8% (71.7% at the start of
+round 7, 64.3% three rounds ago); counting the rules their categories and plugins turn on as
+well (233,108 enables, type-aware excluded), 85.5% (84.6%). The largest missing share is the React
+Compiler rules (about 1,030 enables each, 12,300 together), then `oxc/no-map-spread` (130),
+`no-regex-spaces` (126), `react/no-unstable-nested-components` (123) and the vue plugin (about 35
+rules enabled by about 119 configs each); by name, `no-regex-spaces` (48), `typescript/array-type`
+(33), `prefer-template` (30), `no-restricted-globals` (26).
 
 **The module graph** (`lmod.vu`, `lresolve.vu`, `rimport.vu`): when a rule that reads it is on,
 vlint builds the graph oxlint builds before linting: every linted file's module record (as oxc's
@@ -286,14 +293,10 @@ categories, env, globals and settings maps.
   approximation was considered and not shipped: it would trade missing diagnostics for wrong ones.
 - The other ~540 non-default rules: missing (the vue plugin, nextjs, the rest of import's
   syntactic rules, jest/vitest style rules, most of unicorn's and eslint's pedantic and style
-  rules). On kimi-code (which turns on pedantic, perf, vitest, import) vlint now finds 10,558 of
-  oxlint's 10,599 diagnostics (10,185 at the start of this round, 435 four rounds ago), with
-  none extra and the order identical; the rest are `unicorn/no-immediate-mutation` (14),
-  `no-loop-func` (10), `no-unmodified-loop-condition` (8) and 6 rules with 1 or 2
-  (`no-fallthrough`, `prefer-set-has`, `prefer-dom-node-dataset`, `no-else-return`,
-  `prefer-native-coercion-functions`, `prefer-query-selector`).
-- `jsx-a11y/lang` (needs the IANA language subtag registry) and `jsx-a11y/anchor-ambiguous-text`
-  (13 enables): missing.
+  rules). kimi-code (which turns on pedantic, perf, vitest, import) is now complete: all 10,599 of
+  oxlint's diagnostics, all 1,679 files identical (10,558 at the start of round 7, 435 five rounds
+  ago).
+- `jsx-a11y/anchor-ambiguous-text` (13 enables): missing.
 - `prefer-snapshot-hint`'s diagnostics in two excalidraw files come out in another order: oxc groups
   snapshot calls in an `FxHashMap` keyed by its own node ids, which vlint doesn't number the same.
 - The module graph covers files whose whole text is JavaScript or TypeScript (`.vue`, `.svelte` and
@@ -321,7 +324,15 @@ categories, env, globals and settings maps.
   exports in JavaScript files, and tagged templates in optional chains; a crash on `<!--` in a
   module (`index -1 out of bounds` in `parse.vu`) is fixed (oxc's "HTML comments are not allowed in
   modules" is still not reported). Fixed in the previous round: vlint rejected valid TypeScript with
-  a conditional type inside a mapped type inside a conditional type's `extends` clause.
+  a conditional type inside a mapped type inside a conditional type's `extends` clause. Added in
+  round 7: duplicate parameters where oxc forbids them (arrows, methods, lists that aren't simple,
+  strict code: JavaScript modules, `"use strict"`, classes) as oxc's redeclaration errors (vscode's
+  4 Conway fixtures now match, and vscode with defaults is 2,769 of 2,783 files identical); a static
+  block's `var` no longer leaks into the enclosing scope, and a function or class expression's own
+  name no longer clashes with a declaration in its body (`(function a() { let a; })` was reported
+  as a redeclaration). Counted with one oxlint and one vlint run over the fixtures folder (files
+  with no diagnostics on both count as identical), 89 of 369 are identical before and after this
+  round; the earlier figure of 109 was counted another way.
 - `-f sarif` puts the suppression file's errors into oxlint's `notifications`; vlint doesn't.
   `-f checkstyle` groups files in oxlint's hash order (unchanged).
 
@@ -333,7 +344,7 @@ categories, env, globals and settings maps.
 | lc | the previous round's added rules on | 1570 / 1570 vlint files (oxlint's 3 more: React Compiler) |
 | preact, excalidraw | defaults | 230 / 230 |
 | preact, excalidraw | the previous round's added rules + react plugin | 488 / 574 (the rest: React Compiler, exhaustive-deps, now added) |
-| vscode | defaults | 2764 / 2783 (the rest: files oxc can't parse) |
+| vscode | defaults | 2769 / 2783 (the rest: files oxc rejects with errors vlint words differently or doesn't make) |
 | config cases (`cfgtest`, 54 cases, as an agent and as a person) | | 108 / 108 |
 | mantine (+ preact, Tracearr, next-shadcn-dashboard-starter, difit) | `react-hooks/exhaustive-deps` | 237 + 41 + 5 + 2 diagnostics, all identical |
 | 900 generated components (`gen_hooks.py`, 3 seeds) | exhaustive-deps with `additionalHooks` | 4,101 / 4,101 diagnostics; `--fix` and `--fix-dangerously` files identical |
@@ -345,7 +356,9 @@ categories, env, globals and settings maps.
 | excalidraw, mantine, kimi-code, preact | `react/only-export-components`, defaults and every option | 3,059 and 958 diagnostics, all identical; 7 attack files identical |
 | excalidraw, mantine, preact, Tracearr, kimi-code, next-shadcn-dashboard-starter | the 16 jsx-a11y rules | 145 diagnostics, all identical; attack files with and without options and settings identical, fixes included |
 | lc, kimi-code | three configurations whose overrides add plugins and rules | every file's order identical for every rule whose diagnostics match |
-| kimi-code | its own configuration | 10,558 of oxlint's 10,599 diagnostics, none extra, order identical (10,185 at the start of this round) |
+| kimi-code | its own configuration | 10,599 / 10,599 diagnostics, 1,679 / 1,679 files identical (10,558 at the start of round 7) |
+| oxc's test cases of round 7's 14 rules | defaults, and each case with its options (`opt.sh`) | identical except parse-error wording and early errors vlint doesn't make; `--fix`/`--fix-dangerously` output identical |
+| lc, preact, excalidraw, vscode, the 15 real projects | each of round 7's rules on its own | all identical (7,179 `no-shadow` and 40,269 `consistent-type-imports` on lc2, 5,664 `consistent-function-scoping`, 1,784 `no-else-return`, 843 `no-loop-func`, 446 `no-immediate-mutation`, ...), except files with early errors vlint doesn't make; `consistent-type-imports`' and `no-else-return`'s `--fix` output identical on OpenFrontIO |
 | oxc's test cases of this round's 19 rules | defaults (1,773 cases), and each case with its own options (655 cases, `optcases.py`: one folder and config each) | identical: all 751 and 358 files with diagnostics, and the files `--fix`, `--fix-suggestions`, `--fix-dangerously` write |
 | lc, preact, excalidraw, vscode, kimi-code, the 15 real projects | this round's rules, each batch on its own and all together | all identical (about 15,000 diagnostics: 3,449 `explicit-length-check`, 2,725 `prefer-single-call`, 2,091 `no-lonely-if`, 1,416 `no-inner-declarations` with "both", 1,293 `prefer-at` and 45,618 with `checkAllIndexAccess`, ...); the only differences are files oxlint rejects with early errors vlint doesn't make |
 | JS plugins: oxlint's fixtures | as the fixtures run them | 81 / 94 |
@@ -361,12 +374,24 @@ categories, env, globals and settings maps.
 Real projects with their own `.oxlintrc.json` (15 cloned from GitHub; JS plugins removed from
 their configs where the plugin isn't installed): identical on agents, leaflet-geoman, logtape,
 mcp, OpenFrontIO (type-aware), react-element-to-jsx-string, react-starter-kit,
-typescript-nextjs-starter, yak; FigmaToCode, Tracearr, difit and next-shadcn-dashboard-starter
-differ only by React Compiler diagnostics, jsx-a11y (Tracearr) and `react/no-unstable-nested-components`
-(next-shadcn-dashboard-starter); their `react-hooks/exhaustive-deps` diagnostics are now identical;
-kimi-code by rules vlint doesn't have (10,558 of 10,599 found, none extra).
+typescript-nextjs-starter, yak and (since round 7) kimi-code; FigmaToCode, Tracearr, difit and
+next-shadcn-dashboard-starter differ only by React Compiler diagnostics and
+`react/no-unstable-nested-components` (next-shadcn-dashboard-starter). (OpenFrontIO needs tsgolint
+and evolu's configuration needs oxlint's JavaScript config support to run oxlint at all; they were
+compared with the rule configurations above.)
 
-**Speed this round**: with the default rules nothing changed (callgrind, x86-64-v2 builds, one
+**Speed in round 7** (callgrind, x86-64-v2 builds, one thread): with the default rules zod takes
+543.5M instructions against 541.2M before the round (+0.4%: the larger per-file rule tables and
+the scope events' extra bookkeeping), vscode/src/vs/editor/common 333.4M against 333.5M.
+kimi-code's agent-core-v2 package with kimi-code's configuration, which turns on 10 of this
+round's rules: 9,804M against 9,477M (+3.5%, for the new rules' work; their first version cost
++9%: `prefer-set-has` scanned every reference event and every export for each candidate, now
+one per-file index of each symbol's reference events and one table of exported names, and maps
+keyed by position became an open-addressing table). Whole kimi-code, CPU best of 3 on a loaded
+2-core machine: vlint 2.94 s against 2.80 s before the round, oxlint 2.15 s; the import graph's
+second parse (planned) was not taken on this round.
+
+**Speed in the previous round**: with the default rules nothing changed (callgrind, x86-64-v2 builds, one
 thread: zod 542.6M instructions against 542.9M at the round's start, vscode/src/vs/editor/common
 334.1M against 334.7M). kimi-code with its own configuration, which turns on 19 of this round's
 rules: 2.73 s and 2.41 s of CPU against 2.53 s and 2.50 s for the round's start (best of 5, two
