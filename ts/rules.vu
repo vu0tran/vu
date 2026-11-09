@@ -278,6 +278,11 @@ fn is_func(kd: Int) -> Bool:
 
 # ---- structural equality (oxlint's content_eq: values, not spelling)
 
+# A string literal's text without its quotes, escapes of lone surrogates lower-cased
+fn lone_key(t: Str) -> Str:
+  if t.len < 2: return t
+  return t[1..t.len - 1].lower()
+
 fn same(l: L, a: Int, b: Int) -> Bool:
   if a == b: return true
   if a <= 0 or b <= 0: return false
@@ -289,6 +294,8 @@ fn same(l: L, a: Int, b: Int) -> Bool:
       if not same(l, l.t.L[l.t.nd[a].a + i], l.t.L[l.t.nd[b].a + i]): return false
     return true
   if l.t.nd[a].f != l.t.nd[b].f or l.t.nd[a].s != l.t.nd[b].s: return false
+  # (a lone surrogate reads as U+FFFD here; oxc keeps each one: compare the escapes)
+  if ka == ast.N_STR and l.t.names[l.t.nd[a].s].find("�") >= 0: return lone_key(text(l, a)) == lone_key(text(l, b))
   if ka == ast.N_PROPACCESS: return same(l, l.t.nd[a].a, l.t.nd[b].a)
   if ka == ast.N_VAR or ka == ast.N_INTERFACE or ka == ast.N_TYPEALIAS:
     return same(l, l.t.nd[a].a, l.t.nd[b].a) and same(l, l.t.nd[a].b, l.t.nd[b].b) and same(l, l.t.nd[a].c, l.t.nd[b].c) and l.t.nd[a].d == l.t.nd[b].d
@@ -422,6 +429,8 @@ fn lint_l(c: Cx, sev: [Int], opts: [Str], var l: L, path: Str, root: Int, fixing
   let uvi = c.m.byname.get("eslint/no-unused-vars", -1)
   if uvi >= 0 and opts[uvi] != "": l.uv = uv_options(opts[uvi])
   if opts.len > c.m.name.len: l.globals = opts[c.m.name.len].split("\n")
+  let cai = lmeta.M_ESLINT_NO_COND_ASSIGN
+  if opts[cai] != "": l.nc.ca_always = opts[cai].find("\"always\"") >= 0
   let uoi = lmeta.M_ESLINT_NO_UNSAFE_OPTIONAL_CHAINING
   if opts[uoi] != "":
     var js = lconf.Json([], "", "")
@@ -1536,7 +1545,7 @@ fn check(var l: L, n: Int, kd: Int):
       for_direction(&l, n)
   elif kd == ast.N_COND:
     let test = l.t.nd[n].a
-    cond_assign(&l, unparen(l, test))
+    cond_assign(&l, inner_expr(l, test))
     const_cond(&l, test)
     bool_ctx(&l, test, n)
   elif kd == ast.N_BREAK or kd == ast.N_CONTINUE: check_jump(&l, n, kd)
@@ -1744,7 +1753,9 @@ fn check_binary(var l: L, n: Int):
   if op == T_QQ:
     if const_nullish(l, a, false):
       addn(&l, n, "eslint(no-constant-binary-expression)", "Unexpected constant nullishness on the left-hand side of a \"??\" expression", "This expression always evaluates to the constant on the left-hand side")
-  if is_assign_op(op): ns_import_write(&l, n, a)
+  if is_assign_op(op):
+    ns_import_write(&l, n, a)
+    if l.nc.ca_always: cond_assign_in_test(&l, n)
   if op == T_ASSIGN: ns_import_pattern(&l, unparen(l, a), true)
   if op == T_ASSIGN:
     let ua = unparen(l, a)
@@ -1946,8 +1957,27 @@ fn report_self(var l: L, n: Int):
 
 # ---- conditions
 
-fn cond_assign(var l: L, test: Int):
-  if k(l, test) == ast.N_BINARY and is_assign_op(l.t.nd[test].f):
+fn cond_assign(var l: L, test0: Int):
+  var test = test0
+  if l.nc.ca_always: test = inner_expr(l, test0)
+  if k(l, test) == ast.N_BINARY and is_assign_op(l.t.nd[test].f): cond_assign_at(&l, test)
+
+# ("always": an assignment anywhere in a test, up to the enclosing function or block)
+fn cond_assign_in_test(var l: L, n: Int):
+  var a = parent(&l, n)
+  while a > 0:
+    let ak = l.t.nd[a].k
+    if ak == ast.N_BLOCK or is_fn_kind(ak) or ak == ast.N_FUNCEXPR: return
+    var t = -1
+    if ak == ast.N_IF or ak == ast.N_WHILE or ak == ast.N_COND: t = l.t.nd[a].a
+    elif ak == ast.N_DO or ak == ast.N_FOR: t = l.t.nd[a].b
+    if t > 0 and l.t.nd[t].pos <= l.t.nd[n].pos and l.t.nd[n].end <= l.t.nd[t].end:
+      cond_assign_at(&l, n)
+      return
+    a = parent(&l, a)
+
+fn cond_assign_at(var l: L, test: Int):
+  if true:
     let left = l.t.nd[test].a
     let at = skip_to_op(l, l.t.nd[left].end)
     add(&l, at, "eslint(no-cond-assign)", "Expected a conditional expression and instead saw an assignment", "Consider wrapping the assignment in additional parentheses")
@@ -4625,7 +4655,40 @@ fn pm_target(l: L, n: Int, var vr: {Int: Int}, var sr: {Int: Int}, var wr: {Int:
 
 # ======== plugin rules (oxc, typescript, unicorn)
 
+# The module record's export_default (as oxc): the first local default export (export default ...,
+# export { x as default }), else the first indirect one (export { default } from ...); -1 none
+fn default_export_pos(l: L, root: Int) -> Int:
+  var di = -1
+  for st in ast.items(l.t, root):
+    let ks = l.t.nd[st].k
+    if ks == ast.N_EXPORT:
+      if (l.t.nd[st].f & ast.M_TYPEONLY) != 0: continue
+      let from = l.t.nd[st].a > 0
+      let b = l.t.nd[st].b
+      if b < 0:
+        let ns = l.t.nd[st].c
+        if ns > 0 and l.t.names[l.t.nd[ns].s] == "default" and di < 0: di = l.t.nd[ns].pos
+        continue
+      for sp in ast.items(l.t, b):
+        if (l.t.nd[sp].f & ast.M_TYPEONLY) != 0: continue
+        if l.t.names[l.t.nd[sp].s] == "default":
+          let se = spec_exported(l, sp)
+          if not from: return se[0]
+          if di < 0: di = se[0]
+    elif ks == ast.N_EXPORTDEFAULT: return default_kw(l, st)
+    else:
+      var m = 0
+      if ks == ast.N_VAR or ks == ast.N_INTERFACE: m = l.t.nd[st].d
+      elif ks == ast.N_FUNC or ks == ast.N_CLASS: m = l.t.nd[st].f
+      if (m & ast.M_EXPORT) != 0 and (m & ast.M_DEFAULT) != 0: return default_kw(l, st)
+  return di
+
 fn file_rules(var l: L, root: Int):
+  if on_rule(l, lmeta.M_IMPORT_NO_DEFAULT_EXPORT):
+    let dp = default_export_pos(l, root)
+    if dp >= 0:
+      add(&l, dp, "import(no-default-export)", "Prefer named exports", "Replace this default export with a named export.")
+      span(&l, dp + 7)
   if on_rule(l, lmeta.M_ESLINT_NO_RESTRICTED_IMPORTS):
     let save = l.cur
     l.cur = 0
@@ -5998,9 +6061,11 @@ type NewCfg:
   ar_stmt: Bool         # no-array-reverse: allowExpressionStatement
   ut_default: Bool      # no-unneeded-ternary: defaultAssignment
   uoc_arith: Bool       # no-unsafe-optional-chaining: disallowArithmeticOperators
+  pc_irba: Bool         # prefer-const: ignoreReadBeforeAssign
+  ca_always: Bool       # no-cond-assign: "always"
 
 fn new_cfg() -> NewCfg:
-  return NewCfg([], false, 0, false, false, true, false, [], false, false, false, false, false, 0, false, [], [2, 1, 1, 0], ["", "", "", ""], 3, 0, false, true, true, true, false, [false, false, false], false, {}, {}, {}, false, [], [], 0, true, false, true, true, false)
+  return NewCfg([], false, 0, false, false, true, false, [], false, false, false, false, false, 0, false, [], [2, 1, 1, 0], ["", "", "", ""], 3, 0, false, true, true, true, false, [false, false, false], false, {}, {}, {}, false, [], [], 0, true, false, true, true, false, false, false)
 
 fn on_rule(l: L, m: Int) -> Bool:
   return l.en.len > 0 and l.en[m]
@@ -6024,11 +6089,12 @@ fn opt_bool(js: lconf.Json, o: Int, key: Str, dflt: Bool) -> Bool:
 # Which new rules are on for this file, the node kinds they need, and their options
 fn new_rules_setup(var l: L, sev: [Int], opts: [Str]):
   var any = false
-  for m in [lmeta.M_TYPESCRIPT_NO_EXPLICIT_ANY, lmeta.M_ESLINT_NO_CONSOLE, lmeta.M_ESLINT_NO_VAR, lmeta.M_ESLINT_EQEQEQ, lmeta.M_ESLINT_PREFER_REST_PARAMS, lmeta.M_TYPESCRIPT_NO_REQUIRE_IMPORTS, lmeta.M_ESLINT_NO_EMPTY, lmeta.M_ESLINT_NO_ARRAY_CONSTRUCTOR, lmeta.M_TYPESCRIPT_NO_UNNECESSARY_TYPE_CONSTRAINT, lmeta.M_TYPESCRIPT_NO_NAMESPACE, lmeta.M_TYPESCRIPT_NO_UNSAFE_FUNCTION_TYPE, lmeta.M_TYPESCRIPT_NO_NON_NULL_ASSERTION, lmeta.M_UNICORN_PREFER_NODE_PROTOCOL, lmeta.M_ESLINT_NO_CASE_DECLARATIONS, lmeta.M_ESLINT_NO_PROTOTYPE_BUILTINS, lmeta.M_ESLINT_PREFER_SPREAD, lmeta.M_TYPESCRIPT_BAN_TS_COMMENT, lmeta.M_TYPESCRIPT_NO_EMPTY_OBJECT_TYPE, lmeta.M_ESLINT_CURLY, lmeta.M_REACT_JSX_KEY, lmeta.M_REACT_NO_THIS_IN_SFC, lmeta.M_REACT_NO_CHILDREN_PROP, lmeta.M_REACT_NO_FIND_DOM_NODE, lmeta.M_ESLINT_NO_NEW, lmeta.M_UNICORN_REQUIRE_MODULE_SPECIFIERS, lmeta.M_REACT_JSX_NO_DUPLICATE_PROPS, lmeta.M_REACT_NO_IS_MOUNTED, lmeta.M_REACT_NO_RENDER_RETURN_VALUE, lmeta.M_REACT_NO_STRING_REFS, lmeta.M_REACT_NO_DID_MOUNT_SET_STATE, lmeta.M_REACT_NO_DID_UPDATE_SET_STATE, lmeta.M_REACT_NO_WILL_UPDATE_SET_STATE, lmeta.M_REACT_NO_DIRECT_MUTATION_STATE, lmeta.M_REACT_NO_UNSAFE, lmeta.M_REACT_VOID_DOM_ELEMENTS_NO_CHILDREN, lmeta.M_REACT_NO_DANGER_WITH_CHILDREN, lmeta.M_REACT_JSX_NO_UNDEF, lmeta.M_REACT_FORWARD_REF_USES_REF, lmeta.M_REACT_JSX_PROPS_NO_SPREAD_MULTI, lmeta.M_REACT_RULES_OF_HOOKS, lmeta.M_REACT_EXHAUSTIVE_DEPS, lmeta.M_ESLINT_PREFER_CONST, lmeta.M_ESLINT_NO_RESTRICTED_IMPORTS, lmeta.M_UNICORN_NO_ARRAY_SORT, lmeta.M_UNICORN_NO_ARRAY_REVERSE, lmeta.M_ESLINT_NO_UNNEEDED_TERNARY, lmeta.M_ESLINT_NO_USELESS_CONCAT, lmeta.M_OXC_MISREFACTORED_ASSIGN_OP]:
+  for m in [lmeta.M_TYPESCRIPT_NO_EXPLICIT_ANY, lmeta.M_ESLINT_NO_CONSOLE, lmeta.M_ESLINT_NO_VAR, lmeta.M_ESLINT_EQEQEQ, lmeta.M_ESLINT_PREFER_REST_PARAMS, lmeta.M_TYPESCRIPT_NO_REQUIRE_IMPORTS, lmeta.M_ESLINT_NO_EMPTY, lmeta.M_ESLINT_NO_ARRAY_CONSTRUCTOR, lmeta.M_TYPESCRIPT_NO_UNNECESSARY_TYPE_CONSTRAINT, lmeta.M_TYPESCRIPT_NO_NAMESPACE, lmeta.M_TYPESCRIPT_NO_UNSAFE_FUNCTION_TYPE, lmeta.M_TYPESCRIPT_NO_NON_NULL_ASSERTION, lmeta.M_UNICORN_PREFER_NODE_PROTOCOL, lmeta.M_ESLINT_NO_CASE_DECLARATIONS, lmeta.M_ESLINT_NO_PROTOTYPE_BUILTINS, lmeta.M_ESLINT_PREFER_SPREAD, lmeta.M_TYPESCRIPT_BAN_TS_COMMENT, lmeta.M_TYPESCRIPT_NO_EMPTY_OBJECT_TYPE, lmeta.M_ESLINT_CURLY, lmeta.M_REACT_JSX_KEY, lmeta.M_REACT_NO_THIS_IN_SFC, lmeta.M_REACT_NO_CHILDREN_PROP, lmeta.M_REACT_NO_FIND_DOM_NODE, lmeta.M_ESLINT_NO_NEW, lmeta.M_UNICORN_REQUIRE_MODULE_SPECIFIERS, lmeta.M_REACT_JSX_NO_DUPLICATE_PROPS, lmeta.M_REACT_NO_IS_MOUNTED, lmeta.M_REACT_NO_RENDER_RETURN_VALUE, lmeta.M_REACT_NO_STRING_REFS, lmeta.M_REACT_NO_DID_MOUNT_SET_STATE, lmeta.M_REACT_NO_DID_UPDATE_SET_STATE, lmeta.M_REACT_NO_WILL_UPDATE_SET_STATE, lmeta.M_REACT_NO_DIRECT_MUTATION_STATE, lmeta.M_REACT_NO_UNSAFE, lmeta.M_REACT_VOID_DOM_ELEMENTS_NO_CHILDREN, lmeta.M_REACT_NO_DANGER_WITH_CHILDREN, lmeta.M_REACT_JSX_NO_UNDEF, lmeta.M_REACT_FORWARD_REF_USES_REF, lmeta.M_REACT_JSX_PROPS_NO_SPREAD_MULTI, lmeta.M_REACT_RULES_OF_HOOKS, lmeta.M_REACT_EXHAUSTIVE_DEPS, lmeta.M_ESLINT_PREFER_CONST, lmeta.M_ESLINT_NO_RESTRICTED_IMPORTS, lmeta.M_UNICORN_NO_ARRAY_SORT, lmeta.M_UNICORN_NO_ARRAY_REVERSE, lmeta.M_ESLINT_NO_UNNEEDED_TERNARY, lmeta.M_ESLINT_NO_USELESS_CONCAT, lmeta.M_OXC_MISREFACTORED_ASSIGN_OP, lmeta.M_IMPORT_NO_DEFAULT_EXPORT]:
     if sev[m] > 0: any = true
-  if not any and not rmore.any_on(sev): return
+  # (every rule's on/off, even when none of the rules set up here is on: on_rule reads it)
   l.en = [false] * sev.len
   for i in 0..sev.len: l.en[i] = sev[i] > 0
+  if not any and not rmore.any_on(sev): return
   var nk = [false] * 160
   if l.ts and l.en[lmeta.M_TYPESCRIPT_NO_EXPLICIT_ANY]:
     want_kind(&nk, ast.N_TKW)
@@ -6208,6 +6274,9 @@ fn new_rules_setup(var l: L, sev: [Int], opts: [Str]):
   if l.en[lmeta.M_ESLINT_PREFER_CONST]:
     want_kind(&nk, ast.N_VAR)
     l.nc.pc_all = opts[lmeta.M_ESLINT_PREFER_CONST].find("\"all\"") >= 0
+    var js = lconf.Json([], "", "")
+    let o = opts_obj(opts[lmeta.M_ESLINT_PREFER_CONST], &js)
+    if o >= 0: l.nc.pc_irba = opt_bool(js, o, "ignoreReadBeforeAssign", false)
   if l.en[lmeta.M_REACT_RULES_OF_HOOKS] and not l.vue_svelte: want_kind(&nk, ast.N_CALL)
   if l.en[lmeta.M_REACT_EXHAUSTIVE_DEPS] and not l.vue_svelte:
     want_kind(&nk, ast.N_CALL)
@@ -8405,8 +8474,39 @@ fn target_all_const(var l: L, t: Int) -> Bool:
   if kd == ast.N_BINARY and l.t.nd[t].f == T_ASSIGN: return target_all_const(&l, l.t.nd[t].a)
   return true
 
+# ignoreReadBeforeAssign (as oxc): with an initializer, a read before the declaration; without one
+# and a single plain write, a read before that write (in reference order)
+fn read_before_assign(var l: L, y: Int, has_init: Bool) -> Bool:
+  let evs = rmore7.sym_events(&l, y)
+  if has_init:
+    var d = id_node_at(&l, l.sc.ypos[y])
+    while d > 0 and k(l, d) != ast.N_DECL: d = parent(&l, d)
+    if d <= 0: return false
+    for i in evs:
+      let e = l.t.sv.q[i]
+      if e.k < 64 and (e.k & ast.R_READ) != 0 and l.t.nd[e.n].pos < l.t.nd[d].pos: return true
+    return false
+  var wi = -1
+  var nw = 0
+  for i in evs:
+    let e = l.t.sv.q[i]
+    var wo = e.k < 64 and (e.k & ast.R_WRITE) != 0 and (e.k & ast.R_READ) == 0
+    if e.k == ast.Q_ASSIGN and k(l, e.n) == ast.N_BINARY and l.t.nd[e.n].f == T_ASSIGN: wo = true
+    if wo:
+      nw += 1
+      if wi < 0: wi = i
+  if nw != 1: return false
+  for i in evs:
+    if i == wi: return false
+    let e = l.t.sv.q[i]
+    if e.k < 64 and (e.k & ast.R_READ) != 0: return true
+  return false
+
 fn should_be_const(var l: L, y: Int, has_init: Bool, for_in_of: Bool) -> Bool:
   let ws = sym_writes(&l, y)
+  if l.nc.pc_irba:
+    if has_init and read_before_assign(&l, y, true): return false
+    if not has_init and ws.len == 1 and read_before_assign(&l, y, false): return false
   if for_in_of and ws.len == 0: return true
   if has_init: return ws.len == 0
   if ws.len != 1: return false
