@@ -1,9 +1,12 @@
 /* JS plugins (ljs.vu): long-lived node processes running the plugin host. vlint writes a request (one
    line of JSON) to a process's fd 3 and reads the answer (one line) from its fd 4; the process's
-   standard output and error are vlint's (as a plugin's console.log is oxlint's). Each linting thread
-   uses its own process (up to VL_MAXW, shared beyond that, one request at a time); a process is
-   started when first needed and is first sent the prelude (the plugin loads and the rules'
-   options), so every process registers the same rules. Processes end when their fd 3 closes. */
+   standard output and error are vlint's (as a plugin's console.log is oxlint's). The linting threads
+   share the processes (one process for each two cores by default, see vl_node_setup): a thread
+   writes its request without waiting for the others' answers, so the next file is already there
+   when the process finishes one, and reads its answer when its turn comes (the process answers in
+   the order it was asked: tickets). A process is started when first needed and is first sent the
+   prelude (the plugin loads and the rules' options), so every process registers the same rules.
+   Processes end when their fd 3 closes. */
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
@@ -16,7 +19,14 @@
 #include <unistd.h>
 extern char **environ;
 #define VL_MAXW 8
-typedef struct { pid_t pid; int in, out; char *buf; size_t len, cap; pthread_mutex_t mu; } vl_worker;
+/* mu: starting the process and writing requests (taking a ticket); rmu, cv: reading answers in
+   ticket order. broken: the process died or a write failed; the next writer restarts it (gen
+   counts restarts, so the waiters of a dead process give up). Lock order: mu, then rmu. */
+typedef struct {
+    pid_t pid; int in, out; char *buf; size_t len, cap, have, next;
+    pthread_mutex_t mu, rmu; pthread_cond_t cv;
+    long tickets, serving; int gen, broken;
+} vl_worker;
 static vl_worker vlw[VL_MAXW];
 static pthread_mutex_t vl_mu = PTHREAD_MUTEX_INITIALIZER;
 static char *vl_script = NULL;
@@ -26,6 +36,7 @@ static char **vl_env = NULL;      /* the processes' environment: vlint's, with N
 static char *vl_prelude = NULL;   /* lines */
 static size_t vl_prelude_len = 0;
 static int vl_slots = 1, vl_next_slot = 0, vl_inited = 0;
+static char vl_pool[32] = "";     /* --v8-pool-size=N for the processes, or "" */
 static __thread int vl_slot = -1;
 
 static void vl_stop(vl_worker *w) {
@@ -35,6 +46,7 @@ static void vl_stop(vl_worker *w) {
     int st;
     while (waitpid(w->pid, &st, 0) < 0 && errno == EINTR) {}
     w->pid = -1; w->in = w->out = -1;
+    w->have = w->next = 0;
 }
 
 static void vl_atexit(void) { for (int i = 0; i < VL_MAXW; i++) vl_stop(&vlw[i]); }
@@ -45,6 +57,10 @@ static void vl_init_once(void) {
     for (int i = 0; i < VL_MAXW; i++) {
         vlw[i].pid = -1; vlw[i].in = vlw[i].out = -1; vlw[i].buf = NULL; vlw[i].len = vlw[i].cap = 0;
         pthread_mutex_init(&vlw[i].mu, NULL);
+        pthread_mutex_init(&vlw[i].rmu, NULL);
+        pthread_cond_init(&vlw[i].cv, NULL);
+        vlw[i].have = vlw[i].next = 0;
+        vlw[i].tickets = vlw[i].serving = 0; vlw[i].gen = 0; vlw[i].broken = 0;
     }
     atexit(vl_atexit);
 }
@@ -72,18 +88,28 @@ static bool vl_write(int fd, const char *p, size_t n) {
     return ok;
 }
 
-/* reads one answer line into w->buf (without the newline): false when the process died */
+/* reads one answer line: w->buf[0..w->len) (without the newline), false when the process died.
+   What was read past the line (the next answers) stays in the buffer for the next call. */
 static bool vl_recv(vl_worker *w) {
-    w->len = 0;
+    if (w->next > 0) {
+        memmove(w->buf, w->buf + w->next, w->have - w->next);
+        w->have -= w->next;
+        w->next = 0;
+    }
+    size_t scanned = 0;
     for (;;) {
-        if (w->cap - w->len < 65536) { w->cap = w->cap ? w->cap * 2 : 131072; w->buf = realloc(w->buf, w->cap); }
+        char *nl = w->have > scanned ? memchr(w->buf + scanned, '\n', w->have - scanned) : NULL;
+        if (nl) {
+            w->len = (size_t)(nl - w->buf);
+            w->next = w->len + 1;
+            return true;
+        }
+        scanned = w->have;
+        if (w->cap - w->have < 65536) { w->cap = w->cap ? w->cap * 2 : 131072; w->buf = realloc(w->buf, w->cap); }
         ssize_t r;
-        do r = read(w->out, w->buf + w->len, w->cap - w->len); while (r < 0 && errno == EINTR);
-        if (r <= 0) { vl_stop(w); return false; }
-        size_t start = w->len;
-        w->len += (size_t)r;
-        char *nl = memchr(w->buf + start, '\n', (size_t)r);
-        if (nl) { w->len = (size_t)(nl - w->buf); return true; }
+        do r = read(w->out, w->buf + w->have, w->cap - w->have); while (r < 0 && errno == EINTR);
+        if (r <= 0) return false;
+        w->have += (size_t)r;
     }
 }
 
@@ -100,9 +126,12 @@ static bool vl_start(vl_worker *w) {
     posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
     posix_spawn_file_actions_adddup2(&fa, r3, 3);
     posix_spawn_file_actions_adddup2(&fa, w4, 4);
-    char **argv = calloc((size_t)vl_nargs + 4, sizeof *argv);
-    argv[0] = "node"; argv[1] = "--no-warnings"; argv[2] = vl_script;
-    for (int i = 0; i < vl_nargs; i++) argv[3 + i] = vl_args[i];
+    char **argv = calloc((size_t)vl_nargs + 5, sizeof *argv);
+    int a0 = 0;
+    argv[a0++] = "node"; argv[a0++] = "--no-warnings";
+    if (vl_pool[0]) argv[a0++] = vl_pool;
+    argv[a0++] = vl_script;
+    for (int i = 0; i < vl_nargs; i++) argv[a0 + i] = vl_args[i];
     pid_t pid;
     int rc = posix_spawnp(&pid, "node", &fa, NULL, argv, vl_env ? vl_env : environ);
     free(argv);
@@ -143,7 +172,26 @@ void vl_node_setup(const vu_str *script, const vu_str *args, int64_t slots) {
             p = nl ? nl + 1 : NULL;
         }
     }
-    vl_slots = slots < 1 ? 1 : slots > VL_MAXW ? VL_MAXW : (int)slots;
+    /* How many node processes: one for each two cores (a busy node process keeps about one and a
+       half cores busy, with V8's own threads), at most one per linting thread; the threads share
+       them. VLINT_JS_PROCS sets it (for measuring). */
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    long procs = ncpu > 1 ? ncpu / 2 : 1;
+    if (procs > slots) procs = slots;
+    const char *jp = getenv("VLINT_JS_PROCS");
+    if (jp && atoi(jp) > 0) procs = atoi(jp);
+    vl_slots = procs < 1 ? 1 : procs > VL_MAXW ? VL_MAXW : (int)procs;
+    /* Node gives each process 4 background V8 threads (GC, optimizing compiles) whatever the
+       machine; with a process per core they only take turns with the processes' own threads.
+       Each gets the cores left over per process, at least 1 (AFFiNE's config with six JS plugins
+       on 2 cores: 5-8% less wall and CPU time), unless NODE_OPTIONS sets it. */
+    const char *no = getenv("NODE_OPTIONS");
+    if (!(no && strstr(no, "v8-pool-size"))) {
+        long k = ncpu > 0 ? ncpu / vl_slots - 1 : 1;
+        if (k < 1) k = 1;
+        if (k > 4) k = 4;
+        snprintf(vl_pool, sizeof vl_pool, "--v8-pool-size=%ld", k);
+    } else vl_pool[0] = 0;
     /* Node's compile cache (Node 22.1 and later; older ones ignore it) in a folder beside the host
        script, so later runs don't compile the host and the plugins again (about 0.5 s a process),
        unless the user chose a cache or turned it off */
@@ -172,22 +220,63 @@ void vl_node_prelude(const vu_str *lines) {
     pthread_mutex_unlock(&vl_mu);
 }
 
-/* The answer to a request from this thread's process, or "!" when node can't be started or died. */
+/* Sends a request and takes a ticket for its answer: the ticket and the process's generation, or
+   false when node can't be started. A dead process is stopped and started again first. */
+static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
+    pthread_mutex_lock(&w->mu);
+    if (w->broken || w->pid < 0) {
+        pthread_mutex_lock(&w->rmu);
+        if (w->pid >= 0) vl_stop(w);
+        w->broken = 0; w->gen++; w->tickets = w->serving = 0;
+        pthread_cond_broadcast(&w->cv);
+        pthread_mutex_unlock(&w->rmu);
+        if (!vl_start(w)) { vl_stop(w); w->broken = 1; pthread_mutex_unlock(&w->mu); return false; }
+    }
+    bool ok = vl_write(w->in, req->data, (size_t)req->len) && vl_write(w->in, "\n", 1);
+    pthread_mutex_lock(&w->rmu);
+    if (ok && !w->broken) { *t = w->tickets++; *g = w->gen; }
+    else if (ok) *g = -1;  /* (it died meanwhile, found by a reader: no answer will come) */
+    else {
+        /* (the process died: its waiters give up, the request goes again) */
+        w->broken = 1; w->gen++;
+        *g = -1;
+        pthread_cond_broadcast(&w->cv);
+    }
+    pthread_mutex_unlock(&w->rmu);
+    pthread_mutex_unlock(&w->mu);
+    return true;
+}
+
+/* The answer to a request from this thread's process, or "!" when node can't be started or died
+   answering it. A request queued behind the one that made the process die is sent again (up to
+   3 times) to the new process. */
 vu_str vl_node_call(const vu_str *req) {
     pthread_mutex_lock(&vl_mu);
     vl_init_once();
     if (vl_slot < 0) vl_slot = (vl_next_slot++) % vl_slots;
     pthread_mutex_unlock(&vl_mu);
     vl_worker *w = &vlw[vl_slot];
-    pthread_mutex_lock(&w->mu);
-    vu_str res;
-    if (w->pid < 0 && !vl_start(w)) { res = vu_str_from("!", 1); goto out; }
-    if (!vl_write(w->in, req->data, (size_t)req->len) || !vl_write(w->in, "\n", 1)) { vl_stop(w); res = vu_str_from("!", 1); goto out; }
-    if (!vl_recv(w)) { res = vu_str_from("!", 1); goto out; }
-    res = vu_str_from(w->buf, (int64_t)w->len);
-out:
-    pthread_mutex_unlock(&w->mu);
-    return res;
+    for (int attempt = 0; attempt <= 3; attempt++) {
+        long t = 0;
+        int g = 0;
+        if (!vl_send(w, req, &t, &g)) return vu_str_from("!", 1);
+        if (g < 0) continue;
+        pthread_mutex_lock(&w->rmu);
+        while (w->gen == g && w->serving != t) pthread_cond_wait(&w->cv, &w->rmu);
+        if (w->gen != g) { pthread_mutex_unlock(&w->rmu); continue; }
+        vu_str res;
+        if (vl_recv(w)) {
+            res = vu_str_from(w->buf, (int64_t)w->len);
+            w->serving++;
+        } else {
+            w->broken = 1; w->gen++;
+            res = vu_str_from("!", 1);
+        }
+        pthread_cond_broadcast(&w->cv);
+        pthread_mutex_unlock(&w->rmu);
+        return res;
+    }
+    return vu_str_from("!", 1);
 }
 
 /* Ends the processes (they finish the work they have). */

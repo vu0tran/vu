@@ -175,6 +175,27 @@ set: a one-file run with those plugins, 2.0 s before, takes 1.5 s from the secon
 the same diagnostics on AFFiNE, lc 308 of 308, and a dumping plugin's ASTs and scopes byte-identical
 to the previous build's on 18,196 dumps. Not measured on a machine with more cores.
 
+CPU, the same day: vlint used about 30% more CPU than oxlint there (104-111 s against 79 s), and
+nearly all of it was in the node processes. A busy node process keeps about one and a half cores
+busy (V8's garbage collector and optimizing compiler run beside it), so with a process per core on
+2 cores the processes mostly took turns: the React Compiler's rules alone cost 79 s of CPU in two
+processes and 56 s in one, in the same wall time. Now: one node process for each two cores (at
+most one per linting thread; `VLINT_JS_PROCS` sets it), shared by the linting threads, which send
+their requests without waiting for each other's answers (answers come back in order, by ticket),
+so the process isn't left waiting for the next file (11 s of a 58 s run before); each process gets
+`--v8-pool-size` of the cores left over per process, at least 1, instead of Node's 4 (unless
+`NODE_OPTIONS` sets it); and `setParents` walks each node type's fields from a list made once per
+type. AFFiNE, oxlint's config, three runs each alternating: oxlint 57.8, 58.0, 59.0 s wall and
+81.9, 82.4, 83.2 s CPU; vlint 56.6, 58.4, 61.7 s wall and 80.5, 83.9, 88.9 s CPU, 1.0-1.2 GB
+against oxlint's 2.4 GB; the same diagnostics. A request queued behind one whose plugin made node
+exit is sent again to a new process (the one that did gets the error, as before); and
+`process.exit()` in a plugin no longer leaves node hung (fd 3 is read as a socket now, not a file
+stream with a blocking read in libuv's thread pool). Checked: lc 308 of 308; 8 threads on 1 and 3
+processes, the same AFFiNE diagnostics; plugins that make node exit on one file and on every fifth
+file, 150 runs with 1 to 8 threads and 1 or 2 processes, every other file linted and only those
+files reported; `VLINT_JS_CHECK=1` (no node missed by the per-type field lists) on AFFiNE, lc and
+blocksuite.
+
 **Output**: oxlint's graphical report (themes, links, summary lines), the agent format, and all
 `-f` formats, byte-identical in the cases checked.
 

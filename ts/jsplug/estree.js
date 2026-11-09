@@ -1737,19 +1737,46 @@ function hasModuleSyntax(prog) {
 
 // ---- parents
 
+// Each node type's fields that can hold nodes, from the first node of the type seen: every node of
+// a type has the same fields (as oxc's structs do), and fields holding a string, number or boolean
+// never hold a node. (VLINT_JS_CHECK=1 checks that no node is missed, for testing.)
+const PARENT_SKIP = new Set(["type", "start", "end", "range", "parent", "loc", "comments", "tokens", "regex"]);
+const childKeys = new Map();
+const checkKeys = typeof process !== "undefined" && process.env.VLINT_JS_CHECK === "1";
+function keysOf(node) {
+  let ks = childKeys.get(node.type);
+  if (ks === undefined) {
+    ks = [];
+    for (const k of Object.keys(node)) {
+      if (PARENT_SKIP.has(k)) continue;
+      const v = node[k];
+      if (v === null || typeof v === "object") ks.push(k);
+    }
+    childKeys.set(node.type, ks);
+  }
+  if (checkKeys) {
+    const own = Object.keys(node).filter((k) => !PARENT_SKIP.has(k));
+    for (const k of own) {
+      const v = node[k];
+      const isNode = (x) => x !== null && typeof x === "object" && typeof x.type === "string";
+      if ((isNode(v) || (Array.isArray(v) && v.some(isNode))) && !ks.includes(k)) process.stderr.write(`VLINT_JS_CHECK: ${node.type}.${k} not in [${ks}]\n`);
+    }
+  }
+  return ks;
+}
+
 function setParents(node, parent) {
   node.parent = parent;
-  for (const key in node) {
-    if (key === "parent" || key === "loc" || key === "comments" || key === "tokens") continue;
-    const v = node[key];
+  const ks = keysOf(node);
+  for (let j = 0; j < ks.length; j++) {
+    const v = node[ks[j]];
     if (v === null || typeof v !== "object") continue;
     if (Array.isArray(v)) {
       for (let i = 0; i < v.length; i++) {
         const x = v[i];
         if (x !== null && typeof x === "object" && typeof x.type === "string") setParents(x, node);
       }
-    } else if (typeof v.type === "string" && key !== "value" && key !== "regex") setParents(v, node);
-    else if (key === "value" && typeof v.type === "string") setParents(v, node);
+    } else if (typeof v.type === "string") setParents(v, node);
   }
 }
 

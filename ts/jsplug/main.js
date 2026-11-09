@@ -3,7 +3,8 @@
 //   {"op":"setup", "json"}                      -> null, or the error message
 //   {"op":"lint", "path", "src", "bom", "jsx", "sourceType", "base", "tree", "rules", "opts",
 //    "settings", "globals"}                      -> null, or lintFile's answer (JSON text)
-import { createReadStream as __vlCreateReadStream, writeSync as __vlWriteSync } from "node:fs";
+import { writeSync as __vlWriteSync } from "node:fs";
+import { Socket as __vlSocket } from "node:net";
 import { createInterface as __vlCreateInterface } from "node:readline";
 
 // (standard output and error are vlint's: Node makes pipes non-blocking, which would make vlint's
@@ -49,6 +50,8 @@ function __vlHandle(line) {
   __vlAnswer(null);
 }
 let __vlChain = Promise.resolve();
-__vlCreateInterface({ input: __vlCreateReadStream(null, { fd: 3 }), crlfDelay: Infinity }).on("line", (line) => {
+// (fd 3 read as a pipe, from the event loop: a file stream would leave a blocking read in libuv's
+// thread pool, and process.exit() in a plugin would wait for it forever)
+__vlCreateInterface({ input: new __vlSocket({ fd: 3, readable: true, writable: false }), crlfDelay: Infinity }).on("line", (line) => {
   __vlChain = __vlChain.then(() => __vlHandle(line));
 });
