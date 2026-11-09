@@ -1,0 +1,1413 @@
+# staticcheck's IR-based checks SA4006 (a value never used), SA4009 (an argument overwritten before
+# its first use) and SA4017 (a pure call's result ignored), honnef.co/go/tools v0.6.1, without
+# building its IR: a block graph per function over the local variables the IR would lift into
+# registers, and liveness on it.
+#
+# What the IR does and this models:
+# - a variable stays in memory (and is never reported) when its address is taken, a closure refers
+#   to it, a field of it (a struct) or an element of it (an array) is selected, a method with a
+#   pointer receiver is called on it, or it's a named result of a function that defers;
+# - a value is used when a read of its variable follows on some path before the next assignment;
+#   the exit block reads the named results, and is where returns, panics and calls that never return
+#   go (staticcheck's NoReturn facts: tables for the standard library, computed for the package);
+# - code nothing reaches is gone, so nothing in it is reported;
+# - SA4006 skips constants (nil and conversions of constants too), right-hand sides that are another
+#   register's value, var declarations, op= assignments, range clauses and select cases;
+# - purity (SA4017): staticcheck's facts for the standard library (a table), and for the package's
+#   own functions its rules on the syntax: results, parameters of basic types, nothing but pure
+#   calls, no memory but the stack, no panics, sends, selects, goroutines or defers.
+
+import ast
+import tc
+import vet
+import errcheck
+import ssadata
+from scan import T_ASSIGN, T_DEFINE, T_AND, T_ARROW, T_NOT, T_LAND, T_LOR, T_EQL, T_NEQ, T_MUL
+from scan import K_VAR, K_BREAK, K_CONTINUE, K_GOTO, K_FALLTHROUGH
+
+const USE = 0
+const DEF = 1     # a definition that isn't reported
+const DEFC = 2    # x = v: SA4006 when its value is dead
+const DEFX = 3    # a, b = f(): SA4006 when dead
+const PARAM = 4   # a parameter's value on entry: SA4009 when dead
+const CHECK = 5   # a use in x == nil or x != nil as a branch's condition (SA5011)
+const DEREF = 6   # a use that dereferences x (SA5011)
+const ESC = 7     # the IR needs x's address here, or a closure takes it
+
+fn is_use(kind: Int) -> Bool:
+  return kind == USE or kind == CHECK or kind == DEREF
+
+type Rep:
+  n: Int
+  code: Str
+  msg: Str
+
+type E:
+  pi: Int
+  owner: {Int: Int}     # local variable -> the function (FuncDecl or FuncLit node) declaring it
+  esc: {Int: Bool}      # variables the IR keeps in memory
+  noret: {Int: Int}     # package functions: 1 never returns, 0 returns, -1 being computed
+  pure: {Int: Int}
+  std_noret: {Str: Bool}
+  std_pure: {Str: Bool}
+  esc_log: [Int]        # variables referred to from another function, as they're seen
+  tests: [Bool]         # per file: a _test.go file
+  out: [Rep]
+
+type F:
+  fnode: Int
+  rep: Bool
+  succ: [[Int]]
+  bops: [[Int]]
+  term: [Bool]          # the block ends in a call that never returns, or a panic
+  ok: [Int]             # each operation: kind, variable, identifier, statement, right-hand call
+  oo: [Int]
+  on: [Int]
+  ost: [Int]
+  orc: [Int]
+  oro: [Int]            # DEFC: the right-hand side is this local variable
+  cur: Int
+  exit: Int
+  results: [Int]
+  has_defer: Bool
+  labels: {Str: Int}
+  plabel: Str
+  jl: [Str]
+  jb: [Int]
+  jc: [Int]
+  calls: [Int]          # calls as statements, and their blocks
+  cblk: [Int]
+
+fn new_e(pi: Int, tests: [Bool]) -> E:
+  var ts: [Bool] = []
+  for x in tests: ts.push(x)
+  return E(pi, {}, {}, {}, {}, ssadata.std_noreturn(), ssadata.std_pure(), [], ts, [])
+
+fn kk(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0: return 0
+  return g.pk[pi].t.k[n]
+
+fn fa(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return g.pk[pi].t.a[n]
+
+fn fb(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return g.pk[pi].t.b[n]
+
+fn fc(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return g.pk[pi].t.c[n]
+
+fn fd(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return g.pk[pi].t.d[n]
+
+fn ff(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return g.pk[pi].t.f[n]
+
+fn its(g: tc.Prog, pi: Int, l: Int) -> [Int]:
+  if l <= 0: return []
+  if g.pk[pi].t.k[l] != ast.N_LIST: return [l]
+  return ast.items(g.pk[pi].t, l)
+
+fn name(g: tc.Prog, pi: Int, n: Int) -> Str:
+  return g.pk[pi].t.names[g.pk[pi].t.s[n]] + ""
+
+fn unparen(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return vet.unparen(g, pi, n)
+
+fn obj(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0 or n >= g.pk[pi].use.len: return -1
+  return g.pk[pi].use[n]
+
+fn under_kind(var g: tc.Prog, fs: Fs, pi: Int, n: Int) -> Int:
+  let t = vet.ty(g, pi, n)
+  if t <= 0: return 0
+  let u = tc.under(&g, fs, t)
+  if u <= 0: return 0
+  return g.tk[u]
+
+# ---- blocks and operations
+
+fn nb(var f: F) -> Int:
+  f.succ.push([])
+  f.bops.push([])
+  f.term.push(false)
+  return f.succ.len - 1
+
+fn edge(var f: F, a: Int, b: Int):
+  f.succ[a].push(b)
+
+fn op(var f: F, kind: Int, o: Int, n: Int, st: Int, rc: Int, ro: Int):
+  let i = f.ok.len
+  f.ok.push(kind)
+  f.oo.push(o)
+  f.on.push(n)
+  f.ost.push(st)
+  f.orc.push(rc)
+  f.oro.push(ro)
+  let c = f.cur
+  f.bops[c].push(i)
+
+fn terminate(var f: F):
+  let c = f.cur
+  f.term[c] = true
+  edge(&f, c, f.exit)
+  f.cur = nb(&f)
+
+fn jump(var f: F, to: Int):
+  let c = f.cur
+  edge(&f, c, to)
+  f.cur = nb(&f)
+
+fn label_block(var f: F, l: Str) -> Int:
+  if l in f.labels: return f.labels[l]
+  let b = nb(&f)
+  f.labels[l] = b
+  return b
+
+# A declaration of a local variable (a parameter, a result, := or var).
+fn decl(g: tc.Prog, var e: E, f: F, id: Int):
+  if kk(g, e.pi, id) != ast.N_IDENT or name(g, e.pi, id) == "_": return
+  let o = obj(g, e.pi, id)
+  if o >= 0 and g.ok[o] == tc.O_VAR and not (o in e.owner): e.owner[o] = f.fnode
+
+# The local variable an identifier refers to, if it belongs to this function (else -1; a
+# reference from another function keeps it in memory).
+fn local(g: tc.Prog, var e: E, f: F, id: Int) -> Int:
+  if kk(g, e.pi, id) != ast.N_IDENT: return -1
+  let o = obj(g, e.pi, id)
+  if o < 0 or not (o in e.owner): return -1
+  if e.owner[o] != f.fnode:
+    e.esc_log.push(o)
+    return -1
+  return o
+
+# After a closure (or a range-over-function body): the variables of this function it captured.
+fn captures(var e: E, var f: F, mark: Int, n: Int):
+  var seen: {Int: Bool} = {}
+  var l: [Int] = []
+  for j in mark..e.esc_log.len: l.push(e.esc_log[j])
+  for o in l:
+    if o in seen: continue
+    seen[o] = true
+    if e.owner[o] == f.fnode: op(&f, ESC, o, n, -1, -1, -1)
+
+fn use_id(g: tc.Prog, var e: E, var f: F, id: Int):
+  let o = local(g, &e, f, id)
+  if o >= 0: op(&f, USE, o, id, -1, -1, -1)
+
+# ---- calls
+
+fn static_fn(g: tc.Prog, o: Int) -> Bool:
+  let pk = g.opkg[o]
+  let d = g.odecl[o]
+  return pk >= 0 and d >= 0 and g.pk[pk].t.k[d] == ast.N_FUNCDECL
+
+fn is_builtin(g: tc.Prog, pi: Int, fun: Int, nm: Str) -> Bool:
+  let x = unparen(g, pi, fun)
+  if kk(g, pi, x) != ast.N_IDENT: return false
+  let o = obj(g, pi, x)
+  return o >= 0 and g.ok[o] == tc.O_BUILTIN and g.oname[o] == nm
+
+fn noreturn_call(var g: tc.Prog, fs: Fs, var e: E, call: Int) -> Bool:
+  let pi = e.pi
+  if is_builtin(g, pi, fa(g, pi, call), "panic"): return true
+  var o = vet.callee(g, pi, call)
+  if o < 0: return false
+  o = g.oorig[o]
+  if not static_fn(g, o): return false
+  if g.opkg[o] == pi: return fn_noret(&g, fs, &e, o)
+  let pk = g.opkg[o]
+  if not g.pk[pk].std: return false
+  return errcheck.full_name(&g, fs, o) in e.std_noret
+
+fn fn_noret(var g: tc.Prog, fs: Fs, var e: E, o: Int) -> Bool:
+  if o in e.noret: return e.noret[o] == 1
+  e.noret[o] = -1
+  let d = g.odecl[o]
+  let pi = e.pi
+  var r = 0
+  if fd(g, pi, d) > 0 and func_body(&g, fs, &e, d, fa(g, pi, d), fc(g, pi, d), fd(g, pi, d), false): r = 1
+  e.noret[o] = r
+  return r == 1
+
+# ---- expressions
+
+fn is_const(var g: tc.Prog, fs: Fs, pi: Int, n0: Int) -> Bool:
+  let n = unparen(g, pi, n0)
+  if kk(g, pi, n) == ast.N_IDENT:
+    let o = obj(g, pi, n)
+    if o >= 0 and g.ok[o] == tc.O_NIL: return true
+  if kk(g, pi, n) == ast.N_CALL and g.pk[pi].emd[fa(g, pi, n)] == tc.M_TYPE:
+    let args = its(g, pi, fb(g, pi, n))
+    if args.len == 1 and is_const(&g, fs, pi, args[0]): return true
+  return tc.is_const(&g, fs, pi, n)
+
+# A method with a pointer receiver.
+fn ptr_method(g: tc.Prog, o: Int) -> Bool:
+  if not static_fn(g, o): return true
+  let pk = g.opkg[o]
+  let d = g.odecl[o]
+  let recv = g.pk[pk].t.a[d]
+  if recv < 0: return false
+  var rt = g.pk[pk].t.b[ast.item(g.pk[pk].t, recv, 0)]
+  if g.pk[pk].t.k[rt] == ast.N_PAREN: rt = g.pk[pk].t.a[rt]
+  return g.pk[pk].t.k[rt] == ast.N_STAR
+
+# x where the IR needs x's address: the variable at its root stays in memory.
+fn root_esc(var g: tc.Prog, fs: Fs, var e: E, var f: F, n0: Int):
+  let pi = e.pi
+  let n = unparen(g, pi, n0)
+  let k = kk(g, pi, n)
+  if k == ast.N_IDENT:
+    let o = obj(g, pi, n)
+    if o >= 0 and o in e.owner:
+      if e.owner[o] == f.fnode: op(&f, ESC, o, n, -1, -1, -1)
+      else: e.esc_log.push(o)
+    return
+  if k == ast.N_SELECTOR and g.pk[pi].skind.get(n, 0) == tc.S_FIELD and under_kind(&g, fs, pi, fa(g, pi, n)) == tc.TY_STRUCT:
+    root_esc(&g, fs, &e, &f, fa(g, pi, n))
+    return
+  if k == ast.N_INDEX and under_kind(&g, fs, pi, fa(g, pi, n)) == tc.TY_ARRAY:
+    root_esc(&g, fs, &e, &f, fa(g, pi, n))
+    ex(&g, fs, &e, &f, fb(g, pi, n))
+    return
+  ex(&g, fs, &e, &f, n)
+
+# x a local pointer variable dereferenced at node at: a DEREF use (true), else nothing (false).
+fn deref(var g: tc.Prog, fs: Fs, var e: E, var f: F, x0: Int, at: Int) -> Bool:
+  let pi = e.pi
+  let x = unparen(g, pi, x0)
+  if kk(g, pi, x) != ast.N_IDENT or under_kind(&g, fs, pi, x) != tc.TY_PTR: return false
+  let o = local(g, &e, f, x)
+  if o < 0: return false
+  op(&f, DEREF, o, at, -1, -1, -1)
+  return true
+
+# A branch on a condition: && and || and ! become branches of their own, as in the IR.
+fn cond(var g: tc.Prog, fs: Fs, var e: E, var f: F, n0: Int, t: Int, fl: Int):
+  let pi = e.pi
+  let n = unparen(g, pi, n0)
+  let k = kk(g, pi, n)
+  if k == ast.N_UNARY and ff(g, pi, n) == T_NOT:
+    cond(&g, fs, &e, &f, fa(g, pi, n), fl, t)
+    return
+  if k == ast.N_BINARY and (ff(g, pi, n) == T_LAND or ff(g, pi, n) == T_LOR):
+    let m = nb(&f)
+    if ff(g, pi, n) == T_LAND: cond(&g, fs, &e, &f, fa(g, pi, n), m, fl)
+    else: cond(&g, fs, &e, &f, fa(g, pi, n), t, m)
+    f.cur = m
+    cond(&g, fs, &e, &f, fb(g, pi, n), t, fl)
+    return
+  var done = false
+  if k == ast.N_BINARY and (ff(g, pi, n) == T_EQL or ff(g, pi, n) == T_NEQ):
+    var x = unparen(g, pi, fa(g, pi, n))
+    var y = unparen(g, pi, fb(g, pi, n))
+    if is_nil(g, pi, x):
+      let tmp = x
+      x = y
+      y = tmp
+    if is_nil(g, pi, y) and kk(g, pi, x) == ast.N_IDENT and under_kind(&g, fs, pi, x) == tc.TY_PTR:
+      let o = local(g, &e, f, x)
+      if o >= 0:
+        op(&f, CHECK, o, n, -1, -1, -1)
+        done = true
+  if not done: ex(&g, fs, &e, &f, n)
+  let c = f.cur
+  edge(&f, c, t)
+  edge(&f, c, fl)
+
+fn is_nil(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  if kk(g, pi, n) != ast.N_IDENT: return false
+  let o = obj(g, pi, n)
+  return o >= 0 and g.ok[o] == tc.O_NIL
+
+fn ex(var g: tc.Prog, fs: Fs, var e: E, var f: F, n: Int):
+  if n <= 0: return
+  let pi = e.pi
+  let k = kk(g, pi, n)
+  if k == ast.N_LIST:
+    for x in its(g, pi, n): ex(&g, fs, &e, &f, x)
+    return
+  if k == ast.N_IDENT:
+    use_id(g, &e, &f, n)
+    return
+  if k == ast.N_BASICLIT: return
+  if k == ast.N_FUNCLIT:
+    let mark = e.esc_log.len
+    func_body(&g, fs, &e, n, -1, fa(g, pi, n), fb(g, pi, n), f.rep)
+    captures(&e, &f, mark, n)
+    return
+  if k == ast.N_UNARY and ff(g, pi, n) == T_AND:
+    root_esc(&g, fs, &e, &f, fa(g, pi, n))
+    return
+  if k == ast.N_STAR:
+    if deref(&g, fs, &e, &f, fa(g, pi, n), n): return
+    ex(&g, fs, &e, &f, fa(g, pi, n))
+    return
+  if k == ast.N_SELECTOR:
+    let base = fa(g, pi, n)
+    let sk = g.pk[pi].skind.get(n, 0)
+    if sk == tc.S_PKG: return
+    if sk == tc.S_FIELD and deref(&g, fs, &e, &f, base, fb(g, pi, n)): return
+    if sk == tc.S_METHOD:
+      let m0 = g.pk[pi].sobj.get(n, -1)
+      if m0 >= 0 and not ptr_method(g, g.oorig[m0]) and deref(&g, fs, &e, &f, base, fb(g, pi, n)): return
+    if sk == tc.S_FIELD and under_kind(&g, fs, pi, base) == tc.TY_STRUCT:
+      root_esc(&g, fs, &e, &f, base)
+      return
+    if sk == tc.S_METHOD:
+      let bk = under_kind(&g, fs, pi, base)
+      let m = g.pk[pi].sobj.get(n, -1)
+      if bk != tc.TY_PTR and bk != tc.TY_IFACE and bk != tc.TY_TPARAM and (m < 0 or ptr_method(g, g.oorig[m])):
+        root_esc(&g, fs, &e, &f, base)
+        return
+    ex(&g, fs, &e, &f, base)
+    return
+  if k == ast.N_INDEX or k == ast.N_SLICE:
+    let base = fa(g, pi, n)
+    if under_kind(&g, fs, pi, base) == tc.TY_ARRAY: root_esc(&g, fs, &e, &f, base)
+    elif not (k == ast.N_INDEX and deref(&g, fs, &e, &f, base, n)): ex(&g, fs, &e, &f, base)
+    ex(&g, fs, &e, &f, fb(g, pi, n))
+    if k == ast.N_SLICE:
+      ex(&g, fs, &e, &f, fc(g, pi, n))
+      ex(&g, fs, &e, &f, fd(g, pi, n))
+    return
+  if k == ast.N_CALL:
+    ex(&g, fs, &e, &f, fa(g, pi, n))
+    ex(&g, fs, &e, &f, fb(g, pi, n))
+    if noreturn_call(&g, fs, &e, n): terminate(&f)
+    return
+  if k == ast.N_COMPOSITE:
+    ex(&g, fs, &e, &f, fb(g, pi, n))
+    return
+  if k == ast.N_TYPEASSERT:
+    ex(&g, fs, &e, &f, fa(g, pi, n))
+    return
+  if k >= ast.N_FIELD and k <= ast.N_ELLIPSIS: return
+  for c in [fa(g, pi, n), fb(g, pi, n), fc(g, pi, n), fd(g, pi, n)]:
+    if c > 0: ex(&g, fs, &e, &f, c)
+
+# ---- statements
+
+fn take_label(var f: F) -> Str:
+  let l = f.plabel + ""
+  f.plabel = ""
+  return l
+
+fn push_jump(var f: F, l: Str, b: Int, c: Int):
+  f.jl.push(l)
+  f.jb.push(b)
+  f.jc.push(c)
+
+fn pop_jump(var f: F):
+  f.jl.pop()
+  f.jb.pop()
+  f.jc.pop()
+
+fn find_jump(f: F, l: Str, cont: Bool) -> Int:
+  var i = f.jl.len - 1
+  while i >= 0:
+    let ok = l == "" or f.jl[i] == l
+    if ok and (not cont or f.jc[i] >= 0):
+      if cont: return f.jc[i]
+      return f.jb[i]
+    i -= 1
+  return -1
+
+fn stmts(var g: tc.Prog, fs: Fs, var e: E, var f: F, l: Int):
+  for s in its(g, e.pi, l): st(&g, fs, &e, &f, s)
+
+fn st(var g: tc.Prog, fs: Fs, var e: E, var f: F, n: Int):
+  if n <= 0: return
+  let pi = e.pi
+  let k = kk(g, pi, n)
+  let lbl = take_label(&f)
+  if k == ast.N_LIST or k == ast.N_BLOCK:
+    var l = n
+    if k == ast.N_BLOCK: l = fa(g, pi, n)
+    stmts(&g, fs, &e, &f, l)
+  elif k == ast.N_EXPRSTMT:
+    let x = unparen(g, pi, fa(g, pi, n))
+    if kk(g, pi, x) == ast.N_CALL:
+      f.calls.push(x)
+      f.cblk.push(f.cur)
+    ex(&g, fs, &e, &f, x)
+  elif k == ast.N_DECLSTMT:
+    let gd = fa(g, pi, n)
+    if ff(g, pi, gd) == K_VAR:
+      for sp in its(g, pi, fa(g, pi, gd)):
+        let vals = its(g, pi, fc(g, pi, sp))
+        for v in vals: ex(&g, fs, &e, &f, v)
+        let ids = its(g, pi, fa(g, pi, sp))
+        for i in 0..ids.len:
+          decl(g, &e, f, ids[i])
+          let o = local(g, &e, f, ids[i])
+          if o < 0: continue
+          var rc = -1
+          if vals.len == ids.len:
+            let v = unparen(g, pi, vals[i])
+            if kk(g, pi, v) == ast.N_CALL: rc = v
+          op(&f, DEF, o, ids[i], -1, rc, -1)
+  elif k == ast.N_ASSIGN:
+    assign(&g, fs, &e, &f, n)
+  elif k == ast.N_INCDEC:
+    let x = unparen(g, pi, fa(g, pi, n))
+    let o = local(g, &e, f, x)
+    if o >= 0:
+      op(&f, USE, o, x, -1, -1, -1)
+      op(&f, DEF, o, x, -1, -1, -1)
+    else: ex(&g, fs, &e, &f, x)
+  elif k == ast.N_SEND:
+    ex(&g, fs, &e, &f, fa(g, pi, n))
+    ex(&g, fs, &e, &f, fb(g, pi, n))
+  elif k == ast.N_GO or k == ast.N_DEFER:
+    if k == ast.N_DEFER: f.has_defer = true
+    let call = unparen(g, pi, fa(g, pi, n))
+    if kk(g, pi, call) == ast.N_CALL:
+      ex(&g, fs, &e, &f, fa(g, pi, call))
+      ex(&g, fs, &e, &f, fb(g, pi, call))
+    else: ex(&g, fs, &e, &f, call)
+  elif k == ast.N_RETURN:
+    let rs = its(g, pi, fa(g, pi, n))
+    for r in rs: ex(&g, fs, &e, &f, r)
+    if rs.len > 0:
+      var rl: [Int] = []
+      for r in f.results: rl.push(r)
+      for r in rl: op(&f, DEF, r, -1, -1, -1, -1)
+    jump(&f, f.exit)
+  elif k == ast.N_BRANCH:
+    let tok = ff(g, pi, n)
+    var l = ""
+    if fa(g, pi, n) > 0: l = name(g, pi, fa(g, pi, n))
+    if tok == K_BREAK or tok == K_CONTINUE:
+      let to = find_jump(f, l, tok == K_CONTINUE)
+      if to >= 0: jump(&f, to)
+      else: jump(&f, f.exit)
+    elif tok == K_GOTO:
+      let to = label_block(&f, l)
+      jump(&f, to)
+  elif k == ast.N_LABELED:
+    let lb = label_block(&f, name(g, pi, fa(g, pi, n)))
+    let c = f.cur
+    edge(&f, c, lb)
+    f.cur = lb
+    f.plabel = name(g, pi, fa(g, pi, n))
+    st(&g, fs, &e, &f, fb(g, pi, n))
+  elif k == ast.N_IF:
+    st(&g, fs, &e, &f, fa(g, pi, n))
+    let tb = nb(&f)
+    let eb = nb(&f)
+    cond(&g, fs, &e, &f, fb(g, pi, n), tb, eb)
+    f.cur = tb
+    st(&g, fs, &e, &f, fc(g, pi, n))
+    let te = f.cur
+    var ee = eb
+    var j = eb
+    if fd(g, pi, n) > 0:
+      f.cur = eb
+      st(&g, fs, &e, &f, fd(g, pi, n))
+      ee = f.cur
+      j = nb(&f)
+      edge(&f, ee, j)
+    edge(&f, te, j)
+    f.cur = j
+  elif k == ast.N_FOR:
+    st(&g, fs, &e, &f, fa(g, pi, n))
+    let h = nb(&f)
+    let c0 = f.cur
+    edge(&f, c0, h)
+    f.cur = h
+    let body = nb(&f)
+    let after = nb(&f)
+    if fb(g, pi, n) > 0: cond(&g, fs, &e, &f, fb(g, pi, n), body, after)
+    else: edge(&f, h, body)
+    let post = nb(&f)
+    push_jump(&f, lbl, after, post)
+    f.cur = body
+    st(&g, fs, &e, &f, fd(g, pi, n))
+    let be = f.cur
+    edge(&f, be, post)
+    f.cur = post
+    st(&g, fs, &e, &f, fc(g, pi, n))
+    let pe = f.cur
+    edge(&f, pe, h)
+    pop_jump(&f)
+    f.cur = after
+  elif k == ast.N_RANGE:
+    let x = fc(g, pi, n)
+    let xk = under_kind(&g, fs, pi, x)
+    if xk == tc.TY_ARRAY: root_esc(&g, fs, &e, &f, x)
+    else: ex(&g, fs, &e, &f, x)
+    let h = nb(&f)
+    let c0 = f.cur
+    edge(&f, c0, h)
+    let body = nb(&f)
+    edge(&f, h, body)
+    let after = nb(&f)
+    edge(&f, h, after)
+    f.cur = body
+    for kv in [fa(g, pi, n), fb(g, pi, n)]:
+      if kv <= 0: continue
+      if ff(g, pi, n) == T_DEFINE: decl(g, &e, f, kv)
+      let o = local(g, &e, f, kv)
+      if o >= 0: op(&f, DEF, o, kv, -1, -1, -1)
+      elif kk(g, pi, kv) != ast.N_IDENT: ex(&g, fs, &e, &f, kv)
+    push_jump(&f, lbl, after, h)
+    # the body of a range over a function is a closure in the IR
+    let saved = f.fnode
+    let mark = e.esc_log.len
+    if xk == tc.TY_FUNC: f.fnode = n
+    st(&g, fs, &e, &f, fd(g, pi, n))
+    f.fnode = saved
+    if xk == tc.TY_FUNC: captures(&e, &f, mark, n)
+    let be = f.cur
+    edge(&f, be, h)
+    pop_jump(&f)
+    f.cur = after
+  elif k == ast.N_SWITCH or k == ast.N_TYPESWITCH:
+    st(&g, fs, &e, &f, fa(g, pi, n))
+    let gu = fb(g, pi, n)
+    if k == ast.N_TYPESWITCH and kk(g, pi, gu) == ast.N_ASSIGN:
+      for r in its(g, pi, fb(g, pi, gu)):
+        let ru = unparen(g, pi, r)
+        if kk(g, pi, ru) == ast.N_TYPEASSERT: ex(&g, fs, &e, &f, fa(g, pi, ru))
+        else: ex(&g, fs, &e, &f, ru)
+    elif k == ast.N_TYPESWITCH: st(&g, fs, &e, &f, gu)
+    else: ex(&g, fs, &e, &f, gu)
+    let cases = its(g, pi, fc(g, pi, n))
+    let after = nb(&f)
+    var bl: [Int] = []
+    for c in cases: bl.push(nb(&f))
+    if k == ast.N_SWITCH and gu <= 0:
+      # switch { case c: ... }: a chain of branches, then the default
+      var dfi = -1
+      for i in 0..cases.len:
+        if fa(g, pi, cases[i]) < 0:
+          dfi = i
+          continue
+        for x in its(g, pi, fa(g, pi, cases[i])):
+          let next = nb(&f)
+          cond(&g, fs, &e, &f, x, bl[i], next)
+          f.cur = next
+      let last = f.cur
+      if dfi >= 0: edge(&f, last, bl[dfi])
+      else: edge(&f, last, after)
+    else:
+      var dflt = false
+      for c in cases:
+        if fa(g, pi, c) < 0: dflt = true
+        elif k == ast.N_SWITCH: ex(&g, fs, &e, &f, fa(g, pi, c))
+      let h = f.cur
+      if not dflt: edge(&f, h, after)
+      for b in bl: edge(&f, h, b)
+    push_jump(&f, lbl, after, -1)
+    for i in 0..cases.len:
+      f.cur = bl[i]
+      let body = its(g, pi, fb(g, pi, cases[i]))
+      stmts(&g, fs, &e, &f, fb(g, pi, cases[i]))
+      let ce = f.cur
+      var fall = false
+      if body.len > 0:
+        let last = body[body.len - 1]
+        if kk(g, pi, last) == ast.N_BRANCH and ff(g, pi, last) == K_FALLTHROUGH: fall = true
+      if fall and i + 1 < cases.len: edge(&f, ce, bl[i + 1])
+      else: edge(&f, ce, after)
+    pop_jump(&f)
+    f.cur = after
+  elif k == ast.N_SELECT:
+    let cases = its(g, pi, fa(g, pi, n))
+    for c in cases:
+      let comm = fa(g, pi, c)
+      if comm < 0: continue
+      let ck = kk(g, pi, comm)
+      if ck == ast.N_SEND:
+        ex(&g, fs, &e, &f, fa(g, pi, comm))
+        ex(&g, fs, &e, &f, fb(g, pi, comm))
+      elif ck == ast.N_EXPRSTMT: ex(&g, fs, &e, &f, fa(g, pi, comm))
+      elif ck == ast.N_ASSIGN: ex(&g, fs, &e, &f, fb(g, pi, comm))
+    if cases.len == 0:
+      terminate(&f)
+      return
+    let h = f.cur
+    let after = nb(&f)
+    push_jump(&f, lbl, after, -1)
+    for c in cases:
+      let b = nb(&f)
+      edge(&f, h, b)
+      f.cur = b
+      let comm = fa(g, pi, c)
+      if comm > 0 and kk(g, pi, comm) == ast.N_ASSIGN:
+        for x in its(g, pi, fa(g, pi, comm)):
+          if ff(g, pi, comm) == T_DEFINE: decl(g, &e, f, x)
+          let o = local(g, &e, f, x)
+          if o >= 0: op(&f, DEF, o, x, -1, -1, -1)
+          elif kk(g, pi, x) != ast.N_IDENT: ex(&g, fs, &e, &f, x)
+      stmts(&g, fs, &e, &f, fb(g, pi, c))
+      let ce = f.cur
+      edge(&f, ce, after)
+    pop_jump(&f)
+    f.cur = after
+  elif k == ast.N_EMPTY or k == ast.N_BAD: return
+  else: ex(&g, fs, &e, &f, n)
+
+fn assign(var g: tc.Prog, fs: Fs, var e: E, var f: F, n: Int):
+  let pi = e.pi
+  let lhs = its(g, pi, fa(g, pi, n))
+  let rhs = its(g, pi, fb(g, pi, n))
+  let tok = ff(g, pi, n)
+  if tok != T_ASSIGN and tok != T_DEFINE:
+    for r in rhs: ex(&g, fs, &e, &f, r)
+    let x = unparen(g, pi, lhs[0])
+    let o = local(g, &e, f, x)
+    if o >= 0:
+      op(&f, USE, o, x, -1, -1, -1)
+      op(&f, DEF, o, x, -1, -1, -1)
+    elif kk(g, pi, x) != ast.N_IDENT: ex(&g, fs, &e, &f, x)
+    return
+  var rstart: [Int] = []
+  for r in rhs:
+    rstart.push(f.ok.len)
+    ex(&g, fs, &e, &f, r)
+  for i in 0..lhs.len:
+    let x = unparen(g, pi, lhs[i])
+    if kk(g, pi, x) == ast.N_IDENT: continue
+    if kk(g, pi, x) == ast.N_STAR and i < rhs.len and deref(&g, fs, &e, &f, fa(g, pi, x), rhs[i]): continue
+    ex(&g, fs, &e, &f, x)
+  for i in 0..lhs.len:
+    let x = unparen(g, pi, lhs[i])
+    if kk(g, pi, x) != ast.N_IDENT or name(g, pi, x) == "_": continue
+    if tok == T_DEFINE: decl(g, &e, f, x)
+    let o = local(g, &e, f, x)
+    if o < 0: continue
+    if lhs.len > 1 and rhs.len == 1:
+      op(&f, DEFX, o, x, n, -1, -1)
+      continue
+    if i >= rhs.len: continue
+    let r = unparen(g, pi, rhs[i])
+    var kind = DEFC
+    var ro = -1
+    var rc = -1
+    let rk = kk(g, pi, r)
+    if rk == ast.N_FUNCLIT or is_const(&g, fs, pi, r): kind = DEF
+    if rk == ast.N_IDENT:
+      let o2 = obj(g, pi, r)
+      if o2 >= 0 and g.ok[o2] != tc.O_VAR: kind = DEF
+      # the operation reading it (its value is what's assigned)
+      if o2 >= 0 and o2 in e.owner and rstart[i] < f.ok.len and f.ok[rstart[i]] == USE and f.oo[rstart[i]] == o2: ro = rstart[i]
+    if rk == ast.N_CALL: rc = r
+    op(&f, kind, o, x, n, rc, ro)
+
+# ---- one function
+
+# Builds the function's graph (and reports, with rep); true when it never returns.
+fn func_body(var g: tc.Prog, fs: Fs, var e: E, fnode: Int, recv: Int, typ: Int, body: Int, rep: Bool) -> Bool:
+  let pi = e.pi
+  var f = F(fnode, rep, [], [], [], [], [], [], [], [], [], 0, 0, [], false, {}, "", [], [], [], [], [])
+  f.cur = nb(&f)
+  f.exit = nb(&f)
+  var fields: [Int] = []
+  for x in its(g, pi, recv): fields.push(x)
+  for x in its(g, pi, fb(g, pi, typ)): fields.push(x)
+  for fl in fields:
+    for id in its(g, pi, fa(g, pi, fl)):
+      decl(g, &e, f, id)
+      let o = local(g, &e, f, id)
+      if o >= 0: op(&f, PARAM, o, id, -1, -1, -1)
+  for fl in its(g, pi, fc(g, pi, typ)):
+    for id in its(g, pi, fa(g, pi, fl)):
+      decl(g, &e, f, id)
+      let o = local(g, &e, f, id)
+      if o >= 0:
+        f.results.push(o)
+        op(&f, DEF, o, id, -1, -1, -1)
+  st(&g, fs, &e, &f, body)
+  let last = f.cur
+  edge(&f, last, f.exit)
+  f.cur = f.exit
+  var rl: [Int] = []
+  for r in f.results: rl.push(r)
+  for r in rl: op(&f, USE, r, -1, -1, -1, -1)
+  if f.has_defer:
+    for r in f.results: e.esc[r] = true
+  # never returns: no path from the entry to the exit but through a terminating block
+  var seen: {Int: Bool} = {}
+  var stack = [0]
+  var returns = false
+  while stack.len > 0:
+    let b = stack.pop()
+    if b in seen: continue
+    seen[b] = true
+    if b == f.exit:
+      returns = true
+      continue
+    if f.term[b]: continue
+    for s in f.succ[b]: stack.push(s)
+  if rep: analyze(&g, fs, &e, f, typ, body)
+  return not returns and not f.has_defer
+
+fn param_types_b(var g: tc.Prog, fs: Fs, pi: Int, typ: Int) -> Bool:
+  for fl in its(g, pi, fb(g, pi, typ)):
+    let t = vet.ty(g, pi, fb(g, pi, fl))
+    if t <= 0: continue
+    let u = tc.under(&g, fs, t)
+    if u > 0 and g.tk[u] == tc.TY_PTR:
+      let el = g.ta[u]
+      if el > 0 and g.tk[el] == tc.TY_NAMED and g.oname[g.ta[el]] == "B":
+        let o = g.ta[el]
+        let pk = g.opkg[o]
+        if pk >= 0 and g.pk[pk].path == "testing": return true
+  return false
+
+# The operations as the IR lifts them. A variable whose address the IR needs (ESC operations) is
+# lifted only before that: in the blocks no such block reaches, up to the first one in a block of
+# its own (where its value is stored, a use, as it is on entering the rest); it stays in memory
+# when nothing is read in that part, or when it's a named result of a function that defers.
+type W:
+  bops: [[Int]]
+  ok: [Int]
+  oo: [Int]
+  on: [Int]
+  ost: [Int]
+  orc: [Int]
+  oro: [Int]
+  kept: {Int: Bool}
+  unlifted: {Int: Bool}
+
+fn add_op(var w: W, kind: Int, o: Int) -> Int:
+  let i = w.ok.len
+  w.ok.push(kind)
+  w.oo.push(o)
+  w.on.push(-1)
+  w.ost.push(-1)
+  w.orc.push(-1)
+  w.oro.push(-1)
+  return i
+
+fn lift(e: E, f: F, reach: {Int: Bool}) -> W:
+  var w = W([], [], [], [], [], [], [], {}, {})
+  for x in f.ok: w.ok.push(x)
+  for x in f.oo: w.oo.push(x)
+  for x in f.on: w.on.push(x)
+  for x in f.ost: w.ost.push(x)
+  for x in f.orc: w.orc.push(x)
+  for x in f.oro: w.oro.push(x)
+  let n = f.succ.len
+  var escb: {Int: [Int]} = {}
+  for b in 0..n:
+    if not (b in reach): continue
+    for i in f.bops[b]:
+      if f.ok[i] != ESC: continue
+      let o = f.oo[i]
+      if o in escb:
+        let last = escb[o][escb[o].len - 1]
+        if last != b: escb[o].push(b)
+      else: escb[o] = [b]
+  var taint: {Int: {Int: Bool}} = {}
+  var firstesc: {Int: {Int: Int}} = {}
+  for o, bl in escb:
+    if o in e.esc: continue
+    var t: {Int: Bool} = {}
+    var stack: [Int] = []
+    for b in bl:
+      for s2 in f.succ[b]: stack.push(s2)
+    while stack.len > 0:
+      let x = stack.pop()
+      if x in t: continue
+      t[x] = true
+      for s2 in f.succ[x]: stack.push(s2)
+    var fe: {Int: Int} = {}
+    for b in bl:
+      if b in t: continue
+      let ops = f.bops[b]
+      for j in 0..ops.len:
+        if f.ok[ops[j]] == ESC and f.oo[ops[j]] == o:
+          fe[b] = j
+          break
+    var load = false
+    for b in 0..n:
+      if not (b in reach) or b in t: continue
+      let ops = f.bops[b]
+      let lim = fe.get(b, ops.len)
+      for j in 0..lim:
+        if f.oo[ops[j]] == o and is_use(f.ok[ops[j]]): load = true
+    if not load:
+      w.unlifted[o] = true
+      continue
+    taint[o] = t
+    firstesc[o] = fe
+  for b in 0..n:
+    var l: [Int] = []
+    for o, t in taint:
+      if b in t: l.push(add_op(&w, USE, o))
+    let ops = f.bops[b]
+    for j in 0..ops.len:
+      let i = ops[j]
+      let o = f.oo[i]
+      if f.ok[i] == ESC:
+        if o in firstesc and firstesc[o].get(b, -1) == j: l.push(add_op(&w, USE, o))
+        continue
+      if o in taint:
+        if b in taint[o]: continue
+        let fe = firstesc[o].get(b, -1)
+        if fe >= 0 and j > fe: continue
+      l.push(i)
+      w.kept[i] = true
+    w.bops.push(l)
+  return w
+
+fn unlifted(e: E, w: W, o: Int) -> Bool:
+  return o in e.esc or o in w.unlifted
+
+# The reachable graph: edges, dominators, post-dominators and their frontiers.
+type Gr:
+  succ: [[Int]]
+  pred: [[Int]]
+  idom: [Int]
+  df: [[Int]]
+  rdf: [[Int]]
+  kids: [[Int]]
+
+fn graph(f: F, reach: {Int: Bool}) -> Gr:
+  let n = f.succ.len
+  var succ: [[Int]] = []
+  var pred: [[Int]] = []
+  for b in 0..n:
+    succ.push([])
+    pred.push([])
+  for b in 0..n:
+    if not (b in reach): continue
+    for s2 in f.succ[b]:
+      succ[b].push(s2)
+      pred[s2].push(b)
+  let idom = idoms(succ, pred, 0)
+  let ipdom = idoms(pred, succ, f.exit)
+  let df = frontier(succ, pred, idom)
+  let rdf = frontier(pred, succ, ipdom)
+  var kids: [[Int]] = []
+  for b in 0..n: kids.push([])
+  for b in 0..n:
+    if b != 0 and idom[b] >= 0: kids[idom[b]].push(b)
+  return Gr(succ, pred, idom, df, rdf, kids)
+
+fn analyze(var g: tc.Prog, fs: Fs, var e: E, f: F, typ: Int, body: Int):
+  let pi = e.pi
+  let nbk = f.succ.len
+  var reach: {Int: Bool} = {}
+  var stack = [0]
+  while stack.len > 0:
+    let b = stack.pop()
+    if b in reach: continue
+    reach[b] = true
+    for s in f.succ[b]: stack.push(s)
+  let w = lift(e, f, reach)
+  # liveness: gen (read before written) and kill per block, then live-in to a fixed point
+  var gen: [{Int: Bool}] = []
+  var kill: [{Int: Bool}] = []
+  for b in 0..nbk:
+    var gb: {Int: Bool} = {}
+    var kb: {Int: Bool} = {}
+    for i in w.bops[b]:
+      let o = w.oo[i]
+      if is_use(w.ok[i]):
+        if not (o in kb): gb[o] = true
+      else: kb[o] = true
+    gen.push(gb)
+    kill.push(kb)
+  var lin: [{Int: Bool}] = []
+  for b in 0..nbk:
+    var lb: {Int: Bool} = {}
+    for o, _ in gen[b]: lb[o] = true
+    lin.push(lb)
+  var changed = true
+  while changed:
+    changed = false
+    var b = nbk - 1
+    while b >= 0:
+      for s in f.succ[b]:
+        if s == b: continue
+        var add: [Int] = []
+        for o, _ in lin[s]:
+          if not (o in lin[b]) and not (o in kill[b]): add.push(o)
+        for o in add:
+          lin[b][o] = true
+          changed = true
+      b -= 1
+  var in_test = false
+  let fi = g.pk[pi].t.file[f.fnode]
+  if fi >= 0 and fi < e.tests.len: in_test = e.tests[fi]
+  var example = false
+  if kk(g, pi, f.fnode) == ast.N_FUNCDECL and in_test and name(g, pi, fb(g, pi, f.fnode)).startswith("Example"): example = true
+  let skip4017 = in_test and param_types_b(&g, fs, pi, typ)
+  var gr = Gr([], [], [], [], [], [])
+  var have_gr = false
+  var vals: {Int: V} = {}
+  for b in 0..nbk:
+    if not (b in reach): continue
+    let ops = w.bops[b]
+    for j in 0..ops.len:
+      let i = ops[j]
+      let kind = w.ok[i]
+      if is_use(kind): continue
+      let o = w.oo[i]
+      if unlifted(e, w, o): continue
+      var dead = true
+      var decided = false
+      for j2 in j + 1..ops.len:
+        let i2 = ops[j2]
+        if w.oo[i2] != o: continue
+        dead = not is_use(w.ok[i2])
+        decided = true
+        break
+      if not decided:
+        var live = false
+        for s in f.succ[b]:
+          if o in lin[s]: live = true
+        dead = not live
+      if not dead: continue
+      let id = w.on[i]
+      if (kind == DEFC or kind == DEFX) and not example:
+        var report = true
+        let u = w.oro[i]
+        if kind == DEFC and u >= 0 and u in w.kept and not unlifted(e, w, f.oo[u]):
+          # x = y: y's value, unless something else uses that IR value
+          if not have_gr:
+            gr = graph(f, reach)
+            have_gr = true
+          let y = f.oo[u]
+          if not (y in vals): vals[y] = values(gr, w, y)
+          report = not value_used(gr, w, vals[y], y, u)
+        if report: e.out.push(Rep(w.ost[i], "SA4006", "this value of " + name(g, pi, id) + " is never used"))
+      if kind == PARAM:
+        let a = first_assign(g, pi, body, o)
+        if a > 0:
+          e.out.push(Rep(id, "SA4009", "argument " + name(g, pi, id) + " is overwritten before first use"))
+          e.out.push(Rep(a, "SA4009(related information)", "assignment to " + name(g, pi, id)))
+      let rc = w.orc[i]
+      if rc > 0 and (kind == DEFC or kind == DEF) and not skip4017: sa4017(&g, fs, &e, rc)
+  sa5011(g, &e, f, w, reach)
+  if not skip4017:
+    for ci in 0..f.calls.len:
+      if f.cblk[ci] in reach: sa4017(&g, fs, &e, f.calls[ci])
+
+fn first_assign(g: tc.Prog, pi: Int, body: Int, o: Int) -> Int:
+  for n in vet.preorder(g.pk[pi].t, [body]):
+    if g.pk[pi].t.k[n] != ast.N_ASSIGN: continue
+    for x in its(g, pi, g.pk[pi].t.a[n]):
+      if kk(g, pi, x) == ast.N_IDENT and obj(g, pi, x) == o: return n
+  return -1
+
+# ---- SA4017 and purity
+
+fn sa4017(var g: tc.Prog, fs: Fs, var e: E, call: Int):
+  let pi = e.pi
+  var o = vet.callee(g, pi, call)
+  if o < 0: return
+  o = g.oorig[o]
+  if not static_fn(g, o): return
+  if not pure_fn(&g, fs, &e, o): return
+  let full = errcheck.full_name(&g, fs, o)
+  if g.pk[pi].path == "fmt_test" and full == "fmt.Sprintf": return
+  e.out.push(Rep(call, "SA4017", g.oname[o] + " doesn't have side effects and its return value is ignored"))
+
+fn pure_fn(var g: tc.Prog, fs: Fs, var e: E, o: Int) -> Bool:
+  let pk = g.opkg[o]
+  if pk != e.pi:
+    if not g.pk[pk].std: return false
+    return errcheck.full_name(&g, fs, o) in e.std_pure
+  if g.pk[pk].std and errcheck.full_name(&g, fs, o) in e.std_pure: return true
+  if o in e.pure: return e.pure[o] == 1
+  e.pure[o] = -1
+  var r = 0
+  if pure_body(&g, fs, &e, o): r = 1
+  e.pure[o] = r
+  return r == 1
+
+fn basic_t(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  if t <= 0: return false
+  let u = tc.under(&g, fs, t)
+  return u > 0 and g.tk[u] == tc.TY_BASIC
+
+fn pure_body(var g: tc.Prog, fs: Fs, var e: E, o: Int) -> Bool:
+  let pi = e.pi
+  let d = g.odecl[o]
+  let typ = fc(g, pi, d)
+  let body = fd(g, pi, d)
+  if body <= 0: return false
+  if its(g, pi, fc(g, pi, typ)).len == 0: return false
+  var fields: [Int] = []
+  for x in its(g, pi, fa(g, pi, d)): fields.push(x)
+  for x in its(g, pi, fb(g, pi, typ)): fields.push(x)
+  for fl in fields:
+    let ids = its(g, pi, fa(g, pi, fl))
+    if ids.len == 0: return false
+    for id in ids:
+      let po = obj(g, pi, id)
+      if po < 0: return false
+      let pt = tc.obj_type(&g, fs, po)
+      if not basic_t(&g, fs, pt): return false
+  let lo = g.pk[pi].t.pos[d]
+  let hi = g.pk[pi].t.end[d]
+  let file = g.pk[pi].t.file[d]
+  let nodes = vet.preorder(g.pk[pi].t, [body])
+  var skip: {Int: Bool} = {}
+  var work = false
+  for n in nodes:
+    let k = kk(g, pi, n)
+    if k == ast.N_SELECTOR: skip[fb(g, pi, n)] = true
+    if k == ast.N_KEYVALUE and kk(g, pi, fa(g, pi, n)) == ast.N_IDENT: skip[fa(g, pi, n)] = true
+  for n in nodes:
+    let k = kk(g, pi, n)
+    if k == ast.N_GO or k == ast.N_DEFER or k == ast.N_SEND or k == ast.N_SELECT or k == ast.N_FUNCLIT or k == ast.N_STAR: return false
+    if k == ast.N_UNARY and (ff(g, pi, n) == T_AND or ff(g, pi, n) == T_ARROW): return false
+    if k == ast.N_CALL:
+      work = true
+      let fun = fa(g, pi, n)
+      if is_builtin(g, pi, fun, "len") or is_builtin(g, pi, fun, "cap"): continue
+      if g.pk[pi].emd[fun] == tc.M_TYPE: continue
+      var c = vet.callee(g, pi, n)
+      if c < 0: return false
+      c = g.oorig[c]
+      if not static_fn(g, c): return false
+      if c != o and not pure_fn(&g, fs, &e, c): return false
+    elif k == ast.N_IDENT:
+      if n in skip: continue
+      let v = obj(g, pi, n)
+      if v >= 0 and g.ok[v] == tc.O_VAR:
+        let vn = g.onode[v]
+        let inside = g.opkg[v] == pi and g.ofile[v] == file and vn >= 0 and g.pk[pi].t.pos[vn] >= lo and g.pk[pi].t.pos[vn] < hi
+        if not inside: return false
+        work = true
+    elif k == ast.N_SELECTOR:
+      let sk = g.pk[pi].skind.get(n, 0)
+      if sk == tc.S_PKG:
+        let v = g.pk[pi].sobj.get(n, -1)
+        if v >= 0 and g.ok[v] == tc.O_VAR: return false
+      elif under_kind(&g, fs, pi, fa(g, pi, n)) == tc.TY_PTR: return false
+    elif k == ast.N_INDEX:
+      let bk = under_kind(&g, fs, pi, fa(g, pi, n))
+      if bk != tc.TY_BASIC and bk != tc.TY_MAP and bk != tc.TY_ARRAY and bk != tc.TY_FUNC: return false
+    elif k == ast.N_SLICE:
+      if under_kind(&g, fs, pi, fa(g, pi, n)) != tc.TY_BASIC: return false
+    elif k == ast.N_COMPOSITE:
+      let ck = under_kind(&g, fs, pi, n)
+      if ck != tc.TY_STRUCT and ck != tc.TY_ARRAY and ck != tc.TY_MAP: return false
+    elif k == ast.N_RANGE:
+      let rk = under_kind(&g, fs, pi, fc(g, pi, n))
+      if rk != tc.TY_BASIC and rk != tc.TY_MAP and rk != tc.TY_ARRAY: return false
+    elif k == ast.N_BINARY or k == ast.N_TYPEASSERT: work = true
+  # a stub (only constants returned) isn't pure
+  return work
+
+# ---- the package
+
+fn run(var g: tc.Prog, fs: Fs, pi: Int, roots: [Int], tests: [Bool]) -> [Rep]:
+  var e = new_e(pi, tests)
+  var fns: [Int] = []
+  var lits: [Int] = []
+  for root in roots:
+    for d in its(g, pi, g.pk[pi].t.c[root]):
+      let k = kk(g, pi, d)
+      if k == ast.N_FUNCDECL and fd(g, pi, d) > 0: fns.push(d)
+      elif k == ast.N_GENDECL:
+        for n in vet.preorder(g.pk[pi].t, [d]):
+          if g.pk[pi].t.k[n] == ast.N_FUNCLIT: lits.push(n)
+  for d in fns: func_body(&g, fs, &e, d, fa(g, pi, d), fc(g, pi, d), fd(g, pi, d), true)
+  # package-level closures (the outermost ones: the rest are built inside them)
+  var done: {Int: Bool} = {}
+  for n in lits:
+    if n in done: continue
+    for m in vet.preorder(g.pk[pi].t, [n]):
+      if g.pk[pi].t.k[m] == ast.N_FUNCLIT: done[m] = true
+    func_body(&g, fs, &e, n, -1, fa(g, pi, n), fb(g, pi, n), true)
+  var out: [Rep] = []
+  swap(&out, &e.out)
+  return out
+
+# ---- SA5011: a pointer checked against nil and dereferenced as the same IR value
+#
+# The IR's values of a variable: its stores, phis at the iterated dominance frontier of its stores,
+# and sigmas on the edges out of the branches its uses are control dependent on (the post-dominance
+# frontier, iterated with the phis); a use reads the value renaming gives it, and a phi whose
+# operands are all one value is that value.
+
+# Immediate dominators of the blocks reachable from root over fwd (back: the reverse edges);
+# -1 for the rest.
+fn idoms(fwd: [[Int]], back: [[Int]], root: Int) -> [Int]:
+  let n = fwd.len
+  var num: [Int] = []
+  for i in 0..n: num.push(-1)
+  # postorder, iteratively
+  var post: [Int] = []
+  var stack = [root]
+  var it: [Int] = []
+  for i in 0..n: it.push(0)
+  num[root] = -2
+  while stack.len > 0:
+    let b = stack[stack.len - 1]
+    if it[b] < fwd[b].len:
+      let s = fwd[b][it[b]]
+      it[b] += 1
+      if num[s] == -1:
+        num[s] = -2
+        stack.push(s)
+    else:
+      stack.pop()
+      num[b] = post.len
+      post.push(b)
+  var idom: [Int] = []
+  for i in 0..n: idom.push(-1)
+  idom[root] = root
+  var changed = true
+  while changed:
+    changed = false
+    var j = post.len - 1
+    while j >= 0:
+      let b = post[j]
+      j -= 1
+      if b == root: continue
+      var nd = -1
+      for p in back[b]:
+        if num[p] < 0 or idom[p] < 0: continue
+        if nd < 0:
+          nd = p
+          continue
+        # intersect
+        var x = p
+        var y = nd
+        while x != y:
+          while num[x] < num[y]: x = idom[x]
+          while num[y] < num[x]: y = idom[y]
+        nd = x
+      if nd >= 0 and idom[b] != nd:
+        idom[b] = nd
+        changed = true
+  return idom
+
+fn frontier(fwd: [[Int]], back: [[Int]], idom: [Int]) -> [[Int]]:
+  let n = fwd.len
+  var df: [[Int]] = []
+  for i in 0..n: df.push([])
+  for b in 0..n:
+    if idom[b] < 0 or back[b].len < 2: continue
+    for p in back[b]:
+      if idom[p] < 0: continue
+      var r = p
+      while r >= 0 and r != idom[b]:
+        var has = false
+        for x in df[r]:
+          if x == b: has = true
+        if not has: df[r].push(b)
+        if idom[r] == r: break
+        r = idom[r]
+  return df
+
+fn uf_find(rep: {Int: Int}, v: Int) -> Int:
+  var x = v
+  while x in rep and rep[x] != x: x = rep[x]
+  return x
+
+# A variable's IR values: each operation's (opval), phis replaced by their one operand (rp), the
+# operands of the rest, and each sigma's source.
+type V:
+  opval: {Int: Int}
+  rp: {Int: Int}
+  phiops: {Int: [Int]}
+  sigsrc: {Int: Int}
+
+fn values(gr: Gr, w: W, v: Int) -> V:
+  let n = gr.succ.len
+  let succ = gr.succ
+  let pred = gr.pred
+  var defb: {Int: Bool} = {}
+  var useb: {Int: Bool} = {}
+  for b in 0..n:
+    if gr.idom[b] < 0: continue
+    for i in w.bops[b]:
+      if w.oo[i] != v: continue
+      if is_use(w.ok[i]): useb[b] = true
+      else: defb[b] = true
+  # blocks that reach a reference, and ones that reach a read
+  var rref: {Int: Bool} = {}
+  var rload: {Int: Bool} = {}
+  for pass in 0..2:
+    var stack: [Int] = []
+    for b, _ in useb: stack.push(b)
+    if pass == 0:
+      for b, _ in defb: stack.push(b)
+    var got: {Int: Bool} = {}
+    while stack.len > 0:
+      let b = stack.pop()
+      if b in got: continue
+      got[b] = true
+      for p in pred[b]: stack.push(p)
+    if pass == 0: rref = got
+    else: rload = got
+  var aphi: {Int: Bool} = {}
+  var phi: {Int: Bool} = {}
+  var asig: {Int: Bool} = {}
+  var sig: {Int: [Bool]} = {}
+  var change = true
+  while change:
+    change = false
+    var wl: [Int] = []
+    for b, _ in defb: wl.push(b)
+    while wl.len > 0:
+      let x = wl.pop()
+      for y in gr.df[x]:
+        if y in aphi: continue
+        aphi[y] = true
+        if not (y in rload) or pred[y].len == 0: continue
+        phi[y] = true
+        for p in pred[y]: useb[p] = true
+        change = true
+        if not (y in defb):
+          defb[y] = true
+          wl.push(y)
+    var w2: [Int] = []
+    for b, _ in useb: w2.push(b)
+    while w2.len > 0:
+      let x = w2.pop()
+      for y in gr.rdf[x]:
+        if y in asig: continue
+        asig[y] = true
+        var flags: [Bool] = []
+        var any = false
+        for s in succ[y]:
+          let live = s in rref
+          flags.push(live)
+          if live: any = true
+        if not any: continue
+        sig[y] = flags
+        for s in succ[y]: defb[s] = true
+        change = true
+        if not (y in useb):
+          useb[y] = true
+          w2.push(y)
+  # renaming over the dominator tree
+  var next = 1
+  var opval: {Int: Int} = {}
+  var exitv: {Int: Int} = {}
+  var phiv: {Int: Int} = {}
+  var sigv: {Int: Int} = {}     # block * 64 + successor index -> value
+  var sigsrc: {Int: Int} = {}
+  var stack = [0]
+  var inval = [0]
+  while stack.len > 0:
+    let b = stack.pop()
+    var cur = inval.pop()
+    if b in phi:
+      cur = next
+      phiv[b] = next
+      next += 1
+    for i in w.bops[b]:
+      if w.oo[i] != v: continue
+      if is_use(w.ok[i]): opval[i] = cur
+      else:
+        cur = next
+        next += 1
+    exitv[b] = cur
+    for c in gr.kids[b]:
+      var cv = cur
+      if b in sig:
+        for si in 0..succ[b].len:
+          if succ[b][si] == c and sig[b][si]:
+            let key = b * 64 + si
+            if not (key in sigv):
+              sigv[key] = next
+              sigsrc[next] = cur
+              next += 1
+            cv = sigv[key]
+            break
+      stack.push(c)
+      inval.push(cv)
+  # phi operands, then useless phis replaced by their one operand
+  var ops: {Int: [Int]} = {}
+  for y, _ in phi:
+    if not (y in phiv): continue
+    var l: [Int] = []
+    for p in pred[y]:
+      var val = exitv.get(p, 0)
+      if p in sig:
+        for si in 0..succ[p].len:
+          if succ[p][si] == y:
+            if sig[p][si]:
+              let key = p * 64 + si
+              if not (key in sigv):
+                sigv[key] = next
+                sigsrc[next] = val
+                next += 1
+              val = sigv[key]
+            break
+      l.push(val)
+    ops[phiv[y]] = l
+  var rp: {Int: Int} = {}
+  var ch2 = true
+  while ch2:
+    ch2 = false
+    for pv, l in ops:
+      if uf_find(rp, pv) != pv: continue
+      var v0 = -1
+      var useless = true
+      for x0 in l:
+        let x = uf_find(rp, x0)
+        if x == pv: continue
+        if v0 < 0: v0 = x
+        elif v0 != x: useless = false
+      if useless and v0 >= 0:
+        rp[pv] = v0
+        ch2 = true
+  return V(opval, rp, ops, sigsrc)
+
+# hasUse: a use of the value (but the operation skip), or of a phi or sigma made from it.
+fn value_used(gr: Gr, w: W, vi: V, v: Int, skip: Int) -> Bool:
+  if not (skip in vi.opval): return true
+  let start = uf_find(vi.rp, vi.opval[skip])
+  var uses: {Int: Bool} = {}
+  for b in 0..gr.succ.len:
+    if gr.idom[b] < 0: continue
+    for i in w.bops[b]:
+      if i == skip or w.oo[i] != v or not is_use(w.ok[i]) or not (i in vi.opval): continue
+      uses[uf_find(vi.rp, vi.opval[i])] = true
+  var seen: {Int: Bool} = {}
+  var work = [start]
+  while work.len > 0:
+    let x = work.pop()
+    if x in seen: continue
+    seen[x] = true
+    if x in uses: return true
+    for pv, l in vi.phiops:
+      if uf_find(vi.rp, pv) != pv: continue
+      for y in l:
+        if uf_find(vi.rp, y) == x: work.push(pv)
+    for sv, src in vi.sigsrc:
+      if uf_find(vi.rp, src) == x: work.push(sv)
+  return false
+
+fn sa5011(g: tc.Prog, var e: E, f: F, w: W, reach: {Int: Bool}):
+  let n = f.succ.len
+  var checked: [Int] = []
+  var seen_v: {Int: Bool} = {}
+  for b in 0..n:
+    if not (b in reach): continue
+    for i in w.bops[b]:
+      let o = w.oo[i]
+      if w.ok[i] == CHECK and not unlifted(e, w, o) and not (o in seen_v):
+        seen_v[o] = true
+        checked.push(o)
+  if checked.len == 0: return
+  let gr = graph(f, reach)
+  for v in checked:
+    let vi = values(gr, w, v)
+    # maybeNil: the last check of each value, in block order
+    var maybe: {Int: Int} = {}
+    for b in 0..n:
+      if gr.idom[b] < 0: continue
+      for i in w.bops[b]:
+        if w.oo[i] == v and w.ok[i] == CHECK and i in vi.opval: maybe[uf_find(vi.rp, vi.opval[i])] = w.on[i]
+    for b in 0..n:
+      if gr.idom[b] < 0: continue
+      for i in w.bops[b]:
+        if w.oo[i] != v or w.ok[i] != DEREF or not (i in vi.opval): continue
+        let val = uf_find(vi.rp, vi.opval[i])
+        if val > 0 and val in maybe:
+          e.out.push(Rep(w.on[i], "SA5011", "possible nil pointer dereference"))
+          e.out.push(Rep(maybe[val], "SA5011(related information)", "this check suggests that the pointer can be nil"))

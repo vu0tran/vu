@@ -11,6 +11,7 @@ import vet
 import errcheck
 import deprecated
 import deprdata
+import ssa
 from scan import T_ASSIGN, T_DEFINE, T_LOR, T_LAND, T_EQL, T_NEQ, T_LSS, T_GTR, T_LEQ, T_GEQ, T_NOT, T_ARROW, T_AND, T_SUB, T_ADD, T_QUO, T_REM, T_OR, T_XOR, T_ANDNOT
 from scan import K_BREAK, K_GOTO, K_VAR, K_CONST, K_RETURN
 
@@ -617,6 +618,11 @@ fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gov
   qf1008(&g, fs, &c, nodes, parent)
   redundant_type(&g, fs, &c, p, nodes, parent, "QF1011", "could", true)
   qf1012(&g, fs, &c, nodes)
+  s1002(&g, fs, &c, p, nodes)
+  s1038(&g, fs, &c, p, nodes)
+  s1039(&g, fs, &c, p, nodes)
+  s1040(&g, fs, &c, p, nodes)
+  for r in ssa.run(&g, fs, pi, roots, p.test): report(g, &c, r.n, r.code, r.msg)
   swap(&nodes, &w.nodes)
   swap(&parent, &w.parent)
   for is in c.out: issues.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
@@ -735,10 +741,23 @@ fn st1005(var g: tc.Prog, fs: Fs, var c: C, p: pkg.Pkg, nodes: [Int], roots: [In
       if k(g, pi, d) == ast.N_FUNCDECL: names[nm(g, pi, g.pk[pi].t.b[d])] = true
       elif k(g, pi, d) == ast.N_GENDECL and g.pk[pi].t.f[d] == scan.K_TYPE:
         for sp in ast.items(g.pk[pi].t, g.pk[pi].t.a[d]): names[nm(g, pi, g.pk[pi].t.a[sp])] = true
+  # in a test file only the package's initializers are checked (staticcheck skips the functions
+  # in tests, and the package's init function has no position)
+  var init_calls: {Int: Bool} = {}
+  for root in roots:
+    if not p.test[g.pk[pi].t.file[root]]: continue
+    for d in ast.items(g.pk[pi].t, g.pk[pi].t.c[root]):
+      if k(g, pi, d) != ast.N_GENDECL: continue
+      var stack = [d]
+      while stack.len > 0:
+        let x = stack.pop()
+        if k(g, pi, x) == ast.N_FUNCLIT: continue
+        if k(g, pi, x) == ast.N_CALL: init_calls[x] = true
+        vet.push_kids(g.pk[pi].t, x, &stack)
   for n in nodes:
     if k(g, pi, n) != ast.N_CALL: continue
     let fi = g.pk[pi].t.file[n]
-    if p.test[fi]: continue
+    if p.test[fi] and not (n in init_calls): continue
     let cn = callee_name(&g, fs, &c, n)
     if cn != "errors.New" and cn != "fmt.Errorf": continue
     let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
@@ -1728,3 +1747,126 @@ fn sa1017(var g: tc.Prog, fs: Fs, var c: C, nodes: [Int]):
       let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[a], margs[1], -1, 0)
       unbuf = cv.k == 1 and cv.i == 0
     if unbuf: report(g, &c, a, "SA1017", "the channel used with signal.Notify should be buffered")
+
+# ---- S1002: comparison with a boolean constant
+
+fn bool_const(var g: tc.Prog, fs: Fs, pi: Int, n: Int) -> Int:
+  # 1 true, 0 false, -1 not an (untyped or plain bool) constant identifier
+  if k(g, pi, n) != ast.N_IDENT: return -1
+  let o = obj_of(g, pi, n)
+  if o < 0 or g.ok[o] != tc.O_CONST: return -1
+  let t = tc.obj_type(&g, fs, o)
+  if t != tc.B_BOOL and t != tc.B_UBOOL: return -1
+  let cv = tc.obj_const(&g, fs, o)
+  if cv.k != 4: return -1
+  if cv.i != 0: return 1
+  return 0
+
+fn s1002(var g: tc.Prog, fs: Fs, var c: C, p: pkg.Pkg, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_BINARY: continue
+    let op = g.pk[pi].t.f[n]
+    if op != T_EQL and op != T_NEQ: continue
+    let fi = g.pk[pi].t.file[n]
+    if p.test[fi] or p.hgen[fi]: continue
+    let x = g.pk[pi].t.a[n]
+    let y = g.pk[pi].t.b[n]
+    let bx = bool_const(&g, fs, pi, x)
+    let byv = bool_const(&g, fs, pi, y)
+    if bx < 0 and byv < 0: continue
+    var other = x
+    var val = byv == 1
+    if bx >= 0:
+      other = y
+      val = bx == 1
+    let ot = vet.ty(g, pi, other)
+    if ot <= 0: continue
+    let u = tc.under(&g, fs, ot)
+    if u != tc.B_BOOL and u != tc.B_UBOOL: continue
+    var r = fmt_expr(g, pi, other)
+    if (op == T_EQL and not val) or (op == T_NEQ and val): r = "!" + r
+    let l1 = r.len
+    var i = 0
+    while i < r.len and r[i] == '!': i += 1
+    r = r[i..r.len]
+    if (l1 - r.len) % 2 == 1: r = "!" + r
+    report(g, &c, n, "S1002", "should omit comparison to bool constant, can be simplified to " + r)
+
+# ---- S1039: fmt.Sprint(literal) / fmt.Sprintf(literal without %)
+
+fn s1039(var g: tc.Prog, fs: Fs, var c: C, p: pkg.Pkg, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_CALL: continue
+    if p.hgen[g.pk[pi].t.file[n]]: continue
+    let cn = callee_name(&g, fs, &c, n)
+    if cn != "fmt.Sprint" and cn != "fmt.Sprintf": continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len != 1 or g.pk[pi].t.f[n] == 1: continue
+    let a = args[0]
+    if k(g, pi, a) != ast.N_BASICLIT or g.pk[pi].t.f[a] != scan.T_STRING: continue
+    if cn == "fmt.Sprintf" and nm(g, pi, a).find("%") >= 0: continue
+    report(g, &c, n, "S1039", "unnecessary use of fmt." + cn[4..cn.len])
+
+# ---- S1038: printing fmt.Sprintf's result
+
+fn s1038(var g: tc.Prog, fs: Fs, var c: C, p: pkg.Pkg, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_CALL: continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len == 0 or args.len > 2 or g.pk[pi].t.f[n] == 1: continue
+    let cn = callee_name(&g, fs, &c, n)
+    let last = args[args.len - 1]
+    if k(g, pi, last) != ast.N_CALL or callee_name(&g, fs, &c, last) != "fmt.Sprintf": continue
+    let iargs = ast.items(g.pk[pi].t, g.pk[pi].t.b[last])
+    if iargs.len == 0: continue
+    # fmt.Print/Sprint/Println/Sprintln(fmt.Sprintf(...)), fmt.Fprint/Fprintln(w, fmt.Sprintf(...))
+    var fmt1 = false
+    if args.len == 1 and (cn == "fmt.Print" or cn == "fmt.Sprint" or cn == "fmt.Println" or cn == "fmt.Sprintln"): fmt1 = true
+    if args.len == 2 and (cn == "fmt.Fprint" or cn == "fmt.Fprintln"): fmt1 = true
+    if fmt1:
+      if p.hgen[g.pk[pi].t.file[n]]: continue
+      let name = cn[4..cn.len]
+      if name.endswith("ln"):
+        if k(g, pi, iargs[0]) != ast.N_BASICLIT: continue
+        report(g, &c, n, "S1038", "should use fmt." + name[0..name.len - 2] + "f instead of fmt." + name + "(fmt.Sprintf(...)) (but don't forget the newline)")
+      else: report(g, &c, n, "S1038", "should use fmt." + name + "f instead of fmt." + name + "(fmt.Sprintf(...))")
+      continue
+    if args.len != 1: continue
+    var alt = ""
+    var recv = ""
+    let table = ["(*testing.common).Error", "(*testing.common)", "Errorf", "(testing.TB).Error", "(testing.TB)", "Errorf", "(*testing.common).Fatal", "(*testing.common)", "Fatalf", "(testing.TB).Fatal", "(testing.TB)", "Fatalf", "(*testing.common).Log", "(*testing.common)", "Logf", "(testing.TB).Log", "(testing.TB)", "Logf", "(*testing.common).Skip", "(*testing.common)", "Skipf", "(testing.TB).Skip", "(testing.TB)", "Skipf", "(*log.Logger).Fatal", "(*log.Logger)", "Fatalf", "(*log.Logger).Fatalln", "(*log.Logger)", "Fatalf", "(*log.Logger).Panic", "(*log.Logger)", "Panicf", "(*log.Logger).Panicln", "(*log.Logger)", "Panicf", "(*log.Logger).Print", "(*log.Logger)", "Printf", "(*log.Logger).Println", "(*log.Logger)", "Printf", "log.Fatal", "", "log.Fatalf", "log.Fatalln", "", "log.Fatalf", "log.Panic", "", "log.Panicf", "log.Panicln", "", "log.Panicf", "log.Print", "", "log.Printf", "log.Println", "", "log.Printf"]
+    var ti = 0
+    while ti < table.len:
+      if table[ti] == cn:
+        recv = table[ti + 1] + ""
+        alt = table[ti + 2] + ""
+      ti += 3
+    if alt.len == 0: continue
+    let fun = unparen(g, pi, g.pk[pi].t.a[n])
+    if recv.len == 0:
+      report(g, &c, n, "S1038", "should use " + alt + "(...) instead of " + cn + "(fmt.Sprintf(...))")
+      continue
+    if k(g, pi, fun) != ast.N_SELECTOR or g.pk[pi].skind.get(fun, 0) == tc.S_PKG: continue
+    let sname = nm(g, pi, g.pk[pi].t.b[fun])
+    if not (sname == "Error" or sname == "Fatal" or sname == "Fatalln" or sname == "Log" or sname == "Panic" or sname == "Panicln" or sname == "Print" or sname == "Println" or sname == "Skip"): continue
+    let rx = fmt_expr(g, pi, g.pk[pi].t.a[fun])
+    report(g, &c, n, "S1038", "should use " + rx + "." + alt + "(...) instead of " + fmt_expr(g, pi, fun) + "(fmt.Sprintf(...))")
+
+# ---- S1040: a type assertion to the type the value already has
+
+fn s1040(var g: tc.Prog, fs: Fs, var c: C, p: pkg.Pkg, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if k(g, pi, n) != ast.N_TYPEASSERT: continue
+    let te = g.pk[pi].t.b[n]
+    if te <= 0: continue
+    if p.hgen[g.pk[pi].t.file[n]]: continue
+    let t1 = vet.ty(g, pi, te)
+    let t2 = vet.ty(g, pi, g.pk[pi].t.a[n])
+    if t1 <= 0 or t1 != t2: continue
+    let u = tc.under(&g, fs, t1)
+    if u <= 0 or g.tk[u] != tc.TY_IFACE: continue
+    report(g, &c, n, "S1040", "type assertion to the same type: " + fmt_expr(g, pi, g.pk[pi].t.a[n]) + " already has type " + fmt_expr(g, pi, te))
