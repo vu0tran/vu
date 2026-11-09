@@ -206,6 +206,19 @@ spread it over processes, and on these machines a second node process gains less
 process (hardware threads, V8's own threads), a third nothing. So not 2 times as fast here; not
 measured on a machine with more physical cores.
 
+Built-in rules only (AFFiNE's config without its JS plugins and type-aware rules, 2026-11-08, 2
+cores, four runs each alternating): oxlint 2.32-2.41 s wall and 4.2-4.3 s CPU; vlint 1.45-1.52 s
+and 2.1-2.2 s (1.76-1.90 s and 2.7-2.8 s before); on one thread, oxlint 4.49 s, vlint 2.25 s. Found
+with `vu build --profile` and a count of the C runtime's string copies (3.3 GB copied for 25 MB of
+source): `let src = p.sc.src` in three JSX parsing functions copied the whole file for every JSX
+name and element (3.19 GB of it; the source is now read in place); react-hooks' `additionalHooks`
+pattern was tried at every byte of every call's name, with two lists allocated at each (lmatch now
+skips places where no match can start: the bytes a match can begin with are worked out when the
+pattern is compiled; the old and new matcher agree on 60,000 random patterns and texts); and
+`fast_match` copied a gitignore pattern for each of 1.6 million paths checked. Checked: the same
+diagnostics on AFFiNE with the built-in, no-JS-plugin and full configs; lc 308 of 308; vtsc's and
+vknip's regressions (the parser is theirs too) unchanged.
+
 **Output**: oxlint's graphical report (themes, links, summary lines), the agent format, and all
 `-f` formats, byte-identical in the cases checked.
 
