@@ -52,6 +52,18 @@ bad=$(echo "$res" | grep '^FAIL')
 [ -z "$bad" ]; check "every program prints the same split and whole ($n programs)" $? "$(echo "$bad" | head -20)"
 echo "split and whole the same: $n programs"
 
+# programs that call C (extern blocks), in parts of 40 lines: the glue is in part 0 only, with the
+# functions that call it, so its own state (a count of live handles, kept by two modules) is the
+# same split
+nf=0; badf=""
+for m in ffi/*/main.vu; do
+  want=$(sed -n '2s/^# expect: output //p' "$m"); [ -n "$want" ] || continue
+  d=$(dirname "$m")
+  o1=$(cd "$d" && VU_SPLIT=off timeout 120 "$VU" run main.vu 2>&1); o2=$(cd "$d" && VU_SPLIT=always VU_SPLIT_LINES=40 timeout 120 "$VU" run main.vu 2>&1)
+  if [ "$o1" = "$o2" ] && [ "$o2" = "$want" ]; then nf=$((nf+1)); else badf="$badf $m: [$o1] [$o2]"; fi
+done
+[ -z "$badf" ] && [ $nf -ge 10 ]; check "programs calling C print the same split and whole ($nf programs)" $? "$badf"
+
 # a big program: the compiler's own source
 src="$PWD/../compiler/vuc.vu"
 rm -rf "$XDG_CACHE_HOME"

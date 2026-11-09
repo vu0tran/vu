@@ -9729,8 +9729,15 @@ fn build(var g: G, items: [Node]) -> Str:
     for n, d in g.exttypes: out.push("static void " + d + "(void *p);")
     for fname, fi in g.fns:
       if fi.item >= 0 and items[fi.item].op == "extern": out.push(extern_proto(g, fi, items[fi.item].v))
+    # (a split build includes the glue in part 0 only, with the functions that call it: the extern
+    # functions' bodies (split_build moves them there) and the handles' drops, which the other parts
+    # call; the glue's own static state then exists once)
+    out.push("#if defined(VU_PART) || defined(VU_PART0)\n#define VU_XDROP\n#else\n#define VU_XDROP static\n#endif")
+    for n, d in g.exttypes: out.push("VU_XDROP void drop_X_" + n + "(void **p);")
+    out.push("#ifndef VU_PART")
     for p in g.ext_paths: out.push("#include " + cstr(p))
-    for n, d in g.exttypes: out.push("static void drop_X_" + n + "(void **p) {{ if (*p) {{ " + d + "(*p); *p = NULL; }} }}")
+    for n, d in g.exttypes: out.push("VU_XDROP void drop_X_" + n + "(void **p) {{ if (*p) {{ " + d + "(*p); *p = NULL; }} }}")
+    out.push("#endif")
   for c in consts: out.push(c)
   for n in g.struct_order: out.push("typedef struct T_" + n + " T_" + n + ";")
   for t in g.types:
@@ -10762,6 +10769,32 @@ fn split_parts(rest: Str, size: Int) -> [Str]:
     if cur != "": parts.push(cur)
   return parts
 
+# What the C includes from extern blocks' C files (and the files those include with quotes, one
+# level down): it isn't in the C, so the build caches' keys add it.
+fn glue_text(fs: Fs, csrc: Str) -> Str:
+  var out = ""
+  let end = csrc.find("\n/* vu-parts */\n", 0)
+  var lim = csrc.len
+  if end >= 0: lim = end
+  var i = csrc.find("\n#include \"", 0)
+  while i >= 0 and i < lim:
+    let e = csrc.find("\n", i + 1)
+    let ln = csrc[i + 1..e]
+    if ln.endswith(".c\""):
+      let p = ln[10..ln.len - 1]
+      let txt = fs.read(p) else ""
+      out += p + "\n" + txt + "\n"
+      let dir = p[0..find_last(p, "/") + 1]
+      var j = txt.find("#include \"", 0)
+      while j >= 0:
+        let q = txt.find("\"", j + 10)
+        if q < 0: break
+        let inc = dir + txt[j + 10..q]
+        out += inc + "\n" + (fs.read(inc) else "") + "\n"
+        j = txt.find("#include \"", q)
+    i = csrc.find("\n#include \"", e)
+  return out
+
 # A split build (quick builds of big programs): the parts are compiled as separate C files, as many
 # at once as there are cores, and each part's object file is kept, under the hash of its C and the
 # options, in $XDG_CACHE_HOME/vu/parts (or ~/.cache/vu/parts), one folder per program and options.
@@ -10788,12 +10821,20 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
   var size = 12000
   for a in cflags:
     if a == "-O0": size = 3000
+  # (VU_SPLIT_LINES: the parts' size, for tests that want several parts of a small program)
+  let sl = int(os.env("VU_SPLIT_LINES")) else 0
+  if sl > 0: size = sl
+  # (an extern function's body calls the glue, which part 0 alone includes: it goes in part 0)
+  var part0 = ""
   for p in split_parts(csrc[at + 15..csrc.len], size):
     var rest = ""
     for f in p.split("\n/* vu-part */\n"):
       if f.startswith("VU_FNI "): head += f + "\n"
+      elif f.find("vu_ffi_here(", 0) >= 0: part0 += "\n/* vu-part */\n" + f
       elif f != "": rest += "\n/* vu-part */\n" + f
     if rest != "": parts.push(rest)
+  # (part 0's key holds the glue files it includes, which aren't in the C here)
+  let glue = glue_text(fs, head)
   let ncpu = int((os.output(["getconf", "_NPROCESSORS_ONLN"]) else "1").strip()) else 1
   var home = os.env("XDG_CACHE_HOME")
   if home == "" and os.env("HOME") != "": home = os.env("HOME") + "/.cache"
@@ -10828,10 +10869,12 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
         fs.remove(pch + "." + tag) else 0
         pch = ""
   for i in 0..parts.len + 1:
-    var src = "#define VU_PART0 1\n#include \"head.h\"\n"
+    var src = "#define VU_PART0 1\n#include \"head.h\"\n" + part0
     if i > 0 and pch != "": src = "/* after the precompiled header */\n" + parts[i - 1]
     elif i > 0: src = "#define VU_PART 1\n#include \"head.h\"\n" + parts[i - 1]
-    let obj = slot + "/" + sha256(hkey + src).hex()[0..40] + ".o"
+    var kin = hkey + src
+    if i == 0: kin += glue
+    let obj = slot + "/" + sha256(kin).hex()[0..40] + ".o"
     objs.push(obj)
     if fs.exists(obj): continue
     let c = pdir + "/p{i}.c"
@@ -11315,12 +11358,12 @@ fn main(fs: Fs, os: Os):
   # each part is kept (see split_build). VU_SPLIT=always splits any program, VU_SPLIT=off none.
   var split = false
   let smode = os.env("VU_SPLIT")
-  if not has_ext and not lib and not wasm and emit_c == "" and not san and not san_pool and not tsan and not profile and smode != "off":
+  if not lib and not wasm and emit_c == "" and not san and not san_pool and not tsan and not profile and smode != "off":
     let pat = csrc.find("\n/* vu-parts */\n", 0)
     if pat >= 0 and (smode == "always" or csrc[pat..csrc.len].count("\n") >= 6000): split = true
   # VU_CACHE=dir keeps each binary under the SHA-256 of everything it's made from (the C, the C
-  # compiler's command and version), so building the same program the same way again is a copy. Not
-  # for programs with extern C files (what they include isn't in the C here).
+  # compiler's command and version, and the extern blocks' C files it includes), so building the same
+  # program the same way again is a copy.
   # vu run keeps the binary of each program it ran, one per file and set of flags, in
   # ~/.cache/vu/run (or $XDG_CACHE_HOME/vu/run): running it again unchanged (a script with
   # #!/usr/bin/env -S vu run) skips the C compiler. VU_CACHE (a store of every build) takes its
@@ -11362,14 +11405,16 @@ fn main(fs: Fs, os: Os):
   let cache = os.env("VU_CACHE")
   var key = ""
   var rc = -1
-  if cache != "" and not has_ext:
+  if cache != "":
     var parts: [Str] = []
     for a in argl:
       if a != cfile and a != out: parts.push(a + "")
     let ver = os.output([argl[0] + "", "--version"]) else ""
     # (-march=native: the CPU is part of what the binary is made for)
     let cpu = cpu_key(fs, os, parts)
-    key = sha256(join(parts, "\n") + "\n" + ver + "\n" + cpu + csrc).hex()
+    var glue = ""
+    if has_ext: glue = glue_text(fs, csrc)
+    key = sha256(join(parts, "\n") + "\n" + ver + "\n" + cpu + csrc + glue).hex()
     let hit = cache + "/" + key
     if fs.exists(hit):
       rc = os.run(["cp", hit + "", out + ""]) else -1
