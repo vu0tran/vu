@@ -62,7 +62,7 @@ function lexProgram(prog, text) {
         break;
     }
     for (const k in node) {
-      if (k === "parent" || k === "comments" || k === "tokens") continue;
+      if (k === "parent" || k === "loc" || k === "comments" || k === "tokens") continue;
       const v = node[k];
       if (v === null || typeof v !== "object") continue;
       if (Array.isArray(v)) {

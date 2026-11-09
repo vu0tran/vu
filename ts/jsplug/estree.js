@@ -202,7 +202,7 @@ function setStart(o, s) {
 }
 
 function ident(nameStr, s, e) {
-  return fin({ __proto__: NodeProto, type: "Identifier", decorators: [], name: nameStr, optional: false, typeAnnotation: null }, s, e);
+  return fin({ __proto__: NodeProto, type: "Identifier", decorators: [], name: nameStr, optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, s, e);
 }
 // an identifier node at its own span (N_ID)
 function idNode(n) {
@@ -215,7 +215,7 @@ function identAt(nameStr, i) {
 
 function typeAnn(t, colon) {
   // `: T` (colon: where the colon is)
-  return fin({ __proto__: NodeProto, type: "TSTypeAnnotation", typeAnnotation: t }, colon, null);
+  return fin({ __proto__: NodeProto, type: "TSTypeAnnotation", typeAnnotation: t, start: 0, end: 0, range: null, parent: null }, colon, null);
 }
 // a type annotation for type node n, starting at the colon before it
 function annot(n) {
@@ -315,7 +315,7 @@ function numValue(raw) {
   return Number(r);
 }
 function literal(value, raw, s, e) {
-  return fin({ __proto__: NodeProto, type: "Literal", value, raw }, s, e);
+  return fin({ __proto__: NodeProto, type: "Literal", value, raw, start: 0, end: 0, range: null, parent: null }, s, e);
 }
 function strLit(n) {
   const raw = srcBytes(P(n), E(n));
@@ -347,7 +347,7 @@ function regexLit(n) {
 function templElem(s, e, tail, rawStart, rawEnd) {
   const raw = srcBytes(rawStart, rawEnd).replace(/\r\n?/g, "\n");
   const cooked = unescape(srcBytes(rawStart, rawEnd), true);
-  return fin({ __proto__: NodeProto, type: "TemplateElement", value: { raw, cooked }, tail }, s, e);
+  return fin({ __proto__: NodeProto, type: "TemplateElement", value: { raw, cooked }, tail, start: 0, end: 0, range: null, parent: null }, s, e);
 }
 // the quasis and expressions of a template (n: N_TEMPL or N_NOSUBTEMPL or N_TTEMPLATE), conv for
 // the expressions
@@ -451,34 +451,34 @@ function funcBody(n) {
     directives = false;
     body.push(stmt(st));
   }
-  return fin({ __proto__: NodeProto, type: "BlockStatement", body }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "BlockStatement", body, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 
 function stmt(n) {
   const k = K(n);
   switch (k) {
     case N_BLOCK:
-      return fin({ __proto__: NodeProto, type: "BlockStatement", body: stmtList(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "BlockStatement", body: stmtList(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_EMPTY:
-      return fin({ __proto__: NodeProto, type: "EmptyStatement" }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "EmptyStatement", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_EXPRSTMT:
-      return fin({ __proto__: NodeProto, type: "ExpressionStatement", expression: expr(A(n)), directive: null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ExpressionStatement", expression: expr(A(n)), directive: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_IF:
-      return fin({ __proto__: NodeProto, type: "IfStatement", test: expr(A(n)), consequent: stmt(B(n)), alternate: C(n) >= 0 ? stmt(C(n)) : null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "IfStatement", test: expr(A(n)), consequent: stmt(B(n)), alternate: C(n) >= 0 ? stmt(C(n)) : null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_RETURN:
-      return fin({ __proto__: NodeProto, type: "ReturnStatement", argument: A(n) >= 0 ? expr(A(n)) : null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ReturnStatement", argument: A(n) >= 0 ? expr(A(n)) : null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_WHILE:
-      return fin({ __proto__: NodeProto, type: "WhileStatement", test: expr(A(n)), body: stmt(B(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "WhileStatement", test: expr(A(n)), body: stmt(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_DO:
-      return fin({ __proto__: NodeProto, type: "DoWhileStatement", body: stmt(A(n)), test: expr(B(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "DoWhileStatement", body: stmt(A(n)), test: expr(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_FOR: {
       const init = A(n) < 0 ? null : (K(A(n)) === N_VAR ? varDecl(A(n)) : expr(A(n)));
-      return fin({ __proto__: NodeProto, type: "ForStatement", init, test: B(n) >= 0 ? expr(B(n)) : null, update: C(n) >= 0 ? expr(C(n)) : null, body: stmt(D(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ForStatement", init, test: B(n) >= 0 ? expr(B(n)) : null, update: C(n) >= 0 ? expr(C(n)) : null, body: stmt(D(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_FORIN: {
       const left = K(A(n)) === N_VAR ? varDecl(A(n)) : target(A(n));
-      if (F(n) === 0) return fin({ __proto__: NodeProto, type: "ForInStatement", left, right: expr(B(n)), body: stmt(C(n)) }, P(n), E(n));
-      return fin({ __proto__: NodeProto, type: "ForOfStatement", await: F(n) === 2, left, right: expr(B(n)), body: stmt(C(n)) }, P(n), E(n));
+      if (F(n) === 0) return fin({ __proto__: NodeProto, type: "ForInStatement", left, right: expr(B(n)), body: stmt(C(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ForOfStatement", await: F(n) === 2, left, right: expr(B(n)), body: stmt(C(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_BREAK:
     case N_CONTINUE: {
@@ -487,10 +487,10 @@ function stmt(n) {
         const at = skip(P(n) + (k === N_BREAK ? 5 : 8));
         label = identAt(name(n), at);
       }
-      return fin({ __proto__: NodeProto, type: k === N_BREAK ? "BreakStatement" : "ContinueStatement", label }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: k === N_BREAK ? "BreakStatement" : "ContinueStatement", label, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_THROW:
-      return fin({ __proto__: NodeProto, type: "ThrowStatement", argument: expr(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ThrowStatement", argument: expr(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TRY: {
       const block = stmt(A(n));
       let handler = null;
@@ -505,20 +505,20 @@ function stmt(n) {
             setEnd(param, param.typeAnnotation.end);
           }
         }
-        handler = fin({ __proto__: NodeProto, type: "CatchClause", param, body: stmt(C(n)) }, cs, E(C(n)));
+        handler = fin({ __proto__: NodeProto, type: "CatchClause", param, body: stmt(C(n)), start: 0, end: 0, range: null, parent: null }, cs, E(C(n)));
       }
-      return fin({ __proto__: NodeProto, type: "TryStatement", block, handler, finalizer: D(n) >= 0 ? stmt(D(n)) : null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TryStatement", block, handler, finalizer: D(n) >= 0 ? stmt(D(n)) : null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_SWITCH: {
-      const cases = items(B(n)).map((c) => fin({ __proto__: NodeProto, type: "SwitchCase", test: A(c) >= 0 ? expr(A(c)) : null, consequent: stmtList(B(c)) }, P(c), E(c)));
-      return fin({ __proto__: NodeProto, type: "SwitchStatement", discriminant: expr(A(n)), cases }, P(n), E(n));
+      const cases = items(B(n)).map((c) => fin({ __proto__: NodeProto, type: "SwitchCase", test: A(c) >= 0 ? expr(A(c)) : null, consequent: stmtList(B(c)), start: 0, end: 0, range: null, parent: null }, P(c), E(c)));
+      return fin({ __proto__: NodeProto, type: "SwitchStatement", discriminant: expr(A(n)), cases, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_LABEL:
-      return fin({ __proto__: NodeProto, type: "LabeledStatement", label: identAt(name(n), P(n)), body: stmt(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "LabeledStatement", label: identAt(name(n), P(n)), body: stmt(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_DEBUGGER:
-      return fin({ __proto__: NodeProto, type: "DebuggerStatement" }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "DebuggerStatement", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_WITH:
-      return fin({ __proto__: NodeProto, type: "WithStatement", object: expr(A(n)), body: stmt(B(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "WithStatement", object: expr(A(n)), body: stmt(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_VAR:
       return exported(n, D(n), (s) => varDecl(n, s));
     case N_FUNC:
@@ -540,19 +540,19 @@ function stmt(n) {
     case N_EXPORTDEFAULT: {
       // export default <expression>
       const x = A(n);
-      return fin({ __proto__: NodeProto, type: "ExportDefaultDeclaration", declaration: expr(x), exportKind: "value" }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ExportDefaultDeclaration", declaration: expr(x), exportKind: "value", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_IMPORTEQ:
       return exported(n, F(n), (s) => importEq(n, s));
     case N_EXPORTASSIGN:
-      return fin({ __proto__: NodeProto, type: "TSExportAssignment", expression: expr(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSExportAssignment", expression: expr(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_NSEXPORT: {
       const at = skipWords(P(n), ["export", "as", "namespace"]);
-      return fin({ __proto__: NodeProto, type: "TSNamespaceExportDeclaration", id: identAt(name(n), at) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSNamespaceExportDeclaration", id: identAt(name(n), at), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
   }
   // an expression where a statement was expected (error recovery)
-  return fin({ __proto__: NodeProto, type: "ExpressionStatement", expression: expr(n), directive: null }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "ExpressionStatement", expression: expr(n), directive: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 
 // export / export default around a declaration whose modifiers are mods: build(start of the
@@ -564,15 +564,15 @@ function exported(n, mods, build) {
     const d = build(P(n));
     const w = (mods & M_EXPORT) ? wordBefore(P(n)) : null;
     if (w === null || w.word !== "export") return d;
-    return fin({ __proto__: NodeProto, type: "ExportNamedDeclaration", declaration: d, specifiers: [], source: null, exportKind: "value", attributes: [] }, w.at, E(n));
+    return fin({ __proto__: NodeProto, type: "ExportNamedDeclaration", declaration: d, specifiers: [], source: null, exportKind: "value", attributes: [], start: 0, end: 0, range: null, parent: null }, w.at, E(n));
   }
   if ((mods & M_EXPORT) === 0) return build(P(n));
   const isDefault = (mods & M_DEFAULT) !== 0;
   const s = skipWords(P(n), isDefault ? ["export", "default"] : ["export"]);
   const decl = build(s);
-  if (isDefault) return fin({ __proto__: NodeProto, type: "ExportDefaultDeclaration", declaration: decl, exportKind: "value" }, P(n), E(n));
+  if (isDefault) return fin({ __proto__: NodeProto, type: "ExportDefaultDeclaration", declaration: decl, exportKind: "value", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   const tk = declKind(decl);
-  return fin({ __proto__: NodeProto, type: "ExportNamedDeclaration", declaration: decl, specifiers: [], source: null, exportKind: tk, attributes: [] }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "ExportNamedDeclaration", declaration: decl, specifiers: [], source: null, exportKind: tk, attributes: [], start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 
 // vlint's N_VAR starts at its keyword (var, let, const, using, await): export and declare are before
@@ -593,7 +593,7 @@ function exportedVar(n, mods, build) {
   }
   const decl = build(declStart);
   if (exportStart < 0) return decl;
-  return fin({ __proto__: NodeProto, type: "ExportNamedDeclaration", declaration: decl, specifiers: [], source: null, exportKind: declKind(decl), attributes: [] }, exportStart, E(n));
+  return fin({ __proto__: NodeProto, type: "ExportNamedDeclaration", declaration: decl, specifiers: [], source: null, exportKind: declKind(decl), attributes: [], start: 0, end: 0, range: null, parent: null }, exportStart, E(n));
 }
 function declKind(decl) {
   return decl.declare === true || decl.type === "TSInterfaceDeclaration" || decl.type === "TSTypeAliasDeclaration" ? "type" : "value";
@@ -609,11 +609,11 @@ function varDecl(n, s) {
       id.typeAnnotation = annot(B(d));
       setEnd(id, id.typeAnnotation.end);
     }
-    return fin({ __proto__: NodeProto, type: "VariableDeclarator", id, init: C(d) >= 0 ? expr(C(d)) : null, definite: (F(d) & M_EXCL) !== 0 }, P(d), E(d));
+    return fin({ __proto__: NodeProto, type: "VariableDeclarator", id, init: C(d) >= 0 ? expr(C(d)) : null, definite: (F(d) & M_EXCL) !== 0, start: 0, end: 0, range: null, parent: null }, P(d), E(d));
   });
   const declare = D(n) > 0 && (D(n) & M_DECLARE) !== 0;
   if (s === undefined) s = P(n);
-  return fin({ __proto__: NodeProto, type: "VariableDeclaration", kind, declarations, declare }, s, E(n));
+  return fin({ __proto__: NodeProto, type: "VariableDeclaration", kind, declarations, declare, start: 0, end: 0, range: null, parent: null }, s, E(n));
 }
 
 // a function (declaration or expression): n is N_FUNC / N_FUNCEXPR
@@ -679,7 +679,7 @@ function decoStart(x) {
   return i;
 }
 function decorator(x) {
-  return fin({ __proto__: NodeProto, type: "Decorator", expression: expr(x) }, decoStart(x), E(x));
+  return fin({ __proto__: NodeProto, type: "Decorator", expression: expr(x), start: 0, end: 0, range: null, parent: null }, decoStart(x), E(x));
 }
 
 function param(p) {
@@ -775,7 +775,7 @@ function pattern(n) {
     const properties = items(A(n)).map((e) => {
       if (F(e) & M_REST) {
         const arg = pattern(B(e));
-        return fin({ __proto__: NodeProto, type: "RestElement", decorators: [], argument: arg, optional: false, typeAnnotation: null, value: null }, P(e), E(e));
+        return fin({ __proto__: NodeProto, type: "RestElement", decorators: [], argument: arg, optional: false, typeAnnotation: null, value: null, start: 0, end: 0, range: null, parent: null }, P(e), E(e));
       }
       const shorthand = A(e) < 0;
       const keyNode = shorthand ? B(e) : A(e);
@@ -784,26 +784,26 @@ function pattern(n) {
       let value = pattern(B(e));
       if (C(e) >= 0) {
         const right = expr(C(e));
-        value = fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: value, right, optional: false, typeAnnotation: null }, shorthand ? P(B(e)) : P(B(e)), E(e));
+        value = fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: value, right, optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, shorthand ? P(B(e)) : P(B(e)), E(e));
       }
-      return fin({ __proto__: NodeProto, type: "Property", kind: "init", key, value, method: false, shorthand, computed, optional: false }, P(e), E(e));
+      return fin({ __proto__: NodeProto, type: "Property", kind: "init", key, value, method: false, shorthand, computed, optional: false, start: 0, end: 0, range: null, parent: null }, P(e), E(e));
     });
-    return fin({ __proto__: NodeProto, type: "ObjectPattern", decorators: [], properties, optional: false, typeAnnotation: null }, P(n), E(n));
+    return fin({ __proto__: NodeProto, type: "ObjectPattern", decorators: [], properties, optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   if (k === N_ARRPAT) {
     const elements = items(A(n)).map((e) => {
       if (K(e) === N_OMIT) return null;
       if (F(e) & M_REST) {
         const arg = pattern(B(e));
-        return fin({ __proto__: NodeProto, type: "RestElement", decorators: [], argument: arg, optional: false, typeAnnotation: null, value: null }, P(e), E(e));
+        return fin({ __proto__: NodeProto, type: "RestElement", decorators: [], argument: arg, optional: false, typeAnnotation: null, value: null, start: 0, end: 0, range: null, parent: null }, P(e), E(e));
       }
       let value = pattern(B(e));
       if (C(e) >= 0) {
-        value = fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: value, right: expr(C(e)), optional: false, typeAnnotation: null }, P(e), E(e));
+        value = fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: value, right: expr(C(e)), optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, P(e), E(e));
       }
       return value;
     });
-    return fin({ __proto__: NodeProto, type: "ArrayPattern", decorators: [], elements, optional: false, typeAnnotation: null }, P(n), E(n));
+    return fin({ __proto__: NodeProto, type: "ArrayPattern", decorators: [], elements, optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   return expr(n);
 }
@@ -814,28 +814,28 @@ function target(n) {
   if (k === N_OBJECT) {
     const properties = items(A(n)).map((pr) => {
       const pk = K(pr);
-      if (pk === N_SPREAD) return fin({ __proto__: NodeProto, type: "RestElement", decorators: [], argument: target(A(pr)), optional: false, typeAnnotation: null, value: null }, P(pr), E(pr));
+      if (pk === N_SPREAD) return fin({ __proto__: NodeProto, type: "RestElement", decorators: [], argument: target(A(pr)), optional: false, typeAnnotation: null, value: null, start: 0, end: 0, range: null, parent: null }, P(pr), E(pr));
       if (pk === N_SHORTHAND) {
         const key = identAt(name(pr), P(pr));
         let value = identAt(name(pr), P(pr));
-        if (B(pr) >= 0) value = fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: value, right: expr(B(pr)), optional: false, typeAnnotation: null }, P(pr), E(pr));
-        return fin({ __proto__: NodeProto, type: "Property", kind: "init", key, value, method: false, shorthand: true, computed: false, optional: false }, P(pr), E(pr));
+        if (B(pr) >= 0) value = fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: value, right: expr(B(pr)), optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, P(pr), E(pr));
+        return fin({ __proto__: NodeProto, type: "Property", kind: "init", key, value, method: false, shorthand: true, computed: false, optional: false, start: 0, end: 0, range: null, parent: null }, P(pr), E(pr));
       }
       if (pk === N_PROPASSIGN) {
         const computed = K(A(pr)) === N_COMPUTED;
-        return fin({ __proto__: NodeProto, type: "Property", kind: "init", key: propKey(A(pr)), value: targetWithDefault(B(pr)), method: false, shorthand: false, computed, optional: false }, P(pr), E(pr));
+        return fin({ __proto__: NodeProto, type: "Property", kind: "init", key: propKey(A(pr)), value: targetWithDefault(B(pr)), method: false, shorthand: false, computed, optional: false, start: 0, end: 0, range: null, parent: null }, P(pr), E(pr));
       }
       return objMember(pr);
     });
-    return fin({ __proto__: NodeProto, type: "ObjectPattern", decorators: [], properties, optional: false, typeAnnotation: null }, P(n), E(n));
+    return fin({ __proto__: NodeProto, type: "ObjectPattern", decorators: [], properties, optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   if (k === N_ARRAY) {
     const elements = items(A(n)).map((x) => {
       if (K(x) === N_OMIT) return null;
-      if (K(x) === N_SPREAD) return fin({ __proto__: NodeProto, type: "RestElement", decorators: [], argument: target(A(x)), optional: false, typeAnnotation: null, value: null }, P(x), E(x));
+      if (K(x) === N_SPREAD) return fin({ __proto__: NodeProto, type: "RestElement", decorators: [], argument: target(A(x)), optional: false, typeAnnotation: null, value: null, start: 0, end: 0, range: null, parent: null }, P(x), E(x));
       return targetWithDefault(x);
     });
-    return fin({ __proto__: NodeProto, type: "ArrayPattern", decorators: [], elements, optional: false, typeAnnotation: null }, P(n), E(n));
+    return fin({ __proto__: NodeProto, type: "ArrayPattern", decorators: [], elements, optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   if (k === N_PAREN) return target(A(n));
   return expr(n);
@@ -843,7 +843,7 @@ function target(n) {
 // x = default inside a pattern written as an expression
 function targetWithDefault(n) {
   if (K(n) === N_BINARY && F(n) === 62) {
-    return fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: target(A(n)), right: expr(B(n)), optional: false, typeAnnotation: null }, P(n), E(n));
+    return fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: target(A(n)), right: expr(B(n)), optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   return target(n);
 }
@@ -859,7 +859,7 @@ function propKey(n) {
   return expr(n);
 }
 function privName(n) {
-  return fin({ __proto__: NodeProto, type: "PrivateIdentifier", name: name(n).replace(/^#/, "") }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "PrivateIdentifier", name: name(n).replace(/^#/, ""), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 
 // ---- classes
@@ -878,11 +878,11 @@ function klass(n, s, isDecl) {
     superClass = expr(A(h));
     if (B(h) >= 0) superTypeArguments = typeArgs(B(h));
   }
-  const impl = items(C(n)).map((h) => fin({ __proto__: NodeProto, type: "TSClassImplements", expression: entityExpr(A(h)), typeArguments: B(h) >= 0 ? typeArgs(B(h)) : null }, P(h), E(h)));
+  const impl = items(C(n)).map((h) => fin({ __proto__: NodeProto, type: "TSClassImplements", expression: entityExpr(A(h)), typeArguments: B(h) >= 0 ? typeArgs(B(h)) : null, start: 0, end: 0, range: null, parent: null }, P(h), E(h)));
   const typeParameters = A(n) >= 0 ? typeParams(A(n)) : null;
   const bodyStart = find(C(n) >= 0 ? E(C(n)) : B(n) >= 0 ? E(B(n)) : A(n) >= 0 ? E(A(n)) : id ? idEnd(npos.get(n) ?? 0) : s + 5, 123);
   const members = items(D(n)).filter((m) => K(m) !== N_SEMIMEMBER).map(classMember);
-  const body = fin({ __proto__: NodeProto, type: "ClassBody", body: members }, bodyStart, E(n));
+  const body = fin({ __proto__: NodeProto, type: "ClassBody", body: members, start: 0, end: 0, range: null, parent: null }, bodyStart, E(n));
   const o = {
     __proto__: NodeProto,
     type: isDecl ? "ClassDeclaration" : "ClassExpression",
@@ -918,7 +918,7 @@ function classMember0(m) {
   const f = F(m);
   const decorators = decoratorsBefore(P(m));
   if (k === N_STATICBLOCK) {
-    return fin({ __proto__: NodeProto, type: "StaticBlock", body: stmtList(A(A(m))) }, P(m), E(m));
+    return fin({ __proto__: NodeProto, type: "StaticBlock", body: stmtList(A(A(m))), start: 0, end: 0, range: null, parent: null }, P(m), E(m));
   }
   if (k === N_PROP) {
     const isAcc = (f & M_ACCESSOR) !== 0;
@@ -927,9 +927,9 @@ function classMember0(m) {
     const key = propKey(A(m));
     let type = isAcc ? (abstract ? "TSAbstractAccessorProperty" : "AccessorProperty") : abstract ? "TSAbstractPropertyDefinition" : "PropertyDefinition";
     if (isAcc) {
-      return fin({ __proto__: NodeProto, type, decorators, key, typeAnnotation: B(m) >= 0 ? annot(B(m)) : null, value: C(m) >= 0 ? expr(C(m)) : null, computed, static: (f & M_STATIC) !== 0, override: (f & M_OVERRIDE) !== 0, definite: (f & M_EXCL) !== 0, accessibility: accessibility(f), declare: false, optional: false, readonly: false }, P(m), E(m));
+      return fin({ __proto__: NodeProto, type, decorators, key, typeAnnotation: B(m) >= 0 ? annot(B(m)) : null, value: C(m) >= 0 ? expr(C(m)) : null, computed, static: (f & M_STATIC) !== 0, override: (f & M_OVERRIDE) !== 0, definite: (f & M_EXCL) !== 0, accessibility: accessibility(f), declare: false, optional: false, readonly: false, start: 0, end: 0, range: null, parent: null }, P(m), E(m));
     }
-    return fin({ __proto__: NodeProto, type, decorators, key, typeAnnotation: B(m) >= 0 ? annot(B(m)) : null, value: C(m) >= 0 ? expr(C(m)) : null, computed, static: (f & M_STATIC) !== 0, declare: (f & M_DECLARE) !== 0, override: (f & M_OVERRIDE) !== 0, optional: (f & M_OPTIONAL) !== 0, definite: (f & M_EXCL) !== 0, readonly: (f & M_READONLY) !== 0, accessibility: accessibility(f) }, P(m), E(m));
+    return fin({ __proto__: NodeProto, type, decorators, key, typeAnnotation: B(m) >= 0 ? annot(B(m)) : null, value: C(m) >= 0 ? expr(C(m)) : null, computed, static: (f & M_STATIC) !== 0, declare: (f & M_DECLARE) !== 0, override: (f & M_OVERRIDE) !== 0, optional: (f & M_OPTIONAL) !== 0, definite: (f & M_EXCL) !== 0, readonly: (f & M_READONLY) !== 0, accessibility: accessibility(f), start: 0, end: 0, range: null, parent: null }, P(m), E(m));
   }
   if (k === N_INDEXSIG) return indexSig(m);
   // methods, accessors, constructors
@@ -953,7 +953,7 @@ function classMember0(m) {
   const abstract = (f & M_ABSTRACT) !== 0;
   const value = funcValue(m, sig, body, f, keyEnd(keyNode, k, key));
   const type = abstract ? "TSAbstractMethodDefinition" : "MethodDefinition";
-  return fin({ __proto__: NodeProto, type, decorators, key, value, kind, computed, static: (f & M_STATIC) !== 0, override: (f & M_OVERRIDE) !== 0, optional: (f & M_OPTIONAL) !== 0, accessibility: accessibility(f) }, P(m), E(m));
+  return fin({ __proto__: NodeProto, type, decorators, key, value, kind, computed, static: (f & M_STATIC) !== 0, override: (f & M_OVERRIDE) !== 0, optional: (f & M_OPTIONAL) !== 0, accessibility: accessibility(f), start: 0, end: 0, range: null, parent: null }, P(m), E(m));
 }
 // where a method's function starts: its ( or <
 function keyEnd(keyNode, k, key) {
@@ -982,7 +982,7 @@ function indexSig(m) {
     }
     return id;
   });
-  return fin({ __proto__: NodeProto, type: "TSIndexSignature", parameters, typeAnnotation: B(m) >= 0 ? annot(B(m)) : null, readonly: (f & M_READONLY) !== 0, static: (f & M_STATIC) !== 0, accessibility: accessibility(f) }, P(m), E(m));
+  return fin({ __proto__: NodeProto, type: "TSIndexSignature", parameters, typeAnnotation: B(m) >= 0 ? annot(B(m)) : null, readonly: (f & M_READONLY) !== 0, static: (f & M_STATIC) !== 0, accessibility: accessibility(f), start: 0, end: 0, range: null, parent: null }, P(m), E(m));
 }
 
 // ---- TypeScript declarations
@@ -990,16 +990,16 @@ function indexSig(m) {
 function iface(n, s) {
   const np = npos.get(n);
   const id = identAt(name(n), np !== undefined ? np : skipWords(s, ["declare", "interface"]));
-  const ext = items(B(n)).map((h) => fin({ __proto__: NodeProto, type: "TSInterfaceHeritage", expression: entityExpr(A(h)), typeArguments: B(h) >= 0 ? typeArgs(B(h)) : null }, P(h), E(h)));
+  const ext = items(B(n)).map((h) => fin({ __proto__: NodeProto, type: "TSInterfaceHeritage", expression: entityExpr(A(h)), typeArguments: B(h) >= 0 ? typeArgs(B(h)) : null, start: 0, end: 0, range: null, parent: null }, P(h), E(h)));
   const bodyNode = C(n);
-  const body = fin({ __proto__: NodeProto, type: "TSInterfaceBody", body: items(bodyNode).map(typeMember) }, P(bodyNode), E(bodyNode));
-  return fin({ __proto__: NodeProto, type: "TSInterfaceDeclaration", id, typeParameters: A(n) >= 0 ? typeParams(A(n)) : null, extends: ext, body, declare: (D(n) & M_DECLARE) !== 0 }, s, E(n));
+  const body = fin({ __proto__: NodeProto, type: "TSInterfaceBody", body: items(bodyNode).map(typeMember), start: 0, end: 0, range: null, parent: null }, P(bodyNode), E(bodyNode));
+  return fin({ __proto__: NodeProto, type: "TSInterfaceDeclaration", id, typeParameters: A(n) >= 0 ? typeParams(A(n)) : null, extends: ext, body, declare: (D(n) & M_DECLARE) !== 0, start: 0, end: 0, range: null, parent: null }, s, E(n));
 }
 
 function typeAlias(n, s) {
   const np = npos.get(n);
   const id = identAt(name(n), np !== undefined ? np : skipWords(s, ["declare", "type"]));
-  return fin({ __proto__: NodeProto, type: "TSTypeAliasDeclaration", id, typeParameters: A(n) >= 0 ? typeParams(A(n)) : null, typeAnnotation: type(B(n)), declare: (D(n) & M_DECLARE) !== 0 }, s, E(n));
+  return fin({ __proto__: NodeProto, type: "TSTypeAliasDeclaration", id, typeParameters: A(n) >= 0 ? typeParams(A(n)) : null, typeAnnotation: type(B(n)), declare: (D(n) & M_DECLARE) !== 0, start: 0, end: 0, range: null, parent: null }, s, E(n));
 }
 
 function enumDecl(n, s) {
@@ -1014,10 +1014,10 @@ function enumDecl(n, s) {
     else if (K(kn) === N_STR) key = strLit(kn);
     else if (computed && (K(A(kn)) === N_STR || K(A(kn)) === N_NOSUBTEMPL)) key = K(A(kn)) === N_STR ? strLit(A(kn)) : expr(A(kn));
     else key = propKey(kn);
-    return fin({ __proto__: NodeProto, type: "TSEnumMember", id: key, initializer: B(m) >= 0 ? expr(B(m)) : null, computed }, P(m), E(m));
+    return fin({ __proto__: NodeProto, type: "TSEnumMember", id: key, initializer: B(m) >= 0 ? expr(B(m)) : null, computed, start: 0, end: 0, range: null, parent: null }, P(m), E(m));
   });
-  const body = fin({ __proto__: NodeProto, type: "TSEnumBody", members }, P(lst), E(n));
-  return fin({ __proto__: NodeProto, type: "TSEnumDeclaration", id, body, const: (F(n) & M_CONST) !== 0, declare: (F(n) & M_DECLARE) !== 0 }, s, E(n));
+  const body = fin({ __proto__: NodeProto, type: "TSEnumBody", members, start: 0, end: 0, range: null, parent: null }, P(lst), E(n));
+  return fin({ __proto__: NodeProto, type: "TSEnumDeclaration", id, body, const: (F(n) & M_CONST) !== 0, declare: (F(n) & M_DECLARE) !== 0, start: 0, end: 0, range: null, parent: null }, s, E(n));
 }
 
 function moduleDecl(n, s) {
@@ -1025,8 +1025,8 @@ function moduleDecl(n, s) {
   const declare = (f & M_DECLARE) !== 0;
   if (f & MOD_GLOBAL) {
     const id = idNode(A(n));
-    const body = B(n) >= 0 ? fin({ __proto__: NodeProto, type: "TSModuleBlock", body: stmtList(B(n)) }, P(B(n)), E(n)) : null;
-    return fin({ __proto__: NodeProto, type: "TSModuleDeclaration", id, body, kind: "global", declare, global: true }, s, E(n));
+    const body = B(n) >= 0 ? fin({ __proto__: NodeProto, type: "TSModuleBlock", body: stmtList(B(n)), start: 0, end: 0, range: null, parent: null }, P(B(n)), E(n)) : null;
+    return fin({ __proto__: NodeProto, type: "TSModuleDeclaration", id, body, kind: "global", declare, global: true, start: 0, end: 0, range: null, parent: null }, s, E(n));
   }
   const kind = f & MOD_NAMESPACE ? "namespace" : "module";
   const nameNode = A(n);
@@ -1034,10 +1034,10 @@ function moduleDecl(n, s) {
   if (K(nameNode) === N_STR) id = strLit(nameNode);
   else id = entity(nameNode);
   if (B(n) < 0) {
-    return fin({ __proto__: NodeProto, type: "TSModuleDeclaration", id, kind, declare, global: false }, s, E(n));
+    return fin({ __proto__: NodeProto, type: "TSModuleDeclaration", id, kind, declare, global: false, start: 0, end: 0, range: null, parent: null }, s, E(n));
   }
-  const body = fin({ __proto__: NodeProto, type: "TSModuleBlock", body: stmtList(B(n)) }, P(B(n)), E(n));
-  return fin({ __proto__: NodeProto, type: "TSModuleDeclaration", id, body, kind, declare, global: false }, s, E(n));
+  const body = fin({ __proto__: NodeProto, type: "TSModuleBlock", body: stmtList(B(n)), start: 0, end: 0, range: null, parent: null }, P(B(n)), E(n));
+  return fin({ __proto__: NodeProto, type: "TSModuleDeclaration", id, body, kind, declare, global: false, start: 0, end: 0, range: null, parent: null }, s, E(n));
 }
 
 function importEq(n, s) {
@@ -1048,14 +1048,14 @@ function importEq(n, s) {
   if (K(r) === N_EXTERNALREF) {
     const req = skipWords(idEnd(at), []);
     const rs = skip(find(idEnd(at), 61) + 1);
-    moduleReference = fin({ __proto__: NodeProto, type: "TSExternalModuleReference", expression: strLit(A(r)) }, rs, E(r) + (ch(E(r)) === 41 ? 1 : 0));
+    moduleReference = fin({ __proto__: NodeProto, type: "TSExternalModuleReference", expression: strLit(A(r)), start: 0, end: 0, range: null, parent: null }, rs, E(r) + (ch(E(r)) === 41 ? 1 : 0));
     // (the reference ends at its ')')
     const close = find(E(A(r)), 41);
     moduleReference.end = u(close + 1);
     moduleReference.range[1] = moduleReference.end;
   } else moduleReference = entity(r);
   const typeOnly = wordAt(skip(s + 6)) === "type" && skip(s + 6) !== at;
-  return fin({ __proto__: NodeProto, type: "TSImportEqualsDeclaration", id, moduleReference, importKind: typeOnly ? "type" : "value" }, s, E(n));
+  return fin({ __proto__: NodeProto, type: "TSImportEqualsDeclaration", id, moduleReference, importKind: typeOnly ? "type" : "value", start: 0, end: 0, range: null, parent: null }, s, E(n));
 }
 
 // ---- modules
@@ -1069,12 +1069,12 @@ function importDecl(n) {
   const specifiers = [];
   if (B(n) >= 0) {
     const d = B(n);
-    specifiers.push(fin({ __proto__: NodeProto, type: "ImportDefaultSpecifier", local: idNode(d) }, P(d), E(d)));
+    specifiers.push(fin({ __proto__: NodeProto, type: "ImportDefaultSpecifier", local: idNode(d), start: 0, end: 0, range: null, parent: null }, P(d), E(d)));
   }
   if (C(n) >= 0) {
     const c = C(n);
     const star = find(B(n) >= 0 ? E(B(n)) : skipWords(P(n), ["import", "type"]), 42);
-    specifiers.push(fin({ __proto__: NodeProto, type: "ImportNamespaceSpecifier", local: idNode(c) }, star, E(c)));
+    specifiers.push(fin({ __proto__: NodeProto, type: "ImportNamespaceSpecifier", local: idNode(c), start: 0, end: 0, range: null, parent: null }, star, E(c)));
   }
   for (const sp of items(D(n))) {
     const typeOnly = (F(sp) & M_TYPEONLY) !== 0;
@@ -1087,10 +1087,10 @@ function importDecl(n) {
       imported = ident(local.name, 0, 0);
       imported.start = local.start; imported.end = local.end; imported.range = [local.start, local.end];
     }
-    specifiers.push(fin({ __proto__: NodeProto, type: "ImportSpecifier", imported, local, importKind: typeOnly ? "type" : "value" }, P(sp), E(sp)));
+    specifiers.push(fin({ __proto__: NodeProto, type: "ImportSpecifier", imported, local, importKind: typeOnly ? "type" : "value", start: 0, end: 0, range: null, parent: null }, P(sp), E(sp)));
   }
   const typeOnly = (F(n) & M_TYPEONLY) !== 0;
-  return fin({ __proto__: NodeProto, type: "ImportDeclaration", specifiers, source: strLit(A(n)), phase: null, attributes: attributesAfter(E(A(n))), importKind: typeOnly ? "type" : "value" }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "ImportDeclaration", specifiers, source: strLit(A(n)), phase: null, attributes: attributesAfter(E(A(n))), importKind: typeOnly ? "type" : "value", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 // with { type: "json" } after a module source (vlint's tree doesn't keep it): read from the source
 function attributesAfter(e) {
@@ -1125,7 +1125,7 @@ function attributesAfter(e) {
     while (j < bytes.length && ch(j) !== q) { if (ch(j) === 92) j++; j++; }
     const raw = srcBytes(i, j + 1);
     const value = literal(strValue(raw), raw, i, j + 1);
-    out.push(fin({ __proto__: NodeProto, type: "ImportAttribute", key, value }, ks, j + 1));
+    out.push(fin({ __proto__: NodeProto, type: "ImportAttribute", key, value, start: 0, end: 0, range: null, parent: null }, ks, j + 1));
     i = skip(j + 1);
     if (ch(i) === 44) i = skip(i + 1);
   }
@@ -1151,7 +1151,7 @@ function exportDecl(n) {
   if (B(n) < 0) {
     // export * (as x) from "m"
     const exported = C(n) >= 0 ? modName(C(n)) : null;
-    return fin({ __proto__: NodeProto, type: "ExportAllDeclaration", exported, source: strLit(A(n)), attributes: attributesAfter(E(A(n))), exportKind: kind }, P(n), E(n));
+    return fin({ __proto__: NodeProto, type: "ExportAllDeclaration", exported, source: strLit(A(n)), attributes: attributesAfter(E(A(n))), exportKind: kind, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   const specifiers = items(B(n)).map((sp) => {
     const spType = (F(sp) & M_TYPEONLY) !== 0;
@@ -1179,9 +1179,9 @@ function exportDecl(n) {
         exported = identAt(name(sp), e - Buffer.byteLength(name(sp)));
       }
     }
-    return fin({ __proto__: NodeProto, type: "ExportSpecifier", local, exported, exportKind: spType ? "type" : "value" }, P(sp), E(sp));
+    return fin({ __proto__: NodeProto, type: "ExportSpecifier", local, exported, exportKind: spType ? "type" : "value", start: 0, end: 0, range: null, parent: null }, P(sp), E(sp));
   });
-  return fin({ __proto__: NodeProto, type: "ExportNamedDeclaration", declaration: null, specifiers, source: A(n) >= 0 ? strLit(A(n)) : null, exportKind: kind, attributes: A(n) >= 0 ? attributesAfter(E(A(n))) : [] }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "ExportNamedDeclaration", declaration: null, specifiers, source: A(n) >= 0 ? strLit(A(n)) : null, exportKind: kind, attributes: A(n) >= 0 ? attributesAfter(E(A(n))) : [], start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 
 // ---- expressions
@@ -1234,12 +1234,12 @@ function expr0(n, inChain) {
     case N_TRUE: return literal(true, "true", P(n), E(n));
     case N_FALSE: return literal(false, "false", P(n), E(n));
     case N_NULL: return literal(null, "null", P(n), E(n));
-    case N_THIS: return fin({ __proto__: NodeProto, type: "ThisExpression" }, P(n), E(n));
-    case N_SUPER: return fin({ __proto__: NodeProto, type: "Super" }, P(n), E(n));
+    case N_THIS: return fin({ __proto__: NodeProto, type: "ThisExpression", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
+    case N_SUPER: return fin({ __proto__: NodeProto, type: "Super", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TEMPL:
     case N_NOSUBTEMPL: {
       const { quasis, exprs } = template(n, expr);
-      return fin({ __proto__: NodeProto, type: "TemplateLiteral", quasis, expressions: exprs }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TemplateLiteral", quasis, expressions: exprs, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_PAREN:
       return expr(A(n));
@@ -1249,10 +1249,10 @@ function expr0(n, inChain) {
         if (K(x) === N_SPREAD) return spread(x);
         return expr(x);
       });
-      return fin({ __proto__: NodeProto, type: "ArrayExpression", elements }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ArrayExpression", elements, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_OBJECT:
-      return fin({ __proto__: NodeProto, type: "ObjectExpression", properties: items(A(n)).map(objMember) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ObjectExpression", properties: items(A(n)).map(objMember), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_SPREAD:
       return spread(n);
     case N_FUNCEXPR:
@@ -1263,34 +1263,34 @@ function expr0(n, inChain) {
       return klass(n, P(n), false);
     case N_CALL: {
       const callee = sub(A(n), inChain);
-      return fin({ __proto__: NodeProto, type: "CallExpression", callee, typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null, arguments: args(C(n)), optional: (F(n) & 1) !== 0 }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "CallExpression", callee, typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null, arguments: args(C(n)), optional: (F(n) & 1) !== 0, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_NEW: {
-      return fin({ __proto__: NodeProto, type: "NewExpression", callee: expr(A(n)), typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null, arguments: C(n) >= 0 ? args(C(n)) : [] }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "NewExpression", callee: expr(A(n)), typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null, arguments: C(n) >= 0 ? args(C(n)) : [], start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_IMPORTCALL: {
       const as = items(C(n));
       const opts = as.length > 1 ? argExpr(as[1]) : null;
-      return fin({ __proto__: NodeProto, type: "ImportExpression", source: as.length > 0 ? argExpr(as[0]) : null, options: opts, phase: null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ImportExpression", source: as.length > 0 ? argExpr(as[0]) : null, options: opts, phase: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_PROPACCESS: {
       const object = sub(A(n), inChain);
       const ps = D(n);
       const nmStr = name(n);
       const property = F(n) & 4
-        ? fin({ __proto__: NodeProto, type: "PrivateIdentifier", name: nmStr.replace(/^#/, "") }, ps, E(n))
+        ? fin({ __proto__: NodeProto, type: "PrivateIdentifier", name: nmStr.replace(/^#/, ""), start: 0, end: 0, range: null, parent: null }, ps, E(n))
         : ident(nmStr, ps, E(n));
-      return fin({ __proto__: NodeProto, type: "MemberExpression", object, property, optional: (F(n) & 1) !== 0, computed: false }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "MemberExpression", object, property, optional: (F(n) & 1) !== 0, computed: false, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_ELEMACCESS: {
       const object = sub(A(n), inChain);
-      return fin({ __proto__: NodeProto, type: "MemberExpression", object, property: expr(B(n)), optional: (F(n) & 1) !== 0, computed: true }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "MemberExpression", object, property: expr(B(n)), optional: (F(n) & 1) !== 0, computed: true, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_TAGGED: {
       const q = C(n);
       const { quasis, exprs } = template(q, expr);
-      const quasi = fin({ __proto__: NodeProto, type: "TemplateLiteral", quasis, expressions: exprs }, P(q), E(q));
-      return fin({ __proto__: NodeProto, type: "TaggedTemplateExpression", tag: expr(A(n)), typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null, quasi }, P(n), E(n));
+      const quasi = fin({ __proto__: NodeProto, type: "TemplateLiteral", quasis, expressions: exprs, start: 0, end: 0, range: null, parent: null }, P(q), E(q));
+      return fin({ __proto__: NodeProto, type: "TaggedTemplateExpression", tag: expr(A(n)), typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null, quasi, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_BINARY: {
       const op = F(n);
@@ -1304,47 +1304,47 @@ function expr0(n, inChain) {
         }
         list.push(x);
         list.reverse();
-        return fin({ __proto__: NodeProto, type: "SequenceExpression", expressions: list.map(expr) }, P(n), E(n));
+        return fin({ __proto__: NodeProto, type: "SequenceExpression", expressions: list.map(expr), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
       }
       const opStr = OPS[op];
       if (op === 62 || (op >= 63 && op <= 77)) {
-        return fin({ __proto__: NodeProto, type: "AssignmentExpression", operator: opStr, left: op === 62 ? target(A(n)) : simpleTarget(A(n)), right: expr(B(n)) }, P(n), E(n));
+        return fin({ __proto__: NodeProto, type: "AssignmentExpression", operator: opStr, left: op === 62 ? target(A(n)) : simpleTarget(A(n)), right: expr(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
       }
       if (op === 55 || op === 56 || op === 57) {
-        return fin({ __proto__: NodeProto, type: "LogicalExpression", left: expr(A(n)), operator: opStr, right: expr(B(n)) }, P(n), E(n));
+        return fin({ __proto__: NodeProto, type: "LogicalExpression", left: expr(A(n)), operator: opStr, right: expr(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
       }
       const left = K(A(n)) === N_PRIVNAME ? privName(A(n)) : expr(A(n));
-      return fin({ __proto__: NodeProto, type: "BinaryExpression", left, operator: opStr, right: expr(B(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "BinaryExpression", left, operator: opStr, right: expr(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_PREFIX: {
       const op = F(n);
-      if (op === 45 || op === 46) return fin({ __proto__: NodeProto, type: "UpdateExpression", operator: OPS[op], prefix: true, argument: simpleTarget(A(n)) }, P(n), E(n));
-      return fin({ __proto__: NodeProto, type: "UnaryExpression", operator: OPS[op], argument: expr(A(n)), prefix: true }, P(n), E(n));
+      if (op === 45 || op === 46) return fin({ __proto__: NodeProto, type: "UpdateExpression", operator: OPS[op], prefix: true, argument: simpleTarget(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "UnaryExpression", operator: OPS[op], argument: expr(A(n)), prefix: true, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_POSTFIX:
-      return fin({ __proto__: NodeProto, type: "UpdateExpression", operator: OPS[F(n)], prefix: false, argument: simpleTarget(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "UpdateExpression", operator: OPS[F(n)], prefix: false, argument: simpleTarget(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TYPEOF:
-      return fin({ __proto__: NodeProto, type: "UnaryExpression", operator: "typeof", argument: expr(A(n)), prefix: true }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "UnaryExpression", operator: "typeof", argument: expr(A(n)), prefix: true, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_VOIDEXPR:
-      return fin({ __proto__: NodeProto, type: "UnaryExpression", operator: "void", argument: expr(A(n)), prefix: true }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "UnaryExpression", operator: "void", argument: expr(A(n)), prefix: true, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_DELETE:
-      return fin({ __proto__: NodeProto, type: "UnaryExpression", operator: "delete", argument: expr(A(n)), prefix: true }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "UnaryExpression", operator: "delete", argument: expr(A(n)), prefix: true, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_AWAIT:
-      return fin({ __proto__: NodeProto, type: "AwaitExpression", argument: expr(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "AwaitExpression", argument: expr(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_YIELD:
-      return fin({ __proto__: NodeProto, type: "YieldExpression", delegate: F(n) === 1, argument: A(n) >= 0 ? expr(A(n)) : null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "YieldExpression", delegate: F(n) === 1, argument: A(n) >= 0 ? expr(A(n)) : null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_COND:
-      return fin({ __proto__: NodeProto, type: "ConditionalExpression", test: expr(A(n)), consequent: expr(B(n)), alternate: expr(C(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "ConditionalExpression", test: expr(A(n)), consequent: expr(B(n)), alternate: expr(C(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_AS:
-      return fin({ __proto__: NodeProto, type: "TSAsExpression", expression: expr(A(n)), typeAnnotation: type(B(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSAsExpression", expression: expr(A(n)), typeAnnotation: type(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_SATISFIES:
-      return fin({ __proto__: NodeProto, type: "TSSatisfiesExpression", expression: expr(A(n)), typeAnnotation: type(B(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSSatisfiesExpression", expression: expr(A(n)), typeAnnotation: type(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_NONNULL:
-      return fin({ __proto__: NodeProto, type: "TSNonNullExpression", expression: sub(A(n), inChain) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSNonNullExpression", expression: sub(A(n), inChain), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TYPEASSERT:
-      return fin({ __proto__: NodeProto, type: "TSTypeAssertion", typeAnnotation: type(B(n)), expression: expr(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSTypeAssertion", typeAnnotation: type(B(n)), expression: expr(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_EXPRTARGS:
-      return fin({ __proto__: NodeProto, type: "TSInstantiationExpression", expression: expr(A(n)), typeArguments: typeArgs(B(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSInstantiationExpression", expression: expr(A(n)), typeArguments: typeArgs(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_METAPROP: {
       const isNew = F(n) === W_NEW;
       const meta = ident(isNew ? "new" : "import", P(n), P(n) + (isNew ? 3 : 6));
@@ -1352,7 +1352,7 @@ function expr0(n, inChain) {
       const ps = skip(find(P(n) + (isNew ? 3 : 6), 46) + 1);
       const pe = idEnd(ps);
       const property = ident(prop, ps, pe);
-      return fin({ __proto__: NodeProto, type: "MetaProperty", meta, property }, P(n), pe);
+      return fin({ __proto__: NodeProto, type: "MetaProperty", meta, property, start: 0, end: 0, range: null, parent: null }, P(n), pe);
     }
     case N_PRIVNAME:
       return privName(n);
@@ -1362,7 +1362,7 @@ function expr0(n, inChain) {
       return null;
   }
   // a type or something else where an expression was expected (recovery)
-  return fin({ __proto__: NodeProto, type: "Identifier", decorators: [], name: "", optional: false, typeAnnotation: null }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "Identifier", decorators: [], name: "", optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 
 // the target of ++ / -- / op=: parentheses dropped
@@ -1371,7 +1371,7 @@ function simpleTarget(n) {
 }
 
 function spread(n) {
-  return fin({ __proto__: NodeProto, type: "SpreadElement", argument: expr(A(n)) }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "SpreadElement", argument: expr(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 function argExpr(x) {
   return K(x) === N_SPREAD ? spread(x) : expr(x);
@@ -1385,16 +1385,16 @@ function objMember(pr) {
   if (k === N_SPREAD) return spread(pr);
   if (k === N_PROPASSIGN) {
     const computed = K(A(pr)) === N_COMPUTED;
-    return fin({ __proto__: NodeProto, type: "Property", kind: "init", key: propKey(A(pr)), value: expr(B(pr)), method: false, shorthand: false, computed, optional: false }, P(pr), E(pr));
+    return fin({ __proto__: NodeProto, type: "Property", kind: "init", key: propKey(A(pr)), value: expr(B(pr)), method: false, shorthand: false, computed, optional: false, start: 0, end: 0, range: null, parent: null }, P(pr), E(pr));
   }
   if (k === N_SHORTHAND) {
     const key = identAt(name(pr), P(pr));
     let value = identAt(name(pr), P(pr));
     if (B(pr) >= 0) {
       // x = 1 in an object literal (only valid as a pattern)
-      value = fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: value, right: expr(B(pr)), optional: false, typeAnnotation: null }, P(pr), E(pr));
+      value = fin({ __proto__: NodeProto, type: "AssignmentPattern", decorators: [], left: value, right: expr(B(pr)), optional: false, typeAnnotation: null, start: 0, end: 0, range: null, parent: null }, P(pr), E(pr));
     }
-    return fin({ __proto__: NodeProto, type: "Property", kind: "init", key, value, method: false, shorthand: true, computed: false, optional: false }, P(pr), E(pr));
+    return fin({ __proto__: NodeProto, type: "Property", kind: "init", key, value, method: false, shorthand: true, computed: false, optional: false, start: 0, end: 0, range: null, parent: null }, P(pr), E(pr));
   }
   if (k === N_METHOD || k === N_GET || k === N_SET) {
     const f = F(pr);
@@ -1402,7 +1402,7 @@ function objMember(pr) {
     const key = propKey(A(pr));
     const value = funcValue(pr, B(pr), C(pr), f, null);
     const kind = k === N_GET ? "get" : k === N_SET ? "set" : "init";
-    return fin({ __proto__: NodeProto, type: "Property", kind, key, value, method: k === N_METHOD, shorthand: false, computed, optional: false }, P(pr), E(pr));
+    return fin({ __proto__: NodeProto, type: "Property", kind, key, value, method: k === N_METHOD, shorthand: false, computed, optional: false, start: 0, end: 0, range: null, parent: null }, P(pr), E(pr));
   }
   return expr(pr);
 }
@@ -1431,11 +1431,11 @@ function arrow(n) {
 function entity(n) {
   const k = K(n);
   if (k === N_ID) return idNode(n);
-  if (k === N_THIS) return fin({ __proto__: NodeProto, type: "ThisExpression" }, P(n), E(n));
+  if (k === N_THIS) return fin({ __proto__: NodeProto, type: "ThisExpression", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   if (k === N_QNAME) {
     const right = name(n);
     const r = ident(right, E(n) - Buffer.byteLength(right), E(n));
-    return fin({ __proto__: NodeProto, type: "TSQualifiedName", left: entity(A(n)), right: r }, P(n), E(n));
+    return fin({ __proto__: NodeProto, type: "TSQualifiedName", left: entity(A(n)), right: r, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   // a class's implements written as an expression (a.b)
   if (k === N_PROPACCESS) return expr(n);
@@ -1447,7 +1447,7 @@ function entityExpr(n) {
   if (K(n) === N_QNAME) {
     const right = name(n);
     const r = ident(right, E(n) - Buffer.byteLength(right), E(n));
-    return fin({ __proto__: NodeProto, type: "MemberExpression", object: entityExpr(A(n)), property: r, optional: false, computed: false }, P(n), E(n));
+    return fin({ __proto__: NodeProto, type: "MemberExpression", object: entityExpr(A(n)), property: r, optional: false, computed: false, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   return entity(n);
 }
@@ -1456,7 +1456,7 @@ function typeArgs(l) {
   // <...>: the list spans from < to >
   const ps = items(l).map(type);
   const close = find(ps.length > 0 ? E(items(l)[ps.length - 1]) : P(l) + 1, 62);
-  return fin({ __proto__: NodeProto, type: "TSTypeParameterInstantiation", params: ps }, P(l), close + 1);
+  return fin({ __proto__: NodeProto, type: "TSTypeParameterInstantiation", params: ps, start: 0, end: 0, range: null, parent: null }, P(l), close + 1);
 }
 function typeParams(l) {
   const ps = items(l).map((tp) => {
@@ -1464,10 +1464,10 @@ function typeParams(l) {
     const at = f === 0 ? P(tp) : skipWords(P(tp), ["const", "in", "out"]);
     const nmStr = name(tp);
     const id = identAt(nmStr, at);
-    return fin({ __proto__: NodeProto, type: "TSTypeParameter", name: id, constraint: A(tp) >= 0 ? type(A(tp)) : null, default: B(tp) >= 0 ? type(B(tp)) : null, in: (f & M_IN) !== 0, out: (f & M_OUT) !== 0, const: (f & M_CONST) !== 0 }, P(tp), E(tp));
+    return fin({ __proto__: NodeProto, type: "TSTypeParameter", name: id, constraint: A(tp) >= 0 ? type(A(tp)) : null, default: B(tp) >= 0 ? type(B(tp)) : null, in: (f & M_IN) !== 0, out: (f & M_OUT) !== 0, const: (f & M_CONST) !== 0, start: 0, end: 0, range: null, parent: null }, P(tp), E(tp));
   });
   const close = E(l) > P(l) && ch(E(l) - 1) === 62 ? E(l) : find(E(l), 62) + 1;
-  return fin({ __proto__: NodeProto, type: "TSTypeParameterDeclaration", params: ps }, P(l), close);
+  return fin({ __proto__: NodeProto, type: "TSTypeParameterDeclaration", params: ps, start: 0, end: 0, range: null, parent: null }, P(l), close);
 }
 
 function typePred(n) {
@@ -1475,7 +1475,7 @@ function typePred(n) {
   let at = P(n);
   if (f & 1) at = skip(at + 7);
   let parameterName;
-  if (S(n) < 0) parameterName = fin({ __proto__: NodeProto, type: "TSThisType" }, at, at + 4);
+  if (S(n) < 0) parameterName = fin({ __proto__: NodeProto, type: "TSThisType", start: 0, end: 0, range: null, parent: null }, at, at + 4);
   else parameterName = identAt(name(n), at);
   let typeAnnotation = null;
   if (A(n) >= 0) {
@@ -1485,7 +1485,7 @@ function typePred(n) {
     // (the annotation spans the type alone)
     typeAnnotation.start = t.start; typeAnnotation.end = t.end; typeAnnotation.range = [t.start, t.end]; typeAnnotation.parent = null;
   }
-  return fin({ __proto__: NodeProto, type: "TSTypePredicate", parameterName, asserts: (f & 1) !== 0, typeAnnotation }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "TSTypePredicate", parameterName, asserts: (f & 1) !== 0, typeAnnotation, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 
 function sigParts(sig) {
@@ -1497,17 +1497,17 @@ function typeMember(m) {
   const f = F(m);
   if (k === N_PROP) {
     const computed = K(A(m)) === N_COMPUTED;
-    return fin({ __proto__: NodeProto, type: "TSPropertySignature", computed, optional: (f & M_OPTIONAL) !== 0, readonly: (f & M_READONLY) !== 0, key: propKey(A(m)), typeAnnotation: B(m) >= 0 ? annot(B(m)) : null, accessibility: null, static: false }, P(m), E(m));
+    return fin({ __proto__: NodeProto, type: "TSPropertySignature", computed, optional: (f & M_OPTIONAL) !== 0, readonly: (f & M_READONLY) !== 0, key: propKey(A(m)), typeAnnotation: B(m) >= 0 ? annot(B(m)) : null, accessibility: null, static: false, start: 0, end: 0, range: null, parent: null }, P(m), E(m));
   }
   if (k === N_METHOD || k === N_GET || k === N_SET) {
     const computed = K(A(m)) === N_COMPUTED;
     const { tp, ps, rt } = sigParts(B(m));
     const kind = k === N_GET ? "get" : k === N_SET ? "set" : "method";
-    return fin({ __proto__: NodeProto, type: "TSMethodSignature", key: propKey(A(m)), computed, optional: (f & M_OPTIONAL) !== 0, kind, typeParameters: tp, params: ps, returnType: rt, accessibility: null, readonly: false, static: false }, P(m), E(m));
+    return fin({ __proto__: NodeProto, type: "TSMethodSignature", key: propKey(A(m)), computed, optional: (f & M_OPTIONAL) !== 0, kind, typeParameters: tp, params: ps, returnType: rt, accessibility: null, readonly: false, static: false, start: 0, end: 0, range: null, parent: null }, P(m), E(m));
   }
   if (k === N_CALLSIG || k === N_CTORSIG) {
     const { tp, ps, rt } = sigParts(B(m));
-    return fin({ __proto__: NodeProto, type: k === N_CALLSIG ? "TSCallSignatureDeclaration" : "TSConstructSignatureDeclaration", typeParameters: tp, params: ps, returnType: rt }, P(m), E(m));
+    return fin({ __proto__: NodeProto, type: k === N_CALLSIG ? "TSCallSignatureDeclaration" : "TSConstructSignatureDeclaration", typeParameters: tp, params: ps, returnType: rt, start: 0, end: 0, range: null, parent: null }, P(m), E(m));
   }
   if (k === N_INDEXSIG) return indexSig(m);
   return type(m);
@@ -1519,35 +1519,35 @@ function type(n) {
     case N_TKW: {
       // (vlint ends these nodes where they start)
       const t = KW_TYPES[F(n)];
-      return fin({ __proto__: NodeProto, type: t || "TSAnyKeyword" }, P(n), idEnd(P(n)));
+      return fin({ __proto__: NodeProto, type: t || "TSAnyKeyword", start: 0, end: 0, range: null, parent: null }, P(n), idEnd(P(n)));
     }
     case N_TTHIS:
-      return fin({ __proto__: NodeProto, type: "TSThisType" }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSThisType", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TREF: {
       const nmNode = A(n);
       if (K(nmNode) === N_ID && name(nmNode) === "intrinsic" && false) {}
-      return fin({ __proto__: NodeProto, type: "TSTypeReference", typeName: entity(nmNode), typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSTypeReference", typeName: entity(nmNode), typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_TLIT: {
       const x = A(n);
       let literal_;
       if (K(x) === N_NOSUBTEMPL) {
         const { quasis } = template(x, expr);
-        return fin({ __proto__: NodeProto, type: "TSLiteralType", literal: fin({ __proto__: NodeProto, type: "TemplateLiteral", quasis, expressions: [] }, P(x), E(x)) }, P(n), E(n));
+        return fin({ __proto__: NodeProto, type: "TSLiteralType", literal: fin({ __proto__: NodeProto, type: "TemplateLiteral", quasis, expressions: [] }, P(x), E(x)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
       }
       literal_ = expr(x);
-      return fin({ __proto__: NodeProto, type: "TSLiteralType", literal: literal_ }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSLiteralType", literal: literal_, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_TUNION:
-      return fin({ __proto__: NodeProto, type: "TSUnionType", types: items(A(n)).map(type) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSUnionType", types: items(A(n)).map(type), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TINTER:
-      return fin({ __proto__: NodeProto, type: "TSIntersectionType", types: items(A(n)).map(type) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSIntersectionType", types: items(A(n)).map(type), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TARRAY:
-      return fin({ __proto__: NodeProto, type: "TSArrayType", elementType: type(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSArrayType", elementType: type(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TINDEXED:
-      return fin({ __proto__: NodeProto, type: "TSIndexedAccessType", objectType: type(A(n)), indexType: type(B(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSIndexedAccessType", objectType: type(A(n)), indexType: type(B(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TTUPLE:
-      return fin({ __proto__: NodeProto, type: "TSTupleType", elementTypes: items(A(n)).map(type) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSTupleType", elementTypes: items(A(n)).map(type), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TTUPLEEL: {
       const f = F(n);
       const at = f & M_REST ? skip(P(n) + 3) : P(n);
@@ -1555,40 +1555,40 @@ function type(n) {
       let el = { __proto__: NodeProto, type: "TSNamedTupleMember", label, elementType: type(A(n)), optional: (f & M_OPTIONAL) !== 0 };
       if (f & M_REST) {
         fin(el, at, E(n));
-        return fin({ __proto__: NodeProto, type: "TSRestType", typeAnnotation: el }, P(n), E(n));
+        return fin({ __proto__: NodeProto, type: "TSRestType", typeAnnotation: el, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
       }
       return fin(el, P(n), E(n));
     }
     case N_TOPTIONAL:
-      if (A(n) >= 0 && !(ch(P(n)) === 63 || ch(P(n)) === 33)) return fin({ __proto__: NodeProto, type: "TSOptionalType", typeAnnotation: type(A(n)) }, P(n), E(n));
-      return fin({ __proto__: NodeProto, type: ch(P(n)) === 33 ? "TSJSDocNonNullableType" : A(n) >= 0 ? "TSJSDocNullableType" : "TSJSDocUnknownType", ...(A(n) >= 0 ? { typeAnnotation: type(A(n)), postfix: false } : {}) }, P(n), E(n));
+      if (A(n) >= 0 && !(ch(P(n)) === 63 || ch(P(n)) === 33)) return fin({ __proto__: NodeProto, type: "TSOptionalType", typeAnnotation: type(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: ch(P(n)) === 33 ? "TSJSDocNonNullableType" : A(n) >= 0 ? "TSJSDocNullableType" : "TSJSDocUnknownType", ...(A(n) >= 0 ? { typeAnnotation: type(A(n)), postfix: false } : {}), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TREST:
-      return fin({ __proto__: NodeProto, type: "TSRestType", typeAnnotation: type(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSRestType", typeAnnotation: type(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TFUNC: {
       const { tp, ps, rt } = sigParts(B(n));
       const f = F(n);
-      if (f === 0) return fin({ __proto__: NodeProto, type: "TSFunctionType", typeParameters: tp, params: ps, returnType: rt }, P(n), E(n));
+      if (f === 0) return fin({ __proto__: NodeProto, type: "TSFunctionType", typeParameters: tp, params: ps, returnType: rt, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
       // (vlint's node starts after `new` / `abstract new`)
       let st = wordBefore(P(n)).at;
       if (f === 3) st = wordBefore(st).at;
-      return fin({ __proto__: NodeProto, type: "TSConstructorType", abstract: f === 3, typeParameters: tp, params: ps, returnType: rt }, st, E(n));
+      return fin({ __proto__: NodeProto, type: "TSConstructorType", abstract: f === 3, typeParameters: tp, params: ps, returnType: rt, start: 0, end: 0, range: null, parent: null }, st, E(n));
     }
     case N_TOBJ:
-      return fin({ __proto__: NodeProto, type: "TSTypeLiteral", members: items(A(n)).map(typeMember) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSTypeLiteral", members: items(A(n)).map(typeMember), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TPAREN:
       return type(A(n));
     case N_TQUERY:
-      return fin({ __proto__: NodeProto, type: "TSTypeQuery", exprName: entity(A(n)), typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSTypeQuery", exprName: entity(A(n)), typeArguments: B(n) >= 0 ? typeArgs(B(n)) : null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TOP: {
       const op = F(n) === W_KEYOF ? "keyof" : F(n) === W_UNIQUE ? "unique" : "readonly";
-      return fin({ __proto__: NodeProto, type: "TSTypeOperator", operator: op, typeAnnotation: type(A(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSTypeOperator", operator: op, typeAnnotation: type(A(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_TCOND:
-      return fin({ __proto__: NodeProto, type: "TSConditionalType", checkType: type(A(n)), extendsType: type(B(n)), trueType: type(C(n)), falseType: type(D(n)) }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSConditionalType", checkType: type(A(n)), extendsType: type(B(n)), trueType: type(C(n)), falseType: type(D(n)), start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     case N_TINFER: {
       const tp = A(n);
-      const tpo = fin({ __proto__: NodeProto, type: "TSTypeParameter", name: identAt(name(tp), P(tp)), constraint: A(tp) >= 0 ? type(A(tp)) : null, default: null, in: false, out: false, const: false }, P(tp), E(tp));
-      return fin({ __proto__: NodeProto, type: "TSInferType", typeParameter: tpo }, P(n), E(n));
+      const tpo = fin({ __proto__: NodeProto, type: "TSTypeParameter", name: identAt(name(tp), P(tp)), constraint: A(tp) >= 0 ? type(A(tp)) : null, default: null, in: false, out: false, const: false, start: 0, end: 0, range: null, parent: null }, P(tp), E(tp));
+      return fin({ __proto__: NodeProto, type: "TSInferType", typeParameter: tpo, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_TMAPPED: {
       const f = F(n);
@@ -1596,18 +1596,18 @@ function type(n) {
       const key = identAt(name(tp), P(tp));
       const optional = f & MAP_OPTIONAL ? (ch(skip(E(tp))) === 43 ? "+" : true) : f & MAP_NOOPTIONAL ? "-" : false;
       const readonly = f & MAP_READONLY ? (ch(skip(P(n) + 1)) === 43 ? "+" : true) : f & MAP_NOREADONLY ? "-" : null;
-      return fin({ __proto__: NodeProto, type: "TSMappedType", key, constraint: type(A(tp)), nameType: B(n) >= 0 ? type(B(n)) : null, typeAnnotation: C(n) >= 0 ? type(C(n)) : null, optional, readonly }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSMappedType", key, constraint: type(A(tp)), nameType: B(n) >= 0 ? type(B(n)) : null, typeAnnotation: C(n) >= 0 ? type(C(n)) : null, optional, readonly, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_TTEMPLATE: {
       const { quasis, exprs } = template(n, type);
-      return fin({ __proto__: NodeProto, type: "TSTemplateLiteralType", quasis, types: exprs }, P(n), E(n));
+      return fin({ __proto__: NodeProto, type: "TSTemplateLiteralType", quasis, types: exprs, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
     case N_TPRED:
       return typePred(n);
     case N_TIMPORT: {
       const isTypeof = F(n) === 1;
-      const imp = fin({ __proto__: NodeProto, type: "TSImportType", source: strLit(A(n)), options: null, qualifier: B(n) >= 0 ? entity(B(n)) : null, typeArguments: C(n) >= 0 ? typeArgs(C(n)) : null }, isTypeof ? skip(P(n) + 6) : P(n), E(n));
-      if (isTypeof) return fin({ __proto__: NodeProto, type: "TSTypeQuery", exprName: imp, typeArguments: null }, P(n), E(n));
+      const imp = fin({ __proto__: NodeProto, type: "TSImportType", source: strLit(A(n)), options: null, qualifier: B(n) >= 0 ? entity(B(n)) : null, typeArguments: C(n) >= 0 ? typeArgs(C(n)) : null, start: 0, end: 0, range: null, parent: null }, isTypeof ? skip(P(n) + 6) : P(n), E(n));
+      if (isTypeof) return fin({ __proto__: NodeProto, type: "TSTypeQuery", exprName: imp, typeArguments: null, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
       return imp;
     }
   }
@@ -1622,24 +1622,24 @@ function jsxName(n) {
     const s = name(n);
     const colon = s.indexOf(":");
     if (colon >= 0) {
-      const ns = fin({ __proto__: NodeProto, type: "JSXIdentifier", name: s.slice(0, colon) }, P(n), P(n) + colon);
-      const nmo = fin({ __proto__: NodeProto, type: "JSXIdentifier", name: s.slice(colon + 1) }, P(n) + colon + 1, E(n));
-      return fin({ __proto__: NodeProto, type: "JSXNamespacedName", namespace: ns, name: nmo }, P(n), E(n));
+      const ns = fin({ __proto__: NodeProto, type: "JSXIdentifier", name: s.slice(0, colon), start: 0, end: 0, range: null, parent: null }, P(n), P(n) + colon);
+      const nmo = fin({ __proto__: NodeProto, type: "JSXIdentifier", name: s.slice(colon + 1), start: 0, end: 0, range: null, parent: null }, P(n) + colon + 1, E(n));
+      return fin({ __proto__: NodeProto, type: "JSXNamespacedName", namespace: ns, name: nmo, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
     }
-    return fin({ __proto__: NodeProto, type: "JSXIdentifier", name: s }, P(n), E(n));
+    return fin({ __proto__: NodeProto, type: "JSXIdentifier", name: s, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
-  if (k === N_THIS) return fin({ __proto__: NodeProto, type: "JSXIdentifier", name: "this" }, P(n), E(n));
+  if (k === N_THIS) return fin({ __proto__: NodeProto, type: "JSXIdentifier", name: "this", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   if (k === N_PROPACCESS) {
-    const prop = fin({ __proto__: NodeProto, type: "JSXIdentifier", name: name(n) }, D(n), E(n));
-    return fin({ __proto__: NodeProto, type: "JSXMemberExpression", object: jsxName(A(n)), property: prop }, P(n), E(n));
+    const prop = fin({ __proto__: NodeProto, type: "JSXIdentifier", name: name(n), start: 0, end: 0, range: null, parent: null }, D(n), E(n));
+    return fin({ __proto__: NodeProto, type: "JSXMemberExpression", object: jsxName(A(n)), property: prop, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   if (k === N_EXPRTARGS) return jsxName(A(n));
-  return fin({ __proto__: NodeProto, type: "JSXIdentifier", name: "" }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "JSXIdentifier", name: "", start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 
 function jsxText(s, e) {
   const raw = srcBytes(s, e);
-  return fin({ __proto__: NodeProto, type: "JSXText", value: decodeEntities(raw), raw }, s, e);
+  return fin({ __proto__: NodeProto, type: "JSXText", value: decodeEntities(raw), raw, start: 0, end: 0, range: null, parent: null }, s, e);
 }
 const ENT = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0" };
 function decodeEntities(s) {
@@ -1660,16 +1660,16 @@ function jsxChild(c) {
   const k = K(c);
   if (k === N_JSXTEXT) return jsxText(P(c), E(c));
   if (k === N_JSXEXPR) return jsxExprContainer(c);
-  if (k === N_JSXSPREAD) return fin({ __proto__: NodeProto, type: "JSXSpreadChild", expression: expr(A(c)) }, P(c), E(c));
+  if (k === N_JSXSPREAD) return fin({ __proto__: NodeProto, type: "JSXSpreadChild", expression: expr(A(c)), start: 0, end: 0, range: null, parent: null }, P(c), E(c));
   return jsxElem(c);
 }
 function jsxExprContainer(c) {
   let e;
   if (A(c) < 0) {
     // {} or {/* comment */}: an empty expression from after { to before }
-    e = fin({ __proto__: NodeProto, type: "JSXEmptyExpression" }, P(c) + 1, E(c) - 1);
+    e = fin({ __proto__: NodeProto, type: "JSXEmptyExpression", start: 0, end: 0, range: null, parent: null }, P(c) + 1, E(c) - 1);
   } else e = expr(A(c));
-  return fin({ __proto__: NodeProto, type: "JSXExpressionContainer", expression: e }, P(c), E(c));
+  return fin({ __proto__: NodeProto, type: "JSXExpressionContainer", expression: e, start: 0, end: 0, range: null, parent: null }, P(c), E(c));
 }
 
 function jsxElem(n) {
@@ -1678,16 +1678,16 @@ function jsxElem(n) {
   const children = kidsList >= 0 ? items(kidsList).map(jsxChild) : [];
   if (isFrag) {
     const openEnd = find(P(n) + 1, 62) + 1;
-    const opening = fin({ __proto__: NodeProto, type: "JSXOpeningFragment" }, P(n), openEnd);
+    const opening = fin({ __proto__: NodeProto, type: "JSXOpeningFragment", start: 0, end: 0, range: null, parent: null }, P(n), openEnd);
     const closeStart = kidsList >= 0 ? E(kidsList) : openEnd;
-    const closing = fin({ __proto__: NodeProto, type: "JSXClosingFragment" }, closeStart, E(n));
-    return fin({ __proto__: NodeProto, type: "JSXFragment", openingFragment: opening, children, closingFragment: closing }, P(n), E(n));
+    const closing = fin({ __proto__: NodeProto, type: "JSXClosingFragment", start: 0, end: 0, range: null, parent: null }, closeStart, E(n));
+    return fin({ __proto__: NodeProto, type: "JSXFragment", openingFragment: opening, children, closingFragment: closing, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
   }
   const nameNode = A(n);
   const nameO = jsxName(nameNode);
   const typeArguments = K(nameNode) === N_EXPRTARGS ? typeArgs(B(nameNode)) : null;
   const attributes = items(B(n)).map((at) => {
-    if (K(at) === N_JSXSPREAD) return fin({ __proto__: NodeProto, type: "JSXSpreadAttribute", argument: expr(A(at)) }, P(at), E(at));
+    if (K(at) === N_JSXSPREAD) return fin({ __proto__: NodeProto, type: "JSXSpreadAttribute", argument: expr(A(at)), start: 0, end: 0, range: null, parent: null }, P(at), E(at));
     const nmO = jsxName(A(at));
     let value = null;
     const v = B(at);
@@ -1699,17 +1699,17 @@ function jsxElem(n) {
       } else if (vk === N_JSXEXPR) value = jsxExprContainer(v);
       else value = jsxElem(v);
     }
-    return fin({ __proto__: NodeProto, type: "JSXAttribute", name: nmO, value }, P(at), v >= 0 ? E(at) : E(A(at)));
+    return fin({ __proto__: NodeProto, type: "JSXAttribute", name: nmO, value, start: 0, end: 0, range: null, parent: null }, P(at), v >= 0 ? E(at) : E(A(at)));
   });
   const selfClosing = kidsList < 0;
   const openEnd = selfClosing ? E(n) : (kidsList >= 0 ? P(kidsList) : E(n));
-  const opening = fin({ __proto__: NodeProto, type: "JSXOpeningElement", name: nameO, typeArguments, attributes, selfClosing }, P(n), openEnd);
+  const opening = fin({ __proto__: NodeProto, type: "JSXOpeningElement", name: nameO, typeArguments, attributes, selfClosing, start: 0, end: 0, range: null, parent: null }, P(n), openEnd);
   let closing = null;
   if (!selfClosing) {
     const closeStart = E(kidsList);
-    closing = fin({ __proto__: NodeProto, type: "JSXClosingElement", name: D(n) >= 0 ? jsxName(D(n)) : null }, closeStart, E(n));
+    closing = fin({ __proto__: NodeProto, type: "JSXClosingElement", name: D(n) >= 0 ? jsxName(D(n)) : null, start: 0, end: 0, range: null, parent: null }, closeStart, E(n));
   }
-  return fin({ __proto__: NodeProto, type: "JSXElement", openingElement: opening, children, closingElement: closing }, P(n), E(n));
+  return fin({ __proto__: NodeProto, type: "JSXElement", openingElement: opening, children, closingElement: closing, start: 0, end: 0, range: null, parent: null }, P(n), E(n));
 }
 
 // import / export statements or import.meta make an unambiguous file a module
@@ -1724,7 +1724,7 @@ function hasModuleSyntax(prog) {
     if (found) return;
     if (node.type === "MetaProperty" && node.meta.name === "import") { found = true; return; }
     for (const k in node) {
-      if (k === "parent" || k === "comments" || k === "tokens") continue;
+      if (k === "parent" || k === "loc" || k === "comments" || k === "tokens") continue;
       const v = node[k];
       if (v === null || typeof v !== "object") continue;
       if (Array.isArray(v)) { for (const x of v) if (x !== null && typeof x === "object" && typeof x.type === "string") walk(x); }
@@ -1740,7 +1740,7 @@ function hasModuleSyntax(prog) {
 function setParents(node, parent) {
   node.parent = parent;
   for (const key in node) {
-    if (key === "parent" || key === "comments" || key === "tokens") continue;
+    if (key === "parent" || key === "loc" || key === "comments" || key === "tokens") continue;
     const v = node[key];
     if (v === null || typeof v !== "object") continue;
     if (Array.isArray(v)) {
