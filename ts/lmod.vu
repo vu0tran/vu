@@ -343,14 +343,23 @@ fn parse_text(own src0: Str, path: Str, kind: Str, var kw: {Str: Int}, var t: as
   var src = src0
   ast.clear_nodes(&t)
   let jsx = not (kind.endswith(".ts") or kind.endswith(".mts") or kind.endswith(".cts"))
+  # (the record needs a file's top level only: functions' bodies are skipped, token by token, in
+  # TypeScript without JSX and in dependencies' JavaScript, where JSX text isn't expected)
+  t.lite = 0
+  if kind.endswith(".ts") or kind.endswith(".mts") or kind.endswith(".cts"): t.lite = 1
+  elif path.find("/node_modules/") >= 0 and (kind.endswith(".js") or kind.endswith(".mjs") or kind.endswith(".cjs")): t.lite = 1
   let _ = parse.parse_file_v(&t, &src, 1, &kw, true, jsx)
+  let meta = t.lite == 2
+  t.lite = 0
   let root = find_root(t)
   if root < 0: return new_rec(path)
-  return build_record(t, src, root, path)
+  var r = build_record(t, src, root, path)
+  if meta: r.msyn = true
+  return r
 
 fn parse_record(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast) -> Rec:
-  let src0 = fs.read(path) else return new_rec(path)
-  return parse_text(src0 + "", path, path, &kw, &t)
+  var src0 = fs.read(path) else return new_rec(path)
+  return parse_text(src0, path, path, &kw, &t)
 
 # A .vue, .astro or .svelte file: one record per script section, in order (sec gets each one's start)
 fn parse_sections(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast, var sec: [Int]) -> [Rec]:
@@ -367,12 +376,43 @@ type GRes:
   more: [Rec]           # a partial file: its other sections (rec is the last), and each one's start
   sec: [Int]
 
-fn gworker(fs: Fs, own paths: Shared[[Str]], own jobs: Chan[Int], own res: Chan[GRes]):
+# What each request of a record resolves to (its real path, "" none), into rq_path
+type Rs:
+  rv: lresolve.Rv
+  real: {Str: Str}
+  rdirs: {Str: Str}
+
+fn new_rs() -> Rs:
+  return Rs(lresolve.new_rv(), {}, {})
+
+fn resolve_all(fs: Fs, ffi: Ffi, var rs: Rs, var r: Rec, p: Str):
+  for j in 0..r.rq.len:
+    var target = lresolve.resolve(&rs.rv, fs, p, r.rq[j])
+    if target != "":
+      if not (target in rs.real):
+        var rp = lcache.realpath_memo(ffi, &rs.rdirs, target)
+        if rp == "": rp = target + ""
+        rs.real[target] = rp
+      target = rs.real[target] + ""
+    r.rq_path[j] = target
+
+fn resolve_res(fs: Fs, ffi: Ffi, var rs: Rs, var g: GRes, p: Str):
+  for mi in 0..g.more.len: resolve_all(fs, ffi, &rs, &g.more[mi], p)
+  resolve_all(fs, ffi, &rs, &g.rec, p)
+
+type Job:
+  idx: Int
+  path: Str
+
+fn gworker(fs: Fs, ffi: Ffi, own jobs: Chan[Job], own res: Chan[GRes]):
   var kw = scan.keywords()
   var t = new_tree()
+  var rs = new_rs()
   while true:
-    let i = jobs.recv() else return
-    res.send(parse_one(fs, paths.value[i], i, &kw, &t))
+    let j = jobs.recv() else return
+    var g = parse_one(fs, j.path, j.idx, &kw, &t)
+    resolve_res(fs, ffi, &rs, &g, j.path)
+    res.send(g)
 
 fn parse_one(fs: Fs, path: Str, i: Int, var kw: {Str: Int}, var t: ast.Ast) -> GRes:
   if not lpart.is_partial(path): return GRes(i, parse_record(fs, path, &kw, &t), [], [])
@@ -388,85 +428,89 @@ fn new_tree() -> ast.Ast:
   var t = ast.new_ast()
   return t
 
-# the records of these paths, parsed by `threads` workers
-fn parse_all(fs: Fs, own paths: [Str], threads: Int, var kw: {Str: Int}, var t: ast.Ast) -> [GRes]:
-  var out: [GRes] = []
-  let n = paths.len
-  if threads <= 1 or n < 8:
-    for i in 0..n: out.push(parse_one(fs, paths[i], i, &kw, &t))
-    return out
-  for i in 0..n: out.push(GRes(i, new_rec(""), [], []))
-  let jc: Chan[Int] = chan(n + 1)
-  let rc: Chan[GRes] = chan(n + 1)
-  for i in 0..n: jc.send(i)
-  jc.close()
-  let sp = share(paths)
-  var jobs = threads
-  if jobs > n: jobs = n
-  for w in 0..jobs: spawn gworker(fs, sp, jc, rc)
-  for i in 0..n:
-    var g = rc.recv() else break
-    let gi = g.idx
-    swap(&out[gi], &g)
-  return out
+# A parsed record into the graph at its slot (a partial file's earlier sections get slots of their
+# own): its requests' targets get records, new ones queued in `todo`
+fn place(var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
+  let p = g.recs[gr.idx].path + ""
+  var slots: [Int] = []
+  for mi in 0..gr.more.len:
+    slots.push(g.recs.len)
+    g.recs.push(new_rec(p))
+  slots.push(gr.idx)
+  if p in pshown:
+    let sh = pshown[p]
+    for si in 0..gr.sec.len: g.shown["{sh}#{gr.sec[si]}"] = slots[si]
+  for si in 0..slots.len:
+    var r = new_rec("")
+    if si < gr.more.len: swap(&r, &gr.more[si])
+    else: swap(&r, &gr.rec)
+    if r.path == "": r.path = p + ""
+    # (a dependency in node_modules: only what it re-exports is loaded further; what else it
+    # imports can't lead back to the linted files, and no rule reads it)
+    let dep = p.find("/node_modules/") >= 0
+    var follow: [Bool] = []
+    if dep:
+      follow = [false] * r.rq.len
+      for x in r.star_rq: follow[x] = true
+      for x in r.ind_rq: follow[x] = true
+    for j in 0..r.rq.len:
+      let target = r.rq_path[j] + ""
+      if target != "" and valid_ext(target):
+        if dep and not follow[j]: continue
+        if not (target in g.at):
+          g.at[target] = g.recs.len
+          g.recs.push(new_rec(target))
+          todo.push(Job(g.at[target], target + ""))
+        r.rq_res[j] = g.at[target]
+    swap(&g.recs[slots[si]], &r)
 
 fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, var kw: {Str: Int}, var t: ast.Ast) -> Graph:
   var g = new_graph()
   g.on = true
-  var rv = lresolve.new_rv()
   # (a module is keyed by its real path, as oxc_resolver gives it: with pnpm the same file is
   # reached through many node_modules links, and would otherwise be parsed once for each)
-  var real: {Str: Str} = {}
-  var frontier: [Str] = []
   # a partial linted file's shown name (its sections are keyed "shown#start")
   var pshown: {Str: Str} = {}
+  var todo: [Job] = []
   for i in 0..files.len:
     if not valid_ext(files[i]): continue
     if not (files[i] in g.at):
       g.at[files[i]] = g.recs.len
       g.recs.push(new_rec(files[i]))
-      frontier.push(files[i] + "")
+      todo.push(Job(g.at[files[i]], files[i] + ""))
     if lpart.is_partial(files[i]): pshown[files[i]] = shown[i] + ""
     else: g.shown[shown[i]] = g.at[files[i]]
-  while frontier.len > 0:
-    var batch: [Str] = []
-    swap(&batch, &frontier)
-    var idxs: [Int] = []
-    for p in batch: idxs.push(g.at[p])
-    var res = parse_all(fs, batch, threads, &kw, &t)
-    for bi in 0..res.len:
-      let p = g.recs[idxs[bi]].path + ""
-      # (a partial file: its sections before the last get records of their own; the last one is the
-      # module others load, as oxlint's loaded_modules take the last section)
-      var slots: [Int] = []
-      for mi in 0..res[bi].more.len:
-        slots.push(g.recs.len)
-        g.recs.push(new_rec(p))
-      slots.push(idxs[bi])
-      if p in pshown:
-        let sh = pshown[p]
-        for si in 0..res[bi].sec.len: g.shown["{sh}#{res[bi].sec[si]}"] = slots[si]
-      for si in 0..slots.len:
-        var r = new_rec("")
-        if si < res[bi].more.len: swap(&r, &res[bi].more[si])
-        else: swap(&r, &res[bi].rec)
-        if r.path == "": r.path = p + ""
-        for j in 0..r.rq.len:
-          var target = lresolve.resolve(&rv, fs, p, r.rq[j])
-          if target != "":
-            if not (target in real):
-              var rp = lcache.realpath(ffi, target)
-              if rp == "": rp = target + ""
-              real[target] = rp
-            target = real[target] + ""
-          r.rq_path[j] = target
-          if target != "" and valid_ext(target):
-            if not (target in g.at):
-              g.at[target] = g.recs.len
-              g.recs.push(new_rec(target))
-              frontier.push(target + "")
-            r.rq_res[j] = g.at[target]
-        swap(&g.recs[slots[si]], &r)
+  if threads <= 1 or todo.len < 8:
+    var rs = new_rs()
+    var k = 0
+    while k < todo.len:
+      let ji = todo[k].idx
+      let jp = todo[k].path + ""
+      k += 1
+      var gr = parse_one(fs, jp, ji, &kw, &t)
+      resolve_res(fs, ffi, &rs, &gr, jp)
+      place(&g, &gr, pshown, &todo)
+    return g
+  # workers that stay for the whole graph (their resolvers' caches with them); a record's new
+  # requests are queued as soon as it's placed
+  let jc: Chan[Job] = chan(1 << 20)
+  let rc: Chan[GRes] = chan(1 << 20)
+  for w in 0..threads: spawn gworker(fs, ffi, jc, rc)
+  var pending = 0
+  var sent = 0
+  while sent < todo.len:
+    jc.send(Job(todo[sent].idx, todo[sent].path + ""))
+    sent += 1
+    pending += 1
+  while pending > 0:
+    var gr = rc.recv() else break
+    pending -= 1
+    place(&g, &gr, pshown, &todo)
+    while sent < todo.len:
+      jc.send(Job(todo[sent].idx, todo[sent].path + ""))
+      sent += 1
+      pending += 1
+  jc.close()
   return g
 
 # the record a request of record ri loads (-1 none, or not read)

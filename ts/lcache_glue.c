@@ -63,6 +63,16 @@ vu_str vl_realpath(const vu_str *path) {
   return vu_str_from(buf, (int64_t)strlen(buf));
 }
 
+// Whether a path is a symbolic link (lstat).
+bool vl_is_link(const vu_str *path) {
+  char *p = vu_cstr(path);
+  if (!p) return false;
+  struct stat st;
+  int r = lstat(p, &st);
+  free(p);
+  return r == 0 && S_ISLNK(st.st_mode);
+}
+
 // A folder's entries in the order the file system gives them (as oxlint's walker sees them), each
 // followed by "\n"; folders end with "/" (symbolic links are followed). "" when it can't be read.
 #include <dirent.h>
