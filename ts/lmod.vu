@@ -9,6 +9,7 @@ import scan
 import parse
 import lresolve
 import lcache
+import lpart
 
 type Rec:
   path: Str
@@ -72,10 +73,15 @@ type Graph:
 fn new_graph() -> Graph:
   return Graph(false, [], {}, {}, "", [], [])
 
-fn valid_ext(p: Str) -> Bool:
+# oxc's VALID_EXTENSIONS
+fn js_ext(p: Str) -> Bool:
   for e in [".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"]:
     if p.endswith(e): return true
   return false
+
+# what the module graph loads (as oxlint's runtime: those, and the partial loader's)
+fn valid_ext(p: Str) -> Bool:
+  return js_ext(p) or lpart.is_partial(p)
 
 # ---- the record of a parsed file
 
@@ -333,40 +339,63 @@ fn find_root(t: ast.Ast) -> Int:
     if t.nd[x].k == ast.N_LIST and t.nd[x].d == -2: root = x
   return root
 
-fn parse_record(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast) -> Rec:
-  let src0 = fs.read(path) else return new_rec(path)
-  var src = src0 + ""
+fn parse_text(own src0: Str, path: Str, kind: Str, var kw: {Str: Int}, var t: ast.Ast) -> Rec:
+  var src = src0
   ast.clear_nodes(&t)
-  let jsx = not (path.endswith(".ts") or path.endswith(".mts") or path.endswith(".cts"))
+  let jsx = not (kind.endswith(".ts") or kind.endswith(".mts") or kind.endswith(".cts"))
   let _ = parse.parse_file_v(&t, &src, 1, &kw, true, jsx)
   let root = find_root(t)
   if root < 0: return new_rec(path)
   return build_record(t, src, root, path)
 
+fn parse_record(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast) -> Rec:
+  let src0 = fs.read(path) else return new_rec(path)
+  return parse_text(src0 + "", path, path, &kw, &t)
+
+# A .vue, .astro or .svelte file: one record per script section, in order (sec gets each one's start)
+fn parse_sections(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast, var sec: [Int]) -> [Rec]:
+  var out: [Rec] = []
+  let src0 = fs.read(path) else return out
+  for x in lpart.sections(path, src0):
+    out.push(parse_text(lpart.blank(src0, x.start, x.end), path, "x" + x.ext, &kw, &t))
+    sec.push(x.start)
+  return out
+
 type GRes:
   idx: Int
   rec: Rec
+  more: [Rec]           # a partial file: its other sections (rec is the last), and each one's start
+  sec: [Int]
 
 fn gworker(fs: Fs, own paths: Shared[[Str]], own jobs: Chan[Int], own res: Chan[GRes]):
   var kw = scan.keywords()
   var t = new_tree()
   while true:
     let i = jobs.recv() else return
-    let r = parse_record(fs, paths.value[i], &kw, &t)
-    res.send(GRes(i, r))
+    res.send(parse_one(fs, paths.value[i], i, &kw, &t))
+
+fn parse_one(fs: Fs, path: Str, i: Int, var kw: {Str: Int}, var t: ast.Ast) -> GRes:
+  if not lpart.is_partial(path): return GRes(i, parse_record(fs, path, &kw, &t), [], [])
+  var sec: [Int] = []
+  var rs = parse_sections(fs, path, &kw, &t, &sec)
+  if rs.len == 0: return GRes(i, new_rec(path), [], [])
+  var last = new_rec("")
+  swap(&last, &rs[rs.len - 1])
+  rs.truncate(rs.len - 1)
+  return GRes(i, last, rs, sec)
 
 fn new_tree() -> ast.Ast:
   var t = ast.new_ast()
   return t
 
 # the records of these paths, parsed by `threads` workers
-fn parse_all(fs: Fs, own paths: [Str], threads: Int, var kw: {Str: Int}, var t: ast.Ast) -> [Rec]:
-  var out: [Rec] = []
+fn parse_all(fs: Fs, own paths: [Str], threads: Int, var kw: {Str: Int}, var t: ast.Ast) -> [GRes]:
+  var out: [GRes] = []
   let n = paths.len
   if threads <= 1 or n < 8:
-    for p in paths: out.push(parse_record(fs, p, &kw, &t))
+    for i in 0..n: out.push(parse_one(fs, paths[i], i, &kw, &t))
     return out
-  for i in 0..n: out.push(new_rec(""))
+  for i in 0..n: out.push(GRes(i, new_rec(""), [], []))
   let jc: Chan[Int] = chan(n + 1)
   let rc: Chan[GRes] = chan(n + 1)
   for i in 0..n: jc.send(i)
@@ -377,7 +406,8 @@ fn parse_all(fs: Fs, own paths: [Str], threads: Int, var kw: {Str: Int}, var t: 
   for w in 0..jobs: spawn gworker(fs, sp, jc, rc)
   for i in 0..n:
     var g = rc.recv() else break
-    swap(&out[g.idx], &g.rec)
+    let gi = g.idx
+    swap(&out[gi], &g)
   return out
 
 fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, var kw: {Str: Int}, var t: ast.Ast) -> Graph:
@@ -388,40 +418,55 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, var kw: {St
   # reached through many node_modules links, and would otherwise be parsed once for each)
   var real: {Str: Str} = {}
   var frontier: [Str] = []
+  # a partial linted file's shown name (its sections are keyed "shown#start")
+  var pshown: {Str: Str} = {}
   for i in 0..files.len:
     if not valid_ext(files[i]): continue
     if not (files[i] in g.at):
       g.at[files[i]] = g.recs.len
       g.recs.push(new_rec(files[i]))
       frontier.push(files[i] + "")
-    g.shown[shown[i]] = g.at[files[i]]
+    if lpart.is_partial(files[i]): pshown[files[i]] = shown[i] + ""
+    else: g.shown[shown[i]] = g.at[files[i]]
   while frontier.len > 0:
     var batch: [Str] = []
     swap(&batch, &frontier)
     var idxs: [Int] = []
     for p in batch: idxs.push(g.at[p])
-    var recs = parse_all(fs, batch, threads, &kw, &t)
-    for bi in 0..recs.len:
-      var r = new_rec("")
-      swap(&r, &recs[bi])
+    var res = parse_all(fs, batch, threads, &kw, &t)
+    for bi in 0..res.len:
       let p = g.recs[idxs[bi]].path + ""
-      if r.path == "": r.path = p
-      for j in 0..r.rq.len:
-        var target = lresolve.resolve(&rv, fs, p, r.rq[j])
-        if target != "":
-          if not (target in real):
-            var rp = lcache.realpath(ffi, target)
-            if rp == "": rp = target + ""
-            real[target] = rp
-          target = real[target] + ""
-        r.rq_path[j] = target
-        if target != "" and valid_ext(target):
-          if not (target in g.at):
-            g.at[target] = g.recs.len
-            g.recs.push(new_rec(target))
-            frontier.push(target + "")
-          r.rq_res[j] = g.at[target]
-      swap(&g.recs[idxs[bi]], &r)
+      # (a partial file: its sections before the last get records of their own; the last one is the
+      # module others load, as oxlint's loaded_modules take the last section)
+      var slots: [Int] = []
+      for mi in 0..res[bi].more.len:
+        slots.push(g.recs.len)
+        g.recs.push(new_rec(p))
+      slots.push(idxs[bi])
+      if p in pshown:
+        let sh = pshown[p]
+        for si in 0..res[bi].sec.len: g.shown["{sh}#{res[bi].sec[si]}"] = slots[si]
+      for si in 0..slots.len:
+        var r = new_rec("")
+        if si < res[bi].more.len: swap(&r, &res[bi].more[si])
+        else: swap(&r, &res[bi].rec)
+        if r.path == "": r.path = p + ""
+        for j in 0..r.rq.len:
+          var target = lresolve.resolve(&rv, fs, p, r.rq[j])
+          if target != "":
+            if not (target in real):
+              var rp = lcache.realpath(ffi, target)
+              if rp == "": rp = target + ""
+              real[target] = rp
+            target = real[target] + ""
+          r.rq_path[j] = target
+          if target != "" and valid_ext(target):
+            if not (target in g.at):
+              g.at[target] = g.recs.len
+              g.recs.push(new_rec(target))
+              frontier.push(target + "")
+            r.rq_res[j] = g.at[target]
+        swap(&g.recs[slots[si]], &r)
   return g
 
 # the record a request of record ri loads (-1 none, or not read)
