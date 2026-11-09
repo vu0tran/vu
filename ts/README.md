@@ -196,6 +196,16 @@ file, 150 runs with 1 to 8 threads and 1 or 2 processes, every other file linted
 files reported; `VLINT_JS_CHECK=1` (no node missed by the per-type field lists) on AFFiNE, lc and
 blocksuite.
 
+On GitHub's standard runner (4 vCPUs: 2 AMD EPYC 7763 cores with 2 hardware threads each;
+`bench/vlint_affine.sh` on the `bench-vlint` branch, run 42561461521), the same config, three
+runs each alternating: oxlint 48.0, 48.9, 49.4 s wall and 94-95 s CPU; vlint (2 node processes)
+41.1, 41.9, 40.9 s wall (1.19 times as fast) and 132-135 s CPU. With 1, 3 and 4 processes: 53.0,
+44.7, 48.8 s wall, 97, 166, 187 s CPU. Most of the time is the plugins' own JavaScript (the React
+Compiler and Babel, run the same way in both), which oxlint runs on one thread; vlint can only
+spread it over processes, and on these machines a second node process gains less than half a
+process (hardware threads, V8's own threads), a third nothing. So not 2 times as fast here; not
+measured on a machine with more physical cores.
+
 **Output**: oxlint's graphical report (themes, links, summary lines), the agent format, and all
 `-f` formats, byte-identical in the cases checked.
 
