@@ -22,6 +22,7 @@ static pthread_mutex_t vl_mu = PTHREAD_MUTEX_INITIALIZER;
 static char *vl_script = NULL;
 static char **vl_args = NULL;     /* vlint's own arguments, passed on (plugins read process.argv) */
 static int vl_nargs = 0;
+static char **vl_env = NULL;      /* the processes' environment: vlint's, with NODE_COMPILE_CACHE */
 static char *vl_prelude = NULL;   /* lines */
 static size_t vl_prelude_len = 0;
 static int vl_slots = 1, vl_next_slot = 0, vl_inited = 0;
@@ -103,7 +104,7 @@ static bool vl_start(vl_worker *w) {
     argv[0] = "node"; argv[1] = "--no-warnings"; argv[2] = vl_script;
     for (int i = 0; i < vl_nargs; i++) argv[3 + i] = vl_args[i];
     pid_t pid;
-    int rc = posix_spawnp(&pid, "node", &fa, NULL, argv, environ);
+    int rc = posix_spawnp(&pid, "node", &fa, NULL, argv, vl_env ? vl_env : environ);
     free(argv);
     posix_spawn_file_actions_destroy(&fa);
     close(r3); close(w4);
@@ -143,6 +144,21 @@ void vl_node_setup(const vu_str *script, const vu_str *args, int64_t slots) {
         }
     }
     vl_slots = slots < 1 ? 1 : slots > VL_MAXW ? VL_MAXW : (int)slots;
+    /* Node's compile cache (Node 22.1 and later; older ones ignore it) in a folder beside the host
+       script, so later runs don't compile the host and the plugins again (about 0.5 s a process),
+       unless the user chose a cache or turned it off */
+    const char *sl = vl_script ? strrchr(vl_script, '/') : NULL;
+    if (!vl_env && sl && sl > vl_script && !getenv("NODE_COMPILE_CACHE") && !getenv("NODE_DISABLE_COMPILE_CACHE")) {
+        size_t dl = (size_t)(sl - vl_script);
+        const char *pre = "NODE_COMPILE_CACHE=", *suf = "/node-compile-cache";
+        char *var = malloc(strlen(pre) + dl + strlen(suf) + 1);
+        sprintf(var, "%s%.*s%s", pre, (int)dl, vl_script, suf);
+        int n = 0;
+        while (environ[n]) n++;
+        vl_env = calloc((size_t)n + 2, sizeof *vl_env);
+        for (int i = 0; i < n; i++) vl_env[i] = environ[i];
+        vl_env[n] = var;
+    }
     pthread_mutex_unlock(&vl_mu);
 }
 

@@ -160,6 +160,21 @@ oxlint-plugin-eslint, oxlint-tailwindcss, oxlint-plugin-complexity, oxlint-plugi
 92 s CPU and 71 s wall, vlint 114 s CPU and 59 s wall (oxlint runs JS on one thread, vlint on
 one Node process per thread).
 
+Speed on AFFiNE (2026-11-08; oxlint's own config there: six JS plugins including the React
+Compiler's react-hooks rules, type-aware rules on; 2-core machine, two runs each, wall time):
+oxlint 70.1 and 73.8 s, vlint 63.7 and 68.6 s (79.1 and 90.5 s before this change); without
+type-aware rules, oxlint 57.7 and 67.4 s, vlint 58.2 and 59.9 s. The change: oxlint's
+`NodeProto` has `loc` as an enumerable getter, so vlint's `for-in` walks over the tree read it on
+every node (computing every node's position and giving each node an own property, a slow shape);
+they now skip it. And the node literals in `estree.js` carry `start`, `end`, `range` and `parent`
+themselves, so each node is allocated once in its final shape. Building the ESTree went from
+22.2 s to 3.5 s of CPU on one thread; a 6 MB file (TypeScript's `_tsc.js`) no longer runs Node out
+of memory. The node processes also use Node's compile cache (Node 22.1 and later) in
+`~/.cache/vlint/node-compile-cache`, unless `NODE_COMPILE_CACHE` or `NODE_DISABLE_COMPILE_CACHE` is
+set: a one-file run with those plugins, 2.0 s before, takes 1.5 s from the second run on. Checked:
+the same diagnostics on AFFiNE, lc 308 of 308, and a dumping plugin's ASTs and scopes byte-identical
+to the previous build's on 18,196 dumps. Not measured on a machine with more cores.
+
 **Output**: oxlint's graphical report (themes, links, summary lines), the agent format, and all
 `-f` formats, byte-identical in the cases checked.
 
