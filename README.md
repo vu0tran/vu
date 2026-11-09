@@ -530,8 +530,8 @@ linters (68 of staticcheck's checks, the IR-based ones included: 1793 of golangc
 findings on 21 modules, and 3151 of 3151 on six golang.org/x modules for the implemented checks,
 none extra) and ten of the most enabled optional ones (misspell, unconvert, whitespace,
 nolintlint, copyloopvar, nakedret, asciicheck, dogsled, predeclared, gocyclo: 1860 of 1861
-findings over three configs). It's 23-43x faster than golangci-lint with both caches warm,
-18-88x cold, and 2.4-16x in the edit loop (2-core VM, 2026-11-09). What it does and doesn't do yet: `golint/README.md`. It installs
+findings over three configs). It's 13-43x faster than golangci-lint with both caches warm,
+18-88x cold, and 15-22x in the edit loop (2-core VM, 2026-11-09). What it does and doesn't do yet: `golint/README.md`. It installs
 as golangci-lint does, from release archives through an `install.sh` with the same interface or a
 GitHub Action (`golint/README.md`, Install).
 

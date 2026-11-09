@@ -4,11 +4,13 @@
 #   vgolint run [flags] [packages]     (default ./...)
 #   vgolint linters | help [linters|formatters] | version | config path | cache clean|status
 #
-# Packages are found as `go list` finds them for linux/amd64, and linted on all cores. A run's
-# per-package results are cached under $XDG_CACHE_HOME/vgolint (or ~/.cache/vgolint), keyed by a
-# hash of every .go file linted, go.mod, go.sum, the Go version, the effective config and the
-# vgolint binary itself; a module whose go.mod replaces a module with a local directory isn't
-# cached (that directory's files aren't in the key). --no-cache turns it off.
+# Packages are found as `go list` finds them for linux/amd64, and linted on all cores. Each
+# package's results are cached under $XDG_CACHE_HOME/vgolint (or ~/.cache/vgolint), keyed by a
+# hash of its .go files, of the packages of the module it imports (theirs without tests, and
+# transitively), go.mod, go.sum, the Go version, the effective config and the vgolint binary
+# itself: an edit re-lints the edited package and the ones that import it. A module whose go.mod
+# replaces a module with a local directory isn't cached (that directory's files aren't in the
+# key). --no-cache turns it off.
 
 import scan
 import ast
@@ -187,6 +189,106 @@ fn worker(fs: Fs, own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg:
     var r = lint_one(fs, specs.value[i], &g, &kw, gover, conf.value, rs, diff, chg.value, &dict)
     r.idx = i
     res.send(r)
+
+# The cache key of each package: the run's hash h, its files, and for each package of the module it
+# imports, that package's hash without its tests (its non-test files and theirs, transitively); an
+# external test package also takes the package it tests whole (it's compiled with its tests).
+fn spec_keys(specs: [Spec], srcs: {Str: Str}, h: [Int], var kw: {Str: Int}) -> [Str]:
+  let n = specs.len
+  var byip: {Str: Int} = {}
+  for i in 0..n:
+    if not specs[i].path.endswith("_test"): byip[specs[i].path] = i
+  var libdeps: [[Int]] = []
+  var alldeps: [[Int]] = []
+  for i in 0..n:
+    var lib: [Int] = []
+    var al: [Int] = []
+    for f in specs[i].files:
+      let src = srcs.get(f, "")
+      for ip in file_imports(src, &kw):
+        let j = byip.get(ip, -1)
+        if j < 0 or j == i: continue
+        if not (j in al): al.push(j)
+        if not f.endswith("_test.go") and not (j in lib): lib.push(j)
+    lib.sort()
+    al.sort()
+    libdeps.push(lib)
+    alldeps.push(al)
+  # library hashes, dependencies first (Go has no import cycles; a cycle is cut)
+  var libh: [Str] = []
+  for i in 0..n: libh.push("")
+  var state = [0] * n
+  for i in 0..n:
+    if state[i] != 0: continue
+    var stack = [i]
+    while stack.len > 0:
+      let x = stack[stack.len - 1]
+      if state[x] == 0:
+        state[x] = 1
+        for j in libdeps[x]:
+          if state[j] == 0: stack.push(j)
+        continue
+      stack.pop()
+      if state[x] == 2: continue
+      state[x] = 2
+      var hx = [h[0], h[1]]
+      hash_feed(&hx, "lib " + specs[x].path)
+      for f in specs[x].files:
+        if f.endswith("_test.go"): continue
+        hash_feed(&hx, f)
+        hash_feed(&hx, srcs.get(f, ""))
+      for j in libdeps[x]: hash_feed(&hx, libh[j])
+      libh[x] = hex8(hx[0]) + hex8(hx[1])
+  var keys: [Str] = []
+  for i in 0..n:
+    var hk = [h[0], h[1]]
+    hash_feed(&hk, "pkg " + specs[i].path)
+    for f in specs[i].files:
+      hash_feed(&hk, f)
+      hash_feed(&hk, srcs.get(f, ""))
+    for j in alldeps[i]: hash_feed(&hk, libh[j])
+    if specs[i].path.endswith("_test"):
+      let b = byip.get(specs[i].path[0..specs[i].path.len - 5], -1)
+      if b >= 0:
+        for f in specs[b].files:
+          hash_feed(&hk, f)
+          hash_feed(&hk, srcs.get(f, ""))
+    keys.push(hex8(hk[0]) + hex8(hk[1]))
+  return keys
+
+fn add_counts(var tot: proc.Counts, cnt: proc.Counts):
+  for q in 0..tot.rules.len:
+    if q < cnt.rules.len: tot.rules[q] += cnt.rules[q]
+  for q in 0..tot.paths.len:
+    if q < cnt.paths.len: tot.paths[q] += cnt.paths[q]
+  for q in 0..tot.pexc.len:
+    if q < cnt.pexc.len: tot.pexc[q] += cnt.pexc[q]
+  for u in cnt.unknown:
+    if not (u in tot.unknown): tot.unknown.push(u + "")
+
+fn ints_str(l: [Int]) -> Str:
+  var p: [Str] = []
+  for x in l: p.push("{x}")
+  return ",".join(p)
+
+fn counts_line(c: proc.Counts) -> Str:
+  return "C" + proc.sep() + ints_str(c.rules) + proc.sep() + ints_str(c.paths) + proc.sep() + ints_str(c.pexc) + proc.sep() + chr(2).join(c.unknown)
+
+fn read_ints(s: Str, var out: [Int]) -> Bool:
+  if s.len == 0: return out.len == 0
+  let f = s.split(",")
+  if f.len != out.len: return false
+  for i in 0..f.len:
+    out[i] = int(f[i]) else return false
+  return true
+
+fn read_counts(l: Str, var c: proc.Counts) -> Bool:
+  let f = l.split(proc.sep())
+  if f.len != 5 or f[0] != "C": return false
+  if not read_ints(f[1], &c.rules) or not read_ints(f[2], &c.paths) or not read_ints(f[3], &c.pexc): return false
+  for u in f[4].split(chr(2)):
+    if u.len > 0: c.unknown.push(u + "")
+  return true
 
 # Two 32-bit FNV-style lanes over s (four bytes at a time), then its length.
 fn hash_feed(var h: [Int], s: Str):
@@ -722,7 +824,6 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     if gp.find(":") >= 0: gp = gp[0..gp.find(":")]
     if gp.len == 0: gp = os.env("HOME") + "/go"
     modcache = gp + "/pkg/mod"
-  var cache_file = ""
   if use_cache:
     hash_feed(&h, goroot + "\n" + modcache)
     let gv = fs.read(goroot + "/VERSION") else ""
@@ -731,6 +832,7 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     if exe.len == 0: use_cache = false
     hash_feed(&h, exe)
   var specs: [Spec] = []
+  var srcs: {Str: Str} = {}
   for d in dirs:
     var main_files: [Str] = []
     var x_files: [Str] = []
@@ -741,10 +843,8 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
       var path = d.path + "/" + nm
       if d.path == ".": path = nm + ""
       let src = fs.read(path) else continue
-      if use_cache:
-        hash_feed(&h, path)
-        hash_feed(&h, src)
       if not load.good_constraints(src, c.build_tags): continue
+      if use_cache: srcs[path] = src
       let name = package_name(src, &kw)
       if nm.endswith("_test.go") and name.endswith("_test") and name != pname:
         x_files.push(path)
@@ -764,56 +864,70 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
   var all: [proc.Iss] = []
   var warnings: [Str] = []     # tag, text pairs
   var perrs: [Str] = []
-  var have = false
+  let n = specs.len
+  var results: [[proc.Iss]] = []
+  for k in 0..n: results.push([])
+  var tot = proc.new_counts(c)
+  var keys: [Str] = []
+  var cdir = ""
+  var pending: [Int] = []
   if use_cache:
-    var cdir = os.env("XDG_CACHE_HOME")
+    keys = spec_keys(specs, srcs, h, &kw)
+    cdir = os.env("XDG_CACHE_HOME")
     if cdir.len == 0: cdir = os.env("HOME") + "/.cache"
     cdir += "/vgolint"
-    cache_file = cdir + "/" + hex8(h[0]) + hex8(h[1])
-    if fs.exists(cache_file):
-      let text = fs.read(cache_file) else ""
-      if text.startswith("vgolint2\n"):
-        have = true
-        for l in text[9..text.len].split("\n"):
-          if l.len == 0: continue
-          if l.startswith("W" + proc.sep()):
-            let f = l.split(proc.sep())
-            if f.len == 3:
-              warnings.push(f[1] + "")
-              warnings.push(f[2] + "")
-            continue
-          let is = proc.from_record(l) else continue
-          all.push(is)
-    if not have: fs.mkdir(cdir) else 0
-  if not have:
+    fs.mkdir(cdir) else 0
+  for k in 0..n:
+    var hit = false
+    if use_cache:
+      let text = fs.read(cdir + "/p" + keys[k]) else ""
+      if text.startswith("vgolint3\n"):
+        let lines = text[9..text.len].split("\n")
+        if lines.len > 0:
+          var cnt = proc.new_counts(c)
+          if read_counts(lines[0], &cnt):
+            hit = true
+            for li in 1..lines.len:
+              if lines[li].len == 0: continue
+              let is = proc.from_record(lines[li]) else continue
+              results[k].push(is)
+            add_counts(&tot, cnt)
+    if not hit: pending.push(k)
+  if pending.len > 0:
     var jobs = o.jobs
     if jobs == 0: jobs = c.concurrency
     if jobs == 0: jobs = cpu_count(fs, ffi)
-    if jobs > specs.len: jobs = specs.len
+    if jobs > pending.len: jobs = pending.len
     if jobs < 1: jobs = 1
     var gover = minor_of(c.go_ver)
-    let n = specs.len
-    var results: [[proc.Iss]] = []
-    for k in 0..n: results.push([])
-    var tot = proc.new_counts(c)
-    let shared = share(specs)
+    let np = pending.len
+    var lspecs: [Spec] = []
+    for k in pending:
+      var fl: [Str] = []
+      for f in specs[k].files: fl.push(f + "")
+      lspecs.push(Spec(specs[k].dir + "", fl, specs[k].path + ""))
+    let shared = share(lspecs)
     let sch = share(ch)
-    let jc: Chan[Int] = chan(n + 1)
-    let rc: Chan[Res] = chan(n + 1)
-    for k in 0..n: jc.send(k)
+    let jc: Chan[Int] = chan(np + 1)
+    let rc: Chan[Res] = chan(np + 1)
+    for k in 0..np: jc.send(k)
     jc.close()
     for k in 0..jobs: spawn worker(fs, shared, shc, sch, diff, jc, rc, ".", goroot + "", modcache + "", gover)
-    for k in 0..n:
+    for k in 0..np:
       var r = rc.recv()?
-      swap(&results[r.idx], &r.issues)
+      let si = pending[r.idx]
       for e in r.errs: perrs.push(e + "")
-      for q in 0..tot.rules.len: tot.rules[q] += r.cnt.rules[q]
-      for q in 0..tot.paths.len: tot.paths[q] += r.cnt.paths[q]
-      for q in 0..tot.pexc.len: tot.pexc[q] += r.cnt.pexc[q]
-      for u in r.cnt.unknown:
-        if not (u in tot.unknown): tot.unknown.push(u + "")
-    for k in 0..n:
-      for is in results[k]: all.push(proc.dup(is))
+      if use_cache and r.errs.len == 0:
+        var lines: [Str] = [counts_line(r.cnt)]
+        for is in r.issues: lines.push(proc.to_record(is))
+        let file = cdir + "/p" + keys[si]
+        fs.write(file + ".tmp", "vgolint3\n" + "\n".join(lines)) else 0
+        fs.rename(file + ".tmp", file) else 0
+      add_counts(&tot, r.cnt)
+      swap(&results[si], &r.issues)
+  for k in 0..n:
+    for is in results[k]: all.push(proc.dup(is))
+  if true:
     let cc = c
     # warnings, as the processors' Finish methods log them
     if cc.warn_unused:
@@ -839,16 +953,6 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     if tot.unknown.len > 0:
       warnings.push("runner/nolint_filter")
       warnings.push("Found unknown linters in //nolint directives: " + ", ".join(sorted(tot.unknown)))
-    if cache_file.len > 0 and perrs.len == 0:
-      var lines: [Str] = []
-      var wi = 0
-      while wi + 1 < warnings.len:
-        lines.push("W" + proc.sep() + warnings[wi] + proc.sep() + warnings[wi + 1])
-        wi += 2
-      for is in all: lines.push(proc.to_record(is))
-      let tmp = cache_file + ".tmp"
-      fs.write(tmp, "vgolint2\n" + "\n".join(lines)) else 0
-      fs.rename(tmp, cache_file) else 0
   for e in perrs: eprint("level=error msg=\"[linters_context] typechecking error: " + e + "\"")
   var wi = 0
   while wi + 1 < warnings.len:

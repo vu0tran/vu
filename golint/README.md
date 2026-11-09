@@ -246,24 +246,28 @@ crypto and mod:
 
 | | vgolint | golangci-lint | vgolint faster by |
 |---|---:|---:|---:|
-| both caches warm (nothing changed) | 9-54 | 292-1261 | 23x-43x (median 35x) |
+| both caches warm (nothing changed) | 9-99 | 292-1261 | 13x-43x (median 35x) |
 | cold (golangci-lint after `cache clean`; vgolint `--no-cache`) | 60-1259 | 2373-26762 | 18x-88x (median 39x) |
 | vgolint `--no-cache` against golangci-lint warm | 60-1259 | 292-1261 | 1.0x-5.7x (median 2.7x) |
 
-The edit loop: one file changed, then the module linted again, both caches otherwise warm:
+The edit loop: one file changed, then the module linted again, both caches otherwise warm
+(vgolint's cache is per package since 2026-11-09: the edited package and those that import it
+are linted again, the rest read):
 
 | module | file | vgolint | golangci-lint |
 |---|---|---:|---:|
-| dns | msg.go | 331 | 5358 |
-| gin | context.go | 217 | 2757 |
-| x/text | language/language.go | 1261 | 11690 |
-| x/text | unicode/norm/normalize.go | 1224 | 11265 |
-| x/net | http2/frame.go | 639 | 4767 |
-| x/net | html/parse.go | 652 | 1567 |
+| dns | msg.go | 313 | 6871 |
+| gin | context.go | 194 | 3313 |
+| x/text | language/language.go | 786 | 12615 |
+| x/text | unicode/norm/normalize.go | 776 | 11679 |
+| x/net | http2/frame.go | 295 | 4480 |
+| x/net | html/parse.go | 100 | 1544 |
 
-vgolint's result cache is one entry per run, so an edit re-lints the whole module (the edit-loop
-times equal the `--no-cache` ones); golangci-lint's is per package. A per-package cache is the
-next speedup there.
+dns and gin are one package each, so an edit there lints it all again. With the whole-run cache
+before, x/text took 1261 and 1224 ms and x/net 639 and 652; reading a cache entry per package
+costs the no-change run of x/text 99 ms where one entry took 54. Cached and uncached output are
+the same byte for byte (stdout, stderr, exit code) on the 21 corpus modules under the four
+configs, cold and warm (168 runs), and on x/text, net and dns.
 
 ## Tools
 
