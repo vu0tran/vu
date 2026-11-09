@@ -19,21 +19,24 @@ file it does check gets exactly the errors tsc 7 reports for it.
 
 ## Speed
 
-date-fns (`pkgs/core/src`, 1334 files, 2.0 MB of TypeScript), on a 2-core Intel Xeon @ 2.80GHz
+date-fns (`pkgs/core/src`, 1334 files, 2.0 MB of TypeScript), on a 2-core Intel Xeon @ 2.10GHz
 VM, best of 5 runs, wall clock (`ts/bench.sh` with `ts/bench_parse.mjs`; measured
-2026-11-01):
+2026-11-09):
 
 | type checking (`--noEmit --strict`) | ms |
 |---|---|
-| vtsc (2 workers) | 566 |
-| vtsc (1 thread) | 867 |
-| tsc 7.0.2 (Go) | 1660 |
-| tsc 7.0.2, `--checkers 1 --singleThreaded` | 1999 |
-| tsc 6.0.3 (JavaScript) | 8746 |
+| vtsc (2 workers) | 305 |
+| vtsc (1 thread) | 454 |
+| tsc 7.0.2 (Go) | 1009 |
+| tsc 7.0.2, `--checkers 1 --singleThreaded` | 1143 |
+| tsc 6.0.3 (JavaScript) | 5114 |
 
-vtsc checks 1210 of the 1334 files; it lists the other 124 as not checked (generic call
-patterns, spreads into overloads, and the like), so the comparison is close to, not exactly, the
-same work. It reports no error tsc doesn't on the files it checks.
+vtsc checks all 1334 files and reports what tsc 7 reports for them: no errors (tsc with
+`--allowImportingTsExtensions`, which date-fns' imports need). That makes it 3.3x faster than
+tsc 7 and 17x faster than tsc 6 on the same work. (Before 2026-11-09 it left 34 files unchecked:
+spreads into overloads, a switch's flow join, `x op= y` on an auto-typed variable, infer
+declarations in a conditional type's constraint and in its non-deferred resolution, a spread
+replacing a written property.)
 
 | parsing only (sources in memory) | ms |
 |---|---|

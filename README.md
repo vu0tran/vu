@@ -506,9 +506,10 @@ lower is better. (Earlier rounds measured on another VM, where every time was hi
 ## A TypeScript type checker in Vu
 
 `ts/` holds vtsc, a TypeScript type checker written in Vu that prints the same errors as
-`tsc --noEmit --strict`. On date-fns (1334 files) on a 2-core VM it checks in 566 ms where tsc 7
-(Go) takes 1660 ms and tsc 6 takes 8.7 s; it checks 1210 of the files and lists the other 124 as
-not checked rather than guessing. Its parser handles the same 2.0 MB in 52 ms. Details, caveats
+`tsc --noEmit --strict`. On date-fns (1334 files) on a 2-core VM it checks every file in 305 ms,
+with the same result as tsc, where tsc 7 (Go) takes 1009 ms and tsc 6 takes 5.1 s (2026-11-09).
+On other code it lists what it doesn't model yet as not checked rather than guessing (most of
+zod, remeda and jotai still are). Its parser handles the same 2.0 MB in 23 ms. Details, caveats
 and how it's tested against tsc: `ts/README.md`.
 
 The same directory holds vlint, a linter that prints exactly what oxlint prints for its 96
@@ -635,7 +636,7 @@ attacks until a whole round found nothing; CHANGELOG.md lists what each round fo
 | `mcp/filesystem/`, `mcp/time/`, `mcp/fetch/`, `mcp/sqlite/`, `mcp/git/`, `mcp/vu/` | MCP servers: filesystem, time, fetch, SQLite, git, and Vu's checker for models |
 | `tests/` | the test suites; `tests/gate.sh` runs them all |
 | `bench/` | benchmark programs in C, C++, Rust and Go, and the scripts that time them |
-| `ts/` | vtsc, a TypeScript type checker written in Vu (2.9x faster than tsc 7 on date-fns; see `ts/README.md`) |
+| `ts/` | vtsc, a TypeScript type checker written in Vu (3.3x faster than tsc 7 on date-fns, all of it checked; see `ts/README.md`) |
 | `golint/` | vgolint, a drop-in replacement for golangci-lint (see `golint/README.md`) |
 | `packaging/` | release scripts: Vu's archives, Homebrew, and the drop-in tools' builds and npm packages (`RELEASING.md`) |
 | `SPEC.md` | the language |

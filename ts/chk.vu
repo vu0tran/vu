@@ -2690,9 +2690,17 @@ fn spread_into(var c: C, t: Int, st0: Int, var written: {Int: Bool}) -> Bool:
       opt = true
     let o = c.ta[t]
     if name in c.objs[o].props:
-      # a property written before the spread and replaced by it: its node would mislead elaboration
-      if name in written: return false
+      # a property written before the spread and replaced by it: its node would mislead
+      # elaboration, so an error elaborated into this literal isn't trusted
       let old = c.objs[o].props[name]
+      if name in written:
+        c.spread_replaced[c.objs[o].node] = true
+        # checkSpreadPropOverrides: a property the spread always has overwrites the written one
+        if not opt:
+          let od = c.sdecl[old]
+          var at = od
+          if od >= 0 and c.t.nd[od].k == ast.N_PROPASSIGN: at = c.t.nd[od].a
+          if at >= 0: err(&c, at, 2783, "'" + nm(c, name) + "' is specified more than once, so this usage will be overwritten.")
       if opt:
         let ot = bind.type_of_sym(&c, old)
         let ow = types.filter_union(&c, ot, true, false)
@@ -3062,6 +3070,22 @@ fn sig_max(c: C, sg: Int) -> Int:
     return -1
   return np
 
+# getMinArgumentCount: the required parameters, and a rest parameter typed as a tuple adds the
+# elements it requires.
+fn sig_min(c: C, sg: Int) -> Int:
+  let s = types.sig_copy(c, sg)
+  let np = s.ptypes.len
+  var m = s.min
+  if np > 0 and s.pflags[np - 1] == 2:
+    let rt = s.ptypes[np - 1]
+    if c.tk[rt] == TK_OBJ and c.objs[c.ta[rt]].kind == OK_TUPLE:
+      var req = 0
+      let tf = bind.tuple_fixed(c, rt)
+      for j in 0..tf:
+        if c.objs[c.ta[rt]].eflags[j] == 0: req = j + 1
+      if np - 1 + req > m: m = np - 1 + req
+  return m
+
 fn arity_ok(c: C, sg: Int, n: Int) -> Bool:
   let s = types.sig_copy(c, sg)
   if n < s.min: return false
@@ -3216,8 +3240,23 @@ fn same_params(c: C, a: Int, b: Int) -> Bool:
 
 # f(a, ...xs) with xs an array: the spread goes to f's rest parameter. Other forms (a tuple, a
 # spread before the rest parameter, overloads, inference) aren't modeled.
-fn spread_call(var c: C, n: Int, sgs: [Int], args: [Int], at: Int) -> Int:
-  if sgs.len != 1: return unsup(&c, args[at], "a spread argument to overloads")
+fn spread_call(var c: C, n: Int, sgs0: [Int], args: [Int], at: Int) -> Int:
+  var sgs: [Int] = []
+  for x in sgs0: sgs.push(x)
+  if sgs.len > 1:
+    # overloads: a spread of a non-tuple stays one argument (getEffectiveCallArguments), so
+    # hasCorrectArity keeps the signatures taking it (at least at fixed arguments before it, and a
+    # rest parameter or a parameter at its position); when one is left, it's the one
+    let st0 = check_expr(&c, c.t.nd[args[at]].a, -1)
+    if c.tk[st0] == TK_OBJ and c.objs[c.ta[st0]].kind == OK_TUPLE: return unsup(&c, args[at], "a spread argument of a tuple to overloads")
+    var keep: [Int] = []
+    for sg in sgs:
+      let s0 = types.sig_copy(c, sg)
+      let np0 = s0.ptypes.len
+      let rest = np0 > 0 and s0.pflags[np0 - 1] == 2
+      if at >= sig_min(c, sg) and (rest or at < np0): keep.push(sg)
+    if keep.len != 1: return unsup(&c, args[at], "a spread argument to overloads")
+    sgs = keep
   let sg = sgs[0]
   if c.sigs[sg].tparams.len > 0: return unsup(&c, args[at], "a spread argument to a generic function")
   let s = types.sig_copy(c, sg)
@@ -3234,9 +3273,11 @@ fn spread_call(var c: C, n: Int, sgs: [Int], args: [Int], at: Int) -> Int:
   let rt = s.ptypes[np - 1]
   let st = check_expr(&c, c.t.nd[args[at]].a, rt)
   if is_any(c, st): return sig_result(&c, sg, n)
-  if not rel.is_array_ref(&c, st): return unsup(&c, args[at], "a spread argument that isn't an array")
+  var sta = st
+  if not rel.is_array_ref(&c, sta): sta = rel.apparent(&c, st)
+  if not rel.is_array_ref(&c, sta): return unsup(&c, args[at], "a spread argument that isn't an array")
   # element by element: the array's element type against the rest parameter's
-  let et = c.objs[c.ta[st]].args[0]
+  let et = c.objs[c.ta[sta]].args[0]
   let pe = param_at(&c, sg, at)
   if not reported and not rel.assignable(&c, et, pe): rel.report(&c, et, pe, args[at], -1, 2345)
   return sig_result(&c, sg, n)
@@ -3565,7 +3606,11 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx: Int) -> Int:
         for am in types.members(c, at):
           if not literal_of_ctx(&c, am, rp): all_lit = false
         if all_lit: at = types.regular(c, at)
-      let h13_ = raw_param_at(&c, sg, i)
+      var h13_ = raw_param_at(&c, sg, i)
+      # an optional parameter's type has undefined in it (getTypeAtPosition, strictNullChecks):
+      # an argument's undefined matches that, not the type parameter
+      let s13 = types.sig_copy(c, sg)
+      if i < s13.pflags.len and s13.pflags[i] == 1: h13_ = types.union_of(&c, [h13_, c.undef_t])
       var seen: {Int: Bool} = {}
       infer_in(&c, h13_, at, &inf, false, 0, h13_, &seen)
   let m = inf_mapper(&c, &inf, sg)
@@ -4210,9 +4255,22 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
       arith_operand(&c, r, rt, 2363)
       res = c.number_t
       if bigint_like(c, lt) and bigint_like(c, rt): res = c.bigint_t
-    if not bad_ref(c, before) and not is_any(c, target) and not rel.assignable(&c, res, target): rel.report(&c, res, target, l, -1, 2322)
+    let bad = bad_ref(c, before)
+    if not bad and not is_any(c, target) and not rel.assignable(&c, res, target): rel.report(&c, res, target, l, -1, 2322)
     let key = ref_key(&c, l)
-    if key != "": forget(&c, key)
+    if key != "":
+      forget(&c, key)
+      # a variable's flow type after x op= y is the result's, as after x = (x op y): widened for
+      # an auto-typed one, the declared type reduced by it otherwise (getTypeAtFlowAssignment)
+      if not bad and c.t.nd[skip_parens(c, l)].k == ast.N_ID:
+        if target == c.auto_t:
+          let rr = types.regular(c, res)
+          let aw2 = widen_all(&c, rr)
+          set_narrow(&c, key, aw2)
+        else:
+          let h15c = assigned_narrow(&c, target, res)
+          set_narrow(&c, key, h15c)
+          note_assigned(&c, key, target, res)
     return res
   if op == scan.T_AND:
     let lt = check_expr(&c, l, -1)
@@ -4696,6 +4754,56 @@ fn join_branches(var c: C, ft: {Str: Int}, fe: {Str: Int}, reach_t: Bool, reach_
       if s2 >= 0 and bind.type_of_sym(&c, s2) == c.auto_t: r = -7
     set_narrow(&c, key, r)
 
+# join_branches' join of assigned references, for any number of frames that fall through.
+fn join_many(var c: C, frames: [{Str: Int}], assigned: [Str]):
+  var done: {Str: Bool} = {}
+  for key in assigned:
+    if key in done: continue
+    done[key] = true
+    if frames.len == 0:
+      forget(&c, key)
+      set_narrow(&c, key, -9)
+      continue
+    var vals: [Int] = []
+    for fr in frames:
+      var v = outer_value(c, key)
+      if key in fr: v = fr[key]
+      vals.push(v)
+    var r = -9
+    var unknown = false
+    var missing = false
+    var same = true
+    for v in vals:
+      if v == -7: unknown = true
+      elif v < 0: missing = true
+      if v != vals[0]: same = false
+    if unknown: r = -7
+    elif missing: r = -9
+    elif same: r = vals[0]
+    else:
+      var regs: [Int] = []
+      var fresh_all: [Int] = []
+      for v in vals:
+        for x in regular_lits(c, v): regs.push(x)
+        for x in fresh_lits(c, v): fresh_all.push(x)
+      var fresh = false
+      for f in fresh_all:
+        if not types.has_int(regs, f): fresh = true
+      var u = types.union_of(&c, vals)
+      if fresh: u = union_fresh(&c, vals)
+      if (key.find(".") >= 0): r = -7
+      else:
+        r = u
+        let s = int(key) else -1
+        if s >= 0 and not fresh:
+          let dt = bind.type_of_sym(&c, s)
+          if same_members(c, u, dt): r = -9
+    forget(&c, key)
+    if r == -9 and needs_flow(&c, key):
+      let s2 = int(key) else -1
+      if s2 >= 0 and bind.type_of_sym(&c, s2) == c.auto_t: r = -7
+    set_narrow(&c, key, r)
+
 fn fresh_lits(c: C, x: Int) -> [Int]:
   var out: [Int] = []
   if types.is_fresh_lit(c, x): out.push(types.regular(c, x))
@@ -4981,12 +5089,43 @@ fn check_switch(var c: C, n: Int):
           let h25_ = show.show(&c, a)
           let h26_ = show.show(&c, b)
           err(&c, c.t.nd[cs].a, 2678, "Type '" + h25_ + "' is not comparable to type '" + h26_ + "'.")
+    # the flow join after the switch, when it's simple: a default, and every case ends with a
+    # break of its own (or returns, or is the last; an empty case falls into the next) with no
+    # other break in it. Otherwise what any case assigns is forgotten.
+    let cases = kids(c, c.t.nd[n].b)
+    var simple = false
+    for cs in cases:
+      if c.t.nd[cs].a < 0: simple = true
+    var frames: [{Str: Int}] = []
+    for i in 0..cases.len:
+      let cs = cases[i]
       bind.scope_names(&c, cs)
       c.narrow.push({})
       switch_facts(&c, n, cs, st)
-      check_stmts(&c, kids(c, c.t.nd[cs].b))
-      c.narrow.pop()
-    for cs in kids(c, c.t.nd[n].b): forget_assigned(&c, c.t.nd[cs].b)
+      let all = kids(c, c.t.nd[cs].b)
+      var body: [Int] = []
+      var ends_break = false
+      for j in 0..all.len:
+        let x = all[j]
+        if j == all.len - 1 and c.t.nd[x].k == ast.N_BREAK and c.t.nd[x].s < 0: ends_break = true
+        else: body.push(x)
+      check_stmts(&c, body)
+      let fr = c.narrow.pop()
+      if not simple: continue
+      var ends = false
+      for x in body:
+        if terminates(c, x): ends = true
+        if has_break(c, x): simple = false
+      if all.len == 0 and i < cases.len - 1: continue
+      if not ends_break and not ends and i < cases.len - 1: simple = false
+      if "!u" in fr and not ends: simple = false
+      if not ends: frames.push(fr)
+    if simple:
+      var assigned: [Str] = []
+      for cs in cases: assigned_in(&c, c.t.nd[cs].b, &assigned)
+      join_many(&c, frames, assigned)
+      return
+    for cs in cases: forget_assigned(&c, c.t.nd[cs].b)
     return
 fn enclosing_class(c: C, n0: Int) -> Int:
   var n = bind.up(c, n0)
