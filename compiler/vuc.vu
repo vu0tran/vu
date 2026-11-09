@@ -1899,6 +1899,11 @@ type Scope:
   order: [Int]
   loop: Bool
   unfreeze: [Int]
+  # string views declared in this scope (see s_let): the view, the variable it points into, and the
+  # hidden string that holds its copy once that variable is about to change
+  softs: [Int]
+  soft_roots: [Int]
+  soft_owns: [Str]
 
 type Place:
   ok: Bool
@@ -3437,7 +3442,7 @@ fn declare(var g: G, v: Int):
   g.scopes[si].order.push(v)
 
 fn push_scope(var g: G, loop: Bool):
-  g.scopes.push(Scope({}, [], loop, []))
+  g.scopes.push(Scope({}, [], loop, [], [], [], []))
 
 fn snapshot(g: G) -> Snap:
   var s = Snap([], {}, {})
@@ -3518,8 +3523,38 @@ fn read_check(g: G, p: Place, line: Int):
   if g.vars[v].state == "maybe":
     err(g, line, "'" + g.vars[v].name + "' may have been moved on line {lnum(g.vars[v].moved_line)} (on some path) and can't be used here")
 
-fn write_check(g: G, p: Place, line: Int, whole_ok: Bool):
+# The variable a string view points into (itself when v isn't a string view in scope)
+fn soft_root(g: G, v: Int) -> Int:
+  for sc in g.scopes:
+    for k in 0..sc.softs.len:
+      if sc.softs[k] == v: return sc.soft_roots[k]
+  return v
+
+# Variable root is about to change (written, passed to a var parameter, moved): each string view into
+# it that is still in scope takes its own copy first (once: then it points to the copy). A copy made
+# earlier than needed is harmless, so this runs wherever the write is generated, even in a branch or
+# a loop's condition.
+fn soft_copy(var g: G, root: Int):
+  for si in 0..g.scopes.len:
+    for k in 0..g.scopes[si].softs.len:
+      if g.scopes[si].soft_roots[k] == root:
+        let vc = g.vars[g.scopes[si].softs[k]].cname + ""
+        let own = g.scopes[si].soft_owns[k] + ""
+        emit(&g, "if (" + vc + " != &" + own + ") {{ " + own + " = vu_str_dup(" + vc + "); " + vc + " = &" + own + "; }}")
+
+# String view v takes its own copy now, if it hasn't yet (a closure that borrows it keeps its pointer,
+# which must not point into something that may change)
+fn soft_own_now(var g: G, v: Int):
+  for si in 0..g.scopes.len:
+    for k in 0..g.scopes[si].softs.len:
+      if g.scopes[si].softs[k] == v:
+        let vc = g.vars[v].cname + ""
+        let own = g.scopes[si].soft_owns[k] + ""
+        emit(&g, "if (" + vc + " != &" + own + ") {{ " + own + " = vu_str_dup(" + vc + "); " + vc + " = &" + own + "; }}")
+
+fn write_check(var g: G, p: Place, line: Int, whole_ok: Bool):
   let v = p.root
+  soft_copy(&g, v)
   let name = g.vars[v].name
   if p.ro: err(g, line, "this is part of a Shared value, which can't be changed: tasks on other threads may be reading it at the same time. Build a new value and share that instead")
   if not g.vars[v].mutable:
@@ -3547,6 +3582,13 @@ fn str_last_use(g: G, v: Int) -> Bool:
   if r.last.get(name, -1) > r.idx: return false
   return r.cur.get(name, 0) <= 1
 
+# Whether moving place p (a Str) would copy it: it's part of something, borrowed, frozen, or a local
+# that is used again (see move_place)
+fn str_copies(g: G, p: Place) -> Bool:
+  let v = p.root
+  if not p.is_name or g.vars[v].kind != "local" or g.vars[v].frozen.len > 0: return true
+  return not str_last_use(g, v)
+
 fn move_place(var g: G, p: Place, line: Int) -> Str:
   let v = p.root
   if p.ty == "Str" and (not p.is_name or g.vars[v].kind != "local" or g.vars[v].frozen.len > 0):
@@ -3572,6 +3614,7 @@ fn move_place(var g: G, p: Place, line: Int) -> Str:
   let nf = g.vars[v].frozen.len
   if nf > 0:
     err(g, line, "'" + g.vars[v].name + "' can't be moved while the loop/binding on line {lnum(g.vars[v].frozen[nf - 1].line)} is borrowing it")
+  soft_copy(&g, v)
   g.vars[v].state = "yes"
   g.vars[v].moved_line = line
   return "VU_MV(" + g.vars[v].cname + ")"
@@ -4418,7 +4461,7 @@ fn map_method(var g: G, e: Node) -> CT:
     if nargs_of(e) != 1: err(g, e.line, "m.remove(key) takes one key")
     let p = place(&g, e.kids[0].kids[0])
     if not p.ok or tkind(g, p.ty) != "map": err(g, e.line, ".remove(key) works on a map stored in a variable")
-    write_check(g, p, e.line, false)
+    write_check(&g, p, e.line, false)
     let key = map_key(p.ty)
     let kb = key_begin(&g, e.kids[1].kids[0], key)
     return bw_end(&g, e.kids[1].kids[0], kb, "vu_mremove_" + mg(g, p.ty) + "(&" + p.code + ", " + key_ptr(g, kb, key) + ")", "Bool")
@@ -5113,6 +5156,7 @@ fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Boo
       else: inits.push(move_place(&g, p, e.line))
     else:
       fields.push(ct(g, oty) + " *c{i};")
+      if g.vars[ov].ptr and oty == "Str": soft_own_now(&g, ov)
       if g.vars[ov].ptr: inits.push(g.vars[ov].cname + "")
       else: inits.push("&" + g.vars[ov].cname)
   g.lam_envs[num] = "typedef struct {{ " + join(fields, " ") + " }} vu_env{num};"
@@ -5540,7 +5584,7 @@ fn start_tls_call(var g: G, e: Node, code: Str) -> CT:
   g.uses_tls = true
   let cp = place(&g, e.kids[args[0]].kids[0].kids[0])
   if not cp.ok or cp.ty != "Conn": err(g, e.line, usage)
-  write_check(g, cp, e.line, false)
+  write_check(&g, cp, e.line, false)
   let he = e.kids[args[1]].kids[0]
   let bh = bw_begin(&g, he, "")
   if bh.ty != "Str": err(g, e.line, "net.start_tls(&conn, host): the host is a Str, not " + tn(bh.ty))
@@ -5699,7 +5743,7 @@ fn reserve(var g: G, e: Node) -> CT:
   let p = place(&g, e.kids[0].kids[0])
   if not p.ok or (p.ty != "Str" and tkind(g, p.ty) != "list"):
     err(g, e.line, ".reserve(n) works on a string or list stored in a variable")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   let n = value(&g, e.kids[1].kids[0], "Int")
   if p.ty == "Str": return CT("vu_str_reserve_n(&" + p.code + ", " + n.code + ", {e.line})", "~void")
   return CT("vu_reserve_" + mg(g, p.ty) + "(&" + p.code + ", " + n.code + ", {e.line})", "~void")
@@ -5708,7 +5752,7 @@ fn pop_call(var g: G, e: Node) -> CT:
   if nargs_of(e) > 0: err(g, e.line, ".pop() takes no arguments")
   let p = place(&g, e.kids[0].kids[0])
   if not p.ok or tkind(g, p.ty) != "list": err(g, e.line, ".pop() works on a list stored in a variable")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   return CT("vu_pop_" + mg(g, p.ty) + "(&" + p.code + ", {e.line})", inner_of(p.ty))
 
 # xs.copy_within(to, from, n): copies elements from..from+n to to..to+n, as memmove does (the two may
@@ -5720,7 +5764,7 @@ fn copy_within_call(var g: G, e: Node) -> CT:
   if not p.ok or tkind(g, p.ty) != "list": err(g, e.line, ".copy_within() works on a list stored in a variable")
   let et = inner_of(p.ty)
   if not is_copy(g, et): err(g, e.line, ".copy_within copies plain values (numbers, Bool, Byte, plain structs), not " + tn(et) + ", whose elements own something")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   for ai in 1..4: pure_index(&g, e.kids[ai].kids[0])
   let to = value(&g, e.kids[1].kids[0], "Int")
   let fr = value(&g, e.kids[2].kids[0], "Int")
@@ -5739,7 +5783,7 @@ fn take_str_call(var g: G, e: Node) -> CT:
   if nargs_of(e) != 0: err(g, e.line, ".take_str() takes no arguments")
   let p = place(&g, e.kids[0].kids[0])
   if not p.ok or p.ty != "[Byte]": err(g, e.line, ".take_str() works on a [Byte] list stored in a variable")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   return CT("vu_take_str(&" + p.code + ".data, &" + p.code + ".len, &" + p.code + ".cap)", "Str")
 
 # s.read_le(at, n), s.read_be(at, n): bytes at..at+n of a Str or [Byte] (1 <= n <= 8) as an Int, least or
@@ -5764,7 +5808,7 @@ fn swap_call(var g: G, e: Node) -> CT:
   if nargs_of(e) != 2 or any_named(e): err(g, e.line, ".swap(i, j) takes two indexes")
   let p = place(&g, e.kids[0].kids[0])
   if not p.ok or tkind(g, p.ty) != "list": err(g, e.line, ".swap(i, j) works on a list stored in a variable")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   pure_index(&g, e.kids[1].kids[0])
   pure_index(&g, e.kids[2].kids[0])
   let i = value(&g, e.kids[1].kids[0], "Int")
@@ -5781,7 +5825,7 @@ fn truncate_call(var g: G, e: Node) -> CT:
   if nargs_of(e) != 1 or e.kids[1].flag: err(g, e.line, ".truncate takes one Int: how many elements to keep")
   let p = place(&g, e.kids[0].kids[0])
   if not p.ok or tkind(g, p.ty) != "list": err(g, e.line, ".truncate() works on a list stored in a variable")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   let c = value(&g, e.kids[1].kids[0], "Int")
   if c.ty != "Int": err(g, e.line, ".truncate takes an Int, not " + tn(c.ty))
   let lp = tmp(&g)
@@ -5801,7 +5845,7 @@ fn push(var g: G, e: Node) -> CT:
       err(g, e.line, "to change a map value, put the key in a variable first: let k = ...; m[k].push(...)")
     err(g, e.line, "can only push to a list stored in a variable")
   if tkind(g, p.ty) != "list": err(g, e.line, tn(p.ty) + " has no .push")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   let code = value(&g, e.kids[1].kids[0], inner_of(p.ty)).code
   let tv = tmp(&g)
   return CT("({{ " + ct(g, inner_of(p.ty)) + " " + tv + " = " + code + "; vu_push_" + mg(g, p.ty) + "(&" + p.code + ", " + tv + "); }})", "~void")
@@ -5937,7 +5981,7 @@ fn call_args(var g: G, e: Node, params: [Param], croot: Int, cline: Int) -> Args
       let p = place(&g, a.kids[0])
       if not p.ok and a.op == "method": err(g, a.line, pdesc(pn) + " is 'var', so x." + disp(e.kids[0].name) + "() changes x, and x must be a variable, field, or list element (not a value computed on the spot)")
       elif not p.ok: err(g, a.line, "'&' needs a variable, field, or list element")
-      write_check(g, p, a.line, false)
+      write_check(&g, p, a.line, false)
       if p.ty != pt: err(g, a.line, "expected " + tn(pt) + ", found " + tn(p.ty))
       root_v.push(p.root)
       root_mut.push(true)
@@ -6407,7 +6451,7 @@ fn b_swap(var g: G, e: Node) -> CT:
     if a.k != "ref": err(g, a.line, "swap() changes both values, so mark each argument with '&': swap(&a, &b)")
     let p = place(&g, a.kids[0])
     if not p.ok: err(g, a.line, "'&' needs a variable, field, or list element")
-    write_check(g, p, a.line, false)
+    write_check(&g, p, a.line, false)
     ps.push(p)
   if ps[0].root == ps[1].root or base_of(g, ps[0].root) == base_of(g, ps[1].root):
     err(g, e.line, "swap() needs two different variables; both of these are part of '" + g.vars[ps[0].root].name + "'")
@@ -6509,7 +6553,7 @@ fn sort_method(var g: G, e: Node) -> CT:
   let sf = sort_fn(inner_of(p.ty))
   if sf == "": err(g, e.line, ".sort() works on lists of Int, Float, Byte, Bool or Str, not " + tn(p.ty))
   if nargs_of(e) > 1 or (nargs_of(e) == 1 and e.kids[1].name != "reverse"): err(g, e.line, "sort() takes no arguments, or reverse: true")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   let rev = reverse_arg(&g, e, false)
   return CT("vu_sort_" + sf + "((" + p.code + ").data, (" + p.code + ").len, " + rev + ")", "~void")
 
@@ -6520,7 +6564,7 @@ fn sort_by(var g: G, e: Node, p: Place, by_at: Int) -> CT:
   for i in 1..e.kids.len:
     if not e.kids[i].flag or (e.kids[i].name != "by" and e.kids[i].name != "reverse"):
       err(g, e.line, ".sort() takes by: fn(a, b) -> Bool (whether a goes before b) and reverse: true, both named")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   let et = inner_of(p.ty)
   let ft = fn_type(&g, [et, et], "Bool", false)
   let fe = e.kids[by_at].kids[0]
@@ -6547,7 +6591,7 @@ fn sort_key(var g: G, e: Node, p: Place, key_at: Int) -> CT:
   for i in 1..e.kids.len:
     if not e.kids[i].flag or (e.kids[i].name != "key" and e.kids[i].name != "reverse"):
       err(g, e.line, ".sort() takes key: fn(x) -> Int (or Float, Byte, Bool, Str) and reverse: true, both named")
-  write_check(g, p, e.line, false)
+  write_check(&g, p, e.line, false)
   let et = inner_of(p.ty)
   let fe = e.kids[key_at].kids[0]
   let root = root_name_node(e.kids[0].kids[0])
@@ -7414,7 +7458,7 @@ fn s_match(var g: G, n: Node) -> Bool:
     order_push(&g, hv)
     emit(&g, ct(g, t) + " *" + sp + " = &" + cname + ";")
   else:
-    if n.flag: write_check(g, r.p, n.line, false)
+    if n.flag: write_check(&g, r.p, n.line, false)
     emit(&g, ct(g, t) + " *" + sp + " = &" + r.p.code + ";")
   # An arm names a variant of the matched enum, so in another module's enum (geo__Shape) the arm
   # Circle means geo__Circle.
@@ -7753,6 +7797,24 @@ fn s_let(var g: G, n: Node) -> Bool:
   var c = CT("", "")
   if not n.flag and (e.k == "name" or e.k == "field" or e.k == "index"):
     let r = gen(&g, e, ty)
+    if r.p.ok and r.ty == "Str" and (ty == "" or ty == "Str") and str_copies(g, r.p):
+      # let x = a string kept elsewhere (a field, an element, a borrowed variable, or a local used
+      # again): x points to it instead of copying it. If what it points into is about to change (or
+      # be moved) while x is in scope, x takes its own copy just before (soft_copy); a hidden local
+      # holds that copy, and is dropped with the scope's other locals.
+      let ot = tmp(&g)
+      let ov = new_var(&g, "$" + ot, "Str", ot, "local", true, false, n.line)
+      declare(&g, ov)
+      emit(&g, "vu_str " + ot + " = {{0}};")
+      let vc = var_cname(&g, n.name)
+      let v = new_var(&g, n.name, "Str", vc, "view", false, true, n.line)
+      declare(&g, v)
+      emit(&g, "vu_str *" + vc + " = &" + r.p.code + ";")
+      let si = g.scopes.len - 1
+      g.scopes[si].softs.push(v)
+      g.scopes[si].soft_roots.push(soft_root(g, r.p.root))
+      g.scopes[si].soft_owns.push(ot)
+      return false
     if r.p.ok and not is_copy(g, r.ty) and r.ty != "Str" and (not r.p.is_name or g.vars[r.p.root].kind != "local" or g.vars[r.p.root].frozen.len > 0):
       # The value can't be moved (it's part of something, or borrowed), so `let` names it instead:
       # a read-only view. What it's part of is frozen for reading until the view's block ends.
@@ -7894,7 +7956,7 @@ fn s_assign(var g: G, n: Node) -> Bool:
     if computed_key(&g, target):
       err(g, n.line, "to change part of a map value, put the key in a variable first: let k = ...; m[k].x = ...")
     err(g, n.line, "can't assign to this (constants can't change)")
-  write_check(g, p, n.line, n.op == "=")
+  write_check(&g, p, n.line, n.op == "=")
   let ty = ct(g, p.ty)
   let tv = tmp(&g)
   let pp = tmp(&g)
@@ -7963,7 +8025,7 @@ fn map_insert(var g: G, n: Node, mt: Str) -> Bool:
   let target = n.kids[0]
   let mp = place(&g, target.kids[0])
   if not mp.ok: err(g, n.line, "can only insert into a map stored in a variable")
-  write_check(g, mp, n.line, false)
+  write_check(&g, mp, n.line, false)
   let c = stmt_value(&g, n.kids[1], map_val(mt))
   read_check(g, mp, n.line)
   pure_index(&g, target.kids[1])
@@ -8053,7 +8115,7 @@ fn if_chain(var g: G, n: Node, var ends: [Snap]):
     order_push(&g, hv)
     subj = cname
   else:
-    if n.flag: write_check(g, r.p, n.line, false)
+    if n.flag: write_check(&g, r.p, n.line, false)
     subj = tmp(&g)
     emit(&g, ct(g, t) + " " + subj + " = " + r.p.code + ";")
   let bt = inner_of(t)
@@ -9077,7 +9139,7 @@ fn s_each(var g: G, n: Node) -> Bool:
     order_push(&g, hv)
     lst = cname
   else:
-    if n.flag: write_check(g, r.p, n.line, false)
+    if n.flag: write_check(&g, r.p, n.line, false)
     lst = r.p.code + ""
     root = r.p.root
   let lp = tmp(&g)

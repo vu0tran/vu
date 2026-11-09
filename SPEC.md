@@ -140,7 +140,9 @@ template). Constants are evaluated in the order they use each other, across modu
   `let max = 10` are fine. Calling the shadowed function in that scope is an error that says
   so. Type and variant names stay reserved.
 - **Strings are copied unless moving is free.** Taking a `Str` from a field, a list element, a
-  parameter, a loop binding, or a frozen variable copies it (`let name = p.name`). A `Str` variable
+  parameter, a loop binding, or a frozen variable copies it (`let name = p.name`), as far as the
+  program can tell: `let` points at the text instead, and takes its own copy only if what it points
+  into is about to change or be moved (or a closure borrows it) while it's in scope. A `Str` variable
   given away (`xs.push(s)`, `m[k] = s`, a struct field, `let t = s`) is moved only when that's its
   last use in the block that declared it; anywhere else it's copied, so using it again is always
   fine. Other owned values (lists, structs, enums) are never copied implicitly.

@@ -13,7 +13,7 @@ trap 'rm -rf "$work"' EXIT
 "$top/vu" build --san "$top/mcp/fetch/main.vu" -o "$work/san" || exit 1
 py="${MCP_FETCH_PY:-$d/.mcp_ref_py/bin/python}"
 if [ ! -x "$py" ] || ! "$py" -c 'import mcp_server_fetch' 2>/dev/null; then
-  python3 -m venv "$d/.mcp_ref_py" >/dev/null 2>&1 && "$d/.mcp_ref_py/bin/pip" install -q mcp-server-fetch >/dev/null 2>&1
+  python3 -m venv "$d/.mcp_ref_py" >/dev/null 2>&1 && "$d/.mcp_ref_py/bin/pip" install -q "mcp-server-fetch==2026.10.28" >/dev/null 2>&1
 fi
 if [ -x "$py" ] && "$py" -c 'import mcp_server_fetch' 2>/dev/null; then
   mkdir "$work/src" && cp "$top"/mcp/fetch/*.vu "$d"/mcp_fetch/*_driver.vu "$work/src/" && rm "$work/src/main.vu"

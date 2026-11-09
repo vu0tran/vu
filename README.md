@@ -480,6 +480,20 @@ lower is better. (Earlier rounds measured on another VM, where every time was hi
 - On HTTP, a Vu server on one core handled 121k requests/s for a minimal reply and 25.5k for a
   5.8 KB JSON order parsed and answered, against 112k and 9.5k for a raw-TCP Go server (details and
   memory in CHANGELOG.md, round 7).
+- **`let` of a string doesn't copy it** (2026-11-08). `let name = p.name` (a field, an element, a
+  borrowed or still-used variable) used to copy the text; now the variable points at it, and the
+  compiler adds a copy only just before something that could change what it points into (a write
+  to `p`, `&p` given to a function, a move of `p`, a closure borrowing `name`), guarded so it happens
+  once. The program sees the same values either way. In vlint on AFFiNE (built-in rules, one
+  thread) the string copies made at run time went from 3.5 million to 1.6 million (107 MB to
+  86 MB); the time gained is small: on n8n, vlint with oxlint's default rules 2.13-2.16 s before,
+  2.03-2.07 s after (three runs each, 2 cores), vknip 7.5-7.7 s before, 7.3-7.8 s after (within
+  noise). The compiler's own C has 90 such views. Attack rounds: (1) writes, list growth, map
+  rehash, branches, loops, moves, `var` parameters, returns and stores of the view: nothing found;
+  (2) closures, `swap`, `for var`, early exits, generics, tasks: a closure that borrowed the view
+  kept a pointer into the field and saw its later value (fixed: a borrowing closure makes the view
+  take its copy first); (3) a key taken from the same map, self-assignment, `?`, own closures,
+  nested functions, `par for`, index loops: nothing found. Tests 756-758.
 - **Rebuilds.** On a generated 20,000-line program (`bench/rebuild`, 2 cores, median of 3), an
   edit and `vu run` takes 0.64 s against 0.70 s for `cargo run`, a first `vu run` 4.36 s against
   5.19 s, and `vu check` 0.33 s against 0.53 s for `cargo check`. Builds are compiled in parts, in
