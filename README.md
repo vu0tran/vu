@@ -512,7 +512,9 @@ not checked rather than guessing. Its parser handles the same 2.0 MB in 52 ms. D
 and how it's tested against tsc: `ts/README.md`.
 
 The same directory holds vlint, a linter that prints exactly what oxlint prints for its 96
-default rules (every warning matched on date-fns, zod, vscode, preact, excalidraw and more). It
+default rules (every warning matched on date-fns, zod, vscode, preact, excalidraw and more), and
+on n8n, vitest and tldraw with their own configurations (3688, 1377 and 82 diagnostics identical;
+`ts/README.md` has which rules it still lacks, such as the React Compiler's). It
 takes about as much CPU as oxlint (Rust), 13 times less than Biome and 130 times less than ESLint
 (measured on a loaded 2-core VM; `ts/README.md`). It's on npm as `@vu0tran/vlint`, laid out as
 oxlint is, with an `oxlint` command too (`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`).

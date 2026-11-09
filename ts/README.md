@@ -101,6 +101,39 @@ cd ts && VU_SPLIT=off ../vu build --release vlint.vu -o vlint   # one C file: th
 ./vlint [options] [paths]      # as oxlint; plus --jobs N, --cache, --cache-location PATH
 ```
 
+## Three repositories with their own configurations (2026-11-09)
+
+Run on each repository's own oxlint configuration, vlint's JSON output was compared with
+oxlint 1.90.0's, diagnostic by diagnostic (code, message, labels, help, severity), and both were
+timed on the same loaded 2-core VM (wall seconds, a few runs each):
+
+| repository | configuration | diagnostics | identical | vlint | oxlint |
+|---|---|---|---|---|---|
+| n8n (26,149 files) | defaults (`--disable-nested-config`: its `.mts` configs need a build) | 3688 | 3688 | 2.2-2.5 s | 2.7-2.8 s |
+| n8n `packages/frontend/editor-ui` (2555 files) | its config, 107 rules, the import plugin's graph rules on, local JS plugins left out | 1377 | 1377 | 1.05-1.1 s | 1.42-1.50 s |
+| vitest (1454 files) | its `.oxlintrc.jsonc`, 229 rules | 0 | 0 (and no unused-directive reports) | 0.29-0.31 s | 0.28-0.30 s |
+| tldraw (2854 files) | its config, 122 rules, type-aware (tsgolint), its JS plugin left out | 82 | 82 | 2.3-2.5 s | 2.2-2.3 s (tsgolint's time) |
+
+What it took: the rules these configurations turn on and vlint lacked (no-default-export,
+no-mutable-exports, method-signature-style, prefer-arrow-callback, prefer-template,
+prefer-regex-literals, no-unreachable-loop, no-template-curly-in-string, no-new-func, no-alert,
+no-proto, prefer-regexp-test, no-empty-interface, no-restricted-types,
+vue/no-required-prop-with-default; `rmore8.vu`), options (no-cond-assign "always", prefer-const
+ignoreReadBeforeAssign), and fixes found on the way (no-use-before-define, no-useless-spread,
+no-import-assign, constructor-super, no-invalid-fetch-options, no-useless-length-check, TS1038
+and TS2309). `.vue` files now have module records (one per script section, as oxlint's
+runtime has), so the import plugin's rules run in them. Each ported rule was checked against oxc's
+own test cases through both linters: over every rule, 32,359 of 43,915 cases give the same output
+(263 rules on all their cases); most of the rest are rules vlint doesn't have.
+
+Not the same yet: oxlint's React Compiler rules (`react/refs`, `set-state-in-effect`, and the
+rest of `oxc_react_compiler`, 62,657 lines of Rust) aren't in vlint, so a React project that
+keeps them on gets fewer diagnostics (AFFiNE: 211 of oxlint's, all from those rules; outline:
+170). vitest's config turns on rules vlint still lacks; vitest's code breaks none of them, so its
+output matches, but code that did would differ. Where the speed comes from on editor-ui: the
+import plugin's module graph (1.5 s of the 1.85 s before) now resolves in long-lived workers,
+reads only the top level of each file and stops at what node_modules re-exports.
+
 ## Drop-in status (checked against oxlint 1.90.0)
 
 **Command line** (every flag of `oxlint --help`, plus its hidden ones):
