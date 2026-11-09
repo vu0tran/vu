@@ -150,7 +150,7 @@ reads only the top level of each file and stops at what node_modules re-exports.
 | `--ignore-path`, `--ignore-pattern`, `--no-ignore` | yes |
 | `--threads`, `-h`, `-V`, `--debug files` | yes (`--debug timings` accepted, prints no table) |
 | `--fix` | yes (oxlint's safe fixes, for the rules vlint has) |
-| `--type-aware`, `--type-check`, `options.typeAware/typeCheck` | yes: runs tsgolint (`oxlint-tsgolint`) as oxlint does |
+| `--type-aware`, `--type-check`, `options.typeAware/typeCheck` | yes: runs tsgolint (`oxlint-tsgolint`) as oxlint does, with one deliberate difference: when tsgolint (7.0.2006 and earlier) panics in no-misused-promises on an object literal member with a computed name (`{ ["a"]: async () => {} }`), oxlint fails with `Error running tsgolint`; vlint runs tsgolint again with that rule left out for the files that have such a member, prints a warning naming them, and reports everything else (issue #3) |
 | `--report-unused-disable-directives[-severity]` | yes |
 | `--rules` | yes (the table, `-f json`) |
 | `--init` | yes |
