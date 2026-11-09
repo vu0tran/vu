@@ -176,7 +176,7 @@ how often the 248 configs of the 500 most-starred Go repositories on GitHub (sta
 |---|---:|---|
 | govet | 216 | 22 of the 33 default analyzers; `enable/disable/enable-all/disable-all` |
 | ineffassign | 210 | yes |
-| staticcheck | 206 | 43 checks; `checks` (globs, `-X`, golangci-lint's defaults) |
+| staticcheck | 206 | 68 checks, the IR-based SA4006/SA4009/SA4017/SA5011 among them; `checks` (globs, `-X`, golangci-lint's defaults) |
 | unused | 196 | yes |
 | errcheck | 168 | yes; `exclude-functions`, `disable-default-exclusions` |
 | misspell | 145 | yes (locale US/UK, ignore-rules, extra-words, mode) |
@@ -203,10 +203,19 @@ Enabled linters that vgolint doesn't implement are skipped with one stderr warni
 
 ## Parity
 
-- Default linters, 21 modules (blackfriday ... zap), `default: standard`, no limits: 1744 of
-  golangci-lint's 1754 findings, no extra findings except one ST1005 that golangci-lint hides
-  behind an SA4006 on the same line. The 10 missing are the SSA checks SA4006, SA4009, SA5011 and
-  SA4017.
+- Default linters (`default: standard`), no limits, against golangci-lint 2.5.0 (2026-11-09):
+  - golang.org/x/{tools (go, internal, refactor), net, text, crypto, mod, sync}: 3151 of the 3151
+    findings of the implemented checks, none extra. The one finding of an unported check is
+    SA4020's. These six modules ranked which staticcheck checks to port next: the 21-module corpus
+    below never triggered 17 of them.
+  - the 21-module corpus (blackfriday ... zap, plus `synth`): 1793 of 1796, none extra. The three
+    misses are synthetic cases of aliasing the IR resolves: `p := &x; *p`, `ok := p != nil; if ok`,
+    `q := p`.
+- staticcheck's IR checks (SA4006, SA4009, SA4017, SA5011) run on a model of its IR rather than
+  the IR (`ssa.vu`): which locals it lifts to registers (partly, before their address is taken),
+  liveness, the exit block reading named results, NoReturn and purity facts (the standard
+  library's dumped from staticcheck itself: `tools/dumpfacts`, `tools/gen_ssadata.py`), and for
+  SA5011 and `x = y` the IR's values: phis, sigmas at the post-dominance frontier, renaming.
 - The optional linters above, same 21 modules, all enabled with gocyclo at 10: 900 of 900
   findings, none extra (gocyclo 563, whitespace 204, nakedret 79, predeclared 41, misspell 9,
   dogsled 4; `tools/opt_a.yml`). A second config with every setting changed (`tools/opt_b.yml`:
@@ -231,20 +240,30 @@ Enabled linters that vgolint doesn't implement are skipped with one stderr warni
 
 ## Speed
 
-CPU seconds (user+sys, best of 3), default linters, no limits, on a loaded 2-core VM: vgolint
-without its cache vs golangci-lint with a warm cache.
+Wall clock, ms, default linters, no limits, 2-core VM, 2026-11-09 (`tools/bench2.sh`,
+`tools/bench_edit.sh`; best of 3, cold runs once). Over the 21 corpus modules and x/net, text,
+crypto and mod:
 
-| repo | vgolint | golangci-lint warm |
-|---|---:|---:|
-| dns | 0.58 | 1.05 |
-| otto | 0.66 | 1.13 |
-| zap | 0.43 | 1.10 |
-| testify | 0.48 | 1.05 |
-| gin | 0.56 | 1.19 |
+| | vgolint | golangci-lint | vgolint faster by |
+|---|---:|---:|---:|
+| both caches warm (nothing changed) | 9-54 | 292-1261 | 23x-43x (median 35x) |
+| cold (golangci-lint after `cache clean`; vgolint `--no-cache`) | 60-1259 | 2373-26762 | 18x-88x (median 39x) |
+| vgolint `--no-cache` against golangci-lint warm | 60-1259 | 292-1261 | 1.0x-5.7x (median 2.7x) |
 
-The drop-in front end (config, processing, printing) didn't change vgolint's CPU time against the
-previous version (0.58/0.70/0.45/0.46/0.51 s on the same repos, within noise;
-`tools/bench_oldnew.sh`). Earlier full-corpus numbers: `tools/bench_cpu.txt`.
+The edit loop: one file changed, then the module linted again, both caches otherwise warm:
+
+| module | file | vgolint | golangci-lint |
+|---|---|---:|---:|
+| dns | msg.go | 331 | 5358 |
+| gin | context.go | 217 | 2757 |
+| x/text | language/language.go | 1261 | 11690 |
+| x/text | unicode/norm/normalize.go | 1224 | 11265 |
+| x/net | http2/frame.go | 639 | 4767 |
+| x/net | html/parse.go | 652 | 1567 |
+
+vgolint's result cache is one entry per run, so an edit re-lints the whole module (the edit-loop
+times equal the `--no-cache` ones); golangci-lint's is per package. A per-package cache is the
+next speedup there.
 
 ## Tools
 
@@ -258,8 +277,8 @@ command line, both tools, stdout/stderr/exit code), `tools/freq_fetch.sh` + `too
 
 - Formatters (gofmt, goimports, gofumpt, gci, golines): need a go/printer port.
 - revive, gocritic, gosec, bodyclose, unparam and the rest of the long tail.
-- staticcheck's SSA checks (SA4006, SA4009, SA5011, SA4017 among the defaults) and govet's
-  lostcancel, ifaceassert, loopclosure (pre-1.22), directive, slog, unsafeptr, stdversion,
+- staticcheck: 92 of its checks (most never fire on the modules measured; SA4020 does once),
+  and the IR's alias resolution in SA4006/SA5011 above. govet's lostcancel, ifaceassert, loopclosure (pre-1.22), directive, slog, unsafeptr, stdversion,
   buildtag, cgocall, asmdecl, framepointer.
 - Suggested fixes (`--fix`, json's `SuggestedFixes`).
 - errcheck's `check-type-assertions` and `check-blank`; unused's settings; staticcheck's

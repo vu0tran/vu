@@ -525,10 +525,12 @@ oxlint is, with an `oxlint` command too (`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`
 the same `.golangci.yml/.yaml/.toml/.json` (v2 schema: linter sets and settings, exclusions and
 presets, `//nolint`, limits, severities, diffs against git), takes the same flags and prints the
 same nine output formats byte for byte, with the same exit codes. It implements the five default
-linters (1744 of golangci-lint's 1754 findings on 21 modules) and ten of the most enabled
-optional ones (misspell, unconvert, whitespace, nolintlint, copyloopvar, nakedret, asciicheck,
-dogsled, predeclared, gocyclo: 1860 of 1861 findings over three configs), using about half golangci-lint's CPU time
-against its warm cache (loaded 2-core VM). What it does and doesn't do yet: `golint/README.md`. It installs
+linters (68 of staticcheck's checks, the IR-based ones included: 1793 of golangci-lint's 1796
+findings on 21 modules, and 3151 of 3151 on six golang.org/x modules for the implemented checks,
+none extra) and ten of the most enabled optional ones (misspell, unconvert, whitespace,
+nolintlint, copyloopvar, nakedret, asciicheck, dogsled, predeclared, gocyclo: 1860 of 1861
+findings over three configs). It's 23-43x faster than golangci-lint with both caches warm,
+18-88x cold, and 2.4-16x in the edit loop (2-core VM, 2026-11-09). What it does and doesn't do yet: `golint/README.md`. It installs
 as golangci-lint does, from release archives through an `install.sh` with the same interface or a
 GitHub Action (`golint/README.md`, Install).
 
