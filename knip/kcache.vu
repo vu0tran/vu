@@ -2,6 +2,9 @@
 import dir
 import md5
 import resolve
+import json
+import pkg
+from json import Value
 
 const VERSION = "6.44.1"
 
@@ -89,3 +92,199 @@ fn cache_ctx(comp: Str, pre: Str, tags: [Str]) -> Str:
   for x in tags: s += "\t" + x
   return s
 
+
+# --cache for the JavaScript configs vknip loads with Node.js before it builds the workspaces (the
+# prefetch): their values, kept while everything they depended on is the same. The loader records
+# each module and file the configs loaded or read, each path they looked for and didn't find, each
+# folder they listed and each environment variable they read; the values are reused only when all of
+# those are as they were (and a config's arguments are the same). Values of environment variables are
+# kept as hashes. Not noticed: a different Node.js, a variable that's new and that a config only saw
+# by listing them all, and variables copied all at once ({...process.env}: only their names count).
+const CFG_FORMAT = "vknip-configs-1"
+
+fn cfg_file(loc: Str, production: Bool) -> Str:
+  var dirp = loc + ""
+  while dirp.len > 1 and dirp.endswith("/"): dirp = dirp[0..dirp.len - 1]
+  var name = "vknip-configs-"
+  if production: name += "prod-"
+  return dirp + "/" + name + VERSION + ".json"
+
+fn cfg_read(fs: Fs, file: Str) -> Value:
+  let text = fs.read(file) else ""
+  if text == "": return json.Null
+  let v = json.parse(text) else json.Null
+  if pkg.str_of(pkg.get(v, "format")) != CFG_FORMAT: return json.Null
+  return v
+
+# a file's stamp as the cache keeps it: "size mtime", "dir" for a folder ("dir mtime" for one a config
+# listed), or "" when it isn't there; an absolute path is looked up from the root folder
+fn stamp(d: dir.Dir, top: dir.Dir, rel: Str, listed: Bool) -> Str:
+  var i = dir.Info("", 0, 0, 0.0, 0.0, 0.0, 0.0)
+  if rel.startswith("/"): i = dir.info(top, rel[1..rel.len]) else return ""
+  else: i = dir.info(d, rel) else return ""
+  if i.kind == "dir":
+    if listed: return "dir {i.modified}"
+    return "dir"
+  if i.kind != "file": return ""
+  return "{i.size} {i.modified}"
+
+# whether everything the cached configs depended on is as it was
+fn cfg_fresh(fs: Fs, os: Os, v: Value, here: Str) -> Bool:
+  var why = cfg_stale(fs, os, v)
+  if why == "" and pkg.str_of(pkg.get(v, "where")) != here: why = "they were cached for another folder"
+  if why != "" and os.env("VKNIP_PHASES") != "" and not is_null(v): eprint("vknip: configs loaded again: " + why)
+  return why == ""
+
+# what changed since the configs were cached ("" nothing)
+fn cfg_stale(fs: Fs, os: Os, v: Value) -> Str:
+  if is_null(v): return "no cache"
+  let d = dir.open(fs, ".") else return "the working folder"
+  let top = dir.open(fs, "/") else return "the root folder"
+  let st = pkg.get(v, "stamps")
+  for k in pkg.keys(st):
+    let was = pkg.str_of(pkg.get(st, k))
+    if stamp(d, top, k, was.startswith("dir ")) != was: return k + " changed"
+  for k in pkg.strs(pkg.get(v, "missing")):
+    if stamp(d, top, k, false) != "": return k + " is there now"
+  let env = pkg.get(v, "env")
+  for k in pkg.keys(env):
+    if env_hash(os.env(k)) != pkg.str_of(pkg.get(env, k)): return "the environment variable " + k + " changed"
+  for k in pkg.strs(pkg.get(v, "names")):
+    if os.env(k) == "": return "the environment variable " + k + " isn't set now"
+  return ""
+
+fn env_hash(v: Str) -> Str:
+  if v == "": return ""
+  return md5.hex("vknip-env\0" + v)
+
+fn is_null(v: Value) -> Bool:
+  match v:
+    Null: return true
+    _: return false
+
+# The record of what the configs depended on (the union of each node process's): Null when it can't be
+# kept (a config listed the whole environment, or read something outside the working folder).
+fn cfg_deps(fs: Fs, root: Str, deps: [Value], say_why: Bool) -> Value:
+  let d = dir.open(fs, ".") else return json.Null
+  let top = dir.open(fs, "/") else return json.Null
+  var stamps: {Str: Value} = {}
+  var missing: {Str: Bool} = {}
+  var env: {Str: Value} = {}
+  var names: {Str: Bool} = {}
+  # (and the lockfiles and package managers' install records: an install loads the configs again)
+  for lf in ["pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb", "node_modules/.modules.yaml", "node_modules/.package-lock.json", "node_modules/.yarn-state.yml"]:
+    var rel = lf + ""
+    if root != "" and root != "." and root != "./": rel = root + lf
+    if root != "" and root != "." and root != "./" and not root.endswith("/"): rel = root + "/" + lf
+    let s0 = stamp(d, top, rel, false)
+    if s0 == "": missing[rel] = true
+    else: stamps[rel] = json.Text(s0)
+  for dv in deps:
+    if is_null(dv): return no_keep(say_why, "a node process didn't say what it loaded")
+    if json.stringify(pkg.get(dv, "allEnv")) == "true": return no_keep(say_why, "a config listed the whole environment, or a module wasn't found where it can be told")
+    # (folders listed first: their stamp has the time they last changed)
+    var fl = pkg.strs(pkg.get(dv, "dirs"))
+    let nd = fl.len
+    for x in pkg.strs(pkg.get(dv, "files")): fl.push(x)
+    for x in pkg.strs(pkg.get(dv, "missing")): fl.push(x)
+    for fi in 0..fl.len:
+      let f = fl[fi]
+      if f in stamps or f in missing: continue
+      let s = stamp(d, top, f, fi < nd)
+      if s == "": missing[f] = true
+      else: stamps[f] = json.Text(s)
+    let ev = pkg.get(dv, "env")
+    # (the loader sends a hash of each value, never the value: environment variables hold secrets)
+    for k in pkg.keys(ev): env[k] = json.Text(pkg.str_of(pkg.get(ev, k)))
+    for k in pkg.strs(pkg.get(dv, "names")): names[k] = true
+  var ms: [Value] = []
+  var mk: [Str] = []
+  for k, _ in missing: mk.push(k + "")
+  mk.sort()
+  for k in mk: ms.push(json.Text(k))
+  var o: {Str: Value} = {}
+  o["stamps"] = json.Obj(stamps)
+  o["missing"] = json.Arr(ms)
+  # (variables a config only saw in the list of them all: still set)
+  var nl: [Str] = []
+  for k, _ in names:
+    if not (k in env): nl.push(k + "")
+  o["env"] = json.Obj(env)
+  nl.sort()
+  var nv: [Value] = []
+  for k in nl: nv.push(json.Text(k))
+  o["names"] = json.Arr(nv)
+  return json.Obj(o)
+
+# (why the configs' values aren't kept: printed with VKNIP_PHASES)
+fn no_keep(say_why: Bool, why: Str) -> Value:
+  if say_why: eprint("vknip: configs not cached: " + why)
+  return json.Null
+
+# the record of what the configs depended on, from an earlier run (still fresh) and this run's
+fn cfg_merge(old: Value, new: Value) -> Value:
+  var o: {Str: Value} = {}
+  var st: {Str: Value} = {}
+  for k in pkg.keys(pkg.get(old, "stamps")): st[k] = json.copy(pkg.get(pkg.get(old, "stamps"), k))
+  for k in pkg.keys(pkg.get(new, "stamps")): st[k] = json.copy(pkg.get(pkg.get(new, "stamps"), k))
+  var ms: {Str: Bool} = {}
+  for k in pkg.strs(pkg.get(old, "missing")): ms[k] = true
+  for k in pkg.strs(pkg.get(new, "missing")): ms[k] = true
+  var mk: [Str] = []
+  for k, _ in ms:
+    if not (k in st): mk.push(k + "")
+  mk.sort()
+  var mv: [Value] = []
+  for k in mk: mv.push(json.Text(k))
+  var env: {Str: Value} = {}
+  for k in pkg.keys(pkg.get(old, "env")): env[k] = json.copy(pkg.get(pkg.get(old, "env"), k))
+  for k in pkg.keys(pkg.get(new, "env")): env[k] = json.copy(pkg.get(pkg.get(new, "env"), k))
+  var nm: {Str: Bool} = {}
+  for k in pkg.strs(pkg.get(old, "names")): nm[k] = true
+  for k in pkg.strs(pkg.get(new, "names")): nm[k] = true
+  var nk: [Str] = []
+  for k, _ in nm:
+    if not (k in env): nk.push(k + "")
+  nk.sort()
+  var nv: [Value] = []
+  for k in nk: nv.push(json.Text(k))
+  o["stamps"] = json.Obj(st)
+  o["missing"] = json.Arr(mv)
+  o["env"] = json.Obj(env)
+  o["names"] = json.Arr(nv)
+  return json.Obj(o)
+
+fn cfg_write(fs: Fs, file: Str, here: Str, deps: Value, results: Value):
+  if is_null(deps): return
+  var o: {Str: Value} = {}
+  o["format"] = json.Text(CFG_FORMAT)
+  o["where"] = json.Text(here + "")
+  o["stamps"] = pkg.get(deps, "stamps")
+  o["missing"] = pkg.get(deps, "missing")
+  o["env"] = pkg.get(deps, "env")
+  o["names"] = pkg.get(deps, "names")
+  o["results"] = json.copy(results)
+  if not mkdir_p(fs, resolve.dirname(file)): return
+  fs.write(file, json.stringify(json.Obj(o))) else return
+
+# makes a folder and the ones it's in (true when it's there)
+fn mkdir_p(fs: Fs, d: Str) -> Bool:
+  if d == "" or d == "." or d == "/" or fs.exists(d): return true
+  if not mkdir_p(fs, resolve.dirname(d)): return false
+  fs.mkdir(d) else return fs.exists(d)
+  return true
+
+# What the node processes of this run recorded (the files PREFIX.<pid>, removed once read).
+fn cfg_records(fs: Fs, prefix: Str) -> [Value]:
+  var out: [Value] = []
+  let dp = resolve.dirname(prefix)
+  let base = prefix[dp.len + 1..prefix.len] + "."
+  let d = dir.open(fs, dp) else return out
+  let ents = dir.list(d, ".") else return out
+  for e in ents:
+    if not e.name.startswith(base): continue
+    let text = dir.read(d, e.name) else ""
+    let v = json.parse(text) else json.Null
+    out.push(v)
+    dir.remove(d, e.name) else 0
+  return out

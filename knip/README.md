@@ -159,7 +159,7 @@ error messages and the help text). What they do:
 | `--preprocessor`, `--preprocessor-options` | as knip (modules run in node, their output passed on) |
 | `--fix`, `--fix-type`, `--allow-remove-files`, `--format` | as knip for exports, types, default exports, enum and namespace members, dependencies (package.json rewritten in its own indentation), catalog entries and files; `--format` runs the formatter knip's formatly would pick |
 | `--watch` | as knip: inotify on the project's folders, each change reanalyzed, the watch reporter's screen redrawn (see Gaps for how it differs inside) |
-| `--cache`, `--cache-location` | as knip's FileEntryCache (a file's analysis reused while its size and mtime stay the same) |
+| `--cache`, `--cache-location` | as knip's FileEntryCache (a file's analysis reused while its size and mtime stay the same); vknip also keeps the JavaScript configs' values (below) |
 | `--trace`, `--trace-export`, `--trace-file`, `--trace-dependency` | knip's trees (buildExportsTree, formatTrace), and for a name a file has only through `export *` its origins as knip's resolveExportOrigins finds them (`[ambiguous]` when several, the origin's tree when one) |
 | `--performance`, `--performance-fn`, `--memory`, `--memory-realtime`, `--duration` | knip's tables and formats, vknip's work timed under knip's function names |
 | `--no-progress` | as knip (it, `--debug` and CI turn off the terminal's progress and redraws) |
@@ -549,6 +549,44 @@ The corpus didn't get slower: best of 5 against 6d92970, the 23 projects' CPU 3.
 What's left on n8n (7.1 s): node loading the configs (2.5 s of wall, shared with the reading
 threads), the workspaces' entries and plugins on one core (1.8 s), and linking (resolution, 2 s),
 which stays on one core because the resolver's caches and tsconfig state are one value.
+
+**Configs with `--cache`** (issue #4: on a large private workspace, loading configs and finishing
+the graph were most of a 7 s run). vknip `--cache` also keeps the values of the JavaScript configs
+it loaded with Node.js, and uses them while nothing they depended on changed: the loader records
+every module and file a config loaded or read, each path it looked for and didn't find (a module
+not built yet, an optional dependency), each folder it listed and each environment variable it
+read (kept as a hash), and the lockfiles are always included. On n8n (2 cores, the issue's command
+line: `--include dependencies,unlisted,binaries,unresolved`), with Node.js not started at all when
+nothing changed:
+
+| run | wall |
+|---|---|
+| no `--cache` | 7.37-7.88 s (3 runs) |
+| `--cache`, before this | 7.26-7.90 s (2 runs after the one that filled it: only the files' analyses were kept, and parsing wasn't the slow part) |
+| `--cache`, now | 5.17-5.26 s (3 runs; the run that fills it: 9.65 s) |
+
+stdout and stderr are byte for byte those of a run without `--cache`. `test/cmp_cfg_cache.sh`
+changes a project step by step (a file a config imports, the config, an environment variable it
+reads and one it doesn't, a module it looked for appearing and going, a lockfile, a copy of the
+project with a file changed but not its size or time, sharing the cache) and checks that the output
+is always that of a run without the cache and that the configs are loaded again exactly when they
+should be: 15/15 (the copy fails without the cache's record of the folder it was made in). Tried on n8n too: editing a vite plugin file, `NODE_ENV`, the
+lockfile, building a missing `dist` file and adding a config each reloaded and matched an uncached
+run; `OLDPWD` and new variables didn't. Two things the first version got wrong and that n8n showed:
+`stat` on a folder (path resolution does it to every parent) was taken as listing it, so any file
+created in `/tmp` reloaded the configs; and `Object.keys(process.env)` (the `debug` package, in vite
+and playwright) and playwright's `{ ...process.env }` counted every variable's value, so `cd`
+(`OLDPWD`) reloaded them; a list of the variables now counts only their names, and a copy of them
+all, read in the order they were listed, the same. Not noticed: a different Node.js, a variable that's
+new and that a config only finds by listing them all.
+
+Also: the resolver kept each package's whole `package.json` and copied it for every lookup; it keeps
+only `"exports"` now (n8n, cached: 5.15-5.22 s -> 4.91-5.09 s in one set of runs, close to the
+machine's noise). What's left on n8n with `--cache`
+(5.0 s): the main thread is the whole run, linking (resolution, about 1.8 s) and the workspaces'
+globs and plugins (1.5 s). The first run after the files left the page cache took 119 s, all of it
+reading them (setup and plugin detection, which don't start Node.js, took 50-200 times as long):
+that's the disk, not vknip.
 
 ## Gaps
 

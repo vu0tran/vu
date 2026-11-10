@@ -26,6 +26,7 @@ import varlock
 import autoimp
 import marko
 import kcache
+import md5
 import perf
 import term
 import stdio
@@ -225,6 +226,11 @@ type Proj:
   froot: [Int]               # (the files of the project's folder)
   erx: [re.Regex]            # the plugins' enabler regexes
   erx_ix: {Str: Int}
+  cfg_cache: Str = ""          # --cache: the file keeping the JavaScript configs' values ("" off)
+  cfg_prev: Value = json.Null  # what it held
+  cfg_fresh: Bool = false      # (and everything they depended on is the same)
+  cfg_new: {Str: Value} = {}   # configs loaded this run: mode:file -> {"args", "value"}
+  cfg_track: Str = ""          # where the node processes write what they loaded (PREFIX.<pid>)
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -2868,7 +2874,7 @@ fn quiet_load(var p: Proj, fs: Fs, os: Os, mode: Str, f: Str) -> Value:
   let ck = mode + ":" + fspath(p, f)
   if not (ck in p.js):
     var reqs: [loader.Req] = [loader.Req(fspath(p, f), mode, load_args(p))]
-    let res = loader.load_all(p.node, reqs, fspath(p, ""))
+    let res = node_cfg(&p, reqs)
     let fk = fspath(p, f)
     p.js[ck] = json.copy(res[fk])
   relay_output(&p, ck)
@@ -3091,7 +3097,7 @@ fn load_cfg(var p: Proj, fs: Fs, os: Os, key: Str, f: Str) -> Value:
   let ck = load_mode(key) + ":" + fspath(p, f)
   if not (ck in p.js):
     var reqs: [loader.Req] = [loader.Req(fspath(p, f), load_mode(key), load_args(p))]
-    let res = loader.load_all(p.node, reqs, fspath(p, ""))
+    let res = node_cfg(&p, reqs)
     let fk = fspath(p, f)
     p.js[ck] = json.copy(res[fk])
   relay_output(&p, ck)
@@ -3111,7 +3117,7 @@ fn cfg_yaml(var p: Proj, fs: Fs, os: Os, f: Str, text: Str) -> Value:
   let yk = "yaml:" + fspath(p, f)
   if not (yk in p.js):
     var yreqs: [loader.Req] = [loader.Req(fspath(p, f), "yaml", json.Null)]
-    let yres = loader.load_all(p.node, yreqs, fspath(p, ""))
+    let yres = node_cfg(&p, yreqs)
     let yfk = fspath(p, f)
     p.js[yk] = json.copy(yres[yfk])
   let yr = json.copy(p.js[yk])
@@ -3144,6 +3150,11 @@ fn prefetch(var p: Proj, fs: Fs, os: Os):
         reqs.push(loader.Req(fspath(p, f), load_mode(key), load_args(p)))
   p.cur = saved
   if reqs.len == 0: return
+  # (--cache: the ones an earlier run kept are taken from it)
+  var left = 0
+  for r in reqs:
+    if not cfg_kept(&p, r): left += 1
+  if left == 0: return
   # (a request per mode, a mode with many files in up to one part per process, the largest first;
   # the node processes load them at the same time)
   let workers = p.node_workers
@@ -3151,7 +3162,7 @@ fn prefetch(var p: Proj, fs: Fs, os: Os):
   for mode in ["plain", "vite", "nuxt", "nitro", "next", "webpack", "vue", "expo", "karma", "react-router", "rsbuild", "docusaurus", "electron-forge", "electron-vite", "call0", "gatsby", "eleventy", "storybook", "rstest", "lint-staged", "babel"]:
     var rs: [loader.Req] = []
     for r in reqs:
-      if r.mode == mode: rs.push(loader.Req(r.file + "", r.mode + "", json.copy(r.args)))
+      if r.mode == mode and not cfg_kept(&p, r): rs.push(loader.Req(r.file + "", r.mode + "", json.copy(r.args)))
     if rs.len == 0: continue
     var parts = rs.len / 2
     if parts > workers: parts = workers
@@ -3185,7 +3196,69 @@ fn prefetch(var p: Proj, fs: Fs, os: Os):
     sorted.push(g)
   let res = loader.load_par(p.node_par, sorted, fspath(p, ""), workers)
   for gi in 0..sorted.len:
-    for r in sorted[gi]: p.js[r.mode + ":" + r.file] = json.copy(res[gi][r.file])
+    for r in sorted[gi]:
+      p.js[r.mode + ":" + r.file] = json.copy(res[gi][r.file])
+      cfg_keep(&p, r)
+
+# --cache: when the earlier run's value of a config can be used, it goes into p.js (true)
+fn cfg_kept(var p: Proj, r: loader.Req) -> Bool:
+  if not p.cfg_fresh: return false
+  let ck = r.mode + ":" + r.file
+  if ck in p.js: return true
+  let e = pkg.get(pkg.get(p.cfg_prev, "results"), ck)
+  if not json.has(e, "value") or pkg.str_of(pkg.get(e, "args")) != json.stringify(r.args): return false
+  p.js[ck] = json.copy(pkg.get(e, "value"))
+  return true
+
+# --cache: a config loaded this run, to be kept (from p.js)
+fn cfg_keep(var p: Proj, r: loader.Req):
+  if p.cfg_cache == "": return
+  let ck = r.mode + ":" + r.file
+  if not (ck in p.js): return
+  var o: {Str: Value} = {}
+  o["args"] = json.Text(json.stringify(r.args))
+  o["value"] = json.copy(p.js[ck])
+  p.cfg_new[ck] = json.Obj(o)
+
+# --cache: the configs' values and what they depended on, for the next run (kept from the earlier run
+# too while that's fresh); written only when configs were loaded this run
+fn cfg_save(var p: Proj, fs: Fs, os: Os):
+  if p.cfg_cache == "" or p.cfg_track == "": return
+  let recs = kcache.cfg_records(fs, p.cfg_track)
+  if p.cfg_new.len == 0: return
+  if recs.len == 0:
+    if os.env("VKNIP_PHASES") != "": eprint("vknip: configs not cached: no node process said what it loaded")
+    return
+  var deps = kcache.cfg_deps(fs, fspath(p, ""), recs, os.env("VKNIP_PHASES") != "")
+  if kcache.is_null(deps): return
+  var results: {Str: Value} = {}
+  if p.cfg_fresh:
+    deps = kcache.cfg_merge(p.cfg_prev, deps)
+    let old = pkg.get(p.cfg_prev, "results")
+    for k in pkg.keys(old): results[k] = json.copy(pkg.get(old, k))
+  for k, v in p.cfg_new: results[k] = json.copy(v)
+  kcache.cfg_write(fs, p.cfg_cache, p.realp("."), deps, json.Obj(results))
+
+# loads configs through node (or, with --cache, from an earlier run): each file's {"ok"} or {"error"}
+fn node_cfg(var p: Proj, reqs: [loader.Req]) -> {Str: Value}:
+  var res: {Str: Value} = {}
+  var need: [loader.Req] = []
+  for r in reqs:
+    let ck = r.mode + ":" + r.file
+    if cfg_kept(&p, r): res[r.file] = json.copy(p.js[ck])
+    else: need.push(loader.Req(r.file + "", r.mode + "", json.copy(r.args)))
+  if need.len == 0: return res
+  let got = loader.load_all(p.node, need, fspath(p, ""))
+  for r in need:
+    let fk = r.file + ""
+    let v = json.copy(got[fk])
+    res[r.file] = json.copy(v)
+    if p.cfg_cache != "":
+      var o: {Str: Value} = {}
+      o["args"] = json.Text(json.stringify(r.args))
+      o["value"] = json.copy(v)
+      p.cfg_new[r.mode + ":" + r.file] = json.Obj(o)
+  return res
 
 # knip's runPlugin: config files (found by the plugin's patterns, or named on a command line), the
 # plugin's entry patterns when it can't read a config or found none, what it reads from each config.
@@ -6950,7 +7023,7 @@ fn load_config_file(var p: Proj, fs: Fs, os: Os, f: Str, call_args: Value) -> Va
     let text = fs.read(path) else return json.Null
     return yaml.parse(text)
   var reqs: [loader.Req] = [loader.Req(path, "call", json.Arr([json.copy(call_args)]))]
-  let res = loader.load_all(p.node, reqs, fspath(p, ""))
+  let res = node_cfg(&p, reqs)
   let r = pkg.get(res[path], "ok")
   if json.has(res[path], "error"):
     p.config_errors = true
@@ -9182,8 +9255,23 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   p.rs.lister = own fn(d: Str) => term.list(ffi, d)?
   p.rs.kind = own fn(x: Str) => term.kind(ffi, x)
   p.realp = own fn(x: Str) => term.realpath(ffi, x)
-  p.node = own fn(x: Str) => term.node(ffi, loader.LOADER_JS, x)
-  p.node_par = own fn(x: Str, n: Int) => term.node_par(ffi, loader.LOADER_JS, x, n)
+  # --cache: the configs' values from an earlier run, reused while everything they depended on is the
+  # same (kcache.vu); the node processes then record what they load
+  var ljs = loader.LOADER_JS + ""
+  if opts.flag(a, "cache") and not opts.flag(a, "watch"):
+    var cloc = opts.str_opt(a, "cache-location")
+    if cloc == "": cloc = root + "node_modules/.cache/knip"
+    p.cfg_cache = kcache.cfg_file(cloc, opts.flag(a, "production"))
+    p.cfg_prev = kcache.cfg_read(fs, p.cfg_cache)
+    p.cfg_fresh = kcache.cfg_fresh(fs, os, p.cfg_prev, p.realp("."))
+    if kcache.mkdir_p(fs, resolve.dirname(p.cfg_cache)):
+      p.cfg_track = resolve.dirname(p.cfg_cache) + "/vknip-deps-" + md5.hex("{os.clock()}\0" + root + "\0" + p.cfg_cache)
+      ljs = loader.tracking_js(p.cfg_track)
+    else: p.cfg_cache = ""
+    ph(os, "config_cache")
+  let ljs2 = ljs + ""
+  p.node = own fn(x: Str) => term.node(ffi, ljs, x)
+  p.node_par = own fn(x: Str, n: Int) => term.node_par(ffi, ljs2, x, n)
   # --jobs: the threads that read files (all the cores by default), and the node processes that load
   # configs (at most 4)
   var jobs = 0
@@ -9315,11 +9403,11 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   # (workspaces with JavaScript configs, likely: node processes start now, one per two configs (up to
   # the workers, 2 at most), and get ready while vknip reads the project; one that isn't needed is
   # stopped at the end)
-  if not opts.flag(a, "watch") or os.env("VKNIP_WATCH_RUN") != "":
+  if (not opts.flag(a, "watch") or os.env("VKNIP_WATCH_RUN") != "") and not p.cfg_fresh:
     var warm = (likely_js_configs(p, fs) + 1) / 2
     if warm > p.node_workers: warm = p.node_workers
     if warm > 2: warm = 2
-    if warm > 0: term.node_warm(ffi, loader.LOADER_JS, loader.warm_request(fspath(p, "")), warm)
+    if warm > 0: term.node_warm(ffi, ljs, loader.warm_request(fspath(p, "")), warm)
   for wi in 0..p.ws.len:
     let wc = ws_config(p, p.ws[wi].name)
     let wii = pkg.get(wc, "ignoreIssues")
@@ -9520,6 +9608,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
           perf.add(&p.pf, "walkAST", (tm[tm.len - 2] - tm[tm.len - 3]) * 1000.0)
     for k in 0..wave.len: link_one(&p, fs, &b, wave[k], &raws[k])
   kcache.save_cache(fs, &cache)
+  cfg_save(&p, fs, os)
   ph(os, "link")
   pe(&p, "walkAndAnalyze", t_walk_an)
   perf.mark(&p.pf, fs, "build")
