@@ -57,6 +57,24 @@ is a read-only view (the list can't change while it lives, as with `let` of a fi
 `for x in xs[2..n]` loops over the range. `var v = xs[1..4]` makes a copy that's yours to change.
 
 Structs are built with positional or named arguments: `Body(1, 2)` or `Body(x: 1, y: 2)`.
+A field can have a default, used when a construction leaves it out:
+
+```
+type Opts:
+  name: Str
+  limit: Int = 10
+  tags: [Str] = []
+  inner: Inner = Inner()
+
+let a = Opts(name: "a")          # limit 10, tags [] (each construction gets its own list)
+let b = Opts("b", 20)            # positional: fields with defaults can be left off the end
+```
+
+A default is a constant: a literal, a const, `[]`, `{}`, `nil`, a list or map of those, or a struct
+or variant built from them (arguments are evaluated in the order written, then the defaults).
+Defaults that build each other without end (`A`'s default builds a `B` whose default builds an `A`)
+are an error; make one of them `nil`. Generic types' fields can't have defaults yet, and
+`from_json` still needs every field that isn't optional.
 `s.reserve(n)` and `xs.reserve(n)` make room for `n` more bytes or elements up front, so a
 string or list built in a loop of known length grows without reallocating (a negative `n`
 stops the program).
@@ -1068,6 +1086,8 @@ vu check file.vu            # errors only: no binary, no C compiler (millisecond
 vu check --checks file.vu   # also: the index and overflow checks each loop still makes on every pass
 vu check --index file.vu    # also: what the language server knows (items, fields, variables' types), as JSON lines
 vu check --caps file.vu     # what the program can reach: the capabilities main asks for (fs, os, net, ffi)
+vu check --dups file.vu     # functions defined under the same name in more than one module
+vu def NAME file.vu         # where NAME is defined (file:line: its first line), in every module loaded
 vu run file.vu [args]       # quick -O0 build, then run with args
 vu run --release file.vu    # optimized build, then run (options go before the file;
                             #   everything after it goes to the program)

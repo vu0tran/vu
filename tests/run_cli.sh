@@ -150,5 +150,20 @@ echo "$out" | grep -q "uses nothing outside itself"; check "check --caps: a prog
 out=$($VU check --caps "$work/bad.vu" 2>&1); rc=$?
 [ $rc -eq 1 ]; check "check --caps: a program with errors reports them (exit 1)" $? "rc=$rc [$out]"
 
+# vu def NAME FILE: where a name is defined in the program's modules; vu check --dups: names defined in several
+mkdir -p "$work/defs"
+printf 'import helpers\n\nconst LIMIT = 3\n\ntype Box:\n  n: Int = 1\n\nfn pick(x: Int) -> Int:\n  return x\n\nfn main():\n  print("{pick(helpers.pick(LIMIT))}")\n' > "$work/defs/main.vu"
+printf 'fn pick(x: Int) -> Int:\n  return x + 1\n\nfn only_here() -> Int:\n  return 2\n' > "$work/defs/helpers.vu"
+: > "$work/cc.log"; out=$($VU def pick "$work/defs/main.vu" 2>&1); rc=$?
+want="$work/defs/main.vu:8: fn pick(x: Int) -> Int:
+$work/defs/helpers.vu:1: fn pick(x: Int) -> Int:"
+[ $rc -eq 0 ] && [ "$(echo "$out" | sort)" = "$(echo "$want" | sort)" ] && [ ! -s "$work/cc.log" ]; check "def: every module's definition, with its line" $? "rc=$rc out=[$out]"
+out=$($VU def Box "$work/defs/main.vu" 2>&1)
+[ "$out" = "$work/defs/main.vu:5: type Box:" ]; check "def: a type" $? "[$out]"
+out=$($VU def missing "$work/defs/main.vu" 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$out" | grep -q "no function, type, const or method named missing"; check "def: an unknown name exits 1" $? "rc=$rc [$out]"
+out=$($VU check --dups "$work/defs/main.vu" 2>/dev/null); rc=$?
+[ $rc -eq 0 ] && echo "$out" | grep -q "^pick: " && ! echo "$out" | grep -q "only_here"; check "check --dups: lists names defined in more than one module" $? "rc=$rc [$out]"
+
 echo "$pass passed, $fail failed"
 [ $fail -eq 0 ]

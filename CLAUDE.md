@@ -121,6 +121,15 @@ is in `SPEC.md`; `README.md` introduces it, and history and measurements are in 
   suppressions path makes TSan exit with 66 before running anything) must count as a failure,
   never as "no reports": check the exit code and the output, not just the absence of warnings.
 
+## The tools written in Vu
+
+`ts/` (vtsc, vlint, vknip) and `golint/` (vgolint) each have a `NOTES.md`: where every rule and
+helper lives, how their pipelines fit together, and the parity loop against the tool they
+replace. Read it before exploring the sources. For vlint, `ts/oxprobe.sh` runs oxlint and vlint
+on probe folders and prints only the differences (`./oxprobe.sh --saved probes/*` checks the
+saved ones). To find a definition: `./vu def NAME FILE.vu` (every module the program loads);
+`./vu check --dups FILE.vu` lists functions defined under the same name in several modules.
+
 ## Docs
 
 After a feature: `SPEC.md` (the language, short, examples first) and `CHANGELOG.md` (what

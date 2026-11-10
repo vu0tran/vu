@@ -2959,3 +2959,44 @@ about, and a request forged to the cloud's metadata address.
 Not done this round: a `Secret` type that can't be printed or logged (secrets in logs are the next
 most common leak). Not measured: whether models write Vu backends with fewer holes than in other
 languages; that needs the attack lab described in the plan.
+
+## Round 34: field defaults, and finding things without reading them
+
+What prompted it: while bringing vlint to parity on seven more large repositories, most of the work
+went into finding things in the tools' own sources (rules.vu alone is 9,400 lines; `key_name` is
+defined in three modules) and into editing long positional constructors to add one field.
+
+- **Field defaults.** `limit: Int = 10` in a struct; a named construction can leave the field out,
+  and a positional one can leave off fields with defaults at the end, so a field added at the end
+  needs no change where the struct is built. A default is a constant (literals, consts, `[]`, `{}`,
+  `nil`, lists and maps of those, structs and variants built from them), type-checked where it's
+  declared, and each construction evaluates its own copy (a fresh list each time). The compiler's own
+  `G` went from 104 positional arguments to 5 named ones, vlint's `L` from 55 to 16 and `Scopes`
+  from 39 to none; the C the compiler makes of itself is the same size, and vlint's and vtsc's
+  outputs on their regression corpora are unchanged.
+- **`vu def NAME FILE.vu`** prints each definition of NAME in the program's modules with its file,
+  line and first line; **`vu check --dups FILE.vu`** lists the functions defined under one name in
+  several modules (vlint: 122, vgolint: 39; many are deliberate, so it's a report, not a warning).
+- **Errors that name the idiom**: `.slice`, `.substring`, `.contains`, `.length`, `.trim`, `.indexOf`
+  and others on strings, lists and maps say what to write in Vu. Each suggestion was checked by
+  compiling and running it.
+- `ts/NOTES.md` and `golint/NOTES.md`: where each rule and helper lives, how the pipelines fit, and
+  each tool's parity loop; `ts/oxprobe.sh` runs oxlint and vlint on probe folders and prints only the
+  differences (`ts/probes/` keeps eight with oxlint's saved output).
+
+Attack rounds on field defaults:
+1. Every kind of default, named and positional constructions, loops, mutation of one construction's
+   list (ASan/UBSan clean, same output), and the errors (a call as a default, a wrong type, a gap in a
+   positional construction, a generic type). Found: a default of the wrong type that no construction
+   used wasn't reported (now type-checked at the declaration); and the "only fields with defaults at
+   the end" hint was shown for too many arguments too.
+2. Recursive defaults, hoisted named arguments with side effects mixed with defaults, closures,
+   tasks, moving a defaulted list out, 1,000 constructions. Found: defaults that build each other
+   (`A` builds `B` builds `A`, or `A` builds `A`) overflowed the compiler's stack; now an error naming
+   the field and the cycle.
+3. Copy-type structs, `to_json`/`from_json`, `vu fmt`, a module's default using its own const from
+   a module with a const of the same name. Found nothing. (Converting vlint's `Scopes`, my conversion
+   script missed a field whose type has a space, and the error didn't say which field lacked a
+   default; it lists them now.)
+
+Not done: defaults on generic types' fields, and `from_json` filling a missing field from its default.

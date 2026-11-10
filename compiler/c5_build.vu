@@ -418,7 +418,81 @@ fn gen_consts(var g: G, items: [Node]) -> [Str]:
     let c = value(&g, it.kids[0], "")
     g.consts[it.name] = c.ty + ""
     out.push("#define C_" + it.name + " (" + c.code + ")")
+  # fields' defaults: constants (checked here, once; each construction that leaves the field out
+  # evaluates its own copy)
+  var dsn: [Str] = []
+  var dfn: [Str] = []
+  var dty: [Str] = []
+  for sn in g.struct_order:
+    if not (sn in g.structs): continue
+    for f in g.structs[sn].fields:
+      if (sn + "." + f.name) in g.fdefs:
+        dsn.push(sn + "")
+        dfn.push(f.name + "")
+        dty.push(f.ty + "")
+  # (a default that builds a struct whose defaults build it again would never end)
+  var deps: {Str: [Str]} = {}
+  for i in 0..dsn.len:
+    let key = dsn[i] + "." + dfn[i]
+    let d = copy_node(g.fdefs[key])
+    var cs: [Str] = []
+    default_builds(g, d, &cs)
+    if not (dsn[i] in deps): deps[dsn[i]] = []
+    for c in cs: deps[dsn[i]].push(c + "")
+  for i in 0..dsn.len:
+    let key = dsn[i] + "." + dfn[i]
+    let d = copy_node(g.fdefs[key])
+    var cs: [Str] = []
+    default_builds(g, d, &cs)
+    for c in cs:
+      var seen: {Str: Bool} = {}
+      if c == dsn[i]: err(g, d.line, "the default of field '" + dfn[i] + "' of " + disp(dsn[i]) + " builds " + disp(c) + " again, without end (make it nil)")
+      if default_reaches(deps, c, dsn[i], &seen): err(g, d.line, "the default of field '" + dfn[i] + "' of " + disp(dsn[i]) + " builds " + disp(c) + ", whose defaults build " + disp(dsn[i]) + " again, without end (make one of them nil)")
+  for i in 0..dsn.len:
+    let key = dsn[i] + "." + dfn[i]
+    let d = copy_node(g.fdefs[key])
+    if not default_const(g, d): err(g, d.line, "the default of field '" + dfn[i] + "' of " + disp(dsn[i]) + " must be a constant: a literal, a const, [] or {{}}, or a struct or variant built from those")
+    # (its type, checked even when no construction uses it; the code is thrown away)
+    var saved: [Str] = []
+    swap(&saved, &g.lines)
+    let _c = value(&g, d, dty[i])
+    swap(&saved, &g.lines)
   return out
+
+# The structs a default builds (calls of a struct's name, at any depth).
+fn default_builds(g: G, e: Node, var out: [Str]):
+  if e.k == "call" and e.kids[0].k == "name" and e.kids[0].name in g.structs: out.push(e.kids[0].name + "")
+  for x in e.kids: default_builds(g, x, &out)
+
+# Whether the defaults of s build a t (at any depth).
+fn default_reaches(deps: {Str: [Str]}, s: Str, t: Str, var seen: {Str: Bool}) -> Bool:
+  if s in seen: return false
+  seen[s] = true
+  if not (s in deps): return false
+  for c in deps[s]:
+    if c == t or default_reaches(deps, c, t, &seen): return true
+  return false
+
+fn default_const(g: G, e: Node) -> Bool:
+  let k = e.k
+  if k == "int" or k == "float" or k == "char" or k == "bool" or k == "nil": return true
+  if k == "str": return all_text(e)
+  if k == "name": return e.name in g.consts or e.name in g.variants
+  if k == "un": return default_const(g, e.kids[0])
+  if k == "bin": return default_const(g, e.kids[0]) and default_const(g, e.kids[1])
+  if k == "list" or k == "pair":
+    for x in e.kids:
+      if not default_const(g, x): return false
+    return true
+  if k == "map":
+    for x in e.kids:
+      if not default_const(g, x): return false
+    return true
+  if k == "call" and e.kids[0].k == "name" and (e.kids[0].name in g.structs or e.kids[0].name in g.variants):
+    for i in 1..e.kids.len:
+      if e.kids[i].kids.len == 0 or not default_const(g, e.kids[i].kids[0]): return false
+    return true
+  return false
 
 # A string literal without interpolation, or such literals and text consts joined with +.
 fn str_const_expr(g: G, e: Node) -> Bool:
@@ -1042,7 +1116,9 @@ fn res_items(var r: Res, all_own: [{Str: Str}], ctx: Ctx, var its: [Node]):
         r.tps = {}
         res_fn(&r, all_own, ctx, &its[ii].kids[fi])
     elif k == "type":
-      for fi in 0..its[ii].kids.len: its[ii].kids[fi].ty = res_ty(r, all_own, ctx, its[ii].kids[fi].ty, its[ii].kids[fi].line)
+      for fi in 0..its[ii].kids.len:
+        its[ii].kids[fi].ty = res_ty(r, all_own, ctx, its[ii].kids[fi].ty, its[ii].kids[fi].line)
+        if its[ii].kids[fi].kids.len > 0: res_expr(&r, all_own, ctx, &its[ii].kids[fi].kids[0])
     elif k == "enum":
       for vi in 0..its[ii].kids.len:
         for fi in 0..its[ii].kids[vi].kids.len:
@@ -1497,6 +1573,101 @@ fn fail_new(name: Str) -> Int:
   return 1
 
 # An error found before compiling: reported like any other, but without a source line.
+# A name as written in its module (the module prefix the resolver adds taken off).
+fn plain_name(n: Str) -> Str:
+  var i = n.len - 2
+  while i > 0:
+    if n[i] == '_' and n[i + 1] == '_': return n[i + 2..n.len]
+    i -= 1
+  return n + ""
+
+# vu def / vu check --dups: the program's items (main file and modules, not the standard library) by name.
+fn def_cmd(fs: Fs, os: Os, name: Str, path: Str, dups: Bool) -> Int:
+  var src = ""
+  match fs.read(path):
+    ok(text): src = text
+    err(e):
+      eprint("vu: " + e)
+      return 2
+  src = replace_all(src, "\r\n", "\n")
+  let ctx = Ctx(path + "", split_lines(src), false)
+  var main_deps: {Str: Int} = {}
+  var pkgs: [Pkg] = []
+  let mf = find_manifest(fs, os, path)
+  if mf != "":
+    match load_pkgs(fs, os, mf, &main_deps):
+      ok(ps): pkgs = copy_pkgs(ps)
+      err(e):
+        eprint("vu: " + e)
+        return 1
+  var files: [Ctx] = []
+  var caps: [Str] = []
+  let stdd = std_dir(os)
+  let items = load_program(fs, ctx, src, &files, stdd, pkgs, main_deps, &caps)
+  # (name, where, the definition's first line), in the order found
+  var names: [Str] = []
+  var wheres: [Str] = []
+  var heads: [Str] = []
+  var kinds: [Str] = []
+  for it in items:
+    if it.k != "fn" and it.k != "type" and it.k != "enum" and it.k != "const" and it.k != "impl" and it.k != "iface": continue
+    if it.k == "fn" and it.v == "(library)": continue
+    let fi = it.line >> 24
+    if fi >= files.len: continue
+    let fp = files[fi].path + ""
+    if fp.startswith(stdd + "/"): continue
+    let ln = lnum(it.line)
+    var head = ""
+    if ln >= 1 and ln <= files[fi].lines.len: head = files[fi].lines[ln - 1].strip()
+    if it.k == "impl" or it.k == "iface":
+      for m in it.kids:
+        let mfi = m.line >> 24
+        let mln = lnum(m.line)
+        var mh = ""
+        if mfi < files.len and mln >= 1 and mln <= files[mfi].lines.len: mh = files[mfi].lines[mln - 1].strip()
+        names.push(plain_name(m.name))
+        wheres.push(fp + ":{mln}")
+        heads.push(mh + "   (in " + head.rstrip(":") + ")")
+        kinds.push("method")
+      continue
+    names.push(plain_name(it.name))
+    wheres.push(fp + ":{ln}")
+    heads.push(head)
+    kinds.push(it.k + "")
+  if not dups:
+    var found = 0
+    for i in 0..names.len:
+      if names[i] == name:
+        print(wheres[i] + ": " + heads[i])
+        found += 1
+    if found == 0:
+      eprint("vu def: no function, type, const or method named " + name + " in " + path + " or the modules it imports")
+      return 1
+    return 0
+  # functions under one name in more than one module (methods and the other kinds aren't counted)
+  var grp: {Str: [Int]} = {}
+  var order: [Str] = []
+  for i in 0..names.len:
+    if kinds[i] != "fn" or names[i] == "main": continue
+    if not (names[i] in grp):
+      grp[names[i]] = []
+      order.push(names[i] + "")
+    grp[names[i]].push(i)
+  order.sort()
+  var groups = 0
+  for n in order:
+    var files_seen: {Str: Bool} = {}
+    for i in grp[n]:
+      let w = wheres[i]
+      files_seen[w[0..w.find(":")]] = true
+    if files_seen.len < 2: continue
+    groups += 1
+    var ws: [Str] = []
+    for i in grp[n]: ws.push(wheres[i] + "")
+    print(n + ": " + ", ".join(ws))
+  eprint("vu check --dups: {groups} name(s) defined in more than one module")
+  return 0
+
 fn fail_early(path: Str, json: Bool, line: Int, msg: Str):
   if json: eprint("{{\"type\": \"error\", \"file\": " + json_str(path) + ", \"line\": {line}, \"message\": " + json_str(msg) + ", \"source\": \"\"}}")
   elif line > 0: eprint(path + ":{line}: error: " + msg)
@@ -1786,6 +1957,17 @@ fn main(fs: Fs, os: Os):
     var tpaths: [Str] = []
     for k in 3..argv.len + 1: tpaths.push(argv[k - 1])
     exit(run_tests_cmd(fs, os, argv[0], tpaths))
+  if argv.len >= 2 and argv[1] == "def":
+    # vu def NAME FILE.vu: where NAME is defined in the program FILE.vu loads (every module), with its line
+    if argv.len != 4:
+      eprint("vu def NAME FILE.vu: where NAME (a function, type, const or method) is defined, in FILE.vu and the modules it imports")
+      exit(2)
+    exit(def_cmd(fs, os, argv[2], argv[3], false))
+  if argv.len >= 3 and argv[1] == "check" and argv[2] == "--dups":
+    if argv.len != 4:
+      eprint("vu check --dups FILE.vu: the functions defined under the same name in more than one of the program's modules")
+      exit(2)
+    exit(def_cmd(fs, os, "", argv[3], true))
   if argv.len >= 2 and argv[1] == "fmt":
     # vu fmt FILE.vu...: rewrite each file's spacing (see c7_fmt.vu); --check only lists the files it would change
     var check = false

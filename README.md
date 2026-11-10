@@ -588,6 +588,10 @@ records each round. Most of Vu's design follows from that:
   say what to write instead. A panic prints a backtrace with Vu file and line numbers. `vu check`
   runs only the front end, so a mistake is reported in milliseconds (0.4 s for the compiler itself,
   14,700 lines).
+- **Finding things without reading them.** `vu def NAME file.vu` prints where a function, type,
+  const or method is defined across every module a program loads (0.56 s across all of vlint's modules),
+  and `vu check --dups` lists names defined in several. A method other languages have gets the
+  Vu way in its error (`Str has no .slice(): use s[a..b]`, `lists have no .contains(): use x in xs`).
 - **Checks in one command.** `tests/try.sh file.vu` checks a program, runs it, runs it again under
   the sanitizers and compares the output, and audits the generated C.
 
