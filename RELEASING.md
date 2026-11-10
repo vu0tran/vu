@@ -20,6 +20,22 @@ Each npm tool is five packages: one per platform (`@vu0tran/TOOL-linux-x64`, `-l
 `-darwin-x64`, `-darwin-arm64`, holding the binary) and the main one (`@vu0tran/TOOL`, a Node launcher
 with the commands, naming the others as optionalDependencies). They are published in that order.
 
+## Releasing without pushing a tag
+
+Where tags can't be pushed (a cloud session's git access pushes branches only), the workflow makes
+the tag itself: Actions, release-tools, Run workflow, with `tag` (e.g. `vknip-v0.1.3`), `create`
+checked and `commit` (empty: the head of main; a commit that isn't on main is refused). From the
+command line:
+
+```sh
+gh api -X POST repos/vu0tran/vu/actions/workflows/release-tools.yml/dispatches -f ref=main \
+  -f "inputs[tag]=vknip-v0.1.3" -F "inputs[create]=true" -f "inputs[commit]=34b7928"
+```
+
+The tag is made with the run's own token, so it doesn't start a second run; the release then goes as
+for a pushed tag, and npm versions are still staged until approved with 2FA. A tag that exists is
+released as it is (`commit` is ignored).
+
 ## Once: npm publishing rights (vlint, vsc, vjq, vknip)
 
 The workflow **stages** each npm version (`npm stage publish`, [staged
