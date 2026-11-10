@@ -137,6 +137,38 @@ output matches, but code that did would differ. Where the speed comes from on ed
 import plugin's module graph (1.5 s of the 1.85 s before) now resolves in long-lived workers,
 reads only the top level of each file and stops at what node_modules re-exports.
 
+## Seven more repositories, default configuration (2026-11-09)
+
+vlint and oxlint 1.90.0 with no configuration, JSON compared diagnostic by diagnostic, wall time
+the best of 3 on the same 2-core VM:
+
+| repository | files | identical | only oxlint | only vlint | oxlint | vlint |
+|---|---|---|---|---|---|---|
+| vuejs/core | 539 | 471 | 0 | 0 | 172 ms | 66 ms |
+| excalidraw | 723 | 254 | 0 | 0 | 191 ms | 113 ms |
+| hoppscotch | 1588 | 312 | 1 | 1 | 210 ms | 117 ms |
+| immich | 1574 | 13 | 0 | 0 | 211 ms | 116 ms |
+| nuxt | 2114 | 71 | 0 | 0 | 227 ms | 114 ms |
+| nuxt/ui | 4345 | 366 | 1 | 1 | 277 ms | 216 ms |
+| vscode | 15572 | 10859 | 9 | 9 | 2916 ms | 2824 ms |
+
+The remaining differences are all parse errors in deliberately broken files (test fixtures),
+where vlint words the message as TypeScript does and oxlint as oxc's parser does (e.g. `';'
+expected.` against `Expected a semicolon or an implicit semicolon after a statement, but found
+none`; hoppscotch's is a `.d.ts`, nuxt/ui's an empty JSX attribute expression). Both report the
+file as broken at the same place in most of them.
+
+Fixed on the way (each case is a probe folder in `probes/`, checked with `./oxprobe.sh`):
+no-empty-file never runs on `.vue`/`.svelte`/`.astro` sections, as in oxlint; in TypeScript an
+import and a declaration of the same name are one symbol (no redeclaration error, used together,
+reported where first declared and worded as oxlint words it); in JavaScript an import followed by
+a function of its name is reported twice, as oxlint does; a type alias and a type alias,
+interface, class or enum of its name are a redeclaration; duplicate class members (oxc's
+check_duplicate_class_elements: fields, accessors and methods with bodies, public ones only in
+TypeScript, and TS2804 for a private name both static and not); `@dec()` followed by a computed
+member on the next line (`[X]: string`) is a decorator and a member, not an element access (the
+parser is shared, so vtsc gets this too); no-setter-return's span on a parenthesized arrow body.
+
 ## Drop-in status (checked against oxlint 1.90.0)
 
 **Command line** (every flag of `oxlint --help`, plus its hidden ones):

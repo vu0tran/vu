@@ -404,7 +404,7 @@ fn lint_src(c: Cx, sev: [Int], opts: [Str], path: Str, abs: Str, kind: Str, own 
   if phase == 1: return out
   var tt = ast.blank()
   swap(&tt, &t)
-  var bld = scope.build(tt, root, kind.endswith(".d.ts") or kind.endswith(".d.mts") or kind.endswith(".d.cts"))
+  var bld = scope.build(tt, root, kind.endswith(".d.ts") or kind.endswith(".d.mts") or kind.endswith(".d.cts"), kind.endswith(".ts") or kind.endswith(".tsx") or kind.endswith(".mts") or kind.endswith(".cts"))
   swap(&t, &bld.t)
   var sc = scope.new_scopes()
   swap(&sc, &bld.sc)
@@ -477,6 +477,7 @@ fn lint_l(c: Cx, sev: [Int], opts: [Str], var l: L, path: Str, root: Int, fixing
     sem.push(lout.make_rec(c.o, path, shown0, lout.line_index(shown0), lout.Diag(2, "", "", "Identifier `{nm}` has already been declared", "", labs, "")))
     skey.push(q)
   private_errors(&l, c, path, shown0, &sem, &skey)
+  class_elem_dups(&l, c, path, &shown0, &sem, &skey)
   # TypeScript: a declare modifier inside an already ambient context (oxc's parser), and export =
   # with other exports in the same statements (oxc's semantic checker)
   if l.ts:
@@ -1420,7 +1421,8 @@ fn visit_function(var l: L, n: Int, kd: Int):
   if l.setter and kd == ast.N_ARROW:
     let bd = l.t.nd[n].d
     if bd > 0 and l.t.nd[bd].k != ast.N_BLOCK:
-      addn(&l, bd, "eslint(no-setter-return)", "Setter cannot return a value", "Remove the return statement or ensure it does not return a value.")
+      # oxlint: the expression body without its parentheses
+      addn(&l, unparen(l, bd), "eslint(no-setter-return)", "Setter cannot return a value", "Remove the return statement or ensure it does not return a value.")
       on(&l, n)
   push_jt(&l, 5, -1)
   if kd != ast.N_ARROW: l.infn += 1
@@ -3492,6 +3494,27 @@ fn unused_var(var l: L, y: Int):
   let at = l.sc.ypos[y]
   let rule = "eslint(no-unused-vars)"
   let vsx = uv_suffix(l.uv.vp, l.uv.vs, "variables")
+  if y in l.sc.mk:
+    # an import merged with a declaration of its name (TypeScript), worded as oxc does
+    let k2 = l.sc.mk[y]
+    var noun = "Identifier"
+    for kk in [kind, k2]:
+      if noun == "Identifier":
+        if kk == scope.Y_FUNC: noun = "Function"
+        elif kk == scope.Y_CLASS: noun = "Class"
+        elif kk == scope.Y_ENUM: noun = "Enum"
+        elif kk == scope.Y_TYPE: noun = "Type alias"
+        elif kk == scope.Y_INTERFACE: noun = "Interface"
+    if noun == "Identifier" and kind == scope.Y_IMPORTTYPE: noun = "Type"
+    if kind == scope.Y_IMPORT or kind == scope.Y_IMPORTTYPE:
+      add(&l, at, rule, "{noun} '{name}' is imported but never used.", "Consider removing this import.")
+      label(&l, at + name.len, "'{name}' is imported here")
+    else:
+      var sx = ""
+      if is_var_kind(kind): sx = uv_suffix(l.uv.vp, l.uv.vs, "identifiers")
+      add(&l, at, rule, "{noun} '{name}' is declared but never used.{sx}", "Consider removing this declaration.")
+      label(&l, at + name.len, "'{name}' is declared here")
+    return
   if is_var_kind(kind):
     if l.sc.writes[y] > 0: add(&l, at, rule, "Variable '{name}' is assigned a value but never used.{vsx}", "Did you mean to use this variable?")
     else: add(&l, at, rule, "Variable '{name}' is declared but never used.{vsx}", "Consider removing this declaration.")
@@ -4694,8 +4717,9 @@ fn file_rules(var l: L, root: Int):
     l.cur = 0
     no_restricted_imports(&l, root)
     l.cur = save
-  # unicorn(no-empty-file): nothing but directives and comments
-  var empty = true
+  # unicorn(no-empty-file): nothing but directives and comments (never run on .vue/.astro/.svelte
+  # sections, as oxlint)
+  var empty = not (l.vue_svelte or l.abs.endswith(".astro"))
   for i in 0..ast.count(l.t, root):
     let st = ast.item(l.t, root, i)
     if not (st in l.dirs) and k(l, st) != ast.N_EMPTY: empty = false
@@ -9150,6 +9174,74 @@ fn private_defs(l: L, c: Int) -> [Str]:
     if km == ast.N_PROP: out.push(strip_hash(l.t.names[l.t.nd[key].s]))
     elif (km == ast.N_METHOD or km == ast.N_GET or km == ast.N_SET) and l.t.nd[m].c > 0: out.push(strip_hash(l.t.names[l.t.nd[key].s]))
   return out
+
+# oxc's check_duplicate_class_elements (when the program ends, classes in source order): a class's
+# fields, accessors and methods with bodies, by name; public ones only in TypeScript, and only
+# when both are static or both not; a getter and a setter pair up once
+fn class_elem_dups(var l: L, c: Cx, path: Str, var shown: Str, var sem: [lout.Rec], var skey: [Int]):
+  var nth = 0
+  for cls in 1..l.t.nd.len:
+    let kc = l.t.nd[cls].k
+    if kc != ast.N_CLASS and kc != ast.N_CLASSEXPR: continue
+    let ms = l.t.nd[cls].d
+    if ms <= 0: continue
+    # (per name and namespace: the previous element, and for private names the previous setter)
+    var prev: {Str: Int} = {}
+    var prev_set: {Str: Int} = {}
+    for m in ast.items(l.t, ms):
+      let km = l.t.nd[m].k
+      let key = l.t.nd[m].a
+      if key <= 0: continue
+      if km != ast.N_PROP and not ((km == ast.N_METHOD or km == ast.N_GET or km == ast.N_SET) and l.t.nd[m].c > 0): continue
+      let priv = l.t.nd[key].k == ast.N_PRIVNAME
+      var nm = ""
+      if priv: nm = "#" + strip_hash(l.t.names[l.t.nd[key].s])
+      else:
+        nm = key_name(l, key)
+        if nm == "\t?": continue
+      var ks = key
+      if l.t.nd[key].k == ast.N_COMPUTED: ks = l.t.nd[key].a
+      let accessor = km == ast.N_GET or km == ast.N_SET
+      var pe = -1
+      if priv:
+        if km == ast.N_SET:
+          if nm in prev_set: pe = prev_set[nm]
+          elif nm in prev: pe = prev[nm]
+          prev_set[nm] = m
+        else:
+          if nm in prev: pe = prev[nm]
+          elif nm in prev_set: pe = prev_set[nm]
+          prev[nm] = m
+      else:
+        if nm in prev: pe = prev[nm]
+        prev[nm] = m
+      if pe < 0: continue
+      let kp = l.t.nd[pe].k
+      let st = (l.t.nd[m].f & ast.M_STATIC) != 0
+      let pst = (l.t.nd[pe].f & ast.M_STATIC) != 0
+      var dup = true
+      if accessor and (kp == ast.N_GET or kp == ast.N_SET): dup = km == kp or st != pst
+      if not priv: dup = l.ts and st == pst and dup
+      if not dup: continue
+      var pk = l.t.nd[pe].a
+      if l.t.nd[pk].k == ast.N_COMPUTED: pk = l.t.nd[pk].a
+      if shown == "": shown = shown_src(l.src, l.disp)
+      let p0 = l.t.nd[pk].pos
+      let p1 = l.t.nd[pk].end
+      let q0 = l.t.nd[ks].pos
+      let q1 = l.t.nd[ks].end
+      var labs: [lout.Lab] = []
+      if priv and st != pst and l.ts:
+        labs.push(lout.Lab(p0, p1, "`{nm}` has already been declared here", true, false))
+        labs.push(lout.Lab(q0, q1, "It can not be redeclared here", true, false))
+        sem.push(lout.make_rec(c.o, path, shown, lout.line_index(shown), lout.Diag(2, "TS(2804)", "", "Duplicate identifier `{nm}`. Static and instance elements cannot share the same private name.", "", labs, "")))
+      else:
+        let tx = l.src[p0..p1]
+        labs.push(lout.Lab(p0, p1, "`{tx}` has already been declared here", true, false))
+        labs.push(lout.Lab(q0, q1, "It can not be redeclared here", true, false))
+        sem.push(lout.make_rec(c.o, path, shown, lout.line_index(shown), lout.Diag(2, "", "", "Identifier `{tx}` has already been declared", "", labs, "")))
+      skey.push(l.src.len + 1 + nth)
+      nth += 1
 
 fn private_errors(var l: L, c: Cx, path: Str, shown: Str, var sem: [lout.Rec], var skey: [Int]):
   if l.mc.priv.len == 0: return

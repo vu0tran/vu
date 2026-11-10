@@ -1,0 +1,1 @@
+function f() { const b = 1; } import { b } from "x"; export { b, f };
