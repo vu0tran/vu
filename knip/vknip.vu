@@ -3131,6 +3131,22 @@ fn cfg_yaml(var p: Proj, fs: Fs, os: Os, f: Str, text: Str) -> Value:
 
 # Loads the JavaScript config files the enabled plugins will read, all in one Node.js process.
 fn prefetch(var p: Proj, fs: Fs, os: Os):
+  let sorted = prefetch_plan(&p, fs, os)
+  if sorted.len == 0: return
+  let res = loader.load_par(p.node_par, sorted, fspath(p, ""), p.node_workers)
+  prefetch_apply(&p, sorted, res)
+
+# the prefetch's values into p.js
+fn prefetch_apply(var p: Proj, sorted: [[loader.Req]], res: [{Str: Value}]):
+  for gi in 0..sorted.len:
+    for r in sorted[gi]:
+      let fk = r.file + ""
+      p.js[r.mode + ":" + r.file] = json.copy(res[gi][fk])
+      cfg_keep(&p, r)
+
+# The configs to load before the workspaces are built, in the groups the node processes take (none
+# when there's nothing to load).
+fn prefetch_plan(var p: Proj, fs: Fs, os: Os) -> [[loader.Req]]:
   var reqs: [loader.Req] = []
   var seen: {Str: Bool} = {}
   let saved = p.cur
@@ -3149,12 +3165,12 @@ fn prefetch(var p: Proj, fs: Fs, os: Os):
         seen[ck] = true
         reqs.push(loader.Req(fspath(p, f), load_mode(key), load_args(p)))
   p.cur = saved
-  if reqs.len == 0: return
+  if reqs.len == 0: return []
   # (--cache: the ones an earlier run kept are taken from it)
   var left = 0
   for r in reqs:
     if not cfg_kept(&p, r): left += 1
-  if left == 0: return
+  if left == 0: return []
   # (a request per mode, a mode with many files in up to one part per process, the largest first;
   # the node processes load them at the same time)
   let workers = p.node_workers
@@ -3194,11 +3210,7 @@ fn prefetch(var p: Proj, fs: Fs, os: Os):
     var g: [loader.Req] = []
     for r in groups[gi]: g.push(loader.Req(r.file + "", r.mode + "", json.copy(r.args)))
     sorted.push(g)
-  let res = loader.load_par(p.node_par, sorted, fspath(p, ""), workers)
-  for gi in 0..sorted.len:
-    for r in sorted[gi]:
-      p.js[r.mode + ":" + r.file] = json.copy(res[gi][r.file])
-      cfg_keep(&p, r)
+  return sorted
 
 # --cache: when the earlier run's value of a config can be used, it goes into p.js (true)
 fn cfg_kept(var p: Proj, r: loader.Req) -> Bool:
@@ -6511,6 +6523,13 @@ fn res_worker(fs: Fs, ffi: Ffi, own r0: Resolver, own jc: Chan[RJob], own rc: Ch
     for sp in j.specs: out.push(resolve.resolve(&r, fs, sp, j.from))
     rc.send(RDone(j.idx, out))
 
+# The configs loaded on a thread of its own (term.node_par), the answers sent back; then the end of the
+# speculative reading's channel for the main thread (a Done of index -1).
+fn node_task(ffi: Ffi, own js: Str, own text: Str, workers: Int, own ach: Chan[Str], own sc: Chan[Done]):
+  let a = term.node_par(ffi, js, text, workers)
+  ach.send(a)
+  sc.send(Done(-1, empty_raw(""), []))
+
 # which resolver thread a file's imports go to: by its folder
 fn dir_slot(path: Str, n: Int) -> Int:
   let d = resolve.dirname(path)
@@ -9316,6 +9335,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     else: p.cfg_cache = ""
     ph(os, "config_cache")
   let ljs2 = ljs + ""
+  let ljs3 = ljs + ""
   p.node = own fn(x: Str) => term.node(ffi, ljs, x)
   p.node_par = own fn(x: Str, n: Int) => term.node_par(ffi, ljs2, x, n)
   # --jobs: the threads that read files (all the cores by default), and the node processes that load
@@ -9564,7 +9584,43 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   sjc.close()
   if spec_on:
     for _ in 0..jobs: spawn worker(fs, os, false, root + "", sc(spec_tags), sjc, spec_rc)
-  prefetch(&p, fs, os)
+  # (with cores to spare: node loads the configs on a thread of its own while the files read so far
+  # have their imports resolved, by resolver threads with a copy of the resolver as it is now; the
+  # node thread ends the speculative channel with a Done of index -1 when the configs are in)
+  var overlap = spec_on and jobs >= 4
+  if os.env("VKNIP_OVERLAP") == "1" and spec_on: overlap = true
+  if os.env("VKNIP_OVERLAP") == "0": overlap = false
+  var srres: [[Res]] = []
+  var srhave: [Bool] = []
+  var srsent = 0
+  var srkey = ""
+  var sr_n = jobs - 1
+  if sr_n < 1: sr_n = 1
+  var sqjs: [Chan[RJob]] = []
+  let sqr: Chan[RDone] = chan(spec_files.len + 1)
+  var sorted_pf: [[loader.Req]] = []
+  if overlap: sorted_pf = prefetch_plan(&p, fs, os)
+  if overlap and sorted_pf.len > 0:
+    let ach: Chan[Str] = chan(1)
+    spawn node_task(ffi, ljs3 + "", loader.par_text(sorted_pf, fspath(p, "")), p.node_workers, ach, spec_rc)
+    srkey = resolve.cfg_key(p.rs)
+    for _ in 0..spec_slots.len:
+      srres.push([])
+      srhave.push(false)
+    for _ in 0..sr_n:
+      let sq: Chan[RJob] = chan(spec_files.len + 1)
+      spawn res_worker(fs, ffi, resolve.clone_cfg(p.rs), sq, sqr)
+      sqjs.push(sq)
+    while true:
+      var d = spec_rc.recv() else break
+      if d.idx < 0: break
+      swap(&spec_slots[d.idx], &d.raw)
+      spec_have[d.idx] = true
+      sqjs[dir_slot(spec_files[d.idx], sr_n)].send(RJob(d.idx, spec_files[d.idx] + "", import_specs(spec_slots[d.idx])))
+      srsent += 1
+    let atext = ach.recv() else ""
+    prefetch_apply(&p, sorted_pf, loader.par_answers(sorted_pf, atext))
+  else: prefetch(&p, fs, os)
   ph(os, "prefetch")
   for wi in 0..p.ws.len:
     if not p.ws[wi].has_manifest: continue
@@ -9573,6 +9629,16 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     let wsn = p.ws[wi].name + ""
     perf.mark(&p.pf, fs, wsn)
   ph(os, "build_ws")
+  # (the resolutions made while the configs loaded: kept when the resolver is still as it was then)
+  if srsent > 0:
+    let keep = resolve.cfg_key(p.rs) == srkey
+    for _ in 0..srsent:
+      var rd = sqr.recv() else break
+      if keep:
+        swap(&srres[rd.idx], &rd.res)
+        srhave[rd.idx] = true
+    for sq2 in sqjs: sq2.close()
+    ph(os, "spec_resolved")
   if p.debug:
     for f in b.order: eprint("entry " + b.g.nodes[f].path)
   # the graph: read the files reached from the entries, in waves (each on all cores)
@@ -9655,6 +9721,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
           qjs.push(rq)
         for k in 0..wave.len:
           let si0 = from_spec[k]
+          if si0 >= 0 and si0 < srhave.len and srhave[si0]: continue
           if si0 >= 0 and spec_have[si0]:
             qjs[dir_slot(paths[k], nres)].send(RJob(k, paths[k] + "", import_specs(spec_slots[si0])))
             rsent[k] = true
@@ -9677,7 +9744,10 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
             if pre_on:
               qjs[dir_slot(paths[d.idx], nres)].send(RJob(d.idx, paths[d.idx] + "", import_specs(slots[d.idx])))
               rsent[d.idx] = true
-        if pre_on and rsent[k]:
+        if si >= 0 and si < srhave.len and srhave[si]:
+          swap(&b.pre, &srres[si])
+          b.pre_on = true
+        elif pre_on and rsent[k]:
           while not rhave[k]:
             var rd = qr.recv() else break
             swap(&rres[rd.idx], &rd.res)
