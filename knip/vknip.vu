@@ -231,6 +231,11 @@ type Proj:
   cfg_fresh: Bool = false      # (and everything they depended on is the same)
   cfg_new: {Str: Value} = {}   # configs loaded this run: mode:file -> {"args", "value"}
   cfg_track: Str = ""          # where the node processes write what they loaded (PREFIX.<pid>)
+  dbg_glob: Bool = false
+  dir_files: {Str: [Int]} = {}  # (index_files) a folder ("" the project's) -> the indexes in files of its files
+  ign_pre: [Str] = []          # each ignore pattern's literal folders (glob.safe_prefix; "" none)
+  ign_memo: {Str: Bool} = {}   # ignored_issue_file's answers (cleared when a pattern is added)
+  iss_memo: {Str: Bool} = {}   # should_ignore_issue's, by type \0 file
 
 fn fspath(p: Proj, rel: Str) -> Str:
   if rel == "":
@@ -280,6 +285,17 @@ fn in_selected(p: Proj, path: Str) -> Bool:
 # ---- issues (IssueCollector)
 
 fn ignored_issue_file(var p: Proj, rel: Str) -> Bool:
+  if rel in p.ign_memo: return p.ign_memo[rel]
+  let r = ignored_issue_file_u(&p, rel)
+  p.ign_memo[rel] = r
+  return r
+
+# (a pattern whose literal folders the path isn't in can't match it)
+fn pre_ok(pre: Str, rel: Str) -> Bool:
+  if pre == "" or rel.startswith(pre): return true
+  return rel.len + 1 == pre.len and pre.startswith(rel)
+
+fn ignored_issue_file_u(var p: Proj, rel: Str) -> Bool:
   var hit = false
   var neg = false
   var pos = 0
@@ -290,6 +306,8 @@ fn ignored_issue_file(var p: Proj, rel: Str) -> Bool:
       if glob.match_str(p.ign_ids_full[k], rel, true): neg = true
       continue
     pos += 1
+    if p.ign_used[k] and hit: continue
+    if not pre_ok(p.ign_pre[k], rel): continue
     if glob.matches(p.ign_pats[k], rel, true):
       hit = true
       p.ign_used[k] = true
@@ -297,14 +315,18 @@ fn ignored_issue_file(var p: Proj, rel: Str) -> Bool:
   if pos == 0 and negs > 0: return not neg
   return hit and not neg
 
-fn should_ignore_issue(p: Proj, rel: Str, typ: Str) -> Bool:
+fn should_ignore_issue(var p: Proj, rel: Str, typ: Str) -> Bool:
   if not (typ in p.ignore_issues): return false
-  return glob.matches_any(p.ignore_issues[typ], rel, true)
+  let key = typ + "\0" + rel
+  if key in p.iss_memo: return p.iss_memo[key]
+  let r = glob.matches_any(p.ignore_issues[typ], rel, true)
+  p.iss_memo[key] = r
+  return r
 
 fn add_issue(var p: Proj, own i: Issue):
   if not in_selected(p, i.file): return
   if ignored_issue_file(&p, i.file): return
-  if should_ignore_issue(p, i.file, i.typ): return
+  if should_ignore_issue(&p, i.file, i.typ): return
   if p.rules[i.typ] == "off": return
   i.severity = p.rules[i.typ] + ""
   var sym = i.symbol + ""
@@ -407,6 +429,29 @@ fn is_ignored_path(p: Proj, path: Str, dot: Bool) -> Bool:
     c2 = resolve.dirname(c2)
   return true
 
+# is_ignored_path with the folders' answers remembered (linking asks about every resolved file; the
+# gitignore patterns are all read by then)
+fn is_ignored_path_m(var b: Build, p: Proj, path: Str) -> Bool:
+  if not p.gitignore: return false
+  if glob.set_len(p.ign) == 0 and p.ign_exact.len == 0: return false
+  let d = resolve.dirname(path)
+  let hit = matches_any(p.ign_exact, path, false) or glob.set_any(p.ign, path, false) or (d != "" and dir_hit(&b.ign_dir, p.ign, d))
+  if not hit: return false
+  if glob.set_len(p.unign) == 0 and p.unign_exact.len == 0: return true
+  if matches_any(p.unign_exact, path, false): return false
+  if glob.set_any(p.unign, path, false): return false
+  return not (d != "" and dir_hit(&b.unign_dir, p.unign, d))
+
+# whether a pattern of the set matches the folder or a folder above it (remembered per folder)
+fn dir_hit(var memo: {Str: Bool}, st: glob.PatSet, d: Str) -> Bool:
+  if d in memo: return memo[d]
+  var r = glob.set_any(st, d, false)
+  if not r:
+    let up = resolve.dirname(d)
+    if up != "" and up != d: r = dir_hit(&memo, st, up)
+  memo[d] = r
+  return r
+
 # (in the walk, the folders above a path aren't ignored, so only the path itself is checked)
 fn is_ignored_here(p: Proj, path: Str) -> Bool:
   if not glob.set_any(p.ign, path, true) and not matches_any(p.ign_exact, path, true): return false
@@ -503,6 +548,14 @@ fn prepend_all(dir: Str, pats: [Str]) -> [Str]:
 # on the files below its literal folders (a range of the sorted files), a pattern without glob
 # characters is looked up, and negated ones are kept by prefix (glob.PatSet).
 fn glob_files(p: Proj, patterns: [Str]) -> [Str]:
+  if p.dbg_glob:
+    let t0 = p.clk()
+    let r = glob_files_u(p, patterns)
+    eprint("GLOBF {(p.clk() - t0) * 1000.0} {r.len} " + " ".join(patterns))
+    return r
+  return glob_files_u(p, patterns)
+
+fn glob_files_u(p: Proj, patterns: [Str]) -> [Str]:
   var neg = glob.new_set()
   var pos: [Str] = []
   for pt in patterns:
@@ -525,6 +578,19 @@ fn glob_files(p: Proj, patterns: [Str]) -> [Str]:
     if glob.one_segment(pt):
       for k in p.froot:
         if glob.matches(pt, p.files[k], true): cand.push(k)
+      continue
+    # (only some paths or one folder's files can match: those are looked up)
+    let plan = glob.alt_plan(pt, s)
+    if plan.len > 0:
+      for x in plan:
+        let rest = x[1..x.len]
+        if x[0] == 'L':
+          if rest in p.fix:
+            let k = p.fix[rest]
+            if glob.matches(pt, p.files[k], true): cand.push(k)
+        elif rest in p.dir_files:
+          for k in p.dir_files[rest]:
+            if glob.matches(pt, p.files[k], true): cand.push(k)
       continue
     let pre = glob.safe_prefix(s)
     var lo = 0
@@ -564,6 +630,11 @@ fn glob_files_slow(p: Proj, pos_s: [Str], neg: glob.PatSet) -> [Str]:
     if matches_any(pos, f, true) and not neg_hit(neg, f): out.push(f + "")
   return crawl_order(out)
 
+# whether the sorted list has x
+fn sorted_has(xs: [Str], x: Str) -> Bool:
+  let i = lower_bound(xs, x)
+  return i < xs.len and xs[i] == x
+
 # the first index of the sorted keys that isn't below x
 fn lower_bound(keys: [Str], x: Str) -> Int:
   var lo = 0
@@ -589,6 +660,12 @@ fn index_files(var p: Proj):
   swap(&p.fkeys, &keys)
   swap(&p.fkix, &ix)
   swap(&p.fix, &fix)
+  var df: {Str: [Int]} = {}
+  for k in 0..p.files.len:
+    let d = resolve.dirname(p.files[k])
+    if d in df: df[d].push(k)
+    else: df[d] = [k]
+  swap(&p.dir_files, &df)
   p.froot = []
   for k in 0..p.files.len:
     if p.files[k].find("/") < 0: p.froot.push(k)
@@ -6061,7 +6138,7 @@ type Graph:
   nodes: [Node]
 
 fn empty_raw(path: Str) -> Raw:
-  return Raw(path + "", true, [], [], [], [], [], 0, [0], false, "", [], [])
+  return Raw(path + "", true, [], [], [], [], [], 0, [0], false, "", [], [], [])
 
 fn node_id(var g: Graph, path: Str) -> Int:
   if path in g.ids: return g.ids[path]
@@ -6112,6 +6189,10 @@ fn read_file_t(fs: Fs, root: Str, path: Str, comp: Str, pre: Str, var kw: {Str: 
     r.path = path + ""
     return r
   let src = fs.read(root + path) else return empty_raw(path)
+  return analyze_src(path, comp, src, &kw, &t, tags, clk, &tm)
+
+# (a file's text analyzed, compiled first when it has a compiler)
+fn analyze_src(path: Str, comp: Str, own src: Str, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], clk: fn() -> Float, var tm: [Float]) -> Raw:
   if comp != "":
     # a compiled file: the JavaScript its compiler gives, read as TypeScript
     let js = compilers.compile(comp, src)
@@ -6124,12 +6205,22 @@ fn read_file_t(fs: Fs, root: Str, path: Str, comp: Str, pre: Str, var kw: {Str: 
     return r
   return extract.analyze_tc(path, src, &kw, &t, tags, clk, &tm)
 
-fn worker(fs: Fs, os: Os, timed: Bool, own root: Str, own tags: [Str], own jobs: Chan[Job], own res: Chan[Done]):
+fn worker(fs: Fs, os: Os, ffi: Ffi, timed: Bool, own root: Str, own tags: [Str], own jobs: Chan[Job], own res: Chan[Done]):
   var kw = scan.keywords()
   var t = ast.new_ast()
   while true:
+    # (a turn for the thread's other tasks after each file, when one is ready: new tasks go to the
+    # threads in turn, the main thread's too, and a worker whose queue is never empty kept the main
+    # thread from running until it was: 0.9 s on a 73-workspace monorepo)
+    term.yield_if_ready(ffi)
     let j = jobs.recv() else return
     var tm: [Float] = []
+    if not timed and j.comp != "=":
+      # (the text read ahead, when it was: term.readahead)
+      let src = term.take(ffi, j.path)
+      if not (src.len == 1 and src[0] == 0):
+        res.send(Done(j.idx, analyze_src(j.path, j.comp, src, &kw, &t, tags, fn() => 0.0, &tm), []))
+        continue
     if timed:
       tm.push(os.clock())
       let r = read_file_t(fs, root, j.path, j.comp, j.pre, &kw, &t, tags, fn() => os.clock(), &tm)
@@ -6137,12 +6228,26 @@ fn worker(fs: Fs, os: Os, timed: Bool, own root: Str, own tags: [Str], own jobs:
       res.send(Done(j.idx, r, tm))
     else: res.send(Done(j.idx, read_file(fs, root, j.path, j.comp, j.pre, &kw, &t, tags), tm))
 
+# (the speculative parse) a worker that takes its files from term.job_next: in order, but the ones a
+# wave waits for first
+fn spec_worker(fs: Fs, os: Os, ffi: Ffi, own root: Str, own tags: [Str], own files: [Str], own res: Chan[Done]):
+  var kw = scan.keywords()
+  var t = ast.new_ast()
+  while true:
+    term.yield_if_ready(ffi)
+    let i = term.job_next(ffi)
+    if i < 0 or i >= files.len: return
+    var tm: [Float] = []
+    let src = term.take(ffi, files[i])
+    if not (src.len == 1 and src[0] == 0): res.send(Done(i, analyze_src(files[i], "", src, &kw, &t, tags, fn() => 0.0, &tm), []))
+    else: res.send(Done(i, read_file(fs, root, files[i], "", "", &kw, &t, tags), []))
+
 # Reads a batch of files (on all cores when there are several), from the cache where it has them.
-fn read_batch_c(fs: Fs, os: Os, timed: Bool, var tms: [[Float]], root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], var c: kcache.Cache) -> [Raw]:
-  if not c.on: return read_batch(fs, os, timed, root, paths, comps, pres, jobs_n, &kw, &t, tags, &tms)
+fn read_batch_c(fs: Fs, os: Os, ffi: Ffi, timed: Bool, var tms: [[Float]], root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], var c: kcache.Cache) -> [Raw]:
+  if not c.on: return read_batch(fs, os, ffi, timed, root, paths, comps, pres, jobs_n, &kw, &t, tags, &tms)
   var base = c.base + ""
   if base == "": base = "."
-  let d = kcache.open_dir(fs, base) else return read_batch(fs, os, timed, root, paths, comps, pres, jobs_n, &kw, &t, tags, &tms)
+  let d = kcache.open_dir(fs, base) else return read_batch(fs, os, ffi, timed, root, paths, comps, pres, jobs_n, &kw, &t, tags, &tms)
   var out: [Raw] = []
   var stamps: [[Str]] = []
   var ctxs: [Str] = []
@@ -6175,7 +6280,7 @@ fn read_batch_c(fs: Fs, os: Os, timed: Bool, var tms: [[Float]], root: Str, path
     stamps.push(st)
     ctxs.push(ctx)
   if mp.len == 0: return out
-  var raws = read_batch(fs, os, timed, root, mp, mc, mpre, jobs_n, &kw, &t, tags, &tms)
+  var raws = read_batch(fs, os, ffi, timed, root, mp, mc, mpre, jobs_n, &kw, &t, tags, &tms)
   for k in 0..mix.len:
     let i = mix[k]
     let st = stamps[i]
@@ -6186,7 +6291,7 @@ fn read_batch_c(fs: Fs, os: Os, timed: Bool, var tms: [[Float]], root: Str, path
   return out
 
 # Reads a batch of files (on all cores when there are several). timed: each file's timings go to tms.
-fn read_batch(fs: Fs, os: Os, timed: Bool, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], var tms: [[Float]]) -> [Raw]:
+fn read_batch(fs: Fs, os: Os, ffi: Ffi, timed: Bool, root: Str, paths: [Str], comps: [Str], pres: [Str], jobs_n: Int, var kw: {Str: Int}, var t: ast.Ast, tags: [Str], var tms: [[Float]]) -> [Raw]:
   var out: [Raw] = []
   if jobs_n <= 1 or paths.len < 8:
     for i in 0..paths.len:
@@ -6203,7 +6308,7 @@ fn read_batch(fs: Fs, os: Os, timed: Bool, root: Str, paths: [Str], comps: [Str]
   jc.close()
   var n = jobs_n
   if n > paths.len: n = paths.len
-  for k in 0..n: spawn worker(fs, os, timed, root + "", sc(tags), jc, rc)
+  for k in 0..n: spawn worker(fs, os, ffi, timed, root + "", sc(tags), jc, rc)
   var slots: [Raw] = []
   var tslots: [[Float]] = []
   for i in 0..paths.len:
@@ -6240,6 +6345,8 @@ type Build:
   text: {Int: [[Str]]}       # file -> its re-exports of packages and builtins: [specifier, identifier, alias, type-only]
   pre: [Res] = []            # (the file being linked: its imports resolved by the resolver threads)
   pre_on: Bool = false
+  ign_dir: {Str: Bool} = {}    # (is_ignored_path_m) whether a gitignore pattern matches the folder or one above it
+  unign_dir: {Str: Bool} = {}  # and a negated one
 
 fn add_entry(var b: Build, path: Str, skip: Bool, explicit: Bool):
   if resolve.in_node_modules(path) or not acc(b, path): return
@@ -6342,7 +6449,7 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
         if pn != "" and wi >= 0 and (pn in p.pkg_names or has_dep(p.ws[wi], pn)):
           let l = extract.loc(b.g.nodes[id].raw, im.pos)
           ws_exts.push(Ext(pn, pn, l[0], l[1], l[2], type_only, true, im.tags, (im.flags & extract.F_CAUGHT) != 0))
-          if pn in p.pkg_names and acc(b, r.path) and not is_ignored_path(p, r.path, false): visit(&b, tid)
+          if pn in p.pkg_names and acc(b, r.path) and not is_ignored_path_m(&b, p, r.path): visit(&b, tid)
       else:
         if not (im.spec in targets): targets[im.spec] = -1
         # (--strict: knip's skipTypeOnly drops type-only imports of packages and unresolved ones)
@@ -6395,13 +6502,13 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
       continue
     let cand = resolve.join(resolve.dirname(path), s)
     let ext = resolve.extname(s)
-    var ignored = is_ignored_path(p, cand, false)
+    var ignored = is_ignored_path_m(&b, p, cand)
     if not ignored:
       let al = resolve.alias_exts(ext)
       if al.len > 0:
         let base = cand[0..cand.len - ext.len]
         for a in al:
-          if a != ext and is_ignored_path(p, base + a, false): ignored = true
+          if a != ext and is_ignored_path_m(&b, p, base + a): ignored = true
     # (an import whose JSDoc tags the --tags exclude isn't reported)
     if u.tags != 0 and tag_ignored(p, u.tags): continue
     if not ignored and (ext == "" or (ext != ".json" and not foreign_ext(ext))):
@@ -6532,6 +6639,16 @@ type RDone:
 # A resolver thread: each file's imports resolved, with its own copy of the resolver (clone_cfg).
 fn res_worker(fs: Fs, ffi: Ffi, own r0: Resolver, own jc: Chan[RJob], own rc: Chan[RDone]):
   var r = r0
+  res_loop(fs, ffi, &r, jc, rc)
+
+# (one of a wave's resolver threads: at the end its resolver, caches and all, goes back on `back` for
+# the next wave's thread of the same slot)
+fn res_worker_b(fs: Fs, ffi: Ffi, slot: Int, own r0: Resolver, own jc: Chan[RJob], own rc: Chan[RDone], own back: Chan[RSlot]):
+  var r = r0
+  res_loop(fs, ffi, &r, jc, rc)
+  back.send(RSlot(slot, r))
+
+fn res_loop(fs: Fs, ffi: Ffi, var r: Resolver, jc: Chan[RJob], rc: Chan[RDone]):
   r.lister = own fn(d: Str) => term.list(ffi, d)?
   r.kind = own fn(x: Str) => term.kind(ffi, x)
   while true:
@@ -6540,12 +6657,20 @@ fn res_worker(fs: Fs, ffi: Ffi, own r0: Resolver, own jc: Chan[RJob], own rc: Ch
     for sp in j.specs: out.push(resolve.resolve(&r, fs, sp, j.from))
     rc.send(RDone(j.idx, out))
 
+type RSlot:
+  slot: Int
+  r: Resolver
+
 # The configs loaded on a thread of its own (term.node_par), the answers sent back; then the end of the
 # speculative reading's channel for the main thread (a Done of index -1).
 fn node_task(ffi: Ffi, own js: Str, own text: Str, workers: Int, own ach: Chan[Str], own sc: Chan[Done]):
   let a = term.node_par(ffi, js, text, workers)
   ach.send(a)
   sc.send(Done(-1, empty_raw(""), []))
+
+# the configs loaded on a thread of its own (term.node_par), the answers sent back
+fn node_bg(ffi: Ffi, own js: Str, own text: Str, workers: Int, own ach: Chan[Str]):
+  ach.send(term.node_par(ffi, js, text, workers))
 
 # which resolver thread a file's imports go to: by its folder
 fn dir_slot(path: Str, n: Int) -> Int:
@@ -7104,6 +7229,13 @@ fn load_config_file(var p: Proj, fs: Fs, os: Os, f: Str, call_args: Value) -> Va
   if ext == ".yaml" or ext == ".yml" or f.endswith("rc"):
     let text = fs.read(path) else return json.Null
     return yaml.parse(text)
+  # (a config that is only data is read here: node would give its JSON. Not with --cache, which
+  # records what node loaded)
+  if p.cfg_cache == "" and os.env("VKNIP_NO_STATIC_CFG") == "":
+    let text = fs.read(path) else ""
+    if text != "":
+      let sv = asth.static_config(f, text) else json.Null
+      if json.kind(sv) == "object": return sv
   var reqs: [loader.Req] = [loader.Req(path, "call", json.Arr([json.copy(call_args)]))]
   let res = node_cfg(&p, reqs)
   let r = pkg.get(res[path], "ok")
@@ -7240,10 +7372,37 @@ fn pm_match(pats: [Str], name: Str) -> Bool:
     if glob.match_str(pt, name, false): return true
   return false
 
+# (pkg.get copies what it returns: these walk down to the value in place, and copy only that)
+fn get_in(v: Value, path: [Str], i: Int) -> Value:
+  if i == path.len: return json.copy(v)
+  match v:
+    Obj(fields):
+      if path[i] in fields: return get_in(fields[path[i]], path, i + 1)
+      return json.Null
+    _: return json.Null
+
+fn has_in(v: Value, path: [Str], i: Int) -> Bool:
+  if i == path.len: return true
+  match v:
+    Obj(fields):
+      if path[i] in fields: return has_in(fields[path[i]], path, i + 1)
+      return false
+    _: return false
+
+# the keys of the object at path (nil when it isn't one)
+fn keys_in(v: Value, path: [Str], i: Int) -> [Str]?:
+  match v:
+    Obj(fields):
+      if i == path.len:
+        var out: [Str] = []
+        for k, _ in fields: out.push(k + "")
+        return out
+      if path[i] in fields: return keys_in(fields[path[i]], path, i + 1)
+      return nil
+    _: return nil
+
 fn configured_ws_keys(p: Proj) -> [Str]:
-  var keys: [Str] = ["."]
-  let wsv = pkg.get(p.cfg, "workspaces")
-  if pkg.is_obj(wsv): keys = pkg.keys(wsv)
+  let keys = keys_in(p.cfg, ["workspaces"], 0) else ["."]
   let ign = ignored_ws_patterns(p)
   var out: [Str] = []
   for k in keys:
@@ -7253,16 +7412,22 @@ fn configured_ws_keys(p: Proj) -> [Str]:
 # the configuration of a workspace (getWorkspaceConfig): the most specific matching key of
 # "workspaces", or the top level for the root
 fn ws_config(p: Proj, name: Str) -> Value:
+  let key = ws_config_key(p, name)
+  if key == "\0": return json.Obj({})
+  if key == "": return json.copy(p.cfg)
+  return get_in(p.cfg, ["workspaces", key], 0)
+
+# the key of workspaces the workspace's configuration is under ("" the top level, "\0" none)
+fn ws_config_key(p: Proj, name: Str) -> Str:
   var keys = sort_by_depth(configured_ws_keys(p))
   var k = keys.len - 1
   while k >= 0:
     let key = keys[k]
     if glob.match_str(key, name, false) or key == name:
-      let wsv = pkg.get(p.cfg, "workspaces")
-      if key == "." and not json.has(wsv, "."): return json.copy(p.cfg)
-      return pkg.get(wsv, key)
+      if key == "." and not has_in(p.cfg, ["workspaces", "."], 0): return ""
+      return key + ""
     k -= 1
-  return json.Obj({})
+  return "\0"
 
 fn setup_workspaces(var p: Proj, fs: Fs, os: Os, root_manifest: Value, ws_args: [Str]) -> Str:
   let listed = listed_workspaces(p, fs, root_manifest)
@@ -7535,32 +7700,33 @@ fn register_compilers(var p: Proj, fs: Fs, wi: Int):
       var ex = ""
       if e in raw: ex = raw[e] + ""
       if ex == "true" or (ex == "" and hit): comp_set(&comp, &order, e, bl[2], true)
-  if not early_cfg_off(p, wi, "astro"):
+  let wk = ws_config_key(p, p.ws[wi].name)
+  if not early_cfg_off(p, wk, "astro"):
     if hd(p, wi, "astro"): comp_set(&comp, &order, ".astro", "astro", false)
     if hd(p, wi, "@astrojs/mdx") or hd(p, wi, "@astrojs/starlight"): comp_set(&comp, &order, ".mdx", "astro-mdx", false)
-  if not early_cfg_off(p, wi, "fumadocs") and hd(p, wi, "fumadocs-mdx"): comp_set(&comp, &order, ".mdx", "mdx", false)
-  if not early_cfg_off(p, wi, "marko") and hd(p, wi, "marko"): comp_set(&comp, &order, ".marko", "marko:{wi}", false)
-  if not early_cfg_off(p, wi, "nuxt") and (hd(p, wi, "nuxt") or hd(p, wi, "nuxt-nightly") or exists_dir(p, fs, resolve.join(p.ws[wi].dir, ".nuxt"))):
+  if not early_cfg_off(p, wk, "fumadocs") and hd(p, wi, "fumadocs-mdx"): comp_set(&comp, &order, ".mdx", "mdx", false)
+  if not early_cfg_off(p, wk, "marko") and hd(p, wi, "marko"): comp_set(&comp, &order, ".marko", "marko:{wi}", false)
+  if not early_cfg_off(p, wk, "nuxt") and (hd(p, wi, "nuxt") or hd(p, wi, "nuxt-nightly") or exists_dir(p, fs, resolve.join(p.ws[wi].dir, ".nuxt"))):
     comp_set(&comp, &order, ".vue", "nuxt-vue:{wi}", false)
     comp_set(&comp, &order, ".ts", "nuxt-ts:{wi}", false)
-  if not early_cfg_off(p, wi, "prisma") and hd(p, wi, "prisma"): comp_set(&comp, &order, ".prisma", "prisma", false)
-  if not early_cfg_off(p, wi, "qwik") and hd(p, wi, "@builder.io/qwik-city"): comp_set(&comp, &order, ".mdx", "mdx", false)
-  if not early_cfg_off(p, wi, "stencil") and hd(p, wi, "@stencil/sass"):
+  if not early_cfg_off(p, wk, "prisma") and hd(p, wi, "prisma"): comp_set(&comp, &order, ".prisma", "prisma", false)
+  if not early_cfg_off(p, wk, "qwik") and hd(p, wi, "@builder.io/qwik-city"): comp_set(&comp, &order, ".mdx", "mdx", false)
+  if not early_cfg_off(p, wk, "stencil") and hd(p, wi, "@stencil/sass"):
     comp_set(&comp, &order, ".scss", "scss", false)
     comp_set(&comp, &order, ".sass", "scss", false)
-  if not early_cfg_off(p, wi, "storybook") and (hd(p, wi, "@storybook/addon-docs") or hd(p, wi, "@storybook/addon-essentials")): comp_set(&comp, &order, ".mdx", "mdx", false)
-  if not early_cfg_off(p, wi, "svelte") and hd(p, wi, "svelte"): comp_set(&comp, &order, ".svelte", "svelte", false)
-  if not early_cfg_off(p, wi, "tailwind"):
+  if not early_cfg_off(p, wk, "storybook") and (hd(p, wi, "@storybook/addon-docs") or hd(p, wi, "@storybook/addon-essentials")): comp_set(&comp, &order, ".mdx", "mdx", false)
+  if not early_cfg_off(p, wk, "svelte") and hd(p, wi, "svelte"): comp_set(&comp, &order, ".svelte", "svelte", false)
+  if not early_cfg_off(p, wk, "tailwind"):
     for d in ["tailwindcss", "@tailwindcss/vite", "@tailwindcss/webpack", "@tailwindcss/postcss", "@tailwindcss/cli"]:
       if hd(p, wi, d):
         comp_set(&comp, &order, ".css", "tailwind", false)
         break
-  if not early_cfg_off(p, wi, "unplugin-auto-import") and hd(p, wi, "unplugin-auto-import"):
+  if not early_cfg_off(p, wk, "unplugin-auto-import") and hd(p, wi, "unplugin-auto-import"):
     comp_set(&comp, &order, ".vue", "vue-auto", false)
     comp_set(&comp, &order, ".ts", "ts-auto", false)
-  if not early_cfg_off(p, wi, "unplugin-vue-components") and hd(p, wi, "unplugin-vue-components"): comp_set(&comp, &order, ".vue", "vue-auto", false)
-  if not early_cfg_off(p, wi, "unplugin-vue-markdown") and hd(p, wi, "unplugin-vue-markdown"): comp_set(&comp, &order, ".md", "md-auto", false)
-  if not early_cfg_off(p, wi, "vue"):
+  if not early_cfg_off(p, wk, "unplugin-vue-components") and hd(p, wi, "unplugin-vue-components"): comp_set(&comp, &order, ".vue", "vue-auto", false)
+  if not early_cfg_off(p, wk, "unplugin-vue-markdown") and hd(p, wi, "unplugin-vue-markdown"): comp_set(&comp, &order, ".md", "md-auto", false)
+  if not early_cfg_off(p, wk, "vue"):
     for d in ["vue", "nuxt", "unplugin-vue", "@vitejs/plugin-vue"]:
       if hd(p, wi, d):
         comp_set(&comp, &order, ".vue", "vue-auto", false)
@@ -7592,10 +7758,10 @@ fn comp_set(var comp: {Str: Str}, var order: [Str], ext: Str, id: Str, replace: 
   order.push(ext + "")
 
 # a plugin turned off in the configuration, before the workspace's settings are applied
-fn early_cfg_off(p: Proj, wi: Int, key: Str) -> Bool:
-  let wc = ws_config(p, p.ws[wi].name)
+# (wk: the workspace's ws_config_key; its value read where it is, as ws_config copies the top level)
+fn early_cfg_off(p: Proj, wk: Str, key: Str) -> Bool:
   var v = pkg.get(p.cfg, key)
-  if json.has(wc, key): v = pkg.get(wc, key)
+  if wk != "" and wk != "\0" and has_in(p.cfg, ["workspaces", wk, key], 0): v = get_in(p.cfg, ["workspaces", wk, key], 0)
   match v:
     Flag(b): return not b
     _: return false
@@ -9117,6 +9283,8 @@ fn add_ignore_pat(var p: Proj, pat: Str, id: Str, ws: Str, files: Bool):
   else:
     var pc = glob.compile(pat)
     p.ign_pats.push(pc)
+    p.ign_pre.push(glob.safe_prefix(pat))
+    p.ign_memo = {}
     p.ign_ids.push(id + "")
     p.ign_ids_full.push(strip_bang(pat))
     p.ign_ws.push(ws + "")
@@ -9367,6 +9535,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     root = dir + ""
     if not root.endswith("/"): root += "/"
   var p = new_proj(root)
+  p.dbg_glob = os.env("VKNIP_DBG_GLOB") != ""
   p.clk = own fn() => os.clock()
   p.list_links = own fn(d: Str) => term.links(ffi, d)
   p.list_dir = own fn(d: Str) => term.list(ffi, d)?
@@ -9374,6 +9543,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   p.rs.lister = own fn(d: Str) => term.list(ffi, d)?
   p.rs.kind = own fn(x: Str) => term.kind(ffi, x)
   p.realp = own fn(x: Str) => term.realpath(ffi, x)
+  if not opts.flag(a, "watch"): term.prelist(ffi, fspath(p, ""))
   # --cache: the configs' values from an earlier run, reused while everything they depended on is the
   # same (kcache.vu); the node processes then record what they load
   var ljs = loader.LOADER_JS + ""
@@ -9516,6 +9686,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     for t in pkg.strs(pkg.get(ii, pat)):
       if t in p.ignore_issues: p.ignore_issues[t].push(glob.compile(pat))
       else: p.ignore_issues[t] = [glob.compile(pat)]
+      p.iss_memo = {}
   # workspaces
   let werr = setup_workspaces(&p, fs, os, root_manifest, opts.strs_opt(a, "workspace"))
   ph(os, "setup_workspaces")
@@ -9537,6 +9708,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
           let full = prepend(p.ws[wi].dir, pat)
           if t in p.ignore_issues: p.ignore_issues[t].push(glob.compile(full))
           else: p.ignore_issues[t] = [glob.compile(full)]
+          p.iss_memo = {}
   var pairs: [Str] = []
   for n, wn in p.pkg_names:
     pairs.push(n + "")
@@ -9554,6 +9726,35 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     let m = json.copy(p.all_pkgs[n])
     let ex = pkg.get(m, "exports")
     p.rs.wsi.push(resolve.WsInfo(d, pkg.str_of(pkg.get(m, "name")), json.copy(ex), not is_null(ex), pkg.get(m, "imports")))
+  # the workspaces, each with its entry and project files
+  let trace_on = opts.flag(a, "trace") or opts.has_str(a, "trace-file") or opts.has_str(a, "trace-export") or opts.has_str(a, "trace-dependency")
+  var b = Build({}, Graph({}, []), {}, {}, {}, {}, {}, [], p.on["cycles"] or trace_on, [], {}, trace_on, {}, {}, {}, {}, {})
+  if p.config_file != "": add_entry(&b, p.config_file, true, true)
+  let cli_inc_entry = opts.flag(a, "include-entry-exports")
+  for wi in 0..p.ws.len:
+    if not p.ws[wi].has_manifest: continue
+    p.cur = wi
+    p.ws[wi].inc_entry = cli_inc_entry
+    if p.report_deps:
+      let t_meta = pt(p)
+      load_dep_meta(&p, fs)
+      pe(&p, "getMetaDataFromPackageJson", t_meta)
+    register_compilers(&p, fs, wi)
+    for e in sc(p.ws[wi].cexts):
+      b.cexts[e] = true
+      if not accepted_ext("x" + e) and not opts.has(p.rs.extra_exts, e): p.rs.extra_exts.push(e + "")
+    apply_ws_config(&p, wi)
+    determine_plugins(&p, fs)
+  ph(os, "determine_plugins")
+  # (node loads the plugins' configs on a thread of its own while the project is walked: what decides
+  # them, the workspaces' dependencies and configuration, doesn't depend on the project's files)
+  var early_pf: [[loader.Req]] = []
+  let early_ach: Chan[Str] = chan(1)
+  var early_tried = false
+  if os.env("VKNIP_OVERLAP") != "1" and os.env("VKNIP_NO_EARLY_PF") == "":
+    early_tried = true
+    early_pf = prefetch_plan(&p, fs, os)
+    if early_pf.len > 0: spawn node_bg(ffi, ljs3 + "", loader.par_text(early_pf, fspath(p, "")), p.node_workers, early_ach)
   # .gitignore files: .git/info/exclude and the root's first (the walk adds the nested ones)
   glob.set_add(&p.ign, "**/node_modules")
   glob.set_add(&p.ign, ".git")
@@ -9595,26 +9796,6 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       if v != ws_of_slow(p, k + "/x"): eprint("DIRWS MISMATCH " + k)
   swap(&p.dir_ws, &dws)
   ph(os, "dir_ws")
-  # the workspaces, each with its entry and project files
-  let trace_on = opts.flag(a, "trace") or opts.has_str(a, "trace-file") or opts.has_str(a, "trace-export") or opts.has_str(a, "trace-dependency")
-  var b = Build({}, Graph({}, []), {}, {}, {}, {}, {}, [], p.on["cycles"] or trace_on, [], {}, trace_on, {}, {}, {}, {}, {})
-  if p.config_file != "": add_entry(&b, p.config_file, true, true)
-  let cli_inc_entry = opts.flag(a, "include-entry-exports")
-  for wi in 0..p.ws.len:
-    if not p.ws[wi].has_manifest: continue
-    p.cur = wi
-    p.ws[wi].inc_entry = cli_inc_entry
-    if p.report_deps:
-      let t_meta = pt(p)
-      load_dep_meta(&p, fs)
-      pe(&p, "getMetaDataFromPackageJson", t_meta)
-    register_compilers(&p, fs, wi)
-    for e in sc(p.ws[wi].cexts):
-      b.cexts[e] = true
-      if not accepted_ext("x" + e) and not opts.has(p.rs.extra_exts, e): p.rs.extra_exts.push(e + "")
-    apply_ws_config(&p, wi)
-    determine_plugins(&p, fs)
-  ph(os, "determine_plugins")
   # (the project's JavaScript and TypeScript files are read on the other cores now, while node loads
   # the configs and the workspaces' entries are found; a wave takes a file's result from here when
   # it was read the way the wave reads it)
@@ -9639,12 +9820,13 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     for f in spec_files:
       let n = spec_slots.len
       spec_ix[f] = n
-      sjc.send(Job(n, f + "", "", ""))
       spec_slots.push(empty_raw(""))
       spec_have.push(false)
   sjc.close()
   if spec_on:
-    for _ in 0..jobs: spawn worker(fs, os, false, root + "", sc(spec_tags), sjc, spec_rc)
+    term.readahead(ffi, root, spec_files)
+    term.jobs_init(ffi, spec_files.len)
+    for _ in 0..jobs: spawn spec_worker(fs, os, ffi, root + "", sc(spec_tags), sc(spec_files), spec_rc)
   # (with cores to spare: node loads the configs on a thread of its own while the files read so far
   # have their imports resolved, by resolver threads with a copy of the resolver as it is now; the
   # node thread ends the speculative channel with a Done of index -1 when the configs are in)
@@ -9657,6 +9839,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   var srhave: [Bool] = []
   var srsent = 0
   var srkey = ""
+  var warm_rs: [Resolver] = []   # (VKNIP_PRERESOLVE) the last wave's resolver threads' resolvers, by slot
+  var warm_key = ""              # and their resolve.cfg_key
   var sr_n = jobs - 1
   if sr_n < 1: sr_n = 1
   var sqjs: [Chan[RJob]] = []
@@ -9683,6 +9867,10 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       srsent += 1
     let atext = ach.recv() else ""
     prefetch_apply(&p, sorted_pf, loader.par_answers(sorted_pf, atext))
+  elif early_tried:
+    if early_pf.len > 0:
+      let atext = early_ach.recv() else ""
+      prefetch_apply(&p, early_pf, loader.par_answers(early_pf, atext))
   else: prefetch(&p, fs, os)
   ph(os, "prefetch")
   for wi in 0..p.ws.len:
@@ -9747,10 +9935,17 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
           jc.send(Job(i, paths[i] + "", comps[i] + "", pres[i] + ""))
           nmiss += 1
       jc.close()
+      # (the wave's files the speculative parse hasn't given out yet go first)
+      if use_spec:
+        var firsts: [Int] = []
+        for k in 0..wave.len:
+          let si = from_spec[k]
+          if si >= 0 and not spec_have[si]: firsts.push(si)
+        if firsts.len > 0: term.jobs_first(ffi, firsts)
       if os.env("VKNIP_PHASES") != "": spec_note(p, os, paths, comps, pres, spec_ix, use_spec, nmiss)
       var nw = jobs
       if nw > nmiss: nw = nmiss
-      for _ in 0..nw: spawn worker(fs, os, false, root + "", sc(utags), jc, rc)
+      for _ in 0..nw: spawn worker(fs, os, ffi, false, root + "", sc(utags), jc, rc)
       var slots: [Raw] = []
       var have: [Bool] = []
       for _ in 0..paths.len:
@@ -9758,9 +9953,10 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
         have.push(false)
       # (a large wave: each file's imports resolved by resolver threads as soon as it's read, so
       # linking, which stays in the wave's order here, mostly finds them done)
-      # (off unless asked for, VKNIP_PRERESOLVE=1: as with VKNIP_OVERLAP, the threads' own copies of the
-      # resolver repeat its work, more than they save on a monorepo with many tsconfigs)
-      var pre_on = false
+      # (in waves of 256 files or more: VKNIP_PRERESOLVE=0 or 1 says otherwise. Each thread's copy of
+      # the resolver repeats the main one's work, tsconfigs and all, so the threads keep theirs from
+      # wave to wave: on a 73-workspace monorepo linking went from 0.8 s to 0.25 s of the main thread)
+      var pre_on = wave.len >= 256
       if os.env("VKNIP_PRERESOLVE") == "1": pre_on = true
       if os.env("VKNIP_PRERESOLVE") == "0": pre_on = false
       # (one fewer than the cores, the main thread linking; each folder's files to the same thread, so
@@ -9769,6 +9965,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       if nres < 1: nres = 1
       var qjs: [Chan[RJob]] = []
       let qr: Chan[RDone] = chan(wave.len + 1)
+      let rback: Chan[RSlot] = chan(nres + 1)
       var rres: [[Res]] = []
       var rhave: [Bool] = []
       var rsent: [Bool] = []
@@ -9779,10 +9976,19 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
           rhave.push(false)
           rsent.push(false)
           if from_spec[k] >= 0: k_of_spec[from_spec[k]] = k
-        for _ in 0..nres:
+        # (the threads start with the last wave's resolvers while the configuration is the same: their
+        # caches carry over, as the main thread's do)
+        let rkey = resolve.cfg_key(p.rs)
+        let reuse = rkey == warm_key and warm_rs.len == nres
+        for slot in 0..nres:
           let rq: Chan[RJob] = chan(wave.len + 1)
-          spawn res_worker(fs, ffi, resolve.clone_cfg(p.rs), rq, qr)
+          if reuse:
+            var r = resolve.new_resolver("")
+            swap(&r, &warm_rs[slot])
+            spawn res_worker_b(fs, ffi, slot, r, rq, qr, rback)
+          else: spawn res_worker_b(fs, ffi, slot, resolve.clone_cfg(p.rs), rq, qr, rback)
           qjs.push(rq)
+        warm_key = rkey
         for k in 0..wave.len:
           let si0 = from_spec[k]
           if si0 >= 0 and si0 < srhave.len and srhave[si0]: continue
@@ -9812,10 +10018,27 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
           swap(&b.pre, &srres[si])
           b.pre_on = true
         elif pre_on and rsent[k]:
-          while not rhave[k]:
-            var rd = qr.recv() else break
-            swap(&rres[rd.idx], &rd.res)
-            rhave[rd.idx] = true
+          # (while it waits, the files read meanwhile go to the resolver threads, which would otherwise
+          # get them only when the main thread next waits for a file)
+          var rgone = false
+          while not rhave[k] and not rgone:
+            select:
+              let rd = qr.recv():
+                var rd2 = rd
+                swap(&rres[rd2.idx], &rd2.res)
+                rhave[rd2.idx] = true
+              let d = spec_rc.recv():
+                var d2 = d
+                if d2.idx >= 0 and d2.idx < spec_have.len and not spec_have[d2.idx]:
+                  swap(&spec_slots[d2.idx], &d2.raw)
+                  spec_have[d2.idx] = true
+                  if d2.idx in k_of_spec:
+                    let dk = k_of_spec[d2.idx]
+                    if not rsent[dk]:
+                      qjs[dir_slot(paths[dk], nres)].send(RJob(dk, paths[dk] + "", import_specs(spec_slots[d2.idx])))
+                      rsent[dk] = true
+              qr.closed():
+                rgone = true
           if rhave[k]:
             swap(&b.pre, &rres[k])
             b.pre_on = true
@@ -9824,10 +10047,21 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
         b.pre_on = false
         b.pre = []
       for rq2 in qjs: rq2.close()
+      if pre_on:
+        var got: [Resolver] = []
+        for _ in 0..nres: got.push(resolve.new_resolver(""))
+        var ngot = 0
+        for _ in 0..nres:
+          var bs = rback.recv() else break
+          if bs.slot >= 0 and bs.slot < nres:
+            swap(&got[bs.slot], &bs.r)
+            ngot += 1
+        swap(&warm_rs, &got)
+        if ngot != nres: warm_key = "\0"
       ph(os, "read+link")
       continue
     var tms: [[Float]] = []
-    var raws = read_batch_c(fs, os, p.pf.timerify, &tms, root, paths, comps, pres, jobs, &kw, &t, utags, &cache)
+    var raws = read_batch_c(fs, os, ffi, p.pf.timerify, &tms, root, paths, comps, pres, jobs, &kw, &t, utags, &cache)
     ph(os, "read_batch")
     for tm in tms:
       # (start, parsed, walk start, walk end, done; a file that didn't parse has no walk)
@@ -9845,16 +10079,17 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   # ignoreExportsUsedInFile: an export referenced in its own file (hasRefsInFile)
   var ids_: [Int] = []
   for id in b.order: ids_.push(id)
+  var opts_: {Int: Value} = {}   # (each workspace's option, copied once)
   for id in ids_:
+    if b.g.nodes[id].raw.local_refs.len == 0: continue
     let nd_wi = ws_of(p, b.g.nodes[id].path)
-    if nd_wi < 0 or b.g.nodes[id].raw.local_refs.len == 0: continue
-    let opt = json.copy(p.ws[nd_wi].ignore_in_file)
-    var refs: {Str: Bool} = {}
-    for r in b.g.nodes[id].raw.local_refs: refs[r] = true
+    if nd_wi < 0: continue
+    if not (nd_wi in opts_): opts_[nd_wi] = json.copy(p.ws[nd_wi].ignore_in_file)
+    let opt = opts_[nd_wi]
     for k in 0..b.g.nodes[id].raw.exps.len:
       let nm_ = b.g.nodes[id].raw.exps[k].name + ""
       let ty_ = b.g.nodes[id].raw.exps[k].typ + ""
-      if nm_ in refs and count_refs(opt, ty_): b.g.nodes[id].raw.exps[k].in_file = true
+      if sorted_has(b.g.nodes[id].raw.local_refs, nm_) and count_refs(opt, ty_): b.g.nodes[id].raw.exps[k].in_file = true
   # unused files
   var n_analyzed = 0
   for id in b.order:
@@ -9864,6 +10099,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
   var buckets: [[Str]] = []
   for wi in 0..p.ws.len: buckets.push([])
   for f in p.files:
+    if not (f in b.project): continue
     let k = ws_of(p, f)
     if k >= 0: buckets[k].push(f + "")
   # within a workspace, the order knip's crawler lists files in: by depth, then folder by folder
@@ -9875,10 +10111,13 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
     for f in buckets[wi]:
       var rel = f + ""
       if wd != "" and rel.startswith(wd + "/"): rel = rel[wd.len + 1..rel.len]
-      let parts = rel.split("/")
-      var d = "{parts.len}"
+      # (the depth, then the parts: "\t".join(rel.split("/")))
+      var nparts = 1
+      for ci in 0..rel.len:
+        if rel[ci] == '/': nparts += 1
+      var d = "{nparts}"
       while d.len < 6: d = "0" + d
-      let k = d + "\t" + "\t".join(parts)
+      let k = d + "\t" + rel.replace("/", "\t")
       keys.push(k + "")
       back[k] = f + ""
     keys.sort()
@@ -10497,7 +10736,7 @@ fn add_file_issue(var p: Proj, f: Str):
       p.ignf_used[k] = true
   if pos == 0 and negs > 0: hit = true
   if hit and not neg: return
-  if should_ignore_issue(p, f, "files"): return
+  if should_ignore_issue(&p, f, "files"): return
   var i = issue("files", f, f)
   i.ws = ""
   i.severity = p.rules["files"] + ""

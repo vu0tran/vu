@@ -14,6 +14,8 @@ type Pat:
   dot_lit: Bool    # (such a pattern names a segment starting with '.')
   need: [[Str]]    # each alternative's literal segments: a path it matches has each of them
   tail: [Bool]     # each alternative's last segment is one name (not '**'): the path's last part matches it
+  spre: [Str] = [] # (when every alternative is literal folders, '**', then '*' and a literal suffix) each
+  ssuf: [Str] = [] # one's folders ("a/b/", or "") and suffix: with dot, the path is below them and ends so
 
 # The pattern with its {a,b} groups expanded into every combination.
 fn expand(p: Str) -> [Str]:
@@ -101,7 +103,29 @@ fn compile(pattern: Str) -> Pat:
       if seg != "" and seg != "**" and not is_dynamic(seg) and seg.find("\\") < 0: n.push(seg + "")
     need.push(n)
     tail.push(a.len > 0 and a[a.len - 1] != "**")
-  return Pat(alts, neg, fast, lit, [], false, need, tail)
+  var pt = Pat(alts, neg, fast, lit, [], false, need, tail)
+  simple_shape(&pt)
+  return pt
+
+# (try_one's quick check) every alternative is plain folders, '**' and '*SUFFIX' (SUFFIX plain)
+fn simple_shape(var pt: Pat):
+  if pt.neg or pt.fast != 0 or pt.alts.len == 0: return
+  var pres: [Str] = []
+  var sufs: [Str] = []
+  for a in pt.alts:
+    if a.len < 2 or a[a.len - 2] != "**": return
+    let last = a[a.len - 1]
+    if last.len < 2 or last[0] != '*': return
+    let suf = last[1..last.len]
+    if not plain_seg(suf): return
+    var pre = ""
+    for i in 0..a.len - 2:
+      if not plain_seg(a[i]): return
+      pre += a[i] + "/"
+    pres.push(pre)
+    sufs.push(suf)
+  swap(&pt.spre, &pres)
+  swap(&pt.ssuf, &sufs)
 
 fn matches(pt: Pat, path: Str, dot: Bool) -> Bool:
   if pt.rxs.len > 0: return rx_match(pt, path, dot)
@@ -451,6 +475,7 @@ type PatSet:
   pats: [Pat]
   by_pre: {Str: [Int]}
   every: [Int]
+  by_name: {Str: [Int]} = {}   # ("**/name" patterns without a literal prefix: by the name, the path's last part)
 
 fn new_set() -> PatSet:
   return PatSet([], {}, [])
@@ -476,7 +501,12 @@ fn set_add(var st: PatSet, pattern: Str):
   let k = st.pats.len
   st.pats.push(compile(pattern))
   let pre = safe_prefix(pattern)
-  if pre == "": st.every.push(k)
+  var name = ""
+  if pre == "" and st.pats[k].fast == 1 and not st.pats[k].neg: name = st.pats[k].lit + ""
+  if name != "":
+    if name in st.by_name: st.by_name[name].push(k)
+    else: st.by_name[name] = [k]
+  elif pre == "": st.every.push(k)
   elif pre in st.by_pre: st.by_pre[pre].push(k)
   else: st.by_pre[pre] = [k]
 
@@ -484,6 +514,9 @@ fn set_len(st: PatSet) -> Int:
   return st.pats.len
 
 fn try_one(pt: Pat, path: Str, dot: Bool, var parts: [Str], var split: Bool) -> Bool:
+  if dot and pt.spre.len > 0:
+    let r = simple_try(pt, path)
+    if r != 2: return r == 1
   if pt.rxs.len > 0: return rx_match(pt, path, dot)
   if pt.fast != 0: return fast_match(pt, path, dot)
   if not split:
@@ -493,12 +526,35 @@ fn try_one(pt: Pat, path: Str, dot: Bool, var parts: [Str], var split: Bool) -> 
     if alt_matches(pt, k, parts, dot): return true
   return false
 
+# (dot) 1 a simple-shaped pattern matches, 0 it doesn't, 2 ask the full matcher (a last part that is
+# the suffix itself)
+fn simple_try(pt: Pat, path: Str) -> Int:
+  var b = path.len
+  while b > 0 and path[b - 1] != '/': b -= 1
+  let base_len = path.len - b
+  for k in 0..pt.spre.len:
+    let pre = pt.spre[k]
+    if pre != "" and not path.startswith(pre): continue
+    if b < pre.len: continue
+    let suf = pt.ssuf[k]
+    if base_len < suf.len or not path.endswith(suf): continue
+    if base_len == suf.len: return 2
+    return 1
+  return 0
+
 # Whether any pattern of the set matches the path.
 fn set_any(st: PatSet, path: Str, dot: Bool) -> Bool:
   var parts: [Str] = []
   var split = false
   for k in st.every:
     if try_one(st.pats[k], path, dot, &parts, &split): return true
+  if st.by_name.len > 0:
+    var b = path.len
+    while b > 0 and path[b - 1] != '/': b -= 1
+    let last = path[b..path.len]
+    if last in st.by_name:
+      for k in st.by_name[last]:
+        if try_one(st.pats[k], path, dot, &parts, &split): return true
   if st.by_pre.len == 0: return false
   for j in 0..path.len:
     if path[j] == '/':
@@ -519,6 +575,32 @@ fn literal_path(pt: Pat, src: Str) -> Str:
   for seg in pt.alts[0]:
     if seg == "" or seg == "**" or is_dynamic(seg) or seg.find("]") >= 0: return ""
   return "/".join(pt.alts[0])
+
+# Where the files a pattern can match are, when that's a few places (glob_files): for each alternative
+# "L" and its path when it has no glob characters, or "D" and its folder ("" the project's) when only
+# its last segment has; [] when an alternative is neither ('**', or glob characters before the last
+# segment).
+fn alt_plan(pt: Pat, src: Str) -> [Str]:
+  var out: [Str] = []
+  if pt.rxs.len > 0 or pt.fast != 0 or pt.alts.len == 0 or src.find("\\") >= 0: return []
+  for a in pt.alts:
+    if a.len == 0: return []
+    var dir = ""
+    for i in 0..a.len - 1:
+      let seg = a[i]
+      if not plain_seg(seg): return []
+      if i > 0: dir += "/"
+      dir += seg
+    let last = a[a.len - 1]
+    if last == "" or last == "**" or last == "." or last == "..": return []
+    if plain_seg(last):
+      if dir == "": out.push("L" + last)
+      else: out.push("L" + dir + "/" + last)
+    else: out.push("D" + dir)
+  return out
+
+fn plain_seg(seg: Str) -> Bool:
+  return seg != "" and seg != "." and seg != ".." and seg != "**" and not is_dynamic(seg) and seg.find("]") < 0 and seg.find("\\") < 0
 
 # Whether every alternative of the pattern is one segment without '**' (it can only match a file of
 # the project's folder).

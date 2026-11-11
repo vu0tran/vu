@@ -103,6 +103,7 @@ type Raw:
   lines: [Int]      # line starts (bytes)
   wide: Bool        # has non-ASCII bytes (columns count UTF-16 units)
   src: Str          # kept only when wide (for columns)
+  lines16: [Int]    # (when wide) each line start's offset in UTF-16 units, so loc scans one line
   globs: [Str]      # import globs (plugin visitors): kind \t cwd \t base \t filter \t patterns joined by \n
   local_refs: [Str] # names referenced in the file (ignoreExportsUsedInFile; only when asked for)
 
@@ -164,6 +165,7 @@ type St:
   want_binds: Bool          # (--trace) the exports' bindings are recorded (set_bind)
   at_bits: Int              # the JSDoc words in the file (at_scan)
   stmt_tags: Int            # the JSDoc tags of the statement being read (its imports carry them)
+  lr_want: {Str: Bool} = {}   # (local_refs) the file's export names: the only names asked about
 
 fn new_st(own src: Str, path: Str) -> St:
   let is_js = path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")
@@ -185,6 +187,40 @@ fn at_word(src: Str, i: Int, w: Str) -> Bool:
   for k in 0..w.len:
     if src[i + k] != w[k]: return false
   return true
+
+# src.find(nd, from), by way of the needle's rarest byte: a one-byte find is memchr, many times faster
+# than the C library's memmem for a longer needle (macOS: 20 GB/s against 0.9). A needle of only
+# letters, digits and spaces is looked for as it is.
+fn ffind(src: Str, nd: Str, from: Int) -> Int:
+  var k = -1
+  var best = 9
+  for i in 0..nd.len:
+    let r = byte_rank(nd[i])
+    if r <= best:
+      best = r
+      k = i
+  if k < 0 or best >= 4 or nd.len < 2: return src.find(nd, from)
+  let one = nd[k..k + 1]
+  var i = src.find(one, from + k)
+  while i >= 0:
+    let st = i - k
+    if st + nd.len > src.len: return -1
+    var ok = true
+    for j in 0..nd.len:
+      if src[st + j] != nd[j]:
+        ok = false
+        break
+    if ok: return st
+    i = src.find(one, i + 1)
+  return -1
+
+# (how common a byte is in source text: lower is rarer; 4 and up aren't worth looking for alone)
+fn byte_rank(c: Byte) -> Int:
+  if (c >= 'a' and c <= 'z') or c == ' ' or c == '\n' or c == '\t' or c == '\r': return 5
+  if (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9'): return 4
+  if c == '.': return 3
+  if c == '(' or c == ')' or c == '{' or c == '}' or c == ';' or c == ':' or c == '=' or c == ',' or c == '"' or c == '\'' or c == '*' or c == '/' or c == '-' or c == '_': return 2
+  return 1
 
 fn at_scan(src: Str) -> Int:
   var bits = 0
@@ -348,8 +384,10 @@ fn is_word(c: Byte) -> Bool:
 fn build_tags(var s: St):
   # only these tags matter: without them in the file, every lookup gives nothing
   var any_user = false
-  for u in s.user_tags:
-    if s.src.find(u) >= 0: any_user = true
+  # (a tag is a word after '@': a file without one has none)
+  if s.user_tags.len > 0 and s.src.find("@") >= 0:
+    for u in s.user_tags:
+      if ffind(s.src, u, 0) >= 0: any_user = true
   if not any_user and (s.at_bits & (AT_PUBLIC | AT_BETA | AT_ALIAS | AT_INTERNAL)) == 0: return
   let cm = comments(s.src)
   let n = s.src.len
@@ -2336,11 +2374,11 @@ fn has_module_syntax(t: Ast, root: Int, src: Str) -> Bool:
     if k == ast.N_IMPORT or k == ast.N_EXPORT or k == ast.N_EXPORTDEFAULT or k == ast.N_EXPORTASSIGN: return true
     if k == ast.N_IMPORTEQ and kind(t, t.nd[st].a) == ast.N_EXTERNALREF: return true
     if (k == ast.N_VAR or k == ast.N_FUNC or k == ast.N_CLASS or k == ast.N_INTERFACE or k == ast.N_TYPEALIAS or k == ast.N_ENUM or k == ast.N_MODULE) and is_exported_decl(t, st): return true
-  return src.find("import.meta") >= 0
+  return ffind(src, "import.meta", 0) >= 0
 
 # imports written in comments (extractImportsFromComments)
 fn comment_imports(var s: St, first_stmt: Int):
-  if (s.at_bits & (AT_IMPORT | AT_JSX | AT_ENV)) == 0 and s.src.find("import(") < 0 and s.src.find("<reference") < 0: return
+  if (s.at_bits & (AT_IMPORT | AT_JSX | AT_ENV)) == 0 and ffind(s.src, "import(", 0) < 0 and ffind(s.src, "<reference", 0) < 0: return
   let cm = comments(s.src)
   var i = 0
   while i < cm.len:
@@ -2622,6 +2660,17 @@ fn line_starts(src: Str) -> [Int]:
     i = src.find("\n", i + 1)
   return out
 
+# (for loc) the UTF-16 offset of each line start; [] when src is "" (not kept: no wide bytes)
+fn line_starts16(src: Str, lines: [Int]) -> [Int]:
+  var out: [Int] = []
+  if src == "": return out
+  var n = 0
+  out.push(0)
+  for k in 1..lines.len:
+    n += u16(src, lines[k - 1], lines[k])
+    out.push(n)
+  return out
+
 fn has_wide(src: Str) -> Bool:
   for i in 0..src.len:
     if src[i] >= 128: return true
@@ -2666,7 +2715,8 @@ fn analyze_tc(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags
       if pre.ok: swap(&imps, &pre.imps)
     var keep = ""
     if wide: swap(&keep, &s.src)
-    return Raw(path + "", false, [], imps, [], [], [], 0, lines, wide, keep, [], [])
+    let l16 = line_starts16(keep, lines)
+    return Raw(path + "", false, [], imps, [], [], [], 0, lines, wide, keep, l16, [], [])
   let root = t.nd.len - 1
   build_tags(&s)
   s.module_file = has_module_syntax(t, root, s.src)
@@ -2676,7 +2726,7 @@ fn analyze_tc(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags
   if "static-only" in s.vis:
     var si: [Imp] = []
     swap(&si, &s.imps)
-    return Raw(path + "", true, [], si, [], [], [], 0, lines, false, "", [], [])
+    return Raw(path + "", true, [], si, [], [], [], 0, lines, false, "", [], [], [])
   static_reexports(&s, t, root)
   s.stmt_tags = 0
   if s.vis.len > 0: plugin_visitors(&s, t, root)
@@ -2747,8 +2797,11 @@ fn analyze_tc(path: Str, own src: Str, var kw: {Str: Int}, var t: Ast, user_tags
   var gl: [Str] = []
   swap(&gl, &s.globs)
   var lr: [Str] = []
-  if "refs" in s.vis: lr = local_refs(s, t)
-  return Raw(path + "", true, scs, imps, ops, exps, dups, s.n_static_exports, lines, wide, keep, gl, lr)
+  if "refs" in s.vis:
+    for e in exps: s.lr_want[e.name] = true
+    if s.lr_want.len > 0: lr = local_refs(s, t)
+  let l16 = line_starts16(keep, lines)
+  return Raw(path + "", true, scs, imps, ops, exps, dups, s.n_static_exports, lines, wide, keep, l16, gl, lr)
 
 # line, column (1-based, in UTF-16 units) and offset (UTF-16) of byte offset pos
 fn loc(r: Raw, pos: Int) -> [Int]:
@@ -2759,7 +2812,9 @@ fn loc(r: Raw, pos: Int) -> [Int]:
     if r.lines[mid] <= pos: lo = mid
     else: hi = mid - 1
   if not r.wide: return [lo + 1, pos - r.lines[lo] + 1, pos]
-  return [lo + 1, u16(r.src, r.lines[lo], pos) + 1, u16(r.src, 0, pos)]
+  let col = u16(r.src, r.lines[lo], pos)
+  if lo < r.lines16.len: return [lo + 1, col + 1, r.lines16[lo] + col]
+  return [lo + 1, col + 1, u16(r.src, 0, pos)]
 
 fn u16(src: Str, a: Int, b: Int) -> Int:
   var n = 0
@@ -3232,7 +3287,7 @@ fn local_refs(s: St, t: Ast) -> [Str]:
       while kind(t, left) == ast.N_QNAME: left = t.nd[left].a
       if is_id(t, left):
         let root = nm(t, left)
-        if not (root in s.li) and not shadowed(s, root, t.nd[left].pos): refs[root] = true
+        if root in s.lr_want and not (root in s.li) and not shadowed(s, root, t.nd[left].pos): refs[root] = true
     elif k == ast.N_TREF or k == ast.N_TQUERY:
       if is_id(t, a) and not (nm(t, a) in s.li): lref(s, t, a, &refs, &imported)
   # an imported name referenced in the file: the names it's exported as (localToExports)
@@ -3241,7 +3296,9 @@ fn local_refs(s: St, t: Ast) -> [Str]:
     if key in s.ref_in:
       for e in s.ref_in[key]: refs[e + ""] = true
   var out: [Str] = []
-  for name, _ in refs: out.push(name + "")
+  for name, _ in refs:
+    if name in s.lr_want: out.push(name + "")
+  out.sort()   # (sorted: the main thread looks names up by bisection)
   return out
 
 fn is_assign(op: Int) -> Bool:
@@ -3252,6 +3309,8 @@ fn lref(s: St, t: Ast, n: Int, var refs: {Str: Bool}, var imported: {Str: Bool})
   lref_name(s, nm(t, n), t.nd[n].pos, &refs, &imported)
 
 fn lref_name(s: St, name: Str, pos: Int, var refs: {Str: Bool}, var imported: {Str: Bool}):
+  # (only the file's export names are asked about, and imported names for the exports they become)
+  if not (name in s.lr_want) and not (name in s.li): return
   if shadowed(s, name, pos): return
   if name in s.li: imported[name] = true
   else: refs[name] = true

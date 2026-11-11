@@ -550,6 +550,82 @@ What's left on n8n (7.1 s): node loading the configs (2.5 s of wall, shared with
 threads), the workspaces' entries and plugins on one core (1.8 s), and linking (resolution, 2 s),
 which stays on one core because the resolver's caches and tsconfig state are one value.
 
+**A private monorepo on macOS** (`js/` of a company repository: 73 workspaces, about 30,000 files
+analyzed, no dependencies installed, so both tools print the same config-loading errors; Apple
+silicon, 10 cores, Node 25, jiti from NODE_PATH as the npm launcher sets it). Median of 9 alternating
+runs (knip: 3), wall and CPU seconds; stdout identical between the vknip builds in every run. The
+machine wasn't idle (a `git status` of the desktop app and macOS's media analysis took one to two
+cores throughout), so the numbers are a little worse than a quiet machine's:
+
+| | knip 6.44.1 | vknip before | vknip now |
+|---|---:|---:|---:|
+| wall | 21.15 | 5.41 | 1.98 |
+| CPU | 29.52 | 14.24 | 10.96 |
+
+Found with `sample` (macOS) and `VKNIP_PHASES=1`, in order of size:
+
+1. **Issue locations rescanned their file from the start.** `extract.loc` counted the UTF-16 offset
+   from byte 0 for every issue in a file with non-ASCII text: in generated GraphQL files of 1 to 4 MB
+   with hundreds of ignored exports, 1.7 s on the main thread. Each line start's UTF-16 offset is now
+   kept with the file (`lines16`), so a location scans only its line. 5.4 s -> 3.6 s.
+2. **Linking on one core.** Each wave's imports are resolved on resolver threads as files come in
+   (this was `VKNIP_PRERESOLVE=1`, off because each thread's fresh copy of the resolver loaded every
+   tsconfig again). The threads now hand their resolvers, caches and all, to the next wave's threads
+   while the configuration (`resolve.cfg_key`) is the same, and it is on for waves of 256 files or
+   more; while the main thread waits for a file's resolution it passes the files read meanwhile to
+   the resolver threads (a `select` on both channels). The main thread's linking 0.8 s -> 0.25 s.
+3. **The main thread kept off its own thread.** New tasks go to the threads in turn, the main
+   thread's too, and a task runs until it waits: a parse worker on the main thread's thread, whose
+   queue was never empty, ran whenever the main thread waited and kept it waiting until the parse was
+   done (0.9 s once node's answers came early). Workers now give the thread's other tasks a turn
+   after each file when one is ready (`term.yield_if_ready`, a look at the thread's ready queues;
+   `os.sleep(0)` after each file instead went through the timers and slowed the parse by half).
+4. **Node off the critical path.** The project's `knip.config.ts` is plain data (an object literal
+   with a type annotation): such a config (type-only imports, types, `const`s of literals and
+   `export default` of an object; strings without escapes, integers, booleans, null, arrays and
+   objects with plain keys; anything else goes to node as before, and not with `--cache`) is read
+   from its AST (`asth.static_config`; on this one byte for byte jiti's JSON, and on 23 tricky
+   configs either jiti's value or node). And the plugins' configs, which depend only on the
+   workspaces' dependencies and configuration, are loaded by node on a thread of its own while the
+   project is walked, rather than after. 0.17 s + about 0.3 s of waiting.
+5. **Reading the files.** macOS serializes `open` in the kernel: 38,000 of the files took 0.35 s on
+   4 threads and 0.85 s (8 s of system time) on 10. Three threads read the speculative parse's files
+   ahead of the workers (`term.readahead`/`take`: a worker that gets ahead reads its file itself), and
+   the parse takes its files from a queue in C (`term.job_next`) that puts the first wave's files
+   first once the wave is known: the first wave's wait for the parse 0.3 to 0.5 s -> 0.03 s. A cap on
+   concurrent reads (4) saved CPU but no wall time, and was left out.
+6. **Ignore patterns tried on every issue.** `ignored_issue_file` matched every `ignore` pattern (and
+   `should_ignore_issue` every `ignoreIssues` pattern) for each issue: now remembered per file (and
+   per type), and a pattern whose literal folders the path isn't in is skipped. About 0.25 s.
+7. **The walk listed one folder at a time.** Three threads list the project's folders breadth first
+   into the listing cache from the start of the run (not node_modules or .git), outside the cache's
+   lock; the kinds a listing tells (folder, plain file) answer later stats, and a name a listed
+   folder doesn't have (ASCII, no symbolic links there, none the same but for case) isn't stat-ed.
+   Gitignore patterns `**/name` are looked up by name instead of tried on each path. The walk
+   0.44 s -> 0.17 s.
+8. **Smaller ones.** `glob_files` looks up patterns that name files or one folder's files (brace
+   lists like `dangerfile.{js,cjs,mjs,ts}`, `dir/*.ts`) instead of trying them on every file below
+   their folders, and matches `dir/**/*.ext` by prefix and suffix (238 ms -> about 100). Values of the
+   configuration are read in place (`pkg.get` copies: `early_cfg_off` copied the whole top level per
+   workspace and compiler). `local_refs` (ignoreExportsUsedInFile) records only the file's export
+   names, sorted, for a lookup by bisection. Whole-file `find`s of multi-byte needles look for their
+   rarest byte with a one-byte find (`extract.ffind`: macOS's `memmem` is 0.9 GB/s, its `memchr`
+   20). Gitignore checks of resolved files remember each folder's answer.
+
+The `--cache` format is now `vknip-cache-2` (files' entries carry `lines16` and sorted
+`local_refs`): a cache written by an earlier version is read as empty and rebuilt once.
+
+Checked: stdout byte for byte and stderr between the builds on this repository for the default
+run, `--production`, `--strict`, the json and compact reporters, `-W` (two workspaces), `--include`,
+`--cache` (cold and warm), `--no-gitignore`, `--jobs 1`, and with each new path turned off
+(`VKNIP_NO_STATIC_CFG`, `VKNIP_NO_EARLY_PF`, `VKNIP_NO_READAHEAD`, `VKNIP_NO_PRELIST`,
+`VKNIP_PRERESOLVE=0`); `test/cases.py` to `cases11.py` against knip give what they gave before
+(268 of 269 identical; the one difference, cli_basic with two reporters, was there before). Not measured or checked: Linux, the corpus, knip's fixtures (`cmp_fixtures.py`).
+
+What's left (about 1.9 s): the speculative parse and node's configs sharing the cores (node takes
+0.1 to 0.4 s of waiting depending on how starved it is), the workspaces' entries and plugins on one
+core (0.4 to 0.55 s), the later waves (about 0.4 s), and the walk (0.17 s).
+
 **Configs with `--cache`** (issue #4: on a large private workspace, loading configs and finishing
 the graph were most of a 7 s run). vknip `--cache` also keeps the values of the JavaScript configs
 it loaded with Node.js, and uses them while nothing they depended on changed: the loader records

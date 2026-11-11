@@ -4,6 +4,7 @@
 #include <sys/ioctl.h>
 #include <poll.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <stdio.h>
 #ifdef __linux__
@@ -11,6 +12,222 @@
 #endif
 
 bool vk_isatty(int64_t fd) { return isatty((int)fd) == 1; }
+
+/* Read-ahead of the files the parse workers are about to read (vk_readahead, then vk_take per file):
+   a few threads of their own read them in the workers' order while the workers parse. Opening files
+   is slow and gets slower with many threads at once (macOS serializes open in the kernel: 38,000
+   files took 0.35 s on 4 threads, 0.85 s on 10), and a worker that opens its own files parses
+   nothing meanwhile. A file not read yet when asked for is the worker's to read (vk_take's "\0"
+   answer), as is one too big or past the memory cap. */
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <stdatomic.h>
+#define VKR_THREADS 3
+#define VKR_CAP ((size_t)512 << 20)   /* bytes read and not taken yet, at most */
+#define VKR_BIG ((off_t)8 << 20)      /* larger files are left to the workers */
+typedef struct { char *key; size_t klen; int st; bool ok; char *buf; size_t len; } vkr_ent;  /* st: 0 queued, 1 reading, 2 read, 3 the worker's */
+static vkr_ent *vkr_e = NULL;
+static size_t vkr_n = 0, vkr_hcap = 0;
+static size_t *vkr_h = NULL;          /* open addressing: entry index + 1, 0 empty */
+static char *vkr_root = NULL;
+static size_t vkr_rlen = 0;
+static atomic_size_t vkr_next = 0;
+static size_t vkr_held = 0;
+static atomic_bool vkr_on = false;
+static pthread_mutex_t vkr_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t vkr_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t vkr_hash(const char *p, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; i++) { h ^= (uint8_t)p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+static vkr_ent *vkr_find(const char *p, size_t n) {
+    if (!vkr_hcap) return NULL;
+    size_t h = (size_t)vkr_hash(p, n) & (vkr_hcap - 1);
+    while (vkr_h[h]) {
+        vkr_ent *e = &vkr_e[vkr_h[h] - 1];
+        if (e->klen == n && memcmp(e->key, p, n) == 0) return e;
+        h = (h + 1) & (vkr_hcap - 1);
+    }
+    return NULL;
+}
+static void *vkr_run(void *arg) {
+    (void)arg;
+    char path[4096];
+    for (;;) {
+        size_t i = atomic_fetch_add(&vkr_next, 1);
+        if (i >= vkr_n) return NULL;
+        vkr_ent *e = &vkr_e[i];
+        pthread_mutex_lock(&vkr_mu);
+        bool mine = e->st == 0 && vkr_held < VKR_CAP;
+        if (mine) e->st = 1;
+        pthread_mutex_unlock(&vkr_mu);
+        if (!mine) continue;
+        bool ok = false;
+        char *buf = NULL;
+        size_t len = 0;
+        if (vkr_rlen + e->klen + 1 < sizeof path) {
+            memcpy(path, vkr_root, vkr_rlen);
+            memcpy(path + vkr_rlen, e->key, e->klen);
+            path[vkr_rlen + e->klen] = 0;
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
+            struct stat st;
+            if (fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size <= VKR_BIG) {
+                buf = malloc((size_t)st.st_size + 1);
+                size_t want = (size_t)st.st_size;
+                ok = true;
+                while (len < want) {
+                    ssize_t r = read(fd, buf + len, want - len);
+                    if (r < 0) { ok = false; break; }
+                    if (r == 0) break;
+                    len += (size_t)r;
+                }
+                if (ok) {   /* (a file that grew since fstat: the rest too) */
+                    char extra[4096];
+                    ssize_t r;
+                    while ((r = read(fd, extra, sizeof extra)) > 0) {
+                        buf = realloc(buf, len + (size_t)r + 1);
+                        memcpy(buf + len, extra, (size_t)r);
+                        len += (size_t)r;
+                    }
+                    if (r < 0) ok = false;
+                }
+            }
+            if (fd >= 0) close(fd);
+        }
+        pthread_mutex_lock(&vkr_mu);
+        if (ok) { e->buf = buf; e->len = len; e->ok = true; e->st = 2; vkr_held += len; }
+        else { free(buf); e->st = 0; }   /* (the worker reads it, and reports the error as it would) */
+        pthread_cond_broadcast(&vkr_cv);
+        pthread_mutex_unlock(&vkr_mu);
+    }
+}
+/* paths: one per line, relative to root (a prefix: "" or "dir/"); once per run */
+void vk_readahead(const vu_str *root, const vu_str *paths) {
+    if (atomic_load(&vkr_on) || getenv("VKNIP_NO_READAHEAD")) return;
+    size_t n = 0;
+    for (int64_t i = 0; i < paths->len; i++) if (paths->data[i] == '\n') n++;
+    if (paths->len && paths->data[paths->len - 1] != '\n') n++;
+    if (!n) return;
+    vkr_e = calloc(n, sizeof(vkr_ent));
+    vkr_hcap = 16;
+    while (vkr_hcap < n * 2) vkr_hcap *= 2;
+    vkr_h = calloc(vkr_hcap, sizeof(size_t));
+    vkr_root = malloc((size_t)root->len + 1);
+    memcpy(vkr_root, root->data, (size_t)root->len);
+    vkr_rlen = (size_t)root->len;
+    const char *d = (const char *)paths->data;
+    size_t a = 0, k = 0;
+    for (size_t i = 0; i <= (size_t)paths->len && k < n; i++) {
+        if (i < (size_t)paths->len && d[i] != '\n') continue;
+        size_t len = i - a;
+        if (len && !vkr_find(d + a, len)) {
+            vkr_ent *e = &vkr_e[k];
+            e->key = malloc(len + 1);
+            memcpy(e->key, d + a, len);
+            e->key[len] = 0;
+            e->klen = len;
+            size_t h = (size_t)vkr_hash(e->key, len) & (vkr_hcap - 1);
+            while (vkr_h[h]) h = (h + 1) & (vkr_hcap - 1);
+            vkr_h[h] = ++k;
+        }
+        a = i + 1;
+    }
+    vkr_n = k;
+    atomic_store(&vkr_on, true);
+    int nt = VKR_THREADS;
+    const char *ev = getenv("VKNIP_READAHEAD_THREADS");
+    if (ev && atoi(ev) > 0) nt = atoi(ev);
+    for (int t = 0; t < nt; t++) {
+        pthread_t th;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        pthread_create(&th, &at, vkr_run, NULL);
+        pthread_attr_destroy(&at);
+    }
+}
+/* a file read ahead (waiting while a reader has it), once; "\0" when it wasn't: the caller reads it */
+vu_str vk_take(const vu_str *path) {
+    if (!atomic_load(&vkr_on)) return vu_str_from("\0", 1);
+    pthread_mutex_lock(&vkr_mu);
+    vkr_ent *e = vkr_find((const char *)path->data, (size_t)path->len);
+    if (!e || e->st == 3) { pthread_mutex_unlock(&vkr_mu); return vu_str_from("\0", 1); }
+    while (e->st == 1) pthread_cond_wait(&vkr_cv, &vkr_mu);
+    if (e->st != 2) { e->st = 3; pthread_mutex_unlock(&vkr_mu); return vu_str_from("\0", 1); }
+    char *buf = e->buf;
+    size_t len = e->len;
+    e->buf = NULL;
+    e->st = 3;
+    vkr_held -= len;
+    pthread_mutex_unlock(&vkr_mu);
+    vu_str r = vu_str_from(buf ? buf : "", (int64_t)len);
+    free(buf);
+    return r;
+}
+
+/* The speculative parse's queue (vk_jobs_init, vk_job_next): the files in order, except those the
+   main thread asks for first (vk_jobs_first: the first wave's, once it is known, so it waits less). */
+static pthread_mutex_t vkq_mu = PTHREAD_MUTEX_INITIALIZER;
+static unsigned char *vkq_taken = NULL;
+static int64_t vkq_n = 0, vkq_seq = 0;
+static int64_t *vkq_first = NULL;
+static int64_t vkq_nfirst = 0, vkq_ifirst = 0;
+void vk_jobs_init(int64_t n) {
+    pthread_mutex_lock(&vkq_mu);
+    free(vkq_taken);
+    free(vkq_first);
+    vkq_taken = calloc((size_t)(n > 0 ? n : 1), 1);
+    vkq_first = NULL;
+    vkq_n = n; vkq_seq = 0; vkq_nfirst = vkq_ifirst = 0;
+    pthread_mutex_unlock(&vkq_mu);
+}
+/* the next index to parse, -1 when every one was given out */
+int64_t vk_job_next(void) {
+    int64_t r = -1;
+    pthread_mutex_lock(&vkq_mu);
+    while (vkq_ifirst < vkq_nfirst) {
+        int64_t i = vkq_first[vkq_ifirst++];
+        if (i >= 0 && i < vkq_n && !vkq_taken[i]) { r = i; break; }
+    }
+    if (r < 0) {
+        while (vkq_seq < vkq_n && vkq_taken[vkq_seq]) vkq_seq++;
+        if (vkq_seq < vkq_n) r = vkq_seq++;
+    }
+    if (r >= 0) vkq_taken[r] = 1;
+    pthread_mutex_unlock(&vkq_mu);
+    return r;
+}
+/* idxs: indexes, one per line, to give out before the rest (in that order) */
+void vk_jobs_first(const vu_str *idxs) {
+    pthread_mutex_lock(&vkq_mu);
+    int64_t cnt = 0;
+    for (int64_t i = 0; i < idxs->len; i++) if (idxs->data[i] == '\n') cnt++;
+    int64_t *nf = malloc(sizeof(int64_t) * (size_t)(vkq_nfirst - vkq_ifirst + cnt + 1));
+    int64_t m = 0;
+    for (int64_t i = vkq_ifirst; i < vkq_nfirst; i++) nf[m++] = vkq_first[i];
+    int64_t v = 0;
+    bool any = false;
+    for (int64_t i = 0; i < idxs->len; i++) {
+        unsigned char c = idxs->data[i];
+        if (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); any = true; }
+        else if (c == '\n') { if (any) nf[m++] = v; v = 0; any = false; }
+    }
+    free(vkq_first);
+    vkq_first = nf; vkq_nfirst = m; vkq_ifirst = 0;
+    pthread_mutex_unlock(&vkq_mu);
+}
+
+/* A turn for the other tasks on this thread, when one is ready to run (a hint, read without the
+   loop's lock): new tasks go to the threads in turn, the main thread's too, and a worker that never
+   waits keeps whatever else is on its thread from running. vu_task_yield goes through the timers, so
+   it is only worth calling when something is waiting. (This file is compiled with the runtime.) */
+void vk_yield_if_ready(void) {
+    vu_loop *l = vu_my;
+    if (!l || !vu_cur_task) return;
+    if (__atomic_load_n(&l->rhead, __ATOMIC_RELAXED) || __atomic_load_n(&l->qhead, __ATOMIC_RELAXED)) vu_task_yield();
+}
 
 /* the processors online (Linux and macOS alike) */
 int64_t vk_cpus(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n < 1 ? 1 : (int64_t)n; }
@@ -191,13 +408,69 @@ static bool vkf_cpath(const vu_str *path, char *buf, size_t size) {
     if (path->len == 0) { buf[0] = '.'; buf[1] = 0; }
     return true;
 }
+/* Lists a folder outside the lock and puts the listing in the cache (unless another thread did
+   first), with the kinds of the entries the listing tells (a folder, a plain file: what stat would
+   say). Returns with vkf_mu held and the folder's entry. */
+static void vkf_set_kind(const char *dir, size_t dl, const char *name, size_t nl, int kind) {
+    char kb[4096];
+    size_t n = 0;
+    if (!(dl == 0 || (dl == 1 && dir[0] == '.'))) {
+        if (dl + nl + 2 > sizeof kb) return;
+        memcpy(kb, dir, dl);
+        n = dl;
+        if (kb[n - 1] != '/') kb[n++] = '/';
+    } else if (nl + 1 > sizeof kb) return;
+    memcpy(kb + n, name, nl);
+    n += nl;
+    vk_fent *c = vkf_get(kb, n);
+    if (c->kind < 0) c->kind = kind;
+}
+static vk_fent *vkf_listed_locked(const char *key, size_t klen, const char *cpath) {
+    pthread_mutex_lock(&vkf_mu);
+    vk_fent *e = vkf_get(key, klen);
+    if (e->listed) return e;
+    pthread_mutex_unlock(&vkf_mu);
+    vk_fent t;
+    memset(&t, 0, sizeof t);
+    vkf_list(&t, cpath);
+    pthread_mutex_lock(&vkf_mu);
+    e = vkf_get(key, klen);
+    if (e->listed) { free(t.list); free(t.links); return e; }
+    e->listed = true;
+    e->list_ok = t.list_ok;
+    e->list = t.list;
+    e->list_len = t.list_len;
+    e->links = t.links;
+    e->links_len = t.links_len;
+    if (t.list_ok) {
+        /* (links' kinds are left to stat: it follows them) */
+        size_t a = 0;
+        for (size_t i = 0; i < t.list_len; i++) {
+            if (t.list[i] != 0) continue;
+            size_t nl = i - a;
+            const char *nm = t.list + a;
+            a = i + 1;
+            if (nl == 0) continue;
+            bool dir = nm[nl - 1] == '/';
+            size_t bl = dir ? nl - 1 : nl;
+            bool link = false;
+            for (size_t q = 0; q < t.links_len;) {
+                size_t z = q;
+                while (z < t.links_len && t.links[z] != '\n') z++;
+                if (z - q == bl && memcmp(t.links + q, nm, bl) == 0) { link = true; break; }
+                q = z + 1;
+            }
+            if (!link) vkf_set_kind(key, klen, nm, bl, dir ? 2 : 1);
+        }
+        e = vkf_get(key, klen); /* (the table may have grown) */
+    }
+    return e;
+}
 /* fs.list, cached: "1" then each name and "\0", or "0" when the folder can't be read */
 vu_str vk_list(const vu_str *path) {
     char buf[4096];
     if (!vkf_cpath(path, buf, sizeof buf)) return vu_str_from("0", 1);
-    pthread_mutex_lock(&vkf_mu);
-    vk_fent *e = vkf_get(path->data, (size_t)path->len);
-    if (!e->listed) vkf_list(e, buf);
+    vk_fent *e = vkf_listed_locked((const char *)path->data, (size_t)path->len, buf);
     vu_str r;
     if (!e->list_ok) r = vu_str_from("0", 1);
     else {
@@ -214,12 +487,96 @@ vu_str vk_list(const vu_str *path) {
 vu_str vk_links(const vu_str *path) {
     char buf[4096];
     if (!vkf_cpath(path, buf, sizeof buf)) return vu_str_from("", 0);
-    pthread_mutex_lock(&vkf_mu);
-    vk_fent *e = vkf_get(path->data, (size_t)path->len);
-    if (!e->listed) vkf_list(e, buf);
+    vk_fent *e = vkf_listed_locked((const char *)path->data, (size_t)path->len, buf);
     vu_str r = e->list_ok ? vu_str_from(e->links, (int64_t)e->links_len) : vu_str_from("", 0);
     pthread_mutex_unlock(&vkf_mu);
     return r;
+}
+/* The folders below root listed ahead of the walk, on a few threads of their own (the walk is one
+   folder at a time, each listing a system call or two): breadth first, not node_modules or .git, at
+   most VKP_MAX folders. The walk then mostly finds its listings in the cache. Detached: a run that
+   ends first just stops them. */
+#define VKP_THREADS 3
+#define VKP_MAX 200000
+static pthread_mutex_t vkp_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t vkp_cv = PTHREAD_COND_INITIALIZER;
+static char **vkp_q = NULL;
+static size_t vkp_head = 0, vkp_len = 0, vkp_cap = 0, vkp_seen = 0;
+static int vkp_active = 0;
+static bool vkp_started = false;
+static void vkp_push(char *d) {
+    if (vkp_seen >= VKP_MAX) { free(d); return; }
+    vkp_seen++;
+    if (vkp_len == vkp_cap) { vkp_cap = vkp_cap ? vkp_cap * 2 : 1024; vkp_q = realloc(vkp_q, vkp_cap * sizeof(char *)); }
+    vkp_q[vkp_len++] = d;
+}
+static void *vkp_run(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&vkp_mu);
+        while (vkp_head == vkp_len && vkp_active > 0) pthread_cond_wait(&vkp_cv, &vkp_mu);
+        if (vkp_head == vkp_len) { pthread_cond_broadcast(&vkp_cv); pthread_mutex_unlock(&vkp_mu); return NULL; }
+        char *d = vkp_q[vkp_head++];
+        vkp_active++;
+        pthread_mutex_unlock(&vkp_mu);
+        size_t dl = strlen(d);
+        char cp[4096];
+        if (dl + 1 < sizeof cp) {
+            memcpy(cp, d, dl + 1);
+            if (dl == 0) { cp[0] = '.'; cp[1] = 0; }
+            /* (the subfolders, copied while the lock is held) */
+            vk_fent *e = vkf_listed_locked(d, dl, cp);
+            char *subs = NULL;
+            size_t sl = 0;
+            if (e->list_ok && e->list_len) { subs = malloc(e->list_len); memcpy(subs, e->list, e->list_len); sl = e->list_len; }
+            pthread_mutex_unlock(&vkf_mu);
+            size_t a = 0;
+            pthread_mutex_lock(&vkp_mu);
+            for (size_t i = 0; i < sl; i++) {
+                if (subs[i] != 0) continue;
+                size_t nl = i - a;
+                const char *nm = subs + a;
+                a = i + 1;
+                if (nl < 2 || nm[nl - 1] != '/') continue;
+                nl--;
+                if ((nl == 12 && !memcmp(nm, "node_modules", 12)) || (nl == 4 && !memcmp(nm, ".git", 4))) continue;
+                /* (the keys vknip's paths have: "." lists "name", "dir" lists "dir/name") */
+                size_t o = dl == 0 || (dl == 1 && d[0] == '.') ? 0 : d[dl - 1] == '/' ? dl : dl + 1;
+                char *c = malloc(o + nl + 1);
+                if (o) { memcpy(c, d, dl); c[o - 1] = '/'; }
+                memcpy(c + o, nm, nl);
+                c[o + nl] = 0;
+                vkp_push(c);
+            }
+            pthread_cond_broadcast(&vkp_cv);
+            pthread_mutex_unlock(&vkp_mu);
+            free(subs);
+        }
+        free(d);
+        pthread_mutex_lock(&vkp_mu);
+        vkp_active--;
+        pthread_cond_broadcast(&vkp_cv);
+        pthread_mutex_unlock(&vkp_mu);
+    }
+}
+void vk_prelist(const vu_str *root) {
+    if (getenv("VKNIP_NO_PRELIST") || root->len >= 4000) return;
+    pthread_mutex_lock(&vkp_mu);
+    if (vkp_started) { pthread_mutex_unlock(&vkp_mu); return; }
+    vkp_started = true;
+    char *d = malloc((size_t)root->len + 1);
+    memcpy(d, root->data, (size_t)root->len);
+    d[root->len] = 0;
+    vkp_push(d);
+    pthread_mutex_unlock(&vkp_mu);
+    for (int i = 0; i < VKP_THREADS; i++) {
+        pthread_t t;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+        pthread_create(&t, &at, vkp_run, NULL);
+        pthread_attr_destroy(&at);
+    }
 }
 /* stat, cached: 0 nothing there, 1 a file (or anything but a folder), 2 a folder */
 int64_t vk_kind(const vu_str *path) {
@@ -229,6 +586,34 @@ int64_t vk_kind(const vu_str *path) {
     buf[path->len] = 0;
     pthread_mutex_lock(&vkf_mu);
     vk_fent *e = vkf_get(path->data, (size_t)path->len);
+    if (e->kind < 0) {
+        /* (a folder listed without links names every entry it has, with its kind: a name it lacks
+           isn't there) */
+        const char *pd = (const char *)path->data;
+        size_t n = (size_t)path->len, sl = n;
+        while (sl > 0 && pd[sl - 1] != '/') sl--;
+        bool plain = n > 0 && pd[0] != '/' && sl < n && !memmem(pd, n, "//", 2) && !memmem(pd, n, "/./", 3) && !memmem(pd, n, "/../", 4)
+            && !(n >= 2 && pd[0] == '.' && pd[1] == '/') && !(n >= 3 && pd[0] == '.' && pd[1] == '.' && pd[2] == '/');
+        const char *nm = pd + sl;
+        size_t nl = n - sl;
+        if (plain && ((nl == 1 && nm[0] == '.') || (nl == 2 && nm[0] == '.' && nm[1] == '.'))) plain = false;
+        for (size_t i = 0; plain && i < nl; i++) if ((unsigned char)nm[i] >= 128) plain = false;
+        if (plain) {
+            vk_fent *par = sl == 0 ? vkf_get(".", 1) : vkf_get(pd, sl - 1);
+            /* (and no entry the same but for case: macOS's file systems ignore it, and stat would find it) */
+            bool absent = par->listed && par->list_ok && par->links_len == 0;
+            for (size_t a = 0, i = 0; absent && i < par->list_len; i++) {
+                if (par->list[i] != 0) continue;
+                size_t el = i - a;
+                const char *en = par->list + a;
+                a = i + 1;
+                if (el > 0 && en[el - 1] == '/') el--;
+                if (el == nl && strncasecmp(en, nm, nl) == 0) absent = false;
+            }
+            e = vkf_get(pd, n);   /* (the table may have grown) */
+            if (absent && e->kind < 0) e->kind = 0;
+        }
+    }
     if (e->kind < 0) {
         struct stat st;
         e->kind = stat(buf, &st) != 0 ? 0 : S_ISDIR(st.st_mode) ? 2 : 1;
