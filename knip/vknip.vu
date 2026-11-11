@@ -6209,6 +6209,8 @@ type Build:
   texps: {Int: [[Str]]}      # file -> its exports: [name, members...]
   tbind: {Int: [Str]}        # file -> its exports' bindings (extract's binds rows)
   text: {Int: [[Str]]}       # file -> its re-exports of packages and builtins: [specifier, identifier, alias, type-only]
+  pre: [Res] = []            # (the file being linked: its imports resolved by the resolver threads)
+  pre_on: Bool = false
 
 fn add_entry(var b: Build, path: Str, skip: Bool, explicit: Bool):
   if resolve.in_node_modules(path) or not acc(b, path): return
@@ -6271,9 +6273,11 @@ fn link_file(var p: Proj, fs: Fs, var b: Build, id: Int):
   var ws_exts: [Ext] = []
   var unres: [Ext] = []
   var xspec: [Str] = []           # (--trace) specifier \t how knip names a package or builtin
+  var ii = -1
   for im in imps:
+    ii += 1
     let t_rs = pt(p)
-    var r = resolve.resolve(&p.rs, fs, im.spec, path)
+    var r = pre_res(&p, fs, &b, ii, im.spec, path)
     pe(&p, "resolveModuleName", t_rs)
     let type_only = is_dts or (im.flags & F_TYPEONLY) != 0
     if b.trace_on and r.kind != R_FILE: trace_ext(p, &b, id, im, r, type_only, &xspec)
@@ -6479,14 +6483,56 @@ fn apply_op(var b: Build, tid: Int, src: Int, o: Op):
   elif k == extract.OP_REEXPORTAS: add_ns_val(&b.g.nodes[tid].imby.rex_as, o.a, o.b, src)
   elif k == extract.OP_REEXPORTNS: add_val(&b.g.nodes[tid].imby.rex_ns, o.a, src)
 
+# An import of the file being linked resolved: by the resolver threads when they did (the i-th of its
+# imports), else here.
+fn pre_res(var p: Proj, fs: Fs, var b: Build, i: Int, spec: Str, from: Str) -> Res:
+  if b.pre_on and i < b.pre.len:
+    let x = b.pre[i]
+    return Res(x.kind, x.path + "", x.pkg + "")
+  return resolve.resolve(&p.rs, fs, spec, from)
+
+type RJob:
+  idx: Int
+  from: Str
+  specs: [Str]
+
+type RDone:
+  idx: Int
+  res: [Res]
+
+# A resolver thread: each file's imports resolved, with its own copy of the resolver (clone_cfg).
+fn res_worker(fs: Fs, ffi: Ffi, own r0: Resolver, own jc: Chan[RJob], own rc: Chan[RDone]):
+  var r = r0
+  r.lister = own fn(d: Str) => term.list(ffi, d)?
+  r.kind = own fn(x: Str) => term.kind(ffi, x)
+  while true:
+    let j = jc.recv() else break
+    var out: [Res] = []
+    for sp in j.specs: out.push(resolve.resolve(&r, fs, sp, j.from))
+    rc.send(RDone(j.idx, out))
+
+# which resolver thread a file's imports go to: by its folder
+fn dir_slot(path: Str, n: Int) -> Int:
+  let d = resolve.dirname(path)
+  var h = 0
+  for i in 0..d.len: h = (h * 31 + int(d[i])) % 1000003
+  return h % n
+
+fn import_specs(raw: Raw) -> [Str]:
+  var out: [Str] = []
+  for im in raw.imps: out.push(im.spec + "")
+  return out
+
 # A file outside the project: its imports are followed, nothing else is recorded.
 fn link_follow(var p: Proj, fs: Fs, var b: Build, id: Int):
   let path = b.g.nodes[id].path + ""
   var imps: [Imp] = []
   swap(&imps, &b.g.nodes[id].raw.imps)
+  var ii = -1
   for im in imps:
+    ii += 1
     let t_rs = pt(p)
-    let r = resolve.resolve(&p.rs, fs, im.spec, path)
+    let r = pre_res(&p, fs, &b, ii, im.spec, path)
     pe(&p, "resolveModuleName", t_rs)
     if r.kind == R_FILE and acc(b, r.path) and not resolve.in_node_modules(r.path): visit_path(&b, r.path)
 
@@ -9580,6 +9626,38 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
       for _ in 0..paths.len:
         slots.push(empty_raw(""))
         have.push(false)
+      # (a large wave: each file's imports resolved by resolver threads as soon as it's read, so
+      # linking, which stays in the wave's order here, mostly finds them done)
+      # (with fewer than 4 cores there's none to spare while the files are read: off; VKNIP_PRERESOLVE=1 on,
+      # =0 off)
+      var pre_on = wave.len >= 256 and jobs >= 4
+      if os.env("VKNIP_PRERESOLVE") == "1": pre_on = true
+      if os.env("VKNIP_PRERESOLVE") == "0": pre_on = false
+      # (one fewer than the cores, the main thread linking; each folder's files to the same thread, so
+      # its caches serve them)
+      var nres = jobs - 1
+      if nres < 1: nres = 1
+      var qjs: [Chan[RJob]] = []
+      let qr: Chan[RDone] = chan(wave.len + 1)
+      var rres: [[Res]] = []
+      var rhave: [Bool] = []
+      var rsent: [Bool] = []
+      var k_of_spec: {Int: Int} = {}
+      if pre_on:
+        for k in 0..wave.len:
+          rres.push([])
+          rhave.push(false)
+          rsent.push(false)
+          if from_spec[k] >= 0: k_of_spec[from_spec[k]] = k
+        for _ in 0..nres:
+          let rq: Chan[RJob] = chan(wave.len + 1)
+          spawn res_worker(fs, ffi, resolve.clone_cfg(p.rs), rq, qr)
+          qjs.push(rq)
+        for k in 0..wave.len:
+          let si0 = from_spec[k]
+          if si0 >= 0 and spec_have[si0]:
+            qjs[dir_slot(paths[k], nres)].send(RJob(k, paths[k] + "", import_specs(spec_slots[si0])))
+            rsent[k] = true
       for k in 0..wave.len:
         let si = from_spec[k]
         if si >= 0:
@@ -9587,13 +9665,31 @@ fn main(fs: Fs, os: Os, ffi: Ffi):
             var d = spec_rc.recv() else break
             swap(&spec_slots[d.idx], &d.raw)
             spec_have[d.idx] = true
-          link_one(&p, fs, &b, wave[k], &spec_slots[si])
-          continue
-        while not have[k]:
-          var d = rc.recv() else break
-          swap(&slots[d.idx], &d.raw)
-          have[d.idx] = true
-        link_one(&p, fs, &b, wave[k], &slots[k])
+            if pre_on and d.idx in k_of_spec:
+              let dk = k_of_spec[d.idx]
+              qjs[dir_slot(paths[dk], nres)].send(RJob(dk, paths[dk] + "", import_specs(spec_slots[d.idx])))
+              rsent[dk] = true
+        else:
+          while not have[k]:
+            var d = rc.recv() else break
+            swap(&slots[d.idx], &d.raw)
+            have[d.idx] = true
+            if pre_on:
+              qjs[dir_slot(paths[d.idx], nres)].send(RJob(d.idx, paths[d.idx] + "", import_specs(slots[d.idx])))
+              rsent[d.idx] = true
+        if pre_on and rsent[k]:
+          while not rhave[k]:
+            var rd = qr.recv() else break
+            swap(&rres[rd.idx], &rd.res)
+            rhave[rd.idx] = true
+          if rhave[k]:
+            swap(&b.pre, &rres[k])
+            b.pre_on = true
+        if si >= 0: link_one(&p, fs, &b, wave[k], &spec_slots[si])
+        else: link_one(&p, fs, &b, wave[k], &slots[k])
+        b.pre_on = false
+        b.pre = []
+      for rq2 in qjs: rq2.close()
       ph(os, "read+link")
       continue
     var tms: [[Float]] = []
