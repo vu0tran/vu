@@ -1651,6 +1651,15 @@ fn type_ref(var c: C, n: Int) -> Int:
   var name = 0
   var s = -1
   if c.t.nd[nn].k == ast.N_QNAME:
+    # E.A: an enum member's type
+    let el = c.t.nd[nn].a
+    if c.t.nd[el].k == ast.N_ID:
+      var es = lookup_type(&c, n, c.t.nd[el].s)
+      if es >= 0 and (c.sk[es] & S_ENUM) != 0:
+        let em = enum_member(&c, es, c.t.nd[nn].s)
+        if em >= 0: return c.stype[em]
+        let ett = enum_type(&c, es)
+        if c.tk[ett] == TK_UNSUP: return ett
     # A.B: a type inside a namespace
     let ns = qualified_left(&c, n, c.t.nd[nn].a)
     name = c.t.nd[nn].s
@@ -1735,7 +1744,7 @@ fn type_ref_sym(var c: C, n: Int, s: Int, name: Int) -> Int:
     let full = fill_defaults(&c, c.t.nd[d].a, args, n, generic_name(c, name, c.t.nd[d].a))
     if full.len != tps.len: return c.error_t
     return ref_of(&c, dt, full)
-  if (sk & S_ENUM) != 0: return unsupported(&c, n, "an enum type")
+  if (sk & S_ENUM) != 0: return enum_type(&c, s)
   if (sk & S_NAMESPACE) != 0: return unsupported(&c, n, "a namespace used as a type")
   # an import from a module that isn't found: any, silently
   if s < c.sdtype.len and c.sdtype[s] == c.error_t: return c.error_t
@@ -2164,6 +2173,143 @@ fn resolve_decl(var c: C, t: Int):
         c.objs[o].nidx = index_type(&c, base, true)
         c.objs[o].nname = index_name(&c, base, true)
 
+# ---- enums
+
+# The enum's type: the union of its members' literal types (each member's own literal, E.A),
+# made once with the members' values (auto-incremented numbers, literals, and constant
+# expressions of numbers and of earlier members).
+fn enum_type(var c: C, s: Int) -> Int:
+  if s in c.enum_type: return c.enum_type[s]
+  c.enum_type[s] = c.error_t
+  var members: [Int] = []
+  var lits: [Int] = []
+  var vals: {Int: Int} = {}       # member name -> its literal (for later members' initializers)
+  var next = 0.0
+  var next_ok = true
+  for d in types.sym_decls(c, s):
+    if c.t.nd[d].k != ast.N_ENUM: continue
+    for mn in ast.items(c.t, c.t.nd[d].a):
+      let nn = c.t.nd[mn].a
+      var name = c.t.nd[nn].s
+      if c.t.nd[nn].k != ast.N_ID and c.t.nd[nn].k != ast.N_STR:
+        let u = unsupported(&c, mn, "a computed enum member name")
+        c.enum_type[s] = u
+        return u
+      var base = -1
+      let init = c.t.nd[mn].b
+      if init < 0:
+        if not next_ok:
+          let u = unsupported(&c, mn, "an enum member without an initializer after a string one")
+          c.enum_type[s] = u
+          return u
+        base = types.num_lit(&c, next, false)
+      else:
+        base = enum_const(&c, init, vals, s)
+        if base < 0:
+          let u = unsupported(&c, init, "a computed enum member")
+          c.enum_type[s] = u
+          return u
+      if c.tk[base] == TK_NUMLIT:
+        next = c.nums[c.ta[base]] + 1.0
+        next_ok = true
+      else: next_ok = false
+      let ms = types.new_sym(&c, S_ENUMMEMBER, name, mn)
+      c.nsym[mn] = ms
+      let lt = types.enum_lit(&c, base, ms)
+      c.stype[ms] = lt
+      c.sdtype[ms] = lt
+      c.sflags[ms] = c.sflags[ms] | types.SF_READONLY
+      vals[name] = lt
+      members.push(ms)
+      lits.push(lt)
+  c.enum_members[s] = members
+  var t = c.never_t
+  if lits.len == 1: t = lits[0]
+  elif lits.len > 1:
+    let u0 = types.union_of(&c, lits)
+    # (its own copy: printed as the enum)
+    t = types.mk(&c, TK_UNION, types.F_UNION, c.ta[u0], c.tb[u0])
+    c.enum_union[t] = s
+  for lt in lits: c.enum_base[lt] = t
+  c.enum_type[s] = t
+  return t
+
+# A constant enum initializer: a number or string literal, -x, ~x, a binary operation of numbers,
+# a template without substitutions, a parenthesized one, or an earlier member (A, E.A); -1 else.
+fn enum_const(var c: C, e: Int, vals: {Int: Int}, es: Int) -> Int:
+  let k = c.t.nd[e].k
+  if k == ast.N_NUM: return types.num_lit(&c, num_value(c.t.names[c.t.nd[e].s]), false)
+  if k == ast.N_STR or k == ast.N_NOSUBTEMPL: return types.str_lit(&c, c.t.nd[e].s, false)
+  if k == ast.N_PAREN: return enum_const(&c, c.t.nd[e].a, vals, es)
+  if k == ast.N_ID:
+    if c.t.nd[e].s in vals: return types.regular(c, vals[c.t.nd[e].s])
+    return -1
+  if k == ast.N_PROPACCESS:
+    let o = c.t.nd[e].a
+    if c.t.nd[o].k == ast.N_ID and c.t.nd[o].s == c.sname[es] and c.t.nd[e].s in vals: return vals[c.t.nd[e].s]
+    return -1
+  if k == ast.N_PREFIX:
+    let a = enum_const(&c, c.t.nd[e].a, vals, es)
+    if a < 0 or c.tk[a] != TK_NUMLIT: return -1
+    let v = c.nums[c.ta[a]]
+    let op = c.t.nd[e].f
+    if op == scan.T_MINUS: return types.num_lit(&c, 0.0 - v, false)
+    if op == scan.T_PLUS: return types.num_lit(&c, v, false)
+    if op == scan.T_TILDE: return types.num_lit(&c, float(-1 - int(v)), false)
+    return -1
+  if k == ast.N_BINARY:
+    let a = enum_const(&c, c.t.nd[e].a, vals, es)
+    let b = enum_const(&c, c.t.nd[e].b, vals, es)
+    if a < 0 or b < 0: return -1
+    let op = c.t.nd[e].f
+    if c.tk[a] == TK_STRLIT and c.tk[b] == TK_STRLIT and op == scan.T_PLUS:
+      return types.str_lit_s(&c, c.t.names[c.ta[a]] + c.t.names[c.ta[b]], false)
+    if c.tk[a] != TK_NUMLIT or c.tk[b] != TK_NUMLIT: return -1
+    let x = c.nums[c.ta[a]]
+    let y = c.nums[c.ta[b]]
+    var r = 0.0
+    if op == scan.T_PLUS: r = x + y
+    elif op == scan.T_MINUS: r = x - y
+    elif op == scan.T_STAR: r = x * y
+    elif op == scan.T_SLASH:
+      if y == 0.0: return -1
+      r = x / y
+    elif op == scan.T_BAR: r = float(int(x) | int(y))
+    elif op == scan.T_AMP: r = float(int(x) & int(y))
+    elif op == scan.T_CARET: r = float(int(x) ^ int(y))
+    elif op == scan.T_SHL: r = float((int(x) << (int(y) & 31)) & 4294967295)
+    elif op == scan.T_SHR: r = float(int(x) >> (int(y) & 31))
+    else: return -1
+    # (the shifts and bit operations are on 32-bit signed integers)
+    if op == scan.T_SHL or op == scan.T_BAR or op == scan.T_AMP or op == scan.T_CARET:
+      var iv = int(r)
+      if iv >= 2147483648: iv = iv - 4294967296
+      r = float(iv)
+    return types.num_lit(&c, r, false)
+  return -1
+
+# The enum as a value: its members (read-only), and a numeric enum's reverse mapping ([x: number]:
+# string)
+fn enum_value(var c: C, s: Int) -> Int:
+  let et = enum_type(&c, s)
+  if c.tk[et] == TK_UNSUP: return et
+  let t = types.anon_obj(&c, s, c.sdecl[s])
+  var numeric = false
+  let mems = types.ints(c.enum_members[s])
+  for ms in mems:
+    types.add_prop(&c, t, c.sname[ms], ms)
+    if c.tk[c.stype[ms]] == TK_NUMLIT: numeric = true
+  if numeric: c.objs[c.ta[t]].nidx = c.string_t
+  c.objs[c.ta[t]].resolved = true
+  return t
+
+fn enum_member(var c: C, es: Int, name: Int) -> Int:
+  enum_type(&c, es)
+  if not (es in c.enum_members): return -1
+  for ms in types.ints(c.enum_members[es]):
+    if c.sname[ms] == name: return ms
+  return -1
+
 # The instance type of a class's base (extends B): -1 when there's none.
 # The instance type of a constructor value used as a base (var Error: ErrorConstructor): the
 # return type of its construct signatures, all non-generic and the same; -1 otherwise.
@@ -2532,7 +2678,7 @@ fn compute_sym_type(var c: C, s: Int) -> Int:
     c.objs[o].resolved = true
     return t
   if (sk & S_NAMESPACE) != 0: return ns_value_type(&c, s)
-  if (sk & S_ENUM) != 0: return unsupported(&c, d, "an enum")
+  if (sk & S_ENUM) != 0: return enum_value(&c, s)
   if (sk & S_CLASS) != 0:
     if k == ast.N_CLASS: return chk.class_static(&c, s)
     return unsupported(&c, d, "a class")
