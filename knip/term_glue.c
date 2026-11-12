@@ -739,13 +739,50 @@ static bool vk_node_write(int fd, const char *p, size_t n) {
 
 static int vk_node_recv(vk_worker *w);
 
+/* A config that never finishes loading (a promise that never settles: node then waits at 0% CPU, its
+   fd 3 still open) would hang vknip; after VKNIP_NODE_TIMEOUT seconds (120; 0: no limit) without an
+   answer the process is killed and its request fails, naming the limit. */
+static double vk_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double)t.tv_sec + (double)t.tv_nsec / 1e9; }
+static double vk_node_limit(void) {
+    const char *e = getenv("VKNIP_NODE_TIMEOUT");
+    if (!e || !*e) return 120.0;
+    return atof(e);
+}
+static void vk_node_timed_out(vk_worker *w, double limit) {
+    w->used = false;   /* (so vk_node_stop kills it rather than waiting for it) */
+    vk_node_stop(w);
+    char msg[256];
+    int m = snprintf(msg, sizeof msg, "!vknip: node didn't finish loading this in %g s (a promise that never settles?); VKNIP_NODE_TIMEOUT=SECONDS changes the limit", limit);
+    if (w->cap < (size_t)m + 1) { w->cap = (size_t)m + 1 + 131072; w->buf = realloc(w->buf, w->cap); }
+    memcpy(w->buf, msg, (size_t)m);
+    w->len = (size_t)m;
+}
+/* reads until the answer is complete: 1, or -1 when the process died or didn't answer by the deadline
+   (0: none); then w->buf holds "!" and why */
+static int vk_node_recv_by(vk_worker *w, double deadline, double limit) {
+    for (;;) {
+        if (deadline > 0) {
+            double left = deadline - vk_now();
+            if (left <= 0) { vk_node_timed_out(w, limit); return -1; }
+            struct pollfd pf = { w->out, POLLIN, 0 };
+            int ms = left > 3600.0 ? 3600000 : (int)(left * 1000.0) + 1;
+            int pr = poll(&pf, 1, ms);
+            if (pr < 0 && errno != EINTR) { vk_node_timed_out(w, limit); return -1; }
+            if (pr <= 0) continue;
+        }
+        int r = vk_node_recv(w);
+        if (r != 0) return r;
+    }
+}
+static double vk_deadline(double limit) { return limit > 0 ? vk_now() + limit : 0; }
+
 /* sends a request (starting the process if needed); false when that fails */
 static bool vk_node_send(vk_worker *w, const vu_str *js, const char *req, size_t n) {
     if (w->warm) {
         w->warm = false;
         w->len = 0;
-        int r;
-        while ((r = vk_node_recv(w)) == 0) {}
+        double lim = vk_node_limit();
+        vk_node_recv_by(w, vk_deadline(lim), lim);
     }
     if (w->pid < 0 && !vk_node_start(w, js)) return false;
     w->used = true;
@@ -803,8 +840,8 @@ vu_str vk_node(const vu_str *js, const vu_str *req) {
     vk_worker *w = &vkw[0];
     if (req->len == 0) { vk_node_atexit(); return vu_str_from("", 0); }
     if (!vk_node_send(w, js, req->data, (size_t)req->len)) return vu_str_from("!", 1);
-    int r;
-    while ((r = vk_node_recv(w)) == 0) {}
+    double lim = vk_node_limit();
+    vk_node_recv_by(w, vk_deadline(lim), lim);
     return vu_str_from(w->buf, (int64_t)w->len);
 }
 
@@ -830,21 +867,40 @@ vu_str vk_node_par(const vu_str *js, const vu_str *reqs, int64_t workers) {
     int W = (int)(workers < 1 ? 1 : workers > VK_MAXW ? VK_MAXW : workers);
     if ((size_t)W > n) W = (int)n;
     long cur[VK_MAXW];
-    for (int i = 0; i < W; i++) cur[i] = -1;
+    double since[VK_MAXW];
+    double lim = vk_node_limit();
+    for (int i = 0; i < W; i++) { cur[i] = -1; since[i] = 0; }
     size_t next = 0, done = 0;
     while (done < n) {
         /* each idle process takes the next request */
         for (int i = 0; i < W && next < n; i++) {
             if (cur[i] >= 0) continue;
             size_t j = next++;
-            if (vk_node_send(&vkw[i], js, rs[j], rl[j])) cur[i] = (long)j;
+            if (vk_node_send(&vkw[i], js, rs[j], rl[j])) { cur[i] = (long)j; since[i] = vk_now(); }
             else { ans[j] = strdup("!"); al[j] = 1; done++; }
         }
         struct pollfd pf[VK_MAXW];
         int idx[VK_MAXW], np = 0;
         for (int i = 0; i < W; i++) if (cur[i] >= 0) { pf[np].fd = vkw[i].out; pf[np].events = POLLIN; pf[np].revents = 0; idx[np++] = i; }
         if (np == 0) continue;
-        if (poll(pf, (nfds_t)np, -1) < 0) { if (errno == EINTR) continue; break; }
+        /* (a process that hasn't answered in time is killed, its request failed) */
+        if (lim > 0) {
+            double now = vk_now();
+            bool any = false;
+            for (int i = 0; i < W; i++) {
+                if (cur[i] < 0 || now - since[i] < lim) continue;
+                vk_node_timed_out(&vkw[i], lim);
+                size_t j = (size_t)cur[i];
+                ans[j] = malloc(vkw[i].len + 1);
+                memcpy(ans[j], vkw[i].buf, vkw[i].len);
+                al[j] = vkw[i].len;
+                cur[i] = -1;
+                done++;
+                any = true;
+            }
+            if (any) continue;
+        }
+        if (poll(pf, (nfds_t)np, lim > 0 ? 1000 : -1) < 0) { if (errno == EINTR) continue; break; }
         for (int m = 0; m < np; m++) {
             if (!pf[m].revents) continue;
             int i = idx[m];
