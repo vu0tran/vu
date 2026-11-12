@@ -1,0 +1,21 @@
+type A = { a: number };
+type B = { b: string };
+type AB = A & B;
+export const x1: AB = { a: "s", b: "t" };
+export const x2: AB = { a: 1 };
+export const x3: AB = { a: 1, b: "s", c: 3 };
+export const x4: A & B = { a: 1, b: 2 };
+declare const n: number;
+export const x5: AB = n;
+export const x6: A & { f(): void } = { a: 1, f: 3 };
+export const x7: AB = { a: 1, b: "s" } as A;
+export function f(p: AB) { return p; }
+f({ a: 1, b: 2 });
+f({ a: 1 });
+f({ a: 1, b: "", z: 1 });
+export const x8: (A & B) | null = { a: 1 };
+export const x9: Array<A & B> = [{ a: 1, b: 1 }];
+type N = A & { nested: { deep: number } & B };
+export const y1: N = { a: 1, nested: { deep: "x", b: "y" } };
+export const y2: N = { a: 1, nested: { deep: 1 } };
+export const y3: string & { __brand: 1 } = "x";
