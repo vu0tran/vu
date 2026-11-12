@@ -13,7 +13,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 fail=0
 for d in "$@"; do
   # (the folder's absolute path, in messages that name a module, left out)
-  out=$(cd "$d" && "$vtsc" $(ls *.ts | sort) 2>&1 | sed "s|$(cd "$d" && pwd)/||g")
+  ad=$(cd "$d" && pwd)
+  out=$(cd "$d" && "$vtsc" $(ls *.ts | sort) 2>&1 | sed "s|$ad/||g")
   if [ $save = 1 ]; then printf '%s\n' "$out" > "$d/expected.txt"; continue; fi
   if [ "$out" = "$(cat "$d/expected.txt")" ]; then echo "ok   $(basename "$d")"
   else echo "FAIL $(basename "$d")"; printf '%s\n' "$out" | diff "$d/expected.txt" - | head -20; fail=1; fi
