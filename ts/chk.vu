@@ -78,6 +78,39 @@ fn widen_obj(var c: C, t: Int) -> Int:
   c.objs[ro].resolved = true
   return r
 
+# widen_obj in the light of a contextual type (a function's contextual return type): a literal
+# property stays where the contextual type's property has literals of its kind, as
+# checkObjectLiteral's getWidenedLiteralLikeTypeForContextualType decided it in TypeScript.
+fn widen_obj_ctx(var c: C, t: Int, ctx: Int) -> Int:
+  let o = c.ta[t]
+  let r = types.anon_obj(&c, -1, c.objs[o].node)
+  let ro = c.ta[r]
+  for name in types.ints(c.objs[o].order):
+    let ps = c.objs[o].props[name]
+    let ns = types.new_sym(&c, c.sk[ps], name, c.sdecl[ps])
+    c.sflags[ns] = c.sflags[ps]
+    let pt = bind.type_of_sym(&c, ps)
+    var cps: [Int] = []
+    for m in types.members(c, ctx):
+      if c.tk[m] != TK_OBJ: continue
+      let cp = prop_of(&c, m, name)
+      if cp >= 0: cps.push(bind.type_of_sym(&c, cp))
+    var nt = -1
+    if cps.len > 0:
+      let cpt = types.union_of(&c, cps)
+      if c.tk[pt] == TK_OBJ and c.objs[c.ta[pt]].fresh: nt = widen_obj_ctx(&c, pt, cpt)
+      elif types.is_fresh_lit(c, pt) or pt in c.freg:
+        var all = true
+        for m in types.members(c, pt):
+          if not literal_of_ctx(&c, m, cpt): all = false
+        if all: nt = types.regular(c, pt)
+    if nt < 0: nt = widen_deep(&c, pt)
+    c.stype[ns] = nt
+    types.add_prop(&c, r, name, ns)
+  for sg in types.ints(c.objs[o].calls): c.objs[ro].calls.push(sg)
+  c.objs[ro].resolved = true
+  return r
+
 fn widen_deep(var c: C, t: Int) -> Int:
   let w = widen(&c, t)
   return w
@@ -489,9 +522,19 @@ fn infer_return(var c: C, d: Int) -> Int:
   if c.t.nd[d].k == ast.N_FUNC or is_member_fn(c, d): c.narrow.push({})
   else: c.narrow.push(const_facts(&c, saved, d))
   c.ret_stack.push(-1)
+  # (the returned expressions in the light of the contextual return type)
+  var rc = -1
+  if not is_gen and d in c.ret_ctx:
+    rc = c.ret_ctx[d]
+    if rc >= 0 and (c.t.nd[d].f & ast.M_ASYNC) != 0: rc = awaited(&c, rc, body)
+  c.ret_cstack.push(rc)
   var et = c.any_t
-  if c.t.nd[body].k != ast.N_BLOCK: et = check_expr(&c, body, -1)
+  if c.t.nd[body].k != ast.N_BLOCK:
+    var bctx = rc
+    if bctx >= 0 and (c.t.nd[d].f & ast.M_ASYNC) != 0: bctx = async_return_ctx(&c, bctx, body)
+    et = check_expr(&c, body, bctx)
   else: check_block(&c, body)
+  c.ret_cstack.pop()
   c.ret_stack.pop()
   swap(&saved, &c.narrow)
   c.narrow.pop()
@@ -554,10 +597,16 @@ fn infer_body_return(var c: C, d: Int, body: Int) -> Int:
 fn return_widen(var c: C, d: Int, ts: [Int]) -> Int:
   var parts: [Int] = []
   var fresh = false
+  var rc0 = -1
+  if d in c.ret_ctx:
+    rc0 = c.ret_ctx[d]
+    if rc0 >= 0 and (c.t.nd[d].f & ast.M_ASYNC) != 0: rc0 = awaited(&c, rc0, d)
   for t in ts:
     if types.is_fresh_lit(c, t) or t in c.freg: fresh = true
     if c.tk[t] == TK_SYMBOL and c.tb[t] == 1: fresh = true
-    if c.tk[t] == TK_OBJ and c.objs[c.ta[t]].fresh: parts.push(widen_obj(&c, t))
+    if c.tk[t] == TK_OBJ and c.objs[c.ta[t]].fresh:
+      if rc0 >= 0: parts.push(widen_obj_ctx(&c, t, rc0))
+      else: parts.push(widen_obj(&c, t))
     else: parts.push(t)
   let u = types.union_of(&c, parts)
   let unit = types.is_literal(c, u) or (c.tk[u] == TK_SYMBOL and c.tb[u] == 1)
@@ -1706,7 +1755,12 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
   if k == ast.N_AWAIT:
     let ef = enclosing_fn(c, n)
     if ef < 0 or (c.t.nd[ef].f & ast.M_ASYNC) == 0: return unsup(&c, n, "await outside an async function")
-    let ot = check_expr(&c, c.t.nd[n].a, -1)
+    # (getContextualTypeForAwaitOperand: Awaited<ctx> | PromiseLike<Awaited<ctx>>)
+    var actx = -1
+    if ctx >= 0 and not is_any(c, ctx) and not could_contain_tvars(&c, ctx):
+      let aw = awaited(&c, ctx, n)
+      actx = async_return_ctx(&c, aw, n)
+    let ot = check_expr(&c, c.t.nd[n].a, actx)
     return awaited(&c, ot, n)
   if k == ast.N_TYPEASSERT: return unsup(&c, n, "a <T> type assertion")
   if k == ast.N_TAGGED: return unsup(&c, n, "a tagged template")
@@ -3031,7 +3085,10 @@ fn arity_smaller(var c: C, sg: Int, n: Int) -> Bool:
 fn fn_sig_ctx(var c: C, d: Int, csig: Int) -> Int:
   if d in c.fsig: return c.fsig[d]
   if fn_retnode(c, d) < 0 and csig >= 0:
-    let cret = rel.sig_ret(&c, csig)
+    var cret = rel.sig_ret(&c, csig)
+    # (instantiateContextualType: in a generic call's argument, the type parameters the call's
+    # contextual type infers)
+    if c.ret_mapper >= 0 and cret >= 0 and could_contain_tvars(&c, cret): cret = bind.instantiate(&c, cret, c.ret_mapper)
     c.ret_ctx[d] = cret
   return fn_sig(&c, d)
 
@@ -3043,7 +3100,8 @@ fn arg_count_msg(var c: C, sgs: [Int], n: Int, at: Int):
   var rest = false
   for sg in sgs:
     let s = types.sig_copy(c, sg)
-    if s.min < lo: lo = s.min
+    let smin = void_min(c, sg)
+    if smin < lo: lo = smin
     let smx = sig_max(c, sg)
     if smx < 0: rest = true
     elif smx > hi: hi = smx
@@ -3134,9 +3192,20 @@ fn sig_min(c: C, sg: Int) -> Int:
       if np - 1 + req > m: m = np - 1 + req
   return m
 
-fn arity_ok(c: C, sg: Int, n: Int) -> Bool:
+# getMinArgumentCount: trailing parameters whose type has void in it may be left out
+fn void_min(c: C, sg: Int) -> Int:
   let s = types.sig_copy(c, sg)
-  if n < s.min: return false
+  var m = s.min
+  while m > 0 and m - 1 < s.ptypes.len and s.pflags[m - 1] != 2:
+    var has_void = false
+    for x in types.members(c, s.ptypes[m - 1]):
+      if c.tk[x] == TK_VOID: has_void = true
+    if not has_void: break
+    m -= 1
+  return m
+
+fn arity_ok(c: C, sg: Int, n: Int) -> Bool:
+  if n < void_min(c, sg): return false
   let mx = sig_max(c, sg)
   return mx < 0 or n <= mx
 
@@ -3646,7 +3715,10 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx: Int) -> Int:
         pt = bind.instantiate(&c, pt, m)
         c.fsig.remove(args[i])
         clear_ctx_params(&c, args[i])
+      let saved_rm = c.ret_mapper
+      c.ret_mapper = rmap
       var at = check_expr(&c, args[i], pt)
+      c.ret_mapper = saved_rm
       if rmap >= 0 and (types.is_fresh_lit(c, at) or at in c.freg):
         let rp0 = raw_param_at(&c, sg, i)
         let rp = bind.instantiate(&c, rp0, rmap)
@@ -3871,6 +3943,46 @@ fn infer_in(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, ori
     let both = types.union_of(&c, [tb, fb])
     infer_in(&c, both, a, &inf, contra, prio, orig, &seen)
     return
+  if pk == TK_UNION and c.tk[a] == TK_UNION:
+    # inferFromMatchingTypes: identical members, then instantiations of one generic type, pair off
+    var pms: [Int] = []
+    for m in types.members(c, p): pms.push(m)
+    var ams: [Int] = []
+    for m in types.members(c, a): ams.push(m)
+    var pused: [Bool] = []
+    for _ in pms: pused.push(false)
+    var aused: [Bool] = []
+    for _ in ams: aused.push(false)
+    var matched = false
+    for i in 0..pms.len:
+      for j in 0..ams.len:
+        if not aused[j] and not pused[i] and pms[i] == ams[j]:
+          pused[i] = true
+          aused[j] = true
+          matched = true
+    for i in 0..pms.len:
+      if pused[i] or c.tk[pms[i]] != TK_OBJ or c.objs[c.ta[pms[i]]].kind != OK_REF: continue
+      let tg = c.objs[c.ta[pms[i]]].target
+      for j in 0..ams.len:
+        if aused[j] or c.tk[ams[j]] != TK_OBJ or c.objs[c.ta[ams[j]]].kind != OK_REF: continue
+        if c.objs[c.ta[ams[j]]].target != tg: continue
+        infer_in(&c, pms[i], ams[j], &inf, contra, prio, orig, &seen)
+        pused[i] = true
+        aused[j] = true
+        matched = true
+        break
+    if matched:
+      var prest: [Int] = []
+      for i in 0..pms.len:
+        if not pused[i]: prest.push(pms[i])
+      var arest: [Int] = []
+      for j in 0..ams.len:
+        if not aused[j]: arest.push(ams[j])
+      if prest.len == 0 or arest.len == 0: return
+      let p2 = types.union_of(&c, prest)
+      let a2 = types.union_of(&c, arest)
+      infer_in(&c, p2, a2, &inf, contra, prio, orig, &seen)
+      return
   if pk == TK_UNION:
     # inferToMultipleTypes: the members that aren't naked type parameters first; a naked one
     # gets what the others don't take
@@ -3887,7 +3999,18 @@ fn infer_in(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, ori
           if rel.assignable(&c, am, m2): taken = true
         if not taken: rest.push(am)
       if rest.len > 0:
-        let g4_1 = types.union_of(&c, rest)
+        # (all of a: a itself, which keeps a fresh literal fresh)
+        var g4_1 = a
+        if rest.len < types.members(c, a).len:
+          if a in c.freg:
+            # (part of a fresh union: still fresh)
+            var fr: [Int] = []
+            for m in rest:
+              if types.is_literal(c, m): fr.push(fresh_of(c, m))
+              else: fr.push(m)
+            g4_1 = union_fresh(&c, fr)
+          elif rest.len == 1: g4_1 = rest[0]
+          else: g4_1 = types.union_of(&c, rest)
         infer_in(&c, naked[0], g4_1, &inf, contra, prio | P_NAKED, orig, &seen)
     return
   if c.tk[a] == TK_UNION:
@@ -3924,6 +4047,10 @@ fn infer_in(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, ori
   let pi = bind.index_type(&c, p, false)
   let ai = bind.index_type(&c, a, false)
   if pi >= 0 and ai >= 0: infer_in(&c, pi, ai, &inf, contra, prio, orig, &seen)
+  # (number index signatures too: inferFromIndexTypes)
+  let pn = bind.index_type(&c, p, true)
+  let an = bind.index_type(&c, a, true)
+  if pn >= 0 and an >= 0 and (pn != pi or an != ai): infer_in(&c, pn, an, &inf, contra, prio, orig, &seen)
 
 fn infer_sigs(var c: C, p: Int, a: Int, ctor: Bool, var inf: Inf, contra: Bool, prio: Int, orig: Int, var seen: {Int: Bool}):
   var a2 = a
@@ -4571,6 +4698,11 @@ fn check_function_body(var c: C, d: Int, sg: Int):
       return
     declared = inner
   c.ret_stack.push(declared)
+  var crc = -1
+  if declared < 0 and (c.t.nd[d].f & ast.M_GENERATOR) == 0 and d in c.ret_ctx:
+    crc = c.ret_ctx[d]
+    if crc >= 0 and is_async: crc = awaited(&c, crc, body)
+  c.ret_cstack.push(crc)
   if c.t.nd[body].k == ast.N_BLOCK:
     check_block(&c, body)
     if declared >= 0: check_missing_return(&c, d, declared, body)
@@ -4583,6 +4715,7 @@ fn check_function_body(var c: C, d: Int, sg: Int):
     var et = check_expr(&c, body, rctx)
     if is_async: et = awaited(&c, et, body)
     if declared >= 0: return_expr(&c, false, body, body, et, declared, false)
+  c.ret_cstack.pop()
   c.ret_stack.pop()
   swap(&saved, &c.narrow)
   c.narrow.pop()
@@ -4670,6 +4803,9 @@ fn includes_undefined(var c: C, t: Int) -> Bool:
   return false
 
 fn check_missing_return(var c: C, d: Int, declared: Int, body: Int):
+  # (an assertion function, asserts x: its return type is void)
+  let rn = fn_retnode(c, d)
+  if rn >= 0 and c.t.nd[rn].k == ast.N_TPRED and (c.t.nd[rn].f & 1) != 0: return
   let k = c.tk[declared]
   if k == TK_ANY or k == TK_ERROR or k == TK_UNSUP or k == TK_UNDEF or k == TK_NEVER: return
   for m in types.members(c, declared):
@@ -4947,6 +5083,7 @@ fn check_stmt(var c: C, n: Int):
     let declared = c.ret_stack[c.ret_stack.len - 1]
     if c.t.nd[n].a >= 0:
       var ctx = declared
+      if ctx < 0 and c.ret_cstack.len > 0: ctx = c.ret_cstack[c.ret_cstack.len - 1]
       let ef = enclosing_fn(c, n)
       let in_async = ef >= 0 and (c.t.nd[ef].f & ast.M_ASYNC) != 0
       if in_async and ctx >= 0: ctx = async_return_ctx(&c, ctx, n)
@@ -5504,7 +5641,7 @@ fn check_class(var c: C, n: Int):
         if init >= 0:
           let it = in_member_flow(&c, init, declared)
           if not rel.assignable(&c, it, declared): rel.report(&c, it, declared, nn, init, 2322)
-        elif (mf & (ast.M_STATIC | ast.M_ABSTRACT | ast.M_DECLARE | ast.M_EXCL)) == 0 and c.t.nd[nn].k != ast.N_STR and c.t.nd[nn].k != ast.N_NUM and not (name in assigned) and not includes_undefined(&c, sdt):
+        elif (mf & (ast.M_STATIC | ast.M_ABSTRACT | ast.M_DECLARE | ast.M_EXCL)) == 0 and (c.t.nd[n].f & ast.M_DECLARE) == 0 and c.t.nd[nn].k != ast.N_STR and c.t.nd[nn].k != ast.N_NUM and not (name in assigned) and not includes_undefined(&c, sdt):
           err(&c, nn, 2564, "Property '" + nm(c, name) + "' has no initializer and is not definitely assigned in the constructor.")
       elif init >= 0:
         let ps = bind.get_prop(&c, inst, name)

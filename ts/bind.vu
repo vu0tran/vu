@@ -475,6 +475,7 @@ fn declare_in(var c: C, var vals: {Int: Int}, var tys: {Int: Int}, stmt: Int):
         c.nsym[id] = s
         if c.t.nd[c.t.nd[d].a].k == ast.N_ID: c.nsym[d] = s
         if c.hoisting >= 0: c.hoisted[s] = c.hoisting
+        if name in vals and (c.sk[vals[name]] & S_NAMESPACE) != 0: c.merged_ns[s] = vals[name]
         vals[name] = s
   elif k == ast.N_FUNC:
     let name = c.t.nd[stmt].s
@@ -484,12 +485,14 @@ fn declare_in(var c: C, var vals: {Int: Int}, var tys: {Int: Int}, stmt: Int):
       c.nsym[stmt] = vals[name]
     else:
       let s = types.new_sym(&c, S_FUNC, name, stmt)
+      if name in vals and (c.sk[vals[name]] & S_NAMESPACE) != 0: c.merged_ns[s] = vals[name]
       vals[name] = s
       c.nsym[stmt] = s
   elif k == ast.N_CLASS:
     let name = c.t.nd[stmt].s
     if name < 0: return
     let s = types.new_sym(&c, S_CLASS, name, stmt)
+    if name in vals and (c.sk[vals[name]] & S_NAMESPACE) != 0: c.merged_ns[s] = vals[name]
     vals[name] = s
     tys[name] = s
     c.nsym[stmt] = s
@@ -547,12 +550,19 @@ fn declare_in(var c: C, var vals: {Int: Int}, var tys: {Int: Int}, stmt: Int):
     var first = nn
     while c.t.nd[first].k == ast.N_QNAME: first = c.t.nd[first].a
     let name = c.t.nd[first].s
-    if name in vals and (c.sk[vals[name]] & S_NAMESPACE) != 0:
-      types.add_decl(&c, vals[name], stmt)
-      c.nsym[stmt] = vals[name]
+    var known = -1
+    if name in vals and (c.sk[vals[name]] & S_NAMESPACE) != 0: known = vals[name]
+    elif name in vals and vals[name] in c.merged_ns: known = c.merged_ns[vals[name]]
+    if known >= 0:
+      types.add_decl(&c, known, stmt)
+      c.nsym[stmt] = known
     else:
       let s = types.new_sym(&c, S_NAMESPACE, name, stmt)
-      vals[name] = s
+      c.nsym[stmt] = s
+      # (a function, class or variable merged with a namespace: the value stays, the namespace is
+      # found through it)
+      if name in vals and (c.sk[vals[name]] & (S_FUNC | S_CLASS | S_VAR | S_CONST | S_LET)) != 0: c.merged_ns[vals[name]] = s
+      else: vals[name] = s
       if not (name in tys): tys[name] = s
       c.nsym[stmt] = s
 
@@ -566,6 +576,8 @@ fn declare_globals(var c: C, root: Int):
   for st in ast.items(c.t, root):
     if c.t.nd[st].k == ast.N_MODULE and (c.t.nd[st].f & ast.MOD_GLOBAL) != 0:
       for inner in ast.items(c.t, c.t.nd[st].b): declare_in(&c, &vals, &tys, inner)
+    elif c.t.nd[st].k == ast.N_MODULE and c.t.nd[c.t.nd[st].a].k == ast.N_STR:
+      if c.t.nd[st].b >= 0: ambient_module(&c, nm(c, c.t.nd[c.t.nd[st].a].s), c.t.nd[st].b)
     elif user and c.t.nd[st].k == ast.N_VAR:
       # a script's let or const over a global of the same name: TS2451 at both, the first stays
       var before: {Int: Int} = {}
@@ -613,6 +625,68 @@ fn declare_global_blocks(var c: C, root: Int):
       for inner in ast.items(c.t, c.t.nd[st].b): declare_in(&c, &vals, &tys, inner)
   swap(&vals, &c.globals)
   swap(&tys, &c.gtypes)
+
+# Ambient modules (declare module "fs" { ... } in a script file): module indexes from AMB_BASE,
+# one per name, with every declaration's body.
+const AMB_BASE = 1 << 24
+
+fn ambient_module(var c: C, name: Str, body: Int):
+  if name in c.amb:
+    c.amb_bodies[c.amb[name]].push(body)
+    return
+  let g = AMB_BASE + c.amb.len
+  c.amb[name] = g
+  c.amb_bodies[g] = [body]
+
+# A module's top-level statement lists: a file's root, or an ambient module's bodies.
+fn mod_roots(c: C, f: Int) -> [Int]:
+  if f >= AMB_BASE:
+    var out: [Int] = []
+    for b in c.amb_bodies[f]: out.push(b)
+    return out
+  return [c.roots[f]]
+
+# An export context (TypeScript's NodeFlags.ExportContext): a declaration file or an ambient
+# module without export lists, export * or export =/default exports every declaration.
+fn export_context(c: C, f: Int) -> Bool:
+  if f < AMB_BASE:
+    let p = c.files[f]
+    if not (p.endswith(".d.ts") or p.endswith(".d.mts") or p.endswith(".d.cts")): return false
+  for root in mod_roots(c, f):
+    for st in ast.items(c.t, root):
+      let k = c.t.nd[st].k
+      if k == ast.N_EXPORT or k == ast.N_EXPORTASSIGN or k == ast.N_EXPORTDEFAULT: return false
+  return true
+
+# Module augmentations (declare module "x" { ... } in a module file): an interface merges with
+# the module's exported interface of its name; a new name becomes an export. Run once every file
+# is bound (the module's exports may come from any file's ambient modules).
+fn augmentations(var c: C, from: Int):
+  for fi in from..c.roots.len:
+    let root = c.roots[fi]
+    if not is_module(c, root): continue
+    for st in ast.items(c.t, root):
+      if c.t.nd[st].k != ast.N_MODULE or c.t.nd[st].b < 0: continue
+      if (c.t.nd[st].f & ast.MOD_GLOBAL) != 0 or c.t.nd[c.t.nd[st].a].k != ast.N_STR: continue
+      let g = resolve_module(&c, st, c.t.nd[st].a)
+      if g < 0: continue
+      let body = c.t.nd[st].b
+      c.aug_target[body] = g
+      ensure_exports(&c, g)
+      if not (g in c.mexports): continue
+      scope_names(&c, body)
+      for inner in ast.items(c.t, body):
+        var x = inner
+        let k = c.t.nd[x].k
+        if k != ast.N_INTERFACE: continue
+        let name = c.t.nd[x].s
+        let target = exp_type_of(&c, g, name)
+        if target >= 0:
+          let ts = resolve_alias_type(&c, target)
+          if ts >= 0 and (c.sk[ts] & (S_INTERFACE | S_CLASS)) != 0: types.add_decl(&c, ts, x)
+        elif x in c.nsym:
+          c.mexports[g][name] = c.nsym[x]
+          c.mexp_order[g].push(name)
 
 # Whether a file is a module (has a top-level import or export).
 fn is_module(c: C, root: Int) -> Bool:
@@ -696,6 +770,7 @@ fn resolve_module(var c: C, at: Int, spec_node: Int) -> Int:
     if target in c.file_index:
       let g = c.file_index[target]
       if is_module(c, c.roots[g]): return g
+  if spec in c.amb: return c.amb[spec]
   if (c.files[f] + "|" + spec) in c.pkg_present:
     unsupported(&c, spec_node, "a package import")
     return -2
@@ -718,8 +793,9 @@ fn error_sym(var c: C, name: Int, decl: Int) -> Int:
   return s
 
 fn has_export_eq(c: C, g: Int) -> Bool:
-  for st in ast.items(c.t, c.roots[g]):
-    if c.t.nd[st].k == ast.N_EXPORTASSIGN: return true
+  for root in mod_roots(c, g):
+    for st in ast.items(c.t, root):
+      if c.t.nd[st].k == ast.N_EXPORTASSIGN: return true
   return false
 
 # What an import alias names (the exported symbol), reporting a missing module or export once.
@@ -737,9 +813,15 @@ fn resolve_alias(var c: C, s: Int) -> Int:
   if imp >= 0:
     var g = resolve_module(&c, imp, c.t.nd[imp].a)
     if g >= 0 and has_export_eq(c, g):
-      # (a module of export = x: what an import of it gets isn't modeled)
-      unsupported(&c, d, "an import of a module with export =")
-      g = -1
+      ensure_exports(&c, g)
+      var why = ""
+      if not (g in c.export_eq): why = "an import of a module with export = of an expression"
+      elif c.t.nd[imp].c == d:
+        let es = c.export_eq[g]
+        if (c.sk[es] & S_NAMESPACE) == 0 and not (es in c.merged_ns): why = "a namespace import of a module with export ="
+      if why != "":
+        unsupported(&c, d, why)
+        g = -1
     if g >= 0:
       let spec = nm(c, c.t.nd[c.t.nd[imp].a].s)
       if c.t.nd[imp].c == d:
@@ -755,6 +837,14 @@ fn resolve_alias(var c: C, s: Int) -> Int:
         let ex = exp_of(&c, g, name)
         if ex >= 0:
           r = resolve_alias(&c, ex)
+        elif has_export_eq(c, g) or g >= AMB_BASE:
+          # a property of what export = names (TypeScript's getPropertyOfVariable)
+          var ps = -1
+          if c.t.nd[d].k == ast.N_SPEC and g in c.export_eq and (c.sk[c.export_eq[g]] & S_VALUE) != 0:
+            let vt = type_of_sym(&c, c.export_eq[g])
+            if c.tk[vt] == types.TK_OBJ: ps = chk.prop_of(&c, vt, name)
+          if ps >= 0: r = ps
+          else: unsupported(&c, d, "a named import of a property of a module's export =")
         elif c.t.nd[d].k == ast.N_SPEC:
           no_member(&c, g, at, "\"" + spec + "\"", name)
         else:
@@ -926,7 +1016,30 @@ fn ensure_exports(var c: C, f: Int):
   var tout: {Int: Int} = {}
   if f in c.mod_busy: return
   c.mod_busy[f] = true
-  let root = c.roots[f]
+  for root in mod_roots(c, f): root_exports(&c, f, root, &out, &ord, &tout)
+  if export_context(c, f):
+    for root in mod_roots(c, f):
+      var vn: [Int] = []
+      for k, _ in c.locals[root]: vn.push(k)
+      vn.sort()
+      for k in vn:
+        let sx = c.locals[root][k]
+        if (c.sk[sx] & types.S_IMPORT) == 0 and not (k in out): put2(&c, &out, &ord, &tout, k, sx)
+      var tn: [Int] = []
+      for k, _ in c.ltypes[root]: tn.push(k)
+      tn.sort()
+      for k in tn:
+        let sx = c.ltypes[root][k]
+        if (c.sk[sx] & types.S_IMPORT) != 0: continue
+        if not (k in out): put(&out, &ord, k, sx)
+        elif out[k] != sx and not (k in tout): tout[k] = sx
+  c.mexports[f] = out
+  c.mtexports[f] = tout
+  c.mexp_order[f] = ord
+  c.mod_busy.remove(f)
+
+# One statement list's exports (a file's, or one body of an ambient module).
+fn root_exports(var c: C, f: Int, root: Int, var out: {Int: Int}, var ord: [Int], var tout: {Int: Int}):
   scope_names(&c, root)
   let dflt = ast.intern(&c.t, "default")
   let stmts = ast.items(c.t, root)
@@ -951,6 +1064,8 @@ fn ensure_exports(var c: C, f: Int):
     elif k == ast.N_EXPORTDEFAULT:
       let dsx = default_sym(&c, st)
       put(&out, &ord, dflt, dsx)
+    elif k == ast.N_EXPORTASSIGN:
+      export_eq(&c, f, root, st, &out, &ord, &tout)
   for st in stmts:
     if c.t.nd[st].k != ast.N_EXPORT: continue
     if c.t.nd[st].a >= 0:
@@ -984,10 +1099,49 @@ fn ensure_exports(var c: C, f: Int):
           put(&out, &ord, c.t.nd[sp].s, c.locals[root][local])
           if local in c.ltypes[root] and c.ltypes[root][local] != c.locals[root][local]: tout[c.t.nd[sp].s] = c.ltypes[root][local]
         elif local in c.ltypes[root]: put(&out, &ord, c.t.nd[sp].s, c.ltypes[root][local])
-  c.mexports[f] = out
-  c.mtexports[f] = tout
-  c.mexp_order[f] = ord
-  c.mod_busy.remove(f)
+
+# export = e (e a name): the module's default is e (as esModuleInterop sees it), and when e is or
+# merges with a namespace, its members are the module's exports.
+fn export_eq(var c: C, f: Int, root: Int, st: Int, var out: {Int: Int}, var ord: [Int], var tout: {Int: Int}):
+  let e = c.t.nd[st].a
+  if e < 0 or c.t.nd[e].k != ast.N_ID: return
+  let name = c.t.nd[e].s
+  var v = -1
+  var ty = -1
+  if name in c.locals[root]: v = c.locals[root][name]
+  if name in c.ltypes[root]: ty = c.ltypes[root][name]
+  if v < 0 and ty < 0: return
+  let dflt = ast.intern(&c.t, "default")
+  if v >= 0:
+    c.export_eq[f] = v
+    put(&out, &ord, dflt, v)
+    if ty >= 0 and ty != v: tout[dflt] = ty
+  else:
+    c.export_eq[f] = ty
+    put(&out, &ord, dflt, ty)
+  var ns = -1
+  if v >= 0 and (c.sk[v] & S_NAMESPACE) != 0: ns = v
+  elif v >= 0 and v in c.merged_ns: ns = c.merged_ns[v]
+  elif ty >= 0 and (c.sk[ty] & S_NAMESPACE) != 0: ns = ty
+  if ns < 0: return
+  for d in types.sym_decls(c, ns):
+    if c.t.nd[d].k != ast.N_MODULE or c.t.nd[d].b < 0: continue
+    let body = c.t.nd[d].b
+    scope_names(&c, body)
+    var names: [Int] = []
+    for k, _ in c.locals[body]: names.push(k)
+    for k, _ in c.ltypes[body]:
+      if not (k in c.locals[body]): names.push(k)
+    names.sort()
+    for nmx in names:
+      var mv = -1
+      var mt = -1
+      if nmx in c.locals[body] and ns_exported(c, d, c.locals[body][nmx]): mv = c.locals[body][nmx]
+      if nmx in c.ltypes[body] and ns_exported(c, d, c.ltypes[body][nmx]): mt = c.ltypes[body][nmx]
+      if mv >= 0:
+        if not (nmx in out): put(&out, &ord, nmx, mv)
+        if mt >= 0 and mt != mv: tout[nmx] = mt
+      elif mt >= 0 and not (nmx in out): put(&out, &ord, nmx, mt)
 
 # export default expr: a name for the expression (an identifier exports what it names).
 fn default_sym(var c: C, st: Int) -> Int:
@@ -1088,6 +1242,10 @@ fn lookup_value_raw(var c: C, at: Int, name: Int) -> Int:
       if not is_file or file_is_module(&c, n):
         scope_names(&c, n)
         if name in c.locals[n]: return c.locals[n][name]
+        # (in a module augmentation: what the module exports)
+        if n in c.aug_target:
+          let ae = exp_of(&c, c.aug_target[n], name)
+          if ae >= 0: return ae
     prev = n
     n = c.parent[n]
   if name in c.globals: return c.globals[name]
@@ -1114,6 +1272,9 @@ fn lookup_type(var c: C, at: Int, name: Int) -> Int:
       if not is_file or file_is_module(&c, n):
         scope_names(&c, n)
         if name in c.ltypes[n]: return resolve_alias_type(&c, c.ltypes[n][name])
+        if n in c.aug_target:
+          let ae = exp_type_of(&c, c.aug_target[n], name)
+          if ae >= 0: return resolve_alias_type(&c, ae)
     n = c.parent[n]
   if name in c.gtypes: return c.gtypes[name]
   return -1
@@ -1629,10 +1790,16 @@ fn qualified_left(var c: C, at: Int, e: Int) -> Int:
   var s = -1
   if c.t.nd[e].k == ast.N_ID:
     s = lookup_type(&c, at, c.t.nd[e].s)
-    if s < 0 or (c.sk[s] & S_NAMESPACE) == 0: s = lookup_value(&c, at, c.t.nd[e].s)
+    if s >= 0 and (c.sk[s] & types.S_IMPORT) != 0: s = resolve_alias_type(&c, s)
+    if s >= 0 and s in c.merged_ns: s = c.merged_ns[s]
+    if s < 0 or (c.sk[s] & S_NAMESPACE) == 0:
+      s = lookup_value(&c, at, c.t.nd[e].s)
+      if s >= 0 and (c.sk[s] & types.S_IMPORT) != 0: s = resolve_alias(&c, s)
+      if s >= 0 and s in c.merged_ns: s = c.merged_ns[s]
   elif c.t.nd[e].k == ast.N_QNAME or c.t.nd[e].k == ast.N_PROPACCESS:
     let left = qualified_left(&c, at, c.t.nd[e].a)
     if left >= 0: s = ns_member(&c, left, c.t.nd[e].s, true)
+    if s >= 0 and s in c.merged_ns: s = c.merged_ns[s]
   if s < 0 or (c.sk[s] & S_NAMESPACE) == 0: return -1
   return s
 
@@ -1657,6 +1824,9 @@ fn ns_member(var c: C, ns: Int, name: Int, values: Bool) -> Int:
 
 fn ns_exported(c: C, d: Int, s: Int) -> Bool:
   if c.t.nd[d].file < c.user_from or (c.t.nd[d].f & ast.M_DECLARE) != 0: return true
+  # (in a declaration file: an ambient context)
+  let fp = c.files[c.t.nd[d].file]
+  if fp.endswith(".d.ts") or fp.endswith(".d.mts") or fp.endswith(".d.cts"): return true
   let sd = c.sdecl[s]
   if sd < 0: return false
   var x = sd
@@ -2147,6 +2317,29 @@ fn type_of_sym(var c: C, s: Int) -> Int:
     return t
   if c.stype[s] == -2:
     return c.any_t          # circular: TypeScript reports TS7022; treated as any here
+  if s in c.merged_ns and (c.sk[s] & S_NAMESPACE) == 0:
+    let nt = ns_value_type(&c, c.merged_ns[s])
+    if c.objs[c.ta[nt]].props.len > 0 and (c.sk[s] & S_FUNC) != 0:
+      # a function merged with a namespace: its signatures and the namespace's values
+      c.stype[s] = -2
+      let ft = chk.decl_type(&c, s)
+      if c.tk[ft] == TK_OBJ:
+        let t = types.anon_obj(&c, s, c.sdecl[s])
+        var sgs: [Int] = []
+        for sg in c.objs[c.ta[ft]].calls: sgs.push(sg)
+        for sg in sgs: c.objs[c.ta[t]].calls.push(sg)
+        var pn: [Int] = []
+        for k, _ in c.objs[c.ta[nt]].props: pn.push(k)
+        pn.sort()
+        for k in pn: types.add_prop(&c, t, k, c.objs[c.ta[nt]].props[k])
+        c.objs[c.ta[t]].resolved = true
+        c.stype[s] = t
+        return t
+      c.stype[s] = -1
+    if c.objs[c.ta[nt]].props.len > 0:
+      let lu = lazy_unsupported(&c, c.sdecl[s], "a function, class or variable merged with a namespace that has values")
+      c.stype[s] = lu
+      return lu
   c.stype[s] = -2
   let t = compute_sym_type(&c, s)
   c.stype[s] = t

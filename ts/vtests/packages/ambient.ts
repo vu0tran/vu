@@ -1,0 +1,10 @@
+import { readFileSync, type PathLike } from "fs";
+import * as fs2 from "node:fs";
+import path from "path";
+import { sep } from "node:fs";
+export const a: number = readFileSync("x");
+export const p: PathLike = 3;
+export const b: number = fs2.readFileSync("y");
+export const j: number = path.join("a", "b");
+export const s: "/" = sep;
+export const s2: "-" = path.sep;

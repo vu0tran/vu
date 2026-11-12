@@ -1,2 +1,12 @@
 import eq from "eq";
+import type * as ns from "eqns";
+import fn, { helper, type Opts } from "eqns";
+import Klass from "eqclass";
 export const x: string = eq(1);
+export const o: ns.Opts = { size: "big" };
+export const o2: Opts = { size: 1 };
+export const h: number = helper();
+export const k: string = new Klass().id;
+export const called = fn;
+export const called: number = fn();
+export const viaNs: number = fn.helper();

@@ -1,0 +1,11 @@
+type P = { category: "a" | "b"; n: number };
+declare function i1<U>(f: () => U): Iterator<U>;
+export const q1: Iterator<P> = i1(() => ({ category: "a", n: 1 }));
+declare function i2<U>(f: () => U): ArrayIterator<U>;
+export const q2: Iterator<P> = i2(() => ({ category: "a", n: 1 }));
+declare function i3<U>(f: () => U): IteratorResult<U>;
+export const q3: IteratorResult<P> = i3(() => ({ category: "a", n: 1 }));
+declare function i4<U>(f: () => U): { [Symbol.iterator](): Iterator<U> };
+export const q4: Iterable<P> = i4(() => ({ category: "a", n: 1 }));
+declare function i5<U>(f: () => U): { next(): IteratorResult<U, number> };
+export const q5: { next(): IteratorResult<P, any> } = i5(() => ({ category: "a", n: 1 }));
