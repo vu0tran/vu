@@ -27,9 +27,10 @@ const TK_OBJ = 19         # a: index in objs
 const TK_UNION = 20       # a, b: start and count in tl
 const TK_INTER = 21
 const TK_UNSUP = 22       # something the checker doesn't model (a: node): stops checking the file
-const TK_KEYOF = 23       # keyof T, deferred while T is generic (a: T)
-const TK_INDEXED = 24     # T[K], deferred (a: object type, b: index type)
-const TK_COND = 25        # a conditional type, deferred (a: node, b: mapper)
+const TK_TEMPLATE = 23    # a template literal type with holes, `a${string}b` (a: index in tmpls)
+const TK_KEYOF = 24       # keyof T, deferred while T is generic (a: T)
+const TK_INDEXED = 25     # T[K], deferred (a: object type, b: index type)
+const TK_COND = 26        # a conditional type, deferred (a: node, b: mapper)
 
 # TypeScript's TypeFlags values, in TypeScript 7's order, used to sort union members
 const F_ANY = 1
@@ -54,6 +55,7 @@ const F_NEVER = 262144
 const F_TPARAM = 524288
 const F_OBJECT = 1048576
 const F_INDEX = 2097152
+const F_TEMPLATE = 4194304
 const F_INDEXED = 33554432
 const F_COND = 67108864
 const F_UNION = 134217728
@@ -89,6 +91,12 @@ type Obj:
   sname: Int        # the string index signature's parameter name (-1: x)
   nname: Int        # the number index signature's parameter name (-1: x)
   mcons: Int        # a resolved mapped type (no as clause): its constraint, its keys (-1)
+
+# A template literal type: texts around holes (texts.len == holes.len + 1); the holes are string,
+# number, bigint or any.
+type Tmpl:
+  texts: [Str]
+  holes: [Int]
 
 type Sig:
   tparams: [Int]
@@ -270,6 +278,8 @@ type C:
   infer_depth: Int = 0        # infer_in calls inside one another (isDeeplyNestedType's limit)
   lit_ctx: {Int: Int} = {}    # an object literal -> its contextual type (-1 none), for this in its methods
   meth_this: {Int: Int} = {}  # an object literal's method -> its contextual signature's this type
+  tmpls: [Tmpl] = []          # template literal types (TK_TEMPLATE's a)
+  tmpl_ids: {Str: Int} = {}   # their texts and holes -> the type
   this_of: {Int: Int} = {}    # a polymorphic this type's symbol -> its class or interface (its constraint)
 
 # symbol kinds
@@ -346,6 +356,130 @@ fn str_lit(var c: C, name: Int, fresh: Bool) -> Int:
   let r = c.strlits[name]
   if fresh: return r + 1
   return r
+
+# A template literal type (getTemplateLiteralType): a string literal without holes, string for
+# `${string}`, else one type per texts and holes.
+fn template_of(var c: C, texts: [Str], holes: [Int]) -> Int:
+  if holes.len == 0: return str_lit_s(&c, texts[0], false)
+  if holes.len == 1 and texts[0] == "" and texts[1] == "" and c.tk[holes[0]] == TK_STRING: return holes[0]
+  var key = ""
+  for i in 0..holes.len: key += "{texts[i].len}:" + texts[i] + "{holes[i]};"
+  key += "{texts[holes.len].len}:" + texts[holes.len]
+  if key in c.tmpl_ids: return c.tmpl_ids[key]
+  let ix = c.tmpls.len
+  var tx: [Str] = []
+  for x in texts: tx.push(x + "")
+  var hs: [Int] = []
+  for h in holes: hs.push(h)
+  c.tmpls.push(Tmpl(tx, hs))
+  let t = mk(&c, TK_TEMPLATE, F_TEMPLATE, ix, 0)
+  c.tmpl_ids[key] = t
+  return t
+
+fn tmpl_texts(c: C, t: Int) -> [Str]:
+  var out: [Str] = []
+  for x in c.tmpls[c.ta[t]].texts: out.push(x + "")
+  return out
+
+fn tmpl_holes(c: C, t: Int) -> [Int]:
+  var out: [Int] = []
+  for h in c.tmpls[c.ta[t]].holes: out.push(h)
+  return out
+
+# isTypeMatchedByTemplateLiteralType for a string: the texts found left to right (each the
+# first occurrence; between two holes with nothing between, the first takes one character), and
+# each hole's part valid for its type.
+fn tmpl_matches(c: C, str: Str, t: Int) -> Bool:
+  let texts = tmpl_texts(c, t)
+  let holes = tmpl_holes(c, t)
+  let nh = holes.len
+  let first = texts[0]
+  let last = texts[nh]
+  if str.len < first.len + last.len or not str.startswith(first) or not str.endswith(last): return false
+  let body = str[first.len..str.len - last.len]
+  var parts: [Str] = []
+  var pos = 0
+  for i in 1..nh:
+    let delim = texts[i]
+    if delim.len > 0:
+      let p = find_from(body, delim, pos)
+      if p < 0: return false
+      parts.push(body[pos..p])
+      pos = p + delim.len
+    elif pos < body.len:
+      parts.push(body[pos..pos + 1])
+      pos += 1
+    else: return false
+  parts.push(body[pos..body.len])
+  for i in 0..nh:
+    if not hole_accepts(c, holes[i], parts[i]): return false
+  return true
+
+fn find_from(s: Str, sub: Str, from: Int) -> Int:
+  var i = from
+  while i + sub.len <= s.len:
+    if s[i..i + sub.len] == sub: return i
+    i += 1
+  return -1
+
+# isValidTypeForTemplateLiteralPlaceholder for a string's part.
+fn hole_accepts(c: C, h: Int, part: Str) -> Bool:
+  let k = c.tk[h]
+  if k == TK_STRING or k == TK_ANY: return true
+  if k == TK_NUMBER: return valid_number_string(part)
+  if k == TK_BIGINT: return valid_bigint_string(part)
+  return false
+
+# isValidNumberString(s, false): what +s reads as a finite number (JavaScript's StringToNumber).
+fn valid_number_string(s0: Str) -> Bool:
+  if s0 == "": return false
+  var a = 0
+  var b = s0.len
+  while a < b and (s0[a] == ' ' or s0[a] == '\t' or s0[a] == '\n' or s0[a] == '\r'): a += 1
+  while b > a and (s0[b - 1] == ' ' or s0[b - 1] == '\t' or s0[b - 1] == '\n' or s0[b - 1] == '\r'): b -= 1
+  if a == b: return true
+  let s = s0[a..b]
+  if s.len > 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X' or s[1] == 'o' or s[1] == 'O' or s[1] == 'b' or s[1] == 'B'):
+    for i in 2..s.len:
+      let ch = s[i]
+      let hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F')
+      if s[1] == 'x' or s[1] == 'X':
+        if not hex: return false
+      elif s[1] == 'o' or s[1] == 'O':
+        if ch < '0' or ch > '7': return false
+      elif ch != '0' and ch != '1': return false
+    return true
+  var i = 0
+  if s[i] == '+' or s[i] == '-': i += 1
+  var digits = 0
+  while i < s.len and s[i] >= '0' and s[i] <= '9':
+    i += 1
+    digits += 1
+  if i < s.len and s[i] == '.':
+    i += 1
+    while i < s.len and s[i] >= '0' and s[i] <= '9':
+      i += 1
+      digits += 1
+  if digits == 0: return false
+  if i < s.len and (s[i] == 'e' or s[i] == 'E'):
+    i += 1
+    if i < s.len and (s[i] == '+' or s[i] == '-'): i += 1
+    var ed = 0
+    while i < s.len and s[i] >= '0' and s[i] <= '9':
+      i += 1
+      ed += 1
+    if ed == 0: return false
+  return i == s.len
+
+# isValidBigIntString: an optional minus, then a bigint literal's digits (decimal).
+fn valid_bigint_string(s: Str) -> Bool:
+  var i = 0
+  if i < s.len and s[i] == '-': i += 1
+  if i == s.len: return false
+  while i < s.len:
+    if s[i] < '0' or s[i] > '9': return false
+    i += 1
+  return true
 
 fn str_lit_s(var c: C, s: Str, fresh: Bool) -> Int:
   let name = ast.intern(&c.t, s)
@@ -426,7 +560,7 @@ fn is_literal(c: C, t: Int) -> Bool:
 fn base_of_literal(c: C, t: Int) -> Int:
   if t in c.enum_base: return c.enum_base[t]
   let k = c.tk[t]
-  if k == TK_STRLIT: return c.string_t
+  if k == TK_STRLIT or k == TK_TEMPLATE: return c.string_t
   if k == TK_NUMLIT: return c.number_t
   if k == TK_BIGLIT: return c.bigint_t
   if k == TK_TRUE or k == TK_FALSE: return c.boolean_t
@@ -654,11 +788,25 @@ fn union_plain(var c: C, ts: [Int]) -> Int:
     if c.tk[m] == TK_STRING: has_str = true
     if c.tk[m] == TK_NUMBER: has_num = true
     if c.tk[m] == TK_BIGINT: has_big = true
+  var has_tmpl = false
+  for m in flat:
+    if c.tk[m] == TK_TEMPLATE: has_tmpl = true
   if has_str or has_num or has_big:
     var kept: [Int] = []
     for m in flat:
       let k = c.tk[m]
-      if (k == TK_STRLIT and has_str) or (k == TK_NUMLIT and has_num) or (k == TK_BIGLIT and has_big): continue
+      if ((k == TK_STRLIT or k == TK_TEMPLATE) and has_str) or (k == TK_NUMLIT and has_num) or (k == TK_BIGLIT and has_big): continue
+      kept.push(m)
+    flat = kept
+  elif has_tmpl:
+    # (removeStringLiteralsMatchedByTemplateLiterals)
+    var kept: [Int] = []
+    for m in flat:
+      if c.tk[m] == TK_STRLIT and not is_enum_lit(c, m):
+        var matched = false
+        for x in flat:
+          if c.tk[x] == TK_TEMPLATE and tmpl_matches(c, c.t.names[c.ta[m]] + "", x): matched = true
+        if matched: continue
       kept.push(m)
     flat = kept
   if flat.len == 0: return c.never_t
