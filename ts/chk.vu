@@ -5587,6 +5587,18 @@ fn assigned_in(var c: C, n: Int, var out: [Str]):
   if k == ast.N_BINARY and (c.t.nd[n].f == scan.T_ASSIGN or (c.t.nd[n].f >= scan.T_PLUSEQ and c.t.nd[n].f <= scan.T_QQEQ)):
     let key = ref_key(&c, c.t.nd[n].a)
     if key != "": out.push(key)
+    # (xs[i] = v evolves an evolving array xs)
+    let l0 = c.t.nd[n].a
+    if c.t.nd[n].f == scan.T_ASSIGN and c.t.nd[l0].k == ast.N_ELEMACCESS:
+      let ek = evolving_key(&c, c.t.nd[l0].a)
+      if ek != "": out.push(ek)
+  # (xs.push(v) / xs.unshift(v) too)
+  if k == ast.N_CALL and c.t.nd[c.t.nd[n].a].k == ast.N_PROPACCESS:
+    let cal = c.t.nd[n].a
+    let pn = nm(c, c.t.nd[cal].s)
+    if pn == "push" or pn == "unshift":
+      let ek = evolving_key(&c, c.t.nd[cal].a)
+      if ek != "": out.push(ek)
   if (k == ast.N_PREFIX or k == ast.N_POSTFIX) and (c.t.nd[n].f == scan.T_INC or c.t.nd[n].f == scan.T_DEC):
     let key = ref_key(&c, c.t.nd[n].a)
     if key != "": out.push(key)
@@ -5605,6 +5617,13 @@ fn assigned_in(var c: C, n: Int, var out: [Str]):
   assigned_in(&c, c.t.nd[n].b, &out)
   assigned_in(&c, c.t.nd[n].c, &out)
   assigned_in(&c, c.t.nd[n].d, &out)
+
+# The key of an evolving array variable (let xs = []) named by e, else "".
+fn evolving_key(var c: C, e: Int) -> Str:
+  if c.t.nd[e].k != ast.N_ID or c.auto_arr < 0: return ""
+  let s = bind.lookup_value(&c, e, c.t.nd[e].s)
+  if s < 0 or bind.type_of_sym(&c, s) != c.auto_arr: return ""
+  return "{s}"
 
 fn forget_assigned(var c: C, n: Int):
   var keys: [Str] = []
@@ -5673,6 +5692,10 @@ fn join_branches(var c: C, ft: {Str: Int}, fe: {Str: Int}, reach_t: Bool, reach_
     if key in ft: vt = ft[key]
     var ve = outer_value(c, key)
     if key in fe: ve = fe[key]
+    # (an evolving array not evolved on a side: it's auto[] there, which adds no element)
+    if is_evolving(&c, key):
+      if vt == -1 or vt == -9: vt = c.auto_arr
+      if ve == -1 or ve == -9: ve = c.auto_arr
     var r = -9
     if vt == -7 or ve == -7: r = -7
     elif vt < 0 or ve < 0: r = -9
@@ -5681,7 +5704,7 @@ fn join_branches(var c: C, ft: {Str: Int}, fe: {Str: Int}, reach_t: Bool, reach_
       # fresh literal members keep the union apart from the declared type (tsc compares ids),
       # unless the regular literal is there too (removeRedundantLiteralTypes)
       let fresh = fresh_survives(c, vt, ve)
-      var u = types.union_of(&c, [vt, ve])
+      var u = flow_union(&c, key, [vt, ve])
       if fresh: u = union_fresh(&c, [vt, ve])
       # (a property: the union too, as a variable's, compared with no declared type)
       if false: r = -7
@@ -5708,9 +5731,11 @@ fn join_many(var c: C, frames: [{Str: Int}], assigned: [Str]):
       set_narrow(&c, key, -9)
       continue
     var vals: [Int] = []
+    let evo = is_evolving(&c, key)
     for fr in frames:
       var v = outer_value(c, key)
       if key in fr: v = fr[key]
+      if evo and (v == -1 or v == -9): v = c.auto_arr
       vals.push(v)
     var r = -9
     var unknown = false
@@ -5732,7 +5757,7 @@ fn join_many(var c: C, frames: [{Str: Int}], assigned: [Str]):
       var fresh = false
       for f in fresh_all:
         if not types.has_int(regs, f): fresh = true
-      var u = types.union_of(&c, vals)
+      var u = flow_union(&c, key, vals)
       if fresh: u = union_fresh(&c, vals)
       # (a property: the union too, as a variable's, compared with no declared type)
       if false: r = -7
@@ -6169,6 +6194,18 @@ fn this_type(var c: C, n: Int) -> Int:
       let ps = kids(c, c.t.nd[x].b)
       if ps.len > 0 and c.t.nd[c.t.nd[ps[0]].a].k == ast.N_ID and nm(c, c.t.nd[c.t.nd[ps[0]].a].s) == "this" and c.t.nd[ps[0]].b >= 0:
         return bind.type_from(&c, c.t.nd[ps[0]].b)
+      # a function expression assigned to a property (o.f = function () {}): the object's type
+      if k == ast.N_FUNCEXPR:
+        var fp = c.parent[x]
+        var fx = x
+        while fp >= 0 and c.t.nd[fp].k == ast.N_PAREN:
+          fx = fp
+          fp = c.parent[fp]
+        if fp >= 0 and c.t.nd[fp].k == ast.N_BINARY and c.t.nd[fp].f == scan.T_ASSIGN and c.t.nd[fp].b == fx:
+          let tg = c.t.nd[fp].a
+          let tk0 = c.t.nd[tg].k
+          if (tk0 == ast.N_PROPACCESS or tk0 == ast.N_ELEMACCESS) and c.t.nd[tg].a in c.ntype:
+            return widen(&c, c.ntype[c.t.nd[tg].a])
       return unsup(&c, n, "this outside a class")
     if k == ast.N_CLASSEXPR: return unsup(&c, n, "this outside a class")
     x = bind.up(c, x)
@@ -7792,12 +7829,30 @@ fn cond_refs(var c: C, e: Int, var out: [Str]):
     cond_refs(&c, c.t.nd[e].b, &out)
     cond_refs(&c, c.t.nd[e].c, &out)
 
+# The join of a reference's flow types: their union; for an evolving array (let xs = []), the
+# array of its elements' union (auto[] while none).
+fn is_evolving(var c: C, key: Str) -> Bool:
+  let s = int(key) else -1
+  return s >= 0 and c.auto_arr >= 0 and bind.type_of_sym(&c, s) == c.auto_arr
+
+fn flow_union(var c: C, key: Str, ts: [Int]) -> Int:
+  let s = int(key) else -1
+  if s < 0 or c.auto_arr < 0 or bind.type_of_sym(&c, s) != c.auto_arr: return types.union_of(&c, ts)
+  var els: [Int] = []
+  for t in ts:
+    if t == c.auto_arr: continue
+    if rel.is_array_ref(&c, t): els.push(c.objs[c.ta[t]].args[0])
+    else: return types.union_of(&c, ts)
+  if els.len == 0: return c.auto_arr
+  let eu = types.union_of(&c, els)
+  return bind.array_of(&c, eu)
+
 fn is_tracked(var c: C, key: Str) -> Bool:
   if key.find(".") >= 0: return false
   let s = int(key) else -1
   if s < 0: return false
   let t = bind.type_of_sym(&c, s)
-  if t == c.auto_t or t == c.auto_arr: return false
+  if t == c.auto_t: return false
   return true
 
 # One run over the loop: head types set, the condition's true facts, the body (and the update);
@@ -7990,7 +8045,7 @@ fn check_loop(var c: C, n: Int):
       var ts: [Int] = [head[key]]
       if key in rec.back:
         for t in rec.back[key]: ts.push(types.regular(c, t))
-      let nh = types.union_of(&c, ts)
+      let nh = flow_union(&c, key, ts)
       if nh != head[key]:
         settled = false
         head[key] = nh
@@ -8033,7 +8088,7 @@ fn check_loop(var c: C, n: Int):
       continue
     let s = int(key) else -1
     let dt = bind.type_of_sym(&c, s)
-    let et = types.union_of(&c, outs)
+    let et = flow_union(&c, key, outs)
     forget(&c, key)
     if et == dt: set_narrow(&c, key, -9)
     else: set_narrow(&c, key, et)
