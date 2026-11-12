@@ -13,6 +13,7 @@ import types
 import bind
 import chk
 import tsres
+import tsconf
 import lresolve
 
 fn lib_dir(fs: Fs, os: Os) -> Str:
@@ -169,13 +170,23 @@ fn want_deps(f: Int, user_from: Int, deps: [[Str]], var want: [Bool], index: {St
   for d in deps[f - user_from]:
     if d in index: want_deps(index[d], user_from, deps, &want, index)
 
-fn worker(fs: Fs, os: Os, own files: [Str], own dir: Str, own target: Str, shard: Int, nshards: Int, own ch: Chan[Out]):
-  let o = run(fs, os, files, dir, target, shard, nshards) else Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
+# What the tsconfig decides for a run: lib files (libs, [] the target's default) and @types
+# packages (has_types: the listed ones from tdir, else every one found from the current folder up).
+type Prog:
+  libs: [Str] = []
+  has_types: Bool = false
+  types: [Str] = []
+  tdir: Str = ""
+  pkeys: [Str] = []      # the tsconfig's paths
+  pvals: [[Str]] = []
+
+fn worker(fs: Fs, os: Os, own files: [Str], own dir: Str, own target: Str, own pg: Prog, shard: Int, nshards: Int, own ch: Chan[Out]):
+  let o = run(fs, os, files, dir, target, pg, shard, nshards) else Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
   ch.send(o)
 
 # The checker over the files: the errors of this worker's share of them (every nshards-th file,
 # starting at shard), each with its sort key.
-fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards: Int) -> Out throws:
+fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, pg: Prog, shard: Int, nshards: Int) -> Out throws:
   let t0 = os.clock()
   var out = Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
   var seen: {Str: Bool} = {}
@@ -184,7 +195,9 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
   var libroot = target + ".full"
   if target == "es5": libroot = "d"
   elif target == "es6" or target == "es2015": libroot = "es6"
-  lib_files(fs, dir, libroot, &seen, &libs)
+  if pg.libs.len > 0:
+    for l in pg.libs: lib_files(fs, dir, l, &seen, &libs)
+  else: lib_files(fs, dir, libroot, &seen, &libs)
   var kw = scan.keywords()
   var t = ast.new_ast()
   var srcs: [Str] = [""]
@@ -215,8 +228,14 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
   var pkgset: {Str: Bool} = {}
   var pkg_res: {Str: Str} = {}
   let cwd0 = os.env("PWD")
+  var tfiles: [Str] = []
+  if pg.has_types:
+    for tn in pg.types:
+      let tf = tsres.reference_types(&rv, fs, pg.tdir + "/x", tn)
+      if tf != "": tfiles.push(tf)
+  elif os.env("VTSC_NO_PACKAGES") == "": tfiles = tsres.auto_types(&rv, fs, cwd0)
   if os.env("VTSC_NO_PACKAGES") == "":
-    for f in tsres.auto_types(&rv, fs, cwd0):
+    for f in tfiles:
       if not (f in queued):
         queued[f] = true
         queue.push(f + "")
@@ -256,13 +275,36 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
           queue.push(rtarget + "")
           if path in pkgset or rtarget.find("/node_modules/") >= 0: pkgset[rtarget] = true
         my_deps.push(rtarget + "")
+    # (the statements of ambient modules and augmentations import too)
+    var sts: [Int] = []
     for st in ast.items(t, root):
+      sts.push(st)
+      if t.nd[st].k == ast.N_MODULE and t.nd[st].b >= 0 and t.nd[t.nd[st].a].k == ast.N_STR:
+        for x in ast.items(t, t.nd[st].b): sts.push(x)
+    for st in sts:
       let k = t.nd[st].k
       var spec = -1
       if k == ast.N_IMPORT or k == ast.N_EXPORT: spec = t.nd[st].a
+      if k == ast.N_IMPORTEQ and t.nd[st].a >= 0 and t.nd[t.nd[st].a].k == ast.N_EXTERNALREF: spec = t.nd[t.nd[st].a].a
       if spec < 0 or t.nd[spec].k != ast.N_STR: continue
       let is_imp = k == ast.N_IMPORT
       let sp = t.names[t.nd[spec].s] + ""
+      # (the tsconfig's paths, for a non-relative specifier)
+      if pg.pkeys.len > 0 and not bind.is_relative(sp) and not (path in pkgset):
+        var hit = ""
+        for cand0 in tsconf.path_targets(pg.pkeys, pg.pvals, sp):
+          for cand in bind.module_candidates("/", cand0):
+            if hit == "" and fs.exists(cand): hit = cand
+          if hit == "" and fs.exists(cand0) and (cand0.endswith(".ts") or cand0.endswith(".tsx")): hit = cand0
+        if hit.startswith(cwd0 + "/"): hit = hit[cwd0.len + 1..hit.len]
+        if hit != "":
+          pkg_res[path + "|" + sp] = hit + ""
+          if not (hit in queued):
+            queued[hit] = true
+            queue.push(hit + "")
+          my_deps.push(hit + "")
+          if is_imp: my_imps.push(hit + "")
+          continue
       if os.env("VTSC_NO_PACKAGES") == "" and tsres.is_bare(sp):
         let ptarget = tsres.resolve_types(&rv, fs, abs_path, sp)
         if os.env("VTSC_PKG_LOG") != "": eprint("PKG {path} {sp} -> {ptarget}")
@@ -354,6 +396,7 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
     if not want[fi]: continue
     c.node_file = fi
     let tf = os.clock()
+    if ftime and os.env("VTSC_FILE_TIME") == "2": eprint("BEGIN {names[fi]}")
     if mine[fi]: chk.check_file(&c, roots[fi])
     else:
       chk.declare_only(&c, roots[fi])
@@ -464,6 +507,8 @@ fn main(fs: Fs, os: Os) throws:
   var parse_only = false
   var jobs = 0
   var target = "es2025"
+  var target_set = false
+  var project = ""
   let argv = args()
   var i = 1
   while i < argv.len:
@@ -486,6 +531,11 @@ fn main(fs: Fs, os: Os) throws:
       continue
     if a == "--target" and i + 1 < argv.len:
       target = argv[i + 1].lower()
+      target_set = true
+      i += 2
+      continue
+    if (a == "-p" or a == "--project") and i + 1 < argv.len:
+      project = argv[i + 1] + ""
       i += 2
       continue
     files.push(a + "")
@@ -506,6 +556,35 @@ fn main(fs: Fs, os: Os) throws:
     let p1 = os.clock()
     print("vtsc parse: {files.len} files, {bytes} bytes, {t1.nd.len} nodes, {(p1 - p0) * 1000.0} ms")
     return
+  # a tsconfig: -p, or the current folder's when no files are named
+  var pg = Prog()
+  if project == "" and files.len == 0 and fs.exists(os.env("PWD") + "/tsconfig.json"): project = "tsconfig.json"
+  if project != "":
+    var pp = project + ""
+    if not pp.startswith("/"): pp = bind.norm_path(os.env("PWD") + "/" + pp)
+    if not pp.endswith(".json"): pp = pp + "/tsconfig.json"
+    let cfg = tsconf.read(fs, pp)
+    if cfg.err != "": fail cfg.err
+    if os.env("VTSC_DEBUG_CFG") != "": eprint("CFG {pp}: {cfg.files.len} files, target {cfg.target}, libs {",".join(cfg.libs)}, types {",".join(cfg.types)}")
+    if cfg.unmodeled != "":
+      eprint("vtsc: no file checked: uses the compiler option " + cfg.unmodeled)
+      return
+    if files.len == 0:
+      let pre = os.env("PWD") + "/"
+      for f in cfg.files:
+        if f.startswith(pre): files.push(f[pre.len..f.len])
+        else: files.push(f + "")
+    if cfg.target != "" and not target_set: target = cfg.target + ""
+    if cfg.has_lib:
+      for l in cfg.libs: pg.libs.push(l + "")
+    pg.has_types = cfg.has_types
+    for x in cfg.types: pg.types.push(x + "")
+    pg.tdir = tsconf.dirname(pp)
+    for x in cfg.pkeys: pg.pkeys.push(x + "")
+    for vs in cfg.pvals:
+      var vv: [Str] = []
+      for x in vs: vv.push(x + "")
+      pg.pvals.push(vv)
   if dir == "": dir = lib_dir(fs, os)
   if dir == "": fail "can't find TypeScript's lib files: pass --lib DIR (node_modules/typescript/lib) or set VTSC_LIB"
   # (more than one worker for a big project: each parses everything and checks its share)
@@ -515,13 +594,21 @@ fn main(fs: Fs, os: Os) throws:
   if jobs > 8: jobs = 8
   let tm0 = os.clock()
   var outs: [Out] = []
-  if jobs == 1: outs.push(run(fs, os, files, dir, target, 0, 1)?)
+  if jobs == 1: outs.push(run(fs, os, files, dir, target, pg, 0, 1)?)
   else:
     let ch: Chan[Out] = chan(jobs)
     for k in 0..jobs:
       var fc: [Str] = []
       for x in files: fc.push(x + "")
-      spawn worker(fs, os, fc, dir + "", target + "", k, jobs, ch)
+      var pk = Prog(has_types: pg.has_types, tdir: pg.tdir + "")
+      for x in pg.libs: pk.libs.push(x + "")
+      for x in pg.types: pk.types.push(x + "")
+      for x in pg.pkeys: pk.pkeys.push(x + "")
+      for vs in pg.pvals:
+        var vv: [Str] = []
+        for x in vs: vv.push(x + "")
+        pk.pvals.push(vv)
+      spawn worker(fs, os, fc, dir + "", target + "", pk, k, jobs, ch)
     for k in 0..jobs:
       let o = ch.recv()?
       outs.push(o)

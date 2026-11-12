@@ -13,15 +13,21 @@ Flags: `--lib DIR` (TypeScript's lib files; else `VTSC_LIB`, else `node_modules/
 `--target es2025|esnext|...`, `--jobs N` (workers; the default is the core count for 64 or more
 files), `--time` (phase times), `--parse-only` (parse the files and report the time).
 
+With no files named, vtsc reads the current folder's `tsconfig.json` (or `-p PATH`), as tsc
+does: `extends` (paths and packages), `files`/`include`/`exclude`, `target`, `lib`, `types`
+and `paths`. Strict mode is what vtsc models: a config that turns a strict option off (or turns
+on `exactOptionalPropertyTypes` or `noUncheckedIndexedAccess`) checks no file, and says which
+option. Options that only add errors (`noUnusedLocals`, `noImplicitReturns`, ...) aren't
+reported yet.
+
 Imports of packages resolve to their declarations as TypeScript's `moduleResolution: "bundler"`
 finds them (`exports` conditions `types`/`import`/`default`/`node`, `typesVersions`, `types`,
 `typings`, `main` with a declaration next to it, `@types/NAME`, `/// <reference path|types>`), and
-the `@types` folders from the current directory up are loaded as tsc 5 does without a `types`
-option. A package's files are declared, never checked or reported (`VTSC_NO_PACKAGES=1` turns
-this off; `VTSC_PKG_LOG=1` prints each package import and what it resolved to). tsconfig.json
-isn't read yet, and Node's built-in modules (`declare module "fs"` in `@types/node`) aren't
-resolved yet: an import of one makes the file `not checked`, as does a default or named import of
-a module written with `export =`.
+without a `types` option the `@types` folders from the current directory up are loaded as tsc 5
+does. A package's files are declared, never checked or reported (`VTSC_NO_PACKAGES=1` turns this
+off; `VTSC_PKG_LOG=1` prints each package import and what it resolved to). `export =` (with
+`import x = require(...)`), ambient modules (`declare module "fs"`, as `@types/node` has them) and
+module augmentations are modeled.
 
 A file that uses something vtsc doesn't model yet isn't guessed at: it is listed on stderr as
 `not checked`, with the construct and where it is, and so is every file that imports it. Every
