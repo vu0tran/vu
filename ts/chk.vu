@@ -3985,23 +3985,30 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx: Int) -> Int:
   if s0.ptypes.len > 0 and s0.pflags[s0.ptypes.len - 1] == 2:
     let rt0 = s0.ptypes[s0.ptypes.len - 1]
     if c.tk[rt0] == TK_TPARAM and types.has_int(tps, rt0): rest_at = s0.ptypes.len - 1
+    # (...args: { [K in keyof T]: X }: the same, through the mapped type)
+    if c.tk[rt0] == TK_OBJ and c.objs[c.ta[rt0]].kind == types.OK_MAPPED: rest_at = s0.ptypes.len - 1
   var rest_types: {Int: Int} = {}
   for pass in 0..2:
     for i in 0..args.len:
       let sens = context_sensitive(c, args[i])
       if (pass == 0) == sens: continue
       if rest_at >= 0 and i >= rest_at:
-        var pt1 = raw_param_at(&c, sg, i)
-        if pass == 1:
+        var pt1 = -1
+        let rk = s0.ptypes[rest_at]
+        if c.tk[rk] == TK_TPARAM: pt1 = raw_param_at(&c, sg, i)
+        if pass == 1 and pt1 >= 0:
           c.inf_fixing = true
           let m1 = inf_mapper(&c, &inf, sg)
           c.inf_fixing = false
           pt1 = bind.instantiate(&c, pt1, m1)
           c.fsig.remove(args[i])
           clear_ctx_params(&c, args[i])
+        if pass == 1 and pt1 < 0:
+          c.fsig.remove(args[i])
+          clear_ctx_params(&c, args[i])
         let at1 = check_expr(&c, args[i], pt1)
         # (a literal stays one where the element's constraint is a primitive)
-        if literal_of_ctx(&c, at1, pt1): rest_types[i] = types.regular(c, at1)
+        if pt1 >= 0 and literal_of_ctx(&c, at1, pt1): rest_types[i] = types.regular(c, at1)
         else: rest_types[i] = widen_lit(&c, at1)
         continue
       var pt = raw_param_at(&c, sg, i)
@@ -4259,7 +4266,8 @@ fn infer_in1(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, or
   let pk = c.tk[p]
   # couldContainTypeVariables: nothing to infer from a type without type parameters
   if pk != TK_TPARAM and not could_contain_tvars(&c, p): return
-  if pk == TK_TPARAM:
+  # (T[P] as what's inferred, for a reverse mapped type's property)
+  if pk == TK_TPARAM or (pk == types.TK_INDEXED and types.has_int(inf.tps, p)):
     # (an outer call's type parameter, not inferred yet: silentNever, no inference)
     if c.tk[a] == TK_TPARAM and a != p and types.has_int(c.outer_tps, a) and not types.has_int(inf.tps, a): return
     # (a type parameter from itself: nothing learned)
@@ -4381,7 +4389,8 @@ fn infer_in1(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, or
     if b >= 0 and b != a and c.tk[b] != TK_TPARAM and c.tk[b] != TK_UNSUP: infer_in(&c, p, b, &inf, contra, prio, orig, &seen)
     return
   if pk == TK_OBJ and c.objs[c.ta[p]].kind == types.OK_MAPPED and c.tk[a] != TK_ANY:
-    # inferring to a generic mapped type (inferToMappedType, reverse mapped types) isn't modeled
+    if infer_to_mapped(&c, p, a, &inf, contra, prio, orig, &seen): return
+    # other inferences to a generic mapped type aren't modeled
     let u = bind.lazy_unsupported(&c, c.objs[c.ta[p]].node, "inference to a generic mapped type")
     bind.touch(&c, u)
     return
@@ -4437,6 +4446,84 @@ fn infer_in1(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, or
       let nt = types.union_of(&c, nts)
       infer_in(&c, pn, nt, &inf, contra, prio, orig, &seen)
   if pn >= 0 and an >= 0 and (pn != pi or an != ai): infer_in(&c, pn, an, &inf, contra, prio, orig, &seen)
+
+const P_HOMO = 8
+const P_MAPCON = 32
+
+# inferToMappedType: { [P in keyof T]: X } with T inferred, from an object, array or tuple
+# source: T from the reverse mapped type (each property's type inferred back through X, with T[P]
+# as what's inferred); { [P in K]: X } with K inferred: K from keyof the source, X from its
+# properties' types. False when neither applies.
+fn infer_to_mapped(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, orig: Int, var seen: {Int: Bool}) -> Bool:
+  let po = c.ta[p]
+  let mn = c.objs[po].node
+  let mm = c.objs[po].mapper
+  if mn < 0 or c.t.nd[mn].b >= 0: return false
+  var cn = c.t.nd[c.t.nd[mn].a].a
+  while cn >= 0 and c.t.nd[cn].k == ast.N_TPAREN: cn = c.t.nd[cn].a
+  if cn < 0: return false
+  let tps = bind.tparam_sym(&c, c.t.nd[mn].a)
+  let ptp = c.sdtype[tps]
+  let g0 = tyops.raw(&c, c.t.nd[mn].c)
+  let tmpl = bind.instantiate(&c, g0, mm)
+  if c.t.nd[cn].k == ast.N_TOP and c.t.nd[cn].f == scan.W_KEYOF:
+    let g1 = tyops.raw(&c, c.t.nd[cn].a)
+    let tt = bind.instantiate(&c, g1, mm)
+    if c.tk[tt] != TK_TPARAM or not types.has_int(inf.tps, tt): return false
+    if c.tk[a] != TK_OBJ: return true
+    let ix = tyops.indexed_of(&c, tt, ptp)
+    let ao = c.ta[a]
+    var rev = -1
+    if rel.is_array_ref(&c, a):
+      let el = reverse_prop(&c, tmpl, ix, c.objs[ao].args[0])
+      if rel.is_readonly_array(&c, a): rev = bind.readonly_array_of(&c, el)
+      else: rev = bind.array_of(&c, el)
+    elif c.objs[ao].kind == OK_TUPLE:
+      rev = types.new_obj(&c, OK_TUPLE, -1, c.objs[ao].node)
+      for i in 0..c.objs[ao].args.len:
+        let el = reverse_prop(&c, tmpl, ix, c.objs[ao].args[i])
+        c.objs[c.ta[rev]].args.push(el)
+        c.objs[c.ta[rev]].eflags.push(c.objs[ao].eflags[i])
+      c.objs[c.ta[rev]].ro = c.objs[ao].ro
+    else:
+      if bind.sigs_of(&c, a, false).len > 0 or bind.sigs_of(&c, a, true).len > 0: return false
+      rev = types.anon_obj(&c, -1, -1)
+      for name in bind.prop_names(&c, a):
+        let ps = bind.get_prop(&c, a, name)
+        if ps < 0: continue
+        let st = bind.type_of_sym(&c, ps)
+        let rs = types.new_sym(&c, types.S_PROP, name, c.sdecl[ps])
+        c.stype[rs] = reverse_prop(&c, tmpl, ix, st)
+        c.sflags[rs] = c.sflags[ps] & (SF_OPTIONAL | SF_READONLY)
+        types.add_prop(&c, rev, name, rs)
+      c.objs[c.ta[rev]].resolved = true
+    infer_in(&c, tt, rev, &inf, contra, prio | P_HOMO, orig, &seen)
+    return true
+  let kt = tyops.raw(&c, cn)
+  let k1 = bind.instantiate(&c, kt, mm)
+  if c.tk[k1] == TK_TPARAM and types.has_int(inf.tps, k1):
+    if c.tk[a] != TK_OBJ: return true
+    let ka = tyops.keyof_of(&c, a)
+    infer_in(&c, k1, ka, &inf, contra, prio | P_MAPCON, orig, &seen)
+    var pts: [Int] = []
+    for name in bind.prop_names(&c, a):
+      let ps = bind.get_prop(&c, a, name)
+      if ps >= 0: pts.push(bind.type_of_sym(&c, ps))
+    if pts.len > 0:
+      let u = types.union_of(&c, pts)
+      infer_in(&c, tmpl, u, &inf, contra, prio, orig, &seen)
+    return true
+  return false
+
+# inferReverseMappedType: what the template's T[P] is when the template gives st.
+fn reverse_prop(var c: C, tmpl: Int, ix: Int, st: Int) -> Int:
+  if tmpl == ix: return st
+  var inf2 = new_inf([ix])
+  var seen2: {Int: Bool} = {}
+  infer_in(&c, tmpl, st, &inf2, false, 0, tmpl, &seen2)
+  if inf2.cov[0].len > 0: return types.union_of(&c, types.ints(inf2.cov[0]))
+  if inf2.contra[0].len > 0: return types.inter_of(&c, types.ints(inf2.contra[0]))
+  return c.unknown_t
 
 fn infer_sigs(var c: C, p: Int, a: Int, ctor: Bool, var inf: Inf, contra: Bool, prio: Int, orig: Int, var seen: {Int: Bool}):
   var a2 = a
