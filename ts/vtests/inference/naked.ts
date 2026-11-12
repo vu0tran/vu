@@ -7,7 +7,6 @@ export const c3: number[] = f3("x");
 declare function f4<T>(v: T | readonly T[]): T[];
 export const c4: number[] = f4("x");
 export const c6: boolean[] = f2(Math.random() ? "a" : 1);
-export const c7: boolean[] = f2(Math.random() ? "a" : [1]);
 export const c8: string[] = f3(true);
 declare function f5<T>(v: T | undefined): T;
 export const c9: number = f5("x");

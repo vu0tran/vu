@@ -86,7 +86,7 @@ redeclaration errors.
 
 ## How it's tested
 
-`./vtest.sh VTSC` runs the checked-in cases in `vtests/` (each folder's errors made by tsc,
+`./vtest.sh VTSC` runs the checked-in cases in `vtests/` (each folder's errors made by tsc 7,
 including a `node_modules` of packages laid out each way the resolver handles).
 
 Against tsc 7 itself: generated programs (classes, modules, generics, spreads, instanceof, flow,
