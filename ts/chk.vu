@@ -164,6 +164,7 @@ fn decl_type(var c: C, s: Int) -> Int:
       let h4_ = widen(&c, it)
       return regular_obj(&c, h4_)
     # catch (e)
+    if not c.unknown_catch: return c.any_t
     return c.unknown_t
   if (sk & S_PARAM) != 0:
     if c.t.nd[d].k == ast.N_PARAM and c.t.nd[c.t.nd[d].a].k != ast.N_ID: return pattern_sym_type(&c, s, d)
@@ -266,6 +267,21 @@ fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
         if is_any(c, m):
           pts.push(m)
           continue
+        if c.tk[m] == TK_INTER:
+          # an intersection: the intersection of its members' properties (optional when every
+          # member that has it has it optional)
+          var its: [Int] = []
+          var all_opt = true
+          for im in types.members_inter(c, m):
+            let ips = prop_of(&c, im, name)
+            if ips < 0: continue
+            its.push(bind.prop_type_for(&c, ips, im))
+            if (c.sflags[ips] & SF_OPTIONAL) == 0: all_opt = false
+          if its.len > 0:
+            var it = types.inter_of(&c, its)
+            if all_opt: it = types.union_of(&c, [it, c.undef_t])
+            pts.push(it)
+            continue
         let ps = prop_of(&c, m, name)
         if ps >= 0:
           var pt = bind.prop_type_for(&c, ps, m)
@@ -745,6 +761,8 @@ fn ref_key(var c: C, e: Int) -> Str:
     return inner + "." + nm(c, c.t.nd[e].s)
   if k == ast.N_PAREN: return ref_key(&c, c.t.nd[e].a)
   if k == ast.N_NONNULL: return ref_key(&c, c.t.nd[e].a)
+  # this (of the function or class member it belongs to): this.x narrows
+  if k == ast.N_THIS: return "this{bind.this_container(c, e)}"
   return ""
 
 fn narrowed(c: C, key: Str) -> Int:
@@ -1152,6 +1170,40 @@ fn typeof_narrow(var c: C, t: Int, what: Str, pos: Bool) -> Int:
     elif typeof_matches(&c, m, what) == pos: keep.push(m)
   return types.union_of(&c, keep)
 
+fn discriminant_truthiness(var c: C, e: Int, truth: Bool, var out: [Fact]):
+  let o = c.t.nd[e].a
+  let okey = fact_key(&c, o)
+  if okey == "": return
+  let ot = current_type(&c, o)
+  if ot == -7 or c.tk[ot] != TK_UNION: return
+  let name = c.t.nd[e].s
+  # (a discriminant: every member has it, some as a unit type; isDiscriminantProperty)
+  var disc = false
+  var pts: [Int] = []
+  for m in types.members(c, ot):
+    if c.tk[m] != TK_OBJ: return
+    let ps = prop_of(&c, m, name)
+    if ps < 0: return
+    var pt = bind.type_of_sym(&c, ps)
+    if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+    if is_generic_member(c, pt): return
+    for pm in types.members(c, pt):
+      let pk = c.tk[pm]
+      if pk == TK_TRUE or pk == TK_FALSE or pk == TK_STRLIT or pk == TK_NUMLIT or pk == TK_UNDEF or pk == TK_NULL: disc = true
+    pts.push(pt)
+  if not disc: return
+  # narrowTypeByDiscriminant: the members whose property is comparable to the narrowed one
+  let all = types.union_of(&c, pts)
+  var np = c.never_t
+  if truth: np = truthy_part(&c, all)
+  else: np = falsy_part(&c, all)
+  if c.tk[np] == TK_NEVER: return
+  var keep: [Int] = []
+  let ms = types.members(c, ot)
+  for i in 0..ms.len:
+    if c.tk[pts[i]] != TK_NEVER and comparable(&c, np, pts[i]): keep.push(ms[i])
+  out.push(Fact(okey, types.union_of(&c, keep)))
+
 # (x = e) as a reference: x, which the assignment just narrowed (isMatchingReference)
 fn assign_ref(c: C, e0: Int) -> Int:
   var e = e0
@@ -1182,6 +1234,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     if t == -7:
       if key != "": out.push(Fact(key + "", -7))
       return
+    # (a reference that's an error, a missing property: each use reports it again)
+    if c.tk[t] == TK_ERROR: return
     var plain: [Int] = []
     var tps: [Int] = []
     for m in types.members(c, t):
@@ -1200,6 +1254,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
       tps.push(res)
       res = types.union_of(&c, tps)
     out.push(Fact(key, keep_fresh(&c, t, res)))
+    # if (x.ok): a discriminant's truthiness narrows x too (narrowTypeByDiscriminant)
+    if k == ast.N_PROPACCESS: discriminant_truthiness(&c, e, truth, &out)
     return
   if k == ast.N_BINARY:
     let op = c.t.nd[e].f
@@ -1410,7 +1466,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     let snk = c.t.nd[sn].k
     if snk == ast.N_FUNC or snk == ast.N_FUNCEXPR or snk == ast.N_ARROW: rnode = c.t.nd[sn].c
     elif snk == ast.N_METHOD or snk == ast.N_CALLSIG: rnode = c.t.nd[c.t.nd[sn].b].c
-    if rnode < 0 or c.t.nd[rnode].k != ast.N_TPRED or c.t.nd[rnode].f != 0: return
+    if rnode < 0 or c.t.nd[rnode].k != ast.N_TPRED: return
+    if c.assert_mode != (c.t.nd[rnode].f != 0): return
     let pname = c.t.nd[rnode].s
     var idx = -1
     for i in 0..c.sigs[sg].pnames.len:
@@ -1419,6 +1476,13 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     if idx < 0 or idx >= args.len: return
     let key = fact_key(&c, args[idx])
     if key == "": return
+    # (asserts x: x is truthy after the call)
+    if c.t.nd[rnode].a < 0:
+      if c.assert_mode:
+        c.assert_mode = false
+        facts1(&c, args[idx], true, &out)
+        c.assert_mode = true
+      return
     let pt = bind.type_from(&c, c.t.nd[rnode].a)
     let t = current_type(&c, args[idx])
     if t == -7:
@@ -3471,6 +3535,12 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
   let from_union = usgs.len > 0
   var sgs = usgs
   if not from_union: sgs = bind.sigs_of(&c, ap, is_new)
+  # an intersection: its members' signatures, in order (getSignaturesOfType)
+  if not from_union and c.tk[ap] == TK_INTER:
+    for im in types.members_inter(c, ap):
+      if c.tk[im] == TK_UNSUP: return im
+      let iap = rel.apparent(&c, im)
+      for sg in bind.sigs_of(&c, iap, is_new): sgs.push(sg)
   if sgs.len == 0 and not is_new and c.tk[ap] == TK_OBJ and bind.sigs_of(&c, ap, true).len == 0 and function_like(&c, ft):
     # an untyped call: a Function (no signatures) returns any
     for a in args: check_expr(&c, a, -1)
@@ -5165,6 +5235,15 @@ fn check_stmt(var c: C, n: Int):
     return
   if k == ast.N_EXPRSTMT:
     check_expr(&c, c.t.nd[n].a, -1)
+    # a call to an assertion function narrows what follows
+    var ce = c.t.nd[n].a
+    while c.t.nd[ce].k == ast.N_PAREN: ce = c.t.nd[ce].a
+    if c.t.nd[ce].k == ast.N_CALL:
+      var af: [Fact] = []
+      c.assert_mode = true
+      facts1(&c, ce, true, &af)
+      c.assert_mode = false
+      for f in af: set_narrow(&c, f.key, f.t)
     return
   if k == ast.N_RETURN:
     if c.ret_stack.len == 0:
@@ -5731,7 +5810,7 @@ fn check_class(var c: C, n: Int):
         if init >= 0:
           let it = in_member_flow(&c, init, declared)
           if not rel.assignable(&c, it, declared): rel.report(&c, it, declared, nn, init, 2322)
-        elif (mf & (ast.M_STATIC | ast.M_ABSTRACT | ast.M_DECLARE | ast.M_EXCL)) == 0 and (c.t.nd[n].f & ast.M_DECLARE) == 0 and c.t.nd[nn].k != ast.N_STR and c.t.nd[nn].k != ast.N_NUM and not (name in assigned) and not includes_undefined(&c, sdt):
+        elif c.spi and (mf & (ast.M_STATIC | ast.M_ABSTRACT | ast.M_DECLARE | ast.M_EXCL)) == 0 and (c.t.nd[n].f & ast.M_DECLARE) == 0 and c.t.nd[nn].k != ast.N_STR and c.t.nd[nn].k != ast.N_NUM and not (name in assigned) and not includes_undefined(&c, sdt):
           err(&c, nn, 2564, "Property '" + nm(c, name) + "' has no initializer and is not definitely assigned in the constructor.")
       elif init >= 0:
         let ps = bind.get_prop(&c, inst, name)
@@ -6857,6 +6936,8 @@ fn global_conflicts(var c: C, user_from: Int):
           gents[n].push(x)
         continue
       if ((gflags[n] | fl) & (DF_ENUM | DF_NS)) != 0:
+        # (between packages' declarations: their errors aren't reported)
+        if fi in c.pkg_files: continue
         unsup(&c, e.at[six[n][0]], "a global declaration merged with a namespace or enum")
         return
       # the conflict: reported at every declaration of both (per pair of files, or one error at
