@@ -520,6 +520,9 @@ fn awaited(var c: C, t: Int, at: Int) -> Int:
       if c.tk[a] == TK_UNSUP: return a
       ms.push(a)
     return types.union_of(&c, ms)
+  if k == TK_TPARAM or k == types.TK_COND:
+    let ag = awaited_generic(&c, t)
+    if ag >= 0: return ag
   if k == TK_TPARAM or k == TK_INTER or k >= types.TK_KEYOF: return unsup(&c, at, "awaiting a generic type")
   if k != TK_OBJ: return t
   let o = c.ta[t]
@@ -532,6 +535,39 @@ fn awaited(var c: C, t: Int, at: Int) -> Int:
   let ap = rel.apparent(&c, t)
   if bind.get_prop(&c, ap, then) >= 0: return unsup(&c, at, "awaiting a thenable")
   return t
+
+# The awaited type of a type parameter (getAwaitedTypeNoAlias): itself when its constraint is
+# neither any, unknown, {} nor thenable, else Awaited<T> (the lib's alias, deferred); an
+# Awaited<T> is its own. -1 where that isn't modeled.
+fn awaited_generic(var c: C, t: Int) -> Int:
+  let asym = bind.global_type_sym(&c, "Awaited")
+  if asym < 0: return -1
+  let ad = c.sdecl[asym]
+  if ad < 0 or c.t.nd[ad].k != ast.N_TYPEALIAS or c.t.nd[ad].a < 0: return -1
+  if c.tk[t] == types.TK_COND:
+    var body = c.t.nd[ad].b
+    while body >= 0 and c.t.nd[body].k == ast.N_TPAREN: body = c.t.nd[body].a
+    if c.ta[t] == body: return t
+    return -1
+  let b = base_constraint(&c, t, 0)
+  var needed = b < 0 or b == t or is_any(c, b) or c.tk[b] == TK_UNKNOWN or rel.is_empty_obj(&c, b)
+  if not needed:
+    let then = ast.intern(&c.t, "then")
+    for m in types.members(c, b):
+      let am = rel.apparent(&c, m)
+      if c.tk[am] == TK_OBJ and bind.get_prop(&c, am, then) >= 0: needed = true
+      if c.tk[m] == TK_TPARAM or c.tk[m] >= types.TK_KEYOF: return -1
+  if not needed: return t
+  let tps = bind.tparam_types(&c, c.t.nd[ad].a)
+  if tps.len != 1: return -1
+  let dt = bind.declared_type(&c, asym)
+  let m = types.new_mapper(&c, tps, [t])
+  let r = bind.instantiate(&c, dt, m)
+  if c.tk[r] != types.TK_COND: return -1
+  if not (r in c.t_alias):
+    c.t_alias[r] = asym
+    c.t_alias_args[r] = [t]
+  return r
 
 fn infer_return(var c: C, d: Int) -> Int:
   let body = fn_body(c, d)
@@ -1884,7 +1920,7 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
     let ot = check_expr(&c, c.t.nd[n].a, actx)
     return awaited(&c, ot, n)
   if k == ast.N_TYPEASSERT: return unsup(&c, n, "a <T> type assertion")
-  if k == ast.N_TAGGED: return unsup(&c, n, "a tagged template")
+  if k == ast.N_TAGGED: return tagged_template(&c, n)
   if k == ast.N_CLASSEXPR: return unsup(&c, n, "a class expression")
   if k == ast.N_YIELD:
     let ef = enclosing_fn(c, n)
@@ -2003,6 +2039,8 @@ fn member_constrained(var c: C, m0: Int) -> Int:
           if bk == TK_UNION or bk == TK_UNDEF or bk == TK_NULL: r = 1
           elif bk >= types.TK_KEYOF: return 2
     elif k == types.TK_INDEXED or k == types.TK_COND or k == types.TK_KEYOF:
+      # (Awaited<T>: its base constraint isn't a union)
+      if k == types.TK_COND and awaited_generic(&c, m) == m: continue
       let b = tyops.base_of(&c, m, 0)
       if b == -2: return 2
       if b >= 0:
@@ -3953,6 +3991,35 @@ fn reorder_candidates(var c: C, sgs: [Int]) -> [Int]:
       j -= 1
   return out
 
+# tag`...${e}...`: a call of tag with a TemplateStringsArray and the substitutions (a single
+# non-generic signature; overloads and generic tags aren't modeled).
+fn tagged_template(var c: C, n: Int) -> Int:
+  if c.t.nd[n].b >= 0: return unsup(&c, n, "a tagged template with type arguments")
+  let ft = check_expr(&c, c.t.nd[n].a, -1)
+  var spans: [Int] = []
+  let tp = c.t.nd[n].c
+  if tp >= 0 and c.t.nd[tp].k == ast.N_TEMPL:
+    for sp in kids(c, c.t.nd[tp].a): spans.push(c.t.nd[sp].a)
+  if is_any(c, ft):
+    for e in spans: check_expr(&c, e, -1)
+    return ft
+  let aft = rel.apparent(&c, ft)
+  let sgs = bind.sigs_of(&c, aft, false)
+  if sgs.len != 1 or c.sigs[sgs[0]].tparams.len > 0: return unsup(&c, n, "a tagged template with this tag")
+  let sg = sgs[0]
+  let mx = sig_max(c, sg)
+  if spans.len + 1 < sig_min(c, sg) or (mx >= 0 and spans.len + 1 > mx): return unsup(&c, n, "a tagged template with this tag")
+  let tss = bind.global_type_sym(&c, "TemplateStringsArray")
+  if tss < 0: return unsup(&c, n, "a tagged template")
+  let tsa = bind.declared_type(&c, tss)
+  let p0 = param_at(&c, sg, 0)
+  if not rel.assignable(&c, tsa, p0): return unsup(&c, n, "a tagged template with this tag")
+  for i in 0..spans.len:
+    let pt = param_at(&c, sg, i + 1)
+    let at = check_expr(&c, spans[i], pt)
+    if not rel.assignable(&c, at, pt): rel.report(&c, at, pt, spans[i], spans[i], 2345)
+  return sig_result(&c, sg, n)
+
 fn sig_result(var c: C, sg: Int, n: Int) -> Int:
   let r = c.sigs[sg].ret
   if r < 0: return c.any_t
@@ -4986,6 +5053,44 @@ fn bad_ref(c: C, before: Int) -> Bool:
     if code == 2588 or code == 2540 or code == 2632: return true
   return false
 
+# [a, b] = rhs with each element a reference (no defaults, rest, holes or nested patterns): rhs
+# checked against the tuple of the targets' types, each element assigned its part.
+fn array_assign(var c: C, n: Int, l: Int, r: Int) -> Int:
+  let els = kids(c, c.t.nd[l].a)
+  var targets: [Int] = []
+  for e in els:
+    let ek = c.t.nd[e].k
+    if ek != ast.N_ID and ek != ast.N_PROPACCESS and ek != ast.N_ELEMACCESS: return unsup(&c, n, "a destructuring assignment")
+    let before = c.diags.len
+    let tt = assign_target(&c, e)
+    if bad_ref(c, before) or tt == c.auto_t or c.tk[tt] == TK_UNSUP: return unsup(&c, n, "a destructuring assignment")
+    targets.push(tt)
+  let ctx = types.new_obj(&c, OK_TUPLE, -1, l)
+  for tt in targets:
+    c.objs[c.ta[ctx]].args.push(tt)
+    c.objs[c.ta[ctx]].eflags.push(0)
+  let rt = check_expr(&c, r, ctx)
+  if is_any(c, rt): return rt
+  if c.tk[rt] != TK_OBJ: return unsup(&c, n, "a destructuring assignment")
+  let ro = c.ta[rt]
+  let tup = c.objs[ro].kind == OK_TUPLE
+  if tup and (bind.tuple_has_rest(c, rt) or c.objs[ro].args.len < els.len): return unsup(&c, n, "a destructuring assignment")
+  if not tup and not rel.is_array_ref(&c, rt): return unsup(&c, n, "a destructuring assignment")
+  for i in 0..els.len:
+    var et = -1
+    if tup:
+      et = c.objs[ro].args[i]
+      if c.objs[ro].eflags[i] == 1: et = types.union_of(&c, [et, c.undef_t])
+    else: et = c.objs[ro].args[0]
+    if not rel.assignable(&c, et, targets[i]): rel.report(&c, et, targets[i], els[i], -1, 2322)
+    let key = ref_key(&c, els[i])
+    if key != "":
+      forget(&c, key)
+      let an = assigned_narrow(&c, targets[i], et)
+      set_narrow(&c, key, an)
+      note_assigned(&c, key, targets[i], et)
+  return rt
+
 fn binary(var c: C, n: Int, ctx: Int) -> Int:
   let op = c.t.nd[n].f
   let l = c.t.nd[n].a
@@ -4999,7 +5104,8 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
     return c.boolean_t
   if op == scan.T_ASSIGN:
     let lk = c.t.nd[l].k
-    if lk == ast.N_OBJECT or lk == ast.N_ARRAY: return unsup(&c, n, "a destructuring assignment")
+    if lk == ast.N_ARRAY: return array_assign(&c, n, l, r)
+    if lk == ast.N_OBJECT: return unsup(&c, n, "a destructuring assignment")
     let before = c.diags.len
     var target = assign_target(&c, l)
     # x = a + b (an arithmetic or shift right side): tsc checks against the declared type with its
@@ -5717,7 +5823,10 @@ fn check_stmt(var c: C, n: Int):
       if in_async and ctx >= 0: ctx = async_return_ctx(&c, ctx, n)
       var et = check_expr(&c, c.t.nd[n].a, ctx)
       if in_async: et = awaited(&c, et, c.t.nd[n].a)
-      if declared >= 0: return_expr(&c, true, n, c.t.nd[n].a, et, declared, false)
+      # (an async function's promised type, awaited: a type parameter T is Awaited<T>)
+      var dec = declared
+      if in_async and declared >= 0 and c.tk[declared] == TK_TPARAM: dec = awaited(&c, declared, n)
+      if declared >= 0: return_expr(&c, true, n, c.t.nd[n].a, et, dec, false)
     return
   if k == ast.N_IF:
     let cond = c.t.nd[n].a
