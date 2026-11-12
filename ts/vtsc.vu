@@ -12,6 +12,8 @@ import parse
 import types
 import bind
 import chk
+import tsres
+import lresolve
 
 fn lib_dir(fs: Fs, os: Os) -> Str:
   let env = os.env("VTSC_LIB")
@@ -208,11 +210,23 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
   var deps: [[Str]] = []
   var imps: [[Str]] = []     # the deps through import statements (not export ... from)
   var pkg_present: {Str: Bool} = {}
+  # packages' types (tsres): the files loaded for them, and what each import resolved to
+  var rv = lresolve.new_rv()
+  var pkgset: {Str: Bool} = {}
+  var pkg_res: {Str: Str} = {}
+  let cwd0 = os.env("PWD")
+  if os.env("VTSC_NO_PACKAGES") == "":
+    for f in tsres.auto_types(&rv, fs, cwd0):
+      if not (f in queued):
+        queued[f] = true
+        queue.push(f + "")
+        pkgset[f] = true
   var qi = 0
   while qi < queue.len:
     let path = queue[qi] + ""
     qi += 1
-    let src = fs.read(path)?
+    let src = fs.read(path) else ""
+    if src == "" and not (path in pkgset): fs.read(path)?
     let fi = srcs.len
     let ds = parse.parse_file(&t, src + "", fi, &kw)
     for d in ds: pdiags.push(parse.Diag(d.file, d.pos, d.end, d.code, d.msg + ""))
@@ -222,6 +236,20 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
     roots.push(root)
     var my_deps: [Str] = []
     var my_imps: [Str] = []
+    var abs_path = path + ""
+    if not abs_path.startswith("/"): abs_path = bind.norm_path(cwd0 + "/" + path)
+    # (/// <reference path="..." /> and types="...": declaration files)
+    if os.env("VTSC_NO_PACKAGES") == "" and (path in pkgset or path.endswith(".d.ts")):
+      for ref in tsres.triple_slash(src):
+        var rtarget = ""
+        if ref[0] == "path": rtarget = bind.norm_path(bind.dir_of(abs_path) + "/" + ref[1])
+        else: rtarget = tsres.reference_types(&rv, fs, abs_path, ref[1])
+        if rtarget == "" or not fs.exists(rtarget): continue
+        if not (rtarget in queued):
+          queued[rtarget] = true
+          queue.push(rtarget + "")
+          if path in pkgset or rtarget.find("/node_modules/") >= 0: pkgset[rtarget] = true
+        my_deps.push(rtarget + "")
     for st in ast.items(t, root):
       let k = t.nd[st].k
       var spec = -1
@@ -229,6 +257,18 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
       if spec < 0 or t.nd[spec].k != ast.N_STR: continue
       let is_imp = k == ast.N_IMPORT
       let sp = t.names[t.nd[spec].s] + ""
+      if os.env("VTSC_NO_PACKAGES") == "" and tsres.is_bare(sp):
+        let ptarget = tsres.resolve_types(&rv, fs, abs_path, sp)
+        if os.env("VTSC_PKG_LOG") != "": eprint("PKG {path} {sp} -> {ptarget}")
+        if ptarget != "":
+          pkg_res[path + "|" + sp] = ptarget + ""
+          if not (ptarget in queued):
+            queued[ptarget] = true
+            queue.push(ptarget + "")
+            pkgset[ptarget] = true
+          my_deps.push(ptarget + "")
+          if is_imp: my_imps.push(ptarget + "")
+          continue
       if not bind.is_relative(sp) and package_may_exist(fs, os.env("PWD"), path, sp): pkg_present[path + "|" + sp] = true
       for cand in bind.module_candidates(path, sp):
         if cand in queued:
@@ -249,10 +289,15 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
   c.cwd = os.env("PWD")
   c.debug = os.env("VTSC_DEBUG") != ""
   for k, v in pkg_present: c.pkg_present[k] = v
+  for k, v in pkg_res: c.pkg_res[k] = v + ""
   for fx in 0..names.len:
     c.files.push(names[fx] + "")
     c.roots.push(roots[fx])
     c.file_index[names[fx] + ""] = fx
+    # (a package's files: loaded for its types, and whatever they import)
+    if fx >= user_from and (names[fx] in pkgset or names[fx].find("/node_modules/") >= 0):
+      c.pkg_files[fx] = true
+      c.t.nocheck[fx] = true
   bind.link_parents(&c)
   for fi in 1..roots.len:
     let root = roots[fi]
@@ -277,7 +322,7 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
   var uord: [Int] = []
   var total = 0
   for fx in order0:
-    if fx >= user_from:
+    if fx >= user_from and not (fx in c.pkg_files):
       uord.push(fx)
       total += srcs[fx].len
   var acc = 0
@@ -287,6 +332,8 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
     acc += srcs[fx].len
   for fx in user_from..roots.len:
     if mine[fx]: want_deps(fx, user_from, imps, &want, c.file_index)
+  # (packages' declarations: declared by every worker, never checked)
+  for fx, _ in c.pkg_files: want[fx] = true
   var deps_only = 0
   chk.shared_globals(&c, user_from)
   if os.env("VTSC_SHARDS") != "":
@@ -294,13 +341,16 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
     for fx in user_from..roots.len:
       if want[fx]: nw += 1
     eprint("vtsc: worker {shard}: checks {nw} files")
+  let ftime = os.env("VTSC_FILE_TIME") != ""
   for fi in order0:
     if not want[fi]: continue
     c.node_file = fi
+    let tf = os.clock()
     if mine[fi]: chk.check_file(&c, roots[fi])
     else:
       chk.declare_only(&c, roots[fi])
       deps_only += 1
+    if ftime: eprint("FILE {(os.clock() - tf) * 1000.0:.1} ms {names[fi]}")
   chk.global_conflicts(&c, user_from)
   # (a file importing one that isn't checked isn't checked either: decided by the caller, over
   # every worker's files)
@@ -384,7 +434,7 @@ fn run(fs: Fs, os: Os, files: [Str], dir: Str, target: Str, shard: Int, nshards:
       out.unsup_fi.push(fi)
       out.unsup.push(c.unsupported[fi] + "")
       out.unsup_mine.push(mine[fi])
-      out.unsup_user = true
+      if not (fi in c.pkg_files): out.unsup_user = true
   if shard == 0:
     out.user_from = user_from
     for fx in 0..names.len: out.names.push(names[fx] + "")
@@ -514,7 +564,7 @@ fn main(fs: Fs, os: Os) throws:
     print(texts[ix])
     last = texts[ix] + ""
   for fi in uf..outs[w0].names.len:
-    if fi in why: eprint("vtsc: " + outs[w0].names[fi] + ": not checked: uses " + why[fi])
+    if fi in why and outs[w0].names[fi].find("/node_modules/") < 0: eprint("vtsc: " + outs[w0].names[fi] + ": not checked: uses " + why[fi])
   if timing:
     for o in outs: eprint(o.timing)
     eprint("vtsc: total {(os.clock() - tm0) * 1000.0:.1} ms")

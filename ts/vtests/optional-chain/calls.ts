@@ -1,0 +1,14 @@
+declare const g: (() => void) | undefined;
+declare const g2: (() => void) | null;
+declare const g3: (() => void) | null | undefined;
+declare const o: { f?: () => void, h: (() => void) | null };
+g();
+g2();
+g3();
+o.f();
+o.h();
+(g)();
+declare const x: { a: number } | undefined;
+export const y = (x).a;
+export const z = x.a;
+o["f"]();

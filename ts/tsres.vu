@@ -1,0 +1,262 @@
+# Where a package's types are, as TypeScript resolves an import of it (moduleResolution "bundler",
+# TypeScript's default for type checking with a bundler, and close to node16's): for each folder
+# from the importing file's up, node_modules/NAME and then node_modules/@types/NAME. In a package:
+# package.json's "exports" with the conditions "types", "import", "default" (a pattern's "*"
+# replaced), else typesVersions, "types" or "typings", "main" with a declaration file next to it,
+# else index.d.ts; a subpath without exports: NAME/sub as a file (.d.ts, .ts) or a folder (its
+# package.json's "types", else index.d.ts). Paths are absolute.
+import lconf
+import lresolve
+
+fn is_bare(spec: Str) -> Bool:
+  if spec == "" or spec.startswith(".") or spec.startswith("/") or spec.startswith("#"): return false
+  return spec.find(":") < 0 or spec.startswith("@")
+
+# NAME and the subpath ("." or "./x") of a bare specifier
+fn split_spec(spec: Str) -> [Str]:
+  let parts = spec.split("/")
+  var n = 1
+  if spec.startswith("@") and parts.len >= 2: n = 2
+  var name = parts[0] + ""
+  if n == 2: name = parts[0] + "/" + parts[1]
+  var sub = "."
+  if parts.len > n:
+    var rest: [Str] = []
+    for i in n..parts.len: rest.push(parts[i] + "")
+    sub = "./" + "/".join(rest)
+  return [name, sub]
+
+# @types/NAME's folder name: @scope/pkg is scope__pkg
+fn types_name(name: Str) -> Str:
+  if name.startswith("@"): return name[1..name.len].replace("/", "__")
+  return name + ""
+
+# a declaration (or TypeScript) file for path p written without one: p itself when it's one, else
+# p's .js/.mjs/.cjs swapped for .d.ts/.d.mts/.d.cts, else p + .d.ts, .ts, .tsx
+fn decl_file(var r: lresolve.Rv, fs: Fs, p: Str) -> Str:
+  for e in [".d.ts", ".d.mts", ".d.cts", ".ts", ".tsx", ".mts", ".cts"]:
+    if p.endswith(e) and lresolve.is_file(&r, fs, p): return p + ""
+  for pair in [[".js", ".d.ts"], [".mjs", ".d.mts"], [".cjs", ".d.cts"], [".jsx", ".d.ts"]]:
+    if p.endswith(pair[0]):
+      let stem = p[0..p.len - pair[0].len]
+      if lresolve.is_file(&r, fs, stem + pair[1]): return stem + pair[1]
+      if pair[0] == ".js" and lresolve.is_file(&r, fs, stem + ".ts"): return stem + ".ts"
+      if pair[0] == ".js" and lresolve.is_file(&r, fs, stem + ".tsx"): return stem + ".tsx"
+      return ""
+  for e in [".d.ts", ".ts", ".tsx"]:
+    if lresolve.is_file(&r, fs, p + e): return p + e
+  return ""
+
+fn decl_dir(var r: lresolve.Rv, fs: Fs, d: Str) -> Str:
+  if not lresolve.is_dir(&r, fs, d): return ""
+  let pi = lresolve.package_json(&r, fs, d)
+  if pi >= 0:
+    let ty = lresolve.pstr(r.pjs[pi], 0, "types") + ""
+    let tg = lresolve.pstr(r.pjs[pi], 0, "typings") + ""
+    let m = lresolve.pstr(r.pjs[pi], 0, "main") + ""
+    for t in [ty, tg]:
+      if t == "": continue
+      let f = decl_file(&r, fs, lresolve.join(d, t))
+      if f != "": return f
+      let g = decl_index(&r, fs, lresolve.join(d, t))
+      if g != "": return g
+    if m != "":
+      let f = decl_file(&r, fs, lresolve.join(d, m))
+      if f != "": return f
+      let g = decl_index(&r, fs, lresolve.join(d, m))
+      if g != "": return g
+  return decl_index(&r, fs, d)
+
+fn decl_index(var r: lresolve.Rv, fs: Fs, d: Str) -> Str:
+  for e in ["/index.d.ts", "/index.ts", "/index.tsx"]:
+    if lresolve.is_file(&r, fs, d + e): return d + e
+  return ""
+
+# an exports target's paths, in the order TypeScript tries them (conditions "types", "import",
+# "default", "node" in the object's order; a target that doesn't resolve falls through to the next)
+fn cond(js: lconf.Json, v: Int, star: Str, var out: [Str]):
+  let kv = js.v[v].k
+  if kv == lconf.J_STR:
+    out.push(js.v[v].s.replace("*", star))
+    return
+  if kv == lconf.J_ARR:
+    for c in js.v[v].kids: cond(js, c, star, &out)
+    return
+  if kv == lconf.J_OBJ:
+    for i in 0..js.v[v].keys.len:
+      let key = js.v[v].keys[i]
+      if key == "types" or key == "import" or key == "default" or key == "node": cond(js, js.v[v].kids[i], star, &out)
+
+# the paths exports gives a subpath; [] when it doesn't allow it
+fn exports_sub(js: lconf.Json, ex: Int, sub: Str) -> [Str]:
+  var out: [Str] = []
+  let ke = js.v[ex].k
+  var is_map = false
+  if ke == lconf.J_OBJ:
+    for key in js.v[ex].keys:
+      if key.startswith("."): is_map = true
+  if not is_map:
+    if sub == ".": cond(js, ex, "", &out)
+    return out
+  for i in 0..js.v[ex].keys.len:
+    if js.v[ex].keys[i] == sub:
+      cond(js, js.v[ex].kids[i], "", &out)
+      return out
+  var best = -1
+  var best_pre = -1
+  var star = ""
+  for i in 0..js.v[ex].keys.len:
+    let key = js.v[ex].keys[i]
+    let st = key.find("*")
+    if st < 0: continue
+    let pre = key[0..st]
+    let post = key[st + 1..key.len]
+    if sub.startswith(pre) and sub.endswith(post) and sub.len >= pre.len + post.len and pre.len > best_pre:
+      best = i
+      best_pre = pre.len
+      star = sub[pre.len..sub.len - post.len]
+  if best >= 0: cond(js, js.v[ex].kids[best], star, &out)
+  return out
+
+# typesVersions (the first entry's mapping, "*" for any version): the candidate paths for the
+# subpath ("index" for the package itself), [] when it doesn't apply
+fn types_versions(js: lconf.Json, d: Str, sub: Str) -> [Str]:
+  var out: [Str] = []
+  let tv = lconf.get(js, 0, "typesVersions")
+  if tv < 0 or js.v[tv].k != lconf.J_OBJ or js.v[tv].kids.len == 0: return out
+  let m = js.v[tv].kids[0]
+  if js.v[m].k != lconf.J_OBJ: return out
+  var path = "index"
+  if sub != ".": path = sub[2..sub.len]
+  for i in 0..js.v[m].keys.len:
+    let key = js.v[m].keys[i]
+    let st = key.find("*")
+    var star = ""
+    if st < 0:
+      if key != path: continue
+    else:
+      let pre = key[0..st]
+      let post = key[st + 1..key.len]
+      if not (path.startswith(pre) and path.endswith(post) and path.len >= pre.len + post.len): continue
+      star = path[pre.len..path.len - post.len]
+    let tg = js.v[m].kids[i]
+    if js.v[tg].k != lconf.J_ARR: continue
+    for c in js.v[tg].kids:
+      if js.v[c].k == lconf.J_STR: out.push(lresolve.join(d, js.v[c].s.replace("*", star)))
+  return out
+
+# what package.json (r.pjs[pi]) says about a subpath: ["exports", target] (target "" when exports
+# doesn't allow it), or ["tv", candidates...]
+fn pkg_says(r: lresolve.Rv, pi: Int, d: Str, sub: Str) -> [Str]:
+  let js = r.pjs[pi]
+  let ex = lconf.get(js, 0, "exports")
+  if ex >= 0:
+    var out = ["exports"]
+    for t in exports_sub(js, ex, sub): out.push(t)
+    return out
+  var out = ["tv"]
+  for c in types_versions(js, d, sub): out.push(c)
+  return out
+
+# the types of a subpath of the package in folder d, "" none
+fn in_package(var r: lresolve.Rv, fs: Fs, d: Str, sub: Str) -> Str:
+  let pi = lresolve.package_json(&r, fs, d)
+  if pi >= 0:
+    let says = pkg_says(r, pi, d, sub)
+    if says[0] == "exports":
+      for i in 1..says.len:
+        let f = decl_file(&r, fs, lresolve.join(d, says[i]))
+        if f != "": return f
+      return ""
+    for i in 1..says.len:
+      let f = decl_file(&r, fs, says[i])
+      if f != "": return f
+      let g = decl_index(&r, fs, says[i])
+      if g != "": return g
+  if sub == ".": return decl_dir(&r, fs, d)
+  let p = lresolve.join(d, sub[2..sub.len])
+  let f = decl_file(&r, fs, p)
+  if f != "": return f
+  return decl_dir(&r, fs, p)
+
+# the declarations an import of spec from the file `from` (absolute) gets, "" none
+fn resolve_types(var r: lresolve.Rv, fs: Fs, from: Str, spec: Str) -> Str:
+  let ns = split_spec(spec)
+  let name = ns[0]
+  let sub = ns[1]
+  var d = lresolve.dirname(from)
+  while true:
+    let nm = d + "/node_modules"
+    if lresolve.is_dir(&r, fs, nm):
+      let pd = nm + "/" + name
+      if lresolve.is_dir(&r, fs, pd):
+        let f = in_package(&r, fs, pd, sub)
+        if f != "": return f
+      let td = nm + "/@types/" + types_name(name)
+      if lresolve.is_dir(&r, fs, td):
+        let f = in_package(&r, fs, td, sub)
+        if f != "": return f
+    if d == "/" or d == "": break
+    let up = lresolve.dirname(d)
+    if up == d: break
+    d = up
+  return ""
+
+# The @types packages a program gets without importing them (compilerOptions.types unset): every
+# folder in node_modules/@types from dir up; their entry files.
+fn auto_types(var r: lresolve.Rv, fs: Fs, dir: Str) -> [Str]:
+  var out: [Str] = []
+  var seen: {Str: Bool} = {}
+  var d = dir + ""
+  while true:
+    let td = d + "/node_modules/@types"
+    if lresolve.is_dir(&r, fs, td):
+      let names = fs.list(td) else []
+      var ns: [Str] = []
+      for n in names: ns.push(n + "")
+      ns.sort()
+      for n in ns:
+        if n.startswith(".") or n in seen: continue
+        seen[n] = true
+        let f = decl_dir(&r, fs, td + "/" + n)
+        if f != "": out.push(f)
+    if d == "/" or d == "": break
+    let up = lresolve.dirname(d)
+    if up == d: break
+    d = up
+  return out
+
+# the types a /// <reference types="x" /> names from file `from`
+fn reference_types(var r: lresolve.Rv, fs: Fs, from: Str, name: Str) -> Str:
+  var d = lresolve.dirname(from)
+  while true:
+    let td = d + "/node_modules/@types/" + types_name(name)
+    if lresolve.is_dir(&r, fs, td):
+      let f = decl_dir(&r, fs, td)
+      if f != "": return f
+    let pd = d + "/node_modules/" + name
+    if lresolve.is_dir(&r, fs, pd):
+      let f = in_package(&r, fs, pd, ".")
+      if f != "": return f
+    if d == "/" or d == "": break
+    let up = lresolve.dirname(d)
+    if up == d: break
+    d = up
+  return ""
+
+# a file's leading /// references: [kind, value] with kind "path" or "types"
+fn triple_slash(src: Str) -> [[Str]]:
+  var out: [[Str]] = []
+  for line in src.split("\n"):
+    let l = line.strip()
+    if l == "": continue
+    if not l.startswith("///"):
+      if l.startswith("//") or l.startswith("/*") or l.startswith("*"): continue
+      break
+    for kind in ["path", "types"]:
+      let at = l.find(" " + kind + "=\"")
+      if at < 0: continue
+      let rest = l[at + kind.len + 3..l.len]
+      let q = rest.find("\"")
+      if q > 0: out.push([kind, rest[0..q]])
+  return out

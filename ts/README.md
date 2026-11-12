@@ -13,6 +13,16 @@ Flags: `--lib DIR` (TypeScript's lib files; else `VTSC_LIB`, else `node_modules/
 `--target es2025|esnext|...`, `--jobs N` (workers; the default is the core count for 64 or more
 files), `--time` (phase times), `--parse-only` (parse the files and report the time).
 
+Imports of packages resolve to their declarations as TypeScript's `moduleResolution: "bundler"`
+finds them (`exports` conditions `types`/`import`/`default`/`node`, `typesVersions`, `types`,
+`typings`, `main` with a declaration next to it, `@types/NAME`, `/// <reference path|types>`), and
+the `@types` folders from the current directory up are loaded as tsc 5 does without a `types`
+option. A package's files are declared, never checked or reported (`VTSC_NO_PACKAGES=1` turns
+this off; `VTSC_PKG_LOG=1` prints each package import and what it resolved to). tsconfig.json
+isn't read yet, and Node's built-in modules (`declare module "fs"` in `@types/node`) aren't
+resolved yet: an import of one makes the file `not checked`, as does a default or named import of
+a module written with `export =`.
+
 A file that uses something vtsc doesn't model yet isn't guessed at: it is listed on stderr as
 `not checked`, with the construct and where it is, and so is every file that imports it. Every
 file it does check gets exactly the errors tsc 7 reports for it.
@@ -69,6 +79,9 @@ assertions, alias variances, `@ts-expect-error`/`@ts-ignore`, and the binder's d
 redeclaration errors.
 
 ## How it's tested
+
+`./vtest.sh VTSC` runs the checked-in cases in `vtests/` (each folder's errors made by tsc,
+including a `node_modules` of packages laid out each way the resolver handles).
 
 Against tsc 7 itself: generated programs (classes, modules, generics, spreads, instanceof, flow,
 names, declarations, members, methods, async, loops, tuples, and generic programs with conditional

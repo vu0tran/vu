@@ -17,6 +17,7 @@ and how well; this file says where things are. Keep it current when you move thi
 |---|---|
 | `scan.vu`, `parse.vu`, `ast.vu` | tokens, the parser, the flat tree (`nd[x].k/a/b/c/d/f/s/pos/end`; kinds `N_*`, modifiers `M_*` in ast.vu) |
 | `bind.vu`, `chk.vu`, `rel.vu`, `tyops.vu`, `types.vu`, `show.vu` | vtsc: symbols, checking, assignability, type operators, the type table, printing types |
+| `tsres.vu` | vtsc: where a package's types are (`resolve_types`, `auto_types`, `triple_slash`); `vtsc.run` loads them as package files (`c.pkg_files`: declared, never checked) |
 | `vlint.vu` | vlint's driver: CLI, file walk, workers, tsgolint, output |
 | `rules.vu` | the `L` state, the walk, oxlint's default rules, semantic errors (below) |
 | `rmore.vu` … `rmore8.vu` | non-default rules ported in batches (each file's header lists its rules); `rmore.vu` has the `newr` scheme: setup says which node kinds a rule needs, `node()` runs them |
@@ -89,6 +90,8 @@ finds `existing` in the table its kind belongs to, then:
 
 ## Checks before committing
 
+- vtsc: `VTSC_LIB=.../typescript/lib ./vtest.sh NEW_BUILD` (the cases in `vtests/`); a slow run:
+  `VTSC_FILE_TIME=1` prints each file's check time.
 - `./oxprobe.sh --saved probes/*`: every probe still matches.
 - vlint's regression scripts against saved oxlint output (the session's scratch `prof/vreg.sh`;
   it covers lc, editor-ui, n8n, vitest, tldraw, AFFiNE and oxc's own rule test cases).
