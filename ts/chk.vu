@@ -997,6 +997,15 @@ fn ref_key(var c: C, e: Int) -> Str:
     let inner = ref_key(&c, c.t.nd[e].a)
     if inner == "": return ""
     return inner + "." + nm(c, c.t.nd[e].s)
+  # x["a"] and x[0]: as x.a, x.0 (getAccessedPropertyName: a literal argument)
+  if k == ast.N_ELEMACCESS:
+    let ix = c.t.nd[e].b
+    let ik = c.t.nd[ix].k
+    if ik != ast.N_STR and ik != ast.N_NUM and ik != ast.N_NOSUBTEMPL: return ""
+    let inner = ref_key(&c, c.t.nd[e].a)
+    if inner == "": return ""
+    if ik == ast.N_NUM: return inner + "." + types.num_text(bind.num_value(c.t.names[c.t.nd[ix].s]))
+    return inner + "." + nm(c, c.t.nd[ix].s)
   if k == ast.N_PAREN: return ref_key(&c, c.t.nd[e].a)
   if k == ast.N_NONNULL: return ref_key(&c, c.t.nd[e].a)
   # this (of the function or class member it belongs to): this.x narrows
@@ -1737,12 +1746,18 @@ fn typeof_narrow_flat(var c: C, t: Int, what: Str, pos: Bool) -> Int:
 # x.p === undefined (null; == either): x's members whose p may be that (pos), or may be
 # something else (not pos), when p is a discriminant (its type a unit type in some member,
 # not the same in all).
-fn opt_chain_contain(var c: C, e0: Int, other: Int, var out: [Fact]):
+fn opt_chain_contain(var c: C, e0: Int, other: Int, pos: Bool, loose: Bool, var out: [Fact]):
   let e = skip_parens(c, e0)
   if c.t.nd[e].k != ast.N_PROPACCESS or (c.t.nd[e].f & 1) == 0: return
+  # (equal: every member of the other side something the chain's undefined isn't; not equal:
+  # every member undefined, or null too for == and !=)
   for m in types.members(c, other):
     let mk = c.tk[m]
-    if mk == TK_UNDEF or mk == TK_VOID or mk == TK_ANY or mk == TK_UNKNOWN or mk == TK_ERROR or is_generic_member(c, m): return
+    if is_generic_member(c, m) or mk == TK_ERROR: return
+    let nullish = mk == TK_UNDEF or (loose and mk == TK_NULL)
+    if pos:
+      if nullish or mk == TK_VOID or mk == TK_ANY or mk == TK_UNKNOWN: return
+    elif not nullish: return
   let obj = c.t.nd[e].a
   let okey = fact_key(&c, obj)
   if okey == "": return
@@ -1865,7 +1880,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     return
   if truth: chain_roots(&c, e, &out)
   if k == ast.N_ID: aliased_facts(&c, e, truth, &out)
-  if k == ast.N_ID or k == ast.N_PROPACCESS:
+  if k == ast.N_ID or k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS:
     let key = fact_key(&c, e)
     if key == "": return
     let t = current_type(&c, e)
@@ -1949,6 +1964,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         if uk == -2:
           generic_fact(&c, e, key, &out)
           return
+        # (typeof a?.b === "string": a isn't null or undefined; "undefined" the other way)
+        if pos == (what != "undefined"): chain_roots(&c, c.t.nd[l].a, &out)
         out.push(Fact(key, keep_fresh(&c, t, uk)))
         return
       # x === null / undefined / a literal (either side)
@@ -1967,9 +1984,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         return
       # (a?.b === x where x can't be undefined: a isn't null or undefined,
       # narrowTypeByOptionalChainContainment; either side)
-      if pos and not loose:
-        opt_chain_contain(&c, valside, t, &out)
-        opt_chain_contain(&c, refside, vt, &out)
+      opt_chain_contain(&c, valside, t, pos, loose, &out)
+      opt_chain_contain(&c, refside, vt, pos, loose, &out)
       let vk = c.tk[vt]
       if vk == TK_NULL or vk == TK_UNDEF:
         var keep: [Int] = []
@@ -2166,7 +2182,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
       if idx < 0 or idx >= args.len: return
       refn = args[idx]
     let key = fact_key(&c, refn)
-    if key == "": return
+    if key == "" and not (truth and not c.assert_mode and declared_pred and c.t.nd[rnode].a >= 0): return
     # (asserts x: x is truthy after the call)
     if declared_pred and c.t.nd[rnode].a < 0:
       if c.assert_mode:
@@ -2181,6 +2197,10 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     if e in c.resolved_sig:
       let rs = c.resolved_sig[e]
       if c.sigs[rs].pred_i == idx and c.sigs[sg].tparams.len > 0: pt = c.sigs[rs].pred_t
+    if key == "":
+      # (an optional chain's roots aren't nullish where the predicate's type can't be undefined)
+      if not may_be(c, pt, 2) and not is_generic_member(c, pt): chain_roots(&c, refn, &out)
+      return
     let t = current_type(&c, refn)
     if t == -7:
       if key != "": out.push(Fact(key + "", -7))
@@ -2271,6 +2291,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         elif rel.assignable(&c, t, pt): true_t = t
         else: true_t = types.inter_of(&c, [t, pt])
     if truth:
+      # (an optional chain's roots aren't nullish where the predicate's type can't be undefined)
+      if not may_be(c, pt, 2): chain_roots(&c, refn, &out)
       out.push(Fact(key, keep_fresh(&c, t, true_t)))
       return
     var keep: [Int] = []
@@ -3379,6 +3401,8 @@ fn prop_access(var c: C, n: Int) -> Int:
     let nt = narrowed(c, key)
     if nt == -7: return unsup(&c, n, "a property assigned in a branch, loop, try or switch")
     if nt >= 0:
+      # (the object is still checked for null and undefined)
+      if (c.t.nd[n].f & 1) == 0 and c.tk[ot] != TK_UNKNOWN and not is_any(c, ot) and (may_be(c, ot, 1) or may_be(c, ot, 2)): non_null(&c, ot, obj)
       for m in types.members(c, ot):
         if c.tk[m] == TK_OBJ:
           let ps = prop_of(&c, m, name)
@@ -3474,6 +3498,13 @@ fn elem_access(var c: C, n: Int) -> Int:
   var ot = chain_obj(&c, obj)
   var it = check_expr(&c, idx, -1)
   if forin_numeric(&c, idx): it = c.number_t
+  let key = ref_key(&c, n)
+  if key != "":
+    let nt = narrowed(c, key)
+    if nt == -7: return unsup(&c, n, "an element assigned in a branch, loop, try or switch")
+    if nt >= 0:
+      if (c.t.nd[n].f & 1) == 0 and c.tk[ot] != TK_UNKNOWN and not is_any(c, ot) and (may_be(c, ot, 1) or may_be(c, ot, 2)): non_null(&c, ot, obj)
+      return nt
   if is_any(c, ot): return ot
   if nullable_tparam(&c, ot): return unsup(&c, n, "an element of a type parameter that may be null")
   if (c.t.nd[n].f & 1) != 0: ot = types.filter_union(&c, ot, true, true)
@@ -5310,14 +5341,18 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
   var sens = false
   for a in args:
     if context_sensitive(c, a): sens = true
-  for cand in cands:
-    let sg = instantiate_call(&c, cand, args, ctx)
-    if sens and not args_fit_skip(&c, sg, args): continue
-    let dlen = c.diags.len
-    if args_fit(&c, sg, args):
-      check_args(&c, sg, args, false)
-      return sig_result(&c, sg, n)
-    while c.diags.len > dlen: c.diags.pop()
+  for pass in 0..2:
+    for cand in cands:
+      let sg = instantiate_call(&c, cand, args, ctx)
+      if sens and not args_fit_skip(&c, sg, args): continue
+      let dlen = c.diags.len
+      var fits = false
+      if pass == 0: fits = args_fit_sub(&c, sg, args)
+      else: fits = args_fit(&c, sg, args)
+      if fits:
+        check_args(&c, sg, args, false)
+        return sig_result(&c, sg, n)
+      while c.diags.len > dlen: c.diags.pop()
   for a in args: check_expr(&c, a, -1)
   # reported where the last candidate's first argument error is (as tsc 7 does)
   let last = instantiate_call(&c, cands[cands.len - 1], args, ctx)
@@ -5437,6 +5472,18 @@ fn args_fit(var c: C, sg: Int, args: [Int]) -> Bool:
     let pt = param_at(&c, sg, i)
     let at = check_expr(&c, args[i], pt)
     if not rel.assignable(&c, at, pt): return false
+  return true
+
+# The same by the subtype relation (chooseOverload's first pass with several candidates).
+fn args_fit_sub(var c: C, sg: Int, args: [Int]) -> Bool:
+  for i in 0..args.len:
+    let pt = param_at(&c, sg, i)
+    let at = check_expr(&c, args[i], pt)
+    let ws = c.subtype
+    c.subtype = true
+    let ok = rel.assignable(&c, at, pt)
+    c.subtype = ws
+    if not ok: return false
   return true
 
 fn skip_parens(c: C, e0: Int) -> Int:

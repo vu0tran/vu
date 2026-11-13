@@ -1,0 +1,12 @@
+declare const h: Record<string, string | string[] | undefined>;
+const entry = Object.entries(h).find(([n]) => n === 'a');
+export const header = Array.isArray(entry?.[1]) ? entry[1][0] : entry?.[1];
+declare const e2: [string, string | string[]] | undefined;
+export const h2 = Array.isArray(e2?.[1]) ? e2[1][0] : e2?.[1];
+declare const e3: { k: string | string[] } | undefined;
+export const h3 = Array.isArray(e3?.k) ? e3.k[0] : e3?.k;
+declare function isU(x: unknown): x is string | undefined;
+export const h4 = isU(e3?.k) ? e3.k : 1;
+declare function isS(x: unknown): x is string;
+export const h5 = isS(e3?.k) ? e3.k : 1;
+export const h6 = !isS(e2?.[1]) ? e2[1] : 1;
