@@ -225,6 +225,7 @@ fn decl_type(var c: C, s: Int) -> Int:
         if pp >= 0 and c.t.nd[pp].k == ast.N_FORIN and c.t.nd[pp].a == p:
           if c.t.nd[pp].f == 0: return for_in_key(&c, pp)
           let h2_ = check_expr(&c, c.t.nd[pp].b, -1)
+          if c.t.nd[pp].f == 2: return async_element_type(&c, h2_, c.t.nd[pp].b)
           return element_type(&c, h2_, c.t.nd[pp].b)
       if c.t.nd[d].c < 0:
         if p >= 0 and c.t.nd[p].k == ast.N_VAR and c.t.nd[p].f == 2: return c.any_t
@@ -300,7 +301,8 @@ fn pattern_sym_type(var c: C, s: Int, d: Int) -> Int:
         if c.t.nd[pp].f == 0: src = c.string_t
         else:
           let ot = check_expr(&c, c.t.nd[pp].b, -1)
-          src = element_type(&c, ot, c.t.nd[pp].b)
+          if c.t.nd[pp].f == 2: src = async_element_type(&c, ot, c.t.nd[pp].b)
+          else: src = element_type(&c, ot, c.t.nd[pp].b)
       elif c.t.nd[d].c >= 0:
         src = pattern_init_type(&c, pat, c.t.nd[d].c)
       else:
@@ -792,7 +794,7 @@ fn infer_return(var c: C, d: Int) -> Int:
   let body = fn_body(c, d)
   if body < 0: return c.any_t
   let is_gen = (c.t.nd[d].f & ast.M_GENERATOR) != 0
-  if is_gen and (c.t.nd[d].f & ast.M_ASYNC) != 0: return unsup(&c, d, "an async generator function")
+  let async_gen = is_gen and (c.t.nd[d].f & ast.M_ASYNC) != 0
   if is_gen: c.gen_yields[d] = []
   # the body is checked in the function's own flow (outer narrowings of constants only), and each
   # return's type read as it was seen there
@@ -834,6 +836,25 @@ fn infer_return(var c: C, d: Int) -> Int:
       let wa = return_widen(&c, d, [aw])
       return promise_of(&c, wa, d)
     return return_widen(&c, d, [et])
+  if async_gen:
+    # AsyncGenerator<the yields awaited, the returns awaited (void if none), unknown>
+    var ayt = c.never_t
+    if c.gen_yields[d].len > 0:
+      var ays: [Int] = []
+      var ys0: [Int] = []
+      for y in c.gen_yields[d]: ys0.push(y)
+      for y in ys0: ays.push(awaited(&c, y, body))
+      ayt = return_widen(&c, d, ays)
+    var arets: [Int] = []
+    collect_returns(c, body, &arets)
+    var art = c.void_t
+    if arets.len > 0:
+      let ibr = infer_body_return(&c, d, body)
+      art = awaited(&c, ibr, body)
+    let agn = ast.intern(&c.t, "AsyncGenerator")
+    if not (agn in c.gtypes): return unsup(&c, d, "an async generator without the AsyncGenerator type")
+    let agdt = bind.declared_type(&c, c.gtypes[agn])
+    return bind.ref_of(&c, agdt, [ayt, art, c.unknown_t])
   if is_async:
     let inner = infer_body_return(&c, d, body)
     return promise_of(&c, inner, d)
@@ -991,6 +1012,12 @@ fn return_widen(var c: C, d: Int, ts: [Int]) -> Int:
   if parts.len > 1 and c.tk[u] == TK_UNION: u = subtype_reduce(&c, parts)
   # (getWidenedType: object literals, with the properties of the others in a union)
   if rc0 < 0: u = widen_objs(&c, u)
+  elif c.tk[u] == TK_OBJ and rel.is_array_ref(&c, u) and not rel.is_readonly_array(&c, u):
+    # (an array of object literals and others: its element widened, and so reduced again)
+    let el = c.objs[c.ta[u]].args[0]
+    if c.tk[el] == TK_UNION:
+      let wel = widen_union(&c, el, false)
+      if wel != el: u = bind.array_of(&c, wel)
   let unit = types.is_literal(c, u) or (c.tk[u] == TK_SYMBOL and c.tb[u] == 1)
   if unit and fresh:
     if d in c.ret_ctx:
@@ -2966,6 +2993,7 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
     if c.t.nd[n].f == 1:
       # yield* xs: xs's elements are yielded; its value, a generator's return type
       if c.t.nd[n].a < 0: return unsup(&c, n, "yield*")
+      if (c.t.nd[ef].f & ast.M_ASYNC) != 0: return unsup(&c, n, "yield* in an async generator")
       var dctx = -1
       if ef in c.gen_ann: dctx = -1
       let dt = check_expr(&c, c.t.nd[n].a, dctx)
@@ -4052,6 +4080,32 @@ fn elem_of1(var c: C, n: Int, ot: Int, it: Int) -> Int:
   return unsup(&c, n, "an element access the checker can't type")
 
 # The element type of an iterable used in for-of / spread (arrays, tuples, strings).
+# for await (x of e): an async iterable's [Symbol.asyncIterator]() iterator's T, else e's elements
+# awaited (getIteratedTypeOrElementType with async).
+fn async_element_type(var c: C, t: Int, at: Int) -> Int:
+  if is_any(c, t): return t
+  var ts: [Int] = []
+  let key = ast.intern(&c.t, "[Symbol.asyncIterator]")
+  for m in types.members(c, t):
+    let am = rel.apparent(&c, m)
+    if c.tk[am] == TK_OBJ:
+      let ps = bind.get_prop(&c, am, key)
+      if ps >= 0:
+        let pt = bind.prop_type_for(&c, ps, am)
+        let sgs = bind.sigs_of(&c, pt, false)
+        if sgs.len != 1: return unsup(&c, at, "for await over this type")
+        let r = rel.sig_ret(&c, sgs[0])
+        if c.tk[r] != TK_OBJ or c.objs[c.ta[r]].kind != OK_REF: return unsup(&c, at, "for await over this type")
+        let tsym = c.objs[c.ta[c.objs[c.ta[r]].target]].sym
+        let tn = nm(c, c.sname[tsym])
+        if tn != "AsyncGenerator" and tn != "AsyncIterator" and tn != "AsyncIterableIterator" and tn != "AsyncIteratorObject": return unsup(&c, at, "for await over this type")
+        ts.push(c.objs[c.ta[r]].args[0])
+        continue
+    let el = element_type(&c, m, at)
+    if c.tk[el] == TK_UNSUP: return el
+    ts.push(awaited(&c, el, at))
+  return types.union_of(&c, ts)
+
 fn element_type(var c: C, t: Int, at: Int) -> Int:
   if is_any(c, t): return t
   var ts: [Int] = []
@@ -4926,6 +4980,13 @@ fn expr_template(var c: C, n: Int, sts: [Int], tails: [Str]) -> Int:
   return t
 
 fn subtype_reduce(var c: C, ts: [Int]) -> Int:
+  let wss0 = c.strict_sub
+  c.strict_sub = true
+  let r = subtype_reduce1(&c, ts)
+  c.strict_sub = wss0
+  return r
+
+fn subtype_reduce1(var c: C, ts: [Int]) -> Int:
   let u = types.union_of(&c, ts)
   let ms = types.members(c, u)
   var keep: [Int] = []
@@ -5090,7 +5151,7 @@ fn intersected_sig(var c: C, sgs: [Int]) -> Int:
   return cur_id
 
 fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
-  if (c.t.nd[n].f & ast.M_GENERATOR) != 0 and (c.t.nd[n].f & ast.M_ASYNC) != 0: return unsup(&c, n, "an async generator function")
+  if (c.t.nd[n].f & ast.M_GENERATOR) != 0 and (c.t.nd[n].f & ast.M_ASYNC) != 0 and fn_retnode(c, n) >= 0: return unsup(&c, n, "an async generator function with a return type")
   var csig = -1
   if ctx >= 0:
     var found = 0
@@ -6381,8 +6442,12 @@ fn common_supertype(var c: C, ts: [Int]) -> Int:
   if same_base_literals(c, prim):
     out = types.union_of(&c, prim)
   else:
+    # (reduceLeft by isTypeSubtypeOf: any isn't a subtype of the others)
+    let ws0 = c.subtype
+    c.subtype = true
     for i in 1..prim.len:
-      if rel.assignable(&c, out, prim[i]) and not (rel.assignable(&c, prim[i], out) and true and false): out = prim[i]
+      if rel.assignable(&c, out, prim[i]): out = prim[i]
+    c.subtype = ws0
   if nullable.len > 0:
     var all = [out]
     for x in nullable: all.push(x)
@@ -8329,8 +8394,8 @@ fn check_stmt(var c: C, n: Int):
     return
   if k == ast.N_FUNC:
     if c.t.nd[n].d < 0: return
-    if (c.t.nd[n].f & ast.M_GENERATOR) != 0 and (c.t.nd[n].f & ast.M_ASYNC) != 0:
-      unsup(&c, n, "an async generator function")
+    if (c.t.nd[n].f & ast.M_GENERATOR) != 0 and (c.t.nd[n].f & ast.M_ASYNC) != 0 and fn_retnode(c, n) >= 0:
+      unsup(&c, n, "an async generator function with a return type")
       return
     for p in kids(c, c.t.nd[n].b):
       if c.t.nd[c.t.nd[p].a].k != ast.N_ID:
@@ -10766,7 +10831,11 @@ fn check_loop0(var c: C, n: Int):
       else: check_expr(&c, init, -1)
   if k == ast.N_FORIN:
     let left = c.t.nd[n].a
-    if c.t.nd[n].f == 2: unsup(&c, n, "for await")
+    # (for await: only in an async function or a module's top level)
+    if c.t.nd[n].f == 2:
+      let ef0 = enclosing_fn(c, n)
+      if ef0 >= 0 and (c.t.nd[ef0].f & ast.M_ASYNC) == 0: unsup(&c, n, "for await outside an async function")
+      if c.t.nd[left].k != ast.N_VAR: unsup(&c, n, "for await over an existing variable")
     if c.t.nd[left].k != ast.N_VAR and c.t.nd[left].k != ast.N_ID:
       unsup(&c, n, "a for loop over an existing variable")
       if scoped: c.narrow.pop()
@@ -10775,6 +10844,7 @@ fn check_loop0(var c: C, n: Int):
       let et = check_expr(&c, c.t.nd[n].b, -1)
       c.forin_t[n] = et
       if c.t.nd[n].f == 1: element_type(&c, et, c.t.nd[n].b)
+      if c.t.nd[n].f == 2: async_element_type(&c, et, c.t.nd[n].b)
   # the variables the loop assigns
   var assigned: [Str] = []
   if k == ast.N_WHILE:

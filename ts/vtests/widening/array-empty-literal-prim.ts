@@ -1,0 +1,13 @@
+export const a1: 'z' = [{}, 'a'];
+export const a2: 'z' = [1, {}];
+export const a3: 'z' = [true, {}];
+export const a4: 'z' = [{}, !0];
+export const a5: 'z' = [{}, true];
+declare const s: string;
+export const a6: 'z' = [s, {}];
+export const a7: 'z' = [{}, 1];
+export let v: (s: string) => string = ((s) => ([{}, !0]));
+export const w = () => [{}, true];
+export const ww: 'z' = w;
+let q = [{}, true];
+export const qq: 'z' = q;
