@@ -345,6 +345,7 @@ fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
   if k == ast.N_OBJPAT:
     src = non_null(&c, src, pat)
     var named: [Int] = []
+    var omit_str = false
     for e in kids(c, c.t.nd[pat].a):
       if c.t.nd[e].k != ast.N_BINDEL: continue
       if (c.t.nd[e].f & ast.M_REST) != 0:
@@ -377,12 +378,32 @@ fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
             unsup(&c, e, "a rest element of a generic type")
             return
           else: rms.push(m0)
+        # (getRestType keeps the index signatures; a computed string key leaves out every
+        # property)
+        var sis: [Int] = []
+        var nis: [Int] = []
         for m in rms:
           if c.tk[m] != TK_OBJ: continue
+          let am = rel.apparent(&c, m)
+          let si0 = bind.index_type(&c, am, false)
+          if si0 >= 0: sis.push(si0)
+          let ni0 = bind.index_type(&c, am, true)
+          if ni0 >= 0: nis.push(ni0)
+          if omit_str: continue
           for nmid in bind.prop_names(&c, m):
             if types.has_int(named, nmid) or nmid in c.objs[c.ta[rt]].props: continue
             let ps = bind.get_prop(&c, m, nmid)
             if ps >= 0: types.add_prop(&c, rt, nmid, ps)
+        if rms.len == 1 or c.tk[src] != TK_UNION:
+          if sis.len > 0: c.objs[c.ta[rt]].sidx = types.inter_of(&c, sis)
+          if nis.len > 0: c.objs[c.ta[rt]].nidx = types.inter_of(&c, nis)
+          if rms.len == 1:
+            let am1 = rel.apparent(&c, rms[0])
+            c.objs[c.ta[rt]].sname = bind.index_name(&c, am1, false)
+            c.objs[c.ta[rt]].nname = bind.index_name(&c, am1, true)
+        elif sis.len > 0 or nis.len > 0:
+          unsup(&c, e, "a rest element of a union with index signatures")
+          return
         c.objs[c.ta[rt]].resolved = true
         bind_pattern(&c, c.t.nd[e].b, rt, mutable)
         continue
@@ -394,6 +415,29 @@ fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
       elif pk == ast.N_NUM:
         let ntext = types.num_text(bind.num_value(c.t.names[c.t.nd[pn].s]))
         name = ast.intern(&c.t, ntext)
+      elif pk == ast.N_COMPUTED:
+        let kt0 = check_expr(&c, c.t.nd[pn].a, -1)
+        let kt = types.regular(c, kt0)
+        if c.tk[kt] == TK_STRLIT: name = c.ta[kt]
+        elif c.tk[kt] == TK_NUMLIT: name = ast.intern(&c.t, c.numtext[c.ta[kt]] + "")
+        elif c.tk[kt] == TK_STRING:
+          # (a string key: the string index signatures' types)
+          var kts: [Int] = []
+          for m in types.members(c, src):
+            let am = rel.apparent(&c, m)
+            let si1 = bind.index_type(&c, am, false)
+            if c.tk[am] != TK_OBJ or si1 < 0:
+              unsup(&c, pn, "a computed name in a destructuring pattern")
+              return
+            kts.push(si1)
+          var kpt = types.union_of(&c, kts)
+          kpt = with_default(&c, e, kpt)
+          bind_pattern(&c, c.t.nd[e].b, kpt, mutable)
+          omit_str = true
+          continue
+        else:
+          unsup(&c, pn, "a computed name in a destructuring pattern")
+          return
       else:
         unsup(&c, pn, "a computed name in a destructuring pattern")
         return
@@ -4398,10 +4442,12 @@ fn object_literal(var c: C, n: Int, ctx0: Int) -> Int:
         c.spread_union.remove(n)
         return types.union_of(&c, vs)
       if is_any(c, st):
-        # tsc: a spread of any makes the literal any (the rest is still checked)
-        for q in kids(c, c.t.nd[n].a):
-          if q != p and c.t.nd[q].k == ast.N_PROPASSIGN: check_expr(&c, c.t.nd[q].b, -1)
-        return unsup(&c, p, "a spread of any")
+        # tsc: a spread of any makes the literal any; the rest is still checked in context (as
+        # with the spread empty: any has no properties to override)
+        c.spread_pick[p] = c.undef_t
+        object_literal(&c, n, ctx)
+        c.spread_pick.remove(p)
+        return st
       if rel.generic_object(c, st) and c.tk[st] != TK_UNION:
         if has_cstr or has_cnum: return unsup(&c, p, "a computed property name beside a spread")
         # (checkSpreadPropOverrides on its apparent properties: only when none can clash)
@@ -4499,7 +4545,20 @@ fn object_literal(var c: C, n: Int, ctx0: Int) -> Int:
             if spread:
               # (after a spread: its part's index signature is spread in, getSpreadType keeping
               # only the index signatures both sides have; none on the left: nothing)
-              if c.objs[o].sidx >= 0 or c.objs[o].nidx >= 0: return unsup(&c, pn, "a computed property name after a spread with index signatures")
+              if c.objs[o].sidx >= 0 or c.objs[o].nidx >= 0:
+                # (alone after the last spread, ending the literal: the right part's one index
+                # signature, united with the left's of that kind, getUnionIndexInfos)
+                let ks2 = kids(c, c.t.nd[n].a)
+                let last = ks2.len > 1 and ks2[ks2.len - 1] == p and c.t.nd[ks2[ks2.len - 2]].k == ast.N_SPREAD
+                if not last: return unsup(&c, pn, "a computed property name after a spread with index signatures")
+                if kind == 1:
+                  if c.objs[o].sidx >= 0: c.objs[o].sidx = types.union_of(&c, [c.objs[o].sidx, cv])
+                  c.objs[o].nidx = -1
+                else:
+                  if c.objs[o].nidx >= 0: c.objs[o].nidx = types.union_of(&c, [c.objs[o].nidx, cv])
+                  c.objs[o].sidx = -1
+                c.objs[o].sname = -1
+                c.objs[o].nname = -1
               continue
             if kind == 1: has_cstr = true
             else: has_cnum = true

@@ -1,0 +1,10 @@
+declare const a: any;
+declare const b: { x: number };
+const o1 = { ...a, y: 1 };
+const n1: string = o1.whatever;
+const o2: { f: (n: number) => void; y: string } = { ...a, f: (n) => { const s: string = n; }, y: 1 };
+const o3 = { y: 1, ...a, ...b };
+const r3: boolean = o3;
+const o4 = { y: 1, z: (q) => q, ...a };
+const { p, ...rest } = a;
+export {};
