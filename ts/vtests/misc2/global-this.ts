@@ -1,0 +1,10 @@
+declare var gv: number;
+declare let gl: number;
+declare function gf(): string;
+const g = globalThis;
+const a: string = g.gv;
+const b: number = g.gf();
+const c = g.gl;
+const d: 'z' = g.Math.PI;
+type G = typeof globalThis;
+const e: G['gv'] = 'x';
