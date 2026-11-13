@@ -418,6 +418,77 @@ fn mapped_source_obj(var c: C, s: Int, t: Int) -> Int:
   if ni >= 0 and not assignable(&c, x, ni): return 0
   return 1
 
+# A generic mapped type's keys' lower bound (getLowerBoundOfKeyType): keyof T by T's base
+# constraint, Exclude<A, B> of A's; -1 when not known.
+fn key_lower_bound(var c: C, k: Int, depth: Int) -> Int:
+  if depth > 6: return -1
+  let kk = c.tk[k]
+  if kk == TK_STRLIT or kk == TK_NUMLIT or kk == TK_NEVER: return k
+  if kk == types.TK_KEYOF:
+    let o = c.ta[k]
+    if c.tk[o] != TK_TPARAM: return -1
+    let b = chk.base_constraint(&c, o, 0)
+    if b < 0 or b == o or c.tk[b] != TK_OBJ or tyops.is_generic(&c, b): return -1
+    return tyops.keyof_of(&c, b)
+  if kk == TK_UNION:
+    var ts: [Int] = []
+    for m in types.members(c, k):
+      let r = key_lower_bound(&c, m, depth + 1)
+      if r < 0: return -1
+      ts.push(r)
+    return types.union_of(&c, ts)
+  if kk == types.TK_COND and chk.is_lib_alias(&c, k, "Exclude") and k in c.t_alias_args and c.t_alias_args[k].len == 2:
+    let a0 = c.t_alias_args[k][0]
+    let b0 = c.t_alias_args[k][1]
+    if tyops.is_generic(&c, b0): return -1
+    let la = key_lower_bound(&c, a0, depth + 1)
+    if la < 0: return -1
+    var keep: [Int] = []
+    for m in types.members(c, la):
+      if not assignable_plain(&c, m, b0): keep.push(m)
+    return types.union_of(&c, keep)
+  return -1
+
+# A generic mapped type ({ [P in K]: X }, no as clause) by its keys' lower bound: an object type
+# with a property for each key (the members resolveMappedTypeMembers gives it); -1 if not known.
+fn mapped_lower_obj(var c: C, s: Int) -> Int:
+  let n = c.objs[c.ta[s]].node
+  if n < 0 or c.t.nd[n].k != ast.N_TMAPPED or c.t.nd[n].b >= 0 or c.t.nd[n].c < 0: return -1
+  let tpn = c.t.nd[n].a
+  if c.t.nd[tpn].a < 0: return -1
+  let m = c.objs[c.ta[s]].mapper
+  let g = tyops.raw(&c, c.t.nd[tpn].a)
+  let ks = bind.instantiate(&c, g, m)
+  let lb = key_lower_bound(&c, ks, 0)
+  if lb < 0: return -1
+  let tps0 = bind.tparam_sym(&c, tpn)
+  let tp = c.sdtype[tps0]
+  let tmpl = tyops.raw(&c, c.t.nd[n].c)
+  let r = types.anon_obj(&c, -1, -1)
+  let f = c.t.nd[n].f
+  for k in types.members(c, lb):
+    if c.tk[k] == TK_NEVER: continue
+    if c.tk[k] != TK_STRLIT: return -1
+    let m2 = tyops.extend(&c, m, tp, k)
+    let pt = bind.instantiate(&c, tmpl, m2)
+    if c.tk[pt] == TK_UNSUP: return -1
+    let ps = types.new_sym(&c, types.S_PROP, c.ta[k], -1)
+    c.stype[ps] = pt
+    var fl = 0
+    if (f & ast.MAP_OPTIONAL) != 0: fl = types.SF_OPTIONAL
+    # (T[P]: T's modifiers, as Pick keeps them)
+    if c.tk[tmpl] == types.TK_INDEXED and c.tb[tmpl] == tp:
+      let ot = bind.instantiate(&c, c.ta[tmpl], m)
+      if c.tk[ot] == TK_TPARAM:
+        let ob = chk.base_constraint(&c, ot, 0)
+        if ob >= 0 and c.tk[ob] == TK_OBJ:
+          let bp = bind.get_prop(&c, ob, c.ta[k])
+          if bp >= 0: fl = fl | (c.sflags[bp] & (types.SF_OPTIONAL | types.SF_READONLY))
+    c.sflags[ps] = fl
+    types.add_prop(&c, r, c.ta[k], ps)
+  c.objs[c.ta[r]].resolved = true
+  return r
+
 # isGenericObjectType: a type variable, a generic mapped type, or an intersection with one.
 fn generic_object(c: C, t: Int) -> Bool:
   for m in types.members_inter(c, t):
@@ -606,6 +677,10 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
     if tk != TK_TPARAM and tk < types.TK_KEYOF and not is_mapped(c, t) and tk != TK_UNION and tk != TK_INTER: return false
     let a0 = c.t_alias_args[s][0]
     return rel(&c, a0, t)
+  # (a generic mapped source to a concrete object type: by its keys' lower bound)
+  if is_mapped(c, s) and tk == TK_OBJ and not is_mapped(c, t) and not tyops.is_generic(&c, t) and tyops.is_generic(&c, s):
+    let lo = mapped_lower_obj(&c, s)
+    if lo >= 0: return assignable(&c, lo, t)
   if sk >= types.TK_KEYOF or tk >= types.TK_KEYOF or is_mapped(c, s) or is_mapped(c, t):
     let r = generic_rel(&c, s, t)
     if r == 1: return true
@@ -702,6 +777,20 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
       let r = combined_rel(&c, s, t, nw)
       if r == 1: return true
       if r == 0: return false
+      # (generic mapped members by their keys' lower bounds)
+      var lparts: [Int] = []
+      var lchanged = false
+      for m in types.members_inter(c, s):
+        if is_mapped(c, m) and tyops.is_generic(&c, m):
+          let lo = mapped_lower_obj(&c, m)
+          if lo >= 0:
+            lparts.push(lo)
+            lchanged = true
+            continue
+        lparts.push(m)
+      if lchanged:
+        let lx = types.inter_of(&c, lparts)
+        if lx != s and c.tk[lx] != TK_UNSUP: return assignable(&c, lx, t)
       # the members' properties, signatures and index signatures together (the intersection's
       # apparent type)
       let cb = inter_combined(&c, s)
@@ -2034,10 +2123,15 @@ fn missing(var c: C, s: Int, t: Int, node: Int) -> Bool:
     let tnews = bind.sigs_of(&c, t, true).len
     if not ((tcalls > 0 and scalls > 0) or (tnews > 0 and snews > 0)): return false
   var miss: [Str] = []
+  # (a generic mapped type: the members its keys' lower bound gives it)
+  var sp_of = s
+  if is_mapped(c, s) and tyops.is_generic(&c, s):
+    let lo = mapped_lower_obj(&c, s)
+    if lo >= 0: sp_of = lo
   for name in bind.prop_names(&c, t):
     let tp = bind.get_prop(&c, t, name)
     if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
-    if src_prop(&c, s, name) < 0: miss.push(c.t.names[name] + "")
+    if src_prop(&c, sp_of, name) < 0: miss.push(c.t.names[name] + "")
   if miss.len == 0: return false
   let ss = show.show(&c, s)
   let ts = show.show(&c, t)
