@@ -1,0 +1,12 @@
+type Rgb = [number, number, number];
+declare const m: Rgb;
+const a: string = Math.max(...m);
+declare function f(x: string, ...r: number[]): boolean;
+const b: number = f("a", ...m);
+declare const t2: [number, string];
+f("a", ...t2);
+declare const ro: readonly [number, number];
+const c2: string = Math.min(...ro);
+declare const opt: [number, number?];
+Math.min(...opt);
+export {};
