@@ -1,0 +1,14 @@
+declare const args: [Date] | [number, string];
+export const n1: 'z' = args.length;
+declare const t: [1, 2?, 3?];
+export const n2: 'z' = t.length;
+declare const r: [1, ...string[]];
+export const n3: 'z' = r.length;
+declare const ro: readonly [1, 2];
+export const n4: 'z' = ro.length;
+const lit = [1, 2] as const;
+export const n5: 'z' = lit.length;
+declare let mt: [number, number];
+mt.length = 2;
+mt.length = 3;
+ro.length = 2;
