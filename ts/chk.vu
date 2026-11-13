@@ -60,7 +60,77 @@ fn widen(var c: C, t: Int) -> Int:
   if c.tk[t] == TK_OBJ:
     let o = c.ta[t]
     if c.objs[o].fresh: return widen_obj(&c, t)
+    # (an array of object literals: its element widened)
+    if rel.is_array_ref(&c, t) and not rel.is_readonly_array(&c, t):
+      let el = c.objs[o].args[0]
+      if c.tk[el] == TK_UNION:
+        let we = widen(&c, el)
+        if we != el: return bind.array_of(&c, we)
+  if c.tk[t] == TK_UNION: return widen_union(&c, t, true)
   return t
+
+# getWidenedType without literal widening: object literals (a union's normalized), arrays of them.
+fn widen_objs(var c: C, t: Int) -> Int:
+  if c.tk[t] == TK_OBJ:
+    let o = c.ta[t]
+    if c.objs[o].fresh: return widen_obj(&c, t)
+    if rel.is_array_ref(&c, t) and not rel.is_readonly_array(&c, t):
+      let el = c.objs[o].args[0]
+      if c.tk[el] == TK_UNION:
+        let we = widen_union(&c, el, false)
+        if we != el: return bind.array_of(&c, we)
+    return t
+  if c.tk[t] == TK_UNION: return widen_union(&c, t, false)
+  return t
+
+# getWidenedTypeWithContext over a union with object literals: each literal widened and given the
+# properties the others have that it lacks, optional and undefined (printed in an order tsc 7
+# doesn't keep: marked).
+fn widen_union(var c: C, t: Int, lits: Bool) -> Int:
+  var any_fresh = false
+  for m in types.members(c, t):
+    if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].fresh: any_fresh = true
+  if not any_fresh: return t
+  var names: [Int] = []
+  var nsym: {Int: Int} = {}
+  for m in types.members(c, t):
+    if c.tk[m] != TK_OBJ or not c.objs[c.ta[m]].fresh: continue
+    var spread = false
+    for name in types.ints(c.objs[c.ta[m]].order):
+      if c.objs[c.ta[m]].props[name] in c.spread_syms: spread = true
+    if spread: continue
+    for name in types.ints(c.objs[c.ta[m]].order):
+      if not types.has_int(names, name):
+        names.push(name)
+        nsym[name] = c.objs[c.ta[m]].props[name]
+  var ws: [Int] = []
+  var changed = false
+  for m in types.members(c, t):
+    let mk = c.tk[m]
+    if mk == TK_NULL or mk == TK_UNDEF:
+      ws.push(m)
+      continue
+    if mk == TK_OBJ and c.objs[c.ta[m]].fresh:
+      let w = widen_obj(&c, m)
+      let wo = c.ta[w]
+      var added = false
+      for name in names:
+        if name in c.objs[wo].props: continue
+        let us = types.new_sym(&c, S_PROP, name, c.sdecl[nsym[name]])
+        c.stype[us] = c.undef_t
+        c.sflags[us] = SF_OPTIONAL
+        types.add_prop(&c, w, name, us)
+        added = true
+      if added: c.noshow_t[w] = true
+      ws.push(w)
+      changed = true
+      continue
+    var wm = m
+    if lits: wm = widen(&c, m)
+    if wm != m: changed = true
+    ws.push(wm)
+  if not changed: return t
+  return types.union_of(&c, ws)
 
 # An object literal's type with its properties widened and its freshness dropped (after a declaration).
 fn widen_obj(var c: C, t: Int) -> Int:
@@ -171,7 +241,8 @@ fn decl_type(var c: C, s: Int) -> Int:
         # a constant keeps the fresh literal type (so let x = c widens again)
         if types.is_fresh_lit(c, it): return it
         let h3_ = widen_nested(&c, it)
-        return regular_obj(&c, h3_)
+        let h3b = widen_objs(&c, h3_)
+        return regular_obj(&c, h3b)
       let h4_ = widen(&c, it)
       return regular_obj(&c, h4_)
     # catch (e)
@@ -743,11 +814,11 @@ fn return_widen(var c: C, d: Int, ts: [Int]) -> Int:
   for t in ts:
     if types.is_fresh_lit(c, t) or t in c.freg: fresh = true
     if c.tk[t] == TK_SYMBOL and c.tb[t] == 1: fresh = true
-    if c.tk[t] == TK_OBJ and c.objs[c.ta[t]].fresh:
-      if rc0 >= 0: parts.push(widen_obj_ctx(&c, t, rc0))
-      else: parts.push(widen_obj(&c, t))
+    if c.tk[t] == TK_OBJ and c.objs[c.ta[t]].fresh and rc0 >= 0: parts.push(widen_obj_ctx(&c, t, rc0))
     else: parts.push(t)
-  let u = types.union_of(&c, parts)
+  var u = types.union_of(&c, parts)
+  # (getWidenedType: object literals, with the properties of the others in a union)
+  if rc0 < 0: u = widen_objs(&c, u)
   let unit = types.is_literal(c, u) or (c.tk[u] == TK_SYMBOL and c.tb[u] == 1)
   if unit and fresh:
     if d in c.ret_ctx:
@@ -4167,9 +4238,13 @@ fn subtype_reduce(var c: C, ts: [Int]) -> Int:
       for j in 0..ms.len:
         if j == i or drop: continue
         let n2 = ms[j]
-        if not obj_inter(c, n2) and (c.tk[n2] != TK_OBJ or c.objs[c.ta[n2]].fresh): continue
+        if not obj_inter(c, n2) and c.tk[n2] != TK_OBJ: continue
         if not written_known(&c, m, n2): continue
-        if rel.assignable(&c, m, n2) and not rel.assignable(&c, n2, m): drop = true
+        let n2_fresh = c.tk[n2] == TK_OBJ and c.objs[c.ta[n2]].fresh
+        if rel.assignable(&c, m, n2):
+          # (two fresh literals of one shape: the first stays)
+          let back = rel.assignable(&c, n2, m) and (not n2_fresh or written_known(&c, n2, m))
+          if not back or j < i: drop = true
     if not drop: keep.push(m)
   return types.union_of(&c, keep)
 
@@ -5308,6 +5383,8 @@ fn inf_mapper(var c: C, var inf: Inf, sg: Int) -> Int:
       if (inf.prio[i] & P_RETURN) != 0: t = subtype_reduce(&c, base)
       else: t = common_supertype(&c, base)
       t = regular_obj(&c, t)
+      # (getWidenedType: a union's fresh object literals too)
+      if c.tk[t] == TK_UNION: t = widen_union(&c, t, false)
       if c.tk[t] == TK_UNION and types.regular(c, t) != t: t = types.regular(c, t)
       # with contravariant candidates too: the covariant inference only if it fits one of them
       # (preferCovariantType)
