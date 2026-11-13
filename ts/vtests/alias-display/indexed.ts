@@ -1,0 +1,12 @@
+type O = { a: 'x' | 'y'; b: 'z' };
+type S1 = O[keyof O];
+export const s1: 1 = null! as S1;
+type S2 = O['a'];
+export const s2: 1 = null! as S2;
+type M = { [K in 'p' | 'q']: `${K}!` };
+type S3 = M[keyof M];
+export const s3: 1 = null! as S3;
+type S4 = keyof O;
+export const s4: 1 = null! as S4;
+type S5 = Exclude<keyof O, 'b'>;
+export const s5: 1 = null! as S5;
