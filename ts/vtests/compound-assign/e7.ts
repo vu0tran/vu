@@ -1,0 +1,10 @@
+let n: number | string = 1;
+n += 'a';
+export const z1: 'z' = n;
+let a;
+a = 1;
+a += 'x';
+export const z2: 'z' = a;
+let b: number | string | boolean = true as boolean | number;
+b += 1;
+export const z3: 'z' = b;

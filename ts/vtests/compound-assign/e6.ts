@@ -1,0 +1,10 @@
+declare const o: { s: string | number; t?: string };
+o.s = 'a';
+o.s += 1;
+export const z1: 'z' = o.s;
+o.t += 'x';
+export const z2: 'z' = o.t;
+declare const arr: (string | number)[];
+arr[0] = 1;
+arr[0] += 1;
+export const z3: 'z' = arr[0];
