@@ -1,0 +1,13 @@
+export {};
+type Flat<T> = { [k in keyof T]: T[k] };
+type AQ<T extends object> = { [K in keyof T]: T[K] } & { x?: 1 };
+type Out<S extends Record<string, { o: unknown }>> = Flat<AQ<{ [k in keyof S]: S[k]["o"] }>>;
+declare function g<S extends Record<string, { o: unknown }>>(v: Out<S>): S;
+const r = g({ a: 1 });
+const b: boolean = r;
+declare function k<T>(v: { [P in keyof T as Exclude<P, "zz">]: T[P] }): T;
+const r3 = k({ a: 1 });
+const b3: boolean = r3;
+declare function m<T>(v: Partial<T>): T;
+const b4: boolean = m(null!);
+const b5: boolean = m(undefined as unknown);
