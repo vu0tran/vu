@@ -1,0 +1,10 @@
+declare function p<A extends string, B extends string>(s: `${A}:${B}`): [A, B];
+export const a: 'z' = p('wf:read');
+export const b: 'z' = p('a:b:c');
+declare function q<A extends string>(s: `pre-${A}`): A;
+export const c: 'z' = q('pre-x');
+export const d = q('nope');
+declare function r<A extends string, B extends string>(s: `${A}${B}`): [A, B];
+export const e: 'z' = r('xyz');
+declare function t<A extends string>(s: `${A}`): A;
+export const f: 'z' = t('x' as 'x' | 'y');
