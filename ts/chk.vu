@@ -2110,7 +2110,14 @@ fn discriminant_truthiness(var c: C, e: Int, truth: Bool, var out: [Fact]):
   # (a discriminant: every member has it, some as a unit type; isDiscriminantProperty)
   var disc = false
   var pts: [Int] = []
+  # (x?.k: x's null and undefined have no k, unknown: kept when falsy, and gone when truthy,
+  # where the chain's containment takes them out)
+  let opt = (c.t.nd[e].f & 1) != 0
   for m in types.members(c, ot):
+    if opt and (c.tk[m] == TK_UNDEF or c.tk[m] == TK_NULL):
+      if truth: pts.push(c.never_t)
+      else: pts.push(c.unknown_t)
+      continue
     if c.tk[m] != TK_OBJ and not (c.tk[m] == TK_INTER and not is_generic_member(c, m)): return
     let ps = prop_of(&c, m, name)
     if ps < 0: return
@@ -2123,7 +2130,10 @@ fn discriminant_truthiness(var c: C, e: Int, truth: Bool, var out: [Fact]):
     pts.push(pt)
   if not disc: return
   # narrowTypeByDiscriminant: the members whose property is comparable to the narrowed one
-  let all = types.union_of(&c, pts)
+  var real: [Int] = []
+  for x in pts:
+    if c.tk[x] != TK_NEVER and c.tk[x] != TK_UNKNOWN: real.push(x)
+  let all = types.union_of(&c, real)
   var np = c.never_t
   if truth: np = truthy_part(&c, all)
   else: np = falsy_part(&c, all)
@@ -2131,7 +2141,14 @@ fn discriminant_truthiness(var c: C, e: Int, truth: Bool, var out: [Fact]):
   var keep: [Int] = []
   let ms = types.members(c, ot)
   for i in 0..ms.len:
-    if c.tk[pts[i]] != TK_NEVER and comparable(&c, np, pts[i]): keep.push(ms[i])
+    if c.tk[pts[i]] == TK_UNKNOWN: keep.push(ms[i])
+    elif c.tk[pts[i]] != TK_NEVER and comparable(&c, np, pts[i]): keep.push(ms[i])
+  # (an optional chain whose discriminant takes nothing out: the chain's containment alone)
+  if opt:
+    var dropped = false
+    for i in 0..ms.len:
+      if c.tk[ms[i]] != TK_UNDEF and c.tk[ms[i]] != TK_NULL and not types.has_int(keep, ms[i]): dropped = true
+    if not dropped: return
   out.push(Fact(okey, types.union_of(&c, keep)))
 
 # (x = e) as a reference: x, which the assignment just narrowed (isMatchingReference)
@@ -5870,8 +5887,16 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
   var gen_this = false
   var this_arg = c.void_t
   var this_at = n
-  if has_this and not is_new:
-    if sgs.len != 1: return unsup(&c, n, "a call to overloads or a generic function declaring this")
+  # (overloads declaring this: a candidate whose this doesn't fit isn't applicable)
+  var multi_this = false
+  if has_this and not is_new and sgs.len != 1:
+    if c.t.nd[n].b >= 0: return unsup(&c, n, "a call to overloads or a generic function declaring this")
+    if c.t.nd[callee].k == ast.N_PROPACCESS or c.t.nd[callee].k == ast.N_ELEMACCESS:
+      this_at = c.t.nd[callee].a
+      if this_at in c.ntype: this_arg = c.ntype[this_at]
+      else: return unsup(&c, n, "a method call declaring this")
+    multi_this = true
+  if has_this and not is_new and not multi_this:
     let want = c.sigs[sgs[0]].this_t
     if c.t.nd[callee].k == ast.N_PROPACCESS or c.t.nd[callee].k == ast.N_ELEMACCESS:
       this_at = c.t.nd[callee].a
@@ -5960,9 +5985,13 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
     arg_count_msg(&c, sgs2, args.len, at)
     return sig_result(&c, sgs2[0], n)
   if cands.len == 1:
-    if gen_this: c.call_this = this_arg
+    # (tsc elaborates the this that doesn't fit here: not modeled)
+    let mgen = multi_this and c.sigs[cands[0]].this_t >= 0 and c.sigs[cands[0]].tparams.len > 0
+    if multi_this and not mgen and c.sigs[cands[0]].this_t >= 0 and not rel.assignable(&c, this_arg, c.sigs[cands[0]].this_t): return unsup(&c, n, "overloads declaring a this that doesn't fit, none applicable")
+    if gen_this or mgen: c.call_this = this_arg
     let sg = instantiate_call(&c, cands[0], args, ctx)
     c.call_this = -1
+    if mgen and not rel.assignable(&c, this_arg, c.sigs[sg].this_t): return unsup(&c, n, "overloads declaring a this that doesn't fit, none applicable")
     c.resolved_sig[n] = sg
     # (tsc reports a generic one's this as an argument, elaborated: not modeled)
     if gen_this and c.sigs[sg].this_t >= 0 and not rel.assignable(&c, this_arg, c.sigs[sg].this_t): return unsup(&c, n, "a generic function's this that doesn't fit")
@@ -5973,21 +6002,36 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
   var sens = false
   for a in args:
     if context_sensitive(c, a): sens = true
+  var this_skipped = false
+  var any_cgen = false
   for pass in 0..2:
     for cand in cands:
+      let cgen = multi_this and c.sigs[cand].this_t >= 0 and c.sigs[cand].tparams.len > 0
+      if multi_this and not cgen and c.sigs[cand].this_t >= 0 and not rel.assignable(&c, this_arg, c.sigs[cand].this_t):
+        this_skipped = true
+        continue
       # (what checking the arguments for a candidate that doesn't fit reports is dropped)
       let dlen = c.diags.len
       # (with context-sensitive arguments: inferred without them first, SkipContextSensitive,
       # so a candidate that doesn't fit never gives a function argument its parameters)
       var sg = -1
+      if cgen: any_cgen = true
       if sens:
         c.skip_sens = true
+        if cgen: c.call_this = this_arg
         let sg0 = instantiate_call(&c, cand, args, ctx)
+        c.call_this = -1
         c.skip_sens = false
         if not args_fit_skip(&c, sg0, args):
           while c.diags.len > dlen: c.diags.pop()
           continue
+      if cgen: c.call_this = this_arg
       sg = instantiate_call(&c, cand, args, ctx)
+      c.call_this = -1
+      if cgen and not rel.assignable(&c, this_arg, c.sigs[sg].this_t):
+        while c.diags.len > dlen: c.diags.pop()
+        this_skipped = true
+        continue
       var fits = false
       if pass == 0: fits = args_fit_sub(&c, sg, args)
       else: fits = args_fit(&c, sg, args)
@@ -5996,6 +6040,7 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
         c.resolved_sig[n] = sg
         return sig_result(&c, sg, n)
       while c.diags.len > dlen: c.diags.pop()
+  if this_skipped or any_cgen: return unsup(&c, n, "overloads declaring a this that doesn't fit, none applicable")
   for a in args: check_expr(&c, a, -1)
   # reported where the last candidate's first argument error is (as tsc 7 does)
   let last = instantiate_call(&c, cands[cands.len - 1], args, ctx)
@@ -7071,6 +7116,8 @@ fn infer_sigs(var c: C, p: Int, a: Int, ctor: Bool, var inf: Inf, contra: Bool, 
       asg1 = bind.inst_sig(&c, asg1, bm)
       c.sigs[asg1].tparams = []
     let as_ = types.sig_copy(c, asg1)
+    # (applyToParameterTypes: the this types first, as parameters)
+    if ps.this_t >= 0 and as_.this_t >= 0: infer_in(&c, ps.this_t, as_.this_t, &inf, not contra, prio, orig, &seen)
     let np = ps.ptypes.len
     for i in 0..np:
       if i == np - 1 and ps.pflags[i] == 2 and c.tk[ps.ptypes[i]] == TK_TPARAM:
