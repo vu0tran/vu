@@ -1,0 +1,11 @@
+type Eq<L, R> = (<T>() => T extends (L & T) | T ? true : false) extends (<T>() => T extends (R & T) | T ? true : false) ? true : false;
+const a: Eq<{ a: 1 }, { a: 1 }> = true;
+const b: Eq<{ a: 1 }, { a: 2 }> = true;
+const c: Eq<{ a?: 1 }, { a?: 1 | undefined }> = true;
+const d: Eq<string, string> = false;
+const e: Eq<any, unknown> = true;
+type Eq2<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
+const f: Eq2<{ a: 1 }, { a: 1 }> = true;
+const g: Eq2<number, string> = true;
+const h: Eq2<{ x: string }, { readonly x: string }> = true;
+export {};
