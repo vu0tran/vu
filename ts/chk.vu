@@ -148,7 +148,7 @@ fn decl_type(var c: C, s: Int) -> Int:
       if p >= 0 and c.t.nd[p].k == ast.N_VAR:
         let pp = bind.up(c, p)
         if pp >= 0 and c.t.nd[pp].k == ast.N_FORIN and c.t.nd[pp].a == p:
-          if c.t.nd[pp].f == 0: return c.string_t
+          if c.t.nd[pp].f == 0: return for_in_key(&c, pp)
           let h2_ = check_expr(&c, c.t.nd[pp].b, -1)
           return element_type(&c, h2_, c.t.nd[pp].b)
       if c.t.nd[d].c < 0:
@@ -905,9 +905,36 @@ fn typeof_matches(var c: C, m: Int, what: Str) -> Bool:
   if what == "boolean": return k == TK_TRUE or k == TK_FALSE
   if what == "symbol": return k == TK_SYMBOL
   if what == "undefined": return k == TK_UNDEF or k == TK_VOID
-  if what == "function": return k == TK_OBJ and bind.sigs_of(&c, m, false).len > 0
-  if what == "object": return k == TK_NULL or k == TK_NONPRIM or (k == TK_OBJ and bind.sigs_of(&c, m, false).len == 0)
+  if k == TK_INTER:
+    # (getIntersectionTypeFacts: primitives decide when there are any (object members are tags);
+    # typeof "function" if any member is a function, "object" if all are objects)
+    let xs = types.members_inter(c, m)
+    var prims: [Int] = []
+    for x in xs:
+      let xk = c.tk[x]
+      if xk != TK_OBJ and xk != TK_NONPRIM and xk != TK_INTER: prims.push(x)
+    if prims.len > 0:
+      for x in prims:
+        if not typeof_matches(&c, x, what): return false
+      return true
+    if what == "function":
+      for x in xs:
+        if typeof_matches(&c, x, "function"): return true
+      return false
+    if what == "object":
+      for x in xs:
+        if not typeof_matches(&c, x, "object"): return false
+      return true
+    return false
+  if what == "function": return k == TK_OBJ and fn_like(&c, m)
+  if what == "object": return k == TK_NULL or k == TK_NONPRIM or (k == TK_OBJ and not fn_like(&c, m))
   return false
+
+# isFunctionObjectType: call or construct signatures, or the Function interface
+fn fn_like(var c: C, m: Int) -> Bool:
+  if bind.sigs_of(&c, m, false).len > 0 or bind.sigs_of(&c, m, true).len > 0: return true
+  let fs = bind.global_type_sym(&c, "Function")
+  return fs >= 0 and bind.declared_type(&c, fs) == m
 
 # ---- narrowing a type parameter (tsc's getAdjustedTypeWithFacts / narrowTypeByTypeFacts): the
 # facts of its base constraint decide whether it stays; results tsc writes as intersections
@@ -933,6 +960,9 @@ fn may_be(c: C, b: Int, what: Int) -> Bool:
   return false
 
 fn tp_truthy(var c: C, m: Int, truth: Bool) -> Int:
+  if c.tk[m] == TK_INTER and tparam_inter(c, m):
+    if truth != tparam_inter_null(c, m): return m
+    return -1
   if c.tk[m] != TK_TPARAM: return -2
   let b = base_constraint(&c, m, 0)
   if b < 0: return -2
@@ -949,7 +979,17 @@ fn tp_truthy(var c: C, m: Int, truth: Bool) -> Int:
   if c.tk[fp] == TK_NEVER: return -1
   return m
 
+fn tparam_inter_null(c: C, m: Int) -> Bool:
+  for x in types.members_inter(c, m):
+    if c.tk[x] == TK_NULL: return true
+  return false
+
 fn tp_typeof(var c: C, m: Int, what: Str, pos: Bool) -> Int:
+  # T & object and T & null (from typeof x === "object"): their typeof is "object" (an object
+  # type's facts don't include "function")
+  if c.tk[m] == TK_INTER and tparam_inter(c, m):
+    if pos == (what == "object"): return m
+    return -1
   if c.tk[m] != TK_TPARAM: return -2
   let b = base_constraint(&c, m, 0)
   if b < 0: return -2
@@ -992,6 +1032,11 @@ fn tp_typeof(var c: C, m: Int, what: Str, pos: Bool) -> Int:
   return m
 
 fn tp_nullcmp(var c: C, m: Int, vk: Int, pos: Bool, loose: Bool) -> Int:
+  # T & null and T & object (from typeof x === "object"): null is only T & null
+  if c.tk[m] == TK_INTER and tparam_inter(c, m):
+    let hit = tparam_inter_null(c, m) and (loose or vk == TK_NULL)
+    if pos == hit: return m
+    return -1
   if c.tk[m] != TK_TPARAM: return -2
   let b = base_constraint(&c, m, 0)
   if b < 0: return -2
@@ -1058,7 +1103,7 @@ fn facts(var c: C, e: Int, truth: Bool, var out: [Fact]):
 fn keep_fresh(var c: C, t: Int, r: Int) -> Int:
   # nothing filtered out: the type itself (an alias keeps its name)
   if r != t and c.tk[t] == TK_UNION and c.tk[r] == TK_UNION and same_members(c, r, t): return t
-  if not (t in c.freg or types.is_fresh_lit(c, t)): return r
+  if not (t in c.freg or types.is_fresh_lit(c, t)): return filter_origin(&c, t, r)
   var ms: [Int] = []
   var any_lit = false
   for m in types.members(c, r):
@@ -1068,6 +1113,27 @@ fn keep_fresh(var c: C, t: Int, r: Int) -> Int:
   if not any_lit: return r
   if ms.len == 1: return ms[0]
   return union_fresh(&c, ms)
+
+# filterType of a union written with named unions (its origin): the written members left, when
+# what was removed was only written members (not part of a named union)
+fn filter_origin(var c: C, t: Int, r: Int) -> Int:
+  if r == t or c.tk[t] != TK_UNION or not (t in c.t_origin): return r
+  if c.tk[r] == TK_NEVER: return r
+  let tm = types.members(c, t)
+  let rm = types.members(c, r)
+  for m in rm:
+    if not types.has_int(tm, m): return r
+  let os = types.ints(c.t_origin[t])
+  var kept: [Int] = []
+  var removed = 0
+  for o in os:
+    if c.tk[o] == TK_UNION or types.has_int(rm, o): kept.push(o)
+    else: removed += 1
+  if removed != tm.len - rm.len: return r
+  if kept.len == 1: return kept[0]
+  let u = types.union_of(&c, kept)
+  if types.members(c, u).len != rm.len: return r
+  return u
 
 # Narrowing that would leave a type parameter written as tsc writes it (T & {...}): in the plain
 # pass the reference's type is unknown (-7, reading it leaves the file unchecked); a read where
@@ -1086,7 +1152,8 @@ fn either_facts(var c: C, a: Int, b: Int, truth: Bool, var out: [Fact]):
   var p1: [Fact] = []
   facts1(&c, a, truth, &p1)
   var p2: [Fact] = []
-  facts1(&c, a, not truth, &p2)
+  if c.sub_mode: facts1(&c, a, not truth, &p2)
+  else: facts(&c, a, not truth, &p2)
   c.narrow.push({})
   plain_facts_in_sub(&c, a, not truth)
   for f in p2: set_narrow(&c, f.key, f.t)
@@ -1105,7 +1172,15 @@ fn either_facts(var c: C, a: Int, b: Int, truth: Bool, var out: [Fact]):
       out.push(Fact(k + "", -7))
       continue
     if v1 < 0 or v2 < 0: continue
-    let u = union_fresh(&c, [v1, v2])
+    # (a path with the declared type: tsc's branch join is the declared type)
+    let s0 = int(k) else -1
+    if s0 >= 0 and (tparam_inter(c, v1) or tparam_inter(c, v2)):
+      let dt0 = bind.type_of_sym(&c, s0)
+      let cur0 = narrowed(c, k)
+      if (cur0 < 0 or cur0 == dt0) and (dt0 == v1 or dt0 == v2): continue
+    var u = -1
+    if s0 >= 0 and (tparam_inter(c, v1) or tparam_inter(c, v2)): u = tp_join(&c, s0, [v1, v2])
+    else: u = union_fresh(&c, [v1, v2])
     # all of the reference's type again: no narrowing (an alias keeps its name)
     let cur = narrowed(c, k)
     if cur >= 0 and same_members(c, u, cur): continue
@@ -1127,6 +1202,54 @@ fn presence_possible(var c: C, t: Int, name: Int, assume: Bool) -> Bool:
   return not assume
 
 # Record<K, V> (the lib alias, instantiated; -1 without it).
+# for (const k in x): Extract<keyof X, string> for a generic X (its keys a type parameter or
+# keyof), else string
+fn for_in_key(var c: C, n: Int) -> Int:
+  let e = c.t.nd[n].b
+  if not (n in c.forin_t): return unsup(&c, e, "a for-in variable read before its statement")
+  let t0 = c.forin_t[n]
+  if t0 < 0 or not is_generic_member(c, t0):
+    var gen = false
+    if t0 >= 0:
+      for m in types.members(c, t0):
+        if is_generic_member(c, m): gen = true
+    if not gen: return c.string_t
+  let t1 = types.filter_union(&c, t0, true, true)
+  # (getNonNullableType: T & null goes too)
+  var ms: [Int] = []
+  for m in types.members(c, t1):
+    if c.tk[m] == TK_INTER and tparam_inter_null(c, m): continue
+    if not (c.tk[m] == TK_TPARAM or (c.tk[m] == TK_INTER and tparam_inter(c, m))): return unsup(&c, e, "for-in over a generic type")
+    ms.push(m)
+  let t = types.union_of(&c, ms)
+  let kt = tyops.keyof_of(&c, t)
+  let kk = c.tk[kt]
+  if kk != TK_TPARAM and kk != types.TK_KEYOF:
+    var d = ""
+    if c.debug: d = " " + show.show(&c, t) + " / " + show.show(&c, kt)
+    return unsup(&c, e, "for-in over a generic type" + d)
+  let r = alias_inst(&c, "Extract", [kt, c.string_t])
+  if r < 0: return unsup(&c, e, "for-in over a generic type")
+  return r
+
+fn is_lib_alias(var c: C, t: Int, name: Str) -> Bool:
+  if not (t in c.t_alias) or not (t in c.t_alias_args): return false
+  let rs = bind.global_type_sym(&c, name)
+  return rs >= 0 and c.t_alias[t] == rs
+
+fn alias_inst(var c: C, name: Str, args: [Int]) -> Int:
+  let rs = bind.global_type_sym(&c, name)
+  if rs < 0 or (c.sk[rs] & types.S_ALIAS) == 0: return -1
+  let d = c.sdecl[rs]
+  if c.t.nd[d].a < 0: return -1
+  let tps = bind.tparam_types(&c, c.t.nd[d].a)
+  if tps.len != args.len: return -1
+  let body = bind.declared_type(&c, rs)
+  let m = types.new_mapper(&c, tps, args)
+  let r = bind.instantiate(&c, body, m)
+  if c.tk[r] == TK_UNSUP: return -1
+  return bind.alias_tag(&c, r, rs, args)
+
 fn record_of(var c: C, k: Int, v: Int) -> Int:
   let rs = bind.global_type_sym(&c, "Record")
   if rs < 0 or (c.sk[rs] & types.S_ALIAS) == 0: return -1
@@ -1200,6 +1323,33 @@ fn chain_roots(var c: C, e: Int, var out: [Fact]):
 
 # typeof x === what (pos) or !== (not pos): x's type narrowed; -2 when a generic member can't be
 fn typeof_narrow(var c: C, t: Int, what: Str, pos: Bool) -> Int:
+  # (narrowTypeByTypeName maps over a union's origin: a written member left whole stays as written;
+  # "object" maps twice, for object and for null)
+  if pos and c.tk[t] == TK_UNION and t in c.t_origin:
+    let os = types.ints(c.t_origin[t])
+    var rs: [Int] = []
+    for o in os:
+      let r = typeof_narrow(&c, o, what, pos)
+      if r == -2: return -2
+      if c.tk[o] == TK_UNION and r != o and c.tk[r] == TK_UNION and same_members(c, r, o):
+        var split = false
+        if what == "object":
+          var has_null = false
+          var has_obj = false
+          for m in types.members(c, o):
+            if c.tk[m] == TK_NULL: has_null = true
+            else: has_obj = true
+          split = has_null and has_obj
+        if split:
+          for m in types.members(c, r): rs.push(m)
+        else: rs.push(o)
+      else: rs.push(r)
+    return types.union_of(&c, rs)
+  let r = typeof_narrow_flat(&c, t, what, pos)
+  if pos or r < 0: return r
+  return filter_origin(&c, t, r)
+
+fn typeof_narrow_flat(var c: C, t: Int, what: Str, pos: Bool) -> Int:
   var keep: [Int] = []
   for m in types.members(c, t):
     let mk = c.tk[m]
@@ -1233,6 +1383,10 @@ fn typeof_narrow(var c: C, t: Int, what: Str, pos: Bool) -> Int:
       let tr = tp_typeof(&c, m, what, pos)
       if tr == -2: return -2
       if tr >= 0: keep.push(tr)
+    elif mk == TK_NONPRIM and pos and what == "function":
+      # (Function is a subtype of object: narrowTypeByTypeFacts gives it)
+      let fs = bind.global_type_sym(&c, "Function")
+      if fs >= 0: keep.push(bind.declared_type(&c, fs))
     elif typeof_matches(&c, m, what) == pos: keep.push(m)
   # (T & null beside null itself: null)
   if types.has_int(keep, c.null_t):
@@ -1335,7 +1489,10 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     let op = c.t.nd[e].f
     if op == scan.T_AND:
       if truth:
-        facts1(&c, c.t.nd[e].a, true, &out)
+        # (the plain pass has the left's substituted facts too: the right side may read the
+        # reference where tsc substitutes constraints)
+        if c.sub_mode: facts1(&c, c.t.nd[e].a, true, &out)
+        else: facts(&c, c.t.nd[e].a, true, &out)
         # the right side is checked knowing the left is true
         c.narrow.push({})
         plain_facts_in_sub(&c, c.t.nd[e].a, true)
@@ -1348,7 +1505,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
       return
     if op == scan.T_OR:
       if not truth:
-        facts1(&c, c.t.nd[e].a, false, &out)
+        if c.sub_mode: facts1(&c, c.t.nd[e].a, false, &out)
+        else: facts(&c, c.t.nd[e].a, false, &out)
         c.narrow.push({})
         plain_facts_in_sub(&c, c.t.nd[e].a, false)
         for f in out: set_narrow(&c, f.key, f.t)
@@ -1577,7 +1735,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
       for m in types.members(c, t):
         let mk = c.tk[m]
         let deferred = mk == types.TK_COND or mk == types.TK_INDEXED
-        if is_generic_member(c, m) and mk != TK_TPARAM and not deferred:
+        let tpi = mk == TK_INTER and tparam_inter(c, m)
+        if is_generic_member(c, m) and mk != TK_TPARAM and not deferred and not tpi:
           generic_fact(&c, e, key, &out)
           return
         if deferred and tyops.base_of(&c, m, 0) < 0:
@@ -1588,7 +1747,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         c.subtype = true
         let sub1 = rel.assignable(&c, m, pt)
         var sub2 = false
-        if not sub1 and mk != TK_TPARAM: sub2 = rel.assignable(&c, pt, m)
+        if not sub1 and mk != TK_TPARAM and not tpi: sub2 = rel.assignable(&c, pt, m)
         c.subtype = ws0
         if sub1: direct.push(m)
         elif sub2: direct.push(pt)
@@ -1609,6 +1768,26 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
             let fits1 = rel.assignable(&c, pt, b0)
             c.subtype = ws1
             if fits1: inters.push(types.inter_of(&c, [m, pt]))
+          elif c.tk[m] == TK_INTER and tparam_inter(c, m):
+            # T & object, T & null: the same with T's base constraint
+            var parts: [Int] = []
+            var bad = false
+            for x in types.members_inter(c, m):
+              if c.tk[x] == TK_TPARAM:
+                let bx = base_constraint(&c, x, 0)
+                if bx < 0 or bx == x: continue
+                if c.tk[bx] == TK_TPARAM or c.tk[bx] >= types.TK_KEYOF or c.tk[bx] == TK_UNSUP: bad = true
+                else: parts.push(bx)
+              else: parts.push(x)
+            if bad:
+              gen = true
+              continue
+            let b1 = types.inter_of(&c, parts)
+            let ws2 = c.subtype
+            c.subtype = true
+            let fits2 = rel.assignable(&c, pt, b1)
+            c.subtype = ws2
+            if fits2: inters.push(types.inter_of(&c, [m, pt]))
           elif c.tk[m] == types.TK_COND or c.tk[m] == types.TK_INDEXED:
             # an instantiable member whose base constraint the candidate is a subtype of: their
             # intersection
@@ -1808,7 +1987,8 @@ fn push_facts(var c: C, e: Int, truth: Bool):
   var fs: [Fact] = []
   facts(&c, e, truth, &fs)
   c.narrow.push({})
-  for f in fs: set_narrow(&c, f.key, f.t)
+  for f in fs:
+    set_narrow(&c, f.key, f.t)
   # the branch a literal true/false never takes is unreachable: references there have their
   # declared types (TypeScript's flow analysis gives up on unreachable code)
   var u = e
@@ -2072,6 +2252,8 @@ fn member_constrained(var c: C, m0: Int) -> Int:
     elif k == types.TK_INDEXED or k == types.TK_COND or k == types.TK_KEYOF:
       # (Awaited<T>: its base constraint isn't a union)
       if k == types.TK_COND and awaited_generic(&c, m) == m: continue
+      # (Extract<keyof T, string>, a for-in key: its constraint is string)
+      if k == types.TK_COND and is_lib_alias(&c, m, "Extract") and c.t_alias_args[m].len == 2 and c.t_alias_args[m][1] == c.string_t: continue
       let b = tyops.base_of(&c, m, 0)
       if b == -2: return 2
       if b >= 0:
@@ -2189,7 +2371,9 @@ fn sub_read(var c: C, n: Int) -> Int:
         # assigned the declared type itself, any, or something assignable to every branch: the
         # reduction keeps every member unless one is a subtype of another
         let sub = substitute_constraints(&c, declared)
-        if subtype_pair(&c, sub): return unsup(&c, n, "narrowing a type parameter with a union constraint")
+        if subtype_pair(&c, sub):
+          if c.debug: print("SUBPAIR {key} i={i} v={v} {show.show(&c, sub)}")
+          return unsup(&c, n, "narrowing a type parameter with a union constraint")
         return sub
       return v
     if hidden_in(c, i, key): break
@@ -3670,9 +3854,17 @@ fn union_sigs(var c: C, ft: Int, is_new: Bool) -> [Int]:
   let ms = types.members(c, ft)
   var per: [[Int]] = []
   for m in ms:
-    let ap = rel.apparent(&c, m)
-    if c.tk[ap] != TK_OBJ: return []
-    let ss = bind.sigs_of(&c, ap, is_new)
+    var ss: [Int] = []
+    if c.tk[m] == TK_INTER:
+      # (an intersection's signatures: its members', in order)
+      for x in types.members_inter(c, m):
+        let ax = rel.apparent(&c, x)
+        if c.tk[ax] != TK_OBJ: return []
+        for sg in bind.sigs_of(&c, ax, is_new): ss.push(sg)
+    else:
+      let ap = rel.apparent(&c, m)
+      if c.tk[ap] != TK_OBJ: return []
+      ss = bind.sigs_of(&c, ap, is_new)
     if ss.len == 0: return []
     for sg in ss:
       if c.sigs[sg].this_t >= 0: return []
@@ -5718,7 +5910,15 @@ fn join_branches(var c: C, ft: {Str: Int}, fe: {Str: Int}, reach_t: Bool, reach_
     elif c.tk[v2] == TK_NEVER: u = v
     elif v != v2:
       # (narrowings to a type parameter's intersections: tsc's join keeps them, not modeled)
-      if tparam_inter(c, v) or tparam_inter(c, v2): set_narrow(&c, k + "", -7)
+      if tparam_inter(c, v) or tparam_inter(c, v2):
+        # (a branch with the declared type: tsc's join is the declared type)
+        let ks = int(k) else -1
+        if ks >= 0:
+          let dt = bind.type_of_sym(&c, ks)
+          let cur = narrowed(c, k)
+          if (dt == v or dt == v2) and (cur < 0 or cur == dt): continue
+        let uj = tp_join(&c, ks, [v, v2])
+        set_narrow(&c, k + "", uj)
       continue
     set_narrow(&c, k + "", u)
   for key in assigned:
@@ -7866,6 +8066,31 @@ fn cond_refs(var c: C, e: Int, var out: [Str]):
 # The join of a reference's flow types: their union; for an evolving array (let xs = []), the
 # array of its elements' union (auto[] while none).
 # (T & object or T & null, from typeof x === "object" on a type parameter)
+# A join with a type parameter's intersections: when a path's type isn't part of the declared type,
+# tsc's join reduces by subtypes (T | T & null is T)
+fn tp_join(var c: C, s: Int, ts: [Int]) -> Int:
+  let u = types.union_of(&c, ts)
+  if s < 0: return u
+  let dt = bind.type_of_sym(&c, s)
+  let dms = types.members(c, dt)
+  var subset = true
+  for m in types.members(c, u):
+    if not types.has_int(dms, m): subset = false
+  if subset: return u
+  let ms = types.members(c, u)
+  var keep: [Int] = []
+  let ws = c.subtype
+  c.subtype = true
+  for i in 0..ms.len:
+    let m = ms[i]
+    var drop = false
+    if c.tk[m] == TK_INTER and tparam_inter(c, m):
+      for j in 0..ms.len:
+        if j != i and rel.assignable(&c, m, ms[j]) and not rel.assignable(&c, ms[j], m): drop = true
+    if not drop: keep.push(m)
+  c.subtype = ws
+  return types.union_of(&c, keep)
+
 fn tparam_inter(c: C, t: Int) -> Bool:
   for m in types.members(c, t):
     if c.tk[m] == TK_INTER:
@@ -8016,6 +8241,7 @@ fn check_loop(var c: C, n: Int):
       if scoped: c.narrow.pop()
       return
     let et = check_expr(&c, c.t.nd[n].b, -1)
+    c.forin_t[n] = et
     if c.t.nd[n].f == 1: element_type(&c, et, c.t.nd[n].b)
   # the variables the loop assigns
   var assigned: [Str] = []
