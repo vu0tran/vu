@@ -1632,8 +1632,14 @@ fn type_from(var c: C, n: Int) -> Int:
             c.objs[o].args.push(rt)
             c.objs[o].eflags.push(2)
             continue
-          if c.tk[rt] == TK_TPARAM or c.tk[rt] >= types.TK_KEYOF:
-            # ...T (a variadic element): not modeled; the file stops only where it's used
+          if c.tk[rt] == TK_TPARAM:
+            # ...T (a variadic element, flag 3): made concrete when T is instantiated
+            c.objs[o].args.push(rt)
+            c.objs[o].eflags.push(3)
+            continue
+          if c.tk[rt] >= types.TK_KEYOF:
+            # (a variadic element of another generic type: not modeled; the file stops only where
+            # it's used)
             return lazy_unsupported(&c, e, "a variadic element in a tuple type")
           if c.tk[rt] != TK_OBJ: return unsupported(&c, e, "a rest element in a tuple type")
           let ro2 = c.ta[rt]
@@ -1988,8 +1994,10 @@ fn alias_tag(var c: C, t: Int, a: Int, args: [Int]) -> Int:
     var body = c.t.nd[ad].b
     while body >= 0 and c.t.nd[body].k == ast.N_TPAREN: body = c.t.nd[body].a
     if body >= 0 and c.t.nd[body].k == ast.N_TCOND: return t
-    # (a template literal type has no alias: getTemplateLiteralType)
+    # (a template literal type has no alias: getTemplateLiteralType; nor a tuple a variadic
+    # element made again, createNormalizedTupleType)
     if body >= 0 and c.t.nd[body].k == ast.N_TTEMPLATE: return t
+    if body >= 0 and c.t.nd[body].k == ast.N_TTUPLE and c.sdtype[a] >= 0 and variadic_tuple(c, c.sdtype[a]): return t
     # (so does an indexed access that resolved: { ... }[K] is the property's type)
     # (an index of several keys, T[keyof T], makes a new union, which keeps the name)
     if body >= 0 and c.t.nd[body].k == ast.N_TINDEXED and k != types.TK_INDEXED:
@@ -2723,8 +2731,15 @@ fn prop_names(var c: C, t: Int) -> [Int]:
 fn tuple_fixed(c: C, t: Int) -> Int:
   let o = c.ta[t]
   for i in 0..c.objs[o].args.len:
-    if c.objs[o].eflags[i] == 2: return i
+    if c.objs[o].eflags[i] == 2 or c.objs[o].eflags[i] == 3: return i
   return c.objs[o].args.len
+
+# A tuple with a variadic element (...T of a type parameter T).
+fn variadic_tuple(c: C, t: Int) -> Bool:
+  if c.tk[t] != TK_OBJ or c.objs[c.ta[t]].kind != OK_TUPLE: return false
+  for f in types.ints(c.objs[c.ta[t]].eflags):
+    if f == 3: return true
+  return false
 
 fn tuple_has_rest(c: C, t: Int) -> Bool:
   return tuple_fixed(c, t) < c.objs[c.ta[t]].args.len
@@ -3055,6 +3070,55 @@ fn instantiate(var c: C, t: Int, m: Int) -> Int:
       if b != a: changed = true
       args.push(b)
     if changed: r = ref_of(&c, c.objs[o].target, args)
+  elif kind == OK_TUPLE and variadic_tuple(c, t):
+    # [A, ...T]: T's elements spliced in (an array: a rest element)
+    var nargs: [Int] = []
+    var nflags: [Int] = []
+    var changed = false
+    var bad = false
+    let src_args = types.ints(c.objs[o].args)
+    let src_flags = types.ints(c.objs[o].eflags)
+    for i in 0..src_args.len:
+      let a = src_args[i]
+      let b = instantiate(&c, a, m)
+      if b != a: changed = true
+      if src_flags[i] != 3:
+        nargs.push(b)
+        nflags.push(src_flags[i])
+        continue
+      if c.tk[b] == TK_TPARAM:
+        nargs.push(b)
+        nflags.push(3)
+      elif c.tk[b] == TK_ANY or c.tk[b] == TK_UNKNOWN:
+        # (an infer type parameter not inferred: its implied constraint unknown[])
+        nargs.push(b)
+        nflags.push(2)
+      elif c.tk[b] == TK_OBJ and c.objs[c.ta[b]].kind == OK_TUPLE:
+        for j in 0..c.objs[c.ta[b]].args.len:
+          nargs.push(c.objs[c.ta[b]].args[j])
+          nflags.push(c.objs[c.ta[b]].eflags[j])
+      elif is_array_like_ref(&c, b):
+        nargs.push(c.objs[c.ta[b]].args[0])
+        nflags.push(2)
+      else: bad = true
+    if bad: r = lazy_unsupported(&c, c.objs[o].node, "a variadic element in a tuple type")
+    elif changed:
+      # (only a rest element at the end is modeled)
+      var rests = 0
+      for j in 0..nflags.len:
+        if nflags[j] == 2 or nflags[j] == 3:
+          rests += 1
+          if j != nflags.len - 1: bad = true
+      if bad or rests > 1: r = lazy_unsupported(&c, c.objs[o].node, "a variadic element in a tuple type")
+      elif nargs.len == 1 and nflags[0] == 2:
+        if c.objs[o].ro: r = readonly_array_of(&c, nargs[0])
+        else: r = array_of(&c, nargs[0])
+      else:
+        r = types.new_obj(&c, OK_TUPLE, -1, c.objs[o].node)
+        let ro = c.ta[r]
+        for a in nargs: c.objs[ro].args.push(a)
+        for f in nflags: c.objs[ro].eflags.push(f)
+        c.objs[ro].ro = c.objs[o].ro
   elif kind == OK_TUPLE:
     var args: [Int] = []
     var changed = false
@@ -3111,7 +3175,7 @@ fn instantiate(var c: C, t: Int, m: Int) -> Int:
     let m2 = types.new_mapper(&c, from, to)
     r = instantiate(&c, c.objs[o].target, m2)
   # an aliased object type keeps its alias, its arguments instantiated (instantiateTypeWithAlias)
-  if r != t and t in c.t_alias and c.tk[r] == TK_OBJ and (kind == OK_ANON or kind == OK_INST):
+  if r != t and t in c.t_alias and c.tk[r] == TK_OBJ and (kind == OK_ANON or kind == OK_INST or kind == types.OK_MAPPED):
     let rk = c.objs[c.ta[r]].kind
     if rk == OK_INST or rk == OK_ANON:
       var iargs: [Int] = []

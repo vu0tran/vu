@@ -1,0 +1,11 @@
+export {};
+type MR<T> = T extends [infer H, ...infer Tl] ? readonly [H, ...Tl] : T extends Array<infer V> ? ReadonlyArray<V> : Readonly<T>;
+const a1: boolean = null! as MR<[1, 2, 3]>;
+const a2: boolean = null! as MR<string[]>;
+const a3: boolean = null! as MR<{ x: 1 }>;
+type Pre<T extends unknown[]> = [0, ...T];
+const a4: boolean = null! as Pre<[1, 2]>;
+const a5: boolean = null! as Pre<string[]>;
+declare function tail<T extends unknown[]>(x: [unknown, ...T]): T;
+const a6: boolean = tail([1, "a", true]);
+type Last<T extends unknown[]> = T extends [...infer _, infer L] ? L : never;
