@@ -461,9 +461,19 @@ fn fn_sig(var c: C, d: Int) -> Int:
         if c.objs[c.ta[pt]].eflags[j] == 0: min = i + j + 1
     i += 1
   c.sigs[sg].min = min
-  if fn_retnode(c, d) >= 0: c.sigs[sg].ret = bind.type_from(&c, fn_retnode(c, d))
+  if fn_retnode(c, d) >= 0:
+    c.sigs[sg].ret = bind.type_from(&c, fn_retnode(c, d))
+    bind.set_pred(&c, sg, fn_retnode(c, d))
   elif c.t.nd[d].k == ast.N_CTOR: c.sigs[sg].ret = c.void_t
-  else: c.sigs[sg].ret = infer_return(&c, d)
+  else:
+    c.sigs[sg].ret = infer_return(&c, d)
+    # (a predicate inferred from the body: getTypePredicateFromBody)
+    if d in c.pred_inf and c.sigs[sg].ret == c.boolean_t:
+      let pi0 = c.pred_inf[d][0]
+      let pi1 = c.pred_inf[d][1]
+      if pi0 < c.sigs[sg].pnames.len:
+        c.sigs[sg].pred_i = pi0
+        c.sigs[sg].pred_t = pi1
   return sg
 
 # The return type a function's body gives (its return expressions, widened; void with none).
@@ -590,11 +600,20 @@ fn infer_return(var c: C, d: Int) -> Int:
     if rc >= 0 and (c.t.nd[d].f & ast.M_ASYNC) != 0: rc = awaited(&c, rc, body)
   c.ret_cstack.push(rc)
   var et = c.any_t
+  let plain_fn = not is_gen and (c.t.nd[d].f & ast.M_ASYNC) == 0
   if c.t.nd[body].k != ast.N_BLOCK:
     var bctx = rc
     if bctx >= 0 and (c.t.nd[d].f & ast.M_ASYNC) != 0: bctx = async_return_ctx(&c, bctx, body)
     et = check_expr(&c, body, bctx)
-  else: check_block(&c, body)
+    if plain_fn: probe_pred(&c, d, body, et)
+  else:
+    # (a single return and no implicit one: its expression may refine a parameter)
+    var rs0: [Int] = []
+    collect_returns(c, body, &rs0)
+    let probe = plain_fn and rs0.len == 1 and c.t.nd[rs0[0]].a >= 0 and bind_terminates(&c, body)
+    if probe: c.pred_probe.push(d)
+    check_block(&c, body)
+    if probe: c.pred_probe.pop()
   c.ret_cstack.pop()
   c.ret_stack.pop()
   swap(&saved, &c.narrow)
@@ -625,6 +644,49 @@ fn infer_return(var c: C, d: Int) -> Int:
     let gdt = bind.declared_type(&c, c.gtypes[gn])
     return bind.ref_of(&c, gdt, [yt, rt, c.unknown_t])
   return infer_body_return(&c, d, body)
+
+# getTypePredicateFromBody: a function's single returned boolean expression that narrows a
+# parameter when true, and leaves nothing of that narrowed type when false, makes it x is T.
+fn probe_pred(var c: C, d: Int, e0: Int, et: Int):
+  if et != c.boolean_t: return
+  let e = skip_parens(c, e0)
+  scan_assigns(&c)
+  var i = 0
+  for p in kids(c, fn_params(c, d)):
+    let pn = c.t.nd[p].a
+    if c.t.nd[pn].k == ast.N_ID and nm(c, c.t.nd[pn].s) == "this": continue
+    let idx = i
+    i += 1
+    if c.t.nd[pn].k != ast.N_ID or (c.t.nd[p].f & ast.M_REST) != 0: continue
+    let s = bind.lookup_value(&c, pn, c.t.nd[pn].s)
+    if s < 0 or s in c.last_assign: continue
+    let init = bind.type_of_sym(&c, s)
+    if init < 0 or init == c.boolean_t: continue
+    let key = "{s}"
+    var fs: [Fact] = []
+    facts(&c, e, true, &fs)
+    var tt = -1
+    for f in fs:
+      if f.key == key: tt = f.t
+    if tt == -1: continue
+    if tt < 0:
+      unsup(&c, e, "inferring a type predicate from a narrowing not modeled here")
+      return
+    if tt == init or same_members(c, tt, init): continue
+    c.narrow.push({})
+    set_narrow(&c, key, tt)
+    var gs: [Fact] = []
+    facts(&c, e, false, &gs)
+    c.narrow.pop()
+    var ft = tt
+    for f in gs:
+      if f.key == key: ft = f.t
+    if ft < 0 and ft != -1:
+      unsup(&c, e, "inferring a type predicate from a narrowing not modeled here")
+      return
+    if ft >= 0 and c.tk[ft] == TK_NEVER:
+      c.pred_inf[d] = [idx, tt]
+      return
 
 fn infer_body_return(var c: C, d: Int, body: Int) -> Int:
   let is_async = (c.t.nd[d].f & ast.M_ASYNC) != 0
@@ -1605,8 +1667,17 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
           let okey = fact_key(&c, c.t.nd[refside].a)
           if okey != "":
             let ot = current_type(&c, c.t.nd[refside].a)
+            # (isMatchingReferenceDiscriminant: the reference's declared type a union, its
+            # narrowed type maybe one member)
+            var decl_u = false
+            let on = skip_parens(c, c.t.nd[refside].a)
+            if c.t.nd[on].k == ast.N_ID:
+              let os = bind.lookup_value(&c, on, c.t.nd[on].s)
+              if os >= 0:
+                let odt = bind.type_of_sym(&c, os)
+                decl_u = odt >= 0 and c.tk[odt] == TK_UNION
             if ot == -7: out.push(Fact(okey + "", -7))
-            elif c.tk[ot] == TK_UNION:
+            elif c.tk[ot] == TK_UNION or (decl_u and c.tk[ot] == TK_OBJ):
               var ok: [Int] = []
               for m in types.members(c, ot):
                 let ps = prop_of(&c, m, c.t.nd[refside].s)
@@ -1700,24 +1771,31 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     let snk = c.t.nd[sn].k
     if snk == ast.N_FUNC or snk == ast.N_FUNCEXPR or snk == ast.N_ARROW: rnode = c.t.nd[sn].c
     elif snk == ast.N_METHOD or snk == ast.N_CALLSIG: rnode = c.t.nd[c.t.nd[sn].b].c
-    if rnode < 0 or c.t.nd[rnode].k != ast.N_TPRED: return
-    if c.assert_mode != (c.t.nd[rnode].f != 0): return
-    let pname = c.t.nd[rnode].s
+    let declared_pred = rnode >= 0 and c.t.nd[rnode].k == ast.N_TPRED
+    # (a predicate inferred from the function's body)
+    let inferred_pred = not declared_pred and c.sigs[sg].pred_i >= 0
+    if not declared_pred and not inferred_pred: return
+    if declared_pred and c.assert_mode != (c.t.nd[rnode].f != 0): return
+    if inferred_pred and c.assert_mode: return
     var idx = -1
-    for i in 0..c.sigs[sg].pnames.len:
-      if c.sigs[sg].pnames[i] == pname: idx = i
+    if declared_pred:
+      let pname = c.t.nd[rnode].s
+      for i in 0..c.sigs[sg].pnames.len:
+        if c.sigs[sg].pnames[i] == pname: idx = i
+    else: idx = c.sigs[sg].pred_i
     let args = kids(c, c.t.nd[e].c)
     if idx < 0 or idx >= args.len: return
     let key = fact_key(&c, args[idx])
     if key == "": return
     # (asserts x: x is truthy after the call)
-    if c.t.nd[rnode].a < 0:
+    if declared_pred and c.t.nd[rnode].a < 0:
       if c.assert_mode:
         c.assert_mode = false
         facts1(&c, args[idx], true, &out)
         c.assert_mode = true
       return
-    let pt = bind.type_from(&c, c.t.nd[rnode].a)
+    var pt = c.sigs[sg].pred_t
+    if declared_pred: pt = bind.type_from(&c, c.t.nd[rnode].a)
     let t = current_type(&c, args[idx])
     if t == -7:
       if key != "": out.push(Fact(key + "", -7))
@@ -3871,6 +3949,8 @@ fn union_sigs(var c: C, ft: Int, is_new: Bool) -> [Int]:
     per.push(ss)
   for sg in per[0]:
     var rets: [Int] = [c.sigs[sg].ret]
+    var preds: [Int] = [c.sigs[sg].pred_t]
+    var pred_same = true
     var ok = true
     for i in 1..per.len:
       var found = -1
@@ -3884,12 +3964,20 @@ fn union_sigs(var c: C, ft: Int, is_new: Bool) -> [Int]:
           fm = m
       if found < 0: ok = false
       elif c.sigs[found].ret < 0: rets.push(-1)
-      else: rets.push(bind.instantiate(&c, c.sigs[found].ret, fm))
+      else:
+        rets.push(bind.instantiate(&c, c.sigs[found].ret, fm))
+        if c.sigs[found].pred_i != c.sigs[sg].pred_i: pred_same = false
+        elif c.sigs[found].pred_i >= 0: preds.push(bind.instantiate(&c, c.sigs[found].pred_t, fm))
     if not ok: continue
     for r in rets:
       if r < 0: return []
     var cp = types.sig_copy(c, sg)
     cp.ret = types.union_of(&c, rets)
+    # (getUnionOrIntersectionTypePredicate: the same parameter in each, their types' union)
+    if not pred_same:
+      cp.pred_i = -1
+      cp.pred_t = -1
+    elif cp.pred_i >= 0: cp.pred_t = types.union_of(&c, preds)
     out.push(c.sigs.len)
     c.sigs.push(cp)
   # several signatures each: tsc's choice among them isn't modeled
@@ -4961,7 +5049,8 @@ fn infer_sigs(var c: C, p: Int, a: Int, ctor: Bool, var inf: Inf, contra: Bool, 
         infer_in(&c, ps.ptypes[i], tup, &inf, not contra, prio, orig, &seen)
         break
       if i < as_.ptypes.len: infer_in(&c, ps.ptypes[i], as_.ptypes[i], &inf, not contra, prio, orig, &seen)
-    if ps.ret >= 0 and as_.ret >= 0: infer_in(&c, ps.ret, as_.ret, &inf, contra, prio, orig, &seen)
+    if ps.pred_i >= 0 and as_.pred_i >= 0: infer_in(&c, ps.pred_t, as_.pred_t, &inf, contra, prio, orig, &seen)
+    elif ps.ret >= 0 and as_.ret >= 0: infer_in(&c, ps.ret, as_.ret, &inf, contra, prio, orig, &seen)
 
 fn could_contain_tvars(var c: C, t: Int) -> Bool:
   if t in c.tvar_cache: return c.tvar_cache[t]
@@ -6116,6 +6205,7 @@ fn check_stmt(var c: C, n: Int):
       let in_async = ef >= 0 and (c.t.nd[ef].f & ast.M_ASYNC) != 0
       if in_async and ctx >= 0: ctx = async_return_ctx(&c, ctx, n)
       var et = check_expr(&c, c.t.nd[n].a, ctx)
+      if ef >= 0 and c.pred_probe.len > 0 and c.pred_probe[c.pred_probe.len - 1] == ef: probe_pred(&c, ef, c.t.nd[n].a, et)
       if in_async: et = awaited(&c, et, c.t.nd[n].a)
       # (an async function's promised type, awaited: a type parameter T is Awaited<T>)
       var dec = declared
