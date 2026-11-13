@@ -744,8 +744,13 @@ fn awaited(var c: C, t: Int, at: Int) -> Int:
   if k == TK_TPARAM or k == types.TK_COND:
     let ag = awaited_generic(&c, t)
     if ag >= 0: return ag
-  if k == TK_TPARAM or k == TK_INTER or k >= types.TK_KEYOF: return unsup(&c, at, "awaiting a generic type")
-  if k != TK_OBJ: return t
+  let plain_inter = k == TK_INTER and not is_generic_member(c, t)
+  if k == TK_TPARAM or (k == TK_INTER and not plain_inter) or k >= types.TK_KEYOF: return unsup(&c, at, "awaiting a generic type")
+  if k != TK_OBJ and not plain_inter: return t
+  if plain_inter:
+    let then0 = ast.intern(&c.t, "then")
+    if bind.get_prop(&c, t, then0) >= 0: return unsup(&c, at, "awaiting a thenable")
+    return t
   let o = c.ta[t]
   if c.objs[o].kind == OK_REF and c.objs[o].args.len == 1:
     let tsym = c.objs[c.ta[c.objs[o].target]].sym
@@ -1087,6 +1092,7 @@ fn terminates(c: C, n: Int) -> Bool:
   if n < 0: return false
   let k = c.t.nd[n].k
   if k == ast.N_RETURN or k == ast.N_THROW: return true
+  if k == ast.N_EXPRSTMT and n in c.never_stmts: return true
   if k == ast.N_BLOCK:
     for st in ast.items(c.t, c.t.nd[n].a):
       if terminates(c, st): return true
@@ -1100,7 +1106,7 @@ fn terminates(c: C, n: Int) -> Bool:
     return c.t.nd[cond].k == ast.N_TRUE and not has_break(c, c.t.nd[n].b)
   if k == ast.N_FOR:
     return c.t.nd[n].b < 0 and not has_break(c, c.t.nd[n].d)
-  if k == ast.N_DO: return terminates(c, c.t.nd[n].a) and not has_break(c, c.t.nd[n].a)
+  if k == ast.N_DO: return (terminates(c, c.t.nd[n].a) or c.t.nd[c.t.nd[n].b].k == ast.N_TRUE) and not has_break(c, c.t.nd[n].a)
   if k == ast.N_SWITCH:
     var has_default = false
     let cases = ast.items(c.t, c.t.nd[n].b)
@@ -1119,6 +1125,58 @@ fn terminates(c: C, n: Int) -> Bool:
         if not ends: return false
     return true
   if k == ast.N_LABEL: return terminates(c, c.t.nd[n].a)
+  return false
+
+# getEffectsSignature for a call statement: the callee a dotted name whose every part has an
+# explicit type, with one non-generic signature, or overloads one of which returns never.
+fn never_call(var c: C, ce: Int) -> Bool:
+  let ft = dotted_explicit_type(&c, c.t.nd[ce].a, 0)
+  if ft < 0: return false
+  let aft = rel.apparent(&c, ft)
+  let sgs = bind.sigs_of(&c, aft, false)
+  if sgs.len == 1 and c.sigs[sgs[0]].tparams.len == 0: return true
+  for sg in sgs:
+    let r = c.sigs[sg].ret
+    if r >= 0 and c.tk[r] == TK_NEVER: return true
+  return false
+
+# getTypeOfDottedName: -1 where a part has no explicit type
+fn dotted_explicit_type(var c: C, e: Int, depth: Int) -> Int:
+  if depth > 20: return -1
+  let k = c.t.nd[e].k
+  if k == ast.N_PAREN: return dotted_explicit_type(&c, c.t.nd[e].a, depth + 1)
+  if k == ast.N_ID:
+    var s = bind.lookup_value(&c, e, c.t.nd[e].s)
+    s = bind.resolve_alias(&c, s)
+    if s < 0 or not explicit_sym(c, s): return -1
+    return bind.type_of_sym(&c, s)
+  if k == ast.N_THIS:
+    let tc = bind.this_container(c, e)
+    if tc < 0: return -1
+    let p = bind.up(c, tc)
+    if p < 0 or (c.t.nd[p].k != ast.N_CLASS and c.t.nd[p].k != ast.N_CLASSEXPR): return -1
+    return check_expr(&c, e, -1)
+  if k == ast.N_PROPACCESS:
+    if (c.t.nd[e].f & 3) != 0: return -1
+    let lt = dotted_explicit_type(&c, c.t.nd[e].a, depth + 1)
+    if lt < 0: return -1
+    let ap = rel.apparent(&c, lt)
+    let ps = bind.get_prop(&c, ap, c.t.nd[e].s)
+    if ps < 0 or not explicit_sym(c, ps): return -1
+    return bind.prop_type_for(&c, ps, ap)
+  return -1
+
+# getExplicitTypeOfSymbol: a function, method, class or namespace, or a declaration with a type
+# annotation
+fn explicit_sym(c: C, s: Int) -> Bool:
+  if (c.sk[s] & (types.S_FUNC | types.S_METHOD | types.S_CLASS | types.S_NAMESPACE)) != 0: return true
+  # (a module's namespace object, import * as m)
+  if s in c.ns_file: return true
+  let d = c.sdecl[s]
+  if d < 0: return false
+  let k = c.t.nd[d].k
+  if k == ast.N_FUNC or k == ast.N_METHOD or k == ast.N_CLASS or k == ast.N_MODULE: return true
+  if k == ast.N_DECL or k == ast.N_PARAM or k == ast.N_PROP: return c.t.nd[d].b >= 0
   return false
 
 fn has_break(c: C, n: Int) -> Bool:
@@ -8017,10 +8075,13 @@ fn check_missing_return(var c: C, d: Int, declared: Int, body: Int):
   let rn = fn_retnode(c, d)
   if rn >= 0 and c.t.nd[rn].k == ast.N_TPRED and (c.t.nd[rn].f & 1) != 0: return
   let k = c.tk[declared]
-  if k == TK_ANY or k == TK_ERROR or k == TK_UNSUP or k == TK_UNDEF or k == TK_NEVER: return
+  if k == TK_ANY or k == TK_ERROR or k == TK_UNSUP or k == TK_UNDEF: return
   for m in types.members(c, declared):
     if c.tk[m] == TK_VOID: return
   if terminates(c, body): return
+  if k == TK_NEVER:
+    err(&c, fn_retnode(c, d), 2534, "A function returning 'never' cannot have a reachable end point.")
+    return
   var rets: [Int] = []
   collect_returns(c, body, &rets)
   if rets.len == 0:
@@ -8341,10 +8402,15 @@ fn check_stmt(var c: C, n: Int):
     for d in kids(c, c.t.nd[n].a): check_var_decl(&c, d, c.t.nd[n].f)
     return
   if k == ast.N_EXPRSTMT:
-    check_expr(&c, c.t.nd[n].a, -1)
+    let et0 = check_expr(&c, c.t.nd[n].a, -1)
     # a call to an assertion function narrows what follows
     var ce = c.t.nd[n].a
     while c.t.nd[ce].k == ast.N_PAREN: ce = c.t.nd[ce].a
+    # (a call returning never: what follows is unreachable)
+    if c.t.nd[ce].k == ast.N_CALL and c.tk[et0] == TK_NEVER and never_call(&c, ce):
+      c.never_stmts[n] = true
+      if c.narrow.len > 0: set_narrow(&c, "!u", 1)
+      return
     if c.t.nd[ce].k == ast.N_CALL:
       var af: [Fact] = []
       c.assert_mode = true
