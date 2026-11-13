@@ -1,0 +1,11 @@
+export {};
+const CA = Symbol('a');
+type W<T> = { v: T };
+declare const w: W<typeof CA>;
+const b1: boolean = w;
+declare const a: Array<typeof CA>;
+const b2: boolean = a;
+declare const p: Partial<Record<typeof CA, 1>>;
+const b3: boolean = p;
+declare const q: Promise<typeof CA>;
+const b4: boolean = q;
