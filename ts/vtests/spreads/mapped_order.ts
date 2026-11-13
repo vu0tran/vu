@@ -1,0 +1,12 @@
+export {};
+declare const r: Record<"aa", unknown>;
+declare const r2: { x: 1 } & Record<"aa", unknown>;
+declare const r3: { x: 1 } & Partial<{ aa: 1 }>;
+declare const r4: Partial<{ aa: 1 }>;
+declare const r5: Record<"aa"|"bb", unknown>;
+const a1: boolean = { dd: 2, ...r, cc: 1 };
+const a2: boolean = { dd: 2, ...r2, cc: 1 };
+const a3: boolean = { dd: 2, ...r3, cc: 1 };
+const a4: boolean = { dd: 2, ...r4, cc: 1 };
+const a5: boolean = { dd: 2, ...r5, cc: 1 };
+const a6: boolean = { dd: 2, ...r2, cc: 1, ...r5, ee: 1 };

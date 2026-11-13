@@ -1,0 +1,10 @@
+export {};
+declare const v: object & Record<"aa", unknown>;
+declare const w: object & Record<"bb", unknown>;
+declare const o: { aa: unknown };
+declare const c: boolean;
+const a1: boolean = c ? v : { ...w, aa: 2 };
+const n2 = c ? v : { ...w, aa: 2 };
+const a2: boolean = n2;
+const n3 = c ? o : { ...o, bb: 2 };
+const a3: boolean = n3;

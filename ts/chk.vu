@@ -2349,7 +2349,7 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
     if c.tk[u] == TK_UNION and not (u in c.freg):
       var objs = 0
       for m in types.members(c, u):
-        if c.tk[m] == TK_OBJ: objs += 1
+        if c.tk[m] == TK_OBJ or obj_inter(c, m): objs += 1
       if objs > 1: return subtype_reduce(&c, types.members(c, u))
     return u
   if k == ast.N_AS or k == ast.N_SATISFIES:
@@ -3660,6 +3660,8 @@ fn inter_spread_obj(var c: C, st: Int) -> Int:
   var sidx = -1
   var sname0 = -1
   for m in ms:
+    # (object & {...}: object adds nothing to a spread)
+    if m == c.nonprim_t: continue
     if c.tk[m] != TK_OBJ: return -1
     let k = c.objs[c.ta[m]].kind
     if k == types.OK_TUPLE or k == types.OK_MAPPED or rel.is_array_ref(&c, m) or rel.generic_object(c, m): return -1
@@ -3676,21 +3678,26 @@ fn inter_spread_obj(var c: C, st: Int) -> Int:
   for name in names:
     var pts: [Int] = []
     var all_opt = true
+    var from_mapped = false
     var first = -1
     for m in ms:
+      if m == c.nonprim_t: continue
       let ps = bind.get_prop(&c, m, name)
       if ps < 0: continue
       if (c.sflags[ps] & (types.SF_PRIVATE | types.SF_PROTECTED)) != 0: return -1
       if first < 0: first = ps
       pts.push(bind.prop_type_for(&c, ps, st))
       if (c.sflags[ps] & SF_OPTIONAL) == 0: all_opt = false
+      if ps in c.order_decl: from_mapped = true
     let sym = types.new_sym(&c, S_PROP, name, c.sdecl[first])
+    if first in c.order_decl: c.order_decl[sym] = c.order_decl[first]
     if pts.len == 1: c.stype[sym] = pts[0]
     else: c.stype[sym] = types.inter_of(&c, pts)
     if all_opt:
       c.sflags[sym] = SF_OPTIONAL
       # (spread from a union's member, tsc prints the undefined)
-      if not c.union_spread: c.bare_opt[sym] = true
+      # (a mapped type's optional property has the undefined in its type)
+      if not c.union_spread and not from_mapped: c.bare_opt[sym] = true
     types.add_prop(&c, t, name, sym)
   c.objs[c.ta[t]].sidx = sidx
   c.objs[c.ta[t]].sname = sname0
@@ -3811,6 +3818,7 @@ fn spread_into(var c: C, t: Int, st0: Int, var written: {Int: Bool}) -> Bool:
     var nk = S_PROP
     if (c.sk[sp] & S_METHOD) != 0: nk = S_METHOD
     let ns = types.new_sym(&c, nk, name, c.sdecl[sp])
+    if sp in c.order_decl: c.order_decl[ns] = c.order_decl[sp]
     c.stype[ns] = pt
     if opt: c.sflags[ns] = SF_OPTIONAL
     if sp in c.bare_opt and (fl & SF_OPTIONAL) != 0: c.bare_opt[ns] = true
@@ -3834,9 +3842,10 @@ fn sort_props(var c: C, t: Int):
   c.objs[o].order = names
 
 fn decl_before(c: C, a: Int, b: Int) -> Bool:
-  let da = c.sdecl[a]
-  let db = c.sdecl[b]
-  if da < 0 or db < 0: return false
+  let da = types.order_decl_of(c, a)
+  let db = types.order_decl_of(c, b)
+  # (a mapped type's property over keys of no declaration: after all those with one)
+  if da < 0 or db < 0: return da >= 0
   let fa = c.t.nd[da].file
   let fb = c.t.nd[db].file
   if fa != fb: return fa < fb
@@ -4041,6 +4050,13 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
 
 # An array literal's element type: the union with members that are subtypes of others removed
 # (two identical function types become one).
+# An intersection of object types (object among them).
+fn obj_inter(c: C, t: Int) -> Bool:
+  if c.tk[t] != TK_INTER: return false
+  for m in types.members_inter(c, t):
+    if m != c.nonprim_t and c.tk[m] != TK_OBJ: return false
+  return true
+
 fn subtype_reduce(var c: C, ts: [Int]) -> Int:
   let u = types.union_of(&c, ts)
   let ms = types.members(c, u)
@@ -4058,11 +4074,35 @@ fn subtype_reduce(var c: C, ts: [Int]) -> Int:
       for j in 0..ms.len:
         if j == i: continue
         let n2 = ms[j]
+        if obj_inter(c, n2):
+          # (object & Record<"k", unknown> and the like: a target only)
+          if rel.assignable(&c, m, n2) and not rel.assignable(&c, n2, m): drop = true
+          continue
         if c.tk[n2] != TK_OBJ or c.objs[c.ta[n2]].fresh: continue
         if rel.assignable(&c, m, n2):
           if not rel.assignable(&c, n2, m) or j < i: drop = true
+    if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].fresh and not drop:
+      # a fresh literal: a subtype when its written properties aren't excess (those it got from a
+      # spread aren't checked, shouldCheckAsExcessProperty)
+      for j in 0..ms.len:
+        if j == i or drop: continue
+        let n2 = ms[j]
+        if not obj_inter(c, n2) and (c.tk[n2] != TK_OBJ or c.objs[c.ta[n2]].fresh): continue
+        if not written_known(&c, m, n2): continue
+        if rel.assignable(&c, m, n2) and not rel.assignable(&c, n2, m): drop = true
     if not drop: keep.push(m)
   return types.union_of(&c, keep)
+
+fn written_known(var c: C, lit: Int, t: Int) -> Bool:
+  for name in bind.prop_names(&c, lit):
+    let ps = bind.get_prop(&c, lit, name)
+    if ps < 0 or ps in c.spread_syms: continue
+    var known = false
+    for m in types.members_inter(c, t):
+      if c.tk[m] != TK_OBJ: continue
+      if bind.get_prop(&c, m, name) >= 0 or bind.index_type(&c, m, false) >= 0: known = true
+    if not known: return false
+  return true
   return bind.array_of(&c, h12_)
 
 fn could_keep_literal(var c: C, t: Int) -> Bool:
@@ -9214,6 +9254,9 @@ fn check_loop0(var c: C, n: Int):
   var plain_props: [Str] = []
   for key in assigned:
     if key in head: continue
+    # (a variable declared inside the loop, a nested function's parameter: made anew each time)
+    let ksym = int(key) else -1
+    if ksym >= 0 and c.sdecl[ksym] >= 0 and inside(c, c.sdecl[ksym], n): continue
     if head_exit and key.find(".") >= 0:
       let v0 = narrowed(c, key)
       if v0 == -1 or v0 == -9:
