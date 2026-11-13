@@ -3960,6 +3960,20 @@ fn ctx_prop1(var c: C, m: Int, name: Int) -> Int:
   if ps >= 0: return bind.type_of_sym(&c, ps)
   return bind.index_type(&c, m, false)
 
+# A spread member's element type in an array literal (-1: not modeled).
+fn spread_elems(var c: C, t: Int) -> Int:
+  if rel.is_array_ref(&c, t): return c.objs[c.ta[t]].args[0]
+  if c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == OK_TUPLE:
+    let so = c.ta[t]
+    var es: [Int] = []
+    for k in 0..c.objs[so].args.len:
+      if c.objs[so].eflags[k] != 0: return -1
+      es.push(c.objs[so].args[k])
+    return types.union_of(&c, es)
+  if c.tk[t] == TK_STRING or c.tk[t] == TK_STRLIT: return c.string_t
+  if c.tk[t] == TK_OBJ: return iterated(&c, t)
+  return -1
+
 fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
   # a tuple when the contextual type is a tuple
   var tuple_ctx = -1
@@ -4013,6 +4027,17 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
         let it = iterated(&c, st)
         if it >= 0:
           ts.push(it)
+          continue
+      # a union: each member's elements (T[number] distributes)
+      if c.tk[st] == TK_UNION:
+        var ums: [Int] = []
+        var ok = true
+        for m in types.members(c, st):
+          let me = spread_elems(&c, m)
+          if me < 0: ok = false
+          else: ums.push(me)
+        if ok:
+          ts.push(types.union_of(&c, ums))
           continue
       return unsup(&c, el, "a spread in an array literal of this type")
     if c.t.nd[el].k == ast.N_OMIT: return unsup(&c, el, "a hole in an array literal")
@@ -8313,12 +8338,27 @@ fn check_declarations(var c: C, root: Int):
               for cid in caught:
                 if c.t.nd[cid].s == c.t.nd[id].s: bind.err(&c, d, 2492, "Cannot redeclare identifier '" + nm(c, c.t.nd[id].s) + "' in catch clause.")
     if k == ast.N_VAR and bind.decl_kind_of_var(c, n) == S_VAR: var_shadow(&c, n)
-    if k == ast.N_CLASS or k == ast.N_CLASSEXPR: class_dups(&c, n)
+    if k == ast.N_CLASS or k == ast.N_CLASSEXPR:
+      class_dups(&c, n)
+      if n in c.nsym:
+        let cs = c.nsym[n]
+        let ct = bind.self_type(&c, cs)
+        let cb = c.t.nd[n].b >= 0 or c.t.nd[n].c >= 0
+        index_constraints(&c, ct, [c.t.nd[n].d], cb, n)
     elif k == ast.N_INTERFACE:
       # (merged declarations are one member table: checked at the first one)
       let lists = interface_lists(&c, n)
-      if lists.len > 0 and lists[0] == c.t.nd[n].c: check_members(&c, lists, false, true)
-    elif k == ast.N_TOBJ: check_members(&c, [c.t.nd[n].a], false, true)
+      if lists.len > 0 and lists[0] == c.t.nd[n].c:
+        check_members(&c, lists, false, true)
+        if n in c.nsym:
+          let is = c.nsym[n]
+          let it = bind.self_type(&c, is)
+          let ib = lists.len > 1 or c.t.nd[n].b >= 0
+          index_constraints(&c, it, lists, ib, n)
+    elif k == ast.N_TOBJ:
+      check_members(&c, [c.t.nd[n].a], false, true)
+      let ot = bind.type_from(&c, n)
+      index_constraints(&c, ot, [c.t.nd[n].a], false, n)
     elif k == ast.N_OBJECT: object_dups(&c, n)
     let tl = bind.tparams_of(c, n)
     if tl >= 0:
@@ -8582,6 +8622,71 @@ fn method_overloads(var c: C, decls: [Int], ctor: Bool):
     if r < 0:
       unsup(&c, d, "an overload compared with its implementation through a callback parameter")
       return
+
+# checkIndexConstraints: each property (its type with undefined when optional) assignable to the
+# index signatures that apply to its name (TS2411, at the property), and a number index type to the
+# string one (TS2413, at the number index signature). With bases or merged declarations, where
+# tsc reports isn't modeled: a violation leaves the file unchecked.
+fn index_constraints(var c: C, t: Int, lists: [Int], bases: Bool, at: Int):
+  if t < 0 or c.tk[t] != TK_OBJ: return
+  let si = bind.index_type(&c, t, false)
+  let ni = bind.index_type(&c, t, true)
+  if si < 0 and ni < 0: return
+  var mine: {Int: Bool} = {}
+  var sdecl = -1
+  var ndecl = -1
+  for l in lists:
+    for m in kids(c, l):
+      mine[m] = true
+      if c.t.nd[m].k == ast.N_INDEXSIG:
+        if (c.t.nd[m].f & ast.M_STATIC) != 0: continue
+        let ps = kids(c, c.t.nd[m].a)
+        if ps.len != 1 or c.t.nd[ps[0]].b < 0: continue
+        let kt = bind.type_from(&c, c.t.nd[ps[0]].b)
+        if kt == c.string_t: sdecl = m
+        elif kt == c.number_t: ndecl = m
+  for name in bind.prop_names(&c, t):
+    let ps = bind.get_prop(&c, t, name)
+    if ps < 0: continue
+    let d = c.sdecl[ps]
+    if d >= 0 and c.t.nd[d].k == ast.N_PROP and c.t.nd[c.t.nd[d].a].k == ast.N_COMPUTED: continue
+    var pt = bind.type_of_sym(&c, ps)
+    if c.tk[pt] == TK_UNSUP: return
+    if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+    let text = c.t.names[name] + ""
+    if text.startswith("#"): continue
+    var infos: [Int] = []
+    var keys: [Str] = []
+    if si >= 0:
+      infos.push(si)
+      keys.push("string")
+    if ni >= 0 and is_numeric_name(text):
+      infos.push(ni)
+      keys.push("number")
+    for i in 0..infos.len:
+      if rel.assignable(&c, pt, infos[i]): continue
+      let local = d >= 0 and d in mine
+      if bases or not local:
+        unsup(&c, at, "an index signature its own or inherited properties don't fit (where tsc reports)")
+        return
+      var en = d
+      if c.t.nd[d].a >= 0: en = c.t.nd[d].a
+      let a1 = show.show(&c, pt)
+      let a2 = show.show(&c, infos[i])
+      # (symbolToString: the name as written, a string literal with its quotes)
+      var shown = show.prop_key(text)
+      if c.t.nd[en].k == ast.N_STR:
+        let q = chr(c.t.nd[en].f)
+        shown = q + text + q
+      elif c.t.nd[en].k == ast.N_NUM: shown = text
+      err(&c, en, 2411, "Property '" + shown + "' of type '" + a1 + "' is not assignable to '" + keys[i] + "' index type '" + a2 + "'.")
+  if si >= 0 and ni >= 0 and not rel.assignable(&c, ni, si):
+    if bases or ndecl < 0 or sdecl < 0:
+      unsup(&c, at, "an index signature its own or inherited properties don't fit (where tsc reports)")
+      return
+    let b1 = show.show(&c, ni)
+    let b2 = show.show(&c, si)
+    err(&c, ndecl, 2413, "'number' index type '" + b1 + "' is not assignable to 'string' index type '" + b2 + "'.")
 
 fn interface_lists(var c: C, n: Int) -> [Int]:
   var lists: [Int] = []

@@ -1,0 +1,17 @@
+export {};
+declare const t: { ids?: string[] };
+declare const u: { ids?: readonly string[] };
+const a = [...new Set([...(t.ids ?? []), ...(u.ids ?? [])])];
+const b: boolean = a;
+declare const m: Map<string, number>;
+const c: boolean = [...m];
+const d: boolean = [...m.keys(), 1];
+declare const s: Set<"x" | "y">;
+const e: boolean = [...s];
+const f: boolean = [..."abc"];
+declare const x1: [1, 2] | string[];
+const g: boolean = [...x1];
+declare const x2: Set<number> | number[] | undefined;
+const h: boolean = [...(x2 ?? [])];
+declare const x3: [] | [boolean];
+const i: boolean = [0, ...x3];
