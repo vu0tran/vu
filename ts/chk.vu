@@ -4402,7 +4402,18 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
   for el in kids(c, c.t.nd[n].a):
     if c.t.nd[el].k == ast.N_SPREAD:
       # ...xs: xs's element type (an array, or a tuple's elements), outside a tuple context
-      if tuple_ctx >= 0: return unsup(&c, el, "a spread in a tuple")
+      if tuple_ctx >= 0:
+        # (a tuple of fixed elements, in a tuple context: its elements, as they are)
+        let st0 = check_expr(&c, c.t.nd[el].a, -1)
+        c.ntype[el] = st0
+        if not (c.tk[st0] == TK_OBJ and c.objs[c.ta[st0]].kind == OK_TUPLE and bind.tuple_fixed(c, st0) == c.objs[c.ta[st0]].args.len): return unsup(&c, el, "a spread in a tuple")
+        let so0 = c.ta[st0]
+        for k in 0..c.objs[so0].args.len:
+          if c.objs[so0].eflags[k] != 0: return unsup(&c, el, "a spread in a tuple")
+          ts.push(c.objs[so0].args[k])
+          ecs.push(-1)
+          i += 1
+        continue
       let st = check_expr(&c, c.t.nd[el].a, ctx)
       c.ntype[el] = st
       if is_any(c, st):
@@ -5467,6 +5478,28 @@ fn check_args(var c: C, sg: Int, args: [Int], report: Bool):
       rel.report(&c, at, pt, an, an, 2345)
       reported = true
 
+# A const type parameter (<const T>): an argument it's the contextual type of is in a const
+# context, and its inferences aren't widened.
+fn is_const_tp(c: C, t: Int) -> Bool:
+  if c.tk[t] != TK_TPARAM: return false
+  let d = c.sdecl[c.ta[t]]
+  return d >= 0 and c.t.nd[d].k == ast.N_TPARAM and (c.t.nd[d].f & ast.M_CONST) != 0
+
+# An argument whose contextual type is a const type parameter: as `as const`, but a top-level
+# array literal stays mutable where the constraint is a mutable array (checkArrayLiteral).
+fn const_arg(var c: C, e: Int, tp: Int) -> Int:
+  if context_sensitive(c, e): return unsup(&c, e, "a context-sensitive argument for a const type parameter")
+  let t = const_type(&c, e)
+  let x = skip_parens(c, e)
+  if c.t.nd[x].k == ast.N_ARRAY and c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == OK_TUPLE:
+    let con = rel.constraint_of(&c, tp)
+    var mut_ = false
+    if con >= 0:
+      for m in types.members(c, con):
+        if c.tk[m] == TK_OBJ and ((rel.is_array_ref(&c, m) and not rel.is_readonly_array(&c, m)) or (c.objs[c.ta[m]].kind == OK_TUPLE and not c.objs[c.ta[m]].ro)): mut_ = true
+    if mut_: c.objs[c.ta[t]].ro = false
+  return t
+
 # Infers a generic signature's type arguments from the arguments and instantiates it.
 fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
   let tps = types.ints(c.sigs[sg].tparams)
@@ -5508,6 +5541,9 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
     # (...args: { [K in keyof T]: X }: the same, through the mapped type)
     if c.tk[rt0] == TK_OBJ and c.objs[c.ta[rt0]].kind == types.OK_MAPPED: rest_at = s0.ptypes.len - 1
   var rest_types: {Int: Int} = {}
+  var any_const = false
+  for tp in tps:
+    if is_const_tp(c, tp): any_const = true
   if this_in >= 0 and c.sigs[sg].this_t >= 0:
     var seen_t: {Int: Bool} = {}
     infer_in(&c, c.sigs[sg].this_t, this_in, &inf, false, 0, c.sigs[sg].this_t, &seen_t)
@@ -5518,6 +5554,9 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
       if rest_at >= 0 and i >= rest_at:
         var pt1 = -1
         let rk = s0.ptypes[rest_at]
+        if is_const_tp(c, rk):
+          rest_types[i] = unsup(&c, args[i], "a rest parameter typed as a const type parameter")
+          continue
         if c.tk[rk] == TK_TPARAM: pt1 = raw_param_at(&c, sg, i)
         if pass == 1 and pt1 >= 0:
           c.inf_fixing = true
@@ -5545,7 +5584,15 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
         clear_ctx_params(&c, args[i])
       let saved_rm = c.ret_mapper
       c.ret_mapper = rmap
-      var at = check_expr(&c, args[i], pt)
+      let rawp = raw_param_at(&c, sg, i)
+      var at = -1
+      if is_const_tp(c, rawp): at = const_arg(&c, args[i], rawp)
+      else:
+        if any_const and could_contain_tvars(&c, rawp):
+          let ak = c.t.nd[skip_parens(c, args[i])].k
+          if not (ak == ast.N_ID or ak == ast.N_PROPACCESS or ak == ast.N_ELEMACCESS or ak == ast.N_CALL or ak == ast.N_NEW or ak == ast.N_THIS):
+            at = unsup(&c, args[i], "an argument in a const type parameter's context inside a parameter type")
+        if at < 0: at = check_expr(&c, args[i], pt)
       c.ret_mapper = saved_rm
       if rmap >= 0 and (types.is_fresh_lit(c, at) or at in c.freg):
         let rp0 = raw_param_at(&c, sg, i)
@@ -5663,7 +5710,7 @@ fn inf_mapper(var c: C, var inf: Inf, sg: Int) -> Int:
     var con = rel.constraint_of(&c, tp)
     if con >= 0 and sg in c.sig_outer: con = bind.instantiate(&c, con, c.sig_outer[sg])
     if inf.cov[i].len > 0:
-      let prim = con >= 0 and prim_constraint(&c, con)
+      let prim = (con >= 0 and prim_constraint(&c, con)) or is_const_tp(c, tp)
       let widen_lits = not prim and inf.top[i] and (c.inf_fixing or not (ret >= 0 and at_top_level(c, ret, tp)))
       var base: [Int] = []
       for x in inf.cov[i]:
