@@ -1720,6 +1720,64 @@ fn typeof_narrow_flat(var c: C, t: Int, what: Str, pos: Bool) -> Int:
     return types.union_of(&c, k2)
   return types.union_of(&c, keep)
 
+# x.p === undefined (null; == either): x's members whose p may be that (pos), or may be
+# something else (not pos), when p is a discriminant (its type a unit type in some member,
+# not the same in all).
+fn null_disc(var c: C, refside: Int, vk: Int, pos: Bool, loose: Bool, var out: [Fact]):
+  let obj = c.t.nd[refside].a
+  let okey = fact_key(&c, obj)
+  if okey == "": return
+  let ot = current_type(&c, obj)
+  if ot == -7:
+    out.push(Fact(okey + "", -7))
+    return
+  if c.tk[ot] != TK_UNION: return
+  let name = c.t.nd[refside].s
+  let opt_chain = (c.t.nd[refside].f & 1) != 0
+  var pts: [Int] = []
+  var unit = false
+  for m in types.members(c, ot):
+    let mk = c.tk[m]
+    if mk == TK_NULL or mk == TK_UNDEF or mk == TK_VOID: continue
+    if is_generic_member(c, m) or (mk != TK_OBJ and mk != TK_INTER): return
+    let ps = prop_of(&c, m, name)
+    if ps < 0: return
+    var pt = bind.type_of_sym(&c, ps)
+    if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+    var all_unit = true
+    for pm in types.members(c, pt):
+      if not types.is_literal(c, pm) and c.tk[pm] != TK_UNDEF and c.tk[pm] != TK_NULL: all_unit = false
+    if all_unit: unit = true
+    pts.push(pt)
+  if not unit or pts.len < 2: return
+  var uniform = true
+  for p0 in pts:
+    if p0 != pts[0]: uniform = false
+  if uniform: return
+  var ok: [Int] = []
+  var i = 0
+  for m in types.members(c, ot):
+    let mk = c.tk[m]
+    if mk == TK_NULL or mk == TK_UNDEF or mk == TK_VOID:
+      # (x?.p === undefined: x may be null or undefined)
+      if opt_chain and pos and (vk == TK_UNDEF or loose): ok.push(m)
+      continue
+    let pt = pts[i]
+    i += 1
+    var may = false
+    var other = false
+    for pm in types.members(c, pt):
+      let pk = c.tk[pm]
+      var hit = pk == vk or (vk == TK_UNDEF and pk == TK_VOID)
+      if loose: hit = pk == TK_NULL or pk == TK_UNDEF or pk == TK_VOID
+      if pk == TK_ANY or pk == TK_UNKNOWN:
+        may = true
+        other = true
+      elif hit: may = true
+      else: other = true
+    if (pos and may) or (not pos and other): ok.push(m)
+  out.push(Fact(okey, types.union_of(&c, ok)))
+
 fn discriminant_truthiness(var c: C, e: Int, truth: Bool, var out: [Fact]):
   let o = c.t.nd[e].a
   let okey = fact_key(&c, o)
@@ -1906,6 +1964,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
           if is_match == pos: keep.push(m)
         let uk = types.union_of(&c, keep)
         out.push(Fact(key, keep_fresh(&c, t, uk)))
+        # a discriminant: x.kind === undefined narrows x (narrowTypeByDiscriminantProperty)
+        if c.t.nd[refside].k == ast.N_PROPACCESS: null_disc(&c, refside, vk, pos, loose, &out)
         return
       if types.is_literal(c, vt):
         let rv = types.regular(c, vt)
@@ -2061,14 +2121,22 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
         if c.sigs[sg].pnames[i] == pname: idx = i
     else: idx = c.sigs[sg].pred_i
     let args = kids(c, c.t.nd[e].c)
-    if idx < 0 or idx >= args.len: return
-    let key = fact_key(&c, args[idx])
+    # (this is T: the method's object)
+    var refn = -1
+    if declared_pred and c.t.nd[rnode].s < 0:
+      let cal = c.t.nd[e].a
+      if c.t.nd[cal].k == ast.N_PROPACCESS: refn = c.t.nd[cal].a
+      if refn < 0: return
+    else:
+      if idx < 0 or idx >= args.len: return
+      refn = args[idx]
+    let key = fact_key(&c, refn)
     if key == "": return
     # (asserts x: x is truthy after the call)
     if declared_pred and c.t.nd[rnode].a < 0:
       if c.assert_mode:
         c.assert_mode = false
-        facts1(&c, args[idx], true, &out)
+        facts1(&c, refn, true, &out)
         c.assert_mode = true
       return
     var pt = c.sigs[sg].pred_t
@@ -2078,7 +2146,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
     if e in c.resolved_sig:
       let rs = c.resolved_sig[e]
       if c.sigs[rs].pred_i == idx and c.sigs[sg].tparams.len > 0: pt = c.sigs[rs].pred_t
-    let t = current_type(&c, args[idx])
+    let t = current_type(&c, refn)
     if t == -7:
       if key != "": out.push(Fact(key + "", -7))
       return
@@ -2095,7 +2163,8 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
       for m in types.members(c, t):
         let mk = c.tk[m]
         let deferred = mk == types.TK_COND or mk == types.TK_INDEXED
-        let tpi = mk == TK_INTER and tparam_inter(c, m)
+        # (a type parameter's intersection with object types, this & { ... }: as the parameter)
+        let tpi = mk == TK_INTER and (tparam_inter(c, m) or tp_obj_inter(c, m))
         if is_generic_member(c, m) and mk != TK_TPARAM and not deferred and not tpi:
           generic_fact(&c, e, key, &out)
           return
@@ -2128,7 +2197,7 @@ fn facts1(var c: C, e: Int, truth: Bool, var out: [Fact]):
             let fits1 = rel.assignable(&c, pt, b0)
             c.subtype = ws1
             if fits1: inters.push(types.inter_of(&c, [m, pt]))
-          elif c.tk[m] == TK_INTER and tparam_inter(c, m):
+          elif c.tk[m] == TK_INTER and (tparam_inter(c, m) or tp_obj_inter(c, m)):
             # T & object, T & null: the same with T's base constraint
             var parts: [Int] = []
             var bad = false
@@ -2518,7 +2587,13 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
   if k == ast.N_DELETE:
     check_expr(&c, c.t.nd[n].a, -1)
     return c.boolean_t
-  if k == ast.N_THIS: return this_type(&c, n)
+  if k == ast.N_THIS:
+    let tt0 = this_type(&c, n)
+    # (narrowed by this is T / asserts this is T)
+    let tk0 = ref_key(&c, n)
+    let tn0 = narrowed(c, tk0)
+    if tn0 >= 0: return tn0
+    return tt0
   if k == ast.N_SPREAD: return check_expr(&c, c.t.nd[n].a, -1)
   if k == ast.N_AWAIT:
     let ef = enclosing_fn(c, n)
@@ -4354,6 +4429,7 @@ fn literal_of_ctx(var c: C, lit: Int, ctx: Int) -> Bool:
     if lk == TK_STRLIT and (k == TK_STRLIT or k == types.TK_TEMPLATE): return true
     if lk == TK_NUMLIT and k == TK_NUMLIT: return true
     if (lk == TK_TRUE or lk == TK_FALSE) and (k == TK_TRUE or k == TK_FALSE): return true
+    if lk == TK_SYMBOL and c.tb[lit] == 1 and k == TK_SYMBOL and c.tb[m] == 1: return true
   return false
 
 # An arrow or function expression: parameters from annotations, else from the contextual signature.
@@ -7981,11 +8057,41 @@ fn const_type(var c: C, e: Int) -> Int:
   if k == ast.N_ARRAY:
     let t = types.new_obj(&c, OK_TUPLE, -1, e)
     let o = c.ta[t]
+    var rested = false
     for el in kids(c, c.t.nd[e].a):
-      if c.t.nd[el].k == ast.N_SPREAD or c.t.nd[el].k == ast.N_OMIT: return unsup(&c, el, "a spread or hole in a const array")
+      if rested: return unsup(&c, el, "a spread or hole in a const array")
+      if c.t.nd[el].k == ast.N_SPREAD:
+        # (a tuple's elements, as they are; an array's: a rest element)
+        let st = check_expr(&c, c.t.nd[el].a, -1)
+        c.ntype[el] = st
+        if c.tk[st] == TK_OBJ and c.objs[c.ta[st]].kind == OK_TUPLE:
+          let so = c.ta[st]
+          for j in 0..c.objs[so].args.len:
+            c.objs[o].args.push(c.objs[so].args[j])
+            c.objs[o].eflags.push(c.objs[so].eflags[j])
+            if c.objs[so].eflags[j] == 2: rested = true
+          continue
+        if rel.is_array_ref(&c, st):
+          c.objs[o].args.push(c.objs[c.ta[st]].args[0])
+          c.objs[o].eflags.push(2)
+          rested = true
+          continue
+        return unsup(&c, el, "a spread or hole in a const array")
+      if c.t.nd[el].k == ast.N_OMIT: return unsup(&c, el, "a spread or hole in a const array")
       let et = const_type(&c, el)
       c.objs[o].args.push(et)
       c.objs[o].eflags.push(0)
+    # (an optional element before a required one is required, with undefined: normalized)
+    var later_req = false
+    var j = c.objs[o].args.len - 1
+    while j >= 0:
+      let ef = c.objs[o].eflags[j]
+      if ef == 0: later_req = true
+      elif ef == 1 and later_req:
+        let ou = types.union_of(&c, [c.objs[o].args[j], c.undef_t])
+        c.objs[o].args[j] = ou
+        c.objs[o].eflags[j] = 0
+      j -= 1
     c.objs[o].ro = true
     c.ntype[e] = t
     return t
@@ -9366,6 +9472,15 @@ fn inter_join(var c: C, s: Int, u: Int) -> Int:
   c.strict_sub = wss
   if not dropped: return u
   return types.union_of(&c, keep)
+
+# T & {...} (object types beside one type parameter).
+fn tp_obj_inter(c: C, t: Int) -> Bool:
+  if c.tk[t] != TK_INTER: return false
+  var tps = 0
+  for x in types.members_inter(c, t):
+    if c.tk[x] == TK_TPARAM: tps += 1
+    elif c.tk[x] != TK_OBJ or rel.generic_object(c, x): return false
+  return tps == 1
 
 fn tparam_inter(c: C, t: Int) -> Bool:
   for m in types.members(c, t):
