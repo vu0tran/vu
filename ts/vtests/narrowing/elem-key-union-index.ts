@@ -1,0 +1,10 @@
+type PM<T> = undefined | T[] | { [key: PropertyKey]: PM<T> };
+const result: PM<number> = {};
+declare const k: string;
+result[k] = [1];
+export const a: 'z' = result[k];
+declare const o: { [key: string | number]: boolean };
+export const b: 'z' = o[1];
+declare const sy: symbol;
+declare const p: { [key: PropertyKey]: 1 };
+export const c: 'z' = p[sy];
