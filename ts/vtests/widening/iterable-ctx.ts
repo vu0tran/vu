@@ -1,0 +1,12 @@
+type K = 'a' | 'b';
+export const s1: ReadonlySet<K> = new Set(['a']);
+export const s2: Set<K> = new Set(['c']);
+export const m1: Map<K, number> = new Map([['a', 1]]);
+export const m2: ReadonlyMap<K, 1 | 2> = new Map([['b', 2]]);
+export const a1: K[] = Array.from(['a']);
+declare function it<T>(x: Iterable<T>): T[];
+export const i1: K[] = it(['b']);
+export const i2: K[] = it(['q']);
+declare function al<T>(x: ArrayLike<T>): T;
+export const l1: K = al(['a']);
+export const l2: 'z' = al(['a', 1]);
