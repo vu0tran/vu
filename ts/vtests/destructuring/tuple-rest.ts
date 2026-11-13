@@ -1,0 +1,17 @@
+export {};
+declare const t1: [string, ...number[]];
+declare const t2: readonly [string, boolean?, ...number[]];
+declare const t3: [...number[]];
+const [a, ...b] = t1;
+const [c, d, e] = t1;
+const [f, g, ...h] = t2;
+const [i, j, k, ...l] = t2;
+const [m, ...n] = t3;
+const x: [boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean] = [a, b, c, d, e, f, g, h, i, j, k, l];
+const y: boolean = m; const z: boolean = n;
+declare const t4: readonly [string, number, boolean];
+const [p, ...q] = t4;
+const w: boolean = q;
+declare const t5: readonly string[];
+const [r, ...s] = t5;
+const w2: boolean = s;
