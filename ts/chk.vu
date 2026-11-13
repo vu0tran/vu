@@ -1029,7 +1029,7 @@ fn tp_truthy(var c: C, m: Int, truth: Bool) -> Int:
   let b = base_constraint(&c, m, 0)
   if b < 0: return -2
   if b == m:
-    if truth: return -2
+    if truth: return nonnullable_of(&c, m)
     return m
   if is_generic_member(c, b): return -2
   if truth:
@@ -1093,10 +1093,28 @@ fn tp_typeof(var c: C, m: Int, what: Str, pos: Bool) -> Int:
   if all: return -1
   return m
 
+# A type parameter's intersection with null (1), undefined (2) or a non-nullish type (object, {}:
+# 3), from narrowing it; 0 for anything else.
+fn tp_inter_kind(var c: C, m: Int) -> Int:
+  if c.tk[m] != TK_INTER: return 0
+  var tp = false
+  var r = 0
+  for x in types.members_inter(c, m):
+    let xk = c.tk[x]
+    if xk == TK_TPARAM: tp = true
+    elif xk == TK_NULL: r = 1
+    elif xk == TK_UNDEF: r = 2
+    elif xk == TK_NONPRIM or (xk == TK_OBJ and types.empty_object(c, x)):
+      if r == 0: r = 3
+    else: return 0
+  if not tp: return 0
+  return r
+
 fn tp_nullcmp(var c: C, m: Int, vk: Int, pos: Bool, loose: Bool) -> Int:
-  # T & null and T & object (from typeof x === "object"): null is only T & null
-  if c.tk[m] == TK_INTER and tparam_inter(c, m):
-    let hit = tparam_inter_null(c, m) and (loose or vk == TK_NULL)
+  # T & null, T & undefined, T & object, T & {} (from narrowing T): null is only T & null
+  let ik = tp_inter_kind(&c, m)
+  if ik > 0:
+    let hit = (ik == 1 and (loose or vk == TK_NULL)) or (ik == 2 and (loose or vk == TK_UNDEF))
     if pos == hit: return m
     return -1
   if c.tk[m] != TK_TPARAM: return -2
@@ -1111,8 +1129,63 @@ fn tp_nullcmp(var c: C, m: Int, vk: Int, pos: Bool, loose: Bool) -> Int:
   if pos:
     if may: return m
     return -1
-  if may: return -2
+  if may:
+    # an unconstrained T: NonNullable<T> (x != null), T & ({} | null) (x !== undefined),
+    # T & ({} | undefined) (x !== null)
+    if b != m: return -2
+    if loose: return nonnullable_of(&c, m)
+    var other = c.null_t
+    if vk == TK_NULL: other = c.undef_t
+    let eo = types.union_of(&c, [c.empty_obj, other])
+    return types.inter_of(&c, [m, eo])
   return m
+
+# getNonNullableType: null and undefined removed; a type parameter that may be either is
+# NonNullable<T>, T & null and T & undefined go.
+fn non_null_generic(var c: C, n: Int, t: Int) -> Int:
+  if t < 0 or c.tk[t] == TK_UNSUP: return t
+  var gen = false
+  for m in types.members(c, t):
+    if is_generic_member(c, m): gen = true
+  if not gen: return types.filter_union(&c, t, true, true)
+  var out: [Int] = []
+  var changed = false
+  for m in types.members(c, t):
+    let mk = c.tk[m]
+    if mk == TK_NULL or mk == TK_UNDEF or mk == TK_VOID:
+      changed = true
+      continue
+    if not is_generic_member(c, m):
+      out.push(m)
+      continue
+    let ik = tp_inter_kind(&c, m)
+    if ik == 1 or ik == 2:
+      changed = true
+      continue
+    if ik == 3:
+      out.push(m)
+      continue
+    if mk == TK_TPARAM:
+      let b = base_constraint(&c, m, 0)
+      if b < 0 or (b != m and is_generic_member(c, b)): return unsup(&c, n, "a type parameter made non-nullable")
+      if b == m or may_be(c, b, 1) or may_be(c, b, 2):
+        let nn = nonnullable_of(&c, m)
+        if nn < 0: return unsup(&c, n, "a type parameter made non-nullable")
+        out.push(nn)
+        changed = true
+      else: out.push(m)
+      continue
+    if mk == types.TK_KEYOF:
+      out.push(m)
+      continue
+    return unsup(&c, n, "a generic type made non-nullable")
+  if not changed: return t
+  return types.union_of(&c, out)
+
+fn nonnullable_of(var c: C, m: Int) -> Int:
+  let r = alias_inst(&c, "NonNullable", [m])
+  if r < 0: return -2
+  return r
 
 # The facts a condition gives when it's true (truth) or false: (reference, narrowed type) pairs.
 type Fact:
@@ -1927,6 +2000,8 @@ fn narrow_instanceof(var c: C, t: Int, it: Int, truth: Bool) -> Int:
     if truth: return it
     return t
   let ms = types.members(c, t)
+  let gn = instanceof_generic(&c, t, it, truth)
+  if gn != -2: return gn
   for m in ms:
     let k = c.tk[m]
     if is_generic_member(c, m) or k == TK_INTER or k == TK_UNSUP: return -1
@@ -1963,6 +2038,40 @@ fn narrow_instanceof(var c: C, t: Int, it: Int, truth: Bool) -> Int:
   # (neither: their intersection)
   if ms.len == 1 and c.tk[t] == TK_OBJ: return types.inter_of(&c, [t, it])
   return -1
+
+# x instanceof C where x's members are all a type parameter T or its narrowings (T & null,
+# T & {}, ...): none is derived from C, so true gives each one's intersection with C where C fits
+# its base constraint, false leaves x as it was. -2: not this case.
+fn instanceof_generic(var c: C, t: Int, it: Int, truth: Bool) -> Int:
+  let ms = types.members(c, t)
+  for m in ms:
+    if c.tk[m] != TK_TPARAM and tp_inter_kind(&c, m) == 0: return -2
+  if not truth: return t
+  if c.tk[it] != TK_OBJ: return -1
+  var res: [Int] = []
+  for m in ms:
+    var parts: [Int] = []
+    var tps: [Int] = []
+    for x in types.members_inter(c, m):
+      if c.tk[x] == TK_TPARAM:
+        tps.push(x)
+        let bx = base_constraint(&c, x, 0)
+        if bx < 0: return -1
+        if bx == x: continue
+        if is_generic_member(c, bx): return -1
+        parts.push(bx)
+      else: parts.push(x)
+    var base = c.unknown_t
+    if parts.len > 0: base = types.inter_of(&c, parts)
+    if not rel.assignable(&c, it, base): continue
+    # (an empty object type beside an object type goes)
+    var ps: [Int] = []
+    for x in types.members_inter(c, m):
+      if not (c.tk[x] == TK_OBJ and types.empty_object(c, x)): ps.push(x)
+    ps.push(it)
+    res.push(types.inter_of(&c, ps))
+  if res.len == 0: return -1
+  return types.union_of(&c, res)
 
 # isTypeDerivedFrom: 1 yes, 0 no, -1 not modeled.
 fn derived(var c: C, s: Int, t: Int) -> Int:
@@ -2187,7 +2296,7 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
     return target
   if k == ast.N_NONNULL:
     let t = check_expr(&c, c.t.nd[n].a, ctx)
-    return types.filter_union(&c, t, true, true)
+    return non_null_generic(&c, n, t)
   if k == ast.N_TYPEOF:
     # the operand's type doesn't matter (an unknown flow type is fine)
     c.allow_unknown = true
@@ -4146,7 +4255,13 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
       if c.tk[im] == TK_UNSUP: return im
       let iap = rel.apparent(&c, im)
       for sg in bind.sigs_of(&c, iap, is_new): sgs.push(sg)
-  if sgs.len == 0 and not is_new and c.tk[ap] == TK_OBJ and bind.sigs_of(&c, ap, true).len == 0 and function_like(&c, ft):
+  var no_ctor = c.tk[ap] == TK_OBJ and bind.sigs_of(&c, ap, true).len == 0
+  if c.tk[ap] == TK_INTER:
+    no_ctor = true
+    for im in types.members_inter(c, ap):
+      let iap = rel.apparent(&c, im)
+      if bind.sigs_of(&c, iap, true).len > 0: no_ctor = false
+  if sgs.len == 0 and not is_new and no_ctor and function_like(&c, ft):
     # an untyped call: a Function (no signatures) returns any
     for a in args: check_expr(&c, a, -1)
     return c.any_t
@@ -5654,8 +5769,10 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
   if op == scan.T_QQ:
     let lt = check_expr(&c, l, -1)
     let rt = check_expr(&c, r, ctx)
-    let h18_ = types.filter_union(&c, lt, true, true)
-    return union_fresh(&c, [h18_, rt])
+    let h18_ = non_null_generic(&c, l, lt)
+    let uq = union_fresh(&c, [h18_, rt])
+    if h18_ != lt and h18_ >= 0 and c.tk[h18_] != TK_UNSUP: return reduce_tp_inters(&c, uq)
+    return uq
   if op == scan.T_COMMA:
     check_expr(&c, l, -1)
     return check_expr(&c, r, ctx)
@@ -8326,18 +8443,26 @@ fn tp_join(var c: C, s: Int, ts: [Int]) -> Int:
   for m in types.members(c, u):
     if not types.has_int(dms, m): subset = false
   if subset: return u
+  return reduce_tp_inters(&c, u)
+
+# Subtype reduction of a union's type parameter intersections (T & null, NonNullable<T>, ...):
+# those a subtype of another member go.
+fn reduce_tp_inters(var c: C, u: Int) -> Int:
   let ms = types.members(c, u)
   var keep: [Int] = []
+  var dropped = false
   let ws = c.subtype
   c.subtype = true
   for i in 0..ms.len:
     let m = ms[i]
     var drop = false
-    if c.tk[m] == TK_INTER and tparam_inter(c, m):
+    if c.tk[m] == TK_INTER and tp_inter_kind(&c, m) > 0:
       for j in 0..ms.len:
         if j != i and rel.assignable(&c, m, ms[j]) and not rel.assignable(&c, ms[j], m): drop = true
-    if not drop: keep.push(m)
+    if drop: dropped = true
+    else: keep.push(m)
   c.subtype = ws
+  if not dropped: return u
   return types.union_of(&c, keep)
 
 fn tparam_inter(c: C, t: Int) -> Bool:
