@@ -1,0 +1,20 @@
+declare function f1<T>(x: T | string): T;
+export const a1: 'z' = f1('a');
+export const a2: 'z' = f1(1 as number | string);
+declare function f2<T>(x: T | { x: 1 }): T;
+export const b2: 'z' = f2({ x: 1 } as { x: 1 });
+declare class Box<V> { v: V }
+declare function f3<T>(x: T | Box<T>): T;
+export const c1: 'z' = f3(new Box<number>());
+export const c2: 'z' = f3(1 as number | Box<string>);
+declare function f4<T>(x: T | undefined | null): T;
+export const d1: 'z' = f4(1 as number | undefined);
+declare function f5<T>(x: T | (() => T)): T;
+export const e1: 'z' = f5(() => 1);
+export const e2: 'z' = f5(1 as number | (() => string));
+declare function f6<T>(x: T | Promise<T>): T;
+export const g1: 'z' = f6(Promise.resolve('a'));
+export const g2: 'z' = f6(1 as number | Promise<string>);
+declare function f7<T>(x: T | T[]): T;
+export const h1: 'z' = f7([1, 2]);
+export const h2: 'z' = f7(1 as number | string[]);
