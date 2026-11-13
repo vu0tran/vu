@@ -1,0 +1,13 @@
+declare const s: string;
+const v = s || {};
+export const q: 'z' = v;
+declare const d: { a: 1 } | undefined;
+const w = d ?? {};
+export const q2: 'z' = w;
+const w3 = d ?? { b: 1 };
+export const q3: 'z' = w3;
+declare const n: null | { a: 1 };
+const w4 = n || {};
+export const q4: 'z' = w4;
+const w5 = [d!, {}];
+export const q5: 'z' = w5;
