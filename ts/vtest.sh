@@ -14,7 +14,9 @@ fail=0
 for d in "$@"; do
   # (the folder's absolute path, in messages that name a module, left out)
   ad=$(cd "$d" && pwd)
-  out=$(cd "$d" && "$vtsc" $(ls *.ts | sort) 2>&1 | sed "s|$ad/||g")
+  # (a folder with a file named use-project: checked as its tsconfig.json's project)
+  if [ -f "$d/use-project" ]; then out=$(cd "$d" && PWD="$ad" "$vtsc" -p tsconfig.json 2>&1 | sed "s|$ad/||g")
+  else out=$(cd "$d" && "$vtsc" $(ls *.ts | sort) 2>&1 | sed "s|$ad/||g"); fi
   if [ $save = 1 ]; then printf '%s\n' "$out" > "$d/expected.txt"; continue; fi
   if [ "$out" = "$(cat "$d/expected.txt")" ]; then echo "ok   $(basename "$d")"
   else echo "FAIL $(basename "$d")"; printf '%s\n' "$out" | diff "$d/expected.txt" - | head -20; fail=1; fi
