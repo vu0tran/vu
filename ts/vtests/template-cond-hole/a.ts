@@ -1,0 +1,14 @@
+type JsonPaths<T, Key extends keyof T = keyof T> = Key extends string ? T[Key] extends Record<string, any> ? `${Key}.${JsonPaths<T[Key]>}` : `${Key}` : never;
+type M = { a: { b: string; c: { d: number } }; e: boolean };
+type P = JsonPaths<M>;
+const p1: P = "a.b";
+const p2: P = "a.c.d";
+const p3: P = "e";
+const p4: P = "a.x";
+const n: number = null as any as P;
+type RP<T, Key extends keyof T> = Key extends string ? T[Key] extends Record<string, any> ? `${Key}.${RP<T[Key], Exclude<keyof T[Key], keyof any[]>> & string}` | `${Key}.${Exclude<keyof T[Key], keyof any[]> & string}` : never : never;
+type R1 = RP<M, keyof M>;
+const r1: R1 = "a.b";
+const r2: R1 = "a.c.d";
+const r3: R1 = "e";
+export {};

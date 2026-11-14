@@ -1,0 +1,11 @@
+type C<T> = T extends string ? "s" | "t" : "n";
+type D = C<"a">;
+const d: D = "x";
+type C2<T> = T extends string ? `${T}!` : "n";
+type D2 = C2<"a" | "b">;
+const d2: D2 = "x";
+type C3<T> = T extends string ? `${T}!` : "n";
+const d3: C3<"a" | "b"> = "x";
+type D4 = C3<"a" | "b"> | 5;
+const d4: D4 = "x";
+export {};

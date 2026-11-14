@@ -1,0 +1,13 @@
+type Y<T> = T | null;
+type X = Y<string>;
+const x: number = null as any as X;
+type C<T> = T extends string ? "s" | "t" : "n";
+type D = C<"a">;
+const d: number = null as any as D;
+type C2<T> = T extends string ? `${T}!` : "n";
+type D2 = C2<"a" | "b">;
+const d2: number = null as any as D2;
+type M<T> = { [K in keyof T]: T[K] };
+type MM = M<{ a: 1 }>;
+const m: number = null as any as MM;
+export {};
