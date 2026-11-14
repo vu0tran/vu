@@ -1,0 +1,20 @@
+interface Arb<T> { v: T }
+declare function constantFrom<T = never>(...values: T[]): Arb<T>;
+declare function constantFrom<TArgs extends any[] | [any]>(...values: TArgs): Arb<TArgs[number]>;
+declare function stringOf(a: Arb<string>, o?: { minLength?: number }): Arb<string>;
+const ALNUM = 'abc';
+const a1 = stringOf(constantFrom(...ALNUM), { minLength: 1 });
+const n1: number = constantFrom(...ALNUM);
+declare const nums: number[];
+const n2: string = constantFrom(...nums);
+declare const lits: ("a" | "b")[];
+const n3: number = constantFrom(...lits);
+declare function f<T>(x: number, ...r: T[]): T;
+const n4: string = f(1, ...nums);
+declare function g(...r: string[]): void;
+declare function g(a: number, ...r: number[]): void;
+g(...nums);
+g(1, ...nums);
+g(...ALNUM);
+declare const set: Set<boolean>;
+const n5: string = constantFrom(...set);

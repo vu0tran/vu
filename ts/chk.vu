@@ -6055,6 +6055,8 @@ fn same_params(c: C, a: Int, b: Int) -> Bool:
 # f(a, ...xs) with xs an array: the spread goes to f's rest parameter. Other forms (a tuple, a
 # spread before the rest parameter, overloads, inference) aren't modeled.
 fn spread_call(var c: C, n: Int, sgs0: [Int], args: [Int], at: Int) -> Int:
+  let gr = spread_generic(&c, n, sgs0, args, at)
+  if gr != -1: return gr
   var sgs: [Int] = []
   for x in sgs0: sgs.push(x)
   if sgs.len > 1:
@@ -6159,6 +6161,70 @@ fn spread_call(var c: C, n: Int, sgs0: [Int], args: [Int], at: Int) -> Int:
   let pe = param_at(&c, sg, at)
   if not reported and not rel.assignable(&c, et, pe): rel.report(&c, et, pe, args[at], -1, 2345)
   return sig_result(&c, sg, n)
+
+# f(a, ...xs) with xs an array or iterable (not a tuple) to overloads or a generic function: the
+# spread is one argument of xs's array type for the rest parameter (getSpreadArgumentType); a
+# candidate whose rest parameter is at the spread infers from that, and the first that fits (by
+# the subtype relation, then assignability) is the one. -1 when this doesn't apply.
+fn spread_generic(var c: C, n: Int, sgs: [Int], args: [Int], at: Int) -> Int:
+  if at != args.len - 1: return -1
+  var gen = sgs.len > 1
+  for sg in sgs:
+    if c.sigs[sg].tparams.len > 0: gen = true
+  if not gen: return -1
+  for i in 0..at:
+    if context_sensitive(c, args[i]): return -1
+  let st = check_expr(&c, c.t.nd[args[at]].a, -1)
+  if is_any(c, st): return -1
+  if c.tk[st] == TK_OBJ and c.objs[c.ta[st]].kind == OK_TUPLE: return -1
+  var et = -1
+  if rel.is_array_ref(&c, st): et = c.objs[c.ta[st]].args[0]
+  else:
+    let sta = rel.apparent(&c, st)
+    if rel.is_array_ref(&c, sta): et = c.objs[c.ta[sta]].args[0]
+    elif c.tk[sta] == TK_OBJ: et = iterated(&c, sta)
+  if et < 0 or c.tk[et] == TK_UNSUP: return -1
+  let arr = bind.array_of(&c, et)
+  var ats: [Int] = []
+  for i in 0..at: ats.push(check_expr(&c, args[i], -1))
+  var cands: [Int] = []
+  for sg in sgs:
+    let s0 = types.sig_copy(c, sg)
+    let np = s0.ptypes.len
+    if np == 0 or s0.pflags[np - 1] != 2 or at != np - 1 or sig_min(c, sg) > at: continue
+    cands.push(sg)
+  if cands.len == 0: return -1
+  var npass = 1
+  if cands.len > 1: npass = 2
+  for pass in 0..npass:
+    for sg in cands:
+      var isg = sg
+      let tps = types.ints(c.sigs[sg].tparams)
+      if tps.len > 0:
+        var inf = new_inf(tps)
+        let sgc = types.sig_copy(c, sg)
+        for i in 0..at:
+          var seen: {Int: Bool} = {}
+          let p0 = sgc.ptypes[i]
+          infer_in(&c, p0, ats[i], &inf, false, 0, p0, &seen)
+        let rp = sgc.ptypes[at]
+        var seen2: {Int: Bool} = {}
+        infer_in(&c, rp, arr, &inf, false, 0, rp, &seen2)
+        let m = inf_mapper(&c, &inf, sg)
+        isg = bind.inst_sig(&c, sg, m)
+      let is1 = types.sig_copy(c, isg)
+      var fits = true
+      let ws = c.subtype
+      if pass == 0 and npass == 2: c.subtype = true
+      for i in 0..at:
+        if not rel.assignable(&c, ats[i], is1.ptypes[i]): fits = false
+      if fits and not rel.assignable(&c, arr, is1.ptypes[at]): fits = false
+      c.subtype = ws
+      if fits:
+        for i in 0..at: check_expr(&c, args[i], is1.ptypes[i])
+        c.resolved_sig[n] = isg
+        return sig_result(&c, isg, n)
+  return -1
 
 # isTypeAssignableTo(t, globalFunctionType) for a type without signatures
 fn function_like(var c: C, t: Int) -> Bool:
@@ -6288,10 +6354,8 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
       if full.len == 0: continue
       let tps1 = types.ints(c.sigs[sg].tparams)
       let m = types.new_mapper(&c, tps1, full)
-      let ns = bind.inst_sig(&c, sg, m)
-      c.sigs[ns].tparams = []
       # (with overloads, one whose constraints the type arguments don't satisfy isn't a
-      # candidate: checkTypeArguments)
+      # candidate: checkTypeArguments; made only when no candidate is left)
       var fits = true
       if sgs.len > 1:
         for i in 0..tps1.len:
@@ -6299,10 +6363,20 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
           if con < 0 or con == tps1[i]: continue
           con = bind.instantiate(&c, con, m)
           if not rel.assignable(&c, full[i], con): fits = false
-      if fits: sgs2.push(ns)
-      else: unfit.push(ns)
+      if fits:
+        let ns = bind.inst_sig(&c, sg, m)
+        c.sigs[ns].tparams = []
+        sgs2.push(ns)
+      else:
+        unfit.push(sg)
+        unfit.push(m)
     if sgs2.len == 0:
-      for x in unfit: sgs2.push(x)
+      var ui = 0
+      while ui < unfit.len:
+        let ns2 = bind.inst_sig(&c, unfit[ui], unfit[ui + 1])
+        c.sigs[ns2].tparams = []
+        sgs2.push(ns2)
+        ui += 2
     if sgs2.len == 0:
       for a in args: check_expr(&c, a, -1)
       var lo = 1000
