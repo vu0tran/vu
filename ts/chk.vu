@@ -291,7 +291,8 @@ fn pattern_sym_type(var c: C, s: Int, d: Int) -> Int:
     var mutable = false
     if c.t.nd[d].k == ast.N_PARAM:
       src = param_type(&c, d)
-      if c.t.nd[d].b < 0 and not (d in c.ptype_ctx) and c.t.nd[d].c < 0: return unsup(&c, d, "a destructuring parameter without a type")
+      if c.t.nd[d].b < 0 and not (d in c.ptype_ctx) and c.t.nd[d].c < 0:
+        return unsup(&c, d, "a destructuring parameter without a type")
     else:
       let p = bind.up(c, d)
       mutable = p >= 0 and c.t.nd[p].k == ast.N_VAR and c.t.nd[p].f != 2
@@ -698,6 +699,56 @@ fn pad_to_pattern(var c: C, t: Int, pat: Int) -> Int:
     types.add_prop(&c, r, dnames[i], ps)
   c.objs[c.ta[r]].resolved = true
   return r
+
+# getTypeFromBindingPattern for a parameter without a type or context: an object pattern's
+# properties (optional with a default, its widened type), an array pattern's tuple; an element
+# without a default is any, TS7031. -1 for what isn't modeled (rest elements, holes, a nested
+# pattern with a default).
+fn implied_pattern(var c: C, pat: Int) -> Int:
+  let k = c.t.nd[pat].k
+  if k == ast.N_OBJPAT:
+    let t = types.anon_obj(&c, -1, pat)
+    for e in kids(c, c.t.nd[pat].a):
+      if c.t.nd[e].k != ast.N_BINDEL or (c.t.nd[e].f & ast.M_REST) != 0: return -1
+      var pn = c.t.nd[e].a
+      if pn < 0: pn = c.t.nd[e].b
+      let pk = c.t.nd[pn].k
+      if pk != ast.N_ID and pk != ast.N_STR: return -1
+      let et = implied_element(&c, e)
+      if et < 0: return -1
+      let ps = types.new_sym(&c, S_PROP, c.t.nd[pn].s, e)
+      c.stype[ps] = et
+      if c.t.nd[e].c >= 0: c.sflags[ps] = SF_OPTIONAL
+      types.add_prop(&c, t, c.t.nd[pn].s, ps)
+    c.objs[c.ta[t]].resolved = true
+    return t
+  if k == ast.N_ARRPAT:
+    let t = types.new_obj(&c, OK_TUPLE, -1, pat)
+    for e in kids(c, c.t.nd[pat].a):
+      if c.t.nd[e].k != ast.N_BINDEL or (c.t.nd[e].f & ast.M_REST) != 0: return -1
+      var et = implied_element(&c, e)
+      if et < 0: return -1
+      # (an element with a default: optional, its type with undefined)
+      if c.t.nd[e].c >= 0: et = types.union_of(&c, [et, c.undef_t])
+      c.objs[c.ta[t]].args.push(et)
+      if c.t.nd[e].c >= 0: c.objs[c.ta[t]].eflags.push(1)
+      else: c.objs[c.ta[t]].eflags.push(0)
+    return t
+  return -1
+
+fn implied_element(var c: C, e: Int) -> Int:
+  let b = c.t.nd[e].b
+  if b < 0: return -1
+  let bk = c.t.nd[b].k
+  if bk == ast.N_OBJPAT or bk == ast.N_ARRPAT:
+    if c.t.nd[e].c >= 0: return -1
+    return implied_pattern(&c, b)
+  if bk != ast.N_ID: return -1
+  if c.t.nd[e].c >= 0:
+    let it = check_expr(&c, c.t.nd[e].c, -1)
+    return widen(&c, it)
+  err(&c, b, 7031, "Binding element '" + nm(c, c.t.nd[b].s) + "' implicitly has an 'any' type.")
+  return c.any_t
 
 # A parameter's object literal initializer against its pattern (every element with a default and
 # no rest): a property no element names is excess, reported against the pattern's implied type.
@@ -5684,7 +5735,13 @@ fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
           pt = c.any_t
       if pt < 0:
         if c.t.nd[p].c < 0:
-          if is_pat: return unsup(&c, p, "a destructuring parameter without a type")
+          if is_pat:
+            # (the type the pattern implies, its elements implicitly any: TS7031)
+            pt = implied_pattern(&c, c.t.nd[p].a)
+            if pt < 0: return unsup(&c, p, "a destructuring parameter without a type")
+            c.ptype_ctx[p] = pt
+            i += 1
+            continue
           err(&c, c.t.nd[p].a, 7006, "Parameter '" + nm(c, c.t.nd[c.t.nd[p].a].s) + "' implicitly has an 'any' type.")
           pt = c.any_t
         else:
@@ -10111,7 +10168,7 @@ fn check_class(var c: C, n: Int):
         if init >= 0:
           let it = in_member_flow(&c, init, declared)
           if not rel.assignable(&c, it, declared): rel.report(&c, it, declared, nn, init, 2322)
-        elif c.spi and (mf & (ast.M_STATIC | ast.M_ABSTRACT | ast.M_DECLARE | ast.M_EXCL)) == 0 and (c.t.nd[n].f & ast.M_DECLARE) == 0 and c.t.nd[nn].k != ast.N_STR and c.t.nd[nn].k != ast.N_NUM and not (name in assigned) and not includes_undefined(&c, sdt):
+        elif c.spi and (mf & (ast.M_STATIC | ast.M_ABSTRACT | ast.M_DECLARE | ast.M_EXCL)) == 0 and not ambient_decl(c, n) and c.t.nd[nn].k != ast.N_STR and c.t.nd[nn].k != ast.N_NUM and not (name in assigned) and not includes_undefined(&c, sdt):
           err(&c, nn, 2564, "Property '" + nm(c, name) + "' has no initializer and is not definitely assigned in the constructor.")
       elif init >= 0:
         let ps = bind.get_prop(&c, inst, name)
@@ -10583,7 +10640,13 @@ fn check_container(var c: C, own e0: Ents, root: Int):
 fn ambient_decl(c: C, d: Int) -> Bool:
   if (c.t.nd[d].f & ast.M_DECLARE) != 0: return true
   let f = c.files[c.t.nd[d].file]
-  return f.endswith(".d.ts") or f.endswith(".d.mts") or f.endswith(".d.cts")
+  if f.endswith(".d.ts") or f.endswith(".d.mts") or f.endswith(".d.cts"): return true
+  # (inside a declare module or namespace)
+  var x = bind.up(c, d)
+  while x >= 0:
+    if c.t.nd[x].k == ast.N_MODULE and (c.t.nd[x].f & ast.M_DECLARE) != 0: return true
+    x = bind.up(c, x)
+  return false
 
 # The statement after d in its statement list (-1 if last).
 fn next_stmt(c: C, d: Int) -> Int:

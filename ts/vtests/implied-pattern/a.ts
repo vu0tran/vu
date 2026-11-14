@@ -1,0 +1,13 @@
+declare const a: any;
+a.map((x) => x);
+a.map(({ p, q }) => p);
+a.map(([p]) => p);
+a(function ({ p }) { return p; });
+const f = ({ p }) => p;
+a.map(({ p = 1, q: { r } }) => p);
+const g = ({ p, q = "s" }) => p;
+g({ p: 1 });
+const h = ([x, y = 2]) => x;
+h([1]);
+h(3);
+export {};
