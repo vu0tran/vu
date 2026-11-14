@@ -488,6 +488,11 @@ fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
         if c.tk[m] == TK_OBJ and c.tk[src] == TK_UNION and c.objs[c.ta[m]].node >= 0 and c.t.nd[c.objs[c.ta[m]].node].k == ast.N_OBJECT:
           pts.push(c.undef_t)
           continue
+        # (an object literal initializer and an element with a default: the literal padded with
+        # the pattern's properties, padObjectLiteralToMatchBindingPattern)
+        if c.t.nd[e].c >= 0 and c.tk[m] == TK_OBJ and c.objs[c.ta[m]].node >= 0 and c.t.nd[c.objs[c.ta[m]].node].k == ast.N_OBJECT:
+          pts.push(c.undef_t)
+          continue
         if c.t.nd[e].c < 0 or c.tk[m] != TK_OBJ:
           let shown = show.show(&c, src)
           err(&c, pn, 2339, "Property '" + nm(c, name) + "' does not exist on type '" + shown + "'.")
@@ -644,9 +649,102 @@ fn param_type(var c: C, p: Int) -> Int:
   if p in c.ptype_ctx: return c.ptype_ctx[p]
   if c.t.nd[p].c >= 0:
     let g1_1 = check_expr(&c, c.t.nd[p].c, -1)
-    return widen(&c, g1_1)
+    let w1 = widen(&c, g1_1)
+    let pat1 = c.t.nd[p].a
+    return pad_to_pattern(&c, w1, pat1)
   if (c.t.nd[p].f & ast.M_REST) != 0: return bind.array_of(&c, c.any_t)
   return c.any_t
+
+# padObjectLiteralToMatchBindingPattern: an object literal initializer's type with the pattern's
+# elements that have defaults: missing ones added, optional, of their defaults' widened types
+# (with undefined); present ones made optional.
+fn pad_to_pattern(var c: C, t: Int, pat: Int) -> Int:
+  if pat < 0 or c.t.nd[pat].k != ast.N_OBJPAT or c.tk[t] != TK_OBJ: return t
+  let on = c.objs[c.ta[t]].node
+  if on < 0 or c.t.nd[on].k != ast.N_OBJECT: return t
+  var dnames: [Int] = []
+  var dels: [Int] = []
+  for e in kids(c, c.t.nd[pat].a):
+    if c.t.nd[e].k != ast.N_BINDEL or (c.t.nd[e].f & ast.M_REST) != 0: continue
+    if c.t.nd[e].c < 0: continue
+    var pn = c.t.nd[e].a
+    if pn < 0: pn = c.t.nd[e].b
+    let pk = c.t.nd[pn].k
+    if pk != ast.N_ID and pk != ast.N_STR: return t
+    dnames.push(c.t.nd[pn].s)
+    dels.push(e)
+  if dnames.len == 0: return t
+  let r = types.anon_obj(&c, -1, on)
+  for name in bind.prop_names(&c, t):
+    let ps = bind.get_prop(&c, t, name)
+    if ps < 0: continue
+    if types.has_int(dnames, name) and (c.sflags[ps] & SF_OPTIONAL) == 0:
+      let ops = types.new_sym(&c, S_PROP, name, c.sdecl[ps])
+      c.stype[ops] = bind.prop_type_for(&c, ps, t)
+      c.sflags[ops] = c.sflags[ps] | SF_OPTIONAL
+      c.bare_opt[ops] = true
+      types.add_prop(&c, r, name, ops)
+    else: types.add_prop(&c, r, name, ps)
+  for i in 0..dnames.len:
+    if bind.get_prop(&c, t, dnames[i]) >= 0: continue
+    let e = dels[i]
+    let dt = check_expr(&c, c.t.nd[e].c, -1)
+    let wdt = widen(&c, dt)
+    let pt = types.union_of(&c, [wdt, c.undef_t])
+    let ps = types.new_sym(&c, S_PROP, dnames[i], e)
+    c.stype[ps] = pt
+    c.sflags[ps] = SF_OPTIONAL
+    types.add_prop(&c, r, dnames[i], ps)
+  c.objs[c.ta[r]].resolved = true
+  return r
+
+# A parameter's object literal initializer against its pattern (every element with a default and
+# no rest): a property no element names is excess, reported against the pattern's implied type.
+fn pattern_init_check(var c: C, p: Int):
+  let pat = c.t.nd[p].a
+  let init = skip_parens(c, c.t.nd[p].c)
+  if c.t.nd[pat].k == ast.N_ARRPAT:
+    unsup(&c, p, "an array destructuring parameter with an initializer")
+    return
+  if c.t.nd[pat].k != ast.N_OBJPAT or c.t.nd[init].k != ast.N_OBJECT: return
+  var names: [Int] = []
+  var all_def = true
+  for e in kids(c, c.t.nd[pat].a):
+    if c.t.nd[e].k != ast.N_BINDEL: continue
+    if (c.t.nd[e].f & ast.M_REST) != 0: return
+    var pn = c.t.nd[e].a
+    if pn < 0: pn = c.t.nd[e].b
+    let pk = c.t.nd[pn].k
+    if pk != ast.N_ID and pk != ast.N_STR: return
+    names.push(c.t.nd[pn].s)
+    if c.t.nd[e].c < 0: all_def = false
+  for q in kids(c, c.t.nd[init].a):
+    let qk = c.t.nd[q].k
+    if qk != ast.N_PROPASSIGN and qk != ast.N_SHORTHAND and qk != ast.N_METHOD:
+      return
+    let qn = bind.member_name(&c, q)
+    if qn < 0 or types.has_int(names, qn): continue
+    if not all_def:
+      unsup(&c, q, "an excess property in a destructuring parameter's initializer")
+      return
+    # (the implied type: the elements, optional, of their defaults' types)
+    let it = types.anon_obj(&c, -1, pat)
+    for e in kids(c, c.t.nd[pat].a):
+      if c.t.nd[e].k != ast.N_BINDEL: continue
+      var pn2 = c.t.nd[e].a
+      if pn2 < 0: pn2 = c.t.nd[e].b
+      let dt = check_expr(&c, c.t.nd[e].c, -1)
+      let ps = types.new_sym(&c, S_PROP, c.t.nd[pn2].s, e)
+      let wdt2 = widen(&c, dt)
+      c.stype[ps] = types.union_of(&c, [wdt2, c.undef_t])
+      c.sflags[ps] = SF_OPTIONAL
+      types.add_prop(&c, it, c.t.nd[pn2].s, ps)
+    c.objs[c.ta[it]].resolved = true
+    var at = q
+    if qk == ast.N_PROPASSIGN or qk == ast.N_METHOD: at = c.t.nd[q].a
+    let its = show.show(&c, it)
+    err(&c, at, 2353, "Object literal may only specify known properties, and '" + nm(c, qn) + "' does not exist in type '" + its + "'.")
+    return
 
 # A function declaration's type: one call signature per overload (or the implementation alone).
 fn func_type(var c: C, s: Int) -> Int:
@@ -5484,7 +5582,10 @@ fn function_expr(var c: C, n: Int, ctx: Int) -> Int:
           pt = c.any_t
         else:
           let g3_1 = check_expr(&c, c.t.nd[p].c, -1)
-          pt = widen(&c, g3_1)
+          let w3 = widen(&c, g3_1)
+          let pat3 = c.t.nd[p].a
+          pt = pad_to_pattern(&c, w3, pat3)
+          if is_pat: pattern_init_check(&c, p)
       if (c.t.nd[p].f & ast.M_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
       c.ptype_ctx[p] = pt
     i += 1
@@ -8910,9 +9011,11 @@ fn check_stmt(var c: C, n: Int):
       return
     for p in kids(c, c.t.nd[n].b):
       if c.t.nd[c.t.nd[p].a].k != ast.N_ID:
-        if c.t.nd[p].b < 0:
+        # (with an initializer: its type, padded with the pattern's properties)
+        if c.t.nd[p].b < 0 and c.t.nd[p].c < 0:
           unsup(&c, p, "a destructuring parameter without a type")
           return
+        if c.t.nd[p].b < 0: pattern_init_check(&c, p)
         continue
       if c.t.nd[p].b < 0 and c.t.nd[p].c < 0 and nm(c, c.t.nd[c.t.nd[p].a].s) != "this":
         err(&c, c.t.nd[p].a, 7006, "Parameter '" + nm(c, c.t.nd[c.t.nd[p].a].s) + "' implicitly has an 'any' type.")
