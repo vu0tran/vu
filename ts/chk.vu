@@ -6207,6 +6207,7 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
         continue
       # (what checking the arguments for a candidate that doesn't fit reports is dropped)
       let dlen = c.diags.len
+      let clen = c.checked_log.len
       # (with context-sensitive arguments: inferred without them first, SkipContextSensitive,
       # so a candidate that doesn't fit never gives a function argument its parameters)
       var sg = -1
@@ -6218,13 +6219,13 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
         c.call_this = -1
         c.skip_sens = false
         if not args_fit_skip(&c, sg0, args):
-          while c.diags.len > dlen: c.diags.pop()
+          drop_attempt(&c, dlen, clen)
           continue
       if cgen: c.call_this = this_arg
       sg = instantiate_call(&c, cand, args, ctx)
       c.call_this = -1
       if cgen and not rel.assignable(&c, this_arg, c.sigs[sg].this_t):
-        while c.diags.len > dlen: c.diags.pop()
+        drop_attempt(&c, dlen, clen)
         this_skipped = true
         continue
       var fits = false
@@ -6234,7 +6235,7 @@ fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
         check_args(&c, sg, args, false)
         c.resolved_sig[n] = sg
         return sig_result(&c, sg, n)
-      while c.diags.len > dlen: c.diags.pop()
+      drop_attempt(&c, dlen, clen)
   if this_skipped or any_cgen: return unsup(&c, n, "overloads declaring a this that doesn't fit, none applicable")
   for a in args: check_expr(&c, a, -1)
   # reported where the last candidate's first argument error is (as tsc 7 does)
@@ -6370,11 +6371,20 @@ fn obj_skip_fits(var c: C, a: Int, t: Int) -> Bool:
     names[qn] = true
   let at = rel.apparent(&c, t)
   for m in types.members(c, at):
-    if c.tk[m] != TK_OBJ: continue
+    # (an intersection: every member's required properties)
+    var parts: [Int] = []
+    if c.tk[m] == TK_OBJ: parts.push(m)
+    elif c.tk[m] == TK_INTER and not is_generic_member(c, m):
+      for xm in types.members_inter(c, m): parts.push(rel.apparent(&c, xm))
+    else: continue
     var ok = true
-    for name in bind.prop_names(&c, m):
-      let ps = bind.get_prop(&c, m, name)
-      if ps >= 0 and (c.sflags[ps] & SF_OPTIONAL) == 0 and not (name in names): ok = false
+    for pm in parts:
+      if c.tk[pm] != TK_OBJ:
+        ok = false
+        continue
+      for name in bind.prop_names(&c, pm):
+        let ps = bind.get_prop(&c, pm, name)
+        if ps >= 0 and (c.sflags[ps] & SF_OPTIONAL) == 0 and not (name in names): ok = false
     if ok: return true
   return false
 
@@ -6559,6 +6569,7 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
     # (...args: { [K in keyof T]: X }: the same, through the mapped type)
     if c.tk[rt0] == TK_OBJ and c.objs[c.ta[rt0]].kind == types.OK_MAPPED: rest_at = s0.ptypes.len - 1
   var rest_types: {Int: Int} = {}
+  var fixed_tps: {Int: Bool} = {}
   var rest_done = false
   var any_const = false
   for tp in tps:
@@ -6597,6 +6608,9 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
       var pt = raw_param_at(&c, sg, i)
       if i in rp_over: pt = rp_over[i]
       if pass == 1:
+        # (the type parameters this parameter mentions stay fixed: their final inference widens too)
+        for tpf in tps:
+          if fixed_by(&c, pt, tpf): fixed_tps[tpf] = true
         # (the parameters a context-sensitive function gets fix the inferences: isFixed widens)
         c.inf_fixing = true
         let m = inf_mapper(&c, &inf, sg)
@@ -6633,7 +6647,17 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
       if i < s13.pflags.len and s13.pflags[i] == 1: h13_ = types.union_of(&c, [h13_, c.undef_t])
       var seen: {Int: Bool} = {}
       if c.debug: eprint("ARG {i} pass {pass}: {show.show(&c, at)} to {show.show(&c, h13_)}")
+      # (a fixed inference takes no more candidates: isFixed)
+      var snap = copy_inf(inf)
+      let has_fixed = fixed_tps.len > 0
       infer_in(&c, h13_, at, &inf, false, 0, h13_, &seen)
+      if has_fixed:
+        for j in 0..inf.tps.len:
+          if inf.tps[j] in fixed_tps:
+            inf.cov[j] = types.ints(snap.cov[j])
+            inf.contra[j] = types.ints(snap.contra[j])
+            inf.prio[j] = snap.prio[j]
+            inf.top[j] = snap.top[j]
     # ([...V, F]: V from the leading arguments before the trailing ones' second pass)
     if pass == 0 and rest_v >= 0 and not rest_done:
       var all_in = true
@@ -6657,7 +6681,9 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
     var seen1: {Int: Bool} = {}
     infer_in(&c, rt1, tup, &inf, false, 0, rt1, &seen1)
   while c.outer_tps.len > outer_n: c.outer_tps.pop()
+  c.inf_fixed = fixed_tps
   let m = inf_mapper(&c, &inf, sg)
+  c.inf_fixed = {}
   if c.debug:
     let mp = types.mapper_copy(c, m)
     for i in 0..mp.from.len:
@@ -6783,7 +6809,7 @@ fn inf_mapper(var c: C, var inf: Inf, sg: Int) -> Int:
     if con >= 0 and sg in c.sig_outer: con = bind.instantiate(&c, con, c.sig_outer[sg])
     if inf.cov[i].len > 0:
       let prim = (con >= 0 and prim_constraint(&c, con)) or is_const_tp(c, tp)
-      let widen_lits = not prim and inf.top[i] and (c.inf_fixing or not (ret >= 0 and at_top_level(c, ret, tp)))
+      let widen_lits = not prim and inf.top[i] and (c.inf_fixing or tp in c.inf_fixed or not (ret >= 0 and at_top_level(c, ret, tp)))
       var base: [Int] = []
       for x in inf.cov[i]:
         if prim: base.push(types.regular(c, x))
@@ -8267,11 +8293,84 @@ fn fresh_of(c: C, t: Int) -> Int:
 
 # ---- statements
 
+# Whether a context-sensitive argument's contextual type fixes tp: a call signature's parameter
+# types mention it (the signature at the top, or a property's, one level down).
+fn fixed_by(var c: C, pt: Int, tp: Int) -> Bool:
+  for m in types.members(c, pt):
+    var parts: [Int] = [m]
+    if c.tk[m] == TK_INTER: parts = types.members_inter(c, m)
+    for x in parts:
+      if c.tk[x] != TK_OBJ: continue
+      var fns: [Int] = [x]
+      let ax = rel.apparent(&c, x)
+      if bind.sigs_of(&c, ax, false).len == 0 and c.objs[c.ta[ax]].kind != OK_TUPLE:
+        let names = bind.prop_names(&c, ax)
+        if names.len <= 40:
+          for name in names:
+            let ps = bind.get_prop(&c, ax, name)
+            if ps >= 0: fns.push(bind.prop_type_for(&c, ps, ax))
+      for f in fns:
+        for fm2 in types.members(c, f):
+          if c.tk[fm2] != TK_OBJ: continue
+          for sg in bind.sigs_of(&c, fm2, false):
+            let s0 = types.sig_copy(c, sg)
+            # (a rest parameter typed as a type parameter: the non-fixing mapper)
+            let nq = s0.ptypes.len
+            if nq > 0 and s0.pflags[nq - 1] == 2 and c.tk[s0.ptypes[nq - 1]] == TK_TPARAM: continue
+            for q in s0.ptypes:
+              if mentions_tp(&c, q, tp, 0): return true
+  return false
+
+# Whether t mentions the type parameter tp (structurally; what isn't walked counts as not).
+fn mentions_tp(var c: C, t: Int, tp: Int, d: Int) -> Bool:
+  if t == tp: return true
+  if d > 6 or t < 0: return false
+  let k = c.tk[t]
+  if k == TK_UNION:
+    for m in types.members(c, t):
+      if mentions_tp(&c, m, tp, d + 1): return true
+    return false
+  if k == TK_INTER:
+    for m in types.members_inter(c, t):
+      if mentions_tp(&c, m, tp, d + 1): return true
+    return false
+  if k == types.TK_KEYOF: return mentions_tp(&c, c.ta[t], tp, d + 1)
+  if k == types.TK_INDEXED: return mentions_tp(&c, c.ta[t], tp, d + 1) or mentions_tp(&c, c.tb[t], tp, d + 1)
+  if k != TK_OBJ: return false
+  let kind = c.objs[c.ta[t]].kind
+  if kind == OK_REF or kind == OK_TUPLE:
+    for a in types.ints(c.objs[c.ta[t]].args):
+      if mentions_tp(&c, a, tp, d + 1): return true
+    return false
+  if kind == types.OK_ANON or kind == types.OK_INST:
+    for sg in bind.sigs_of(&c, t, false):
+      let s1 = types.sig_copy(c, sg)
+      for q in s1.ptypes:
+        if mentions_tp(&c, q, tp, d + 1): return true
+      if s1.ret >= 0 and mentions_tp(&c, s1.ret, tp, d + 1): return true
+    let names = bind.prop_names(&c, t)
+    if names.len > 20: return false
+    for name in names:
+      let ps = bind.get_prop(&c, t, name)
+      if ps >= 0:
+        let pt2 = bind.prop_type_for(&c, ps, t)
+        if mentions_tp(&c, pt2, tp, d + 1): return true
+  return false
+
+# A candidate that doesn't fit: what checking its arguments reported is dropped, and the function
+# bodies it checked are checked again for the one chosen.
+fn drop_attempt(var c: C, dlen: Int, clen: Int):
+  while c.diags.len > dlen: c.diags.pop()
+  while c.checked_log.len > clen:
+    let d = c.checked_log.pop()
+    c.checked_fns.remove(d)
+
 fn check_function_body(var c: C, d: Int, sg: Int):
   if d in c.checked_fns: return
   # (a function inside a loop checked speculatively is checked in the real pass)
   if c.spec > 0: return
   c.checked_fns[d] = true
+  c.checked_log.push(d)
   let body = fn_body(c, d)
   if body < 0: return
   # outer narrowings of variables that can change don't hold inside a function

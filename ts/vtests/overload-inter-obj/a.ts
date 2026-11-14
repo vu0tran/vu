@@ -1,0 +1,15 @@
+type Shared = { min?: number };
+type A<T, U> = Shared & { sel?: (v: T) => U; cmp?: "a" | "b" };
+type B<T> = Shared & { cmp: (a: T, b: T) => boolean; sel?: undefined };
+type C2<T, U> = Shared & { cmp: (a: U, b: U) => boolean; sel: (v: T) => U };
+declare function ua<T, U>(x: T, c?: A<T, U>): T[];
+declare function ua<T>(x: T, c: B<T>): T[];
+declare function ua<T, U>(x: T, c: C2<T, U>): T[];
+const r1: number = ua({ id: "s" }, { sel: (e) => e.id });
+const r2: number = ua(1, { cmp: (a, b) => a === b });
+type Req = { need: string } & { opt?: (n: number) => void };
+declare function ov(x: Req): string;
+declare function ov(x: { other: (s: string) => void }): number;
+const r4: boolean = ov({ opt: (n) => {}, need: "a" });
+const r5: boolean = ov({ other: (s) => {} });
+export {};
