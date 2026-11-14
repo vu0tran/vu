@@ -1,0 +1,13 @@
+type F = ((arg: { a: 1 }) => void) | ((arg: { a: 1; b: 2 }) => void);
+type I3 = F extends (arg: infer I) => void ? I : never;
+declare const i3: I3;
+const z: string = i3;
+type G = ((arg: string) => void) | ((arg: number) => void);
+type I4 = G extends (arg: infer I) => void ? I : never;
+declare const i4: I4;
+const w: string = i4;
+type H = ((arg: "a") => void) | ((arg: string) => void);
+type I5 = H extends (arg: infer I) => void ? I : never;
+declare const i5: I5;
+const v: number = i5;
+export {};
