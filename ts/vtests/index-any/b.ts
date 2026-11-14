@@ -1,0 +1,13 @@
+type B = ["a"][any];
+const b: boolean = null as unknown as B;
+type D = [1, ...string[]][any];
+const d: boolean = null as unknown as D;
+type E = { [k: number]: 1 }[any];
+const e: boolean = null as unknown as E;
+type F = [1, "x"][number];
+const f: boolean = null as unknown as F;
+type G = ("a" | "b")[][any];
+const g: boolean = null as unknown as G;
+type H = { [k: string]: "lit" }[any];
+const h: boolean = null as unknown as H;
+export {};
