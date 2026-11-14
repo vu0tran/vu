@@ -173,15 +173,53 @@ fn hidden_by(src: Str, ls: [Int], dirs: {Int: Int}, pos: Int) -> Int:
 
 # Whether the first line after line l (0-based) that isn't blank or a // comment starts with @.
 fn decorator_next(src: Str, ls: [Int], l: Int) -> Bool:
+  return decorator_at(src, ls, l) >= 0
+
+# Where the name of a class declared on the next code line after line l starts (-1 when none).
+fn class_next(src: Str, ls: [Int], l: Int) -> Int:
   var line = l + 1
   while line < ls.len:
     var a = ls[line]
     var b = src.len
     if line + 1 < ls.len: b = ls[line + 1]
     while a < b and (src[a] == ' ' or src[a] == '\t' or src[a] == '\r' or src[a] == '\n'): a += 1
-    if a < b and not (b - a >= 2 and src[a] == '/' and src[a + 1] == '/'): return src[a] == '@'
+    if a < b and not (b - a >= 2 and src[a] == '/' and src[a + 1] == '/'):
+      var x = a
+      if src[x..b].startswith("abstract "): x += 9
+      if not src[x..b].startswith("class "): return -1
+      return x + 6
     line += 1
-  return false
+  return -1
+
+fn idch(ch: Byte) -> Bool:
+  return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '$' or ch >= 128
+
+# How many times a name appears in src as a whole word.
+fn word_count(src: Str, w: Str) -> Int:
+  if w == "": return 0
+  var n = 0
+  var i = src.find(w)
+  while i >= 0:
+    let before = i == 0 or not idch(src[i - 1])
+    let j = i + w.len
+    let after = j >= src.len or not idch(src[j])
+    if before and after: n += 1
+    i = types.find_from(src, w, j)
+  return n
+
+# Where the decorator on the next code line after line l starts (its @), -1 when none.
+fn decorator_at(src: Str, ls: [Int], l: Int) -> Int:
+  var line = l + 1
+  while line < ls.len:
+    var a = ls[line]
+    var b = src.len
+    if line + 1 < ls.len: b = ls[line + 1]
+    while a < b and (src[a] == ' ' or src[a] == '\t' or src[a] == '\r' or src[a] == '\n'): a += 1
+    if a < b and not (b - a >= 2 and src[a] == '/' and src[a + 1] == '/'):
+      if src[a] == '@': return a
+      return -1
+    line += 1
+  return -1
 
 fn line_col(src: Str, pos: Int) -> [Int]:
   var line = 1
@@ -278,6 +316,8 @@ type Prog:
   pvals: [[Str]] = []
   node16: Bool = false   # moduleResolution node16 / nodenext: a CommonJS importer's packages by "require"
   meta_ok: Bool = false  # module es2020, es2022, esnext or preserve: import.meta is allowed everywhere
+  exp_deco: Bool = false  # experimentalDecorators
+  no_unused: Bool = false  # noUnusedLocals
 
 # A file TypeScript treats as CommonJS under node16 / nodenext: .cts, or .ts / .d.ts in a package
 # whose nearest package.json has no "type": "module".
@@ -485,6 +525,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   c.spi = pg.spi
   c.unknown_catch = pg.unknown_catch
   c.meta_ok = pg.meta_ok
+  c.exp_deco = pg.exp_deco
   for k, v in pkg_present: c.pkg_present[k] = v
   for k, v in pkg_res: c.pkg_res[k] = v + ""
   for fx in 0..names.len:
@@ -581,6 +622,8 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   var dir_used: {Int: Bool} = {}           # (file << 32 | start)
   var lstarts: {Int: [Int]} = {}
   var deco_dirs: {Int: Int} = {}
+  var presumed_used: {Int: Bool} = {}
+  var unused_dirs: {Int: Int} = {}
   for fi in user_from..roots.len:
     if not (fi in c.t.dirs): continue
     let ds = c.t.dirs[fi]
@@ -597,10 +640,28 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
     # known)
     var dj = 0
     while dj < ds.len:
-      if ds[dj + 2] == 2 and not (fi in c.unsupported) and decorator_next(srcs[fi], lstarts[fi], line_of(lstarts[fi], ds[dj + 1])):
-        deco_dirs[fi] = ds[dj]
+      if ds[dj + 2] == 2 and not (fi in c.unsupported) and mine[fi]:
+        # (a property decorator checked: its errors are known; by the worker checking the file)
+        let da = decorator_at(srcs[fi], lstarts[fi], line_of(lstarts[fi], ds[dj + 1]))
+        if da >= 0 and not (((fi << 32) | (da + 1)) in c.deco_checked): deco_dirs[fi] = ds[dj]
+        # (noUnusedLocals: over a class declaration whose name appears nowhere else, the class is
+        # unused, TS6133, and the directive is used; appearing elsewhere: not known here)
+        if pg.no_unused and mine[fi]:
+          let cp = class_next(srcs[fi], lstarts[fi], line_of(lstarts[fi], ds[dj + 1]))
+          if cp >= 0:
+            var ce = cp
+            while ce < srcs[fi].len and idch(srcs[fi][ce]): ce += 1
+            let cn = srcs[fi][cp..ce]
+            let ck = (fi << 32) | cp
+            # (referenced as a value: used, no TS6133)
+            let refd = ck in c.class_at and c.class_at[ck] in c.value_refs
+            # (a class in a function, never referenced: unused)
+            if word_count(srcs[fi], cn) == 1 or (ck in c.class_at and not refd): presumed_used[(fi << 32) | ds[dj]] = true
+            else: unused_dirs[fi] = ds[dj]
       dj += 3
   for fi, at in deco_dirs: c.unsupported[fi] = "a @ts-expect-error directive over a decorator at {at}"
+  for fi, at in unused_dirs:
+    if not (fi in c.unsupported): c.unsupported[fi] = "a @ts-expect-error directive over a class noUnusedLocals may report at {at}"
   # (a message printing a type tsc prints differently: the file isn't checked)
   var noshow: {Int: Int} = {}
   for d in c.diags:
@@ -629,7 +690,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       let ds = c.t.dirs[fi]
       var di = 0
       while di < ds.len:
-        if ds[di + 2] == 2 and not (((fi << 32) | ds[di]) in dir_used):
+        if ds[di + 2] == 2 and not (((fi << 32) | ds[di]) in dir_used) and not (((fi << 32) | ds[di]) in presumed_used):
           all.push(parse.Diag(rank[fi], ds[di], ds[di + 1], 2578, "Unused '@ts-expect-error' directive."))
           all_lib.push(false)
         di += 3
@@ -754,6 +815,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     if mr == "" and (mo == "node16" or mo == "node18" or mo == "node20" or mo == "nodenext"): mr = "nodenext"
     pg.node16 = mr == "node16" or mr == "nodenext"
     pg.meta_ok = mo == "es2020" or mo == "es2022" or mo == "esnext" or mo == "preserve"
+    pg.exp_deco = cfg.opts.get("experimentaldecorators", "") == "true"
+    pg.no_unused = cfg.opts.get("nounusedlocals", "") == "true"
     for x in cfg.pkeys: pg.pkeys.push(x + "")
     for vs in cfg.pvals:
       var vv: [Str] = []
@@ -774,7 +837,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     for k in 0..jobs:
       var fc: [Str] = []
       for x in files: fc.push(x + "")
-      var pk = Prog(has_types: pg.has_types, tdir: pg.tdir + "", spi: pg.spi, unknown_catch: pg.unknown_catch, node16: pg.node16, meta_ok: pg.meta_ok)
+      var pk = Prog(has_types: pg.has_types, tdir: pg.tdir + "", spi: pg.spi, unknown_catch: pg.unknown_catch, node16: pg.node16, meta_ok: pg.meta_ok, exp_deco: pg.exp_deco, no_unused: pg.no_unused)
       for x in pg.libs: pk.libs.push(x + "")
       for x in pg.types: pk.types.push(x + "")
       for x in pg.pkeys: pk.pkeys.push(x + "")

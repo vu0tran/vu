@@ -1,0 +1,13 @@
+declare const SlotSymbol: unique symbol;
+type Slots = { [SlotSymbol]?: { a: number } };
+type Unwrap<S extends Slots> = NonNullable<S[typeof SlotSymbol]>;
+type U1 = Unwrap<{}>;
+type G<T> = T extends any ? T["x" & keyof T] : never;
+type P<T, K extends PropertyKey> = T[K & keyof T];
+type Q = P<{ a: 1 }, "b">;
+const q: string = null as any as Q;
+type R<T extends { x?: unknown }> = T["x"];
+type R1 = R<{}>;
+const r: string = 1 as any as R1;
+const r2: R1 = 1;
+export {};
