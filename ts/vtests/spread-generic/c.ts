@@ -1,0 +1,17 @@
+declare function h(a: string): string;
+declare function h(a: number, b?: boolean): number;
+declare const t1: [string];
+declare const t2: [number, boolean?];
+declare const t3: [boolean];
+declare const t4: [number, boolean, string];
+const r1: number = h(...t1);
+const r2: string = h(...t2);
+declare function k<T>(a: T, b?: T): T[];
+declare function m<K extends "a" | "b">(k: K): K;
+declare function m(k: string): number;
+declare const t5: [string];
+declare const t6: ["a"];
+const r5: string = m(...t5);
+const r6: number = m(...t6);
+export {};
+declare const t7: [number, number?]; const r7: string = k(...t7);
