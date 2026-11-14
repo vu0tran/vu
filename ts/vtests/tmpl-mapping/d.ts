@@ -1,0 +1,15 @@
+declare const a: `x${Capitalize<string>}`;
+const b1: Capitalize<string> = a;
+declare const c: `${Capitalize<string>}x${number}`;
+const b2: Capitalize<string> = c;
+const b3: Uncapitalize<string> = c;
+declare const d: `ab${Uppercase<string>}`;
+const b4: Lowercase<string> = d;
+const b5: Uncapitalize<string> = d;
+declare const e: `AB${number}`;
+const b6: Uppercase<string> = e;
+const b7: Uppercase<string> = `AB${"c"}` as const;
+const b8: Uppercase<string> = `AB${"C"}` as const;
+const b9 = `x${1}${true}` as const;
+const n9: number = b9;
+export {};

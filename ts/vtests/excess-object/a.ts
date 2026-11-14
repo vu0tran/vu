@@ -1,0 +1,12 @@
+declare function f(o: Object): void;
+declare function g(o: Object | string): void;
+declare function h(o: { a: number } | Object): void;
+declare function k(o: {}): void;
+f({ scopes: 1 });
+g({ scopes: 1 });
+h({ scopes: 1 });
+k({ scopes: 1 });
+const x: Object = { a: 1 };
+const y: Object & { b: number } = { a: 1, b: 2 };
+f({ toString: 1 });
+h({ a: "x" });

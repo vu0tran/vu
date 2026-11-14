@@ -1,0 +1,25 @@
+type F = `N8N_ENV_FEAT_${Uppercase<string>}`;
+type G = `${Lowercase<string>}-x`;
+type H = `${Uppercase<string>}`;
+type I = `a${Capitalize<string>}b${number}`;
+function f(e: F): string { return e; }
+f('N8N_ENV_FEAT_SOME_FLAG');
+f('N8N_ENV_FEAT_some');
+f('N8N_ENV_FEAT_');
+const g1: G = "abc-x";
+const g2: G = "aBc-x";
+const h1: H = "ABC";
+const h2: H = "aBC";
+const i1: I = "aXyb3";
+const i2: I = "axyb3";
+const i3: I = "aXybq";
+declare const ff: F;
+const s: string = ff;
+const g3: G = ff;
+const n: number = ff;
+const hh: number = h1;
+const env: Record<string, string | undefined> = {};
+const v: number = env[ff];
+let u: Uppercase<string> = "A";
+const fu: F = `N8N_ENV_FEAT_${u}`;
+export {};

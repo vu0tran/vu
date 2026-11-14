@@ -1,0 +1,20 @@
+type F = `N8N_${Uppercase<string>}`;
+declare const f: F;
+const a1: `N8N_${string}` = f;
+const a2: `N${string}` = f;
+const a3: Uppercase<string> = f;
+const a4: `N8N_${Lowercase<string>}` = f;
+const a5: `X_${Uppercase<string>}` = f;
+type U = `a_${Uppercase<string>}` | `b_${Lowercase<string>}`;
+const u1: U = "a_X";
+const u2: U = "b_x";
+const u3: U = "a_x";
+const u4: U = "c";
+const lit = `N8N_${"abc"}` as const;
+const a6: F = lit;
+function g(x: string) { const y: F = `N8N_${x.toUpperCase()}`; return y; }
+const a7: F = "N8N_123";
+const a8: F = "N8N_";
+const a9: `${Capitalize<string>}!` = "!";
+const a10: `${Uncapitalize<string>}!` = "a!";
+export {};
