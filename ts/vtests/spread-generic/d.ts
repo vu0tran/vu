@@ -1,0 +1,10 @@
+declare function cf<T = never>(...values: T[]): T;
+declare function cf<TArgs extends any[] | [any]>(...values: TArgs): TArgs[number];
+const IK = ['x', 'y'] as const;
+const a: number = cf(...IK, 'length');
+declare function g(a: string, b: number, c: boolean): void;
+declare const t2: [string, number];
+g(...t2, true);
+declare function h(a: string, ...r: number[]): number;
+const b: string = h(...(["a", 1] as const), 2, 3);
+export {};

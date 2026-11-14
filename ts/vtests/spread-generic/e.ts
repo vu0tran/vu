@@ -1,0 +1,10 @@
+declare function cf<T = never>(...values: T[]): T;
+declare function cf<TArgs extends any[] | [any]>(...values: TArgs): TArgs[number];
+const A = new Set(["a", "b"]);
+const B: ReadonlySet<string> = new Set(["c"]);
+const r1: number = cf(...A, ...B);
+declare const nums: number[];
+const r2: string = cf(...nums, "x");
+declare function h(...r: number[]): void;
+h(...nums, 1, ...nums);
+export {};
