@@ -1,0 +1,15 @@
+type EP<T> = T extends string[] ? { [K in `on${Capitalize<T[number]>}`]?: (...args: any[]) => any } : never;
+type P = EP<string[]>;
+declare const p: P;
+const f: number = p.onClick;
+const g = p.onclick;
+const o1: P = { onClick: () => 1 };
+const o2: P = { onClick: 5 };
+const o3: P = { other: 1 };
+const n: number = p;
+type Q = { [K in `data-${string}`]: string };
+const q: Q = { "data-a": "x" };
+const q2: Q = { "data-a": 1 };
+declare const qq: Q;
+const s: number = qq["data-z"];
+export {};
