@@ -1,0 +1,11 @@
+declare function f<T extends string>(): void;
+f<number>();
+f<"a">();
+declare function g<T extends { a: number }, U extends keyof T>(): void;
+g<{ a: 1 }, "b">();
+declare function h(x: number): void;
+declare function h<T extends string>(x: T): void;
+h<number>(1);
+declare const o: { m<T extends number[]>(): T };
+const r = o.m<string[]>();
+export {};
