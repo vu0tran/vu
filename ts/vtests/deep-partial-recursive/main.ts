@@ -1,0 +1,20 @@
+export {};
+type Builtin = string | number | boolean | null | undefined | Function | Date | RegExp;
+type DeepPartial<T> = T extends Builtin ? T : T extends ReadonlyArray<infer V> ? Array<DeepPartial<V> | undefined> : T extends {} ? { [K in keyof T]?: DeepPartial<T[K]> } : T;
+type JsonValue = string | number | boolean | null | JsonObject | JsonValue[];
+type JsonObject = { [key: string]: JsonValue };
+declare function mock<T>(impl?: DeepPartial<T>): T;
+declare const o: JsonObject;
+declare const v: JsonValue;
+declare const arr: JsonValue[];
+export const a = mock<JsonObject>(o);
+export const b: DeepPartial<JsonValue> = v;
+export const c: DeepPartial<JsonValue[]> = arr;
+export const d: DeepPartial<JsonObject> = { x: [1, "a", { y: [null] }], z: undefined };
+declare const dp: DeepPartial<JsonValue>;
+export const e: string | number | boolean | null | object | undefined = dp;
+interface Node1 { name: string; kids: Node1[]; parent?: Node1 }
+declare const n: Node1;
+export const f: DeepPartial<Node1> = n;
+export const g: DeepPartial<Node1> = { kids: [{ name: "x" }, undefined] };
+export const h: DeepPartial<Node1>["kids"] = [];

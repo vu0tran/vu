@@ -144,8 +144,11 @@ fn keyof_of(var c: C, t: Int) -> Int:
     let text = c.t.names[name] + ""
     if text.startswith("[Symbol."): continue
     # a property named by a numeric literal gives a number literal key
+    if text.startswith("#"): continue
     let ps = bind.get_prop(&c, a, name)
     var numeric = false
+    # (a class's private and protected members aren't keys, getLiteralTypeFromProperties)
+    if ps >= 0 and (c.sflags[ps] & (types.SF_PRIVATE | types.SF_PROTECTED)) != 0: continue
     if ps >= 0:
       let d = c.sdecl[ps]
       if d >= 0:
@@ -895,6 +898,11 @@ fn mapped_over(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int) -> Int:
   if r != t: c.tl_cache[key] = r
   return r
 
+fn mapped_index_value(var c: C, tmpl: Int, m: Int, fl: Int) -> Int:
+  let v = bind.instantiate(&c, tmpl, m)
+  if (fl & ast.MAP_OPTIONAL) != 0: return types.union_of(&c, [v, c.undef_t])
+  return v
+
 fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) -> Int:
   let fl = c.t.nd[n].f
   let o = c.ta[t]
@@ -903,14 +911,15 @@ fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) 
   for key in types.members(c, cons):
     let kk = c.tk[key]
     let m2 = extend(&c, m, tp, key)
+    # (an index signature of an optional mapped type takes undefined, addOptionality)
     if kk == TK_STRING:
-      c.objs[o].sidx = bind.instantiate(&c, tmpl, m2)
+      c.objs[o].sidx = mapped_index_value(&c, tmpl, m2, fl)
       continue
     if kk == TK_NUMBER:
-      c.objs[o].nidx = bind.instantiate(&c, tmpl, m2)
+      c.objs[o].nidx = mapped_index_value(&c, tmpl, m2, fl)
       continue
     if kk == TK_SYMBOL and c.tb[key] == 0:
-      c.yidx[o] = bind.instantiate(&c, tmpl, m2)
+      c.yidx[o] = mapped_index_value(&c, tmpl, m2, fl)
       continue
     if kk == types.TK_TEMPLATE:
       # (a pattern key, `on${string}`: a template literal index signature, optional adding
@@ -941,7 +950,6 @@ fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) 
         name = ast.intern(&c.t, ntx)
       elif c.tk[nk] == TK_SYMBOL and c.tb[nk] == 1: name = chk.symbol_key(&c, nk)
       else: continue
-      var pt = bind.instantiate(&c, tmpl, m2)
       var opt = false
       var ro = false
       var odecl = -1
@@ -968,14 +976,24 @@ fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) 
           opt = all_opt
           ro = all_ro
       if (fl & ast.MAP_OPTIONAL) != 0: opt = true
+      # (the property's type is instantiated when asked for, as tsc resolves a mapped type's
+      # members lazily: DeepPartial<T> of a large graph makes only what is read)
+      var pt = -1
       if (fl & ast.MAP_NOOPTIONAL) != 0:
+        pt = bind.instantiate(&c, tmpl, m2)
         if opt: pt = types.filter_union(&c, pt, true, false)
         opt = false
       if (fl & ast.MAP_READONLY) != 0: ro = true
       if (fl & ast.MAP_NOREADONLY) != 0: ro = false
       let ps = types.new_sym(&c, S_PROP, name, n)
       c.order_decl[ps] = odecl
-      c.stype[ps] = pt
+      if pt >= 0: c.stype[ps] = pt
+      else:
+        if not (n in c.mtmpl):
+          let tsym = types.new_sym(&c, S_PROP, name, n)
+          c.stype[tsym] = tmpl
+          c.mtmpl[n] = tsym
+        c.lazy_inst[ps] = [c.mtmpl[n], m2]
       var f = 0
       if opt: f = f | SF_OPTIONAL
       if ro: f = f | SF_READONLY
@@ -985,7 +1003,23 @@ fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) 
   # a mapped type over concrete keys made concrete properties: nothing in it to instantiate
   var concrete = true
   for name in types.ints(c.objs[o].order):
-    if chk.could_contain_tvars(&c, c.stype[c.objs[o].props[name]]): concrete = false
+    let ps1 = c.objs[o].props[name]
+    if c.stype[ps1] >= 0:
+      if chk.could_contain_tvars(&c, c.stype[ps1]): concrete = false
+    elif ps1 in c.lazy_inst:
+      # (a lazy one: concrete when the template is, or what the mapper gives is)
+      let li = types.ints(c.lazy_inst[ps1])
+      if chk.could_contain_tvars(&c, c.stype[li[0]]):
+        # (the type parameters the template mentions, as the mapper gives them)
+        let tn = c.t.nd[n].c
+        if not (tn in c.cond_free):
+          var refs: [Int] = []
+          free_tp_refs(&c, tn, tn, &refs)
+          c.cond_free[tn] = refs
+        for ftp in types.ints(c.cond_free[tn]):
+          let x = bind.instantiate(&c, ftp, li[1])
+          if chk.could_contain_tvars(&c, x): concrete = false
+    else: concrete = false
   if c.objs[o].sidx >= 0 and chk.could_contain_tvars(&c, c.objs[o].sidx): concrete = false
   if c.objs[o].nidx >= 0 and chk.could_contain_tvars(&c, c.objs[o].nidx): concrete = false
   if concrete: c.concrete_objs[o] = true
@@ -999,7 +1033,31 @@ fn cond_of(var c: C, n: Int, m: Int) -> Int:
   if c.cond_depth > 50: return bind.lazy_unsupported(&c, n, "conditional types instantiated too deeply")
   c.cond_depth += 1
   let ms = strip_infers(&c, n, m)
-  let r = cond_of0(&c, n, ms)
+  # (one that refers to itself while it is resolved, DeepPartial<J> through Array<DeepPartial<J>>:
+  # tsc defers the array reference; here, resolved twice inside itself, the third gets an empty
+  # union, filled by the second when its result is a union)
+  let bk = cond_key(&c, n, ms)
+  var cnt = 0
+  if bk in c.cond_busy: cnt = c.cond_busy[bk]
+  if cnt >= 2:
+    c.cond_depth -= 1
+    if not (bk in c.cond_shell): c.cond_shell[bk] = types.mk(&c, TK_UNION, types.F_UNION, 0, 0)
+    return c.cond_shell[bk]
+  c.cond_busy[bk] = cnt + 1
+  var r = cond_of0(&c, n, ms)
+  if cnt == 0: c.cond_busy.remove(bk)
+  else: c.cond_busy[bk] = cnt
+  if cnt == 1 and bk in c.cond_shell:
+    let sh = c.cond_shell[bk]
+    c.cond_shell.remove(bk)
+    # (an object result: the shell shares its object)
+    if (c.tk[r] == TK_UNION or c.tk[r] == TK_OBJ) and r != sh:
+      c.tk[sh] = c.tk[r]
+      c.tf[sh] = c.tf[r]
+      c.ta[sh] = c.ta[r]
+      c.tb[sh] = c.tb[r]
+      r = sh
+    elif c.tk[r] != TK_UNSUP: r = bind.lazy_unsupported(&c, n, "a conditional type that refers to itself")
   c.cond_depth -= 1
   return r
 

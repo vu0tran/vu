@@ -1,0 +1,10 @@
+export {};
+type Tok = "a" | "b";
+type Loc<Template> = { [T in Tok]: Template };
+type V = string | { one: string };
+const l: Loc<V> = { a: { one: "x" }, b: "y" };
+const bad: Loc<V> = { a: 1, b: "y" };
+type Rec<K extends string, T> = { [P in K]: T };
+declare const r: Rec<"0", unknown>;
+const r2: Rec<"0", unknown> = r;
+const r3: Rec<"0", number> = r;
