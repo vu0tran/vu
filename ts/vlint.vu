@@ -25,6 +25,7 @@ import lprint
 import lsupp
 import lglob
 import ljs
+import lvtsc
 
 const HELP = """
   Usage: [-c=<./.oxlintrc.json>] [PATH]...
@@ -1146,28 +1147,19 @@ fn work_copy(w: Work, o: lout.Opts, ffi: Ffi) -> Work:
   for x in w.sev_of: c.sev_of.push(x)
   return c
 
-# Type-aware rules by tsgolint: its diagnostics come after the others, in the order it sends them.
-# Returns oxlint's message when tsgolint fails.
-fn type_aware_run(fs: Fs, os: Os, cwd: Str, o: lout.Opts, exe: Str, w: Work, check: Bool, var results: [[lout.Rec]], var shown: [Str]) -> Str:
-  let m = w.cx.m
-  let dflt = ltsgo.defaults()
-  var files: [Str] = []
-  var sets: [Str] = []
-  var idx_of: {Str: Int} = {}
-  for i in 0..w.files.len:
-    if not want(w.files[i]): continue
-    idx_of[w.files[i]] = i
-    files.push(w.files[i] + "")
-    sets.push(ltsgo.ruleset(m, dflt, w.sevs[w.sev_of[i]], w.optss[w.sev_of[i]]))
-  var any = check
-  for x in sets:
-    if x != "": any = true
-  if not any: return ""
-  let dir = fs.temp_dir() else return "Error running tsgolint: \"can't create a temporary folder\""
+# tsgolint run over files (sets: each one's rules, "" none): its messages, or oxlint's message when
+# it fails (err)
+type TsgoOut:
+  err: Str
+  ms: [ltsgo.Msg]
+
+fn tsgo_run(fs: Fs, os: Os, cwd: Str, exe: Str, files: [Str], sets: [Str], check: Bool) -> TsgoOut:
+  var r = TsgoOut("", [])
+  let dir = fs.temp_dir() else return TsgoOut("Error running tsgolint: \"can't create a temporary folder\"", [])
   let pin = dir + "/payload.json"
   let pout = dir + "/out.bin"
   let perr = dir + "/err.txt"
-  fs.write(pin, ltsgo.payload(files, sets, check)) else return "Error running tsgolint: \"can't write the payload\""
+  fs.write(pin, ltsgo.payload(files, sets, check)) else return TsgoOut("Error running tsgolint: \"can't write the payload\"", [])
   var rc = os.run(["sh", "-c", "exec \"$0\" headless < \"$1\" > \"$2\" 2> \"$3\"", exe, pin, pout, perr]) else -1
   var out = fs.read(pout) else ""
   var errt = fs.read(perr) else ""
@@ -1210,13 +1202,70 @@ fn type_aware_run(fs: Fs, os: Os, cwd: Str, o: lout.Opts, exe: Str, w: Work, che
   fs.remove(pout) else 0
   fs.remove(perr) else 0
   fs.remove(dir) else 0
-  if rc < 0: return "Failed to spawn tsgolint from path `{exe}`"
+  if rc < 0:
+    r.err = "Failed to spawn tsgolint from path `{exe}`"
+    return r
   let ms = ltsgo.parse_messages(out)
   # oxlint formats Rust's ExitStatus, whose Display is "exit status: N" already, after its own
   # "exit status: ", then prints the String with {:?} (quoted, escaped)
   for msg in ms:
-    if msg.kind == 0 and rc != 0: return "Error running tsgolint: " + rust_debug_str("exit status: exit status: {rc}, error: {msg.msg}")
-  if rc != 0: return "Error running tsgolint: " + rust_debug_str("exit status: exit status: {rc}")
+    if msg.kind == 0 and rc != 0:
+      r.err = "Error running tsgolint: " + rust_debug_str("exit status: exit status: {rc}, error: {msg.msg}")
+      return r
+  if rc != 0:
+    r.err = "Error running tsgolint: " + rust_debug_str("exit status: exit status: {rc}")
+    return r
+  r.ms = ms
+  return r
+
+# Type-aware rules by tsgolint: its diagnostics come after the others, in the order it sends them.
+# With the type check, vtsc's errors for the files it fully checks (lvtsc), tsgolint's for the
+# others. Returns oxlint's message when tsgolint fails.
+fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w: Work, check: Bool, var results: [[lout.Rec]], var shown: [Str]) -> Str:
+  let m = w.cx.m
+  let dflt = ltsgo.defaults()
+  var files: [Str] = []
+  var sets: [Str] = []
+  var idx_of: {Str: Int} = {}
+  for i in 0..w.files.len:
+    if not want(w.files[i]): continue
+    idx_of[w.files[i]] = i
+    files.push(w.files[i] + "")
+    sets.push(ltsgo.ruleset(m, dflt, w.sevs[w.sev_of[i]], w.optss[w.sev_of[i]]))
+  var any = check
+  for x in sets:
+    if x != "": any = true
+  if not any: return ""
+  var ms: [ltsgo.Msg] = []
+  if check and os.env("VLINT_VTSC") == "1":
+    let pl = lvtsc.plan(fs, os, ffi, files)
+    var fa: [Str] = []
+    var sa: [Str] = []
+    var fb: [Str] = []
+    var sb: [Str] = []
+    for i in 0..files.len:
+      if files[i] in pl.covered:
+        if sets[i] != "":
+          fb.push(files[i] + "")
+          sb.push(sets[i] + "")
+      else:
+        fa.push(files[i] + "")
+        sa.push(sets[i] + "")
+    var ma: [ltsgo.Msg] = []
+    var mb: [ltsgo.Msg] = []
+    if fa.len > 0:
+      let ra = tsgo_run(fs, os, cwd, exe, fa, sa, true)
+      if ra.err != "": return ra.err
+      for x in ra.ms: ma.push(lvtsc.copy_msg(x))
+    if fb.len > 0:
+      let rb = tsgo_run(fs, os, cwd, exe, fb, sb, false)
+      if rb.err != "": return rb.err
+      for x in rb.ms: mb.push(lvtsc.copy_msg(x))
+    ms = lvtsc.merge(pl, files, ma, mb)
+  else:
+    let r = tsgo_run(fs, os, cwd, exe, files, sets, check)
+    if r.err != "": return r.err
+    for x in r.ms: ms.push(lvtsc.copy_msg(x))
   var srcs: {Str: Str} = {}
   var dirs: {Str: Int} = {}
   var dlist: [rules.Dirs] = []
@@ -1329,7 +1378,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       if not a.no_ignore and (lglob.gi_ignores(w.over, r, false) or lglob.gi_ignores(explicit_ignore, r, false)): continue
       if want(r) or r.endswith(".vue") or r.endswith(".astro") or r.endswith(".svelte"): files.push(r + "")
       continue
-    # ignore files in the folders above a root (up to the repository's root)
+    # ignore files in the folders above a root (up to the repository's root; outside a repository,
+    # every folder's: oxlint's walker doesn't require git)
     var ups: [Str] = []
     var d = parent_dir(r)
     var stop = false
@@ -1337,7 +1387,6 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       ups.push(d + "")
       if fs.exists(d + "/.git") or fs.exists(d + "/.jj"): stop = true
       d = parent_dir(d)
-    if not stop: ups = []
     var w2 = Walker([], lglob.gi_new(cwd), w.use_ignore, w.ignore_name)
     for x in w.over.globs: w2.over.globs.push(x + "")
     for x in w.over.neg: w2.over.neg.push(x)
@@ -1606,7 +1655,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
         var r = rc.recv()?
         swap(&results[r.idx], &r.recs)
   if type_aware:
-    let e = type_aware_run(fs, os, cwd, o, tsgo, work_ta, type_check, &results, &shown2)
+    let e = type_aware_run(fs, os, ffi, cwd, o, tsgo, work_ta, type_check, &results, &shown2)
     if e != "":
       write(e + "\n")
       exit(1)

@@ -211,6 +211,28 @@ parser is shared, so vtsc gets this too); no-setter-return's span on a parenthes
 | `--suppress-all`, `--prune-suppressions` (hidden), `oxlint-suppressions.json` | yes (`lsupp.vu`) |
 | `--type-check-only` (hidden) | yes (tsgolint's type check only, oxlint's messages for invalid combinations) |
 
+**The type check by vtsc (`VLINT_VTSC=1`, off by default, 2026-11-14)**: with `--type-check`,
+vlint can take the type errors from vtsc, its own checker, run in the same process, for every
+file vtsc fully checks in its tsconfig's program. tsgolint then type-checks only the other files
+and still runs the type-aware rules (`lvtsc.vu`). The errors are tsgolint's, file for file and in
+its order (each program's errors in program order, imports first, before that program's rule
+diagnostics). Against oxlint 1.90.0 with n8n's tsgolint 0.21.1, default configuration, on 22 n8n
+packages: no difference in either `--type-check` (every line equal) or `--type-check-only`.
+vtsc checks 809 of the 1,280 linted files under a tsconfig; the rest are files that tsconfig
+doesn't include, files that use something vtsc doesn't model, and every file of the 6 packages
+whose tsconfig has `references`. It stays off because it isn't faster yet. Type-aware rules still need tsgolint's
+program, and vtsc is slower than tsgolint's checker on this code (workflow, 251 files: 2.4 s
+against tsc 7's 0.63 s with 2 cores; 3.1 s against 0.85 s on one), so `--type-check` took
+0.3-4.0 s per package with vtsc against oxlint's 0.2-2.7 s, and 14.7 s on mcp-apps (Vue's
+types; 0.7 s for oxlint). TypeScript's lib files come from
+`$VTSC_LIB`, else the nearest TypeScript 7 or 6 install; with an older one, tsgolint checks
+everything.
+
+While doing this, one walker difference was fixed. Outside a git repository, oxlint's walker
+applies the `.gitignore` files of every folder above the paths it lints (a package's folder
+inside a monorepo copied without `.git`). vlint read them only up to a `.git`, so it linted
+`node_modules` there.
+
 **Configuration**: `.oxlintrc.json`/`.jsonc` discovery and `-c`, nested configs, `extends`
 (with oxlint's error messages for missing files, named configs and cycles), `overrides`, rules
 with severities and options, `categories`, `plugins`, `env`/`globals` (globals read by

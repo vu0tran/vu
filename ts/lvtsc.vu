@@ -1,0 +1,172 @@
+# The type check (--type-check) by vtsc where it fully checks a file, tsgolint's for the others.
+#
+# tsgolint checks each linted file in its program (the nearest tsconfig.json that includes it, else
+# an inferred one) and sends, program by program (in the order their first file comes, inferred
+# ones last): the files' syntax errors, their type errors (both in program order, imports first),
+# then the type-aware rules' diagnostics. vtsc checks each such tsconfig's program; a file it
+# checks gets its errors from vtsc (tsc 7's, as tsgolint's checker reports them), and tsgolint
+# type-checks only the others. On with VLINT_VTSC=1 (not yet faster: tsgolint still runs for the
+# type-aware rules, and vtsc is slower than tsgolint's checker on n8n's code); VLINT_VTSC_DEBUG=1
+# prints what each program got.
+import parse
+import tsconf
+import tsprog
+import ltsgo
+import lconf
+import lcache
+
+# TypeScript's lib files for a folder's project: $VTSC_LIB, else the nearest node_modules'
+# TypeScript 7 (its platform package's lib) or 6 ("" none: older libs aren't tsgolint's).
+fn lib_for(fs: Fs, os: Os, ffi: Ffi, dir: Str) -> Str:
+  let env = os.env("VTSC_LIB")
+  if env != "": return env
+  var d = dir + ""
+  while true:
+    let nm = d + "/node_modules"
+    let x = platform_lib(fs, nm)
+    if x != "": return x
+    if fs.exists(nm + "/typescript/package.json"):
+      let txt = fs.read(nm + "/typescript/package.json") else ""
+      let js = lconf.parse_json(txt)
+      var ver = ""
+      if js.err == "" and js.v.len > 0:
+        let v = lconf.get(js, 0, "version")
+        if v >= 0 and js.v[v].k == lconf.J_STR: ver = js.v[v].s + ""
+      let major = int(ver.split(".")[0]) else 0
+      if major >= 7:
+        # (pnpm: the platform package beside the real typescript folder)
+        let real = lcache.realpath(ffi, nm + "/typescript")
+        if real != "":
+          let y = platform_lib(fs, tsconf.dirname(real))
+          if y != "": return y
+          let z = platform_lib(fs, real + "/node_modules")
+          if z != "": return z
+        return ""
+      if major == 6 and fs.exists(nm + "/typescript/lib/lib.es5.d.ts"): return nm + "/typescript/lib"
+      return ""
+    if d == "/" or d == "": break
+    d = tsconf.dirname(d)
+  return ""
+
+# node_modules/@typescript/typescript-<platform>/lib ("" none)
+fn platform_lib(fs: Fs, nm: Str) -> Str:
+  let names = fs.list(nm + "/@typescript") else []
+  for n0 in names:
+    var n = n0 + ""
+    if n.endswith("/"): n = n[0..n.len - 1]
+    if n.startswith("typescript-") and fs.exists(nm + "/@typescript/" + n + "/lib/lib.es5.d.ts"): return nm + "/@typescript/" + n + "/lib"
+  return ""
+
+type Plan:
+  covered: {Str: Bool}         # the linted files whose type check is vtsc's
+  gk: {Str: Str}               # a linted file -> its program's tsconfig ("" none found)
+  pidx: {Str: Int}             # a file -> its place in its program
+  diags: {Str: [parse.Diag]}   # a covered file's errors
+
+fn plan(fs: Fs, os: Os, ffi: Ffi, files: [Str]) -> Plan:
+  var pl = Plan({}, {}, {}, {})
+  let debug = os.env("VLINT_VTSC_DEBUG") != ""
+  var tc_of_dir: {Str: Str} = {}
+  var tcs: [Str] = []
+  var tc_files: {Str: [Str]} = {}
+  for f in files:
+    let d = tsconf.dirname(f)
+    if not (d in tc_of_dir): tc_of_dir[d] = tsconf.find(fs, d)
+    let tc = tc_of_dir[d]
+    if tc == "": continue
+    if not (tc in tc_files):
+      tcs.push(tc + "")
+      tc_files[tc] = []
+    tc_files[tc].push(f + "")
+  for tc in tcs:
+    let t0 = os.clock()
+    let lib = lib_for(fs, os, ffi, tsconf.dirname(tc))
+    var p = tsprog.Proj(false, "", [], {}, {}, {})
+    if lib == "":
+      p.err = "no TypeScript 6 or 7 lib files"
+      let cf = tsprog.read_config(fs, os, tc)
+      for f in cf.files: p.members[f] = true
+    else: p = tsprog.check_project(fs, os, ffi, tc, lib, 0)
+    for i in 0..p.files.len: pl.pidx[p.files[i]] = i
+    var ncov = 0
+    var why = ""
+    for f in tc_files[tc]:
+      if not (f in p.members): continue
+      pl.gk[f] = tc + ""
+      if p.ok and f in p.checked:
+        pl.covered[f] = true
+        var ds: [parse.Diag] = []
+        for d in p.diags[f]: ds.push(parse.Diag(0, d.pos, d.end, d.code, d.msg + ""))
+        pl.diags[f] = ds
+        ncov += 1
+      elif why == "":
+        if not p.ok: why = p.err + ""
+        elif f in p.why: why = f + ": " + p.why[f]
+        else: why = f + ": not in the program"
+    if debug:
+      var tail = ""
+      if why != "": tail = "; first not: " + why
+      eprint("vlint: vtsc: {tc}: {ncov} of {tc_files[tc].len} files checked, {(os.clock() - t0) * 1000.0:.0} ms{tail}")
+  return pl
+
+fn diag_msg(f: Str, d: parse.Diag) -> ltsgo.Msg:
+  return ltsgo.Msg(2, "", f + "", d.pos, d.end, "TS{d.code}", d.msg + "", "", false, [], [], [], 0)
+
+# The messages in tsgolint's order: a (tsgolint over the other files, type-checked) and b (over the
+# covered files with type-aware rules, not type-checked) with vtsc's errors for the covered files.
+fn merge(pl: Plan, files: [Str], a: [ltsgo.Msg], b: [ltsgo.Msg]) -> [ltsgo.Msg]:
+  # the programs, in the order their first linted file comes; those without a tsconfig last
+  var gorder: [Str] = []
+  var gseen: {Str: Bool} = {}
+  for f in files:
+    let g = pl.gk.get(f, "")
+    if g != "" and not (g in gseen):
+      gseen[g] = true
+      gorder.push(g + "")
+  gorder.push("")
+  var out: [ltsgo.Msg] = []
+  for g in gorder:
+    var any_cov = false
+    for f in files:
+      if pl.gk.get(f, "") == g and f in pl.covered: any_cov = true
+    if not any_cov:
+      for m in a:
+        if pl.gk.get(m.file, "") == g: out.push(copy_msg(m))
+      continue
+    # the type check (vtsc's and tsgolint's, by program order), then the rules' (both runs')
+    var tc: [ltsgo.Msg] = []
+    for f in files:
+      if pl.gk.get(f, "") == g and f in pl.covered:
+        for d in pl.diags[f]: tc.push(diag_msg(f, d))
+    for m in a:
+      if m.kind == 2 and pl.gk.get(m.file, "") == g: tc.push(copy_msg(m))
+    var rl: [ltsgo.Msg] = []
+    for m in a:
+      if m.kind != 2 and pl.gk.get(m.file, "") == g: rl.push(copy_msg(m))
+    for m in b:
+      if m.kind != 2 and pl.gk.get(m.file, "") == g: rl.push(copy_msg(m))
+    let t1 = by_program(pl, tc)
+    for m in t1: out.push(copy_msg(m))
+    let r1 = by_program(pl, rl)
+    for m in r1: out.push(copy_msg(m))
+  return out
+
+# (stable: a file's messages keep their order)
+fn by_program(pl: Plan, ms: [ltsgo.Msg]) -> [ltsgo.Msg]:
+  var idx: [Int] = []
+  for i in 0..ms.len: idx.push(i)
+  var key: [Int] = []
+  for m in ms: key.push(pl.pidx.get(m.file, 1 << 40))
+  idx.sort(by: fn(x, y) => key[x] < key[y] or (key[x] == key[y] and x < y))
+  var out: [ltsgo.Msg] = []
+  for i in idx: out.push(copy_msg(ms[i]))
+  return out
+
+fn copy_msg(m: ltsgo.Msg) -> ltsgo.Msg:
+  var labs: [Int] = []
+  for x in m.labs: labs.push(x)
+  var lt: [Str] = []
+  for x in m.ltext: lt.push(x + "")
+  var fx: [Str] = []
+  for x in m.fixes: fx.push(x + "")
+  return ltsgo.Msg(m.kind, m.rule + "", m.file + "", m.pos, m.end, m.id + "", m.msg + "", m.help + "", m.has_help, labs, lt, fx, m.nfix)
