@@ -32,7 +32,7 @@ type Cfg:
   opts: [Str]
 
 # The rules ported here.
-const PORTED = "no-array-delete no-base-to-string no-duplicate-type-constituents no-for-in-array no-implied-eval no-misused-spread no-redundant-type-constituents no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
+const PORTED = "await-thenable no-array-delete no-base-to-string no-duplicate-type-constituents no-for-in-array no-implied-eval no-misused-spread no-redundant-type-constituents no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
 
 fn ported(name: Str) -> Bool:
   for x in PORTED.split(" "):
@@ -374,7 +374,8 @@ fn visit(var c: C, var r: Run, n: Int):
   let k = c.t.nd[n].k
   for ri in 0..r.cf.names.len:
     let nm = r.cf.names[ri] + ""
-    if nm == "no-array-delete" and k == ast.N_DELETE: no_array_delete(&c, &r, n)
+    if nm == "await-thenable" and (k == ast.N_AWAIT or k == ast.N_CALL or k == ast.N_FORIN or k == ast.N_VAR): await_thenable(&c, &r, n)
+    elif nm == "no-array-delete" and k == ast.N_DELETE: no_array_delete(&c, &r, n)
     elif nm == "no-for-in-array" and k == ast.N_FORIN and c.t.nd[n].f == 0: no_for_in_array(&c, &r, n)
     elif nm == "no-base-to-string" and (k == ast.N_BINARY or k == ast.N_CALL or k == ast.N_TEMPL): no_base_to_string(&c, &r, n)
     elif nm == "no-duplicate-type-constituents" and (k == ast.N_TUNION or k == ast.N_TINTER): no_duplicate_constituents(&c, &r, n)
@@ -1269,6 +1270,11 @@ const U_SOMETIMES = 2
 # getPropertyOfType: the type's own (an object type's apparent members: Object's, Function's for
 # one with signatures)
 fn prop_sym(var c: C, t: Int, name: Str) -> Int:
+  if c.tk[t] == TK_INTER:
+    for m in inter_parts(c, t):
+      let p = prop_sym(&c, m, name)
+      if p >= 0: return p
+    return -1
   var a = t
   if c.tk[t] != TK_OBJ and c.tk[t] != TK_INTER: a = rel.apparent(&c, t)
   if c.tk[a] != TK_OBJ: return -1
@@ -1572,3 +1578,156 @@ fn no_misused_spread(var c: C, var r: Run, n: Int):
     if c.t.nd[a].k != ast.N_SPREAD: continue
     if k == ast.N_ARRAY: spread_check(&c, &r, a)
     else: obj_spread_check(&c, &r, a)
+
+# ---- await-thenable
+
+const A_ALWAYS = 0
+const A_NEVER = 1
+const A_MAY = 2
+
+# getApparentType: a type parameter's constraint, a primitive's wrapper interface
+fn apparent_of(var c: C, t: Int) -> Int:
+  var x = t
+  if c.tk[x] == TK_TPARAM:
+    let b = base_constraint1(&c, x, 0)
+    if b < 0: return c.unknown_t
+    x = b
+  let k = c.tk[x]
+  if k == TK_STRING or k == TK_STRLIT or k == TK_NUMBER or k == TK_NUMLIT or k == TK_BIGINT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_SYMBOL or k == TK_TEMPLATE: return rel.apparent(&c, x)
+  if x == c.boolean_t: return rel.apparent(&c, c.true_t)
+  return x
+
+fn sig_list(var c: C, t: Int) -> [Int]:
+  if c.tk[t] == TK_OBJ: return bind.sigs_of(&c, t, false)
+  if c.tk[t] == TK_INTER:
+    var out: [Int] = []
+    for m in inter_parts(c, t):
+      if c.tk[m] == TK_OBJ:
+        for sg in bind.sigs_of(&c, m, false): out.push(sg)
+    return out
+  return []
+
+# IsCallback: the parameter's type (a rest parameter's element) has call signatures
+fn callback_param(var c: C, sg: Int) -> Bool:
+  if c.sigs[sg].ptypes.len == 0: return false
+  var t = apparent_of(&c, c.sigs[sg].ptypes[0])
+  if c.sigs[sg].pflags[0] == 2:
+    t = number_index(&c, t)
+    if t < 0: return false
+  for m in parts(c, t):
+    if call_sig_count(&c, m) != 0: return true
+  return false
+
+fn thenable(var c: C, t: Int) -> Bool:
+  let a = apparent_of(&c, t)
+  for m in parts(c, a):
+    let p = prop_sym(&c, m, "then")
+    if p < 0: continue
+    var mm = m
+    if c.tk[mm] == TK_INTER:
+      for x in inter_parts(c, m):
+        if prop_sym(&c, x, "then") == p: mm = x
+    if c.tk[mm] != TK_OBJ: mm = rel.apparent(&c, mm)
+    let tt = bind.prop_type_for(&c, p, mm)
+    for x in parts(c, tt):
+      for sg in sig_list(&c, x):
+        if callback_param(&c, sg): return true
+  return false
+
+fn needs_await(var c: C, t: Int) -> Int:
+  var con = t
+  if c.tk[t] == TK_TPARAM:
+    con = base_constraint1(&c, t, 0)
+    if con < 0: return A_MAY
+  if is_any(c, con) or c.tk[con] == TK_UNKNOWN: return A_MAY
+  if thenable(&c, con): return A_ALWAYS
+  return A_NEVER
+
+fn await_diag(var r: Run, pos: Int, end: Int, id: Str, msg: Str, help: Str, lpos: Int, lend: Int, ltext: Str):
+  r.out.push(RDiag("await-thenable", pos, end, id, msg, help, [lpos, lend], [ltext]))
+
+fn await_thenable(var c: C, var r: Run, n: Int):
+  let k = c.t.nd[n].k
+  if k == ast.N_AWAIT:
+    let a = c.t.nd[n].a
+    let t = type_at(&c, a)
+    if needs_await(&c, t) == A_NEVER:
+      let p = c.t.nd[n].pos
+      await_diag(&r, p, p + 5, "await", "Unexpected `await` of a non-Promise (non-\"Thenable\") value.", "Remove `await` if the value is synchronous, or change the expression to return a Promise or Thenable before awaiting it.", c.t.nd[a].pos, xend(c, r, a), "This expression is not Promise-like")
+    return
+  if k == ast.N_FORIN:
+    if c.t.nd[n].f != 2: return
+    let e = c.t.nd[n].b
+    let t = type_at(&c, e)
+    if is_any(c, t): return
+    for m in parts(c, t):
+      if prop_sym(&c, m, "[Symbol.asyncIterator]") >= 0: return
+    let body = c.t.nd[n].c
+    let end = back_trivia(r.src, c.t.nd[n].pos, c.t.nd[body].pos)
+    await_diag(&r, c.t.nd[n].pos, end, "forAwaitOfNonAsyncIterable", "Unexpected `for await...of` of a value that is not async iterable.", "Use `for...of` for synchronous iterables, or change the iterable to implement `Symbol.asyncIterator`.", c.t.nd[e].pos, xend(c, r, e), "This value is not async iterable")
+    return
+  if k == ast.N_VAR:
+    if c.t.nd[n].f != 3 or not r.src[c.t.nd[n].pos..r.src.len].startswith("await"): return
+    for dcl in ast.items(c.t, c.t.nd[n].a):
+      let init = c.t.nd[dcl].c
+      if init < 0: continue
+      let t = type_at(&c, init)
+      if is_any(c, t): continue
+      var ok = false
+      for m in parts(c, t):
+        if prop_sym(&c, m, "[Symbol.asyncDispose]") >= 0: ok = true
+      if ok: continue
+      await_diag(&r, c.t.nd[init].pos, xend(c, r, init), "awaitUsingOfNonAsyncDisposable", "Unexpected `await using` of a value that is not async disposable.", "Use plain `using` for synchronous disposables, or change the value to implement `Symbol.asyncDispose`.", c.t.nd[init].pos, xend(c, r, init), "This value is not async disposable")
+    return
+  # Promise.all([...]) and the other aggregators
+  var callee = unparen(c, c.t.nd[n].a)
+  let ck = c.t.nd[callee].k
+  var mname = ""
+  if ck == ast.N_PROPACCESS: mname = bind.nm(c, c.t.nd[callee].s)
+  elif ck == ast.N_ELEMACCESS:
+    let ix = c.t.nd[callee].b
+    if c.t.nd[ix].k == ast.N_STR or c.t.nd[ix].k == ast.N_NOSUBTEMPL: mname = bind.nm(c, c.t.nd[ix].s)
+  else: return
+  if not (mname == "all" or mname == "allSettled" or mname == "any" or mname == "race"): return
+  let ot = constrained_at(&c, c.t.nd[callee].a)
+  if not builtin_like(&c, ot, ["PromiseConstructor"], 0): return
+  let args = ast.items(c.t, c.t.nd[n].c)
+  if args.len == 0: return
+  let arg = args[0]
+  let msg = "Unexpected iterable of non-Promise (non-\"Thenable\") values passed to promise aggregator."
+  let help = "Pass an iterable of Promise-like values, or wrap each synchronous value in `Promise.resolve(...)` before calling the aggregator."
+  if c.t.nd[arg].k == ast.N_ARRAY:
+    for el in ast.items(c.t, c.t.nd[arg].a):
+      if c.t.nd[el].k == ast.N_OMIT: continue
+      var t = -1
+      if c.t.nd[el].k == ast.N_SPREAD:
+        # (a spread element's type is its elements')
+        let st = type_at(&c, c.t.nd[el].a)
+        t = number_index(&c, st)
+        if t < 0: continue
+        t = base_constraint(&c, t)
+      else: t = constrained_at(&c, el)
+      var all_never = true
+      for m in parts(c, t):
+        if needs_await(&c, m) != A_NEVER: all_never = false
+      if not all_never: continue
+      r.out.push(RDiag("await-thenable", c.t.nd[el].pos, xend(c, r, el), "invalidPromiseAggregatorInput", msg, help, [c.t.nd[el].pos, xend(c, r, el), c.t.nd[arg].pos, xend(c, r, arg)], ["This expression is not Promise-like", "Promise aggregator input"]))
+    return
+  let t = constrained_at(&c, arg)
+  # (an iterable whose values aren't all awaitable)
+  for m in parts(c, t):
+    if prop_sym(&c, m, "[Symbol.iterator]") < 0: return
+  var bad = false
+  for m in parts(c, t):
+    for vt in array_values(&c, m):
+      for x in parts(c, vt):
+        if needs_await(&c, x) == A_NEVER: bad = true
+  if bad: await_diag(&r, c.t.nd[arg].pos, xend(c, r, arg), "invalidPromiseAggregatorInput", msg, help, c.t.nd[arg].pos, xend(c, r, arg), "This expression is not Promise-like")
+
+fn array_values(var c: C, t: Int) -> [Int]:
+  if is_tuple(c, t): return type_args(c, t)
+  let ni = number_index(&c, t)
+  if ni >= 0: return [ni]
+  let ta = type_args(c, t)
+  if ta.len > 0: return [ta[0]]
+  return []
