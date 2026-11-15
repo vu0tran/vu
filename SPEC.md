@@ -517,8 +517,9 @@ let squares = {1: 1, 2: 4, 3: 9}
 - Keys are Int, Byte, Bool or Str. The map keeps its own copy of each key; a key variable
   that isn't used again in its block is moved into the map instead of copied.
 - Iteration follows insertion order, like Python, so output is deterministic.
-- Hashing uses SipHash with a random key per run, so input that an attacker controls can't
-  be chosen to collide (hash flooding).
+- Hashing is keyed with a random key per run, so input that an attacker controls can't be
+  chosen to collide (hash flooding): SipHash for strings, a keyed multiply-mix for Int keys (as
+  Go's maps hash integers).
 - While a loop or binding borrows a map, the map can't be changed. In `for k, var v in m`
   the loop has exclusive access: values change only through `v`, and keys never change.
 - A key built by an expression (`m["k{i}"] = v`, `m[s[0..2]]`) works for inserting and for

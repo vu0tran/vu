@@ -1089,9 +1089,17 @@ fn infer_return(var c: C, d: Int) -> Int:
     # (a single return and no implicit one: its expression may refine a parameter)
     var rs0: [Int] = []
     collect_returns(c, body, &rs0)
+    # (no return with a value, not a generator: the return type is void, or never when the end
+    # isn't reached, which the statements tell without checking them; the body is checked once,
+    # as the function's, not once more for each call that infers through it)
+    var valued = false
+    for r0 in rs0:
+      if c.t.nd[r0].a >= 0: valued = true
+    var skip_body = false
+    if not is_gen and not valued: skip_body = quick_terminates(&c, body) >= 0
     let probe = plain_fn and rs0.len == 1 and c.t.nd[rs0[0]].a >= 0 and bind_terminates(&c, body)
     if probe: c.pred_probe.push(d)
-    check_block(&c, body)
+    if not skip_body: check_block(&c, body)
     if probe: c.pred_probe.pop()
   c.ret_cstack.pop()
   c.ret_stack.pop()
@@ -1389,6 +1397,56 @@ fn terminates(c: C, n: Int) -> Bool:
     return true
   if k == ast.N_LABEL: return terminates(c, c.t.nd[n].a)
   return false
+
+# terminates, from the statements alone: 1 or 0, or -1 when it takes the checker (a call that may
+# return never, a switch).
+fn quick_terminates(var c: C, n: Int) -> Int:
+  if n < 0: return 0
+  let k = c.t.nd[n].k
+  if k == ast.N_RETURN or k == ast.N_THROW: return 1
+  if k == ast.N_EXPRSTMT:
+    var ce = c.t.nd[n].a
+    while c.t.nd[ce].k == ast.N_PAREN: ce = c.t.nd[ce].a
+    if c.t.nd[ce].k == ast.N_CALL and never_call(&c, ce): return -1
+    return 0
+  if k == ast.N_BLOCK:
+    var unknown = false
+    for st in ast.items(c.t, c.t.nd[n].a):
+      let r = quick_terminates(&c, st)
+      if r == 1: return 1
+      if r < 0: unknown = true
+    if unknown: return -1
+    return 0
+  if k == ast.N_IF:
+    if c.t.nd[n].c < 0: return 0
+    let a = quick_terminates(&c, c.t.nd[n].b)
+    let b = quick_terminates(&c, c.t.nd[n].c)
+    if a == 0 or b == 0: return 0
+    if a == 1 and b == 1: return 1
+    return -1
+  if k == ast.N_TRY:
+    let fin = c.t.nd[n].d
+    var f = 0
+    if fin >= 0: f = quick_terminates(&c, fin)
+    if f == 1: return 1
+    let a = quick_terminates(&c, c.t.nd[n].a)
+    var b = 1
+    if c.t.nd[n].c >= 0: b = quick_terminates(&c, c.t.nd[n].c)
+    if f < 0 or a < 0 or b < 0: return -1
+    if a == 1 and b == 1: return 1
+    return 0
+  if k == ast.N_WHILE or k == ast.N_FOR: return if_int(terminates(c, n))
+  if k == ast.N_DO:
+    let a = quick_terminates(&c, c.t.nd[n].a)
+    if a < 0: return -1
+    return if_int(terminates(c, n))
+  if k == ast.N_SWITCH: return -1
+  if k == ast.N_LABEL: return quick_terminates(&c, c.t.nd[n].a)
+  return 0
+
+fn if_int(b: Bool) -> Int:
+  if b: return 1
+  return 0
 
 # getEffectsSignature for a call statement: the callee a dotted name whose every part has an
 # explicit type, with one non-generic signature, or overloads one of which returns never.
@@ -3209,6 +3267,16 @@ fn push_facts(var c: C, e: Int, truth: Bool):
 # ---- expressions
 
 fn check_expr(var c: C, n: Int, ctx: Int) -> Int:
+  c.stats[2] += 1
+  if c.debug_counts:
+    if not (n in c.stat_seen):
+      c.stat_seen[n] = true
+      c.stats[3] += 1
+    if not (n in c.stat_cnt): c.stat_cnt[n] = 0
+    c.stat_cnt[n] += 1
+    if n == c.debug_node and c.stat_cnt[n] == c.debug_hitn:
+      let xs: [Int] = []
+      eprint("{xs[n]}")
   let outer = c.cur_expr
   c.cur_expr = n
   let t = expr_type(&c, n, ctx)
@@ -6476,6 +6544,34 @@ fn function_like(var c: C, t: Int) -> Bool:
   return rel.assignable(&c, t, ft)
 
 fn call(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
+  # (a call inside another call's arguments, resolved again while that one is: the same result,
+  # unless what it depends on changed (its contextual type, the return mapper, a loop's pass).
+  # Kept only when it reported nothing and checked no function body, so nothing is lost.)
+  var pe = 0
+  if c.epoch_stack.len > 0: pe = c.epoch_stack[c.epoch_stack.len - 1]
+  if c.spec == 0 and pe >= 0 and n in c.call_memo:
+    let e = types.ints(c.call_memo[n])
+    if e[0] == pe and e[1] == ctx and e[2] == c.ret_mapper and e[3] == c.loop_gen and e[4] == c.narrow.len:
+      c.stats[6] += 1
+      return e[5]
+    if e[0] != pe: c.stats[7] += 1
+    elif e[1] != ctx: c.pcount[0] += 1
+    elif e[2] != c.ret_mapper: c.pcount[1] += 1
+    elif e[3] != c.loop_gen: c.pcount[2] += 1
+    else: c.pcount[3] += 1
+  c.epoch_ctr += 1
+  c.epoch_stack.push(c.epoch_ctr)
+  let dlen = c.diags.len
+  let clen = c.checked_log.len
+  let r = call1(&c, n, is_new0, ctx)
+  c.epoch_stack.pop()
+  if c.spec == 0 and pe >= 0 and c.diags.len == dlen and c.checked_log.len == clen: c.call_memo[n] = [pe, ctx, c.ret_mapper, c.loop_gen, c.narrow.len, r]
+  elif c.spec == 0:
+    if c.diags.len != dlen: c.pcount[4] += 1
+    else: c.pcount[5] += 1
+  return r
+
+fn call1(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
   let callee = c.t.nd[n].a
   let args = kids(c, c.t.nd[n].c)
   # Symbol() / Symbol.for() initializing a const: its unique symbol (getESSymbolLikeTypeForNode)
@@ -7124,8 +7220,13 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
         let m = inf_mapper(&c, &inf, sg)
         c.inf_fixing = false
         pt = bind.instantiate(&c, pt, m)
-        c.fsig.remove(args[i])
-        clear_ctx_params(&c, args[i])
+        # (a function given the same parameter types and return context as the last time keeps
+        # its signature: checking a call again doesn't check its callbacks' bodies again, and
+        # nested calls aren't checked once more for each call around them)
+        let same_ctx = args[i] in c.fsig and c.ctx_used.get(args[i], -2) == pt and c.ctx_rmap.get(args[i], -2) == rmap
+        if not same_ctx:
+          c.fsig.remove(args[i])
+          clear_ctx_params(&c, args[i])
       let saved_rm = c.ret_mapper
       c.ret_mapper = rmap
       var rawp = raw_param_at(&c, sg, i)
@@ -7139,6 +7240,9 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
             at = unsup(&c, args[i], "an argument in a const type parameter's context inside a parameter type")
         if at < 0: at = check_expr(&c, args[i], pt)
       c.ret_mapper = saved_rm
+      if pass == 1:
+        c.ctx_used[args[i]] = pt
+        c.ctx_rmap[args[i]] = rmap
       if rmap >= 0 and (types.is_fresh_lit(c, at) or at in c.freg):
         var rp0 = raw_param_at(&c, sg, i)
         if i in rp_over: rp0 = rp_over[i]
@@ -9372,6 +9476,7 @@ fn check_pattern_decl(var c: C, d: Int):
     if id in c.nsym: bind.type_of_sym(&c, c.nsym[id])
 
 fn check_stmt(var c: C, n: Int):
+  c.stats[4] += 1
   let k = c.t.nd[n].k
   if k == ast.N_VAR:
     if (c.t.nd[n].d & ast.M_DECLARE) != 0: return
@@ -11848,6 +11953,7 @@ fn is_tracked(var c: C, key: Str) -> Bool:
 # One run over the loop: head types set, the condition's true facts, the body (and the update);
 # the types at the end of the body join those at continue. Returns the record.
 fn loop_pass(var c: C, n: Int, keys: [Str], head: {Str: Int}) -> LoopRec:
+  c.loop_gen += 1
   let k = c.t.nd[n].k
   var kc: [Str] = []
   for x in keys: kc.push(x + "")
@@ -12111,18 +12217,22 @@ fn check_loop0(var c: C, n: Int):
     if key in head: continue
     keys.push(key + "")
     head[key] = types.regular(c, t)
-  # the fixpoint (speculative passes)
+  # the fixpoint: passes until what reaches the head again is what it started with. Each is a real
+  # pass: the one that settles is the loop's (not checked once more), and nested loops aren't
+  # checked one pass more for each loop around them; the others' errors and the function bodies
+  # they checked are dropped.
   var settled = keys.len == 0
   var bad = false
   var tries = 0
+  var have_real = false
+  var rec0 = LoopRec([], false, {}, {}, false, {})
   while not settled and tries < 6 and not bad:
     tries += 1
     let dlen = c.diags.len
-    c.spec += 1
+    let clen = c.checked_log.len
     let rec = loop_pass(&c, n, keys, head)
-    c.spec -= 1
-    while c.diags.len > dlen: c.diags.pop()
     if rec.bad:
+      drop_attempt(&c, dlen, clen)
       bad = true
       break
     settled = true
@@ -12134,13 +12244,19 @@ fn check_loop0(var c: C, n: Int):
       if nh != head[key]:
         settled = false
         head[key] = nh
+    if settled:
+      have_real = true
+      rec0 = rec
+    else: drop_attempt(&c, dlen, clen)
   if not settled or bad:
     if c.debug: eprint("LOOPFAIL settled {settled} bad {bad}")
     for key in keys: reset_key(&c, key)
     keys = []
+    have_real = false
   # the real pass, then the types after the loop: the head where the condition fails, joined with
   # those at break
-  let rec = loop_pass(&c, n, keys, head)
+  var rec = rec0
+  if not have_real: rec = loop_pass(&c, n, keys, head)
   for key in keys:
     var outs: [Int] = []
     var exit_t = head[key]

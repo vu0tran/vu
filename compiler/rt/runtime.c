@@ -1343,7 +1343,17 @@ static uint64_t vu_siphash(const uint8_t *in, size_t len) {
     v2 ^= 0xff; VU_SIPROUND; VU_SIPROUND; VU_SIPROUND;
     return v0 ^ v1 ^ v2 ^ v3;
 }
+/* Int keys: a keyed multiply-and-fold (wyhash's mum, twice), as Go's maps hash integers: a tenth
+   of SipHash's cost, still keyed by the per-run random key. */
+#ifdef __SIZEOF_INT128__
+static inline uint64_t vu_mum(uint64_t a, uint64_t b) { __uint128_t p = (__uint128_t)a * b; return (uint64_t)p ^ (uint64_t)(p >> 64); }
+static inline uint64_t vu_hash_int(int64_t v) {
+    uint64_t h = vu_mum((uint64_t)v ^ vu_sip_k0 ^ 0xa0761d6478bd642fULL, vu_sip_k1 ^ 0xe7037ed1a0b428dbULL);
+    return vu_mum(h ^ 0x8ebc6af09c88c6e3ULL, vu_sip_k0 ^ 0x589965cc75374cc3ULL);
+}
+#else
 static inline uint64_t vu_hash_int(int64_t v) { return vu_siphash((const uint8_t *)&v, 8); }
+#endif
 
 /* Capabilities: zero-size tokens. Only main receives them, so only code handed one can use it. */
 typedef struct { char unused; } vu_cap;
