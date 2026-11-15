@@ -269,6 +269,39 @@ mcp-apps, Vue's types; vtsc's speed since: "n8n" under Speed). TypeScript's lib 
 `$VTSC_LIB`, else the nearest TypeScript 7 or 6 install; with an older one, tsgolint checks
 everything.
 
+### The type-aware rules in vtsc (2026-11-14)
+
+The 15 type-aware rules oxlint turns on by default now also run inside vtsc (`trules.vu`), over
+each file it fully checks, ported from tsgolint 0.21.1 (the version n8n uses): await-thenable,
+no-array-delete, no-base-to-string, no-duplicate-type-constituents, no-floating-promises,
+no-for-in-array, no-implied-eval, no-meaningless-void-operator, no-misused-spread,
+no-redundant-type-constituents, no-unsafe-unary-minus, no-useless-default-assignment,
+require-array-sort-compare, restrict-template-expressions, unbound-method. With `VLINT_VTSC=1`, a
+file whose type check and rules are all vtsc's isn't sent to tsgolint at all; a rule that reaches
+something vtsc doesn't model leaves that file's rules to tsgolint (`VLINT_VTSC_RULES=0` turns the
+rules off). `vtsc --lint RULES` prints them as tsgolint's messages.
+
+Checked two ways:
+- tsgolint's own test cases (`tsgolint_parity.py`: each case's program run through the tsgolint
+  0.21.1 binary and through `vtsc --lint`): 1,107 of 1,258 cases give the same diagnostics (ranges,
+  message ids, messages, help, labels), 7 differ, 135 are files vtsc doesn't check or rules it
+  leaves to tsgolint, 9 have options not written as JSON. The 7: unbound-method 4 (a class
+  extending Array's statics, `C.prototype.m`, a for-of pattern), and one each in no-base-to-string
+  (a user function named String), no-floating-promises (`yield*`'s result type) and
+  restrict-template-expressions (tsgo prints an unresolved type parameter by its name).
+- The 22 n8n packages, default configuration, `--type-aware --type-check`: every line equal to
+  oxlint's (`hyall.sh`). 809 of 1,280 files get their type check from vtsc, and the rules of
+  almost all of those. Wall time over the 22: oxlint 22.0 s, vlint with this 20.5 s, vlint with
+  tsgolint for everything 20.8 s; tsgolint still starts for each package with a file vtsc doesn't
+  cover, which most have, so it stays opt-in.
+
+Found on the way (and fixed in the checker, since tsc does them): `x ?? y` is x's type when x can't
+be nullish; a homomorphic mapped type over a type with an index signature keeps the declared
+properties (zod's `meta()?.title` was `unknown`). Not modeled yet, so those files' rules are
+tsgolint's: tsc narrows `unknown` by typeof as `{} | null | undefined`, and intersects a narrowed
+type parameter with what the narrowing leaves; a pattern's contextual type keeps its
+initializer's literals.
+
 While doing this, one walker difference was fixed. Outside a git repository, oxlint's walker
 applies the `.gitignore` files of every folder above the paths it lints (a package's folder
 inside a monorepo copied without `.git`). vlint read them only up to a `.git`, so it linted
