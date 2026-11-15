@@ -1,0 +1,772 @@
+# typescript-eslint's type-aware rules, as tsgolint runs them (oxlint's `--type-aware`), over a file
+# vtsc has checked: the types are the checker's, read after the file's check (getTypeAtLocation is
+# the type an expression was last checked with). Each rule follows tsgolint's Go port
+# (internal/rules/<rule>), its messages and ranges included; the diagnostics come in tsgolint's
+# order: the nodes in source order, each node's rules by name.
+import scan
+import ast
+import types
+import bind
+import rel
+import chk
+import tyops
+import show
+import lconf
+from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP, TK_TEMPLATE, TK_KEYOF
+from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE, OK_MAPPED
+
+# A rule's diagnostic, as tsgolint sends it (labels: pos, end pairs with their texts).
+type RDiag:
+  rule: Str
+  pos: Int
+  end: Int
+  id: Str
+  msg: Str
+  help: Str
+  labs: [Int]
+  ltext: [Str]
+
+# The rules on for a file, by name, with their options (JSON, "" none).
+type Cfg:
+  names: [Str]
+  opts: [Str]
+
+# The rules ported here.
+const PORTED = "no-array-delete no-for-in-array no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
+
+fn ported(name: Str) -> Bool:
+  for x in PORTED.split(" "):
+    if x == name: return true
+  return false
+
+# The rules of a tsgolint rule list ([{"name": .., "options": ..}, ..]).
+fn parse_cfg(text: Str) -> Cfg:
+  var cf = Cfg([], [])
+  let js = lconf.parse_json(text)
+  if js.err != "" or js.v.len == 0 or js.v[0].k != lconf.J_ARR: return cf
+  for x in js.v[0].kids:
+    let nm = lconf.get(js, x, "name")
+    if nm < 0: continue
+    cf.names.push(js.v[nm].s + "")
+    let o = lconf.get(js, x, "options")
+    if o >= 0: cf.opts.push(lconf.to_text(js, o))
+    else: cf.opts.push("")
+  return cf
+
+# What a run of the rules over one file needs besides the checker.
+type Run:
+  cf: Cfg
+  src: Str
+  out: [RDiag]
+  parents: {Int: Int}
+  # options
+  void_never: Bool
+  sort_ignore_str: Bool
+  tmpl: TmplOpts
+
+type TmplOpts:
+  any: Bool
+  boolean: Bool
+  nullish: Bool
+  number: Bool
+  never: Bool
+  regexp: Bool
+  array: Bool
+  allow: [Spec]
+
+fn opt_bool(text: Str, key: Str, dflt: Bool) -> Bool:
+  if text == "": return dflt
+  let js = lconf.parse_json(text)
+  if js.err != "" or js.v.len == 0: return dflt
+  var o = 0
+  if js.v[0].k == lconf.J_ARR:
+    if js.v[0].kids.len == 0: return dflt
+    o = js.v[0].kids[0]
+  if js.v[o].k != lconf.J_OBJ: return dflt
+  let x = lconf.get(js, o, key)
+  if x < 0: return dflt
+  if js.v[x].k == lconf.J_TRUE: return true
+  if js.v[x].k == lconf.J_FALSE: return false
+  return dflt
+
+# A TypeOrValueSpecifier: a name (or names) declared in the project's files (from 0), TypeScript's
+# lib files (1) or a package (2).
+type Spec:
+  from: Int
+  names: [Str]
+  path: Str
+  pkg: Str
+
+fn copy_spec(x: Spec) -> Spec:
+  var ns: [Str] = []
+  for n in x.names: ns.push(n + "")
+  return Spec(x.from, ns, x.path + "", x.pkg + "")
+
+# The specifiers of an option (an array of strings and objects); none when the option isn't there
+# (dflt: the default list, lib names).
+fn specs_of(text: Str, key: Str, dflt: [Str]) -> [Spec]:
+  var out: [Spec] = []
+  var js = lconf.parse_json("[]")
+  var o = -1
+  if text != "":
+    js = lconf.parse_json(text)
+    if js.err == "" and js.v.len > 0:
+      o = 0
+      if js.v[0].k == lconf.J_ARR:
+        o = -1
+        if js.v[0].kids.len > 0: o = js.v[0].kids[0]
+  var al = -1
+  if o >= 0 and js.v[o].k == lconf.J_OBJ: al = lconf.get(js, o, key)
+  if al < 0:
+    if dflt.len > 0:
+      var ns: [Str] = []
+      for x in dflt: ns.push(x + "")
+      out.push(Spec(1, ns, "", ""))
+    return out
+  if js.v[al].k != lconf.J_ARR: return out
+  for x in js.v[al].kids:
+    if js.v[x].k == lconf.J_STR:
+      out.push(Spec(0, [js.v[x].s + ""], "", ""))
+      continue
+    if js.v[x].k != lconf.J_OBJ: continue
+    var from = 0
+    let fr = lconf.get(js, x, "from")
+    if fr >= 0 and js.v[fr].s == "lib": from = 1
+    elif fr >= 0 and js.v[fr].s == "package": from = 2
+    var ns: [Str] = []
+    let nmv = lconf.get(js, x, "name")
+    if nmv >= 0 and js.v[nmv].k == lconf.J_STR: ns.push(js.v[nmv].s + "")
+    elif nmv >= 0 and js.v[nmv].k == lconf.J_ARR:
+      for y in js.v[nmv].kids: ns.push(js.v[y].s + "")
+    var path = ""
+    let pv = lconf.get(js, x, "path")
+    if pv >= 0: path = js.v[pv].s + ""
+    var pkg = ""
+    let kv = lconf.get(js, x, "package")
+    if kv >= 0: pkg = js.v[kv].s + ""
+    out.push(Spec(from, ns, path, pkg))
+  return out
+
+fn tmpl_allow(text: Str) -> [Spec]:
+  return specs_of(text, "allow", ["Error", "URL", "URLSearchParams"])
+
+# The symbol a type is named by: its alias's, else its own (-1 none).
+fn type_symbol(c: C, t: Int) -> Int:
+  if t in c.t_alias: return c.t_alias[t]
+  return own_symbol(c, t)
+
+fn own_symbol(c: C, t: Int) -> Int:
+  let k = c.tk[t]
+  if k == TK_OBJ:
+    var o = c.ta[t]
+    if c.objs[o].kind == OK_REF: o = c.ta[c.objs[o].target]
+    return c.objs[o].sym
+  if k == TK_TPARAM: return c.ta[t]
+  if k == TK_UNION and t in c.enum_union: return c.enum_union[t]
+  return -1
+
+fn intrinsic_name(c: C, t: Int) -> Str:
+  let k = c.tk[t]
+  if k == TK_ANY: return "any"
+  if k == TK_ERROR: return "error"
+  if k == TK_UNKNOWN: return "unknown"
+  if k == TK_STRING: return "string"
+  if k == TK_NUMBER: return "number"
+  if k == TK_BIGINT: return "bigint"
+  if k == TK_SYMBOL and c.tb[t] == 0: return "symbol"
+  if k == TK_TRUE: return "true"
+  if k == TK_FALSE: return "false"
+  if k == TK_UNDEF: return "undefined"
+  if k == TK_NULL: return "null"
+  if k == TK_VOID: return "void"
+  if k == TK_NEVER: return "never"
+  if k == TK_NONPRIM: return "object"
+  return ""
+
+fn decl_files(c: C, s: Int) -> [Int]:
+  var out: [Int] = []
+  if s < 0: return out
+  if c.sdecl[s] >= 0: out.push(c.t.nd[c.sdecl[s]].file)
+  if s in c.smore:
+    for x in c.smore[s]:
+      if x >= 0: out.push(c.t.nd[x].file)
+  return out
+
+fn abs_name(c: C, f: Int) -> Str:
+  let n = c.files[f]
+  if n.startswith("/"): return n + ""
+  return c.cwd + "/" + n
+
+fn spec_match(var c: C, t: Int, sp: Spec) -> Bool:
+  var named = false
+  let s = type_symbol(c, t)
+  if s >= 0:
+    let sn = bind.nm(c, c.sname[s])
+    for x in sp.names:
+      if x == sn: named = true
+  if not named:
+    let iname = intrinsic_name(c, t)
+    if iname != "":
+      for x in sp.names:
+        if x == iname: named = true
+  if not named: return false
+  var sym = own_symbol(c, t)
+  if sym < 0 and t in c.t_alias: sym = c.t_alias[t]
+  let fs = decl_files(c, sym)
+  if sp.from == 1:
+    # (no declarations: an intrinsic type is the lib's)
+    if fs.len == 0: return true
+    for f in fs:
+      if f > 0 and f < c.user_from: return true
+    return false
+  if sp.from == 0:
+    if sp.path == "":
+      for f in fs:
+        if f > 0 and abs_name(c, f).startswith(c.cwd): return true
+      return false
+    let want = norm_path(c.cwd + "/" + sp.path)
+    for f in fs:
+      if f > 0 and abs_name(c, f) == want: return true
+    return false
+  # a package's: declared in `declare module "pkg"`, or in a declaration file of the package (or
+  # its @types package)
+  for f in fs:
+    if f <= 0 or not (f in c.pkg_files): continue
+    let pn = package_of(abs_name(c, f))
+    if pn == sp.pkg or pn == "@types/" + types_name(sp.pkg) or pn == types_name(sp.pkg): return true
+  return in_declare_module(c, sym, sp.pkg)
+
+fn types_name(p: Str) -> Str:
+  if p == "" or not p.startswith("@"): return p
+  let k = p.find("/")
+  if k <= 1 or k + 1 >= p.len: return p
+  return p[1..k] + "__" + p[k + 1..p.len]
+
+fn package_of(path: Str) -> Str:
+  let segs = path.split("/")
+  var i = segs.len - 1
+  while i >= 0:
+    if segs[i] == "node_modules" and i + 1 < segs.len:
+      let nm = segs[i + 1]
+      if nm.startswith("@"):
+        if i + 2 < segs.len: return nm + "/" + segs[i + 2]
+      elif nm != "" and nm != "." and nm != "..": return nm + ""
+    i -= 1
+  return ""
+
+fn in_declare_module(c: C, s: Int, pkg: Str) -> Bool:
+  if s < 0: return false
+  var ds: [Int] = [c.sdecl[s]]
+  if s in c.smore:
+    for x in c.smore[s]: ds.push(x)
+  for d in ds:
+    if d < 0: continue
+    var p = up(c, d)
+    while p >= 0:
+      if c.t.nd[p].k == ast.N_MODULE:
+        let nn = c.t.nd[p].a
+        if nn >= 0 and c.t.nd[nn].k == ast.N_STR:
+          if bind.nm(c, c.t.nd[nn].s) == pkg: return true
+          break
+      p = up(c, p)
+  return false
+
+fn norm_path(p: Str) -> Str:
+  var out: [Str] = []
+  for seg in p.split("/"):
+    if seg == "" or seg == ".": continue
+    if seg == "..":
+      if out.len > 0: out.pop()
+      continue
+    out.push(seg + "")
+  return "/" + "/".join(out)
+
+# TypeMatchesSomeSpecifier: (each intersection member counts, but the whole type is matched, as
+# tsgolint does)
+fn matches_specs(var c: C, t: Int, specs: [Spec]) -> Bool:
+  for m in inter_parts(c, t):
+    if c.tk[m] == TK_ERROR: continue
+    for sp in specs:
+      if spec_match(&c, t, sp): return true
+  return false
+
+fn opt_of(cf: Cfg, name: Str) -> Str:
+  for i in 0..cf.names.len:
+    if cf.names[i] == name: return cf.opts[i] + ""
+  return ""
+
+# Whether the rules could run over the file without reaching something the checker doesn't model
+# (a type it marks unsupported: then the file's diagnostics are tsgolint's).
+fn run(var c: C, root: Int, src: Str, cf: Cfg, var out: [RDiag]) -> Bool:
+  let to = opt_of(cf, "restrict-template-expressions")
+  let tmo = TmplOpts(opt_bool(to, "allowAny", true), opt_bool(to, "allowBoolean", true), opt_bool(to, "allowNullish", true), opt_bool(to, "allowNumber", true), opt_bool(to, "allowNever", false), opt_bool(to, "allowRegExp", true), opt_bool(to, "allowArray", false), tmpl_allow(to))
+  var cf2 = Cfg([], [])
+  for x in cf.names: cf2.names.push(x + "")
+  for x in cf.opts: cf2.opts.push(x + "")
+  var r = Run(cf2, src + "", [], {}, opt_bool(opt_of(cf, "no-meaningless-void-operator"), "checkNever", false), opt_bool(opt_of(cf, "require-array-sort-compare"), "ignoreStringArrays", true), tmo)
+  let seq0 = c.unsup_seq
+  walk(&c, &r, root, -1)
+  for d in r.out: out.push(copy_diag(d))
+  return c.unsup_seq == seq0
+
+fn copy_diag(d: RDiag) -> RDiag:
+  var labs: [Int] = []
+  for x in d.labs: labs.push(x)
+  var lt: [Str] = []
+  for x in d.ltext: lt.push(x + "")
+  return RDiag(d.rule + "", d.pos, d.end, d.id + "", d.msg + "", d.help + "", labs, lt)
+
+# ---- the walk
+
+# A node's children in source order (lists flattened).
+fn children(c: C, n: Int) -> [Int]:
+  var out: [Int] = []
+  if n < 0: return out
+  let k = c.t.nd[n].k
+  if k == ast.N_LIST:
+    for x in ast.items(c.t, n): out.push(x)
+    return out
+  var fs = [c.t.nd[n].a, c.t.nd[n].b, c.t.nd[n].c, c.t.nd[n].d]
+  # (d holds modifier flags there, and marks a file's root)
+  if k == ast.N_VAR or k == ast.N_INTERFACE or k == ast.N_TYPEALIAS or c.t.nd[n].d == -2: fs[3] = -1
+  for x in fs:
+    if x < 0: continue
+    if c.t.nd[x].k == ast.N_LIST:
+      for y in ast.items(c.t, x): out.push(y)
+    else: out.push(x)
+  return out
+
+fn walk(var c: C, var r: Run, n: Int, parent: Int):
+  if n < 0: return
+  r.parents[n] = parent
+  visit(&c, &r, n)
+  for x in children(c, n): walk(&c, &r, x, n)
+
+fn visit(var c: C, var r: Run, n: Int):
+  let k = c.t.nd[n].k
+  for ri in 0..r.cf.names.len:
+    let nm = r.cf.names[ri] + ""
+    if nm == "no-array-delete" and k == ast.N_DELETE: no_array_delete(&c, &r, n)
+    elif nm == "no-for-in-array" and k == ast.N_FORIN and c.t.nd[n].f == 0: no_for_in_array(&c, &r, n)
+    elif nm == "no-meaningless-void-operator" and k == ast.N_VOIDEXPR: no_meaningless_void(&c, &r, n)
+    elif nm == "no-unsafe-unary-minus" and k == ast.N_PREFIX and c.t.nd[n].f == scan.T_MINUS: no_unsafe_unary_minus(&c, &r, n)
+    elif nm == "require-array-sort-compare" and k == ast.N_CALL: require_sort_compare(&c, &r, n)
+    elif nm == "restrict-template-expressions" and k == ast.N_TEMPL: restrict_template(&c, &r, n)
+
+fn report(var r: Run, rule: Str, pos: Int, end: Int, id: Str, msg: Str):
+  r.out.push(RDiag(rule, pos, end, id, msg, "", [], []))
+
+# ---- types
+
+# getTypeAtLocation: the type the expression was checked with (regular, not fresh)
+fn type_at(var c: C, n: Int) -> Int:
+  let t = c.ntype.get(n, -1)
+  if t < 0:
+    # (never checked: not something this checker models here)
+    let u = bind.lazy_unsupported(&c, n, "a rule's type of an expression not checked")
+    bind.touch(&c, u)
+    return c.any_t
+  bind.touch(&c, t)
+  return types.regular(c, t)
+
+# getConstrainedTypeAtLocation: a type parameter (or deferred type) as its base constraint
+fn constrained_at(var c: C, n: Int) -> Int:
+  let t = type_at(&c, n)
+  return base_constraint(&c, t)
+
+# getBaseConstraintOfType, the type itself when it has none
+fn base_constraint(var c: C, t: Int) -> Int:
+  let b = base_constraint1(&c, t, 0)
+  if b < 0: return t
+  return b
+
+# (-1: none, as an unconstrained type parameter has; computeBaseConstraint)
+fn base_constraint1(var c: C, t: Int, depth: Int) -> Int:
+  if depth > 20: return -1
+  let k = c.tk[t]
+  if k == TK_TPARAM:
+    let con = rel.constraint_of(&c, t)
+    if con < 0 or con == t: return -1
+    # (T extends any: unknown, getConstraintFromTypeParameter)
+    if c.tk[con] == TK_ANY: return c.unknown_t
+    return base_constraint1_of(&c, con, depth + 1)
+  if k >= TK_KEYOF and k != TK_UNSUP and k != TK_TEMPLATE:
+    let b = tyops.base_of(&c, t, 0)
+    if b < 0 or b == t: return -1
+    return base_constraint1_of(&c, b, depth + 1)
+  if k == TK_UNION or k == TK_INTER:
+    var different = false
+    var bs: [Int] = []
+    for i in 0..c.tb[t]:
+      let m = c.tl[c.ta[t] + i]
+      let b = base_constraint1_of(&c, m, depth + 1)
+      if b >= 0:
+        if b != m: different = true
+        bs.push(b)
+      else: different = true
+    if not different: return t
+    if k == TK_UNION:
+      if bs.len == c.tb[t]: return types.union_of(&c, bs)
+      return -1
+    if bs.len > 0: return types.inter_of(&c, bs)
+    return -1
+  return t
+
+# (a constraint's own base constraint: itself when it's concrete)
+fn base_constraint1_of(var c: C, t: Int, depth: Int) -> Int:
+  let k = c.tk[t]
+  if k == TK_TPARAM or (k >= TK_KEYOF and k != TK_UNSUP and k != TK_TEMPLATE) or k == TK_UNION or k == TK_INTER: return base_constraint1(&c, t, depth)
+  return t
+
+fn parts(c: C, t: Int) -> [Int]:
+  return types.members(c, t)
+
+fn inter_parts(c: C, t: Int) -> [Int]:
+  if c.tk[t] == TK_INTER: return types.members_inter(c, t)
+  return [t]
+
+fn number_like(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_NUMBER or k == TK_NUMLIT
+
+fn bigint_like(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_BIGINT or k == TK_BIGLIT
+
+fn string_like(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_STRING or k == TK_STRLIT or k == TK_TEMPLATE
+
+fn boolean_like(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_TRUE or k == TK_FALSE or t == c.boolean_t
+
+fn is_any(c: C, t: Int) -> Bool:
+  return c.tk[t] == TK_ANY or c.tk[t] == TK_ERROR
+
+fn void_like(c: C, t: Int) -> Bool:
+  return c.tk[t] == TK_VOID or c.tk[t] == TK_UNDEF
+
+fn is_array_or_tuple(var c: C, t: Int) -> Bool:
+  if c.tk[t] != TK_OBJ: return false
+  if c.objs[c.ta[t]].kind == OK_TUPLE: return true
+  return rel.is_array_ref(&c, t)
+
+# getIndexTypeOfType(t, number): the number index signature, else the string one that applies
+fn number_index(var c: C, t: Int) -> Int:
+  var a = t
+  if c.tk[t] != TK_OBJ and c.tk[t] != TK_INTER: a = rel.apparent(&c, t)
+  if c.tk[a] != TK_OBJ: return -1
+  if c.objs[c.ta[a]].kind == OK_TUPLE: return bind.tuple_elem_union(&c, a)
+  let ni = bind.index_type(&c, a, true)
+  if ni >= 0: return ni
+  return bind.index_type(&c, a, false)
+
+fn prop_type(var c: C, t: Int, name: Str) -> Int:
+  var a = t
+  if c.tk[t] != TK_OBJ and c.tk[t] != TK_INTER: a = rel.apparent(&c, t)
+  if c.tk[a] != TK_OBJ: return -1
+  let id = ast.intern(&c.t, name)
+  let p = bind.get_prop(&c, a, id)
+  if p < 0: return -1
+  return bind.prop_type_for(&c, p, a)
+
+fn type_str(var c: C, t: Int) -> Str:
+  return show.show(&c, t)
+
+# The type's symbol's name when it's declared in TypeScript's lib files ("" otherwise).
+fn lib_name(var c: C, t: Int) -> Str:
+  if c.tk[t] != TK_OBJ: return ""
+  var o = c.ta[t]
+  if c.objs[o].kind == OK_REF: o = c.ta[c.objs[o].target]
+  let s = c.objs[o].sym
+  if s < 0: return ""
+  let d = c.sdecl[s]
+  if d < 0: return ""
+  let f = c.t.nd[d].file
+  if f <= 0 or f >= c.user_from: return ""
+  return bind.nm(c, c.sname[s])
+
+# ---- source text
+
+fn skip_trivia(src: Str, at: Int) -> Int:
+  var i = at
+  while i < src.len:
+    let ch = src[i]
+    if ch == 32 or ch == 9 or ch == 10 or ch == 13 or ch == 11 or ch == 12:
+      i += 1
+      continue
+    if ch == 47 and i + 1 < src.len and src[i + 1] == 47:
+      while i < src.len and src[i] != 10: i += 1
+      continue
+    if ch == 47 and i + 1 < src.len and src[i + 1] == 42:
+      i += 2
+      while i + 1 < src.len and not (src[i] == 42 and src[i + 1] == 47): i += 1
+      i += 2
+      continue
+    break
+  return i
+
+# Where node n's last token ends (the checker's tree ends a node where the next token starts, and
+# a leaf where it starts).
+fn xend(c: C, r: Run, n: Int) -> Int:
+  let p = c.t.nd[n].pos
+  let e = c.t.nd[n].end
+  if e <= p: return tok_end(r.src, p)
+  return back_trivia(r.src, p, e)
+
+# Back from e over white space and comments, not before lo.
+fn back_trivia(src: Str, lo: Int, e: Int) -> Int:
+  var i = e
+  while i > lo:
+    let ch = src[i - 1]
+    if ch == 32 or ch == 9 or ch == 10 or ch == 13 or ch == 11 or ch == 12:
+      i -= 1
+      continue
+    if i - 2 >= lo and src[i - 1] == 47 and src[i - 2] == 42:
+      # (a block comment: back to its start)
+      var j = i - 3
+      while j > lo and not (src[j] == 47 and src[j + 1] == 42): j -= 1
+      if j >= lo and src[j] == 47 and src[j + 1] == 42:
+        i = j
+        continue
+      break
+    # a line comment ending here: the line's // outside a string
+    var ls = i - 1
+    while ls > lo and src[ls - 1] != 10: ls -= 1
+    let lc = line_comment_at(src, ls, i)
+    if lc >= lo and lc < i:
+      i = lc
+      continue
+    break
+  return i
+
+fn line_comment_at(src: Str, from: Int, to: Int) -> Int:
+  var k = from
+  var q = 0
+  while k < to:
+    let ch = int(src[k])
+    if q != 0:
+      if ch == 92: k += 1
+      elif ch == q: q = 0
+    elif ch == 39 or ch == 34 or ch == 96: q = ch
+    elif ch == 47 and k + 1 < to and src[k + 1] == 47: return k
+    elif ch == 47 and k + 1 < to and src[k + 1] == 42:
+      k += 2
+      while k + 1 < to and not (src[k] == 42 and src[k + 1] == 47): k += 1
+      k += 1
+    k += 1
+  return -1
+
+fn id_char(ch0: Byte) -> Bool:
+  return id_c(int(ch0))
+
+fn id_c(ch: Int) -> Bool:
+  return (ch >= 97 and ch <= 122) or (ch >= 65 and ch <= 90) or (ch >= 48 and ch <= 57) or ch == 95 or ch == 36 or ch >= 128
+
+# The end of the token at p (a leaf's: a name, keyword, number, string or punctuator).
+fn tok_end(src: Str, p: Int) -> Int:
+  if p >= src.len: return p
+  let ch = int(src[p])
+  if ch == 39 or ch == 34 or ch == 96:
+    var k = p + 1
+    while k < src.len and int(src[k]) != ch:
+      if src[k] == 92: k += 1
+      k += 1
+    return k + 1
+  if id_c(ch) or ch == 35:
+    var k = p + 1
+    while k < src.len and (id_char(src[k]) or (src[k] == 46 and ch >= 48 and ch <= 57)): k += 1
+    return k
+  # (punctuators: the longest match)
+  for pu in [">>>=", "...", "===", "!==", "**=", "<<=", ">>=", ">>>", "&&=", "||=", "??=", "=>", "==", "!=", "<=", ">=", "&&", "||", "??", "?.", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "**", "<<", ">>"]:
+    if src[p..src.len].startswith(pu): return p + pu.len
+  return p + 1
+
+fn unparen(c: C, n: Int) -> Int:
+  var x = n
+  while x >= 0 and c.t.nd[x].k == ast.N_PAREN: x = c.t.nd[x].a
+  return x
+
+# ---- the rules
+
+fn no_unsafe_unary_minus(var c: C, var r: Run, n: Int):
+  let op = c.t.nd[n].a
+  let t = constrained_at(&c, op)
+  for m in parts(c, t):
+    if not (is_any(c, m) or c.tk[m] == TK_NEVER or bigint_like(c, m) or number_like(c, m)):
+      report(&r, "no-unsafe-unary-minus", c.t.nd[n].pos, xend(c, r, n), "unaryMinus", "Argument of unary negation should be assignable to number | bigint but is {type_str(&c, m)} instead.")
+      return
+
+fn no_meaningless_void(var c: C, var r: Run, n: Int):
+  let arg = c.t.nd[n].a
+  let t = type_at(&c, arg)
+  var all_void = true
+  var all_void_never = true
+  for m in parts(c, t):
+    if not void_like(c, m): all_void = false
+    if not void_like(c, m) and c.tk[m] != TK_NEVER: all_void_never = false
+  if all_void or (r.void_never and all_void_never):
+    report(&r, "no-meaningless-void-operator", c.t.nd[n].pos, xend(c, r, n), "meaninglessVoidOperator", "void operator shouldn't be used on {type_str(&c, t)}; it should convey that a return value is being ignored")
+
+fn array_like(var c: C, t: Int) -> Bool:
+  if c.tk[t] == TK_UNION or c.tk[t] == TK_INTER:
+    for i in 0..c.tb[t]:
+      if array_like(&c, c.tl[c.ta[t] + i]): return true
+    return false
+  if number_index(&c, t) < 0: return false
+  let lt = prop_type(&c, t, "length")
+  if lt < 0: return false
+  return number_like(c, lt) or (c.tk[lt] == TK_UNION and all_number_like(c, lt))
+
+fn all_number_like(c: C, t: Int) -> Bool:
+  for m in parts(c, t):
+    if not number_like(c, m): return false
+  return true
+
+fn no_for_in_array(var c: C, var r: Run, n: Int):
+  let e = c.t.nd[n].b
+  let t = constrained_at(&c, e)
+  if not array_like(&c, t): return
+  # (the statement's head: from `for` to the end of `)`, GetForStatementHeadLoc)
+  let body = c.t.nd[n].c
+  let end = back_trivia(r.src, c.t.nd[n].pos, c.t.nd[body].pos)
+  r.out.push(RDiag("no-for-in-array", c.t.nd[n].pos, end, "forInViolation", "For-in loops over arrays skips holes, returns indices as strings, and may visit the prototype chain or other enumerable properties.", "Use a more robust iteration method such as for-of or array.forEach instead.", [], []))
+
+fn no_array_delete(var c: C, var r: Run, n: Int):
+  let x = unparen(c, c.t.nd[n].a)
+  if c.t.nd[x].k != ast.N_ELEMACCESS: return
+  let obj = c.t.nd[x].a
+  let t = constrained_at(&c, obj)
+  var arr = false
+  if c.tk[t] == TK_UNION:
+    arr = true
+    for m in parts(c, t):
+      if not is_array_or_tuple(&c, m): arr = false
+  elif c.tk[t] == TK_INTER:
+    for m in inter_parts(c, t):
+      if is_array_or_tuple(&c, m): arr = true
+  else: arr = is_array_or_tuple(&c, t)
+  if not arr: return
+  # (the `delete` keyword's range)
+  let p = c.t.nd[n].pos
+  r.out.push(RDiag("no-array-delete", p, p + 6, "noArrayDelete", "Using the `delete` operator with an array expression is unsafe.", "", [c.t.nd[obj].pos, xend(c, r, obj)], ["This expression evaluates to an array."]))
+
+fn require_sort_compare(var c: C, var r: Run, n: Int):
+  let args = c.t.nd[n].c
+  if ast.items(c.t, args).len != 0: return
+  let callee = c.t.nd[n].a
+  let ck = c.t.nd[callee].k
+  var name = ""
+  if ck == ast.N_PROPACCESS: name = bind.nm(c, c.t.nd[callee].s)
+  elif ck == ast.N_ELEMACCESS:
+    let ix = c.t.nd[callee].b
+    if c.t.nd[ix].k == ast.N_STR or c.t.nd[ix].k == ast.N_NOSUBTEMPL: name = bind.nm(c, c.t.nd[ix].s)
+    else: return
+  else: return
+  if name != "sort" and name != "toSorted": return
+  let t = constrained_at(&c, c.t.nd[callee].a)
+  if r.sort_ignore_str and is_array_or_tuple(&c, t):
+    var all_str = true
+    for a in type_args(c, t):
+      var b = base_constraint(&c, a)
+      if not (c.tk[b] == TK_STRING or type_name(&c, b) == "string"): all_str = false
+    if all_str: return
+  for m in parts(c, t):
+    if not is_array_or_tuple(&c, m): return
+  report(&r, "require-array-sort-compare", c.t.nd[n].pos, xend(c, r, n), "requireCompare", "Require 'compare' argument.")
+
+# A reference's (or tuple's) type arguments.
+fn type_args(c: C, t: Int) -> [Int]:
+  if c.tk[t] != TK_OBJ: return []
+  let o = c.ta[t]
+  if c.objs[o].kind == OK_REF or c.objs[o].kind == OK_TUPLE: return types.ints(c.objs[o].args)
+  return []
+
+# GetTypeName: string for string-like types (and type parameters constrained to them).
+fn type_name(var c: C, t: Int) -> Str:
+  if string_like(c, t): return "string"
+  if c.tk[t] == TK_TPARAM:
+    let b = rel.constraint_of(&c, t)
+    if b >= 0 and b != t: return type_name(&c, b)
+  if c.tk[t] == TK_UNION:
+    var all = true
+    for m in parts(c, t):
+      if type_name(&c, m) != "string": all = false
+    if all: return "string"
+  if c.tk[t] == TK_INTER:
+    for m in inter_parts(c, t):
+      if type_name(&c, m) == "string": return "string"
+  return type_str(&c, t)
+
+fn tmpl_allowed(var c: C, r: Run, t: Int) -> Bool:
+  for m in parts(c, t):
+    var ok = false
+    for x in inter_parts(c, m):
+      if ok: break
+      if string_like(c, x): ok = true
+      elif r.tmpl.any and is_any(c, x): ok = true
+      elif r.tmpl.boolean and boolean_like(c, x): ok = true
+      elif r.tmpl.nullish and (c.tk[x] == TK_NULL or c.tk[x] == TK_UNDEF or c.tk[x] == TK_VOID): ok = true
+      elif r.tmpl.number and (number_like(c, x) or bigint_like(c, x)): ok = true
+      elif r.tmpl.never and c.tk[x] == TK_NEVER: ok = true
+      elif r.tmpl.allow.len > 0 and allowed_base(&c, x, r.tmpl.allow, 0): ok = true
+      elif r.tmpl.array and is_array_or_tuple(&c, x) and elem_allowed(&c, r, x): ok = true
+      elif r.tmpl.regexp and lib_name(&c, x) == "RegExp": ok = true
+    if not ok: return false
+  return true
+
+fn elem_allowed(var c: C, r: Run, x: Int) -> Bool:
+  let el = number_index(&c, x)
+  if el < 0: return false
+  return tmpl_allowed(&c, r, el)
+
+# MatchesTypeOrBaseType: the type or one of its base types matches.
+fn allowed_base(var c: C, t: Int, specs: [Spec], depth: Int) -> Bool:
+  if depth > 10: return false
+  if matches_specs(&c, t, specs): return true
+  for b in base_types(&c, t):
+    if allowed_base(&c, b, specs, depth + 1): return true
+  return false
+
+# An interface's or a class's base types (its extends clauses' types).
+fn base_types(var c: C, t: Int) -> [Int]:
+  var out: [Int] = []
+  if c.tk[t] != TK_OBJ: return out
+  var o = c.ta[t]
+  if c.objs[o].kind == OK_REF: o = c.ta[c.objs[o].target]
+  let s = c.objs[o].sym
+  if s < 0: return out
+  var decls: [Int] = [c.sdecl[s]]
+  if s in c.smore:
+    for x in types.ints(c.smore[s]): decls.push(x)
+  for d in decls:
+    if d < 0: continue
+    let dk = c.t.nd[d].k
+    if dk == ast.N_INTERFACE:
+      for h in ast.items(c.t, c.t.nd[d].b): out.push(bind.heritage_type(&c, h))
+    elif dk == ast.N_CLASS or dk == ast.N_CLASSEXPR:
+      let h = c.t.nd[d].b
+      if h >= 0: out.push(bind.heritage_type(&c, h))
+  return out
+
+fn restrict_template(var c: C, var r: Run, n: Int):
+  # (not a tagged template's)
+  let p0 = r.parents.get(n, -1)
+  if p0 >= 0 and c.t.nd[p0].k == ast.N_TAGGED: return
+  for sp in ast.items(c.t, c.t.nd[n].a):
+    let e = c.t.nd[sp].a
+    let t = constrained_at(&c, e)
+    if tmpl_allowed(&c, r, t): continue
+    let p = c.t.nd[e].pos
+    let en = xend(c, r, e)
+    r.out.push(RDiag("restrict-template-expressions", p, en, "invalidType", "Invalid type used in template literal expression.", "", [p, en], ["Type: {type_str(&c, t)}"]))
+
+# A node's parent (lists skipped).
+fn up(c: C, n: Int) -> Int:
+  if n < 0 or n >= c.parent.len: return -1
+  var p = c.parent[n]
+  while p >= 0 and c.t.nd[p].k == ast.N_LIST:
+    if p >= c.parent.len: return -1
+    p = c.parent[p]
+  return p
