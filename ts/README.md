@@ -72,6 +72,48 @@ parts of the import order, balanced by size), and resolves the declarations its 
 from other parts; the files not checked are merged over all workers. The output doesn't depend
 on the number of workers (checked on date-fns, ky, redux, zod and remeda with 1, 2 and 3).
 
+### n8n (2026-11-14)
+
+One thread, wall seconds on the 2-core VM, every package's own tsconfig (`perf.sh`); tsc 7.0.2
+with `--checkers 1 --singleThreaded` and a fresh `--tsBuildInfoFile` each run:
+
+| package | files checked | vtsc | tsc 7 |
+|---|---|---|---|
+| workflow | 251 | 1.43 | 2.52 |
+| @n8n/mcp-apps | 38 | 0.29 | 0.49 |
+| @n8n/task-runner | 43 | 0.32 | 0.70 |
+| @n8n/backend-common | 36 | 0.28 | 0.61 |
+| @n8n/config | 88 | 0.19 | 0.41 |
+| @n8n/permissions | 40 | 0.14 | 0.39 |
+| @n8n/utils | 97 | 0.29 | 0.47 |
+| @n8n/json-schema-to-zod | 40 | 0.20 | 0.30 |
+| total | | 3.13 | 5.89 |
+
+With their default threads (2 cores): workflow 1.08 s against 2.52 s, task-runner 0.39 s against
+0.83 s. The same 8 packages took vtsc 22.9 s before this work, and earlier numbers here compared
+it with tsc runs that weren't checking: these packages are composite projects, and tsc reused
+their `dist/typecheck.tsbuildinfo` (written by an earlier run) and checked nothing (0.63 s for
+workflow, "Check time: 0.002s"). The errors are unchanged: all 1102 files of 22 packages still
+checked with tsc 7's errors, the vtests and the regression set the same.
+
+Where the time went, and what fixed it (callgrind on workflow: 11.5G instructions to 5.8G, after
+22.9 s to 4.4 s over the 8 packages in the first round):
+- Caches tsc has: composed mappers, mappers interned by their contents, a package's declarations
+  given types only when used, each type's signatures instantiated once, scope lookups, a call's
+  result when its context and the flow state are the same (with the epoch of what it read),
+  conditional types by their arguments, `is_generic`, weak types, subtype reductions.
+- Unions and intersections interned by Int hashes instead of strings; members read by index
+  instead of copied lists; signatures read in place instead of copied.
+- Linear where it was quadratic: a `&&`/`||` chain's facts found once per chain (the first
+  operand of a 40-term chain was checked about 1,500 times); a type found in a large union by a
+  set (containsType), not by relating it to each member; subtype reduction skips pairs that can't
+  relate (tsc's key property, object literals' property names, primitives when there's no empty
+  object type).
+- Loops: each pass is a real one, and the pass that settles is kept as the final one.
+- Vu's runtime: Int map keys hashed with a keyed multiply-mix instead of SipHash.
+- The checker isn't freed piece by piece when the program exits (3% of the run).
+
+
 ## What it checks
 
 Expressions, statements and declarations with tsc's errors and messages: assignability with
@@ -220,11 +262,10 @@ diagnostics). Against oxlint 1.90.0 with n8n's tsgolint 0.21.1, default configur
 packages: no difference in either `--type-check` (every line equal) or `--type-check-only`.
 vtsc checks 809 of the 1,280 linted files under a tsconfig; the rest are files that tsconfig
 doesn't include, files that use something vtsc doesn't model, and every file of the 6 packages
-whose tsconfig has `references`. It stays off because it isn't faster yet. Type-aware rules still need tsgolint's
-program, and vtsc is slower than tsgolint's checker on this code (workflow, 251 files: 2.4 s
-against tsc 7's 0.63 s with 2 cores; 3.1 s against 0.85 s on one), so `--type-check` took
-0.3-4.0 s per package with vtsc against oxlint's 0.2-2.7 s, and 14.7 s on mcp-apps (Vue's
-types; 0.7 s for oxlint). TypeScript's lib files come from
+whose tsconfig has `references`. It stays off for now: the type-aware rules still need tsgolint's
+program, so tsgolint runs either way (when this was measured, vtsc itself was also slower:
+`--type-check` took 0.3-4.0 s per package with vtsc against oxlint's 0.2-2.7 s, and 14.7 s on
+mcp-apps, Vue's types; vtsc's speed since: "n8n" under Speed). TypeScript's lib files come from
 `$VTSC_LIB`, else the nearest TypeScript 7 or 6 install; with an older one, tsgolint checks
 everything.
 
