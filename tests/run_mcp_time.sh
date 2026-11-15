@@ -10,7 +10,7 @@ trap 'rm -rf "$work"' EXIT
 "$d/../vu" build --san "$d/../mcp/time/main.vu" -o "$work/san" || exit 1
 py="${MCP_TIME_PY:-$d/.mcp_ref_py/bin/python}"
 if [ ! -x "$py" ]; then
-  python3 -m venv "$d/.mcp_ref_py" >/dev/null 2>&1 && "$d/.mcp_ref_py/bin/pip" install -q mcp-server-time >/dev/null 2>&1
+  python3 -m venv "$d/.mcp_ref_py" >/dev/null 2>&1 && "$d/.mcp_ref_py/bin/pip" install -q "mcp-server-time==2026.10.28" >/dev/null 2>&1
 fi
 if [ -x "$py" ] && "$py" -c 'import mcp_server_time' 2>/dev/null && [ -d /usr/share/zoneinfo ]; then
   for b in plain san; do
