@@ -32,7 +32,7 @@ type Cfg:
   opts: [Str]
 
 # The rules ported here.
-const PORTED = "no-array-delete no-for-in-array no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
+const PORTED = "no-array-delete no-duplicate-type-constituents no-for-in-array no-implied-eval no-redundant-type-constituents no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
 
 fn ported(name: Str) -> Bool:
   for x in PORTED.split(" "):
@@ -62,6 +62,8 @@ type Run:
   # options
   void_never: Bool
   sort_ignore_str: Bool
+  dup_no_inter: Bool
+  dup_no_union: Bool
   tmpl: TmplOpts
 
 type TmplOpts:
@@ -303,7 +305,7 @@ fn run(var c: C, root: Int, src: Str, cf: Cfg, var out: [RDiag]) -> Bool:
   var cf2 = Cfg([], [])
   for x in cf.names: cf2.names.push(x + "")
   for x in cf.opts: cf2.opts.push(x + "")
-  var r = Run(cf2, src + "", [], {}, opt_bool(opt_of(cf, "no-meaningless-void-operator"), "checkNever", false), opt_bool(opt_of(cf, "require-array-sort-compare"), "ignoreStringArrays", true), tmo)
+  var r = Run(cf2, src + "", [], {}, opt_bool(opt_of(cf, "no-meaningless-void-operator"), "checkNever", false), opt_bool(opt_of(cf, "require-array-sort-compare"), "ignoreStringArrays", true), opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreIntersections", false), opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreUnions", false), tmo)
   let seq0 = c.unsup_seq
   walk(&c, &r, root, -1)
   for d in r.out: out.push(copy_diag(d))
@@ -348,6 +350,10 @@ fn visit(var c: C, var r: Run, n: Int):
     let nm = r.cf.names[ri] + ""
     if nm == "no-array-delete" and k == ast.N_DELETE: no_array_delete(&c, &r, n)
     elif nm == "no-for-in-array" and k == ast.N_FORIN and c.t.nd[n].f == 0: no_for_in_array(&c, &r, n)
+    elif nm == "no-duplicate-type-constituents" and (k == ast.N_TUNION or k == ast.N_TINTER): no_duplicate_constituents(&c, &r, n)
+    elif nm == "no-redundant-type-constituents" and k == ast.N_TUNION: redundant_union(&c, &r, n)
+    elif nm == "no-redundant-type-constituents" and k == ast.N_TINTER: redundant_inter(&c, &r, n)
+    elif nm == "no-implied-eval" and (k == ast.N_CALL or k == ast.N_NEW): no_implied_eval(&c, &r, n)
     elif nm == "no-meaningless-void-operator" and k == ast.N_VOIDEXPR: no_meaningless_void(&c, &r, n)
     elif nm == "no-unsafe-unary-minus" and k == ast.N_PREFIX and c.t.nd[n].f == scan.T_MINUS: no_unsafe_unary_minus(&c, &r, n)
     elif nm == "require-array-sort-compare" and k == ast.N_CALL: require_sort_compare(&c, &r, n)
@@ -770,3 +776,458 @@ fn up(c: C, n: Int) -> Int:
     if p >= c.parent.len: return -1
     p = c.parent[p]
   return p
+
+# ---- no-implied-eval
+
+fn callee_name(c: C, e: Int) -> Str:
+  let k = c.t.nd[e].k
+  if k == ast.N_ID: return bind.nm(c, c.t.nd[e].s)
+  if k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS:
+    let o = c.t.nd[e].a
+    if c.t.nd[o].k != ast.N_ID: return ""
+    let on = bind.nm(c, c.t.nd[o].s)
+    if on != "global" and on != "globalThis" and on != "window": return ""
+    if k == ast.N_PROPACCESS:
+      if (c.t.nd[e].f & 4) != 0: return ""
+      return bind.nm(c, c.t.nd[e].s)
+    let ix = c.t.nd[e].b
+    if c.t.nd[ix].k == ast.N_STR: return bind.nm(c, c.t.nd[ix].s)
+  return ""
+
+# IsBuiltinSymbolLike: the type (every union member, some intersection member, a type parameter's
+# constraint) is the lib's type of one of these names
+fn builtin_like(var c: C, t: Int, names: [Str], depth: Int) -> Bool:
+  return builtin_like3(&c, t, names, depth) == 1
+
+# (1 yes, 0 no, -1 unknown)
+fn builtin_like3(var c: C, t: Int, names: [Str], depth: Int) -> Int:
+  if depth > 20: return 0
+  let k = c.tk[t]
+  if k == TK_INTER:
+    for m in inter_parts(c, t):
+      if builtin_like3(&c, m, names, depth + 1) == 1: return 1
+    return 0
+  if k == TK_UNION:
+    for m in parts(c, t):
+      if builtin_like3(&c, m, names, depth + 1) != 1: return 0
+    return 1
+  if k == TK_TPARAM:
+    let con = rel.constraint_of(&c, t)
+    if con >= 0 and con != t: return builtin_like3(&c, con, names, depth + 1)
+    return 0
+  let ln = lib_name(&c, t)
+  if ln != "":
+    for x in names:
+      if x == ln: return 1
+  # (an object type that derives from one: its base types)
+  for b in base_types(&c, t):
+    if builtin_like3(&c, b, names, depth + 1) == 1: return 1
+  return 0
+
+fn call_sig_count(var c: C, t: Int) -> Int:
+  if c.tk[t] == TK_UNION:
+    for m in parts(c, t):
+      if call_sig_count(&c, m) == 0: return 0
+    return 1
+  var a = t
+  if c.tk[t] != TK_OBJ and c.tk[t] != TK_INTER: a = rel.apparent(&c, t)
+  if c.tk[a] == TK_INTER:
+    var n = 0
+    for m in inter_parts(c, a): n += bind.sig_count(&c, m, false)
+    return n
+  if c.tk[a] == TK_TPARAM:
+    let con = rel.constraint_of(&c, a)
+    if con >= 0 and con != a: return call_sig_count(&c, con)
+    return 0
+  return bind.sig_count(&c, a, false)
+
+fn is_function_type(var c: C, n: Int) -> Bool:
+  let t = type_at(&c, n)
+  let s = own_symbol(c, t)
+  if s >= 0 and (c.sk[s] & (types.S_FUNC | types.S_METHOD)) != 0: return true
+  if builtin_like(&c, t, ["Function"], 0): return true
+  return call_sig_count(&c, t) > 0
+
+fn function_like_node(c: C, n: Int) -> Bool:
+  let k = c.t.nd[n].k
+  return k == ast.N_ARROW or k == ast.N_FUNCEXPR or k == ast.N_FUNC or k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET or k == ast.N_CTOR
+
+fn literal_node(c: C, n: Int) -> Bool:
+  let k = c.t.nd[n].k
+  return k == ast.N_STR or k == ast.N_NUM or k == ast.N_BIGINT or k == ast.N_REGEX or k == ast.N_NOSUBTEMPL or k == ast.N_TEMPL
+
+fn is_bind(c: C, e: Int) -> Bool:
+  if c.t.nd[e].k == ast.N_PROPACCESS: return bind.nm(c, c.t.nd[e].s) == "bind"
+  return c.t.nd[e].k == ast.N_ID and bind.nm(c, c.t.nd[e].s) == "bind"
+
+fn is_function_arg(var c: C, n: Int) -> Bool:
+  if function_like_node(c, n): return true
+  if literal_node(c, n): return false
+  if c.t.nd[n].k == ast.N_CALL: return is_bind(c, c.t.nd[n].a) or is_function_type(&c, n)
+  return is_function_type(&c, n)
+
+fn no_implied_eval(var c: C, var r: Run, n: Int):
+  let callee = c.t.nd[n].a
+  let name = callee_name(c, callee)
+  if name == "": return
+  if name == "Function":
+    let t = type_at(&c, callee)
+    let s = own_symbol(c, t)
+    if s >= 0:
+      if builtin_like(&c, t, ["FunctionConstructor"], 0):
+        report(&r, "no-implied-eval", c.t.nd[n].pos, xend(c, r, n), "noFunctionConstructor", "Implied eval. Do not use the Function constructor to create functions.")
+        return
+    else:
+      report(&r, "no-implied-eval", c.t.nd[n].pos, xend(c, r, n), "noFunctionConstructor", "Implied eval. Do not use the Function constructor to create functions.")
+  let al = c.t.nd[n].c
+  if al < 0: return
+  let args = ast.items(c.t, al)
+  if args.len == 0: return
+  let h = args[0]
+  if not (name == "execScript" or name == "setImmediate" or name == "setInterval" or name == "setTimeout"): return
+  if is_function_arg(&c, h): return
+  # (a function of that name declared in this file isn't the global one)
+  let s = symbol_at(&c, callee)
+  if s >= 0:
+    for f in decl_files(c, s):
+      if f == c.t.nd[n].file: return
+  report(&r, "no-implied-eval", c.t.nd[h].pos, xend(c, r, h), "noImpliedEvalError", "Implied eval. Consider passing a function.")
+
+# GetSymbolAtLocation for a callee: an identifier's value, a property's symbol (-1 none)
+fn symbol_at(var c: C, e: Int) -> Int:
+  let k = c.t.nd[e].k
+  if k == ast.N_ID: return bind.lookup_value(&c, e, c.t.nd[e].s)
+  if k == ast.N_PROPACCESS:
+    let ot = type_at(&c, c.t.nd[e].a)
+    var a = ot
+    if c.tk[ot] != TK_OBJ and c.tk[ot] != TK_INTER: a = rel.apparent(&c, ot)
+    if c.tk[a] != TK_OBJ: return -1
+    return bind.get_prop(&c, a, c.t.nd[e].s)
+  return -1
+
+# ---- type nodes
+
+# getTypeFromTypeNode
+fn node_type(var c: C, n: Int) -> Int:
+  if c.t.nd[n].k == ast.N_TLIT:
+    var l = c.t.nd[n].a
+    if c.t.nd[l].k == ast.N_PREFIX: l = c.t.nd[l].a
+    if c.t.nd[l].k == ast.N_BIGINT:
+      let u = bind.lazy_unsupported(&c, n, "a bigint literal type")
+      bind.touch(&c, u)
+      return c.any_t
+  let t = tyops.raw(&c, n)
+  bind.touch(&c, t)
+  return t
+
+fn src_text(c: C, r: Run, n: Int) -> Str:
+  return r.src[c.t.nd[n].pos..xend(c, r, n)]
+
+# The parent of kind k above n through parenthesized types (-1 none).
+fn unwound_parent(c: C, r: Run, n: Int, k: Int) -> Int:
+  var p = r.parents.get(n, -1)
+  while p >= 0:
+    if c.t.nd[p].k == k: return p
+    if c.t.nd[p].k != ast.N_TPAREN: return -1
+    p = r.parents.get(p, -1)
+  return -1
+
+fn skip_tparens(c: C, n: Int) -> Int:
+  var x = n
+  while c.t.nd[x].k == ast.N_TPAREN: x = c.t.nd[x].a
+  return x
+
+# ---- no-duplicate-type-constituents
+
+fn no_duplicate_constituents(var c: C, var r: Run, n: Int):
+  let k = c.t.nd[n].k
+  if k == ast.N_TINTER and r.dup_no_inter: return
+  if k == ast.N_TUNION and r.dup_no_union: return
+  if unwound_parent(c, r, n, k) >= 0: return
+  var seen: {Str: Int} = {}
+  # (a union that is an optional parameter's type: an undefined member is unnecessary)
+  var opt_param = false
+  if k == ast.N_TUNION:
+    let p = r.parents.get(n, -1)
+    if p >= 0 and c.t.nd[p].k == ast.N_PARAM and c.t.nd[p].b == n and (c.t.nd[p].f & ast.M_OPTIONAL) != 0: opt_param = true
+  for x in ast.items(c.t, c.t.nd[n].a): dup_rec(&c, &r, k, x, &seen, opt_param)
+
+# A type's identity as tsc's (tuples of the same elements are one type there).
+fn type_key(var c: C, t: Int) -> Str:
+  if c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == OK_TUPLE:
+    let o = c.ta[t]
+    var k = "tuple"
+    if c.objs[o].ro: k += "ro"
+    for i in 0..c.objs[o].args.len: k += ",{c.objs[o].args[i]}:{c.objs[o].eflags[i]}"
+    if t in c.tuple_labels:
+      k += "|"
+      for x in c.tuple_labels[t]: k += "{x},"
+    return k
+  return "{t}"
+
+fn dup_rec(var c: C, var r: Run, k: Int, n: Int, var seen: {Str: Int}, opt_param: Bool) -> Bool:
+  let t = node_type(&c, n)
+  if c.tk[t] == TK_ERROR: return false
+  let key = type_key(&c, t)
+  if key in seen:
+    let prev = seen[key]
+    var what = "Union"
+    if k == ast.N_TINTER: what = "Intersection"
+    let ptext = src_text(c, r, prev)
+    # (the message has the node's text from its full start, its leading trivia too)
+    let full = r.src[back_trivia(r.src, 0, c.t.nd[prev].pos)..xend(c, r, prev)]
+    r.out.push(RDiag("no-duplicate-type-constituents", c.t.nd[n].pos, xend(c, r, n), "duplicate", "{what} type constituent is duplicated with {full}.", "", [c.t.nd[prev].pos, xend(c, r, prev)], ["Type '{ptext}' is first declared here."]))
+    return true
+  if opt_param and c.tk[t] == TK_UNDEF:
+    report(&r, "no-duplicate-type-constituents", c.t.nd[n].pos, xend(c, r, n), "unnecessary", "Explicit undefined is unnecessary on an optional parameter.")
+  seen[key] = n
+  let x = skip_tparens(c, n)
+  if c.t.nd[x].k != k: return false
+  for y in ast.items(c.t, c.t.nd[x].a): dup_rec(&c, &r, k, y, &seen, opt_param)
+  return false
+
+# ---- no-redundant-type-constituents
+
+# A type part: tsgolint's flags of it (F_* below) and the node or type it came from.
+type RPart:
+  fl: Int
+  node: Int
+  t: Int
+
+const F_ANY = 1
+const F_UNKNOWN = 2
+const F_STRING = 4
+const F_NUMBER = 8
+const F_BIGINT = 64
+const F_BOOLEAN = 16
+const F_STRLIT = 128
+const F_NUMLIT = 256
+const F_BIGLIT = 2048
+const F_BOOLLIT = 512
+const F_NEVER = 131072
+const F_TEMPLATE = 134217728
+const F_OTHER = 1 << 40
+const F_UNIONF = 1 << 20
+const F_ENUMLIT = 1 << 10
+
+# Type_flags of a type, as far as these rules compare them (an enum literal has more flags, so it
+# matches none; boolean is a union).
+fn tflags(c: C, t: Int) -> Int:
+  let k = c.tk[t]
+  if k == TK_ANY or k == TK_ERROR: return F_ANY
+  if k == TK_UNKNOWN: return F_UNKNOWN
+  if k == TK_STRING: return F_STRING
+  if k == TK_NUMBER: return F_NUMBER
+  if k == TK_BIGINT: return F_BIGINT
+  if k == TK_NEVER: return F_NEVER
+  if k == TK_STRLIT:
+    if t in c.enum_base: return F_STRLIT | F_ENUMLIT
+    return F_STRLIT
+  if k == TK_NUMLIT:
+    if t in c.enum_base: return F_NUMLIT | F_ENUMLIT
+    return F_NUMLIT
+  if k == TK_BIGLIT: return F_BIGLIT
+  if k == TK_TRUE or k == TK_FALSE: return F_BOOLLIT
+  if k == TK_TEMPLATE: return F_TEMPLATE
+  return F_OTHER
+
+fn type_parts_flags(var c: C, n0: Int) -> [RPart]:
+  var out: [RPart] = []
+  let n = n0
+  let k = c.t.nd[n].k
+  if k == ast.N_TKW:
+    let w = c.t.nd[n].f
+    var fl = 0
+    if w == scan.W_ANY: fl = F_ANY
+    elif w == scan.W_BIGINT: fl = F_BIGINT
+    elif w == scan.W_BOOLEAN: fl = F_BOOLEAN
+    elif w == scan.W_NEVER: fl = F_NEVER
+    elif w == scan.W_NUMBER: fl = F_NUMBER
+    elif w == scan.W_STRING: fl = F_STRING
+    elif w == scan.W_UNKNOWN: fl = F_UNKNOWN
+    if fl != 0:
+      out.push(RPart(fl, n, -1))
+      return out
+  if k == ast.N_TLIT:
+    let lk = c.t.nd[c.t.nd[n].a].k
+    var fl = 0
+    if lk == ast.N_BIGINT: fl = F_BIGLIT
+    elif lk == ast.N_TRUE or lk == ast.N_FALSE: fl = F_BOOLLIT
+    elif lk == ast.N_NUM: fl = F_NUMLIT
+    elif lk == ast.N_STR: fl = F_STRLIT
+    if fl != 0:
+      out.push(RPart(fl, n, -1))
+      return out
+  if k == ast.N_TUNION:
+    for x in ast.items(c.t, c.t.nd[n].a):
+      for p in type_parts_flags(&c, x): out.push(RPart(p.fl, p.node, p.t))
+    return out
+  let t = node_type(&c, n)
+  if t == c.boolean_t:
+    out.push(RPart(F_BOOLEAN | F_UNIONF, -1, t))
+    return out
+  # (an unresolved name: an error type, printed by its name)
+  if c.tk[t] == TK_ERROR and k == ast.N_TREF:
+    out.push(RPart(F_ANY, -2 - n, t))
+    return out
+  for m in parts(c, t): out.push(RPart(tflags(c, m), -1, m))
+  return out
+
+fn go_quote(s: Str) -> Str:
+  var o = "\""
+  for i in 0..s.len:
+    let ch = int(s[i])
+    if ch == 34: o += "\\\""
+    elif ch == 92: o += "\\\\"
+    elif ch == 10: o += "\\n"
+    elif ch == 9: o += "\\t"
+    elif ch == 13: o += "\\r"
+    else: o += s[i..i + 1]
+  return o + "\""
+
+fn part_str(var c: C, r: Run, p: RPart) -> Str:
+  if p.node < -1: return src_text(c, r, c.t.nd[-2 - p.node].a)
+  if p.node >= 0:
+    let n = p.node
+    let k = c.t.nd[n].k
+    if k == ast.N_TKW:
+      let w = c.t.nd[n].f
+      if w == scan.W_ANY: return "any"
+      if w == scan.W_BOOLEAN: return "boolean"
+      if w == scan.W_NEVER: return "never"
+      if w == scan.W_NUMBER: return "number"
+      if w == scan.W_STRING: return "string"
+      if w == scan.W_UNKNOWN: return "unknown"
+    if k == ast.N_TLIT:
+      let l = c.t.nd[n].a
+      let lk = c.t.nd[l].k
+      if lk == ast.N_NOSUBTEMPL: return "template literal type"
+      if lk == ast.N_STR: return bind.nm(c, c.t.nd[l].s)
+      if lk == ast.N_NUM or lk == ast.N_BIGINT: return bind.nm(c, c.t.nd[l].s)
+    return "literal type"
+  if p.fl == F_STRLIT: return go_quote(type_str(&c, p.t))
+  return type_str(&c, p.t)
+
+fn fn_like(c: C, n: Int) -> Bool:
+  let k = c.t.nd[n].k
+  return k == ast.N_SIG or k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET or k == ast.N_CTOR
+
+fn redundant_top(var c: C, var r: Run, p: RPart, tn: Int, container: Str, union: Bool, n: Int) -> Bool:
+  var msg = ""
+  var id = ""
+  if p.fl == F_ANY:
+    let nm = part_str(&c, r, p)
+    if nm == "any":
+      id = "overrides"
+      msg = "'{nm}' overrides all other types in this {container} type."
+    else:
+      id = "errorTypeOverrides"
+      msg = "'{nm}' is an 'error' type that acts as 'any' and overrides all other types in this {container} type."
+  elif p.fl == F_NEVER:
+    if union:
+      let par = r.parents.get(n, -1)
+      if par >= 0 and fn_like(c, par): return false
+      id = "overridden"
+      msg = "'never' is overridden by other types in this union type."
+    else:
+      id = "overrides"
+      msg = "'{part_str(&c, r, p)}' overrides all other types in this intersection type."
+  elif p.fl == F_UNKNOWN:
+    if union:
+      id = "overrides"
+      msg = "'{part_str(&c, r, p)}' overrides all other types in this union type."
+    else:
+      id = "overridden"
+      msg = "'{part_str(&c, r, p)}' is overridden by other types in this intersection type."
+  else: return false
+  report(&r, "no-redundant-type-constituents", c.t.nd[tn].pos, xend(c, r, tn), id, msg)
+  return true
+
+fn join_parts(var c: C, r: Run, ps: [RPart]) -> Str:
+  var xs: [Str] = []
+  for p in ps: xs.push(part_str(&c, r, p))
+  return " | ".join(xs)
+
+fn redundant_union(var c: C, var r: Run, n: Int):
+  var seen_prim = 0
+  # (per type node, its literals of each primitive)
+  var tnodes: [Int] = []
+  var lits: [[RPart]] = []
+  for tn in ast.items(c.t, c.t.nd[n].a):
+    let ps = type_parts_flags(&c, tn)
+    var mine: [RPart] = []
+    for p in ps:
+      if redundant_top(&c, &r, p, tn, "union", true, n): continue
+      if p.fl == F_BIGLIT or p.fl == F_BOOLLIT or p.fl == F_NUMLIT or p.fl == F_STRLIT or p.fl == F_TEMPLATE: mine.push(RPart(p.fl, p.node, p.t))
+      seen_prim = seen_prim | (p.fl & (F_BIGINT | F_BOOLEAN | F_NUMBER | F_STRING))
+    tnodes.push(tn)
+    lits.push(mine)
+  for pr in [[F_BIGINT, F_BIGLIT], [F_BOOLEAN, F_BOOLLIT], [F_NUMBER, F_NUMLIT], [F_STRING, F_STRLIT]]:
+    if (seen_prim & pr[0]) == 0: continue
+    var pname = "bigint"
+    if pr[0] == F_BOOLEAN: pname = "boolean"
+    elif pr[0] == F_NUMBER: pname = "number"
+    elif pr[0] == F_STRING: pname = "string"
+    for i in 0..tnodes.len:
+      var sel: [RPart] = []
+      for p in lits[i]:
+        if p.fl == pr[1] or (pr[1] == F_STRLIT and p.fl == F_TEMPLATE): sel.push(RPart(p.fl, p.node, p.t))
+      if sel.len == 0: continue
+      let tn = tnodes[i]
+      report(&r, "no-redundant-type-constituents", c.t.nd[tn].pos, xend(c, r, tn), "literalOverridden", "{join_parts(&c, r, sel)} is overridden by {pname} in this union type.")
+
+fn redundant_inter(var c: C, var r: Run, n: Int):
+  var lit_b: [RPart] = []
+  var lit_bo: [RPart] = []
+  var lit_n: [RPart] = []
+  var lit_s: [RPart] = []
+  var prim_b: [Int] = []
+  var prim_bo: [Int] = []
+  var prim_n: [Int] = []
+  var prim_s: [Int] = []
+  var unions: [[RPart]] = []
+  var union_nodes: [Int] = []
+  for tn in ast.items(c.t, c.t.nd[n].a):
+    let ps = type_parts_flags(&c, tn)
+    if ps.len >= 2:
+      var cp: [RPart] = []
+      for p in ps: cp.push(RPart(p.fl, p.node, p.t))
+      unions.push(cp)
+      union_nodes.push(tn)
+    for p in ps:
+      if redundant_top(&c, &r, p, tn, "intersection", false, n): continue
+      if unions.len == 0:
+        if p.fl == F_BIGLIT: lit_b.push(RPart(p.fl, p.node, p.t))
+        elif p.fl == F_BOOLLIT: lit_bo.push(RPart(p.fl, p.node, p.t))
+        elif p.fl == F_NUMLIT: lit_n.push(RPart(p.fl, p.node, p.t))
+        elif p.fl == F_STRLIT or p.fl == F_TEMPLATE: lit_s.push(RPart(p.fl, p.node, p.t))
+      if p.fl == F_BIGINT: prim_b.push(tn)
+      elif p.fl == F_BOOLEAN: prim_bo.push(tn)
+      elif p.fl == F_NUMBER: prim_n.push(tn)
+      elif p.fl == F_STRING: prim_s.push(tn)
+  if unions.len > 0 and (prim_b.len > 0 or prim_bo.len > 0 or prim_n.len > 0 or prim_s.len > 0):
+    var values = ""
+    for ui in 0..unions.len:
+      var pname = ""
+      # (the last part decides, as tsgolint's loop leaves it)
+      for p in unions[ui]:
+        pname = ""
+        if p.fl == F_BIGLIT and prim_b.len > 0: pname = "bigint"
+        elif p.fl == F_BOOLLIT and prim_bo.len > 0: pname = "boolean"
+        elif p.fl == F_NUMLIT and prim_n.len > 0: pname = "number"
+        elif (p.fl == F_STRLIT or p.fl == F_TEMPLATE) and prim_s.len > 0: pname = "string"
+        if pname == "": break
+      if pname == "": continue
+      if values == "": values = join_parts(&c, r, unions[ui])
+      let tn = union_nodes[ui]
+      report(&r, "no-redundant-type-constituents", c.t.nd[tn].pos, xend(c, r, tn), "primitiveOverridden", "{values} is overridden by the {pname} in this intersection type.")
+  if unions.len > 0: return
+  inter_lits(&c, &r, lit_b, prim_b, "bigint")
+  inter_lits(&c, &r, lit_bo, prim_bo, "boolean")
+  inter_lits(&c, &r, lit_n, prim_n, "number")
+  inter_lits(&c, &r, lit_s, prim_s, "string")
+
+fn inter_lits(var c: C, var r: Run, lits: [RPart], prims: [Int], pname: Str):
+  if lits.len == 0: return
+  let vals = join_parts(&c, r, lits)
+  for tn in prims: report(&r, "no-redundant-type-constituents", c.t.nd[tn].pos, xend(c, r, tn), "primitiveOverridden", "{pname} is overridden by the {vals} in this intersection type.")
