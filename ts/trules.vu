@@ -32,7 +32,7 @@ type Cfg:
   opts: [Str]
 
 # The rules ported here.
-const PORTED = "await-thenable no-array-delete no-base-to-string no-duplicate-type-constituents no-for-in-array no-implied-eval no-misused-spread no-redundant-type-constituents no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
+const PORTED = "await-thenable no-array-delete no-base-to-string no-duplicate-type-constituents no-for-in-array no-implied-eval no-misused-spread no-redundant-type-constituents no-useless-default-assignment no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
 
 fn ported(name: Str) -> Bool:
   for x in PORTED.split(" "):
@@ -383,6 +383,7 @@ fn visit(var c: C, var r: Run, n: Int):
     elif nm == "no-redundant-type-constituents" and k == ast.N_TINTER: redundant_inter(&c, &r, n)
     elif nm == "no-implied-eval" and (k == ast.N_CALL or k == ast.N_NEW): no_implied_eval(&c, &r, n)
     elif nm == "no-misused-spread" and (k == ast.N_ARRAY or k == ast.N_CALL or k == ast.N_OBJECT): no_misused_spread(&c, &r, n)
+    elif nm == "no-useless-default-assignment" and (k == ast.N_BINDEL or k == ast.N_PARAM): useless_default(&c, &r, n)
     elif nm == "no-meaningless-void-operator" and k == ast.N_VOIDEXPR: no_meaningless_void(&c, &r, n)
     elif nm == "no-unsafe-unary-minus" and k == ast.N_PREFIX and c.t.nd[n].f == scan.T_MINUS: no_unsafe_unary_minus(&c, &r, n)
     elif nm == "require-array-sort-compare" and k == ast.N_CALL: require_sort_compare(&c, &r, n)
@@ -1731,3 +1732,225 @@ fn array_values(var c: C, t: Int) -> [Int]:
   let ta = type_args(c, t)
   if ta.len > 0: return [ta[0]]
   return []
+
+# ---- no-useless-default-assignment
+
+fn can_be_undefined(c: C, t: Int) -> Bool:
+  if t < 0: return false
+  if is_any(c, t) or c.tk[t] == TK_UNKNOWN: return true
+  for m in parts(c, t):
+    if c.tk[m] == TK_UNDEF: return true
+  return false
+
+fn simple_for_msg(c: C, t: Int) -> Bool:
+  if t < 0: return false
+  let k = c.tk[t]
+  if k == TK_UNION or k == TK_INTER: return false
+  if string_like(c, t) or number_like(c, t) or boolean_like(c, t) or bigint_like(c, t) or k == TK_SYMBOL: return true
+  if k == TK_TPARAM: return true
+  if k == TK_OBJ: return c.objs[c.ta[t]].kind != OK_TUPLE
+  return false
+
+fn prop_name_of(c: C, n: Int) -> Str:
+  if n < 0: return ""
+  var x = n
+  if c.t.nd[x].k == ast.N_COMPUTED: x = c.t.nd[x].a
+  let k = c.t.nd[x].k
+  if k == ast.N_ID or k == ast.N_STR or k == ast.N_NOSUBTEMPL or k == ast.N_NUM: return bind.nm(c, c.t.nd[x].s)
+  return ""
+
+fn has_prop_all_branches(c: C, e0: Int, name: Str) -> Bool:
+  let e = unparen(c, e0)
+  if c.t.nd[e].k == ast.N_OBJECT:
+    for p in ast.items(c.t, c.t.nd[e].a):
+      let pk = c.t.nd[p].k
+      if pk == ast.N_SPREAD: continue
+      var nn = ""
+      if pk == ast.N_SHORTHAND: nn = bind.nm(c, c.t.nd[p].s)
+      else: nn = prop_name_of(c, c.t.nd[p].a)
+      if nn == name: return true
+    return false
+  if c.t.nd[e].k == ast.N_COND: return has_prop_all_branches(c, c.t.nd[e].b, name) and has_prop_all_branches(c, c.t.nd[e].c, name)
+  return false
+
+fn index_in(c: C, list: Int, x: Int) -> Int:
+  let its = ast.items(c.t, list)
+  for i in 0..its.len:
+    if its[i] == x: return i
+  return -1
+
+fn elem_type_at(var c: C, t: Int, i: Int) -> Int:
+  if is_tuple(c, t):
+    let a = type_args(c, t)
+    if i >= 0 and i < a.len: return a[i]
+  return number_index(&c, t)
+
+# The type a pattern destructures (-1 not known).
+fn pattern_source(var c: C, r: Run, pat: Int) -> Int:
+  let p = r.parents.get(pat, -1)
+  if p < 0: return -1
+  let pk = c.t.nd[p].k
+  if pk == ast.N_DECL and c.t.nd[p].a == pat and c.t.nd[p].c >= 0:
+    # (literals there keep their types, contextually typed by the pattern, getTypeFromBindingPattern:
+    # not modeled here)
+    let ik = c.t.nd[unparen(c, c.t.nd[p].c)].k
+    if ik == ast.N_OBJECT or ik == ast.N_COND or ik == ast.N_ARRAY or ik == ast.N_BINARY:
+      let u = bind.lazy_unsupported(&c, p, "a pattern's contextual type for its initializer's literals")
+      bind.touch(&c, u)
+      return -1
+    return type_at(&c, c.t.nd[p].c)
+  if pk == ast.N_PARAM and c.t.nd[p].a == pat:
+    var f = r.parents.get(p, -1)
+    if f < 0 or not fn_like(c, f): return -1
+    if c.t.nd[f].k == ast.N_SIG: f = r.parents.get(f, -1)
+    if f < 0: return -1
+    var sg = c.fsig.get(f, -1)
+    if sg < 0: sg = chk.fn_sig(&c, f)
+    if sg < 0: return -1
+    var idx = 0
+    var found = -1
+    var pf = f
+    if c.t.nd[f].k == ast.N_METHOD or c.t.nd[f].k == ast.N_GET or c.t.nd[f].k == ast.N_SET or c.t.nd[f].k == ast.N_CTOR: pf = c.t.nd[f].b
+    for q in fn_params(c, pf):
+      if q == p:
+        found = idx
+        break
+      let qn = c.t.nd[q].a
+      if not (c.t.nd[qn].k == ast.N_ID and bind.nm(c, c.t.nd[qn].s) == "this"): idx += 1
+    if found < 0 or found >= c.sigs[sg].ptypes.len: return -1
+    var pt = c.sigs[sg].ptypes[found]
+    # (a parameter written with ? includes undefined; one with an initializer doesn't)
+    if (c.t.nd[p].f & ast.M_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+    return pt
+  if pk == ast.N_BINDEL and c.t.nd[p].b == pat: return bindel_type(&c, r, p)
+  return -1
+
+fn fn_params(c: C, f: Int) -> [Int]:
+  let k = c.t.nd[f].k
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW: return ast.items(c.t, c.t.nd[f].b)
+  if k == ast.N_SIG: return ast.items(c.t, c.t.nd[f].b)
+  if k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET or k == ast.N_CTOR:
+    let sgn = c.t.nd[f].b
+    if sgn >= 0: return ast.items(c.t, c.t.nd[sgn].b)
+  return []
+
+# The type of a binding element's value (-1 not known).
+fn bindel_type(var c: C, r: Run, be: Int) -> Int:
+  let pat = r.parents.get(be, -1)
+  if pat < 0: return -1
+  let src = pattern_source(&c, r, pat)
+  if src < 0: return -1
+  if c.t.nd[pat].k == ast.N_OBJPAT:
+    var pn = c.t.nd[be].a
+    if pn < 0: pn = c.t.nd[be].b
+    let name = prop_name_of(c, pn)
+    if name == "": return -1
+    if c.tk[src] == TK_UNION:
+      # (a union's property: in every member, optional when it is in one, its type the union)
+      var ts: [Int] = []
+      var opt = false
+      for m in parts(c, src):
+        let q = prop_sym(&c, m, name)
+        if q < 0: return -1
+        if (c.sflags[q] & types.SF_OPTIONAL) != 0: opt = true
+        var a = m
+        if c.tk[a] != TK_OBJ and c.tk[a] != TK_INTER: a = rel.apparent(&c, a)
+        if c.tk[a] != TK_OBJ: return -1
+        ts.push(bind.prop_type_for(&c, q, a))
+      if opt:
+        let pp = r.parents.get(pat, -1)
+        if pp >= 0 and c.t.nd[pp].k == ast.N_DECL and c.t.nd[pp].c >= 0:
+          if not has_prop_all_branches(c, c.t.nd[pp].c, name): return -1
+        else: return -1
+        ts.push(c.undef_t)
+      return types.union_of(&c, ts)
+    let p = prop_sym(&c, src, name)
+    if p < 0: return -1
+    if (c.sflags[p] & types.SF_OPTIONAL) != 0:
+      let pp = r.parents.get(pat, -1)
+      if pp >= 0 and c.t.nd[pp].k == ast.N_DECL and c.t.nd[pp].c >= 0:
+        if not has_prop_all_branches(c, c.t.nd[pp].c, name): return -1
+      else: return -1
+      var a = src
+      if c.tk[a] != TK_OBJ: a = rel.apparent(&c, a)
+      let pt0 = bind.prop_type_for(&c, p, a)
+      return types.union_of(&c, [pt0, c.undef_t])
+    var a = src
+    if c.tk[a] == TK_INTER or c.tk[a] == TK_UNION: return -1
+    if c.tk[a] != TK_OBJ: a = rel.apparent(&c, a)
+    return bind.prop_type_for(&c, p, a)
+  if c.t.nd[pat].k == ast.N_ARRPAT:
+    let i = index_in(c, c.t.nd[pat].a, be)
+    if i < 0: return -1
+    return elem_type_at(&c, src, i)
+  return -1
+
+fn useless_report(var c: C, var r: Run, n: Int, what: Str, vt: Int):
+  let init = c.t.nd[n].c
+  if init < 0: return
+  var msg = "Default value is useless because the {what} is not nullish. This default assignment will never be used."
+  var tt = ""
+  if vt >= 0 and simple_for_msg(c, vt):
+    tt = type_str(&c, vt)
+    msg = "Default value is useless because the {what} has type `{tt}` (not nullish). This default assignment will never be used."
+  var labs = [c.t.nd[init].pos, xend(c, r, init)]
+  var lt = ["Default value"]
+  if tt != "":
+    var target = -1
+    if c.t.nd[n].k == ast.N_PARAM:
+      target = c.t.nd[n].b
+      if target < 0: target = c.t.nd[n].a
+    else: target = c.t.nd[n].b
+    if target >= 0:
+      labs.push(c.t.nd[target].pos)
+      labs.push(xend(c, r, target))
+      lt.push("{what} type `{tt}` is not nullish")
+  r.out.push(RDiag("no-useless-default-assignment", c.t.nd[init].pos, xend(c, r, init), "uselessDefaultAssignment", msg, "Remove the default assignment", labs, lt))
+
+fn useless_default(var c: C, var r: Run, n: Int):
+  let init0 = c.t.nd[n].c
+  if init0 < 0: return
+  let init = unparen(c, init0)
+  let isp = c.t.nd[n].k == ast.N_PARAM
+  if c.t.nd[init].k == ast.N_ID and bind.nm(c, c.t.nd[init].s) == "undefined":
+    if isp:
+      let tn = c.t.nd[n].b
+      var tnt = -1
+      if tn >= 0: tnt = node_type(&c, tn)
+      if tn >= 0 and can_be_undefined(c, tnt):
+        r.out.push(RDiag("no-useless-default-assignment", c.t.nd[init0].pos, xend(c, r, init0), "preferOptionalSyntax", "Using `= undefined` to make a parameter optional adds unnecessary runtime logic. Use the `?` optional syntax instead.", "", [], []))
+        return
+      r.out.push(RDiag("no-useless-default-assignment", c.t.nd[init0].pos, xend(c, r, init0), "uselessUndefined", "Default value is useless because it is undefined. Optional parameters are already undefined by default.", "Remove the default assignment", [], []))
+      return
+    r.out.push(RDiag("no-useless-default-assignment", c.t.nd[init0].pos, xend(c, r, init0), "uselessUndefined", "Default value is useless because it is undefined. Optional properties are already undefined by default.", "Remove the default assignment", [], []))
+    return
+  if isp:
+    # a function expression's parameter: the contextual signature's parameter
+    let f = r.parents.get(n, -1)
+    if f < 0 or (c.t.nd[f].k != ast.N_ARROW and c.t.nd[f].k != ast.N_FUNCEXPR): return
+    let i = index_in(c, c.t.nd[f].b, n)
+    if i < 0: return
+    let cs = c.fn_csig.get(f, -1)
+    if cs < 0: return
+    # (the contextual type's own call signatures: a union's members must all have them)
+    let ctxt = c.fn_ctxt.get(f, -1)
+    if ctxt < 0 or call_sig_count(&c, ctxt) == 0: return
+    if c.sigs[cs].node == f: return
+    if i >= c.sigs[cs].ptypes.len: return
+    if c.sigs[cs].pflags[i] == 2 or c.sigs[cs].pflags[i] == 1: return
+    let pt = c.sigs[cs].ptypes[i]
+    if c.tk[pt] != TK_TPARAM and not can_be_undefined(c, pt): useless_report(&c, &r, n, "parameter", pt)
+    return
+  let pat = r.parents.get(n, -1)
+  if pat < 0: return
+  if c.t.nd[pat].k == ast.N_OBJPAT:
+    let pt = bindel_type(&c, r, n)
+    if pt >= 0 and not can_be_undefined(c, pt): useless_report(&c, &r, n, "property", pt)
+    return
+  if c.t.nd[pat].k == ast.N_ARRPAT:
+    let src = pattern_source(&c, r, pat)
+    if src < 0 or not is_tuple(c, src): return
+    let args = type_args(c, src)
+    let i = index_in(c, c.t.nd[pat].a, n)
+    if i < 0 or i >= args.len: return
+    if not can_be_undefined(c, args[i]): useless_report(&c, &r, n, "property", args[i])
