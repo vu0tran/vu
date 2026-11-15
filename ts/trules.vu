@@ -32,7 +32,7 @@ type Cfg:
   opts: [Str]
 
 # The rules ported here.
-const PORTED = "await-thenable no-array-delete no-base-to-string no-duplicate-type-constituents no-for-in-array no-implied-eval no-misused-spread no-redundant-type-constituents no-useless-default-assignment no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
+const PORTED = "await-thenable no-array-delete no-base-to-string no-duplicate-type-constituents no-floating-promises no-for-in-array no-implied-eval no-misused-spread no-redundant-type-constituents no-useless-default-assignment no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
 
 fn ported(name: Str) -> Bool:
   for x in PORTED.split(" "):
@@ -64,6 +64,11 @@ type Run:
   sort_ignore_str: Bool
   dup_no_inter: Bool
   spread_allow: [Spec]
+  fp_void: Bool
+  fp_iife: Bool
+  fp_thenables: Bool
+  fp_safe: [Spec]
+  fp_safe_calls: Bool
   bts_unknown: Bool
   bts_ignored: [Str]
   bts_memo: {Int: Int}
@@ -331,7 +336,7 @@ fn run(var c: C, root: Int, src: Str, cf: Cfg, var out: [RDiag]) -> Bool:
   var cf2 = Cfg([], [])
   for x in cf.names: cf2.names.push(x + "")
   for x in cf.opts: cf2.opts.push(x + "")
-  var r = Run(cf2, src + "", [], {}, opt_bool(opt_of(cf, "no-meaningless-void-operator"), "checkNever", false), opt_bool(opt_of(cf, "require-array-sort-compare"), "ignoreStringArrays", true), opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreIntersections", false), specs_of(opt_of(cf, "no-misused-spread"), "allow", []), opt_bool(opt_of(cf, "no-base-to-string"), "checkUnknown", false), str_list(opt_of(cf, "no-base-to-string"), "ignoredTypeNames", ["Error", "RegExp", "URL", "URLSearchParams"]), {}, {}, {}, opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreUnions", false), tmo)
+  var r = Run(cf2, src + "", [], {}, opt_bool(opt_of(cf, "no-meaningless-void-operator"), "checkNever", false), opt_bool(opt_of(cf, "require-array-sort-compare"), "ignoreStringArrays", true), opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreIntersections", false), specs_of(opt_of(cf, "no-misused-spread"), "allow", []), opt_bool(opt_of(cf, "no-floating-promises"), "ignoreVoid", true), opt_bool(opt_of(cf, "no-floating-promises"), "ignoreIIFE", false), opt_bool(opt_of(cf, "no-floating-promises"), "checkThenables", false), specs_of(opt_of(cf, "no-floating-promises"), "allowForKnownSafePromises", []), specs_of(opt_of(cf, "no-floating-promises"), "allowForKnownSafeCalls", []).len > 0, opt_bool(opt_of(cf, "no-base-to-string"), "checkUnknown", false), str_list(opt_of(cf, "no-base-to-string"), "ignoredTypeNames", ["Error", "RegExp", "URL", "URLSearchParams"]), {}, {}, {}, opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreUnions", false), tmo)
   let seq0 = c.unsup_seq
   walk(&c, &r, root, -1)
   for d in r.out: out.push(copy_diag(d))
@@ -376,6 +381,7 @@ fn visit(var c: C, var r: Run, n: Int):
     let nm = r.cf.names[ri] + ""
     if nm == "await-thenable" and (k == ast.N_AWAIT or k == ast.N_CALL or k == ast.N_FORIN or k == ast.N_VAR): await_thenable(&c, &r, n)
     elif nm == "no-array-delete" and k == ast.N_DELETE: no_array_delete(&c, &r, n)
+    elif nm == "no-floating-promises" and k == ast.N_EXPRSTMT: no_floating(&c, &r, n)
     elif nm == "no-for-in-array" and k == ast.N_FORIN and c.t.nd[n].f == 0: no_for_in_array(&c, &r, n)
     elif nm == "no-base-to-string" and (k == ast.N_BINARY or k == ast.N_CALL or k == ast.N_TEMPL): no_base_to_string(&c, &r, n)
     elif nm == "no-duplicate-type-constituents" and (k == ast.N_TUNION or k == ast.N_TINTER): no_duplicate_constituents(&c, &r, n)
@@ -1954,3 +1960,139 @@ fn useless_default(var c: C, var r: Run, n: Int):
     let i = index_in(c, c.t.nd[pat].a, n)
     if i < 0 or i >= args.len: return
     if not can_be_undefined(c, args[i]): useless_report(&c, &r, n, "property", args[i])
+
+# ---- no-floating-promises
+
+fn accessed_name(c: C, callee: Int) -> Str:
+  let k = c.t.nd[callee].k
+  if k == ast.N_PROPACCESS:
+    if (c.t.nd[callee].f & 4) != 0: return "#" + bind.nm(c, c.t.nd[callee].s)
+    return bind.nm(c, c.t.nd[callee].s)
+  if k == ast.N_ELEMACCESS:
+    let ix = c.t.nd[callee].b
+    if c.t.nd[ix].k == ast.N_STR or c.t.nd[ix].k == ast.N_NOSUBTEMPL: return bind.nm(c, c.t.nd[ix].s)
+  return ""
+
+fn fn_param_callable(var c: C, sg: Int, i: Int) -> Bool:
+  if i >= c.sigs[sg].ptypes.len: return false
+  let t = apparent_of(&c, c.sigs[sg].ptypes[i])
+  for m in parts(c, t):
+    if call_sig_count(&c, m) != 0: return true
+  return false
+
+fn fp_promise_like(var c: C, r: Run, t: Int) -> Bool:
+  if matches_specs(&c, t, r.fp_safe): return false
+  let a = apparent_of(&c, t)
+  for m in parts(c, a):
+    if builtin_like(&c, m, ["Promise"], 0): return true
+  if not r.fp_thenables: return false
+  for m in parts(c, a):
+    let p = prop_sym(&c, m, "then")
+    if p < 0: continue
+    var mm = m
+    if c.tk[mm] != TK_OBJ: mm = rel.apparent(&c, mm)
+    if c.tk[mm] != TK_OBJ: continue
+    let tt = bind.prop_type_for(&c, p, mm)
+    for x in parts(c, tt):
+      for sg in sig_list(&c, x):
+        if c.sigs[sg].ptypes.len >= 2 and fn_param_callable(&c, sg, 0) and fn_param_callable(&c, sg, 1): return true
+  return false
+
+fn fp_promise_array(var c: C, r: Run, t: Int) -> Bool:
+  for m in parts(c, t):
+    let a = apparent_of(&c, m)
+    if is_array_only(&c, a):
+      let ta = type_args(c, a)
+      if ta.len > 0 and fp_promise_like(&c, r, ta[0]): return true
+    if is_tuple(c, a):
+      for x in type_args(c, a):
+        if fp_promise_like(&c, r, x): return true
+  return false
+
+# (unhandled, a non-function rejection handler, a promise array)
+fn unhandled(var c: C, r: Run, n0: Int) -> [Bool]:
+  let n = n0
+  let k = c.t.nd[n].k
+  let no = [false, false, false]
+  if k == ast.N_BINARY and c.t.nd[n].f >= scan.T_ASSIGN and c.t.nd[n].f <= scan.T_QQEQ: return no
+  if k == ast.N_BINARY and c.t.nd[n].f == scan.T_COMMA:
+    let a = unhandled(&c, r, c.t.nd[n].a)
+    if a[0]: return a
+    return unhandled(&c, r, c.t.nd[n].b)
+  if not r.fp_void and k == ast.N_VOIDEXPR: return unhandled(&c, r, c.t.nd[n].a)
+  let t = type_at(&c, n)
+  if fp_promise_array(&c, r, t): return [true, false, true]
+  if k == ast.N_AWAIT: return no
+  if not fp_promise_like(&c, r, t): return no
+  if k == ast.N_CALL:
+    let callee = c.t.nd[n].a
+    let ck = c.t.nd[callee].k
+    if ck == ast.N_PROPACCESS or ck == ast.N_ELEMACCESS:
+      let mn = accessed_name(c, callee)
+      let args = ast.items(c.t, c.t.nd[n].c)
+      if mn == "catch" and args.len >= 1:
+        let ht = type_at(&c, args[0])
+        if call_sig_count(&c, ht) > 0: return no
+        return [true, true, false]
+      if mn == "then" and args.len >= 2:
+        let ht = type_at(&c, args[1])
+        if call_sig_count(&c, ht) > 0: return no
+        return [true, true, false]
+      if mn == "finally": return unhandled(&c, r, c.t.nd[callee].a)
+    return [true, false, false]
+  if k == ast.N_COND:
+    let a = unhandled(&c, r, c.t.nd[n].c)
+    if a[0]: return a
+    return unhandled(&c, r, c.t.nd[n].b)
+  if k == ast.N_BINARY and (c.t.nd[n].f == scan.T_AND or c.t.nd[n].f == scan.T_OR or c.t.nd[n].f == scan.T_QQ):
+    let a = unhandled(&c, r, c.t.nd[n].a)
+    if a[0]: return a
+    return unhandled(&c, r, c.t.nd[n].b)
+  return [true, false, false]
+
+fn no_floating(var c: C, var r: Run, n: Int):
+  let e0 = c.t.nd[n].a
+  if r.fp_iife and c.t.nd[e0].k == ast.N_CALL:
+    let cal = unparen(c, c.t.nd[e0].a)
+    if c.t.nd[cal].k == ast.N_ARROW or c.t.nd[cal].k == ast.N_FUNCEXPR: return
+  let e = unparen(c, e0)
+  if r.fp_safe_calls:
+    # (allowForKnownSafeCalls: matching a callee's name and declaration isn't modeled here)
+    let u = bind.lazy_unsupported(&c, n, "no-floating-promises' allowForKnownSafeCalls")
+    bind.touch(&c, u)
+    return
+  let u = unhandled(&c, r, e)
+  if not u[0]: return
+  let base = "Promises must be awaited, add await operator."
+  let base_help = "The promise must end with a call to .catch, or end with a call to .then with a rejection handler."
+  let vbase = "Promises must be awaited, add void operator to ignore."
+  let vhelp = "The promise must end with a call to .catch, or end with a call to .then with a rejection handler, or be explicitly marked as ignored with the `void` operator."
+  let rej = "A rejection handler that is not a function will be ignored."
+  var id = ""
+  var msg = ""
+  var help = ""
+  if u[2]:
+    msg = "An array of Promises may be unintentional."
+    if r.fp_void:
+      id = "floatingPromiseArrayVoid"
+      help = "Consider handling the promises' fulfillment or rejection with Promise.all or similar, or explicitly marking the expression as ignored with the `void` operator."
+    else:
+      id = "floatingPromiseArray"
+      help = "Consider handling the promises' fulfillment or rejection with Promise.all or similar."
+  elif r.fp_void:
+    msg = vbase
+    if u[1]:
+      id = "floatingUselessRejectionHandlerVoid"
+      help = vhelp + " " + rej
+    else:
+      id = "floatingVoid"
+      help = vhelp
+  else:
+    msg = base
+    if u[1]:
+      id = "floatingUselessRejectionHandler"
+      help = base_help + " " + rej
+    else:
+      id = "floating"
+      help = base_help
+  r.out.push(RDiag("no-floating-promises", c.t.nd[n].pos, xend(c, r, n), id, msg, help, [], []))
