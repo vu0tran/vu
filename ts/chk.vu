@@ -5752,21 +5752,93 @@ fn subtype_reduce(var c: C, ts: [Int]) -> Int:
 
 fn subtype_reduce1(var c: C, ts: [Int]) -> Int:
   let u = types.union_of(&c, ts)
+  if c.tk[u] != TK_UNION: return u
+  # (once per union, as tsc's subtypeReductionCache: not while another relation's flags are on)
+  let plain = not c.comparable and not c.permissive and not c.restrictive and not c.inter_src and not c.subtype
+  if plain:
+    let r0 = c.sred_cache.get(u, -1)
+    if r0 >= 0: return r0
+  let r = subtype_reduce2(&c, u)
+  if plain: c.sred_cache[u] = r
+  return r
+
+# A unit-typed property of an object type (removeSubtypes' key property), -1 none.
+fn key_prop(var c: C, t: Int) -> Int:
+  for name in bind.prop_names(&c, t):
+    let p = bind.get_prop(&c, t, name)
+    if p < 0: continue
+    let pt = bind.type_of_sym(&c, p)
+    if unit_type(c, pt): return name
+  return -1
+
+fn unit_type(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_STRLIT or k == TK_NUMLIT or k == types.TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_NULL or k == TK_UNDEF
+
+# Whether t's key property (of m's, name) is a different unit type: m can't be a subtype of t.
+fn other_key(var c: C, name: Int, kt: Int, t: Int) -> Bool:
+  if name < 0 or c.tk[t] != TK_OBJ: return false
+  let p = bind.get_prop(&c, t, name)
+  if p < 0: return false
+  let pt = bind.type_of_sym(&c, p)
+  return unit_type(c, pt) and types.regular(c, pt) != kt
+
+fn subtype_reduce2(var c: C, u: Int) -> Int:
   let ms = types.members(c, u)
   var keep: [Int] = []
+  # (primitives are subtypes only of empty object types: none, nothing to check, removeSubtypes)
+  var empty_obj = false
+  for m in ms:
+    if not empty_obj and c.tk[m] == TK_OBJ and rel.is_empty_obj(&c, m): empty_obj = true
+  # (object literals' property names, to skip pairs that can't relate: a literal with only required
+  # properties takes a literal source of the same names, or a source with them all)
+  var shape: [Int] = []
+  var nprops: [Int] = []
+  var plain_lit: [Bool] = []
+  var no_spread: [Bool] = []
+  for m in ms:
+    var h = 0
+    var np = 0
+    var pl = false
+    var ns = true
+    if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == types.OK_ANON and c.objs[c.ta[m]].node >= 0 and c.t.nd[c.objs[c.ta[m]].node].k == ast.N_OBJECT and c.objs[c.ta[m]].sidx < 0 and c.objs[c.ta[m]].nidx < 0 and not (c.ta[m] in c.tidx) and bind.sig_count(&c, m, false) == 0:
+      pl = true
+      for name in bind.prop_names(&c, m):
+        let p = bind.get_prop(&c, m, name)
+        if p < 0 or (c.sflags[p] & SF_OPTIONAL) != 0: pl = false
+        if p >= 0 and p in c.spread_syms: ns = false
+        h = (h + (name * 1000003 + 12345) % 2147483647) % 2305843009213693951
+        np += 1
+    shape.push(h)
+    nprops.push(np)
+    plain_lit.push(pl)
+    no_spread.push(ns)
   for i in 0..ms.len:
     let m = ms[i]
     var drop = false
-    if c.tk[m] != TK_OBJ and c.tk[m] != TK_NULL and c.tk[m] != TK_UNDEF:
+    # (a primitive: string, a literal, object; not a structured or instantiable type)
+    let prim = c.tk[m] <= TK_NONPRIM
+    if c.tk[m] != TK_OBJ and c.tk[m] != TK_NULL and c.tk[m] != TK_UNDEF and (empty_obj or not prim):
       # a primitive is a subtype of an object type it fits ({} and the like)
       for j in 0..ms.len:
         let n2 = ms[j]
         if j == i or c.tk[n2] != TK_OBJ: continue
         if rel.assignable(&c, m, n2) and not rel.assignable(&c, n2, m): drop = true
+    var kn = -1
+    var kt = -1
+    # (an object literal's: its properties' types are known already)
+    if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == types.OK_ANON and c.objs[c.ta[m]].node >= 0 and c.t.nd[c.objs[c.ta[m]].node].k == ast.N_OBJECT:
+      kn = key_prop(&c, m)
+      if kn >= 0:
+        let kp = bind.get_prop(&c, m, kn)
+        let kpt = bind.type_of_sym(&c, kp)
+        kt = types.regular(c, kpt)
     if c.tk[m] == TK_OBJ and not c.objs[c.ta[m]].fresh:
       for j in 0..ms.len:
         if j == i: continue
         let n2 = ms[j]
+        if other_key(&c, kn, kt, n2): continue
+        if plain_lit[j] and nprops[j] > nprops[i]: continue
         if obj_inter(c, n2):
           # (object & Record<"k", unknown> and the like: a target only)
           if rel.assignable(&c, m, n2) and not rel.assignable(&c, n2, m): drop = true
@@ -5781,9 +5853,13 @@ fn subtype_reduce1(var c: C, ts: [Int]) -> Int:
         if j == i or drop: continue
         let n2 = ms[j]
         if not obj_inter(c, n2) and c.tk[n2] != TK_OBJ: continue
+        if other_key(&c, kn, kt, n2): continue
+        if plain_lit[j] and (nprops[j] > nprops[i] or (no_spread[i] and plain_lit[i] and shape[j] != shape[i])): continue
         if not written_known(&c, m, n2): continue
         let n2_fresh = c.tk[n2] == TK_OBJ and c.objs[c.ta[n2]].fresh
+        c.stats[8] += 1
         if rel.assignable(&c, m, n2):
+          c.stats[9] += 1
           # (two fresh literals of one shape: the first stays)
           let back = rel.assignable(&c, n2, m) and (not n2_fresh or written_known(&c, n2, m))
           if not back or j < i: drop = true
@@ -8298,10 +8374,11 @@ fn infer_sigs(var c: C, p: Int, a: Int, ctor: Bool, var inf: Inf, contra: Bool, 
     elif c.sigs[psi].ret >= 0 and c.sigs[asg1].ret >= 0: infer_in(&c, c.sigs[psi].ret, c.sigs[asg1].ret, &inf, contra, prio, orig, &seen)
 
 fn could_contain_tvars(var c: C, t: Int) -> Bool:
-  if t in c.tvar_cache: return c.tvar_cache[t]
+  if t < c.tvar_arr.len and c.tvar_arr[t] != 0: return c.tvar_arr[t] == 2
+  while c.tvar_arr.len <= t: c.tvar_arr.push(0)
   # assumed false while computing: a recursive type (type J = J[] | ...) contains type variables
   # only if some other part of it does
-  c.tvar_cache[t] = false
+  c.tvar_arr[t] = 1
   var r = false
   let k = c.tk[t]
   if k == TK_TPARAM or k >= types.TK_KEYOF or k == TK_UNSUP or bind.generic_template(c, t): r = true
@@ -8323,7 +8400,8 @@ fn could_contain_tvars(var c: C, t: Int) -> Bool:
     elif kind == types.OK_MAPPED: r = true
     elif o in c.concrete_objs: r = false
     else: r = bind.mentions_tparams(&c, t) or c.objs[o].tparams.len > 0
-  c.tvar_cache[t] = r
+  if r: c.tvar_arr[t] = 2
+  else: c.tvar_arr[t] = 1
   return r
 
 # ---- operators
