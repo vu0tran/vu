@@ -32,7 +32,7 @@ type Cfg:
   opts: [Str]
 
 # The rules ported here.
-const PORTED = "no-array-delete no-duplicate-type-constituents no-for-in-array no-implied-eval no-redundant-type-constituents no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
+const PORTED = "no-array-delete no-base-to-string no-duplicate-type-constituents no-for-in-array no-implied-eval no-redundant-type-constituents no-meaningless-void-operator no-unsafe-unary-minus require-array-sort-compare restrict-template-expressions"
 
 fn ported(name: Str) -> Bool:
   for x in PORTED.split(" "):
@@ -63,6 +63,11 @@ type Run:
   void_never: Bool
   sort_ignore_str: Bool
   dup_no_inter: Bool
+  bts_unknown: Bool
+  bts_ignored: [Str]
+  bts_memo: {Int: Int}
+  join_memo: {Int: Int}
+  bts_busy: {Int: Bool}
   dup_no_union: Bool
   tmpl: TmplOpts
 
@@ -292,6 +297,26 @@ fn matches_specs(var c: C, t: Int, specs: [Spec]) -> Bool:
       if spec_match(&c, t, sp): return true
   return false
 
+# A list of strings option (dflt when it isn't given).
+fn str_list(text: Str, key: Str, dflt: [Str]) -> [Str]:
+  var out: [Str] = []
+  var found = false
+  if text != "":
+    let js = lconf.parse_json(text)
+    if js.err == "" and js.v.len > 0:
+      var o = 0
+      if js.v[0].k == lconf.J_ARR:
+        o = -1
+        if js.v[0].kids.len > 0: o = js.v[0].kids[0]
+      if o >= 0 and js.v[o].k == lconf.J_OBJ:
+        let x = lconf.get(js, o, key)
+        if x >= 0 and js.v[x].k == lconf.J_ARR:
+          found = true
+          for y in js.v[x].kids: out.push(js.v[y].s + "")
+  if not found:
+    for x in dflt: out.push(x + "")
+  return out
+
 fn opt_of(cf: Cfg, name: Str) -> Str:
   for i in 0..cf.names.len:
     if cf.names[i] == name: return cf.opts[i] + ""
@@ -305,7 +330,7 @@ fn run(var c: C, root: Int, src: Str, cf: Cfg, var out: [RDiag]) -> Bool:
   var cf2 = Cfg([], [])
   for x in cf.names: cf2.names.push(x + "")
   for x in cf.opts: cf2.opts.push(x + "")
-  var r = Run(cf2, src + "", [], {}, opt_bool(opt_of(cf, "no-meaningless-void-operator"), "checkNever", false), opt_bool(opt_of(cf, "require-array-sort-compare"), "ignoreStringArrays", true), opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreIntersections", false), opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreUnions", false), tmo)
+  var r = Run(cf2, src + "", [], {}, opt_bool(opt_of(cf, "no-meaningless-void-operator"), "checkNever", false), opt_bool(opt_of(cf, "require-array-sort-compare"), "ignoreStringArrays", true), opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreIntersections", false), opt_bool(opt_of(cf, "no-base-to-string"), "checkUnknown", false), str_list(opt_of(cf, "no-base-to-string"), "ignoredTypeNames", ["Error", "RegExp", "URL", "URLSearchParams"]), {}, {}, {}, opt_bool(opt_of(cf, "no-duplicate-type-constituents"), "ignoreUnions", false), tmo)
   let seq0 = c.unsup_seq
   walk(&c, &r, root, -1)
   for d in r.out: out.push(copy_diag(d))
@@ -350,6 +375,7 @@ fn visit(var c: C, var r: Run, n: Int):
     let nm = r.cf.names[ri] + ""
     if nm == "no-array-delete" and k == ast.N_DELETE: no_array_delete(&c, &r, n)
     elif nm == "no-for-in-array" and k == ast.N_FORIN and c.t.nd[n].f == 0: no_for_in_array(&c, &r, n)
+    elif nm == "no-base-to-string" and (k == ast.N_BINARY or k == ast.N_CALL or k == ast.N_TEMPL): no_base_to_string(&c, &r, n)
     elif nm == "no-duplicate-type-constituents" and (k == ast.N_TUNION or k == ast.N_TINTER): no_duplicate_constituents(&c, &r, n)
     elif nm == "no-redundant-type-constituents" and k == ast.N_TUNION: redundant_union(&c, &r, n)
     elif nm == "no-redundant-type-constituents" and k == ast.N_TINTER: redundant_inter(&c, &r, n)
@@ -1231,3 +1257,203 @@ fn inter_lits(var c: C, var r: Run, lits: [RPart], prims: [Int], pname: Str):
   if lits.len == 0: return
   let vals = join_parts(&c, r, lits)
   for tn in prims: report(&r, "no-redundant-type-constituents", c.t.nd[tn].pos, xend(c, r, tn), "primitiveOverridden", "{pname} is overridden by the {vals} in this intersection type.")
+
+# ---- no-base-to-string
+
+const U_ALWAYS = 0
+const U_NEVER = 1
+const U_SOMETIMES = 2
+
+# getPropertyOfType: the type's own (an object type's apparent members: Object's, Function's for
+# one with signatures)
+fn prop_sym(var c: C, t: Int, name: Str) -> Int:
+  var a = t
+  if c.tk[t] != TK_OBJ and c.tk[t] != TK_INTER: a = rel.apparent(&c, t)
+  if c.tk[a] != TK_OBJ: return -1
+  let id = ast.intern(&c.t, name)
+  let p = bind.get_prop(&c, a, id)
+  if p >= 0: return p
+  if bind.sig_count(&c, a, false) > 0 or bind.sig_count(&c, a, true) > 0:
+    let fs = bind.global_type_sym(&c, "Function")
+    if fs >= 0:
+      let ft = bind.declared_type(&c, fs)
+      let q = bind.get_prop(&c, ft, id)
+      if q >= 0: return q
+  let os = bind.global_type_sym(&c, "Object")
+  if os < 0: return -1
+  let ot = bind.declared_type(&c, os)
+  if ot == a: return -1
+  return bind.get_prop(&c, ot, id)
+
+fn sym_decls(c: C, s: Int) -> [Int]:
+  var out: [Int] = []
+  if s < 0: return out
+  if c.sdecl[s] >= 0: out.push(c.sdecl[s])
+  if s in c.smore:
+    for x in c.smore[s]:
+      if x >= 0: out.push(x)
+  return out
+
+fn in_object_iface(c: C, d: Int) -> Bool:
+  let p = up(c, d)
+  return p >= 0 and c.t.nd[p].k == ast.N_INTERFACE and bind.nm(c, c.t.nd[p].s) == "Object"
+
+fn union_certainty(cs: [Int]) -> Int:
+  var all_never = true
+  var all_always = true
+  for x in cs:
+    if x != U_NEVER: all_never = false
+    if x != U_ALWAYS: all_always = false
+  if all_never: return U_NEVER
+  if all_always: return U_ALWAYS
+  return U_SOMETIMES
+
+fn tuple_certainty(cs: [Int]) -> Int:
+  for x in cs:
+    if x == U_NEVER: return U_NEVER
+  for x in cs:
+    if x == U_SOMETIMES: return U_SOMETIMES
+  return U_ALWAYS
+
+fn is_tuple(c: C, t: Int) -> Bool:
+  return c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == OK_TUPLE
+
+fn is_array_only(var c: C, t: Int) -> Bool:
+  return c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind != OK_TUPLE and rel.is_array_ref(&c, t)
+
+fn tostring_certainty(var c: C, var r: Run, t: Int, visited: [Int]) -> Int:
+  for v in visited:
+    if v == t: return U_ALWAYS
+  if t in r.bts_memo: return r.bts_memo[t]
+  if t in r.bts_busy: return U_ALWAYS
+  r.bts_busy[t] = true
+  let x = tostring_certainty1(&c, &r, t, visited)
+  r.bts_busy.remove(t)
+  r.bts_memo[t] = x
+  return x
+
+fn tostring_certainty1(var c: C, var r: Run, t: Int, visited: [Int]) -> Int:
+  let k = c.tk[t]
+  if k == TK_TPARAM:
+    let b = base_constraint1(&c, t, 0)
+    if b >= 0: return tostring_certainty(&c, &r, b, visited)
+    if r.bts_unknown: return U_SOMETIMES
+    return U_ALWAYS
+  if boolean_like(c, t): return U_ALWAYS
+  if ignored_name(&c, r, t, 0): return U_ALWAYS
+  if k == TK_INTER:
+    for m in inter_parts(c, t):
+      if tostring_certainty(&c, &r, m, visited) == U_ALWAYS: return U_ALWAYS
+    return U_NEVER
+  if k == TK_UNION:
+    var cs: [Int] = []
+    for m in parts(c, t): cs.push(tostring_certainty(&c, &r, m, visited))
+    return union_certainty(cs)
+  if is_tuple(c, t):
+    var v2: [Int] = []
+    for v in visited: v2.push(v)
+    v2.push(t)
+    var cs: [Int] = []
+    for a in type_args(c, t): cs.push(tostring_certainty(&c, &r, a, v2))
+    return tuple_certainty(cs)
+  if is_array_only(&c, t):
+    var v2: [Int] = []
+    for v in visited: v2.push(v)
+    v2.push(t)
+    let el = number_index(&c, t)
+    if el < 0: return U_ALWAYS
+    return tostring_certainty(&c, &r, el, v2)
+  var fallback = false
+  for pname in ["toString", "toLocaleString", "valueOf"]:
+    let p = prop_sym(&c, t, pname)
+    if p < 0: continue
+    let ds = sym_decls(c, p)
+    if ds.len == 0: continue
+    for d in ds:
+      if not in_object_iface(c, d): return U_ALWAYS
+    fallback = true
+  if fallback: return U_NEVER
+  if r.bts_unknown and k == TK_UNKNOWN: return U_SOMETIMES
+  return U_ALWAYS
+
+# (MatchesTypeOrBaseType with the type's name among ignoredTypeNames)
+fn ignored_name(var c: C, r: Run, t: Int, depth: Int) -> Bool:
+  if depth > 10: return false
+  let nm = type_name(&c, t)
+  for x in r.bts_ignored:
+    if x == nm: return true
+  if c.tk[t] != TK_OBJ: return false
+  for b in base_types(&c, t):
+    if ignored_name(&c, r, b, depth + 1): return true
+  return false
+
+fn join_certainty(var c: C, var r: Run, t: Int) -> Int:
+  if t in r.join_memo: return r.join_memo[t]
+  r.join_memo[t] = U_ALWAYS
+  var x = U_ALWAYS
+  let k = c.tk[t]
+  if k == TK_UNION:
+    var cs: [Int] = []
+    for m in parts(c, t): cs.push(join_certainty(&c, &r, m))
+    x = union_certainty(cs)
+  elif k == TK_INTER:
+    x = U_NEVER
+    for m in inter_parts(c, t):
+      if join_certainty(&c, &r, m) == U_ALWAYS: x = U_ALWAYS
+  elif is_tuple(c, t):
+    var cs: [Int] = []
+    for a in type_args(c, t): cs.push(tostring_certainty(&c, &r, a, []))
+    x = tuple_certainty(cs)
+  elif is_array_only(&c, t):
+    let el = number_index(&c, t)
+    if el >= 0: x = tostring_certainty(&c, &r, el, [])
+  r.join_memo[t] = x
+  return x
+
+fn certainty_word(x: Int) -> Str:
+  if x == U_ALWAYS: return "always"
+  if x == U_NEVER: return "will"
+  return "may"
+
+fn bts_check(var c: C, var r: Run, e: Int, t0: Int):
+  if literal_node(c, e) and c.t.nd[e].k != ast.N_TEMPL: return
+  var t = t0
+  if t < 0: t = type_at(&c, e)
+  let x = tostring_certainty(&c, &r, t, [])
+  if x == U_ALWAYS: return
+  r.out.push(RDiag("no-base-to-string", c.t.nd[e].pos, xend(c, r, e), "baseToString", "'{src_text(c, r, e)}' {certainty_word(x)} use Object's default stringification format ('[object Object]') when stringified.", "Consider picking a property (e.g. `user.name`), using a formatter (or `JSON.stringify`), or implementing a custom `toString()`/`toLocaleString()` on the type.", [], []))
+
+fn no_base_to_string(var c: C, var r: Run, n: Int):
+  let k = c.t.nd[n].k
+  if k == ast.N_BINARY:
+    let op = c.t.nd[n].f
+    if op != scan.T_PLUS and op != scan.T_PLUSEQ: return
+    let l = c.t.nd[n].a
+    let rr = c.t.nd[n].b
+    let lt = type_at(&c, l)
+    let rt = type_at(&c, rr)
+    if type_name(&c, lt) == "string": bts_check(&c, &r, rr, rt)
+    elif type_name(&c, rt) == "string" and c.t.nd[l].k != ast.N_PRIVNAME: bts_check(&c, &r, l, lt)
+    return
+  if k == ast.N_TEMPL:
+    let p0 = r.parents.get(n, -1)
+    if p0 >= 0 and c.t.nd[p0].k == ast.N_TAGGED: return
+    for sp in ast.items(c.t, c.t.nd[n].a): bts_check(&c, &r, c.t.nd[sp].a, -1)
+    return
+  # a call: String(x), x.join(), x.toString(), x.toLocaleString()
+  let callee = c.t.nd[n].a
+  let args = ast.items(c.t, c.t.nd[n].c)
+  if c.t.nd[callee].k == ast.N_ID and bind.nm(c, c.t.nd[callee].s) == "String" and args.len > 0:
+    let ct = type_at(&c, callee)
+    if builtin_like(&c, ct, ["String"], 0) or builtin_like(&c, ct, ["StringConstructor"], 0):
+      if c.t.nd[args[0]].k != ast.N_SPREAD: bts_check(&c, &r, args[0], -1)
+      return
+  if c.t.nd[callee].k == ast.N_PROPACCESS and (c.t.nd[callee].f & 4) == 0:
+    let pn = bind.nm(c, c.t.nd[callee].s)
+    let obj = c.t.nd[callee].a
+    if pn == "join":
+      let t = constrained_at(&c, obj)
+      let x = join_certainty(&c, &r, t)
+      if x == U_ALWAYS: return
+      r.out.push(RDiag("no-base-to-string", c.t.nd[obj].pos, xend(c, r, obj), "baseArrayJoin", "Using `join()` for {src_text(c, r, obj)} {certainty_word(x)} use Object's default stringification format ('[object Object]') when stringified.", "Consider mapping the values to a meaningful string (e.g. pick a property or call a formatter) before calling `join()`, or implementing a custom `toString()`/`toLocaleString()` on the element type.", [], []))
+    elif pn == "toLocaleString" or pn == "toString": bts_check(&c, &r, obj, -1)
