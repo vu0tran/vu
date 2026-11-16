@@ -317,6 +317,25 @@ fn pattern_sym_type(var c: C, s: Int, d: Int) -> Int:
       else:
         return unsup(&c, d, "a destructuring declaration without an initializer")
     bind_pattern(&c, pat, src, mutable)
+    # (const { a } = x.y: a as the flow type of x.y.a where that's narrowed,
+    # getFlowTypeOfDestructuring)
+    if c.t.nd[d].k == ast.N_DECL and c.t.nd[d].b < 0 and c.t.nd[d].c >= 0 and c.t.nd[pat].k == ast.N_OBJPAT:
+      let ik = ref_key(&c, skip_parens(c, c.t.nd[d].c))
+      if ik != "":
+        for el in kids(c, c.t.nd[pat].a):
+          if c.t.nd[el].k != ast.N_BINDEL or (c.t.nd[el].f & ast.M_REST) != 0 or c.t.nd[el].c >= 0: continue
+          let tg = c.t.nd[el].b
+          if tg < 0 or c.t.nd[tg].k != ast.N_ID: continue
+          var pn = c.t.nd[tg].s
+          let kn = c.t.nd[el].a
+          if kn >= 0:
+            if c.t.nd[kn].k != ast.N_ID and c.t.nd[kn].k != ast.N_STR: continue
+            pn = c.t.nd[kn].s
+          let nt = narrowed(c, ik + "." + nm(c, pn))
+          if nt >= 0:
+            var ft = nt
+            if mutable: ft = widen(&c, ft)
+            c.ntype[tg] = regular_obj(&c, ft)
   # the binding's own name node
   var ids: [Int] = []
   bind.binding_ids(c, pat, &ids)
@@ -2494,6 +2513,52 @@ fn in_opt_chain(c: C, e: Int) -> Bool:
     x = c.t.nd[x].a
   return false
 
+# A constant aliasing a property, const k = x.kind or const { kind: k } = x: [x's node, the
+# property's name]; [] none.
+fn disc_alias(var c: C, id: Int) -> [Int]:
+  var out: [Int] = []
+  let s = bind.lookup_value(&c, id, c.t.nd[id].s)
+  if s < 0 or (c.sk[s] & S_CONST) == 0: return out
+  let d = c.sdecl[s]
+  if d < 0: return out
+  if c.t.nd[d].k == ast.N_DECL and c.t.nd[d].b < 0 and c.t.nd[d].c >= 0 and c.t.nd[c.t.nd[d].a].k == ast.N_ID:
+    let ini = skip_parens(c, c.t.nd[d].c)
+    if c.t.nd[ini].k == ast.N_PROPACCESS:
+      out.push(c.t.nd[ini].a)
+      out.push(c.t.nd[ini].s)
+    return out
+  # (the binding element of the name, at the top of the declaration's object pattern)
+  let decl = d
+  if c.t.nd[decl].k != ast.N_DECL or c.t.nd[decl].b >= 0 or c.t.nd[decl].c < 0: return out
+  let pat = c.t.nd[decl].a
+  if c.t.nd[pat].k != ast.N_OBJPAT: return out
+  var el = -1
+  for x in kids(c, c.t.nd[pat].a):
+    if c.t.nd[x].k == ast.N_BINDEL and c.t.nd[x].b >= 0 and c.t.nd[c.t.nd[x].b].k == ast.N_ID and c.t.nd[c.t.nd[x].b].s == c.t.nd[id].s: el = x
+  if el < 0 or c.t.nd[el].c >= 0 or (c.t.nd[el].f & ast.M_REST) != 0: return out
+  let ini = skip_parens(c, c.t.nd[decl].c)
+  let ik = c.t.nd[ini].k
+  if ik != ast.N_ID and ik != ast.N_PROPACCESS: return out
+  var pn = -1
+  let kn = c.t.nd[el].a
+  if kn >= 0:
+    if c.t.nd[kn].k != ast.N_ID and c.t.nd[kn].k != ast.N_STR: return out
+    pn = c.t.nd[kn].s
+  elif c.t.nd[el].b >= 0 and c.t.nd[c.t.nd[el].b].k == ast.N_ID: pn = c.t.nd[c.t.nd[el].b].s
+  if pn < 0: return out
+  out.push(ini)
+  out.push(pn)
+  return out
+
+# The same literal: an enum member's literal is comparable to the plain literal of its value
+# (areTypesComparable), both ways.
+fn same_lit(c: C, a: Int, b: Int) -> Bool:
+  if a == b: return true
+  let ka = c.tk[a]
+  if ka != c.tk[b] or (ka != TK_STRLIT and ka != TK_NUMLIT): return false
+  if not types.is_enum_lit(c, a) and not types.is_enum_lit(c, b): return false
+  return c.ta[a] == c.ta[b]
+
 fn null_disc(var c: C, refside: Int, vk: Int, pos: Bool, loose: Bool, var out: [Fact]):
   let obj = c.t.nd[refside].a
   let okey = fact_key(&c, obj)
@@ -2812,24 +2877,35 @@ fn facts1x(var c: C, e: Int, truth: Bool, var out: [Fact]):
             generic_fact(&c, e, key, &out)
             return
           if pos:
-            if m == rv: keep.push(m)
+            if same_lit(c, m, rv): keep.push(m)
             elif rel.assignable(&c, rv, m) and not types.is_literal(c, m): keep.push(rv)
           else:
-            if m != rv: keep.push(m)
+            if not same_lit(c, m, rv): keep.push(m)
         # (no member equal: the reference itself isn't narrowed; its object still is, to the
         # members whose property may be it)
         if not (pos and keep.len == 0):
           let uk = types.union_of(&c, keep)
           out.push(Fact(key, keep_fresh(&c, t, uk)))
-        # a discriminant: x.kind === "a" narrows x
+        # a discriminant: x.kind === "a" narrows x (and through an alias, const k = x.kind or
+        # const { kind: k } = x, getCandidateDiscriminantPropertyAccess)
+        var dobj = -1
+        var dname = -1
         if c.t.nd[refside].k == ast.N_PROPACCESS:
-          let okey = fact_key(&c, c.t.nd[refside].a)
+          dobj = c.t.nd[refside].a
+          dname = c.t.nd[refside].s
+        elif c.t.nd[refside].k == ast.N_ID:
+          let al = disc_alias(&c, refside)
+          if al.len == 2:
+            dobj = al[0]
+            dname = al[1]
+        if dobj >= 0:
+          let okey = fact_key(&c, dobj)
           if okey != "":
-            let ot = current_type(&c, c.t.nd[refside].a)
+            let ot = current_type(&c, dobj)
             # (isMatchingReferenceDiscriminant: the reference's declared type a union, its
             # narrowed type maybe one member)
             var decl_u = false
-            let on = skip_parens(c, c.t.nd[refside].a)
+            let on = skip_parens(c, dobj)
             if c.t.nd[on].k == ast.N_ID:
               let os = bind.lookup_value(&c, on, c.t.nd[on].s)
               if os >= 0:
@@ -2839,7 +2915,7 @@ fn facts1x(var c: C, e: Int, truth: Bool, var out: [Fact]):
             elif c.tk[ot] == TK_UNION or (decl_u and (c.tk[ot] == TK_OBJ or (c.tk[ot] == TK_INTER and not is_generic_member(c, ot)))):
               var ok: [Int] = []
               # (x?.kind, or x?.a.kind: in an optional chain)
-              let opt_chain = in_opt_chain(c, refside)
+              let opt_chain = c.t.nd[refside].k == ast.N_PROPACCESS and in_opt_chain(c, refside)
               for mi47_ in 0..types.nmem(c, ot):
                 let m = types.mem(c, ot, mi47_)
                 let mk0 = c.tk[m]
@@ -2847,7 +2923,7 @@ fn facts1x(var c: C, e: Int, truth: Bool, var out: [Fact]):
                 if opt_chain and (mk0 == TK_NULL or mk0 == TK_UNDEF or mk0 == TK_VOID):
                   if not pos or c.tk[rv] == TK_UNDEF: ok.push(m)
                   continue
-                let ps = prop_of(&c, m, c.t.nd[refside].s)
+                let ps = prop_of(&c, m, dname)
                 if ps < 0:
                   ok.push(m)
                   continue
@@ -2855,9 +2931,9 @@ fn facts1x(var c: C, e: Int, truth: Bool, var out: [Fact]):
                 var overlap = false
                 for mi48_ in 0..types.nmem(c, pt):
                   let pm = types.mem(c, pt, mi48_)
-                  if pm == rv or (not types.is_literal(c, pm) and rel.assignable(&c, rv, pm)): overlap = true
+                  if same_lit(c, pm, rv) or (not types.is_literal(c, pm) and rel.assignable(&c, rv, pm)): overlap = true
                 if pos and overlap: ok.push(m)
-                if not pos and not (types.is_literal(c, pt) and pt == rv): ok.push(m)
+                if not pos and not (types.is_literal(c, pt) and same_lit(c, pt, rv)): ok.push(m)
               out.push(Fact(okey, types.union_of(&c, ok)))
       return
     if op == scan.W_IN and (c.t.nd[c.t.nd[e].a].k == ast.N_STR or c.t.nd[c.t.nd[e].a].k == ast.N_ID):
@@ -3583,9 +3659,10 @@ fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
     if ef < 0 or (c.t.nd[ef].f & ast.M_ASYNC) == 0: return unsup(&c, n, "await outside an async function")
     # (getContextualTypeForAwaitOperand: Awaited<ctx> | PromiseLike<Awaited<ctx>>)
     var actx = -1
-    if ctx >= 0 and not is_any(c, ctx) and not could_contain_tvars(&c, ctx):
+    # (a generic one too: Awaited<T> | PromiseLike<Awaited<T>>)
+    if ctx >= 0 and not is_any(c, ctx):
       let aw = awaited(&c, ctx, n)
-      actx = async_return_ctx(&c, aw, n)
+      if aw >= 0 and c.tk[aw] != TK_UNSUP: actx = async_return_ctx(&c, aw, n)
     let ot = check_expr(&c, c.t.nd[n].a, actx)
     return awaited(&c, ot, n)
   if k == ast.N_TYPEASSERT: return unsup(&c, n, "a <T> type assertion")
@@ -4366,7 +4443,13 @@ fn prop_access(var c: C, n: Int) -> Int:
       continue
     if c.tk[m] == TK_NEVER: continue
     if c.tk[m] == TK_INTER:
-      ts.push(inter_prop(&c, n, m, name))
+      # (a member missing it: the error names the whole union)
+      let saved_pe = c.prop_err_t
+      c.prop_err_t = ot
+      let ip = inter_prop(&c, n, m, name)
+      c.prop_err_t = saved_pe
+      if c.tk[ip] == TK_ERROR: return ip
+      ts.push(ip)
       continue
     # (a type parameter constrained to an intersection: the intersection's property, where a
     # member has it)
@@ -4452,7 +4535,9 @@ fn inter_prop(var c: C, n: Int, t: Int, name: Int) -> Int:
       let si = bind.index_type(&c, am, false)
       if si >= 0: ts.push(si)
     if ts.len == 0:
-      let shown = show.show(&c, t)
+      var shown_t = t
+      if c.prop_err_t >= 0: shown_t = c.prop_err_t
+      let shown = show.show(&c, shown_t)
       bind.err_at(&c, n, c.t.nd[n].d, 2339, "Property '" + nm(c, name) + "' does not exist on type '" + shown + "'.")
       return c.error_t
     return types.inter_of(&c, ts)
@@ -5355,9 +5440,12 @@ fn spread_into(var c: C, t: Int, st0: Int, var written: {Int: Bool}) -> Bool:
         # (of a union: a property of the union, required in each member)
         var all_req = true
         let ln = c.objs[o].node
+        # (undefined or null in the union too: a union property is in every member, so none)
         if ln >= 0 and ln in c.spread_union:
           for um in types.members(c, c.spread_union[ln]):
-            if spreads_empty(&c, um): continue
+            if c.tk[um] != TK_OBJ:
+              all_req = false
+              continue
             let ups = bind.get_prop(&c, um, name)
             if ups < 0 or (c.sflags[ups] & SF_OPTIONAL) != 0: all_req = false
         if not opt and all_req:
@@ -7314,6 +7402,27 @@ fn args_fit_skip(var c: C, sg: Int, args: [Int]) -> Bool:
     if not rel.assignable(&c, at, pt): return false
   return true
 
+# inferFromAnnotatedParameters: a function argument's annotated parameters as sources for the
+# contextual signature's parameter types (before the inferences are fixed for its others).
+fn annotated_params(var c: C, arg: Int, pt: Int, var inf: Inf):
+  let f = skip_parens(c, arg)
+  let fk = c.t.nd[f].k
+  if fk != ast.N_ARROW and fk != ast.N_FUNCEXPR: return
+  if pt < 0 or c.tk[pt] != TK_OBJ: return
+  let cs = bind.last_sig(&c, pt, false)
+  if cs < 0: return
+  let ps = kids(c, fn_params(c, f))
+  var n = c.sigs[cs].ptypes.len
+  if n > 0 and c.sigs[cs].pflags[n - 1] == 2: n -= 1
+  for j in 0..ps.len:
+    if j >= n: break
+    let p = ps[j]
+    if c.t.nd[p].b < 0 or (c.t.nd[p].f & ast.M_REST) != 0: continue
+    var src = bind.type_from(&c, c.t.nd[p].b)
+    if (c.t.nd[p].f & ast.M_OPTIONAL) != 0: src = types.union_of(&c, [src, c.undef_t])
+    var seen: {Int: Bool} = {}
+    infer_in(&c, c.sigs[cs].ptypes[j], src, &inf, false, 0, c.sigs[cs].ptypes[j], &seen)
+
 # A context-sensitive argument, with its functions anyFunctionType, against a parameter type: an
 # array literal element by element (against an array's element type).
 fn skip_fits(var c: C, a: Int, pt: Int) -> Bool:
@@ -7588,6 +7697,9 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
       var pt = raw_param_at(&c, sg, i)
       if i in rp_over: pt = rp_over[i]
       if pass == 1:
+        # (a function's annotated parameters infer first, to the contextual signature's parameters:
+        # inferFromAnnotatedParameters)
+        annotated_params(&c, args[i], pt, &inf)
         # (the type parameters this parameter mentions stay fixed: their final inference widens too)
         for tpf in tps:
           if fixed_by(&c, pt, tpf): fixed_tps[tpf] = true
@@ -10247,6 +10359,12 @@ fn check_stmt(var c: C, n: Int):
         bind.scope_names(&c, c.t.nd[n].b)
         check_stmts(&c, kids(c, c.t.nd[n].b))
         return
+    # (a shorthand ambient module, declare module "m"; in a script: nothing to check but a
+    # relative name, TS2436)
+    if c.t.nd[c.t.nd[n].a].k == ast.N_STR and c.t.nd[n].b < 0 and not bind.is_module(c, c.roots[c.t.nd[n].file]):
+      let mname = nm(c, c.t.nd[c.t.nd[n].a].s)
+      if mname.startswith("./") or mname.startswith("../"): err(&c, c.t.nd[n].a, 2436, "Ambient module declaration cannot specify relative module name.")
+      return
     # (an ambient module declaration, declare module "m" { ... } in a script: declarations only)
     if c.t.nd[c.t.nd[n].a].k == ast.N_STR and c.t.nd[n].b >= 0 and (c.t.nd[n].f & ast.M_DECLARE) != 0 and not (c.t.nd[n].b in c.aug_target):
       bind.scope_names(&c, c.t.nd[n].b)
@@ -10668,7 +10786,9 @@ fn da_stmt(c: C, st: Int, pre: {Int: Bool}, var exits: [{Int: Bool}]) -> {Int: B
   let k = c.t.nd[st].k
   if k == ast.N_EXPRSTMT:
     var e = c.t.nd[st].a
-    while c.t.nd[e].k == ast.N_BINARY and c.t.nd[e].f == scan.T_ASSIGN:
+    # (this.x ??= v and this.x ||= v assign it too: the flow type after them is v's where it was
+    # undefined)
+    while c.t.nd[e].k == ast.N_BINARY and (c.t.nd[e].f == scan.T_ASSIGN or c.t.nd[e].f == scan.T_QQEQ or c.t.nd[e].f == scan.T_OREQ):
       let l = c.t.nd[e].a
       if c.t.nd[l].k == ast.N_PROPACCESS and c.t.nd[c.t.nd[l].a].k == ast.N_THIS: out[c.t.nd[l].s] = true
       e = c.t.nd[e].b
@@ -10712,9 +10832,14 @@ fn member_errors(var c: C, n: Int, inst: Int, base: Int) -> Bool:
     let own = bind.get_prop(&c, inst, name)
     let bp = bind.get_prop(&c, base, name)
     if own < 0 or bp < 0: continue
+    # (the base's with this as the derived class's this type, getTypeWithThisArgument)
     var ot = bind.type_of_sym(&c, own)
     if (c.sflags[own] & SF_OPTIONAL) != 0: ot = types.union_of(&c, [ot, c.undef_t])
     var btp = bind.type_of_sym(&c, bp)
+    let bowner = c.sparent[bp]
+    if n in c.nsym and c.nsym[n] in c.this_tp and bowner >= 0 and bowner in c.this_tp and bowner != c.nsym[n]:
+      let tm = types.new_mapper(&c, [c.this_tp[bowner]], [c.this_tp[c.nsym[n]]])
+      btp = bind.instantiate(&c, btp, tm)
     if (c.sflags[bp] & SF_OPTIONAL) != 0: btp = types.union_of(&c, [btp, c.undef_t])
     if not rel.assignable(&c, ot, btp):
       err(&c, c.t.nd[m].a, 2416, "Property '" + nm(c, name) + "' in type '" + cname + "' is not assignable to the same property in base type '" + bname + "'.")
@@ -10912,9 +11037,12 @@ fn check_class(var c: C, n: Int):
       unsup(&c, m, "a static block")
   # the base class, then each implemented interface: member by member, else as a whole
   var base_ok = true
-  if base >= 0 and c.tk[base] == TK_OBJ and not rel.assignable(&c, inst, base):
-    base_ok = false
-    if not member_errors(&c, n, inst, base):
+  # (the members with this as the derived class's this type first: a member may fit only for the
+  # base's own this, checkTypeAssignableTo(typeWithThis, baseWithThis))
+  if base >= 0 and c.tk[base] == TK_OBJ:
+    if member_errors(&c, n, inst, base): base_ok = false
+    elif not rel.assignable(&c, inst, base):
+      base_ok = false
       let bname = show.show(&c, base)
       bind.err_name(&c, n, 2415, "Class '" + cname + "' incorrectly extends base class '" + bname + "'.")
   # the static side against the base's (its members, not its construct signatures)
