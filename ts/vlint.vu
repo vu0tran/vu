@@ -1152,15 +1152,23 @@ fn work_copy(w: Work, o: lout.Opts, ffi: Ffi) -> Work:
 type TsgoOut:
   err: Str
   ms: [ltsgo.Msg]
+  errt: Str = ""   # tsgolint's stderr, when not printed (a speculative run)
 
 fn tsgo_run(fs: Fs, os: Os, cwd: Str, exe: Str, files: [Str], sets: [Str], check: Bool) -> TsgoOut:
+  return tsgo_run_x(fs, os, cwd, exe, files, sets, check, "")
+
+# (pidf: a speculative run, whose process id goes there so it can be stopped, and whose stderr
+# is kept in errt instead of printed)
+fn tsgo_run_x(fs: Fs, os: Os, cwd: Str, exe: Str, files: [Str], sets: [Str], check: Bool, pidf: Str) -> TsgoOut:
   var r = TsgoOut("", [])
   let dir = fs.temp_dir() else return TsgoOut("Error running tsgolint: \"can't create a temporary folder\"", [])
   let pin = dir + "/payload.json"
   let pout = dir + "/out.bin"
   let perr = dir + "/err.txt"
   fs.write(pin, ltsgo.payload(files, sets, check)) else return TsgoOut("Error running tsgolint: \"can't write the payload\"", [])
-  var rc = os.run(["sh", "-c", "exec \"$0\" headless < \"$1\" > \"$2\" 2> \"$3\"", exe, pin, pout, perr]) else -1
+  var rc = -1
+  if pidf != "": rc = os.run(["sh", "-c", "echo $$ > \"$4\"; exec \"$0\" headless < \"$1\" > \"$2\" 2> \"$3\"", exe, pin, pout, perr, pidf]) else -1
+  else: rc = os.run(["sh", "-c", "exec \"$0\" headless < \"$1\" > \"$2\" 2> \"$3\"", exe, pin, pout, perr]) else -1
   var out = fs.read(pout) else ""
   var errt = fs.read(perr) else ""
   # tsgolint's no-misused-promises panics on an object literal member with a computed name
@@ -1194,7 +1202,8 @@ fn tsgo_run(fs: Fs, os: Os, cwd: Str, exe: Str, files: [Str], sets: [Str], check
         if skipped.len > 5: more = " and {skipped.len - 5} more"
         eprint("vlint: tsgolint crashed in no-misused-promises on a computed property name (a tsgolint bug; oxlint stops here). The rule was skipped in {skipped.len} file(s): " + ", ".join(shownf) + more + ".")
   # tsgolint's own stderr (a panic's trace), passed on as oxlint passes it
-  if errt.len > 0:
+  if pidf != "": r.errt = errt + ""
+  elif errt.len > 0:
     var et = errt
     if et.endswith("\n"): et = et[0..et.len - 1]
     eprint(et)
@@ -1219,6 +1228,41 @@ fn tsgo_run(fs: Fs, os: Os, cwd: Str, exe: Str, files: [Str], sets: [Str], check
   return r
 
 # Type-aware rules by tsgolint: its diagnostics come after the others, in the order it sends them.
+fn tsgo_bg(fs: Fs, os: Os, own cwd: Str, own exe: Str, own files: [Str], own sets: [Str], own pidf: Str, own ch: Chan[TsgoOut]):
+  let r = tsgo_run_x(fs, os, cwd, exe, files, sets, true, pidf)
+  ch.send(r)
+
+# Whether vtsc left files of this run to tsgolint last time ("partial", "full", "" unknown): a file
+# in $XDG_CACHE_HOME/vlint (~/.cache/vlint) named by the folder and the files.
+fn cover_key(ffi: Ffi, cwd: Str, files: [Str]) -> Str:
+  # (and this vlint: a new one looks again)
+  var st: [Int] = [0, 0, 0, 0, 0]
+  lcache.stat(ffi, lcache.realpath(ffi, "/proc/self/exe"), &st)
+  var h = lcache.mix(lcache.hash64(cwd), lcache.hash64("{st[0]}/{st[1]}"))
+  for f in files: h = lcache.mix(h, lcache.hash64(f))
+  return lcache.hex16(h)
+
+fn cover_dir(os: Os) -> Str:
+  var base = os.env("XDG_CACHE_HOME")
+  if base == "":
+    let home = os.env("HOME")
+    if home == "": return ""
+    base = home + "/.cache"
+  return base + "/vlint/vtsc-cover"
+
+fn cover_read(fs: Fs, os: Os, key: Str) -> Str:
+  let d = cover_dir(os)
+  if d == "": return ""
+  let t = fs.read(d + "/" + key) else ""
+  return t.strip()
+
+fn cover_set(fs: Fs, os: Os, key: Str, v: Str):
+  let d = cover_dir(os)
+  if d == "": return
+  if cover_read(fs, os, key) == v: return
+  fs.mkdir(d) else 0
+  fs.write(d + "/" + key, v + "\n") else 0
+
 # With the type check, vtsc's errors for the files it fully checks (lvtsc), tsgolint's for the
 # others. Returns oxlint's message when tsgolint fails.
 fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w: Work, check: Bool, var results: [[lout.Rec]], var shown: [Str]) -> Str:
@@ -1237,7 +1281,33 @@ fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w:
     if x != "": any = true
   if not any: return ""
   var ms: [ltsgo.Msg] = []
-  if check and os.env("VLINT_VTSC") == "1":
+  # (where vtsc left files to tsgolint the last time, tsgolint runs anyway, and over a whole program
+  # it takes about as long for some files as for all: then vtsc is left out, except every 8th run,
+  # which looks again. VLINT_VTSC_SPECULATE=1 runs tsgolint beside vtsc instead, over all the files,
+  # stopped when vtsc covers them all: faster with more cores than the two need)
+  let ckey = cover_key(ffi, cwd, files)
+  let cov0 = cover_read(fs, os, ckey)
+  let skip0 = os.env("VLINT_TSGO_SKIP") == "1"
+  let spec_mode = os.env("VLINT_VTSC_SPECULATE") == "1"
+  var use_vtsc = check and os.env("VLINT_VTSC") == "1"
+  if use_vtsc and not spec_mode and not skip0 and cov0.startswith("partial"):
+    let nrun = int(cov0[7..cov0.len].strip()) else 0
+    if nrun < 7:
+      use_vtsc = false
+      cover_set(fs, os, ckey, "partial {nrun + 1}")
+  if use_vtsc:
+    let spec = not skip0 and spec_mode and cov0.startswith("partial")
+    var pidf = ""
+    let sch: Chan[TsgoOut] = chan(1)
+    if spec:
+      let pdir = fs.temp_dir() else ""
+      if pdir != "":
+        pidf = pdir + "/pid"
+        var f2: [Str] = []
+        for x in files: f2.push(x + "")
+        var s2: [Str] = []
+        for x in sets: s2.push(x + "")
+        spawn tsgo_bg(fs, os, cwd + "", exe + "", f2, s2, pidf + "", sch)
     let pl = lvtsc.plan_lint(fs, os, ffi, files, sets)
     var fa: [Str] = []
     var sa: [Str] = []
@@ -1256,11 +1326,35 @@ fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w:
     var mb: [ltsgo.Msg] = []
     # (VLINT_TSGO_SKIP=1, for measuring: tsgolint isn't run)
     let skip = os.env("VLINT_TSGO_SKIP") == "1"
-    if fa.len > 0 and not skip:
+    if not skip:
+      if fa.len > 0 or fb.len > 0: cover_set(fs, os, ckey, "partial 0")
+      else: cover_set(fs, os, ckey, "full")
+    if pidf != "":
+      if fa.len == 0 and fb.len == 0:
+        # (all vtsc's: the speculative run is stopped, its result dropped)
+        os.run(["sh", "-c", "i=0; while [ ! -s \"$0\" ] && [ $i -lt 1000 ]; do sleep 0.01; i=$((i+1)); done; kill $(cat \"$0\") 2>/dev/null", pidf]) else 0
+        let _r = sch.recv() else TsgoOut("", [])
+      else:
+        let rs = sch.recv() else TsgoOut("Error running tsgolint", [])
+        if rs.errt.len > 0:
+          var et = rs.errt
+          if et.endswith("\n"): et = et[0..et.len - 1]
+          eprint(et)
+        if rs.err != "": return rs.err
+        var ina: {Str: Bool} = {}
+        for x in fa: ina[x] = true
+        var inb: {Str: Bool} = {}
+        for x in fb: inb[x] = true
+        for x in rs.ms:
+          if x.file == "" or x.file in ina: ma.push(lvtsc.copy_msg(x))
+          elif x.file in inb and x.kind == 1: mb.push(lvtsc.copy_msg(x))
+      fs.remove(pidf) else 0
+      fs.remove(pidf[0..pidf.len - 4]) else 0
+    elif fa.len > 0 and not skip:
       let ra = tsgo_run(fs, os, cwd, exe, fa, sa, true)
       if ra.err != "": return ra.err
       for x in ra.ms: ma.push(lvtsc.copy_msg(x))
-    if fb.len > 0 and not skip:
+    if fb.len > 0 and not skip and pidf == "":
       let rb = tsgo_run(fs, os, cwd, exe, fb, sb, false)
       if rb.err != "": return rb.err
       for x in rb.ms: mb.push(lvtsc.copy_msg(x))
