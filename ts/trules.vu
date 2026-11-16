@@ -712,12 +712,65 @@ fn all_number_like(c: C, t: Int) -> Bool:
     if not number_like(c, m): return false
   return true
 
+# Whether a reference may be narrowed: its name appears in the file before it more than once (its
+# declaration; else nothing can have narrowed it).
+fn maybe_narrowed(c: C, r: Run, id: Int) -> Bool:
+  let from = 0
+  let name = c.t.names[c.t.nd[id].s]
+  let to = c.t.nd[id].pos
+  var seen = 0
+  var at = from
+  while at < to:
+    let i = r.src[at..to].find(name)
+    if i < 0: break
+    let p = at + i
+    let q = p + name.len
+    let before_ok = p == 0 or not ident_byte(int(r.src[p - 1]))
+    let after_ok = q >= r.src.len or not ident_byte(int(r.src[q]))
+    if before_ok and after_ok: seen += 1
+    at = q
+  return seen > 1
+
+# Whether `typeof NAME` comes before the reference in its function, compared with "object" or
+# "undefined" (or with something other than a string).
+fn typeof_before(c: C, r: Run, id: Int) -> Bool:
+  var f = c.parent[id]
+  while f >= 0 and not fn_like(c, f): f = c.parent[f]
+  var from = 0
+  if f >= 0: from = c.t.nd[f].pos
+  let pat = "typeof " + c.t.names[c.t.nd[id].s]
+  let to = c.t.nd[id].pos
+  var at = from
+  while at < to:
+    let i = r.src[at..to].find(pat)
+    if i < 0: return false
+    let q = at + i + pat.len
+    # (typeof x itself, not typeof x.y)
+    if q >= r.src.len: return true
+    let b = int(r.src[q])
+    if not ident_byte(b) and b != 46 and b != 91 and b != 63 and b != 33:
+      # (compared with "object" or "undefined": the narrowings that take null or undefined out of
+      # unknown's {} | null | undefined; the others leave unknown)
+      var j = q
+      while j < r.src.len and (r.src[j] == ' ' or r.src[j] == '=' or r.src[j] == '!'): j += 1
+      if j < r.src.len and (r.src[j] == '\'' or r.src[j] == '"' or r.src[j] == '`'):
+        var we = j + 11
+        if we > r.src.len: we = r.src.len
+        let w = r.src[j + 1..we]
+        if w.startswith("object") or w.startswith("undefined"): return true
+      else: return true
+    at = q
+  return false
+
+fn ident_byte(b: Int) -> Bool:
+  return (b >= 97 and b <= 122) or (b >= 65 and b <= 90) or (b >= 48 and b <= 57) or b == 95 or b == 36 or b >= 128
+
 fn no_for_in_array(var c: C, var r: Run, n: Int):
   let e = c.t.nd[n].b
   # (a type parameter narrowed by the flow: tsc intersects it with what typeof and the like leave,
   # which this checker doesn't, so its constraint here may say too much)
   let t0 = type_at(&c, e)
-  if c.tk[t0] == TK_TPARAM and c.t.nd[unparen(c, e)].k == ast.N_ID:
+  if c.tk[t0] == TK_TPARAM and c.t.nd[unparen(c, e)].k == ast.N_ID and maybe_narrowed(c, r, unparen(c, e)):
     let u = bind.lazy_unsupported(&c, e, "a narrowed type parameter")
     bind.touch(&c, u)
     return
@@ -1502,18 +1555,14 @@ fn bts_check(var c: C, var r: Run, e: Int, t0: Int):
   if literal_node(c, e) and c.t.nd[e].k != ast.N_TEMPL: return
   var t = t0
   if t < 0: t = type_at(&c, e)
-  # (a reference declared unknown: tsc narrows unknown as {} | null | undefined, which this checker
-  # doesn't, so what it was narrowed to here isn't known)
+  # (an unknown reference still unknown here though typeof may have narrowed it: tsc narrows unknown
+  # as {} | null | undefined, so typeof x !== "object" and the like leave {} where this checker
+  # leaves unknown)
   let ue = unparen(c, e)
-  if c.t.nd[ue].k == ast.N_ID:
-    let vs = bind.lookup_value(&c, ue, c.t.nd[ue].s)
-    if vs >= 0 and c.sdecl[vs] >= 0:
-      let dn = c.sdecl[vs]
-      let tn = c.t.nd[dn].b
-      if (c.t.nd[dn].k == ast.N_PARAM or c.t.nd[dn].k == ast.N_DECL) and tn >= 0 and c.t.nd[tn].k == ast.N_TKW and c.t.nd[tn].f == scan.W_UNKNOWN and c.tk[t] != TK_UNKNOWN and not prim_only(c, t):
-        let u = bind.lazy_unsupported(&c, e, "an unknown reference narrowed")
-        bind.touch(&c, u)
-        return
+  if c.tk[t] == TK_UNKNOWN and c.t.nd[ue].k == ast.N_ID and typeof_before(c, r, ue):
+    let u = bind.lazy_unsupported(&c, e, "an unknown reference narrowed")
+    bind.touch(&c, u)
+    return
   let x = tostring_certainty(&c, &r, t, [])
   if x == U_ALWAYS: return
   r.out.push(RDiag("no-base-to-string", c.t.nd[e].pos, xend(c, r, e), "baseToString", "'{src_text(c, r, e)}' {certainty_word(x)} use Object's default stringification format ('[object Object]') when stringified.", "Consider picking a property (e.g. `user.name`), using a formatter (or `JSON.stringify`), or implementing a custom `toString()`/`toLocaleString()` on the type.", [], []))
@@ -1884,9 +1933,34 @@ fn pattern_ctx_free(c: C, e0: Int) -> Bool:
     if op >= scan.T_ASSIGN and op <= scan.T_QQEQ: return false
     if not pattern_ctx_free(c, c.t.nd[e].a): return false
     let rt = unparen(c, c.t.nd[e].b)
-    if (op == scan.T_QQ or op == scan.T_OR) and c.t.nd[rt].k == ast.N_OBJECT and c.t.nd[rt].b == 0: return true
+    if (op == scan.T_QQ or op == scan.T_OR) and c.t.nd[rt].k == ast.N_OBJECT and ast.count(c.t, c.t.nd[rt].a) == 0: return true
     return pattern_ctx_free(c, rt)
   return true
+
+# An object literal initializer the pattern's implied type (any for each element, with no
+# defaults to pad it with) types as it is: its properties' values aren't functions or literals
+# of objects or arrays, which any would type.
+fn plain_object_init(c: C, pat: Int, e0: Int) -> Bool:
+  let e = unparen(c, e0)
+  if c.t.nd[e].k != ast.N_OBJECT: return false
+  if pattern_has_default(c, pat): return false
+  for p in ast.items(c.t, c.t.nd[e].a):
+    let pk = c.t.nd[p].k
+    if pk != ast.N_PROPASSIGN: return false
+    if c.t.nd[c.t.nd[p].a].k == ast.N_COMPUTED: return false
+    let v = unparen(c, c.t.nd[p].b)
+    let vk = c.t.nd[v].k
+    if vk == ast.N_ARROW or vk == ast.N_FUNCEXPR or vk == ast.N_OBJECT or vk == ast.N_ARRAY or vk == ast.N_CLASSEXPR or vk == ast.N_COND or vk == ast.N_BINARY: return false
+  return true
+
+fn pattern_has_default(c: C, pat: Int) -> Bool:
+  let k = c.t.nd[pat].k
+  if k != ast.N_OBJPAT and k != ast.N_ARRPAT: return false
+  for el in ast.items(c.t, c.t.nd[pat].a):
+    if c.t.nd[el].k != ast.N_BINDEL: continue
+    if c.t.nd[el].c >= 0: return true
+    if c.t.nd[el].b >= 0 and pattern_has_default(c, c.t.nd[el].b): return true
+  return false
 
 # The type a pattern destructures (-1 not known).
 fn pattern_source(var c: C, r: Run, pat: Int) -> Int:
@@ -1905,7 +1979,7 @@ fn pattern_source(var c: C, r: Run, pat: Int) -> Int:
   if pk == ast.N_DECL and c.t.nd[p].a == pat and c.t.nd[p].c >= 0:
     # (literals there keep their types, contextually typed by the pattern, getTypeFromBindingPattern:
     # not modeled here)
-    if not pattern_ctx_free(c, c.t.nd[p].c):
+    if not pattern_ctx_free(c, c.t.nd[p].c) and not plain_object_init(c, pat, c.t.nd[p].c):
       let u = bind.lazy_unsupported(&c, p, "a pattern's contextual type for its initializer's literals")
       bind.touch(&c, u)
       return -1

@@ -9,6 +9,8 @@
 # type-aware rules, and vtsc is slower than tsgolint's checker on n8n's code); VLINT_VTSC_DEBUG=1
 # prints what each program got.
 import parse
+import ast
+import scan
 import tsconf
 import tsprog
 import trules
@@ -88,11 +90,15 @@ fn plan_lint(fs: Fs, os: Os, ffi: Ffi, files: [Str], sets: [Str]) -> Plan:
   var tc_of_dir: {Str: Str} = {}
   var tcs: [Str] = []
   var tc_files: {Str: [Str]} = {}
+  # (the files no tsconfig has: tsgolint's inferred program)
+  var unm: [Str] = []
   for f in files:
     let d = tsconf.dirname(f)
     if not (d in tc_of_dir): tc_of_dir[d] = tsconf.find(fs, d)
     let tc = tc_of_dir[d]
-    if tc == "": continue
+    if tc == "":
+      unm.push(f + "")
+      continue
     if not (tc in tc_files):
       tcs.push(tc + "")
       tc_files[tc] = []
@@ -114,9 +120,24 @@ fn plan_lint(fs: Fs, os: Os, ffi: Ffi, files: [Str], sets: [Str]) -> Plan:
     var ncov = 0
     var why = ""
     let dbg2 = os.env("VLINT_VTSC_DEBUG") == "2"
+    var refd: {Str: Bool} = {}
+    var nonmem = false
+    for f in tc_files[tc]:
+      if not (f in p.members): nonmem = true
+    if nonmem:
+      # (tsgolint looks for a file in the tsconfig's references too: those programs are left to it;
+      # it doesn't look in the tsconfigs above)
+      let cfg = tsconf.read(fs, tc)
+      var rseen: {Str: Bool} = {}
+      rseen[tc] = true
+      var rl: [tsconf.Ref] = []
+      tsconf.read_refs(fs, cfg.refs, &rseen, &rl)
+      for rf in rl:
+        for x in rf.files: refd[x] = true
     for f in tc_files[tc]:
       if not (f in p.members):
-        if dbg2: eprint("vlint: vtsc: NOT {f}: not in {tc}")
+        if not (f in refd) and p.err != "no TypeScript 6 or 7 lib files": unm.push(f + "")
+        elif dbg2: eprint("vlint: vtsc: NOT {f}: not in {tc}")
         continue
       pl.gk[f] = tc + ""
       if p.ok and f in p.checked:
@@ -147,7 +168,108 @@ fn plan_lint(fs: Fs, os: Os, ffi: Ffi, files: [Str], sets: [Str]) -> Plan:
       for f in tc_files[tc]:
         if f in pl.linted: nl += 1
       eprint("vlint: vtsc: {tc}: {ncov} of {tc_files[tc].len} files checked, {nl} linted, {(os.clock() - t0) * 1000.0:.0} ms{tail}")
+  if unm.len > 0 and os.env("VLINT_VTSC_INFERRED") != "0": plan_inferred(fs, os, ffi, unm, lint, debug, &pl)
   return pl
+
+fn is_js(f: Str) -> Bool:
+  return f.endswith(".js") or f.endswith(".mjs") or f.endswith(".cjs") or f.endswith(".jsx")
+
+# The files no tsconfig has, as tsgolint's inferred program (its errors and the rules' diagnostics
+# in it, reported after the other programs'). A JavaScript file is covered when it's in the part of
+# JavaScript the checker types as TypeScript types it, and TypeScript reports nothing about it but
+# implicit anys and modules not found (any there too; no checkJs: tsgolint reports no errors for it).
+fn plan_inferred(fs: Fs, os: Os, ffi: Ffi, files: [Str], lint: {Str: Str}, debug: Bool, var pl: Plan):
+  let t0 = os.clock()
+  let cwd = os.env("PWD")
+  let lib = lib_for(fs, os, ffi, cwd)
+  if lib == "": return
+  var tl: {Str: Str} = {}
+  for f in files:
+    if f in lint: tl[f] = lint[f] + ""
+  var p = tsprog.check_inferred_lint(fs, os, ffi, cwd, files, lib, 0, tl)
+  let dbg2 = os.env("VLINT_VTSC_DEBUG") == "2"
+  var ncov = 0
+  var why = ""
+  for f in files:
+    if p.ok and f in p.checked and is_js(f):
+      let src = fs.read(f) else ""
+      var w = js_unsupported(src)
+      if w == "":
+        for d in p.diags[f]:
+          let cd = d.code
+          if w == "" and cd != 7005 and cd != 7006 and cd != 7008 and cd != 7031 and cd != 7034 and cd != 7015 and cd != 7053 and cd != 2307 and cd != 7016: w = "TS{cd} as TypeScript ({d.msg} at {d.pos})"
+      if w != "":
+        p.checked.remove(f)
+        p.why[f] = "JavaScript: " + w
+      else: p.diags[f] = []
+    if p.ok and f in p.checked:
+      pl.gk[f] = ""
+      pl.covered[f] = true
+      var ds: [parse.Diag] = []
+      for d in p.diags[f]: ds.push(parse.Diag(0, d.pos, d.end, d.code, d.msg + ""))
+      pl.diags[f] = ds
+      ncov += 1
+      if f in p.rules_ok:
+        pl.linted[f] = true
+        var rs: [trules.RDiag] = []
+        for x in p.rules[f]: rs.push(trules.copy_diag(x))
+        pl.rdiags[f] = rs
+    else:
+      var w2 = "not in the program"
+      if not p.ok: w2 = p.err + ""
+      elif f in p.why: w2 = p.why[f] + ""
+      if why == "": why = f + ": " + w2
+      if dbg2: eprint("vlint: vtsc: NOT {f}: {w2}")
+  for i in 0..p.files.len:
+    if not (p.files[i] in pl.pidx): pl.pidx[p.files[i]] = i
+  if debug:
+    var tail = ""
+    if why != "": tail = "; first not: " + why
+    var nl = 0
+    for f in files:
+      if f in pl.linted: nl += 1
+    eprint("vlint: vtsc: (inferred program): {ncov} of {files.len} files checked, {nl} linted, {(os.clock() - t0) * 1000.0:.0} ms{tail}")
+
+# Why the checker can't type a JavaScript file as TypeScript types it ("" it can): JSDoc, CommonJS,
+# classes and this, expando assignments, TypeScript's own syntax.
+fn js_unsupported(src: Str) -> Str:
+  if src.find("@ts-") >= 0: return "a @ts- comment"
+  var at = 0
+  while true:
+    let i = src[at..src.len].find("/*")
+    if i < 0: break
+    let st = at + i
+    let e = src[st..src.len].find("*/")
+    if e < 0: break
+    if src[st..st + e].find("@") >= 0: return "a JSDoc tag"
+    at = st + e + 2
+  var t = ast.new_ast()
+  var kw = scan.keywords()
+  let ds = parse.parse_file(&t, src + "", 1, &kw)
+  if ds.len > 0: return "a syntax error"
+  for i in 0..t.nd.len:
+    let k = t.nd[i].k
+    if k >= ast.N_TREF and k <= ast.N_TREST: return "a type"
+    if k == ast.N_INTERFACE or k == ast.N_TYPEALIAS or k == ast.N_ENUM or k == ast.N_MODULE or k == ast.N_IMPORTEQ or k == ast.N_EXPORTASSIGN or k == ast.N_EXTERNALREF or k == ast.N_NSEXPORT: return "TypeScript's syntax"
+    if k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_NONNULL or k == ast.N_TYPEASSERT or k == ast.N_EXPRTARGS or k == ast.N_INDEXSIG or k == ast.N_CALLSIG or k == ast.N_CTORSIG: return "TypeScript's syntax"
+    if k == ast.N_CLASS or k == ast.N_CLASSEXPR or k == ast.N_THIS or k == ast.N_SUPER or k == ast.N_PROP or k == ast.N_CTOR: return "a class or this"
+    if k == ast.N_WITH or (k >= ast.N_JSX and k <= ast.N_JSXTEXT): return "with or JSX"
+    if (k == ast.N_IMPORT or k == ast.N_EXPORT or k == ast.N_SPEC) and (t.nd[i].f & ast.M_TYPEONLY) != 0: return "TypeScript's syntax"
+    if k == ast.N_PARAM and (t.nd[i].b >= 0 or (t.nd[i].f & ast.M_OPTIONAL) != 0): return "TypeScript's syntax"
+    if (k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW) and (t.nd[i].a >= 0 or t.nd[i].c >= 0): return "TypeScript's syntax"
+    if k == ast.N_FUNC and t.nd[i].d < 0: return "TypeScript's syntax"
+    if k == ast.N_SIG and (t.nd[i].a >= 0 or t.nd[i].c >= 0): return "TypeScript's syntax"
+    if k == ast.N_DECL and (t.nd[i].b >= 0 or (t.nd[i].f & ast.M_EXCL) != 0): return "TypeScript's syntax"
+    if k == ast.N_VAR and (t.nd[i].d & ast.M_DECLARE) != 0: return "TypeScript's syntax"
+    if (k == ast.N_CALL or k == ast.N_NEW or k == ast.N_TAGGED) and t.nd[i].b >= 0: return "TypeScript's syntax"
+    if k == ast.N_ID:
+      let n = t.names[t.nd[i].s]
+      if n == "require" or n == "module" or n == "exports" or n == "define" or n == "arguments": return "CommonJS"
+    if k == ast.N_BINARY and t.nd[i].f == scan.T_ASSIGN:
+      var l = t.nd[i].a
+      while t.nd[l].k == ast.N_PAREN: l = t.nd[l].a
+      if t.nd[l].k == ast.N_PROPACCESS or t.nd[l].k == ast.N_ELEMACCESS: return "an expando assignment"
+  return ""
 
 fn diag_msg(f: Str, d: parse.Diag) -> ltsgo.Msg:
   return ltsgo.Msg(2, "", f + "", d.pos, d.end, "TS{d.code}", d.msg + "", "", false, [], [], [], 0)
