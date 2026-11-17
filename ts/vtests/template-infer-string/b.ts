@@ -1,0 +1,10 @@
+export {};
+declare const s: string;
+declare function h<T extends string>(p: `${T}`): T;
+const h1: number = h(s);
+declare function k<T>(p: `${T & string}`, q: T): T;
+const k1: number = k(s, 3);
+declare function m<A extends string, B extends string>(p: `${A}${B}`): [A, B];
+const m1: number = m(s);
+declare function u<T extends string>(p: `${T}` | number): T;
+const u1: number = u(s);

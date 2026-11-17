@@ -652,8 +652,12 @@ fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
           let rtu = types.union_of(&c, rts)
           rt = bind.array_of(&c, rtu)
         else:
-          unsup(&c, e, "a rest element of this type")
-          return
+          var itr = -1
+          if c.tk[src] == TK_OBJ: itr = iterated(&c, src)
+          if itr < 0:
+            unsup(&c, e, "a rest element of this type")
+            return
+          rt = bind.array_of(&c, itr)
         bind_pattern(&c, c.t.nd[e].b, rt, mutable)
         break
       var et = -1
@@ -697,6 +701,8 @@ fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
             et = bind.prop_type_for(&c, ip, src)
             if (c.sflags[ip] & SF_OPTIONAL) != 0: et = types.union_of(&c, [et, c.undef_t])
           else: et = bind.index_type(&c, src, true)
+        # (another iterable, a Set or a Map: what it iterates, getIteratedTypeOrElementType)
+        if et < 0 and c.tk[src] == TK_OBJ: et = iterated(&c, src)
         if et < 0:
           unsup(&c, e, "destructuring this type")
           return
@@ -1676,6 +1682,29 @@ fn has_break_direct(c: C, n: Int) -> Bool:
 # ---- narrowing
 
 # The reference an expression names (x, x.a.b), as a key, or "".
+# Whether a.b.c's root names something narrowing can't change: an import, an enum, a namespace, a
+# class, a function, or a parameter or variable declared with a type that isn't a union.
+fn flow_free_root(var c: C, e: Int) -> Bool:
+  var x = e
+  while c.t.nd[x].k == ast.N_PROPACCESS: x = c.t.nd[x].a
+  if c.t.nd[x].k != ast.N_ID: return false
+  let rs = bind.lookup_value_raw(&c, x, c.t.nd[x].s)
+  if rs < 0: return false
+  if (c.sk[rs] & (types.S_IMPORT | S_ENUM | S_NAMESPACE | S_CLASS | S_FUNC)) != 0: return true
+  let d = c.sdecl[rs]
+  if d < 0: return false
+  var dd = d
+  if c.t.nd[dd].k == ast.N_ID and c.parent[dd] >= 0: dd = c.parent[dd]
+  let dk = c.t.nd[dd].k
+  if (dk == ast.N_DECL or dk == ast.N_PARAM) and c.t.nd[dd].b >= 0:
+    let dt = bind.type_of_sym(&c, rs)
+    return c.tk[dt] != TK_UNION
+  # (a const initialized by a literal)
+  if dk == ast.N_DECL and c.t.nd[dd].c >= 0 and (c.sk[rs] & S_CONST) != 0:
+    let ik = c.t.nd[skip_parens(c, c.t.nd[dd].c)].k
+    return ik == ast.N_STR or ik == ast.N_NUM or ik == ast.N_NOSUBTEMPL or ik == ast.N_OBJECT
+  return false
+
 fn ref_key(var c: C, e: Int) -> Str:
   let k = c.t.nd[e].k
   if k == ast.N_ID:
@@ -1712,8 +1741,12 @@ fn ref_key(var c: C, e: Int) -> Str:
         # (a for-of variable: its type is the iterated expression's)
         if c.t.nd[dd].k == ast.N_DECL and c.t.nd[dd].b < 0 and c.t.nd[dd].c < 0: return inner0 + ".[{ksym}]"
         if c.t.nd[dd].k == ast.N_DECL and c.t.nd[dd].b < 0 and c.t.nd[dd].c >= 0:
-          let ink = c.t.nd[skip_parens(c, c.t.nd[dd].c)].k
+          let inx = skip_parens(c, c.t.nd[dd].c)
+          let ink = c.t.nd[inx].k
           if not (ink == ast.N_ID or ink == ast.N_PROPACCESS or ink == ast.N_STR or ink == ast.N_NUM or ink == ast.N_NOSUBTEMPL or ink == ast.N_AS): return inner0 + ".[{ksym}]"
+          # (a name or a property of one whose type flow may narrow, a local declared without a
+          # type: not checked out of place either)
+          if (ink == ast.N_ID or ink == ast.N_PROPACCESS) and not flow_free_root(&c, inx): return inner0 + ".[{ksym}]"
       let kt = bind.type_of_sym(&c, ksym)
       if c.tk[kt] == TK_STRLIT: return inner0 + "." + nm(c, c.ta[kt])
       if c.tk[kt] == TK_NUMLIT: return inner0 + "." + c.numtext[c.ta[kt]]
@@ -3113,15 +3146,23 @@ fn facts1x(var c: C, e: Int, truth: Bool, var out: [Fact]):
         let uk = types.union_of(&c, keep)
         res = keep_fresh(&c, t, uk)
       elif truth:
-        # over a union tsc keeps the intersection's origin ((A | B) & Record<...>): not modeled
-        if c.tk[t] == TK_UNION:
-          generic_fact(&c, e, key, &out)
-          return
         let rec = record_of(&c, name_t, c.unknown_t)
         if rec < 0:
           unsup(&c, e, "an in check the type doesn't know")
           return
-        res = types.inter_of(&c, [t, rec])
+        if c.tk[t] == TK_UNION:
+          # (A | B) & Record<K, unknown>, distributed over the members; tsc prints it by its
+          # origin, the intersection (not modeled: printing it leaves the file unchecked)
+          var parts: [Int] = []
+          for mi50b_ in 0..types.nmem(c, t):
+            let m = types.mem(c, t, mi50b_)
+            if not (c.tk[m] == TK_OBJ or (c.tk[m] == TK_INTER and not is_generic_member(c, m))):
+              generic_fact(&c, e, key, &out)
+              return
+            parts.push(types.inter_of(&c, [m, rec]))
+          res = types.union_of(&c, parts)
+          c.noshow_t[res] = true
+        else: res = types.inter_of(&c, [t, rec])
       out.push(Fact(key, res))
       return
     if op == scan.W_INSTANCEOF:
@@ -4530,6 +4571,9 @@ fn chain_end(var c: C, n: Int, r: Int) -> Int:
   if not adds: return r
   let k = c.tk[r]
   if k == TK_UNSUP or k == TK_ERROR or is_any(c, r): return r
+  if n in c.chain_hint:
+    c.chain_raw[n] = c.chain_hint[n]
+    return r
   c.chain_raw[n] = r
   return types.union_of(&c, [r, c.undef_t])
 
@@ -4579,6 +4623,7 @@ fn prop_access(var c: C, n: Int) -> Int:
     return bind.type_of_sym(&c, gs)
   if (c.t.nd[n].f & 4) != 0: return unsup(&c, n, "a private name")
   var ot = chain_obj(&c, obj)
+  if n in c.chain_hint: c.chain_hint.remove(n)
   let key = ref_key(&c, n)
   if key != "":
     let nt = narrowed(c, key)
@@ -4591,6 +4636,23 @@ fn prop_access(var c: C, n: Int) -> Int:
         if c.tk[m] == TK_OBJ:
           let ps = prop_of(&c, m, name)
           if ps >= 0: check_access(&c, n, ps, name)
+      # (in an optional chain, the narrowed type keeps the chain's undefined, tsc's optional type
+      # marker, which the next link removes: where the property itself can't be undefined)
+      if in_optional_chain(c, n) and may_be(c, nt, 2):
+        let base = types.filter_union(&c, ot, true, true)
+        var decl_undef = types.nmem(c, base) == 0
+        for mi70b_ in 0..types.nmem(c, base):
+          let m = types.mem(c, base, mi70b_)
+          if c.tk[m] != TK_OBJ:
+            decl_undef = true
+            continue
+          let ps = prop_of(&c, m, name)
+          if ps < 0 or (c.sflags[ps] & SF_OPTIONAL) != 0:
+            decl_undef = true
+            continue
+          let pt1 = bind.prop_type_for(&c, ps, m)
+          if may_be(c, pt1, 2) or is_any(c, pt1) or c.tk[pt1] == TK_UNKNOWN: decl_undef = true
+        if not decl_undef: c.chain_hint[n] = types.filter_union(&c, nt, true, false)
       return nt
   if is_any(c, ot): return ot
   # (u?.x of an unknown u: {} | null | undefined, its non-null part {})
@@ -4628,6 +4690,10 @@ fn prop_access(var c: C, n: Int) -> Int:
     # member has it)
     if c.tk[m] == TK_TPARAM:
       let bm = base_constraint(&c, m, 0)
+      # (constrained to the error type, an unresolved name: its members are the error type)
+      if bm >= 0 and c.tk[bm] == TK_ERROR:
+        ts.push(bm)
+        continue
       if bm >= 0 and c.tk[bm] == TK_INTER:
         var has = false
         for ii18_ in 0..types.ninter(c, bm):
@@ -7224,6 +7290,8 @@ fn call1(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
       if spread_at < 0: spread_at = i
   var ft = chain_obj(&c, callee)
   if is_any(c, ft):
+    # (an untyped call with type arguments: TS2347, unless the error type, already reported)
+    if c.tk[ft] == TK_ANY and c.t.nd[n].b >= 0 and c.t.nd[callee].k != ast.N_SUPER: err(&c, n, 2347, "Untyped function calls may not accept type arguments.")
     for a in args: check_expr(&c, a, -1)
     return ft
   if nullable_tparam(&c, ft): return unsup(&c, n, "calling a type parameter that may be null")
@@ -8319,6 +8387,35 @@ fn infer_in1(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, or
           let pl = types.str_lit_s(&c, parts[i], false)
           infer_in(&c, holes[i], pl, &inf, contra, prio, orig, &seen)
       return
+    # (from string or a template: inferTypesFromTemplateLiteralType gives no matches from string,
+    # so nothing is inferred unless the texts are all empty; holes that are indexed accesses with
+    # a literal index take no inference either way)
+    if types.tmpl_mapping(c, p) == "":
+      var only_str = true
+      var str_or_tmpl = true
+      for mi115b_ in 0..types.nmem(c, a):
+        let am = types.mem(c, a, mi115b_)
+        if c.tk[am] != TK_STRING: only_str = false
+        if c.tk[am] != TK_STRING and not (c.tk[am] == types.TK_TEMPLATE and types.tmpl_mapping(c, am) == ""): str_or_tmpl = false
+      var empty_texts = true
+      for tx in types.tmpl_texts(c, p):
+        if tx != "": empty_texts = false
+      if only_str and not empty_texts: return
+      if only_str and empty_texts:
+        # (no matches, the texts all empty: never into each hole)
+        for h in types.tmpl_holes(c, p): infer_in(&c, h, c.never_t, &inf, contra, prio, orig, &seen)
+        return
+      var idx_holes = true
+      for h in types.tmpl_holes(c, p):
+        for ii33b_ in 0..types.ninter(c, h):
+          let hm = types.inter_at(c, h, ii33b_)
+          if c.tk[hm] == TK_TPARAM: idx_holes = false
+          elif c.tk[hm] == types.TK_INDEXED:
+            let ix = c.tb[hm]
+            if could_contain_tvars(&c, ix): idx_holes = false
+          elif could_contain_tvars(&c, hm): idx_holes = false
+      if str_or_tmpl and idx_holes: return
+    if c.all_reasons: eprint("VREASON-TMPL {show.show(&c, p)} <- {show.show(&c, a)}")
     let gu = bind.lazy_unsupported(&c, 0, "inference to a template literal type")
     bind.touch(&c, gu)
     return
@@ -8332,8 +8429,8 @@ fn infer_in1(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, or
   if pk == TK_TPARAM or (pk == types.TK_INDEXED and types.has_int(inf.tps, p)):
     # (an outer call's type parameter, not inferred yet: silentNever, no inference)
     if c.tk[a] == TK_TPARAM and a != p and types.has_int(c.outer_tps, a) and not types.has_int(inf.tps, a): return
-    # (a type parameter from itself: nothing learned)
-    if a == p: return
+    # (a type parameter from itself: a candidate like any other, the class's own constructor in
+    # its body inferring A from this.a)
     for i in 0..inf.tps.len:
       if inf.tps[i] != p: continue
       if c.tk[a] == TK_UNSUP:
@@ -9522,10 +9619,14 @@ fn binary1(var c: C, n: Int, ctx: Int) -> Int:
     let h16_ = definitely_falsy(&c, lt)
     return union_fresh(&c, [h16_, rt])
   if op == scan.T_OR:
-    let lt = check_expr(&c, l, -1)
+    # (getContextualTypeForBinaryOperand: both sides take the contextual type; without one, the
+    # right side takes the left side's type)
+    let lt = check_expr(&c, l, ctx)
     check_truthiness(&c, l)
     push_facts(&c, l, false)
-    let rt = check_expr(&c, r, ctx)
+    var rctx = ctx
+    if rctx < 0: rctx = lt
+    let rt = check_expr(&c, r, rctx)
     c.narrow.pop()
     forget_assigned(&c, r)
     # (a left side that can't be falsy: its type alone)
@@ -9534,8 +9635,10 @@ fn binary1(var c: C, n: Int, ctx: Int) -> Int:
     let uo = union_fresh(&c, [h17_, rt])
     return logical_reduce(&c, uo)
   if op == scan.T_QQ:
-    let lt = check_expr(&c, l, -1)
-    let rt = check_expr(&c, r, ctx)
+    let lt = check_expr(&c, l, ctx)
+    var rctx = ctx
+    if rctx < 0: rctx = lt
+    let rt = check_expr(&c, r, rctx)
     # (a left side that can't be nullish: its type alone, checkNullishCoalescingExpression)
     if never_nullish(c, lt): return lt
     let h18_ = non_null_generic(&c, l, lt)
