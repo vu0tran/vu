@@ -1,0 +1,10 @@
+export {};
+declare function join(...p: string[]): string;
+declare const segs: string[];
+declare const nums: number[];
+const a: number = join('a', ...segs, 'b');
+join('a', ...nums, 'b');
+join('a', ...segs, 1);
+join('a', ...segs, ...nums);
+declare function k(x: number, ...p: string[]): string;
+k(1, ...segs, 'b');
