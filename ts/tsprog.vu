@@ -297,6 +297,42 @@ type Out:
   rdiags: [trules.RDiag] = []  # the type-aware rules' diagnostics (Prog.lint)
   rfile: [Int] = []            # ... each one's file index
   rbad: [Int] = []             # files whose rules reached something not modeled
+  ckeys: [Str] = []            # (worker 0, with the file cache) each file's key ("" none)
+  cnew: {Str: CEntry} = {}     # the cache entries of the files this worker checked, by key
+  ncached: Int = 0             # (worker 0) the user files the cache answered
+
+# The file cache ($VTSC_CACHE_DIR): a checked file's results by its key, a hash of its source,
+# what it imports (all the way down), what declares globals, the options and this checker. A file
+# whose key is there isn't checked again.
+type CEntry:
+  diags: [parse.Diag]       # its errors (file unused), after the directives
+  unsup: Str = ""           # why it isn't checked (its own constructs), "" it is
+  rd: [trules.RDiag] = []   # its type-aware rules' diagnostics
+  rbad: Bool = false
+  marks: [Str] = []         # the files whose constructs its check found not modeled, and why (pairs)
+
+type CFile:
+  entries: {Str: CEntry} = {}
+  # (the last run whole: when the options, the files and every file and folder it looked at are
+  # as they were, its result is the answer without reading anything)
+  phash: Str = ""
+  spaths: [Str] = []
+  sstat: [Int] = []
+  last: Proj = Proj(false, "", [], {}, {}, {})
+
+fn copy_entry(e: CEntry) -> CEntry:
+  var ds: [parse.Diag] = []
+  for d in e.diags: ds.push(parse.Diag(0, d.pos, d.end, d.code, d.msg + ""))
+  var rd: [trules.RDiag] = []
+  for x in e.rd: rd.push(trules.copy_diag(x))
+  var mk: [Str] = []
+  for x in e.marks: mk.push(x + "")
+  return CEntry(ds, e.unsup + "", rd, e.rbad, mk)
+
+# Where a program's file cache is (cache: the folder, "" none; id: what names the program).
+fn cache_path(cache: Str, id: Str) -> Str:
+  if cache == "": return ""
+  return cache + "/" + lcache.hex16(lcache.hash64(id)) + ".json"
 
 fn want_deps(f: Int, user_from: Int, deps: [[Str]], var want: [Bool], index: {Str: Int}):
   if want[f]: return
@@ -329,6 +365,7 @@ type Prog:
   redir_src: [Str] = []
   redir_files: {Str: Bool} = {}
   redir_pkg: {Str: Str} = {}
+  cache: Str = ""          # the file cache's file for this program ("" none)
 
 # A file TypeScript treats as CommonJS under node16 / nodenext: .cts, or .ts / .d.ts in a package
 # whose nearest package.json has no "type": "module".
@@ -350,6 +387,64 @@ fn worker(fs: Fs, os: Os, ffi: Ffi, own files: [Str], own dir: Str, own target: 
 
 # The checker over the files: the errors of this worker's share of them (every nshards-th file,
 # starting at shard), each with its sort key.
+# Each file's cache key ("" none: libraries' and packages' files): its own hash (path, source,
+# what its imports resolved to) summed over what it imports, all the way down, with the hashes
+# of what declares globals (lib files, scripts, declare global and module augmentations), the
+# options, the lib folder, the target, its rules and this checker's executable.
+fn file_keys(fs: Fs, ffi: Ffi, c: types.C, pg: Prog, dir: Str, target: Str, srcs: [Str], names: [Str], roots: [Int], deps: [[Str]], user_from: Int, pkg_present: {Str: Bool}) -> [Str]:
+  var miss: {Str: Str} = {}
+  for k, _ in pkg_present:
+    let bar = k.find("|")
+    if bar < 0: continue
+    let f = k[0..bar]
+    miss[f] = miss.get(f, "") + "|" + k[bar + 1..k.len]
+  var fh: [Int] = [0]
+  for fx in 1..names.len:
+    var h = lcache.mix(lcache.hash64(names[fx]), lcache.hash64(srcs[fx]))
+    if fx >= user_from:
+      var dl = ""
+      for d in deps[fx - user_from]: dl = dl + d + "\n"
+      h = lcache.mix(h, lcache.hash64(dl + miss.get(names[fx], "")))
+    fh.push(h)
+  var pk = copy_prog(pg)
+  pk.lint_files = {}
+  pk.cache = ""
+  var st: [Int] = [0, 0, 0, 0, 0]
+  lcache.stat(ffi, lcache.realpath(ffi, "/proc/self/exe"), &st)
+  var g = lcache.hash64(to_json(pk) + "|" + dir + "|" + target + "|{st[0]}/{st[1]}")
+  for fx in 1..names.len:
+    if fx < user_from or not bind.is_module(c, roots[fx]) or srcs[fx].find("declare global") >= 0 or srcs[fx].find("declare module") >= 0: g = lcache.mix(g, fh[fx])
+  var out: [Str] = []
+  for fx in 0..names.len: out.push("")
+  var seen: [Int] = []
+  for fx in 0..names.len: seen.push(-1)
+  for fx in user_from..names.len:
+    if fx in c.pkg_files: continue
+    # (what it imports, all the way down: a sum, so the order doesn't matter)
+    var sum = 0
+    var n = 0
+    var stack: [Int] = [fx]
+    seen[fx] = fx
+    while stack.len > 0:
+      let x = stack.pop()
+      sum = sum +% fh[x]
+      n += 1
+      if x < user_from: continue
+      for d in deps[x - user_from]:
+        let y = c.file_index.get(d, -1)
+        if y >= 0 and seen[y] != fx:
+          seen[y] = fx
+          stack.push(y)
+    var rl = pg.lint + ""
+    if pg.lint_files.len > 0:
+      rl = ""
+      var an = names[fx] + ""
+      if not an.startswith("/") and pg.cwd != "": an = bind.norm_path(pg.cwd + "/" + an)
+      rl = pg.lint_files.get(an, "") + ""
+    # (and its own hash apart: the files of an import cycle have the same closure)
+    out[fx] = lcache.hex16(lcache.mix(lcache.mix(lcache.mix(lcache.mix(g, fh[fx]), sum), n), lcache.hash64(rl)))
+  return out
+
 fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, shard: Int, nshards: Int) -> Out throws:
   let t0 = os.clock()
   var out = Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
@@ -595,6 +690,18 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
     if not bind.is_module(c, root): bind.declare_globals(&c, root)
     else: bind.declare_global_blocks(&c, root)
   bind.augmentations(&c, user_from)
+  # (the file cache: each user file's key; those the cache has aren't checked)
+  var ckey: [Str] = []
+  var cached: {Int: CEntry} = {}
+  if pg.cache != "" and pdiags.len == 0:
+    let ck = file_keys(fs, ffi, c, pg, dir, target, srcs, names, roots, deps, user_from, pkg_present)
+    for x in ck: ckey.push(x + "")
+    let ct = fs.read(pg.cache) else ""
+    if ct != "":
+      let cf0 = from_json(ct, CFile) else CFile()
+      for fx in user_from..names.len:
+        if ckey[fx] != "" and ckey[fx] in cf0.entries: cached[fx] = copy_entry(cf0.entries[ckey[fx]])
+        elif ckey[fx] != "" and shard == 0 and os.env("VTSC_CACHE_DEBUG") != "": eprint("vtsc: cache: checks {names[fx]}")
   let t2 = os.clock()
   # imported files first (a module's declarations are checked in their own flow before another
   # file asks for their types)
@@ -614,7 +721,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   var uord: [Int] = []
   var total = 0
   for fx in order0:
-    if fx >= user_from and not (fx in c.pkg_files):
+    if fx >= user_from and not (fx in c.pkg_files) and not (fx in cached):
       uord.push(fx)
       total += srcs[fx].len
   var acc = 0
@@ -639,6 +746,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
     c.node_file = fi
     let tf = os.clock()
     if ftime and os.env("VTSC_FILE_TIME") == "2": eprint("BEGIN {names[fi]}")
+    c.file_inst = 0
     if mine[fi]:
       chk.check_file(&c, roots[fi])
       var rl = pg.lint + ""
@@ -662,7 +770,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
     else:
       chk.declare_only(&c, roots[fi])
       deps_only += 1
-    if ftime: eprint("FILE {(os.clock() - tf) * 1000.0:.1} ms {names[fi]}")
+    if ftime: eprint("FILE {(os.clock() - tf) * 1000.0:.1} ms {c.file_inst} inst {names[fi]}")
   chk.global_conflicts(&c, user_from)
   # (a file importing one that isn't checked isn't checked either: decided by the caller, over
   # every worker's files)
@@ -731,6 +839,15 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
             if word_count(srcs[fi], cn) == 1 or (ck in c.class_at and not refd): presumed_used[(fi << 32) | ds[dj]] = true
             else: unused_dirs[fi] = ds[dj]
       dj += 3
+  # (the cache's files: why they aren't checked, unless this check found a reason)
+  for fx, e in cached:
+    if e.unsup != "" and not (fx in c.unsupported): c.unsupported[fx] = e.unsup + ""
+    # (and what its check found in other files)
+    var mi = 0
+    while mi + 1 < e.marks.len:
+      let y = c.file_index.get(e.marks[mi], -1)
+      if y >= 0 and not (y in c.unsupported): c.unsupported[y] = e.marks[mi + 1] + ""
+      mi += 2
   for fi, at in deco_dirs: c.unsupported[fi] = "a @ts-expect-error directive over a decorator at {at}"
   for fi, at in unused_dirs:
     if not (fi in c.unsupported): c.unsupported[fi] = "a @ts-expect-error directive over a class noUnusedLocals may report at {at}"
@@ -777,6 +894,54 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
           all.push(parse.Diag(rank[fi], ds[di], ds[di + 1], 2578, "Unused '@ts-expect-error' directive."))
           all_lib.push(false)
         di += 3
+  # (the cache's files' errors and rules' diagnostics: worker 0's)
+  if shard == 0 and pdiags.len == 0:
+    for fx, e in cached:
+      if fx in c.unsupported: continue
+      for d in e.diags:
+        all.push(parse.Diag(rank[fx], d.pos, d.end, d.code, d.msg + ""))
+        all_lib.push(false)
+      if e.rbad: out.rbad.push(fx)
+      for x in e.rd:
+        out.rdiags.push(trules.copy_diag(x))
+        out.rfile.push(fx)
+    out.ncached = cached.len
+  # (this worker's checked files' entries; not those whose directives depend on other files)
+  if ckey.len > 0:
+    var rows: {Int: [parse.Diag]} = {}
+    for ix in 0..all.len:
+      if all_lib[ix]: continue
+      let fx = order[all[ix].file]
+      if not mine[fx]: continue
+      if not (fx in rows): rows[fx] = []
+      rows[fx].push(parse.Diag(0, all[ix].pos, all[ix].end, all[ix].code, all[ix].msg + ""))
+    var rds: {Int: [trules.RDiag]} = {}
+    for ix in 0..out.rdiags.len:
+      let fx = out.rfile[ix]
+      if not (fx in rds): rds[fx] = []
+      rds[fx].push(trules.copy_diag(out.rdiags[ix]))
+    var bad: {Int: Bool} = {}
+    for fx in out.rbad: bad[fx] = true
+    for fx in user_from..names.len:
+      if not mine[fx] or ckey[fx] == "" or fx in deco_dirs or fx in unused_dirs or fx in c.t.nocheck: continue
+      var skip = false
+      for pk, _ in presumed_used:
+        if (pk >> 32) == fx: skip = true
+      if skip: continue
+      var e = CEntry([], "", [], fx in bad)
+      if fx in rows:
+        for d in rows[fx]: e.diags.push(parse.Diag(0, d.pos, d.end, d.code, d.msg + ""))
+      if fx in c.unsupported: e.unsup = c.unsupported[fx] + ""
+      if fx in rds:
+        for x in rds[fx]: e.rd.push(trules.copy_diag(x))
+      if fx in c.marks:
+        for y in c.marks[fx]:
+          if y in c.unsupported:
+            e.marks.push(names[y] + "")
+            e.marks.push(c.unsupported[y] + "")
+      out.cnew[ckey[fx] + ""] = e
+    if shard == 0:
+      for x in ckey: out.ckeys.push(x + "")
   # each error with its sort key (merged with the other workers' and sorted by the caller)
   for ix in 0..all.len:
     let d = all[ix]
@@ -935,6 +1100,7 @@ fn copy_prog(pg: Prog) -> Prog:
   for x in pg.redir_src: pk.redir_src.push(x + "")
   for k, v in pg.redir_files: pk.redir_files[k] = v
   for k, v in pg.redir_pkg: pk.redir_pkg[k] = v + ""
+  pk.cache = pg.cache + ""
   for x in pg.libs: pk.libs.push(x + "")
   for x in pg.types: pk.types.push(x + "")
   for x in pg.pkeys: pk.pkeys.push(x + "")
@@ -1045,6 +1211,8 @@ type Proj:
   members_ok: Bool = false    # ... it could
   rules: {Str: [trules.RDiag]} = {}  # a checked file's type-aware rules' diagnostics (rule lists given)
   rules_ok: {Str: Bool} = {}         # ... the files they could all run over
+  fkeys: {Str: Str} = {}             # (with the file cache) a file -> its key
+  ncached: Int = 0                   # ... the files it answered
 
 fn check_project(fs: Fs, os: Os, ffi: Ffi, pp: Str, lib: Str, jobs: Int) -> Proj:
   return check_project_lint(fs, os, ffi, pp, lib, jobs, {})
@@ -1089,7 +1257,55 @@ fn check_conf(fs: Fs, os: Os, ffi: Ffi, cf: Conf, pg0: Prog, target: Str, lib: S
   var pg = copy_prog(pg0)
   pg.abs_names = true
   for k, v in lint: pg.lint_files[k] = v + ""
-  let outs = run_all(fs, os, ffi, cf.files, lib, target, pg, jobs) else []
+  # (the file cache, $VTSC_CACHE_DIR: one file per program, named by its tsconfig or its files)
+  # (a project by its folder, patterns and listed files: a new file keeps the others' entries)
+  var pid = pg.cwd + "|" + target + "|{cf.nlisted}"
+  for x in cf.incl: pid = pid + "|" + x
+  for i in 0..cf.nlisted:
+    if i < cf.files.len: pid = pid + "|" + cf.files[i]
+  pg.cache = cache_path(os.env("VTSC_CACHE_DIR"), pid)
+  var jobs1 = jobs
+  var phash = ""
+  if pg.cache != "":
+    var pk = copy_prog(pg)
+    pk.cache = ""
+    var st: [Int] = [0, 0, 0, 0, 0]
+    lcache.stat(ffi, lcache.realpath(ffi, "/proc/self/exe"), &st)
+    var all = to_json(pk) + "|" + target + "|" + lib + "|{st[0]}/{st[1]}/{st[2]}/{st[3]}"
+    for f in cf.files: all = all + "|" + f
+    phash = lcache.hex16(lcache.hash64(all))
+    let c0 = from_json(fs.read(pg.cache) else "", CFile) else CFile()
+    # (a few files changed since the last run: one worker, the others' results from the cache)
+    if c0.spaths.len > 0 and jobs1 == 0:
+      var nchg = 0
+      for i in 0..c0.spaths.len:
+        if nchg <= 16 and lcache.stat_any(ffi, c0.spaths[i]) != c0.sstat[i]: nchg += 1
+      if nchg <= 16: jobs1 = 1
+    if c0.phash == phash and c0.spaths.len > 0 and c0.last.ok:
+      var same = true
+      for i in 0..c0.spaths.len:
+        if lcache.stat_any(ffi, c0.spaths[i]) != c0.sstat[i]:
+          same = false
+          break
+      if same:
+        let l = c0.last
+        for f in l.files: p.files.push(f + "")
+        for k, v in l.checked: p.checked[k + ""] = v
+        for k, ds in l.diags:
+          var dd: [parse.Diag] = []
+          for d in ds: dd.push(parse.Diag(0, d.pos, d.end, d.code, d.msg + ""))
+          p.diags[k + ""] = dd
+        for k, v in l.why: p.why[k + ""] = v + ""
+        for k, rs in l.rules:
+          var rr: [trules.RDiag] = []
+          for x in rs: rr.push(trules.copy_diag(x))
+          p.rules[k + ""] = rr
+        for k, v in l.rules_ok: p.rules_ok[k + ""] = v
+        for k, v in l.fkeys: p.fkeys[k + ""] = v + ""
+        p.ncached = l.fkeys.len
+        p.ok = true
+        return
+  let outs = run_all(fs, os, ffi, cf.files, lib, target, pg, jobs1) else []
   if outs.len == 0:
     p.err = "the checker failed"
     return
@@ -1098,6 +1314,32 @@ fn check_conf(fs: Fs, os: Os, ffi: Ffi, cf: Conf, pg0: Prog, target: Str, lib: S
   if m.nsyntax > 0:
     p.err = "syntax errors"
     return
+  var w0 = 0
+  for k in 0..outs.len:
+    if outs[k].ckeys.len > 0: w0 = k
+  if pg.cache != "" and outs[w0].ckeys.len > 0:
+    # (the new cache: this run's files' entries, checked now or kept from the last)
+    let old = from_json(fs.read(pg.cache) else "", CFile) else CFile()
+    var nc = CFile()
+    for o in outs:
+      for k, e in o.cnew: nc.entries[k + ""] = copy_entry(e)
+    for fx in 0..outs[w0].ckeys.len:
+      let k = outs[w0].ckeys[fx]
+      if k == "" or k in nc.entries: continue
+      if k in old.entries: nc.entries[k + ""] = copy_entry(old.entries[k])
+    for fx in 0..outs[w0].ckeys.len:
+      let k = outs[w0].ckeys[fx]
+      if k == "": continue
+      var nm = m.names[fx] + ""
+      if not nm.startswith("/"): nm = bind.norm_path(pg.cwd + "/" + nm)
+      p.fkeys[nm] = k + ""
+    p.ncached = outs[w0].ncached
+    let cd = tsconf.dirname(pg.cache)
+    fs.mkdir(tsconf.dirname(cd)) else 0
+    fs.mkdir(cd) else 0
+    let tmp = pg.cache + ".tmp{lcache.now_ns(ffi)}"
+    fs.write(tmp, to_json(nc)) else 0
+    fs.rename(tmp, pg.cache) else 0
   for fi in program_order(m, cf):
     var nm = m.names[fi] + ""
     if not nm.startswith("/"): nm = bind.norm_path(pg.cwd + "/" + nm)
@@ -1135,6 +1377,62 @@ fn check_conf(fs: Fs, os: Os, ffi: Ffi, cf: Conf, pg0: Prog, target: Str, lib: S
     let nm = nmof[fi]
     if nm in p.rules_ok: p.rules[nm].push(trules.copy_diag(m.rdiags[ix]))
   p.ok = true
+  if pg.cache != "" and phash != "":
+    # (this run whole, with what it looked at: its files, their folders and those folders'
+    # parents, and the node_modules folders above the project)
+    var nc = from_json(fs.read(pg.cache) else "", CFile) else CFile()
+    nc.phash = phash + ""
+    nc.spaths = []
+    nc.sstat = []
+    var seen: {Str: Bool} = {}
+    var paths: [Str] = []
+    for nm0 in m.names:
+      if nm0 == "": continue
+      var a = nm0 + ""
+      if not a.startswith("/"): a = bind.norm_path(pg.cwd + "/" + a)
+      paths.push(a)
+      let d1 = tsconf.dirname(a)
+      paths.push(d1)
+      paths.push(tsconf.dirname(d1))
+    var d = pg.cwd + ""
+    while d != "" and d != "/":
+      paths.push(d + "/node_modules")
+      paths.push(d + "/package.json")
+      let up = tsconf.dirname(d)
+      if up == d: break
+      d = up
+    # (a file changed less than 2 s ago may have changed again while this run read it: the run
+    # isn't kept whole, the files' entries decide next time, as git's index does with racy files)
+    let now = lcache.now_ns(ffi)
+    var racy = false
+    var fst: [Int] = [0, 0, 0, 0, 0]
+    for x in paths:
+      if x in seen: continue
+      seen[x] = true
+      nc.spaths.push(x + "")
+      nc.sstat.push(lcache.stat_any(ffi, x))
+      if lcache.stat(ffi, x, &fst) and fst[1] > now - 2000000000: racy = true
+    if racy:
+      nc.spaths = []
+      nc.sstat = []
+    var l = Proj(true, "", [], {}, {}, {})
+    for f in p.files: l.files.push(f + "")
+    for k, v in p.checked: l.checked[k + ""] = v
+    for k, ds in p.diags:
+      var dd: [parse.Diag] = []
+      for x in ds: dd.push(parse.Diag(0, x.pos, x.end, x.code, x.msg + ""))
+      l.diags[k + ""] = dd
+    for k, v in p.why: l.why[k + ""] = v + ""
+    for k, rs in p.rules:
+      var rr: [trules.RDiag] = []
+      for x in rs: rr.push(trules.copy_diag(x))
+      l.rules[k + ""] = rr
+    for k, v in p.rules_ok: l.rules_ok[k + ""] = v
+    for k, v in p.fkeys: l.fkeys[k + ""] = v + ""
+    nc.last = l
+    let tmp = pg.cache + ".tmp{lcache.now_ns(ffi)}"
+    fs.write(tmp, to_json(nc)) else 0
+    fs.rename(tmp, pg.cache) else 0
 
 # A path's place in tsc's directory walk (matchFiles: a folder's files, sorted, before its folders,
 # sorted), as parts to compare in order

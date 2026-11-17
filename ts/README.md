@@ -661,6 +661,55 @@ now use lists the walk fills; the per-file tables of the new rules; the `new Arr
 on calls), vscode/src/vs/editor/common 338.0M against 335.1M (+0.9%). With only exhaustive-deps on, mantine
 takes 0.31 s of CPU (0.27 s with no rules) against oxlint's 0.25 s (0.23 s).
 
+### The type check's cache (2026-11-16)
+
+With `VLINT_VTSC=1`, vlint keeps what the type check found, in `$XDG_CACHE_HOME/vlint/vtsc-files`
+(`~/.cache/...`; `VLINT_VTSC_CACHE=0` turns it off), so a run where little changed checks little:
+
+- Each file of a program has a key: a hash of its path, its source and what its imports resolved
+  to, summed over everything it imports all the way down, with the hashes of whatever declares
+  globals (lib files, scripts, `declare global`, module augmentations), the compiler options, the
+  lib folder, its rule list and the vlint executable (`tsprog.file_keys`). A file whose key is in
+  the cache isn't checked: vtsc still reads and binds the program (about 0.2-0.4 s for n8n's
+  packages), checks the files whose keys changed and takes the rest's errors, rules' diagnostics
+  and reasons for not checking from the cache. What a file's check found in another file (a
+  construct vtsc doesn't model) is kept with it and applied again.
+- tsgolint's results for the files vtsc leaves to it are kept by the same keys, per rule list, so
+  tsgolint runs only for those whose keys changed (none: it doesn't start). A message about no file
+  turns this off for the folder.
+- When the options, the file list and every file and folder the last run looked at (their
+  modification and change times, sizes and inodes) are as they were, the last run's result is the
+  answer without reading a file. A file changed less than 2 s before the run's end isn't trusted
+  that way (as git's index treats racy files); its key decides next time.
+- With at most 16 changes since the last run, one worker checks instead of one per core (the
+  others' parse is all they'd do).
+
+Checked: a run with the cache prints the same as one without it after each of 155 random edits to
+a copy of `@n8n/workflow-sdk` (adding type errors, widening and narrowing declared types, adding
+imports, adding and removing files, touching files and doing nothing, in sequence; tsgolint left
+out there, since it runs out of memory on the copy). Over the 33 n8n packages, `--type-aware
+--type-check`, default configuration (`hyw.sh`): every line equal to oxlint's, the first run and
+the second.
+
+| | oxlint | first run | next run |
+|---|---|---|---|
+| 22 smaller packages (total) | 20.5 s | 11.2 s | 0.7 s |
+| `@n8n/api-types` (608 of 704 files vtsc's) | 6.86 s | 7.30 s | 0.15 s |
+| `core` (164 of 286) | 3.90 s | 6.19 s | 0.11 s |
+| `@n8n/workflow-sdk` | 2.37 s | 2.85 s | 0.11 s |
+| `frontend/@n8n/composables` | 2.68 s | 3.85 s | 0.03 s |
+| `@n8n/node-cli`, `@n8n/eslint-config` (no TypeScript 7 lib: all tsgolint's) | 0.93, 0.91 s | 0.86, 0.74 s | 0.88, 0.86 s |
+
+After an edit to one file of `@n8n/workflow-sdk` (the copy), the type check takes 0.4-1.0 s
+against about 1.0 s without the cache (vtsc's part only; oxlint takes 2.4 s for the package each
+time). A first run is still slower than oxlint where vtsc leaves files to tsgolint: both run, and
+tsgolint's cost is mostly its program, not the files. On this two-core machine, starting tsgolint
+beside vtsc (`VLINT_VTSC_SPECULATE=1`) is slower again (`core` 6.7 s, `@n8n/api-types` 10.6 s).
+
+Also: a statement past 400,000 type instantiations (was 1,000,000) leaves its file to tsgolint; the
+most n8n's checked statements need is 390,000, and reaching the limit took up to 1.6 s
+(`core`'s `supply-data-context.ts`, lodash's `get`), so `core`'s check went from 2.8 s to 1.5 s.
+
 ## Install
 
 ```sh

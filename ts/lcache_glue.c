@@ -28,6 +28,27 @@ bool vl_stat(const vu_str *path, int64_t *out, int64_t n) {
   return true;
 }
 
+// A file's or folder's modification time (ns) mixed with its size and inode, 0 when it isn't there.
+int64_t vl_stat_any(const vu_str *path) {
+  char buf[4096];
+  char *p = buf;
+  if (path->len >= (int64_t)sizeof buf) { p = vu_cstr(path); if (!p) return 0; }
+  else {
+    if (memchr(path->data, 0, (size_t)path->len)) return 0;
+    memcpy(buf, path->data, (size_t)path->len);
+    buf[path->len] = 0;
+  }
+  struct stat st;
+  int r = stat(p, &st);
+  if (p != buf) free(p);
+  if (r != 0) return 0;
+  uint64_t h = (uint64_t)st.st_mtim.tv_sec * 1000000000u + (uint64_t)st.st_mtim.tv_nsec;
+  h = h * 0x9E3779B97F4A7C15u ^ (uint64_t)st.st_size;
+  h = h * 0x9E3779B97F4A7C15u ^ (uint64_t)st.st_ino;
+  h = h * 0x9E3779B97F4A7C15u ^ ((uint64_t)st.st_ctim.tv_sec * 1000000000u + (uint64_t)st.st_ctim.tv_nsec);
+  return (int64_t)(h | 1);
+}
+
 int64_t vl_now_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
