@@ -1,0 +1,11 @@
+export {};
+const x = [1] as const satisfies number[];
+const y: number[] = [1] as const;
+const z = { e: [1, 2] } as const satisfies { e?: any[] };
+const z2: string = z;
+const w = { e: [1, 2] } as const satisfies { e?: readonly any[] };
+const w2: string = w;
+const v = { e: { f: [1] } } as const satisfies { e: { f: number[] } | string };
+const v2: string = v;
+const u = [[1]] as const satisfies number[][];
+const u2: string = u;

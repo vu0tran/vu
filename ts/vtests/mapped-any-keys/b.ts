@@ -1,0 +1,17 @@
+import { Bad } from "nope";
+type B = typeof Bad;
+type M1 = { [K in B]: number };
+declare const m1: M1;
+export const a1: string = m1.foo;
+export const a1b: string = m1;
+type M2 = { [K in any]?: number };
+declare const m2: M2;
+export const a2: string = m2.foo;
+export const a2b: string = m2;
+type M3<T> = { [K in T & string]: T };
+declare const m3: M3<B>;
+export const a3: string = m3.foo;
+type I = { a: 1 } & { [K in B]?: unknown };
+declare const m4: { [k in keyof I]: I[k] };
+export const a4: number = m4.a;
+export const a5: number = m4.zz;

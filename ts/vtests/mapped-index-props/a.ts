@@ -1,0 +1,20 @@
+export {};
+type X = { a: 1; [x: string]: unknown };
+declare const m: { [k in keyof X]: X[k] };
+export const a1: string = m.a;
+export const a2: string = m.zz;
+type Y = { a: 1 } & { [x: string]: number };
+declare const y: { [k in keyof Y]: Y[k] };
+export const b1: string = y.a;
+export const b2: string = y.q;
+type Z = { b: 2 } & { c: 3 };
+declare const z: { [k in keyof Z]?: Z[k] };
+export const c1: string = z.b;
+class P { private p = 1; q = 2; [k: string]: number }
+declare const pp: { [k in keyof P]: P[k] };
+export const d1: string = pp.q;
+export const d2: string = pp.p;
+type N = { 0: "z"; [x: number]: string };
+declare const nn: { [k in keyof N]: k };
+export const e1: number = nn[0];
+export const e2: number = nn[1];

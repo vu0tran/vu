@@ -1,0 +1,18 @@
+import { Bad } from "nope";
+type B = typeof Bad;
+declare const x1: undefined extends B ? 1 : 2;
+export const a1: string = x1;
+type C<T> = undefined extends T ? 1 : 2;
+declare const x2: C<B>;
+export const a2: string = x2;
+type D<T> = { [k in keyof T]: undefined extends T[k] ? k : never };
+declare const x3: D<{ i: B }>;
+export const a3: string = x3.i;
+type E<T> = { [k in keyof T]: undefined extends T[k] ? k : never }[keyof T];
+declare const x4: E<{ i: B }>;
+export const a4: string = x4;
+declare const x5: { i: B }["i"];
+export const a5: string = x5;
+type F<T> = undefined extends T[keyof T] ? 1 : 2;
+declare const x6: F<{ i: B }>;
+export const a6: string = x6;
