@@ -6459,6 +6459,8 @@ fn literal_of_ctx(var c: C, lit: Int, ctx: Int) -> Bool:
       if k != TK_TPARAM and literal_of_ctx(&c, lit, b): return true
       for bm in types.parts(c, b):
         let bk = c.tk[bm]
+        # (keyof T's base constraint: string | number | symbol)
+        if bk == types.TK_KEYOF and (lk == TK_STRLIT or lk == TK_NUMLIT): return true
         if lk == TK_STRLIT and (bk == TK_STRING or bk == TK_STRLIT): return true
         if lk == TK_NUMLIT and (bk == TK_NUMBER or bk == TK_NUMLIT): return true
         if lk == TK_BIGLIT and (bk == TK_BIGINT or bk == TK_BIGLIT): return true
@@ -9731,7 +9733,19 @@ fn array_assign(var c: C, n: Int, l: Int, r: Int) -> Int:
     c.objs[c.ta[ctx]].args.push(tt)
     c.objs[c.ta[ctx]].eflags.push(0)
   let rt = check_expr(&c, r, ctx)
-  if is_any(c, rt): return rt
+  if c.tk[rt] == TK_UNSUP: return rt
+  if is_any(c, rt):
+    # (each target assigned any: its declared type from here)
+    for i in 0..els.len:
+      let key = ref_key(&c, els[i])
+      if key == "": continue
+      forget(&c, key)
+      if c.tk[targets[i]] == TK_ERROR: continue
+      let an = assigned_narrow(&c, targets[i], rt)
+      set_narrow(&c, key, an)
+      note_assigned(&c, key, targets[i], rt)
+      rec_try(&c, key)
+    return rt
   if c.tk[rt] != TK_OBJ: return unsup(&c, n, "a destructuring assignment")
   let ro = c.ta[rt]
   let tup = c.objs[ro].kind == OK_TUPLE
@@ -13696,7 +13710,77 @@ fn check_loop(var c: C, n: Int):
     # (after the loop: what it was before, or an element)
     set_narrow(&c, fk, post)
     return
+  # for ([a, b] of xs) over variables declared before: each element assigned to its variable
+  if k == ast.N_FORIN and c.t.nd[n].f == 1 and c.t.nd[c.t.nd[n].a].k == ast.N_ARRAY:
+    var posts: [Int] = []
+    if not forin_pattern(&c, n, &posts): return
+    check_loop0(&c, n)
+    var pr: [Int] = []
+    for x in c.forin_pat[n]: pr.push(x)
+    var j = 0
+    while j < pr.len:
+      set_narrow(&c, "{pr[j]}", posts[j / 2])
+      j += 2
+    return
   check_loop0(&c, n)
+
+# for ([a, b] of xs), a and b lets or vars with declared types, the body not assigning them: as
+# forin_existing for each, from the iterated type's element (any, an array's element or a fixed
+# tuple's). posts: each one's type after the loop.
+fn forin_pattern(var c: C, n: Int, var posts: [Int]) -> Bool:
+  let left = c.t.nd[n].a
+  let els = kids(c, c.t.nd[left].a)
+  var syms: [Int] = []
+  for e in els:
+    if c.t.nd[e].k != ast.N_ID:
+      unsup(&c, n, "a for loop over an existing pattern")
+      return false
+    let s = bind.lookup_value(&c, e, c.t.nd[e].s)
+    if s < 0 or (c.sk[s] & S_CONST) != 0 or not ((c.sk[s] & S_LET) != 0 or (c.sk[s] & types.S_VAR) != 0) or types.has_int(syms, s):
+      unsup(&c, n, "a for loop over an existing pattern")
+      return false
+    syms.push(s)
+  var asg: [Str] = []
+  assigned_in(&c, c.t.nd[n].c, &asg)
+  for s in syms:
+    for a0 in asg:
+      if a0 == "{s}":
+        unsup(&c, n, "a for loop over an existing variable the body assigns")
+        return false
+  let et0 = check_expr(&c, c.t.nd[n].b, -1)
+  c.forin_t[n] = et0
+  let el = element_type(&c, et0, c.t.nd[n].b)
+  if el < 0 or c.tk[el] == TK_UNSUP:
+    unsup(&c, n, "a for loop over an existing pattern")
+    return false
+  var pr: [Int] = []
+  for i in 0..syms.len:
+    let s = syms[i]
+    let dt = bind.type_of_sym(&c, s)
+    if dt < 0 or dt == c.auto_t or c.tk[dt] == TK_UNSUP:
+      unsup(&c, n, "a for loop over an existing pattern")
+      return false
+    var eti = -1
+    if c.tk[el] == TK_ANY: eti = c.any_t
+    elif c.tk[el] == TK_OBJ and rel.is_array_ref(&c, el): eti = c.objs[c.ta[el]].args[0]
+    elif c.tk[el] == TK_OBJ and c.objs[c.ta[el]].kind == OK_TUPLE and not bind.tuple_has_rest(c, el) and i < c.objs[c.ta[el]].args.len and c.objs[c.ta[el]].eflags[i] == 0: eti = c.objs[c.ta[el]].args[i]
+    if eti < 0 or c.tk[eti] == TK_UNSUP or not rel.assignable(&c, eti, dt):
+      unsup(&c, n, "a for loop over an existing pattern")
+      return false
+    let red = assigned_narrow(&c, dt, eti)
+    let key = "{s}"
+    var pre = narrowed(c, key)
+    if pre == -7:
+      unsup(&c, n, "a variable assigned in a loop, a try or a switch")
+      return false
+    if pre < 0: pre = dt
+    let post = types.union_of(&c, [pre, red])
+    if same_members(c, post, dt): posts.push(-9)
+    else: posts.push(post)
+    pr.push(s)
+    pr.push(red)
+  c.forin_pat[n] = pr
+  return true
 
 fn check_loop0(var c: C, n: Int):
   let k = c.t.nd[n].k
@@ -13709,6 +13793,13 @@ fn check_loop0(var c: C, n: Int):
       let fl = c.t.nd[n].a
       let fs = bind.lookup_value(&c, fl, c.t.nd[fl].s)
       set_narrow(&c, "{fs}", c.forin_var[n])
+    if n in c.forin_pat:
+      var pr0: [Int] = []
+      for x in c.forin_pat[n]: pr0.push(x)
+      var j0 = 0
+      while j0 < pr0.len:
+        set_narrow(&c, "{pr0[j0]}", pr0[j0 + 1])
+        j0 += 2
   if k == ast.N_FOR:
     let init = c.t.nd[n].a
     if init >= 0:
@@ -13722,7 +13813,7 @@ fn check_loop0(var c: C, n: Int):
       let ef0 = enclosing_fn(c, n)
       if ef0 >= 0 and (c.t.nd[ef0].f & ast.M_ASYNC) == 0: unsup(&c, n, "for await outside an async function")
       if c.t.nd[left].k != ast.N_VAR: unsup(&c, n, "for await over an existing variable")
-    if c.t.nd[left].k != ast.N_VAR and c.t.nd[left].k != ast.N_ID:
+    if c.t.nd[left].k != ast.N_VAR and c.t.nd[left].k != ast.N_ID and not (n in c.forin_pat):
       unsup(&c, n, "a for loop over an existing variable")
       if scoped: c.narrow.pop()
       return
