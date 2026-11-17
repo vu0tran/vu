@@ -104,23 +104,67 @@ fn plan_lint(fs: Fs, os: Os, ffi: Ffi, files: [Str], sets: [Str]) -> Plan:
       tcs.push(tc + "")
       tc_files[tc] = []
     tc_files[tc].push(f + "")
+  # the programs' files from their configs first (the inferred program's are those no tsconfig
+  # has, or that tsconfig leaves out), then every program checked at once, each in its worker
+  var jobs: [Job] = []
+  var job_of: {Str: Int} = {}
+  var libs: {Str: Str} = {}
+  var unm_set: {Str: Bool} = {}
+  for f in unm: unm_set[f] = true
+  for tc in tcs:
+    let lib = lib_for(fs, os, ffi, tsconf.dirname(tc))
+    libs[tc] = lib + ""
+    let cf = tsprog.read_config(fs, os, tc)
+    var mem: {Str: Bool} = {}
+    for f in cf.files: mem[f] = true
+    let mok = cf.err == "" and (lib != "" or keys_on(os))
+    var nonmem0 = false
+    for f in tc_files[tc]:
+      if not (f in mem): nonmem0 = true
+    var refd0: {Str: Bool} = {}
+    if nonmem0 and mok:
+      let cfg0 = tsconf.read(fs, tc)
+      var rseen0: {Str: Bool} = {}
+      rseen0[tc] = true
+      var rl0: [tsconf.Ref] = []
+      tsconf.read_refs(fs, cfg0.refs, &rseen0, &rl0)
+      for rf in rl0:
+        for x in rf.files: refd0[x] = true
+    for f in tc_files[tc]:
+      if not (f in mem) and mok and not (f in refd0) and not (f in unm_set):
+        unm_set[f] = true
+        unm.push(f + "")
+    if lib == "" and keys_on(os):
+      job_of[tc] = jobs.len
+      jobs.push(Job("project", tc + "", [], "-", {}))
+    elif lib != "":
+      var tl: {Str: Str} = {}
+      for f in tc_files[tc]:
+        if f in lint: tl[f] = lint[f] + ""
+      job_of[tc] = jobs.len
+      jobs.push(Job("project", tc + "", [], lib + "", tl))
+  var inf_job = -1
+  if unm.len > 0 and os.env("VLINT_VTSC_INFERRED") != "0":
+    let ij = inferred_job(fs, os, ffi, unm, lint)
+    if ij.kind != "":
+      inf_job = jobs.len
+      jobs.push(ij)
+  let t00 = os.clock()
+  var outs = run_jobs(fs, os, ffi, jobs)
   for tc in tcs:
     let t0 = os.clock()
-    let lib = lib_for(fs, os, ffi, tsconf.dirname(tc))
+    let lib = libs[tc] + ""
     var p = tsprog.Proj(false, "", [], {}, {}, {})
     if lib == "" and keys_on(os):
       # (the program's files and their keys, for tsgolint's cache; none checked)
-      p = run_program(fs, os, ffi, "project", tc, [], "-", {})
+      p = take_out(&outs, job_of[tc])
       if p.err == "": p.err = "no TypeScript 6 or 7 lib files"
     elif lib == "":
       p.err = "no TypeScript 6 or 7 lib files"
       let cf = tsprog.read_config(fs, os, tc)
       for f in cf.files: p.members[f] = true
     else:
-      var tl: {Str: Str} = {}
-      for f in tc_files[tc]:
-        if f in lint: tl[f] = lint[f] + ""
-      p = run_program(fs, os, ffi, "project", tc, [], lib, tl)
+      p = take_out(&outs, job_of[tc])
     for i in 0..p.files.len: pl.pidx[p.files[i]] = i
     for k, v in p.fkeys: pl.fkeys[k + ""] = v + ""
     var ncov = 0
@@ -142,7 +186,10 @@ fn plan_lint(fs: Fs, os: Os, ffi: Ffi, files: [Str], sets: [Str]) -> Plan:
         for x in rf.files: refd[x] = true
     for f in tc_files[tc]:
       if not (f in p.members):
-        if p.members_ok and not (f in refd) and (p.err != "no TypeScript 6 or 7 lib files" or keys_on(os)): unm.push(f + "")
+        if p.members_ok and not (f in refd) and (p.err != "no TypeScript 6 or 7 lib files" or keys_on(os)):
+          if not (f in unm_set):
+            unm_set[f] = true
+            unm.push(f + "")
         elif dbg2: eprint("vlint: vtsc: NOT {f}: not in {tc}")
         continue
       pl.gk[f] = tc + ""
@@ -174,8 +221,61 @@ fn plan_lint(fs: Fs, os: Os, ffi: Ffi, files: [Str], sets: [Str]) -> Plan:
       for f in tc_files[tc]:
         if f in pl.linted: nl += 1
       eprint("vlint: vtsc: {tc}: {ncov} of {tc_files[tc].len} files checked, {nl} linted, {p.ncached} from the cache, {(os.clock() - t0) * 1000.0:.0} ms{tail}")
-  if unm.len > 0 and os.env("VLINT_VTSC_INFERRED") != "0": plan_inferred(fs, os, ffi, unm, lint, debug, &pl)
+  if debug: eprint("vlint: vtsc: {jobs.len} programs at once, {(os.clock() - t00) * 1000.0:.0} ms")
+  if inf_job >= 0:
+    let ip = take_out(&outs, inf_job)
+    plan_inferred(fs, os, ffi, unm, lint, debug, ip, &pl)
   return pl
+
+# The inferred program's job ("" kind: none, no lib and no keys).
+fn inferred_job(fs: Fs, os: Os, ffi: Ffi, files: [Str], lint: {Str: Str}) -> Job:
+  let cwd = os.env("PWD")
+  var lib = lib_for(fs, os, ffi, cwd)
+  var tl: {Str: Str} = {}
+  if lib == "":
+    if not keys_on(os): return Job("", "", [], "", {})
+    # (keys only, for tsgolint's cache)
+    lib = "-"
+  else:
+    for f in files:
+      if f in lint: tl[f] = lint[f] + ""
+  var fl: [Str] = []
+  for f in files: fl.push(f + "")
+  return Job("inferred", cwd + "", fl, lib + "", tl)
+
+type JobOut:
+  i: Int
+  js: Str      # the program's check, as JSON
+
+fn job_bg(fs: Fs, os: Os, ffi: Ffi, own i: Int, own j: Job, own ch: Chan[JobOut]):
+  let js = run_program_js(fs, os, ffi, j.kind, j.at, j.files, j.lib, j.lint)
+  ch.send(JobOut(i, js))
+
+# The programs' checks at once (each in its own worker process), as JSON; one alone runs here.
+fn run_jobs(fs: Fs, os: Os, ffi: Ffi, jobs: [Job]) -> {Int: Str}:
+  var out: {Int: Str} = {}
+  if jobs.len == 1 or os.env("VLINT_VTSC_SERIAL") == "1":
+    for i in 0..jobs.len:
+      out[i] = run_program_js(fs, os, ffi, jobs[i].kind, jobs[i].at, jobs[i].files, jobs[i].lib, jobs[i].lint)
+    return out
+  let ch: Chan[JobOut] = chan(jobs.len + 1)
+  for i in 0..jobs.len:
+    var fl: [Str] = []
+    for f in jobs[i].files: fl.push(f + "")
+    var tl: {Str: Str} = {}
+    for k, v in jobs[i].lint: tl[k + ""] = v + ""
+    spawn job_bg(fs, os, ffi, i, Job(jobs[i].kind + "", jobs[i].at + "", fl, jobs[i].lib + "", tl), ch)
+  for _ in 0..jobs.len:
+    let r = ch.recv() else JobOut(-1, "")
+    if r.i >= 0: out[r.i] = r.js + ""
+  return out
+
+fn take_out(var outs: {Int: Str}, i: Int) -> tsprog.Proj:
+  let lost = tsprog.Proj(false, "vtsc: a program's check was lost", [], {}, {}, {})
+  if not (i in outs): return lost
+  let p = from_json(outs[i], tsprog.Proj) else tsprog.Proj(false, "vtsc: unreadable worker output", [], {}, {}, {})
+  outs.remove(i)
+  return p
 
 # What a vtsc worker is given: a tsconfig's program or the inferred one over files.
 type Job:
@@ -189,17 +289,23 @@ type Job:
 # running out of memory or of its CPU time ($VLINT_VTSC_CPU seconds, 600) leaves the program to
 # tsgolint instead of stopping vlint. VLINT_VTSC_INPROC=1 checks in this process.
 fn run_program(fs: Fs, os: Os, ffi: Ffi, kind: Str, at: Str, files: [Str], lib: Str, tl: {Str: Str}) -> tsprog.Proj:
+  let out = run_program_js(fs, os, ffi, kind, at, files, lib, tl)
+  let p = from_json(out, tsprog.Proj) else return tsprog.Proj(false, "vtsc: unreadable worker output", [], {}, {}, {})
+  return p
+
+# run_program's check as the worker's JSON.
+fn run_program_js(fs: Fs, os: Os, ffi: Ffi, kind: Str, at: Str, files: [Str], lib: Str, tl: {Str: Str}) -> Str:
   var fl: [Str] = []
   for f in files: fl.push(f + "")
   var tl2: {Str: Str} = {}
   for k, v in tl: tl2[k + ""] = v + ""
-  if os.env("VLINT_VTSC_INPROC") == "1": return work(fs, os, ffi, Job(kind + "", at + "", fl, lib + "", tl2))
+  if os.env("VLINT_VTSC_INPROC") == "1": return to_json(work(fs, os, ffi, Job(kind + "", at + "", fl, lib + "", tl2)))
   var failed = tsprog.Proj(false, "", [], {}, {}, {})
   let exe = lcache.realpath(ffi, "/proc/self/exe")
   if exe == "":
     failed.err = "vtsc: can't find vlint's own executable"
-    return failed
-  let dir = fs.temp_dir() else return tsprog.Proj(false, "vtsc: can't create a temporary folder", [], {}, {}, {})
+    return to_json(failed)
+  let dir = fs.temp_dir() else return to_json(tsprog.Proj(false, "vtsc: can't create a temporary folder", [], {}, {}, {}))
   let pj = dir + "/job.json"
   let po = dir + "/out.json"
   let pe = dir + "/err.txt"
@@ -220,9 +326,8 @@ fn run_program(fs: Fs, os: Os, ffi: Ffi, kind: Str, at: Str, files: [Str], lib: 
     elif errt != "": w = w + ": " + errt
     if os.env("VLINT_VTSC_DEBUG") != "": eprint("vlint: vtsc: {at}: {w}")
     failed.err = w
-    return failed
-  let p = from_json(out, tsprog.Proj) else return tsprog.Proj(false, "vtsc: unreadable worker output", [], {}, {}, {})
-  return p
+    return to_json(failed)
+  return out
 
 # The file cache's folder ($XDG_CACHE_HOME/vlint/vtsc-files, ~/.cache/...; "" none, or
 # VLINT_VTSC_CACHE=0): a checked file's results, by a key that changes with it and whatever it
@@ -260,20 +365,12 @@ fn is_js(f: Str) -> Bool:
 # in it, reported after the other programs'). A JavaScript file is covered when it's in the part of
 # JavaScript the checker types as TypeScript types it, and TypeScript reports nothing about it but
 # implicit anys and modules not found (any there too; no checkJs: tsgolint reports no errors for it).
-fn plan_inferred(fs: Fs, os: Os, ffi: Ffi, files: [Str], lint: {Str: Str}, debug: Bool, var pl: Plan):
+fn plan_inferred(fs: Fs, os: Os, ffi: Ffi, files: [Str], lint: {Str: Str}, debug: Bool, own p0: tsprog.Proj, var pl: Plan):
   let t0 = os.clock()
+  var p = p0
   let cwd = os.env("PWD")
-  var lib = lib_for(fs, os, ffi, cwd)
-  var tl: {Str: Str} = {}
-  if lib == "":
-    if not keys_on(os): return
-    # (keys only, for tsgolint's cache)
-    lib = "-"
-  else:
-    for f in files:
-      if f in lint: tl[f] = lint[f] + ""
-  var p = run_program(fs, os, ffi, "inferred", cwd, files, lib, tl)
-  if lib == "-" and p.err == "": p.err = "no TypeScript 6 or 7 lib files"
+  let lib = lib_for(fs, os, ffi, cwd)
+  if lib == "" and p.err == "": p.err = "no TypeScript 6 or 7 lib files"
   let dbg2 = os.env("VLINT_VTSC_DEBUG") == "2"
   var ncov = 0
   var why = ""
