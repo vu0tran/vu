@@ -710,6 +710,60 @@ Also: a statement past 400,000 type instantiations (was 1,000,000) leaves its fi
 most n8n's checked statements need is 390,000, and reaching the limit took up to 1.6 s
 (`core`'s `supply-data-context.ts`, lodash's `get`), so `core`'s check went from 2.8 s to 1.5 s.
 
+### More of n8n checked, and the second run everywhere (2026-11-17)
+
+Measured on the same two-core machine, oxlint 1.90.0 with tsgolint against `vlint` with
+`VLINT_VTSC=1`, `--type-aware --type-check`, default configuration (`hyw.sh`): every line equal to
+oxlint's in all 33 packages, the first run (cache cleared) and the second.
+
+| | oxlint | first run | next run |
+|---|---|---|---|
+| 22 smaller packages (total) | 20.96 s | 11.20 s | 0.67 s |
+| `core` (255 of 264 files vtsc's, was 164 of 286) | 4.24 s | 5.79 s | 0.13 s |
+| `@n8n/api-types` | 7.43 s | 5.71 s | 0.21 s |
+| `@n8n/workflow-sdk` | 2.51 s | 2.19 s | 0.12 s |
+| `@n8n/engine` (117 of 135, was 110) | 1.68 s | 1.35 s | 0.07 s |
+| `frontend/@n8n/composables` | 3.34 s | 4.58 s | 0.03 s |
+| `@n8n/ai-utilities` | 2.73 s | 2.87 s | 0.07 s |
+| `frontend/@n8n/stores`, `chat` | 1.39, 1.00 s | 1.82, 1.36 s | 0.03, 0.03 s |
+| `@n8n/node-cli`, `@n8n/eslint-config` (no TypeScript 6 or 7 lib) | 1.07, 0.81 s | 1.56, 1.01 s | 0.06, 0.15 s (were 0.88, 0.86 s) |
+| `frontend/@n8n/rest-api-client` | 1.08 s | 0.52 s | 0.03 s |
+
+A first run is still slower than oxlint where a package keeps files vtsc leaves to tsgolint
+(`core`'s 9 test files, `composables`' 2): tsgolint then loads the whole program as oxlint does,
+after vtsc's check. Every next run takes 0.03-0.21 s, 20-140 times less than oxlint.
+
+What changed:
+- **tsgolint's cache without a TypeScript 6 or 7 lib**: vtsc still finds such a program's files
+  and their keys (nothing checked), its own and the inferred program's, so tsgolint's results
+  are cached there too. Messages tsgolint reports outside the requested files (a template's
+  `tsconfig.json`) are kept for the whole set of files, under all their keys and those files'
+  contents, instead of turning the cache off. Checked on a copy of `node-cli`: after editing a
+  template's tsconfig, restoring it, editing a source file and editing an inferred-program file,
+  each run printed what oxlint printed.
+- **Instantiations cached by mapper** (a union, intersection, conditional type, indexed access,
+  keyof or template by the same interned mapper is the same instantiation): `core`'s check 2.2 s
+  to 1.5 s; inference into a recursive conditional type stops where tsc's `invokeOnce` does
+  (lodash's `get` with a contextual type went past the instantiation limit), 1.2 s.
+- **Errors vtsc missed, silently**: a `catch (e)` variable was `any` whatever
+  `useUnknownInCatchVariables` said; `get(o, ['a', 'b'])` (a literal in a tuple contextually
+  typed by type parameters constrained to `keyof`) picked lodash's `any` overload;
+  `[1] extends [infer A extends string]` took the true branch; `instanceof` never reported a
+  primitive left side (TS2358); `k in x` with `k` a constant didn't narrow; `[a] = anyValue`
+  kept `a`'s narrowing.
+- **Errors vtsc reported that tsc doesn't** (in files checked for the first time): the right side
+  of `&&` without the contextual type; object-literal methods with a `this` parameter (every
+  parameter implicitly `any`); `this` in an arrow function in a derived class's constructor
+  (TS17009); `x!` where `x` is only `null` by flow (tsc takes the declared type); a property
+  narrowed before its object was narrowed to an intersection; `break label` out of a labeled
+  block (now left unmodeled).
+- **Coverage**: assignments in conditional and logical expressions joined; `this as T` through a
+  mapped type; labeled `break`/`continue` to loops; for-of over existing variables in a pattern;
+  a union's generic methods (`(A[] | B[]).flatMap`); `instanceof` with an unresolved import or
+  generic construct signatures; a method call's `this` in an optional chain; properties
+  assigned in loops; package-declared iterators; `as const` with shorthand properties;
+  destructuring intersected tuples; `Exclude` over a union with a named member prints by it.
+
 ## Install
 
 ```sh
