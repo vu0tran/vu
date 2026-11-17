@@ -5852,12 +5852,33 @@ fn ctx_prop_list(var c: C, ctx: Int, name: Int) -> [Int]:
       if b >= 0 and b != m:
         for bt in ctx_prop_list(&c, b, name): ts.push(bt)
       continue
+    if c.tk[m] == TK_TPARAM:
+      # (a type parameter by its apparent type, its constraint: a literal property keeps its
+      # literal type when the constraint's property has literals)
+      let b = base_constraint(&c, m, 0)
+      if b >= 0 and b != m and c.tk[b] != TK_TPARAM:
+        for bt in ctx_prop_list(&c, b, name): ts.push(bt)
+      continue
     let mt = ctx_prop1(&c, m, name)
     if mt >= 0: ts.push(mt)
   return ts
 
 fn ctx_prop1(var c: C, m: Int, name: Int) -> Int:
   if c.tk[m] != TK_OBJ: return -1
+  if c.objs[c.ta[m]].kind == types.OK_MAPPED:
+    # getTypeOfPropertyOfContextualType: a generic mapped type (no as clause) whose keys'
+    # constraint takes the name, its template for the name
+    let mn = c.objs[c.ta[m]].node
+    if mn < 0 or c.t.nd[mn].b >= 0: return -1
+    let g = tyops.raw(&c, c.t.nd[c.t.nd[mn].a].a)
+    let k = bind.instantiate(&c, g, c.objs[c.ta[m]].mapper)
+    var b = tyops.base_of(&c, k, 0)
+    if b < 0: b = k
+    let lt = types.str_lit(&c, name, false)
+    if not rel.assignable(&c, lt, b): return -1
+    let r = tyops.mapped_at(&c, m, lt)
+    if r < 0 or c.tk[r] == TK_UNSUP: return -1
+    return r
   let ps = bind.get_prop(&c, m, name)
   if ps >= 0: return bind.type_of_sym(&c, ps)
   # (a numeric name: the number index signature, else the string one; findApplicableIndexInfo)
@@ -7931,6 +7952,7 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
     var seen_t: {Int: Bool} = {}
     infer_in(&c, c.sigs[sg].this_t, this_in, &inf, false, 0, c.sigs[sg].this_t, &seen_t)
   for pass in 0..2:
+    var const_seen: {Int: Bool} = {}
     for i in 0..args.len:
       let sens = context_sensitive(c, args[i])
       # (the first pass checks a context-sensitive object literal too, its context-sensitive
@@ -7991,12 +8013,18 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
       var rawp = raw_param_at(&c, sg, i)
       if i in rp_over: rawp = rp_over[i]
       var at = -1
-      if is_const_tp(c, rawp): at = const_arg(&c, args[i], rawp)
+      # (a const type parameter given by two arguments: their candidates combined, not modeled)
+      if is_const_tp(c, rawp) and rawp in const_seen: at = unsup(&c, args[i], "a const type parameter given by two arguments")
+      elif is_const_tp(c, rawp):
+        const_seen[rawp] = true
+        at = const_arg(&c, args[i], rawp)
       else:
         if any_const and could_contain_tvars(&c, rawp):
           let ak = c.t.nd[skip_parens(c, args[i])].k
-          if not (ak == ast.N_ID or ak == ast.N_PROPACCESS or ak == ast.N_ELEMACCESS or ak == ast.N_CALL or ak == ast.N_NEW or ak == ast.N_THIS):
+          # (a string or number literal: a const context changes nothing for it)
+          if not (ak == ast.N_ID or ak == ast.N_PROPACCESS or ak == ast.N_ELEMACCESS or ak == ast.N_CALL or ak == ast.N_NEW or ak == ast.N_THIS or ak == ast.N_STR or ak == ast.N_NUM or ak == ast.N_NOSUBTEMPL):
             at = unsup(&c, args[i], "an argument in a const type parameter's context inside a parameter type")
+          elif ak == ast.N_STR or ak == ast.N_NUM or ak == ast.N_NOSUBTEMPL: c.noshow_args[args[i]] = true
         if at < 0: at = check_expr(&c, args[i], pt)
       c.ret_mapper = saved_rm
       if pass == 1:
@@ -11729,6 +11757,119 @@ fn check_file(var c: C, root: Int):
     i += 1
   while c.narrow.len > saved: c.narrow.pop()
   if i == sts.len: check_declarations(&c, root)
+  if i == sts.len: targ_constraints(&c, root)
+
+# getResolvedApparentTypeOfMappedType: a homomorphic mapped type over T (no as clause) whose base
+# constraint is arrays or tuples, instantiated for that constraint; else t.
+fn mapped_apparent(var c: C, t: Int) -> Int:
+  if c.tk[t] != TK_OBJ or c.objs[c.ta[t]].kind != types.OK_MAPPED: return t
+  let mn = c.objs[c.ta[t]].node
+  if mn < 0 or c.t.nd[mn].b >= 0: return t
+  var cn = c.t.nd[c.t.nd[mn].a].a
+  while cn >= 0 and c.t.nd[cn].k == ast.N_TPAREN: cn = c.t.nd[cn].a
+  if cn < 0 or c.t.nd[cn].k != ast.N_TOP or c.t.nd[cn].f != scan.W_KEYOF: return t
+  let kr = tyops.raw(&c, cn)
+  let mm = c.objs[c.ta[t]].mapper
+  let kt = bind.instantiate(&c, kr, mm)
+  if c.tk[kt] != types.TK_KEYOF: return t
+  let tv = c.ta[kt]
+  if c.tk[tv] != TK_TPARAM: return t
+  let bc = tyops.base_of(&c, tv, 0)
+  if bc < 0: return t
+  for m in types.parts(c, bc):
+    if not (rel.is_array_ref(&c, m) or rel.is_readonly_array(&c, m) or (c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_TUPLE)): return t
+  let m1 = types.new_mapper(&c, [tv], [bc])
+  return bind.instantiate(&c, t, m1)
+
+# Each type parameter a conditional type around n checks (n in its true branch) mapped to its
+# intersection with the extends type (one without infer); -1 when there's none.
+fn implied_mapper(var c: C, n: Int) -> Int:
+  var from: [Int] = []
+  var to: [Int] = []
+  var ch = n
+  var p = bind.up(c, n)
+  while p >= 0:
+    let pk = c.t.nd[p].k
+    if pk == ast.N_TCOND and c.t.nd[p].c == ch:
+      var cn = c.t.nd[p].a
+      while c.t.nd[cn].k == ast.N_TPAREN: cn = c.t.nd[cn].a
+      if c.t.nd[cn].k == ast.N_TREF and c.t.nd[cn].b < 0 and c.t.nd[c.t.nd[cn].a].k == ast.N_ID and not has_infer(c, c.t.nd[p].b):
+        let ts = bind.lookup_type(&c, cn, c.t.nd[c.t.nd[cn].a].s)
+        if ts >= 0 and (c.sk[ts] & S_TPARAM) != 0:
+          let tp = c.sdtype[ts]
+          let et = bind.type_from(&c, c.t.nd[p].b)
+          if not types.has_int(from, tp):
+            from.push(tp)
+            to.push(types.inter_of(&c, [tp, et]))
+    if pk == ast.N_TYPEALIAS or pk == ast.N_INTERFACE or pk == ast.N_CLASS or pk == ast.N_FUNC: break
+    ch = p
+    p = bind.up(c, p)
+  if from.len == 0: return -1
+  return types.new_mapper(&c, from, to)
+
+fn has_infer(c: C, n: Int) -> Bool:
+  if n < 0 or n >= c.t.nd.len: return false
+  let k = c.t.nd[n].k
+  if k == ast.N_TINFER: return true
+  if k == ast.N_LIST:
+    for x in ast.items(c.t, n):
+      if has_infer(c, x): return true
+    return false
+  if k == ast.N_ID or k == ast.N_STR or k == ast.N_NUM: return false
+  for x in [c.t.nd[n].a, c.t.nd[n].b, c.t.nd[n].c]:
+    if x > 0 and has_infer(c, x): return true
+  return false
+
+# checkTypeArgumentConstraints for each type reference of the file with type arguments: each
+# argument assignable to its parameter's constraint (instantiated by the arguments), the first
+# that isn't reported (TS2344).
+fn targ_constraints(var c: C, root: Int):
+  let f = c.t.nd[root].file
+  var i = root - 1
+  while i >= 0 and c.t.nd[i].file == f: i -= 1
+  for n in i + 1..root:
+    if c.t.nd[n].k != ast.N_TREF: continue
+    let argl = c.t.nd[n].b
+    if argl < 0 or not (argl in c.targ_sym): continue
+    let s = c.targ_sym[argl]
+    let d = c.sdecl[s]
+    if d < 0: continue
+    let tl = c.t.nd[d].a
+    if tl < 0: continue
+    let tps = bind.tparam_types(&c, tl)
+    var any_con = false
+    for tp in tps:
+      if rel.constraint_of(&c, tp) >= 0: any_con = true
+    if not any_con: continue
+    let anodes = kids(c, argl)
+    let full = types.ints(c.targ_full[argl])
+    if full.len != tps.len: continue
+    let m = types.new_mapper(&c, tps, full)
+    for j in 0..tps.len:
+      let con = rel.constraint_of(&c, tps[j])
+      if con < 0: continue
+      let ci = bind.instantiate(&c, con, m)
+      if rel.assignable(&c, full[j], ci): continue
+      # (in a conditional type's true branch its check type parameter is constrained by the
+      # extends type too: getImpliedConstraint's substitution types)
+      let sm = implied_mapper(&c, n)
+      if sm >= 0:
+        let fs = bind.instantiate(&c, full[j], sm)
+        let cs = bind.instantiate(&c, ci, sm)
+        if rel.assignable(&c, fs, cs): continue
+      # (a homomorphic mapped type over an array or tuple constraint: by its apparent type)
+      let ma = mapped_apparent(&c, full[j])
+      if ma != full[j] and rel.assignable(&c, ma, ci): continue
+      # (with type parameters in it the relation isn't fully modeled: not reported)
+      if could_contain_tvars(&c, full[j]) or could_contain_tvars(&c, ci):
+        var why = ""
+        if c.debug or c.all_reasons:
+          let sa = show.show(&c, full[j])
+          let sb = show.show(&c, ci)
+          why = " [" + sa + "] [" + sb + "]"
+        bind.unsupported(&c, n, "a type argument that may not satisfy its constraint, with type parameters" + why)
+      elif j < anodes.len: rel.report(&c, full[j], ci, anodes[j], -1, 2344)
+      break
 
 # The types of a file's top-level variables and functions, without checking its statements (for
 # a worker whose own files import this one, which another worker checks).
