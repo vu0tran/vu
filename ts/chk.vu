@@ -814,6 +814,14 @@ fn param_type(var c: C, p: Int) -> Int:
     return t
   # contextually typed parameters get their type when their function is checked
   if p in c.ptype_ctx: return c.ptype_ctx[p]
+  # (a JavaScript function declaration's pattern without a type or default: the type it implies)
+  if c.t.nd[p].c < 0 and c.t.nd[c.t.nd[p].a].k != ast.N_ID and js_node(c, p):
+    let fp = bind.up(c, p)
+    if fp >= 0 and c.t.nd[fp].k == ast.N_FUNC:
+      let ip = implied_pattern(&c, c.t.nd[p].a)
+      if ip >= 0:
+        c.ptype_ctx[p] = ip
+        return ip
   if c.t.nd[p].c >= 0:
     let g1_1 = check_expr(&c, c.t.nd[p].c, -1)
     let w1 = widen(&c, g1_1)
@@ -9176,6 +9184,8 @@ fn inf_mapper(var c: C, var inf: Inf, sg: Int) -> Int:
       t = common_subtype(&c, inf.contra[i])
     else:
       t = c.unknown_t
+      # (in a JavaScript file: any, getDefaultTypeArgumentType's AnyDefault)
+      if c.cur_expr >= 0 and js_node(c, c.cur_expr): t = c.any_t
       # (no inferences: the type parameter's default, in terms of the ones before it)
       let tsym = c.ta[tp]
       let td = c.sdecl[tsym]
@@ -10874,6 +10884,8 @@ fn binary1(var c: C, n: Int, ctx: Int) -> Int:
     return logical_reduce(&c, uq)
   if op == scan.T_COMMA:
     check_expr(&c, l, -1)
+    # (TS2695: a left side without effects, unless (0, a.b)(...) or (0, eval)(...))
+    if not c.allow_unreach and side_effect_free(c, l) and not indirect_call(c, n): err(&c, l, 2695, "Left side of comma operator is unused and has no side effects.")
     return check_expr(&c, r, ctx)
   let lt = check_expr(&c, l, -1)
   let rt = check_expr(&c, r, -1)
@@ -11807,6 +11819,10 @@ fn check_stmt(var c: C, n: Int):
     # (getEffectsSignature: an assertion call's callee is a dotted name with an explicit type;
     # else tsc reports TS2775/TS2776, which this checker doesn't)
     if c.t.nd[ce].k == ast.N_CALL and dotted_explicit_type(&c, c.t.nd[ce].a, 0) < 0 and ce in c.resolved_sig and assertion_sig(c, c.resolved_sig[ce]):
+      # (not a dotted name at all, (0, f)(x): no effects, and TS2776)
+      if not is_dotted_name(c, c.t.nd[ce].a):
+        if not js_node(c, ce): err(&c, c.t.nd[ce].a, 2776, "Assertions require the call target to be an identifier or qualified name.")
+        return
       unsup(&c, ce, "an assertion call whose callee isn't a dotted name with explicit types")
       return
     if c.t.nd[ce].k == ast.N_CALL and dotted_explicit_type(&c, c.t.nd[ce].a, 0) >= 0:
@@ -11871,6 +11887,13 @@ fn check_stmt(var c: C, n: Int):
       if c.t.nd[c.t.nd[p].a].k != ast.N_ID:
         # (with an initializer: its type, padded with the pattern's properties)
         if c.t.nd[p].b < 0 and c.t.nd[p].c < 0:
+          # (JavaScript: the type the pattern implies, its elements any; TypeScript's TS7031s
+          # aren't modeled)
+          if js_node(c, p):
+            let ip = implied_pattern(&c, c.t.nd[p].a)
+            if ip >= 0:
+              c.ptype_ctx[p] = ip
+              continue
           unsup(&c, p, "a destructuring parameter without a type")
           return
         if c.t.nd[p].b < 0: pattern_init_check(&c, p)
@@ -12284,6 +12307,11 @@ fn this_type_from(var c: C, n: Int, x0: Int) -> Int:
         if x in c.meth_this: return c.meth_this[x]
         var lctx = -1
         if cls in c.lit_ctx: lctx = c.lit_ctx[cls]
+        # (none: the literal's own type, widened, once it has one)
+        if lctx < 0 and cls in c.ntype and c.tk[c.ntype[cls]] != TK_UNSUP: return widen(&c, c.ntype[cls])
+        # (JavaScript, the literal still being typed, this only an argument of a call whose value
+        # is dropped: what it reads as can't matter there)
+        if lctx < 0 and js_node(c, n) and this_dropped_arg(c, n): return c.any_t
         if lctx < 0: return unsup(&c, n, "this in an object literal's method without a contextual type")
         let tt = this_type_marker(&c, lctx)
         if tt >= 0: return tt
@@ -12311,10 +12339,143 @@ fn this_type_from(var c: C, n: Int, x0: Int) -> Int:
           let tk0 = c.t.nd[tg].k
           if (tk0 == ast.N_PROPACCESS or tk0 == ast.N_ELEMACCESS) and c.t.nd[tg].a in c.ntype:
             return widen(&c, c.ntype[c.t.nd[tg].a])
+      # (a JavaScript function that assigns no this.x (not a constructor function): any)
+      if js_node(c, n) and not assigns_this_prop(c, c.t.nd[x].d): return c.any_t
       return unsup(&c, n, "this outside a class")
     if k == ast.N_CLASSEXPR: return unsup(&c, n, "this outside a class")
     x = bind.up(c, x)
+  # (a JavaScript file's top level: typeof globalThis, whose members read as any; tsc's helpers,
+  # this && this.__decorate)
+  if js_node(c, n) and top_this_member(c, n): return c.any_t
   return unsup(&c, n, "this outside a class")
+
+# A JavaScript this.x property's type (getWidenedTypeForAssignmentDeclaration): the constructor's
+# assignments' types where one isn't null or undefined, else all of them; with undefined when only
+# methods assign it; widened ([] is any[], only null or undefined is any).
+fn js_this_type(var c: C, s: Int) -> Int:
+  let xs = types.ints(c.js_this[s])
+  var ctor_ts: [Int] = []
+  var all_ts: [Int] = []
+  var in_ctor = false
+  let dlen = c.diags.len
+  for x0 in xs:
+    var x = x0
+    let cx = x0 < 0
+    if cx: x = -x0 - 1
+    let r = skip_parens(c, c.t.nd[x].b)
+    var rt = -1
+    if c.t.nd[r].k == ast.N_ARRAY and ast.count(c.t, c.t.nd[r].a) == 0: rt = bind.array_of(&c, c.any_t)
+    else:
+      let saved = c.cur_expr
+      rt = check_expr(&c, r, -1)
+      c.cur_expr = saved
+    while c.diags.len > dlen: c.diags.pop()
+    if c.tk[rt] == TK_UNSUP: return rt
+    rt = widen(&c, rt)
+    all_ts.push(rt)
+    if cx:
+      in_ctor = true
+      ctor_ts.push(rt)
+  var src = all_ts
+  var ctor_real = false
+  for t in ctor_ts:
+    for mi_ in 0..types.nmem(c, t):
+      let mk = c.tk[types.mem(c, t, mi_)]
+      if mk != TK_NULL and mk != TK_UNDEF: ctor_real = true
+  if ctor_real: src = ctor_ts
+  var u = types.union_of(&c, src)
+  var all_null = true
+  for mi_ in 0..types.nmem(c, u):
+    let mk = c.tk[types.mem(c, u, mi_)]
+    if mk != TK_NULL and mk != TK_UNDEF: all_null = false
+  if all_null: u = c.any_t
+  elif not in_ctor: u = types.union_of(&c, [u, c.undef_t])
+  if s in c.js_this_base:
+    let bsym = c.js_this_base[s]
+    let bt = bind.type_of_sym(&c, bsym)
+    if u != bt and rel.identical(&c, u, bt, 0) != 1: return unsup(&c, 0, "a JavaScript class assigning an inherited property")
+    return bt
+  return u
+
+fn side_effect_free(c: C, e0: Int) -> Bool:
+  var e = e0
+  while c.t.nd[e].k == ast.N_PAREN: e = c.t.nd[e].a
+  let k = c.t.nd[e].k
+  if k == ast.N_ID or k == ast.N_STR or k == ast.N_REGEX or k == ast.N_TAGGED or k == ast.N_TEMPL or k == ast.N_NOSUBTEMPL or k == ast.N_NUM or k == ast.N_BIGINT or k == ast.N_TRUE or k == ast.N_FALSE or k == ast.N_NULL or k == ast.N_FUNCEXPR or k == ast.N_CLASSEXPR or k == ast.N_ARROW or k == ast.N_ARRAY or k == ast.N_OBJECT or k == ast.N_TYPEOF or k == ast.N_NONNULL or k == ast.N_JSX or k == ast.N_JSXELEM: return true
+  if k == ast.N_COND: return side_effect_free(c, c.t.nd[e].b) and side_effect_free(c, c.t.nd[e].c)
+  if k == ast.N_BINARY:
+    let op = c.t.nd[e].f
+    if parse.is_assign_op(op): return false
+    return side_effect_free(c, c.t.nd[e].a) and side_effect_free(c, c.t.nd[e].b)
+  if k == ast.N_PREFIX or k == ast.N_POSTFIX:
+    let op2 = c.t.nd[e].f
+    return op2 == scan.T_BANG or op2 == scan.T_PLUS or op2 == scan.T_MINUS or op2 == scan.T_TILDE
+  return false
+
+fn indirect_call(c: C, n: Int) -> Bool:
+  let l = c.t.nd[n].a
+  if c.t.nd[l].k != ast.N_NUM or c.t.names[c.t.nd[l].s] != "0": return false
+  let p = c.parent[n]
+  if p < 0 or c.t.nd[p].k != ast.N_PAREN: return false
+  let pp = c.parent[p]
+  if pp < 0: return false
+  let ppk = c.t.nd[pp].k
+  if not ((ppk == ast.N_CALL or ppk == ast.N_TAGGED) and c.t.nd[pp].a == p): return false
+  let r = c.t.nd[n].b
+  let rk = c.t.nd[r].k
+  return rk == ast.N_PROPACCESS or rk == ast.N_ELEMACCESS or (rk == ast.N_ID and c.t.names[c.t.nd[r].s] == "eval")
+
+# isDottedName: an identifier, this, super, or a property access of one (no parentheses)
+fn is_dotted_name(c: C, e: Int) -> Bool:
+  let k = c.t.nd[e].k
+  if k == ast.N_ID or k == ast.N_THIS or k == ast.N_SUPER or k == ast.N_METAPROP: return true
+  if k == ast.N_PROPACCESS: return is_dotted_name(c, c.t.nd[e].a)
+  return false
+
+fn this_dropped_arg(c: C, n: Int) -> Bool:
+  let l = c.parent[n]
+  if l < 0 or c.t.nd[l].k != ast.N_LIST: return false
+  let call = c.parent[l]
+  if call < 0 or c.t.nd[call].k != ast.N_CALL or c.t.nd[call].c != l: return false
+  let st = c.parent[call]
+  return st >= 0 and c.t.nd[st].k == ast.N_EXPRSTMT
+
+fn js_node(c: C, n: Int) -> Bool:
+  let f = c.t.nd[n].file
+  if f < 0 or f >= c.files.len: return false
+  let p = c.files[f]
+  return p.endswith(".js") or p.endswith(".cjs") or p.endswith(".mjs") or p.endswith(".jsx")
+
+# this used as `this` alone in a condition or as this.x (read): what globalThis gives as any
+fn top_this_member(c: C, n: Int) -> Bool:
+  let p = c.parent[n]
+  if p < 0: return false
+  let pk = c.t.nd[p].k
+  if pk == ast.N_PROPACCESS and c.t.nd[p].a == n:
+    let pp = c.parent[p]
+    if pp >= 0 and c.t.nd[pp].k == ast.N_BINARY and c.t.nd[pp].f == scan.T_ASSIGN and c.t.nd[pp].a == p: return false
+    return true
+  if pk == ast.N_BINARY and c.t.nd[p].f == scan.T_AND and c.t.nd[p].a == n: return true
+  return false
+
+fn assigns_this_prop(c: C, body: Int) -> Bool:
+  if body < 0: return false
+  var stack: [Int] = [body]
+  while stack.len > 0:
+    let x = stack.pop()
+    if x < 0 or x >= c.t.nd.len: continue
+    let k = c.t.nd[x].k
+    if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_CLASS or k == ast.N_CLASSEXPR: continue
+    if k == ast.N_BINARY and c.t.nd[x].f == scan.T_ASSIGN:
+      let l = c.t.nd[x].a
+      if (c.t.nd[l].k == ast.N_PROPACCESS or c.t.nd[l].k == ast.N_ELEMACCESS) and c.t.nd[c.t.nd[l].a].k == ast.N_THIS: return true
+    if k == ast.N_LIST:
+      for y in ast.items(c.t, x): stack.push(y)
+      continue
+    if k == ast.N_ID or k == ast.N_STR or k == ast.N_NUM: continue
+    for ch in [c.t.nd[x].a, c.t.nd[x].b, c.t.nd[x].c, c.t.nd[x].d]:
+      if ch > 0: stack.push(ch)
+  return false
 
 # ThisType<T> in a contextual type (a member of it, or of an intersection in it): T.
 fn this_type_marker(var c: C, t: Int) -> Int:
@@ -12466,17 +12627,23 @@ fn class_static(var c: C, s: Int) -> Int:
       var nta = 0
       let hh = c.t.nd[d].b
       if c.t.nd[hh].b >= 0: nta = ast.items(c.t, c.t.nd[hh].b).len
+      let hjs = bind.js_path(c, hh)
       for bsg in bind.ctor_sigs_mixed(&c, bt):
-        if c.sigs[bsg].tparams.len != nta: continue
+        let ntp0 = c.sigs[bsg].tparams.len
+        if ntp0 < nta: continue
         var cp = types.sig_copy(c, bsg)
-        if nta > 0:
-          # (extends f(x)<A>: the signature with those arguments)
+        if ntp0 > 0:
+          # (extends f(x)<A>: the signature with those arguments, then the defaults)
           var targs: [Int] = []
-          for x in ast.items(c.t, c.t.nd[hh].b): targs.push(bind.type_from(&c, x))
+          if c.t.nd[hh].b >= 0:
+            for x in ast.items(c.t, c.t.nd[hh].b): targs.push(bind.type_from(&c, x))
+          let full = bind.fill_ctor_targs(&c, bsg, targs, hjs)
+          if full.len != ntp0: continue
           let stps = types.ints(c.sigs[bsg].tparams)
-          let mp = types.new_mapper(&c, stps, targs)
+          let mp = types.new_mapper(&c, stps, full)
           let ms = bind.inst_sig(&c, bsg, mp)
           cp = types.sig_copy(c, ms)
+          cp.tparams = []
         let ns = types.new_sig(&c, cp.node)
         c.sigs[ns] = cp
         c.sigs[ns].ret = inst

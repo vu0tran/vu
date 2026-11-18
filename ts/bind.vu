@@ -2933,6 +2933,23 @@ fn ns_value_type(var c: C, s: Int) -> Int:
         # (an exported const is a read-only property)
         if (c.sk[rs] & S_CONST) != 0: c.sflags[rs] = c.sflags[rs] | types.SF_READONLY
         types.add_prop(&c, t, name, rs)
+    # (export { a as b } in it: what a names, a value, as b; events' EventEmitter.EventEmitter)
+    for st in ast.items(c.t, body):
+      if c.t.nd[st].k != ast.N_EXPORT or c.t.nd[st].a >= 0 or c.t.nd[st].b < 0: continue
+      if (c.t.nd[st].f & ast.M_TYPEONLY) != 0: continue
+      for sp in ast.items(c.t, c.t.nd[st].b):
+        if (c.t.nd[sp].f & ast.M_TYPEONLY) != 0: continue
+        let en = c.t.nd[sp].s
+        if en in c.objs[c.ta[t]].props: continue
+        var ln = en
+        var at = sp
+        if c.t.nd[sp].b >= 0:
+          ln = c.t.nd[c.t.nd[sp].b].s
+          at = c.t.nd[sp].b
+        let ls = lookup_value(&c, at, ln)
+        if ls < 0: continue
+        let rs2 = resolve_alias(&c, ls)
+        if rs2 >= 0 and (c.sk[rs2] & S_VALUE) != 0: types.add_prop(&c, t, en, rs2)
   c.objs[c.ta[t]].resolved = true
   return t
 
@@ -3234,6 +3251,7 @@ fn resolve_decl(var c: C, t: Int):
         if c.objs[o].nidx < 0:
           c.objs[o].nidx = index_type(&c, base, true)
           c.objs[o].nname = index_name(&c, base, true)
+      add_js_this_props(&c, t, d, s)
   # inherited members: from each base, what isn't declared here
   for d in types.sym_decls(c, s):
     if c.t.nd[d].k != ast.N_INTERFACE: continue
@@ -3421,12 +3439,20 @@ fn ctor_type_instance(var c: C, h: Int, vt: Int) -> Int:
     for x in ast.items(c.t, c.t.nd[h].b): targs.push(type_from(&c, x))
   if c.tk[vt] != TK_OBJ and c.tk[vt] != TK_INTER: return -1
   var r = -1
+  let hf = c.t.nd[h].file
+  var js = false
+  if hf >= 0 and hf < c.files.len:
+    let hp = c.files[hf]
+    js = hp.endswith(".js") or hp.endswith(".cjs") or hp.endswith(".mjs") or hp.endswith(".jsx")
   for sg in ctor_sigs_mixed(&c, vt):
     var rt = c.sigs[sg].ret
-    let ntp = c.sigs[sg].tparams.len
-    if ntp != targs.len: continue
+    let tps = types.ints(c.sigs[sg].tparams)
+    let ntp = tps.len
+    if targs.len > ntp: continue
+    let full = fill_ctor_targs(&c, sg, targs, js)
+    if full.len != ntp: continue
     if ntp > 0:
-      let m = types.new_mapper(&c, types.ints(c.sigs[sg].tparams), targs)
+      let m = types.new_mapper(&c, tps, full)
       rt = instantiate(&c, rt, m)
     if rt < 0 or not obj_like(c, rt): return -1
     if r >= 0 and rt != r:
@@ -3437,6 +3463,34 @@ fn ctor_type_instance(var c: C, h: Int, vt: Int) -> Int:
       continue
     r = rt
   return r
+
+# A construct signature's type arguments: those given, then the defaults, in terms of the ones
+# before them; in JavaScript, any where there's none (getInstantiatedConstructorsForTypeArguments).
+# Shorter than its type parameters when one can't be filled.
+fn fill_ctor_targs(var c: C, sg: Int, targs: [Int], js: Bool) -> [Int]:
+  let tps = types.ints(c.sigs[sg].tparams)
+  var full: [Int] = []
+  for x in targs: full.push(x)
+  for i in targs.len..tps.len:
+    let td = c.sdecl[c.ta[tps[i]]]
+    if td >= 0 and c.t.nd[td].k == ast.N_TPARAM and c.t.nd[td].b >= 0:
+      var pre: [Int] = []
+      var pto: [Int] = []
+      for j in 0..i:
+        pre.push(tps[j])
+        pto.push(full[j])
+      let dm = types.new_mapper(&c, pre, pto)
+      let dt0 = type_from(&c, c.t.nd[td].b)
+      full.push(instantiate(&c, dt0, dm))
+    elif js: full.push(c.any_t)
+    else: return full
+  return full
+
+fn js_path(c: C, n: Int) -> Bool:
+  let hf = c.t.nd[n].file
+  if hf < 0 or hf >= c.files.len: return false
+  let hp = c.files[hf]
+  return hp.endswith(".js") or hp.endswith(".cjs") or hp.endswith(".mjs") or hp.endswith(".jsx")
 
 # The construct signatures of a type; an intersection's are its members' in order, but a mixin
 # constructor's (new (...args: any[]) => X) are dropped and their return types mixed into the
@@ -3624,6 +3678,63 @@ fn self_type(var c: C, s: Int) -> Int:
   let tps = types.ints(c.objs[c.ta[dt]].tparams)
   if tps.len == 0: return dt
   return ref_of(&c, dt, tps)
+
+# A JavaScript class's this.x = v assignments in its constructor and methods (not static ones):
+# properties, where nothing declares x (bindThisPropertyAssignment); their types come from the
+# assignments (chk.js_this_type).
+fn add_js_this_props(var c: C, t: Int, d: Int, owner: Int):
+  let f = c.t.nd[d].file
+  if f < 0 or f >= c.files.len: return
+  let p = c.files[f]
+  if not (p.endswith(".js") or p.endswith(".cjs") or p.endswith(".mjs") or p.endswith(".jsx")): return
+  let o = c.ta[t]
+  var names: [Int] = []
+  var asg: {Int: [Int]} = {}
+  for m in ast.items(c.t, c.t.nd[d].d):
+    let mk = c.t.nd[m].k
+    if mk != ast.N_CTOR and mk != ast.N_METHOD and mk != ast.N_GET and mk != ast.N_SET: continue
+    if (c.t.nd[m].f & ast.M_STATIC) != 0: continue
+    let body = c.t.nd[m].c
+    if body < 0: continue
+    var stack: [Int] = [body]
+    while stack.len > 0:
+      let x = stack.pop()
+      if x <= 0 or x >= c.t.nd.len: continue
+      let k = c.t.nd[x].k
+      if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_CLASS or k == ast.N_CLASSEXPR or k == ast.N_METHOD: continue
+      if k == ast.N_BINARY and c.t.nd[x].f == scan.T_ASSIGN:
+        let l = c.t.nd[x].a
+        if c.t.nd[l].k == ast.N_PROPACCESS and c.t.nd[c.t.nd[l].a].k == ast.N_THIS:
+          let nm0 = c.t.nd[l].s
+          if not (nm0 in asg):
+            asg[nm0] = []
+            names.push(nm0)
+          # (the constructor's: marked by a negative id)
+          if mk == ast.N_CTOR: asg[nm0].push(-x - 1)
+          else: asg[nm0].push(x)
+      if k == ast.N_LIST:
+        for y in ast.items(c.t, x): stack.push(y)
+        continue
+      if k == ast.N_ID or k == ast.N_STR or k == ast.N_NUM: continue
+      for ch in [c.t.nd[x].a, c.t.nd[x].b, c.t.nd[x].c, c.t.nd[x].d]:
+        if ch > 0: stack.push(ch)
+  for nm1 in names:
+    var inh = -1
+    if nm1 in c.objs[o].props:
+      # (declared here: an assignment; inherited: a declaration of its own, whose type is the
+      # inherited one's where they're identical (else not modeled))
+      let ex = c.objs[o].props[nm1]
+      if c.sparent[ex] == owner: continue
+      inh = ex
+    let first = asg[nm1][0]
+    var fx = first
+    if fx < 0: fx = -fx - 1
+    let s = types.new_sym(&c, S_PROP, nm1, c.t.nd[fx].a)
+    c.sparent[s] = owner
+    c.sflags[s] = 0
+    c.js_this[s] = types.ints(asg[nm1])
+    if inh >= 0: c.js_this_base[s] = inh
+    types.add_prop(&c, t, nm1, s)
 
 # constructor(private x: number): parameter properties are instance properties.
 fn add_param_props(var c: C, t: Int, d: Int, owner: Int):
@@ -3957,6 +4068,11 @@ fn tmpl_index_plain(var c: C, t: Int, name: Int) -> Int:
 
 fn type_of_sym(var c: C, s: Int) -> Int:
   if c.stype[s] >= 0: return c.stype[s]
+  if s in c.js_this and c.stype[s] != -2:
+    c.stype[s] = -2
+    let jt = chk.js_this_type(&c, s)
+    c.stype[s] = jt
+    return jt
   if s in c.lazy_inst:
     let li = types.ints(c.lazy_inst[s])
     c.lazy_inst.remove(s)
