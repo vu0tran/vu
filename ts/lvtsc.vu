@@ -291,6 +291,19 @@ type JobOut:
 fn isolate(os: Os) -> Bool:
   return os.env("VLINT_VTSC_ISOLATE") == "1"
 
+fn copy_job(j: Job) -> Job:
+  var fl: [Str] = []
+  for f in j.files: fl.push(f + "")
+  var tl: {Str: Str} = {}
+  for k, v in j.lint: tl[k + ""] = v + ""
+  return Job(j.kind + "", j.at + "", fl, j.lib + "", tl)
+
+# Programs checked one after another, each with one worker.
+fn jobs_seq_bg(fs: Fs, os: Os, ffi: Ffi, own is: [Int], own js: [Job], own ch: Chan[JobOut]):
+  for k in 0..is.len:
+    if not isolate(os): ch.send(JobOut(is[k], "", work_n(fs, os, ffi, js[k], 1), true))
+    else: ch.send(JobOut(is[k], run_program_js_n(fs, os, ffi, js[k].kind, js[k].at, js[k].files, js[k].lib, js[k].lint, 1)))
+
 fn job_bg(fs: Fs, os: Os, ffi: Ffi, own i: Int, own j: Job, own ch: Chan[JobOut], nj: Int):
   if not isolate(os):
     ch.send(JobOut(i, "", work_n(fs, os, ffi, j, nj), true))
@@ -308,38 +321,33 @@ fn run_jobs(fs: Fs, os: Os, ffi: Ffi, jobs: [Job]) -> [JobOut]:
       else: out[i] = JobOut(i, run_program_js(fs, os, ffi, jobs[i].kind, jobs[i].at, jobs[i].files, jobs[i].lib, jobs[i].lint))
     return out
   let ch: Chan[JobOut] = chan(jobs.len + 1)
-  # (the cores shared out: one worker each, the rest to the tsconfigs' programs, so the programs
-  # together don't run more workers than there are cores)
-  # (a program's work guessed from its files: the lib's ~100 ms, then ~8 ms a file; the largest
-  # takes every core when the others together come to less than a fourth of it, else one each)
-  let cores = tsprog.cpu_count(fs)
-  var nj: [Int] = []
+  # (a program's work guessed from its files: the lib's ~100 ms, then ~8 ms a file. The largest
+  # gets a worker per core; the ones less than half of it are checked one after another in one
+  # task started first, the others in a task each. A task runs until it waits, so the small ones
+  # take one core while the largest one's workers share out its files as they come.)
   var big = 0
   var costs: [Int] = []
-  var sum = 0
   for i in 0..jobs.len:
-    nj.push(1)
     var n = jobs[i].files.len
     if jobs[i].lint.len > n: n = jobs[i].lint.len
     let cst = 100 + 8 * n
     costs.push(cst)
-    sum += cst
     if cst > costs[big]: big = i
-  var thr = int(os.env("VLINT_VTSC_THR")) else 30
-  if costs[big] * 10 > (sum - costs[big]) * thr: nj[big] = 0
-  # (a task runs until it waits: with the largest on every core, the smaller first, so they don't
-  # wait for one of its workers (which share out its files as they come); with one worker each,
-  # the largest first, the one the run waits for)
-  var ord: [Int] = []
-  for i in 0..jobs.len: ord.push(i)
-  let small_first = nj[big] == 0
-  ord.sort(by: fn(a, b) => (small_first and costs[a] < costs[b]) or (not small_first and costs[a] > costs[b]) or (costs[a] == costs[b] and a < b))
-  for i in ord:
-    var fl: [Str] = []
-    for f in jobs[i].files: fl.push(f + "")
-    var tl: {Str: Str} = {}
-    for k, v in jobs[i].lint: tl[k + ""] = v + ""
-    spawn job_bg(fs, os, ffi, i, Job(jobs[i].kind + "", jobs[i].at + "", fl, jobs[i].lib + "", tl), ch, nj[i])
+  var seq: [Int] = []
+  var rest: [Int] = []
+  for i in 0..jobs.len:
+    if i == big: continue
+    if costs[i] * 2 < costs[big] and os.env("VLINT_VTSC_SEQ") != "0": seq.push(i)
+    else: rest.push(i)
+  if seq.len > 0:
+    var sj: [Job] = []
+    var si: [Int] = []
+    for i in seq:
+      si.push(i)
+      sj.push(copy_job(jobs[i]))
+    spawn jobs_seq_bg(fs, os, ffi, si, sj, ch)
+  for i in rest: spawn job_bg(fs, os, ffi, i, copy_job(jobs[i]), ch, 1)
+  spawn job_bg(fs, os, ffi, big, copy_job(jobs[big]), ch, 0)
   for _ in 0..jobs.len:
     let r = ch.recv() else JobOut(-1, "")
     if r.i >= 0 and r.i < out.len:
