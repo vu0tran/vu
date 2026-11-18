@@ -721,7 +721,8 @@ second):
 | `@n8n/engine` (135 of 135, was 117) | 1.51 s | 0.53 s | 0.05 s |
 | `@n8n/api-types` | 7.47 s | 5.14 s | 0.17 s |
 | `workflow` | 3.92 s | 2.24 s | 0.08 s |
-| 21 other smaller packages | 0.3-2.7 s each | 2-4 times less | 0.01-0.07 s |
+| 20 other smaller packages | 0.3-2.7 s each | 2-4 times less | 0.01-0.05 s |
+| `@n8n/decorators` | 2.09 s | 1.97 s | 0.07 s |
 
 Still slower than oxlint on a first run: `frontend/@n8n/composables` (one Vue test file vtsc leaves
 to tsgolint: inference to a mapped type with an `as` clause), `stores` and `ai-utilities` (11 and
