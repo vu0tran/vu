@@ -7850,6 +7850,18 @@ fn call1(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
         let ns = bind.inst_sig(&c, sg, m)
         c.sigs[ns].tparams = []
         sgs2.push(ns)
+        if targs.len < tps1.len:
+          let tl0 = sig_tparam_list(c, sg)
+          if tl0 >= 0:
+            let tn0 = ast.items(c.t, tl0)
+            var raw: [Int] = []
+            for a in targs: raw.push(a)
+            for i in targs.len..tps1.len:
+              let dn = c.t.nd[tn0[i]].b
+              if dn >= 0: raw.push(bind.type_from(&c, dn))
+            if raw.len == tps1.len:
+              let mr = types.new_mapper(&c, tps1, raw)
+              c.fail_ret[ns] = bind.instantiate(&c, c.sigs[sg].ret, mr)
       else:
         unfit.push(sg)
         unfit.push(m)
@@ -7941,7 +7953,10 @@ fn call1(var c: C, n: Int, is_new0: Bool, ctx: Int) -> Int:
     # (tsc reports a generic one's this as an argument, elaborated: not modeled)
     if gen_this and c.sigs[sg].this_t >= 0 and not rel.assignable(&c, this_arg, c.sigs[sg].this_t):
       return unsup(&c, n, "a generic function's this that doesn't fit")
-    check_args(&c, sg, args, true)
+    let bad_arg = check_args(&c, sg, args, true)
+    # (a failed call with explicit type arguments: the signature with the rest filled by their
+    # defaults as written, not instantiated, getTypeArgumentsFromNodes)
+    if bad_arg and cands[0] in c.fail_ret: return c.fail_ret[cands[0]]
     return sig_result(&c, sg, n)
   # overloads: the first whose arguments all fit (chooseOverload: context-sensitive arguments
   # are left out of a first pass, where they fit any object type without required members)
@@ -8248,7 +8263,7 @@ fn return_expr(var c: C, in_return: Bool, stmt: Int, expr: Int, et: Int, declare
   if in_return and not in_cond: at = stmt
   rel.report(&c, et, declared, at, u, 2322)
 
-fn check_args(var c: C, sg: Int, args: [Int], report: Bool):
+fn check_args(var c: C, sg: Int, args: [Int], report: Bool) -> Bool:
   var reported = false
   for i in 0..args.len:
     let pt = param_at(&c, sg, i)
@@ -8257,6 +8272,7 @@ fn check_args(var c: C, sg: Int, args: [Int], report: Bool):
       let an = skip_parens(c, args[i])
       rel.report(&c, at, pt, an, an, 2345)
       reported = true
+  return reported
 
 # A const type parameter (<const T>): an argument it's the contextual type of is in a const
 # context, and its inferences aren't widened.
@@ -12125,6 +12141,87 @@ fn field_decorators(var c: C, cls: Int, m: Int, s: Int, inst: Int, name: Int):
       err(&c, d, 1271, "Decorator function return type is '" + rs + "' but is expected to be 'void' or 'any'.")
     c.deco_checked[(f << 32) | c.t.nd[d].pos] = true
 
+# A method's or accessor's decorators without experimentalDecorators (TC39's): each called with
+# the member's value and its context (ClassMethodDecoratorContext<This, Value> and the like),
+# returning void or a value of that kind (checkDecorator). Checked only for a decorator with one
+# call signature whose type parameters, if any, default to unknown; others aren't modeled.
+fn es_decorators(var c: C, m: Int, s: Int, inst: Int):
+  let k = c.t.nd[m].k
+  let name = bind.member_name(&c, m)
+  if name < 0: return
+  let static_ = (c.t.nd[m].f & ast.M_STATIC) != 0
+  var this_t = inst
+  if static_: this_t = bind.type_of_sym(&c, s)
+  let ps = bind.get_prop(&c, this_t, name)
+  if ps < 0: return
+  var vt = bind.type_of_sym(&c, ps)
+  # (the member's value: the method, the getter as () => V, the setter as (value: V) => void)
+  var value = vt
+  var ctx_name = "ClassMethodDecoratorContext"
+  if k == ast.N_GET or k == ast.N_SET:
+    let fo = types.anon_obj(&c, -1, -1)
+    let fs = types.new_sig(&c, -1)
+    if k == ast.N_GET:
+      c.sigs[fs].ret = vt
+      ctx_name = "ClassGetterDecoratorContext"
+    else:
+      return
+    c.objs[c.ta[fo]].calls.push(fs)
+    c.objs[c.ta[fo]].resolved = true
+    value = fo
+  let cs = bind.global_type_sym(&c, ctx_name)
+  if cs < 0: return
+  let cdt = bind.declared_type(&c, cs)
+  if c.objs[c.ta[cdt]].tparams.len != 2: return
+  let ctx_t = bind.ref_of(&c, cdt, [this_t, vt])
+  let expected = types.union_of(&c, [c.void_t, value])
+  for d in types.ints(c.t.mdecos[m]):
+    let dt = check_expr(&c, d, -1)
+    if is_any(c, dt):
+      c.es_deco_ok[d] = true
+      continue
+    let sgs = bind.sigs_of(&c, dt, false)
+    if sgs.len != 1: continue
+    var sg = sgs[0]
+    var ok = true
+    let td = types.ints(c.sigs[sg].tparams)
+    if td.len > 0:
+      for tp in types.ints(td):
+        let dd = c.sdecl[c.ta[tp]]
+        if dd < 0 or c.t.nd[dd].k != ast.N_TPARAM or c.t.nd[dd].b < 0 or c.t.nd[dd].a >= 0: ok = false
+        elif bind.type_from(&c, c.t.nd[dd].b) != c.unknown_t: ok = false
+      if not ok: continue
+      # (no inference from the two arguments that this models: each its default, unknown)
+      var inf = new_inf(types.ints(td))
+      let ats = [value, ctx_t]
+      for i in 0..2:
+        var seen: {Int: Bool} = {}
+        let p0 = param_at(&c, sg, i)
+        infer_in(&c, p0, ats[i], &inf, false, 0, p0, &seen)
+      for i in 0..inf.tps.len:
+        if inf.cov[i].len > 0 or inf.contra[i].len > 0: ok = false
+      if not ok: continue
+      let mp = inf_mapper(&c, &inf, sg)
+      sg = bind.inst_sig(&c, sg, mp)
+    var at = c.t.nd[d].pos
+    if c.t.nd[d].k == ast.N_CALL: at = at - 1
+    let s0 = types.sig_copy(c, sg)
+    let np = s0.ptypes.len
+    let rest = np > 0 and s0.pflags[np - 1] == 2
+    var fits = void_min(c, sg) <= 2 and (rest or np >= 2)
+    if fits:
+      let p0 = param_at(&c, sg, 0)
+      let p1 = param_at(&c, sg, 1)
+      if not rel.assignable(&c, value, p0) or not rel.assignable(&c, ctx_t, p1): fits = false
+    if not fits: bind.err_at(&c, d, at, 1241, "Unable to resolve signature of method decorator when called as an expression.")
+    var rt = rel.sig_ret(&c, sg)
+    if rt < 0: rt = c.any_t
+    if not rel.assignable(&c, rt, expected):
+      let rs = show.show(&c, rt)
+      let es = show.show(&c, expected)
+      bind.err_at(&c, d, at, 1270, "Decorator function return type '" + rs + "' is not assignable to type '" + es + "'.")
+    c.es_deco_ok[d] = true
+
 fn inside_fn(c: C, n: Int) -> Bool:
   var x = bind.up(c, n)
   while x >= 0:
@@ -12142,6 +12239,13 @@ fn check_class(var c: C, n: Int):
   # (a class declared in a function: its references are all in the file)
   if n in c.t.npos and inside_fn(c, n): c.class_at[(c.t.nd[n].file << 32) | c.t.npos[n]] = s
   let derived = c.t.nd[n].b >= 0
+  # (TC39 class decorators: one of type any or Function is an untyped call, nothing to check;
+  # others aren't modeled)
+  if not c.exp_deco and n in c.t.cdecos:
+    let fsym = bind.global_type_sym(&c, "Function")
+    for d in types.ints(c.t.cdecos[n]):
+      let dt = check_expr(&c, d, -1)
+      if is_any(c, dt) or (fsym >= 0 and dt == bind.declared_type(&c, fsym)): c.es_deco_ok[d] = true
   let base = bind.class_base(&c, n)
   var ctor = -1
   for m in kids(c, c.t.nd[n].d):
@@ -12189,6 +12293,7 @@ fn check_class(var c: C, n: Int):
         unsup(&c, c.t.nd[m].a, "a computed member name")
         continue
       if k != ast.N_CTOR and c.t.nd[c.t.nd[m].a].k == ast.N_COMPUTED: check_expr(&c, c.t.nd[c.t.nd[m].a].a, -1)
+      if not c.exp_deco and k != ast.N_CTOR and m in c.t.mdecos: es_decorators(&c, m, s, inst)
       if c.t.nd[m].c < 0: continue
       let sg = fn_sig(&c, m)
       check_function_body(&c, m, sg)
@@ -14438,7 +14543,7 @@ fn cjs_require(var c: C, n: Int) -> Int:
   if g < 0 and bind.is_relative(nm(c, c.t.nd[spec].s)): return unsup(&c, n, "a require of a file")
   if g < 0: return c.any_t
   # (a CommonJS module's exports, module.exports = x: not modeled)
-  if c.roots[g] in c.cjs_roots: return unsup(&c, n, "a require of a CommonJS module")
+  if g < c.roots.len and c.roots[g] in c.cjs_roots: return unsup(&c, n, "a require of a CommonJS module")
   bind.ensure_exports(&c, g)
   var ms = -1
   if g in c.export_eq: ms = bind.resolve_alias(&c, c.export_eq[g])
