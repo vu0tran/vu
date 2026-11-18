@@ -1541,6 +1541,10 @@ fn export_eq(var c: C, f: Int, root: Int, st: Int, var out: {Int: Int}, var ord:
   var ty = -1
   if name in c.locals[root]: v = c.locals[root][name]
   if name in c.ltypes[root]: ty = c.ltypes[root][name]
+  # (an ambient module's export = of a global, declare module "x" { export = Global; })
+  if v < 0 and ty < 0 and f >= AMB_BASE:
+    v = lookup_value_raw(&c, e, name)
+    ty = lookup_type(&c, e, name)
   # (export = an import: what it names, import x = require("y"); export = x)
   if v >= 0 and (c.sk[v] & types.S_IMPORT) != 0:
     let iv = v
@@ -2266,6 +2270,21 @@ fn intrinsic_alias(var c: C, n: Int, name: Str, a: Int) -> Int:
       if n > 0 and c.parent[n] >= 0 and c.t.nd[c.parent[n]].k == ast.N_PARAM and c.t.nd[c.parent[n]].b == n:
         c.noinfer_p[c.parent[n]] = true
         return a
+      # (in a conditional type's check or extends type, 0 extends 1 & NoInfer<T>: nothing is inferred there
+      # anyway, T)
+      if n > 0:
+        var ch = n
+        var up0 = c.parent[n]
+        var guard = 0
+        while up0 >= 0 and guard < 20:
+          guard += 1
+          if c.t.nd[up0].k == ast.N_TCOND:
+            if c.t.nd[up0].a == ch or c.t.nd[up0].b == ch: return a
+            break
+          let uk = c.t.nd[up0].k
+          if uk != ast.N_TINTER and uk != ast.N_TUNION and uk != ast.N_TPAREN and uk != ast.N_LIST: break
+          ch = up0
+          up0 = c.parent[up0]
       return lazy_unsupported(&c, n, "NoInfer of a generic type")
     return a
   if name != "Uppercase" and name != "Lowercase" and name != "Capitalize" and name != "Uncapitalize": return lazy_unsupported(&c, n, "an intrinsic type")
@@ -2279,7 +2298,7 @@ fn intrinsic_alias(var c: C, n: Int, name: Str, a: Int) -> Int:
       ts.push(types.mapping_of(&c, name))
       continue
     # (a type parameter, T[K], keyof T, or another such mapping: deferred)
-    if k == TK_TPARAM or k == types.TK_INDEXED or k == types.TK_KEYOF or types.is_gen_mapping(c, m):
+    if k == TK_TPARAM or k == types.TK_INDEXED or k == types.TK_KEYOF or k == types.TK_COND or types.is_gen_mapping(c, m):
       ts.push(types.gen_mapping_of(&c, name, m))
       continue
     # (number, bigint: a pattern placeholder, the mapping of `${number}`)
@@ -2307,7 +2326,10 @@ fn intrinsic_alias(var c: C, n: Int, name: Str, a: Int) -> Int:
         if c.tk[h] == types.TK_UNSUP: return h
       ts.push(types.template_of(&c, tx, hs))
       continue
-    if k != TK_STRLIT: return lazy_unsupported(&c, n, "a string mapping type of a non-literal")
+    if k != TK_STRLIT:
+      var dd = ""
+      if c.all_reasons: dd = " [{k} " + show.show(&c, m) + "]"
+      return lazy_unsupported(&c, n, "a string mapping type of a non-literal" + dd)
     let v = c.t.names[c.ta[m]] + ""
     var r = v
     if name == "Uppercase": r = v.upper()
@@ -2468,6 +2490,24 @@ fn fill_defaults(var c: C, tl: Int, args: [Int], at: Int, name: Str) -> [Int]:
   return out
 
 # t printed as alias a (with arguments): a union gets a copy that remembers it.
+# Whether alias a's body is a reference to the interface or class t instantiates (I<X>, ns.I<X>),
+# not to another alias that resolved to it.
+fn body_refers_to(c: C, a: Int, t: Int) -> Bool:
+  let ad = c.sdecl[a]
+  if ad < 0 or c.t.nd[ad].k != ast.N_TYPEALIAS: return false
+  var body = c.t.nd[ad].b
+  while body >= 0 and c.t.nd[body].k == ast.N_TPAREN: body = c.t.nd[body].a
+  if body < 0 or c.t.nd[body].k != ast.N_TREF or c.t.nd[body].b < 0: return false
+  let nn = c.t.nd[body].a
+  var last = -1
+  if c.t.nd[nn].k == ast.N_ID: last = c.t.nd[nn].s
+  elif c.t.nd[nn].k == ast.N_QNAME: last = c.t.nd[nn].s
+  if last < 0: return false
+  let tg = c.objs[c.ta[t]].target
+  if tg < 0 or c.tk[tg] != TK_OBJ: return false
+  let ts = c.objs[c.ta[tg]].sym
+  return ts >= 0 and c.sname[ts] == last and (c.sk[ts] & (S_INTERFACE | S_CLASS)) != 0
+
 fn alias_tag(var c: C, t: Int, a: Int, args: [Int]) -> Int:
   let k = c.tk[t]
   # a conditional type the alias declares that resolved to another type: that type has no alias
@@ -2527,8 +2567,9 @@ fn alias_tag(var c: C, t: Int, a: Int, args: [Int]) -> Int:
     if kind == OK_ANON or kind == types.OK_MAPPED or kind == OK_INST:
       c.t_alias[t] = a
       if args.len > 0: c.t_alias_args[t] = types.ints(args)
-    elif kind == OK_TUPLE or is_array_like_ref(&c, t):
-      # an array or tuple type named by an alias: a copy that remembers the name
+    elif kind == OK_TUPLE or is_array_like_ref(&c, t) or (kind == OK_REF and body_refers_to(c, a, t)):
+      # an array, tuple or interface reference named by an alias: a copy that remembers the name
+      # (tsgo keeps an alias of a type reference written as its body, type A<T> = I<T>)
       let o = c.ta[t]
       let t4 = types.new_obj(&c, kind, c.objs[o].sym, c.objs[o].node)
       let o4 = c.ta[t4]
@@ -2667,6 +2708,9 @@ fn declared_type1(var c: C, s: Int) -> Int:
         let ti = alias_tag(&c, t, s, [])
         if ti != t: c.t_iorigin[ti] = c.t_iorigin[t]
         t = ti
+      elif c.tk[t] == TK_OBJ and not (t in c.t_alias) and c.t.nd[body].k == ast.N_TREF and c.t.nd[body].b >= 0 and c.objs[c.ta[t]].kind == OK_REF and body_refers_to(c, s, t):
+        # (type A = I<X>: tsgo keeps the alias of a type reference with arguments)
+        t = alias_tag(&c, t, s, [])
       elif c.tk[t] == TK_OBJ and not (t in c.t_alias) and (c.t.nd[body].k == ast.N_TTUPLE or c.t.nd[body].k == ast.N_TARRAY or (c.t.nd[body].k == ast.N_TOP and c.t.nd[body].f == scan.W_READONLY)) and not (c.objs[c.ta[t]].kind == OK_TUPLE and c.objs[c.ta[t]].args.len == 0):
         t = alias_tag(&c, t, s, [])
     c.sdtype[s] = t
@@ -4125,7 +4169,14 @@ fn instantiate1(var c: C, t: Int, m: Int) -> Int:
       let b = instantiate(&c, a, m)
       if b != a: changed = true
       args.push(b)
-    if changed: r = ref_of(&c, c.objs[o].target, args)
+    if changed:
+      r = ref_of(&c, c.objs[o].target, args)
+      # (an alias's reference: the instantiation keeps the alias, its arguments instantiated)
+      if t in c.t_alias:
+        var iargs: [Int] = []
+        if t in c.t_alias_args:
+          for x in types.ints(c.t_alias_args[t]): iargs.push(instantiate(&c, x, m))
+        r = alias_tag(&c, r, c.t_alias[t], iargs)
   elif kind == OK_TUPLE and variadic_tuple(c, t):
     # [A, ...T]: T's elements spliced in (an array: a rest element)
     var nargs: [Int] = []

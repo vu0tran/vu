@@ -716,31 +716,32 @@ Same setup (`hyw.sh` over the 33 packages, oxlint 1.90.0 with tsgolint against `
 `VLINT_VTSC=1`, cache cleared for the first run): every line equal to oxlint's in all 33
 packages, first run and second. Packages that used to send files to tsgolint and now don't:
 `frontend/@n8n/chat` (53 of 53 files, was 41), `frontend/@n8n/stores` (39 of 39, was 29),
-`@n8n/api-types` (700 of 700, was 697). Fewer in `@n8n/node-cli` (35 of 59 in its main program,
-was 20) and `@n8n/ai-utilities` (164 of 183, was 152).
+`@n8n/api-types` (700 of 700, was 697), `@n8n/eslint-config`'s main program (73 of 73, was 68).
+Fewer in `@n8n/node-cli` (45 of 59 in its main program, was 20) and `@n8n/ai-utilities` (164 of
+183, was 152).
 
 | | oxlint | first run | next run |
 |---|---|---|---|
-| `core` | 4.55 s | 2.22 s | 0.12 s |
-| `frontend/@n8n/chat` | 1.19 s | 0.50 s | 0.03 s |
-| `frontend/@n8n/stores` | 1.42 s | 0.69 s | 0.03 s |
-| `@n8n/engine` | 1.55 s | 0.55 s | 0.06 s |
-| `workflow` | 3.13 s | 1.53 s | 0.14 s |
-| `@n8n/api-types` | 8.32 s | 6.07 s | 0.18 s |
-| `@n8n/workflow-sdk` | 2.62 s | 2.14 s | 0.12 s |
-| `@n8n/ai-utilities` | 2.60 s | 2.97 s | 0.06 s |
-| `frontend/@n8n/composables` | 3.53 s | 4.33 s | 0.03 s |
-| `@n8n/node-cli` | 1.04 s | 1.20 s | 0.03 s |
-| `@n8n/eslint-config` | 0.95 s | 0.94 s | 0.15 s |
-| `@n8n/decorators` | 2.16 s | 2.16 s | 0.07 s |
-| 21 other packages | 0.3-2.4 s each | 2-3.4 times less | 0.02-0.06 s |
+| `core` | 4.93 s | 2.57 s | 0.12 s |
+| `@n8n/api-types` | 8.35 s | 4.46 s | 0.25 s |
+| `workflow` | 3.13 s | 1.52 s | 0.11 s |
+| `frontend/@n8n/chat` | 1.03 s | 0.51 s | 0.03 s |
+| `frontend/@n8n/stores` | 1.39 s | 0.75 s | 0.03 s |
+| `@n8n/engine` | 1.66 s | 0.65 s | 0.07 s |
+| `@n8n/workflow-sdk` | 2.74 s | 2.25 s | 0.15 s |
+| `@n8n/ai-utilities` | 2.42 s | 3.06 s | 0.08 s |
+| `frontend/@n8n/composables` | 3.69 s | 4.39 s | 0.03 s |
+| `@n8n/node-cli` | 1.15 s | 1.05 s | 0.04 s |
+| `@n8n/eslint-config` | 0.92 s | 0.76 s | 0.16 s |
+| `@n8n/decorators` | 2.55 s | 2.43 s | 0.07 s |
+| 21 other packages | 0.3-2.4 s each | 1.8-4 times less | 0.02-0.07 s |
 
 Not yet twice as fast: the packages where tsgolint still starts for a few files (its start costs
 about two seconds: composables 1 file, ai-utilities 20, node-cli 25 of its templates' programs,
 eslint-config 8, decorators 118 stale `.js` outputs), and `api-types` and `workflow-sdk`, whose
 zod schemas vtsc checks in 6 s of CPU on two cores.
 
-What changed (each checked against tsc 7, 22 new vtests):
+What changed (each checked against tsc 7, 25 new vtests):
 - **Errors vtsc got wrong, silently, now right**: a function inside another function that an
   overload candidate checked and dropped was never checked again (pinia's `defineStore` setup
   functions: no errors in their nested functions); `Partial<X>` and conditional types of an
@@ -762,7 +763,12 @@ What changed (each checked against tsc 7, 22 new vtests):
   one package version are one: vitest's matchers reach the tests' `Assertion`); a side-effect
   import of a package's JavaScript; interface heritage in variance; variance of recursive aliases
   (a reference inside is related, as tsc's in-progress variance); callback parameters of methods
-  compared strictly (`Promise<T>` stays covariant); Lowercase and the like of template literals.
+  compared strictly (`Promise<T>` stays covariant); Lowercase and the like of template literals
+  and deferred conditional types; an ambient module's `export =` of a global namespace
+  (handlebars); `NoInfer<T>` in a conditional type (type-fest's `IsAny`); a unique symbol key
+  missing from an instantiated type with only a string index (unknown, Vue's slots).
+- **Printing**: an alias of an interface or class reference keeps its name, `type H<T> = I<T>`
+  prints `H<number>` (tsgo does; tsc 6 printed `I<number>`).
 
 ### All of n8n core checked, twice as fast as oxlint (2026-11-18)
 
