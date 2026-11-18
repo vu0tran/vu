@@ -3873,6 +3873,21 @@ fn is_any(c: C, t: Int) -> Bool:
 
 fn expr_type(var c: C, n: Int, ctx: Int) -> Int:
   let k = c.t.nd[n].k
+  # (a literal whose contextual type is a const type parameter, inside an argument: as const)
+  if c.const_at.len > 0 and n in c.const_at and c.const_at[n] >= 0:
+    let ctp = c.const_at[n]
+    c.const_at[n] = -1
+    let cr = const_arg(&c, n, ctp)
+    c.const_at[n] = ctp
+    # (an array literal stays mutable where its contextual type has a mutable array, an
+    # intersection's member too: checkArrayLiteral's isMutableArrayLikeType)
+    if k == ast.N_ARRAY and ctx >= 0 and c.tk[cr] == TK_OBJ and c.objs[c.ta[cr]].kind == OK_TUPLE:
+      for mi_ in 0..types.nmem(c, ctx):
+        let m = types.mem(c, ctx, mi_)
+        for ii in 0..types.ninter(c, m):
+          let x = types.inter_at(c, m, ii)
+          if c.tk[x] == TK_OBJ and ((rel.is_array_ref(&c, x) and not rel.is_readonly_array(&c, x)) or (c.objs[c.ta[x]].kind == OK_TUPLE and not c.objs[c.ta[x]].ro)): c.objs[c.ta[cr]].ro = false
+    return cr
   if k == ast.N_NUM: return types.num_lit(&c, bind.num_value(c.t.names[c.t.nd[n].s]), true)
   if k == ast.N_STR or k == ast.N_NOSUBTEMPL: return types.str_lit(&c, c.t.nd[n].s, true)
   if k == ast.N_TEMPL:
@@ -4205,6 +4220,9 @@ fn generic_pair(var c: C, n: Int, p: Int) -> Bool:
   let s = bind.lookup_value(&c, n, c.t.nd[n].s)
   if s < 0: return false
   let declared = bind.type_of_sym(&c, s)
+  return generic_pair_t(&c, declared, p)
+
+fn generic_pair_t(var c: C, declared: Int, p: Int) -> Bool:
   var gen = false
   for mi59_ in 0..types.nmem(c, declared):
     let m = types.mem(c, declared, mi59_)
@@ -4312,6 +4330,8 @@ fn no_sub_yet(var c: C, n: Int, t: Int, ctx: Int) -> Int:
   let uc = union_constrained(&c, t)
   if uc == 0: return t
   if not sub_position(&c, n, ctx): return t
+  let p = c.parent[n]
+  if p >= 0 and c.t.nd[p].k == ast.N_ELEMACCESS and c.t.nd[p].a == n and c.t.nd[n].k != ast.N_ID and generic_pair_t(&c, t, p): return t
   if uc == 2: return unsup(&c, n, "a property of a type parameter with a union constraint")
   return substitute_constraints(&c, t)
 
@@ -5206,6 +5226,10 @@ fn index_fits(var c: C, r: Int) -> Bool:
   if c.tk[ap] == TK_OBJ: has_num = bind.index_type(&c, ap, true) >= 0
   for mi74_ in 0..types.nmem(c, i):
     let k = types.mem(c, i, mi74_)
+    # (K extends keyof O for this O: fits, whatever O's keys are)
+    if c.tk[k] == TK_TPARAM:
+      let kc = rel.constraint_of(&c, k)
+      if kc >= 0 and c.tk[kc] == types.TK_KEYOF and c.ta[kc] == o: continue
     if rel.assignable(&c, k, kt): continue
     if has_num and rel.assignable(&c, k, c.number_t): continue
     return false
@@ -5472,16 +5496,55 @@ fn async_element_type(var c: C, t: Int, at: Int) -> Int:
         let sgs = bind.sigs_of(&c, pt, false)
         if sgs.len != 1: return unsup(&c, at, "for await over this type")
         let r = rel.sig_ret(&c, sgs[0])
-        if c.tk[r] != TK_OBJ or c.objs[c.ta[r]].kind != OK_REF: return unsup(&c, at, "for await over this type")
-        let tsym = c.objs[c.ta[c.objs[c.ta[r]].target]].sym
-        let tn = nm(c, c.sname[tsym])
-        if tn != "AsyncGenerator" and tn != "AsyncIterator" and tn != "AsyncIterableIterator" and tn != "AsyncIteratorObject": return unsup(&c, at, "for await over this type")
-        ts.push(c.objs[c.ta[r]].args[0])
+        var known = c.tk[r] == TK_OBJ and c.objs[c.ta[r]].kind == OK_REF
+        if known:
+          let tsym = c.objs[c.ta[c.objs[c.ta[r]].target]].sym
+          let tn = nm(c, c.sname[tsym])
+          known = tn == "AsyncGenerator" or tn == "AsyncIterator" or tn == "AsyncIterableIterator" or tn == "AsyncIteratorObject"
+        if known:
+          ts.push(c.objs[c.ta[r]].args[0])
+          continue
+        # (another async iterator, a stream whose [Symbol.asyncIterator]() is this: next()'s
+        # awaited results whose done can be false give their value, getIterationTypesOfIteratorSlow)
+        let sv = async_next_values(&c, r, at)
+        if sv < 0: return unsup(&c, at, "for await over this type")
+        ts.push(sv)
         continue
     let el = element_type(&c, m, at)
     if c.tk[el] == TK_UNSUP: return el
     ts.push(awaited(&c, el, at))
   return types.union_of(&c, ts)
+
+fn async_next_values(var c: C, r: Int, at: Int) -> Int:
+  let ar = rel.apparent(&c, r)
+  if c.tk[ar] != TK_OBJ: return -1
+  let next_n = ast.intern(&c.t, "next")
+  let nx = bind.get_prop(&c, ar, next_n)
+  if nx < 0: return -1
+  let nxt = bind.prop_type_for(&c, nx, ar)
+  let nsg = bind.sigs_of(&c, nxt, false)
+  if nsg.len != 1 or c.sigs[nsg[0]].tparams.len > 0: return -1
+  let nr = rel.sig_ret(&c, nsg[0])
+  let res = awaited(&c, nr, at)
+  if c.tk[res] == TK_UNSUP: return -1
+  let done_n = ast.intern(&c.t, "done")
+  let value_n = ast.intern(&c.t, "value")
+  var vals: [Int] = []
+  for mi_ in 0..types.nmem(c, res):
+    let m = types.mem(c, res, mi_)
+    let am = rel.apparent(&c, m)
+    if c.tk[am] != TK_OBJ: return -1
+    let dp = bind.get_prop(&c, am, done_n)
+    let vp = bind.get_prop(&c, am, value_n)
+    if dp < 0 or vp < 0: return -1
+    let dt = bind.prop_type_for(&c, dp, am)
+    var can_false = (c.sflags[dp] & SF_OPTIONAL) != 0
+    for mj_ in 0..types.nmem(c, dt):
+      let dm = types.mem(c, dt, mj_)
+      if c.tk[dm] == TK_FALSE: can_false = true
+    if can_false: vals.push(bind.prop_type_for(&c, vp, am))
+  if vals.len == 0: return -1
+  return types.union_of(&c, vals)
 
 fn element_type(var c: C, t: Int, at: Int) -> Int:
   if is_any(c, t): return t
@@ -5583,6 +5646,25 @@ fn iterator_arg(var c: C, r: Int) -> Int:
     if can_false: vals.push(bind.prop_type_for(&c, vp, am))
   if vals.len == 0: return -1
   return types.union_of(&c, vals)
+
+fn plain_obj_inter(var c: C, m: Int) -> Bool:
+  let key = ast.intern(&c.t, "[Symbol.iterator]")
+  for ii in 0..types.ninter(c, m):
+    let x = types.inter_at(c, m, ii)
+    if c.tk[x] != TK_OBJ or tyops.is_generic(&c, x): return false
+    let k = c.objs[c.ta[x]].kind
+    if k == OK_TUPLE or rel.is_array_ref(&c, x): return false
+    let ap = rel.apparent(&c, x)
+    if c.tk[ap] != TK_OBJ: return false
+    # (a string index of unknown, Record<string, unknown>: unknown, which types nothing)
+    let si = bind.index_type(&c, ap, false)
+    if si >= 0 and c.tk[si] != TK_UNKNOWN: return false
+    if bind.index_type(&c, ap, true) >= 0: return false
+    if bind.get_prop(&c, ap, key) >= 0: return false
+    for pn in bind.prop_names(&c, ap):
+      let tx = c.t.names[pn]
+      if tx.len > 0 and tx[0] >= '0' and tx[0] <= '9': return false
+  return true
 
 fn iterated(var c: C, t: Int) -> Int:
   let direct = iterator_arg(&c, t)
@@ -6408,6 +6490,9 @@ fn array_literal(var c: C, n: Int, ctx: Int) -> Int:
           if c.tk[x] == TK_OBJ and rel.is_empty_obj(&c, x): continue
           str_empty = false
         if str_empty: continue
+        # (object types without index signatures, numeric names or an iterator: no element
+        # contextual type, getContextualTypeForElementExpression)
+        if plain_obj_inter(&c, m): continue
         let dsh = dbg_show(&c, m)
         return unsup(&c, n, "an array literal with an intersection contextual type" + dsh)
       if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_TUPLE: tuple_ctx = m
@@ -7361,6 +7446,9 @@ fn union_sigs(var c: C, ft: Int, is_new: Bool) -> [Int]:
     let nsg = c.sigs.len
     out.push(nsg)
     c.sigs.push(cp)
+    if sg in c.sig_outer:
+      let so0 = c.sig_outer[sg]
+      c.sig_outer[nsg] = so0
     # (this is T, the same declaration's in each member: the union signature's too)
     if sg in c.this_pred:
       let tpv = c.this_pred[sg]
@@ -7482,13 +7570,18 @@ fn identical_tparams(var c: C, a: Int, b: Int) -> Int:
     let hx = dx >= 0 and c.t.nd[dx].k == ast.N_TPARAM and c.t.nd[dx].b > 0
     let hy = dy >= 0 and c.t.nd[dy].k == ast.N_TPARAM and c.t.nd[dy].b > 0
     if (hx or hy) and dx != dy: return -2
-    let cx = rel.constraint_of(&c, x[i])
+    var cx = rel.constraint_of(&c, x[i])
     var cy = rel.constraint_of(&c, y[i])
     if (cx < 0) != (cy < 0): return -2
+    # (constraints seen through an instantiation: instantiated by it)
+    if cx >= 0 and a in c.sig_outer: cx = bind.instantiate(&c, cx, c.sig_outer[a])
+    if cy >= 0 and b in c.sig_outer: cy = bind.instantiate(&c, cy, c.sig_outer[b])
     if cy >= 0:
       let icy = bind.instantiate(&c, cy, m)
       # (the same constraint made twice: identical, compareTypeParametersIdentical)
-      if icy != cx and rel.identical(&c, icy, cx, 0) != 1: return -2
+      if icy != cx and rel.identical(&c, icy, cx, 0) != 1:
+        if c.debug: eprint("IDTP {i} {show.show(&c, icy)} kinds {c.tk[icy]} {c.tk[cx]} VS {show.show(&c, cx)}")
+        return -2
   return m
 
 fn same_params_mapped(var c: C, a: Int, b: Int, m: Int) -> Bool:
@@ -7843,7 +7936,13 @@ fn spread_generic(var c: C, n: Int, sgs: [Int], args: [Int], at: Int) -> Int:
         for i in 0..ats.len:
           var seen: {Int: Bool} = {}
           let p0 = param_at(&c, sg, i)
+          var iss1_: [Int] = []
+          var its1_: [Int] = []
+          swap(&iss1_, &c.inf_ss)
+          swap(&its1_, &c.inf_ts)
           infer_in(&c, p0, ats[i], &inf, false, 0, p0, &seen)
+          swap(&iss1_, &c.inf_ss)
+          swap(&its1_, &c.inf_ts)
         if not tuple:
           let rp = c.sigs[sg].ptypes[at]
           var seen2: {Int: Bool} = {}
@@ -7853,7 +7952,13 @@ fn spread_generic(var c: C, n: Int, sgs: [Int], args: [Int], at: Int) -> Int:
             if c.tk[rel0] == TK_TPARAM:
               let rc0 = rel.constraint_of(&c, rel0)
               if not (rc0 >= 0 and prim_constraint(&c, rc0)): src_arr = arr_w
+          var iss2_: [Int] = []
+          var its2_: [Int] = []
+          swap(&iss2_, &c.inf_ss)
+          swap(&its2_, &c.inf_ts)
           infer_in(&c, rp, src_arr, &inf, false, 0, rp, &seen2)
+          swap(&iss2_, &c.inf_ss)
+          swap(&its2_, &c.inf_ts)
         let m = inf_mapper(&c, &inf, sg)
         isg = bind.inst_sig(&c, sg, m)
       var fits = true
@@ -8332,7 +8437,13 @@ fn infer_obj_skip(var c: C, a: Int, pt: Int, var inf: Inf):
     let vt = check_expr(&c, c.t.nd[q].b, ptp)
     while c.diags.len > dlen: c.diags.pop()
     var seen: {Int: Bool} = {}
+    var iss3_: [Int] = []
+    var its3_: [Int] = []
+    swap(&iss3_, &c.inf_ss)
+    swap(&its3_, &c.inf_ts)
     infer_in(&c, ptp, vt, &inf, false, 0, ptp, &seen)
+    swap(&iss3_, &c.inf_ss)
+    swap(&its3_, &c.inf_ts)
 
 # inferFromAnnotatedParameters: a function argument's annotated parameters as sources for the
 # contextual signature's parameter types (before the inferences are fixed for its others).
@@ -8353,7 +8464,13 @@ fn annotated_params(var c: C, arg: Int, pt: Int, var inf: Inf):
     var src = bind.type_from(&c, c.t.nd[p].b)
     if (c.t.nd[p].f & ast.M_OPTIONAL) != 0: src = types.union_of(&c, [src, c.undef_t])
     var seen: {Int: Bool} = {}
+    var iss4_: [Int] = []
+    var its4_: [Int] = []
+    swap(&iss4_, &c.inf_ss)
+    swap(&its4_, &c.inf_ts)
     infer_in(&c, c.sigs[cs].ptypes[j], src, &inf, false, 0, c.sigs[cs].ptypes[j], &seen)
+    swap(&iss4_, &c.inf_ss)
+    swap(&its4_, &c.inf_ts)
 
 # A context-sensitive argument, with its functions anyFunctionType, against a parameter type: an
 # array literal element by element (against an array's element type).
@@ -8519,6 +8636,68 @@ fn is_const_tp(c: C, t: Int) -> Bool:
   if c.tk[t] != TK_TPARAM: return false
   let d = c.sdecl[c.ta[t]]
   return d >= 0 and c.t.nd[d].k == ast.N_TPARAM and (c.t.nd[d].f & ast.M_CONST) != 0
+
+# The properties of an object literal argument whose contextual type (the raw parameter type's
+# property) is a const type parameter: marked (c.const_at); false where it can't be told.
+fn mark_const_ctx(var c: C, e: Int, rt: Int, depth: Int) -> Bool:
+  if depth > 4: return false
+  for p in kids(c, c.t.nd[e].a):
+    let pk = c.t.nd[p].k
+    if pk == ast.N_SPREAD: return false
+    if pk != ast.N_PROPASSIGN: continue
+    if c.t.nd[c.t.nd[p].a].k == ast.N_COMPUTED: return false
+    let name = bind.member_name(&c, p)
+    let v = skip_parens(c, c.t.nd[p].b)
+    let vk = c.t.nd[v].k
+    let pt = raw_prop_ctx(&c, rt, name)
+    if c.debug: eprint("MARK {c.t.names[name]} pt {pt} vk {vk}")
+    if pt == -2: return false
+    if pt < 0 or not could_contain_tvars(&c, pt): continue
+    var ctp = -1
+    for mi_ in 0..types.nmem(c, pt):
+      let m = types.mem(c, pt, mi_)
+      for ii in 0..types.ninter(c, m):
+        let x = types.inter_at(c, m, ii)
+        if is_const_tp(c, x): ctp = x
+    if c.debug: eprint("CONSTCTX {c.t.names[name]} {pt} {show.show(&c, pt)} -> {ctp}")
+    if ctp >= 0:
+      if vk == ast.N_ARROW or vk == ast.N_FUNCEXPR: return false
+      c.const_at[v] = ctp
+      continue
+    if vk == ast.N_OBJECT:
+      if not mark_const_ctx(&c, v, pt, depth + 1): return false
+    elif vk == ast.N_ARRAY: return false
+  return true
+
+# A property's type in a raw (generic) contextual type: -1 when it has none, -2 when not known.
+fn raw_prop_ctx(var c: C, rt: Int, name: Int) -> Int:
+  var ts: [Int] = []
+  for mi_ in 0..types.nmem(c, rt):
+    let m = types.mem(c, rt, mi_)
+    let mk = c.tk[m]
+    if mk == TK_UNDEF or mk == TK_NULL: continue
+    if mk == TK_INTER:
+      # (an intersection: the members' types of it, intersected)
+      var its: [Int] = []
+      for ii in 0..types.ninter(c, m):
+        let x = types.inter_at(c, m, ii)
+        let r = raw_prop_ctx(&c, x, name)
+        if r == -2: return -2
+        if r >= 0: its.push(r)
+      if its.len > 0: ts.push(types.inter_of(&c, its))
+      continue
+    if mk != TK_OBJ or c.objs[c.ta[m]].kind == types.OK_MAPPED:
+      if c.debug: eprint("RAWPROP -2 {c.t.names[name]} {mk} {show.show(&c, m)}")
+      return -2
+    let ap = rel.apparent(&c, m)
+    if c.tk[ap] != TK_OBJ: return -2
+    let ps = bind.get_prop(&c, ap, name)
+    if ps < 0:
+      if bind.index_type(&c, ap, false) >= 0: return -2
+      continue
+    ts.push(bind.prop_type_for(&c, ps, m))
+  if ts.len == 0: return -1
+  return types.union_of(&c, ts)
 
 # An argument whose contextual type is a const type parameter: as `as const`, but a top-level
 # array literal stays mutable where the constraint is a mutable array (checkArrayLiteral).
@@ -8721,7 +8900,10 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
           let ak = c.t.nd[skip_parens(c, args[i])].k
           # (a string or number literal: a const context changes nothing for it)
           if not (ak == ast.N_ID or ak == ast.N_PROPACCESS or ak == ast.N_ELEMACCESS or ak == ast.N_CALL or ak == ast.N_NEW or ak == ast.N_THIS or ak == ast.N_STR or ak == ast.N_NUM or ak == ast.N_NOSUBTEMPL):
-            at = unsup(&c, args[i], "an argument in a const type parameter's context inside a parameter type")
+            # (an object literal: the values whose contextual type is a const type parameter are
+            # in a const context, isConstContext)
+            if not (ak == ast.N_OBJECT and mark_const_ctx(&c, skip_parens(c, args[i]), rawp, 0)):
+              at = unsup(&c, args[i], "an argument in a const type parameter's context inside a parameter type")
           elif ak == ast.N_STR or ak == ast.N_NUM or ak == ast.N_NOSUBTEMPL: c.noshow_args[args[i]] = true
         if at < 0: at = check_expr(&c, args[i], pt)
       c.ret_mapper = saved_rm
@@ -8748,7 +8930,13 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
       let has_fixed = fixed_tps.len > 0
       var snap = Inf([], [], [], [], [])
       if has_fixed: snap = copy_inf(inf)
+      var iss5_: [Int] = []
+      var its5_: [Int] = []
+      swap(&iss5_, &c.inf_ss)
+      swap(&its5_, &c.inf_ts)
       if not param_noinfer(c, sg, i): infer_in(&c, h13_, at, &inf, false, 0, h13_, &seen)
+      swap(&iss5_, &c.inf_ss)
+      swap(&its5_, &c.inf_ts)
       if has_fixed:
         for j in 0..inf.tps.len:
           if inf.tps[j] in fixed_tps:
@@ -8767,7 +8955,13 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
           c.objs[c.ta[tup0]].args.push(rest_types[i])
           c.objs[c.ta[tup0]].eflags.push(0)
         var seen0: {Int: Bool} = {}
+        var iss6_: [Int] = []
+        var its6_: [Int] = []
+        swap(&iss6_, &c.inf_ss)
+        swap(&its6_, &c.inf_ts)
         if not param_noinfer(c, sg, rest_at): infer_in(&c, rest_v, tup0, &inf, false, 0, rest_v, &seen0)
+        swap(&iss6_, &c.inf_ss)
+        swap(&its6_, &c.inf_ts)
         rest_done = true
   if rest_at >= 0 and not rest_done:
     let tup = types.new_obj(&c, OK_TUPLE, -1, -1)
@@ -8777,7 +8971,13 @@ fn instantiate_call(var c: C, sg: Int, args: [Int], ctx0: Int) -> Int:
     var rt1 = c.sigs[sg].ptypes[rest_at]
     if rest_v >= 0: rt1 = rest_v
     var seen1: {Int: Bool} = {}
+    var iss7_: [Int] = []
+    var its7_: [Int] = []
+    swap(&iss7_, &c.inf_ss)
+    swap(&its7_, &c.inf_ts)
     if not param_noinfer(c, sg, rest_at): infer_in(&c, rt1, tup, &inf, false, 0, rt1, &seen1)
+    swap(&iss7_, &c.inf_ss)
+    swap(&its7_, &c.inf_ts)
   while c.outer_tps.len > outer_n: c.outer_tps.pop()
   c.inf_fixed = fixed_tps
   let m = inf_mapper(&c, &inf, sg)
@@ -9254,7 +9454,56 @@ fn infer_in1(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, or
         if v == 2: infer_in(&c, pa[i], aa[i], &inf, not contra, prio, orig, &seen)
         else: infer_in(&c, pa[i], aa[i], &inf, contra, prio, orig, &seen)
       return
+  # (object types: invokeOnce's stacks; the same recursion identity twice, newer each time, on
+  # both sides: no further, isDeeplyNestedType's 2)
+  let ak0 = c.tk[a]
+  if pk == TK_OBJ and (ak0 == TK_OBJ or ak0 == TK_INTER) and not same_ref_target(c, p, a):
+    c.inf_ss.push(a)
+    c.inf_ts.push(p)
+    let deep = deeply_nested(c, a, c.inf_ss) and deeply_nested(c, p, c.inf_ts)
+    if not deep: infer_in2(&c, p, a, &inf, contra, prio, orig, &seen)
+    c.inf_ss.pop()
+    c.inf_ts.pop()
+    return
   infer_in2(&c, p, a, &inf, contra, prio, orig, &seen)
+
+fn same_ref_target(c: C, p: Int, a: Int) -> Bool:
+  if c.tk[a] != TK_OBJ: return false
+  let po = c.ta[p]
+  let ao = c.ta[a]
+  if c.objs[po].kind == OK_REF and c.objs[ao].kind == OK_REF and c.objs[po].target == c.objs[ao].target: return true
+  return false
+
+# getRecursionIdentity: a reference by its target, an object type with a declaration by it, else
+# the type itself.
+fn rec_identity(c: C, t: Int) -> Int:
+  if c.tk[t] != TK_OBJ: return -t - 1
+  let o = c.ta[t]
+  if c.objs[o].kind == OK_REF: return c.objs[o].target * 4 + 1
+  if c.objs[o].node >= 0: return c.objs[o].node * 4 + 2
+  return -t - 1
+
+fn deeply_nested(c: C, t: Int, stack: [Int]) -> Bool:
+  if stack.len < 2: return false
+  if c.tk[t] == TK_INTER:
+    for ii in 0..types.ninter(c, t):
+      if deeply_nested(c, types.inter_at(c, t, ii), stack): return true
+    return false
+  let id = rec_identity(c, t)
+  var count = 0
+  var last = 0
+  for x in stack:
+    var hit = false
+    if c.tk[x] == TK_INTER:
+      for ii in 0..types.ninter(c, x):
+        if rec_identity(c, types.inter_at(c, x, ii)) == id: hit = true
+    elif rec_identity(c, x) == id: hit = true
+    if hit:
+      if x >= last:
+        count += 1
+        if count >= 2: return true
+      last = x
+  return false
 
 fn infer_cond(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, orig: Int, var seen: {Int: Bool}):
   let cn = c.ta[p]
@@ -9500,8 +9749,9 @@ fn infer_in2(var c: C, p: Int, a: Int, var inf: Inf, contra: Bool, prio: Int, or
     let pp = bind.get_prop(&c, p, name)
     let ap = bind.get_prop(&c, a, name)
     if pp >= 0 and ap >= 0:
-      let g5_1 = bind.type_of_sym(&c, pp)
-      let g6_1 = bind.type_of_sym(&c, ap)
+      # (each side's this its own type, as a reference's members have it)
+      let g5_1 = bind.prop_type_for(&c, pp, p)
+      let g6_1 = bind.prop_type_for(&c, ap, a)
       infer_in(&c, g5_1, g6_1, &inf, contra, prio, orig, &seen)
   # signatures (call, then construct): parameters the other way round, return types the same way
   for ctor in [false, true]:
@@ -11042,7 +11292,7 @@ fn const_facts(var c: C, frames: [{Str: Int}], fnode: Int) -> {Str: Int}:
         # a constant evolving array doesn't carry its evolution into a closure
         if c.auto_arr >= 0 and c.stype[s] == c.auto_arr: continue
         out[k + ""] = v
-      elif dot < 0 and mutable_local(&c, s):
+      elif (dot < 0 or k == base + ".~sub") and mutable_local(&c, s):
         # a mutable variable keeps its narrowing in a closure that comes after its last assignment
         var last = -1
         if s in c.last_assign: last = c.last_assign[s]
@@ -12491,7 +12741,13 @@ fn field_decorators(var c: C, cls: Int, m: Int, s: Int, inst: Int, name: Int):
       for i in 0..2:
         var seen: {Int: Bool} = {}
         let p0 = param_at(&c, sg, i)
+        var iss8_: [Int] = []
+        var its8_: [Int] = []
+        swap(&iss8_, &c.inf_ss)
+        swap(&its8_, &c.inf_ts)
         infer_in(&c, p0, ats[i], &inf, false, 0, p0, &seen)
+        swap(&iss8_, &c.inf_ss)
+        swap(&its8_, &c.inf_ts)
       let mp = inf_mapper(&c, &inf, sg)
       sg = bind.inst_sig(&c, sg, mp)
     if not arity_bad:
@@ -12562,7 +12818,13 @@ fn es_decorators(var c: C, m: Int, s: Int, inst: Int):
       for i in 0..2:
         var seen: {Int: Bool} = {}
         let p0 = param_at(&c, sg, i)
+        var iss9_: [Int] = []
+        var its9_: [Int] = []
+        swap(&iss9_, &c.inf_ss)
+        swap(&its9_, &c.inf_ts)
         infer_in(&c, p0, ats[i], &inf, false, 0, p0, &seen)
+        swap(&iss9_, &c.inf_ss)
+        swap(&its9_, &c.inf_ts)
       for i in 0..inf.tps.len:
         if inf.cov[i].len > 0 or inf.contra[i].len > 0: ok = false
       if not ok: continue
