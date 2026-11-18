@@ -4,6 +4,7 @@
 # moved onto the parts of an object or array literal that don't fit.
 
 import ast
+import scan
 import types
 import bind
 import show
@@ -1794,6 +1795,7 @@ fn variance_walk(var c: C, n: Int, name: Int, pos: Bool, var acc: [Int]):
           continue
         var v = -1
         if gs >= 0: v = decl_variance(&c, gs, i)
+        if v == -3: continue
         if v < 0:
           acc[0] = -1
           return
@@ -1845,6 +1847,18 @@ fn variance_walk(var c: C, n: Int, name: Int, pos: Bool, var acc: [Int]):
       acc[0] = -1
       return
     if mentions(c, c.t.nd[n].a, name): acc[0] = acc[0] | 4
+    else:
+      # (check and extends types without type variables: resolved where it's instantiated, only
+      # the branch it takes varies)
+      var infs: [Int] = []
+      tyops.collect_infers(c, c.t.nd[n].b, &infs)
+      if infs.len == 0:
+        let ct = bind.type_from(&c, c.t.nd[n].a)
+        let et = bind.type_from(&c, c.t.nd[n].b)
+        if ct >= 0 and et >= 0 and c.tk[ct] != types.TK_UNSUP and c.tk[et] != types.TK_UNSUP and c.tk[ct] != types.TK_ERROR and c.tk[et] != types.TK_ERROR and not chk.could_contain_tvars(&c, ct) and not chk.could_contain_tvars(&c, et):
+          if assignable(&c, ct, et): variance_walk(&c, c.t.nd[n].c, name, pos, &acc)
+          else: variance_walk(&c, c.t.nd[n].d, name, pos, &acc)
+          return
     variance_walk(&c, c.t.nd[n].c, name, pos, &acc)
     variance_walk(&c, c.t.nd[n].d, name, pos, &acc)
     return
@@ -1860,9 +1874,63 @@ fn variance_walk(var c: C, n: Int, name: Int, pos: Bool, var acc: [Int]):
     return
   if mentions(c, n, name): acc[0] = -1
 
+fn heritage_variance(var c: C, h: Int, name: Int, var acc: [Int]):
+  if not mentions(c, h, name): return
+  let e = c.t.nd[h].a
+  if c.t.nd[h].k != ast.N_EXPRTARGS or c.t.nd[e].k != ast.N_ID or c.t.nd[h].b < 0:
+    acc[0] = -1
+    return
+  let gs = bind.lookup_type(&c, h, c.t.nd[e].s)
+  if gs < 0:
+    acc[0] = -1
+    return
+  let xs = ast.items(c.t, c.t.nd[h].b)
+  for i in 0..xs.len:
+    let x = xs[i]
+    if not mentions(c, x, name): continue
+    let v = decl_variance(&c, gs, i)
+    if v == -3: continue
+    if v < 0:
+      acc[0] = -1
+      return
+    if (v & 4) != 0: acc[0] = acc[0] | 4
+    if (v & 1) != 0: variance_walk(&c, x, name, true, &acc)
+    if (v & 2) != 0: variance_walk(&c, x, name, false, &acc)
+
+# A parameter type that is one function type (with null or undefined beside it): the callback's
+# function type node, else -1 (compareSignaturesRelated's callbacks).
+fn callback_type(c: C, n0: Int) -> Int:
+  var n = n0
+  while n >= 0 and c.t.nd[n].k == ast.N_TPAREN: n = c.t.nd[n].a
+  if n < 0: return -1
+  if c.t.nd[n].k == ast.N_TFUNC and c.t.nd[n].f == 0: return n
+  if c.t.nd[n].k != ast.N_TUNION: return -1
+  var fnode = -1
+  for x0 in ast.items(c.t, c.t.nd[n].a):
+    var x = x0
+    while c.t.nd[x].k == ast.N_TPAREN: x = c.t.nd[x].a
+    let k = c.t.nd[x].k
+    if k == ast.N_TKW and (c.t.nd[x].f == scan.W_NULL or c.t.nd[x].f == scan.W_UNDEFINED): continue
+    if k == ast.N_TFUNC and c.t.nd[x].f == 0 and fnode < 0:
+      fnode = x
+      continue
+    return -1
+  return fnode
+
+# A signature's own type parameters whose constraints mention the name (their defaults aren't
+# compared when signatures relate).
+fn tps_constrain(c: C, tl: Int, name: Int) -> Bool:
+  if tl < 0: return false
+  for tp in ast.items(c.t, tl):
+    if c.t.nd[tp].k != ast.N_TPARAM:
+      if mentions(c, tp, name): return true
+      continue
+    if c.t.nd[tp].a >= 0 and mentions(c, c.t.nd[tp].a, name): return true
+  return false
+
 fn variance_sig(var c: C, sg: Int, name: Int, pos: Bool, var acc: [Int]):
   if sg < 0: return
-  if c.t.nd[sg].a >= 0 and mentions(c, c.t.nd[sg].a, name):
+  if tps_constrain(c, c.t.nd[sg].a, name):
     acc[0] = -1
     return
   if c.t.nd[sg].b >= 0:
@@ -1874,7 +1942,8 @@ fn variance_sig(var c: C, sg: Int, name: Int, pos: Bool, var acc: [Int]):
 fn decl_variance(var c: C, s: Int, i: Int) -> Int:
   let key = (s << 8) | i
   if key in c.var_cache: return c.var_cache[key]
-  c.var_cache[key] = -1
+  # (-3 while it's measured: a reference to it inside relates, VarianceFlags unknown, Ternary.Unknown)
+  c.var_cache[key] = -3
   var r = -1
   let decls = types.sym_decls(c, s)
   if (c.sk[s] & types.S_ALIAS) != 0 and decls.len == 1:
@@ -1909,12 +1978,17 @@ fn decl_variance(var c: C, s: Int, i: Int) -> Int:
         elif mk == ast.N_INDEXSIG: variance_walk(&c, c.t.nd[mm].b, name, true, &acc)
         elif mk == ast.N_METHOD and c.t.nd[mm].b >= 0:
           let sg = c.t.nd[mm].b
-          if c.t.nd[sg].a >= 0 and mentions(c, c.t.nd[sg].a, name):
+          if tps_constrain(c, c.t.nd[sg].a, name):
             acc[0] = -1
           else:
             if c.t.nd[sg].b >= 0:
               for pp in ast.items(c.t, c.t.nd[sg].b):
-                if mentions(c, c.t.nd[pp].b, name): acc[0] = acc[0] | 4
+                if mentions(c, c.t.nd[pp].b, name):
+                  # (a callback parameter's parameters are compared one way, strictly: through
+                  # it, contravariantly; any other parameter of a method bivariantly)
+                  let cbn = callback_type(c, c.t.nd[pp].b)
+                  if cbn >= 0: variance_walk(&c, cbn, name, false, &acc)
+                  else: acc[0] = acc[0] | 4
             variance_walk(&c, c.t.nd[sg].c, name, true, &acc)
         elif mk == ast.N_GET and c.t.nd[mm].b >= 0 and c.t.nd[c.t.nd[mm].b].c >= 0: variance_walk(&c, c.t.nd[c.t.nd[mm].b].c, name, true, &acc)
         elif mk == ast.N_SET and has_getter(c, mems, mm): continue
@@ -1930,10 +2004,10 @@ fn decl_variance(var c: C, s: Int, i: Int) -> Int:
         acc[0] = -1
         break
       let name = c.t.nd[tps[i]].s
-      # heritage clauses aren't measured
+      # heritage clauses: a base interface's type arguments through its variances
       if c.t.nd[d].b >= 0 and mentions(c, c.t.nd[d].b, name):
-        acc[0] = -1
-        break
+        for h in ast.items(c.t, c.t.nd[d].b): heritage_variance(&c, h, name, &acc)
+        if acc[0] < 0: break
       let mems = ast.items(c.t, c.t.nd[d].c)
       for mm in mems:
         let mk = c.t.nd[mm].k
@@ -1943,11 +2017,16 @@ fn decl_variance(var c: C, s: Int, i: Int) -> Int:
         elif mk == ast.N_METHOD and c.t.nd[mm].b >= 0:
           # (a method: its parameters bivariantly, its return as it is)
           let sg = c.t.nd[mm].b
-          if c.t.nd[sg].a >= 0 and mentions(c, c.t.nd[sg].a, name): acc[0] = -1
+          if tps_constrain(c, c.t.nd[sg].a, name): acc[0] = -1
           else:
             if c.t.nd[sg].b >= 0:
               for pp in ast.items(c.t, c.t.nd[sg].b):
-                if mentions(c, c.t.nd[pp].b, name): acc[0] = acc[0] | 4
+                if mentions(c, c.t.nd[pp].b, name):
+                  # (a callback parameter's parameters are compared one way, strictly: through
+                  # it, contravariantly; any other parameter of a method bivariantly)
+                  let cbn = callback_type(c, c.t.nd[pp].b)
+                  if cbn >= 0: variance_walk(&c, cbn, name, false, &acc)
+                  else: acc[0] = acc[0] | 4
             if acc[0] >= 0: variance_walk(&c, c.t.nd[sg].c, name, true, &acc)
         elif mk == ast.N_GET and c.t.nd[mm].b >= 0 and c.t.nd[c.t.nd[mm].b].c >= 0 and not (c.t.nd[c.t.nd[mm].b].a >= 0 and mentions(c, c.t.nd[c.t.nd[mm].b].a, name)):
           # (an accessor's read type is its getter's: a setter's parameter isn't compared)
@@ -2034,6 +2113,8 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
               # (only bivariant uses, a conditional type's check type or a method's parameter:
               # either way)
               elif mv > 0 and (mv & 3) == 0: ann = 4
+              # (contravariant, invariant: as measured)
+              elif mv > 0: ann = mv & 3
       if ann == 4:
         if not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]) and not assignable(&c, c.objs[to].args[i], c.objs[so].args[i]): return false
         continue
@@ -2945,7 +3026,14 @@ fn missing(var c: C, s: Int, t: Int, node: Int) -> Bool:
   for name in bind.prop_names(&c, t):
     let tp = bind.get_prop(&c, t, name)
     if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
-    if src_prop(&c, sp_of, name) < 0: miss.push(miss_name(&c, tp, name))
+    let sp0 = src_prop(&c, sp_of, name)
+    # (#x of another class is another member: the first one unmatched so, the plain message,
+    # "refers to a different member", reportUnmatchedProperty)
+    if sp0 >= 0 and c.t.names[name].startswith("#") and c.sdecl[sp0] != c.sdecl[tp]:
+      if miss.len == 0: return false
+      miss.push(miss_name(&c, tp, name))
+      continue
+    if sp0 < 0: miss.push(miss_name(&c, tp, name))
   if miss.len == 0: return false
   let ss = show.show(&c, s)
   let ts = show.show(&c, t)

@@ -985,7 +985,9 @@ fn resolve_module(var c: C, at: Int, spec_node: Int) -> Int:
 fn resolve_module1(var c: C, at: Int, spec_node: Int) -> Int:
   let f = c.t.nd[at].file
   let spec = nm(c, c.t.nd[spec_node].s)
-  for cand in module_candidates(c.files[f], spec):
+  for cand0 in module_candidates(c.files[f], spec):
+    var cand = cand0
+    if c.file_redirect.len > 0 and cand0 in c.file_redirect: cand = c.file_redirect[cand0] + ""
     if cand in c.file_index:
       let g = c.file_index[cand]
       if not is_module(c, c.roots[g]):
@@ -1005,7 +1007,8 @@ fn resolve_module1(var c: C, at: Int, spec_node: Int) -> Int:
   if spec in c.amb: return c.amb[spec]
   if spec in c.amb_short: return -1
   # (a package's declarations, found as TypeScript finds them: tsres)
-  let pk = c.files[f] + "|" + spec
+  var pk = c.files[f] + "|" + spec
+  if c.t.nd[at].k == ast.N_IMPORTCALL and (pk + "|esm") in c.pkg_res: pk = pk + "|esm"
   if pk in c.pkg_res:
     let target = c.pkg_res[pk]
     if target in c.file_index:
@@ -1017,6 +1020,11 @@ fn resolve_module1(var c: C, at: Int, spec_node: Int) -> Int:
     err(&c, spec_node, 2591, "Cannot find name '" + spec + "'. Do you need to install type definitions for node? Try `npm i --save-dev @types/node` and then add 'node' to the types field in your tsconfig.")
     return -1
   if (c.files[f] + "|" + spec) in c.pkg_present:
+    # (a package's augmentation of a module its package doesn't export, pinia's "vue/types/vue":
+    # TS2664 in a declaration file, unreported, the augmentation nothing)
+    if c.t.nd[at].k == ast.N_MODULE and f in c.pkg_files: return -1
+    # (a side-effect import of a package's JavaScript: resolved, untyped, nothing to report)
+    if c.t.nd[at].k == ast.N_IMPORT and c.t.nd[at].b < 0 and c.t.nd[at].c < 0 and c.t.nd[at].d < 0: return -1
     unsupported(&c, spec_node, "a package import")
     return -2
   let pa1 = pattern_ambient(c, spec)
@@ -2213,9 +2221,17 @@ fn type_ref(var c: C, n: Int) -> Int:
       if c.t.nd[lm].k == ast.N_ID:
         var ls = lookup_type(&c, n, c.t.nd[lm].s)
         if ls < 0: ls = lookup_value(&c, n, c.t.nd[lm].s)
-        if ls >= 0 and ls < c.sdtype.len and c.sdtype[ls] == c.error_t: return c.error_t
+        if ls >= 0 and ls < c.sdtype.len and c.sdtype[ls] == c.error_t: return c.unres_t
+      # (globalThis.T, T no global type: TS2694, the error type)
+      if c.t.nd[gl].k == ast.N_ID and nm(c, c.t.nd[gl].s) == "globalThis" and lookup_type(&c, n, c.t.nd[gl].s) < 0 and lookup_value(&c, n, c.t.nd[gl].s) < 0:
+        err_at(&c, n, c.t.nd[nn].pos + 11, 2694, "Namespace 'globalThis' has no exported member '" + nm(c, name) + "'.")
+        return c.error_t
       # ns.T with import * as ns: the module's exported type
       let mf = ns_import_file(&c, n, c.t.nd[nn].a)
+      # (a leftmost name that's nothing at all: TS2503, the error type)
+      if mf < 0 and c.t.nd[lm].k == ast.N_ID and lookup_type(&c, n, c.t.nd[lm].s) < 0 and lookup_value(&c, n, c.t.nd[lm].s) < 0 and not (c.t.nd[lm].s in c.gtypes):
+        err_at(&c, n, c.t.nd[lm].pos, 2503, "Cannot find namespace '" + nm(c, c.t.nd[lm].s) + "'.")
+        return c.error_t
       if mf < 0: return unsupported(&c, n, "a qualified type name")
       let e0 = exp_type_of(&c, mf, name)
       if e0 < 0: return unsupported(&c, n, "a missing member of a namespace import")
@@ -2240,12 +2256,17 @@ fn type_ref(var c: C, n: Int) -> Int:
       if c.debug: d = " " + nm(c, name)
       return unsupported(&c, n, "a lib type the checker can't resolve" + d)
     if not type_not_found(&c, nn, name): return unsupported(&c, nn, "a name TypeScript may suggest another name for")
-    return c.error_t
+    return c.unres_t
   return type_ref_sym(&c, n, s, name)
 
 fn intrinsic_alias(var c: C, n: Int, name: Str, a: Int) -> Int:
   if name == "NoInfer":
-    if chk.could_contain_tvars(&c, a): return lazy_unsupported(&c, n, "NoInfer of a generic type")
+    if chk.could_contain_tvars(&c, a):
+      # (a parameter's whole type: T, no inference from the argument there)
+      if n > 0 and c.parent[n] >= 0 and c.t.nd[c.parent[n]].k == ast.N_PARAM and c.t.nd[c.parent[n]].b == n:
+        c.noinfer_p[c.parent[n]] = true
+        return a
+      return lazy_unsupported(&c, n, "NoInfer of a generic type")
     return a
   if name != "Uppercase" and name != "Lowercase" and name != "Capitalize" and name != "Uncapitalize": return lazy_unsupported(&c, n, "an intrinsic type")
   var ts: [Int] = []
@@ -2260,6 +2281,31 @@ fn intrinsic_alias(var c: C, n: Int, name: Str, a: Int) -> Int:
     # (a type parameter, T[K], keyof T, or another such mapping: deferred)
     if k == TK_TPARAM or k == types.TK_INDEXED or k == types.TK_KEYOF or types.is_gen_mapping(c, m):
       ts.push(types.gen_mapping_of(&c, name, m))
+      continue
+    # (number, bigint: a pattern placeholder, the mapping of `${number}`)
+    if k == types.TK_NUMBER or k == types.TK_BIGINT:
+      let pt0 = types.template_of(&c, ["", ""], [m])
+      ts.push(types.gen_mapping_of(&c, name, pt0))
+      continue
+    # (a template literal type: its texts mapped, and its holes, applyTemplateStringMapping;
+    # the same mapping of a mapping: itself)
+    if k == types.TK_TEMPLATE and types.tmpl_mapping(c, m) == name:
+      ts.push(m)
+      continue
+    if k == types.TK_TEMPLATE and types.tmpl_mapping(c, m) == "":
+      var tx = types.tmpl_texts(c, m)
+      let hs0 = types.tmpl_holes(c, m)
+      var hs: [Int] = []
+      if name == "Uppercase" or name == "Lowercase":
+        for i in 0..tx.len: tx[i] = types.apply_mapping(name, tx[i])
+        for h in hs0: hs.push(intrinsic_alias(&c, n, name, h))
+      else:
+        for h in hs0: hs.push(h)
+        if tx[0] != "": tx[0] = types.apply_mapping(name, tx[0])
+        elif hs.len > 0: hs[0] = intrinsic_alias(&c, n, name, hs0[0])
+      for h in hs:
+        if c.tk[h] == types.TK_UNSUP: return h
+      ts.push(types.template_of(&c, tx, hs))
       continue
     if k != TK_STRLIT: return lazy_unsupported(&c, n, "a string mapping type of a non-literal")
     let v = c.t.names[c.ta[m]] + ""
@@ -2360,7 +2406,7 @@ fn type_ref_sym_args(var c: C, n: Int, s: Int, name: Int, argl: Int) -> Int:
   if (sk & S_ENUM) != 0: return enum_type(&c, s)
   if (sk & S_NAMESPACE) != 0: return unsupported(&c, n, "a namespace used as a type")
   # an import from a module that isn't found: any, silently
-  if s < c.sdtype.len and c.sdtype[s] == c.error_t: return c.error_t
+  if s < c.sdtype.len and c.sdtype[s] == c.error_t: return c.unres_t
   # (import * as m from "x" with export = e in x: m as a type is e's)
   if s in c.ns_file:
     let g = c.ns_file[s]
@@ -3045,6 +3091,8 @@ fn add_members(var c: C, t: Int, members: Int, owner: Int, statics: Bool):
     if (mf & ast.M_OPTIONAL) != 0: fl = fl | SF_OPTIONAL
     if (mf & ast.M_READONLY) != 0: fl = fl | SF_READONLY
     if (mf & ast.M_PRIVATE) != 0: fl = fl | types.SF_PRIVATE
+    # (#x: private, ECMAScript's)
+    if c.t.names[name].startswith("#"): fl = fl | types.SF_PRIVATE
     if (mf & ast.M_PROTECTED) != 0: fl = fl | types.SF_PROTECTED
     if is_static: fl = fl | SF_STATIC
     c.sflags[s] = fl
@@ -3289,12 +3337,7 @@ fn ctor_type_instance(var c: C, h: Int, vt: Int) -> Int:
     for x in ast.items(c.t, c.t.nd[h].b): targs.push(type_from(&c, x))
   if c.tk[vt] != TK_OBJ and c.tk[vt] != TK_INTER: return -1
   var r = -1
-  # (an intersection: its members' construct signatures)
-  var csgs: [Int] = []
-  for ii66_ in 0..types.ninter(c, vt):
-    let mv = types.inter_at(c, vt, ii66_)
-    for sg0 in sigs_of(&c, mv, true): csgs.push(sg0)
-  for sg in csgs:
+  for sg in ctor_sigs_mixed(&c, vt):
     var rt = c.sigs[sg].ret
     let ntp = c.sigs[sg].tparams.len
     if ntp != targs.len: continue
@@ -3310,6 +3353,53 @@ fn ctor_type_instance(var c: C, h: Int, vt: Int) -> Int:
       continue
     r = rt
   return r
+
+# The construct signatures of a type; an intersection's are its members' in order, but a mixin
+# constructor's (new (...args: any[]) => X) are dropped and their return types mixed into the
+# others' (resolveIntersectionTypeMembers, findMixins).
+fn ctor_sigs_mixed(var c: C, vt: Int) -> [Int]:
+  if c.tk[vt] != TK_INTER: return sigs_of(&c, vt, true)
+  let nm0 = types.ninter(c, vt)
+  var mixin: [Bool] = []
+  var nctor = 0
+  var nmix = 0
+  for i in 0..nm0:
+    let ss = sigs_of(&c, types.inter_at(c, vt, i), true)
+    if ss.len > 0: nctor += 1
+    var mx = false
+    if ss.len == 1:
+      let s0 = ss[0]
+      if c.sigs[s0].tparams.len == 0 and c.sigs[s0].ptypes.len == 1 and c.sigs[s0].pflags[0] == 2:
+        let pt0 = c.sigs[s0].ptypes[0]
+        if c.tk[pt0] == types.TK_ANY: mx = true
+        elif c.tk[pt0] == TK_OBJ and c.objs[c.ta[pt0]].kind == types.OK_REF and c.objs[c.ta[pt0]].args.len == 1 and c.tk[c.objs[c.ta[pt0]].args[0]] == types.TK_ANY: mx = true
+    if mx: nmix += 1
+    mixin.push(mx)
+  if nctor > 0 and nctor == nmix:
+    for i in 0..mixin.len:
+      if mixin[i]:
+        mixin[i] = false
+        nmix -= 1
+        break
+  var out: [Int] = []
+  for i in 0..nm0:
+    if mixin[i]: continue
+    for sg0 in sigs_of(&c, types.inter_at(c, vt, i), true):
+      if nmix == 0:
+        out.push(sg0)
+        continue
+      var parts: [Int] = []
+      for j in 0..nm0:
+        if j == i: parts.push(c.sigs[sg0].ret)
+        elif mixin[j]:
+          let mss = sigs_of(&c, types.inter_at(c, vt, j), true)
+          parts.push(c.sigs[mss[0]].ret)
+      let cp = types.sig_copy(c, sg0)
+      let ns = types.new_sig(&c, cp.node)
+      c.sigs[ns] = cp
+      c.sigs[ns].ret = types.inter_of(&c, parts)
+      out.push(ns)
+  return out
 
 # An object type, or an intersection of them (a base type with statically known members).
 fn obj_like(c: C, t: Int) -> Bool:

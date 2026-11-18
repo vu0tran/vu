@@ -1,0 +1,17 @@
+type NN<T> = [NonNullable<T>] extends [Array<infer U>] ? U : T;
+type OF<T> = { parse: FP<T | undefined>; input: string[]; default?: FD<T | undefined> };
+type FP<T> = (input: string, opts: { a: 1 } & OF<T>) => Promise<NN<T> | undefined>;
+type FD<T> = T | ((ctx: { x: OF<T> }) => Promise<T>);
+declare const o: OF<string>;
+export const a: OF<any> = o;
+declare const p: FP<string | undefined>;
+export const b: FP<any> = p;
+type Arg<T> = { parse: (s: string) => Promise<T>; options?: T[] };
+type ArgInput<T> = { [P in keyof T]: Arg<T[P]> };
+declare function parse<A>(o: { args?: ArgInput<A> }): A;
+declare const a1: Arg<string | undefined>;
+export const r1: number = parse({ args: { action: a1 } });
+type Flag<T> = { kind: 'b'; d?: T } | Arg<T>;
+type FlagInput<T> = { [P in keyof T]: Flag<T[P]> };
+declare function pf<F>(o: { flags?: FlagInput<F> }): F;
+export const r2: number = pf({ flags: { 'x-y': a1 } });

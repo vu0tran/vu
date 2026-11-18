@@ -1,0 +1,12 @@
+const v = { key: 'k', value: 'v', n: 1, opt: undefined as number | undefined };
+declare const f: 'key' | 'value';
+const { [f]: x, ...rest } = v;
+export const a: number = x;
+export const b: number = rest;
+declare const g: 'key' | 'nope';
+const { [g]: y } = v;
+declare const h: 'n' | 'opt';
+const { [h]: z, ...r2 } = v;
+export const c: string = z;
+export const d: number = r2;
+const { ['nope2']: y2 } = v;

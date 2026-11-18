@@ -137,6 +137,61 @@ fn real_or(ffi: Ffi, var dirs: {Str: Str}, p: Str) -> Str:
   if r == "": return p
   return r
 
+# TypeScript's package id of a file in node_modules: the package's name, the file's path in it, its
+# version and the versions of its peer dependencies installed beside it ("" outside a package). A
+# second copy of a package with the same id (pnpm's peer variants) redirects to the first file.
+fn package_id(var rv: lresolve.Rv, fs: Fs, var pid_pkg: {Str: Str}, p: Str) -> Str:
+  var at = -1
+  var x = p.find("/node_modules/")
+  while x >= 0:
+    at = x
+    x = p.find("/node_modules/", x + 1)
+  if at < 0: return ""
+  let rest = p[at + 14..p.len]
+  var nlen = rest.find("/")
+  if nlen < 0: return ""
+  if rest.startswith("@"):
+    let n2 = rest.find("/", nlen + 1)
+    if n2 < 0: return ""
+    nlen = n2
+  let pdir = p[0..at + 14 + nlen]
+  let sub = rest[nlen + 1..rest.len]
+  var head = pid_pkg.get(pdir, "?") + ""
+  if head == "?":
+    head = ""
+    let pi = lresolve.package_json(&rv, fs, pdir)
+    if pi >= 0:
+      let nvk = name_ver_peers(rv, pi)
+      if nvk[0] != "" and nvk[1] != "":
+        var peers = ""
+        let nmd = p[0..at + 13]
+        for ki in 2..nvk.len:
+          let qi = lresolve.package_json(&rv, fs, nmd + "/" + nvk[ki])
+          if qi >= 0: peers = peers + "+" + nvk[ki] + "@" + pkg_version(rv, qi)
+        head = nvk[0] + "|" + nvk[1] + peers
+    pid_pkg[pdir] = head + ""
+  if head == "": return ""
+  return head + "|" + sub
+
+fn name_ver_peers(rv: lresolve.Rv, pi: Int) -> [Str]:
+  let js = rv.pjs[pi]
+  var out = [lresolve.pstr(js, 0, "name"), lresolve.pstr(js, 0, "version")]
+  let pd = lconf.get(js, 0, "peerDependencies")
+  if pd >= 0 and js.v[pd].k == lconf.J_OBJ:
+    for key in js.v[pd].keys: out.push(key + "")
+  return out
+
+fn pkg_version(rv: lresolve.Rv, qi: Int) -> Str:
+  return lresolve.pstr(rv.pjs[qi], 0, "version")
+
+fn dedup_pkg(var rv: lresolve.Rv, fs: Fs, var pid_pkg: {Str: Str}, var pid_first: {Str: Str}, p: Str) -> Str:
+  if p.find("/node_modules/") < 0: return p
+  let id = package_id(&rv, fs, &pid_pkg, p)
+  if id == "": return p
+  if id in pid_first: return pid_first[id] + ""
+  pid_first[id] = p + ""
+  return p
+
 # The specifiers of import("x") in a source (import types, scanned as text: a dynamic import()
 # in code finds its module too, which tsc also loads).
 fn import_type_specs(src: Str) -> [Str]:
@@ -371,6 +426,7 @@ type Prog:
   pvals: [[Str]] = []
   node16: Bool = false   # moduleResolution node16 / nodenext: a CommonJS importer's packages by "require"
   meta_ok: Bool = false  # module es2020, es2022, esnext or preserve: import.meta is allowed everywhere
+  tla_ok: Bool = false   # module es2022, esnext or preserve: top-level await
   exp_deco: Bool = false  # experimentalDecorators
   no_unused: Bool = false  # noUnusedLocals
   skip_lib: Bool = false   # skipLibCheck: no declaration file's errors
@@ -524,6 +580,9 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   # is one package, and its imports resolve from where it really is)
   var rdirs: {Str: Str} = {}
   var res_memo: {Str: Str} = {}
+  var pid_pkg: {Str: Str} = {}
+  var pid_first: {Str: Str} = {}
+  var redirects: {Str: Str} = {}
   for ti in 0..tfiles.len: tfiles[ti] = real_or(ffi, &rdirs, tfiles[ti])
   if os.env("VTSC_NO_PACKAGES") == "":
     for f in tfiles:
@@ -622,7 +681,9 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       sps.push(x)
       sp_imp.push(true)
     # (import("x") types)
+    var dyn_specs: {Str: Bool} = {}
     for x in import_type_specs(src):
+      dyn_specs[x] = true
       sps.push(x)
       sp_imp.push(true)
     # (each specifier once: a declaration file can name import("vue") thousands of times)
@@ -660,6 +721,23 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
           continue
       if os.env("VTSC_NO_PACKAGES") == "" and tsres.is_bare(sp):
         rv.req = pg.node16 and importer_cjs(fs, &rv, abs_path)
+        # (import() in a CommonJS file resolves as an ECMAScript import: the "import" condition)
+        if rv.req and sp in dyn_specs:
+          rv.req = false
+          let ekey = bind.dir_of(abs_path) + "|" + sp + "|false"
+          var etarget = res_memo.get(ekey, "?") + ""
+          if etarget == "?":
+            etarget = real_or(ffi, &rdirs, tsres.resolve_types(&rv, fs, abs_path, sp))
+            res_memo[ekey] = etarget + ""
+          etarget = dedup_pkg(&rv, fs, &pid_pkg, &pid_first, etarget)
+          rv.req = true
+          if etarget != "":
+            pkg_res[path + "|" + sp + "|esm"] = etarget + ""
+            if not (etarget in queued):
+              queued[etarget] = true
+              queue.push(etarget + "")
+              pkgset[etarget] = true
+            my_deps.push(etarget + "")
         # (by the importer's folder, the mode and the specifier: a package's files import the
         # same packages many times)
         let rkey = bind.dir_of(abs_path) + "|" + sp + "|{rv.req}"
@@ -667,6 +745,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
         if ptarget == "?":
           ptarget = real_or(ffi, &rdirs, tsres.resolve_types(&rv, fs, abs_path, sp))
           res_memo[rkey] = ptarget + ""
+        ptarget = dedup_pkg(&rv, fs, &pid_pkg, &pid_first, ptarget)
         if os.env("VTSC_PKG_LOG") != "": eprint("PKG {path} {sp} -> {ptarget}")
         if ptarget != "":
           pkg_res[path + "|" + sp] = ptarget + ""
@@ -678,7 +757,11 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
           if is_imp: my_imps.push(ptarget + "")
           continue
       if not bind.is_relative(sp) and package_may_exist(fs, cwd0, path, sp): pkg_present[path + "|" + sp] = true
-      for cand in bind.module_candidates(path, sp):
+      for cand0 in bind.module_candidates(path, sp):
+        var cand = cand0 + ""
+        if pid_first.len > 0 and cand.find("/node_modules/") >= 0 and fs.exists(cand):
+          cand = dedup_pkg(&rv, fs, &pid_pkg, &pid_first, cand)
+          if cand != cand0: redirects[cand0] = cand + ""
         if cand in queued:
           my_deps.push(cand + "")
           if is_imp: my_imps.push(cand + "")
@@ -711,10 +794,12 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   c.unknown_catch = pg.unknown_catch
   c.side_unchecked = pg.side_unchecked
   c.meta_ok = pg.meta_ok
+  c.tla_ok = pg.tla_ok
   c.exp_deco = pg.exp_deco
   for k, v in pkg_present: c.pkg_present[k] = v
   for k, v in cjs_roots: c.cjs_roots[k] = v
   for k, v in pkg_res: c.pkg_res[k] = v + ""
+  for k, v in redirects: c.file_redirect[k] = v + ""
   for fx in 0..names.len:
     c.files.push(names[fx] + "")
     c.roots.push(roots[fx])
@@ -1165,6 +1250,7 @@ fn read_config(fs: Fs, os: Os, pp: Str) -> Conf:
   if mr == "" and (mo == "node16" or mo == "node18" or mo == "node20" or mo == "nodenext"): mr = "nodenext"
   pg.node16 = mr == "node16" or mr == "nodenext"
   pg.meta_ok = mo == "es2020" or mo == "es2022" or mo == "esnext" or mo == "preserve"
+  pg.tla_ok = mo == "es2022" or mo == "esnext" or mo == "preserve"
   pg.exp_deco = cfg.opts.get("experimentaldecorators", "") == "true"
   pg.no_unused = cfg.opts.get("nounusedlocals", "") == "true"
   pg.skip_lib = cfg.opts.get("skiplibcheck", "") == "true"
@@ -1178,7 +1264,7 @@ fn read_config(fs: Fs, os: Os, pp: Str) -> Conf:
   return cf
 
 fn copy_prog(pg: Prog) -> Prog:
-  var pk = Prog(has_types: pg.has_types, tdir: pg.tdir + "", spi: pg.spi, unknown_catch: pg.unknown_catch, node16: pg.node16, meta_ok: pg.meta_ok, exp_deco: pg.exp_deco, no_unused: pg.no_unused, skip_lib: pg.skip_lib, side_unchecked: pg.side_unchecked, cwd: pg.cwd + "", abs_names: pg.abs_names, lint: pg.lint + "")
+  var pk = Prog(has_types: pg.has_types, tdir: pg.tdir + "", spi: pg.spi, unknown_catch: pg.unknown_catch, node16: pg.node16, meta_ok: pg.meta_ok, tla_ok: pg.tla_ok, exp_deco: pg.exp_deco, no_unused: pg.no_unused, skip_lib: pg.skip_lib, side_unchecked: pg.side_unchecked, cwd: pg.cwd + "", abs_names: pg.abs_names, lint: pg.lint + "")
   for k, v in pg.lint_files: pk.lint_files[k] = v + ""
   for x in pg.redir_out: pk.redir_out.push(x + "")
   for x in pg.redir_src: pk.redir_src.push(x + "")
@@ -1333,7 +1419,7 @@ fn check_inferred_lint(fs: Fs, os: Os, ffi: Ffi, cwd: Str, files: [Str], lib: St
     cf.files.push(f + "")
     p.members[f] = true
   cf.nlisted = files.len
-  var pg = Prog(has_types: true, meta_ok: true, cwd: cwd + "")
+  var pg = Prog(has_types: true, meta_ok: true, tla_ok: true, cwd: cwd + "")
   check_conf(fs, os, ffi, cf, pg, "es2022", lib, jobs, lint, &p)
   return p
 

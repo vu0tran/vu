@@ -1,0 +1,13 @@
+declare const k: any;
+declare const s: string;
+declare const base: Record<string, number>;
+const a = { [k]: 1, b: 'x' };
+const a1: { [n: number]: number } = a;
+const b = { ...base, [k]: 2 };
+const b1: null = b.zz;
+const c = { ...base, [s]: 2 };
+const c1: null = c.zz;
+const d: Record<string, { n: number }> = { ...base as any, [k]: { n: 1 } };
+const e = { x: 1, [k]: 'y' };
+e[0].toFixed();
+export {};

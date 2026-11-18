@@ -1,0 +1,17 @@
+import type { W } from 'nope-pkg';
+type C1 = W extends Function ? 1 : 2;
+type C2 = string extends W ? 1 : 2;
+type C3 = Nope extends Function ? 1 : 2;
+type C4 = string extends Nope ? 1 : 2;
+type G<T> = T extends Function ? 1 : 2;
+type C5 = G<W>;
+type C6 = G<Nope>;
+type H<T> = string extends T ? 1 : 2;
+type C7 = H<W>;
+export const c1: C1 = 3;
+export const c2: C2 = 3;
+export const c3: C3 = 3;
+export const c4: C4 = 3;
+export const c5: C5 = 3;
+export const c6: C6 = 3;
+export const c7: C7 = 3;

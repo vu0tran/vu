@@ -710,6 +710,60 @@ Also: a statement past 400,000 type instantiations (was 1,000,000) leaves its fi
 most n8n's checked statements need is 390,000, and reaching the limit took up to 1.6 s
 (`core`'s `supply-data-context.ts`, lodash's `get`), so `core`'s check went from 2.8 s to 1.5 s.
 
+### Fewer files left to tsgolint (2026-11-18, later)
+
+Same setup (`hyw.sh` over the 33 packages, oxlint 1.90.0 with tsgolint against `vlint` with
+`VLINT_VTSC=1`, cache cleared for the first run): every line equal to oxlint's in all 33
+packages, first run and second. Packages that used to send files to tsgolint and now don't:
+`frontend/@n8n/chat` (53 of 53 files, was 41), `frontend/@n8n/stores` (39 of 39, was 29),
+`@n8n/api-types` (700 of 700, was 697). Fewer in `@n8n/node-cli` (35 of 59 in its main program,
+was 20) and `@n8n/ai-utilities` (164 of 183, was 152).
+
+| | oxlint | first run | next run |
+|---|---|---|---|
+| `core` | 4.55 s | 2.22 s | 0.12 s |
+| `frontend/@n8n/chat` | 1.19 s | 0.50 s | 0.03 s |
+| `frontend/@n8n/stores` | 1.42 s | 0.69 s | 0.03 s |
+| `@n8n/engine` | 1.55 s | 0.55 s | 0.06 s |
+| `workflow` | 3.13 s | 1.53 s | 0.14 s |
+| `@n8n/api-types` | 8.32 s | 6.07 s | 0.18 s |
+| `@n8n/workflow-sdk` | 2.62 s | 2.14 s | 0.12 s |
+| `@n8n/ai-utilities` | 2.60 s | 2.97 s | 0.06 s |
+| `frontend/@n8n/composables` | 3.53 s | 4.33 s | 0.03 s |
+| `@n8n/node-cli` | 1.04 s | 1.20 s | 0.03 s |
+| `@n8n/eslint-config` | 0.95 s | 0.94 s | 0.15 s |
+| `@n8n/decorators` | 2.16 s | 2.16 s | 0.07 s |
+| 21 other packages | 0.3-2.4 s each | 2-3.4 times less | 0.02-0.06 s |
+
+Not yet twice as fast: the packages where tsgolint still starts for a few files (its start costs
+about two seconds: composables 1 file, ai-utilities 20, node-cli 25 of its templates' programs,
+eslint-config 8, decorators 118 stale `.js` outputs), and `api-types` and `workflow-sdk`, whose
+zod schemas vtsc checks in 6 s of CPU on two cores.
+
+What changed (each checked against tsc 7, 22 new vtests):
+- **Errors vtsc got wrong, silently, now right**: a function inside another function that an
+  overload candidate checked and dropped was never checked again (pinia's `defineStore` setup
+  functions: no errors in their nested functions); `Partial<X>` and conditional types of an
+  unresolved `X` (tsgo's unresolvedType is any in a conditional type, the error type isn't);
+  same-generic type arguments compared covariantly whatever the interface's measured variance
+  (`B<'a'>` assignable to `B<string>` with `f: (x: T) => void`); inference through a type alias's
+  type arguments (oclif's `Args.string()`); a union member that's an instantiation of the same alias
+  as the source takes the inference (`Flag<T>`); single-quoted property names print with single
+  quotes; parameters of immediately invoked functions typed by their arguments (they were
+  implicitly any, TS7006).
+- **Modeled now**: destructured discriminants (`const { done, value } = await reader.read()`;
+  `if (done)` narrows `value`); computed names of a union of literals in destructuring patterns;
+  a computed key beside a spread (the spread drops the index signature); `{} | undefined` and
+  `T | undefined` spreads (tsc's partial of the constraint); `NoInfer<T>` parameters; mixin
+  constructor intersections as class bases (ts-morph); `this is T` predicates of union
+  signatures; type guards on `Awaited<T>`; async generators with a return type; `#private`
+  names; properties assigned in loops (the loop's fixpoint, as for variables); `import()` in a
+  CommonJS file (the `import` condition); TypeScript's package deduplication (two pnpm copies of
+  one package version are one: vitest's matchers reach the tests' `Assertion`); a side-effect
+  import of a package's JavaScript; interface heritage in variance; variance of recursive aliases
+  (a reference inside is related, as tsc's in-progress variance); callback parameters of methods
+  compared strictly (`Promise<T>` stays covariant); Lowercase and the like of template literals.
+
 ### All of n8n core checked, twice as fast as oxlint (2026-11-18)
 
 Same machine and setup (`hyw.sh`, every line equal to oxlint's in all 33 packages, first run and

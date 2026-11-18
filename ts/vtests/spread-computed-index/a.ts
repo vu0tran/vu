@@ -1,0 +1,16 @@
+declare const k: string;
+declare const meta: { a: number } | undefined;
+const o1 = { action: 'x', [k]: 1, ...(meta ? { metadata: meta } : {}) };
+export const t1: number = o1;
+const o2 = { action: 'x', [k]: 1, ...meta };
+export const t2: number = o2;
+const o3 = { action: 'x', [k]: 1, ...{ b: 2 }, c: 3 };
+export const t3: number = o3;
+declare const n: number;
+const o4 = { [n]: 's', ...{ b: 2 } };
+export const t4: number = o4;
+declare const e: {} | undefined;
+const o5 = { action: 'x', ...e, b: 1 };
+export const t5: number = o5;
+const o6 = { ...e };
+export const t6: number = o6;
