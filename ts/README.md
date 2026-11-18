@@ -230,7 +230,36 @@ TypeScript, and TS2804 for a private name both static and not); `@dec()` followe
 member on the next line (`[X]: string`) is a decorator and a member, not an element access (the
 parser is shared, so vtsc gets this too); no-setter-return's span on a parenthesized arrow body.
 
-## Rules a production configuration was missing (2026-11-18)
+## The React Compiler rules (2026-11-18, latest)
+
+oxlint's 22 rules from oxc's port of the React Compiler (`react(purity)`, `refs`,
+`set-state-in-effect`, `memo-dependencies`, `exhaustive-effect-dependencies`, `immutability`,
+`hooks`, `todo`, ...) all come from one compile of each file's components and hooks, each rule
+reporting the diagnostics of its category. vlint now runs the same compiler, ported to Vu (`rc_*.vu`,
+about 15,500 lines with its generated tables, read side by side with `oxc_react_compiler` 1.90.0): discovery of components
+and hooks and the suppression comments, lowering vlint's syntax tree to the compiler's HIR, SSA,
+constant propagation, type inference with oxc's shapes and globals (`rc_gdefs.vu` is generated from
+`globals.rs` by `rc_gen/gen_shapes.py`), the mutation and aliasing analysis (effects, then ranges),
+reactive places and scope variables, and every validation up to `ValidateStaticComponents`. 21 of
+the 22 rules are on in `limpl.vu`.
+
+Compared with oxlint 1.90.0, every React Compiler rule on, diagnostics compared with message, help,
+note and every label:
+
+| files | oxlint | vlint | identical | missing: preserve-manual-memoization | other differences |
+|---|---|---|---|---|---|
+| oxc's compiler fixtures (1,846 files) | 464 | 447 | 444 | 16 | 3 extra, 1 more missing (below) |
+| the `.tsx`/`.jsx` of 21 repositories (5,829 files: excalidraw, tldraw, immich, next.js, supabase, outline, mantine, ...) | 780 | 771 | 771 | 9 | none |
+| outline's `app/` with its own `.oxlintrc.json` | 159 | 149 | 149 | 10 | none |
+
+Not done: `preserve-manual-memoization` (its validation runs on the reactive function, after about 15
+scope passes that aren't ported) is still named on stderr as not implemented. The other fixture
+differences come from those passes too: two invariants and a `todo` they throw (oxlint then
+reports only that error, vlint the function's earlier ones: the 3 extra are such a file's 2 `hooks`
+errors, and a `.js` file using TypeScript syntax, which oxc refuses to parse and vlint's parser
+accepts). Speed: the 5,829 files take 4.4 s with these rules, as with oxlint.
+
+## Rules a production configuration was missing (2026-11-18, earlier)
 
 A company configuration (not public) had these rules on, where vlint reported nothing. In order of
 how often oxlint reported them there:
@@ -255,9 +284,8 @@ saved probe `probes/round-r9` has all of them on one project (20 diagnostics, id
 regression checks (n8n defaults 3,688, editor-ui 1,377, lc 308 files, oxc's cases for earlier rules,
 the probes) are unchanged.
 
-Not done: the React Compiler rules oxlint reports as `react(purity)`, `set-state-in-effect`,
-`preserve-manual-memoization`, `refs`, `memo-dependencies` (they run oxc's port of the React
-Compiler, about 100 files), and the other 22 `jsdoc` rules.
+Not done then: the React Compiler rules (done since, above, except
+`preserve-manual-memoization`), and the other 22 `jsdoc` rules.
 
 **Rules vlint doesn't have are now named on stderr.** When the configuration turns on a rule vlint
 doesn't implement, vlint prints, once per run, `vlint: N enabled rules aren't implemented yet and

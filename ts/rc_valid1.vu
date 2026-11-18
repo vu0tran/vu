@@ -1,0 +1,268 @@
+# Validations after InferMutationAliasingRanges (oxc_react_compiler react_compiler_validation):
+# ValidateLocalsNotReassignedAfterRender, ValidateNoSetStateInRender, ValidateNoJsxInTryStatement
+# and ValidateNoFreezingKnownMutableFunctions.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_diags_hand
+import rc_ops
+import rc_cfg
+import rc_dom
+import rc_pass1
+import rc_shapes
+import rc_gdefs
+from rc_hir import Sp, Place, HirFunction, InstrValue
+from rc_env import Env, Diag
+
+fn var_name(e: Env, id: Int, dflt: Str) -> Str:
+  if e.identifiers[id].name_kind == 1: return "`{e.identifiers[id].name}`"
+  return dflt
+
+fn fn_shape(e: Env, id: Int) -> Str:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TFunction(sh, has, _, _):
+      if has: return sh
+    _: return ""
+  return ""
+
+fn obj_shape(e: Env, id: Int) -> Str:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TObject(sh, has):
+      if has: return sh
+    _: return ""
+  return ""
+
+fn has_no_alias(e: Env, id: Int) -> Bool:
+  let s = rc_shapes.function_signature(e.reg, e.types[e.identifiers[id].type_])
+  return s.len > 0 and s[0].no_alias
+
+# ---- ValidateLocalsNotReassignedAfterRender
+
+fn validate_locals_not_reassigned_after_render(f: HirFunction, var e: Env):
+  var ctx_vars: {Int: Bool} = {}
+  var diags: [Diag] = []
+  let r = get_context_reassignment(f, e, &ctx_vars, false, false, &diags)
+  for i in 0..diags.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &diags[i])
+    e.errors.push(d)
+  if r.len > 0:
+    let p = r[0]
+    e.errors.push(rc_diags_hand.reassigned_after_render(var_name(e, p.identifier, "variable"), p.sp, e.identifiers[p.identifier].sp))
+
+# [] none, else the reassigned place
+fn get_context_reassignment(f: HirFunction, e: Env, var ctx_vars: {Int: Bool}, is_fe: Bool, is_async: Bool, var diags: [Diag]) -> [Place]:
+  var rf: {Int: Place} = {}
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let ins = f.instructions[iid]
+      let lid = ins.lvalue.identifier
+      match ins.value:
+        rc_hir.FunctionExpression(_, _, _, fid, _, _):
+          if reassign_fn(e, fid, &ctx_vars, is_async, &diags, &rf, lid): return []
+        rc_hir.ObjectMethod(_, fid):
+          if reassign_fn(e, fid, &ctx_vars, is_async, &diags, &rf, lid): return []
+        rc_hir.StoreLocal(lv, v, _):
+          if v.identifier in rf:
+            let p = rf[v.identifier]
+            rf[lv.place.identifier] = p
+            rf[lid] = p
+        rc_hir.LoadLocal(p, _):
+          if p.identifier in rf: rf[lid] = rf[p.identifier]
+        rc_hir.DeclareContext(lv, _):
+          if not is_fe: ctx_vars[lv.place.identifier] = true
+        rc_hir.StoreContext(lv, v, _):
+          if is_fe and lv.place.identifier in ctx_vars: return [lv.place]
+          if not is_fe: ctx_vars[lv.place.identifier] = true
+          if v.identifier in rf:
+            let p = rf[v.identifier]
+            rf[lv.place.identifier] = p
+            rf[lid] = p
+        _:
+          var ops: [Place] = []
+          var done = false
+          match ins.value:
+            rc_hir.CallExpression(c, _, _):
+              if has_no_alias(e, c.identifier):
+                ops = [c]
+                done = true
+            rc_hir.MethodCall(r, p, _, _):
+              if has_no_alias(e, p.identifier):
+                ops = [r, p]
+                done = true
+            rc_hir.TaggedTemplateExpression(t, _, _, _, _):
+              if has_no_alias(e, t.identifier):
+                ops = [t]
+                done = true
+            _: nop()
+          if not done: ops = rc_ops.value_operands(ins.value, e)
+          for op in ops:
+            if op.identifier in rf:
+              let rp = rf[op.identifier]
+              if op.effect == rc_hir.EF_FREEZE: return [rp]
+              for l in rc_ops.instr_lvalues(ins): rf[l.identifier] = rp
+    for op in rc_ops.term_operands(f.body.blocks[bid].terminal):
+      if op.identifier in rf: return [rf[op.identifier]]
+  return []
+
+# true: an async reassignment was reported (the caller returns none)
+fn reassign_fn(e: Env, fid: Int, var ctx_vars: {Int: Bool}, is_async: Bool, var diags: [Diag], var rf: {Int: Place}, lid: Int) -> Bool:
+  let inner_async = is_async or e.functions[fid].is_async
+  var r = get_context_reassignment(e.functions[fid], e, &ctx_vars, true, inner_async, &diags)
+  if r.len == 0:
+    for cp in e.functions[fid].context:
+      if r.len == 0 and cp.identifier in rf: r = [rf[cp.identifier]]
+  if r.len > 0:
+    let rp = r[0]
+    if inner_async:
+      diags.push(rc_diags_hand.reassigned_in_async_function(var_name(e, rp.identifier, "variable"), rp.sp, e.identifiers[rp.identifier].sp))
+      return true
+    rf[lid] = rp
+  return false
+
+# ---- ValidateNoSetStateInRender
+
+fn is_set_state(e: Env, id: Int) -> Bool:
+  return fn_shape(e, id) == rc_gdefs.BUILT_IN_SET_STATE_ID
+
+fn validate_no_set_state_in_render(f: HirFunction, var e: Env):
+  var uncond: {Int: Bool} = {}
+  let nb = rc_env.next_block_id(&e)
+  var errs: [Diag] = []
+  set_state_impl(f, &e, nb, &uncond, &errs)
+  if e.failed: return
+  for i in 0..errs.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &errs[i])
+    e.errors.push(d)
+
+fn set_state_impl(f: HirFunction, var e: Env, nb: Int, var ussf: {Int: Bool}, var errs: [Diag]):
+  let ub = rc_dom.compute_unconditional_blocks(f, &e, nb)
+  if e.failed: return
+  var memo = false
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      var inner = -1
+      match f.instructions[iid].value:
+        rc_hir.LoadLocal(p, _):
+          if p.identifier in ussf: ussf[lid] = true
+        rc_hir.StoreLocal(lv, v, _):
+          if v.identifier in ussf:
+            ussf[lv.place.identifier] = true
+            ussf[lid] = true
+        rc_hir.ObjectMethod(_, fid): inner = fid
+        rc_hir.FunctionExpression(_, _, _, fid, _, _): inner = fid
+        rc_hir.StartMemoize(_, _, _, _, _, _, _): memo = true
+        rc_hir.FinishMemoize(_, _, _, _): memo = false
+        rc_hir.CallExpression(c, _, _):
+          if is_set_state(e, c.identifier) or c.identifier in ussf:
+            if memo: errs.push(rc_diags.set_state_in_use_memo(c.sp))
+            elif bid in ub: errs.push(rc_diags.set_state_in_render(c.sp))
+        _: nop()
+      if inner >= 0:
+        var any = false
+        for cp in e.functions[inner].context:
+          if is_set_state(e, cp.identifier) or cp.identifier in ussf: any = true
+        if any:
+          var ie: [Diag] = []
+          var fcopy = rc_cfg.placeholder_function()
+          swap(&fcopy, &e.functions[inner])
+          set_state_impl(fcopy, &e, nb, &ussf, &ie)
+          swap(&fcopy, &e.functions[inner])
+          if e.failed: return
+          if ie.len > 0: ussf[lid] = true
+
+# ---- ValidateNoJsxInTryStatement (its errors are events)
+
+fn validate_no_jsx_in_try(f: HirFunction) -> [Diag]:
+  var active: [Int] = []
+  var out: [Diag] = []
+  for bid in f.body.order:
+    var keep: [Int] = []
+    for a in active:
+      if a != bid: keep.push(a)
+    active = keep
+    if active.len > 0:
+      for iid in f.body.blocks[bid].instructions:
+        match f.instructions[iid].value:
+          rc_hir.JsxExpression(_, _, _, _, _, _, sp, _, opening_name, _, _):
+            var s = opening_name
+            if s.s < 0: s = sp
+            out.push(rc_diags.jsx_in_try(s))
+          rc_hir.JsxFragment(_, sp, opening, _):
+            var s = opening
+            if s.s < 0: s = sp
+            out.push(rc_diags.jsx_in_try(s))
+          _: nop()
+    match f.body.blocks[bid].terminal:
+      rc_hir.Try(_, _, _, _, h, _, _, _, _): active.push(h)
+      _: nop()
+  return out
+
+# ---- ValidateNoFreezingKnownMutableFunctions
+
+type MInfo:
+  id: Int
+  sp: Sp
+
+fn is_ref_like_mutable(e: Env, id: Int) -> Bool:
+  let s = obj_shape(e, id)
+  return s == rc_gdefs.BUILT_IN_USE_REF_ID or s == rc_gdefs.REANIMATED_SHARED_VALUE_ID
+
+fn validate_no_freezing_known_mutable_functions(f: HirFunction, var e: Env):
+  var cme: {Int: MInfo} = {}
+  var fsp: {Int: Sp} = {}
+  var diags: [Diag] = []
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.LoadLocal(p, _):
+          if p.identifier in cme: cme[lid] = cme[p.identifier]
+          if p.identifier in fsp: fsp[lid] = fsp[p.identifier]
+        rc_hir.StoreLocal(lv, v, _):
+          if v.identifier in cme:
+            let m = cme[v.identifier]
+            cme[lid] = m
+            cme[lv.place.identifier] = m
+          if v.identifier in fsp:
+            let s = fsp[v.identifier]
+            fsp[lid] = s
+            fsp[lv.place.identifier] = s
+        rc_hir.FunctionExpression(_, _, _, fid, _, _):
+          let ds = rc_pass1.fn_diagnostic_span(e.functions[fid])
+          if ds.s >= 0: fsp[lid] = ds
+          if e.functions[fid].has_aliasing:
+            var ctx: {Int: Bool} = {}
+            for cp in e.functions[fid].context: ctx[cp.identifier] = true
+            var stop = false
+            for x in e.functions[fid].aliasing_effects:
+              if stop: continue
+              let k = x.kind
+              let vid = x.a.identifier
+              if k == rc_hir.AE_MUTATE or k == rc_hir.AE_MUTATE_TRANSITIVE:
+                if vid in cme: cme[lid] = cme[vid]
+                elif vid in ctx and not is_ref_like_mutable(e, vid):
+                  cme[lid] = MInfo(vid, x.a.sp)
+                  stop = true
+              elif k == rc_hir.AE_MUTATE_CONDITIONALLY or k == rc_hir.AE_MUTATE_TRANSITIVE_CONDITIONALLY:
+                if vid in cme: cme[lid] = cme[vid]
+        _:
+          for op in rc_ops.value_operands(f.instructions[iid].value, e): check_freeze(op, cme, fsp, e, &diags)
+    for op in rc_ops.term_operands(f.body.blocks[bid].terminal): check_freeze(op, cme, fsp, e, &diags)
+  for i in 0..diags.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &diags[i])
+    e.errors.push(d)
+
+fn check_freeze(op: Place, cme: {Int: MInfo}, fsp: {Int: Sp}, e: Env, var diags: [Diag]):
+  if op.effect == rc_hir.EF_FREEZE and op.identifier in cme:
+    let m = cme[op.identifier]
+    var s = op.sp
+    if op.identifier in fsp: s = fsp[op.identifier]
+    diags.push(rc_diags_hand.known_mutable_function(var_name(e, m.id, "a local variable"), s, m.sp))
+
+fn nop():
+  return

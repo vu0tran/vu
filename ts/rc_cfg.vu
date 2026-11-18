@@ -1,0 +1,298 @@
+# Control-flow passes over a lowered function: get_reverse_postordered_blocks on a HIR
+# (hir_builder.rs), prune_maybe_throws and merge_consecutive_blocks (react_compiler_optimization).
+
+import rc_hir
+import rc_env
+import rc_build
+import rc_visit
+import rc_ops
+from rc_hir import Sp, Place, Instruction, InstrValue, Terminal, BasicBlock, HIR, HirFunction, Phi
+from rc_env import Env
+
+fn placeholder_function() -> HirFunction:
+  let np = Place(-1, rc_hir.EF_UNKNOWN, false, rc_hir.nosp())
+  return HirFunction(rc_hir.nosp(), rc_hir.nosp(), "", false, rc_hir.nosp(), false, np, "", rc_hir.FN_OTHER, [], np, [], HIR(0, [], {}), [], false, false, [], false, [])
+
+fn empty_block() -> BasicBlock:
+  return BasicBlock(0, 0, [], rc_hir.Unreachable(0, rc_hir.nosp()), [], [])
+
+# the functions a function's instructions lower (in block order)
+fn inner_functions(f: HirFunction) -> [Int]:
+  var out: [Int] = []
+  for id_i in 0..f.body.order.len:
+    let id = f.body.order[id_i]
+    for iid in f.body.blocks[id].instructions:
+      let x = rc_ops.value_func(f.instructions[iid].value)
+      if x >= 0: out.push(x)
+  return out
+
+# ---- get_reverse_postordered_blocks
+
+fn rpo_visit(hir: HIR, id: Int, is_used: Bool, var visited: {Int: Bool}, var used: {Int: Bool}, var used_ft: {Int: Bool}, var post: [Int]):
+  let was_used = used.get(id, false)
+  let was_visited = visited.get(id, false)
+  visited[id] = true
+  if is_used: used[id] = true
+  if was_visited and (was_used or not is_used): return
+  let term = hir.blocks[id].terminal
+  let succ = rc_visit.successors(term)
+  let ft = rc_visit.fallthrough(term)
+  if ft >= 0:
+    if is_used: used_ft[ft] = true
+    rpo_visit(hir, ft, false, &visited, &used, &used_ft, &post)
+  var i = succ.len - 1
+  while i >= 0:
+    rpo_visit(hir, succ[i], is_used, &visited, &used, &used_ft, &post)
+    i -= 1
+  if not was_visited: post.push(id)
+
+fn reverse_postorder(var hir: HIR):
+  var visited: {Int: Bool} = {}
+  var used: {Int: Bool} = {}
+  var used_ft: {Int: Bool} = {}
+  var post: [Int] = []
+  rpo_visit(hir, hir.entry, true, &visited, &used, &used_ft, &post)
+  var blocks: {Int: BasicBlock} = {}
+  var order: [Int] = []
+  var i = post.len - 1
+  while i >= 0:
+    let id = post[i]
+    i -= 1
+    if used.get(id, false):
+      var b = empty_block()
+      swap(&b, &hir.blocks[id])
+      blocks[id] = b
+      order.push(id)
+    elif used_ft.get(id, false):
+      let ob = hir.blocks[id]
+      var preds: [Int] = []
+      for p in ob.preds: preds.push(p)
+      let t = rc_hir.Unreachable(rc_visit.term_id(ob.terminal), rc_visit.term_sp(ob.terminal))
+      blocks[id] = BasicBlock(ob.kind, id, [], t, preds, [])
+      order.push(id)
+  hir.blocks = blocks
+  hir.order = order
+
+# ---- merge_consecutive_blocks
+
+fn merged_get(m: {Int: Int}, b: Int) -> Int:
+  var cur = b
+  while cur in m: cur = m[cur]
+  return cur
+
+fn phi_set(var phi: Phi, pred: Int, p: Place):
+  for i in 0..phi.ops_block.len:
+    if phi.ops_block[i] == pred:
+      phi.ops[i] = p
+      return
+  phi.ops_block.push(pred)
+  phi.ops.push(p)
+
+fn phi_remove(var phi: Phi, pred: Int) -> Place:
+  var nb: [Int] = []
+  var no: [Place] = []
+  var out = Place(-1, rc_hir.EF_UNKNOWN, false, rc_hir.nosp())
+  for i in 0..phi.ops_block.len:
+    if phi.ops_block[i] == pred: out = phi.ops[i]
+    else:
+      nb.push(phi.ops_block[i])
+      no.push(phi.ops[i])
+  phi.ops_block = nb
+  phi.ops = no
+  return out
+
+fn remove_from_order(var hir: HIR, id: Int):
+  var o: [Int] = []
+  for x in hir.order:
+    if x != id: o.push(x)
+  hir.order = o
+  hir.blocks.remove(id)
+
+fn merge_consecutive_blocks(var f: HirFunction, var e: Env):
+  for fid in inner_functions(f):
+    var inner = placeholder_function()
+    swap(&inner, &e.functions[fid])
+    merge_consecutive_blocks(&inner, &e)
+    swap(&inner, &e.functions[fid])
+    if e.failed: return
+  var fts: {Int: Bool} = {}
+  for id_i in 0..f.body.order.len:
+    let id = f.body.order[id_i]
+    let ft = rc_visit.fallthrough(f.body.blocks[id].terminal)
+    if ft >= 0: fts[ft] = true
+  var merged: {Int: Int} = {}
+  var ids: [Int] = []
+  for id in f.body.order: ids.push(id)
+  for id in ids:
+    if not (id in f.body.blocks): continue
+    let npreds = f.body.blocks[id].preds.len
+    let bkind = f.body.blocks[id].kind
+    if npreds != 1 or bkind != rc_hir.BK_BLOCK or fts.get(id, false): continue
+    let pred_id = merged_get(merged, f.body.blocks[id].preds[0])
+    var mergeable = false
+    if pred_id in f.body.blocks:
+      let pk = f.body.blocks[pred_id].kind
+      match f.body.blocks[pred_id].terminal:
+        Goto(_, _, _, _): mergeable = pk == rc_hir.BK_BLOCK
+        _: mergeable = false
+    if not mergeable: continue
+    let eval_order = rc_visit.term_id(f.body.blocks[pred_id].terminal)
+    var phi_ids: [Int] = []
+    var phi_ops: [Place] = []
+    var bad = -1
+    for phi in f.body.blocks[id].phis:
+      if phi.ops.len != 1: bad = phi.ops.len
+      else:
+        phi_ids.push(phi.place.identifier)
+        phi_ops.push(phi.ops[0])
+    if bad >= 0:
+      rc_env.throw(&e, rc_env.diag(rc_env.EC_INVARIANT, "Single predecessor phi has multiple operands"))
+      return
+    var new_ids: [Int] = []
+    for k in 0..phi_ids.len:
+      let operand = phi_ops[k]
+      let lv = Place(phi_ids[k], rc_hir.EF_COND_MUTATE, false, rc_hir.nosp())
+      new_ids.push(f.instructions.len)
+      f.instructions.push(Instruction(eval_order, lv, rc_hir.LoadLocal(operand, rc_hir.nosp()), rc_hir.nosp(), [rc_hir.ae2(rc_hir.AE_ALIAS, operand, lv)], true))
+    var bins: [Int] = []
+    for x in f.body.blocks[id].instructions: bins.push(x)
+    var bterm = rc_hir.Unreachable(0, rc_hir.nosp())
+    swap(&bterm, &f.body.blocks[id].terminal)
+    for x in new_ids: f.body.blocks[pred_id].instructions.push(x)
+    for x in bins: f.body.blocks[pred_id].instructions.push(x)
+    f.body.blocks[pred_id].terminal = bterm
+    merged[id] = merged_get(merged, pred_id)
+    remove_from_order(&f.body, id)
+  for id_i in 0..f.body.order.len:
+    let id = f.body.order[id_i]
+    for pi in 0..f.body.blocks[id].phis.len:
+      var ups_old: [Int] = []
+      var ups_new: [Int] = []
+      for pb in f.body.blocks[id].phis[pi].ops_block:
+        let m = merged_get(merged, pb)
+        if m != pb:
+          ups_old.push(pb)
+          ups_new.push(m)
+      for k in 0..ups_old.len:
+        let p = phi_remove(&f.body.blocks[id].phis[pi], ups_old[k])
+        phi_set(&f.body.blocks[id].phis[pi], ups_new[k], p)
+  rc_build.mark_predecessors(&f.body)
+  for id_i in 0..f.body.order.len:
+    let id = f.body.order[id_i]
+    var bs = rc_ops.term_all_blocks(f.body.blocks[id].terminal)
+    for k in 0..bs.len: bs[k] = merged_get(merged, bs[k])
+    rc_ops.set_term_all_blocks(&f.body.blocks[id].terminal, bs)
+
+# ---- prune_maybe_throws
+
+fn value_may_throw(v: InstrValue) -> Bool:
+  match v:
+    DeclareLocal(_, _): return false
+    DeclareContext(_, _): return false
+    Primitive(_, _): return false
+    JSXText(_, _): return false
+    TypeCastExpression(_, _, _, _): return false
+    ObjectMethod(_, _): return false
+    FunctionExpression(_, _, _, _, _, _): return false
+    RegExpLiteral(_, _, _): return false
+    MetaProperty(_, _, _): return false
+    Debugger(_): return false
+    StartMemoize(_, _, _, _, _, _, _): return false
+    FinishMemoize(_, _, _, _): return false
+    StoreLocal(lv, _, _): return lv.kind == rc_hir.IK_REASSIGN
+    StoreContext(lv, _, _): return lv.kind == rc_hir.IK_REASSIGN
+    ArrayExpression(els, _):
+      for x in els:
+        if x.kind == 1: return true
+      return false
+    ObjectExpression(props, _):
+      for p in props:
+        if p.spread or p.key.kind == 2: return true
+      return false
+    _: return true
+
+fn value_may_throw_when_pruning(v: InstrValue) -> Bool:
+  match v:
+    StoreLocal(_, _, _): return true
+    StoreContext(_, _, _): return true
+    _: return value_may_throw(v)
+
+fn prune_unreachable_phi_operands(var f: HirFunction) -> Bool:
+  var pruned = false
+  for id_i in 0..f.body.order.len:
+    let id = f.body.order[id_i]
+    for pi in 0..f.body.blocks[id].phis.len:
+      var nb: [Int] = []
+      var no: [Place] = []
+      for i in 0..f.body.blocks[id].phis[pi].ops_block.len:
+        let pb = f.body.blocks[id].phis[pi].ops_block[i]
+        if pb in f.body.blocks:
+          nb.push(pb)
+          no.push(f.body.blocks[id].phis[pi].ops[i])
+        else: pruned = true
+      f.body.blocks[id].phis[pi].ops_block = nb
+      f.body.blocks[id].phis[pi].ops = no
+  return pruned
+
+# prune_maybe_throws in two halves, for the caller (rc_ssa.prune_maybe_throws) to run
+# eliminate_redundant_phi between them when pruning phi operands asks for it. pmt_begin gives the
+# terminal mapping in mapping and returns 0 (nothing pruned), 1, or 2 (redundant phis to eliminate).
+fn pmt_begin(var f: HirFunction, var mapping: {Int: Int}) -> Int:
+  var any = false
+  for id_i in 0..f.body.order.len:
+    let id = f.body.order[id_i]
+    var cont = -1
+    match f.body.blocks[id].terminal:
+      MaybeThrow(c, _, _, _, _, _): cont = c
+      _: cont = -1
+    if cont < 0: continue
+    var can_throw = false
+    for iid in f.body.blocks[id].instructions:
+      if value_may_throw_when_pruning(f.instructions[iid].value): can_throw = true
+    if not can_throw:
+      var source = id
+      if id in mapping: source = mapping[id]
+      mapping[cont] = source
+      any = true
+      match var f.body.blocks[id].terminal:
+        MaybeThrow(_, h, _, _, _, _): h = -1
+        _: any = any
+  if not any: return 0
+  reverse_postorder(&f.body)
+  rc_build.remove_unreachable_for_updates(&f.body)
+  rc_build.remove_dead_do_while(&f.body)
+  rc_build.remove_unnecessary_try_catch(&f.body)
+  rc_build.mark_predecessors(&f.body)
+  if prune_unreachable_phi_operands(&f): return 2
+  return 1
+
+fn pmt_end(var f: HirFunction, var e: Env, mapping: {Int: Int}):
+  mark_ids(&f)
+  merge_consecutive_blocks(&f, &e)
+  if e.failed: return
+  for id_i in 0..f.body.order.len:
+    let id = f.body.order[id_i]
+    var preds: [Int] = []
+    for x in f.body.blocks[id].preds: preds.push(x)
+    for pi in 0..f.body.blocks[id].phis.len:
+      var olds: [Int] = []
+      var news: [Int] = []
+      for pb in f.body.blocks[id].phis[pi].ops_block:
+        var inp = false
+        for p in preds:
+          if p == pb: inp = true
+        if not inp:
+          if not (pb in mapping):
+            rc_env.throw(&e, rc_env.diag(rc_env.EC_INVARIANT, "Expected non-existing phi operand's predecessor to have been mapped to a new terminal"))
+            return
+          olds.push(pb)
+          news.push(mapping[pb])
+      for k in 0..olds.len:
+        let p = phi_remove(&f.body.blocks[id].phis[pi], olds[k])
+        phi_set(&f.body.blocks[id].phis[pi], news[k], p)
+
+fn mark_ids(var f: HirFunction):
+  var ins: [Instruction] = []
+  swap(&ins, &f.instructions)
+  rc_build.mark_instruction_ids(&f.body, &ins)
+  swap(&ins, &f.instructions)

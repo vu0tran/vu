@@ -1,0 +1,864 @@
+# The React Compiler's program entry (oxc_react_compiler 1.90.0, react_compiler/entrypoint/
+# program.rs, pipeline.rs, suppression.rs and imports.rs) in lint mode, as oxlint runs it: the
+# components and hooks of a file (compilation mode "infer"), each compiled on its own, and the
+# diagnostics of the compiles that failed. Function names follow the Rust source.
+
+import ast
+import rc_hir
+import rc_env
+import rc_sem
+import rc_build
+import rc_lower
+import rc_diags
+import rc_cfg
+import rc_pass1
+import rc_ssa
+import rc_constprop
+import rc_types
+import rc_shapes
+import rc_analyse
+import rc_hooks
+import rc_valid1
+import rc_vref
+import rc_valid2
+import rc_imae
+import rc_imar
+import rc_dce
+import rc_rik
+import rc_irp
+import rc_ved
+import scan
+from scan import T_ASSIGN, T_COMMA, T_AND, T_OR, T_QQ, T_INC, T_DEC
+from rc_hir import Sp
+from rc_env import Env, Diag, Lab
+from rc_build import Ctx
+
+fn suppression_rules() -> [Str]:
+  return ["react-hooks/exhaustive-deps", "react-hooks/rules-of-hooks", "react/exhaustive-deps", "react/rules-of-hooks"]
+
+fn nk(c: Ctx, n: Int) -> Int:
+  return rc_lower.nk(c, n)
+
+fn nm(c: Ctx, n: Int) -> Str:
+  return rc_lower.nm(c, n)
+
+fn items(c: Ctx, l: Int) -> [Int]:
+  return rc_lower.items(c, l)
+
+# ---- what's a component or a hook
+
+fn is_hook_name(s: Str) -> Bool:
+  return s.len >= 4 and s[0] == 'u' and s[1] == 's' and s[2] == 'e' and ((s[3] >= 'A' and s[3] <= 'Z') or (s[3] >= '0' and s[3] <= '9'))
+
+fn is_component_name(s: Str) -> Bool:
+  return s.len > 0 and s[0] >= 'A' and s[0] <= 'Z'
+
+fn expr_is_hook(c: Ctx, n: Int) -> Bool:
+  let k = nk(c, n)
+  if k == ast.N_ID: return is_hook_name(nm(c, n))
+  if k == ast.N_PROPACCESS and (c.t.nd[n].f & 4) == 0:
+    if not is_hook_name(nm(c, n)): return false
+    let o = c.t.nd[n].a
+    if nk(c, o) == ast.N_ID:
+      let s = nm(c, o)
+      return s.len > 0 and s[0] >= 'A' and s[0] <= 'Z'
+  return false
+
+fn expr_contains_optional(c: Ctx, n: Int) -> Bool:
+  let k = nk(c, n)
+  if k == ast.N_CALL or k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS:
+    if (c.t.nd[n].f & 1) != 0: return true
+    return expr_contains_optional(c, c.t.nd[n].a)
+  return false
+
+fn is_regular_call(c: Ctx, n: Int) -> Bool:
+  return (c.t.nd[n].f & 1) == 0 and not expr_contains_optional(c, c.t.nd[n].a)
+
+fn is_non_node(c: Ctx, n: Int) -> Bool:
+  let k = nk(c, n)
+  if k == ast.N_PAREN: return is_non_node(c, c.t.nd[n].a)
+  return k == ast.N_OBJECT or k == ast.N_ARROW or k == ast.N_FUNCEXPR or k == ast.N_BIGINT or k == ast.N_CLASSEXPR or k == ast.N_NEW
+
+fn returns_non_node_stmt(c: Ctx, n: Int, var r: Bool):
+  if n <= 0: return
+  let nd = c.t.nd[n]
+  let k = nd.k
+  if k == ast.N_RETURN:
+    if nd.a > 0: r = is_non_node(c, nd.a)
+    else: r = true
+  elif k == ast.N_BLOCK:
+    for s in items(c, nd.a): returns_non_node_stmt(c, s, &r)
+  elif k == ast.N_IF:
+    returns_non_node_stmt(c, nd.b, &r)
+    if nd.c > 0: returns_non_node_stmt(c, nd.c, &r)
+  elif k == ast.N_FOR: returns_non_node_stmt(c, nd.d, &r)
+  elif k == ast.N_WHILE: returns_non_node_stmt(c, nd.b, &r)
+  elif k == ast.N_DO: returns_non_node_stmt(c, nd.a, &r)
+  elif k == ast.N_FORIN: returns_non_node_stmt(c, nd.c, &r)
+  elif k == ast.N_SWITCH:
+    for cs in items(c, nd.b):
+      for s in items(c, c.t.nd[cs].b): returns_non_node_stmt(c, s, &r)
+  elif k == ast.N_TRY:
+    for s in items(c, c.t.nd[nd.a].a): returns_non_node_stmt(c, s, &r)
+    if nd.c > 0:
+      for s in items(c, c.t.nd[nd.c].a): returns_non_node_stmt(c, s, &r)
+    if nd.d > 0:
+      for s in items(c, c.t.nd[nd.d].a): returns_non_node_stmt(c, s, &r)
+  elif k == ast.N_LABEL: returns_non_node_stmt(c, nd.a, &r)
+  elif k == ast.N_WITH: returns_non_node_stmt(c, nd.b, &r)
+
+fn returns_non_node_fn(c: Ctx, f: rc_lower.FnParts) -> Bool:
+  if f.expr_body: return is_non_node(c, f.body)
+  var r = false
+  for s in items(c, c.t.nd[f.body].a): returns_non_node_stmt(c, s, &r)
+  return r
+
+fn hj_stmts(c: Ctx, lst: Int) -> Bool:
+  for s in items(c, lst):
+    if hj_stmt(c, s): return true
+  return false
+
+fn hj_decls(c: Ctx, v: Int) -> Bool:
+  for d in items(c, c.t.nd[v].a):
+    let init = c.t.nd[d].c
+    if init > 0 and hj_expr(c, init): return true
+  return false
+
+fn hj_stmt(c: Ctx, n: Int) -> Bool:
+  if n <= 0: return false
+  let nd = c.t.nd[n]
+  let k = nd.k
+  if k == ast.N_EXPRSTMT or k == ast.N_THROW: return hj_expr(c, nd.a)
+  if k == ast.N_RETURN: return nd.a > 0 and hj_expr(c, nd.a)
+  if k == ast.N_VAR: return hj_decls(c, n)
+  if k == ast.N_BLOCK: return hj_stmts(c, nd.a)
+  if k == ast.N_IF: return hj_expr(c, nd.a) or hj_stmt(c, nd.b) or (nd.c > 0 and hj_stmt(c, nd.c))
+  if k == ast.N_FOR:
+    if nd.a > 0:
+      if nk(c, nd.a) == ast.N_VAR:
+        if hj_decls(c, nd.a): return true
+      elif hj_expr(c, nd.a): return true
+    if nd.b > 0 and hj_expr(c, nd.b): return true
+    if nd.c > 0 and hj_expr(c, nd.c): return true
+    return hj_stmt(c, nd.d)
+  if k == ast.N_WHILE: return hj_expr(c, nd.a) or hj_stmt(c, nd.b)
+  if k == ast.N_DO: return hj_stmt(c, nd.a) or hj_expr(c, nd.b)
+  if k == ast.N_FORIN: return hj_expr(c, nd.b) or hj_stmt(c, nd.c)
+  if k == ast.N_SWITCH:
+    if hj_expr(c, nd.a): return true
+    for cs in items(c, nd.b):
+      let t = c.t.nd[cs].a
+      if t > 0 and hj_expr(c, t): return true
+      if hj_stmts(c, c.t.nd[cs].b): return true
+    return false
+  if k == ast.N_TRY:
+    if hj_stmts(c, c.t.nd[nd.a].a): return true
+    if nd.c > 0 and hj_stmts(c, c.t.nd[nd.c].a): return true
+    if nd.d > 0 and hj_stmts(c, c.t.nd[nd.d].a): return true
+    return false
+  if k == ast.N_LABEL: return hj_stmt(c, nd.a)
+  if k == ast.N_WITH: return hj_expr(c, nd.a) or hj_stmt(c, nd.b)
+  return false
+
+fn is_nested_fn(c: Ctx, n: Int) -> Bool:
+  let k = nk(c, n)
+  return k == ast.N_ARROW or k == ast.N_FUNCEXPR
+
+fn hj_args(c: Ctx, lst: Int) -> Bool:
+  for a in items(c, lst):
+    if nk(c, a) == ast.N_SPREAD:
+      if hj_expr(c, c.t.nd[a].a): return true
+    else:
+      if is_nested_fn(c, a): continue
+      if hj_expr(c, a): return true
+  return false
+
+# calls_hooks_or_creates_jsx_in_expr
+fn hj_expr(c: Ctx, n: Int) -> Bool:
+  if n <= 0: return false
+  let nd = c.t.nd[n]
+  let k = nd.k
+  if k == ast.N_JSXELEM: return true
+  if k == ast.N_CALL:
+    if is_regular_call(c, n) and expr_is_hook(c, nd.a): return true
+    if hj_expr(c, nd.a): return true
+    return hj_args(c, nd.c)
+  if k == ast.N_BINARY:
+    if nd.f >= T_ASSIGN and nd.f <= scan.T_QQEQ: return hj_expr(c, nd.b)
+    return hj_expr(c, nd.a) or hj_expr(c, nd.b)
+  if k == ast.N_COND: return hj_expr(c, nd.a) or hj_expr(c, nd.b) or hj_expr(c, nd.c)
+  if (k == ast.N_PREFIX or k == ast.N_POSTFIX) and (nd.f == T_INC or nd.f == T_DEC):
+    let t = rc_lower.inner_expr(c, nd.a)
+    if nk(c, t) == ast.N_ID: return false
+    if nk(c, t) == ast.N_PROPACCESS: return hj_expr(c, c.t.nd[t].a)
+    if nk(c, t) == ast.N_ELEMACCESS: return hj_expr(c, c.t.nd[t].a) or hj_expr(c, c.t.nd[t].b)
+    return false
+  if k == ast.N_PREFIX or k == ast.N_TYPEOF or k == ast.N_VOIDEXPR or k == ast.N_DELETE or k == ast.N_AWAIT or k == ast.N_PAREN or k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_NONNULL or k == ast.N_TYPEASSERT or k == ast.N_EXPRTARGS: return hj_expr(c, nd.a)
+  if k == ast.N_PROPACCESS: return hj_expr(c, nd.a)
+  if k == ast.N_ELEMACCESS: return hj_expr(c, nd.a) or hj_expr(c, nd.b)
+  if k == ast.N_YIELD: return nd.a > 0 and hj_expr(c, nd.a)
+  if k == ast.N_TAGGED:
+    if hj_expr(c, nd.a): return true
+    if nk(c, nd.c) == ast.N_TEMPL:
+      for ts in items(c, c.t.nd[nd.c].a):
+        if hj_expr(c, c.t.nd[ts].a): return true
+    return false
+  if k == ast.N_TEMPL:
+    for ts in items(c, nd.a):
+      if hj_expr(c, c.t.nd[ts].a): return true
+    return false
+  if k == ast.N_ARRAY:
+    for el in items(c, nd.a):
+      let ek = nk(c, el)
+      if ek == ast.N_OMIT: continue
+      if ek == ast.N_SPREAD:
+        if hj_expr(c, c.t.nd[el].a): return true
+      elif hj_expr(c, el): return true
+    return false
+  if k == ast.N_OBJECT:
+    for p in items(c, nd.a):
+      let pk = nk(c, p)
+      if pk == ast.N_SPREAD:
+        if hj_expr(c, c.t.nd[p].a): return true
+      elif pk == ast.N_METHOD or pk == ast.N_GET or pk == ast.N_SET:
+        let body = c.t.nd[p].c
+        if body > 0 and hj_stmts(c, c.t.nd[body].a): return true
+      elif pk == ast.N_PROPASSIGN:
+        if hj_expr(c, c.t.nd[p].b): return true
+    return false
+  if k == ast.N_NEW:
+    if hj_expr(c, nd.a): return true
+    return hj_args(c, nd.c)
+  return false
+
+fn hj_binding(c: Ctx, n: Int) -> Bool:
+  let k = nk(c, n)
+  if k == ast.N_OBJPAT or k == ast.N_ARRPAT:
+    for el in items(c, c.t.nd[n].a):
+      if nk(c, el) == ast.N_BINDEL and hj_binding(c, el): return true
+    return false
+  if k == ast.N_BINDEL:
+    let d = c.t.nd[n]
+    if d.c > 0: return hj_expr(c, d.c) or hj_binding(c, d.b)
+    return hj_binding(c, d.b)
+  return false
+
+fn param_list(c: Ctx, f: rc_lower.FnParts) -> [Int]:
+  var out: [Int] = []
+  for p in items(c, f.params):
+    if nk(c, p) == ast.N_PARAM and not rc_sem.is_this_param(c.t, p): out.push(p)
+  return out
+
+fn calls_hooks_or_creates_jsx(c: Ctx, f: rc_lower.FnParts) -> Bool:
+  for p in param_list(c, f):
+    let pd = c.t.nd[p]
+    if (pd.f & ast.M_REST) == 0 and pd.c > 0 and hj_expr(c, pd.c): return true
+    if hj_binding(c, pd.a): return true
+  if f.expr_body: return hj_expr(c, f.body)
+  return hj_stmts(c, c.t.nd[f.body].a)
+
+fn is_valid_props_annotation(c: Ctx, t: Int) -> Bool:
+  if t <= 0: return true
+  let k = nk(c, t)
+  if k == ast.N_TARRAY or k == ast.N_TLIT or k == ast.N_TTUPLE or k == ast.N_TFUNC: return false
+  if k == ast.N_TKW:
+    let f = c.t.nd[t].f
+    return not (f == scan.W_BIGINT or f == scan.W_BOOLEAN or f == scan.W_NEVER or f == scan.W_NUMBER or f == scan.W_STRING or f == scan.W_SYMBOL)
+  return true
+
+fn is_valid_component_params(c: Ctx, f: rc_lower.FnParts) -> Bool:
+  let ps = param_list(c, f)
+  if ps.len == 0: return true
+  if ps.len > 2: return false
+  let first = ps[0]
+  if (c.t.nd[first].f & ast.M_REST) != 0: return false
+  if not is_valid_props_annotation(c, c.t.nd[first].b): return false
+  if ps.len == 1: return true
+  let second = ps[1]
+  if (c.t.nd[second].f & ast.M_REST) != 0: return false
+  let pat = c.t.nd[second].a
+  if nk(c, pat) != ast.N_ID: return false
+  let s = nm(c, pat)
+  return s.find("ref") >= 0 or s.find("Ref") >= 0
+
+# -1: neither
+fn get_component_or_hook_like(c: Ctx, name: Str, has_name: Bool, f: rc_lower.FnParts, parent_callee: Str) -> Int:
+  if has_name:
+    if is_component_name(name):
+      if is_valid_component_params(c, f) and calls_hooks_or_creates_jsx(c, f) and not returns_non_node_fn(c, f): return rc_hir.FN_COMPONENT
+      return -1
+    if is_hook_name(name):
+      if calls_hooks_or_creates_jsx(c, f): return rc_hir.FN_HOOK
+      return -1
+  if parent_callee == "forwardRef" or parent_callee == "memo":
+    if calls_hooks_or_creates_jsx(c, f): return rc_hir.FN_COMPONENT
+  return -1
+
+fn body_directives(c: Ctx, f: rc_lower.FnParts) -> [Str]:
+  var out: [Str] = []
+  if f.expr_body or f.body <= 0: return out
+  let stmts = items(c, c.t.nd[f.body].a)
+  let n = rc_lower.directive_count(c, stmts)
+  for i in 0..n: out.push(nm(c, c.t.nd[stmts[i]].a))
+  return out
+
+fn get_react_function_type(c: Ctx, name: Str, has_name: Bool, f: rc_lower.FnParts, parent_callee: Str) -> Int:
+  if not f.expr_body:
+    for d in body_directives(c, f):
+      if d == "use forget" or d == "use memo":
+        let t = get_component_or_hook_like(c, name, has_name, f, parent_callee)
+        if t < 0: return rc_hir.FN_OTHER
+        return t
+  return get_component_or_hook_like(c, name, has_name, f, parent_callee)
+
+fn get_callee_name_if_react_api(c: Ctx, n: Int) -> Str:
+  let k = nk(c, n)
+  if k == ast.N_ID:
+    let s = nm(c, n)
+    if s == "forwardRef" or s == "memo": return s
+    return ""
+  if k == ast.N_PROPACCESS and (c.t.nd[n].f & 4) == 0:
+    let o = c.t.nd[n].a
+    let p = nm(c, n)
+    if nk(c, o) == ast.N_ID and nm(c, o) == "React" and (p == "forwardRef" or p == "memo"): return p
+  return ""
+
+# ---- discovery (DiscoveryWalker, compilation mode "infer")
+
+type Source:
+  node: Int
+  fn_type: Int
+
+type Walker:
+  done: {Int: Bool} = {}
+  queue: [Source] = []
+  decl_name: Str = ""
+  has_decl_name: Bool = false
+  callees: [Str] = []
+
+fn parent_callee(w: Walker) -> Str:
+  if w.callees.len == 0: return ""
+  return w.callees[w.callees.len - 1] + ""
+
+fn try_make_compile_source(c: Ctx, var w: Walker, n: Int, name: Str, has_name: Bool, callee: Str) -> Bool:
+  let f = rc_lower.fn_parts(c, n)
+  if f.body <= 0: return false
+  let s = c.m.scope_of.get(n, -1)
+  if s < 0 or w.done.get(s, false): return false
+  let t = get_react_function_type(c, name, has_name, f, callee)
+  if t < 0: return false
+  w.done[s] = true
+  w.queue.push(Source(n, t))
+  return true
+
+fn walk_statement(c: Ctx, var w: Walker, n: Int):
+  if n <= 0: return
+  let nd = c.t.nd[n]
+  let k = nd.k
+  if k == ast.N_BLOCK:
+    for s in items(c, nd.a): walk_statement(c, &w, s)
+  elif k == ast.N_RETURN or k == ast.N_EXPRSTMT or k == ast.N_THROW:
+    if nd.a > 0: walk_expression(c, &w, nd.a)
+  elif k == ast.N_IF:
+    walk_expression(c, &w, nd.a)
+    walk_statement(c, &w, nd.b)
+    walk_statement(c, &w, nd.c)
+  elif k == ast.N_FOR:
+    if nd.a > 0:
+      if nk(c, nd.a) == ast.N_VAR: walk_variable_declaration(c, &w, nd.a)
+      else: walk_expression(c, &w, nd.a)
+    if nd.b > 0: walk_expression(c, &w, nd.b)
+    if nd.c > 0: walk_expression(c, &w, nd.c)
+    walk_statement(c, &w, nd.d)
+  elif k == ast.N_WHILE:
+    walk_expression(c, &w, nd.a)
+    walk_statement(c, &w, nd.b)
+  elif k == ast.N_DO:
+    walk_statement(c, &w, nd.a)
+    walk_expression(c, &w, nd.b)
+  elif k == ast.N_FORIN:
+    if nk(c, nd.a) == ast.N_VAR: walk_variable_declaration(c, &w, nd.a)
+    walk_expression(c, &w, nd.b)
+    walk_statement(c, &w, nd.c)
+  elif k == ast.N_SWITCH:
+    walk_expression(c, &w, nd.a)
+    for cs in items(c, nd.b):
+      if c.t.nd[cs].a > 0: walk_expression(c, &w, c.t.nd[cs].a)
+      for s in items(c, c.t.nd[cs].b): walk_statement(c, &w, s)
+  elif k == ast.N_TRY:
+    walk_statement(c, &w, nd.a)
+    if nd.c > 0: walk_statement(c, &w, nd.c)
+    if nd.d > 0: walk_statement(c, &w, nd.d)
+  elif k == ast.N_LABEL: walk_statement(c, &w, nd.a)
+  elif k == ast.N_VAR: walk_variable_declaration(c, &w, n)
+  elif k == ast.N_FUNC: walk_function(c, &w, n, "", false)
+  elif k == ast.N_WITH:
+    walk_expression(c, &w, nd.a)
+    walk_statement(c, &w, nd.b)
+  elif k == ast.N_EXPORTDEFAULT:
+    let x = nd.a
+    if nk(c, x) == ast.N_FUNC: walk_function(c, &w, x, "", false)
+    elif nk(c, x) != ast.N_CLASS and nk(c, x) != ast.N_INTERFACE: walk_expression(c, &w, x)
+
+fn walk_variable_declaration(c: Ctx, var w: Walker, n: Int):
+  for d in items(c, c.t.nd[n].a):
+    let init = c.t.nd[d].c
+    if init > 0:
+      let x = rc_lower.without_parens(c, init)
+      if nk(c, x) == ast.N_FUNCEXPR or nk(c, x) == ast.N_ARROW:
+        let id = c.t.nd[d].a
+        if nk(c, id) == ast.N_ID:
+          w.decl_name = nm(c, id)
+          w.has_decl_name = true
+        else: w.has_decl_name = false
+      walk_expression(c, &w, init)
+    w.has_decl_name = false
+
+fn walk_params(c: Ctx, var w: Walker, lst: Int):
+  for p in items(c, lst):
+    if nk(c, p) != ast.N_PARAM: continue
+    walk_binding(c, &w, c.t.nd[p].a)
+    if c.t.nd[p].c > 0: walk_expression(c, &w, c.t.nd[p].c)
+
+fn walk_binding(c: Ctx, var w: Walker, n: Int):
+  let k = nk(c, n)
+  if k == ast.N_OBJPAT or k == ast.N_ARRPAT:
+    for el in items(c, c.t.nd[n].a):
+      if nk(c, el) != ast.N_BINDEL: continue
+      let ed = c.t.nd[el]
+      if nk(c, ed.a) == ast.N_COMPUTED: walk_expression(c, &w, c.t.nd[ed.a].a)
+      walk_binding(c, &w, ed.b)
+      if ed.c > 0: walk_expression(c, &w, ed.c)
+
+fn walk_function(c: Ctx, var w: Walker, n: Int, inferred: Str, has_inferred: Bool):
+  let decl = nk(c, n) == ast.N_FUNC
+  var name = inferred
+  var has = has_inferred
+  if decl:
+    has = c.t.nd[n].s >= 0
+    name = ""
+    if has: name = nm(c, n)
+  let cal = parent_callee(w)
+  if try_make_compile_source(c, &w, n, name, has, cal): return
+  w.callees.push("")
+  let f = rc_lower.fn_parts(c, n)
+  walk_params(c, &w, f.params)
+  if f.body > 0:
+    if f.expr_body: walk_expression(c, &w, f.body)
+    else:
+      for s in items(c, c.t.nd[f.body].a): walk_statement(c, &w, s)
+  w.callees.pop()
+
+fn take_decl_name(var w: Walker) -> [Str]:
+  if w.has_decl_name:
+    w.has_decl_name = false
+    return [w.decl_name + ""]
+  return []
+
+fn walk_expression(c: Ctx, var w: Walker, n: Int):
+  if n <= 0: return
+  let nd = c.t.nd[n]
+  let k = nd.k
+  if k == ast.N_FUNCEXPR or k == ast.N_ARROW:
+    let nmv = take_decl_name(&w)
+    if nmv.len > 0: walk_function(c, &w, n, nmv[0], true)
+    else: walk_function(c, &w, n, "", false)
+  elif k == ast.N_CALL:
+    if rc_lower.is_chain_root(c, n):
+      walk_expression(c, &w, nd.a)
+      for a in items(c, nd.c): walk_argument(c, &w, a)
+      return
+    let cn = get_callee_name_if_react_api(c, nd.a)
+    w.has_decl_name = false
+    w.callees.push(cn)
+    walk_expression(c, &w, nd.a)
+    for a in items(c, nd.c): walk_argument(c, &w, a)
+    w.callees.pop()
+  elif k == ast.N_PROPACCESS: walk_expression(c, &w, nd.a)
+  elif k == ast.N_ELEMACCESS:
+    walk_expression(c, &w, nd.a)
+    walk_expression(c, &w, nd.b)
+  elif k == ast.N_BINARY:
+    if nd.f >= T_ASSIGN and nd.f <= scan.T_QQEQ: walk_expression(c, &w, nd.b)
+    else:
+      walk_expression(c, &w, nd.a)
+      walk_expression(c, &w, nd.b)
+  elif (k == ast.N_PREFIX or k == ast.N_POSTFIX) and (nd.f == T_INC or nd.f == T_DEC):
+    let t = rc_lower.inner_expr(c, nd.a)
+    if nk(c, t) == ast.N_PROPACCESS: walk_expression(c, &w, c.t.nd[t].a)
+    elif nk(c, t) == ast.N_ELEMACCESS:
+      walk_expression(c, &w, c.t.nd[t].a)
+      walk_expression(c, &w, c.t.nd[t].b)
+  elif k == ast.N_PREFIX or k == ast.N_TYPEOF or k == ast.N_VOIDEXPR or k == ast.N_DELETE or k == ast.N_AWAIT or k == ast.N_PAREN or k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_NONNULL or k == ast.N_TYPEASSERT or k == ast.N_EXPRTARGS:
+    walk_expression(c, &w, nd.a)
+  elif k == ast.N_YIELD:
+    if nd.a > 0: walk_expression(c, &w, nd.a)
+  elif k == ast.N_COND:
+    walk_expression(c, &w, nd.a)
+    walk_expression(c, &w, nd.b)
+    walk_expression(c, &w, nd.c)
+  elif k == ast.N_OBJECT:
+    for p in items(c, nd.a): walk_object_property(c, &w, p)
+  elif k == ast.N_ARRAY:
+    for el in items(c, nd.a):
+      if nk(c, el) == ast.N_SPREAD: walk_expression(c, &w, c.t.nd[el].a)
+      elif nk(c, el) != ast.N_OMIT: walk_expression(c, &w, el)
+  elif k == ast.N_NEW:
+    walk_expression(c, &w, nd.a)
+    for a in items(c, nd.c): walk_argument(c, &w, a)
+  elif k == ast.N_TEMPL:
+    for ts in items(c, nd.a): walk_expression(c, &w, c.t.nd[ts].a)
+  elif k == ast.N_TAGGED:
+    walk_expression(c, &w, nd.a)
+    if nk(c, nd.c) == ast.N_TEMPL:
+      for ts in items(c, c.t.nd[nd.c].a): walk_expression(c, &w, c.t.nd[ts].a)
+  elif k == ast.N_JSXELEM: walk_jsx_element(c, &w, n)
+
+fn walk_argument(c: Ctx, var w: Walker, a: Int):
+  if nk(c, a) == ast.N_SPREAD: walk_expression(c, &w, c.t.nd[a].a)
+  else: walk_expression(c, &w, a)
+
+fn walk_object_property(c: Ctx, var w: Walker, p: Int):
+  let pk = nk(c, p)
+  if pk == ast.N_SPREAD:
+    walk_expression(c, &w, c.t.nd[p].a)
+    return
+  let key = c.t.nd[p].a
+  if (pk == ast.N_PROPASSIGN or pk == ast.N_METHOD or pk == ast.N_GET or pk == ast.N_SET) and nk(c, key) == ast.N_COMPUTED: walk_expression(c, &w, c.t.nd[key].a)
+  if pk == ast.N_METHOD or pk == ast.N_GET or pk == ast.N_SET:
+    let f = rc_lower.fn_parts(c, p)
+    walk_params(c, &w, f.params)
+    if f.body > 0:
+      for s in items(c, c.t.nd[f.body].a): walk_statement(c, &w, s)
+  elif pk == ast.N_PROPASSIGN: walk_expression(c, &w, c.t.nd[p].b)
+
+fn walk_jsx_element(c: Ctx, var w: Walker, n: Int):
+  let nd = c.t.nd[n]
+  for at in items(c, nd.b):
+    if nk(c, at) == ast.N_JSXSPREAD: walk_expression(c, &w, c.t.nd[at].a)
+    else:
+      let v = c.t.nd[at].b
+      if nk(c, v) == ast.N_JSXEXPR: walk_expression(c, &w, c.t.nd[v].a)
+      elif nk(c, v) == ast.N_JSXELEM: walk_jsx_element(c, &w, v)
+  walk_jsx_children(c, &w, nd.c)
+
+fn walk_jsx_children(c: Ctx, var w: Walker, lst: Int):
+  for ch in items(c, lst):
+    let k = nk(c, ch)
+    if k == ast.N_JSXELEM: walk_jsx_element(c, &w, ch)
+    elif k == ast.N_JSXEXPR or k == ast.N_JSXSPREAD: walk_expression(c, &w, c.t.nd[ch].a)
+
+fn find_functions_to_compile(c: Ctx, root: Int) -> [Source]:
+  var w = Walker()
+  for s in items(c, root): walk_statement(c, &w, s)
+  var out: [Source] = []
+  swap(&out, &w.queue)
+  return out
+
+# ---- suppressions (suppression.rs): eslint-disable comments for the rules of hooks
+
+type Supp:
+  ds: Int          # the disable comment (start, end)
+  de: Int
+  has_enable: Bool
+  ee: Int          # the enable comment's end
+  text: Str        # the disable comment's text
+
+fn comment_value(src: Str, s: Int, e: Int) -> Str:
+  var a = s + 2
+  var z = e
+  if src[s + 1] == '*': z = e - 2
+  if z < a: z = a
+  return src[a..z].strip()
+
+fn rule_after(value: Str, prefix: Str) -> Bool:
+  for alt in [prefix, "ox" + prefix[2..prefix.len]]:
+    if value.startswith(alt):
+      let rest = value[alt.len..value.len]
+      for r in suppression_rules():
+        if rest.startswith(r): return true
+  return false
+
+fn matches_disable_next_line(v: Str) -> Bool:
+  return rule_after(v, "eslint-disable-next-line ")
+
+fn matches_disable(v: Str) -> Bool:
+  return rule_after(v, "eslint-disable ")
+
+fn matches_enable(v: Str) -> Bool:
+  return rule_after(v, "eslint-enable ")
+
+# find_program_suppressions (comments: start, end pairs)
+fn find_program_suppressions(src: Str, comments: [Int]) -> [Supp]:
+  var out: [Supp] = []
+  var has_dis = false
+  var dis_s = 0
+  var dis_e = 0
+  var has_en = false
+  var en_e = 0
+  var source = 0
+  var i = 0
+  while i + 1 < comments.len:
+    let s = comments[i]
+    let e = comments[i + 1]
+    i += 2
+    let v = comment_value(src, s, e)
+    if not has_dis and matches_disable_next_line(v):
+      has_dis = true
+      dis_s = s
+      dis_e = e
+      has_en = true
+      en_e = e
+      source = 1
+    if matches_disable(v):
+      has_dis = true
+      dis_s = s
+      dis_e = e
+      source = 1
+    if matches_enable(v) and source == 1:
+      has_en = true
+      en_e = e
+    if has_dis and source != 0:
+      out.push(Supp(dis_s, dis_e, has_en, en_e, comment_value(src, dis_s, dis_e)))
+      has_dis = false
+      has_en = false
+      source = 0
+  return out
+
+fn suppression_diags(src: Str, sups: [Supp], start: Int, end: Int) -> [Diag]:
+  var out: [Diag] = []
+  for s in sups:
+    var affects = false
+    if s.ds > start and (not s.has_enable or s.ee < end): affects = true
+    if s.ds < start and (not s.has_enable or s.ee > end): affects = true
+    if affects:
+      let reason = "React Compiler has skipped optimizing this component because one or more React ESLint rules were disabled"
+      let desc = "React Compiler only works when your components follow all the rules of React, disabling them may result in unexpected or incorrect behavior. Found suppression `{s.text}`"
+      out.push(rc_diags.suppression(reason, desc, Sp(s.ds, s.de)))
+  return out
+
+# has_memo_cache_function_import: `import {{ c }} from "react/compiler-runtime"`
+fn has_memo_cache_function_import(c: Ctx, root: Int) -> Bool:
+  for s in items(c, root):
+    let nd = c.t.nd[s]
+    if nd.k != ast.N_IMPORT or (nd.f & ast.M_TYPEONLY) != 0 or nd.a <= 0: continue
+    if nm(c, nd.a) != "react/compiler-runtime": continue
+    for sp in items(c, nd.d):
+      if (c.t.nd[sp].f & ast.M_TYPEONLY) != 0: continue
+      var imported = nm(c, sp)
+      let pn = c.t.nd[sp].b
+      if pn > 0: imported = nm(c, pn)
+      if imported == "c": return true
+  return false
+
+# ---- the pipeline (pipeline.rs compile_fn), as far as it's ported
+
+type Result:
+  ok: Bool          # compiled (lint mode: nothing to emit)
+  errs: [Diag]
+  events: [Diag]    # log_errors_as_events: reported whatever the compile's outcome
+
+fn take_thrown(var e: Env) -> [Diag]:
+  var out: [Diag] = []
+  if e.thrown.len > 0:
+    var d = rc_env.diag(0, "")
+    swap(&d, &e.thrown[0])
+    out.push(d)
+  return out
+
+fn take_errors(var e: Env) -> [Diag]:
+  var out: [Diag] = []
+  for i in 0..e.errors.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &e.errors[i])
+    out.push(d)
+  e.errors = []
+  return out
+
+fn has_invariant_errors(e: Env) -> Bool:
+  for d in e.errors:
+    if d.category == rc_env.EC_INVARIANT: return true
+  return false
+
+fn take_invariant_errors(var e: Env) -> [Diag]:
+  var out: [Diag] = []
+  var all = take_errors(&e)
+  for i in 0..all.len:
+    if all[i].category == rc_env.EC_INVARIANT:
+      var d = rc_env.diag(0, "")
+      swap(&d, &all[i])
+      out.push(d)
+  return out
+
+fn compile_fn(c: Ctx, src: Source, var reg: rc_shapes.Registry) -> Result:
+  var e = rc_env.new_env(src.fn_type)
+  swap(&e.reg, &reg)
+  var r = compile_in(c, src, &e)
+  swap(&e.reg, &reg)
+  return r
+
+fn compile_in(c: Ctx, src: Source, var e: Env) -> Result:
+  var events: [Diag] = []
+  var f = rc_lower.lower(c, &e, src.node)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  if has_invariant_errors(e): return Result(false, take_invariant_errors(&e), events)
+  if e.skip_compilation: return Result(true, [], events)
+  rc_ssa.prune_maybe_throws(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_pass1.validate_context_variable_lvalues(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  var um = rc_pass1.validate_use_memo(f, &e)
+  for i in 0..um.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &um[i])
+    events.push(d)
+  rc_pass1.drop_manual_memoization(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_pass1.inline_iifes(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_cfg.merge_consecutive_blocks(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_ssa.enter_ssa(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_ssa.eliminate_redundant_phi(&f, &e)
+  rc_constprop.constant_propagation(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_types.infer_types(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_hooks.validate_hooks_usage(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_hooks.validate_no_capitalized_calls(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_hooks.optimize_props_method_calls(&f, e)
+  rc_analyse.analyse_functions(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  if has_invariant_errors(e): return Result(false, take_invariant_errors(&e), events)
+  rc_imae.infer_mutation_aliasing_effects(&f, &e, false)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_dce.dead_code_elimination(&f, e)
+  rc_ssa.prune_maybe_throws(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_imar.infer_mutation_aliasing_ranges(&f, &e, false)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_valid1.validate_locals_not_reassigned_after_render(f, &e)
+  rc_vref.validate_no_ref_access_in_render(f, &e)
+  rc_valid1.validate_no_set_state_in_render(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_valid2.validate_no_derived_computations_in_effects(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  var se = rc_valid2.validate_no_set_state_in_effects(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  for i in 0..se.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &se[i])
+    events.push(d)
+  var jt = rc_valid1.validate_no_jsx_in_try(f)
+  for i in 0..jt.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &jt[i])
+    events.push(d)
+  rc_valid1.validate_no_freezing_known_mutable_functions(f, &e)
+  rc_irp.infer_reactive_places(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_ved.validate_exhaustive_dependencies(&f, &e)
+  rc_rik.rewrite_instruction_kinds(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  var sc = rc_valid2.validate_static_components(f, e)
+  for i in 0..sc.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &sc[i])
+    events.push(d)
+  # (the reactive scope passes are ported next)
+  if e.errors.len > 0: return Result(false, take_errors(&e), events)
+  return Result(true, [], events)
+
+# with_fallback_label: a diagnostic without a label gets one at the function; else its first label
+# is primary when none is
+fn with_fallback_label(own d0: Diag, fsp: Sp) -> Diag:
+  var d = d0
+  if d.labels.len == 0:
+    if fsp.s >= 0: d.labels.push(Lab(fsp.s, fsp.e, d.message + "", true, true))
+    return d
+  var any = false
+  for l in d.labels:
+    if l.primary: any = true
+  if not any: d.labels[0].primary = true
+  return d
+
+fn log_error(own errs: [Diag], fsp: Sp, var out: [Diag]):
+  if errs.len == 1 and errs[0].category == rc_env.EC_INVARIANT and errs[0].message == "unexpected error":
+    out.push(rc_diags.pipeline_error(fsp))
+    return
+  var es = errs
+  for i in 0..es.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &es[i])
+    out.push(with_fallback_label(d, fsp))
+
+fn process_fn(c: Ctx, src: Source, sups: [Supp], var reg: rc_shapes.Registry, var out: [Diag]):
+  let fsp = rc_lower.function_diag_span(c, src.node)
+  let nd = c.t.nd[src.node]
+  let sd = suppression_diags(c.src, sups, nd.pos, nd.end)
+  if sd.len > 0:
+    log_error(sd, fsp, &out)
+    return
+  if not reg.built: reg = rc_shapes.base()
+  var r = compile_fn(c, src, &reg)
+  for i in 0..r.events.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &r.events[i])
+    out.push(d)
+  if not r.ok:
+    var errs: [Diag] = []
+    swap(&errs, &r.errs)
+    log_error(errs, fsp, &out)
+
+# compile_program in lint mode: the diagnostics of the file
+fn lint(c: Ctx, root: Int, comments: [Int]) -> [Diag]:
+  var out: [Diag] = []
+  if has_memo_cache_function_import(c, root): return out
+  let queue = find_functions_to_compile(c, root)
+  if queue.len == 0: return out
+  let sups = find_program_suppressions(c.src, comments)
+  var reg = rc_shapes.Registry()
+  for s in queue: process_fn(c, s, sups, &reg, &out)
+  return out
+
+# every comment's span (start, end pairs), outside literals (rjest.all_comments over a tree)
+fn all_comments(t: ast.Ast, s: Str) -> [Int]:
+  var lits: [Int] = []
+  for x in 1..t.nd.len:
+    let kd = t.nd[x].k
+    if kd == ast.N_STR or kd == ast.N_NOSUBTEMPL or kd == ast.N_TEMPL or kd == ast.N_REGEX or kd == ast.N_JSXTEXT:
+      if t.nd[x].end > t.nd[x].pos: lits.push(x)
+  lits.sort(by: fn(a, b) => t.nd[a].pos < t.nd[b].pos)
+  var out: [Int] = []
+  let n = s.len
+  var li = 0
+  var i = 0
+  if n > 1 and s[0] == '#' and s[1] == '!':
+    while i < n and s[i] != '\n': i += 1
+  while i < n:
+    while li < lits.len and t.nd[lits[li]].end <= i: li += 1
+    if li < lits.len and t.nd[lits[li]].pos <= i:
+      i = t.nd[lits[li]].end
+      continue
+    let c = s[i]
+    if c == '/' and i + 1 < n:
+      if s[i + 1] == '/':
+        var e = i + 2
+        while e < n and s[e] != '\n' and s[e] != '\r' and not (s[e] == 0xE2 and e + 2 < n and s[e + 1] == 0x80 and (s[e + 2] == 0xA8 or s[e + 2] == 0xA9)): e += 1
+        out.push(i)
+        out.push(e)
+        i = e
+        continue
+      if s[i + 1] == '*':
+        var e = s.find("*/", i + 2)
+        if e < 0: e = n
+        else: e += 2
+        out.push(i)
+        out.push(e)
+        i = e
+        continue
+    i += 1
+  return out

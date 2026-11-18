@@ -1,0 +1,593 @@
+# The React Compiler's passes between lowering and SSA: validate_context_variable_lvalues,
+# validate_use_memo (react_compiler_validation) and drop_manual_memoization
+# (react_compiler_optimization).
+
+import rc_hir
+import rc_env
+import rc_build
+import rc_ops
+import rc_cfg
+import rc_visit
+import rc_diags
+import rc_diags_hand
+from rc_hir import Sp, Place, Instruction, InstrValue, Terminal, HirFunction, ManualMemoDep, DepPathEntry, PropLit, NonLocal
+from rc_env import Env, Diag
+
+fn nosp() -> Sp:
+  return rc_hir.nosp()
+
+# ---- validate_context_variable_lvalues
+
+# kinds: 0 local, 1 context, 2 destructure
+fn vk_name(k: Int) -> Str:
+  if k == 0: return "local"
+  if k == 1: return "context"
+  return "destructure"
+
+type Kinds:
+  kind: {Int: Int} = {}
+  place: {Int: Place} = {}
+
+fn format_place(e: Env, p: Place) -> Str:
+  let id = e.identifiers[p.identifier]
+  return "{rc_hir.effect_name(p.effect)} {id.name}${p.identifier}"
+
+fn vcl_visit(var ks: Kinds, var e: Env, p: Place, kind: Int):
+  if p.identifier in ks.kind:
+    let prev = ks.kind[p.identifier]
+    let was_ctx = prev == 1
+    let is_ctx = kind == 1
+    if was_ctx != is_ctx:
+      if prev == 2 or kind == 2:
+        var sp = ks.place[p.identifier].sp
+        if kind == 2: sp = p.sp
+        rc_env.record_diagnostic(&e, rc_diags.todo_support_destructuring_context_variables(sp))
+        return
+      rc_env.throw(&e, rc_diags.inconsistent_context_variable(format_place(e, p), vk_name(kind), vk_name(prev), p.sp))
+      return
+  ks.kind[p.identifier] = kind
+  ks.place[p.identifier] = p
+
+fn vcl_impl(f: HirFunction, var ks: Kinds, var e: Env):
+  var inner: [Int] = []
+  for bid_i in 0..f.body.order.len:
+    let bid = f.body.order[bid_i]
+    for iid in f.body.blocks[bid].instructions:
+      let v = f.instructions[iid].value
+      match v:
+        DeclareContext(lv, _): vcl_visit(&ks, &e, lv.place, 1)
+        StoreContext(lv, _, _): vcl_visit(&ks, &e, lv.place, 1)
+        LoadContext(p, _, _): vcl_visit(&ks, &e, p, 1)
+        StoreLocal(lv, _, _): vcl_visit(&ks, &e, lv.place, 0)
+        DeclareLocal(lv, _): vcl_visit(&ks, &e, lv.place, 0)
+        LoadLocal(p, _): vcl_visit(&ks, &e, p, 0)
+        PostfixUpdate(lv, _, _, _): vcl_visit(&ks, &e, lv, 0)
+        PrefixUpdate(lv, _, _, _): vcl_visit(&ks, &e, lv, 0)
+        Destructure(pat, _, _, _):
+          for p in rc_ops.pattern_operands(pat):
+            vcl_visit(&ks, &e, p, 2)
+            if e.failed: return
+        FunctionExpression(_, _, _, fid, _, _): inner.push(fid)
+        ObjectMethod(_, fid): inner.push(fid)
+        _:
+          for p in rc_ops.value_lvalues(v): rc_env.record_diagnostic(&e, rc_diags.todo_validate_context_variable_lvalues_unhandled_instruction_variant(rc_ops.value_sp(v)))
+      if e.failed: return
+  for fid in inner:
+    var g = rc_cfg.placeholder_function()
+    swap(&g, &e.functions[fid])
+    vcl_impl(g, &ks, &e)
+    swap(&g, &e.functions[fid])
+    if e.failed: return
+
+
+fn validate_context_variable_lvalues(f: HirFunction, var e: Env):
+  var ks = Kinds()
+  vcl_impl(f, &ks, &e)
+
+# ---- validate_use_memo: returns the void-use-memo diagnostics (logged as events)
+
+fn nonlocal_name(b: NonLocal) -> Str:
+  return b.name + ""
+
+fn has_non_void_return(f: HirFunction) -> Bool:
+  for bid_i in 0..f.body.order.len:
+    let bid = f.body.order[bid_i]
+    match f.body.blocks[bid].terminal:
+      Return(_, variant, _, _, _, _):
+        if variant == rc_hir.RV_EXPLICIT or variant == rc_hir.RV_IMPLICIT: return true
+      _: continue
+  return false
+
+# HirFunction::diagnostic_span
+fn fn_diagnostic_span(f: HirFunction) -> Sp:
+  let fs = f.sp
+  if fs.s < 0: return nosp()
+  if f.body_sp.s >= 0:
+    var end = f.body_sp.s + 1
+    if end > fs.e: end = fs.e
+    return Sp(fs.s, end)
+  if f.has_id and f.id_sp.s >= 0: return f.id_sp
+  if f.is_async:
+    var end = fs.s + 5
+    if end > fs.e: end = fs.e
+    return Sp(fs.s, end)
+  var end = fs.s + 2
+  if f.params.len > 0:
+    let ps = f.params[0].place.sp
+    if ps.s >= 0: end = ps.e
+  if end > fs.e: end = fs.e
+  return Sp(fs.s, end)
+
+fn validate_no_context_variable_assignment(f: HirFunction, var e: Env):
+  var ctx: {Int: Sp} = {}
+  for p in f.context:
+    var s = e.identifiers[p.identifier].sp
+    if s.s < 0: s = p.sp
+    ctx[p.identifier] = s
+  for bid_i in 0..f.body.order.len:
+    let bid = f.body.order[bid_i]
+    for iid in f.body.blocks[bid].instructions:
+      match f.instructions[iid].value:
+        StoreContext(lv, _, _):
+          if lv.place.identifier in ctx: rc_env.record_diagnostic(&e, rc_diags_hand.use_memo_reassigns_outer_variable(lv.place.sp, ctx[lv.place.identifier]))
+        _: continue
+
+fn validate_use_memo(f: HirFunction, var e: Env) -> [Diag]:
+  var out: [Diag] = []
+  var use_memos: {Int: Bool} = {}
+  var react: {Int: Bool} = {}
+  var fexpr_fn: {Int: Int} = {}
+  var fexpr_sp: {Int: Sp} = {}
+  var unused_ids: [Int] = []
+  var unused_sp: [Sp] = []
+  for bid_i in 0..f.body.order.len:
+    let bid = f.body.order[bid_i]
+    for iid in f.body.blocks[bid].instructions:
+      let ins = f.instructions[iid]
+      let lv = ins.lvalue
+      if unused_ids.len > 0:
+        for p in rc_ops.value_operands(ins.value, e): drop_unused(&unused_ids, &unused_sp, p.identifier)
+      match ins.value:
+        LoadGlobal(bnd, _):
+          if bnd.name == "useMemo": use_memos[lv.identifier] = true
+          elif bnd.name == "React": react[lv.identifier] = true
+        PropertyLoad(o, prop, _, _, _):
+          if react.get(o.identifier, false) and not prop.is_num and prop.s == "useMemo": use_memos[lv.identifier] = true
+        FunctionExpression(_, _, _, fid, _, sp):
+          fexpr_fn[lv.identifier] = fid
+          fexpr_sp[lv.identifier] = sp
+        CallExpression(callee, args, _): possible_use_memo(&e, &out, use_memos, fexpr_fn, fexpr_sp, &unused_ids, &unused_sp, callee, args, lv)
+        MethodCall(_, prop, args, _): possible_use_memo(&e, &out, use_memos, fexpr_fn, fexpr_sp, &unused_ids, &unused_sp, prop, args, lv)
+        _: continue
+    if unused_ids.len > 0:
+      for p in rc_ops.term_operands(f.body.blocks[bid].terminal): drop_unused(&unused_ids, &unused_sp, p.identifier)
+  for s in unused_sp: out.push(rc_diags.unused_use_memo(s))
+  return out
+
+fn drop_unused(var ids: [Int], var sps: [Sp], id: Int):
+  for i in 0..ids.len:
+    if ids[i] == id:
+      var ni: [Int] = []
+      var ns: [Sp] = []
+      for j in 0..ids.len:
+        if j != i:
+          ni.push(ids[j])
+          ns.push(sps[j])
+      ids = ni
+      sps = ns
+      return
+
+fn possible_use_memo(var e: Env, var out: [Diag], use_memos: {Int: Bool}, fexpr_fn: {Int: Int}, fexpr_sp: {Int: Sp}, var unused_ids: [Int], var unused_sp: [Sp], callee: Place, args: [rc_hir.Elem], lv: Place):
+  if not use_memos.get(callee.identifier, false) or args.len == 0: return
+  if args[0].kind != 0: return
+  let first = args[0].place
+  if not (first.identifier in fexpr_fn): return
+  let fid = fexpr_fn[first.identifier]
+  let fsp = fexpr_sp[first.identifier]
+  var body = rc_cfg.placeholder_function()
+  swap(&body, &e.functions[fid])
+  if body.params.len > 0: rc_env.record_diagnostic(&e, rc_diags.use_memo_callback_parameters(body.params[0].place.sp))
+  if body.is_async or body.generator:
+    var s = fn_diagnostic_span(body)
+    if s.s < 0: s = fsp
+    rc_env.record_diagnostic(&e, rc_diags.async_or_generator_use_memo(s))
+  validate_no_context_variable_assignment(body, &e)
+  if not has_non_void_return(body):
+    var s = fn_diagnostic_span(body)
+    if s.s < 0: s = fsp
+    out.push(rc_diags.use_memo_no_return(s))
+  elif callee.sp.s >= 0:
+    var found = false
+    for i in 0..unused_ids.len:
+      if unused_ids[i] == lv.identifier:
+        unused_sp[i] = callee.sp
+        found = true
+    if not found:
+      unused_ids.push(lv.identifier)
+      unused_sp.push(callee.sp)
+  swap(&body, &e.functions[fid])
+
+# ---- drop_manual_memoization
+
+fn is_known_react_module(m: Str) -> Bool:
+  let l = m.lower()
+  return l == "react" or l == "react-dom"
+
+fn hook_detection_name(b: NonLocal) -> Str:
+  if b.kind == rc_hir.NL_GLOBAL: return b.name + ""
+  if b.kind == rc_hir.NL_IMPORT_SPECIFIER:
+    if is_known_react_module(b.module): return b.imported + ""
+    return ""
+  if b.kind == rc_hir.NL_IMPORT_DEFAULT or b.kind == rc_hir.NL_IMPORT_NAMESPACE:
+    if is_known_react_module(b.module): return b.name + ""
+  return ""
+
+fn dep_copy(d: ManualMemoDep) -> ManualMemoDep:
+  var path: [DepPathEntry] = []
+  for x in d.path: path.push(DepPathEntry(PropLit(x.property.is_num, x.property.s + "", x.property.num), x.computed, x.optional, x.sp))
+  return ManualMemoDep(d.global, d.name + "", d.value, d.constant, path, d.sp)
+
+type Sidemap:
+  functions: {Int: Bool} = {}
+  memo_kind: {Int: Int} = {}       # 0 useMemo, 1 useCallback
+  memo_load: {Int: Int} = {}       # -> the instruction loading it
+  react: {Int: Bool} = {}
+  lists_sp: {Int: Sp} = {}
+  lists: {Int: [Place]} = {}
+  deps: {Int: ManualMemoDep} = {}
+  optionals: {Int: Bool} = {}
+
+fn find_optional_places(f: HirFunction, var e: Env) -> {Int: Bool}:
+  var out: {Int: Bool} = {}
+  for bid_i in 0..f.body.order.len:
+    let bid = f.body.order[bid_i]
+    var opt = false
+    var test = -1
+    var oft = -1
+    match f.body.blocks[bid].terminal:
+      Optional(o, t, ft, _, _):
+        opt = o
+        test = t
+        oft = ft
+      _: continue
+    if not opt: continue
+    var tb = test
+    while true:
+      var next = -1
+      var done = false
+      match f.body.blocks[tb].terminal:
+        Branch(_, cons, _, ft, _, _):
+          if ft == oft:
+            let cb = f.body.blocks[cons]
+            if cb.instructions.len > 0:
+              match f.instructions[cb.instructions[cb.instructions.len - 1]].value:
+                StoreLocal(_, val, _): out[val.identifier] = true
+                _: done = true
+            done = true
+          else: next = ft
+        Optional(_, _, ft, _, _): next = ft
+        Logical(_, _, ft, _, _): next = ft
+        Sequence(_, ft, _, _): next = ft
+        Ternary(_, ft, _, _): next = ft
+        MaybeThrow(c, _, _, _, _, _): next = c
+        _:
+          rc_env.throw(&e, rc_diags_hand.unexpected_optional_terminal("Discriminant"))
+          return out
+      if done: break
+      tb = next
+  return out
+
+fn collect_maybe_memo_dependency(v: InstrValue, sm: Sidemap, optional: Bool, e: Env) -> [ManualMemoDep]:
+  match v:
+    LoadGlobal(b, sp): return [ManualMemoDep(true, b.name + "", Place(-1, 0, false, nosp()), false, [], sp)]
+    PropertyLoad(o, prop, computed, psp, sp):
+      if o.identifier in sm.deps:
+        let od = sm.deps[o.identifier]
+        var d = dep_copy(od)
+        var s = psp
+        if s.s < 0: s = sp
+        d.path.push(DepPathEntry(PropLit(prop.is_num, prop.s + "", prop.num), computed, optional, s))
+        d.sp = sp
+        return [d]
+      return []
+    LoadLocal(p, _): return load_dep(p, sm, e)
+    LoadContext(p, _, _): return load_dep(p, sm, e)
+    StoreLocal(lv, val, _):
+      if val.identifier in sm.deps:
+        if e.identifiers[lv.place.identifier].name_kind != 1: return [dep_copy(sm.deps[val.identifier])]
+      return []
+    _: return []
+
+fn load_dep(p: Place, sm: Sidemap, e: Env) -> [ManualMemoDep]:
+  if p.identifier in sm.deps: return [dep_copy(sm.deps[p.identifier])]
+  if e.identifiers[p.identifier].name_kind == 1: return [ManualMemoDep(false, "", p, false, [], p.sp)]
+  return []
+
+fn collect_temporaries(f: HirFunction, e: Env, iid: Int, var sm: Sidemap):
+  let ins = f.instructions[iid]
+  let lid = ins.lvalue.identifier
+  match ins.value:
+    FunctionExpression(_, _, _, _, _, _): sm.functions[lid] = true
+    LoadGlobal(b, _):
+      let hn = hook_detection_name(b)
+      var detected = false
+      if hn == "useMemo":
+        sm.memo_kind[lid] = 0
+        sm.memo_load[lid] = iid
+        detected = true
+      elif hn == "useCallback":
+        sm.memo_kind[lid] = 1
+        sm.memo_load[lid] = iid
+        detected = true
+      if not detected and b.name == "React": sm.react[lid] = true
+    PropertyLoad(o, prop, _, _, _):
+      if sm.react.get(o.identifier, false) and not prop.is_num:
+        if prop.s == "useMemo":
+          sm.memo_kind[lid] = 0
+          sm.memo_load[lid] = iid
+        elif prop.s == "useCallback":
+          sm.memo_kind[lid] = 1
+          sm.memo_load[lid] = iid
+    ArrayExpression(els, sp):
+      var all = true
+      var ps: [Place] = []
+      for x in els:
+        if x.kind == 0: ps.push(x.place)
+        else: all = false
+      if all:
+        sm.lists[lid] = ps
+        sm.lists_sp[lid] = sp
+    _: nop()
+  let opt = sm.optionals.get(lid, false)
+  let md = collect_maybe_memo_dependency(ins.value, sm, opt, e)
+  if md.len > 0:
+    match ins.value:
+      StoreLocal(lv, _, _): sm.deps[lv.place.identifier] = dep_copy(md[0])
+      _: nop()
+    sm.deps[lid] = dep_copy(md[0])
+
+fn drop_manual_memoization(var f: HirFunction, var e: Env):
+  let validation = true
+  var sm = Sidemap()
+  sm.optionals = find_optional_places(f, &e)
+  if e.failed: return
+  var next_id = 0
+  var q_after: [Int] = []          # queued inserts: after this instruction ...
+  var q_ins: [Instruction] = []    # ... this one
+  var all: [[Int]] = []
+  for bid_i in 0..f.body.order.len:
+    let bid = f.body.order[bid_i]
+    var xs: [Int] = []
+    for x in f.body.blocks[bid].instructions: xs.push(x)
+    all.push(xs)
+  for xs in all:
+    for iid in xs:
+      var lookup = -1
+      match f.instructions[iid].value:
+        CallExpression(callee, _, _): lookup = callee.identifier
+        MethodCall(_, prop, _, _): lookup = prop.identifier
+        _: lookup = -1
+      if lookup >= 0 and lookup in sm.memo_kind:
+        process_manual_memo_call(&f, &e, iid, sm.memo_kind[lookup], sm.memo_load[lookup], sm, validation, &next_id, &q_after, &q_ins)
+      else: collect_temporaries(f, e, iid, &sm)
+  if q_after.len == 0: return
+  var changed = false
+  for bid_i in 0..f.body.order.len:
+    let bid = f.body.order[bid_i]
+    var out: [Int] = []
+    var touched = false
+    var cur: [Int] = []
+    for x in f.body.blocks[bid].instructions: cur.push(x)
+    for x in cur:
+      out.push(x)
+      for qi in 0..q_after.len:
+        if q_after[qi] == x:
+          let nid = f.instructions.len
+          var ins = Instruction(0, Place(-1, 0, false, nosp()), rc_hir.Debugger(nosp()), nosp(), [], false)
+          swap(&ins, &q_ins[qi])
+          q_after[qi] = -1
+          f.instructions.push(ins)
+          out.push(nid)
+          touched = true
+          break
+    if touched:
+      f.body.blocks[bid].instructions = out
+      changed = true
+  if changed: rc_cfg.mark_ids(&f)
+
+fn process_manual_memo_call(var f: HirFunction, var e: Env, iid: Int, kind: Int, load_iid: Int, sm: Sidemap, validation: Bool, var next_id: Int, var q_after: [Int], var q_ins: [Instruction]):
+  var kind_name = "useMemo"
+  if kind == 1: kind_name = "useCallback"
+  var args: [rc_hir.Elem] = []
+  match f.instructions[iid].value:
+    CallExpression(_, a, _):
+      for x in a: args.push(x)
+    MethodCall(_, _, a, _):
+      for x in a: args.push(x)
+    _: return
+  if args.len == 0 or args[0].kind != 0:
+    rc_env.record_diagnostic(&e, rc_diags_hand.expected_memo_callback(kind_name, kind == 1, rc_ops.value_sp(f.instructions[iid].value)))
+    return
+  let fn_place = args[0].place
+  var has_deps = false
+  var deps: [ManualMemoDep] = []
+  var deps_sp = nosp()
+  if args.len > 1:
+    let dl = args[1]
+    if dl.kind != 0 or not (dl.place.identifier in sm.lists):
+      var s = f.instructions[iid].sp
+      if dl.kind == 0: s = dl.place.sp
+      rc_env.record_diagnostic(&e, rc_diags_hand.expected_memo_dependency_array(kind_name, s))
+      return
+    has_deps = true
+    deps_sp = sm.lists_sp[dl.place.identifier]
+    for d in sm.lists[dl.place.identifier]:
+      if d.identifier in sm.deps: deps.push(dep_copy(sm.deps[d.identifier]))
+      else: rc_env.record_diagnostic(&e, rc_diags_hand.expected_simple_memo_dependencies(d.sp))
+  let sp = rc_ops.value_sp(f.instructions[iid].value)
+  let callee_sp = rc_ops.value_sp(f.instructions[load_iid].value)
+  if kind == 0: f.instructions[iid].value = rc_hir.CallExpression(fn_place, [], sp)
+  else: f.instructions[iid].value = rc_hir.LoadLocal(Place(fn_place.identifier, rc_hir.EF_UNKNOWN, false, sp), sp)
+  if not validation: return
+  if not sm.functions.get(fn_place.identifier, false):
+    rc_env.record_diagnostic(&e, rc_diags_hand.expected_inline_memo_function(fn_place.sp))
+    return
+  var decl = Place(fn_place.identifier, rc_hir.EF_UNKNOWN, false, fn_place.sp)
+  if kind == 0: decl = f.instructions[iid].lvalue
+  let mid = next_id
+  next_id += 1
+  let sl = rc_build.create_temporary_place(&e, fn_place.sp)
+  let start = Instruction(0, sl, rc_hir.StartMemoize(mid, has_deps, deps, deps_sp, false, callee_sp, fn_place.sp), fn_place.sp, [], false)
+  let fl = rc_build.create_temporary_place(&e, fn_place.sp)
+  let finish = Instruction(0, fl, rc_hir.FinishMemoize(mid, decl, false, fn_place.sp), fn_place.sp, [], false)
+  queue(&q_after, &q_ins, load_iid, start)
+  queue(&q_after, &q_ins, iid, finish)
+
+# (an FxHashMap insert: a later insert for the same instruction replaces the earlier)
+fn queue(var after: [Int], var ins: [Instruction], at: Int, own x: Instruction):
+  for i in 0..after.len:
+    if after[i] == at:
+      ins[i] = x
+      return
+  after.push(at)
+  ins.push(x)
+
+fn nop():
+  return
+
+# ---- inline_immediately_invoked_function_expressions
+
+fn has_single_exit_return_terminal(f: HirFunction) -> Bool:
+  var has_return = false
+  var exits = 0
+  for bid_i in 0..f.body.order.len:
+    match f.body.blocks[f.body.order[bid_i]].terminal:
+      Return(_, _, _, _, _, _):
+        has_return = true
+        exits += 1
+      Throw(_, _, _): exits += 1
+      _: continue
+  return exits == 1 and has_return
+
+fn add_block(var f: HirFunction, own b: rc_hir.BasicBlock):
+  let id = b.id
+  if not (id in f.body.blocks): f.body.order.push(id)
+  f.body.blocks[id] = b
+
+fn inline_iifes(var f: HirFunction, var e: Env):
+  var functions: {Int: Int} = {}
+  var inlined: {Int: Bool} = {}
+  var queue: [Int] = []
+  for x in f.body.order: queue.push(x)
+  var qi = 0
+  while qi < queue.len:
+    let bid = queue[qi]
+    qi += 1
+    if not (bid in f.body.blocks): continue
+    let bk = f.body.blocks[bid].kind
+    if bk != rc_hir.BK_BLOCK and bk != rc_hir.BK_CATCH: continue
+    let n = f.body.blocks[bid].instructions.len
+    var ii = 0
+    while ii < n:
+      let iid = f.body.blocks[bid].instructions[ii]
+      ii += 1
+      var callee_id = -1
+      var is_call = false
+      var fn_id = -1
+      match f.instructions[iid].value:
+        FunctionExpression(_, _, _, fid, _, _): fn_id = fid
+        CallExpression(callee, args, _):
+          is_call = true
+          if args.len == 0: callee_id = callee.identifier
+        _: is_call = false
+      if fn_id >= 0:
+        let lid = f.instructions[iid].lvalue.identifier
+        if e.identifiers[lid].name_kind == 0: functions[lid] = fn_id
+        continue
+      if is_call:
+        if callee_id < 0 or not (callee_id in functions): continue
+        let inner_id = functions[callee_id]
+        if e.functions[inner_id].params.len > 0 or e.functions[inner_id].is_async or e.functions[inner_id].generator: continue
+        inlined[callee_id] = true
+        let call_lv = f.instructions[iid].lvalue
+        let tid = rc_visit_term_id(f.body.blocks[bid].terminal)
+        let tsp = rc_visit_term_sp(f.body.blocks[bid].terminal)
+        let cont_id = rc_env.next_block_id(&e)
+        var cont_ins: [Int] = []
+        for k in ii..f.body.blocks[bid].instructions.len: cont_ins.push(f.body.blocks[bid].instructions[k])
+        var cterm = rc_hir.Unreachable(0, nosp())
+        swap(&cterm, &f.body.blocks[bid].terminal)
+        add_block(&f, rc_hir.BasicBlock(bk, cont_id, cont_ins, cterm, [], []))
+        var keep: [Int] = []
+        for k in 0..ii - 1: keep.push(f.body.blocks[bid].instructions[k])
+        f.body.blocks[bid].instructions = keep
+        let single = has_single_exit_return_terminal(e.functions[inner_id])
+        let inner_entry = e.functions[inner_id].body.entry
+        if single: f.body.blocks[bid].terminal = rc_hir.Goto(inner_entry, rc_hir.GV_BREAK, tid, tsp)
+        else:
+          f.body.blocks[bid].terminal = rc_hir.Label(inner_entry, nosp(), 0, cont_id, tsp)
+          let dl = rc_build.create_temporary_place(&e, call_lv.sp)
+          let did = f.instructions.len
+          f.instructions.push(Instruction(0, dl, rc_hir.DeclareLocal(rc_hir.LValue(call_lv, rc_hir.IK_LET), call_lv.sp), nosp(), [], false))
+          f.body.blocks[bid].instructions.push(did)
+          if e.identifiers[call_lv.identifier].name_kind == 0: rc_build.promote_temporary(&e, call_lv.identifier)
+        var inner = rc_cfg.placeholder_function()
+        swap(&inner, &e.functions[inner_id])
+        let off = f.instructions.len
+        for k in 0..inner.instructions.len:
+          var x = Instruction(0, call_lv, rc_hir.Debugger(nosp()), nosp(), [], false)
+          swap(&x, &inner.instructions[k])
+          f.instructions.push(x)
+        for oi in 0..inner.body.order.len:
+          let ib = inner.body.order[oi]
+          var blk = rc_cfg.empty_block()
+          swap(&blk, &inner.body.blocks[ib])
+          for k in 0..blk.instructions.len: blk.instructions[k] = blk.instructions[k] + off
+          blk.preds = []
+          var rv = Place(-1, 0, false, nosp())
+          var rid = 0
+          var rsp = nosp()
+          var is_ret = false
+          match blk.terminal:
+            Return(v, _, i, s, _, _):
+              is_ret = true
+              rv = v
+              rid = i
+              rsp = s
+            _: is_ret = false
+          if is_ret:
+            if single:
+              let lid = f.instructions.len
+              f.instructions.push(Instruction(0, call_lv, rc_hir.LoadLocal(rv, rsp), rsp, [], false))
+              blk.instructions.push(lid)
+              blk.terminal = rc_hir.Goto(cont_id, rc_hir.GV_BREAK, rid, rsp)
+            else:
+              let sl = rc_build.create_temporary_place(&e, rsp)
+              let sid = f.instructions.len
+              f.instructions.push(Instruction(0, sl, rc_hir.StoreLocal(rc_hir.LValue(call_lv, rc_hir.IK_REASSIGN), rv, rsp), rsp, [], false))
+              blk.instructions.push(sid)
+              blk.terminal = rc_hir.Goto(cont_id, rc_hir.GV_BREAK, 0, rsp)
+          add_block(&f, blk)
+        inner.body = rc_hir.HIR(inner.body.entry, [], {})
+        inner.instructions = []
+        swap(&inner, &e.functions[inner_id])
+        queue.push(cont_id)
+        break
+      for p in rc_ops.value_operands(f.instructions[iid].value, e): functions.remove(p.identifier)
+  if inlined.len == 0: return
+  for oi in 0..f.body.order.len:
+    let bid = f.body.order[oi]
+    var keep: [Int] = []
+    for x in f.body.blocks[bid].instructions:
+      if not inlined.get(f.instructions[x].lvalue.identifier, false): keep.push(x)
+    f.body.blocks[bid].instructions = keep
+  rc_cfg.reverse_postorder(&f.body)
+  rc_cfg.mark_ids(&f)
+  rc_build.mark_predecessors(&f.body)
+  rc_cfg.merge_consecutive_blocks(&f, &e)
+
+fn rc_visit_term_id(t: Terminal) -> Int:
+  return rc_visit.term_id(t)
+
+fn rc_visit_term_sp(t: Terminal) -> Sp:
+  return rc_visit.term_sp(t)

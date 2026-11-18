@@ -1,0 +1,303 @@
+# SSA form (react_compiler_ssa/enter_ssa.rs, eliminate_redundant_phi.rs): every assignment defines
+# a new identifier; phis join the definitions that reach a block from several predecessors.
+
+import rc_hir
+import rc_env
+import rc_ops
+import rc_cfg
+import rc_visit
+import rc_diags
+from rc_hir import Sp, Place, Instruction, InstrValue, Terminal, HirFunction, Phi, Param
+from rc_env import Env
+
+type Incomplete:
+  old: Place
+  new: Place
+
+type SSA:
+  defs: {Int: {Int: Int}} = {}          # block -> old id -> new id
+  incomplete: {Int: [Incomplete]} = {}
+  started: {Int: Bool} = {}
+  current: Int = -1
+  unsealed: {Int: Int} = {}
+  preds: {Int: [Int]} = {}
+  unknown: {Int: Bool} = {}
+  pending: {Int: [Phi]} = {}
+  processed: [Int] = []
+
+fn make_id(var e: Env, old: Int) -> Int:
+  let id = rc_env.next_identifier_id(&e)
+  e.identifiers[id].declaration_id = e.identifiers[old].declaration_id
+  e.identifiers[id].name_kind = e.identifiers[old].name_kind
+  e.identifiers[id].name = e.identifiers[old].name + ""
+  e.identifiers[id].sp = e.identifiers[old].sp
+  return id
+
+fn define_place(var b: SSA, var e: Env, p: Place) -> Place:
+  if b.unknown.get(p.identifier, false):
+    var name = "${p.identifier}"
+    if e.identifiers[p.identifier].name_kind != 0: name = "{e.identifiers[p.identifier].name}${p.identifier}"
+    rc_env.throw(&e, rc_diags.undefined_ssa_identifier(name, p.sp))
+    return p
+  let nid = make_id(&e, p.identifier)
+  b.defs[b.current][p.identifier] = nid
+  return Place(nid, p.effect, p.reactive, p.sp)
+
+fn get_place(var b: SSA, var e: Env, p: Place) -> Place:
+  let nid = get_id_at(&b, &e, p, b.current)
+  return Place(nid, p.effect, p.reactive, p.sp)
+
+fn get_id_at(var b: SSA, var e: Env, p: Place, bid: Int) -> Int:
+  if bid in b.defs and p.identifier in b.defs[bid]: return b.defs[bid][p.identifier]
+  var preds: [Int] = []
+  if bid in b.preds:
+    for x in b.preds[bid]: preds.push(x)
+  if preds.len == 0:
+    b.unknown[p.identifier] = true
+    return p.identifier
+  if b.unsealed.get(bid, 0) > 0:
+    let nid = make_id(&e, p.identifier)
+    let np = Place(nid, p.effect, p.reactive, p.sp)
+    b.incomplete[bid].push(Incomplete(p, np))
+    b.defs[bid][p.identifier] = nid
+    return nid
+  if preds.len == 1:
+    let nid = get_id_at(&b, &e, p, preds[0])
+    b.defs[bid][p.identifier] = nid
+    return nid
+  let nid = make_id(&e, p.identifier)
+  b.defs[bid][p.identifier] = nid
+  add_phi(&b, &e, bid, p, Place(nid, p.effect, p.reactive, p.sp))
+  return nid
+
+fn add_phi(var b: SSA, var e: Env, bid: Int, old: Place, np: Place):
+  var preds: [Int] = []
+  if bid in b.preds:
+    for x in b.preds[bid]: preds.push(x)
+  var phi = Phi(np, [], [])
+  for pb in preds:
+    let pid = get_id_at(&b, &e, old, pb)
+    rc_cfg.phi_set(&phi, pb, Place(pid, old.effect, old.reactive, old.sp))
+  if not (bid in b.pending): b.pending[bid] = []
+  b.pending[bid].push(phi)
+
+fn fix_incomplete_phis(var b: SSA, var e: Env, bid: Int):
+  var inc: [Incomplete] = []
+  swap(&inc, &b.incomplete[bid])
+  for x in inc: add_phi(&b, &e, bid, x.old, x.new)
+
+fn start_block(var b: SSA, bid: Int):
+  b.current = bid
+  b.defs[bid] = {}
+  b.incomplete[bid] = []
+
+fn define_function(var b: SSA, f: HirFunction):
+  for oi in 0..f.body.order.len:
+    let id = f.body.order[oi]
+    var ps: [Int] = []
+    for x in f.body.blocks[id].preds: ps.push(x)
+    b.preds[id] = ps
+
+# for_each_instruction_lvalue_mut: the value's local lvalues, then the instruction's
+fn local_lvalues(v: InstrValue) -> [Place]:
+  match v:
+    DeclareLocal(lv, _): return [lv.place]
+    StoreLocal(lv, _, _): return [lv.place]
+    Destructure(pat, _, _, _): return rc_ops.pattern_operands(pat)
+    PostfixUpdate(lv, _, _, _): return [lv]
+    PrefixUpdate(lv, _, _, _): return [lv]
+    _: return []
+
+fn define_params(var b: SSA, var e: Env, var ps: [Param]):
+  for i in 0..ps.len:
+    ps[i].place = define_place(&b, &e, ps[i].place)
+    if e.failed: return
+
+fn enter_ssa(var f: HirFunction, var e: Env):
+  var b = SSA()
+  define_function(&b, f)
+  let root = f.body.entry
+  enter_ssa_impl(&f, &b, &e, root)
+  if e.failed: return
+  for oi in 0..f.body.order.len:
+    let id = f.body.order[oi]
+    if id in b.pending:
+      var phis: [Phi] = []
+      swap(&phis, &b.pending[id])
+      b.pending.remove(id)
+      move_phis(&f.body.blocks[id].phis, &phis)
+  var procs: [Int] = []
+  for x in b.processed: procs.push(x)
+  for fid in procs:
+    for oi in 0..e.functions[fid].body.order.len:
+      let id = e.functions[fid].body.order[oi]
+      if id in b.pending:
+        var phis: [Phi] = []
+        swap(&phis, &b.pending[id])
+        b.pending.remove(id)
+        move_phis(&e.functions[fid].body.blocks[id].phis, &phis)
+
+fn move_phis(var dst: [Phi], var src: [Phi]):
+  for k in 0..src.len:
+    var ph = Phi(src[k].place, [], [])
+    swap(&ph, &src[k])
+    dst.push(ph)
+
+fn enter_ssa_impl(var f: HirFunction, var b: SSA, var e: Env, root: Int):
+  var visited: {Int: Bool} = {}
+  var ids: [Int] = []
+  for x in f.body.order: ids.push(x)
+  for bid in ids:
+    if visited.get(bid, false):
+      rc_env.throw(&e, rc_diags.enter_ssa_cycle("{bid}"))
+      return
+    visited[bid] = true
+    start_block(&b, bid)
+    if bid == root:
+      if f.context.len > 0:
+        rc_env.throw(&e, rc_diags.invariant_expected_function_context_empty_outer_function_declarations())
+        return
+      if f.has_self:
+        f.self_binding = define_place(&b, &e, f.self_binding)
+        if e.failed: return
+      define_params(&b, &e, &f.params)
+      if e.failed: return
+    var iids: [Int] = []
+    for x in f.body.blocks[bid].instructions: iids.push(x)
+    for iid in iids:
+      let fid = rc_ops.value_func(f.instructions[iid].value)
+      if fid >= 0:
+        var ctx: [Place] = []
+        swap(&ctx, &e.functions[fid].context)
+        for i in 0..ctx.len: ctx[i] = get_place(&b, &e, ctx[i])
+        swap(&ctx, &e.functions[fid].context)
+      var ops = rc_ops.value_operands_nofn(f.instructions[iid].value)
+      for i in 0..ops.len: ops[i] = get_place(&b, &e, ops[i])
+      rc_ops.set_value_operands_nofn(&f.instructions[iid].value, ops)
+      var lvs = local_lvalues(f.instructions[iid].value)
+      for i in 0..lvs.len:
+        lvs[i] = define_place(&b, &e, lvs[i])
+        if e.failed: return
+      set_local_lvalues(&f.instructions[iid].value, lvs)
+      f.instructions[iid].lvalue = define_place(&b, &e, f.instructions[iid].lvalue)
+      if e.failed: return
+      if fid >= 0:
+        for p in e.functions[fid].context: b.unknown.remove(p.identifier)
+        b.processed.push(fid)
+        let ie = e.functions[fid].body.entry
+        if e.functions[fid].body.blocks[ie].preds.len > 0:
+          rc_env.throw(&e, rc_diags.invariant_expected_function_expression_entry_block_have_zero_predecessors())
+          return
+        e.functions[fid].body.blocks[ie].preds.push(bid)
+        var inner = rc_cfg.placeholder_function()
+        swap(&inner, &e.functions[fid])
+        define_function(&b, inner)
+        let saved = b.current
+        if inner.has_self:
+          inner.self_binding = define_place(&b, &e, inner.self_binding)
+          if e.failed: return
+        define_params(&b, &e, &inner.params)
+        if e.failed: return
+        enter_ssa_impl(&inner, &b, &e, root)
+        if e.failed: return
+        b.current = saved
+        inner.body.blocks[ie].preds = []
+        swap(&inner, &e.functions[fid])
+        b.preds[ie] = []
+    var tops = rc_ops.term_operands(f.body.blocks[bid].terminal)
+    for i in 0..tops.len: tops[i] = get_place(&b, &e, tops[i])
+    rc_ops.set_term_operands(&f.body.blocks[bid].terminal, tops)
+    for out in rc_visit.successors(f.body.blocks[bid].terminal):
+      var n = 0
+      if out in b.preds: n = b.preds[out].len
+      var count = n - 1
+      if out in b.unsealed: count = b.unsealed[out] - 1
+      b.unsealed[out] = count
+      if count == 0 and visited.get(out, false): fix_incomplete_phis(&b, &e, out)
+
+fn is_context_store(v: InstrValue) -> Bool:
+  match v:
+    DeclareContext(_, _): return true
+    StoreContext(_, _, _): return true
+    _: return false
+
+fn set_local_lvalues(var v: InstrValue, ps: [Place]):
+  if is_context_store(v): return
+  rc_ops.set_value_lvalues(&v, ps)
+
+# ---- eliminate_redundant_phi
+
+type Rewrites:
+  map: {Int: Int} = {}
+
+fn rw(r: Rewrites, p: Place) -> Place:
+  if p.identifier in r.map: return Place(r.map[p.identifier], p.effect, p.reactive, p.sp)
+  return p
+
+fn eliminate_redundant_phi(var f: HirFunction, var e: Env):
+  var r = Rewrites()
+  erp_impl(&f, &e, &r)
+
+fn erp_impl(var f: HirFunction, var e: Env, var r: Rewrites):
+  var has_back_edge = false
+  var visited: {Int: Bool} = {}
+  while true:
+    let size = r.map.len
+    var ids: [Int] = []
+    for x in f.body.order: ids.push(x)
+    for bid in ids:
+      if not has_back_edge:
+        for p in f.body.blocks[bid].preds:
+          if not visited.get(p, false): has_back_edge = true
+      visited[bid] = true
+      var phis: [Phi] = []
+      swap(&phis, &f.body.blocks[bid].phis)
+      var keep: [Phi] = []
+      for pi in 0..phis.len:
+        for k in 0..phis[pi].ops.len: phis[pi].ops[k] = rw(r, phis[pi].ops[k])
+        var same = -1
+        var redundant = true
+        for op in phis[pi].ops:
+          if (same >= 0 and op.identifier == same) or op.identifier == phis[pi].place.identifier: continue
+          elif same >= 0:
+            redundant = false
+            break
+          else: same = op.identifier
+        if redundant: r.map[phis[pi].place.identifier] = same
+        else:
+          var ph = Phi(phis[pi].place, [], [])
+          swap(&ph, &phis[pi])
+          keep.push(ph)
+      f.body.blocks[bid].phis = keep
+      var iids: [Int] = []
+      for x in f.body.blocks[bid].instructions: iids.push(x)
+      for iid in iids:
+        f.instructions[iid].lvalue = rw(r, f.instructions[iid].lvalue)
+        var lvs = rc_ops.value_lvalues(f.instructions[iid].value)
+        for i in 0..lvs.len: lvs[i] = rw(r, lvs[i])
+        rc_ops.set_value_lvalues(&f.instructions[iid].value, lvs)
+        var ops = rc_ops.value_operands_nofn(f.instructions[iid].value)
+        for i in 0..ops.len: ops[i] = rw(r, ops[i])
+        rc_ops.set_value_operands_nofn(&f.instructions[iid].value, ops)
+        let fid = rc_ops.value_func(f.instructions[iid].value)
+        if fid >= 0:
+          for i in 0..e.functions[fid].context.len: e.functions[fid].context[i] = rw(r, e.functions[fid].context[i])
+          var inner = rc_cfg.placeholder_function()
+          swap(&inner, &e.functions[fid])
+          erp_impl(&inner, &e, &r)
+          swap(&inner, &e.functions[fid])
+      var tops = rc_ops.term_operands(f.body.blocks[bid].terminal)
+      for i in 0..tops.len: tops[i] = rw(r, tops[i])
+      rc_ops.set_term_operands(&f.body.blocks[bid].terminal, tops)
+    if not (r.map.len > size and has_back_edge): break
+
+# PruneMaybeThrows (react_compiler_optimization/prune_maybe_throws.rs), with the redundant phi
+# elimination it runs after pruning phi operands
+fn prune_maybe_throws(var f: HirFunction, var e: Env):
+  var mapping: {Int: Int} = {}
+  let r = rc_cfg.pmt_begin(&f, &mapping)
+  if r == 0: return
+  if r == 2:
+    eliminate_redundant_phi(&f, &e)
+    if e.failed: return
+  rc_cfg.pmt_end(&f, &e, mapping)

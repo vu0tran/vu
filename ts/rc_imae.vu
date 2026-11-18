@@ -1,0 +1,1198 @@
+# InferMutationAliasingEffects (oxc_react_compiler react_compiler_inference/
+# infer_mutation_aliasing_effects.rs): an abstract interpretation over the CFG that turns each
+# instruction's candidate effects (its signature) into the effects that hold given what each value
+# is known to be (mutable, frozen, primitive, ...), stored on the instructions and terminals.
+# Errors are thrown into the Env (rc_env.throw), so callers check e.failed.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_diags_hand
+import rc_ops
+import rc_visit
+import rc_shapes
+import rc_gdefs
+from rc_hir import Sp, Place, Elem, Ty, HirFunction, Instruction, InstrValue, Terminal, AliasingEffect
+from rc_hir import AE_FREEZE, AE_MUTATE, AE_MUTATE_CONDITIONALLY, AE_MUTATE_TRANSITIVE, AE_MUTATE_TRANSITIVE_CONDITIONALLY
+from rc_hir import AE_CAPTURE, AE_ALIAS, AE_MAYBE_ALIAS, AE_ASSIGN, AE_CREATE, AE_CREATE_FROM, AE_IMMUTABLE_CAPTURE
+from rc_hir import AE_APPLY, AE_CREATE_FUNCTION, AE_MUTATE_FROZEN, AE_MUTATE_GLOBAL, AE_IMPURE, AE_RENDER
+from rc_hir import VK_MUTABLE, VK_FROZEN, VK_PRIMITIVE, VK_MAYBE_FROZEN, VK_GLOBAL, VK_CONTEXT
+from rc_env import Env
+
+# ---- abstract values
+
+# AbstractValue: a kind and a set of reasons (bit r for ValueReason r)
+type AV:
+  kind: Int
+  reason: Int
+
+fn bit(r: Int) -> Int:
+  return 1 << r
+
+fn av(kind: Int, r: Int) -> AV:
+  return AV(kind, bit(r))
+
+fn is_superset(a: Int, b: Int) -> Bool:
+  return (a & b) == b
+
+fn merge_value_kinds(a: Int, b: Int) -> Int:
+  if a == b: return a
+  if a == VK_MAYBE_FROZEN or b == VK_MAYBE_FROZEN: return VK_MAYBE_FROZEN
+  if a == VK_MUTABLE or b == VK_MUTABLE:
+    if a == VK_FROZEN or b == VK_FROZEN: return VK_MAYBE_FROZEN
+    if a == VK_CONTEXT or b == VK_CONTEXT: return VK_CONTEXT
+    return VK_MUTABLE
+  if a == VK_CONTEXT or b == VK_CONTEXT:
+    if a == VK_FROZEN or b == VK_FROZEN: return VK_MAYBE_FROZEN
+    return VK_CONTEXT
+  if a == VK_FROZEN or b == VK_FROZEN: return VK_FROZEN
+  if a == VK_GLOBAL or b == VK_GLOBAL: return VK_GLOBAL
+  return VK_PRIMITIVE
+
+fn merge_av(a: AV, b: AV) -> AV:
+  let k = merge_value_kinds(a.kind, b.kind)
+  if k == a.kind and k == b.kind and is_superset(a.reason, b.reason): return AV(a.kind, a.reason)
+  return AV(k, a.reason | b.reason)
+
+fn primary_reason(rs: Int) -> Int:
+  for r in 0..12:
+    if (rs & bit(r)) != 0 and r != rc_hir.VR_OTHER: return r
+  return rc_hir.VR_OTHER
+
+# ---- the state
+
+type St:
+  is_fe: Bool = false
+  values: {Int: AV} = {}
+  vars: {Int: [Int]} = {}       # identifier -> its values, an ordered set
+  un_id: Int = -1               # the first read of an undefined identifier
+  un_sp: Sp = Sp(-1, -1)
+
+fn has_id(xs: [Int], x: Int) -> Bool:
+  for y in xs:
+    if y == x: return true
+  return false
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn clone_state(s: St) -> St:
+  var n = St()
+  n.is_fe = s.is_fe
+  for k, v in s.values: n.values[k] = AV(v.kind, v.reason)
+  for k, v in s.vars: n.vars[k] = copy_ints(v)
+  return n
+
+fn kind_sp(var s: St, id: Int, sp: Sp) -> AV:
+  if not (id in s.vars):
+    if s.un_id < 0:
+      s.un_id = id
+      s.un_sp = sp
+    return av(VK_MUTABLE, rc_hir.VR_OTHER)
+  var have = false
+  var m = AV(0, 0)
+  for vid in s.vars[id]:
+    if not (vid in s.values): continue
+    let k = s.values[vid]
+    if have: m = merge_av(m, k)
+    else:
+      m = AV(k.kind, k.reason)
+      have = true
+  if not have: return av(VK_MUTABLE, rc_hir.VR_OTHER)
+  return m
+
+fn kind(var s: St, id: Int) -> AV:
+  return kind_sp(&s, id, rc_hir.nosp())
+
+fn initialize(var s: St, vid: Int, v: AV):
+  s.values[vid] = AV(v.kind, v.reason)
+
+fn define(var s: St, id: Int, vid: Int):
+  s.vars[id] = [vid]
+
+fn from_identifier(id: Int) -> Int:
+  return id + (1 << 40)
+
+fn assign(var s: St, into: Int, from: Int):
+  if from in s.vars:
+    s.vars[into] = copy_ints(s.vars[from])
+    return
+  let vid = from_identifier(from)
+  if not (vid in s.values): s.values[vid] = av(VK_MUTABLE, rc_hir.VR_OTHER)
+  s.vars[into] = [vid]
+
+fn append_alias(var s: St, place: Int, value: Int):
+  if not (value in s.vars) or not (place in s.vars): return
+  let nv = copy_ints(s.vars[value])
+  var pv = copy_ints(s.vars[place])
+  for v in nv:
+    if not has_id(pv, v): pv.push(v)
+  s.vars[place] = pv
+
+fn is_defined(s: St, id: Int) -> Bool:
+  return id in s.vars
+
+fn values_for(s: St, id: Int) -> [Int]:
+  if id in s.vars: return copy_ints(s.vars[id])
+  return []
+
+fn freeze_value(var s: St, vid: Int, reason: Int):
+  s.values[vid] = av(VK_FROZEN, reason)
+
+fn freeze(var s: St, id: Int, reason: Int) -> Bool:
+  if not (id in s.vars): return false
+  let k = kind(&s, id).kind
+  if k == VK_CONTEXT or k == VK_MUTABLE or k == VK_MAYBE_FROZEN:
+    for vid in values_for(s, id): freeze_value(&s, vid, reason)
+    return true
+  return false
+
+fn contributes_new_value(this: [Int], other: [Int]) -> Bool:
+  for v in other:
+    if not has_id(this, v): return true
+  return false
+
+fn union_into(var this: [Int], other: [Int]):
+  for v in other:
+    if not has_id(this, v): this.push(v)
+
+# merge: [] when nothing changes
+fn merge(a: St, b: St) -> [St]:
+  var changed = false
+  var n = clone_state(a)
+  for id, tv in a.values:
+    if id in b.values:
+      let m = merge_av(tv, b.values[id])
+      if m.kind != tv.kind or not is_superset(tv.reason, m.reason):
+        n.values[id] = m
+        changed = true
+  for id, ov in b.values:
+    if not (id in a.values):
+      n.values[id] = AV(ov.kind, ov.reason)
+      changed = true
+  for id, tv in a.vars:
+    if id in b.vars:
+      if contributes_new_value(tv, b.vars[id]):
+        var m = copy_ints(tv)
+        union_into(&m, b.vars[id])
+        n.vars[id] = m
+        changed = true
+  for id, ov in b.vars:
+    if not (id in a.vars):
+      n.vars[id] = copy_ints(ov)
+      changed = true
+  if not changed: return []
+  return [n]
+
+fn merge_from(var a: St, b: St):
+  for id, ov in b.values:
+    if id in a.values:
+      let tv = a.values[id]
+      let m = merge_av(tv, ov)
+      if m.kind != tv.kind or not is_superset(tv.reason, m.reason): a.values[id] = m
+    else: a.values[id] = AV(ov.kind, ov.reason)
+  for id, ov in b.vars:
+    if id in a.vars:
+      if contributes_new_value(a.vars[id], ov):
+        var m = copy_ints(a.vars[id])
+        union_into(&m, ov)
+        a.vars[id] = m
+    else: a.vars[id] = copy_ints(ov)
+  a.un_id = -1
+
+fn infer_phi(var s: St, ph: rc_hir.Phi):
+  var vals: [Int] = []
+  for op in ph.ops:
+    if op.identifier in s.vars:
+      for v in s.vars[op.identifier]:
+        if not has_id(vals, v): vals.push(v)
+  if vals.len > 0: s.vars[ph.place.identifier] = vals
+
+# ---- the pass's context
+
+# AliasingSignature (built from a function expression)
+type FSig:
+  receiver: Int
+  params: [Int]
+  rest: Int
+  returns: Int
+  effects: [AliasingEffect]
+
+type IC:
+  sig_cache: {Int: [AliasingEffect]} = {}
+  catch_handlers: {Int: Place} = {}
+  is_fe: Bool = false
+  hoisted: {Int: Bool} = {}         # declaration ids of hoisted context declarations
+  hoisted_place: {Int: Place} = {}  # ... and the first place that reads one (when there is one)
+  non_mut: {Int: Bool} = {}
+  vcache: {Str: Int} = {}
+  fvals: {Int: Int} = {}            # value id -> function id
+  fsigs: {Int: FSig} = {}
+  temp_cache: {Str: Place} = {}
+  next_vid: Int = 1
+
+fn new_vid(var ic: IC) -> Int:
+  let v = ic.next_vid
+  ic.next_vid += 1
+  return v
+
+fn effect_key(x: AliasingEffect) -> Str:
+  if x.kind == AE_CREATE: return "{x.kind}:{x.b.identifier}:{x.vk}:{x.reason}"
+  if x.kind == AE_CREATE_FUNCTION:
+    var k = "{x.kind}:{x.b.identifier}:{x.n}"
+    for c in x.captures: k = k + ":{c.identifier}"
+    return k
+  return "{x.kind}:{x.a.identifier}:{x.b.identifier}"
+
+fn cached_vid(var ic: IC, key: Str) -> Int:
+  if key in ic.vcache: return ic.vcache[key]
+  let v = new_vid(&ic)
+  ic.vcache[key] = v
+  return v
+
+fn tyof(e: Env, id: Int) -> Ty:
+  return rc_hir.cp_ty(e.types[e.identifiers[id].type_])
+
+fn is_shape_obj(t: Ty, id: Str) -> Bool:
+  match t:
+    rc_hir.TObject(sh, has): return has and sh == id
+    _: return false
+  return false
+
+fn is_ref_or_ref_value(t: Ty) -> Bool:
+  return is_shape_obj(t, rc_gdefs.BUILT_IN_USE_REF_ID) or is_shape_obj(t, rc_gdefs.BUILT_IN_REF_VALUE_ID)
+
+fn is_ref_id(e: Env, id: Int) -> Bool:
+  return is_ref_or_ref_value(tyof(e, id))
+
+fn is_primitive_type(t: Ty) -> Bool:
+  match t:
+    rc_hir.TPrimitive: return true
+    _: return false
+  return false
+
+fn is_jsx_type(t: Ty) -> Bool:
+  return is_shape_obj(t, rc_gdefs.BUILT_IN_JSX_ID)
+
+fn is_builtin_collection_type(t: Ty) -> Bool:
+  return is_shape_obj(t, rc_gdefs.BUILT_IN_ARRAY_ID) or is_shape_obj(t, rc_gdefs.BUILT_IN_SET_ID) or is_shape_obj(t, rc_gdefs.BUILT_IN_MAP_ID)
+
+# conditionally_mutate_iterator ([] none)
+fn cond_mutate_iter(p: Place, t: Ty) -> [AliasingEffect]:
+  if not is_builtin_collection_type(t): return [rc_hir.ae1(AE_MUTATE_TRANSITIVE_CONDITIONALLY, p)]
+  return []
+
+fn named(e: Env, id: Int) -> Str:
+  if e.identifiers[id].name_kind == 1: return "`{e.identifiers[id].name}`"
+  return ""
+
+fn get_write_error_reason(v: AV) -> Str:
+  let r = v.reason
+  if (r & bit(rc_hir.VR_GLOBAL)) != 0: return "Modifying a variable defined outside a component or hook is not allowed. Consider using an effect"
+  if (r & bit(rc_hir.VR_JSX_CAPTURED)) != 0: return "Modifying a value used previously in JSX is not allowed. Consider moving the modification before the JSX"
+  if (r & bit(rc_hir.VR_CONTEXT)) != 0: return "Modifying a value returned from 'useContext()' is not allowed."
+  if (r & bit(rc_hir.VR_KNOWN_RETURN_SIGNATURE)) != 0: return "Modifying a value returned from a function whose return value should not be mutated"
+  if (r & bit(rc_hir.VR_REACTIVE_FUNCTION_ARGUMENT)) != 0: return "Do not mutate component props or hook arguments. If the value should change, update it where it is owned and pass an update callback, or use local state"
+  if (r & bit(rc_hir.VR_STATE)) != 0: return "Modifying a value returned from 'useState()', which should not be modified directly. Use the setter function to update instead"
+  if (r & bit(rc_hir.VR_REDUCER_STATE)) != 0: return "Modifying a value returned from 'useReducer()', which should not be modified directly. Use the dispatch function to update instead"
+  if (r & bit(rc_hir.VR_EFFECT)) != 0: return "Modifying a value used previously in an effect function or as an effect dependency is not allowed. Consider moving the modification before calling useEffect()"
+  if (r & bit(rc_hir.VR_HOOK_CAPTURED)) != 0: return "Modifying a value previously passed as an argument to a hook is not allowed. Consider moving the modification before calling the hook"
+  if (r & bit(rc_hir.VR_HOOK_RETURN)) != 0: return "Modifying a value returned from a hook is not allowed. Consider moving the modification into the hook where the value is constructed"
+  return "This modifies a variable that React considers immutable"
+
+fn create_temp_place(var e: Env, sp: Sp) -> Place:
+  let id = rc_env.next_identifier_id(&e)
+  e.identifiers[id].sp = sp
+  return Place(id, rc_hir.EF_UNKNOWN, false, sp)
+
+fn format_type_for_print(t: Ty) -> Str:
+  match t:
+    rc_hir.TPrimitive: return ""
+    rc_hir.TFunction(sh, has, ret, _):
+      if has:
+        let r = format_type_for_print(ret[0])
+        if r == "": return ":TFunction<{sh}>()"
+        return ":TFunction<{sh}>():  {r}"
+      return ":TFunction"
+    rc_hir.TObject(sh, has):
+      if has: return ":TObject<{sh}>"
+      return ":TObject"
+    rc_hir.TPoly: return ":TPoly"
+    rc_hir.TPhi(_): return ":TPhi"
+    rc_hir.TProperty(_, _, _, _): return ":TProperty"
+    rc_hir.TVar(_): return ""
+    rc_hir.TObjectMethod: return ":TObjectMethod"
+  return ""
+
+# ---- the pass
+
+fn infer_mutation_aliasing_effects(var f: HirFunction, var e: Env, is_fe: Bool):
+  var ic = IC()
+  ic.is_fe = is_fe
+  var init = St()
+  init.is_fe = is_fe
+  for p in f.context:
+    let v = new_vid(&ic)
+    initialize(&init, v, av(VK_CONTEXT, rc_hir.VR_OTHER))
+    define(&init, p.identifier, v)
+  if f.has_self:
+    let v = new_vid(&ic)
+    initialize(&init, v, av(VK_MUTABLE, rc_hir.VR_OTHER))
+    define(&init, f.self_binding.identifier, v)
+  var pk = av(VK_FROZEN, rc_hir.VR_REACTIVE_FUNCTION_ARGUMENT)
+  if is_fe: pk = av(VK_MUTABLE, rc_hir.VR_OTHER)
+  if f.fn_type == rc_hir.FN_COMPONENT:
+    if f.params.len > 0:
+      let v = new_vid(&ic)
+      initialize(&init, v, pk)
+      define(&init, f.params[0].place.identifier, v)
+    if f.params.len > 1:
+      let v = new_vid(&ic)
+      initialize(&init, v, av(VK_MUTABLE, rc_hir.VR_OTHER))
+      define(&init, f.params[1].place.identifier, v)
+  else:
+    for p in f.params:
+      let v = new_vid(&ic)
+      initialize(&init, v, pk)
+      define(&init, p.place.identifier, v)
+  var queued: {Int: St} = {}
+  var by_block: {Int: St} = {}
+  queue(&queued, by_block, f.body.entry, init)
+  find_hoisted_context_declarations(&ic, f, e)
+  ic.non_mut = find_non_mutated_destructure_spreads(f, e)
+  var index: {Int: Int} = {}
+  for i in 0..f.body.order.len: index[f.body.order[i]] = i
+  var back = false
+  for i in 0..f.body.order.len:
+    for s in rc_visit.successors(f.body.blocks[f.body.order[i]].terminal):
+      if not (s in index) or index[s] <= i: back = true
+  var iterations = 0
+  while queued.len > 0:
+    iterations += 1
+    if iterations > 100:
+      rc_env.throw(&e, rc_diags.invariant_infer_mutation_aliasing_effects_potential_infinite_loop_value_temporary_place_or_effect_no())
+      return
+    for bi in 0..f.body.order.len:
+      let bid = f.body.order[bi]
+      if not (bid in queued): continue
+      var st = St()
+      swap(&st, &queued[bid])
+      queued.remove(bid)
+      if back: by_block[bid] = clone_state(st)
+      infer_block(&ic, &st, bid, &f, &e)
+      if e.failed: return
+      if st.un_id >= 0:
+        let uid = st.un_id
+        var sp = st.un_sp
+        var name = ""
+        var tstr = ""
+        if uid < e.identifiers.len:
+          name = e.identifiers[uid].name + ""
+          if sp.s < 0: sp = e.identifiers[uid].sp
+          tstr = format_type_for_print(e.types[e.identifiers[uid].type_])
+        rc_env.throw(&e, rc_diags.uninitialized_value("<unknown> {name}${uid}{tstr}", sp))
+        return
+      let succ = rc_visit.successors(f.body.blocks[bid].terminal)
+      for si in 0..succ.len:
+        if si + 1 < succ.len: queue(&queued, by_block, succ[si], clone_state(st))
+        else:
+          var last = St()
+          swap(&last, &st)
+          queue(&queued, by_block, succ[si], last)
+
+fn queue(var queued: {Int: St}, by_block: {Int: St}, bid: Int, own st: St):
+  if bid in queued:
+    merge_from(&queued[bid], st)
+    return
+  if bid in by_block:
+    var n = merge(by_block[bid], st)
+    if n.len > 0:
+      var x = St()
+      swap(&x, &n[0])
+      queued[bid] = x
+    return
+  queued[bid] = st
+
+fn find_hoisted_context_declarations(var ic: IC, f: HirFunction, e: Env):
+  for bi in 0..f.body.order.len:
+    let bid = f.body.order[bi]
+    for iid in f.body.blocks[bid].instructions:
+      match f.instructions[iid].value:
+        rc_hir.DeclareContext(lv, _):
+          let k = lv.kind
+          if k == rc_hir.IK_HOISTED_CONST or k == rc_hir.IK_HOISTED_FUNCTION or k == rc_hir.IK_HOISTED_LET:
+            let d = e.identifiers[lv.place.identifier].declaration_id
+            ic.hoisted[d] = true
+            ic.hoisted_place.remove(d)
+        _:
+          for p in rc_ops.value_operands(f.instructions[iid].value, e): hoisted_visit(&ic, p, e)
+    for p in rc_ops.term_operands(f.body.blocks[bid].terminal): hoisted_visit(&ic, p, e)
+
+fn hoisted_visit(var ic: IC, p: Place, e: Env):
+  let d = e.identifiers[p.identifier].declaration_id
+  if d in ic.hoisted and not (d in ic.hoisted_place): ic.hoisted_place[d] = p
+
+fn find_non_mutated_destructure_spreads(f: HirFunction, e: Env) -> {Int: Bool}:
+  var known_frozen: {Int: Bool} = {}
+  if f.fn_type == rc_hir.FN_COMPONENT:
+    if f.params.len > 0 and not f.params[0].spread: known_frozen[f.params[0].place.identifier] = true
+  else:
+    for p in f.params:
+      if not p.spread: known_frozen[p.place.identifier] = true
+  var cand: {Int: Int} = {}
+  for bi in 0..f.body.order.len:
+    let bid = f.body.order[bi]
+    if cand.len > 0:
+      for ph in f.body.blocks[bid].phis:
+        for op in ph.ops:
+          if op.identifier in cand:
+            let s = cand[op.identifier]
+            cand.remove(s)
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      var callee = -1
+      var other = false
+      match f.instructions[iid].value:
+        rc_hir.Destructure(pat, k, val, _):
+          if (val.identifier in known_frozen) and (k == rc_hir.IK_LET or k == rc_hir.IK_CONST) and pat.is_object:
+            for p in pat.props:
+              if p.spread: cand[p.place.identifier] = p.place.identifier
+        rc_hir.LoadLocal(p, _):
+          if p.identifier in cand: cand[lid] = cand[p.identifier]
+        rc_hir.StoreLocal(lv, sv, _):
+          if sv.identifier in cand:
+            let s = cand[sv.identifier]
+            cand[lid] = s
+            cand[lv.place.identifier] = s
+        rc_hir.JsxFragment(_, _, _, _): nop()
+        rc_hir.JsxExpression(_, _, _, _, _, _, _, _, _, _, _): nop()
+        rc_hir.PropertyLoad(_, _, _, _, _): nop()
+        rc_hir.CallExpression(c, _, _): callee = c.identifier
+        rc_hir.MethodCall(_, c, _, _): callee = c.identifier
+        rc_hir.TaggedTemplateExpression(c, _, _, _, _): callee = c.identifier
+        _: other = true
+      if callee >= 0:
+        if rc_shapes.hook_kind_of(e.reg, tyof(e, callee)) >= 0:
+          if not is_ref_id(e, lid): known_frozen[lid] = true
+        else: other = true
+      if other and cand.len > 0:
+        for op in rc_ops.value_operands(f.instructions[iid].value, e):
+          if op.identifier in cand:
+            let s = cand[op.identifier]
+            cand.remove(s)
+  var out: {Int: Bool} = {}
+  for k, v in cand:
+    if k == v: out[k] = true
+  return out
+
+fn infer_block(var ic: IC, var st: St, bid: Int, var f: HirFunction, var e: Env):
+  for ph in f.body.blocks[bid].phis: infer_phi(&st, ph)
+  let iids = copy_ints(f.body.blocks[bid].instructions)
+  for iid in iids:
+    if not (iid in ic.sig_cache):
+      let sig = compute_signature(&ic, &e, f.instructions[iid])
+      ic.sig_cache[iid] = sig
+    var effs = apply_signature(&ic, &st, iid, f.instructions[iid], &e)
+    if e.failed: return
+    f.instructions[iid].has_effects = effs.len > 0
+    f.instructions[iid].effects = effs
+  var tk = 0
+  var handler = -1
+  match f.body.blocks[bid].terminal:
+    rc_hir.Try(_, _, has_binding, binding, h, _, _, _, _):
+      if has_binding:
+        ic.catch_handlers[h] = binding
+    rc_hir.MaybeThrow(_, h, _, _, _, _):
+      if h >= 0:
+        tk = 1
+        handler = h
+    rc_hir.Return(_, _, _, _, _, _): tk = 2
+    _: nop()
+  if tk == 1:
+    if handler in ic.catch_handlers:
+      let hp = ic.catch_handlers[handler]
+      if is_defined(st, hp.identifier):
+        var tes: [AliasingEffect] = []
+        for iid in iids:
+          var call = false
+          match f.instructions[iid].value:
+            rc_hir.CallExpression(_, _, _): call = true
+            rc_hir.MethodCall(_, _, _, _): call = true
+            _: nop()
+          if call:
+            let lv = f.instructions[iid].lvalue
+            append_alias(&st, hp.identifier, lv.identifier)
+            let k = kind(&st, lv.identifier).kind
+            if k == VK_MUTABLE or k == VK_CONTEXT: tes.push(rc_hir.ae2(AE_ALIAS, lv, hp))
+        match var f.body.blocks[bid].terminal:
+          rc_hir.MaybeThrow(_, _, _, _, effs, has):
+            has = tes.len > 0
+            effs = tes
+          _: nop()
+  elif tk == 2 and not ic.is_fe:
+    match var f.body.blocks[bid].terminal:
+      rc_hir.Return(v, _, _, _, effs, has):
+        effs = [rc_hir.ae_freeze(v, rc_hir.VR_JSX_CAPTURED)]
+        has = true
+      _: nop()
+
+fn apply_signature(var ic: IC, var st: St, iid: Int, ins: Instruction, var e: Env) -> [AliasingEffect]:
+  var out: [AliasingEffect] = []
+  let fid = rc_ops.value_func(ins.value)
+  if fid >= 0 and e.functions[fid].has_aliasing:
+    var ctx: {Int: Bool} = {}
+    for p in e.functions[fid].context: ctx[p.identifier] = true
+    let ies = rc_hir.cp_effects(e.functions[fid].aliasing_effects)
+    for x in ies:
+      if x.kind != AE_MUTATE and x.kind != AE_MUTATE_TRANSITIVE: continue
+      let mv = x.a
+      if not (mv.identifier in ctx) or not is_defined(st, mv.identifier): continue
+      let va = kind(&st, mv.identifier)
+      if va.kind == VK_FROZEN:
+        var variable = named(e, mv.identifier)
+        if variable == "": variable = "value"
+        let d = rc_diags_hand.immutable_value(get_write_error_reason(va), variable, mv.sp, e.identifiers[mv.identifier].sp)
+        let err = rc_env.intern_aliasing(&e, mv.identifier, d)
+        out.push(rc_hir.ae_err(AE_MUTATE_FROZEN, mv, err))
+  var initialized: {Int: Bool} = {}
+  let sig = rc_hir.cp_effects(ic.sig_cache[iid])
+  for x in sig:
+    apply_effect(&ic, &st, x, &initialized, &out, &e)
+    if e.failed: return out
+  if not is_defined(st, ins.lvalue.identifier):
+    let v = from_identifier(ins.lvalue.identifier)
+    initialize(&st, v, av(VK_MUTABLE, rc_hir.VR_OTHER))
+    define(&st, ins.lvalue.identifier, v)
+  return out
+
+fn freeze_function_captures_transitive(var st: St, ic: IC, e: Env, vid: Int, reason: Int):
+  if not (vid in ic.fvals): return
+  let fid = ic.fvals[vid]
+  var ids: [Int] = []
+  for p in e.functions[fid].context: ids.push(p.identifier)
+  for id in ids:
+    if not (id in st.vars): continue
+    let k = kind(&st, id).kind
+    if k == VK_CONTEXT or k == VK_MUTABLE or k == VK_MAYBE_FROZEN:
+      for v in values_for(st, id):
+        freeze_value(&st, v, reason)
+        freeze_function_captures_transitive(&st, ic, e, v, reason)
+
+# a place's kind for capture/alias: 0 none, 1 context, 2 mutable, 3 frozen
+fn dest_type(k: Int) -> Int:
+  if k == VK_CONTEXT: return 1
+  if k == VK_MUTABLE or k == VK_MAYBE_FROZEN: return 2
+  return 0
+
+fn source_type(k: Int) -> Int:
+  if k == VK_CONTEXT: return 1
+  if k == VK_GLOBAL or k == VK_PRIMITIVE: return 0
+  if k == VK_MAYBE_FROZEN or k == VK_FROZEN: return 3
+  return 2
+
+fn apply_effect(var ic: IC, var st: St, x: AliasingEffect, var initialized: {Int: Bool}, var out: [AliasingEffect], var e: Env):
+  let k = x.kind
+  if k == AE_FREEZE:
+    if freeze(&st, x.a.identifier, x.reason):
+      out.push(rc_hir.cp_effect(x))
+      for v in values_for(st, x.a.identifier): freeze_function_captures_transitive(&st, ic, e, v, x.reason)
+  elif k == AE_CREATE:
+    initialized[x.b.identifier] = true
+    let v = cached_vid(&ic, effect_key(x))
+    initialize(&st, v, av(x.vk, x.reason))
+    define(&st, x.b.identifier, v)
+    out.push(rc_hir.cp_effect(x))
+  elif k == AE_IMMUTABLE_CAPTURE:
+    let fk = kind(&st, x.a.identifier).kind
+    if fk != VK_GLOBAL and fk != VK_PRIMITIVE: out.push(rc_hir.cp_effect(x))
+  elif k == AE_CREATE_FROM:
+    initialized[x.b.identifier] = true
+    let fv = kind(&st, x.a.identifier)
+    let v = cached_vid(&ic, effect_key(x))
+    initialize(&st, v, fv)
+    define(&st, x.b.identifier, v)
+    if fv.kind == VK_PRIMITIVE or fv.kind == VK_GLOBAL:
+      out.push(rc_hir.ae_create(x.b, fv.kind, primary_reason(fv.reason)))
+    elif fv.kind == VK_FROZEN:
+      out.push(rc_hir.ae_create(x.b, fv.kind, primary_reason(fv.reason)))
+      apply_effect(&ic, &st, rc_hir.ae2(AE_IMMUTABLE_CAPTURE, x.a, x.b), &initialized, &out, &e)
+    else: out.push(rc_hir.cp_effect(x))
+  elif k == AE_CREATE_FUNCTION:
+    initialized[x.b.identifier] = true
+    out.push(rc_hir.cp_effect(x))
+    var has_captures = false
+    for c in x.captures:
+      if is_defined(st, c.identifier):
+        let ck = kind(&st, c.identifier).kind
+        if ck == VK_CONTEXT or ck == VK_MUTABLE: has_captures = true
+    let fid = x.n
+    var tracked = false
+    if e.functions[fid].has_aliasing:
+      for y in e.functions[fid].aliasing_effects:
+        if y.kind == AE_MUTATE_FROZEN or y.kind == AE_MUTATE_GLOBAL or y.kind == AE_IMPURE: tracked = true
+    var captures_ref = false
+    for p in e.functions[fid].context:
+      if is_ref_id(e, p.identifier): captures_ref = true
+    let is_mutable = has_captures or tracked or captures_ref
+    var ctx: [Place] = []
+    for p in e.functions[fid].context: ctx.push(p)
+    for op in ctx:
+      if op.effect != rc_hir.EF_CAPTURE or not is_defined(st, op.identifier): continue
+      let ok = kind(&st, op.identifier).kind
+      if ok == VK_PRIMITIVE or ok == VK_FROZEN or ok == VK_GLOBAL:
+        for ci in 0..e.functions[fid].context.len:
+          if e.functions[fid].context[ci].identifier == op.identifier and e.functions[fid].context[ci].effect == rc_hir.EF_CAPTURE:
+            e.functions[fid].context[ci].effect = rc_hir.EF_READ
+    let v = cached_vid(&ic, effect_key(x))
+    ic.fvals[v] = fid
+    var vk = VK_FROZEN
+    if is_mutable: vk = VK_MUTABLE
+    initialize(&st, v, AV(vk, 0))
+    define(&st, x.b.identifier, v)
+    for c in x.captures:
+      apply_effect(&ic, &st, rc_hir.ae2(AE_CAPTURE, c, x.b), &initialized, &out, &e)
+      if e.failed: return
+  elif k == AE_MAYBE_ALIAS or k == AE_ALIAS or k == AE_CAPTURE:
+    let dt = dest_type(kind_sp(&st, x.b.identifier, x.b.sp).kind)
+    let srt = source_type(kind_sp(&st, x.a.identifier, x.a.sp).kind)
+    if srt == 3:
+      apply_effect(&ic, &st, rc_hir.ae2(AE_IMMUTABLE_CAPTURE, x.a, x.b), &initialized, &out, &e)
+    elif (srt == 2 and dt == 2) or k == AE_MAYBE_ALIAS:
+      out.push(rc_hir.cp_effect(x))
+    elif (srt == 1 and dt != 0) or (srt == 2 and dt == 1):
+      apply_effect(&ic, &st, rc_hir.ae2(AE_MAYBE_ALIAS, x.a, x.b), &initialized, &out, &e)
+  elif k == AE_ASSIGN:
+    initialized[x.b.identifier] = true
+    let fv = kind_sp(&st, x.a.identifier, x.a.sp)
+    if fv.kind == VK_FROZEN:
+      apply_effect(&ic, &st, rc_hir.ae2(AE_IMMUTABLE_CAPTURE, x.a, x.b), &initialized, &out, &e)
+      let v = cached_vid(&ic, "AF:{x.a.identifier}:{x.b.identifier}")
+      initialize(&st, v, fv)
+      define(&st, x.b.identifier, v)
+    elif fv.kind == VK_GLOBAL or fv.kind == VK_PRIMITIVE:
+      let v = cached_vid(&ic, "AC:{x.a.identifier}:{x.b.identifier}")
+      initialize(&st, v, fv)
+      define(&st, x.b.identifier, v)
+    else:
+      assign(&st, x.b.identifier, x.a.identifier)
+      out.push(rc_hir.cp_effect(x))
+  elif k == AE_APPLY:
+    apply_apply(&ic, &st, x, &initialized, &out, &e)
+  elif k == AE_MUTATE or k == AE_MUTATE_CONDITIONALLY or k == AE_MUTATE_TRANSITIVE or k == AE_MUTATE_TRANSITIVE_CONDITIONALLY:
+    let value = x.a
+    let strong = k == AE_MUTATE or k == AE_MUTATE_TRANSITIVE
+    # mutate_with_span: 0 none, 1 mutate, 2 frozen, 3 global, 4 ref
+    var r = 0
+    if is_ref_id(e, value.identifier): r = 4
+    else:
+      let vk = kind_sp(&st, value.identifier, value.sp).kind
+      if vk == VK_MUTABLE or vk == VK_CONTEXT: r = 1
+      elif strong:
+        if vk == VK_FROZEN or vk == VK_MAYBE_FROZEN: r = 2
+        elif vk == VK_GLOBAL: r = 3
+    if r == 1: out.push(rc_hir.cp_effect(x))
+    elif r != 4 and r != 0 and strong:
+      let abv = kind(&st, value.identifier)
+      let decl = e.identifiers[value.identifier].declaration_id
+      if r == 2 and decl in ic.hoisted:
+        var access_sp = rc_hir.nosp()
+        if decl in ic.hoisted_place:
+          let hp = ic.hoisted_place[decl]
+          if not (hp.sp.s == value.sp.s and hp.sp.e == value.sp.e): access_sp = hp.sp
+        let d = rc_diags_hand.variable_accessed_before_declaration(named(e, value.identifier), access_sp, rc_hir.nosp())
+        let err = rc_env.intern_aliasing(&e, value.identifier, d)
+        apply_effect(&ic, &st, rc_hir.ae_err(AE_MUTATE_FROZEN, value, err), &initialized, &out, &e)
+      else:
+        var variable = named(e, value.identifier)
+        if variable == "": variable = "value"
+        let d = rc_diags_hand.immutable_value(get_write_error_reason(abv), variable, value.sp, e.identifiers[value.identifier].sp)
+        let err = rc_env.intern_aliasing(&e, value.identifier, d)
+        var ek = AE_MUTATE_GLOBAL
+        if abv.kind == VK_FROZEN: ek = AE_MUTATE_FROZEN
+        apply_effect(&ic, &st, rc_hir.ae_err(ek, value, err), &initialized, &out, &e)
+  else:
+    # Impure, Render, MutateFrozen, MutateGlobal
+    out.push(rc_hir.cp_effect(x))
+
+type Opt:
+  has: Bool
+  effs: [AliasingEffect]
+
+fn none() -> Opt:
+  return Opt(false, [])
+
+fn apply_apply(var ic: IC, var st: St, x: AliasingEffect, var initialized: {Int: Bool}, var out: [AliasingEffect], var e: Env):
+  let receiver = x.a
+  let function = x.f
+  let into = x.b
+  if is_defined(st, function.identifier):
+    let fv = values_for(st, function.identifier)
+    if fv.len == 1 and fv[0] in ic.fvals:
+      let fid = ic.fvals[fv[0]]
+      if e.functions[fid].has_aliasing:
+        if not (fid in ic.fsigs):
+          let s = build_signature_from_function_expression(&e, fid)
+          ic.fsigs[fid] = s
+        var ctx: [Place] = []
+        for p in e.functions[fid].context: ctx.push(p)
+        var o = compute_effects_for_aliasing_signature(&e, ic.fsigs[fid], into, receiver, x.args, ctx, x.sp)
+        if e.failed: return
+        if o.has:
+          apply_effect(&ic, &st, rc_hir.ae1(AE_MUTATE_TRANSITIVE_CONDITIONALLY, function), &initialized, &out, &e)
+          if e.failed: return
+          for y in o.effs:
+            apply_effect(&ic, &st, y, &initialized, &out, &e)
+            if e.failed: return
+          return
+  var sigs: [rc_shapes.FnSig] = []
+  if x.n >= 0: sigs = rc_shapes.function_signature(e.reg, e.types[x.n])
+  if sigs.len > 0:
+    let sig = sigs[0]
+    if sig.has_known_incompatible:
+      rc_env.throw(&e, rc_diags_hand.incompatible_library(sig.known_incompatible, receiver.sp))
+      return
+    if sig.aliasing.len > 0:
+      var o = compute_effects_for_aliasing_signature_config(&ic, &e, sig.aliasing[0], into, receiver, x.args, x.sp)
+      if e.failed: return
+      if o.has:
+        for y in o.effs:
+          apply_effect(&ic, &st, y, &initialized, &out, &e)
+          if e.failed: return
+        return
+    var todo: [rc_env.Diag] = []
+    let le = compute_effects_for_legacy_signature(&st, sig, into, receiver, x.args, x.sp, &e, ic, &todo)
+    if todo.len > 0:
+      var d = rc_env.diag(0, "")
+      swap(&d, &todo[0])
+      rc_env.throw(&e, d)
+      return
+    for y in le:
+      apply_effect(&ic, &st, y, &initialized, &out, &e)
+      if e.failed: return
+    return
+  apply_effect(&ic, &st, rc_hir.ae_create(into, VK_MUTABLE, rc_hir.VR_OTHER), &initialized, &out, &e)
+  # build_apply_operands: (place, is_spread)
+  var ops: [Place] = [receiver, function]
+  var spr: [Bool] = [false, false]
+  for a in x.args:
+    if a.kind == 2: continue
+    ops.push(a.place)
+    spr.push(a.kind == 1)
+  for i in 0..ops.len:
+    let op = ops[i]
+    if not (op.identifier == function.identifier and not x.flag):
+      apply_effect(&ic, &st, rc_hir.ae1(AE_MUTATE_TRANSITIVE_CONDITIONALLY, op), &initialized, &out, &e)
+    if spr[i]:
+      for y in cond_mutate_iter(op, tyof(e, op.identifier)): apply_effect(&ic, &st, y, &initialized, &out, &e)
+    apply_effect(&ic, &st, rc_hir.ae2(AE_MAYBE_ALIAS, op, into), &initialized, &out, &e)
+    for j in 0..ops.len:
+      if not spr[i] and ops[j].identifier == op.identifier: continue
+      apply_effect(&ic, &st, rc_hir.ae2(AE_CAPTURE, op, ops[j]), &initialized, &out, &e)
+    if e.failed: return
+
+fn is_known_mutable_effect(ef: Int) -> Bool:
+  return ef == rc_hir.EF_STORE or ef == rc_hir.EF_MUTATE or ef == rc_hir.EF_COND_MUTATE or ef == rc_hir.EF_COND_MUTATE_ITER
+
+fn are_arguments_immutable_and_non_mutating(var st: St, args: [Elem], e: Env, ic: IC) -> Bool:
+  for a in args:
+    if a.kind == 2: continue
+    let p = a.place
+    if a.kind == 0:
+      let t = tyof(e, p.identifier)
+      match t:
+        rc_hir.TFunction(_, _, _, _):
+          let fs = rc_shapes.function_signature(e.reg, t)
+          if fs.len > 0:
+            var m = false
+            for ef in fs[0].positional_params:
+              if is_known_mutable_effect(ef): m = true
+            if fs[0].rest_param >= 0 and is_known_mutable_effect(fs[0].rest_param): m = true
+            return not m
+        _: nop()
+    let k = kind(&st, p.identifier).kind
+    if k != VK_PRIMITIVE and k != VK_FROZEN: return false
+    for v in values_for(st, p.identifier):
+      if v in ic.fvals:
+        let fid = ic.fvals[v]
+        for pp in e.functions[fid].params:
+          let r = e.identifiers[pp.place.identifier].mutable_range
+          if r.end > r.start + 1: return false
+  return true
+
+fn compute_effects_for_legacy_signature(var st: St, sig: rc_shapes.FnSig, lvalue: Place, receiver: Place, args: [Elem], sp: Sp, var e: Env, ic: IC, var todo: [rc_env.Diag]) -> [AliasingEffect]:
+  var rvr = sig.return_value_reason
+  if rvr < 0: rvr = rc_hir.VR_OTHER
+  var out: [AliasingEffect] = [rc_hir.ae_create(lvalue, sig.return_value_kind, rvr)]
+  if sig.impure and (not sig.impure_if_no_args or args.len == 0):
+    let d = rc_diags_hand.impure_function(sig.canonical_name, sp)
+    let err = rc_env.intern_aliasing(&e, receiver.identifier, d)
+    out.push(rc_hir.ae_err(AE_IMPURE, receiver, err))
+  if sig.mutable_only_if_operands_are_mutable and are_arguments_immutable_and_non_mutating(&st, args, e, ic):
+    out.push(rc_hir.ae2(AE_ALIAS, receiver, lvalue))
+    for a in args:
+      if a.kind != 2: out.push(rc_hir.ae2(AE_IMMUTABLE_CAPTURE, a.place, lvalue))
+    return out
+  var stores: [Place] = []
+  var captures: [Place] = []
+  if sig.callee_effect != rc_hir.EF_CAPTURE: out.push(rc_hir.ae2(AE_ALIAS, receiver, lvalue))
+  legacy_visit(receiver, sig.callee_effect, lvalue, rvr, e, &out, &stores, &captures)
+  for i in 0..args.len:
+    let a = args[i]
+    if a.kind == 2: continue
+    let is_spread = a.kind == 1
+    var se = rc_hir.EF_COND_MUTATE
+    if not is_spread and i < sig.positional_params.len: se = sig.positional_params[i]
+    elif sig.rest_param >= 0: se = sig.rest_param
+    var ef = se
+    if is_spread and se != rc_hir.EF_MUTATE and se != rc_hir.EF_COND_MUTATE:
+      if se == rc_hir.EF_FREEZE: todo.push(rc_diags.todo_support_spread_syntax_hook_arguments(a.place.sp))
+      ef = rc_hir.EF_COND_MUTATE_ITER
+    legacy_visit(a.place, ef, lvalue, rvr, e, &out, &stores, &captures)
+  if captures.len > 0:
+    if stores.len == 0:
+      for c in captures: out.push(rc_hir.ae2(AE_ALIAS, c, lvalue))
+    else:
+      for c in captures:
+        for s in stores: out.push(rc_hir.ae2(AE_CAPTURE, c, s))
+  return out
+
+fn legacy_visit(p: Place, ef: Int, lvalue: Place, rvr: Int, e: Env, var out: [AliasingEffect], var stores: [Place], var captures: [Place]):
+  if ef == rc_hir.EF_STORE:
+    out.push(rc_hir.ae1(AE_MUTATE, p))
+    stores.push(p)
+  elif ef == rc_hir.EF_CAPTURE: captures.push(p)
+  elif ef == rc_hir.EF_COND_MUTATE: out.push(rc_hir.ae1(AE_MUTATE_TRANSITIVE_CONDITIONALLY, p))
+  elif ef == rc_hir.EF_COND_MUTATE_ITER:
+    for y in cond_mutate_iter(p, tyof(e, p.identifier)): out.push(rc_hir.cp_effect(y))
+    out.push(rc_hir.ae2(AE_CAPTURE, p, lvalue))
+  elif ef == rc_hir.EF_FREEZE: out.push(rc_hir.ae_freeze(p, rvr))
+  elif ef == rc_hir.EF_MUTATE: out.push(rc_hir.ae1(AE_MUTATE_TRANSITIVE, p))
+  elif ef == rc_hir.EF_READ: out.push(rc_hir.ae2(AE_IMMUTABLE_CAPTURE, p, lvalue))
+
+fn subst_get(m: {Str: [Place]}, k: Str) -> [Place]:
+  var r: [Place] = []
+  if k in m:
+    for p in m[k]: r.push(p)
+  return r
+
+fn subst_add(var m: {Str: [Place]}, k: Str, p: Place):
+  if k in m:
+    var l: [Place] = []
+    for q in m[k]: l.push(q)
+    l.push(p)
+    m[k] = l
+  else: m[k] = [p]
+
+fn compute_effects_for_aliasing_signature_config(var ic: IC, var e: Env, cfg: rc_gdefs.AliasSig, lvalue: Place, receiver: Place, args: [Elem], sp: Sp) -> Opt:
+  var subs: {Str: [Place]} = {}
+  subs[cfg.receiver] = [receiver]
+  subs[cfg.returns] = [lvalue]
+  var mutable_spreads: {Int: Bool} = {}
+  for i in 0..args.len:
+    let a = args[i]
+    if a.kind == 2: continue
+    if i < cfg.params.len and a.kind != 1: subs[cfg.params[i]] = [a.place]
+    elif cfg.rest != "": subst_add(&subs, cfg.rest, a.place)
+    else: return none()
+    if a.kind == 1 and cond_mutate_iter(a.place, tyof(e, a.place.identifier)).len > 0: mutable_spreads[a.place.identifier] = true
+  for tn in cfg.temporaries:
+    let key = "{lvalue.identifier}:{tn}"
+    if not (key in ic.temp_cache):
+      let tp = create_temp_place(&e, receiver.sp)
+      ic.temp_cache[key] = tp
+    subs[tn] = [ic.temp_cache[key]]
+  var out: [AliasingEffect] = []
+  for c in cfg.effects:
+    let k = c.kind
+    if k == rc_gdefs.AC_FREEZE:
+      for v in subst_get(subs, c.a):
+        if v.identifier in mutable_spreads:
+          rc_env.throw(&e, rc_diags.todo_support_spread_syntax_hook_arguments_2(v.sp))
+          return none()
+        out.push(rc_hir.ae_freeze(v, c.reason))
+    elif k == rc_gdefs.AC_CREATE:
+      for v in subst_get(subs, c.b): out.push(rc_hir.ae_create(v, c.value, c.reason))
+    elif k == rc_gdefs.AC_CREATE_FROM or k == rc_gdefs.AC_ASSIGN or k == rc_gdefs.AC_ALIAS or k == rc_gdefs.AC_CAPTURE or k == rc_gdefs.AC_IMMUTABLE_CAPTURE:
+      var ak = AE_CREATE_FROM
+      if k == rc_gdefs.AC_ASSIGN: ak = AE_ASSIGN
+      elif k == rc_gdefs.AC_ALIAS: ak = AE_ALIAS
+      elif k == rc_gdefs.AC_CAPTURE: ak = AE_CAPTURE
+      elif k == rc_gdefs.AC_IMMUTABLE_CAPTURE: ak = AE_IMMUTABLE_CAPTURE
+      let fs = subst_get(subs, c.a)
+      let ts = subst_get(subs, c.b)
+      for fp in fs:
+        for tp in ts: out.push(rc_hir.ae2(ak, fp, tp))
+    elif k == rc_gdefs.AC_IMPURE:
+      for v in subst_get(subs, c.a):
+        let err = rc_env.intern_aliasing(&e, v.identifier, rc_diags.purity_impure_function_call())
+        out.push(rc_hir.ae_err(AE_IMPURE, v, err))
+    elif k == rc_gdefs.AC_MUTATE:
+      for v in subst_get(subs, c.a): out.push(rc_hir.ae1(AE_MUTATE, v))
+    elif k == rc_gdefs.AC_MUTATE_TRANSITIVE_CONDITIONALLY:
+      for v in subst_get(subs, c.a): out.push(rc_hir.ae1(AE_MUTATE_TRANSITIVE_CONDITIONALLY, v))
+    elif k == rc_gdefs.AC_APPLY:
+      let r = subst_get(subs, c.a)
+      let fn_ = subst_get(subs, c.function)
+      let i = subst_get(subs, c.b)
+      if r.len == 0 or fn_.len == 0 or i.len == 0: return none()
+      var aa: [Elem] = []
+      for an in c.args:
+        if an == "": aa.push(Elem(2, rc_hir.place(-1, rc_hir.nosp()), rc_hir.nosp()))
+        else:
+          let ps = subst_get(subs, an)
+          if ps.len > 0: aa.push(Elem(0, ps[0], ps[0].sp))
+      out.push(rc_hir.AliasingEffect(kind: AE_APPLY, a: r[0], f: fn_[0], flag: c.mutates_function, args: aa, b: i[0], n: -1, sp: sp))
+  return Opt(true, out)
+
+fn build_signature_from_function_expression(var e: Env, fid: Int) -> FSig:
+  var params: [Int] = []
+  var rest = -1
+  for p in e.functions[fid].params:
+    if p.spread: rest = p.place.identifier
+    else: params.push(p.place.identifier)
+  let returns = e.functions[fid].returns.identifier
+  var effs: [AliasingEffect] = []
+  if e.functions[fid].has_aliasing: effs = rc_hir.cp_effects(e.functions[fid].aliasing_effects)
+  let sp = e.functions[fid].sp
+  if rest < 0:
+    let t = create_temp_place(&e, sp)
+    rest = t.identifier
+  return FSig(0, params, rest, returns, effs)
+
+fn isubst_get(m: {Int: [Place]}, k: Int) -> [Place]:
+  var r: [Place] = []
+  if k in m:
+    for p in m[k]: r.push(p)
+  return r
+
+fn compute_effects_for_aliasing_signature(var e: Env, sig: FSig, lvalue: Place, receiver: Place, args: [Elem], ctx: [Place], sp: Sp) -> Opt:
+  if sig.params.len > args.len or (args.len > sig.params.len and sig.rest < 0): return none()
+  var mutable_spreads: {Int: Bool} = {}
+  var subs: {Int: [Place]} = {}
+  subs[sig.receiver] = [receiver]
+  subs[sig.returns] = [lvalue]
+  for i in 0..args.len:
+    let a = args[i]
+    if a.kind == 2: continue
+    let is_spread = a.kind == 1
+    if not is_spread and i < sig.params.len: subs[sig.params[i]] = [a.place]
+    elif sig.rest >= 0:
+      var l = isubst_get(subs, sig.rest)
+      l.push(a.place)
+      subs[sig.rest] = l
+    else: return none()
+    if is_spread and cond_mutate_iter(a.place, tyof(e, a.place.identifier)).len > 0: mutable_spreads[a.place.identifier] = true
+  for op in ctx: subs[op.identifier] = [op]
+  var out: [AliasingEffect] = []
+  for x in sig.effects:
+    let k = x.kind
+    if k == AE_MAYBE_ALIAS or k == AE_ASSIGN or k == AE_IMMUTABLE_CAPTURE or k == AE_ALIAS or k == AE_CREATE_FROM or k == AE_CAPTURE:
+      let fs = isubst_get(subs, x.a.identifier)
+      let ts = isubst_get(subs, x.b.identifier)
+      for fp in fs:
+        for tp in ts: out.push(rc_hir.ae2(k, fp, tp))
+    elif k == AE_IMPURE or k == AE_MUTATE_FROZEN or k == AE_MUTATE_GLOBAL:
+      for v in isubst_get(subs, x.a.identifier): out.push(rc_hir.ae_err(k, v, x.n))
+    elif k == AE_RENDER or k == AE_MUTATE_CONDITIONALLY or k == AE_MUTATE_TRANSITIVE or k == AE_MUTATE_TRANSITIVE_CONDITIONALLY:
+      for v in isubst_get(subs, x.a.identifier): out.push(rc_hir.ae1(k, v))
+    elif k == AE_MUTATE:
+      for v in isubst_get(subs, x.a.identifier): out.push(rc_hir.AliasingEffect(kind: AE_MUTATE, a: v, flag: x.flag))
+    elif k == AE_FREEZE:
+      for v in isubst_get(subs, x.a.identifier):
+        if v.identifier in mutable_spreads:
+          rc_env.throw(&e, rc_diags.todo_support_spread_syntax_hook_arguments_3(v.sp))
+          return none()
+        out.push(rc_hir.ae_freeze(v, x.reason))
+    elif k == AE_CREATE:
+      for v in isubst_get(subs, x.b.identifier): out.push(rc_hir.ae_create(v, x.vk, x.reason))
+    elif k == AE_APPLY:
+      let r = isubst_get(subs, x.a.identifier)
+      let fn_ = isubst_get(subs, x.f.identifier)
+      let i = isubst_get(subs, x.b.identifier)
+      if r.len == 0 or fn_.len == 0 or i.len == 0: return none()
+      var aa: [Elem] = []
+      for a in x.args:
+        if a.kind == 2: aa.push(Elem(2, a.place, a.sp))
+        else:
+          let ps = isubst_get(subs, a.place.identifier)
+          if ps.len > 0: aa.push(Elem(a.kind, ps[0], a.sp))
+      out.push(rc_hir.AliasingEffect(kind: AE_APPLY, a: r[0], f: fn_[0], flag: x.flag, args: aa, b: i[0], n: x.n, sp: sp))
+    elif k == AE_CREATE_FUNCTION: return none()
+  return Opt(true, out)
+
+# ---- an instruction's candidate effects (compute_signature_for_instruction)
+
+fn apply_args(args: [Elem]) -> [Elem]:
+  var r = args[0..args.len]
+  return r
+
+fn compute_signature(var ic: IC, var e: Env, ins: Instruction) -> [AliasingEffect]:
+  let lv = ins.lvalue
+  var out: [AliasingEffect] = []
+  match ins.value:
+    rc_hir.ArrayExpression(els, _):
+      out.push(rc_hir.ae_create(lv, VK_MUTABLE, rc_hir.VR_OTHER))
+      for el in els:
+        if el.kind == 0: out.push(rc_hir.ae2(AE_CAPTURE, el.place, lv))
+        elif el.kind == 1:
+          for y in cond_mutate_iter(el.place, tyof(e, el.place.identifier)): out.push(rc_hir.cp_effect(y))
+          out.push(rc_hir.ae2(AE_CAPTURE, el.place, lv))
+    rc_hir.ObjectExpression(props, _):
+      out.push(rc_hir.ae_create(lv, VK_MUTABLE, rc_hir.VR_OTHER))
+      for p in props: out.push(rc_hir.ae2(AE_CAPTURE, p.place, lv))
+    rc_hir.Await(v, _):
+      out.push(rc_hir.ae_create(lv, VK_MUTABLE, rc_hir.VR_OTHER))
+      out.push(rc_hir.ae1(AE_MUTATE_TRANSITIVE_CONDITIONALLY, v))
+      out.push(rc_hir.ae2(AE_CAPTURE, v, lv))
+    rc_hir.TaggedTemplateExpression(tag, _, subs, _, sp):
+      var args: [Elem] = [Elem(2, rc_hir.place(-1, rc_hir.nosp()), rc_hir.nosp())]
+      for s in subs: args.push(Elem(0, s, s.sp))
+      out.push(rc_hir.AliasingEffect(kind: AE_APPLY, a: tag, f: tag, flag: true, args: args, b: lv, n: e.identifiers[tag.identifier].type_, sp: sp))
+    rc_hir.NewExpression(callee, args, sp):
+      out.push(rc_hir.AliasingEffect(kind: AE_APPLY, a: callee, f: callee, flag: false, args: apply_args(args), b: lv, n: e.identifiers[callee.identifier].type_, sp: sp))
+    rc_hir.CallExpression(callee, args, sp):
+      out.push(rc_hir.AliasingEffect(kind: AE_APPLY, a: callee, f: callee, flag: true, args: apply_args(args), b: lv, n: e.identifiers[callee.identifier].type_, sp: sp))
+    rc_hir.MethodCall(recv, prop, args, sp):
+      out.push(rc_hir.AliasingEffect(kind: AE_APPLY, a: recv, f: prop, flag: false, args: apply_args(args), b: lv, n: e.identifiers[prop.identifier].type_, sp: sp))
+    rc_hir.PropertyDelete(o, _, _, _):
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+      out.push(rc_hir.ae1(AE_MUTATE, o))
+    rc_hir.ComputedDelete(o, _, _):
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+      out.push(rc_hir.ae1(AE_MUTATE, o))
+    rc_hir.PropertyLoad(o, _, _, _, _):
+      if is_primitive_type(tyof(e, lv.identifier)): out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+      else: out.push(rc_hir.ae2(AE_CREATE_FROM, o, lv))
+    rc_hir.ComputedLoad(o, _, _):
+      if is_primitive_type(tyof(e, lv.identifier)): out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+      else: out.push(rc_hir.ae2(AE_CREATE_FROM, o, lv))
+    rc_hir.PropertyStore(o, prop, _, _, val, _):
+      var cur = false
+      if not prop.is_num and prop.s == "current":
+        match tyof(e, o.identifier):
+          rc_hir.TVar(_): cur = true
+          _: nop()
+      out.push(rc_hir.AliasingEffect(kind: AE_MUTATE, a: o, flag: cur))
+      out.push(rc_hir.ae2(AE_CAPTURE, val, o))
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    rc_hir.ComputedStore(o, _, val, _):
+      out.push(rc_hir.ae1(AE_MUTATE, o))
+      out.push(rc_hir.ae2(AE_CAPTURE, val, o))
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    rc_hir.FunctionExpression(_, _, _, fid, _, _):
+      out.push(create_function_effect(e, fid, lv))
+    rc_hir.ObjectMethod(_, fid):
+      out.push(create_function_effect(e, fid, lv))
+    rc_hir.GetIterator(col, _):
+      out.push(rc_hir.ae_create(lv, VK_MUTABLE, rc_hir.VR_OTHER))
+      if is_builtin_collection_type(tyof(e, col.identifier)): out.push(rc_hir.ae2(AE_CAPTURE, col, lv))
+      else:
+        out.push(rc_hir.ae2(AE_ALIAS, col, lv))
+        out.push(rc_hir.ae1(AE_MUTATE_TRANSITIVE_CONDITIONALLY, col))
+    rc_hir.IteratorNext(it, col, _):
+      out.push(rc_hir.ae1(AE_MUTATE_CONDITIONALLY, it))
+      out.push(rc_hir.ae2(AE_CREATE_FROM, col, lv))
+    rc_hir.NextPropertyOf(_, _):
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    rc_hir.JsxExpression(builtin, _, tag, props, has_children, children, _, _, _, _, _):
+      out.push(rc_hir.ae_create(lv, VK_FROZEN, rc_hir.VR_JSX_CAPTURED))
+      for op in rc_ops.value_operands(ins.value, e):
+        out.push(rc_hir.ae_freeze(op, rc_hir.VR_JSX_CAPTURED))
+        out.push(rc_hir.ae2(AE_CAPTURE, op, lv))
+      if not builtin: out.push(rc_hir.ae1(AE_RENDER, tag))
+      if has_children:
+        for ch in children: out.push(rc_hir.ae1(AE_RENDER, ch))
+      for a in props:
+        if a.spread: continue
+        match tyof(e, a.place.identifier):
+          rc_hir.TFunction(_, _, ret, _):
+            if is_jsx_type(ret[0]) or is_phi_with_jsx(ret[0]): out.push(rc_hir.ae1(AE_RENDER, a.place))
+          _: nop()
+    rc_hir.JsxFragment(_, _, _, _):
+      out.push(rc_hir.ae_create(lv, VK_FROZEN, rc_hir.VR_JSX_CAPTURED))
+      for op in rc_ops.value_operands(ins.value, e):
+        out.push(rc_hir.ae_freeze(op, rc_hir.VR_JSX_CAPTURED))
+        out.push(rc_hir.ae2(AE_CAPTURE, op, lv))
+    rc_hir.DeclareLocal(dl, _):
+      out.push(rc_hir.ae_create(dl.place, VK_PRIMITIVE, rc_hir.VR_OTHER))
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    rc_hir.Destructure(pat, _, dv, _):
+      if pat.is_object:
+        for p in pat.props: destructure_item(e, ic, p.place, p.spread, dv, &out)
+      else:
+        for it in pat.items:
+          if it.kind != 2: destructure_item(e, ic, it.place, it.kind == 1, dv, &out)
+      out.push(rc_hir.ae2(AE_ASSIGN, dv, lv))
+    rc_hir.LoadContext(p, _, _):
+      out.push(rc_hir.ae2(AE_CREATE_FROM, p, lv))
+    rc_hir.DeclareContext(dcl, _):
+      let d = e.identifiers[dcl.place.identifier].declaration_id
+      let k = dcl.kind
+      if not (d in ic.hoisted) or k == rc_hir.IK_HOISTED_CONST or k == rc_hir.IK_HOISTED_FUNCTION or k == rc_hir.IK_HOISTED_LET:
+        out.push(rc_hir.ae_create(dcl.place, VK_MUTABLE, rc_hir.VR_OTHER))
+      else: out.push(rc_hir.ae1(AE_MUTATE, dcl.place))
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    rc_hir.StoreContext(scl, v, _):
+      let d = e.identifiers[scl.place.identifier].declaration_id
+      if scl.kind == rc_hir.IK_REASSIGN or d in ic.hoisted: out.push(rc_hir.ae1(AE_MUTATE, scl.place))
+      else: out.push(rc_hir.ae_create(scl.place, VK_MUTABLE, rc_hir.VR_OTHER))
+      out.push(rc_hir.ae2(AE_CAPTURE, v, scl.place))
+      out.push(rc_hir.ae2(AE_ASSIGN, v, lv))
+    rc_hir.LoadLocal(p, _):
+      out.push(rc_hir.ae2(AE_ASSIGN, p, lv))
+    rc_hir.StoreLocal(sl, v, _):
+      out.push(rc_hir.ae2(AE_ASSIGN, v, sl.place))
+      out.push(rc_hir.ae2(AE_ASSIGN, v, lv))
+    rc_hir.PostfixUpdate(pl, _, _, _):
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+      out.push(rc_hir.ae_create(pl, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    rc_hir.PrefixUpdate(pl, _, _, _):
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+      out.push(rc_hir.ae_create(pl, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    rc_hir.StoreGlobal(name, v, _):
+      let d = rc_diags.global_reassignment("`{name}`", ins.sp)
+      let err = rc_env.intern_aliasing(&e, v.identifier, d)
+      out.push(rc_hir.ae_err(AE_MUTATE_GLOBAL, v, err))
+      out.push(rc_hir.ae2(AE_ASSIGN, v, lv))
+    rc_hir.TypeCastExpression(v, _, _, _):
+      out.push(rc_hir.ae2(AE_ASSIGN, v, lv))
+    rc_hir.LoadGlobal(_, _):
+      out.push(rc_hir.ae_create(lv, VK_GLOBAL, rc_hir.VR_GLOBAL))
+    rc_hir.StartMemoize(_, _, _, _, _, _, _):
+      for op in rc_ops.value_operands(ins.value, e): out.push(rc_hir.ae_freeze(op, rc_hir.VR_HOOK_CAPTURED))
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    rc_hir.FinishMemoize(_, _, _, _):
+      for op in rc_ops.value_operands(ins.value, e): out.push(rc_hir.ae_freeze(op, rc_hir.VR_HOOK_CAPTURED))
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    _:
+      out.push(rc_hir.ae_create(lv, VK_PRIMITIVE, rc_hir.VR_OTHER))
+  return out
+
+fn is_phi_with_jsx(t: Ty) -> Bool:
+  match t:
+    rc_hir.TPhi(ops):
+      for o in ops:
+        if is_jsx_type(o): return true
+      return false
+    _: return false
+  return false
+
+fn create_function_effect(e: Env, fid: Int, lv: Place) -> AliasingEffect:
+  var caps: [Place] = []
+  for p in e.functions[fid].context:
+    if p.effect == rc_hir.EF_CAPTURE: caps.push(p)
+  return rc_hir.AliasingEffect(kind: AE_CREATE_FUNCTION, b: lv, n: fid, captures: caps)
+
+fn destructure_item(e: Env, ic: IC, p: Place, spread: Bool, dv: Place, var out: [AliasingEffect]):
+  if not spread:
+    if is_primitive_type(tyof(e, p.identifier)): out.push(rc_hir.ae_create(p, VK_PRIMITIVE, rc_hir.VR_OTHER))
+    else: out.push(rc_hir.ae2(AE_CREATE_FROM, dv, p))
+  else:
+    var vk = VK_MUTABLE
+    if p.identifier in ic.non_mut: vk = VK_FROZEN
+    out.push(rc_hir.ae_create(p, vk, rc_hir.VR_OTHER))
+    out.push(rc_hir.ae2(AE_CAPTURE, dv, p))
+
+fn nop():
+  return

@@ -1,0 +1,311 @@
+# InferReactivePlaces (oxc_react_compiler react_compiler_inference/infer_reactive_places.rs): which
+# places are reactive (derived from props, state, hooks, or computed under reactive control flow),
+# marked on the places.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_diags_hand
+import rc_ops
+import rc_dom
+import rc_rsv
+import rc_shapes
+import rc_gdefs
+from rc_hir import Sp, Place, HirFunction, InstrValue, Terminal
+from rc_env import Env
+
+type RM:
+  changes: Bool = false
+  reactive: {Int: Bool} = {}
+  ds: rc_rsv.DSet = rc_rsv.DSet()
+
+fn canon(var m: RM, id: Int) -> Int:
+  if id in m.ds.parent: return rc_rsv.ds_find(&m.ds, id)
+  return id
+
+fn is_reactive(var m: RM, id: Int) -> Bool:
+  let c = canon(&m, id)
+  return m.reactive.get(c, false)
+
+fn mark(var m: RM, id: Int):
+  let c = canon(&m, id)
+  if not m.reactive.get(c, false):
+    m.reactive[c] = true
+    m.changes = true
+
+fn fn_shape(e: Env, id: Int) -> Str:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TFunction(sh, has, _, _):
+      if has: return sh
+    _: return ""
+  return ""
+
+fn obj_shape(e: Env, id: Int) -> Str:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TObject(sh, has):
+      if has: return sh
+    _: return ""
+  return ""
+
+fn is_stable_type(e: Env, id: Int) -> Bool:
+  let f = fn_shape(e, id)
+  if f == "BuiltInSetState" or f == "BuiltInSetActionState" or f == "BuiltInDispatch" or f == "BuiltInStartTransition" or f == "BuiltInSetOptimistic": return true
+  return obj_shape(e, id) == "BuiltInUseRefId"
+
+fn is_stable_container(e: Env, id: Int) -> Bool:
+  let o = obj_shape(e, id)
+  return o == "BuiltInUseState" or o == "BuiltInUseActionState" or o == "BuiltInUseReducer" or o == "BuiltInUseOptimistic" or o == "BuiltInUseTransition"
+
+fn hook_kind(e: Env, id: Int) -> Int:
+  return rc_shapes.hook_kind_of(e.reg, e.types[e.identifiers[id].type_])
+
+fn stable_or_container_hook(e: Env, id: Int) -> Bool:
+  let k = hook_kind(e, id)
+  return k == rc_gdefs.HK_USE_STATE or k == rc_gdefs.HK_USE_REDUCER or k == rc_gdefs.HK_USE_ACTION_STATE or k == rc_gdefs.HK_USE_REF or k == rc_gdefs.HK_USE_TRANSITION or k == rc_gdefs.HK_USE_OPTIMISTIC
+
+# StableSidemap: identifier -> stable (absent: unknown)
+fn handle_instruction(var sm: {Int: Bool}, ins: rc_hir.Instruction, e: Env):
+  let lid = ins.lvalue.identifier
+  var callee = -1
+  match ins.value:
+    rc_hir.CallExpression(c, _, _): callee = c.identifier
+    rc_hir.TaggedTemplateExpression(c, _, _, _, _): callee = c.identifier
+    rc_hir.MethodCall(_, p, _, _): callee = p.identifier
+    rc_hir.PropertyLoad(o, _, _, _, _):
+      if o.identifier in sm:
+        if is_stable_container(e, lid): sm[lid] = false
+        elif is_stable_type(e, lid): sm[lid] = true
+    rc_hir.Destructure(_, _, v, _):
+      if v.identifier in sm:
+        for l in rc_ops.instr_lvalues(ins):
+          if is_stable_container(e, l.identifier): sm[l.identifier] = false
+          elif is_stable_type(e, l.identifier): sm[l.identifier] = true
+    rc_hir.StoreLocal(lv, v, _):
+      if v.identifier in sm:
+        let x = sm[v.identifier]
+        sm[lid] = x
+        sm[lv.place.identifier] = x
+    rc_hir.LoadLocal(p, _):
+      if p.identifier in sm: sm[lid] = sm[p.identifier]
+    _: nop()
+  if callee >= 0 and stable_or_container_hook(e, callee): sm[lid] = is_stable_type(e, lid)
+
+fn has_reactive_test(f: HirFunction, bid: Int, var m: RM) -> Bool:
+  match f.body.blocks[bid].terminal:
+    rc_hir.If(t, _, _, _, _, _, _, _): return is_reactive(&m, t.identifier)
+    rc_hir.Branch(t, _, _, _, _, _): return is_reactive(&m, t.identifier)
+    rc_hir.Switch(t, cases, _, _, _):
+      if is_reactive(&m, t.identifier): return true
+      for c in cases:
+        if c.has_test and is_reactive(&m, c.test.identifier): return true
+      return false
+    _: return false
+  return false
+
+fn controlled(f: HirFunction, bid: Int, fr: {Int: [Int]}, throwing: {Int: Bool}, var m: RM) -> Bool:
+  if not (bid in fr): return false
+  for cb in fr[bid]:
+    if has_reactive_test(f, cb, &m) or cb in throwing: return true
+  return false
+
+fn is_reactive_input_call(e: Env, v: InstrValue) -> Bool:
+  match v:
+    rc_hir.CallExpression(c, _, _): return hook_kind(e, c.identifier) >= 0 or fn_shape(e, c.identifier) == rc_gdefs.BUILT_IN_USE_OPERATOR_ID
+    rc_hir.TaggedTemplateExpression(_, _, _, _, _): return true
+    rc_hir.MethodCall(_, p, _, _): return hook_kind(e, p.identifier) >= 0 or fn_shape(e, p.identifier) == rc_gdefs.BUILT_IN_USE_OPERATOR_ID
+    _: return false
+  return false
+
+fn caught(t: Terminal) -> Bool:
+  match t:
+    rc_hir.MaybeThrow(_, h, _, _, _, _): return h >= 0
+    _: return false
+  return false
+
+fn merge_frontiers(var a: {Int: [Int]}, b: {Int: [Int]}):
+  for k, v in b:
+    if not (k in a): a[k] = []
+    for x in v:
+      var has = false
+      for y in a[k]:
+        if y == x: has = true
+      if not has: a[k].push(x)
+
+fn infer_reactive_places(var f: HirFunction, var e: Env):
+  var m = RM()
+  m.ds = rc_rsv.find_disjoint_mutable_values(f, e)
+  var sm: {Int: Bool} = {}
+  for p in f.params: mark(&m, p.place.identifier)
+  let nb = rc_env.next_block_id(&e)
+  var fr = rc_dom.post_dominator_frontiers(f, &e, nb, false, true)
+  if e.failed: return
+  var any_caught = false
+  for bid in f.body.order:
+    if caught(f.body.blocks[bid].terminal): any_caught = true
+  if any_caught:
+    let fr2 = rc_dom.post_dominator_frontiers(f, &e, nb, false, false)
+    if e.failed: return
+    merge_frontiers(&fr, fr2)
+  # ThrowingBlocks
+  var tops: {Int: [Int]} = {}
+  var tkeys: [Int] = []
+  for bid in f.body.order:
+    if caught(f.body.blocks[bid].terminal):
+      var ops: [Int] = []
+      for iid in f.body.blocks[bid].instructions:
+        for p in rc_ops.value_operands(f.instructions[iid].value, e): ops.push(p.identifier)
+      tops[bid] = ops
+      tkeys.push(bid)
+  var deps: {Int: [Int]} = {}
+  for b in tkeys:
+    if b in fr:
+      for cb in fr[b]:
+        if cb in tops:
+          if not (cb in deps): deps[cb] = []
+          deps[cb].push(b)
+  var throwing: {Int: Bool} = {}
+  var phi_op: {Str: Bool} = {}
+  while true:
+    # ThrowingBlocks::update
+    var work: [Int] = []
+    for b in tkeys:
+      if b in throwing: continue
+      var r = false
+      for id in tops[b]:
+        if is_reactive(&m, id): r = true
+      if not r and b in fr:
+        for cb in fr[b]:
+          if has_reactive_test(f, cb, &m): r = true
+      if r:
+        throwing[b] = true
+        work.push(b)
+    while work.len > 0:
+      let b = work.pop()
+      if b in deps:
+        for d in deps[b]:
+          if not (d in throwing):
+            throwing[d] = true
+            work.push(d)
+    for bi in 0..f.body.order.len:
+      let bid = f.body.order[bi]
+      let hrc = controlled(f, bid, fr, throwing, &m)
+      for pi in 0..f.body.blocks[bid].phis.len:
+        let pid = f.body.blocks[bid].phis[pi].place.identifier
+        if is_reactive(&m, pid): continue
+        var pr = false
+        for oi in 0..f.body.blocks[bid].phis[pi].ops.len:
+          let r = is_reactive(&m, f.body.blocks[bid].phis[pi].ops[oi].identifier)
+          phi_op["{bid}:{pi}:{oi}"] = r
+          if r:
+            pr = true
+            break
+        if pr: mark(&m, pid)
+        else:
+          for pb in f.body.blocks[bid].phis[pi].ops_block:
+            if controlled(f, pb, fr, throwing, &m):
+              mark(&m, pid)
+              break
+      for iid in f.body.blocks[bid].instructions:
+        handle_instruction(&sm, f.instructions[iid], e)
+        let ops = rc_ops.value_operands(f.instructions[iid].value, e)
+        var hri = false
+        for op in ops:
+          if is_reactive(&m, op.identifier): hri = true
+        if is_reactive_input_call(e, f.instructions[iid].value): hri = true
+        if hri:
+          for l in rc_ops.instr_lvalues(f.instructions[iid]):
+            if sm.get(l.identifier, false): continue
+            mark(&m, l.identifier)
+        if hri or hrc:
+          for op in ops:
+            let ef = op.effect
+            if ef == rc_hir.EF_CAPTURE or ef == rc_hir.EF_STORE or ef == rc_hir.EF_COND_MUTATE or ef == rc_hir.EF_COND_MUTATE_ITER or ef == rc_hir.EF_MUTATE:
+              if rc_hir.range_contains(e.identifiers[op.identifier].mutable_range, f.instructions[iid].id): mark(&m, op.identifier)
+            elif ef == rc_hir.EF_UNKNOWN:
+              rc_env.throw(&e, rc_diags_hand.unexpected_unknown_effect(op.sp))
+              return
+    let had = m.changes
+    m.changes = false
+    if not had: break
+  apply_flags(&f, &e, &m, sm, phi_op)
+
+fn reactive_ids(var m: RM) -> {Int: Bool}:
+  var out: {Int: Bool} = {}
+  for k, v in m.reactive:
+    if v: out[k] = true
+  let keys = copy_ints(m.ds.keys)
+  for k in keys:
+    let c = rc_rsv.ds_find(&m.ds, k)
+    if m.reactive.get(c, false): out[k] = true
+  return out
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn apply_flags(var f: HirFunction, var e: Env, var m: RM, sm: {Int: Bool}, phi_op: {Str: Bool}):
+  let ri = reactive_ids(&m)
+  for i in 0..f.params.len: f.params[i].place.reactive = true
+  for bi in 0..f.body.order.len:
+    let bid = f.body.order[bi]
+    for pi in 0..f.body.blocks[bid].phis.len:
+      if ri.get(f.body.blocks[bid].phis[pi].place.identifier, false): f.body.blocks[bid].phis[pi].place.reactive = true
+      for oi in 0..f.body.blocks[bid].phis[pi].ops.len:
+        if phi_op.get("{bid}:{pi}:{oi}", false): f.body.blocks[bid].phis[pi].ops[oi].reactive = true
+    for ii in 0..f.body.blocks[bid].instructions.len:
+      let iid = f.body.blocks[bid].instructions[ii]
+      var hri = false
+      for op in rc_ops.value_operands(f.instructions[iid].value, e):
+        if ri.get(op.identifier, false): hri = true
+      if is_reactive_input_call(e, f.instructions[iid].value): hri = true
+      var ops = rc_ops.value_operands_nofn(f.instructions[iid].value)
+      for oi in 0..ops.len:
+        if ri.get(ops[oi].identifier, false): ops[oi].reactive = true
+      rc_ops.set_value_operands_nofn(&f.instructions[iid].value, ops)
+      let fid = rc_ops.value_func(f.instructions[iid].value)
+      if fid >= 0:
+        for ci in 0..e.functions[fid].context.len:
+          if ri.get(e.functions[fid].context[ci].identifier, false): e.functions[fid].context[ci].reactive = true
+      if hri:
+        let lid = f.instructions[iid].lvalue.identifier
+        if not sm.get(lid, false) and ri.get(lid, false): f.instructions[iid].lvalue.reactive = true
+        var lvs = rc_ops.value_lvalues(f.instructions[iid].value)
+        for li in 0..lvs.len:
+          let id = lvs[li].identifier
+          if not sm.get(id, false) and ri.get(id, false): lvs[li].reactive = true
+        rc_ops.set_value_lvalues(&f.instructions[iid].value, lvs)
+    var tops = rc_ops.term_operands(f.body.blocks[bid].terminal)
+    for ti in 0..tops.len:
+      if ri.get(tops[ti].identifier, false): tops[ti].reactive = true
+    rc_ops.set_term_operands(&f.body.blocks[bid].terminal, tops)
+  for fid in rc_cfg_inner(f): apply_inner(fid, &e, ri)
+
+fn rc_cfg_inner(f: HirFunction) -> [Int]:
+  var out: [Int] = []
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let x = rc_ops.value_func(f.instructions[iid].value)
+      if x >= 0: out.push(x)
+  return out
+
+fn apply_inner(fid: Int, var e: Env, ri: {Int: Bool}):
+  let nested = rc_cfg_inner(e.functions[fid])
+  for bi in 0..e.functions[fid].body.order.len:
+    let bid = e.functions[fid].body.order[bi]
+    for ii in 0..e.functions[fid].body.blocks[bid].instructions.len:
+      let iid = e.functions[fid].body.blocks[bid].instructions[ii]
+      var ops = rc_ops.value_operands_nofn(e.functions[fid].instructions[iid].value)
+      for oi in 0..ops.len:
+        if ri.get(ops[oi].identifier, false): ops[oi].reactive = true
+      rc_ops.set_value_operands_nofn(&e.functions[fid].instructions[iid].value, ops)
+    var tops = rc_ops.term_operands(e.functions[fid].body.blocks[bid].terminal)
+    for ti in 0..tops.len:
+      if ri.get(tops[ti].identifier, false): tops[ti].reactive = true
+    rc_ops.set_term_operands(&e.functions[fid].body.blocks[bid].terminal, tops)
+  for n in nested:
+    for ci in 0..e.functions[n].context.len:
+      if ri.get(e.functions[n].context[ci].identifier, false): e.functions[n].context[ci].reactive = true
+    apply_inner(n, &e, ri)
+
+fn nop():
+  return

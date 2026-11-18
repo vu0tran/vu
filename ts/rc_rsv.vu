@@ -1,0 +1,178 @@
+# InferReactiveScopeVariables (oxc_react_compiler react_compiler_inference/
+# infer_reactive_scope_variables.rs): groups the identifiers that are mutated together into
+# reactive scopes (a disjoint set), each scope's range spanning its identifiers'.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_ops
+import rc_visit
+from rc_hir import HirFunction, InstrValue, Sp, MutableRange
+from rc_env import Env
+
+# DisjointSet over identifier ids (insertion ordered)
+type DSet:
+  keys: [Int] = []
+  parent: {Int: Int} = {}
+
+fn ds_find(var d: DSet, x: Int) -> Int:
+  if not (x in d.parent):
+    d.parent[x] = x
+    d.keys.push(x)
+    return x
+  let p = d.parent[x]
+  if p == x: return x
+  let r = ds_find(&d, p)
+  d.parent[x] = r
+  return r
+
+fn ds_union(var d: DSet, items: [Int]):
+  if items.len == 0: return
+  let root = ds_find(&d, items[0])
+  for i in 1..items.len:
+    let r = ds_find(&d, items[i])
+    if r != root: d.parent[r] = root
+
+fn may_allocate(v: InstrValue, prim: Bool) -> Bool:
+  match v:
+    rc_hir.Destructure(pat, _, _, _): return rc_ops.pattern_has_spread(pat)
+    rc_hir.TaggedTemplateExpression(_, _, _, _, _): return not prim
+    rc_hir.CallExpression(_, _, _): return not prim
+    rc_hir.MethodCall(_, _, _, _): return not prim
+    rc_hir.RegExpLiteral(_, _, _): return true
+    rc_hir.PropertyStore(_, _, _, _, _, _): return true
+    rc_hir.ComputedStore(_, _, _, _): return true
+    rc_hir.ArrayExpression(_, _): return true
+    rc_hir.JsxExpression(_, _, _, _, _, _, _, _, _, _, _): return true
+    rc_hir.JsxFragment(_, _, _, _): return true
+    rc_hir.NewExpression(_, _, _): return true
+    rc_hir.ObjectExpression(_, _): return true
+    rc_hir.TSEnumDeclaration(_, _): return true
+    rc_hir.ObjectMethod(_, _): return true
+    rc_hir.FunctionExpression(_, _, _, _, _, _): return true
+    _: return false
+  return false
+
+fn is_prim(e: Env, id: Int) -> Bool:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TPrimitive: return true
+    _: return false
+  return false
+
+fn mutated(r: MutableRange) -> Bool:
+  return r.end > r.start + 1
+
+fn find_disjoint_mutable_values(f: HirFunction, e: Env) -> DSet:
+  var d = DSet()
+  var decls: {Int: Int} = {}
+  for bi in 0..f.body.order.len:
+    let bid = f.body.order[bi]
+    var first = 0
+    if f.body.blocks[bid].instructions.len > 0: first = f.instructions[f.body.blocks[bid].instructions[0]].id
+    else: first = rc_visit.term_id(f.body.blocks[bid].terminal)
+    for ph in f.body.blocks[bid].phis:
+      let pid = ph.place.identifier
+      let pr = e.identifiers[pid].mutable_range
+      let pdecl = e.identifiers[pid].declaration_id
+      let mutated_after = pr.start + 1 != pr.end and pr.end > first
+      var loop_carried = false
+      if not mutated_after:
+        for op in ph.ops:
+          if e.identifiers[op.identifier].mutable_range.start >= first: loop_carried = true
+      if mutated_after or loop_carried:
+        var ops = [pid]
+        if pdecl in decls: ops.push(decls[pdecl])
+        for op in ph.ops: ops.push(op.identifier)
+        ds_union(&d, ops)
+    for iid in f.body.blocks[bid].instructions:
+      let ins = f.instructions[iid]
+      var ops: [Int] = []
+      let lid = ins.lvalue.identifier
+      if mutated(e.identifiers[lid].mutable_range) or may_allocate(ins.value, is_prim(e, lid)): ops.push(lid)
+      var generic = false
+      var prop = -1
+      match ins.value:
+        rc_hir.DeclareLocal(lv, _): decl_add(&decls, e, lv.place.identifier)
+        rc_hir.DeclareContext(lv, _): decl_add(&decls, e, lv.place.identifier)
+        rc_hir.StoreLocal(lv, v, _): store_ops(&decls, e, lv.place.identifier, v.identifier, ins.id, &ops)
+        rc_hir.StoreContext(lv, v, _): store_ops(&decls, e, lv.place.identifier, v.identifier, ins.id, &ops)
+        rc_hir.Destructure(pat, _, v, _):
+          for p in rc_ops.pattern_operands(pat):
+            decl_add(&decls, e, p.identifier)
+            if mutated(e.identifiers[p.identifier].mutable_range): ops.push(p.identifier)
+          let vr = e.identifiers[v.identifier].mutable_range
+          if rc_hir.range_contains(vr, ins.id) and vr.start > 0: ops.push(v.identifier)
+        rc_hir.MethodCall(_, p, _, _):
+          generic = true
+          prop = p.identifier
+        _: generic = true
+      if generic:
+        for op in rc_ops.value_operands(ins.value, e):
+          let r = e.identifiers[op.identifier].mutable_range
+          if rc_hir.range_contains(r, ins.id) and r.start > 0: ops.push(op.identifier)
+        if prop >= 0: ops.push(prop)
+      if ops.len > 0: ds_union(&d, ops)
+  return d
+
+fn decl_add(var decls: {Int: Int}, e: Env, pid: Int):
+  let d = e.identifiers[pid].declaration_id
+  if not (d in decls): decls[d] = pid
+
+fn store_ops(var decls: {Int: Int}, e: Env, pid: Int, vid: Int, order: Int, var ops: [Int]):
+  decl_add(&decls, e, pid)
+  if mutated(e.identifiers[pid].mutable_range): ops.push(pid)
+  let vr = e.identifiers[vid].mutable_range
+  if rc_hir.range_contains(vr, order) and vr.start > 0: ops.push(vid)
+
+fn merge_location(l: Sp, r: Sp) -> Sp:
+  if l.s < 0: return r
+  if r.s < 0: return l
+  var s = l.s
+  if r.s < s: s = r.s
+  var en = l.e
+  if r.e > en: en = r.e
+  return Sp(s, en)
+
+fn infer_reactive_scope_variables(f: HirFunction, var e: Env):
+  var d = find_disjoint_mutable_values(f, e)
+  var group_scope: {Int: Int} = {}
+  var scope_sp: {Int: Sp} = {}
+  var created: [Int] = []
+  let keys = copy_ints(d.keys)
+  for id in keys:
+    let g = ds_find(&d, id)
+    let ir = e.identifiers[id].mutable_range
+    let isp = e.identifiers[id].sp
+    if not (g in group_scope):
+      let sid = rc_env.next_scope_id(&e)
+      e.scopes[sid].range = ir
+      group_scope[g] = sid
+      scope_sp[sid] = isp
+      created.push(sid)
+    let sid = group_scope[g]
+    let sr = e.scopes[sid].range
+    if sr.start != ir.start or sr.end != ir.end:
+      if sr.start == 0: e.scopes[sid].range.start = ir.start
+      elif ir.start != 0 and ir.start < sr.start: e.scopes[sid].range.start = ir.start
+      if ir.end > e.scopes[sid].range.end: e.scopes[sid].range.end = ir.end
+    scope_sp[sid] = merge_location(scope_sp[sid], isp)
+    e.identifiers[id].scope = sid
+  for sid in created: e.scopes[sid].sp = scope_sp[sid]
+  for id in keys:
+    let sid = e.identifiers[id].scope
+    e.identifiers[id].mutable_range = e.scopes[sid].range
+  var max_i = 0
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      if f.instructions[iid].id > max_i: max_i = f.instructions[iid].id
+    let t = rc_visit.term_id(f.body.blocks[bid].terminal)
+    if t > max_i: max_i = t
+  for sid in created:
+    let r = e.scopes[sid].range
+    if r.start == 0 or r.end == 0 or max_i == 0 or r.end > max_i + 1:
+      rc_env.throw(&e, rc_diags.invalid_mutable_range("{sid}", "{r.start}", "{r.end}", "{max_i + 1}"))
+      return
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r

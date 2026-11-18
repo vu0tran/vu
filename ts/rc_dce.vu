@@ -1,0 +1,207 @@
+# DeadCodeElimination (oxc_react_compiler react_compiler_optimization/dead_code_elimination.rs):
+# drops the phis, instructions and context variables nothing reads, and rewrites the destructures
+# and stores whose targets are unused.
+
+import rc_hir
+import rc_env
+import rc_ops
+import rc_cfg
+from rc_hir import HirFunction, InstrValue, Terminal, Elem, ObjProp
+from rc_env import Env
+
+type DState:
+  ids: {Int: Bool} = {}
+  named: {Str: Bool} = {}
+
+fn reference(var s: DState, e: Env, id: Int):
+  s.ids[id] = true
+  if e.identifiers[id].name_kind != 0: s.named[e.identifiers[id].name] = true
+
+fn used(s: DState, e: Env, id: Int) -> Bool:
+  if id in s.ids: return true
+  if e.identifiers[id].name_kind != 0:
+    let n = e.identifiers[id].name
+    return n in s.named
+  return false
+
+fn id_used(s: DState, id: Int) -> Bool:
+  return id in s.ids
+
+fn has_back_edge(f: HirFunction) -> Bool:
+  var visited: {Int: Bool} = {}
+  for bid in f.body.order:
+    for p in f.body.blocks[bid].preds:
+      if not (p in visited): return true
+    visited[bid] = true
+  return false
+
+fn caught(t: Terminal) -> Bool:
+  match t:
+    rc_hir.MaybeThrow(_, h, _, _, _, _): return h >= 0
+    _: return false
+  return false
+
+fn find_referenced_identifiers(f: HirFunction, e: Env, preserve_caught_throws: Bool) -> DState:
+  let has_loop = has_back_edge(f)
+  var s = DState()
+  while true:
+    let size = s.ids.len
+    var bi = f.body.order.len - 1
+    while bi >= 0:
+      let bid = f.body.order[bi]
+      bi -= 1
+      for p in rc_ops.term_operands(f.body.blocks[bid].terminal): reference(&s, e, p.identifier)
+      let n = f.body.blocks[bid].instructions.len
+      let is_caught = caught(f.body.blocks[bid].terminal)
+      let bkind = f.body.blocks[bid].kind
+      var i = n - 1
+      while i >= 0:
+        let iid = f.body.blocks[bid].instructions[i]
+        let is_block_value = bkind != rc_hir.BK_BLOCK and i == n - 1
+        i -= 1
+        let lid = f.instructions[iid].lvalue.identifier
+        if is_block_value:
+          reference(&s, e, lid)
+          for p in rc_ops.value_operands(f.instructions[iid].value, e): reference(&s, e, p.identifier)
+        elif used(s, e, lid) or (preserve_caught_throws and is_caught and rc_cfg.value_may_throw(f.instructions[iid].value)) or not pruneable_value(f.instructions[iid].value, s, e):
+          reference(&s, e, lid)
+          var done = false
+          match f.instructions[iid].value:
+            rc_hir.StoreLocal(lv, v, _):
+              done = true
+              if lv.kind == rc_hir.IK_REASSIGN or id_used(s, lv.place.identifier): reference(&s, e, v.identifier)
+            _: nop()
+          if not done:
+            for p in rc_ops.value_operands(f.instructions[iid].value, e): reference(&s, e, p.identifier)
+      for ph in f.body.blocks[bid].phis:
+        if used(s, e, ph.place.identifier):
+          for op in ph.ops: reference(&s, e, op.identifier)
+    if not (s.ids.len > size and has_loop): break
+  return s
+
+fn pruneable_value(v: InstrValue, s: DState, e: Env) -> Bool:
+  match v:
+    rc_hir.DeclareLocal(lv, _): return not used(s, e, lv.place.identifier)
+    rc_hir.StoreLocal(lv, _, _):
+      if lv.kind == rc_hir.IK_REASSIGN: return not id_used(s, lv.place.identifier)
+      return not used(s, e, lv.place.identifier)
+    rc_hir.Destructure(pat, k, _, _):
+      var any_named = false
+      var any_id = false
+      for p in rc_ops.pattern_operands(pat):
+        if id_used(s, p.identifier):
+          any_named = true
+          any_id = true
+        elif used(s, e, p.identifier): any_named = true
+      if k == rc_hir.IK_REASSIGN: return not any_id
+      return not any_named
+    rc_hir.PostfixUpdate(lv, _, _, _): return not id_used(s, lv.identifier)
+    rc_hir.PrefixUpdate(lv, _, _, _): return not id_used(s, lv.identifier)
+    rc_hir.RegExpLiteral(_, _, _): return true
+    rc_hir.MetaProperty(_, _, _): return true
+    rc_hir.LoadGlobal(_, _): return true
+    rc_hir.ArrayExpression(_, _): return true
+    rc_hir.BinaryExpression(_, _, _, _): return true
+    rc_hir.ComputedLoad(_, _, _): return true
+    rc_hir.ObjectMethod(_, _): return true
+    rc_hir.FunctionExpression(_, _, _, _, _, _): return true
+    rc_hir.LoadLocal(_, _): return true
+    rc_hir.JsxExpression(_, _, _, _, _, _, _, _, _, _, _): return true
+    rc_hir.JsxFragment(_, _, _, _): return true
+    rc_hir.JSXText(_, _): return true
+    rc_hir.ObjectExpression(_, _): return true
+    rc_hir.Primitive(_, _): return true
+    rc_hir.PropertyLoad(_, _, _, _, _): return true
+    rc_hir.TemplateLiteral(_, _, _): return true
+    rc_hir.TypeCastExpression(_, _, _, _): return true
+    rc_hir.UnaryExpression(_, _, _): return true
+    _: return false
+  return false
+
+fn dead_code_elimination(var f: HirFunction, e: Env):
+  let s = find_referenced_identifiers(f, e, true)
+  var rewrite: [Int] = []
+  var preserve: [Bool] = []
+  for bi in 0..f.body.order.len:
+    let bid = f.body.order[bi]
+    var phis: [rc_hir.Phi] = []
+    swap(&phis, &f.body.blocks[bid].phis)
+    var keep: [rc_hir.Phi] = []
+    for pi in 0..phis.len:
+      if used(s, e, phis[pi].place.identifier):
+        var ph = rc_hir.Phi(rc_hir.place(-1, rc_hir.nosp()), [], [])
+        swap(&ph, &phis[pi])
+        keep.push(ph)
+    swap(&keep, &f.body.blocks[bid].phis)
+    var ins: [Int] = []
+    for iid in f.body.blocks[bid].instructions:
+      if used(s, e, f.instructions[iid].lvalue.identifier): ins.push(iid)
+    let n = ins.len
+    let is_caught = caught(f.body.blocks[bid].terminal)
+    let bkind = f.body.blocks[bid].kind
+    for i in 0..n:
+      if not (bkind != rc_hir.BK_BLOCK and i == n - 1):
+        var pd = false
+        if is_caught:
+          match f.instructions[ins[i]].value:
+            rc_hir.Destructure(_, _, _, _): pd = true
+            _: nop()
+        rewrite.push(ins[i])
+        preserve.push(pd)
+    f.body.blocks[bid].instructions = ins
+  for ri in 0..rewrite.len: rewrite_instruction(&f, rewrite[ri], preserve[ri], s, e)
+  var ctx: [rc_hir.Place] = []
+  for p in f.context:
+    if used(s, e, p.identifier): ctx.push(p)
+  f.context = ctx
+
+fn rewrite_instruction(var f: HirFunction, iid: Int, preserve_destructure: Bool, s: DState, e: Env):
+  var decl = false
+  var dlv = rc_hir.LValue(rc_hir.place(-1, rc_hir.nosp()), 0)
+  var dsp = rc_hir.nosp()
+  match var f.instructions[iid].value:
+    rc_hir.Destructure(pat, _, _, _):
+      if preserve_destructure: return
+      if not pat.is_object:
+        var last = 0
+        for i in 0..pat.items.len:
+          if pat.items[i].kind == 2: continue
+          if not used(s, e, pat.items[i].place.identifier):
+            pat.items[i] = Elem(2, rc_hir.place(-1, rc_hir.nosp()), rc_hir.nosp())
+          else: last = i
+        var items: [Elem] = []
+        for i in 0..pat.items.len:
+          if i <= last: items.push(pat.items[i])
+        pat.items = items
+      else:
+        var have = false
+        var keep: [Int] = []
+        var stop = false
+        for pi in 0..pat.props.len:
+          if stop: continue
+          if not pat.props[pi].spread:
+            if used(s, e, pat.props[pi].place.identifier):
+              keep.push(pi)
+              have = true
+          elif used(s, e, pat.props[pi].place.identifier):
+            have = false
+            stop = true
+        if have:
+          var old: [ObjProp] = []
+          swap(&old, &pat.props)
+          var next: [ObjProp] = []
+          for ki in keep:
+            var x = ObjProp(false, rc_hir.PropKey(0, "", rc_hir.place(-1, rc_hir.nosp()), rc_hir.nosp()), false, rc_hir.place(-1, rc_hir.nosp()), rc_hir.nosp())
+            swap(&x, &old[ki])
+            next.push(x)
+          pat.props = next
+    rc_hir.StoreLocal(lv, _, sp):
+      if lv.kind != rc_hir.IK_REASSIGN and not id_used(s, lv.place.identifier):
+        decl = true
+        dlv = lv
+        dsp = sp
+    _: nop()
+  if decl: f.instructions[iid].value = rc_hir.DeclareLocal(dlv, dsp)
+
+fn nop():
+  return

@@ -1,0 +1,422 @@
+# InferMutationAliasingRanges (oxc_react_compiler react_compiler_inference/
+# infer_mutation_aliasing_ranges.rs): builds a graph of the data flow the instructions' effects
+# describe, replays the mutations over it to extend each identifier's mutable range, records the
+# errors (impure calls, frozen or global mutations) the effects carry, sets the places' effects,
+# and returns the function's externally visible effects.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_ops
+import rc_visit
+import rc_gdefs
+from rc_hir import Sp, Place, Ty, HirFunction, Instruction, InstrValue, Terminal, AliasingEffect
+from rc_hir import AE_FREEZE, AE_MUTATE, AE_MUTATE_CONDITIONALLY, AE_MUTATE_TRANSITIVE, AE_MUTATE_TRANSITIVE_CONDITIONALLY
+from rc_hir import AE_CAPTURE, AE_ALIAS, AE_MAYBE_ALIAS, AE_ASSIGN, AE_CREATE, AE_CREATE_FROM, AE_IMMUTABLE_CAPTURE
+from rc_hir import AE_APPLY, AE_CREATE_FUNCTION, AE_MUTATE_FROZEN, AE_MUTATE_GLOBAL, AE_IMPURE, AE_RENDER
+from rc_env import Env
+
+const MK_CONDITIONAL = 1
+const MK_DEFINITE = 2
+
+const EK_CAPTURE = 0
+const EK_ALIAS = 1
+const EK_MAYBE_ALIAS = 2
+
+const NV_OBJECT = 0
+const NV_PHI = 1
+const NV_FUNCTION = 2
+
+type Edge:
+  index: Int
+  node: Int
+  kind: Int
+
+# an insertion-ordered map id -> index (first insert wins)
+type OMap:
+  k: [Int] = []
+  v: [Int] = []
+
+fn om_add(var m: OMap, k: Int, v: Int):
+  for x in m.k:
+    if x == k: return
+  m.k.push(k)
+  m.v.push(v)
+
+type Node:
+  id: Int
+  created_from: OMap = OMap()
+  captures: OMap = OMap()
+  aliases: OMap = OMap()
+  maybe_aliases: OMap = OMap()
+  edges: [Edge] = []
+  transitive: Int = 0        # MutationInfo kind (0 none)
+  tsp: Sp = Sp(-1, -1)
+  local: Int = 0
+  lsp: Sp = Sp(-1, -1)
+  last_mutated: Int = 0
+  reason: Bool = false       # MutationReason::AssignCurrentProperty
+  value: Int = NV_OBJECT
+  fid: Int = -1
+
+type AState:
+  nodes: {Int: Node} = {}
+
+fn create(var s: AState, p: Place, value: Int, fid: Int):
+  s.nodes[p.identifier] = Node(id: p.identifier, value: value, fid: fid)
+
+fn create_from(var s: AState, index: Int, from: Place, into: Place):
+  create(&s, into, NV_OBJECT, -1)
+  if from.identifier in s.nodes: s.nodes[from.identifier].edges.push(Edge(index, into.identifier, EK_ALIAS))
+  om_add(&s.nodes[into.identifier].created_from, from.identifier, index)
+
+fn capture(var s: AState, index: Int, from: Place, into: Place):
+  if not (from.identifier in s.nodes) or not (into.identifier in s.nodes): return
+  s.nodes[from.identifier].edges.push(Edge(index, into.identifier, EK_CAPTURE))
+  om_add(&s.nodes[into.identifier].captures, from.identifier, index)
+
+fn assign(var s: AState, index: Int, from: Place, into: Place):
+  if not (from.identifier in s.nodes) or not (into.identifier in s.nodes): return
+  s.nodes[from.identifier].edges.push(Edge(index, into.identifier, EK_ALIAS))
+  om_add(&s.nodes[into.identifier].aliases, from.identifier, index)
+
+fn maybe_alias(var s: AState, index: Int, from: Place, into: Place):
+  if not (from.identifier in s.nodes) or not (into.identifier in s.nodes): return
+  s.nodes[from.identifier].edges.push(Edge(index, into.identifier, EK_MAYBE_ALIAS))
+  om_add(&s.nodes[into.identifier].maybe_aliases, from.identifier, index)
+
+fn append_function_errors(var e: Env, fid: Int):
+  if not e.functions[fid].has_aliasing: return
+  var ids: [Int] = []
+  for x in e.functions[fid].aliasing_effects:
+    if x.kind == AE_IMPURE or x.kind == AE_MUTATE_FROZEN or x.kind == AE_MUTATE_GLOBAL: ids.push(x.n)
+  for id in ids: e.errors.push(rc_env.aliasing_diag(e, id))
+
+fn render(s: AState, index: Int, start: Int, var e: Env):
+  var seen: {Int: Bool} = {}
+  var queue: [Int] = [start]
+  while queue.len > 0:
+    let cur = queue.pop()
+    if cur in seen: continue
+    seen[cur] = true
+    if not (cur in s.nodes): continue
+    let n = s.nodes[cur]
+    if n.transitive != 0 or n.local != 0: continue
+    if n.value == NV_FUNCTION: append_function_errors(&e, n.fid)
+    for i in 0..n.created_from.k.len:
+      if n.created_from.v[i] < index: queue.push(n.created_from.k[i])
+    for i in 0..n.aliases.k.len:
+      if n.aliases.v[i] < index: queue.push(n.aliases.k[i])
+    for i in 0..n.captures.k.len:
+      if n.captures.v[i] < index: queue.push(n.captures.k[i])
+
+type QE:
+  place: Int
+  transitive: Bool
+  backwards: Bool
+  kind: Int
+
+# end < 0: a simulated mutation
+fn mutate(var s: AState, index: Int, start: Int, end: Int, transitive: Bool, start_kind: Int, sp: Sp, reason: Bool, var e: Env, record: Bool):
+  var seen: {Int: Int} = {}
+  var queue: [QE] = [QE(start, transitive, true, start_kind)]
+  while queue.len > 0:
+    let q = queue.pop()
+    let cur = q.place
+    if cur in seen and seen[cur] >= q.kind: continue
+    seen[cur] = q.kind
+    if not (cur in s.nodes): continue
+    if not s.nodes[cur].reason: s.nodes[cur].reason = reason
+    if index > s.nodes[cur].last_mutated: s.nodes[cur].last_mutated = index
+    let nid = s.nodes[cur].id
+    if end >= 0 and end > e.identifiers[nid].mutable_range.end: e.identifiers[nid].mutable_range.end = end
+    if s.nodes[cur].value == NV_FUNCTION and s.nodes[cur].transitive == 0 and s.nodes[cur].local == 0 and record:
+      append_function_errors(&e, s.nodes[cur].fid)
+    if q.transitive:
+      if s.nodes[cur].transitive < q.kind:
+        s.nodes[cur].transitive = q.kind
+        s.nodes[cur].tsp = sp
+    else:
+      if s.nodes[cur].local < q.kind:
+        s.nodes[cur].local = q.kind
+        s.nodes[cur].lsp = sp
+    let n = s.nodes[cur]
+    for ed in n.edges:
+      if ed.index >= index: break
+      var k = q.kind
+      if ed.kind == EK_MAYBE_ALIAS: k = MK_CONDITIONAL
+      queue.push(QE(ed.node, q.transitive, false, k))
+    for i in 0..n.created_from.k.len:
+      if n.created_from.v[i] < index: queue.push(QE(n.created_from.k[i], true, true, q.kind))
+    if q.backwards or n.value != NV_PHI:
+      for i in 0..n.aliases.k.len:
+        if n.aliases.v[i] < index: queue.push(QE(n.aliases.k[i], q.transitive, true, q.kind))
+      for i in 0..n.maybe_aliases.k.len:
+        if n.maybe_aliases.v[i] < index: queue.push(QE(n.maybe_aliases.k[i], q.transitive, true, MK_CONDITIONAL))
+    if q.transitive:
+      for i in 0..n.captures.k.len:
+        if n.captures.v[i] < index: queue.push(QE(n.captures.k[i], q.transitive, true, q.kind))
+
+type PendingPhi:
+  from: Place
+  into: Place
+  index: Int
+
+type PendingMut:
+  index: Int
+  id: Int
+  transitive: Bool
+  kind: Int
+  place: Place
+  reason: Bool
+
+type PendingRender:
+  index: Int
+  place: Place
+
+fn is_shape_obj(t: Ty, id: Str) -> Bool:
+  match t:
+    rc_hir.TObject(sh, has): return has and sh == id
+    _: return false
+  return false
+
+fn infer_mutation_aliasing_ranges(var f: HirFunction, var e: Env, is_fe: Bool) -> [AliasingEffect]:
+  var fx: [AliasingEffect] = []
+  var s = AState()
+  var pending_phis: {Int: [PendingPhi]} = {}
+  var mutations: [PendingMut] = []
+  var renders: [PendingRender] = []
+  var index = 0
+  let record = not is_fe
+  if f.has_self: create(&s, f.self_binding, NV_OBJECT, -1)
+  for p in f.params: create(&s, p.place, NV_OBJECT, -1)
+  for p in f.context: create(&s, p, NV_OBJECT, -1)
+  create(&s, f.returns, NV_OBJECT, -1)
+  var seen_blocks: {Int: Bool} = {}
+  var order: [Int] = []
+  for b in f.body.order: order.push(b)
+  for bid in order:
+    for ph in f.body.blocks[bid].phis:
+      create(&s, ph.place, NV_PHI, -1)
+      for oi in 0..ph.ops.len:
+        let pred = ph.ops_block[oi]
+        if not (pred in seen_blocks):
+          if not (pred in pending_phis): pending_phis[pred] = []
+          pending_phis[pred].push(PendingPhi(ph.ops[oi], ph.place, index))
+        else: assign(&s, index, ph.ops[oi], ph.place)
+        index += 1
+    seen_blocks[bid] = true
+    for iid in f.body.blocks[bid].instructions:
+      if not f.instructions[iid].has_effects: continue
+      let eo = f.instructions[iid].id
+      let effs = rc_hir.cp_effects(f.instructions[iid].effects)
+      for x in effs:
+        let k = x.kind
+        if k == AE_CREATE: create(&s, x.b, NV_OBJECT, -1)
+        elif k == AE_CREATE_FUNCTION: create(&s, x.b, NV_FUNCTION, x.n)
+        elif k == AE_CREATE_FROM:
+          create_from(&s, index, x.a, x.b)
+          index += 1
+        elif k == AE_ASSIGN:
+          if not (x.b.identifier in s.nodes): create(&s, x.b, NV_OBJECT, -1)
+          assign(&s, index, x.a, x.b)
+          index += 1
+        elif k == AE_ALIAS:
+          assign(&s, index, x.a, x.b)
+          index += 1
+        elif k == AE_MAYBE_ALIAS:
+          maybe_alias(&s, index, x.a, x.b)
+          index += 1
+        elif k == AE_CAPTURE:
+          capture(&s, index, x.a, x.b)
+          index += 1
+        elif k == AE_MUTATE_TRANSITIVE or k == AE_MUTATE_TRANSITIVE_CONDITIONALLY:
+          var mk = MK_DEFINITE
+          if k == AE_MUTATE_TRANSITIVE_CONDITIONALLY: mk = MK_CONDITIONAL
+          mutations.push(PendingMut(index, eo, true, mk, x.a, false))
+          index += 1
+        elif k == AE_MUTATE:
+          mutations.push(PendingMut(index, eo, false, MK_DEFINITE, x.a, x.flag))
+          index += 1
+        elif k == AE_MUTATE_CONDITIONALLY:
+          mutations.push(PendingMut(index, eo, false, MK_CONDITIONAL, x.a, false))
+          index += 1
+        elif k == AE_MUTATE_FROZEN or k == AE_MUTATE_GLOBAL or k == AE_IMPURE:
+          if record: e.errors.push(rc_env.aliasing_diag(e, x.n))
+          fx.push(rc_hir.cp_effect(x))
+        elif k == AE_RENDER:
+          renders.push(PendingRender(index, x.a))
+          index += 1
+          fx.push(rc_hir.cp_effect(x))
+    if bid in pending_phis:
+      for pp in pending_phis[bid]: assign(&s, pp.index, pp.from, pp.into)
+      pending_phis.remove(bid)
+    var tes: [AliasingEffect] = []
+    match f.body.blocks[bid].terminal:
+      rc_hir.Return(v, _, _, _, effs, has):
+        assign(&s, index, v, f.returns)
+        index += 1
+        if has: tes = rc_hir.cp_effects(effs)
+      rc_hir.MaybeThrow(_, _, _, _, effs, has):
+        if has: tes = rc_hir.cp_effects(effs)
+      _: nop()
+    for x in tes:
+      if x.kind == AE_ALIAS:
+        assign(&s, index, x.a, x.b)
+        index += 1
+  for m in mutations:
+    mutate(&s, m.index, m.place.identifier, m.id + 1, m.transitive, m.kind, m.place.sp, m.reason, &e, record)
+  if record:
+    for r in renders: render(s, r.index, r.place.identifier, &e)
+  for p in f.context: collect_param_effects(s, p, &fx)
+  for p in f.params: collect_param_effects(s, p.place, &fx)
+  var captured: {Int: Bool} = {}
+  for p in f.params:
+    if p.place.identifier in s.nodes:
+      let n = s.nodes[p.place.identifier]
+      if n.local != 0 or n.transitive != 0: captured[p.place.identifier] = true
+  for p in f.context:
+    if p.identifier in s.nodes:
+      let n = s.nodes[p.identifier]
+      if n.local != 0 or n.transitive != 0: captured[p.identifier] = true
+  for i in 0..f.params.len:
+    if f.params[i].place.identifier in captured: f.params[i].place.effect = rc_hir.EF_CAPTURE
+  for i in 0..f.context.len:
+    if f.context[i].identifier in captured: f.context[i].effect = rc_hir.EF_CAPTURE
+  for bid in order:
+    var first = 0
+    if f.body.blocks[bid].instructions.len > 0: first = f.instructions[f.body.blocks[bid].instructions[0]].id
+    else: first = rc_visit_id(f.body.blocks[bid].terminal)
+    for pi in 0..f.body.blocks[bid].phis.len:
+      let pid = f.body.blocks[bid].phis[pi].place.identifier
+      let mutated_after = e.identifiers[pid].mutable_range.end > first
+      f.body.blocks[bid].phis[pi].place.effect = rc_hir.EF_STORE
+      for oi in 0..f.body.blocks[bid].phis[pi].ops.len:
+        if mutated_after: f.body.blocks[bid].phis[pi].ops[oi].effect = rc_hir.EF_CAPTURE
+        else: f.body.blocks[bid].phis[pi].ops[oi].effect = rc_hir.EF_READ
+      if mutated_after and e.identifiers[pid].mutable_range.start == 0:
+        var st = first - 1
+        if st < 0: st = 0
+        e.identifiers[pid].mutable_range.start = st
+    let iids = copy_ints(f.body.blocks[bid].instructions)
+    for iid in iids:
+      let eo = f.instructions[iid].id
+      let lid = f.instructions[iid].lvalue.identifier
+      start_range(&e, lid, eo)
+      f.instructions[iid].lvalue.effect = rc_hir.EF_COND_MUTATE
+      var lvs = rc_ops.value_lvalues(f.instructions[iid].value)
+      for p in lvs: start_range(&e, p.identifier, eo)
+      for li in 0..lvs.len: lvs[li].effect = rc_hir.EF_COND_MUTATE
+      rc_ops.set_value_lvalues(&f.instructions[iid].value, lvs)
+      var ops = rc_ops.value_operands_nofn(f.instructions[iid].value)
+      for oi in 0..ops.len: ops[oi].effect = rc_hir.EF_READ
+      rc_ops.set_value_operands_nofn(&f.instructions[iid].value, ops)
+      if not f.instructions[iid].has_effects: continue
+      let effs = rc_hir.cp_effects(f.instructions[iid].effects)
+      var oe: {Int: Int} = {}
+      for x in effs:
+        let k = x.kind
+        if k == AE_ASSIGN or k == AE_ALIAS or k == AE_CAPTURE or k == AE_CREATE_FROM or k == AE_MAYBE_ALIAS:
+          if e.identifiers[x.b.identifier].mutable_range.end > eo:
+            oe[x.a.identifier] = rc_hir.EF_CAPTURE
+          else: oe[x.a.identifier] = rc_hir.EF_READ
+          oe[x.b.identifier] = rc_hir.EF_STORE
+        elif k == AE_MUTATE: oe[x.a.identifier] = rc_hir.EF_STORE
+        elif k == AE_APPLY:
+          rc_env.throw(&e, rc_diags.invariant_analyze_functions_expected_apply_effects_replaced_more_precise_effects_2())
+          return fx
+        elif k == AE_MUTATE_TRANSITIVE or k == AE_MUTATE_CONDITIONALLY or k == AE_MUTATE_TRANSITIVE_CONDITIONALLY:
+          oe[x.a.identifier] = rc_hir.EF_COND_MUTATE
+        elif k == AE_FREEZE: oe[x.a.identifier] = rc_hir.EF_FREEZE
+      if lid in oe: f.instructions[iid].lvalue.effect = oe[lid]
+      var lvs2 = rc_ops.value_lvalues(f.instructions[iid].value)
+      for li in 0..lvs2.len:
+        if lvs2[li].identifier in oe: lvs2[li].effect = oe[lvs2[li].identifier]
+      rc_ops.set_value_lvalues(&f.instructions[iid].value, lvs2)
+      var ops2 = rc_ops.value_operands_nofn(f.instructions[iid].value)
+      for oi in 0..ops2.len:
+        let pid = ops2[oi].identifier
+        if e.identifiers[pid].mutable_range.end > eo and e.identifiers[pid].mutable_range.start == 0:
+          e.identifiers[pid].mutable_range.start = eo
+        if pid in oe: ops2[oi].effect = oe[pid]
+      rc_ops.set_value_operands_nofn(&f.instructions[iid].value, ops2)
+      let fid = rc_ops.value_func(f.instructions[iid].value)
+      if fid >= 0:
+        var ctx_ids: [Int] = []
+        for c in e.functions[fid].context: ctx_ids.push(c.identifier)
+        for cid in ctx_ids:
+          if e.identifiers[cid].mutable_range.end > eo and e.identifiers[cid].mutable_range.start == 0:
+            e.identifiers[cid].mutable_range.start = eo
+          let ef = oe.get(cid, rc_hir.EF_READ)
+          for ci in 0..e.functions[fid].context.len:
+            if e.functions[fid].context[ci].identifier == cid: e.functions[fid].context[ci].effect = ef
+      match f.instructions[iid].value:
+        rc_hir.StoreContext(_, v, _):
+          if e.identifiers[v.identifier].mutable_range.end <= eo: e.identifiers[v.identifier].mutable_range.end = eo + 1
+        _: nop()
+    var is_ret = false
+    match var f.body.blocks[bid].terminal:
+      rc_hir.Return(v, _, _, _, _, _):
+        is_ret = true
+        if is_fe: v.effect = rc_hir.EF_READ
+        else: v.effect = rc_hir.EF_FREEZE
+      _: nop()
+    if not is_ret:
+      var tops = rc_ops.term_operands(f.body.blocks[bid].terminal)
+      for ti in 0..tops.len: tops[ti].effect = rc_hir.EF_READ
+      rc_ops.set_term_operands(&f.body.blocks[bid].terminal, tops)
+  let rvk = return_value_kind(e, f.returns.identifier)
+  fx.push(rc_hir.ae_create(f.returns, rvk, rc_hir.VR_KNOWN_RETURN_SIGNATURE))
+  var tracked: [Place] = []
+  for p in f.params: tracked.push(p.place)
+  for p in f.context: tracked.push(p)
+  tracked.push(f.returns)
+  let rid = f.returns.identifier
+  for i in 0..tracked.len:
+    let into = tracked[i]
+    let mi = index
+    index += 1
+    mutate(&s, mi, into.identifier, -1, true, MK_CONDITIONAL, into.sp, false, &e, false)
+    for from in tracked:
+      if from.identifier == into.identifier or from.identifier == rid: continue
+      if not (from.identifier in s.nodes): continue
+      if s.nodes[from.identifier].last_mutated == mi:
+        if into.identifier == rid: fx.push(rc_hir.ae2(AE_ALIAS, from, into))
+        else: fx.push(rc_hir.ae2(AE_CAPTURE, from, into))
+  return fx
+
+fn return_value_kind(e: Env, id: Int) -> Int:
+  let rt = e.types[e.identifiers[id].type_]
+  match rt:
+    rc_hir.TPrimitive: return rc_hir.VK_PRIMITIVE
+    _:
+      if is_shape_obj(rt, rc_gdefs.BUILT_IN_JSX_ID): return rc_hir.VK_FROZEN
+  return rc_hir.VK_MUTABLE
+
+fn start_range(var e: Env, id: Int, eo: Int):
+  if e.identifiers[id].mutable_range.start == 0: e.identifiers[id].mutable_range.start = eo
+  if e.identifiers[id].mutable_range.end == 0:
+    var en = eo + 1
+    if e.identifiers[id].mutable_range.end > en: en = e.identifiers[id].mutable_range.end
+    e.identifiers[id].mutable_range.end = en
+
+fn with_sp(p: Place, sp: Sp) -> Place:
+  return Place(p.identifier, p.effect, p.reactive, sp)
+
+fn collect_param_effects(s: AState, p: Place, var fx: [AliasingEffect]):
+  if not (p.identifier in s.nodes): return
+  let n = s.nodes[p.identifier]
+  if n.local == MK_CONDITIONAL: fx.push(rc_hir.ae1(AE_MUTATE_CONDITIONALLY, with_sp(p, n.lsp)))
+  elif n.local == MK_DEFINITE: fx.push(rc_hir.AliasingEffect(kind: AE_MUTATE, a: with_sp(p, n.lsp), flag: n.reason))
+  if n.transitive == MK_CONDITIONAL: fx.push(rc_hir.ae1(AE_MUTATE_TRANSITIVE_CONDITIONALLY, with_sp(p, n.tsp)))
+  elif n.transitive == MK_DEFINITE: fx.push(rc_hir.ae1(AE_MUTATE_TRANSITIVE, with_sp(p, n.tsp)))
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn rc_visit_id(t: Terminal) -> Int:
+  return rc_visit.term_id(t)
+
+fn nop():
+  return

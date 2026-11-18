@@ -1,0 +1,128 @@
+# RewriteInstructionKindsBasedOnReassignment (oxc_react_compiler react_compiler_ssa/
+# rewrite_instruction_kinds_based_on_reassignment.rs): marks each declaration const, let or a
+# reassignment from how the variable is assigned later.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_diags_hand
+import rc_ops
+from rc_hir import HirFunction, Place
+from rc_env import Env
+
+fn format_kind(k: Int) -> Str:
+  let names = ["Const", "Let", "Reassign", "Catch", "HoistedConst", "HoistedLet", "HoistedFunction", "Function"]
+  if k < 0: return "null"
+  return names[k] + ""
+
+fn format_place(p: Place, e: Env) -> Str:
+  let id = e.identifiers[p.identifier]
+  var scope = ""
+  if id.scope >= 0: scope = "_@{id.scope}"
+  var range = ""
+  if id.mutable_range.end > id.mutable_range.start + 1: range = "[{id.mutable_range.start}:{id.mutable_range.end}]"
+  var reactive = ""
+  if p.reactive: reactive = "{{reactive}}"
+  return "{rc_hir.effect_name(p.effect)} {id.name}${p.identifier}{scope}{range}{reactive}"
+
+# declarations: decl id -> encoded location (block index * 2^32 + instruction index), -1 a param
+fn loc(bi: Int, ii: Int) -> Int:
+  return bi * 4294967296 + ii
+
+fn rewrite_instruction_kinds(var f: HirFunction, var e: Env):
+  var decls: {Int: Int} = {}
+  var reassign: [Int] = []
+  var lets: [Int] = []
+  var consts: [Int] = []
+  var dlocs: [Int] = []
+  var dkinds: [Int] = []
+  for p in f.params:
+    if e.identifiers[p.place.identifier].name_kind != 0: decls[e.identifiers[p.place.identifier].declaration_id] = -1
+  for p in f.context:
+    if e.identifiers[p.identifier].name_kind != 0: decls[e.identifiers[p.identifier].declaration_id] = -1
+  if f.has_self: decls[e.identifiers[f.self_binding.identifier].declaration_id] = -1
+  for bi in 0..f.body.order.len:
+    let bid = f.body.order[bi]
+    let bkind = f.body.blocks[bid].kind
+    for li in 0..f.body.blocks[bid].instructions.len:
+      let iid = f.body.blocks[bid].instructions[li]
+      match f.instructions[iid].value:
+        rc_hir.DeclareLocal(lv, _):
+          let d = e.identifiers[lv.place.identifier].declaration_id
+          if d in decls:
+            rc_env.throw(&e, rc_diags_hand.ssa_variable_already_defined(format_place(lv.place, e), lv.place.sp))
+            return
+          decls[d] = loc(bi, li)
+        rc_hir.StoreLocal(lv, _, _):
+          if e.identifiers[lv.place.identifier].name_kind != 0:
+            let d = e.identifiers[lv.place.identifier].declaration_id
+            if d in decls:
+              if decls[d] >= 0: lets.push(decls[d])
+              reassign.push(loc(bi, li))
+            else:
+              decls[d] = loc(bi, li)
+              consts.push(loc(bi, li))
+        rc_hir.Destructure(pat, _, _, _):
+          var kind = -1
+          for p in rc_ops.pattern_operands(pat):
+            if e.identifiers[p.identifier].name_kind == 0:
+              if not (kind < 0 or kind == rc_hir.IK_CONST):
+                rc_env.throw(&e, rc_diags_hand.ssa_inconsistent_unnamed_const(format_kind(kind), format_place(p, e), p.sp))
+                return
+              kind = rc_hir.IK_CONST
+            else:
+              let d = e.identifiers[p.identifier].declaration_id
+              if d in decls:
+                if not (kind < 0 or kind == rc_hir.IK_REASSIGN):
+                  rc_env.throw(&e, rc_diags_hand.ssa_inconsistent_reassignment(format_kind(kind), format_place(p, e), p.sp))
+                  return
+                kind = rc_hir.IK_REASSIGN
+                if decls[d] >= 0: lets.push(decls[d])
+              else:
+                if bkind == rc_hir.BK_VALUE:
+                  rc_env.throw(&e, rc_diags_hand.ssa_dce_reassignment(p.sp))
+                  return
+                decls[d] = loc(bi, li)
+                if not (kind < 0 or kind == rc_hir.IK_CONST):
+                  rc_env.throw(&e, rc_diags_hand.ssa_inconsistent_const(format_kind(kind), format_place(p, e), p.sp))
+                  return
+                kind = rc_hir.IK_CONST
+          if kind < 0:
+            rc_env.throw(&e, rc_diags.ssa_expected_operand())
+            return
+          dlocs.push(loc(bi, li))
+          dkinds.push(kind)
+        rc_hir.PostfixUpdate(lv, _, _, _):
+          if not update_decl(&e, decls, lv, &lets): return
+        rc_hir.PrefixUpdate(lv, _, _, _):
+          if not update_decl(&e, decls, lv, &lets): return
+        _: nop()
+  for l in consts: set_kind(&f, l, rc_hir.IK_CONST, 1)
+  for l in reassign: set_kind(&f, l, rc_hir.IK_REASSIGN, 1)
+  for i in 0..dlocs.len: set_kind(&f, dlocs[i], dkinds[i], 2)
+  for l in lets: set_kind(&f, l, rc_hir.IK_LET, 3)
+
+fn update_decl(var e: Env, decls: {Int: Int}, lv: Place, var lets: [Int]) -> Bool:
+  let d = e.identifiers[lv.identifier].declaration_id
+  if not (d in decls):
+    rc_env.throw(&e, rc_diags_hand.ssa_missing_declaration(format_place(lv, e), lv.sp))
+    return false
+  if decls[d] >= 0: lets.push(decls[d])
+  return true
+
+# which: 1 StoreLocal, 2 Destructure, 3 DeclareLocal / StoreLocal / Destructure
+fn set_kind(var f: HirFunction, l: Int, k: Int, which: Int):
+  let bi = l / 4294967296
+  let li = l % 4294967296
+  let iid = f.body.blocks[f.body.order[bi]].instructions[li]
+  match var f.instructions[iid].value:
+    rc_hir.StoreLocal(lv, _, _):
+      if which != 2: lv.kind = k
+    rc_hir.Destructure(_, kind, _, _):
+      if which != 1: kind = k
+    rc_hir.DeclareLocal(lv, _):
+      if which == 3: lv.kind = k
+    _: nop()
+
+fn nop():
+  return

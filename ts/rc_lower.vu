@@ -1,0 +1,3263 @@
+# The React Compiler's lowering (oxc_react_compiler 1.90.0, react_compiler_lowering/build_hir.rs,
+# find_context_identifiers.rs and identifier_loc_index.rs) over vlint's syntax tree: a component or
+# hook becomes a HirFunction (blocks of instructions), with its nested functions in the Env's
+# function table. Function names follow the Rust source. A failing `?` in Rust sets e.failed here
+# (rc_env.throw / record_error of an invariant): every caller checks it and returns.
+
+import ast
+import rc_hir
+import rc_env
+import rc_sem
+import rc_build
+import rc_diags
+import rc_diags_hand
+import rc_ent
+import scan
+from scan import T_ASSIGN, T_COMMA, T_AND, T_OR, T_QQ, T_INC, T_DEC, T_PLUS, T_MINUS, T_BANG, T_TILDE, T_EQ3
+from rc_hir import Sp, Place, Instruction, InstrValue, Terminal, LValue, Elem, PropKey, ObjProp, Pattern, PropLit, Prim, TemplateQuasi, JsxAttr, NonLocal, HirFunction, Param, Directive, Case
+from rc_env import Env, Diag
+from rc_build import Ctx, Builder, LocIndex, VarBinding, Wip
+
+# ---- small helpers over the tree
+
+fn nk(c: Ctx, n: Int) -> Int:
+  if n <= 0: return 0
+  return c.t.nd[n].k
+
+fn spn(c: Ctx, n: Int) -> Sp:
+  if n <= 0: return rc_hir.nosp()
+  return Sp(c.t.nd[n].pos, c.t.nd[n].end)
+
+fn nm(c: Ctx, n: Int) -> Str:
+  let s = c.t.nd[n].s
+  if s < 0: return ""
+  return c.t.names[s] + ""
+
+fn sym_name(c: Ctx, y: Int) -> Str:
+  return c.t.names[c.m.yn[y]] + ""
+
+fn items(c: Ctx, l: Int) -> [Int]:
+  if l <= 0: return []
+  return ast.items(c.t, l)
+
+fn nosp() -> Sp:
+  return rc_hir.nosp()
+
+# the reference an identifier node is (-1 none) and the symbol it resolves to (-1 global)
+fn ref_id(c: Ctx, n: Int) -> Int:
+  return c.m.ref_of.get(n, -1)
+
+fn ref_sym(c: Ctx, n: Int) -> Int:
+  let r = c.m.ref_of.get(n, -1)
+  if r < 0: return -1
+  return c.m.rsym[r]
+
+# resolve_binding_identifier: the symbol, when this identifier is its first declaration
+fn bind_sym(c: Ctx, n: Int) -> Int:
+  let y = c.m.bind_of.get(n, -1)
+  if y >= 0 and c.m.yid[y] == n: return y
+  return -1
+
+# resolve_declared_binding: any declaration's symbol
+fn declared_sym(c: Ctx, n: Int) -> Int:
+  return c.m.bind_of.get(n, -1)
+
+# an identifier's own span (a shorthand property's name)
+fn id_sp(c: Ctx, n: Int) -> Sp:
+  let nd = c.t.nd[n]
+  if nd.k == ast.N_SHORTHAND: return Sp(nd.pos, nd.pos + nm(c, n).len)
+  return Sp(nd.pos, nd.end)
+
+# a function's or class's name span
+fn fn_name_sp(c: Ctx, n: Int) -> Sp:
+  var kw = "function"
+  let k = nk(c, n)
+  if k == ast.N_CLASS or k == ast.N_CLASSEXPR: kw = "class"
+  let p = rc_sem.name_pos(c.t, c.src, n, kw)
+  return Sp(p, p + nm(c, n).len)
+
+fn is_type_node(k: Int) -> Bool:
+  return k >= ast.N_TREF and k <= ast.N_TREST and k != ast.N_TSPAN
+
+fn without_parens(c: Ctx, n: Int) -> Int:
+  var x = n
+  while nk(c, x) == ast.N_PAREN: x = c.t.nd[x].a
+  return x
+
+# get_inner_expression: through parentheses and TypeScript wrappers
+fn inner_expr(c: Ctx, n: Int) -> Int:
+  var x = n
+  while true:
+    let k = nk(c, x)
+    if k == ast.N_PAREN or k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_NONNULL or k == ast.N_TYPEASSERT or k == ast.N_EXPRTARGS: x = c.t.nd[x].a
+    else: return x
+  return x
+
+fn is_member(c: Ctx, n: Int) -> Bool:
+  let k = nk(c, n)
+  return k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS
+
+fn is_private_member(c: Ctx, n: Int) -> Bool:
+  return nk(c, n) == ast.N_PROPACCESS and (c.t.nd[n].f & 4) != 0
+
+# a member's property name span (N_PROPACCESS keeps where its name starts in d)
+fn prop_sp(c: Ctx, n: Int) -> Sp:
+  let nd = c.t.nd[n]
+  if nd.d >= 0: return Sp(nd.d, nd.end)
+  return Sp(nd.end - nm(c, n).len, nd.end)
+
+# a numeric literal's value
+fn num_value(s0: Str) -> Float:
+  let s = s0.replace("_", "")
+  if s.len > 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X' or s[1] == 'o' or s[1] == 'O' or s[1] == 'b' or s[1] == 'B'):
+    var base = 16.0
+    if s[1] == 'o' or s[1] == 'O': base = 8.0
+    if s[1] == 'b' or s[1] == 'B': base = 2.0
+    var v = 0.0
+    for i in 2..s.len: v = v * base + float(scan.hexval(s[i]))
+    return v
+  if s.len > 1 and s[0] == '0' and s[1] >= '0' and s[1] <= '7':
+    var octal = true
+    for i in 1..s.len:
+      if s[i] < '0' or s[i] > '7': octal = false
+    if octal:
+      var v = 0.0
+      for i in 1..s.len: v = v * 8.0 + float(scan.hexval(s[i]))
+      return v
+  return float(s) else 0.0
+
+fn num_of(c: Ctx, n: Int) -> Float:
+  return num_value(nm(c, n))
+
+# Rust's `{}` for an f64 (an integral value has no fraction)
+fn fmt_num(v: Float) -> Str:
+  if v != v: return "NaN"
+  if v > 1.0e300 * 1.0e300: return "inf"
+  if v < 0.0 - 1.0e300 * 1.0e300: return "-inf"
+  if v < 9.0e15 and v > -9.0e15 and v == float(int(v)): return "{int(v)}"
+  return "{v}"
+
+fn prim(kind: Int) -> Prim:
+  return Prim(kind, false, 0.0, "")
+
+fn prim_undefined() -> Prim:
+  return prim(1)
+
+fn prim_bool(b: Bool) -> Prim:
+  return Prim(2, b, 0.0, "")
+
+fn prim_num(v: Float) -> Prim:
+  return Prim(3, false, v, "")
+
+fn prim_str(s: Str) -> Prim:
+  return Prim(4, false, 0.0, s)
+
+fn plit_str(s: Str) -> PropLit:
+  return PropLit(false, s, 0.0)
+
+fn plcopy(p: PropLit) -> PropLit:
+  return PropLit(p.is_num, p.s + "", p.num)
+
+fn plit_num(v: Float) -> PropLit:
+  return PropLit(true, fmt_num(v), v)
+
+fn pl(id: Int, sp: Sp) -> Place:
+  return Place(id, rc_hir.EF_UNKNOWN, false, sp)
+
+fn noplace() -> Place:
+  return Place(-1, rc_hir.EF_UNKNOWN, false, nosp())
+
+fn value_sp(v: InstrValue) -> Sp:
+  match v:
+    LoadLocal(_, sp): return sp
+    LoadContext(_, sp, _): return sp
+    DeclareLocal(_, sp): return sp
+    DeclareContext(_, sp): return sp
+    StoreLocal(_, _, sp): return sp
+    StoreContext(_, _, sp): return sp
+    Destructure(_, _, _, sp): return sp
+    Primitive(_, sp): return sp
+    JSXText(_, sp): return sp
+    BinaryExpression(_, _, _, sp): return sp
+    NewExpression(_, _, sp): return sp
+    CallExpression(_, _, sp): return sp
+    MethodCall(_, _, _, sp): return sp
+    UnaryExpression(_, _, sp): return sp
+    TypeCastExpression(_, _, _, sp): return sp
+    JsxExpression(_, _, _, _, _, _, sp, _, _, _, _): return sp
+    ObjectExpression(_, sp): return sp
+    ObjectMethod(sp, _): return sp
+    ArrayExpression(_, sp): return sp
+    JsxFragment(_, sp, _, _): return sp
+    RegExpLiteral(_, _, sp): return sp
+    MetaProperty(_, _, sp): return sp
+    PropertyStore(_, _, _, _, _, sp): return sp
+    PropertyLoad(_, _, _, _, sp): return sp
+    PropertyDelete(_, _, _, sp): return sp
+    ComputedStore(_, _, _, sp): return sp
+    ComputedLoad(_, _, sp): return sp
+    ComputedDelete(_, _, sp): return sp
+    LoadGlobal(_, sp): return sp
+    StoreGlobal(_, _, sp): return sp
+    FunctionExpression(_, _, _, _, _, sp): return sp
+    TaggedTemplateExpression(_, _, _, _, sp): return sp
+    TemplateLiteral(_, _, sp): return sp
+    Await(_, sp): return sp
+    GetIterator(_, sp): return sp
+    IteratorNext(_, _, sp): return sp
+    NextPropertyOf(_, sp): return sp
+    PrefixUpdate(_, _, _, sp): return sp
+    PostfixUpdate(_, _, _, sp): return sp
+    Debugger(sp): return sp
+    TSEnumDeclaration(_, sp): return sp
+    StartMemoize(_, _, _, _, _, _, sp): return sp
+    FinishMemoize(_, _, _, sp): return sp
+
+# ---- the identifier index (identifier_loc_index.rs): the references and declarations a walk of
+# the compiled function meets (class bodies and TypeScript declarations aside)
+
+fn loc_ref(c: Ctx, var x: LocIndex, n: Int, open: Sp, td: Int):
+  let r = ref_id(c, n)
+  if r < 0 or r in x.rspan_s: return
+  let s = id_sp(c, n)
+  x.rspan_s[r] = s.s
+  x.rspan_e[r] = s.e
+  x.rjsx_s[r] = open.s
+  x.rjsx_e[r] = open.e
+  x.rtype[r] = td > 0
+
+fn loc_decl(c: Ctx, var x: LocIndex, n: Int, sp: Sp):
+  let y = c.m.bind_of.get(n, -1)
+  if y < 0 or y in x.dspan_s: return
+  x.dspan_s[y] = sp.s
+  x.dspan_e[y] = sp.e
+
+# a node's children, in order (fields that hold something else left out)
+fn kids(c: Ctx, n: Int) -> [Int]:
+  let nd = c.t.nd[n]
+  let k = nd.k
+  if k == ast.N_LIST: return items(c, n)
+  if k == ast.N_ID or k == ast.N_STR or k == ast.N_NUM or k == ast.N_BIGINT or k == ast.N_REGEX or k == ast.N_NOSUBTEMPL or k == ast.N_JSXTEXT or k == ast.N_THIS or k == ast.N_SUPER or k == ast.N_TRUE or k == ast.N_FALSE or k == ast.N_NULL: return []
+  if k == ast.N_BINARY or k == ast.N_ELEMACCESS: return [nd.a, nd.b]
+  if k == ast.N_PREFIX or k == ast.N_POSTFIX or k == ast.N_PROPACCESS or k == ast.N_QNAME or k == ast.N_VAR or k == ast.N_PAREN or k == ast.N_SPREAD or k == ast.N_NONNULL or k == ast.N_AWAIT or k == ast.N_TYPEOF or k == ast.N_VOIDEXPR or k == ast.N_DELETE or k == ast.N_RETURN or k == ast.N_THROW or k == ast.N_EXPRSTMT or k == ast.N_TSPAN or k == ast.N_LABEL: return [nd.a]
+  if k == ast.N_SHORTHAND: return [nd.b]
+  if k == ast.N_INTERFACE or k == ast.N_TYPEALIAS: return [nd.a, nd.b, nd.c]
+  return [nd.a, nd.b, nd.c, nd.d]
+
+fn loc_walk(c: Ctx, var x: LocIndex, n: Int, td0: Int):
+  if n <= 0: return
+  let nd = c.t.nd[n]
+  let k = nd.k
+  var td = td0
+  if is_type_node(k): td += 1
+  if k == ast.N_ID:
+    loc_ref(c, &x, n, nosp(), td)
+    if td == 0: loc_decl(c, &x, n, spn(c, n))
+    return
+  if k == ast.N_SHORTHAND:
+    loc_ref(c, &x, n, nosp(), td)
+    loc_walk(c, &x, nd.b, td)
+    return
+  if k == ast.N_INTERFACE or k == ast.N_TYPEALIAS or k == ast.N_ENUM or k == ast.N_MODULE: return
+  if k == ast.N_CLASS or k == ast.N_CLASSEXPR:
+    if nd.s >= 0: loc_decl(c, &x, n, fn_name_sp(c, n))
+    loc_walk(c, &x, nd.a, td + 1)
+    if nd.b > 0 and nk(c, nd.b) == ast.N_EXPRTARGS: loc_walk(c, &x, c.t.nd[nd.b].b, td + 1)
+    loc_walk(c, &x, nd.c, td + 1)
+    return
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR:
+    if nd.s >= 0 and td == 0: loc_decl(c, &x, n, fn_name_sp(c, n))
+    loc_walk(c, &x, nd.a, td + 1)
+    loc_walk(c, &x, nd.b, td)
+    loc_walk(c, &x, nd.c, td + 1)
+    loc_walk(c, &x, nd.d, td)
+    return
+  if k == ast.N_PROPACCESS:
+    loc_walk(c, &x, nd.a, td)
+    return
+  if k == ast.N_PROPASSIGN:
+    if nk(c, nd.a) == ast.N_COMPUTED: loc_walk(c, &x, nd.a, td)
+    loc_walk(c, &x, nd.b, td)
+    return
+  if k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET:
+    if nk(c, nd.a) == ast.N_COMPUTED: loc_walk(c, &x, nd.a, td)
+    let sig = nd.b
+    if sig > 0:
+      loc_walk(c, &x, c.t.nd[sig].a, td + 1)
+      loc_walk(c, &x, c.t.nd[sig].b, td)
+      loc_walk(c, &x, c.t.nd[sig].c, td + 1)
+    loc_walk(c, &x, nd.c, td)
+    return
+  if k == ast.N_BINDEL:
+    if nk(c, nd.a) == ast.N_COMPUTED: loc_walk(c, &x, nd.a, td)
+    loc_walk(c, &x, nd.b, td)
+    loc_walk(c, &x, nd.c, td)
+    return
+  if k == ast.N_JSXELEM:
+    var name = nd.a
+    if nk(c, name) == ast.N_EXPRTARGS:
+      loc_walk(c, &x, c.t.nd[name].b, td + 1)
+      name = c.t.nd[name].a
+    loc_jsx_name(c, &x, name, jsx_opening_sp(c, n), td)
+    for at in items(c, nd.b):
+      if nk(c, at) == ast.N_JSXATTR:
+        let v = c.t.nd[at].b
+        if nk(c, v) == ast.N_JSXEXPR or nk(c, v) == ast.N_JSXELEM: loc_walk(c, &x, v, td)
+      else: loc_walk(c, &x, c.t.nd[at].a, td)
+    loc_walk(c, &x, nd.c, td)
+    return
+  for ch in kids(c, n): loc_walk(c, &x, ch, td)
+
+fn loc_jsx_name(c: Ctx, var x: LocIndex, n: Int, open: Sp, td: Int):
+  let k = nk(c, n)
+  if k == ast.N_ID: loc_ref(c, &x, n, open, td)
+  elif k == ast.N_PROPACCESS: loc_jsx_name(c, &x, c.t.nd[n].a, open, td)
+
+# the opening element's span: up to its children (or the whole self-closing element)
+fn jsx_opening_sp(c: Ctx, n: Int) -> Sp:
+  let nd = c.t.nd[n]
+  if nd.c > 0: return Sp(nd.pos, c.t.nd[nd.c].pos)
+  return Sp(nd.pos, nd.end)
+
+fn jsx_closing_sp(c: Ctx, n: Int) -> Sp:
+  let nd = c.t.nd[n]
+  if nd.c > 0: return Sp(c.t.nd[nd.c].end, nd.end)
+  return nosp()
+
+# FunctionNode: the parts of a function, arrow or object method being lowered
+type FnParts:
+  node: Int
+  params: Int          # list of N_PARAM
+  body: Int
+  expr_body: Bool
+  generator: Bool
+  is_async: Bool
+  sp: Sp
+  has_id: Bool
+  id: Str
+  id_sp: Sp
+  tparams: Int
+  ret: Int
+
+fn fn_parts(c: Ctx, n: Int) -> FnParts:
+  let nd = c.t.nd[n]
+  let k = nd.k
+  let gen = (nd.f & ast.M_GENERATOR) != 0
+  let asy = (nd.f & ast.M_ASYNC) != 0
+  if k == ast.N_ARROW:
+    let expr = nd.d > 0 and nk(c, nd.d) != ast.N_BLOCK
+    return FnParts(n, nd.b, nd.d, expr, false, asy, spn(c, n), false, "", nosp(), nd.a, nd.c)
+  if k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET:
+    let sig = nd.b
+    var ps = -1
+    var tp = -1
+    var rt = -1
+    if sig > 0:
+      ps = c.t.nd[sig].b
+      tp = c.t.nd[sig].a
+      rt = c.t.nd[sig].c
+    return FnParts(n, ps, nd.c, false, gen, asy, spn(c, n), false, "", nosp(), tp, rt)
+  var has_id = nd.s >= 0
+  var idsp = nosp()
+  if has_id: idsp = fn_name_sp(c, n)
+  return FnParts(n, nd.b, nd.d, false, gen, asy, spn(c, n), has_id, nm(c, n), idsp, nd.a, nd.c)
+
+fn build_identifier_loc_index(c: Ctx, f: FnParts) -> LocIndex:
+  var x = LocIndex()
+  let k = nk(c, f.node)
+  if (k == ast.N_FUNC or k == ast.N_FUNCEXPR) and f.has_id: loc_decl(c, &x, f.node, f.id_sp)
+  loc_walk(c, &x, f.tparams, 1)
+  loc_walk(c, &x, f.params, 0)
+  loc_walk(c, &x, f.ret, 1)
+  loc_walk(c, &x, f.body, 0)
+  return x
+
+fn loc_has(x: LocIndex, r: Int) -> Bool:
+  return r in x.rspan_s
+
+fn loc_sp(x: LocIndex, r: Int) -> Sp:
+  return Sp(x.rspan_s[r], x.rspan_e[r])
+
+fn loc_is_jsx(x: LocIndex, r: Int) -> Bool:
+  return x.rjsx_s.get(r, -1) >= 0
+
+# ---- context identifiers (find_context_identifiers.rs): locals reassigned inside a nested
+# function, or reassigned and referenced from one
+
+type CtxInfo:
+  reassigned: {Int: Bool} = {}
+  by_inner: {Int: Bool} = {}
+  ref_inner: {Int: Bool} = {}
+  fns: [Int] = []           # the function scopes being walked into
+
+# is_captured_by_function: the binding's scope strictly encloses the function's
+fn is_captured_by_function(c: Ctx, binding_scope: Int, fn_scope: Int) -> Bool:
+  var x = c.m.spar[fn_scope]
+  while x >= 0:
+    if x == binding_scope: return true
+    x = c.m.spar[x]
+  return false
+
+fn ctx_captured(c: Ctx, var ci: CtxInfo, y: Int):
+  if y < 0 or ci.fns.len == 0: return
+  if is_captured_by_function(c, rc_sem.symbol_scope(c.m, y), ci.fns[ci.fns.len - 1]): ci.ref_inner[y] = true
+
+# handle_reassignment_identifier: the name from the scope the assignment is in
+fn ctx_reassign(c: Ctx, var ci: CtxInfo, n: Int):
+  let r = ref_id(c, n)
+  if r < 0: return
+  let y = rc_sem.find_binding(c.m, c.m.rsc[r], c.t.nd[n].s)
+  if y < 0: return
+  ci.reassigned[y] = true
+  if ci.fns.len > 0 and is_captured_by_function(c, rc_sem.symbol_scope(c.m, y), ci.fns[ci.fns.len - 1]): ci.by_inner[y] = true
+
+# an assignment target's reassigned names
+fn ctx_target(c: Ctx, var ci: CtxInfo, n: Int):
+  let k = nk(c, n)
+  if k == ast.N_ID: ctx_reassign(c, &ci, n)
+  elif k == ast.N_PAREN or k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_NONNULL or k == ast.N_TYPEASSERT:
+    let x = inner_expr(c, n)
+    if nk(c, x) == ast.N_ID: ctx_reassign(c, &ci, x)
+  elif k == ast.N_ARRAY:
+    for el in items(c, c.t.nd[n].a):
+      let ek = nk(c, el)
+      if ek == ast.N_OMIT: continue
+      if ek == ast.N_SPREAD: ctx_target(c, &ci, c.t.nd[el].a)
+      elif ek == ast.N_BINARY and c.t.nd[el].f == T_ASSIGN: ctx_target(c, &ci, c.t.nd[el].a)
+      else: ctx_target(c, &ci, el)
+  elif k == ast.N_OBJECT:
+    for p in items(c, c.t.nd[n].a):
+      let pk = nk(c, p)
+      if pk == ast.N_SHORTHAND: ctx_reassign(c, &ci, p)
+      elif pk == ast.N_PROPASSIGN:
+        let v = c.t.nd[p].b
+        if nk(c, v) == ast.N_BINARY and c.t.nd[v].f == T_ASSIGN: ctx_target(c, &ci, c.t.nd[v].a)
+        else: ctx_target(c, &ci, v)
+      elif pk == ast.N_SPREAD: ctx_target(c, &ci, c.t.nd[p].a)
+
+fn ctx_walk(c: Ctx, var ci: CtxInfo, n: Int):
+  if n <= 0: return
+  let nd = c.t.nd[n]
+  let k = nd.k
+  if is_type_node(k): return
+  if k == ast.N_ID or k == ast.N_SHORTHAND:
+    let r = ref_id(c, n)
+    if r >= 0: ctx_captured(c, &ci, c.m.rsym[r])
+    if k == ast.N_ID: ctx_captured(c, &ci, bind_sym(c, n))
+    if k == ast.N_SHORTHAND: ctx_walk(c, &ci, nd.b)
+    return
+  if k == ast.N_CLASS or k == ast.N_CLASSEXPR or k == ast.N_ENUM or k == ast.N_MODULE or k == ast.N_INTERFACE or k == ast.N_TYPEALIAS: return
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or ((k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET) and c.m.objm.get(n, false)):
+    let f = fn_parts(c, n)
+    let s = c.m.scope_of.get(n, -1)
+    if (k == ast.N_METHOD or k == ast.N_GET or k == ast.N_SET) and nk(c, nd.a) == ast.N_COMPUTED: ctx_walk(c, &ci, nd.a)
+    if s >= 0: ci.fns.push(s)
+    ctx_walk(c, &ci, f.params)
+    ctx_walk(c, &ci, f.body)
+    if s >= 0: ci.fns.pop()
+    return
+  if k == ast.N_BINARY and nd.f >= T_ASSIGN and nd.f <= scan.T_QQEQ:
+    ctx_target(c, &ci, nd.a)
+  elif (k == ast.N_PREFIX or k == ast.N_POSTFIX) and (nd.f == T_INC or nd.f == T_DEC):
+    let x = inner_expr(c, nd.a)
+    if nk(c, x) == ast.N_ID: ctx_reassign(c, &ci, x)
+  if k == ast.N_PROPACCESS:
+    ctx_walk(c, &ci, nd.a)
+    return
+  if k == ast.N_PROPASSIGN:
+    if nk(c, nd.a) == ast.N_COMPUTED: ctx_walk(c, &ci, nd.a)
+    ctx_walk(c, &ci, nd.b)
+    return
+  if k == ast.N_BINDEL:
+    if nk(c, nd.a) == ast.N_COMPUTED: ctx_walk(c, &ci, nd.a)
+    ctx_walk(c, &ci, nd.b)
+    ctx_walk(c, &ci, nd.c)
+    return
+  if k == ast.N_JSXELEM:
+    var name = nd.a
+    if nk(c, name) == ast.N_EXPRTARGS: name = c.t.nd[name].a
+    ctx_jsx_name(c, &ci, name)
+    for at in items(c, nd.b):
+      if nk(c, at) == ast.N_JSXATTR:
+        let v = c.t.nd[at].b
+        if nk(c, v) == ast.N_JSXEXPR or nk(c, v) == ast.N_JSXELEM: ctx_walk(c, &ci, v)
+      else: ctx_walk(c, &ci, c.t.nd[at].a)
+    ctx_walk(c, &ci, nd.c)
+    return
+  if k == ast.N_DECL or k == ast.N_PARAM:
+    ctx_walk(c, &ci, nd.a)
+    ctx_walk(c, &ci, nd.c)
+    return
+  if k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_TYPEASSERT or k == ast.N_EXPRTARGS:
+    ctx_walk(c, &ci, nd.a)
+    return
+  if k == ast.N_CALL or k == ast.N_NEW:
+    ctx_walk(c, &ci, nd.a)
+    ctx_walk(c, &ci, nd.c)
+    return
+  if k == ast.N_TAGGED:
+    ctx_walk(c, &ci, nd.a)
+    ctx_walk(c, &ci, nd.c)
+    return
+  for ch in kids(c, n): ctx_walk(c, &ci, ch)
+
+fn ctx_jsx_name(c: Ctx, var ci: CtxInfo, n: Int):
+  let k = nk(c, n)
+  if k == ast.N_ID:
+    let r = ref_id(c, n)
+    if r >= 0: ctx_captured(c, &ci, c.m.rsym[r])
+  elif k == ast.N_PROPACCESS: ctx_jsx_name(c, &ci, c.t.nd[n].a)
+
+# the function scopes around a reference, innermost first
+fn containing_function_scopes(c: Ctx, r: Int) -> [Int]:
+  var out: [Int] = []
+  var x = c.m.rsc[r]
+  while x >= 0:
+    if rc_sem.scope_kind(c.m, x) == rc_sem.SK_FUNCTION: out.push(x)
+    x = c.m.spar[x]
+  return out
+
+fn find_context_identifiers(c: Ctx, f: FnParts, idx: LocIndex) -> {Int: Bool}:
+  var ci = CtxInfo()
+  ctx_walk(c, &ci, f.params)
+  ctx_walk(c, &ci, f.body)
+  var ys: [Int] = []
+  for y in ci.reassigned:
+    if not ci.ref_inner.get(y, false): ys.push(y)
+  for y in ys:
+    let bs = rc_sem.symbol_scope(c.m, y)
+    var found = false
+    for r in c.m.yrefs[y]:
+      if found: break
+      if not loc_has(idx, r): continue
+      for fs in containing_function_scopes(c, r):
+        if is_captured_by_function(c, bs, fs):
+          found = true
+          break
+    if found: ci.ref_inner[y] = true
+  var out: {Int: Bool} = {}
+  for y in ci.reassigned:
+    if ci.by_inner.get(y, false) or ci.ref_inner.get(y, false): out[y] = true
+  for y in ci.by_inner: out[y] = true
+  return out
+
+# ---- builder helpers (hir_builder.rs) that need the tree
+
+fn rec(var e: Env, own d: Diag) -> Bool:
+  return rc_env.record_error(&e, d)
+
+fn find_binding_in_descendants(c: Ctx, name: Int, ancestor: Int) -> Int:
+  for s in 0..c.m.sf.len:
+    if not rc_sem.is_descendant(c.m, s, ancestor): continue
+    let y = rc_sem.get_binding(c.m, s, name)
+    if y >= 0: return y
+  return -1
+
+fn set_identifier_declaration_span(var e: Env, id: Int, sp: Sp):
+  e.identifiers[id].sp = sp
+
+# lower_value_to_temporary: a load of an unnamed temporary is that temporary
+fn lower_value_to_temporary(var b: Builder, var e: Env, own v: InstrValue) -> Place:
+  var direct = noplace()
+  match v:
+    LoadLocal(p, _): direct = p
+    _: direct = noplace()
+  if direct.identifier >= 0 and e.identifiers[direct.identifier].name_kind == 0: return direct
+  let sp = value_sp(v)
+  let place = rc_build.temp_place(&e, sp)
+  rc_build.push(&b, &e, Instruction(0, place, v, sp, [], false))
+  return place
+
+fn lower_expression_to_temporary(c: Ctx, var b: Builder, var e: Env, n: Int) -> Place:
+  let v = lower_expression(c, &b, &e, n)
+  if e.failed: return noplace()
+  return lower_value_to_temporary(&b, &e, v)
+
+fn undefined_value(sp: Sp) -> InstrValue:
+  return rc_hir.Primitive(prim_undefined(), sp)
+
+fn goto(block: Int, variant: Int, sp: Sp) -> Terminal:
+  return rc_hir.Goto(block, variant, 0, sp)
+
+fn cur_kind(b: Builder) -> Int:
+  return b.cur_kind
+
+# FunctionNode::diagnostic_span
+fn function_diag_span(c: Ctx, n: Int) -> Sp:
+  let nd = c.t.nd[n]
+  if nd.k == ast.N_ARROW:
+    var end = nd.end
+    let body = nd.d
+    if body > 0:
+      if nk(c, body) == ast.N_BLOCK: end = c.t.nd[body].pos + 1
+      else: end = c.t.nd[body].pos
+    if end > nd.end: end = nd.end
+    return Sp(nd.pos, end)
+  if nd.s >= 0: return fn_name_sp(c, n)
+  var end = nd.end
+  if nd.d > 0: end = c.t.nd[nd.d].pos + 1
+  elif nd.b > 0: end = c.t.nd[nd.b].end
+  if end > nd.end: end = nd.end
+  return Sp(nd.pos, end)
+
+# ---- lower (build_hir.rs `lower`, `lower_inner`)
+
+type Inner:
+  func: HirFunction
+  used_names: [Str]
+  used_syms: [Int]
+  bind_syms: [Int]
+  bind_ids: [Int]
+
+# the parent's bindings and names, the function's context (symbol -> where it's first referenced)
+type Parent:
+  bind_syms: [Int]
+  bind_ids: [Int]
+  used_names: [Str]
+  used_syms: [Int]
+  ctx_syms: [Int]
+  ctx_sp: [Sp]
+
+fn empty_hir_function() -> HirFunction:
+  return HirFunction(nosp(), nosp(), "", false, nosp(), false, noplace(), "", rc_hir.FN_OTHER, [], noplace(), [], rc_hir.HIR(0, [], {}), [], false, false, [], false, [])
+
+fn failed_inner() -> Inner:
+  return Inner(empty_hir_function(), [], [], [], [])
+
+fn lower(c: Ctx, var e: Env, n: Int) -> HirFunction:
+  let f = fn_parts(c, n)
+  let scope = c.m.scope_of.get(n, 0)
+  var idx = build_identifier_loc_index(c, f)
+  let ctx_ids = find_context_identifiers(c, f, idx)
+  let par = Parent([], [], [], [], [], [])
+  var r = lower_inner(c, &e, f, par, scope, scope, ctx_ids, true, &idx)
+  var out = empty_hir_function()
+  swap(&out, &r.func)
+  return out
+
+# a body's directives ("use memo"...) and the statements after them
+fn directive_count(c: Ctx, stmts: [Int]) -> Int:
+  var i = 0
+  while i < stmts.len:
+    let s = stmts[i]
+    if nk(c, s) != ast.N_EXPRSTMT or nk(c, c.t.nd[s].a) != ast.N_STR: break
+    i += 1
+  return i
+
+# (idx is lent to the function's builder and given back)
+fn lower_inner(c: Ctx, var e: Env, f: FnParts, par: Parent, function_scope: Int, component_scope: Int, context_ids: {Int: Bool}, is_top: Bool, var idx: LocIndex) -> Inner:
+  var cids: {Int: Bool} = {}
+  for y in context_ids: cids[y] = true
+  var b = rc_build.new_builder(&e, function_scope, component_scope, cids, rc_hir.BK_BLOCK, LocIndex())
+  swap(&b.idx, &idx)
+  for i in 0..par.bind_syms.len: rc_build.add_bind(&b, par.bind_syms[i], par.bind_ids[i])
+  for i in 0..par.used_names.len: rc_build.add_used(&b, par.used_names[i], par.used_syms[i])
+  for i in 0..par.ctx_syms.len:
+    b.ctx_syms.push(par.ctx_syms[i])
+    b.ctx_sp.push(par.ctx_sp[i])
+  var context: [Place] = []
+  for i in 0..b.ctx_syms.len:
+    let y = b.ctx_syms[i]
+    let id = rc_build.resolve_binding(&b, &e, c, sym_name(c, y), y, nosp())
+    if e.failed: return failed_inner()
+    context.push(pl(id, b.ctx_sp[i]))
+  var has_self = false
+  var self_binding = noplace()
+  if f.has_id:
+    let y = rc_sem.get_binding(c.m, function_scope, c.t.nd[f.node].s)
+    if y >= 0 and c.m.ydk[y] == rc_sem.DK_FUNCTION_EXPR and c.m.yrefs[y].len > 0:
+      let id = rc_build.resolve_binding(&b, &e, c, f.id, y, f.id_sp)
+      if e.failed: return failed_inner()
+      has_self = true
+      self_binding = pl(id, f.id_sp)
+  var hir_params: [Param] = []
+  for p in items(c, f.params):
+    if nk(c, p) != ast.N_PARAM or rc_sem.is_this_param(c.t, p): continue
+    let pd = c.t.nd[p]
+    let pat = pd.a
+    if (pd.f & ast.M_REST) != 0:
+      let rest_sp = spn(c, p)
+      let place = rc_build.temp_place(&e, rest_sp)
+      hir_params.push(Param(true, place, rest_sp))
+      lower_binding_assignment(c, &b, &e, rest_sp, rc_hir.IK_LET, pat, place, style_for_binding(c, pat))
+      if e.failed: return failed_inner()
+      continue
+    if pd.c <= 0 and nk(c, pat) == ast.N_ID:
+      let name = nm(c, pat)
+      let psp = spn(c, pat)
+      if rc_build.is_always_reserved(name):
+        rc_env.throw(&e, rc_diags.reserved_identifier(name, psp))
+        return failed_inner()
+      var bnd = rc_build.resolve_identifier(&b, &e, c, name, psp, bind_sym(c, pat))
+      if e.failed: return failed_inner()
+      if bnd.kind != 0:
+        let y = find_binding_in_descendants(c, c.t.nd[pat].s, b.function_scope)
+        if y >= 0:
+          let bk = rc_sem.binding_kind(c.m, y)
+          let id = rc_build.resolve_binding(&b, &e, c, name, y, psp)
+          if e.failed: return failed_inner()
+          bnd = VarBinding(0, id, bk, name, "", "")
+      if bnd.kind == 0:
+        set_identifier_declaration_span(&e, bnd.id, psp)
+        hir_params.push(Param(false, pl(bnd.id, psp), psp))
+      else:
+        rc_env.record_diagnostic(&e, rc_diags.missing_parameter_binding(name, psp))
+      continue
+    let psp = spn(c, p)
+    let place = rc_build.temp_place(&e, psp)
+    rc_build.promote_temporary(&e, place.identifier)
+    hir_params.push(Param(false, pl(place.identifier, nosp()), psp))
+    var value = place
+    if pd.c > 0:
+      value = lower_default_to_temp(c, &b, &e, psp, pd.c, place)
+      if e.failed: return failed_inner()
+    lower_binding_assignment(c, &b, &e, psp, rc_hir.IK_LET, pat, value, style_for_binding(c, pat))
+    if e.failed: return failed_inner()
+  var body_sp = nosp()
+  var directives: [Directive] = []
+  if f.expr_body:
+    let ft = rc_build.reserve(&e)
+    let value = lower_expression_to_temporary(c, &b, &e, f.body)
+    if e.failed: return failed_inner()
+    rc_build.terminate_with_continuation(&b, rc_hir.Return(value, rc_hir.RV_IMPLICIT, 0, nosp(), [], false), ft, rc_hir.BK_BLOCK)
+  elif f.body > 0:
+    body_sp = spn(c, f.body)
+    let stmts = items(c, c.t.nd[f.body].a)
+    let nd = directive_count(c, stmts)
+    var rest: [Int] = []
+    for i in 0..stmts.len:
+      let s = stmts[i]
+      if i < nd:
+        let str = c.t.nd[s].a
+        let ssp = spn(c, str)
+        var raw = ""
+        if ssp.e - ssp.s >= 2: raw = c.src[ssp.s + 1..ssp.e - 1]
+        directives.push(Directive(nm(c, str), raw, spn(c, s), ssp))
+      else: rest.push(s)
+    lower_block_inner(c, &b, &e, rest, -1, function_scope, -1)
+    if e.failed: return failed_inner()
+  let ret = lower_value_to_temporary(&b, &e, undefined_value(nosp()))
+  rc_build.terminate(&b, &e, rc_hir.Return(ret, rc_hir.RV_VOID, 0, nosp(), [], false), -1)
+  var built = rc_build.build(&b, &e)
+  if e.failed: return failed_inner()
+  let returns = rc_build.create_temporary_place(&e, f.sp)
+  var fn_type = rc_hir.FN_OTHER
+  if is_top: fn_type = e.fn_type
+  var body = rc_hir.HIR(0, [], {})
+  swap(&body, &built.hir)
+  var instrs: [Instruction] = []
+  swap(&instrs, &built.instrs)
+  let func = HirFunction(f.sp, body_sp, f.id, f.has_id, f.id_sp, has_self, self_binding, "", fn_type, hir_params, returns, context, body, instrs, f.generator, f.is_async, directives, false, [])
+  var un: [Str] = []
+  swap(&un, &b.used_names)
+  var us: [Int] = []
+  swap(&us, &b.used_syms)
+  var bs: [Int] = []
+  swap(&bs, &b.bind_syms)
+  var bi: [Int] = []
+  swap(&bi, &b.bind_ids)
+  swap(&b.idx, &idx)
+  return Inner(func, un, us, bs, bi)
+
+# lower_identifier: a local's place, or a LoadGlobal of what it names
+fn lower_identifier(c: Ctx, var b: Builder, var e: Env, name: Str, sp: Sp, y: Int) -> Place:
+  let bnd = rc_build.resolve_identifier(&b, &e, c, name, sp, y)
+  if e.failed: return noplace()
+  if bnd.kind == 0: return pl(bnd.id, sp)
+  var nl = NonLocal(rc_hir.NL_GLOBAL, name, "", "")
+  if bnd.kind == 1:
+    if name == "eval":
+      if not rec(&e, rc_diags.unsupported_eval(sp)): return noplace()
+    elif name == "arguments":
+      if not rec(&e, rc_diags.unsupported_implicit_arguments(sp)): return noplace()
+  elif bnd.kind == 2: nl = NonLocal(rc_hir.NL_IMPORT_DEFAULT, name, bnd.module, "")
+  elif bnd.kind == 3: nl = NonLocal(rc_hir.NL_IMPORT_SPECIFIER, name, bnd.module, bnd.imported)
+  elif bnd.kind == 4: nl = NonLocal(rc_hir.NL_IMPORT_NAMESPACE, name, bnd.module, "")
+  else: nl = NonLocal(rc_hir.NL_MODULE_LOCAL, name, "", "")
+  return lower_value_to_temporary(&b, &e, rc_hir.LoadGlobal(nl, sp))
+
+# ---- blocks (lower_block_statement_inner): hoisting of bindings referenced before their
+# declaration from a nested function (or function declarations referenced before)
+
+fn in_direct_statements(c: Ctx, decl_start: Int, stmts: [Int]) -> Bool:
+  if decl_start < 0: return false
+  for s in stmts:
+    let k = nk(c, s)
+    if k == ast.N_VAR or k == ast.N_FUNC or k == ast.N_CLASS:
+      if decl_start >= c.t.nd[s].pos and decl_start < c.t.nd[s].end: return true
+  return false
+
+fn collect_pattern_syms(c: Ctx, n: Int, var out: {Int: Bool}):
+  var ids: [Int] = []
+  rc_sem.bound_ids(c.t, n, &ids)
+  for idn in ids:
+    let y = declared_sym(c, idn)
+    if y >= 0: out[y] = true
+
+fn lower_block_statement(c: Ctx, var b: Builder, var e: Env, stmts: [Int], block_scope: Int, parent_scope: Int):
+  lower_block_inner(c, &b, &e, stmts, block_scope, -1, parent_scope)
+
+fn lower_block_inner(c: Ctx, var b: Builder, var e: Env, stmts: [Int], block_scope: Int, scope_override: Int, parent_scope: Int):
+  var sid = scope_override
+  if sid < 0: sid = block_scope
+  if sid < 0:
+    for s in stmts:
+      lower_statement(c, &b, &e, s, "", false, parent_scope)
+      if e.failed: return
+    return
+  var hs: [Int] = []
+  for y in rc_sem.bindings_with_child_blocks(c.m, sid):
+    if rc_sem.is_type_only(c.m, y): continue
+    let bk = rc_sem.binding_kind(c.m, y)
+    if bk == rc_sem.BK_PARAM or bk == rc_sem.BK_MODULE: continue
+    let dk = c.m.ydk[y]
+    if dk == rc_sem.DK_FUNCTION_EXPR or dk == rc_sem.DK_TYPE_ALIAS or dk == rc_sem.DK_ENUM: continue
+    hs.push(y)
+  if hs.len == 0:
+    for s in stmts:
+      lower_statement(c, &b, &e, s, "", false, sid)
+      if e.failed: return
+    return
+  let franges = rc_sem.function_scope_ranges(c.m, c.t)
+  var declared: {Int: Bool} = {}
+  for s in stmts:
+    let st = c.t.nd[s].pos
+    let en = c.t.nd[s].end
+    let is_fd = nk(c, s) == ast.N_FUNC
+    var nested: [Int] = []
+    if is_fd:
+      nested.push(st)
+      nested.push(en)
+    else:
+      var i = 0
+      while i + 1 < franges.len:
+        if franges[i] > st and franges[i] < en:
+          nested.push(franges[i])
+          nested.push(franges[i + 1])
+        i += 2
+    var wy: [Int] = []
+    var wsp: [Sp] = []
+    for y in hs:
+      if declared.get(y, false): continue
+      let bk = rc_sem.binding_kind(c.m, y)
+      var refs: [Sp] = []
+      for r in c.m.yrefs[y]:
+        if not loc_has(b.idx, r): continue
+        let rs = loc_sp(b.idx, r)
+        if rs.s < st or rs.s >= en: continue
+        if loc_is_jsx(b.idx, r): continue
+        refs.push(rs)
+      if bk == rc_sem.BK_HOISTED and not is_fd:
+        let ds = rc_build.decl_span(b, y)
+        if ds.s >= 0 and ds.s >= st and ds.s < en: refs.push(ds)
+      if refs.len == 0: continue
+      var first = refs[0]
+      for r in refs:
+        if r.s < first.s: first = r
+      var has_nested = false
+      var first_nested = Sp(-1, -1)
+      for r in refs:
+        var inside = false
+        var i = 0
+        while i + 1 < nested.len:
+          if r.s >= nested[i] and r.s < nested[i + 1]: inside = true
+          i += 2
+        if inside:
+          if not has_nested or r.s < first_nested.s: first_nested = r
+          has_nested = true
+      let is_hoisted_kind = bk == rc_sem.BK_HOISTED
+      if is_hoisted_kind or has_nested:
+        if rc_sem.symbol_scope(c.m, y) != sid and not in_direct_statements(c, c.m.yst[y], stmts): continue
+        wy.push(y)
+        if is_hoisted_kind: wsp.push(first)
+        else: wsp.push(first_nested)
+    # (sorted by the first reference)
+    var i = 1
+    while i < wy.len:
+      var j = i
+      while j > 0 and wsp[j].s < wsp[j - 1].s:
+        let ty = wy[j]
+        wy[j] = wy[j - 1]
+        wy[j - 1] = ty
+        let ts = wsp[j]
+        wsp[j] = wsp[j - 1]
+        wsp[j - 1] = ts
+        j -= 1
+      i += 1
+    for wi in 0..wy.len:
+      let y = wy[wi]
+      if e.hoisted.get(y, false): continue
+      let bk = rc_sem.binding_kind(c.m, y)
+      let dk = c.m.ydk[y]
+      var hk = rc_hir.IK_HOISTED_CONST
+      if bk == rc_sem.BK_CONST or bk == rc_sem.BK_VAR: hk = rc_hir.IK_HOISTED_CONST
+      elif bk == rc_sem.BK_LET: hk = rc_hir.IK_HOISTED_LET
+      elif bk == rc_sem.BK_HOISTED: hk = rc_hir.IK_HOISTED_FUNCTION
+      elif dk == rc_sem.DK_FUNCTION_DECL: hk = rc_hir.IK_HOISTED_FUNCTION
+      elif dk == rc_sem.DK_VAR_DECLARATOR:
+        if not rec(&e, rc_diags_hand.non_const_declaration_hoisting(sym_name(c, y), bk)): return
+        continue
+      else:
+        if not rec(&e, rc_diags.unsupported_declaration_hoisting(sym_name(c, y), rc_sem.decl_kind_name(dk))): return
+        continue
+      let rsp = wsp[wi]
+      let id = rc_build.resolve_binding(&b, &e, c, sym_name(c, y), y, nosp())
+      if e.failed: return
+      lower_value_to_temporary(&b, &e, rc_hir.DeclareContext(LValue(pl(id, rsp), hk), rsp))
+      e.hoisted[y] = true
+      b.context_ids[y] = true
+    let k = nk(c, s)
+    if (k == ast.N_FUNC or k == ast.N_CLASS) and c.t.nd[s].s >= 0:
+      let y = declared_sym(c, s)
+      if y >= 0: declared[y] = true
+    elif k == ast.N_VAR:
+      for d in items(c, c.t.nd[s].a): collect_pattern_syms(c, c.t.nd[d].a, &declared)
+    lower_statement(c, &b, &e, s, "", false, sid)
+    if e.failed: return
+
+# ---- statements (lower_statement)
+
+fn source_block_span(c: Ctx, n: Int) -> Sp:
+  if nk(c, n) == ast.N_BLOCK: return spn(c, n)
+  return nosp()
+
+fn block_stmts(c: Ctx, n: Int) -> [Int]:
+  if nk(c, n) == ast.N_BLOCK: return items(c, c.t.nd[n].a)
+  return [n]
+
+fn block_scope(c: Ctx, n: Int) -> Int:
+  return c.m.scope_of.get(n, -1)
+
+# a catch clause's span: from `catch` to its block's end
+fn catch_span(c: Ctx, n: Int) -> Sp:
+  let nd = c.t.nd[n]
+  var st = c.t.nd[nd.c].pos
+  let at = c.src.find("catch", c.t.nd[nd.a].end)
+  if at >= 0 and at < st: st = at
+  return Sp(st, c.t.nd[nd.c].end)
+
+fn is_loop(k: Int) -> Bool:
+  return k == ast.N_FOR or k == ast.N_WHILE or k == ast.N_DO or k == ast.N_FORIN
+
+fn lower_statement(c: Ctx, var b: Builder, var e: Env, n: Int, label: Str, has_label: Bool, parent_scope: Int):
+  let nd = c.t.nd[n]
+  let k = nd.k
+  let sp = spn(c, n)
+  if k == ast.N_EMPTY: return
+  if k == ast.N_DEBUGGER:
+    lower_value_to_temporary(&b, &e, rc_hir.Debugger(sp))
+  elif k == ast.N_EXPRSTMT:
+    lower_expression_to_temporary(c, &b, &e, nd.a)
+  elif k == ast.N_RETURN:
+    var value = noplace()
+    if nd.a > 0:
+      value = lower_expression_to_temporary(c, &b, &e, nd.a)
+      if e.failed: return
+    else: value = lower_value_to_temporary(&b, &e, undefined_value(nosp()))
+    let ft = rc_build.reserve(&e)
+    rc_build.terminate_with_continuation(&b, rc_hir.Return(value, rc_hir.RV_EXPLICIT, 0, sp, [], false), ft, rc_hir.BK_BLOCK)
+  elif k == ast.N_THROW:
+    let value = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return
+    if rc_build.resolve_throw_handler(b) >= 0:
+      if not rec(&e, rc_diags.todo_build_hir_lower_statement_support_throw_statement_inside_try_catch(sp)): return
+    let ft = rc_build.reserve(&e)
+    rc_build.terminate_with_continuation(&b, rc_hir.Throw(value, 0, sp), ft, rc_hir.BK_BLOCK)
+  elif k == ast.N_BLOCK:
+    lower_block_statement(c, &b, &e, items(c, nd.a), block_scope(c, n), parent_scope)
+  elif k == ast.N_VAR:
+    lower_variable_declaration(c, &b, &e, n)
+  elif k == ast.N_FUNC:
+    if nd.d > 0: lower_function_declaration(c, &b, &e, n)
+  elif k == ast.N_IF:
+    let cont = rc_build.reserve(&e)
+    let csp = source_block_span(c, nd.b)
+    let cblk = rc_build.reserve(&e)
+    var w = rc_build.enter_reserved(&b, cblk, rc_hir.BK_BLOCK)
+    lower_statement(c, &b, &e, nd.b, "", false, parent_scope)
+    if e.failed: return
+    rc_build.leave_reserved(&b, &w, goto(cont, rc_hir.GV_BREAK, csp))
+    var asp = nosp()
+    var ablk = cont
+    if nd.c > 0:
+      asp = source_block_span(c, nd.c)
+      ablk = rc_build.reserve(&e)
+      var w2 = rc_build.enter_reserved(&b, ablk, rc_hir.BK_BLOCK)
+      lower_statement(c, &b, &e, nd.c, "", false, parent_scope)
+      if e.failed: return
+      rc_build.leave_reserved(&b, &w2, goto(cont, rc_hir.GV_BREAK, asp))
+    let test = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return
+    rc_build.terminate_with_continuation(&b, rc_hir.If(test, cblk, csp, ablk, asp, cont, 0, sp), cont, rc_hir.BK_BLOCK)
+  elif k == ast.N_FOR:
+    let test_blk = rc_build.reserve(&e)
+    let cont = rc_build.reserve(&e)
+    let init_blk = rc_build.reserve(&e)
+    var w = rc_build.enter_reserved(&b, init_blk, rc_hir.BK_LOOP)
+    var init_sp = sp
+    if nd.a <= 0:
+      lower_value_to_temporary(&b, &e, undefined_value(sp))
+    elif nk(c, nd.a) == ast.N_VAR:
+      init_sp = spn(c, nd.a)
+      lower_variable_declaration(c, &b, &e, nd.a)
+      if e.failed: return
+    else:
+      init_sp = spn(c, nd.a)
+      if not rec(&e, rc_diags.todo_build_hir_lower_statement_handle_non_variable_initialization_statement(sp)): return
+      lower_expression_to_temporary(c, &b, &e, nd.a)
+      if e.failed: return
+    rc_build.leave_reserved(&b, &w, goto(test_blk, rc_hir.GV_BREAK, init_sp))
+    var upd = -1
+    if nd.c > 0:
+      let usp = spn(c, nd.c)
+      upd = rc_build.reserve(&e)
+      var w2 = rc_build.enter_reserved(&b, upd, rc_hir.BK_LOOP)
+      lower_expression_to_temporary(c, &b, &e, nd.c)
+      if e.failed: return
+      rc_build.leave_reserved(&b, &w2, goto(test_blk, rc_hir.GV_BREAK, usp))
+    var cont_target = test_blk
+    if upd >= 0: cont_target = upd
+    let body_sp = source_block_span(c, nd.d)
+    let body_blk = rc_build.reserve(&e)
+    var w3 = rc_build.enter_reserved(&b, body_blk, rc_hir.BK_BLOCK)
+    rc_build.push_loop(&b, label, has_label, cont_target, cont)
+    lower_statement(c, &b, &e, nd.d, "", false, parent_scope)
+    if e.failed: return
+    rc_build.pop_scope(&b)
+    rc_build.leave_reserved(&b, &w3, goto(cont_target, rc_hir.GV_CONTINUE, body_sp))
+    rc_build.terminate_with_continuation(&b, rc_hir.For(init_blk, test_blk, upd, body_blk, body_sp, cont, 0, sp), test_blk, rc_hir.BK_LOOP)
+    var test = noplace()
+    if nd.b > 0:
+      test = lower_expression_to_temporary(c, &b, &e, nd.b)
+      if e.failed: return
+    else: test = lower_value_to_temporary(&b, &e, rc_hir.Primitive(prim_bool(true), sp))
+    rc_build.terminate_with_continuation(&b, rc_hir.Branch(test, body_blk, cont, cont, 0, sp), cont, rc_hir.BK_BLOCK)
+  elif k == ast.N_WHILE or k == ast.N_DO:
+    var body = nd.b
+    var cond = nd.a
+    if k == ast.N_DO:
+      body = nd.a
+      cond = nd.b
+    let cond_blk = rc_build.reserve(&e)
+    let cont = rc_build.reserve(&e)
+    let body_sp = source_block_span(c, body)
+    let loop_blk = rc_build.reserve(&e)
+    var w = rc_build.enter_reserved(&b, loop_blk, rc_hir.BK_BLOCK)
+    rc_build.push_loop(&b, label, has_label, cond_blk, cont)
+    lower_statement(c, &b, &e, body, "", false, parent_scope)
+    if e.failed: return
+    rc_build.pop_scope(&b)
+    rc_build.leave_reserved(&b, &w, goto(cond_blk, rc_hir.GV_CONTINUE, body_sp))
+    if k == ast.N_WHILE: rc_build.terminate_with_continuation(&b, rc_hir.While(cond_blk, loop_blk, body_sp, cont, 0, sp), cond_blk, rc_hir.BK_LOOP)
+    else: rc_build.terminate_with_continuation(&b, rc_hir.DoWhile(loop_blk, body_sp, cond_blk, cont, 0, sp), cond_blk, rc_hir.BK_LOOP)
+    let test = lower_expression_to_temporary(c, &b, &e, cond)
+    if e.failed: return
+    rc_build.terminate_with_continuation(&b, rc_hir.Branch(test, loop_blk, cont, cond_blk, 0, sp), cont, rc_hir.BK_BLOCK)
+  elif k == ast.N_FORIN and nd.f == 0:
+    let left_sp = spn(c, nd.a)
+    let cont = rc_build.reserve(&e)
+    let init_blk = rc_build.reserve(&e)
+    let body_sp = source_block_span(c, nd.c)
+    let loop_blk = rc_build.reserve(&e)
+    var w = rc_build.enter_reserved(&b, loop_blk, rc_hir.BK_BLOCK)
+    rc_build.push_loop(&b, label, has_label, init_blk, cont)
+    lower_statement(c, &b, &e, nd.c, "", false, parent_scope)
+    if e.failed: return
+    rc_build.pop_scope(&b)
+    rc_build.leave_reserved(&b, &w, goto(init_blk, rc_hir.GV_CONTINUE, body_sp))
+    let value = lower_expression_to_temporary(c, &b, &e, nd.b)
+    if e.failed: return
+    rc_build.terminate_with_continuation(&b, rc_hir.ForIn(init_blk, loop_blk, body_sp, left_sp, cont, 0, sp), init_blk, rc_hir.BK_LOOP)
+    let next_prop = lower_value_to_temporary(&b, &e, rc_hir.NextPropertyOf(value, left_sp))
+    let assigned = lower_for_in_of_left(c, &b, &e, nd.a, left_sp, next_prop)
+    if e.failed: return
+    var tv = next_prop
+    if assigned.identifier >= 0: tv = assigned
+    let test = lower_value_to_temporary(&b, &e, rc_hir.LoadLocal(tv, left_sp))
+    rc_build.terminate_with_continuation(&b, rc_hir.Branch(test, loop_blk, cont, cont, 0, sp), cont, rc_hir.BK_BLOCK)
+  elif k == ast.N_FORIN:
+    let left_sp = spn(c, nd.a)
+    let cont = rc_build.reserve(&e)
+    let init_blk = rc_build.reserve(&e)
+    let test_blk = rc_build.reserve(&e)
+    if nd.f == 2:
+      if not rec(&e, rc_diags.todo_build_hir_lower_statement_handle_await_loops(Sp(sp.s, left_sp.s))): return
+      return
+    let body_sp = source_block_span(c, nd.c)
+    let loop_blk = rc_build.reserve(&e)
+    var w = rc_build.enter_reserved(&b, loop_blk, rc_hir.BK_BLOCK)
+    rc_build.push_loop(&b, label, has_label, init_blk, cont)
+    lower_statement(c, &b, &e, nd.c, "", false, parent_scope)
+    if e.failed: return
+    rc_build.pop_scope(&b)
+    rc_build.leave_reserved(&b, &w, goto(init_blk, rc_hir.GV_CONTINUE, body_sp))
+    let value = lower_expression_to_temporary(c, &b, &e, nd.b)
+    if e.failed: return
+    rc_build.terminate_with_continuation(&b, rc_hir.ForOf(init_blk, test_blk, loop_blk, body_sp, left_sp, cont, 0, sp), init_blk, rc_hir.BK_LOOP)
+    let iter = lower_value_to_temporary(&b, &e, rc_hir.GetIterator(value, value.sp))
+    rc_build.terminate_with_continuation(&b, goto(test_blk, rc_hir.GV_BREAK, sp), test_blk, rc_hir.BK_LOOP)
+    let adv = lower_value_to_temporary(&b, &e, rc_hir.IteratorNext(iter, value, left_sp))
+    let assigned = lower_for_in_of_left(c, &b, &e, nd.a, left_sp, adv)
+    if e.failed: return
+    var tv = adv
+    if assigned.identifier >= 0: tv = assigned
+    let test = lower_value_to_temporary(&b, &e, rc_hir.LoadLocal(tv, left_sp))
+    rc_build.terminate_with_continuation(&b, rc_hir.Branch(test, loop_blk, cont, cont, 0, sp), cont, rc_hir.BK_BLOCK)
+  elif k == ast.N_SWITCH:
+    let cont = rc_build.reserve(&e)
+    var ft = cont
+    var cases: [Case] = []
+    var has_default = false
+    let cl = items(c, nd.b)
+    var ii = cl.len - 1
+    while ii >= 0:
+      let cs = cl[ii]
+      ii -= 1
+      let csp = spn(c, cs)
+      let test_n = c.t.nd[cs].a
+      if test_n <= 0:
+        if has_default:
+          if not rec(&e, rc_diags.syntax_expected_at_most_one_default_branch_switch_statement(csp)): return
+          break
+        has_default = true
+      let target = ft
+      let blk = rc_build.reserve(&e)
+      var w = rc_build.enter_reserved(&b, blk, rc_hir.BK_BLOCK)
+      rc_build.push_switch(&b, label, has_label, cont)
+      for st in items(c, c.t.nd[cs].b):
+        lower_statement(c, &b, &e, st, "", false, parent_scope)
+        if e.failed: return
+      rc_build.pop_scope(&b)
+      rc_build.leave_reserved(&b, &w, goto(target, rc_hir.GV_BREAK, csp))
+      var test = noplace()
+      if test_n > 0:
+        test = lower_reorderable_expression(c, &b, &e, test_n)
+        if e.failed: return
+      cases.push(Case(test_n > 0, test, blk, csp))
+      ft = blk
+    var rcases: [Case] = []
+    var j = cases.len - 1
+    while j >= 0:
+      rcases.push(cases[j])
+      j -= 1
+    if not has_default: rcases.push(Case(false, noplace(), cont, nosp()))
+    let test = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return
+    rc_build.terminate_with_continuation(&b, rc_hir.Switch(test, rcases, cont, 0, sp), cont, rc_hir.BK_BLOCK)
+  elif k == ast.N_TRY:
+    lower_try(c, &b, &e, n, parent_scope)
+  elif k == ast.N_BREAK or k == ast.N_CONTINUE:
+    let has = nd.s >= 0
+    var target = -1
+    if k == ast.N_BREAK: target = rc_build.lookup_break(&b, &e, nm(c, n), has)
+    else: target = rc_build.lookup_continue(&b, &e, nm(c, n), has)
+    if e.failed: return
+    let ft = rc_build.reserve(&e)
+    var variant = rc_hir.GV_BREAK
+    if k == ast.N_CONTINUE: variant = rc_hir.GV_CONTINUE
+    rc_build.terminate_with_continuation(&b, goto(target, variant, sp), ft, rc_hir.BK_BLOCK)
+  elif k == ast.N_LABEL:
+    let body = nd.a
+    let lname = nm(c, n)
+    if is_loop(nk(c, body)):
+      lower_statement(c, &b, &e, body, lname, true, parent_scope)
+    else:
+      let cont = rc_build.reserve(&e)
+      let body_sp = source_block_span(c, body)
+      let blk = rc_build.reserve(&e)
+      var w = rc_build.enter_reserved(&b, blk, rc_hir.BK_BLOCK)
+      rc_build.push_label(&b, lname, cont)
+      lower_statement(c, &b, &e, body, "", false, parent_scope)
+      if e.failed: return
+      rc_build.pop_scope(&b)
+      rc_build.leave_reserved(&b, &w, goto(cont, rc_hir.GV_BREAK, body_sp))
+      rc_build.terminate_with_continuation(&b, rc_hir.Label(blk, body_sp, cont, 0, sp), cont, rc_hir.BK_BLOCK)
+  elif k == ast.N_WITH:
+    rec(&e, rc_diags.unsupported_with_statement(sp))
+  elif k == ast.N_CLASS:
+    rec(&e, rc_diags.unsupported_inline_class(sp))
+  elif k == ast.N_IMPORT or k == ast.N_EXPORT or k == ast.N_EXPORTDEFAULT or k == ast.N_EXPORTASSIGN or k == ast.N_NSEXPORT:
+    rec(&e, rc_diags.syntax_java_script_import_and_export_statements_may_only_appear_at_top_level_module(sp))
+  elif k == ast.N_ENUM:
+    let y = enum_symbol(c, n)
+    var loses = false
+    if y >= 0: loses = rc_sem.scope_kind(c.m, rc_sem.symbol_scope(c.m, y)) != rc_sem.SK_FUNCTION
+    if loses or ts_enum_has_captured_reference(c, b, n): e.skip_compilation = true
+    lower_value_to_temporary(&b, &e, rc_hir.TSEnumDeclaration(n, sp))
+
+fn enum_symbol(c: Ctx, n: Int) -> Int:
+  for y in 0..c.m.ydn.len:
+    if c.m.ydn[y] == n and c.m.ydk[y] == rc_sem.DK_ENUM: return y
+  return -1
+
+# capture_scopes: from `from` up to `to`
+fn capture_scopes(c: Ctx, from: Int, to: Int) -> {Int: Bool}:
+  var out: {Int: Bool} = {}
+  var x = from
+  while x >= 0:
+    out[x] = true
+    if x == to: break
+    x = c.m.spar[x]
+  return out
+
+fn enum_refs(c: Ctx, n: Int, var out: [Int]):
+  if n <= 0: return
+  let k = nk(c, n)
+  if k == ast.N_ID or k == ast.N_SHORTHAND:
+    let y = ref_sym(c, n)
+    if y >= 0: out.push(y)
+    if k == ast.N_SHORTHAND: enum_refs(c, c.t.nd[n].b, &out)
+    return
+  for ch in kids(c, n): enum_refs(c, ch, &out)
+
+fn ts_enum_has_captured_reference(c: Ctx, b: Builder, n: Int) -> Bool:
+  let fs = b.function_scope
+  if fs == b.component_scope: return false
+  let ps = c.m.spar[fs]
+  if ps < 0: return false
+  let cs = capture_scopes(c, ps, b.component_scope)
+  var ys: [Int] = []
+  for mem in items(c, c.t.nd[n].a): enum_refs(c, c.t.nd[mem].b, &ys)
+  for y in ys:
+    if cs.get(rc_sem.symbol_scope(c.m, y), false): return true
+  return false
+
+fn collect_catch_ids(c: Ctx, n: Int, var out: [Sp]):
+  var ids: [Int] = []
+  rc_sem.bound_ids(c.t, n, &ids)
+  for idn in ids: out.push(spn(c, idn))
+
+fn lower_try(c: Ctx, var b: Builder, var e: Env, n: Int, parent_scope: Int):
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  var kw_end = sp.s + 3
+  if kw_end > sp.e: kw_end = sp.e
+  let try_kw = Sp(sp.s, kw_end)
+  var finally_kw = nosp()
+  if nd.d > 0: finally_kw = Sp(c.t.nd[nd.a].end, c.t.nd[nd.d].pos)
+  let cont = rc_build.reserve(&e)
+  if nd.c <= 0:
+    rec(&e, rc_diags_hand.todo_build_hir_lower_statement_handle_try_statement_without_catch_clause(try_kw, finally_kw))
+    return
+  let hsp = catch_span(c, n)
+  if nd.d > 0:
+    if not rec(&e, rc_diags.todo_build_hir_lower_statement_handle_try_statement_finalizer_finally_clause(Sp(hsp.e, c.t.nd[nd.d].pos))): return
+  var has_binding = false
+  var binding = noplace()
+  var pat = -1
+  var param_sp = nosp()
+  if nd.b > 0:
+    pat = c.t.nd[nd.b].a
+    param_sp = spn(c, pat)
+    let pk = nk(c, pat)
+    if pk == ast.N_OBJPAT or pk == ast.N_ARRPAT:
+      var sps: [Sp] = []
+      collect_catch_ids(c, pat, &sps)
+      for s in sps:
+        if not rec(&e, rc_diags.invariant_build_hir_lower_assignment_could_not_find_binding_declaration(s)): return
+      pat = -1
+    else:
+      let id = rc_build.make_temporary(&e, param_sp)
+      rc_build.promote_temporary(&e, id)
+      binding = pl(id, param_sp)
+      lower_value_to_temporary(&b, &e, rc_hir.DeclareLocal(LValue(binding, rc_hir.IK_CATCH), param_sp))
+      has_binding = true
+  let hblk = rc_build.reserve(&e)
+  var w = rc_build.enter_reserved(&b, hblk, rc_hir.BK_CATCH)
+  if has_binding:
+    var asp = hsp
+    if param_sp.s >= 0: asp = param_sp
+    lower_binding_assignment(c, &b, &e, asp, rc_hir.IK_CATCH, pat, binding, 0)
+    if e.failed: return
+  let cscope = c.m.scope_of.get(-n - 1, -1)
+  if cscope >= 0: lower_block_inner(c, &b, &e, items(c, c.t.nd[nd.c].a), -1, cscope, -1)
+  else: lower_block_statement(c, &b, &e, items(c, c.t.nd[nd.c].a), block_scope(c, nd.c), parent_scope)
+  if e.failed: return
+  rc_build.leave_reserved(&b, &w, goto(cont, rc_hir.GV_BREAK, hsp))
+  let tsp = spn(c, nd.a)
+  let tblk = rc_build.reserve(&e)
+  var w2 = rc_build.enter_reserved(&b, tblk, rc_hir.BK_BLOCK)
+  b.handlers.push(hblk)
+  lower_block_statement(c, &b, &e, items(c, c.t.nd[nd.a].a), block_scope(c, nd.a), parent_scope)
+  if e.failed: return
+  b.handlers.pop()
+  rc_build.leave_reserved(&b, &w2, goto(cont, rc_hir.GV_TRY, tsp))
+  rc_build.terminate_with_continuation(&b, rc_hir.Try(tblk, tsp, has_binding, binding, hblk, spn(c, nd.c), cont, 0, sp), cont, rc_hir.BK_BLOCK)
+
+# lower_variable_declaration
+fn lower_variable_declaration(c: Ctx, var b: Builder, var e: Env, n: Int):
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  if nd.f == 0:
+    if not rec(&e, rc_diags.todo_build_hir_lower_statement_handle_var_kinds_variable_declaration(sp)): return
+  if nd.f == 3: e.skip_compilation = true
+  var kind = rc_hir.IK_CONST
+  if nd.f <= 1: kind = rc_hir.IK_LET
+  for d in items(c, nd.a):
+    let dd = c.t.nd[d]
+    if dd.c > 0:
+      let value = lower_expression_to_temporary(c, &b, &e, dd.c)
+      if e.failed: return
+      lower_binding_assignment(c, &b, &e, sp, kind, dd.a, value, style_for_binding(c, dd.a))
+      if e.failed: return
+    elif nk(c, dd.a) == ast.N_ID:
+      let id = dd.a
+      let isp = spn(c, id)
+      let name = nm(c, id)
+      var bnd = rc_build.resolve_identifier(&b, &e, c, name, isp, bind_sym(c, id))
+      if e.failed: return
+      if bnd.kind != 0:
+        let y = find_binding_in_descendants(c, c.t.nd[id].s, b.function_scope)
+        if y >= 0:
+          let bk = rc_sem.binding_kind(c.m, y)
+          let iid = rc_build.resolve_binding(&b, &e, c, name, y, isp)
+          if e.failed: return
+          bnd = VarBinding(0, iid, bk, name, "", "")
+      if bnd.kind == 0:
+        set_identifier_declaration_span(&e, bnd.id, isp)
+        let place = pl(bnd.id, isp)
+        if rc_build.is_context_identifier(c, b, bind_sym(c, id)):
+          if kind == rc_hir.IK_CONST:
+            if not rec(&e, rc_diags.syntax_expect_const_declaration_not_reassigned(isp)): return
+          lower_value_to_temporary(&b, &e, rc_hir.DeclareContext(LValue(place, rc_hir.IK_LET), isp))
+        else:
+          lower_value_to_temporary(&b, &e, rc_hir.DeclareLocal(LValue(place, kind), isp))
+      else:
+        if not rec(&e, rc_diags.invariant_could_not_find_binding_declaration_3(isp)): return
+    else:
+      if not rec(&e, rc_diags.syntax_expected_variable_declaration_identifier_if_no_initializer_provided(spn(c, d))): return
+
+fn lower_for_in_of_left(c: Ctx, var b: Builder, var e: Env, left: Int, left_sp: Sp, value: Place) -> Place:
+  if nk(c, left) == ast.N_VAR:
+    let ds = items(c, c.t.nd[left].a)
+    if ds.len != 1:
+      if not rec(&e, rc_diags.unexpected_for_in_of_declarations(ds.len, left_sp)): return noplace()
+    if ds.len > 0: return lower_binding_assignment(c, &b, &e, left_sp, rc_hir.IK_LET, c.t.nd[ds[0]].a, value, 0)
+    return noplace()
+  return lower_assignment_target(c, &b, &e, left_sp, rc_hir.IK_REASSIGN, left, value, 0)
+
+# ---- expressions (lower_expression)
+
+fn is_assign_op(op: Int) -> Bool:
+  return op >= T_ASSIGN and op <= scan.T_QQEQ
+
+fn is_logical_op(op: Int) -> Bool:
+  return op == T_AND or op == T_OR or op == T_QQ
+
+# a member, call or non-null link of an optional chain (expr_contains_optional)
+fn contains_optional(c: Ctx, n: Int) -> Bool:
+  let k = nk(c, n)
+  if k == ast.N_CALL or k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS:
+    if (c.t.nd[n].f & 1) != 0: return true
+    return contains_optional(c, c.t.nd[n].a)
+  if k == ast.N_NONNULL: return contains_optional(c, c.t.nd[n].a)
+  return false
+
+# the top of an optional chain (oxc's ChainExpression): its parent doesn't continue the chain
+fn is_chain_root(c: Ctx, n: Int) -> Bool:
+  if not contains_optional(c, n): return false
+  let p = c.par[n]
+  if p <= 0: return true
+  let pk = nk(c, p)
+  if (pk == ast.N_CALL or pk == ast.N_PROPACCESS or pk == ast.N_ELEMACCESS or pk == ast.N_NONNULL) and c.t.nd[p].a == n: return false
+  return true
+
+fn unary_op(tok: Int, k: Int) -> Int:
+  if k == ast.N_TYPEOF: return rc_hir.UN_TYPEOF
+  if k == ast.N_VOIDEXPR: return rc_hir.UN_VOID
+  if tok == T_MINUS: return rc_hir.UN_MINUS
+  if tok == T_PLUS: return rc_hir.UN_PLUS
+  if tok == T_BANG: return rc_hir.UN_NOT
+  return rc_hir.UN_BITNOT
+
+# a reference to a name (N_ID, or a shorthand property's)
+fn lower_ident_load(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let isp = id_sp(c, n)
+  let y = ref_sym(c, n)
+  let place = lower_identifier(c, &b, &e, nm(c, n), isp, y)
+  if e.failed: return undefined_value(nosp())
+  if rc_build.is_context_identifier(c, b, y): return rc_hir.LoadContext(place, isp, false)
+  return rc_hir.LoadLocal(place, isp)
+
+fn regex_parts(text: Str) -> [Str]:
+  var i = text.len - 1
+  while i > 0 and text[i] != '/': i -= 1
+  if i <= 0: return [text, ""]
+  return [text[1..i], text[i + 1..text.len]]
+
+# the comma operands of a sequence, flattened as oxc parses them
+fn sequence_items(c: Ctx, n: Int, var out: [Int]):
+  let nd = c.t.nd[n]
+  if nk(c, nd.a) == ast.N_BINARY and c.t.nd[nd.a].f == T_COMMA: sequence_items(c, nd.a, &out)
+  else: out.push(nd.a)
+  out.push(nd.b)
+
+fn lower_expression(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  let k = nd.k
+  let sp = spn(c, n)
+  if k == ast.N_ID: return lower_ident_load(c, &b, &e, n)
+  if k == ast.N_NULL: return rc_hir.Primitive(prim(0), sp)
+  if k == ast.N_TRUE: return rc_hir.Primitive(prim_bool(true), sp)
+  if k == ast.N_FALSE: return rc_hir.Primitive(prim_bool(false), sp)
+  if k == ast.N_NUM: return rc_hir.Primitive(prim_num(num_of(c, n)), sp)
+  if k == ast.N_STR: return rc_hir.Primitive(prim_str(nm(c, n)), sp)
+  if k == ast.N_REGEX:
+    let parts = regex_parts(nm(c, n))
+    return rc_hir.RegExpLiteral(parts[0], parts[1], sp)
+  if k == ast.N_PAREN or k == ast.N_EXPRTARGS: return lower_expression(c, &b, &e, nd.a)
+  if k == ast.N_NONNULL:
+    if is_chain_root(c, n): return lower_chain_expression(c, &b, &e, n)
+    return lower_expression(c, &b, &e, nd.a)
+  if k == ast.N_BINARY:
+    let op = nd.f
+    if op == T_COMMA: return lower_sequence(c, &b, &e, n)
+    if is_logical_op(op): return lower_logical(c, &b, &e, n)
+    if is_assign_op(op): return lower_assignment_expression(c, &b, &e, n)
+    if nk(c, nd.a) == ast.N_PRIVNAME:
+      let left = lower_private_name_to_temporary(&b, &e, spn(c, nd.a))
+      if e.failed: return undefined_value(nosp())
+      let right = lower_expression_to_temporary(c, &b, &e, nd.b)
+      if e.failed: return undefined_value(nosp())
+      return rc_hir.BinaryExpression(scan.W_IN, left, right, sp)
+    let left = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return undefined_value(nosp())
+    let right = lower_expression_to_temporary(c, &b, &e, nd.b)
+    if e.failed: return undefined_value(nosp())
+    return rc_hir.BinaryExpression(op, left, right, sp)
+  if k == ast.N_DELETE:
+    let m = without_parens(c, nd.a)
+    if is_member(c, m):
+      var lm = lower_member_expression(c, &b, &e, m, noplace(), false)
+      if e.failed: return undefined_value(nosp())
+      if lm.is_lit: return rc_hir.PropertyDelete(lm.object, plcopy(lm.lit), lm.prop_sp, sp)
+      return rc_hir.ComputedDelete(lm.object, lm.prop, sp)
+    if not rec(&e, rc_diags.syntax_only_object_properties_can_deleted(sp)): return undefined_value(nosp())
+    return undefined_value(sp)
+  if (k == ast.N_PREFIX and nd.f != T_INC and nd.f != T_DEC) or k == ast.N_TYPEOF or k == ast.N_VOIDEXPR:
+    let value = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return undefined_value(nosp())
+    return rc_hir.UnaryExpression(unary_op(nd.f, k), value, sp)
+  if k == ast.N_PREFIX or k == ast.N_POSTFIX: return lower_update(c, &b, &e, n)
+  if k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS:
+    if is_chain_root(c, n): return lower_chain_expression(c, &b, &e, n)
+    var lm = lower_member_expression(c, &b, &e, n, noplace(), false)
+    if e.failed: return undefined_value(nosp())
+    var v = undefined_value(nosp())
+    swap(&v, &lm.value)
+    return v
+  if k == ast.N_CALL:
+    if is_chain_root(c, n): return lower_chain_expression(c, &b, &e, n)
+    let callee = nd.a
+    if is_member(c, callee):
+      var lm = lower_member_expression(c, &b, &e, callee, noplace(), false)
+      if e.failed: return undefined_value(nosp())
+      var v = undefined_value(nosp())
+      swap(&v, &lm.value)
+      let property = lower_value_to_temporary(&b, &e, v)
+      let args = lower_arguments(c, &b, &e, nd.c)
+      if e.failed: return undefined_value(nosp())
+      return rc_hir.MethodCall(lm.object, property, args, sp)
+    let cp = lower_expression_to_temporary(c, &b, &e, callee)
+    if e.failed: return undefined_value(nosp())
+    let args = lower_arguments(c, &b, &e, nd.c)
+    if e.failed: return undefined_value(nosp())
+    return rc_hir.CallExpression(cp, args, sp)
+  if k == ast.N_COND: return lower_conditional(c, &b, &e, n)
+  if k == ast.N_NEW:
+    let callee = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return undefined_value(nosp())
+    let args = lower_arguments(c, &b, &e, nd.c)
+    if e.failed: return undefined_value(nosp())
+    return rc_hir.NewExpression(callee, args, sp)
+  if k == ast.N_TEMPL or k == ast.N_NOSUBTEMPL:
+    var subs: [Place] = []
+    for ts in items(c, nd.a):
+      let p = lower_expression_to_temporary(c, &b, &e, c.t.nd[ts].a)
+      if e.failed: return undefined_value(nosp())
+      subs.push(p)
+    return rc_hir.TemplateLiteral(subs, template_quasis(c, n), sp)
+  if k == ast.N_TAGGED:
+    let tpl = nd.c
+    let tag = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return undefined_value(nosp())
+    var subs: [Place] = []
+    if nk(c, tpl) == ast.N_TEMPL:
+      for ts in items(c, c.t.nd[tpl].a):
+        let p = lower_expression_to_temporary(c, &b, &e, c.t.nd[ts].a)
+        if e.failed: return undefined_value(nosp())
+        subs.push(p)
+    return rc_hir.TaggedTemplateExpression(tag, template_quasis(c, tpl), subs, spn(c, tpl), sp)
+  if k == ast.N_AWAIT:
+    let value = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return undefined_value(nosp())
+    return rc_hir.Await(value, sp)
+  if k == ast.N_YIELD:
+    if not rec(&e, rc_diags.todo_build_hir_lower_expression_handle_yield_expression_expressions(sp)): return undefined_value(nosp())
+    return undefined_value(sp)
+  if k == ast.N_METAPROP:
+    if nd.f == scan.W_IMPORT: return rc_hir.MetaProperty("import", "meta", sp)
+    if not rec(&e, rc_diags.todo_build_hir_lower_expression_handle_meta_property_expressions_other_than_import_meta(sp)): return undefined_value(nosp())
+    return undefined_value(sp)
+  if k == ast.N_CLASSEXPR:
+    var dsp = Sp(sp.s, sp.s + 5)
+    if dsp.e > sp.e: dsp = Sp(sp.s, sp.e)
+    if nd.s >= 0: dsp = Sp(sp.s, fn_name_sp(c, n).e)
+    if not rec(&e, rc_diags.todo_build_hir_lower_expression_handle_class_expression_expressions(dsp)): return undefined_value(nosp())
+    return undefined_value(sp)
+  if k == ast.N_SUPER:
+    if not rec(&e, rc_diags.todo_build_hir_lower_expression_handle_super_expressions(sp)): return undefined_value(nosp())
+    return undefined_value(sp)
+  if k == ast.N_THIS:
+    if not rec(&e, rc_diags.todo_build_hir_lower_expression_handle_this_expression_expressions(sp)): return undefined_value(nosp())
+    return undefined_value(sp)
+  if k == ast.N_IMPORTCALL:
+    let callee = lower_import_keyword_to_temporary(&b, &e, Sp(sp.s, sp.s + 6))
+    if e.failed: return undefined_value(nosp())
+    var args: [Elem] = []
+    let al = items(c, nd.c)
+    if al.len > 0:
+      let src = lower_expression_to_temporary(c, &b, &e, al[0])
+      if e.failed: return undefined_value(nosp())
+      args.push(Elem(0, src, nosp()))
+    if al.len > 1:
+      let opt = lower_expression_to_temporary(c, &b, &e, al[1])
+      if e.failed: return undefined_value(nosp())
+      args.push(Elem(0, opt, nosp()))
+    return rc_hir.CallExpression(callee, args, sp)
+  if k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_TYPEASSERT:
+    let value = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return undefined_value(nosp())
+    lower_ts_type(c, &e, nd.b)
+    return rc_hir.TypeCastExpression(value, k == ast.N_SATISFIES, nd.b, sp)
+  if k == ast.N_OBJECT: return lower_object_expression(c, &b, &e, n)
+  if k == ast.N_ARRAY:
+    var els: [Elem] = []
+    for el in items(c, nd.a):
+      let ek = nk(c, el)
+      if ek == ast.N_OMIT: els.push(Elem(2, noplace(), nosp()))
+      elif ek == ast.N_SPREAD:
+        let p = lower_expression_to_temporary(c, &b, &e, c.t.nd[el].a)
+        if e.failed: return undefined_value(nosp())
+        els.push(Elem(1, p, spn(c, el)))
+      else:
+        let p = lower_expression_to_temporary(c, &b, &e, el)
+        if e.failed: return undefined_value(nosp())
+        els.push(Elem(0, p, nosp()))
+    return rc_hir.ArrayExpression(els, sp)
+  if k == ast.N_JSXELEM:
+    if nd.a <= 0: return lower_jsx_fragment_expr(c, &b, &e, n)
+    return lower_jsx_element_expr(c, &b, &e, n)
+  if k == ast.N_ARROW: return lower_function_to_value(c, &b, &e, n, rc_hir.FT_ARROW)
+  if k == ast.N_FUNCEXPR: return lower_function_to_value(c, &b, &e, n, rc_hir.FT_EXPRESSION)
+  return undefined_value(sp)
+
+# the template's text parts: between the backtick, each `${`...`}` and the closing backtick
+fn template_quasis(c: Ctx, n: Int) -> [TemplateQuasi]:
+  var out: [TemplateQuasi] = []
+  let nd = c.t.nd[n]
+  if nd.k == ast.N_NOSUBTEMPL:
+    let s = nd.pos + 1
+    var e = nd.end - 1
+    if e < s: e = s
+    out.push(TemplateQuasi(c.src[s..e], nm(c, n), true, Sp(s, e)))
+    return out
+  let spans = items(c, nd.a)
+  var start = nd.pos + 1
+  var cooked = nm(c, n)
+  for ts in spans:
+    let ex = c.t.nd[ts].a
+    var hend = c.t.nd[ex].pos
+    var at = hend - 2
+    while at >= start and not (c.src[at] == '$' and c.src[at + 1] == '{'): at -= 1
+    if at >= start: hend = at
+    out.push(TemplateQuasi(c.src[start..hend], cooked, true, Sp(start, hend)))
+    var close = c.src.find("}}", c.t.nd[ex].end)
+    if close < 0: close = c.t.nd[ex].end
+    start = close + 1
+    cooked = nm(c, ts)
+  var last = nd.end - 1
+  if last < start: last = start
+  out.push(TemplateQuasi(c.src[start..last], cooked, true, Sp(start, last)))
+  return out
+
+fn lower_sequence(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let sp = spn(c, n)
+  var exprs: [Int] = []
+  sequence_items(c, n, &exprs)
+  let cont = rc_build.reserve(&e)
+  let ck = b.cur_kind
+  let place = rc_build.temp_place(&e, sp)
+  let blk = rc_build.reserve(&e)
+  var w = rc_build.enter_reserved(&b, blk, rc_hir.BK_SEQUENCE)
+  var last = noplace()
+  for x in exprs:
+    last = lower_expression_to_temporary(c, &b, &e, x)
+    if e.failed: return undefined_value(nosp())
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), last, sp))
+  rc_build.leave_reserved(&b, &w, goto(cont, rc_hir.GV_BREAK, sp))
+  rc_build.terminate_with_continuation(&b, rc_hir.Sequence(blk, cont, 0, sp), cont, ck)
+  return rc_hir.LoadLocal(place, sp)
+
+fn lower_logical(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  let cont = rc_build.reserve(&e)
+  let ck = b.cur_kind
+  let test_blk = rc_build.reserve(&e)
+  let place = rc_build.temp_place(&e, sp)
+  let left_sp = spn(c, nd.a)
+  let left_place = rc_build.temp_place(&e, left_sp)
+  let cblk = rc_build.reserve(&e)
+  var w = rc_build.enter_reserved(&b, cblk, rc_hir.BK_VALUE)
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), left_place, left_place.sp))
+  rc_build.leave_reserved(&b, &w, goto(cont, rc_hir.GV_BREAK, left_place.sp))
+  let ablk = rc_build.reserve(&e)
+  var w2 = rc_build.enter_reserved(&b, ablk, rc_hir.BK_VALUE)
+  let right = lower_expression_to_temporary(c, &b, &e, nd.b)
+  if e.failed: return undefined_value(nosp())
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), right, right.sp))
+  rc_build.leave_reserved(&b, &w2, goto(cont, rc_hir.GV_BREAK, right.sp))
+  rc_build.terminate_with_continuation(&b, rc_hir.Logical(nd.f, test_blk, cont, 0, sp), test_blk, rc_hir.BK_VALUE)
+  let left_value = lower_expression_to_temporary(c, &b, &e, nd.a)
+  if e.failed: return undefined_value(nosp())
+  rc_build.push(&b, &e, Instruction(0, left_place, rc_hir.LoadLocal(left_value, sp), sp, [], false))
+  rc_build.terminate_with_continuation(&b, rc_hir.Branch(left_place, cblk, ablk, cont, 0, sp), cont, ck)
+  return rc_hir.LoadLocal(place, place.sp)
+
+fn lower_conditional(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  let cont = rc_build.reserve(&e)
+  let ck = b.cur_kind
+  let test_blk = rc_build.reserve(&e)
+  let place = rc_build.temp_place(&e, sp)
+  let csp = spn(c, nd.b)
+  let cblk = rc_build.reserve(&e)
+  var w = rc_build.enter_reserved(&b, cblk, rc_hir.BK_VALUE)
+  let cv = lower_expression_to_temporary(c, &b, &e, nd.b)
+  if e.failed: return undefined_value(nosp())
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), cv, sp))
+  rc_build.leave_reserved(&b, &w, goto(cont, rc_hir.GV_BREAK, csp))
+  let asp = spn(c, nd.c)
+  let ablk = rc_build.reserve(&e)
+  var w2 = rc_build.enter_reserved(&b, ablk, rc_hir.BK_VALUE)
+  let av = lower_expression_to_temporary(c, &b, &e, nd.c)
+  if e.failed: return undefined_value(nosp())
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), av, sp))
+  rc_build.leave_reserved(&b, &w2, goto(cont, rc_hir.GV_BREAK, asp))
+  rc_build.terminate_with_continuation(&b, rc_hir.Ternary(test_blk, cont, 0, sp), test_blk, rc_hir.BK_VALUE)
+  let test = lower_expression_to_temporary(c, &b, &e, nd.a)
+  if e.failed: return undefined_value(nosp())
+  rc_build.terminate_with_continuation(&b, rc_hir.Branch(test, cblk, ablk, cont, 0, sp), cont, ck)
+  return rc_hir.LoadLocal(place, place.sp)
+
+# LoweredMemberExpression
+type LM:
+  object: Place
+  is_lit: Bool
+  lit: PropLit
+  prop: Place
+  computed: Bool
+  prop_sp: Sp
+  value: InstrValue
+
+# lower_member_expression_impl (with `object` already lowered when its identifier is >= 0);
+# for_update: lower_member_expression_for_update's diagnostic
+fn lower_member_expression(c: Ctx, var b: Builder, var e: Env, n: Int, lowered: Place, for_update: Bool) -> LM:
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  var object = lowered
+  if object.identifier < 0:
+    object = lower_expression_to_temporary(c, &b, &e, nd.a)
+    if e.failed: return failed_lm()
+  if nd.k == ast.N_PROPACCESS and (nd.f & 4) != 0:
+    var d = rc_diags.todo_build_hir_lower_member_expression_handle_private_field_property(sp)
+    if for_update: d = rc_diags.todo_build_hir_lower_member_expression_handle_private_field_property_2(sp)
+    if not rec(&e, d): return failed_lm()
+    return LM(object, true, plit_str(""), noplace(), false, nosp(), undefined_value(sp))
+  if nd.k == ast.N_PROPACCESS:
+    let psp = prop_sp(c, n)
+    let lit = plit_str(nm(c, n))
+    return LM(object, true, lit, noplace(), false, psp, rc_hir.PropertyLoad(object, plit_str(nm(c, n)), false, psp, sp))
+  if nk(c, nd.b) == ast.N_NUM:
+    let psp = spn(c, nd.b)
+    let v = num_of(c, nd.b)
+    return LM(object, true, plit_num(v), noplace(), true, psp, rc_hir.PropertyLoad(object, plit_num(v), true, psp, sp))
+  let property = lower_expression_to_temporary(c, &b, &e, nd.b)
+  if e.failed: return failed_lm()
+  return LM(object, false, plit_str(""), property, true, property.sp, rc_hir.ComputedLoad(object, property, sp))
+
+fn failed_lm() -> LM:
+  return LM(noplace(), true, plit_str(""), noplace(), false, nosp(), undefined_value(nosp()))
+
+fn lower_import_keyword_to_temporary(var b: Builder, var e: Env, sp: Sp) -> Place:
+  if not rec(&e, rc_diags.todo_build_hir_lower_expression_handle_import_expressions(sp)): return noplace()
+  return lower_value_to_temporary(&b, &e, undefined_value(sp))
+
+fn lower_private_name_to_temporary(var b: Builder, var e: Env, sp: Sp) -> Place:
+  if not rec(&e, rc_diags.todo_build_hir_lower_expression_handle_private_name_expressions(sp)): return noplace()
+  return lower_value_to_temporary(&b, &e, undefined_value(sp))
+
+# lower_ts_type: a type variable unless the annotation is an array or a primitive
+fn lower_ts_type(c: Ctx, var e: Env, t: Int):
+  let k = nk(c, t)
+  if k == ast.N_TARRAY: return
+  if k == ast.N_TREF:
+    let nn = c.t.nd[t].a
+    if nk(c, nn) == ast.N_ID and nm(c, nn) == "Array": return
+  if k == ast.N_TKW:
+    let f = c.t.nd[t].f
+    if f == scan.W_BOOLEAN or f == scan.W_NULL or f == scan.W_NUMBER or f == scan.W_STRING or f == scan.W_SYMBOL or f == scan.W_UNDEFINED or f == scan.W_VOID: return
+  rc_env.make_type(&e)
+
+fn lower_arguments(c: Ctx, var b: Builder, var e: Env, lst: Int) -> [Elem]:
+  var out: [Elem] = []
+  for a in items(c, lst):
+    if nk(c, a) == ast.N_SPREAD:
+      let p = lower_expression_to_temporary(c, &b, &e, c.t.nd[a].a)
+      if e.failed: return out
+      out.push(Elem(1, p, spn(c, a)))
+    else:
+      let p = lower_expression_to_temporary(c, &b, &e, a)
+      if e.failed: return out
+      out.push(Elem(0, p, nosp()))
+  return out
+
+# UpdateExpression (++ and --)
+fn lower_update(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  let prefix = nd.k == ast.N_PREFIX
+  let target = inner_expr(c, nd.a)
+  if is_member(c, target):
+    var bop = T_PLUS
+    if nd.f == T_DEC: bop = T_MINUS
+    let msp = spn(c, target)
+    var lm = lower_member_expression(c, &b, &e, target, noplace(), true)
+    if e.failed: return undefined_value(nosp())
+    var v = undefined_value(nosp())
+    swap(&v, &lm.value)
+    let prev = lower_value_to_temporary(&b, &e, v)
+    let one = lower_value_to_temporary(&b, &e, rc_hir.Primitive(prim_num(1.0), nosp()))
+    let updated = lower_value_to_temporary(&b, &e, rc_hir.BinaryExpression(bop, prev, one, msp))
+    var nv = noplace()
+    if lm.is_lit: nv = lower_value_to_temporary(&b, &e, rc_hir.PropertyStore(lm.object, plcopy(lm.lit), lm.computed, lm.prop_sp, updated, msp))
+    else: nv = lower_value_to_temporary(&b, &e, rc_hir.ComputedStore(lm.object, lm.prop, updated, msp))
+    var res = prev
+    if prefix: res = nv
+    return rc_hir.LoadLocal(res, res.sp)
+  if nk(c, target) == ast.N_ID:
+    let y = ref_sym(c, target)
+    if rc_build.is_context_identifier(c, b, y):
+      if not rec(&e, rc_diags.todo_build_hir_lower_expression_handle_update_expression_variables_captured_within_lambdas(sp)): return undefined_value(nosp())
+      return undefined_value(sp)
+    let isp = spn(c, target)
+    let name = nm(c, target)
+    let bnd = rc_build.resolve_identifier(&b, &e, c, name, isp, y)
+    if e.failed: return undefined_value(nosp())
+    if bnd.kind == 1:
+      if not rec(&e, rc_diags.todo_update_expression_where_argument_global_not_yet_supported(sp)): return undefined_value(nosp())
+      return undefined_value(sp)
+    if bnd.kind != 0:
+      if not rec(&e, rc_diags.todo_build_hir_lower_expression_support_update_expression_where_argument_global(sp)): return undefined_value(nosp())
+      return undefined_value(sp)
+    let lv = pl(bnd.id, isp)
+    let value = lower_identifier(c, &b, &e, name, isp, y)
+    if e.failed: return undefined_value(nosp())
+    if prefix: return rc_hir.PrefixUpdate(lv, nd.f, value, sp)
+    return rc_hir.PostfixUpdate(lv, nd.f, value, sp)
+  if not rec(&e, rc_diags.todo_update_expression_unsupported_argument_type(sp)): return undefined_value(nosp())
+  return undefined_value(sp)
+
+# ---- assignments and patterns
+
+# AssignmentStyle: 0 Assignment, 1 Destructure
+fn style_for_binding(c: Ctx, n: Int) -> Int:
+  let k = nk(c, n)
+  if k == ast.N_OBJPAT or k == ast.N_ARRPAT: return 1
+  return 0
+
+# IdentifierForAssignment: kind 0 none, 1 a place, 2 a global (name)
+type IFA:
+  kind: Int
+  place: Place
+  name: Str
+
+fn lower_identifier_for_assignment(c: Ctx, var b: Builder, var e: Env, sp: Sp, isp: Sp, kind: Int, name: Str, name_id: Int, y: Int) -> IFA:
+  var bnd = rc_build.resolve_identifier(&b, &e, c, name, isp, y)
+  if e.failed: return IFA(0, noplace(), "")
+  if bnd.kind != 0 and kind != rc_hir.IK_REASSIGN:
+    let y2 = find_binding_in_descendants(c, name_id, b.function_scope)
+    if y2 >= 0:
+      let bk = rc_sem.binding_kind(c.m, y2)
+      let id = rc_build.resolve_binding(&b, &e, c, name, y2, isp)
+      if e.failed: return IFA(0, noplace(), "")
+      bnd = VarBinding(0, id, bk, name, "", "")
+  if bnd.kind == 0:
+    if kind != rc_hir.IK_REASSIGN: set_identifier_declaration_span(&e, bnd.id, isp)
+    if bnd.binding_kind == rc_sem.BK_CONST and kind == rc_hir.IK_REASSIGN:
+      var dsp = nosp()
+      if y >= 0: dsp = rc_build.decl_span(b, y)
+      rec(&e, rc_diags_hand.const_reassignment(name, sp, dsp))
+      return IFA(0, noplace(), "")
+    return IFA(1, pl(bnd.id, sp), "")
+  if kind == rc_hir.IK_REASSIGN: return IFA(2, noplace(), name)
+  if bnd.kind == 1: rec(&e, rc_diags.invariant_could_not_find_binding_declaration(sp))
+  else: rec(&e, rc_diags.invariant_could_not_find_binding_declaration_2(sp))
+  return IFA(0, noplace(), "")
+
+# a binding pattern's span: an element with a default spans its target and default
+fn bp_span(c: Ctx, n: Int) -> Sp:
+  if nk(c, n) == ast.N_BINDEL and c.t.nd[n].c > 0: return Sp(c.t.nd[c.t.nd[n].b].pos, c.t.nd[n].end)
+  if nk(c, n) == ast.N_BINDEL: return spn(c, c.t.nd[n].b)
+  return spn(c, n)
+
+# lower_binding_assignment: n is N_ID, N_OBJPAT, N_ARRPAT, or an element (N_BINDEL; one with a
+# default is an AssignmentPattern)
+fn lower_binding_assignment(c: Ctx, var b: Builder, var e: Env, sp: Sp, kind: Int, n0: Int, value: Place, style: Int) -> Place:
+  var n = n0
+  if nk(c, n) == ast.N_BINDEL and c.t.nd[n].c <= 0: n = c.t.nd[n].b
+  let k = nk(c, n)
+  if k == ast.N_BINDEL:
+    let psp = bp_span(c, n)
+    let temp = lower_default_to_temp(c, &b, &e, psp, c.t.nd[n].c, value)
+    if e.failed: return noplace()
+    return lower_binding_assignment(c, &b, &e, psp, kind, c.t.nd[n].b, temp, style)
+  if k == ast.N_ID:
+    let y = bind_sym(c, n)
+    let r = lower_identifier_for_assignment(c, &b, &e, sp, spn(c, n), kind, nm(c, n), c.t.nd[n].s, y)
+    if e.failed or r.kind == 0: return noplace()
+    if r.kind == 2: return lower_value_to_temporary(&b, &e, rc_hir.StoreGlobal(r.name, value, sp))
+    if rc_build.is_context_identifier(c, b, y):
+      let hoisted = y >= 0 and e.hoisted.get(y, false)
+      if kind == rc_hir.IK_CONST and not hoisted:
+        if not rec(&e, rc_diags.syntax_expected_const_declaration_not_reassigned(sp)): return noplace()
+      return lower_value_to_temporary(&b, &e, rc_hir.StoreContext(LValue(r.place, kind), value, sp))
+    return lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(r.place, kind), value, sp))
+  var fp: [Place] = []
+  var fn_: [Int] = []
+  if k == ast.N_ARRPAT:
+    var its: [Elem] = []
+    for el in items(c, c.t.nd[n].a):
+      if nk(c, el) == ast.N_OMIT:
+        its.push(Elem(2, noplace(), nosp()))
+        continue
+      let ed = c.t.nd[el]
+      let rest = (ed.f & ast.M_REST) != 0
+      let esp = spn(c, el)
+      if ed.c <= 0 and nk(c, ed.b) == ast.N_ID:
+        let id = ed.b
+        let y = bind_sym(c, id)
+        let direct = style == 0 or not rc_build.is_context_identifier(c, b, y)
+        var isp = spn(c, id)
+        var asp = isp
+        if rest: asp = esp
+        if direct:
+          let r = lower_identifier_for_assignment(c, &b, &e, asp, isp, kind, nm(c, id), c.t.nd[id].s, y)
+          if e.failed: return noplace()
+          if r.kind == 1:
+            if rest: its.push(Elem(1, r.place, esp))
+            else: its.push(Elem(0, r.place, nosp()))
+          elif r.kind == 2:
+            let temp = rc_build.temp_place(&e, asp)
+            rc_build.promote_temporary(&e, temp.identifier)
+            if rest: its.push(Elem(1, temp, esp))
+            else: its.push(Elem(0, temp, nosp()))
+            fp.push(temp)
+            fn_.push(id)
+          elif not rest: its.push(Elem(2, noplace(), nosp()))
+        else:
+          let temp = rc_build.temp_place(&e, asp)
+          rc_build.promote_temporary(&e, temp.identifier)
+          if rest: its.push(Elem(1, temp, esp))
+          else: its.push(Elem(0, temp, nosp()))
+          fp.push(temp)
+          fn_.push(id)
+        continue
+      var tsp = bp_span(c, el)
+      if rest: tsp = esp
+      let temp = rc_build.temp_place(&e, tsp)
+      rc_build.promote_temporary(&e, temp.identifier)
+      if rest:
+        its.push(Elem(1, temp, esp))
+        fp.push(temp)
+        fn_.push(ed.b)
+      else:
+        its.push(Elem(0, temp, nosp()))
+        fp.push(temp)
+        fn_.push(el)
+    let tmp = lower_value_to_temporary(&b, &e, rc_hir.Destructure(Pattern(false, its, [], spn(c, n)), kind, value, sp))
+    for i in 0..fp.len:
+      lower_binding_assignment(c, &b, &e, bp_span(c, fn_[i]), kind, fn_[i], fp[i], style)
+      if e.failed: return noplace()
+    return tmp
+  if k == ast.N_OBJPAT:
+    var props: [ObjProp] = []
+    for el in items(c, c.t.nd[n].a):
+      let ed = c.t.nd[el]
+      let esp = spn(c, el)
+      if (ed.f & ast.M_REST) != 0:
+        let arg = ed.b
+        if nk(c, arg) == ast.N_ID:
+          let y = bind_sym(c, arg)
+          let direct = style == 0 or not rc_build.is_context_identifier(c, b, y)
+          if direct:
+            let r = lower_identifier_for_assignment(c, &b, &e, esp, spn(c, arg), kind, nm(c, arg), c.t.nd[arg].s, y)
+            if e.failed: return noplace()
+            if r.kind == 1: props.push(ObjProp(true, no_key(), false, r.place, esp))
+            elif r.kind == 2:
+              if not rec(&e, rc_diags.todo_expected_reassignment_globals_enable_force_temporaries_2(esp)): return noplace()
+          else:
+            let temp = rc_build.temp_place(&e, esp)
+            rc_build.promote_temporary(&e, temp.identifier)
+            props.push(ObjProp(true, no_key(), false, temp, esp))
+            fp.push(temp)
+            fn_.push(arg)
+        else:
+          var kname = "unknown"
+          let ak = nk(c, arg)
+          if ak == ast.N_OBJPAT: kname = "ObjectPattern"
+          elif ak == ast.N_ARRPAT: kname = "ArrayPattern"
+          if not rec(&e, rc_diags.unsupported_object_pattern_rest(kname, esp)): return noplace()
+        continue
+      let keyn = ed.a
+      var computed = false
+      var kinner = keyn
+      if nk(c, keyn) == ast.N_COMPUTED:
+        computed = true
+        kinner = c.t.nd[keyn].a
+      if computed and nk(c, kinner) != ast.N_STR:
+        if not rec(&e, rc_diags.todo_build_hir_lower_assignment_handle_computed_properties_object_pattern(esp)): return noplace()
+        continue
+      var key = no_key()
+      if keyn <= 0: key = PropKey(1, nm(c, ed.b), noplace(), spn(c, ed.b))
+      else:
+        let kr = lower_object_property_key(c, &b, &e, kinner, computed)
+        if e.failed: return noplace()
+        if kr.kind < 0: continue
+        key = kr
+      if ed.c <= 0 and nk(c, ed.b) == ast.N_ID:
+        let id = ed.b
+        let y = bind_sym(c, id)
+        let direct = style == 0 or not rc_build.is_context_identifier(c, b, y)
+        let isp = spn(c, id)
+        if direct:
+          let r = lower_identifier_for_assignment(c, &b, &e, isp, isp, kind, nm(c, id), c.t.nd[id].s, y)
+          if e.failed: return noplace()
+          if r.kind == 1: props.push(ObjProp(false, key, false, r.place, nosp()))
+          elif r.kind == 2:
+            if not rec(&e, rc_diags.todo_expected_reassignment_globals_enable_force_temporaries(isp)): return noplace()
+        else:
+          let temp = rc_build.temp_place(&e, isp)
+          rc_build.promote_temporary(&e, temp.identifier)
+          props.push(ObjProp(false, key, false, temp, nosp()))
+          fp.push(temp)
+          fn_.push(id)
+        continue
+      var target = el
+      if ed.c <= 0: target = ed.b
+      let temp = rc_build.temp_place(&e, bp_span(c, target))
+      rc_build.promote_temporary(&e, temp.identifier)
+      props.push(ObjProp(false, key, false, temp, nosp()))
+      fp.push(temp)
+      fn_.push(target)
+    let tmp = lower_value_to_temporary(&b, &e, rc_hir.Destructure(Pattern(true, [], props, spn(c, n)), kind, value, sp))
+    for i in 0..fp.len:
+      lower_binding_assignment(c, &b, &e, bp_span(c, fn_[i]), kind, fn_[i], fp[i], style)
+      if e.failed: return noplace()
+    return tmp
+  return noplace()
+
+fn no_key() -> PropKey:
+  return PropKey(0, "", noplace(), nosp())
+
+# the ternary that picks a default (lower_default_to_temp / lower_assignment_target_default)
+fn lower_default_to_temp(c: Ctx, var b: Builder, var e: Env, psp: Sp, default: Int, value: Place) -> Place:
+  let temp = rc_build.temp_place(&e, psp)
+  let test_blk = rc_build.reserve(&e)
+  let cont = rc_build.reserve(&e)
+  let ck = b.cur_kind
+  let cblk = rc_build.reserve(&e)
+  var w = rc_build.enter_reserved(&b, cblk, rc_hir.BK_VALUE)
+  let dv = lower_reorderable_expression(c, &b, &e, default)
+  if e.failed: return noplace()
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(temp, rc_hir.IK_CONST), dv, psp))
+  rc_build.leave_reserved(&b, &w, goto(cont, rc_hir.GV_BREAK, psp))
+  let ablk = rc_build.reserve(&e)
+  var w2 = rc_build.enter_reserved(&b, ablk, rc_hir.BK_VALUE)
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(temp, rc_hir.IK_CONST), value, psp))
+  rc_build.leave_reserved(&b, &w2, goto(cont, rc_hir.GV_BREAK, psp))
+  rc_build.terminate_with_continuation(&b, rc_hir.Ternary(test_blk, cont, 0, psp), test_blk, rc_hir.BK_VALUE)
+  let undef = lower_value_to_temporary(&b, &e, undefined_value(psp))
+  let test = lower_value_to_temporary(&b, &e, rc_hir.BinaryExpression(T_EQ3, value, undef, psp))
+  rc_build.terminate_with_continuation(&b, rc_hir.Branch(test, cblk, ablk, cont, 0, psp), cont, ck)
+  return temp
+
+fn lower_store_to_identifier(c: Ctx, var b: Builder, var e: Env, sp: Sp, kind: Int, id: Int, value: Place, const_check: Bool) -> Place:
+  let y = ref_sym(c, id)
+  let r = lower_identifier_for_assignment(c, &b, &e, sp, id_sp(c, id), kind, nm(c, id), c.t.nd[id].s, y)
+  if e.failed or r.kind == 0: return noplace()
+  if r.kind == 2: return lower_value_to_temporary(&b, &e, rc_hir.StoreGlobal(r.name, value, sp))
+  if rc_build.is_context_identifier(c, b, y):
+    if const_check:
+      let hoisted = y >= 0 and e.hoisted.get(y, false)
+      if kind == rc_hir.IK_CONST and not hoisted:
+        if not rec(&e, rc_diags.syntax_expected_const_declaration_not_reassigned_2(sp)): return noplace()
+    return lower_value_to_temporary(&b, &e, rc_hir.StoreContext(LValue(r.place, kind), value, sp))
+  return lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(r.place, kind), value, sp))
+
+fn lower_member_assignment_target(c: Ctx, var b: Builder, var e: Env, sp: Sp, kind: Int, n: Int, value: Place) -> Place:
+  if kind != rc_hir.IK_REASSIGN:
+    rec(&e, rc_diags.invariant_member_expression_may_only_appear_assignment_expression(sp))
+    return noplace()
+  let nd = c.t.nd[n]
+  let object = lower_expression_to_temporary(c, &b, &e, nd.a)
+  if e.failed: return noplace()
+  if nd.k == ast.N_PROPACCESS and (nd.f & 4) != 0:
+    if not rec(&e, rc_diags.todo_build_hir_lower_assignment_handle_private_name_properties_member_expression(prop_sp(c, n))): return noplace()
+    return lower_value_to_temporary(&b, &e, undefined_value(sp))
+  if nd.k == ast.N_PROPACCESS: return lower_value_to_temporary(&b, &e, rc_hir.PropertyStore(object, plit_str(nm(c, n)), false, prop_sp(c, n), value, sp))
+  if nk(c, nd.b) == ast.N_NUM: return lower_value_to_temporary(&b, &e, rc_hir.PropertyStore(object, plit_num(num_of(c, nd.b)), true, spn(c, nd.b), value, sp))
+  let prop = lower_expression_to_temporary(c, &b, &e, nd.b)
+  if e.failed: return noplace()
+  return lower_value_to_temporary(&b, &e, rc_hir.ComputedStore(object, prop, value, sp))
+
+# an assignment target that is a plain local identifier
+fn target_is_local_identifier(c: Ctx, var b: Builder, var e: Env, n0: Int) -> Bool:
+  let n = without_parens(c, n0)
+  if nk(c, n) != ast.N_ID: return false
+  let y = ref_sym(c, n)
+  if rc_build.is_context_identifier(c, b, y): return false
+  let bnd = rc_build.resolve_identifier(&b, &e, c, nm(c, n), spn(c, n), y)
+  return bnd.kind == 0
+
+# followups: kind 0 a target, 1 a target that may have a default, 2 an identifier, 3 a
+# shorthand identifier with a default
+type Follow:
+  kind: Int
+  node: Int
+  place: Place
+
+fn lower_followup(c: Ctx, var b: Builder, var e: Env, kind: Int, f: Follow, style: Int) -> Place:
+  if f.kind == 0: return lower_assignment_target(c, &b, &e, spn(c, f.node), kind, f.node, f.place, style)
+  if f.kind == 1:
+    let m = without_parens(c, f.node)
+    if nk(c, m) == ast.N_BINARY and c.t.nd[m].f == T_ASSIGN: return lower_assignment_target_default(c, &b, &e, spn(c, m), kind, c.t.nd[m].b, c.t.nd[m].a, false, f.place, style)
+    return lower_assignment_target(c, &b, &e, spn(c, m), kind, m, f.place, style)
+  if f.kind == 2: return lower_store_to_identifier(c, &b, &e, id_sp(c, f.node), kind, f.node, f.place, false)
+  return lower_assignment_target_default(c, &b, &e, spn(c, f.node), kind, c.t.nd[f.node].b, f.node, true, f.place, style)
+
+fn lower_assignment_target_default(c: Ctx, var b: Builder, var e: Env, sp: Sp, kind: Int, default: Int, binding: Int, is_ident: Bool, value: Place, style: Int) -> Place:
+  let temp = lower_default_to_temp(c, &b, &e, sp, default, value)
+  if e.failed: return noplace()
+  if is_ident: return lower_store_to_identifier(c, &b, &e, sp, kind, binding, temp, false)
+  return lower_assignment_target(c, &b, &e, sp, kind, binding, temp, style)
+
+fn lower_assignment_target(c: Ctx, var b: Builder, var e: Env, sp: Sp, kind: Int, n0: Int, value: Place, style: Int) -> Place:
+  let n = without_parens(c, n0)
+  let k = nk(c, n)
+  if k == ast.N_ID: return lower_store_to_identifier(c, &b, &e, sp, kind, n, value, true)
+  if is_member(c, n): return lower_member_assignment_target(c, &b, &e, sp, kind, n, value)
+  if k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_NONNULL or k == ast.N_TYPEASSERT:
+    let x = inner_expr(c, n)
+    if is_member(c, x): return lower_member_assignment_target(c, &b, &e, sp, kind, x, value)
+    if nk(c, x) == ast.N_ID: return lower_store_to_identifier(c, &b, &e, sp, kind, x, value, true)
+    return noplace()
+  var fs: [Follow] = []
+  if k == ast.N_ARRAY:
+    let els = items(c, c.t.nd[n].a)
+    var force = false
+    if kind == rc_hir.IK_REASSIGN:
+      for el in els:
+        if nk(c, el) == ast.N_SPREAD: force = true
+      for el in els:
+        if force: break
+        if nk(c, el) == ast.N_OMIT:
+          force = true
+          break
+        if not target_is_local_identifier(c, &b, &e, el):
+          force = true
+          break
+      if e.failed: return noplace()
+    var its: [Elem] = []
+    for el0 in els:
+      let ek = nk(c, el0)
+      if ek == ast.N_OMIT:
+        its.push(Elem(2, noplace(), nosp()))
+        continue
+      if ek == ast.N_SPREAD:
+        let rsp = spn(c, el0)
+        let tgt = without_parens(c, c.t.nd[el0].a)
+        if nk(c, tgt) == ast.N_ID:
+          let y = ref_sym(c, tgt)
+          let direct = not force and (style == 0 or not rc_build.is_context_identifier(c, b, y))
+          if direct:
+            let r = lower_identifier_for_assignment(c, &b, &e, rsp, spn(c, tgt), kind, nm(c, tgt), c.t.nd[tgt].s, y)
+            if e.failed: return noplace()
+            if r.kind == 1: its.push(Elem(1, r.place, rsp))
+            elif r.kind == 2:
+              let temp = rc_build.temp_place(&e, rsp)
+              rc_build.promote_temporary(&e, temp.identifier)
+              its.push(Elem(1, temp, rsp))
+              fs.push(Follow(0, tgt, temp))
+            continue
+        let temp = rc_build.temp_place(&e, rsp)
+        rc_build.promote_temporary(&e, temp.identifier)
+        its.push(Elem(1, temp, rsp))
+        fs.push(Follow(0, tgt, temp))
+        continue
+      let el = without_parens(c, el0)
+      if nk(c, el) == ast.N_ID:
+        let y = ref_sym(c, el)
+        let isp = spn(c, el)
+        let direct = not force and (style == 0 or not rc_build.is_context_identifier(c, b, y))
+        if direct:
+          let r = lower_identifier_for_assignment(c, &b, &e, isp, isp, kind, nm(c, el), c.t.nd[el].s, y)
+          if e.failed: return noplace()
+          if r.kind == 1: its.push(Elem(0, r.place, nosp()))
+          elif r.kind == 2:
+            let temp = rc_build.temp_place(&e, isp)
+            rc_build.promote_temporary(&e, temp.identifier)
+            its.push(Elem(0, temp, nosp()))
+            fs.push(Follow(1, el, temp))
+          else: its.push(Elem(2, noplace(), nosp()))
+        else:
+          let temp = rc_build.temp_place(&e, isp)
+          rc_build.promote_temporary(&e, temp.identifier)
+          its.push(Elem(0, temp, nosp()))
+          fs.push(Follow(1, el, temp))
+        continue
+      let temp = rc_build.temp_place(&e, spn(c, el))
+      rc_build.promote_temporary(&e, temp.identifier)
+      its.push(Elem(0, temp, nosp()))
+      fs.push(Follow(1, el, temp))
+    let tmp = lower_value_to_temporary(&b, &e, rc_hir.Destructure(Pattern(false, its, [], spn(c, n)), kind, value, sp))
+    for f in fs:
+      lower_followup(c, &b, &e, kind, f, style)
+      if e.failed: return noplace()
+    return tmp
+  if k == ast.N_OBJECT:
+    let ps = items(c, c.t.nd[n].a)
+    var force = false
+    if kind == rc_hir.IK_REASSIGN:
+      for p in ps:
+        if nk(c, p) == ast.N_SPREAD: force = true
+      for p in ps:
+        if force: break
+        let pk = nk(c, p)
+        if pk == ast.N_SHORTHAND:
+          if c.t.nd[p].b > 0:
+            force = true
+            break
+          let bnd = rc_build.resolve_identifier(&b, &e, c, nm(c, p), id_sp(c, p), ref_sym(c, p))
+          if e.failed: return noplace()
+          if bnd.kind != 0:
+            force = true
+            break
+        elif pk == ast.N_PROPASSIGN:
+          if not target_is_local_identifier(c, &b, &e, c.t.nd[p].b):
+            force = true
+            break
+          if e.failed: return noplace()
+    var props: [ObjProp] = []
+    for p in ps:
+      let pk = nk(c, p)
+      let psp = spn(c, p)
+      if pk == ast.N_SHORTHAND:
+        let isp = id_sp(c, p)
+        let key = PropKey(1, nm(c, p), noplace(), isp)
+        if c.t.nd[p].b > 0:
+          let temp = rc_build.temp_place(&e, psp)
+          rc_build.promote_temporary(&e, temp.identifier)
+          props.push(ObjProp(false, key, false, temp, nosp()))
+          fs.push(Follow(3, p, temp))
+          continue
+        let y = ref_sym(c, p)
+        let direct = not force and (style == 0 or not rc_build.is_context_identifier(c, b, y))
+        if direct:
+          let r = lower_identifier_for_assignment(c, &b, &e, isp, isp, kind, nm(c, p), c.t.nd[p].s, y)
+          if e.failed: return noplace()
+          if r.kind == 1: props.push(ObjProp(false, key, false, r.place, nosp()))
+          elif r.kind == 2:
+            if not rec(&e, rc_diags.todo_expected_reassignment_globals_enable_force_temporaries_3(isp)): return noplace()
+        else:
+          let temp = rc_build.temp_place(&e, isp)
+          rc_build.promote_temporary(&e, temp.identifier)
+          props.push(ObjProp(false, key, false, temp, nosp()))
+          fs.push(Follow(2, p, temp))
+        continue
+      if pk == ast.N_PROPASSIGN:
+        let keyn = c.t.nd[p].a
+        var computed = false
+        var kinner = keyn
+        if nk(c, keyn) == ast.N_COMPUTED:
+          computed = true
+          kinner = c.t.nd[keyn].a
+        if computed and nk(c, kinner) != ast.N_STR:
+          if not rec(&e, rc_diags.todo_build_hir_lower_assignment_handle_computed_properties_object_pattern_2(psp)): return noplace()
+          continue
+        let key = lower_object_property_key(c, &b, &e, kinner, computed)
+        if e.failed: return noplace()
+        if key.kind < 0: continue
+        let tgt = without_parens(c, c.t.nd[p].b)
+        if nk(c, tgt) == ast.N_ID:
+          let y = ref_sym(c, tgt)
+          let isp = spn(c, tgt)
+          let direct = not force and (style == 0 or not rc_build.is_context_identifier(c, b, y))
+          if direct:
+            let r = lower_identifier_for_assignment(c, &b, &e, isp, isp, kind, nm(c, tgt), c.t.nd[tgt].s, y)
+            if e.failed: return noplace()
+            if r.kind == 1: props.push(ObjProp(false, key, false, r.place, nosp()))
+            elif r.kind == 2:
+              if not rec(&e, rc_diags.todo_expected_reassignment_globals_enable_force_temporaries_4(isp)): return noplace()
+          else:
+            let temp = rc_build.temp_place(&e, isp)
+            rc_build.promote_temporary(&e, temp.identifier)
+            props.push(ObjProp(false, key, false, temp, nosp()))
+            fs.push(Follow(1, tgt, temp))
+          continue
+        let temp = rc_build.temp_place(&e, spn(c, tgt))
+        rc_build.promote_temporary(&e, temp.identifier)
+        props.push(ObjProp(false, key, false, temp, nosp()))
+        fs.push(Follow(1, tgt, temp))
+        continue
+      if pk == ast.N_SPREAD:
+        let tgt = without_parens(c, c.t.nd[p].a)
+        if nk(c, tgt) == ast.N_ID:
+          let y = ref_sym(c, tgt)
+          let direct = not force and (style == 0 or not rc_build.is_context_identifier(c, b, y))
+          if direct:
+            let r = lower_identifier_for_assignment(c, &b, &e, psp, spn(c, tgt), kind, nm(c, tgt), c.t.nd[tgt].s, y)
+            if e.failed: return noplace()
+            if r.kind == 1: props.push(ObjProp(true, no_key(), false, r.place, psp))
+            elif r.kind == 2:
+              if not rec(&e, rc_diags.todo_expected_reassignment_globals_enable_force_temporaries_5(psp)): return noplace()
+          else:
+            let temp = rc_build.temp_place(&e, psp)
+            rc_build.promote_temporary(&e, temp.identifier)
+            props.push(ObjProp(true, no_key(), false, temp, psp))
+            fs.push(Follow(0, tgt, temp))
+        else:
+          var kname = "unknown"
+          let tk = nk(c, tgt)
+          if tk == ast.N_OBJECT: kname = "ObjectPattern"
+          elif tk == ast.N_ARRAY: kname = "ArrayPattern"
+          elif is_member(c, tgt): kname = "MemberExpression"
+          if not rec(&e, rc_diags.unsupported_object_pattern_rest(kname, psp)): return noplace()
+    let tmp = lower_value_to_temporary(&b, &e, rc_hir.Destructure(Pattern(true, [], props, spn(c, n)), kind, value, sp))
+    for f in fs:
+      lower_followup(c, &b, &e, kind, f, style)
+      if e.failed: return noplace()
+    return tmp
+  return noplace()
+
+# a simple assignment target: 1 an identifier, 2 a member (and the node), 0 neither
+fn simple_target(c: Ctx, n0: Int) -> Int:
+  let n = without_parens(c, n0)
+  let k = nk(c, n)
+  if k == ast.N_ID: return 1
+  if is_member(c, n): return 2
+  if k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_NONNULL or k == ast.N_TYPEASSERT:
+    let x = inner_expr(c, n)
+    if nk(c, x) == ast.N_ID: return 1
+    if is_member(c, x): return 2
+  return 0
+
+fn compound_op(op: Int) -> Int:
+  if op == scan.T_PLUSEQ: return T_PLUS
+  if op == scan.T_MINUSEQ: return T_MINUS
+  if op == scan.T_STAREQ: return scan.T_STAR
+  if op == scan.T_SLASHEQ: return scan.T_SLASH
+  if op == scan.T_PCTEQ: return scan.T_PCT
+  if op == scan.T_STAR2EQ: return scan.T_STAR2
+  if op == scan.T_SHLEQ: return scan.T_SHL
+  if op == scan.T_SHREQ: return scan.T_SHR
+  if op == scan.T_SHRUEQ: return scan.T_SHRU
+  if op == scan.T_BAREQ: return scan.T_BAR
+  if op == scan.T_CARETEQ: return scan.T_CARET
+  if op == scan.T_AMPEQ: return scan.T_AMP
+  return -1
+
+fn lower_member_assignment_expression(c: Ctx, var b: Builder, var e: Env, n: Int, right: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  let msp = spn(c, n)
+  let object = lower_expression_to_temporary(c, &b, &e, nd.a)
+  if e.failed: return undefined_value(nosp())
+  var temp = noplace()
+  if nd.k == ast.N_PROPACCESS and (nd.f & 4) != 0:
+    let prop = lower_private_name_to_temporary(&b, &e, prop_sp(c, n))
+    if e.failed: return undefined_value(nosp())
+    let value = lower_expression_to_temporary(c, &b, &e, right)
+    if e.failed: return undefined_value(nosp())
+    temp = lower_value_to_temporary(&b, &e, rc_hir.ComputedStore(object, prop, value, msp))
+  elif nd.k == ast.N_PROPACCESS:
+    let value = lower_expression_to_temporary(c, &b, &e, right)
+    if e.failed: return undefined_value(nosp())
+    temp = lower_value_to_temporary(&b, &e, rc_hir.PropertyStore(object, plit_str(nm(c, n)), false, prop_sp(c, n), value, msp))
+  elif nk(c, nd.b) == ast.N_NUM:
+    let value = lower_expression_to_temporary(c, &b, &e, right)
+    if e.failed: return undefined_value(nosp())
+    temp = lower_value_to_temporary(&b, &e, rc_hir.PropertyStore(object, plit_num(num_of(c, nd.b)), true, spn(c, nd.b), value, msp))
+  else:
+    let prop = lower_expression_to_temporary(c, &b, &e, nd.b)
+    if e.failed: return undefined_value(nosp())
+    let value = lower_expression_to_temporary(c, &b, &e, right)
+    if e.failed: return undefined_value(nosp())
+    temp = lower_value_to_temporary(&b, &e, rc_hir.ComputedStore(object, prop, value, msp))
+  return rc_hir.LoadLocal(temp, temp.sp)
+
+fn lower_assignment_expression(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  let left = without_parens(c, nd.a)
+  if nd.f == T_ASSIGN:
+    if simple_target(c, left) == 2:
+      var m = left
+      if not is_member(c, m): m = inner_expr(c, m)
+      return lower_member_assignment_expression(c, &b, &e, m, nd.b)
+    if nk(c, left) == ast.N_ID:
+      let y = ref_sym(c, left)
+      let right = lower_expression_to_temporary(c, &b, &e, nd.b)
+      if e.failed: return undefined_value(nosp())
+      let isp = spn(c, left)
+      let name = nm(c, left)
+      let bnd = rc_build.resolve_identifier(&b, &e, c, name, isp, y)
+      if e.failed: return undefined_value(nosp())
+      if bnd.kind == 0:
+        if bnd.binding_kind == rc_sem.BK_CONST:
+          var dsp = nosp()
+          if y >= 0: dsp = rc_build.decl_span(b, y)
+          if not rec(&e, rc_diags_hand.const_reassignment(name, isp, dsp)): return undefined_value(nosp())
+          return undefined_value(isp)
+        let place = pl(bnd.id, isp)
+        if rc_build.is_context_identifier(c, b, y):
+          let t = lower_value_to_temporary(&b, &e, rc_hir.StoreContext(LValue(place, rc_hir.IK_REASSIGN), right, isp))
+          return rc_hir.LoadLocal(t, t.sp)
+        let t = lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_REASSIGN), right, isp))
+        return rc_hir.LoadLocal(t, t.sp)
+      let t = lower_value_to_temporary(&b, &e, rc_hir.StoreGlobal(name, right, isp))
+      return rc_hir.LoadLocal(t, t.sp)
+    let right = lower_expression_to_temporary(c, &b, &e, nd.b)
+    if e.failed: return undefined_value(nosp())
+    let r = lower_assignment_target(c, &b, &e, spn(c, left), rc_hir.IK_REASSIGN, left, right, 1)
+    if e.failed: return undefined_value(nosp())
+    if r.identifier >= 0: return rc_hir.LoadLocal(r, r.sp)
+    return rc_hir.LoadLocal(right, sp)
+  if nd.f == scan.T_ANDEQ or nd.f == scan.T_OREQ or nd.f == scan.T_QQEQ:
+    if not rec(&e, rc_diags.todo_logical_assignment_operators_not_yet_supported(sp)): return undefined_value(nosp())
+    return undefined_value(sp)
+  let bop = compound_op(nd.f)
+  let st = simple_target(c, left)
+  if st == 1:
+    let id = inner_expr(c, left)
+    let isp = spn(c, id)
+    let name = nm(c, id)
+    let y = ref_sym(c, id)
+    var lp = lower_identifier(c, &b, &e, name, isp, y)
+    if e.failed: return undefined_value(nosp())
+    let is_ctx = rc_build.is_context_identifier(c, b, y)
+    if is_ctx: lp = lower_value_to_temporary(&b, &e, rc_hir.LoadContext(lp, isp, false))
+    else: lp = lower_value_to_temporary(&b, &e, rc_hir.LoadLocal(lp, isp))
+    let right = lower_expression_to_temporary(c, &b, &e, nd.b)
+    if e.failed: return undefined_value(nosp())
+    let bp = lower_value_to_temporary(&b, &e, rc_hir.BinaryExpression(bop, lp, right, sp))
+    let bnd = rc_build.resolve_identifier(&b, &e, c, name, isp, y)
+    if e.failed: return undefined_value(nosp())
+    if bnd.kind == 0:
+      let place = pl(bnd.id, isp)
+      if rc_build.is_context_identifier(c, b, y):
+        lower_value_to_temporary(&b, &e, rc_hir.StoreContext(LValue(place, rc_hir.IK_REASSIGN), bp, sp))
+        return rc_hir.LoadContext(place, sp, true)
+      lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_REASSIGN), bp, sp))
+      return rc_hir.LoadLocal(place, sp)
+    let t = lower_value_to_temporary(&b, &e, rc_hir.StoreGlobal(name, bp, sp))
+    return rc_hir.LoadLocal(t, t.sp)
+  if st == 2:
+    var m = left
+    if not is_member(c, m): m = inner_expr(c, m)
+    let msp = spn(c, m)
+    var lm = lower_member_expression(c, &b, &e, m, noplace(), false)
+    if e.failed: return undefined_value(nosp())
+    var v = undefined_value(nosp())
+    swap(&v, &lm.value)
+    let cur = lower_value_to_temporary(&b, &e, v)
+    let right = lower_expression_to_temporary(c, &b, &e, nd.b)
+    if e.failed: return undefined_value(nosp())
+    let res = lower_value_to_temporary(&b, &e, rc_hir.BinaryExpression(bop, cur, right, msp))
+    if lm.is_lit: return rc_hir.PropertyStore(lm.object, plcopy(lm.lit), lm.computed, lm.prop_sp, res, msp)
+    return rc_hir.ComputedStore(lm.object, lm.prop, res, msp)
+  if not rec(&e, rc_diags.todo_compound_assignment_complex_pattern_not_yet_supported(sp)): return undefined_value(nosp())
+  return undefined_value(sp)
+
+# ---- optional chains
+
+fn lower_chain_expression(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let k = nk(c, n)
+  if k == ast.N_CALL: return lower_optional_call(c, &b, &e, n, -1)
+  if k == ast.N_NONNULL: return lower_chain_subexpr(c, &b, &e, c.t.nd[n].a)
+  let r = lower_optional_member(c, &b, &e, n, -1)
+  if e.failed: return undefined_value(nosp())
+  return rc_hir.LoadLocal(r[1], r[1].sp)
+
+fn lower_chain_subexpr(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let k = nk(c, n)
+  if is_member(c, n) and contains_optional(c, n):
+    let r = lower_optional_member(c, &b, &e, n, -1)
+    if e.failed: return undefined_value(nosp())
+    return rc_hir.LoadLocal(r[1], r[1].sp)
+  if k == ast.N_CALL and contains_optional(c, n): return lower_optional_call(c, &b, &e, n, -1)
+  if k == ast.N_NONNULL: return lower_chain_subexpr(c, &b, &e, c.t.nd[n].a)
+  return lower_expression(c, &b, &e, n)
+
+# the alternate (the value undefined) unless a parent chain's is given
+fn optional_alternate(var b: Builder, var e: Env, parent_alt: Int, place: Place, cont: Int, sp: Sp) -> Int:
+  if parent_alt >= 0: return parent_alt
+  let blk = rc_build.reserve(&e)
+  var w = rc_build.enter_reserved(&b, blk, rc_hir.BK_VALUE)
+  let t = lower_value_to_temporary(&b, &e, undefined_value(sp))
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), t, sp))
+  rc_build.leave_reserved(&b, &w, goto(cont, rc_hir.GV_BREAK, sp))
+  return blk
+
+# (object, place)
+fn lower_optional_member(c: Ctx, var b: Builder, var e: Env, n: Int, parent_alt: Int) -> [Place]:
+  let nd = c.t.nd[n]
+  let optional = (nd.f & 1) != 0
+  let sp = spn(c, n)
+  let place = rc_build.temp_place(&e, sp)
+  let cont = rc_build.reserve(&e)
+  let ck = b.cur_kind
+  let consequent = rc_build.reserve(&e)
+  let alternate = optional_alternate(&b, &e, parent_alt, place, cont, sp)
+  let ox = nd.a
+  let test_blk = rc_build.reserve(&e)
+  var w = rc_build.enter_reserved(&b, test_blk, rc_hir.BK_VALUE)
+  var object = noplace()
+  if is_member(c, ox) and contains_optional(c, ox):
+    let r = lower_optional_member(c, &b, &e, ox, alternate)
+    if e.failed: return [noplace(), noplace()]
+    object = r[1]
+  elif nk(c, ox) == ast.N_CALL and contains_optional(c, ox):
+    let v = lower_optional_call(c, &b, &e, ox, alternate)
+    if e.failed: return [noplace(), noplace()]
+    object = lower_value_to_temporary(&b, &e, v)
+  elif nk(c, ox) == ast.N_NONNULL:
+    let v = lower_chain_subexpr(c, &b, &e, ox)
+    if e.failed: return [noplace(), noplace()]
+    object = lower_value_to_temporary(&b, &e, v)
+  else:
+    object = lower_expression_to_temporary(c, &b, &e, ox)
+    if e.failed: return [noplace(), noplace()]
+  rc_build.leave_reserved(&b, &w, rc_hir.Branch(object, consequent, alternate, cont, 0, sp))
+  var w2 = rc_build.enter_reserved(&b, consequent, rc_hir.BK_VALUE)
+  var lm = lower_member_expression(c, &b, &e, n, object, false)
+  if e.failed: return [noplace(), noplace()]
+  var v = undefined_value(nosp())
+  swap(&v, &lm.value)
+  let t = lower_value_to_temporary(&b, &e, v)
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), t, sp))
+  rc_build.leave_reserved(&b, &w2, goto(cont, rc_hir.GV_BREAK, sp))
+  rc_build.terminate_with_continuation(&b, rc_hir.Optional(optional, test_blk, cont, 0, sp), cont, ck)
+  return [object, place]
+
+fn lower_optional_call(c: Ctx, var b: Builder, var e: Env, n: Int, parent_alt: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  let place = rc_build.temp_place(&e, sp)
+  let cont = rc_build.reserve(&e)
+  let ck = b.cur_kind
+  let consequent = rc_build.reserve(&e)
+  let alternate = optional_alternate(&b, &e, parent_alt, place, cont, sp)
+  let callee = nd.a
+  var is_method = false
+  var receiver = noplace()
+  var cp = noplace()
+  let test_blk = rc_build.reserve(&e)
+  var w = rc_build.enter_reserved(&b, test_blk, rc_hir.BK_VALUE)
+  let ck2 = nk(c, callee)
+  if ck2 == ast.N_CALL and contains_optional(c, callee):
+    let v = lower_optional_call(c, &b, &e, callee, alternate)
+    if e.failed: return undefined_value(nosp())
+    cp = lower_value_to_temporary(&b, &e, v)
+  elif is_member(c, callee) and contains_optional(c, callee):
+    let r = lower_optional_member(c, &b, &e, callee, alternate)
+    if e.failed: return undefined_value(nosp())
+    is_method = true
+    receiver = r[0]
+    cp = r[1]
+  elif is_member(c, callee):
+    var lm = lower_member_expression(c, &b, &e, callee, noplace(), false)
+    if e.failed: return undefined_value(nosp())
+    var v = undefined_value(nosp())
+    swap(&v, &lm.value)
+    is_method = true
+    receiver = lm.object
+    cp = lower_value_to_temporary(&b, &e, v)
+  elif ck2 == ast.N_NONNULL:
+    var inner = callee
+    while nk(c, inner) == ast.N_NONNULL: inner = c.t.nd[inner].a
+    if is_member(c, inner):
+      if contains_optional(c, inner):
+        let r = lower_optional_member(c, &b, &e, inner, alternate)
+        if e.failed: return undefined_value(nosp())
+        receiver = r[0]
+        cp = r[1]
+      else:
+        var lm = lower_member_expression(c, &b, &e, inner, noplace(), false)
+        if e.failed: return undefined_value(nosp())
+        var v = undefined_value(nosp())
+        swap(&v, &lm.value)
+        receiver = lm.object
+        cp = lower_value_to_temporary(&b, &e, v)
+      is_method = true
+    else:
+      let v = lower_chain_subexpr(c, &b, &e, callee)
+      if e.failed: return undefined_value(nosp())
+      cp = lower_value_to_temporary(&b, &e, v)
+  else:
+    cp = lower_expression_to_temporary(c, &b, &e, callee)
+    if e.failed: return undefined_value(nosp())
+  rc_build.leave_reserved(&b, &w, rc_hir.Branch(cp, consequent, alternate, cont, 0, sp))
+  var w2 = rc_build.enter_reserved(&b, consequent, rc_hir.BK_VALUE)
+  let args = lower_arguments(c, &b, &e, nd.c)
+  if e.failed: return undefined_value(nosp())
+  let t = rc_build.temp_place(&e, sp)
+  if is_method: rc_build.push(&b, &e, Instruction(0, t, rc_hir.MethodCall(receiver, cp, args, sp), sp, [], false))
+  else: rc_build.push(&b, &e, Instruction(0, t, rc_hir.CallExpression(cp, args, sp), sp, [], false))
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), t, sp))
+  rc_build.leave_reserved(&b, &w2, goto(cont, rc_hir.GV_BREAK, sp))
+  rc_build.terminate_with_continuation(&b, rc_hir.Optional((nd.f & 1) != 0, test_blk, cont, 0, sp), cont, ck)
+  return rc_hir.LoadLocal(place, place.sp)
+
+# ---- functions
+
+fn lower_function_to_value(c: Ctx, var b: Builder, var e: Env, n: Int, expr_type: Int) -> InstrValue:
+  let sp = spn(c, n)
+  var name = ""
+  var name_sp = nosp()
+  if nk(c, n) == ast.N_FUNCEXPR and c.t.nd[n].s >= 0:
+    name = nm(c, n)
+    name_sp = fn_name_sp(c, n)
+  let func = lower_function(c, &b, &e, n)
+  if e.failed: return undefined_value(nosp())
+  return rc_hir.FunctionExpression(name, name_sp, "", func, expr_type, sp)
+
+# gather_captured_context: the bindings of the scopes between the function and the component
+# that the function references (each with its first reference's span), in source order
+fn gather_captured_context(c: Ctx, b: Builder, fs: Int, root: Int) -> [Int]:
+  var out: [Int] = []
+  let ps = c.m.spar[fs]
+  if ps < 0: return out
+  let pure = capture_scopes(c, ps, b.component_scope)
+  let rs = c.t.nd[root].pos
+  let re = c.t.nd[root].end
+  var ys: [Int] = []
+  var pos: [Int] = []
+  var ss: [Int] = []
+  var se: [Int] = []
+  for y in 0..c.m.yn.len:
+    let dk = c.m.ydk[y]
+    if dk == rc_sem.DK_TYPE_ALIAS or dk == rc_sem.DK_ENUM: continue
+    if not pure.get(rc_sem.symbol_scope(c.m, y), false): continue
+    let ds = c.m.yst[y]
+    var best = -1
+    var bs = Sp(-1, -1)
+    for r in c.m.yrefs[y]:
+      if not loc_has(b.idx, r): continue
+      if b.idx.rtype.get(r, false): continue
+      let s = loc_sp(b.idx, r)
+      if s.s < rs or s.s >= re: continue
+      if s.s == ds: continue
+      var span = s
+      if loc_is_jsx(b.idx, r): span = Sp(b.idx.rjsx_s[r], b.idx.rjsx_e[r])
+      if best < 0 or s.s < best:
+        best = s.s
+        bs = span
+    if best >= 0:
+      ys.push(y)
+      pos.push(best)
+      ss.push(bs.s)
+      se.push(bs.e)
+  # (by first reference)
+  var order: [Int] = []
+  for i in 0..ys.len: order.push(i)
+  var i = 1
+  while i < order.len:
+    var j = i
+    while j > 0 and pos[order[j]] < pos[order[j - 1]]:
+      let t = order[j]
+      order[j] = order[j - 1]
+      order[j - 1] = t
+      j -= 1
+    i += 1
+  for o in order:
+    out.push(ys[o])
+    out.push(ss[o])
+    out.push(se[o])
+  return out
+
+fn lower_function(c: Ctx, var b: Builder, var e: Env, n: Int) -> Int:
+  let f = fn_parts(c, n)
+  let fs = c.m.scope_of.get(n, 0)
+  let cap = gather_captured_context(c, b, fs, n)
+  var cs: [Int] = []
+  var csp: [Sp] = []
+  for i in 0..b.ctx_syms.len:
+    cs.push(b.ctx_syms[i])
+    csp.push(b.ctx_sp[i])
+  var i = 0
+  while i + 2 < cap.len:
+    let y = cap[i]
+    let s = Sp(cap[i + 1], cap[i + 2])
+    var found = false
+    for j in 0..cs.len:
+      if cs[j] == y:
+        csp[j] = s
+        found = true
+    if not found:
+      cs.push(y)
+      csp.push(s)
+    i += 3
+  var bsy: [Int] = []
+  var bid: [Int] = []
+  for j in 0..b.bind_syms.len:
+    bsy.push(b.bind_syms[j])
+    bid.push(b.bind_ids[j])
+  var un: [Str] = []
+  var us: [Int] = []
+  for j in 0..b.used_names.len:
+    un.push(b.used_names[j] + "")
+    us.push(b.used_syms[j])
+  let par = Parent(bsy, bid, un, us, cs, csp)
+  let comp = b.component_scope
+  var cids: {Int: Bool} = {}
+  for y in b.context_ids: cids[y] = true
+  var r = lower_inner(c, &e, f, par, fs, comp, cids, false, &b.idx)
+  if e.failed: return -1
+  for j in 0..r.used_names.len: rc_build.add_used(&b, r.used_names[j], r.used_syms[j])
+  for j in 0..r.bind_syms.len:
+    if not (r.bind_syms[j] in b.bind_at): rc_build.add_bind(&b, r.bind_syms[j], r.bind_ids[j])
+  var func = empty_hir_function()
+  swap(&func, &r.func)
+  return rc_env.add_function(&e, func)
+
+# get_function_declaration_binding: the binding the name resolves to from the function's own scope
+# (a body-level local shadowing the name wins), by its current (renamed) name
+fn fn_binding_match(c: Ctx, b: Builder, e: Env, y: Int, name: Str) -> Int:
+  let id = b.bind_at.get(y, -1)
+  if id < 0: return -1
+  if e.identifiers[id].name_kind == 1 and e.identifiers[id].name == name: return 1
+  return 0
+
+fn get_function_declaration_binding(c: Ctx, b: Builder, e: Env, fs: Int, name: Str, name_id: Int) -> Int:
+  var cur = fs
+  while cur >= 0:
+    var found = -1
+    for y in c.m.sby[cur]:
+      if fn_binding_match(c, b, e, y, name) == 1:
+        found = y
+        break
+    if found < 0:
+      let y = rc_sem.get_binding(c.m, cur, name_id)
+      if y >= 0 and fn_binding_match(c, b, e, y, name) != 0: found = y
+    if found >= 0:
+      if not rc_build.scope_within_compiled(c, b, rc_sem.symbol_scope(c.m, found)): return -1
+      return found
+    cur = c.m.spar[cur]
+  return -1
+
+fn lower_function_declaration(c: Ctx, var b: Builder, var e: Env, n: Int):
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  let fs = c.m.scope_of.get(n, 0)
+  let func = lower_function(c, &b, &e, n)
+  if e.failed: return
+  var name = ""
+  var name_sp = nosp()
+  if nd.s >= 0:
+    name = nm(c, n)
+    name_sp = fn_name_sp(c, n)
+  let fp = lower_value_to_temporary(&b, &e, rc_hir.FunctionExpression(name, name_sp, "", func, rc_hir.FT_DECLARATION, sp))
+  if nd.s < 0: return
+  let y0 = get_function_declaration_binding(c, b, e, fs, name, nd.s)
+  var is_ctx = false
+  var bnd = VarBinding(1, -1, 0, name, "", "")
+  if y0 >= 0:
+    is_ctx = rc_sem.symbol_scope(c.m, y0) != 0 and b.context_ids.get(y0, false)
+    let bk = rc_sem.binding_kind(c.m, y0)
+    let id = rc_build.resolve_binding(&b, &e, c, name, y0, name_sp)
+    if e.failed: return
+    bnd = VarBinding(0, id, bk, name, "", "")
+  else:
+    bnd = rc_build.resolve_identifier(&b, &e, c, name, name_sp, bind_sym(c, n))
+    if e.failed: return
+    if bnd.kind == 1:
+      let y2 = rc_sem.find_binding(c.m, fs, nd.s)
+      if y2 >= 0:
+        bnd = rc_build.resolve_identifier(&b, &e, c, name, name_sp, y2)
+        if e.failed: return
+    if bnd.kind == 0: is_ctx = rc_build.is_context_identifier(c, b, bind_sym(c, n))
+  if bnd.kind == 0:
+    let place = pl(bnd.id, sp)
+    if is_ctx: lower_value_to_temporary(&b, &e, rc_hir.StoreContext(LValue(place, rc_hir.IK_FUNCTION), fp, sp))
+    else: lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_FUNCTION), fp, sp))
+  else:
+    rec(&e, rc_diags.missing_function_declaration_binding(name, sp))
+
+# ---- objects
+
+fn lower_object_property_key(c: Ctx, var b: Builder, var e: Env, key: Int, computed: Bool) -> PropKey:
+  let k = nk(c, key)
+  let sp = spn(c, key)
+  if k == ast.N_STR:
+    if has_lone_surrogate(c, key):
+      rec(&e, rc_diags.todo_unsupported_key_type_object_expression(sp))
+      rc_env.throw(&e, rc_diags.todo_unsupported_key_type_object_expression(sp))
+      return PropKey(-1, "", noplace(), nosp())
+    return PropKey(0, nm(c, key), noplace(), sp)
+  if k == ast.N_ID and not computed: return PropKey(1, nm(c, key), noplace(), sp)
+  if k == ast.N_NUM and not computed: return PropKey(1, fmt_num(num_of(c, key)), noplace(), sp)
+  if k == ast.N_BIGINT and not computed:
+    var v = nm(c, key)
+    if v.len > 0 and v[v.len - 1] == 'n': v = v[0..v.len - 1]
+    return PropKey(0, v, noplace(), sp)
+  if computed:
+    let p = lower_expression_to_temporary(c, &b, &e, key)
+    if e.failed: return PropKey(-1, "", noplace(), nosp())
+    return PropKey(2, "", p, sp)
+  var dsp = nosp()
+  if k == ast.N_ID: dsp = sp
+  rec(&e, rc_diags.todo_unsupported_key_type_object_expression(dsp))
+  return PropKey(-1, "", noplace(), nosp())
+
+# a string literal whose escapes leave a lone UTF-16 surrogate (oxc's value isn't a Rust str)
+fn unicode_escape_at(src: Str, i: Int, end: Int) -> [Int]:
+  # [code unit, length] of the \u escape at i, or [-1, 0]
+  if i + 1 >= end or src[i] != '\\' or src[i + 1] != 'u': return [-1, 0]
+  if i + 2 < end and src[i + 2] == '{':
+    var j = i + 3
+    var v = 0
+    while j < end and src[j] != '}':
+      v = v * 16 + scan.hexval(src[j])
+      j += 1
+    return [v, j + 1 - i]
+  if i + 6 > end: return [-1, 0]
+  var v = 0
+  for j in i + 2..i + 6: v = v * 16 + scan.hexval(src[j])
+  return [v, 6]
+
+fn has_lone_surrogate(c: Ctx, n: Int) -> Bool:
+  let nd = c.t.nd[n]
+  let src = c.src
+  var i = nd.pos + 1
+  let end = nd.end - 1
+  while i < end:
+    if src[i] == '\\':
+      let u = unicode_escape_at(src, i, end)
+      if u[0] < 0:
+        i += 2
+        continue
+      if u[0] >= 0xD800 and u[0] <= 0xDBFF:
+        let nx = unicode_escape_at(src, i + u[1], end)
+        if nx[0] >= 0xDC00 and nx[0] <= 0xDFFF:
+          i += u[1] + nx[1]
+          continue
+        return true
+      if u[0] >= 0xDC00 and u[0] <= 0xDFFF: return true
+      i += u[1]
+      continue
+    i += 1
+  return false
+
+fn key_parts(c: Ctx, keyn: Int) -> [Int]:
+  if nk(c, keyn) == ast.N_COMPUTED: return [c.t.nd[keyn].a, 1]
+  return [keyn, 0]
+
+fn lower_object_expression(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let sp = spn(c, n)
+  var props: [ObjProp] = []
+  for p in items(c, c.t.nd[n].a):
+    let pk = nk(c, p)
+    if pk == ast.N_METHOD or pk == ast.N_GET or pk == ast.N_SET:
+      let kind_str = ["method", "get", "set"]
+      var ki = 0
+      if pk == ast.N_GET: ki = 1
+      elif pk == ast.N_SET: ki = 2
+      if ki > 0:
+        let ps = spn(c, p)
+        var ke = ps.s + kind_str[ki].len
+        if ke > ps.e: ke = ps.e
+        if not rec(&e, rc_diags.unsupported_object_method(kind_str[ki], Sp(ps.s, ke))): return undefined_value(nosp())
+        continue
+      let kp = key_parts(c, c.t.nd[p].a)
+      var key = lower_object_property_key(c, &b, &e, kp[0], kp[1] == 1)
+      if e.failed: return undefined_value(nosp())
+      if key.kind < 0: key = PropKey(0, "", noplace(), nosp())
+      let func = lower_function(c, &b, &e, p)
+      if e.failed: return undefined_value(nosp())
+      let mp = lower_value_to_temporary(&b, &e, rc_hir.ObjectMethod(spn(c, p), func))
+      props.push(ObjProp(false, key, true, mp, nosp()))
+    elif pk == ast.N_PROPASSIGN:
+      let kp = key_parts(c, c.t.nd[p].a)
+      let key = lower_object_property_key(c, &b, &e, kp[0], kp[1] == 1)
+      if e.failed: return undefined_value(nosp())
+      if key.kind < 0: continue
+      let v = lower_expression_to_temporary(c, &b, &e, c.t.nd[p].b)
+      if e.failed: return undefined_value(nosp())
+      props.push(ObjProp(false, key, false, v, nosp()))
+    elif pk == ast.N_SHORTHAND:
+      let key = PropKey(1, nm(c, p), noplace(), id_sp(c, p))
+      let lv = lower_ident_load(c, &b, &e, p)
+      if e.failed: return undefined_value(nosp())
+      let v = lower_value_to_temporary(&b, &e, lv)
+      props.push(ObjProp(false, key, false, v, nosp()))
+    elif pk == ast.N_SPREAD:
+      let v = lower_expression_to_temporary(c, &b, &e, c.t.nd[p].a)
+      if e.failed: return undefined_value(nosp())
+      props.push(ObjProp(true, no_key(), false, v, spn(c, p)))
+  return rc_hir.ObjectExpression(props, sp)
+
+# ---- reorderable expressions (switch tests, defaults)
+
+fn expression_type_name(c: Ctx, n: Int) -> Str:
+  let k = nk(c, n)
+  let f = c.t.nd[n].f
+  if k == ast.N_ID: return "Identifier"
+  if k == ast.N_STR: return "StringLiteral"
+  if k == ast.N_NUM: return "NumericLiteral"
+  if k == ast.N_TRUE or k == ast.N_FALSE: return "BooleanLiteral"
+  if k == ast.N_NULL: return "NullLiteral"
+  if k == ast.N_BIGINT: return "BigIntLiteral"
+  if k == ast.N_REGEX: return "RegExpLiteral"
+  if (k == ast.N_CALL or is_member(c, n) or k == ast.N_NONNULL) and is_chain_root(c, n): return "OptionalMemberExpression"
+  if k == ast.N_CALL: return "CallExpression"
+  if is_member(c, n): return "MemberExpression"
+  if k == ast.N_BINARY:
+    if f == T_COMMA: return "SequenceExpression"
+    if is_logical_op(f): return "LogicalExpression"
+    if is_assign_op(f): return "AssignmentExpression"
+    return "BinaryExpression"
+  if k == ast.N_PREFIX and (f == T_INC or f == T_DEC): return "UpdateExpression"
+  if k == ast.N_PREFIX or k == ast.N_TYPEOF or k == ast.N_VOIDEXPR or k == ast.N_DELETE: return "UnaryExpression"
+  if k == ast.N_POSTFIX: return "UpdateExpression"
+  if k == ast.N_COND: return "ConditionalExpression"
+  if k == ast.N_ARROW: return "ArrowFunctionExpression"
+  if k == ast.N_FUNCEXPR: return "FunctionExpression"
+  if k == ast.N_OBJECT: return "ObjectExpression"
+  if k == ast.N_ARRAY: return "ArrayExpression"
+  if k == ast.N_NEW: return "NewExpression"
+  if k == ast.N_TEMPL or k == ast.N_NOSUBTEMPL: return "TemplateLiteral"
+  if k == ast.N_TAGGED: return "TaggedTemplateExpression"
+  if k == ast.N_AWAIT: return "AwaitExpression"
+  if k == ast.N_YIELD: return "YieldExpression"
+  if k == ast.N_METAPROP: return "MetaProperty"
+  if k == ast.N_CLASSEXPR: return "ClassExpression"
+  if k == ast.N_SUPER: return "Super"
+  if k == ast.N_IMPORTCALL: return "Import"
+  if k == ast.N_THIS: return "ThisExpression"
+  if k == ast.N_PAREN: return "ParenthesizedExpression"
+  if k == ast.N_JSXELEM:
+    if c.t.nd[n].a <= 0: return "JSXFragment"
+    return "JSXElement"
+  if k == ast.N_AS: return "TSAsExpression"
+  if k == ast.N_SATISFIES: return "TSSatisfiesExpression"
+  if k == ast.N_NONNULL: return "TSNonNullExpression"
+  if k == ast.N_TYPEASSERT: return "TSTypeAssertion"
+  if k == ast.N_EXPRTARGS: return "TSInstantiationExpression"
+  return "Unknown"
+
+fn lower_reorderable_expression(c: Ctx, var b: Builder, var e: Env, n: Int) -> Place:
+  if not is_reorderable(c, b, n, true):
+    var dsp = spn(c, n)
+    let k = nk(c, n)
+    if k == ast.N_FUNCEXPR or k == ast.N_ARROW: dsp = function_diag_span(c, n)
+    if not rec(&e, rc_diags.unsafe_reorderable_expression(expression_type_name(c, n), dsp)): return noplace()
+  return lower_expression_to_temporary(c, &b, &e, n)
+
+fn ident_reorderable(c: Ctx, n: Int, allow_local: Bool) -> Bool:
+  let y = ref_sym(c, n)
+  if y < 0: return true
+  if rc_sem.symbol_scope(c.m, y) == 0: return true
+  return allow_local
+
+fn is_reorderable(c: Ctx, b: Builder, n: Int, allow_local: Bool) -> Bool:
+  let nd = c.t.nd[n]
+  let k = nd.k
+  if k == ast.N_ID: return ident_reorderable(c, n, allow_local)
+  if k == ast.N_REGEX or k == ast.N_STR or k == ast.N_NUM or k == ast.N_NULL or k == ast.N_TRUE or k == ast.N_FALSE or k == ast.N_BIGINT: return true
+  if k == ast.N_PREFIX:
+    if nd.f == T_BANG or nd.f == T_PLUS or nd.f == T_MINUS: return is_reorderable(c, b, nd.a, allow_local)
+    return false
+  if k == ast.N_BINARY:
+    if is_logical_op(nd.f): return is_reorderable(c, b, nd.a, allow_local) and is_reorderable(c, b, nd.b, allow_local)
+    return false
+  if k == ast.N_COND: return is_reorderable(c, b, nd.a, allow_local) and is_reorderable(c, b, nd.b, allow_local) and is_reorderable(c, b, nd.c, allow_local)
+  if k == ast.N_ARRAY:
+    for el in items(c, nd.a):
+      let ek = nk(c, el)
+      if ek == ast.N_OMIT or ek == ast.N_SPREAD: return false
+      if not is_reorderable(c, b, el, allow_local): return false
+    return true
+  if k == ast.N_OBJECT:
+    for p in items(c, nd.a):
+      let pk = nk(c, p)
+      if pk == ast.N_PROPASSIGN:
+        if nk(c, c.t.nd[p].a) == ast.N_COMPUTED: return false
+        if not is_reorderable(c, b, c.t.nd[p].b, allow_local): return false
+      elif pk == ast.N_SHORTHAND:
+        if not ident_reorderable(c, p, allow_local): return false
+      else: return false
+    return true
+  if is_member(c, n) or k == ast.N_CALL or k == ast.N_NONNULL:
+    if is_chain_root(c, n): return false
+  if is_member(c, n):
+    var inner = n
+    while is_member(c, inner): inner = c.t.nd[inner].a
+    if nk(c, inner) != ast.N_ID: return false
+    let y = ref_sym(c, inner)
+    if y < 0: return true
+    return rc_sem.symbol_scope(c.m, y) == 0 or c.m.ydk[y] == rc_sem.DK_ENUM
+  if k == ast.N_ARROW:
+    let body = nd.d
+    if nk(c, body) != ast.N_BLOCK: return is_reorderable(c, b, body, false)
+    return items(c, c.t.nd[body].a).len == 0
+  if k == ast.N_CALL or k == ast.N_NEW:
+    if not is_reorderable(c, b, nd.a, allow_local): return false
+    for a in items(c, nd.c):
+      if nk(c, a) == ast.N_SPREAD: return false
+      if not is_reorderable(c, b, a, allow_local): return false
+    return true
+  if k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_NONNULL or k == ast.N_EXPRTARGS or k == ast.N_TYPEASSERT or k == ast.N_PAREN: return is_reorderable(c, b, nd.a, allow_local)
+  return false
+
+# ---- JSX
+
+# a JSX tag name that oxc parses as an IdentifierReference (not lowercase, no `-` or `:`)
+fn jsx_is_reference(s: Str) -> Bool:
+  if s.find(":") >= 0 or s.find("-") >= 0: return false
+  if s.len > 0 and s[0] >= 'a' and s[0] <= 'z': return false
+  return true
+
+# the tag: (builtin, its name) or a place
+type JsxTag:
+  builtin: Bool
+  name: Str
+  place: Place
+
+fn lower_jsx_element_name(c: Ctx, var b: Builder, var e: Env, n: Int) -> JsxTag:
+  let k = nk(c, n)
+  let sp = spn(c, n)
+  if k == ast.N_THIS: return JsxTag(true, "this", noplace())
+  if k == ast.N_PROPACCESS:
+    let p = lower_jsx_member_expression(c, &b, &e, n)
+    return JsxTag(false, "", p)
+  let s = nm(c, n)
+  let colon = s.find(":")
+  if colon >= 0:
+    let ns = s[0..colon]
+    let name = s[colon + 1..s.len]
+    if ns.find(":") >= 0 or name.find(":") >= 0:
+      if not rec(&e, rc_diags.invalid_jsx_namespace(ns, name, sp)): return JsxTag(false, "", noplace())
+    let p = lower_value_to_temporary(&b, &e, rc_hir.Primitive(prim_str(ns + ":" + name), sp))
+    return JsxTag(false, "", p)
+  if jsx_is_reference(s):
+    let y = ref_sym(c, n)
+    let place = lower_identifier(c, &b, &e, s, sp, y)
+    if e.failed: return JsxTag(false, "", noplace())
+    var p = noplace()
+    if rc_build.is_context_identifier(c, b, y): p = lower_value_to_temporary(&b, &e, rc_hir.LoadContext(place, sp, false))
+    else: p = lower_value_to_temporary(&b, &e, rc_hir.LoadLocal(place, sp))
+    return JsxTag(false, "", p)
+  return JsxTag(true, s, noplace())
+
+fn lower_jsx_member_expression(c: Ctx, var b: Builder, var e: Env, n: Int) -> Place:
+  let nd = c.t.nd[n]
+  let esp = spn(c, n)
+  let o = nd.a
+  var object = noplace()
+  if nk(c, o) == ast.N_PROPACCESS:
+    object = lower_jsx_member_expression(c, &b, &e, o)
+    if e.failed: return noplace()
+  else:
+    var name = "this"
+    var y = -1
+    if nk(c, o) == ast.N_ID:
+      name = nm(c, o)
+      y = ref_sym(c, o)
+    let place = lower_identifier(c, &b, &e, name, spn(c, o), y)
+    if e.failed: return noplace()
+    if rc_build.is_context_identifier(c, b, y): object = lower_value_to_temporary(&b, &e, rc_hir.LoadContext(place, esp, false))
+    else: object = lower_value_to_temporary(&b, &e, rc_hir.LoadLocal(place, esp))
+  return lower_value_to_temporary(&b, &e, rc_hir.PropertyLoad(object, plit_str(nm(c, n)), false, prop_sp(c, n), esp))
+
+# resolve_local_binding_by_name: a local binding of a JSX tag's name (-1 none)
+fn resolve_local_binding_by_name(c: Ctx, var b: Builder, var e: Env, n: Int) -> Int:
+  let sp = spn(c, n)
+  let y = rc_sem.find_binding_at_position(c.m, c.t, c.t.nd[n].s, b.component_scope, sp.s)
+  if y < 0: return -1
+  if rc_sem.symbol_scope(c.m, y) == 0: return -1
+  let name = sym_name(c, y)
+  if name == "fbt":
+    rc_build.resolve_binding(&b, &e, c, name, y, sp)
+    return -1
+  return rc_build.resolve_binding(&b, &e, c, name, y, sp)
+
+fn jsx_name_node(c: Ctx, n: Int) -> Int:
+  var name = c.t.nd[n].a
+  if nk(c, name) == ast.N_EXPRTARGS: name = c.t.nd[name].a
+  return name
+
+fn lower_jsx_element_expr(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  let name = jsx_name_node(c, n)
+  let opening = jsx_opening_sp(c, n)
+  let opening_name = spn(c, name)
+  let closing = jsx_closing_sp(c, n)
+  var closing_name = nosp()
+  if nd.d > 0: closing_name = spn(c, nd.d)
+  let tag = lower_jsx_element_name(c, &b, &e, name)
+  if e.failed: return undefined_value(nosp())
+  var props: [JsxAttr] = []
+  for at in items(c, nd.b):
+    if nk(c, at) == ast.N_JSXSPREAD:
+      let arg = lower_expression_to_temporary(c, &b, &e, c.t.nd[at].a)
+      if e.failed: return undefined_value(nosp())
+      props.push(JsxAttr(true, "", nosp(), arg, spn(c, at)))
+      continue
+    let an = c.t.nd[at].a
+    let pname = nm(c, an)
+    let v = c.t.nd[at].b
+    let vk = nk(c, v)
+    var value = noplace()
+    if vk == ast.N_STR:
+      ent_ready(&e)
+      let dv = rc_ent.decode_entities(e.ent, nm(c, v))
+      value = lower_value_to_temporary(&b, &e, rc_hir.Primitive(prim_str(dv), spn(c, v)))
+    elif vk == ast.N_JSXEXPR:
+      if c.t.nd[v].a <= 0: continue
+      value = lower_expression_to_temporary(c, &b, &e, c.t.nd[v].a)
+      if e.failed: return undefined_value(nosp())
+    elif vk == ast.N_JSXELEM:
+      var val = undefined_value(nosp())
+      if c.t.nd[v].a <= 0: val = lower_jsx_fragment_expr(c, &b, &e, v)
+      else: val = lower_jsx_element_expr(c, &b, &e, v)
+      if e.failed: return undefined_value(nosp())
+      value = lower_value_to_temporary(&b, &e, val)
+    else:
+      value = lower_value_to_temporary(&b, &e, rc_hir.Primitive(prim_bool(true), spn(c, at)))
+    props.push(JsxAttr(false, pname, spn(c, an), value, nosp()))
+  let is_fbt = tag.builtin and (tag.name == "fbt" or tag.name == "fbs")
+  if is_fbt:
+    if nk(c, name) == ast.N_ID:
+      let found = resolve_local_binding_by_name(c, &b, &e, name)
+      if e.failed: return undefined_value(nosp())
+      if found >= 0:
+        rc_env.throw(&e, rc_diags_hand.local_fbt_tag(tag.name, spn(c, name)))
+        return undefined_value(nosp())
+    var en: [Sp] = []
+    var pl_: [Sp] = []
+    var pr: [Sp] = []
+    collect_fbt_sub_tags(c, nd.c, tag.name, &en, &pl_, &pr)
+    if en.len > 1: rc_env.record_diagnostic(&e, rc_diags_hand.duplicate_fbt_tags(tag.name, "enum", en))
+    if pl_.len > 1: rc_env.record_diagnostic(&e, rc_diags_hand.duplicate_fbt_tags(tag.name, "plural", pl_))
+    if pr.len > 1: rc_env.record_diagnostic(&e, rc_diags_hand.duplicate_fbt_tags(tag.name, "pronoun", pr))
+    b.fbt_depth += 1
+  var children: [Place] = []
+  for ch in items(c, nd.c):
+    let p = lower_jsx_child(c, &b, &e, ch)
+    if e.failed: return undefined_value(nosp())
+    if p.identifier >= 0: children.push(p)
+  if is_fbt: b.fbt_depth -= 1
+  let has = children.len > 0
+  return rc_hir.JsxExpression(tag.builtin, tag.name, tag.place, props, has, children, sp, opening, opening_name, closing, closing_name)
+
+fn lower_jsx_fragment_expr(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  var children: [Place] = []
+  for ch in items(c, nd.c):
+    let p = lower_jsx_child(c, &b, &e, ch)
+    if e.failed: return undefined_value(nosp())
+    if p.identifier >= 0: children.push(p)
+  return rc_hir.JsxFragment(children, spn(c, n), jsx_opening_sp(c, n), jsx_closing_sp(c, n))
+
+fn ent_ready(var e: Env):
+  if e.ent.len == 0: e.ent = rc_ent.entity_table()
+
+fn lower_jsx_child(c: Ctx, var b: Builder, var e: Env, n: Int) -> Place:
+  let k = nk(c, n)
+  let nd = c.t.nd[n]
+  if k == ast.N_JSXTEXT:
+    let raw = c.src[nd.pos..nd.end]
+    ent_ready(&e)
+    let decoded = rc_ent.decode_entities(e.ent, raw)
+    var value = decoded
+    var start = 0
+    if b.fbt_depth == 0:
+      let r = trim_jsx_text(decoded)
+      if r.len == 0: return noplace()
+      value = r[0]
+      start = int(r[1]) else 0
+    let off = source_offset_for_decoded(e.ent, raw, start)
+    return lower_value_to_temporary(&b, &e, rc_hir.JSXText(value, Sp(nd.pos + off, nd.end)))
+  if k == ast.N_JSXELEM:
+    var v = undefined_value(nosp())
+    if nd.a <= 0: v = lower_jsx_fragment_expr(c, &b, &e, n)
+    else: v = lower_jsx_element_expr(c, &b, &e, n)
+    if e.failed: return noplace()
+    return lower_value_to_temporary(&b, &e, v)
+  if k == ast.N_JSXEXPR:
+    if nd.a <= 0: return noplace()
+    return lower_expression_to_temporary(c, &b, &e, nd.a)
+  if k == ast.N_JSXSPREAD: return lower_expression_to_temporary(c, &b, &e, nd.a)
+  return noplace()
+
+# trim_jsx_text: [] when nothing is left, else [text, where it starts (as a string)]
+fn trim_jsx_text(s: Str) -> [Str]:
+  var lines_s: [Int] = []
+  var lines_e: [Int] = []
+  var term: [Int] = []
+  var st = 0
+  var i = 0
+  while i < s.len:
+    if s[i] == '\r':
+      var tl = 1
+      if i + 1 < s.len and s[i + 1] == '\n': tl = 2
+      lines_s.push(st)
+      lines_e.push(i)
+      term.push(tl)
+      i += tl
+      st = i
+    elif s[i] == '\n':
+      lines_s.push(st)
+      lines_e.push(i)
+      term.push(1)
+      i += 1
+      st = i
+    else: i += 1
+  lines_s.push(st)
+  lines_e.push(s.len)
+  term.push(0)
+  var last_ne = 0
+  for li in 0..lines_s.len:
+    for j in lines_s[li]..lines_e[li]:
+      if s[j] != ' ' and s[j] != '\t':
+        last_ne = li
+        break
+  var out = ""
+  var have = false
+  var offset = 0
+  var line_off = 0
+  for li in 0..lines_s.len:
+    let first = li == 0
+    let last = li == lines_s.len - 1
+    var a = lines_s[li]
+    var z = lines_e[li]
+    if not first:
+      while a < z and (s[a] == ' ' or s[a] == '\t'): a += 1
+    if not last:
+      while z > a and (s[z - 1] == ' ' or s[z - 1] == '\t'): z -= 1
+    if a < z:
+      if not have:
+        have = true
+        offset = line_off + (a - lines_s[li])
+      for j in a..z:
+        if s[j] == '\t': out += " "
+        else: out += s[j..j + 1]
+      if li != last_ne: out += " "
+    line_off += (lines_e[li] - lines_s[li]) + term[li]
+  if not have: return []
+  return [out, "{offset}"]
+
+# source_offset_for_decoded_jsx_text: where a decoded offset is in the source
+fn source_offset_for_decoded(tab: {Str: Int}, src: Str, target: Int) -> Int:
+  if target == 0 or src.find("&") < 0: return target
+  var so = 0
+  var dof = 0
+  var pending_lead = false
+  while dof < target and so < src.len:
+    if src[so] == '&':
+      let end = src.find(";", so + 1)
+      if end > so:
+        let word = src[so + 1..end]
+        if word.find("&") < 0:
+          let cp = rc_ent.decode_entity(tab, word)
+          if cp >= 0:
+            let is_trail = cp >= 0xDC00 and cp <= 0xDFFF
+            var dl = utf8_len_cp(cp)
+            if pending_lead and is_trail: dl = 1
+            pending_lead = cp >= 0xD800 and cp <= 0xDBFF
+            if dof + dl > target: return so
+            dof += dl
+            so = end + 1
+            continue
+    pending_lead = false
+    let cl = utf8_len_byte(src[so])
+    dof += cl
+    so += cl
+  return so
+
+fn utf8_len_cp(cp: Int) -> Int:
+  if cp < 0x80: return 1
+  if cp < 0x800: return 2
+  if cp < 0x10000: return 3
+  return 4
+
+fn utf8_len_byte(c: Byte) -> Int:
+  let v = int(c)
+  if v < 0x80: return 1
+  if v >= 0xF0: return 4
+  if v >= 0xE0: return 3
+  if v >= 0xC0: return 2
+  return 1
+
+# fbt sub-tags (<fbt:enum> ...) in an fbt element's children
+fn collect_fbt_sub_tags(c: Ctx, lst: Int, tag: Str, var en: [Sp], var pl_: [Sp], var pr: [Sp]):
+  for ch in items(c, lst):
+    let k = nk(c, ch)
+    if k == ast.N_JSXELEM:
+      if c.t.nd[ch].a <= 0: collect_fbt_sub_tags(c, c.t.nd[ch].c, tag, &en, &pl_, &pr)
+      else: collect_fbt_element(c, ch, tag, &en, &pl_, &pr)
+    elif k == ast.N_JSXEXPR:
+      if c.t.nd[ch].a > 0: collect_fbt_expr(c, c.t.nd[ch].a, tag, &en, &pl_, &pr)
+
+fn collect_fbt_element(c: Ctx, n: Int, tag: Str, var en: [Sp], var pl_: [Sp], var pr: [Sp]):
+  let name = jsx_name_node(c, n)
+  if nk(c, name) == ast.N_ID:
+    let s = nm(c, name)
+    let colon = s.find(":")
+    if colon >= 0 and s[0..colon] == tag:
+      let sub = s[colon + 1..s.len]
+      if sub == "enum": en.push(spn(c, name))
+      elif sub == "plural": pl_.push(spn(c, name))
+      elif sub == "pronoun": pr.push(spn(c, name))
+  collect_fbt_sub_tags(c, c.t.nd[n].c, tag, &en, &pl_, &pr)
+  for at in items(c, c.t.nd[n].b):
+    if nk(c, at) != ast.N_JSXATTR: continue
+    let v = c.t.nd[at].b
+    if nk(c, v) == ast.N_JSXEXPR and c.t.nd[v].a > 0: collect_fbt_expr(c, c.t.nd[v].a, tag, &en, &pl_, &pr)
+    elif nk(c, v) == ast.N_JSXELEM and c.t.nd[v].a > 0: collect_fbt_element(c, v, tag, &en, &pl_, &pr)
+
+fn collect_fbt_expr(c: Ctx, n: Int, tag: Str, var en: [Sp], var pl_: [Sp], var pr: [Sp]):
+  let nd = c.t.nd[n]
+  let k = nd.k
+  if k == ast.N_JSXELEM:
+    if nd.a <= 0: collect_fbt_sub_tags(c, nd.c, tag, &en, &pl_, &pr)
+    else: collect_fbt_element(c, n, tag, &en, &pl_, &pr)
+  elif k == ast.N_COND:
+    collect_fbt_expr(c, nd.b, tag, &en, &pl_, &pr)
+    collect_fbt_expr(c, nd.c, tag, &en, &pl_, &pr)
+  elif k == ast.N_BINARY and is_logical_op(nd.f):
+    collect_fbt_expr(c, nd.a, tag, &en, &pl_, &pr)
+    collect_fbt_expr(c, nd.b, tag, &en, &pl_, &pr)
+  elif k == ast.N_PAREN: collect_fbt_expr(c, nd.a, tag, &en, &pl_, &pr)
+  elif k == ast.N_ARROW:
+    if nk(c, nd.d) != ast.N_BLOCK: collect_fbt_expr(c, nd.d, tag, &en, &pl_, &pr)
+    else:
+      for s in items(c, c.t.nd[nd.d].a):
+        let sk = nk(c, s)
+        if (sk == ast.N_RETURN or sk == ast.N_EXPRSTMT) and c.t.nd[s].a > 0: collect_fbt_expr(c, c.t.nd[s].a, tag, &en, &pl_, &pr)
+  elif k == ast.N_CALL:
+    for a in items(c, nd.c):
+      if nk(c, a) != ast.N_SPREAD: collect_fbt_expr(c, a, tag, &en, &pl_, &pr)

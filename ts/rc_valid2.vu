@@ -1,0 +1,374 @@
+# ValidateNoSetStateInEffects (oxc_react_compiler react_compiler_validation/
+# validate_no_set_state_in_effects.rs; enable_allow_set_state_from_refs_in_effects is on, verbose off).
+# Its errors are events.
+
+import rc_hir
+import rc_env
+import rc_diags_hand
+import rc_ops
+import rc_dom
+import rc_gdefs
+import rc_pass1
+import rc_diags
+from rc_hir import Sp, Place, HirFunction, InstrValue, Pattern
+from rc_env import Env, Diag
+
+fn shape(e: Env, id: Int, want_fn: Bool) -> Str:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TFunction(sh, has, _, _):
+      if has and want_fn: return sh
+    rc_hir.TObject(sh, has):
+      if has and not want_fn: return sh
+    _: return ""
+  return ""
+
+fn is_set_state(e: Env, id: Int) -> Bool:
+  return shape(e, id, true) == rc_gdefs.BUILT_IN_SET_STATE_ID
+
+fn is_effect_hook(e: Env, id: Int) -> Bool:
+  let s = shape(e, id, true)
+  return s == rc_gdefs.BUILT_IN_USE_EFFECT_HOOK_ID or s == rc_gdefs.BUILT_IN_USE_LAYOUT_EFFECT_HOOK_ID or s == rc_gdefs.BUILT_IN_USE_INSERTION_EFFECT_HOOK_ID
+
+fn is_effect_event(e: Env, id: Int) -> Bool:
+  return shape(e, id, true) == rc_gdefs.BUILT_IN_USE_EFFECT_EVENT_ID
+
+fn is_ref_type(e: Env, id: Int) -> Bool:
+  let s = shape(e, id, false)
+  return s == rc_gdefs.BUILT_IN_USE_REF_ID or s == rc_gdefs.BUILT_IN_REF_VALUE_ID
+
+fn first_place_arg(args: [rc_hir.Elem]) -> Int:
+  if args.len > 0 and args[0].kind == 0: return args[0].place.identifier
+  return -1
+
+fn validate_no_set_state_in_effects(f: HirFunction, var e: Env) -> [Diag]:
+  var ssf: {Int: Sp} = {}
+  var errs: [Diag] = []
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.LoadLocal(p, _):
+          if p.identifier in ssf: ssf[lid] = ssf[p.identifier]
+        rc_hir.StoreLocal(lv, v, _):
+          if v.identifier in ssf:
+            let s = ssf[v.identifier]
+            ssf[lv.place.identifier] = s
+            ssf[lid] = s
+        rc_hir.FunctionExpression(_, _, _, fid, _, _):
+          var any = false
+          for cp in e.functions[fid].context:
+            if is_set_state(e, cp.identifier) or cp.identifier in ssf: any = true
+          if any:
+            let r = get_set_state_call(fid, &ssf, &e)
+            if e.failed: return errs
+            if r.len > 0: ssf[lid] = r[0]
+        rc_hir.MethodCall(_, prop, args, _): effect_call(e, prop, args, lid, &ssf, &errs)
+        rc_hir.CallExpression(callee, args, _): effect_call(e, callee, args, lid, &ssf, &errs)
+        _: nop()
+  return errs
+
+fn effect_call(e: Env, callee: Place, args: [rc_hir.Elem], lid: Int, var ssf: {Int: Sp}, var errs: [Diag]):
+  let a = first_place_arg(args)
+  if is_effect_event(e, callee.identifier):
+    if a >= 0 and a in ssf: ssf[lid] = ssf[a]
+  elif is_effect_hook(e, callee.identifier):
+    if a >= 0 and a in ssf: errs.push(rc_diags_hand.set_state_in_effect(ssf[a], callee.sp))
+
+fn derived(e: Env, rdv: {Int: Bool}, id: Int) -> Bool:
+  return id in rdv or is_ref_type(e, id)
+
+fn track_refs(f: HirFunction, e: Env, iid: Int, var rdv: {Int: Bool}):
+  let ins = f.instructions[iid]
+  var has = false
+  for op in rc_ops.value_operands(ins.value, e):
+    if derived(e, rdv, op.identifier): has = true
+  if has:
+    rdv[ins.lvalue.identifier] = true
+    match ins.value:
+      rc_hir.Destructure(pat, _, _, _):
+        for p in rc_ops.pattern_operands(pat): rdv[p.identifier] = true
+      rc_hir.StoreLocal(lv, _, _): rdv[lv.place.identifier] = true
+      _: nop()
+  match ins.value:
+    rc_hir.PropertyLoad(o, prop, _, _, _):
+      if not prop.is_num and prop.s == "current" and is_ref_type(e, o.identifier): rdv[ins.lvalue.identifier] = true
+    _: nop()
+
+# the setState call a function makes unconditionally ([] none)
+fn get_set_state_call(fid: Int, var ssf: {Int: Sp}, var e: Env) -> [Sp]:
+  var f = rc_hir_placeholder()
+  swap(&f, &e.functions[fid])
+  let r = set_state_call_impl(f, &ssf, &e)
+  swap(&f, &e.functions[fid])
+  return r
+
+fn set_state_call_impl(f: HirFunction, var ssf: {Int: Sp}, var e: Env) -> [Sp]:
+  var rdv: {Int: Bool} = {}
+  for bid in f.body.order:
+    for ph in f.body.blocks[bid].phis:
+      var d = false
+      for op in ph.ops:
+        if derived(e, rdv, op.identifier): d = true
+      if d: rdv[ph.place.identifier] = true
+    for iid in f.body.blocks[bid].instructions: track_refs(f, e, iid, &rdv)
+  let fr = rc_dom.post_dominator_frontiers(f, &e, e.next_block, false, true)
+  if e.failed: return []
+  var controlled: {Int: Bool} = {}
+  for bid in f.body.order:
+    var c = false
+    if bid in fr:
+      for fb in fr[bid]:
+        if c: continue
+        match f.body.blocks[fb].terminal:
+          rc_hir.If(t, _, _, _, _, _, _, _):
+            if derived(e, rdv, t.identifier): c = true
+          rc_hir.Branch(t, _, _, _, _, _):
+            if derived(e, rdv, t.identifier): c = true
+          rc_hir.Switch(t, cases, _, _, _):
+            if derived(e, rdv, t.identifier): c = true
+            for cs in cases:
+              if cs.has_test and derived(e, rdv, cs.test.identifier): c = true
+          _: nop()
+    controlled[bid] = c
+  rdv = {}
+  for bid in f.body.order:
+    for ph in f.body.blocks[bid].phis:
+      if derived(e, rdv, ph.place.identifier): continue
+      var d = false
+      for op in ph.ops:
+        if derived(e, rdv, op.identifier): d = true
+      if d: rdv[ph.place.identifier] = true
+      else:
+        for pb in ph.ops_block:
+          if controlled.get(pb, false):
+            rdv[ph.place.identifier] = true
+            break
+    for iid in f.body.blocks[bid].instructions:
+      track_refs(f, e, iid, &rdv)
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.LoadLocal(p, _):
+          if p.identifier in ssf: ssf[lid] = ssf[p.identifier]
+        rc_hir.StoreLocal(lv, v, _):
+          if v.identifier in ssf:
+            let s = ssf[v.identifier]
+            ssf[lv.place.identifier] = s
+            ssf[lid] = s
+        rc_hir.CallExpression(callee, args, _):
+          if is_set_state(e, callee.identifier) or callee.identifier in ssf:
+            let a = first_place_arg(args)
+            if a >= 0 and derived(e, rdv, a): return []
+            if not controlled.get(bid, false): return [callee.sp]
+        _: nop()
+  return []
+
+fn rc_hir_placeholder() -> HirFunction:
+  let np = rc_hir.Place(-1, rc_hir.EF_UNKNOWN, false, rc_hir.nosp())
+  return HirFunction(rc_hir.nosp(), rc_hir.nosp(), "", false, rc_hir.nosp(), false, np, "", rc_hir.FN_OTHER, [], np, [], rc_hir.HIR(0, [], {}), [], false, false, [], false, [])
+
+fn nop():
+  return
+
+# ---- ValidateNoDerivedComputationsInEffects (the non-experimental one)
+
+type Dep:
+  id: Int
+  sp: Sp
+
+fn validate_no_derived_computations_in_effects(f: HirFunction, var e: Env):
+  var cand: {Int: [Dep]} = {}
+  var fns: {Int: Int} = {}
+  var locals: {Int: Int} = {}
+  var todo_f: [Int] = []
+  var todo_d: [[Dep]] = []
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.LoadLocal(p, _): locals[lid] = p.identifier
+        rc_hir.ArrayExpression(els, _):
+          var deps: [Dep] = []
+          for el in els:
+            if el.kind == 0: deps.push(Dep(el.place.identifier, el.place.sp))
+          if deps.len == els.len: cand[lid] = deps
+        rc_hir.FunctionExpression(_, _, _, fid, _, _): fns[lid] = fid
+        rc_hir.CallExpression(callee, args, _): effect_candidate(e, callee, args, cand, fns, locals, &todo_f, &todo_d)
+        rc_hir.MethodCall(_, prop, args, _): effect_candidate(e, prop, args, cand, fns, locals, &todo_f, &todo_d)
+        _: nop()
+  for i in 0..todo_f.len:
+    var ds = validate_effect_non_exp(e.functions[todo_f[i]], todo_d[i], e)
+    for j in 0..ds.len:
+      var d = rc_env.diag(0, "")
+      swap(&d, &ds[j])
+      if not rc_env.record_error(&e, d): return
+
+fn effect_candidate(e: Env, callee: Place, args: [rc_hir.Elem], cand: {Int: [Dep]}, fns: {Int: Int}, locals: {Int: Int}, var todo_f: [Int], var todo_d: [[Dep]]):
+  if shape(e, callee.identifier, true) != rc_gdefs.BUILT_IN_USE_EFFECT_HOOK_ID: return
+  if args.len != 2 or args[0].kind != 0 or args[1].kind != 0: return
+  let a0 = args[0].place.identifier
+  let a1 = args[1].place.identifier
+  if not (a0 in fns) or not (a1 in cand): return
+  if cand[a1].len == 0: return
+  var res: [Dep] = []
+  for d in cand[a1]: res.push(Dep(locals.get(d.id, d.id), d.sp))
+  todo_f.push(fns[a0])
+  todo_d.push(res)
+
+fn has_int(xs: [Int], x: Int) -> Bool:
+  for y in xs:
+    if y == x: return true
+  return false
+
+fn non_exp_operands(v: InstrValue) -> [Int]:
+  var out: [Int] = []
+  match v:
+    rc_hir.ComputedLoad(o, p, _):
+      out.push(o.identifier)
+      out.push(p.identifier)
+    rc_hir.PropertyLoad(o, _, _, _, _): out.push(o.identifier)
+    rc_hir.BinaryExpression(_, l, r, _):
+      out.push(l.identifier)
+      out.push(r.identifier)
+    rc_hir.TemplateLiteral(subs, _, _):
+      for s in subs: out.push(s.identifier)
+    rc_hir.CallExpression(c, args, _):
+      out.push(c.identifier)
+      for a in args: out.push(a.place.identifier)
+    rc_hir.MethodCall(r, p, args, _):
+      out.push(r.identifier)
+      out.push(p.identifier)
+      for a in args: out.push(a.place.identifier)
+    _: nop()
+  return out
+
+fn validate_effect_non_exp(ef: HirFunction, deps: [Dep], e: Env) -> [Diag]:
+  for c in ef.context:
+    var ok = is_set_state(e, c.identifier)
+    for d in deps:
+      if d.id == c.identifier: ok = true
+    if not ok: return []
+  for d in deps:
+    var found = false
+    for c in ef.context:
+      if c.identifier == d.id: found = true
+    if not found: return []
+  var seen: {Int: Bool} = {}
+  var dv: {Int: [Int]} = {}
+  for d in deps: dv[d.id] = [d.id]
+  var sps: [Sp] = []
+  for bid in ef.body.order:
+    for p in ef.body.blocks[bid].preds:
+      if not (p in seen): return []
+    for ph in ef.body.blocks[bid].phis:
+      var agg: [Int] = []
+      for op in ph.ops:
+        if op.identifier in dv:
+          for x in dv[op.identifier]:
+            if not has_int(agg, x): agg.push(x)
+      if agg.len > 0: dv[ph.place.identifier] = agg
+    for iid in ef.body.blocks[bid].instructions:
+      let lid = ef.instructions[iid].lvalue.identifier
+      var kind = 0
+      match ef.instructions[iid].value:
+        rc_hir.Primitive(_, _): kind = 1
+        rc_hir.JSXText(_, _): kind = 1
+        rc_hir.LoadGlobal(_, _): kind = 1
+        rc_hir.LoadLocal(p, _):
+          kind = 1
+          if p.identifier in dv:
+            var c: [Int] = []
+            for x in dv[p.identifier]: c.push(x)
+            dv[lid] = c
+        rc_hir.ComputedLoad(_, _, _): kind = 2
+        rc_hir.PropertyLoad(_, _, _, _, _): kind = 2
+        rc_hir.BinaryExpression(_, _, _, _): kind = 2
+        rc_hir.TemplateLiteral(_, _, _): kind = 2
+        rc_hir.CallExpression(_, _, _): kind = 2
+        rc_hir.MethodCall(_, _, _, _): kind = 2
+        _: kind = 0
+      if kind == 0: return []
+      if kind == 2:
+        var agg: [Int] = []
+        for op in non_exp_operands(ef.instructions[iid].value):
+          if op in dv:
+            for x in dv[op]:
+              if not has_int(agg, x): agg.push(x)
+        if agg.len > 0: dv[lid] = agg
+        match ef.instructions[iid].value:
+          rc_hir.CallExpression(callee, args, _):
+            if is_set_state(e, callee.identifier) and args.len == 1 and args[0].kind == 0:
+              let a = args[0].place.identifier
+              if not (a in dv): return []
+              if dv[a].len == deps.len:
+                if callee.sp.s >= 0: sps.push(callee.sp)
+              else: return []
+          _: nop()
+    var tid = -1
+    match ef.body.blocks[bid].terminal:
+      rc_hir.Return(v, _, _, _, _, _): tid = v.identifier
+      rc_hir.Throw(v, _, _): tid = v.identifier
+      rc_hir.If(t, _, _, _, _, _, _, _): tid = t.identifier
+      rc_hir.Branch(t, _, _, _, _, _): tid = t.identifier
+      rc_hir.Switch(t, _, _, _, _): tid = t.identifier
+      _: nop()
+    if tid >= 0 and tid in dv: return []
+    seen[bid] = true
+  if sps.len == 0: return []
+  var names: [Str] = []
+  for d in deps:
+    if e.identifiers[d.id].name_kind == 1:
+      let n = e.identifiers[d.id].name
+      var dup = false
+      for x in names:
+        if x == n: dup = true
+      if not dup: names.push(n + "")
+  var desc = "the effect's reactive dependencies"
+  if names.len > 0:
+    var s = "s"
+    if names.len == 1: s = ""
+    desc = "the reactive value{s} `{"`, `".join(names)}`"
+  let help = "This effect derives state from {desc}, causing an extra render and potentially showing a stale value. Calculate the derived value during render, then remove the redundant state and effect."
+  var dsps: [Sp] = []
+  for d in deps:
+    if d.sp.s >= 0: dsps.push(d.sp)
+  var out: [Diag] = []
+  for s in sps: out.push(rc_diags_hand.derived_state_in_effect_from_dependencies(help, s, dsps))
+  return out
+
+# ---- ValidateStaticComponents (its errors are events)
+
+fn validate_static_components(f: HirFunction, e: Env) -> [Diag]:
+  var out: [Diag] = []
+  var known: {Int: Sp} = {}
+  for bid in f.body.order:
+    for ph in f.body.blocks[bid].phis:
+      var done = false
+      for op in ph.ops:
+        if not done and op.identifier in known:
+          known[ph.place.identifier] = known[op.identifier]
+          done = true
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.FunctionExpression(_, _, _, fid, _, sp):
+          var l = rc_pass1.fn_diagnostic_span(e.functions[fid])
+          if l.s < 0: l = sp
+          known[lid] = l
+        rc_hir.NewExpression(c, _, sp): known[lid] = or_sp(c.sp, sp)
+        rc_hir.CallExpression(c, _, sp): known[lid] = or_sp(c.sp, sp)
+        rc_hir.MethodCall(_, p, _, sp): known[lid] = or_sp(p.sp, sp)
+        rc_hir.LoadLocal(p, _):
+          if p.identifier in known: known[lid] = known[p.identifier]
+        rc_hir.StoreLocal(lv, v, _):
+          if v.identifier in known:
+            let s = known[v.identifier]
+            known[lid] = s
+            known[lv.place.identifier] = s
+        rc_hir.JsxExpression(builtin, _, tag, _, _, _, _, _, _, _, _):
+          if not builtin and tag.identifier in known: out.push(rc_diags_hand.static_component_during_render(tag.sp, known[tag.identifier]))
+        _: nop()
+  return out
+
+fn or_sp(a: Sp, b: Sp) -> Sp:
+  if a.s >= 0: return a
+  return b

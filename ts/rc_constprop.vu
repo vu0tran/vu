@@ -1,0 +1,402 @@
+# constant_propagation (react_compiler_optimization/constant_propagation.rs): primitives and globals
+# known at each identifier, folded into the instructions that use them; an `if` on a known test
+# becomes a goto and the graph is cleaned up again.
+
+import rc_hir
+import rc_env
+import rc_build
+import rc_cfg
+import rc_ssa
+import rc_ops
+import scan
+from rc_hir import Sp, Place, Instruction, InstrValue, Terminal, HirFunction, Phi, Prim, PropLit, NonLocal
+from rc_env import Env
+
+type Const:
+  is_global: Bool
+  prim: Prim
+  binding: NonLocal
+  sp: Sp
+
+fn cprim(own p: Prim, sp: Sp) -> Const:
+  return Const(false, p, NonLocal(0, "", "", ""), sp)
+
+fn pcopy(p: Prim) -> Prim:
+  return Prim(p.kind, p.b, p.num, p.s + "")
+
+fn ccopy(c: Const) -> Const:
+  return Const(c.is_global, pcopy(c.prim), NonLocal(c.binding.kind, c.binding.name + "", c.binding.module + "", c.binding.imported + ""), c.sp)
+
+type CP:
+  m: {Int: Const} = {}
+
+fn read(cp: CP, p: Place) -> [Const]:
+  if p.identifier in cp.m: return [ccopy(cp.m[p.identifier])]
+  return []
+
+fn is_nan(v: Float) -> Bool:
+  return v != v
+
+fn is_truthy(p: Prim) -> Bool:
+  if p.kind == 0 or p.kind == 1: return false
+  if p.kind == 2: return p.b
+  if p.kind == 3: return p.num != 0.0 and not is_nan(p.num)
+  return p.s.len > 0
+
+fn strict_equal(a: Prim, b: Prim) -> Bool:
+  if a.kind != b.kind: return false
+  if a.kind == 0 or a.kind == 1: return true
+  if a.kind == 2: return a.b == b.b
+  if a.kind == 3:
+    if is_nan(a.num) or is_nan(b.num): return false
+    return a.num == b.num
+  return a.s == b.s
+
+fn string_to_number(s0: Str) -> Float:
+  let s = s0.strip()
+  if s.len == 0: return 0.0
+  if s == "Infinity" or s == "+Infinity": return 1.0e300 * 1.0e300
+  if s == "-Infinity": return 0.0 - 1.0e300 * 1.0e300
+  if s.len > 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X' or s[1] == 'o' or s[1] == 'O' or s[1] == 'b' or s[1] == 'B'):
+    var base = 16
+    if s[1] == 'o' or s[1] == 'O': base = 8
+    if s[1] == 'b' or s[1] == 'B': base = 2
+    var v = 0.0
+    for i in 2..s.len:
+      let d = scan.hexval(s[i])
+      if d < 0 or d >= base: return 0.0 / 0.0
+      v = v * float(base) + float(d)
+    return v
+  for i in 0..s.len:
+    let c = s[i]
+    if not ((c >= '0' and c <= '9') or c == '.' or c == 'e' or c == 'E' or c == '+' or c == '-'): return 0.0 / 0.0
+  return float(s) else 0.0 / 0.0
+
+fn abstract_equal(a: Prim, b: Prim) -> Bool:
+  if (a.kind == 0 or a.kind == 1) and (b.kind == 0 or b.kind == 1): return true
+  if a.kind == b.kind: return strict_equal(a, b)
+  if (a.kind == 3 and b.kind == 4) or (a.kind == 4 and b.kind == 3):
+    var n = a.num
+    var s = b.s
+    if a.kind == 4:
+      n = b.num
+      s = a.s
+    let sv = string_to_number(s)
+    if is_nan(n) or is_nan(sv): return false
+    return n == sv
+  if a.kind == 2:
+    var v = 0.0
+    if a.b: v = 1.0
+    return abstract_equal(Prim(3, false, v, ""), b)
+  if b.kind == 2:
+    var v = 0.0
+    if b.b: v = 1.0
+    return abstract_equal(a, Prim(3, false, v, ""))
+  return false
+
+# ToInt32 / ToUint32
+fn to_uint32(v: Float) -> Int:
+  if is_nan(v) or v > 1.0e300 or v < -1.0e300: return 0
+  let t = v - fmod(v, 1.0)
+  let m = 4294967296.0
+  var r = fmod(t, m)
+  if r < 0.0: r += m
+  return int(r)
+
+fn to_int32(v: Float) -> Int:
+  let u = to_uint32(v)
+  if u >= 2147483648: return u - 4294967296
+  return u
+
+fn num(v: Float) -> Prim:
+  return Prim(3, false, v, "")
+
+fn boolp(b: Bool) -> Prim:
+  return Prim(2, b, 0.0, "")
+
+fn fmod(a: Float, b: Float) -> Float:
+  return a.fmod(b)
+
+fn powf(a: Float, b: Float) -> Float:
+  return a.pow(b)
+
+# evaluate_binary_op: [] when unknown
+fn binary(op: Int, l: Prim, r: Prim) -> [Prim]:
+  let nn = l.kind == 3 and r.kind == 3
+  if op == scan.T_PLUS:
+    if nn: return [num(l.num + r.num)]
+    if l.kind == 4 and r.kind == 4: return [Prim(4, false, 0.0, l.s + r.s)]
+    return []
+  if op == scan.T_MINUS and nn: return [num(l.num - r.num)]
+  if op == scan.T_STAR and nn: return [num(l.num * r.num)]
+  if op == scan.T_SLASH and nn: return [num(l.num / r.num)]
+  if op == scan.T_PCT and nn: return [num(fmod(l.num, r.num))]
+  if op == scan.T_STAR2 and nn:
+    let ab = l.num == 1.0 or l.num == -1.0
+    if ab and (is_nan(r.num) or r.num > 1.0e300 or r.num < -1.0e300): return [num(0.0 / 0.0)]
+    return [num(powf(l.num, r.num))]
+  if op == scan.T_BAR and nn: return [num(float(to_int32(l.num) | to_int32(r.num)))]
+  if op == scan.T_AMP and nn: return [num(float(to_int32(l.num) & to_int32(r.num)))]
+  if op == scan.T_CARET and nn: return [num(float(to_int32(l.num) ^ to_int32(r.num)))]
+  if op == scan.T_SHL and nn:
+    let x = (to_int32(l.num) << (to_uint32(r.num) & 31)) & 4294967295
+    var y = x
+    if y >= 2147483648: y -= 4294967296
+    return [num(float(y))]
+  if op == scan.T_SHR and nn: return [num(float(to_int32(l.num) >> (to_uint32(r.num) & 31)))]
+  if op == scan.T_SHRU and nn: return [num(float(to_uint32(l.num) >> (to_uint32(r.num) & 31)))]
+  if op == scan.T_LT and nn: return [boolp(l.num < r.num)]
+  if op == scan.T_LE and nn: return [boolp(l.num <= r.num)]
+  if op == scan.T_GT and nn: return [boolp(l.num > r.num)]
+  if op == scan.T_GE and nn: return [boolp(l.num >= r.num)]
+  if op == scan.T_EQ3: return [boolp(strict_equal(l, r))]
+  if op == scan.T_NE2: return [boolp(not strict_equal(l, r))]
+  if op == scan.T_EQ2: return [boolp(abstract_equal(l, r))]
+  if op == scan.T_NE: return [boolp(not abstract_equal(l, r))]
+  return []
+
+fn reserved_word(s: Str) -> Bool:
+  for w in ["break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "import", "in", "instanceof", "new", "null", "return", "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with", "implements", "interface", "let", "package", "private", "protected", "public", "static", "yield", "await"]:
+    if s == w: return true
+  return false
+
+fn is_valid_identifier(s: Str) -> Bool:
+  if s.len == 0: return false
+  for i in 0..s.len:
+    let c = s[i]
+    let ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$' or (i > 0 and c >= '0' and c <= '9') or int(c) >= 128
+    if not ok: return false
+  return not reserved_word(s)
+
+# Number.prototype.toString for the common cases
+fn js_num_str(v: Float) -> Str:
+  if is_nan(v): return "NaN"
+  if v > 1.0e300 * 1.0e300: return "Infinity"
+  if v < 0.0 - 1.0e300 * 1.0e300: return "-Infinity"
+  if v < 9.0e18 and v > -9.0e18 and v == float(int(v)): return "{int(v)}"
+  return "{v}"
+
+fn utf16_len(s: Str) -> Int:
+  var n = 0
+  for i in 0..s.len:
+    let b = int(s[i])
+    if b < 0x80 or b >= 0xC0: n += 1
+    if b >= 0xF0: n += 1
+  return n
+
+fn evaluate_phi(cp: CP, phi: Phi) -> [Const]:
+  var have = false
+  var cur = cprim(Prim(1, false, 0.0, ""), rc_hir.nosp())
+  for op in phi.ops:
+    if not (op.identifier in cp.m): return []
+    let v = cp.m[op.identifier]
+    if not have:
+      cur = ccopy(v)
+      have = true
+      continue
+    if not cur.is_global and not v.is_global:
+      if not strict_equal(cur.prim, v.prim): return []
+    elif cur.is_global and v.is_global:
+      if cur.binding.name != v.binding.name: return []
+    else: return []
+  if not have: return []
+  return [cur]
+
+
+fn const_value(c: Const) -> InstrValue:
+  if c.is_global: return rc_hir.LoadGlobal(NonLocal(c.binding.kind, c.binding.name + "", c.binding.module + "", c.binding.imported + ""), c.sp)
+  return rc_hir.Primitive(pcopy(c.prim), c.sp)
+
+fn evaluate_instruction(var cp: CP, var f: HirFunction, iid: Int) -> [Const]:
+  var repl: [InstrValue] = []
+  var res: [Const] = []
+  var memo_consts: [Int] = []
+  eval_value(&cp, f.instructions[iid].value, &repl, &res, &memo_consts)
+  if repl.len > 0:
+    var v = rc_hir.Debugger(rc_hir.nosp())
+    swap(&v, &repl[0])
+    f.instructions[iid].value = v
+  for i in memo_consts:
+    match var f.instructions[iid].value:
+      StartMemoize(_, _, ds, _, _, _, _): ds[i].constant = true
+      _: continue
+  return res
+
+fn eval_value(var cp: CP, v: InstrValue, var repl: [InstrValue], var res: [Const], var memo_consts: [Int]):
+  match v:
+    Primitive(p, sp): res.push(cprim(pcopy(p), sp))
+    LoadGlobal(b, sp): res.push(Const(true, Prim(1, false, 0.0, ""), NonLocal(b.kind, b.name + "", b.module + "", b.imported + ""), sp))
+    ComputedLoad(o, prop, sp):
+      let pv = read(cp, prop)
+      if pv.len > 0 and not pv[0].is_global:
+        let p = pv[0].prim
+        if p.kind == 4 and is_valid_identifier(p.s): repl.push(rc_hir.PropertyLoad(o, PropLit(false, p.s + "", 0.0), true, prop.sp, sp))
+        elif p.kind == 3: repl.push(rc_hir.PropertyLoad(o, PropLit(true, js_num_str(p.num), p.num), true, prop.sp, sp))
+    ComputedStore(o, prop, val, sp):
+      let pv = read(cp, prop)
+      if pv.len > 0 and not pv[0].is_global:
+        let p = pv[0].prim
+        if p.kind == 4 and is_valid_identifier(p.s): repl.push(rc_hir.PropertyStore(o, PropLit(false, p.s + "", 0.0), true, prop.sp, val, sp))
+        elif p.kind == 3: repl.push(rc_hir.PropertyStore(o, PropLit(true, js_num_str(p.num), p.num), true, prop.sp, val, sp))
+    PostfixUpdate(lv, op, val, sp):
+      let pv = read(cp, val)
+      if pv.len > 0 and not pv[0].is_global and pv[0].prim.kind == 3:
+        var nx = pv[0].prim.num + 1.0
+        if op == scan.T_DEC: nx = pv[0].prim.num - 1.0
+        cp.m[lv.identifier] = cprim(num(nx), sp)
+        res.push(cprim(num(pv[0].prim.num), pv[0].sp))
+    PrefixUpdate(lv, op, val, sp):
+      let pv = read(cp, val)
+      if pv.len > 0 and not pv[0].is_global and pv[0].prim.kind == 3:
+        var nx = pv[0].prim.num + 1.0
+        if op == scan.T_DEC: nx = pv[0].prim.num - 1.0
+        cp.m[lv.identifier] = cprim(num(nx), sp)
+        res.push(cprim(num(nx), sp))
+    UnaryExpression(op, val, sp):
+      let pv = read(cp, val)
+      if pv.len > 0 and not pv[0].is_global:
+        if op == rc_hir.UN_NOT:
+          let neg = not is_truthy(pv[0].prim)
+          repl.push(rc_hir.Primitive(boolp(neg), sp))
+          res.push(cprim(boolp(neg), sp))
+        elif op == rc_hir.UN_MINUS and pv[0].prim.kind == 3:
+          let n = 0.0 - pv[0].prim.num
+          repl.push(rc_hir.Primitive(num(n), sp))
+          res.push(cprim(num(n), sp))
+    BinaryExpression(op, l, r, sp):
+      let lv = read(cp, l)
+      let rv = read(cp, r)
+      if lv.len > 0 and rv.len > 0 and not lv[0].is_global and not rv[0].is_global:
+        let bres = binary(op, lv[0].prim, rv[0].prim)
+        if bres.len > 0:
+          repl.push(rc_hir.Primitive(pcopy(bres[0]), sp))
+          res.push(cprim(pcopy(bres[0]), sp))
+    PropertyLoad(o, prop, _, _, sp):
+      let ov = read(cp, o)
+      if ov.len > 0 and not ov[0].is_global and ov[0].prim.kind == 4 and not prop.is_num and prop.s == "length":
+        let n = float(utf16_len(ov[0].prim.s))
+        repl.push(rc_hir.Primitive(num(n), sp))
+        res.push(cprim(num(n), sp))
+    TemplateLiteral(subs, quasis, sp):
+      let s = template_value(cp, subs, quasis)
+      if s.len > 0:
+        repl.push(rc_hir.Primitive(Prim(4, false, 0.0, s[0] + ""), sp))
+        res.push(cprim(Prim(4, false, 0.0, s[0] + ""), sp))
+    LoadLocal(p, _):
+      let pv = read(cp, p)
+      if pv.len > 0:
+        repl.push(const_value(pv[0]))
+        res.push(ccopy(pv[0]))
+    StoreLocal(lv, val, _):
+      let pv = read(cp, val)
+      if pv.len > 0:
+        cp.m[lv.place.identifier] = ccopy(pv[0])
+        res.push(ccopy(pv[0]))
+    StartMemoize(_, has, deps, _, _, _, _):
+      if has:
+        for i in 0..deps.len:
+          if not deps[i].global:
+            let pv = read(cp, deps[i].value)
+            if pv.len > 0 and not pv[0].is_global: memo_consts.push(i)
+    _: return
+
+# a template literal's text when every part is known ([] otherwise)
+fn template_value(cp: CP, subs: [Place], quasis: [rc_hir.TemplateQuasi]) -> [Str]:
+  if subs.len == 0:
+    var s = ""
+    for q in quasis:
+      if not q.has_cooked: return []
+      s = s + q.cooked
+    return [s]
+  if subs.len != quasis.len - 1: return []
+  for q in quasis:
+    if not q.has_cooked: return []
+  var s = quasis[0].cooked + ""
+  for i in 0..subs.len:
+    let sv = read(cp, subs[i])
+    if sv.len == 0 or sv[0].is_global: return []
+    let p = sv[0].prim
+    if p.kind == 0: s = s + "null"
+    elif p.kind == 2:
+      if p.b: s = s + "true"
+      else: s = s + "false"
+    elif p.kind == 3: s = s + js_num_str(p.num)
+    elif p.kind == 4: s = s + p.s
+    else: return []
+    s = s + quasis[i + 1].cooked
+  return [s]
+
+fn constant_propagation(var f: HirFunction, var e: Env):
+  var cp = CP()
+  cp_impl(&f, &e, &cp)
+
+fn cp_impl(var f: HirFunction, var e: Env, var cp: CP):
+  while true:
+    let changed = apply(&f, &e, &cp)
+    if e.failed: return
+    if not changed: break
+    rc_cfg.reverse_postorder(&f.body)
+    rc_build.remove_unreachable_for_updates(&f.body)
+    rc_build.remove_dead_do_while(&f.body)
+    rc_build.remove_unnecessary_try_catch(&f.body)
+    rc_cfg.mark_ids(&f)
+    rc_build.mark_predecessors(&f.body)
+    for oi in 0..f.body.order.len:
+      let bid = f.body.order[oi]
+      var preds: [Int] = []
+      for p in f.body.blocks[bid].preds: preds.push(p)
+      for pi in 0..f.body.blocks[bid].phis.len:
+        var nb: [Int] = []
+        var no: [Place] = []
+        for k in 0..f.body.blocks[bid].phis[pi].ops_block.len:
+          let pb = f.body.blocks[bid].phis[pi].ops_block[k]
+          var keep = false
+          for p in preds:
+            if p == pb: keep = true
+          if keep:
+            nb.push(pb)
+            no.push(f.body.blocks[bid].phis[pi].ops[k])
+        f.body.blocks[bid].phis[pi].ops_block = nb
+        f.body.blocks[bid].phis[pi].ops = no
+    rc_ssa.eliminate_redundant_phi(&f, &e)
+    rc_cfg.merge_consecutive_blocks(&f, &e)
+    if e.failed: return
+
+fn apply(var f: HirFunction, var e: Env, var cp: CP) -> Bool:
+  var changed = false
+  var ids: [Int] = []
+  for x in f.body.order: ids.push(x)
+  for bid in ids:
+    for phi in f.body.blocks[bid].phis:
+      let v = evaluate_phi(cp, phi)
+      if v.len > 0: cp.m[phi.place.identifier] = ccopy(v[0])
+    var iids: [Int] = []
+    for x in f.body.blocks[bid].instructions: iids.push(x)
+    let kind = f.body.blocks[bid].kind
+    for i in 0..iids.len:
+      let iid = iids[i]
+      if kind == rc_hir.BK_SEQUENCE and i == iids.len - 1: continue
+      let fid = rc_ops.value_func(f.instructions[iid].value)
+      if fid >= 0:
+        var inner = rc_cfg.placeholder_function()
+        swap(&inner, &e.functions[fid])
+        cp_impl(&inner, &e, &cp)
+        swap(&inner, &e.functions[fid])
+        if e.failed: return changed
+      let r = evaluate_instruction(&cp, &f, iid)
+      if r.len > 0: cp.m[f.instructions[iid].lvalue.identifier] = ccopy(r[0])
+    var nt = -1
+    var tid = 0
+    var tsp = rc_hir.nosp()
+    match f.body.blocks[bid].terminal:
+      If(test, cons, _, alt, _, _, id, sp):
+        let tv = read(cp, test)
+        if tv.len > 0 and not tv[0].is_global:
+          changed = true
+          nt = alt
+          if is_truthy(tv[0].prim): nt = cons
+          tid = id
+          tsp = sp
+      _: nt = -1
+    if nt >= 0: f.body.blocks[bid].terminal = rc_hir.Goto(nt, rc_hir.GV_BREAK, tid, tsp)
+  return changed

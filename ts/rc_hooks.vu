@@ -1,0 +1,290 @@
+# ValidateHooksUsage, ValidateNoCapitalizedCalls (react_compiler_validation) and
+# OptimizePropsMethodCalls (react_compiler_optimization).
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_diags_hand
+import rc_ops
+import rc_dom
+import rc_pass1
+import rc_shapes
+import rc_gdefs
+from rc_hir import Sp, Place, HirFunction, InstrValue
+from rc_env import Env, Diag
+
+const K_ERROR = 0
+const K_KNOWN_HOOK = 1
+const K_POTENTIAL_HOOK = 2
+const K_GLOBAL = 3
+const K_LOCAL = 4
+
+fn join_kinds(a: Int, b: Int) -> Int:
+  if a == K_ERROR or b == K_ERROR: return K_ERROR
+  if a == K_KNOWN_HOOK or b == K_KNOWN_HOOK: return K_KNOWN_HOOK
+  if a == K_POTENTIAL_HOOK or b == K_POTENTIAL_HOOK: return K_POTENTIAL_HOOK
+  if a == K_GLOBAL or b == K_GLOBAL: return K_GLOBAL
+  return K_LOCAL
+
+fn name_is_hook(e: Env, id: Int) -> Bool:
+  return e.identifiers[id].name_kind != 0 and rc_shapes.is_hook_name(e.identifiers[id].name)
+
+type HV:
+  kinds: {Int: Int} = {}            # identifier -> Kind (absent: none)
+  origins: {Int: Sp} = {}
+  err_keys: [Str] = []              # errors by span, in insertion order
+  errs: {Str: Diag} = {}
+
+fn kind_for_place(h: HV, e: Env, p: Place) -> Int:
+  let known = h.kinds.get(p.identifier, K_LOCAL)
+  if name_is_hook(e, p.identifier): return join_kinds(known, K_POTENTIAL_HOOK)
+  return known
+
+fn origin(h: HV, id: Int) -> Sp:
+  if id in h.origins: return h.origins[id]
+  return rc_hir.nosp()
+
+fn or_sp(a: Sp, b: Sp) -> Sp:
+  if a.s >= 0: return a
+  return b
+
+fn sp_key(s: Sp) -> Str:
+  return "{s.s}:{s.e}"
+
+fn put_err(var h: HV, s: Sp, own d: Diag):
+  let k = sp_key(s)
+  if not (k in h.errs): h.err_keys.push(k)
+  h.errs[k] = d
+
+fn visit_place(var h: HV, var e: Env, p: Place):
+  if h.kinds.get(p.identifier, -1) == K_KNOWN_HOOK:
+    if p.sp.s >= 0:
+      if not (sp_key(p.sp) in h.errs): put_err(&h, p.sp, rc_diags.hook_used_as_value(p.sp))
+    else: rc_env.record_error(&e, rc_diags.hook_used_as_value(p.sp))
+
+fn validate_hook_call(var h: HV, var e: Env, callee: Place, unconditional: Bool):
+  let ck = kind_for_place(h, e, callee)
+  let is_hook = ck == K_KNOWN_HOOK or ck == K_POTENTIAL_HOOK
+  if is_hook and not unconditional:
+    h.kinds[callee.identifier] = K_ERROR
+    if callee.sp.s >= 0:
+      let d = rc_diags.conditional_hook(callee.sp)
+      let k = sp_key(callee.sp)
+      if not (k in h.errs) or h.errs[k].message != d.message: put_err(&h, callee.sp, d)
+    else: rc_env.record_error(&e, rc_diags.conditional_hook(callee.sp))
+  elif ck == K_POTENTIAL_HOOK:
+    let o = origin(h, callee.identifier)
+    if callee.sp.s >= 0:
+      if not (sp_key(callee.sp) in h.errs): put_err(&h, callee.sp, rc_diags_hand.dynamic_hook(callee.sp, o))
+    else: rc_env.record_error(&e, rc_diags_hand.dynamic_hook(callee.sp, o))
+
+fn hook_kind_of_id(e: Env, id: Int) -> Int:
+  return rc_shapes.hook_kind_of(e.reg, e.types[e.identifiers[id].type_])
+
+fn validate_hooks_usage(f: HirFunction, var e: Env):
+  let nb = rc_env.next_block_id(&e)
+  let unconditional = rc_dom.compute_unconditional_blocks(f, &e, nb)
+  if e.failed: return
+  var h = HV()
+  for p in f.params:
+    let k = kind_for_place(h, e, p.place)
+    h.kinds[p.place.identifier] = k
+    h.origins[p.place.identifier] = or_sp(p.place.sp, e.identifiers[p.place.identifier].sp)
+  for bid in f.body.order:
+    let uncond = bid in unconditional
+    for ph in f.body.blocks[bid].phis:
+      var k = K_LOCAL
+      if name_is_hook(e, ph.place.identifier): k = K_POTENTIAL_HOOK
+      for op in ph.ops:
+        if op.identifier in h.kinds: k = join_kinds(k, h.kinds[op.identifier])
+      h.kinds[ph.place.identifier] = k
+      var o = rc_hir.nosp()
+      for op in ph.ops:
+        if o.s < 0: o = or_sp(origin(h, op.identifier), op.sp)
+      h.origins[ph.place.identifier] = or_sp(o, ph.place.sp)
+    for iid in f.body.blocks[bid].instructions:
+      let lv = f.instructions[iid].lvalue
+      let lid = lv.identifier
+      match f.instructions[iid].value:
+        rc_hir.LoadGlobal(_, _):
+          if hook_kind_of_id(e, lid) >= 0: h.kinds[lid] = K_KNOWN_HOOK
+          else: h.kinds[lid] = K_GLOBAL
+        rc_hir.LoadContext(p, _, _): load(&h, &e, lid, p)
+        rc_hir.LoadLocal(p, _): load(&h, &e, lid, p)
+        rc_hir.StoreLocal(l, v, _): store(&h, &e, lid, l.place, v)
+        rc_hir.StoreContext(l, v, _): store(&h, &e, lid, l.place, v)
+        rc_hir.ComputedLoad(o, _, _):
+          visit_place(&h, &e, o)
+          let k = kind_for_place(h, e, o)
+          let lk = kind_for_place(h, e, lv)
+          h.kinds[lid] = join_kinds(lk, k)
+          h.origins[lid] = or_sp(o.sp, origin(h, o.identifier))
+        rc_hir.PropertyLoad(o, prop, _, _, _):
+          let ok = kind_for_place(h, e, o)
+          let hp = not prop.is_num and rc_shapes.is_hook_name(prop.s)
+          var k = K_LOCAL
+          if ok == K_ERROR: k = K_ERROR
+          elif ok == K_KNOWN_HOOK:
+            if hp: k = K_KNOWN_HOOK
+          elif ok == K_POTENTIAL_HOOK: k = K_POTENTIAL_HOOK
+          elif ok == K_GLOBAL:
+            if hp: k = K_KNOWN_HOOK
+            else: k = K_GLOBAL
+          elif hp: k = K_POTENTIAL_HOOK
+          h.kinds[lid] = k
+          h.origins[lid] = or_sp(lv.sp, or_sp(o.sp, origin(h, o.identifier)))
+        rc_hir.CallExpression(callee, args, _):
+          validate_hook_call(&h, &e, callee, uncond)
+          for a in args: visit_place(&h, &e, a.place)
+        rc_hir.MethodCall(recv, prop, args, _):
+          validate_hook_call(&h, &e, prop, uncond)
+          visit_place(&h, &e, recv)
+          for a in args: visit_place(&h, &e, a.place)
+        rc_hir.TaggedTemplateExpression(tag, _, subs, _, _):
+          validate_hook_call(&h, &e, tag, uncond)
+          for s in subs: visit_place(&h, &e, s)
+        rc_hir.Destructure(pat, _, v, _):
+          visit_place(&h, &e, v)
+          let ok = kind_for_place(h, e, v)
+          var places = [lv]
+          for p in rc_ops.pattern_operands(pat): places.push(p)
+          for p in places:
+            let hp = name_is_hook(e, p.identifier)
+            var k = K_LOCAL
+            if ok == K_ERROR: k = K_ERROR
+            elif ok == K_KNOWN_HOOK: k = K_KNOWN_HOOK
+            elif ok == K_POTENTIAL_HOOK: k = K_POTENTIAL_HOOK
+            elif ok == K_GLOBAL:
+              if hp: k = K_KNOWN_HOOK
+              else: k = K_GLOBAL
+            elif hp: k = K_POTENTIAL_HOOK
+            h.kinds[p.identifier] = k
+            h.origins[p.identifier] = or_sp(p.sp, origin(h, v.identifier))
+        rc_hir.ObjectMethod(_, fid): visit_function_expression(&e, fid)
+        rc_hir.FunctionExpression(_, _, _, fid, _, _): visit_function_expression(&e, fid)
+        _:
+          for p in rc_ops.value_operands(f.instructions[iid].value, e): visit_place(&h, &e, p)
+          h.kinds[lid] = kind_for_place(h, e, lv)
+          h.origins[lid] = lv.sp
+          for p in rc_ops.value_lvalues(f.instructions[iid].value):
+            h.kinds[p.identifier] = kind_for_place(h, e, p)
+            h.origins[p.identifier] = p.sp
+      if e.failed: return
+    for p in rc_ops.term_operands(f.body.blocks[bid].terminal): visit_place(&h, &e, p)
+    if e.failed: return
+  var keys: [Str] = []
+  for k in h.err_keys: keys.push(k)
+  for k in keys:
+    var d = rc_env.diag(0, "")
+    swap(&d, &h.errs[k])
+    if not rc_env.record_error(&e, d): return
+
+fn load(var h: HV, var e: Env, lid: Int, p: Place):
+  visit_place(&h, &e, p)
+  h.kinds[lid] = kind_for_place(h, e, p)
+  h.origins[lid] = or_sp(origin(h, p.identifier), or_sp(p.sp, e.identifiers[p.identifier].sp))
+
+fn store(var h: HV, var e: Env, lid: Int, lp: Place, v: Place):
+  visit_place(&h, &e, v)
+  let k = join_kinds(kind_for_place(h, e, v), kind_for_place(h, e, lp))
+  h.kinds[lp.identifier] = k
+  h.kinds[lid] = k
+  let o = or_sp(e.identifiers[lp.identifier].sp, or_sp(lp.sp, origin(h, v.identifier)))
+  h.origins[lp.identifier] = o
+  h.origins[lid] = o
+
+fn visit_function_expression(var e: Env, fid: Int):
+  let fsp = rc_pass1.fn_diagnostic_span(e.functions[fid])
+  var calls: [Int] = []
+  var call_sps: [Sp] = []
+  var nested: [Int] = []
+  var is_nested: [Bool] = []
+  for bid in e.functions[fid].body.order:
+    for iid in e.functions[fid].body.blocks[bid].instructions:
+      match e.functions[fid].instructions[iid].value:
+        rc_hir.ObjectMethod(_, x):
+          nested.push(x)
+          is_nested.push(true)
+          calls.push(-1)
+          call_sps.push(rc_hir.nosp())
+        rc_hir.FunctionExpression(_, _, _, x, _, _):
+          nested.push(x)
+          is_nested.push(true)
+          calls.push(-1)
+          call_sps.push(rc_hir.nosp())
+        rc_hir.CallExpression(c, _, _):
+          nested.push(-1)
+          is_nested.push(false)
+          calls.push(c.identifier)
+          call_sps.push(c.sp)
+        rc_hir.MethodCall(_, c, _, _):
+          nested.push(-1)
+          is_nested.push(false)
+          calls.push(c.identifier)
+          call_sps.push(c.sp)
+        rc_hir.TaggedTemplateExpression(c, _, _, _, _):
+          nested.push(-1)
+          is_nested.push(false)
+          calls.push(c.identifier)
+          call_sps.push(c.sp)
+        _: nop()
+  for i in 0..is_nested.len:
+    if is_nested[i]:
+      visit_function_expression(&e, nested[i])
+    else:
+      let hk = hook_kind_of_id(e, calls[i])
+      if hk >= 0:
+        var what = "hook"
+        if hk != rc_gdefs.HK_CUSTOM: what = rc_gdefs.hook_kind_name(hk)
+        rc_env.record_error(&e, rc_diags_hand.hook_in_function_expression("Cannot call {what} within a function expression", call_sps[i], fsp))
+    if e.failed: return
+
+fn validate_no_capitalized_calls(f: HirFunction, var e: Env):
+  var cap_globals: {Int: Str} = {}
+  var cap_props: {Int: Str} = {}
+  var cap_prop_sp: {Int: Sp} = {}
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.LoadGlobal(b, _):
+          let n = b.name
+          if n.len > 0 and n[0] >= 'A' and n[0] <= 'Z' and n != n.upper() and not (n in e.reg.globals): cap_globals[lid] = n + ""
+        rc_hir.CallExpression(c, _, _):
+          if c.identifier in cap_globals:
+            if not rc_env.record_error(&e, rc_diags.capitalized_call(cap_globals[c.identifier], c.sp)): return
+        rc_hir.PropertyLoad(_, prop, _, psp, _):
+          if not prop.is_num and prop.s.len > 0 and prop.s[0] >= 'A' and prop.s[0] <= 'Z':
+            cap_props[lid] = prop.s + ""
+            cap_prop_sp[lid] = psp
+        rc_hir.MethodCall(_, p, _, _):
+          if p.identifier in cap_props:
+            if not rc_env.record_error(&e, rc_diags.capitalized_call(cap_props[p.identifier], or_sp(cap_prop_sp[p.identifier], p.sp))): return
+        _: nop()
+
+fn is_props_type(e: Env, id: Int) -> Bool:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TObject(sh, has): return has and sh == rc_gdefs.BUILT_IN_PROPS_ID
+    _: return false
+  return false
+
+fn optimize_props_method_calls(var f: HirFunction, e: Env):
+  for bi in 0..f.body.order.len:
+    let bid = f.body.order[bi]
+    for ii in 0..f.body.blocks[bid].instructions.len:
+      let iid = f.body.blocks[bid].instructions[ii]
+      var yes = false
+      match f.instructions[iid].value:
+        rc_hir.MethodCall(r, _, _, _): yes = is_props_type(e, r.identifier)
+        _: nop()
+      if yes:
+        var old = rc_hir.Debugger(rc_hir.nosp())
+        swap(&old, &f.instructions[iid].value)
+        match old:
+          rc_hir.MethodCall(_, prop, args, sp):
+            var a = args[0..args.len]
+            f.instructions[iid].value = rc_hir.CallExpression(prop, a, sp)
+          _: nop()
+
+fn nop():
+  return

@@ -1,0 +1,421 @@
+# Type inference (oxc_react_compiler react_compiler_typeinference/infer_types.rs): type equations
+# from the HIR, unified, and the resolved types written back to the identifiers' type slots.
+# enable_treat_ref_like_identifiers_as_refs is on and enable_treat_set_identifiers_as_state_setters
+# off (the lint configuration), so they aren't options here.
+
+import scan
+import rc_hir
+import rc_env
+import rc_diags
+import rc_ops
+import rc_cfg
+import rc_shapes
+import rc_gdefs
+from rc_hir import Ty, TPrimitive, TPoly, TObject, TFunction, TVar, TPhi, TProperty, TObjectMethod, PropLit, Place, HirFunction, InstrValue
+from rc_env import Env
+from rc_shapes import Registry
+
+type Unifier:
+  subs: {Int: Ty} = {}
+
+fn cp(t: Ty) -> Ty:
+  return rc_hir.cp_ty(t)
+
+fn obj(id: Str) -> Ty:
+  return TObject(id, true)
+
+fn is_var(t: Ty) -> Int:
+  match t:
+    TVar(id): return id
+    _: return -1
+  return -1
+
+fn type_equals(a: Ty, b: Ty) -> Bool:
+  match a:
+    TVar(x):
+      match b:
+        TVar(y): return x == y
+        _: return false
+    TPrimitive:
+      match b:
+        TPrimitive: return true
+        _: return false
+    TPoly:
+      match b:
+        TPoly: return true
+        _: return false
+    TObjectMethod:
+      match b:
+        TObjectMethod: return true
+        _: return false
+    TObject(sa, ha):
+      match b:
+        TObject(sb, hb): return ha == hb and (not ha or sa == sb)
+        _: return false
+    TFunction(_, _, ra, _):
+      match b:
+        TFunction(_, _, rb, _): return type_equals(ra[0], rb[0])
+        _: return false
+    _: return false
+  return false
+
+fn get(u: Unifier, t: Ty) -> Ty:
+  match t:
+    TVar(id):
+      if id in u.subs: return get(u, u.subs[id])
+    TPhi(ops):
+      var r: [Ty] = []
+      for o in ops: r.push(get(u, o))
+      return TPhi(r)
+    TFunction(sh, has, ret, con): return TFunction(sh, has, [get(u, ret[0])], con)
+    _: return cp(t)
+  return cp(t)
+
+fn occurs_check(u: Unifier, v: Ty, t: Ty) -> Bool:
+  if type_equals(v, t): return true
+  match t:
+    TVar(id):
+      if id in u.subs: return occurs_check(u, v, u.subs[id])
+    TPhi(ops):
+      for o in ops:
+        if occurs_check(u, v, o): return true
+      return false
+    TFunction(_, _, ret, _): return occurs_check(u, v, ret[0])
+    _: return false
+  return false
+
+# try_resolve_type ([] none)
+fn try_resolve_type(var u: Unifier, v: Int, t: Ty) -> [Ty]:
+  match t:
+    TPhi(ops):
+      var r: [Ty] = []
+      for o in ops:
+        if is_var(o) == v: continue
+        var x = try_resolve_type(&u, v, o)
+        if x.len == 0: return []
+        var y = TPoly
+        swap(&y, &x[0])
+        r.push(y)
+      return [TPhi(r)]
+    TVar(id):
+      let s = get(u, t)
+      if not type_equals(s, t):
+        var x = try_resolve_type(&u, v, s)
+        if x.len == 0: return []
+        u.subs[id] = cp(x[0])
+        return x
+      return [cp(t)]
+    TProperty(o, name, computed, prop):
+      let ro = get(u, o[0])
+      var x = try_resolve_type(&u, v, ro)
+      if x.len == 0: return []
+      var y = TPoly
+      swap(&y, &x[0])
+      return [TProperty([y], name, computed, PropLit(prop.is_num, prop.s, prop.num))]
+    TFunction(sh, has, ret, con):
+      let rr = get(u, ret[0])
+      var x = try_resolve_type(&u, v, rr)
+      if x.len == 0: return []
+      var y = TPoly
+      swap(&y, &x[0])
+      return [TFunction(sh, has, [y], con)]
+    _: return [cp(t)]
+  return [cp(t)]
+
+fn try_union_types(t1: Ty, t2: Ty) -> [Ty]:
+  var ro = -1
+  if is_shape(t1, rc_gdefs.BUILT_IN_MIXED_READONLY_ID): ro = 1
+  elif is_shape(t2, rc_gdefs.BUILT_IN_MIXED_READONLY_ID): ro = 2
+  else: return []
+  var other = cp(t2)
+  var readonly = cp(t1)
+  if ro == 2:
+    other = cp(t1)
+    readonly = cp(t2)
+  match other:
+    TPrimitive: return [readonly]
+    _: nop()
+  if is_shape(other, rc_gdefs.BUILT_IN_ARRAY_ID): return [other]
+  return []
+
+fn is_shape(t: Ty, id: Str) -> Bool:
+  match t:
+    TObject(sh, has): return has and sh == id
+    _: return false
+  return false
+
+fn is_ref_like_name(name: Str, computed: Bool, prop: PropLit) -> Bool:
+  if computed or prop.is_num or prop.s != "current": return false
+  if name == "ref": return true
+  if name.len <= 3 or not name.endswith("Ref"): return false
+  let c = name[0]
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '$' or c == '_'
+
+# resolve_property_type, with the custom hook type as the fallback for hook-like names
+fn resolve_property_type(reg: Registry, o: Ty, computed: Bool, prop: PropLit) -> [Ty]:
+  let hooky = not computed and not prop.is_num and rc_shapes.is_hook_name(prop.s)
+  let sh = rc_shapes.shape_of(o)
+  if sh == "":
+    if hooky: return [rc_shapes.custom_hook_type()]
+    return []
+  if not (sh in reg.shapes): return []
+  let s = reg.shapes[sh]
+  if not computed and not prop.is_num:
+    let k = prop.s
+    if k in s.props: return [cp(s.props[k])]
+    if "*" in s.props: return [cp(s.props["*"])]
+    if hooky: return [rc_shapes.custom_hook_type()]
+    return []
+  if "*" in s.props: return [cp(s.props["*"])]
+  return []
+
+# unify: 0, or 1 (a phi without operands) / 2 (a cycle), the invariants it throws
+fn unify(var u: Unifier, a: Ty, b: Ty, reg: Registry) -> Int:
+  match b:
+    TProperty(o, name, computed, prop):
+      if is_ref_like_name(name, computed, prop):
+        let r = unify(&u, o[0], obj(rc_gdefs.BUILT_IN_USE_REF_ID), reg)
+        if r != 0: return r
+        return unify(&u, a, obj(rc_gdefs.BUILT_IN_REF_VALUE_ID), reg)
+      let ro = get(u, o[0])
+      let pt = resolve_property_type(reg, ro, computed, prop)
+      if pt.len > 0: return unify(&u, a, pt[0], reg)
+      return 0
+    _: nop()
+  if type_equals(a, b): return 0
+  let va = is_var(a)
+  if va >= 0: return bind_variable_to(&u, va, b, reg)
+  let vb = is_var(b)
+  if vb >= 0: return bind_variable_to(&u, vb, a, reg)
+  match a:
+    TFunction(_, _, ra, ca):
+      match b:
+        TFunction(_, _, rb, cb):
+          if ca == cb: return unify(&u, ra[0], rb[0], reg)
+        _: nop()
+    _: nop()
+  return 0
+
+fn bind_variable_to(var u: Unifier, v: Int, t: Ty, reg: Registry) -> Int:
+  match t:
+    TPoly: return 0
+    _: nop()
+  if v in u.subs:
+    let ex = cp(u.subs[v])
+    return unify(&u, ex, t, reg)
+  let tv = is_var(t)
+  if tv >= 0 and tv in u.subs:
+    let ex = cp(u.subs[tv])
+    return unify(&u, TVar(v), ex, reg)
+  match t:
+    TPhi(ops):
+      if ops.len == 0: return 1
+      var cand: [Ty] = []
+      var done = false
+      for o in ops:
+        if done: continue
+        let res = get(u, o)
+        if cand.len == 0: cand.push(res)
+        elif not type_equals(res, cand[0]):
+          var un = try_union_types(res, cand[0])
+          if un.len > 0:
+            var y = TPoly
+            swap(&y, &un[0])
+            cand[0] = y
+          else:
+            cand = []
+            done = true
+      if cand.len > 0: return unify(&u, TVar(v), cand[0], reg)
+    _: nop()
+  if occurs_check(u, TVar(v), t):
+    var x = try_resolve_type(&u, v, t)
+    if x.len > 0:
+      var y = TPoly
+      swap(&y, &x[0])
+      u.subs[v] = y
+      return 0
+    return 2
+  u.subs[v] = cp(t)
+  return 0
+
+# ---- generating the equations
+
+type Gen:
+  u: Unifier = Unifier()
+  failed: Bool = false
+
+fn tyof(e: Env, id: Int) -> Ty:
+  return TVar(e.identifiers[id].type_)
+
+fn eq(var g: Gen, var e: Env, a: Ty, b: Ty):
+  if g.failed: return
+  let r = unify(&g.u, a, b, e.reg)
+  if r == 1:
+    rc_env.throw(&e, rc_diags.invariant_there_should_at_least_one_operand())
+    g.failed = true
+  elif r == 2:
+    rc_env.throw(&e, rc_diags.invariant_cycle_detected())
+    g.failed = true
+
+fn new_type(var e: Env) -> Ty:
+  return TVar(rc_env.make_type(&e))
+
+fn lit(s: Str) -> PropLit:
+  return PropLit(false, s, 0.0)
+
+fn prop_ty(e: Env, o: Int, names: {Int: Str}, computed: Bool, prop: PropLit) -> Ty:
+  return TProperty([tyof(e, o)], names.get(o, ""), computed, PropLit(prop.is_num, prop.s, prop.num))
+
+fn generate(var g: Gen, var e: Env, f: HirFunction):
+  if f.fn_type == rc_hir.FN_COMPONENT:
+    if f.params.len > 0 and not f.params[0].spread:
+      eq(&g, &e, tyof(e, f.params[0].place.identifier), obj(rc_gdefs.BUILT_IN_PROPS_ID))
+    if f.params.len > 1 and not f.params[1].spread:
+      eq(&g, &e, tyof(e, f.params[1].place.identifier), obj(rc_gdefs.BUILT_IN_USE_REF_ID))
+  var names: {Int: Str} = {}
+  var rets: [Ty] = []
+  for bi in 0..f.body.order.len:
+    let bid = f.body.order[bi]
+    for ph in f.body.blocks[bid].phis:
+      var ops: [Ty] = []
+      for p in ph.ops: ops.push(tyof(e, p.identifier))
+      eq(&g, &e, tyof(e, ph.place.identifier), TPhi(ops))
+    for iid in f.body.blocks[bid].instructions:
+      gen_instr(&g, &e, f.instructions[iid].lvalue, f.instructions[iid].value, &names)
+      if g.failed: return
+    match f.body.blocks[bid].terminal:
+      Return(v, _, _, _, _, _): rets.push(tyof(e, v.identifier))
+      _: nop()
+  let rt = tyof(e, f.returns.identifier)
+  if rets.len > 1: eq(&g, &e, rt, TPhi(rets))
+  elif rets.len == 1: eq(&g, &e, rt, rets[0])
+
+fn gen_inner(var g: Gen, var e: Env, fid: Int):
+  var inner = rc_cfg.placeholder_function()
+  swap(&inner, &e.functions[fid])
+  generate(&g, &e, inner)
+  swap(&inner, &e.functions[fid])
+
+fn gen_instr(var g: Gen, var e: Env, lv: Place, v: InstrValue, var names: {Int: Str}):
+  let left = tyof(e, lv.identifier)
+  match v:
+    TemplateLiteral(_, _, _): eq(&g, &e, left, TPrimitive)
+    JSXText(_, _): eq(&g, &e, left, TPrimitive)
+    Primitive(_, _): eq(&g, &e, left, TPrimitive)
+    UnaryExpression(_, _, _): eq(&g, &e, left, TPrimitive)
+    LoadLocal(p, _):
+      if e.identifiers[p.identifier].name_kind == 1: names[lv.identifier] = e.identifiers[p.identifier].name + ""
+      eq(&g, &e, left, tyof(e, p.identifier))
+    StoreContext(l, val, _):
+      if l.kind == rc_hir.IK_CONST: eq(&g, &e, tyof(e, l.place.identifier), tyof(e, val.identifier))
+    StoreLocal(l, val, _):
+      eq(&g, &e, left, tyof(e, val.identifier))
+      eq(&g, &e, tyof(e, l.place.identifier), tyof(e, val.identifier))
+    StoreGlobal(_, val, _): eq(&g, &e, left, tyof(e, val.identifier))
+    BinaryExpression(op, l, r, _):
+      if is_primitive_binary_op(op):
+        eq(&g, &e, tyof(e, l.identifier), TPrimitive)
+        eq(&g, &e, tyof(e, r.identifier), TPrimitive)
+      eq(&g, &e, left, TPrimitive)
+    PostfixUpdate(l, _, val, _):
+      eq(&g, &e, tyof(e, val.identifier), TPrimitive)
+      eq(&g, &e, tyof(e, l.identifier), TPrimitive)
+      eq(&g, &e, left, TPrimitive)
+    PrefixUpdate(l, _, val, _):
+      eq(&g, &e, tyof(e, val.identifier), TPrimitive)
+      eq(&g, &e, tyof(e, l.identifier), TPrimitive)
+      eq(&g, &e, left, TPrimitive)
+    LoadGlobal(b, _):
+      var t = rc_shapes.global_declaration(&e.reg, b)
+      if t.len > 0: eq(&g, &e, left, t[0])
+    CallExpression(callee, _, _):
+      let rt = new_type(&e)
+      eq(&g, &e, tyof(e, callee.identifier), TFunction("", false, [cp(rt)], false))
+      eq(&g, &e, left, rt)
+    TaggedTemplateExpression(tag, _, _, _, _):
+      let rt = new_type(&e)
+      eq(&g, &e, tyof(e, tag.identifier), TFunction("", false, [cp(rt)], false))
+      eq(&g, &e, left, rt)
+    ObjectExpression(props, _):
+      for p in props:
+        if not p.spread and p.key.kind == 2: eq(&g, &e, tyof(e, p.key.place.identifier), TPrimitive)
+      eq(&g, &e, left, obj(rc_gdefs.BUILT_IN_OBJECT_ID))
+    ArrayExpression(_, _): eq(&g, &e, left, obj(rc_gdefs.BUILT_IN_ARRAY_ID))
+    PropertyLoad(o, prop, _, _, _): eq(&g, &e, left, prop_ty(e, o.identifier, names, false, prop))
+    ComputedLoad(o, _, _): eq(&g, &e, left, prop_ty(e, o.identifier, names, true, lit("")))
+    MethodCall(_, prop, _, _):
+      let rt = new_type(&e)
+      eq(&g, &e, tyof(e, prop.identifier), TFunction("", false, [cp(rt)], false))
+      eq(&g, &e, left, rt)
+    Destructure(pat, _, val, _):
+      if pat.is_object:
+        for p in pat.props:
+          if not p.spread and (p.key.kind == 0 or p.key.kind == 1):
+            eq(&g, &e, tyof(e, p.place.identifier), prop_ty(e, val.identifier, names, false, lit(p.key.name)))
+      else:
+        for i in 0..pat.items.len:
+          let it = pat.items[i]
+          if it.kind == 0: eq(&g, &e, tyof(e, it.place.identifier), prop_ty(e, val.identifier, names, false, lit("{i}")))
+          elif it.kind == 1: eq(&g, &e, tyof(e, it.place.identifier), obj(rc_gdefs.BUILT_IN_ARRAY_ID))
+    TypeCastExpression(val, _, _, _): eq(&g, &e, left, tyof(e, val.identifier))
+    PropertyDelete(_, _, _, _): eq(&g, &e, left, TPrimitive)
+    ComputedDelete(_, _, _): eq(&g, &e, left, TPrimitive)
+    FunctionExpression(_, _, _, fid, _, _):
+      gen_inner(&g, &e, fid)
+      if g.failed: return
+      let rt = tyof(e, e.functions[fid].returns.identifier)
+      eq(&g, &e, left, TFunction(rc_gdefs.BUILT_IN_FUNCTION_ID, true, [rt], false))
+    NextPropertyOf(_, _): eq(&g, &e, left, TPrimitive)
+    ObjectMethod(_, fid):
+      gen_inner(&g, &e, fid)
+      if g.failed: return
+      eq(&g, &e, left, TObjectMethod)
+    JsxExpression(_, _, _, props, _, _, _, _, _, _, _):
+      for a in props:
+        if not a.spread and a.name == "ref": eq(&g, &e, tyof(e, a.place.identifier), obj(rc_gdefs.BUILT_IN_USE_REF_ID))
+      eq(&g, &e, left, obj(rc_gdefs.BUILT_IN_JSX_ID))
+    JsxFragment(_, _, _, _): eq(&g, &e, left, obj(rc_gdefs.BUILT_IN_JSX_ID))
+    NewExpression(callee, _, _):
+      let rt = new_type(&e)
+      eq(&g, &e, tyof(e, callee.identifier), TFunction("", false, [cp(rt)], true))
+      eq(&g, &e, left, rt)
+    PropertyStore(o, prop, _, _, _, _):
+      let d = new_type(&e)
+      eq(&g, &e, d, prop_ty(e, o.identifier, names, false, prop))
+    _: nop()
+
+fn is_primitive_binary_op(op: Int) -> Bool:
+  return op == scan.T_PLUS or op == scan.T_MINUS or op == scan.T_SLASH or op == scan.T_PCT or op == scan.T_STAR or op == scan.T_STAR2 or op == scan.T_AMP or op == scan.T_BAR or op == scan.T_SHR or op == scan.T_SHL or op == scan.T_CARET or op == scan.T_GT or op == scan.T_LT or op == scan.T_GE or op == scan.T_LE
+
+# ---- applying the resolved types
+
+fn resolve(var e: Env, u: Unifier, id: Int):
+  let tid = e.identifiers[id].type_
+  e.types[tid] = get(u, e.types[tid])
+
+fn apply_function(var e: Env, u: Unifier, fid: Int, f: HirFunction):
+  for bi in 0..f.body.order.len:
+    let bid = f.body.order[bi]
+    for ph in f.body.blocks[bid].phis: resolve(&e, u, ph.place.identifier)
+    for iid in f.body.blocks[bid].instructions:
+      resolve(&e, u, f.instructions[iid].lvalue.identifier)
+      for p in rc_ops.value_lvalues(f.instructions[iid].value): resolve(&e, u, p.identifier)
+      let x = rc_ops.value_func(f.instructions[iid].value)
+      if x >= 0:
+        var inner = rc_cfg.placeholder_function()
+        swap(&inner, &e.functions[x])
+        for p in inner.context: resolve(&e, u, p.identifier)
+        apply_function(&e, u, x, inner)
+        swap(&inner, &e.functions[x])
+      else:
+        for p in rc_ops.value_operands_nofn(f.instructions[iid].value): resolve(&e, u, p.identifier)
+  resolve(&e, u, f.returns.identifier)
+
+fn infer_types(f: HirFunction, var e: Env):
+  var g = Gen()
+  generate(&g, &e, f)
+  if g.failed: return
+  apply_function(&e, g.u, -1, f)
+
+fn nop():
+  return

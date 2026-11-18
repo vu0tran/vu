@@ -1,0 +1,592 @@
+# ValidateExhaustiveDependencies (oxc_react_compiler react_compiler_validation/
+# validate_exhaustive_dependencies.rs): compares each useMemo/useCallback's and each effect's
+# dependency list with the dependencies its callback actually reads (memoization: all; effects:
+# the lint mode is All).
+
+import rc_hir
+import rc_env
+import rc_ops
+import rc_lower
+import rc_gdefs
+from rc_hir import Sp, Place, HirFunction, InstrValue, DepPathEntry, ManualMemoDep, PropLit
+from rc_env import Env, Diag
+
+# InferredDependency
+type IDep:
+  global: Bool
+  name: Str          # a global's binding name
+  id: Int
+  path: [DepPathEntry]
+  context: Bool
+  sp: Sp
+
+# Temporary: kind 0 local (d), 1 global (d), 2 aggregate (deps, sp)
+type Tmp:
+  kind: Int
+  d: IDep
+  deps: [IDep]
+  sp: Sp
+
+fn cp_path(xs: [DepPathEntry]) -> [DepPathEntry]:
+  var r: [DepPathEntry] = []
+  for x in xs: r.push(DepPathEntry(PropLit(x.property.is_num, x.property.s, x.property.num), x.computed, x.optional, x.sp))
+  return r
+
+fn cp_dep(d: IDep) -> IDep:
+  return IDep(d.global, d.name, d.id, cp_path(d.path), d.context, d.sp)
+
+fn cp_deps(xs: [IDep]) -> [IDep]:
+  var r: [IDep] = []
+  for x in xs: r.push(cp_dep(x))
+  return r
+
+fn cp_tmp(t: Tmp) -> Tmp:
+  return Tmp(t.kind, cp_dep(t.d), cp_deps(t.deps), t.sp)
+
+fn local_dep(id: Int, own path: [DepPathEntry], context: Bool, sp: Sp) -> IDep:
+  return IDep(false, "", id, path, context, sp)
+
+fn global_dep(name: Str) -> IDep:
+  return IDep(true, name, -1, [], false, rc_hir.nosp())
+
+fn no_dep() -> IDep:
+  return IDep(false, "", -1, [], false, rc_hir.nosp())
+
+fn tmp_local(own d: IDep) -> Tmp:
+  return Tmp(0, d, [], rc_hir.nosp())
+
+fn tmp_global(name: Str) -> Tmp:
+  return Tmp(1, global_dep(name), [], rc_hir.nosp())
+
+fn tmp_agg(own deps: [IDep], sp: Sp) -> Tmp:
+  return Tmp(2, no_dep(), deps, sp)
+
+fn plit_text(p: PropLit) -> Str:
+  if p.is_num: return rc_lower.fmt_num(p.num)
+  return p.s
+
+fn path_key(path: [DepPathEntry]) -> Str:
+  var s = ""
+  for p in path:
+    if p.optional: s = s + "?."
+    else: s = s + "."
+    s = s + plit_text(p.property)
+  return s
+
+fn dep_key(d: IDep) -> Str:
+  if d.global: return "G:{d.name}"
+  return "L:{d.id}:{path_key(d.path)}"
+
+type DS:
+  deps: [IDep] = []
+  keys: {Str: Bool} = {}
+  locals: {Int: Bool} = {}
+
+fn add_inferred(var s: DS, d: IDep):
+  if not d.global and d.id in s.locals: return
+  let k = dep_key(d)
+  if k in s.keys: return
+  s.keys[k] = true
+  s.deps.push(cp_dep(d))
+
+fn add_dependency(var s: DS, t: Tmp):
+  if t.kind == 2:
+    for d in t.deps: add_inferred(&s, d)
+  else: add_inferred(&s, t.d)
+
+fn visit(var s: DS, temps: {Int: Tmp}, p: Place):
+  if p.identifier in temps: add_dependency(&s, temps[p.identifier])
+
+fn shape(e: Env, id: Int, want_fn: Bool) -> Str:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TFunction(sh, has, _, _):
+      if has and want_fn: return sh
+    rc_hir.TObject(sh, has):
+      if has and not want_fn: return sh
+    _: return ""
+  return ""
+
+fn is_primitive(e: Env, id: Int) -> Bool:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TPrimitive: return true
+    _: return false
+  return false
+
+fn is_stable(e: Env, id: Int) -> Bool:
+  let f = shape(e, id, true)
+  if f == "BuiltInSetState" or f == "BuiltInSetActionState" or f == "BuiltInDispatch" or f == "BuiltInStartTransition" or f == "BuiltInSetOptimistic": return true
+  return shape(e, id, false) == "BuiltInUseRefId"
+
+fn is_effect_hook(e: Env, id: Int) -> Bool:
+  let s = shape(e, id, true)
+  return s == "BuiltInUseEffectHook" or s == "BuiltInUseLayoutEffectHook" or s == "BuiltInUseInsertionEffectHook"
+
+fn is_effect_event_fn(e: Env, id: Int) -> Bool:
+  return shape(e, id, true) == "BuiltInEffectEventFunction"
+
+fn ident_name(e: Env, id: Int) -> Str:
+  if e.identifiers[id].name_kind != 0: return e.identifiers[id].name
+  return ""
+
+fn has_name(e: Env, id: Int) -> Bool:
+  return e.identifiers[id].name_kind != 0
+
+fn paths_equal(a: [DepPathEntry], b: [DepPathEntry]) -> Bool:
+  if a.len != b.len: return false
+  for i in 0..a.len:
+    if not plit_eq(a[i].property, b[i].property) or a[i].optional != b[i].optional: return false
+  return true
+
+fn plit_eq(a: PropLit, b: PropLit) -> Bool:
+  if a.is_num != b.is_num: return false
+  if a.is_num: return a.num == b.num
+  return a.s == b.s
+
+fn is_sub_path(sub: [DepPathEntry], path: [DepPathEntry]) -> Bool:
+  if sub.len > path.len: return false
+  for i in 0..sub.len:
+    if not plit_eq(sub[i].property, path[i].property) or sub[i].optional != path[i].optional: return false
+  return true
+
+fn is_sub_path_ignoring_optionals(sub: [DepPathEntry], path: [DepPathEntry]) -> Bool:
+  if sub.len > path.len: return false
+  for i in 0..sub.len:
+    if not plit_eq(sub[i].property, path[i].property): return false
+  return true
+
+# ---- the pass
+
+type CB:
+  has_start: Bool = false
+  memo_id: Int = -1
+  has_deps: Bool = false
+  deps: [ManualMemoDep] = []
+  deps_sp: Sp = Sp(-1, -1)
+  reactive: {Int: Bool} = {}
+  diags: [Diag] = []
+  invalid: {Int: Bool} = {}
+
+fn collect_reactive(f: HirFunction, e: Env) -> {Int: Bool}:
+  var r: {Int: Bool} = {}
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let ins = f.instructions[iid]
+      if ins.lvalue.reactive: r[ins.lvalue.identifier] = true
+      for p in rc_ops.value_lvalues(ins.value):
+        if p.reactive: r[p.identifier] = true
+      for p in rc_ops.value_operands(ins.value, e):
+        if p.reactive: r[p.identifier] = true
+    for p in rc_ops.term_operands(f.body.blocks[bid].terminal):
+      if p.reactive: r[p.identifier] = true
+  return r
+
+fn validate_exhaustive_dependencies(var f: HirFunction, var e: Env):
+  var cb = CB()
+  cb.reactive = collect_reactive(f, e)
+  var temps: {Int: Tmp} = {}
+  for p in f.params: temps[p.place.identifier] = tmp_local(local_dep(p.place.identifier, [], false, p.place.sp))
+  collect_dependencies(f, e, &temps, &cb, true, false)
+  if cb.invalid.len > 0:
+    for i in 0..f.instructions.len:
+      match var f.instructions[i].value:
+        rc_hir.StartMemoize(mid, _, _, _, inv, _, _):
+          if mid in cb.invalid: inv = true
+        _: nop()
+  for i in 0..cb.diags.len:
+    var d = rc_env.diag(0, "")
+    swap(&d, &cb.diags[i])
+    e.errors.push(d)
+
+fn find_optional_places(f: HirFunction) -> {Int: Bool}:
+  var opt: {Int: Bool} = {}
+  var visited: {Int: Bool} = {}
+  for bid in f.body.order:
+    if bid in visited: continue
+    var start = -1
+    var oft = -1
+    var o = false
+    match f.body.blocks[bid].terminal:
+      rc_hir.Optional(optional, test, fallthrough, _, _):
+        start = test
+        oft = fallthrough
+        o = optional
+      _: nop()
+    if start < 0: continue
+    visited[bid] = true
+    var tb = start
+    var queue: [Int] = [bint(o)]      # 0 false, 1 true, 2 none
+    while true:
+      visited[tb] = true
+      var next = -1
+      var stop = false
+      match f.body.blocks[tb].terminal:
+        rc_hir.Branch(t, cons, _, ft, _, _):
+          let io = queue.pop()
+          if io != 2: opt[t.identifier] = io == 1
+          if ft == oft:
+            let ci = f.body.blocks[cons].instructions
+            if ci.len > 0:
+              match f.instructions[ci[ci.len - 1]].value:
+                rc_hir.StoreLocal(_, v, _):
+                  if io != 2: opt[v.identifier] = io == 1
+                _: nop()
+            stop = true
+          else: next = ft
+        rc_hir.Optional(op2, t2, _, _, _):
+          queue.push(bint(op2))
+          next = t2
+        rc_hir.Logical(_, t2, _, _, _):
+          queue.push(2)
+          next = t2
+        rc_hir.Ternary(t2, _, _, _):
+          queue.push(2)
+          next = t2
+        rc_hir.Sequence(b2, _, _, _): next = b2
+        rc_hir.MaybeThrow(c, _, _, _, _, _): next = c
+        _: stop = true
+      if stop or next < 0: break
+      tb = next
+  return opt
+
+fn collect_dependencies(f: HirFunction, e: Env, var temps: {Int: Tmp}, var cb: CB, has_cb: Bool, is_fe: Bool) -> Tmp:
+  let optionals = find_optional_places(f)
+  var s = DS()
+  if is_fe:
+    for p in f.params: s.locals[p.place.identifier] = true
+  var saved_deps: [IDep] = []
+  var saved_keys: {Str: Bool} = {}
+  var saved_locals: {Int: Bool} = {}
+  var has_saved = false
+  for bid in f.body.order:
+    for ph in f.body.blocks[bid].phis:
+      var deps: [IDep] = []
+      for op in ph.ops:
+        if op.identifier in temps:
+          let t = temps[op.identifier]
+          if t.kind == 2:
+            for d in t.deps: deps.push(cp_dep(d))
+          else: deps.push(cp_dep(t.d))
+      if deps.len == 0: continue
+      if deps.len == 1:
+        if deps[0].global: temps[ph.place.identifier] = tmp_global(deps[0].name)
+        else: temps[ph.place.identifier] = tmp_local(cp_dep(deps[0]))
+      else: temps[ph.place.identifier] = tmp_agg(deps, rc_hir.nosp())
+    for iid in f.body.blocks[bid].instructions:
+      let ins = f.instructions[iid]
+      let lid = ins.lvalue.identifier
+      match ins.value:
+        rc_hir.LoadGlobal(b, _): temps[lid] = tmp_global(b.name)
+        rc_hir.LoadContext(p, _, _): load(&temps, &s, p, lid)
+        rc_hir.LoadLocal(p, _): load(&temps, &s, p, lid)
+        rc_hir.DeclareLocal(lv, _):
+          temps[lv.place.identifier] = tmp_local(local_dep(lv.place.identifier, [], false, lv.place.sp))
+          s.locals[lv.place.identifier] = true
+        rc_hir.StoreLocal(lv, v, _):
+          if not has_name(e, lv.place.identifier):
+            if v.identifier in temps: temps[lv.place.identifier] = cp_tmp(temps[v.identifier])
+          else:
+            visit(&s, temps, v)
+            if lv.kind != rc_hir.IK_REASSIGN:
+              temps[lv.place.identifier] = tmp_local(local_dep(lv.place.identifier, [], false, lv.place.sp))
+              s.locals[lv.place.identifier] = true
+        rc_hir.DeclareContext(lv, _):
+          temps[lv.place.identifier] = tmp_local(local_dep(lv.place.identifier, [], true, lv.place.sp))
+          s.locals[lv.place.identifier] = true
+        rc_hir.StoreContext(lv, v, _):
+          visit(&s, temps, v)
+          if lv.kind != rc_hir.IK_REASSIGN:
+            temps[lv.place.identifier] = tmp_local(local_dep(lv.place.identifier, [], true, lv.place.sp))
+            s.locals[lv.place.identifier] = true
+        rc_hir.Destructure(_, k, v, _):
+          visit(&s, temps, v)
+          if k != rc_hir.IK_REASSIGN:
+            for p in rc_ops.value_lvalues(ins.value):
+              temps[p.identifier] = tmp_local(local_dep(p.identifier, [], false, p.sp))
+              s.locals[p.identifier] = true
+        rc_hir.PropertyLoad(o, prop, computed, psp, vsp):
+          let ref_current = shape(e, o.identifier, false) == "BuiltInUseRefId" and not prop.is_num and prop.s == "current"
+          if prop.is_num or ref_current: visit(&s, temps, o)
+          elif o.identifier in temps and temps[o.identifier].kind == 0:
+            let ot = cp_tmp(temps[o.identifier])
+            var np = cp_path(ot.d.path)
+            var esp = psp
+            if esp.s < 0: esp = vsp
+            np.push(DepPathEntry(PropLit(prop.is_num, prop.s, prop.num), computed, optionals.get(o.identifier, false), esp))
+            temps[lid] = tmp_local(local_dep(ot.d.id, np, ot.d.context, vsp))
+        rc_hir.FunctionExpression(_, _, _, fid, _, _): inner_fn(e, fid, lid, &temps, &cb, &s)
+        rc_hir.ObjectMethod(_, fid): inner_fn(e, fid, lid, &temps, &cb, &s)
+        rc_hir.StartMemoize(mid, hd, deps, dsp, _, _, _):
+          if has_cb:
+            cb.has_start = true
+            cb.memo_id = mid
+            cb.has_deps = hd
+            var dl: [ManualMemoDep] = []
+            for d in deps: dl.push(cp_mdep(d))
+            cb.deps = dl
+            cb.deps_sp = dsp
+            var x: [IDep] = []
+            swap(&x, &s.deps)
+            saved_deps = x
+            var y: {Str: Bool} = {}
+            swap(&y, &s.keys)
+            saved_keys = y
+            var z: {Int: Bool} = {}
+            swap(&z, &s.locals)
+            saved_locals = z
+            has_saved = true
+        rc_hir.FinishMemoize(mid, decl, _, _):
+          if has_cb and cb.has_start:
+            cb.has_start = false
+            visit(&s, temps, decl)
+            let inferred = cp_deps(s.deps)
+            var md: [ManualMemoDep] = []
+            for d in cb.deps: md.push(cp_mdep(d))
+            var dg = validate_dependencies(e, inferred, md, cb.reactive, cb.deps_sp, rc_env.EC_MEMO_DEPENDENCIES, 0)
+            if dg.len > 0:
+              var d = rc_env.diag(0, "")
+              swap(&d, &dg[0])
+              cb.diags.push(d)
+              cb.invalid[cb.memo_id] = true
+            if has_saved:
+              has_saved = false
+              var memo: [IDep] = []
+              swap(&memo, &s.deps)
+              swap(&s.deps, &saved_deps)
+              swap(&s.keys, &saved_keys)
+              swap(&s.locals, &saved_locals)
+              saved_deps = []
+              saved_keys = {}
+              saved_locals = {}
+              for d in memo:
+                let k = dep_key(d)
+                if not (k in s.keys):
+                  s.keys[k] = true
+                  s.deps.push(cp_dep(d))
+        rc_hir.ArrayExpression(els, sp):
+          var a = DS()
+          for el in els:
+            if el.kind == 2: continue
+            visit(&a, temps, el.place)
+            visit(&s, temps, el.place)
+          var ad: [IDep] = []
+          swap(&ad, &a.deps)
+          temps[lid] = tmp_agg(ad, sp)
+        rc_hir.CallExpression(c, args, _):
+          if has_cb: check_effect(e, c, args, temps, &cb)
+          for op in rc_ops.value_operands(ins.value, e): visit(&s, temps, op)
+        rc_hir.MethodCall(r, p, args, _):
+          if has_cb: check_effect(e, p, args, temps, &cb)
+          visit(&s, temps, r)
+          for a in args: visit(&s, temps, a.place)
+        _:
+          for op in rc_ops.value_operands(ins.value, e): visit(&s, temps, op)
+          s.locals[lid] = true
+          for p in rc_ops.value_lvalues(ins.value): s.locals[p.identifier] = true
+    for op in rc_ops.term_operands(f.body.blocks[bid].terminal):
+      if op.identifier in optionals: continue
+      visit(&s, temps, op)
+  var out: [IDep] = []
+  swap(&out, &s.deps)
+  return tmp_agg(out, rc_hir.nosp())
+
+fn cp_mdep(d: ManualMemoDep) -> ManualMemoDep:
+  return ManualMemoDep(d.global, d.name, d.value, d.constant, cp_path(d.path), d.sp)
+
+fn load(var temps: {Int: Tmp}, var s: DS, p: Place, lid: Int):
+  if p.identifier in temps:
+    var t = cp_tmp(temps[p.identifier])
+    if t.kind == 0: t.d.sp = p.sp
+    temps[lid] = t
+    if p.identifier in s.locals: s.locals[lid] = true
+
+fn inner_fn(e: Env, fid: Int, lid: Int, var temps: {Int: Tmp}, var cb: CB, var s: DS):
+  var dummy = CB()
+  let fd = collect_dependencies(e.functions[fid], e, &temps, &dummy, false, true)
+  temps[lid] = cp_tmp(fd)
+  add_dependency(&s, fd)
+
+fn check_effect(e: Env, callee: Place, args: [rc_hir.Elem], temps: {Int: Tmp}, var cb: CB):
+  if not is_effect_hook(e, callee.identifier) or args.len < 2: return
+  if args[0].kind != 0 or args[1].kind != 0: return
+  let fa = args[0].place.identifier
+  let da = args[1].place.identifier
+  if not (fa in temps) or not (da in temps): return
+  if temps[fa].kind != 2 or temps[da].kind != 2: return
+  let fdl = cp_deps(temps[fa].deps)
+  let mspan = temps[da].sp
+  var md: [ManualMemoDep] = []
+  for d in temps[da].deps:
+    if d.global: md.push(ManualMemoDep(true, d.name, rc_hir.place(-1, rc_hir.nosp()), false, [], rc_hir.nosp()))
+    else: md.push(ManualMemoDep(false, "", Place(d.id, rc_hir.EF_READ, d.id in cb.reactive, d.sp), false, cp_path(d.path), d.sp))
+  var dg = validate_dependencies(e, fdl, md, cb.reactive, mspan, rc_env.EC_EFFECT_EXHAUSTIVE_DEPS, 0)
+  if dg.len > 0:
+    var d = rc_env.diag(0, "")
+    swap(&d, &dg[0])
+    cb.diags.push(d)
+
+# the sort comparator: -1, 0, 1
+fn cmp_str(a: Str, b: Str) -> Int:
+  if a < b: return -1
+  if a > b: return 1
+  return 0
+
+fn cmp_dep(e: Env, a: IDep, b: IDep) -> Int:
+  if a.global and b.global: return cmp_str(a.name, b.name)
+  if not a.global and not b.global:
+    if not has_name(e, a.id) or not has_name(e, b.id): return 0
+    if a.id != b.id: return cmp_str(ident_name(e, a.id), ident_name(e, b.id))
+    if a.path.len != b.path.len:
+      if a.path.len < b.path.len: return -1
+      return 1
+    for i in 0..a.path.len:
+      var ao = 1
+      if a.path[i].optional: ao = 0
+      var bo = 1
+      if b.path[i].optional: bo = 0
+      if ao != bo:
+        if ao < bo: return -1
+        return 1
+      let c = cmp_str(plit_text(a.path[i].property), plit_text(b.path[i].property))
+      if c != 0: return c
+    return 0
+  if a.global:
+    if not has_name(e, b.id): return 0
+    return cmp_str(a.name, ident_name(e, b.id))
+  if not has_name(e, a.id): return 0
+  return cmp_str(ident_name(e, a.id), b.name)
+
+fn is_equal_temporary(a: IDep, b: IDep) -> Bool:
+  if a.global and b.global: return a.name == b.name
+  if not a.global and not b.global: return a.id == b.id and paths_equal(a.path, b.path)
+  return false
+
+fn is_optional_dependency(e: Env, id: Int, reactive: {Int: Bool}) -> Bool:
+  if id in reactive: return false
+  return is_stable(e, id) or is_primitive(e, id)
+
+fn print_path(path: [DepPathEntry]) -> Str:
+  var s = ""
+  for p in path:
+    if p.optional: s = s + "?"
+    s = s + "." + plit_text(p.property)
+  return s
+
+fn print_inferred(e: Env, d: IDep) -> Str:
+  if d.global: return d.name
+  var n = ident_name(e, d.id)
+  if not has_name(e, d.id): n = "<unnamed>"
+  return n + print_path(d.path)
+
+fn print_manual(e: Env, d: ManualMemoDep) -> Str:
+  var n = d.name
+  if not d.global:
+    n = ident_name(e, d.value.identifier)
+    if not has_name(e, d.value.identifier): n = "<unnamed>"
+  return n + print_path(d.path)
+
+fn or_sp(a: Sp, b: Sp) -> Sp:
+  if a.s >= 0: return a
+  return b
+
+# mode 0 all ([] no diagnostic)
+fn validate_dependencies(e: Env, own inferred0: [IDep], manual: [ManualMemoDep], reactive: {Int: Bool}, mspan: Sp, category: Int, mode: Int) -> [Diag]:
+  var src = inferred0
+  # insertion sort (stable), on indices
+  var ord: [Int] = []
+  for i in 0..src.len: ord.push(i)
+  for i in 1..ord.len:
+    var j = i
+    while j > 0 and cmp_dep(e, src[ord[j - 1]], src[ord[j]]) > 0:
+      let t = ord[j]
+      ord[j] = ord[j - 1]
+      ord[j - 1] = t
+      j -= 1
+  var inferred: [IDep] = []
+  for i in ord:
+    var t = no_dep()
+    swap(&t, &src[i])
+    inferred.push(t)
+  var kept: [IDep] = []
+  for ix in 0..inferred.len:
+    var first = -1
+    for k in 0..inferred.len:
+      if first >= 0: continue
+      let pd = inferred[k]
+      let d = inferred[ix]
+      if is_equal_temporary(pd, d) or (not pd.global and not d.global and pd.id == d.id and is_sub_path(pd.path, d.path)): first = k
+    if first < 0 or first >= ix: kept.push(cp_dep(inferred[ix]))
+  inferred = kept
+  var matched: {Int: Bool} = {}
+  var missing: [Int] = []
+  var extra: [Int] = []
+  for ii in 0..inferred.len:
+    let d = inferred[ii]
+    if d.global:
+      for i in 0..manual.len:
+        if manual[i].global and manual[i].name == d.name:
+          matched[i] = true
+          extra.push(i)
+      continue
+    if is_effect_event_fn(e, d.id): continue
+    var hm = false
+    for i in 0..manual.len:
+      let m = manual[i]
+      if not m.global and m.value.identifier == d.id and (paths_equal(m.path, d.path) or is_sub_path_ignoring_optionals(m.path, d.path)):
+        hm = true
+        matched[i] = true
+    if hm or is_optional_dependency(e, d.id, reactive): continue
+    missing.push(ii)
+  for i in 0..manual.len:
+    if i in matched: continue
+    let m = manual[i]
+    if not m.global and m.constant:
+      if not m.value.reactive and is_primitive(e, m.value.identifier): continue
+    extra.push(i)
+  if missing.len == 0 and extra.len == 0: return []
+  var d = create_diagnostic(category, missing.len > 0, extra.len > 0)
+  if missing.len > 0 and extra.len == 0: d = rc_env.with_label(d, mspan, "This dependency list is missing values used by the callback")
+  for mi in missing:
+    let dep = inferred[mi]
+    var hint = ""
+    if is_stable(e, dep.id): hint = ". Refs, setState functions, and other \"stable\" values generally do not need to be added as dependencies, but this variable may change over time to point to different values"
+    d = rc_env.and_label(d, dep.sp, "Missing dependency `{print_inferred(e, dep)}`{hint}")
+  for xi in extra:
+    let m = manual[xi]
+    let s = or_sp(m.sp, mspan)
+    let ds = print_manual(e, m)
+    if m.global:
+      d = rc_env.and_label(d, s, "Unnecessary dependency `{ds}`. Values declared outside of a component/hook should not be listed as dependencies as the component will not re-render if they change")
+      continue
+    var mt = -1
+    for ii in 0..inferred.len:
+      if mt < 0 and not inferred[ii].global and inferred[ii].id == m.value.identifier and is_sub_path_ignoring_optionals(inferred[ii].path, m.path): mt = ii
+    if mt >= 0:
+      let md = inferred[mt]
+      if is_effect_event_fn(e, md.id): d = rc_env.and_label(d, s, "Functions returned from `useEffectEvent` must not be included in the dependency array. Remove `{ds}` from the dependencies.")
+      elif not is_optional_dependency(e, md.id, reactive): d = rc_env.and_label(d, s, "Overly precise dependency `{ds}`, use `{print_inferred(e, md)}` instead")
+      else: d = rc_env.and_label(d, s, "Unnecessary dependency `{ds}`")
+    else: d = rc_env.and_label(d, s, "Unnecessary dependency `{ds}`")
+  return [d]
+
+fn create_diagnostic(category: Int, missing: Bool, extra: Bool) -> Diag:
+  var parts: [Str] = []
+  if missing: parts.push("missing")
+  if extra: parts.push("extra")
+  var desc: [Str] = []
+  var reason = ""
+  if category == rc_env.EC_MEMO_DEPENDENCIES:
+    reason = "Found {"/".join(parts)} memoization dependencies"
+    if missing: desc.push("Missing dependencies can cause a value to update less often than it should, resulting in stale UI")
+    if extra: desc.push("Extra dependencies can cause a value to update more often than it should, resulting in performance problems such as excessive renders or effects firing too often")
+  else:
+    reason = "Found {"/".join(parts)} effect dependencies"
+    if missing: desc.push("Missing dependencies can cause an effect to fire less often than it should")
+    if extra: desc.push("Extra dependencies can cause an effect to fire more often than it should, resulting in performance problems such as excessive renders and side effects")
+  return rc_env.with_help(rc_env.diag(category, reason), ". ".join(desc))
+
+fn bint(b: Bool) -> Int:
+  if b: return 1
+  return 0
+
+fn nop():
+  return

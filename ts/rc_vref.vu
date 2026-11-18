@@ -1,0 +1,537 @@
+# ValidateNoRefAccessInRender (oxc_react_compiler react_compiler_validation/
+# validate_no_ref_access_in_render.rs): an abstract interpretation of what each value is with
+# respect to refs (a ref, a ref's value, a guard on one, a structure or function holding one), to
+# report reads and writes of ref values during render.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_diags_hand
+import rc_ops
+import rc_shapes
+import rc_gdefs
+from rc_hir import Sp, Place, HirFunction, InstrValue, AliasingEffect
+from rc_env import Env, Diag
+
+const RA_NONE = 0
+const RA_NULLABLE = 1
+const RA_GUARD = 2
+const RA_REF = 3
+const RA_REF_VALUE = 4
+const RA_STRUCTURE = 5
+
+# RefAccessType and RefAccessRefType in one record: id is the ref id (-1 none for a RefValue);
+# a Structure has value (0 or 1 element, a Ref, RefValue or Structure) and maybe a function type
+type RT:
+  k: Int = RA_NONE
+  id: Int = -1
+  sp: Sp = Sp(-1, -1)
+  rsp: Sp = Sp(-1, -1)
+  value: [RT] = []
+  has_fn: Bool = false
+  rre: Bool = false
+  rasp: Sp = Sp(-1, -1)
+  ret: [RT] = []
+
+fn rt(k: Int) -> RT:
+  return RT(k: k)
+
+fn cp(a: RT) -> RT:
+  var v: [RT] = []
+  for x in a.value: v.push(cp(x))
+  var r: [RT] = []
+  for x in a.ret: r.push(cp(x))
+  return RT(a.k, a.id, a.sp, a.rsp, v, a.has_fn, a.rre, a.rasp, r)
+
+fn sp_eq(a: Sp, b: Sp) -> Bool:
+  return a.s == b.s and a.e == b.e
+
+fn rt_eq(a: RT, b: RT) -> Bool:
+  if a.k != b.k: return false
+  if a.k == RA_GUARD: return a.id == b.id
+  if a.k == RA_REF_VALUE: return sp_eq(a.sp, b.sp)
+  if a.k == RA_STRUCTURE:
+    if a.value.len != b.value.len: return false
+    if a.value.len > 0 and not rt_eq(a.value[0], b.value[0]): return false
+    if a.has_fn != b.has_fn: return false
+    if a.has_fn:
+      if a.rre != b.rre or not sp_eq(a.rasp, b.rasp): return false
+      if not rt_eq(a.ret[0], b.ret[0]): return false
+  return true
+
+type RE:
+  changed: Bool = false
+  data: {Int: RT} = {}
+  temps: {Int: Int} = {}
+  next_id: Int = 0
+
+fn new_ref(var r: RE) -> RT:
+  let id = r.next_id
+  r.next_id += 1
+  return RT(k: RA_REF, id: id)
+
+fn join_ref(var r: RE, a: RT, b: RT) -> RT:
+  if a.k == RA_REF_VALUE and b.k == RA_REF_VALUE:
+    if a.id == b.id: return cp(a)
+    return rt(RA_REF_VALUE)
+  if a.k == RA_REF_VALUE: return cp(a)
+  if b.k == RA_REF_VALUE: return cp(b)
+  if a.k == RA_REF and b.k == RA_REF:
+    if a.id == b.id: return cp(a)
+    return new_ref(&r)
+  if a.k == RA_REF or b.k == RA_REF: return new_ref(&r)
+  var out = rt(RA_STRUCTURE)
+  if not a.has_fn and b.has_fn:
+    out.has_fn = true
+    out.rre = b.rre
+    out.rasp = b.rasp
+    out.ret = [cp(b.ret[0])]
+  elif a.has_fn and not b.has_fn:
+    out.has_fn = true
+    out.rre = a.rre
+    out.rasp = a.rasp
+    out.ret = [cp(a.ret[0])]
+  elif a.has_fn and b.has_fn:
+    out.has_fn = true
+    out.rre = a.rre or b.rre
+    out.rasp = a.rasp
+    if out.rasp.s < 0: out.rasp = b.rasp
+    out.ret = [join(&r, a.ret[0], b.ret[0])]
+  if a.value.len == 0 and b.value.len > 0: out.value = [cp(b.value[0])]
+  elif a.value.len > 0 and b.value.len == 0: out.value = [cp(a.value[0])]
+  elif a.value.len > 0: out.value = [join_ref(&r, a.value[0], b.value[0])]
+  return out
+
+fn is_ref_kind(k: Int) -> Bool:
+  return k == RA_REF or k == RA_REF_VALUE or k == RA_STRUCTURE
+
+fn join(var r: RE, a: RT, b: RT) -> RT:
+  if a.k == RA_NONE: return cp(b)
+  if b.k == RA_NONE: return cp(a)
+  if a.k == RA_GUARD and b.k == RA_GUARD:
+    if a.id == b.id: return cp(a)
+    return rt(RA_NONE)
+  if (a.k == RA_GUARD and b.k == RA_NULLABLE) or (a.k == RA_NULLABLE and b.k == RA_GUARD): return rt(RA_NONE)
+  if a.k == RA_GUARD: return cp(b)
+  if b.k == RA_GUARD: return cp(a)
+  if a.k == RA_NULLABLE: return cp(b)
+  if b.k == RA_NULLABLE: return cp(a)
+  return join_ref(&r, a, b)
+
+fn join_many(var r: RE, ts: [RT]) -> RT:
+  var acc = rt(RA_NONE)
+  for t in ts: acc = join(&r, acc, t)
+  return acc
+
+fn operand_id(r: RE, k: Int) -> Int:
+  return r.temps.get(k, k)
+
+# [] none
+fn get(r: RE, k: Int) -> [RT]:
+  let o = operand_id(r, k)
+  if o in r.data: return [cp(r.data[o])]
+  return []
+
+fn get_or(r: RE, k: Int, own d: RT) -> RT:
+  let o = operand_id(r, k)
+  if o in r.data: return cp(r.data[o])
+  return d
+
+fn set(var r: RE, k: Int, v: RT):
+  let o = operand_id(r, k)
+  var has = o in r.data
+  var w = rt(RA_NONE)
+  if has:
+    let cur = cp(r.data[o])
+    w = join(&r, v, cur)
+    if not rt_eq(cur, w): r.changed = true
+  else:
+    w = join(&r, v, rt(RA_NONE))
+    if w.k != RA_NONE: r.changed = true
+  r.data[o] = w
+
+fn obj_shape(e: Env, id: Int) -> Str:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TObject(sh, has):
+      if has: return sh
+    _: return ""
+  return ""
+
+fn is_ref_type(e: Env, id: Int) -> Bool:
+  return obj_shape(e, id) == rc_gdefs.BUILT_IN_USE_REF_ID
+
+fn is_ref_value_type(e: Env, id: Int) -> Bool:
+  return obj_shape(e, id) == rc_gdefs.BUILT_IN_REF_VALUE_ID
+
+fn ref_type_of_type(var r: RE, e: Env, id: Int) -> RT:
+  if is_ref_value_type(e, id): return rt(RA_REF_VALUE)
+  if is_ref_type(e, id): return new_ref(&r)
+  return rt(RA_NONE)
+
+fn destructure(t: RT) -> RT:
+  if t.k == RA_STRUCTURE and t.value.len > 0: return destructure(t.value[0])
+  return cp(t)
+
+fn or_sp(a: Sp, b: Sp) -> Sp:
+  if a.s >= 0: return a
+  return b
+
+fn no_direct(var errs: [Diag], op: Place, r: RE):
+  let g = get(r, op.identifier)
+  if g.len == 0: return
+  let t = destructure(g[0])
+  if t.k == RA_REF_VALUE: errs.push(rc_diags_hand.ref_value_access(or_sp(t.sp, op.sp)))
+
+fn no_value(var errs: [Diag], r: RE, op: Place):
+  let g = get(r, op.identifier)
+  if g.len == 0: return
+  let t = destructure(g[0])
+  if t.k == RA_REF_VALUE: errs.push(rc_diags_hand.ref_value_access(or_sp(t.sp, op.sp)))
+  elif t.k == RA_STRUCTURE and t.has_fn and t.rre: errs.push(rc_diags_hand.ref_value_access(op.sp))
+
+fn no_passed(var errs: [Diag], r: RE, op: Place, sp: Sp):
+  let g = get(r, op.identifier)
+  if g.len == 0: return
+  let t = destructure(g[0])
+  if t.k == RA_REF: errs.push(rc_diags_hand.ref_passed_to_function(sp))
+  elif t.k == RA_REF_VALUE: errs.push(rc_diags_hand.ref_passed_to_function(or_sp(t.sp, sp)))
+  elif t.k == RA_STRUCTURE and t.has_fn and t.rre: errs.push(rc_diags_hand.ref_passed_to_function(sp))
+
+fn no_update(var errs: [Diag], r: RE, op: Place, sp: Sp):
+  let g = get(r, op.identifier)
+  if g.len == 0: return
+  let t = destructure(g[0])
+  if t.k == RA_REF: errs.push(rc_diags_hand.ref_update(sp, op.sp))
+  elif t.k == RA_REF_VALUE: errs.push(rc_diags_hand.ref_update(or_sp(t.sp, sp), or_sp(t.rsp, op.sp)))
+
+fn guard_check(var errs: [Diag], op: Place, r: RE):
+  let g = get(r, op.identifier)
+  if g.len > 0 and g[0].k == RA_GUARD: errs.push(rc_diags_hand.ref_value_access(op.sp))
+
+fn diag_key(d: Diag) -> Str:
+  var k = "{d.message}\n{d.help}\n{d.note}\n{d.severity}\n{d.category}\n{d.url}"
+  for l in d.labels: k = k + "\n{l.has_text}\t{l.text}\t{l.s}\t{l.e}\t{l.primary}"
+  return k
+
+fn validate_no_ref_access_in_render(f: HirFunction, var e: Env):
+  var r = RE()
+  collect_temporaries(f, e, &r)
+  var errs: [Diag] = []
+  impl(f, e, &r, &errs)
+  var seen: {Str: Bool} = {}
+  for i in 0..errs.len:
+    let k = diag_key(errs[i])
+    if k in seen: continue
+    seen[k] = true
+    var d = rc_env.diag(0, "")
+    swap(&d, &errs[i])
+    e.errors.push(d)
+
+fn collect_temporaries(f: HirFunction, e: Env, var r: RE):
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.LoadLocal(p, _): r.temps[lid] = r.temps.get(p.identifier, p.identifier)
+        rc_hir.StoreLocal(lv, v, _):
+          let t = r.temps.get(v.identifier, v.identifier)
+          r.temps[lid] = t
+          r.temps[lv.place.identifier] = t
+        rc_hir.PropertyLoad(o, prop, _, _, _):
+          if is_ref_type(e, o.identifier) and not prop.is_num and prop.s == "current": continue
+          r.temps[lid] = r.temps.get(o.identifier, o.identifier)
+        _: nop()
+
+fn lookup(var r: RE, o: Place, ins_sp: Sp, with_ref: Bool) -> [RT]:
+  let g = get(r, o.identifier)
+  if g.len > 0:
+    if g[0].k == RA_STRUCTURE and g[0].value.len > 0: return [cp(g[0].value[0])]
+    if with_ref and g[0].k == RA_REF: return [RT(k: RA_REF_VALUE, id: g[0].id, sp: ins_sp, rsp: o.sp)]
+  return []
+
+fn set_or_type(var r: RE, e: Env, id: Int, own t: [RT]):
+  if t.len > 0: set(&r, id, t[0])
+  else:
+    let x = ref_type_of_type(&r, e, id)
+    set(&r, id, x)
+
+fn impl(f: HirFunction, e: Env, var r: RE, var errs: [Diag]) -> RT:
+  var rets: [RT] = []
+  for p in f.params:
+    let t = ref_type_of_type(&r, e, p.place.identifier)
+    set(&r, p.place.identifier, t)
+  var jsx_children: {Int: Bool} = {}
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      match f.instructions[iid].value:
+        rc_hir.JsxExpression(_, _, _, _, has, ch, _, _, _, _, _):
+          if has:
+            for c in ch: jsx_children[c.identifier] = true
+        rc_hir.JsxFragment(ch, _, _, _):
+          for c in ch: jsx_children[c.identifier] = true
+        _: nop()
+  for iteration in 0..10:
+    if iteration > 0 and not r.changed: break
+    r.changed = false
+    rets = []
+    var safe_b: [Int] = []
+    var safe_r: [Int] = []
+    for bid in f.body.order:
+      var nb: [Int] = []
+      var nr: [Int] = []
+      for i in 0..safe_b.len:
+        if safe_b[i] != bid:
+          nb.push(safe_b[i])
+          nr.push(safe_r[i])
+      safe_b = nb
+      safe_r = nr
+      for ph in f.body.blocks[bid].phis:
+        var ts: [RT] = []
+        for op in ph.ops: ts.push(get_or(r, op.identifier, rt(RA_NONE)))
+        let j = join_many(&r, ts)
+        set(&r, ph.place.identifier, j)
+      for iid in f.body.blocks[bid].instructions:
+        instr(f, e, iid, &r, &errs, jsx_children, &safe_b, &safe_r)
+      var test = -1
+      var ft = -1
+      match f.body.blocks[bid].terminal:
+        rc_hir.If(t, _, _, _, _, fallthrough, _, _):
+          test = t.identifier
+          ft = fallthrough
+        _: nop()
+      if test >= 0:
+        let g = get(r, test)
+        if g.len > 0 and g[0].k == RA_GUARD:
+          var dup = false
+          for x in safe_r:
+            if x == g[0].id: dup = true
+          if not dup:
+            safe_b.push(ft)
+            safe_r.push(g[0].id)
+      var is_ret = false
+      var is_if = false
+      match f.body.blocks[bid].terminal:
+        rc_hir.Return(_, _, _, _, _, _): is_ret = true
+        rc_hir.If(_, _, _, _, _, _, _, _): is_if = true
+        _: nop()
+      for op in rc_ops.term_operands(f.body.blocks[bid].terminal):
+        if not is_ret:
+          no_value(&errs, r, op)
+          if not is_if: guard_check(&errs, op, r)
+        else:
+          no_direct(&errs, op, r)
+          guard_check(&errs, op, r)
+          let g = get(r, op.identifier)
+          if g.len > 0: rets.push(cp(g[0]))
+    if errs.len > 0: return rt(RA_NONE)
+  if r.changed:
+    errs.push(rc_diags.invariant_ref_type_environment_did_not_converge())
+    return rt(RA_NONE)
+  return join_many(&r, rets)
+
+fn instr(f: HirFunction, e: Env, iid: Int, var r: RE, var errs: [Diag], jsx_children: {Int: Bool}, var safe_b: [Int], var safe_r: [Int]):
+  let ins = f.instructions[iid]
+  let lid = ins.lvalue.identifier
+  let ops = rc_ops.value_operands(ins.value, e)
+  match ins.value:
+    rc_hir.JsxExpression(_, _, _, _, _, _, _, _, _, _, _):
+      for op in ops: no_direct(&errs, op, r)
+    rc_hir.JsxFragment(_, _, _, _):
+      for op in ops: no_direct(&errs, op, r)
+    rc_hir.ComputedLoad(o, p, _):
+      no_direct(&errs, p, r)
+      let t = lookup(&r, o, ins.sp, true)
+      set_or_type(&r, e, lid, t)
+    rc_hir.PropertyLoad(o, _, _, _, _):
+      let t = lookup(&r, o, ins.sp, true)
+      set_or_type(&r, e, lid, t)
+    rc_hir.TypeCastExpression(v, _, _, _): set_or_type(&r, e, lid, get(r, v.identifier))
+    rc_hir.LoadContext(p, _, _): set_or_type(&r, e, lid, get(r, p.identifier))
+    rc_hir.LoadLocal(p, _): set_or_type(&r, e, lid, get(r, p.identifier))
+    rc_hir.StoreContext(lv, v, _):
+      set_or_type(&r, e, lv.place.identifier, get(r, v.identifier))
+      set_or_type(&r, e, lid, get(r, v.identifier))
+    rc_hir.StoreLocal(lv, v, _):
+      set_or_type(&r, e, lv.place.identifier, get(r, v.identifier))
+      set_or_type(&r, e, lid, get(r, v.identifier))
+    rc_hir.Destructure(pat, _, v, _):
+      let t = lookup(&r, v, ins.sp, false)
+      set_or_type(&r, e, lid, copy_rts(t))
+      for p in rc_ops.pattern_operands(pat): set_or_type(&r, e, p.identifier, copy_rts(t))
+    rc_hir.ObjectMethod(_, fid): fn_value(e, fid, lid, &r)
+    rc_hir.FunctionExpression(_, _, _, fid, _, _): fn_value(e, fid, lid, &r)
+    rc_hir.MethodCall(_, prop, _, _): call(f, e, iid, prop, &r, &errs, jsx_children)
+    rc_hir.CallExpression(callee, _, _): call(f, e, iid, callee, &r, &errs, jsx_children)
+    rc_hir.ObjectExpression(_, _): aggregate(e, ops, lid, &r, &errs)
+    rc_hir.ArrayExpression(_, _): aggregate(e, ops, lid, &r, &errs)
+    rc_hir.PropertyDelete(o, _, _, _): store(ins, o, false, &r, &errs, &safe_b, &safe_r)
+    rc_hir.PropertyStore(o, _, _, _, _, _): store(ins, o, true, &r, &errs, &safe_b, &safe_r)
+    rc_hir.ComputedDelete(o, _, _): store(ins, o, false, &r, &errs, &safe_b, &safe_r)
+    rc_hir.ComputedStore(o, _, _, _): store(ins, o, false, &r, &errs, &safe_b, &safe_r)
+    rc_hir.StartMemoize(_, _, _, _, _, _, _): nop()
+    rc_hir.FinishMemoize(_, _, _, _): nop()
+    rc_hir.LoadGlobal(b, _):
+      if b.name == "undefined": set(&r, lid, rt(RA_NULLABLE))
+    rc_hir.Primitive(v, _):
+      if v.kind == 0 or v.kind == 1: set(&r, lid, rt(RA_NULLABLE))
+    rc_hir.UnaryExpression(op, v, _):
+      let g = get(r, v.identifier)
+      if op == rc_hir.UN_NOT and g.len > 0 and g[0].k == RA_REF_VALUE and g[0].id >= 0:
+        set(&r, lid, RT(k: RA_GUARD, id: g[0].id))
+        errs.push(rc_diags_hand.ref_value_access(v.sp))
+      else: no_value(&errs, r, v)
+    rc_hir.BinaryExpression(_, l, rr, _):
+      let lt = get(r, l.identifier)
+      let rtt = get(r, rr.identifier)
+      var found = -1
+      if lt.len > 0 and lt[0].k == RA_REF_VALUE and lt[0].id >= 0: found = lt[0].id
+      elif rtt.len > 0 and rtt[0].k == RA_REF_VALUE and rtt[0].id >= 0: found = rtt[0].id
+      let nullish = (lt.len > 0 and lt[0].k == RA_NULLABLE) or (rtt.len > 0 and rtt[0].k == RA_NULLABLE)
+      if found >= 0 and nullish: set(&r, lid, RT(k: RA_GUARD, id: found))
+      else:
+        no_value(&errs, r, l)
+        no_value(&errs, r, rr)
+    _:
+      for op in ops: no_value(&errs, r, op)
+  # the computed / property stores' value and property checks
+  match ins.value:
+    rc_hir.ComputedDelete(_, p, _): no_value(&errs, r, p)
+    rc_hir.ComputedStore(o, p, v, _):
+      no_value(&errs, r, p)
+      store_value(o, v, &r, &errs)
+    rc_hir.PropertyStore(o, _, _, _, v, _): store_value(o, v, &r, &errs)
+    _: nop()
+  for op in ops: guard_check(&errs, op, r)
+  if is_ref_type(e, lid):
+    let g = get(r, lid)
+    if g.len == 0 or g[0].k != RA_REF:
+      var ex = rt(RA_NONE)
+      if g.len > 0: ex = cp(g[0])
+      let nr = new_ref(&r)
+      let j = join(&r, ex, nr)
+      set(&r, lid, j)
+  if is_ref_value_type(e, lid):
+    let g = get(r, lid)
+    if g.len == 0 or g[0].k != RA_REF_VALUE:
+      var ex = rt(RA_NONE)
+      if g.len > 0: ex = cp(g[0])
+      let j = join(&r, ex, RT(k: RA_REF_VALUE, sp: ins.sp))
+      set(&r, lid, j)
+
+fn copy_rts(xs: [RT]) -> [RT]:
+  var o: [RT] = []
+  for x in xs: o.push(cp(x))
+  return o
+
+fn fn_value(e: Env, fid: Int, lid: Int, var r: RE):
+  var ie: [Diag] = []
+  let res = impl(e.functions[fid], e, &r, &ie)
+  var t = rt(RA_STRUCTURE)
+  t.has_fn = true
+  if ie.len == 0:
+    t.ret = [res]
+  else:
+    t.ret = [rt(RA_NONE)]
+    t.rre = true
+    var s = rc_hir.nosp()
+    for d in ie:
+      for l in d.labels:
+        if s.s < 0 and l.primary: s = Sp(l.s, l.e)
+    if s.s < 0:
+      for d in ie:
+        for l in d.labels:
+          if s.s < 0: s = Sp(l.s, l.e)
+    t.rasp = s
+  set(&r, lid, t)
+
+fn aggregate(e: Env, ops: [Place], lid: Int, var r: RE, var errs: [Diag]):
+  var ts: [RT] = []
+  for op in ops:
+    no_direct(&errs, op, r)
+    ts.push(get_or(r, op.identifier, rt(RA_NONE)))
+  let v = join_many(&r, ts)
+  if v.k == RA_NONE or v.k == RA_GUARD or v.k == RA_NULLABLE: set(&r, lid, rt(RA_NONE))
+  else:
+    var s = rt(RA_STRUCTURE)
+    s.value = [v]
+    set(&r, lid, s)
+
+fn store(ins: rc_hir.Instruction, o: Place, is_prop_store: Bool, var r: RE, var errs: [Diag], var safe_b: [Int], var safe_r: [Int]):
+  let target = get(r, o.identifier)
+  var found = false
+  if is_prop_store and target.len > 0 and target[0].k == RA_REF:
+    for i in 0..safe_r.len:
+      if not found and safe_r[i] == target[0].id:
+        var nb: [Int] = []
+        var nr: [Int] = []
+        for j in 0..safe_r.len:
+          if j != i:
+            nb.push(safe_b[j])
+            nr.push(safe_r[j])
+        safe_b = nb
+        safe_r = nr
+        found = true
+        break
+  if not found: no_update(&errs, r, o, ins.sp)
+
+fn store_value(o: Place, v: Place, var r: RE, var errs: [Diag]):
+  no_direct(&errs, v, r)
+  let vt = get(r, v.identifier)
+  if vt.len > 0 and vt[0].k == RA_STRUCTURE:
+    var ot = cp(vt[0])
+    let target = get(r, o.identifier)
+    if target.len > 0: ot = join(&r, ot, target[0])
+    set(&r, o.identifier, ot)
+
+fn call(f: HirFunction, e: Env, iid: Int, callee: Place, var r: RE, var errs: [Diag], jsx_children: {Int: Bool}):
+  let ins = f.instructions[iid]
+  let lid = ins.lvalue.identifier
+  let ops = rc_ops.value_operands(ins.value, e)
+  var ret = rt(RA_NONE)
+  var did = false
+  let ft = get(r, callee.identifier)
+  if ft.len > 0 and ft[0].k == RA_STRUCTURE and ft[0].has_fn:
+    ret = cp(ft[0].ret[0])
+    if ft[0].rre:
+      did = true
+      errs.push(rc_diags_hand.function_accesses_ref(callee.sp, ft[0].rasp))
+  if not did:
+    let is_ref_lv = is_ref_type(e, lid)
+    let hk = rc_shapes.hook_kind_of(e.reg, e.types[e.identifiers[callee.identifier].type_])
+    if is_ref_lv or (hk >= 0 and hk != rc_gdefs.HK_USE_STATE and hk != rc_gdefs.HK_USE_REDUCER):
+      for op in ops: no_direct(&errs, op, r)
+    elif lid in jsx_children:
+      for op in ops: no_value(&errs, r, op)
+    elif hk < 0:
+      if ins.has_effects:
+        var opids: {Int: Bool} = {}
+        for op in ops: opids[operand_id(r, op.identifier)] = true
+        var visited: {Str: Bool} = {}
+        for x in ins.effects:
+          let k = x.kind
+          var p = x.a
+          var v = 0
+          if k == rc_hir.AE_FREEZE: v = 1
+          elif k == rc_hir.AE_MUTATE or k == rc_hir.AE_MUTATE_TRANSITIVE or k == rc_hir.AE_MUTATE_CONDITIONALLY or k == rc_hir.AE_MUTATE_TRANSITIVE_CONDITIONALLY: v = 2
+          elif k == rc_hir.AE_RENDER: v = 2
+          elif k == rc_hir.AE_CAPTURE or k == rc_hir.AE_ALIAS or k == rc_hir.AE_MAYBE_ALIAS or k == rc_hir.AE_ASSIGN or k == rc_hir.AE_CREATE_FROM: v = 2
+          elif k == rc_hir.AE_IMMUTABLE_CAPTURE:
+            var frozen = false
+            for y in ins.effects:
+              if y.kind == rc_hir.AE_FREEZE and y.a.identifier == x.a.identifier: frozen = true
+            v = 2
+            if frozen: v = 1
+          if v != 0 and operand_id(r, p.identifier) in opids:
+            let key = "{p.identifier}:{v}"
+            if not (key in visited):
+              visited[key] = true
+              if v == 1: no_direct(&errs, p, r)
+              else: no_passed(&errs, r, p, p.sp)
+      else:
+        for op in ops: no_passed(&errs, r, op, op.sp)
+    else:
+      for op in ops: no_passed(&errs, r, op, op.sp)
+  set(&r, lid, ret)
+
+fn nop():
+  return

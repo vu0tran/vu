@@ -1,0 +1,468 @@
+# The React Compiler's HIR builder (react_compiler_lowering/hir_builder.rs): the blocks of the
+# function being lowered, the block under construction, break/continue scopes, exception
+# handlers, and the bindings (symbol -> identifier) with oxc's name_N renaming.
+
+import ast
+import rc_hir
+import rc_env
+import rc_sem
+import rc_visit
+from rc_hir import Sp, Place, Instruction, InstrValue, Terminal, BasicBlock, HIR, Phi
+from rc_env import Env, Diag
+from rc_sem import Sem
+
+# what the lowering reads: the tree, the source, oxc's model of names, parents
+type Ctx:
+  t: ast.Ast
+  src: Str
+  m: Sem
+  par: [Int]
+  ts: Bool
+
+# IdentifierLocIndex: the references and declarations inside the compiled function
+type LocIndex:
+  rspan_s: {Int: Int} = {}    # reference -> its identifier's span
+  rspan_e: {Int: Int} = {}
+  rjsx_s: {Int: Int} = {}     # reference -> the JSX opening element it names (-1 none)
+  rjsx_e: {Int: Int} = {}
+  rtype: {Int: Bool} = {}     # reference -> in a type annotation
+  dspan_s: {Int: Int} = {}    # symbol -> its declaration identifier's span
+  dspan_e: {Int: Int} = {}
+
+# a break/continue scope: kind 0 loop, 1 label, 2 switch
+type LScope:
+  kind: Int
+  label: Str
+  has_label: Bool
+  continue_block: Int
+  break_block: Int
+
+type Builder:
+  completed_order: [Int] = []
+  completed: {Int: BasicBlock} = {}
+  cur_id: Int = 0
+  cur_kind: Int = 0
+  cur_instrs: [Int] = []
+  entry: Int = 0
+  scopes: [LScope] = []
+  ctx_syms: [Int] = []        # context: symbol -> where it's referenced (in order)
+  ctx_sp: [Sp] = []
+  bind_syms: [Int] = []       # bindings: symbol -> identifier (in order)
+  bind_ids: [Int] = []
+  bind_at: {Int: Int} = {}
+  used_names: [Str] = []      # name -> symbol (in order)
+  used_syms: [Int] = []
+  used_at: {Str: Int} = {}
+  handlers: [Int] = []
+  instrs: [Instruction] = []
+  fbt_depth: Int = 0
+  function_scope: Int = 0
+  component_scope: Int = 0
+  context_ids: {Int: Bool} = {}
+  idx: LocIndex = LocIndex()
+
+fn new_builder(var e: Env, function_scope: Int, component_scope: Int, own context_ids: {Int: Bool}, entry_kind: Int, own idx: LocIndex) -> Builder:
+  var b = Builder()
+  b.entry = rc_env.next_block_id(&e)
+  b.cur_id = b.entry
+  b.cur_kind = entry_kind
+  b.function_scope = function_scope
+  b.component_scope = component_scope
+  b.context_ids = context_ids
+  b.idx = idx
+  return b
+
+fn scope_within_compiled(c: Ctx, b: Builder, s: Int) -> Bool:
+  return rc_sem.is_descendant(c.m, s, b.component_scope)
+
+fn make_temporary(var e: Env, sp: Sp) -> Int:
+  let id = rc_env.next_identifier_id(&e)
+  e.identifiers[id].sp = sp
+  return id
+
+fn temp_place(var e: Env, sp: Sp) -> Place:
+  return Place(make_temporary(&e, sp), rc_hir.EF_UNKNOWN, false, sp)
+
+fn promote_temporary(var e: Env, id: Int):
+  let d = e.identifiers[id].declaration_id
+  e.identifiers[id].name_kind = 2
+  e.identifiers[id].name = "#t{d}"
+
+fn complete_block(var b: Builder, id: Int, kind: Int, own instrs: [Int], own term: Terminal):
+  b.completed[id] = BasicBlock(kind, id, instrs, term, [], [])
+  b.completed_order.push(id)
+
+# push: the instruction joins the current block; with a handler active, a MaybeThrow follows
+fn push(var b: Builder, var e: Env, own ins: Instruction):
+  let sp = ins.sp
+  let iid = b.instrs.len
+  b.instrs.push(ins)
+  b.cur_instrs.push(iid)
+  if b.handlers.len > 0:
+    let h = b.handlers[b.handlers.len - 1]
+    let cont = rc_env.next_block_id(&e)
+    let ck = b.cur_kind
+    terminate_with_continuation(&b, rc_hir.MaybeThrow(cont, h, 0, sp, [], false), cont, ck)
+
+# terminate the current block; with next_kind >= 0, a new current block of that kind
+fn terminate(var b: Builder, var e: Env, own term: Terminal, next_kind: Int) -> Int:
+  let id = b.cur_id
+  var ins: [Int] = []
+  swap(&ins, &b.cur_instrs)
+  complete_block(&b, id, b.cur_kind, ins, term)
+  if next_kind >= 0:
+    b.cur_id = rc_env.next_block_id(&e)
+    b.cur_kind = next_kind
+  return id
+
+fn terminate_with_continuation(var b: Builder, own term: Terminal, cont_id: Int, cont_kind: Int):
+  let id = b.cur_id
+  var ins: [Int] = []
+  swap(&ins, &b.cur_instrs)
+  complete_block(&b, id, b.cur_kind, ins, term)
+  b.cur_id = cont_id
+  b.cur_kind = cont_kind
+
+# reserve a block id (a WipBlock is its id and kind)
+fn reserve(var e: Env) -> Int:
+  return rc_env.next_block_id(&e)
+
+# Saved current block, for entering a reserved one
+type Wip:
+  id: Int
+  kind: Int
+  instrs: [Int]
+
+fn enter_reserved(var b: Builder, id: Int, kind: Int) -> Wip:
+  var ins: [Int] = []
+  swap(&ins, &b.cur_instrs)
+  let w = Wip(b.cur_id, b.cur_kind, ins)
+  b.cur_id = id
+  b.cur_kind = kind
+  return w
+
+# finish the entered block with its terminal and go back to the saved one
+fn leave_reserved(var b: Builder, var w: Wip, own term: Terminal):
+  let id = b.cur_id
+  var ins: [Int] = []
+  swap(&ins, &b.cur_instrs)
+  complete_block(&b, id, b.cur_kind, ins, term)
+  b.cur_id = w.id
+  b.cur_kind = w.kind
+  swap(&b.cur_instrs, &w.instrs)
+
+fn push_loop(var b: Builder, label: Str, has_label: Bool, cont: Int, brk: Int):
+  b.scopes.push(LScope(0, label, has_label, cont, brk))
+
+fn push_label(var b: Builder, label: Str, brk: Int):
+  b.scopes.push(LScope(1, label, true, -1, brk))
+
+fn push_switch(var b: Builder, label: Str, has_label: Bool, brk: Int):
+  b.scopes.push(LScope(2, label, has_label, -1, brk))
+
+fn pop_scope(var b: Builder):
+  b.scopes.pop()
+
+# -1 (and an invariant thrown) when there's none
+fn lookup_break(var b: Builder, var e: Env, label: Str, has_label: Bool) -> Int:
+  var i = b.scopes.len - 1
+  while i >= 0:
+    let s = b.scopes[i]
+    if not has_label and (s.kind == 0 or s.kind == 2): return s.break_block
+    if has_label and s.has_label and s.label == label: return s.break_block
+    i -= 1
+  rc_env.throw(&e, rc_env.diag(rc_env.EC_INVARIANT, "Expected a loop or switch to be in scope for break"))
+  return -1
+
+fn lookup_continue(var b: Builder, var e: Env, label: Str, has_label: Bool) -> Int:
+  var i = b.scopes.len - 1
+  while i >= 0:
+    let s = b.scopes[i]
+    if s.kind == 0:
+      if not has_label or (s.has_label and s.label == label): return s.continue_block
+    elif has_label and s.has_label and s.label == label:
+      rc_env.throw(&e, rc_env.diag(rc_env.EC_INVARIANT, "Continue may only refer to a labeled loop"))
+      return -1
+    i -= 1
+  rc_env.throw(&e, rc_env.diag(rc_env.EC_INVARIANT, "Expected a loop to be in scope for continue"))
+  return -1
+
+fn resolve_throw_handler(b: Builder) -> Int:
+  if b.handlers.len == 0: return -1
+  return b.handlers[b.handlers.len - 1]
+
+fn decl_span(b: Builder, y: Int) -> Sp:
+  let s = b.idx.dspan_s.get(y, -1)
+  if s < 0: return rc_hir.nosp()
+  return Sp(s, b.idx.dspan_e.get(y, -1))
+
+fn binding_of(b: Builder, y: Int) -> Int:
+  return b.bind_at.get(y, -1)
+
+fn add_bind(var b: Builder, y: Int, id: Int):
+  b.bind_at[y] = id
+  b.bind_syms.push(y)
+  b.bind_ids.push(id)
+
+fn add_used(var b: Builder, name: Str, y: Int):
+  if name in b.used_at:
+    return
+  b.used_at[name + ""] = y
+  b.used_names.push(name + "")
+  b.used_syms.push(y)
+
+# resolve_binding_with_span: the symbol's identifier, created (with a unique name) the first time
+fn resolve_binding(var b: Builder, var e: Env, c: Ctx, name: Str, y: Int, sp: Sp) -> Int:
+  let have = binding_of(b, y)
+  if have >= 0: return have
+  if name == "fbt":
+    rc_env.record_error(&e, local_fbt(decl_span(b, y), sp))
+    if e.failed: return -1
+  if is_always_reserved(name):
+    rc_env.throw(&e, reserved_identifier(name, sp))
+    return -1
+  var cand = name + ""
+  var i = 0
+  while cand in b.used_at:
+    if b.used_at[cand] == y: break
+    cand = "{name}_{i}"
+    i += 1
+  let id = rc_env.next_identifier_id(&e)
+  e.identifiers[id].name_kind = 1
+  e.identifiers[id].name = cand + ""
+  let ds = decl_span(b, y)
+  if ds.s >= 0: e.identifiers[id].sp = ds
+  elif sp.s >= 0: e.identifiers[id].sp = sp
+  b.used_at[cand + ""] = y
+  b.used_names.push(cand + "")
+  b.used_syms.push(y)
+  add_bind(&b, y, id)
+  return id
+
+fn local_fbt(ds: Sp, sp: Sp) -> Diag:
+  var at = ds
+  if at.s < 0: at = sp
+  let d = rc_env.with_help(rc_env.diag(rc_env.EC_TODO, "Support local variables named `fbt`"), "Local variables named `fbt` may conflict with the fbt plugin and are not yet supported")
+  return rc_env.with_label(d, at, "Local variables named `fbt` are not supported")
+
+fn reserved_identifier(name: Str, sp: Sp) -> Diag:
+  let d = rc_env.diag(rc_env.EC_SYNTAX, "Expected a non-reserved identifier name")
+  return rc_env.with_label(rc_env.with_help(d, "`{name}` is a reserved word in JavaScript and cannot be used as an identifier name"), sp, "`{name}` is reserved")
+
+fn is_always_reserved(s: Str) -> Bool:
+  for w in ["break", "case", "catch", "continue", "debugger", "default", "do", "else", "finally", "for", "function", "if", "in", "instanceof", "new", "return", "switch", "this", "throw", "try", "typeof", "var", "void", "while", "with", "class", "const", "enum", "export", "extends", "import", "super", "null", "true", "false", "delete"]:
+    if s == w: return true
+  return false
+
+# VariableBinding: kind 0 identifier (id, binding_kind), 1 global, 2 import default, 3 import
+# specifier, 4 import namespace, 5 module local
+type VarBinding:
+  kind: Int
+  id: Int
+  binding_kind: Int
+  name: Str
+  module: Str
+  imported: Str
+
+fn resolve_identifier(var b: Builder, var e: Env, c: Ctx, name: Str, sp: Sp, y: Int) -> VarBinding:
+  if y < 0: return VarBinding(1, -1, 0, name + "", "", "")
+  let dk = c.m.ydk[y]
+  if dk == rc_sem.DK_TYPE_ALIAS or dk == rc_sem.DK_ENUM or dk == rc_sem.DK_MODULE: return VarBinding(1, -1, 0, name + "", "", "")
+  let ss = rc_sem.symbol_scope(c.m, y)
+  if ss == 0:
+    let ik = rc_sem.import_kind(c.m, y)
+    if ik == 0: return VarBinding(2, -1, 0, name + "", rc_sem.import_source(c.m, c.t, y), "")
+    if ik == 1: return VarBinding(3, -1, 0, name + "", rc_sem.import_source(c.m, c.t, y), rc_sem.import_imported(c.m, c.t, y))
+    if ik == 2: return VarBinding(4, -1, 0, name + "", rc_sem.import_source(c.m, c.t, y), "")
+    return VarBinding(5, -1, 0, name + "", "", "")
+  if not scope_within_compiled(c, b, ss): return VarBinding(5, -1, 0, name + "", "", "")
+  let bk = rc_sem.binding_kind(c.m, y)
+  let id = resolve_binding(&b, &e, c, name, y, sp)
+  return VarBinding(0, id, bk, name + "", "", "")
+
+fn is_context_identifier(c: Ctx, b: Builder, y: Int) -> Bool:
+  if y < 0: return false
+  if rc_sem.symbol_scope(c.m, y) == 0: return false
+  return b.context_ids.get(y, false)
+
+# ---- build(): the blocks in reverse postorder, then the cleanups
+
+fn rpo_visit(b: Builder, id: Int, is_used: Bool, var visited: {Int: Bool}, var used: {Int: Bool}, var used_ft: {Int: Bool}, var post: [Int]):
+  let was_used = used.get(id, false)
+  let was_visited = visited.get(id, false)
+  visited[id] = true
+  if is_used: used[id] = true
+  if was_visited and (was_used or not is_used): return
+  let term = b.completed[id].terminal
+  var succ = rc_visit.successors(term)
+  let ft = rc_visit.fallthrough(term)
+  if ft >= 0:
+    if is_used: used_ft[ft] = true
+    rpo_visit(b, ft, false, &visited, &used, &used_ft, &post)
+  var i = succ.len - 1
+  while i >= 0:
+    rpo_visit(b, succ[i], is_used, &visited, &used, &used_ft, &post)
+    i -= 1
+  if not was_visited: post.push(id)
+
+type Built:
+  hir: HIR
+  instrs: [Instruction]
+
+fn build(var b: Builder, var e: Env) -> Built:
+  var visited: {Int: Bool} = {}
+  var used: {Int: Bool} = {}
+  var used_ft: {Int: Bool} = {}
+  var post: [Int] = []
+  rpo_visit(b, b.entry, true, &visited, &used, &used_ft, &post)
+  # (unreachable blocks holding a function expression may hide hoisted declarations)
+  for id in b.completed_order:
+    if visited.get(id, false): continue
+    var sp = rc_hir.nosp()
+    var found = false
+    for iid in b.completed[id].instructions:
+      match b.instrs[iid].value:
+        FunctionExpression(_, name_sp, _, func, _, fsp):
+          if not found:
+            found = true
+            sp = name_sp
+            if sp.s < 0: sp = diagnostic_span(e, func)
+            if sp.s < 0: sp = fsp
+        _: continue
+    if found:
+      if sp.s < 0: sp = rc_visit.term_sp(b.completed[id].terminal)
+      let d = rc_env.with_label_plain(rc_env.diag(rc_env.EC_TODO, "Support functions with unreachable code that may contain hoisted declarations"), sp)
+      rc_env.record_error(&e, d)
+      if e.failed: return Built(HIR(b.entry, [], {}), [])
+  var hir = HIR(b.entry, [], {})
+  var i = post.len - 1
+  while i >= 0:
+    let id = post[i]
+    i -= 1
+    if used.get(id, false):
+      var blk = rc_hir.BasicBlock(0, 0, [], rc_hir.Unreachable(0, rc_hir.nosp()), [], [])
+      swap(&blk, &b.completed[id])
+      hir.blocks[id] = blk
+      hir.order.push(id)
+    elif used_ft.get(id, false):
+      let blk = b.completed[id]
+      let term = rc_hir.Unreachable(rc_visit.term_id(blk.terminal), rc_visit.term_sp(blk.terminal))
+      hir.blocks[id] = BasicBlock(blk.kind, id, [], term, [], [])
+      hir.order.push(id)
+  remove_unreachable_for_updates(&hir)
+  remove_dead_do_while(&hir)
+  remove_unnecessary_try_catch(&hir)
+  var instrs: [Instruction] = []
+  swap(&instrs, &b.instrs)
+  mark_instruction_ids(&hir, &instrs)
+  mark_predecessors(&hir)
+  return Built(hir, instrs)
+
+# HirFunction::diagnostic_span: the function's name, else its span (none here: callers fall back)
+fn diagnostic_span(e: Env, f: Int) -> Sp:
+  if f < 0 or f >= e.functions.len: return rc_hir.nosp()
+  let fun = e.functions[f]
+  if fun.has_id and fun.id_sp.s >= 0: return fun.id_sp
+  return fun.sp
+
+fn remove_unreachable_for_updates(var hir: HIR):
+  for oi in 0..hir.order.len:
+    let id = hir.order[oi]
+    var u = -1
+    match hir.blocks[id].terminal:
+      For(_, _, update, _, _, _, _, _): u = update
+      _: continue
+    if u >= 0 and not (u in hir.blocks):
+      match var hir.blocks[id].terminal:
+        For(_, _, update, _, _, _, _, _): update = -1
+        _: continue
+
+fn remove_dead_do_while(var hir: HIR):
+  for oi in 0..hir.order.len:
+    let id = hir.order[oi]
+    var repl = false
+    var lb = 0
+    var tid = 0
+    var tsp = rc_hir.nosp()
+    match hir.blocks[id].terminal:
+      DoWhile(loop_block, _, test, _, i, sp):
+        if not (test in hir.blocks):
+          repl = true
+          lb = loop_block
+          tid = i
+          tsp = sp
+      _: continue
+    if repl: hir.blocks[id].terminal = rc_hir.Goto(lb, rc_hir.GV_BREAK, tid, tsp)
+
+fn remove_unnecessary_try_catch(var hir: HIR):
+  var rb: [Int] = []
+  var rt: [Int] = []
+  var rh: [Int] = []
+  var rf: [Int] = []
+  var rs: [Sp] = []
+  for oi in 0..hir.order.len:
+    let id = hir.order[oi]
+    match hir.blocks[id].terminal:
+      Try(block, _, _, _, handler, _, ft, _, sp):
+        if not (handler in hir.blocks):
+          rb.push(id)
+          rt.push(block)
+          rh.push(handler)
+          rf.push(ft)
+          rs.push(sp)
+      _: continue
+  for i in 0..rb.len:
+    hir.blocks[rb[i]].terminal = rc_hir.Goto(rt[i], rc_hir.GV_BREAK, 0, rs[i])
+    let ft = rf[i]
+    if ft in hir.blocks:
+      var preds: [Int] = []
+      for p in hir.blocks[ft].preds: preds.push(p)
+      if preds.len == 1 and preds[0] == rh[i]:
+        hir.blocks.remove(ft)
+        var o: [Int] = []
+        for x in hir.order:
+          if x != ft: o.push(x)
+        hir.order = o
+      else:
+        var np: [Int] = []
+        for p in preds:
+          if p != rh[i]: np.push(p)
+        hir.blocks[ft].preds = np
+
+fn mark_instruction_ids(var hir: HIR, var instrs: [Instruction]):
+  var order = 0
+  for oi in 0..hir.order.len:
+    let id = hir.order[oi]
+    for iid in hir.blocks[id].instructions:
+      order += 1
+      instrs[iid].id = order
+    order += 1
+    rc_visit.set_term_id(&hir.blocks[id].terminal, order)
+
+fn add_pred(var hir: HIR, id: Int, p: Int):
+  for x in hir.blocks[id].preds:
+    if x == p: return
+  hir.blocks[id].preds.push(p)
+
+fn mark_preds_visit(var hir: HIR, id: Int, prev: Int, var visited: {Int: Bool}):
+  if prev >= 0:
+    if not (id in hir.blocks): return
+    add_pred(&hir, id, prev)
+  if visited.get(id, false): return
+  visited[id] = true
+  if not (id in hir.blocks): return
+  let succ = rc_visit.successors(hir.blocks[id].terminal)
+  for s in succ: mark_preds_visit(&hir, s, id, &visited)
+
+fn mark_predecessors(var hir: HIR):
+  for oi in 0..hir.order.len:
+    let id = hir.order[oi]
+    hir.blocks[id].preds = []
+  var visited: {Int: Bool} = {}
+  mark_preds_visit(&hir, hir.entry, -1, &visited)
+
+# create_temporary_place (the place has no span; the identifier has)
+fn create_temporary_place(var e: Env, sp: Sp) -> Place:
+  let id = rc_env.next_identifier_id(&e)
+  e.identifiers[id].sp = sp
+  return Place(id, rc_hir.EF_UNKNOWN, false, rc_hir.nosp())
