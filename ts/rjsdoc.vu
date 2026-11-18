@@ -1,0 +1,365 @@
+# oxlint's jsdoc plugin (oxlint 1.90.0): oxc_jsdoc's parser (a /** */ comment's text and its tags,
+# with their spans as oxc gives them), the plugin's settings (settings.jsdoc), and its rules.
+
+import lconf
+import rules
+import rjest
+from rules import L, add, span, order_at
+
+# A file's JSDoc comments, parsed: per comment its span (after /** to before */) and text part,
+# per tag its comment, kind span, kind name, body span and body text.
+type Docs:
+  start: [Int]          # each comment's content start (after /**) and end (before */)
+  end: [Int]
+  ctext_s: [Int]        # its comment part (before the first tag)
+  ctext_e: [Int]
+  tfirst: [Int]         # its tags: first index, count
+  tcount: [Int]
+  tdoc: [Int]           # each tag: its comment
+  ks: [Int]             # kind span (the @name)
+  ke: [Int]
+  kname: [Str]          # the name without @
+  bs: [Int]             # body span (after the name, to the next tag)
+  be: [Int]
+
+fn new_docs() -> Docs:
+  return Docs([], [], [], [], [], [], [], [], [], [], [], [])
+
+type JSet:
+  on: Bool
+  ignore_private: Bool
+  ignore_internal: Bool
+  ignore_replaces: Bool
+  override_replaces: Bool
+  augments_replaces: Bool
+  implements_replaces: Bool
+  exempt_roots: Bool
+  pref_key: [Str]       # tagNamePreference: key, kind (1 name, 2 message+replacement, 3 message, 4 false), name, message
+  pref_kind: [Int]
+  pref_name: [Str]
+  pref_msg: [Str]
+
+fn default_set() -> JSet:
+  return JSet(false, false, false, true, true, false, false, false, [], [], [], [])
+
+fn jbool(js: lconf.Json, o: Int, key: Str, d: Bool) -> Bool:
+  let v = lconf.get(js, o, key)
+  if v < 0: return d
+  if js.v[v].k == lconf.J_TRUE: return true
+  if js.v[v].k == lconf.J_FALSE: return false
+  return d
+
+# settings.jsdoc from the configuration's settings object (JSON text)
+fn read_settings(text: Str) -> JSet:
+  var st = default_set()
+  st.on = true
+  if text == "": return st
+  let js = lconf.parse_json(text)
+  if js.err != "" or js.v.len == 0 or js.v[0].k != lconf.J_OBJ: return st
+  let o = lconf.get(js, 0, "jsdoc")
+  if o < 0 or js.v[o].k != lconf.J_OBJ: return st
+  st.ignore_private = jbool(js, o, "ignorePrivate", false)
+  st.ignore_internal = jbool(js, o, "ignoreInternal", false)
+  st.ignore_replaces = jbool(js, o, "ignoreReplacesDocs", true)
+  st.override_replaces = jbool(js, o, "overrideReplacesDocs", true)
+  st.augments_replaces = jbool(js, o, "augmentsExtendsReplacesDocs", false)
+  st.implements_replaces = jbool(js, o, "implementsReplacesDocs", false)
+  st.exempt_roots = jbool(js, o, "exemptDestructuredRootsFromChecks", false)
+  let tp = lconf.get(js, o, "tagNamePreference")
+  if tp >= 0 and js.v[tp].k == lconf.J_OBJ:
+    for i in 0..js.v[tp].keys.len:
+      let key = js.v[tp].keys[i] + ""
+      let v = js.v[tp].kids[i]
+      var kind = 0
+      var nm = ""
+      var msg = ""
+      let vk = js.v[v].k
+      if vk == lconf.J_STR:
+        kind = 1
+        nm = js.v[v].s + ""
+      elif vk == lconf.J_OBJ:
+        let m = lconf.get(js, v, "message")
+        let r = lconf.get(js, v, "replacement")
+        if m >= 0 and js.v[m].k == lconf.J_STR and r >= 0 and js.v[r].k == lconf.J_STR:
+          kind = 2
+          msg = js.v[m].s + ""
+          nm = js.v[r].s + ""
+        elif m >= 0 and js.v[m].k == lconf.J_STR:
+          kind = 3
+          msg = js.v[m].s + ""
+      elif vk == lconf.J_FALSE or vk == lconf.J_TRUE: kind = 4
+      if kind == 0: continue
+      # (a key given twice: the last wins)
+      var at = -1
+      for j in 0..st.pref_key.len:
+        if st.pref_key[j] == key: at = j
+      if at >= 0:
+        st.pref_kind[at] = kind
+        st.pref_name[at] = nm
+        st.pref_msg[at] = msg
+      else:
+        st.pref_key.push(key)
+        st.pref_kind.push(kind)
+        st.pref_name.push(nm)
+        st.pref_msg.push(msg)
+  return st
+
+fn pref_at(st: JSet, name: Str) -> Int:
+  for i in 0..st.pref_key.len:
+    if st.pref_key[i] == name: return i
+  return -1
+
+fn resolve_tag(st: JSet, name: Str) -> Str:
+  let i = pref_at(st, name)
+  if i >= 0 and (st.pref_kind[i] == 1 or st.pref_kind[i] == 2): return st.pref_name[i] + ""
+  return name + ""
+
+fn user_defined(st: JSet, name: Str) -> Bool:
+  for i in 0..st.pref_key.len:
+    if (st.pref_kind[i] == 1 or st.pref_kind[i] == 2) and st.pref_name[i] == name: return true
+  return false
+
+# check_blocked_tag_name ("" when not blocked)
+fn blocked(st: JSet, name: Str) -> Str:
+  let i = pref_at(st, name)
+  if i < 0: return ""
+  if st.pref_kind[i] == 4: return "Unexpected tag `@" + name + "`."
+  if st.pref_kind[i] == 3: return st.pref_msg[i] + ""
+  return ""
+
+fn default_alias(name: Str) -> Str:
+  if name == "virtual": return "abstract"
+  if name == "extends": return "augments"
+  if name == "constructor": return "class"
+  if name == "const": return "constant"
+  if name == "defaultvalue": return "default"
+  if name == "desc": return "description"
+  if name == "host": return "external"
+  if name == "fileoverview" or name == "overview": return "file"
+  if name == "emits": return "fires"
+  if name == "func" or name == "method": return "function"
+  if name == "var": return "member"
+  if name == "arg" or name == "argument": return "param"
+  if name == "prop": return "property"
+  if name == "return": return "returns"
+  if name == "exception": return "throws"
+  if name == "yield": return "yields"
+  return name + ""
+
+# check_preferred_tag_name ("" when fine)
+fn preferred(st: JSet, name: Str) -> Str:
+  let i = pref_at(st, name)
+  if i >= 0:
+    if st.pref_kind[i] == 1: return "Replace tag `@" + name + "` with `@" + st.pref_name[i] + "`."
+    if st.pref_kind[i] == 2: return st.pref_msg[i] + ""
+  let a = default_alias(name)
+  if a != name: return "Replace tag `@" + name + "` with `@" + a + "`."
+  return ""
+
+# ---- the parser
+
+fn is_ws(c: Byte) -> Bool:
+  return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12
+
+fn trim(s: Str) -> Str:
+  var a = 0
+  var b = s.len
+  while a < b and is_ws(s[a]): a += 1
+  while b > a and is_ws(s[b - 1]): b -= 1
+  return s[a..b]
+
+fn is_alnum_ascii(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or int(c) >= 128
+
+# JSDocCommentPart::parsed
+fn parsed(raw: Str) -> Str:
+  if raw.find("\n") < 0: return trim(raw)
+  var out = ""
+  for line0 in raw.split("\n"):
+    var line = line0 + ""
+    if line.endswith("\r"): line = line[0..line.len - 1]
+    let t = trim(line)
+    if t.startswith("*"):
+      let rest = t[1..t.len]
+      let emph = rest.len > 0 and (is_alnum_ascii(rest[0]) or rest[0] == '_')
+      if not emph:
+        let content = trim(rest)
+        if content.len == 0: continue
+        if out.len > 0: out += "\n"
+        out += content
+        continue
+    if t.len == 0: continue
+    if out.len > 0: out += "\n"
+    out += t
+  return out
+
+fn add_tag(var d: Docs, src: Str, s: Int, e: Int, di: Int):
+  # find_token_range: the first run of non-white space, up to a { or white space
+  var a = s
+  while a < e and (is_ws(src[a]) or src[a] == '{'): a += 1
+  var b = a
+  while b < e and not is_ws(src[b]) and src[b] != '{': b += 1
+  d.tdoc.push(di)
+  d.ks.push(a)
+  d.ke.push(b)
+  d.kname.push(src[a + 1..b])
+  d.bs.push(b)
+  d.be.push(e)
+
+# parse_jsdoc over src[s..e]
+fn parse_one(var d: Docs, src: Str, s: Int, e: Int):
+  let di = d.start.len
+  d.start.push(s)
+  d.end.push(e)
+  d.tfirst.push(d.ks.len)
+  var curly = 0
+  var brace = 0
+  var square = 0
+  var ticks = 0
+  var dq = false
+  var sq = false
+  var in_import = false
+  var at_line_start = true
+  var seen_star = false
+  var spaces = 0
+  var comment_found = false
+  var start = s
+  var i = s
+  var cs = s
+  var ce = s
+  while i < e:
+    let ch = src[i]
+    let can_parse = curly == 0 and square == 0 and brace == 0 and ticks == 0 and not dq and not sq
+    if ch == '`' and ((not sq and not dq) or (curly == 0 and square == 0 and brace == 0 and not in_import)):
+      var count = 1
+      while i + 1 < e and src[i + 1] == '`':
+        i += 1
+        count += 1
+      if ticks == 0: ticks = count
+      elif ticks == count: ticks = 0
+    elif ch == '"' and ticks == 0 and not sq: dq = not dq
+    elif ch == '\'' and ticks == 0 and not dq: sq = not sq
+    elif ch == '\n':
+      dq = false
+      sq = false
+      brace = 0
+      square = 0
+    elif ch == '{' and ticks == 0 and not dq and not sq: curly += 1
+    elif ch == '}' and ticks == 0 and not dq and not sq:
+      curly -= 1
+      if curly < 0: curly = 0
+    elif ch == '(' and ticks == 0 and not dq and not sq: brace += 1
+    elif ch == ')' and ticks == 0 and not dq and not sq:
+      brace -= 1
+      if brace < 0: brace = 0
+    elif ch == '[' and ticks == 0 and not dq and not sq: square += 1
+    elif ch == ']' and ticks == 0 and not dq and not sq:
+      square -= 1
+      if square < 0: square = 0
+    elif ch == '@' and can_parse and at_line_start and not (seen_star and spaces >= 5):
+      if comment_found: add_tag(&d, src, start, i, di)
+      else:
+        cs = start
+        ce = i
+        comment_found = true
+      start = i
+      in_import = src[i..e].startswith("@import") and i + 7 < e and is_ws(src[i + 7])
+    if ch == '\n':
+      at_line_start = true
+      seen_star = false
+      spaces = 0
+    elif at_line_start:
+      if ch == '*':
+        seen_star = true
+        spaces = 0
+      elif ch == ' ' or ch == '\t' or ch == '\r':
+        if seen_star: spaces += 1
+      else: at_line_start = false
+    i += 1
+  if start != e:
+    if comment_found: add_tag(&d, src, start, e, di)
+    else:
+      cs = start
+      ce = e
+  d.ctext_s.push(cs)
+  d.ctext_e.push(ce)
+  d.tcount.push(d.ks.len - d.tfirst[di])
+
+# Every /** */ comment of the file (not /**/), parsed.
+fn parse_all(l: L) -> Docs:
+  var d = new_docs()
+  let cs = rjest.all_comments(l)
+  var i = 0
+  while i + 1 < cs.len:
+    let a = cs[i]
+    let b = cs[i + 1]
+    i += 2
+    if b - a < 5 or l.src[a + 1] != '*' or l.src[a + 2] != '*': continue
+    if not l.src[a..b].endswith("*/"): continue
+    if l.src[a..b] == "/**/": continue
+    parse_one(&d, l.src, a + 3, b - 2)
+  return d
+
+fn tag_comment(l: L, d: Docs, t: Int) -> Str:
+  return parsed(l.src[d.bs[t]..d.be[t]])
+
+fn ignored_internal(l: L, d: Docs, di: Int, st: JSet) -> Bool:
+  if not st.ignore_internal: return false
+  let r = resolve_tag(st, "internal")
+  for t in d.tfirst[di]..d.tfirst[di] + d.tcount[di]:
+    if d.kname[t] == r: return true
+  return false
+
+fn ignored_private(l: L, d: Docs, di: Int, st: JSet) -> Bool:
+  if not st.ignore_private: return false
+  let rp = resolve_tag(st, "private")
+  let ra = resolve_tag(st, "access")
+  for t in d.tfirst[di]..d.tfirst[di] + d.tcount[di]:
+    let nm = d.kname[t]
+    if nm == rp or (nm == ra and tag_comment(l, d, t) == "private"): return true
+  return false
+
+# ---- jsdoc(check-tag-names)
+
+fn valid_tags() -> [Str]:
+  return ["abstract", "access", "alias", "async", "augments", "author", "borrows", "callback", "class", "classdesc", "constant", "constructs", "copyright", "default", "deprecated", "description", "enum", "event", "example", "exports", "external", "file", "fires", "function", "generator", "global", "hideconstructor", "ignore", "implements", "inheritdoc", "inner", "instance", "interface", "kind", "lends", "license", "listens", "member", "memberof", "memberof!", "mixes", "mixin", "modifies", "module", "name", "namespace", "override", "package", "param", "private", "property", "protected", "public", "readonly", "requires", "returns", "see", "since", "static", "summary", "this", "throws", "todo", "tutorial", "type", "typedef", "variation", "version", "yields", "import", "internal", "overload", "satisfies", "template"]
+
+fn typed_always() -> [Str]:
+  return ["augments", "callback", "class", "enum", "implements", "private", "property", "protected", "public", "readonly", "this", "type", "typedef"]
+
+fn typed_outside_ambient() -> [Str]:
+  return ["abstract", "access", "class", "constant", "constructs", "enum", "export", "exports", "function", "global", "inherits", "instance", "interface", "member", "memberOf", "memberof", "method", "mixes", "mixin", "module", "name", "namespace", "override", "property", "requires", "static", "this"]
+
+fn ctn_report(var l: L, d: Docs, t: Int, help: Str):
+  add(&l, d.ks[t], "jsdoc(check-tag-names)", "Invalid tag name found.", help)
+  span(&l, d.ke[t])
+  order_at(&l, d.ks[t])
+
+fn check_tag_names(var l: L, d: Docs, st: JSet, defined: [Str], jsx_tags: Bool, typed: Bool, path: Str):
+  let valid = valid_tags()
+  let ambient = path.endswith(".d.ts")
+  for di in 0..d.start.len:
+    if ignored_internal(l, d, di, st) or ignored_private(l, d, di, st): continue
+    for t in d.tfirst[di]..d.tfirst[di] + d.tcount[di]:
+      let nm = d.kname[t]
+      if user_defined(st, nm) or nm in defined: continue
+      let b = blocked(st, nm)
+      if b.len > 0:
+        ctn_report(&l, d, t, b)
+        continue
+      let p = preferred(st, nm)
+      if p.len > 0:
+        ctn_report(&l, d, t, p)
+        continue
+      if typed:
+        if nm in typed_always():
+          ctn_report(&l, d, t, "`@" + nm + "` is redundant when using a type system.")
+          continue
+        if nm == "template" and tag_comment(l, d, t).len == 0:
+          ctn_report(&l, d, t, "`@" + nm + "` without a name is redundant when using a type system.")
+          continue
+        if not ambient and nm in typed_outside_ambient():
+          ctn_report(&l, d, t, "`@" + nm + "` is redundant outside of ambient(`declare` or `.d.ts`) contexts when using a type system.")
+          continue
+      let ok = (jsx_tags and (nm == "jsx" or nm == "jsxFrag" or nm == "jsxImportSource" or nm == "jsxRuntime")) or nm in valid
+      if not ok: ctn_report(&l, d, t, "`@" + nm + "` is invalid tag name.")
