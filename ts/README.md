@@ -257,7 +257,7 @@ the probes) are unchanged.
 
 Not done: the React Compiler rules oxlint reports as `react(purity)`, `set-state-in-effect`,
 `preserve-manual-memoization`, `refs`, `memo-dependencies` (they run oxc's port of the React
-Compiler, about 100 files), `react/no-unstable-nested-components`, and the other 22 `jsdoc` rules.
+Compiler, about 100 files), and the other 22 `jsdoc` rules.
 
 **Rules vlint doesn't have are now named on stderr.** When the configuration turns on a rule vlint
 doesn't implement, vlint prints, once per run, `vlint: N enabled rules aren't implemented yet and
@@ -273,6 +273,32 @@ rules' options, and three readers still counted from the end: `settings["jsx-a11
 two rules that look up globals: `no-implied-eval` (with `env.browser`, oxlint reports
 `window.setTimeout("alert(1)")` and vlint didn't; it does now) and `no-shadow`'s `builtinGlobals`.
 They now read their entries by position (`rmore.extra`).
+
+**Also this round:** `react/no-unstable-nested-components` (oxc's 88 cases identical, unix and
+JSON output); oxc's parser errors for `await` and `for await` outside async functions, in class
+static blocks, and module syntax in `.cjs` files (`import`/`export` statements, `import.meta` also in
+`.cts`): 72 of 72 placements across `.js .cjs .mjs .ts .cts .mts` identical to oxlint, where vlint
+reported none before. Found with them: `is_module` took a `for (const …)` declaration's empty
+modifier field for `export`, so such a file counted as a module.
+
+**JS plugin hosts can't hang a run (issue #7).** Two ways a run could stop forever, where oxlint
+finishes: a plugin that keeps Node's event loop alive (a timer, an open handle) kept its host from
+exiting when its input closed, and vlint waited for it at exit without a limit (reproduced: a plugin
+with `setInterval` hung the previous build until killed, and the run now ends in 2 s); and a host
+that stops answering (a plugin stuck in a loop) kept the file's thread waiting. Now every read and
+write on a host's pipes gives up after `VLINT_JS_TIMEOUT` seconds (default 120, 0 for no limit) and
+the host is killed: that file gets `Error running JS plugin` saying so, and the rest of the run goes
+on (checked: a plugin looping on one file of 400, with a 3 s limit, gives that error and the 400
+files' other diagnostics, in 3.4 s). At exit a host gets 2 s. Hosts are started one at a time with
+close-on-exec pipes (on macOS with `POSIX_SPAWN_CLOEXEC_DEFAULT`), so one can't inherit another's
+pipe ends, and the host answers every request once, even if handling it throws. `VLINT_JS_DEBUG=1`
+traces requests and answers on stderr. Not reproduced: the macOS 39k-file stall itself (this was
+checked on Linux; the Mac wasn't reachable), so whether it was one of these is not confirmed.
+
+**An old oxlint-tsgolint is named (issue #6).** When the tsgolint found is older than 7.0.2005 (what
+oxlint 1.90.0's package.json requires; older ones panic with `unknown rule` on newer rule names),
+vlint says so on stderr before running it. The run and its output are otherwise oxlint's (tsgolint's
+stderr was already passed on).
 
 ## Drop-in status (checked against oxlint 1.90.0)
 

@@ -35,7 +35,11 @@ function setupRuleConfigsWrapper(json) {
 }
 // (requests are handled one after another; promises are chained with then() rather than awaited,
 // so a plugin's async stack trace doesn't show this loop)
-function __vlHandle(line) {
+function __vlHandleOnce(line, done) {
+  const answer = __vlAnswer;
+  return __vlHandle(line, (v) => { answer(v); done(); });
+}
+function __vlHandle(line, __vlAnswer) {
   if (line === "") return;
   let req;
   try {
@@ -53,5 +57,22 @@ let __vlChain = Promise.resolve();
 // (fd 3 read as a pipe, from the event loop: a file stream would leave a blocking read in libuv's
 // thread pool, and process.exit() in a plugin would wait for it forever)
 __vlCreateInterface({ input: new __vlSocket({ fd: 3, readable: true, writable: false }), crlfDelay: Infinity }).on("line", (line) => {
-  __vlChain = __vlChain.then(() => __vlHandle(line));
+  // (every request is answered exactly once: if handling it throws, the error is the answer, and
+  // the chain goes on to the next request rather than stopping for good; issue #7)
+  __vlChain = __vlChain.then(() => {
+    let answered = false;
+    const fail = (err) => {
+      if (answered) return;
+      answered = true;
+      try { __vlAnswer(JSON.stringify({ Failure: { message: "vlint: the plugin host failed: " + String(err && err.stack || err) } })); } catch {}
+    };
+    let r;
+    try {
+      r = __vlHandleOnce(line, () => { answered = true; });
+    } catch (err) {
+      fail(err);
+      return;
+    }
+    if (r && typeof r.then === "function") return r.then(undefined, fail);
+  });
 });

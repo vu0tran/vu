@@ -689,6 +689,9 @@ fn js_pass(c: Cx, var l: L, path: Str, root: Int, spec: Str, globals: Str, setti
   let req = ljs.lint_request(l.abs, text, bom, jsx, st, base, ljs.tree_json(l.t, root, 1), rids, oids, settings, globals)
   let ans = ljs.call(c.ffi, req)
   if ans == "null": return
+  if ans == "!t":
+    out.push(plain_error(c, path, shown, -1, -1, "Error running JS plugin.\nFile path: {l.abs}\nvlint: the JS plugin host (node) stopped answering and was stopped (VLINT_JS_TIMEOUT sets the limit in seconds; VLINT_JS_DEBUG=1 traces the requests)", ""))
+    return
   if ans == "!" or ans == "":
     out.push(plain_error(c, path, shown, -1, -1, "Error running JS plugin.\nFile path: {l.abs}\nvlint: the JS plugin host (node) stopped", ""))
     return
@@ -9306,6 +9309,112 @@ fn opt_chain(l: L, e: Int) -> Bool:
     else: return false
   return false
 
+# oxc's parser: `await` and `for await` outside async functions (a top-level `await` only in a
+# CommonJS file, a top-level `for await` outside a module), and in a class static block; import and
+# export statements in a .cjs file, import.meta in a .cjs or .cts file. In order of position.
+fn await_errors(var l: L, c: Cx, path: Str, var out: [lout.Rec]):
+  let p = l.abs.lower()
+  let cjs = p.endswith(".cjs") or p.endswith(".cts")
+  var ep: [Int] = []
+  var em: [Str] = []
+  var eh: [Str] = []
+  var el: [Int] = []
+  if cjs:
+    let root = l.t.nd.len - 1
+    if p.endswith(".cjs") and l.t.nd[root].k == ast.N_LIST:
+      for st in ast.items(l.t, root):
+        let ks = l.t.nd[st].k
+        var m = 0
+        if ks == ast.N_VAR or ks == ast.N_TYPEALIAS or ks == ast.N_INTERFACE: m = l.t.nd[st].d
+        elif ks == ast.N_FUNC or ks == ast.N_CLASS or ks == ast.N_ENUM or ks == ast.N_MODULE: m = l.t.nd[st].f
+        var what = ""
+        if ks == ast.N_IMPORT: what = "import"
+        elif ks == ast.N_EXPORT or ks == ast.N_EXPORTDEFAULT or ks == ast.N_EXPORTASSIGN or (m > 0 and (m & ast.M_EXPORT) != 0): what = "export"
+        if what == "": continue
+        let at = l.src.find(what, l.t.nd[st].pos)
+        if at < 0: continue
+        ep.push(at)
+        em.push("Cannot use {what} statement outside a module")
+        eh.push("")
+        el.push(6)
+    if l.src.find("import") >= 0:
+      for x in 1..l.t.nd.len:
+        if l.t.nd[x].k == ast.N_METAPROP and l.t.nd[x].f == scan.W_IMPORT:
+          ep.push(l.t.nd[x].pos)
+          em.push("Unexpected import.meta expression")
+          eh.push("import.meta is only allowed in module code")
+          el.push(11)
+  if l.src.find("await") >= 0: await_list(&l, cjs, &ep, &em, &eh, &el)
+  if ep.len == 0: return
+  let shown = shown_src(l.src, l.disp)
+  let li = lout.line_index(shown)
+  var ord: [Int] = []
+  for i in 0..ep.len: ord.push(i)
+  ord.sort(by: fn(a, b) => ep[a] < ep[b] or (ep[a] == ep[b] and a < b))
+  for i in ord:
+    let labs: [lout.Lab] = [lout.Lab(ep[i], ep[i] + el[i], "", false, false)]
+    out.push(lout.make_rec(c.o, path, shown, li, lout.Diag(2, "", "", em[i], eh[i], labs, "")))
+
+fn await_list(var l: L, cjs: Bool, var ep: [Int], var em: [Str], var eh: [Str], var el: [Int]):
+  # (a top-level await expression makes an unambiguous file a module)
+  var top_await = false
+  for x in 1..l.t.nd.len:
+    if l.t.nd[x].k == ast.N_AWAIT and await_ctx(&l, x) == 0: top_await = true
+  for x in 1..l.t.nd.len:
+    let kd = l.t.nd[x].k
+    var kw = -1
+    if kd == ast.N_AWAIT: kw = l.t.nd[x].pos
+    elif kd == ast.N_FORIN and l.t.nd[x].f == 2:
+      kw = l.src.find("await", l.t.nd[x].pos)
+    if kw < 0: continue
+    # the nearest function, static block or class field
+    var y = parent(&l, x)
+    var ctx = 0
+    while y > 0:
+      let yk = l.t.nd[y].k
+      if yk == ast.N_FUNC or yk == ast.N_FUNCEXPR or yk == ast.N_ARROW or yk == ast.N_METHOD or yk == ast.N_GET or yk == ast.N_SET or yk == ast.N_CTOR:
+        ctx = 1
+        if (l.t.nd[y].f & ast.M_ASYNC) != 0: ctx = 4
+        break
+      if yk == ast.N_STATICBLOCK:
+        ctx = 2
+        break
+      if yk == ast.N_PROP:
+        ctx = 3
+        break
+      y = parent(&l, y)
+    var bad = false
+    var msg = "`await` is only allowed within async functions and at the top levels of modules"
+    if kd == ast.N_FORIN: msg = "`for await` loops are only allowed within async functions and at the top levels of modules"
+    var help = "Either remove this `await` or add the `async` keyword to the enclosing function"
+    if ctx == 1: bad = true
+    elif ctx == 2:
+      bad = true
+      msg = "Cannot use await in class static initialization block"
+      help = ""
+    elif ctx == 3: bad = cjs or rmore6.is_module(&l)
+    elif ctx == 0:
+      if kd == ast.N_AWAIT: bad = cjs
+      else: bad = not rmore6.is_module(&l) and not (top_await and not cjs)
+    if not bad: continue
+    ep.push(kw)
+    em.push(msg)
+    eh.push(help)
+    el.push(5)
+
+# the nearest function (1, 4 async), static block (2) or class field (3) around x; 0 top level
+fn await_ctx(var l: L, x: Int) -> Int:
+  var y = parent(&l, x)
+  while y > 0:
+    let yk = l.t.nd[y].k
+    if yk == ast.N_FUNC or yk == ast.N_FUNCEXPR or yk == ast.N_ARROW or yk == ast.N_METHOD or yk == ast.N_GET or yk == ast.N_SET or yk == ast.N_CTOR:
+      if (l.t.nd[y].f & ast.M_ASYNC) != 0: return 4
+      return 1
+    if yk == ast.N_STATICBLOCK: return 2
+    if yk == ast.N_PROP: return 3
+    y = parent(&l, y)
+  return 0
+
 fn err_rec(c: Cx, path: Str, shown: Str, msg: Str, labs: [Lab0]) -> lout.Rec:
   return err_rec_code(c, path, shown, "", msg, labs)
 
@@ -9385,6 +9494,7 @@ fn parser_late_errors(var l: L, c: Cx, path: Str) -> [lout.Rec]:
     if opt_chain(l, l.t.nd[x].a):
       let q = l.t.nd[x].c
       out.push(err_rec(c, path, shown_src(l.src, l.disp), "Tagged template expressions are not permitted in an optional chain", [Lab0(l.t.nd[q].pos, l.t.nd[q].end, "")]))
+  await_errors(&l, c, path, &out)
   if l.ts: return out
   let root = l.t.nd.len - 1
   if l.t.nd[root].k != ast.N_LIST: return out
