@@ -518,7 +518,10 @@ on n8n, vitest and tldraw with their own configurations (3688, 1377 and 82 diagn
 `ts/README.md` has which rules it still lacks, such as the React Compiler's). It
 takes about as much CPU as oxlint (Rust), 13 times less than Biome and 130 times less than ESLint
 (measured on a loaded 2-core VM; `ts/README.md`). It's on npm as `@vu0tran/vlint`, laid out as
-oxlint is, with an `oxlint` command too (`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`).
+oxlint is, with an `oxlint` command too (`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`). With
+`VLINT_VTSC=1`, `--type-aware --type-check` needs no tsgolint on n8n's 33 core packages: vtsc
+checks every file, every line equal to oxlint's, 1.8 to 3.8 times as fast as oxlint (
+best of 3, 2026-11-18; `ts/README.md`).
 
 ## A golangci-lint replacement in Vu
 

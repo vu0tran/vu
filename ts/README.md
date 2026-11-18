@@ -710,6 +710,68 @@ Also: a statement past 400,000 type instantiations (was 1,000,000) leaves its fi
 most n8n's checked statements need is 390,000, and reaching the limit took up to 1.6 s
 (`core`'s `supply-data-context.ts`, lodash's `get`), so `core`'s check went from 2.8 s to 1.5 s.
 
+### No file left to tsgolint (2026-11-18, latest)
+
+Over the 33 n8n packages (`--type-aware --type-check`, default configuration, cache cleared
+before each run; oxlint 1.90.0 with tsgolint against vlint with `VLINT_VTSC=1`): every line equal
+to oxlint's in all 33, and vtsc checks every file of every program, tsgolint's inferred program
+included (`inv.sh`: none left). vlint then doesn't look for tsgolint at all: run without
+`OXLINT_TSGOLINT_PATH` and with no tsgolint installed, `frontend/@n8n/chat` prints what oxlint
+prints. (tsgolint is still looked for, and its missing-executable error printed, the moment a file
+would be left to it.)
+
+Best of 3 runs each, interleaved, same 2-core VM (`hyw3.sh`, load average about 1):
+
+| | oxlint | vlint | |
+|---|---|---|---|
+| `@n8n/api-types` (704 files) | 7.70 s | 3.85 s | 2.00x |
+| `core` | 4.43 s | 2.12 s | 2.09x |
+| `workflow` | 3.08 s | 1.47 s | 2.10x |
+| `frontend/@n8n/composables` | 3.00 s | 1.41 s | 2.13x |
+| `@n8n/workflow-sdk` | 2.75 s | 1.42 s | 1.94x |
+| `@n8n/ai-utilities` | 2.59 s | 1.05 s | 2.46x |
+| `@n8n/telemetry` | 2.38 s | 0.83 s | 2.88x |
+| `@n8n/decorators` | 1.95 s | 0.68 s | 2.89x |
+| `@n8n/engine` | 1.65 s | 0.50 s | 3.30x |
+| `frontend/@n8n/stores` | 1.33 s | 0.64 s | 2.09x |
+| `@n8n/node-cli` | 1.05 s | 0.50 s | 2.09x |
+| `frontend/@n8n/chat` | 1.00 s | 0.47 s | 2.10x |
+| `@n8n/task-runner` | 0.99 s | 0.51 s | 1.93x |
+| `@n8n/eslint-config` | 0.84 s | 0.46 s | 1.82x |
+| 19 other packages | 0.29-1.30 s | 0.08-0.52 s | 2.25-3.79x |
+
+Below 2x: `eslint-config` (three programs, two of them a few files each, every one parsing the
+lib and `@types` again: 0.07-0.13 s each), `task-runner` and `workflow-sdk`, within the runs'
+spread of 2x (single runs vary by about 10%).
+
+What changed:
+- **The last fallbacks**: `templates[type][name]` (`N extends keyof M[T]`: the read stays
+  `M[T]`, and `M[T][N]` has no constraint where a union member lacks the key); a `in`-narrowed
+  union-constrained parameter read in a closure; a union of one declaration's generic methods
+  (their constraints compared through the instantiation); `Omit<O, K>` against a union; zod and
+  langchain inference stopped at `isDeeplyNestedType` (it ran to millions of instantiations); each
+  side's own `this` in inference; `flatten<T> = identity<{ ... }>` printed without the alias; a const
+  type parameter as an object literal property's contextual type; `pkg/` as the package itself;
+  `for await` over an iterable whose iterator is `this`; the permissive and restrictive
+  instantiations of a conditional type with free type variables.
+- **TypeScript 7's default is strict** (a `{}` tsconfig is strict; vtsc read it as loose). A strict
+  flag set off checks only files it can't matter in (enums, constants of literals).
+- **JavaScript** (decorators' 118 stale tsc outputs): tsc's CommonJS output (`exports.x = ...`,
+  top-level `this && this.__decorate`, `Object.defineProperty(exports, ...)`), a class's
+  `this.x = v` declarations (the constructor's widened types, `[]` as `any[]`, `| undefined` when
+  only methods assign), inference without candidates giving any, `extends` a generic expression
+  filled with defaults, destructured parameters without types, and errors that don't change types
+  allowed (no checkJs: none reported). A TypeScript file the inferred program only imports doesn't
+  need its TC39 decorators modeled.
+- **Speed**: vlint checks its programs in-process (no worker process and JSON;
+  `VLINT_VTSC_ISOLATE=1` keeps them); vtsc's workers take files from a shared queue; a file a worker
+  only declares gets its declarations' types as importers ask for them, and a one-signature call
+  there isn't checked against its arguments; programs at once share the cores; a worker per core
+  from 16 files; a conditional type's free type variables found without resolving object
+  literals' members (chat's check 508 -> 230 ms).
+- TS2695 and TS2776 (`(0, f)(x)` assertion calls), vtsc printing duplicates of different spans as
+  tsc does, `export { a as b }` in a namespace (events' `EventEmitter.EventEmitter`).
+
 ### Fewer files left to tsgolint (2026-11-18, later)
 
 Same setup (`hyw.sh` over the 33 packages, oxlint 1.90.0 with tsgolint against `vlint` with
