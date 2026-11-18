@@ -1,0 +1,15 @@
+declare const o: { a?: number; b: { c?: string } };
+declare const p: { a?: number } & { a: 1 | 2; d: boolean };
+declare const q: { a?: number } & { a?: 1 | 2 };
+declare const r: { a: any } & { a: string };
+type X = typeof o.a;
+type Y = typeof o.b.c;
+type Z = typeof p.a;
+type W = typeof q.a;
+type V = typeof p.d;
+const x: null = 1 as any as X;
+const y: null = 1 as any as Y;
+const z: null = 1 as any as Z;
+const w: null = 1 as any as W;
+const v: null = 1 as any as V;
+const u: null = 1 as any as typeof r.a;

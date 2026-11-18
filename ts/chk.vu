@@ -730,6 +730,16 @@ fn bind_pattern(var c: C, pat: Int, src0: Int, mutable: Bool):
               if x != iels[0]: same = false
             if same: et = iels[0]
             else: et = types.inter_of(&c, iels)
+        # (a union of tuples, arrays and intersections of them: their elements' union)
+        if et < 0 and c.tk[src] == TK_UNION:
+          var uels: [Int] = []
+          for mi_ in 0..types.nmem(c, src):
+            let x = member_elem(&c, types.mem(c, src, mi_), i)
+            if x < 0:
+              uels = []
+              break
+            uels.push(x)
+          if uels.len > 0: et = types.union_of(&c, uels)
         if et < 0:
           var dd = ""
           if c.all_reasons: dd = " " + show.show(&c, src)
@@ -4859,7 +4869,12 @@ fn prop_access(var c: C, n: Int) -> Int:
           let dt1 = bind.type_of_sym(&c, os1)
           if has_cond(c, dt1): via_cond = true
       if via_cond: return unsup(&c, n, "a property missing from a conditional type's constraint")
-      let shown = show.show(&c, ot)
+      # (on a class's or interface's this: tsc names its apparent type, the class)
+      var shown_t = ot
+      if c.tk[ot] == TK_TPARAM and is_this_tparam(c, ot):
+        let bc = base_constraint(&c, ot, 0)
+        if bc >= 0: shown_t = bc
+      let shown = show.show(&c, shown_t)
       bind.err_at(&c, n, c.t.nd[n].d, 2339, "Property '" + nm(c, name) + "' does not exist on type '" + shown + "'.")
       return c.error_t
     check_access(&c, n, ps, name)
@@ -4872,6 +4887,50 @@ fn prop_access(var c: C, n: Int) -> Int:
     if (c.sflags[ps] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
     ts.push(pt)
   return types.union_of(&c, ts)
+
+# A union member's element at index i in array destructuring (-1 not modeled): a tuple's (with
+# an element there), an array's, an intersection of them (their elements intersected).
+fn member_elem(var c: C, m: Int, i: Int) -> Int:
+  if c.tk[m] == TK_OBJ:
+    let o = c.ta[m]
+    if c.objs[o].kind == OK_TUPLE:
+      if bind.tuple_has_rest(c, m): return -1
+      if i >= c.objs[o].args.len: return -1
+      var x = c.objs[o].args[i]
+      if c.objs[o].eflags[i] == 1: x = types.union_of(&c, [x, c.undef_t])
+      return x
+    if rel.is_array_ref(&c, m): return c.objs[o].args[0]
+    return -1
+  if c.tk[m] != TK_INTER: return -1
+  var iels: [Int] = []
+  for ii_ in 0..types.ninter(c, m):
+    let im = types.inter_at(c, m, ii_)
+    if c.tk[im] != TK_OBJ: return -1
+    let io = c.ta[im]
+    if c.objs[io].kind == OK_TUPLE and not bind.tuple_has_rest(c, im) and i < c.objs[io].args.len:
+      var x = c.objs[io].args[i]
+      if c.objs[io].eflags[i] == 1: x = types.union_of(&c, [x, c.undef_t])
+      iels.push(x)
+    elif rel.is_array_ref(&c, im): iels.push(c.objs[io].args[0])
+    elif c.objs[io].kind == OK_TUPLE: return -1
+    else:
+      # (another object type: its property of the index, if it has one)
+      let iname = ast.intern(&c.t, "{i}")
+      let ip = bind.get_prop(&c, im, iname)
+      if ip >= 0: return -1
+      if bind.index_type(&c, im, true) >= 0 or bind.index_type(&c, im, false) >= 0: return -1
+  if iels.len == 0: return -1
+  var same = true
+  for x in iels:
+    if x != iels[0]: same = false
+  if same: return iels[0]
+  return types.inter_of(&c, iels)
+
+# Whether a type parameter is a class's or interface's polymorphic this.
+fn is_this_tparam(c: C, t: Int) -> Bool:
+  for o, tp in c.this_tp:
+    if tp == t: return true
+  return false
 
 # A property of an intersection: the intersection of the members that declare it (index
 # signatures only when none does).
@@ -9971,6 +10030,102 @@ fn array_assign(var c: C, n: Int, l: Int, r: Int) -> Int:
       rec_try(&c, key)
   return rt
 
+# ({ a, b: x.y } = rhs) with each property a shorthand or a name with a reference (no defaults,
+# rest, computed names or nested patterns): rhs checked against the object of the targets'
+# types, each target assigned its property.
+fn object_assign(var c: C, n: Int, l: Int, r: Int) -> Int:
+  let ps = kids(c, c.t.nd[l].a)
+  var names: [Int] = []
+  var tnodes: [Int] = []
+  var targets: [Int] = []
+  var keys: [Str] = []
+  for p in ps:
+    let pk = c.t.nd[p].k
+    var tn = -1
+    var name = -1
+    if pk == ast.N_SHORTHAND and c.t.nd[p].b < 0:
+      tn = p
+      name = c.t.nd[p].s
+    elif pk == ast.N_PROPASSIGN and c.t.nd[c.t.nd[p].a].k != ast.N_COMPUTED:
+      let v = c.t.nd[p].b
+      let vk = c.t.nd[v].k
+      if vk != ast.N_ID and vk != ast.N_PROPACCESS and vk != ast.N_ELEMACCESS: return unsup(&c, n, "a destructuring assignment")
+      tn = v
+      name = bind.member_name(&c, p)
+    if tn < 0 or name < 0 or types.has_int(names, name): return unsup(&c, n, "a destructuring assignment")
+    let before = c.diags.len
+    var tt = -1
+    var key = ""
+    if pk == ast.N_SHORTHAND:
+      tt = short_target(&c, p)
+      let s0 = bind.lookup_value(&c, p, c.t.nd[p].s)
+      if s0 >= 0: key = "{s0}"
+    else:
+      tt = assign_target(&c, tn)
+      key = ref_key(&c, tn)
+    if tt == c.auto_t or c.tk[tt] == TK_UNSUP: return unsup(&c, n, "a destructuring assignment")
+    # (a constant or read-only target: reported alone, nothing assigned)
+    if bad_ref(c, before): key = "!"
+    names.push(name)
+    tnodes.push(tn)
+    targets.push(tt)
+    keys.push(key)
+  let ctx = types.anon_obj(&c, -1, l)
+  for i in 0..names.len:
+    let us = types.new_sym(&c, S_PROP, names[i], tnodes[i])
+    c.stype[us] = targets[i]
+    types.add_prop(&c, ctx, names[i], us)
+  c.objs[c.ta[ctx]].resolved = true
+  let rt = check_expr(&c, r, ctx)
+  if c.tk[rt] == TK_UNSUP: return rt
+  var pts: [Int] = []
+  for i in 0..names.len:
+    if is_any(c, rt):
+      pts.push(rt)
+      continue
+    if c.tk[rt] != TK_OBJ: return unsup(&c, n, "a destructuring assignment")
+    let ap = rel.apparent(&c, rt)
+    let sp = bind.get_prop(&c, ap, names[i])
+    if sp < 0:
+      # (a property the right side lacks, and no index signature: TS2339 at its name)
+      if bind.index_type(&c, ap, false) >= 0 or bind.sig_count(&c, ap, false) > 0 or rt != ap: return unsup(&c, n, "a destructuring assignment")
+      var at = ps[i]
+      if c.t.nd[at].k == ast.N_PROPASSIGN: at = c.t.nd[at].a
+      let shown = show.show(&c, rt)
+      err(&c, at, 2339, "Property '" + nm(c, names[i]) + "' does not exist on type '" + shown + "'.")
+      pts.push(c.error_t)
+      continue
+    var pt = bind.prop_type_for(&c, sp, rt)
+    if (c.sflags[sp] & SF_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+    if c.tk[pt] == TK_UNSUP: return pt
+    pts.push(pt)
+  for i in 0..names.len:
+    let et = pts[i]
+    if c.tk[et] == TK_ERROR or keys[i] == "!": continue
+    if not is_any(c, et) and not rel.assignable(&c, et, targets[i]): rel.report(&c, et, targets[i], tnodes[i], -1, 2322)
+    let key = keys[i]
+    if key == "": continue
+    forget(&c, key)
+    if c.tk[targets[i]] == TK_ERROR: continue
+    let an = assigned_narrow(&c, targets[i], et)
+    set_narrow(&c, key, an)
+    note_assigned(&c, key, targets[i], et)
+    rec_try(&c, key)
+  return rt
+
+# The declared type of a shorthand's variable as an assignment target ({ a } = rhs).
+fn short_target(var c: C, p: Int) -> Int:
+  let name = c.t.nd[p].s
+  let raw = bind.lookup_value_raw(&c, p, name)
+  if raw >= 0 and (c.sk[raw] & types.S_IMPORT) != 0: return unsup(&c, p, "assigning to an import")
+  let s = bind.lookup_value(&c, p, name)
+  if s < 0: return unsup(&c, p, "a destructuring assignment to an unknown name")
+  if (c.sk[s] & S_CONST) != 0:
+    err(&c, p, 2588, "Cannot assign to '" + nm(c, name) + "' because it is a constant.")
+    return bind.type_of_sym(&c, s)
+  if (c.sk[s] & (S_FUNC | S_CLASS | S_ENUM | S_NAMESPACE)) != 0: return unsup(&c, p, "assigning to a function or class")
+  return bind.type_of_sym(&c, s)
+
 fn binary(var c: C, n: Int, ctx: Int) -> Int:
   let op = c.t.nd[n].f
   let l = c.t.nd[n].a
@@ -9987,7 +10142,7 @@ fn binary(var c: C, n: Int, ctx: Int) -> Int:
   if op == scan.T_ASSIGN:
     let lk = c.t.nd[l].k
     if lk == ast.N_ARRAY: return array_assign(&c, n, l, r)
-    if lk == ast.N_OBJECT: return unsup(&c, n, "a destructuring assignment")
+    if lk == ast.N_OBJECT: return object_assign(&c, n, l, r)
     let before = c.diags.len
     var target = assign_target(&c, l)
     # x = a + b (an arithmetic or shift right side): tsc checks against the declared type with its
@@ -11630,7 +11785,7 @@ fn class_sym_of_base(var c: C, d: Int) -> Int:
   if c.t.nd[e].k != ast.N_ID: return -1
   let bs = bind.lookup_value(&c, h, c.t.nd[e].s)
   if bs < 0: return -1
-  if (c.sk[bs] & S_CLASS) == 0 and bind.ctor_value_instance(&c, h, bs) < 0: return -1
+  if (c.sk[bs] & S_CLASS) == 0 and bind.ctor_value_instance(&c, h, bs) < 0 and not bind.error_base(&c, d): return -1
   return bs
 
 # The class's constructor type: construct signatures (its constructor's, else its base's, else
@@ -11699,6 +11854,12 @@ fn class_static(var c: C, s: Int) -> Int:
         let cp = types.sig_copy(c, bsg)
         let ns = types.new_sig(&c, cp.node)
         c.sigs[ns] = cp
+        c.sigs[ns].ret = inst
+        c.sigs[ns].tparams = types.ints(ctps)
+        c.objs[o].ctors.push(ns)
+      # (an error base, an import not found: no base signatures, the none-argument one)
+      if c.objs[o].ctors.len == 0 and bind.error_base(&c, d):
+        let ns = types.new_sig(&c, d)
         c.sigs[ns].ret = inst
         c.sigs[ns].tparams = types.ints(ctps)
         c.objs[o].ctors.push(ns)
