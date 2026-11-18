@@ -520,8 +520,8 @@ takes about as much CPU as oxlint (Rust), 13 times less than Biome and 130 times
 (measured on a loaded 2-core VM; `ts/README.md`). It's on npm as `@vu0tran/vlint`, laid out as
 oxlint is, with an `oxlint` command too (`"oxlint": "npm:@vu0tran/vlint@^0.1.0"`). With
 `VLINT_VTSC=1`, `--type-aware --type-check` needs no tsgolint on n8n's 33 core packages: vtsc
-checks every file, every line equal to oxlint's, 1.8 to 3.8 times as fast as oxlint (
-best of 3, 2026-11-18; `ts/README.md`).
+checks every file, every line equal to oxlint's, 1.8 to 3.8 times as fast as
+oxlint (best of 3, 2026-11-18; `ts/README.md`).
 
 ## A golangci-lint replacement in Vu
 
