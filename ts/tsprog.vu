@@ -456,8 +456,8 @@ fn importer_cjs(fs: Fs, var rv: lresolve.Rv, path: Str) -> Bool:
     d = up
   return true
 
-fn worker(fs: Fs, os: Os, ffi: Ffi, own files: [Str], own dir: Str, own target: Str, own pg: Prog, shard: Int, nshards: Int, own ch: Chan[Out]):
-  let o = run(fs, os, ffi, files, dir, target, pg, shard, nshards) else Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
+fn worker(fs: Fs, os: Os, ffi: Ffi, own files: [Str], own dir: Str, own target: Str, own pg: Prog, shard: Int, nshards: Int, own ch: Chan[Out], own wq: Chan[Int], cap: Int):
+  let o = run(fs, os, ffi, files, dir, target, pg, shard, nshards, wq, cap) else Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
   ch.send(o)
 
 # The checker over the files: the errors of this worker's share of them (every nshards-th file,
@@ -520,7 +520,7 @@ fn file_keys(fs: Fs, ffi: Ffi, c: types.C, pg: Prog, dir: Str, target: Str, srcs
     out[fx] = lcache.hex16(lcache.mix(lcache.mix(lcache.mix(lcache.mix(g, fh[fx]), sum), n), lcache.hash64(rl)))
   return out
 
-fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, shard: Int, nshards: Int) -> Out throws:
+fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, shard: Int, nshards: Int, own wq: Chan[Int], cap: Int) -> Out throws:
   let t0 = os.clock()
   var out = Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
   var seen: {Str: Bool} = {}
@@ -864,7 +864,10 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
     if fx >= user_from and not (fx in c.pkg_files) and not (fx in cached):
       uord.push(fx)
       total += fcost[fx]
-  if nshards <= 1 or os.env("VTSC_SHARD_CONTIG") != "":
+  let dyn = nshards > 1 and cap > 0
+  if dyn:
+    mine[0] = false
+  elif nshards <= 1 or os.env("VTSC_SHARD_CONTIG") != "":
     var acc = 0
     for fx in uord:
       let part = (acc * nshards) / (total + 1)
@@ -951,8 +954,47 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       dk += 3
     if rr.len > 0: c.expect_ranges[fi] = rr
   let ftime = os.env("VTSC_FILE_TIME") != ""
+  # (the files in the order they're checked or declared in; with tickets, each taken file after
+  # the imports of it this worker doesn't check)
+  var plan: [Int] = []
   for fi in order0:
-    if not want[fi]: continue
+    if want[fi]: plan.push(fi)
+  var rank_of: [Int] = []
+  for _q in 0..roots.len: rank_of.push(-1)
+  for ri in 0..uord.len: rank_of[uord[ri]] = ri
+  var declared: [Bool] = []
+  for _q in 0..roots.len: declared.push(false)
+  var pi = 0
+  var tickets_done = not dyn
+  var late = cap
+  while true:
+    if pi >= plan.len:
+      if tickets_done: break
+      var r = wq.recv() else -1
+      if r < 0:
+        # (no tickets left: the ranks past cap, every nshards-th)
+        while late < uord.len and late % nshards != shard: late += 1
+        r = late
+        late += 1
+      if r >= uord.len:
+        tickets_done = true
+        continue
+      let fx = uord[r]
+      mine[fx] = true
+      var w2: [Bool] = []
+      for _q in 0..roots.len: w2.push(false)
+      want_deps(fx, user_from, imps, &w2, c.file_index)
+      for fi2 in order0:
+        if fi2 == fx or not w2[fi2] or fi2 < user_from or mine[fi2] or declared[fi2] or fi2 in c.pkg_files or fi2 in cached: continue
+        # (an import later in the order, through a cycle: perhaps this worker's yet, so not
+        # declared; its types come as they're asked for)
+        if rank_of[fi2] > r: continue
+        declared[fi2] = true
+        plan.push(fi2)
+      plan.push(fx)
+      continue
+    let fi = plan[pi]
+    pi += 1
     c.node_file = fi
     let tf = os.clock()
     if ftime and os.env("VTSC_FILE_TIME") == "2": eprint("BEGIN {names[fi]}")
@@ -1352,13 +1394,23 @@ fn run_all(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Pr
     if files.len >= 64: jobs = cpu_count(fs)
   if jobs > 8: jobs = 8
   var outs: [Out] = []
-  if jobs == 1: outs.push(run(fs, os, ffi, files, dir, target, pg, 0, 1)?)
+  if jobs == 1:
+    let wq0: Chan[Int] = chan(1)
+    wq0.close()
+    outs.push(run(fs, os, ffi, files, dir, target, pg, 0, 1, wq0, 0)?)
   else:
     let ch: Chan[Out] = chan(jobs)
+    # (the files' ranks in the checking order, taken by whichever worker is free: past cap, every
+    # nshards-th one by each)
+    var cap = files.len * 4 + 4096
+    if os.env("VTSC_SHARD_STATIC") != "": cap = 0
+    let wq: Chan[Int] = chan(cap + 1)
+    for r in 0..cap: wq.send(r)
+    wq.close()
     for k in 0..jobs:
       var fc: [Str] = []
       for x in files: fc.push(x + "")
-      spawn worker(fs, os, ffi, fc, dir + "", target + "", copy_prog(pg), k, jobs, ch)
+      spawn worker(fs, os, ffi, fc, dir + "", target + "", copy_prog(pg), k, jobs, ch, wq, cap)
     for k in 0..jobs:
       let o = ch.recv()?
       outs.push(o)
