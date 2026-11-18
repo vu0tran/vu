@@ -710,6 +710,48 @@ Also: a statement past 400,000 type instantiations (was 1,000,000) leaves its fi
 most n8n's checked statements need is 390,000, and reaching the limit took up to 1.6 s
 (`core`'s `supply-data-context.ts`, lodash's `get`), so `core`'s check went from 2.8 s to 1.5 s.
 
+### All of n8n core checked, twice as fast as oxlint (2026-11-18)
+
+Same machine and setup (`hyw.sh`, every line equal to oxlint's in all 33 packages, first run and
+second):
+
+| | oxlint | first run | next run |
+|---|---|---|---|
+| `core` (all 275 files vtsc's, was 255 of 264 plus 9 of 11 inferred) | 3.92-4.34 s | 1.83-2.10 s | 0.11-0.14 s |
+| `@n8n/engine` (135 of 135, was 117) | 1.51 s | 0.53 s | 0.05 s |
+| `@n8n/api-types` | 7.47 s | 5.14 s | 0.17 s |
+| `workflow` | 3.92 s | 2.24 s | 0.08 s |
+| 21 other smaller packages | 0.3-2.7 s each | 2-4 times less | 0.01-0.07 s |
+
+Still slower than oxlint on a first run: `frontend/@n8n/composables` (one Vue test file vtsc leaves
+to tsgolint: inference to a mapped type with an `as` clause), `stores` and `ai-utilities` (11 and
+35 files left), `@n8n/decorators` (121 stale `.js` build outputs in `src`, tsc's CommonJS).
+
+What changed:
+- **Long types in messages print as tsc 7 prints them.** Past 160 characters tsc elides members
+  (`... 31 more ...`) and union or argument lists, by an approximate length it counts as it
+  builds the type, and cuts the text at 320 characters. Each form's count was measured against
+  tsc 7 (a property's name plus one, a named type's name twice, two per list member, a
+  parameter's name after its type, `readonly` after the property's type). Such a message used to
+  leave its file unchecked. 750 generated types compared with tsc 7: the differences left are
+  union orders and reductions vtsc already got wrong in short messages. Printing also stops after
+  4000 types (one mock's message took 614 ms, now 49 ms).
+- **TC39 decorators** (no `experimentalDecorators`): method and getter decorators are checked
+  (TS1241, TS1270); class decorators of type `Function` or `any` are untyped calls; any other
+  decorator leaves its file unchecked (before, none were checked).
+- **CommonJS in JavaScript**: `require("x")` is the module (a relative file or a CommonJS module
+  isn't modeled); `module.exports = ...` at the top level; a JavaScript file no type-aware rule
+  runs on only has to parse.
+- **Coverage**: an augmentation's interface is the merged one inside the augmentation (vitest's
+  `expect.soft`); classes extending or implementing an import of a module not found; `typeof a.b`
+  through intersections; array destructuring of unions of tuples; object destructuring
+  assignments; JSON files in packages; `Awaited<T>` against an object type.
+- **Errors vtsc got wrong, silently**: the subtype reduction let `{ a; b }` absorb a fresh
+  `{ a }` literal (an `it.each` table failed with TS2769); a missing property on `this` named the
+  type `this` instead of the class; a mapped array of the error type wasn't the error type; a
+  call with explicit type arguments whose arguments fail now returns the defaults as written
+  (`mock<T>({...})` is `_MockProxy<T> & T` in tsc).
+
 ### More of n8n checked, and the second run everywhere (2026-11-17)
 
 Measured on the same two-core machine, oxlint 1.90.0 with tsgolint against `vlint` with
