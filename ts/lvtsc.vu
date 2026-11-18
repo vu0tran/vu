@@ -282,18 +282,30 @@ fn inferred_job(fs: Fs, os: Os, ffi: Ffi, files: [Str], lint: {Str: Str}) -> Job
 
 type JobOut:
   i: Int
-  js: Str      # the program's check, as JSON
+  js: Str      # the program's check, as JSON (a worker process's)
+  p: tsprog.Proj = tsprog.Proj(false, "", [], {}, {}, {})   # ... or as checked here
+  has_p: Bool = false
+
+# (VLINT_VTSC_ISOLATE=1: each program in a worker process, where a crash, a stack overflow or
+# running out of time leaves its files to tsgolint; else in this process)
+fn isolate(os: Os) -> Bool:
+  return os.env("VLINT_VTSC_ISOLATE") == "1"
 
 fn job_bg(fs: Fs, os: Os, ffi: Ffi, own i: Int, own j: Job, own ch: Chan[JobOut], nj: Int):
+  if not isolate(os):
+    ch.send(JobOut(i, "", work_n(fs, os, ffi, j, nj), true))
+    return
   let js = run_program_js_n(fs, os, ffi, j.kind, j.at, j.files, j.lib, j.lint, nj)
   ch.send(JobOut(i, js))
 
-# The programs' checks at once (each in its own worker process), as JSON; one alone runs here.
-fn run_jobs(fs: Fs, os: Os, ffi: Ffi, jobs: [Job]) -> {Int: Str}:
-  var out: {Int: Str} = {}
+# The programs' checks at once (each in a task, or a worker process); one alone runs here.
+fn run_jobs(fs: Fs, os: Os, ffi: Ffi, jobs: [Job]) -> [JobOut]:
+  var out: [JobOut] = []
+  for _i in 0..jobs.len: out.push(JobOut(-1, ""))
   if jobs.len == 1 or os.env("VLINT_VTSC_SERIAL") == "1":
     for i in 0..jobs.len:
-      out[i] = run_program_js(fs, os, ffi, jobs[i].kind, jobs[i].at, jobs[i].files, jobs[i].lib, jobs[i].lint)
+      if not isolate(os): out[i] = JobOut(i, "", work_n(fs, os, ffi, jobs[i], 0), true)
+      else: out[i] = JobOut(i, run_program_js(fs, os, ffi, jobs[i].kind, jobs[i].at, jobs[i].files, jobs[i].lib, jobs[i].lint))
     return out
   let ch: Chan[JobOut] = chan(jobs.len + 1)
   # (the cores shared out: one worker each, the rest to the tsconfigs' programs, so the programs
@@ -322,15 +334,22 @@ fn run_jobs(fs: Fs, os: Os, ffi: Ffi, jobs: [Job]) -> {Int: Str}:
     spawn job_bg(fs, os, ffi, i, Job(jobs[i].kind + "", jobs[i].at + "", fl, jobs[i].lib + "", tl), ch, nj[i])
   for _ in 0..jobs.len:
     let r = ch.recv() else JobOut(-1, "")
-    if r.i >= 0: out[r.i] = r.js + ""
+    if r.i >= 0 and r.i < out.len:
+      let ri = r.i
+      out[ri] = r
   return out
 
-fn take_out(var outs: {Int: Str}, i: Int) -> tsprog.Proj:
+fn take_out(var outs: [JobOut], i: Int) -> tsprog.Proj:
   let lost = tsprog.Proj(false, "vtsc: a program's check was lost", [], {}, {}, {})
-  if not (i in outs): return lost
-  let p = from_json(outs[i], tsprog.Proj) else tsprog.Proj(false, "vtsc: unreadable worker output", [], {}, {}, {})
-  outs.remove(i)
-  return p
+  if i < 0 or i >= outs.len or outs[i].i < 0: return lost
+  if outs[i].has_p:
+    var p = tsprog.Proj(false, "", [], {}, {}, {})
+    swap(&p, &outs[i].p)
+    outs[i].i = -1
+    return p
+  let p2 = from_json(outs[i].js, tsprog.Proj) else tsprog.Proj(false, "vtsc: unreadable worker output", [], {}, {}, {})
+  outs[i].i = -1
+  return p2
 
 # What a vtsc worker is given: a tsconfig's program or the inferred one over files.
 type Job:
@@ -407,8 +426,14 @@ fn cache_dir(os: Os) -> Str:
 
 fn work(fs: Fs, os: Os, ffi: Ffi, j: Job) -> tsprog.Proj:
   let nj = int(os.env("VTSC_JOBS")) else 0
-  if j.kind == "inferred": return tsprog.check_inferred_lint(fs, os, ffi, j.at, j.files, j.lib, nj, j.lint)
-  return tsprog.check_project_lint(fs, os, ffi, j.at, j.lib, nj, j.lint)
+  return work_n(fs, os, ffi, j, nj)
+
+fn work_n(fs: Fs, os: Os, ffi: Ffi, j: Job, nj: Int) -> tsprog.Proj:
+  # (a worker process is given the cache's folder; here, it's vlint's own)
+  var cdir = os.env("VTSC_CACHE_DIR")
+  if cdir == "" and os.env("VLINT_VTSC_ISOLATE") != "1": cdir = cache_dir(os)
+  if j.kind == "inferred": return tsprog.check_inferred_lint(fs, os, ffi, j.at, j.files, j.lib, nj, j.lint, cdir)
+  return tsprog.check_project_lint(fs, os, ffi, j.at, j.lib, nj, j.lint, cdir)
 
 # vlint --vtsc-worker JOB OUT: the program's check, as JSON in OUT.
 fn worker(fs: Fs, os: Os, ffi: Ffi, jp: Str, op: Str) -> Int:
