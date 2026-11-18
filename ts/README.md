@@ -710,7 +710,55 @@ Also: a statement past 400,000 type instantiations (was 1,000,000) leaves its fi
 most n8n's checked statements need is 390,000, and reaching the limit took up to 1.6 s
 (`core`'s `supply-data-context.ts`, lodash's `get`), so `core`'s check went from 2.8 s to 1.5 s.
 
-### No file left to tsgolint (2026-11-18, latest)
+### Twice as fast as oxlint on every package (2026-11-18, latest)
+
+The same 33 n8n packages, the same comparison (best of 3 interleaved runs, cache cleared before
+each, 2-core VM, load average 1-1.8, `hyw3.sh`): every line equal to oxlint's in all 33, no file
+left to tsgolint, and vlint at least 2x faster on each:
+
+| | oxlint | vlint | |
+|---|---|---|---|
+| `@n8n/api-types` (704 files) | 7.28 s | 3.47 s | 2.10x |
+| `core` | 4.08 s | 1.75 s | 2.33x |
+| `workflow` | 3.23 s | 1.26 s | 2.57x |
+| `frontend/@n8n/composables` | 3.22 s | 1.27 s | 2.53x |
+| `@n8n/workflow-sdk` | 2.55 s | 1.10 s | 2.32x |
+| `@n8n/ai-utilities` | 2.45 s | 0.96 s | 2.55x |
+| `@n8n/telemetry` | 2.20 s | 0.74 s | 2.97x |
+| `@n8n/decorators` | 1.92 s | 0.56 s | 3.45x |
+| `frontend/@n8n/stores` | 1.32 s | 0.58 s | 2.28x |
+| `@n8n/task-runner` | 0.94 s | 0.40 s | 2.34x |
+| `@n8n/eslint-config` | 0.83 s | 0.36 s | 2.30x |
+| `frontend/@n8n/chat` | 0.96 s | 0.42 s | 2.31x |
+| 21 other packages | 0.26-1.56 s | 0.07-0.44 s | 2.40-4.60x |
+
+What changed (each measured on the package it was found in; instruction counts from callgrind
+on a build for plain x86-64):
+- **Conditional and mapped types keep only the outer type parameters they mention**
+  (getConditionalTypeInstantiation's outer type parameters; one with a `typeof` query keeps them
+  all). A deferred conditional type carried every type parameter in scope, about 19, and composing
+  it with the next mapper instantiated each one. eslint-config's `base.ts` (type-fest's `KebabCase`
+  under eslint-import-context's `WithPluginName`): 94 -> 55 ms, 81,691 -> 66,096 instantiations,
+  mapper entries 180,724 -> 58,844. Also memoized: `inter_of` of two types, `cond_key` and
+  `strip_infers` by node and mapper.
+- **Subtype reduction** of a union of more than 10 members skips the pairs whose key properties
+  differ (removeSubtypes does so for any object type, not only object literals): a rule file whose
+  conditional expression joins two of TSESTree's `Node` unions, 31 -> 12 ms.
+- **The type-aware rules**: their visitor compared every rule's name, copied, at every node (5.5
+  million string copies on workflow-sdk); rule numbers, a table of the node kinds some rule visits,
+  and the children walked without lists built: 6.79 -> 5.46 G instructions for workflow-sdk's
+  program with its 15 rules (4.87 G without them).
+- **The cache keys** (vlint): each file's import closure walked file indexes, not paths looked up in
+  a map at every step: workflow-sdk's 128 -> 36 ms per worker.
+- **Cores**: the largest program gets one worker fewer than the cores when the others are a third
+  of its size or more (each worker parses the whole program): eslint-config 0.40 -> 0.38 s, best
+  of 5; workflow-sdk and task-runner keep a worker per core (one fewer was slower for them).
+- List copies are slices (one allocation), and the lib files' reference directives are read from
+  their heads only: 2.5% of workflow-sdk's instructions.
+- New vtest `typeof-param-cond` (vue-i18n's `createI18n`, which the first version of the mapper
+  cut got wrong in `@n8n/mcp-apps`: found by the n8n parity run, fixed before commit).
+
+### No file left to tsgolint (2026-11-18)
 
 Over the 33 n8n packages (`--type-aware --type-check`, default configuration, cache cleared
 before each run; oxlint 1.90.0 with tsgolint against vlint with `VLINT_VTSC=1`): every line equal
