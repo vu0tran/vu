@@ -56,7 +56,18 @@ function __vlHandle(line, __vlAnswer) {
 let __vlChain = Promise.resolve();
 // (fd 3 read as a pipe, from the event loop: a file stream would leave a blocking read in libuv's
 // thread pool, and process.exit() in a plugin would wait for it forever)
-__vlCreateInterface({ input: new __vlSocket({ fd: 3, readable: true, writable: false }), crlfDelay: Infinity }).on("line", (line) => {
+const __vlIn = new __vlSocket({ fd: 3, readable: true, writable: false });
+// (when fd 3 ends, every request has come: the host ends once they're answered, even if a plugin
+// keeps the event loop alive; if reading it fails, the host ends at once, so vlint sees its pipes
+// close rather than a process that no longer reads: issue #7)
+__vlIn.on("end", () => { setImmediate(() => __vlChain.then(() => process.exit(0))); });
+__vlIn.on("error", (err) => {
+  if (process.env.VLINT_JS_DEBUG && process.env.VLINT_JS_DEBUG !== "0") {
+    try { process.stderr.write("vlint js: process " + process.pid + ": reading fd 3 failed: " + String(err && err.message || err) + "\n"); } catch {}
+  }
+  process.exit(1);
+});
+__vlCreateInterface({ input: __vlIn, crlfDelay: Infinity }).on("line", (line) => {
   // (every request is answered exactly once: if handling it throws, the error is the answer, and
   // the chain goes on to the next request rather than stopping for good; issue #7)
   __vlChain = __vlChain.then(() => {

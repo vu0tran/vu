@@ -328,6 +328,33 @@ oxlint 1.90.0's package.json requires; older ones panic with `unknown rule` on n
 vlint says so on stderr before running it. The run and its output are otherwise oxlint's (tsgolint's
 stderr was already passed on).
 
+**Issues #6 and #7, follow-up (2026-11-18).** #7 still stalled on macOS with 0.4.1, with a thread
+in `write` and none in `poll`. The write path waited once for room in the pipe and then wrote the
+whole request (178 KB there) with a blocking `write`, and `poll`'s "writable" only means some room,
+so a host that stopped reading held that thread forever, past `VLINT_JS_TIMEOUT`. The pipe to a
+host is now non-blocking: each wait for room is limited, and a host that takes nothing for the
+limit is killed and the request sent again to a new one. Reproduced on Linux (one thread, 440
+files of 2.4 MB, `VLINT_JS_TIMEOUT=5`): a plugin that, after answering one file, blocks its host
+for 40 s at 0% CPU (`Atomics.wait`) while the next request is written. The previous build sat in
+`write` for all 40 s, ignoring the limit, and said nothing (61.7 s; 20 s without the nap); now
+the host is killed after 5 s and the run ends in 27.4 s with the same 440 diagnostics. Freezing
+the host with `SIGSTOP` mid-write, three times: the same output as a normal run each time.
+`VLINT_JS_DEBUG=1` now names the
+host's pid, its fd, the request's size and file before each write, and how much was written when a
+write waits more than 1 s or gives up. A host also exits when its input ends or fails. Still not
+known: why the Mac's host stopped reading (it was at 0% CPU); the trace will say which file and
+host. AFFiNE with its six JS plugins (no type-aware rules), two runs each: the same 322
+diagnostics and stderr as the previous build, 45.5 and 46.6 s against 50.3 and 46.9 s.
+#6 in a pnpm workspace: `node_modules/.bin/tsgolint` is a shell shim there, so the package.json
+beside it wasn't tsgolint's. vlint now also looks for `oxlint-tsgolint/package.json` in the
+`node_modules` folders above the binary and above the working folder, and in the pnpm store paths
+the shim names (the version in the store folder's name if its package.json is gone). Checked in a
+real pnpm workspace with oxlint-tsgolint 7.0.2001: the warning shows (it didn't before), also with
+the `node_modules/oxlint-tsgolint` link removed. When no version is found and tsgolint fails with
+`unknown rule`, vlint adds a line saying that's what an old oxlint-tsgolint does (checked with a
+copied 7.0.2001 binary and no package.json around). The `Error running tsgolint` line itself stays
+oxlint's.
+
 ## Drop-in status (checked against oxlint 1.90.0)
 
 **Command line** (every flag of `oxlint --help`, plus its hidden ones):

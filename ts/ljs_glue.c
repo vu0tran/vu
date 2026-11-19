@@ -8,8 +8,8 @@
    prelude (the plugin loads and the rules' options), so every process registers the same rules.
    Processes end when their fd 3 closes.
 
-   Nothing here waits forever (issue #7): every read and write on a process's pipes gives up after
-   VLINT_JS_TIMEOUT seconds (default 120; 0: no limit), and the process is then killed, so the file
+   Nothing here waits forever (issue #7): every read and write on a process's pipes (each wait for
+   room in fd 3 too, which is non-blocking) gives up after VLINT_JS_TIMEOUT seconds (default 120; 0: no limit), and the process is then killed, so the file
    gets an error instead of the run hanging; at exit a process that doesn't end within 2 s of its
    fd 3 closing is killed. Processes are started one at a time with close-on-exec pipes, so no
    process inherits another's pipe ends (which would keep it from ever seeing its fd 3 close).
@@ -98,10 +98,15 @@ static void vl_init_once(void) {
     vl_debug = d && *d && strcmp(d, "0") != 0;
 }
 
-/* waits until fd is ready (POLLIN or POLLOUT); false after vl_timeout_ms */
+/* waits until fd is ready (POLLIN or POLLOUT); false after vl_timeout_ms (with no limit, waits) */
 static bool vl_ready(int fd, short ev) {
-    if (vl_timeout_ms < 0) return true;
     struct pollfd p = {fd, ev, 0};
+    if (vl_timeout_ms < 0) {
+        for (;;) {
+            int r = poll(&p, 1, -1);
+            if (r > 0 || errno != EINTR) return true;
+        }
+    }
     double until = vl_now() + vl_timeout_ms / 1000.0;
     for (;;) {
         int left = (int)((until - vl_now()) * 1000.0);
@@ -113,25 +118,42 @@ static bool vl_ready(int fd, short ev) {
     }
 }
 
+/* Writes all of p to the process's fd 3. The pipe's write end is non-blocking (vl_start), so a
+   request larger than the pipe's buffer is written as the process reads it, and the time limit
+   holds for each wait for room, not only the first: poll's "writable" means some room, and a
+   blocking write of the rest would wait for the process however long it takes (issue #7: a
+   178 KB request stuck in write). */
 static bool vl_write(vl_worker *wk, int fd, const char *p, size_t n) {
     sigset_t set, old;
     sigemptyset(&set);
     sigaddset(&set, SIGPIPE);
     pthread_sigmask(SIG_BLOCK, &set, &old);
     bool ok = true;
+    size_t total = n, done = 0;
+    double t0 = vl_now();
+    int traced = 0;
     while (n > 0) {
-        if (!vl_ready(fd, POLLOUT)) {
-            VL_DBG("process %d took no request for %d s: killed", (int)wk->pid, vl_timeout_ms / 1000);
-            wk->timed_out = 1;
-            kill(wk->pid, SIGKILL);
-            ok = false;
-            break;
-        }
         ssize_t w = write(fd, p, n);
+        if (w > 0) { p += w; n -= (size_t)w; done += (size_t)w; continue; }
         if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) { ok = false; break; }
-        p += w; n -= (size_t)w;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!traced && vl_now() - t0 > 1.0) {
+                traced = 1;
+                VL_DBG("process %d: fd 3 full, %zu of %zu bytes written; waiting for it to read", (int)wk->pid, done, total);
+            }
+            if (!vl_ready(fd, POLLOUT)) {
+                VL_DBG("process %d took no request for %d s (fd 3, %zu of %zu bytes written): killed", (int)wk->pid, vl_timeout_ms / 1000, done, total);
+                wk->timed_out = 1;
+                kill(wk->pid, SIGKILL);
+                ok = false;
+                break;
+            }
+            continue;
+        }
+        ok = false;
+        break;
     }
+    if (ok && traced) VL_DBG("process %d: request of %zu bytes written after %.1f s", (int)wk->pid, total, vl_now() - t0);
     if (!ok) {
         /* a SIGPIPE left pending by the failed write is consumed (sigwait returns at once for a
            pending signal; sigtimedwait isn't on macOS) */
@@ -220,6 +242,7 @@ static bool vl_start(vl_worker *w) {
     pthread_mutex_unlock(&vl_spawn_mu);
     if (rc != 0) { close(wp); close(rp); return false; }
     w->pid = pid; w->in = wp; w->out = rp;
+    fcntl(wp, F_SETFL, fcntl(wp, F_GETFL) | O_NONBLOCK);
     VL_DBG("process %d started", (int)pid);
     /* the prelude: each line answered, the answers dropped */
     const char *p = vl_prelude, *e = vl_prelude ? vl_prelude + vl_prelude_len : NULL;
@@ -302,6 +325,22 @@ void vl_node_prelude(const vu_str *lines) {
     pthread_mutex_unlock(&vl_mu);
 }
 
+/* the request's file, for the trace: the "path" of a lint request (escapes left as they are) */
+static void vl_req_path(const vu_str *req, char *out, size_t cap) {
+    static const char key[] = "\"path\":\"";
+    out[0] = 0;
+    const char *d = (const char *)req->data;
+    size_t n = (size_t)req->len, k = sizeof key - 1;
+    if (n > 4096) n = 4096;
+    for (size_t i = 0; i + k <= n; i++) {
+        if (memcmp(d + i, key, k) != 0) continue;
+        size_t j = i + k, o = 0;
+        while (j < n && d[j] != '"' && o + 2 < cap) { if (d[j] == '\\' && j + 1 < n) out[o++] = d[j++]; out[o++] = d[j++]; }
+        out[o] = 0;
+        return;
+    }
+}
+
 /* Sends a request and takes a ticket for its answer: the ticket and the process's generation, or
    false when node can't be started. A dead process is stopped and started again first. */
 static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
@@ -313,6 +352,11 @@ static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
         pthread_cond_broadcast(&w->cv);
         pthread_mutex_unlock(&w->rmu);
         if (!vl_start(w)) { vl_stop(w); w->broken = 1; pthread_mutex_unlock(&w->mu); return false; }
+    }
+    if (vl_debug) {
+        char path[512];
+        vl_req_path(req, path, sizeof path);
+        VL_DBG("process %d: sending request of %lld bytes on its fd 3 (vlint's fd %d), ticket %ld%s%s", (int)w->pid, (long long)req->len, w->in, w->tickets, path[0] ? ": " : "", path);
     }
     bool ok = vl_write(w, w->in, req->data, (size_t)req->len) && vl_write(w, w->in, "\n", 1);
     pthread_mutex_lock(&w->rmu);
