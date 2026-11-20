@@ -524,8 +524,10 @@ typedef struct { uint8_t *data; int64_t len, cap; } vu_str;
 #ifndef VU_SKEEP
 #define VU_SKEEP 4096
 #endif
-VU_G __thread void *vu_sfree[5];
-VU_G __thread int32_t vu_snum[5];
+/* (one thread-local: on macOS each thread-local's address is a call to _tlv_get_addr, so the lists
+   and their counts are found with one per allocation or free, not two) */
+typedef struct { void *free[5]; int32_t num[5]; } vu_spool;
+VU_G __thread vu_spool vu_sp;
 static inline int vu_sclass(int64_t c) { return c <= 16 ? 0 : c <= 32 ? 1 : c <= 64 ? 2 : c <= 128 ? 3 : c <= 256 ? 4 : -1; }
 /* A buffer of at least *cap bytes; *cap becomes its real size. */
 static inline uint8_t *vu_salloc(int64_t *cap) {
@@ -533,11 +535,12 @@ static inline uint8_t *vu_salloc(int64_t *cap) {
     int k = vu_sclass(*cap);
     if (k >= 0) {
         *cap = (int64_t)16 << k;
-        void *p = vu_sfree[k];
+        vu_spool *sp = &vu_sp;
+        void *p = sp->free[k];
         if (p) {
             VU_UNPOISON(p, (size_t)*cap);
-            memcpy(&vu_sfree[k], p, sizeof(void *));
-            vu_snum[k]--;
+            memcpy(&sp->free[k], p, sizeof(void *));
+            sp->num[k]--;
             return (uint8_t *)p;
         }
     }
@@ -551,14 +554,15 @@ static inline uint8_t *vu_salloc(int64_t *cap) {
 __attribute__((noinline)) static void vu_sfree_(uint8_t *p, int64_t cap) {
 #ifndef VU_MALLOC
     int k = vu_sclass(cap);
+    vu_spool *sp = &vu_sp;
 #if defined(_OPENMP) || defined(VU_MT)
-    if (k >= 0 && vu_snum[k] < VU_SKEEP) {
+    if (k >= 0 && sp->num[k] < VU_SKEEP) {
 #else
     if (k >= 0) {   /* one thread: the list never outgrows what was once alive at the same time */
 #endif
-        memcpy(p, &vu_sfree[k], sizeof(void *));
-        vu_sfree[k] = p;
-        vu_snum[k]++;
+        memcpy(p, &sp->free[k], sizeof(void *));
+        sp->free[k] = p;
+        sp->num[k]++;
         VU_POISON(p, (size_t)cap);   /* any later access to this freed buffer is reported */
         return;
     }
