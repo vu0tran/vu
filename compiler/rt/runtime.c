@@ -1098,6 +1098,13 @@ static void vu_guard_init(void *top) { vu_stack_top = (uintptr_t)top; }
 #ifdef VU_ASAN
 VU_G struct sigaction vu_asan_segv, vu_asan_bus;   /* AddressSanitizer's handlers, from before ours */
 #endif
+#if defined(VU_ASAN) && !defined(VU_PART)
+/* LeakSanitizer: what glibc's DNS resolver allocates and keeps (a buffer from __res_context_send,
+   now and then, under getaddrinfo: CI's ARM runners reported it from net.resolve) is the C
+   library's; no Vu program holds a pointer to it, and none of a program's own leaks pass through it. */
+const char *__lsan_default_suppressions(void);
+__attribute__((used)) const char *__lsan_default_suppressions(void) { return "leak:__res_context_send\n"; }
+#endif
 static void vu_segv(int sig, siginfo_t *si, void *ctx) {
     (void)sig; (void)ctx;
     uintptr_t a = (uintptr_t)si->si_addr;
@@ -1308,6 +1315,13 @@ static int vu_start(int argc, char **argv, int (*fn)(void), const char *const *f
     vu_argc = argc;
     vu_argv = argv;
     vu_files = files;
+#if defined(_OPENMP) && defined(__APPLE__)
+    /* libomp on macOS finds which thread is calling by default from the stack it runs on, and a task
+       runs on a stack of its own: a task's par loop or spawn then read another thread's OpenMP state
+       ("spawn can't be used inside a par loop" outside one, or a crash). Mode 2 keeps the thread's id
+       in thread-local storage. Read when the first par loop starts; the environment's value wins. */
+    setenv("KMP_GTID_MODE", "2", 0);
+#endif
 #ifdef VU_JSON_PANIC
     vu_json = true;
 #else

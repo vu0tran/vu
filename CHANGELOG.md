@@ -3052,3 +3052,25 @@ built with `--param asan-use-after-return=0` or built with `-mno-avx512f`; it cr
 an Intel Xeon 6975P-C, whose own native code doesn't spill there. Sanitizer builds on x86-64 now
 add `-mno-avx512f` (AVX2's 32-byte slots fit the fake frames), which keeps the new use-after-return
 checks rather than turning them off.
+
+**par loops in tasks on macOS (2026-11-20).** CI's `core (macos-15)` job failed on
+`targeted/779_memo_in_shared.vu` (exit 101, no output): `panic: spawn can't be used inside a par
+loop`, though no par loop was running. Not Memo's doing: 8 tasks that each run a par loop and then
+spawn (now `targeted/781_par_then_spawn_in_tasks.vu`) failed 40 of 40 runs with 2 or more task
+threads, at times as a segmentation fault, and failed the same way with the spawn as the task's
+first statement. The check is `omp_in_parallel()`, and libomp (macOS's OpenMP) finds which thread
+calls it by default from the stack it runs on (`KMP_GTID_MODE` 0, or 1: 20 of 20 failed, the second
+by crashing), while each Vu task runs on a stack of its own; with mode 2, which keeps the thread's
+id in thread-local storage, 0 of 20 failed. The runtime now sets `KMP_GTID_MODE=2` on macOS before
+OpenMP starts, unless the environment sets it. After: 781 0 of 30 failures at 2, 3 and 10 task
+threads, 779 0 of 30 at 2 (it failed 7 of 30), and 118 targeted tests on tasks, channels, par loops
+and Memo pass. Linux builds use gcc's libgomp, which keeps the thread in thread-local storage.
+
+**Two more CI failures (2026-11-20).** `core (ubuntu-24.04-arm)` failed now and then on
+`targeted/715_net_resolve.vu`: the right output, but LeakSanitizer reported a buffer allocated in
+glibc's resolver (`__res_context_send`, under `getaddrinfo`). It didn't come back in 180 runs on
+three ARM runners (a plain C `getaddrinfo` of the same name and Vu's test, 90 each), so it depends on
+how the runner's DNS server answers; the buffer is the C library's, so sanitizer builds now leave
+leaks allocated there out (`__lsan_default_suppressions`). `services (ubuntu-24.04)` failed once on
+`run_mail.sh`: the test's SMTP server couldn't bind the port found free for it ("address already in
+use"); tests/mail/server.py now starts each server again on a new port when that happens.

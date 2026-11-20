@@ -29,10 +29,19 @@ def auth(server, session, envelope, mechanism, auth_data):
 import socket
 def free():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
-starttls = Controller(Handler("starttls"), hostname="127.0.0.1", port=free(), tls_context=ctx, require_starttls=True, authenticator=auth, auth_required=True)
-implicit = Controller(Handler("implicit"), hostname="127.0.0.1", port=free(), ssl_context=ctx, authenticator=auth, auth_required=True, auth_require_tls=False, server_hostname="localhost")   # (aiosmtpd hides AUTH on a connection that was TLS from the start unless told it may show it)
-plain = Controller(Handler("plain"), hostname="0.0.0.0", port=free(), auth_require_tls=False)
-for c in (starttls, implicit, plain): c.start()
+# (a port found free can be taken before the controller binds it, as on a CI runner once: "address
+# already in use"; then another one is tried)
+def started(make):
+    for attempt in range(10):
+        c = make(free())
+        try:
+            c.start()
+            return c
+        except Exception:
+            if attempt == 9: raise
+starttls = started(lambda p: Controller(Handler("starttls"), hostname="127.0.0.1", port=p, tls_context=ctx, require_starttls=True, authenticator=auth, auth_required=True))
+implicit = started(lambda p: Controller(Handler("implicit"), hostname="127.0.0.1", port=p, ssl_context=ctx, authenticator=auth, auth_required=True, auth_require_tls=False, server_hostname="localhost"))   # (aiosmtpd hides AUTH on a connection that was TLS from the start unless told it may show it)
+plain = started(lambda p: Controller(Handler("plain"), hostname="0.0.0.0", port=p, auth_require_tls=False))
 
 resend = []
 class R(http.server.BaseHTTPRequestHandler):
