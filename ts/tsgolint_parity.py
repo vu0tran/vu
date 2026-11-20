@@ -93,7 +93,8 @@ def run_case(i,c):
     tc=c.get('tsconfig',deftc)
     shutil.copy(d+'/'+tc,d+'/tsconfig.use.json')
     for f in os.listdir(d):
-        if f.startswith('tsconfig') and f!='tsconfig.use.json': os.remove(d+'/'+f)
+        # (a tsconfig the chosen one extends stays)
+        if f.startswith('tsconfig') and f!='tsconfig.use.json' and f not in open(d+'/tsconfig.use.json').read(): os.remove(d+'/'+f)
     os.rename(d+'/tsconfig.use.json',d+'/tsconfig.json')
     fn=c.get('file') or ('react.tsx' if c.get('tsx') else 'file.ts')
     open(d+'/'+fn,'w').write(c['code'])

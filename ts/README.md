@@ -157,7 +157,8 @@ configuration files, the same output bytes and exit codes. It checks `.js .mjs .
 .cts .tsx` and the script sections of `.vue`, `.astro` and `.svelte` files. It reuses vtsc's
 scanner and parser, plus a scope builder (`scope.vu`), a regular-expression parser (`regex.vu`),
 the rules (`rules.vu`), configuration (`lconf.vu`, `lglob.vu`, `lmatch.vu`), output (`lout.vu`),
-the rule table (`lmeta.vu`, `lrules.vu`), partial files (`lpart.vu`), tsgolint (`ltsgo.vu`) and,
+the rule table (`lmeta.vu`, `lrules.vu`), partial files (`lpart.vu`), the type-aware rules (`ltyped.vu`,
+`lvtsc.vu`, `trules.vu`, `trules2.vu`, with TypeScript 7's lib files in `ltslib.vu`) and,
 for `--fix`, a printer of expressions as oxc prints them (`fixgen.vu`).
 
 ```
@@ -165,7 +166,56 @@ cd ts && VU_SPLIT=off ../vu build --release vlint.vu -o vlint   # one C file: th
 ./vlint [options] [paths]      # as oxlint; plus --jobs N, --cache, --cache-location PATH
 ```
 
-## The same monorepo with its dependencies installed (2026-11-20, latest)
+## Type-aware rules without tsgolint (2026-11-20, latest)
+
+vlint no longer runs `oxlint-tsgolint`. `--type-aware` and `--type-check` run in vlint itself: vtsc
+types the programs (the tsconfigs found as before, and tsgolint's inferred program for files no
+tsconfig has), and the type-aware rules run on vtsc's types. TypeScript 7's lib files are built in
+(`ltslib.vu`, made by `tslib/gen_tslib.py` from typescript-go 2bd066d8, the commit tsgolint
+7.0.2005 pins; Apache-2.0, `tslib/LICENSE`): 108 files, written once to the cache folder
+(`~/.cache/vlint/tslib-HASH`). Neither tsgolint nor TypeScript needs to be installed.
+
+What isn't guessed:
+
+- A file vtsc can't fully type (it uses something vtsc doesn't model, or a message would print a
+  type differently from tsc) gets neither its type check nor its type-aware rules, and is named on
+  stderr: `vlint: vtsc couldn't fully type N files, so their type check and type-aware rules
+  didn't run: ...` (`VLINT_VTSC_DEBUG=2` says why for each).
+- A type-aware rule vlint doesn't have is named on stderr with the other missing rules and reports
+  nothing. 57 of tsgolint 7.0.2005's 61 rules are ported; missing: `no-deprecated` (vtsc's parser
+  doesn't keep JSDoc yet), `no-unnecessary-condition`, `no-unnecessary-type-assertion`,
+  `prefer-optional-chain`.
+
+**On tsgolint's own test cases** (`tsgolint_parity.py RULE VTSC` runs tsgolint 7.0.2005 and vtsc on
+every case of a rule's `*_test.go` with its options and files, and compares the diagnostics: range,
+message, help, labels), for the 57 rules: 5,378 cases, 4,849 the same, 35 different, 450 that vtsc
+can't fully type (the rules don't run there; vtsc says so), 44 the harness skips. Of the cases both
+ran, 99.3% are the same. The differences: contextual types of overloaded or generic callbacks,
+class expressions, merged namespace enums, union member order for enum literals, and a few
+spread or index-signature cases.
+
+**n8n** (oxlint 1.90.0 with tsgolint 7.0.2005 against vlint, `--type-aware --type-check`, `-f unix`):
+
+- Default rules, 33 packages: 27 identical; `core` (19 lines: tsgolint doesn't resolve
+  `@n8n/decorators` from `nodes-testing`, vtsc does) and `mcp-apps` (3: vtsc doesn't make TS2835 for `vite.config.mts`) differ; tsgolint
+  runs out of memory on 3 (`eslint-config`, `chat`, `ai-utilities`).
+- All 57 rules on, 11 packages, on the files vtsc types (it leaves out 1 to 221 per package, mostly
+  tests): `scheduler` 485 messages the same and 1 different, `workflow` 883 / 4, `utils` 256 / 2,
+  `workflow-sdk` 2,111 / 34, `api-types` 377 / 8, `task-runner` 130 / 13, `permissions` 50 / 4,
+  `config` 9 / 0, `di` 9 / 0. Of those 66 differences, 22 are `no-unsafe-type-assertion` messages
+  that print a type differently (an alias where tsgolint expands it); most others are `no-unsafe-*`
+  messages where one side types an expression as `any` and the other doesn't (not investigated). In `engine` (569 / 52) tsgolint doesn't resolve
+  `typeorm`'s decorators (43 `no-unsafe-call` on an error type); in `decorators` (410 / 4,815)
+  tsgolint types compiled `.js` files lying in `src/` (outside the tsconfig) with their imports
+  unresolved and reports 4,774 messages there that vlint doesn't. `backend-common`: tsgolint exits
+  with status 1.
+
+Also fixed in vtsc on the way: an assertion signature (`asserts x is T`) returns `void` (it was
+`boolean`), so `const y: number = assertX(v)` now reports `Type 'void' is not assignable`. vtsc's
+263 checked-in cases pass. Not measured here: speed against tsgolint (the run no longer starts
+tsgolint at all).
+
+## The same monorepo with its dependencies installed (2026-11-20, with tsgolint)
 
 The repository of the next section, now with its `node_modules` linked (`pnpm install
 --ignore-scripts`), so the types resolve: tsgolint reports 210,000 messages instead of 1.55 million

@@ -49,8 +49,10 @@ no JavaScript API (oxlint's `defineConfig` isn't there; JS plugins in the config
   `--debug files`, exit codes and messages for bad usage.
 - **Bulk suppressions**: `oxlint-suppressions.json`, `--suppress-all`, `--prune-suppressions`
   (and pruning on `--fix`), as oxlint does them.
-- **Type-aware linting**: `--type-aware` / `--type-check` run `oxlint-tsgolint` (install it as you
-  would for oxlint), with all 61 type-aware rules.
+- **Type-aware linting**: `--type-aware` / `--type-check` run in vlint itself (its own TypeScript
+  checker, vtsc, with TypeScript 7's lib files built in): no `oxlint-tsgolint` and no TypeScript
+  install needed. The type-aware rules vlint doesn't have yet are named on stderr, as are files
+  whose types it can't fully work out (their type-aware rules are skipped rather than guessed).
 - **Output**: oxlint's report for terminals, its one-line agent format and every `-f` format,
   byte for byte in the cases compared, including "Found N warnings and M errors."
 - **Diagnostics**: identical (position, rule, message, help, labels, order) on date-fns, zod,
