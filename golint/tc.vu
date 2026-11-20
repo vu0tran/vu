@@ -104,6 +104,7 @@ type Pk:
   lnames: {Str: [Int]}   # lazy: top-level name -> files declaring it
   lmethods: {Str: [Int]} # lazy: receiver base type name -> files with its methods
   pkgdoc: [Str]          # lazy: each file's package doc comment text
+  dpi: Int = -1          # its files in Prog.dps (an imported package), or -1
 
 type Prog:
   pk: [Pk]
@@ -149,18 +150,24 @@ type Prog:
   tags: [Str]       # extra build tags (run.build-tags)
   # the module's sources, read already (relative path -> source), for the packages it imports
   msrc: Shared[{Str: Str}]
+  # Imported packages as read from disk and their files as parsed, once for the run, whichever worker
+  # needs them first: load_pkg takes a package's files from dsrc, ensure_file a file's tree from dast.
+  dsrc: Memo[Str, DepPkg]
+  dast: Memo[Str, DepFile]
   # (staticcheck's stdlib deprecation table, built on first use: sc.sa1019_report)
   depr: {Str: Str} = {}
   # (staticcheck's facts about the standard library, built on first use: ssa.run)
   ssa_noret: {Str: Bool} = {}
   ssa_pure: {Str: Bool} = {}
   trace: Bool = false   # (VGOLINT_T=1: each imported file parsed, on stderr)
+  fnames: {Int: Str} = {}   # (errcheck.full_name of each object asked about)
+  dps: [Shared[DepPkg]] = []   # (Pk.dpi: a package's files, from dsrc)
 
 fn empty_srcs() -> {Str: Str}:
   return {}
 
 fn new_prog(goroot: Str, modcache: Str) -> Prog:
-  var g = Prog([], {}, [], [], [], [], [], [], [], [], [], [], {}, {}, [], {}, [], [], [], [], [], [], {}, {}, {}, 0, 0, 0, goroot + "", modcache + "", "", "", [], [], scan.keywords(), [], -1, -1, [], share(empty_srcs()))
+  var g = Prog([], {}, [], [], [], [], [], [], [], [], [], [], {}, {}, [], {}, [], [], [], [], [], [], {}, {}, {}, 0, 0, 0, goroot + "", modcache + "", "", "", [], [], scan.keywords(), [], -1, -1, [], share(empty_srcs()), memo(), memo())
   # type 0: invalid; 1..25: basic
   for i in 0..NBASIC:
     g.tk.push(TY_BASIC)
@@ -646,35 +653,70 @@ fn load_pkg(var g: Prog, fs: Fs, path: Str, from_std: Bool) -> Int:
   if dir.len == 0:
     g.bypath[key] = -1
     return -1
-  let names = fs.list(dir) else []
-  var files: [Str] = []
-  for nm in names:
-    if not nm.endswith(".go") or nm.endswith("_test.go") or nm.startswith(".") or nm.startswith("_"): continue
-    if not load.good_name(nm): continue
-    files.push(nm + "")
   let pi = g.pk.len
   g.bypath[key] = pi
   var p = new_pk(path, dir)
   p.std = dir.startswith(g.goroot + "/")
   g.pk.push(p)
   g.pk[pi].lazy = true
-  var kw: {Str: Int} = {}
-  swap(&kw, &g.kw)
-  var rel = dir + "/"
-  if rel.startswith("./"): rel = rel[2..rel.len]
-  for nm in files:
-    var src = ""
-    let rp = rel + nm
-    if rp in g.msrc.value: src = g.msrc.value[rp] + ""
-    else: src = fs.read(dir + "/" + nm) else continue
-    if not load.good_constraints(src, g.tags): continue
-    let ix = index_lines(src)
-    if g.pk[pi].name.len == 0: g.pk[pi].name = ix.pkgname + ""
-    add_lazy(&g, pi, ix)
-    g.pk[pi].lsrc.push(src)
-  swap(&kw, &g.kw)
+  var tags: [Str] = []
+  for x in g.tags: tags.push(x + "")
+  let ms = g.msrc.share()
+  let dp = g.dsrc.get(dir, fn(d) => read_dep(fs, d, tags, ms))
+  for lf in 0..dp.value.ixs.len:
+    if g.pk[pi].name.len == 0: g.pk[pi].name = dp.value.ixs[lf].pkgname + ""
+    add_lazy(&g, pi, dp.value.ixs[lf])
+    g.pk[pi].lsrc.push("")
+  g.pk[pi].dpi = g.dps.len
+  g.dps.push(dp)
   g.pk[pi].ok = true
   return pi
+
+# The files of the package in dir that build with tags: their sources (the module's from ms, read
+# already) and what each declares.
+fn read_dep(fs: Fs, dir: Str, tags: [Str], ms: Shared[{Str: Str}]) -> DepPkg:
+  var out = DepPkg([], [])
+  let names = fs.list(dir) else []
+  var rel = dir + "/"
+  if rel.startswith("./"): rel = rel[2..rel.len]
+  for nm in names:
+    if not nm.endswith(".go") or nm.endswith("_test.go") or nm.startswith(".") or nm.startswith("_"): continue
+    if not load.good_name(nm): continue
+    var src = ""
+    let rp = rel + nm
+    if rp in ms.value: src = ms.value[rp] + ""
+    else: src = fs.read(dir + "/" + nm) else continue
+    if not load.good_constraints(src, tags): continue
+    out.ixs.push(index_lines(src))
+    out.srcs.push(src)
+  return out
+
+# File lf of an imported package parsed on its own (function bodies skipped)
+fn parse_dep(dp: Shared[DepPkg], lf: Int) -> DepFile:
+  var ps = parse.parser(scan.scanner(dp.value.srcs[lf] + "", scan.keywords()), ast.new_ast(), 0)
+  ps.skip = true
+  let root = parse.parse_file(&ps)
+  var t = ast.new_ast()
+  swap(&t, &ps.t)
+  var cm: [Int] = []
+  swap(&cm, &ps.sc.comments)
+  return DepFile(t, root, cm)
+
+# Adds file lf of imported package pi, parsed already (pf), as add_src adds a file it parses.
+fn add_parsed(var g: Prog, pi: Int, pf: Shared[DepFile], dp: Shared[DepPkg], lf: Int):
+  let fi = g.pk[pi].roots.len
+  let base = ast.append(&g.pk[pi].t, pf.value.t, fi)
+  let root = pf.value.root + base
+  var cm: [Int] = []
+  for x in pf.value.cmts: cm.push(x)
+  g.pk[pi].cmts.push(cm)
+  g.pk[pi].roots.push(root)
+  g.pk[pi].srcs.push(dp.value.srcs[lf] + "")
+  g.pk[pi].imps.push(ast.items(g.pk[pi].t, g.pk[pi].t.b[root]))
+  g.pk[pi].iname.push({})
+  if g.pk[pi].name.len == 0:
+    let nmid = g.pk[pi].t.s[g.pk[pi].t.a[root]]
+    g.pk[pi].name = g.pk[pi].t.names[nmid] + ""
 
 # Lazy file lf (the next one) of package pi: the names it declares and the receivers of its methods.
 fn add_lazy(var g: Prog, pi: Int, ix: Index):
@@ -699,13 +741,21 @@ fn has_at(src: Str, i: Int, w: Str) -> Bool:
 fn ensure_file(var g: Prog, pi: Int, lf: Int):
   if g.pk[pi].lparsed[lf]: return
   g.pk[pi].lparsed[lf] = true
-  var src = ""
-  swap(&src, &g.pk[pi].lsrc[lf])
-  if g.trace: eprint("TP {g.pk[pi].dir} {lf} {src.len}")
-  var kw: {Str: Int} = {}
-  swap(&kw, &g.kw)
-  add_src(&g, pi, src, true, &kw)
-  swap(&kw, &g.kw)
+  let di = g.pk[pi].dpi
+  if di >= 0:
+    # (parsed once for the run: dast)
+    let dp = g.dps[di].share()
+    let key = g.pk[pi].dir + "\n{lf}"
+    let pf = g.dast.get(key, fn(k) => parse_dep(dp, lf))
+    if g.trace: eprint("TP {g.pk[pi].dir} {lf} {dp.value.srcs[lf].len}")
+    add_parsed(&g, pi, pf, dp, lf)
+  else:
+    var src = ""
+    swap(&src, &g.pk[pi].lsrc[lf])
+    var kw: {Str: Int} = {}
+    swap(&kw, &g.kw)
+    add_src(&g, pi, src, true, &kw)
+    swap(&kw, &g.kw)
   collect_file(&g, pi, g.pk[pi].roots.len - 1)
 
 # A package-level object by name, parsing the file that declares it if needed. -1: none.
@@ -732,6 +782,18 @@ fn methods_of(var g: Prog, o: Int) -> [Int]:
   if name in g.pk[pi].mbyname:
     for m in g.pk[pi].mbyname[name]: out.push(m)
   return out
+
+# An imported package's files, read once for the run (Prog.dsrc): those that build with the run's
+# tags, their sources and what each declares.
+type DepPkg:
+  srcs: [Str]
+  ixs: [Index]
+
+# One of its files parsed on its own (Prog.dast), copied into a worker's package by ast.append.
+type DepFile:
+  t: ast.Ast
+  root: Int
+  cmts: [Int]
 
 type Index:
   pkgname: Str
