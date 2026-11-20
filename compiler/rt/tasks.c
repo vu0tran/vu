@@ -641,6 +641,9 @@ static void vu_poll(void) {
 }
 /* The current task has put itself on a wait list (or is finished): run others until it is woken. */
 static void vu_block(void) {
+#ifdef VU_MEMO
+    if (vu_memo_depth) vu_memo_parked();
+#endif
     for (;;) {
         vu_task *t = vu_ready_pop();
         if (t) {
@@ -827,6 +830,9 @@ static void vu_task_sleep(vu_cap os, double seconds, int line) {
    computation such as pbkdf2_sha256. Nothing outside a task (a par loop's threads, or before tasks start). */
 static void vu_task_yield(void) {
     if (!vu_cur_task || vu_in_par()) return;
+#ifdef VU_MEMO
+    if (vu_memo_depth) return;   /* (a Memo value being computed: see memo.c) */
+#endif
     vu_task *t = vu_cur_task;
     t->wait_kind = VU_W_SLEEP;
     t->wait_line = 0;

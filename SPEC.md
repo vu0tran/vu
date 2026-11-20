@@ -783,6 +783,35 @@ let h = share(own fn(req: Request) => answer(req, base))   # closures too: h.val
 - `.value` is read through a variable or field holding the handle, so the value stays alive while
   it's read: `make().value` is refused; write `let s = make()` first.
 
+### Memo: values computed once, shared
+
+```
+fn load(m: Memo[Str, Pkg], path: Str) -> Pkg: ...       # may ask m for other paths
+
+fn worker(own m: Memo[Str, Pkg], own path: Str):
+  let p = m.get(path, fn(x) => load(m, x))               # Shared[Pkg]: p.value
+  print(p.value.name)
+
+let m: Memo[Str, Pkg] = memo()
+spawn worker(m, "a")                                     # an own parameter gets another handle
+spawn worker(m, "b")
+```
+
+- `m.get(key, compute)` gives key's value as a `Shared[V]`. The first task (or `par` loop thread)
+  to ask for a key runs `compute(key)`; one that asks while it runs waits for it; every later call
+  gets the same value, frozen, without running `compute`. So a value is computed once however many
+  tasks need it, and no task can see it change: a Memo is a shared table that only grows, with no
+  locks to write.
+- Keys are Int, Byte, Bool or Str; values are whatever a `Shared` value can hold. `m.len()` is how
+  many values it has, `m.share()` another handle (passing it to an `own` parameter makes one too);
+  the values are freed with the last handle.
+- A computation may ask the Memo (or another) for other keys. One that needs its own key, directly or
+  through others (a's computation waits for b, whose waits for a), stops the program saying so,
+  instead of waiting forever.
+- A computation can't wait on anything else: a task waiting for its value holds its thread, so a
+  `recv`, `send` that would wait, `os.sleep`, a select or a network call inside one stops the program
+  (`spawn` is fine). It can run `par` loops; their threads can't ask for the key being computed.
+
 ### Signals and stopping
 
 `os.signals()` returns a `Chan[Str]` on which SIGTERM, SIGINT and SIGHUP arrive (as `"TERM"`,

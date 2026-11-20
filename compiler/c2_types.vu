@@ -149,7 +149,7 @@ type G:
   par_var: Str = ""
   par_line: Int = 0
   par_elems: {Int: Int} = {}
-  uses_par, uses_float_parse, uses_tasks: Bool = false
+  uses_par, uses_float_parse, uses_tasks, uses_memo: Bool = false
   tcache: {Int: Str} = {}
   scache: {Int: Str} = {}
   ecache: {Int: Bool} = {}
@@ -307,6 +307,7 @@ fn tkind(g: G, t: Str) -> Str:
     return "fn"
   if t.startswith("Chan["): return "chan"
   if t.startswith("Shared["): return "shared"
+  if t.startswith("Memo["): return "memo"
   if t == "Conn" or t == "Listener": return "ext"
   if t.len > 0 and t[0] == '[': return "list"
   if t.len > 0 and t[0] == '{': return "map"
@@ -326,6 +327,7 @@ fn inner_of(t: Str) -> Str:
   if t[t.len - 1] == '?': return t[0..t.len - 1]
   if t.startswith("Chan["): return t[5..t.len - 1]
   if t.startswith("Shared["): return t[7..t.len - 1]
+  if t.startswith("Memo["): return t[5..t.len - 1]
   return t[1..t.len - 1]
 
 # "{K: V}" -> the position of the ": " that separates K and V
@@ -428,6 +430,9 @@ fn tn(t: Str) -> Str:
     return s
   if t.startswith("Chan["): return "Chan[" + tn(t[5..t.len - 1]) + "]"
   if t.startswith("Shared["): return "Shared[" + tn(t[7..t.len - 1]) + "]"
+  if t.startswith("Memo[{{"):
+    let mi = t[5..t.len - 1]
+    return "Memo[" + tn(map_key(mi)) + ", " + tn(map_val(mi)) + "]"
   if t[0] == '[': return "[" + tn(t[1..t.len - 1]) + "]"
   if t[0] == '{':
     let s = map_split(t)
@@ -458,6 +463,7 @@ fn ct(g: G, t: Str) -> Str:
   if k == "list": return "L_" + mg(g, inner_of(t))
   if k == "chan": return "vu_chan *"
   if k == "shared": return "vu_sh_" + mg(g, inner_of(t)) + " *"
+  if k == "memo": return "vu_memo *"
   if k == "fn" or k == "lfn": return "vu_fn"
   if k == "map" or k == "res" or k == "iface": return mg(g, t)
   return ct(g, inner_of(t)) + "*"
@@ -487,6 +493,7 @@ fn mg(g: G, t: Str) -> Str:
     return "R_" + mg(g, inner_of(t))
   if k == "chan": return "C_" + mg(g, inner_of(t))
   if k == "shared": return "H_" + mg(g, inner_of(t))
+  if k == "memo": return "Q_" + mg(g, inner_of(t))
   if k == "fn" or k == "lfn":
     let f = fn_parts(t)
     var s = "FP"
@@ -525,6 +532,9 @@ fn reg(var g: G, t: Str) -> Str:
       let val = map_val(t)
       let vk = tkind(g, val)
       if vk == "list" or vk == "opt" or vk == "map" or vk == "chan": reg(&g, val)
+    elif k == "memo":
+      # (its values are handed out as Shared values)
+      reg(&g, "Shared[" + map_val(inner_of(t)) + "]")
     g.typeset[t] = true
     g.types.push(t)
   return t
@@ -548,6 +558,8 @@ fn shared_bad(g: G, t: Str, var seen: {Str: Bool}) -> Str:
   # a channel is safe to share whatever it carries: a task takes a value out of it to own (a pool of
   # connections in a Chan[pg.Db] is how tasks share connections), so no two tasks use one at once
   if k == "chan": return ""
+  # (a Memo's values are frozen once computed, and it's locked while one is added)
+  if k == "memo": return ""
   if k == "list" or k == "opt" or k == "shared": return shared_bad(g, inner_of(t), &seen)
   if k == "map": return shared_bad(g, map_val(t), &seen)
   if k == "struct" or k == "enum":
@@ -613,6 +625,25 @@ fn resolve(var g: G, t: Str, line: Int) -> Str:
     let inner = resolve(&g, inner_of(t), line)
     shared_check(g, inner, line)
     return reg(&g, "Shared[" + inner + "]")
+  if k == "memo":
+    # Memo[K, V] as written, or Memo[{K: V}] (how it's kept)
+    var mk = ""
+    var mv = ""
+    let body = t[5..t.len - 1]
+    if body.startswith("{{"):
+      mk = map_key(body)
+      mv = map_val(body)
+    else:
+      let parts = split_targs(body)
+      if parts.len != 2: err(g, line, "a Memo has a key type and a value type: Memo[Str, T]")
+      mk = parts[0]
+      mv = parts[1]
+    let key = resolve(&g, mk, line)
+    let val = resolve(&g, mv, line)
+    if key != "Int" and key != "Str" and key != "Byte" and key != "Bool": err(g, line, "a Memo's keys can be Int, Byte, Bool or Str, not " + tn(key))
+    shared_check(g, val, line)
+    g.uses_memo = true
+    return reg(&g, "Memo[{{" + key + ": " + val + "}}]")
   if t == "Conn" or t == "Listener": g.uses_tasks = true
   if k == "map":
     let key = resolve(&g, map_key(t), line)
@@ -642,6 +673,7 @@ fn has_cap(g: G, t: Str, var seen: {Str: Bool}) -> Bool:
   let k = tkind(g, t)
   if k == "cap": return true
   if k == "list" or k == "opt" or k == "res" or k == "chan" or k == "shared": return has_cap(g, inner_of(t), &seen)
+  if k == "memo": return has_cap(g, map_val(inner_of(t)), &seen)
   if k == "map": return has_cap(g, map_val(t), &seen)
   if k == "struct" or k == "enum":
     if t in seen: return false
@@ -696,7 +728,7 @@ fn define(var g: G, name: Str, line: Int):
   g.top[name] = line
 
 fn is_builtin(n: Str) -> Bool:
-  return is_crypto_builtin(n) or n == "assert" or n == "ord" or n == "chr" or n == "share" or n == "print" or n == "panic" or n == "sqrt" or n == "fma" or n == "float" or n == "int" or n == "min" or n == "max" or n == "abs" or n == "arg" or n == "byte" or n == "write" or n == "str" or n == "bytes" or n == "exit" or n == "eprint" or n == "args" or n == "swap" or n == "sorted" or n == "chan" or n == "to_json" or n == "from_json"
+  return is_crypto_builtin(n) or n == "assert" or n == "ord" or n == "chr" or n == "share" or n == "print" or n == "panic" or n == "sqrt" or n == "fma" or n == "float" or n == "int" or n == "min" or n == "max" or n == "abs" or n == "arg" or n == "byte" or n == "write" or n == "str" or n == "bytes" or n == "exit" or n == "eprint" or n == "args" or n == "swap" or n == "sorted" or n == "chan" or n == "memo" or n == "to_json" or n == "from_json"
 
 fn is_crypto_builtin(n: Str) -> Bool:
   return n == "sha256" or n == "sha1" or n == "hmac_sha256" or n == "pbkdf2_sha256" or n == "random_bytes" or n == "b64encode" or n == "b64decode" or n == "from_hex"
@@ -1136,6 +1168,7 @@ fn caps_walk(g: G, t0: Str, var seen: {Str: Bool}, var out: [Str]):
   if k == "cap":
     if not has_str(out, t): out.push(t + "")
   elif k == "list" or k == "opt" or k == "chan" or k == "shared": caps_walk(g, inner_of(t), &seen, &out)
+  elif k == "memo": caps_walk(g, map_val(inner_of(t)), &seen, &out)
   elif k == "map": caps_walk(g, map_val(t), &seen, &out)
   elif k == "struct" or k == "enum":
     for f in info_fields(g, t): caps_walk(g, f.ty, &seen, &out)
@@ -1247,6 +1280,7 @@ fn type_arg_check(var g: G, a: Str, line: Int):
 fn type_depth(g: G, t: Str) -> Int:
   let k = tkind(g, t)
   if k == "list" or k == "opt" or k == "chan" or k == "shared": return 1 + type_depth(g, inner_of(t))
+  if k == "memo": return 1 + type_depth(g, map_val(inner_of(t)))
   if k == "map": return 1 + max(type_depth(g, map_key(t)), type_depth(g, map_val(t)))
   if (k == "struct" or k == "enum") and t in g.inst_of:
     var d = 0
@@ -1512,6 +1546,7 @@ fn field_type(g: G, bt: Str, name: Str, line: Int) -> Str:
     if name == "value": return inner_of(bt)
     err(g, line, "a Shared value has .value (what it holds, read-only) and .share() (another handle to it), not ." + name)
   if k == "map": err(g, line, "maps have .len, .get(key, default) and .remove(key), not ." + name)
+  if k == "memo": err(g, line, "a Memo has .get(key, compute), .share() and .len(), not ." + name)
   if k == "iface": err(g, line, "a " + tn(bt) + " (an interface value) has no fields; call its functions, like " + disp(g.ifaces[bt][0]) + "(x)")
   if k != "struct": err(g, line, tn(bt) + " has no fields")
   let ft = struct_field(g, bt, name)

@@ -3016,3 +3016,24 @@ thread, 32.7 s profiled against 27.1 s, now 29.2 s. Quick builds keep every fram
 backtraces), and release builds have none, as before. `tests/run_profile.py` checks the leaf case
 (tests/profile/leaf.vu). On this Mac, two of its other checks (samples per second, burn's share in
 tasks.vu) fail with the old compiler and the new one alike; the gate wasn't run (it needs Linux).
+
+**Memo (2026-11-20).** `Memo[K, V]` (`memo()`), a table that tasks fill once and then share:
+`m.get(key, compute)` runs `compute(key)` the first time any task asks for key (one that asks while
+it runs waits) and hands every caller the same frozen `Shared[V]`. Tasks still share no mutable
+state they can see: a value never changes once it's in, and the table's lock is held only to find,
+claim or fill an entry (`compiler/rt/memo.c`, one lock for every Memo so that a cycle across two is
+seen too). Waiting holds the waiting task's thread, so a computation can't park its own task: the
+scheduler stops the program if one tries (`vu_block` with `vu_memo_depth > 0`), and `vu_task_yield`
+doesn't yield there. A computation that needs its own key, directly or through other threads'
+computations, stops the program with that message instead of hanging. Kept as `Memo[{K: V}]`, so the
+map helpers find its key and value types. Tests: tests/targeted/769 to 780 (computed once across 8
+tasks and a par loop with nested gets, checked against Python; a cycle within one task and across
+two; a wait inside a computation; Int, Bool and Str keys with the empty Str, values owning lists, a
+Memo in a struct and in a Shared value, a computation running a par loop and spawning a task; the
+refused types and calls). Attack rounds: the first found only mistakes in my tests (a channel that
+already held a value, so nothing waited; a miscounted total; `own` missing for spawn; an error's
+wording); the second found nothing. ThreadSanitizer (clang) reported nothing on the task tests; the
+par ones can't be built with it on macOS (no OpenMP in Apple's clang) and were run under ASan/UBSan.
+Not done: Memo in generic functions, and in `--lib` exports (a panic caught there would leave a key
+being computed). vgolint is its first user: each imported package is read, and each of its files
+parsed, once for all the workers.
