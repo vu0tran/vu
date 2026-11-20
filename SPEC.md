@@ -1148,10 +1148,13 @@ another part: functions are grouped by source file, so calls within a module sti
   CPU time went: by function (self, and total with what it calls) and by line, from a sample of each
   thread's call stack at every tick of the kernel's CPU timer (often 250 a second, across all
   threads). `vu-profile.txt` has all of it, and `vu-profile.folded` one stack per sample for
-  `flamegraph.pl` or speedscope (`VU_PROF_OUT=prefix` moves them). The profiled program keeps every
-  call's frame and the line it's at, which made the benchmarks 1.0x (`par` loops) to 2.5x
-  (spectralnorm) slower, and the optimizer moves work between neighbouring lines, so shares by line
-  are approximate; by function they're the program's.
+  `flamegraph.pl` or speedscope (`VU_PROF_OUT=prefix` moves them). The profiled program keeps each
+  call's frame and the line it's at; a small leaf function (no loop, no call to another of the
+  program's functions) keeps none, so its time is counted on its caller's line, as if it were
+  inlined (its frame would cost more than it does, and that cost would be counted as its own). The
+  optimizer moves work between neighbouring lines, so shares by line are approximate. It's built
+  with the release builds' `-O3`; the frames made vgolint's run 1.08x slower (single-threaded, user
+  time) and a loop calling a two-push function 1.17x.
 - **`vu lsp`** speaks the Language Server Protocol on standard input and output: the compiler's
   error for each open file (re-checked on every change), and formatting with `vu fmt`.
 - **Other machines**: Vu runs on Linux on x86-64 and ARM64 (`tests/run_arm64.sh` runs the test

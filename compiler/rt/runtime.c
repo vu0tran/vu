@@ -74,7 +74,9 @@ VU_G char **vu_argv;
    Optimized builds compile VU_ENTER and VU_AT away and report only the panic's own line. */
 VU_G const char *const *vu_files;
 VU_G bool vu_json;   /* report panics as JSON (vu run --json, or VU_PANIC=json at run time) */
-typedef struct vu_frame { const char *name; int loc; struct vu_frame *prev; } vu_frame;
+/* (tp: where vu_top is, for --profile builds: a thread-local's address is a function call on macOS,
+   so a frame looks it up once, on entry, and leaves through it) */
+typedef struct vu_frame { const char *name; int loc; struct vu_frame *prev; struct vu_frame **tp; } vu_frame;
 VU_G __thread vu_frame *vu_top;
 static inline void vu_leave(vu_frame *f) { vu_top = f->prev; }
 /* x.sin(), y.atan2(x), x.pow(y)...: the C math library's functions, called through pointers the
@@ -115,19 +117,26 @@ VU_G __thread char *vu_lib_msg;
 #if defined(VU_TRACE) && defined(VU_PROF)
 /* (the profiler's signal handler reads the frames: each must be complete before vu_top points at it,
    and the optimizer must keep the stores to vu_top, which no code it can see reads) */
-static inline void vu_leave_prof(vu_frame *f) { __asm__ volatile("" ::: "memory"); vu_top = f->prev; }
-#define VU_ENTER(n) vu_frame vu_fr __attribute__((cleanup(vu_leave_prof))) = {n, 0, vu_top}; __asm__ volatile("" ::: "memory"); vu_top = &vu_fr; __asm__ volatile("" ::: "memory")
+static inline void vu_leave_prof(vu_frame *f) { __asm__ volatile("" ::: "memory"); *f->tp = f->prev; }
+#define VU_ENTER(n) vu_frame **const vu_tp = &vu_top; vu_frame vu_fr __attribute__((cleanup(vu_leave_prof))) = {n, 0, *vu_tp, vu_tp}; __asm__ volatile("" ::: "memory"); *vu_tp = &vu_fr; __asm__ volatile("" ::: "memory")
+/* A small leaf function (no loop, no call to another Vu function: gen_fn_node) has no frame of its own
+   here: what it costs is counted on its caller's line, as if it were inlined, and the profile doesn't
+   carry the frame's own cost, several times the function's on one that small. VU_AT's stores go to a
+   local nothing reads. */
+#define VU_ENTER_LEAF(n) vu_frame vu_fr = {n, 0, 0, 0}; (void)vu_fr
 #define VU_AT(l) (*(volatile int *)&vu_fr.loc = (l))   /* (a store the optimizer keeps: the signal reads it) */
 #define VU_PAR_TOP(t) vu_frame *const t = vu_top
 #define VU_PAR_JOIN(t) (vu_top = (t))
 #elif defined(VU_TRACE)
 #define VU_ENTER(n) vu_frame vu_fr __attribute__((cleanup(vu_leave))) = {n, 0, vu_top}; vu_top = &vu_fr
+#define VU_ENTER_LEAF(n) VU_ENTER(n)
 #define VU_AT(l) (vu_fr.loc = (l))
 /* par loop worker threads chain their calls to the frame of the function running the loop */
 #define VU_PAR_TOP(t) vu_frame *const t = vu_top
 #define VU_PAR_JOIN(t) (vu_top = (t))
 #else
 #define VU_ENTER(n) ((void)0)
+#define VU_ENTER_LEAF(n) ((void)0)
 #define VU_AT(l) ((void)0)
 #define VU_PAR_TOP(t) ((void)0)
 #define VU_PAR_JOIN(t) ((void)0)

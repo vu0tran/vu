@@ -60,6 +60,13 @@ folded = open(os.path.join(work, 'hot.folded')).read().split('\n') if os.path.ex
 stacks = [l for l in folded if l]
 check('vu-profile.folded has one stack per sample, from main down', len(stacks) == n and all(re.fullmatch(r'main(;\w+)* hot\.vu:\d+ 1', l) for l in stacks), stacks[:5])
 
+leaf = build('leaf')
+r = run(leaf, '4000000')
+s = shares(r.stderr)
+lines = re.findall(r'^\s+([\d.]+)\s+leaf\.vu:(\d+) in (\S+)$', r.stderr, re.M)
+check(f'a small leaf function has no frame: its time is its caller\'s, on the calling line (step {s.get("step")}, run {s.get("run")})',
+      r.returncode == 0 and s.get('step', (0, 0))[1] < 2 and s.get('run', (0, 0))[1] > 80 and lines and lines[0][1:] == ('18', 'run'), r.stderr)
+
 tasks = build('tasks')
 r = run(tasks)
 s = shares(r.stderr)

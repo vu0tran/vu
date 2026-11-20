@@ -3000,3 +3000,19 @@ Attack rounds on field defaults:
    default; it lists them now.)
 
 Not done: defaults on generic types' fields, and `from_json` filling a missing field from its default.
+
+**The profiler and small functions (2026-11-20).** `--profile` reported vgolint spending 10.6% of
+its time in `ast.node`, a function of ten list pushes; in the release build it's about 1% (macOS's
+`sample`). Every call kept a frame on the shadow stack, between compiler barriers, and on macOS each
+access to the thread-local stack pointer is a call (`_tlv_get_addr`), two per Vu call: on a function
+that small the frame costs several times the function, and the profile counted it as the function's
+time. Now a small leaf function (no loop, no call to another of the program's functions:
+`small_leaf` in c5_build.vu) keeps no frame in profiled builds and its time is its caller's, on the
+calling line, as with inlining; other frames look the stack pointer up once (`vu_frame.tp`); and
+profiled builds use `-O3`, as release builds do (they used `-O2`). Measured on this Mac: a loop
+calling a two-push function took 0.43 s of user time profiled against 0.24 s in release, now 0.28 s,
+and its time moved from the function (97%) to the calling line; vgolint on 2,981 packages, one
+thread, 32.7 s profiled against 27.1 s, now 29.2 s. Quick builds keep every frame (panic
+backtraces), and release builds have none, as before. `tests/run_profile.py` checks the leaf case
+(tests/profile/leaf.vu). On this Mac, two of its other checks (samples per second, burn's share in
+tasks.vu) fail with the old compiler and the new one alike; the gate wasn't run (it needs Linux).
