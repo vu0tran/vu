@@ -125,6 +125,17 @@ is mostly the imported packages each worker loads, parses and type-checks for it
 quarter of the time): sharing them would take one type-checked copy built before the workers start,
 which this design can't build in parallel.
 
+**Imported packages once for all workers (Memo, 2026-11-20): about 4.1 s uncached.** With Vu's
+`Memo` (SPEC.md), an imported package's files are read and indexed once for the run, by whichever
+worker needs the package first (`tc.read_dep`, keyed by folder), and each of its files parsed once
+(`tc.parse_dep`); a worker copies a parsed file into its own package (`ast.append`: nodes renumbered,
+names appended, not interned again). The exclusion rules' patterns are compiled once for the run the
+same way. On the 2,981 packages: 4.06 to 4.11 s (4.8 to 5.4 before), system time 4.6 to 2.8 s; byte
+for byte the same output, cached and uncached. One worker takes 24.3 s of user time and ten 32.7 s:
+what the ten still do each for themselves is mostly type-checking the imported declarations they use
+(shared, it would need their objects and types numbered apart from each worker's, and types compared
+by structure rather than by number), and copying the parsed files.
+
 ## Drop-in status
 
 ### Commands
