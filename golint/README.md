@@ -111,6 +111,20 @@ the same set). `VGOLINT_T=1` prints each phase's time and each package over 0.3 
 left is mostly type-checking the imported packages, which each of the 10 workers does for itself
 (11,274 loads of 3,734 packages there).
 
+**Later the same day: 4.8 to 5.4 s uncached, 0.6 s cached.** Each worker allocated its rule patterns
+and staticcheck's standard library tables again (now once per worker, on first use, and a rule's
+patterns only when an issue of one of its linters meets it); the module's files are read on 4 threads
+(macOS opens files more slowly from more at once: 0.45 s against 0.22 for these 16,445); most of
+staticcheck's checks get only the nodes of the kind they look at, from one pass, instead of each
+walking all of them; children are walked without building a list per node; unused's edges are keyed
+by Int; a linted package's tables are dropped once it's done. Measured: user time 37.7 to 35.5 s,
+system 6.5 to 4.6 s. What doesn't pay here: workers by region of the tree (each still loads 1,200 to
+1,500 imported packages, most of them imported all over the repo), and parsing a big imported file a
+declaration at a time (496 to 304 MB parsed, 6.5 to 5.5 GB of memory, the same time). What's left
+is mostly the imported packages each worker loads, parses and type-checks for itself (about a
+quarter of the time): sharing them would take one type-checked copy built before the workers start,
+which this design can't build in parallel.
+
 ## Drop-in status
 
 ### Commands

@@ -138,6 +138,7 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
     lints.run(&g, fs, pi, p, c, &dict, w2.nodes, &issues)
   if cfg.is_enabled(c, "copyloopvar") and gover < 22: issues = drop_linter(issues, "copyloopvar")
   swap(&p.t, &g.pk[pi].t)
+  tc.drop_target(&g, pi)
   var kept: [pkg.Issue] = []
   var ord: [Int] = []
   for i in 0..issues.len: ord.push(i)
@@ -149,7 +150,7 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
   if not rs_ready and (kept.len > 0 or cfg.is_enabled(c, "nolintlint")):
     rs = proc.compile_all(c)
     rs_ready = true
-  let res = proc.process_pkg(c, rs, p, kept, &cnt, diff, ch)
+  let res = proc.process_pkg(c, &rs, p, kept, &cnt, diff, ch)
   return Res(0, res, cnt, [])
 
 # errcheck's issues come sorted by file name, then position; everything else keeps its order.
@@ -184,28 +185,31 @@ fn rank_of(is: pkg.Issue) -> Int:
     if names[i] == is.linter: return 10000000 + i * 100000 + local
   return 90000000 + local
 
-fn worker(fs: Fs, os: Os, tm: Bool, own msrc: Shared[{Str: Str}], own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: Chan[Int], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str, gover: Int):
+fn worker(fs: Fs, os: Os, tm: Bool, own msrc: Shared[{Str: Str}], own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str, gover: Int):
   var kw = scan.keywords()
   var g = tc.new_prog(goroot, modcache)
   g.msrc = msrc
+  g.trace = tm
   for t in conf.value.build_tags: g.tags.push(t + "")
   tc.read_gomod(fs, &g, modroot)
   var rs = proc.Rxs([], [], [], [], [], [], [], [], [], [])
   var rs_ready = false
   var dict = lints.Dict({}, {}, {}, [], [])
   if cfg.is_enabled(conf.value, "misspell"): dict = lints.new_dict(conf.value)
-  while true:
-    # (a job is a run of packages next to each other: start << 24 | end)
-    let jb = jobs.recv() else -1
-    if jb < 0:
-      if tm: eprint("T worker: {g.pk.len} packages loaded, done at {os.clock()}")
-      return
-    for i in (jb >> 24)..(jb & 16777215):
+  # (its own region first, then the next ones': each channel is filled and closed before it starts)
+  var ri = 0
+  while ri < jobs.len:
+    let i = jobs[ri].recv() else -1
+    if i < 0:
+      ri += 1
+      continue
+    if true:
       let ts = os.clock()
       var r = lint_one(fs, specs.value[i], &g, &kw, gover, conf.value, &rs, &rs_ready, diff, chg.value, &dict)
       if tm and os.clock() - ts > 0.3: eprint("T package {specs.value[i].path}: {os.clock() - ts} (ends at {os.clock()})")
       r.idx = i
       res.send(r)
+  if tm: eprint("T worker: {g.pk.len} packages loaded, done at {os.clock()}")
 
 # The cache key of each package: the run's hash h, its files, and for each package of the module it
 # imports, that package's hash without its tests (its non-test files and theirs, transitively); an
@@ -978,7 +982,9 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
       if d.path == ".": rpaths.push(nm + "")
       else: rpaths.push(d.path + "/" + nm)
   let nrp = rpaths.len
-  let nch = 64
+  # (4 threads: on macOS, opening files from more at once is slower, 0.45 s against 0.22 for these
+  # 16,445 files, the kernel's time tripling)
+  let nch = 4
   var rtext: [[Str]] = []
   var rok: [[Bool]] = []
   for _ in 0..nch:
@@ -1049,11 +1055,11 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     for k in 0..n: cpaths.push(cdir + "/p" + keys[k])
     var ct: [[Str]] = []
     var cok: [[Bool]] = []
-    for _ in 0..64:
+    for _ in 0..4:
       ct.push([])
       cok.push([])
-    par for q in 0..64: read_chunk(fs, cpaths, q, n, 64, &ct[q], &cok[q])
-    for q in 0..64:
+    par for q in 0..4: read_chunk(fs, cpaths, q, n, 4, &ct[q], &cok[q])
+    for q in 0..4:
       for x in 0..ct[q].len:
         var t = ""
         swap(&t, &ct[q][x])
@@ -1097,24 +1103,41 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     var sorted: [Int] = []
     for pth in paths:
       for k in bypath[pth]: sorted.push(k)
-    # (the largest packages go first, one by one, so that none is left running alone at the end)
+    # Each worker gets a region of that order, a run of folders with about the same amount of source
+    # (neighbouring folders import mostly the same packages, and each worker loads its own copy of
+    # what its packages import); in its region the 2 largest packages go first. A worker whose region
+    # is done takes packages from the next regions'.
     var wt: [Int] = []
+    var total = 0
     for k in sorted:
       var b = 0
       for f in specs[k].files: b += msrc.value.get(f, "").len
       wt.push(b)
-    var byw: [Int] = []
-    for i in 0..sorted.len: byw.push(i)
-    byw.sort(by: fn(a, b) => wt[a] > wt[b] or (wt[a] == wt[b] and a < b))
-    var nheavy = jobs * 2
-    if nheavy > sorted.len: nheavy = sorted.len
-    var heavy = [false] * sorted.len
+      total += b
     var ordered: [Int] = []
-    for q in 0..nheavy:
-      heavy[byw[q]] = true
-      ordered.push(sorted[byw[q]])
-    for i in 0..sorted.len:
-      if not heavy[i]: ordered.push(sorted[i])
+    var rlen: [Int] = []
+    var i0 = 0
+    for r in 0..jobs:
+      var i1 = i0
+      var acc = 0
+      let want = total * (r + 1) / jobs - total * r / jobs
+      while i1 < sorted.len and (acc < want or r == jobs - 1):
+        acc += wt[i1]
+        i1 += 1
+      # (its two largest first)
+      var big1 = -1
+      var big2 = -1
+      for i in i0..i1:
+        if big1 < 0 or wt[i] > wt[big1]:
+          big2 = big1
+          big1 = i
+        elif big2 < 0 or wt[i] > wt[big2]: big2 = i
+      if big1 >= 0: ordered.push(sorted[big1])
+      if big2 >= 0: ordered.push(sorted[big2])
+      for i in i0..i1:
+        if i != big1 and i != big2: ordered.push(sorted[i])
+      rlen.push(i1 - i0)
+      i0 = i1
     pending = ordered
     var lspecs: [Spec] = []
     for k in pending:
@@ -1123,19 +1146,20 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
       lspecs.push(Spec(specs[k].dir + "", fl, specs[k].path + ""))
     let shared = share(lspecs)
     let sch = share(ch)
-    let jc: Chan[Int] = chan(np + 1)
     let rc: Chan[Res] = chan(np + 1)
-    for q in 0..nheavy: jc.send((q << 24) | (q + 1))
-    var at = nheavy
-    while at < np:
-      var sz = (np - at) / (jobs * 3)
-      if sz < 1: sz = 1
-      if sz > 64: sz = 64
-      jc.send((at << 24) | (at + sz))
-      at += sz
-    jc.close()
+    var chs: [Chan[Int]] = []
+    var at = 0
+    for r in 0..jobs:
+      let rch: Chan[Int] = chan(rlen[r] + 1)
+      for q in at..at + rlen[r]: rch.send(q)
+      rch.close()
+      at += rlen[r]
+      chs.push(rch)
     if tm: eprint("T workers start: {os.clock() - t0} at {os.clock()}")
-    for k in 0..jobs: spawn worker(fs, os, tm, msrc, shared, shc, sch, diff, jc, rc, ".", goroot + "", modcache + "", gover)
+    for k in 0..jobs:
+      var mine: [Chan[Int]] = []
+      for q in 0..jobs: mine.push(chs[(k + q) % jobs].share())
+      spawn worker(fs, os, tm, msrc, shared, shc, sch, diff, mine, rc, ".", goroot + "", modcache + "", gover)
     for k in 0..np:
       var r = rc.recv()?
       let si = pending[r.idx]
