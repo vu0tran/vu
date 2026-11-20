@@ -165,6 +165,148 @@ cd ts && VU_SPLIT=off ../vu build --release vlint.vu -o vlint   # one C file: th
 ./vlint [options] [paths]      # as oxlint; plus --jobs N, --cache, --cache-location PATH
 ```
 
+## The same monorepo with its dependencies installed (2026-11-20, latest)
+
+The repository of the next section, now with its `node_modules` linked (`pnpm install
+--ignore-scripts`), so the types resolve: tsgolint reports 210,000 messages instead of 1.55 million
+and does far more work (about 400 s of CPU). Its own config, `--disable-nested-config`,
+`-A typescript/no-misused-promises` (tsgolint 7.0.2005 panics in that rule on a computed property
+name; oxlint stops there, see below), tsgolint 7.0.2005, 10 cores (wall seconds):
+
+| run | oxlint 1.90.0 | vlint 0.4.2 | vlint now |
+|---|---:|---:|---:|
+| no cache | 90.1, 90.7 | 61.7, 64.5 | 55.1 to 64.4 |
+| `--cache`, nothing changed | (no cache) | (cache off on macOS) | 5.8 to 7.0 |
+| `--cache`, the largest tsgolint program changed | | | 10.4 |
+
+Without a cache the run is bound by CPU: tsgolint's ~400 s and the linting's ~120 s (vlint and the
+plugin's node processes) need at least 47 s on 10 cores, so no scheduling makes it 5 times
+oxlint's. More tsgolint processes than 3 are slower (4: 68.7 s, 5: 65.1, 6: 82.2): they and the
+linting compete for the cores.
+
+**tsgolint's results are cached** with `--cache` (`.vlintcache-tsgolint` next to `.vlintcache`;
+`VLINT_TSGO_CACHE=0` turns it off), one entry per tsgolint program (tsgolint's own assignment of
+files to tsconfigs, read as before). A program's key: its files (path, rules, size, times, inode)
+and those of every file they import, followed through the module graph (not into
+`node_modules`), plus for all programs tsgolint's and vlint's executables, `--type-check`, the
+lockfile and `node_modules/.modules.yaml`, the tsconfigs and the files they extend or reference,
+and every `.d.ts` under the folder (an ambient one that nothing imports and the linting ignores
+still types the programs that include it). A run sends tsgolint only the programs whose key
+changed, once the module graph is built, and the cached messages come back program by program, so
+a warm run's output is the same bytes as a cold one's. A message for a file outside the run keeps
+it from being saved. Checked on a two-package workspace against an uncached run and oxlint after
+each of: a change in the other package (through `node_modules/@scope/pkg`), in an imported file
+the linting ignores, through a tsconfig `paths` alias, in a global `.d.ts` the tsconfig includes,
+in an ignored ambient `.d.ts` nothing imports (missed before the `.d.ts` walk), and in the
+tsconfig itself.
+
+**The cache was off on macOS**: its key hashed `/proc/self/exe`, which macOS doesn't have, and a
+failed read turned the cache off without a word (in vgolint too). The executable is now found with
+`_NSGetExecutablePath` there (`lcache.self_exe`), also for vtsc's keys.
+
+**Diagnostics on the wrong files.** Node's `readline` ends a line at U+2028 and U+2029, which JSON
+leaves as they are: one file holding a U+2028 was read by the plugin host as two requests and
+answered twice, and from then on every answer of that node process went to the file after its
+own. That was the ~5,000 JS plugin diagnostics that changed from run to run (in vlint 0.4.2 too,
+and taken for noise: oxlint's output doesn't change). Requests are now written with those two
+escaped (`vl_write_req`). Also fixed while comparing with oxlint here (each checked on a probe
+against oxlint):
+
+- unused-directive reports for comments that only suppress tsgolint diagnostics (372 here): the
+  linting reports unused directives before tsgolint's messages come; now the directives those
+  messages hit count as used and the comments' records are made again (`ta_fix_unused`);
+- react-perf and `jsx-no-useless-fragment`: a call at the end of an optional chain (`a?.b.map(f)`)
+  is a ChainExpression in oxc, not a call; a parameter's own default (`a = []`) isn't checked by
+  oxc 1.90, only defaults inside patterns; a function declared after an `async` arrow in its body
+  wasn't found (`async` was looked for in the whole function);
+- `promise/always-return`: oxc's graph reaches a `finally` only by Finalize edges, which the rule's
+  search doesn't follow, so a `catch` that can end normally, or a `try` without one, ends a path
+  with no return;
+- `no-unused-vars`: names declared in a `for` header were never reported (the header's
+  declaration has no modifiers field, read as every bit: exported and ambient), and `i += 1` in the
+  update reassigns `i` only to itself (oxc's climb from it meets no expression statement);
+- `react/no-this-in-sfc` ran in `.ts` files; `exhaustive-deps` took an enum declared in the
+  component for an outer-scope value.
+
+Left, against oxlint on this repository (277,584 lines): 40 unused directives and 4 diagnostics of
+`react/preserve-manual-memoization`, which vlint doesn't implement; one `react/immutability`
+(a hoisted function called from a callback passed to the hook whose result it reads); and 28 lines
+whose union members tsgolint orders differently from run to run (oxlint's own runs differ there).
+With nested configs on, oxlint 1.90.0 and vlint both stop at the first nested config: its JS
+plugin `eslint-plugin-react-hooks` is registered twice ("Plugin name 'react-hooks-js' is already
+registered"); they name different configs, as they read them in a different order.
+
+**Every package's own lint scripts** (`lint`, `lint:react19`, `lint:source`...: 109 command lines
+built as the repository's `scripts/oxlint/package.mts` builds them, each package's config with its
+overrides, `--type-aware`, its ignore patterns, `--report-unused-disable-directives-severity error`,
+`--format stylish`): 101 give oxlint 1.90.0's output and exit code. The other 8: six differ only by
+`react/preserve-manual-memoization` (vlint doesn't implement it), and on opshub oxlint stops at
+tsgolint's `no-misused-promises` panic where vlint leaves that rule out of the files it crashes
+on (and says so on stderr). Both took about 3 minutes for the 109 runs without a cache (oxlint
+188 s, vlint 172 s). Found and fixed on the way: `node/no-process-env`, `react/forbid-dom-props`,
+`react/no-array-index-key` and `next/no-duplicate-head` (ported, `rmore4.vu`), `no-empty-pattern`'s
+`allowObjectPatternsAsParameters`, a file linted twice when two paths on the command line reach it
+(`seller-flow .`), and the unused-directive records above matched by their text, which is empty
+in the stylish format. The packages' configs turn on 55 more rules vlint doesn't implement (the
+`next/*` set, some vitest and react ones); none of them reports anything in this repository.
+
+## A 36,000-file monorepo, type-aware (2026-11-11)
+
+A private monorepo (`js/`: 73 workspaces, 36,060 files, its own `.oxlintrc.json`: 297 rules,
+`typeAware`, a local JS plugin; `--disable-nested-config`, as the nested configs' JS plugins
+weren't installed; no `node_modules`, so types are mostly `any` and the type-aware rules report
+1.55 million diagnostics). Apple silicon, 10 cores, tsgolint 7.0.2005, median of 3 runs (wall
+seconds):
+
+| output | oxlint 1.90.0 | vlint before | vlint now |
+|---|---:|---:|---:|
+| default | 36.76 | 63.40 | 28.69 |
+| `-f json` | 37.54 | 57.03 | 26.79 |
+
+tsgolint itself takes 20.3 s on this payload (91 s of CPU); it is now most of vlint's run, so this
+is about as fast as one tsgolint run allows. Where the time went before (`-f json`, 61.6 s): the
+files linted (6.5 s), then tsgolint (20.5 s), then its 510 MB of output parsed on one thread
+(6.3 s), its 1.55 million messages made into diagnostics on one thread (23.9 s), and the output
+written (4 s). What changed:
+
+1. **A line index per message.** Each tsgolint message copied its file's text and found the file's
+   line starts again: now once per file. 23.9 s -> 6.6 s, then on all cores (`par for`: the files
+   read with their line starts and eslint-disable comments, the messages' diagnostics in chunks,
+   kept in tsgolint's order; `rules.dir_hit`, `dir_off` without marking, as nothing reports
+   unused directives from that list) -> 1.7 s.
+2. **tsgolint runs from the start**, beside the module graph and the linting (it reads only the
+   files and the rules), started with `posix_spawn` and waited for when its answer is needed
+   (`ljs.proc_start`/`proc_wait`; a task running it with `os.run` held its thread, the main
+   thread's at times). The rulesets are made once per severity table, not per file.
+3. **Its output parsed on all cores**: the frames found first, then parsed in chunks (6.3 s ->
+   1.4 s).
+4. **The JSON report** is built in one buffer and written in three parts (it was copied into
+   records, a list, a joined string and a formatted one: 640 MB here); the records are copied only
+   for the formats that read them.
+
+**A hang fixed** (in vlint 0.2.0 too, about one run in three here): JS plugin answers were read by
+the linting thread whose ticket came up, but linting threads are tasks, several to an OS thread at
+times, and one that blocked its thread waiting for its turn could keep the ticket's holder from
+running; node then stopped on a full pipe. Each node process now has a reader thread of its own
+that keeps the answers until their askers take them (`ljs_glue.c`).
+
+Checked: the diagnostics of the default and JSON runs are those of vlint before, as multisets,
+except what varies between runs of either build: the JS plugin's diagnostics (and the unused
+directives in its files; with several node processes, the plugin's module-level caches see
+different files in each run) and 53 `no-unsafe-type-assertion` help texts whose union members
+tsgolint prints in a different order from run to run. On a generated project (400 files, a JS
+plugin rule, type-aware rules, eslint-disable and oxlint-disable comments for them) the output is
+the same diagnostics as before and as oxlint's, in tsgolint's order, which varies (oxlint's too);
+`probes/` as before. Splitting tsgolint's payload into shards (2: 15.0 s, 4: 13.5 s) changes what
+it reports with 4 (690 more messages: the programs see different files), so vlint doesn't.
+
+Not the same as oxlint on this repository (before and now): oxlint reports 44,600 diagnostics
+vlint doesn't, mostly `eslint/require-await` (16,518, on with `typescript/require-await` in the
+config) and react-perf's `jsx-no-new-function-as-prop`, `-object-as-prop`, `-array-as-prop`
+(22,665), `jsdoc/check-tag-names` (2,918) and `jsx-a11y/anchor-is-valid` (621); and vlint reports
+as unused the eslint-disable comments that only suppress tsgolint diagnostics (138 of the generated
+project's 183; oxlint counts them as used).
+
 ## Three repositories with their own configurations (2026-11-09)
 
 Run on each repository's own oxlint configuration, vlint's JSON output was compared with
@@ -1126,9 +1268,12 @@ them, lints the rest, and saves the cache again only if something changed. The o
 bytes in the same order as without the cache. The code is `lcache.vu` (with `lcache_glue.c` for
 `stat`) and `cached_run` in `vlint.vu`; the path without `--cache` is unchanged.
 
-- The cache as a whole is keyed by a hash of the vlint executable (`/proc/self/exe`), a version
-  string and the options that change the output, so a rebuilt vlint or other rules start over. Where
-  the executable can't be read, nothing is cached.
+- The cache as a whole is keyed by a hash of the vlint executable (`/proc/self/exe`, on macOS
+  `_NSGetExecutablePath`), a version string and the options that change the output, so a rebuilt
+  vlint or other rules start over. Where the executable can't be read, nothing is cached.
+- A file's entry doesn't depend on other files, as with ESLint's cache: a rule that reads the files
+  a file imports (`import/no-cycle`, `import/named`...) can be out of date after one of those
+  changes alone. tsgolint's results have a cache of their own that follows the imports (above).
 - Each file's entry holds its path (as printed), size, modification and change times (ns), inode, a
   64-bit content hash (xxHash64's word step, one lane) and the output lines. A file whose size,
   times and inode all match is a hit without being read. Otherwise it's read and hashed (in the

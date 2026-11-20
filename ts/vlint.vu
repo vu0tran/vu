@@ -617,13 +617,21 @@ fn cworker(fs: Fs, own sj: Shared[CJobs], own jobs: Chan[Int], own res: Chan[CRe
     r.idx = i
     res.send(r)
 
+# --cache-location's file: PATH, or PATH/.vlintcache for a folder
+fn cache_loc(fs: Fs, loc0: Str) -> Str:
+  var loc = loc0 + ""
+  if loc.endswith("/") or fs.exists(loc + "/"):
+    while loc.len > 1 and loc.endswith("/"): loc = loc[0..loc.len - 1]
+    loc += "/.vlintcache"
+  return loc
+
 fn cached_run(fs: Fs, ffi: Ffi, own w: Work, jobs0: Int, phase: Int, loc: Str, optkey: Str) -> [[lout.Rec]]:
   var files: [Str] = []
   for x in w.files: files.push(x + "")
   let n = files.len
   var out: [[lout.Rec]] = []
   for i in 0..n: out.push([])
-  let cfg = lcache.config_key(fs, "phase={phase};{optkey}")
+  let cfg = lcache.config_key(fs, ffi, "phase={phase};{optkey}")
   var old = lcache.empty()
   if cfg != 0: old = lcache.load(fs, loc, cfg)
   # Timestamps this close to now may not change again when the file does (coarse clocks): such a
@@ -1133,19 +1141,20 @@ fn globals_json(c: lconf.Conf, rel: Str) -> Str:
     if ev[k]: ep.push(json_str(k) + ":true")
   return "{{\"globals\":{{" + ",".join(gp) + "}},\"envs\":{{" + ",".join(ep) + "}}}}"
 
-fn work_copy(w: Work, o: lout.Opts, ffi: Ffi) -> Work:
+# (type_aware_run's copy of what work will hold, made before the module graph is built)
+fn ta_work(files: [Str], shown: [Str], sevs: [[Int]], optss: [[Str]], sev_of: [Int], o: lout.Opts, ffi: Ffi) -> Work:
   var c = Work([], [], [], [], [], rules.Cx(o, lmeta.load(), 1, lmod.new_graph(), false, ffi))
-  for x in w.files: c.files.push(x + "")
-  for x in w.shown: c.shown.push(x + "")
-  for t in w.sevs:
+  for x in files: c.files.push(x + "")
+  for x in shown: c.shown.push(x + "")
+  for t in sevs:
     var r: [Int] = []
     for x in t: r.push(x)
     c.sevs.push(r)
-  for t in w.optss:
+  for t in optss:
     var r: [Str] = []
     for x in t: r.push(x + "")
     c.optss.push(r)
-  for x in w.sev_of: c.sev_of.push(x)
+  for x in sev_of: c.sev_of.push(x)
   return c
 
 # tsgolint run over files (sets: each one's rules, "" none): its messages, or oxlint's message when
@@ -1276,6 +1285,408 @@ fn tsgo_run_x(fs: Fs, os: Os, cwd: Str, exe: Str, files: [Str], sets: [Str], che
   var rc = -1
   if pidf != "": rc = os.run(["sh", "-c", "echo $$ > \"$4\"; exec \"$0\" headless < \"$1\" > \"$2\" 2> \"$3\"", exe, pin, pout, perr, pidf]) else -1
   else: rc = os.run(["sh", "-c", "exec \"$0\" headless < \"$1\" > \"$2\" 2> \"$3\"", exe, pin, pout, perr]) else -1
+  return tsgo_finish(fs, os, cwd, exe, files, sets, check, pidf, dir, pin, pout, perr, rc)
+
+# tsgolint started without waiting for it (tsgo_start) and its answer read (tsgo_wait): on the
+# plain path (vtsc not asked for) it starts before the module graph is built and runs while vlint
+# lints, which it doesn't need. (Run after linting, as before, the two added up: 15 s of linting,
+# then 19 s of tsgolint on a 36,000-file monorepo.)
+type TsgoJob:
+  on: Bool       # started (or failed to: err)
+  err: Str
+  check: Bool
+  # (one tsgolint process per part: each part's files, rules, folder, payload, output, errors, pid
+  # (-1: it couldn't start))
+  files: [[Str]]
+  sets: [[Str]]
+  dir: [Str]
+  pin: [Str]
+  pout: [Str]
+  perr: [Str]
+  pid: [Int]
+  grp: TgGroups = TgGroups([], [])   # tsgolint's programs, when they were read
+
+fn no_job() -> TsgoJob:
+  return TsgoJob(false, "", false, [], [], [], [], [], [], [])
+
+# How many tsgolint processes the files are split among. tsgolint builds and checks its programs (a
+# tsconfig's, or the inferred one of the files no tsconfig has) one after another, and only the
+# checking inside a program runs on several cores: on a 36,000-file monorepo with 98 programs it kept
+# 4.7 of 10 cores busy for 19 s. A program depends only on its tsconfig (the inferred one, on its
+# files), so programs can be checked in separate processes and each file gets what it got before.
+# VLINT_TSGO_PARTS sets it (1: one process, as oxlint runs it).
+fn tsgo_nparts(os: Os, nfiles: Int, cores: Int) -> Int:
+  let e = os.env("VLINT_TSGO_PARTS")
+  if e != "": return int(e) else 1
+  if nfiles < 2000 or cores < 4: return 1
+  var n = cores / 3
+  if n > 4: n = 4
+  return n
+
+# tsgolint's programs: each one's tsconfig ("<none>" for the inferred one) and its files (indices
+# into files, in order), from tsgolint's own assignment (ljs.tsgo_assign over the payload at pin).
+# Empty when the assignment couldn't be read or doesn't name every file.
+type TgGroups:
+  tcs: [Str]
+  idx: [[Int]]
+
+fn tsgo_groups(ffi: Ffi, exe: Str, pin: Str, files: [Str]) -> TgGroups:
+  var g = TgGroups([], [])
+  let txt = ljs.tsgo_assign(ffi, exe, pin)
+  if txt == "": return g
+  var tc_of: {Str: Str} = {}
+  for ln in txt.split("\n"):
+    if ln == "": continue
+    let t = ln.find("\t")
+    if t < 0: return TgGroups([], [])
+    tc_of[ln[0..t]] = ln[t + 1..ln.len]
+  var gidx: {Str: Int} = {}
+  for i in 0..files.len:
+    if not (files[i] in tc_of): return TgGroups([], [])
+    let tc = tc_of[files[i]]
+    if not (tc in gidx):
+      gidx[tc] = g.idx.len
+      g.tcs.push(tc + "")
+      g.idx.push([])
+    g.idx[gidx[tc]].push(i)
+  return g
+
+fn copy_groups(g: TgGroups) -> TgGroups:
+  var c = TgGroups([], [])
+  for x in g.tcs: c.tcs.push(x + "")
+  for l in g.idx:
+    var m: [Int] = []
+    for x in l: m.push(x)
+    c.idx.push(m)
+  return c
+
+# The programs sel (indices into g) split into nparts parts of file indices: the largest programs
+# first, each to the part with the fewest files; empty parts left out.
+fn tsgo_lpt(g: TgGroups, sel: [Int], nparts: Int) -> [[Int]]:
+  var order: [Int] = []
+  for x in sel: order.push(x)
+  order.sort(by: fn(a, b) => g.idx[a].len > g.idx[b].len)
+  var parts: [[Int]] = []
+  var load: [Int] = []
+  for _ in 0..nparts:
+    parts.push([])
+    load.push(0)
+  for k in order:
+    var best = 0
+    for q in 1..nparts:
+      if load[q] < load[best]: best = q
+    for i in g.idx[k]: parts[best].push(i)
+    load[best] += g.idx[k].len
+  var out: [[Int]] = []
+  for q in 0..nparts:
+    if parts[q].len > 0:
+      var l: [Int] = []
+      for i in parts[q]: l.push(i)
+      l.sort()
+      out.push(l)
+  return out
+
+fn tsgo_start(fs: Fs, os: Os, ffi: Ffi, exe: Str, files: [Str], sets: [Str], check: Bool, cores: Int, want_groups: Bool) -> TsgoJob:
+  var j = no_job()
+  j.on = true
+  j.check = check
+  let dir = fs.temp_dir() else ""
+  if dir == "":
+    j.err = "Error running tsgolint: \"can't create a temporary folder\""
+    return j
+  let pin = dir + "/payload.json"
+  var wrote = true
+  fs.write(pin, ltsgo.payload(files, sets, check)) else wrote_failed(&wrote)
+  if not wrote:
+    j.err = "Error running tsgolint: \"can't write the payload\""
+    return j
+  let np = tsgo_nparts(os, files.len, cores)
+  if np > 1 or want_groups: j.grp = tsgo_groups(ffi, exe, pin, files)
+  var parts: [[Int]] = []
+  if np > 1 and j.grp.idx.len >= 2:
+    var all: [Int] = []
+    for k in 0..j.grp.idx.len: all.push(k)
+    parts = tsgo_lpt(j.grp, all, np)
+  if parts.len <= 1:
+    var f1: [Str] = []
+    for x in files: f1.push(x + "")
+    var s1: [Str] = []
+    for x in sets: s1.push(x + "")
+    tsgo_part(fs, ffi, exe, &j, dir, pin, f1, s1)
+    return j
+  fs.remove(pin) else 0
+  fs.remove(dir) else 0
+  tsgo_start_parts(fs, ffi, exe, files, sets, &j, parts)
+  return j
+
+# One tsgolint process for each part (indices into files), into j.
+fn tsgo_start_parts(fs: Fs, ffi: Ffi, exe: Str, files: [Str], sets: [Str], var j: TsgoJob, parts: [[Int]]):
+  j.on = true
+  for part in parts:
+    var fk: [Str] = []
+    var sk: [Str] = []
+    for i in part:
+      fk.push(files[i] + "")
+      sk.push(sets[i] + "")
+    let d = fs.temp_dir() else ""
+    if d == "":
+      j.err = "Error running tsgolint: \"can't create a temporary folder\""
+      return
+    let pk = d + "/payload.json"
+    var ok = true
+    fs.write(pk, ltsgo.payload(fk, sk, j.check)) else wrote_failed(&ok)
+    if not ok:
+      j.err = "Error running tsgolint: \"can't write the payload\""
+      return
+    tsgo_part(fs, ffi, exe, &j, d, pk, fk, sk)
+
+# (one process started over files, its payload already written at pin)
+fn tsgo_part(fs: Fs, ffi: Ffi, exe: Str, var j: TsgoJob, dir: Str, pin: Str, own files: [Str], own sets: [Str]):
+  let pout = dir + "/out.bin"
+  let perr = dir + "/err.txt"
+  j.pid.push(ljs.proc_start(ffi, exe, pin, pout, perr))
+  j.dir.push(dir + "")
+  j.pin.push(pin + "")
+  j.pout.push(pout)
+  j.perr.push(perr)
+  j.files.push(files)
+  j.sets.push(sets)
+
+fn wrote_failed(var ok: Bool):
+  ok = false
+
+# Every part's messages, part by part (tsgolint's own order of programs changes from run to run);
+# the first part's failure as oxlint reports tsgolint's.
+fn tsgo_wait(fs: Fs, os: Os, ffi: Ffi, cwd: Str, exe: Str, j: TsgoJob) -> TsgoOut:
+  if j.err != "":
+    for pid in j.pid: ljs.proc_wait(ffi, pid)
+    return TsgoOut(j.err + "", [])
+  var all = TsgoOut("", [])
+  var err = ""
+  for k in 0..j.pid.len:
+    let rc = ljs.proc_wait(ffi, j.pid[k])
+    var r = tsgo_finish(fs, os, cwd, exe, j.files[k], j.sets[k], j.check, "", j.dir[k], j.pin[k], j.pout[k], j.perr[k], rc)
+    if r.err != "":
+      if err == "": err = r.err + ""
+      continue
+    # (moved, not copied: 1.55 million messages)
+    if all.ms.len == 0: swap(&all.ms, &r.ms)
+    else:
+      for q in 0..r.ms.len:
+        var m = ltsgo.Msg(0, "", "", -1, -1, "", "", "", false, [], [], [], 0)
+        swap(&m, &r.ms[q])
+        all.ms.push(m)
+  if err != "": return TsgoOut(err, [])
+  return all
+
+# ---- tsgolint's results kept between runs (--cache)
+# Each tsgolint program's messages, under a key made of: tsgolint and vlint (their paths and stats),
+# --type-check, the lockfile and node_modules/.modules.yaml, the tsconfigs the programs use (and the
+# files they extend or reference), and for the program its tsconfig, its files (path, rules, size,
+# times and inode) and the same for every file they import, followed through the module graph (not
+# into node_modules: the lockfile covers it). Without the graph, every file sent counts for every
+# program. A run sends tsgolint only the programs whose key changed. A message for a file outside
+# the run (or for none) keeps the run from being saved. VLINT_TSGO_CACHE=0 turns it off.
+type TgStore:
+  keys: [Str]
+  ms: [[ltsgo.Msg]]
+
+type TgRun:
+  on: Bool = false
+  deferred: Bool = false     # a cache file was there: tsgolint starts once the keys are known
+  path: Str = ""
+  files: [Str] = []
+  sets: [Str] = []
+  grp: TgGroups = TgGroups([], [])
+  keys: [Str] = []
+  hit: [Bool] = []
+  cached: [[ltsgo.Msg]] = []
+
+fn tg_sig(ffi: Ffi, var memo: {Str: Int}, path: Str) -> Int:
+  if path in memo: return memo[path]
+  var st: [Int] = [0, 0, 0, 0, 0]
+  var h = 7
+  if lcache.stat(ffi, path, &st):
+    h = lcache.mix(lcache.mix(lcache.mix(lcache.hash64(path), st[0]), st[1]), lcache.mix(st[2], st[3]))
+  else: h = lcache.mix(lcache.hash64(path), 3)
+  memo[path] = h
+  return h
+
+# (a tsconfig's content, and that of the files it names by relative path: extends, references)
+fn tg_tsconfig(fs: Fs, path: Str, var seen: {Str: Bool}, var h: Int):
+  if path in seen or seen.len > 2000: return
+  seen[path] = true
+  let t = fs.read(path) else ""
+  h = lcache.mix(h, lcache.hash64(path + "\n" + t))
+  var d = path
+  var k = d.len - 1
+  while k > 0 and d[k] != '/': k -= 1
+  d = d[0..k]
+  var i = 0
+  while i < t.len:
+    let q = t.find("\"", i)
+    if q < 0: break
+    let e = t.find("\"", q + 1)
+    if e < 0: break
+    let v = t[q + 1..e]
+    i = e + 1
+    if not (v.startswith("./") or v.startswith("../")): continue
+    let f = d + "/" + v
+    if v.endswith(".json"):
+      tg_tsconfig(fs, f, &seen, &h)
+    elif fs.exists(f + "/tsconfig.json"):
+      tg_tsconfig(fs, f + "/tsconfig.json", &seen, &h)
+
+fn tg_env(fs: Fs, ffi: Ffi, cwd: Str, exe: Str, check: Bool, g: TgGroups) -> Int:
+  var memo: {Str: Int} = {}
+  var h = lcache.hash64("vlint-tsgo-cache-1|{check}|{exe}")
+  h = lcache.mix(h, tg_sig(ffi, &memo, lcache.realpath(ffi, exe)))
+  h = lcache.mix(h, tg_sig(ffi, &memo, lcache.self_exe(ffi)))
+  var d = cwd
+  var found = false
+  while d.len > 0 and not found:
+    for name in ["pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb"]:
+      let t = fs.read(d + "/" + name) else "\0"
+      if t != "\0":
+        h = lcache.mix(h, lcache.hash64(name + "\n" + t))
+        h = lcache.mix(h, tg_sig(ffi, &memo, d + "/node_modules/.modules.yaml"))
+        found = true
+    var k = d.len - 1
+    while k > 0 and d[k] != '/': k -= 1
+    d = d[0..k]
+  # (declaration files anywhere under the folder, node_modules and links left out: an ambient one the
+  # linting ignores and nothing imports still types the programs that include it)
+  var stack: [Str] = [cwd + ""]
+  var ndirs = 0
+  while stack.len > 0 and ndirs < 200000:
+    let d0 = stack.pop()
+    ndirs += 1
+    for e in lcache.readdir(ffi, d0):
+      if e.endswith("/"):
+        if e == "node_modules/" or e == ".git/": continue
+        let sub = d0 + "/" + e[0..e.len - 1]
+        if lcache.is_link(ffi, sub): continue
+        stack.push(sub)
+      elif e.endswith(".d.ts") or e.endswith(".d.mts") or e.endswith(".d.cts"):
+        h = h +% tg_sig(ffi, &memo, d0 + "/" + e)
+  var seen: {Str: Bool} = {}
+  var tcs: [Str] = []
+  for x in g.tcs: tcs.push(x + "")
+  tcs.sort()
+  for tc in tcs:
+    if tc.startswith("/"): tg_tsconfig(fs, tc, &seen, &h)
+    else: h = lcache.mix(h, lcache.hash64(tc))
+  return h
+
+# Each program's key.
+fn tg_keys(fs: Fs, ffi: Ffi, cwd: Str, exe: Str, check: Bool, mg: lmod.Graph, files: [Str], sets: [Str], g: TgGroups) -> [Str]:
+  let env = tg_env(fs, ffi, cwd, exe, check, g)
+  var memo: {Str: Int} = {}
+  var shash: {Str: Int} = {}
+  var keys: [Str] = []
+  # (no graph: every file's signature, for all)
+  var all = 0
+  if not mg.on:
+    for f in files: all = all +% tg_sig(ffi, &memo, f)
+  var mark: [Int] = [0] * mg.recs.len
+  for k in 0..g.idx.len:
+    var h = lcache.mix(env, lcache.hash64(g.tcs[k]))
+    var dep = all
+    var todo: [Int] = []
+    for i in g.idx[k]:
+      if not (sets[i] in shash): shash[sets[i]] = lcache.hash64(sets[i])
+      h = lcache.mix(lcache.mix(h, tg_sig(ffi, &memo, files[i])), shash[sets[i]])
+      if mg.on and files[i] in mg.at:
+        let r = mg.at[files[i]]
+        if mark[r] != k + 1:
+          mark[r] = k + 1
+          todo.push(r)
+    # (the files they import, transitively: their signatures summed, so the order doesn't matter)
+    var q = 0
+    while q < todo.len:
+      let r = todo[q]
+      q += 1
+      let rec = mg.recs[r]
+      dep = dep +% tg_sig(ffi, &memo, rec.path)
+      for x in 0..rec.rq_res.len:
+        let t = rec.rq_res[x]
+        if t < 0:
+          dep = dep +% lcache.hash64("?" + rec.path + "|" + rec.rq[x])
+          continue
+        if mark[t] == k + 1: continue
+        mark[t] = k + 1
+        if mg.recs[t].path.find("/node_modules/") >= 0: continue
+        todo.push(t)
+    keys.push(lcache.hex16(h) + lcache.hex16(dep))
+  return keys
+
+# The programs found in the cache (tg.hit, tg.cached) and the parts to run for the others.
+fn tg_lookup(fs: Fs, os: Os, var tg: TgRun, cores: Int) -> [[Int]]:
+  var st = from_json(fs.read(tg.path) else "", TgStore) else TgStore([], [])
+  var at: {Str: Int} = {}
+  for k in 0..st.keys.len: at[st.keys[k]] = k
+  var miss: [Int] = []
+  var nmiss = 0
+  for k in 0..tg.keys.len:
+    var l: [ltsgo.Msg] = []
+    if tg.keys[k] in at and at[tg.keys[k]] < st.ms.len:
+      swap(&l, &st.ms[at[tg.keys[k]]])
+      tg.hit.push(true)
+    else:
+      tg.hit.push(false)
+      miss.push(k)
+      nmiss += tg.grp.idx[k].len
+    tg.cached.push(l)
+  if miss.len == 0: return []
+  return tsgo_lpt(tg.grp, miss, tsgo_nparts(os, nmiss, cores))
+
+# The run's messages program by program (cached or fresh), and the cache saved.
+fn tg_merge(fs: Fs, var tg: TgRun, var ms: [ltsgo.Msg]):
+  while tg.hit.len < tg.grp.idx.len:
+    tg.hit.push(false)
+    tg.cached.push([])
+  var gof: {Str: Int} = {}
+  for k in 0..tg.grp.idx.len:
+    for i in tg.grp.idx[k]: gof[tg.files[i]] = k
+  var byp: [[ltsgo.Msg]] = []
+  for _ in 0..tg.grp.idx.len: byp.push([])
+  var stray: [ltsgo.Msg] = []
+  for q in 0..ms.len:
+    var m = ltsgo.Msg(0, "", "", -1, -1, "", "", "", false, [], [], [], 0)
+    swap(&m, &ms[q])
+    if m.file in gof and m.kind != 0:
+      let k = gof[m.file]
+      if not tg.hit[k]: byp[k].push(m)
+      else: stray.push(m)
+    else: stray.push(m)
+  for k in 0..tg.grp.idx.len:
+    if tg.hit[k]: swap(&byp[k], &tg.cached[k])
+  if stray.len == 0:
+    var st = TgStore([], [])
+    for k in 0..tg.keys.len:
+      st.keys.push(tg.keys[k] + "")
+      var l: [ltsgo.Msg] = []
+      for m in byp[k]: l.push(lvtsc.copy_msg(m))
+      st.ms.push(l)
+    let tmp = tg.path + ".tmp"
+    fs.write(tmp, to_json(st)) else 0
+    fs.rename(tmp, tg.path) else 0
+  else: fs.remove(tg.path) else 0
+  var out: [ltsgo.Msg] = []
+  for k in 0..byp.len:
+    for q in 0..byp[k].len:
+      var m = ltsgo.Msg(0, "", "", -1, -1, "", "", "", false, [], [], [], 0)
+      swap(&m, &byp[k][q])
+      out.push(m)
+  for q in 0..stray.len:
+    var m = ltsgo.Msg(0, "", "", -1, -1, "", "", "", false, [], [], [], 0)
+    swap(&m, &stray[q])
+    out.push(m)
+  swap(&ms, &out)
+
+fn tsgo_finish(fs: Fs, os: Os, cwd: Str, exe: Str, files: [Str], sets: [Str], check: Bool, pidf: Str, dir: Str, pin: Str, pout: Str, perr: Str, rc0: Int) -> TsgoOut:
+  var r = TsgoOut("", [])
+  var rc = rc0
   var out = fs.read(pout) else ""
   var errt = fs.read(perr) else ""
   # tsgolint's no-misused-promises panics on an object literal member with a computed name
@@ -1321,7 +1732,9 @@ fn tsgo_run_x(fs: Fs, os: Os, cwd: Str, exe: Str, files: [Str], sets: [Str], che
   if rc < 0:
     r.err = "Failed to spawn tsgolint from path `{exe}`"
     return r
+  if os.env("VLINT_T") != "": eprint("vlint T@ tsgolint part ended, parsing {os.clock()}")
   let ms = ltsgo.parse_messages(out)
+  if os.env("VLINT_T") != "": eprint("vlint T@ parsed {ms.len} {os.clock()}")
   # oxlint formats Rust's ExitStatus, whose Display is "exit status: N" already, after its own
   # "exit status: ", then prints the String with {:?} (quoted, escaped)
   for msg in ms:
@@ -1351,7 +1764,7 @@ fn tsgo_bg(fs: Fs, os: Os, own cwd: Str, own exe: Str, own files: [Str], own set
 fn cover_key(ffi: Ffi, cwd: Str, files: [Str]) -> Str:
   # (and this vlint: a new one looks again)
   var st: [Int] = [0, 0, 0, 0, 0]
-  lcache.stat(ffi, lcache.realpath(ffi, "/proc/self/exe"), &st)
+  lcache.stat(ffi, lcache.self_exe(ffi), &st)
   var h = lcache.mix(lcache.hash64(cwd), lcache.hash64("{st[0]}/{st[1]}"))
   for f in files: h = lcache.mix(h, lcache.hash64(f))
   return lcache.hex16(h)
@@ -1377,19 +1790,43 @@ fn cover_set(fs: Fs, os: Os, key: Str, v: Str):
   fs.mkdir(d) else 0
   fs.write(d + "/" + key, v + "\n") else 0
 
-# With the type check, vtsc's errors for the files it fully checks (lvtsc), tsgolint's for the
-# others. Returns oxlint's message when tsgolint fails.
-fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w: Work, check: Bool, var results: [[lout.Rec]], var shown: [Str]) -> Str:
+# The files tsgolint is sent and each one's rules ("" none): a ruleset per severity table, not per file
+type TaIn:
+  files: [Str]
+  sets: [Str]
+  idx_of: {Str: Int}
+
+fn ta_in(w: Work) -> TaIn:
+  var r = TaIn([], [], {})
   let m = w.cx.m
   let dflt = ltsgo.defaults()
-  var files: [Str] = []
-  var sets: [Str] = []
-  var idx_of: {Str: Int} = {}
+  var by_table: {Int: Str} = {}
   for i in 0..w.files.len:
     if not want(w.files[i]): continue
-    idx_of[w.files[i]] = i
-    files.push(w.files[i] + "")
-    sets.push(ltsgo.ruleset(m, dflt, w.sevs[w.sev_of[i]], w.optss[w.sev_of[i]]))
+    r.idx_of[w.files[i]] = i
+    r.files.push(w.files[i] + "")
+    let tb = w.sev_of[i]
+    if not (tb in by_table): by_table[tb] = ltsgo.ruleset(m, dflt, w.sevs[tb], w.optss[tb])
+    r.sets.push(by_table[tb] + "")
+  return r
+
+# Whether type_aware_run takes the plain path (tsgolint for every file, no vtsc), whose run can start
+# before linting (pre)
+fn ta_plain(os: Os, check: Bool) -> Bool:
+  return not (check and os.env("VLINT_VTSC") == "1")
+
+# With the type check, vtsc's errors for the files it fully checks (lvtsc), tsgolint's for the
+# others. Returns oxlint's message when tsgolint fails. (pre: tsgolint already started for the plain
+# path, or no_job())
+fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w: Work, check: Bool, pre: TsgoJob, var tg: TgRun, var results: [[lout.Rec]], var shown: [Str]) -> Str:
+  let m = w.cx.m
+  var tin = ta_in(w)
+  var files: [Str] = []
+  swap(&files, &tin.files)
+  var sets: [Str] = []
+  swap(&sets, &tin.sets)
+  var idx_of: {Str: Int} = {}
+  swap(&idx_of, &tin.idx_of)
   var any = check
   for x in sets:
     if x != "": any = true
@@ -1480,21 +1917,180 @@ fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w:
     ms = lvtsc.merge(pl, files, ma, mb)
   else:
     if exe.startswith("!"): return exe[1..exe.len]
-    let r = tsgo_run(fs, os, cwd, exe, files, sets, check)
+    var r = TsgoOut("", [])
+    if pre.on: r = tsgo_wait(fs, os, ffi, cwd, exe, pre)
+    elif not tg.deferred: r = tsgo_run(fs, os, cwd, exe, files, sets, check)
     if r.err != "": return r.err
-    for x in r.ms: ms.push(lvtsc.copy_msg(x))
-  var srcs: {Str: Str} = {}
-  var dirs: {Str: Int} = {}
-  var dlist: [rules.Dirs] = []
+    if tg.on: tg_merge(fs, &tg, &r.ms)
+    swap(&ms, &r.ms)
+  ta_records(fs, os, cwd, o, w, idx_of, ms, &results, &shown)
+  return ""
+
+# The records of tsgolint's messages (ms), appended to results and shown in its order: each file the
+# messages name read once, with its line starts and eslint-disable comments, then the messages'
+# records, both in chunks on all cores. Before, each
+# message found its file's line starts again: 1.55 million messages in 36,000 files took 28 s on one
+# thread on one monorepo.
+fn ta_records(fs: Fs, os: Os, cwd: Str, o: lout.Opts, w: Work, idx_of: {Str: Int}, ms: [ltsgo.Msg], var results: [[lout.Rec]], var shown: [Str]):
+  var flist: [Str] = [""]
+  var fidx: {Str: Int} = {}
+  var mfi: [Int] = []
+  for msg in ms:
+    var fi = 0
+    if msg.kind != 0 and msg.file != "":
+      if not (msg.file in fidx):
+        fidx[msg.file] = flist.len
+        flist.push(msg.file + "")
+      fi = fidx[msg.file]
+    mfi.push(fi)
+  let nch = 64
+  let nf = flist.len
+  var pf_src: [[Str]] = []
+  var pf_lix: [[[Int]]] = []
+  var pf_dirs: [[rules.Dirs]] = []
+  for _ in 0..nch:
+    pf_src.push([])
+    pf_lix.push([])
+    pf_dirs.push([])
+  par for c in 0..nch: ta_read_chunk(fs, flist, c, nf, nch, &pf_src[c], &pf_lix[c], &pf_dirs[c])
+  var fsrc: [Str] = []
+  var flix: [[Int]] = []
+  var fdirs: [rules.Dirs] = []
+  for c in 0..nch:
+    for k in 0..pf_src[c].len:
+      var x = ""
+      swap(&x, &pf_src[c][k])
+      fsrc.push(x)
+      var l: [Int] = []
+      swap(&l, &pf_lix[c][k])
+      flix.push(l)
+      var d = rules.no_dirs()
+      swap(&d, &pf_dirs[c][k])
+      fdirs.push(d)
+  if os.env("VLINT_T") != "": eprint("vlint T@ records: files read {os.clock()}")
+  let nmsg = ms.len
+  var p_rec: [[lout.Rec]] = []
+  var p_shown: [[Str]] = []
+  var p_hits: [[Int]] = []
+  for _ in 0..nch:
+    p_rec.push([])
+    p_shown.push([])
+    p_hits.push([])
+  par for c in 0..nch: ta_rec_chunk(cwd, o, w, idx_of, ms, mfi, fsrc, flix, fdirs, c, nmsg, nch, &p_rec[c], &p_shown[c], &p_hits[c])
+  if os.env("VLINT_T") != "": eprint("vlint T@ records: made {os.clock()}")
+  # A directive that only a tsgolint message used was reported unused by the linting (which ran
+  # before tsgolint's messages came): oxlint applies the directives to them first. Those comments'
+  # unused records are made again without the directives tsgolint used.
+  var hit_of: {Int: [Int]} = {}
+  var hfiles: [Int] = []
+  for c in 0..nch:
+    var q = 0
+    while q + 1 < p_hits[c].len:
+      let fi = p_hits[c][q]
+      if not (fi in hit_of):
+        hit_of[fi] = []
+        hfiles.push(fi)
+      hit_of[fi].push(p_hits[c][q + 1])
+      q += 2
+  for fi in hfiles:
+    let i = idx_of.get(flist[fi], -1)
+    if i < 0 or i >= results.len: continue
+    ta_fix_unused(o, w.shown[i], fsrc[fi], flix[fi], fdirs[fi], hit_of[fi], &results[i])
+  for c in 0..nch:
+    for k in 0..p_rec[c].len:
+      var r = lout.Rec(0, "", "", "", 0, 0, 0, 0, "")
+      swap(&r, &p_rec[c][k])
+      results.push([r])
+      shown.push(p_shown[c][k] + "")
+
+# (one file's unused-directive records with the directives in hk used)
+# (records compared by message and place: their text is empty in formats rendered later, stylish)
+fn same_rec(a: lout.Rec, b: lout.Rec) -> Bool:
+  return a.msg == b.msg and a.line == b.line and a.col == b.col and a.eline == b.eline and a.ecol == b.ecol and a.text == b.text
+
+fn ta_fix_unused(o: lout.Opts, path: Str, src: Str, ls: [Int], d: rules.Dirs, hk: [Int], var recs: [lout.Rec]):
+  var any = false
+  var sev = 0
+  for r in recs:
+    if r.code == "!unused":
+      any = true
+      sev = r.sev
+  if not any: return
+  var hit = [false] * d.iv.len
+  for k in hk:
+    if k >= 0 and k < d.iv.len: hit[k] = true
+  var k = 0
+  while k < d.iv.len:
+    var j = k
+    while j < d.iv.len and d.iv[j].cs == d.iv[k].cs and d.iv[j].ce == d.iv[k].ce: j += 1
+    var touched = false
+    for q in k..j:
+      if hit[q]: touched = true
+    if not touched:
+      k = j
+      continue
+    # (which of the comment's directives the linting reported: its records, matched by their text)
+    var all_un: [Bool] = []
+    for _ in k..j: all_un.push(true)
+    let whole = rules.unused_comment(o, path, src, ls, d, k, j, all_un, sev)
+    var unused: [Bool] = []
+    for _ in k..j: unused.push(false)
+    var drop = [false] * recs.len
+    var at = -1
+    for x in 0..recs.len:
+      if recs[x].code != "!unused": continue
+      if whole.len == 1 and same_rec(recs[x], whole[0]):
+        for q in k..j: unused[q - k] = true
+        drop[x] = true
+        if at < 0: at = x
+        continue
+      for q in k..j:
+        var one: [Bool] = []
+        for z in k..j: one.push(z == q)
+        if j - k == 1: continue
+        let fr = rules.unused_comment(o, path, src, ls, d, k, j, one, sev)
+        if fr.len == 1 and same_rec(recs[x], fr[0]):
+          unused[q - k] = true
+          drop[x] = true
+          if at < 0: at = x
+    if at < 0:
+      k = j
+      continue
+    for q in k..j:
+      if hit[q]: unused[q - k] = false
+    var fresh = rules.unused_comment(o, path, src, ls, d, k, j, unused, sev)
+    var out: [lout.Rec] = []
+    for x in 0..recs.len:
+      if x == at:
+        for y in 0..fresh.len:
+          var r = lout.Rec(0, "", "", "", 0, 0, 0, 0, "")
+          swap(&r, &fresh[y])
+          r.code = "!unused"
+          out.push(r)
+      if drop[x]: continue
+      var r = lout.Rec(0, "", "", "", 0, 0, 0, 0, "")
+      swap(&r, &recs[x])
+      out.push(r)
+    swap(&recs, &out)
+    k = j
+
+fn ta_read_chunk(fs: Fs, flist: [Str], c: Int, nf: Int, nch: Int, var src: [Str], var lix: [[Int]], var dirs: [rules.Dirs]):
   var kw = scan.keywords()
   var t = rules.new_tree()
-  for msg in ms:
+  for f in c * nf / nch..(c + 1) * nf / nch:
+    var text = ""
+    if f > 0: text = fs.read(flist[f]) else ""
+    lix.push(lout.line_index(text))
+    dirs.push(rules.file_dirs(text, flist[f], &kw, &t))
+    src.push(text)
+
+fn ta_rec_chunk(cwd: Str, o: lout.Opts, w: Work, idx_of: {Str: Int}, ms: [ltsgo.Msg], mfi: [Int], fsrc: [Str], flix: [[Int]], fdirs: [rules.Dirs], c: Int, nmsg: Int, nch: Int, var recs: [lout.Rec], var shown: [Str], var hits: [Int]):
+  let m = w.cx.m
+  for q in c * nmsg / nch..(c + 1) * nmsg / nch:
+    let msg = ms[q]
     if msg.kind == 0: continue
     let i = idx_of.get(msg.file, -1)
-    var src = ""
-    if msg.file != "":
-      if not (msg.file in srcs): srcs[msg.file] = fs.read(msg.file) else ""
-      src = srcs[msg.file]
+    let fi = mfi[q]
     var shown_path = ""
     if i >= 0: shown_path = w.shown[i] + ""
     elif msg.file != "":
@@ -1505,7 +2101,7 @@ fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w:
       var labs: [lout.Lab] = []
       if msg.file != "" and msg.pos >= 0: labs.push(lout.Lab(msg.pos, msg.end, "", false, false))
       let d = lout.Diag(2, "typescript({msg.id})", "", msg.msg, msg.help, labs, "")
-      results.push([lout.make_rec(o, shown_path, src, lout.line_index(src), d)])
+      recs.push(lout.make_rec(o, shown_path, fsrc[fi], flix[fi], d))
       shown.push(shown_path)
       continue
     if i < 0: continue
@@ -1514,14 +2110,17 @@ fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w:
     let sv = w.sevs[w.sev_of[i]][mi]
     if sv <= 0: continue
     # eslint-disable comments apply (by the rule's name, also as typescript-eslint/ and @typescript-eslint/)
-    if not (msg.file in dirs):
-      dirs[msg.file] = dlist.len
-      dlist.push(rules.file_dirs(src, msg.file, &kw, &t))
     var at = msg.pos
     if msg.pos == 0 and msg.end == 0 and msg.labs.len > 0: at = msg.labs[0]
     var e_at = msg.end
     if msg.pos == 0 and msg.end == 0 and msg.labs.len > 0: e_at = msg.labs[1]
-    if rules.dir_off(&dlist[dirs[msg.file]], "typescript({msg.rule})", at, e_at): continue
+    let hk = rules.dir_hits(fdirs[fi], "typescript({msg.rule})", at, e_at)
+    if hk.len > 0:
+      # (the directives it hits are used: their unused records are fixed afterwards)
+      for k in hk:
+        hits.push(fi)
+        hits.push(k)
+      continue
     var labs: [lout.Lab] = []
     if msg.labs.len == 0: labs.push(lout.Lab(msg.pos, msg.end, "", false, false))
     else:
@@ -1530,9 +2129,8 @@ fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, exe: Str, w:
     var help = ""
     if msg.has_help: help = msg.help + ""
     let d = lout.Diag(sv, "typescript({msg.rule})", lmeta.url(m, mi), msg.msg + "", help, labs, "")
-    results.push([lout.make_rec(o, shown_path, src, lout.line_index(src), d)])
+    recs.push(lout.make_rec(o, shown_path, fsrc[fi], flix[fi], d))
     shown.push(shown_path)
-  return ""
 
 # (pre: what happened to oxlint-suppressions.json)
 fn finish_info(o: lout.Opts, secs: Float, nfiles: Int, nrules: Int, threads: Int, shown_json: Bool, pre: Str):
@@ -1540,6 +2138,7 @@ fn finish_info(o: lout.Opts, secs: Float, nfiles: Int, nrules: Int, threads: Int
 
 fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   let t0 = os.clock()
+  if os.env("VLINT_T") != "": eprint("vlint T@ start {t0}")
   # (a vtsc program check in a child process: lvtsc.run_program)
   let av = args()
   if av.len == 4 and av[1] == "--vtsc-worker": exit(lvtsc.worker(fs, os, ffi, av[2], av[3]))
@@ -1622,6 +2221,15 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       k -= 1
     if r != cwd and ignored(w2, r, true): continue
     walk(fs, ffi, r, &w2, &files)
+  # (paths that overlap, `seller-flow .`, name a file more than once: oxlint lints it once)
+  if roots.len > 1:
+    var seenf: {Str: Bool} = {}
+    var uniq: [Str] = []
+    for f in files:
+      if f in seenf: continue
+      seenf[f] = true
+      uniq.push(f + "")
+    swap(&files, &uniq)
   # the configuration
   var root_path = ""
   if a.config != "": root_path = abs_path(cwd, a.config)
@@ -1821,6 +2429,39 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   var phase = int(os.env("VLINT_PHASE")) else 9
   if a.fix or a.fix_other != "": phase = 10
   var results: [[lout.Rec]] = []
+  # (tsgolint, on its own copy of the files and rules, starts now on the plain path and runs while
+  # the module graph is built and the files are linted: it needs neither)
+  var work_ta = Work([], [], [], [], [], rules.Cx(o, lmeta.Meta([], [], [], [], [], [], [], [], [], [], {}, {}, [], {}, {}), 1, lmod.new_graph(), false, ffi))
+  if type_aware: work_ta = ta_work(kept, shown, sevs, optss, sev_of, o, ffi)
+  var pre = no_job()
+  var tg = TgRun()
+  if type_aware and not tsgo.startswith("!") and ta_plain(os, type_check) and os.env("VLINT_TSGO_LATE") != "1":
+    var tin = ta_in(work_ta)
+    var any = type_check
+    for x in tin.sets:
+      if x != "": any = true
+    if any and a.cache and phase != 10 and os.env("VLINT_TSGO_CACHE") != "0":
+      # (with --cache: tsgolint's programs are read now; when there's a cache file, tsgolint starts
+      # once the module graph gives their keys, for the programs that changed)
+      tg.on = true
+      tg.path = cache_loc(fs, a.loc) + "-tsgolint"
+      if fs.exists(tg.path):
+        let dir = fs.temp_dir() else ""
+        if dir != "":
+          let pin = dir + "/payload.json"
+          fs.write(pin, ltsgo.payload(tin.files, tin.sets, type_check)) else 0
+          tg.grp = tsgo_groups(ffi, tsgo, pin, tin.files)
+          fs.remove(pin) else 0
+          fs.remove(dir) else 0
+        if tg.grp.idx.len > 0: tg.deferred = true
+      if not tg.deferred:
+        pre = tsgo_start(fs, os, ffi, tsgo, tin.files, tin.sets, type_check, threads, true)
+        tg.grp = copy_groups(pre.grp)
+      if tg.grp.idx.len == 0: tg.on = false
+      else:
+        swap(&tg.files, &tin.files)
+        swap(&tg.sets, &tin.sets)
+    elif any: pre = tsgo_start(fs, os, ffi, tsgo, tin.files, tin.sets, type_check, threads, false)
   let nfiles = kept.len
   var fixmask = 0
   if a.fix: fixmask = fixmask | 1
@@ -1872,6 +2513,15 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     for tb in sevs:
       if tb.len >= m.name.len and tb[lmeta.M_IMPORT_NO_CYCLE] > 0: need_cycle = true
     if need_cycle: rimport.cycle_components(&mg)
+  if tg.on:
+    tg.keys = tg_keys(fs, ffi, cwd, tsgo, type_check, mg, tg.files, tg.sets, tg.grp)
+    if os.env("VLINT_T") != "": eprint("vlint T@ tsgolint keys {os.clock()}")
+    if tg.deferred:
+      let parts = tg_lookup(fs, os, &tg, threads)
+      if os.env("VLINT_T") != "": eprint("vlint T@ tsgolint cache read, {parts.len} part(s) to run {os.clock()}")
+      if parts.len > 0:
+        pre.check = type_check
+        tsgo_start_parts(fs, ffi, tsgo, tg.files, tg.sets, &pre, parts)
   let cx = rules.Cx(o, m, fixmask, mg, os.env("VLINT_ESTREE") != "", ffi)
   # (the cache's key covers the tables)
   var tkey: [Str] = []
@@ -1884,16 +2534,10 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     tkey.push(",".join(parts))
   let nsevs = lcache.hex16(lcache.hash64(";".join(tkey)))
   var work = Work(kept, shown, sevs, optss, sev_of, cx)
-  # (tsgolint's run reads its own copy: work goes to the workers)
-  var work_ta = Work([], [], [], [], [], rules.Cx(o, lmeta.Meta([], [], [], [], [], [], [], [], [], [], {}, {}, [], {}, {}), 1, lmod.new_graph(), false, ffi))
-  if type_aware: work_ta = work_copy(work, o, ffi)
   var shown2: [Str] = []
   for s in work.shown: shown2.push(s + "")
   if a.cache and phase != 10:
-    var loc = a.loc + ""
-    if loc.endswith("/") or fs.exists(loc + "/"):
-      while loc.len > 1 and loc.endswith("/"): loc = loc[0..loc.len - 1]
-      loc += "/.vlintcache"
+    let loc = cache_loc(fs, a.loc)
     results = cached_run(fs, ffi, work, threads, phase, loc, "fmt={o.fmt};theme={o.theme};links={o.links};sevs={nsevs}")
   else:
     var jobs = threads
@@ -1914,11 +2558,14 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       for k in 0..nfiles:
         var r = rc.recv()?
         swap(&results[r.idx], &r.recs)
+  if os.env("VLINT_T") != "": eprint("vlint T linted {os.clock() - t0}")
   if type_aware:
-    let e = type_aware_run(fs, os, ffi, cwd, o, tsgo, work_ta, type_check, &results, &shown2)
+    var e = ""
+    e = type_aware_run(fs, os, ffi, cwd, o, tsgo, work_ta, type_check, pre, &tg, &results, &shown2)
     if e != "":
       write(e + "\n")
       exit(1)
+  if os.env("VLINT_T") != "": eprint("vlint T tsgolint merged {os.clock() - t0}")
   # unused eslint-disable comments come last (oxlint reports them after linting every file)
   if report_sev > 0:
     let nres = results.len
@@ -1936,6 +2583,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       if tail.len > 0:
         results.push(tail)
         shown2.push(shown2[k] + "")
+  if os.env("VLINT_T") != "": eprint("vlint T unused directives {os.clock() - t0}")
   # bulk suppressions (oxlint-suppressions.json)
   var sup = lsupp.load(fs, cwd, a.suppress_all, a.prune or a.fix or a.fix_other != "")
   if not lsupp.ignored(sup):
@@ -1958,12 +2606,14 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   var max_warnings = a.max_warnings
   if max_warnings < 0: max_warnings = cc0.max_warnings
   let deny = a.deny_warnings or cc0.deny_warnings
+  if os.env("VLINT_T") != "": eprint("vlint T suppressions {os.clock() - t0}")
   var json: [Str] = []
   let res = print_results(fs, ffi, o, a, shown2, results, max_warnings, &json)
   if o.fmt == lout.F_JSON:
     var nr = "null"
     if nrules >= 0: nr = "{nrules}"
     write("{{ \"diagnostics\": {json[0]},\n              \"number_of_files\": {nfiles},\n              \"number_of_rules\": {nr},\n              \"threads_count\": {threads},\n              \"start_time\": {os.clock() - t0}\n            }}\n            ")
+  if os.env("VLINT_T") != "": eprint("vlint T printed {os.clock() - t0}")
   finish_info(o, os.clock() - t0, nfiles, nrules, threads, false, lsupp.action_text(sup))
   if a.suppress_all and sup.action != lsupp.A_MALFORMED: return
   if sup.action == lsupp.A_UNPRUNED: exit(1)

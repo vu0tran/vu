@@ -41,14 +41,14 @@ for d in "${dirs[@]}"; do
   [ -d "$d" ] || { echo "$d: not a folder"; bad=1; continue; }
   exp="$d/.oxlint.txt"
   if [ $saved -eq 0 ] && [ -n "$OX" ]; then
-    (cd "$d" && "$OX" --format unix "${args[@]}" . 2>&1) | norm > "$tmp/o"
+    (cd "$d" && "$OX" --format unix ${args[@]+"${args[@]}"} . 2>&1) | norm > "$tmp/o"
     [ $save -eq 1 ] && cp "$tmp/o" "$exp"
   elif [ -f "$exp" ]; then
     cp "$exp" "$tmp/o"
   else
     echo "$d: no oxlint (set OXLINT) and no saved $exp"; bad=1; continue
   fi
-  (cd "$d" && "$VL" --format unix "${args[@]}" . 2>&1) | norm > "$tmp/v"
+  (cd "$d" && "$VL" --format unix ${args[@]+"${args[@]}"} . 2>&1) | norm > "$tmp/v"
   comm -23 "$tmp/o" "$tmp/v" > "$tmp/oo"
   comm -13 "$tmp/o" "$tmp/v" > "$tmp/vo"
   a=$(wc -l < "$tmp/oo"); b=$(wc -l < "$tmp/vo")

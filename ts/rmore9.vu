@@ -364,8 +364,19 @@ fn callee_is(l: L, call: Int, name: Str) -> Bool:
   let c = l.t.nd[call].a
   return k(l, c) == ast.N_ID and name_of(l, c) == name
 
+# A call that's a CallExpression in oxc: not ?.(), and not the end of a chain with a ?. in it
+# (`a?.b.map(f)` is a ChainExpression there; `(a?.b).map(f)` isn't)
 fn plain_call(l: L, n: Int) -> Bool:
-  return k(l, n) == ast.N_CALL and (l.t.nd[n].f & 3) == 0
+  if k(l, n) != ast.N_CALL or (l.t.nd[n].f & 3) != 0: return false
+  var x = l.t.nd[n].a
+  while x > 0:
+    let xk = l.t.nd[x].k
+    if xk == ast.N_PROPACCESS or xk == ast.N_ELEMACCESS or xk == ast.N_CALL:
+      if (l.t.nd[x].f & 1) != 0: return false
+      x = l.t.nd[x].a
+    elif xk == ast.N_NONNULL: x = l.t.nd[x].a
+    else: break
+  return true
 
 fn nargs(l: L, call: Int) -> Int:
   let a = l.t.nd[call].c
@@ -451,11 +462,9 @@ fn build_decls(var l: L):
     let kd = l.t.nd[x].k
     if kd == ast.N_DECL or kd == ast.N_PARAM: bind_ids(l, l.t.nd[x].a, x, &m)
     elif (kd == ast.N_FUNC or kd == ast.N_FUNCEXPR) and l.t.nd[x].s >= 0:
-      let fs = async_at(l, l.t.nd[x].pos, l.t.nd[x].end)
-      var from = l.t.nd[x].pos
-      if fs >= 0: from = fs
-      let np = fn_name_pos(l, x, from)
-      if np >= 0: m[np] = x
+      # (the name's position as the parser kept it: looking for "async" from the function's start
+      # found one in its body, `async () =>`, and the name after it wasn't there)
+      m[rules.fn_name_pos(l, x)] = x
   l.mc.c9.decl_of = m
   l.mc.c9.decls_done = true
 
@@ -542,9 +551,10 @@ fn react_perf(var l: L, attr: Int):
     elif dk == ast.N_PARAM:
       if i != 0 and i != 1: continue
       let pat = l.t.nd[d].a
-      var r: [Int] = []
-      if k(l, pat) == ast.N_ID: r = init_binding(l, pat, l.sc.ypos[y], l.t.nd[d].c)
-      else: r = init_binding(l, pat, l.sc.ypos[y], -1)
+      # (oxc 1.90 keeps a parameter's own default apart from its pattern, as FormalParameter's
+      # initializer, and find_initialized_binding reads only the pattern: `a = []` isn't one,
+      # `{ a = [] }` is)
+      let r = init_binding(l, pat, l.sc.ypos[y], -1)
       if r[0] < 0: continue
       let iv = violation(l, i, r[1])
       if iv < 0: continue
@@ -825,6 +835,71 @@ fn ar_tail(l: L, lst: Int) -> Int:
     i -= 1
   return -1
 
+# rules.gr_list for always-return, whose search (has_no_return_code_path) stops at a block with no
+# normal, jump or explicit-error edge out and no return or throw. oxc's graph joins a try that has
+# a finally to it only by Finalize edges, which that search doesn't follow: there, the end of a
+# catch, or of a try without one, is such a block (dead), and nothing after the statement is
+# reached. (Elsewhere as getter-return's.)
+fn ar_list(var l: L, lst: Int, reach: Bool, var dead: Bool) -> Bool:
+  var r = reach
+  for i in 0..ast.count(l.t, lst):
+    if not r: return false
+    let x = ast.item(l.t, lst, i)
+    r = ar_stmt(&l, x, r, &dead)
+  return r
+
+fn ar_stmt(var l: L, n: Int, reach: Bool, var dead: Bool) -> Bool:
+  if n <= 0 or not reach: return reach
+  let kd = l.t.nd[n].k
+  if kd == ast.N_BLOCK: return ar_list(&l, l.t.nd[n].a, reach, &dead)
+  if kd == ast.N_RETURN or kd == ast.N_THROW or kd == ast.N_CONTINUE: return false
+  if kd == ast.N_BREAK:
+    rules.fbreak(&l, n, 1)
+    return false
+  if kd == ast.N_IF:
+    let t = ar_stmt(&l, l.t.nd[n].b, true, &dead)
+    var e = true
+    if l.t.nd[n].c > 0: e = ar_stmt(&l, l.t.nd[n].c, true, &dead)
+    return t or e
+  if kd == ast.N_WHILE or kd == ast.N_FOR or kd == ast.N_FORIN or kd == ast.N_DO:
+    rules.fpush(&l, 1, -1)
+    var body = l.t.nd[n].b
+    if kd == ast.N_FOR: body = l.t.nd[n].d
+    elif kd == ast.N_FORIN: body = l.t.nd[n].c
+    elif kd == ast.N_DO: body = l.t.nd[n].a
+    let b = ar_stmt(&l, body, true, &dead)
+    let broke = rules.fpop(&l) != 0
+    if kd == ast.N_DO: return b or broke
+    return true
+  if kd == ast.N_LABEL:
+    rules.fpush(&l, 3, l.t.nd[n].s)
+    let b = ar_stmt(&l, l.t.nd[n].a, true, &dead)
+    let broke = rules.fpop(&l) != 0
+    return b or broke
+  if kd == ast.N_SWITCH:
+    rules.fpush(&l, 2, -1)
+    var r = false
+    let cs = l.t.nd[n].b
+    for i in 0..ast.count(l.t, cs):
+      let c = ast.item(l.t, cs, i)
+      r = ar_list(&l, l.t.nd[c].b, true, &dead)
+    let broke = rules.fpop(&l) != 0
+    return r or broke
+  if kd == ast.N_TRY:
+    let t = ar_stmt(&l, l.t.nd[n].a, true, &dead)
+    if l.t.nd[n].d > 0:
+      if l.t.nd[n].c > 0:
+        if ar_stmt(&l, l.t.nd[n].c, true, &dead): dead = true
+      elif t: dead = true
+      return false
+    var tc = t
+    if l.t.nd[n].c > 0:
+      let c = ar_stmt(&l, l.t.nd[n].c, true, &dead)
+      tc = t or c
+    return tc
+  if kd == ast.N_WITH: return ar_stmt(&l, l.t.nd[n].b, true, &dead)
+  return true
+
 fn always_return(var l: L, f: Int, kd: Int):
   let body = l.t.nd[f].d
   if k(l, body) != ast.N_BLOCK: return
@@ -833,9 +908,10 @@ fn always_return(var l: L, f: Int, kd: Int):
   if not ar_member_call(l, call, "then") or ar_first_arg(l, call) != f: return
   if l.mc.c9.ar_ignore_last and ar_last_callback(&l, call): return
   if l.mc.c9.ar_vars.len > 0 and ar_last_callback(&l, call) and ar_has_ignored(l, f): return
-  let end = rules.gr_list(&l, l.t.nd[body].a, true)
-  if not end: return
-  if ar_tail(l, l.t.nd[body].a) == 1: return
+  var dead = false
+  let end = ar_list(&l, l.t.nd[body].a, true, &dead)
+  if not end and not dead: return
+  if not dead and ar_tail(l, l.t.nd[body].a) == 1: return
   addn(&l, f, "promise(always-return)", "Each then() should return a value or throw", "")
 
 # ---- react(jsx-no-constructed-context-values)
@@ -998,7 +1074,8 @@ fn uf_less_than_two(l: L, ch: [Int]) -> Bool:
     if uf_padding(l, x): continue
     count += 1
     if count >= 2: return false
-    call = k(l, x) == ast.N_JSXEXPR and k(l, l.t.nd[x].a) == ast.N_CALL
+    # (a CallExpression in oxc: `{a?.map(f)}` is a ChainExpression there)
+    call = k(l, x) == ast.N_JSXEXPR and plain_call(l, l.t.nd[x].a)
   return not call
 
 fn uf_single_expr(l: L, ch: [Int]) -> Bool:

@@ -84,6 +84,23 @@ vu_str vl_realpath(const vu_str *path) {
   return vu_str_from(buf, (int64_t)strlen(buf));
 }
 
+// The running executable's full path (its links resolved), or "".
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+vu_str vl_self_exe(void) {
+  char buf[PATH_MAX];
+#ifdef __APPLE__
+  char raw[PATH_MAX];
+  uint32_t n = sizeof raw;
+  if (_NSGetExecutablePath(raw, &n) != 0) return vu_str_from("", 0);
+  if (!realpath(raw, buf)) return vu_str_from("", 0);
+#else
+  if (!realpath("/proc/self/exe", buf)) return vu_str_from("", 0);
+#endif
+  return vu_str_from(buf, (int64_t)strlen(buf));
+}
+
 // Whether a path is a symbolic link (lstat).
 bool vl_is_link(const vu_str *path) {
   char *p = vu_cstr(path);

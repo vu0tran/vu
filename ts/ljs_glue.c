@@ -4,7 +4,13 @@
    share the processes (one process for each two cores by default, see vl_node_setup): a thread
    writes its request without waiting for the others' answers, so the next file is already there
    when the process finishes one, and reads its answer when its turn comes (the process answers in
-   the order it was asked: tickets). A process is started when first needed and is first sent the
+   the order it was asked: tickets). A thread of the process's own (vl_reader, a plain pthread) reads
+   the answers as they come and keeps each until its asker takes it. (The askers used to read them
+   in turn, the holder of the current ticket reading next; but the linting threads are tasks,
+   several to an OS thread at times, and a task waiting for its turn blocked its thread and could
+   keep the ticket's holder from running: nobody read, node stopped on a full fd 4, and the run
+   waited for VLINT_JS_TIMEOUT, losing those files' JS diagnostics; once in a dozen runs on a
+   36,000-file monorepo with tsgolint running beside the linting.) A process is started when first needed and is first sent the
    prelude (the plugin loads and the rules' options), so every process registers the same rules.
    Processes end when their fd 3 closes.
 
@@ -33,13 +39,18 @@ static int vl_debug = 0;
 static pthread_mutex_t vl_spawn_mu = PTHREAD_MUTEX_INITIALIZER;
 static double vl_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec / 1e9; }
 #define VL_DBG(...) do { if (vl_debug) { fprintf(stderr, "vlint js %.3f: ", vl_now()); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
-/* mu: starting the process and writing requests (taking a ticket); rmu, cv: reading answers in
-   ticket order. broken: the process died or a write failed; the next writer restarts it (gen
-   counts restarts, so the waiters of a dead process give up). Lock order: mu, then rmu. */
+/* mu: starting the process and writing requests (taking a ticket); rmu, cv: the answers (ans[t]
+   for ticket t, nans read so far). broken: the process died or a write failed; the next writer
+   restarts it (gen counts restarts, so the waiters of a dead process give up). Lock order: mu, then
+   rmu. The reader thread alone uses buf while it runs, and takes rmu to store an answer. */
 typedef struct {
     pid_t pid; int in, out; char *buf; size_t len, cap, have, next;
     pthread_mutex_t mu, rmu; pthread_cond_t cv;
     long tickets, serving; int gen, broken, timed_out;
+    char **ans; size_t *alen; long nans, acap;
+    pthread_t reader; int has_reader;
+    /* the request being answered when the process died (it gets "!", "!t" when it was stuck) */
+    int died_gen, died_to; long died_t;
 } vl_worker;
 static vl_worker vlw[VL_MAXW];
 static pthread_mutex_t vl_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -53,10 +64,11 @@ static int vl_slots = 1, vl_next_slot = 0, vl_inited = 0;
 static char vl_pool[32] = "";     /* --v8-pool-size=N for the processes, or "" */
 static __thread int vl_slot = -1;
 
+/* (rmu not held: the reader may be waiting for it) */
 static void vl_stop(vl_worker *w) {
     if (w->pid < 0) return;
     close(w->in);
-    close(w->out);
+    if (!w->has_reader) close(w->out);
     int st;
     /* (it ends when its fd 3 closes; one that doesn't within 2 s, or that was found stuck, is killed) */
     if (w->timed_out) kill(w->pid, SIGKILL);
@@ -73,6 +85,12 @@ static void vl_stop(vl_worker *w) {
         struct timespec ts = {0, 10000000};
         nanosleep(&ts, NULL);
     }
+    /* (the process has ended: its fd 4 is at its end and the reader stops) */
+    if (w->has_reader) { pthread_join(w->reader, NULL); w->has_reader = 0; close(w->out); }
+    pthread_mutex_lock(&w->rmu);
+    for (long i = 0; i < w->nans; i++) free(w->ans[i]);
+    w->nans = 0;
+    pthread_mutex_unlock(&w->rmu);
     w->timed_out = 0;
     w->pid = -1; w->in = w->out = -1;
     w->have = w->next = 0;
@@ -90,6 +108,8 @@ static void vl_init_once(void) {
         pthread_cond_init(&vlw[i].cv, NULL);
         vlw[i].have = vlw[i].next = 0;
         vlw[i].tickets = vlw[i].serving = 0; vlw[i].gen = 0; vlw[i].broken = 0; vlw[i].timed_out = 0;
+        vlw[i].ans = NULL; vlw[i].alen = NULL; vlw[i].nans = vlw[i].acap = 0; vlw[i].has_reader = 0;
+        vlw[i].died_gen = -1; vlw[i].died_t = -1; vlw[i].died_to = 0;
     }
     atexit(vl_atexit);
     const char *t = getenv("VLINT_JS_TIMEOUT");
@@ -167,7 +187,7 @@ static bool vl_write(vl_worker *wk, int fd, const char *p, size_t n) {
 
 /* reads one answer line: w->buf[0..w->len) (without the newline), false when the process died.
    What was read past the line (the next answers) stays in the buffer for the next call. */
-static bool vl_recv(vl_worker *w) {
+static bool vl_recv(vl_worker *w, bool limit) {
     if (w->next > 0) {
         memmove(w->buf, w->buf + w->next, w->have - w->next);
         w->have -= w->next;
@@ -183,7 +203,7 @@ static bool vl_recv(vl_worker *w) {
         }
         scanned = w->have;
         if (w->cap - w->have < 65536) { w->cap = w->cap ? w->cap * 2 : 131072; w->buf = realloc(w->buf, w->cap); }
-        if (!vl_ready(w->out, POLLIN)) {
+        if (limit && !vl_ready(w->out, POLLIN)) {
             VL_DBG("process %d gave no answer for %d s: killed", (int)w->pid, vl_timeout_ms / 1000);
             w->timed_out = 1;
             kill(w->pid, SIGKILL);
@@ -193,6 +213,59 @@ static bool vl_recv(vl_worker *w) {
         do r = read(w->out, w->buf + w->have, w->cap - w->have); while (r < 0 && errno == EINTR);
         if (r <= 0) return false;
         w->have += (size_t)r;
+    }
+}
+
+/* A request's line, with U+2028 and U+2029 written as \u2028 and \u2029: node's readline ends a
+   line at either (JSON.stringify leaves them as they are, and so does vlint), so a file holding one
+   was read as two requests and answered twice, and every later answer of that process went to the
+   file after its own (thousands of JS diagnostics on the wrong files in a 36,000-file monorepo
+   with one such file). Raw, they can only be inside a JSON string, where the escape means the same. */
+static bool vl_write_req(vl_worker *w, const char *p, size_t n) {
+    size_t from = 0;
+    for (size_t i = 0; i + 2 < n; i++) {
+        if ((unsigned char)p[i] == 0xE2 && (unsigned char)p[i + 1] == 0x80 && ((unsigned char)p[i + 2] == 0xA8 || (unsigned char)p[i + 2] == 0xA9)) {
+            if (!vl_write(w, w->in, p + from, i - from)) return false;
+            if (!vl_write(w, w->in, (unsigned char)p[i + 2] == 0xA8 ? "\\u2028" : "\\u2029", 6)) return false;
+            i += 2;
+            from = i + 1;
+        }
+    }
+    return vl_write(w, w->in, p + from, n - from);
+}
+
+/* A process's reader: each answer line kept for its ticket, in order; at the end of the output (the
+   process died, was killed or was stopped) its waiters are told (broken, gen). */
+typedef struct { vl_worker *w; int gen; } vl_rarg;
+static void *vl_reader(void *arg) {
+    vl_rarg *ra = arg;
+    vl_worker *w = ra->w;
+    int gen = ra->gen;
+    free(ra);
+    for (;;) {
+        bool ok = vl_recv(w, false);
+        pthread_mutex_lock(&w->rmu);
+        if (w->gen != gen) { pthread_mutex_unlock(&w->rmu); return NULL; }
+        if (!ok) {
+            w->died_gen = gen; w->died_t = w->nans; w->died_to = w->timed_out;
+            w->broken = 1; w->gen++;
+            pthread_cond_broadcast(&w->cv);
+            pthread_mutex_unlock(&w->rmu);
+            return NULL;
+        }
+        if (w->nans == w->acap) {
+            w->acap = w->acap ? w->acap * 2 : 1024;
+            w->ans = realloc(w->ans, (size_t)w->acap * sizeof *w->ans);
+            w->alen = realloc(w->alen, (size_t)w->acap * sizeof *w->alen);
+        }
+        char *a = malloc(w->len + 1);
+        memcpy(a, w->buf, w->len);
+        w->ans[w->nans] = a;
+        w->alen[w->nans] = w->len;
+        VL_DBG("process %d: answer %ld, %zu bytes", (int)w->pid, w->nans, w->len);
+        w->nans++;
+        pthread_cond_broadcast(&w->cv);
+        pthread_mutex_unlock(&w->rmu);
     }
 }
 
@@ -250,10 +323,18 @@ static bool vl_start(vl_worker *w) {
         const char *nl = memchr(p, '\n', (size_t)(e - p));
         if (!nl) nl = e;
         if (nl > p) {
-            if (!vl_write(w, w->in, p, (size_t)(nl - p)) || !vl_write(w, w->in, "\n", 1) || !vl_recv(w)) { vl_stop(w); return false; }
+            if (!vl_write_req(w, p, (size_t)(nl - p)) || !vl_write(w, w->in, "\n", 1) || !vl_recv(w, true)) { vl_stop(w); return false; }
         }
         p = nl + 1;
     }
+    /* (what the prelude's answers left in buf is the reader's now) */
+    vl_rarg *ra = malloc(sizeof *ra);
+    ra->w = w;
+    pthread_mutex_lock(&w->rmu);
+    ra->gen = w->gen;
+    pthread_mutex_unlock(&w->rmu);
+    if (pthread_create(&w->reader, NULL, vl_reader, ra) != 0) { free(ra); vl_stop(w); return false; }
+    w->has_reader = 1;
     return true;
 }
 
@@ -346,8 +427,8 @@ static void vl_req_path(const vu_str *req, char *out, size_t cap) {
 static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
     pthread_mutex_lock(&w->mu);
     if (w->broken || w->pid < 0) {
-        pthread_mutex_lock(&w->rmu);
         if (w->pid >= 0) vl_stop(w);
+        pthread_mutex_lock(&w->rmu);
         w->broken = 0; w->gen++; w->tickets = w->serving = 0;
         pthread_cond_broadcast(&w->cv);
         pthread_mutex_unlock(&w->rmu);
@@ -358,7 +439,7 @@ static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
         vl_req_path(req, path, sizeof path);
         VL_DBG("process %d: sending request of %lld bytes on its fd 3 (vlint's fd %d), ticket %ld%s%s", (int)w->pid, (long long)req->len, w->in, w->tickets, path[0] ? ": " : "", path);
     }
-    bool ok = vl_write(w, w->in, req->data, (size_t)req->len) && vl_write(w, w->in, "\n", 1);
+    bool ok = vl_write_req(w, req->data, (size_t)req->len) && vl_write(w, w->in, "\n", 1);
     pthread_mutex_lock(&w->rmu);
     VL_DBG("process %d: request of %lld bytes sent (%s), ticket %ld", (int)w->pid, (long long)req->len, ok ? "ok" : "failed", w->tickets);
     if (ok && !w->broken) { *t = w->tickets++; *g = w->gen; }
@@ -389,21 +470,47 @@ vu_str vl_node_call(const vu_str *req) {
         if (!vl_send(w, req, &t, &g)) return vu_str_from("!", 1);
         if (g < 0) continue;
         pthread_mutex_lock(&w->rmu);
-        while (w->gen == g && w->serving != t) pthread_cond_wait(&w->cv, &w->rmu);
-        if (w->gen != g) { pthread_mutex_unlock(&w->rmu); continue; }
-        vu_str res;
-        if (vl_recv(w)) {
-            VL_DBG("process %d: answer %ld, %zu bytes", (int)w->pid, t, w->len);
-            res = vu_str_from(w->buf, (int64_t)w->len);
-            w->serving++;
-        } else {
-            /* ("!t": it was stuck and was killed) */
-            int to = w->timed_out;
-            w->broken = 1; w->gen++;
-            res = to ? vu_str_from("!t", 2) : vu_str_from("!", 1);
+        /* (no answer to the oldest request for VLINT_JS_TIMEOUT seconds: the process is stuck and is
+           killed; its reader then tells the waiters) */
+        bool killed = false;
+        double until = vl_now() + (vl_timeout_ms < 0 ? 0 : vl_timeout_ms / 1000.0);
+        long seen = w->nans;
+        while (w->gen == g && w->nans <= t) {
+            if (vl_timeout_ms < 0 || killed) { pthread_cond_wait(&w->cv, &w->rmu); continue; }
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            double left = until - vl_now();
+            if (left < 0) left = 0;
+            ts.tv_sec += (time_t)left;
+            ts.tv_nsec += (long)((left - (double)(time_t)left) * 1e9);
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            pthread_cond_timedwait(&w->cv, &w->rmu, &ts);
+            if (w->gen != g || w->nans > t) break;
+            /* (an answer came: the process is alive, the time starts again) */
+            if (w->nans != seen) { seen = w->nans; until = vl_now() + vl_timeout_ms / 1000.0; continue; }
+            if (vl_now() >= until) {
+                VL_DBG("process %d gave no answer for %d s: killed", (int)w->pid, vl_timeout_ms / 1000);
+                w->timed_out = 1;
+                kill(w->pid, SIGKILL);
+                killed = true;
+            }
         }
-        pthread_cond_broadcast(&w->cv);
+        if (w->gen != g) {
+            /* (the process died answering this one: "!", "!t" when it was stuck; the ones after it
+               are sent again) */
+            bool mine = w->died_gen == g && w->died_t == t;
+            int to = w->died_to;
+            pthread_mutex_unlock(&w->rmu);
+            if (mine) return to ? vu_str_from("!t", 2) : vu_str_from("!", 1);
+            continue;
+        }
+        char *a = w->ans[t];
+        size_t al = w->alen[t];
+        w->ans[t] = NULL;
+        w->serving++;
         pthread_mutex_unlock(&w->rmu);
+        vu_str res = vu_str_from(a, (int64_t)al);
+        free(a);
         return res;
     }
     return vu_str_from("!", 1);
@@ -415,5 +522,110 @@ void vl_node_stop(void) {
     vl_init_once();
     for (int i = 0; i < VL_MAXW; i++) { pthread_mutex_lock(&vlw[i].mu); vl_stop(&vlw[i]); pthread_mutex_unlock(&vlw[i].mu); }
     pthread_mutex_unlock(&vl_mu);
+}
+
+
+/* tsgolint as a process of its own, started without waiting (vl_proc_start: exe "headless", standard
+   input from the payload file, output and errors to files) and waited for when its answer is
+   needed (vl_proc_wait: the exit status, 128 + the signal when one ended it, -1 when it couldn't
+   start). (A task running it with os.run held its thread, the main thread's at times, for the
+   whole run.) */
+int64_t vl_proc_start(const vu_str *exe, const vu_str *pin, const vu_str *pout, const vu_str *perr) {
+    char *e = vu_cstr(exe), *i = vu_cstr(pin), *o = vu_cstr(pout), *r = vu_cstr(perr);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, i, O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, o, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_addopen(&fa, 2, r, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    char *argv[3] = { e, "headless", NULL };
+    pid_t pid;
+    int rc = posix_spawnp(&pid, e, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    free(e); free(i); free(o); free(r);
+    return rc == 0 ? (int64_t)pid : -1;
+}
+int64_t vl_proc_wait(int64_t pid) {
+    if (pid <= 0) return -1;
+    int st;
+    while (waitpid((pid_t)pid, &st, 0) < 0) { if (errno != EINTR) return -1; }
+    if (WIFEXITED(st)) return WEXITSTATUS(st);
+    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
+    return -1;
+}
+
+/* Which program tsgolint puts each file in: tsgolint run on the payload with OXC_LOG=debug prints,
+   once it has looked up every file's tsconfig ("Got tsconfig for file F: T", T "<none>" for its
+   inferred program) and before it builds any program, "Done assigning files to programs"; it is
+   stopped there. Returns "F\tT\n" per file ("" when that line never came: an exit, or another
+   log format). */
+vu_str vl_tsgo_assign(const vu_str *exe, const vu_str *pin) {
+    char *e = vu_cstr(exe), *in = vu_cstr(pin);
+    int p[2];
+    if (pipe(p) != 0) { free(e); free(in); return vu_str_from("", 0); }
+    fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, in, O_RDONLY, 0);
+    posix_spawn_file_actions_addopen(&fa, 1, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, p[1], 2);
+    posix_spawn_file_actions_addclose(&fa, p[1]);
+    size_t ne = 0;
+    while (environ[ne]) ne++;
+    char **env = malloc((ne + 2) * sizeof *env);
+    size_t k = 0;
+    for (size_t i = 0; i < ne; i++) if (strncmp(environ[i], "OXC_LOG=", 8) != 0) env[k++] = environ[i];
+    env[k++] = "OXC_LOG=debug";
+    env[k] = NULL;
+    char *argv[3] = { e, "headless", NULL };
+    pid_t pid;
+    int rc = posix_spawnp(&pid, e, &fa, NULL, argv, env);
+    posix_spawn_file_actions_destroy(&fa);
+    free(env);
+    close(p[1]);
+    free(e); free(in);
+    if (rc != 0) { close(p[0]); return vu_str_from("", 0); }
+    size_t cap = 1 << 20, len = 0, scan = 0;
+    char *buf = malloc(cap);
+    char *out = NULL; size_t olen = 0, ocap = 0;
+    int done = 0;
+    static const char got[] = "Got tsconfig for file ";
+    static const char fin[] = "Done assigning files to programs";
+    while (!done) {
+        if (cap - len < 65536) { cap *= 2; buf = realloc(buf, cap); }
+        ssize_t r = read(p[0], buf + len, cap - len);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        len += (size_t)r;
+        for (;;) {
+            char *nl = memchr(buf + scan, '\n', len - scan);
+            if (!nl) break;
+            char *ln = buf + scan;
+            size_t ll = (size_t)(nl - ln);
+            scan = (size_t)(nl - buf) + 1;
+            char *g = memmem(ln, ll, got, sizeof got - 1);
+            if (g) {
+                char *f = g + sizeof got - 1;
+                size_t fl = (size_t)(nl - f);
+                /* (the last ": " splits the file from its tsconfig) */
+                char *sep = NULL;
+                for (char *q = f; q + 1 < nl; q++) if (q[0] == ':' && q[1] == ' ') sep = q;
+                if (!sep) continue;
+                if (olen + fl + 2 > ocap) { ocap = (olen + fl + 2) * 2 + 4096; out = realloc(out, ocap); }
+                memcpy(out + olen, f, (size_t)(sep - f)); olen += (size_t)(sep - f);
+                out[olen++] = '\t';
+                memcpy(out + olen, sep + 2, (size_t)(nl - sep - 2)); olen += (size_t)(nl - sep - 2);
+                out[olen++] = '\n';
+                (void)fl;
+            } else if (memmem(ln, ll, fin, sizeof fin - 1)) { done = 1; break; }
+        }
+    }
+    kill(pid, SIGKILL);
+    close(p[0]);
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    free(buf);
+    vu_str res = done && out ? vu_str_from(out, (int64_t)olen) : vu_str_from("", 0);
+    free(out);
+    return res;
 }
 

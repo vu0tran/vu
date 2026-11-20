@@ -263,49 +263,174 @@ fn sval(js: lconf.Json, o: Int, key: Str) -> Str:
   return js.v[x].s + ""
 
 # Messages: | payload size (u32 LE) | type (u8) | JSON payload |
+# tsgolint's framed messages (4-byte little-endian size, type, JSON), in order: the frames found first,
+# then parsed on all cores in chunks (hundreds of megabytes on a large monorepo)
 fn parse_messages(out: Str) -> [Msg]:
-  var ms: [Msg] = []
+  var starts: [Int] = []
   var i = 0
   while i + 5 <= out.len:
     let size = out.read_le(i, 4)
-    let ty = int(out[i + 4])
     if i + 5 + size > out.len: break
-    let js = lconf.parse_json(out[i + 5..i + 5 + size])
+    starts.push(i)
     i += 5 + size
-    if js.err != "" or js.v.len == 0: continue
-    if ty == 0:
-      ms.push(Msg(0, "", "", -1, -1, "", sval(js, 0, "error"), "", false, [], [], [], 0))
-      continue
-    if ty != 1: continue
-    let kind = num(js, 0, "kind")
-    var m = Msg(1, sval(js, 0, "rule"), sval(js, 0, "file_path"), -1, -1, "", "", "", false, [], [], [], 0)
-    if kind == 1: m.kind = 2
-    let rg = lconf.get(js, 0, "range")
-    if rg >= 0 and js.v[rg].k == lconf.J_OBJ:
-      m.pos = num(js, rg, "pos")
-      m.end = num(js, rg, "end")
-    let mo = lconf.get(js, 0, "message")
-    if mo >= 0:
-      m.id = sval(js, mo, "id")
-      m.msg = sval(js, mo, "description")
-      let h = lconf.get(js, mo, "help")
-      if h >= 0 and js.v[h].k == lconf.J_STR:
-        m.help = js.v[h].s + ""
-        m.has_help = true
-    let lr = lconf.get(js, 0, "labeled_ranges")
-    if lr >= 0 and js.v[lr].k == lconf.J_ARR:
-      for x in js.v[lr].kids:
-        let r = lconf.get(js, x, "range")
-        m.labs.push(num(js, r, "pos"))
-        m.labs.push(num(js, r, "end"))
-        m.ltext.push(sval(js, x, "label"))
-    let fx = lconf.get(js, 0, "fixes")
-    if fx >= 0 and js.v[fx].k == lconf.J_ARR:
-      for x in js.v[fx].kids:
-        let r = lconf.get(js, x, "range")
-        m.fixes.push("{num(js, r, "pos")}")
-        m.fixes.push("{num(js, r, "end")}")
-        m.fixes.push(sval(js, x, "text"))
-        m.nfix += 1
-    ms.push(m)
+  let n = starts.len
+  var nch = 64
+  if n < 4096: nch = 1
+  var parts: [[Msg]] = []
+  for _ in 0..nch: parts.push([])
+  par for c in 0..nch:
+    for k in c * n / nch..(c + 1) * n / nch:
+      if not fast_frame(out, starts[k], &parts[c]): parse_frame(out, starts[k], &parts[c])
+  var ms: [Msg] = []
+  for c in 0..nch:
+    for k in 0..parts[c].len:
+      var m = Msg(0, "", "", -1, -1, "", "", "", false, [], [], [], 0)
+      swap(&m, &parts[c][k])
+      ms.push(m)
   return ms
+
+# A frame in the layout nearly all of tsgolint's diagnostics take, read without building a JSON tree:
+# {"kind":K,"range":{"pos":P,"end":E},"message":{"id":"..","description":".."[,"help":".."]},
+# "file_path":".."[,"rule":".."]} with no escape in any string. False for anything else (labels,
+# fixes, suggestions, an escape, another order), which parse_frame reads. (1.55 million messages,
+# 514 MB, on one monorepo: the JSON trees were most of the time reading them took.)
+fn fast_frame(out: Str, i: Int, var ms: [Msg]) -> Bool:
+  let size = out.read_le(i, 4)
+  if out[i + 4] != 1: return false
+  let e = i + 5 + size
+  var p = i + 5
+  if not lit(out, p, "{{\"kind\":"): return false
+  p += 8
+  if p >= e: return false
+  let kc = out[p]
+  if kc != '0' and kc != '1': return false
+  p += 1
+  if not lit(out, p, ",\"range\":{{\"pos\":"): return false
+  p += 16
+  let pos = fnum(out, p, e)
+  if pos < 0: return false
+  p = fnum_end(out, p, e)
+  if not lit(out, p, ",\"end\":"): return false
+  p += 7
+  let end = fnum(out, p, e)
+  if end < 0: return false
+  p = fnum_end(out, p, e)
+  if not lit(out, p, "}},\"message\":{{\"id\":\""): return false
+  p += 19
+  let id_e = fstr_end(out, p, e)
+  if id_e < 0: return false
+  let id = out[p..id_e]
+  p = id_e
+  if not lit(out, p, "\",\"description\":\""): return false
+  p += 17
+  let d_e = fstr_end(out, p, e)
+  if d_e < 0: return false
+  let desc = out[p..d_e]
+  p = d_e
+  var help = ""
+  var has_help = false
+  if lit(out, p, "\",\"help\":\""):
+    p += 10
+    let h_e = fstr_end(out, p, e)
+    if h_e < 0: return false
+    help = out[p..h_e]
+    has_help = true
+    p = h_e
+  if not lit(out, p, "\"}},\"file_path\":\""): return false
+  p += 16
+  let f_e = fstr_end(out, p, e)
+  if f_e < 0: return false
+  let file = out[p..f_e]
+  p = f_e
+  var rule = ""
+  if lit(out, p, "\",\"rule\":\""):
+    p += 10
+    let r_e = fstr_end(out, p, e)
+    if r_e < 0: return false
+    rule = out[p..r_e]
+    p = r_e
+    if not lit(out, p, "\"}}") or p + 2 != e: return false
+  elif not lit(out, p, "\"}}") or p + 2 != e: return false
+  var m = Msg(1, rule, file, pos, end, id, desc, help, has_help, [], [], [], 0)
+  if kc == '1': m.kind = 2
+  ms.push(m)
+  return true
+
+# whether s has l at p (8 bytes at a time)
+fn lit(s: Str, p: Int, l: Str) -> Bool:
+  if p < 0 or p + l.len > s.len: return false
+  var k = 0
+  while k + 8 <= l.len:
+    if s.read_le(p + k, 8) != l.read_le(k, 8): return false
+    k += 8
+  while k < l.len:
+    if s[p + k] != l[k]: return false
+    k += 1
+  return true
+
+# a non-negative integer's value at p (before e), -1 none; fnum_end: where its digits end
+fn fnum(s: Str, p: Int, e: Int) -> Int:
+  var q = p
+  var v = 0
+  while q < e and s[q] >= '0' and s[q] <= '9' and q - p < 18:
+    v = v * 10 + int(s[q]) - 48
+    q += 1
+  if q == p: return -1
+  return v
+
+fn fnum_end(s: Str, p: Int, e: Int) -> Int:
+  var q = p
+  while q < e and s[q] >= '0' and s[q] <= '9': q += 1
+  return q
+
+# where a string's text that starts at p ends (its closing quote), -1 when it has an escape or
+# doesn't end before e
+fn fstr_end(s: Str, p: Int, e: Int) -> Int:
+  var q = p
+  while q < e:
+    let c = s[q]
+    if c == '"': return q
+    if c == '\\': return -1
+    q += 1
+  return -1
+
+fn parse_frame(out: Str, i: Int, var ms: [Msg]):
+  let size = out.read_le(i, 4)
+  let ty = int(out[i + 4])
+  let js = lconf.parse_json(out[i + 5..i + 5 + size])
+  if js.err != "" or js.v.len == 0: return
+  if ty == 0:
+    ms.push(Msg(0, "", "", -1, -1, "", sval(js, 0, "error"), "", false, [], [], [], 0))
+    return
+  if ty != 1: return
+  let kind = num(js, 0, "kind")
+  var m = Msg(1, sval(js, 0, "rule"), sval(js, 0, "file_path"), -1, -1, "", "", "", false, [], [], [], 0)
+  if kind == 1: m.kind = 2
+  let rg = lconf.get(js, 0, "range")
+  if rg >= 0 and js.v[rg].k == lconf.J_OBJ:
+    m.pos = num(js, rg, "pos")
+    m.end = num(js, rg, "end")
+  let mo = lconf.get(js, 0, "message")
+  if mo >= 0:
+    m.id = sval(js, mo, "id")
+    m.msg = sval(js, mo, "description")
+    let h = lconf.get(js, mo, "help")
+    if h >= 0 and js.v[h].k == lconf.J_STR:
+      m.help = js.v[h].s + ""
+      m.has_help = true
+  let lr = lconf.get(js, 0, "labeled_ranges")
+  if lr >= 0 and js.v[lr].k == lconf.J_ARR:
+    for x in js.v[lr].kids:
+      let r = lconf.get(js, x, "range")
+      m.labs.push(num(js, r, "pos"))
+      m.labs.push(num(js, r, "end"))
+      m.ltext.push(sval(js, x, "label"))
+  let fx = lconf.get(js, 0, "fixes")
+  if fx >= 0 and js.v[fx].k == lconf.J_ARR:
+    for x in js.v[fx].kids:
+      let r = lconf.get(js, x, "range")
+      m.fixes.push("{num(js, r, "pos")}")
+      m.fixes.push("{num(js, r, "end")}")
+      m.fixes.push(sval(js, x, "text"))
+      m.nfix += 1
+  ms.push(m)
