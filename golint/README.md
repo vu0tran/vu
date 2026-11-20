@@ -136,6 +136,21 @@ what the ten still do each for themselves is mostly type-checking the imported d
 (shared, it would need their objects and types numbered apart from each worker's, and types compared
 by structure rather than by number), and copying the parsed files.
 
+**3.4 s uncached (later on 2026-11-20).** Median 3.44 s, best 3.40, over 8 runs on the 2,981
+packages (end to end, output checked each time; Spotlight and media analysis used about half a core
+to a core meanwhile). Without the cache the workers start right after the folder walk (0.04 s, on 4
+threads): each builds its folders' packages itself, reading their files through a Memo the imported
+packages' loader shares, and the results go into go list's order afterwards, from the imports the
+workers report (`stream_lint`; `VGOLINT_STREAM=0` reads everything first, as the cache does). The
+scanner tells keywords apart in place and the parser interns names from the source bytes; vet and
+gocyclo walk without a list per node, and the other linters reuse vet's walk; staticcheck compares
+callee names in place and builds doc comments only when they hold a deprecation; printf keeps each
+function's print kind. Nothing is freed before the run's exit (the Memos live in `run_lint`, and
+workers park their state in a channel): freeing kept main, which shares a thread with a worker,
+waiting up to half a second. Vu's runtime now finds its string pool with one thread-local lookup
+instead of two (macOS makes each a call). User time 32.7 -> 28.0 s; exit, unmapping about 6 GB,
+takes 0.10 to 0.14 s of the run.
+
 ## Drop-in status
 
 ### Commands
