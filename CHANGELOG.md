@@ -3037,3 +3037,18 @@ par ones can't be built with it on macOS (no OpenMP in Apple's clang) and were r
 Not done: Memo in generic functions, and in `--lib` exports (a panic caught there would leave a key
 being computed). vgolint is its first user: each imported package is read, and each of its files
 parsed, once for all the workers.
+
+**Sanitizer builds and AVX-512 (2026-11-20).** CI's `mcp (ubuntu-24.04)` job started failing on
+the `20261116.376.1` image: mcp/time's sanitizer build stopped at startup with an AddressSanitizer
+"SEGV on unknown address ... dereference of a high value address" in `fn_zone` (the first
+`time.parse_tzif`). Only some runs failed: the ones on AMD Zen 4 (EPYC 9V45, 9V74). `vu build --san`
+compiles with `-march=native`, and there gcc 13.3 spills AVX-512 registers to 64-byte aligned stack
+slots (`vmovdqa64 ZMMWORD PTR [rbx-0x340],zmm5`, the faulting instruction); the image's libasan8
+(from gcc 14.2) turns on fake stack frames for use-after-return checks by default, and those are
+32-byte aligned, so the aligned store faults (a #GP, which the sanitizer can only report as a high
+address). Measured on CI (a throwaway branch's runs, 6 runners): Zen 4 code under the sanitizers
+crashed 20 of 20 times with the runtime's default, 0 of 20 with `detect_stack_use_after_return=0`,
+built with `--param asan-use-after-return=0` or built with `-mno-avx512f`; it crashes the same way on
+an Intel Xeon 6975P-C, whose own native code doesn't spill there. Sanitizer builds on x86-64 now
+add `-mno-avx512f` (AVX2's 32-byte slots fit the fake frames), which keeps the new use-after-return
+checks rather than turning them off.
