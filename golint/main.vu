@@ -101,9 +101,13 @@ fn check_on(c: cfg.Cfg, is: pkg.Issue, gover: Int) -> Bool:
 fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c: cfg.Cfg, var rs: proc.Rxs, var rs_ready: Bool, diff: Bool, ch: proc.Changed, var dict: lints.Dict) -> Res:
   var p = pkg.new_pkg(sp.dir)
   for f in sp.files:
-    # (the sources read before the workers started, else from disk)
+    # (the sources read before the workers started, else through mfile, else from disk)
     var src = ""
     if f in g.msrc.value: src = g.msrc.value[f] + ""
+    elif g.stream:
+      let sv = g.mfile.get(f, fn(fp) => tc.read_src(fs, fp))
+      if not sv.value.ok: continue
+      src = sv.value.text + ""
     else: src = fs.read(f) else continue
     pkg.add_file(&p, f, src, &kw)
   var cnt = proc.new_counts(c)
@@ -213,6 +217,176 @@ fn worker(fs: Fs, os: Os, tm: Bool, own msrc: Shared[{Str: Str}], own dsrc: Memo
       r.idx = i
       res.send(r)
   if tm: eprint("T worker: {g.pk.len} packages loaded, done at {os.clock()}")
+
+# What a stream_lint worker sends for one folder: its packages (0 to 2: the package and its external
+# test package), each one's imports (spec_deps) and lint result.
+type DRes:
+  dir: Int
+  specs: [Spec]
+  deps: [[Str]]
+  res: [Res]
+
+# The packages in folder d, as run_lint builds them from the sources it reads first: the package
+# (its files, then its tests) and the external test package. Their files are read through mf.
+fn dir_specs(fs: Fs, d: load.Dir, c: cfg.Cfg, modpath: Str, var kw: {Str: Int}, mf: Memo[Str, tc.Src]) -> [Spec]:
+  var main_files: [Str] = []
+  var x_files: [Str] = []
+  var pname = ""
+  for nm in d.files:
+    if not load.good_name(nm): continue
+    if not c.tests and nm.endswith("_test.go"): continue
+    var path = d.path + "/" + nm
+    if d.path == ".": path = nm + ""
+    let sv = mf.get(path, fn(p) => tc.read_src(fs, p))
+    if not sv.value.ok: continue
+    if not load.good_constraints(sv.value.text, c.build_tags): continue
+    let name = package_name(sv.value.text, &kw)
+    if nm.endswith("_test.go") and name.endswith("_test") and name != pname:
+      x_files.push(path)
+    else:
+      if not nm.endswith("_test.go") or pname.len == 0: pname = name + ""
+      main_files.push(path)
+  var ip = modpath + ""
+  if d.path != ".": ip = modpath + "/" + d.path
+  var ordered: [Str] = []
+  for f in main_files:
+    if not f.endswith("_test.go"): ordered.push(f + "")
+  for f in main_files:
+    if f.endswith("_test.go"): ordered.push(f + "")
+  var out: [Spec] = []
+  if main_files.len > 0: out.push(Spec(d.path + "", ordered, ip + ""))
+  if x_files.len > 0: out.push(Spec(d.path + "", x_files, ip + "_test"))
+  return out
+
+fn dworker(fs: Fs, os: Os, tm: Bool, own dirs: Shared[[load.Dir]], own modpath: Str, own mf: Memo[Str, tc.Src], own dsrc: Memo[Str, tc.DepPkg], own dast: Memo[Str, tc.DepFile], own rxc: Memo[Str, rx.Rx], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[DRes], own goroot: Str, own modcache: Str, gover: Int):
+  var kw = scan.keywords()
+  var g = tc.new_prog(goroot, modcache)
+  g.mfile = mf.share()
+  g.dsrc = dsrc
+  g.dast = dast
+  g.trace = tm
+  g.stream = true
+  for t in conf.value.build_tags: g.tags.push(t + "")
+  tc.read_gomod(fs, &g, ".")
+  var rs = proc.Rxs([], [], [], [], [], [], [], [], [], [], rxc)
+  var rs_ready = false
+  var dict = lints.Dict({}, {}, {}, [], [])
+  if cfg.is_enabled(conf.value, "misspell"): dict = lints.new_dict(conf.value)
+  var ri = 0
+  while ri < jobs.len:
+    let di = jobs[ri].recv() else -1
+    if di < 0:
+      ri += 1
+      continue
+    var dr = DRes(di, dir_specs(fs, dirs.value[di], conf.value, modpath, &kw, mf), [], [])
+    for si in 0..dr.specs.len:
+      dr.deps.push(spec_deps(fs, dr.specs[si], &kw, mf))
+      let ts = os.clock()
+      var r = lint_one(fs, dr.specs[si], &g, &kw, gover, conf.value, &rs, &rs_ready, diff, chg.value, &dict)
+      if tm and os.clock() - ts > 0.3: eprint("T package {dr.specs[si].path}: {os.clock() - ts} (ends at {os.clock()})")
+      dr.res.push(r)
+    res.send(dr)
+  if tm: eprint("T worker: {g.pk.len} packages loaded, done at {os.clock()}")
+
+# Without the cache: the workers start as soon as the folders are known, each building the packages
+# of the folders it's given (dir_specs), their files read through one Memo the imported packages'
+# loader shares, and linting them; the results are then put in golist_order's order, from the
+# imports the workers report. (Run_lint reads every file and orders the packages first otherwise:
+# the cache keys need the sources.)
+fn stream_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, shc: Shared[cfg.Cfg], own dirs0: [load.Dir], modpath: Str, goroot: Str, modcache: Str, own ch: proc.Changed, diff: Bool, tm: Bool, t0: Float, var results: [[proc.Iss]], var perrs: [Str], var tot: proc.Counts) throws:
+  let c = shc.value
+  # (folders in path order, handed out in regions of about the same number of files, the two
+  # biggest of each first: see run_lint)
+  var byname: {Str: Int} = {}
+  var paths: [Str] = []
+  for i in 0..dirs0.len:
+    byname[dirs0[i].path + ""] = i
+    paths.push(dirs0[i].path + "")
+  paths.sort()
+  var sorted: [Int] = []
+  for pth in paths: sorted.push(byname[pth])
+  let nd = dirs0.len
+  var jobs = o.jobs
+  if jobs == 0: jobs = c.concurrency
+  if jobs == 0: jobs = cpu_count(fs, ffi)
+  if jobs > nd: jobs = nd
+  if jobs < 1: jobs = 1
+  var wt: [Int] = []
+  var total = 0
+  for k in sorted:
+    wt.push(dirs0[k].files.len)
+    total += dirs0[k].files.len
+  var ordered: [Int] = []
+  var rlen: [Int] = []
+  var i0 = 0
+  for r in 0..jobs:
+    var i1 = i0
+    var acc = 0
+    let want = total * (r + 1) / jobs - total * r / jobs
+    while i1 < sorted.len and (acc < want or r == jobs - 1):
+      acc += wt[i1]
+      i1 += 1
+    var big1 = -1
+    var big2 = -1
+    for i in i0..i1:
+      if big1 < 0 or wt[i] > wt[big1]:
+        big2 = big1
+        big1 = i
+      elif big2 < 0 or wt[i] > wt[big2]: big2 = i
+    if big1 >= 0: ordered.push(sorted[big1])
+    if big2 >= 0: ordered.push(sorted[big2])
+    for i in i0..i1:
+      if i != big1 and i != big2: ordered.push(sorted[i])
+    rlen.push(i1 - i0)
+    i0 = i1
+  var chs: [Chan[Int]] = []
+  var at = 0
+  for r in 0..jobs:
+    let rch: Chan[Int] = chan(rlen[r] + 1)
+    for q in at..at + rlen[r]: rch.send(ordered[q])
+    rch.close()
+    at += rlen[r]
+    chs.push(rch)
+  let dirs = share(dirs0)
+  let mf: Memo[Str, tc.Src] = memo()
+  let dsrc: Memo[Str, tc.DepPkg] = memo()
+  let dast: Memo[Str, tc.DepFile] = memo()
+  let rxc: Memo[Str, rx.Rx] = memo()
+  let sch = share(ch)
+  let rc: Chan[DRes] = chan(nd + 1)
+  let gover = minor_of(c.go_ver)
+  if tm: eprint("T workers start (streaming): {os.clock() - t0} at {os.clock()}")
+  for k in 0..jobs:
+    var mine: [Chan[Int]] = []
+    for q in 0..jobs: mine.push(chs[(k + q) % jobs].share())
+    spawn dworker(fs, os, tm, dirs, modpath + "", mf, dsrc, dast, rxc, shc, sch, diff, mine, rc, goroot + "", modcache + "", gover)
+  var got: [DRes] = []
+  for _ in 0..nd: got.push(DRes(-1, [], [], []))
+  for _ in 0..nd:
+    var dr = rc.recv()?
+    let di = dr.dir
+    swap(&got[di], &dr)
+  # the packages as run_lint lists them (folder by folder), then in go list's order
+  var specs: [Spec] = []
+  var deps: [[Str]] = []
+  var res: [Res] = []
+  for di in 0..nd:
+    for si in 0..got[di].specs.len:
+      var sp = Spec("", [], "")
+      swap(&sp, &got[di].specs[si])
+      specs.push(sp)
+      var ds: [Str] = []
+      swap(&ds, &got[di].deps[si])
+      deps.push(ds)
+      var r = Res(0, [], proc.new_counts(c), [])
+      swap(&r, &got[di].res[si])
+      res.push(r)
+  for k in golist_perm(specs, deps):
+    for e in res[k].errs: perrs.push(e + "")
+    add_counts(&tot, res[k].cnt)
+    var iss: [proc.Iss] = []
+    swap(&iss, &res[k].issues)
+    results.push(iss)
 
 # The cache key of each package: the run's hash h, its files, and for each package of the module it
 # imports, that package's hash without its tests (its non-test files and theirs, transitively); an
@@ -481,6 +655,41 @@ fn gl_visit(i: Int, specs: [Spec], imps: [[Int]], var seen: [Bool], var out: [In
 # tests in dependency order (roots by import path, imports sorted), then each tested package's
 # test variant and its external test package, by import path.
 fn golist_order(fs: Fs, own specs: [Spec], var kw: {Str: Int}, srcs: {Str: Str}) -> [Spec]:
+  var deps: [[Str]] = []
+  for i in 0..specs.len:
+    var ds: [Str] = []
+    for f in specs[i].files:
+      if f.endswith("_test.go"): continue
+      # (the sources read already, else from disk)
+      var src = ""
+      if f in srcs: src = srcs[f] + ""
+      else: src = fs.read(f) else continue
+      for ip in file_imports(src, &kw):
+        if not (ip in ds): ds.push(ip)
+    ds.sort()
+    deps.push(ds)
+  let order = golist_perm(specs, deps)
+  var out: [Spec] = []
+  for i in order:
+    var fl: [Str] = []
+    for f in specs[i].files: fl.push(f + "")
+    out.push(Spec(specs[i].dir + "", fl, specs[i].path + ""))
+  return out
+
+# The imports of a package's files other than its tests, sorted, each once.
+fn spec_deps(fs: Fs, sp: Spec, var kw: {Str: Int}, mf: Memo[Str, tc.Src]) -> [Str]:
+  var ds: [Str] = []
+  for f in sp.files:
+    if f.endswith("_test.go"): continue
+    let sv = mf.get(f, fn(p) => tc.read_src(fs, p))
+    if not sv.value.ok: continue
+    for ip in file_imports(sv.value.text, &kw):
+      if not (ip in ds): ds.push(ip)
+  ds.sort()
+  return ds
+
+# golist_order's order, as indexes into specs, from each package's imports (spec_deps)
+fn golist_perm(specs: [Spec], deps: [[Str]]) -> [Int]:
   let n = specs.len
   var byip: {Str: Int} = {}
   for i in 0..n:
@@ -488,20 +697,10 @@ fn golist_order(fs: Fs, own specs: [Spec], var kw: {Str: Int}, srcs: {Str: Str})
   var tested = [false] * n
   var imps: [[Int]] = []
   for i in 0..n:
-    var deps: [Str] = []
     for f in specs[i].files:
-      if f.endswith("_test.go"):
-        tested[i] = true
-        continue
-      # (the sources read already, else from disk)
-      var src = ""
-      if f in srcs: src = srcs[f] + ""
-      else: src = fs.read(f) else continue
-      for ip in file_imports(src, &kw):
-        if not (ip in deps): deps.push(ip)
-    deps.sort()
+      if f.endswith("_test.go"): tested[i] = true
     var js: [Int] = []
-    for ip in deps:
+    for ip in deps[i]:
       let j = byip.get(ip, -1)
       if j >= 0 and j != i: js.push(j)
     imps.push(js)
@@ -531,14 +730,12 @@ fn golist_order(fs: Fs, own specs: [Spec], var kw: {Str: Int}, srcs: {Str: Str})
     let xp = specs[r].path + "_test"
     if xp in xtests:
       for i in xtests[xp]: order.push(i)
-  var out: [Spec] = []
+  var out: [Int] = []
   var taken = [false] * n
   for i in order:
     if taken[i]: continue
     taken[i] = true
-    var fl: [Str] = []
-    for f in specs[i].files: fl.push(f + "")
-    out.push(Spec(specs[i].dir + "", fl, specs[i].path + ""))
+    out.push(i)
   return out
 
 fn gomod_go(fs: Fs) -> Str:
@@ -973,214 +1170,219 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     let exe = fs.read(gl_self_exe(ffi)) else ""
     if exe.len == 0: use_cache = false
     hash_feed(&h, exe)
-  var specs: [Spec] = []
-  var srcs: {Str: Str} = {}
-  # (the files read on all cores first: on a 3,000-package module, opening them one after another
-  # was most of a run whose results all came from the cache)
-  var rpaths: [Str] = []
-  for d in dirs:
-    for nm in d.files:
-      if not load.good_name(nm): continue
-      if not c.tests and nm.endswith("_test.go"): continue
-      if d.path == ".": rpaths.push(nm + "")
-      else: rpaths.push(d.path + "/" + nm)
-  let nrp = rpaths.len
-  # (4 threads: on macOS, opening files from more at once is slower, 0.45 s against 0.22 for these
-  # 16,445 files, the kernel's time tripling)
-  let nch = 4
-  var rtext: [[Str]] = []
-  var rok: [[Bool]] = []
-  for _ in 0..nch:
-    rtext.push([])
-    rok.push([])
-  if tm: eprint("T to read: {os.clock() - t0}")
-  par for q in 0..nch: read_chunk(fs, rpaths, q, nrp, nch, &rtext[q], &rok[q])
-  if tm: eprint("T read {nrp}: {os.clock() - t0}")
-  var rsrc: {Str: Str} = {}
-  for q in 0..nch:
-    let lo = q * nrp / nch
-    for x in 0..rtext[q].len:
-      if rok[q][x]:
-        var t = ""
-        swap(&t, &rtext[q][x])
-        rsrc[rpaths[lo + x]] = t
-  for d in dirs:
-    var main_files: [Str] = []
-    var x_files: [Str] = []
-    var pname = ""
-    for nm in d.files:
-      if not load.good_name(nm): continue
-      if not c.tests and nm.endswith("_test.go"): continue
-      var path = d.path + "/" + nm
-      if d.path == ".": path = nm + ""
-      if not (path in rsrc): continue
-      let src = rsrc[path]
-      if not load.good_constraints(src, c.build_tags): continue
-      if use_cache: srcs[path] = src
-      let name = package_name(src, &kw)
-      if nm.endswith("_test.go") and name.endswith("_test") and name != pname:
-        x_files.push(path)
-      else:
-        if not nm.endswith("_test.go") or pname.len == 0: pname = name + ""
-        main_files.push(path)
-    var ip = modpath + ""
-    if d.path != ".": ip = modpath + "/" + d.path
-    var ordered: [Str] = []
-    for f in main_files:
-      if not f.endswith("_test.go"): ordered.push(f + "")
-    for f in main_files:
-      if f.endswith("_test.go"): ordered.push(f + "")
-    if main_files.len > 0: specs.push(Spec(d.path + "", ordered, ip + ""))
-    if x_files.len > 0: specs.push(Spec(d.path + "", x_files, ip + "_test"))
-  if tm: eprint("T specs: {os.clock() - t0}")
-  specs = golist_order(fs, specs, &kw, rsrc)
-  let msrc = share(rsrc)
-  if tm: eprint("T files read, packages ordered: {os.clock() - t0}")
   var all: [proc.Iss] = []
   var warnings: [Str] = []     # tag, text pairs
   var perrs: [Str] = []
-  let n = specs.len
   var results: [[proc.Iss]] = []
-  for k in 0..n: results.push([])
   var tot = proc.new_counts(c)
-  var keys: [Str] = []
-  var cdir = ""
-  var pending: [Int] = []
-  if use_cache:
-    keys = spec_keys(fs, specs, srcs, h, &kw, rmods, rdirs)
-    cdir = os.env("XDG_CACHE_HOME")
-    if cdir.len == 0: cdir = os.env("HOME") + "/.cache"
-    cdir += "/vgolint"
-    fs.mkdir(cdir) else 0
-  var ctext: [Str] = []
-  if use_cache:
-    var cpaths: [Str] = []
-    for k in 0..n: cpaths.push(cdir + "/p" + keys[k])
-    var ct: [[Str]] = []
-    var cok: [[Bool]] = []
-    for _ in 0..4:
-      ct.push([])
-      cok.push([])
-    par for q in 0..4: read_chunk(fs, cpaths, q, n, 4, &ct[q], &cok[q])
-    for q in 0..4:
-      for x in 0..ct[q].len:
-        var t = ""
-        swap(&t, &ct[q][x])
-        ctext.push(t)
-  for k in 0..n:
-    var hit = false
+  # (without the cache, the workers start before the files are read: stream_lint; VGOLINT_STREAM=0
+  # reads them all first, as with the cache)
+  let stream = not use_cache and os.env("VGOLINT_STREAM") != "0"
+  if stream: stream_lint(fs, os, ffi, o, shc, dirs, modpath, goroot, modcache, ch, diff, tm, t0, &results, &perrs, &tot)?
+  else:
+    var specs: [Spec] = []
+    var srcs: {Str: Str} = {}
+    # (the files read on all cores first: on a 3,000-package module, opening them one after another
+    # was most of a run whose results all came from the cache)
+    var rpaths: [Str] = []
+    for d in dirs:
+      for nm in d.files:
+        if not load.good_name(nm): continue
+        if not c.tests and nm.endswith("_test.go"): continue
+        if d.path == ".": rpaths.push(nm + "")
+        else: rpaths.push(d.path + "/" + nm)
+    let nrp = rpaths.len
+    # (4 threads: on macOS, opening files from more at once is slower, 0.45 s against 0.22 for these
+    # 16,445 files, the kernel's time tripling)
+    let nch = 4
+    var rtext: [[Str]] = []
+    var rok: [[Bool]] = []
+    for _ in 0..nch:
+      rtext.push([])
+      rok.push([])
+    if tm: eprint("T to read: {os.clock() - t0}")
+    par for q in 0..nch: read_chunk(fs, rpaths, q, nrp, nch, &rtext[q], &rok[q])
+    if tm: eprint("T read {nrp}: {os.clock() - t0}")
+    var rsrc: {Str: Str} = {}
+    for q in 0..nch:
+      let lo = q * nrp / nch
+      for x in 0..rtext[q].len:
+        if rok[q][x]:
+          var t = ""
+          swap(&t, &rtext[q][x])
+          rsrc[rpaths[lo + x]] = t
+    for d in dirs:
+      var main_files: [Str] = []
+      var x_files: [Str] = []
+      var pname = ""
+      for nm in d.files:
+        if not load.good_name(nm): continue
+        if not c.tests and nm.endswith("_test.go"): continue
+        var path = d.path + "/" + nm
+        if d.path == ".": path = nm + ""
+        if not (path in rsrc): continue
+        let src = rsrc[path]
+        if not load.good_constraints(src, c.build_tags): continue
+        if use_cache: srcs[path] = src
+        let name = package_name(src, &kw)
+        if nm.endswith("_test.go") and name.endswith("_test") and name != pname:
+          x_files.push(path)
+        else:
+          if not nm.endswith("_test.go") or pname.len == 0: pname = name + ""
+          main_files.push(path)
+      var ip = modpath + ""
+      if d.path != ".": ip = modpath + "/" + d.path
+      var ordered: [Str] = []
+      for f in main_files:
+        if not f.endswith("_test.go"): ordered.push(f + "")
+      for f in main_files:
+        if f.endswith("_test.go"): ordered.push(f + "")
+      if main_files.len > 0: specs.push(Spec(d.path + "", ordered, ip + ""))
+      if x_files.len > 0: specs.push(Spec(d.path + "", x_files, ip + "_test"))
+    if tm: eprint("T specs: {os.clock() - t0}")
+    specs = golist_order(fs, specs, &kw, rsrc)
+    let msrc = share(rsrc)
+    if tm: eprint("T files read, packages ordered: {os.clock() - t0}")
+    let n = specs.len
+    for k in 0..n: results.push([])
+    var keys: [Str] = []
+    var cdir = ""
+    var pending: [Int] = []
     if use_cache:
-      let text = ctext[k]
-      if text.startswith("vgolint3\n"):
-        let lines = text[9..text.len].split("\n")
-        if lines.len > 0:
-          var cnt = proc.new_counts(c)
-          if read_counts(lines[0], &cnt):
-            hit = true
-            for li in 1..lines.len:
-              if lines[li].len == 0: continue
-              let is = proc.from_record(lines[li]) else continue
-              results[k].push(is)
-            add_counts(&tot, cnt)
-    if not hit: pending.push(k)
-  if pending.len > 0:
-    var jobs = o.jobs
-    if jobs == 0: jobs = c.concurrency
-    if jobs == 0: jobs = cpu_count(fs, ffi)
-    if jobs > pending.len: jobs = pending.len
-    if jobs < 1: jobs = 1
-    var gover = minor_of(c.go_ver)
-    let np = pending.len
-    # (packages in import path order, handed out in runs that shrink as they run out, so that a
-    # worker lints packages near each other, which import mostly the same packages: each worker
-    # loads its own copy of what they import)
-    var bypath: {Str: [Int]} = {}
-    var paths: [Str] = []
-    for k in pending:
-      let pth = specs[k].dir + ""
-      if pth in bypath: bypath[pth].push(k)
-      else:
-        bypath[pth] = [k]
-        paths.push(pth)
-    paths.sort()
-    var sorted: [Int] = []
-    for pth in paths:
-      for k in bypath[pth]: sorted.push(k)
-    # Each worker gets a region of that order, a run of folders with about the same amount of source
-    # (neighbouring folders import mostly the same packages, and each worker loads its own copy of
-    # what its packages import); in its region the 2 largest packages go first. A worker whose region
-    # is done takes packages from the next regions'.
-    var wt: [Int] = []
-    var total = 0
-    for k in sorted:
-      var b = 0
-      for f in specs[k].files: b += msrc.value.get(f, "").len
-      wt.push(b)
-      total += b
-    var ordered: [Int] = []
-    var rlen: [Int] = []
-    var i0 = 0
-    for r in 0..jobs:
-      var i1 = i0
-      var acc = 0
-      let want = total * (r + 1) / jobs - total * r / jobs
-      while i1 < sorted.len and (acc < want or r == jobs - 1):
-        acc += wt[i1]
-        i1 += 1
-      # (its two largest first)
-      var big1 = -1
-      var big2 = -1
-      for i in i0..i1:
-        if big1 < 0 or wt[i] > wt[big1]:
-          big2 = big1
-          big1 = i
-        elif big2 < 0 or wt[i] > wt[big2]: big2 = i
-      if big1 >= 0: ordered.push(sorted[big1])
-      if big2 >= 0: ordered.push(sorted[big2])
-      for i in i0..i1:
-        if i != big1 and i != big2: ordered.push(sorted[i])
-      rlen.push(i1 - i0)
-      i0 = i1
-    pending = ordered
-    var lspecs: [Spec] = []
-    for k in pending:
-      var fl: [Str] = []
-      for f in specs[k].files: fl.push(f + "")
-      lspecs.push(Spec(specs[k].dir + "", fl, specs[k].path + ""))
-    let shared = share(lspecs)
-    let sch = share(ch)
-    let rc: Chan[Res] = chan(np + 1)
-    var chs: [Chan[Int]] = []
-    var at = 0
-    for r in 0..jobs:
-      let rch: Chan[Int] = chan(rlen[r] + 1)
-      for q in at..at + rlen[r]: rch.send(q)
-      rch.close()
-      at += rlen[r]
-      chs.push(rch)
-    # (each imported package read, and each of its files parsed, once for all the workers)
-    let dsrc: Memo[Str, tc.DepPkg] = memo()
-    let dast: Memo[Str, tc.DepFile] = memo()
-    let rxc: Memo[Str, rx.Rx] = memo()
-    if tm: eprint("T workers start: {os.clock() - t0} at {os.clock()}")
-    for k in 0..jobs:
-      var mine: [Chan[Int]] = []
-      for q in 0..jobs: mine.push(chs[(k + q) % jobs].share())
-      spawn worker(fs, os, tm, msrc, dsrc, dast, rxc, shared, shc, sch, diff, mine, rc, ".", goroot + "", modcache + "", gover)
-    for k in 0..np:
-      var r = rc.recv()?
-      let si = pending[r.idx]
-      for e in r.errs: perrs.push(e + "")
-      if use_cache and r.errs.len == 0:
-        var lines: [Str] = [counts_line(r.cnt)]
-        for is in r.issues: lines.push(proc.to_record(is))
-        let file = cdir + "/p" + keys[si]
-        fs.write(file + ".tmp", "vgolint3\n" + "\n".join(lines)) else 0
-        fs.rename(file + ".tmp", file) else 0
-      add_counts(&tot, r.cnt)
-      swap(&results[si], &r.issues)
+      keys = spec_keys(fs, specs, srcs, h, &kw, rmods, rdirs)
+      cdir = os.env("XDG_CACHE_HOME")
+      if cdir.len == 0: cdir = os.env("HOME") + "/.cache"
+      cdir += "/vgolint"
+      fs.mkdir(cdir) else 0
+    var ctext: [Str] = []
+    if use_cache:
+      var cpaths: [Str] = []
+      for k in 0..n: cpaths.push(cdir + "/p" + keys[k])
+      var ct: [[Str]] = []
+      var cok: [[Bool]] = []
+      for _ in 0..4:
+        ct.push([])
+        cok.push([])
+      par for q in 0..4: read_chunk(fs, cpaths, q, n, 4, &ct[q], &cok[q])
+      for q in 0..4:
+        for x in 0..ct[q].len:
+          var t = ""
+          swap(&t, &ct[q][x])
+          ctext.push(t)
+    for k in 0..n:
+      var hit = false
+      if use_cache:
+        let text = ctext[k]
+        if text.startswith("vgolint3\n"):
+          let lines = text[9..text.len].split("\n")
+          if lines.len > 0:
+            var cnt = proc.new_counts(c)
+            if read_counts(lines[0], &cnt):
+              hit = true
+              for li in 1..lines.len:
+                if lines[li].len == 0: continue
+                let is = proc.from_record(lines[li]) else continue
+                results[k].push(is)
+              add_counts(&tot, cnt)
+      if not hit: pending.push(k)
+    if pending.len > 0:
+      var jobs = o.jobs
+      if jobs == 0: jobs = c.concurrency
+      if jobs == 0: jobs = cpu_count(fs, ffi)
+      if jobs > pending.len: jobs = pending.len
+      if jobs < 1: jobs = 1
+      var gover = minor_of(c.go_ver)
+      let np = pending.len
+      # (packages in import path order, handed out in runs that shrink as they run out, so that a
+      # worker lints packages near each other, which import mostly the same packages: each worker
+      # loads its own copy of what they import)
+      var bypath: {Str: [Int]} = {}
+      var paths: [Str] = []
+      for k in pending:
+        let pth = specs[k].dir + ""
+        if pth in bypath: bypath[pth].push(k)
+        else:
+          bypath[pth] = [k]
+          paths.push(pth)
+      paths.sort()
+      var sorted: [Int] = []
+      for pth in paths:
+        for k in bypath[pth]: sorted.push(k)
+      # Each worker gets a region of that order, a run of folders with about the same amount of source
+      # (neighbouring folders import mostly the same packages, and each worker loads its own copy of
+      # what its packages import); in its region the 2 largest packages go first. A worker whose region
+      # is done takes packages from the next regions'.
+      var wt: [Int] = []
+      var total = 0
+      for k in sorted:
+        var b = 0
+        for f in specs[k].files: b += msrc.value.get(f, "").len
+        wt.push(b)
+        total += b
+      var ordered: [Int] = []
+      var rlen: [Int] = []
+      var i0 = 0
+      for r in 0..jobs:
+        var i1 = i0
+        var acc = 0
+        let want = total * (r + 1) / jobs - total * r / jobs
+        while i1 < sorted.len and (acc < want or r == jobs - 1):
+          acc += wt[i1]
+          i1 += 1
+        # (its two largest first)
+        var big1 = -1
+        var big2 = -1
+        for i in i0..i1:
+          if big1 < 0 or wt[i] > wt[big1]:
+            big2 = big1
+            big1 = i
+          elif big2 < 0 or wt[i] > wt[big2]: big2 = i
+        if big1 >= 0: ordered.push(sorted[big1])
+        if big2 >= 0: ordered.push(sorted[big2])
+        for i in i0..i1:
+          if i != big1 and i != big2: ordered.push(sorted[i])
+        rlen.push(i1 - i0)
+        i0 = i1
+      pending = ordered
+      var lspecs: [Spec] = []
+      for k in pending:
+        var fl: [Str] = []
+        for f in specs[k].files: fl.push(f + "")
+        lspecs.push(Spec(specs[k].dir + "", fl, specs[k].path + ""))
+      let shared = share(lspecs)
+      let sch = share(ch)
+      let rc: Chan[Res] = chan(np + 1)
+      var chs: [Chan[Int]] = []
+      var at = 0
+      for r in 0..jobs:
+        let rch: Chan[Int] = chan(rlen[r] + 1)
+        for q in at..at + rlen[r]: rch.send(q)
+        rch.close()
+        at += rlen[r]
+        chs.push(rch)
+      # (each imported package read, and each of its files parsed, once for all the workers)
+      let dsrc: Memo[Str, tc.DepPkg] = memo()
+      let dast: Memo[Str, tc.DepFile] = memo()
+      let rxc: Memo[Str, rx.Rx] = memo()
+      if tm: eprint("T workers start: {os.clock() - t0} at {os.clock()}")
+      for k in 0..jobs:
+        var mine: [Chan[Int]] = []
+        for q in 0..jobs: mine.push(chs[(k + q) % jobs].share())
+        spawn worker(fs, os, tm, msrc, dsrc, dast, rxc, shared, shc, sch, diff, mine, rc, ".", goroot + "", modcache + "", gover)
+      for k in 0..np:
+        var r = rc.recv()?
+        let si = pending[r.idx]
+        for e in r.errs: perrs.push(e + "")
+        if use_cache and r.errs.len == 0:
+          var lines: [Str] = [counts_line(r.cnt)]
+          for is in r.issues: lines.push(proc.to_record(is))
+          let file = cdir + "/p" + keys[si]
+          fs.write(file + ".tmp", "vgolint3\n" + "\n".join(lines)) else 0
+          fs.rename(file + ".tmp", file) else 0
+        add_counts(&tot, r.cnt)
+        swap(&results[si], &r.issues)
   if tm: eprint("T packages linted: {os.clock() - t0}")
-  for k in 0..n:
+  for k in 0..results.len:
     for is in results[k]: all.push(proc.dup(is))
   if true:
     let cc = c
