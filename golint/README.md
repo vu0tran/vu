@@ -80,7 +80,36 @@ Releasing: `RELEASING.md`.
 
 Platform notes: packages are matched for linux/amd64 on every platform (as above), so on macOS
 files with `_darwin.go` suffixes or `//go:build darwin` lines are skipped where golangci-lint on a
-Mac would lint them. On macOS the result cache is off (it is keyed by `/proc/self/exe`).
+Mac would lint them. The result cache works on macOS too (it was off there until 2026-11-20: its key
+read `/proc/self/exe`).
+
+The cache and local replaces: a module replaced with a local folder (`replace example.com/x =>
+./x`) is no longer a reason to turn the cache off; the files of its packages that a linted package
+imports, and those they import, go into that package's key. On a 2,981-package monorepo with two
+such modules (2,900 files in them) a run whose results all come from the cache takes 1.76 s against
+13.8 to 15.0 s without (it was 12.7 s on every run before: the cache was off there for both reasons).
+The files are read and hashed on all cores, each once (they were read one after another and each
+hashed twice). Checked on a module with a local replace: a changed signature in the replaced
+module, imported directly and through another of its packages, reaches the next cached run, as
+without the cache.
+
+**Patterns and the uncached run (2026-11-20).** A package path given without `/...` (`vgolint run
+./a ./b`) is now that one package, as `go list` reads it; it used to take every package under it
+too, so on that monorepo, named as 2,981 folders, many packages were linted several times and their
+issues printed up to 3 times. A package named twice, or under two patterns, is linted once. The
+same run (2,981 packages, the repo's own config, 10 cores, macOS) without the cache now takes 5.5 to
+6.3 s (it was 13.8 to 15.0) and with it 0.75 s (1.76): besides the patterns, gocyclo looked for
+`//gocyclo:ignore` above every function by scanning the file's comments from the end (now only over
+the limit), SA1019 found each declaration's doc comment by a scan from the file's start and copied
+the declaring file per object, the deprecation table and the misspell and exclusion patterns were
+built for each package or worker (now on first use), misspell lowered every word of every line (a
+filter of the typos' hashes skips files with none), the package order read every file again, and
+the workers read the module's files again. Packages go to the workers in runs of neighbouring
+folders (which import mostly the same packages: each worker loads its own copy of what they import),
+the largest first. Output is byte for byte what it was, with the repeated issues gone (16 issues,
+the same set). `VGOLINT_T=1` prints each phase's time and each package over 0.3 s on stderr. What's
+left is mostly type-checking the imported packages, which each of the 10 workers does for itself
+(11,274 loads of 3,734 packages there).
 
 ## Drop-in status
 

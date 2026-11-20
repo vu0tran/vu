@@ -33,6 +33,7 @@ extern "sys_glue.c":
   fn gl_getcwd(ffi: Ffi) -> Str
   fn gl_isatty(ffi: Ffi, fd: Int) -> Bool
   fn gl_ncpu(ffi: Ffi) -> Int
+  fn gl_self_exe(ffi: Ffi) -> Str
 
 type Spec:
   dir: Str
@@ -96,10 +97,13 @@ fn check_on(c: cfg.Cfg, is: pkg.Issue, gover: Int) -> Bool:
     if k > 0: return vet_enabled(c, is.msg[0..k], gover)
   return true
 
-fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c: cfg.Cfg, rs: proc.Rxs, diff: Bool, ch: proc.Changed, var dict: lints.Dict) -> Res:
+fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c: cfg.Cfg, var rs: proc.Rxs, var rs_ready: Bool, diff: Bool, ch: proc.Changed, var dict: lints.Dict) -> Res:
   var p = pkg.new_pkg(sp.dir)
   for f in sp.files:
-    let src = fs.read(f) else continue
+    # (the sources read before the workers started, else from disk)
+    var src = ""
+    if f in g.msrc.value: src = g.msrc.value[f] + ""
+    else: src = fs.read(f) else continue
     pkg.add_file(&p, f, src, &kw)
   var cnt = proc.new_counts(c)
   var issues: [pkg.Issue] = []
@@ -141,6 +145,10 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
   for i in ord:
     let is = issues[i]
     if check_on(c, is, gover): kept.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", rank_of(is)))
+  # (the exclusion patterns are compiled when a package first has an issue, or nolint comments to check)
+  if not rs_ready and (kept.len > 0 or cfg.is_enabled(c, "nolintlint")):
+    rs = proc.compile_all(c)
+    rs_ready = true
   let res = proc.process_pkg(c, rs, p, kept, &cnt, diff, ch)
   return Res(0, res, cnt, [])
 
@@ -176,30 +184,61 @@ fn rank_of(is: pkg.Issue) -> Int:
     if names[i] == is.linter: return 10000000 + i * 100000 + local
   return 90000000 + local
 
-fn worker(fs: Fs, own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: Chan[Int], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str, gover: Int):
+fn worker(fs: Fs, os: Os, tm: Bool, own msrc: Shared[{Str: Str}], own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: Chan[Int], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str, gover: Int):
   var kw = scan.keywords()
   var g = tc.new_prog(goroot, modcache)
+  g.msrc = msrc
   for t in conf.value.build_tags: g.tags.push(t + "")
   tc.read_gomod(fs, &g, modroot)
-  let rs = proc.compile_all(conf.value)
-  var dict = lints.Dict({}, {}, {}, [])
+  var rs = proc.Rxs([], [], [], [], [], [], [], [], [], [])
+  var rs_ready = false
+  var dict = lints.Dict({}, {}, {}, [], [])
   if cfg.is_enabled(conf.value, "misspell"): dict = lints.new_dict(conf.value)
   while true:
-    let i = jobs.recv() else return
-    var r = lint_one(fs, specs.value[i], &g, &kw, gover, conf.value, rs, diff, chg.value, &dict)
-    r.idx = i
-    res.send(r)
+    # (a job is a run of packages next to each other: start << 24 | end)
+    let jb = jobs.recv() else -1
+    if jb < 0:
+      if tm: eprint("T worker: {g.pk.len} packages loaded, done at {os.clock()}")
+      return
+    for i in (jb >> 24)..(jb & 16777215):
+      let ts = os.clock()
+      var r = lint_one(fs, specs.value[i], &g, &kw, gover, conf.value, &rs, &rs_ready, diff, chg.value, &dict)
+      if tm and os.clock() - ts > 0.3: eprint("T package {specs.value[i].path}: {os.clock() - ts} (ends at {os.clock()})")
+      r.idx = i
+      res.send(r)
 
 # The cache key of each package: the run's hash h, its files, and for each package of the module it
 # imports, that package's hash without its tests (its non-test files and theirs, transitively); an
 # external test package also takes the package it tests whole (it's compiled with its tests).
-fn spec_keys(specs: [Spec], srcs: {Str: Str}, h: [Int], var kw: {Str: Int}) -> [Str]:
+fn spec_keys(fs: Fs, specs: [Spec], srcs: {Str: Str}, h: [Int], var kw: {Str: Int}, rmods: [Str], rdirs: [Str]) -> [Str]:
   let n = specs.len
+  var ext: {Str: Str} = {}
+  # (each file's content hashed once, on all cores; the keys take that hash)
+  var fl: [Str] = []
+  var fseen: {Str: Bool} = {}
+  for sp in specs:
+    for f in sp.files:
+      if not (f in fseen):
+        fseen[f] = true
+        fl.push(f + "")
+  let nf = fl.len
+  var fhp: [[Str]] = []
+  for _ in 0..64: fhp.push([])
+  par for q in 0..64: hash_chunk(fl, srcs, q, nf, 64, &fhp[q])
+  var fh: {Str: Str} = {}
+  for q in 0..64:
+    let lo = q * nf / 64
+    for x in 0..fhp[q].len: fh[fl[lo + x]] = fhp[q][x] + ""
   var byip: {Str: Int} = {}
   for i in 0..n:
     if not specs[i].path.endswith("_test"): byip[specs[i].path] = i
   var libdeps: [[Int]] = []
   var alldeps: [[Int]] = []
+  var xl: [Str] = []
+  var xt: [Str] = []
+  for _ in 0..n:
+    xl.push("")
+    xt.push("")
   for i in 0..n:
     var lib: [Int] = []
     var al: [Int] = []
@@ -207,6 +246,13 @@ fn spec_keys(specs: [Spec], srcs: {Str: Str}, h: [Int], var kw: {Str: Int}) -> [
       let src = srcs.get(f, "")
       for ip in file_imports(src, &kw):
         let j = byip.get(ip, -1)
+        if j < 0 and rmods.len > 0:
+          # (a package of a locally replaced module: its files, and those it imports)
+          let eh = ext_hash(fs, ip, rmods, rdirs, &ext, &kw)
+          if eh != "":
+            if f.endswith("_test.go"): xt[i] = xt[i] + eh
+            else: xl[i] = xl[i] + eh
+          continue
         if j < 0 or j == i: continue
         if not (j in al): al.push(j)
         if not f.endswith("_test.go") and not (j in lib): lib.push(j)
@@ -236,8 +282,9 @@ fn spec_keys(specs: [Spec], srcs: {Str: Str}, h: [Int], var kw: {Str: Int}) -> [
       for f in specs[x].files:
         if f.endswith("_test.go"): continue
         hash_feed(&hx, f)
-        hash_feed(&hx, srcs.get(f, ""))
+        hash_feed(&hx, fh.get(f, ""))
       for j in libdeps[x]: hash_feed(&hx, libh[j])
+      hash_feed(&hx, xl[x])
       libh[x] = hex8(hx[0]) + hex8(hx[1])
   var keys: [Str] = []
   for i in 0..n:
@@ -245,16 +292,64 @@ fn spec_keys(specs: [Spec], srcs: {Str: Str}, h: [Int], var kw: {Str: Int}) -> [
     hash_feed(&hk, "pkg " + specs[i].path)
     for f in specs[i].files:
       hash_feed(&hk, f)
-      hash_feed(&hk, srcs.get(f, ""))
+      hash_feed(&hk, fh.get(f, ""))
     for j in alldeps[i]: hash_feed(&hk, libh[j])
+    hash_feed(&hk, xl[i] + xt[i])
     if specs[i].path.endswith("_test"):
       let b = byip.get(specs[i].path[0..specs[i].path.len - 5], -1)
       if b >= 0:
         for f in specs[b].files:
           hash_feed(&hk, f)
-          hash_feed(&hk, srcs.get(f, ""))
+          hash_feed(&hk, fh.get(f, ""))
     keys.push(hex8(hk[0]) + hex8(hk[1]))
   return keys
+
+# A package of a module replaced with a local folder (import path ip): a hash of its folder's .go
+# files that aren't tests and of the packages of such modules they import, transitively ("" when ip
+# isn't in one; its other imports are the module cache's, which go.sum covers).
+fn hash_chunk(fl: [Str], srcs: {Str: Str}, q: Int, n: Int, nch: Int, var out: [Str]):
+  for i in q * n / nch..(q + 1) * n / nch:
+    var hx = [2166136261, 84696351]
+    hash_feed(&hx, srcs.get(fl[i], ""))
+    out.push(hex8(hx[0]) + hex8(hx[1]))
+
+fn ext_hash(fs: Fs, ip: Str, rmods: [Str], rdirs: [Str], var memo: {Str: Str}, var kw: {Str: Int}) -> Str:
+  if ip in memo: return memo[ip]
+  var best = -1
+  for i in 0..rmods.len:
+    if ip == rmods[i] or ip.startswith(rmods[i] + "/"):
+      if best < 0 or rmods[i].len > rmods[best].len: best = i
+  if best < 0: return ""
+  let dir = rdirs[best] + ip[rmods[best].len..ip.len]
+  # (a cycle is cut)
+  memo[ip] = "?"
+  var hx = [2166136261, 84696351]
+  hash_feed(&hx, "ext " + ip)
+  var names = fs.list(dir) else []
+  names.sort()
+  for nm in names:
+    if not nm.endswith(".go") or nm.endswith("_test.go"): continue
+    let src = fs.read(dir + "/" + nm) else ""
+    hash_feed(&hx, nm)
+    hash_feed(&hx, src)
+    for dep in file_imports(src, &kw):
+      let d = ext_hash(fs, dep, rmods, rdirs, &memo, &kw)
+      if d != "": hash_feed(&hx, d)
+  let r = hex8(hx[0]) + hex8(hx[1])
+  memo[ip] = r
+  return r
+
+# Files lo..hi of paths (chunk q of nch) read: each one's text and whether it could be read.
+fn read_chunk(fs: Fs, paths: [Str], q: Int, n: Int, nch: Int, var text: [Str], var ok: [Bool]):
+  for i in q * n / nch..(q + 1) * n / nch:
+    var good = true
+    let t = fs.read(paths[i]) else read_failed(&good)
+    text.push(t)
+    ok.push(good)
+
+fn read_failed(var good: Bool) -> Str:
+  good = false
+  return ""
 
 fn add_counts(var tot: proc.Counts, cnt: proc.Counts):
   for q in 0..tot.rules.len:
@@ -378,7 +473,7 @@ fn gl_visit(i: Int, specs: [Spec], imps: [[Int]], var seen: [Bool], var out: [In
 # The order go/packages returns golangci-lint's packages in (go list -deps -test): packages without
 # tests in dependency order (roots by import path, imports sorted), then each tested package's
 # test variant and its external test package, by import path.
-fn golist_order(fs: Fs, own specs: [Spec], var kw: {Str: Int}) -> [Spec]:
+fn golist_order(fs: Fs, own specs: [Spec], var kw: {Str: Int}, srcs: {Str: Str}) -> [Spec]:
   let n = specs.len
   var byip: {Str: Int} = {}
   for i in 0..n:
@@ -391,7 +486,10 @@ fn golist_order(fs: Fs, own specs: [Spec], var kw: {Str: Int}) -> [Spec]:
       if f.endswith("_test.go"):
         tested[i] = true
         continue
-      let src = fs.read(f) else continue
+      # (the sources read already, else from disk)
+      var src = ""
+      if f in srcs: src = srcs[f] + ""
+      else: src = fs.read(f) else continue
       for ip in file_imports(src, &kw):
         if not (ip in deps): deps.push(ip)
     deps.sort()
@@ -415,12 +513,17 @@ fn golist_order(fs: Fs, own specs: [Spec], var kw: {Str: Int}) -> [Spec]:
   var order: [Int] = []
   for i in post:
     if not tested[i]: order.push(i)
+  var xtests: {Str: [Int]} = {}
+  for i in 0..n:
+    if specs[i].path.endswith("_test"):
+      if specs[i].path in xtests: xtests[specs[i].path].push(i)
+      else: xtests[specs[i].path + ""] = [i]
   for r in roots:
     if not tested[r]: continue
     order.push(r)
-    let x = byip.get(specs[r].path + "_test", -2)
-    for i in 0..n:
-      if specs[i].path == specs[r].path + "_test": order.push(i)
+    let xp = specs[r].path + "_test"
+    if xp in xtests:
+      for i in xtests[xp]: order.push(i)
   var out: [Spec] = []
   var taken = [false] * n
   for i in order:
@@ -772,16 +875,25 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
 
 fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
   let c = shc.value
+  # (VGOLINT_T=1: each phase's time on stderr, and each package that takes over 0.3 s)
+  let tm = os.env("VGOLINT_T") == "1"
+  let t0 = os.clock()
   # packages
   var roots: [Str] = []
+  var recs: [Bool] = []
   for a in o.args:
     var r = a + ""
+    # (as go list reads a pattern: ./x is the package in x, ./x/... every package under it too)
+    recs.push(r.endswith("/...") or r == "...")
+    if r == "...": r = "."
     if r.endswith("/..."): r = r[0..r.len - 4]
     if r.len == 0: r = "."
     while r.len > 1 and r.endswith("/"): r = r[0..r.len - 1]
     if r.startswith("./") and r.len > 2: r = r[2..r.len]
     roots.push(r)
-  if roots.len == 0: roots.push(".")
+  if roots.len == 0:
+    roots.push(".")
+    recs.push(true)
   for r in roots:
     if not fs.exists(r):
       print("0 issues.")
@@ -792,21 +904,44 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
   if diff: ch = git_changes(os, c, fs)
   var use_cache = not o.no_cache and not diff
   var h = [2166136261, 84696351]
+  var rmods: [Str] = []
+  var rdirs: [Str] = []
   if use_cache:
     let gm = fs.read("go.mod") else ""
     if gm.len == 0: use_cache = false
+    # (a module replaced with a local folder: its packages' files go into the keys of the packages
+    # that import them, spec_keys)
     for l in gm.split("\n"):
       let ar = l.find("=>")
       if ar >= 0:
         let rhs = l[ar + 2..l.len].strip()
-        if rhs.startswith(".") or rhs.startswith("/"): use_cache = false
+        if rhs.startswith(".") or rhs.startswith("/"):
+          var lhs = l[0..ar].strip()
+          if lhs.startswith("replace "): lhs = lhs[8..lhs.len].strip()
+          let lp = lhs.split()
+          let rp = rhs.split()
+          if lp.len == 0 or rp.len == 0: use_cache = false
+          else:
+            rmods.push(lp[0] + "")
+            rdirs.push(rp[0] + "")
     hash_feed(&h, gm)
     let gs = fs.read("go.sum") else ""
     hash_feed(&h, gs)
     hash_feed(&h, doc.dump(c.d, c.d.root))
     hash_feed(&h, c.cwd + "\n" + c.base + "\n" + ",".join(c.enabled) + "\n" + ",".join(roots))
   var dirs: [load.Dir] = []
-  for r in roots: load.walk(fs, r, true, &dirs)
+  var walked: {Str: Bool} = {}
+  for ri in 0..roots.len:
+    var ds: [load.Dir] = []
+    load.walk2(fs, roots[ri], true, recs[ri], &ds)
+    # (a package named twice, or under two patterns, is linted once)
+    for di in 0..ds.len:
+      if ds[di].path in walked: continue
+      walked[ds[di].path + ""] = true
+      var d = load.Dir("", [])
+      swap(&d, &ds[di])
+      dirs.push(d)
+  if tm: eprint("T walked: {os.clock() - t0}")
   var kw = scan.keywords()
   var probe = tc.new_prog("", "")
   tc.read_gomod(fs, &probe, ".")
@@ -828,11 +963,38 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     hash_feed(&h, goroot + "\n" + modcache)
     let gv = fs.read(goroot + "/VERSION") else ""
     hash_feed(&h, gv)
-    let exe = fs.read("/proc/self/exe") else ""
+    let exe = fs.read(gl_self_exe(ffi)) else ""
     if exe.len == 0: use_cache = false
     hash_feed(&h, exe)
   var specs: [Spec] = []
   var srcs: {Str: Str} = {}
+  # (the files read on all cores first: on a 3,000-package module, opening them one after another
+  # was most of a run whose results all came from the cache)
+  var rpaths: [Str] = []
+  for d in dirs:
+    for nm in d.files:
+      if not load.good_name(nm): continue
+      if not c.tests and nm.endswith("_test.go"): continue
+      if d.path == ".": rpaths.push(nm + "")
+      else: rpaths.push(d.path + "/" + nm)
+  let nrp = rpaths.len
+  let nch = 64
+  var rtext: [[Str]] = []
+  var rok: [[Bool]] = []
+  for _ in 0..nch:
+    rtext.push([])
+    rok.push([])
+  if tm: eprint("T to read: {os.clock() - t0}")
+  par for q in 0..nch: read_chunk(fs, rpaths, q, nrp, nch, &rtext[q], &rok[q])
+  if tm: eprint("T read {nrp}: {os.clock() - t0}")
+  var rsrc: {Str: Str} = {}
+  for q in 0..nch:
+    let lo = q * nrp / nch
+    for x in 0..rtext[q].len:
+      if rok[q][x]:
+        var t = ""
+        swap(&t, &rtext[q][x])
+        rsrc[rpaths[lo + x]] = t
   for d in dirs:
     var main_files: [Str] = []
     var x_files: [Str] = []
@@ -842,7 +1004,8 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
       if not c.tests and nm.endswith("_test.go"): continue
       var path = d.path + "/" + nm
       if d.path == ".": path = nm + ""
-      let src = fs.read(path) else continue
+      if not (path in rsrc): continue
+      let src = rsrc[path]
       if not load.good_constraints(src, c.build_tags): continue
       if use_cache: srcs[path] = src
       let name = package_name(src, &kw)
@@ -860,7 +1023,10 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
       if f.endswith("_test.go"): ordered.push(f + "")
     if main_files.len > 0: specs.push(Spec(d.path + "", ordered, ip + ""))
     if x_files.len > 0: specs.push(Spec(d.path + "", x_files, ip + "_test"))
-  specs = golist_order(fs, specs, &kw)
+  if tm: eprint("T specs: {os.clock() - t0}")
+  specs = golist_order(fs, specs, &kw, rsrc)
+  let msrc = share(rsrc)
+  if tm: eprint("T files read, packages ordered: {os.clock() - t0}")
   var all: [proc.Iss] = []
   var warnings: [Str] = []     # tag, text pairs
   var perrs: [Str] = []
@@ -872,15 +1038,30 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
   var cdir = ""
   var pending: [Int] = []
   if use_cache:
-    keys = spec_keys(specs, srcs, h, &kw)
+    keys = spec_keys(fs, specs, srcs, h, &kw, rmods, rdirs)
     cdir = os.env("XDG_CACHE_HOME")
     if cdir.len == 0: cdir = os.env("HOME") + "/.cache"
     cdir += "/vgolint"
     fs.mkdir(cdir) else 0
+  var ctext: [Str] = []
+  if use_cache:
+    var cpaths: [Str] = []
+    for k in 0..n: cpaths.push(cdir + "/p" + keys[k])
+    var ct: [[Str]] = []
+    var cok: [[Bool]] = []
+    for _ in 0..64:
+      ct.push([])
+      cok.push([])
+    par for q in 0..64: read_chunk(fs, cpaths, q, n, 64, &ct[q], &cok[q])
+    for q in 0..64:
+      for x in 0..ct[q].len:
+        var t = ""
+        swap(&t, &ct[q][x])
+        ctext.push(t)
   for k in 0..n:
     var hit = false
     if use_cache:
-      let text = fs.read(cdir + "/p" + keys[k]) else ""
+      let text = ctext[k]
       if text.startswith("vgolint3\n"):
         let lines = text[9..text.len].split("\n")
         if lines.len > 0:
@@ -901,6 +1082,40 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     if jobs < 1: jobs = 1
     var gover = minor_of(c.go_ver)
     let np = pending.len
+    # (packages in import path order, handed out in runs that shrink as they run out, so that a
+    # worker lints packages near each other, which import mostly the same packages: each worker
+    # loads its own copy of what they import)
+    var bypath: {Str: [Int]} = {}
+    var paths: [Str] = []
+    for k in pending:
+      let pth = specs[k].dir + ""
+      if pth in bypath: bypath[pth].push(k)
+      else:
+        bypath[pth] = [k]
+        paths.push(pth)
+    paths.sort()
+    var sorted: [Int] = []
+    for pth in paths:
+      for k in bypath[pth]: sorted.push(k)
+    # (the largest packages go first, one by one, so that none is left running alone at the end)
+    var wt: [Int] = []
+    for k in sorted:
+      var b = 0
+      for f in specs[k].files: b += msrc.value.get(f, "").len
+      wt.push(b)
+    var byw: [Int] = []
+    for i in 0..sorted.len: byw.push(i)
+    byw.sort(by: fn(a, b) => wt[a] > wt[b] or (wt[a] == wt[b] and a < b))
+    var nheavy = jobs * 2
+    if nheavy > sorted.len: nheavy = sorted.len
+    var heavy = [false] * sorted.len
+    var ordered: [Int] = []
+    for q in 0..nheavy:
+      heavy[byw[q]] = true
+      ordered.push(sorted[byw[q]])
+    for i in 0..sorted.len:
+      if not heavy[i]: ordered.push(sorted[i])
+    pending = ordered
     var lspecs: [Spec] = []
     for k in pending:
       var fl: [Str] = []
@@ -910,9 +1125,17 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     let sch = share(ch)
     let jc: Chan[Int] = chan(np + 1)
     let rc: Chan[Res] = chan(np + 1)
-    for k in 0..np: jc.send(k)
+    for q in 0..nheavy: jc.send((q << 24) | (q + 1))
+    var at = nheavy
+    while at < np:
+      var sz = (np - at) / (jobs * 3)
+      if sz < 1: sz = 1
+      if sz > 64: sz = 64
+      jc.send((at << 24) | (at + sz))
+      at += sz
     jc.close()
-    for k in 0..jobs: spawn worker(fs, shared, shc, sch, diff, jc, rc, ".", goroot + "", modcache + "", gover)
+    if tm: eprint("T workers start: {os.clock() - t0} at {os.clock()}")
+    for k in 0..jobs: spawn worker(fs, os, tm, msrc, shared, shc, sch, diff, jc, rc, ".", goroot + "", modcache + "", gover)
     for k in 0..np:
       var r = rc.recv()?
       let si = pending[r.idx]
@@ -925,6 +1148,7 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
         fs.rename(file + ".tmp", file) else 0
       add_counts(&tot, r.cnt)
       swap(&results[si], &r.issues)
+  if tm: eprint("T packages linted: {os.clock() - t0}")
   for k in 0..n:
     for is in results[k]: all.push(proc.dup(is))
   if true:

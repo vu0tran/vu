@@ -1,6 +1,7 @@
 // vgolint's few system calls: the working directory, whether a stream is a terminal, a file's
 // modification time.
 #include <unistd.h>
+#include <stdlib.h>
 #include <limits.h>
 #include <sys/stat.h>
 
@@ -21,6 +22,24 @@ bool gl_is_dir(const vu_str *path) {
   int r = stat(p, &st);
   free(p);
   return r == 0 && S_ISDIR(st.st_mode);
+}
+
+// The running executable's path, links resolved ("" when it can't be found): /proc/self/exe isn't
+// there on macOS, which turned the cache off.
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+vu_str gl_self_exe(void) {
+  char buf[PATH_MAX];
+#ifdef __APPLE__
+  char raw[PATH_MAX];
+  uint32_t n = sizeof raw;
+  if (_NSGetExecutablePath(raw, &n) != 0) return vu_str_from("", 0);
+  if (!realpath(raw, buf)) return vu_str_from("", 0);
+#else
+  if (!realpath("/proc/self/exe", buf)) return vu_str_from("", 0);
+#endif
+  return vu_str_from(buf, (int64_t)strlen(buf));
 }
 
 // The online CPUs, where /proc/cpuinfo isn't there (macOS).

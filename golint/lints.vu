@@ -402,16 +402,19 @@ fn gocyclo(g: tc.Prog, var l: L, p: pkg.Pkg, c: cfg.Cfg, roots: [Int]):
         let rv = t.a[d]
         if rv >= 0 and ast.count(t, rv) > 0:
           name = "(" + recv_str(t, t.b[ast.item(t, rv, 0)]) + ")." + name
-        if doc_ignore(p, t.file[d], t.pos[d]): continue
-        stats.push(Stat(name, 1 + cyclo(t, d), d, t.pos[d]))
+        # (only a function over the limit can be reported: the ignore comment matters only there)
+        let cx = 1 + cyclo(t, d)
+        if cx > over and doc_ignore(p, t.file[d], t.pos[d]): continue
+        stats.push(Stat(name, cx, d, t.pos[d]))
       elif t.k[d] == ast.N_GENDECL:
         for sp in ast.items(t, t.a[d]):
           if t.k[sp] != ast.N_VALUESPEC or t.c[sp] < 0: continue
           for v in ast.items(t, t.c[sp]):
             if t.k[v] != ast.N_FUNCLIT: continue
-            if doc_ignore(p, t.file[d], t.pos[d]): continue
+            let cx = 1 + cyclo(t, v)
+            if cx > over and doc_ignore(p, t.file[d], t.pos[d]): continue
             let nm0 = ast.item(t, t.a[sp], 0)
-            stats.push(Stat(t.names[t.s[nm0]] + "", 1 + cyclo(t, v), v, t.pos[v]))
+            stats.push(Stat(t.names[t.s[nm0]] + "", cx, v, t.pos[v]))
   # sort.Stable with Less(i, j) = s[i] >= s[j]: equal complexities end up reversed
   var idx: [Int] = []
   for i in 0..stats.len: idx.push(i)
@@ -461,9 +464,12 @@ type Dict:
   first: {Str: Str}      # typo -> correction the replacer picks (the first listed)
   prio: {Str: Int}
   rxs: [rx.Rx]           # url, email, host, backslash
+  bloom: [Bool]          # by word_hash of each typo: false means the word isn't one
 
 fn new_dict(c: cfg.Cfg) -> Dict:
-  var d = Dict({}, {}, {}, [])
+  var bl: [Bool] = []
+  for _ in 0..BLOOM: bl.push(false)
+  var d = Dict({}, {}, {}, [], bl)
   let s = cfg.lsettings(c, "misspell")
   let locale = doc.str_of(c.d, doc.get(c.d, s, "locale"), "").upper()
   let ignore = doc.strs_of(c.d, doc.get(c.d, s, "ignore-rules"))
@@ -492,13 +498,19 @@ fn new_dict(c: cfg.Cfg) -> Dict:
       d.corr[typo] = corr
       if not (lk in d.first):
         d.first[lk] = corr
+        d.bloom[word_hash(lk, 0, lk.len)] = true
         d.prio[lk] = prio
       prio -= 1
+  # (the patterns are compiled on first use: dict_rxs)
+  return d
+
+# url, email, host, backslash: what misspell leaves out of a line
+fn dict_rxs(var d: Dict):
+  if d.rxs.len > 0: return
   d.rxs.push(rx.compile("(?i)(https?|ftp)://(-\\.)?([^\\s/?.#]+\\.?)+(/\\S*)?"))
   d.rxs.push(rx.compile("[[:alnum:]_.%+-]+@[[:alnum:]-.]+\\.[[:alpha:]]{{2,6}}[^[:alpha:]]"))
   d.rxs.push(rx.compile("([[:alnum:]-]+\\.)+[[:alpha:]]{{2,63}}"))
   d.rxs.push(rx.compile("\\\\[[:lower:]]"))
-  return d
 
 fn blank_matches(x: rx.Rx, s: Str, host: Bool) -> Str:
   if not x.ok: return s
@@ -616,20 +628,38 @@ fn replace_word(d: Dict, w: Str) -> Str:
 fn eq_fold(a: Str, b: Str) -> Bool:
   return a.lower() == b.lower()
 
-fn misspell_line(g: tc.Prog, var l: L, d: Dict, s: Str, start: Int, node: Int):
-  # quick test: any word (or a word after a backslash escape) that is a typo
-  var cand = false
+const BLOOM = 1 << 20
+
+# A word's hash, its letters lowered (s[i..j]), for Dict.bloom
+fn word_hash(s: Str, i: Int, j: Int) -> Int:
+  var h = 2166136261
+  for k in i..j:
+    var b = int(s[k])
+    if b >= 65 and b <= 90: b += 32
+    h = ((h ^ b) * 16777619) & 4294967295
+  return h & (BLOOM - 1)
+
+fn typo_at(d: Dict, s: Str, i: Int, j: Int) -> Bool:
+  if not d.bloom[word_hash(s, i, j)]: return false
+  return doc.lower(s[i..j]) in d.first
+
+# Whether s has a word (or a word after a backslash escape) that is a typo
+fn has_typo(d: Dict, s: Str) -> Bool:
   var i = 0
-  while i < s.len and not cand:
+  while i < s.len:
     if word_byte(s[i]):
       var j = i
       while j < s.len and word_byte(s[j]): j += 1
-      let lw = doc.lower(s[i..j])
-      if lw in d.first: cand = true
-      elif i > 0 and s[i - 1] == '\\' and j - i > 1 and (doc.lower(s[i + 1..j]) in d.first): cand = true
+      if typo_at(d, s, i, j): return true
+      if i > 0 and s[i - 1] == '\\' and j - i > 1 and typo_at(d, s, i + 1, j): return true
       i = j
     else: i += 1
-  if not cand: return
+  return false
+
+fn misspell_line(g: tc.Prog, var l: L, var d: Dict, s: Str, start: Int, node: Int):
+  if not has_typo(d, s): return
+  dict_rxs(&d)
+  var i = 0
   var red = blank_matches(d.rxs[0], s, false)
   red = remove_path(red)
   red = blank_matches(d.rxs[1], red, false)
@@ -650,12 +680,14 @@ fn misspell_line(g: tc.Prog, var l: L, d: Dict, s: Str, start: Int, node: Int):
         report(g, &l, node, start + i, "misspell", "`" + word + "` is a misspelling of `" + nw + "`")
     i = j
 
-fn misspell(g: tc.Prog, var l: L, p: pkg.Pkg, d: Dict, c: cfg.Cfg, roots: [Int]):
+fn misspell(g: tc.Prog, var l: L, p: pkg.Pkg, var d: Dict, c: cfg.Cfg, roots: [Int]):
   let t = g.pk[l.pi].t
   let mode = doc.lower(doc.str_of(c.d, doc.get(c.d, cfg.lsettings(c, "misspell"), "mode"), ""))
   for r in roots:
     let fi = t.file[r]
     let src = p.srcs[fi]
+    # (a file without a typo in it has none on any line)
+    if not has_typo(d, src): continue
     if mode == "restricted":
       let cm = p.comments[fi]
       var k = 0
@@ -663,7 +695,7 @@ fn misspell(g: tc.Prog, var l: L, p: pkg.Pkg, d: Dict, c: cfg.Cfg, roots: [Int])
         let text = src[cm[k]..cm[k + 1]]
         var off = 0
         for ln in text.split("\n"):
-          misspell_line(g, &l, d, ln, cm[k] + off, r)
+          misspell_line(g, &l, &d, ln, cm[k] + off, r)
           off += ln.len + 1
         k += 3
       continue
@@ -671,7 +703,7 @@ fn misspell(g: tc.Prog, var l: L, p: pkg.Pkg, d: Dict, c: cfg.Cfg, roots: [Int])
     while pos < src.len:
       var e = src.find("\n", pos)
       if e < 0: e = src.len
-      misspell_line(g, &l, d, src[pos..e], pos, r)
+      misspell_line(g, &l, &d, src[pos..e], pos, r)
       pos = e + 1
 
 # ---- unconvert
@@ -758,7 +790,7 @@ fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, c: cfg.Cfg, var d: Dict, nod
   if cfg.is_enabled(c, "copyloopvar"): copyloopvar(g, &l, c, nodes)
   if cfg.is_enabled(c, "dogsled"): dogsled(g, &l, c, nodes)
   if cfg.is_enabled(c, "gocyclo"): gocyclo(g, &l, p, c, roots)
-  if cfg.is_enabled(c, "misspell"): misspell(g, &l, p, d, c, roots)
+  if cfg.is_enabled(c, "misspell"): misspell(g, &l, p, &d, c, roots)
   if cfg.is_enabled(c, "nakedret"): nakedret(g, &l, p, c, roots)
   if cfg.is_enabled(c, "predeclared"): predeclared(g, &l, c, nodes)
   if cfg.is_enabled(c, "unconvert"): unconvert(&g, fs, &l, p, c, nodes)
