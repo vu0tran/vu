@@ -258,7 +258,7 @@ fn dir_specs(fs: Fs, d: load.Dir, c: cfg.Cfg, modpath: Str, var kw: {Str: Int}, 
   if x_files.len > 0: out.push(Spec(d.path + "", x_files, ip + "_test"))
   return out
 
-fn dworker(fs: Fs, os: Os, tm: Bool, own dirs: Shared[[load.Dir]], own modpath: Str, own mf: Memo[Str, tc.Src], own dsrc: Memo[Str, tc.DepPkg], own dast: Memo[Str, tc.DepFile], own rxc: Memo[Str, rx.Rx], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[DRes], own goroot: Str, own modcache: Str, gover: Int):
+fn dworker(fs: Fs, os: Os, tm: Bool, own dirs: Shared[[load.Dir]], own modpath: Str, own mf: Memo[Str, tc.Src], own dsrc: Memo[Str, tc.DepPkg], own dast: Memo[Str, tc.DepFile], own rxc: Memo[Str, rx.Rx], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[DRes], own keep: Chan[tc.Prog], own goroot: Str, own modcache: Str, gover: Int):
   var kw = scan.keywords()
   var g = tc.new_prog(goroot, modcache)
   g.mfile = mf.share()
@@ -287,13 +287,16 @@ fn dworker(fs: Fs, os: Os, tm: Bool, own dirs: Shared[[load.Dir]], own modpath: 
       dr.res.push(r)
     res.send(dr)
   if tm: eprint("T worker: {g.pk.len} packages loaded, done at {os.clock()}")
+  # (what it built goes where nothing frees it before the run's exit(): freeing it here kept main,
+  # which shares its thread, waiting up to half a second)
+  keep.send(g)
 
 # Without the cache: the workers start as soon as the folders are known, each building the packages
 # of the folders it's given (dir_specs), their files read through one Memo the imported packages'
 # loader shares, and linting them; the results are then put in golist_order's order, from the
 # imports the workers report. (Run_lint reads every file and orders the packages first otherwise:
 # the cache keys need the sources.)
-fn stream_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, shc: Shared[cfg.Cfg], own dirs0: [load.Dir], modpath: Str, goroot: Str, modcache: Str, own ch: proc.Changed, diff: Bool, tm: Bool, t0: Float, var results: [[proc.Iss]], var perrs: [Str], var tot: proc.Counts) throws:
+fn stream_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, shc: Shared[cfg.Cfg], own dirs0: [load.Dir], modpath: Str, goroot: Str, modcache: Str, own ch: proc.Changed, diff: Bool, tm: Bool, t0: Float, mf: Memo[Str, tc.Src], dsrc: Memo[Str, tc.DepPkg], dast: Memo[Str, tc.DepFile], rxc: Memo[Str, rx.Rx], keep: Chan[tc.Prog], var results: [[proc.Iss]], var perrs: [Str], var tot: proc.Counts) throws:
   let c = shc.value
   # (folders in path order, handed out in regions of about the same number of files, the two
   # biggest of each first: see run_lint)
@@ -348,10 +351,6 @@ fn stream_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, shc: Shared[cfg.Cfg], own dirs
     at += rlen[r]
     chs.push(rch)
   let dirs = share(dirs0)
-  let mf: Memo[Str, tc.Src] = memo()
-  let dsrc: Memo[Str, tc.DepPkg] = memo()
-  let dast: Memo[Str, tc.DepFile] = memo()
-  let rxc: Memo[Str, rx.Rx] = memo()
   let sch = share(ch)
   let rc: Chan[DRes] = chan(nd + 1)
   let gover = minor_of(c.go_ver)
@@ -359,7 +358,7 @@ fn stream_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, shc: Shared[cfg.Cfg], own dirs
   for k in 0..jobs:
     var mine: [Chan[Int]] = []
     for q in 0..jobs: mine.push(chs[(k + q) % jobs].share())
-    spawn dworker(fs, os, tm, dirs, modpath + "", mf, dsrc, dast, rxc, shc, sch, diff, mine, rc, goroot + "", modcache + "", gover)
+    spawn dworker(fs, os, tm, dirs, modpath + "", mf, dsrc, dast, rxc, shc, sch, diff, mine, rc, keep, goroot + "", modcache + "", gover)
   var got: [DRes] = []
   for _ in 0..nd: got.push(DRes(-1, [], [], []))
   for _ in 0..nd:
@@ -998,6 +997,7 @@ fn cmd_linters(c: cfg.Cfg):
     if " [deprecated]" in l: print(l)
 
 fn main(fs: Fs, os: Os, ffi: Ffi) throws:
+  if os.env("VGOLINT_T") == "1": eprint("T main at {os.time()}")
   let argv = args()
   if argv.len < 2:
     print_help()
@@ -1082,6 +1082,7 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
   # (VGOLINT_T=1: each phase's time on stderr, and each package that takes over 0.3 s)
   let tm = os.env("VGOLINT_T") == "1"
   let t0 = os.clock()
+  if tm: eprint("T run_lint at {os.time()}")
   # packages
   var roots: [Str] = []
   var recs: [Bool] = []
@@ -1178,7 +1179,14 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
   # (without the cache, the workers start before the files are read: stream_lint; VGOLINT_STREAM=0
   # reads them all first, as with the cache)
   let stream = not use_cache and os.env("VGOLINT_STREAM") != "0"
-  if stream: stream_lint(fs, os, ffi, o, shc, dirs, modpath, goroot, modcache, ch, diff, tm, t0, &results, &perrs, &tot)?
+  # (made here, so that what they hold, every imported package's files and trees, is still there at
+  # the exit() that ends the run, instead of being freed one by one before the output)
+  let mf: Memo[Str, tc.Src] = memo()
+  let dsrc: Memo[Str, tc.DepPkg] = memo()
+  let dast: Memo[Str, tc.DepFile] = memo()
+  let rxc: Memo[Str, rx.Rx] = memo()
+  let keep: Chan[tc.Prog] = chan(1024)
+  if stream: stream_lint(fs, os, ffi, o, shc, dirs, modpath, goroot, modcache, ch, diff, tm, t0, mf, dsrc, dast, rxc, keep, &results, &perrs, &tot)?
   else:
     var specs: [Spec] = []
     var srcs: {Str: Str} = {}
@@ -1360,10 +1368,8 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
         rch.close()
         at += rlen[r]
         chs.push(rch)
-      # (each imported package read, and each of its files parsed, once for all the workers)
-      let dsrc: Memo[Str, tc.DepPkg] = memo()
-      let dast: Memo[Str, tc.DepFile] = memo()
-      let rxc: Memo[Str, rx.Rx] = memo()
+      # (each imported package read, and each of its files parsed, once for all the workers: the
+      # Memos made above)
       if tm: eprint("T workers start: {os.clock() - t0} at {os.clock()}")
       for k in 0..jobs:
         var mine: [Chan[Int]] = []
@@ -1384,6 +1390,7 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
   if tm: eprint("T packages linted: {os.clock() - t0}")
   for k in 0..results.len:
     for is in results[k]: all.push(proc.dup(is))
+  if tm: eprint("T issues gathered: {os.clock() - t0}")
   if true:
     let cc = c
     # warnings, as the processors' Finish methods log them
@@ -1450,8 +1457,11 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
         for is in shown:
           if is.linter == nm: k += 1
         print("* " + nm + ": {k}")
+  if tm: eprint("T printed: {os.clock() - t0} at {os.time()}")
   if shown.len > 0: exit(c.issues_exit)
   if perrs.len > 0: exit(7)
+  # (as the two above: the program ends without freeing what the run built)
+  exit(0)
 
 fn go_quote(s: Str) -> Str:
   return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
