@@ -166,6 +166,10 @@ type Prog:
   pkinds: {Int: Int} = {}   # (printf.name_and_kind: each object's print kind, -1 none)
   stream: Bool = false      # the linted files are read through mfile (main.stream_lint)
   dps: [Shared[DepPkg]] = []   # (Pk.dpi: a package's files, from dsrc)
+  # (the imported packages' cache: its folder, "" off, and what its keys hold besides a folder: the
+  # Go version and the build tags; read_dep)
+  dcache: Str = ""
+  dkey: Str = ""
 
 fn empty_srcs() -> {Str: Str}:
   return {}
@@ -667,7 +671,12 @@ fn load_pkg(var g: Prog, fs: Fs, path: Str, from_std: Bool) -> Int:
   for x in g.tags: tags.push(x + "")
   let ms = g.msrc.share()
   let mf = g.mfile.share()
-  let dp = g.dsrc.get(dir, fn(d) => read_dep(fs, d, tags, ms, mf))
+  # (the standard library's and the module cache's folders don't change: their files, indexes and
+  # trees come from the cache when it has them)
+  var dc = ""
+  if g.dcache.len > 0 and (dir.startswith(g.goroot + "/") or (g.modcache.len > 0 and dir.startswith(g.modcache + "/"))): dc = g.dcache + ""
+  let dk = g.dkey + ""
+  let dp = g.dsrc.get(dir, fn(d) => read_dep(fs, d, tags, ms, mf, dc, dk))
   for lf in 0..dp.value.ixs.len:
     if g.pk[pi].name.len == 0: g.pk[pi].name = dp.value.ixs[lf].pkgname + ""
     add_lazy(&g, pi, dp.value.ixs[lf])
@@ -679,8 +688,19 @@ fn load_pkg(var g: Prog, fs: Fs, path: Str, from_std: Bool) -> Int:
 
 # The files of the package in dir that build with tags: their sources (the module's from ms, read
 # already) and what each declares.
-fn read_dep(fs: Fs, dir: Str, tags: [Str], ms: Shared[{Str: Str}], mf: Memo[Str, Src]) -> DepPkg:
-  var out = DepPkg([], [])
+fn read_dep(fs: Fs, dir: Str, tags: [Str], ms: Shared[{Str: Str}], mf: Memo[Str, Src], dc: Str, dk: Str) -> DepPkg:
+  var out = DepPkg([], [], [])
+  var cpath = ""
+  var ckey = ""
+  if dc.len > 0:
+    ckey = DEP_FMT + "\n" + dir + "\n" + dk + "\n" + "\n".join(tags)
+    cpath = dc + "/" + key_hex(ckey)
+    let blob = fs.read(cpath) else ""
+    if blob.len > 0 and dec_pkg(blob, ckey, &out):
+      out.cfile = cpath
+      out.ckey = ckey
+      return out
+    out = DepPkg([], [], [])
   let names = fs.list(dir) else []
   var rel = dir + "/"
   if rel.startswith("./"): rel = rel[2..rel.len]
@@ -699,11 +719,40 @@ fn read_dep(fs: Fs, dir: Str, tags: [Str], ms: Shared[{Str: Str}], mf: Memo[Str,
     if not load.good_constraints(src, tags): continue
     out.ixs.push(index_lines(src))
     out.srcs.push(src)
+    out.enc.push("")
+    out.paths.push(dir + "/" + nm)
+  if cpath.len > 0:
+    # (every file's tree, for the next runs: parsed now, written with its source and index)
+    var all = true
+    for i in 0..out.srcs.len:
+      let df = parse_src(out.srcs[i])
+      out.enc[i] = enc_file(df)
+      var parts: [Str] = []
+      var b: [Byte] = []
+      put_str(&parts, &b, ckey + "\n{i}")
+      put_str(&parts, &b, out.srcs[i])
+      parts.push(b.take_str())
+      parts.push(out.enc[i])
+      let ftmp = cpath + ".{i}.tmp"
+      fs.write(ftmp, "".join(parts)) else all = false
+      if all: fs.rename(ftmp, cpath + ".{i}") else all = false
+    # (the package's entry last: with it, the files' are there)
+    let blob = enc_pkg(out, ckey)
+    let tmp = cpath + ".tmp"
+    var wrote = true
+    fs.write(tmp, blob) else wrote = false
+    if wrote and all: fs.rename(tmp, cpath) else 0
   return out
 
 # File lf of an imported package parsed on its own (function bodies skipped)
 fn parse_dep(dp: Shared[DepPkg], lf: Int) -> DepFile:
-  var ps = parse.parser(scan.scanner(dp.value.srcs[lf] + "", scan.keywords()), ast.new_ast(), 0)
+  var df = DepFile(ast.new_ast(), 0, [])
+  if lf < dp.value.enc.len:
+    if dp.value.enc[lf].len > 0 and dec_file(dp.value.enc[lf], 0, dp.value.enc[lf].len, &df): return df
+  return parse_src(src_of(dp.value, lf))
+
+fn parse_src(src: Str) -> DepFile:
+  var ps = parse.parser(scan.scanner(src + "", scan.keywords()), ast.new_ast(), 0)
   ps.skip = true
   let root = parse.parse_file(&ps)
   var t = ast.new_ast()
@@ -711,6 +760,84 @@ fn parse_dep(dp: Shared[DepPkg], lf: Int) -> DepFile:
   var cm: [Int] = []
   swap(&cm, &ps.sc.comments)
   return DepFile(t, root, cm)
+
+# Adds file lf of imported package pi from its entry in the cache (s, its tree from start), as add_parsed does
+# with a parsed one: decoded straight into the package's tree, renumbered as ast.append does.
+# false: the tree doesn't read back (nothing added).
+fn add_enc(var g: Prog, pi: Int, lf: Int, s: Str, start: Int, own src: Str) -> Bool:
+  let stop = s.len
+  var r = Rd(start, true)
+  var root = 0
+  var cm: [Int] = []
+  var ks: [Int] = []
+  if true:
+    root = get_int(s, &r)
+    get_ints(s, &r, &cm)
+    get_ints(s, &r, &ks)
+    if not r.ok or ks.len == 0: return false
+    # (the other node fields are as many as ks; check the lengths before adding anything)
+    let n = ks.len
+    var at = r.at
+    for _ in 0..8:
+      if at + 4 > stop or s.read_le(at, 4) != n: return false
+      at += 4 + n * 4
+    if at + 4 > stop: return false
+    let nl = s.read_le(at, 4)
+    at += 4 + nl * 4
+    if at + 4 > stop: return false
+  var t = ast.new_ast()
+  swap(&t, &g.pk[pi].t)
+  let fi = g.pk[pi].roots.len
+  let base = t.k.len - 1
+  let lbase = t.L.len
+  let nbase = t.names.len
+  let n = ks.len
+  if true:
+    for i in 1..n: t.k.push(ks[i])
+    for fld in 0..8:
+      r.at += 4
+      var at = r.at + 4
+      for i in 1..n:
+        var v = s.read_le(at, 4)
+        at += 4
+        if v >= 2147483648: v -= 4294967296
+        if fld == 0: t.pos.push(v)
+        elif fld == 1: t.end.push(v)
+        elif fld == 2:
+          if ks[i] == ast.N_LIST: t.a.push(v + lbase)
+          else: t.a.push(ast.reloc(v, base))
+        elif fld == 3:
+          if ks[i] == ast.N_LIST: t.b.push(v)
+          else: t.b.push(ast.reloc(v, base))
+        elif fld == 4: t.c.push(ast.reloc(v, base))
+        elif fld == 5: t.d.push(ast.reloc(v, base))
+        elif fld == 6: t.f.push(v)
+        else:
+          if (ks[i] == ast.N_IDENT or ks[i] == ast.N_BASICLIT) and v >= 0: t.s.push(v + nbase)
+          else: t.s.push(v)
+      r.at = at
+    for _ in 1..n: t.file.push(fi)
+    let nl = get_int(s, &r)
+    for _ in 0..nl:
+      var v = s.read_le(r.at, 4)
+      r.at += 4
+      if v >= 2147483648: v -= 4294967296
+      t.L.push(ast.reloc(v, base))
+    let nn = get_int(s, &r)
+    for _ in 0..nn: t.names.push(get_str(s, &r))
+  swap(&t, &g.pk[pi].t)
+  let rt = root + base
+  g.pk[pi].cmts.push(cm)
+  g.pk[pi].roots.push(rt)
+  g.pk[pi].srcs.push(src)
+  while g.pk[pi].flf.len < fi: g.pk[pi].flf.push(-1)
+  g.pk[pi].flf.push(lf)
+  g.pk[pi].imps.push(ast.items(g.pk[pi].t, g.pk[pi].t.b[rt]))
+  g.pk[pi].iname.push({})
+  if g.pk[pi].name.len == 0:
+    let nmid = g.pk[pi].t.s[g.pk[pi].t.a[rt]]
+    g.pk[pi].name = g.pk[pi].t.names[nmid] + ""
+  return true
 
 # Adds file lf of imported package pi, parsed already (pf), as add_src adds a file it parses.
 fn add_parsed(var g: Prog, pi: Int, pf: Shared[DepFile], dp: Shared[DepPkg], lf: Int):
@@ -751,16 +878,33 @@ fn has_at(src: Str, i: Int, w: Str) -> Bool:
   return true
 
 # Parses lazy file lf of package pi (once) and adds its declarations.
-fn ensure_file(var g: Prog, pi: Int, lf: Int):
+fn ensure_file(var g: Prog, fs: Fs, pi: Int, lf: Int):
   if g.pk[pi].lparsed[lf]: return
   g.pk[pi].lparsed[lf] = true
   let di = g.pk[pi].dpi
-  if di >= 0:
+  if di >= 0 and g.dps[di].value.cfile.len > 0:
+    # (from the cache: this file's own entry, read only now that it's needed)
+    let s = fs.read(g.dps[di].value.cfile + ".{lf}") else ""
+    var r = Rd(0, true)
+    var src = ""
+    var ok = s.len > 0 and get_str(s, &r) == g.dps[di].value.ckey + "\n{lf}"
+    if ok:
+      src = get_str(s, &r)
+      ok = r.ok and add_enc(&g, pi, lf, s, r.at, src)
+    if not ok:
+      # (no entry, or one that doesn't read back: the file itself)
+      src = fs.read(g.dps[di].value.paths[lf]) else ""
+      var kw: {Str: Int} = {}
+      swap(&kw, &g.kw)
+      add_src(&g, pi, src, true, &kw)
+      swap(&kw, &g.kw)
+    if g.trace: eprint("TP {g.pk[pi].dir} {lf} cached {ok}")
+  elif di >= 0:
     # (parsed once for the run: dast)
     let dp = g.dps[di].share()
     let key = g.pk[pi].dir + "\n{lf}"
     let pf = g.dast.get(key, fn(k) => parse_dep(dp, lf))
-    if g.trace: eprint("TP {g.pk[pi].dir} {lf} {dp.value.srcs[lf].len}")
+    if g.trace: eprint("TP {g.pk[pi].dir} {lf} {src_of(dp.value, lf).len}")
     add_parsed(&g, pi, pf, dp, lf)
   else:
     var src = ""
@@ -772,17 +916,17 @@ fn ensure_file(var g: Prog, pi: Int, lf: Int):
   collect_file(&g, pi, g.pk[pi].roots.len - 1)
 
 # A package-level object by name, parsing the file that declares it if needed. -1: none.
-fn scope_get(var g: Prog, pi: Int, name: Str) -> Int:
+fn scope_get(var g: Prog, fs: Fs, pi: Int, name: Str) -> Int:
   let o = g.pk[pi].scope.get(name, -1)
   if o >= 0 or not g.pk[pi].lazy: return o
   if not (name in g.pk[pi].lnames): return -1
   var lfs: [Int] = []
   for x in g.pk[pi].lnames[name]: lfs.push(x)
-  for lf in lfs: ensure_file(&g, pi, lf)
+  for lf in lfs: ensure_file(&g, fs, pi, lf)
   return g.pk[pi].scope.get(name, -1)
 
 # The methods declared on package-level type object o.
-fn methods_of(var g: Prog, o: Int) -> [Int]:
+fn methods_of(var g: Prog, fs: Fs, o: Int) -> [Int]:
   var out: [Int] = []
   let pi = g.opkg[o]
   if pi < 0: return out
@@ -790,7 +934,7 @@ fn methods_of(var g: Prog, o: Int) -> [Int]:
   if g.pk[pi].lazy and name in g.pk[pi].lmethods:
     var lfs: [Int] = []
     for x in g.pk[pi].lmethods[name]: lfs.push(x)
-    for lf in lfs: ensure_file(&g, pi, lf)
+    for lf in lfs: ensure_file(&g, fs, pi, lf)
   if g.pk[pi].scope.get(name, -1) != o: return out
   if name in g.pk[pi].mbyname:
     for m in g.pk[pi].mbyname[name]: out.push(m)
@@ -810,6 +954,19 @@ fn read_src(fs: Fs, p: Str) -> Src:
 type DepPkg:
   srcs: [Str]
   ixs: [Index]
+  enc: [Str]     # each file's tree as the cache holds it ("" none: parse_dep parses its source)
+  # (read from the cache, srcs and enc are empty: file lf's source and tree are in its own entry,
+  # cfile + ".lf", which starts with ckey + "\nlf"; paths are the files, if an entry is missing)
+  cfile: Str = ""
+  ckey: Str = ""
+  paths: [Str] = []
+
+fn src_of(dp: DepPkg, lf: Int) -> Str:
+  if lf < dp.srcs.len: return dp.srcs[lf]
+  return ""
+
+fn nfiles(dp: DepPkg) -> Int:
+  return dp.ixs.len
 
 # One of its files parsed on its own (Prog.dast), copied into a worker's package by ast.append.
 type DepFile:
@@ -1201,7 +1358,7 @@ fn dot_lookup(var g: Prog, fs: Fs, pi: Int, fi: Int, name: Str) -> Int:
     let lit = g.pk[pi].t.names[g.pk[pi].t.s[pnode]]
     let q = load_pkg(&g, fs, lit[1..lit.len - 1], std)
     if q < 0: continue
-    let o = scope_get(&g, q, name)
+    let o = scope_get(&g, fs, q, name)
     if o >= 0: return o
   return -1
 
@@ -1218,7 +1375,7 @@ fn lookup(var g: Prog, fs: Fs, pi: Int, fi: Int, name: Str) -> Int:
     let o = g.scopes[i].get(name, -1)
     if o >= 0: return o
     i -= 1
-  let o = scope_get(&g, pi, name)
+  let o = scope_get(&g, fs, pi, name)
   if o >= 0: return o
   let q = file_import(&g, fs, pi, fi, name)
   if q >= 0:
@@ -1552,7 +1709,7 @@ fn find_method(var g: Prog, fs: Fs, t: Int, name: Str) -> [Int]:
   let pi = g.opkg[o]
   if pi < 0: return []
   var hit = -1
-  for m in methods_of(&g, o):
+  for m in methods_of(&g, fs, o):
     if g.oname[m] == name: hit = m
   if hit < 0: return []
   var mt = obj_type(&g, fs, hit)
@@ -1620,6 +1777,11 @@ fn implements_error(var g: Prog, fs: Fs, t: Int) -> Bool:
 
 fn ensure(var g: Prog, pi: Int):
   let n = g.pk[pi].t.k.len
+  let have = g.pk[pi].ety.len
+  if have >= n: return
+  g.pk[pi].ety.reserve(n - have)
+  g.pk[pi].emd.reserve(n - have)
+  g.pk[pi].use.reserve(n - have)
   while g.pk[pi].ety.len < n:
     g.pk[pi].ety.push(-1)
     g.pk[pi].emd.push(0)
@@ -1894,7 +2056,7 @@ fn selector(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int) -> Int:
     let po = g.pk[pi].use[x]
     let q = g.oaux[po]
     if q < 0: return 0
-    let o = scope_get(&g, q, name)
+    let o = scope_get(&g, fs, q, name)
     if o < 0: return 0
     if g.pk[pi].use[sel] < 0: g.pk[pi].use[sel] = o
     g.pk[pi].sobj[n] = o
@@ -2771,3 +2933,177 @@ fn go_minor(fs: Fs, dir: Str) -> Int:
       let parts = v.split(".")
       if parts.len >= 2: return int(parts[1]) else 0
   return 0
+
+# ---- the imported packages' cache
+# A folder of the standard library or the module cache doesn't change, so what read_dep and
+# parse_dep make of it (the files that build, their sources, indexes and trees, function bodies
+# skipped) is kept on disk for the next runs, as Go's build cache keeps compiled packages. Under a hash
+# of its key (DEP_FMT, the folder, the Go version, the build tags): the folder's entry (the key, then
+# each file's index and path) and one entry per file, read only when the file is needed (hash.N: its
+# key + "\nN", source and tree): a run needs few of a folder's files. Each entry repeats
+# its key; one that doesn't read back is skipped (the source is parsed). Ints are 4 bytes, least
+# significant first; a text is its length and its bytes.
+# Change DEP_FMT when the parser, the index or this format changes.
+
+const DEP_FMT = "vgolint-dep2"
+
+fn key_hex(k: Str) -> Str:
+  var a = 2166136261
+  var b = 84696351
+  for i in 0..k.len:
+    let c = int(k[i])
+    a = ((a ^ c) * 16777619) & 4294967295
+    b = ((b ^ c) * 1597334677 + 374761393) & 4294967295
+  let hx = "0123456789abcdef"
+  var out = "d"
+  for x in [a, b]:
+    for sh in [28, 24, 20, 16, 12, 8, 4, 0]: out += hx[(x >> sh) & 15..((x >> sh) & 15) + 1]
+  return out
+
+fn put_int(var b: [Byte], x: Int):
+  let v = x & 4294967295
+  b.push(byte(v & 255))
+  b.push(byte((v >> 8) & 255))
+  b.push(byte((v >> 16) & 255))
+  b.push(byte((v >> 24) & 255))
+
+fn put_ints(var b: [Byte], xs: [Int]):
+  put_int(&b, xs.len)
+  for x in xs: put_int(&b, x)
+
+fn put_str(var parts: [Str], var b: [Byte], s: Str):
+  put_int(&b, s.len)
+  parts.push(b.take_str())
+  parts.push(s + "")
+
+# (a reader over a blob: at, and false once something didn't fit)
+type Rd:
+  at: Int
+  ok: Bool
+
+fn get_int(s: Str, var r: Rd) -> Int:
+  if r.at + 4 > s.len:
+    r.ok = false
+    return 0
+  var v = s.read_le(r.at, 4)
+  r.at += 4
+  if v >= 2147483648: v -= 4294967296
+  return v
+
+fn get_ints(s: Str, var r: Rd, var out: [Int]):
+  let n = get_int(s, &r)
+  if n < 0 or r.at + n * 4 > s.len:
+    r.ok = false
+    return
+  out.reserve(n)
+  for _ in 0..n:
+    var v = s.read_le(r.at, 4)
+    r.at += 4
+    if v >= 2147483648: v -= 4294967296
+    out.push(v)
+
+fn get_str(s: Str, var r: Rd) -> Str:
+  let n = get_int(s, &r)
+  if n < 0 or r.at + n > s.len:
+    r.ok = false
+    return ""
+  let t = s[r.at..r.at + n]
+  r.at += n
+  return t
+
+fn get_strs(s: Str, var r: Rd, var out: [Str]):
+  let n = get_int(s, &r)
+  if n < 0 or n > s.len:
+    r.ok = false
+    return
+  for _ in 0..n:
+    out.push(get_str(s, &r))
+    if not r.ok: return
+
+fn put_strs(var parts: [Str], var b: [Byte], xs: [Str]):
+  put_int(&b, xs.len)
+  for x in xs: put_str(&parts, &b, x)
+
+fn enc_file(df: DepFile) -> Str:
+  var b: [Byte] = []
+  let t = df.t
+  put_int(&b, df.root)
+  put_ints(&b, df.cmts)
+  put_ints(&b, t.k)
+  put_ints(&b, t.pos)
+  put_ints(&b, t.end)
+  put_ints(&b, t.a)
+  put_ints(&b, t.b)
+  put_ints(&b, t.c)
+  put_ints(&b, t.d)
+  put_ints(&b, t.f)
+  put_ints(&b, t.s)
+  put_ints(&b, t.L)
+  var parts: [Str] = []
+  put_strs(&parts, &b, t.names)
+  parts.push(b.take_str())
+  return "".join(parts)
+
+fn dec_file(s: Str, start: Int, stop: Int, var df: DepFile) -> Bool:
+  var r = Rd(start, true)
+  df.root = get_int(s, &r)
+  get_ints(s, &r, &df.cmts)
+  var t = ast.new_ast()
+  t.k = []
+  t.pos = []
+  t.end = []
+  t.a = []
+  t.b = []
+  t.c = []
+  t.d = []
+  t.f = []
+  t.s = []
+  t.names = []
+  get_ints(s, &r, &t.k)
+  get_ints(s, &r, &t.pos)
+  get_ints(s, &r, &t.end)
+  get_ints(s, &r, &t.a)
+  get_ints(s, &r, &t.b)
+  get_ints(s, &r, &t.c)
+  get_ints(s, &r, &t.d)
+  get_ints(s, &r, &t.f)
+  get_ints(s, &r, &t.s)
+  get_ints(s, &r, &t.L)
+  get_strs(s, &r, &t.names)
+  let n = t.k.len
+  if not r.ok or r.at != stop or t.pos.len != n or t.end.len != n or t.a.len != n or t.b.len != n or t.c.len != n or t.d.len != n or t.f.len != n or t.s.len != n: return false
+  for _ in 0..n: t.file.push(0)
+  t.htab = []
+  t.hids = []
+  df.t = t
+  return true
+
+fn enc_pkg(dp: DepPkg, key: Str) -> Str:
+  var parts: [Str] = []
+  var b: [Byte] = []
+  put_str(&parts, &b, key)
+  put_int(&b, dp.srcs.len)
+  for i in 0..dp.srcs.len:
+    let ix = dp.ixs[i]
+    put_str(&parts, &b, ix.pkgname)
+    put_str(&parts, &b, ix.doc)
+    put_strs(&parts, &b, ix.names)
+    put_strs(&parts, &b, ix.methods)
+    put_str(&parts, &b, dp.paths[i])
+  parts.push(b.take_str())
+  return "".join(parts)
+
+fn dec_pkg(s: Str, key: Str, var out: DepPkg) -> Bool:
+  var r = Rd(0, true)
+  if get_str(s, &r) != key or not r.ok: return false
+  let n = get_int(s, &r)
+  if n < 0 or n > s.len: return false
+  for _ in 0..n:
+    var ix = Index("", [], [], "")
+    ix.pkgname = get_str(s, &r)
+    ix.doc = get_str(s, &r)
+    get_strs(s, &r, &ix.names)
+    get_strs(s, &r, &ix.methods)
+    out.paths.push(get_str(s, &r))
+    out.ixs.push(ix)
+  return r.ok and r.at == s.len

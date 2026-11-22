@@ -151,6 +151,25 @@ waiting up to half a second. Vu's runtime now finds its string pool with one thr
 instead of two (macOS makes each a call). User time 32.7 -> 28.0 s; exit, unmapping about 6 GB,
 takes 0.10 to 0.14 s of the run.
 
+**Imported packages cached on disk (2026-11-22): 3.9 to 3.2 s uncached on the corpus.** A folder of
+the standard library or the module cache doesn't change between runs, so what a run reads and parses
+there (the files that build, what each declares, each file's tree with function bodies skipped) is
+kept in `~/.cache/vgolint/deps` (`$XDG_CACHE_HOME`), keyed by the folder, the Go installation and
+the build tags, and used with `--no-cache` too, which is about the linted packages' results
+(`VGOLINT_DEP_CACHE=0` turns it off; `cache clean` empties it). A folder's entry holds its files'
+indexes; each file has its own entry, read only when a declaration in it is needed (gin's run reads
+138 files from the 59 folders it takes a declaration from, which hold 1,465 non-test Go files). A cached tree goes straight into the worker's package, renumbered
+as it's read. Literals are no longer looked up in the parser's name table (most are different):
+x/text's CPU time 1.62 to 1.36 s. On the 21 corpus modules and x/text, net, crypto and mod
+(`--no-cache`, best of 3, 2 cores, both binaries measured in the same session): 3,895 to 3,222 ms
+wall, 6,144 to 5,012 ms CPU, byte for byte the same output under the default config and the three
+`tools/opt_*.yml` (66 runs), cold or warm, and with entries truncated, deleted or overwritten with
+noise, or two runs filling an empty cache at once. The cache takes about 31 MB for x/text's
+imports, and the run that fills it costs about 0.1 s more (x/text: 0.89 s against 0.69 to 0.85).
+What's left is flat: type-checking the linted packages and the imported declarations they use (each
+worker for itself) about a third, staticcheck a quarter (its IR 9%), parsing the linted files 14%,
+vet 9%, ineffassign 7%, unused 6%.
+
 ## Drop-in status
 
 ### Commands
