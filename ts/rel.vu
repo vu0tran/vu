@@ -13,8 +13,17 @@ import tyops
 from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP
 from types import OK_DECL, OK_REF, OK_ANON, OK_INST, OK_TUPLE, SF_OPTIONAL
 
+# (VTSC_TRACE_REL) a relation's failing check, remembered for the trace; v is returned
+fn rfail(var c: C, why: Str, v: Bool) -> Bool:
+  if c.trace_rel and c.trace_why == "": c.trace_why = why
+  return v
+
 fn assignable(var c: C, s: Int, t: Int) -> Bool:
   if s == t:
+    c.no_weak = false
+    return true
+  # (strictNullChecks false: undefined and null are in every type's domain, isSimpleTypeRelatedTo)
+  if c.snc_off and (c.tk[s] == types.TK_NULL or c.tk[s] == types.TK_UNDEF):
     c.no_weak = false
     return true
   var key = (s << 32) | t
@@ -26,23 +35,46 @@ fn assignable(var c: C, s: Int, t: Int) -> Bool:
   if c.comparable: key = key | (1 << 57)
   if c.strict_sub: key = key | (1 << 56)
   if c.narrow_sub: key = key | (1 << 55)
-  if key in c.rel_cache:
+  # (one lookup: 1 related, 0 not)
+  let cv = c.rel_cache.get(key, -1)
+  if cv >= 0:
     # (one decided through a type not modeled: the file asking now depends on it too)
-    if key in c.rel_taint: bind.touch(&c, c.rel_taint[key])
-    return c.rel_cache[key]
+    if c.rel_taint.len > 0:
+      let tv = c.rel_taint.get(key, -1)
+      if tv >= 0: bind.touch(&c, tv)
+    return cv == 1
   # a relation being computed is assumed to hold (recursive types)
-  c.rel_cache[key] = true
+  c.rel_cache[key] = 1
   let seq0 = c.unsup_seq
   c.rel_n += 1
   let rn0 = c.rel_n
   let outer_rel = c.rel_top
   c.rel_top = true
+  if c.trace_rel:
+    if c.trace_depth == 0: c.trace_lines = []
+    c.trace_depth += 1
+    c.trace_stk.push(s)
+    c.trace_stk.push(t)
   let r = rel(&c, s, t)
+  if c.trace_rel:
+    c.trace_depth -= 1
+    c.trace_stk.pop()
+    c.trace_stk.pop()
+    if not r:
+      var w = c.trace_why
+      if w == "": w = "(its parts)"
+      var pad = "  "
+      for _i in 0..c.trace_depth: pad += "  "
+      let ss = show.show(&c, s)
+      let ts = show.show(&c, t)
+      c.trace_lines.push(pad + ss + "  ->  " + ts + "   [" + w + "]")
+    c.trace_why = ""
   c.rel_top = outer_rel
   if c.debug_counts and not outer_rel and c.rel_n - rn0 > 30:
     c.rel_pairs[key] = c.rel_n - rn0
     c.rel_pair_txt[key] = show.show(&c, s) + " TO " + show.show(&c, t)
-  c.rel_cache[key] = r
+  if r: c.rel_cache[key] = 1
+  else: c.rel_cache[key] = 0
   if c.unsup_seq != seq0 and c.last_unsup >= 0: c.rel_taint[key] = c.last_unsup
   return r
 
@@ -68,17 +100,24 @@ fn cond_target_rel(var c: C, s: Int, t: Int) -> Int:
   let cn = c.ta[t]
   let m = c.tb[t]
   if cn < 0 or c.t.nd[cn].k != ast.N_TCOND: return -1
+  # (with infer declarations, or branches that depend on the distribution, structuredTypeRelatedTo
+  # has no rule for a concrete source: not related, an object one compared structurally with no
+  # object target)
+  let cst = c.tk[s] == TK_OBJ or is_prim(c, s)
   var infs: [Int] = []
   tyops.collect_infers(c, c.t.nd[cn].b, &infs)
-  if infs.len > 0: return -1
+  if infs.len > 0:
+    if cst: return 0
+    return -1
   var chn = c.t.nd[cn].a
   while chn >= 0 and c.t.nd[chn].k == ast.N_TPAREN: chn = c.t.nd[chn].a
   let rct = tyops.raw(&c, chn)
-  # (distributive over a type parameter the branches mention: not modeled)
   if c.tk[rct] == TK_TPARAM and c.t.nd[chn].k == ast.N_TREF:
     let rtb = tyops.raw(&c, c.t.nd[cn].c)
     let rfb = tyops.raw(&c, c.t.nd[cn].d)
-    if chk.mentions_tp(&c, rtb, rct, 0) or chk.mentions_tp(&c, rfb, rct, 0): return -1
+    if chk.mentions_tp(&c, rtb, rct, 0) or chk.mentions_tp(&c, rfb, rct, 0):
+      if cst: return 0
+      return -1
   let ct = bind.instantiate(&c, rct, m)
   let g1 = tyops.raw(&c, c.t.nd[cn].b)
   let ext = bind.instantiate(&c, g1, m)
@@ -119,12 +158,171 @@ fn cond_target_rel(var c: C, s: Int, t: Int) -> Int:
   if r: return 1
   return 0
 
+# isDistributionDependent: a distributive conditional type whose branches mention its check type
+# parameter.
+fn dist_dependent(var c: C, n: Int) -> Bool:
+  var cn = c.t.nd[n].a
+  while cn >= 0 and c.t.nd[cn].k == ast.N_TPAREN: cn = c.t.nd[cn].a
+  if cn < 0 or c.t.nd[cn].k != ast.N_TREF or c.t.nd[cn].b >= 0: return false
+  let rc = tyops.raw(&c, cn)
+  if c.tk[rc] != TK_TPARAM: return false
+  let nm0 = c.t.nd[c.t.nd[cn].a].s
+  return bind.contains_ref(&c, c.t.nd[n].c, nm0) or bind.contains_ref(&c, c.t.nd[n].d, nm0)
+
+# Whether every branch of the conditional type at node n is a string: a string or template literal
+# type, a union of them, never, or another such conditional (written so, whatever is substituted).
+fn cond_stringish(var c: C, n: Int, depth: Int) -> Bool:
+  if depth > 8 or n < 0 or c.t.nd[n].k != ast.N_TCOND: return false
+  return node_stringish(&c, c.t.nd[n].c, depth) and node_stringish(&c, c.t.nd[n].d, depth)
+
+fn node_stringish(var c: C, x0: Int, depth: Int) -> Bool:
+  var x = x0
+  while x >= 0 and c.t.nd[x].k == ast.N_TPAREN: x = c.t.nd[x].a
+  if x < 0: return false
+  let k = c.t.nd[x].k
+  if k == ast.N_TCOND: return cond_stringish(&c, x, depth + 1)
+  if k == ast.N_TTEMPLATE: return true
+  if depth > 8: return false
+  # ({ [K in ...]: X }[I]: X, the template)
+  if k == ast.N_TINDEXED:
+    var ob = c.t.nd[x].a
+    while ob >= 0 and c.t.nd[ob].k == ast.N_TPAREN: ob = c.t.nd[ob].a
+    if ob >= 0 and c.t.nd[ob].k == ast.N_TMAPPED: return node_stringish(&c, c.t.nd[ob].c, depth + 1)
+    return false
+  # (a generic alias's reference: its body, as written)
+  if k == ast.N_TREF and c.t.nd[x].b >= 0:
+    let nn = c.t.nd[x].a
+    if nn >= 0 and c.t.nd[nn].k == ast.N_ID:
+      let sy = bind.lookup_type(&c, x, c.t.nd[nn].s)
+      if sy >= 0 and (c.sk[sy] & types.S_ALIAS) != 0:
+        let dd = c.sdecl[sy]
+        if dd >= 0 and c.t.nd[dd].k == ast.N_TYPEALIAS: return node_stringish(&c, c.t.nd[dd].b, depth + 1)
+    return false
+  if k == ast.N_TUNION:
+    for y in ast.items(c.t, c.t.nd[x].a):
+      if not node_stringish(&c, y, depth): return false
+    return true
+  let r = tyops.raw(&c, x)
+  let rk = c.tk[r]
+  return rk == TK_STRING or rk == TK_STRLIT or rk == types.TK_TEMPLATE or rk == TK_NEVER
+
+# Two instantiations of one conditional type (generic_rel): 1 related, 0 not, -1 not decided.
+fn same_cond_rel(var c: C, s: Int, t: Int, n: Int) -> Int:
+  # (the same conditional type made twice: the same type arguments)
+  if tyops.cond_key(&c, n, c.tb[s]) == tyops.cond_key(&c, n, c.tb[t]): return 1
+  var parts: [[Int]] = []
+  for m in [c.tb[s], c.tb[t]]:
+    var ps: [Int] = []
+    for x in [c.t.nd[n].a, c.t.nd[n].b, c.t.nd[n].c, c.t.nd[n].d]:
+      let r = tyops.raw(&c, x)
+      ps.push(bind.instantiate(&c, r, m))
+    parts.push(ps)
+  if parts[0][0] == parts[1][0] and parts[0][1] == parts[1][1]:
+    if assignable(&c, parts[0][2], parts[1][2]) and assignable(&c, parts[0][3], parts[1][3]): return 1
+  # (the check types related one way, the extends types each other's (identical, as made apart),
+  # the branches related)
+  let ck = parts[0][0] == parts[1][0] or assignable(&c, parts[0][0], parts[1][0]) or assignable(&c, parts[1][0], parts[0][0])
+  # (the extends type mentioning no type parameter the two mappers give differently: one type,
+  # `${infer K}.${infer R}` whatever T is)
+  var ex_same = parts[0][1] == parts[1][1]
+  if not ex_same:
+    let en = c.t.nd[n].b
+    var frs: [Int] = []
+    tyops.free_tp_refs(&c, en, en, &frs)
+    ex_same = true
+    for ftp in frs:
+      if bind.instantiate(&c, ftp, c.tb[s]) != bind.instantiate(&c, ftp, c.tb[t]): ex_same = false
+  let ex = ex_same or (assignable(&c, parts[0][1], parts[1][1]) and assignable(&c, parts[1][1], parts[0][1]))
+  if ck and ex and assignable(&c, parts[0][2], parts[1][2]) and assignable(&c, parts[0][3], parts[1][3]): return 1
+  # (the check types not identical, or the branches unrelated: the source through its constraints,
+  # and a target whose branches depend on the distribution (Extract<T, U>) takes nothing but another
+  # conditional type, structuredTypeRelatedTo)
+  if parts[0][0] != parts[1][0] and dist_dependent(&c, n):
+    var inf2: [Int] = []
+    tyops.collect_infers(c, c.t.nd[n].b, &inf2)
+    let dd2 = tyops.cond_dist(&c, s)
+    let d02 = tyops.cond_default(&c, s)
+    if inf2.len == 0 and dd2 == -1 and d02 >= 0:
+      let dk = c.tk[d02]
+      if dk == TK_OBJ or dk == TK_INTER or dk == TK_UNION or dk == TK_NEVER:
+        var plain = dk != TK_UNION
+        if dk == TK_UNION:
+          plain = true
+          for um in types.members(c, d02):
+            let uk = c.tk[um]
+            if uk != TK_OBJ and uk != TK_INTER: plain = false
+        if dk == TK_NEVER: return 1
+        if plain: return 0
+  return -1
+
+# T[K]'s base constraint for writing (structuredTypeRelatedTo's indexed access target): the
+# access of T's and K's base constraints, the keys' properties intersected, without index
+# signatures when T has a constraint; -1 when either is still generic (there's none), -2 when it
+# isn't modeled.
+fn write_constraint(var c: C, t: Int) -> Int:
+  var bo = tyops.base_of(&c, c.ta[t], 0)
+  if bo == -2: return -2
+  if bo == -1: bo = c.ta[t]
+  var bi = tyops.base_of(&c, c.tb[t], 0)
+  if bi == -2: return -2
+  if bi == -1: bi = c.tb[t]
+  if generic_object(c, bo) or tyops.is_deferred(c, bi) or c.tk[bi] == TK_TPARAM: return -1
+  var ps: [Int] = []
+  for mi161_ in 0..types.nmem(c, bi):
+    let k = types.mem(c, bi, mi161_)
+    if bo == c.ta[t]:
+      let r = tyops.indexed_of(&c, bo, k)
+      if c.tk[r] == TK_UNSUP: return -2
+      ps.push(r)
+      continue
+    # (the object's base constraint, without index signatures: its properties of the keys)
+    if c.tk[k] != TK_STRLIT:
+      # (an array's or tuple's elements by number)
+      if (c.tk[k] == TK_NUMBER or c.tk[k] == TK_NUMLIT) and c.tk[bo] == TK_OBJ and (is_array_ref(&c, bo) or c.objs[c.ta[bo]].kind == types.OK_TUPLE):
+        let rn = tyops.indexed_of(&c, bo, k)
+        if c.tk[rn] == TK_UNSUP: return -2
+        ps.push(rn)
+        continue
+      return -2
+    if c.tk[bo] == TK_INTER:
+      # (an intersection: the property in the members that have it)
+      let ri = tyops.indexed_of(&c, bo, k)
+      if c.tk[ri] == TK_UNSUP: return -2
+      ps.push(ri)
+      continue
+    let ap = apparent(&c, bo)
+    if c.tk[ap] != TK_OBJ: return -2
+    let sp = bind.get_prop(&c, ap, c.ta[k])
+    if sp < 0: return -2
+    ps.push(bind.prop_type_for(&c, sp, bo))
+  let w = types.inter_of(&c, ps)
+  if c.tk[w] == TK_UNSUP: return -2
+  return w
+
 fn generic_rel(var c: C, s: Int, t: Int) -> Int:
   let sk = c.tk[s]
   let tk = c.tk[t]
+  # (a concrete source to T[K] with a literal key: related to the base constraint for writing when
+  # that isn't generic, S["_zod"]["output"] through S's constraint; structuredTypeRelatedTo)
+  if tk == types.TK_INDEXED and sk != types.TK_INDEXED:
+    let ik0 = c.tk[c.tb[t]]
+    if ik0 == TK_STRLIT or ik0 == TK_NUMLIT:
+      let wb = tyops.base_of(&c, t, 0)
+      if wb >= 0 and wb != t and not tyops.is_generic(&c, wb) and c.tk[wb] != TK_UNSUP:
+        if assignable(&c, s, wb): return 1
+        if not chk.could_contain_tvars(&c, s): return 0
   # a concrete source to a deferred conditional type: related to both branches (the one the
   # check can't take skipped), when it infers nothing and its branches don't depend on the
   # distribution (structuredTypeRelatedTo)
+  # (a concrete source that may still mention type parameters by its syntax, a function type:
+  # the same when it isn't generic, for a target with infer declarations or depending on the
+  # distribution)
+  if tk == types.TK_COND and (sk == TK_OBJ or is_prim(c, s)) and chk.could_contain_tvars(&c, s) and not tyops.is_generic(&c, s):
+    let cn9 = c.ta[t]
+    if cn9 >= 0 and c.t.nd[cn9].k == ast.N_TCOND:
+      var inf9: [Int] = []
+      tyops.collect_infers(c, c.t.nd[cn9].b, &inf9)
+      if inf9.len > 0 or dist_dependent(&c, cn9): return 0
   if tk == types.TK_COND and sk != types.TK_COND and not chk.could_contain_tvars(&c, s):
     let r0 = cond_target_rel(&c, s, t)
     if r0 >= 0: return r0
@@ -155,7 +353,9 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     let mr = mapped_mapped(&c, s, t)
     if mr != -2: return mr
   # { [P in K]: X } over a type parameter K as the target, a concrete object type as the source
-  if is_mapped(c, t) and sk == TK_OBJ and not is_mapped(c, s) and not tyops.is_generic(&c, s):
+  # (a source with type variables in its members, a function returning Pick<S, K>, the same: its
+  # keys are concrete)
+  if is_mapped(c, t) and sk == TK_OBJ and not is_mapped(c, s):
     let mr = mapped_tparam_target(&c, s, t)
     if mr != -2: return mr
   # a generic mapped source over a type parameter K (no members): an object target by its index
@@ -179,6 +379,12 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     for ii41_ in 0..types.ninter(c, s):
       let m = types.inter_at(c, s, ii41_)
       if m == t: return 1
+    # (a concrete object member that is the target's equal, made apart: before the generic ones,
+    # whose relation may not be modeled)
+    if tk == TK_OBJ and not is_mapped(c, t):
+      for ii43_ in 0..types.ninter(c, s):
+        let m = types.inter_at(c, s, ii43_)
+        if c.tk[m] == TK_OBJ and not is_mapped(c, m) and assignable(&c, m, t): return 1
     for ii42_ in 0..types.ninter(c, s):
       let m = types.inter_at(c, s, ii42_)
       if (c.tk[m] >= types.TK_KEYOF or is_mapped(c, m) or c.tk[m] == TK_TPARAM) and assignable(&c, m, t): return 1
@@ -252,84 +458,49 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     if st_ != t:
       if assignable(&c, s, st_): return 1
       return 0
+  # S[K] to T[J], not related part by part: only through T[J]'s writing constraint, since the
+  # source's own constraint step is skipped when both are indexed accesses
+  # (structuredTypeRelatedTo); without one (T's or J's base constraint still generic, or the
+  # subtype relation), not related
+  if sk == types.TK_INDEXED and tk == types.TK_INDEXED:
+    if c.subtype: return 0
+    let wc = write_constraint(&c, t)
+    if wc == -2: return -1
+    if wc == -1: return 0
+    if assignable(&c, s, wc): return 1
+    return 0
   # T[K] as a target: a concrete source relates to its writing constraint, when T's and K's base
   # constraints aren't generic (else to nothing)
   if tk == types.TK_INDEXED and (not tyops.is_generic(&c, s) or (sk == TK_TPARAM and tp_concrete(&c, s))) and sk < types.TK_KEYOF:
-    var bo = tyops.base_of(&c, c.ta[t], 0)
-    if bo == -2: return -1
-    if bo == -1: bo = c.ta[t]
-    var bi = tyops.base_of(&c, c.tb[t], 0)
-    if bi == -2: return -1
-    if bi == -1: bi = c.tb[t]
-    if generic_object(c, bo) or tyops.is_deferred(c, bi) or c.tk[bi] == TK_TPARAM: return 0
-    if bo != c.ta[t]:
-      # (the object's base constraint, without index signatures: its properties of the keys)
-      var ps0: [Int] = []
-      for mi161_ in 0..types.nmem(c, bi):
-        let k = types.mem(c, bi, mi161_)
-        if c.tk[k] != TK_STRLIT:
-          # (an array's or tuple's elements by number)
-          if (c.tk[k] == TK_NUMBER or c.tk[k] == TK_NUMLIT) and c.tk[bo] == TK_OBJ and (is_array_ref(&c, bo) or c.objs[c.ta[bo]].kind == types.OK_TUPLE):
-            let rn = tyops.indexed_of(&c, bo, k)
-            if c.tk[rn] == TK_UNSUP: return -1
-            ps0.push(rn)
-            continue
-          return -1
-        if c.tk[bo] == TK_INTER:
-          # (an intersection: the property in the members that have it)
-          let ri = tyops.indexed_of(&c, bo, k)
-          if c.tk[ri] == TK_UNSUP: return -1
-          ps0.push(ri)
-          continue
-        let ap = apparent(&c, bo)
-        if c.tk[ap] != TK_OBJ: return -1
-        let sp = bind.get_prop(&c, ap, c.ta[k])
-        if sp < 0: return -1
-        ps0.push(bind.prop_type_for(&c, sp, bo))
-      let w0 = types.inter_of(&c, ps0)
-      if c.tk[w0] == TK_UNSUP: return -1
-      if assignable(&c, s, w0): return 1
-      # (a type parameter: then through its constraint)
-      if sk == TK_TPARAM:
-        let sc0 = constraint_of(&c, s)
-        if sc0 >= 0 and sc0 != s and not tyops.is_generic(&c, sc0) and assignable(&c, sc0, t): return 1
-        return 0
-      # (an object literal's error there is elaborated into its properties: not modeled)
-      if c.tk[s] == TK_OBJ and c.objs[c.ta[s]].fresh: return -1
-      return 0
-    var parts: [Int] = []
-    for mi162_ in 0..types.nmem(c, bi):
-      let k = types.mem(c, bi, mi162_)
-      let r = tyops.indexed_of(&c, bo, k)
-      if c.tk[r] == TK_UNSUP: return -1
-      parts.push(r)
-    let w = types.inter_of(&c, parts)
+    let w = write_constraint(&c, t)
+    if w == -2: return -1
+    if w == -1: return 0
     if assignable(&c, s, w): return 1
+    # (a type parameter: then through its constraint)
     if sk == TK_TPARAM:
-      let sc1 = constraint_of(&c, s)
-      if sc1 >= 0 and sc1 != s and not tyops.is_generic(&c, sc1) and assignable(&c, sc1, t): return 1
+      let sc0 = constraint_of(&c, s)
+      if sc0 >= 0 and sc0 != s and not tyops.is_generic(&c, sc0) and assignable(&c, sc0, t): return 1
+      return 0
+    # (an object literal's error against T's constraint's properties is elaborated into its
+    # properties: not modeled)
+    let bo1 = tyops.base_of(&c, c.ta[t], 0)
+    if bo1 >= 0 and bo1 != c.ta[t] and c.tk[s] == TK_OBJ and c.objs[c.ta[s]].fresh: return -1
     return 0
   # two instantiations of one conditional type: the same checked and extends types, and the
   # branches related
   if sk == types.TK_COND and tk == types.TK_COND and c.ta[s] == c.ta[t]:
     let n = c.ta[s]
-    # (the same conditional type made twice: the same type arguments)
-    if tyops.cond_key(&c, n, c.tb[s]) == tyops.cond_key(&c, n, c.tb[t]): return 1
-    var parts: [[Int]] = []
-    for m in [c.tb[s], c.tb[t]]:
-      var ps: [Int] = []
-      for x in [c.t.nd[n].a, c.t.nd[n].b, c.t.nd[n].c, c.t.nd[n].d]:
-        let r = tyops.raw(&c, x)
-        ps.push(bind.instantiate(&c, r, m))
-      parts.push(ps)
-    if parts[0][0] == parts[1][0] and parts[0][1] == parts[1][1]:
-      if assignable(&c, parts[0][2], parts[1][2]) and assignable(&c, parts[0][3], parts[1][3]): return 1
-    # (the check types related one way, the extends types each other's (identical, as made apart),
-    # the branches related)
-    let ck = parts[0][0] == parts[1][0] or assignable(&c, parts[0][0], parts[1][0]) or assignable(&c, parts[1][0], parts[0][0])
-    let ex = parts[0][1] == parts[1][1] or (assignable(&c, parts[0][1], parts[1][1]) and assignable(&c, parts[1][1], parts[0][1]))
-    if ck and ex and assignable(&c, parts[0][2], parts[1][2]) and assignable(&c, parts[0][3], parts[1][3]): return 1
-    return -1
+    # (isDeeplyNestedType: the same conditional type related inside itself three times, each side
+    # a new instantiation (a recursive alias over T[K], react-hook-form's PathValue): Ternary.Maybe,
+    # related)
+    var depth_n = 0
+    for x in c.cond_rel_stk:
+      if x == n: depth_n += 1
+    if depth_n >= 3 and tyops.cond_key(&c, n, c.tb[s]) != tyops.cond_key(&c, n, c.tb[t]): return 1
+    c.cond_rel_stk.push(n)
+    let r_sc = same_cond_rel(&c, s, t, n)
+    let _ = c.cond_rel_stk.pop()
+    return r_sc
   # two conditional types: identical extends types, check types related one way, branches related
   if sk == types.TK_COND and tk == types.TK_COND:
     var inf1: [Int] = []
@@ -356,6 +527,9 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
         if d0 >= 0 and dd == -1 and not tyops.is_generic(&c, ps[1][2]) and not tyops.is_generic(&c, ps[1][3]):
           if not assignable(&c, d0, ps[1][2]) and not assignable(&c, d0, ps[1][3]): return 0
     return -1
+  # (a conditional whose every branch is a string, template literal types as react-hook-form's
+  # PathImpl: to a primitive that isn't a string, never related)
+  if sk == types.TK_COND and (tk == TK_UNDEF or tk == TK_NULL or tk == TK_VOID or tk == TK_NUMBER or tk == TK_NUMLIT or tk == TK_BIGINT or tk == TK_BIGLIT or tk == TK_TRUE or tk == TK_FALSE or tk == TK_SYMBOL) and cond_stringish(&c, c.ta[s], 0): return 0
   # a deferred conditional type: through an upper bound of its branches
   if sk == types.TK_COND and tk != types.TK_COND:
     # isRelatedTo through the default constraint, then the distributive one
@@ -369,6 +543,9 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     let b = cond_bound(&c, s, 0)
     if b >= 0 and assignable(&c, b, t): return 1
     if d0 >= 0 and dd != -2 and not tyops.is_generic(&c, t): return 0
+    # (an object type target, generic or not: only the constraints relate a conditional source to
+    # it, and none did)
+    if d0 >= 0 and dd != -2 and tk == TK_OBJ and not is_mapped(c, t) and c.objs[c.ta[t]].kind != OK_TUPLE: return 0
     if d0 >= 0 and dd != -2 and tk == types.TK_KEYOF and (c.tk[c.ta[t]] == TK_TPARAM or c.tk[c.ta[t]] == types.TK_COND):
       # no constraint relates: only the target's own rule is left
       let kr = keyof_target(&c, s, t)
@@ -377,6 +554,17 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
     return -1
   if tk == types.TK_COND:
     let n = c.ta[t]
+    # (a type parameter source: its constraint related to the target, structuredTypeRelatedTo's
+    # type variable step; TName extends FieldPath<T> to Path<T>)
+    if sk == TK_TPARAM:
+      let scn = constraint_of(&c, s)
+      if scn >= 0 and scn != s and c.tk[scn] != TK_UNSUP and c.tk[scn] != TK_UNKNOWN:
+        if assignable(&c, scn, t): return 1
+        # (a target whose branches depend on the distribution, or with infer declarations, has no
+        # other rule for it: not related)
+        var inf0: [Int] = []
+        tyops.collect_infers(c, c.t.nd[n].b, &inf0)
+        if inf0.len > 0 or dist_dependent(&c, n): return 0
     var infers: [Int] = []
     tyops.collect_infers(c, c.t.nd[n].b, &infers)
     if infers.len == 0 and sk != TK_TPARAM:
@@ -454,15 +642,9 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
       if ib >= 0 and c.tk[ib] == TK_TPARAM:
         if assignable(&c, ib, t): return 1
         if not tyops.is_generic(&c, t): return 0
-      # (no constraint at all: related as {} is, to the target's members but object)
+      # (no constraint at all: related as unknown is, getConstraintOfType(source) || unknownType)
       if ib == -3 and not tyops.is_generic(&c, t):
-        var tms: [Int] = []
-        for mi163_ in 0..types.nmem(c, t):
-          let tm = types.mem(c, t, mi163_)
-          if c.tk[tm] != types.TK_NONPRIM: tms.push(tm)
-        if tms.len == 0: return 0
-        let tw = types.union_of(&c, tms)
-        if assignable(&c, c.empty_obj, tw): return 1
+        if assignable(&c, c.unknown_t, t): return 1
         return 0
     var o = c.ta[s]
     var i = c.tb[s]
@@ -476,6 +658,12 @@ fn generic_rel(var c: C, s: Int, t: Int) -> Int:
       i = ci
     if tyops.is_generic(&c, o) or tyops.is_generic(&c, i): return -1
     if c.tk[o] == types.TK_NONPRIM: return -1
+    # (a key of K's constraint the object lacks, no index signature for it: T[K] has no
+    # constraint (getIndexedAccessTypeOrUndefined without an access node), related as unknown is;
+    # react-hook-form's T[TFieldName] with Path<T>'s `documentUuids.${number}`)
+    if c.tk[o] == TK_OBJ and tyops.lacks_key(&c, o, i) and not tyops.is_generic(&c, t):
+      if assignable(&c, c.unknown_t, t): return 1
+      return 0
     let r = tyops.indexed_of(&c, o, i)
     if c.tk[r] == TK_UNSUP: return -1
     if assignable(&c, r, t): return 1
@@ -501,8 +689,7 @@ fn mapped_mapped(var c: C, s: Int, t: Int) -> Int:
   let ns = c.objs[c.ta[s]].node
   let nt = c.objs[c.ta[t]].node
   if ns < 0 or nt < 0: return -2
-  if c.t.nd[ns].k != ast.N_TMAPPED or c.t.nd[ns].b >= 0: return -2
-  if c.t.nd[nt].k != ast.N_TMAPPED or c.t.nd[nt].b >= 0: return -2
+  if c.t.nd[ns].k != ast.N_TMAPPED or c.t.nd[nt].k != ast.N_TMAPPED: return -2
   if mapped_optionality(c, ns) > mapped_optionality(c, nt): return 0
   let tpns = c.t.nd[ns].a
   let tpnt = c.t.nd[nt].a
@@ -519,6 +706,34 @@ fn mapped_mapped(var c: C, s: Int, t: Int) -> Int:
   let kps = c.sdtype[kss]
   let kpt = c.sdtype[kts]
   let ms2 = tyops.extend(&c, c.objs[c.ta[s]].mapper, kps, kpt)
+  # (as clauses: the name types, the source's key as the target's, the same type, else not
+  # related; mappedTypeRelatedTo)
+  let has_s = c.t.nd[ns].b >= 0
+  let has_t = c.t.nd[nt].b >= 0
+  if has_s != has_t: return 0
+  if has_s:
+    let rns = tyops.raw(&c, c.t.nd[ns].b)
+    let nms = bind.instantiate(&c, rns, ms2)
+    let rnt = tyops.raw(&c, c.t.nd[nt].b)
+    let mtt = c.objs[c.ta[t]].mapper
+    let nmt = bind.instantiate(&c, rnt, mtt)
+    if c.tk[nms] == TK_UNSUP or c.tk[nmt] == TK_UNSUP: return -1
+    if nms != nmt:
+      let idn = identical(&c, nms, nmt, 0)
+      if idn == 0: return 0
+      if idn < 0:
+        # (one alias's instantiations with different arguments, MergePath<A, P> and MergePath<B, P>:
+        # different types)
+        if nms in c.t_alias and nmt in c.t_alias and c.t_alias[nms] == c.t_alias[nmt] and nms in c.t_alias_args and nmt in c.t_alias_args:
+          let a1 = types.ints(c.t_alias_args[nms])
+          let a2 = types.ints(c.t_alias_args[nmt])
+          var differ = false
+          if a1.len == a2.len:
+            for i in 0..a1.len:
+              if identical(&c, a1[i], a2[i], 0) == 0: differ = true
+          if not differ: return -1
+          return 0
+        return -1
   let tms = tyops.raw(&c, c.t.nd[ns].c)
   let tmt = tyops.raw(&c, c.t.nd[nt].c)
   let xs = bind.instantiate(&c, tms, ms2)
@@ -529,8 +744,8 @@ fn mapped_mapped(var c: C, s: Int, t: Int) -> Int:
 
 # structuredTypeRelatedTo with a generic mapped target whose keys are a type parameter K (no as
 # clause): with ?, a source without properties relates (the mapped type has no known members);
-# without, K must relate to the source's keys, so a source without properties doesn't. -2 when
-# this isn't the case, -1 when the rest isn't modeled.
+# without, K must relate to the source's keys and S[P] to the template. -2 when this isn't the
+# case, -1 when the rest isn't modeled.
 fn mapped_tparam_target(var c: C, s: Int, t: Int) -> Int:
   let n = c.objs[c.ta[t]].node
   if n < 0 or c.t.nd[n].k != ast.N_TMAPPED or c.t.nd[n].b >= 0: return -2
@@ -539,6 +754,39 @@ fn mapped_tparam_target(var c: C, s: Int, t: Int) -> Int:
   let g = tyops.raw(&c, c.t.nd[tpn].a)
   let kt = bind.instantiate(&c, g, c.objs[c.ta[t]].mapper)
   if c.tk[kt] != TK_TPARAM: return -2
+  # (without ? or -?: K related to keyof S without index signatures, then S[P] to the template,
+  # P the mapped type's own parameter; K extends keyof {} is never, so a function type or {} to
+  # Pick<{}, K> relates. Either failing: not related, the generic mapped target's last word)
+  let f0 = c.t.nd[n].f
+  if (f0 & (ast.MAP_OPTIONAL | ast.MAP_PLUSOPTIONAL | ast.MAP_NOOPTIONAL)) == 0 and c.t.nd[n].c >= 0:
+    var skeys = -1
+    if bind.index_type(&c, s, false) >= 0 or bind.index_type(&c, s, true) >= 0: skeys = prop_name_keys(&c, s)
+    else: skeys = tyops.keyof_of(&c, s)
+    if skeys < 0 or c.tk[skeys] == TK_UNSUP or tyops.is_generic(&c, skeys): return -1
+    let seq0 = c.unsup_seq
+    if not assignable(&c, kt, skeys):
+      if c.unsup_seq == seq0: return 0
+      return -1
+    # (P made fresh with K as its constraint, as instantiateMappedType makes it, so S[P] reads
+    # S at K's constraint: { a: string } to Record<J, string>, J extends "a")
+    let pts = bind.tparam_sym(&c, tpn)
+    let op = c.sdtype[pts]
+    var ptp = c.mapped_fresh_p.get(t, -1)
+    if ptp < 0:
+      let ns = types.new_sym(&c, types.S_TPARAM, c.sname[pts], c.sdecl[pts])
+      ptp = types.mk(&c, TK_TPARAM, types.F_TPARAM, ns, 0)
+      c.sdtype[ns] = ptp
+      c.tp_con[ns] = kt
+      c.mapped_fresh_p[t] = ptp
+    let rtm = tyops.raw(&c, c.t.nd[n].c)
+    let tmm = tyops.extend(&c, c.objs[c.ta[t]].mapper, op, ptp)
+    let tmpl = bind.instantiate(&c, rtm, tmm)
+    let ia = tyops.indexed_of(&c, s, ptp)
+    if c.tk[tmpl] == TK_UNSUP or ia < 0 or c.tk[ia] == TK_UNSUP: return -1
+    if assignable(&c, ia, tmpl): return 1
+    if c.unsup_seq == seq0: return 0
+    return -1
+  if tyops.is_generic(&c, s): return -2
   if bind.sig_count(&c, s, false) > 0 or bind.sig_count(&c, s, true) > 0: return -1
   if bind.index_type(&c, s, false) >= 0 or bind.index_type(&c, s, true) >= 0: return -1
   let no_props = bind.prop_count(&c, s) == 0
@@ -546,24 +794,40 @@ fn mapped_tparam_target(var c: C, s: Int, t: Int) -> Int:
   if (c.t.nd[n].f & ast.MAP_OPTIONAL) != 0: return 1
   return 0
 
-# A generic mapped type { [P in K]: X } (K a type parameter constrained to string) to a concrete
+# A generic mapped type { [P in K]: X } (K a type parameter) to a concrete
 # object type: resolveMappedTypeMembers gives it no members, so a required property fails, and a
 # string index signature takes the template (indexSignaturesRelatedTo). -1 when not modeled.
 fn mapped_source_obj(var c: C, s: Int, t: Int) -> Int:
   let n = c.objs[c.ta[s]].node
+  # (with an as clause: no members; to an object type with neither properties nor signatures,
+  # its index signatures decide: a string one takes the template (indexSignaturesRelatedTo's
+  # generic mapped source), any other the source's inferable index of no members)
+  if n >= 0 and c.t.nd[n].k == ast.N_TMAPPED and c.t.nd[n].b >= 0 and c.t.nd[n].c >= 0 and c.tk[t] == TK_OBJ and not is_mapped(c, t) and c.objs[c.ta[t]].kind != types.OK_TUPLE:
+    if bind.sig_count(&c, t, false) > 0 or bind.sig_count(&c, t, true) > 0: return -1
+    # (a required property it can't have: not related; optional ones it lacks are fine)
+    for pn0 in bind.prop_names(&c, t):
+      let tp0 = bind.get_prop(&c, t, pn0)
+      if tp0 >= 0 and (c.sflags[tp0] & types.SF_OPTIONAL) == 0: return 0
+    let si0 = bind.index_type(&c, t, false)
+    if si0 < 0: return 1
+    if c.tk[si0] == TK_ANY: return 1
+    let tm0 = tyops.raw(&c, c.t.nd[n].c)
+    var x0 = bind.instantiate(&c, tm0, c.objs[c.ta[s]].mapper)
+    if c.tk[x0] == TK_UNSUP: return -1
+    if (c.t.nd[n].f & ast.MAP_OPTIONAL) != 0: x0 = types.union_of(&c, [x0, c.undef_t])
+    if assignable(&c, x0, si0): return 1
+    return 0
   if n < 0 or c.t.nd[n].k != ast.N_TMAPPED or c.t.nd[n].b >= 0 or c.t.nd[n].c < 0: return -1
   let tpn = c.t.nd[n].a
   if c.t.nd[tpn].a < 0: return -1
   let g = tyops.raw(&c, c.t.nd[tpn].a)
   let ks = bind.instantiate(&c, g, c.objs[c.ta[s]].mapper)
-  # (keys K constrained to string; or keyof T of a type parameter T, homomorphic, whose members
-  # come from T's constraint: a required property isn't decided then)
+  # (keys a type parameter K, whatever its constraint: getLowerBoundOfKeyType keeps K, which
+  # adds no member, so Pick<S, K> has none; or keyof T of a type parameter T, homomorphic, whose
+  # members come from T's constraint: a required property isn't decided then)
   var homo = false
   if c.tk[ks] == types.TK_KEYOF and c.tk[c.ta[ks]] == TK_TPARAM: homo = true
   elif c.tk[ks] != TK_TPARAM: return -1
-  else:
-    let kb = chk.base_constraint(&c, ks, 0)
-    if kb != c.string_t: return -1
   if is_prim(c, t) or is_nullish(c, t) or c.tk[t] == TK_NEVER: return 0
   if c.tk[t] == types.TK_NONPRIM: return 1
   if c.tk[t] != TK_OBJ or is_mapped(c, t) or tyops.is_generic(&c, t): return -1
@@ -633,6 +897,27 @@ fn key_lower_bound(var c: C, k: Int, depth: Int) -> Int:
 
 # A generic mapped type ({ [P in K]: X }, no as clause) by its keys' lower bound: an object type
 # with a property for each key (the members resolveMappedTypeMembers gives it); -1 if not known.
+# A generic mapped type whose keys are keyof T, T a type parameter with no constraint (or keyof
+# another such mapped type, whose keys are its own).
+fn mapped_over_free_tparam(var c: C, t: Int, depth: Int) -> Bool:
+  if depth > 4 or c.tk[t] != TK_OBJ: return false
+  let n = c.objs[c.ta[t]].node
+  if n < 0 or c.t.nd[n].k != ast.N_TMAPPED or c.t.nd[n].b >= 0: return false
+  let tpn = c.t.nd[n].a
+  if c.t.nd[tpn].a < 0: return false
+  let g = tyops.raw(&c, c.t.nd[tpn].a)
+  let ks = bind.instantiate(&c, g, c.objs[c.ta[t]].mapper)
+  if c.tk[ks] != types.TK_KEYOF: return false
+  let x = c.ta[ks]
+  if c.tk[x] == TK_TPARAM:
+    # (a constraint with properties makes the target weak: TS2559 there, not modeled)
+    let con = constraint_of(&c, x)
+    # (one with index signatures only, Record<string, unknown>: no properties, not weak either)
+    if con >= 0 and c.tk[con] == TK_OBJ and not is_mapped(c, con) and bind.prop_names(&c, con).len == 0 and bind.sig_count(&c, con, false) == 0 and bind.sig_count(&c, con, true) == 0: return true
+    return con < 0 or c.tk[con] == TK_UNKNOWN or c.tk[con] == TK_NONPRIM or (c.tk[con] == TK_OBJ and is_empty_obj(&c, con))
+  if is_mapped(c, x): return mapped_over_free_tparam(&c, x, depth + 1)
+  return false
+
 fn mapped_lower_obj(var c: C, s: Int) -> Int:
   let n = c.objs[c.ta[s]].node
   if n < 0 or c.t.nd[n].k != ast.N_TMAPPED or c.t.nd[n].b >= 0 or c.t.nd[n].c < 0: return -1
@@ -691,8 +976,8 @@ fn mentions(c: C, n: Int, name: Int) -> Bool:
   if n < 0 or n >= c.t.nd.len: return false
   let k = c.t.nd[n].k
   if k == ast.N_ID: return c.t.nd[n].s == name
-  # (the polymorphic this type, named this)
-  if k == ast.N_TTHIS: return c.t.names[name] == "this"
+  # (the polymorphic this type, named this; typeof this too)
+  if k == ast.N_TTHIS or bind.tquery_this(c, n): return c.t.names[name] == "this"
   if k == ast.N_LIST:
     for x in ast.items(c.t, n):
       if mentions(c, x, name): return true
@@ -710,7 +995,7 @@ fn mention_names(c: C, n: Int, var out: {Int: Bool}):
   if k == ast.N_ID:
     out[c.t.nd[n].s] = true
     return
-  if k == ast.N_TTHIS:
+  if k == ast.N_TTHIS or bind.tquery_this(c, n):
     out[-1] = true
     return
   # (typeof x: a value's type, which may name any type parameter: -3)
@@ -757,6 +1042,14 @@ fn keyof_target(var c: C, s: Int, t: Int) -> Int:
     let kc = tyops.keyof_of(&c, con)
     if c.tk[kc] == TK_UNSUP: return -1
     if assignable(&c, s, kc): return 1
+    if sk < types.TK_KEYOF and not tyops.is_generic(&c, s): return 0
+    if via_con == 1: return 0
+  # (a conditional type's constraint that is generic itself, L for Exclude<L, Error>: S to keyof
+  # of it, which decides by its own rule)
+  if con >= 0 and con != x and c.tk[x] == types.TK_COND and c.tk[con] != TK_UNSUP and (c.tk[con] == TK_TPARAM or c.tk[con] == types.TK_COND or c.tk[con] == types.TK_INTER):
+    let kc2 = tyops.keyof_of(&c, con)
+    if c.tk[kc2] == TK_UNSUP: return -1
+    if assignable(&c, s, kc2): return 1
     if sk < types.TK_KEYOF and not tyops.is_generic(&c, s): return 0
     if via_con == 1: return 0
   return -1
@@ -824,15 +1117,324 @@ fn cond_bound(var c: C, t: Int, depth: Int) -> Int:
   if c.tk[fb] == TK_ANY: return tb
   return types.union_of(&c, [tb, fb])
 
+# A deferred conditional type s to the type parameter t: 0 not related (a branch is a concrete
+# type, which no type parameter takes), 1 related (each branch is t, never or such a conditional),
+# -1 not decided here (a distributive constraint, a generic branch).
+# A generic type's constraint down to one without type variables (getBaseConstraintOfType): a type
+# parameter's, unknown without one; T[K]'s; a conditional's, else its branches; a union's members';
+# -1 when not known.
+fn deep_base(var c: C, t: Int, depth: Int) -> Int:
+  if t < 0: return -1
+  if not tyops.is_generic(&c, t): return t
+  if depth > 8: return -1
+  let k = c.tk[t]
+  if k == TK_TPARAM:
+    let b = chk.base_constraint(&c, t, 0)
+    if b < 0 or b == t: return c.unknown_t
+    return deep_base(&c, b, depth + 1)
+  if k == TK_UNION:
+    var ms: [Int] = []
+    for mi_db in 0..types.nmem(c, t):
+      let x = deep_base(&c, types.mem(c, t, mi_db), depth + 1)
+      if x < 0: return -1
+      ms.push(x)
+    return types.union_of(&c, ms)
+  if k == TK_INTER:
+    # (its members' together; any with any member any)
+    var xs: [Int] = []
+    for ii_db in 0..types.ninter(c, t):
+      let x = deep_base(&c, types.inter_at(c, t, ii_db), depth + 1)
+      if x < 0: return -1
+      if c.tk[x] == TK_ANY: return x
+      xs.push(x)
+    return types.inter_of(&c, xs)
+  if k == types.TK_COND:
+    # (distributive over a type parameter with a concrete constraint: the conditional with that
+    # constraint for it, getConstraintOfDistributiveConditionalType)
+    let cn = c.ta[t]
+    if cn >= 0 and c.t.nd[cn].k == ast.N_TCOND:
+      let ct0 = tyops.raw(&c, c.t.nd[cn].a)
+      if c.tk[ct0] == TK_TPARAM:
+        let ct = bind.instantiate(&c, ct0, c.tb[t])
+        if c.tk[ct] == TK_TPARAM and ct != ct0:
+          let con = chk.base_constraint(&c, ct, 0)
+          if con >= 0 and con != ct and c.tk[con] != TK_UNSUP and not tyops.is_generic(&c, con):
+            let m2 = tyops.extend(&c, c.tb[t], ct0, con)
+            let r2 = tyops.cond_of(&c, cn, m2)
+            if r2 >= 0 and r2 != t and c.tk[r2] != TK_UNSUP: return deep_base(&c, r2, depth + 1)
+  if k == types.TK_INDEXED or k == types.TK_COND:
+    var b = tyops.base_of(&c, t, 0)
+    if b == -1 and k == types.TK_INDEXED: return c.unknown_t
+    if (b < 0 or b == t) and k == types.TK_COND: b = cond_default(&c, t)
+    if b < 0 or b == t or c.tk[b] == TK_UNSUP: return -1
+    return deep_base(&c, b, depth + 1)
+  return -1
+
+# A distributive conditional type over a type parameter with a constraint: the conditional with that
+# constraint for it (getConstraintOfDistributiveConditionalType); -1 when there's none, -2 when not
+# known.
+fn cond_distributive(var c: C, t: Int) -> Int:
+  let cn = c.ta[t]
+  if cn < 0 or c.t.nd[cn].k != ast.N_TCOND: return -2
+  let ct0 = tyops.raw(&c, c.t.nd[cn].a)
+  if c.tk[ct0] != TK_TPARAM: return -1
+  let ct = bind.instantiate(&c, ct0, c.tb[t])
+  if c.tk[ct] != TK_TPARAM: return -1
+  let con = constraint_of(&c, ct)
+  if con < 0 or con == ct: return -1
+  if c.tk[con] == TK_UNSUP: return -2
+  let m2 = tyops.extend(&c, c.tb[t], ct0, con)
+  let r = tyops.cond_of(&c, cn, m2)
+  if r < 0 or c.tk[r] == TK_UNSUP: return -2
+  return r
+
+# Whether a generic type's base constraint, computed through its members (a union with an any
+# member is any, whatever the others are; a conditional by its branches; T[K] by its base), is any:
+# getBaseConstraintOfType's union absorbing any.
+fn base_is_any(var c: C, t: Int, depth: Int) -> Bool:
+  if t < 0 or depth > 12: return false
+  let k = c.tk[t]
+  if k == TK_ANY: return true
+  if not tyops.is_generic(&c, t): return false
+  if k == TK_UNION:
+    for mi_ba in 0..types.nmem(c, t):
+      if base_is_any(&c, types.mem(c, t, mi_ba), depth + 1): return true
+    return false
+  if k == TK_INTER:
+    for ii_ba in 0..types.ninter(c, t):
+      if base_is_any(&c, types.inter_at(c, t, ii_ba), depth + 1): return true
+    return false
+  if k == TK_TPARAM:
+    let b = chk.base_constraint(&c, t, 0)
+    if b < 0 or b == t: return false
+    return base_is_any(&c, b, depth + 1)
+  if k == types.TK_INDEXED:
+    # (the object's base with a string index signature of any: any for every key, without asking
+    # for the key's base, unknown for an infer type parameter)
+    var ob = c.ta[t]
+    if tyops.is_generic(&c, ob): ob = tyops.base_of(&c, ob, 0)
+    if ob >= 0 and c.tk[ob] == TK_OBJ:
+      let osi = bind.index_type(&c, ob, false)
+      if osi >= 0 and c.tk[osi] == TK_ANY: return true
+    let ib = tyops.base_of(&c, c.tb[t], 0)
+    if ib < 0 or c.tk[ib] == TK_UNKNOWN or c.tk[ib] == TK_UNSUP: return false
+    let b = tyops.base_of(&c, t, 0)
+    if b < 0 or b == t: return false
+    return base_is_any(&c, b, depth + 1)
+  if k == types.TK_COND:
+    # (by its branches: their own bases are looked at member by member)
+    let d = cond_default(&c, t)
+    if d < 0 or d == t: return false
+    return base_is_any(&c, d, depth + 1)
+  return false
+
+# A deferred conditional type's default constraint: its true and false branches united
+# (getDefaultConstraintOfConditionalType); -1 when not known.
+fn cond_default(var c: C, s: Int) -> Int:
+  let cn = c.ta[s]
+  if cn < 0 or c.t.nd[cn].k != ast.N_TCOND: return -1
+  let m = c.tb[s]
+  var bs: [Int] = []
+  for bn in [c.t.nd[cn].c, c.t.nd[cn].d]:
+    let b0 = tyops.raw(&c, bn)
+    let b = bind.instantiate(&c, b0, m)
+    if c.tk[b] == TK_UNSUP or c.tk[b] == TK_ERROR: return -1
+    bs.push(b)
+  let u = types.union_of(&c, bs)
+  if c.tk[u] == TK_UNSUP or u == s: return -1
+  return u
+
+fn cond_to_tparam(var c: C, s: Int, t: Int, depth: Int) -> Int:
+  if depth > 20: return -1
+  let cn = c.ta[s]
+  if cn < 0 or c.t.nd[cn].k != ast.N_TCOND: return -1
+  let m = c.tb[s]
+  # (a check type that's a type parameter with a constraint: a distributive constraint, not modeled)
+  let ct0 = tyops.raw(&c, c.t.nd[cn].a)
+  let ct = bind.instantiate(&c, ct0, m)
+  if c.tk[ct] == TK_TPARAM:
+    let k0 = constraint_of(&c, ct)
+    if k0 >= 0 and c.tk[k0] != TK_UNKNOWN: return -1
+  elif c.tk[ct] != TK_TPARAM: return -1
+  var all = true
+  for bn in [c.t.nd[cn].c, c.t.nd[cn].d]:
+    let b0 = tyops.raw(&c, bn)
+    let b = bind.instantiate(&c, b0, m)
+    let bk = c.tk[b]
+    if b == t or bk == TK_NEVER: continue
+    if bk == TK_ANY or bk == TK_ERROR or bk == TK_UNSUP: return -1
+    if bk == types.TK_COND:
+      let r = cond_to_tparam(&c, b, t, depth + 1)
+      if r == 0: return 0
+      if r == -1: all = false
+      continue
+    if bk == TK_UNION:
+      for x in types.members(c, b):
+        if x == t or c.tk[x] == TK_NEVER: continue
+        if c.tk[x] == TK_ANY or c.tk[x] == TK_UNSUP: return -1
+        if c.tk[x] == types.TK_COND or tyops.is_generic(&c, x):
+          all = false
+          continue
+        return 0
+      continue
+    if tyops.is_generic(&c, b):
+      all = false
+      continue
+    return 0
+  if all: return 1
+  return -1
+
+# A node's file and offset, for debug output.
+fn node_where(c: C, n: Int) -> Str:
+  if n < 0 or n >= c.t.nd.len: return "?"
+  let f = c.t.nd[n].file
+  if f < 0 or f >= c.files.len: return "?:{c.t.nd[n].pos}"
+  return c.files[f] + ":{c.t.nd[n].pos}"
+
 fn dbg_types(var c: C, s: Int, t: Int) -> Str:
   if not c.debug and not c.all_reasons: return ""
   var a = show.show(&c, s)
   var b = show.show(&c, t)
-  if c.tk[s] == types.TK_COND: a += "[n{c.ta[s]} " + tyops.cond_key(&c, c.ta[s], c.tb[s]) + "]"
-  if c.tk[t] == types.TK_COND: b += "[n{c.ta[t]} " + tyops.cond_key(&c, c.ta[t], c.tb[t]) + "]"
+  if c.tk[s] == types.TK_COND: a += "[n{c.ta[s]} " + tyops.cond_key(&c, c.ta[s], c.tb[s]) + " " + node_where(c, c.ta[s]) + "]"
+  if c.tk[t] == types.TK_COND: b += "[n{c.ta[t]} " + tyops.cond_key(&c, c.ta[t], c.tb[t]) + " " + node_where(c, c.ta[t]) + " m" + mapper_desc(&c, c.tb[t]) + "]"
+  if c.tk[t] == types.TK_KEYOF and c.tk[c.ta[t]] == types.TK_COND:
+    let q = c.ta[t]
+    b += "[keyof n{c.ta[q]} " + node_where(c, c.ta[q]) + " m " + mapper_desc(&c, c.tb[q]) + "]"
   var at = ""
   if c.cur_expr >= 0: at = " at {c.t.nd[c.cur_expr].pos}"
   return a + " TO " + b + at
+
+# (VTSC_TRACE_REL with VTSC_ALL_REASONS, where a relation isn't modeled) the relations being
+# decided, outermost first; for a pair that prints the same but are two types, where they first
+# differ (TDIFF): a type made twice, which tsc's caches would have made once
+fn trace_stack(var c: C):
+  var i = 0
+  var diffed = false
+  while i + 1 < c.trace_stk.len:
+    let a = c.trace_stk[i]
+    let b = c.trace_stk[i + 1]
+    let sa = show.show(&c, a)
+    let sb = show.show(&c, b)
+    eprint("VSTACK  " + sa + "  ->  " + sb + "  [{a} {b}]")
+    if not diffed and a != b and sa == sb:
+      tdiff(&c, a, b, 0)
+      diffed = true
+    i += 2
+
+fn tdesc(var c: C, t: Int) -> Str:
+  var d = "{t} tk{c.tk[t]} a{c.ta[t]} b{c.tb[t]}"
+  if c.tk[t] == TK_OBJ:
+    let o = c.ta[t]
+    d = d + " ok{c.objs[o].kind} node{c.objs[o].node} mapper{c.objs[o].mapper} target{c.objs[o].target} sym{c.objs[o].sym}"
+    if c.objs[o].node >= 0: d = d + " @" + c.files[c.t.nd[c.objs[o].node].file] + ":{c.t.nd[c.objs[o].node].pos}"
+  if t in c.t_alias: d = d + " alias " + c.t.names[c.sname[c.t_alias[t]]]
+  if t in c.t_alias_args:
+    d = d + " args"
+    for x in types.ints(c.t_alias_args[t]): d = d + " {x}"
+  return d
+
+fn mapper_desc(var c: C, m: Int) -> Str:
+  var d = ""
+  if m < 0: return " none"
+  for i in 0..c.mappers[m].from.len:
+    let x = c.mappers[m].from[i]
+    d = d + " {x}"
+    if x >= 0 and c.tk[x] == TK_TPARAM and c.ta[x] >= 0:
+      d = d + "=" + c.t.names[c.sname[c.ta[x]]]
+      let dd = c.sdecl[c.ta[x]]
+      if dd >= 0: d = d + "@" + c.files[c.t.nd[dd].file] + ":{c.t.nd[dd].pos}"
+    d = d + "->{c.mappers[m].to[i]}"
+    let tt9 = c.mappers[m].to[i]
+    if tt9 >= 0: d = d + "<" + show.show(&c, tt9) + " tk{c.tk[tt9]}>"
+    if tt9 >= 0 and c.tk[tt9] == TK_TPARAM and c.ta[tt9] >= 0:
+      let dd9 = c.sdecl[c.ta[tt9]]
+      d = d + "(tparam " + c.t.names[c.sname[c.ta[tt9]]]
+      if dd9 >= 0: d = d + "@" + c.files[c.t.nd[dd9].file] + ":{c.t.nd[dd9].pos}"
+      d = d + ")"
+  return d
+
+# (the first part two types differ in, recursively: members, alias arguments, type arguments,
+# mappers)
+fn tdiff(var c: C, a: Int, b: Int, depth: Int):
+  if a == b or depth > 12: return
+  eprint("TDIFF{depth} " + tdesc(&c, a) + "  VS  " + tdesc(&c, b))
+  if c.tk[a] != c.tk[b]: return
+  let k = c.tk[a]
+  if a in c.t_alias_args and b in c.t_alias_args:
+    let ya = types.ints(c.t_alias_args[a])
+    let yb = types.ints(c.t_alias_args[b])
+    for i in 0..ya.len:
+      if i < yb.len and ya[i] != yb[i]:
+        tdiff(&c, ya[i], yb[i], depth + 1)
+        return
+  if k == TK_UNION or k == TK_INTER:
+    let pa = types.parts(c, a)
+    let pb = types.parts(c, b)
+    if pa.len != pb.len: return
+    for i in 0..pa.len:
+      if pa[i] != pb[i]:
+        tdiff(&c, pa[i], pb[i], depth + 1)
+        return
+    return
+  if k == TK_OBJ:
+    let oa = c.ta[a]
+    let ob = c.ta[b]
+    let xa = types.ints(c.objs[oa].args)
+    let xb = types.ints(c.objs[ob].args)
+    for i in 0..xa.len:
+      if i < xb.len and xa[i] != xb[i]:
+        tdiff(&c, xa[i], xb[i], depth + 1)
+        return
+    let ma = c.objs[oa].mapper
+    let mb = c.objs[ob].mapper
+    if ma >= 0 and mb >= 0 and ma != mb:
+      eprint("  MAPPER " + mapper_desc(&c, ma))
+      eprint("  MAPPER " + mapper_desc(&c, mb))
+      let fa = types.ints(c.mappers[ma].to)
+      let fb = types.ints(c.mappers[mb].to)
+      if fa.len == fb.len:
+        for i in 0..fa.len:
+          if fa[i] != fb[i]:
+            tdiff(&c, fa[i], fb[i], depth + 1)
+            return
+  if k == types.TK_COND and c.ta[a] == c.ta[b] and c.tb[a] >= 0 and c.tb[b] >= 0:
+    eprint("  CMAPPER " + mapper_desc(&c, c.tb[a]))
+    eprint("  CMAPPER " + mapper_desc(&c, c.tb[b]))
+    let fa2 = types.ints(c.mappers[c.tb[a]].to)
+    let fb2 = types.ints(c.mappers[c.tb[b]].to)
+    if fa2.len == fb2.len:
+      for i in 0..fa2.len:
+        if fa2[i] != fb2[i]:
+          tdiff(&c, fa2[i], fb2[i], depth + 1)
+          return
+    return
+  if k >= types.TK_KEYOF:
+    if c.ta[a] != c.ta[b]: tdiff(&c, c.ta[a], c.ta[b], depth + 1)
+    elif c.tb[a] != c.tb[b]: tdiff(&c, c.tb[a], c.tb[b], depth + 1)
+
+# keyof an object type without its index signatures (getIndexType with NoIndexSignatures): its
+# properties' names as literals; -1 where a name isn't a plain string or number (a symbol, a
+# late-bound name), or the object has template literal index signatures.
+fn prop_name_keys(var c: C, a: Int) -> Int:
+  if c.tk[a] != TK_OBJ or c.ta[a] in c.tidx: return -1
+  var keys: [Int] = []
+  for name in bind.prop_names(&c, a):
+    let text = c.t.names[name] + ""
+    if text.startswith("[") or text.startswith("#"): return -1
+    let ps = bind.get_prop(&c, a, name)
+    if ps < 0: return -1
+    if (c.sflags[ps] & (types.SF_PRIVATE | types.SF_PROTECTED)) != 0: continue
+    var numeric = false
+    let d = c.sdecl[ps]
+    if d >= 0:
+      let dk = c.t.nd[d].k
+      if dk == ast.N_PROPASSIGN or dk == ast.N_PROP or dk == ast.N_METHOD:
+        let pn = c.t.nd[d].a
+        if pn >= 0 and c.t.nd[pn].k == ast.N_NUM: numeric = true
+        if bind.computed_key_type(&c, pn) >= 0: return -1
+    if numeric: keys.push(types.num_lit(&c, bind.num_value(text), false))
+    else: keys.push(types.str_lit(&c, name, false))
+  return types.union_of(&c, keys)
 
 fn is_mapped(c: C, t: Int) -> Bool:
   return c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == types.OK_MAPPED
@@ -845,41 +1447,256 @@ fn is_prim(c: C, t: Int) -> Bool:
   let k = c.tk[t]
   return k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE
 
+# Whether xs has t or a type identical to it (isTypeIdenticalTo).
+fn ident_member(var c: C, xs: [Int], t: Int) -> Bool:
+  if types.has_int(xs, t): return true
+  # (a type without type variables: by its id alone; the structural comparison is for generic
+  # ones made apart, M<O, P> twice)
+  if not chk.could_contain_tvars(&c, t): return false
+  for x in xs:
+    if c.tk[x] != c.tk[t]: continue
+    # (objects: only one declaration made twice, the same node through two mappers; comparing a
+    # fresh JSX props object with each member of a large union is most of a JSX file's time)
+    if c.tk[x] == TK_OBJ:
+      let xd = obj_decl_node(c, x)
+      if xd == -1 or xd != obj_decl_node(c, t): continue
+      # (two instantiations of one declaration, a mapped type's or a literal's through mappers: the
+      # same type when what their mappers give is, not compared property by property (Partial<X>
+      # and Omit<Y, K> share lib's mapped type; their 500 properties were most of a JSX file's time)
+      let mx = c.objs[c.ta[x]].mapper
+      let mt = c.objs[c.ta[t]].mapper
+      let kx = c.objs[c.ta[x]].kind
+      if (kx == types.OK_INST or kx == types.OK_MAPPED) and mx >= 0 and mt >= 0:
+        var nx = mx
+        var nt = mt
+        let tg = c.objs[c.ta[x]].target
+        if kx == types.OK_INST and tg >= 0 and tg == c.objs[c.ta[t]].target and c.tk[tg] == TK_OBJ:
+          nx = bind.narrow_mapper(&c, tg, mx)
+          nt = bind.narrow_mapper(&c, tg, mt)
+        if same_mapping(&c, nx, nt): return true
+        continue
+    if identical(&c, x, t, 0) == 1: return true
+  return false
+
+# whether two mappers map the same type parameters to identical types
+# (an entry one has and the other hasn't: the type parameter itself there)
+fn same_mapping(var c: C, a: Int, b: Int) -> Bool:
+  if a == b: return true
+  for pass in 0..2:
+    var m1 = a
+    var m2 = b
+    if pass == 1:
+      m1 = b
+      m2 = a
+    for i in 0..c.mappers[m1].from.len:
+      let tp = c.mappers[m1].from[i]
+      let v1 = c.mappers[m1].to[i]
+      let v2 = bind.map_tparam(c, tp, m2)
+      if v1 == v2: continue
+      if pass == 1 and bind.map_tparam(c, tp, m2) != tp: continue
+      if identical(&c, v1, v2, 0) != 1: return false
+  return true
+
+# an object type's declaration: its node, or for an instantiation its target's (-1 none)
+fn obj_decl_node(c: C, t: Int) -> Int:
+  let o = c.ta[t]
+  if c.objs[o].kind == types.OK_REF: return -2 - c.objs[o].target
+  if c.objs[o].kind == types.OK_INST and c.objs[o].target >= 0 and c.tk[c.objs[o].target] == TK_OBJ: return c.objs[c.ta[c.objs[o].target]].node
+  return c.objs[o].node
+
 fn rel(var c: C, s0: Int, t0: Int) -> Bool:
+  # (types that expand as they're related, as recursive generic ones can: tsc stops at a depth and
+  # takes the relation to hold (Ternary.Maybe); here the file isn't checked, so nothing wrong is said)
+  # (the objects' isDeeplyNestedType below counts its own depth; this one is any kind's)
+  if c.rel_nest >= 200:
+    let u = bind.unsupported(&c, 0, "relating types nested too deep")
+    bind.touch(&c, u)
+    return true
+  c.rel_nest += 1
+  let r = rel0(&c, s0, t0)
+  c.rel_nest -= 1
+  return r
+
+# Two types that are one alias's instantiation with the same type arguments (an alias declared
+# outside functions and classes, whose instantiation its type arguments decide).
+fn same_alias(var c: C, s: Int, t: Int) -> Bool:
+  let a = c.t_alias.get(s, -1)
+  if a < 0 or c.t_alias.get(t, -1) != a: return false
+  if not (s in c.t_alias_args) or not (t in c.t_alias_args): return false
+  let na = c.t_alias_args[s].len
+  if na == 0 or na != c.t_alias_args[t].len: return false
+  for i in 0..na:
+    if c.t_alias_args[s][i] != c.t_alias_args[t][i]: return false
+  if a in c.alias_top: return c.alias_top[a]
+  var top = true
+  let d = c.sdecl[a]
+  if d < 0 or c.t.nd[d].k != ast.N_TYPEALIAS: top = false
+  var p = -1
+  if top: p = c.parent[d]
+  while top and p >= 0:
+    let k = c.t.nd[p].k
+    if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET or k == ast.N_CLASS or k == ast.N_CLASSEXPR or k == ast.N_BLOCK: top = false
+    p = c.parent[p]
+  c.alias_top[a] = top
+  return top
+
+fn rel0(var c: C, s0: Int, t0: Int) -> Bool:
+  if c.inst_exit > 0:
+    c.last_rel = s0
+    bind.budget_tick(&c)
   # a member of an intersection target: the weak type check is made on the whole intersection
   let nw = c.no_weak
   c.no_weak = false
-  let s = types.regular(c, s0)
-  let t = types.regular(c, t0)
+  var s = types.regular(c, s0)
+  var t = types.regular(c, t0)
+  # (NoInfer<T>: T, getNormalizedType)
+  if c.tk[s] == types.TK_NOINFER: s = c.ta[s]
+  if c.tk[t] == types.TK_NOINFER: t = c.ta[t]
   if s == t: return true
   let sk = c.tk[s]
   let tk = c.tk[t]
+  # (two instantiations of one alias with the same type arguments: one type, as tsc's alias
+  # instantiation cache makes it)
+  if sk == tk and same_alias(&c, s, t): return true
   # getPermissiveInstantiation: type parameters (and what's deferred on them) are the wildcard
   if c.permissive:
     if sk == TK_TPARAM or sk >= types.TK_KEYOF or is_mapped(c, s): return tk != TK_NEVER
     if tk == TK_TPARAM or tk >= types.TK_KEYOF or is_mapped(c, t): return true
+  # (any isn't a strict subtype of unknown, isSimpleTypeRelatedTo: Record<string, any> narrowed by
+  # a predicate to Record<string, unknown> is the predicate's type)
+  if tk == TK_UNKNOWN and c.strict_sub and (sk == TK_ANY or sk == TK_ERROR): return rfail(&c, "rel0: any to unknown under the strict subtype relation", false)
   if tk == TK_ANY or tk == TK_UNKNOWN or tk == TK_ERROR: return true
   # getRestrictiveInstantiation: type parameters without their constraints
   if c.restrictive:
-    if sk == TK_TPARAM: return false
+    if sk == TK_TPARAM: return rfail(&c, "rel0: sk == TK_TPARAM", false)
     if sk >= types.TK_KEYOF or tk >= types.TK_KEYOF or is_mapped(c, s) or is_mapped(c, t):
       c.restrict_fail = true
-      return false
-  if sk == TK_ANY and c.subtype: return false
+      return rfail(&c, "rel0: c.restrict_fail = true", false)
+  if (sk == TK_ANY or sk == TK_ERROR) and (c.subtype or c.strict_sub): return rfail(&c, "rel0: an any or error source under a subtype relation", false)
   if sk == TK_ANY or sk == TK_ERROR: return tk != TK_NEVER
   if sk == TK_NEVER: return true
+  # (unknown to a union of {}, null and undefined: related, unknown being that union, as
+  # structuredTypeRelatedTo relates it to each of the three in the target)
+  if sk == TK_UNKNOWN and tk == TK_UNION:
+    var has_n = false
+    var has_u = false
+    var has_e = false
+    for mi_un in 0..types.nmem(c, t):
+      let um = types.mem(c, t, mi_un)
+      let uk = c.tk[um]
+      if uk == TK_NULL: has_n = true
+      elif uk == TK_UNDEF: has_u = true
+      elif uk == TK_OBJ and is_empty_obj(&c, um): has_e = true
+    if has_n and has_u and has_e: return true
+  # (only a source with type variables: a concrete one is related as usual, and comparing each of
+  # its members with each of a large union's, structurally, is most of the time a JSX file takes)
+  if sk == TK_INTER and tk == TK_UNION and chk.could_contain_tvars(&c, s):
+    # (an intersection source with a member that is one of the target's, or with all the members
+    # of one that is an intersection: related, whatever the others; before relating the others,
+    # which may not be modeled)
+    let sms = types.members_inter(c, s)
+    for mi170b in 0..types.nmem(c, t):
+      let u = types.mem(c, t, mi170b)
+      if ident_member(&c, sms, u): return true
+      if c.tk[u] == TK_INTER:
+        var all_in = true
+        for um in types.members_inter(c, u):
+          if all_in and not ident_member(&c, sms, um): all_in = false
+        if all_in: return true
   # a tuple with a variadic element: a target no non-array type relates to; else not modeled
+  # (a tuple with a variadic element to an array type: its elements to the array's element type,
+  # ...V as V[number], the tuple's base type Array<A[number] | H>; readonly only to readonly)
+  if bind.variadic_tuple(c, s) and not bind.variadic_tuple(c, t) and tk == TK_OBJ and is_array_ref(&c, t):
+    let so = c.ta[s]
+    if c.objs[so].ro and not is_readonly_array(&c, t): return rfail(&c, "rel0: a readonly variadic tuple to a mutable array", false)
+    let tel = c.objs[c.ta[t]].args[0]
+    let rta = bind.readonly_array_of(&c, tel)
+    for i in 0..c.objs[so].args.len:
+      let ea = c.objs[so].args[i]
+      let ef = c.objs[so].eflags[i]
+      if ef == 3:
+        if not assignable(&c, ea, rta): return rfail(&c, "rel0: a variadic element to the array type", false)
+        continue
+      var et = ea
+      if ef == 1 and not c.exact_opt: et = types.union_of(&c, [ea, c.undef_t])
+      if not assignable(&c, et, tel): return rfail(&c, "rel0: a variadic tuple's element to the array's element type", false)
+    return true
+  # (two variadic tuples of one shape, [...A, x] to [...B, y]: element by element, a variadic element
+  # by its type, tupleTypeRelatedTo's element-wise case; readonly only to readonly)
+  if bind.variadic_tuple(c, s) and bind.variadic_tuple(c, t):
+    let so2 = c.ta[s]
+    let to2 = c.ta[t]
+    if c.objs[so2].args.len == c.objs[to2].args.len:
+      var same_shape = true
+      for i in 0..c.objs[so2].args.len:
+        if c.objs[so2].eflags[i] != c.objs[to2].eflags[i]: same_shape = false
+      if same_shape:
+        if c.objs[so2].ro and not c.objs[to2].ro: return rfail(&c, "rel0: a readonly variadic tuple to a mutable one", false)
+        for i in 0..c.objs[so2].args.len:
+          var ea = c.objs[so2].args[i]
+          var ta2 = c.objs[to2].args[i]
+          if c.objs[so2].eflags[i] == 1 and not c.exact_opt:
+            ea = types.union_of(&c, [ea, c.undef_t])
+            ta2 = types.union_of(&c, [ta2, c.undef_t])
+          if not assignable(&c, ea, ta2): return rfail(&c, "rel0: a variadic tuple's element", false)
+        return true
   if bind.variadic_tuple(c, s) or bind.variadic_tuple(c, t):
+    # (a variadic tuple to object: related; to a primitive: never)
+    if bind.variadic_tuple(c, s) and tk == TK_NONPRIM: return true
+    if bind.variadic_tuple(c, s) and (tk == TK_UNDEF or tk == TK_NULL or tk == TK_VOID or tk == TK_STRING or tk == TK_NUMBER or tk == TK_BIGINT or tk == TK_SYMBOL or tk == TK_STRLIT or tk == TK_NUMLIT or tk == TK_BIGLIT or tk == TK_TRUE or tk == TK_FALSE or tk == TK_NEVER or tk == types.TK_TEMPLATE): return rfail(&c, "rel0: a variadic tuple to a primitive", false)
     if bind.variadic_tuple(c, t) and not bind.variadic_tuple(c, s) and sk != TK_UNION and sk != TK_INTER and sk != TK_TPARAM and sk < types.TK_KEYOF:
-      if sk != TK_OBJ: return false
-      if not is_array_ref(&c, s) and c.objs[c.ta[s]].kind != types.OK_TUPLE: return false
+      if sk != TK_OBJ: return rfail(&c, "rel0: sk != TK_OBJ", false)
+      if not is_array_ref(&c, s) and c.objs[c.ta[s]].kind != types.OK_TUPLE: return rfail(&c, "rel0: not is_array_ref(&c, s) and c.objs[c.ta[s]].kind != types.OK_TUPLE", false)
     let vu = bind.lazy_unsupported(&c, 0, "relating a tuple with a variadic element")
     bind.touch(&c, vu)
     return true
   # a template literal type with type parameters: a string, else not modeled
   if bind.generic_template(c, s) or bind.generic_template(c, t):
     if bind.generic_template(c, s) and (tk == TK_STRING or (tk == TK_OBJ and prim_to_obj(&c, c.string_t, t))): return true
-    let gu = bind.lazy_unsupported(&c, 0, "relating a template literal type with type parameters")
+    # (a template literal type is a string: to a primitive that isn't one, never related)
+    if bind.generic_template(c, s) and (tk == TK_UNDEF or tk == TK_NULL or tk == TK_VOID or tk == TK_NUMBER or tk == TK_NUMLIT or tk == TK_BIGINT or tk == TK_BIGLIT or tk == TK_TRUE or tk == TK_FALSE or tk == TK_SYMBOL or tk == TK_NEVER): return rfail(&c, "rel0: a template literal type to a primitive that isn't a string", false)
+    # (a union target: some member, as typeRelatedToSomeType; members that aren't strings all: none)
+    if bind.generic_template(c, s) and not bind.generic_template(c, t) and tk == TK_UNION:
+      var all_ns = true
+      for um in types.members(c, t):
+        let uk = c.tk[um]
+        if not (uk == TK_UNDEF or uk == TK_NULL or uk == TK_VOID or uk == TK_NUMBER or uk == TK_NUMLIT or uk == TK_BIGINT or uk == TK_BIGLIT or uk == TK_TRUE or uk == TK_FALSE or uk == TK_SYMBOL):
+          all_ns = false
+          if assignable(&c, s, um): return true
+      if all_ns: return rfail(&c, "rel0: a template literal type to a union of primitives that aren't strings", false)
+    # (two templates of the same texts: each placeholder the target's, assignable or string or
+    # any there, isTypeMatchedByTemplateLiteralType)
+    if sk == types.TK_TEMPLATE and tk == types.TK_TEMPLATE and types.tmpl_mapping(c, s) == "" and types.tmpl_mapping(c, t) == "":
+      let tx1 = types.tmpl_texts(c, s)
+      let tx2 = types.tmpl_texts(c, t)
+      let h1 = types.tmpl_holes(c, s)
+      let h2 = types.tmpl_holes(c, t)
+      var same_tx = tx1.len == tx2.len and h1.len == h2.len
+      if same_tx:
+        for i in 0..tx1.len:
+          if tx1[i] != tx2[i]: same_tx = false
+      if same_tx:
+        var all_ok = true
+        for i in 0..h1.len:
+          let ht = c.tk[h2[i]]
+          if h1[i] == h2[i] or ht == TK_STRING or ht == TK_ANY: continue
+          if not assignable(&c, h1[i], h2[i]): all_ok = false
+        if all_ok: return true
+        # (no two placeholders side by side: each source one is the target's there, so one that
+        # doesn't fit decides)
+        var adj = false
+        for i in 1..tx1.len - 1:
+          if tx1[i] == "": adj = true
+        if not adj: return rfail(&c, "rel0: a template placeholder that doesn't fit the target's", false)
+    # (the source's leading text must start with the target's, its trailing one end with the
+    # target's: inferTypesFromTemplateLiteralType)
+    if sk == types.TK_TEMPLATE and tk == types.TK_TEMPLATE and types.tmpl_mapping(c, s) == "" and types.tmpl_mapping(c, t) == "":
+      let ty1 = types.tmpl_texts(c, s)
+      let ty2 = types.tmpl_texts(c, t)
+      if ty1.len > 0 and ty2.len > 0:
+        if not ty1[0].startswith(ty2[0]) or not ty1[ty1.len - 1].endswith(ty2[ty2.len - 1]): return rfail(&c, "rel0: template texts that can't match", false)
+    let gdb = dbg_types(&c, s, t)
+    let gu = bind.lazy_unsupported(&c, 0, "relating a template literal type with type parameters" + gdb)
     bind.touch(&c, gu)
     return true
   # (comparable: isSimpleTypeRelatedTo both ways, so object compares with any object type, and
@@ -888,9 +1705,12 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
   if c.comparable and sk == TK_UNKNOWN and tk != TK_NEVER: return true
   # Extract<keyof T, string> (a for-in key): its distributive constraint string, then keyof T
   if sk == types.TK_COND and chk.is_lib_alias(&c, s, "Extract") and c.t_alias_args[s].len == 2 and c.t_alias_args[s][1] == c.string_t:
+    # (keyof T itself the target: its default constraint, keyof T & string, has it)
+    let a00 = c.t_alias_args[s][0]
+    if a00 == t or (c.tk[a00] == types.TK_KEYOF and tk == types.TK_KEYOF and c.ta[a00] == c.ta[t]): return true
     if rel(&c, c.string_t, t): return true
     # (keyof T's constraint is string | number | symbol: only a generic target can take it)
-    if tk != TK_TPARAM and tk < types.TK_KEYOF and not is_mapped(c, t) and tk != TK_UNION and tk != TK_INTER: return false
+    if tk != TK_TPARAM and tk < types.TK_KEYOF and not is_mapped(c, t) and tk != TK_UNION and tk != TK_INTER: return rfail(&c, "rel0: tk != TK_TPARAM and tk < types.TK_KEYOF and not is_mapped(c, t) and tk != TK_UNION and tk ", false)
     let a0 = c.t_alias_args[s][0]
     return rel(&c, a0, t)
   # (a generic mapped source to an index signature of unknown or any and nothing else: its
@@ -898,6 +1718,16 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
   if is_mapped(c, s) and tk == TK_OBJ and not is_mapped(c, t) and tyops.is_generic(&c, s) and bind.prop_count(&c, t) == 0:
     let ti = bind.index_type(&c, t, false)
     if ti >= 0 and (c.tk[ti] == TK_UNKNOWN or c.tk[ti] == TK_ANY) and bind.sig_count(&c, t, false) == 0 and bind.sig_count(&c, t, true) == 0: return true
+    # (else its template, the type parameter still generic, to the index signature's type: a
+    # generic mapped type relates to a type of index signatures only)
+    let mn0 = c.objs[c.ta[s]].node
+    if ti >= 0 and mn0 >= 0 and c.t.nd[mn0].k == ast.N_TMAPPED and c.t.nd[mn0].b < 0 and bind.sig_count(&c, t, false) == 0 and bind.sig_count(&c, t, true) == 0:
+      let tmpl0 = tyops.raw(&c, c.t.nd[mn0].c)
+      var tmi = bind.instantiate(&c, tmpl0, c.objs[c.ta[s]].mapper)
+      if (c.t.nd[mn0].f & ast.MAP_OPTIONAL) != 0: tmi = types.union_of(&c, [tmi, c.undef_t])
+      let ni0 = bind.index_type(&c, t, true)
+      if ni0 >= 0 and not rel(&c, tmi, ni0): return rfail(&c, "rel0: ni0 >= 0 and not rel(&c, tmi, ni0)", false)
+      return rel(&c, tmi, ti)
   # (a generic mapped source to a concrete object type: by its keys' lower bound)
   if is_mapped(c, s) and tk == TK_OBJ and not is_mapped(c, t) and not tyops.is_generic(&c, t) and tyops.is_generic(&c, s):
     let lo = mapped_lower_obj(&c, s)
@@ -912,31 +1742,287 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
     # (and as a target: only what relates to it otherwise, a type parameter through its
     # constraint, which can't reach it)
     if tk == types.TK_INDEXED and simplified(&c, t) == t and tyops.base_of(&c, t, 0) == -1 and c.tk[c.ta[t]] == TK_TPARAM:
-      if sk == TK_TPARAM and tp_concrete(&c, s): return false
-      if sk != TK_TPARAM and sk < types.TK_KEYOF and not tyops.is_generic(&c, s): return false
+      if sk == TK_TPARAM and tp_concrete(&c, s): return rfail(&c, "rel0: sk == TK_TPARAM and tp_concrete(&c, s)", false)
+      if sk != TK_TPARAM and sk < types.TK_KEYOF and not tyops.is_generic(&c, s): return rfail(&c, "rel0: sk != TK_TPARAM and sk < types.TK_KEYOF and not tyops.is_generic(&c, s)", false)
   # (an empty object type to a mapped type with ?: related, isPartialMappedType)
   # (a mapped type made over its keys is still a mapped type there: Partial<Record<string, T>>)
   let t_mapnode = tk == TK_OBJ and c.objs[c.ta[t]].node >= 0 and c.t.nd[c.objs[c.ta[t]].node].k == ast.N_TMAPPED
+  # (two instantiations of one alias, a mapped type among them: by the alias's variances first,
+  # structuredTypeRelatedTo's alias rule before its generic mapped type rules)
+  if sk == TK_OBJ and tk == TK_OBJ and (is_mapped(c, s) or is_mapped(c, t)) and s in c.t_alias and t in c.t_alias and c.t_alias[s] == c.t_alias[t]:
+    let avr = alias_rel(&c, s, t)
+    if avr == 1: return true
+    if avr == 0: return rfail(&c, "rel0: a mapped alias's instantiations by its variances", false)
   if (is_mapped(c, t) or t_mapnode) and not c.subtype and (sk == TK_NONPRIM or (sk == TK_OBJ and not is_mapped(c, s) and is_empty_obj(&c, s))):
     let mn = c.objs[c.ta[t]].node
     if mn >= 0 and c.t.nd[mn].k == ast.N_TMAPPED and mapped_optionality(c, mn) == 1: return true
+  # (comparing with T[K] whose object and index have concrete constraints: with that constraint's
+  # access, structuredTypeRelatedTo's indexed access target)
+  if c.comparable and tk == types.TK_INDEXED and sk != types.TK_INDEXED:
+    let tbc = tyops.base_of(&c, t, 0)
+    if tbc >= 0 and tbc != t and c.tk[tbc] != TK_UNSUP and not tyops.is_deferred(c, tbc): return rel(&c, s, tbc)
+  # (a deferred conditional type to a type parameter: through its default constraint only, its
+  # branches united, a concrete one never relating; structuredTypeRelatedTo's conditional source)
+  if sk == types.TK_COND and tk == TK_TPARAM:
+    let cr = cond_to_tparam(&c, s, t, 0)
+    if cr == 0: return rfail(&c, "rel0: a conditional type's branches to a type parameter", false)
+    if cr == 1: return true
+  # (a concrete source to { [P in keyof T]: X }, T constrained to an object type with an index
+  # signature: keyof T can't relate to the source's own keys, a finite union, so not related,
+  # structuredTypeRelatedTo's generic mapped target)
+  if is_mapped(c, t) and not is_mapped(c, s) and (sk == TK_OBJ or sk == TK_STRING or sk == TK_NUMBER or sk == TK_STRLIT or sk == TK_NUMLIT) and not tyops.is_generic(&c, s):
+    let mn1 = c.objs[c.ta[t]].node
+    if mn1 >= 0 and c.t.nd[mn1].k == ast.N_TMAPPED and mapped_optionality(c, mn1) == 0:
+      let mk1 = mapped_keys(&c, t)
+      if mk1 >= 0 and c.tk[mk1] == types.TK_KEYOF and c.tk[c.ta[mk1]] == TK_TPARAM:
+        let kb = chk.base_constraint(&c, c.ta[mk1], 0)
+        if kb >= 0 and kb != c.ta[mk1] and c.tk[kb] == TK_OBJ and (bind.index_type(&c, kb, false) >= 0 or bind.index_type(&c, kb, true) >= 0): return rfail(&c, "rel0: keyof T (T with an index signature) to a source's own keys", false)
+  # (getNormalizedType of an intersection with a generic mapped type's T[K] among its members,
+  # NonNullable<{ [P in K]?: E }[X]>: each such member simplified to E with X for P
+  # (getSimplifiedIndexedAccessType's substituteIndexedMappedType; not with an as clause or -?),
+  # then the intersection related)
+  if sk == TK_INTER:
+    var ichg = false
+    var ims: [Int] = []
+    for ii_nm in 0..types.ninter(c, s):
+      let m = types.inter_at(c, s, ii_nm)
+      var r = m
+      if c.tk[m] == types.TK_INDEXED and is_mapped(c, c.ta[m]):
+        let mnn = c.objs[c.ta[c.ta[m]]].node
+        if mnn >= 0 and c.t.nd[mnn].k == ast.N_TMAPPED and (c.t.nd[mnn].f & ast.MAP_NOOPTIONAL) == 0:
+          let sub = tyops.mapped_at(&c, c.ta[m], c.tb[m])
+          if sub >= 0 and c.tk[sub] != TK_UNSUP:
+            r = sub
+            ichg = true
+      ims.push(r)
+    if ichg:
+      let ns = types.inter_of(&c, ims)
+      if ns != s and c.tk[ns] != TK_UNSUP: return rel(&c, ns, t)
   if sk >= types.TK_KEYOF or tk >= types.TK_KEYOF or is_mapped(c, s) or is_mapped(c, t):
     let r = generic_rel(&c, s, t)
     if r == 1: return true
-    if r == 0: return false
+    if r == 0: return rfail(&c, "rel0: r == 0", false)
+    # (a generic source, T[K] or a conditional type, to a target: through its base constraint
+    # when that relates, structuredTypeRelatedTo's constraint step)
+    # (a type parameter: through its constraint, E extends X & {} to X)
+    if sk == TK_TPARAM:
+      let scon = constraint_of(&c, s)
+      if scon >= 0 and scon != s and c.tk[scon] != TK_UNSUP and rel(&c, scon, t): return true
+    # (a conditional source: its default constraint, its branches united, to any target; after the
+    # conditional-to-conditional rules, structuredTypeRelatedTo's getDefaultConstraintOfConditionalType)
+    # (a conditional target without infer type parameters whose branches don't depend on the
+    # distribution: a source related to both branches, structuredTypeRelatedTo; not another
+    # instantiation of the same conditional, which has its own rule)
+    if tk == types.TK_COND and not (sk == types.TK_COND and c.ta[s] == c.ta[t]):
+      let tn0 = c.ta[t]
+      if tn0 >= 0 and c.t.nd[tn0].k == ast.N_TCOND:
+        var tinf: [Int] = []
+        tyops.collect_infers(c, c.t.nd[tn0].b, &tinf)
+        if tinf.len == 0 and not dist_dependent(&c, tn0):
+          let tr0 = tyops.raw(&c, c.t.nd[tn0].c)
+          let fr0 = tyops.raw(&c, c.t.nd[tn0].d)
+          let tm0 = c.tb[t]
+          let tb0 = bind.instantiate(&c, tr0, tm0)
+          let fb0 = bind.instantiate(&c, fr0, tm0)
+          if c.tk[tb0] != TK_UNSUP and c.tk[fb0] != TK_UNSUP:
+            let seq_b = c.unsup_seq
+            if rel(&c, s, tb0) and rel(&c, s, fb0) and c.unsup_seq == seq_b: return true
+      # (a source no rule of its own reaches, a primitive or a concrete object type that isn't a
+      # mapped type: not related to a conditional target otherwise, structuredTypeRelatedTo has
+      # nothing more for it; an object type is compared structurally only with an object target)
+      let conc_src = (sk >= TK_UNDEF and sk <= TK_NONPRIM) or (sk == TK_OBJ and not is_mapped(c, s) and not tyops.is_generic(&c, s))
+      if conc_src and tn0 >= 0 and c.t.nd[tn0].k == ast.N_TCOND: return rfail(&c, "rel0: a concrete source to a conditional type", false)
+    # (a conditional source whose base constraint is any, a branch reading T[K] of an object with a
+    # string index signature of any: related)
+    if sk == types.TK_COND and base_is_any(&c, s, 0): return true
+    if sk == types.TK_COND:
+      let cdf = cond_default(&c, s)
+      if cdf >= 0 and cdf != s and c.tk[cdf] != TK_UNSUP:
+        let seq_d = c.unsup_seq
+        # (a recursive conditional, PathValue<T[K], R> inside PathValue<T, P>, expanded inside itself
+        # three times: isDeeplyNestedType's Ternary.Maybe, related)
+        let sn = c.ta[s]
+        var dn = 0
+        for x in c.cond_rel_stk:
+          if x == -sn - 1: dn += 1
+        if dn >= 3: return true
+        c.cond_rel_stk.push(-sn - 1)
+        let rd = rel(&c, cdf, t)
+        let _ = c.cond_rel_stk.pop()
+        if rd: return true
+        # (then its distributive constraint: the check type parameter's constraint for it,
+        # getConstraintOfDistributiveConditionalType; neither relating: not related)
+        if c.unsup_seq == seq_d and tk != types.TK_COND and not tyops.is_generic(&c, t):
+          let dcon = cond_distributive(&c, s)
+          if dcon == -1: return rfail(&c, "rel0: a conditional source by its default constraint", false)
+          if dcon >= 0 and dcon != s and c.tk[dcon] != TK_UNSUP:
+            if rel(&c, dcon, t): return true
+            if c.unsup_seq == seq_d: return rfail(&c, "rel0: a conditional source by its distributive constraint", false)
+    if sk == types.TK_INDEXED or sk == types.TK_COND:
+      var sb = tyops.base_of(&c, s, 0)
+      if sb >= 0 and sb != s and c.tk[sb] != TK_UNSUP and not tyops.is_deferred(c, sb) and rel(&c, sb, t): return true
+      # ({ [P in K]: E }[X], K concrete and X generic: its constraint, E with X for P, then the
+      # mapped type indexed by X's constraint; neither relating, to a target no rule above reads
+      # as generic: not related, structuredTypeRelatedTo's isMappedTypeGenericIndexedAccess)
+      if sk == types.TK_INDEXED and tk != TK_TPARAM and tk < types.TK_KEYOF and not is_mapped(c, t):
+        let mga = tyops.mapped_generic_access(&c, c.ta[s], c.tb[s])
+        if mga >= 0 and c.tk[mga] != TK_UNSUP:
+          let seq_m = c.unsup_seq
+          if rel(&c, mga, t): return true
+          var ic = -1
+          if c.tk[c.tb[s]] == TK_TPARAM: ic = constraint_of(&c, c.tb[s])
+          else: ic = tyops.base_of(&c, c.tb[s], 0)
+          if ic >= 0 and ic != c.tb[s] and c.tk[ic] != TK_UNSUP and not tyops.is_generic(&c, ic):
+            let ia = tyops.indexed_of(&c, c.ta[s], ic)
+            if ia >= 0 and c.tk[ia] != TK_UNSUP and rel(&c, ia, t): return true
+            if c.unsup_seq == seq_m: return rfail(&c, "rel0: a mapped type's generic indexed access by its constraint and its index's", false)
+      # (T[K] whose base constraint is concrete and doesn't relate, to a target without type
+      # variables: not related, structuredTypeRelatedTo's constraint step; a narrower constraint
+      # couldn't relate where the widest doesn't. Not a mapped type's T[K], which has another rule)
+      if sk == types.TK_INDEXED and sb >= 0 and sb != s and c.tk[sb] != TK_UNSUP and not tyops.is_generic(&c, sb) and not chk.could_contain_tvars(&c, t) and not is_mapped(c, c.ta[s]): return rfail(&c, "rel0: T[K] by its base constraint", false)
+      # (a base constraint still generic, T[P] of a conditional's branch: its own, down to a
+      # concrete one, getBaseConstraintOfType; unknown where there's none. A conditional without
+      # one: its default constraint, its branches united)
+      if sk == types.TK_COND and (sb < 0 or sb == s): sb = cond_default(&c, s)
+      if sb >= 0 and sb != s and c.tk[sb] != TK_UNSUP and tyops.is_generic(&c, sb) and not chk.could_contain_tvars(&c, t) and not (sk == types.TK_INDEXED and is_mapped(c, c.ta[s])):
+        let db = deep_base(&c, sb, 0)
+        if db >= 0 and c.tk[db] != TK_UNSUP and not tyops.is_generic(&c, db):
+          if rel(&c, db, t): return true
+          return rfail(&c, "rel0: a deferred type by its base constraint's base constraint", false)
+    # (a generic mapped source of T[K]'s: the same through its apparent object)
+    if is_mapped(c, s) and not is_mapped(c, t):
+      let lo3 = mapped_lower_obj(&c, s)
+      if lo3 >= 0 and rel(&c, lo3, t): return true
+    # (a primitive to a generic mapped type { [P in K]: X } without an as clause or ?: related
+    # only if K relates to keyof the primitive's apparent type, structuredTypeRelatedTo; a
+    # string-like K never does)
+    # (an object source the same: its keys, keyof S without index signatures, and its properties;
+    # one with index signatures, by its properties' names alone: getIndexType's NoIndexSignatures)
+    let s_idx = sk == TK_OBJ and (bind.index_type(&c, s, false) >= 0 or bind.index_type(&c, s, true) >= 0)
+    if is_mapped(c, t) and not is_mapped(c, s) and (is_prim(c, s) or sk == TK_OBJ) and not tyops.is_generic(&c, s):
+      let mn = c.objs[c.ta[t]].node
+      # (and with or without ?: a template that holds primitives only, where the primitive's
+      # properties, its apparent type's methods, can't go)
+      if mn >= 0 and c.t.nd[mn].k == ast.N_TMAPPED and c.t.nd[mn].b < 0 and is_prim(c, s):
+        let tkeys0 = mapped_keys(&c, t)
+        if tkeys0 >= 0:
+          let tmpl0 = tyops.mapped_at(&c, t, tkeys0)
+          if tmpl0 >= 0 and c.tk[tmpl0] != TK_UNSUP:
+            # (each member, a generic one by its base constraint)
+            var prim_only = true
+            var tbs: [Int] = []
+            for tm0 in types.members(c, tmpl0):
+              var tb0 = tm0
+              # (M[K] of a mapped M: its template at K, substituteIndexedMappedType)
+              if c.tk[tm0] == types.TK_INDEXED and is_mapped(c, c.ta[tm0]):
+                let sub = tyops.mapped_at(&c, c.ta[tm0], c.tb[tm0])
+                if sub >= 0: tb0 = sub
+              if tyops.is_generic(&c, tb0): tb0 = tyops.base_of(&c, tb0, 0)
+              if tb0 < 0 or c.tk[tb0] == TK_UNSUP or tyops.is_generic(&c, tb0):
+                prim_only = false
+                continue
+              tbs.push(tb0)
+              for tm in types.members(c, tb0):
+                let tmk = c.tk[tm]
+                if not (is_prim(c, tm) or tmk == TK_UNDEF or tmk == TK_NULL or tmk == TK_NEVER or tmk == TK_VOID): prim_only = false
+            # (only where the keys aren't all the primitive's own: "length" of a string fits number)
+            if prim_only:
+              let sap0 = apparent(&c, s)
+              let skeys0 = tyops.keyof_of(&c, sap0)
+              let kb0 = tyops.base_of(&c, tkeys0, 0)
+              if c.tk[skeys0] != TK_UNSUP and kb0 >= 0 and c.tk[kb0] != TK_UNSUP and not tyops.is_generic(&c, kb0):
+                if not assignable(&c, kb0, skeys0): return rfail(&c, "rel0: a primitive to a generic mapped type of primitives", false)
+                # (its own keys: the primitive's properties there against the template)
+                let ia0 = tyops.indexed_of(&c, sap0, kb0)
+                let tbu = types.union_of(&c, tbs)
+                if ia0 >= 0 and c.tk[ia0] != TK_UNSUP and not tyops.is_generic(&c, ia0) and not assignable(&c, ia0, tbu): return rfail(&c, "rel0: a primitive's properties to a generic mapped type's template", false)
+      if mn >= 0 and c.t.nd[mn].k == ast.N_TMAPPED and c.t.nd[mn].b < 0 and (c.t.nd[mn].f & (ast.MAP_OPTIONAL | ast.MAP_PLUSOPTIONAL)) == 0:
+        let tkeys = mapped_keys(&c, t)
+        if tkeys >= 0:
+          let ap = apparent(&c, s)
+          var skeys = -1
+          if s_idx: skeys = prop_name_keys(&c, ap)
+          else: skeys = tyops.keyof_of(&c, ap)
+          if skeys >= 0 and c.tk[skeys] != TK_UNSUP and not tyops.is_generic(&c, skeys):
+            let kb = tyops.base_of(&c, tkeys, 0)
+            if kb >= 0 and c.tk[kb] != TK_UNSUP and not tyops.is_generic(&c, kb) and not assignable(&c, kb, skeys): return rfail(&c, "rel0: a primitive to a generic mapped type whose keys aren't its own", false)
+            # (its own keys, an object's: its properties there against a template that is concrete
+            # at them, S[P] related to X)
+            if sk == TK_OBJ and kb >= 0 and c.tk[kb] != TK_UNSUP and not tyops.is_generic(&c, kb):
+              let tm1 = tyops.mapped_at(&c, t, kb)
+              let ia1 = tyops.indexed_of(&c, ap, kb)
+              if tm1 >= 0 and ia1 >= 0 and c.tk[tm1] != TK_UNSUP and c.tk[ia1] != TK_UNSUP and not tyops.is_generic(&c, tm1) and not tyops.is_generic(&c, ia1):
+                if assignable(&c, ia1, tm1): return true
+                return rfail(&c, "rel0: an object's properties to a generic mapped type's template", false)
+    # (an object with a string index signature only, Object.fromEntries' { [k: string]: T }, to a
+    # generic mapped type without an as clause: its keys without index signatures are never (a
+    # number or symbol index signature's would stay, getIndexType's NoIndexSignatures), so the
+    # keys rule (K related to never) and the optional one (K & never) both fail, and it isn't
+    # empty; structuredTypeRelatedTo's generic mapped target then: not related. unknown the same:
+    # keyof unknown is never)
+    if is_mapped(c, t) and not is_mapped(c, s) and (sk == TK_UNKNOWN or (sk == TK_OBJ and not tyops.is_generic(&c, s) and c.objs[c.ta[s]].kind != types.OK_TUPLE and not (c.ta[s] in c.tidx) and not (c.ta[s] in c.yidx) and bind.index_type(&c, s, false) >= 0 and bind.index_type(&c, s, true) < 0 and bind.prop_count(&c, s) == 0 and bind.sig_count(&c, s, false) == 0 and bind.sig_count(&c, s, true) == 0)):
+      let tkeys2 = mapped_keys(&c, t)
+      if tkeys2 >= 0:
+        let kb2 = tyops.base_of(&c, tkeys2, 0)
+        if kb2 >= 0 and c.tk[kb2] != TK_UNSUP and c.tk[kb2] != TK_NEVER and not tyops.is_generic(&c, kb2): return rfail(&c, "rel0: an object of index signatures to a generic mapped type", false)
+    # (a mapped type adding ? to a type parameter, Partial<T> to T: unrelated, the template rule
+    # for a type parameter target excludes optional mapped types)
+    if tk == TK_TPARAM and is_mapped(c, s):
+      let smn = c.objs[c.ta[s]].node
+      if smn >= 0 and c.t.nd[smn].k == ast.N_TMAPPED and c.t.nd[smn].b < 0 and (c.t.nd[smn].f & (ast.MAP_OPTIONAL | ast.MAP_PLUSOPTIONAL)) != 0: return rfail(&c, "rel0: an optional mapped type to a type parameter", false)
+    # (a primitive to a mapped type over the keys of an unconstrained type parameter, Partial<T>:
+    # unrelated, structuredTypeRelatedTo's generic mapped target relates it to T itself)
+    if is_mapped(c, t) and not is_mapped(c, s) and (sk == TK_STRING or sk == TK_NUMBER or sk == TK_BIGINT or sk == TK_SYMBOL or sk == TK_TRUE or sk == TK_FALSE or sk == TK_STRLIT or sk == TK_NUMLIT or sk == TK_BIGLIT or sk == types.TK_TEMPLATE):
+      if mapped_over_free_tparam(&c, t, 0): return rfail(&c, "rel0: a primitive to a mapped type over keyof an unconstrained T", false)
+    # (T[K] of an unconstrained T to a type parameter U, or such a U to T[K]: no constraint of
+    # either side reaches the other, so unknown is what's related, and unknown relates to neither;
+    # structuredTypeRelatedTo's indexed access target needs a base object and index that aren't
+    # generic; assignability only)
+    if not c.comparable and sk == types.TK_INDEXED and tk == TK_TPARAM and s != t and tyops.base_of(&c, s, 0) == -1: return rfail(&c, "rel0: an indexed access without a constraint to a type parameter", false)
+    if not c.comparable and sk == TK_TPARAM and tk == types.TK_INDEXED and constraint_of(&c, s) < 0 and tyops.base_of(&c, t, 0) == -1: return rfail(&c, "rel0: a type parameter without a constraint to an indexed access without one", false)
+    # (unknown to T[K]: only through T[K]'s constraint for writing, which is no wider than the one
+    # for reading: where that has no any or unknown in it, or there's none, unknown isn't related)
+    if not c.comparable and sk == TK_UNKNOWN and tk == types.TK_INDEXED:
+      let tb = tyops.base_of(&c, t, 0)
+      if tb == -1: return rfail(&c, "rel0: unknown to an indexed access without a constraint", false)
+      if tb >= 0 and c.tk[tb] != TK_UNSUP and not tyops.is_generic(&c, tb):
+        var top = false
+        for m in types.members(c, tb):
+          let mk = c.tk[m]
+          if mk == TK_ANY or mk == TK_UNKNOWN or mk == TK_ERROR: top = true
+        if not top: return rfail(&c, "rel0: unknown to an indexed access whose constraint has no any or unknown", false)
+    # (a generic mapped source to a union: some member, typeRelatedToSomeType, Pick<S, K> to
+    # Pick<S2, K> | S2 | null with S and S2 two {} written apart. None related, over keys that
+    # are a type parameter K: it has no members (resolveMappedTypeMembers adds none for K), so
+    # no discriminant either (typeRelatedToDiscriminatedType): not related)
+    if is_mapped(c, s) and tk == TK_UNION:
+      let seq_u = c.unsup_seq
+      for mi_gu in 0..types.nmem(c, t):
+        if assignable(&c, s, types.mem(c, t, mi_gu)): return true
+      let sks = mapped_keys(&c, s)
+      if c.unsup_seq == seq_u and sks >= 0 and c.tk[sks] == TK_TPARAM: return rfail(&c, "rel0: a generic mapped type over K to each member of a union", false)
     # not related by this checker yet: the file isn't checked
     let dbg = dbg_types(&c, s, t)
     let ms = is_mapped(c, s)
     let mt = is_mapped(c, t)
     let u = bind.unsupported(&c, 0, "relating a generic keyof, indexed access, mapped or conditional type [{sk} {tk} {ms} {mt}] " + dbg)
+    if c.trace_rel and c.all_reasons: trace_stack(&c)
     bind.touch(&c, u)
     return true
   if sk == TK_UNSUP or tk == TK_UNSUP:
     bind.touch(&c, s)
     bind.touch(&c, t)
     return true
-  if tk == TK_NEVER: return false
-  if sk == TK_UNKNOWN: return false
+  # (a type parameter constrained to never, K extends keyof {}: related to never through its
+  # constraint, structuredTypeRelatedTo's type parameter source)
+  if tk == TK_NEVER and sk == TK_TPARAM:
+    let bcn = chk.base_constraint(&c, s, 0)
+    if bcn >= 0 and c.tk[bcn] == TK_NEVER: return true
+  if tk == TK_NEVER: return rfail(&c, "rel0: tk == TK_NEVER", false)
+  # (strictNullChecks false: unknown relates to an object type as its apparent type, {},
+  # structuredTypeRelatedToWorker's getApparentType)
+  if sk == TK_UNKNOWN and c.snc_off and (tk == TK_OBJ or tk == TK_UNION or tk == TK_INTER): return assignable(&c, c.empty_obj, t)
+  if sk == TK_UNKNOWN: return rfail(&c, "rel0: sk == TK_UNKNOWN", false)
   if c.comparable:
     # simple types relate either way; a union source needs one member
     if chk.simple_type(c, s) and chk.simple_type(c, t) and simple_rel(&c, t, s): return true
@@ -944,7 +2030,7 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
       for mi167_ in 0..types.nmem(c, s):
         let m = types.mem(c, s, mi167_)
         if assignable(&c, m, t): return true
-      return false
+      return rfail(&c, "rel0: assignable(&c, m, t): return true", false)
     # an unconstrained type parameter compares with anything but another type parameter
     if sk == TK_TPARAM and tk != TK_TPARAM and constraint_of(&c, s) < 0: return true
     # object compares as its apparent type {} (no required members, implicit index signatures)
@@ -957,13 +2043,13 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
   if sk == TK_UNION:
     for mi168_ in 0..types.nmem(c, s):
       let m = types.mem(c, s, mi168_)
-      if not assignable(&c, m, t): return false
+      if not assignable(&c, m, t): return rfail(&c, "rel0: not assignable(&c, m, t)", false)
     return true
   if tk == TK_UNION:
     if sk == TK_OBJ and c.objs[c.ta[s]].fresh and not has_global_object(&c, t):
       let et = excess_target(&c, s, t)
       for name in fresh_names(&c, s):
-        if not known_prop(&c, et, name): return false
+        if not known_prop(&c, et, name): return rfail(&c, "rel0: not known_prop(&c, et, name)", false)
       let plain = unfresh(&c, s)
       for mi169_ in 0..types.nmem(c, t):
         let m = types.mem(c, t, mi169_)
@@ -971,15 +2057,24 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
       return disc_related(&c, plain, t)
     # (one of its members: containsType)
     if in_union(&c, t, s): return true
+    # (the members that aren't generic first: the answer is the same in any order, and a source
+    # related to one of those never meets a generic mapped or conditional member vtsc doesn't
+    # model, es-toolkit's ListIteratee<T> with PartialShallow<T>, where the union's order put it)
+    var gen_ms: [Int] = []
     for mi170_ in 0..types.nmem(c, t):
       let m = types.mem(c, t, mi170_)
+      if c.tk[m] >= types.TK_KEYOF or (c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == types.OK_MAPPED and tyops.is_generic(&c, m)):
+        gen_ms.push(m)
+        continue
+      if assignable(&c, s, m): return true
+    for m in gen_ms:
       if assignable(&c, s, m): return true
     if sk == TK_OBJ and disc_related(&c, s, t): return true
     # a type parameter: its constraint against the whole union
     if sk == TK_TPARAM:
       let con = constraint_of(&c, s)
       if con >= 0 and con != s: return assignable(&c, con, t)
-    return false
+    return rfail(&c, "rel0: con >= 0 and con != s: return assignable(&c, con, t)", false)
   if tk == TK_INTER:
     let ms = types.members_inter(c, t)
     var src = s
@@ -989,15 +2084,17 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
         var known = false
         for m in ms:
           if known_prop(&c, m, name): known = true
-        if not known: return false
+        if not known:
+          if c.trace_rel: return rfail(&c, "rel0: excess property '" + c.t.names[name] + "' against an intersection", false)
+          return false
       src = unfresh(&c, s)
-    if not c.comparable and weak_fails_inter(&c, src, ms): return false
+    if not c.comparable and weak_fails_inter(&c, src, ms): return rfail(&c, "rel0: not c.comparable and weak_fails_inter(&c, src, ms)", false)
     for m in ms:
       c.no_weak = true
-      if not assignable(&c, src, m): return false
+      if not assignable(&c, src, m): return rfail(&c, "rel0: not assignable(&c, src, m)", false)
     return true
   if sk == TK_INTER:
-    if tk == TK_OBJ and not nw and not c.comparable and inter_weak_fails(&c, s, t): return false
+    if tk == TK_OBJ and not nw and not c.comparable and inter_weak_fails(&c, s, t): return rfail(&c, "rel0: tk == TK_OBJ and not nw and not c.comparable and inter_weak_fails(&c, s, t)", false)
     # a member alone, without implicit index signatures (IntersectionState.Source)
     let was_is = c.inter_src
     c.inter_src = true
@@ -1011,12 +2108,17 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
       let m = types.inter_at(c, s, ii45_)
       if tyops.is_generic(&c, m): imembers.push(m)
     for m in imembers:
-      # (a member of an intersection target: no weak type check, IntersectionState.Target)
-      if nw: c.no_weak = true
+      # (each member with IntersectionState.Source alone: the weak type check is made on it even
+      # inside an intersection target's member, someTypeRelatedToType)
       if not any_rel and assignable(&c, m, t): any_rel = true
     c.no_weak = false
     c.inter_src = was_is
-    if any_rel: return true
+    if any_rel:
+      # (and a non-generic object target's optional properties against the whole intersection:
+      # a member's mismatched property shows only there, structuredTypeRelatedTo's optionalsOnly
+      # check)
+      if tk == TK_OBJ and not inter_optionals_ok(&c, s, t): return rfail(&c, "rel0: an optional property against the whole source intersection", false)
+      return true
     # getEffectiveConstraintOfIntersection: with a member of a disjoint domain (or a union
     # target), the intersection of the generic members' base constraints and those members
     let ec = inter_effective_constraint(&c, s, tk == TK_UNION)
@@ -1026,10 +2128,10 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
       for ii46_ in 0..types.ninter(c, s):
         let m = types.inter_at(c, s, ii46_)
         let mk = c.tk[m]
-        if mk == TK_NULL or mk == TK_UNDEF or mk == TK_VOID: return false
+        if mk == TK_NULL or mk == TK_UNDEF or mk == TK_VOID: return rfail(&c, "rel0: mk == TK_NULL or mk == TK_UNDEF or mk == TK_VOID", false)
       let r = combined_rel(&c, s, t, nw)
       if r == 1: return true
-      if r == 0: return false
+      if r == 0: return rfail(&c, "rel0: r == 0", false)
       # (generic mapped members by their keys' lower bounds)
       var lparts: [Int] = []
       var lchanged = false
@@ -1073,6 +2175,14 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
             parts.push(con)
             changed = true
             continue
+        # (a generic T[K] or conditional member: its base constraint where that is concrete,
+        # NonNullable<X[K]>'s X[K], getEffectiveConstraintOfIntersection)
+        if c.tk[m] == types.TK_INDEXED or c.tk[m] == types.TK_COND:
+          let mb = tyops.base_of(&c, m, 0)
+          if mb >= 0 and mb != m and c.tk[mb] != TK_UNSUP and not tyops.is_generic(&c, mb):
+            parts.push(mb)
+            changed = true
+            continue
         parts.push(m)
       if changed:
         let x = types.inter_of(&c, parts)
@@ -1090,26 +2200,49 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
       if empty_all and tk == TK_OBJ:
         for name in bind.prop_names(&c, t):
           let tp = bind.get_prop(&c, t, name)
-          if tp >= 0 and (c.sflags[tp] & types.SF_OPTIONAL) == 0: return false
+          if tp >= 0 and (c.sflags[tp] & types.SF_OPTIONAL) == 0: return rfail(&c, "rel0: tp >= 0 and (c.sflags[tp] & types.SF_OPTIONAL) == 0", false)
+      # (a conditional or T[K] member whose base constraint is a union of object types with generic
+      # property types, apollo's VariablesOption<NoInfer<TVariables>>: the intersection's properties
+      # are that union's (getApparentType), which relate as the intersection distributed over it)
+      var uparts: [Int] = []
+      var uchanged = false
+      for ii_u in 0..types.ninter(c, s):
+        let m = types.inter_at(c, s, ii_u)
+        if c.tk[m] == types.TK_INDEXED or c.tk[m] == types.TK_COND:
+          let mb = tyops.base_of(&c, m, 0)
+          var objs = mb >= 0 and mb != m and c.tk[mb] == TK_UNION
+          if objs:
+            for mi_u in 0..types.nmem(c, mb):
+              let um = types.mem(c, mb, mi_u)
+              if c.tk[um] != TK_OBJ or is_mapped(c, um): objs = false
+          if objs:
+            uparts.push(mb)
+            uchanged = true
+            continue
+        uparts.push(m)
+      if uchanged:
+        let ux = types.inter_of(&c, uparts)
+        if ux != s and c.tk[ux] != TK_UNSUP: return assignable(&c, ux, t)
       let dbg = dbg_types(&c, s, t)
+      if c.trace_rel and c.all_reasons: trace_stack(&c)
       let u = bind.unsupported(&c, 0, "relating an intersection to an object type by its combined properties" + dbg)
       bind.touch(&c, u)
       return true
-    return false
+    return rfail(&c, "rel0: return true", false)
   if sk == TK_UNDEF: return tk == TK_VOID
-  if sk == TK_NULL or sk == TK_VOID: return false
+  if sk == TK_NULL or sk == TK_VOID: return rfail(&c, "rel0: sk == TK_NULL or sk == TK_VOID", false)
   if sk == TK_TPARAM:
     if tk == TK_TPARAM:
       # (U extends T: through its constraint)
       let con0 = constraint_of(&c, s)
       if con0 >= 0 and con0 != s and (c.tk[con0] == TK_TPARAM or c.tk[con0] == TK_INTER or c.tk[con0] == TK_UNION): return assignable(&c, con0, t)
-      return false
+      return rfail(&c, "rel0: con0 >= 0 and con0 != s and (c.tk[con0] == TK_TPARAM or c.tk[con0] == TK_INTER or c.tk[con", false)
     let con = constraint_of(&c, s)
     # (no constraint: unknown, related to nothing but unknown and any)
-    if con < 0: return false
+    if con < 0: return rfail(&c, "rel0: con < 0", false)
     return assignable(&c, con, t)
-  if tk == TK_TPARAM: return false
-  if tk == TK_OBJ and not nw and not (c.comparable and not types.is_literal(c, s)) and weak_fails(&c, s, t): return false
+  if tk == TK_TPARAM: return rfail(&c, "rel0: tk == TK_TPARAM", false)
+  if tk == TK_OBJ and not nw and not (c.comparable and not types.is_literal(c, s)) and weak_fails(&c, s, t): return rfail(&c, "rel0: tk == TK_OBJ and not nw and not (c.comparable and not types.is_literal(c, s)) and weak_fai", false)
   # enum literals (isSimpleTypeRelatedTo): a member to the plain literal of its value; a number,
   # or a number literal of its value, to a numeric member
   if (sk == TK_STRLIT or sk == TK_NUMLIT) and tk == sk and c.ta[s] == c.ta[t]:
@@ -1121,7 +2254,7 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
   if tk == types.TK_TEMPLATE:
     if sk == TK_STRLIT: return types.tmpl_matches(c, c.t.names[c.ta[s]] + "", t)
     if sk == types.TK_TEMPLATE: return tmpl_tmpl(&c, s, t)
-    return false
+    return rfail(&c, "rel0: sk == types.TK_TEMPLATE: return tmpl_tmpl(&c, s, t)", false)
   if sk == types.TK_TEMPLATE: return tk == TK_STRING or (tk == TK_OBJ and prim_to_obj(&c, c.string_t, t))
   if sk == TK_STRLIT: return tk == TK_STRING or (tk == TK_OBJ and prim_to_obj(&c, c.string_t, t))
   if sk == TK_NUMLIT: return tk == TK_NUMBER or (tk == TK_OBJ and prim_to_obj(&c, c.number_t, t))
@@ -1131,10 +2264,10 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
   if sk == TK_STRING or sk == TK_NUMBER or sk == TK_BIGINT or sk == TK_SYMBOL: return tk == TK_OBJ and prim_to_obj(&c, s, t)
   if tk == TK_NONPRIM:
     # (strictSubtypeRelation: {} isn't a subtype of object)
-    if c.strict_sub and sk == TK_OBJ and is_empty_obj(&c, s) and not c.objs[c.ta[s]].fresh: return false
+    if c.strict_sub and sk == TK_OBJ and is_empty_obj(&c, s) and not c.objs[c.ta[s]].fresh: return rfail(&c, "rel0: c.strict_sub and sk == TK_OBJ and is_empty_obj(&c, s) and not c.objs[c.ta[s]].fresh", false)
     return sk == TK_OBJ or sk == TK_NONPRIM
   if sk == TK_NONPRIM:
-    if tk != TK_OBJ: return false
+    if tk != TK_OBJ: return rfail(&c, "rel0: tk != TK_OBJ", false)
     # (object relates as its apparent type, the global Object interface)
     let os = bind.global_type_sym(&c, "Object")
     if os >= 0:
@@ -1151,11 +2284,11 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
     # two instantiations of one alias: their type arguments by the alias's variances
     let vr = alias_rel(&c, s, t)
     if vr == 1: return true
-    if vr == 0: return false
+    if vr == 0: return rfail(&c, "rel0: vr == 0", false)
   if sk == TK_OBJ and tk == TK_OBJ:
-    if has_excess(&c, s, t): return false
-    # (strictSubtypeRelation: only an empty object is a subtype of an empty object literal)
-    if c.strict_sub and s != t and c.objs[c.ta[t]].fresh and is_empty_obj(&c, t) and not is_empty_obj(&c, s): return false
+    if has_excess(&c, s, t): return rfail(&c, "rel0: has_excess(&c, s, t)", false)
+    # (the subtype relations: only an empty object is a subtype of an empty object literal)
+    if (c.subtype or c.strict_sub) and s != t and c.objs[c.ta[t]].fresh and is_empty_obj(&c, t) and not is_empty_obj(&c, s): return rfail(&c, "rel0: c.strict_sub and s != t and c.objs[c.ta[t]].fresh and is_empty_obj(&c, t) and not is_empty", false)
     # isDeeplyNestedType: the same generic types nested over and over (each level a new
     # instantiation) - tsc assumes the relation holds there; its exact cut-off isn't modeled
     let si = rec_id(c, s)
@@ -1165,8 +2298,8 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
     let deep_both = count_incr(c.rel_src, c.rel_src_t, si, s) >= 3 and count_incr(c.rel_tgt, c.rel_tgt_t, ti, t) >= 3
     # (both sides expanding the same generic types three times, ExpandingFlags.Both: Ternary.Maybe,
     # related)
-    if deep_both and c.rel_depth <= 60: return true
-    if c.rel_depth > 60 or deep_both:
+    if deep_both and c.rel_depth <= 99: return true
+    if c.rel_depth > 99 or deep_both:
       var dd = ""
       if c.all_reasons:
         dd = " " + dbg_types(&c, s, t) + " depth {c.rel_depth}"
@@ -1188,7 +2321,7 @@ fn rel(var c: C, s0: Int, t0: Int) -> Bool:
     c.rel_tgt_t.pop()
     c.rel_depth -= 1
     return r
-  return false
+  return rfail(&c, "rel0: return r", false)
 
 # getRecursionIdentity: what instantiations of one generic type have in common.
 # Whether m is one of union u's members (a set made once for a large union).
@@ -1263,9 +2396,18 @@ fn weak_fails(var c: C, s0: Int, t: Int) -> Bool:
   if c.tk[a] != TK_OBJ: return false
   let names = bind.prop_names(&c, a)
   if names.len == 0 and bind.sig_count(&c, a, false) == 0 and bind.sig_count(&c, a, true) == 0: return false
+  # (JSX attributes: a hyphenated name is known, isKnownProperty's isComparingJsxAttributes)
+  let jsx = jsx_attrs(c, a)
   for name in names:
     if bind.get_prop(&c, t, name) >= 0: return false
-  return true
+    if jsx and c.t.names[name].find("-") >= 0: return false
+  return rfail(&c, "weak_fails: jsx and c.t.names[name].find('-') >= 0: return false", true)
+
+# An object literal type made of a JSX element's attributes (ObjectFlags.JsxAttributes).
+fn jsx_attrs(c: C, s: Int) -> Bool:
+  if c.tk[s] != TK_OBJ: return false
+  let sn = c.objs[c.ta[s]].node
+  return sn >= 0 and sn < c.parent.len and c.parent[sn] >= 0 and c.t.nd[sn].k == ast.N_OBJECT and c.t.nd[c.parent[sn]].k == ast.N_JSXELEM
 
 # The weak type check for an intersection: when every member is a weak object type, the source
 # must share a property with one of them.
@@ -1280,18 +2422,24 @@ fn weak_fails_inter(var c: C, s0: Int, ms: [Int]) -> Bool:
   if sk != TK_OBJ: return false
   let names = bind.prop_names(&c, s)
   if names.len == 0 and bind.sig_count(&c, s, false) == 0 and bind.sig_count(&c, s, true) == 0: return false
+  let jsx = jsx_attrs(c, s)
   for name in names:
+    if jsx and c.t.names[name].find("-") >= 0: return false
     for m in ms:
       if bind.get_prop(&c, m, name) >= 0: return false
-  return true
+  return rfail(&c, "weak_fails_inter: bind.get_prop(&c, m, name) >= 0: return false", true)
 
 # A fresh object literal with a property the target doesn't know (excess property checks).
 # The properties written in a fresh object literal (excess property checks skip spread ones).
 fn fresh_names(var c: C, s: Int) -> [Int]:
   var out: [Int] = []
+  let jsx = jsx_attrs(c, s)
   for name in bind.prop_names(&c, s):
     let ps = bind.get_prop(&c, s, name)
-    if not (ps in c.spread_syms): out.push(name)
+    if ps in c.spread_syms: continue
+    # (JSX attributes: a hyphenated name is never excess, isIgnoredJsxProperty)
+    if jsx and c.t.names[name].find("-") >= 0: continue
+    out.push(name)
   return out
 
 # isTypeSubsetOf(globalObjectType, target): no excess property check against Object.
@@ -1311,9 +2459,14 @@ fn has_excess(var c: C, s: Int, t: Int) -> Bool:
   let so = c.ta[s]
   if not c.objs[so].fresh: return false
   if has_global_object(&c, t): return false
+  # (JSX attributes: hyphenated names aren't excess, isIgnoredJsxProperty)
+  let jsx = jsx_attrs(c, s)
   for name in bind.prop_names(&c, s):
     if bind.get_prop(&c, s, name) in c.spread_syms: continue
-    if not known_prop(&c, t, name): return true
+    if jsx and c.t.names[name].find("-") >= 0: continue
+    if not known_prop(&c, t, name):
+      if c.trace_rel: return rfail(&c, "has_excess: excess property '" + c.t.names[name] + "'", true)
+      return true
   return false
 
 fn constraint_of(var c: C, tp: Int) -> Int:
@@ -1394,6 +2547,9 @@ fn apparent(var c: C, t: Int) -> Int:
     let con = constraint_of(&c, t)
     if con >= 0: return apparent(&c, con)
     return c.empty_obj
+  elif k == types.TK_NOINFER: return apparent(&c, c.ta[t])
+  # (strictNullChecks false: unknown's is {}, getApparentType)
+  elif k == TK_UNKNOWN and c.snc_off: return c.empty_obj
   if name == "": return t
   let s = bind.global_type_sym(&c, name)
   if s < 0: return t
@@ -1443,6 +2599,8 @@ fn is_iterable_ref(var c: C, t: Int) -> Bool:
 
 # getPropertyOfType with the augmentations: a function's Function members, every object's Object members.
 fn src_prop(var c: C, s: Int, name: Int) -> Int:
+  # (a tuple's length: its literal lengths, as a property access reads it)
+  if c.tk[s] == TK_OBJ and obj_kind(c, s) == OK_TUPLE and bind.nm(c, name) == "length": return chk.prop_of(&c, s, name)
   let p = bind.get_prop(&c, s, name)
   if p >= 0: return p
   let arr = obj_kind(c, s) == OK_TUPLE or is_array_ref(&c, s)
@@ -1469,12 +2627,19 @@ fn rest_tuple_rel(var c: C, s: Int, t: Int) -> Bool:
   let to = c.ta[t]
   if c.objs[c.ta[s]].kind != OK_TUPLE:
     # an array to a tuple: only to one that is a rest element alone
-    if not is_array_ref(&c, s): return false
-    if c.objs[to].args.len != 1: return false
-    if is_readonly_array(&c, s) and not c.objs[to].ro: return false
-    return assignable(&c, c.objs[c.ta[s]].args[0], c.objs[to].args[0])
+    if not is_array_ref(&c, s): return rfail(&c, "rest_tuple_rel: not is_array_ref(&c, s)", false)
+    if is_readonly_array(&c, s) and not c.objs[to].ro: return rfail(&c, "rest_tuple_rel: is_readonly_array(&c, s) and not c.objs[to].ro", false)
+    # (to [A?, B?, ...R[]]: no required element, and the source's element fits each of them;
+    # structuredTypeRelatedTo's tuple target)
+    let sel = c.objs[c.ta[s]].args[0]
+    for j in 0..c.objs[to].args.len:
+      let f = c.objs[to].eflags[j]
+      if f == 0: return rfail(&c, "rest_tuple_rel: an array to a tuple with a required element", false)
+      if f == 3: return rfail(&c, "rest_tuple_rel: an array to a variadic element", false)
+      if not assignable(&c, sel, c.objs[to].args[j]): return rfail(&c, "rest_tuple_rel: an array's element to a tuple element", false)
+    return true
   let so = c.ta[s]
-  if c.objs[so].ro and not c.objs[to].ro: return false
+  if c.objs[so].ro and not c.objs[to].ro: return rfail(&c, "rest_tuple_rel: c.objs[so].ro and not c.objs[to].ro", false)
   let tf = bind.tuple_fixed(c, t)
   let tn = c.objs[to].args.len
   let t_rest = tf < tn
@@ -1482,7 +2647,7 @@ fn rest_tuple_rel(var c: C, s: Int, t: Int) -> Bool:
   let sf = bind.tuple_fixed(c, s)
   let sn = c.objs[so].args.len
   let s_rest = sf < sn
-  if s_rest and not t_rest: return false
+  if s_rest and not t_rest: return rfail(&c, "rest_tuple_rel: s_rest and not t_rest", false)
   # the target's required leading elements
   var tmin = 0
   for i in 0..tf:
@@ -1491,7 +2656,7 @@ fn rest_tuple_rel(var c: C, s: Int, t: Int) -> Bool:
     var smin = 0
     for i in 0..sn:
       if c.objs[so].eflags[i] == 0: smin = i + 1
-    if smin < tmin + t_suffix: return false
+    if smin < tmin + t_suffix: return rfail(&c, "rest_tuple_rel: smin < tmin + t_suffix", false)
     for i in 0..sn:
       var want = -1
       if i < tf:
@@ -1501,18 +2666,52 @@ fn rest_tuple_rel(var c: C, s: Int, t: Int) -> Bool:
       else: want = c.objs[to].args[tf]
       var have = c.objs[so].args[i]
       if c.objs[so].eflags[i] == 1: have = types.union_of(&c, [have, c.undef_t])
-      if not assignable(&c, have, want): return false
+      if not assignable(&c, have, want): return rfail(&c, "rest_tuple_rel: not assignable(&c, have, want)", false)
     return true
-  # both with rest elements: no suffixes modeled here
-  if t_suffix > 0 or sf + 1 < sn: return false
-  if sf < tmin: return false
+  # both with rest elements, elements after them too (structuredTypeRelatedTo's tuple case: each
+  # source element against the target's at the same place from the start or the end, or against the
+  # union of the target's middle elements)
+  var no_var = true
+  for f in c.objs[so].eflags:
+    if f == 3: no_var = false
+  for f in c.objs[to].eflags:
+    if f == 3: no_var = false
+  if no_var and (t_suffix > 0 or sf + 1 < sn):
+    var t_start = 0
+    while t_start < tn and c.objs[to].eflags[t_start] < 2: t_start += 1
+    var t_end = 0
+    while t_end < tn - t_start and c.objs[to].eflags[tn - 1 - t_end] < 2: t_end += 1
+    var mids: [Int] = []
+    for i in t_start..(tn - t_end):
+      mids.push(c.objs[to].args[i])
+      if c.objs[to].eflags[i] == 1: mids.push(c.undef_t)
+    let mid_t = types.union_of(&c, mids)
+    for i in 0..sn:
+      let sfl = c.objs[so].eflags[i]
+      let from_end = sn - 1 - i
+      var tfl = 2
+      var want = mid_t
+      if i < t_start:
+        tfl = c.objs[to].eflags[i]
+        want = c.objs[to].args[i]
+      elif from_end < t_end:
+        tfl = c.objs[to].eflags[tn - 1 - from_end]
+        want = c.objs[to].args[tn - 1 - from_end]
+      if tfl == 0 and sfl != 0: return rfail(&c, "rest_tuple_rel: a required target element against an optional or rest one", false)
+      var have = c.objs[so].args[i]
+      if sfl == 1 and tfl != 1: have = types.union_of(&c, [have, c.undef_t])
+      if tfl == 1 and sfl != 1: want = types.union_of(&c, [want, c.undef_t])
+      if not assignable(&c, have, want): return rfail(&c, "rest_tuple_rel: an element's type", false)
+    return true
+  if t_suffix > 0 or sf + 1 < sn: return rfail(&c, "rest_tuple_rel: t_suffix > 0 or sf + 1 < sn", false)
+  if sf < tmin: return rfail(&c, "rest_tuple_rel: sf < tmin", false)
   for i in 0..sf:
     var want = c.objs[to].args[tf]
     if i < tf: want = c.objs[to].args[i]
-    if not assignable(&c, c.objs[so].args[i], want): return false
+    if not assignable(&c, c.objs[so].args[i], want): return rfail(&c, "rest_tuple_rel: not assignable(&c, c.objs[so].args[i], want)", false)
   # the source's rest against what's left of the target
   for i in sf..tf:
-    if not assignable(&c, c.objs[so].args[sf], c.objs[to].args[i]): return false
+    if not assignable(&c, c.objs[so].args[sf], c.objs[to].args[i]): return rfail(&c, "rest_tuple_rel: not assignable(&c, c.objs[so].args[sf], c.objs[to].args[i])", false)
   return assignable(&c, c.objs[so].args[sf], c.objs[to].args[tf])
 
 # An intersection of plain object types against an object type with only properties, by the
@@ -1520,6 +2719,10 @@ fn rest_tuple_rel(var c: C, s: Int, t: Int) -> Bool:
 # An intersection of object types as one object type: each property in the members that have
 # it, its types intersected (optional when optional in all of them); their call and construct
 # signatures; their index signatures intersected. -1 for a member that isn't a plain object type.
+# isEmptyAnonymousObjectType: a type literal with no members ({} of NonNullable's T & {}).
+fn empty_anon(var c: C, t: Int) -> Bool:
+  return c.tk[t] == TK_OBJ and c.objs[c.ta[t]].kind == OK_ANON and is_empty_obj(&c, t)
+
 fn inter_effective_constraint(var c: C, s: Int, target_union: Bool) -> Int:
   var cons: [Int] = []
   var disjoint = false
@@ -1531,15 +2734,18 @@ fn inter_effective_constraint(var c: C, s: Int, target_union: Bool) -> Int:
       if b < 0: continue
       cons.push(b)
       if target_union: cons.push(m)
-    elif k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_NULL or k == TK_UNDEF or k == TK_VOID or k == TK_NONPRIM or m == c.empty_obj:
+    elif k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_NULL or k == TK_UNDEF or k == TK_VOID or k == TK_NONPRIM or m == c.empty_obj or empty_anon(&c, m):
       disjoint = true
   if cons.len == 0 or not (target_union or disjoint): return -1
   if disjoint:
     for ii50_ in 0..types.ninter(c, s):
       let m = types.inter_at(c, s, ii50_)
       let k = c.tk[m]
-      if k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_NULL or k == TK_UNDEF or k == TK_VOID or k == TK_NONPRIM or m == c.empty_obj: cons.push(m)
+      if k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_NULL or k == TK_UNDEF or k == TK_VOID or k == TK_NONPRIM or m == c.empty_obj or empty_anon(&c, m): cons.push(m)
+  # (NoConstraintReduction: T & P kept, not reduced to T, never or a constrained type variable)
+  c.inter_red += 1
   let r = types.inter_of(&c, cons)
+  c.inter_red -= 1
   if c.tk[r] == TK_UNSUP: return -1
   return r
 
@@ -1572,27 +2778,29 @@ fn inter_combined(var c: C, s: Int) -> Int:
     for nm1 in bind.prop_names(&c, am):
       if not types.has_int(names, nm1): names.push(nm1)
   for name in names:
-    var pts: [Int] = []
+    var pts: [Int] = [s, 0]
     var all_opt = true
     var all_ro = true
     var only = -1
     for am in ams:
       let ps = bind.get_prop(&c, am, name)
       if ps < 0: continue
-      pts.push(bind.prop_type_for(&c, ps, s))
+      pts.push(ps)
       only = ps
       if (c.sflags[ps] & SF_OPTIONAL) == 0: all_opt = false
       if (c.sflags[ps] & types.SF_READONLY) == 0: all_ro = false
     # (one member's property: its declaration, private or protected as it is)
     var sdecl0 = -1
-    if pts.len == 1: sdecl0 = c.sdecl[only]
+    let np = pts.len - 2
+    if np == 1: sdecl0 = c.sdecl[only]
     let sym = types.new_sym(&c, types.S_PROP, name, sdecl0)
-    c.stype[sym] = types.inter_of(&c, pts)
+    # (its type made when asked for: a discriminant or relation reads only a few of them)
+    c.lazy_icomb[sym] = pts
     var f = 0
     if all_opt: f = f | SF_OPTIONAL
     # (readonly where every member's is)
-    if all_ro and pts.len > 0: f = f | types.SF_READONLY
-    if pts.len == 1:
+    if all_ro and np > 0: f = f | types.SF_READONLY
+    if np == 1:
       f = f | (c.sflags[only] & (types.SF_PRIVATE | types.SF_PROTECTED))
       c.sparent[sym] = c.sparent[only]
     c.sflags[sym] = f
@@ -1622,7 +2830,8 @@ fn combined_rel(var c: C, s: Int, t: Int, nw: Bool) -> Int:
     if plain:
       for name in bind.prop_names(&c, t):
         let tp = bind.get_prop(&c, t, name)
-        if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
+        # (a name get_prop doesn't find: nothing to require)
+        if tp < 0 or (c.sflags[tp] & SF_OPTIONAL) != 0: continue
         var found = false
         for m in ms:
           if bind.get_prop(&c, m, name) >= 0: found = true
@@ -1708,10 +2917,15 @@ fn combined_rel(var c: C, s: Int, t: Int, nw: Bool) -> Int:
     if sts.len == 0:
       if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
       return 0
+    # (optional in every member that has it, required in the target: propertiesRelatedTo's
+    # "optional in the source but required in the target")
+    if all_opt and not c.comparable and (c.sflags[tp] & SF_OPTIONAL) == 0: return 0
     var st = types.inter_of(&c, sts)
-    if all_opt: st = types.union_of(&c, [st, c.undef_t])
+    # (exactOptionalPropertyTypes: the types without the optional properties' missing undefined,
+    # isPropertySymbolTypeRelated)
+    if all_opt and not c.exact_opt: st = types.union_of(&c, [st, c.undef_t])
     var tt = bind.prop_type_for(&c, tp, t)
-    if (c.sflags[tp] & SF_OPTIONAL) != 0: tt = types.union_of(&c, [tt, c.undef_t])
+    if (c.sflags[tp] & SF_OPTIONAL) != 0 and not c.exact_opt: tt = types.union_of(&c, [tt, c.undef_t])
     if not assignable(&c, st, tt): return 0
   return 1
 
@@ -1719,6 +2933,61 @@ fn combined_rel(var c: C, s: Int, t: Int, nw: Bool) -> Int:
 # known.
 fn identical(var c: C, s: Int, t: Int, depth: Int) -> Int:
   if s == t: return 1
+  # (asked again for the same two types, as each member of an intersection source against each
+  # member of a large union target is, at any depth: the answer it had)
+  var key = (s << 33) | (t << 1)
+  if c.permissive: key = key | 1
+  let hit = c.ident_cache.get(key, -2)
+  if hit != -2: return hit
+  # (a pair that couldn't be told at this depth or a shallower one, earlier in this comparison: it
+  # can't be told now, with no more depth left to look; without this, two deep copies of one
+  # structure are compared once per path to each pair, exponentially many: zod's .d.ts and .d.cts)
+  if c.ident_unk.get(key, 1000) <= depth: return -1
+  # (two object types compared member by member whose members mention them again: interfaces,
+  # HTMLSpanElement and HTMLElement (this: HTMLSpanElement), or two copies of a recursive type,
+  # ReactNode's ReactElement and its function types: the pair being compared is assumed identical
+  # where it comes back, recursiveTypeRelatedTo's maybe stack)
+  let objs = c.tk[s] == TK_OBJ and c.tk[t] == TK_OBJ
+  let decl = objs and c.objs[c.ta[s]].kind == types.OK_DECL and c.objs[c.ta[t]].kind == types.OK_DECL
+  # (and isDeeplyNestedType: a third instantiation of one declaration on each side under the
+  # pairs being compared, a new copy each time: assumed identical too)
+  if objs:
+    let ra = rec_id(c, s)
+    let rb = rec_id(c, t)
+    var on = false
+    var na = 0
+    var nb = 0
+    for i in 0..c.ident_stk.len:
+      if c.ident_stk[i] == key: on = true
+      if c.ident_rid[2 * i] == ra: na += 1
+      if c.ident_rid[2 * i + 1] == rb: nb += 1
+    if on or (na >= 2 and nb >= 2):
+      c.ident_maybe = true
+      return 1
+    c.ident_stk.push(key)
+    c.ident_rid.push(ra)
+    c.ident_rid.push(rb)
+  c.ident_nest += 1
+  let r = identical1(&c, s, t, depth)
+  c.ident_nest -= 1
+  if r < 0 and c.ident_nest > 0: c.ident_unk[key] = depth
+  if c.ident_nest == 0 and c.ident_unk.len > 0: c.ident_unk = {}
+  if objs:
+    let _ = c.ident_stk.pop()
+    let _ = c.ident_rid.pop()
+    let _ = c.ident_rid.pop()
+    # (the outermost pair: every assumption made under it settled; for two interfaces "can't tell"
+    # kept too, which was the answer before they were compared)
+    if c.ident_stk.len == 0:
+      if r >= 0 or decl: c.ident_cache[key] = r
+      c.ident_maybe = false
+      return r
+  # (not "can't tell": that may change as more is resolved, and it is what the depth cut-off gives;
+  # not identical under an assumption, which may not hold)
+  if r == 0 or (r == 1 and not c.ident_maybe): c.ident_cache[key] = r
+  return r
+
+fn identical1(var c: C, s: Int, t: Int, depth: Int) -> Int:
   if depth > 8: return -1
   let sk = c.tk[s]
   let tk = c.tk[t]
@@ -1755,7 +3024,13 @@ fn identical(var c: C, s: Int, t: Int, depth: Int) -> Int:
       for q in mt:
         if pass == 0: ys.push(q)
         else: xs.push(q)
+      # (a member the other side has as the same type: identical, without comparing it to the
+      # others; the loop below would end there too)
+      var yset: {Int: Bool} = {}
+      if ys.len > 8:
+        for y in ys: yset[y] = true
       for x in xs:
+        if ys.len > 8 and x in yset: continue
         var best = 0
         for y in ys:
           let d = identical(&c, x, y, depth + 1)
@@ -1782,14 +3057,48 @@ fn identical(var c: C, s: Int, t: Int, depth: Int) -> Int:
       if d == 0: return 0
       if d < 0: r2 = -1
     return r2
-  if ks != types.OK_ANON or kt != types.OK_ANON: return -1
-  if bind.sig_count(&c, s, false) > 0 or bind.sig_count(&c, t, false) > 0: return -1
-  if bind.sig_count(&c, s, true) > 0 or bind.sig_count(&c, t, true) > 0: return -1
-  if bind.index_type(&c, s, false) >= 0 or bind.index_type(&c, t, false) >= 0: return -1
-  if bind.index_type(&c, s, true) >= 0 or bind.index_type(&c, t, true) >= 0: return -1
+  # (tuples: the same element flags and readonly-ness, the elements identical)
+  if ks == types.OK_TUPLE and kt == types.OK_TUPLE:
+    if c.objs[so].args.len != c.objs[to].args.len or c.objs[so].eflags.len != c.objs[to].eflags.len: return 0
+    if c.objs[so].ro != c.objs[to].ro: return 0
+    for j in 0..c.objs[so].eflags.len:
+      if c.objs[so].eflags[j] != c.objs[to].eflags[j]: return 0
+    var r4 = 1
+    for i in 0..c.objs[so].args.len:
+      let d = identical(&c, c.objs[so].args[i], c.objs[to].args[i], depth + 1)
+      if d == 0: return 0
+      if d < 0: r4 = -1
+    return r4
+  if (ks == types.OK_TUPLE) != (kt == types.OK_TUPLE): return 0
+  # (an anonymous type instantiated, the same declaration through two mappers, or an interface:
+  # compared as written, their members)
+  if not ident_structural(c, s) or not ident_structural(c, t): return -1
+  # (as many properties and signatures, first: before anything is instantiated)
   let n1 = bind.prop_names(&c, s)
   let n2 = bind.prop_names(&c, t)
   if n1.len != n2.len: return 0
+  for ctor in [false, true]:
+    if bind.sig_count(&c, s, ctor) != bind.sig_count(&c, t, ctor): return 0
+  # (index signatures: both or neither, of identical types)
+  var r5 = 1
+  for ctor in [false, true]:
+    let ss = bind.sigs_of(&c, s, ctor)
+    let ts = bind.sigs_of(&c, t, ctor)
+    if ss.len != ts.len: return 0
+    for i in 0..ss.len:
+      let ds = sig_identical(&c, ss[i], ts[i], depth + 1)
+      if ds == 0: return 0
+      if ds < 0: r5 = -1
+  # (index signatures: both or neither, of identical types)
+  for numk in [false, true]:
+    let ia = bind.index_type(&c, s, numk)
+    let ib = bind.index_type(&c, t, numk)
+    if (ia >= 0) != (ib >= 0): return 0
+    if ia >= 0:
+      let di = identical(&c, ia, ib, depth + 1)
+      if di == 0: return 0
+      if di < 0: r5 = -1
+  if bind.has_tmpl_index(c, s) or bind.has_tmpl_index(c, t): return -1
   var r3 = 1
   for name in n1:
     let p1 = bind.get_prop(&c, s, name)
@@ -1806,7 +3115,139 @@ fn identical(var c: C, s: Int, t: Int, depth: Int) -> Int:
     let d = identical(&c, pt1, pt2, depth + 1)
     if d == 0: return 0
     if d < 0: r3 = -1
+  # (call and construct signatures: each identical to the other's at its place,
+  # signaturesIdenticalTo)
+  var r6 = 1
+  for ctor in [false, true]:
+    let xs = bind.sigs_of(&c, s, ctor)
+    let ys = bind.sigs_of(&c, t, ctor)
+    if xs.len != ys.len: return 0
+    for i in 0..xs.len:
+      let d = sig_identical(&c, xs[i], ys[i], depth + 1)
+      if d == 0: return 0
+      if d < 0: r6 = -1
+  if r5 < 0 or r6 < 0: return -1
   return r3
+
+# Object types the identity relation compares by their members here: anonymous ones (instantiated
+# or not), interfaces (a generic one's instantiation too); not classes, whose private members are
+# compared by declaration.
+fn ident_structural(c: C, t: Int) -> Bool:
+  let o = c.ta[t]
+  let k = c.objs[o].kind
+  if k == types.OK_ANON or k == types.OK_INST: return true
+  var sy = c.objs[o].sym
+  if k == OK_REF:
+    let tg = c.objs[o].target
+    if tg < 0 or c.tk[tg] != TK_OBJ: return false
+    sy = c.objs[c.ta[tg]].sym
+  elif k != types.OK_DECL or c.objs[o].tparams.len > 0: return false
+  return sy >= 0 and (c.sk[sy] & types.S_INTERFACE) != 0 and (c.sk[sy] & types.S_CLASS) == 0
+
+# A signature's parameters for getParameterCount and getTypeAtPosition: a rest parameter of a tuple
+# type without a rest element spread into its elements (flags 1 optional, 2 rest); the minimum
+# argument count, -1 where that isn't modeled (a tuple with a rest or variadic element).
+fn flat_params(var c: C, sg: Int, var ts: [Int], var fs: [Int]) -> Int:
+  let n = c.sigs[sg].ptypes.len
+  var spread = false
+  for i in 0..n:
+    let pt = c.sigs[sg].ptypes[i]
+    let f = c.sigs[sg].pflags[i]
+    if f != 2:
+      ts.push(pt)
+      fs.push(f)
+      continue
+    if c.tk[pt] == TK_OBJ and is_array_ref(&c, pt):
+      ts.push(pt)
+      fs.push(2)
+      continue
+    if c.tk[pt] != TK_OBJ or obj_kind(c, pt) != OK_TUPLE: return -1
+    spread = true
+    for j in 0..c.objs[c.ta[pt]].args.len:
+      let ef = c.objs[c.ta[pt]].eflags[j]
+      if ef != 0 and ef != 1: return -1
+      ts.push(c.objs[c.ta[pt]].args[j])
+      fs.push(ef)
+  if not spread: return c.sigs[sg].min
+  var m = 0
+  for i in 0..fs.len:
+    if fs[i] == 0: m = i + 1
+  return m
+
+# compareSignaturesIdentical (no partial match, this and return types compared): 1 identical, 0
+# not, -1 not known.
+fn sig_identical(var c: C, a: Int, b: Int, depth: Int) -> Int:
+  if a == b or same_sig(c, a, b): return 1
+  # (isMatchingSignature: as many parameters, required ones and rest parameters)
+  var pa_t: [Int] = []
+  var pa_f: [Int] = []
+  var pb_t: [Int] = []
+  var pb_f: [Int] = []
+  let ma = flat_params(&c, a, &pa_t, &pa_f)
+  let mb = flat_params(&c, b, &pb_t, &pb_f)
+  if ma < 0 or mb < 0: return -1
+  if pa_t.len != pb_t.len or ma != mb: return 0
+  for i in 0..pa_t.len:
+    if (pa_f[i] == 2) != (pb_f[i] == 2): return 0
+  if c.sigs[a].tparams.len != c.sigs[b].tparams.len: return 0
+  # (generic: the type parameters' constraints and defaults identical, the source's as the
+  # target's)
+  var sa = a
+  if c.sigs[a].tparams.len > 0:
+    let um = chk.identical_tparams(&c, b, a)
+    if um < 0:
+      # (a constraint on one side only, or two that aren't identical: not)
+      let xs = types.ints(c.sigs[a].tparams)
+      let ys = types.ints(c.sigs[b].tparams)
+      let m0 = types.new_mapper(&c, xs, ys)
+      for i in 0..xs.len:
+        let cx = constraint_of(&c, xs[i])
+        let cy = constraint_of(&c, ys[i])
+        if (cx < 0) != (cy < 0): return 0
+        if cx >= 0 and not (a in c.sig_outer) and not (b in c.sig_outer):
+          let icx = bind.instantiate(&c, cx, m0)
+          if identical(&c, icx, cy, depth) == 0: return 0
+      return -1
+    sa = bind.inst_sig(&c, a, um)
+  var r = 1
+  let ta = c.sigs[sa].this_t
+  let tb = c.sigs[b].this_t
+  if ta >= 0 and tb >= 0:
+    let d = identical(&c, ta, tb, depth)
+    if d == 0: return 0
+    if d < 0: r = -1
+  # (getTypeAtPosition: an optional parameter's type has undefined in it, strictNullChecks)
+  if sa != a:
+    pa_t = []
+    pa_f = []
+    let _ = flat_params(&c, sa, &pa_t, &pa_f)
+    if pa_t.len != pb_t.len: return -1
+  for i in 0..pa_t.len:
+    var x = pa_t[i]
+    var y = pb_t[i]
+    if pa_f[i] == 1: x = types.union_of(&c, [x, c.undef_t])
+    if pb_f[i] == 1: y = types.union_of(&c, [y, c.undef_t])
+    let d = identical(&c, y, x, depth)
+    if d == 0: return 0
+    if d < 0: r = -1
+  # (type predicates: the same parameter, identical types; one with and one without: not)
+  let pa = sig_is_pred(c, sa)
+  let pb = sig_is_pred(c, b)
+  if pa != pb: return 0
+  # (an assertion signature, asserts x is T: not modeled)
+  if not pa and (c.sigs[sa].pred_i >= 0 or c.sigs[b].pred_i >= 0): return -1
+  if pa:
+    if c.sigs[sa].pred_i < 0 or c.sigs[b].pred_i < 0: return -1
+    if c.sigs[sa].pred_i != c.sigs[b].pred_i: return 0
+    let d = identical(&c, c.sigs[sa].pred_t, c.sigs[b].pred_t, depth)
+    if d == 0: return 0
+    if d < 0: return -1
+    return r
+  if c.sigs[sa].ret < 0 or c.sigs[b].ret < 0: return -1
+  let d = identical(&c, c.sigs[sa].ret, c.sigs[b].ret, depth)
+  if d == 0: return 0
+  if d < 0: return -1
+  return r
 
 # isObjectTypeWithInferableIndex: a type literal or object literal type (or an instantiation of
 # one) without call or construct signatures.
@@ -1831,19 +3272,32 @@ fn alias_rel(var c: C, s: Int, t: Int) -> Int:
   let tps = ast.items(c.t, c.t.nd[d].a)
   if sa.len != tps.len or ta.len != tps.len: return -1
   var vs: [Int] = []
+  var unmeasured = false
   for i in 0..tps.len:
     let v = decl_variance(&c, a, i)
-    if v < 0: return -1
+    if v < 0: unmeasured = true
     vs.push(v)
+  if unmeasured:
+    # (identical type arguments: the same type, whatever the variances; tsc relates an
+    # unmeasurable one by identity, typeArgumentsRelatedTo, so two copies of one instantiation
+    # don't need their members compared)
+    for i in 0..tps.len:
+      if identical(&c, sa[i], ta[i], 0) != 1: return -1
+    return 1
+  # (a variance measured through a mapped type, VarianceFlags.Unreliable: a failed check isn't
+  # an answer, the structure is compared, typeArgumentsRelatedTo's fallback)
+  var vfail = 0
+  for i in 0..tps.len:
+    if c.var_unrel.get((a << 8) | i, false): vfail = -1
   for i in 0..tps.len:
     let v = vs[i]
     if v == 0: continue
     if (v & 3) == 0:
       # (bivariant: either way)
-      if not assignable(&c, sa[i], ta[i]) and not assignable(&c, ta[i], sa[i]): return 0
+      if not assignable(&c, sa[i], ta[i]) and not assignable(&c, ta[i], sa[i]): return vfail
       continue
-    if (v & 1) != 0 and not assignable(&c, sa[i], ta[i]): return 0
-    if (v & 2) != 0 and not assignable(&c, ta[i], sa[i]): return 0
+    if (v & 1) != 0 and not assignable(&c, sa[i], ta[i]): return vfail
+    if (v & 2) != 0 and not assignable(&c, ta[i], sa[i]): return vfail
   return 1
 
 # The polarities a type parameter (by name) appears with in a type node: 1 covariant, 2 contravariant;
@@ -1916,6 +3370,28 @@ fn variance_walk(var c: C, n: Int, name: Int, pos: Bool, var acc: [Int]):
           break
       if all_plain: return
     acc[0] = -1
+    return
+  if k == ast.N_TINDEXED:
+    # (T[X] of the parameter itself, X without it: as T, S[X] relating to T[X] where S relates to T)
+    let on = c.t.nd[n].a
+    if on >= 0 and c.t.nd[on].k == ast.N_TREF and c.t.nd[on].b < 0 and c.t.nd[c.t.nd[on].a].k == ast.N_ID and c.t.nd[c.t.nd[on].a].s == name and not mentions(c, c.t.nd[n].b, name):
+      if pos: acc[0] = acc[0] | 1
+      else: acc[0] = acc[0] | 2
+      return
+  if k == ast.N_TMAPPED:
+    # ({ [P in C]: E }, no as clause, C not keyof: its keys contravariant, its template as it is,
+    # mappedTypeRelatedTo; measured through a mapped type, VarianceFlags.Unreliable)
+    let tpn = c.t.nd[n].a
+    var cn = -1
+    if tpn >= 0: cn = c.t.nd[tpn].a
+    if (c.t.nd[n].b >= 0 and mentions(c, c.t.nd[n].b, name)) or cn < 0 or (c.t.nd[cn].k == ast.N_TOP and c.t.nd[cn].f == scan.W_KEYOF and mentions(c, cn, name)) or (tpn >= 0 and c.t.nd[tpn].s == name):
+      if mentions(c, n, name): acc[0] = -1
+      return
+    if not mentions(c, n, name): return
+    variance_walk(&c, cn, name, not pos, &acc)
+    if acc[0] < 0: return
+    if c.t.nd[n].c >= 0: variance_walk(&c, c.t.nd[n].c, name, pos, &acc)
+    if acc.len > 1: acc[1] = 1
     return
   if k == ast.N_TCOND:
     # (the check type: two instantiations relate when either check type relates to the other,
@@ -2028,9 +3504,10 @@ fn decl_variance(var c: C, s: Int, i: Int) -> Int:
     if c.t.nd[d].k == ast.N_TYPEALIAS and c.t.nd[d].a >= 0:
       let tps = ast.items(c.t, c.t.nd[d].a)
       if i < tps.len:
-        var acc: [Int] = [0]
+        var acc: [Int] = [0, 0]
         variance_walk(&c, c.t.nd[d].b, c.t.nd[tps[i]].s, true, &acc)
         r = acc[0]
+        if r >= 0 and acc[1] == 1: c.var_unrel[key] = true
   elif (c.sk[s] & types.S_CLASS) != 0:
     # (a class's instance side: properties as they are, a method's parameters bivariantly, its
     # return as it is; constructors and statics aren't part of it)
@@ -2169,9 +3646,13 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
   if skind == OK_REF and tkind == OK_REF and c.objs[so].target == c.objs[to].target:
     let tg = c.objs[so].target
     let tps = types.ints(c.objs[c.ta[tg]].tparams)
+    # (a type argument whose variance isn't measured here: a failed check falls back to comparing
+    # the members, as tsc does for variances it marks unmeasurable or unreliable)
+    var fallback = false
     for i in 0..c.objs[so].args.len:
       # (a variance annotation: in, out, in out)
       var ann = 1
+      var unmeasured = false
       if i < tps.len and c.tk[tps[i]] == TK_TPARAM:
         let td = c.sdecl[c.ta[tps[i]]]
         if td >= 0 and c.t.nd[td].k == ast.N_TPARAM:
@@ -2192,23 +3673,27 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
               elif mv > 0 and (mv & 3) == 0: ann = 4
               # (contravariant, invariant: as measured)
               elif mv > 0: ann = mv & 3
+              elif mv == -1: unmeasured = true
+      if unmeasured and not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]):
+        fallback = true
+        break
       if ann == 4:
-        if not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]) and not assignable(&c, c.objs[to].args[i], c.objs[so].args[i]): return false
+        if not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]) and not assignable(&c, c.objs[to].args[i], c.objs[so].args[i]): return rfail(&c, "structural: not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]) and not assignable(&c, c.objs[t", false)
         continue
-      if (ann & 1) != 0 and not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]): return false
-      if (ann & 2) != 0 and not assignable(&c, c.objs[to].args[i], c.objs[so].args[i]): return false
-    return true
+      if (ann & 1) != 0 and not assignable(&c, c.objs[so].args[i], c.objs[to].args[i]): return rfail(&c, "structural: (ann & 1) != 0 and not assignable(&c, c.objs[so].args[i], c.objs[to].args[i])", false)
+      if (ann & 2) != 0 and not assignable(&c, c.objs[to].args[i], c.objs[so].args[i]): return rfail(&c, "structural: (ann & 2) != 0 and not assignable(&c, c.objs[to].args[i], c.objs[so].args[i])", false)
+    if not fallback: return true
   # Array<T> to ReadonlyArray<U>
   if skind == OK_REF and tkind == OK_REF and is_array_ref(&c, s) and is_array_ref(&c, t):
     let sn = bind.nm(c, c.sname[c.objs[c.ta[c.objs[so].target]].sym])
     let tn = bind.nm(c, c.sname[c.objs[c.ta[c.objs[to].target]].sym])
-    if sn == "ReadonlyArray" and tn == "Array": return false
+    if sn == "ReadonlyArray" and tn == "Array": return rfail(&c, "structural: sn == 'ReadonlyArray' and tn == 'Array'", false)
     return assignable(&c, c.objs[so].args[0], c.objs[to].args[0])
   if tkind == OK_TUPLE and (bind.tuple_has_rest(c, t) or (skind == OK_TUPLE and bind.tuple_has_rest(c, s))):
     return rest_tuple_rel(&c, s, t)
   if tkind == OK_TUPLE:
-    if skind != OK_TUPLE: return false
-    if c.objs[so].ro and not c.objs[to].ro: return false
+    if skind != OK_TUPLE: return rfail(&c, "structural: skind != OK_TUPLE", false)
+    if c.objs[so].ro and not c.objs[to].ro: return rfail(&c, "structural: c.objs[so].ro and not c.objs[to].ro", false)
     let sa = c.objs[so].args.len
     let ta = c.objs[to].args.len
     var tmin = 0
@@ -2217,22 +3702,23 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
     var smin = 0
     for i in 0..sa:
       if c.objs[so].eflags[i] == 0: smin = i + 1
-    if smin < tmin or sa > ta: return false
+    if smin < tmin or sa > ta: return rfail(&c, "structural: smin < tmin or sa > ta", false)
     for i in 0..sa:
       var have = c.objs[so].args[i]
       if c.objs[so].eflags[i] == 1: have = types.union_of(&c, [have, c.undef_t])
       var want = c.objs[to].args[i]
       if c.objs[to].eflags[i] == 1: want = types.union_of(&c, [want, c.undef_t])
-      if not assignable(&c, have, want): return false
+      if not assignable(&c, have, want): return rfail(&c, "structural: not assignable(&c, have, want)", false)
     return true
   if skind == OK_TUPLE and is_array_ref(&c, t):
-    if c.objs[so].ro and not is_readonly_array(&c, t): return false
+    if c.objs[so].ro and not is_readonly_array(&c, t): return rfail(&c, "structural: c.objs[so].ro and not is_readonly_array(&c, t)", false)
     let h1_ = bind.tuple_elem_union(&c, s)
     return assignable(&c, h1_, c.objs[to].args[0])
   # properties: a missing one first (getUnmatchedProperty), then their types
-  # (the subtype relation: optional ones too, but for an object literal's type or a tuple)
+  # (the subtype relations: optional ones too, but for an object literal's type or a tuple,
+  # requireOptionalProperties)
   var req_opt = false
-  if c.subtype and skind != OK_TUPLE:
+  if (c.subtype or c.strict_sub) and skind != OK_TUPLE:
     let sn = c.objs[so].node
     req_opt = not (sn >= 0 and (c.t.nd[sn].k == ast.N_OBJECT or c.t.nd[sn].k == ast.N_ARRAY))
   # (the subtype relations, an object literal's type as the target, not widened: a source
@@ -2242,17 +3728,17 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
       if bind.get_prop(&c, t, name) >= 0: continue
       let sp0 = bind.get_prop(&c, s, name)
       if sp0 < 0: continue
-      return false
+      return rfail(&c, "structural: sp0 < 0: continue", false)
   let tnames = bind.prop_names(&c, t)
   for name in tnames:
     let tp = bind.get_prop(&c, t, name)
-    if (req_opt or (c.sflags[tp] & SF_OPTIONAL) == 0) and src_prop(&c, s, name) < 0: return false
+    if (req_opt or (c.sflags[tp] & SF_OPTIONAL) == 0) and src_prop(&c, s, name) < 0: return rfail(&c, "structural: (req_opt or (c.sflags[tp] & SF_OPTIONAL) == 0) and src_prop(&c, s, name) < 0", false)
   for name in tnames:
     let tp = bind.get_prop(&c, t, name)
     let sp = src_prop(&c, s, name)
     if sp < 0:
       if (c.sflags[tp] & SF_OPTIONAL) != 0: continue
-      return false
+      return rfail(&c, "structural: (c.sflags[tp] & SF_OPTIONAL) != 0: continue", false)
     # private members are nominal (the same declaration only); a protected one is fitted by
     # an override in a class derived from its own
     if sp != tp:
@@ -2260,21 +3746,36 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
       let tf = c.sflags[tp]
       # (two instantiations of one generic class: the same declaration)
       let same_decl = c.sdecl[sp] >= 0 and c.sdecl[sp] == c.sdecl[tp]
-      if ((sf | tf) & types.SF_PRIVATE) != 0 and not same_decl: return false
+      if ((sf | tf) & types.SF_PRIVATE) != 0 and not same_decl: return rfail(&c, "structural: ((sf | tf) & types.SF_PRIVATE) != 0 and not same_decl", false)
       if (tf & types.SF_PROTECTED) != 0 and not same_decl:
         let sown = c.sparent[sp]
         let to2 = c.sparent[tp]
-        if sown != to2 and not (sown >= 0 and to2 >= 0 and chk.derives_from(&c, sown, to2)): return false
-      elif (sf & types.SF_PROTECTED) != 0 and not same_decl: return false
+        if sown != to2 and not (sown >= 0 and to2 >= 0 and chk.derives_from(&c, sown, to2)): return rfail(&c, "structural: sown != to2 and not (sown >= 0 and to2 >= 0 and chk.derives_from(&c, sown, to2))", false)
+      elif (sf & types.SF_PROTECTED) != 0 and not same_decl: return rfail(&c, "structural: (sf & types.SF_PROTECTED) != 0 and not same_decl", false)
+    # (optional in the source, required in the target: not related, whatever their types, except
+    # when comparing; propertyRelatedTo's Property_0_is_optional_in_type_1_but_required_in_type_2)
+    if not c.comparable and (c.sflags[sp] & SF_OPTIONAL) != 0 and (c.sflags[tp] & SF_OPTIONAL) == 0: return rfail(&c, "structural: an optional property to a required one", false)
+    # (the subtype relations: a readonly property isn't a subtype of a mutable one, propertiesRelatedTo;
+    # DOMException's readonly message keeps it beside Error)
+    if (c.subtype or c.strict_sub) and (c.sflags[sp] & types.SF_READONLY) != 0 and (c.sflags[tp] & types.SF_READONLY) == 0: return rfail(&c, "structural: a readonly property to a mutable one under a subtype relation", false)
+    # (two spread copies of one property, or a copy and the property: one type)
+    if sp != tp:
+      let so0 = bind.spread_origin(&c, sp)
+      if so0 >= 0 and so0 == bind.spread_origin(&c, tp): continue
     # (this in the target's member types: the target itself, as a type reference's members have
     # it, resolveTypeReferenceMembers)
+    # (exactOptionalPropertyTypes: both without an optional property's missing undefined)
     var tt = bind.prop_type_for(&c, tp, t)
-    if (c.sflags[tp] & SF_OPTIONAL) != 0: tt = types.union_of(&c, [tt, c.undef_t])
+    if (c.sflags[tp] & SF_OPTIONAL) != 0 and not c.exact_opt: tt = types.union_of(&c, [tt, c.undef_t])
     var st = bind.prop_type_for(&c, sp, s)
-    if (c.sflags[sp] & SF_OPTIONAL) != 0: st = types.union_of(&c, [st, c.undef_t])
+    if (c.sflags[sp] & SF_OPTIONAL) != 0 and not c.exact_opt: st = types.union_of(&c, [st, c.undef_t])
     if not assignable(&c, st, tt):
       if c.debug and c.all_reasons: eprint("PROPFAIL {bind.nm(c, name)}: {show.show(&c, st)} TO {show.show(&c, tt)}")
+      if c.trace_rel: return rfail(&c, "structural: property '" + bind.nm(c, name) + "' type", false)
       return false
+    # (an optional property for a required one: TS2327, propertyRelatedTo, outside the comparable
+    # relation)
+    if not c.comparable and (c.sflags[sp] & SF_OPTIONAL) != 0 and (c.sflags[tp] & SF_OPTIONAL) == 0: return rfail(&c, "structural: property '" + bind.nm(c, name) + "' optional for a required one", false)
   # signatures (instantiations of one declaration's: pairwise, as tsc)
   let tsgs = bind.sigs_of(&c, t, false)
   let ssgs = bind.sigs_of(&c, s, false)
@@ -2284,7 +3785,11 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
       if c.sigs[tsgs[i]].node < 0 or c.sigs[tsgs[i]].node != c.sigs[ssgs[i]].node: pairwise = false
   if pairwise:
     for i in 0..tsgs.len:
-      if not sig_assignable(&c, ssgs[i], tsgs[i]): return false
+      if not sig_erased(&c, ssgs[i], tsgs[i]): return rfail(&c, "structural: not sig_erased(&c, ssgs[i], tsgs[i])", false)
+  elif tsgs.len == 1 and ssgs.len == 1:
+    # (one signature each: a generic source's type parameters inferred from the target, not erased,
+    # signaturesRelatedTo)
+    if not sig_single(&c, ssgs[0], tsgs[0]): return rfail(&c, "structural: not sig_single(&c, ssgs[0], tsgs[0])", false)
   else:
     for tsg in tsgs:
       var ok = false
@@ -2292,21 +3797,27 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
         if sig_assignable(&c, ssg, tsg):
           ok = true
           break
-      if not ok: return false
+      if not ok: return rfail(&c, "structural: not ok", false)
   # (an abstract class's static side: its construct signatures are abstract)
   var s_abstract = false
   if s in c.static_side:
     let cd = c.sdecl[c.static_side[s]]
     s_abstract = cd >= 0 and (c.t.nd[cd].f & ast.M_ABSTRACT) != 0
-  for tsg in bind.sigs_of(&c, t, true):
+  let tcs = bind.sigs_of(&c, t, true)
+  let scs = bind.sigs_of(&c, s, true)
+  for tsg in tcs:
     var ok = false
-    for ssg in bind.sigs_of(&c, s, true):
+    for ssg in scs:
       # (an abstract construct signature isn't a concrete one)
       if (s_abstract or abstract_sig(c, ssg)) and not abstract_sig(c, tsg): continue
-      if sig_assignable(&c, ssg, tsg):
+      if tcs.len == 1 and scs.len == 1:
+        if sig_single(&c, ssg, tsg):
+          ok = true
+          break
+      elif sig_assignable(&c, ssg, tsg):
         ok = true
         break
-    if not ok: return false
+    if not ok: return rfail(&c, "structural: not ok", false)
   # (the {} that narrowing unknown gives has no implicit index signature: no symbol,
   # isObjectTypeWithInferableIndex; an object or type literal's type has one, instantiated too,
   # unless it has call or construct signatures)
@@ -2322,7 +3833,7 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
   if tsi >= 0 and c.tk[tsi] != TK_ANY:
     let ssi = bind.index_type(&c, s, false)
     if ssi >= 0:
-      if not assignable(&c, ssi, tsi): return false
+      if not assignable(&c, ssi, tsi): return rfail(&c, "structural: not assignable(&c, ssi, tsi)", false)
     elif implicit_idx:
       for name in bind.prop_names(&c, s):
         # (a unique symbol's property isn't a string-named one)
@@ -2331,25 +3842,28 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
         var gt = bind.type_of_sym(&c, gp)
         # (an optional property: without undefined, getNonMissingTypeOfSymbol)
         if (c.sflags[gp] & SF_OPTIONAL) != 0: gt = types.filter_union(&c, gt, true, false)
-        if not assignable(&c, gt, tsi): return false
-    else: return false
+        if not assignable(&c, gt, tsi): return rfail(&c, "structural: not assignable(&c, gt, tsi)", false)
+      # (its number index signature applies to a string key too, membersRelatedToIndexer)
+      let sni1 = bind.index_type(&c, s, true)
+      if sni1 >= 0 and not assignable(&c, sni1, tsi): return rfail(&c, "structural: number index to string index", false)
+    else: return rfail(&c, "structural: else", false)
   let tni = bind.index_type(&c, t, true)
   if tni >= 0 and not (tsi >= 0 and c.tk[tni] == TK_ANY):
     let sni = bind.index_type(&c, s, true)
     if sni >= 0:
-      if not assignable(&c, sni, tni): return false
+      if not assignable(&c, sni, tni): return rfail(&c, "structural: not assignable(&c, sni, tni)", false)
     elif tsi < 0:
       let ssi2 = bind.index_type(&c, s, false)
       if ssi2 >= 0:
-        if not assignable(&c, ssi2, tni): return false
+        if not assignable(&c, ssi2, tni): return rfail(&c, "structural: not assignable(&c, ssi2, tni)", false)
       elif implicit_idx:
         for name in bind.prop_names(&c, s):
           let v = float(c.t.names[name]) else -1.0
           let gp = bind.get_prop(&c, s, name)
           var gt = bind.type_of_sym(&c, gp)
           if (c.sflags[gp] & SF_OPTIONAL) != 0: gt = types.filter_union(&c, gt, true, false)
-          if v >= 0.0 and not assignable(&c, gt, tni): return false
-      else: return false
+          if v >= 0.0 and not assignable(&c, gt, tni): return rfail(&c, "structural: v >= 0.0 and not assignable(&c, gt, tni)", false)
+      else: return rfail(&c, "structural: else", false)
   # template literal index signatures: the source's of the same key, else an object literal type's
   # properties the key matches (membersRelatedToIndexer)
   if c.ta[t] in c.tidx and not (tsi >= 0 and c.tk[tsi] == TK_ANY):
@@ -2366,33 +3880,42 @@ fn structural(var c: C, s: Int, t: Int) -> Bool:
         while si2 < sxs.len:
           if sxs[si2] == tkey:
             found = true
-            if not assignable(&c, sxs[si2 + 1], tval): return false
+            if not assignable(&c, sxs[si2 + 1], tval): return rfail(&c, "structural: not assignable(&c, sxs[si2 + 1], tval)", false)
           si2 += 3
       if found: continue
       let ssi3 = bind.index_type(&c, s, false)
       if ssi3 >= 0:
-        if not assignable(&c, ssi3, tval): return false
+        if not assignable(&c, ssi3, tval): return rfail(&c, "structural: not assignable(&c, ssi3, tval)", false)
         continue
-      if not (implicit_idx): return false
+      if not (implicit_idx): return rfail(&c, "structural: not (implicit_idx)", false)
       for name in bind.prop_names(&c, s):
         if c.t.names[name].startswith("["): continue
         if not types.tmpl_matches(c, c.t.names[name] + "", tkey): continue
         let gp = bind.get_prop(&c, s, name)
         var gt = bind.type_of_sym(&c, gp)
         if (c.sflags[gp] & SF_OPTIONAL) != 0: gt = types.filter_union(&c, gt, true, false)
-        if not assignable(&c, gt, tval): return false
+        if not assignable(&c, gt, tval): return rfail(&c, "structural: not assignable(&c, gt, tval)", false)
   # a symbol index signature: the source's own, or an object literal type's (no symbol keys
   # modeled: nothing to check)
   let tyi = bind.symbol_index(&c, t)
   if tyi >= 0 and not (tsi >= 0 and c.tk[tsi] == TK_ANY):
     let syi = bind.symbol_index(&c, s)
     if syi >= 0:
-      if not assignable(&c, syi, tyi): return false
-    elif not (implicit_idx): return false
+      if not assignable(&c, syi, tyi): return rfail(&c, "structural: not assignable(&c, syi, tyi)", false)
+    elif not (implicit_idx): return rfail(&c, "structural: not (implicit_idx)", false)
   return true
 
 fn sig_ret(var c: C, sg: Int) -> Int:
   if c.sigs[sg].ret >= 0: return c.sigs[sg].ret
+  # (circular only when asked for in one of its own return expressions, as tsc's TS7023: its return
+  # type comes from those; read elsewhere in its body, checked in order here (tsc defers that),
+  # the return type isn't known yet: any for now, and inferred still)
+  if sg in c.ret_pending:
+    let fnode = c.sigs[sg].node
+    var in_ret = false
+    for x in c.ret_exprs:
+      if x == fnode: in_ret = true
+    if in_ret: c.ret_circ[sg] = true
   return c.any_t
 
 # Whether a signature returns a type predicate (x is T).
@@ -2475,6 +3998,24 @@ fn abstract_sig(c: C, sg: Int) -> Bool:
 fn sig_assignable(var c: C, ssg0: Int, tsg: Int) -> Bool:
   return sig_rel(&c, ssg0, tsg, 0)
 
+# (instantiations of one declaration's signatures, pairwise: compareSignaturesRelated with both
+# erased, their type parameters any, signaturesRelatedTo)
+fn sig_erased(var c: C, ssg0: Int, tsg: Int) -> Bool:
+  let w = c.sig_erase
+  c.sig_erase = true
+  let r = sig_rel(&c, ssg0, tsg, 0)
+  c.sig_erase = w
+  return r
+
+# (the only signature of each: compareSignaturesRelated without erasing, a generic source
+# instantiated in the context of the target)
+fn sig_single(var c: C, ssg0: Int, tsg: Int) -> Bool:
+  let w = c.sig_infer
+  c.sig_infer = true
+  let r = sig_rel(&c, ssg0, tsg, 0)
+  c.sig_infer = w
+  return r
+
 # A parameter's type with exactly one call signature (and no construct signatures), not generic
 # and no predicate: a callback (compareSignaturesRelated); else -1.
 fn callback_sig(var c: C, t: Int) -> Int:
@@ -2495,26 +4036,72 @@ fn nullish_facts(c: C, t: Int) -> Int:
     if k == TK_ANY or k == TK_UNKNOWN: r = r | 3
   return r
 
+# isTopSignature: no type parameters, one rest parameter of any or never (or an array of them),
+# returning any or unknown.
+fn top_sig(c: C, sg: Int) -> Bool:
+  if c.sigs[sg].tparams.len > 0 or c.sigs[sg].ptypes.len != 1 or c.sigs[sg].pflags[0] != 2: return false
+  let th = c.sigs[sg].this_t
+  if th >= 0 and c.tk[th] != TK_ANY: return false
+  var rt = c.sigs[sg].ptypes[0]
+  if c.tk[rt] == TK_OBJ and c.objs[c.ta[rt]].kind == OK_REF and c.objs[c.ta[rt]].args.len == 1 and c.objs[c.ta[rt]].sym >= 0 and c.t.names[c.sname[c.objs[c.ta[rt]].sym]] == "Array": rt = c.objs[c.ta[rt]].args[0]
+  if c.tk[rt] != TK_ANY and c.tk[rt] != TK_NEVER: return false
+  let r = c.sigs[sg].ret
+  return r >= 0 and (c.tk[r] == TK_ANY or c.tk[r] == TK_UNKNOWN)
+
+# getErasedSignature: a signature with its type parameters any.
+fn erase_sig(var c: C, sg: Int) -> Int:
+  # (once per signature, as tsc caches it: each comparison making new instantiations would defeat
+  # the instantiation caches)
+  if sg in c.erased_sig: return c.erased_sig[sg]
+  var anys: [Int] = []
+  for x in types.ints(c.sigs[sg].tparams): anys.push(c.any_t)
+  let m = types.new_mapper(&c, types.ints(c.sigs[sg].tparams), anys)
+  let r = bind.inst_sig(&c, sg, m)
+  c.sigs[r].tparams = []
+  c.erased_sig[sg] = r
+  c.erased_sig[r] = r
+  return r
+
 # mode 0: signatures; 1: a callback parameter's, strictly; 2: bivariantly (its return too).
-fn sig_rel(var c: C, ssg0: Int, tsg: Int, mode: Int) -> Bool:
+fn sig_rel(var c: C, ssg0: Int, tsg0: Int, mode: Int) -> Bool:
+  var tsg = tsg0
+  let infer_src = c.sig_infer
+  c.sig_infer = false
+  let erase_both = c.sig_erase
+  c.sig_erase = false
   # (one declaration instantiated the same way: identical)
   if ssg0 == tsg or same_sig(c, ssg0, tsg): return true
+  # (a top signature, (...args: any) => any: every signature relates to it, isTopSignature)
+  if not c.strict_sub and top_sig(c, tsg): return true
   var ssg = ssg0
   # (both generic with identical type parameters: the source's as the target's)
   var unified = false
+  # (erased: each one's type parameters any)
+  if erase_both:
+    if c.sigs[ssg].tparams.len > 0: ssg = erase_sig(&c, ssg)
+    if c.sigs[tsg].tparams.len > 0: tsg = erase_sig(&c, tsg)
+    unified = true
   # (the same type parameters: one declaration's signature)
   if c.sigs[ssg].tparams.len > 0 and c.sigs[ssg].tparams.len == c.sigs[tsg].tparams.len:
     var same_tps = true
     for i in 0..c.sigs[ssg].tparams.len:
       if c.sigs[ssg].tparams[i] != c.sigs[tsg].tparams[i]: same_tps = false
     if same_tps: unified = true
+  # (a generic target seen through an instantiation, UseFormSetValue<Data>'s: its type parameters
+  # fresh, their constraints instantiated, as tsc's instantiated signature has them; before the
+  # source's identical ones are taken as the target's, which then have those constraints)
+  if not unified and c.sigs[tsg].tparams.len > 0 and tsg in c.sig_outer: tsg = chk.fresh_tparams_sig(&c, tsg)
   if not unified and c.sigs[ssg].tparams.len > 0 and c.sigs[ssg].tparams.len == c.sigs[tsg].tparams.len:
     let um = chk.identical_tparams(&c, tsg, ssg)
     if um >= 0:
       ssg = bind.inst_sig(&c, ssg, um)
       c.sigs[ssg].tparams = []
       unified = true
-  # a generic source: its type parameters erased to any
+  # a generic source: its type parameters inferred from the target (instantiateSignatureInContextOf);
+  # comparing, or with a rest parameter, erased to any
+  if not unified and c.sigs[ssg].tparams.len > 0 and not c.comparable and infer_src:
+    let isg = chk.sig_in_context_of(&c, ssg, tsg)
+    if isg >= 0: ssg = isg
   if not unified and c.sigs[ssg].tparams.len > 0:
     var anys: [Int] = []
     for x in types.ints(c.sigs[ssg].tparams): anys.push(c.any_t)
@@ -2541,7 +4128,13 @@ fn sig_rel(var c: C, ssg0: Int, tsg: Int, mode: Int) -> Bool:
     else: tmax = 1000000
   # (getMinArgumentCount: a trailing parameter of a type with void may be left out)
   if chk.void_min(c, ssg) > tmax: return false
-  let strict = c.sigs[tsg].node >= 0 and c.t.nd[c.sigs[tsg].node].k == ast.N_TFUNC
+  # (strictFunctionTypes false: every parameter bivariantly, as a method's)
+  # (strictVariance: a target declared as anything but a method or a constructor, a function
+  # declaration or expression, an arrow, a call signature, a function type)
+  let tdn = c.sigs[tsg].node
+  var tdk = -1
+  if tdn >= 0: tdk = c.t.nd[tdn].k
+  let strict = not c.sft_off and tdn >= 0 and (tdk == ast.N_TFUNC or tdk == ast.N_FUNC or tdk == ast.N_FUNCEXPR or tdk == ast.N_ARROW or tdk == ast.N_CALLSIG or tdk == ast.N_CTORSIG)
   var n = c.sigs[ssg].ptypes.len
   if s_has_rest: n = c.sigs[ssg].ptypes.len - 1
   if tmax < 1000000 and tmax > n and s_has_rest: n = tmax
@@ -2660,6 +4253,27 @@ fn report_target(var c: C, s: Int, t: Int) -> Int:
 # Reports s not assignable to t at node, as TypeScript would (the first line of its message).
 # expr is the source expression (-1 if none), for errors moved onto the parts of literals.
 fn report(var c: C, s0: Int, t0: Int, node: Int, expr: Int, code: Int):
+  if c.trace_rel and c.trace_lines.len > 0:
+    eprint("TRACE-REL at {c.t.nd[node].pos} (file {c.t.nd[node].file}): innermost first")
+    for tl in c.trace_lines: eprint(tl)
+    c.trace_lines = []
+  # (exactOptionalPropertyTypes: an error about undefined for an optional property is worded
+  # differently, TS2375 / TS2379 / TS2412: not modeled)
+  if c.exact_opt and node >= 0 and node in c.exact_targets and (code == 2322 and has_undef(c, s0)):
+    let xs = show.show(&c, s0)
+    let xt = show.show(&c, t0)
+    bind.err(&c, node, 2412, "Type '" + xs + "' is not assignable to type '" + xt + "' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the type of the target.")
+    return
+  if c.exact_opt and (code == 2322 or code == 2345) and exact_mismatch(&c, s0, t0):
+    let ys = show.show(&c, s0)
+    let yt = show.show(&c, t0)
+    if code == 2322: bind.err(&c, node, 2375, "Type '" + ys + "' is not assignable to type '" + yt + "' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.")
+    else: bind.err(&c, node, 2379, "Argument of type '" + ys + "' is not assignable to parameter of type '" + yt + "' with 'exactOptionalPropertyTypes: true'. Consider adding 'undefined' to the types of the target's properties.")
+    return
+  if c.exact_opt and exact_mismatch(&c, s0, t0):
+    let ue = bind.unsupported(&c, node, "an error under exactOptionalPropertyTypes")
+    bind.touch(&c, ue)
+    return
   # (an argument whose parameter type a const type parameter's inference made: tsc's order of its
   # union isn't modeled, so the message is left to tsgolint)
   if expr >= 0 and expr in c.noshow_args:
@@ -2678,7 +4292,12 @@ fn report(var c: C, s0: Int, t0: Int, node: Int, expr: Int, code: Int):
     report(&c, s0, t0s, node, expr, code)
     return
   # an object literal typed as a union (a spread of a union): the first member that fails
-  if c.tk[s] == TK_UNION and expr >= 0 and c.t.nd[expr].k == ast.N_OBJECT:
+  # (elaborateObjectLiteral: only into a target that isn't primitive)
+  var t_obj = false
+  for tm in types.members(c, t0):
+    let tmk = c.tk[tm]
+    if tmk == TK_OBJ or tmk == TK_INTER or tmk == TK_NONPRIM or tmk == TK_TPARAM or tmk >= types.TK_KEYOF: t_obj = true
+  if t_obj and c.tk[s] == TK_UNION and expr >= 0 and c.t.nd[expr].k == ast.N_OBJECT:
     var all_fresh = true
     for mi177_ in 0..types.nmem(c, s):
       let m = types.mem(c, s, mi177_)
@@ -2812,7 +4431,10 @@ fn known_prop(var c: C, t: Int, name: Int) -> Bool:
   return false
 
 # The same object literal type without freshness (its properties shared).
+# (once per literal: its relations then share the copy, and the relation cache finds them)
 fn unfresh(var c: C, s: Int) -> Int:
+  let hit = c.unfresh_of.get(s, -1)
+  if hit >= 0: return hit
   let so = c.ta[s]
   let r = types.anon_obj(&c, -1, c.objs[so].node)
   let ro = c.ta[r]
@@ -2824,6 +4446,7 @@ fn unfresh(var c: C, s: Int) -> Int:
   c.objs[ro].nidx = c.objs[so].nidx
   if so in c.yidx: c.yidx[ro] = c.yidx[so]
   c.objs[ro].resolved = true
+  c.unfresh_of[s] = r
   return r
 
 # hasExcessProperties' reduced target: the union members a discriminant property allows.
@@ -2840,10 +4463,43 @@ fn is_unitish(c: C, t: Int) -> Bool:
     if k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_NULL or k == TK_UNDEF: return true
   return false
 
+# getExactOptionalUnassignableProperties: a target's optional property whose type has no undefined,
+# given a source property that may be undefined.
+fn exact_mismatch(var c: C, s: Int, t: Int) -> Bool:
+  if c.tk[s] != TK_OBJ: return false
+  for mi_x in 0..types.nmem(c, t):
+    let tm = types.mem(c, t, mi_x)
+    for ii_x in 0..types.ninter(c, tm):
+      let ti = types.inter_at(c, tm, ii_x)
+      if c.tk[ti] != TK_OBJ: continue
+      for name in bind.prop_names(&c, ti):
+        let tp = bind.get_prop(&c, ti, name)
+        if tp < 0 or (c.sflags[tp] & SF_OPTIONAL) == 0: continue
+        let tpt = bind.prop_type_for(&c, tp, ti)
+        if has_undef(c, tpt): continue
+        let sp = bind.get_prop(&c, s, name)
+        if sp < 0: continue
+        let spt = opt_prop_type(&c, sp)
+        if has_undef(c, spt): return true
+  return false
+
+fn has_undef(c: C, t: Int) -> Bool:
+  for mi_u in 0..types.nmem(c, t):
+    let k = c.tk[types.mem(c, t, mi_u)]
+    if k == TK_UNDEF or k == TK_ANY or k == TK_UNKNOWN: return true
+  return false
+
 # A property's type as read (an optional one includes undefined).
 fn opt_prop_type(var c: C, p: Int) -> Int:
   let pt = bind.type_of_sym(&c, p)
-  if (c.sflags[p] & SF_OPTIONAL) != 0: return types.union_of(&c, [pt, c.undef_t])
+  if (c.sflags[p] & SF_OPTIONAL) != 0:
+    # (T | undefined made once a property: discriminate asks for it per member and property)
+    let k = (p << 32) | pt
+    let v = c.optp_cache.get(k, -1)
+    if v >= 0: return v
+    let u = types.union_of(&c, [pt, c.undef_t])
+    c.optp_cache[k] = u
+    return u
   return pt
 
 # typeRelatedToDiscriminatedType: an object whose discriminant properties are unions of literals
@@ -2860,14 +4516,28 @@ fn disc_related(var c: C, s: Int, t: Int) -> Bool:
     if sp < 0: continue
     let st = bind.type_of_sym(&c, sp)
     if c.tk[st] != TK_UNION or not all_units(c, st): continue
-    # (a discriminant of the target: a unit type in some member)
+    # (a discriminant of the target: a unit type in some member; an intersection member, the
+    # JSX props IntrinsicAttributes & FilledSelectProps & ..., by its members' property)
     var disc = false
     for mi in 0..types.nmem(c, t):
       let m = types.mem(c, t, mi)
-      if c.tk[m] != TK_OBJ: continue
-      let tp = bind.get_prop(&c, m, name)
-      if tp < 0: continue
-      let tt = bind.type_of_sym(&c, tp)
+      if c.tk[m] != TK_OBJ and c.tk[m] != TK_INTER: continue
+      var tt = -1
+      if c.tk[m] == TK_INTER:
+        # (the members' types of it intersected, the intersection's synthetic property:
+        # variant: 'filled' & (SelectVariants | undefined))
+        var its: [Int] = []
+        for ii_dp in 0..types.ninter(c, m):
+          let im = types.inter_at(c, m, ii_dp)
+          if c.tk[im] != TK_OBJ: continue
+          let ip = bind.get_prop(&c, im, name)
+          if ip >= 0: its.push(bind.type_of_sym(&c, ip))
+        if its.len == 0: continue
+        tt = types.inter_of(&c, its)
+      else:
+        let tp = bind.get_prop(&c, m, name)
+        if tp < 0: continue
+        tt = bind.type_of_sym(&c, tp)
       if types.is_literal(c, tt) or c.tk[tt] == TK_NULL or c.tk[tt] == TK_UNDEF: disc = true
     if not disc: continue
     dnames.push(name)
@@ -2889,7 +4559,11 @@ fn disc_related(var c: C, s: Int, t: Int) -> Bool:
       else:
         let ns = types.new_sym(&c, types.S_PROP, name, c.sdecl[sp])
         c.stype[ns] = dvals[di][idx[di]]
-        c.sflags[ns] = c.sflags[sp]
+        # (an optional discriminant to a required one: related, propertyRelatedTo's skipOptional
+        # with strictNullChecks; its value is the combination's)
+        var dfl = c.sflags[sp]
+        if not c.snc_off and (dfl & types.SF_OPTIONAL) != 0: dfl = dfl - types.SF_OPTIONAL
+        c.sflags[ns] = dfl
         types.add_prop(&c, o, name, ns)
     c.objs[c.ta[o]].resolved = true
     var ok = false
@@ -2911,6 +4585,49 @@ fn disc_related(var c: C, s: Int, t: Int) -> Bool:
 
 # findMatchingDiscriminantType / discriminateTypeByDiscriminableItems: -1 when nothing is ruled out.
 fn discriminate(var c: C, s: Int, t: Int) -> Int:
+  # (memoized by the pair and the relation's modes, as assignable is; not when deciding it
+  # touched what isn't modeled, which the file asking would need to know)
+  var key = (s << 32) | t
+  if c.permissive: key = key | (1 << 61)
+  if c.restrictive: key = key | (1 << 60)
+  if c.inter_src: key = key | (1 << 59)
+  if c.subtype: key = key | (1 << 58)
+  if c.comparable: key = key | (1 << 57)
+  if c.strict_sub: key = key | (1 << 56)
+  if c.narrow_sub: key = key | (1 << 55)
+  let hit = c.disc_cache.get(key, -2)
+  if hit != -2: return hit
+  let seq0 = c.unsup_seq
+  let r = discriminate1(&c, s, t)
+  if c.unsup_seq == seq0: c.disc_cache[key] = r
+  return r
+
+# Whether name discriminates union t's members (dms: their object types, -1 for others): the
+# index of their property types in c.disc_lists, -1 if it doesn't.
+fn disc_info(var c: C, t: Int, dms: [Int], name: Int) -> Int:
+  let key = (t << 32) | name
+  let hit = c.disc_info.get(key, -2)
+  if hit != -2: return hit
+  var pts: [Int] = []
+  var ptypes: [Int] = []
+  var unit = false
+  for m in dms:
+    var pt = -1
+    if m >= 0:
+      let p = bind.get_prop(&c, m, name)
+      if p >= 0:
+        pt = opt_prop_type(&c, p)
+        if is_unitish(c, pt): unit = true
+        if not types.has_int(ptypes, pt): ptypes.push(pt)
+    pts.push(pt)
+  var r = -1
+  if unit and ptypes.len >= 2:
+    r = c.disc_lists.len
+    c.disc_lists.push(pts)
+  c.disc_info[key] = r
+  return r
+
+fn discriminate1(var c: C, s: Int, t: Int) -> Int:
   let ms = types.members(c, t)
   var inc: [Int] = []
   # (an intersection of object types is a member too, by its combined properties)
@@ -2924,30 +4641,26 @@ fn discriminate(var c: C, s: Int, t: Int) -> Int:
     else: inc.push(0)
   var any_disc = false
   for name in bind.prop_names(&c, s):
-    # a discriminant: its types differ across the members and one of them has a unit type
-    var ptypes: [Int] = []
-    var unit = false
-    for m in dms:
-      if m < 0: continue
-      let p = bind.get_prop(&c, m, name)
-      if p < 0: continue
-      let pt = opt_prop_type(&c, p)
-      if is_unitish(c, pt): unit = true
-      if not types.has_int(ptypes, pt): ptypes.push(pt)
-    if not unit or ptypes.len < 2: continue
+    # a discriminant: its types differ across the members and one of them has a unit type (per
+    # union and name: disc_info, the members' property types, -1 where a member has none)
+    let di = disc_info(&c, t, dms, name)
+    if di < 0: continue
     any_disc = true
     let sp = bind.get_prop(&c, s, name)
     let st = bind.type_of_sym(&c, sp)
     var matched = false
     for i in 0..ms.len:
       if inc[i] != 1: continue
-      let p = bind.get_prop(&c, dms[i], name)
-      if p < 0: continue
-      let pt = opt_prop_type(&c, p)
+      let pt = c.disc_lists[di][i]
+      if pt < 0: continue
       var rel_ok = false
       for mi184_ in 0..types.nmem(c, st):
         let sm = types.mem(c, st, mi184_)
-        if assignable(&c, sm, pt): rel_ok = true
+        # (a literal to a literal, neither an enum member's: the same literal or not, without
+        # the relation's cache lookup, one per member of a large union)
+        if types.is_literal(c, sm) and types.is_literal(c, pt) and not (sm in c.enum_base) and not (pt in c.enum_base):
+          if types.regular(c, sm) == types.regular(c, pt): rel_ok = true
+        elif assignable(&c, sm, pt): rel_ok = true
       if rel_ok: matched = true
       else: inc[i] = 3
     for i in 0..ms.len:
@@ -2980,6 +4693,13 @@ fn excess(var c: C, s: Int, t0: Int, node: Int) -> Bool:
       var shown = t
       if c.tk[t] == TK_UNION: shown = types.union_of(&c, objs)
       let h4_ = show.show(&c, shown)
+      # (a JSX element's attributes: TS2322 on the attribute, its chain's property line not printed,
+      # checkJsxOpeningLikeElementOrOpeningFragment's elaboration)
+      let on = c.objs[so].node
+      if on >= 0 and on < c.parent.len and c.parent[on] >= 0 and c.t.nd[c.parent[on]].k == ast.N_JSXELEM:
+        let ss = show.show(&c, s)
+        bind.err(&c, at, 2322, "Type '" + ss + "' is not assignable to type '" + h4_ + "'.")
+        return true
       # (a property written in the literal: a spelling suggestion among the target's properties,
       # getSuggestedSymbolForNonexistentProperty; a union's are those of all its members)
       if named:
@@ -3145,7 +4865,12 @@ fn tmpl_tmpl(var c: C, s: Int, t: Int) -> Bool:
   let smp = types.tmpl_mapping(c, s)
   let tmp = types.tmpl_mapping(c, t)
   if tmp != "":
-    if smp == tmp: return true
+    # (the same mapping: what each maps related, string to `${string & {}}` not)
+    if smp == tmp:
+      let sh0 = types.tmpl_holes(c, s)[0]
+      let th0 = types.tmpl_holes(c, t)[0]
+      if c.tk[sh0] == TK_STRING and c.tk[th0] == types.TK_TEMPLATE: return false
+      return true
     if smp != "" or c.tk[types.tmpl_holes(c, t)[0]] != TK_STRING: return false
     return tmpl_fixed_by(c, s, tmp)
   let sm = c.tmpls[c.ta[s]]
@@ -3546,10 +5271,25 @@ fn key_set(var c: C, s: Int) -> {Int: Bool}:
 
 # Moves the error onto the parts of an object or array literal (elaborateError): each property or
 # element whose type doesn't fit is reported where it's written. True if anything was reported.
-fn elaborate(var c: C, e0: Int, t: Int, code: Int) -> Bool:
-  if did_you_mean(&c, e0, t, code): return true
+fn as_const(c: C, n: Int) -> Bool:
+  let tn = c.t.nd[n].b
+  if tn < 0 or c.t.nd[tn].k != ast.N_TREF: return false
+  let a = c.t.nd[tn].a
+  return a >= 0 and c.t.nd[a].k == ast.N_ID and bind.nm(c, c.t.nd[a].s) == "const"
+
+fn elaborate(var c: C, e0: Int, t0: Int, code: Int) -> Bool:
+  if did_you_mean(&c, e0, t0, code): return true
+  # (one type with null or undefined, an optional parameter's: elaborated against that type)
+  var t = t0
+  if c.tk[t0] == TK_UNION:
+    var rest: [Int] = []
+    for mi_e in 0..types.nmem(c, t0):
+      let m = types.mem(c, t0, mi_e)
+      if c.tk[m] != TK_UNDEF and c.tk[m] != TK_NULL: rest.push(m)
+    if rest.len == 1 and c.tk[rest[0]] == TK_INTER: t = rest[0]
   var e = e0
-  while c.t.nd[e].k == ast.N_PAREN: e = c.t.nd[e].a
+  # (through parentheses and as const, elaborateError)
+  while c.t.nd[e].k == ast.N_PAREN or (c.t.nd[e].k == ast.N_AS and as_const(c, e)): e = c.t.nd[e].a
   # a union of primitives only isn't elaborated into (like a primitive target)
   if c.tk[t] == TK_UNION:
     # (a union of strings is: each member's String has a number index)
@@ -3557,13 +5297,37 @@ fn elaborate(var c: C, e0: Int, t: Int, code: Int) -> Bool:
     var all_str = true
     for mi191_ in 0..types.nmem(c, t):
       let m = types.mem(c, t, mi191_)
-      if c.tk[m] == TK_OBJ: has_obj = true
+      if c.tk[m] == TK_OBJ or c.tk[m] == TK_INTER: has_obj = true
       if c.tk[m] != TK_STRING and c.tk[m] != TK_STRLIT: all_str = false
     if not has_obj and not (all_str and c.t.nd[e].k == ast.N_ARRAY): return false
   let k = c.t.nd[e].k
+  # (a property a later spread replaced: elaborateElementwise's source is the literal's type's
+  # property, the spread's; elaborating into a written literal value with it isn't modeled)
+  var replaced: {Int: Bool} = {}
+  var inner_rep = false
   if k == ast.N_OBJECT and e in c.spread_replaced:
-    bind.unsupported(&c, e, "an error in an object literal where a spread replaces a property")
-    return true
+    if e in c.spread_rep_names:
+      for k1, v1 in c.spread_rep_names[e]: replaced[k1] = v1
+    var deep = not (e in c.spread_rep_names) or not (e in c.ntype)
+    for p0 in ast.items(c.t, c.t.nd[e].a):
+      # (a replaced property's object, array, function or conditional value: in the loop below,
+      # where the property fails)
+      if c.t.nd[p0].k == ast.N_PROPASSIGN and c.t.nd[c.t.nd[p0].a].k != ast.N_COMPUTED and c.t.nd[c.t.nd[p0].a].s in replaced:
+        var v0 = c.t.nd[p0].b
+        while c.t.nd[v0].k == ast.N_PAREN: v0 = c.t.nd[v0].a
+        let vk = c.t.nd[v0].k
+        if vk == ast.N_OBJECT or vk == ast.N_ARRAY or vk == ast.N_ARROW or vk == ast.N_FUNCEXPR or vk == ast.N_COND: inner_rep = true
+        continue
+      if c.t.nd[p0].k == ast.N_SHORTHAND and c.t.nd[p0].s in replaced: inner_rep = true
+      elif c.t.nd[p0].k != ast.N_PROPASSIGN and c.t.nd[p0].k != ast.N_SPREAD:
+        let pn0 = bind.member_name(&c, p0)
+        # (a method a spread replaced: not modeled; a shorthand is related with the property's type,
+        # below, as elaborateElementwise with no inner expression)
+        if c.t.nd[p0].k != ast.N_SHORTHAND and pn0 >= 0 and pn0 in replaced: deep = true
+    if deep:
+      if c.all_reasons: eprint("VREASON-SPREPL {show.show(&c, c.ntype[e])} -> {show.show(&c, t)}")
+      bind.unsupported(&c, e, "an error in an object literal where a spread replaces a property")
+      return true
   if k == ast.N_OBJECT and (c.tk[t] == TK_OBJ or c.tk[t] == TK_INTER or (c.tk[t] == TK_UNION and t != c.boolean_t)):
     var any = false
     for p in ast.items(c.t, c.t.nd[e].a):
@@ -3622,7 +5386,7 @@ fn elaborate(var c: C, e0: Int, t: Int, code: Int) -> Bool:
         else:
           # (this in it: the target)
           tt = bind.prop_type_for(&c, tp, t)
-          if (c.sflags[tp] & SF_OPTIONAL) != 0: tt = types.union_of(&c, [tt, c.undef_t])
+          if (c.sflags[tp] & SF_OPTIONAL) != 0 and not c.exact_opt: tt = types.union_of(&c, [tt, c.undef_t])
       else:
         tt = union_prop(&c, t, name)
         if tt < 0:
@@ -3633,12 +5397,56 @@ fn elaborate(var c: C, e0: Int, t: Int, code: Int) -> Bool:
             tt = union_prop(&c, best, name)
             if tt < 0: continue
           else:
-            if c.tk[best] != TK_OBJ: continue
-            let tp = bind.get_prop(&c, best, name)
+            # (an intersection member: its members' properties together)
+            var bo = best
+            if c.tk[best] == TK_INTER:
+              let bic = inter_combined(&c, best)
+              if bic >= 0: bo = bic
+            if c.tk[bo] != TK_OBJ: continue
+            let tp = bind.get_prop(&c, bo, name)
             if tp < 0: continue
-            tt = bind.prop_type_for(&c, tp, best)
-            if (c.sflags[tp] & SF_OPTIONAL) != 0: tt = types.union_of(&c, [tt, c.undef_t])
+            tt = bind.prop_type_for(&c, tp, bo)
+            if (c.sflags[tp] & SF_OPTIONAL) != 0 and not c.exact_opt: tt = types.union_of(&c, [tt, c.undef_t])
       var vt = c.any_t
+      if (pk == ast.N_PROPASSIGN or pk == ast.N_SHORTHAND) and name in replaced:
+        let sp1 = bind.get_prop(&c, c.ntype[e], name)
+        if sp1 < 0: continue
+        vt = bind.type_of_sym(&c, sp1)
+        if (c.sflags[sp1] & SF_OPTIONAL) != 0: vt = types.union_of(&c, [vt, c.undef_t])
+        if assignable(&c, vt, tt): continue
+        # (a shorthand that fails: its type is the literal's widened one, not modeled)
+        if pk == ast.N_SHORTHAND:
+          bind.unsupported(&c, e, "an error in an object literal where a spread replaces a property")
+          return true
+        # (an object literal value: elaborateError into it with the property's type, each of its
+        # properties' types there against the target's; one that fails isn't modeled, else the
+        # error is on the property, as below)
+        var v1 = val
+        while v1 >= 0 and c.t.nd[v1].k == ast.N_PAREN: v1 = c.t.nd[v1].a
+        if v1 >= 0:
+          let vk1 = c.t.nd[v1].k
+          if vk1 == ast.N_ARRAY or vk1 == ast.N_ARROW or vk1 == ast.N_FUNCEXPR or vk1 == ast.N_COND:
+            bind.unsupported(&c, e, "an error in an object literal where a spread replaces a property")
+            return true
+        if v1 >= 0 and c.t.nd[v1].k == ast.N_OBJECT:
+          let ri = replaced_inner(&c, v1, vt, tt)
+          if ri == 2:
+            bind.unsupported(&c, e, "an error in an object literal where a spread replaces a property")
+            return true
+          # (its properties fail as with their own types: the literal's own elaboration)
+          if ri == 1 and elaborate(&c, v1, tt, 2322):
+            any = true
+            continue
+        any = true
+        # (the message names the written value's type where it fails too, else the spread's)
+        if val >= 0 and val in c.ntype:
+          let wt = recheck(&c, val, vt)
+          if not assignable(&c, wt, tt): vt = wt
+        if c.tk[vt] == TK_OBJ and c.tk[tt] == TK_OBJ and missing(&c, vt, tt, at): continue
+        let g1r = report_target(&c, vt, tt)
+        let h5r = not_assignable_msg(&c, vt, g1r, 2322)
+        bind.err(&c, at, 2322, h5r)
+        continue
       if val >= 0 and val in c.ntype:
         vt = c.ntype[val]
         let sp = bind.get_prop(&c, c.ntype[e], name)
@@ -3657,6 +5465,12 @@ fn elaborate(var c: C, e0: Int, t: Int, code: Int) -> Bool:
       let g1_95 = report_target(&c, vt, tt)
       let h5_ = not_assignable_msg(&c, vt, g1_95, 2322)
       bind.err(&c, at, 2322, h5_)
+    # (JSX attributes with a replaced object, array, function or shorthand value and no property
+    # found failing: a union props type's relation this doesn't model (a calendar component's props), so
+    # not a whole-object error; an object literal's is tsc's whole-object error)
+    if not any and inner_rep and c.parent[e] >= 0 and c.t.nd[c.parent[e]].k == ast.N_JSXELEM:
+      bind.unsupported(&c, e, "an error in an object literal where a spread replaces a property")
+      return true
     return any
   if k == ast.N_ARROW and c.tk[t] == TK_OBJ and c.t.nd[e].d >= 0 and c.t.nd[c.t.nd[e].d].k != ast.N_BLOCK:
     for p in ast.items(c.t, c.t.nd[e].b):
@@ -3706,6 +5520,23 @@ fn elaborate(var c: C, e0: Int, t: Int, code: Int) -> Bool:
       # (a tuple target: elements by the source tuple's index, which a spread shifts: those
       # before it only)
       if c.objs[to].kind == OK_TUPLE and c.t.nd[el].k == ast.N_SPREAD: break
+      # (an array target: a spread of a type parameter is its own element, its iterated type
+      # (the constraint's element type) reported at the spread, elaborateElementwise)
+      if c.t.nd[el].k == ast.N_SPREAD and is_array_ref(&c, t) and c.t.nd[el].a in c.ntype:
+        let sx = c.ntype[c.t.nd[el].a]
+        var sel = -1
+        if chk.generic_array_like(&c, sx):
+          let sb = chk.base_constraint(&c, sx, 0)
+          if is_array_ref(&c, sb): sel = c.objs[c.ta[sb]].args[0]
+        i += 1
+        if sel < 0: continue
+        let stt = c.objs[to].args[0]
+        if assignable(&c, sel, stt): continue
+        any = true
+        let g2s = report_target(&c, sel, stt)
+        let h6s = not_assignable_msg(&c, sel, g2s, 2322)
+        bind.err(&c, el, 2322, h6s)
+        continue
       if c.t.nd[el].k == ast.N_SPREAD or c.t.nd[el].k == ast.N_OMIT:
         i += 1
         continue
@@ -3736,8 +5567,143 @@ fn elaborate(var c: C, e0: Int, t: Int, code: Int) -> Bool:
       if inner: continue
       var at = el
       while c.t.nd[at].k == ast.N_PAREN: at = c.t.nd[at].a
+      # (an object literal element with a property the target lacks: TS2353 there, as the
+      # element's own relation reports it; one in an as const array)
+      let raw0 = c.ntype[el]
+      if c.tk[raw0] == TK_OBJ and c.tk[tt] == TK_OBJ and excess(&c, raw0, tt, at): continue
       let g2_95 = report_target(&c, vt, tt)
       let h6_ = not_assignable_msg(&c, vt, g2_95, 2322)
       bind.err(&c, at, 2322, h6_)
     return any
   return false
+
+# A replaced property's object literal value, elaborated into with the property's type (vt, the
+# literal's and the spread's union) against the target's (elaborateElementwise; a member without the
+# property gives nothing for it, getIndexedAccessTypeOrUndefined): 0 when no property fails there,
+# 1 when the ones that fail are those that fail with their own types and their values are plain
+# (no deeper elaboration: the literal's own elaboration is tsc's), 2 otherwise (not modeled).
+fn replaced_inner(var c: C, v: Int, vt: Int, tt: Int) -> Int:
+  if c.tk[tt] != TK_OBJ or not (v in c.ntype): return 2
+  let own = c.ntype[v]
+  if c.tk[own] != TK_OBJ: return 2
+  var r = 0
+  for q in ast.items(c.t, c.t.nd[v].a):
+    if c.t.nd[q].k != ast.N_PROPASSIGN or c.t.nd[c.t.nd[q].a].k == ast.N_COMPUTED: return 2
+    let qn = c.t.nd[c.t.nd[q].a].s
+    let tq0 = src_prop(&c, tt, qn)
+    if tq0 < 0: continue
+    var tq = bind.prop_type_for(&c, tq0, tt)
+    if (c.sflags[tq0] & SF_OPTIONAL) != 0 and not c.exact_opt: tq = types.union_of(&c, [tq, c.undef_t])
+    var us: [Int] = []
+    var all = true
+    for mi in 0..types.nmem(c, vt):
+      let m = types.mem(c, vt, mi)
+      if c.tk[m] == types.TK_UNDEF: continue
+      if c.tk[m] != TK_OBJ: return 2
+      let mp = bind.get_prop(&c, m, qn)
+      if mp < 0:
+        all = false
+        break
+      var mt = bind.type_of_sym(&c, mp)
+      if (c.sflags[mp] & SF_OPTIONAL) != 0: mt = types.union_of(&c, [mt, c.undef_t])
+      us.push(mt)
+    if not all or us.len == 0: continue
+    let uq = types.union_of(&c, us)
+    let u_ok = assignable(&c, uq, tq)
+    let op = bind.get_prop(&c, own, qn)
+    if op < 0: return 2
+    let ot = bind.type_of_sym(&c, op)
+    let o_ok = assignable(&c, ot, tq)
+    if u_ok != o_ok: return 2
+    if not u_ok:
+      var qv = c.t.nd[q].b
+      while qv >= 0 and c.t.nd[qv].k == ast.N_PAREN: qv = c.t.nd[qv].a
+      let qk = c.t.nd[qv].k
+      if qk == ast.N_OBJECT or qk == ast.N_ARRAY or qk == ast.N_ARROW or qk == ast.N_FUNCEXPR or qk == ast.N_COND: return 2
+      r = 1
+  return r
+
+# isLiteralType: a unit type, or a union of them (boolean too).
+fn literal_type(c: C, t: Int) -> Bool:
+  for mi_l in 0..types.nmem(c, t):
+    let k = c.tk[types.mem(c, t, mi_l)]
+    if not (k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_NULL or k == TK_UNDEF): return false
+  return types.nmem(c, t) > 0
+
+# getReducedType's isNeverReducedProperty, the discriminant case: an intersection of object types
+# where a property of two or more of them (required in one), of literal types that differ, has
+# the type never: { status: 'active' } & { status: 'done' } is never.
+fn never_reduced(var c: C, t: Int) -> Bool:
+  if c.tk[t] != TK_INTER: return false
+  if t in c.never_red: return c.never_red[t]
+  let r = never_reduced1(&c, t)
+  c.never_red[t] = r
+  return r
+
+fn never_reduced1(var c: C, t: Int) -> Bool:
+  var objs: [Int] = []
+  for ii_r in 0..types.ninter(c, t):
+    let m = types.inter_at(c, t, ii_r)
+    if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind != types.OK_MAPPED: objs.push(m)
+  if objs.len < 2: return false
+  var seen: {Int: Bool} = {}
+  for i in 0..objs.len - 1:
+    for name in bind.prop_names(&c, objs[i]):
+      if name in seen: continue
+      seen[name] = true
+      var pts: [Int] = []
+      var req = false
+      var lit = false
+      for j in i..objs.len:
+        let ps = bind.get_prop(&c, objs[j], name)
+        if ps < 0: continue
+        if (c.sflags[ps] & SF_OPTIONAL) == 0: req = true
+        let pt = opt_prop_type(&c, ps)
+        if literal_type(c, pt): lit = true
+        if not types.has_int(pts, pt): pts.push(pt)
+      if pts.len < 2 or not req or not lit: continue
+      let it = types.inter_of(&c, pts)
+      if c.tk[it] == TK_NEVER: return true
+  return false
+
+# getReducedType of a union: its never-reduced intersections left out (-1: none are).
+fn reduce_union(var c: C, t: Int) -> Int:
+  if c.tk[t] != TK_UNION: return -1
+  var keep: [Int] = []
+  var any_red = false
+  for mi_u in 0..types.nmem(c, t):
+    let m = types.mem(c, t, mi_u)
+    if c.tk[m] == TK_INTER and never_reduced(&c, m): any_red = true
+    else: keep.push(m)
+  if not any_red: return -1
+  if keep.len == 0: return c.never_t
+  return types.union_of(&c, keep)
+
+# The optionalsOnly check of an intersection source that relates by one member: each optional
+# property of the target the intersection has, its members' types intersected, against the target's.
+fn inter_optionals_ok(var c: C, s: Int, t: Int) -> Bool:
+  let ok = c.objs[c.ta[t]].kind
+  if ok == OK_TUPLE or bind.is_array_like_ref(&c, t) or tyops.is_generic(&c, t): return true
+  var ms: [Int] = []
+  for ii in 0..types.ninter(c, s):
+    let m = types.inter_at(c, s, ii)
+    if m == t: return true
+    let am = apparent(&c, m)
+    if c.tk[am] != TK_OBJ: return true
+    ms.push(am)
+  for name in bind.prop_names(&c, t):
+    let tp = bind.get_prop(&c, t, name)
+    if tp < 0 or (c.sflags[tp] & SF_OPTIONAL) == 0: continue
+    var pts: [Int] = []
+    for m in ms:
+      let sp = bind.get_prop(&c, m, name)
+      if sp >= 0: pts.push(bind.prop_type_for(&c, sp, m))
+    if pts.len < 1: continue
+    var st = pts[0]
+    if pts.len > 1: st = types.inter_of(&c, pts)
+    let tt0 = bind.prop_type_for(&c, tp, t)
+    let ud = c.undef_t
+    let tt = types.union_of(&c, [tt0, ud])
+    if c.tk[st] == TK_UNSUP or c.tk[tt] == TK_UNSUP: return true
+    if not assignable(&c, st, tt): return false
+  return true

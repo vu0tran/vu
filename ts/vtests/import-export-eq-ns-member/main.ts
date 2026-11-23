@@ -1,0 +1,11 @@
+import { run, Ctx, each, forEach } from "fk";
+const a: number = run;
+declare const c: Ctx;
+const b: number = c.name;
+const e: string = each;
+const f: string = forEach;
+import mk, { type Err, isErr } from "he";
+const g: string = isErr;
+const h: string = mk(1).code;
+declare const i: Err;
+const j: string = i.code;

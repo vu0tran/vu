@@ -1,0 +1,17 @@
+declare const p1: ((a: string) => number) | ((a: string, b?: number) => string);
+const r1: boolean = p1("x", 1);
+declare const p2: { (a: string, b?: number): number; (a: number): number } | ((a: string) => string);
+const r2: boolean = p2("x", 1);
+declare const p3: { <T>(a: T): T; <T>(a: T, b: number): T } | ((a: string) => number);
+const r3: boolean = p3("x");
+const r3b: boolean = p3("x", 2);
+declare const p4: ((a: string) => number) | { <T>(a: T): T; <T>(a: T, b: number): T };
+const r4: boolean = p4("x", 2);
+declare const p5: { <T>(a: T): T; <T>(a: T, b: number): T } | (<U>(a: U) => number);
+const r5: boolean = p5("x");
+declare const p6: { <T>(a: T): T; <T>(a: T, b: number): T } | ((a: string) => number) | ((a: "x") => string);
+const r6: boolean = p6("x");
+declare const p7: { <T extends string>(a: T): T; <T extends string>(a: T, b: number): T } | (<U extends string>(a: U) => number);
+const r7: boolean = p7("x");
+declare const p8: { (a: string): number; (a: number): number } | { (a: string): string; (a: boolean): string };
+const r8: boolean = p8("x");

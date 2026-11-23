@@ -1,0 +1,16 @@
+type Neg<S> = S extends `-${infer P extends number}` ? P : never;
+const a: string = null as unknown as Neg<'-1'>;
+type B<S> = S extends `${infer P extends boolean}` ? P : 0;
+const b: string = null as unknown as B<'true'>;
+type C<S> = S extends `${infer P extends 1 | 2 | 'x'}` ? P : 0;
+const c: string = null as unknown as C<'2'>;
+const c2: string = null as unknown as C<'x'>;
+type D<S> = S extends `${infer P extends number}px` ? P : 0;
+const d: string = null as unknown as D<'12px' | '3.5px'>;
+type E<S> = S extends `${infer P extends `a${string}`}!` ? P : 0;
+const e: string = null as unknown as E<'ab!'>;
+type F<S> = S extends `${infer P extends null | undefined}` ? P : 0;
+const f: string = null as unknown as F<'null'>;
+declare function g<T extends number>(x: `n${T}`): T;
+const h: string = g('n5');
+export {};

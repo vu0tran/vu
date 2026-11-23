@@ -1,0 +1,24 @@
+// which operators keep the error type: + with it on either side does (checkBinaryLikeExpression)
+import { G } from '@gql';
+declare const g: G;
+declare const a: any;
+declare const b: boolean;
+export const v1 = g.n ?? 0;
+export const v2 = (g.n ?? 0) + 1;
+export const v3 = g.n + 1;
+export const v4 = 1 + g.n;
+export const v5 = a + 1;
+export const v6 = b ? a : g.n;
+export const v7 = b ? g.n : a;
+export const v8 = g.n || 'x';
+export const v9 = g.n && 'x';
+export const v10 = g.n - 1;
+export const v11 = [g.n][0];
+export const v12 = a ?? g.n;
+export const v13 = g.n * a;
+export const v14 = `${g.n}`;
+export const v15 = (b ? a : g.n) + 1;
+export const v16 = g.n!;
+export const v17 = -g.n;
+export const v18 = typeof g.n;
+export const v19 = g.n as unknown as G;

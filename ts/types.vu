@@ -5,6 +5,9 @@ import ast
 import parse
 import chk
 import tyops
+import bind
+import show
+import rel
 
 # kinds
 const TK_ANY = 1
@@ -33,6 +36,7 @@ const TK_TEMPLATE = 23    # a template literal type with holes, `a${string}b` (a
 const TK_KEYOF = 24       # keyof T, deferred while T is generic (a: T)
 const TK_INDEXED = 25     # T[K], deferred (a: object type, b: index type)
 const TK_COND = 26        # a conditional type, deferred (a: node, b: mapper)
+const TK_NOINFER = 27     # NoInfer<T> of a generic T (a: T): T, except that nothing is inferred to it
 
 # TypeScript's TypeFlags values, in TypeScript 7's order, used to sort union members
 const F_ANY = 1
@@ -128,6 +132,8 @@ type LoopRec:
   bad: Bool        # a labeled jump or a type that isn't known: the loop isn't modeled
   pre: {Str: Int}  # do-while: the types reaching the condition
   node: Int = -1   # the loop (a labeled jump's target)
+  base: Int = -1   # a switch: the narrowing frame its clause being checked starts at
+  snaps: [{Str: Int}] = []  # a switch: what's known at each break inside a clause (that frame on)
 
 type C:
   t: ast.Ast
@@ -192,7 +198,7 @@ type C:
   rets_seen: [[Int]]       # return expression types per function (for inference)
   this_stack: [Int]
   node_file: Int           # the file being checked
-  rel_cache: {Int: Bool}   # s << 32 | t (| 1 << 62 without the weak check) -> assignable
+  rel_cache: {Int: Int}    # (1 related, 0 not) s << 32 | t (| 1 << 62 without the weak check) -> assignable
   ptype_ctx: {Int: Int}    # parameter node -> its contextual type
   ret_ctx: {Int: Int}      # function node -> its contextual return type
   fsig: {Int: Int}         # function node -> its signature
@@ -259,16 +265,27 @@ type C:
   var_cache: {Int: Int}    # (symbol << 8 | type parameter index) -> its measured variance
   elem_key_full: Int       # the whole union of literal keys an element access is split over (-1)
   spread_replaced: {Int: Bool} # object literals where a spread replaced a property written before it
+  spread_rep_names: {Int: {Int: Bool}} = {} # (with spread_replaced) the names a spread replaced, by literal
   pkg_res: {Str: Str} = {}    # file path + "|" + package specifier -> the declarations it resolved to
+  cjs_ts: {Int: Bool} = {}     # TypeScript files that are CommonJS (node16 module rules), by file index
+  cjs_dts: {Int: Bool} = {}    # packages' declaration files that are CommonJS (node16 module rules)
+  js_imps: {Str: Bool} = {}    # file path + "|" + relative specifier naming a JavaScript file (no TypeScript one)
   es_deco_ok: {Int: Bool} = {}  # decorators checked as TC39's (without experimentalDecorators)
   fail_ret: {Int: Int} = {}   # a signature with explicit type arguments -> its return type when its arguments fail (defaults as written)
   cjs_roots: {Int: Bool} = {} # JavaScript files that are CommonJS modules (require calls, module.exports), by root
+  cjs_exp: {Int: Int} = {}    # a CommonJS module's one module.exports = x: x, by root
+  cjs_exp_t: {Int: Int} = {}  # its type, by module
+  cjs_mod_t: {Int: Int} = {}  # a CommonJS file's module, { exports: its value }, by file
+  cjs_xs_t: {Int: Int} = {}   # a CommonJS file's exports, from its exports.x = v statements, by file (-3 while typed)
   pkg_files: {Int: Bool} = {} # files loaded for packages' types: declared, not checked or reported
+  never_red: {Int: Bool} = {}  # an intersection -> whether getReducedType makes it never (rel.never_reduced, computed once as tsc's IsNeverIntersectionComputed)
+  var_unrel: {Int: Bool} = {}  # (symbol << 8 | type parameter index) whose variance was measured through a mapped type: VarianceFlags.Unreliable
   chain_raw: {Int: Int} = {}  # a link of an optional chain -> its type without the undefined the chain adds
   merged_ns: {Int: Int} = {}  # a function, class or variable -> the namespace of the same name merged with it
   export_eq: {Int: Int} = {}  # module file -> what its export = names (a symbol)
   amb: {Str: Int} = {}        # an ambient module's name (declare module "fs") -> its module index (AMB_BASE + n)
   amb_short: {Str: Bool} = {}  # shorthand ambient modules (declare module "x";): every import of them is any
+  amb_order: {Str: Int} = {}  # an ambient module's name -> the order its first declaration was read in (program order)
   amb_bodies: {Int: [Int]} = {} # an ambient module -> the bodies of its declarations
   aug_target: {Int: Int} = {}  # a module augmentation's body (declare module "./x" { ... } in a module) -> the module it augments
   ret_mapper: Int = -1        # while checking a generic call's arguments: what the call's contextual type alone infers (returnMapper)
@@ -276,6 +293,7 @@ type C:
   cond_depth: Int = 0         # conditional types being resolved inside one another
   mapped_depth: Int = 0       # mapped types being made inside one another (properties are made eagerly)
   inf_fixing: Bool = false    # inf_mapper for a context-sensitive argument's parameters: the inferences are fixed (literals widen)
+  inf_ctx: Int = -1           # inf_mapper for a context-sensitive argument's contextual type: the type parameter that is that whole type (-1 none)
   outer_tps: [Int] = []       # the type parameters of the generic calls whose arguments are being checked
   assert_mode: Bool = false   # facts of a call to an assertion function (asserts x is T)
   shell_busy: {Int: Bool} = {}  # a union alias being made: whether something took its (still empty) union
@@ -286,13 +304,30 @@ type C:
   inter_report_off: Bool = false  # (testing) errors against intersections not reported
   spi: Bool = true            # strictPropertyInitialization (TS2564)
   npai: Bool = false          # noPropertyAccessFromIndexSignature (the type-aware rules read it)
+  no_trunc: Bool = false      # noErrorTruncation: typeToString never elides (the type-aware rules' messages)
   allow_unreach: Bool = false # allowUnreachableCode: true
   unknown_catch: Bool = true  # useUnknownInCatchVariables (else a catch variable is any)
+  exact_opt: Bool = false     # exactOptionalPropertyTypes: an optional property's undefined is only for reading
+  snc_off: Bool = false       # strictNullChecks false: null and undefined in every type's domain, left out of unions
+  nia_off: Bool = false       # noImplicitAny false: no implicit-any errors
+  sft_off: Bool = false       # strictFunctionTypes false: function parameters compared bivariantly
+  sbca_off: Bool = false      # strictBindCallApply false: call, apply and bind are Function's (any)
+  nit_off: Bool = false       # noImplicitThis false: no error for this of type any
+  exact_targets: {Int: Bool} = {}  # assignment targets written by that rule (their errors are worded differently)
+  nuia: Bool = false          # noUncheckedIndexedAccess: a read through an index signature may be undefined
+  noinfer_of_t: {Int: Int} = {}  # T -> NoInfer<T>
+  exp_cycle: Bool = false        # an export * cycle met while a module's exports were made
+  prov_this: {Int: Int} = {}     # an object literal still being typed -> this in its accessors
+  exp_partial: [Int] = []        # modules whose exports were made inside an open cycle
+  nuia_write: Bool = false    # the access being checked is a simple assignment's target
+  idx_hit: Bool = false       # the access being checked was answered by an index signature
   side_unchecked: Bool = false  # noUncheckedSideEffectImports false: import "x" isn't resolved for errors
   meta_ok: Bool = false  # import.meta allowed by the module option
+  mod_node: Bool = false  # module node16 to nodenext: import.meta allowed in ESM files
   tla_ok: Bool = false   # top-level await allowed by the module option (es2022, esnext, preserve)
   infer_depth: Int = 0        # infer_in calls inside one another (isDeeplyNestedType's limit)
   js_this: {Int: [Int]} = {}  # a JavaScript class's this.x property -> its assignments (the constructor's negative)
+  js_expando: {Int: Bool} = {}  # a JavaScript {} expando object's property (its assignments in js_this)
   js_this_base: {Int: Int} = {}  # ... the inherited property it declares again
   eager_decl: Bool = false    # (VTSC_EAGER_DECL) declare-only files' declarations typed eagerly
   decl_files: {Int: Bool} = {}  # files this worker only declares (another checks them)
@@ -301,12 +336,52 @@ type C:
   inf_ts: [Int] = []
   inf_src: [Int] = []    # inference into conditional types: the sources on the way down (invokeOnce's stacks)
   inf_root: [Int] = []   # ... and the conditional types' declarations
+  fn_arg_raw: {Int: Int} = {}  # chk: a function argument of a generic call inferring its type arguments -> the declared parameter type (for the lint's getContextualType)
+  ret_ctx_raw: {Int: Int} = {}  # chk.fn_sig_ctx: a function's contextual return type before the call's return mapper instantiated it (for the lint's getContextualType)
   lit_ctx: {Int: Int} = {}    # an object literal -> its contextual type (-1 none), for this in its methods
   meth_this: {Int: Int} = {}  # an object literal's method -> its contextual signature's this type
+  defer_narrow: {Int: [{Str: Int}]} = {}   # a deferred function body -> the narrowings where it was
+  const_spread_pick: {Int: Int} = {}   # a const object literal's spread of a union -> the member being spread
+  lazy_from: [Int] = []           # the expressions whose reading started each symbol type being found
+  lazy_sym: [Int] = []            # ... and those symbols
+  sym_reenter: {Int: Bool} = {}   # mapped properties instantiated again inside their own instantiation
+  lazy_busy: {Int: [Int]} = {}    # mapped properties being instantiated: their lazy_inst entry
+  alias_busy: {Int: Bool} = {}    # aliases being resolved (their sdtype the error placeholder)
+  cyc_hits: Int = 0               # readings of such a placeholder
+  cyc_taint: [Int] = []           # symbols whose types read one: made again once the alias is
+  cyc_tset: {Int: Bool} = {}      # ... as a set
+  cyc_fset: {Int: Bool} = {}      # declarations whose cached signatures (fsig) read one
+  cyc_sigs: {Int: Int} = {}       # signatures of function types that read one -> their node, made again after
+  cyc_aliases: [Int] = []         # aliases that came out as the placeholder by reading one: made again after
+  cyc_lazy: {Int: [Int]} = {}     # ... a mapped property's lazy_inst entry, to make it again
+  infer_fns: [Int] = []           # the function declarations whose return types are being inferred
+  ret_exprs: [Int] = []          # chk: the functions whose return expressions are being checked, innermost last (rel.sig_ret's TS7023)
+  ret_pending: {Int: Bool} = {}  # chk: a function's signature its variable already has, its return type being inferred
+  ret_circ: {Int: Bool} = {}  # rel: such a signature whose return type was asked for meanwhile (circular: any, TS7023)
+  fn_var_hook: {Int: [Int]} = {}  # chk: a function expression initializing a variable whose type is being found -> [the variable, the function's type], given to the variable once the parameters are known
+  defer_bodies: {Int: [Int]} = {}  # a variable whose type is being found -> functions in its initializer whose bodies wait for it
+  circ_reads: Int = 0             # reads of a variable while its own type is being found (any)
+  spec_syms: [Int] = []            # while spec > 0: the symbols whose types were found (reset for a deferred body)
+  spec_fns: [Int] = []             # while spec > 0: the function expressions typed (their parameters' contexts reset)
+  spec_fn: [Int] = []              # the functions whose return types are being inferred that way (function_expr), innermost last
+  spec_keep: [parse.Diag] = []     # errors of declarations outside them, typed meanwhile: kept
+  kept: [parse.Diag] = []          # errors of deferred function bodies (run_deferred), kept from what drops the errors around them
+  defer_reset: {Int: [Int]} = {}   # a deferred function whose return type was inferred -> [symbols..., -1, functions...] to find again
+  fn_names: {Int: {Int: Bool}} = {}  # a function expression -> the names its nodes have (chk.mentions_pending)
+  pat_busy: {Int: Bool} = {}       # a destructuring pattern whose initializer is being checked (chk.pattern_sym_type)
+  pat_circ: Bool = false           # a binding of such a pattern was read: its any isn't kept as its type
   tmpls: [Tmpl] = []          # template literal types (TK_TEMPLATE's a)
   tmpl_ids: {Str: Int} = {}   # their texts and holes -> the type
   tuple_labels: {Int: [Int]} = {}  # a tuple made from parameters -> their names (labels)
+  trace_rel: Bool = false     # (VTSC_TRACE_REL) each failed relation's chain printed where its error is reported
+  trace_why: Str = ""         # the check that made the innermost relation fail
+  trace_lines: [Str] = []     # failed relations since the last top-level one, innermost first
+  trace_depth: Int = 0
+  trace_stk: [Int] = []       # (VTSC_TRACE_REL) the relations being decided, s and t in pairs, printed under an unsupported one
   all_reasons: Bool = false   # (VTSC_ALL_REASONS) every reason a file isn't checked, printed as found
+  nt_log: [Int] = []       # (an aliased condition re-read) node, type it had before, in pairs: restored after
+  alias_clones: {Int: Int} = {}  # (an instantiation << 32 | an alias written as it) -> its copy named by that alias
+  biglits: {Str: Int} = {} # a bigint literal's decimal text (with -) -> its regular literal type
   yidx: {Int: Int} = {}      # an object (objs index) -> its symbol index signature's type
   try_rec: [{Str: [Int]}] = []  # per try block being checked: each reference's flow types right after its assignments
   reset_why: Str = ""        # (debug) what reset a reference's flow type
@@ -315,7 +390,12 @@ type C:
   forin_pat: {Int: [Int]} = {} # for ([a, b] of xs) over existing a, b: their keys' symbols and body types, in pairs
   strict_sub: Bool = false   # relating under strictSubtypeRelation (removeSubtypes)
   computed_lits: {Int: Bool} = {} # object literals with computed names of string or number type
+  base_sigs: {Int: Int} = {}
+  alias_top: {Int: Bool} = {}   # an alias symbol declared outside functions and classes (rel.same_alias)
+  unfresh_of: {Int: Int} = {}  # a fresh object literal's type without freshness (rel.unfresh)   # a generic signature's base signature (chk.base_sig)
+  sig_infer: Bool = false    # relating the only signature of each type: a generic source inferred from the target (rel.sig_single)
   erasing: Bool = false      # instantiating a signature with its type parameters erased to any
+  sig_erase: Bool = false    # relating instantiations of one declaration's signatures pairwise: both erased (rel.sig_erased)
   spread_array: Bool = false # an array was spread into an object literal
   union_spread: Bool = false  # spreading one member of a union
   bare_opt: {Int: Bool} = {}  # optional properties printed without the undefined (an intersection's)
@@ -326,10 +406,14 @@ type C:
   resolved_sig: {Int: Int} = {}
   call_sig: {Int: Int} = {}   # a call -> the signature its result came from (for the type-aware rules)
   keep_ctx: Bool = false      # record nctx (the type-aware rules that ask for contextual types are on)
+  tl_import: Bool = false     # the last lookup_type found an import (a named import of a type)
+  unres_names: {Int: Int} = {} # a written name (interned) -> its unresolved type, which prints it
+  ref_via_import: Bool = false # the type reference being made names an import: its alias keeps the written arguments
   nctx: {Int: Int} = {}       # an expression -> the contextual type it was last checked with
   call_this: Int = -1  # a call's this, for a generic signature declaring this
   unsup_seq: Int = 0  # unsupported types made or touched so far
   last_unsup: Int = -1  # the latest of them
+  tq_flow: {Int: Int} = {}   # a type query node -> its type where it is (read in its flow)
   rule_why: Str = ""    # (trules) why the rules couldn't run over the last file
   show_al: Int = 0      # (show) the node builder's approximate length so far
   show_tr: Bool = false # (show) past it: eliding
@@ -337,6 +421,9 @@ type C:
   show_depth: Int = 0   # (show) how deep a type is being printed
   prop_err_t: Int = -1  # (a union's member) the type a missing property's TS2339 names
   inst_count: Int = 0   # instantiations since the statement began (bind.instantiate)
+  inst_limit: Int = 5000000  # (VTSC_INST_LIMIT) the instantiations a statement may make before its file isn't checked: tsc's limit (400k, which no statement of the corpus reaches on one worker, was reached on fewer, a worker counting the instantiations of lib types the files it hadn't checked would have cached)
+  inst_stmt: Int = -1   # that statement (for VTSC_DEBUG)
+  inst_hist: {Str: Int} = {}   # VTSC_INST_HIST: what instantiate is asked for
   inst_gcache: {Int: Int} = {}  # a union, intersection, conditional, indexed access, keyof or template's instantiation by a mapper
   file_inst: Int = 0    # ... since the file's check began
   lb_keep: Bool = false # (rel.key_lower_bound) keep generic keys
@@ -346,6 +433,9 @@ type C:
   expect_ranges: {Int: [Int]} = {}  # file -> (start, end, directive start) of the lines @ts-expect-error governs
   expect_presumed: {Int: Bool} = {}  # (file << 32 | directive start): an error presumed there (not modeled)
   expect_unsup: {Int: Int} = {}  # an unsupported type made in such a line -> the range's index
+  arr_assigned: {Str: Bool} = {}  # evolving arrays (let x = []) assigned an array somewhere: their joins reduce by subtypes
+  auto_evo: {Str: Int} = {}  # the evolving array types an auto-typed variable (let x;) made one by x = [] has had: "key#type"
+  fn_cont: Int = -1  # the function whose body's flow is being checked (-1: the file's)
   evo_arg: {Int: Int} = {}  # an evolving array's push argument -> its type the first time (a loop checks it again)
   narrow_sub: Bool = false  # relating as type predicate narrowing does (isTypeStrictSubtypeOf)
   inter_red: Int = 0    # (inter_of) inside a type parameter's constraint for a reduction
@@ -372,13 +462,17 @@ type C:
   this_pred: {Int: Int} = {}  # a signature -> its this is T predicate's type (instantiated with it)
   tlen_sym: {Int: Int} = {}  # a tuple type -> its length property (a literal length, a union of them, or number)
   order_decl: {Int: Int} = {}  # a mapped type's property: the declaration tsc 7 orders it by (-1: none, last)
+  frank: [Int] = []        # file -> its place in tsc's program order (tsc_order), -1 not there
   inst_noacc: Bool = false   # an indexed access made by instantiation (no access node)
   tp_con: {Int: Int} = {}    # a fresh type parameter's symbol -> its constraint (-1: none)
   fresh_sig: {Int: Int} = {} # a contextual signature -> it with fresh type parameters
+  mapped_fresh_p: {Int: Int} = {} # a generic mapped type -> its own type parameter made fresh, constrained by its keys
+  erased_sig: {Int: Int} = {} # a signature -> it with its type parameters any (rel.erase_sig, getErasedSignature)
   tidx: {Int: [Int]} = {}    # an object (objs index) -> its template literal index signatures (key, value pairs)
   cond_busy: {Str: Int} = {}  # conditional types being resolved: how many times inside one another
   cond_shell: {Str: Int} = {}  # ... and the (still empty) union a third one got
   mtmpl: {Int: Int} = {}      # a mapped type node -> a symbol whose type is its template (for lazy properties)
+  mapped_m: {Int: Int} = {}   # a mapped type made over concrete keys (its object) -> the mapper it was made with, without the key
   compose_cache: {Int: Int} = {}     # two mappers composed (m1 << 32 | m2)
   mapper_ids: {Int: [Int]} = {}      # new_mapper: the mappers by their lists' hash
   mentions_this: {Int: Bool} = {}    # a member's node mentions this (bind.node_mentions_this)
@@ -391,12 +485,16 @@ type C:
   phase_n: [Int] = [0, 0, 0, 0]
   stat_cnt: {Int: Int} = {}
   debug_counts: Bool = false
+  debug_inst: Bool = false
+  inst_hist_from: Int = 300000
   debug_node: Int = -1
   debug_hitn: Int = -1
   debug_file: Int = -2
   sigs_cache: {Int: [Int]} = {}      # bind.sigs_of of an instantiated object: (t << 1 | ctor) -> its signatures
   ctx_used: {Int: Int} = {}          # a context-sensitive argument: the parameter type its signature was made for
   ctx_rmap: {Int: Int} = {}          # ... and the return mapper
+  ovl_args: {Int: Bool} = {}         # chk.choose: a call that is an argument of an overloaded call being resolved
+  ovl_frozen: {Int: Int} = {}        # ... its type, found once, with the first candidate's context (tsc's resolvedSignature)
   call_memo: {Int: [Int]} = {}       # chk.call: a call's last result (the enclosing call's epoch, ctx, return mapper, loop pass, narrow depth, type)
   epoch_stack: [Int] = []
   epoch_ctr: Int = 0
@@ -405,12 +503,20 @@ type C:
   intern_at: {Int: [Int]} = {}
   inst_icache: {Int: Int} = {}       # bind.instantiate: (t << 32 | m) -> its instantiation
   inst_acache: {Int: Int} = {}       # ... an aliased union's, with its alias
+  alias_inst: {Str: Int} = {}        # an aliased anonymous type's instantiation by its alias's arguments (bind.instantiate1)
+  outer_map: Int = -1               # chk.instantiate_call: the outer call's inferences so far, for an argument that's a call (cloneInferenceContext NoDefault)
+  ns_kids: {Int: {Int: Int}} = {}    # namespace a.b.c written dotted: a namespace symbol's inner levels by name
+  ns_inner: {Int: Int} = {}          # ... a dotted namespace declaration -> its innermost level's symbol (its body's)
+  ns_chain: {Int: [Int]} = {}        # ... the declaration's levels, outermost first
+  ns_kid_seen: {Str: Int} = {}       # "namespace name" -> its inner level, merged with a member of that name (ns_kid)
   ref_at: {Int: [Int]} = {}          # bind.ref_of: references by a hash of target and arguments
   body_by_infer: {Int: [Int]} = {}   # chk.infer_return checked a body as its own check would: [log from, to, last, loop pass]
   tvar_arr: [Int] = []               # chk.could_contain_tvars: 0 not known, 1 no, 2 yes
   weak_cache: {Int: Int} = {}        # rel.is_weak: 1 weak, 0 not
   gen_cache: {Int: Int} = {}         # tyops.is_generic: 1 generic, 0 not
+  as_early: {Int: Int} = {}          # a variable whose initializer, x as T, is being checked -> T
   fn_ctxt: {Int: Int} = {}           # a function expression -> its (last) contextual type (-1 none)
+  implicit_at: {Int: Int} = {}       # file << 32 | position of a TS7006 at a parameter -> the parameter
   fn_csig: {Int: Int} = {}          # a function expression -> the contextual signature its own was made from
   object_iface: Int = -2             # rel.has_global_object: the global Object interface (-2 not looked up)
   sred_cache: {Int: Int} = {}        # chk.subtype_reduce1: a union -> its reduction
@@ -435,6 +541,8 @@ type C:
   si_memo: {Int: Int} = {}            # strip_infers by (node << 32 | mapper)
   ckr_memo: {Int: Int} = {}           # ck_restrict by (node << 32 | mapper)
   inter_memo: {Int: Int} = {}         # inter_of of two types (a << 31 | b)
+  t_ctv: {Int: Bool} = {}             # intersections T & P marked IsConstrainedTypeVariable (inter_of1)
+  never_inter_memo: {Int: Bool} = {}  # an intersection getReducedType makes never (chk.never_inter)
   ck_inside: {Int: Bool} = {}         # ... whether a type parameter's owner holds the node (n << 24 | f)
   unsup_msg: {Int: Str} = {}  # an unsupported type -> its message (~ when lazy), as node 0 is shared
   exp_deco: Bool = false     # experimentalDecorators
@@ -444,6 +552,66 @@ type C:
   base_ctor: {Int: Int} = {}      # a class extending an expression -> the expression's type
   marks: {Int: [Int]} = {}        # a file being checked -> the files it found something not modeled in
   chain_hint: {Int: Int} = {}     # a narrowed link of an optional chain -> its type without the chain's undefined
+  chain_guarded: {Int: Bool} = {}  # a call whose arguments are checked with its chain's ?. receivers not null (a frame pushed)
+  rel_nest: Int = 0               # rel's nesting, of every kind of type (a limit: rel.rel)
+  jsx_mode: Str = ""              # the jsx compiler option (react-jsx, react-jsxdev, react, preserve...)
+  jsx_src: Str = ""               # jsxImportSource ("" react)
+  jsx_obj: {Int: Int} = {}        # a JSX element -> its attributes as an object literal made for it
+  jsx_nsc: {Int: Int} = {}        # a file -> its JSX namespace symbol (-1 none)
+  ctx_epoch: Int = 0               # the state of contextual parameter types: a new id each time one is set
+  ctx_next: Int = 0                # the last id given
+  jsx_nomemo: Bool = false         # VTSC_NO_JSX_MEMO
+  umd_pending: {Int: Int} = {}     # export as namespace X: X -> that statement (made a global when first looked up)
+  inst_exit: Int = 0               # VTSC_INST_EXIT: instantiations after which vtsc exits (for profiling a slow file)
+  inst_all: Int = 0
+  last_expr: Int = -1
+  last_rel: Int = -1
+  last_what: Str = ""
+  jsx_memo_f: {Int: [Int]} = {}    # ... the function bodies checking it checked
+  jsx_memo_p: {Int: [Int]} = {}    # ... and their parameters' contextual types (parameter, type, ...)
+  jsx_memo: {Int: Int} = {}        # a JSX element checked at an epoch: its type
+  jsx_memo_ep: {Int: Int} = {}     # ... that epoch
+  jsx_memo_d: {Int: [parse.Diag]} = {}  # ... and the diagnostics checking it made
+  narrow_cache: {Int: Int} = {}   # (declaration node << 32 | mapper) -> the mapper narrowed to its type parameters
+  mention_cache: {Int: Bool} = {}  # (node << 32 | name) -> node_mentions
+  skip_lib: Bool = false   # skipLibCheck: a declaration file's errors aren't reported
+  dts_quiet: Bool = false  # skipLibCheck, or linting (the rules need the types, not the errors): what two declaration files' conflicts report doesn't matter
+  mtp_cache: {Int: Int} = {}  # (t << 32 | tp) -> mentions_tp's answer and the depth it held at
+  mod_flag: {Int: Int} = {}  # a file's root -> 1 a module, 0 a script (is_module)
+  enum_mm: {Int: Int} = {}   # no-unsafe-enum-assignment: (source << 32 | target) -> a mismatch (1)
+  gsyms: [Int] = []          # global_type_sym's fixed slots (-2 not looked up yet)
+  checking_started: Bool = false  # the globals are declared: global_type_sym may keep what it finds
+  enum_rt: {Int: Int} = {}   # no-unsafe-enum-assignment: a receiver -> an enum literal reachable (1)
+  enum_rt_d: {Int: Int} = {} # rt_enum: a type -> the most depth left with which an enum literal was found from it
+  enum_rt_no: {Int: Int} = {}  # ... the most depth left with which none was, by a search no ancestor cut short
+  enum_cut: Int = 0            # ... searches cut short by an ancestor being searched
+  closed_t: [Int] = []          # bind.closed_alias by type: 0 not asked, 1 closed, 2 not
+  alias_closed: {Int: Int} = {}  # bind.closed_alias: an alias symbol -> 1 no type parameters in scope, 0 else
+  touch_moved: [Int] = []       # bind.touch: files it marked for a use in them, not in the file being checked (withdrawn with that file's mark by the probes)
+  cinit_narrow: {Int: Int} = {}  # const_init_narrow: a const symbol -> its declared type narrowed by its initializer (-1 none)
+  has_enum: Int = -1           # ... whether the program declares an enum (-1 not looked yet): without one there's no enum literal type
+  strict_sub_reads: Bool = false  # VTSC_STRICT_SUB: refuse reads of generics with an unknown constraint
+  disc_cache: {Int: Int} = {}  # rel.discriminate: (source << 32 | union, modes) -> its result
+  optp_cache: {Int: Int} = {}  # rel.opt_prop_type: (property << 32 | type) -> type | undefined
+  disc_info: {Int: Int} = {}  # rel.disc_info: (union << 32 | name) -> index in disc_lists, -1 not a discriminant
+  disc_lists: [[Int]] = []
+  lazy_meth: {Int: Int} = {}  # chk: a provisional object literal type's method that reads this -> the method, typed when asked for
+  lazy_icomb: {Int: [Int]} = {}  # an intersection's or a spread's property -> [the receiver, 1 adding undefined, the properties]
+  spread_orig: {Int: Int} = {}  # bind.spread_origin: a spread copy -> (the property it copies << 1) | adds undefined
+  cond_rel_stk: [Int] = []  # rel.same_cond_rel: the conditional types being related to another of their instantiations
+  const_spread_ovr: {Int: Int} = {}  # chk.const_type_ctx: a union spread's member, for the literal made once per member
+  pkg_js: {Str: Str} = {}  # pkg_present's key: the JavaScript file of a package without declarations
+  ident_cache: {Int: Int} = {}  # rel.identical's answers for two types (and the permissive flag)
+  ident_stk: [Int] = []        # rel.identical: the pairs of object types being compared (their keys)
+  ident_rid: [Int] = []        # their recursion identities, two per pair
+  ident_maybe: Bool = false     # an answer under them assumed one of them identical
+  ident_unk: {Int: Int} = {}    # within one rel.identical: the least depth each pair was "can't tell" at
+  ident_nest: Int = 0
+  await_noalias: Bool = false  # chk.awaited for a return statement: generic types as they are (getAwaitedTypeNoAlias)
+  tmpl_sig: Int = -1  # chk: the generic signature a template expression argument is checked against (its type parameters' constraints through sig_outer)
+  ret_ctx_over: {Int: Int} = {}  # chk: a function argument's contextual return type through the call's return mapper, where nothing else is inferred yet (instantiateContextualType)
+  ret_infers: {Int: Bool} = {}  # chk: a function argument whose raw parameter's return is a type parameter of the call (it is inferred from what it returns)
+  arr_implicit: {Str: Int} = {}  # an evolving array's join that took its unevolved side's implicit any[]: that any[] (TS7034/TS7005 where read)
 
 # symbol kinds
 const S_VAR = 1
@@ -490,6 +658,9 @@ fn new_checker(own t: ast.Ast) -> C:
   c.sdtype.reserve(ns0)
   c.sparent.reserve(ns0)
   c.sflags.reserve(ns0)
+  # (and the object types: each is a large record, so a doubling copies hundreds of megabytes of
+  # them in a large program; about one per 16 nodes in one large package's)
+  c.objs.reserve(c.t.nd.len / 16 + 4096)
   mk(&c, 0, 0, 0, 0)                    # type 0 unused
   c.any_t = mk(&c, TK_ANY, F_ANY, 0, 0)
   c.unknown_t = mk(&c, TK_UNKNOWN, F_UNKNOWN, 0, 0)
@@ -515,6 +686,14 @@ fn new_checker(own t: ast.Ast) -> C:
   c.narrow.push({})
   return c
 
+# The error type of an unresolved reference written as the name (A or ns.A): it prints as the name
+# (tsc's unresolved symbols); a union or intersection of it is the plain error type.
+fn unres_named(var c: C, name: Int) -> Int:
+  if name in c.unres_names: return c.unres_names[name]
+  let t = mk(&c, TK_ERROR, F_ANY, name, 2)
+  c.unres_names[name] = t
+  return t
+
 fn mk(var c: C, k: Int, f: Int, a: Int, b: Int) -> Int:
   let id = c.tk.len
   c.tk.push(k)
@@ -524,6 +703,17 @@ fn mk(var c: C, k: Int, f: Int, a: Int, b: Int) -> Int:
   return id
 
 # ---- literals
+
+# A bigint literal type by its decimal text ("-5", "16"): interned, fresh at r + 1.
+fn big_lit(var c: C, text: Str, fresh: Bool) -> Int:
+  if not (text in c.biglits):
+    let id = ast.intern(&c.t, text)
+    let r = mk(&c, TK_BIGLIT, F_BIGLIT, id, 0)
+    mk(&c, TK_BIGLIT, F_BIGLIT, id, 1)
+    c.biglits[text + ""] = r
+  let r = c.biglits[text]
+  if fresh: return r + 1
+  return r
 
 fn str_lit(var c: C, name: Int, fresh: Bool) -> Int:
   if not (name in c.strlits):
@@ -607,7 +797,13 @@ fn tmpl_holes(c: C, t: Int) -> [Int]:
 # each hole's part valid for its type.
 fn tmpl_matches(c: C, str: Str, t: Int) -> Bool:
   let mp = tmpl_mapping(c, t)
-  if mp != "": return apply_mapping(mp, str) == str
+  # (isMemberOfStringMapping: the mapping leaves it as it is, and it fits what is mapped, a
+  # pattern template `${number}` or `${string & {}}`)
+  if mp != "":
+    if apply_mapping(mp, str) != str: return false
+    let h = c.tmpls[c.ta[t]].holes[0]
+    if c.tk[h] == TK_TEMPLATE: return tmpl_matches(c, str, h)
+    return true
   return tmpl_matches1(c, str, t)
 
 fn tmpl_matches1(c: C, str: Str, t: Int) -> Bool:
@@ -667,6 +863,16 @@ fn find_from(s: Str, sub: Str, from: Int) -> Int:
     i += 1
   return -1
 
+# isPatternLiteralType: a template (or a mapping) whose holes are all string, number, bigint,
+# any or a mapping of string.
+fn tmpl_pattern(c: C, t: Int) -> Bool:
+  for h in c.tmpls[c.ta[t]].holes:
+    let k = c.tk[h]
+    if k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_ANY: continue
+    if k == TK_TEMPLATE and c.tmpls[c.ta[h]].mapping != "" and c.tk[c.tmpls[c.ta[h]].holes[0]] == TK_STRING: continue
+    return false
+  return true
+
 # isValidTypeForTemplateLiteralPlaceholder for a string's part.
 fn hole_accepts(c: C, h: Int, part: Str) -> Bool:
   let k = c.tk[h]
@@ -675,6 +881,12 @@ fn hole_accepts(c: C, h: Int, part: Str) -> Bool:
   if k == TK_BIGINT: return valid_bigint_string(part)
   # (Uppercase<string> and the like: what the mapping leaves as it is)
   if k == TK_TEMPLATE and tmpl_mapping(c, h) != "" and c.tk[tmpl_holes(c, h)[0]] == TK_STRING: return apply_mapping(tmpl_mapping(c, h), part) == part
+  # (string & {}: each member's, an object (made only with nothing in it) any string's)
+  if k == TK_INTER:
+    for ii_h in 0..ninter(c, h):
+      let x = inter_at(c, h, ii_h)
+      if c.tk[x] != TK_OBJ and not hole_accepts(c, x, part): return false
+    return true
   return false
 
 # isValidNumberString(s, false): what +s reads as a finite number (JavaScript's StringToNumber).
@@ -778,22 +990,31 @@ fn num_lit(var c: C, v: Float, fresh: Bool) -> Int:
   if fresh: return r + 1
   return r
 
-# An enum member's literal type: the literal's kind and value, tb = 2 + the member's symbol (never
-# fresh; distinct from the plain literal)
+# An enum member's literal type: the literal's kind and value, tb = 2 + the member's symbol
+# (distinct from the plain literal); its fresh copy at r + 1 with tb = -(2 + the member), the type
+# of the member read as a value (getFreshTypeOfLiteralType in getDeclaredTypeOfEnum)
 fn enum_lit(var c: C, base: Int, member: Int) -> Int:
-  return mk(&c, c.tk[base], c.tf[base], c.ta[base], 2 + member)
+  let r = mk(&c, c.tk[base], c.tf[base], c.ta[base], 2 + member)
+  mk(&c, c.tk[base], c.tf[base], c.ta[base], -2 - member)
+  return r
 
 fn is_enum_lit(c: C, t: Int) -> Bool:
   let k = c.tk[t]
-  return (k == TK_STRLIT or k == TK_NUMLIT) and c.tb[t] >= 2
+  return (k == TK_STRLIT or k == TK_NUMLIT) and (c.tb[t] >= 2 or c.tb[t] <= -2)
+
+# (an enum member's symbol, from its literal type, fresh or not)
+fn enum_lit_member(c: C, t: Int) -> Int:
+  if c.tb[t] <= -2: return -2 - c.tb[t]
+  return c.tb[t] - 2
 
 fn is_fresh_lit(c: C, t: Int) -> Bool:
   let k = c.tk[t]
-  return (k == TK_STRLIT or k == TK_NUMLIT or k == TK_TRUE or k == TK_FALSE) and c.tb[t] == 1
+  if (k == TK_STRLIT or k == TK_NUMLIT) and c.tb[t] <= -2: return true
+  return (k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE) and c.tb[t] == 1
 
 fn regular(c: C, t: Int) -> Int:
   let k = c.tk[t]
-  if (k == TK_STRLIT or k == TK_NUMLIT) and c.tb[t] == 1: return t - 1
+  if (k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT) and (c.tb[t] == 1 or c.tb[t] <= -2): return t - 1
   if k == TK_TRUE and c.tb[t] == 1: return c.true_t
   if k == TK_FALSE and c.tb[t] == 1: return c.false_t
   if k != TK_UNION: return t
@@ -848,12 +1069,30 @@ fn is_union(c: C, t: Int) -> Bool:
 # TypeScript 7's order of union members (compareTypes): by kind flags, then by value or declaration.
 fn cmp_types(c: C, a: Int, b: Int) -> Int:
   if a == b: return 0
-  let fa = c.tf[a]
-  let fb = c.tf[b]
+  var fa = c.tf[a]
+  var fb = c.tf[b]
+  # (an enum member's literal has EnumLiteral too: after the plain literals, getSortOrderFlags)
+  let ea = is_enum_lit(c, a)
+  let eb = is_enum_lit(c, b)
+  if ea: fa = fa | F_ENUMLIT
+  if eb: fb = fb | F_ENUMLIT
   if fa != fb:
     if fa < fb: return -1
     return 1
   let k = c.tk[a]
+  if ea and eb:
+    # (enum members by their declarations, compareTypeNames' symbols)
+    let da = c.sdecl[enum_lit_member(c, a)]
+    let db = c.sdecl[enum_lit_member(c, b)]
+    if da >= 0 and db >= 0:
+      let ra = file_rank(c, c.t.nd[da].file)
+      let rb = file_rank(c, c.t.nd[db].file)
+      if ra != rb:
+        if ra < rb: return -1
+        return 1
+      if c.t.nd[da].pos != c.t.nd[db].pos:
+        if c.t.nd[da].pos < c.t.nd[db].pos: return -1
+        return 1
   if k == TK_STRLIT:
     let sa = c.t.names[c.ta[a]]
     let sb = c.t.names[c.ta[b]]
@@ -953,8 +1192,10 @@ fn cmp_obj(c: C, a: Int, b: Int) -> Int:
   if rb: return 1
   return 0
 
-# The symbol that names an object type in compareTypeNames: -1 for an anonymous or tuple type.
+# The symbol that names an object type in compareTypeNames (getTypeNameSymbol): its alias first,
+# type Flip = {...}; -1 for an anonymous or tuple type without one.
 fn obj_name_sym(c: C, t: Int) -> Int:
+  if t in c.t_alias: return c.t_alias[t]
   let o = c.ta[t]
   let k = c.objs[o].kind
   if k == OK_REF:
@@ -992,10 +1233,61 @@ fn sort_types(c: C, var xs: [Int]):
 # A union of types: flattened, without duplicates, sorted; never when empty, the type itself when one.
 # any absorbs everything; unknown absorbs everything but any. Literal types fold into their primitive
 # when the primitive is present ("a" | string is string).
+fn tick_t(var c: C, what: Str):
+  c.last_what = what + ""
+  c.inst_all += 1
+  if c.inst_all > c.inst_exit:
+    eprint("vtsc: VTSC_INST_EXIT reached in " + what)
+    exit(3)
+
+# NoInfer<T>: a substitution type over a generic T (one per T), T itself when T isn't generic.
+fn noinfer_of(var c: C, t: Int) -> Int:
+  if c.tk[t] == TK_NOINFER: return t
+  if not chk.could_contain_tvars(&c, t): return t
+  if t in c.noinfer_of_t: return c.noinfer_of_t[t]
+  let r = mk(&c, TK_NOINFER, 0, t, 0)
+  c.noinfer_of_t[t] = r
+  return r
+
+# addNamedUnions: a union with an alias, or an origin that isn't a union, is named; one whose
+# origin is a union, the named unions of that origin's members.
+fn add_named_unions(c: C, t: Int, var named: [Int]):
+  if c.tk[t] != TK_UNION: return
+  # (an origin of one type that isn't a union, keyof T: named too)
+  var named_origin = false
+  if t in c.t_origin and c.t_origin[t].len == 1 and c.tk[c.t_origin[t][0]] != TK_UNION: named_origin = true
+  # (an enum's union is named too: tsc makes it with the enum's symbol as its alias, so E | E, or E
+  # with some of its own members, is E itself; Object.values({ a: E, b: E }) is E[])
+  if t in c.t_alias or t in c.t_iorigin or named_origin or t in c.enum_union:
+    if not has_int(named, t): named.push(t)
+    return
+  if t in c.t_origin:
+    for o in c.t_origin[t]: add_named_unions(c, o, &named)
+
 fn union_of(var c: C, ts: [Int]) -> Int:
+  if c.inst_exit > 0: tick_t(&c, "union_of")
+  # (strictNullChecks false: null and undefined aren't a union's members unless nothing else is,
+  # addTypeToUnion)
+  if c.snc_off:
+    var keep: [Int] = []
+    var dropped = false
+    var other = false
+    var first_null = -1
+    var first_undef = -1
+    for t in ts:
+      let k = c.tk[t]
+      if k == TK_NULL or k == TK_UNDEF:
+        dropped = true
+        if k == TK_NULL and first_null < 0: first_null = t
+        if k == TK_UNDEF and first_undef < 0: first_undef = t
+      else:
+        keep.push(t)
+        if k != TK_NEVER: other = true
+    if dropped and other: return union_of(&c, keep)
+    # (only null and undefined: null if it is there, getUnionType's empty type set)
+    if first_null >= 0 and first_undef >= 0: return first_null
   var named: [Int] = []
-  for t in ts:
-    if c.tk[t] == TK_UNION and (t in c.t_alias or t in c.t_origin or t in c.t_iorigin) and not has_int(named, t): named.push(t)
+  for t in ts: add_named_unions(c, t, &named)
   let u = union_plain(&c, ts)
   if named.len == 0 or c.tk[u] != TK_UNION: return u
   # TypeScript's origin: the named unions plus the members none of them has, if they don't overlap
@@ -1135,6 +1427,11 @@ fn union_plain1(var c: C, ts: [Int]) -> Int:
         if matched: continue
       kept.push(m)
     flat = kept
+  var has_ctv = false
+  if c.t_ctv.len > 0:
+    for m in flat:
+      if m in c.t_ctv: has_ctv = true
+  if has_ctv: remove_ctvs(&c, &flat)
   if flat.len == 0: return c.never_t
   if flat.len == 1: return flat[0]
   sort_types(c, &flat)
@@ -1146,7 +1443,153 @@ fn union_plain1(var c: C, ts: [Int]) -> Int:
   intern_put(&c, 1, 0, flat, id)
   return id
 
+# removeConstrainedTypeVariables: a union's members T & p (constrained type variables) whose p
+# cover every member of T's base constraint are T.
+fn ctv_var(c: C, x: Int) -> Int:
+  let a = inter_at(c, x, 0)
+  if c.tk[a] == TK_TPARAM or c.tk[a] == TK_INDEXED: return a
+  return inter_at(c, x, 1)
+
+fn ctv_other(c: C, x: Int) -> Int:
+  let a = inter_at(c, x, 0)
+  if c.tk[a] == TK_TPARAM or c.tk[a] == TK_INDEXED: return inter_at(c, x, 1)
+  return a
+
+fn remove_ctvs(var c: C, var flat: [Int]):
+  var tvs: [Int] = []
+  for m in flat:
+    if m in c.t_ctv:
+      let tv = ctv_var(c, m)
+      if not has_int(tvs, tv): tvs.push(tv)
+  for tv in tvs:
+    var prims: [Int] = []
+    for m in flat:
+      if m in c.t_ctv and ctv_var(c, m) == tv: prims.push(ctv_other(c, m))
+    c.inter_red += 1
+    var con = -1
+    if c.tk[tv] == TK_TPARAM: con = chk.base_constraint(&c, tv, 0)
+    else: con = tyops.base_of(&c, tv, 0)
+    c.inter_red -= 1
+    if con < 0 or con == tv: continue
+    var every = true
+    for mi_ in 0..nmem(c, con):
+      if not has_int(prims, mem(c, con, mi_)): every = false
+    if not every: continue
+    var kept: [Int] = []
+    for m in flat:
+      if m in c.t_ctv and ctv_var(c, m) == tv and has_int(prims, ctv_other(c, m)): continue
+      kept.push(m)
+    if not has_int(kept, tv): kept.push(tv)
+    flat = kept
+
+# A primitive type for intersecting unions of them as sets (TypeFlags.Primitive).
+fn prim_member(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE or k == TK_NULL or k == TK_UNDEF or k == TK_VOID
+
+fn union_has(c: C, u: Int, t: Int) -> Bool:
+  let ms = members(c, u)
+  if has_int(ms, t): return true
+  # (a literal in a union with its primitive: eachUnionContains)
+  if c.tk[t] == TK_STRLIT or c.tk[t] == TK_NUMLIT or c.tk[t] == TK_BIGLIT:
+    let b = base_of_literal(c, t)
+    if b >= 0 and has_int(ms, b): return true
+  return false
+
+# getIntersectionType's steps for unions whose cross product is large: unions of primitives
+# intersected as sets (intersectUnionsOfPrimitiveTypes), undefined or null that every union has
+# taken out, an empty intersection found from the other members, four or more members halved
+# (divide and conquer), and past 100,000 combinations not modeled (tsc: TS2590). -1: the plain way.
+fn inter_big(var c: C, ts: [Int], prod: Int) -> Int:
+  # (the same member twice is once: the intersection's members are a set)
+  var uniq: [Int] = []
+  for x in ts:
+    if not has_int(uniq, x): uniq.push(x)
+  if uniq.len < ts.len:
+    if uniq.len == 1: return uniq[0]
+    return inter_of(&c, uniq)
+  # (the other members alone already empty: disjoint primitives, or null or undefined with an
+  # object type)
+  var pk = -1
+  var has_nullish = false
+  var has_obj = false
+  for x in ts:
+    let k = c.tk[x]
+    if k == TK_NEVER: return c.never_t
+    if k == TK_NULL or k == TK_UNDEF or k == TK_VOID: has_nullish = true
+    if k == TK_OBJ or k == TK_NONPRIM: has_obj = true
+    if k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL:
+      if pk >= 0 and pk != k: return c.never_t
+      pk = k
+  if has_nullish and (has_obj or pk >= 0): return c.never_t
+  # unions of primitives: one union of what every one of them has
+  var pus: [Int] = []
+  for x in ts:
+    if c.tk[x] == TK_UNION:
+      var allp = true
+      for m in members(c, x):
+        if not prim_member(c, m): allp = false
+      if allp: pus.push(x)
+  if pus.len >= 2:
+    var res: [Int] = []
+    var checked: [Int] = []
+    for u in pus:
+      for m in members(c, u):
+        if has_int(checked, m): continue
+        checked.push(m)
+        var every = true
+        for u2 in pus:
+          if not union_has(c, u2, m): every = false
+        if every: res.push(m)
+    var nts: [Int] = []
+    var placed = false
+    for x in ts:
+      if has_int(pus, x):
+        if not placed:
+          if res.len == 0: nts.push(c.never_t)
+          else: nts.push(union_of(&c, res))
+          placed = true
+      else: nts.push(x)
+    return inter_of(&c, nts)
+  # every member a union with undefined (or null) in it: that taken out, then added back
+  for nk in [TK_UNDEF, TK_NULL]:
+    var every = true
+    for x in ts:
+      if c.tk[x] != TK_UNION: every = false
+      elif every:
+        var has = false
+        for m in members(c, x):
+          if c.tk[m] == nk: has = true
+        if not has: every = false
+    if every:
+      var nts: [Int] = []
+      for x in ts: nts.push(filter_union(&c, x, nk == TK_UNDEF, nk == TK_NULL))
+      var nt = c.undef_t
+      if nk == TK_NULL: nt = c.null_t
+      let inn = inter_of(&c, nts)
+      return union_of(&c, [inn, nt])
+  if ts.len >= 4:
+    let mid = ts.len / 2
+    var l: [Int] = []
+    var r: [Int] = []
+    for i in 0..ts.len:
+      if i < mid: l.push(ts[i])
+      else: r.push(ts[i])
+    let li = inter_of(&c, l)
+    let ri = inter_of(&c, r)
+    return inter_of(&c, [li, ri])
+  if prod > 100000:
+    if c.debug:
+      eprint("INTERBIG {ts.len} members, product {prod}")
+      for x in ts: eprint("  k{c.tk[x]} n{c.tb[x]} " + show.show(&c, x))
+    return bind.lazy_unsupported(&c, 0, "an intersection of unions too large to represent")
+  return -1
+
 fn inter_of(var c: C, ts: [Int]) -> Int:
+  if c.inst_exit > 0: tick_t(&c, "inter_of")
+  # (one type: itself, a union with its alias's name too, getIntersectionType's typeSet.length === 1;
+  # an intersection's property that one member has, JsonValue, keeps the name)
+  if ts.len == 1: return ts[0]
   # (two types: memoized; the result depends on them alone, outside a reduction in progress)
   if ts.len == 2 and c.inter_red == 0 and ts[0] < 2147483648 and ts[1] < 2147483648:
     let ik = (ts[0] << 31) | ts[1]
@@ -1158,6 +1601,34 @@ fn inter_of(var c: C, ts: [Int]) -> Int:
   return inter_of1(&c, ts)
 
 fn inter_of1(var c: C, ts: [Int]) -> Int:
+  # (two unions that are one type made twice, the same union of instantiations of one object type:
+  # one, as tsc's instantiation caches make it, before any cross product)
+  var nu = 0
+  for x in ts:
+    if c.tk[x] == TK_UNION: nu += 1
+  if nu >= 2:
+    var keep: [Int] = []
+    for x in ts:
+      var dup = false
+      if c.tk[x] == TK_UNION:
+        for ki in 0..keep.len:
+          let y = keep[ki]
+          if not dup and c.tk[y] == TK_UNION and nmem(c, x) == nmem(c, y) and rel.identical(&c, x, y, 0) == 1:
+            dup = true
+            # (the one without an alias's name, as the type an alias names is the same type)
+            if y in c.t_alias and not (x in c.t_alias): keep[ki] = x
+      if not dup: keep.push(x)
+    if keep.len < ts.len:
+      if keep.len == 1: return keep[0]
+      return inter_of(&c, keep)
+  # (a large cross product of unions: reduced first as tsc's getIntersectionType does, never
+  # made whole)
+  var prod = 1
+  for x in ts:
+    if c.tk[x] == TK_UNION and prod <= 100000: prod = prod * c.tb[x]
+  if prod > 64:
+    let rr = inter_big(&c, ts, prod)
+    if rr >= 0: return rr
   # (A | B) & C is (A & C) | (B & C)
   for i in 0..ts.len:
     if c.tk[ts[i]] == TK_UNION:
@@ -1175,6 +1646,7 @@ fn inter_of1(var c: C, ts: [Int]) -> Int:
     for ii68_ in 0..ninter(c, t):
       let m = inter_at(c, t, ii68_)
       if c.tk[m] == TK_NEVER: return c.never_t
+      if c.tk[m] == TK_ERROR and c.tb[m] == 2: return c.error_t
       if c.tk[m] == TK_ANY or c.tk[m] == TK_ERROR: return m
       if c.tk[m] == TK_UNKNOWN: continue
       if not has_int(flat, m): flat.push(m)
@@ -1184,11 +1656,15 @@ fn inter_of1(var c: C, ts: [Int]) -> Int:
   # type are never; a literal with its own primitive is the literal
   var prim = -1
   var nonnull_obj = false
+  # (the empty object type written, kept as it is: a type literal's {} has an implicit index
+  # signature, the {} narrowing makes doesn't)
+  var empty_m = -1
   var keep: [Int] = []
   for m in flat:
     let k = c.tk[m]
     if k == TK_OBJ and empty_object(c, m):
       nonnull_obj = true
+      if empty_m < 0: empty_m = m
       continue
     if k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE:
       if prim >= 0 and prim != m:
@@ -1207,14 +1683,49 @@ fn inter_of1(var c: C, ts: [Int]) -> Int:
   for m in keep:
     let k = c.tk[m]
     if (k == TK_NULL or k == TK_UNDEF or k == TK_VOID) and (nonnull_obj or prim >= 0 or has_obj_k): return c.never_t
+  # (a template literal type with null or undefined: never, disjoint domains)
+  for m in keep:
+    if c.tk[m] == TK_TEMPLATE:
+      for m2 in keep:
+        let km = c.tk[m2]
+        if km == TK_NULL or km == TK_UNDEF or km == TK_VOID: return c.never_t
+  # (a template literal type is string-like: with a number, bigint or boolean primitive it's never,
+  # with string the template; getIntersectionType's disjoint domains)
+  if prim >= 0:
+    var has_tmpl = false
+    for m in keep:
+      if c.tk[m] == TK_TEMPLATE and c.tmpls[c.ta[m]].mapping == "": has_tmpl = true
+    if has_tmpl:
+      let pb = base_of_literal(c, prim)
+      if c.tk[pb] != TK_STRING and c.tk[prim] != TK_STRING: return c.never_t
+      if c.tk[prim] == TK_STRING: prim = -1
+      elif c.tk[prim] == TK_STRLIT:
+        # (extractRedundantTemplateLiterals: a template the literal matches is dropped; a pattern
+        # template it doesn't match makes the intersection never)
+        let lit = c.t.names[c.ta[prim]] + ""
+        var kept: [Int] = []
+        for m in keep:
+          if c.tk[m] == TK_TEMPLATE and c.tmpls[c.ta[m]].mapping == "":
+            if tmpl_matches(c, lit, m): continue
+            var pattern = true
+            for h in tmpl_holes(c, m):
+              let hk = c.tk[h]
+              if hk != TK_STRING and hk != TK_NUMBER and hk != TK_BIGINT and hk != TK_ANY: pattern = false
+            if pattern: return c.never_t
+          kept.push(m)
+        keep = kept
   if prim >= 0 and keep.len == 0: return prim
   if prim >= 0: keep.push(prim)
-  if keep.len == 0 and nonnull_obj: return c.empty_obj
+  if keep.len == 0 and nonnull_obj:
+    if empty_m >= 0: return empty_m
+    return c.empty_obj
   # {} with another object type is dropped
   var has_obj = false
   for m in keep:
     if c.tk[m] == TK_OBJ: has_obj = true
-  if nonnull_obj and prim < 0 and not has_obj: keep.push(c.empty_obj)
+  if nonnull_obj and prim < 0 and not has_obj:
+    if empty_m >= 0: keep.push(empty_m)
+    else: keep.push(c.empty_obj)
   # (in the order written: the primitive where it was)
   var ordered: [Int] = []
   for m in flat:
@@ -1225,6 +1736,7 @@ fn inter_of1(var c: C, ts: [Int]) -> Int:
   if flat.len == 1: return flat[0]
   # (T & P, T a type parameter whose constraint is all primitives, P a primitive or {}: T where
   # the constraint is a subtype of P, never where they're unrelated; getIntersectionType)
+  var ctv = false
   if flat.len == 2 and c.inter_red == 0:
     var vi = -1
     if c.tk[flat[0]] == TK_TPARAM or c.tk[flat[0]] == TK_INDEXED: vi = 0
@@ -1250,18 +1762,24 @@ fn inter_of1(var c: C, ts: [Int]) -> Int:
             for mi_ in 0..nmem(c, con):
               if prim_sub(c, mem(c, con, mi_), p): some = true
           if not some and not prim_sub(c, p, con): return c.never_t
+          ctv = true
   # disjoint primitives make never
   var prims = 0
   for m in flat:
     let k = c.tk[m]
     if k == TK_STRING or k == TK_NUMBER or k == TK_BIGINT or k == TK_SYMBOL or k == TK_UNDEF or k == TK_NULL or k == TK_VOID: prims += 1
   if prims > 1: return c.never_t
-  let f0 = intern_find(c, 2, 0, flat)
+  # (a constrained type variable, IsConstrainedTypeVariable: a type of its own, which a union
+  # with the others that cover the constraint reduces to the type variable)
+  var pre = 0
+  if ctv: pre = 1
+  let f0 = intern_find(c, 2, pre, flat)
   if f0 >= 0: return f0
   let start = c.tl.len
   for m in flat: c.tl.push(m)
   let id = mk(&c, TK_INTER, F_INTER, start, flat.len)
-  intern_put(&c, 2, 0, flat, id)
+  intern_put(&c, 2, pre, flat, id)
+  if ctv: c.t_ctv[id] = true
   return id
 
 # A primitive type, a literal, null, undefined, void or object (TypeFlags.Primitive | NonPrimitive).
@@ -1282,6 +1800,8 @@ fn prim_sub(c: C, a: Int, b: Int) -> Bool:
     return false
   let ka = c.tk[a]
   let kb = c.tk[b]
+  # ({} and another {}: identical, as P['Inputs'] & {} with the constraint {} is P['Inputs'])
+  if kb == TK_OBJ and empty_object(c, b) and ka == TK_OBJ and empty_object(c, a): return true
   if kb == TK_OBJ and empty_object(c, b): return ka != TK_NULL and ka != TK_UNDEF and ka != TK_VOID and prim_like(c, a)
   if ka == TK_UNDEF and kb == TK_VOID: return true
   if (ka == TK_STRLIT and kb == TK_STRING) or (ka == TK_NUMLIT and kb == TK_NUMBER) or (ka == TK_BIGLIT and kb == TK_BIGINT): return true
@@ -1376,6 +1896,21 @@ fn filter_union(var c: C, t: Int, drop_undef: Bool, drop_null: Bool) -> Int:
     if drop_undef and (c.tk[m] == TK_UNDEF or c.tk[m] == TK_VOID): continue
     if drop_null and c.tk[m] == TK_NULL: continue
     keep.push(m)
+  # (filterType: a union's origin filtered too, its unions kept, when it drops as many: O | undefined
+  # without undefined is O)
+  if keep.len < nmem(c, t) and c.tk[t] == TK_UNION and t in c.t_origin:
+    var ots: [Int] = []
+    for o0 in c.t_origin[t]: ots.push(o0)
+    var ofl: [Int] = []
+    for o in ots:
+      let ok = c.tk[o]
+      if ok == TK_UNION: ofl.push(o)
+      elif drop_undef and (ok == TK_UNDEF or ok == TK_VOID): continue
+      elif drop_null and ok == TK_NULL: continue
+      else: ofl.push(o)
+    if ots.len - ofl.len == nmem(c, t) - keep.len:
+      if ofl.len == 1: return ofl[0]
+      return union_of(&c, ofl)
   return union_of(&c, keep)
 
 # ---- objects
@@ -1427,6 +1962,12 @@ fn same_ints(a: [Int], b: [Int]) -> Bool:
   return true
 
 # ---- symbols
+
+# A file's place in tsc's program order (compareNodes orders declarations of two files so), its
+# number when it has none.
+fn file_rank(c: C, f: Int) -> Int:
+  if f >= 0 and f < c.frank.len and c.frank[f] >= 0: return c.frank[f]
+  return c.frank.len + f
 
 fn order_decl_of(c: C, s: Int) -> Int:
   if s in c.order_decl: return c.order_decl[s]

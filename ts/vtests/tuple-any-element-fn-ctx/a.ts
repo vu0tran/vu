@@ -1,0 +1,14 @@
+type Row = { key: string; deadline: string | null };
+type PartialShallow<T> = { [P in keyof T]?: T[P] extends object ? object : T[P] };
+type LI<T> = ((value: T, index: number) => unknown) | (PropertyKey | [PropertyKey, any] | PartialShallow<T>);
+type Many<T> = T | readonly T[];
+declare function sortBy<T>(c: ArrayLike<T>, ...it: Array<Many<LI<T>>>): T[];
+declare const rows: Row[];
+export const r1 = sortBy(rows, [(row) => { const n: number = row; return 1; }, (row) => { const n: number = row; return 1; }]);
+type LI2<T> = ((value: T, index: number) => unknown) | PropertyKey | [PropertyKey, any];
+declare function sortBy2<T>(c: ArrayLike<T>, ...it: Array<Many<LI2<T>>>): T[];
+export const r2 = sortBy2(rows, [(row) => { const n: number = row; return 1; }, (row) => { const n: number = row; return 1; }]);
+declare function sortBy3<T>(c: ArrayLike<T>, ...it: Array<Many<(value: T) => unknown>>): T[];
+export const r3 = sortBy3(rows, [(row) => { const n: number = row; return 1; }, (row) => { const n: number = row; return 1; }]);
+declare function sortBy4(...it: Array<Many<LI2<Row>>>): void;
+sortBy4([(row) => { const n: number = row; return 1; }, (row) => { const n: number = row; return 1; }]);

@@ -10,6 +10,7 @@ import rel
 import show
 import trules
 import chk
+import tyops
 import regex
 import lconf
 from types import C, TK_ANY, TK_UNKNOWN, TK_UNDEF, TK_NULL, TK_VOID, TK_STRING, TK_NUMBER, TK_BIGINT, TK_SYMBOL, TK_STRLIT, TK_NUMLIT, TK_BIGLIT, TK_TRUE, TK_FALSE, TK_NONPRIM, TK_NEVER, TK_ERROR, TK_TPARAM, TK_OBJ, TK_UNION, TK_INTER, TK_UNSUP, TK_TEMPLATE, TK_KEYOF, TK_INDEXED, TK_COND
@@ -143,10 +144,75 @@ fn non_nullable_style(var c: C, var r: Run, n: Int):
 
 # ---- no-generated-empty-object-type
 
+# A generic mapped type's keys by their lower bound (getLowerBoundOfKeyType): 1 if it has a key
+# (a literal, string, number, symbol or a template), 0 if it has none, -1 if not known here.
+fn mapped_lower_keys(var c: C, t: Int, depth: Int) -> Int:
+  let lb = mapped_key_lb(&c, t, depth)
+  if lb < 0: return -1
+  var r = 0
+  for i in 0..types.nmem(c, lb):
+    let kk = c.tk[types.mem(c, lb, i)]
+    if kk == TK_STRLIT or kk == TK_NUMLIT or kk == TK_STRING or kk == TK_NUMBER or kk == TK_SYMBOL or kk == TK_TEMPLATE: return 1
+    if kk != TK_NEVER: r = -1
+  return r
+
+fn mapped_key_lb(var c: C, t: Int, depth: Int) -> Int:
+  if depth > 6 or c.tk[t] != TK_OBJ or c.objs[c.ta[t]].kind != OK_MAPPED: return -1
+  let n = c.objs[c.ta[t]].node
+  if n < 0 or c.t.nd[n].k != ast.N_TMAPPED: return -1
+  let tpn = c.t.nd[n].a
+  if c.t.nd[tpn].a < 0: return -1
+  let g = tyops.raw(&c, c.t.nd[tpn].a)
+  let ks = bind.instantiate(&c, g, c.objs[c.ta[t]].mapper)
+  return key_lb(&c, ks, depth + 1)
+
+# The lower bound of a key type, -1 if not known here: keyof T by T's constraint, keyof a generic
+# mapped type by its keys, Exclude and Extract of a key by what of its lower bound they keep.
+fn key_lb(var c: C, k: Int, depth: Int) -> Int:
+  if depth > 8: return -1
+  let kk = c.tk[k]
+  if kk == TK_NEVER or kk == TK_STRLIT or kk == TK_NUMLIT or kk == TK_STRING or kk == TK_NUMBER or kk == TK_SYMBOL: return k
+  if kk == TK_TEMPLATE and not bind.generic_template(c, k): return k
+  if kk == TK_UNION:
+    var ts: [Int] = []
+    for i in 0..types.nmem(c, k):
+      let x = key_lb(&c, types.mem(c, k, i), depth + 1)
+      if x < 0: return -1
+      ts.push(x)
+    return types.union_of(&c, ts)
+  if kk == TK_KEYOF:
+    let o = c.ta[k]
+    if c.tk[o] == TK_OBJ and c.objs[c.ta[o]].kind == OK_MAPPED: return mapped_key_lb(&c, o, depth + 1)
+    var b = o
+    if c.tk[o] == TK_TPARAM: b = chk.base_constraint(&c, o, 0)
+    if b < 0 or (c.tk[b] != TK_OBJ and c.tk[b] != TK_UNION and c.tk[b] != TK_INTER): return -1
+    if c.tk[b] == TK_OBJ and c.objs[c.ta[b]].kind == OK_MAPPED and tyops.is_generic(&c, b): return mapped_key_lb(&c, b, depth + 1)
+    if tyops.is_generic(&c, b): return -1
+    let kb = tyops.keyof_of(&c, b)
+    if kb < 0 or c.tk[kb] == TK_UNSUP: return -1
+    return kb
+  if kk == TK_COND and k in c.t_alias_args and c.t_alias_args[k].len == 2:
+    let ex = chk.is_lib_alias(&c, k, "Exclude")
+    if not ex and not chk.is_lib_alias(&c, k, "Extract"): return -1
+    let a0 = c.t_alias_args[k][0]
+    let b0 = c.t_alias_args[k][1]
+    if tyops.is_generic(&c, b0): return -1
+    let la = key_lb(&c, a0, depth + 1)
+    if la < 0: return -1
+    var keep: [Int] = []
+    for i in 0..types.nmem(c, la):
+      let m = types.mem(c, la, i)
+      if rel.assignable_plain(&c, m, b0) != ex: keep.push(m)
+    return types.union_of(&c, keep)
+  return -1
+
 fn generated_empty(var c: C, t: Int) -> Bool:
   if c.tk[t] != TK_OBJ: return false
   let o = c.ta[t]
   let ok = c.objs[o].kind
+  # (a generic mapped type has the members its keys' lower bound gives, resolveMappedTypeMembers'
+  # getLowerBoundOfKeyType: a property or an index signature for each key; with any, not empty)
+  if ok == OK_MAPPED and mapped_lower_keys(&c, t, 0) == 1: return false
   # (classes and interfaces aren't: ObjectFlagsClassOrInterface; a reference to one neither)
   if ok == OK_DECL or ok == OK_REF:
     var target = t
@@ -158,6 +224,8 @@ fn generated_empty(var c: C, t: Int) -> Bool:
   if ok == OK_TUPLE: return false
   if bind.prop_names(&c, t).len > 0: return false
   if bind.index_type(&c, t, true) >= 0 or bind.index_type(&c, t, false) >= 0: return false
+  # (a symbol index signature is one too, getIndexInfosOfType: Record<symbol, unknown>)
+  if bind.symbol_index(&c, t) >= 0: return false
   if bind.sigs_of(&c, t, false).len > 0 or bind.sigs_of(&c, t, true).len > 0: return false
   return rel.assignable_plain(&c, c.number_t, t) and rel.assignable_plain(&c, c.string_t, t)
 
@@ -328,36 +396,103 @@ fn object_literal_type(c: C, t: Int) -> Bool:
   let nd = c.objs[o].node
   return c.objs[o].kind == OK_ANON and nd >= 0 and c.t.nd[nd].k == ast.N_OBJECT
 
+# (tsgolint with no-unnecessary-type-assertion on as well: an asserted call in an optional chain,
+# o?.g(s) as T, whose signature has a type parameter only in its return type (querySelector<E
+# extends Element = Element>(s: string): E | null) is read as that call's return with the type
+# parameter any. tsc gives E's default or the asserted type's inference, and so does tsgolint with
+# no-unsafe-type-assertion alone; the other rule's reading of the call first is what changes it.
+# Not for a parameter an argument infers, nor with parentheses or an access after the call;
+# probe unsafe-assertion-optcall-generic. -1: not such a call)
+fn opt_call_any(var c: C, e: Int) -> Int:
+  if c.t.nd[e].k != ast.N_CALL or not chk.in_opt_chain(c, e): return -1
+  let sg = c.call_sig.get(e, -1)
+  if sg < 0 or c.sigs[sg].node < 0: return -1
+  let ct0 = trules.type_at(&c, c.t.nd[e].a)
+  if ct0 < 0: return -1
+  # (the callee as the chain calls it: without the undefined its ?. adds)
+  var ct = ct0
+  if c.tk[ct0] == TK_UNION: ct = types.filter_union(&c, ct0, true, true)
+  let gs = bind.sigs_of(&c, ct, false)
+  for g in gs:
+    if c.sigs[g].node != c.sigs[sg].node or c.sigs[g].tparams.len == 0: continue
+    let rt = rel.sig_ret(&c, g)
+    var from: [Int] = []
+    var to: [Int] = []
+    let tps = types.ints(c.sigs[g].tparams)
+    let pts = types.ints(c.sigs[g].ptypes)
+    let pfs = types.ints(c.sigs[g].pflags)
+    # (the parameters an argument is given for: an optional one left out infers nothing,
+    # getData<T = unknown>(f: string, dflt?: T): T | undefined called with f alone)
+    var nargs = 0
+    if c.t.nd[e].c >= 0: nargs = ast.items(c.t, c.t.nd[e].c).len
+    for tp in tps:
+      if not chk.mentions_tp(&c, rt, tp, 0): continue
+      var inp = false
+      for pi in 0..pts.len:
+        let given = pi < nargs or (pi < pfs.len and pfs[pi] == 2 and nargs > pi)
+        if given and chk.mentions_tp(&c, pts[pi], tp, 0): inp = true
+      if inp: continue
+      from.push(tp)
+      to.push(c.any_t)
+    if from.len == 0: return -1
+    # (the other type parameters as the call has them: its instantiated return where they're
+    # not among these)
+    let mp = types.new_mapper(&c, from, to)
+    let any_r = bind.instantiate(&c, rt, mp)
+    if not trules.is_any(c, any_r): return -1
+    return any_r
+  return -1
+
+# (the assertion, parentheses looked through, as an operand: 1 what a property or element access
+# is made on, (x?.g(s) as T)?.p; 2 a binary expression's operand, (x?.g(s) as T) || ''; 0 neither,
+# a declaration's initializer, an array element, a returned value. Probes
+# unsafe-assertion-optcall-generic and -recv)
+fn operand_kind(c: C, n: Int) -> Int:
+  var x = n
+  var p = c.parent[x]
+  while p >= 0 and c.t.nd[p].k == ast.N_PAREN:
+    x = p
+    p = c.parent[x]
+  if p < 0: return 0
+  let k = c.t.nd[p].k
+  if (k == ast.N_PROPACCESS or k == ast.N_ELEMACCESS) and c.t.nd[p].a == x: return 1
+  if k == ast.N_BINARY and (c.t.nd[p].a == x or c.t.nd[p].b == x) and c.t.nd[p].f != scan.T_ASSIGN: return 2
+  return 0
+
 fn no_unsafe_type_assertion(var c: C, var r: Run, n: Int):
   let e = c.t.nd[n].a
   let tn = c.t.nd[n].b
-  if is_const_assertion(c, n):
-    # (as const: the type node isn't a type)
-    let u = bind.lazy_unsupported(&c, n, "no-unsafe-type-assertion on as const")
-    bind.touch(&c, u)
-    return
-  let et = trules.type_at(&c, e)
-  let at = trules.node_type(&c, tn)
+  # (as const: nothing reported, tsgolint's asserted type there is the expression's own; 837 of
+  # the corpus's, none reported)
+  if is_const_assertion(c, n): return
+  var et = trules.type_at(&c, e)
+  # (the assertion as an operand: no-unsafe-assignment or no-unsafe-enum-assignment (and, for an
+  # access made on it, unbound-method), when on, read it first, and then it isn't any)
+  let ok_ = operand_kind(c, n)
+  let reads_op = "no-unsafe-assignment" in r.cf.names or "no-unsafe-enum-assignment" in r.cf.names or (ok_ == 1 and "unbound-method" in r.cf.names)
+  if "no-unnecessary-type-assertion" in r.cf.names and not (ok_ > 0 and reads_op):
+    let ea = opt_call_any(&c, e)
+    if ea >= 0: et = ea
+  # (the assertion's own type, as checked where it is: a typeof query in it narrowed there)
+  var at = -1
+  if n in c.ntype: at = trules.type_at(&c, n)
+  if at < 0 or c.tk[at] == TK_UNSUP: at = trules.node_type(&c, tn)
   if et == at: return
   var id = ""
   var msg = ""
-  var help = ""
   if trules.is_any(c, at) and c.tk[et] == TK_UNKNOWN:
     id = "unsafeToAnyTypeAssertion"
     msg = "Unsafe assertion to `any` detected."
-    help = "Keep the original type or use `unknown` and narrow the value before use."
   if id == "":
     let x = unsafe_assign(&c, et, at, e)
     if x[0] == 1:
       id = "unsafeOfAnyTypeAssertion"
       msg = "Unsafe assertion from {any_name(c, x[2])} detected."
-      help = "Use a type guard to check the value before asserting its type."
   if id == "":
     let y = unsafe_assign(&c, at, et, tn)
     if y[0] == 1:
       id = "unsafeToAnyTypeAssertion"
       msg = "Unsafe assertion to {any_name(c, y[2])} detected."
-      help = "Keep the original type or use `unknown` and narrow the value before use."
   if id == "":
     var ew = et
     if object_literal_type(c, et): ew = chk.widen(&c, et)
@@ -374,10 +509,8 @@ fn no_unsafe_type_assertion(var c: C, var r: Run, n: Int):
     if id == "":
       id = "unsafeTypeAssertion"
       msg = "Unsafe type assertion: type '{ats}' is more narrow than the original type."
-  var h = "The original expression has type `{type_label(&c, et)}`, and the assertion changes it to `{type_label(&c, at)}`."
-  if help != "": h = h + " " + help
-  else: h = h + " Use a type guard to narrow the value before asserting a more specific type."
-  rep_help(&r, "no-unsafe-type-assertion", npos(c, r, n), nend(c, r, n), id, msg, h)
+  # (tsgolint 7.0.2001's messages: typescript-eslint's, no help)
+  rep(&r, "no-unsafe-type-assertion", npos(c, r, n), nend(c, r, n), id, msg)
 
 # ---- prefer-reduce-type-parameter
 
@@ -588,6 +721,12 @@ fn member_state(var c: C, var r: Run, n: Int, allow_chain: Bool) -> Int:
   let t = trules.type_at(&c, e)
   var st = 1
   if trules.is_any(c, t): st = 0
+  # (module or exports in a CommonJS JavaScript file, not declared: the file's module object
+  # (resolveName's commonJsModuleIndicator), not any; tsgolint reports neither module.exports
+  # nor exports.x, with or without Node's types)
+  if st == 0 and ek == ast.N_ID and chk.js_node(c, e) and not c.files[c.t.nd[e].file].endswith(".mjs"):
+    let en0 = c.t.names[c.t.nd[e].s]
+    if (en0 == "module" or en0 == "exports") and bind.lookup_value(&c, e, c.t.nd[e].s) < 0: st = 1
   r.ma_state[n] = st
   if st == 0:
     if k == ast.N_PROPACCESS:
@@ -595,6 +734,8 @@ fn member_state(var c: C, var r: Run, n: Int, allow_chain: Bool) -> Int:
       var ns = c.t.nd[n].d
       let name = bind.nm(c, c.t.nd[n].s)
       if ns < 0: ns = en - name.len
+      # (a property access with no name: a syntax error's `a.`)
+      if name.len == 0 or ns > en: return st
       rep(&r, "no-unsafe-member-access", ns, en, "unsafeMemberExpression", "Unsafe member access .{r.src[ns..en]} on an {data_type(c, t)} value.")
     else:
       let a = c.t.nd[n].b
@@ -604,7 +745,11 @@ fn member_state(var c: C, var r: Run, n: Int, allow_chain: Bool) -> Int:
   return st
 
 fn no_unsafe_member_access(var c: C, var r: Run, n: Int):
-  let allow_chain = trules.opt_bool(trules.opt_of(r.cf, "no-unsafe-member-access"), "allowOptionalChaining", false)
+  # (read once a file)
+  if r.uma_chain < 0:
+    r.uma_chain = 0
+    if trules.opt_bool(trules.opt_of(r.cf, "no-unsafe-member-access"), "allowOptionalChaining", false): r.uma_chain = 1
+  let allow_chain = r.uma_chain == 1
   member_state(&c, &r, n, allow_chain)
   if c.t.nd[n].k != ast.N_ELEMACCESS: return
   if allow_chain and (c.t.nd[n].f & 1) != 0: return
@@ -688,6 +833,24 @@ fn ctx_rets(var c: C, r: Run, f: Int) -> [Int]:
   let pk = c.t.nd[pp].k
   if pk == ast.N_CALL or pk == ast.N_NEW:
     if c.t.nd[pp].a == f: return none
+    # (the parameter's type in the resolved signature, its type parameters inferred: the
+    # contextual type once the call is resolved)
+    let sg = c.call_sig.get(pp, -1)
+    if sg >= 0 and c.t.nd[pp].c >= 0:
+      var a = arg_sig(&c, sg)
+      var pt = -1
+      var found = false
+      for x in ast.items(c.t, c.t.nd[pp].c):
+        if c.t.nd[x].k == ast.N_SPREAD: break
+        let xt = next_param(&a)
+        if x == f or skip_parens(c, x) == f:
+          pt = xt
+          found = true
+          break
+      if found and pt >= 0 and c.tk[pt] != TK_UNSUP:
+        let ptn = types.filter_union(&c, pt, true, true)
+        let prs = call_rets(&c, ptn)
+        if prs.len > 0: return prs
     if f in c.ret_ctx:
       let rc = c.ret_ctx[f]
       if rc < 0: return none
@@ -701,6 +864,44 @@ fn ctx_rets(var c: C, r: Run, f: Int) -> [Int]:
   if pk == ast.N_BINARY and c.t.nd[pp].f == scan.T_ASSIGN and c.t.nd[pp].b == f:
     let lt = trules.type_at(&c, c.t.nd[pp].a)
     return call_rets(&c, lt)
+  if pk == ast.N_JSXEXPR:
+    # (an attribute's value: the props type's property, getContextualTypeForJsxAttribute)
+    var at = r.parents.get(pp, -1)
+    if at >= 0 and c.t.nd[at].k == ast.N_JSXATTR and c.t.nd[at].a >= 0:
+      var el = r.parents.get(at, -1)
+      if el >= 0 and c.t.nd[el].k == ast.N_LIST: el = r.parents.get(el, -1)
+      if el >= 0 and c.t.nd[el].k == ast.N_JSXELEM and el in c.jsx_obj:
+        let lctx = c.lit_ctx.get(c.jsx_obj[el], -1)
+        # (no contextual type for the attributes, props of any (no JSX namespace): none for the
+        # function either, its own type)
+        if lctx < 0: return none
+        let pt = trules.prop_type(&c, lctx, bind.nm(c, c.t.nd[c.t.nd[at].a].s))
+        if pt < 0: return none
+        return call_rets(&c, pt)
+  if pk == ast.N_JSXEXPR:
+    # (an element's only child, a render prop: the props type's children,
+    # getContextualTypeForChildJsxExpression)
+    var cl0 = r.parents.get(pp, -1)
+    var el0 = -1
+    if cl0 >= 0 and c.t.nd[cl0].k == ast.N_LIST: el0 = r.parents.get(cl0, -1)
+    elif cl0 >= 0 and c.t.nd[cl0].k == ast.N_JSXELEM:
+      el0 = cl0
+      cl0 = c.t.nd[el0].c
+    if el0 >= 0 and c.t.nd[el0].k == ast.N_JSXELEM and cl0 >= 0 and c.t.nd[el0].c == cl0 and types.has_int(ast.items(c.t, cl0), pp) and el0 in c.jsx_obj:
+      var nkids = 0
+      for ch in ast.items(c.t, cl0):
+        let ck = c.t.nd[ch].k
+        if ck == ast.N_JSXTEXT:
+          if (c.t.nd[ch].f & 1) == 0: nkids += 1
+        elif ck == ast.N_JSXEXPR:
+          if c.t.nd[ch].a >= 0: nkids += 1
+        else: nkids += 1
+      let lctx0 = c.lit_ctx.get(c.jsx_obj[el0], -1)
+      if nkids == 1 and lctx0 < 0: return none
+      if nkids == 1 and lctx0 >= 0:
+        let pt0 = trules.prop_type(&c, lctx0, "children")
+        if pt0 < 0: return none
+        return call_rets(&c, pt0)
   if pk == ast.N_JSXEXPR or pk == ast.N_TSPAN:
     let u = bind.lazy_unsupported(&c, f, "no-unsafe-return: a contextual type in JSX or a template")
     bind.touch(&c, u)
@@ -725,11 +926,20 @@ fn unsafe_return_check(var c: C, var r: Run, rn: Int, rep_n: Int):
       let ft = trules.type_at(&c, f)
       rets = call_rets(&c, ft)
     else:
-      if (f in c.nsym and c.nsym[f] in c.smore) or not (f in c.fsig):
+      # (an overloaded declaration: its type's call signatures, the overloads, GetCallSignatures)
+      if f in c.nsym and c.nsym[f] in c.smore and fk == ast.N_FUNC:
+        let fst = bind.type_of_sym(&c, c.nsym[f])
+        let ors = call_rets(&c, fst)
+        if ors.len == 0 or c.tk[fst] == TK_UNSUP:
+          let u0 = bind.lazy_unsupported(&c, f, "no-unsafe-return: a declaration's signatures")
+          bind.touch(&c, u0)
+          return
+        rets = ors
+      elif (f in c.nsym and c.nsym[f] in c.smore) or not (f in c.fsig):
         let u = bind.lazy_unsupported(&c, f, "no-unsafe-return: a declaration's signatures")
         bind.touch(&c, u)
         return
-      rets = [rel.sig_ret(&c, c.fsig[f])]
+      else: rets = [rel.sig_ret(&c, c.fsig[f])]
   let tnode = ret_type_node(c, f)
   let is_async = (c.t.nd[f].f & ast.M_ASYNC) != 0
   if tnode >= 0:
@@ -804,6 +1014,18 @@ type ArgSig:
 fn arg_sig(var c: C, sg: Int) -> ArgSig:
   var a = ArgSig([], 2, -1, [], 0, false)
   let n = c.sigs[sg].ptypes.len
+  # (the declared parameters, this left out: one written with ? has undefined in its type,
+  # getTypeOfSymbol; one with only an initializer doesn't)
+  var pnodes: [Int] = []
+  let sd = c.sigs[sg].node
+  if sd >= 0 and sd < c.t.nd.len:
+    let pl = decl_params(c, sd)
+    if pl >= 0:
+      for pn in ast.items(c.t, pl):
+        let pid = c.t.nd[pn].a
+        if pid >= 0 and c.t.nd[pid].k == ast.N_ID and bind.nm(c, c.t.nd[pid].s) == "this": continue
+        pnodes.push(pn)
+  if pnodes.len != n: pnodes = []
   for i in 0..n:
     if (c.sigs[sg].pflags[i] & 2) != 0:
       let rt = c.sigs[sg].ptypes[i]
@@ -816,7 +1038,9 @@ fn arg_sig(var c: C, sg: Int) -> ArgSig:
         a.rest_args = trules.type_args(c, rt)
       else: a.rest_t = rt
       return a
-    a.ptypes.push(c.sigs[sg].ptypes[i])
+    var pt = c.sigs[sg].ptypes[i]
+    if pnodes.len > 0 and (c.sigs[sg].pflags[i] & 1) != 0 and (c.t.nd[pnodes[i]].f & ast.M_OPTIONAL) != 0: pt = types.union_of(&c, [pt, c.undef_t])
+    a.ptypes.push(pt)
   return a
 
 fn next_param(var a: ArgSig) -> Int:
@@ -836,6 +1060,18 @@ fn describe(var c: C, t: Int) -> Str:
   if c.tk[t] == TK_ERROR: return "error typed"
   return trules.type_str(&c, t)
 
+# isUntypedFunctionCall: a callee with no call or construct signatures that is a Function.
+fn untyped_callee(var c: C, t: Int) -> Bool:
+  let fs = bind.global_type_sym(&c, "Function")
+  if fs < 0: return false
+  let ft = bind.declared_type(&c, fs)
+  for x in trules.parts(c, t):
+    let ax = rel.apparent(&c, x)
+    if c.tk[ax] != TK_OBJ: return false
+    if bind.sigs_of(&c, ax, false).len > 0 or bind.sigs_of(&c, ax, true).len > 0: return false
+    if not rel.assignable(&c, x, ft): return false
+  return true
+
 fn unsafe_args(var c: C, var r: Run, args: [Int], callee: Int, n: Int):
   var any_arg = false
   for a in args:
@@ -844,6 +1080,8 @@ fn unsafe_args(var c: C, var r: Run, args: [Int], callee: Int, n: Int):
   let calt = trules.type_at(&c, callee)
   if trules.is_any(c, calt): return
   let sg = c.call_sig.get(n, -1)
+  # (an untyped call, a callee of type Function: resolveUntypedCall's anySignature, no parameters)
+  if sg < 0 and c.t.nd[n].k == ast.N_CALL and untyped_callee(&c, calt): return
   if sg < 0:
     let u = bind.lazy_unsupported(&c, n, "no-unsafe-argument: the call's resolved signature")
     bind.touch(&c, u)
@@ -955,6 +1193,8 @@ fn receiver_type(var c: C, r: Run, n: Int) -> Int:
 
 # (an any assigned when id is anyAssignment: the message names the sender's kind)
 fn ua_report(var c: C, var r: Run, rp: Int, id: Str, stt: Int, rtt: Int, inferred: Bool, help0: Str):
+  # (tsgolint 7.0.2001's: the two types printed)
+  # (tsgolint 7.0.2008 no longer names the types)
   var msg = "Unsafe assignment between incompatible types."
   if id == "anyAssignment": msg = "Unsafe assignment of an {sender_text(c, stt)} value."
   let st = diag_text(&c, stt)
@@ -1024,6 +1264,16 @@ fn ua_array(var c: C, var r: Run, recv: Int, st: Int, sender: Int) -> Bool:
     if ua_elem(&c, &r, e, els[i], sender): did = true
   return did
 
+# getTypeOfPropertyOfType: of a union, the union of its members' (when every member has it)
+fn ua_prop_type(var c: C, t: Int, key: Str) -> Int:
+  if c.tk[t] != TK_UNION: return trules.prop_type(&c, t, key)
+  var pts: [Int] = []
+  for m in types.members(c, t):
+    let pt = trules.prop_type(&c, m, key)
+    if pt < 0: return -1
+    pts.push(pt)
+  return types.union_of(&c, pts)
+
 fn ua_object(var c: C, var r: Run, recv: Int, st: Int, sender: Int) -> Bool:
   var did = false
   for p in ast.items(c.t, c.t.nd[recv].a):
@@ -1056,7 +1306,7 @@ fn ua_object(var c: C, var r: Run, recv: Int, st: Int, sender: Int) -> Bool:
       val = c.t.nd[p].b
     else: continue
     if key == "" or val < 0: continue
-    let pt = trules.prop_type(&c, st, key)
+    let pt = ua_prop_type(&c, st, key)
     if pt < 0: continue
     if ua_elem(&c, &r, val, pt, sender): did = true
   return did
@@ -1097,6 +1347,112 @@ fn in_assign_pattern(c: C, r: Run, n: Int) -> Bool:
     return false
   return false
 
+# getTypeOfPropertyOfContextualType: a union's members mapped (those without the property, or an
+# index signature for it, left out; undefined and null too), else the type's property
+fn ctx_prop_type(var c: C, t: Int, key: Str) -> Int:
+  if c.tk[t] == TK_INTER: return ctx_prop_inter(&c, t, key)
+  if c.tk[t] != TK_UNION: return ctx_prop1(&c, t, key)
+  var ts: [Int] = []
+  for m in types.members(c, t):
+    if c.tk[m] == TK_UNDEF or c.tk[m] == TK_NULL: continue
+    var pt = -1
+    if c.tk[m] == TK_INTER: pt = ctx_prop_inter(&c, m, key)
+    else:
+      pt = ctx_prop1(&c, m, key)
+      if pt < 0:
+        let am = rel.apparent(&c, m)
+        if c.tk[am] == TK_OBJ: pt = bind.index_type(&c, am, false)
+    if pt >= 0: ts.push(pt)
+  if ts.len == 0: return -1
+  return types.union_of(&c, ts)
+
+# (an optional property's type has undefined in it, getTypeOfSymbol; removeMissingType takes it
+# out only under exactOptionalPropertyTypes: a receiver string[] | undefined is a union, and
+# any[] assigned to it isn't an unsafe assignment)
+fn ctx_prop1(var c: C, t: Int, key: Str) -> Int:
+  let pt = trules.prop_type(&c, t, key)
+  if pt < 0 or c.exact_opt or c.snc_off: return pt
+  let q = trules.prop_sym(&c, t, key)
+  if q >= 0 and (c.sflags[q] & types.SF_OPTIONAL) != 0: return types.union_of(&c, [pt, c.undef_t])
+  return pt
+
+# An intersection's contextual property type (getTypeOfPropertyOfContextualType): the property
+# types of the object members that have it, else those members' index signatures, intersected;
+# any (and the error type) counts as unknown there (appendContextualPropertyTypeConstituent), as
+# it would spoil what the other members say. -1 none.
+fn ctx_prop_inter(var c: C, t: Int, key: Str) -> Int:
+  var ts: [Int] = []
+  var cands: [Int] = []
+  var have = false
+  for m in types.members_inter(c, t):
+    if c.tk[m] != TK_OBJ: continue
+    let pt = ctx_prop1(&c, m, key)
+    if pt < 0:
+      if not have: cands.push(m)
+      continue
+    have = true
+    cands = []
+    if trules.is_any(c, pt): ts.push(c.unknown_t)
+    else: ts.push(pt)
+  for m in cands:
+    let am = rel.apparent(&c, m)
+    if c.tk[am] != TK_OBJ: continue
+    let it = bind.index_type(&c, am, false)
+    if it < 0: continue
+    if trules.is_any(c, it): ts.push(c.unknown_t)
+    else: ts.push(it)
+  if ts.len == 0: return -1
+  if ts.len == 1: return ts[0]
+  return types.inter_of(&c, ts)
+
+# The contextual type of an object or array literal as the uninstantiated contextual return type
+# of the function returning it (chk's ret_ctx_raw) gives it, through property values and array
+# elements; -1 none, -2 not such a literal.
+fn raw_fn_ret(var c: C, f: Int) -> Int:
+  if (c.t.nd[f].f & (ast.M_ASYNC | ast.M_GENERATOR)) != 0: return -2
+  # (a written return type is the contextual type)
+  if chk.fn_retnode(c, f) >= 0: return -2
+  if f in c.fn_arg_raw:
+    let sgs = bind.sigs_of(&c, c.fn_arg_raw[f], false)
+    if sgs.len != 1: return -2
+    return rel.sig_ret(&c, sgs[0])
+  if f in c.ret_ctx_raw: return c.ret_ctx_raw[f]
+  return -2
+
+fn raw_lit_ctx(var c: C, n: Int, depth: Int) -> Int:
+  if depth > 20: return -2
+  var x = n
+  var p = c.parent[x]
+  while p >= 0 and c.t.nd[p].k == ast.N_PAREN:
+    x = p
+    p = c.parent[p]
+  if p < 0: return -2
+  # (an array's elements are in a list)
+  if c.t.nd[p].k == ast.N_LIST and c.parent[p] >= 0 and c.t.nd[c.parent[p]].k == ast.N_ARRAY: p = c.parent[p]
+  let pk = c.t.nd[p].k
+  if pk == ast.N_ARROW and chk.fn_body(c, p) == x: return raw_fn_ret(&c, p)
+  if pk == ast.N_RETURN and c.t.nd[p].a == x:
+    let f = chk.enclosing_fn(c, p)
+    if f >= 0 and (c.t.nd[f].f & (ast.M_ASYNC | ast.M_GENERATOR)) == 0: return raw_fn_ret(&c, f)
+    return -2
+  if pk == ast.N_PROPASSIGN and c.t.nd[p].b == x:
+    var o = c.parent[p]
+    if o >= 0 and c.t.nd[o].k == ast.N_LIST: o = c.parent[o]
+    if o < 0 or c.t.nd[o].k != ast.N_OBJECT: return -2
+    let kn = c.t.nd[p].a
+    if kn < 0 or c.t.nd[kn].k != ast.N_ID: return -2
+    let r = raw_lit_ctx(&c, o, depth + 1)
+    if r < 0: return r
+    if c.tk[r] == TK_TPARAM: return -1
+    return ctx_prop_type(&c, r, trules.prop_name_of(c, kn))
+  if pk == ast.N_ARRAY:
+    let r = raw_lit_ctx(&c, p, depth + 1)
+    if r < 0: return r
+    if c.tk[r] == TK_TPARAM: return -1
+    let i = trules.index_in(c, c.t.nd[p].a, x)
+    return trules.elem_type_at(&c, r, i)
+  return -2
+
 fn no_unsafe_assignment(var c: C, var r: Run, n: Int):
   let k = c.t.nd[n].k
   if k == ast.N_PROP:
@@ -1107,11 +1463,15 @@ fn no_unsafe_assignment(var c: C, var r: Run, n: Int):
     if can_skip_sender(c, init, comp): return
     var rt = -1
     if c.nsym.get(n, -1) >= 0: rt = bind.type_of_sym(&c, c.nsym[n])
+    # (no symbol recorded for it: its annotation, else what its initializer gives, widened)
+    elif c.t.nd[n].b >= 0: rt = trules.node_type(&c, c.t.nd[n].b)
+    elif init in c.ntype: rt = chk.widen(&c, c.ntype[init])
     else: rt = unsup_here(&c, n, "no-unsafe-assignment: a property's symbol")
     ua_check(&c, &r, c.t.nd[n].a, init, n, comp, rt)
   elif k == ast.N_BINARY:
-    let op = c.t.nd[n].f
-    if op < scan.T_ASSIGN or op > scan.T_QQEQ: return
+    # (`=` only: a compound assignment isn't checked, typescript-eslint's AssignmentExpression[operator
+    # = "="])
+    if c.t.nd[n].f != scan.T_ASSIGN: return
     ua_full(&c, &r, c.t.nd[n].a, c.t.nd[n].b, n)
   elif k == ast.N_BINDEL or k == ast.N_PARAM:
     let init = c.t.nd[n].c
@@ -1142,7 +1502,14 @@ fn no_unsafe_assignment(var c: C, var r: Run, n: Int):
     if is_obj_pat(c, id): ua_object(&c, &r, id, st, init)
   elif k == ast.N_OBJECT:
     if in_assign_pattern(c, r, n): return
-    let lctx = c.lit_ctx.get(n, -1)
+    var lctx = c.lit_ctx.get(n, -1)
+    # (returned by a function argument whose contextual return type a generic call's return
+    # mapper instantiated: tsgolint's getContextualType, after the check, has the signature's
+    # own, without that instantiation)
+    let rawc = raw_lit_ctx(&c, n, 0)
+    if rawc != -2: lctx = rawc
+    # (a type parameter: no property, getTypeOfPropertyOfContextualType)
+    if lctx >= 0 and c.tk[lctx] == TK_TPARAM: lctx = -1
     for p in ast.items(c.t, c.t.nd[n].a):
       let pk = c.t.nd[p].k
       var init = -1
@@ -1158,12 +1525,52 @@ fn no_unsafe_assignment(var c: C, var r: Run, n: Int):
       let x = skip_parens(c, init)
       if c.t.nd[x].k == ast.N_BINARY and c.t.nd[x].f >= scan.T_ASSIGN and c.t.nd[x].f <= scan.T_QQEQ: return
       if can_skip_sender(c, init, 2): continue
-      # (the receiver's type: the contextual type's property, else the literal's own)
+      # (the receiver's type: the contextual type's property, else the literal's own; only an
+      # identifier key is given the contextual type, typescript-eslint's getContextualType)
+      # (tsgolint 7.0.2008: a string or number key too)
+      var kk0 = -1
+      if pk == ast.N_PROPASSIGN and c.t.nd[p].a >= 0: kk0 = c.t.nd[c.t.nd[p].a].k
+      let idkey = pk == ast.N_SHORTHAND or kk0 == ast.N_ID or kk0 == ast.N_STR or kk0 == ast.N_NUM
+      # (a key with a name: '' is one, a string key's)
+      let named = key != "" or kk0 == ast.N_STR
       var rt = -1
-      if lctx >= 0 and key != "": rt = trules.prop_type(&c, lctx, key)
-      if rt < 0 and key != "":
+      # ([k]: v, a computed key: the contextual type's string index signature (tsgolint 7.0.2008),
+      # else getTypeAtLocation of the key's expression)
+      if pk == ast.N_PROPASSIGN and kk0 == ast.N_COMPUTED:
+        if lctx >= 0:
+          let apc = rel.apparent(&c, lctx)
+          if c.tk[apc] == TK_OBJ: rt = bind.index_type(&c, apc, false)
+        let kx = c.t.nd[c.t.nd[p].a].a
+        if rt < 0 and kx >= 0: rt = trules.type_at(&c, kx)
+      if rt < 0 and idkey and lctx >= 0 and named: rt = ctx_prop_type(&c, lctx, key)
+      # (an intersection contextual type whose only member with the property has it any: not
+      # reported, as tsgolint 7.0.2001 does; probes ua-intersection-receiver)
+      if rt >= 0 and idkey and lctx >= 0 and c.tk[lctx] == TK_INTER and trules.is_any(c, rt):
+        var have = 0
+        var lack = 0
+        for im in types.members_inter(c, lctx):
+          if trules.prop_type(&c, im, key) >= 0: have += 1
+          else: lack += 1
+        if have == 1 and lack > 0: continue
+      # (a named key the contextual type has no property for: its index signature,
+      # getTypeOfPropertyOfContextualType; an intersection's are in ctx_prop_inter)
+      if rt < 0 and idkey and named and lctx >= 0 and c.tk[lctx] != TK_INTER:
+        let ap1 = rel.apparent(&c, lctx)
+        if c.tk[ap1] == TK_OBJ:
+          rt = bind.index_type(&c, ap1, false)
+      if rt < 0 and named:
         let ot = trules.type_at(&c, n)
         rt = trules.prop_type(&c, ot, key)
+        # (a union, a literal spreading a union: the property of each member having it)
+        if rt < 0 and c.tk[ot] == TK_UNION:
+          var urs: [Int] = []
+          for mi_r in 0..types.nmem(c, ot):
+            let ur = trules.prop_type(&c, types.mem(c, ot, mi_r), key)
+            if ur >= 0: urs.push(ur)
+          if urs.len > 0: rt = types.union_of(&c, urs)
+      # (no property in either, a literal spreading any say: getTypeAtLocation of the key, the
+      # property symbol's type, which is its initializer's)
+      if rt < 0 and named: rt = trules.type_at(&c, init)
       if rt < 0: rt = unsup_here(&c, p, "no-unsafe-assignment: an object literal property's receiver")
       ua_check(&c, &r, -1, init, p, 2, rt)
   elif k == ast.N_ARRAY:
@@ -1179,7 +1586,20 @@ fn no_unsafe_assignment(var c: C, var r: Run, n: Int):
     if v < 0 or c.t.nd[v].k != ast.N_JSXEXPR: return
     let e = c.t.nd[v].a
     if e < 0: return
-    unsup_here(&c, n, "no-unsafe-assignment in JSX attributes")
+    # (checkAssignment(name, expression, expression, Basic): an any value reports (against the
+    # expression's own type, as before: MUI's generic TextField's value: unknown still reports);
+    # another is checked against the props type's property, Map<any, any> to a
+    # Map<string, Asset> prop reports, any[] to an optional prop's T[] | undefined doesn't)
+    let st = trules.type_at(&c, e)
+    var rt = st
+    var el = r.parents.get(n, -1)
+    if el >= 0 and c.t.nd[el].k == ast.N_LIST: el = r.parents.get(el, -1)
+    if not trules.is_any(c, st) and c.t.nd[n].a >= 0 and el >= 0 and c.t.nd[el].k == ast.N_JSXELEM and el in c.jsx_obj:
+      let lctx = c.lit_ctx.get(c.jsx_obj[el], -1)
+      if lctx >= 0:
+        let pt = ctx_prop_type(&c, lctx, bind.nm(c, c.t.nd[c.t.nd[n].a].s))
+        if pt >= 0: rt = pt
+    ua_check(&c, &r, -1, e, e, 1, rt)
 
 # ---- no-unsafe-enum-comparison
 
@@ -1707,6 +2127,19 @@ fn fn_name_kind(c: C, r: Run, n: Int) -> Str:
       if c.t.nd[a].k == ast.N_ID: nm0 = bind.nm(c, c.t.nd[a].s)
       else: nm0 = trules.src_text(c, r, a).strip()
   elif k == ast.N_CTOR: nm0 = "constructor"
+  # (an anonymous one: the variable it initializes, the property it's the value of, or the
+  # name it's assigned to; a class field's value has none)
+  if nm0 == "" and (k == ast.N_ARROW or k == ast.N_FUNCEXPR):
+    var pp = r.parents.get(n, -1)
+    var x = n
+    while pp >= 0 and c.t.nd[pp].k == ast.N_PAREN:
+      x = pp
+      pp = r.parents.get(pp, -1)
+    if pp >= 0:
+      let pk = c.t.nd[pp].k
+      if pk == ast.N_DECL and c.t.nd[pp].c == x and c.t.nd[pp].a >= 0 and c.t.nd[c.t.nd[pp].a].k == ast.N_ID: nm0 = bind.nm(c, c.t.nd[c.t.nd[pp].a].s)
+      elif pk == ast.N_PROPASSIGN and c.t.nd[pp].b == x and c.t.nd[pp].a >= 0 and c.t.nd[c.t.nd[pp].a].k == ast.N_ID: nm0 = bind.nm(c, c.t.nd[c.t.nd[pp].a].s)
+      elif pk == ast.N_BINARY and c.t.nd[pp].f == scan.T_ASSIGN and c.t.nd[pp].b == x and c.t.nd[c.t.nd[pp].a].k == ast.N_ID: nm0 = bind.nm(c, c.t.nd[c.t.nd[pp].a].s)
   if nm0 == "": return kp
   return "{kp} '{nm0}'"
 
@@ -1743,12 +2176,46 @@ fn cr_allows_void(var c: C, var r: Run, top: Int) -> Bool:
   r.cr_state[top] = ns
   return ok
 
+# whether the end of n can't be reached, from the statements alone (as tsgolint's code paths see it:
+# a call that returns never and a switch without a default, exhaustive or not, both go on)
+fn cr_terminates(c: C, n: Int) -> Bool:
+  if n < 0: return false
+  let k = c.t.nd[n].k
+  if k == ast.N_RETURN or k == ast.N_THROW: return true
+  if k == ast.N_BLOCK:
+    for st in ast.items(c.t, c.t.nd[n].a):
+      if cr_terminates(c, st): return true
+    return false
+  if k == ast.N_IF: return c.t.nd[n].c >= 0 and cr_terminates(c, c.t.nd[n].b) and cr_terminates(c, c.t.nd[n].c)
+  if k == ast.N_TRY:
+    if c.t.nd[n].d >= 0 and cr_terminates(c, c.t.nd[n].d): return true
+    return cr_terminates(c, c.t.nd[n].a) and (c.t.nd[n].c < 0 or cr_terminates(c, c.t.nd[n].c))
+  if k == ast.N_SWITCH:
+    let cases = ast.items(c.t, c.t.nd[n].b)
+    var has_default = false
+    for cs in cases:
+      if c.t.nd[cs].a < 0: has_default = true
+    if not has_default: return false
+    for i in 0..cases.len:
+      let body = ast.items(c.t, c.t.nd[cases[i]].b)
+      for st in body:
+        if chk.has_break_direct(c, st): return false
+      if i == cases.len - 1:
+        var ends = false
+        for st in body:
+          if cr_terminates(c, st): ends = true
+        if not ends: return false
+    return true
+  if k == ast.N_LABEL: return cr_terminates(c, c.t.nd[n].a)
+  if k == ast.N_WHILE or k == ast.N_FOR or k == ast.N_DO: return chk.terminates(c, n)
+  return false
+
 fn cr_leave(var c: C, var r: Run, n: Int):
   let top = r.cr_fn.len - 1
   let st = r.cr_state[top]
   if (st & 4) == 0 and (st & 1) != 0 and (st & 2) != 0:
     let b = fn_body(c, n)
-    if b >= 0 and c.t.nd[b].k == ast.N_BLOCK and not chk.terminates(c, b) and not cr_allows_void(&c, &r, top):
+    if b >= 0 and c.t.nd[b].k == ast.N_BLOCK and not cr_terminates(c, b) and not cr_allows_void(&c, &r, top):
       rep(&r, "consistent-return", npos(c, r, n), nend(c, r, n), "missingReturnValue", fn_name_kind(c, r, n) + " expected a return value.")
   r.cr_fn.pop()
   r.cr_state.pop()
@@ -2716,6 +3183,8 @@ fn same_default(var c: C, dt: Int, at: Int) -> Bool:
   if dt == at: return true
   if c.tk[dt] != TK_OBJ or c.tk[at] != TK_OBJ:
     return false
+  # (two written {}: the same empty type, as tsgolint finds them)
+  if c.objs[c.ta[dt]].kind == types.OK_ANON and c.objs[c.ta[at]].kind == types.OK_ANON and types.empty_object(c, dt) and types.empty_object(c, at): return true
   let tg = rel.ref_target(c, dt)
   if tg < 0 or tg != rel.ref_target(c, at): return false
   let da = trules.type_args(c, dt)
@@ -2797,7 +3266,32 @@ fn unnecessary_type_args(var c: C, var r: Run, n: Int):
     if argl < 0 or ast.count(c.t, argl) == 0: return
     let nn = c.t.nd[n].a
     if c.t.nd[nn].k != ast.N_ID:
-      unsup_here(&c, n, "no-unnecessary-type-arguments: a qualified type name")
+      # (ns.T: the namespace's member, or a namespace import's export)
+      var qs = -1
+      if c.t.nd[nn].k == ast.N_QNAME or c.t.nd[nn].k == ast.N_PROPACCESS:
+        let ql = bind.qualified_left(&c, n, c.t.nd[nn].a)
+        if ql >= 0: qs = bind.ns_member(&c, ql, c.t.nd[nn].s, false)
+        if qs < 0:
+          let qf = bind.ns_import_file(&c, n, c.t.nd[nn].a)
+          if qf >= 0:
+            let qe = bind.exp_type_of(&c, qf, c.t.nd[nn].s)
+            if qe >= 0: qs = bind.resolve_alias_type(&c, qe)
+      if qs < 0:
+        # (the symbol the checker resolved it to: its type's alias, or the generic declaration a
+        # reference instantiates)
+        let rtt = trules.node_type(&c, n)
+        # (an unresolved name, a namespace import of a missing module's say: no symbol, no
+        # type parameters, nothing to report)
+        if c.tk[rtt] == TK_ERROR: return
+        if rtt in c.t_alias: qs = c.t_alias[rtt]
+        elif c.tk[rtt] == TK_OBJ and c.objs[c.ta[rtt]].kind == types.OK_REF:
+          let tg = c.objs[c.ta[rtt]].target
+          if tg >= 0: qs = c.objs[c.ta[tg]].sym
+      if qs < 0:
+        unsup_here(&c, n, "no-unnecessary-type-arguments: a qualified type name")
+        return
+      let qtpl = tparams_of_sym(&c, qs, true)
+      uta_check(&c, &r, n, argl, qtpl)
       return
     var s = bind.lookup_type(&c, n, c.t.nd[nn].s)
     if s < 0: s = bind.lookup_value(&c, n, c.t.nd[nn].s)
@@ -2807,10 +3301,31 @@ fn unnecessary_type_args(var c: C, var r: Run, n: Int):
     let argl = c.t.nd[n].b
     if argl < 0 or ast.count(c.t, argl) == 0: return
     let e = c.t.nd[n].a
+    let in_type = heritage_in_type(c, r, n)
     if c.t.nd[e].k != ast.N_ID:
+      # (<A.B<T> ...>, a JSX tag's type arguments: the resolved signature's declaration's type
+      # parameters, getTypeParametersFromCall)
+      let jp = r.parents.get(n, -1)
+      if jp >= 0 and c.t.nd[jp].k == ast.N_JSXELEM and c.t.nd[jp].a == n:
+        trules.type_at(&c, jp)
+        if jp in c.call_sig and c.call_sig[jp] >= 0:
+          var tplj = -1
+          let dj = c.sigs[c.call_sig[jp]].node
+          if dj >= 0:
+            tplj = decl_tparams(c, dj)
+            if tplj >= 0 and ast.count(c.t, tplj) == 0: tplj = -1
+          uta_check(&c, &r, n, argl, tplj)
+          return
+      # (a class's heritage A.B<T>: the class its value names, by its static side)
+      if not in_type and e in c.ntype:
+        let et = trules.type_at(&c, e)
+        if c.tk[et] == TK_ANY or c.tk[et] == TK_ERROR: return
+        if et in c.static_side:
+          let qtpl = tparams_of_sym(&c, c.static_side[et], false)
+          uta_check(&c, &r, n, argl, qtpl)
+          return
       unsup_here(&c, n, "no-unnecessary-type-arguments: a qualified heritage name")
       return
-    let in_type = heritage_in_type(c, r, n)
     var s = -1
     if in_type:
       s = bind.lookup_type(&c, n, c.t.nd[e].s)
@@ -3647,6 +4162,8 @@ fn mp_type(var c: C, n: Int) -> Int:
       let pk = c.t.nd[p].k
       var ot = -1
       if (pk == ast.N_CLASS or pk == ast.N_CLASSEXPR or pk == ast.N_INTERFACE) and p in c.nsym and (c.t.nd[n].f & ast.M_STATIC) == 0: ot = bind.declared_type(&c, c.nsym[p])
+      # (a static member: the class value's type, its static side)
+      elif (pk == ast.N_CLASS or pk == ast.N_CLASSEXPR) and p in c.nsym: ot = bind.type_of_sym(&c, c.nsym[p])
       elif pk == ast.N_OBJECT and p in c.ntype: ot = c.ntype[p]
       if ot >= 0:
         let nm0 = c.t.nd[n].a
@@ -3656,7 +4173,9 @@ fn mp_type(var c: C, n: Int) -> Int:
           if nk == ast.N_ID or nk == ast.N_STR or nk == ast.N_NUM: name = bind.nm(c, c.t.nd[nm0].s)
           elif nk == ast.N_PRIVNAME: name = "#" + bind.nm(c, c.t.nd[nm0].s)
         if name != "":
-          let ps = trules.prop_sym(&c, ot, name)
+          var ps = trules.prop_sym(&c, ot, name)
+          # (a private name: the member is keyed by its name as the lexer has it)
+          if ps < 0 and c.t.nd[nm0].k == ast.N_PRIVNAME: ps = trules.prop_sym(&c, ot, bind.nm(c, c.t.nd[nm0].s))
           if ps >= 0: return bind.type_of_sym(&c, ps)
   if k == ast.N_ID:
     let vs = bind.lookup_value(&c, n, c.t.nd[n].s)
@@ -3937,7 +4456,15 @@ fn obj_prop_sym(var c: C, r: Run, n: Int) -> Int:
   return trules.prop_sym(&c, ot, name)
 
 fn misused_promises(var c: C, var r: Run, k: Int, n: Int):
-  let o = mp_opts(trules.opt_of(r.cf, "no-misused-promises"))
+  if not r.mp_set:
+    let o0 = mp_opts(trules.opt_of(r.cf, "no-misused-promises"))
+    r.mp_set = true
+    r.mp_cond = o0.cond
+    r.mp_spread = o0.spreads
+    r.mp_vr = []
+    for x in o0.vr: r.mp_vr.push(x)
+  var o = MpOpts(r.mp_cond, r.mp_spread, [])
+  for x in r.mp_vr: o.vr.push(x)
   if k == ast.N_BINARY:
     let op = c.t.nd[n].f
     if o.cond and (op == scan.T_AND or op == scan.T_OR or op == scan.T_QQ): mp_conditional(&c, &r, n, false)
@@ -4436,6 +4963,48 @@ fn direct_mismatch(var c: C, s: Int, rt: Int) -> Bool:
     if not ok: return true
   return false
 
+# Whether deep_mismatch could find an enum literal in the receiver: the same edges (type
+# arguments, the number index, the apparent type's properties) to the same depth
+# (a primitive's apparent type, String or Number, has no enum-typed members: not followed)
+fn rt_enum(var c: C, r0: Int, depth: Int, var seen: {Int: Int}) -> Bool:
+  if depth > 5: return false
+  let rt = trules.base_constraint(&c, r0)
+  # (found from here before with at least this much depth left: found again)
+  let known = c.enum_rt_d.get(rt, -1)
+  if known >= 5 - depth: return true
+  # (and found nothing from here with at least this much depth left: nothing again, unless that
+  # search was cut short by one of its ancestors being searched, which isn't kept)
+  let kno = c.enum_rt_no.get(rt, -1)
+  if kno >= 5 - depth: return false
+  if rt in seen and seen[rt] <= depth:
+    c.enum_cut += 1
+    return false
+  seen[rt] = depth
+  let cut0 = c.enum_cut
+  let r = rt_enum1(&c, rt, depth, &seen)
+  if r and known < 5 - depth: c.enum_rt_d[rt] = 5 - depth
+  if not r and c.enum_cut == cut0 and kno < 5 - depth: c.enum_rt_no[rt] = 5 - depth
+  return r
+
+fn rt_enum1(var c: C, rt: Int, depth: Int, var seen: {Int: Int}) -> Bool:
+  for p in trules.parts(c, rt):
+    if types.is_enum_lit(c, p): return true
+  let rk = c.tk[rt]
+  if rk == TK_STRING or rk == TK_NUMBER or rk == TK_STRLIT or rk == TK_NUMLIT or rk == TK_TRUE or rk == TK_FALSE or rk == TK_BIGINT or rk == TK_BIGLIT or rk == TK_SYMBOL or rk == TK_NULL or rk == TK_UNDEF or rk == TK_VOID or rk == TK_ANY or rk == TK_UNKNOWN or rk == TK_NEVER: return false
+  for a in nea_targs(c, rt):
+    if rt_enum(&c, a, depth + 1, &seen): return true
+  let re = trules.number_index(&c, rt)
+  if re >= 0 and rt_enum(&c, re, depth + 1, &seen): return true
+  var ra2 = rt
+  if c.tk[ra2] != TK_OBJ: ra2 = rel.apparent(&c, rt)
+  if c.tk[ra2] != TK_OBJ: return false
+  for name in bind.prop_names(&c, ra2):
+    let rp = bind.get_prop(&c, ra2, name)
+    if rp < 0: continue
+    let rpt = bind.type_of_sym(&c, rp)
+    if rt_enum(&c, rpt, depth + 1, &seen): return true
+  return false
+
 fn deep_mismatch(var c: C, s0: Int, r0: Int, depth: Int, in_generic: Bool, var seen: {Int: Int}) -> Bool:
   if depth > 5: return false
   let s = trules.base_constraint(&c, s0)
@@ -4467,7 +5036,14 @@ fn deep_mismatch(var c: C, s0: Int, r0: Int, depth: Int, in_generic: Bool, var s
     let rp = bind.get_prop(&c, ra2, name)
     if rp < 0: continue
     let rpt = bind.type_of_sym(&c, rp)
-    # (a union's property: each member's)
+    # (a union's property: each member's, when every member has it: getPropertyOfType of a
+    # union, T | undefined say, has none that a member lacks)
+    var all_have = true
+    for sm in sms:
+      var sa1 = sm
+      if c.tk[sa1] != TK_OBJ and c.tk[sa1] != TK_INTER: sa1 = rel.apparent(&c, sm)
+      if trules.prop_sym(&c, sa1, bind.nm(c, name)) < 0: all_have = false
+    if not all_have: continue
     for sm in sms:
       var sa2 = sm
       if c.tk[sa2] != TK_OBJ and c.tk[sa2] != TK_INTER: sa2 = rel.apparent(&c, sm)
@@ -4478,8 +5054,40 @@ fn deep_mismatch(var c: C, s0: Int, r0: Int, depth: Int, in_generic: Bool, var s
   return false
 
 fn enum_mismatch(var c: C, s: Int, rt: Int) -> Bool:
+  # (a pure function of the two types: memoized for the worker's files)
+  let key = (s << 32) | rt
+  let v = c.enum_mm.get(key, -1)
+  if v >= 0: return v == 1
+  # (enum literal types come only from enum declarations: a program without one has none to find)
+  if c.has_enum < 0:
+    var he = 0
+    for ni in 0..c.t.nd.len:
+      if c.t.nd[ni].k == ast.N_ENUM:
+        he = 1
+        break
+    c.has_enum = he
+  if c.has_enum == 0: return false
+  # (a mismatch needs an enum literal in the receiver where deep_mismatch looks: none there,
+  # none at all, whatever the source; memoized by the receiver alone)
+  var rv = c.enum_rt.get(rt, -1)
+  if rv < 0:
+    var rseen: {Int: Int} = {}
+    rv = 0
+    if rt_enum(&c, rt, 0, &rseen): rv = 1
+    c.enum_rt[rt] = rv
+    # (nothing found within depth 5: nothing within 5 - d of whatever the search reached at depth
+    # d either, cut short or not, or the search would have found it through there)
+    if rv == 0:
+      for x, d in rseen:
+        if c.enum_rt_no.get(x, -1) < 5 - d: c.enum_rt_no[x] = 5 - d
+  if rv == 0:
+    c.enum_mm[key] = 0
+    return false
   var seen: {Int: Int} = {}
-  return deep_mismatch(&c, s, rt, 0, false, &seen)
+  let r = deep_mismatch(&c, s, rt, 0, false, &seen)
+  if r: c.enum_mm[key] = 1
+  else: c.enum_mm[key] = 0
+  return r
 
 fn nea_names(var c: C, t0: Int, depth: Int, var names: [Str], var seen: {Int: Int}):
   if depth > 5: return
@@ -4594,7 +5202,9 @@ fn nea_args(var c: C, var r: Run, n: Int, args: [Int], tagged: Bool):
         if el >= 0: rest = [el]
         else: rest = [con]
       break
-    params.push(t)
+    # (an optional parameter: undefined in its type, getTypeAtPosition's)
+    if (c.sigs[sg].pflags[i] & 1) != 0 and not c.snc_off and t >= 0: params.push(types.union_of(&c, [t, c.undef_t]))
+    else: params.push(t)
   var idx = 0
   var consumed = false
   if tagged: idx = 1
@@ -4617,6 +5227,31 @@ fn nea_args(var c: C, var r: Run, n: Int, args: [Int], tagged: Bool):
           if (ef & 2) != 0: consumed = true
         continue
       st = chk.iterated(&c, spt)
+      # (a spread of any: any elements, never an enum mismatch)
+      if st < 0 and trules.is_any(c, spt): st = spt
+      # (a union of arrays or tuples, Parameters of an overloaded method: its members' elements;
+      # an empty tuple none)
+      if st < 0 and c.tk[spt] == types.TK_UNION:
+        var its: [Int] = []
+        var ok = true
+        for mi in 0..types.nmem(c, spt):
+          let m = types.mem(c, spt, mi)
+          if c.tk[m] == types.TK_OBJ and c.objs[c.ta[m]].kind == types.OK_TUPLE and c.objs[c.ta[m]].args.len == 0: continue
+          let mt = chk.iterated(&c, m)
+          if mt < 0: ok = false
+          else: its.push(mt)
+        if ok and its.len > 0: st = types.union_of(&c, its)
+      # (a homomorphic mapped type over an array constraint: its apparent type's elements,
+      # getResolvedApparentTypeOfMappedType)
+      if st < 0 and c.tk[spt] == TK_OBJ and c.objs[c.ta[spt]].kind == OK_MAPPED:
+        let ma = chk.mapped_apparent(&c, spt)
+        if ma != spt and c.tk[ma] != TK_UNSUP: st = chk.iterated(&c, ma)
+      # (a generic one, T extends number[]: its base constraint's elements)
+      if st < 0 and tyops.is_generic(&c, spt):
+        let sb = tyops.base_of(&c, spt, 0)
+        if sb >= 0 and sb != spt and c.tk[sb] != TK_UNSUP and not tyops.is_generic(&c, sb):
+          if trules.is_any(c, sb): st = sb
+          else: st = chk.iterated(&c, sb)
       if st < 0:
         unsup_here(&c, a, "no-unsafe-enum-assignment: a spread argument of this type")
         return
@@ -4663,7 +5298,13 @@ fn mapped_key_types(var c: C, d: Int) -> [Int]:
         let bc = trules.base_constraint(&c, con)
         if enum_types(c, bc).len > 0: return [con]
       elif c.objs[o].kind == OK_MAPPED:
-        unsup_here(&c, tn, "no-unsafe-enum-assignment: a generic mapped type")
+        # (a generic mapped type: its keys' constraint, Record<T, X>'s T, getConstraintTypeFromMappedType)
+        let mk = rel.mapped_keys(&c, tt)
+        if mk < 0:
+          unsup_here(&c, tn, "no-unsafe-enum-assignment: a generic mapped type")
+          return []
+        let mbc = trules.base_constraint(&c, mk)
+        if enum_types(c, mbc).len > 0: return [mk]
     return []
   if tk == ast.N_TMAPPED:
     let tp = c.t.nd[tn].a
@@ -4684,6 +5325,36 @@ fn mapped_key_types(var c: C, d: Int) -> [Int]:
             return []
           out.push(bind.type_of_sym(&c, cs))
   return out
+
+# The receiver of an object literal's property: its contextual type with undefined added where a
+# member of the literal's contextual type has the property optional (getTypeOfPropertyOfContextualType
+# reads getTypeOfSymbol, which adds the optionality; tsgolint then finds no enum below the union).
+fn nea_opt_prop(var c: C, lit_ctx: Int, name: Int, ct: Int) -> Int:
+  if ct < 0 or name < 0 or lit_ctx < 0 or c.snc_off or c.exact_opt: return ct
+  # (optional in every member that has it: a union discriminated by the literal (success: true)
+  # leaves the member that has it required, whose type the value's context already is; an
+  # intersection's property is optional when each part having it has it optional)
+  var opt = 0
+  var req = 0
+  for mi in 0..types.nmem(c, lit_ctx):
+    let m = types.mem(c, lit_ctx, mi)
+    var parts: [Int] = []
+    if c.tk[m] == TK_OBJ: parts.push(m)
+    elif c.tk[m] == TK_INTER:
+      for ii in 0..types.ninter(c, m): parts.push(types.inter_at(c, m, ii))
+    var have = 0
+    var mopt = true
+    for x in parts:
+      if c.tk[x] != TK_OBJ: continue
+      let ps = bind.get_prop(&c, x, name)
+      if ps < 0: continue
+      have += 1
+      if (c.sflags[ps] & types.SF_OPTIONAL) == 0: mopt = false
+    if have == 0: continue
+    if mopt: opt += 1
+    else: req += 1
+  if opt == 0 or req > 0: return ct
+  return types.union_of(&c, [ct, c.undef_t])
 
 fn unsafe_enum_assignment(var c: C, var r: Run, k: Int, n: Int):
   if k == ast.N_DECL or k == ast.N_PARAM:
@@ -4799,7 +5470,19 @@ fn unsafe_enum_assignment(var c: C, var r: Run, k: Int, n: Int):
         let et = trules.number_index(&c, at)
         if et < 0: continue
         let xt = trules.type_at(&c, c.t.nd[e].a)
-        let it = chk.iterated(&c, xt)
+        var it = chk.iterated(&c, xt)
+        # (a union of arrays or tuples, [] | [Role.A]: its members' elements; an empty tuple none)
+        if it < 0 and c.tk[xt] == types.TK_UNION:
+          var its: [Int] = []
+          var ok = true
+          for mi in 0..types.nmem(c, xt):
+            let m = types.mem(c, xt, mi)
+            if c.tk[m] == types.TK_OBJ and c.objs[c.ta[m]].kind == types.OK_TUPLE and c.objs[c.ta[m]].args.len == 0: continue
+            let mt = chk.iterated(&c, m)
+            if mt < 0: ok = false
+            else: its.push(mt)
+          if ok: it = types.union_of(&c, its)
+        if it < 0 and trules.is_any(c, xt): continue
         if it < 0:
           unsup_here(&c, e, "no-unsafe-enum-assignment: a spread of this type")
           return
@@ -4817,13 +5500,18 @@ fn unsafe_enum_assignment(var c: C, var r: Run, k: Int, n: Int):
         if ct >= 0: nea_check(&c, &r, ct, c.t.nd[p].a, p, "unsafeEnumAssignment", -1)
       elif pk == ast.N_PROPASSIGN:
         let sn = c.t.nd[p].b
-        let ct = ctx_of(c, sn)
+        var ct = ctx_of(c, sn)
+        if ct >= 0 and c.t.nd[c.t.nd[p].a].k != ast.N_COMPUTED:
+          let lc = ctx_of(c, n)
+          let pn = bind.member_name(&c, p)
+          ct = nea_opt_prop(&c, lc, pn, ct)
         if ct >= 0: nea_check(&c, &r, ct, sn, p, "unsafeEnumAssignment", -1)
       elif pk == ast.N_SHORTHAND:
         let ot = ctx_of(c, n)
         if ot < 0: continue
-        let ct = chk.ctx_prop(&c, ot, c.t.nd[p].s)
-        if ct < 0: continue
+        let ct0 = chk.ctx_prop(&c, ot, c.t.nd[p].s)
+        if ct0 < 0: continue
+        let ct = nea_opt_prop(&c, ot, c.t.nd[p].s, ct0)
         var vt = c.ntype.get(p, -1)
         if vt < 0:
           let vs = bind.lookup_value(&c, p, c.t.nd[p].s)
@@ -5617,7 +6305,10 @@ fn utp_type(var c: C, var u: UtpCount, t: Int, multi: Bool, ret: Bool):
   if t < 0 or u.remaining == 0: return
   let cnt = u.usages.get(t, 0) + 1
   u.usages[t] = cnt
-  if cnt > 9: return
+  # (typescript-eslint stops past 9 visits of a type; each visit adds at least 1 to every count
+  # it reaches and a count stops changing past 2, so past 3 visits nothing changes: stopping
+  # there gives the same counts)
+  if cnt > 3: return
   let k = c.tk[t]
   if k == TK_TPARAM:
     let sym = c.ta[t]
@@ -5859,10 +6550,1501 @@ fn unnecessary_type_params(var c: C, var r: Run, k: Int, n: Int):
       le = nend(c, r, crefs[i][0])
     r.out.push(RDiag("no-unnecessary-type-parameters", npos(c, r, tp), nend(c, r, tp), "sole", "Type parameter {name} is {uses} in the {desc} signature.", "", [lp, le], ["This is the only usage of type parameter {name} in the signature."]))
 
+# ---- no-deprecated
+
+# The reason of a @deprecated JSDoc on a declaration ("" none given), or NO_DEP: none. The comment
+# comes right before the declaration's first token, or its statement's (a variable's).
+const NO_DEP = "@@NODEP@@"
+
+fn node_deprecation(c: C, d: Int) -> Str:
+  if d < 0 or d >= c.t.nd.len: return NO_DEP
+  var x = d
+  var guard = 0
+  while x >= 0 and guard < 4:
+    guard += 1
+    let key = (c.t.nd[x].file << 32) | c.t.nd[x].pos
+    if key in c.t.deprec: return c.t.deprec[key] + ""
+    # (a variable statement's modifiers come first: the comment is before them)
+    if x in c.t.mod_start:
+      let key2 = (c.t.nd[x].file << 32) | c.t.mod_start[x]
+      if key2 in c.t.deprec: return c.t.deprec[key2] + ""
+    let k = c.t.nd[x].k
+    # (a variable's comment is its statement's; a statement's, an export's)
+    if k != ast.N_DECL and k != ast.N_LIST and k != ast.N_VAR and k != ast.N_SPEC: break
+    x = c.parent[x]
+  return NO_DEP
+
+fn sym_deprecation(c: C, s: Int) -> Str:
+  if s < 0: return NO_DEP
+  for d in types.sym_decls(c, s):
+    let r = node_deprecation(c, d)
+    if r != NO_DEP: return r
+  # (a mapped type's property, Pick<S, 'a'>: the source property's declarations, unless the
+  # mapped type renames its keys with as (shouldLinkPropDeclarations))
+  if s in c.order_decl:
+    let md = c.sdecl[s]
+    let od = c.order_decl[s]
+    if od >= 0 and md >= 0 and c.t.nd[md].k == ast.N_TMAPPED and c.t.nd[md].b < 0: return node_deprecation(c, od)
+  return NO_DEP
+
+fn union_read_partial(var c: C, t: Int, name: Int) -> Bool:
+  if c.tk[t] != types.TK_UNION: return false
+  for mi in 0..types.nmem(c, t):
+    let m = types.mem(c, t, mi)
+    let am = rel.apparent(&c, m)
+    if c.tk[am] == types.TK_NEVER or c.tk[am] == types.TK_ERROR: continue
+    # (null and undefined: an optional property's context, read without them)
+    if c.tk[m] == types.TK_NULL or c.tk[m] == types.TK_UNDEF or c.tk[m] == types.TK_VOID: continue
+    if c.tk[am] == TK_OBJ or c.tk[am] == TK_INTER:
+      if chk.prop_of(&c, am, name) >= 0: continue
+      if bind.index_type(&c, am, false) >= 0: continue
+      # (an object literal's type: WritePartial, not ReadPartial)
+      if c.tk[am] == TK_OBJ and c.objs[c.ta[am]].fresh: continue
+    return true
+  return false
+
+fn dep_report(var c: C, var r: Run, pos: Int, name: Str, reason: Str):
+  var msg = "`" + name + "` is deprecated."
+  if reason != "": msg = msg + " " + reason
+  rep(&r, "no-deprecated", pos, pos + name.len, "deprecated", msg)
+
+fn dep_shorthand(var c: C, var r: Run, p: Int):
+  let name = c.t.nd[p].s
+  if name < 0: return
+  let s0 = bind.lookup_value(&c, p, name)
+  if s0 < 0: return
+  let s = bind.resolve_alias(&c, s0)
+  var reason = sym_deprecation(c, s)
+  if reason == NO_DEP and s != s0: reason = sym_deprecation(c, s0)
+  if reason == NO_DEP: return
+  dep_report(&c, &r, c.t.nd[p].pos, bind.nm(c, name), reason)
+
+fn no_deprecated(var c: C, var r: Run, k: Int, n: Int):
+  if c.t.deprec.len == 0: return
+  if k == ast.N_PROPACCESS:
+    let name = c.t.nd[n].s
+    if name < 0: return
+    let ot = c.ntype.get(c.t.nd[n].a, -1)
+    if ot < 0: return
+    var reason = NO_DEP
+    for mi in 0..types.nmem(c, ot):
+      let m = types.mem(c, ot, mi)
+      let am = rel.apparent(&c, m)
+      if c.tk[am] != TK_OBJ and c.tk[am] != TK_INTER: continue
+      let ps = chk.prop_of(&c, am, name)
+      if ps < 0: continue
+      # (a call of a method: the resolved signature's comment when it has one, getCallLikeDeprecation)
+      let pp = r.parents.get(n, -1)
+      if pp >= 0 and c.t.nd[pp].k == ast.N_CALL and c.t.nd[pp].a == n and pp in c.call_sig:
+        let sd = c.sigs[c.call_sig[pp]].node
+        let dk = c.sdecl[ps]
+        if dk >= 0 and (c.t.nd[dk].k == ast.N_METHOD or c.t.nd[dk].k == ast.N_FUNC):
+          reason = node_deprecation(c, sd)
+          # (one declaration: the signature's is the method's own)
+          if reason == NO_DEP and types.sym_decls(c, ps).len == 1: reason = sym_deprecation(c, ps)
+          if reason != NO_DEP: break
+          continue
+      reason = sym_deprecation(c, ps)
+      if reason != NO_DEP: break
+    if reason == NO_DEP: return
+    dep_report(&c, &r, c.t.nd[n].d, bind.nm(c, name), reason)
+    return
+  if k == ast.N_ID:
+    # (a reference: checked as an expression, not a declaration's name)
+    if not (n in c.ntype): return
+    let s0 = bind.lookup_value(&c, n, c.t.nd[n].s)
+    if s0 < 0: return
+    let s = bind.resolve_alias(&c, s0)
+    var reason = sym_deprecation(c, s)
+    if reason == NO_DEP and s != s0: reason = sym_deprecation(c, s0)
+    let pp = r.parents.get(n, -1)
+    # (a call or new of the name: a function's resolved signature's comment; of anything else,
+    # a variable or a class, the symbol's comment, else the signature's, getCallLikeDeprecation)
+    if pp >= 0 and (c.t.nd[pp].k == ast.N_CALL or c.t.nd[pp].k == ast.N_NEW) and c.t.nd[pp].a == n and pp in c.call_sig and s >= 0 and c.sdecl[s] >= 0:
+      let sgn = c.sigs[c.call_sig[pp]].node
+      let dk = c.t.nd[c.sdecl[s]].k
+      if dk == ast.N_FUNC:
+        if c.t.nd[pp].k == ast.N_CALL: reason = node_deprecation(c, sgn)
+      elif reason == NO_DEP and sgn >= 0:
+        let sk = c.t.nd[sgn].k
+        if sk == ast.N_CTOR or sk == ast.N_CALLSIG or sk == ast.N_CTORSIG or sk == ast.N_METHOD or sk == ast.N_FUNC: reason = node_deprecation(c, sgn)
+    if reason == NO_DEP: return
+    dep_report(&c, &r, c.t.nd[n].pos, bind.nm(c, c.t.nd[n].s), reason)
+    return
+  if k == ast.N_TQUERY:
+    # (typeof a.b.c: each property of the chain, as a property access is)
+    let e = c.t.nd[n].a
+    if e < 0 or c.t.nd[e].k != ast.N_QNAME: return
+    var qns: [Int] = []
+    var x = e
+    while c.t.nd[x].k == ast.N_QNAME:
+      qns.push(x)
+      x = c.t.nd[x].a
+    if c.t.nd[x].k != ast.N_ID: return
+    let vs = bind.lookup_value(&c, n, c.t.nd[x].s)
+    if vs < 0: return
+    var t = bind.type_of_sym(&c, vs)
+    var i = qns.len - 1
+    while i >= 0 and t >= 0 and c.tk[t] != TK_UNSUP:
+      let q = qns[i]
+      let ap = rel.apparent(&c, t)
+      if c.tk[ap] != TK_OBJ and c.tk[ap] != TK_INTER: return
+      let ps = chk.prop_of(&c, ap, c.t.nd[q].s)
+      if ps < 0: return
+      let reason = sym_deprecation(c, ps)
+      if reason != NO_DEP: dep_report(&c, &r, c.t.nd[q].f, bind.nm(c, c.t.nd[q].s), reason)
+      t = bind.type_of_sym(&c, ps)
+      i -= 1
+    return
+  if k == ast.N_EXPORT:
+    # (each specifier of an export list: the exported symbol, at the exported name)
+    let lst = c.t.nd[n].b
+    if lst < 0: return
+    let ms = c.t.nd[n].a
+    var g = -1
+    if ms >= 0:
+      g = quiet_module(&c, n, ms)
+      if g < 0: return
+    for sp in ast.items(c.t, lst):
+      let ename = c.t.nd[sp].s
+      if ename < 0: continue
+      var lname = ename
+      if c.t.nd[sp].b >= 0:
+        if c.t.nd[c.t.nd[sp].b].k != ast.N_ID: continue
+        lname = c.t.nd[c.t.nd[sp].b].s
+      var s0 = -1
+      var s1 = -1
+      if ms >= 0:
+        s0 = bind.exp_of(&c, g, lname)
+        if s0 >= 0: s1 = bind.resolve_alias(&c, s0)
+        if s1 < 0 or not (s1 >= 0 and (c.sk[s1] & types.S_VALUE) != 0):
+          let t0 = bind.exp_type_of(&c, g, lname)
+          if t0 >= 0:
+            s0 = t0
+            s1 = bind.resolve_alias_type(&c, t0)
+      else:
+        s0 = bind.lookup_value(&c, sp, lname)
+        if s0 >= 0: s1 = bind.resolve_alias(&c, s0)
+        else:
+          s0 = bind.lookup_type(&c, sp, lname)
+          if s0 >= 0: s1 = bind.resolve_alias_type(&c, s0)
+      if s1 < 0: continue
+      var reason = sym_deprecation(c, s1)
+      if reason == NO_DEP and s0 != s1: reason = sym_deprecation(c, s0)
+      if reason == NO_DEP: continue
+      var at = c.t.npos.get(sp, -1)
+      if c.t.nd[sp].b >= 0 or at < 0: at = trules.back_trivia(r.src, 0, c.t.nd[sp].end) - bind.nm(c, ename).len
+      dep_report(&c, &r, at, bind.nm(c, ename), reason)
+    return
+  if k == ast.N_TREF:
+    let nn = c.t.nd[n].a
+    if nn >= 0 and c.t.nd[nn].k == ast.N_QNAME:
+      # (ns.T, z.ZodTypeAny: the right name's symbol, through a namespace or a namespace import)
+      let rn = c.t.nd[nn].s
+      if rn < 0: return
+      var qs = -1
+      let left = bind.qualified_left(&c, n, c.t.nd[nn].a)
+      if left >= 0: qs = bind.ns_member(&c, left, rn, false)
+      else:
+        let mf = bind.ns_import_file(&c, n, c.t.nd[nn].a)
+        if mf < 0: return
+        let e0 = bind.exp_type_of(&c, mf, rn)
+        if e0 < 0: return
+        qs = e0
+      if qs < 0: return
+      let qr = bind.resolve_alias_type(&c, qs)
+      var qreason = sym_deprecation(c, qr)
+      if qreason == NO_DEP and qr != qs: qreason = sym_deprecation(c, qs)
+      if qreason == NO_DEP: return
+      dep_report(&c, &r, c.t.nd[nn].f, bind.nm(c, rn), qreason)
+      return
+    if nn < 0 or c.t.nd[nn].k != ast.N_ID: return
+    let s0 = bind.lookup_type(&c, n, c.t.nd[nn].s)
+    if s0 < 0: return
+    let s = bind.resolve_alias_type(&c, s0)
+    let reason = sym_deprecation(c, s)
+    if reason == NO_DEP: return
+    dep_report(&c, &r, c.t.nd[nn].pos, bind.nm(c, c.t.nd[nn].s), reason)
+    return
+  if k == ast.N_OBJECT:
+    # (an object literal's keys: the contextual type's property of the name)
+    let lctx = c.lit_ctx.get(n, -1)
+    for p in ast.items(c.t, c.t.nd[n].a):
+      # (a shorthand's value: the variable it reads, getShorthandAssignmentValueSymbol)
+      if lctx < 0 or c.t.nd[p].k == ast.N_SHORTHAND:
+        if c.t.nd[p].k == ast.N_SHORTHAND and lctx < 0: dep_shorthand(&c, &r, p)
+        if lctx < 0: continue
+      let pk = c.t.nd[p].k
+      var kn = -1
+      var kpos = c.t.nd[p].pos
+      if pk == ast.N_PROPASSIGN or pk == ast.N_METHOD or pk == ast.N_GET or pk == ast.N_SET:
+        kn = bind.member_name(&c, p)
+        if pk == ast.N_PROPASSIGN and c.t.nd[p].a >= 0: kpos = c.t.nd[c.t.nd[p].a].pos
+      elif pk == ast.N_SHORTHAND: kn = c.t.nd[p].s
+      if kn < 0: continue
+      var reason = NO_DEP
+      # (the contextual type's property, getPropertyOfType: none for a union with a member that
+      # has neither it nor an index signature for it (ReadPartial))
+      if union_read_partial(&c, lctx, kn): continue
+      for mi in 0..types.nmem(c, lctx):
+        let m = types.mem(c, lctx, mi)
+        let am = rel.apparent(&c, m)
+        if c.tk[am] != TK_OBJ and c.tk[am] != TK_INTER: continue
+        let ps = chk.prop_of(&c, am, kn)
+        if ps < 0: continue
+        reason = sym_deprecation(c, ps)
+        if reason != NO_DEP: break
+      if reason != NO_DEP: dep_report(&c, &r, kpos, bind.nm(c, kn), reason)
+      elif pk == ast.N_SHORTHAND: dep_shorthand(&c, &r, p)
+    return
+  if k == ast.N_OBJPAT:
+    # (a binding pattern's names: the destructured type's property, at the key and at a renamed
+    # binding both)
+    let pt = trules.pattern_type(&c, r, n)
+    if pt < 0: return
+    for el in ast.items(c.t, c.t.nd[n].a):
+      if c.t.nd[el].k != ast.N_BINDEL or (c.t.nd[el].f & ast.M_REST) != 0: continue
+      var kn = c.t.nd[el].a
+      let vn = c.t.nd[el].b
+      let renamed = kn >= 0
+      if kn < 0: kn = vn
+      if kn < 0 or c.t.nd[kn].k != ast.N_ID: continue
+      let name = c.t.nd[kn].s
+      if name < 0: continue
+      if union_read_partial(&c, pt, name): continue
+      var reason = NO_DEP
+      for mi in 0..types.nmem(c, pt):
+        let m = types.mem(c, pt, mi)
+        let am = rel.apparent(&c, m)
+        if c.tk[am] != TK_OBJ and c.tk[am] != TK_INTER: continue
+        let ps = chk.prop_of(&c, am, name)
+        if ps < 0: continue
+        reason = sym_deprecation(c, ps)
+        if reason != NO_DEP: break
+      if reason == NO_DEP: continue
+      dep_report(&c, &r, c.t.nd[kn].pos, bind.nm(c, name), reason)
+      if renamed and vn >= 0 and c.t.nd[vn].k == ast.N_ID: dep_report(&c, &r, c.t.nd[vn].pos, bind.nm(c, c.t.nd[vn].s), reason)
+    return
+  if k == ast.N_JSXATTR:
+    # (an attribute: the props type's property)
+    let an = c.t.nd[n].a
+    if an < 0: return
+    var el = r.parents.get(n, -1)
+    if el >= 0 and c.t.nd[el].k == ast.N_LIST: el = r.parents.get(el, -1)
+    if el < 0 or not (el in c.jsx_obj): return
+    let lctx = c.lit_ctx.get(c.jsx_obj[el], -1)
+    if lctx < 0: return
+    var reason = NO_DEP
+    for mi in 0..types.nmem(c, lctx):
+      let m = types.mem(c, lctx, mi)
+      let am = rel.apparent(&c, m)
+      if c.tk[am] != TK_OBJ and c.tk[am] != TK_INTER: continue
+      let ps = chk.prop_of(&c, am, c.t.nd[an].s)
+      if ps < 0: continue
+      reason = sym_deprecation(c, ps)
+      if reason != NO_DEP: break
+    if reason == NO_DEP: return
+    dep_report(&c, &r, c.t.nd[an].pos, bind.nm(c, c.t.nd[an].s), reason)
+
+# ---- no-unnecessary-type-assertion (typescript-eslint 8.59's rule)
+
+const NUTA_RULE = "no-unnecessary-type-assertion"
+const NUTA_MSG = "This assertion is unnecessary since it does not change the type of the expression."
+const NUTA_CTX_MSG = "This assertion is unnecessary since the receiver accepts the original type of the expression."
+
+# The parent as ESTree has it (parentheses skipped).
+fn nuta_parent(c: C, n: Int) -> Int:
+  var p = trules.up(c, n)
+  while p >= 0 and c.t.nd[p].k == ast.N_PAREN: p = trules.up(c, p)
+  return p
+
+# isPossiblyUsedBeforeAssigned: a typed let without an initializer read where its type is still the
+# declared one
+fn uta_maybe_unassigned(var c: C, e: Int) -> Bool:
+  let k = c.t.nd[e].k
+  var s = -1
+  if k == ast.N_ID: s = bind.lookup_value(&c, e, c.t.nd[e].s)
+  else: return false
+  if s < 0: return false
+  let d = c.sdecl[s]
+  if d < 0 or c.t.nd[d].k != ast.N_DECL: return false
+  if c.t.nd[d].c >= 0 or (c.t.nd[d].f & ast.M_EXCL) != 0 or c.t.nd[d].b < 0: return false
+  let vd = c.parent[d]
+  if vd >= 0 and c.t.nd[vd].k == ast.N_LIST: return uta_typed_unassigned(&c, e, d, c.parent[vd])
+  return uta_typed_unassigned(&c, e, d, vd)
+
+fn uta_typed_unassigned(var c: C, e: Int, d: Int, vs: Int) -> Bool:
+  # (declare let x: T; isn't narrowed: never skipped)
+  if vs >= 0 and c.t.nd[vs].k == ast.N_VAR and (c.t.nd[vs].d & ast.M_DECLARE) != 0: return false
+  let dt = trules.node_type(&c, c.t.nd[d].b)
+  let t = trules.constrained_at(&c, e)
+  return dt == t
+
+fn unnecessary_assertion(var c: C, var r: Run, k: Int, n: Int):
+  if k == ast.N_NONNULL:
+    let p = r.parents.get(n, -1)
+    if p >= 0 and c.t.nd[p].k == ast.N_BINARY and c.t.nd[p].f == scan.T_ASSIGN:
+      if c.t.nd[p].a == n: rep(&r, "no-unnecessary-type-assertion", npos(c, r, n), nend(c, r, n), "contextuallyUnnecessary", "This assertion is unnecessary since the receiver accepts the original type of the expression.")
+      return
+    let e = c.t.nd[n].a
+    # (an operand the checker didn't record, inside an object literal's value say: skipped, so
+    # the rule never leaves a file unchecked)
+    if not (skip_parens(c, e) in c.ntype) and not (e in c.ntype): return
+    let t = trules.constrained_at(&c, e)
+    if t < 0 or c.tk[t] == TK_UNSUP: return
+    let nullable = c.tk[t] == TK_ANY or c.tk[t] == TK_ERROR or c.tk[t] == TK_UNKNOWN or uta_has(c, t, TK_NULL) or uta_has(c, t, TK_UNDEF) or uta_has(c, t, TK_VOID)
+    if not nullable:
+      if uta_maybe_unassigned(&c, skip_parens(c, e)): return
+      # (at the expression's start, without its leading trivia: tsgolint 7.0.2008)
+      let fs = npos(c, r, n)
+      rep(&r, "no-unnecessary-type-assertion", fs, nend(c, r, n), "unnecessaryAssertion", "This assertion is unnecessary since it does not change the type of the expression.")
+      return
+    let ct = uta_context(&c, r, n)
+    if ct < 0 or c.tk[ct] == TK_UNSUP: return
+    if c.tk[t] == TK_UNKNOWN and c.tk[ct] != TK_UNKNOWN: return
+    let ok_u = not uta_has(c, t, TK_UNDEF) or uta_has(c, ct, TK_UNDEF)
+    let ok_n = not uta_has(c, t, TK_NULL) or uta_has(c, ct, TK_NULL)
+    let ok_v = not uta_has(c, t, TK_VOID) or uta_has(c, ct, TK_VOID)
+    if ok_u and ok_n and ok_v: rep(&r, "no-unnecessary-type-assertion", npos(c, r, n), nend(c, r, n), "contextuallyUnnecessary", "This assertion is unnecessary since the receiver accepts the original type of the expression.")
+    return
+  # x as T, <T>x
+  uta_assertion(&c, &r, n)
+
+fn nuta_tvar(var c: C, t: Int) -> Bool:
+  var seen: {Int: Bool} = {}
+  return nuta_contains(&c, t, false, &seen)
+
+# isTypeFlagSet on a union: some member has the flag (getTypeFlags joins them).
+fn nuta_has_kind(c: C, t: Int, k: Int) -> Bool:
+  for m in types.members(c, t):
+    if c.tk[m] == k: return true
+  return false
+
+fn nuta_literal(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE
+
+# getIndexInfosOfType(t).length > 0 (a primitive by its apparent type; a union: every member's)
+fn nuta_index(var c: C, t: Int) -> Bool:
+  if c.tk[t] == TK_UNION:
+    for m in types.members(c, t):
+      if not nuta_index(&c, m): return false
+    return true
+  if c.tk[t] == TK_INTER:
+    for m in types.members_inter(c, t):
+      if nuta_index(&c, m): return true
+    return false
+  var a = t
+  if c.tk[t] != TK_OBJ: a = rel.apparent(&c, t)
+  if c.tk[a] != TK_OBJ: return false
+  if bind.index_type(&c, a, false) >= 0 or bind.index_type(&c, a, true) >= 0: return true
+  let o = c.ta[a]
+  return o in c.tidx or o in c.yidx
+
+# getProperties (a primitive's: its apparent type's)
+fn nuta_props(var c: C, t: Int) -> [Int]:
+  var a = t
+  if c.tk[t] != TK_OBJ and c.tk[t] != TK_INTER and c.tk[t] != TK_UNION: a = rel.apparent(&c, t)
+  if c.tk[a] != TK_OBJ and c.tk[a] != TK_INTER: return []
+  return bind.prop_names(&c, a)
+
+fn nuta_prop_readonly(var c: C, t: Int, name: Int) -> Bool:
+  var a = t
+  if c.tk[t] != TK_OBJ and c.tk[t] != TK_INTER: a = rel.apparent(&c, t)
+  if c.tk[a] != TK_OBJ and c.tk[a] != TK_INTER: return false
+  let ps = bind.get_prop(&c, a, name)
+  if ps < 0: return false
+  return (c.sflags[ps] & types.SF_READONLY) != 0
+
+fn nuta_same_props(var c: C, u: Int, t: Int) -> Bool:
+  let up = nuta_props(&c, u)
+  let tp = nuta_props(&c, t)
+  if up.len != tp.len: return false
+  var names: {Int: Bool} = {}
+  for x in tp: names[x] = true
+  for x in up:
+    if not (x in names): return false
+    if nuta_prop_readonly(&c, u, x) != nuta_prop_readonly(&c, t, x): return false
+  return true
+
+fn nuta_same_args(c: C, u: Int, t: Int) -> Bool:
+  let ua = trules.type_args(c, u)
+  let ta = trules.type_args(c, t)
+  if ua.len != ta.len: return false
+  for i in 0..ua.len:
+    if ua[i] != ta[i]: return false
+  return true
+
+fn nuta_conceptual_literal(c: C, e: Int) -> Bool:
+  let k = c.t.nd[e].k
+  return k == ast.N_STR or k == ast.N_NUM or k == ast.N_BIGINT or k == ast.N_TRUE or k == ast.N_FALSE or k == ast.N_NULL or k == ast.N_REGEX or k == ast.N_ARRAY or k == ast.N_OBJECT or k == ast.N_TEMPL or k == ast.N_NOSUBTEMPL or k == ast.N_CLASSEXPR or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_JSXELEM
+
+fn nuta_empty_obj(var c: C, t: Int) -> Bool:
+  if c.tk[t] == TK_NONPRIM: return true
+  if c.tk[t] != TK_OBJ: return false
+  return bind.prop_names(&c, t).len == 0 and bind.sigs_of(&c, t, false).len == 0 and bind.sigs_of(&c, t, true).len == 0 and bind.index_type(&c, t, false) < 0 and bind.index_type(&c, t, true) < 0
+
+fn nuta_unchanged(var c: C, n: Int, e: Int, u: Int, t: Int) -> Bool:
+  if u == t: return true
+  let tn = c.t.nd[n].b
+  if tn >= 0 and c.t.nd[tn].k == ast.N_TINTER and nuta_tvar(&c, t): return false
+  if c.exact_opt and nuta_has_kind(c, u, TK_UNDEF) and nuta_has_kind(c, t, TK_UNDEF):
+    var us: [Int] = []
+    var ts: [Int] = []
+    for m in types.members(c, u):
+      if c.tk[m] != TK_UNDEF: us.push(m)
+    for m in types.members(c, t):
+      if c.tk[m] != TK_UNDEF: ts.push(m)
+    if us.len != ts.len: return false
+    for m in ts:
+      if not types.has_int(us, m): return false
+    return true
+  if nuta_has_kind(c, u, TK_NONPRIM) and not nuta_has_kind(c, t, TK_NONPRIM): return false
+  if nuta_index(&c, u) and not nuta_index(&c, t): return false
+  if nuta_any(&c, u) or nuta_any(&c, t): return false
+  if nuta_tvar(&c, t) and not nuta_tvar(&c, u): return false
+  if nuta_conceptual_literal(c, e):
+    if c.t.nd[e].k != ast.N_OBJECT or ast.items(c.t, c.t.nd[e].a).len == 0: return false
+    for pn in nuta_props(&c, t):
+      let tap = rel.apparent(&c, t)
+      let ps = bind.get_prop(&c, tap, pn)
+      if ps >= 0:
+        let ppt = bind.prop_type_for(&c, ps, t)
+        if nuta_literal(c, ppt): return false
+  if c.tk[t] == TK_INTER and c.tk[u] != TK_INTER:
+    let cps = types.members_inter(c, t)
+    if c.tk[u] == TK_TPARAM and cps.len == 2 and types.has_int(cps, u):
+      var other = cps[0]
+      if other == u: other = cps[1]
+      if nuta_empty_obj(&c, other) and not nuta_tvar(&c, other):
+        let con = trules.base_constraint(&c, u)
+        if con >= 0 and con != u and not trules2_nullable(c, con): return true
+    return false
+  if not nuta_same_props(&c, u, t) or not nuta_same_args(c, u, t): return false
+  return rel.assignable_plain(&c, u, t) and rel.assignable_plain(&c, t, u)
+
+fn trules2_nullable(c: C, t: Int) -> Bool:
+  for m in types.members(c, t):
+    let k = c.tk[m]
+    if k == TK_NULL or k == TK_UNDEF or k == TK_ANY or k == TK_UNKNOWN or k == TK_VOID: return true
+  return false
+
+# isImplicitlyNarrowedLiteralDeclaration
+fn nuta_narrowed_decl(c: C, n: Int) -> Bool:
+  let e = trules.unparen(c, c.t.nd[n].a)
+  if c.t.nd[e].k == ast.N_TEMPL and c.t.nd[e].a >= 0 and ast.items(c.t, c.t.nd[e].a).len > 0: return false
+  let p = nuta_parent(c, n)
+  if p < 0: return false
+  if c.t.nd[p].k == ast.N_PROP: return (c.t.nd[p].f & ast.M_READONLY) != 0
+  if c.t.nd[p].k == ast.N_DECL:
+    let vl = nuta_parent(c, p)
+    return vl >= 0 and c.t.nd[vl].k == ast.N_VAR and c.t.nd[vl].f == 2
+  return false
+
+fn nuta_args(c: C, call: Int) -> [Int]:
+  let al = c.t.nd[call].c
+  if al < 0: return []
+  return ast.items(c.t, al)
+
+fn nuta_is_arg(c: C, n: Int, p: Int) -> Bool:
+  if c.t.nd[p].k != ast.N_CALL and c.t.nd[p].k != ast.N_NEW: return false
+  for a in nuta_args(c, p):
+    if trules.unparen(c, a) == n or a == n: return true
+  return false
+
+fn nuta_overloaded_arg(var c: C, n: Int, p: Int) -> Bool:
+  if not nuta_is_arg(c, n, p): return false
+  let ct = trules.type_at(&c, c.t.nd[p].a)
+  var a = ct
+  if c.tk[ct] != TK_OBJ and c.tk[ct] != TK_INTER: a = rel.apparent(&c, ct)
+  let sgs = bind.sigs_of(&c, a, c.t.nd[p].k == ast.N_NEW)
+  if sgs.len <= 1: return false
+  var idx = 0
+  let args = nuta_args(c, p)
+  for i in 0..args.len:
+    if trules.unparen(c, args[i]) == n or args[i] == n: idx = i
+  var pts: [Int] = []
+  for sg in sgs:
+    let ps = types.ints(c.sigs[sg].ptypes)
+    if idx >= ps.len: return true
+    var pt = ps[idx]
+    if types.ints(c.sigs[sg].pflags)[idx] == 2:
+      let targs = trules.type_args(c, pt)
+      if targs.len > 0: pt = targs[0]
+    pts.push(pt)
+  var all_same = true
+  for x in pts:
+    if x != pts[0]: all_same = false
+  if all_same: return false
+  let ut = trules.type_at(&c, c.t.nd[n].a)
+  for x in pts:
+    if not rel.assignable_plain(&c, ut, x): return true
+  return false
+
+fn nuta_generic_sig(var c: C, t: Int) -> Bool:
+  var a = t
+  if c.tk[t] != TK_OBJ and c.tk[t] != TK_INTER: a = rel.apparent(&c, t)
+  for sg in bind.sigs_of(&c, a, false):
+    if c.sigs[sg].tparams.len > 0: return true
+  return false
+
+fn nuta_generic_context(var c: C, n: Int) -> Bool:
+  var seen_fn = false
+  var cur = nuta_parent(c, n)
+  while cur >= 0:
+    let k = c.t.nd[cur].k
+    if k == ast.N_FUNC: return false
+    if k == ast.N_FUNCEXPR or k == ast.N_ARROW:
+      var body = c.t.nd[cur].d
+      if body >= 0 and c.t.nd[body].k == ast.N_BLOCK: return false
+      if seen_fn: return false
+      seen_fn = true
+    if k == ast.N_CALL or k == ast.N_NEW:
+      var skip = c.t.nd[cur].b >= 0
+      let callee = c.t.nd[cur].a
+      if not skip and k == ast.N_CALL and c.t.nd[trules.unparen(c, callee)].k == ast.N_PROPACCESS and nuta_is_arg(c, n, cur): skip = true
+      if not skip:
+        let cty = trules.type_at(&c, callee)
+        if nuta_generic_sig(&c, cty): return true
+    cur = nuta_parent(c, cur)
+  return false
+
+# the node's full start: back over the whitespace before it (tsgolint's node.Loc)
+fn uta_full_start(c: C, r: Run, n: Int) -> Int:
+  var fs = npos(c, r, n)
+  while fs > 0 and (r.src[fs - 1] == ' ' or r.src[fs - 1] == '\t' or r.src[fs - 1] == '\n' or r.src[fs - 1] == '\r'): fs -= 1
+  return fs
+
+# (at the node's full start: tsgolint's node.Loc)
+fn uta_report_ctx(var c: C, var r: Run, n: Int):
+  rep(&r, "no-unnecessary-type-assertion", nuta_pos(c, r, n, npos(c, r, n)), nend(c, r, n), "contextuallyUnnecessary", "This assertion is unnecessary since the receiver accepts the original type of the expression.")
+
+# (tsgolint v7.0.2001's checkTypeAssertion, its closures as uta_* functions)
+
+# a node's parent, past the argument lists the tree puts between them
+fn uta_up(c: C, r: Run, n: Int) -> Int:
+  var p = r.parents.get(n, -1)
+  if p >= 0 and c.t.nd[p].k == ast.N_LIST: p = r.parents.get(p, -1)
+  return p
+
+# parentThroughParens
+fn uta_up_np(c: C, r: Run, n: Int) -> Int:
+  var p = uta_up(c, r, n)
+  while p >= 0 and c.t.nd[p].k == ast.N_PAREN: p = uta_up(c, r, p)
+  return p
+
+fn uta_is_assert(c: C, n: Int) -> Bool:
+  let k = c.t.nd[n].k
+  return k == ast.N_AS or k == ast.N_TYPEASSERT
+
+# typeContains: the type, its union and intersection parts, type arguments (an alias's, else a
+# reference's) and call signatures' parameters and return types (pred 0: any, 1: a type variable)
+fn uta_contains(var c: C, t: Int, pred: Int, var seen: {Int: Bool}) -> Bool:
+  if t < 0 or t in seen: return false
+  seen[t] = true
+  let k = c.tk[t]
+  if pred == 0 and (k == TK_ANY or k == TK_ERROR): return true
+  if pred == 1 and (k == TK_TPARAM or k == types.TK_INDEXED or k == types.TK_KEYOF): return true
+  if k == TK_UNION:
+    for m in types.members(c, t):
+      if uta_contains(&c, m, pred, &seen): return true
+  if k == TK_INTER:
+    for m in types.members_inter(c, t):
+      if uta_contains(&c, m, pred, &seen): return true
+  for a in uta_targs(c, t):
+    if uta_contains(&c, a, pred, &seen): return true
+  if k == TK_OBJ:
+    for sg in bind.sigs_of(&c, t, false):
+      let pts = types.ints(c.sigs[sg].ptypes)
+      for pt in pts:
+        if uta_contains(&c, pt, pred, &seen): return true
+      let rt = rel.sig_ret(&c, sg)
+      if uta_contains(&c, rt, pred, &seen): return true
+  return false
+
+fn uta_any(var c: C, t: Int) -> Bool:
+  var seen: {Int: Bool} = {}
+  return uta_contains(&c, t, 0, &seen)
+
+fn uta_tvar(var c: C, t: Int) -> Bool:
+  var seen: {Int: Bool} = {}
+  return uta_contains(&c, t, 1, &seen)
+
+# getTypeArguments: an alias's, else a reference's
+fn uta_targs(c: C, t: Int) -> [Int]:
+  if t in c.t_alias_args:
+    let aa = types.ints(c.t_alias_args[t])
+    if aa.len > 0: return aa
+  return trules.type_args(c, t)
+
+fn uta_has_index(var c: C, t: Int) -> Bool:
+  for m in types.members(c, t):
+    if c.tk[m] != TK_OBJ: continue
+    if bind.index_type(&c, m, false) >= 0 or bind.index_type(&c, m, true) >= 0 or bind.symbol_index(&c, m) >= 0: return true
+  return false
+
+# getPropertiesOfType: an object's, a union's common ones, an intersection's together (none of a
+# primitive)
+fn uta_props(var c: C, t: Int) -> [Int]:
+  let k = c.tk[t]
+  if k == TK_OBJ: return bind.prop_names(&c, t)
+  var out: [Int] = []
+  if k == TK_INTER:
+    # (each name once, in the order the members first have it)
+    var seen: {Int: Bool} = {}
+    for m in types.members_inter(c, t):
+      for x in uta_props(&c, m):
+        if not (x in seen):
+          seen[x] = true
+          out.push(x)
+    return out
+  if k == TK_UNION:
+    let ms = types.members(c, t)
+    if ms.len == 0: return out
+    let first = uta_props(&c, ms[0])
+    # (the names every member has, in the first's order: each member's names read once)
+    var sets: [{Int: Bool}] = []
+    for m in ms[1..ms.len]:
+      var st: {Int: Bool} = {}
+      for x in uta_props(&c, m): st[x] = true
+      sets.push(st)
+    for x in first:
+      var all = true
+      for st in sets:
+        if not (x in st):
+          all = false
+          break
+      if all: out.push(x)
+  return out
+
+fn uta_prop_ro(var c: C, t: Int, name: Int) -> Bool:
+  let ps = bind.get_prop(&c, t, name)
+  return ps >= 0 and (c.sflags[ps] & types.SF_READONLY) != 0
+
+fn uta_same_props(var c: C, u: Int, t: Int) -> Bool:
+  let up = uta_props(&c, u)
+  let tp = uta_props(&c, t)
+  if up.len != tp.len: return false
+  var tset: {Int: Bool} = {}
+  for x in tp: tset[x] = true
+  for x in up:
+    if not (x in tset): return false
+    if c.tk[u] == TK_OBJ and c.tk[t] == TK_OBJ and uta_prop_ro(&c, u, x) != uta_prop_ro(&c, t, x): return false
+  return true
+
+fn uta_same_targs(c: C, u: Int, t: Int) -> Bool:
+  let ua = uta_targs(c, u)
+  let ta = uta_targs(c, t)
+  if ua.len != ta.len: return false
+  for i in 0..ua.len:
+    if ua[i] != ta[i]: return false
+  return true
+
+fn uta_empty_obj(var c: C, t: Int) -> Bool:
+  if c.tk[t] == TK_NONPRIM: return true
+  if c.tk[t] != TK_OBJ: return false
+  return bind.prop_names(&c, t).len == 0 and bind.sigs_of(&c, t, false).len == 0 and bind.sigs_of(&c, t, true).len == 0 and bind.index_type(&c, t, false) < 0 and bind.index_type(&c, t, true) < 0
+
+# isConceptuallyLiteral (of the expression as written, parentheses not skipped)
+fn uta_literal_expr(c: C, x: Int) -> Bool:
+  let k = c.t.nd[x].k
+  return k == ast.N_ARRAY or k == ast.N_OBJECT or k == ast.N_CLASSEXPR or k == ast.N_FUNCEXPR or k == ast.N_ARROW or k == ast.N_JSXELEM or k == ast.N_STR or k == ast.N_NUM or k == ast.N_NOSUBTEMPL or k == ast.N_TRUE or k == ast.N_FALSE or k == ast.N_NULL or k == ast.N_TEMPL
+
+fn uta_lit_type(c: C, t: Int) -> Bool:
+  let k = c.tk[t]
+  return k == TK_STRLIT or k == TK_NUMLIT or k == TK_BIGLIT or k == TK_TRUE or k == TK_FALSE
+
+fn uta_write_target(c: C, r: Run, n: Int) -> Bool:
+  var cur = uta_up_np(c, r, n)
+  var child = n
+  while cur >= 0 and (c.t.nd[cur].k == ast.N_PROPACCESS or c.t.nd[cur].k == ast.N_ELEMACCESS):
+    if c.t.nd[cur].a == child or skip_parens(c, c.t.nd[cur].a) == child:
+      let p = uta_up_np(c, r, cur)
+      if p >= 0 and c.t.nd[p].k == ast.N_BINARY and c.t.nd[p].f >= scan.T_ASSIGN and c.t.nd[p].f <= scan.T_QQEQ and skip_parens(c, c.t.nd[p].a) == cur: return true
+      if p >= 0 and (c.t.nd[p].k == ast.N_PREFIX or c.t.nd[p].k == ast.N_POSTFIX) and (c.t.nd[p].f == scan.T_INC or c.t.nd[p].f == scan.T_DEC): return true
+    child = cur
+    cur = uta_up_np(c, r, cur)
+  return false
+
+fn uta_elem_arg(c: C, r: Run, n: Int) -> Bool:
+  var cur = n
+  var p = uta_up(c, r, n)
+  while p >= 0 and c.t.nd[p].k == ast.N_PAREN:
+    cur = p
+    p = uta_up(c, r, p)
+  return p >= 0 and c.t.nd[p].k == ast.N_ELEMACCESS and c.t.nd[p].b == cur
+
+# isTypeUnchanged
+fn uta_unchanged(var c: C, r: Run, n: Int, e: Int, u: Int, t: Int) -> Bool:
+  # (a union with an error type member is tsgo's one errorType, getUnionType's IncludesError; so is
+  # vtsc's c.error_t: two of them are the same type whatever names they were made from, uncast ==
+  # cast. x.kind as gql.K | undefined with @gql unresolved; probe
+  # unnecessary-assertion-error-union)
+  if u == t and u == c.error_t: return true
+  if c.tk[t] == TK_ERROR or c.tk[u] == TK_ERROR:
+    # (the error type on both sides: the same only from the same unresolved name, a variable
+    # declared with it cast to it)
+    if c.tk[t] != TK_ERROR or c.tk[u] != TK_ERROR: return false
+    let x0 = skip_parens(c, e)
+    if c.t.nd[x0].k != ast.N_ID: return false
+    let vs0 = bind.lookup_value(&c, x0, c.t.nd[x0].s)
+    if vs0 < 0 or c.sdecl[vs0] < 0: return false
+    let dd = c.sdecl[vs0]
+    let tn0 = c.t.nd[n].b
+    return (c.t.nd[dd].k == ast.N_DECL or c.t.nd[dd].k == ast.N_PARAM) and c.t.nd[dd].b >= 0 and tn0 >= 0 and trules.src_text(c, r, c.t.nd[dd].b).strip() == trules.src_text(c, r, tn0).strip()
+  # (an array literal's type is its own array literal type, never the asserted one: [s] as
+  # string[] isn't reported, tsgolint 7.0.2008, probe nuta-array-literal)
+  if c.t.nd[skip_parens(c, e)].k == ast.N_ARRAY: return false
+  if u == t: return true
+  # ({ ...route, path: x } as R: R & { path: string } where R's constraint has every property the
+  # literal adds; { ...route, extra: 1 } isn't)
+  if c.tk[u] == TK_INTER and c.tk[t] == TK_TPARAM and c.t.nd[skip_parens(c, e)].k == ast.N_OBJECT:
+    let ims = types.members_inter(c, u)
+    if ims.len == 2 and types.has_int(ims, t):
+      var oth = ims[0]
+      if oth == t: oth = ims[1]
+      let con = trules.base_constraint1(&c, t, 0)
+      if c.tk[oth] == TK_OBJ and con >= 0 and c.tk[con] == TK_OBJ and bind.sigs_of(&c, oth, false).len == 0:
+        var all_in = true
+        for pn in bind.prop_names(&c, oth):
+          if bind.get_prop(&c, con, pn) < 0: all_in = false
+        if all_in: return true
+  if c.tk[u] == TK_TPARAM and uta_write_target(c, r, n): return false
+  if c.nuia and uta_elem_arg(c, r, n): return false
+  let tn = c.t.nd[n].b
+  if tn >= 0 and c.t.nd[tn].k == ast.N_TINTER and uta_tvar(&c, t): return false
+  if c.exact_opt and uta_has(c, u, TK_UNDEF) and uta_has(c, t, TK_UNDEF):
+    var ups: [Int] = []
+    for m in types.members(c, u):
+      if c.tk[m] != TK_UNDEF: ups.push(m)
+    var n2 = 0
+    for m in types.members(c, t):
+      if c.tk[m] == TK_UNDEF: continue
+      if not types.has_int(ups, m): return false
+      n2 += 1
+    return ups.len == n2
+  if (c.tk[u] == TK_NONPRIM and c.tk[t] != TK_NONPRIM) or uta_has_index(&c, u) != uta_has_index(&c, t) or uta_any(&c, u) or uta_any(&c, t) or (uta_tvar(&c, t) and not uta_tvar(&c, u)): return false
+  if uta_literal_expr(c, e):
+    if c.t.nd[e].k != ast.N_OBJECT or ast.count(c.t, c.t.nd[e].a) == 0: return false
+    for pn in uta_props(&c, t):
+      let ps = bind.get_prop(&c, t, pn)
+      if ps < 0: continue
+      let ppt = bind.prop_type_for(&c, ps, t)
+      if uta_lit_type(c, ppt): return false
+  if c.tk[t] == TK_INTER and c.tk[u] != TK_INTER:
+    let cps = types.members_inter(c, t)
+    var other = -1
+    for x in cps:
+      if x != u and other < 0: other = x
+    if c.tk[u] == TK_TPARAM and cps.len == 2 and types.has_int(cps, u) and other >= 0 and uta_empty_obj(&c, other) and not uta_tvar(&c, other):
+      let con = trules.base_constraint1(&c, u, 0)
+      if con >= 0 and not uta_has(c, con, TK_NULL) and not uta_has(c, con, TK_UNDEF) and c.tk[con] != TK_UNKNOWN and c.tk[con] != TK_ANY: return true
+    return false
+  if not uta_same_props(&c, u, t) or not uta_same_targs(c, u, t): return false
+  # (unknown, which strictNullChecks off relates to object types as {}: only unknown is the same)
+  if (c.tk[u] == TK_UNKNOWN) != (c.tk[t] == TK_UNKNOWN): return false
+  return rel.assignable(&c, u, t) and rel.assignable(&c, t, u)
+
+# isImplicitlyNarrowedLiteralDeclaration
+fn uta_narrowed_lit(c: C, r: Run, n: Int) -> Bool:
+  if c.t.nd[c.t.nd[n].a].k == ast.N_TEMPL: return false
+  let p = r.parents.get(n, -1)
+  if p < 0: return false
+  if c.t.nd[p].k == ast.N_DECL and c.t.nd[p].c == n:
+    var vd = r.parents.get(p, -1)
+    if vd >= 0 and c.t.nd[vd].k == ast.N_LIST: vd = r.parents.get(vd, -1)
+    return vd >= 0 and c.t.nd[vd].k == ast.N_VAR and c.t.nd[vd].f == 2
+  return c.t.nd[p].k == ast.N_PROP and c.t.nd[p].c == n and (c.t.nd[p].f & ast.M_READONLY) != 0
+
+# skipParentTypeForContextualAny
+fn uta_skip_parent(c: C, r: Run, n: Int) -> Bool:
+  let p = uta_up_np(c, r, n)
+  if p < 0: return false
+  let k = c.t.nd[p].k
+  return k == ast.N_AS or k == ast.N_TYPEASSERT or k == ast.N_SPREAD or k == ast.N_SATISFIES
+
+# isArgumentToParentCallOrNew: its argument index (-1)
+fn uta_arg_index(c: C, r: Run, n: Int) -> Int:
+  let p = uta_up_np(c, r, n)
+  if p < 0 or (c.t.nd[p].k != ast.N_CALL and c.t.nd[p].k != ast.N_NEW) or c.t.nd[p].c < 0: return -1
+  var i = 0
+  for x in ast.items(c.t, c.t.nd[p].c):
+    if x == n or skip_parens(c, x) == n: return i
+    i += 1
+  return -1
+
+fn uta_prop_init(c: C, r: Run, n: Int) -> Int:
+  let p = r.parents.get(n, -1)
+  if p < 0 or c.t.nd[p].k != ast.N_PROPASSIGN or c.t.nd[p].b != n: return -1
+  var o = r.parents.get(p, -1)
+  if o >= 0 and c.t.nd[o].k == ast.N_LIST: o = r.parents.get(o, -1)
+  if o < 0 or c.t.nd[o].k != ast.N_OBJECT: return -1
+  return o
+
+# An object literal property's value whose literal's contextual type is an intersection: an any
+# property type there is still a receiver that accepts the original type (tsgolint 7.0.2008, probe
+# nuta-inter-any-prop; a plain object type's any property isn't)
+fn uta_inter_prop(var c: C, r: Run, n: Int) -> Bool:
+  var x = n
+  var p = r.parents.get(x, -1)
+  while p >= 0 and c.t.nd[p].k == ast.N_PAREN:
+    x = p
+    p = r.parents.get(p, -1)
+  let o = uta_prop_init(c, r, x)
+  if o < 0: return false
+  var oc = c.nctx.get(o, -1)
+  if oc < 0: oc = uta_walk_ctx(&c, r, o, 0)
+  return oc >= 0 and c.tk[oc] == TK_INTER
+
+# isPropertyInProblematicContext
+fn uta_problem_prop(var c: C, r: Run, n: Int) -> Bool:
+  let o = uta_prop_init(c, r, n)
+  if o < 0: return false
+  let oc = c.nctx.get(o, -1)
+  if oc >= 0 and c.tk[oc] == TK_UNION:
+    let pc = c.nctx.get(n, -1)
+    if pc < 0: return true
+    var nn = types.filter_union(&c, pc, true, true)
+    # (GetNonNullableType of unknown is {}, NonNullable<unknown>: x as unknown as T in a
+    # property of an optional Record<string, unknown> parameter isn't reported, as unknown isn't
+    # assignable to it; orbit ingest.test.ts' 'labtop' as unknown as 'laptop')
+    if c.tk[nn] == TK_UNKNOWN: nn = c.empty_obj
+    if c.tk[nn] == TK_UNION: return true
+    let e = c.t.nd[n].a
+    if not (e in c.ntype): return true
+    let ut = trules.type_at(&c, e)
+    return not rel.assignable(&c, ut, nn)
+  let op = uta_up(c, r, o)
+  if op < 0: return false
+  let k = c.t.nd[op].k
+  if k == ast.N_AS or k == ast.N_TYPEASSERT or k == ast.N_SATISFIES: return true
+  if k == ast.N_CALL:
+    let gp = uta_up(c, r, op)
+    return gp >= 0 and c.t.nd[gp].k == ast.N_SATISFIES
+  return false
+
+fn uta_in_destructuring(c: C, r: Run, n: Int) -> Bool:
+  let p = r.parents.get(n, -1)
+  if p < 0 or c.t.nd[p].k != ast.N_DECL or c.t.nd[p].c != n: return false
+  let nk = c.t.nd[c.t.nd[p].a].k
+  return nk == ast.N_OBJPAT or nk == ast.N_ARRPAT
+
+fn uta_callback_return_prop(var c: C, r: Run, n: Int) -> Bool:
+  let o = uta_prop_init(c, r, n)
+  if o < 0: return false
+  let cb = uta_up_np(c, r, o)
+  return cb >= 0 and c.t.nd[cb].k == ast.N_ARROW and skip_parens(c, c.t.nd[cb].d) == o and uta_generic_context(&c, r, n)
+
+fn uta_assign_value(c: C, r: Run, n: Int) -> Bool:
+  let p = r.parents.get(n, -1)
+  if p < 0 or c.t.nd[p].k != ast.N_BINARY or c.t.nd[p].f < scan.T_ASSIGN or c.t.nd[p].f > scan.T_QQEQ or c.t.nd[p].b != n: return false
+  let gp = r.parents.get(p, -1)
+  return gp < 0 or c.t.nd[gp].k != ast.N_EXPRSTMT
+
+fn uta_logical_assign_value(c: C, r: Run, n: Int) -> Bool:
+  let p = r.parents.get(n, -1)
+  if p < 0 or c.t.nd[p].k != ast.N_BINARY or c.t.nd[p].b != n: return false
+  let op = c.t.nd[p].f
+  return op == scan.T_ANDEQ or op == scan.T_OREQ or op == scan.T_QQEQ
+
+# a parameter's type at an argument index (a rest parameter's element type)
+fn uta_param_at(var c: C, sg: Int, i: Int) -> Int:
+  let pts = types.ints(c.sigs[sg].ptypes)
+  if pts.len == 0: return -1
+  var pi = i
+  if pi >= pts.len: pi = pts.len - 1
+  var pt = pts[pi]
+  if (c.sigs[sg].pflags[pi] & 2) != 0:
+    let ta = trules.type_args(c, pt)
+    if ta.len > 0:
+      var ti = 0
+      if ta.len > 1:
+        ti = i - pi
+        if ti > ta.len - 1: ti = ta.len - 1
+      pt = ta[ti]
+  return pt
+
+fn uta_overloaded_arg(var c: C, r: Run, n: Int) -> Bool:
+  let ai = uta_arg_index(c, r, n)
+  if ai < 0: return false
+  let p = uta_up_np(c, r, n)
+  let callee = c.t.nd[p].a
+  if not (callee in c.ntype): return true
+  let ct = trules.type_at(&c, callee)
+  let sgs = bind.sigs_of(&c, ct, false)
+  if sgs.len <= 1: return false
+  var pts: [Int] = []
+  for sg in sgs:
+    if ai >= c.sigs[sg].ptypes.len: return true
+    var pt = c.sigs[sg].ptypes[ai]
+    if (c.sigs[sg].pflags[ai] & 2) != 0:
+      let ta = trules.type_args(c, pt)
+      if ta.len > 0: pt = ta[0]
+    pts.push(pt)
+  var differ = false
+  for pt in pts:
+    if pt != pts[0]: differ = true
+  if not differ: return false
+  let e = c.t.nd[n].a
+  if not (e in c.ntype): return true
+  let ut = trules.type_at(&c, e)
+  for pt in pts:
+    if not rel.assignable(&c, ut, pt): return true
+  return false
+
+# isNestedInArrayLiteralArgumentToGenericCall (the generic signatures' declared parameter types)
+fn uta_nested_array_arg(var c: C, r: Run, n: Int) -> Bool:
+  var path: [Int] = []
+  var child = n
+  var cur = uta_up(c, r, n)
+  while cur >= 0:
+    let k = c.t.nd[cur].k
+    if k == ast.N_FUNCEXPR or k == ast.N_ARROW: return false
+    if k == ast.N_ARRAY:
+      var ei = -1
+      var j = 0
+      for el in ast.items(c.t, c.t.nd[cur].a):
+        if ei < 0 and (el == child or skip_parens(c, el) == skip_parens(c, child)): ei = j
+        j += 1
+      if ei >= 0:
+        var np: [Int] = [ei]
+        for x in path: np.push(x)
+        path = np
+        var arg = cur
+        var par = uta_up_np(c, r, arg)
+        var off = 0
+        if par >= 0 and c.t.nd[par].k == ast.N_SPREAD:
+          off = ei
+          arg = par
+          par = uta_up_np(c, r, arg)
+        if par >= 0 and (c.t.nd[par].k == ast.N_CALL or c.t.nd[par].k == ast.N_NEW):
+          if c.t.nd[par].b >= 0: return false
+          var ai = -1
+          var q = 0
+          if c.t.nd[par].c >= 0:
+            for x in ast.items(c.t, c.t.nd[par].c):
+              if ai < 0 and (x == arg or skip_parens(c, x) == arg): ai = q
+              q += 1
+          if ai >= 0:
+            var ppath: [Int] = []
+            for pi0 in 0..path.len:
+              if pi0 > 0 or c.t.nd[arg].k != ast.N_SPREAD: ppath.push(path[pi0])
+            let callee = c.t.nd[par].a
+            if not (callee in c.ntype): return false
+            let ct = trules.type_at(&c, callee)
+            for sg in bind.sigs_of(&c, ct, c.t.nd[par].k == ast.N_NEW):
+              if c.sigs[sg].tparams.len == 0: continue
+              var pt = uta_param_at(&c, sg, ai + off)
+              for ix in ppath:
+                if pt < 0: break
+                var et = -1
+                if c.tk[pt] == TK_OBJ and c.objs[c.ta[pt]].kind == OK_TUPLE:
+                  let ta = trules.type_args(c, pt)
+                  if ta.len > 0:
+                    var ti = ix
+                    if ti > ta.len - 1: ti = ta.len - 1
+                    et = ta[ti]
+                elif c.tk[pt] == TK_OBJ:
+                  let apt = rel.apparent(&c, pt)
+                  et = bind.index_type(&c, apt, true)
+                if et < 0: break
+                pt = et
+              if pt >= 0 and uta_tvar(&c, pt): return true
+            return false
+    child = cur
+    cur = uta_up(c, r, cur)
+  return false
+
+# shouldSkipContextualTypeFallback
+# isInNarrowingAssignment (tsgolint 7.0.2008 narrowing_assignment.go): the assertion is the value an
+# assignment gives a variable of a union type, and with it the assignment narrows the variable to
+# other members than without it (getAssignmentReducedType): the receiver accepting the original
+# type doesn't make it unnecessary. Up through parentheses, logical operands, a conditional's
+# branches (the other branch's type joined to both) and the comma's right side. Not modeled: the
+# logical operators' result types, and destructuring targets (a literal on the way: not skipped).
+fn uta_narrowing_assign(var c: C, r: Run, n: Int, ut0: Int, cast0: Int) -> Bool:
+  var ut = ut0
+  var cast = cast0
+  var cur = n
+  var p = r.parents.get(cur, -1)
+  while p >= 0:
+    let k = c.t.nd[p].k
+    if k == ast.N_BINARY:
+      let op = c.t.nd[p].f
+      let logical = op == scan.T_AND or op == scan.T_OR or op == scan.T_QQ
+      if (op == scan.T_OR or op == scan.T_QQ) and c.t.nd[p].a == cur:
+        # (|| and ?? discard the left operand's nullish values: a non-nullable-only assertion can't
+        # change the narrowing)
+        let un = types.filter_union(&c, ut, true, true)
+        let cn = types.filter_union(&c, cast, true, true)
+        if un == cn: return false
+      if logical or (op == scan.T_COMMA and c.t.nd[p].b == cur):
+        cur = p
+        p = r.parents.get(cur, -1)
+        continue
+      if op == scan.T_ASSIGN and c.t.nd[p].b == cur:
+        let l = skip_parens(c, c.t.nd[p].a)
+        if not (l in c.ntype): return false
+        var recv = trules.type_at(&c, l)
+        if recv < 0: return false
+        let bc = trules.base_constraint(&c, recv)
+        if bc >= 0: recv = bc
+        if c.tk[recv] != TK_UNION: return false
+        let a = chk.assign_reduced(&c, recv, ut)
+        let b = chk.assign_reduced(&c, recv, cast)
+        return a != b
+      return false
+    if k == ast.N_PAREN:
+      cur = p
+      p = r.parents.get(cur, -1)
+      continue
+    if k == ast.N_COND and c.t.nd[p].a != cur:
+      var other = c.t.nd[p].b
+      if other == cur: other = c.t.nd[p].c
+      if other >= 0 and (other in c.ntype):
+        let ot = trules.type_at(&c, other)
+        let u1 = types.union_of(&c, [ut, ot])
+        let u2 = types.union_of(&c, [cast, ot])
+        ut = u1
+        cast = u2
+      cur = p
+      p = r.parents.get(cur, -1)
+      continue
+    return false
+  return false
+
+fn uta_skip_ctx(var c: C, r: Run, n: Int, cast_any: Bool) -> Bool:
+  let p = uta_up_np(c, r, n)
+  if n in c.ntype:
+    let ut0 = trules.type_at(&c, skip_parens(c, c.t.nd[n].a))
+    let ct0 = trules.type_at(&c, n)
+    if ut0 >= 0 and ct0 >= 0 and uta_narrowing_assign(&c, r, n, ut0, ct0): return true
+  if cast_any:
+    if p >= 0 and c.t.nd[p].k == ast.N_BINARY and (c.t.nd[p].f == scan.T_AND or c.t.nd[p].f == scan.T_OR or c.t.nd[p].f == scan.T_QQ): return true
+    return uta_generic_context(&c, r, n) or uta_problem_prop(&c, r, n)
+  # (a template with substitutions: it can widen to string even where the context accepts it,
+  # typescript-eslint#12276; tsgolint 7.0.2008, `chevron-${d}` as IconName)
+  let te = skip_parens(c, c.t.nd[n].a)
+  if c.t.nd[te].k == ast.N_TEMPL and c.t.nd[te].a >= 0 and ast.items(c.t, c.t.nd[te].a).len > 0: return true
+  if uta_skip_parent(c, r, n) or c.t.nd[c.t.nd[n].a].k == ast.N_ARRAY or uta_nested_array_arg(&c, r, n) or uta_in_destructuring(c, r, n) or uta_problem_prop(&c, r, n) or uta_callback_return_prop(&c, r, n) or uta_assign_value(c, r, n) or uta_logical_assign_value(c, r, n) or uta_overloaded_arg(&c, r, n): return true
+  if uta_generic_context(&c, r, n):
+    var o = skip_parens(c, c.t.nd[n].a)
+    while uta_is_assert(c, o): o = skip_parens(c, c.t.nd[o].a)
+    return not uta_literal_expr(c, o) and (p < 0 or c.t.nd[p].k != ast.N_PROPASSIGN)
+  return false
+
+# genericsMismatch: a property of the contextual type with a generic call signature the original
+# type's property lacks
+fn uta_generics_mismatch(var c: C, u: Int, ctx: Int) -> Bool:
+  for pn in uta_props(&c, ctx):
+    let ps = bind.get_prop(&c, ctx, pn)
+    if ps < 0: continue
+    let pt = bind.prop_type_for(&c, ps, ctx)
+    var gen = false
+    for sg in bind.sigs_of(&c, pt, false):
+      if c.sigs[sg].tparams.len > 0: gen = true
+    if not gen: continue
+    if c.tk[u] != TK_OBJ: return true
+    let us = bind.get_prop(&c, u, pn)
+    if us < 0: return true
+    let ut = bind.prop_type_for(&c, us, u)
+    var ugen = false
+    for sg in bind.sigs_of(&c, ut, false):
+      if c.sigs[sg].tparams.len > 0: ugen = true
+    if not ugen: return true
+  return false
+
+fn uta_phantom(var c: C, t: Int) -> Bool:
+  return uta_empty_obj(&c, t) and uta_targs(c, t).len > 0
+
+# the contextual type: a call's argument its parameter's in the resolved signature, else the one it
+# was checked with
+fn uta_ctx_type(var c: C, r: Run, n: Int) -> Int:
+  # (exports.x = v in a JavaScript file: an assignment declaration, its value without a
+  # contextual type, getContextualTypeForAssignmentDeclaration)
+  var q0 = n
+  while r.parents.get(q0, -1) >= 0 and c.t.nd[r.parents[q0]].k == ast.N_PAREN: q0 = r.parents[q0]
+  let pa = r.parents.get(q0, -1)
+  if pa >= 0 and c.t.nd[pa].k == ast.N_BINARY and c.t.nd[pa].f == scan.T_ASSIGN and c.t.nd[pa].b == q0 and chk.js_node(c, n):
+    let l = c.t.nd[pa].a
+    if c.t.nd[l].k == ast.N_PROPACCESS and c.t.nd[c.t.nd[l].a].k == ast.N_ID and bind.nm(c, c.t.nd[c.t.nd[l].a].s) == "exports": return -1
+  if uta_arg_index(c, r, n) >= 0:
+    var q = n
+    while true:
+      let p0 = r.parents.get(q, -1)
+      if p0 < 0 or c.t.nd[p0].k != ast.N_PAREN: break
+      q = p0
+    return uta_context(&c, r, q)
+  let gen_ctx = uta_generic_context(&c, r, n)
+  if gen_ctx:
+    let w = uta_walk_ctx(&c, r, n, 0)
+    if w >= 0: return w
+  let nc = c.nctx.get(n, -1)
+  if nc >= 0 and not nuta_tvar(&c, nc): return nc
+  # (none recorded, or one with a type parameter the call it was checked in has since inferred:
+  # a block body's return, useMemo(() => { return {} as R }))
+  if not gen_ctx:
+    let w2 = uta_walk_ctx(&c, r, n, 0)
+    if w2 >= 0: return w2
+  if nc >= 0: return nc
+  # (an annotated declaration's initializer, a non-async function's returned value with a declared
+  # return type: that type)
+  let par = r.parents.get(n, -1)
+  if par < 0: return -1
+  if c.t.nd[par].k == ast.N_DECL and c.t.nd[par].c == n and c.t.nd[par].b >= 0: return trules.node_type(&c, c.t.nd[par].b)
+  var fnn = -1
+  if c.t.nd[par].k == ast.N_ARROW and c.t.nd[par].d == n: fnn = par
+  if c.t.nd[par].k == ast.N_RETURN:
+    var q2 = r.parents.get(par, -1)
+    while q2 >= 0 and not fn_like(c, q2): q2 = r.parents.get(q2, -1)
+    fnn = q2
+  if fnn >= 0 and (c.t.nd[fnn].f & ast.M_ASYNC) == 0:
+    let rn = chk.fn_retnode(c, fnn)
+    if rn >= 0: return trules.node_type(&c, rn)
+  return -1
+
+# getContextualType asked once the call is resolved: a value inside a generic call's argument (a
+# property of an object literal, a callback's returned value) gets its context from the resolved
+# signature's instantiated parameter type, not the uninstantiated one it was checked with
+# (vi.hoisted(() => ({ s: { v: undefined as unknown } })), useMemo(() => {} as Record<..>))
+fn uta_walk_ctx(var c: C, r: Run, n: Int, depth: Int) -> Int:
+  if depth > 8: return -1
+  var x = n
+  var p = r.parents.get(x, -1)
+  while p >= 0 and c.t.nd[p].k == ast.N_PAREN:
+    x = p
+    p = r.parents.get(p, -1)
+  if p < 0: return -1
+  if uta_arg_index(c, r, n) >= 0: return uta_context(&c, r, x)
+  let pk = c.t.nd[p].k
+  if pk == ast.N_PROPASSIGN and c.t.nd[p].b == x:
+    let o = uta_prop_init(c, r, x)
+    let key = c.t.nd[p].a
+    if o < 0 or key < 0 or c.t.nd[key].k != ast.N_ID: return -1
+    let oc = uta_walk_ctx(&c, r, o, depth + 1)
+    if oc < 0 or c.tk[oc] == TK_UNSUP: return -1
+    return chk.ctx_prop(&c, oc, c.t.nd[key].s)
+  # (an array literal's element: the element's or tuple position's)
+  let ap = uta_up(c, r, x)
+  if ap >= 0 and c.t.nd[ap].k == ast.N_ARRAY:
+    var i = 0
+    var at_i = -1
+    for el in ast.items(c.t, c.t.nd[ap].a):
+      if c.t.nd[el].k == ast.N_SPREAD: return -1
+      if el == x: at_i = i
+      i += 1
+    if at_i < 0: return -1
+    let ac = uta_walk_ctx(&c, r, ap, depth + 1)
+    if ac < 0 or c.tk[ac] == TK_UNSUP: return -1
+    return chk.ctx_elem(&c, ac, at_i)
+  var fnn = -1
+  if pk == ast.N_ARROW and c.t.nd[p].d == x: fnn = p
+  if pk == ast.N_RETURN:
+    var q2 = r.parents.get(p, -1)
+    while q2 >= 0 and not fn_like(c, q2): q2 = r.parents.get(q2, -1)
+    fnn = q2
+  if fnn < 0 or (c.t.nd[fnn].f & (ast.M_ASYNC | ast.M_GENERATOR)) != 0: return -1
+  let fk = c.t.nd[fnn].k
+  if fk != ast.N_ARROW and fk != ast.N_FUNCEXPR: return -1
+  let rn = chk.fn_retnode(c, fnn)
+  if rn >= 0: return trules.node_type(&c, rn)
+  let fc = uta_walk_ctx(&c, r, fnn, depth + 1)
+  if fc < 0 or c.tk[fc] == TK_UNSUP: return -1
+  let sgs = bind.sigs_of(&c, fc, false)
+  if sgs.len != 1: return -1
+  return rel.sig_ret(&c, sgs[0])
+
+# (a JSDoc cast, /** @type {T} */ (x): no-unnecessary-type-assertion is reported at the comment's
+# /**, tsgolint 7.0.2008; the type was parsed at its place in the comment, before the expression)
+fn nuta_pos(c: C, r: Run, n: Int, dflt: Int) -> Int:
+  if c.t.nd[n].k != ast.N_AS: return dflt
+  let ty = c.t.nd[n].b
+  if ty < 0 or c.t.nd[ty].pos >= c.t.nd[n].pos: return dflt
+  var j = c.t.nd[ty].pos
+  while j > 0 and not (r.src[j] == 47 and j + 2 < r.src.len and r.src[j + 1] == 42 and r.src[j + 2] == 42): j -= 1
+  if j <= 0 and not (r.src.len > 2 and r.src[0] == 47 and r.src[1] == 42 and r.src[2] == 42): return dflt
+  return j
+
+# checkTypeAssertion
+fn uta_assertion(var c: C, var r: Run, n: Int):
+  let tn = c.t.nd[n].b
+  if tn < 0 or not (n in c.ntype): return
+  let cast = trules.type_at(&c, n)
+  if cast < 0 or c.tk[cast] == TK_UNSUP: return
+  let lit = uta_lit_type(c, cast)
+  let isconst = is_const_assertion(c, n)
+  if lit and isconst: return
+  let e = c.t.nd[n].a
+  let x = skip_parens(c, e)
+  if not (x in c.ntype) and not (e in c.ntype): return
+  let ut = trules.type_at(&c, x)
+  if ut < 0 or c.tk[ut] == TK_UNSUP: return
+  var same_inferred = not isconst
+  if lit: same_inferred = uta_narrowed_lit(c, r, n)
+  # (a call to a generic function without type arguments, through await, ! and the comma operator:
+  # unchanged, its own message; changed, nothing else is reported. tsgolint 7.0.2008's
+  # contextuallyInferredTypeArguments)
+  let gen = nuta_generic_call(&c, x)
+  # (a function or arrow, in parentheses too, is a literal: its own type is never the asserted
+  # one, (async (url) => ..) as typeof fetch; x as unknown as typeof fetch still is unchanged,
+  # reportDoubleAssertionIfUnnecessary)
+  let xk = c.t.nd[x].k
+  let unchanged = xk != ast.N_ARROW and xk != ast.N_FUNCEXPR and uta_unchanged(&c, r, n, e, ut, cast)
+  if gen:
+    if unchanged and same_inferred: rep(&r, "no-unnecessary-type-assertion", npos(c, r, n), nend(c, r, n), "contextuallyInferredTypeArguments", "The type arguments for this generic call may be inferred from the assertion. Specify them explicitly instead.")
+    return
+  let ret_inferred = false
+  if unchanged and same_inferred:
+    # (at the expression, the diagnostic's first label: its parentheses included, tsgolint
+    # 7.0.2008 reads the operand as tsgo's AST has it)
+    rep(&r, "no-unnecessary-type-assertion", nuta_pos(c, r, n, npos(c, r, e)), nend(c, r, n), "unnecessaryAssertion", "This assertion is unnecessary since it does not change the type of the expression.")
+    return
+  let cast_any = trules.is_any(c, cast) and not uta_skip_parent(c, r, n)
+  var ctx = -1
+  if not uta_skip_ctx(&c, r, n, cast_any): ctx = uta_ctx_type(&c, r, n)
+  if ctx >= 0 and c.tk[ctx] == TK_UNSUP: return
+  if ctx >= 0 and ret_inferred: return
+  if ctx >= 0:
+    let ctx_any = trules.is_any(c, ctx)
+    let is_arg = uta_arg_index(c, r, n) >= 0
+    let ok_any = (not ctx_any and not uta_any(&c, ctx)) or (ctx_any and (is_arg or uta_inter_prop(&c, r, n)) and not uta_any(&c, cast))
+    let phantom = uta_generic_context(&c, r, n) and (uta_phantom(&c, ut) or uta_phantom(&c, ctx)) and not uta_same_targs(c, ut, ctx)
+    let nullish = c.tk[cast] == TK_UNION and (c.t.nd[x].k == ast.N_NULL or (c.t.nd[x].k == ast.N_ID and bind.nm(c, c.t.nd[x].s) == "undefined"))
+    if not isconst and not uta_any(&c, ut) and ok_any and not phantom and (cast_any or not uta_generics_mismatch(&c, ut, ctx)) and (ctx_any or rel.assignable(&c, ut, ctx)) and not nullish:
+      uta_report_ctx(&c, &r, n)
+      return
+  uta_double(&c, &r, n, ctx)
+
+# reportDoubleAssertionIfUnnecessary: x as unknown as T
+fn uta_double(var c: C, var r: Run, n: Int, ctx: Int):
+  let inner = skip_parens(c, c.t.nd[n].a)
+  if not uta_is_assert(c, inner): return
+  var o = skip_parens(c, c.t.nd[inner].a)
+  while uta_is_assert(c, o): o = skip_parens(c, c.t.nd[o].a)
+  if not (o in c.ntype) or not (inner in c.ntype): return
+  let ot = trules.type_at(&c, o)
+  let cast = trules.type_at(&c, n)
+  if ot < 0 or c.tk[ot] == TK_UNSUP: return
+  var unrelated = false
+  if ot != cast and c.tk[ot] == TK_TPARAM and c.tk[cast] == TK_TPARAM:
+    unrelated = true
+    var z = ot
+    var guard = 0
+    while z >= 0 and guard < 20:
+      if z == cast: unrelated = false
+      if c.tk[z] == TK_INTER:
+        for m in types.members_inter(c, z):
+          if m == cast: unrelated = false
+      if c.tk[z] != TK_TPARAM: break
+      z = rel.constraint_of(&c, z)
+      guard += 1
+  if uta_unchanged(&c, r, n, inner, ot, cast) and not trules.is_any(c, cast):
+    rep(&r, "no-unnecessary-type-assertion", nuta_pos(c, r, n, npos(c, r, n)), nend(c, r, n), "unnecessaryAssertion", "This assertion is unnecessary since it does not change the type of the expression.")
+    return
+  if ctx >= 0 and not unrelated:
+    let it = trules.type_at(&c, inner)
+    if (trules.is_any(c, it) or c.tk[it] == TK_UNKNOWN) and rel.assignable(&c, ot, ctx): uta_report_ctx(&c, &r, n)
+
+fn uta_context(var c: C, r: Run, n: Int) -> Int:
+  var p = r.parents.get(n, -1)
+  if p < 0: return -1
+  if c.t.nd[p].k == ast.N_LIST:
+    let gp = r.parents.get(p, -1)
+    if gp >= 0 and (c.t.nd[gp].k == ast.N_CALL or c.t.nd[gp].k == ast.N_NEW): p = gp
+    else: return -1
+  let pk = c.t.nd[p].k
+  if pk == ast.N_CALL or pk == ast.N_NEW:
+    if c.t.nd[p].a == n: return -1
+    # (an untyped call's argument, the callee any: any, resolveUntypedCall)
+    let cle = c.t.nd[p].a
+    if cle in c.ntype:
+      let clt = trules.type_at(&c, cle)
+      if c.tk[clt] == TK_ANY or c.tk[clt] == TK_ERROR: return c.any_t
+    # (an argument: its parameter's type in the resolved signature)
+    let sg = c.call_sig.get(p, -1)
+    if sg < 0 or c.t.nd[p].c < 0: return c.nctx.get(n, -1)
+    var a = arg_sig(&c, sg)
+    for x in ast.items(c.t, c.t.nd[p].c):
+      if c.t.nd[x].k == ast.N_SPREAD: return -1
+      let pt = next_param(&a)
+      if x == n: return pt
+    return -1
+  if pk == ast.N_DECL or pk == ast.N_PROP or pk == ast.N_PARAM:
+    if c.t.nd[p].b >= 0: return trules.node_type(&c, c.t.nd[p].b)
+    return -1
+  if pk == ast.N_JSXEXPR: return c.nctx.get(n, -1)
+  # (an assignment's right side: none in tsgolint)
+  return -1
+
+fn uta_has(c: C, t: Int, k: Int) -> Bool:
+  for x in trules.parts(c, t):
+    if c.tk[x] == k: return true
+  return false
+
+fn uta_generic_context(var c: C, r: Run, n: Int) -> Bool:
+  var seen_fn = false
+  var prev = n
+  var cur = r.parents.get(n, -1)
+  while cur >= 0:
+    let k = c.t.nd[cur].k
+    if k == ast.N_FUNC: return false
+    if k == ast.N_FUNCEXPR or k == ast.N_ARROW:
+      let body = c.t.nd[cur].d
+      if k == ast.N_FUNCEXPR or (body >= 0 and c.t.nd[body].k == ast.N_BLOCK): return false
+      if seen_fn: return false
+      seen_fn = true
+    if k == ast.N_CALL or k == ast.N_NEW:
+      let skip_this = c.t.nd[cur].b >= 0
+      var direct = false
+      if c.t.nd[cur].c >= 0:
+        for x in ast.items(c.t, c.t.nd[cur].c):
+          if skip_parens(c, x) == n or x == n: direct = true
+      let method_arg = k == ast.N_CALL and (c.t.nd[c.t.nd[cur].a].k == ast.N_PROPACCESS or c.t.nd[c.t.nd[cur].a].k == ast.N_ELEMACCESS) and direct
+      if not skip_this and not method_arg:
+        let callee = c.t.nd[cur].a
+        if not (callee in c.ntype): return true
+        let ct = trules.type_at(&c, callee)
+        for sg in bind.sigs_of(&c, ct, k == ast.N_NEW):
+          if c.sigs[sg].tparams.len > 0: return true
+    prev = cur
+    cur = r.parents.get(cur, -1)
+  return false
+
+fn nuta_contains(var c: C, t: Int, any_kind: Bool, var seen: {Int: Bool}) -> Bool:
+  if t < 0 or t in seen: return false
+  seen[t] = true
+  let k = c.tk[t]
+  if any_kind and (k == TK_ANY or k == TK_ERROR): return true
+  if not any_kind and (k == TK_TPARAM or k == types.TK_INDEXED or k == types.TK_KEYOF): return true
+  if k == TK_UNION:
+    for m in types.members(c, t):
+      if nuta_contains(&c, m, any_kind, &seen): return true
+    return false
+  if k == TK_INTER:
+    for m in types.members_inter(c, t):
+      if nuta_contains(&c, m, any_kind, &seen): return true
+    return false
+  for a in trules.type_args(c, t):
+    if nuta_contains(&c, a, any_kind, &seen): return true
+  if k == TK_OBJ:
+    for sg in bind.sigs_of(&c, t, false):
+      let srt = rel.sig_ret(&c, sg)
+      if nuta_contains(&c, srt, any_kind, &seen): return true
+      for pt in types.ints(c.sigs[sg].ptypes):
+        if nuta_contains(&c, pt, any_kind, &seen): return true
+  return false
+
+fn nuta_any(var c: C, t: Int) -> Bool:
+  var seen: {Int: Bool} = {}
+  return nuta_contains(&c, t, true, &seen)
+
+# isGenericCallWithInferredTypeArguments: a call without type arguments whose callee has a generic
+# call signature and whose resolved signature has type parameters (through parentheses, await, !
+# and a comma's right side).
+fn nuta_generic_call(var c: C, e0: Int) -> Bool:
+  var e = e0
+  var guard = 0
+  while guard < 50:
+    guard += 1
+    e = skip_parens(c, e)
+    let k = c.t.nd[e].k
+    if k == ast.N_AWAIT or k == ast.N_NONNULL:
+      e = c.t.nd[e].a
+      continue
+    if k == ast.N_BINARY and c.t.nd[e].f == scan.T_COMMA:
+      e = c.t.nd[e].b
+      continue
+    if k != ast.N_CALL: return false
+    if c.t.nd[e].b >= 0: return false
+    if not (e in c.call_sig): return false
+    let isg = c.call_sig[e]
+    if isg < 0: return false
+    if not (c.t.nd[e].a in c.ntype): return false
+    let ct = trules.type_at(&c, c.t.nd[e].a)
+    var ap = ct
+    if c.tk[ct] != TK_OBJ and c.tk[ct] != TK_INTER: ap = rel.apparent(&c, ct)
+    var any_gen = false
+    var res_gen = false
+    for sg in nuta_callee_sigs(&c, ap, false):
+      if c.sigs[sg].tparams.len == 0: continue
+      any_gen = true
+      if sg == isg or (c.sigs[isg].node >= 0 and c.sigs[sg].node == c.sigs[isg].node): res_gen = true
+    return any_gen and res_gen
+  return false
+
+# A callee's signatures: an intersection's, its members' in order (getSignaturesOfType), as
+# testing-library's screen.getByRole has them.
+fn nuta_callee_sigs(var c: C, ap: Int, ctor: Bool) -> [Int]:
+  if c.tk[ap] != TK_INTER: return bind.sigs_of(&c, ap, ctor)
+  var out: [Int] = []
+  for i in 0..types.ninter(c, ap):
+    let im = rel.apparent(&c, types.inter_at(c, ap, i))
+    for sg in bind.sigs_of(&c, im, ctor): out.push(sg)
+  return out
+
+fn nuta_return_inferred(var c: C, e: Int) -> Bool:
+  let k = c.t.nd[e].k
+  if k != ast.N_CALL and k != ast.N_NEW: return false
+  if c.t.nd[e].b >= 0: return false
+  if not (e in c.call_sig): return false
+  let isg = c.call_sig[e]
+  if isg < 0: return false
+  let ct = trules.type_at(&c, c.t.nd[e].a)
+  var ap = ct
+  if c.tk[ct] != TK_OBJ and c.tk[ct] != TK_INTER: ap = rel.apparent(&c, ct)
+  for sg in nuta_callee_sigs(&c, ap, k == ast.N_NEW):
+    if c.sigs[sg].tparams.len == 0: continue
+    if c.sigs[isg].node >= 0 and c.sigs[sg].node != c.sigs[isg].node: continue
+    let rt = rel.sig_ret(&c, sg)
+    for tp in types.ints(c.sigs[sg].tparams):
+      var s1: {Int: Bool} = {}
+      if not nuta_mentions(&c, rt, tp, 0, &s1): continue
+      var in_param = false
+      for x in types.ints(c.sigs[sg].ptypes):
+        var s2: {Int: Bool} = {}
+        if nuta_mentions(&c, x, tp, 0, &s2): in_param = true
+      if not in_param: return true
+    return false
+  return false
+
+fn nuta_mentions(var c: C, t: Int, tp: Int, depth: Int, var seen: {Int: Bool}) -> Bool:
+  if t == tp: return true
+  if depth > 5 or t < 0 or t in seen: return false
+  seen[t] = true
+  let k = c.tk[t]
+  if k == TK_UNION:
+    for m in types.members(c, t):
+      if nuta_mentions(&c, m, tp, depth + 1, &seen): return true
+    return false
+  if k == TK_INTER:
+    for m in types.members_inter(c, t):
+      if nuta_mentions(&c, m, tp, depth + 1, &seen): return true
+    return false
+  if k != TK_OBJ: return false
+  for a in trules.type_args(c, t):
+    if nuta_mentions(&c, a, tp, depth + 1, &seen): return true
+  let o = c.ta[t]
+  if c.objs[o].kind == types.OK_INST:
+    let mm = c.objs[o].mapper
+    for x in types.ints(c.mappers[mm].to):
+      if nuta_mentions(&c, x, tp, depth + 1, &seen): return true
+  if c.objs[o].kind == OK_ANON:
+    for name in bind.prop_names(&c, t):
+      let ps = bind.get_prop(&c, t, name)
+      if ps < 0: continue
+      let pt = bind.type_of_sym(&c, ps)
+      if nuta_mentions(&c, pt, tp, depth + 1, &seen): return true
+    for sg in bind.sigs_of(&c, t, false):
+      let rt = rel.sig_ret(&c, sg)
+      if nuta_mentions(&c, rt, tp, depth + 1, &seen): return true
+      for x in types.ints(c.sigs[sg].ptypes):
+        if nuta_mentions(&c, x, tp, depth + 1, &seen): return true
+  return false
+
 # ---- dispatch (ids: trules.rule_names' places)
 
 fn kinds() -> [Int]:
-  return [ast.N_ENUM, ast.N_AS, ast.N_TYPEASSERT, ast.N_TINTER, ast.N_TREF, ast.N_CLASS, ast.N_CLASSEXPR, ast.N_INTERFACE, ast.N_TOBJ, ast.N_CALL, ast.N_NEW, ast.N_TAGGED, ast.N_PROP, ast.N_METHOD, ast.N_THROW, ast.N_PROPACCESS, ast.N_ELEMACCESS, ast.N_ARROW, ast.N_RETURN, ast.N_BINARY, ast.N_BINDEL, ast.N_PARAM, ast.N_DECL, ast.N_OBJECT, ast.N_ARRAY, ast.N_JSXATTR, ast.N_CASE, ast.N_FUNC, ast.N_CTOR, ast.N_GET, ast.N_SET, ast.N_FUNCEXPR, ast.N_AWAIT, ast.N_FORIN, ast.N_VAR, ast.N_YIELD, ast.N_TEMPL, ast.N_TTEMPLATE, ast.N_SWITCH, ast.N_IF, ast.N_WHILE, ast.N_DO, ast.N_FOR, ast.N_COND, ast.N_PREFIX, ast.N_EXPRTARGS, ast.N_EXPORT, ast.N_PROPASSIGN, ast.N_SHORTHAND, ast.N_SPREAD, ast.N_BINDEL, ast.N_POSTFIX, ast.N_SATISFIES, ast.N_MODULE, ast.N_QNAME, ast.N_CALLSIG, ast.N_CTORSIG, ast.N_TFUNC]
+  return [ast.N_ID, ast.N_JSXATTR, ast.N_ENUM, ast.N_AS, ast.N_TYPEASSERT, ast.N_TINTER, ast.N_TREF, ast.N_CLASS, ast.N_CLASSEXPR, ast.N_INTERFACE, ast.N_TOBJ, ast.N_CALL, ast.N_NEW, ast.N_TAGGED, ast.N_PROP, ast.N_METHOD, ast.N_THROW, ast.N_PROPACCESS, ast.N_ELEMACCESS, ast.N_ARROW, ast.N_RETURN, ast.N_BINARY, ast.N_BINDEL, ast.N_PARAM, ast.N_DECL, ast.N_OBJECT, ast.N_ARRAY, ast.N_JSXATTR, ast.N_CASE, ast.N_FUNC, ast.N_CTOR, ast.N_GET, ast.N_SET, ast.N_FUNCEXPR, ast.N_AWAIT, ast.N_FORIN, ast.N_VAR, ast.N_YIELD, ast.N_TEMPL, ast.N_TTEMPLATE, ast.N_SWITCH, ast.N_IF, ast.N_WHILE, ast.N_DO, ast.N_FOR, ast.N_COND, ast.N_PREFIX, ast.N_EXPRTARGS, ast.N_EXPORT, ast.N_PROPASSIGN, ast.N_SHORTHAND, ast.N_SPREAD, ast.N_BINDEL, ast.N_POSTFIX, ast.N_SATISFIES, ast.N_MODULE, ast.N_QNAME, ast.N_CALLSIG, ast.N_CTORSIG, ast.N_TFUNC, ast.N_NONNULL, ast.N_TQUERY]
 
 fn visit(var c: C, var r: Run, id: Int, k: Int, n: Int):
   if id == 15 and k == ast.N_ENUM: no_mixed_enums(&c, &r, n)
@@ -5905,5 +8087,7 @@ fn visit(var c: C, var r: Run, id: Int, k: Int, n: Int):
   elif id == 53 and (k == ast.N_BINARY or k == ast.N_CALL): starts_ends_with(&c, &r, k, n)
   elif id == 54: prefer_readonly(&c, &r, k, n)
   elif id == 55 and (k == ast.N_ARROW or k == ast.N_CALLSIG or k == ast.N_CTORSIG or k == ast.N_CTOR or k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_TFUNC or k == ast.N_METHOD): readonly_params(&c, &r, k, n)
+  elif id == 58 and (k == ast.N_AS or k == ast.N_TYPEASSERT or k == ast.N_NONNULL): unnecessary_assertion(&c, &r, k, n)
+  elif id == 57 and (k == ast.N_PROPACCESS or k == ast.N_ID or k == ast.N_TREF or k == ast.N_JSXATTR or k == ast.N_OBJECT or k == ast.N_OBJPAT or k == ast.N_EXPORT or k == ast.N_TQUERY): no_deprecated(&c, &r, k, n)
   elif id == 56 and (k == ast.N_ARROW or k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_CALLSIG or k == ast.N_CTORSIG or k == ast.N_TFUNC or k == ast.N_METHOD or k == ast.N_CLASS or k == ast.N_CLASSEXPR): unnecessary_type_params(&c, &r, k, n)
   elif id == 42 and (k == ast.N_AWAIT or k == ast.N_CALL or k == ast.N_TAGGED): confusing_void(&c, &r, n)

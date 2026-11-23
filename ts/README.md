@@ -152,7 +152,7 @@ parameter constrained to `{}` against a union.
 
 # vlint: an oxlint-compatible linter written in Vu
 
-`vlint` is meant as a drop-in replacement for oxlint 1.90.0: the same command line, the same
+`vlint` is meant as a drop-in replacement for oxlint 1.94.0: the same command line, the same
 configuration files, the same output bytes and exit codes. It checks `.js .mjs .cjs .jsx .ts .mts
 .cts .tsx` and the script sections of `.vue`, `.astro` and `.svelte` files. It reuses vtsc's
 scanner and parser, plus a scope builder (`scope.vu`), a regular-expression parser (`regex.vu`),
@@ -166,7 +166,32 @@ cd ts && VU_SPLIT=off ../vu build --release vlint.vu -o vlint   # one C file: th
 ./vlint [options] [paths]      # as oxlint; plus --jobs N, --cache, --cache-location PATH
 ```
 
-## Type-aware rules without tsgolint (2026-11-20, latest)
+## oxlint 1.94.0 and tsgolint 7.0.2008 (2026-11-23, latest)
+
+vlint now follows oxlint 1.94.0, and its type-aware rules follow tsgolint 7.0.2008: `--version`,
+`--help` and `--rules` print what oxlint 1.94.0 prints, byte for byte. `no-deprecated` and
+`no-unnecessary-type-assertion` are ported (vtsc's parser keeps JSDoc now). Two type-aware rules
+are still missing, `no-unnecessary-condition` and `prefer-optional-chain`: when they're on, vlint
+names them on stderr, and they report nothing.
+
+**The React monorepo** (the one below, with its dependencies installed; its own configuration with
+`--type-aware`, `-f unix`, compared line by line with oxlint 1.94.0 running tsgolint 7.0.2008):
+
+- Type-aware rules: 207,757 of tsgolint's 207,907 diagnostics are the same (99.93%). In the files
+  vtsc types, 64 are missing and 51 are extra. 81 files vtsc can't fully type hold the other 174,
+  and vlint names those files on stderr.
+- The other rules: the same output except 9 diagnostics of
+  `react/preserve-manual-memoization`, which vlint doesn't implement.
+- Wall time, cold (no cache), on a 10-core Mac: vlint 33.6 to 37.1 s, oxlint 1.94.0 57.2 to 63.1 s,
+  and the oxlint 1.79.0 the repository pins 77.0 to 86.3 s. Warm, with `--cache` and nothing changed,
+  vlint takes 2.6 s (7.6 s of CPU). The cold run is about 280 s of CPU, 220 of them in the type-aware
+  part.
+
+`ts/parity/` has the scripts behind these numbers (`VLINT_CORPUS` names the folder linted), and
+`ts/NOTES.md` has where the time goes. 813 vtsc cases (`vtest.sh`) and 108 probes
+(`oxprobe.sh --saved probes/*`) are checked in.
+
+## Type-aware rules without tsgolint (2026-11-20)
 
 vlint no longer runs `oxlint-tsgolint`. `--type-aware` and `--type-check` run in vlint itself: vtsc
 types the programs (the tsconfigs found as before, and tsgolint's inferred program for files no
@@ -214,6 +239,36 @@ Also fixed in vtsc on the way: an assertion signature (`asserts x is T`) returns
 `boolean`), so `const y: number = assertX(v)` now reports `Type 'void' is not assignable`. vtsc's
 263 checked-in cases pass. Not measured here: speed against tsgolint (the run no longer starts
 tsgolint at all).
+
+**A React monorepo** (the one of the sections below, 277,584 lines from oxlint 1.90.0 with
+tsgolint 7.0.2005; its own config, `--disable-nested-config -A typescript/no-misused-promises`, 10
+cores, 2026-11-20). At first this version stopped at the first file a type-aware rule reached. That
+crash hid several more, each fixed:
+
+- `.tsx` and `.jsx` files were parsed with JSX off, so `<p>` read as a type assertion and the text
+  after it as code. That left a property access with no name, and `no-unsafe-member-access` sliced
+  backwards on it. They're now parsed as tsc's LanguageVariant.JSX has it (`tsprog.is_jsx_path`). A
+  file the checker gave up on no longer gets the type-aware rules either: their results were dropped
+  with its type check anyway. A name the parser didn't find (`a.`) reads as "".
+- `super` in a class extending `ns.C` with no type for `ns.C`; `unsupported` with no node, from
+  awaiting a generic type or a thenable; a required property `get_prop` doesn't find.
+- Relating types that expand as they're related, which aren't objects (the objects'
+  isDeeplyNestedType didn't cover them): unbounded recursion, a stack overflow. Past a nesting of 200
+  the file isn't checked (`rel_nest`).
+
+With those fixed it runs, but vtsc can't fully type 27,120 files here (every `.tsx` among them:
+vtsc doesn't type JSX), so 26,790 of tsgolint's 210,137 type-aware diagnostics come out
+(`no-unsafe-member-access` 8,281 of 71,399; `no-deprecated` and `no-unnecessary-type-assertion`,
+6,670 and 1,765, aren't ported). The other 67,000 lines are the same as before. Wall seconds:
+
+| run | oxlint 1.90.0 | vlint with tsgolint (e0321f9) | vlint, vtsc's types |
+|---|---:|---:|---:|
+| no `--cache`, vtsc's file cache empty | 110.0, 99.0 | 58.4, 56.8 | 194.6 |
+| no `--cache`, vtsc's file cache warm | | | 35.1 |
+| `--cache`, warm | (no cache) | 6.4 | 23.6, 23.7 |
+
+vtsc's per-file cache (`~/.cache/vlint/vtsc-files`, 341 MB after one run here) is used whether
+`--cache` is given or not. The `probes/tsx-typed` probe covers the first crash.
 
 ## The same monorepo with its dependencies installed (2026-11-20, with tsgolint)
 
@@ -290,7 +345,7 @@ registered"); they name different configs, as they read them in a different orde
 built as the repository's `scripts/oxlint/package.mts` builds them, each package's config with its
 overrides, `--type-aware`, its ignore patterns, `--report-unused-disable-directives-severity error`,
 `--format stylish`): 101 give oxlint 1.90.0's output and exit code. The other 8: six differ only by
-`react/preserve-manual-memoization` (vlint doesn't implement it), and on opshub oxlint stops at
+`react/preserve-manual-memoization` (vlint doesn't implement it), and on one package oxlint stops at
 tsgolint's `no-misused-promises` panic where vlint leaves that rule out of the files it crashes
 on (and says so on stderr). Both took about 3 minutes for the 109 runs without a cache (oxlint
 188 s, vlint 172 s). Found and fixed on the way: `node/no-process-env`, `react/forbid-dom-props`,

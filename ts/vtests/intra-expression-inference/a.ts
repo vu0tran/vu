@@ -1,0 +1,13 @@
+declare function f2<T>(o: { a: (x: number) => T; b: (t: T) => void }): void;
+f2({ a: () => "lit", b: (t) => { const n: number = t; } });
+f2({ b: (t) => { const n: number = t; }, a: (x) => String(x) });
+declare function f4<T extends string>(o: { a: (x: number) => T; b: (t: T) => void }): void;
+f4({ a: (x) => "lit", b: (t) => { const n: number = t; } });
+declare function f5<T, U>(o: { a: (x: number) => T; b: (t: T) => U; c: (u: U) => void }): void;
+f5({ a: (x) => ({ id: x }), b: (t) => [t.id], c: (u) => { const n: string = u; } });
+declare function f6<T>(o: { a: (x: number) => T; b: (t: T) => void }, z: T): void;
+f6({ a: (x) => x > 1, b: (t) => { const n: string = t; } }, true);
+declare function f7<T>(o: { init: T; a: (x: T) => T; b: (t: T) => void }): void;
+f7({ init: 1, a: (x) => x + 1, b: (t) => { const n: string = t; } });
+declare function f3<T>(o: { a: (x: number) => T | Promise<T>; b: (t: T) => void }): void;
+f3({ a: async (x): Promise<string> => String(x), b: (t) => { const n: number = t; } });

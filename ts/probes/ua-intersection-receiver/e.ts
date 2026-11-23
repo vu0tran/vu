@@ -1,0 +1,21 @@
+import { Address } from './missing';
+declare const ANY: any;
+type I3 = { address: any } & { m: number };
+type I4 = { address: Address } & { address: string };
+type I5 = { address: Address; m: number } & {};
+type I6 = { address: Address } & { m: number } & { k: 1 };
+interface J { address: Address }
+type I7 = J & { m: number };
+type U1 = { address: Address } | { m: number };
+declare function f3(o: I3): void;
+declare function f4(o: I4): void;
+declare function f5(o: I5): void;
+declare function f6(o: I6): void;
+declare function f7(o: I7): void;
+declare function u1(o: U1): void;
+f3({ address: ANY, m: 1 });
+f4({ address: ANY });
+f5({ address: ANY, m: 1 });
+f6({ address: ANY, m: 1, k: 1 });
+f7({ address: ANY, m: 1 });
+u1({ address: ANY });

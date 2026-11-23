@@ -14,6 +14,7 @@ import lresolve
 import trules
 import lconf
 import lglob
+import lprobe
 
 fn lib_dir(fs: Fs, os: Os) -> Str:
   let env = os.env("VTSC_LIB")
@@ -25,6 +26,11 @@ fn lib_dir(fs: Fs, os: Os) -> Str:
 # Whether a node_modules directory above the file may hold the package (or its @types): then
 # the import isn't modeled; else tsc reports TS2307 for it.
 fn package_may_exist(fs: Fs, var rv: lresolve.Rv, cwd: Str, path: Str, spec: Str) -> Bool:
+  return package_js(fs, &rv, cwd, path, spec) != ""
+
+# package_may_exist's answer: "" when no package is there, the JavaScript file an import of it
+# loads when it has no declarations (TS7016), "?" otherwise.
+fn package_js(fs: Fs, var rv: lresolve.Rv, cwd: Str, path: Str, spec: Str) -> Str:
   var name = spec + ""
   let parts = spec.split("/")
   if spec.startswith("@") and parts.len >= 2: name = parts[0] + "/" + parts[1]
@@ -36,25 +42,29 @@ fn package_may_exist(fs: Fs, var rv: lresolve.Rv, cwd: Str, path: Str, spec: Str
   if not abs.startswith("/"): abs = bind.norm_path(cwd + "/" + path)
   var dir = bind.dir_of(abs)
   while dir != "" and dir != "/":
-    if lresolve.kind_of(&rv, fs, dir + "/node_modules/@types/" + types_name) > 0 or lresolve.kind_of(&rv, fs, dir + "/node_modules/" + name + ".d.ts") > 0: return true
+    if lresolve.kind_of(&rv, fs, dir + "/node_modules/@types/" + types_name) > 0 or lresolve.kind_of(&rv, fs, dir + "/node_modules/" + name + ".d.ts") > 0: return "?"
     let pd = dir + "/node_modules/" + name
     if lresolve.kind_of(&rv, fs, pd) > 0:
       # (a package without declarations or the JavaScript they'd describe, one not built yet:
       # nothing there for TypeScript, TS2307)
       var sub = ""
       if spec.len > name.len: sub = spec[name.len + 1..spec.len]
-      return package_js_exists(fs, pd, sub)
+      return package_js_file(fs, pd, sub)
     dir = bind.dir_of(dir)
-  if fs.exists("/node_modules/" + name) or fs.exists("/node_modules/@types/" + types_name): return true
-  return false
+  if fs.exists("/node_modules/" + name) or fs.exists("/node_modules/@types/" + types_name): return "?"
+  return ""
 
 # Whether a package folder has JavaScript an import of it (subpath sub, "" for the package) could
 # load: its exports' targets for the subpath, else main / index.js (or sub as a file).
 fn package_js_exists(fs: Fs, pd: Str, sub: Str) -> Bool:
+  return package_js_file(fs, pd, sub) != ""
+
+# package_js_exists's file: the first candidate there, "?" when it can't tell, "" for none
+fn package_js_file(fs: Fs, pd: Str, sub: Str) -> Str:
   let txt = fs.read(pd + "/package.json") else ""
-  if txt == "": return true
+  if txt == "": return "?"
   let js = lconf.parse_json(txt)
-  if js.err != "" or js.v.len == 0: return true
+  if js.err != "" or js.v.len == 0: return "?"
   var cands: [Str] = []
   let ex = lconf.get(js, 0, "exports")
   if ex >= 0:
@@ -83,7 +93,7 @@ fn package_js_exists(fs: Fs, pd: Str, sub: Str) -> Bool:
             collect_targets(js, pv, &pc)
             for x in pc: cands.push(x.replace("*", mid))
             matched = true
-          if not matched: return true
+          if not matched: return "?"
           tv = -1
     if tv >= 0: collect_targets(js, tv, &cands)
   else:
@@ -95,16 +105,17 @@ fn package_js_exists(fs: Fs, pd: Str, sub: Str) -> Bool:
       cands.push(sub)
       cands.push(sub + ".js")
       cands.push(sub + "/index.js")
-  if cands.len == 0: return true
+  if cands.len == 0: return "?"
   for cnd in cands:
-    if cnd.find("*") >= 0: return true
+    if cnd.find("*") >= 0: return "?"
     # (a TypeScript source as a target isn't JavaScript to load)
     if cnd.endswith(".ts") or cnd.endswith(".tsx") or cnd.endswith(".mts") or cnd.endswith(".cts"): continue
     var pth = cnd + ""
     if pth.startswith("./"): pth = pth[2..pth.len]
     let full = pd + "/" + pth
-    if fs.exists(full) or fs.exists(full + ".js") or fs.exists(full + "/index.js"): return true
-  return false
+    for ext in ["", ".js", "/index.js"]:
+      if fs.exists(full + ext) and not fs.exists(full + ext + "/"): return full + ext
+  return ""
 
 fn collect_targets(js: lconf.Json, v: Int, var out: [Str]):
   let k = js.v[v].k
@@ -115,7 +126,9 @@ fn collect_targets(js: lconf.Json, v: Int, var out: [Str]):
     for x in js.v[v].kids: collect_targets(js, x, &out)
 
 # The lib files a root lib references (/// <reference lib="x" />), each once, references first.
-fn lib_files(fs: Fs, dir: Str, name: Str, var seen: {Str: Bool}, var out: [Str]):
+fn lib_files(fs: Fs, dir: Str, name0: Str, var seen: {Str: Bool}, var out: [Str]):
+  # (lib names are case-insensitive: "DOM.Iterable" is dom.iterable)
+  let name = name0.lower()
   if name in seen: return
   seen[name] = true
   let path = dir + "/lib." + name + ".d.ts"
@@ -142,8 +155,46 @@ fn lib_files(fs: Fs, dir: Str, name: Str, var seen: {Str: Bool}, var out: [Str])
     if at < 0: continue
     let rest = l[at + 6..l.len]
     let q = rest.find("\"")
-    if q > 0: lib_files(fs, dir, rest[0..q], &seen, &out)
+    if q > 0: lib_files(fs, dir, tsconf.lib_alias(rest[0..q].lower()), &seen, &out)
   out.push(path)
+
+# TypeScript 7's lib names in the order of its lib list (tsoptions.Libs, as `tsc --listFiles`
+# prints them): the lib files are merged in this order, whatever references them first.
+fn lib_order() -> Str:
+  return "es5 es2015 es2016 es2017 es2018 es2019 es2020 es2021 es2022 es2023 es2024 es2025 esnext dom dom.iterable dom.asynciterable webworker webworker.importscripts webworker.iterable webworker.asynciterable scripthost es2015.core es2015.collection es2015.generator es2015.iterable es2015.promise es2015.proxy es2015.reflect es2015.symbol es2015.symbol.wellknown es2016.array.include es2016.intl es2017.arraybuffer es2017.date es2017.object es2017.sharedmemory es2017.string es2017.intl es2017.typedarrays es2018.asyncgenerator es2018.asynciterable es2018.intl es2018.promise es2018.regexp es2019.array es2019.object es2019.string es2019.symbol es2019.intl es2020.bigint es2020.date es2020.promise es2020.sharedmemory es2020.string es2020.symbol.wellknown es2020.intl es2020.number es2021.promise es2021.string es2021.weakref es2021.intl es2022.array es2022.error es2022.intl es2022.object es2022.string es2022.regexp es2023.array es2023.collection es2023.intl es2024.arraybuffer es2024.collection es2024.object es2024.promise es2024.regexp es2024.sharedmemory es2024.string es2025.collection es2025.float16 es2025.intl es2025.iterator es2025.promise es2025.regexp esnext.array esnext.collection esnext.date esnext.decorators esnext.disposable esnext.error esnext.intl esnext.sharedmemory esnext.temporal esnext.typedarrays decorators decorators.legacy"
+
+# The lib files in tsgo's order (fileLoader.sortLibs, getDefaultLibFilePriority): lib.d.ts and
+# lib.es6.d.ts first, then the listed libs by their place in the list, then the rest (a target's
+# .full root) in the order found.
+fn sort_libs(libs: [Str]) -> [Str]:
+  var rank: {Str: Int} = {}
+  var i = 0
+  for nm in lib_order().split(" "):
+    i += 1
+    rank[nm] = i
+  var keyed: [Int] = []
+  for p in libs:
+    let parts = p.split("/")
+    let b = parts[parts.len - 1]
+    var r = 1000
+    if b == "lib.d.ts" or b == "lib.es6.d.ts": r = 0
+    elif b.startswith("lib.") and b.endswith(".d.ts"):
+      let nm2 = b[4..b.len - 5]
+      if nm2 in rank: r = rank[nm2]
+    keyed.push(r)
+  var out: [Str] = []
+  # (a stable selection by rank: few files, each rank once but the rest's)
+  var ranks: [Int] = []
+  for r in keyed:
+    var have = false
+    for x in ranks:
+      if x == r: have = true
+    if not have: ranks.push(r)
+  ranks.sort()
+  for r in ranks:
+    for j in 0..libs.len:
+      if keyed[j] == r: out.push(libs[j] + "")
+  return out
 
 fn real_or(ffi: Ffi, var dirs: {Str: Str}, p: Str) -> Str:
   if p == "" or p.find("/node_modules/") < 0: return p
@@ -303,9 +354,19 @@ fn decorator_at(src: Str, ls: [Int], l: Int) -> Int:
   return -1
 
 fn line_col(src: Str, pos: Int) -> [Int]:
-  var line = 1
-  var col = 1
-  var i = 0
+  var at = [0, 1, 1]
+  return line_col_from(src, pos, &at)
+
+# line_col from where the last call on the same text stopped (at: index, line, column), when pos is
+# at or past it: the errors of a file come in order
+fn line_col_from(src: Str, pos: Int, var at: [Int]) -> [Int]:
+  if at[0] > pos or at[0] > src.len:
+    at[0] = 0
+    at[1] = 1
+    at[2] = 1
+  var line = at[1]
+  var col = at[2]
+  var i = at[0]
   while i < pos and i < src.len:
     let ch = src[i]
     if ch == '\n':
@@ -324,7 +385,46 @@ fn line_col(src: Str, pos: Int) -> [Int]:
     else:
       col += 1
       i += 2
+  at[0] = i
+  at[1] = line
+  at[2] = col
   return [line, col]
+
+# The program's files in the order tsc's file loader lists them (--listFiles): the libs, then
+# each root file in turn, after its /// <reference path> files, its /// <reference types>
+# packages and its imports, each depth first and once; then the types option's packages.
+# (the root files: "files" as listed, then by the include each matches first and the walk tsc's
+# matchFiles takes, a folder's files before its folders)
+fn tsc_order(cwd: Str, files: [Str], tfiles: [Str], incl: [Str], nlisted: Int, user_from: Int, odeps: [[Str]], index: {Str: Int}, n: Int) -> [Int]:
+  var out: [Int] = []
+  var state: [Int] = []
+  for fx in 0..n: state.push(0)
+  for fx in 1..user_from:
+    out.push(fx)
+    state[fx] = 2
+  var inc_of: [Int] = []
+  var keys: [[Str]] = []
+  for ri in 0..files.len:
+    var af = files[ri] + ""
+    if not af.startswith("/"): af = bind.norm_path(cwd + "/" + af)
+    var ii = -1
+    if ri >= nlisted and incl.len > 0:
+      ii = incl.len
+      for k in 0..incl.len:
+        if ii == incl.len and lglob.glob_match(incl[k], af): ii = k
+    inc_of.push(ii)
+    keys.push(walk_key(af))
+  var idx: [Int] = []
+  for i in 0..files.len: idx.push(i)
+  if incl.len > 0: idx.sort(by: fn(a, b) => order_less(a, b, inc_of, keys))
+  for i in idx:
+    let np = bind.norm_path(files[i])
+    if np in index: visit(index[np], user_from, odeps, &state, &out, index)
+  for tf in tfiles:
+    if tf in index: visit(index[tf], user_from, odeps, &state, &out, index)
+  for fx in user_from..n:
+    if state[fx] == 0: out.push(fx)
+  return out
 
 fn visit(f: Int, user_from: Int, deps: [[Str]], var state: [Int], var out: [Int], index: {Str: Int}):
   if state[f] != 0: return
@@ -362,6 +462,85 @@ fn diag_less(a: parse.Diag, b: parse.Diag) -> Bool:
   return a.msg < b.msg
 
 
+# Out without the checker: what a forked shard sends its parent (as JSON).
+type OutW:
+  keys: [parse.Diag]
+  lines: [Str]
+  lib: [Bool]
+  unsup_user: Bool
+  timing: Str
+  ok: Bool
+  unsup: [Str]
+  unsup_fi: [Int]
+  unsup_mine: [Bool]
+  fidx: [Int]
+  user_from: Int
+  names: [Str]
+  deps: [[Int]]
+  pkgs: [Bool] = []
+  order: [Int] = []
+  nsyntax: Int = 0
+  rdiags: [trules.RDiag] = []
+  rfile: [Int] = []
+  rbad: [Int] = []
+  ckeys: [Str] = []
+  cnew: {Str: CEntry} = {}
+  ncached: Int = 0
+
+fn out_wire(own o0: Out) -> OutW:
+  var o = o0
+  var w = OutW([], [], [], false, "", false, [], [], [], [], 0, [], [])
+  swap(&w.keys, &o.keys)
+  swap(&w.lines, &o.lines)
+  swap(&w.lib, &o.lib)
+  swap(&w.unsup, &o.unsup)
+  swap(&w.unsup_fi, &o.unsup_fi)
+  swap(&w.unsup_mine, &o.unsup_mine)
+  swap(&w.fidx, &o.fidx)
+  swap(&w.names, &o.names)
+  swap(&w.deps, &o.deps)
+  swap(&w.pkgs, &o.pkgs)
+  swap(&w.order, &o.order)
+  swap(&w.rdiags, &o.rdiags)
+  swap(&w.rfile, &o.rfile)
+  swap(&w.rbad, &o.rbad)
+  swap(&w.ckeys, &o.ckeys)
+  swap(&w.cnew, &o.cnew)
+  w.unsup_user = o.unsup_user
+  w.ok = o.ok
+  w.user_from = o.user_from
+  w.nsyntax = o.nsyntax
+  w.ncached = o.ncached
+  w.timing = o.timing + ""
+  return w
+
+fn out_unwire(own w0: OutW) -> Out:
+  var w = w0
+  var o = Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
+  swap(&o.keys, &w.keys)
+  swap(&o.lines, &w.lines)
+  swap(&o.lib, &w.lib)
+  swap(&o.unsup, &w.unsup)
+  swap(&o.unsup_fi, &w.unsup_fi)
+  swap(&o.unsup_mine, &w.unsup_mine)
+  swap(&o.fidx, &w.fidx)
+  swap(&o.names, &w.names)
+  swap(&o.deps, &w.deps)
+  swap(&o.pkgs, &w.pkgs)
+  swap(&o.order, &w.order)
+  swap(&o.rdiags, &w.rdiags)
+  swap(&o.rfile, &w.rfile)
+  swap(&o.rbad, &w.rbad)
+  swap(&o.ckeys, &w.ckeys)
+  swap(&o.cnew, &w.cnew)
+  o.unsup_user = w.unsup_user
+  o.ok = w.ok
+  o.user_from = w.user_from
+  o.nsyntax = w.nsyntax
+  o.ncached = w.ncached
+  o.timing = w.timing + ""
+  return o
+
 type Out:
   keys: [parse.Diag]
   lines: [Str]
@@ -383,6 +562,8 @@ type Out:
   rdiags: [trules.RDiag] = []  # the type-aware rules' diagnostics (Prog.lint)
   rfile: [Int] = []            # ... each one's file index
   rbad: [Int] = []             # files whose rules reached something not modeled
+  sub_path: Str = ""           # (a forked shard) where its Out goes
+  subs: [Str] = []             # (the parent of forked shards) their Outs, as JSON
   ckeys: [Str] = []            # (worker 0, with the file cache) each file's key ("" none)
   cnew: {Str: CEntry} = {}     # the cache entries of the files this worker checked, by key
   ncached: Int = 0             # (worker 0) the user files the cache answered
@@ -420,6 +601,33 @@ fn cache_path(cache: Str, id: Str) -> Str:
   if cache == "": return ""
   return cache + "/" + lcache.hex16(lcache.hash64(id)) + ".json"
 
+# want_deps with the imports as file indexes (dep_index): no string hashing on the way
+fn want_deps_i(f: Int, user_from: Int, impi: [[Int]], var want: [Bool]):
+  if want[f]: return
+  want[f] = true
+  if f < user_from or f - user_from >= impi.len: return
+  for d in impi[f - user_from]: want_deps_i(d, user_from, impi, &want)
+
+# The files want_deps marks from f, as a list: mark[x] == stamp for those seen (one array for all
+# the calls, a new stamp each)
+fn dep_closure(f: Int, user_from: Int, impi: [[Int]], var mark: [Int], stamp: Int, var out: [Int]):
+  if mark[f] == stamp: return
+  mark[f] = stamp
+  out.push(f)
+  if f < user_from or f - user_from >= impi.len: return
+  for d in impi[f - user_from]: dep_closure(d, user_from, impi, &mark, stamp, &out)
+
+# Each user file's imports as file indexes (those the program has)
+fn dep_index(deps: [[Str]], index: {Str: Int}) -> [[Int]]:
+  var r: [[Int]] = []
+  for ds in deps:
+    var xs: [Int] = []
+    for d in ds:
+      let x = index.get(d, -1)
+      if x >= 0: xs.push(x)
+    r.push(xs)
+  return r
+
 fn want_deps(f: Int, user_from: Int, deps: [[Str]], var want: [Bool], index: {Str: Int}):
   if want[f]: return
   want[f] = true
@@ -430,19 +638,34 @@ fn want_deps(f: Int, user_from: Int, deps: [[Str]], var want: [Bool], index: {St
 # packages (has_types: the listed ones from tdir, else every one found from the current folder up).
 type Prog:
   libs: [Str] = []
+  root_incl: [Str] = []      # the include patterns, and how many root files "files" lists: tsc's root order
+  root_listed: Int = 0
   has_types: Bool = false
   allow_unreach: Bool = false  # allowUnreachableCode: true (no TS2695)
   inferred: Bool = false     # (vlint) tsgolint's inferred program: only its listed files are reported
+  allow_js: Bool = false     # allowJs: a JavaScript file an import names is the program's
   types: [Str] = []
   tdir: Str = ""
   spi: Bool = true
   npai: Bool = false  # noPropertyAccessFromIndexSignature (for the type-aware rules)
+  no_trunc: Bool = false  # noErrorTruncation (types in messages printed in full)
+  jsx: Str = ""         # the jsx option, lowercased (react-jsx...)
+  jsx_src: Str = ""     # jsxImportSource
   unknown_catch: Bool = true
+  exact_opt: Bool = false
+  nuia: Bool = false
+  snc_off: Bool = false
+  nia_off: Bool = false
+  sft_off: Bool = false
+  sbca_off: Bool = false
+  nit_off: Bool = false
   side_unchecked: Bool = false
   pkeys: [Str] = []      # the tsconfig's paths
   pvals: [[Str]] = []
   node16: Bool = false   # moduleResolution node16 / nodenext: a CommonJS importer's packages by "require"
   meta_ok: Bool = false  # module es2020, es2022, esnext or preserve: import.meta is allowed everywhere
+  mod_node: Bool = false  # module node16, node18, node20 or nodenext (import.meta in ESM files only)
+  mod_force: Bool = false # moduleDetection: force (every file but a declaration file a module)
   tla_ok: Bool = false   # module es2022, esnext or preserve: top-level await
   exp_deco: Bool = false  # experimentalDecorators
   no_unused: Bool = false  # noUnusedLocals
@@ -459,6 +682,10 @@ type Prog:
 
 # A file TypeScript treats as CommonJS under node16 / nodenext: .cts, or .ts / .d.ts in a package
 # whose nearest package.json has no "type": "module".
+fn abs_of(cwd: Str, path: Str) -> Str:
+  if path.startswith("/"): return path
+  return bind.norm_path(cwd + "/" + path)
+
 fn importer_cjs(fs: Fs, var rv: lresolve.Rv, path: Str) -> Bool:
   if path.endswith(".cts") or path.endswith(".cjs"): return true
   if path.endswith(".mts") or path.endswith(".mjs"): return false
@@ -471,8 +698,8 @@ fn importer_cjs(fs: Fs, var rv: lresolve.Rv, path: Str) -> Bool:
     d = up
   return true
 
-fn worker(fs: Fs, os: Os, ffi: Ffi, own files: [Str], own dir: Str, own target: Str, own pg: Prog, shard: Int, nshards: Int, own ch: Chan[Out], own wq: Chan[Int], cap: Int):
-  let o = run(fs, os, ffi, files, dir, target, pg, shard, nshards, wq, cap) else Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
+fn worker(fs: Fs, os: Os, ffi: Ffi, own files: [Str], own dir: Str, own target: Str, own pg: Prog, shard: Int, nshards: Int, own ch: Chan[Out], own wq: Chan[Int], cap: Int, own fm: Memo[Str, FSrc], own km: Memo[Str, Int]):
+  let o = run(fs, os, ffi, files, dir, target, pg, shard, nshards, wq, cap, fm, km) else Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
   ch.send(o)
 
 # The checker over the files: the errors of this worker's share of them (every nshards-th file,
@@ -542,7 +769,96 @@ fn file_keys(fs: Fs, ffi: Ffi, c: types.C, pg: Prog, dir: Str, target: Str, srcs
     out[fx] = lcache.hex16(lcache.mix(lcache.mix(lcache.mix(lcache.mix(g, fh[fx]), sum), n), lcache.hash64(rl)))
   return out
 
-fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, shard: Int, nshards: Int, own wq: Chan[Int], cap: Int) -> Out throws:
+# A file's text, read once for every program and worker of a run (fm): a monorepo's 93 shards each
+# read their programs' files, the same packages' declarations among them, 7% of the run's CPU.
+type FSrc:
+  ok: Bool
+  text: Str
+  specs: [Str] = []   # its import("x") types' specifiers (import_type_specs), found once too
+
+fn read_fsrc(fs: Fs, p: Str) -> FSrc:
+  let t = fs.read(p) else return FSrc(false, "")
+  let sp = import_type_specs(t)
+  return FSrc(true, t, sp)
+
+# import_type_specs(src) of the file at p, from the run's read of it when src is that text
+fn shared_specs(fs: Fs, fm: Memo[Str, FSrc], p: Str, src: Str) -> [Str]:
+  let v = fm.get(p, fn(k) => read_fsrc(fs, k))
+  if v.value.ok and v.value.text == src:
+    var out: [Str] = []
+    for x in v.value.specs: out.push(x + "")
+    return out
+  return import_type_specs(src)
+
+fn read_shared(fs: Fs, fm: Memo[Str, FSrc], p: Str) -> Str:
+  let v = fm.get(p, fn(k) => read_fsrc(fs, k))
+  if not v.value.ok: return ""
+  return v.value.text + ""
+
+fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, shard: Int, nshards: Int, own wq: Chan[Int], cap: Int, fm: Memo[Str, FSrc], km: Memo[Str, Int]) -> Out throws:
+  return run_libs(fs, os, ffi, files, dir, target, pg, shard, nshards, wq, cap, fm, km, [])?
+
+# (xlibs: the libs the program's files reference, /// <reference lib="x" />, which tsc loads with
+# the others, before every other file: found while reading the files, which are then read again)
+# (shard -1: forks nshards processes where the shards part, each the run's state copy-on-write; the
+# parent's Out has their results' paths in subs, a child's its own path in sub_path)
+# Which shard each of uord's files goes to (-1: done already): a file goes where its imports
+# already are, unless that shard has more to do than the others; the largest closures first.
+# (done: checked before the shards part, not given to any, its imports there in every shard)
+fn closure_shards(uord: [Int], fcost: [Int], impi: [[Int]], user_from: Int, skip: [Bool], done: [Bool], nshards: Int) -> [Int]:
+  let nroots = skip.len
+  var clo: [[Int]] = []
+  var csize: [Int] = []
+  var cmark: [Int] = []
+  for _q in 0..nroots: cmark.push(-1)
+  var cstamp = 0
+  for fx in uord:
+    var got: [Int] = []
+    dep_closure(fx, user_from, impi, &cmark, cstamp, &got)
+    cstamp += 1
+    got.sort()
+    var cl: [Int] = []
+    var sz = 0
+    for q in got:
+      if q >= user_from and not skip[q] and not done[q]:
+        cl.push(q)
+        sz += fcost[q]
+    clo.push(cl)
+    csize.push(sz)
+  var ix: [Int] = []
+  for i in 0..uord.len: ix.push(i)
+  ix.sort(by: fn(a, b) => csize[a] > csize[b] or (csize[a] == csize[b] and a < b))
+  var load: [Int] = []
+  var have: [[Bool]] = []
+  for _s in 0..nshards:
+    load.push(0)
+    var hv: [Bool] = []
+    for _q in 0..nroots: hv.push(false)
+    have.push(hv)
+  var out: [Int] = []
+  for _i in 0..uord.len: out.push(-1)
+  for i in ix:
+    if done[uord[i]]: continue
+    var best = 0
+    var best_cost = -1
+    for sh in 0..nshards:
+      var add = 0
+      for q in clo[i]:
+        if not have[sh][q]: add += fcost[q]
+      let cost = load[sh] + add
+      if best_cost < 0 or cost < best_cost:
+        best = sh
+        best_cost = cost
+    for q in clo[i]:
+      if not have[best][q]:
+        have[best][q] = true
+        load[best] += fcost[q]
+    out[i] = best
+  return out
+
+fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, shard0: Int, nshards0: Int, own wq: Chan[Int], cap: Int, fm: Memo[Str, FSrc], km: Memo[Str, Int], xlibs: [Str]) -> Out throws:
+  var shard = shard0
+  var nshards = nshards0
   let t0 = os.clock()
   var out = Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
   var seen: {Str: Bool} = {}
@@ -557,6 +873,10 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   elif pg.libs.len > 0:
     for l in pg.libs: lib_files(fs, dir, l, &seen, &libs)
   else: lib_files(fs, dir, libroot, &seen, &libs)
+  if not keys_only:
+    for l in xlibs: lib_files(fs, dir, l, &seen, &libs)
+  libs = sort_libs(libs)
+  var ref_libs: [Str] = []
   var kw = scan.keywords()
   var t = ast.new_ast()
   # (room up front: a program with packages' types has about a million nodes, and growing the
@@ -567,8 +887,10 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   var names: [Str] = [""]
   var pdiags: [parse.Diag] = []
   var pkg_syntax: {Int: Str} = {}   # a package file the parser found a syntax error in
+  var jsdoc_why: {Int: Str} = {}    # a JavaScript file whose JSDoc isn't read as tsc reads it
   for path in libs:
-    let src = fs.read(path)?
+    var src = read_shared(fs, fm, path)
+    if src == "": src = fs.read(path)?
     let fi = srcs.len
     parse.parse_file(&t, src + "", fi, &kw)
     srcs.push(src)
@@ -584,22 +906,34 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       queued[np] = true
       queue.push(np)
   var deps: [[Str]] = []
+  var odeps: [[Str]] = []    # the deps in the order tsc's file loader visits them (tsc_order)
   var imps: [[Str]] = []     # the deps through import statements (not export ... from)
   var pkg_present: {Str: Bool} = {}
+  var pkg_js: {Str: Str} = {}
   var cjs_roots: {Int: Bool} = {}
+  var cjs_exp: {Int: Int} = {}
   # packages' types (tsres): the files loaded for them, and what each import resolved to
   var rv = lresolve.new_rv()
+  rv.km.push(km.share())
   for x in pg.redir_out: rv.redir_out.push(x + "")
   for x in pg.redir_src: rv.redir_src.push(x + "")
   for k, v in pg.redir_files: rv.redir_files[k] = v
   for k, v in pg.redir_pkg: rv.redir_pkg[k] = v + ""
   var pkgset: {Str: Bool} = {}
   var pkg_res: {Str: Str} = {}
+  var js_imps: {Str: Bool} = {}
+  var cjs_ts: {Int: Bool} = {}
+  var cjs_dts: {Int: Bool} = {}
   var cwd0 = os.env("PWD")
   if pg.cwd != "": cwd0 = pg.cwd + ""
   var tfiles: [Str] = []
+  # ("*": every @types package found from the current folder up, as with no types option)
   if pg.has_types:
     for tn in pg.types:
+      if tn == "*":
+        if os.env("VTSC_NO_PACKAGES") == "":
+          for tf0 in tsres.auto_types(&rv, fs, cwd0): tfiles.push(tf0)
+        continue
       let tf = tsres.reference_types(&rv, fs, pg.tdir + "/x", tn)
       if tf != "": tfiles.push(tf)
   elif os.env("VTSC_NO_PACKAGES") == "": tfiles = tsres.auto_types(&rv, fs, cwd0)
@@ -611,27 +945,42 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   var pid_first: {Str: Str} = {}
   var redirects: {Str: Str} = {}
   for ti in 0..tfiles.len: tfiles[ti] = real_or(ffi, &rdirs, tfiles[ti])
-  if os.env("VTSC_NO_PACKAGES") == "":
-    for f in tfiles:
-      if not (f in queued):
-        queued[f] = true
-        queue.push(f + "")
-        pkgset[f] = true
+  # (the types option's packages come after the root files and all they import, as tsc
+  # processes the automatic type directives after the root files: where two declare one global,
+  # google-maps' googlemaps and @types/google.maps, the first file's wins)
+  var types_in = os.env("VTSC_NO_PACKAGES") != ""
   var qi = 0
   var tparse = 0.0
-  while qi < queue.len:
+  while qi < queue.len or not types_in:
+    if qi == queue.len:
+      types_in = true
+      for f in tfiles:
+        if not (f in queued):
+          queued[f] = true
+          queue.push(f + "")
+          pkgset[f] = true
+      continue
     let path = queue[qi] + ""
     qi += 1
-    var src = fs.read(path) else ""
-    if src == "" and not (path in pkgset): fs.read(path)?
+    var src = read_shared(fs, fm, path)
+    if src == "" and not (path in pkgset): src = fs.read(path)?
     if path.endswith(".json"):
       # (a JSON module: its value's widened type, as the type of a const it initializes, the
       # module's export =; loaded for its type, not checked)
       src = "const __json = " + src + ";\nexport = __json;\n"
       pkgset[path] = true
     let fi = srcs.len
+    # (a TypeScript file that's CommonJS under node16's rules: import x = require there is allowed)
+    if pg.node16 and not (path in pkgset) and path.find("/node_modules/") < 0 and (path.endswith(".ts") or path.endswith(".tsx") or path.endswith(".cts")) and importer_cjs(fs, &rv, abs_of(cwd0, path)): cjs_ts[fi] = true
+    # (a package's declaration file that's CommonJS: an ECMAScript module's default import of it
+    # is its module.exports, the module itself)
+    elif pg.node16 and pg.mod_node and (path in pkgset or path.find("/node_modules/") >= 0) and (path.endswith(".d.ts") or path.endswith(".d.cts")) and importer_cjs(fs, &rv, abs_of(cwd0, path)): cjs_dts[fi] = true
     let tp0 = os.clock()
-    let ds = parse.parse_file(&t, src + "", fi, &kw)
+    # (a .tsx or .jsx file: '<' in an expression starts JSX, as tsc's LanguageVariant.JSX has it)
+    let nb0 = t.nd.len
+    # (JavaScript is read with JSX too, getLanguageVariant)
+    let jsxv = is_jsx_path(path) or path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs")
+    let ds = parse.parse_file_x(&t, src + "", fi, &kw, false, jsxv)
     tparse += os.clock() - tp0
     # (a package's syntax errors aren't reported: tsc reports them, but they'd hide every other error)
     let in_pkg = path in pkgset or path.find("/node_modules/") >= 0
@@ -642,13 +991,21 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       if os.env("VTSC_PKG_SYNTAX") != "": eprint("PKGSYNTAX {path} TS{ds[0].code} {ds[0].pos} {ds[0].msg}")
     srcs.push(src)
     names.push(path + "")
-    let root = t.nd.len - 1
+    var root = t.nd.len - 1
+    # (a JavaScript file of the program's own: its JSDoc types set where TypeScript writes them)
+    if not in_pkg and (path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")):
+      var jfirst = 0
+      if roots.len > 0: jfirst = roots[roots.len - 1] + 1
+      let jw = jsdoc_attach(&t, src, fi, jfirst, root, &kw)
+      if jw != "": jsdoc_why[fi] = jw
+      root = t.nd.len - 1
     roots.push(root)
     # (a JavaScript file's require("x") calls: CommonJS imports, and the file a CommonJS module)
     var req_specs: [Str] = []
     if path.endswith(".js") or path.endswith(".cjs") or path.endswith(".jsx"):
       var ni = 0
       if roots.len > 1: ni = roots[roots.len - 2] + 1
+      let ni0 = ni
       var cjs = false
       while ni < root:
         let rs = require_spec(t, ni)
@@ -658,23 +1015,47 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
         if t.nd[ni].k == ast.N_PROPACCESS and t.nd[t.nd[ni].a].k == ast.N_ID and t.names[t.nd[t.nd[ni].a].s] == "module" and t.names[t.nd[ni].s] == "exports": cjs = true
         if t.nd[ni].k == ast.N_ID and t.names[t.nd[ni].s] == "exports": cjs = true
         ni += 1
-      if cjs: cjs_roots[root] = true
+      if cjs:
+        cjs_roots[root] = true
+        let ce = cjs_export_expr(t, root, ni0)
+        if ce >= 0: cjs_exp[root] = ce
+    # (an ES module's require("x") calls, its own require's: what const x = require("x") aliases)
+    if path.endswith(".mjs") and not in_pkg:
+      var nm0 = 0
+      if roots.len > 1: nm0 = roots[roots.len - 2] + 1
+      while nm0 < root:
+        let rs = require_spec(t, nm0)
+        if rs >= 0: req_specs.push(t.names[t.nd[rs].s] + "")
+        nm0 += 1
     var my_deps: [Str] = []
     var my_imps: [Str] = []
+    var dep_rank: [Int] = []   # (each dep's place in tsc's visit: path refs, types refs, then imports)
     var abs_path = path + ""
     if not abs_path.startswith("/"): abs_path = bind.norm_path(cwd0 + "/" + path)
     # (/// <reference path="..." /> and types="...": declaration files)
     if os.env("VTSC_NO_PACKAGES") == "":
       for ref in tsres.triple_slash(src):
+        if ref[0] == "lib":
+          if os.env("VTSC_DEBUG_LIBS") != "": eprint("LIBREF {path}: {ref[1]}")
+          ref_libs.push(tsconf.lib_alias(ref[1].lower()))
+          continue
         var rtarget = ""
         if ref[0] == "path": rtarget = bind.norm_path(bind.dir_of(abs_path) + "/" + ref[1])
-        else: rtarget = real_or(ffi, &rdirs, tsres.reference_types(&rv, fs, abs_path, ref[1]))
+        elif ref[1].startswith("./") or ref[1].startswith("../"):
+          # (a relative types=, next's "./types/global": resolved as a relative import of a
+          # declaration file is)
+          let rb = bind.norm_path(bind.dir_of(abs_path) + "/" + ref[1])
+          for cand in [rb + ".d.ts", rb, rb + "/index.d.ts"]:
+            if rtarget == "" and cand.endswith(".d.ts") and fs.exists(cand): rtarget = real_or(ffi, &rdirs, cand)
+        else: rtarget = real_or(ffi, &rdirs, tsres.reference_types_from(&rv, fs, cwd0, abs_path, ref[1]))
         if rtarget == "" or not fs.exists(rtarget): continue
         if not (rtarget in queued):
           queued[rtarget] = true
           queue.push(rtarget + "")
           if path in pkgset or rtarget.find("/node_modules/") >= 0: pkgset[rtarget] = true
         my_deps.push(rtarget + "")
+        if ref[0] == "path": dep_rank.push(0)
+        else: dep_rank.push(1)
     # (the statements of ambient modules and augmentations import too)
     var sts: [Int] = []
     for st in ast.items(t, root):
@@ -683,6 +1064,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
         for x in ast.items(t, t.nd[st].b): sts.push(x)
     var sps: [Str] = []
     var sp_imp: [Bool] = []
+    var sp_rank: [Int] = []
     for st in sts:
       let k = t.nd[st].k
       var spec = -1
@@ -691,6 +1073,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       if spec < 0 or t.nd[spec].k != ast.N_STR: continue
       sps.push(t.names[t.nd[spec].s] + "")
       sp_imp.push(k == ast.N_IMPORT)
+      sp_rank.push(3)
     # (a module augmentation's module, declare module "m" in a module file: resolved as an import)
     var is_mod = false
     for st in ast.items(t, root):
@@ -700,24 +1083,39 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       if k0 == ast.N_VAR and (t.nd[st].d & ast.M_EXPORT) != 0: is_mod = true
       if (k0 == ast.N_FUNC or k0 == ast.N_CLASS or k0 == ast.N_ENUM or k0 == ast.N_MODULE) and (t.nd[st].f & ast.M_EXPORT) != 0: is_mod = true
       if (k0 == ast.N_INTERFACE or k0 == ast.N_TYPEALIAS) and (t.nd[st].d & ast.M_EXPORT) != 0: is_mod = true
+    # (moduleDetection force: any file but a declaration file of the program's own)
+    if pg.mod_force and not path.endswith(".d.ts") and not (path in pkgset) and path.find("/node_modules/") < 0: is_mod = true
     if is_mod:
       for st in ast.items(t, root):
         if t.nd[st].k == ast.N_MODULE and t.nd[st].b >= 0 and t.nd[t.nd[st].a].k == ast.N_STR and (t.nd[st].f & ast.MOD_GLOBAL) == 0:
           sps.push(t.names[t.nd[t.nd[st].a].s] + "")
           sp_imp.push(false)
-    for x in req_specs:
-      sps.push(x)
+          sp_rank.push(5)
+    # (react-jsx: a JSX file imports its runtime, as tsc's GetJSXRuntimeImportSpecifier adds it; here
+    # whether or not it has an element)
+    if is_jsx_path(path) and (pg.jsx == "react-jsx" or pg.jsx == "react-jsxdev"):
+      var jsrc = pg.jsx_src + ""
+      if jsrc == "": jsrc = "react"
+      if pg.jsx == "react-jsxdev": req_specs.push(jsrc + "/jsx-dev-runtime")
+      else: req_specs.push(jsrc + "/jsx-runtime")
+    for rqi in 0..req_specs.len:
+      sps.push(req_specs[rqi] + "")
       sp_imp.push(true)
+      # (the JSX runtime: tsc's synthetic import, before the file's own)
+      if rqi == req_specs.len - 1 and is_jsx_path(path) and (pg.jsx == "react-jsx" or pg.jsx == "react-jsxdev"): sp_rank.push(2)
+      else: sp_rank.push(4)
     # (import("x") types)
     var dyn_specs: {Str: Bool} = {}
-    for x in import_type_specs(src):
+    for x in shared_specs(fs, fm, path, src):
       dyn_specs[x] = true
       sps.push(x)
       sp_imp.push(true)
+      sp_rank.push(4)
     # (each specifier once: a declaration file can name import("vue") thousands of times)
     var sp_at: {Str: Int} = {}
     var sps1: [Str] = []
     var imp1: [Bool] = []
+    var rank1: [Int] = []
     for si0 in 0..sps.len:
       let x0 = sps[si0]
       if x0 in sp_at:
@@ -726,26 +1124,65 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       sp_at[x0] = sps1.len
       sps1.push(x0 + "")
       imp1.push(sp_imp[si0])
+      rank1.push(sp_rank[si0])
     sps = sps1
     sp_imp = imp1
     for si in 0..sps.len:
       let is_imp = sp_imp[si]
+      while dep_rank.len < my_deps.len: dep_rank.push(rank1[si - 1])
       let sp = sps[si] + ""
-      # (the tsconfig's paths, for a non-relative specifier)
-      if pg.pkeys.len > 0 and not bind.is_relative(sp) and not (path in pkgset):
+      # (the tsconfig's paths, for a non-relative specifier, in any file: a package's declaration
+      # files too, as tsc's tryLoadModuleUsingPathsIfEligible, so `"mapbox-gl": [".../esm/..."]`
+      # is the one copy react-map-gl's types import)
+      if pg.pkeys.len > 0 and not bind.is_relative(sp):
         var hit = ""
         for cand0 in tsconf.path_targets(pg.pkeys, pg.pvals, sp):
           for cand in bind.module_candidates("/", cand0):
             if hit == "" and lresolve.kind_of(&rv, fs, cand) > 0: hit = cand
           if hit == "" and lresolve.kind_of(&rv, fs, cand0) > 0 and (cand0.endswith(".ts") or cand0.endswith(".tsx")): hit = cand0
-        if hit.startswith(cwd0 + "/") and not pg.abs_names: hit = hit[cwd0.len + 1..hit.len]
+        # (a path into node_modules: the file's real path, as a package's resolution gives it, so a
+        # package imported both ways is one file; tsc's realpath, without preserveSymlinks)
+        var hit_pkg = false
+        if hit != "" and hit.find("/node_modules/") >= 0:
+          var ah = hit + ""
+          if not ah.startswith("/"): ah = cwd0 + "/" + ah
+          hit = dedup_pkg(&rv, fs, &pid_pkg, &pid_first, real_or(ffi, &rdirs, ah))
+          hit_pkg = true
+        if hit.startswith(cwd0 + "/") and not pg.abs_names and not hit_pkg: hit = hit[cwd0.len + 1..hit.len]
+        # (a JavaScript file the program has itself, its include naming it with allowJs: as a
+        # relative specifier's, resolved to it)
+        if hit == "":
+          for cand0 in tsconf.path_targets(pg.pkeys, pg.pvals, sp):
+            for jc0 in bind.js_candidates("/", cand0):
+              var jc = jc0 + ""
+              if jc.startswith(cwd0 + "/") and not pg.abs_names: jc = jc[cwd0.len + 1..jc.len]
+              if hit == "" and jc in queued and not (jc in pkgset): hit = jc
         if hit != "":
           pkg_res[path + "|" + sp] = hit + ""
           if not (hit in queued):
             queued[hit] = true
             queue.push(hit + "")
+            if hit_pkg: pkgset[hit] = true
           my_deps.push(hit + "")
           if is_imp: my_imps.push(hit + "")
+          continue
+      # (#name: the nearest package.json's imports, every moduleResolution TypeScript 7 has)
+      if sp.startswith("#") and os.env("VTSC_NO_PACKAGES") == "":
+        rv.req = pg.node16 and importer_cjs(fs, &rv, abs_path)
+        var ih = tsres.resolve_imports(&rv, fs, abs_path, sp)
+        if ih != "":
+          var ih_pkg = false
+          if ih.find("/node_modules/") >= 0:
+            ih = dedup_pkg(&rv, fs, &pid_pkg, &pid_first, real_or(ffi, &rdirs, ih))
+            ih_pkg = true
+          if ih.startswith(cwd0 + "/") and not pg.abs_names and not ih_pkg: ih = ih[cwd0.len + 1..ih.len]
+          pkg_res[path + "|" + sp] = ih + ""
+          if not (ih in queued):
+            queued[ih] = true
+            queue.push(ih + "")
+            if ih_pkg: pkgset[ih] = true
+          my_deps.push(ih + "")
+          if is_imp: my_imps.push(ih + "")
           continue
       if os.env("VTSC_NO_PACKAGES") == "" and tsres.is_bare(sp):
         rv.req = pg.node16 and importer_cjs(fs, &rv, abs_path)
@@ -784,7 +1221,28 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
           my_deps.push(ptarget + "")
           if is_imp: my_imps.push(ptarget + "")
           continue
-      if not bind.is_relative(sp) and package_may_exist(fs, &rv, cwd0, path, sp): pkg_present[path + "|" + sp] = true
+      if not bind.is_relative(sp):
+        let pjs = package_js(fs, &rv, cwd0, path, sp)
+        if pjs != "":
+          # (allowJs: a package whose JavaScript is outside node_modules once its link is
+          # followed, a workspace package: the file is the program's, as a relative import's)
+          if pjs != "?" and (pg.allow_js or pg.inferred) and not (path in pkgset):
+            var rj = real_or(ffi, &rdirs, pjs)
+            if not rj.startswith("/"): rj = cwd0 + "/" + rj
+            let rjk = lresolve.kind_of(&rv, fs, rj)
+            let rj_js = rj.endswith(".js") or rj.endswith(".mjs") or rj.endswith(".cjs") or rj.endswith(".jsx")
+            if rj_js and rj.find("/node_modules/") < 0 and rjk > 0 and rjk != 2:
+              if rj.startswith(cwd0 + "/") and not pg.abs_names: rj = rj[cwd0.len + 1..rj.len]
+              pkg_res[path + "|" + sp] = rj + ""
+              if not (rj in queued):
+                queued[rj] = true
+                queue.push(rj + "")
+              my_deps.push(rj + "")
+              if is_imp: my_imps.push(rj + "")
+              continue
+          pkg_present[path + "|" + sp] = true
+          if pjs != "?": pkg_js[path + "|" + sp] = real_or(ffi, &rdirs, pjs)
+      var found_rel = false
       for cand0 in bind.module_candidates(path, sp):
         var cand = cand0 + ""
         if pid_first.len > 0 and cand.find("/node_modules/") >= 0 and lresolve.kind_of(&rv, fs, cand) > 0:
@@ -793,6 +1251,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
         if cand in queued:
           my_deps.push(cand + "")
           if is_imp: my_imps.push(cand + "")
+          found_rel = true
           break
         if lresolve.kind_of(&rv, fs, cand) > 0:
           queued[cand] = true
@@ -801,9 +1260,60 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
           if path in pkgset: pkgset[cand] = true
           my_deps.push(cand + "")
           if is_imp: my_imps.push(cand + "")
+          found_rel = true
           break
+      # (a relative specifier naming a JavaScript file and no TypeScript one: TypeScript types
+      # it with allowJs, or gives it any; neither is modeled for what imports it)
+      if not found_rel and bind.is_relative(sp):
+        # (a JavaScript file the program has itself, its include naming it with allowJs: resolved
+        # to it, typed as the checker types it; another one isn't modeled)
+        for jc in bind.js_candidates(path, sp):
+          if jc in queued and not (jc in pkgset):
+            my_deps.push(jc + "")
+            if is_imp: my_imps.push(jc + "")
+            found_rel = true
+            break
+      if not found_rel and bind.is_relative(sp):
+        for jc in bind.js_candidates(path, sp):
+          let jk = lresolve.kind_of(&rv, fs, jc)
+          if jk > 0 and jk != 2:
+            # (allowJs, or tsgolint's inferred program: the file is the program's, typed as the
+            # checker types it where it can, as tsc adds it; a package's import of one isn't)
+            if (pg.allow_js or pg.inferred) and not (path in pkgset) and jc.find("/node_modules/") < 0:
+              queued[jc] = true
+              queue.push(jc + "")
+              my_deps.push(jc + "")
+              if is_imp: my_imps.push(jc + "")
+              break
+            js_imps[path + "|" + sp] = true
+            break
+    if sps.len > 0:
+      while dep_rank.len < my_deps.len: dep_rank.push(rank1[sps.len - 1])
+    var od: [Str] = []
+    for rk in 0..6:
+      for di in 0..my_deps.len:
+        if dep_rank[di] == rk: od.push(my_deps[di] + "")
+    odeps.push(od)
     deps.push(my_deps)
     imps.push(my_imps)
+  # (a lib a file references that isn't loaded yet: read again with it)
+  if not keys_only:
+    var more: [Str] = []
+    var seen2: {Str: Bool} = {}
+    for k, v in seen: seen2[k + ""] = v
+    for l in ref_libs:
+      var got: [Str] = []
+      lib_files(fs, dir, l, &seen2, &got)
+      var any_new = false
+      for g in got:
+        if fs.exists(g): any_new = true
+      if any_new: more.push(l + "")
+    if more.len > 0:
+      if os.env("VTSC_DEBUG_LIBS") != "": eprint("LIBS {",".join(more)} (have {",".join(xlibs)})")
+      var xl: [Str] = []
+      for l in xlibs: xl.push(l + "")
+      for l in more: xl.push(l + "")
+      return run_libs(fs, os, ffi, files, dir, target, pg, shard, nshards, wq, cap, fm, km, xl)?
   let t1 = os.clock()
   if os.env("VTSC_FILE_TIME") != "":
     var nb = 0
@@ -816,6 +1326,12 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   c.user_from = user_from
   c.cwd = cwd0 + ""
   c.debug = os.env("VTSC_DEBUG") != ""
+  c.debug_inst = c.debug or os.env("VTSC_INST_DEBUG") != ""
+  c.inst_hist_from = int(os.env("VTSC_INST_HIST_FROM")) else 300000
+  c.jsx_nomemo = os.env("VTSC_NO_JSX_MEMO") != ""
+  c.inst_exit = int(os.env("VTSC_INST_EXIT")) else 0
+  let il0 = int(os.env("VTSC_INST_LIMIT")) else 0
+  if il0 > 0: c.inst_limit = il0
   c.debug_counts = os.env("VTSC_COUNTS") != ""
   c.debug_node = int(os.env("VTSC_NODE")) else -1
   c.debug_hitn = int(os.env("VTSC_HITN")) else -1
@@ -824,19 +1340,48 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
     for i in 0..names.len:
       if names[i].endswith(dfe): c.debug_file = i
   c.all_reasons = os.env("VTSC_ALL_REASONS") != ""
+  c.trace_rel = os.env("VTSC_TRACE_REL") != ""
   c.eager_decl = os.env("VTSC_EAGER_DECL") != ""
   c.spi = pg.spi
   c.npai = pg.npai
+  c.no_trunc = pg.no_trunc
   c.keep_ctx = wants_ctx(pg)
   c.allow_unreach = pg.allow_unreach
   c.unknown_catch = pg.unknown_catch
+  c.exact_opt = pg.exact_opt
+  c.snc_off = pg.snc_off
+  c.nia_off = pg.nia_off
+  c.sft_off = pg.sft_off
+  c.sbca_off = pg.sbca_off
+  c.nit_off = pg.nit_off
+  c.nuia = pg.nuia
   c.side_unchecked = pg.side_unchecked
+  c.jsx_mode = pg.jsx + ""
+  c.jsx_src = pg.jsx_src + ""
   c.meta_ok = pg.meta_ok
+  c.mod_node = pg.mod_node
+  c.skip_lib = pg.skip_lib
+  c.dts_quiet = pg.skip_lib or pg.lint != "" or pg.lint_files.len > 0
+  c.strict_sub_reads = os.env("VTSC_STRICT_SUB") == "1"
   c.tla_ok = pg.tla_ok
   c.exp_deco = pg.exp_deco
   for k, v in pkg_present: c.pkg_present[k] = v
+  for k, v in pkg_js: c.pkg_js[k] = v + ""
   for k, v in cjs_roots: c.cjs_roots[k] = v
+  for k, v in cjs_exp: c.cjs_exp[k] = v
+  # (moduleDetection force: every file but a declaration file is a module, its declare module
+  # 'x' an augmentation)
+  for ri0 in 0..roots.len:
+    let rt0 = roots[ri0]
+    if bind.is_module_scan(c, rt0): c.mod_flag[rt0] = 1
+    elif pg.mod_force and ri0 >= user_from and not names[ri0].endswith(".d.ts"): c.mod_flag[rt0] = 1
+    else: c.mod_flag[rt0] = 0
   for k, v in pkg_res: c.pkg_res[k] = v + ""
+  for k, _v in js_imps: c.js_imps[k + ""] = true
+  for k, _v in cjs_ts: c.cjs_ts[k] = true
+  for k, _v in cjs_dts: c.cjs_dts[k] = true
+  # (JavaScript whose JSDoc isn't read as tsc reads it: not checked, its rules not run)
+  for jf, jw0 in jsdoc_why: c.unsupported[jf] = "JavaScript: " + jw0
   for k, v in redirects: c.file_redirect[k] = v + ""
   for fx in 0..names.len:
     c.files.push(names[fx] + "")
@@ -848,11 +1393,29 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       c.t.nocheck[fx] = true
   let tlink0 = os.clock()
   bind.link_parents(&c)
-  for fi in 1..roots.len:
+  # (globals merged in tsc's file order: the libs, then each root file after what it references
+  # and imports, depth first, then the types option's packages; the declaration that comes first
+  # wins a conflict, and merged declarations and overloads keep that order)
+  let gorder = tsc_order(cwd0, files, tfiles, pg.root_incl, pg.root_listed, user_from, odeps, c.file_index, roots.len)
+  c.frank = []
+  for fi0 in 0..roots.len: c.frank.push(-1)
+  for oi in 0..gorder.len:
+    let fi1 = gorder[oi]
+    if fi1 >= 0 and fi1 < roots.len: c.frank[fi1] = oi
+  if os.env("VTSC_ORDER") != "":
+    eprint("ORDER incl {pg.root_incl.len} listed {pg.root_listed}")
+    for fi in gorder:
+      if fi >= user_from: eprint("ORDER {names[fi]}")
+  for fi in gorder:
     let root = roots[fi]
     if not bind.is_module(c, root): bind.declare_globals(&c, root)
-    else: bind.declare_global_blocks(&c, root)
-  bind.augmentations(&c, user_from)
+    else:
+      bind.declare_global_blocks(&c, root)
+      if fi < user_from or fi in c.pkg_files: bind.note_umd(&c, root)
+  var aug_files: [Int] = []
+  for fi in gorder:
+    if fi >= user_from: aug_files.push(fi)
+  bind.augmentations(&c, aug_files)
   # (the file cache: each user file's key; those the cache has aren't checked)
   var ckey: [Str] = []
   var cached: {Int: CEntry} = {}
@@ -897,8 +1460,59 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
     if fx >= user_from and not (fx in c.pkg_files) and not (fx in cached):
       uord.push(fx)
       total += fcost[fx]
+  let impi = dep_index(imps, c.file_index)
+  # (shards as processes, warmed: this process checks the first files of the order before they
+  # fork, VTSC_WARM_PERMILLE of the work (500; 200 on the corpus: 1.3% more cpu, 2% more
+  # wall, 700 no better), so that what every shard would type again, the
+  # lib's and the shared declarations' types, is typed once and comes to each copy-on-write;
+  # shard 0 reports those files. VTSC_FORK_WARM=0: forked cold)
+  var warm = false
+  var prefix: [Bool] = []
+  for _q in 0..roots.len: prefix.push(false)
+  if shard < 0 and nshards > 1 and os.env("VTSC_FORK_WARM") != "0" and os.env("VTSC_ONLY") == "":
+    let pm = int(os.env("VTSC_WARM_PERMILLE")) else 500
+    var acc = 0
+    for fx in uord:
+      if acc * 1000 >= total * pm: break
+      prefix[fx] = true
+      acc += fcost[fx]
+    warm = acc > 0
+  if shard < 0 and not warm:
+    # (the shards as processes: everything above is the same for each)
+    let tdir = fs.temp_dir() else ""
+    var pids: [Int] = []
+    var paths: [Str] = []
+    var child = false
+    if tdir != "":
+      for k in 0..nshards:
+        let path = tdir + "/shard{k}.json"
+        let pid = lcache.fork(ffi)
+        if pid == 0:
+          child = true
+          shard = k
+          out.sub_path = path
+          break
+        if pid < 0: break
+        pids.push(pid)
+        paths.push(path)
+    if not child:
+      var okall = tdir != "" and pids.len == nshards
+      for pid in pids:
+        if lcache.wait(ffi, pid) != 0: okall = false
+      for path in paths:
+        if okall:
+          let js = fs.read(path) else ""
+          if js == "": okall = false
+          out.subs.push(js)
+        fs.remove(path) else 0
+      if tdir != "": fs.remove(tdir) else 0
+      out.ok = okall
+      out.keep.push(c)
+      return out
   let dyn = nshards > 1 and cap > 0
-  if dyn:
+  if warm:
+    for fx in uord: mine[fx] = prefix[fx]
+  elif dyn:
     mine[0] = false
   elif nshards <= 1 or os.env("VTSC_SHARD_CONTIG") != "":
     var acc = 0
@@ -909,48 +1523,27 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   else:
     # (each worker checks its files' imports too: a file goes where its imports already are,
     # unless that worker has more to do than the others; the largest closures first)
-    var clo: [[Int]] = []
-    var csize: [Int] = []
-    for fx in uord:
-      var w2: [Bool] = []
-      for _q in 0..roots.len: w2.push(false)
-      want_deps(fx, user_from, imps, &w2, c.file_index)
-      var cl: [Int] = []
-      var sz = 0
-      for q in user_from..roots.len:
-        if w2[q] and not (q in c.pkg_files) and not (q in cached):
-          cl.push(q)
-          sz += fcost[q]
-      clo.push(cl)
-      csize.push(sz)
-    var ix: [Int] = []
-    for i in 0..uord.len: ix.push(i)
-    ix.sort(by: fn(a, b) => csize[a] > csize[b] or (csize[a] == csize[b] and a < b))
-    var load: [Int] = []
-    var have: [[Bool]] = []
-    for _s in 0..nshards:
-      load.push(0)
-      var hv: [Bool] = []
-      for _q in 0..roots.len: hv.push(false)
-      have.push(hv)
-    for i in ix:
-      var best = 0
-      var best_cost = -1
-      for sh in 0..nshards:
-        var add = 0
-        for q in clo[i]:
-          if not have[sh][q]: add += fcost[q]
-        let cost = load[sh] + add
-        if best_cost < 0 or cost < best_cost:
-          best = sh
-          best_cost = cost
-      for q in clo[i]:
-        if not have[best][q]:
-          have[best][q] = true
-          load[best] += fcost[q]
-      if best == shard: mine[uord[i]] = true
+    var skip: [Bool] = []
+    var none: [Bool] = []
+    for q in 0..roots.len:
+      skip.push(q in c.pkg_files or q in cached)
+      none.push(false)
+    let asg = closure_shards(uord, fcost, impi, user_from, skip, none, nshards)
+    for i in 0..uord.len:
+      if asg[i] == shard: mine[uord[i]] = true
+  # (debugging splits: VTSC_ONLY=FILE checks only the files FILE lists, one path a line;
+  # VTSC_SHARD_FILES=1 prints each worker's)
+  let only = os.env("VTSC_ONLY")
+  if only != "":
+    var want_only: {Str: Bool} = {}
+    for ln in (fs.read(only) else "").split("\n"):
+      if ln != "": want_only[ln] = true
+    for fx in user_from..roots.len: mine[fx] = names[fx] in want_only
+  if os.env("VTSC_SHARD_FILES") != "":
+    for fx in user_from..roots.len:
+      if mine[fx]: eprint("SHARDFILE {shard} {names[fx]}")
   for fx in user_from..roots.len:
-    if mine[fx]: want_deps(fx, user_from, imps, &want, c.file_index)
+    if mine[fx]: want_deps_i(fx, user_from, impi, &want)
   # (packages' declarations: declared by every worker, never checked)
   for fx, _ in c.pkg_files: want[fx] = true
   var deps_only = 0
@@ -997,10 +1590,93 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   for ri in 0..uord.len: rank_of[uord[ri]] = ri
   var declared: [Bool] = []
   for _q in 0..roots.len: declared.push(false)
+  var pos0: [Int] = []
+  for _q in 0..roots.len: pos0.push(-1)
+  for oi in 0..order0.len: pos0[order0[oi]] = oi
+  var tmark: [Int] = []
+  for _q in 0..roots.len: tmark.push(-1)
+  var tstamp = 0
+  c.checking_started = true
+  # (the rule lists' configurations, each read once: most files share one)
+  var rcfs: {Str: trules.Cfg} = {}
   var pi = 0
   var tickets_done = not dyn
   var late = cap
+  var dbg_checked: [Str] = []
+  let dbg_checked_on = os.env("VTSC_SHARD_FILES").startswith("/")
+  var done: [Bool] = []
+  var checked0: [Bool] = []
+  for _q in 0..roots.len:
+    done.push(false)
+    checked0.push(false)
   while true:
+    if pi >= plan.len and tickets_done and warm:
+      # (the first files checked: now the shards, each the rest of its files)
+      warm = false
+      let tdir = fs.temp_dir() else ""
+      var pids: [Int] = []
+      var paths: [Str] = []
+      var child = false
+      if tdir != "":
+        for k in 0..nshards:
+          let path = tdir + "/shard{k}.json"
+          let pid = lcache.fork(ffi)
+          if pid == 0:
+            child = true
+            shard = k
+            out.sub_path = path
+            break
+          if pid < 0: break
+          pids.push(pid)
+          paths.push(path)
+      if not child:
+        var okall = tdir != "" and pids.len == nshards
+        for pid in pids:
+          if lcache.wait(ffi, pid) != 0: okall = false
+        for path in paths:
+          if okall:
+            let js = fs.read(path) else ""
+            if js == "": okall = false
+            out.subs.push(js)
+          fs.remove(path) else 0
+        if tdir != "": fs.remove(tdir) else 0
+        out.ok = okall
+        out.keep.push(c)
+        return out
+      var skip2: [Bool] = []
+      for q in 0..roots.len: skip2.push(q in c.pkg_files or q in cached)
+      let asg2 = closure_shards(uord, fcost, impi, user_from, skip2, prefix, nshards)
+      for i in 0..uord.len:
+        let fx = uord[i]
+        mine[fx] = asg2[i] == shard or (shard == 0 and prefix[fx])
+      # (the first files' rule diagnostics: shard 0's)
+      if shard != 0:
+        var rd2: [trules.RDiag] = []
+        var rf2: [Int] = []
+        for ri in 0..out.rdiags.len:
+          if not prefix[out.rfile[ri]]:
+            rd2.push(trules.copy_diag(out.rdiags[ri]))
+            rf2.push(out.rfile[ri])
+        out.rdiags = rd2
+        out.rfile = rf2
+        var rb2: [Int] = []
+        for fi0 in out.rbad:
+          if not prefix[fi0]: rb2.push(fi0)
+        out.rbad = rb2
+      var want2: [Bool] = []
+      for _q in 0..roots.len: want2.push(false)
+      for fx in user_from..roots.len:
+        if mine[fx] and not prefix[fx]: want_deps_i(fx, user_from, impi, &want2)
+      for fx, _ in c.pkg_files: want2[fx] = true
+      for fi in order0:
+        if want2[fi] and not done[fi]: plan.push(fi)
+      let sfd = os.env("VTSC_SHARD_FILES")
+      if sfd.startswith("/"):
+        var lines: [Str] = []
+        for fx in user_from..roots.len:
+          if mine[fx]: lines.push("{prefix[fx]} {checked0[fx]} {names[fx]}")
+        fs.write(sfd + "/shard{shard}.txt", "\n".join(lines) + "\n") else 0
+      continue
     if pi >= plan.len:
       if tickets_done: break
       var r = wq.recv() else -1
@@ -1014,11 +1690,17 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
         continue
       let fx = uord[r]
       mine[fx] = true
-      var w2: [Bool] = []
-      for _q in 0..roots.len: w2.push(false)
-      want_deps(fx, user_from, imps, &w2, c.file_index)
-      for fi2 in order0:
-        if fi2 == fx or not w2[fi2] or fi2 < user_from or mine[fi2] or declared[fi2] or fi2 in c.pkg_files or fi2 in cached: continue
+      var got: [Int] = []
+      dep_closure(fx, user_from, impi, &tmark, tstamp, &got)
+      tstamp += 1
+      # (in order0's order)
+      var gpos: [Int] = []
+      for g in got:
+        if pos0[g] >= 0: gpos.push(pos0[g])
+      gpos.sort()
+      for gp in gpos:
+        let fi2 = order0[gp]
+        if fi2 == fx or fi2 < user_from or mine[fi2] or declared[fi2] or fi2 in c.pkg_files or fi2 in cached: continue
         # (an import later in the order, through a cycle: perhaps this worker's yet, so not
         # declared; its types come as they're asked for)
         if rank_of[fi2] > r: continue
@@ -1028,20 +1710,27 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       continue
     let fi = plan[pi]
     pi += 1
+    done[fi] = true
     c.node_file = fi
     let tf = os.clock()
     if ftime and os.env("VTSC_FILE_TIME") == "2": eprint("BEGIN {names[fi]}")
     c.file_inst = 0
     if mine[fi]:
+      checked0[fi] = true
+      if dbg_checked_on: dbg_checked.push("{shard} {names[fi]}")
       chk.check_file(&c, roots[fi])
       var rl = pg.lint + ""
+      # (a file the checker couldn't type gets no rules: their results would be dropped with its
+      # type check, and its tree may hold what the rules don't expect)
+      if fi in c.unsupported: rl = ""
       if pg.lint_files.len > 0:
         rl = ""
         var an = names[fi] + ""
         if not an.startswith("/") and pg.cwd != "": an = bind.norm_path(pg.cwd + "/" + an)
         if an in pg.lint_files: rl = pg.lint_files[an] + ""
       if rl != "" and rl != "[]":
-        let rcf = trules.parse_cfg(rl)
+        if not (rl in rcfs): rcfs[rl + ""] = trules.parse_cfg(rl)
+        let rcf = rcfs[rl]
         var rd: [trules.RDiag] = []
         if not trules.run(&c, roots[fi], srcs[fi], rcf, &rd):
           out.rbad.push(fi)
@@ -1052,10 +1741,16 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
     elif fi in c.pkg_files:
       # (a package's declarations get their types when something uses them, as tsc's do)
       if bind.is_module(c, roots[fi]): bind.scope_names(&c, roots[fi])
+    elif warm and fi >= user_from and not prefix[fi] and not (fi in cached):
+      # (before the shards fork: an import after the first files, through a cycle, is some
+      # shard's to check, so not declared here; its types come as they're asked for)
+      done[fi] = false
     else:
       chk.declare_only(&c, roots[fi])
       deps_only += 1
     if ftime: eprint("FILE {(os.clock() - tf) * 1000.0:.1} ms {c.file_inst} inst {names[fi]}")
+  if dbg_checked_on: fs.write(os.env("VTSC_SHARD_FILES") + "/checked{shard}.txt", "\n".join(dbg_checked) + "\n") else 0
+  chk.flush_kept(&c)
   chk.global_conflicts(&c, user_from)
   # (a file importing one that isn't checked isn't checked either: decided by the caller, over
   # every worker's files)
@@ -1155,6 +1850,19 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       if fi >= user_from and not (fi in c.pkg_files) and not (fi in c.unsupported): c.unsupported[fi] = "a decorator (without experimentalDecorators) at {dpos}"
   for fi, at in unused_dirs:
     if not (fi in c.unsupported): c.unsupported[fi] = "a @ts-expect-error directive over a class noUnusedLocals may report at {at}"
+  # (a project's own JavaScript, allowJs: checked where it's in the part the checker types as
+  # TypeScript types it, as the inferred program's (lvtsc); else not, nor what imports it)
+  # (in the inferred program, a JavaScript file it only imports: lvtsc decides for its own files)
+  for fi in user_from..names.len:
+    if fi in c.pkg_files or fi in c.unsupported: continue
+    let fnm = names[fi]
+    if pg.inferred:
+      var an3 = fnm + ""
+      if not an3.startswith("/") and pg.cwd != "": an3 = bind.norm_path(pg.cwd + "/" + an3)
+      if an3 in pg.lint_files: continue
+    if fnm.endswith(".js") or fnm.endswith(".mjs") or fnm.endswith(".cjs") or fnm.endswith(".jsx"):
+      let jw = js_unsupported(srcs[fi], fnm)
+      if jw != "": c.unsupported[fi] = "JavaScript: " + jw
   # (a package declaration file the parser can't read: what it declares is missing, so no file
   # is checked; tsc would report the syntax error alone if it is one)
   if pkg_syntax.len > 0:
@@ -1171,6 +1879,9 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       if d.file in dir_line and hidden_by(srcs[d.file], lstarts[d.file], dir_line[d.file], d.pos) >= 0: continue
       noshow[d.file] = d.pos
       if os.env("VTSC_NOSHOW") != "": eprint("NOSHOW {d.code} {d.msg}")
+  # (linting: the rules need the types, not the message; the type check of the file misses that
+  # one error, --type-check being experimental there)
+  if pg.lint != "" or pg.lint_files.len > 0: noshow = {}
   for nf, np in noshow:
     if not (nf in c.unsupported): c.unsupported[nf] = "printing a type not printed as tsc does (a conditional type, an object literal with computed names, a spread array or object literals given each other's properties) at {np}"
   for d in c.diags:
@@ -1247,10 +1958,15 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
     if shard == 0:
       for x in ckey: out.ckeys.push(x + "")
   # each error with its sort key (merged with the other workers' and sorted by the caller)
+  var lc_fi = -1
+  var lc_at = [0, 1, 1]
   for ix in 0..all.len:
     let d = all[ix]
     let fi = order[d.file]
-    let lc = line_col(srcs[fi], d.pos)
+    if fi != lc_fi:
+      lc_fi = fi
+      lc_at = [0, 1, 1]
+    let lc = line_col_from(srcs[fi], d.pos, &lc_at)
     var fname = names[fi] + ""
     if fname.startswith("/"): fname = relative_to(c.cwd, fname)
     let line = fname + "({lc[0]},{lc[1]}): error TS{d.code}: " + d.msg
@@ -1265,7 +1981,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
       out.unsup_mine.push(mine[fi])
       if not (fi in c.pkg_files): out.unsup_user = true
   out.nsyntax = pdiags.len
-  if os.env("VTSC_PHASES") != "": eprint("PHASES shard {shard}: read+parse {(t1 - t0) * 1000.0:.0} (parse {tparse * 1000.0:.0}) bind+keys {(t2 - tk0) * 1000.0:.0} check {(t3 - t2) * 1000.0:.0} report {(os.clock() - t3) * 1000.0:.0} ms")
+  if os.env("VTSC_PHASES") != "": eprint("PHASES shard {shard}/{nshards} {target} {pg.cwd} files {files.len}: read+parse {(t1 - t0) * 1000.0:.0} (parse {tparse * 1000.0:.0}) bind+keys {(t2 - tk0) * 1000.0:.0} check {(t3 - t2) * 1000.0:.0} report {(os.clock() - t3) * 1000.0:.0} ms rel_cache {c.rel_cache.len} rels {c.rel_n} types {c.tk.len} objs {c.objs.len}")
   if shard == 0:
     out.user_from = user_from
     for fx in order0:
@@ -1320,12 +2036,14 @@ fn run(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, 
   return out
 
 
-fn cpu_count(fs: Fs) -> Int:
+# (Linux: /proc/cpuinfo; elsewhere, macOS among them, the system's count: there was no /proc and
+# every program got one worker)
+fn cpu_count(fs: Fs, ffi: Ffi) -> Int:
   let info = fs.read("/proc/cpuinfo") else ""
   var n = 0
   for l in info.split("\n"):
     if l.startswith("processor"): n += 1
-  if n < 1: return 1
+  if n < 1: return lcache.ncpu(ffi)
   return n
 
 
@@ -1365,8 +2083,88 @@ fn redirect_refs(fs: Fs, pp: Str, refs: [Str], var pg: Prog):
       d = tsconf.dirname(d)
 
 fn read_config(fs: Fs, os: Os, pp: Str) -> Conf:
-  var cf = Conf("", "", [], "", Prog())
   let cfg = tsconf.read(fs, pp)
+  return conf_of(os, pp, cfg)
+
+# read_config through the tsconfig cache (read_tsconfig)
+fn read_config_c(fs: Fs, os: Os, ffi: Ffi, pp: Str) -> Conf:
+  let cfg = read_tsconfig(fs, os, ffi, pp)
+  return conf_of(os, pp, cfg)
+
+# A tsconfig cache entry: the read and the state (lcache.stat_any) of each path reading it asked
+# about, taken after it (bin: vlint's own binary's)
+type TcEnt:
+  bin: Str = ""
+  paths: [Str] = []
+  st: [Int] = []
+  cfg: tsconf.Cfg = tsconf.Cfg()
+
+fn tc_cache_dir(os: Os) -> Str:
+  if os.env("VLINT_VTSC_CACHE") == "0" or os.env("VLINT_TSCONFIG_CACHE") == "0": return ""
+  var base = os.env("XDG_CACHE_HOME")
+  if base == "":
+    let home = os.env("HOME")
+    if home == "": return ""
+    base = home + "/.cache"
+  return base + "/vlint/tsconfig"
+
+# tsconf.read(pp), from $XDG_CACHE_HOME/vlint/tsconfig when every path its read asked about (files
+# read, paths looked for, found or not, folders listed: tsconf's probes) is as it was then. A
+# folder's state changes with its names, so a file added, removed or renamed reads it again. An
+# entry that can't be read, or is for another binary, is read again; none is kept when a path
+# changed less than 2 s before the read began (git's racy rule: a change during the read can't
+# hide behind an unchanged state).
+fn read_tsconfig(fs: Fs, os: Os, ffi: Ffi, pp: Str) -> tsconf.Cfg:
+  let dir = tc_cache_dir(os)
+  if dir == "": return tsconf.read(fs, pp)
+  var st0: [Int] = [0, 0, 0, 0, 0]
+  lcache.stat(ffi, lcache.self_exe(ffi), &st0)
+  let bin = "{st0[0]}/{st0[1]}/{st0[2]}/{st0[3]}"
+  let ent = dir + "/" + lcache.hex16(lcache.hash64(pp)) + ".json"
+  let txt = fs.read(ent) else ""
+  if txt != "":
+    var e = from_json(txt, TcEnt) else TcEnt()
+    if e.bin == bin and e.cfg.path == pp and e.paths.len == e.st.len and e.paths.len > 0:
+      var same = true
+      for i in 0..e.paths.len:
+        if same and lcache.stat_any(ffi, e.paths[i]) != e.st[i]: same = false
+      if os.env("VLINT_TSCONFIG_DEBUG") != "" and not same: eprint("vlint: tsconfig {pp}: changed")
+      if same:
+        if os.env("VLINT_TSCONFIG_DEBUG") != "": eprint("vlint: tsconfig {pp}: from the cache")
+        var c = tsconf.Cfg()
+        swap(&c, &e.cfg)
+        return c
+  let t0 = lcache.now_ns(ffi)
+  var cfg = tsconf.read(fs, pp)
+  var ne = TcEnt(bin: bin + "")
+  var seen: {Str: Bool} = {}
+  var racy = false
+  for pr in cfg.probes:
+    let p = lprobe.path_of(pr)
+    if p == "" or p in seen: continue
+    seen[p + ""] = true
+    ne.paths.push(p + "")
+    ne.st.push(lcache.stat_any(ffi, p))
+    if lcache.changed_since(ffi, p, t0 - 2000000000): racy = true
+  if racy or ne.paths.len == 0:
+    if os.env("VLINT_TSCONFIG_DEBUG") != "": eprint("vlint: tsconfig {pp}: not kept (changed in the last 2 s)")
+    return cfg
+  swap(&ne.cfg, &cfg)
+  ne.cfg.probes = []
+  fs.mkdir(dir) else 0
+  let tmp = ent + ".{lcache.now_ns(ffi)}.tmp"
+  var wrote = true
+  fs.write(tmp, to_json(ne)) else wrote = false
+  if wrote:
+    var moved = true
+    fs.rename(tmp, ent) else moved = false
+    if not moved: fs.remove(tmp) else 0
+  swap(&cfg, &ne.cfg)
+  return cfg
+
+# (read_config from the tsconfig already read)
+fn conf_of(os: Os, pp: Str, cfg: tsconf.Cfg) -> Conf:
+  var cf = Conf("", "", [], "", Prog())
   if cfg.err != "":
     cf.err = cfg.err + ""
     return cf
@@ -1384,18 +2182,33 @@ fn read_config(fs: Fs, os: Os, pp: Str) -> Conf:
   for x in cfg.refs: cf.refs.push(x + "")
   if cfg.has_lib:
     for l in cfg.libs: pg.libs.push(l + "")
-  pg.has_types = cfg.has_types
+  # (a tsconfig without types: none, TypeScript 6's default `[]`; vtsc given files alone still
+  # takes every @types package found from the current folder up)
+  pg.has_types = true
   for x in cfg.types: pg.types.push(x + "")
   pg.tdir = tsconf.dirname(pp)
   pg.spi = cfg.spi
   pg.npai = cfg.opts.get("nopropertyaccessfromindexsignature", "") == "true"
+  pg.no_trunc = cfg.opts.get("noerrortruncation", "") == "true"
+  pg.jsx = cfg.opts.get("jsx", "").lower()
+  pg.jsx_src = cfg.opts.get("jsximportsource", "") + ""
   pg.unknown_catch = cfg.unknown_catch
+  pg.exact_opt = cfg.exact_opt
+  pg.snc_off = cfg.snc_off
+  pg.nia_off = cfg.nia_off
+  pg.sft_off = cfg.sft_off
+  pg.sbca_off = cfg.sbca_off
+  pg.nit_off = cfg.nit_off
+  pg.nuia = cfg.nuia
   pg.allow_unreach = cfg.opts.get("allowunreachablecode", "") == "true"
+  pg.allow_js = cfg.opts.get("allowjs", "") == "true"
   var mr = cfg.opts.get("moduleresolution", "") + ""
   let mo = cfg.opts.get("module", "") + ""
   if mr == "" and (mo == "node16" or mo == "node18" or mo == "node20" or mo == "nodenext"): mr = "nodenext"
   pg.node16 = mr == "node16" or mr == "nodenext"
-  pg.meta_ok = mo == "es2020" or mo == "es2022" or mo == "esnext" or mo == "preserve"
+  pg.meta_ok = mo == "" or mo == "es2020" or mo == "es2022" or mo == "esnext" or mo == "preserve" or mo == "system"
+  pg.mod_node = mo == "node16" or mo == "node18" or mo == "node20" or mo == "nodenext"
+  pg.mod_force = cfg.opts.get("moduledetection", "").lower() == "force"
   pg.tla_ok = mo == "es2022" or mo == "esnext" or mo == "preserve"
   pg.exp_deco = cfg.opts.get("experimentaldecorators", "") == "true"
   pg.no_unused = cfg.opts.get("nounusedlocals", "") == "true"
@@ -1406,11 +2219,13 @@ fn read_config(fs: Fs, os: Os, pp: Str) -> Conf:
     var vv: [Str] = []
     for x in vs: vv.push(x + "")
     pg.pvals.push(vv)
+  for x in cfg.incl: pg.root_incl.push(x + "")
+  pg.root_listed = cfg.nlisted
   cf.pg = pg
   return cf
 
 fn copy_prog(pg: Prog) -> Prog:
-  var pk = Prog(has_types: pg.has_types, tdir: pg.tdir + "", spi: pg.spi, unknown_catch: pg.unknown_catch, node16: pg.node16, meta_ok: pg.meta_ok, tla_ok: pg.tla_ok, exp_deco: pg.exp_deco, no_unused: pg.no_unused, skip_lib: pg.skip_lib, side_unchecked: pg.side_unchecked, cwd: pg.cwd + "", abs_names: pg.abs_names, lint: pg.lint + "", inferred: pg.inferred, allow_unreach: pg.allow_unreach, npai: pg.npai)
+  var pk = Prog(has_types: pg.has_types, tdir: pg.tdir + "", spi: pg.spi, unknown_catch: pg.unknown_catch, exact_opt: pg.exact_opt, nuia: pg.nuia, snc_off: pg.snc_off, nia_off: pg.nia_off, sft_off: pg.sft_off, sbca_off: pg.sbca_off, nit_off: pg.nit_off, node16: pg.node16, meta_ok: pg.meta_ok, mod_node: pg.mod_node, mod_force: pg.mod_force, tla_ok: pg.tla_ok, exp_deco: pg.exp_deco, no_unused: pg.no_unused, skip_lib: pg.skip_lib, side_unchecked: pg.side_unchecked, cwd: pg.cwd + "", abs_names: pg.abs_names, lint: pg.lint + "", inferred: pg.inferred, allow_js: pg.allow_js, allow_unreach: pg.allow_unreach, npai: pg.npai, no_trunc: pg.no_trunc, jsx: pg.jsx + "", jsx_src: pg.jsx_src + "")
   for k, v in pg.lint_files: pk.lint_files[k] = v + ""
   for x in pg.redir_out: pk.redir_out.push(x + "")
   for x in pg.redir_src: pk.redir_src.push(x + "")
@@ -1424,21 +2239,51 @@ fn copy_prog(pg: Prog) -> Prog:
     var vv: [Str] = []
     for x in vs: vv.push(x + "")
     pk.pvals.push(vv)
+  for x in pg.root_incl: pk.root_incl.push(x + "")
+  pk.root_listed = pg.root_listed
   return pk
 
 # The checker's workers over the files (jobs 0: one per core for a big project, at most 8)
-fn run_all(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, jobs0: Int) -> [Out] throws:
+fn run_all(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, jobs0: Int, fm: Memo[Str, FSrc], km: Memo[Str, Int]) -> [Out] throws:
   var jobs = jobs0
   if jobs == 0:
     jobs = 1
-    if files.len >= 16: jobs = cpu_count(fs)
+    if files.len >= 16: jobs = cpu_count(fs, ffi)
   if jobs > 8: jobs = 8
   var outs: [Out] = []
-  if jobs == 1:
+  # (the workers as forked processes where this one runs no other thread: the program is read,
+  # parsed and bound once, not by each worker; VTSC_FORK=0 keeps threads)
+  var forked = false
+  if os.env("VTSC_FORK_DEBUG") != "": eprint("vtsc: fork: jobs {jobs} threads {lcache.threads(ffi)}")
+  # (two threads: Vu's runtime runs main on a thread of its own while the first waits for it,
+  # holding nothing)
+  if jobs > 1 and os.env("VTSC_FORK") != "0" and lcache.threads(ffi) <= 2:
+    let wqf: Chan[Int] = chan(1)
+    wqf.close()
+    var fo = run(fs, os, ffi, files, dir, target, pg, -1, jobs, wqf, 0, fm, km) else Out([], [], [], false, "", false, [], [], [], [], 0, [], [])
+    let fo_ok = fo.ok
+    if lcache.is_child(ffi):
+      # (a shard: its result for the parent, then gone without unwinding anything)
+      var code = 1
+      if fo.sub_path != "":
+        let sp = fo.sub_path + ""
+        fs.write(sp, to_json(out_wire(fo))) else 0
+        code = 0
+      lcache.exit_now(ffi, code)
+      return outs
+    if fo_ok:
+      var all_ok = true
+      for js in fo.subs:
+        let sw = from_json(js, OutW) else OutW([], [], [], false, "", false, [], [], [], [], 0, [], [])
+        if not sw.ok: all_ok = false
+        outs.push(out_unwire(sw))
+      if all_ok: forked = true
+      else: outs = []
+  if not forked and jobs == 1:
     let wq0: Chan[Int] = chan(1)
     wq0.close()
-    outs.push(run(fs, os, ffi, files, dir, target, pg, 0, 1, wq0, 0)?)
-  else:
+    outs.push(run(fs, os, ffi, files, dir, target, pg, 0, 1, wq0, 0, fm, km)?)
+  elif not forked:
     let ch: Chan[Out] = chan(jobs)
     # (the files' ranks in the checking order, taken by whichever worker is free: past cap, every
     # nshards-th one by each)
@@ -1450,7 +2295,7 @@ fn run_all(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Pr
     for k in 0..jobs:
       var fc: [Str] = []
       for x in files: fc.push(x + "")
-      spawn worker(fs, os, ffi, fc, dir + "", target + "", copy_prog(pg), k, jobs, ch, wq, cap)
+      spawn worker(fs, os, ffi, fc, dir + "", target + "", copy_prog(pg), k, jobs, ch, wq, cap, fm.share(), km.share())
     for k in 0..jobs:
       let o = ch.recv()?
       outs.push(o)
@@ -1475,7 +2320,7 @@ type Merged:
   rfile: [Int] = []
   rbad: {Int: Bool} = {}
 
-fn merge(outs: [Out]) -> Merged:
+fn merge(outs: [Out], prop_off: Bool) -> Merged:
   var any_unsup = false
   for o in outs:
     if o.unsup_user: any_unsup = true
@@ -1491,13 +2336,22 @@ fn merge(outs: [Out]) -> Merged:
   for o in outs:
     for ix in 0..o.unsup_fi.len:
       if not (o.unsup_fi[ix] in why): why[o.unsup_fi[ix]] = o.unsup[ix] + ""
-  var grew = true
+  # (a file whose reason is inside an annotated function body doesn't stop what imports it)
+  var body_only: {Int: Bool} = {}
+  var bk: [Int] = []
+  for fi, w in why: bk.push(fi)
+  for fi in bk:
+    let w = why[fi] + ""
+    if w.endswith(bind.BODY_ONLY):
+      why[fi] = w[0..w.len - bind.BODY_ONLY.len]
+      body_only[fi] = true
+  var grew = not prop_off
   while grew:
     grew = false
     for fi in uf..outs[w0].names.len:
       if fi in why: continue
       for d in outs[w0].deps[fi - uf]:
-        if d >= 0 and d in why:
+        if d >= 0 and d in why and not (d in body_only):
           why[fi] = "an import of " + outs[w0].names[d] + ", which isn't checked"
           grew = true
           break
@@ -1541,13 +2395,18 @@ type Proj:
   ncached: Int = 0                   # ... the files it answered
 
 fn check_project(fs: Fs, os: Os, ffi: Ffi, pp: Str, lib: Str, jobs: Int) -> Proj:
-  return check_project_lint(fs, os, ffi, pp, lib, jobs, {}, os.env("VTSC_CACHE_DIR"))
+  let fm: Memo[Str, FSrc] = memo()
+  let km: Memo[Str, Int] = memo()
+  return check_project_lint(fs, os, ffi, pp, lib, jobs, {}, os.env("VTSC_CACHE_DIR"), fm, km)
 
 # (lint: an absolute file path -> the type-aware rules to run over it, tsgolint's rule list JSON)
 # (cdir: the file cache's folder, "" none)
-fn check_project_lint(fs: Fs, os: Os, ffi: Ffi, pp: Str, lib: Str, jobs: Int, lint: {Str: Str}, cdir: Str) -> Proj:
+fn check_project_lint(fs: Fs, os: Os, ffi: Ffi, pp: Str, lib: Str, jobs: Int, lint: {Str: Str}, cdir: Str, fm: Memo[Str, FSrc], km: Memo[Str, Int]) -> Proj:
   var p = Proj(false, "", [], {}, {}, {})
-  let cf = read_config(fs, os, pp)
+  # (the tsconfig cache along with the file cache: vtsc alone has neither)
+  var cf = Conf("", "", [], "", Prog())
+  if cdir != "": cf = read_config_c(fs, os, ffi, pp)
+  else: cf = read_config(fs, os, pp)
   if cf.err != "":
     p.err = cf.err + ""
     return p
@@ -1561,7 +2420,7 @@ fn check_project_lint(fs: Fs, os: Os, ffi: Ffi, pp: Str, lib: Str, jobs: Int, li
   pg.cwd = tsconf.dirname(pp)
   var target = "es2025"
   if cf.target != "": target = cf.target + ""
-  check_conf(fs, os, ffi, cf, pg, target, lib, jobs, lint, cdir, &p)
+  check_conf(fs, os, ffi, cf, pg, target, lib, jobs, lint, cdir, fm, km, &p)
   if cf.loose != "" and p.ok:
     # (a strict flag off: checked as strict, kept only where no type could have null, undefined,
     # an implicit any or a function in it)
@@ -1618,7 +2477,7 @@ fn loose_ok(src: Str) -> Bool:
 # (TypeScript 7's default), target ES2022 (its lib with the DOM), module ESNext with bundler
 # resolution, no automatic @types (types: []), the files as its roots in order; cwd: the folder
 # tsgolint runs in.
-fn check_inferred_lint(fs: Fs, os: Os, ffi: Ffi, cwd: Str, files: [Str], lib: Str, jobs: Int, lint: {Str: Str}, cdir: Str) -> Proj:
+fn check_inferred_lint(fs: Fs, os: Os, ffi: Ffi, cwd: Str, files: [Str], lib: Str, jobs: Int, lint: {Str: Str}, cdir: Str, fm: Memo[Str, FSrc], km: Memo[Str, Int]) -> Proj:
   var p = Proj(false, "", [], {}, {}, {})
   var cf = Conf("", "", [], "es2022", Prog())
   p.members_ok = true
@@ -1626,11 +2485,17 @@ fn check_inferred_lint(fs: Fs, os: Os, ffi: Ffi, cwd: Str, files: [Str], lib: St
     cf.files.push(f + "")
     p.members[f] = true
   cf.nlisted = files.len
-  var pg = Prog(has_types: true, meta_ok: true, tla_ok: true, cwd: cwd + "", inferred: true)
-  check_conf(fs, os, ffi, cf, pg, "es2022", lib, jobs, lint, cdir, &p)
+  var pg = Prog(has_types: true, meta_ok: true, tla_ok: true, cwd: cwd + "", inferred: true, allow_js: true)
+  check_conf(fs, os, ffi, cf, pg, "es2022", lib, jobs, lint, cdir, fm, km, &p)
   return p
 
-fn check_conf(fs: Fs, os: Os, ffi: Ffi, cf: Conf, pg0: Prog, target: Str, lib: Str, jobs: Int, lint: {Str: Str}, cdir: Str, var p: Proj):
+# (a check given jobs -1 that the file cache can't answer whole: nothing checked, the caller
+# checks it as it would have, in a worker process)
+fn cache_miss() -> Str:
+  return "vtsc: not answered by the cache"
+
+# (jobs -1: the program's results only when the cache has them all, else p.err is cache_miss())
+fn check_conf(fs: Fs, os: Os, ffi: Ffi, cf: Conf, pg0: Prog, target: Str, lib: Str, jobs: Int, lint: {Str: Str}, cdir: Str, fm: Memo[Str, FSrc], km: Memo[Str, Int], var p: Proj):
   var pg = copy_prog(pg0)
   pg.abs_names = true
   for k, v in lint: pg.lint_files[k] = v + ""
@@ -1641,15 +2506,20 @@ fn check_conf(fs: Fs, os: Os, ffi: Ffi, cf: Conf, pg0: Prog, target: Str, lib: S
   for i in 0..cf.nlisted:
     if i < cf.files.len: pid = pid + "|" + cf.files[i]
   pg.cache = cache_path(cdir, pid)
+  let only_cached = jobs < 0
   var jobs1 = jobs
+  if only_cached: jobs1 = 0
   var phash = ""
   if pg.cache != "":
     var pk = copy_prog(pg)
     pk.cache = ""
     var st: [Int] = [0, 0, 0, 0, 0]
     lcache.stat(ffi, lcache.self_exe(ffi), &st)
-    var all = to_json(pk) + "|" + target + "|" + lib + "|{st[0]}/{st[1]}/{st[2]}/{st[3]}"
-    for f in cf.files: all = all + "|" + f
+    # (joined once: appending each file to the key copied it every time, quadratic in a 14,000-file
+    # program's files)
+    var parts: [Str] = [to_json(pk) + "|" + target + "|" + lib + "|{st[0]}/{st[1]}/{st[2]}/{st[3]}"]
+    for f in cf.files: parts.push(f + "")
+    let all = "|".join(parts)
     phash = lcache.hex16(lcache.hash64(all))
     let c0 = from_json(fs.read(pg.cache) else "", CFile) else CFile()
     # (a few files changed since the last run: one worker, the others' results from the cache)
@@ -1682,11 +2552,14 @@ fn check_conf(fs: Fs, os: Os, ffi: Ffi, cf: Conf, pg0: Prog, target: Str, lib: S
         p.ncached = l.fkeys.len
         p.ok = true
         return
-  let outs = run_all(fs, os, ffi, cf.files, lib, target, pg, jobs1) else []
+  if only_cached:
+    p.err = cache_miss()
+    return
+  let outs = run_all(fs, os, ffi, cf.files, lib, target, pg, jobs1, fm, km) else []
   if outs.len == 0:
     p.err = "the checker failed"
     return
-  let m = merge(outs)
+  let m = merge(outs, os.env("VTSC_NO_PROPAGATE") != "")
   # (with a syntax error, tsc reports only those: the type check is tsgolint's)
   if m.nsyntax > 0:
     p.err = "syntax errors"
@@ -1895,4 +2768,662 @@ fn wants_ctx(pg: Prog) -> Bool:
   return false
 
 fn ctx_rule_in(s: Str) -> Bool:
-  return s.find("strict-void-return") >= 0 or s.find("no-misused-promises") >= 0 or s.find("no-unsafe-enum-assignment") >= 0
+  return s.find("strict-void-return") >= 0 or s.find("no-misused-promises") >= 0 or s.find("no-unsafe-enum-assignment") >= 0 or s.find("no-unnecessary-type-assertion") >= 0
+
+fn is_jsx_path(p: Str) -> Bool:
+  return p.endswith(".tsx") or p.endswith(".jsx")
+
+# ---- the JavaScript the checker types as TypeScript types it (moved from lvtsc: tsprog checks a
+# program's own JavaScript files with it too)
+
+# A JSDoc comment whose one tag is @type {T}.
+fn only_type_tag(body: Str) -> Bool:
+  let i = body.find("@type")
+  if i < 0 or body[0..i].find("@") >= 0: return false
+  var j = i + 5
+  while j < body.len and (body[j] == ' ' or body[j] == '\t'): j += 1
+  if j >= body.len or body[j] != '{': return false
+  # (the type in braces, which may name a package with @; nothing tagged after it)
+  var depth = 0
+  while j < body.len:
+    if body[j] == '{': depth += 1
+    elif body[j] == '}':
+      depth -= 1
+      if depth == 0: break
+    j += 1
+  if depth != 0: return false
+  return body[j..body.len].find("@") < 0
+
+# An expression of literals, objects and arrays of them, and calls of the built-in conversions (no
+# functions, generic calls or spreads, whose types a contextual type could change).
+fn plain_data(t: ast.Ast, e: Int) -> Bool:
+  if e < 0: return true
+  let k = t.nd[e].k
+  if k == ast.N_STR or k == ast.N_NUM or k == ast.N_BIGINT or k == ast.N_TRUE or k == ast.N_FALSE or k == ast.N_NULL or k == ast.N_NOSUBTEMPL or k == ast.N_REGEX: return true
+  if k == ast.N_ID: return true
+  if k == ast.N_PAREN: return plain_data(t, t.nd[e].a)
+  if k == ast.N_PREFIX: return plain_data(t, t.nd[e].a)
+  if k == ast.N_PROPACCESS: return plain_data(t, t.nd[e].a)
+  if k == ast.N_BINARY: return plain_data(t, t.nd[e].a) and plain_data(t, t.nd[e].b)
+  if k == ast.N_ARRAY:
+    for x in ast.items(t, t.nd[e].a):
+      if not plain_data(t, x): return false
+    return true
+  if k == ast.N_OBJECT:
+    for p in ast.items(t, t.nd[e].a):
+      if t.nd[p].k != ast.N_PROPASSIGN: return false
+      if t.nd[t.nd[p].a].k == ast.N_COMPUTED: return false
+      if not plain_data(t, t.nd[p].b): return false
+    return true
+  if k == ast.N_CALL:
+    let cal = t.nd[e].a
+    if t.nd[cal].k != ast.N_ID: return false
+    let cn = t.names[t.nd[cal].s]
+    if cn != "Number" and cn != "String" and cn != "Boolean" and cn != "parseInt" and cn != "parseFloat": return false
+    for x in ast.items(t, t.nd[e].c):
+      if not plain_data(t, x): return false
+    return true
+  return false
+
+# Where the next block comment from at starts, past strings, templates and line comments (a
+# glob like 'src/**' isn't one); -1 when there's none.
+fn block_comment_at(src: Str, at: Int) -> Int:
+  var i = at
+  while i + 1 < src.len:
+    let ch = src[i]
+    if ch == '/' and src[i + 1] == '*': return i
+    if ch == '/' and src[i + 1] == '/':
+      while i < src.len and src[i] != '\n': i += 1
+      continue
+    if ch == '\'' or ch == '"' or ch == '`':
+      i += 1
+      while i < src.len and src[i] != ch:
+        if src[i] == '\\': i += 1
+        i += 1
+      i += 1
+      continue
+    i += 1
+  return -1
+
+# Why the checker can't type a JavaScript file as TypeScript types it ("" it can): JSDoc, CommonJS,
+# classes and this, expando assignments, TypeScript's own syntax.
+fn js_unsupported(src: Str, path: Str) -> Str:
+  # (// @ts-check and // @ts-nocheck say only whether errors are reported, which changes no type;
+  # @ts-ignore and @ts-expect-error hide errors the checks below look at)
+  var tsat = 0
+  while true:
+    let k0 = src[tsat..src.len].find("@ts-")
+    if k0 < 0: break
+    let q0 = tsat + k0 + 4
+    var qe = q0
+    while qe < src.len and src[qe] >= 'a' and src[qe] <= 'z': qe += 1
+    let dir = src[q0..qe]
+    if dir != "check" and dir != "nocheck": return "a @ts- comment"
+    tsat = qe
+  var at = 0
+  # (/** @type {T} */ before export default: allowed when what it types is plain data, which a
+  # contextual type changes nothing a rule sees in)
+  var typed_at: [Int] = []
+  var tg0 = ast.new_ast()
+  var kw0 = scan.keywords()
+  let ds0 = parse.parse_file_x(&tg0, src + "", 1, &kw0, false, true)
+  if ds0.len > 0: return "a syntax error"
+  for st in jsdoc_starts(tg0, src, 0, tg0.nd.len - 1):
+    let e0 = src[st + 2..src.len].find("*/")
+    if e0 < 0: break
+    let e = e0 + 2
+    let body = src[st..st + e]
+    if body.find("@") >= 0:
+      # (the tags jsdoc_attach reads, and those that only describe; it decides the rest)
+      var jt: [JTag] = []
+      if jsdoc_tags(src, st + 2, st + e, &jt) != "": return "a JSDoc tag"
+      for tg in jt:
+        let tn = tg.tag
+        if not (tn == "param" or tn == "arg" or tn == "argument" or tn == "returns" or tn == "return" or tn == "type" or tn == "typedef" or tn == "template" or jsdoc_info_tag(tn)): return "a JSDoc tag"
+      # (/** @type {T} */ before export default: as before)
+      if only_type_tag(body):
+        var q0 = st + e + 2
+        while q0 < src.len and (src[q0] == ' ' or src[q0] == '\n' or src[q0] == '\t' or src[q0] == '\r'): q0 += 1
+        if q0 + 15 <= src.len and src[q0..q0 + 15] == "export default ": typed_at.push(st + e + 2)
+  var t = ast.new_ast()
+  var kw = scan.keywords()
+  let ds = parse.parse_file_x(&t, src + "", 1, &kw, false, true)
+  if ds.len > 0: return "a syntax error"
+  for ca in typed_at:
+    var q = ca
+    while q < src.len and (src[q] == ' ' or src[q] == '\n' or src[q] == '\t' or src[q] == '\r'): q += 1
+    var found = false
+    for i in 0..t.nd.len:
+      if t.nd[i].k == ast.N_EXPORTDEFAULT and t.nd[i].pos == q:
+        found = true
+        if not plain_data(t, t.nd[i].a): return "a JSDoc type on something not plain data"
+    if not found: return "a JSDoc tag"
+  # (CommonJS as TypeScript types it: require("x") calls, module.exports = x at the top level)
+  var cjs_ok: {Int: Bool} = {}
+  for i in 0..t.nd.len:
+    if require_spec(t, i) >= 0: cjs_ok[t.nd[i].a] = true
+    # (a template literal expression's spans: not types)
+    if t.nd[i].k == ast.N_TEMPL:
+      for sp in ast.items(t, t.nd[i].a): cjs_ok[sp] = true
+    # (a property's name, { define: ... } or { module() {} }: not a reference)
+    let k0 = t.nd[i].k
+    if (k0 == ast.N_PROPASSIGN or k0 == ast.N_METHOD or k0 == ast.N_GET or k0 == ast.N_SET or k0 == ast.N_PROP or k0 == ast.N_BINDEL) and t.nd[i].a >= 0 and t.nd[t.nd[i].a].k == ast.N_ID: cjs_ok[t.nd[i].a] = true
+    # (require(x) of something not a string literal: an ordinary call of require, no import,
+    # isRequireCall)
+    if k0 == ast.N_CALL and t.nd[i].b < 0 and require_spec(t, i) < 0 and t.nd[t.nd[i].a].k == ast.N_ID and t.names[t.nd[t.nd[i].a].s] == "require" and ast.items(t, t.nd[i].c).len == 1: cjs_ok[t.nd[i].a] = true
+  # (the names the file declares, anywhere: bindings of its own)
+  var has_req_call = false
+  for i in 0..t.nd.len:
+    if require_spec(t, i) >= 0: has_req_call = true
+  var local_names: {Int: Bool} = {}
+  for i in 0..t.nd.len:
+    let k = t.nd[i].k
+    if (k == ast.N_DECL or k == ast.N_PARAM) and t.nd[i].a >= 0 and t.nd[t.nd[i].a].k == ast.N_ID: local_names[t.nd[t.nd[i].a].s] = true
+    elif k == ast.N_BINDEL and t.nd[i].b >= 0 and t.nd[t.nd[i].b].k == ast.N_ID: local_names[t.nd[t.nd[i].b].s] = true
+    elif (k == ast.N_FUNC or k == ast.N_CLASS) and t.nd[i].s >= 0: local_names[t.nd[i].s] = true
+  # (the names an expando assignment could declare a member of)
+  var expando: {Int: Bool} = {}
+  var empty_objs: {Int: Bool} = {}
+  for i in 0..t.nd.len:
+    let k = t.nd[i].k
+    if (k == ast.N_FUNC or k == ast.N_CLASS) and t.nd[i].s >= 0: expando[t.nd[i].s] = true
+    if k == ast.N_DECL and t.nd[t.nd[i].a].k == ast.N_ID and t.nd[i].c >= 0:
+      var iv = t.nd[i].c
+      while t.nd[iv].k == ast.N_PAREN: iv = t.nd[iv].a
+      let ik = t.nd[iv].k
+      if ik == ast.N_FUNCEXPR or ik == ast.N_ARROW or ik == ast.N_CLASSEXPR or ik == ast.N_BINARY: expando[t.nd[t.nd[i].a].s] = true
+      # (x = {}: x.p = v declares p, as the checker types it (js_expando_props); x['p'] = v not)
+      elif ik == ast.N_OBJECT and ast.count(t, t.nd[iv].a) == 0: empty_objs[t.nd[t.nd[i].a].s] = true
+  # (f.p = v beside function f's declaration, in the same statements: its expando property, as the
+  # checker types it (func_type))
+  var fn_exp_ok: {Int: Bool} = {}
+  for li in 0..t.nd.len:
+    if t.nd[li].k != ast.N_LIST: continue
+    let its = ast.items(t, li)
+    var fns: {Int: Bool} = {}
+    for st in its:
+      if t.nd[st].k == ast.N_FUNC and t.nd[st].s >= 0 and t.nd[st].d >= 0: fns[t.nd[st].s] = true
+    if fns.len == 0: continue
+    for st in its:
+      if t.nd[st].k != ast.N_EXPRSTMT: continue
+      let e = t.nd[st].a
+      if t.nd[e].k != ast.N_BINARY or t.nd[e].f != scan.T_ASSIGN: continue
+      let l = t.nd[e].a
+      if t.nd[l].k == ast.N_PROPACCESS and (t.nd[l].f & 5) == 0 and t.nd[t.nd[l].a].k == ast.N_ID and t.nd[t.nd[l].a].s in fns: fn_exp_ok[e] = true
+  let root = t.nd.len - 1
+  # (module as a value in a file whose one module.exports = x the checker types: the file's module,
+  # { exports: x }; require as the object of an access, require.main: the global require)
+  let mod_ok = not path.endswith(".mjs") and cjs_export_expr(t, root, 0) >= 0
+  var acc_obj: {Int: Bool} = {}
+  for i in 0..t.nd.len:
+    if t.nd[i].k == ast.N_PROPACCESS and t.nd[i].a >= 0: acc_obj[t.nd[i].a] = true
+  for i in 0..t.nd.len:
+    if t.nd[i].k != ast.N_ID or t.nd[i].s in local_names: continue
+    let n0 = t.names[t.nd[i].s]
+    if n0 == "module" and mod_ok and not (i in acc_obj): cjs_ok[i] = true
+    if n0 == "require" and i in acc_obj and not path.endswith(".mjs"): cjs_ok[i] = true
+  for st in ast.items(t, root):
+    if t.nd[st].k != ast.N_EXPRSTMT: continue
+    let e = t.nd[st].a
+    if t.nd[e].k != ast.N_BINARY or t.nd[e].f != scan.T_ASSIGN: continue
+    let l = t.nd[e].a
+    if t.nd[l].k == ast.N_PROPACCESS and t.nd[t.nd[l].a].k == ast.N_ID and t.names[t.nd[t.nd[l].a].s] == "module" and t.names[t.nd[l].s] == "exports":
+      cjs_ok[t.nd[l].a] = true
+      cjs_ok[e] = true
+  for i in 0..t.nd.len:
+    let k = t.nd[i].k
+    if k >= ast.N_TREF and k <= ast.N_TREST and not (k == ast.N_TSPAN and i in cjs_ok): return "a type at {t.nd[i].pos}"
+    if k == ast.N_INTERFACE or k == ast.N_TYPEALIAS or k == ast.N_ENUM or k == ast.N_MODULE or k == ast.N_IMPORTEQ or k == ast.N_EXPORTASSIGN or k == ast.N_EXTERNALREF or k == ast.N_NSEXPORT: return "TypeScript's syntax at {t.nd[i].pos}"
+    # (a class's extends clause without type arguments: JavaScript's)
+    if k == ast.N_EXPRTARGS and t.nd[i].b < 0: continue
+    if k == ast.N_AS or k == ast.N_SATISFIES or k == ast.N_NONNULL or k == ast.N_TYPEASSERT or k == ast.N_EXPRTARGS or k == ast.N_INDEXSIG or k == ast.N_CALLSIG or k == ast.N_CTORSIG: return "TypeScript's syntax at {t.nd[i].pos}"
+    # (a class: as TypeScript's, its this.x assignments (JavaScript's declarations) refused below)
+    if k == ast.N_PROP and t.nd[i].a >= 0 and t.nd[t.nd[i].a].k != ast.N_ID: return "a class or this at {t.nd[i].pos}"
+    # (JSX: as in a .tsx file)
+    if k == ast.N_WITH: return "with at {t.nd[i].pos}"
+    if (k == ast.N_IMPORT or k == ast.N_EXPORT or k == ast.N_SPEC) and (t.nd[i].f & ast.M_TYPEONLY) != 0: return "TypeScript's syntax at {t.nd[i].pos}"
+    if k == ast.N_PARAM and (t.nd[i].b >= 0 or (t.nd[i].f & ast.M_OPTIONAL) != 0): return "TypeScript's syntax at {t.nd[i].pos}"
+    if (k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW) and (t.nd[i].a >= 0 or t.nd[i].c >= 0): return "TypeScript's syntax at {t.nd[i].pos}"
+    if k == ast.N_FUNC and t.nd[i].d < 0: return "TypeScript's syntax at {t.nd[i].pos}"
+    if k == ast.N_SIG and (t.nd[i].a >= 0 or t.nd[i].c >= 0): return "TypeScript's syntax at {t.nd[i].pos}"
+    if k == ast.N_DECL and (t.nd[i].b >= 0 or (t.nd[i].f & ast.M_EXCL) != 0): return "TypeScript's syntax at {t.nd[i].pos}"
+    # (a for header's declaration has no modifiers: -1)
+    if k == ast.N_VAR and t.nd[i].d > 0 and (t.nd[i].d & ast.M_DECLARE) != 0: return "TypeScript's syntax at {t.nd[i].pos}"
+    if (k == ast.N_CALL or k == ast.N_NEW or k == ast.N_TAGGED) and t.nd[i].b >= 0: return "TypeScript's syntax at {t.nd[i].pos}"
+    if k == ast.N_ID and not (i in cjs_ok):
+      let n = t.names[t.nd[i].s]
+      # (exports: tsc's CommonJS output, exports.x = ... and Object.defineProperty(exports, ...),
+      # which no file here imports: an import of a CommonJS file isn't modeled)
+      # (a name the file declares, const require = createRequire(...) or (module) => ...: its
+      # own binding, not CommonJS's, isCommonJsRequire)
+      # (a local require called require("x"): tsc's binder makes that an import, not modeled here)
+      # (an ES module's own require, createRequire(import.meta.url): require("x") an ordinary call
+      # of it, typed any, as tsgolint has it)
+      let esm_req = n == "require" and path.endswith(".mjs") and t.nd[i].s in local_names
+      if (n == "require" or n == "module" or n == "define") and not esm_req and not (t.nd[i].s in local_names and not (n == "require" and has_req_call)): return "CommonJS at {t.nd[i].pos}"
+    if k == ast.N_BINARY and t.nd[i].f == scan.T_ASSIGN and not (i in cjs_ok) and not (i in fn_exp_ok):
+      var l = t.nd[i].a
+      while t.nd[l].k == ast.N_PAREN: l = t.nd[l].a
+      # (x.p = v declares p only where x is this, exports, or names a function, a class, or a
+      # variable made from one or from {} (TypeScript's expando declarations): others are
+      # assignments, checked as TypeScript checks them)
+      # (x[k] = v with k not a literal: an assignment, not a declaration, bindSpecialPropertyAssignment
+      # taking only x.p and x['p'])
+      var lit_key = t.nd[l].k == ast.N_PROPACCESS
+      if t.nd[l].k == ast.N_ELEMACCESS:
+        var ix = t.nd[l].b
+        while ix >= 0 and t.nd[ix].k == ast.N_PAREN: ix = t.nd[ix].a
+        lit_key = ix >= 0 and (t.nd[ix].k == ast.N_STR or t.nd[ix].k == ast.N_NUM or t.nd[ix].k == ast.N_NOSUBTEMPL)
+      if lit_key:
+        var lo = t.nd[l].a
+        while t.nd[lo].k == ast.N_PAREN: lo = t.nd[lo].a
+        var plain = true
+        if t.nd[lo].k == ast.N_ID:
+          plain = not (t.nd[lo].s in expando)
+          if t.nd[lo].s in empty_objs and not (t.nd[lo].s in expando) and t.nd[l].k != ast.N_PROPACCESS: plain = false
+        elif t.nd[lo].k == ast.N_THIS: plain = t.nd[l].k == ast.N_PROPACCESS
+        elif t.nd[lo].k == ast.N_PROPACCESS:
+          # (a.b.c = v: a declaration where the chain is a.prototype or starts at an expando name)
+          var q = lo
+          while t.nd[q].k == ast.N_PROPACCESS:
+            if t.names[t.nd[q].s] == "prototype": plain = false
+            q = t.nd[q].a
+          if t.nd[q].k == ast.N_ID and t.nd[q].s in expando: plain = false
+        if not plain: return "an expando assignment at {t.nd[i].pos}"
+  return ""
+
+# A CommonJS file's value, the x of its one top-level module.exports = x, where nothing else in it
+# names module or exports (-1 otherwise: exports.y = ... and the like aren't modeled).
+fn cjs_export_expr(t: ast.Ast, root: Int, first: Int) -> Int:
+  var e = -1
+  var lhs = -1
+  for st in ast.items(t, root):
+    if t.nd[st].k != ast.N_EXPRSTMT: continue
+    let x = t.nd[st].a
+    if t.nd[x].k != ast.N_BINARY or t.nd[x].f != scan.T_ASSIGN: continue
+    let l = t.nd[x].a
+    if t.nd[l].k == ast.N_PROPACCESS and t.nd[t.nd[l].a].k == ast.N_ID and t.names[t.nd[t.nd[l].a].s] == "module" and t.names[t.nd[l].s] == "exports":
+      if e >= 0: return -1
+      e = t.nd[x].b
+      lhs = t.nd[l].a
+  if e < 0: return -1
+  # (module read as a value, not as the object of an access: { exports: x }, which adds nothing)
+  var acc: {Int: Bool} = {}
+  for i in first..root:
+    if (t.nd[i].k == ast.N_PROPACCESS or t.nd[i].k == ast.N_ELEMACCESS) and t.nd[i].a >= 0: acc[t.nd[i].a] = true
+  for i in first..root:
+    if t.nd[i].k == ast.N_ID and i != lhs and t.names[t.nd[i].s] == "module" and i in acc: return -1
+    if t.nd[i].k == ast.N_ID and i != lhs and t.names[t.nd[i].s] == "exports": return -1
+  return e
+
+# Whether a JavaScript file parses ("" it does).
+fn js_syntax(src: Str) -> Str:
+  var t = ast.new_ast()
+  var kw = scan.keywords()
+  # (JavaScript is read with JSX, as TypeScript reads .js and .jsx files)
+  let ds = parse.parse_file_x(&t, src + "", 1, &kw, false, true)
+  if ds.len > 0: return "a syntax error"
+  return ""
+
+
+# ---- JSDoc types in a JavaScript file (@param, @returns, @type, @typedef), as tsc reads them
+# with checkJs: each type parsed in place in its comment and set where TypeScript writes it (a
+# parameter's type, a function's return type, a declaration's type; a typedef a type alias).
+
+type JTag:
+  tag: Str
+  tpos: Int      # the type's text in the source ([tpos..tend]; -1 none)
+  tend: Int
+  name: Str
+  opt: Bool
+
+# The tags of a comment's body (src[a..b], between /** and */): "" or why they aren't read.
+fn jsdoc_tags(src: Str, a: Int, b: Int, var out: [JTag]) -> Str:
+  var i = a
+  while i < b:
+    if src[i] != '@':
+      # ({@link x} and the like inside text: not tags)
+      if src[i] == '{' and i + 1 < b and src[i + 1] == '@':
+        while i < b and src[i] != '}': i += 1
+      i += 1
+      continue
+    # (a tag starts at an @ after whitespace, a * margin or the comment's start, mid-line too:
+    # tsc reads /** @param {A} a @returns {B} */ as two tags; a@b isn't one)
+    if i > a and not (src[i - 1] == ' ' or src[i - 1] == '\t' or src[i - 1] == '\n' or src[i - 1] == '\r' or src[i - 1] == '*'):
+      i += 1
+      continue
+    var j = i + 1
+    while j < b and ((src[j] >= 'a' and src[j] <= 'z') or (src[j] >= 'A' and src[j] <= 'Z')): j += 1
+    let tag = src[i + 1..j]
+    # (an @ before no name, e.g. @^1.2: a tag with a missing name, which types nothing)
+    if tag == "":
+      i = j
+      continue
+    var tg = JTag(tag + "", -1, -1, "", false)
+    while j < b and (src[j] == ' ' or src[j] == '\t'): j += 1
+    if j < b and src[j] == '{':
+      var depth = 0
+      var e = j
+      while e < b:
+        if src[e] == '{': depth += 1
+        elif src[e] == '}':
+          depth -= 1
+          if depth == 0: break
+        e += 1
+      if e >= b: return "an unclosed JSDoc type"
+      tg.tpos = j + 1
+      tg.tend = e
+      j = e + 1
+      while j < b and (src[j] == ' ' or src[j] == '\t'): j += 1
+    # (@template T, U: the names, comma separated)
+    if tag == "template":
+      var n1 = j
+      while n1 < b and src[n1] != '\n' and src[n1] != '\r' and src[n1] != '*' and src[n1] != '@' and not (src[n1] == ' ' and n1 + 1 < b and src[n1 + 1] != ',' and src[n1 - 1] != ','): n1 += 1
+      tg.name = src[j..n1].replace(" ", "")
+      j = n1
+    if tag == "param" or tag == "arg" or tag == "argument" or tag == "typedef":
+      var n0 = j
+      var opt = false
+      if n0 < b and src[n0] == '[':
+        opt = true
+        n0 += 1
+      var n1 = n0
+      while n1 < b and src[n1] != ' ' and src[n1] != '\t' and src[n1] != '\n' and src[n1] != '\r' and src[n1] != ']' and src[n1] != '=' and src[n1] != '*': n1 += 1
+      tg.name = src[n0..n1]
+      tg.opt = opt
+      j = n1
+    out.push(tg)
+    i = j
+  return ""
+
+fn jsdoc_info_tag(t: Str) -> Bool:
+  for x in ["deprecated", "example", "see", "since", "default", "defaultValue", "description", "desc", "author", "todo", "throws", "exception", "remarks", "internal", "summary", "file", "fileoverview", "overview", "module", "license", "copyright", "version", "note", "public", "link", "inheritdoc"]:
+    if t == x: return true
+  return false
+
+# The node a comment ending at e documents: the first declaration after it, past modifiers.
+fn jsdoc_target(t: ast.Ast, src: Str, e: Int, first: Int, root: Int) -> Int:
+  var q = e
+  while q < src.len and (src[q] == ' ' or src[q] == '\t' or src[q] == '\n' or src[q] == '\r'): q += 1
+  # (export, default, async before the declaration's own start)
+  var q2 = q
+  var moved = true
+  while moved:
+    moved = false
+    for w in ["export ", "default ", "async "]:
+      if q2 + w.len <= src.len and src[q2..q2 + w.len] == w:
+        q2 += w.len
+        while q2 < src.len and (src[q2] == ' ' or src[q2] == '\t' or src[q2] == '\n'): q2 += 1
+        moved = true
+  for i in first..root:
+    let k = t.nd[i].k
+    if t.nd[i].pos != q and t.nd[i].pos != q2: continue
+    if k == ast.N_VAR or k == ast.N_FUNC or k == ast.N_EXPORTDEFAULT or k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET or k == ast.N_PROPASSIGN or k == ast.N_ARROW or k == ast.N_FUNCEXPR: return i
+    # ((/** @type {T} */ x) => ...: the parameter's type, getJSDocTypeTag on a parameter)
+    if k == ast.N_PARAM: return i
+    # (return function ... / return (...) => ...: the returned function's, getNextJSDocCommentLocation;
+    # /** @type {T} */ (x): a type assertion, JSDocTypeAssertion)
+    if k == ast.N_RETURN and jsdoc_fn_of(t, i) >= 0: return i
+    if k == ast.N_PAREN: return i
+  return -1
+
+# A list's items; a lone parameter (x => ...) as one; nothing else
+fn jsdoc_list(t: ast.Ast, n: Int) -> [Int]:
+  if n < 0: return []
+  if t.nd[n].k == ast.N_LIST: return ast.items(t, n)
+  if t.nd[n].k == ast.N_PARAM: return [n]
+  return []
+
+fn jsdoc_unparen(t: ast.Ast, n: Int) -> Int:
+  var x = n
+  while x >= 0 and t.nd[x].k == ast.N_PAREN: x = t.nd[x].a
+  return x
+
+fn jsdoc_fn_of(t: ast.Ast, n: Int) -> Int:
+  if n < 0: return -1
+  let k = t.nd[n].k
+  if k == ast.N_FUNC or k == ast.N_FUNCEXPR or k == ast.N_ARROW: return n
+  if k == ast.N_METHOD or k == ast.N_CTOR or k == ast.N_GET or k == ast.N_SET: return t.nd[n].b
+  if k == ast.N_PROPASSIGN: return jsdoc_fn_of(t, jsdoc_unparen(t, t.nd[n].b))
+  if k == ast.N_EXPORTDEFAULT: return jsdoc_fn_of(t, jsdoc_unparen(t, t.nd[n].a))
+  if k == ast.N_RETURN: return jsdoc_fn_of(t, jsdoc_unparen(t, t.nd[n].a))
+  if k == ast.N_VAR:
+    let ds = jsdoc_list(t, t.nd[n].a)
+    if ds.len == 1 and t.nd[ds[0]].c >= 0: return jsdoc_fn_of(t, jsdoc_unparen(t, t.nd[ds[0]].c))
+  return -1
+
+# A tag's type as a node: JSDoc's * and Object are any; Closure's ?T, !T, T= and bare generic
+# names aren't modeled ("" ok, else why).
+fn jsdoc_type(var t: ast.Ast, src: Str, tg: JTag, fi: Int, var kw: {Str: Int}, var out: Int) -> Str:
+  var a = tg.tpos
+  var b = tg.tend
+  while a < b and (src[a] == ' ' or src[a] == '\t'): a += 1
+  while b > a and (src[b - 1] == ' ' or src[b - 1] == '\t'): b -= 1
+  let text = src[a..b]
+  if text == "*" or text == "Object" or text == "?":
+    let n = ast.node(&t, ast.N_TKW, a, b, fi)
+    t.nd[n].f = scan.W_ANY
+    out = n
+    return ""
+  if text.startswith("?") or text.startswith("!") or text.startswith("...") or text.endswith("="): return "a Closure JSDoc type"
+  for g in ["Array", "Promise", "Map", "Set", "Record", "ReadonlyArray", "Iterable", "Partial", "Readonly", "WeakMap", "WeakSet", "Function"]:
+    if text == g: return "a JSDoc generic type without arguments"
+  # (a type over several lines: each line's leading * left out, as the JSDoc scanner does; the
+  # source copied with those blanked, positions kept)
+  var r = -1
+  if text.find("\n") >= 0:
+    var parts: [Str] = [src[0..a]]
+    var i = a
+    var seg = a
+    while i < b:
+      if src[i] == '\n':
+        var j = i + 1
+        while j < b and (src[j] == ' ' or src[j] == '\t'): j += 1
+        if j < b and src[j] == '*':
+          parts.push(src[seg..j])
+          parts.push(" ")
+          seg = j + 1
+        i = j
+      else: i += 1
+    parts.push(src[seg..b])
+    let s2 = "".join(parts)
+    r = parse.parse_type_at(&t, s2, a, b, fi, &kw)
+  else: r = parse.parse_type_at(&t, src, a, b, fi, &kw)
+  if r < 0: return "a JSDoc type that isn't TypeScript's"
+  out = r
+  return ""
+
+# Sets the file's JSDoc types on what they document; "" or why the file isn't modeled. New type
+# aliases (typedefs) are added to the root statement list, a new root made last.
+fn jsdoc_attach(var t: ast.Ast, src: Str, fi: Int, first: Int, root: Int, var kw: {Str: Int}) -> Str:
+  var aliases: [Int] = []
+  let w = jsdoc_attach1(&t, src, fi, first, root, &kw, &aliases)
+  # (nodes added after the root: a new root last, the old one no longer a file's; also when the
+  # file isn't modeled, as roots must stay each file's last node)
+  if aliases.len > 0 or t.nd.len > root + 1:
+    var its = ast.items(t, root)
+    if w == "":
+      for al in aliases: its.push(al)
+    let nr = ast.list(&t, its, t.nd[root].pos, t.nd[root].end, fi)
+    t.nd[nr].f = t.nd[root].f
+    t.nd[nr].d = t.nd[root].d
+    t.nd[root].d = 0
+  return w
+
+# Where the file's /** comments start: past strings, templates and regular expressions, which the
+# parse found (a regex's quotes would mislead a scan of the text alone).
+fn jsdoc_starts(t: ast.Ast, src: Str, first: Int, root: Int) -> [Int]:
+  var opaque: [Int] = []
+  for i in first..root:
+    let k = t.nd[i].k
+    if k == ast.N_STR or k == ast.N_NOSUBTEMPL or k == ast.N_TEMPL or k == ast.N_REGEX:
+      opaque.push(t.nd[i].pos)
+      # (a leaf's end is its start, the parse not being exact: past its closing quote, '@a/**')
+      var e = t.nd[i].end
+      if e <= t.nd[i].pos and k != ast.N_TEMPL: e = lit_end(src, t.nd[i].pos, k)
+      opaque.push(e)
+  var out: [Int] = []
+  var at = 0
+  while true:
+    let k0 = src[at..src.len].find("/**")
+    if k0 < 0: break
+    let st = at + k0
+    var inside = -1
+    var oi = 0
+    while oi < opaque.len:
+      if st >= opaque[oi] and st < opaque[oi + 1]:
+        if opaque[oi + 1] > inside: inside = opaque[oi + 1]
+      oi += 2
+    if inside >= 0:
+      at = inside
+      continue
+    # (a line comment's text: not a comment start)
+    var ls = st
+    while ls > 0 and src[ls - 1] != '\n': ls -= 1
+    let lc = src[ls..st].find("//")
+    if lc >= 0:
+      at = st + 3
+      continue
+    out.push(st)
+    let ce = src[st + 2..src.len].find("*/")
+    if ce < 0: break
+    at = st + 2 + ce + 2
+  return out
+
+# Where a string, no-substitution template or regular expression literal starting at pos ends.
+fn lit_end(src: Str, pos: Int, k: Int) -> Int:
+  if pos >= src.len: return pos
+  var i = pos + 1
+  if k == ast.N_REGEX:
+    var cls = false
+    while i < src.len and src[i] != '\n':
+      let ch = src[i]
+      if ch == '\\':
+        i += 2
+        continue
+      if ch == '[': cls = true
+      elif ch == ']': cls = false
+      elif ch == '/' and not cls: return i + 1
+      i += 1
+    return i
+  let q = src[pos]
+  while i < src.len:
+    if src[i] == '\\':
+      i += 2
+      continue
+    if src[i] == q: return i + 1
+    i += 1
+  return i
+
+fn jsdoc_attach1(var t: ast.Ast, src: Str, fi: Int, first: Int, root: Int, var kw: {Str: Int}, var aliases: [Int]) -> Str:
+  for st in jsdoc_starts(t, src, first, root):
+    let ee = src[st + 2..src.len].find("*/")
+    if ee < 0: break
+    let e = st + 2 + ee
+    if src[st..e].find("@") < 0: continue
+    var tags: [JTag] = []
+    let w = jsdoc_tags(src, st + 3, e, &tags)
+    if w != "": return w
+    var typing = false
+    var has_typedef = false
+    for tg in tags:
+      if tg.tag == "typedef": has_typedef = true
+    for tg in tags:
+      if tg.tag == "template":
+        # (a generic typedef: not modeled)
+        if has_typedef: return "a JSDoc @template on a typedef"
+        typing = true
+      elif tg.tag == "param" or tg.tag == "arg" or tg.tag == "argument" or tg.tag == "returns" or tg.tag == "return" or tg.tag == "type": typing = true
+      elif tg.tag == "typedef":
+        if tg.tpos < 0 or tg.name == "" or tg.name.find(".") >= 0: return "a JSDoc typedef without a type"
+        var ty = -1
+        let w2 = jsdoc_type(&t, src, tg, fi, &kw, &ty)
+        if w2 != "": return w2
+        let al = ast.node(&t, ast.N_TYPEALIAS, st, e + 2, fi)
+        t.nd[al].s = ast.intern(&t, tg.name)
+        t.nd[al].b = ty
+        # (a module's typedefs are exported: tsc exports them)
+        t.nd[al].d = ast.M_EXPORT
+        aliases.push(al)
+      elif not jsdoc_info_tag(tg.tag): return "a JSDoc tag @" + tg.tag
+    if not typing: continue
+    let tgt = jsdoc_target(t, src, e + 2, first, root)
+    if tgt < 0: return "a JSDoc type on something not a declaration"
+    let fnn = jsdoc_fn_of(t, tgt)
+    var pti = -1
+    # (@template T: the function's type parameters, the tag's {C} constraining each)
+    var tps: [Int] = []
+    for tg in tags:
+      if tg.tag != "template": continue
+      if fnn < 0: return "a JSDoc @template not on a function"
+      if t.nd[fnn].a >= 0: return "a JSDoc @template on a function with type parameters"
+      var con = -1
+      if tg.tpos >= 0:
+        let wc = jsdoc_type(&t, src, tg, fi, &kw, &con)
+        if wc != "": return wc
+      for tname in tg.name.split(","):
+        if tname == "": return "a JSDoc @template without a name"
+        let tpn = ast.node(&t, ast.N_TPARAM, st, e + 2, fi)
+        t.nd[tpn].s = ast.intern(&t, tname)
+        t.nd[tpn].a = con
+        t.nd[tpn].b = -1
+        tps.push(tpn)
+    if tps.len > 0: t.nd[fnn].a = ast.list(&t, tps, st, e + 2, fi)
+    for tg in tags:
+      if tg.tag == "type":
+        if tg.tpos < 0: return "a JSDoc @type without a type"
+        # (before export default: the gate's plain data check, js_unsupported)
+        if t.nd[tgt].k == ast.N_EXPORTDEFAULT: continue
+        if t.nd[tgt].k == ast.N_PAREN:
+          var tyc = -1
+          let w6 = jsdoc_type(&t, src, tg, fi, &kw, &tyc)
+          if w6 != "": return w6
+          t.nd[tgt].k = ast.N_AS
+          t.nd[tgt].b = tyc
+          # (where tsgolint reports it: the expression in the parentheses)
+          if t.nd[tgt].a >= 0: t.nd[tgt].pos = t.nd[t.nd[tgt].a].pos
+          continue
+        if t.nd[tgt].k == ast.N_PARAM:
+          if t.nd[tgt].b >= 0: return "a JSDoc @type on a typed parameter"
+          var typ = -1
+          let w7 = jsdoc_type(&t, src, tg, fi, &kw, &typ)
+          if w7 != "": return w7
+          t.nd[tgt].b = typ
+          continue
+        if t.nd[tgt].k != ast.N_VAR: return "a JSDoc @type not on a variable"
+        let ds = jsdoc_list(t, t.nd[tgt].a)
+        if ds.len != 1: return "a JSDoc @type on several declarations"
+        var ty = -1
+        let w3 = jsdoc_type(&t, src, tg, fi, &kw, &ty)
+        if w3 != "": return w3
+        t.nd[ds[0]].b = ty
+      elif tg.tag == "returns" or tg.tag == "return":
+        if tg.tpos < 0: continue
+        if fnn < 0: return "a JSDoc @returns not on a function"
+        var ty = -1
+        let w4 = jsdoc_type(&t, src, tg, fi, &kw, &ty)
+        if w4 != "": return w4
+        t.nd[fnn].c = ty
+      elif tg.tag == "param" or tg.tag == "arg" or tg.tag == "argument":
+        pti += 1
+        if tg.tpos < 0: continue
+        if fnn < 0: return "a JSDoc @param not on a function"
+        if tg.name == "" or tg.name.find(".") >= 0: return "a JSDoc @param of a nested property"
+        var found = -1
+        let prs = jsdoc_list(t, t.nd[fnn].b)
+        for pr in prs:
+          let pn = t.nd[pr].a
+          if pn >= 0 and t.nd[pn].k == ast.N_ID and t.names[t.nd[pn].s] == tg.name: found = pr
+        # (a destructured parameter: the @param tag at its position, getJSDocParameterTags; a tag
+        # matching no parameter types nothing)
+        if found < 0 and pti < prs.len:
+          let pn2 = t.nd[prs[pti]].a
+          if pn2 >= 0 and (t.nd[pn2].k == ast.N_OBJPAT or t.nd[pn2].k == ast.N_ARRPAT): found = prs[pti]
+        if found < 0: continue
+        if (t.nd[found].f & ast.M_REST) != 0: return "a JSDoc @param of a rest parameter"
+        var ty = -1
+        let w5 = jsdoc_type(&t, src, tg, fi, &kw, &ty)
+        if w5 != "": return w5
+        t.nd[found].b = ty
+        if tg.opt and t.nd[found].c < 0: t.nd[found].f = t.nd[found].f | ast.M_OPTIONAL
+  return ""

@@ -1,4 +1,4 @@
-# vlint: a JavaScript and TypeScript linter, a drop-in replacement for oxlint 1.90.0: the same
+# vlint: a JavaScript and TypeScript linter, a drop-in replacement for oxlint 1.94.0: the same
 # command line, configuration files (.oxlintrc.json), rules and output (lout.vu).
 #
 #   vlint [OPTIONS] [PATH]...     (oxlint's options; see --help)
@@ -132,8 +132,7 @@ const HELP = """
           --lsp                 Start the language server
           --disable-nested-config  Disable the automatic loading of nested configuration files
           --type-aware          Enable rules that require type information
-          --type-check          Enable experimental type checking (includes TypeScript compiler
-                                diagnostics)
+          --type-check          Enable type checking (includes TypeScript compiler diagnostics)
       -h, --help                Prints help information
       -V, --version             Prints version information
   """
@@ -564,13 +563,19 @@ fn lint_one(fs: Fs, w: Work, i: Int, var kw: {Str: Int}, phase: Int, var t: ast.
     return recs
   return rules.lint_upto(w.cx, sev, w.optss[w.sev_of[i]], w.shown[i], w.files[i], src, &kw, phase, &t)
 
+# (16 files, then a successor task in its place: a task runs until it waits, so a worker looping
+# over all the files held its thread for the whole linting, and the type-aware programs queued on
+# those threads couldn't start; one ending lets its thread run what's queued, in turn)
 fn worker(fs: Fs, own w: Shared[Work], own jobs: Chan[Int], own res: Chan[Res], phase: Int):
   var kw = scan.keywords()
   var t = rules.new_tree()
-  while true:
+  var n = 0
+  while n < 16:
     let i = jobs.recv() else return
     let recs = lint_one(fs, w.value, i, &kw, phase, &t)
     res.send(Res(i, recs))
+    n += 1
+  spawn worker(fs, w, jobs, res, phase)
 
 # ---- the cache (--cache): records encoded as text
 
@@ -625,6 +630,22 @@ fn cache_loc(fs: Fs, loc0: Str) -> Str:
     while loc.len > 1 and loc.endswith("/"): loc = loc[0..loc.len - 1]
     loc += "/.vlintcache"
   return loc
+
+# Whether --cache has every file's output (cached_run would check none): then the module graph,
+# which only the checked files' import rules read, needn't be built.
+fn cache_all_hit(fs: Fs, ffi: Ffi, files: [Str], phase: Int, loc: Str, optkey: Str) -> Bool:
+  let cfg = lcache.config_key(fs, ffi, "phase={phase};{optkey}")
+  if cfg == 0: return false
+  let old = lcache.load(fs, loc, cfg)
+  if old.paths.len == 0: return false
+  let fresh = lcache.now_ns(ffi) - 2000000000
+  var st = [0, 0, 0, 0]
+  for f in files:
+    let k = old.at.get(f, -1)
+    if k < 0 or not lcache.stat(ffi, f, &st): return false
+    if st[1] >= fresh or st[2] >= fresh: return false
+    if old.mt[k] != st[1] or old.ct[k] != st[2] or old.ino[k] != st[3] or old.size[k] != st[0]: return false
+  return true
 
 fn cached_run(fs: Fs, ffi: Ffi, own w: Work, jobs0: Int, phase: Int, loc: Str, optkey: Str) -> [[lout.Rec]]:
   var files: [Str] = []
@@ -1182,7 +1203,26 @@ fn ta_in(w: Work) -> TaIn:
 # and the type-aware rules vtsc has run there. With the type check, the type errors come first,
 # program by program, as tsgolint sends them. A file vtsc can't fully type gets neither (no
 # report from types vtsc may have wrong), and stderr names it.
-fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, w: Work, check: Bool, var results: [[lout.Rec]], var shown: [Str]) -> Str:
+# The type-aware plan (lvtsc.plan_lint), started before the linting so the two share the cores, as
+# oxlint runs tsgolint alongside its own rules: none started when there's nothing to type.
+fn ta_start(fs: Fs, os: Os, ffi: Ffi, w: Work, check: Bool, pch: Chan[lvtsc.Plan]) -> Bool:
+  var tin = ta_in(w)
+  var any = check
+  for x in tin.sets:
+    if x != "": any = true
+  if not any: return false
+  var files: [Str] = []
+  swap(&files, &tin.files)
+  var sets: [Str] = []
+  swap(&sets, &tin.sets)
+  spawn ta_plan_bg(fs, os, ffi, files, sets, pch.share())
+  return true
+
+fn ta_plan_bg(fs: Fs, os: Os, ffi: Ffi, own files: [Str], own sets: [Str], own pch: Chan[lvtsc.Plan]):
+  let pl = lvtsc.plan_lint(fs, os, ffi, files, sets)
+  pch.send(pl)
+
+fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, w: Work, check: Bool, pch: Chan[lvtsc.Plan], var results: [[lout.Rec]], var shown: [Str]) -> Str:
   var tin = ta_in(w)
   var files: [Str] = []
   swap(&files, &tin.files)
@@ -1194,7 +1234,10 @@ fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, w: Work, che
   for x in sets:
     if x != "": any = true
   if not any: return ""
-  let pl = lvtsc.plan_lint(fs, os, ffi, files, sets)
+  # (the plan ta_start began)
+  let pl = pch.recv() else return "vlint: the type-aware run stopped"
+  if os.env("VLINT_T") != "": eprint("vlint T@ type-aware plan {os.clock()}")
+
   # the files vtsc couldn't do: their type check (with --type-check) or their rules
   var skipped: [Str] = []
   for i in 0..files.len:
@@ -1216,6 +1259,7 @@ fn type_aware_run(fs: Fs, os: Os, ffi: Ffi, cwd: Str, o: lout.Opts, w: Work, che
     if skipped.len == 1: nf = "1 file"
     eprint("vlint: vtsc couldn't fully type {nf}, so their {what} didn't run: " + ", ".join(names) + more + " (VLINT_VTSC_DEBUG=2 says why).")
   let ms = lvtsc.merge(pl, files, check)
+  if os.env("VLINT_T") != "": eprint("vlint T@ type-aware messages {ms.len} {os.clock()}")
   ta_records(fs, os, cwd, o, w, idx_of, ms, &results, &shown)
   return ""
 
@@ -1441,7 +1485,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     write(HELP + "\n\n")
     return
   if a.version:
-    write("Version: 1.90.0\n\n")
+    write("Version: 1.94.0\n\n")
     return
   if a.lsp:
     eprint("vlint: --lsp isn't supported")
@@ -1600,7 +1644,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       kept.push(files[i] + "")
       kept_conf.push(c)
   # type-aware linting (vtsc): the flag or the root configuration's options.typeAware
-  let type_aware = a.type_check_only or a.type_aware or cf.confs[0].type_aware == 1
+  # (VLINT_TYPE_AWARE=0: without the type-aware part, for measuring the rest)
+  let type_aware = (a.type_check_only or a.type_aware or cf.confs[0].type_aware == 1) and os.env("VLINT_TYPE_AWARE") != "0"
   let type_check = a.type_check_only or a.type_check or cf.confs[0].type_check == 1
   if type_check and not type_aware:
     write("The `--type-check` option requires type-aware linting.\nUse `--type-aware --type-check` or enable `options.typeAware` in your config.\n")
@@ -1711,6 +1756,8 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   # (the type-aware part reads its own copy of the files and rules)
   var work_ta = Work([], [], [], [], [], rules.Cx(o, lmeta.Meta([], [], [], [], [], [], [], [], [], [], {}, {}, [], {}, {}), 1, lmod.new_graph(), false, ffi))
   if type_aware: work_ta = ta_work(kept, shown, sevs, optss, sev_of, o, ffi)
+  let pch: Chan[lvtsc.Plan] = chan(1)
+  if type_aware: let _ = ta_start(fs, os, ffi, work_ta, type_check, pch)
   let nfiles = kept.len
   var fixmask = 0
   if a.fix: fixmask = fixmask | 1
@@ -1757,16 +1804,6 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       for tb in sevs:
         for x in rimport.graph_rules():
           if x != lmeta.M_OXC_NO_BARREL_FILE and tb.len >= m.name.len and tb[x] > 0: need_graph = true
-  if need_graph and phase != 0:
-    var kw = scan.keywords()
-    var gt = rules.new_tree()
-    mg = lmod.build(fs, ffi, kept, shown, threads, full_graph, &kw, &gt)
-    mg.cwd = cwd + ""
-    var need_cycle = false
-    for tb in sevs:
-      if tb.len >= m.name.len and tb[lmeta.M_IMPORT_NO_CYCLE] > 0: need_cycle = true
-    if need_cycle: rimport.cycle_components(&mg)
-  let cx = rules.Cx(o, m, fixmask, mg, os.env("VLINT_ESTREE") != "", ffi)
   # (the cache's key covers the tables)
   var tkey: [Str] = []
   for k in 0..sevs.len:
@@ -1777,6 +1814,22 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       if sevs[k][i] > 0 or op != "": parts.push("{i}:{sevs[k][i]}:{op}")
     tkey.push(",".join(parts))
   let nsevs = lcache.hex16(lcache.hash64(";".join(tkey)))
+  # (--cache with every file's output in it: no file is checked, so no graph; VLINT_CACHE_GRAPH=1
+  # builds it anyway)
+  var graph_skip = false
+  if a.cache and phase != 10 and need_graph and os.env("VLINT_CACHE_GRAPH") != "1":
+    graph_skip = cache_all_hit(fs, ffi, kept, phase, cache_loc(fs, a.loc), "fmt={o.fmt};theme={o.theme};links={o.links};sevs={nsevs}")
+  if graph_skip: need_graph = false
+  if need_graph and phase != 0:
+    var kw = scan.keywords()
+    var gt = rules.new_tree()
+    mg = lmod.build(fs, ffi, kept, shown, threads, full_graph, &kw, &gt)
+    mg.cwd = cwd + ""
+    var need_cycle = false
+    for tb in sevs:
+      if tb.len >= m.name.len and tb[lmeta.M_IMPORT_NO_CYCLE] > 0: need_cycle = true
+    if need_cycle: rimport.cycle_components(&mg)
+  let cx = rules.Cx(o: o, m: m, fixmask: fixmask, mg: mg, jsd: os.env("VLINT_ESTREE") != "", ffi: ffi)
   var work = Work(kept, shown, sevs, optss, sev_of, cx)
   var shown2: [Str] = []
   for s in work.shown: shown2.push(s + "")
@@ -1804,7 +1857,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
         swap(&results[r.idx], &r.recs)
   if os.env("VLINT_T") != "": eprint("vlint T linted {os.clock() - t0}")
   if type_aware:
-    let e = type_aware_run(fs, os, ffi, cwd, o, work_ta, type_check, &results, &shown2)
+    let e = type_aware_run(fs, os, ffi, cwd, o, work_ta, type_check, pch, &results, &shown2)
     if e != "":
       write(e + "\n")
       exit(1)

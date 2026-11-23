@@ -1,0 +1,15 @@
+declare const opts: { byRow?: Record<number, string>; byName?: Record<string, number>; t?: { [k: `x${string}`]: number } };
+declare const i: number;
+const byRow = opts.byRow ?? { 3: 'Catalog Information' };
+export const a = byRow[i] ?? '';
+export const a2: [typeof byRow] = 0;
+const byRow2 = opts.byRow || { 3: 'x', 4: 'y' };
+export const b2: [typeof byRow2] = 0;
+const byName = opts.byName ?? { 3: 1, a: 2 };
+export const b3: [typeof byName] = 0;
+const byRow3 = opts.byRow ?? { 3: 'x', a: 'y' };
+export const b4: [typeof byRow3] = 0;
+const byRow4 = opts.byRow ?? { '3': 'x' };
+export const b5: [typeof byRow4] = 0;
+const byRow5 = opts.byRow ?? { 1.5: 'x' };
+export const b6: [typeof byRow5] = 0;

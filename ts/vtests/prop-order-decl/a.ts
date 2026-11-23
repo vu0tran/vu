@@ -1,0 +1,31 @@
+import type { Frag } from "./b";
+// properties in tsc 7's order: by declaration (file in program order, position), those without
+// one last by name
+declare const fs: Frag[];
+const ps = fs.map((f) => ({ ...f, isCur: true }));
+const n1: number = ps;
+const q = { own: 1, ...fs[0] };
+const n2: number = q;
+type P<T> = { [K in keyof T]: T[K] } & {};
+declare const x1: P<{ [k in 'c' | 'a' as k]: 1 } & { b: 2 }>;
+const y1: number = x1;
+declare const x2: P<{ [k in 'c' | 'a' as k]: 1 } & { [k in 'b' as k]?: 2 }>;
+const y2: number = x2;
+declare const x3: P<{ [k in 'c' | 'a']: 1 } & { [k in 'b']?: 2 }>;
+const y3: number = x3;
+declare const x4: P<{ c: 1; a: 1 } & { [k in 'b' as k]?: 2 }>;
+const y4: number = x4;
+type S = { z: 1; y: 2; x?: 3; w: 4 };
+type Req<T> = { [k in keyof T as undefined extends T[k] ? never : k]: T[k] };
+type Opt<T> = { [k in keyof T as undefined extends T[k] ? k : never]?: T[k] };
+declare const x6: P<Req<S> & Opt<S>>;
+const y6: number = x6;
+type S2 = { z: 1; a: 2; q: 3 };
+type G<T> = { [K in keyof T as `get_${K & string}`]: T[K] };
+declare const g1: P<G<S2>>;
+const h1: number = g1;
+type E<T> = { [K in keyof T as Exclude<K, 'q'>]: T[K] };
+declare const g2: P<E<S2>>;
+const h2: number = g2;
+declare const g3: P<E<S2> & { b: 1 }>;
+const h3: number = g3;

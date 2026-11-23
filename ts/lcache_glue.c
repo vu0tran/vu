@@ -28,6 +28,26 @@ bool vl_stat(const vu_str *path, int64_t *out, int64_t n) {
   return true;
 }
 
+// Whether a path's modification or change time is at t (ns) or later ("racy": a state a cache
+// can't trust yet, as git has it); false when it isn't there.
+bool vl_changed_since(const vu_str *path, int64_t t) {
+  char buf[4096];
+  char *p = buf;
+  if (path->len >= (int64_t)sizeof buf) { p = vu_cstr(path); if (!p) return false; }
+  else {
+    if (memchr(path->data, 0, (size_t)path->len)) return false;
+    memcpy(buf, path->data, (size_t)path->len);
+    buf[path->len] = 0;
+  }
+  struct stat st;
+  int r = stat(p, &st);
+  if (p != buf) free(p);
+  if (r != 0) return false;
+  int64_t m = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+  int64_t c = (int64_t)st.st_ctim.tv_sec * 1000000000 + st.st_ctim.tv_nsec;
+  return m >= t || c >= t;
+}
+
 // A file's or folder's modification time (ns) mixed with its size and inode, 0 when it isn't there.
 int64_t vl_stat_any(const vu_str *path) {
   char buf[4096];
@@ -147,4 +167,108 @@ vu_str vl_readdir(const vu_str *path) {
   vu_str r = vu_str_from(buf, (int64_t)len);
   free(buf);
   return r;
+}
+
+// The checker's workers as processes (tsprog.run_all): forked after the program is read, parsed and
+// bound, so each shares that copy-on-write instead of making its own. Only where this process has
+// one thread: another's locks (malloc's among them) would stay held in the child.
+#include <sys/wait.h>
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+static int vl_child_flag = 0;
+
+int64_t vl_threads(void) {
+#ifdef __APPLE__
+  thread_act_array_t list;
+  mach_msg_type_number_t n = 0;
+  if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) return -1;
+  for (mach_msg_type_number_t i = 0; i < n; i++) mach_port_deallocate(mach_task_self(), list[i]);
+  vm_deallocate(mach_task_self(), (vm_address_t)list, sizeof(thread_t) * n);
+  return (int64_t)n;
+#else
+  FILE *f = fopen("/proc/self/status", "r");
+  if (!f) return -1;
+  char line[256];
+  int64_t n = -1;
+  while (fgets(line, sizeof line, f)) {
+    if (strncmp(line, "Threads:", 8) == 0) { n = atoll(line + 8); break; }
+  }
+  fclose(f);
+  return n;
+#endif
+}
+
+int64_t vl_fork(void) {
+  fflush(stdout);
+  fflush(stderr);
+  pid_t p = fork();
+  if (p == 0) vl_child_flag = 1;
+  return (int64_t)p;
+}
+
+bool vl_is_child(void) { return vl_child_flag != 0; }
+
+// A child's exit status (128 + the signal that stopped it; -1 when it can't be waited for).
+int64_t vl_wait(int64_t pid) {
+  int st = 0;
+  pid_t r;
+  do { r = waitpid((pid_t)pid, &st, 0); } while (r < 0 && errno == EINTR);
+  if (r < 0) return -1;
+  if (WIFEXITED(st)) return (int64_t)WEXITSTATUS(st);
+  if (WIFSIGNALED(st)) return 128 + (int64_t)WTERMSIG(st);
+  return -1;
+}
+
+void vl_exit_now(int64_t code) {
+  fflush(stdout);
+  fflush(stderr);
+  _exit((int)code);
+}
+
+// What path is, following links: 0 nothing (or unreadable), 1 a regular file, 2 a folder, 3 else.
+int64_t vl_kind(const vu_str *path) {
+  char *p = vu_cstr(path);
+  if (!p) return 0;
+  struct stat st;
+  int r = stat(p, &st);
+  free(p);
+  if (r != 0) return 0;
+  if (S_ISREG(st.st_mode)) return 1;
+  if (S_ISDIR(st.st_mode)) return 2;
+  return 3;
+}
+
+// A file's text; ok[0] is 1 when it could be read.
+#include <stdio.h>
+vu_str vl_read_text(const vu_str *path, int64_t *ok, int64_t n) {
+  if (n > 0) ok[0] = 0;
+  char *p = vu_cstr(path);
+  if (!p) return vu_str_from("", 0);
+  FILE *f = fopen(p, "rb");
+  free(p);
+  if (!f) return vu_str_from("", 0);
+  size_t cap = 65536, len = 0;
+  char *buf = malloc(cap);
+  if (!buf) { fclose(f); return vu_str_from("", 0); }
+  for (;;) {
+    if (len == cap) {
+      char *nb = realloc(buf, cap * 2);
+      if (!nb) { free(buf); fclose(f); return vu_str_from("", 0); }
+      buf = nb;
+      cap *= 2;
+    }
+    size_t k = fread(buf + len, 1, cap - len, f);
+    len += k;
+    if (k == 0) break;
+  }
+  int err = ferror(f);
+  fclose(f);
+  vu_str s = vu_str_from(err ? "" : buf, err ? 0 : (int64_t)len);
+  free(buf);
+  if (!err && n > 0) ok[0] = 1;
+  return s;
 }

@@ -1,0 +1,13 @@
+type JV = number | string | boolean | null | JO | JV[];
+type JO = { [k: string]: JV };
+type U = number | string;
+declare const x1: { f: JV } & { z?: number };
+const a: number = x1.f;
+declare const x2: { f: JV } & { z: number };
+const b: number = x2.f;
+declare const x3: { f: U } & { z: number };
+const c: number = x3.f;
+declare const x4: { f: JO } & { z: number };
+const d: number = x4.f;
+declare const x5: { f: JV };
+const e: number = x5.f;

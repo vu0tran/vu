@@ -1236,8 +1236,14 @@ fn lower_try(c: Ctx, var b: Builder, var e: Env, n: Int, parent_scope: Int):
   var finally_kw = nosp()
   if nd.d > 0: finally_kw = Sp(c.t.nd[nd.a].end, c.t.nd[nd.d].pos)
   let cont = rc_build.reserve(&e)
+  # (oxlint 1.94 reports a `finally` as a todo but still lowers it: without a catch, the try block
+  # and the finally block are plain blocks one after the other; with one, the finally block follows
+  # the try statement)
   if nd.c <= 0:
-    rec(&e, rc_diags_hand.todo_build_hir_lower_statement_handle_try_statement_without_catch_clause(try_kw, finally_kw))
+    if not rec(&e, rc_diags_hand.todo_build_hir_lower_statement_handle_try_statement_without_catch_clause(try_kw, finally_kw)): return
+    lower_block_statement(c, &b, &e, items(c, c.t.nd[nd.a].a), block_scope(c, nd.a), parent_scope)
+    if e.failed: return
+    if nd.d > 0: lower_block_statement(c, &b, &e, items(c, c.t.nd[nd.d].a), block_scope(c, nd.d), parent_scope)
     return
   let hsp = catch_span(c, n)
   if nd.d > 0:
@@ -1283,6 +1289,7 @@ fn lower_try(c: Ctx, var b: Builder, var e: Env, n: Int, parent_scope: Int):
   b.handlers.pop()
   rc_build.leave_reserved(&b, &w2, goto(cont, rc_hir.GV_TRY, tsp))
   rc_build.terminate_with_continuation(&b, rc_hir.Try(tblk, tsp, has_binding, binding, hblk, spn(c, nd.c), cont, 0, sp), cont, rc_hir.BK_BLOCK)
+  if nd.d > 0: lower_block_statement(c, &b, &e, items(c, c.t.nd[nd.d].a), block_scope(c, nd.d), parent_scope)
 
 # lower_variable_declaration
 fn lower_variable_declaration(c: Ctx, var b: Builder, var e: Env, n: Int):
@@ -1750,8 +1757,23 @@ fn lower_update(c: Ctx, var b: Builder, var e: Env, n: Int) -> InstrValue:
   if nk(c, target) == ast.N_ID:
     let y = ref_sym(c, target)
     if rc_build.is_context_identifier(c, b, y):
-      if not rec(&e, rc_diags.todo_build_hir_lower_expression_handle_update_expression_variables_captured_within_lambdas(sp)): return undefined_value(nosp())
-      return undefined_value(sp)
+      # (oxlint 1.94 lowers it as a compound assignment: load, add or subtract 1, store; the value
+      # is the old one for x++, the new one for ++x)
+      let csp = spn(c, target)
+      let cname = nm(c, target)
+      var lp = lower_identifier(c, &b, &e, cname, csp, y)
+      if e.failed: return undefined_value(nosp())
+      let prev = lower_value_to_temporary(&b, &e, rc_hir.LoadContext(lp, csp, false))
+      var bop = T_PLUS
+      if nd.f == T_DEC: bop = T_MINUS
+      let one = lower_value_to_temporary(&b, &e, rc_hir.Primitive(prim_num(1.0), nosp()))
+      let updated = lower_value_to_temporary(&b, &e, rc_hir.BinaryExpression(bop, prev, one, sp))
+      let cb = rc_build.resolve_identifier(&b, &e, c, cname, csp, y)
+      if e.failed: return undefined_value(nosp())
+      if cb.kind == 0: lower_value_to_temporary(&b, &e, rc_hir.StoreContext(LValue(pl(cb.id, csp), rc_hir.IK_REASSIGN), updated, sp))
+      var res = prev
+      if prefix: res = updated
+      return rc_hir.LoadLocal(res, res.sp)
     let isp = spn(c, target)
     let name = nm(c, target)
     let bnd = rc_build.resolve_identifier(&b, &e, c, name, isp, y)
@@ -2345,8 +2367,10 @@ fn lower_assignment_expression(c: Ctx, var b: Builder, var e: Env, n: Int) -> In
     if r.identifier >= 0: return rc_hir.LoadLocal(r, r.sp)
     return rc_hir.LoadLocal(right, sp)
   if nd.f == scan.T_ANDEQ or nd.f == scan.T_OREQ or nd.f == scan.T_QQEQ:
-    if not rec(&e, rc_diags.todo_logical_assignment_operators_not_yet_supported(sp)): return undefined_value(nosp())
-    return undefined_value(sp)
+    if simple_target(c, left) == 0:
+      if not rec(&e, rc_diags.todo_logical_assignment_operators_not_yet_supported(sp)): return undefined_value(nosp())
+      return undefined_value(sp)
+    return lower_logical_assignment(c, &b, &e, n, left)
   let bop = compound_op(nd.f)
   let st = simple_target(c, left)
   if st == 1:
@@ -2389,6 +2413,85 @@ fn lower_assignment_expression(c: Ctx, var b: Builder, var e: Env, n: Int) -> In
     return rc_hir.ComputedStore(lm.object, lm.prop, res, msp)
   if not rec(&e, rc_diags.todo_compound_assignment_complex_pattern_not_yet_supported(sp)): return undefined_value(nosp())
   return undefined_value(sp)
+
+# `x ||= v`, `x &&= v`, `x ??= v` (oxlint 1.94; earlier a todo): a logical expression whose right
+# side stores v into the target (an identifier or a member), as `x || (x = v)`
+fn lower_logical_assignment(c: Ctx, var b: Builder, var e: Env, n: Int, left: Int) -> InstrValue:
+  let nd = c.t.nd[n]
+  let sp = spn(c, n)
+  var op = T_OR
+  if nd.f == scan.T_ANDEQ: op = T_AND
+  elif nd.f == scan.T_QQEQ: op = T_QQ
+  let st = simple_target(c, left)
+  var id = -1
+  var isp = nosp()
+  var name = ""
+  var y = -1
+  var bnd = VarBinding(2, -1, 0, "", "", "")
+  if st == 1:
+    id = inner_expr(c, left)
+    isp = spn(c, id)
+    name = nm(c, id)
+    y = ref_sym(c, id)
+    bnd = rc_build.resolve_identifier(&b, &e, c, name, isp, y)
+    if e.failed: return undefined_value(nosp())
+    if bnd.kind == 0 and bnd.binding_kind == rc_sem.BK_CONST:
+      if not rec(&e, rc_diags_hand.logical_assignment_to_const(name, isp)): return undefined_value(nosp())
+      return undefined_value(sp)
+  let cont = rc_build.reserve(&e)
+  let ck = b.cur_kind
+  let test_blk = rc_build.reserve(&e)
+  let place = rc_build.temp_place(&e, sp)
+  let left_place = rc_build.temp_place(&e, spn(c, left))
+  let cblk = rc_build.reserve(&e)
+  let ablk = rc_build.reserve(&e)
+  rc_build.terminate_with_continuation(&b, rc_hir.Logical(op, test_blk, cont, 0, sp), test_blk, rc_hir.BK_VALUE)
+  var object = noplace()
+  var is_lit = false
+  var lit = plit_str("")
+  var prop = noplace()
+  var computed = false
+  var psp = nosp()
+  var msp = nosp()
+  var left_value = noplace()
+  if st == 1:
+    let lp = lower_identifier(c, &b, &e, name, isp, y)
+    if e.failed: return undefined_value(nosp())
+    if rc_build.is_context_identifier(c, b, y): left_value = lower_value_to_temporary(&b, &e, rc_hir.LoadContext(lp, isp, false))
+    else: left_value = lower_value_to_temporary(&b, &e, rc_hir.LoadLocal(lp, isp))
+  else:
+    var m = left
+    if not is_member(c, m): m = inner_expr(c, m)
+    msp = spn(c, m)
+    var lm = lower_member_expression(c, &b, &e, m, noplace(), false)
+    if e.failed: return undefined_value(nosp())
+    var v = undefined_value(nosp())
+    swap(&v, &lm.value)
+    left_value = lower_value_to_temporary(&b, &e, v)
+    object = lm.object
+    is_lit = lm.is_lit
+    lit = plcopy(lm.lit)
+    prop = lm.prop
+    computed = lm.computed
+    psp = lm.prop_sp
+  rc_build.push(&b, &e, Instruction(0, left_place, rc_hir.LoadLocal(left_value, sp), sp, [], false))
+  var w = rc_build.enter_reserved(&b, cblk, rc_hir.BK_VALUE)
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), left_place, left_place.sp))
+  rc_build.leave_reserved(&b, &w, goto(cont, rc_hir.GV_BREAK, left_place.sp))
+  var w2 = rc_build.enter_reserved(&b, ablk, rc_hir.BK_VALUE)
+  let right = lower_expression_to_temporary(c, &b, &e, nd.b)
+  if e.failed: return undefined_value(nosp())
+  if st == 1:
+    if bnd.kind == 0:
+      if rc_build.is_context_identifier(c, b, y): lower_value_to_temporary(&b, &e, rc_hir.StoreContext(LValue(pl(bnd.id, isp), rc_hir.IK_REASSIGN), right, isp))
+      else: lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(pl(bnd.id, isp), rc_hir.IK_REASSIGN), right, isp))
+    else: lower_value_to_temporary(&b, &e, rc_hir.StoreGlobal(name, right, isp))
+  elif is_lit: lower_value_to_temporary(&b, &e, rc_hir.PropertyStore(object, lit, computed, psp, right, msp))
+  else: lower_value_to_temporary(&b, &e, rc_hir.ComputedStore(object, prop, right, msp))
+  lower_value_to_temporary(&b, &e, rc_hir.StoreLocal(LValue(place, rc_hir.IK_CONST), right, right.sp))
+  rc_build.leave_reserved(&b, &w2, goto(cont, rc_hir.GV_BREAK, right.sp))
+  rc_build.terminate_with_continuation(&b, rc_hir.Branch(left_place, cblk, ablk, cont, 0, sp), cont, ck)
+  return rc_hir.LoadLocal(place, place.sp)
 
 # ---- optional chains
 

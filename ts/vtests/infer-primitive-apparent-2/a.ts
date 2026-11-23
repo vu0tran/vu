@@ -1,0 +1,11 @@
+declare function g<T>(x: Iterable<T> | ArrayLike<T>): T[];
+declare function k<T>(x: ArrayLike<T>): T[];
+declare function m<T>(x: { length: T }): T[];
+declare function v<T>(x: { valueOf(): T }): T;
+declare const s: string;
+export const a: number = g(s);
+export const b: number = k("ab");
+export const c: number = m(s);
+export const d: boolean = v(1);
+export const e: number = v(true);
+export const f: number = Array.from(s).some((ch) => ch.charCodeAt(0) < 32);

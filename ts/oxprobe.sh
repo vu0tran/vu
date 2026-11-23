@@ -35,7 +35,8 @@ OX=${OXLINT:-$(command -v oxlint || true)}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # (the summary line "N problems" and blank lines are dropped; the rest sorted)
-norm() { grep -v -e '^$' -e '^[0-9]* problems\?$' -e '^Found [0-9]' | sort; }
+# (vlint's note naming the files vtsc couldn't type is its own, with nothing of oxlint's to match)
+norm() { grep -v -e '^$' -e '^[0-9]* problems\?$' -e '^Found [0-9]' -e "^vlint: vtsc couldn't fully type" | sort; }
 bad=0
 for d in "${dirs[@]}"; do
   [ -d "$d" ] || { echo "$d: not a folder"; bad=1; continue; }

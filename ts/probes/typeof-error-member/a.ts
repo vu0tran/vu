@@ -1,0 +1,13 @@
+import { X, S } from './missing';
+type R = (typeof X.results)[number];
+type M = typeof S.method.get | typeof S.method.put;
+type Q = typeof X;
+type Q2 = typeof X.results;
+declare const r: R;
+declare const m: M;
+declare const q: Q;
+declare const q2: Q2;
+export const a1 = r.result;
+export const a2 = m.parent;
+export const a3 = q.z;
+export const a4 = q2.z;

@@ -1,0 +1,13 @@
+type Lead = { kind: 'a'; offers: { p: string; q: boolean }[] } | { kind: 'b'; offers: { p: number }[]; extra?: string };
+type SL = Lead & { id: string };
+declare const lead: SL;
+declare const one: { kind: 'a' };
+declare const two: { kind: 'a' } | { kind: 'b' };
+const o = { p: 'x', q: true } satisfies (typeof lead.offers)[number];
+const n: number = null as unknown as typeof lead.offers;
+const k: number = null as unknown as typeof lead.kind;
+const k1: number = null as unknown as typeof one.kind;
+const k2: number = null as unknown as typeof two.kind;
+let k3: typeof two.kind = 'b';
+const k4: number = k3;
+export { o, n, k, k1, k2, k4 };

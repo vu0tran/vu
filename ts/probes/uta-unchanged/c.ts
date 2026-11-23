@@ -1,0 +1,17 @@
+declare const p1: { x: string };
+declare const p2: { x: number };
+declare const p3: { x: number | string };
+declare const p4: { x: any };
+declare const p5: () => any;
+declare const p6: (a: any) => void;
+declare const p7: Array<string>;
+declare const p8: { x: unknown };
+export const q1 = p1 as { x: any };
+export const q2 = p2 as { x: number | string };
+export const q3 = p3 as { x: number };
+export const q4 = p4 as { x: number };
+export const q5 = p5 as () => string;
+export const q6 = p6 as (a: string) => void;
+export const q7 = p7 as Array<any>;
+export const q8 = p8 as { x: any };
+export const q9 = p4 as { x: number; y: string };

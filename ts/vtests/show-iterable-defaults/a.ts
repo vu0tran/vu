@@ -1,0 +1,14 @@
+declare const a: Iterable<string>;
+const n1: number = a;
+declare const b: Iterable<string, void>;
+const n2: number = b;
+declare const c: AsyncIterable<number, any, any>;
+const n3: number = c;
+declare const d: IterableIterator<string>;
+const n4: number = d;
+declare const e: Generator<number>;
+const n5: number = e;
+declare function f(x: Iterable<unknown> | null): void;
+f(1);
+declare const g: Set<string>;
+const n6: number = g.values();
