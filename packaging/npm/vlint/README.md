@@ -1,7 +1,8 @@
 # vlint
 
 An oxlint-compatible linter written in [Vu](https://github.com/vu0tran/vu), meant as a drop-in
-replacement for oxlint 1.90.0: the same command line, configuration files, output and exit codes.
+replacement for oxlint 1.94.0, with tsgolint 7.0.2008's type-aware rules run without tsgolint: the
+same command line, configuration files, output and exit codes.
 It runs oxlint's default rules and about 215 of the rules projects most often turn on, reads
 `.oxlintrc.json`, and checks `.js .mjs .cjs .jsx .ts .mts .cts .tsx` plus the scripts in `.vue`,
 `.astro` and `.svelte` files.
@@ -20,8 +21,8 @@ scripts, change one line in `package.json`:
 
 ```diff
    "devDependencies": {
--    "oxlint": "^1.90.0"
-+    "oxlint": "npm:@vu0tran/vlint@^0.4.0"
+-    "oxlint": "^1.94.0"
++    "oxlint": "npm:@vu0tran/vlint@^0.5.0"
    }
 ```
 

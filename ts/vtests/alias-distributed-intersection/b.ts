@@ -1,0 +1,13 @@
+type NN3<T> = T & {};
+type Mock<T> = { m: T } & T;
+declare const q1: { a: NonNullable<'A' | 'B' | null> };
+export const r1: number = q1;
+declare const q2: { a: NN3<'A' | 'B' | null> };
+export const r2: number = q2;
+declare function g<T>(t: T): { a: NonNullable<T>; b: NN3<T>; c: NonNullable<T | undefined> };
+export const r3: number = g('A' as 'A' | 'B' | null);
+export const r4: number = g('A' as 'A' | 'B');
+export const r5: number = g('A' as 'A');
+export const r6: number = g({ z: 1 } as { z: 1 } | null);
+declare function h<T>(t: T): { a: Mock<T> };
+export const r7: number = h({ z: 1 } as { z: 1 } | { y: 2 });

@@ -3088,3 +3088,23 @@ main), the same output each time. `tests/run_split.sh`'s check that no part has 
 runtime's state looked only at the compiler, which doesn't use Memo: it now checks a split build of
 vgolint too (Memo, tasks, channels), and fails on the old compiler with `vu_memo_cond` and
 `vu_memo_lock` defined in more than one part.
+
+**`vu build --profile` over a long run (2026-11-23).** The profiler kept its first 65,536 samples
+and dropped the rest, so a run past about a minute of CPU on one core (or 6.5 s across ten) was
+profiled only at its start: vlint's 372 s of CPU came out as its first phase alone. Past the first
+65,536 ticks, tick i now replaces a random row with probability 65,536/(i+1) (reservoir sampling;
+the random number is a hash of i, so the signal handler shares no state), and the rows stay a
+uniform sample of the whole run, in the same memory.
+
+**vlint 0.5.0: oxlint 1.94.0 and tsgolint 7.0.2008 (2026-11-23).** vlint follows oxlint 1.94.0
+now (`--version`, `--help` and `--rules` print the same bytes), and its type-aware rules, which run
+on vtsc's types without tsgolint, follow tsgolint 7.0.2008. `no-deprecated` and
+`no-unnecessary-type-assertion` are ported. On a React monorepo with its dependencies installed and
+its own configuration, 207,757 of tsgolint's 207,907 type-aware diagnostics come out the same
+(99.93%; in the files vtsc types, 64 missing and 51 extra; 81 files vtsc can't fully type hold
+the other 174), and the other rules give the same output except 9 diagnostics of
+`react/preserve-manual-memoization`, which isn't implemented. Cold, on a 10-core Mac: vlint 33.6 to
+37.1 s, oxlint 1.94.0 57.2 to 63.1 s; warm with `--cache`, 2.6 s. The cold run went from 41 s to
+about 32 s on the way (plans read each tsconfig once, a tsconfig cache, dense React Compiler state,
+lib types shared by the workers; `ts/NOTES.md` has the list and the profile). 813 vtsc cases and
+108 probes, each made from a difference found on that repository and reduced, are checked in.

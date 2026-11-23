@@ -1,0 +1,12 @@
+export const A = () => <svg role="img" aria-label="x" />;
+export const B = () => <svg role="button" aria-label="x" />;
+export const C = () => <svg role="img button" aria-label="x" />;
+export const D = () => <svg role="status" aria-label="x" />;
+export const E = () => <span role="img" aria-label="x" />;
+export const F = () => <path role="img" aria-label="x" />;
+export const G = () => <math role="img" aria-label="x" />;
+export const H = () => <img role="img" aria-label="x" />;
+export const I = () => <svg role="separator" aria-label="x" />;
+export const J = () => <g role="img" aria-label="x" />;
+export const K = () => <canvas role="img" aria-label="x" />;
+export const L = () => <svg role="group" aria-label="x" />;

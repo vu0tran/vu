@@ -1,0 +1,11 @@
+declare const A: any;
+declare function warn(ctx: { a: string } | Record<string, unknown>, m: string, data?: Record<string, unknown>): void;
+declare function g(o?: { x: number }): void;
+declare function h(o: { x: number } | { y: string }): void;
+declare function k(o: { x: number } | null): void;
+warn({ a: 's' }, 'm', { flip: A, n: A ?? null });
+warn({ b: A }, 'm');
+g({ x: A });
+h({ x: A });
+h({ y: A });
+k({ x: A });

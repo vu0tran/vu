@@ -1,0 +1,16 @@
+type U = 'a' | 'b' | 'c';
+type W<T> = T extends 'a' ? { k: 1 } : { k: 2; t: T };
+type L<T> = T extends 'a' ? 1 : 2 | 3;
+type M<T> = T extends 'a' ? { k: 1 } : T;
+declare const e1: Exclude<U, 'a'>;
+declare const e2: W<U>;
+declare const e3: L<U>;
+declare const e4: M<U>;
+declare const e5: NonNullable<U | null>;
+declare const e6: Extract<{ a: 1 } | { b: 2 } | { c: 3 }, { a: 1 } | { b: 2 }>;
+export const n1: number = e1;
+export const n2: number = e2;
+export const n3: number = e3;
+export const n4: number = e4;
+export const n5: number = e5;
+export const n6: number = e6;

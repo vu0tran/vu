@@ -1,0 +1,11 @@
+declare const o1: { x: number };
+declare const o2: { x: number; y?: string };
+declare const o3: { x: any; y: number };
+declare const o4: Array<{ x: any }>;
+declare const o5: string | number;
+export const r1 = o1 as { x: number; y?: string };
+export const r2 = o2 as { x: number };
+export const r3 = o3 as { x: string; y: number };
+export const r4 = o4 as Array<{ x: number }>;
+export const r5 = o5 as number | string;
+export const r6 = o1 as { readonly x: number };

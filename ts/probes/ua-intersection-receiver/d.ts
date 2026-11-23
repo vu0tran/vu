@@ -1,0 +1,14 @@
+import { Address } from './missing';
+declare const ADDRESS: Address;
+declare const ANY: any;
+type I1 = { address: string } & { m: number };
+type I2 = { address: Address } & { m: number };
+declare function f1(o: I1): void;
+declare function f2(o: I2): void;
+declare function f3(o: { address: string; m: number }): void;
+f1({ address: ADDRESS, m: 1 });
+f1({ address: ANY, m: 1 });
+f2({ address: ADDRESS, m: 1 });
+f2({ address: ANY, m: 1 });
+f3({ address: ADDRESS, m: 1 });
+export const v1: I1 = { address: ANY, m: 1 };

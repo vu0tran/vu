@@ -61,12 +61,47 @@ fn primary_reason(rs: Int) -> Int:
 
 # ---- the state
 
+# (dense, so that a clone is a few list copies: values by value id (vk, ids from new_vid) and by
+# identifier (ik, from_identifier's), each an AV packed as kind << 32 | reasons, -1 none;
+# vars: an identifier's one value (v1), -1 none, or where its several are in vm, in their order)
 type St:
   is_fe: Bool = false
-  values: {Int: AV} = {}
-  vars: {Int: [Int]} = {}       # identifier -> its values, an ordered set
+  vk: [Int] = []
+  ik: [Int] = []
+  v1: [Int] = []
+  vm: [Int] = []                # several values: at v1[id] = -3 - o, vm[o] their count, then them
+  vm_live: Int = 0              # ... the part still pointed at
   un_id: Int = -1               # the first read of an undefined identifier
   un_sp: Sp = Sp(-1, -1)
+
+const IDV = 1099511627776      # 1 << 40: from_identifier's values
+
+fn pack(v: AV) -> Int:
+  return (v.kind << 32) | v.reason
+
+fn unpack(x: Int) -> AV:
+  return AV(x >> 32, x & 4294967295)
+
+# a value's packed AV, -1 none
+fn vget(s: St, vid: Int) -> Int:
+  if vid >= IDV:
+    let i = vid - IDV
+    if i < s.ik.len: return s.ik[i]
+    return -1
+  if vid >= 0 and vid < s.vk.len: return s.vk[vid]
+  return -1
+
+fn has_value(s: St, vid: Int) -> Bool:
+  return vget(s, vid) >= 0
+
+fn vset(var s: St, vid: Int, v: AV):
+  if vid >= IDV:
+    let i = vid - IDV
+    while s.ik.len <= i: s.ik.push(-1)
+    s.ik[i] = pack(v)
+    return
+  while s.vk.len <= vid: s.vk.push(-1)
+  s.vk[vid] = pack(v)
 
 fn has_id(xs: [Int], x: Int) -> Bool:
   for y in xs:
@@ -77,27 +112,67 @@ fn copy_ints(xs: [Int]) -> [Int]:
   var r = xs[0..xs.len]
   return r
 
+fn is_defined(s: St, id: Int) -> Bool:
+  return id >= 0 and id < s.v1.len and s.v1[id] != -1
+
+# an identifier's values, in their order ([] none)
+fn values_for(s: St, id: Int) -> [Int]:
+  if id < 0 or id >= s.v1.len: return []
+  let x = s.v1[id]
+  if x == -1: return []
+  if x >= 0: return [x]
+  let o = -3 - x
+  var r = s.vm[o + 1..o + 1 + s.vm[o]]
+  return r
+
+fn set_vars(var s: St, id: Int, own vs: [Int]):
+  while s.v1.len <= id: s.v1.push(-1)
+  let old = s.v1[id]
+  if old <= -3: s.vm_live -= s.vm[-3 - old] + 1
+  if vs.len == 1:
+    s.v1[id] = vs[0]
+    return
+  s.v1[id] = -3 - s.vm.len
+  s.vm.push(vs.len)
+  for v in vs: s.vm.push(v)
+  s.vm_live += vs.len + 1
+
 fn clone_state(s: St) -> St:
   var n = St()
   n.is_fe = s.is_fe
-  for k, v in s.values: n.values[k] = AV(v.kind, v.reason)
-  for k, v in s.vars: n.vars[k] = copy_ints(v)
+  n.vk = copy_ints(s.vk)
+  n.ik = copy_ints(s.ik)
+  n.v1 = copy_ints(s.v1)
+  if s.vm.len <= 2 * s.vm_live + 64:
+    n.vm = copy_ints(s.vm)
+    n.vm_live = s.vm_live
+    return n
+  # (mostly segments nothing points at: the live ones packed again)
+  for id in 0..n.v1.len:
+    let x = n.v1[id]
+    if x > -3: continue
+    let o = -3 - x
+    let c = s.vm[o]
+    n.v1[id] = -3 - n.vm.len
+    for k in o..o + c + 1: n.vm.push(s.vm[k])
+  n.vm_live = n.vm.len
   return n
 
 fn kind_sp(var s: St, id: Int, sp: Sp) -> AV:
-  if not (id in s.vars):
+  if not is_defined(s, id):
     if s.un_id < 0:
       s.un_id = id
       s.un_sp = sp
     return av(VK_MUTABLE, rc_hir.VR_OTHER)
   var have = false
   var m = AV(0, 0)
-  for vid in s.vars[id]:
-    if not (vid in s.values): continue
-    let k = s.values[vid]
+  for vid in values_for(s, id):
+    let x = vget(s, vid)
+    if x < 0: continue
+    let k = unpack(x)
     if have: m = merge_av(m, k)
     else:
-      m = AV(k.kind, k.reason)
+      m = k
       have = true
   if not have: return av(VK_MUTABLE, rc_hir.VR_OTHER)
   return m
@@ -106,42 +181,35 @@ fn kind(var s: St, id: Int) -> AV:
   return kind_sp(&s, id, rc_hir.nosp())
 
 fn initialize(var s: St, vid: Int, v: AV):
-  s.values[vid] = AV(v.kind, v.reason)
+  vset(&s, vid, v)
 
 fn define(var s: St, id: Int, vid: Int):
-  s.vars[id] = [vid]
+  set_vars(&s, id, [vid])
 
 fn from_identifier(id: Int) -> Int:
-  return id + (1 << 40)
+  return id + IDV
 
 fn assign(var s: St, into: Int, from: Int):
-  if from in s.vars:
-    s.vars[into] = copy_ints(s.vars[from])
+  if is_defined(s, from):
+    set_vars(&s, into, values_for(s, from))
     return
   let vid = from_identifier(from)
-  if not (vid in s.values): s.values[vid] = av(VK_MUTABLE, rc_hir.VR_OTHER)
-  s.vars[into] = [vid]
+  if not has_value(s, vid): vset(&s, vid, av(VK_MUTABLE, rc_hir.VR_OTHER))
+  set_vars(&s, into, [vid])
 
 fn append_alias(var s: St, place: Int, value: Int):
-  if not (value in s.vars) or not (place in s.vars): return
-  let nv = copy_ints(s.vars[value])
-  var pv = copy_ints(s.vars[place])
+  if not is_defined(s, value) or not is_defined(s, place): return
+  let nv = values_for(s, value)
+  var pv = values_for(s, place)
   for v in nv:
     if not has_id(pv, v): pv.push(v)
-  s.vars[place] = pv
-
-fn is_defined(s: St, id: Int) -> Bool:
-  return id in s.vars
-
-fn values_for(s: St, id: Int) -> [Int]:
-  if id in s.vars: return copy_ints(s.vars[id])
-  return []
+  set_vars(&s, place, pv)
 
 fn freeze_value(var s: St, vid: Int, reason: Int):
-  s.values[vid] = av(VK_FROZEN, reason)
+  vset(&s, vid, av(VK_FROZEN, reason))
 
 fn freeze(var s: St, id: Int, reason: Int) -> Bool:
-  if not (id in s.vars): return false
+  if not is_defined(s, id): return false
   let k = kind(&s, id).kind
   if k == VK_CONTEXT or k == VK_MUTABLE or k == VK_MAYBE_FROZEN:
     for vid in values_for(s, id): freeze_value(&s, vid, reason)
@@ -157,57 +225,63 @@ fn union_into(var this: [Int], other: [Int]):
   for v in other:
     if not has_id(this, v): this.push(v)
 
+# (one packed list merged into another: b's values a lacks added, both's merged; whether a changed)
+fn merge_packed(var a: [Int], b: [Int]) -> Bool:
+  var changed = false
+  for i in 0..b.len:
+    let ov = b[i]
+    if ov < 0: continue
+    while a.len <= i: a.push(-1)
+    let t = a[i]
+    if t < 0:
+      a[i] = ov
+      changed = true
+      continue
+    let tv = unpack(t)
+    let m = merge_av(tv, unpack(ov))
+    if m.kind != tv.kind or not is_superset(tv.reason, m.reason):
+      a[i] = pack(m)
+      changed = true
+  return changed
+
+# (b's vars merged into a's: an identifier a lacks gets b's values, one both have their union)
+fn merge_vars(var a: St, b: St) -> Bool:
+  var changed = false
+  for id in 0..b.v1.len:
+    if b.v1[id] == -1: continue
+    let ov = values_for(b, id)
+    if is_defined(a, id):
+      var tv = values_for(a, id)
+      if contributes_new_value(tv, ov):
+        union_into(&tv, ov)
+        set_vars(&a, id, tv)
+        changed = true
+    else:
+      set_vars(&a, id, ov)
+      changed = true
+  return changed
+
 # merge: [] when nothing changes
 fn merge(a: St, b: St) -> [St]:
-  var changed = false
   var n = clone_state(a)
-  for id, tv in a.values:
-    if id in b.values:
-      let m = merge_av(tv, b.values[id])
-      if m.kind != tv.kind or not is_superset(tv.reason, m.reason):
-        n.values[id] = m
-        changed = true
-  for id, ov in b.values:
-    if not (id in a.values):
-      n.values[id] = AV(ov.kind, ov.reason)
-      changed = true
-  for id, tv in a.vars:
-    if id in b.vars:
-      if contributes_new_value(tv, b.vars[id]):
-        var m = copy_ints(tv)
-        union_into(&m, b.vars[id])
-        n.vars[id] = m
-        changed = true
-  for id, ov in b.vars:
-    if not (id in a.vars):
-      n.vars[id] = copy_ints(ov)
-      changed = true
+  var changed = merge_packed(&n.vk, b.vk)
+  if merge_packed(&n.ik, b.ik): changed = true
+  if merge_vars(&n, b): changed = true
   if not changed: return []
   return [n]
 
 fn merge_from(var a: St, b: St):
-  for id, ov in b.values:
-    if id in a.values:
-      let tv = a.values[id]
-      let m = merge_av(tv, ov)
-      if m.kind != tv.kind or not is_superset(tv.reason, m.reason): a.values[id] = m
-    else: a.values[id] = AV(ov.kind, ov.reason)
-  for id, ov in b.vars:
-    if id in a.vars:
-      if contributes_new_value(a.vars[id], ov):
-        var m = copy_ints(a.vars[id])
-        union_into(&m, ov)
-        a.vars[id] = m
-    else: a.vars[id] = copy_ints(ov)
+  let _ = merge_packed(&a.vk, b.vk)
+  let _ = merge_packed(&a.ik, b.ik)
+  let _ = merge_vars(&a, b)
   a.un_id = -1
 
 fn infer_phi(var s: St, ph: rc_hir.Phi):
   var vals: [Int] = []
   for op in ph.ops:
-    if op.identifier in s.vars:
-      for v in s.vars[op.identifier]:
-        if not has_id(vals, v): vals.push(v)
-  if vals.len > 0: s.vars[ph.place.identifier] = vals
+    for v in values_for(s, op.identifier):
+      if not has_id(vals, v): vals.push(v)
+  if vals.len > 0: set_vars(&s, ph.place.identifier, vals)
 
 # ---- the pass's context
 
@@ -421,7 +495,8 @@ fn find_hoisted_context_declarations(var ic: IC, f: HirFunction, e: Env):
       match f.instructions[iid].value:
         rc_hir.DeclareContext(lv, _):
           let k = lv.kind
-          if k == rc_hir.IK_HOISTED_CONST or k == rc_hir.IK_HOISTED_FUNCTION or k == rc_hir.IK_HOISTED_LET:
+          # (oxlint 1.94: a hoisted function declaration isn't one: it has its value from the start)
+          if k == rc_hir.IK_HOISTED_CONST or k == rc_hir.IK_HOISTED_LET:
             let d = e.identifiers[lv.place.identifier].declaration_id
             ic.hoisted[d] = true
             ic.hoisted_place.remove(d)
@@ -556,10 +631,14 @@ fn apply_signature(var ic: IC, var st: St, iid: Int, ins: Instruction, var e: En
         let err = rc_env.intern_aliasing(&e, mv.identifier, d)
         out.push(rc_hir.ae_err(AE_MUTATE_FROZEN, mv, err))
   var initialized: {Int: Bool} = {}
-  let sig = rc_hir.cp_effects(ic.sig_cache[iid])
-  for x in sig:
-    apply_effect(&ic, &st, x, &initialized, &out, &e)
-    if e.failed: return out
+  # (the cached signature lent out while it's applied: only infer_block, before, writes it)
+  var sig: [AliasingEffect] = []
+  swap(&sig, &ic.sig_cache[iid])
+  for i in 0..sig.len:
+    if e.failed: break
+    apply_effect(&ic, &st, sig[i], &initialized, &out, &e)
+  swap(&sig, &ic.sig_cache[iid])
+  if e.failed: return out
   if not is_defined(st, ins.lvalue.identifier):
     let v = from_identifier(ins.lvalue.identifier)
     initialize(&st, v, av(VK_MUTABLE, rc_hir.VR_OTHER))
@@ -572,7 +651,7 @@ fn freeze_function_captures_transitive(var st: St, ic: IC, e: Env, vid: Int, rea
   var ids: [Int] = []
   for p in e.functions[fid].context: ids.push(p.identifier)
   for id in ids:
-    if not (id in st.vars): continue
+    if not is_defined(st, id): continue
     let k = kind(&st, id).kind
     if k == VK_CONTEXT or k == VK_MUTABLE or k == VK_MAYBE_FROZEN:
       for v in values_for(st, id):
@@ -824,7 +903,9 @@ fn compute_effects_for_legacy_signature(var st: St, sig: rc_shapes.FnSig, lvalue
   var rvr = sig.return_value_reason
   if rvr < 0: rvr = rc_hir.VR_OTHER
   var out: [AliasingEffect] = [rc_hir.ae_create(lvalue, sig.return_value_kind, rvr)]
-  if sig.impure and (not sig.impure_if_no_args or args.len == 0):
+  # (`new Date()` is impure only in the component or hook itself: oxlint 1.94 reports none in a
+  # function expression inside it, called during render or not; Date.now() and the like propagate)
+  if sig.impure and (not sig.impure_if_no_args or (args.len == 0 and not ic.is_fe)):
     let d = rc_diags_hand.impure_function(sig.canonical_name, sp)
     let err = rc_env.intern_aliasing(&e, receiver.identifier, d)
     out.push(rc_hir.ae_err(AE_IMPURE, receiver, err))

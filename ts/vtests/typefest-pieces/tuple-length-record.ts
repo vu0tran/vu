@@ -1,0 +1,13 @@
+type T = [true, false];
+type A = T extends Record<'0', true> ? 't' : 'f';
+const a: 5 = null as unknown as A;
+type B = T extends Record<'length', 2> ? 't' : 'f';
+const b: 5 = null as unknown as B;
+type C = T extends Record<'at', T['at']> ? 't' : 'f';
+const c: 5 = null as unknown as C;
+type D = T extends Record<number, T[number]> ? 't' : 'f';
+const d: 5 = null as unknown as D;
+type IsOpt<Ty extends object, K extends keyof Ty> = K extends keyof Ty ? Ty extends Record<K, Ty[K]> ? false : true : false;
+const e: 5 = null as unknown as IsOpt<T, '0'>;
+const f: 5 = null as unknown as IsOpt<T, 'at'>;
+export {};

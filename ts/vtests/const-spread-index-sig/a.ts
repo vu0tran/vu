@@ -1,0 +1,13 @@
+declare const o: { [k: string]: unknown };
+declare const p: number;
+const a = [ "m", { ...o, target: `http://x:${p}` } ] as const;
+const a1: number = a;
+const b = { ...o, t: 1 } as const;
+const b1: number = b;
+const c1: number = c;
+const d = { x: 1, ...o } as const;
+const d1: number = d;
+declare const q: { [k: string]: number; y: number };
+const e = { ...q, z: 1 } as const;
+const e1: number = e;
+const f1: number = f;

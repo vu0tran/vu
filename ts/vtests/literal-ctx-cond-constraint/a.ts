@@ -1,0 +1,14 @@
+type P1<T> = T extends any ? P2<T> : never;
+type P2<T> = T extends readonly any[] ? `${number}` : { [K in keyof T]-?: K & string }[keyof T];
+type F = { a: number; b: string };
+declare function w<T, N extends P1<T>>(t: T, n: N): { n: N };
+const x = w({} as F, 'a');
+const n1: number = x;
+type Q1<T> = T extends any ? { [K in keyof T]-?: K & string }[keyof T] : never;
+declare function w2<T, N extends Q1<T>>(t: T, n: N): { n: N };
+const x2 = w2({} as F, 'a');
+const n2: number = x2;
+type R1<T> = { [K in keyof T]-?: K & string }[keyof T];
+declare function w3<T, N extends R1<T>>(t: T, n: N): { n: N };
+const x3 = w3({} as F, 'a');
+const n3: number = x3;

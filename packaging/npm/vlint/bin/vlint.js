@@ -8,7 +8,7 @@ const path = require("node:path");
 
 const SCOPE = "@vu0tran";
 const VERSION = "0.0.0";
-const OXLINT = "1.90.0";
+const OXLINT = "1.94.0";
 const PLATFORMS = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"];
 
 function die(msg) {

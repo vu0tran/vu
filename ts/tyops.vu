@@ -37,7 +37,7 @@ fn is_generic(var c: C, t: Int) -> Bool:
 
 fn generic_in(var c: C, t: Int, var seen: {Int: Bool}, depth: Int) -> Bool:
   let k = c.tk[t]
-  if k == TK_TPARAM or k == TK_KEYOF or k == TK_INDEXED or k == TK_COND: return true
+  if k == TK_TPARAM or k == TK_KEYOF or k == TK_INDEXED or k == TK_COND or k == types.TK_NOINFER: return true
   if bind.generic_template(c, t): return true
   if k == TK_UNION or k == TK_INTER:
     for i in 0..c.tb[t]:
@@ -55,9 +55,19 @@ fn generic_in(var c: C, t: Int, var seen: {Int: Bool}, depth: Int) -> Bool:
     return false
   if kind == OK_INST:
     let mm = c.objs[o].mapper
+    let nd0 = c.objs[o].node
     for i in 0..c.mappers[mm].to.len:
+      # (an entry for a type parameter its declaration can't reference: not one of its type
+      # arguments, getObjectTypeInstantiation)
+      let f = c.mappers[mm].from[i]
+      if nd0 >= 0 and nd0 < c.parent.len and c.tk[f] == TK_TPARAM and c.ta[f] >= 0:
+        let fd = c.sdecl[c.ta[f]]
+        if fd >= 0 and c.t.nd[fd].k == ast.N_TPARAM and not bind.possibly_referenced(&c, fd, nd0, c.sname[c.ta[f]]): continue
       if generic_in(&c, c.mappers[mm].to[i], &seen, depth + 1): return true
     return false
+  # (a mapped type's properties over concrete keys and arguments: nothing generic, and its lazy
+  # property types stay unmade, as tsc's isGenericObjectType never reads them)
+  if kind == OK_ANON and o in c.concrete_objs: return false
   if kind == OK_ANON:
     if bind.mentions_tparams(&c, t):
       for name in bind.prop_names(&c, t):
@@ -76,7 +86,7 @@ fn generic_in(var c: C, t: Int, var seen: {Int: Bool}, depth: Int) -> Bool:
 # an object literal type's members: one that may name an enclosing type parameter counts).
 fn free_tvars(var c: C, t: Int, depth: Int) -> Bool:
   let k = c.tk[t]
-  if k == TK_TPARAM or k == TK_KEYOF or k == TK_INDEXED or k == TK_COND: return true
+  if k == TK_TPARAM or k == TK_KEYOF or k == TK_INDEXED or k == TK_COND or k == types.TK_NOINFER: return true
   if bind.generic_template(c, t): return true
   if k == TK_UNION or k == TK_INTER:
     for i in 0..c.tb[t]:
@@ -102,7 +112,7 @@ fn free_tvars(var c: C, t: Int, depth: Int) -> Bool:
 # operator (an object type with type parameters inside still has known keys).
 fn is_deferred(c: C, t: Int) -> Bool:
   let k = c.tk[t]
-  if k == TK_TPARAM or k == TK_KEYOF or k == TK_INDEXED or k == TK_COND: return true
+  if k == TK_TPARAM or k == TK_KEYOF or k == TK_INDEXED or k == TK_COND or k == types.TK_NOINFER: return true
   if bind.generic_template(c, t): return true
   if k == TK_OBJ and c.objs[c.ta[t]].kind == OK_MAPPED: return true
   if k == TK_UNION or k == TK_INTER:
@@ -119,13 +129,12 @@ fn interned(var c: C, key: Str, k: Int, f: Int, a: Int, b: Int) -> Int:
 # ---- keyof
 
 fn keyof_of(var c: C, t: Int) -> Int:
+  if c.inst_exit > 0: bind.budget_tick2(&c, "keyof_of")
   let k = c.tk[t]
   if k == TK_ANY or k == TK_ERROR: return types.union_of(&c, [c.string_t, c.number_t, c.symbol_t])
   if k == TK_UNSUP: return t
   if k == TK_UNKNOWN or k == TK_NONPRIM: return c.never_t
   if k == TK_NEVER: return types.union_of(&c, [c.string_t, c.number_t, c.symbol_t])
-  # (template literal index signatures: their keys aren't modeled)
-  if bind.has_tmpl_index(c, t): return bind.lazy_unsupported(&c, 0, "keyof a type with template literal index signatures")
   if k == TK_OBJ and c.objs[c.ta[t]].kind == OK_MAPPED:
     # a generic mapped type's keys: its constraint (getIndexTypeForMappedType, no as clause)
     let n = c.objs[c.ta[t]].node
@@ -178,7 +187,12 @@ fn keyof_of(var c: C, t: Int) -> Int:
   var keys: [Int] = []
   for name in bind.prop_names(&c, a):
     let text = c.t.names[name] + ""
-    if text.startswith("[Symbol."): continue
+    if text.startswith("[Symbol.") and text.endswith("]"):
+      # (a well-known symbol's member: its unique symbol, getLiteralTypeFromProperty)
+      let wname = ast.intern(&c.t, text[8..text.len - 1])
+      let wt = bind.wk_symbol_type(&c, wname)
+      if wt >= 0: keys.push(wt)
+      continue
     # a property named by a numeric literal gives a number literal key
     if text.startswith("#"): continue
     let ps = bind.get_prop(&c, a, name)
@@ -211,10 +225,19 @@ fn keyof_of(var c: C, t: Int) -> Int:
     keys.push(c.number_t)
   elif ni >= 0 or rel.is_array_ref(&c, a):
     keys.push(c.number_t)
+  # (template literal index signatures: their key types, getIndexType)
+  if c.ta[a] in c.tidx:
+    let txs = types.ints(c.tidx[c.ta[a]])
+    var ti = 0
+    while ti < txs.len:
+      keys.push(txs[ti])
+      ti += 3
   let u = types.union_of(&c, keys)
   if c.tk[u] != TK_UNION: return u
   # getUnionType of a single type is that type (a string index signature alone: string | number)
   if keys.len == 2 and bind.prop_count(&c, a) == 0 and si >= 0: return u
+  # (a mapped type's keys, its as clause's names: a plain union, getIndexTypeForMappedType)
+  if c.tk[t] == TK_OBJ and c.objs[c.ta[t]].node >= 0 and c.t.nd[c.objs[c.ta[t]].node].k == ast.N_TMAPPED: return u
   # the union remembers it was keyof T (it prints that way) for a class, an interface, a generic
   # type's reference or an aliased type only
   if c.tk[t] == TK_OBJ and not (t in c.t_alias):
@@ -228,6 +251,7 @@ fn keyof_of(var c: C, t: Int) -> Int:
 # ---- indexed access
 
 fn indexed_of(var c: C, o: Int, i0: Int) -> Int:
+  if c.inst_exit > 0: bind.budget_tick2(&c, "indexed_of")
   # (an error type as the index: any, as tsc's errorType is)
   var i = i0
   if c.tk[i] == TK_ERROR: i = c.any_t
@@ -236,6 +260,75 @@ fn indexed_of(var c: C, o: Int, i0: Int) -> Int:
   if ok == TK_UNSUP: return o
   if ik == TK_UNSUP: return i
   if ok == TK_ANY or ok == TK_ERROR: return o
+  # (unknown[K], a concrete K, made by instantiation: no property, no index signature, so
+  # unknown, getIndexedAccessType without an access node; written, bind reports it)
+  if ok == TK_UNKNOWN and not is_deferred(c, i): return o
+  # (object[K] made by instantiation: its apparent type {} has no property, unknown)
+  if ok == types.TK_NONPRIM and c.inst_noacc and not is_deferred(c, i): return c.unknown_t
+  # (a template literal index type: the template literal index signatures it's assignable to,
+  # intersected, else a string index signature; isApplicableIndexType. The object needn't be free
+  # of type parameters, only not generic: Record<K, O>[`fd${number}`] is O, isGenericObjectType)
+  if ik == types.TK_TEMPLATE and not chk.could_contain_tvars(&c, i) and not is_deferred(c, o):
+    let ta0 = rel.apparent(&c, o)
+    if c.tk[ta0] == TK_OBJ: bind.ensure_resolved(&c, ta0)
+    # (an intersection: its members' index signatures together, resolveIntersectionTypeMembers)
+    if c.tk[ta0] == TK_INTER:
+      var ivs: [Int] = []
+      var isis: [Int] = []
+      var all_obj = true
+      for ii_t in 0..types.ninter(c, ta0):
+        let m0 = types.inter_at(c, ta0, ii_t)
+        if c.tk[m0] == TK_NONPRIM or c.tk[m0] == TK_UNKNOWN: continue
+        let am0 = rel.apparent(&c, m0)
+        if c.tk[am0] != TK_OBJ:
+          all_obj = false
+          break
+        bind.ensure_resolved(&c, am0)
+        if c.ta[am0] in c.tidx:
+          let txs0 = types.ints(c.tidx[c.ta[am0]])
+          var tj = 0
+          while tj < txs0.len:
+            if rel.assignable(&c, i, txs0[tj]): ivs.push(txs0[tj + 1])
+            tj += 3
+        let msi = bind.index_type(&c, am0, false)
+        if msi >= 0: isis.push(msi)
+      if all_obj and ivs.len > 0: return types.inter_of(&c, ivs)
+      if all_obj and isis.len > 0: return types.inter_of(&c, isis)
+    if c.tk[ta0] == TK_OBJ and c.ta[ta0] in c.tidx:
+      let txs = types.ints(c.tidx[c.ta[ta0]])
+      var vs: [Int] = []
+      var ti = 0
+      while ti < txs.len:
+        if rel.assignable(&c, i, txs[ti]): vs.push(txs[ti + 1])
+        ti += 3
+      if vs.len > 0: return types.inter_of(&c, vs)
+      let tsi = bind.index_type(&c, ta0, false)
+      if tsi >= 0: return tsi
+    # (made by instantiation, an object with no index signature for it: no property, unknown,
+    # getIndexedAccessType without an access node; react-hook-form's PathValue's T[P] there)
+    if c.inst_noacc and c.tk[ta0] == TK_OBJ and c.objs[c.ta[ta0]].kind != OK_TUPLE and not rel.is_array_ref(&c, ta0) and bind.index_type(&c, ta0, false) < 0 and bind.index_type(&c, ta0, true) < 0 and bind.symbol_index(&c, ta0) < 0: return c.unknown_t
+  # ((A & B)[`a${string}`]: the intersection's index signatures, its members' together, the
+  # ones it's assignable to intersected, else their string index signatures)
+  if ik == types.TK_TEMPLATE and ok == TK_INTER and not chk.could_contain_tvars(&c, i) and not is_deferred(c, o):
+    var vs2: [Int] = []
+    var sis: [Int] = []
+    var all_obj = true
+    for ii_t in 0..types.ninter(c, o):
+      let mo = rel.apparent(&c, types.inter_at(c, o, ii_t))
+      if c.tk[mo] != TK_OBJ:
+        all_obj = false
+        break
+      bind.ensure_resolved(&c, mo)
+      if c.ta[mo] in c.tidx:
+        let txs2 = types.ints(c.tidx[c.ta[mo]])
+        var tj = 0
+        while tj < txs2.len:
+          if rel.assignable(&c, i, txs2[tj]): vs2.push(txs2[tj + 1])
+          tj += 3
+      let si2 = bind.index_type(&c, mo, false)
+      if si2 >= 0: sis.push(si2)
+    if all_obj and vs2.len > 0: return types.inter_of(&c, vs2)
+    if all_obj and sis.len > 0: return types.inter_of(&c, sis)
   # (T[never]: never, the empty union of keys)
   if ik == TK_NEVER and not is_deferred(c, o): return i
   # (never[K]: never, getIndexedAccessType of never)
@@ -250,14 +343,34 @@ fn indexed_of(var c: C, o: Int, i0: Int) -> Int:
       return bind.index_type(&c, o, false)
   # an element access expression waits only for a generic index (tsc's accessNode rule)
   if (is_deferred(c, o) and not (c.eager_index and c.tk[o] == TK_INTER)) or is_deferred(c, i): return interned(&c, "i{o},{i}", TK_INDEXED, types.F_INDEXED, o, i)
+  # (an index that can't be a key, an object or function type, instantiated without an access
+  # node: no property, getIndexedAccessType's unknownType; ts-essentials' WritableKeys<'a'>)
+  if c.inst_noacc and (ik == TK_OBJ or ik == types.TK_NONPRIM or ik == TK_NULL or ik == TK_UNDEF or ik == TK_VOID or ik == TK_TRUE or ik == TK_FALSE): return c.unknown_t
+  # (string & {}: an object's string (number) index signature, as a mapped type over it made one)
+  if ik == TK_INTER and c.tk[o] == TK_OBJ:
+    var ik2 = -1
+    for ii_k in 0..types.ninter(c, i):
+      let km = types.inter_at(c, i, ii_k)
+      if c.tk[km] == TK_STRING or c.tk[km] == TK_NUMBER: ik2 = c.tk[km]
+    if ik2 == TK_STRING and bind.index_type(&c, o, false) >= 0: return bind.index_type(&c, o, false)
+    if ik2 == TK_NUMBER and bind.index_type(&c, o, true) >= 0: return bind.index_type(&c, o, true)
   if ik == TK_UNION:
     var ts: [Int] = []
     for m in types.members(c, i): ts.push(indexed_of(&c, o, m))
     return types.union_of(&c, ts)
   if ok == TK_UNION:
+    # (its never-reduced intersections left out, getReducedApparentType)
+    let ro = rel.reduce_union(&c, o)
+    if ro >= 0: return indexed_of(&c, ro, i)
     var ts: [Int] = []
     for m in types.members(c, o): ts.push(indexed_of(&c, m, i))
     return types.union_of(&c, ts)
+  # (`${number}`, numericStringType: a number index signature applies to it, isApplicableIndexType;
+  # an array's or tuple's elements)
+  if ik == types.TK_TEMPLATE and c.tmpls[c.ta[i]].mapping == "" and types.tmpl_holes(c, i).len == 1 and c.tk[types.tmpl_holes(c, i)[0]] == TK_NUMBER and types.tmpl_texts(c, i)[0] == "" and types.tmpl_texts(c, i)[1] == "":
+    let na = rel.apparent(&c, o)
+    if c.tk[na] == TK_OBJ and (bind.index_type(&c, na, true) >= 0 or c.objs[c.ta[na]].kind == OK_TUPLE or rel.is_array_ref(&c, na)): return indexed_of(&c, o, c.number_t)
+
   if ok == TK_INTER and ik == TK_ANY:
     # (A & B)[any]: the members' index signatures (an array's or tuple's elements), intersected;
     # none: the error type, any
@@ -272,6 +385,7 @@ fn indexed_of(var c: C, o: Int, i0: Int) -> Int:
         var x = bind.index_type(&c, am, false)
         if x < 0: x = bind.index_type(&c, am, true)
         if x >= 0: xa.push(x)
+    if xa.len == 0 and c.tk[i0] == TK_ERROR: return i0
     if xa.len == 0: return c.any_t
     return types.inter_of(&c, xa)
   if ok == TK_INTER and (ik == TK_STRING or ik == TK_NUMBER or (ik == TK_SYMBOL and c.tb[i] == 0)):
@@ -280,8 +394,11 @@ fn indexed_of(var c: C, o: Int, i0: Int) -> Int:
     var xs: [Int] = []
     for ii58_ in 0..types.ninter(c, o):
       let m = types.inter_at(c, o, ii58_)
-      if c.tk[m] == TK_NONPRIM: continue
-      if c.tk[m] != TK_OBJ: return idx_unsup(&c, o, i)
+      # (object has no index signatures; unknown & X is X; a primitive by its apparent type,
+      # string & {}: String's)
+      if c.tk[m] == TK_NONPRIM or c.tk[m] == TK_UNKNOWN: continue
+      let apm = rel.apparent(&c, m)
+      if c.tk[m] != TK_OBJ and c.tk[apm] != TK_OBJ: return idx_unsup(&c, o, i)
       if ik == TK_SYMBOL:
         let amy = rel.apparent(&c, m)
         let ysx = bind.symbol_index(&c, amy)
@@ -310,11 +427,24 @@ fn indexed_of(var c: C, o: Int, i0: Int) -> Int:
       name = ast.intern(&c.t, ntx)
     var ts: [Int] = []
     var all_opt = true
+    # (a member any: the intersection is any)
+    for ii59a_ in 0..types.ninter(c, o):
+      let ma = types.inter_at(c, o, ii59a_)
+      if c.tk[ma] == TK_ANY or c.tk[ma] == TK_ERROR: return c.any_t
     for ii59_ in 0..types.ninter(c, o):
       let m = types.inter_at(c, o, ii59_)
+      # (object: no properties of its own)
+      if c.tk[m] == types.TK_NONPRIM: continue
       let am = rel.apparent(&c, m)
       if c.tk[am] != TK_OBJ: return idx_unsup(&c, o, i)
-      if c.objs[c.ta[am]].kind == OK_TUPLE: return idx_unsup(&c, o, i)
+      if c.objs[c.ta[am]].kind == OK_TUPLE:
+        # (a tuple member: its element or property, as the tuple alone is indexed)
+        let tr = indexed_of(&c, am, i)
+        if c.tk[tr] == TK_UNSUP: return tr
+        if c.tk[tr] == TK_UNKNOWN or c.tk[tr] == TK_ERROR: continue
+        ts.push(tr)
+        all_opt = false
+        continue
       # a generic mapped type has no properties yet (its keys are a type parameter)
       if c.objs[c.ta[am]].kind == OK_MAPPED and is_generic(&c, am): continue
       let ps = bind.get_prop(&c, am, name)
@@ -331,14 +461,23 @@ fn indexed_of(var c: C, o: Int, i0: Int) -> Int:
         let am = rel.apparent(&c, m)
         var x = -1
         if ik == TK_NUMLIT: x = bind.index_type(&c, am, true)
+        if x < 0: x = bind.tmpl_index_for(&c, am, name)
         if x < 0: x = bind.index_type(&c, am, false)
         if x >= 0: xs.push(x)
+      # (instantiated, without an access node: a missing property reads unknown)
+      if xs.len == 0 and c.inst_noacc: return c.unknown_t
       if xs.len == 0: return idx_unsup(&c, o, i)
       return types.inter_of(&c, xs)
     var r = types.inter_of(&c, ts)
     if all_opt: r = types.union_of(&c, [r, c.undef_t])
     return r
   let a = rel.apparent(&c, o)
+  # (unknown[K] instantiated, without an access node: its apparent type {} has no property,
+  # getIndexedAccessType's unknownType)
+  if ok == TK_UNKNOWN and c.inst_noacc and (ik == TK_STRLIT or ik == TK_NUMLIT or ik == TK_STRING or ik == TK_NUMBER): return c.unknown_t
+  # (object, undefined or null indexed so: no property there either (object's apparent type {}),
+  # unknown as well)
+  if (ok == TK_NONPRIM or ok == TK_UNDEF or ok == TK_NULL) and c.inst_noacc and (ik == TK_STRLIT or ik == TK_NUMLIT or ik == TK_STRING or ik == TK_NUMBER): return c.unknown_t
   if c.tk[a] != TK_OBJ: return idx_unsup(&c, o, i)
   let ao = c.ta[a]
   # (a unique symbol key: the property it names)
@@ -390,14 +529,40 @@ fn indexed_of(var c: C, o: Int, i0: Int) -> Int:
       if rel.is_array_ref(&c, a): return c.objs[ao].args[0]
       let ni = bind.index_type(&c, a, true)
       if ni >= 0: return ni
+    # (template literal index signatures the name matches before a string index signature,
+    # findApplicableIndexInfo)
+    let tx = bind.tmpl_index_for(&c, a, name)
+    if tx >= 0: return tx
     let si = bind.index_type(&c, a, false)
     if si >= 0: return si
     # (instantiated, without an access node: a missing property reads unknown,
     # getIndexedAccessType)
     if c.inst_noacc and c.objs[ao].kind != OK_TUPLE and not rel.is_array_ref(&c, a): return c.unknown_t
+    # (object, a constraint read for its properties: none, unknown)
+    if ok == types.TK_NONPRIM: return c.unknown_t
     return idx_unsup(&c, o, i)
-  # (an object indexed by any, instantiated (any for a type parameter): any)
-  if ik == TK_ANY and c.objs[ao].kind != OK_TUPLE and not rel.is_array_ref(&c, a): return c.any_t
+  # (an object indexed by any or the error type, instantiated (any for a type parameter): the
+  # index signatures any applies to, the non-string ones intersected, else the string one; none:
+  # the index type itself, the error type kept (getPropertyTypeForIndexType, findApplicableIndexInfo))
+  if ik == TK_ANY and c.objs[ao].kind != OK_TUPLE and not rel.is_array_ref(&c, a):
+    bind.ensure_resolved(&c, a)
+    var app: [Int] = []
+    let nix = bind.index_type(&c, a, true)
+    if nix >= 0: app.push(nix)
+    let yix = bind.symbol_index(&c, a)
+    if yix >= 0: app.push(yix)
+    if ao in c.tidx:
+      let txa = types.ints(c.tidx[ao])
+      var tai = 0
+      while tai < txa.len:
+        app.push(txa[tai + 1])
+        tai += 3
+    if app.len == 1: return app[0]
+    if app.len > 1: return types.inter_of(&c, app)
+    let six = bind.index_type(&c, a, false)
+    if six >= 0: return six
+    if c.tk[i0] == TK_ERROR: return i0
+    return c.any_t
   # (an array or tuple indexed by any: its number index, the elements' union)
   if ik == TK_ANY and (rel.is_array_ref(&c, a) or c.objs[ao].kind == OK_TUPLE):
     if rel.is_array_ref(&c, a): return c.objs[ao].args[0]
@@ -409,14 +574,20 @@ fn indexed_of(var c: C, o: Int, i0: Int) -> Int:
     if ni >= 0: return ni
     let si = bind.index_type(&c, a, false)
     if si >= 0: return si
+    # (instantiated, without an access node: no index signature reads unknown)
+    if c.inst_noacc: return c.unknown_t
     return idx_unsup(&c, o, i)
   if ik == TK_STRING:
     let si = bind.index_type(&c, a, false)
     if si >= 0: return si
-  # (symbol: the symbol index signature)
+    if c.inst_noacc: return c.unknown_t
+  # (symbol: the symbol index signature, else the string one: getPropertyTypeForIndexType,
+  # which reports TS2538 only at an access expression)
   if ik == TK_SYMBOL and c.tb[i] == 0:
     let yi = bind.symbol_index(&c, a)
     if yi >= 0: return yi
+    let ys = bind.index_type(&c, a, false)
+    if ys >= 0: return ys
   return idx_unsup(&c, o, i)
 
 # The base constraint of a deferred T[K] (getSimplifiedIndexedAccessType + constraints): K and T by
@@ -468,6 +639,9 @@ fn indexed_constraint(var c: C, t: Int, depth: Int) -> Int:
             continue
           im = types.union_of(&c, nos)
     if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_MAPPED: r = mapped_at(&c, m, i)
+    # (a key the object lacks, no index signature for it: no constraint,
+    # getIndexedAccessTypeOrUndefined, not a refusal)
+    elif not is_deferred(c, m) and lacks_key(&c, m, im): return -1
     elif not is_deferred(c, m): r = indexed_of(&c, m, im)
     if r < 0 or c.tk[r] == TK_UNSUP or is_deferred(c, r): return -1
     parts.push(r)
@@ -494,6 +668,7 @@ fn base_of(var c: C, t: Int, depth: Int) -> Int:
   if depth > 20 or t < 0: return -2
   let k = c.tk[t]
   if k == TK_UNSUP: return -2
+  if k == types.TK_NOINFER: return base_of(&c, c.ta[t], depth + 1)
   if k == TK_TPARAM:
     let con = rel.constraint_of(&c, t)
     if con < 0: return -1
@@ -519,6 +694,13 @@ fn base_of(var c: C, t: Int, depth: Int) -> Int:
     if bs.len > 0: return types.inter_of(&c, bs)
     return -1
   if k == TK_INDEXED:
+    # (a generic mapped type indexed by its key: its template for the key, simplified first,
+    # getResolvedBaseConstraint's computeBaseConstraint(getSimplifiedType(t)))
+    # (where the simplified type has no base, the indexed access's own is taken, V[N & keyof V])
+    let st = rel.simplified(&c, t)
+    if st != t:
+      let sb = base_of(&c, st, depth + 1)
+      if sb >= 0: return sb
     let r = indexed_base(&c, t, depth)
     if r == -3: return -1
     if r < 0: return -2
@@ -536,16 +718,60 @@ fn base_of(var c: C, t: Int, depth: Int) -> Int:
     return types.union_of(&c, [c.string_t, c.number_t, c.symbol_t])
   return t
 
+# A mapped type made over concrete keys, indexed by a generic key: its template with that key for
+# its type parameter (with undefined when it adds ?), substituteIndexedMappedType; -1 when not one
+# (an as clause, -?, or its mapper unknown: not made by mapped_over1, no property made lazily).
+fn mapped_generic_access(var c: C, o: Int, i: Int) -> Int:
+  if c.tk[o] != TK_OBJ or c.objs[c.ta[o]].kind != OK_ANON: return -1
+  let n = c.objs[c.ta[o]].node
+  if n < 0 or c.t.nd[n].k != ast.N_TMAPPED or c.t.nd[n].b >= 0: return -1
+  let fl = c.t.nd[n].f
+  if (fl & ast.MAP_NOOPTIONAL) != 0: return -1
+  if not is_generic(&c, i): return -1
+  # (the mapper it was made with, -1 for none: its properties may all be typed already)
+  var m2 = -1
+  var found = false
+  if c.ta[o] in c.mapped_m:
+    m2 = c.mapped_m[c.ta[o]]
+    found = true
+  else:
+    for name in types.ints(c.objs[c.ta[o]].order):
+      let ps = c.objs[c.ta[o]].props[name]
+      if ps in c.lazy_inst:
+        m2 = c.lazy_inst[ps][1]
+        found = true
+        break
+  if not found: return -1
+  let tps0 = bind.tparam_sym(&c, c.t.nd[n].a)
+  let tp = c.sdtype[tps0]
+  let tmpl = raw(&c, c.t.nd[n].c)
+  let mx = extend(&c, m2, tp, i)
+  let r = bind.instantiate(&c, tmpl, mx)
+  if (fl & ast.MAP_OPTIONAL) != 0: return types.union_of(&c, [r, c.undef_t])
+  return r
+
 # T[K] by the base constraints of T and K (an intersection distributed, a generic mapped type's
 # template instantiated for the keys); the result may still be generic. -1 when not computed here.
 fn indexed_base(var c: C, t: Int, depth: Int) -> Int:
   var o = c.ta[t]
   let i0 = c.tb[t]
+  # ({ [P in K]: E }[X], K not generic and X generic: E with X for P, isMappedTypeGenericIndexedAccess)
+  let sub = mapped_generic_access(&c, o, i0)
+  if sub >= 0: return sub
   let i = base_of(&c, i0, depth + 1)
   # an object or index type with no base constraint: none for T[K] either
   if i == -1: return -3
-  if i < 0 or is_deferred(c, i): return -1
-  if c.tk[o] == TK_TPARAM or c.tk[o] == types.TK_INDEXED:
+  if i < 0 or is_deferred(c, i):
+    # (an index whose constraint isn't known, on an object whose base constraint has a string index
+    # signature of any, Record<string, any>: any for every key, FieldValues of react-hook-form)
+    var ob = o
+    if c.tk[o] == TK_TPARAM or c.tk[o] == types.TK_INDEXED or c.tk[o] == types.TK_COND: ob = base_of(&c, o, depth + 1)
+    if ob >= 0 and c.tk[ob] == TK_OBJ and c.objs[c.ta[ob]].kind != OK_MAPPED:
+      let osi = bind.index_type(&c, ob, false)
+      if osi >= 0 and c.tk[osi] == TK_ANY: return osi
+    return -1
+  # (a conditional object too: its constraint, the branches united, getBaseConstraint)
+  if c.tk[o] == TK_TPARAM or c.tk[o] == types.TK_INDEXED or c.tk[o] == types.TK_COND:
     let co = base_of(&c, o, depth + 1)
     if co == -1: return -3
     # (a generic mapped type, { [P in keyof T]: X }: its template for the keys)
@@ -557,14 +783,43 @@ fn indexed_base(var c: C, t: Int, depth: Int) -> Int:
   elif c.tk[o] == TK_INTER:
     # (an intersection with a type parameter in it, T & string[] (a substitution type): by its
     # base constraint, computeBaseConstraint's baseObjectType)
+    # (or a generic T[K] or conditional member, NonNullable<X[K]>'s X[K] & {})
     var has_tp = false
     for ii in 0..types.ninter(c, o):
-      if c.tk[types.inter_at(c, o, ii)] == TK_TPARAM: has_tp = true
+      let imk = c.tk[types.inter_at(c, o, ii)]
+      if imk == TK_TPARAM or imk == types.TK_INDEXED or imk == types.TK_COND: has_tp = true
     if has_tp:
       let co = base_of(&c, o, depth + 1)
       if co >= 0 and co != o and not is_deferred(c, co): o = co
+  elif c.tk[o] == TK_UNION:
+    # (a union with generic members, Extract<A, {case: C}> | Extract<B, {case: C}> distributed over
+    # a concrete union: by its base constraint, the members' united)
+    var has_g = false
+    for mi_g in 0..types.nmem(c, o):
+      let gmk = c.tk[types.mem(c, o, mi_g)]
+      if gmk == TK_TPARAM or gmk == types.TK_INDEXED or gmk == types.TK_COND: has_g = true
+    if has_g:
+      let co = base_of(&c, o, depth + 1)
+      if co == -1: return -3
+      if co < 0 or is_deferred(c, co): return -1
+      o = co
   var parts: [Int] = []
   let oms = types.members_inter(c, o)
+  # (a string or symbol key on an object type with no index signature for it, keyof T's
+  # string | number | symbol on an array: no constraint, getIndexedAccessTypeOrUndefined without
+  # an access node)
+  if oms.len == 1 and (c.tk[o] == TK_OBJ or c.tk[o] == TK_UNION):
+    for mi_k in 0..types.nmem(c, i):
+      let km = types.mem(c, i, mi_k)
+      let kk = c.tk[km]
+      if kk != TK_STRING and not (kk == TK_SYMBOL and c.tb[km] == 0): continue
+      for mi_o in 0..types.nmem(c, o):
+        let om = types.mem(c, o, mi_o)
+        if c.tk[om] != TK_OBJ: continue
+        let ao = rel.apparent(&c, om)
+        if c.tk[ao] != TK_OBJ: continue
+        if kk == TK_STRING and bind.index_type(&c, ao, false) < 0: return -3
+        if kk == TK_SYMBOL and bind.symbol_index(&c, ao) < 0 and bind.index_type(&c, ao, false) < 0: return -3
   # a plain object type without the key: no constraint (getIndexedAccessTypeOrUndefined)
   if oms.len == 1 and c.tk[o] == TK_OBJ and key_missing(&c, o, i): return -3
   # (a union, some member without the key: none either)
@@ -596,11 +851,37 @@ fn indexed_base(var c: C, t: Int, depth: Int) -> Int:
             continue
           im = types.union_of(&c, nos)
     if c.tk[m] == TK_OBJ and c.objs[c.ta[m]].kind == OK_MAPPED: r = mapped_at(&c, m, i)
+    # (a key the object lacks, no index signature for it: no constraint,
+    # getIndexedAccessTypeOrUndefined, not a refusal)
+    elif not is_deferred(c, m) and lacks_key(&c, m, im): return -3
     elif not is_deferred(c, m): r = indexed_of(&c, m, im)
     if r < 0 or c.tk[r] == TK_UNSUP: return -1
     parts.push(r)
+  # (an intersection whose members each lack some of the keys, (A & Partial<B>)[keyof A | keyof B]:
+  # by key, the members that have it, getIndexedAccessType distributing over a union key)
+  if parts.len == 0 and oms.len > 1 and inter_obj_keys_lit(c, oms, i):
+    var per: [Int] = []
+    for mi_k2 in 0..types.nmem(c, i):
+      let km = types.mem(c, i, mi_k2)
+      var kp: [Int] = []
+      for m in oms:
+        if key_missing(&c, m, km): continue
+        let r2 = indexed_of(&c, m, km)
+        if r2 < 0 or c.tk[r2] == TK_UNSUP: return -1
+        kp.push(r2)
+      if kp.len == 0: return -1
+      per.push(types.inter_of(&c, kp))
+    return types.union_of(&c, per)
   if parts.len == 0: return -1
   return types.inter_of(&c, parts)
+
+fn inter_obj_keys_lit(c: C, oms: [Int], i: Int) -> Bool:
+  for m in oms:
+    if c.tk[m] != TK_OBJ or c.objs[c.ta[m]].kind == OK_MAPPED: return false
+  for mi in 0..types.nmem(c, i):
+    let k = c.tk[types.mem(c, i, mi)]
+    if k != TK_STRLIT and k != TK_NUMLIT: return false
+  return true
 
 fn key_missing(var c: C, o: Int, i: Int) -> Bool:
   let kind = c.objs[c.ta[o]].kind
@@ -647,8 +928,12 @@ fn cond_dist(var c: C, t: Int) -> Int:
   let ct = bind.instantiate(&c, raw_check, m)
   if c.tk[ct] != TK_TPARAM:
     if not is_generic(&c, ct): return -1
-    # (another generic check type, P & { v: number }: its base constraint, getConstraintOfType)
-    if c.tk[ct] != TK_INTER: return -2
+    # (an object type has no constraint of its own, getBaseConstraintOfType: the default
+    # constraint, the branches)
+    if c.tk[ct] == TK_OBJ: return -1
+    # (another generic check type, P & { v: number } or T[number]: its base constraint,
+    # getConstraintOfType)
+    if c.tk[ct] != TK_INTER and c.tk[ct] != types.TK_INDEXED: return -2
     let bc = base_of(&c, ct, 0)
     if bc < 0 or bc == ct or is_generic(&c, bc) or c.tk[bc] == TK_UNSUP: return -2
     let m3 = extend(&c, m, raw_check, bc)
@@ -691,6 +976,14 @@ fn cond_default1(var c: C, t: Int, loose: Bool) -> Int:
     let ex1 = bind.instantiate(&c, eraw1, m)
     let it1 = types.inter_of(&c, [ct1, ex1])
     if c.tk[it1] == TK_NEVER: subst = it1
+    # (a check type instantiated to a concrete type: the substitution type instantiated, the
+    # check type where it relates to the extends type, else the extends type & the check type)
+    elif c.tk[ct1] != TK_UNSUP and c.tk[ex1] != TK_UNSUP and not is_generic(&c, ct1):
+      if not is_generic(&c, ex1) and rel.assignable_plain(&c, ct1, ex1): subst = ct1
+      elif c.tk[it1] != TK_UNSUP: subst = types.inter_of(&c, [ex1, ct1])
+    # (an object type with generic parts against a generic extends type: the same intersection, as
+    # its restrictive instantiation can't relate to one with type parameters there)
+    elif c.tk[ct1] == TK_OBJ and c.tk[ex1] == TK_OBJ and is_generic(&c, ex1) and c.objs[c.ta[ct1]].kind != OK_MAPPED and c.tk[it1] != TK_UNSUP: subst = types.inter_of(&c, [ex1, ct1])
   # (a check type parameter in the true branch: the substitution type there, the check type &
   # the extends type, getSubstitutionType; one written alone, T or T[K], isn't modeled)
   var sub_m = -1
@@ -698,7 +991,8 @@ fn cond_default1(var c: C, t: Int, loose: Bool) -> Int:
     let ct2 = bind.instantiate(&c, raw_check, m)
     let eraw2 = raw(&c, c.t.nd[n].b)
     let ex2 = bind.instantiate(&c, eraw2, m)
-    if c.tk[ct2] == TK_TPARAM and c.tk[ex2] != TK_UNSUP:
+    # (getSubstitutionType: an any or unknown constraint leaves the type parameter itself)
+    if c.tk[ct2] == TK_TPARAM and c.tk[ex2] != TK_UNSUP and c.tk[ex2] != TK_ANY and c.tk[ex2] != TK_UNKNOWN:
       let si = types.inter_of(&c, [ct2, ex2])
       if c.tk[si] != TK_NEVER and c.tk[si] != TK_UNSUP:
         sub_m = extend(&c, m, raw_check, si)
@@ -738,7 +1032,7 @@ fn cond_default1(var c: C, t: Int, loose: Bool) -> Int:
       elif inf.contra[i].len > 0: it = contra_inference(&c, types.ints(inf.contra[i]))
       # (one the constraint doesn't take, none (unknown) among them: the constraint, getInferredType)
       let cn = rel.constraint_of(&c, tps[i])
-      if cn >= 0 and c.tk[cn] != TK_UNKNOWN and c.tk[it] != TK_UNSUP and not chk.could_contain_tvars(&c, cn) and not rel.assignable(&c, it, cn): it = cn
+      if cn >= 0 and c.tk[cn] != TK_UNKNOWN and c.tk[it] != TK_UNSUP and not chk.could_contain_tvars(&c, cn) and not rel.assignable_plain(&c, it, cn): it = cn
       to.push(it)
     let im = types.new_mapper(&c, tps, to)
     mt = compose(&c, m, im)
@@ -810,7 +1104,12 @@ fn cond_one_fc(var c: C, n: Int, m0: Int, ct: Int, depth: Int) -> Int:
   let rf = raw(&c, c.t.nd[n].d)
   if c.tk[rt] == TK_UNSUP or c.tk[rf] == TK_UNSUP: return -2
   if ek == TK_ANY or ek == TK_UNKNOWN or (c.tk[ct] != TK_ANY and rel.assignable_plain(&c, ct, ext)):
-    if c.tk[rt] == TK_COND: return -2
+    # (a conditional true branch: instantiated, as getConditionalType does, when it comes out
+    # concrete; react-hook-form's Path<T> over T's constraint)
+    if c.tk[rt] == TK_COND:
+      let ri = bind.instantiate(&c, rt, m)
+      if c.tk[ri] == TK_UNSUP or is_deferred(c, ri) or is_generic(&c, ri): return -2
+      return ri
     return bind.instantiate(&c, rt, m)
   var extra = -1
   var keep = c.tk[ct] == TK_ANY
@@ -840,10 +1139,13 @@ fn cond_one_fc(var c: C, n: Int, m0: Int, ct: Int, depth: Int) -> Int:
     var checkn = c.t.nd[n].a
     while c.t.nd[checkn].k == ast.N_TPAREN: checkn = c.t.nd[checkn].a
     let same = nraw == raw(&c, checkn)
-    if ndist and not same: return -2
     let g2 = raw(&c, nc)
     let nct = bind.instantiate(&c, g2, m0)
-    res = cond_one_fc(&c, fnode, m0, nct, depth + 1)
+    # (distributive over another type parameter, concrete here: over its union's members)
+    if ndist and not same:
+      if is_generic(&c, nct) or is_deferred(c, nct): return -2
+      res = cond_inst_fc(&c, fnode, m0, nct)
+    else: res = cond_one_fc(&c, fnode, m0, nct, depth + 1)
     if res < 0: return -2
   else:
     if c.tk[rf] == TK_COND: return -2
@@ -867,6 +1169,35 @@ fn mapped_at(var c: C, mt: Int, keys: Int) -> Int:
     if (c.t.nd[n].f & ast.MAP_OPTIONAL) != 0: r = types.union_of(&c, [r, c.undef_t])
     ts.push(r)
   return types.union_of(&c, ts)
+
+# Whether an object type (not generic) lacks a literal key of k's, or has no index signature for
+# a template literal one (a constraint's T[K]: no property there).
+fn lacks_key(var c: C, m: Int, k: Int) -> Bool:
+  # (a union: a member that lacks it)
+  if c.tk[m] == TK_UNION:
+    for mi0 in 0..types.nmem(c, m):
+      if lacks_key(&c, types.mem(c, m, mi0), k): return true
+    return false
+  # (undefined or null: no properties at all)
+  if c.tk[m] == TK_UNDEF or c.tk[m] == TK_NULL: return c.tk[k] != TK_NEVER
+  let am = rel.apparent(&c, m)
+  if c.tk[am] != TK_OBJ: return false
+  let ao = c.ta[am]
+  if c.objs[ao].kind == OK_TUPLE or c.objs[ao].kind == OK_MAPPED or rel.is_array_ref(&c, am): return false
+  bind.ensure_resolved(&c, am)
+  let has_idx = bind.index_type(&c, am, false) >= 0 or ao in c.tidx
+  for mi in 0..types.nmem(c, k):
+    let x = types.mem(c, k, mi)
+    let xk = c.tk[x]
+    if xk == TK_STRLIT:
+      if bind.get_prop(&c, am, c.ta[x]) < 0 and not has_idx: return true
+    elif xk == types.TK_TEMPLATE:
+      if not has_idx and not chk.could_contain_tvars(&c, x): return true
+    elif xk == TK_STRING:
+      if bind.index_type(&c, am, false) < 0: return true
+    elif xk == TK_NUMBER:
+      if bind.index_type(&c, am, true) < 0 and bind.index_type(&c, am, false) < 0: return true
+  return false
 
 fn idx_unsup(var c: C, o: Int, i: Int) -> Int:
   var d = ""
@@ -919,6 +1250,7 @@ fn extend(var c: C, m: Int, tp: Int, t: Int) -> Int:
 # ---- mapped types
 
 fn mapped_of(var c: C, n: Int, m: Int) -> Int:
+  if c.inst_exit > 0: bind.budget_tick2(&c, "mapped_of")
   # (mapped types made inside one another, through conditional types too: a deeply recursive
   # type like DeepPartial<T> over a large graph isn't modeled)
   if c.mapped_depth > 40: return bind.lazy_unsupported(&c, n, "a mapped type over a deeply recursive type")
@@ -991,19 +1323,47 @@ fn mapped_of1(var c: C, n: Int, m: Int) -> Int:
       var mu = m
       if src_tv >= 0: mu = extend(&c, m, src_tv, src)
       return mapped_over(&c, n, mu, tp, c.never_t, src)
+    # (keyof any or of the error type written: a string index signature only,
+    # forEachMappedTypePropertyKeyTypeAndIndexSignatureKeyType. A type variable instantiated to
+    # any is mapped so too in tsc, instantiateMappedType, but that reaches what isn't modeled
+    # (react-hook-form's paths of any): any, as before; to the error type it stays that)
+    if (sk == TK_ANY or sk == TK_ERROR) and src_tv < 0: return mapped_over(&c, n, m, tp, c.string_t, -1)
+    # (a type variable instantiated to any (not the error type) whose constraint is only arrays and
+    # tuples, Promise.all's T extends readonly unknown[] | []: an array of the mapped element,
+    # instantiateMappedType's instantiateMappedArrayType)
+    if sk == TK_ANY and src_tv >= 0 and c.t.nd[n].b < 0 and arrays_only(&c, src_tv):
+      let tmpla = raw(&c, c.t.nd[n].c)
+      let ma0 = extend(&c, m, src_tv, src)
+      let num = c.number_t
+      let mxa = extend(&c, ma0, tp, num)
+      var ela = bind.instantiate(&c, tmpla, mxa)
+      if c.tk[ela] == TK_ERROR: return c.error_t
+      if c.tk[ela] == TK_UNSUP: return ela
+      let fla = c.t.nd[n].f
+      if (fla & ast.MAP_OPTIONAL) != 0 and not c.snc_off: ela = types.union_of(&c, [ela, c.undef_t])
+      if (fla & ast.MAP_READONLY) != 0 and (fla & ast.MAP_NOREADONLY) == 0: return bind.readonly_array_of(&c, ela)
+      return bind.array_of(&c, ela)
+    if sk == TK_ANY and src_tv >= 0 and not mapped_recursive(c, n):
+      let ma = extend(&c, m, src_tv, src)
+      return mapped_over(&c, n, ma, tp, c.string_t, -1)
     if sk != TK_OBJ and sk != TK_INTER: return src
-    if sk == TK_OBJ and rel.is_array_ref(&c, src):
+    # (an as clause: arrays and tuples are mapped as objects, over all their keys,
+    # instantiateMappedType's !nameType)
+    let as_clause = c.t.nd[n].b >= 0
+    if sk == TK_OBJ and rel.is_array_ref(&c, src) and not as_clause:
       # an array maps to an array of the mapped element
       let tmpl0 = raw(&c, c.t.nd[n].c)
       let mx = extend(&c, m, tp, c.number_t)
-      let el = bind.instantiate(&c, tmpl0, mx)
+      var el = bind.instantiate(&c, tmpl0, mx)
       # (an error element: the error type, instantiateMappedArrayType)
       if c.tk[el] == TK_ERROR: return c.error_t
       let fl = c.t.nd[n].f
+      # (with ?: undefined added, instantiateMappedTypeTemplate's isOptional)
+      if (fl & ast.MAP_OPTIONAL) != 0 and not c.snc_off: el = types.union_of(&c, [el, c.undef_t])
       let ro = rel.is_readonly_array(&c, src)
       if ((fl & ast.MAP_READONLY) != 0 or ro) and (fl & ast.MAP_NOREADONLY) == 0: return bind.readonly_array_of(&c, el)
       return bind.array_of(&c, el)
-    if sk == TK_OBJ and c.objs[c.ta[src]].kind == OK_TUPLE:
+    if sk == TK_OBJ and c.objs[c.ta[src]].kind == OK_TUPLE and not as_clause:
       # a tuple maps element by element
       let tup = types.new_obj(&c, OK_TUPLE, -1, n)
       let so = c.ta[src]
@@ -1011,18 +1371,37 @@ fn mapped_of1(var c: C, n: Int, m: Int) -> Int:
       let fl = c.t.nd[n].f
       # (readonly as the mapped type says, else as the source)
       c.objs[to].ro = ((fl & ast.MAP_READONLY) != 0 or c.objs[so].ro) and (fl & ast.MAP_NOREADONLY) == 0
+      let fixed = bind.tuple_fixed(c, src)
       for i in 0..c.objs[so].args.len:
-        let key = types.str_lit_s(&c, "{i}", false)
         let tmpl1 = raw(&c, c.t.nd[n].c)
-        let mk2 = extend(&c, m, tp, key)
-        let el = bind.instantiate(&c, tmpl1, mk2)
+        var mk2 = -1
+        let by_array = i >= fixed and src_tv >= 0 and c.objs[so].eflags[i] != 3
+        if by_array:
+          # (a rest element and those after it: the mapped type over an array of the element, its
+          # element type; the keys past the fixed ones aren't the tuple's, instantiateMappedTupleType)
+          let arr = bind.array_of(&c, c.objs[so].args[i])
+          let ma = extend(&c, m, src_tv, arr)
+          let num = c.number_t
+          mk2 = extend(&c, ma, tp, num)
+        else:
+          let key = types.str_lit_s(&c, "{i}", false)
+          mk2 = extend(&c, m, tp, key)
+        var el = bind.instantiate(&c, tmpl1, mk2)
         # (an error element: the error type, instantiateMappedTupleType)
         if c.tk[el] == TK_ERROR: return c.error_t
+        # (an array's element with ?: undefined added, instantiateMappedArrayType; an optional
+        # element with -?: without it, instantiateMappedTypeTemplate)
+        if by_array and (fl & ast.MAP_OPTIONAL) != 0 and not c.snc_off: el = types.union_of(&c, [el, c.undef_t])
+        if not by_array and (fl & ast.MAP_NOOPTIONAL) != 0 and c.objs[so].eflags[i] == 1 and not c.snc_off: el = types.filter_union(&c, el, true, false)
         c.objs[to].args.push(el)
         var ef = c.objs[so].eflags[i]
         if (fl & ast.MAP_OPTIONAL) != 0 and ef == 0: ef = 1
         if (fl & ast.MAP_NOOPTIONAL) != 0 and ef == 1: ef = 0
         c.objs[to].eflags.push(ef)
+      # (with a rest element: normalized, optional elements after it folded into it, createTupleType)
+      if fixed < c.objs[so].args.len:
+        let targs = types.ints(c.objs[to].args)
+        return bind.norm_tuple(&c, to, targs)
       return tup
   # (homomorphic over a type with an index signature: its declared properties too, as tsc's
   # forEachMappedTypePropertyKeyTypeAndIndexSignatureKeyType; keyof alone has only string | number)
@@ -1066,16 +1445,53 @@ fn mapped_of1(var c: C, n: Int, m: Int) -> Int:
               if dn >= 0 and c.t.nd[dn].k == ast.N_NUM: lk = nk0
       # (keyof's keys only: not private or protected members)
       if with_index or types.has_int(types.members(c, cons), lk): ks.push(lk)
-    if ks.len > 0:
+    # (the index keys the source has: keyof's number beside a string index signature isn't one,
+    # forEachMappedTypePropertyKeyTypeAndIndexSignatureKeyType takes the index infos)
+    var num_idx = false
+    for sm in srcm:
+      if bind.index_type(&c, sm, true) >= 0: num_idx = true
+    let drop_num = with_index and not num_idx and types.has_int(types.members(c, cons), c.number_t)
+    # (keyof a type whose keys are any, Record<any, V>: its index infos' key types instead,
+    # forEachMappedTypePropertyKeyTypeAndIndexSignatureKeyType)
+    if with_index and (c.tk[cons] == TK_ANY or c.tk[cons] == TK_ERROR):
+      var str_idx = false
+      for sm in srcm:
+        if bind.index_type(&c, sm, false) >= 0: str_idx = true
+      if str_idx: ks.push(c.string_t)
+      if num_idx: ks.push(c.number_t)
+      var kk0 = "K"
+      for x in ks: kk0 = kk0 + "{x},"
+      if kk0 in c.tl_cache: keys = c.tl_cache[kk0]
+      else:
+        let st0 = c.tl.len
+        for x in ks: c.tl.push(x)
+        keys = types.mk(&c, TK_UNION, types.F_UNION, st0, ks.len)
+        c.tl_cache[kk0] = keys
+    elif ks.len > 0 or drop_num:
       for i in 0..types.nmem(c, cons):
         let ck = types.mem(c, cons, i)
+        if drop_num and ck == c.number_t: continue
         if not types.has_int(ks, ck): ks.push(ck)
-      # (as a list of keys, not reduced: the literals stay beside string)
-      let st = c.tl.len
-      for x in ks: c.tl.push(x)
-      keys = types.mk(&c, TK_UNION, types.F_UNION, st, ks.len)
+      # (as a list of keys, not reduced: the literals stay beside string; one type per list, so
+      # mapped_over's cache, keyed by it, finds the mapped type made from the same keys)
+      var kk = "K"
+      for x in ks: kk = kk + "{x},"
+      if kk in c.tl_cache: keys = c.tl_cache[kk]
+      else:
+        let st = c.tl.len
+        for x in ks: c.tl.push(x)
+        keys = types.mk(&c, TK_UNION, types.F_UNION, st, ks.len)
+        c.tl_cache[kk] = keys
   if src < 0: src = mods
-  return mapped_over(&c, n, m, tp, keys, src)
+  let r = mapped_over(&c, n, m, tp, keys, src)
+  # (its keyof: the constraint type itself, keyof T as it prints, getIndexTypeForMappedType, where
+  # the keys are its members in property order)
+  if keys != cons and c.tk[r] == TK_OBJ and c.objs[c.ta[r]].mcons == keys and c.t.nd[n].b < 0 and types.nmem(c, keys) == types.nmem(c, cons):
+    var same = true
+    for i in 0..types.nmem(c, keys):
+      if not types.has_int(types.members(c, cons), types.mem(c, keys, i)): same = false
+    if same: c.objs[c.ta[r]].mcons = cons
+  return r
 
 fn mapped_over(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int) -> Int:
   # (a mapped type over a recursive type, DeepPartial<T>, made eagerly: deferred properties
@@ -1096,45 +1512,106 @@ fn mapped_index_value(var c: C, tmpl: Int, m: Int, fl: Int) -> Int:
   if (fl & ast.MAP_OPTIONAL) != 0: return types.union_of(&c, [v, c.undef_t])
   return v
 
+# A template literal index signature of a mapped type's: one with that key already there takes the
+# union of the values (appendIndexInfo with union, resolveMappedTypeMembers).
+fn mapped_add_tidx(var c: C, o: Int, key: Int, tv: Int, fl: Int):
+  var opt = 0
+  if (fl & ast.MAP_OPTIONAL) != 0: opt = 1
+  if not (o in c.tidx): c.tidx[o] = []
+  var i = 0
+  while i < c.tidx[o].len:
+    if c.tidx[o][i] == key:
+      let u = types.union_of(&c, [c.tidx[o][i + 1], tv])
+      c.tidx[o][i + 1] = u
+      return
+    i += 3
+  c.tidx[o].push(key)
+  c.tidx[o].push(tv)
+  c.tidx[o].push(opt)
+
 fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) -> Int:
   let fl = c.t.nd[n].f
   let o = c.ta[t]
   if c.t.nd[n].b < 0: c.objs[o].mcons = cons
+  c.mapped_m[o] = m
   let tmpl = raw(&c, c.t.nd[n].c)
+  var renamed = false
   for mi205_ in 0..types.nmem(c, cons):
     let key = types.mem(c, cons, mi205_)
     let kk = c.tk[key]
     let m2 = extend(&c, m, tp, key)
     # (an index signature of an optional mapped type takes undefined, addOptionality)
     # (any keys: a string index signature, the key type any; resolveMappedTypeMembers)
+    # (an as clause on an index signature's key: never drops it, the key itself keeps it,
+    # resolveMappedTypeMembers' addMemberForKeyTypeWorker through the name type)
+    # (a literal name makes a property, string, number or symbol an index signature of that key)
+    var idx_lits = false
+    # (and on a pattern template literal key, `${string}/a`: its name type the same)
+    let tkey = kk == types.TK_TEMPLATE and not bind.generic_template(c, key)
+    if c.t.nd[n].b >= 0 and (kk == TK_STRING or kk == TK_NUMBER or (kk == TK_SYMBOL and c.tb[key] == 0) or tkey):
+      let asn = raw(&c, c.t.nd[n].b)
+      let ant = bind.instantiate(&c, asn, m2)
+      if c.tk[ant] == TK_UNSUP: return ant
+      for x in types.members(c, ant):
+        let xk = c.tk[x]
+        if xk == TK_NEVER: continue
+        if xk == TK_STRING: c.objs[o].sidx = mapped_index_value(&c, tmpl, m2, fl)
+        elif xk == TK_NUMBER: c.objs[o].nidx = mapped_index_value(&c, tmpl, m2, fl)
+        elif xk == TK_SYMBOL and c.tb[x] == 0: c.yidx[o] = mapped_index_value(&c, tmpl, m2, fl)
+        elif xk == TK_STRLIT or xk == TK_NUMLIT or (xk == TK_SYMBOL and c.tb[x] == 1): idx_lits = true
+        elif xk == types.TK_TEMPLATE and c.tmpls[c.ta[x]].mapping == "" and not bind.generic_template(c, x):
+          # (a pattern template name: a template literal index signature, isValidIndexKeyType)
+          var tv = bind.instantiate(&c, tmpl, m2)
+          if (fl & ast.MAP_OPTIONAL) != 0: tv = types.union_of(&c, [tv, c.undef_t])
+          mapped_add_tidx(&c, o, x, tv, fl)
+        else: return bind.lazy_unsupported(&c, n, "a mapped type with an as clause renaming an index signature")
+      if not idx_lits: continue
     if kk == TK_ANY or kk == TK_ERROR:
       if c.t.nd[n].b >= 0: return bind.lazy_unsupported(&c, n, "a mapped type with an as clause over any keys")
       c.objs[o].sidx = mapped_index_value(&c, tmpl, m2, fl)
       continue
-    if kk == TK_STRING:
+    if kk == TK_STRING and not idx_lits:
       c.objs[o].sidx = mapped_index_value(&c, tmpl, m2, fl)
       continue
-    if kk == TK_NUMBER:
+    if kk == TK_NUMBER and not idx_lits:
       c.objs[o].nidx = mapped_index_value(&c, tmpl, m2, fl)
       continue
-    if kk == TK_SYMBOL and c.tb[key] == 0:
+    if kk == TK_SYMBOL and c.tb[key] == 0 and not idx_lits:
       c.yidx[o] = mapped_index_value(&c, tmpl, m2, fl)
       continue
+    # (string & {}: an index signature, isValidIndexKeyType's intersection with a member that is
+    # one; here keyed by that member, the template's key that member too)
+    if kk == TK_INTER and c.t.nd[n].b < 0 and not idx_lits and not is_generic(&c, key):
+      var ik = -1
+      for ii_k in 0..types.ninter(c, key):
+        let km = types.inter_at(c, key, ii_k)
+        if c.tk[km] == TK_STRING or c.tk[km] == TK_NUMBER: ik = c.tk[km]
+      if ik == TK_STRING:
+        let st = c.string_t
+        let ms = extend(&c, m, tp, st)
+        c.objs[o].sidx = mapped_index_value(&c, tmpl, ms, fl)
+        continue
+      if ik == TK_NUMBER:
+        let nt = c.number_t
+        let mn = extend(&c, m, tp, nt)
+        c.objs[o].nidx = mapped_index_value(&c, tmpl, mn, fl)
+        continue
     if kk == types.TK_TEMPLATE:
       # (a pattern key, `on${string}`: a template literal index signature, optional adding
       # undefined)
-      if c.t.nd[n].b >= 0 or bind.generic_template(c, key): return bind.lazy_unsupported(&c, n, "a mapped type over a template literal type")
-      var tv = bind.instantiate(&c, tmpl, m2)
-      if (fl & ast.MAP_OPTIONAL) != 0: tv = types.union_of(&c, [tv, c.undef_t])
-      if not (o in c.tidx): c.tidx[o] = []
-      c.tidx[o].push(key)
-      c.tidx[o].push(tv)
-      if (fl & ast.MAP_OPTIONAL) != 0: c.tidx[o].push(1)
-      else: c.tidx[o].push(0)
-      continue
+      if bind.generic_template(c, key): return bind.lazy_unsupported(&c, n, "a mapped type over a template literal type")
+      # (with an as clause: made from its names above)
+      if c.t.nd[n].b < 0:
+        var tv = bind.instantiate(&c, tmpl, m2)
+        if (fl & ast.MAP_OPTIONAL) != 0: tv = types.union_of(&c, [tv, c.undef_t])
+        mapped_add_tidx(&c, o, key, tv, fl)
+        continue
     # (a unique symbol key: a property named by it)
     let usym = kk == TK_SYMBOL and c.tb[key] == 1
-    if kk != TK_STRLIT and kk != TK_NUMLIT and not usym: continue
+    # (with an as clause any key counts: { [N in Node as N['kind']]: ... } over object types,
+    # the names its as clause gives them; addMemberForKeyType)
+    let lit_key = kk == TK_STRLIT or kk == TK_NUMLIT or usym or idx_lits
+    if not lit_key and c.t.nd[n].b < 0: continue
     # as clause: the property's name (never drops it)
     var names: [Int] = [key]
     if c.t.nd[n].b >= 0:
@@ -1148,20 +1625,44 @@ fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) 
         let ntx = c.numtext[c.ta[nk]] + ""
         name = ast.intern(&c.t, ntx)
       elif c.tk[nk] == TK_SYMBOL and c.tb[nk] == 1: name = chk.symbol_key(&c, nk)
+      elif c.tk[nk] == types.TK_TEMPLATE and c.tmpls[c.ta[nk]].mapping == "" and not bind.generic_template(c, nk):
+        # (a pattern template name, MergePath<string, "/a">'s `${string}/a`: a template literal
+        # index signature, isValidIndexKeyType)
+        var tvn = bind.instantiate(&c, tmpl, m2)
+        if (fl & ast.MAP_OPTIONAL) != 0: tvn = types.union_of(&c, [tvn, c.undef_t])
+        mapped_add_tidx(&c, o, nk, tvn, fl)
+        continue
+      elif not lit_key and (c.tk[nk] == TK_STRING or c.tk[nk] == TK_NUMBER or c.tk[nk] == TK_ANY):
+        # (an object key named string or number by the as clause: an index signature, the values
+        # of every key naming it united, appendIndexInfo; any a string one)
+        let iv = mapped_index_value(&c, tmpl, m2, fl)
+        if c.tk[nk] != TK_NUMBER:
+          if c.objs[o].sidx >= 0: c.objs[o].sidx = types.union_of(&c, [c.objs[o].sidx, iv])
+          else: c.objs[o].sidx = iv
+        else:
+          if c.objs[o].nidx >= 0: c.objs[o].nidx = types.union_of(&c, [c.objs[o].nidx, iv])
+          else: c.objs[o].nidx = iv
+        continue
       else: continue
       var opt = false
       var ro = false
       var odecl = -1
       # (the modifiers are the source property's of the key, not of its as-clause name)
       var kname = name
+      if not lit_key: kname = -1
       if c.tk[key] == TK_STRLIT: kname = c.ta[key]
       elif c.tk[key] == TK_NUMLIT:
         let ktx = c.numtext[c.ta[key]] + ""
         kname = ast.intern(&c.t, ktx)
       elif usym: kname = chk.symbol_key(&c, key)
-      if src >= 0 and c.tk[src] == TK_OBJ:
+      if c.t.nd[n].b >= 0 and kname >= 0 and name != kname: renamed = true
+      # (the source properties, for T[P] under exactOptionalPropertyTypes)
+      var sps: [Int] = []
+      if kname < 0: odecl = -1
+      elif src >= 0 and c.tk[src] == TK_OBJ:
         let sp = bind.get_prop(&c, src, kname)
         if sp >= 0:
+          sps.push(sp)
           odecl = types.order_decl_of(c, sp)
           opt = (c.sflags[sp] & SF_OPTIONAL) != 0
           ro = (c.sflags[sp] & SF_READONLY) != 0
@@ -1175,6 +1676,7 @@ fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) 
           if c.tk[mem] != TK_OBJ: continue
           let sp = bind.get_prop(&c, mem, kname)
           if sp < 0: continue
+          sps.push(sp)
           if not seen_p: odecl = types.order_decl_of(c, sp)
           seen_p = true
           if (c.sflags[sp] & SF_OPTIONAL) == 0: all_opt = false
@@ -1201,6 +1703,15 @@ fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) 
         pt = bind.instantiate(&c, tmpl, m2)
         if opt: pt = types.filter_union(&c, pt, true, false)
         opt = false
+      # (exactOptionalPropertyTypes, a homomorphic T[P] of an optional property: T[P] reads it
+      # with the missing type, which the mapped property's type keeps and relations and printing
+      # remove; here the source properties' own types, which have no undefined for being optional)
+      if pt < 0 and c.exact_opt and opt and (fl & ast.MAP_OPTIONAL) == 0 and sps.len > 0 and c.tk[tmpl] == types.TK_INDEXED and c.tb[tmpl] == tp and src >= 0:
+        let tobj = bind.instantiate(&c, c.ta[tmpl], m2)
+        if tobj == src:
+          var dts: [Int] = []
+          for sp1 in sps: dts.push(bind.prop_type_for(&c, sp1, src))
+          pt = types.inter_of(&c, dts)
       if (fl & ast.MAP_READONLY) != 0: ro = true
       if (fl & ast.MAP_NOREADONLY) != 0: ro = false
       let ps = types.new_sym(&c, S_PROP, name, n)
@@ -1217,26 +1728,37 @@ fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) 
       if ro: f = f | SF_READONLY
       c.sflags[ps] = f
       types.add_prop(&c, t, name, ps)
+  # (the declarations tsc 7 orders its properties by when it prints them (show.mapped_names): the
+  # source properties', which an as clause that renames keys doesn't keep, shouldLinkPropDeclarations)
+  if renamed:
+    for rn in types.ints(c.objs[o].order): c.order_decl[c.objs[o].props[rn]] = -1
   c.objs[o].resolved = true
   # a mapped type over concrete keys made concrete properties: nothing in it to instantiate
   var concrete = true
+  # (the lazy properties' mappers differ only in the key, a literal: the template's other type
+  # parameters are the same for each, so they are looked at once)
+  var lazy_conc = -1
   for name in types.ints(c.objs[o].order):
     let ps1 = c.objs[o].props[name]
     if c.stype[ps1] >= 0:
       if chk.could_contain_tvars(&c, c.stype[ps1]): concrete = false
     elif ps1 in c.lazy_inst:
       # (a lazy one: concrete when the template is, or what the mapper gives is)
-      let li = types.ints(c.lazy_inst[ps1])
-      if chk.could_contain_tvars(&c, c.stype[li[0]]):
-        # (the type parameters the template mentions, as the mapper gives them)
-        let tn = c.t.nd[n].c
-        if not (tn in c.cond_free):
-          var refs: [Int] = []
-          free_tp_refs(&c, tn, tn, &refs)
-          c.cond_free[tn] = refs
-        for ftp in types.ints(c.cond_free[tn]):
-          let x = bind.instantiate(&c, ftp, li[1])
-          if chk.could_contain_tvars(&c, x): concrete = false
+      if lazy_conc < 0:
+        lazy_conc = 1
+        let li = types.ints(c.lazy_inst[ps1])
+        if chk.could_contain_tvars(&c, c.stype[li[0]]):
+          # (the type parameters the template mentions, as the mapper gives them)
+          let tn = c.t.nd[n].c
+          if not (tn in c.cond_free):
+            var refs: [Int] = []
+            free_tp_refs(&c, tn, tn, &refs)
+            c.cond_free[tn] = refs
+          for ftp in types.ints(c.cond_free[tn]):
+            if ftp == tp: continue
+            let x = bind.instantiate(&c, ftp, m)
+            if chk.could_contain_tvars(&c, x): lazy_conc = 0
+      if lazy_conc == 0: concrete = false
     else: concrete = false
   if c.objs[o].sidx >= 0 and chk.could_contain_tvars(&c, c.objs[o].sidx): concrete = false
   if c.objs[o].nidx >= 0 and chk.could_contain_tvars(&c, c.objs[o].nidx): concrete = false
@@ -1246,6 +1768,7 @@ fn mapped_over1(var c: C, n: Int, m: Int, tp: Int, cons: Int, src: Int, t: Int) 
 # ---- conditional types
 
 fn cond_of(var c: C, n: Int, m: Int) -> Int:
+  if c.inst_exit > 0: bind.budget_tick2(&c, "cond_of")
   # (conditional types resolved inside one another: tsc stops at an instantiation depth, with
   # error 2589; not modeled)
   if c.cond_depth > 50: return bind.lazy_unsupported(&c, n, "conditional types instantiated too deeply")
@@ -1271,7 +1794,22 @@ fn cond_of(var c: C, n: Int, m: Int) -> Int:
     return c.cond_shell[bk]
   c.cond_busy[bk] = cnt + 1
   let tk0 = c.tk.len
+  # (resolved as tsc resolves it, outside any relation being decided around it: cond_cache isn't
+  # keyed by the relation's flags, so a result found under the subtype relations would be kept for
+  # every later use, and a file's types would depend on the files checked before it)
+  let wsub = c.subtype
+  let wss = c.strict_sub
+  let wns = c.narrow_sub
+  let wcmp = c.comparable
+  c.subtype = false
+  c.strict_sub = false
+  c.narrow_sub = false
+  c.comparable = false
   var r = cond_of0(&c, n, ms)
+  c.subtype = wsub
+  c.strict_sub = wss
+  c.narrow_sub = wns
+  c.comparable = wcmp
   if c.debug_counts and c.cond_depth == 1:
     c.cond_miss[n] = c.cond_miss.get(n, 0) + c.tk.len - tk0
     c.cond_nmiss[n] = c.cond_nmiss.get(n, 0) + 1
@@ -1298,7 +1836,9 @@ fn cond_of(var c: C, n: Int, m: Int) -> Int:
 fn own_infers(var c: C, n: Int) -> [Int]:
   if not (n in c.ck_skip):
     var infs: [Int] = []
-    all_infers(c, n, &infs)
+    # (a mapped type's infer declarations belong to the conditional type around it: they are
+    # its arguments here, { [K in Tg]: infer R })
+    if c.t.nd[n].k != ast.N_TMAPPED: all_infers(c, n, &infs)
     var skip: [Int] = []
     for x in infs:
       let ts0 = bind.tparam_sym(&c, c.t.nd[x].a)
@@ -1354,8 +1894,9 @@ fn cond_of0(var c: C, n: Int, m: Int) -> Int:
       if same_members(c, ct, ts0): return ct
       return types.union_of(&c, ts0)
   if is_generic(&c, ct) or free_generic(&c, checkn, m):
-    # ([A] extends [B] with a generic element: deferred, checkTuples)
-    if tuple_check_deferred(&c, n, ct):
+    # ([A] extends [B] with a generic element: deferred, checkTuples; a tuple with a variadic
+    # element still generic, [X, ...T], is a generic object type itself, isGenericTupleType)
+    if tuple_check_deferred(&c, n, ct) or bind.variadic_tuple(c, ct):
       let ck0 = cond_key(&c, n, m)
       return interned(&c, ck0, TK_COND, types.F_COND, n, m)
     # generic but not deferred (isGenericType is about the top level): decided when the
@@ -1487,6 +2028,14 @@ fn ck_relevant(var c: C, n: Int, f: Int) -> Bool:
     own_infers(&c, n)
     var names: {Int: Bool} = {}
     rel.mention_names(c, n, &names)
+    # (a mapped type's infer declarations, { [K in Tg]: infer R }: the conditional type around
+    # it gives them)
+    if c.t.nd[n].k == ast.N_TMAPPED:
+      var infs: [Int] = []
+      all_infers(c, n, &infs)
+      for x in infs:
+        let ts0 = bind.tparam_sym(&c, c.t.nd[x].a)
+        if ts0 >= 0: names[c.sname[ts0]] = true
     c.ck_names[n] = names
   if f < 0 or c.tk[f] != TK_TPARAM: return false
   let nm = c.sname[c.ta[f]]
@@ -1505,7 +2054,15 @@ fn ck_relevant(var c: C, n: Int, f: Int) -> Bool:
     let ik = (n << 24) | f
     if not (ik in c.ck_inside):
       let owner = bind.up(c, fdecl)
-      c.ck_inside[ik] = not (owner >= 0 and not chk.inside(c, n, owner))
+      var ins = not (owner >= 0 and not chk.inside(c, n, owner))
+      # (an interface declared more than once: its type parameters are its first declaration's,
+      # seen in every declaration)
+      if not ins and owner >= 0 and owner in c.nsym:
+        let os = c.nsym[owner]
+        if os in c.smore:
+          for od in types.sym_decls(c, os):
+            if chk.inside(c, n, od): ins = true
+      c.ck_inside[ik] = ins
     if not c.ck_inside[ik]: return false
   return true
 
@@ -1554,12 +2111,21 @@ fn free_generic(var c: C, chk0: Int, m: Int) -> Bool:
   return false
 
 fn free_tp_refs(var c: C, root: Int, n: Int, var out: [Int]):
+  free_tp_refs1(&c, root, n, false, &out)
+
+fn free_tp_refs1(var c: C, root: Int, n: Int, in_cond: Bool, var out: [Int]):
   if n <= 0: return
   let k = c.t.nd[n].k
   if k == ast.N_LIST:
-    for x in ast.items(c.t, n): free_tp_refs(&c, root, x, &out)
+    for x in ast.items(c.t, n): free_tp_refs1(&c, root, x, in_cond, &out)
     return
   if k == ast.N_ID or k == ast.N_STR or k == ast.N_NUM: return
+  if k == ast.N_TINFER and not in_cond:
+    # (infer R not under a conditional type inside: one of the conditional type around, free here)
+    let isym = bind.tparam_sym(&c, c.t.nd[n].a)
+    if isym >= 0:
+      let it = c.sdtype[isym]
+      if it >= 0 and not types.has_int(out, it): out.push(it)
   if k == ast.N_TREF:
     let nn = c.t.nd[n].a
     if nn >= 0 and c.t.nd[nn].k == ast.N_ID:
@@ -1567,8 +2133,9 @@ fn free_tp_refs(var c: C, root: Int, n: Int, var out: [Int]):
       if s >= 0 and (c.sk[s] & types.S_TPARAM) != 0 and c.sdecl[s] >= 0 and not chk.inside(c, c.sdecl[s], root):
         let t = c.sdtype[s]
         if t >= 0 and not types.has_int(out, t): out.push(t)
+  let ic = in_cond or k == ast.N_TCOND
   for ch in [c.t.nd[n].a, c.t.nd[n].b, c.t.nd[n].c, c.t.nd[n].d]:
-    if ch > 0: free_tp_refs(&c, root, ch, &out)
+    if ch > 0: free_tp_refs1(&c, root, ch, ic, &out)
 
 fn permissive_pick(var c: C, n: Int, m0: Int, ct: Int) -> Int:
   if is_deferred(c, ct): return -1
@@ -1680,12 +2247,15 @@ fn cond_one(var c: C, n: Int, m0: Int, ct: Int) -> Int:
       elif inf.contra[i].len > 0: it = contra_inference(&c, types.ints(inf.contra[i]))
       # (one the constraint doesn't take, none (unknown) among them: the constraint, getInferredType)
       let cn = rel.constraint_of(&c, tps[i])
-      if cn >= 0 and c.tk[cn] != TK_UNKNOWN and c.tk[it] != TK_UNSUP and not chk.could_contain_tvars(&c, cn) and not rel.assignable(&c, it, cn): it = cn
+      if cn >= 0 and c.tk[cn] != TK_UNKNOWN and c.tk[it] != TK_UNSUP and not chk.could_contain_tvars(&c, cn) and not rel.assignable_plain(&c, it, cn): it = cn
       to.push(it)
     let im = types.new_mapper(&c, tps, to)
     m2 = compose(&c, m, im)
-  let g6_83 = raw(&c, c.t.nd[n].b)
-  let ext = bind.instantiate(&c, g6_83, m2)
+  # (no infer declarations: the same mapper, the same extends type, instantiated once)
+  var ext = ext0
+  if m2 != m or ext0 == c.any_t:
+    let g6_83 = raw(&c, c.t.nd[n].b)
+    ext = bind.instantiate(&c, g6_83, m2)
   if c.tk[ext] == TK_UNSUP: return ext
   # a generic extends type (after inference): deferred (getConditionalType; a written tuple's
   # elements too, checkTuples)
@@ -1758,3 +2328,31 @@ fn infer_named(c: C, cond: Int, name: Int) -> Int:
   for inn in infers:
     if c.t.nd[c.t.nd[inn].a].s == name: return c.t.nd[inn].a
   return -1
+
+# Whether a mapped type written as an alias's body refers to that alias in its template (a
+# recursive type, react-hook-form's DeepPartial: over any it stays any here, see mapped_type).
+# Whether a type parameter's constraint is only array and tuple types (everyType(constraint,
+# isArrayOrTupleType)).
+fn arrays_only(var c: C, tv: Int) -> Bool:
+  let t = rel.constraint_of(&c, tv)
+  if t < 0: return false
+  for x in types.members(c, t):
+    if c.tk[x] != TK_OBJ: return false
+    if not rel.is_array_ref(&c, x) and c.objs[c.ta[x]].kind != OK_TUPLE: return false
+  return true
+
+fn mapped_recursive(c: C, n: Int) -> Bool:
+  if n < 0 or n >= c.parent.len: return true
+  var up = c.parent[n]
+  while up >= 0 and c.t.nd[up].k == ast.N_TPAREN: up = c.parent[up]
+  # (the object of an indexed access that is the alias, sequelize's NullishPropertiesOf<T>,
+  # { [P in keyof T]-?: ... }[keyof T])
+  if up >= 0 and c.t.nd[up].k == ast.N_TINDEXED and c.t.nd[up].a >= 0:
+    var oa = c.t.nd[up].a
+    while c.t.nd[oa].k == ast.N_TPAREN: oa = c.t.nd[oa].a
+    if oa == n:
+      up = c.parent[up]
+      while up >= 0 and c.t.nd[up].k == ast.N_TPAREN: up = c.parent[up]
+  if up < 0 or c.t.nd[up].k != ast.N_TYPEALIAS: return true
+  let name = c.t.nd[up].s
+  return name < 0 or rel.mentions(c, c.t.nd[n].c, name)

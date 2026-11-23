@@ -1,0 +1,11 @@
+import type { U, W, M, V2 } from './w';
+declare const e2: W<U>;
+declare const e4: M<U>;
+declare const e5: W<'b'>;
+declare const e6: V2;
+declare const e7: W<U> | undefined;
+export const n2: number = e2;
+export const n4: number = e4;
+export const n5: number = e5;
+export const n6: number = e6;
+export const n7: number = e7;

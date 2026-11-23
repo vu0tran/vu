@@ -1,0 +1,18 @@
+declare const s: string;
+const w = (s.match(/[a-z]+/g) ?? []).sort((a, b) => { const q: number = a; return b.length - a.length; });
+const n1: number = w;
+const w2 = (s.match(/x/) ?? []).map((a) => a.length);
+const n2: number = w2;
+const w3 = (s.match(/x/) ?? []).filter((a) => a.length > 1);
+const n3: number = w3;
+declare const u: string[] | number[];
+const w4 = u.sort((a, b) => 0);
+const n4: number = w4;
+const w5 = (s.match(/x/) ?? []).find((a) => a.length > 1);
+const n5: number = w5;
+declare const v: { f(x: string): number } | { f(x: string | number): boolean };
+const w6 = v.f('a');
+const n6: string = w6;
+declare const v2: { f(x: string, y?: number): number } | { f(x: string): string };
+const w7 = v2.f('a');
+const n7: boolean = w7;

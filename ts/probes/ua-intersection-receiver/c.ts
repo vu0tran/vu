@@ -1,0 +1,10 @@
+import { Address, Lead } from './missing';
+declare const ADDRESS: Address;
+declare const LEAD: Lead;
+type Base = { address: Address; n: number };
+type Opts = Base & { m: number };
+type Opts2 = Base & { lead: Lead };
+declare function f(o: Opts): void;
+declare function f2(o: Opts2): void;
+f({ address: ADDRESS, n: 1, m: 1 });
+f2({ address: ADDRESS, n: 1, lead: LEAD });

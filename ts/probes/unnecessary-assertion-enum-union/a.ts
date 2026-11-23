@@ -1,0 +1,11 @@
+import type { E as G } from './e';
+import { E } from './e';
+declare const g1: G[];
+export const x1 = g1 as E[];
+declare const r1: { [k: string]: G };
+export const x2 = Object.values(r1) as E[];
+const m = { A: 'A_X', B: 'B_X' } as const;
+declare const r2: { readonly [K in keyof typeof m]: G };
+export const x3 = Object.values(r2) as E[];
+declare const r3: { a: G; b: G };
+export const x4 = Object.values(r3) as E[];

@@ -1,0 +1,12 @@
+import { Address } from './missing';
+declare const ADDRESS: Address;
+declare const A2: any;
+type Base = { address: Address; n: number };
+type Base2 = { address: string; n: number };
+declare function g(o: Base): void;
+declare function g2(o: Base2): void;
+g({ address: ADDRESS, n: 1 });
+g({ address: A2, n: 1 });
+g2({ address: ADDRESS, n: 1 });
+g2({ address: A2, n: 1 });
+export const o1: Base = { address: ADDRESS, n: 1 };

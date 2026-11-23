@@ -1,0 +1,44 @@
+// no-unnecessary-type-assertion: x! of a non-nullable type, x! where the receiver takes the nullable type, x as T of the same type
+import { E, mk } from '@gql';
+declare const s: string;
+declare const ns: string | null;
+declare const us: string | undefined;
+declare const a: any;
+declare const u: unknown;
+declare const e: E;
+declare function f(x: string): void;
+declare function g(x: string | null): void;
+declare function h(x: string | undefined): void;
+declare function mkS(): string;
+export const v1 = s!;
+export const v2 = ns!;
+f(ns!); g(ns!); h(us!); g(us!);
+f(a!); f(e!); f(u!); f(mk()!); f(mkS()!);
+const o = { p: 'x' as string, q: ns };
+export const v3 = o.p!;
+export const v4 = o.q!;
+let lt: string;
+export function r1() { return lt!; }
+let lt2: string | null = null;
+export function r2() { return lt2!; }
+export const c1 = s as string;
+export const c2 = 'a' as 'a';
+let c3 = 'a' as 'a';
+export const c4 = ns as string | null;
+export const c5 = s;
+export const c6 = a as any;
+export const c7 = e as E;
+export const c8 = ['a'] as const;
+export const c9 = 'x' as const;
+export const c10 = { a: 1 } as { a: number };
+export const c11 = (ns as string | null)!;
+type S = string;
+export const c12 = s as S;
+const x1: string | null = ns!;
+let y1: string | null = null;
+y1 = ns!;
+y1 = 'a';
+export const c13 = `${ns!}`;
+export const c14 = [ns!];
+export const c15 = { k: ns! };
+export { c3, x1 };

@@ -1,0 +1,11 @@
+let a = [];
+a = [...new Set([1])];
+const q1: string = a;
+let b = [];
+b = [...document.querySelectorAll('x')];
+const q2: string = b;
+declare const nl: NodeListOf<Element>;
+let e = [];
+e = [...nl];
+const q3: string = e;
+export {};

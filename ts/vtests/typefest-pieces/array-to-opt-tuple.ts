@@ -1,0 +1,10 @@
+declare const s: string[];
+const a: [string?, ...string[]] = s;
+const b: [string?, number?] = s;
+const c: [string, ...string[]] = s;
+const d: [number?, ...string[]] = s;
+const e: readonly [string?, ...string[]] = s;
+declare const r: readonly string[];
+const f: [string?, ...string[]] = r;
+const g: [(string | number)?, ...(string | number)[]] = s;
+export {};

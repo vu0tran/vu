@@ -1,0 +1,30 @@
+type PageState = 'login' | 'password' | 'session';
+export const a1 = (options: { start?: PageState; afterLogin?: PageState } = {}) => {
+  let p = options.start ?? 'login';
+  const x: [typeof p] = 0;
+  const visible = (selector: string): boolean => {
+    const controls: Record<PageState, string[]> = { login: [], password: [], session: [] };
+    return selector.split(',').some((part) => controls[p].includes(part));
+  };
+  return visible;
+};
+declare const s: PageState | undefined;
+declare const one: 'login' | undefined;
+declare const b: boolean;
+let p2 = s ?? 'login';
+const x2: [typeof p2] = 0;
+let p3 = s || 'zzz';
+const x3: [typeof p3] = 0;
+let p4 = b ? s : 'session';
+const x4: [typeof p4] = 0;
+let p5 = one ?? 'login';
+const x5: [typeof p5] = 0;
+let p6 = s ?? (b ? 'login' : 'password');
+const x6: [typeof p6] = 0;
+declare const n: 1 | 2 | undefined;
+let p8 = n ?? 2;
+const x8: [typeof p8] = 0;
+let p9 = n ?? 3;
+const x9: [typeof p9] = 0;
+let p10 = b ? true : b;
+const x10: [typeof p10] = 0;

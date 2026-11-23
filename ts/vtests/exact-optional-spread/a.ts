@@ -1,0 +1,18 @@
+type Legacy = { a?: boolean; b?: string; scalars?: string | { [k: string]: string }; x?: boolean } & { c?: number };
+type Std = Omit<Legacy, "x">;
+type SM = Extract<NonNullable<Std["scalars"]>, object>;
+type StdS = Std & { scalars: SM };
+type LegS = Legacy & { scalars: SM };
+const g: (s: SM) => StdS = (scalars) => ({ a: true, scalars }) satisfies StdS;
+const h: (s: SM) => LegS = (scalars) => ({ ...g(scalars), x: true }) satisfies LegS;
+declare const i: StdS;
+const j = { ...i, x: true };
+const k: number = j;
+declare const bb: boolean;
+const pp = { k: 1, ...(bb ? { e: true } : {}) } satisfies { k: number; e?: true };
+const pp1: number = pp;
+const qq = { k: 1, ...(bb ? { k: 2 } : {}) };
+const qq1: number = qq;
+declare const ox: { a: number } | undefined;
+const rr = { ...ox };
+const rr1: number = rr;

@@ -1,0 +1,15 @@
+declare function f1(p: unknown[]): void;
+declare function f2(p: Promise<unknown>): void;
+declare function f3(p: { x: unknown }): void;
+declare function f4(p: unknown): void;
+declare const a1: any[];
+declare const a2: Promise<any>;
+declare const a3: { x: any };
+declare const a4: Map<string, any>;
+f1(a1 as unknown[]);
+f2(a2 as Promise<unknown>);
+f3(a3 as { x: unknown });
+f4(a4 as unknown);
+f1(a1 as any);
+f2(a2 as any);
+f3(a3 as any);
