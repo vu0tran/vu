@@ -22,10 +22,14 @@ typedef struct vu_memo {
     vu_memo_ent **b;
     int64_t nb, n, done;
 } vu_memo;
-static pthread_mutex_t vu_memo_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t vu_memo_cond = PTHREAD_COND_INITIALIZER;
+/* (VU_G, not static: a program built in parts (VU_PART) has one copy of each for all of them; static,
+   each part had its own lock, condition variable and thread identity, so two threads running
+   different parts' code claimed and grew one Memo's table at once: freed it twice, corrupted the heap,
+   and a waiter could miss the fill that would wake it) */
+VU_G pthread_mutex_t vu_memo_lock VU_GI(PTHREAD_MUTEX_INITIALIZER);
+VU_G pthread_cond_t vu_memo_cond VU_GI(PTHREAD_COND_INITIALIZER);
 VU_G __thread int vu_memo_depth;   /* how many values this thread is computing */
-static __thread vu_memo_who vu_memo_me;
+VU_G __thread vu_memo_who vu_memo_me;
 
 static vu_memo *vu_memo_new(void (*dropv)(void *)) {
     vu_memo *m = (vu_memo *)calloc(1, sizeof *m);

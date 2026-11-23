@@ -3074,3 +3074,17 @@ how the runner's DNS server answers; the buffer is the C library's, so sanitizer
 leaks allocated there out (`__lsan_default_suppressions`). `services (ubuntu-24.04)` failed once on
 `run_mail.sh`: the test's SMTP server couldn't bind the port found free for it ("address already in
 use"); tests/mail/server.py now starts each server again on a new port when that happens.
+
+**Memo in split builds (2026-11-23).** vgolint crashed in about half of its cold runs on a
+2,981-package Go repository on macOS: SIGABRT ("pointer being freed was not allocated") or SIGTRAP
+from inside `vu_memo_claim`, now and then a crash in `realloc` elsewhere; vgolint v0.3.0 crashed 4 of
+8 times. Never in sanitizer, `--profile` or `--malloc` builds, which aren't split: an optimized build
+of a big program is compiled in parts (VU_PART), and memo.c's lock, condition variable and per-thread
+identity were `static`, so each of vgolint's 60 parts had its own. Two threads running different
+parts' code claimed and grew one Memo's table at once (the old table freed twice), and a waiter could
+miss the fill that would wake it. They are `VU_G` now, one copy for all parts, as the node pools'
+locks already were. After: 0 crashes in 20 cold runs (12 of 18 before, the same program built from
+main), the same output each time. `tests/run_split.sh`'s check that no part has its own copy of the
+runtime's state looked only at the compiler, which doesn't use Memo: it now checks a split build of
+vgolint too (Memo, tasks, channels), and fails on the old compiler with `vu_memo_cond` and
+`vu_memo_lock` defined in more than one part.
