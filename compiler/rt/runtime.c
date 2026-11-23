@@ -1148,7 +1148,7 @@ static void vu_guard_init(void *top) {
 /* main runs on a thread with a 256 MB stack (reserved, not committed), so deeply recursive code such
    as parsers and compilers works; recursion past that still stops cleanly with "stack overflow". */
 #define VU_MAIN_STACK ((size_t)256 << 20)
-static int (*vu_main_fn)(void);
+VU_G int (*vu_main_fn)(void);   /* (one for all of a split build's parts, as memo.c's state) */
 VU_G int vu_main_rc;
 static void vu_thread_guard(void);
 /* The main thread exits the process itself, while it's still alive: its thread-local free lists then
