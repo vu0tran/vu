@@ -3,21 +3,31 @@
 import os, random, socket, subprocess, sys, time, urllib.request, urllib.error
 import boto3
 
-def ready(port):
-    # the socket accepts before the app behind it answers: wait for an answer (up to 60 s, on a busy machine)
-    for _ in range(600):
+def ready(port, proc):
+    # the socket accepts before the app behind it answers: wait for an answer (up to 60 s, on a busy
+    # machine); False if the server exited first (its port taken, say) or never answered
+    end = time.time() + 60
+    while time.time() < end:
+        if proc.poll() is not None: return False
         try:
             urllib.request.urlopen("http://127.0.0.1:%d/moto-api/" % port, timeout=2).read()
-            return
+            return True
         except Exception:
             time.sleep(0.1)
-    raise SystemExit("moto didn't start on port %d" % port)
+    return False
 
-port = random.randint(20000, 40000)
+def start(lo, hi, env=None):
+    # a moto server on a free port in [lo, hi]: started again on another one when it doesn't come up
+    for _ in range(4):
+        port = random.randint(lo, hi)
+        proc = subprocess.Popen([sys.executable, "-m", "moto.server", "-p", str(port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if ready(port, proc): return port, proc
+        proc.kill(); proc.wait()
+    raise SystemExit("moto didn't start (4 ports tried in %d-%d)" % (lo, hi))
+
 env = dict(os.environ, INITIAL_NO_AUTH_ACTION_COUNT="4")
-srv = subprocess.Popen([sys.executable, "-m", "moto.server", "-p", str(port)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+port, srv = start(20000, 40000, env)
 try:
-    ready(port)
     ep = "http://127.0.0.1:%d" % port
     iam = boto3.client("iam", endpoint_url=ep, region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
     iam.create_user(UserName="app")
@@ -35,10 +45,8 @@ try:
     # moto answers 500 to any presigned URL while it checks signatures (boto3's own too), so the
     # presigned URLs are checked for where they lead on a second server that doesn't (their signatures
     # are checked against botocore's in model.py)
-    port2 = random.randint(40001, 60000)
-    srv2 = subprocess.Popen([sys.executable, "-m", "moto.server", "-p", str(port2)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    port2, srv2 = start(40001, 60000)
     try:
-        ready(port2)
         ep2 = "http://127.0.0.1:%d" % port2
         open_s3 = boto3.client("s3", endpoint_url=ep2, region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
         open_s3.create_bucket(Bucket="vu-test")
