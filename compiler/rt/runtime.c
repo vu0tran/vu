@@ -1173,7 +1173,19 @@ static void vu_prof_tick(int sig) {
     (void)sig;
     int saved = errno;
     int i = __atomic_fetch_add(&vu_prof_taken, 1, __ATOMIC_RELAXED);
-    if (i < VU_PROF_MAX) {
+    /* past the first VU_PROF_MAX ticks, reservoir sampling: tick i replaces a random row with
+       probability VU_PROF_MAX / (i + 1), so the rows stay a uniform sample of the whole run (keeping
+       only the first ticks profiled a long run's first half minute). The random number is a hash of
+       i: no state a signal handler would share. */
+    if (i >= VU_PROF_MAX) {
+        uint64_t z = (uint64_t)i * 0x9E3779B97F4A7C15ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        z ^= z >> 31;
+        uint64_t j = z % ((uint64_t)i + 1);
+        i = j < VU_PROF_MAX ? (int)j : -1;
+    }
+    if (i >= 0) {
         vu_pf *row = vu_prof_rows + (size_t)i * VU_PROF_DEPTH;
         int d = 0;
         for (vu_frame *f = vu_top; f && d < VU_PROF_DEPTH; f = f->prev) { row[d].name = f->name; row[d].loc = f->loc; d++; }
