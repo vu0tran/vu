@@ -298,6 +298,26 @@ Tried within the forked model, outputs identical each time, none kept:
 - the read-ahead as joined C threads where the shards fork, with 200 or 100 files a worker: the job
   76.9 and 73.3 s against 74.1 s without, within the run-to-run spread (about 3 s).
 
+A shared type table (the redesign this would take), as scoped on 2026-11-24, not started:
+- The state: `types.C` has 476 fields; 1,222 functions take `var c: C`; the type tables are read
+  in about 8,000 places (`c.tk[` 2,800, `c.objs[` 1,721, `c.ta[` 1,299, `c.sigs[` 774), and
+  binding's tables (`c.sdecl`, `c.sk`, `c.stype`, `c.sdtype`...) are written lazily during checking,
+  so "frozen bound data" doesn't exist yet: binding finishes while checking.
+- Vu's tasks share only frozen values (Memo, channels). A table several threads add types to
+  would live in C (FFI): every one of those reads becomes an extern call, in the checker's
+  hottest loops, unless the language gains shared, growable, lock-protected or append-only
+  tables (a runtime and compiler change, with the gate).
+- Determinism: union members are ordered by TypeScript 7's compareTypes (types.cmp_types: kind,
+  value, declaration), with the type id as the last tie-break; an id given by whichever worker
+  makes a type first would reach that tie-break, and every cache keyed by ids (relations,
+  instantiations by mapper id) would differ run to run. Ids would have to be canonical (structural
+  keys) or the tie-breaks removed, checked against tsgolint's text.
+- The most it could save: the re-typing a shard does (33-40% of a shard's check, table above),
+  so a mid-sized program's check on four workers from about 0.7-1.0 s to 0.3-0.4 s; read, resolve
+  and parse (0.45-0.7 s a program) stay serial. Over the 66 invocations whose critical path is the
+  type-aware check, that is perhaps 10-15 s of the job's 71-75 s: about the 20% asked for at best,
+  for a rewrite of most of vtsc's checker.
+
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
 against oxlint's 74-76 s, outputs identical; the run that fills them 81.6 s.
