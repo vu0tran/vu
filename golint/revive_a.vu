@@ -1,0 +1,869 @@
+# revive rules, group a (mgechev/revive v1.17.0's rule/*.go): "exported", "package-comments", "var-naming", "receiver-naming", "error-naming", "time-naming", "blank-imports", "dot-imports"
+# Each rule adds its failures for file x.fi of package x.pi (revive.add); x.args[rule] is the rule's
+# `arguments` node in the config (-1: none, the rule's defaults).
+
+import ast
+import pkg
+import tc
+import cfg
+import doc
+import vet
+import deprecated
+import revive_core
+from scan import K_CONST, K_VAR, K_TYPE, K_IMPORT, T_ASSIGN
+
+# The rules this file has (names() lists only the ones ported so far)
+fn names() -> [Str]:
+  return ["exported", "package-comments", "var-naming", "receiver-naming", "error-naming", "time-naming", "blank-imports", "dot-imports"]
+
+fn apply(var g: tc.Prog, fs: Fs, var x: revive_core.Ctx, p: pkg.Pkg, name: Str, c: cfg.Cfg):
+  var args = -1
+  if name in x.args: args = x.args[name]
+  let pi = x.pi
+  if name == "exported": exported(g.pk[pi].t, &x, p, c.d, args)
+  elif name == "package-comments": package_comments(g.pk[pi].t, &x, p)
+  elif name == "var-naming": var_naming(g.pk[pi].t, &x, p, c.d, args)
+  elif name == "receiver-naming": receiver_naming(g.pk[pi].t, &x, p, c.d, args)
+  elif name == "error-naming": error_naming(g.pk[pi].t, &x, p)
+  elif name == "time-naming": time_naming(&g, fs, &x, p)
+  elif name == "blank-imports": blank_imports(g.pk[pi].t, &x, p)
+  elif name == "dot-imports": dot_imports(g.pk[pi].t, &x, p, c.d, args)
+
+# ---- shared helpers
+
+fn nm(t: ast.Ast, n: Int) -> Str:
+  return t.names[t.s[n]] + ""
+
+fn kind(t: ast.Ast, n: Int) -> Int:
+  if n <= 0: return 0
+  return t.k[n]
+
+fn first_code(s: Str) -> Int:
+  if s.len == 0: return -1
+  if int(s[0]) < 128: return int(s[0])
+  var n = 1
+  while n < s.len and n < 4 and (int(s[n]) & 192) == 128: n += 1
+  let cs = s[0..n].codes()
+  if cs.len == 0: return -1
+  return cs[0]
+
+fn is_upper_cp(r: Int) -> Bool:
+  if r >= 65 and r <= 90: return true
+  if r < 128: return false
+  return chr(r).is_upper()
+
+fn is_lower_cp(r: Int) -> Bool:
+  if r >= 97 and r <= 122: return true
+  if r < 128: return false
+  return chr(r).is_lower()
+
+fn is_digit_cp(r: Int) -> Bool:
+  if r >= 48 and r <= 57: return true
+  if r < 128: return false
+  return chr(r).is_decimal()
+
+# ast.IsExported
+fn is_exported(s: Str) -> Bool:
+  let r = first_code(s)
+  return r >= 0 and is_upper_cp(r)
+
+# config.NormalizeOption
+fn norm_opt(s: Str) -> Str:
+  return s.lower().replace("-", "")
+
+# (revive's package holds the files it lints: generated ones are left out)
+fn is_main_pkg(t: ast.Ast, p: pkg.Pkg) -> Bool:
+  for j in 0..p.roots.len:
+    if not p.hgen[j] and nm(t, t.a[p.roots[j]]) == "main": return true
+  return false
+
+# The doc comment group (lead comment) right before pos: [first, last] comment indexes, or []
+fn doc_at(p: pkg.Pkg, fi: Int, pos: Int) -> [Int]:
+  return deprecated.doc_group(p.srcs[fi], p.comments[fi], pos)
+
+# CommentGroup.Text() ("" for none)
+fn gtext(p: pkg.Pkg, fi: Int, gr: [Int]) -> Str:
+  if gr.len == 0: return ""
+  return deprecated.group_text(p.srcs[fi], p.comments[fi], gr[0], gr[1] + 3)
+
+fn gstart(p: pkg.Pkg, fi: Int, gr: [Int]) -> Int:
+  return p.comments[fi][gr[0]]
+
+fn gend(p: pkg.Pkg, fi: Int, gr: [Int]) -> Int:
+  return p.comments[fi][gr[1] + 1]
+
+fn count_nl(src: Str, a: Int, b: Int) -> Int:
+  var n = 0
+  for i in a..b:
+    if src[i] == '\n': n += 1
+  return n
+
+# Whether the spec ending at endp has a line comment (go/parser's lineComment after it)
+fn has_line_comment(p: pkg.Pkg, fi: Int, endp: Int) -> Bool:
+  let src = p.srcs[fi]
+  let cm = p.comments[fi]
+  var i = 0
+  while i < cm.len and cm[i] < endp: i += 3
+  if i >= cm.len: return false
+  # only spaces (and an explicit semicolon) between the spec and the comment
+  var j = endp
+  var semi = false
+  while j < cm[i]:
+    let ch = src[j]
+    if ch == ';' and not semi: semi = true
+    elif ch != ' ' and ch != '\t': return false
+    j += 1
+  # the group: comments starting on the line the previous one ends on
+  var e = i
+  while e + 3 < cm.len and count_nl(src, cm[e + 1], cm[e + 3]) == 0:
+    # (a token between them ends the group)
+    var only_ws = true
+    for q in cm[e + 1]..cm[e + 3]:
+      if src[q] != ' ' and src[q] != '\t' and src[q] != '\r':
+        only_ws = false
+        break
+    if not only_ws: break
+    e += 3
+  # the next token on another line (or a semicolon, or the end)
+  var q = cm[e + 1]
+  while q < src.len and (src[q] == ' ' or src[q] == '\t' or src[q] == '\r'): q += 1
+  if q >= src.len: return true
+  if src[q] == '\n' or src[q] == ';': return true
+  return false
+
+fn add(var x: revive_core.Ctx, rule: Str, msg: Str, conf: Float, pos: Int, endp: Int):
+  revive_core.add(&x, rule, msg, conf, pos, endp)
+
+# The nodes of file fi, in preorder
+fn file_nodes(t: ast.Ast, root: Int) -> [Int]:
+  var out: [Int] = []
+  var stack: [Int] = [root]
+  while stack.len > 0:
+    let n = stack.pop()
+    out.push(n)
+    vet.push_kids(t, n, &stack)
+  return out
+
+# typeparams.ReceiverType
+fn recv_type(t: ast.Ast, fd: Int) -> Str:
+  let f0 = ast.item(t, t.a[fd], 0)
+  var e = t.b[f0]
+  if kind(t, e) == ast.N_STAR: e = t.a[e]
+  if kind(t, e) == ast.N_INDEX: e = t.a[e]
+  if kind(t, e) == ast.N_IDENT: return nm(t, e)
+  return "invalid-type"
+
+fn is_method(t: ast.Ast, fd: Int) -> Bool:
+  return t.a[fd] >= 0 and ast.count(t, t.a[fd]) > 0
+
+# ---- exported
+
+type ExOpt:
+  priv: Bool        # PrivateReceivers disabled
+  pubif: Bool       # PublicInterfaces disabled
+  rep: Bool         # RepetitiveNames disabled
+  dconst: Bool
+  dfunc: Bool
+  dmethod: Bool
+  dtype: Bool
+  dvar: Bool
+  rep_msg: Str
+  pkgname: Str
+  sortable: {Str: Bool}
+  have_sortable: Bool
+
+fn ex_disabled(o: ExOpt, kind: Str) -> Bool:
+  if kind == "var": return o.dvar
+  if kind == "const": return o.dconst
+  if kind == "function": return o.dfunc
+  if kind == "method": return o.dmethod
+  if kind == "type": return o.dtype
+  return false
+
+fn first_comment_line(text: Str) -> Str:
+  for l in text.split("\n"):
+    let s = l.strip()
+    if s == "": continue
+    if s.startswith("Deprecated: "): break
+    return s + ""
+  return ""
+
+fn strip_first_rune(s: Str) -> Str:
+  if s.len == 0: return s + ""
+  let c = int(s[0])
+  if c < 128: return s[1..s.len]
+  var n = 0
+  if c >= 194 and c <= 223: n = 2
+  elif c >= 224 and c <= 239: n = 3
+  elif c >= 240 and c <= 244: n = 4
+  if n == 0 or s.len < n: return s + ""
+  if not s[0..n].is_utf8(): return s + ""
+  return s[n..s.len]
+
+# 0 ok, 1 missing, 2 case mismatch, 3 first letter mismatch, 4 unexpected
+fn go_doc_status(fcl: Str, name0: Str) -> Int:
+  if fcl == "": return 1
+  let pre = name0.strip() + " "
+  if fcl.startswith(pre): return 0
+  if not fcl.lower().startswith(pre.lower()): return 4
+  if strip_first_rune(fcl).startswith(strip_first_rune(pre)): return 3
+  return 2
+
+fn status_conf(st: Int) -> Float:
+  if st == 4: return 0.8
+  return 1.0
+
+fn correction_hint(st: Int, fcl: Str) -> Str:
+  var w = fcl + ""
+  let sp = fcl.find(" ")
+  if sp >= 0: w = fcl[0..sp]
+  if st == 2: return " by using its correct casing, not \"{w} ...\""
+  if st == 3: return " to match its exported status, not \"{w} ...\""
+  return ""
+
+fn type_name_of(t: ast.Ast, e: Int) -> Str:
+  let k = kind(t, e)
+  if k == ast.N_IDENT: return nm(t, e)
+  if k == ast.N_SELECTOR: return type_name_of(t, t.a[e]) + "." + type_name_of(t, t.b[e])
+  if k == ast.N_STAR: return "*" + type_name_of(t, t.a[e])
+  if k == ast.N_INDEX:
+    if ast.count(t, t.b[e]) == 1: return type_name_of(t, t.a[e]) + "[" + type_name_of(t, ast.item(t, t.b[e], 0)) + "]"
+    return "UNHANDLED_TYPE"
+  if k == ast.N_ARRAYTYPE: return "[]" + type_name_of(t, t.b[e])
+  if k == ast.N_IFACETYPE: return "interface{{}}"
+  return "UNHANDLED_TYPE"
+
+fn type_names(t: ast.Ast, l: Int) -> [Str]:
+  var out: [Str] = []
+  if l < 0: return out
+  for f in ast.items(t, l):
+    let tn = type_name_of(t, t.b[f])
+    if t.a[f] < 0 or ast.count(t, t.a[f]) == 0: out.push(tn + "")
+    else:
+      for _ in 0..ast.count(t, t.a[f]): out.push(tn + "")
+  return out
+
+fn same_strs(a: [Str], b: [Str]) -> Bool:
+  if a.len != b.len: return false
+  for i in 0..a.len:
+    if a[i] != b[i]: return false
+  return true
+
+fn sortable_flag(t: ast.Ast, fd: Int) -> Int:
+  let name = nm(t, t.b[fd])
+  let ft = t.c[fd]
+  let ps = type_names(t, t.b[ft])
+  let rs = type_names(t, t.c[ft])
+  if name == "Len" and same_strs(rs, ["int"]) and ps.len == 0: return 1
+  if name == "Less" and same_strs(rs, ["bool"]) and same_strs(ps, ["int", "int"]): return 2
+  if name == "Swap" and rs.len == 0 and same_strs(ps, ["int", "int"]): return 4
+  return 0
+
+fn scan_sortable(t: ast.Ast, p: pkg.Pkg) -> {Str: Bool}:
+  var flags: {Str: Int} = {}
+  for j in 0..p.roots.len:
+    if p.hgen[j]: continue
+    for d in ast.items(t, t.c[p.roots[j]]):
+      if t.k[d] != ast.N_FUNCDECL or not is_method(t, d): continue
+      let rt = recv_type(t, d)
+      var f = 0
+      if rt in flags: f = flags[rt]
+      flags[rt] = f | sortable_flag(t, d)
+  var out: {Str: Bool} = {}
+  for k, v in flags:
+    if v == 7: out[k + ""] = true
+  return out
+
+fn must_check_method(t: ast.Ast, p: pkg.Pkg, var o: ExOpt, fd: Int) -> Bool:
+  let rt = recv_type(t, fd)
+  if not is_exported(rt) and o.priv: return false
+  let name = nm(t, t.b[fd])
+  if name == "Error" or name == "Read" or name == "ServeHTTP" or name == "String" or name == "Write" or name == "Unwrap": return false
+  if name == "Len" or name == "Less" or name == "Swap":
+    if not o.have_sortable:
+      o.sortable = scan_sortable(t, p)
+      o.have_sortable = true
+    if rt in o.sortable: return false
+  return true
+
+fn ex_repetitive(t: ast.Ast, var x: revive_core.Ctx, o: ExOpt, id: Int, thing: Str):
+  if o.rep: return
+  let pk = o.pkgname
+  let name = nm(t, id)
+  if not is_exported(name): return
+  if name.len <= pk.len: return
+  if doc.lower(pk) != doc.lower(name[0..pk.len]): return
+  let rem = name[pk.len..name.len]
+  let nx = first_code(rem)
+  if nx == 95 or (nx >= 0 and is_upper_cp(nx)):
+    add(&x, "exported", "{thing} name will be used as {pk}.{name} by other packages, and that {o.rep_msg}; consider calling this {rem}", 0.8, t.pos[id], t.end[id])
+
+fn ex_func(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg, var o: ExOpt, fd: Int):
+  let fi = x.fi
+  let name = nm(t, t.b[fd])
+  if not is_exported(name): return
+  var kd = "function"
+  var full = name + ""
+  if is_method(t, fd):
+    if not must_check_method(t, p, &o, fd): return
+    kd = "method"
+    full = recv_type(t, fd) + "." + name
+  if ex_disabled(o, kd): return
+  let gr = doc_at(p, fi, t.pos[fd])
+  let fcl = first_comment_line(gtext(p, fi, gr))
+  let st = go_doc_status(fcl, name)
+  if st == 0: return
+  if st == 1:
+    add(&x, "exported", "exported {kd} {full} should have comment or be unexported", status_conf(st), t.pos[fd], t.end[fd])
+    return
+  add(&x, "exported", "comment on exported {kd} {full} should be of the form \"{name} ...\"{correction_hint(st, fcl)}", status_conf(st), gstart(p, fi, gr), gend(p, fi, gr))
+
+fn ex_type(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg, o: ExOpt, ts: Int, gr: [Int], fcl0: Str):
+  if o.dtype: return
+  let fi = x.fi
+  let tn = nm(t, t.a[ts])
+  if not is_exported(tn): return
+  if fcl0 == "":
+    add(&x, "exported", "exported type {tn} should have comment or be unexported", 1.0, t.pos[ts], t.end[ts])
+    return
+  var fcl = fcl0 + ""
+  var expected = tn + ""
+  for a in ["A", "An", "The", "This"]:
+    if tn == a: continue
+    if fcl.startswith(a + " "):
+      fcl = fcl[a.len + 1..fcl.len]
+      expected = a + " " + tn
+      break
+  let st = go_doc_status(first_comment_line(gtext(p, fi, gr)), expected)
+  if st == 0: return
+  add(&x, "exported", "comment on exported type {tn} should be of the form \"{tn} ...\" (with optional leading article){correction_hint(st, fcl)}", status_conf(st), gstart(p, fi, gr), gend(p, fi, gr))
+
+fn ex_value(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg, o: ExOpt, vs: Int, gd: Int, var missing: {Int: Bool}):
+  let fi = x.fi
+  var kd = "var"
+  if t.f[gd] == K_CONST: kd = "const"
+  if ex_disabled(o, kd): return
+  let ids = ast.items(t, t.a[vs])
+  if ids.len >= 2:
+    for i in 1..ids.len:
+      if is_exported(nm(t, ids[i])):
+        add(&x, "exported", "exported {kd} {nm(t, ids[i])} should have its own declaration", 1.0, t.pos[vs], t.end[vs])
+        return
+  let name = nm(t, ids[0])
+  if not is_exported(name): return
+  let paren = t.s[gd] == 1
+  var vgr: [Int] = []
+  if paren: vgr = doc_at(p, fi, t.pos[vs])
+  let ggr = doc_at(p, fi, t.pos[gd])
+  let vf = first_comment_line(gtext(p, fi, vgr))
+  let gf = first_comment_line(gtext(p, fi, ggr))
+  if vf == "" and gf == "":
+    if gd in missing: return
+    var block = ""
+    if kd == "const" and paren: block = " (or a comment on this block)"
+    add(&x, "exported", "exported {kd} {name} should have comment{block} or be unexported", 1.0, t.pos[vs], t.end[vs])
+    missing[gd] = true
+    return
+  if gf != "" and paren: return
+  var gr = ggr
+  if vf != "": gr = vgr
+  let fcl = first_comment_line(gtext(p, fi, gr))
+  let st = go_doc_status(fcl, name)
+  if st == 0: return
+  add(&x, "exported", "comment on exported {kd} {name} should be of the form \"{name} ...\"{correction_hint(st, fcl)}", status_conf(st), gstart(p, fi, gr), gend(p, fi, gr))
+
+fn ex_iface(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg, tn: Str, it: Int):
+  let fi = x.fi
+  for m in ast.items(t, t.a[it]):
+    if t.a[m] < 0 or ast.count(t, t.a[m]) == 0: continue
+    let name = nm(t, ast.item(t, t.a[m], 0))
+    if not is_exported(name): continue
+    let gr = doc_at(p, fi, t.pos[m])
+    let fcl = first_comment_line(gtext(p, fi, gr))
+    let st = go_doc_status(fcl, name)
+    if st == 0: continue
+    if st == 1:
+      add(&x, "exported", "public interface method {tn}.{name} should be commented", status_conf(st), t.pos[m], t.end[m])
+      continue
+    add(&x, "exported", "comment on exported interface method {tn}.{name} should be of the form \"{name} ...\"{correction_hint(st, fcl)}", status_conf(st), gstart(p, fi, gr), gend(p, fi, gr))
+
+fn exported(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg, d: doc.Doc, args: Int):
+  let fi = x.fi
+  if p.test[fi] or is_main_pkg(t, p): return
+  let root = p.roots[fi]
+  var o = ExOpt(true, true, false, false, false, false, false, false, "stutters", nm(t, t.a[root]), {}, false)
+  if args >= 0 and d.kind[args] == doc.K_SEQ:
+    for a in d.kids[args]:
+      if d.kind[a] != doc.K_SCALAR: continue
+      let f = norm_opt(d.text[a])
+      if f == "checkprivatereceivers": o.priv = false
+      elif f == "disablestutteringcheck": o.rep = true
+      elif f == "sayrepetitiveinsteadofstutters": o.rep_msg = "is repetitive"
+      elif f == "checkpublicinterface": o.pubif = false
+      elif f == "disablechecksonconstants": o.dconst = true
+      elif f == "disablechecksonfunctions": o.dfunc = true
+      elif f == "disablechecksonmethods": o.dmethod = true
+      elif f == "disablechecksontypes": o.dtype = true
+      elif f == "disablechecksonvariables": o.dvar = true
+  var missing: {Int: Bool} = {}
+  for dcl in ast.items(t, t.c[root]):
+    let k = t.k[dcl]
+    if k == ast.N_FUNCDECL:
+      ex_func(t, &x, p, &o, dcl)
+      if t.a[dcl] < 0: ex_repetitive(t, &x, o, t.b[dcl], "func")
+      continue
+    if k != ast.N_GENDECL or t.f[dcl] == K_IMPORT: continue
+    let paren = t.s[dcl] == 1
+    for sp in ast.items(t, t.a[dcl]):
+      if t.k[sp] == ast.N_TYPESPEC:
+        var gr: [Int] = []
+        if paren: gr = doc_at(p, fi, t.pos[sp])
+        var fcl = first_comment_line(gtext(p, fi, gr))
+        if fcl == "":
+          gr = doc_at(p, fi, t.pos[dcl])
+          fcl = first_comment_line(gtext(p, fi, gr))
+        ex_type(t, &x, p, o, sp, gr, fcl)
+        ex_repetitive(t, &x, o, t.a[sp], "type")
+        if not o.pubif and kind(t, t.c[sp]) == ast.N_IFACETYPE:
+          let tn = nm(t, t.a[sp])
+          if is_exported(tn): ex_iface(t, &x, p, tn, t.c[sp])
+      elif t.k[sp] == ast.N_VALUESPEC:
+        ex_value(t, &x, p, o, sp, dcl, &missing)
+
+# ---- package-comments
+
+# The "detached package comment" failure's offset for file fi, or -1
+fn pc_detached(t: ast.Ast, p: pkg.Pkg, fi: Int) -> Int:
+  let root = p.roots[fi]
+  let src = p.srcs[fi]
+  let cm = p.comments[fi]
+  let pkgpos = t.pos[root]
+  var j = -3
+  var i = 0
+  while i < cm.len and cm[i] <= pkgpos:
+    j = i
+    i += 3
+  if j < 0: return -1
+  var st = j
+  while st >= 3 and count_nl(src, cm[st - 2], cm[st]) <= 1: st -= 3
+  let prefix = "Package " + nm(t, t.a[root]) + " "
+  let text = deprecated.group_text(src, cm, st, j + 3)
+  if not text.startswith(prefix): return -1
+  let lines = p.lines[fi]
+  let end_line = pkg.line_of(lines, cm[j]) + count_nl(src, cm[j], cm[j + 1])
+  if end_line + 1 < pkg.line_of(lines, pkgpos):
+    if end_line < lines.len: return lines[end_line]
+    return src.len
+  return -1
+
+fn package_comments(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg):
+  let fi = x.fi
+  # "should have a package comment", once for the package, on its first file by name
+  var first = -1
+  for j in 0..p.paths.len:
+    if not p.hgen[j] and (first < 0 or p.paths[j] < p.paths[first]): first = j
+  if fi == first:
+    var any_doc = false
+    for j in 0..p.roots.len:
+      if not p.hgen[j] and doc_at(p, j, t.pos[p.roots[j]]).len > 0:
+        any_doc = true
+        break
+    if not any_doc:
+      var caller = false
+      for j in 0..p.roots.len:
+        if not p.hgen[j] and not p.test[j] and pc_detached(t, p, j) < 0:
+          caller = true
+          break
+      if caller:
+        let r = p.roots[fi]
+        add(&x, "package-comments", "should have a package comment", 1.0, t.pos[r], t.end[t.a[r]])
+  if p.test[fi]: return
+  let det = pc_detached(t, p, fi)
+  if det >= 0:
+    revive_core.add_lc(&x, "package-comments", "package comment is detached; there should be no blank lines between it and the package statement", 0.9, det, det)
+    return
+  let root = p.roots[fi]
+  let gr = doc_at(p, fi, t.pos[root])
+  let s = gtext(p, fi, gr)
+  if s == "": return
+  let prefix = "Package " + nm(t, t.a[root]) + " "
+  if not is_main_pkg(t, p) and not s.startswith(prefix):
+    add(&x, "package-comments", "package comment should be of the form \"{prefix}...\"", 1.0, gstart(p, fi, gr), gend(p, fi, gr))
+
+# ---- var-naming
+
+type VnOpt:
+  allow: [Str]
+  block: [Str]
+  skip_init: Bool
+  upper_const: Bool
+
+fn common_initialism(u: Str) -> Bool:
+  return u in ["ACL", "API", "ASCII", "CPU", "CSS", "DNS", "EOF", "GUID", "HTML", "HTTP", "HTTPS", "ID", "IDS", "IP", "JSON", "LHS", "QPS", "RAM", "RHS", "RPC", "SLA", "SMTP", "SQL", "SSH", "TCP", "TLS", "TTL", "UDP", "UI", "UID", "UUID", "URI", "URL", "UTF8", "VM", "XML", "XMPP", "XSRF", "XSS"]
+
+fn cps_str(r: [Int], a: Int, b: Int) -> Str:
+  var s = ""
+  for i in a..b: s += chr(r[i])
+  return s
+
+# internal/rule.Name
+fn lint_name(name: Str, o: VnOpt) -> Str:
+  if name == "_": return name + ""
+  var all_lower = true
+  for c in name.codes():
+    if not is_lower_cp(c):
+      all_lower = false
+      break
+  if all_lower: return name + ""
+  var r = name.codes()
+  var w = 0
+  var i = 0
+  while i + 1 <= r.len:
+    var eow = false
+    if i + 1 == r.len: eow = true
+    elif r[i + 1] == 95:
+      eow = true
+      var n = 1
+      while i + n + 1 < r.len and r[i + n + 1] == 95: n += 1
+      if i + n + 1 < r.len and is_digit_cp(r[i]) and is_digit_cp(r[i + n + 1]): n -= 1
+      if n > 0:
+        var r2: [Int] = []
+        for q in 0..i + 1: r2.push(r[q])
+        for q in i + n + 1..r.len: r2.push(r[q])
+        r = r2
+    elif is_lower_cp(r[i]) and not is_lower_cp(r[i + 1]): eow = true
+    i += 1
+    if not eow: continue
+    let word = cps_str(r, w, i)
+    var u = word.upper()
+    if not o.skip_init and (common_initialism(u) or u in o.block) and not (u in o.allow):
+      if w == 0 and is_lower_cp(r[w]): u = u.lower()
+      if u == "IDS": u = "IDs"
+      let uc = u.codes()
+      var q = 0
+      while q < uc.len and w + q < r.len:
+        r[w + q] = uc[q]
+        q += 1
+    elif w > 0 and word.lower() == word:
+      let up = chr(r[w]).upper().codes()
+      if up.len == 1: r[w] = up[0]
+    w = i
+  return cps_str(r, 0, r.len)
+
+fn is_upper_underscore(s: Str) -> Bool:
+  if s.find("_") < 0: return false
+  if s.len <= 5: return false
+  for i in 0..s.len:
+    let c = s[i]
+    if c == '_' or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9'): continue
+    return false
+  return true
+
+fn upper_or_digit(c: Int) -> Bool:
+  return (c >= 65 and c <= 90) or (c >= 48 and c <= 57)
+
+fn is_upper_case_const(s: Str) -> Bool:
+  if s == "": return false
+  let r = s.codes()
+  let c = r[0]
+  if r.len == 1: return c >= 65 and c <= 90
+  if c != 95 and not (c >= 65 and c <= 90): return false
+  for i in 0..r.len:
+    if upper_or_digit(r[i]): continue
+    if r[i] == 95:
+      if i + 1 >= s.len or not upper_or_digit(r[i + 1]): return false
+      continue
+    return false
+  return true
+
+fn vn_check(t: ast.Ast, var x: revive_core.Ctx, o: VnOpt, id: Int, thing: Str):
+  let name = nm(t, id)
+  if name == "_": return
+  if name == "LastInsertId" or name == "kWh": return
+  if thing == "const" and o.upper_const and is_upper_case_const(name): return
+  if is_upper_underscore(name):
+    add(&x, "var-naming", "don't use ALL_CAPS in Go names; use CamelCase", 0.8, t.pos[id], t.end[id])
+    return
+  let should = lint_name(name, o)
+  if name == should: return
+  if name.len > 2 and name[1..name.len].find("_") >= 0:
+    add(&x, "var-naming", "don't use underscores in Go names; {thing} {name} should be {should}", 0.9, t.pos[id], t.end[id])
+    return
+  add(&x, "var-naming", "{thing} {name} should be {should}", 0.8, t.pos[id], t.end[id])
+
+fn vn_list(t: ast.Ast, var x: revive_core.Ctx, o: VnOpt, l: Int, thing: Str):
+  if l < 0: return
+  for f in ast.items(t, l):
+    if t.a[f] < 0: continue
+    for id in ast.items(t, t.a[f]): vn_check(t, &x, o, id, thing)
+
+# astutils.IsCgoExported
+fn cgo_exported(t: ast.Ast, p: pkg.Pkg, fi: Int, fd: Int) -> Bool:
+  if t.a[fd] >= 0: return false
+  let gr = doc_at(p, fi, t.pos[fd])
+  if gr.len == 0: return false
+  let want = "//export " + nm(t, t.b[fd])
+  let src = p.srcs[fi]
+  let cm = p.comments[fi]
+  var i = gr[0]
+  while i <= gr[1]:
+    for l in src[cm[i]..cm[i + 1]].replace("\r", "").split("\n"):
+      if l == want: return true
+    i += 3
+  return false
+
+fn doc_strs(d: doc.Doc, n: Int) -> [Str]:
+  var out: [Str] = []
+  if n < 0 or d.kind[n] != doc.K_SEQ: return out
+  for c in d.kids[n]:
+    if d.kind[c] == doc.K_SCALAR: out.push(d.text[c] + "")
+  return out
+
+fn var_naming(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg, d: doc.Doc, args: Int):
+  let fi = x.fi
+  var o = VnOpt([], [], false, false)
+  if args >= 0 and d.kind[args] == doc.K_SEQ:
+    let ks = d.kids[args]
+    if ks.len >= 1: o.allow = doc_strs(d, ks[0])
+    if ks.len >= 2: o.block = doc_strs(d, ks[1])
+    if ks.len >= 3 and d.kind[ks[2]] == doc.K_SEQ and d.kids[ks[2]].len == 1:
+      let m = d.kids[ks[2]][0]
+      if d.kind[m] == doc.K_MAP:
+        for i in 0..d.keys[m].len:
+          let key = norm_opt(d.keys[m][i])
+          let v = d.kids[m][i]
+          var val = false
+          if d.kind[v] == doc.K_SCALAR and d.text[v].lower() == "true": val = true
+          if key == "skipinitialismnamechecks": o.skip_init = val
+          elif key == "uppercaseconst": o.upper_const = val
+  let test = p.test[fi]
+  for n in file_nodes(t, p.roots[fi]):
+    let k = t.k[n]
+    if k == ast.N_ASSIGN:
+      if t.f[n] == T_ASSIGN: continue
+      for e in ast.items(t, t.a[n]):
+        if kind(t, e) == ast.N_IDENT: vn_check(t, &x, o, e, "var")
+    elif k == ast.N_FUNCDECL:
+      let fname = nm(t, t.b[n])
+      if test and (fname.startswith("Example") or fname.startswith("Test") or fname.startswith("Benchmark") or fname.startswith("Fuzz")): continue
+      var thing = "func"
+      if t.a[n] >= 0: thing = "method"
+      if is_exported(fname) or not cgo_exported(t, p, fi, n): vn_check(t, &x, o, t.b[n], thing)
+      let ft = t.c[n]
+      vn_list(t, &x, o, t.b[ft], thing + " parameter")
+      vn_list(t, &x, o, t.c[ft], thing + " result")
+    elif k == ast.N_GENDECL:
+      let tok = t.f[n]
+      if tok == K_IMPORT: continue
+      var thing = "var"
+      if tok == K_CONST: thing = "const"
+      elif tok == K_TYPE: thing = "type"
+      for sp in ast.items(t, t.a[n]):
+        if t.k[sp] == ast.N_TYPESPEC: vn_check(t, &x, o, t.a[sp], thing)
+        elif t.k[sp] == ast.N_VALUESPEC:
+          for id in ast.items(t, t.a[sp]): vn_check(t, &x, o, id, thing)
+    elif k == ast.N_IFACETYPE:
+      for f in ast.items(t, t.a[n]):
+        let ft = t.b[f]
+        if kind(t, ft) != ast.N_FUNCTYPE: continue
+        vn_list(t, &x, o, t.b[ft], "interface method parameter")
+        vn_list(t, &x, o, t.c[ft], "interface method result")
+    elif k == ast.N_RANGE:
+      if t.f[n] == T_ASSIGN: continue
+      if kind(t, t.a[n]) == ast.N_IDENT: vn_check(t, &x, o, t.a[n], "range var")
+      if kind(t, t.b[n]) == ast.N_IDENT: vn_check(t, &x, o, t.b[n], "range var")
+    elif k == ast.N_STRUCTTYPE:
+      for f in ast.items(t, t.a[n]):
+        if t.a[f] < 0: continue
+        for id in ast.items(t, t.a[f]): vn_check(t, &x, o, id, "struct field")
+
+# ---- receiver-naming
+
+fn receiver_naming(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg, d: doc.Doc, args: Int):
+  var maxlen = -1
+  if args >= 0 and d.kind[args] == doc.K_SEQ and d.kids[args].len >= 1:
+    let m = d.kids[args][0]
+    if d.kind[m] == doc.K_MAP:
+      for i in 0..d.keys[m].len:
+        if norm_opt(d.keys[m][i]) == "maxlength": maxlen = doc.int_of(d, d.kids[m][i], -1)
+  var seen: {Str: Str} = {}
+  for dcl in ast.items(t, t.c[p.roots[x.fi]]):
+    if t.k[dcl] != ast.N_FUNCDECL or not is_method(t, dcl): continue
+    let f0 = ast.item(t, t.a[dcl], 0)
+    if t.a[f0] < 0 or ast.count(t, t.a[f0]) < 1: continue
+    let name = nm(t, ast.item(t, t.a[f0], 0))
+    if name == "_":
+      add(&x, "receiver-naming", "receiver name should not be an underscore, omit the name if it is unused", 1.0, t.pos[dcl], t.end[dcl])
+      continue
+    if name == "this" or name == "self":
+      add(&x, "receiver-naming", "receiver name should be a reflection of its identity; don't use generic names such as \"this\" or \"self\"", 1.0, t.pos[dcl], t.end[dcl])
+      continue
+    if maxlen > 0 and name.char_count() > maxlen:
+      add(&x, "receiver-naming", "receiver name {name} is longer than {maxlen} characters", 1.0, t.pos[dcl], t.end[dcl])
+      continue
+    let rt = recv_type(t, dcl)
+    if rt in seen and seen[rt] != name:
+      add(&x, "receiver-naming", "receiver name {name} should be consistent with previous receiver name {seen[rt]} for {rt}", 1.0, t.pos[dcl], t.end[dcl])
+      continue
+    seen[rt] = name + ""
+
+# ---- error-naming
+
+fn is_pkg_dot(t: ast.Ast, e: Int, pk: Str, name: Str) -> Bool:
+  if kind(t, e) != ast.N_SELECTOR: return false
+  let a = t.a[e]
+  return kind(t, a) == ast.N_IDENT and nm(t, a) == pk and nm(t, t.b[e]) == name
+
+fn error_naming(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg):
+  for dcl in ast.items(t, t.c[p.roots[x.fi]]):
+    if t.k[dcl] != ast.N_GENDECL or t.f[dcl] != K_VAR: continue
+    for sp in ast.items(t, t.a[dcl]):
+      if t.k[sp] != ast.N_VALUESPEC: continue
+      if ast.count(t, t.a[sp]) != 1 or ast.count(t, t.c[sp]) != 1: continue
+      let ce = ast.item(t, t.c[sp], 0)
+      if kind(t, ce) != ast.N_CALL: continue
+      if not is_pkg_dot(t, t.a[ce], "errors", "New") and not is_pkg_dot(t, t.a[ce], "fmt", "Errorf"): continue
+      let id = ast.item(t, t.a[sp], 0)
+      let name = nm(t, id)
+      if name == "_": continue
+      var prefix = "err"
+      if is_exported(name): prefix = "Err"
+      if not name.startswith(prefix):
+        add(&x, "error-naming", "error var {name} should have name of the form {prefix}Foo", 0.9, t.pos[id], t.end[id])
+
+# ---- time-naming
+
+fn time_suffix(name: Str) -> Str:
+  for suf in ["Hour", "Hours", "Min", "Mins", "Minutes", "Minute", "Sec", "Secs", "Seconds", "Second", "Msec", "Msecs", "Milli", "Millis", "Milliseconds", "Millisecond", "Usec", "Usecs", "Microseconds", "Microsecond", "MS", "Ms"]:
+    if name.endswith(suf): return suf + ""
+  return ""
+
+fn alias_type_expr(g: tc.Prog, pi: Int, te0: Int) -> Bool:
+  var te = te0
+  if te <= 0: return false
+  if g.pk[pi].t.k[te] == ast.N_STAR: te = g.pk[pi].t.a[te]
+  var o = -1
+  let k = g.pk[pi].t.k[te]
+  if k == ast.N_IDENT and te < g.pk[pi].use.len: o = g.pk[pi].use[te]
+  elif k == ast.N_SELECTOR:
+    if te in g.pk[pi].sobj: o = g.pk[pi].sobj[te]
+    elif g.pk[pi].t.b[te] < g.pk[pi].use.len: o = g.pk[pi].use[g.pk[pi].t.b[te]]
+  if o < 0 or g.ok[o] != tc.O_TYPE: return false
+  let q = g.opkg[o]
+  let d = g.odecl[o]
+  if q < 0 or d < 0 or d >= g.pk[q].t.k.len: return false
+  return g.pk[q].t.k[d] == ast.N_TYPESPEC and g.pk[q].t.f[d] == 1
+
+# Whether value i of a spec with no type is a call of a function declared to return an alias
+fn alias_value(g: tc.Prog, pi: Int, sp: Int, i: Int) -> Bool:
+  if g.pk[pi].t.b[sp] > 0 or g.pk[pi].t.c[sp] < 0: return false
+  let vals = ast.items(g.pk[pi].t, g.pk[pi].t.c[sp])
+  if vals.len != ast.count(g.pk[pi].t, g.pk[pi].t.a[sp]) or i >= vals.len: return false
+  let v = vals[i]
+  if g.pk[pi].t.k[v] != ast.N_CALL: return false
+  let o = vet.callee(g, pi, v)
+  if o < 0: return false
+  let q = g.opkg[o]
+  let d = g.odecl[o]
+  if q < 0 or d < 0 or d >= g.pk[q].t.k.len or g.pk[q].t.k[d] != ast.N_FUNCDECL: return false
+  let rl = g.pk[q].t.c[g.pk[q].t.c[d]]
+  if rl < 0 or ast.count(g.pk[q].t, rl) != 1: return false
+  let f = ast.item(g.pk[q].t, rl, 0)
+  if g.pk[q].t.a[f] >= 0 and ast.count(g.pk[q].t, g.pk[q].t.a[f]) > 1: return false
+  return alias_type_expr(g, q, g.pk[q].t.b[f])
+
+fn time_naming(var g: tc.Prog, fs: Fs, var x: revive_core.Ctx, p: pkg.Pkg):
+  let pi = x.pi
+  # (the value specs' names with a suffix, found first: typing needs g)
+  var specs: [Int] = []
+  var ids: [Int] = []
+  var sufs: [Str] = []
+  var idx: [Int] = []
+  for n in file_nodes(g.pk[pi].t, p.roots[x.fi]):
+    if g.pk[pi].t.k[n] != ast.N_VALUESPEC: continue
+    var j = 0
+    for id in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
+      j += 1
+      let suf = time_suffix(nm(g.pk[pi].t, id))
+      if suf == "": continue
+      idx.push(j - 1)
+      specs.push(n)
+      ids.push(id)
+      sufs.push(suf)
+  for i in 0..ids.len:
+    let id = ids[i]
+    tc.ensure(&g, pi)
+    let o = g.pk[pi].use[id]
+    if o < 0: continue
+    # a declared type naming an alias (or a pointer to one) is a types.Alias, not a Named
+    if alias_type_expr(g, pi, g.pk[pi].t.b[specs[i]]): continue
+    let orig = tc.obj_type(&g, fs, o)
+    if alias_value(g, pi, specs[i], idx[i]): continue
+    var ty = orig
+    if ty > 0 and g.tk[ty] == tc.TY_PTR: ty = g.ta[ty]
+    if ty <= 0 or g.tk[ty] != tc.TY_NAMED: continue
+    let to = g.ta[ty]
+    let tp = g.opkg[to]
+    if g.oname[to] != "Duration" or tp < 0 or g.pk[tp].path != "time": continue
+    let name = nm(g.pk[pi].t, id)
+    let ts = tc.type_str(&g, fs, orig, "")
+    let sp = specs[i]
+    add(&x, "time-naming", "var {name} is of type {ts}; don't use unit-specific suffix \"{sufs[i]}\"", 0.9, g.pk[pi].t.pos[sp], g.pk[pi].t.end[sp])
+
+# ---- blank-imports
+
+fn path_raw(t: ast.Ast, imp: Int) -> Str:
+  if t.b[imp] <= 0: return ""
+  return nm(t, t.b[imp])
+
+fn is_blank_imp(t: ast.Ast, imp: Int) -> Bool:
+  let a = t.a[imp]
+  return a > 0 and nm(t, a) == "_"
+
+fn blank_imports(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg):
+  let fi = x.fi
+  if p.test[fi] or is_main_pkg(t, p): return
+  let root = p.roots[fi]
+  var paren: {Int: Bool} = {}
+  for dcl in ast.items(t, t.c[root]):
+    if t.k[dcl] == ast.N_GENDECL and t.f[dcl] == K_IMPORT and t.s[dcl] == 1:
+      for sp in ast.items(t, t.a[dcl]): paren[sp] = true
+  let imps = ast.items(t, t.b[root])
+  let lines = p.lines[fi]
+  let src = p.srcs[fi]
+  let cm = p.comments[fi]
+  for i in 0..imps.len:
+    let imp = imps[i]
+    if not is_blank_imp(t, imp): continue
+    let line = pkg.line_of(lines, t.pos[imp])
+    if i > 0:
+      let prev = imps[i - 1]
+      if pkg.line_of(lines, t.pos[prev]) + 1 == line and path_raw(t, prev) != "\"embed\"" and is_blank_imp(t, prev): continue
+    if path_raw(t, imp) == "\"embed\"":
+      var has = false
+      var q = 0
+      while q < cm.len:
+        if src[cm[q]..cm[q + 1]].startswith("//go:embed "):
+          has = true
+          break
+        q += 3
+      if has: continue
+    var has_doc = false
+    if imp in paren: has_doc = doc_at(p, fi, t.pos[imp]).len > 0
+    if not has_doc and not has_line_comment(p, fi, t.end[imp]):
+      add(&x, "blank-imports", "a blank import should be only in a main or test package, or have a comment justifying it", 1.0, t.pos[imp], t.end[imp])
+
+# ---- dot-imports
+
+fn dot_imports(t: ast.Ast, var x: revive_core.Ctx, p: pkg.Pkg, d: doc.Doc, args: Int):
+  var allowed: [Str] = []
+  if args >= 0 and d.kind[args] == doc.K_SEQ and d.kids[args].len >= 1:
+    let m = d.kids[args][0]
+    if d.kind[m] == doc.K_MAP:
+      for i in 0..d.keys[m].len:
+        if norm_opt(d.keys[m][i]) != "allowedpackages": continue
+        for s in doc_strs(d, d.kids[m][i]): allowed.push("\"" + s + "\"")
+  for imp in ast.items(t, t.b[p.roots[x.fi]]):
+    let a = t.a[imp]
+    if a > 0 and nm(t, a) == "." and not (path_raw(t, imp) in allowed):
+      add(&x, "dot-imports", "should not use dot imports", 1.0, t.pos[imp], t.end[imp])

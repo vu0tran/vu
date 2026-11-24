@@ -1,7 +1,10 @@
 # vgolint: golangci-lint in Vu
 
 `vgolint` is a drop-in replacement for `golangci-lint run` (v2.5.0): same command line, same
-config files, same output in every format, same exit codes, for the linters it implements.
+config files, same output in every format, same exit codes, **for the linters it implements**
+(Coverage below). A config that enables a linter vgolint doesn't have, or a revive rule it doesn't
+have, gets one warning on stderr naming it, and that linter reports nothing: check the warning
+before treating vgolint's output as golangci-lint's.
 
 ```
 vu build --release golint/main.vu -o vgolint
@@ -170,6 +173,43 @@ What's left is flat: type-checking the linted packages and the imported declarat
 worker for itself) about a third, staticcheck a quarter (its IR 9%), parsing the linted files 14%,
 vet 9%, ineffassign 7%, unused 6%.
 
+## lll, depguard, revive and four staticcheck checks (2026-11-23)
+
+Ported from the versions golangci-lint 2.14.0 pins (lll from golangci-lint itself, depguard v2.2.1,
+revive v1.17.0, staticcheck v0.8.1); the rest of vgolint still follows 2.5.0.
+
+- **lll**: line-length, tab-width; //go: lines and import blocks skipped.
+- **depguard**: rule lists, files globs (gobwas/glob), allow/deny with `$gostd`, the three list
+  modes, descriptions as suggestions; with no rules, list Main (the standard library only).
+- **revive**: the 23 default rules and their arguments, golangci-lint's way of choosing rules (no
+  settings: the defaults; settings: the listed rules, plus enable-default-rules or enable-all-rules),
+  the confidence cutoff, `//revive:disable` directives, issues with a line range (all their source
+  lines printed, `LineRange` in JSON).
+- **staticcheck**: SA1000 (invalid regular expressions: `resyntax.vu`, Go 1.27.3's regexp/syntax
+  parse checks with its messages, the same answer as regexp.Compile on 23,105 patterns), ST1020,
+  ST1021, ST1022, and `dot-import-whitelist` for ST1001.
+- Folders whose files are all `package x_test` were never linted; they are now.
+
+Checked against golangci-lint 2.14.0 on the 2,981-package monorepo above:
+
+- its lib/ folder with its own config: `0 issues.`, as golangci-lint (gofmt and goimports, which
+  that config enables, are named on stderr as skipped).
+- lib/ with a strict variant (lll at 100, no exclusion presets, depguard denying fmt, testify and
+  uuid, revive's defaults, staticcheck all): byte-identical output, 5,445 issues (revive 2,224, lll
+  2,680, depguard 337, errcheck 199, staticcheck 5).
+- revive's defaults on lib/ and two large services: byte-identical, 6,886 issues
+  over 14 rules; the rules that don't fire there (and arguments) on hand-written cases, 11 configs,
+  1,284 issues, identical in text and JSON. vgolint takes 0.15 to 0.42 s on each folder, golangci-lint
+  2.76 s on the larger service with its cache empty.
+- SA1000 on staticcheck's own testdata and 16 more cases; depguard on three configs over its modes
+  and globs: identical.
+
+Where golangci-lint itself isn't deterministic, vgolint can't match it run for run: revive runs its
+rules in Go map order, so when two rules report on one line, which one uniq-by-line keeps (and the
+order of issues at one position) changes between runs; vgolint keeps the one listed first. And
+golangci-lint 2.14.0's cache doesn't notice a change of revive's settings: after editing them, clear
+it (`golangci-lint cache clean`) before comparing.
+
 ## Drop-in status
 
 ### Commands
@@ -264,13 +304,13 @@ how often the 248 configs of the 500 most-starred Go repositories on GitHub (sta
 |---|---:|---|
 | govet | 216 | 22 of the 33 default analyzers; `enable/disable/enable-all/disable-all` |
 | ineffassign | 210 | yes |
-| staticcheck | 206 | 68 checks, the IR-based SA4006/SA4009/SA4017/SA5011 among them; `checks` (globs, `-X`, golangci-lint's defaults) |
+| staticcheck | 206 | 72 checks, the IR-based SA4006/SA4009/SA4017/SA5011 among them; `checks` (globs, `-X`, golangci-lint's defaults), `dot-import-whitelist` |
 | unused | 196 | yes |
 | errcheck | 168 | yes; `exclude-functions`, `disable-default-exclusions` |
 | misspell | 145 | yes (locale US/UK, ignore-rules, extra-words, mode) |
 | goimports | 132 | not yet |
 | unconvert | 132 | yes (fast-math) |
-| revive | 115 | not yet |
+| revive | 115 | its 23 default rules with their arguments (golangci-lint 2.14.0's revive v1.17.0); not the other 82 |
 | gofmt | 114 | not yet |
 | bodyclose | 94 | not yet |
 | gocritic | 90 | not yet |
@@ -285,6 +325,8 @@ how often the 248 configs of the 500 most-starred Go repositories on GitHub (sta
 | dogsled | 42 | yes (max-blank-identifiers) |
 | predeclared | 35 | yes (ignore, qualified-name) |
 | gocyclo | 31 | yes (min-complexity, `//gocyclo:ignore`) |
+
+Also: lll and depguard (as golangci-lint 2.14.0 runs them).
 
 Enabled linters that vgolint doesn't implement are skipped with one stderr warning
 (`VGOLINT_QUIET=1` silences it); nolintlint then doesn't judge directives naming them.
@@ -368,12 +410,12 @@ command line, both tools, stdout/stderr/exit code), `tools/freq_fetch.sh` + `too
 ## Not done
 
 - Formatters (gofmt, goimports, gofumpt, gci, golines): need a go/printer port.
-- revive, gocritic, gosec, bodyclose, unparam and the rest of the long tail.
-- staticcheck: 92 of its checks (most never fire on the modules measured; SA4020 does once),
+- revive's 82 non-default rules; gocritic, gosec, bodyclose, unparam and the rest of the long tail.
+- staticcheck: 88 of its checks (most never fire on the modules measured; SA4020 does once),
   and the IR's alias resolution in SA4006/SA5011 above. govet's lostcancel, ifaceassert, loopclosure (pre-1.22), directive, slog, unsafeptr, stdversion,
   buildtag, cgocall, asmdecl, framepointer.
 - Suggested fixes (`--fix`, json's `SuggestedFixes`).
 - errcheck's `check-type-assertions` and `check-blank`; unused's settings; staticcheck's
-  `initialisms`/`dot-import-whitelist`/`http-status-code-whitelist`.
+  `initialisms`/`http-status-code-whitelist`.
 - Parse errors are printed as vgolint's own `typechecking error` lines, not as golangci-lint's
   `typecheck` issues.

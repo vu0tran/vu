@@ -20,6 +20,8 @@ import ineff
 import tc
 import errcheck
 import unused
+import revive
+import resolve
 import vet
 import sc
 import cfg
@@ -74,6 +76,13 @@ fn sc_enabled(c: cfg.Cfg, code: Str) -> Bool:
     elif ch == code: on = b
   return on
 
+# staticcheck's dot-import-whitelist: the setting, else staticcheck's default (v0.8.1)
+fn sc_dotw(c: cfg.Cfg) -> [Str]:
+  let s = cfg.lsettings(c, "staticcheck")
+  let v = doc.get(c.d, s, "dot-import-whitelist")
+  if doc.is_set(c.d, v): return doc.strs_of(c.d, v)
+  return ["simd/archsimd", "github.com/mmcloughlin/avo/build", "github.com/mmcloughlin/avo/operand", "github.com/mmcloughlin/avo/reg"]
+
 fn vet_default(name: Str) -> Bool:
   return name in ["appends", "asmdecl", "assign", "atomic", "bools", "buildtag", "cgocall", "composites", "copylocks", "defers", "directive", "errorsas", "framepointer", "httpresponse", "ifaceassert", "loopclosure", "lostcancel", "nilfunc", "printf", "shift", "sigchanyzer", "slog", "stdmethods", "stdversion", "stringintconv", "structtag", "testinggoroutine", "tests", "timeformat", "unmarshal", "unreachable", "unsafeptr", "unusedresult"]
 
@@ -119,6 +128,12 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
   if c.gen_mode == "disable":
     for f in 0..p.gen.len: p.gen[f] = false
   if cfg.is_enabled(c, "ineffassign"): ineff.run(&p, &issues)
+  # (revive's rules read go/parser's object resolution, which ineffassign computes when it runs)
+  if cfg.is_enabled(c, "revive") and p.pobj.len == 0:
+    var r = resolve.new_res(p.t.k.len)
+    for fi in 0..p.roots.len: resolve.resolve_file(p.t, &r, p.roots[fi])
+    for x in r.obj: p.pobj.push(x)
+    for x in r.decl: p.pdecl.push(x)
   var path = sp.path + ""
   var roots: [Int] = []
   for r in p.roots: roots.push(r)
@@ -127,6 +142,7 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
     let es = cfg.lsettings(c, "errcheck")
     errcheck.run(&g, fs, pi, p, &issues, doc.strs_of(c.d, doc.get(c.d, es, "exclude-functions")), doc.bool_of(c.d, doc.get(c.d, es, "disable-default-exclusions"), false))
   if cfg.is_enabled(c, "unused"): unused.run(&g, fs, pi, p, &issues)
+  if cfg.is_enabled(c, "revive"): revive.run(&g, fs, pi, p, c, &issues)
   let want_vet = cfg.is_enabled(c, "govet")
   let want_sc = cfg.is_enabled(c, "staticcheck")
   var w = vet.Walk([], [])
@@ -141,7 +157,7 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
     w = vet.walk_pkg(g.pk[pi].t, roots2)
     have_w = true
     if want_vet: vet.run(&g, fs, pi, p, &issues, gover, &w)
-    if want_sc: sc.run(&g, fs, pi, p, &issues, gover, &w)
+    if want_sc: sc.run(&g, fs, pi, p, &issues, gover, &w, sc_dotw(c))
   if any_lints(c):
     # (the same walk when no file is generated: vet and staticcheck give its lists back as they were)
     if have_w and no_gen: lints.run(&g, fs, pi, p, c, &dict, w.nodes, &issues)
@@ -159,7 +175,7 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
   ord.sort(by: fn(a, b) => errcheck_before(p, issues[a], issues[b]))
   for i in ord:
     let is = issues[i]
-    if check_on(c, is, gover): kept.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", rank_of(is)))
+    if check_on(c, is, gover): kept.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", rank_of(is), is.endp, is.lsev + "", is.zoff))
   # (the exclusion patterns are compiled when a package first has an issue, or nolint comments to check)
   if not rs_ready and (kept.len > 0 or cfg.is_enabled(c, "nolintlint")):
     rs = proc.compile_all(c, rs.cache.share())
@@ -174,14 +190,14 @@ fn errcheck_before(p: pkg.Pkg, a: pkg.Issue, b: pkg.Issue) -> Bool:
   return a.pos < b.pos
 
 fn any_lints(c: cfg.Cfg) -> Bool:
-  for n in ["asciicheck", "copyloopvar", "dogsled", "gocyclo", "misspell", "nakedret", "predeclared", "unconvert", "whitespace"]:
+  for n in ["asciicheck", "copyloopvar", "depguard", "dogsled", "gocyclo", "lll", "misspell", "nakedret", "predeclared", "unconvert", "whitespace"]:
     if cfg.is_enabled(c, n): return true
   return false
 
 fn drop_linter(issues: [pkg.Issue], name: Str) -> [pkg.Issue]:
   var out: [pkg.Issue] = []
   for is in issues:
-    if is.linter != name: out.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
+    if is.linter != name: out.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank, is.endp, is.lsev + "", is.zoff))
   return out
 
 # golangci-lint's order within a line: linters with their own issue reporters first (by name), then
@@ -775,6 +791,15 @@ fn golist_perm(specs: [Spec], deps: [[Str]]) -> [Int]:
     let xp = specs[r].path + "_test"
     if xp in xtests:
       for i in xtests[xp]: order.push(i)
+  # (an external test package whose folder has no other package, only `package x_test` files: go
+  # list lists it, and golangci-lint lints it, after the others)
+  var has_root: {Str: Bool} = {}
+  for r in roots: has_root[specs[r].path + "_test"] = true
+  var orphans: [Int] = []
+  for i in 0..n:
+    if specs[i].path.endswith("_test") and not (specs[i].path in has_root): orphans.push(i)
+  orphans.sort(by: fn(a, b) => specs[a].path < specs[b].path)
+  for i in orphans: order.push(i)
   var out: [Int] = []
   var taken = [false] * n
   for i in order:
@@ -1123,6 +1148,12 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     if not (n in cfg.implemented()): skipped.push(n + "")
   if skipped.len > 0 and os.env("VGOLINT_QUIET").len == 0:
     eprint("level=warning msg=\"[vgolint] linters not implemented yet, skipped: " + ", ".join(skipped) + "\"")
+  if cfg.is_enabled(c, "revive") and os.env("VGOLINT_QUIET").len == 0:
+    let rc = revive.conf_of(c)
+    var rskip: [Str] = []
+    for nm in rc.order:
+      if nm in rc.rules and not revive.implemented(nm): rskip.push(nm + "")
+    if rskip.len > 0: eprint("level=warning msg=\"[vgolint] revive rules not implemented yet, skipped: " + ", ".join(rskip) + "\"")
   let shc = share(c)
   run_lint(fs, os, ffi, o, shc)?
 

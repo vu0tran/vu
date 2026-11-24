@@ -1,0 +1,437 @@
+# revive rules, group b (mgechev/revive v1.17.0's rule/*.go): "indent-error-flow", "superfluous-else", "empty-block", "unreachable-code", "range", "increment-decrement", "unused-parameter", "redefines-builtin-id"
+# Each rule adds its failures for file x.fi of package x.pi (revive.add); x.args[rule] is the rule's
+# `arguments` node in the config (-1: none, the rule's defaults).
+#
+# The walks follow ast.Walk's order over vgolint's flat tree (resolve.kid gives a node's children as
+# ast.Walk visits them). Where Go's tree has a BlockStmt vgolint's doesn't (a switch's body: its list
+# of cases, whose list node spans the braces), the rules that care see that list.
+
+import ast
+import pkg
+import tc
+import cfg
+import doc
+import rx
+import format
+import resolve
+import revive_core
+from scan import T_DEFINE, T_INT, T_ADD_ASSIGN, T_SUB_ASSIGN, K_BREAK, K_CONTINUE, K_GOTO, K_FALLTHROUGH, K_TYPE, K_VAR, K_CONST
+
+# The rules this file has (names() lists only the ones ported so far)
+fn names() -> [Str]:
+  return ["indent-error-flow", "superfluous-else", "empty-block", "unreachable-code", "range", "increment-decrement", "unused-parameter", "redefines-builtin-id"]
+
+fn apply(var g: tc.Prog, fs: Fs, var x: revive_core.Ctx, p: pkg.Pkg, name: Str, c: cfg.Cfg):
+  let _ = fs
+  let pi = x.pi
+  let fi = x.fi
+  let root = g.pk[pi].roots[fi]
+  let an = x.args.get(name, -1)
+  if name == "indent-error-flow" or name == "superfluous-else":
+    let ps = preserve_scope(c.d, an)
+    ie_visit(g.pk[pi].t, &x, root, name, ps)
+  elif name == "empty-block":
+    var ign: {Int: Bool} = {}
+    eb_visit(g.pk[pi].t, &x, root, &ign)
+  elif name == "unreachable-code": uc_visit(g.pk[pi].t, &x, root)
+  elif name == "range": rg_visit(g.pk[pi].t, &x, root)
+  elif name == "increment-decrement": id_visit(g.pk[pi].t, &x, root)
+  elif name == "unused-parameter":
+    var o = UpOpts(false, rx.compile("^_$"), "parameter '%s' seems to be unused, consider removing or renaming it as _")
+    up_configure(c.d, an, &o)
+    if p.pobj.len == g.pk[pi].t.k.len: up_visit(g.pk[pi].t, p.pobj, &x, root, o)
+    else:
+      var r = resolve.new_res(g.pk[pi].t.k.len)
+      resolve.resolve_file(g.pk[pi].t, &r, root)
+      up_visit(g.pk[pi].t, r.obj, &x, root, o)
+  elif name == "redefines-builtin-id":
+    let go121 = go_minor(c.go_ver) >= 21
+    rb_visit(g.pk[pi].t, &x, root, go121)
+
+fn nk(t: ast.Ast, n: Int) -> Int:
+  if n <= 0: return 0
+  return t.k[n]
+
+fn ident_name(t: ast.Ast, n: Int) -> Str:
+  return t.names[t.s[n]] + ""
+
+fn is_ident(t: ast.Ast, n: Int, s: Str) -> Bool:
+  return nk(t, n) == ast.N_IDENT and t.names[t.s[n]] == s
+
+# config.NormalizeOption: lower case, without "-"
+fn norm_opt(s: Str) -> Str:
+  return doc.lower(s.replace("-", ""))
+
+fn go_minor(v: Str) -> Int:
+  var s = v + ""
+  if s.startswith("go"): s = s[2..s.len]
+  let parts = s.split(".")
+  if parts.len >= 2: return int(parts[1]) else 0
+  return 0
+
+fn add_node(t: ast.Ast, var x: revive_core.Ctx, rule: Str, msg: Str, conf: Float, n: Int):
+  revive_core.add(&x, rule, msg, conf, t.pos[n], t.end[n])
+
+# ---- indent-error-flow, superfluous-else (internal/ifelse)
+
+const BK_EMPTY = 0
+const BK_RETURN = 1
+const BK_CONTINUE = 2
+const BK_BREAK = 3
+const BK_GOTO = 4
+const BK_PANIC = 5
+const BK_EXIT = 6
+const BK_REGULAR = 7
+
+type Br:
+  kind: Int
+  call: Str     # Panic, Exit: the function called ("os.Exit", "panic")
+  block: Int    # the block's statement list (-1 for an empty block)
+
+fn preserve_scope(d: doc.Doc, an: Int) -> Bool:
+  if an < 0 or d.kind[an] != doc.K_SEQ: return false
+  var on = false
+  for e in d.kids[an]:
+    if d.kind[e] == doc.K_SCALAR and norm_opt(d.text[e]) == "preservescope": on = true
+  return on
+
+fn deviates(k: Int) -> Bool:
+  return k != BK_EMPTY and k != BK_REGULAR
+
+fn block_branch(t: ast.Ast, block: Int) -> Br:
+  let l = t.a[block]
+  let n = ast.count(t, l)
+  if n == 0: return Br(BK_EMPTY, "", -1)
+  var b = stmt_branch(t, ast.item(t, l, n - 1))
+  b.block = l
+  return b
+
+fn stmt_branch(t: ast.Ast, s: Int) -> Br:
+  let k = nk(t, s)
+  if k == ast.N_RETURN: return Br(BK_RETURN, "", -1)
+  if k == ast.N_BLOCK: return block_branch(t, s)
+  if k == ast.N_BRANCH:
+    let f = t.f[s]
+    if f == K_BREAK: return Br(BK_BREAK, "", -1)
+    if f == K_CONTINUE: return Br(BK_CONTINUE, "", -1)
+    if f == K_GOTO: return Br(BK_GOTO, "", -1)
+    return Br(BK_REGULAR, "", -1)
+  if k == ast.N_EXPRSTMT:
+    let call = t.a[s]
+    if nk(t, call) != ast.N_CALL: return Br(BK_REGULAR, "", -1)
+    let fun = t.a[call]
+    var pk = ""
+    var nm = ""
+    if nk(t, fun) == ast.N_IDENT: nm = ident_name(t, fun)
+    elif nk(t, fun) == ast.N_SELECTOR and nk(t, t.a[fun]) == ast.N_IDENT:
+      pk = ident_name(t, t.a[fun])
+      nm = ident_name(t, t.b[fun])
+    else: return Br(BK_REGULAR, "", -1)
+    let kind = deviating(pk, nm)
+    if kind == BK_REGULAR: return Br(BK_REGULAR, "", -1)
+    var full = nm + ""
+    if pk != "": full = pk + "." + nm
+    return Br(kind, full, -1)
+  if k == ast.N_EMPTY: return Br(BK_EMPTY, "", -1)
+  if k == ast.N_LABELED: return stmt_branch(t, t.b[s])
+  return Br(BK_REGULAR, "", -1)
+
+# DeviatingFuncs
+fn deviating(pk: Str, nm: Str) -> Int:
+  if pk == "os" and nm == "Exit": return BK_EXIT
+  if pk == "log" and (nm == "Fatal" or nm == "Fatalf" or nm == "Fatalln"): return BK_EXIT
+  if pk == "" and nm == "panic": return BK_PANIC
+  if pk == "log" and (nm == "Panic" or nm == "Panicf" or nm == "Panicln"): return BK_PANIC
+  return BK_REGULAR
+
+fn long_string(b: Br) -> Str:
+  let k = b.kind
+  if k == BK_PANIC or k == BK_EXIT: return "call to " + b.call + " function"
+  if k == BK_EMPTY: return "an empty block"
+  if k == BK_REGULAR: return "a regular statement"
+  if k == BK_RETURN: return "a return statement"
+  if k == BK_CONTINUE: return "a continue statement"
+  if k == BK_BREAK: return "a break statement"
+  if k == BK_GOTO: return "a goto statement"
+  return ""
+
+fn has_decls(t: ast.Ast, b: Br) -> Bool:
+  if b.block < 0: return false
+  for s in ast.items(t, b.block):
+    let k = nk(t, s)
+    if k == ast.N_DECLSTMT: return true
+    if k == ast.N_ASSIGN and t.f[s] == T_DEFINE: return true
+  return false
+
+fn ie_visit(t: ast.Ast, var x: revive_core.Ctx, n: Int, rule: Str, ps: Bool):
+  if n <= 0: return
+  let k = t.k[n]
+  if k == ast.N_FUNCDECL:
+    if t.d[n] > 0: ie_block(t, &x, t.a[t.d[n]], rule, ps)
+    return
+  if k == ast.N_FUNCLIT:
+    if t.b[n] > 0: ie_block(t, &x, t.a[t.b[n]], rule, ps)
+    return
+  if k == ast.N_FOR or k == ast.N_RANGE:
+    if t.d[n] > 0: ie_block(t, &x, t.a[t.d[n]], rule, ps)
+    return
+  if k == ast.N_CASE:
+    ie_block(t, &x, t.b[n], rule, ps)
+    return
+  if k == ast.N_BLOCK:
+    ie_block(t, &x, t.a[n], rule, ps)
+    return
+  for i in 0..resolve.nkids(t, n): ie_visit(t, &x, resolve.kid(t, n, i), rule, ps)
+
+fn ie_block(t: ast.Ast, var x: revive_core.Ctx, l: Int, rule: Str, ps: Bool):
+  let n = ast.count(t, l)
+  for i in 0..n:
+    let s = ast.item(t, l, i)
+    if nk(t, s) != ast.N_IF:
+      ie_visit(t, &x, s, rule, ps)
+      continue
+    ie_if(t, &x, s, false, false, i == n - 1, rule, ps)
+
+fn ie_if(t: ast.Ast, var x: revive_core.Ctx, s: Int, init0: Bool, prior0: Bool, at_end: Bool, rule: Str, ps: Bool):
+  ie_block(t, &x, t.a[t.c[s]], rule, ps)
+  var has_init = init0
+  let ini = t.a[s]
+  if nk(t, ini) == ast.N_ASSIGN and t.f[ini] == T_DEFINE: has_init = true
+  let ib = block_branch(t, t.c[s])
+  let el = t.d[s]
+  if el <= 0: return
+  if nk(t, el) == ast.N_IF:
+    var prior = prior0
+    if not deviates(ib.kind): prior = true
+    ie_if(t, &x, el, has_init, prior, at_end, rule, ps)
+    return
+  ie_block(t, &x, t.a[el], rule, ps)
+  let eb = block_branch(t, el)
+  if not deviates(ib.kind): return
+  if prior0: return
+  var msg = ""
+  if rule == "indent-error-flow":
+    if ib.kind != BK_RETURN: return
+    msg = "if block ends with a return statement, so drop this else and outdent its block"
+  else:
+    if ib.kind == BK_RETURN: return
+    msg = "if block ends with " + long_string(ib) + ", so drop this else and outdent its block"
+  if ps and not at_end and (has_init or has_decls(t, eb)): return
+  if has_init: msg += " (move short variable declaration to its own line if necessary)"
+  add_node(t, &x, rule, msg, 1.0, el)
+
+# ---- empty-block
+
+fn eb_visit(t: ast.Ast, var x: revive_core.Ctx, n: Int, var ign: {Int: Bool}):
+  if n <= 0: return
+  let k = t.k[n]
+  if k == ast.N_FUNCDECL:
+    if t.d[n] > 0: ign[t.d[n]] = true
+  elif k == ast.N_FUNCLIT: ign[t.b[n]] = true
+  elif k == ast.N_FOR:
+    let body = t.d[n]
+    if ast.count(t, t.a[body]) == 0 and t.a[n] <= 0 and t.c[n] <= 0 and t.b[n] > 0 and nk(t, t.b[n]) == ast.N_CALL: ign[body] = true
+  elif k == ast.N_RANGE:
+    let body = t.d[n]
+    if ast.count(t, t.a[body]) == 0:
+      if t.a[n] <= 0 and t.b[n] <= 0: ign[body] = true
+      else:
+        add_node(t, &x, "empty-block", "this block is empty, you can remove it", 0.9, n)
+        return
+  elif k == ast.N_BLOCK:
+    if not (n in ign) and ast.count(t, t.a[n]) == 0: add_node(t, &x, "empty-block", "this block is empty, you can remove it", 1.0, n)
+  elif k == ast.N_SWITCH or k == ast.N_TYPESWITCH:
+    # (the body's BlockStmt: its list of cases)
+    eb_visit(t, &x, t.a[n], &ign)
+    eb_visit(t, &x, t.b[n], &ign)
+    let body = t.c[n]
+    if ast.count(t, body) == 0: add_node(t, &x, "empty-block", "this block is empty, you can remove it", 1.0, body)
+    for c in ast.items(t, body): eb_visit(t, &x, c, &ign)
+    return
+  for i in 0..resolve.nkids(t, n): eb_visit(t, &x, resolve.kid(t, n, i), &ign)
+
+# ---- unreachable-code
+
+fn uc_visit(t: ast.Ast, var x: revive_core.Ctx, n: Int):
+  if n <= 0: return
+  if t.k[n] == ast.N_BLOCK: uc_block(t, &x, t.a[n])
+  for i in 0..resolve.nkids(t, n): uc_visit(t, &x, resolve.kid(t, n, i))
+
+fn branching(pk: Str, f: Str) -> Bool:
+  if pk == "os": return f == "Exit"
+  if pk == "log": return f == "Fatal" or f == "Fatalf" or f == "Fatalln" or f == "Panic" or f == "Panicf" or f == "Panicln"
+  if pk == "t" or pk == "b" or pk == "f": return f == "Fatal" or f == "Fatalf" or f == "FailNow"
+  return false
+
+fn uc_block(t: ast.Ast, var x: revive_core.Ctx, l: Int):
+  let n = ast.count(t, l)
+  if n < 2: return
+  for i in 0..n - 1:
+    let s = ast.item(t, l, i)
+    let nx = ast.item(t, l, i + 1)
+    if nk(t, nx) == ast.N_LABELED: continue
+    let k = nk(t, s)
+    if k == ast.N_RETURN:
+      add_node(t, &x, "unreachable-code", "unreachable code after this statement", 1.0, s)
+      return
+    if k == ast.N_BRANCH:
+      if t.f[s] != K_FALLTHROUGH:
+        add_node(t, &x, "unreachable-code", "unreachable code after this statement", 1.0, s)
+        return
+    if k == ast.N_EXPRSTMT:
+      let ce = t.a[s]
+      if nk(t, ce) != ast.N_CALL: continue
+      let fc = t.a[ce]
+      if nk(t, fc) != ast.N_SELECTOR: continue
+      if nk(t, t.a[fc]) != ast.N_IDENT: continue
+      if not branching(ident_name(t, t.a[fc]), ident_name(t, t.b[fc])): continue
+      if nk(t, nx) == ast.N_RETURN: continue
+      add_node(t, &x, "unreachable-code", "unreachable code after this statement", 1.0, s)
+      return
+
+# ---- range
+
+fn rg_visit(t: ast.Ast, var x: revive_core.Ctx, n: Int):
+  if n <= 0: return
+  if t.k[n] == ast.N_RANGE and t.b[n] > 0 and is_ident(t, t.b[n], "_"):
+    var tok = "="
+    if t.f[n] == T_DEFINE: tok = ":="
+    add_node(t, &x, "range", "should omit 2nd value from range; this loop is equivalent to `for {format.expr(t, t.a[n])} {tok} range ...`", 1.0, t.b[n])
+  for i in 0..resolve.nkids(t, n): rg_visit(t, &x, resolve.kid(t, n, i))
+
+# ---- increment-decrement
+
+fn id_visit(t: ast.Ast, var x: revive_core.Ctx, n: Int):
+  if n <= 0: return
+  if t.k[n] == ast.N_ASSIGN and ast.count(t, t.a[n]) == 1 and ast.count(t, t.b[n]) > 0:
+    let r = ast.item(t, t.b[n], 0)
+    let op = t.f[n]
+    if nk(t, r) == ast.N_BASICLIT and t.f[r] == T_INT and t.names[t.s[r]] == "1" and (op == T_ADD_ASSIGN or op == T_SUB_ASSIGN):
+      var sfx = "++"
+      var ops = "+="
+      if op == T_SUB_ASSIGN:
+        sfx = "--"
+        ops = "-="
+      let lhs = format.expr(t, ast.item(t, t.a[n], 0))
+      var rhs: [Str] = []
+      for e in ast.items(t, t.b[n]): rhs.push(format.expr(t, e))
+      add_node(t, &x, "increment-decrement", "should replace " + lhs + " " + ops + " " + ", ".join(rhs) + " with " + lhs + sfx, 0.8, n)
+  for i in 0..resolve.nkids(t, n): id_visit(t, &x, resolve.kid(t, n, i))
+
+# ---- unused-parameter
+
+type UpOpts:
+  custom: Bool
+  allow: rx.Rx
+  msg: Str          # with %s for the name
+
+fn up_configure(d: doc.Doc, an: Int, var o: UpOpts):
+  if an < 0 or d.kind[an] != doc.K_SEQ or d.kids[an].len == 0: return
+  let m = d.kids[an][0]
+  if d.kind[m] != doc.K_MAP: return
+  for i in 0..d.keys[m].len:
+    if norm_opt(d.keys[m][i]) != "allowregex": return
+    let v = d.kids[m][i]
+    if d.kind[v] != doc.K_SCALAR: return
+    let s = d.text[v] + ""
+    o.custom = true
+    o.allow = rx.compile(s)
+    o.msg = "parameter '%s' seems to be unused, consider removing or renaming it to match " + s
+
+# The named parameters' identifiers of function type ft ("_" left out)
+fn up_params(t: ast.Ast, ft: Int) -> [Int]:
+  var out: [Int] = []
+  for f in ast.items(t, t.b[ft]):
+    for id in ast.items(t, t.a[f]):
+      if t.names[t.s[id]] != "_": out.push(id)
+  return out
+
+fn up_mark(t: ast.Ast, objs: [Int], n: Int, var used: {Int: Bool}):
+  if n <= 0: return
+  if t.k[n] == ast.N_IDENT:
+    let o = objs[n]
+    if o >= 0 and o in used: used[o] = true
+  for i in 0..resolve.nkids(t, n): up_mark(t, objs, resolve.kid(t, n, i), &used)
+
+fn up_visit(t: ast.Ast, objs: [Int], var x: revive_core.Ctx, n: Int, o: UpOpts):
+  if n <= 0: return
+  let k = t.k[n]
+  var ft = -1
+  var body = -1
+  if k == ast.N_FUNCLIT:
+    ft = t.a[n]
+    body = t.b[n]
+  elif k == ast.N_FUNCDECL:
+    if t.d[n] <= 0: return
+    ft = t.c[n]
+    body = t.d[n]
+  if ft > 0:
+    let ps = up_params(t, ft)
+    if ps.len > 0:
+      var used: {Int: Bool} = {}
+      for id in ps: used[id] = false
+      up_mark(t, objs, body, &used)
+      for id in ps:
+        let nm = t.names[t.s[id]] + ""
+        if o.custom:
+          if rx.matches(o.allow, nm): continue
+        if not used[id]: add_node(t, &x, "unused-parameter", o.msg.replace("%s", nm), 1.0, id)
+  for i in 0..resolve.nkids(t, n): up_visit(t, objs, &x, resolve.kid(t, n, i), o)
+
+# ---- redefines-builtin-id
+
+fn builtin_kind(id: Str, go121: Bool) -> Str:
+  if id in ["append", "cap", "close", "complex", "copy", "delete", "imag", "len", "make", "new", "panic", "print", "println", "real", "recover"]: return "function"
+  if go121 and (id == "clear" or id == "max" or id == "min"): return "function"
+  if id == "true" or id == "false" or id == "iota" or id == "nil": return "constant or variable"
+  if id in ["bool", "byte", "comparable", "complex128", "complex64", "error", "float32", "float64", "int", "int16", "int32", "int64", "int8", "rune", "string", "uint", "uint16", "uint32", "uint64", "uint8", "uintptr", "any"]: return "type"
+  return ""
+
+fn rb_visit(t: ast.Ast, var x: revive_core.Ctx, n: Int, go121: Bool):
+  if n <= 0: return
+  let k = t.k[n]
+  let rule = "redefines-builtin-id"
+  if k == ast.N_GENDECL:
+    let tok = t.f[n]
+    if tok == K_TYPE:
+      let specs = t.a[n]
+      if ast.count(t, specs) < 1: return
+      let sp = ast.item(t, specs, 0)
+      if nk(t, sp) != ast.N_TYPESPEC: return
+      let id = ident_name(t, t.a[sp])
+      let bt = builtin_kind(id, go121)
+      if bt != "": add_node(t, &x, rule, "redefinition of the built-in " + bt + " " + id, 1.0, n)
+    elif tok == K_VAR or tok == K_CONST:
+      for sp in ast.items(t, t.a[n]):
+        if nk(t, sp) != ast.N_VALUESPEC: continue
+        for nmn in ast.items(t, t.a[sp]):
+          let id = ident_name(t, nmn)
+          let bt = builtin_kind(id, go121)
+          if bt != "": add_node(t, &x, rule, "redefinition of the built-in " + bt + " " + id, 1.0, n)
+    else: return
+  elif k == ast.N_FUNCDECL:
+    if t.a[n] < 0:
+      let id = ident_name(t, t.b[n])
+      let bt = builtin_kind(id, go121)
+      if bt != "": add_node(t, &x, rule, "redefinition of the built-in " + bt + " " + id, 1.0, n)
+  elif k == ast.N_FUNCTYPE:
+    for l in [t.a[n], t.b[n], t.c[n]]:
+      if l < 0: continue
+      for f in ast.items(t, l):
+        for nmn in ast.items(t, t.a[f]):
+          let id = ident_name(t, nmn)
+          let bt = builtin_kind(id, go121)
+          if bt != "": add_node(t, &x, rule, "redefinition of the built-in " + bt + " " + id, 1.0, nmn)
+  elif k == ast.N_ASSIGN:
+    for e in ast.items(t, t.a[n]):
+      if nk(t, e) != ast.N_IDENT: continue
+      let id = ident_name(t, e)
+      let bt = builtin_kind(id, go121)
+      if bt == "": continue
+      var msg = ""
+      if bt == "constant or variable":
+        if t.f[n] == T_DEFINE: msg = "assignment creates a shadow of built-in identifier " + id
+        else: msg = "assignment modifies built-in identifier " + id
+      else: msg = "redefinition of the built-in " + bt + " " + id
+      add_node(t, &x, rule, msg, 1.0, n)
+  for i in 0..resolve.nkids(t, n): rb_visit(t, &x, resolve.kid(t, n, i), go121)

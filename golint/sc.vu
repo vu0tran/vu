@@ -12,6 +12,7 @@ import errcheck
 import deprecated
 import deprdata
 import ssa
+import resyntax
 from scan import T_ASSIGN, T_DEFINE, T_LOR, T_LAND, T_EQL, T_NEQ, T_LSS, T_GTR, T_LEQ, T_GEQ, T_NOT, T_ARROW, T_AND, T_SUB, T_ADD, T_QUO, T_REM, T_OR, T_XOR, T_ANDNOT
 from scan import K_BREAK, K_GOTO, K_VAR, K_CONST, K_RETURN
 
@@ -19,6 +20,9 @@ type C:
   pi: Int
   out: [pkg.Issue]
   cname: {Int: Str}      # call -> its callee's full name
+  dotw: [Str] = []       # dot-import-whitelist (ST1001)
+  written: {Int: Bool} = {}  # locals staticcheck's IR doesn't lift to one value (SA1000), once wk_done
+  wk_done: Bool = false
 
 fn code_rank(code: Str) -> Int:
   var base = 0
@@ -522,8 +526,83 @@ fn st1001(var g: tc.Prog, var c: C, p: pkg.Pkg):
       if n <= 0 or nm(g, pi, n) != ".": continue
       let lit = nm(g, pi, g.pk[pi].t.b[im])
       let path = lit[1..lit.len - 1]
-      if path == "github.com/mmcloughlin/avo/build" or path == "github.com/mmcloughlin/avo/operand" or path == "github.com/mmcloughlin/avo/reg": continue
+      if path in c.dotw: continue
       report(g, &c, im, "ST1001", "should not use dot imports")
+
+# ---- ST1020, ST1021, ST1022: the doc comments of exported functions, types, vars and consts
+
+fn report_at(g: tc.Prog, var c: C, n: Int, pos: Int, code: Str, msg: Str):
+  let pi = c.pi
+  c.out.push(pkg.Issue(g.pk[pi].t.file[n], pos, "staticcheck", code + ": " + msg, code_rank(code)))
+
+# The doc comment group right before pos in file fi: its start and its text, trimmed as staticcheck's
+# docText does (strings.TrimSpace of CommentGroup.Text()), or start -1 when it has none or it's empty
+type DocT:
+  pos: Int
+  text: Str
+
+fn doc_text(p: pkg.Pkg, fi: Int, pos: Int) -> DocT:
+  let cm = p.comments[fi]
+  let gr = deprecated.doc_group(p.srcs[fi], cm, pos)
+  if gr.len == 0: return DocT(-1, "")
+  let t = deprecated.group_text(p.srcs[fi], cm, gr[0], gr[1] + 3).strip()
+  if t == "": return DocT(-1, "")
+  return DocT(cm[gr[0]], t)
+
+fn st102x(var g: tc.Prog, var c: C, p: pkg.Pkg):
+  let pi = c.pi
+  let t = g.pk[pi].t
+  for fi in 0..g.pk[pi].roots.len:
+    if p.test[fi] or p.hgen[fi]: continue
+    let root = g.pk[pi].roots[fi]
+    for d in ast.items(t, t.c[root]):
+      if k(g, pi, d) == ast.N_FUNCDECL:
+        let name = nm(g, pi, t.b[d])
+        let dt = doc_text(p, fi, t.pos[d])
+        if dt.pos < 0 or not vet.exported(name) or dt.text.startswith("Deprecated: "): continue
+        var kind = "function"
+        if t.a[d] >= 0:
+          kind = "method"
+          let fs0 = ast.items(t, t.a[d])
+          if fs0.len == 0: continue
+          var rt = t.b[fs0[0]]
+          if k(g, pi, rt) == ast.N_STAR: rt = t.a[rt]
+          if k(g, pi, rt) == ast.N_INDEX: rt = t.a[rt]
+          if k(g, pi, rt) != ast.N_IDENT or not vet.exported(nm(g, pi, rt)): continue
+        if not dt.text.startswith(name + " "): report_at(g, &c, d, dt.pos, "ST1020", "comment on exported {kind} {name} should be of the form \"{name} ...\"")
+        continue
+      if k(g, pi, d) != ast.N_GENDECL: continue
+      let tok = t.f[d]
+      if tok == scan.K_IMPORT: continue
+      let paren = t.s[d] == 1
+      let specs = ast.items(t, t.a[d])
+      for sp in specs:
+        if k(g, pi, sp) == ast.N_TYPESPEC:
+          let name = nm(g, pi, t.a[sp])
+          if not vet.exported(name): continue
+          # (a parenthesized spec's own doc; else the declaration's)
+          var dt = DocT(-1, "")
+          if paren: dt = doc_text(p, fi, t.pos[sp])
+          elif specs.len == 1: dt = doc_text(p, fi, t.pos[d])
+          if dt.pos < 0: continue
+          if dt.text.startswith(name + " "): continue
+          var s2 = dt.text
+          for a in ["A", "An", "The"]:
+            if s2.startswith(a + " "):
+              s2 = s2[a.len + 1..s2.len]
+              break
+          if not s2.startswith(name + " "): report_at(g, &c, d, dt.pos, "ST1021", "comment on exported type {name} should be of the form \"{name} ...\" (with optional leading article)")
+        elif k(g, pi, sp) == ast.N_VALUESPEC:
+          let names = ast.items(t, t.a[sp])
+          if paren or names.len > 1: continue
+          let name = nm(g, pi, names[0])
+          if not vet.exported(name): continue
+          let dt = doc_text(p, fi, t.pos[d])
+          if dt.pos < 0: continue
+          if not dt.text.startswith(name + " "):
+            var kind = "var"
+            if tok == scan.K_CONST: kind = "const"
+            report_at(g, &c, d, dt.pos, "ST1022", "comment on exported {kind} {name} should be of the form \"{name} ...\"")
 
 # ---- S1003: strings.Index(...) != -1
 
@@ -574,8 +653,9 @@ fn s1003(var g: tc.Prog, fs: Fs, var c: C, p: pkg.Pkg, nodes: [Int]):
 
 # ---- the driver
 
-fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gover: Int, var w: vet.Walk):
+fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gover: Int, var w: vet.Walk, dotw: [Str]):
   var c = C(pi, [], {})
+  for x in dotw: c.dotw.push(x + "")
   var roots: [Int] = []
   for fi in 0..g.pk[pi].roots.len:
     if not p.gen[fi]: roots.push(g.pk[pi].roots[fi])
@@ -631,7 +711,9 @@ fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gov
   sa6006_qf1010(&g, fs, &c, bk_n_call, gover)
   sa6002(&g, fs, &c, bk_n_call)
   sa9003(&g, &c, p, bk_n_if, roots)
+  sa1000(&g, fs, &c, bk_n_call, nodes)
   st1001(&g, &c, p)
+  st102x(&g, &c, p)
   st1005(&g, fs, &c, p, bk_n_call, roots)
   st1006(&g, &c, p, roots)
   st1008(&g, fs, &c, nodes)
@@ -1268,6 +1350,95 @@ fn sa1019(var g: tc.Prog, fs: Fs, var c: C, p: pkg.Pkg, roots: [Int], gover: Int
       if msg.len == 0: continue
       if path == "github.com/golang/protobuf/proto" and p.hgen[fi]: continue
       sa1019_report(&g, fs, &c, pi, g.pk[pi].t.b[im], lit, path, path, false, msg, gover)
+
+# ---- SA1000: invalid regular expressions (a constant pattern to regexp.Compile and the like)
+
+# The locals that aren't one value through the function (as staticcheck's IR, after lifting, sees
+# them): assigned again (=, op=, ++, a range clause, a := that redeclares them), their address taken,
+# or captured by a closure (a free variable, on the heap)
+fn written_locals(g: tc.Prog, var c: C, nodes: [Int]):
+  let pi = c.pi
+  let t = g.pk[pi].t
+  var lits: [Int] = []
+  for n in nodes:
+    let kn = k(g, pi, n)
+    if kn == ast.N_ASSIGN:
+      for l in ast.items(t, t.a[n]):
+        let o = obj_of(g, pi, unparen(g, pi, l))
+        # (the declaring := itself declares the names it doesn't redeclare)
+        if o >= 0 and not (g.odecl[o] == n and g.onode[o] == unparen(g, pi, l)): c.written[o] = true
+    elif kn == ast.N_INCDEC:
+      let o = obj_of(g, pi, unparen(g, pi, t.a[n]))
+      if o >= 0: c.written[o] = true
+    elif kn == ast.N_RANGE:
+      for x in [t.a[n], t.b[n]]:
+        if x > 0:
+          let o = obj_of(g, pi, unparen(g, pi, x))
+          if o >= 0 and g.odecl[o] != n: c.written[o] = true
+    elif kn == ast.N_UNARY and t.f[n] == T_AND:
+      let o = obj_of(g, pi, unparen(g, pi, t.a[n]))
+      if o >= 0: c.written[o] = true
+    elif kn == ast.N_FUNCLIT: lits.push(n)
+  # (a use inside a function literal of a local declared outside it)
+  if lits.len > 0:
+    for n in nodes:
+      if k(g, pi, n) != ast.N_IDENT: continue
+      let o = obj_of(g, pi, n)
+      if o < 0 or g.ok[o] != tc.O_VAR or g.opkg[o] != pi or g.onode[o] == n: continue
+      let dp = t.pos[g.onode[o]]
+      for fl in lits:
+        if t.file[fl] != t.file[n]: continue
+        if t.pos[n] >= t.pos[fl] and t.pos[n] < t.end[fl] and not (dp >= t.pos[fl] and dp < t.end[fl]):
+          c.written[o] = true
+          break
+  c.wk_done = true
+
+# The value expression a local is declared with (`x := v`, `var x = v`, one value per name), or -1
+fn decl_value(g: tc.Prog, pi: Int, o: Int) -> Int:
+  let d = g.odecl[o]
+  let t = g.pk[pi].t
+  var ls: [Int] = []
+  var rs: [Int] = []
+  if k(g, pi, d) == ast.N_ASSIGN and t.f[d] == T_DEFINE:
+    ls = ast.items(t, t.a[d])
+    rs = ast.items(t, t.b[d])
+  elif k(g, pi, d) == ast.N_VALUESPEC and t.c[d] >= 0:
+    ls = ast.items(t, t.a[d])
+    rs = ast.items(t, t.c[d])
+  if ls.len != rs.len: return -1
+  for i in 0..ls.len:
+    if ls[i] == g.onode[o]: return rs[i]
+  return -1
+
+# The constant a call argument has once the IR lifts locals: a constant expression, or a local
+# declared with a constant value (:= or var, one value per name) that's one value throughout
+fn ir_const(var g: tc.Prog, fs: Fs, var c: C, nodes: [Int], arg: Int) -> tc.Cv:
+  let pi = c.pi
+  let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[arg], arg, -1, 0)
+  if cv.k != 0: return cv
+  let a = unparen(g, pi, arg)
+  if k(g, pi, a) != ast.N_IDENT: return cv
+  let o = obj_of(g, pi, a)
+  if o < 0 or g.ok[o] != tc.O_VAR or g.opkg[o] != pi: return cv
+  let val = decl_value(g, pi, o)
+  if val < 0: return cv
+  if not c.wk_done: written_locals(g, &c, nodes)
+  if o in c.written: return cv
+  let vf = g.pk[pi].t.file[val]
+  return tc.const_val(&g, fs, pi, vf, val, -1, 0)
+
+fn sa1000(var g: tc.Prog, fs: Fs, var c: C, calls: [Int], nodes: [Int]):
+  let pi = c.pi
+  for n in calls:
+    if k(g, pi, n) != ast.N_CALL: continue
+    let cn = callee_name(&g, fs, &c, n)
+    if not (cn == "regexp.MustCompile" or cn == "regexp.Compile" or cn == "regexp.Match" or cn == "regexp.MatchReader" or cn == "regexp.MatchString"): continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len == 0: continue
+    let cv = ir_const(&g, fs, &c, nodes, args[0])
+    if cv.k != 2: continue
+    let e = resyntax.check(cv.s)
+    if e != "": report(g, &c, args[0], "SA1000", e)
 
 # ---- SA1004: time.Sleep with a small constant
 

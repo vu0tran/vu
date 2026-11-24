@@ -1,0 +1,266 @@
+# depguard (OpenPeeDeeP/depguard v2.2.1, as golangci-lint 2.14.0 runs it): each file's imports
+# against the rule lists whose files patterns match its path. Lists are named by their keys (viper
+# lowercases them), checked in name order; with no rules, one list "Main" allows only the standard
+# library ($gostd: the folders of GOROOT/src).
+
+import doc
+import cfg
+
+type Rule:
+  name: Str
+  mode: Int          # 0 original, 1 strict, 2 lax
+  files: [Str]
+  nfiles: [Str]
+  allow: [Str]       # sorted
+  deny: [Str]        # sorted
+  sugg: [Str]        # each deny's desc, trimmed
+
+# ---- gobwas/glob with '/' as the separator: * (not across /), ** (anything), ? (one rune, not
+# /), [abc] [a-z] [!...] (one rune), {a,b} (alternatives), \ escapes
+
+fn rune_len(s: Str, i: Int) -> Int:
+  let b = s[i]
+  if b < 128 or b >= 248: return 1
+  var n = 1
+  if b >= 240: n = 4
+  elif b >= 224: n = 3
+  elif b >= 192: n = 2
+  if i + n > s.len: return 1
+  return n
+
+# the end of the {...} starting at i (the index of its }), or -1
+fn brace_end(p: Str, i: Int) -> Int:
+  var depth = 0
+  var j = i
+  while j < p.len:
+    let c = p[j]
+    if c == '\\': j += 1
+    elif c == '[':
+      j += 1
+      while j < p.len and p[j] != ']': j += 1
+    elif c == '{': depth += 1
+    elif c == '}':
+      depth -= 1
+      if depth == 0: return j
+    j += 1
+  return -1
+
+# the alternatives of the {...} from i to e
+fn alternatives(p: Str, i: Int, e: Int) -> [Str]:
+  var out: [Str] = []
+  var depth = 0
+  var st = i + 1
+  var j = i + 1
+  while j < e:
+    let c = p[j]
+    if c == '\\': j += 1
+    elif c == '{': depth += 1
+    elif c == '}': depth -= 1
+    elif c == ',' and depth == 0:
+      out.push(p[st..j])
+      st = j + 1
+    j += 1
+  out.push(p[st..e])
+  return out
+
+# the rune class at i ([): [end, matches] for the rune r of s at si
+fn class_match(p: Str, i: Int, s: Str, si: Int) -> [Int]:
+  var j = i + 1
+  var neg = false
+  if j < p.len and p[j] == '!':
+    neg = true
+    j += 1
+  let rl = rune_len(s, si)
+  let r = s[si..si + rl]
+  var hit = false
+  # a single range lo-hi, or a list of runes
+  if j + 3 < p.len + 1 and j + 2 < p.len and p[j + 1] == '-' and j + 3 < p.len and p[j + 3] == ']':
+    if r.len == 1 and s[si] >= p[j] and s[si] <= p[j + 2]: hit = true
+    j += 3
+  else:
+    while j < p.len and p[j] != ']':
+      if p[j] == '\\': j += 1
+      if j < p.len:
+        let l = rune_len(p, j)
+        if p[j..j + l] == r: hit = true
+        j += l
+  if j >= p.len: return [-1, 0]
+  var m = 0
+  if hit != neg: m = 1
+  return [j + 1, m]
+
+fn gmatch(p: Str, pi: Int, s: Str, si: Int) -> Bool:
+  if pi >= p.len: return si == s.len
+  let c = p[pi]
+  if c == '*':
+    if pi + 1 < p.len and p[pi + 1] == '*':
+      var k = si
+      while k <= s.len:
+        if gmatch(p, pi + 2, s, k): return true
+        k += 1
+      return false
+    var k = si
+    while true:
+      if gmatch(p, pi + 1, s, k): return true
+      if k >= s.len or s[k] == '/': return false
+      k += 1
+    return false
+  if c == '?':
+    if si >= s.len or s[si] == '/': return false
+    return gmatch(p, pi + 1, s, si + rune_len(s, si))
+  if c == '[':
+    if si >= s.len: return false
+    let cm = class_match(p, pi, s, si)
+    if cm[0] < 0 or cm[1] == 0: return false
+    return gmatch(p, cm[0], s, si + rune_len(s, si))
+  if c == '{':
+    let e = brace_end(p, pi)
+    if e < 0: return false
+    let rest = p[e + 1..p.len]
+    for alt in alternatives(p, pi, e):
+      if gmatch(alt + rest, 0, s, si): return true
+    return false
+  var pc = pi
+  if c == '\\' and pi + 1 < p.len: pc = pi + 1
+  if si >= s.len or s[si] != p[pc]: return false
+  return gmatch(p, pc + 1, s, si + 1)
+
+fn glob(p: Str, s: Str) -> Bool:
+  return gmatch(p, 0, s, 0)
+
+# ---- the rules
+
+fn gostd(fs: Fs, goroot: Str) -> [Str]:
+  var out: [Str] = []
+  let names = fs.list(goroot + "/src") else return out
+  for nm in names:
+    if nm.endswith("/"): out.push(nm[0..nm.len - 1])
+  return out
+
+fn expand(xs: [Str], key: Str, with: [Str]) -> [Str]:
+  var out: [Str] = []
+  for x in xs:
+    if x == key:
+      for w in with: out.push(w + "")
+    else: out.push(x + "")
+  return out
+
+fn trim_dollar(s: Str) -> Str:
+  var e = s.len
+  while e > 0 and s[e - 1] == '$': e -= 1
+  return s[0..e]
+
+fn rules(fs: Fs, c: cfg.Cfg, goroot: Str) -> [Rule]:
+  let d = c.d
+  let rs = doc.get(d, cfg.lsettings(c, "depguard"), "rules")
+  var out: [Rule] = []
+  var std: [Str] = []
+  var have_std = false
+  var names: [Str] = []
+  var nodes: {Str: Int} = {}
+  if rs >= 0 and d.kind[rs] == doc.K_MAP:
+    for i in 0..d.keys[rs].len:
+      let nm = doc.lower(d.keys[rs][i])
+      if not (nm in nodes): names.push(nm)
+      nodes[nm] = d.kids[rs][i]
+  if names.len == 0:
+    std = gostd(fs, goroot)
+    var al: [Str] = []
+    for x in std: al.push(x + "")
+    al.sort()
+    out.push(Rule("Main", 0, ["**/*.go"], [], al, [], []))
+    return out
+  names.sort()
+  for nm in names:
+    let n = nodes[nm]
+    let lm = doc.lower(doc.str_of(d, doc.get(d, n, "list-mode"), ""))
+    var mode = 0
+    if lm == "strict": mode = 1
+    elif lm == "lax": mode = 2
+    elif lm != "" and lm != "original": continue
+    var files: [Str] = []
+    var nfiles: [Str] = []
+    for f0 in doc.strs_of(d, doc.get(d, n, "files")):
+      var f = f0.replace("${{base-path}}", c.base).replace("${{config-path}}", c.cfg_dir)
+      var neg = false
+      if f.len > 0 and f[0] == '!':
+        neg = true
+        f = f[1..f.len]
+      var exp: [Str] = [f]
+      if f == "$all": exp = ["**/*.go"]
+      elif f == "$test": exp = ["**/*_test.go"]
+      for e in exp:
+        if neg: nfiles.push(e + "")
+        else: files.push(e + "")
+    var allow = doc.strs_of(d, doc.get(d, n, "allow"))
+    if "$gostd" in allow:
+      if not have_std:
+        std = gostd(fs, goroot)
+        have_std = true
+      allow = expand(allow, "$gostd", std)
+    allow.sort()
+    # (deny: a map from package to desc, later entries winning; $gostd expands to every folder)
+    var dmap: {Str: Str} = {}
+    let dn = doc.get(d, n, "deny")
+    if dn >= 0 and d.kind[dn] == doc.K_SEQ:
+      for e in d.kids[dn]:
+        let pk = doc.str_of(d, doc.get(d, e, "pkg"), "")
+        let ds = doc.str_of(d, doc.get(d, e, "desc"), "")
+        if pk == "$gostd":
+          if not have_std:
+            std = gostd(fs, goroot)
+            have_std = true
+          for x in std: dmap[x + ""] = ds + ""
+        else: dmap[pk + ""] = ds + ""
+    var deny: [Str] = []
+    for k2, _ in dmap: deny.push(k2 + "")
+    deny.sort()
+    var sugg: [Str] = []
+    for x in deny: sugg.push(dmap[x].strip())
+    if allow.len == 0 and deny.len == 0: continue
+    out.push(Rule(nm + "", mode, files, nfiles, allow, deny, sugg))
+  return out
+
+fn file_match(r: Rule, path: Str) -> Bool:
+  var inc = r.files.len == 0
+  for g in r.files:
+    if glob(g, path): inc = true
+  if not inc: return false
+  for g in r.nfiles:
+    if glob(g, path): return false
+  return true
+
+# strInPrefixList: [in, index] (index -1 when every entry sorts after s)
+fn in_prefix(s: Str, l: [Str]) -> [Int]:
+  var lo = 0
+  var hi = l.len
+  while lo < hi:
+    let mid = (lo + hi) / 2
+    if trim_dollar(l[mid]) > s: hi = mid
+    else: lo = mid + 1
+  let idx = lo - 1
+  if idx < 0: return [0, -1]
+  let ioc = l[idx]
+  if ioc[ioc.len - 1] == '$':
+    if s == ioc[0..ioc.len - 1]: return [1, idx]
+    return [0, idx]
+  if ioc.find(".") < 0 and ioc.find("/") < 0 and s.find(".") >= 0: return [0, idx]
+  if s.startswith(ioc): return [1, idx]
+  return [0, idx]
+
+# "" when the import is allowed, else the message
+fn verdict(r: Rule, imp: Str) -> Str:
+  let a = in_prefix(imp, r.allow)
+  let dd = in_prefix(imp, r.deny)
+  var in_a = a[0] == 1
+  let in_d = dd[0] == 1
+  var ok = false
+  if r.mode == 0:
+    in_a = r.allow.len == 0 or in_a
+    ok = in_a and not in_d
+  elif r.mode == 1: ok = in_a and (not in_d or r.allow[a[1]].len > r.deny[dd[1]].len)
+  else: ok = not in_d or (in_a and r.allow[a[1]].len > r.deny[dd[1]].len)
+  if ok: return ""
+  var msg = "import '{imp}' is not allowed from list '{r.name}'"
+  if in_d and dd[1] >= 0 and r.sugg[dd[1]] != "": msg = msg + ": " + r.sugg[dd[1]]
+  return msg
