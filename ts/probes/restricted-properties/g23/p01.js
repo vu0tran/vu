@@ -1,0 +1,1 @@
+legacyApi[method]

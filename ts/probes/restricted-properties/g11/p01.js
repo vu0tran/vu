@@ -1,0 +1,1 @@
+let bar; ([bar = 5] = foo);
