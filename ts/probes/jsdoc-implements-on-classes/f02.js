@@ -1,0 +1,8 @@
+
+			      /**
+			       * @implements {SomeClass}
+			       */
+			      const quux = () => {
+
+			      }
+			      

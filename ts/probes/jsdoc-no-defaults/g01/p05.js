@@ -1,0 +1,6 @@
+
+			          /**
+			           * @callback
+			           * @param {number} foo
+			           */
+			      

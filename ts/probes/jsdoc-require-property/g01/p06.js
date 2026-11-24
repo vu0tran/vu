@@ -1,0 +1,5 @@
+
+			          /**
+			           * @typedef {string} SomeTypedef
+			           */
+			      

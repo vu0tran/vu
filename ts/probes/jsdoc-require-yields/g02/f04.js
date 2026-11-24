@@ -1,0 +1,8 @@
+
+                             /**
+                              *
+                              */
+                             async function * quux () {
+                               yield;
+                             }
+                        

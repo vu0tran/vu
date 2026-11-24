@@ -1,0 +1,6 @@
+
+			      /**
+			       * @callback
+			       * @implements {SomeClass}
+			       */
+			      

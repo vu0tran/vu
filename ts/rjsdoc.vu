@@ -1,10 +1,16 @@
-# oxlint's jsdoc plugin (oxlint 1.90.0): oxc_jsdoc's parser (a /** */ comment's text and its tags,
-# with their spans as oxc gives them), the plugin's settings (settings.jsdoc), and its rules.
+# oxlint's jsdoc plugin (oxlint 1.94.0): oxc_jsdoc's parser (a /** */ comment's text and its tags,
+# with their spans as oxc gives them), which comments are JSDoc and what they're attached to (oxc's
+# lexer and JSDocBuilder), the plugin's settings (settings.jsdoc), and its rules: check-tag-names,
+# check-property-names, implements-on-classes, no-defaults, require-property (and its -description,
+# -name, -type) and require-yields. The rules that run once per file report in the order oxc's
+# iter_all gives the comments (FxHashMap order, doc_order).
 
+import ast
 import lconf
 import rules
 import rjest
-from rules import L, add, span, order_at
+import rhooks
+from rules import L, k, parent, add, span, order_at, label, more
 
 # A file's JSDoc comments, parsed: per comment its span (after /** to before */) and text part,
 # per tag its comment, kind span, kind name, body span and body text.
@@ -21,9 +27,10 @@ type Docs:
   kname: [Str]          # the name without @
   bs: [Int]             # body span (after the name, to the next tag)
   be: [Int]
+  att: [Int]            # each comment: the position of the token it's attached to (oxc's attached_to)
 
 fn new_docs() -> Docs:
-  return Docs([], [], [], [], [], [], [], [], [], [], [], [])
+  return Docs([], [], [], [], [], [], [], [], [], [], [], [], [])
 
 type JSet:
   on: Bool
@@ -206,9 +213,25 @@ fn add_tag(var d: Docs, src: Str, s: Int, e: Int, di: Int):
   d.bs.push(b)
   d.be.push(e)
 
-# parse_jsdoc over src[s..e]
-fn parse_one(var d: Docs, src: Str, s: Int, e: Int):
+# the length of the line terminator at i (0 none): \n, \r, U+2028, U+2029
+fn lt_len(src: Str, i: Int) -> Int:
+  let c = src[i]
+  if c == '\n' or c == '\r': return 1
+  if c == 0xE2 and i + 2 < src.len and src[i + 1] == 0x80 and (src[i + 2] == 0xA8 or src[i + 2] == 0xA9): return 3
+  return 0
+
+# starts_block_tag: the @word at i has no / in it
+fn block_tag(src: Str, i: Int, e: Int) -> Bool:
+  let r = token_range(src, i, e)
+  if r[0] < 0: return true
+  for x in r[0]..r[1]:
+    if src[x] == '/': return false
+  return true
+
+# parse_jsdoc over src[s..e] (oxc_jsdoc's parse.rs)
+fn parse_one(var d: Docs, src: Str, s: Int, e: Int, at: Int):
   let di = d.start.len
+  d.att.push(at)
   d.start.push(s)
   d.end.push(e)
   d.tfirst.push(d.ks.len)
@@ -229,7 +252,7 @@ fn parse_one(var d: Docs, src: Str, s: Int, e: Int):
   var ce = s
   while i < e:
     let ch = src[i]
-    let can_parse = curly == 0 and square == 0 and brace == 0 and ticks == 0 and not dq and not sq
+    let nl = lt_len(src, i)
     if ch == '`' and ((not sq and not dq) or (curly == 0 and square == 0 and brace == 0 and not in_import)):
       var count = 1
       while i + 1 < e and src[i + 1] == '`':
@@ -239,11 +262,13 @@ fn parse_one(var d: Docs, src: Str, s: Int, e: Int):
       elif ticks == count: ticks = 0
     elif ch == '"' and ticks == 0 and not sq: dq = not dq
     elif ch == '\'' and ticks == 0 and not dq: sq = not sq
-    elif ch == '\n':
+    elif nl > 0:
       dq = false
       sq = false
       brace = 0
       square = 0
+      curly = 0
+      if ticks < 3: ticks = 0
     elif ch == '{' and ticks == 0 and not dq and not sq: curly += 1
     elif ch == '}' and ticks == 0 and not dq and not sq:
       curly -= 1
@@ -256,7 +281,7 @@ fn parse_one(var d: Docs, src: Str, s: Int, e: Int):
     elif ch == ']' and ticks == 0 and not dq and not sq:
       square -= 1
       if square < 0: square = 0
-    elif ch == '@' and can_parse and at_line_start and not (seen_star and spaces >= 5):
+    elif ch == '@' and ticks == 0 and at_line_start and not (seen_star and spaces >= 5) and block_tag(src, i, e):
       if comment_found: add_tag(&d, src, start, i, di)
       else:
         cs = start
@@ -264,15 +289,16 @@ fn parse_one(var d: Docs, src: Str, s: Int, e: Int):
         comment_found = true
       start = i
       in_import = src[i..e].startswith("@import") and i + 7 < e and is_ws(src[i + 7])
-    if ch == '\n':
+    if nl > 0:
       at_line_start = true
       seen_star = false
       spaces = 0
+      i += nl - 1
     elif at_line_start:
       if ch == '*':
         seen_star = true
         spaces = 0
-      elif ch == ' ' or ch == '\t' or ch == '\r':
+      elif ch == ' ' or ch == '\t':
         if seen_star: spaces += 1
       else: at_line_start = false
     i += 1
@@ -285,20 +311,158 @@ fn parse_one(var d: Docs, src: Str, s: Int, e: Int):
   d.ctext_e.push(ce)
   d.tcount.push(d.ks.len - d.tfirst[di])
 
-# Every /** */ comment of the file (not /**/), parsed.
+# Every JSDoc comment oxc keeps (leading ones; see leading_docs), parsed.
 fn parse_all(l: L) -> Docs:
   var d = new_docs()
-  let cs = rjest.all_comments(l)
+  let ds = leading_docs(l)
   var i = 0
-  while i + 1 < cs.len:
+  while i + 2 < ds.len:
+    parse_one(&d, l.src, ds[i] + 3, ds[i + 1] - 2, ds[i + 2])
+    i += 3
+  return d
+
+# ---- which comments are JSDoc, as oxc's lexer decides (oxc_parser's trivia_builder): a /** */
+# comment (not /**/ or only stars) that's leading, attached to the token after it. One on the line
+# of the token before it, with a line break after it (or the end of the file, or a binary operator
+# continuing that token's expression), is trailing instead, and not JSDoc.
+
+fn has_nl(s: Str, a: Int, b: Int) -> Bool:
+  for i in a..b:
+    if s[i] == '\n' or s[i] == '\r': return true
+  return false
+
+fn word_ch(c: Byte) -> Bool:
+  return is_alnum_ascii(c) or c == '_' or c == '$'
+
+# can_end_expression: the token ending at e
+fn reserved(w: Str) -> Bool:
+  return w in ["await", "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum", "export", "extends", "finally", "for", "function", "if", "import", "in", "instanceof", "new", "return", "switch", "throw", "try", "typeof", "var", "void", "while", "with", "yield"]
+
+fn can_end(l: L, e: Int) -> Bool:
+  let s = l.src
+  let c = s[e - 1]
+  if word_ch(c):
+    var a = e - 1
+    while a > 0 and word_ch(s[a - 1]): a -= 1
+    return not reserved(s[a..e])
+  if c == '/':
+    for x in 1..l.t.nd.len:
+      if l.t.nd[x].k == ast.N_REGEX and l.t.nd[x].end == e: return true
+    return false
+  if c == ')' or c == ']' or c == '}' or c == '"' or c == '\'' or c == '`': return true
+  if c == '>': return e < 2 or s[e - 2] != '='
+  if (c == '+' or c == '-') and e >= 2 and s[e - 2] == c: return true
+  return false
+
+fn word_at(s: Str, p: Int, w: Str) -> Bool:
+  if not s[p..s.len].startswith(w): return false
+  return p + w.len >= s.len or not word_ch(s[p + w.len])
+
+# continues_previous_expression: a binary, logical or assignment operator starts at p
+fn continues(s: Str, p: Int) -> Bool:
+  let c = s[p]
+  var c1: Byte = 0
+  if p + 1 < s.len: c1 = s[p + 1]
+  if c == '+' or c == '-': return c1 != c
+  if c == '*' or c == '/' or c == '%' or c == '<' or c == '>' or c == '&' or c == '|' or c == '^': return true
+  if c == '=': return c1 != '>'
+  if c == '!': return c1 == '='
+  if c == '?': return c1 == '?'
+  return word_at(s, p, "in") or word_at(s, p, "instanceof")
+
+fn license(t: Str) -> Bool:
+  return t.find("@license") >= 0 or t.find("@preserve") >= 0
+
+# should_stay_leading (legal, pure and no-side-effects comments)
+fn stays(s: Str, a: Int, b: Int) -> Bool:
+  var e = b
+  if s[a + 1] == '*' and b - a >= 4: e = b - 2
+  let t = s[a + 2..e]
+  if t.startswith("!") or license(t): return true
+  let u = trim(t)
+  if u.startswith("@") or u.startswith("#"):
+    let r = u[1..u.len]
+    if r.startswith("__PURE__") or r.startswith("__NO_SIDE_EFFECTS__") or r.startswith("__KEY__"): return true
+  return false
+
+fn is_doc(s: Str, a: Int, b: Int) -> Bool:
+  if s[a + 1] != '*' or b - a < 5 or s[a + 2] != '*' or not s[a..b].endswith("*/"): return false
+  for i in a + 2..b - 2:
+    if s[i] != '*': return true
+  return false
+
+# The leading JSDoc comments: start, end (after */) and attached position, three Ints each.
+fn leading_docs(l: L) -> [Int]:
+  let cs = rjest.all_comments(l)
+  let s = l.src
+  var out: [Int] = []
+  var pend: [Int] = []        # pending block comments: start, end, preceded by a line break (0/1)
+  var has_prev = false        # a token before
+  var prev_end = 0
+  var saw_nl = true           # a line break since that token (or the start)
+  var nl_c = true             # ... since it or the last block comment
+  var cur = 0
+  if s.len > 1 and s[0] == '#' and s[1] == '!':
+    while cur < s.len and s[cur] != '\n': cur += 1
+  var i = 0
+  while i <= cs.len:
+    var g1 = s.len
+    if i < cs.len: g1 = cs[i]
+    # the text between: white space, or tokens
+    var f = cur
+    while f < g1 and is_ws(s[f]): f += 1
+    if has_nl(s, cur, f):
+      if pend.len > 0 and not saw_nl and not stays(s, pend[pend.len - 3], pend[pend.len - 2]): pend = []
+      saw_nl = true
+      nl_c = true
+    if f < g1:
+      let attach = has_prev and prev_end > 0 and can_end(l, prev_end) and continues(s, f)
+      var j = 0
+      while j + 2 < pend.len:
+        let a = pend[j]
+        let b = pend[j + 1]
+        let trailing = attach and pend[j + 2] == 0 and not stays(s, a, b)
+        if not trailing and is_doc(s, a, b):
+          out.push(a)
+          out.push(b)
+          out.push(f)
+        j += 3
+      pend = []
+      var q = g1
+      while q > f and is_ws(s[q - 1]): q -= 1
+      has_prev = true
+      prev_end = q
+      saw_nl = has_nl(s, q, g1)
+      nl_c = saw_nl
+    if i >= cs.len: break
     let a = cs[i]
     let b = cs[i + 1]
     i += 2
-    if b - a < 5 or l.src[a + 1] != '*' or l.src[a + 2] != '*': continue
-    if not l.src[a..b].endswith("*/"): continue
-    if l.src[a..b] == "/**/": continue
-    parse_one(&d, l.src, a + 3, b - 2)
-  return d
+    cur = b
+    if s[a + 1] == '/':
+      var pk: Byte = 0
+      if has_prev and prev_end > 0: pk = s[prev_end - 1]
+      let eq = pk == '=' and not (prev_end >= 2 and "=!<>+-*/%&|^?".find(s[prev_end - 2..prev_end - 1]) >= 0)
+      if not saw_nl and not eq and pk != '(' and pk != ':' and not stays(s, a, b): pend = []
+      saw_nl = true
+      nl_c = true
+    else:
+      pend.push(a)
+      pend.push(b)
+      if nl_c: pend.push(1)
+      else: pend.push(0)
+      nl_c = false
+  # the end of the file: a comment on the last token's line is trailing
+  var j = 0
+  while j + 2 < pend.len:
+    let a = pend[j]
+    let b = pend[j + 1]
+    if not (has_prev and pend[j + 2] == 0 and not stays(s, a, b)) and is_doc(s, a, b):
+      out.push(a)
+      out.push(b)
+      out.push(s.len)
+    j += 3
+  return out
 
 fn tag_comment(l: L, d: Docs, t: Int) -> Str:
   return parsed(l.src[d.bs[t]..d.be[t]])
@@ -330,36 +494,585 @@ fn typed_always() -> [Str]:
 fn typed_outside_ambient() -> [Str]:
   return ["abstract", "access", "class", "constant", "constructs", "enum", "export", "exports", "function", "global", "inherits", "instance", "interface", "member", "memberOf", "memberof", "method", "mixes", "mixin", "module", "name", "namespace", "override", "property", "requires", "static", "this"]
 
-fn ctn_report(var l: L, d: Docs, t: Int, help: Str):
-  add(&l, d.ks[t], "jsdoc(check-tag-names)", "Invalid tag name found.", help)
-  span(&l, d.ke[t])
-  order_at(&l, d.ks[t])
+fn ctn_report(var l: L, d: Docs, t: Int, help: Str, var seq: Int):
+  report_seq(&l, d.ks[t], d.ke[t], "jsdoc(check-tag-names)", "Invalid tag name found.", help, &seq)
 
 fn check_tag_names(var l: L, d: Docs, st: JSet, defined: [Str], jsx_tags: Bool, typed: Bool, path: Str):
   let valid = valid_tags()
   let ambient = path.endswith(".d.ts")
-  for di in 0..d.start.len:
+  var seq = 0
+  for di in doc_order(&l, d):
     if ignored_internal(l, d, di, st) or ignored_private(l, d, di, st): continue
     for t in d.tfirst[di]..d.tfirst[di] + d.tcount[di]:
       let nm = d.kname[t]
       if user_defined(st, nm) or nm in defined: continue
       let b = blocked(st, nm)
       if b.len > 0:
-        ctn_report(&l, d, t, b)
+        ctn_report(&l, d, t, b, &seq)
         continue
       let p = preferred(st, nm)
       if p.len > 0:
-        ctn_report(&l, d, t, p)
+        ctn_report(&l, d, t, p, &seq)
         continue
       if typed:
         if nm in typed_always():
-          ctn_report(&l, d, t, "`@" + nm + "` is redundant when using a type system.")
+          ctn_report(&l, d, t, "`@" + nm + "` is redundant when using a type system.", &seq)
           continue
         if nm == "template" and tag_comment(l, d, t).len == 0:
-          ctn_report(&l, d, t, "`@" + nm + "` without a name is redundant when using a type system.")
+          ctn_report(&l, d, t, "`@" + nm + "` without a name is redundant when using a type system.", &seq)
           continue
         if not ambient and nm in typed_outside_ambient():
-          ctn_report(&l, d, t, "`@" + nm + "` is redundant outside of ambient(`declare` or `.d.ts`) contexts when using a type system.")
+          ctn_report(&l, d, t, "`@" + nm + "` is redundant outside of ambient(`declare` or `.d.ts`) contexts when using a type system.", &seq)
           continue
       let ok = (jsx_tags and (nm == "jsx" or nm == "jsxFrag" or nm == "jsxImportSource" or nm == "jsxRuntime")) or nm in valid
-      if not ok: ctn_report(&l, d, t, "`@" + nm + "` is invalid tag name.")
+      if not ok: ctn_report(&l, d, t, "`@" + nm + "` is invalid tag name.", &seq)
+
+# ---- a tag's parts (JSDocTag::type_comment, type_name_comment, as oxc_jsdoc splits them)
+
+# find_type_range over src[s..e]: the {type}'s span ([-1, -1] when there's none)
+fn type_range(src: Str, s: Int, e: Int) -> [Int]:
+  var i = s
+  while i < e and is_ws(src[i]): i += 1
+  if i >= e or src[i] != '{': return [-1, -1]
+  var depth = 0
+  for j in i..e:
+    if src[j] == '{': depth += 1
+    elif src[j] == '}':
+      depth -= 1
+      if depth == 0: return [i, j + 1]
+  return [-1, -1]
+
+# find_token_range: the first run of characters that aren't white space or {
+fn token_range(src: Str, s: Int, e: Int) -> [Int]:
+  var a = s
+  while a < e and (is_ws(src[a]) or src[a] == '{'): a += 1
+  if a >= e: return [-1, -1]
+  var b = a
+  while b < e and not is_ws(src[b]) and src[b] != '{': b += 1
+  return [a, b]
+
+# find_type_name_range: a name, or [name = default] with its brackets balanced
+fn name_range(src: Str, s: Int, e: Int) -> [Int]:
+  var i = s
+  while i < e and is_ws(src[i]): i += 1
+  if i >= e or src[i] != '[': return token_range(src, s, e)
+  var bracket = 0
+  var start = -1
+  for x in s..e:
+    let c = src[x]
+    if is_ws(c):
+      if bracket != 0: continue
+      if start >= 0: return [start, x]
+    else:
+      if c == '[': bracket += 1
+      if c == ']': bracket -= 1
+      if start < 0: start = x
+  if start >= 0 and bracket == 0: return [start, e]
+  return [-1, -1]
+
+# type_name_comment of tag t: type start, end (-1 none), name start, end (-1 none), comment start
+fn tnc(l: L, d: Docs, t: Int) -> [Int]:
+  let ty = type_range(l.src, d.bs[t], d.be[t])
+  var rest = d.bs[t]
+  if ty[0] >= 0: rest = ty[1]
+  let nm = name_range(l.src, rest, d.be[t])
+  var cs = rest
+  if nm[0] >= 0: cs = nm[1]
+  return [ty[0], ty[1], nm[0], nm[1], cs]
+
+# JSDocTagTypeNamePart: optional ([x]), default ([x = 1]), parsed (x)
+fn name_optional(raw: Str) -> Bool:
+  return raw.startswith("[") and raw.endswith("]")
+
+fn name_parsed(raw: Str) -> Str:
+  if not name_optional(raw): return raw + ""
+  var a = 0
+  var b = raw.len
+  while a < b and raw[a] == '[': a += 1
+  while b > a and raw[b - 1] == ']': b -= 1
+  let inner = trim(raw[a..b])
+  let q = inner.find("=")
+  if q >= 0: return trim(inner[0..q])
+  return inner
+
+fn tags_of(d: Docs, di: Int) -> [Int]:
+  var out: [Int] = []
+  for t in d.tfirst[di]..d.tfirst[di] + d.tcount[di]: out.push(t)
+  return out
+
+fn kept(l: L, d: Docs, di: Int, st: JSet) -> Bool:
+  return not ignored_internal(l, d, di, st) and not ignored_private(l, d, di, st)
+
+# ---- jsdoc(check-property-names)
+
+# ---- iteration orders of oxc's FxHashMap and FxHashSet (rustc-hash 2 over std's hashbrown, groups
+# of 8 control bytes as on aarch64; nothing deleted before the iteration)
+
+fn hash_u64(x: Int) -> Int:
+  return rhooks.rotl(rhooks.add_to(0, x), 26)
+
+fn hash_str(x: Str) -> Int:
+  return rhooks.rotl(rhooks.write_str(0, x), 26)
+
+# find_insert_slot in a table of buckets (-1 empty)
+fn hb_slot(tab: [Int], h: Int) -> Int:
+  let n = tab.len
+  let mask = n - 1
+  var pos = h & mask
+  var stride = 0
+  while true:
+    for bit in 0..8:
+      let j = pos + bit
+      var b = j & mask
+      if n < 8:
+        # (a small table: past its buckets come empty bytes, then a copy of them)
+        if j >= n and j < 8:
+          if tab[b] < 0: return b
+          for z in 0..n:
+            if tab[z] < 0: return z
+          return -1
+        if j >= 8: b = j - 8
+      if tab[b] < 0: return b
+    stride += 8
+    pos = (pos + stride) & mask
+  return -1
+
+# the indices of hs (distinct items' hashes, in the order inserted) in the table's bucket order
+fn hb_order(hs: [Int]) -> [Int]:
+  var tab: [Int] = []
+  var growth = 0
+  for i in 0..hs.len:
+    if growth == 0:
+      var full = 0
+      if tab.len > 0: full = rhooks.cap_of(tab.len)
+      var want = i + 1
+      if want < full + 1: want = full + 1
+      let nb = rhooks.buckets_for(want)
+      var old: [Int] = [-1] * nb
+      swap(&old, &tab)
+      for x in old:
+        if x >= 0: tab[hb_slot(tab, hs[x])] = x
+      growth = rhooks.cap_of(nb) - i
+    tab[hb_slot(tab, hs[i])] = i
+    growth -= 1
+  var out: [Int] = []
+  for x in tab:
+    if x >= 0: out.push(x)
+  return out
+
+# The comments in the order oxc's iter_all gives them: those attached to a node (a key per position,
+# inserted in the order the nodes are visited), then the others (keyed by position too, in the
+# order of the comments).
+fn doc_order(var l: L, d: Docs) -> [Int]:
+  if d.att.len < 2:
+    var one: [Int] = []
+    for di in 0..d.att.len: one.push(di)
+    return one
+  var want: {Int: Bool} = {}
+  for a in d.att: want[a] = true
+  var starts: {Int: Bool} = {}
+  for x in 1..l.t.nd.len:
+    if l.t.nd[x].k == ast.N_LIST: continue
+    let p = start_of(l, x)
+    if want.get(p, false) and not starts.get(p, false) and attachable(&l, x): starts[p] = true
+  var ka: [Int] = []
+  var kn: [Int] = []
+  var seen: {Int: Bool} = {}
+  for a in d.att:
+    if seen.get(a, false): continue
+    seen[a] = true
+    kn.push(a)
+  var att_keys: [Int] = []
+  for a in kn:
+    if starts.get(a, false): att_keys.push(a)
+  att_keys.sort(by: fn(x, y) => x < y)
+  var hs: [Int] = []
+  for a in att_keys: hs.push(hash_u64(a))
+  var out: [Int] = []
+  for i in hb_order(hs):
+    for di in 0..d.att.len:
+      if d.att[di] == att_keys[i]: out.push(di)
+  hs = []
+  for a in kn: hs.push(hash_u64(a))
+  for i in hb_order(hs):
+    if starts.get(kn[i], false): continue
+    for di in 0..d.att.len:
+      if d.att[di] == kn[i]: out.push(di)
+  return out
+
+# A diagnostic of a rule that runs once per file, ordered as reported (in iter_all's order)
+fn report_seq(var l: L, s: Int, e: Int, rule: Str, msg: Str, help: Str, var seq: Int):
+  add(&l, s, rule, msg, help)
+  span(&l, e)
+  order_at(&l, seq)
+  seq += 1
+
+fn check_property_names(var l: L, d: Docs, st: JSet):
+  let rp = resolve_tag(st, "property")
+  var seq = 0
+  for di in doc_order(&l, d):
+    if not kept(l, d, di, st): continue
+    var names: [Str] = []
+    var spans: [[Int]] = []
+    for t in tags_of(d, di):
+      if d.kname[t] != rp: continue
+      let p = tnc(l, d, t)
+      if p[2] < 0: continue
+      let nm = name_parsed(l.src[p[2]..p[3]])
+      var dot = nm.len - 1
+      while dot >= 0 and nm[dot] != '.': dot -= 1
+      if dot >= 0:
+        var par = nm[0..dot]
+        while par.endswith("[]"): par = par[0..par.len - 2]
+        if not (par in names):
+          report_seq(&l, p[2], p[3], "jsdoc(check-property-names)", "No root defined for `@property` path.", "`@property` path declaration `{nm}` appears before any real property.", &seq)
+      var at = -1
+      for j in 0..names.len:
+        if names[j] == nm: at = j
+      if at < 0:
+        names.push(nm)
+        spans.push([p[2], p[3]])
+      else:
+        spans[at].push(p[2])
+        spans[at].push(p[3])
+    var nh: [Int] = []
+    for nm in names: nh.push(hash_str(nm))
+    for j in hb_order(nh):
+      # (the spans: a set)
+      var sh: [Int] = []
+      var ss: [Int] = []
+      var x = 0
+      while x + 1 < spans[j].len:
+        var dup = false
+        var z = 0
+        while z + 1 < ss.len:
+          if ss[z] == spans[j][x] and ss[z + 1] == spans[j][x + 1]: dup = true
+          z += 2
+        if not dup:
+          ss.push(spans[j][x])
+          ss.push(spans[j][x + 1])
+          sh.push(hash_u64(spans[j][x] | (spans[j][x + 1] << 32)))
+        x += 2
+      if sh.len < 2: continue
+      let o = hb_order(sh)
+      add(&l, ss[2 * o[0]], "jsdoc(check-property-names)", "Duplicate @property found.", "@property `{names[j]}` is duplicated on the same block.")
+      label(&l, ss[2 * o[0] + 1], "Duplicated property")
+      order_at(&l, seq)
+      seq += 1
+      for q in 1..o.len: more(&l, ss[2 * o[q]], ss[2 * o[q] + 1], "Duplicated property", true)
+
+# ---- jsdoc(require-property), require-property-description, -name, -type
+
+fn require_property(var l: L, d: Docs, st: JSet):
+  let rp = resolve_tag(st, "property")
+  let rt = resolve_tag(st, "typedef")
+  let rn = resolve_tag(st, "namespace")
+  let msg = "The `@typedef` and `@namespace` tags must include a `@property` tag with the type Object."
+  let help = "Consider adding a `@property` tag or replacing it with a more specific type."
+  var seq = 0
+  for di in doc_order(&l, d):
+    if not kept(l, d, di, st): continue
+    var rs = -1
+    var re = -1
+    for t in tags_of(d, di):
+      let nm = d.kname[t]
+      if nm == rt or nm == rn:
+        if rs >= 0: report_seq(&l, rs, re, "jsdoc(require-property)", msg, help, &seq)
+        let ty = type_range(l.src, d.bs[t], d.be[t])
+        if ty[0] >= 0:
+          let tx = trim(l.src[ty[0] + 1..ty[1] - 1])
+          if tx == "Object" or tx == "object" or tx == "PlainObject":
+            rs = d.ks[t]
+            re = ty[1]
+      if nm == rp: rs = -1
+    if rs >= 0: report_seq(&l, rs, re, "jsdoc(require-property)", msg, help, &seq)
+
+# which: 0 description, 1 name, 2 type
+fn require_property_part(var l: L, d: Docs, st: JSet, which: Int):
+  let rp = resolve_tag(st, "property")
+  var seq = 0
+  for di in doc_order(&l, d):
+    if not kept(l, d, di, st): continue
+    for t in tags_of(d, di):
+      if d.kname[t] != rp: continue
+      let p = tnc(l, d, t)
+      if which == 0:
+        if parsed(l.src[p[4]..d.be[t]]).len > 0: continue
+        report_seq(&l, d.ks[t], d.ke[t], "jsdoc(require-property-description)", "Missing description in `@property` tag.", "Add a description to this `@property` tag.", &seq)
+      elif which == 1:
+        if p[2] >= 0: continue
+        report_seq(&l, d.ks[t], d.ke[t], "jsdoc(require-property-name)", "Missing name in `@property` tag.", "Add a type name to this `@property` tag.", &seq)
+      else:
+        if p[0] >= 0: continue
+        report_seq(&l, d.ks[t], d.ke[t], "jsdoc(require-property-type)", "Missing type in `@property` tag.", "Add a {{type}} to this `@property` tag.", &seq)
+
+# ---- the JSDoc of a function (oxc's get_function_nearest_jsdoc_node, on oxc's JSDoc attachment:
+# the comments attached to a position belong to the outermost node of the kinds below that starts
+# there)
+
+fn fn_like(kd: Int) -> Bool:
+  return kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW or kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR
+
+fn start_of(l: L, x: Int) -> Int:
+  if l.t.nd[x].k == ast.N_VAR:
+    let p = l.t.mod_start.get(x, -1)
+    if p >= 0: return p
+  return l.t.nd[x].pos
+
+fn str_stmt(l: L, x: Int) -> Bool:
+  if l.t.nd[x].k != ast.N_EXPRSTMT: return false
+  let e = l.t.nd[x].a
+  if e <= 0 or l.t.nd[e].k != ast.N_STR: return false
+  let c = l.src[l.t.nd[e].pos]
+  return c == '"' or c == '\''
+
+# a directive ("use strict"): a string statement in the prologue of the file or a function body
+fn directive(var l: L, x: Int) -> Bool:
+  if not str_stmt(l, x): return false
+  let par = parent(&l, x)
+  var lst = -1
+  if par == 0: lst = l.t.nd.len - 1
+  elif k(l, par) == ast.N_BLOCK:
+    let pp = parent(&l, par)
+    if fn_like(k(l, pp)): lst = l.t.nd[par].a
+  if lst <= 0 or l.t.nd[lst].k != ast.N_LIST: return false
+  for y in ast.items(l.t, lst):
+    if y == x: return true
+    if not str_stmt(l, y): return false
+  return false
+
+# should_attach_jsdoc's kinds, as vlint's nodes
+fn attachable(var l: L, x: Int) -> Bool:
+  let kd = l.t.nd[x].k
+  if kd == ast.N_EXPRSTMT: return not directive(&l, x)
+  if kd == ast.N_BLOCK:
+    let par = parent(&l, x)
+    return not fn_like(k(l, par))
+  if kd == ast.N_FUNC and l.t.nd[x].d <= 0: return (l.t.nd[x].f & ast.M_EXPORT) != 0
+  if kd >= ast.N_VAR and kd <= ast.N_EMPTY: return true
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_PROP:
+    let par = parent(&l, x)
+    let pk = k(l, par)
+    return pk == ast.N_CLASS or pk == ast.N_CLASSEXPR or pk == ast.N_OBJECT
+  if kd == ast.N_DEBUGGER or kd == ast.N_WITH or kd == ast.N_CLASS or kd == ast.N_CLASSEXPR: return true
+  if kd == ast.N_IMPORT or kd == ast.N_EXPORT or kd == ast.N_EXPORTDEFAULT: return true
+  if kd == ast.N_ARROW or kd == ast.N_OBJECT or kd == ast.N_PAREN or kd == ast.N_FUNCEXPR: return true
+  if kd == ast.N_PROPASSIGN or kd == ast.N_SHORTHAND: return true
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR or kd == ast.N_PROP or kd == ast.N_STATICBLOCK: return true
+  if kd == ast.N_INTERFACE or kd == ast.N_TYPEALIAS: return (l.t.nd[x].d & ast.M_EXPORT) != 0
+  if kd == ast.N_ENUM or kd == ast.N_MODULE: return (l.t.nd[x].f & ast.M_EXPORT) != 0
+  return false
+
+fn has_att(d: Docs, p: Int) -> Bool:
+  for a in d.att:
+    if a == p: return true
+  return false
+
+# whether node x has the JSDoc comments attached at its start
+fn owns(var l: L, d: Docs, x: Int) -> Bool:
+  if x <= 0: return false
+  let p = start_of(l, x)
+  if not has_att(d, p) or not attachable(&l, x): return false
+  var y = parent(&l, x)
+  while y > 0 and start_of(l, y) == p:
+    if attachable(&l, y): return false
+    y = parent(&l, y)
+  return true
+
+# the node whose JSDoc is function f's (-1 none)
+fn nearest_doc(var l: L, d: Docs, f: Int) -> Int:
+  let fk = k(l, f)
+  if fk == ast.N_METHOD or fk == ast.N_GET or fk == ast.N_SET or fk == ast.N_CTOR:
+    if owns(&l, d, f): return f
+    return -1
+  var cur = f
+  while cur > 0:
+    let kd = k(l, cur)
+    if cur != f and fn_like(kd): return -1
+    if owns(&l, d, cur): return cur
+    if kd == ast.N_OBJECT: return -1
+    if kd == ast.N_VAR or kd == ast.N_PROP or kd == ast.N_CALL or kd == ast.N_NEW or kd == ast.N_RETURN:
+      let p = parent(&l, cur)
+      if p > 0 and k(l, p) == ast.N_EXPORTDEFAULT and owns(&l, d, p): return p
+      return -1
+    cur = parent(&l, cur)
+  return -1
+
+# the comments attached to node x
+fn docs_at(l: L, d: Docs, x: Int) -> [Int]:
+  let p = start_of(l, x)
+  var out: [Int] = []
+  for di in 0..d.att.len:
+    if d.att[di] == p: out.push(di)
+  return out
+
+# a function oxc's jsdoc rules visit (a Function that's a declaration or an expression, with a
+# method's value, or an arrow), and its body
+fn fn_body(l: L, f: Int) -> Int:
+  let kd = k(l, f)
+  if kd == ast.N_FUNC or kd == ast.N_FUNCEXPR or kd == ast.N_ARROW: return l.t.nd[f].d
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR: return l.t.nd[f].c
+  return -1
+
+# oxc's Function span: a method's from its parameters, a declaration's without export/default
+fn fn_span_start(l: L, f: Int) -> Int:
+  let kd = k(l, f)
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET or kd == ast.N_CTOR:
+    let sig = l.t.nd[f].b
+    if sig > 0: return l.t.nd[sig].pos
+    return l.t.nd[f].pos
+  let p = l.t.nd[f].pos
+  if kd == ast.N_FUNC and (l.t.nd[f].f & (ast.M_EXPORT | ast.M_DEFAULT | ast.M_DECLARE)) != 0:
+    var w = "function"
+    if (l.t.nd[f].f & ast.M_ASYNC) != 0: w = "async"
+    var i = l.src.find(w, p)
+    while i >= 0 and i < l.t.nd[f].end:
+      if (i == 0 or not word_ch(l.src[i - 1])) and word_at(l.src, i, w): return i
+      i = l.src.find(w, i + 1)
+  return p
+
+fn in_class(var l: L, f: Int) -> Bool:
+  var cur = f
+  while true:
+    let p = parent(&l, cur)
+    let pk = k(l, p)
+    if pk == ast.N_PROP: return true
+    if pk != ast.N_PAREN: return false
+    cur = p
+  return false
+
+# ---- jsdoc(implements-on-classes)
+
+fn implements_on_classes(var l: L, d: Docs, st: JSet, f: Int):
+  let kd = k(l, f)
+  if kd == ast.N_METHOD or kd == ast.N_GET or kd == ast.N_SET:
+    let par = parent(&l, f)
+    if k(l, par) != ast.N_OBJECT: return
+  elif kd == ast.N_CTOR: return
+  elif kd == ast.N_FUNCEXPR or kd == ast.N_ARROW:
+    if in_class(&l, f): return
+  elif kd != ast.N_FUNC: return
+  if fn_body(l, f) <= 0: return
+  let owner = nearest_doc(&l, d, f)
+  if owner < 0: return
+  let ri = resolve_tag(st, "implements")
+  let rc = resolve_tag(st, "class")
+  let rk = resolve_tag(st, "constructor")
+  var found = -1
+  var cls = false
+  for di in docs_at(l, d, owner):
+    if not kept(l, d, di, st): continue
+    for t in tags_of(d, di):
+      let nm = d.kname[t]
+      if nm == ri: found = t
+      if nm == rc or nm == rk: cls = true
+  if found >= 0 and not cls:
+    add(&l, d.ks[found], "jsdoc(implements-on-classes)", "`@implements` used on a non-constructor function", "Add `@class` tag or use class syntax.")
+    span(&l, d.ke[found])
+    rules.on(&l, f)
+
+# ---- jsdoc(no-defaults)
+
+fn no_defaults(var l: L, d: Docs, st: JSet, f: Int, no_optional: Bool):
+  if not fn_like(k(l, f)) or fn_body(l, f) <= 0: return
+  let owner = nearest_doc(&l, d, f)
+  if owner < 0: return
+  let rp = resolve_tag(st, "param")
+  for di in docs_at(l, d, owner):
+    if not kept(l, d, di, st): continue
+    for t in tags_of(d, di):
+      let nm = d.kname[t]
+      if nm != rp: continue
+      let p = tnc(l, d, t)
+      if p[2] < 0: continue
+      let raw = l.src[p[2]..p[3]]
+      if not name_optional(raw): continue
+      var help = ""
+      if no_optional: help = "Optional param names are not permitted on `@{nm}` tag."
+      elif raw.find("=") >= 0: help = "Defaults are not permitted on `@{nm}` tag."
+      else: continue
+      add(&l, p[2], "jsdoc(no-defaults)", "Defaults are not permitted.", help)
+      span(&l, p[3])
+      rules.on(&l, f)
+
+# ---- jsdoc(require-yields)
+
+fn is_generator(l: L, f: Int) -> Bool:
+  let kd = k(l, f)
+  if kd == ast.N_ARROW or not fn_like(kd): return false
+  return (l.t.nd[f].f & ast.M_GENERATOR) != 0 and fn_body(l, f) > 0
+
+fn custom_skip(d: Docs, di: Int) -> Bool:
+  for t in tags_of(d, di):
+    let nm = d.kname[t]
+    if nm == "abstract" or nm == "class" or nm == "constructor" or nm == "interface" or nm == "type" or nm == "virtual": return true
+  return false
+
+fn avoided(d: Docs, di: Int, st: JSet, exempt: [Str]) -> Bool:
+  var names: [Str] = []
+  for x in exempt: names.push(x + "")
+  if st.ignore_replaces: names.push(resolve_tag(st, "ignore"))
+  if st.override_replaces: names.push(resolve_tag(st, "override"))
+  if st.augments_replaces:
+    names.push(resolve_tag(st, "augments"))
+    names.push(resolve_tag(st, "extends"))
+  if st.implements_replaces: names.push(resolve_tag(st, "implements"))
+  for t in tags_of(d, di):
+    if d.kname[t] in names: return true
+  return false
+
+# the generator's JSDoc comments, or [] when it has none or they're all skipped
+fn yields_docs(var l: L, d: Docs, st: JSet, f: Int, exempt: [Str]) -> [Int]:
+  let owner = nearest_doc(&l, d, f)
+  if owner < 0: return []
+  let ds = docs_at(l, d, owner)
+  var any = false
+  for di in ds:
+    if not custom_skip(d, di) and not avoided(d, di, st, exempt) and kept(l, d, di, st): any = true
+  if any: return ds
+  return []
+
+fn yields_missing(var l: L, f: Int):
+  add(&l, fn_span_start(l, f), "jsdoc(require-yields)", "Missing JSDoc `@yields` declaration for generator function.", "Add `@yields` tag to the JSDoc comment.")
+  span(&l, l.t.nd[f].end)
+
+# opts: forceRequireYields, withGeneratorTag
+fn require_yields(var l: L, d: Docs, st: JSet, n: Int, exempt: [Str], force: Bool, with_gen: Bool):
+  let kd = k(l, n)
+  let ry = resolve_tag(st, "yields")
+  if kd == ast.N_YIELD:
+    if force or l.t.nd[n].a <= 0: return
+    var f = parent(&l, n)
+    while f > 0 and not is_generator(l, f): f = parent(&l, f)
+    if f <= 0: return
+    let ds = yields_docs(&l, d, st, f, exempt)
+    if ds.len == 0: return
+    for di in ds:
+      for t in tags_of(d, di):
+        if d.kname[t] == ry: return
+    yields_missing(&l, f)
+    rules.on(&l, n)
+    return
+  if not is_generator(l, n): return
+  let ds = yields_docs(&l, d, st, n, exempt)
+  if ds.len == 0: return
+  var ys: [Int] = []
+  var gen = -1
+  let rg = resolve_tag(st, "generator")
+  for di in ds:
+    for t in tags_of(d, di):
+      if d.kname[t] == ry: ys.push(t)
+      if d.kname[t] == rg: gen = t
+  if force and ys.len == 0:
+    yields_missing(&l, n)
+    rules.on(&l, n)
+    return
+  if ys.len > 1:
+    add(&l, d.ks[ys[1]], "jsdoc(require-yields)", "Duplicate `@yields` tags.", "Remove redundant `@yields` tag.")
+    span(&l, d.ke[ys[1]])
+    rules.on(&l, n)
+    return
+  if with_gen and gen >= 0 and ys.len == 0:
+    add(&l, d.ks[gen], "jsdoc(require-yields)", "`@yields` tag is required when using `@generator` tag.", "Add `@yields` tag to the JSDoc comment.")
+    span(&l, d.ke[gen])
+    rules.on(&l, n)

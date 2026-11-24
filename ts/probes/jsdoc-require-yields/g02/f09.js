@@ -1,0 +1,10 @@
+
+                        class quux {
+                          /**
+                           *
+                           */
+                          * quux () {
+                            yield;
+                          }
+                        }
+                        

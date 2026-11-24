@@ -1,0 +1,7 @@
+
+                            /**
+                             * @function
+                             * @generator
+                             */
+                        function*d() {}
+                        

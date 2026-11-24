@@ -1,0 +1,8 @@
+
+			      /**
+			       * @implements {SomeClass}
+			       */
+			      function quux () {
+
+			      }
+			      
