@@ -3108,3 +3108,20 @@ the other 174), and the other rules give the same output except 9 diagnostics of
 about 32 s on the way (plans read each tsconfig once, a tsconfig cache, dense React Compiler state,
 lib types shared by the workers; `ts/NOTES.md` has the list and the profile). 813 vtsc cases and
 108 probes, each made from a difference found on that repository and reduced, are checked in.
+
+**vgolint: lll, depguard, revive and SA1000 (2026-11-23).** A 2,981-package Go monorepo's config enables
+depguard, lll and revive, and staticcheck with all checks, none of which vgolint had (it named them
+on stderr as skipped and reported nothing for them), and vgolint ignored staticcheck's
+dot-import-whitelist. Ported from what golangci-lint 2.14.0 pins: lll; depguard v2.2.1 (rule lists,
+gobwas/glob file patterns, $gostd, the three list modes); revive v1.17.0's 23 default rules with
+their arguments, its directives and confidence cutoff, and golangci-lint's line ranges for its
+issues (source lines printed, LineRange in JSON); staticcheck's SA1000 (a port of Go 1.27.3's
+regexp/syntax checks, the same as regexp.Compile on 23,105 patterns), ST1020, ST1021, ST1022 and
+dot-import-whitelist. Folders holding only `package x_test` files were never linted, for any linter;
+they are. On its lib/ folder, its own config gives `0 issues.` as golangci-lint does;
+a strict variant gives byte-identical output (5,445 issues over five linters); revive's defaults on
+lib/ and two large services give byte-identical output (6,886 issues), and hand-written cases for
+the rest (11 configs, 1,284 issues) match in text and JSON. revive's rules were ported in three
+parallel groups; each group's first comparisons shared golangci-lint's cache, which doesn't notice a
+change of revive's settings, so every comparison was rerun with an empty cache. What's still
+missing for that config: the gofmt and goimports formatters (not ported: they need go/printer).

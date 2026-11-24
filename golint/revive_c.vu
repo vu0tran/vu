@@ -1,0 +1,545 @@
+# revive rules, group c (mgechev/revive v1.17.0's rule/*.go): "var-declaration", "errorf", "error-strings", "error-return", "unexported-return", "context-keys-type", "context-as-argument"
+# Each rule adds its failures for file x.fi of package x.pi (revive.add); x.args[rule] is the rule's
+# `arguments` node in the config (-1: none, the rule's defaults).
+#
+# revive type-checks a package itself (lint.Package.TypeCheck) with importer.Default(), which finds
+# only the standard library's export data: every other import fails, and whatever comes from one is
+# an invalid type. The rules that use types (var-declaration, errorf, unexported-return,
+# context-keys-type) treat such an expression as revive does (tainted below). The package is checked
+# under its name, not its path, so its types print as NAME.T.
+
+import ast
+import pkg
+import tc
+import cfg
+import doc
+import vet
+import format
+import scan
+import revive_core
+
+# The rules this file has (names() lists only the ones ported so far)
+fn names() -> [Str]:
+  return ["var-declaration", "errorf", "error-strings", "error-return", "unexported-return", "context-keys-type", "context-as-argument"]
+
+fn apply(var g: tc.Prog, fs: Fs, var x: revive_core.Ctx, p: pkg.Pkg, name: Str, c: cfg.Cfg):
+  if name == "var-declaration": var_declaration(&g, fs, &x, p)
+  elif name == "errorf": errorf(&g, fs, &x, p)
+  elif name == "error-strings": error_strings(&g, &x, p, c)
+  elif name == "error-return": error_return(&g, &x, p)
+  elif name == "unexported-return": unexported_return(&g, fs, &x, p)
+  elif name == "context-keys-type": context_keys_type(&g, fs, &x, p)
+  elif name == "context-as-argument": context_as_argument(&g, &x, p, c)
+
+# ---- helpers
+
+fn kd(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0: return 0
+  return g.pk[pi].t.k[n]
+
+fn nmof(g: tc.Prog, pi: Int, n: Int) -> Str:
+  return g.pk[pi].t.names[g.pk[pi].t.s[n]] + ""
+
+fn is_ident(g: tc.Prog, pi: Int, n: Int, name: Str) -> Bool:
+  return kd(g, pi, n) == ast.N_IDENT and nmof(g, pi, n) == name
+
+# astutils.IsPkgDotName: n is the selector PKG.NAME (by the identifiers' text only)
+fn is_pkg_dot(g: tc.Prog, pi: Int, n: Int, pk: Str, name: Str) -> Bool:
+  if kd(g, pi, n) != ast.N_SELECTOR: return false
+  return is_ident(g, pi, g.pk[pi].t.a[n], pk) and is_ident(g, pi, g.pk[pi].t.b[n], name)
+
+fn render(g: tc.Prog, pi: Int, n: Int) -> Str:
+  return format.expr(g.pk[pi].t, n)
+
+fn root_of(g: tc.Prog, pi: Int, fi: Int) -> Int:
+  return g.pk[pi].roots[fi]
+
+fn top_decls(g: tc.Prog, pi: Int, fi: Int) -> [Int]:
+  return ast.items(g.pk[pi].t, g.pk[pi].t.c[root_of(g, pi, fi)])
+
+# Every node of file fi, in pre-order
+fn file_nodes(g: tc.Prog, pi: Int, fi: Int) -> [Int]:
+  var out: [Int] = []
+  var stack = [root_of(g, pi, fi)]
+  while stack.len > 0:
+    let n = stack.pop()
+    out.push(n)
+    vet.push_kids(g.pk[pi].t, n, &stack)
+  return out
+
+fn rfail(var x: revive_core.Ctx, g: tc.Prog, rule: Str, msg: Str, conf: Float, n: Int):
+  revive_core.add(&x, rule, msg, conf, g.pk[x.pi].t.pos[n], g.pk[x.pi].t.end[n])
+
+fn is_exported_name(s: Str) -> Bool:
+  if s.len == 0: return false
+  let c = s[0]
+  if c >= 'A' and c <= 'Z': return true
+  if int(c) < 128: return false
+  let cs = s.codes()
+  return cs.len > 0 and chr(cs[0]).is_upper()
+
+# Whether package q is one revive's type check couldn't import (not the standard library, not the
+# package itself)
+fn bad_pkg(g: tc.Prog, pi: Int, q: Int) -> Bool:
+  if q < 0 or q == pi: return false
+  if q >= g.pk.len: return false
+  return not g.pk[q].std and g.pk[q].path != "unsafe"
+
+# Whether type t involves a type from a package revive couldn't import
+fn bad_type(var g: tc.Prog, fs: Fs, pi: Int, t: Int, depth: Int) -> Bool:
+  if t <= 0 or depth > 8: return false
+  let k = g.tk[t]
+  if k == tc.TY_NAMED:
+    let o = g.ta[t]
+    if bad_pkg(g, pi, g.opkg[o]): return true
+    for a in tc.tlist(g, t):
+      if bad_type(&g, fs, pi, a, depth + 1): return true
+    return false
+  if k == tc.TY_PTR or k == tc.TY_SLICE or k == tc.TY_ARRAY or k == tc.TY_CHAN: return bad_type(&g, fs, pi, g.ta[t], depth + 1)
+  if k == tc.TY_MAP: return bad_type(&g, fs, pi, g.ta[t], depth + 1) or bad_type(&g, fs, pi, g.tb[t], depth + 1)
+  if k == tc.TY_TUPLE:
+    for a in tc.tlist(g, t):
+      if bad_type(&g, fs, pi, a, depth + 1): return true
+    return false
+  if k == tc.TY_FUNC: return bad_type(&g, fs, pi, g.ta[t], depth + 1) or bad_type(&g, fs, pi, g.tb[t], depth + 1)
+  if k == tc.TY_STRUCT:
+    for f in tc.tlist(g, t):
+      let ft = tc.obj_type(&g, fs, f)
+      if bad_type(&g, fs, pi, ft, depth + 1): return true
+    return false
+  return false
+
+# Whether revive would see expression n as invalid: it refers to an import revive couldn't load, or
+# to something whose type comes from one
+fn tainted(var g: tc.Prog, fs: Fs, pi: Int, n: Int) -> Bool:
+  var stack = [n]
+  while stack.len > 0:
+    let m = stack.pop()
+    if m <= 0: continue
+    let k = g.pk[pi].t.k[m]
+    if k == ast.N_FUNCLIT: continue
+    if k == ast.N_IDENT and m < g.pk[pi].use.len:
+      let o = g.pk[pi].use[m]
+      if o >= 0:
+        if g.ok[o] == tc.O_PKGNAME:
+          if bad_pkg(g, pi, g.oaux[o]): return true
+        elif bad_pkg(g, pi, g.opkg[o]): return true
+    if k != ast.N_LIST and bad_type(&g, fs, pi, vet.ty(g, pi, m), 0): return true
+    vet.push_kids(g.pk[pi].t, m, &stack)
+  return false
+
+# A type as go/types prints it in revive's check (the package itself under its name)
+fn rv_str(var g: tc.Prog, fs: Fs, pi: Int, t: Int) -> Str:
+  if t <= 0: return "invalid type"
+  let k = g.tk[t]
+  if k == tc.TY_NAMED:
+    let o = g.ta[t]
+    let q = g.opkg[o]
+    if bad_pkg(g, pi, q): return "invalid type"
+    var s = g.oname[o] + ""
+    if q >= 0:
+      if q == pi: s = g.pk[q].name + "." + s
+      else: s = g.pk[q].path + "." + s
+    let args = tc.tlist(g, t)
+    if args.len > 0:
+      s += "["
+      for i in 0..args.len:
+        if i > 0: s += ", "
+        s += rv_str(&g, fs, pi, args[i])
+      s += "]"
+    return s
+  if k == tc.TY_PTR: return "*" + rv_str(&g, fs, pi, g.ta[t])
+  if k == tc.TY_SLICE: return "[]" + rv_str(&g, fs, pi, g.ta[t])
+  if k == tc.TY_ARRAY:
+    var n = "{g.tb[t]}"
+    if g.tb[t] < 0: n = "?"
+    return "[" + n + "]" + rv_str(&g, fs, pi, g.ta[t])
+  if k == tc.TY_MAP: return "map[" + rv_str(&g, fs, pi, g.ta[t]) + "]" + rv_str(&g, fs, pi, g.tb[t])
+  if k == tc.TY_CHAN:
+    let e = rv_str(&g, fs, pi, g.ta[t])
+    if g.tb[t] == 1: return "chan<- " + e
+    if g.tb[t] == 2: return "<-chan " + e
+    return "chan " + e
+  let path = g.pk[pi].path + ""
+  return tc.type_str(&g, fs, t, path)
+
+# ---- var-declaration
+
+fn zero_literal(s: Str) -> Bool:
+  return s == "false" or s == "'\\x00'" or s == "'\\000'" or s == "\"\"" or s == "``" or s == "0" or s == "0." or s == "0.0" or s == "0i"
+
+fn var_declaration(var g: tc.Prog, fs: Fs, var x: revive_core.Ctx, p: pkg.Pkg):
+  let pi = x.pi
+  let fi = x.fi
+  var stack = [root_of(g, pi, fi)]
+  while stack.len > 0:
+    let n = stack.pop()
+    let k = kd(g, pi, n)
+    if k == ast.N_GENDECL:
+      let tok = g.pk[pi].t.f[n]
+      if tok == scan.K_CONST: continue
+      if tok != scan.K_VAR: continue
+      for sp in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]): var_spec(&g, fs, &x, sp)
+      continue
+    vet.push_kids(g.pk[pi].t, n, &stack)
+
+fn var_spec(var g: tc.Prog, fs: Fs, var x: revive_core.Ctx, sp: Int):
+  let pi = x.pi
+  if kd(g, pi, sp) != ast.N_VALUESPEC: return
+  let names = ast.items(g.pk[pi].t, g.pk[pi].t.a[sp])
+  let te = g.pk[pi].t.b[sp]
+  let vl = g.pk[pi].t.c[sp]
+  if names.len > 1 or te <= 0 or ast.count(g.pk[pi].t, vl) == 0: return
+  let rhs = ast.item(g.pk[pi].t, vl, 0)
+  let name = nmof(g, pi, names[0])
+  if name == "_": return
+  var zero = false
+  let rk = kd(g, pi, rhs)
+  if rk == ast.N_BASICLIT:
+    let lit = nmof(g, pi, rhs)
+    let tk = kd(g, pi, te)
+    if tk == ast.N_IDENT and nmof(g, pi, te) == "any": zero = false
+    elif tk == ast.N_IFACETYPE: zero = false
+    else: zero = zero_literal(lit)
+  elif is_ident(g, pi, rhs, "nil"): zero = true
+  if zero:
+    rfail(&x, g, "var-declaration", "should drop = " + render(g, pi, rhs) + " from declaration of var " + name + "; it is the zero value", 0.9, rhs)
+    return
+  if tainted(&g, fs, pi, te) or tainted(&g, fs, pi, rhs): return
+  let lt = vet.ty(g, pi, te)
+  var rt = vet.ty(g, pi, rhs)
+  if lt <= 0 or rt <= 0: return
+  let untyped = tc.is_untyped(rt)
+  if untyped:
+    # (go/types records an untyped operand's type as the type it was converted to)
+    if rt == tc.B_UNIL: return
+    let u = tc.under(&g, fs, lt)
+    if u > 0 and g.tk[u] == tc.TY_IFACE: rt = tc.default_type(rt)
+    else: rt = lt
+  if rt != lt and tc.type_str(&g, fs, rt, "") != tc.type_str(&g, fs, lt, ""): return
+  if kd(g, pi, te) == ast.N_IFACETYPE: return
+  if untyped:
+    # (IsUntypedConst: the right side alone is untyped, its default type named as the declared type)
+    let dt = default_name(vet.ty(g, pi, rhs))
+    if dt != "" and not is_ident(g, pi, te, dt): return
+  rfail(&x, g, "var-declaration", "should omit type " + render(g, pi, te) + " from declaration of var " + name + "; it will be inferred from the right-hand side", 0.8, te)
+
+fn default_name(t: Int) -> Str:
+  if t == tc.B_UBOOL: return "bool"
+  if t == tc.B_UINT_: return "int"
+  if t == tc.B_URUNE: return "rune"
+  if t == tc.B_UFLOAT: return "float64"
+  if t == tc.B_UCOMPLEX: return "complex128"
+  if t == tc.B_USTRING: return "string"
+  return ""
+
+# ---- errorf
+
+fn errorf(var g: tc.Prog, fs: Fs, var x: revive_core.Ctx, p: pkg.Pkg):
+  let pi = x.pi
+  for n in file_nodes(g, pi, x.fi):
+    if kd(g, pi, n) != ast.N_CALL: continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len != 1: continue
+    let fun = g.pk[pi].t.a[n]
+    let is_new = is_pkg_dot(g, pi, fun, "errors", "New")
+    var is_t = false
+    let se = kd(g, pi, fun) == ast.N_SELECTOR
+    if se and nmof(g, pi, g.pk[pi].t.b[fun]) == "Error":
+      let sx = g.pk[pi].t.a[fun]
+      let t = vet.ty(g, pi, sx)
+      if t > 0 and not tainted(&g, fs, pi, sx): is_t = rv_str(&g, fs, pi, t) == "*testing.T"
+    if not is_new and not is_t: continue
+    let a = args[0]
+    if kd(g, pi, a) != ast.N_CALL or not is_pkg_dot(g, pi, g.pk[pi].t.a[a], "fmt", "Sprintf"): continue
+    var prefix = "fmt"
+    if is_t: prefix = render(g, pi, g.pk[pi].t.a[fun])
+    rfail(&x, g, "errorf", "should replace " + render(g, pi, fun) + "(fmt.Sprintf(...)) with " + prefix + ".Errorf(...)", 1.0, n)
+
+# ---- error-strings
+
+fn error_funcs(c: cfg.Cfg, arg: Int) -> {Str: Bool}:
+  var out: {Str: Bool} = {}
+  out["fmt.Errorf"] = true
+  for f in ["Errorf", "WithMessage", "Wrap", "New", "WithMessagef", "Wrapf"]: out["errors." + f] = true
+  if arg < 0: return out
+  let d = c.d
+  if d.kind[arg] != doc.K_SEQ: return out
+  for e in d.kids[arg]:
+    if d.kind[e] != doc.K_SCALAR: continue
+    let s = d.text[e].strip()
+    let dot = s.find(".")
+    if dot <= 0 or dot == s.len - 1: continue
+    out[s + ""] = true
+  return out
+
+fn is_space_rune(r: Int) -> Bool:
+  if r == 32 or (r >= 9 and r <= 13) or r == 133 or r == 160: return true
+  if r < 256: return false
+  return r == 5760 or (r >= 8192 and r <= 8202) or r == 8232 or r == 8233 or r == 8239 or r == 8287 or r == 12288
+
+fn is_upper_rune(r: Int) -> Bool:
+  if r >= 65 and r <= 90: return true
+  if r < 128: return false
+  return chr(r).is_upper()
+
+fn is_digit_rune(r: Int) -> Bool:
+  if r >= 48 and r <= 57: return true
+  if r < 128: return false
+  return chr(r).is_decimal()
+
+fn string_lit(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  return kd(g, pi, n) == ast.N_BASICLIT and g.pk[pi].t.f[n] == scan.T_STRING
+
+fn error_strings(var g: tc.Prog, var x: revive_core.Ctx, p: pkg.Pkg, c: cfg.Cfg):
+  let pi = x.pi
+  let funcs = error_funcs(c, x.args.get("error-strings", -1))
+  for n in file_nodes(g, pi, x.fi):
+    if kd(g, pi, n) != ast.N_CALL: continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len < 1: continue
+    let fun = g.pk[pi].t.a[n]
+    if kd(g, pi, fun) != ast.N_SELECTOR: continue
+    let sx = g.pk[pi].t.a[fun]
+    if kd(g, pi, sx) != ast.N_IDENT: continue
+    let key = nmof(g, pi, sx) + "." + nmof(g, pi, g.pk[pi].t.b[fun])
+    if not (key in funcs): continue
+    var lit = -1
+    if string_lit(g, pi, args[0]): lit = args[0]
+    elif args.len >= 2 and string_lit(g, pi, args[1]): lit = args[1]
+    if lit < 0: continue
+    let s = tc.unquote(nmof(g, pi, lit))
+    if s == "": continue
+    let conf = error_string_conf(s)
+    if conf > 0.0: rfail(&x, g, "error-strings", "error strings should not be capitalized or end with punctuation or a newline", conf, lit)
+
+# lintErrorString: 0 when clean, else the confidence
+fn error_string_conf(s: Str) -> Float:
+  let cs = s.codes()
+  if cs.len == 0: return 0.0
+  let last = cs[cs.len - 1]
+  if last == 46 or last == 58 or last == 33 or last == 10: return 0.8
+  if not is_upper_rune(cs[0]): return 0.0
+  for i in 1..cs.len:
+    let r = cs[i]
+    if is_space_rune(r): break
+    if is_upper_rune(r) or is_digit_rune(r): return 0.0
+  return 0.8 - 0.2
+
+# ---- error-return
+
+fn error_return(var g: tc.Prog, var x: revive_core.Ctx, p: pkg.Pkg):
+  let pi = x.pi
+  for d in top_decls(g, pi, x.fi):
+    if kd(g, pi, d) != ast.N_FUNCDECL: continue
+    let ft = g.pk[pi].t.c[d]
+    let rl = g.pk[pi].t.c[ft]
+    let res = ast.items(g.pk[pi].t, rl)
+    if res.len <= 1: continue
+    if is_ident(g, pi, g.pk[pi].t.b[res[res.len - 1]], "error"): continue
+    for i in 0..res.len - 1:
+      if is_ident(g, pi, g.pk[pi].t.b[res[i]], "error"):
+        rfail(&x, g, "error-return", "error should be the last type when returning multiple items", 0.9, d)
+        break
+
+# ---- unexported-return
+
+# typeparams.ReceiverType
+fn receiver_type(g: tc.Prog, pi: Int, recv: Int) -> Str:
+  var e = g.pk[pi].t.b[ast.item(g.pk[pi].t, recv, 0)]
+  if kd(g, pi, e) == ast.N_STAR: e = g.pk[pi].t.a[e]
+  if kd(g, pi, e) == ast.N_INDEX: e = g.pk[pi].t.a[e]
+  if kd(g, pi, e) == ast.N_IDENT: return nmof(g, pi, e)
+  return "invalid-type"
+
+# exportedType over the result's type expression (aliases count by their own name, as
+# types.Alias does): "" when exported, else the type as revive prints it
+fn unexported_in(var g: tc.Prog, fs: Fs, pi: Int, n: Int) -> Bool:
+  let k = kd(g, pi, n)
+  if k == ast.N_PAREN: return unexported_in(&g, fs, pi, g.pk[pi].t.a[n])
+  if k == ast.N_IDENT:
+    let o = vet_obj(g, pi, n)
+    if o < 0 or g.ok[o] != tc.O_TYPE or g.opkg[o] != pi: return false
+    let ot = tc.obj_type(&g, fs, o)
+    if ot > 0 and g.tk[ot] == tc.TY_TPARAM: return false
+    return not is_exported_name(nmof(g, pi, n))
+  if k == ast.N_INDEX: return unexported_in(&g, fs, pi, g.pk[pi].t.a[n])
+  if k == ast.N_STAR: return unexported_in(&g, fs, pi, g.pk[pi].t.a[n])
+  if k == ast.N_ARRAYTYPE: return unexported_in(&g, fs, pi, g.pk[pi].t.b[n])
+  if k == ast.N_CHANTYPE: return unexported_in(&g, fs, pi, g.pk[pi].t.a[n])
+  if k == ast.N_MAPTYPE: return unexported_in(&g, fs, pi, g.pk[pi].t.a[n]) or unexported_in(&g, fs, pi, g.pk[pi].t.b[n])
+  return false
+
+fn vet_obj(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0 or n >= g.pk[pi].use.len: return -1
+  return g.pk[pi].use[n]
+
+# The type expression as go/types prints its type in revive's check
+fn type_text(var g: tc.Prog, fs: Fs, pi: Int, n: Int) -> Str:
+  let k = kd(g, pi, n)
+  if k == ast.N_PAREN: return type_text(&g, fs, pi, g.pk[pi].t.a[n])
+  if k == ast.N_IDENT:
+    let o = vet_obj(g, pi, n)
+    if o >= 0 and g.ok[o] == tc.O_TYPE and g.opkg[o] == pi:
+      let ot = tc.obj_type(&g, fs, o)
+      if ot > 0 and g.tk[ot] == tc.TY_TPARAM: return nmof(g, pi, n)
+      return g.pk[pi].name + "." + nmof(g, pi, n)
+    if o >= 0 and g.opkg[o] < 0: return nmof(g, pi, n)
+  if k == ast.N_INDEX:
+    var s = type_text(&g, fs, pi, g.pk[pi].t.a[n]) + "["
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    for i in 0..args.len:
+      if i > 0: s += ", "
+      s += type_text(&g, fs, pi, args[i])
+    return s + "]"
+  if k == ast.N_STAR: return "*" + type_text(&g, fs, pi, g.pk[pi].t.a[n])
+  if k == ast.N_ARRAYTYPE:
+    let e = type_text(&g, fs, pi, g.pk[pi].t.b[n])
+    if g.pk[pi].t.a[n] <= 0: return "[]" + e
+    let t = vet.ty(g, pi, n)
+    if t > 0 and g.tk[t] == tc.TY_ARRAY: return "[{g.tb[t]}]" + e
+    return "[?]" + e
+  if k == ast.N_MAPTYPE: return "map[" + type_text(&g, fs, pi, g.pk[pi].t.a[n]) + "]" + type_text(&g, fs, pi, g.pk[pi].t.b[n])
+  if k == ast.N_CHANTYPE:
+    let e = type_text(&g, fs, pi, g.pk[pi].t.a[n])
+    let f = g.pk[pi].t.f[n]
+    if f == 1: return "chan<- " + e
+    if f == 2: return "<-chan " + e
+    return "chan " + e
+  if tainted(&g, fs, pi, n): return "invalid type"
+  let t = vet.ty(g, pi, n)
+  return rv_str(&g, fs, pi, t)
+
+fn unexported_return(var g: tc.Prog, fs: Fs, var x: revive_core.Ctx, p: pkg.Pkg):
+  let pi = x.pi
+  if p.test[x.fi]: return
+  if g.pk[pi].name == "main": return
+  for d in top_decls(g, pi, x.fi):
+    if kd(g, pi, d) != ast.N_FUNCDECL: continue
+    let ft = g.pk[pi].t.c[d]
+    let rl = g.pk[pi].t.c[ft]
+    if rl <= 0: continue
+    let fname = nmof(g, pi, g.pk[pi].t.b[d])
+    if not is_exported_name(fname): continue
+    var thing = "func"
+    let recv = g.pk[pi].t.a[d]
+    if recv > 0 and ast.count(g.pk[pi].t, recv) > 0:
+      thing = "method"
+      if not is_exported_name(receiver_type(g, pi, recv)): continue
+    for r in ast.items(g.pk[pi].t, rl):
+      let te = g.pk[pi].t.b[r]
+      if not unexported_in(&g, fs, pi, te): continue
+      let ts = type_text(&g, fs, pi, te)
+      rfail(&x, g, "unexported-return", "exported " + thing + " " + fname + " returns unexported type " + ts + ", which can be annoying to use", 0.8, te)
+      break
+
+# ---- context-keys-type
+
+# How go/types names the type of expression n where vgolint's types can't tell: "alias" (a type
+# alias declared in the package: a *types.Alias, not a *types.Basic), "byte" or "rune" (their own
+# names in go/types), "" otherwise. Follows conversions, parentheses and declarations.
+fn spelled(var g: tc.Prog, pi: Int, n: Int, depth: Int) -> Str:
+  if n <= 0 or depth > 6: return ""
+  let m = vet.unparen(g, pi, n)
+  let k = kd(g, pi, m)
+  if k == ast.N_CALL:
+    let f = vet.unparen(g, pi, g.pk[pi].t.a[m])
+    if kd(g, pi, f) == ast.N_IDENT:
+      let o = vet_obj(g, pi, f)
+      if o >= 0 and (g.ok[o] == tc.O_TYPE or o >= 0 and g.opkg[o] < 0): return type_spelled(g, pi, f)
+    return ""
+  if k != ast.N_IDENT: return ""
+  let o = vet_obj(g, pi, m)
+  if o < 0 or g.opkg[o] != pi: return ""
+  if g.ok[o] != tc.O_VAR and g.ok[o] != tc.O_CONST: return ""
+  let d = g.odecl[o]
+  if d <= 0: return ""
+  let id = g.onode[o]
+  let dk = kd(g, pi, d)
+  if dk == ast.N_FIELD: return type_spelled(g, pi, g.pk[pi].t.b[d])
+  if dk == ast.N_VALUESPEC:
+    if g.pk[pi].t.b[d] > 0: return type_spelled(g, pi, g.pk[pi].t.b[d])
+    let ids = ast.items(g.pk[pi].t, g.pk[pi].t.a[d])
+    let vals = ast.items(g.pk[pi].t, g.pk[pi].t.c[d])
+    if ids.len != vals.len: return ""
+    for i in 0..ids.len:
+      if ids[i] == id: return spelled(&g, pi, vals[i], depth + 1)
+    return ""
+  if dk == ast.N_ASSIGN:
+    let ids = ast.items(g.pk[pi].t, g.pk[pi].t.a[d])
+    let vals = ast.items(g.pk[pi].t, g.pk[pi].t.b[d])
+    if ids.len != vals.len: return ""
+    for i in 0..ids.len:
+      if ids[i] == id: return spelled(&g, pi, vals[i], depth + 1)
+  return ""
+
+fn type_spelled(g: tc.Prog, pi: Int, te: Int) -> Str:
+  let t = vet.unparen(g, pi, te)
+  if kd(g, pi, t) != ast.N_IDENT: return ""
+  let o = vet_obj(g, pi, t)
+  if o < 0: return ""
+  if g.opkg[o] < 0:
+    let s = nmof(g, pi, t)
+    if s == "byte" or s == "rune": return s
+    return ""
+  if g.opkg[o] == pi and g.ok[o] == tc.O_TYPE:
+    let d = g.odecl[o]
+    if d > 0 and kd(g, pi, d) == ast.N_TYPESPEC and g.pk[pi].t.f[d] == 1: return "alias"
+  return ""
+
+fn basic_name(t: Int, sp: Str) -> Str:
+  if t == tc.B_URUNE: return "rune"
+  if tc.is_untyped(t) and t != tc.B_UNIL:
+    return default_name(t)
+  if (t == tc.B_UINT8 or t == tc.B_INT32) and sp != "": return sp
+  let names = ["invalid type", "bool", "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "float32", "float64", "complex64", "complex128", "string", "unsafe.Pointer", "untyped bool", "untyped int", "untyped rune", "untyped float", "untyped complex", "untyped string", "untyped nil"]
+  return names[t] + ""
+
+fn context_keys_type(var g: tc.Prog, fs: Fs, var x: revive_core.Ctx, p: pkg.Pkg):
+  let pi = x.pi
+  for n in file_nodes(g, pi, x.fi):
+    if kd(g, pi, n) != ast.N_CALL: continue
+    if not is_pkg_dot(g, pi, g.pk[pi].t.a[n], "context", "WithValue"): continue
+    let args = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if args.len != 3: continue
+    let key = args[1]
+    if tainted(&g, fs, pi, key): continue
+    let t = vet.ty(g, pi, key)
+    if t <= 0 or t >= tc.NBASIC: continue
+    let sp = spelled(&g, pi, key, 0)
+    if sp == "alias": continue
+    let bn = basic_name(t, sp)
+    rfail(&x, g, "context-keys-type", "should not use basic type " + bn + " as key in context.WithValue", 1.0, n)
+
+# ---- context-as-argument
+
+fn allow_types(c: cfg.Cfg, arg: Int) -> {Str: Bool}:
+  var out: {Str: Bool} = {}
+  let d = c.d
+  if arg >= 0 and d.kind[arg] == doc.K_SEQ and d.kids[arg].len >= 1:
+    let m = d.kids[arg][0]
+    if d.kind[m] == doc.K_MAP:
+      for i in 0..d.keys[m].len:
+        let k = doc.lower(d.keys[m][i].replace("-", ""))
+        if k != "allowtypesbefore": continue
+        let v = d.kids[m][i]
+        if d.kind[v] != doc.K_SCALAR: continue
+        for s in d.text[v].split(","): out[s + ""] = true
+  out["context.Context"] = true
+  return out
+
+fn context_as_argument(var g: tc.Prog, var x: revive_core.Ctx, p: pkg.Pkg, c: cfg.Cfg):
+  let pi = x.pi
+  let allow = allow_types(c, x.args.get("context-as-argument", -1))
+  for d in top_decls(g, pi, x.fi):
+    if kd(g, pi, d) != ast.N_FUNCDECL: continue
+    let ft = g.pk[pi].t.c[d]
+    let params = ast.items(g.pk[pi].t, g.pk[pi].t.b[ft])
+    if params.len <= 1: continue
+    var allowed = true
+    for f in params:
+      let te = g.pk[pi].t.b[f]
+      if is_pkg_dot(g, pi, te, "context", "Context") and not allowed:
+        rfail(&x, g, "context-as-argument", "context.Context should be the first parameter of a function", 0.9, f)
+        break
+      allowed = render(g, pi, te) in allow

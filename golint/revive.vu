@@ -1,0 +1,238 @@
+# revive (mgechev/revive v1.17.0, as golangci-lint 2.14.0 runs it): which rules run, each file's
+# failures, revive's own //revive:disable directives, the confidence cutoff, and the issues
+# ("RULE: message"). The rules themselves are in revive_*.vu, one function per rule, each adding
+# Fails for one file.
+#
+# Which rules: with no revive settings, revive's 23 default rules. With settings, only the rules
+# listed (and not disabled), plus the defaults with enable-default-rules, plus every rule with
+# enable-all-rules. Files with a "// Code generated ... DO NOT EDIT." line are skipped (golangci-lint
+# passes ignore-generated-header false). A failure below `confidence` (0.8) is dropped.
+
+import ast
+import pkg
+import tc
+import cfg
+import doc
+import revive_core
+import revive_a
+import revive_b
+import revive_c
+from revive_core import Fail, Ctx
+
+fn default_rules() -> [Str]:
+  return ["var-declaration", "package-comments", "dot-imports", "blank-imports", "exported", "var-naming", "indent-error-flow", "range", "errorf", "error-naming", "error-strings", "receiver-naming", "increment-decrement", "error-return", "unexported-return", "time-naming", "context-keys-type", "context-as-argument", "empty-block", "superfluous-else", "unused-parameter", "unreachable-code", "redefines-builtin-id"]
+
+# The rules that run: name -> its arguments node (-1 none); confidence in thousandths
+type Conf:
+  rules: {Str: Int}
+  order: [Str]
+  confidence: Float
+
+fn conf_of(c: cfg.Cfg) -> Conf:
+  let d = c.d
+  let s = cfg.lsettings(c, "revive")
+  var out = Conf({}, [], 0.8)
+  var any_set = false
+  if s >= 0 and d.kind[s] == doc.K_MAP and d.keys[s].len > 0: any_set = true
+  if not any_set:
+    for r in default_rules():
+      out.rules[r] = -1
+      out.order.push(r)
+    return out
+  let cf = doc.get(d, s, "confidence")
+  if doc.is_set(d, cf):
+    let v = float(doc.str_of(d, cf, "0")) else 0.0
+    if v != 0.0: out.confidence = v
+  let rl = doc.get(d, s, "rules")
+  var listed: {Str: Bool} = {}
+  if rl >= 0 and d.kind[rl] == doc.K_SEQ:
+    for e in d.kids[rl]:
+      let nm = doc.str_of(d, doc.get(d, e, "name"), "")
+      if nm == "": continue
+      listed[nm] = true
+      if doc.bool_of(d, doc.get(d, e, "disabled"), false):
+        if nm in out.rules: out.rules.remove(nm)
+        continue
+      if not (nm in out.rules): out.order.push(nm)
+      out.rules[nm] = doc.get(d, e, "arguments")
+  let all = doc.bool_of(d, doc.get(d, s, "enable-all-rules"), false)
+  let dflt = doc.bool_of(d, doc.get(d, s, "enable-default-rules"), false)
+  if all or dflt:
+    for r in default_rules():
+      if not (r in listed):
+        out.rules[r] = -1
+        out.order.push(r)
+  return out
+
+# ---- //revive:disable directives
+
+type Dir:
+  enable: Bool
+  modifier: Str     # "", "line" or "next-line"
+  rules: [Str]
+
+fn is_space(c: Byte) -> Bool:
+  return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 12
+
+# directiveRegexp: ^//[\s]*revive:(enable|disable)(?:-(line|next-line))?(?::([^\s]+))?[\s]*(?: (.+))?$
+fn parse_dir(t: Str) -> Dir?:
+  if not t.startswith("//"): return nil
+  var i = 2
+  while i < t.len and is_space(t[i]): i += 1
+  let rest = t[i..t.len]
+  var en = false
+  var j = 0
+  if rest.startswith("revive:enable"):
+    en = true
+    j = 13
+  elif rest.startswith("revive:disable"): j = 14
+  else: return nil
+  # (the regexp may take the modifier or not; try with it first, as it's greedy)
+  for try_mod in [true, false]:
+    var k = j
+    var md = ""
+    if try_mod:
+      if rest[k..rest.len].startswith("-next-line"):
+        md = "next-line"
+        k += 10
+      elif rest[k..rest.len].startswith("-line"):
+        md = "line"
+        k += 5
+      else: continue
+    var rules: [Str] = []
+    if k < rest.len and rest[k] == ':':
+      var e = k + 1
+      while e < rest.len and not is_space(rest[e]): e += 1
+      if e > k + 1:
+        for nm in rest[k + 1..e].split(","):
+          let n2 = nm.replace("\n", "")
+          if n2 != "": rules.push(n2 + "")
+        k = e
+    var m = k
+    while m < rest.len and is_space(rest[m]): m += 1
+    # the rest: nothing, or (after optional white space ending in a space) a reason
+    var ok = m == rest.len
+    if not ok:
+      # (?: (.+))?: a space then at least one char; the [\s]* before it gave back that space
+      if m > k and rest[m - 1] == ' ': ok = true
+    if ok: return Dir(en, md, rules)
+  return nil
+
+type Iv:
+  rule: Str
+  from: Int
+  to: Int
+
+fn intervals(p: pkg.Pkg, fi: Int, active: [Str]) -> [Iv]:
+  let src = p.srcs[fi]
+  let cm = p.comments[fi]
+  let lines = p.lines[fi]
+  var hist: {Str: [Int]} = {}        # rule -> positions, alternately disable/enable
+  var state: {Str: [Bool]} = {}
+  var names: [Str] = []
+  # (each comment, with the line its group ends on)
+  var i = 0
+  while i < cm.len:
+    # the group: comments on adjacent lines with nothing between
+    var j = i
+    while j + 3 < cm.len and cm[j + 5] == cm[i + 2] and pkg.line_of(lines, cm[j + 3]) <= pkg.line_of(lines, cm[j + 1]) + 1: j += 3
+    let gline = pkg.line_of(lines, cm[j + 1])
+    var k = i
+    while k <= j:
+      let t = src[cm[k]..cm[k + 1]]
+      k += 3
+      let d = parse_dir(t) else continue
+      var rs: [Str] = []
+      for r0 in d.rules: rs.push(r0 + "")
+      if rs.len == 0:
+        for a in active: rs.push(a + "")
+      for nm in rs:
+        if not (nm in hist):
+          hist[nm + ""] = []
+          state[nm + ""] = []
+          names.push(nm + "")
+        var steps: [Int] = []
+        if d.modifier == "line": steps = [gline, gline]
+        elif d.modifier == "next-line": steps = [gline + 1, gline + 1]
+        else: steps = [gline]
+        var want = d.enable
+        for si in 0..steps.len:
+          let n_st = state[nm].len
+          var cur = true
+          if n_st > 0: cur = state[nm][n_st - 1]
+          if cur == want:
+            break
+          state[nm].push(want)
+          hist[nm].push(steps[si])
+          want = not want
+    i = j + 3
+  var out: [Iv] = []
+  for nm in names:
+    let h = hist[nm]
+    var k = 0
+    while k < h.len:
+      var to = 2147483647
+      if k + 1 < h.len: to = h[k + 1]
+      out.push(Iv(nm + "", h[k], to))
+      k += 2
+  return out
+
+# ---- running the rules
+
+# revive's severity for a rule's failures: error when the rule's or the global severity is error
+fn rule_sev(c: cfg.Cfg, rule: Str) -> Str:
+  let d = c.d
+  let s = cfg.lsettings(c, "revive")
+  var sev = doc.lower(doc.str_of(d, doc.get(d, s, "severity"), ""))
+  let rl = doc.get(d, s, "rules")
+  if rl >= 0 and d.kind[rl] == doc.K_SEQ:
+    for e in d.kids[rl]:
+      if doc.str_of(d, doc.get(d, e, "name"), "") == rule:
+        let rs = doc.lower(doc.str_of(d, doc.get(d, e, "severity"), ""))
+        if rs != "": sev = rs
+  if sev == "error": return "error"
+  return "warning"
+
+# Whether a rule vgolint has: the others are named on stderr and report nothing
+fn implemented(name: Str) -> Bool:
+  return name in implemented_rules()
+
+fn implemented_rules() -> [Str]:
+  var out: [Str] = []
+  for n in revive_a.names(): out.push(n + "")
+  for n in revive_b.names(): out.push(n + "")
+  for n in revive_c.names(): out.push(n + "")
+  return out
+
+fn apply(var g: tc.Prog, fs: Fs, var x: Ctx, p: pkg.Pkg, name: Str, c: cfg.Cfg):
+  if name in revive_a.names(): revive_a.apply(&g, fs, &x, p, name, c)
+  elif name in revive_b.names(): revive_b.apply(&g, fs, &x, p, name, c)
+  elif name in revive_c.names(): revive_c.apply(&g, fs, &x, p, name, c)
+
+fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, c: cfg.Cfg, var issues: [pkg.Issue]):
+  let rc = conf_of(c)
+  var active: [Str] = []
+  for nm in rc.order:
+    if nm in rc.rules and implemented(nm): active.push(nm + "")
+  if active.len == 0: return
+  for fi in 0..p.srcs.len:
+    if p.hgen[fi]: continue
+    var x = Ctx(pi, fi, {}, [])
+    for nm in active: x.args[nm + ""] = rc.rules[nm]
+    for nm in active: apply(&g, fs, &x, p, nm, c)
+    if x.out.len == 0: continue
+    let ivs = intervals(p, fi, active)
+    let lines = p.lines[fi]
+    for f in x.out:
+      if f.conf < rc.confidence: continue
+      let sl = pkg.line_of(lines, f.pos)
+      let el = pkg.line_of(lines, f.endp)
+      var keep = true
+      for iv in ivs:
+        if iv.rule == f.rule and ((sl >= iv.from and sl <= iv.to) or (el >= iv.from and el <= iv.to)):
+          keep = false
+          break
+      # (golangci-lint's LineRange: start to end line; exported's only its start line)
+      var re = f.endp
+      if f.rule == "exported": re = f.pos
+      if keep: issues.push(pkg.Issue(fi, f.pos, "revive", f.rule + ": " + f.msg, issues.len, re, rule_sev(c, f.rule), f.zoff))
