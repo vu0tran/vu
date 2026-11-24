@@ -198,6 +198,49 @@ faults on many threads inflate push lines); the serial run is cleaner. 5x cold (
 the checker itself about 3x faster: about 200 cpu-s of checking without duplication is at least 20 s
 wall on 10 cores.
 
+## Speed linted a package at a time (a CI job's pattern, measured 2026-11-24)
+
+A monorepo's CI lints each package in its own vlint process, two at a time, `--threads=4
+--type-aware`, with the package's config (88 invocations). Reproduce it with a plan of the argv
+lists and a runner that keeps two going (the session's scratch `job.py`); compare wall and the cpu
+of every child (getrusage), and check that every output is unchanged.
+
+What was wrong in 0.5.0 (99.5 s and 840 cpu-s, against oxlint 1.79's 74 s and 466 on 10 cores):
+- a program alone in a package was checked in vlint's own process, which runs other threads, so it
+  couldn't fork: its workers were threads that each read, parsed and bound the whole program
+  again (a 211-file program: 29.8 cpu-s and 4.4 s on 8 workers, 11.6 cpu-s and 3.0 s on one)
+- workers came from `/proc/cpuinfo`, every core of a CI node whatever the pod's quota
+- forked shards were warmed with half the work first (VTSC_WARM_PERMILLE 500), serial when the
+  program is the package's only one
+- `/// <reference lib>` in @types/node made every program read and parse its files twice
+
+Now (`lvtsc.run_jobs`, `shards_for`, `tsprog.cpu_count`, `lcache.cpu_budget`): a program gets a
+worker per 200 files (VLINT_VTSC_SHARD_FILES), at most 8 and the budget (VLINT_CPUS, else the CPUs
+the process may use: on Linux its affinity and cgroup quota); a program with more than one is
+checked in a worker process that forks them cold after parsing; the programs take CPU tokens; the
+types packages' lib references are read first; a single-worker program's files are read ahead by
+four tasks. The job: 73.7 and 76.7 s, 453 and 449 cpu-s (oxlint 74.1 and 73.5 s, 470 and 462),
+outputs identical; a package's largest process 2.7 GB where it was 13.3.
+
+With 200 files a worker (the default since): 71.2 and 71.2 s, 478 and 475 cpu-s, against oxlint's
+74.4 and 74.3 s alternated (4% under). Tried and not kept: a warm-up of 5-12% of the work (less cpu
+on single packages, the job no faster: 74.4 and 72.8 s); 120 files a worker (74.5 and 72.6 s);
+read-ahead as plain C threads so that forking programs get it too (their read+parse 2.0 -> 0.57 s on
+one, but the job 73.9 and 76.3 s with 14 s more sys time).
+
+Where the wall goes now: in 66 of the 88 invocations the type-aware check is the critical path (the
+plain lint is done in a third of the time). In four mid-sized and large programs measured, the
+files nothing lints take 4-12 ms of a check of 1.0-4.8 s; before the check, reading, resolving and
+parsing 3,000-6,500 declaration files takes 0.45-0.7 s (parse 0.17-0.20 s, bind 0.03), the most a
+cross-process cache of parsed declarations could save (about 13 s of the job's 71 if it went to
+zero). On the job the plain lint costs 228 cpu-s against oxlint's 129 (the React Compiler is about
+40% of a large package's; most of the rest the module graph no-barrel-file needs), the type-aware
+part about 250 against tsgolint's 340. More shards barely help there
+(each types the shared declarations again: a 79-file program reads 6,500 declaration files to check
+its own). JavaScript plugins are where vlint wins (a plugin-heavy package 7-8 s against 14.7).
+VLINT_VTSC_DEBUG=3 shows a worker's stderr; VTSC_PHASES times read+parse, bind, check per shard,
+the worker, run_all and the fork.
+
 ## Checks before committing
 
 - vtsc: `VTSC_LIB=.../typescript/lib ./vtest.sh NEW_BUILD` (the cases in `vtests/`); a slow run:

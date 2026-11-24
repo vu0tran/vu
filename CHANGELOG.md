@@ -3172,3 +3172,33 @@ aarch64's 8-byte control groups (the oxlint measured is darwin-arm64); large tab
 has 634 JSDoc comments, its order matches). Not checked: TypeScript-only corners of the CFG beyond
 the probes, and the order on an x86-64 oxlint (16-byte groups), which can differ in tables of more
 than 16 buckets.
+
+**vlint: linting a package at a time costs half the CPU (2026-11-24).** A monorepo's CI job lints
+its 88 package invocations two at a time (`--threads=4 --type-aware`, each package's config), and
+vlint 0.5.0 was no faster there than oxlint. Reproduced on 10 cores, alternating runs, outputs
+identical every time: 0.5.0 took 99.5 and 99.4 s and 840 and 838 cpu-s; now 73.7 and 76.7 s and
+453 and 449 cpu-s; oxlint 1.79 74.1 and 73.5 s, 470 and 462 cpu-s. So the wall is oxlint's, not
+better: the type-aware check of one mid-sized program is most packages' critical path. A
+package's largest process went from 13.3 GB to 2.7 (the largest package; oxlint's 7.4); summed
+over the process tree (forked shards counted once each) 12.3-12.7 GB against oxlint's 12.3-12.4.
+What changed: a program checked alone no longer runs its workers as threads that each read, parse
+and bind it again (they're forked from a worker process after parsing); workers are one per 400
+files, at most 8 and the CPUs the process may use (on Linux its affinity and cgroup quota, not
+`/proc/cpuinfo`'s count of the whole node); programs take CPU tokens; forked shards start cold
+(the warm-up was a serial half); @types/node's `/// <reference lib>` no longer makes every program
+be read twice; a single-worker program's files are read ahead by four tasks. Not measured: the CI
+machine itself (its core count and quota aren't known here).
+
+**vlint: an unused disable closed by an enable is reported at the disable (2026-11-24).** oxlint 1.94
+moved it there; `probes/disable-enable-unused` (with `.args`, which oxprobe.sh now reads per folder).
+Against oxlint 1.94 on that CI job, 79 of 88 invocations are now identical (76 on 0.5.0); the rest
+are the React Compiler's preserve-manual-memoization (not ported: it needs the reactive-scope
+passes) and the rules whose results depend on it, plus two files vtsc can't type yet.
+
+**vlint: a type-aware worker per 200 files (2026-11-24).** On the CI job's pattern, alternated with
+oxlint 1.79: vlint 71.2 and 71.2 s (478 and 475 cpu-s), oxlint 74.4 and 74.3 s (473 and 470);
+outputs identical. 4% under oxlint's wall, not the 20% aimed at: most packages' critical path is one
+program's check of its own files (the files nothing lints take 4-12 ms of 1-4.8 s), after 0.45-0.7 s
+of reading and parsing declarations. Measured and not kept: a small warm-up before forking (less
+cpu, no faster), 120 files a worker, and read-ahead threads in forking programs (their read+parse
+2.0 -> 0.57 s, but the job 73.9 and 76.3 s with 14 s more sys time).
