@@ -118,6 +118,17 @@ int64_t vl_ncpu(void) {
   return n > 0 ? (int64_t)n : 1;
 }
 
+// For values a process hands its workers through the environment (VLINT_BUILD_ID).
+void vl_setenv(const vu_str *name, const vu_str *value) {
+  char k[256], v[256];
+  if (name->len <= 0 || name->len >= (int64_t)sizeof k || value->len >= (int64_t)sizeof v) return;
+  memcpy(k, name->data, (size_t)name->len);
+  k[name->len] = 0;
+  memcpy(v, value->data, (size_t)value->len);
+  v[value->len] = 0;
+  setenv(k, v, 1);
+}
+
 
 // For the command line: whether a descriptor is a terminal, the working directory, a real path.
 #include <unistd.h>

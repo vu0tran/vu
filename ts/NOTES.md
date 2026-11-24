@@ -302,6 +302,42 @@ With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache,
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
 against oxlint's 74-76 s, outputs identical; the run that fills them 81.6 s.
 
+## Keeping the caches in CI
+
+What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
+without XDG_CACHE_HOME). In it:
+- `vtsc-files/`: each program's type-aware results, used again for a file while every path its
+  check read or looked for has the same state (tsprog.check_conf); a program with a few changed
+  files is checked on one worker, the rest of its results read
+- `tsconfig/`: each tsconfig's reading, with what it asked the file system (lprobe)
+- `modrec-BUILD/`: dependencies' module records (lmod)
+- `tslib-HASH/`, `host-HASH.mjs`, `node-compile-cache/`: the TypeScript lib vlint carries, its
+  JavaScript plugin host and node's compiled copy of it (all keyed by their content)
+
+BUILD, and the build part of the other keys, is VLINT_BUILD_ID: a hash of vlint's executable bytes,
+set by vlint for itself and its worker processes. A job that installs vlint afresh each run gets a
+new file (new times and inode) with the same bytes, and its caches still apply; another vlint
+gets new keys, its old entries unused. (Before, the keys were the executable's times and inode:
+a reinstall missed every entry.) So a CI cache key needs no vlint version for correctness;
+`vlint-<version>-<lockfile hash>` with `vlint-<version>-` as the fallback prefix keeps old builds'
+entries from piling up. VLINT_VTSC_CACHE=0, VLINT_TSCONFIG_CACHE=0 and VLINT_MODREC_CACHE=0 turn
+the parts off.
+
+Size: 282 MB after the 88 invocations of the CI job's pattern (vtsc-files most of it). Nothing
+prunes old entries: start from an empty cache when the key's version changes.
+
+Measured on a scratch copy of the monorepo (the job's pattern, two at a time, `--threads=4`),
+starting from the cache a full run left, vlint reinstalled (copied to a new file) before the
+measured run:
+
+| change | vlint, cache warm | vlint, cold | oxlint 1.79 | warm against cold, every output |
+|---|---|---|---|---|
+| none | 33.9 s, 214 cpu-s | 71-74 s | 74-76 s | identical |
+| 1 file, 1 package | 35.1 s, 221 cpu-s | 75.2 s | 77.6 s | identical |
+| 10 files, 3 packages | 36.8 s, 226 cpu-s | 76.3 s | 79.1 s | identical |
+| 50 files, 10 packages (one module of a shared package imported in 29 places) | 47.2 s, 284 cpu-s | 76.5 s | 79.1 s | identical |
+The run that fills an empty cache: 78.8-81.6 s.
+
 ## Checks before committing
 
 - vtsc: `VTSC_LIB=.../typescript/lib ./vtest.sh NEW_BUILD` (the cases in `vtests/`); a slow run:
