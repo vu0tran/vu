@@ -255,6 +255,16 @@ Later the same day (the module record cache, lmod: `PkgC`, `parse_cached`, `save
   tsconfig extending the package's with noEmit): tsgo 791,000 instantiations and 1.22 s of check,
   vtsc 554,000 (cache hits counted) and 1.29 s. No missing cache: vtsc checks a file as fast as
   tsgo on one thread; tsgolint is faster by running four checkers over one parsed program.
+- a cache of parsed declaration files (built, measured, not kept): entries made relocatable by
+  parsing each file twice into trees whose node, list and name tables start at different offsets
+  (a field that moves by an offset is that kind of reference), loaded by appending and interning the
+  names in parse order. Outputs were identical cold and warm, but on a 79-file program with 5,268
+  package declaration files the parse went from 170 ms to 155 ms warm (interning the names and
+  relocating 2.1 million nodes cost about what parsing them does: the parser is already about
+  180 MB/s), the cold run cost 2.6 s more (two parses each) and the cache took 124 MB for that one
+  package. The code is kept in the session's scratch (dcache_attempt/), not in the repo.
+- warming the resolver's stat answers in the read-ahead tasks (resolving each file's rough
+  specifiers there): read+parse 470-485 ms -> 606-672 ms, the reads arriving later. Not kept.
 - the measurement harness must give absolute paths for XDG_CACHE_HOME: one run from the linted
   folder with a relative one wrote its caches there.
 
