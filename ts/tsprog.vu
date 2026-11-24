@@ -937,6 +937,32 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       let tf = tsres.reference_types(&rv, fs, pg.tdir + "/x", tn)
       if tf != "": tfiles.push(tf)
   elif os.env("VTSC_NO_PACKAGES") == "": tfiles = tsres.auto_types(&rv, fs, cwd0)
+  # (the libs the types packages' own files reference (@types/node's esnext.disposable): found
+  # here, before the program is read, the run starts again with them at once; found at the end,
+  # where the other files' references are, every file was read and parsed twice: 0.7 s of a
+  # 1,127-file program's 3.9. The libs loaded are the same either way, sorted: sort_libs)
+  if not keys_only and os.env("VTSC_NO_PACKAGES") == "" and os.env("VTSC_LATE_LIBS") == "":
+    var early: [Str] = []
+    var seen3: {Str: Bool} = {}
+    for k, v in seen: seen3[k + ""] = v
+    for tf in tfiles:
+      var tsrc = read_shared(fs, fm, tf)
+      if tsrc == "": tsrc = fs.read(tf) else ""
+      for ref in tsres.triple_slash(tsrc):
+        if ref[0] != "lib": continue
+        let l = tsconf.lib_alias(ref[1].lower())
+        var got: [Str] = []
+        lib_files(fs, dir, l, &seen3, &got)
+        var any_new = false
+        for g in got:
+          if fs.exists(g): any_new = true
+        if any_new: early.push(l + "")
+    if early.len > 0:
+      if os.env("VTSC_DEBUG_LIBS") != "": eprint("LIBS early {",".join(early)} (have {",".join(xlibs)})")
+      var xl: [Str] = []
+      for l in xlibs: xl.push(l + "")
+      for l in early: xl.push(l + "")
+      return run_libs(fs, os, ffi, files, dir, target, pg, shard, nshards, wq, cap, fm, km, xl)?
   # (packages' files by their real paths, as tsc has them: a package reached through two links
   # is one package, and its imports resolve from where it really is)
   var rdirs: {Str: Str} = {}
@@ -1463,15 +1489,17 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       total += fcost[fx]
   let impi = dep_index(imps, c.file_index)
   # (shards as processes, warmed: this process checks the first files of the order before they
-  # fork, VTSC_WARM_PERMILLE of the work (500; 200 on the corpus: 1.3% more cpu, 2% more
-  # wall, 700 no better), so that what every shard would type again, the
-  # lib's and the shared declarations' types, is typed once and comes to each copy-on-write;
-  # shard 0 reports those files. VTSC_FORK_WARM=0: forked cold)
+  # fork, VTSC_WARM_PERMILLE of the work (0: forked cold, the default), so that what every shard
+  # would type again, the lib's and the shared declarations' types, is typed once and comes to each
+  # copy-on-write; shard 0 reports those files. 500 saved 1.3% of the cpu on a whole monorepo in one
+  # run, where other programs fill the cores meanwhile; linted a package at a time (as a CI job
+  # does), the warm-up is a serial half: a 2,696-file program on 4 shards took 13.8 s warmed with
+  # 500, 11.0 with 200, 6.6 cold, the same cpu each)
   var warm = false
   var prefix: [Bool] = []
   for _q in 0..roots.len: prefix.push(false)
   if shard < 0 and nshards > 1 and os.env("VTSC_FORK_WARM") != "0" and os.env("VTSC_ONLY") == "":
-    let pm = int(os.env("VTSC_WARM_PERMILLE")) else 500
+    let pm = int(os.env("VTSC_WARM_PERMILLE")) else 0
     var acc = 0
     for fx in uord:
       if acc * 1000 >= total * pm: break
@@ -1479,6 +1507,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       acc += fcost[fx]
     warm = acc > 0
   if shard < 0 and not warm:
+    if os.env("VTSC_PHASES") != "": eprint("FORK at {os.clock()}")
     # (the shards as processes: everything above is the same for each)
     let tdir = fs.temp_dir() else ""
     var pids: [Int] = []
@@ -1982,7 +2011,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       out.unsup_mine.push(mine[fi])
       if not (fi in c.pkg_files): out.unsup_user = true
   out.nsyntax = pdiags.len
-  if os.env("VTSC_PHASES") != "": eprint("PHASES shard {shard}/{nshards} {target} {pg.cwd} files {files.len}: read+parse {(t1 - t0) * 1000.0:.0} (parse {tparse * 1000.0:.0}) bind+keys {(t2 - tk0) * 1000.0:.0} check {(t3 - t2) * 1000.0:.0} report {(os.clock() - t3) * 1000.0:.0} ms rel_cache {c.rel_cache.len} rels {c.rel_n} types {c.tk.len} objs {c.objs.len}")
+  if os.env("VTSC_PHASES") != "": eprint("PHASES shard {shard}/{nshards} {target} {pg.cwd} files {files.len}: read+parse {(t1 - t0) * 1000.0:.0} (parse {tparse * 1000.0:.0}) bind+keys {(t2 - tk0) * 1000.0:.0} check {(t3 - t2) * 1000.0:.0} report {(os.clock() - t3) * 1000.0:.0} ms rel_cache {c.rel_cache.len} rels {c.rel_n} types {c.tk.len} objs {c.objs.len} start {t0} end {os.clock()}")
   if shard == 0:
     out.user_from = user_from
     for fx in order0:
@@ -2037,15 +2066,10 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   return out
 
 
-# (Linux: /proc/cpuinfo; elsewhere, macOS among them, the system's count: there was no /proc and
-# every program got one worker)
-fn cpu_count(fs: Fs, ffi: Ffi) -> Int:
-  let info = fs.read("/proc/cpuinfo") else ""
-  var n = 0
-  for l in info.split("\n"):
-    if l.startswith("processor"): n += 1
-  if n < 1: return lcache.ncpu(ffi)
-  return n
+# (VLINT_CPUS, else the CPUs this process may use: lcache.cpu_budget. /proc/cpuinfo counted every
+# core of a CI node whose pod was limited to a few, and every program got 8 workers)
+fn cpu_count(os: Os, ffi: Ffi) -> Int:
+  return lcache.cpu_budget(os, ffi)
 
 
 # A tsconfig read for a run
@@ -2249,7 +2273,7 @@ fn run_all(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Pr
   var jobs = jobs0
   if jobs == 0:
     jobs = 1
-    if files.len >= 16: jobs = cpu_count(fs, ffi)
+    if files.len >= 16: jobs = cpu_count(os, ffi)
   if jobs > 8: jobs = 8
   var outs: [Out] = []
   # (the workers as forked processes where this one runs no other thread: the program is read,
@@ -2556,11 +2580,15 @@ fn check_conf(fs: Fs, os: Os, ffi: Ffi, cf: Conf, pg0: Prog, target: Str, lib: S
   if only_cached:
     p.err = cache_miss()
     return
+  let ph = os.env("VTSC_PHASES") != ""
+  let tq0 = os.clock()
   let outs = run_all(fs, os, ffi, cf.files, lib, target, pg, jobs1, fm, km) else []
   if outs.len == 0:
     p.err = "the checker failed"
     return
+  let tq1 = os.clock()
   let m = merge(outs, os.env("VTSC_NO_PROPAGATE") != "")
+  if ph: eprint("CONF run_all from {tq0}, {int((tq1 - tq0) * 1000.0)} ms, merge {int((os.clock() - tq1) * 1000.0)} ms")
   # (with a syntax error, tsc reports only those: the type check is tsgolint's)
   if m.nsyntax > 0:
     p.err = "syntax errors"

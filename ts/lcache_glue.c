@@ -2,6 +2,9 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #ifdef __APPLE__
 #define st_mtim st_mtimespec
 #define st_ctim st_ctimespec
@@ -75,14 +78,63 @@ int64_t vl_now_ns(void) {
   return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 
-// The online CPUs, where /proc/cpuinfo isn't there (macOS).
+// The CPUs this process may use: the online ones, on Linux fewer when its affinity mask or its
+// cgroup's CPU quota (v2 cpu.max, v1 cpu.cfs_quota_us) allows fewer. (A container's limit shows in
+// neither /proc/cpuinfo nor the affinity mask: a CI pod limited to a few CPUs of a large node saw
+// all of the node's.)
+#ifdef __linux__
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static long vl_quota_cpus(void) {
+  FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
+  long long q = -1, per = 0;
+  if (f) {
+    char a[64] = {0};
+    if (fscanf(f, "%63s %lld", a, &per) == 2 && strcmp(a, "max") != 0) q = atoll(a);
+    fclose(f);
+  } else {
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
+    if (f) { if (fscanf(f, "%lld", &q) != 1) q = -1; fclose(f); }
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+    if (f) { if (fscanf(f, "%lld", &per) != 1) per = 0; fclose(f); }
+  }
+  if (q <= 0 || per <= 0) return -1;
+  return (long)((q + per - 1) / per);
+}
+#endif
 int64_t vl_ncpu(void) {
   long n = sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef __linux__
+  cpu_set_t cs;
+  if (sched_getaffinity(0, sizeof cs, &cs) == 0) {
+    long a = CPU_COUNT(&cs);
+    if (a > 0 && (n <= 0 || a < n)) n = a;
+  }
+  long q = vl_quota_cpus();
+  if (q > 0 && (n <= 0 || q < n)) n = q;
+#endif
   return n > 0 ? (int64_t)n : 1;
+}
+
+// The CPU budget handed to this process's task threads (VU_THREADS, read at the first spawn) and
+// to its worker processes (VLINT_CPUS).
+void vl_setenv(const vu_str *name, const vu_str *value) {
+  char k[256], v[256];
+  if (name->len <= 0 || name->len >= (int64_t)sizeof k || value->len >= (int64_t)sizeof v) return;
+  memcpy(k, name->data, (size_t)name->len);
+  k[name->len] = 0;
+  memcpy(v, value->data, (size_t)value->len);
+  v[value->len] = 0;
+  setenv(k, v, 1);
 }
 
 // For the command line: whether a descriptor is a terminal, the working directory, a real path.
 #include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <limits.h>
 #include <stdlib.h>
 

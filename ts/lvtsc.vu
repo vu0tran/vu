@@ -428,102 +428,93 @@ fn jobs_seq_bg(fs: Fs, os: Os, ffi: Ffi, own is: [Int], own js: [Job], own ch: C
 # (VLINT_VTSC_SCHED=1: each program's start and end on stderr, seconds of the monotonic clock)
 # (sub: in a worker process even when the others aren't isolated, so that its own workers can be
 # processes forked after it's parsed and bound, tsprog.run_all; VLINT_VTSC_SUB=0 keeps it here)
-fn job_bg(fs: Fs, os: Os, ffi: Ffi, own i: Int, own j: Job, own ch: Chan[JobOut], nj: Int, own fm: Memo[Str, tsprog.FSrc], own km: Memo[Str, Int], sub: Bool):
-  if not isolate(os) and not (sub and os.env("VLINT_VTSC_SUB") != "0" and os.env("VLINT_VTSC_INPROC") != "1"):
-    let sch = os.env("VLINT_VTSC_SCHED") == "1"
-    let t0 = os.clock()
-    if sch: eprint("SCHED start {i} files {j.files.len} lint {j.lint.len} workers {nj} at {t0} {j.at}")
-    let r = work_n(fs, os, ffi, j, nj, fm, km)
-    if sch: eprint("SCHED end {i} took {os.clock() - t0} at {os.clock()}")
-    ch.send(JobOut(i, "", r, true))
-    return
-  # (a program the file cache answers whole: here, as a worker process would; else its process.
-  # VLINT_VTSC_TRYCACHE=0: always the process)
-  if os.env("VLINT_VTSC_TRYCACHE") != "0":
-    let r0 = work_n(fs, os, ffi, j, -1, fm, km)
-    if r0.err != tsprog.cache_miss():
-      ch.send(JobOut(i, "", r0, true))
-      return
-  let js = run_program_js_n(fs, os, ffi, j.kind, j.at, j.files, j.lib, j.lint, nj)
-  ch.send(JobOut(i, js))
+# (tok, lk: the run's CPU budget, a token a CPU, and the lock under which a program takes its nj
+# tokens all at once, so that two can't each hold part of what they need)
+fn job_bg(fs: Fs, os: Os, ffi: Ffi, own i: Int, own j: Job, own ch: Chan[JobOut], nj: Int, own fm: Memo[Str, tsprog.FSrc], own km: Memo[Str, Int], sub: Bool, own tok: Chan[Int], own lk: Chan[Int], need: Int):
+  let _l = lk.recv() else 0
+  for _k in 0..need: let _t = tok.recv() else 0
+  lk.send(0)
+  let r = job_run(fs, os, ffi, i, j, nj, fm, km, sub)
+  for _k in 0..need: tok.send(0)
+  ch.send(r)
 
-# The programs' checks at once (each in a task, or a worker process); one alone runs here.
+fn job_run(fs: Fs, os: Os, ffi: Ffi, i: Int, j: Job, nj: Int, fm: Memo[Str, tsprog.FSrc], km: Memo[Str, Int], sub: Bool) -> JobOut:
+  let sch = os.env("VLINT_VTSC_SCHED") == "1"
+  let t0 = os.clock()
+  if sch: eprint("SCHED start {i} files {j.files.len} lint {j.lint.len} workers {nj} sub {sub} at {t0} {j.at}")
+  var out = JobOut(i, "")
+  if not isolate(os) and not (sub and os.env("VLINT_VTSC_SUB") != "0" and os.env("VLINT_VTSC_INPROC") != "1"):
+    out = JobOut(i, "", work_n(fs, os, ffi, j, nj, fm, km), true)
+  else:
+    # (a program the file cache answers whole: here, as a worker process would; else its process.
+    # VLINT_VTSC_TRYCACHE=0: always the process)
+    var done = false
+    if os.env("VLINT_VTSC_TRYCACHE") != "0":
+      let r0 = work_n(fs, os, ffi, j, -1, fm, km)
+      if r0.err != tsprog.cache_miss():
+        out = JobOut(i, "", r0, true)
+        done = true
+    if not done: out = JobOut(i, run_program_js_n(fs, os, ffi, j.kind, j.at, j.files, j.lib, j.lint, nj))
+  if sch: eprint("SCHED end {i} took {os.clock() - t0} at {os.clock()}")
+  return out
+
+# A program's workers: one per VLINT_VTSC_SHARD_FILES files (400), at most the budget and 8. (Each
+# worker types the lib and the declarations its files need again: on a 211-file program one worker
+# took 11.6 cpu-s and 3.0 s, eight 29.8 cpu-s and 4.4 s; on a 5,104-file one, eight forked workers
+# 18.1 cpu-s and 6.0 s against one's 16.0 and 7.9.) VTSC_JOBS=N: N.
+fn shards_for(os: Os, nfiles: Int, budget: Int) -> Int:
+  let forced = int(os.env("VTSC_JOBS")) else 0
+  if forced > 0: return forced
+  let per = int(os.env("VLINT_VTSC_SHARD_FILES")) else 400
+  var n = budget
+  if per > 0: n = nfiles / per
+  if n > budget: n = budget
+  if n > 8: n = 8
+  if n < 1: n = 1
+  return n
+
+# The programs' checks, at most the CPU budget's worth at once (tsprog.cpu_count: --threads, else
+# the CPUs this process may use). A program with one worker is checked in this process when it's
+# alone; one with more is checked in a worker process, whose workers are forked after it's parsed
+# and bound (in this process, which runs other threads, each worker would read, parse and bind the
+# whole program again: a 1,127-file program took 33.7 cpu-s and 5.1 s that way, 14.0 and 3.9 forked).
 fn run_jobs(fs: Fs, os: Os, ffi: Ffi, jobs: [Job]) -> [JobOut]:
   var out: [JobOut] = []
   for _i in 0..jobs.len: out.push(JobOut(-1, ""))
-  if jobs.len == 1 or os.env("VLINT_VTSC_SERIAL") == "1":
-    for i in 0..jobs.len:
-      if not isolate(os):
-        let fm: Memo[Str, tsprog.FSrc] = memo()
-        let km: Memo[Str, Int] = memo()
-        # (VTSC_JOBS=N: N workers, for comparing splits)
-        let nj0 = int(os.env("VTSC_JOBS")) else 0
-        out[i] = JobOut(i, "", work_n(fs, os, ffi, jobs[i], nj0, fm, km), true)
-      else: out[i] = JobOut(i, run_program_js(fs, os, ffi, jobs[i].kind, jobs[i].at, jobs[i].files, jobs[i].lib, jobs[i].lint))
-    return out
-  let ch: Chan[JobOut] = chan(jobs.len + 1)
-  # (a program's work guessed from its files: the lib's ~100 ms, then ~8 ms a file. The largest
-  # gets a worker per core; the ones less than half of it are checked one after another in one
-  # task started first, the others in a task each. A task runs until it waits, so the small ones
-  # take one core while the largest one's workers share out its files as they come.)
-  var big = 0
+  var budget = tsprog.cpu_count(os, ffi)
+  if budget < 1: budget = 1
   var costs: [Int] = []
+  var nj: [Int] = []
   for i in 0..jobs.len:
     var n = jobs[i].files.len
     if jobs[i].lint.len > n: n = jobs[i].lint.len
-    let cst = 100 + 8 * n
-    costs.push(cst)
-    if cst > costs[big]: big = i
-  # (every other program a task of its own: an idle thread takes the next one that hasn't started. Queuing the smaller ones one after another in a task kept a monorepo's dozens of
-  # packages on one core, 178 s of a 194 s run (65 s this way); a long-lived worker per core taking
-  # them from a channel didn't spread either: the others never started)
-  var rest: [Int] = []
-  for i in 0..jobs.len:
-    if i != big: rest.push(i)
+    costs.push(100 + 8 * n)
+    nj.push(shards_for(os, n, budget))
+  if jobs.len == 1 or os.env("VLINT_VTSC_SERIAL") == "1":
+    for i in 0..jobs.len:
+      let fm: Memo[Str, tsprog.FSrc] = memo()
+      let km: Memo[Str, Int] = memo()
+      out[i] = job_run(fs, os, ffi, i, jobs[i], nj[i], fm, km, nj[i] > 1)
+    return out
+  let ch: Chan[JobOut] = chan(jobs.len + 1)
+  let tok: Chan[Int] = chan(budget + 1)
+  for _k in 0..budget: tok.send(0)
+  let lk: Chan[Int] = chan(2)
+  lk.send(0)
   # (the long ones first, by the guessed cost, so the last to finish isn't one started late;
   # output is the same either way; VLINT_VTSC_ORDER=0 keeps the programs' order)
-  if os.env("VLINT_VTSC_ORDER") != "0": rest.sort(by: fn(a, b) => costs[a] > costs[b] or (costs[a] == costs[b] and a < b))
-  # (in their order: largest first by the guessed cost, which misses the packages' types, took
-  # 72.5 s against 64-65)
-  # (the largest: a worker per core, but the one the others hold when they're a third of it or
-  # more (each worker parses the whole program: on 2 cores, eslint-config's 0.40 -> 0.38 s best
-  # of 5; task-runner's and workflow-sdk's others are less, and their own workers keep them
-  # faster); VLINT_VTSC_BIGJ=N: N)
-  var others = 0
-  for i in 0..jobs.len:
-    if i != big: others += costs[i]
-  var nbig = 0
-  if others * 3 > costs[big]:
-    nbig = tsprog.cpu_count(fs, ffi) - 1
-    # (at most 4: every worker checks its files' imports again, so a program's instructions grow
-    # with its workers (one large package: 223 G on 1, 389 G on 4, 531 G on 8) and its memory with them;
-    # the corpus under load: 61.5 s with 3 against 72.8 s with 9)
-    if nbig > 4: nbig = 4
-    if nbig < 1: nbig = 1
-  let bj = int(os.env("VLINT_VTSC_BIGJ")) else -1
-  if bj >= 0: nbig = bj
-  # (the largest first: spawned after the others, it waited behind them for a thread, 14.7 s of
-  # a monorepo's 41.7 s span; started first, the others fill the threads its workers leave)
-  # (the files' texts read once for all the programs)
+  var order: [Int] = []
+  for i in 0..jobs.len: order.push(i)
+  if os.env("VLINT_VTSC_ORDER") != "0": order.sort(by: fn(a, b) => costs[a] > costs[b] or (costs[a] == costs[b] and a < b))
+  # (the files' texts read once for all the programs checked here)
   let fm: Memo[Str, tsprog.FSrc] = memo()
   let km: Memo[Str, Int] = memo()
-  spawn job_bg(fs, os, ffi, big, copy_job(jobs[big]), ch, nbig, fm, km, nbig > 1)
-  # (the others: one worker each, in a worker process of its own. Splitting a large one, one worker
-  # per VLINT_VTSC_PER files (at most half the cores), once kept a 2,710-file program from
-  # finishing last, but each worker types the lib and the declarations it needs again: on
-  # the corpus, splitting by 300 cost 295 cpu-s and 35.5 s against 285 cpu-s and 32.9 s now
-  # (the long programs start first). Checked in vlint's own process instead (VLINT_VTSC_SUB=0) they
-  # share the files' texts and the resolver's table: 267 cpu-s, but 10.5 GB at the peak, against
-  # 3.2 GB. The output is the same every way.)
-  let ncpu = tsprog.cpu_count(fs, ffi)
-  let per = int(os.env("VLINT_VTSC_PER")) else 0
-  for i in rest:
-    var nj = 1
-    if per > 0:
-      nj = (costs[i] - 100) / 8 / per
-      if nj * 2 > ncpu: nj = ncpu / 2
-      if nj < 1: nj = 1
-    spawn job_bg(fs, os, ffi, i, copy_job(jobs[i]), ch, nj, fm, km, true)
+  for i in order:
+    # (every program in a worker process: checked here, the programs' types pile up in this one
+    # (10.5 GB at the peak on a monorepo, against 3.2))
+    var need = nj[i]
+    if need > budget: need = budget
+    spawn job_bg(fs, os, ffi, i, copy_job(jobs[i]), ch, nj[i], fm.share(), km.share(), true, tok.share(), lk.share(), need)
   for _ in 0..jobs.len:
     let r = ch.recv() else JobOut(-1, "")
     if r.i >= 0 and r.i < out.len:
@@ -586,6 +577,8 @@ fn run_program_js_n(fs: Fs, os: Os, ffi: Ffi, kind: Str, at: Str, files: [Str], 
   let rc = os.run(["sh", "-c", "ulimit -t \"$4\" 2>/dev/null; VTSC_JOBS=\"$6\" VTSC_CACHE_DIR=\"$5\" exec \"$0\" --vtsc-worker \"$1\" \"$2\" 2> \"$3\"", exe, pj, po, pe, cpu, cache_dir(os), "{nj}"]) else -1
   let out = fs.read(po) else ""
   let errt = fs.read(pe) else ""
+  # (VLINT_VTSC_DEBUG=3: the worker's whole stderr, e.g. its VTSC_PHASES lines)
+  if os.env("VLINT_VTSC_DEBUG") == "3" and errt != "": eprint(errt)
   fs.remove(pj) else 0
   fs.remove(po) else 0
   fs.remove(pe) else 0
@@ -634,8 +627,13 @@ fn work_n(fs: Fs, os: Os, ffi: Ffi, j: Job, nj: Int, fm: Memo[Str, tsprog.FSrc],
 fn worker(fs: Fs, os: Os, ffi: Ffi, jp: Str, op: Str) -> Int:
   let jt = fs.read(jp) else return 2
   let j = from_json(jt, Job) else return 2
+  let ph = os.env("VTSC_PHASES") != ""
+  let t0 = os.clock()
   let p = work(fs, os, ffi, j)
-  fs.write(op, to_json(p)) else return 2
+  let t1 = os.clock()
+  let js = to_json(p)
+  fs.write(op, js) else return 2
+  if ph: eprint("WORKER start at {t0}, work {int((t1 - t0) * 1000.0)} ms, output {js.len} bytes {int((os.clock() - t1) * 1000.0)} ms")
   return 0
 
 # Whether pos is inside a /** comment (the last /** before it not closed before it).
