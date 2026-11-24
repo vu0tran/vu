@@ -1,10 +1,11 @@
 # vgolint: golangci-lint in Vu
 
-`vgolint` is a drop-in replacement for `golangci-lint run` (v2.5.0): same command line, same
+`vgolint` is a drop-in replacement for `golangci-lint run` (v2.14.0): same command line, same
 config files, same output in every format, same exit codes, **for the linters it implements**
 (Coverage below). A config that enables a linter vgolint doesn't have, or a revive rule it doesn't
 have, gets one warning on stderr naming it, and that linter reports nothing: check the warning
-before treating vgolint's output as golangci-lint's.
+before treating vgolint's output as golangci-lint's, or set `VGOLINT_REQUIRE_ALL=1` to make it an
+error.
 
 ```
 vu build --release golint/main.vu -o vgolint
@@ -15,7 +16,8 @@ vgolint linters | help linters | version | config path | cache clean
 
 Its own Go front end (scanner, parser, a type checker that loads dependencies from GOROOT and
 the module cache lazily) feeds ports of the linters. Packages are found as `go list` finds them
-for linux/amd64 (build tags from `run.build-tags` included) and linted on all cores; results are
+for the go command's build context (its GOOS, GOARCH, cgo, tool and release tags; build tags from
+`run.build-tags` included) and linted on all cores; results are
 cached per run, keyed by every linted file, go.mod/go.sum, the Go version, the effective config
 and the binary (`--no-cache` turns that off).
 
@@ -30,7 +32,7 @@ musl); macOS binaries need macOS 12 or later. There is no Windows build (Vu does
 
 ```sh
 # golangci-lint:
-curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.5.0
+curl -sSfL https://golangci-lint.run/install.sh | sh -s -- -b $(go env GOPATH)/bin v2.14.0
 # vgolint:
 curl -sSfL https://raw.githubusercontent.com/vu0tran/vu/main/golint/install.sh | sh -s -- -b $(go env GOPATH)/bin v0.1.0
 ```
@@ -40,7 +42,7 @@ so Makefiles and scripts that call `golangci-lint run` keep working. A `golangci
 already in the folder and isn't vgolint's is left alone unless `-f` is given; `-n` installs
 `vgolint` only. With no version it installs the newest vgolint release. The version is vgolint's own
 (`v0.1.0`), not golangci-lint's: `golangci-lint version` says which golangci-lint it mirrors
-(`golangci-lint has version 2.5.0 built with vgolint (Vu) ...`).
+(`golangci-lint has version 2.14.0 built with vgolint (Vu) ...`).
 
 **What it needs where it runs** (as golangci-lint does): the Go toolchain's standard library
 source and the module cache, because it type-checks against them. It reads source files and never
@@ -81,9 +83,8 @@ clash with Homebrew's golangci-lint.
 
 Releasing: `RELEASING.md`.
 
-Platform notes: packages are matched for linux/amd64 on every platform (as above), so on macOS
-files with `_darwin.go` suffixes or `//go:build darwin` lines are skipped where golangci-lint on a
-Mac would lint them. The result cache works on macOS too (it was off there until 2026-11-20: its key
+Platform notes: packages are matched for the build context `go list` reports (GOOS and GOARCH from
+the environment, as for go), so a Mac lints `_darwin.go` files as golangci-lint there does. The result cache works on macOS too (it was off there until 2026-11-20: its key
 read `/proc/self/exe`).
 
 The cache and local replaces: a module replaced with a local folder (`replace example.com/x =>
@@ -173,10 +174,141 @@ What's left is flat: type-checking the linted packages and the imported declarat
 worker for itself) about a third, staticcheck a quarter (its IR 9%), parsing the linted files 14%,
 vet 9%, ineffassign 7%, unused 6%.
 
+## goimports, ST1000 and ST1003, a whole monorepo (2026-11-24)
+
+goimports (`goimports.vu`), on the printer: x/tools' own import sorting (not go/ast's: grouping by
+`local-prefixes`, comments attached to the spec before them, merged lines, Go's pdqsort so that ties
+land where sort.Sort puts them), the blank lines between groups, and on code that compiles the one
+change goimports makes there, naming an import whose package name isn't the one its path suggests.
+Files that import "C" are skipped by both formatters, as in golangci-lint. Identical text and JSON
+(SuggestedFixes included) on 33 hand-made cases, a 884-file library scrambled seven ways with seven
+`local-prefixes` settings (478 to 589 issues each), and scrambled copies of x/tools v0.50.0 (709
+issues) and x/net v0.59.0 (354).
+
+staticcheck's ST1000 and ST1003 (`sc_g7.vu`: lintName, `initialisms` or v0.8.1's default list, its
+exceptions), so all 161 of v0.8.1's checks are in: 162 of the 173 testdata suites now identical.
+
+The whole 105-pattern monorepo, golangci-lint 2.14.0 (empty cache, 4 cores) against vgolint:
+
+| config | issues | |
+|---|---:|---|
+| its own (gofmt and goimports on) | 5 | byte-identical |
+| strict: staticcheck `all` but ST1000/ST1003, govet, lll, revive, depguard, misspell, gocyclo, no limits | 187,963 | all the same; only the order of issues at one position differs, which golangci-lint's unstable sort doesn't fix |
+| ST1000 and ST1003 with initialisms | 8,687 | byte-identical (golangci-lint 98 s, vgolint 17 s) |
+
+On the way: the build context now comes from `go list` rather than being linux/amd64 (the standard
+library lints as the `std` and `cmd` modules: 20,463 of golangci-lint's 20,514 issues on darwin, the
+rest vendored packages and checks that skip their own package); govet's buildtag and directive read
+the files build constraints leave out; patterns load as go list loads them (no package at all, a
+named folder with no Go file or whose files are all left out: golangci-lint's errors and exit codes);
+cached issues keep their extra source lines; and the type checker types imported generic fields and
+methods in time, scopes local aliases, and keys parsed dependency files by path (a panic before).
+
+`VGOLINT_REQUIRE_ALL=1` turns the "not implemented, skipped" warning into an error (exit 3), so a CI
+job can't pass on a linter, govet analyzer or revive rule that never ran. `tools/shadow.sh` runs
+vgolint beside golangci-lint in CI: golangci-lint's exit code is the job's, and the two tools' issues
+(limits off) are compared and reported without failing it unless `SHADOW_STRICT=1`.
+
+## gofmt (2026-11-24)
+
+The gofmt formatter, as golangci-lint 2.14.0 runs it (github.com/golangci/gofmt, which is Go
+1.27.3's cmd/gofmt): each file is parsed (`fparse.vu`, go/parser with every position go/ast keeps
+and its comment groups), the rewrite rules applied (with go/ast's comment map, so comments attached
+to a replaced node go, as in gofmt), its imports sorted (ast.SortImports), simplified (`-s`, the
+default), and printed by a port of go/printer (`printer.vu`: printer.go and nodes.go function for
+function, nodeSize's second printer, the //go:build fixing, text/tabwriter and the trimmer; doc
+comments reformatted by go/doc/comment's parser and printer, `doccmt.vu`). A file that comes out
+different gives golangci-lint's "File is not properly formatted" issues: the unified diff of
+rogpeppe/go-internal, its hunks read as sourcegraph/go-diff reads them and turned into changes as
+golangci-lint does, one issue per change (golangci-lint keeps a file's first), with its
+`SuggestedFixes` in JSON. `vgolint fmt-debug [-s] [-r RULE] [-d] FILE` prints a file as it formats it.
+
+Checked against Go 1.27.3's gofmt byte for byte, every file the same:
+
+| corpus | files | `gofmt` | `gofmt -s` | `gofmt -r 'interface{} -> any'` |
+|---|---:|---:|---:|---:|
+| Go 1.27.3's src (testdata left out) | 6,827 | 6,827 | 6,827 | |
+| the monorepo | 20,362 | 20,362 | 20,362 (`-s -r`, its settings) | |
+| the module cache: every .go file but the toolchains' (13 GB) that gofmt accepts | 137,304 | 137,304 | 29,978 of a 30,000-file sample | the same 29,978 |
+| Go's src, mangled | 6,827 | 6,827 | 6,827 | |
+| the monorepo, mangled | 20,362 | 20,362 | 20,362 (`-s -r`) | |
+| the module-cache sample, mangled | 29,978 | 29,978 | 29,978 | |
+| Go's src, mangled with comments | 6,827 | 6,827 | 6,827 | |
+| the monorepo, mangled with comments | 20,362 | | 20,362 (`-s -r`) | |
+| 20,454 files of the module-cache sample, mangled with comments | 20,454 | 20,454 | | |
+
+The mangled copies change what gofmt fixes: spacing between tokens, line breaks after `( [ { ,` and
+operators (added and removed), indentation, blank lines, the space before trailing comments, a
+missing final newline; the second set also puts `/* */` comments between tokens, `//` comments at
+line ends, multi-line comments on their own lines and generated doc comments (paragraphs, lists,
+code, headings, link definitions, `` and '') above declarations. Also identical: gofmt's own
+testdata (cmd/gofmt's 24 cases with their flags, go/printer's 39 inputs and goldens, each also with
+`-s` and two rewrite rules), go/doc/comment's 53 test inputs as `//` and `/* */` doc comments, the
+1,215 files under Go's testdata folders that gofmt accepts, and about 23,000 generated files (random
+programs, with and without `-s`) that aim at one part each (doc comments, import blocks with
+duplicates and comments, `interface{}` in every position with comments around it, struct and const
+alignment, line breaks in expressions, calls and signatures, statements with comments, block
+comments, build lines, simplify's cases, number literals, CRLF and BOM, one-line function bodies
+near the 100-column limit, key-value columns, selector chains, type parameters, statement sequences
+with empty statements and labels, expressions of every kind, declarations, closures; 1,499 of them
+module-cache files mangled with comments). Those found two differences, both fixed: a label last in
+a block after an empty statement, and `2.5.F` (a selector on a float literal), which the scanner
+read as one number.
+
+The issues, golangci-lint 2.14.0 against vgolint, text and JSON (SuggestedFixes included)
+identical:
+
+- the monorepo with its own gofmt settings (rewrite `interface{}` -> `any`): 55 issues (all in
+  folders its own config excludes, so with the whole config: none, as golangci-lint).
+- A copy of the monorepo with 568 files mangled (spacing, or spacing and comments), its own
+  config, twelve folders holding most of them: 252 gofmt issues (and every other linter's issues as
+  before).
+- 40 hand-made files of what the diff-to-issue path has to handle (`tools/fmtcases`: a deletion
+  first, additions only, no final newline, CRLF, a BOM, build lines, generated files,
+  `//nolint:gofmt`, duplicate and unsorted imports, doc comments).
+- Standard-library packages copied into modules (18, and 37 others that build outside std), as
+  they are and each set mangled with three seeds, under four configs (defaults, `simplify: false`, two rewrite
+  rules with exclusion paths, generated files linted): 28 to 93 issues each.
+
+With nothing unformatted, `0 issues.` as before; the other linters' output on the monorepo with
+its own config is the same as before, byte for byte.
+
+The cost, the monorepo with its own config (gofmt on), `--no-cache`, three
+runs each on a loaded 10-core Mac: 43.4 s of CPU before, 49.2 s with gofmt (+13%); wall 6.1 s and
+6.7 s. Formatting all 20,362 files on their own (`fmttest bench`, `-s` and the rewrite rule, one
+thread) takes 10.8 s; vgolint formats only the files whose issues it can report (generated files
+are skipped under `generated: lax`). The printer stops a nodeSize print once it can't fit, looks
+lines up in a table, and the tabwriter keeps cells as stretches of its input.
+
+## The rest of staticcheck and govet, as golangci-lint 2.14.0 (2026-11-24)
+
+The 87 staticcheck checks vgolint didn't have are ported from v0.8.1 (`sc_g1.vu` to `sc_g5.vu`),
+and the 25 it had that differed from v0.8.1 (they came from v0.6.1, golangci-lint 2.5.0's) are
+updated; govet gains asmdecl, buildtag, cgocall, directive, framepointer, hostport, ifaceassert,
+lostcancel, slog, stdversion, unsafeptr and waitgroup (`vet_g6.vu`). Several are modelled on
+staticcheck's IR: block graphs with dominators and reaching definitions, lifting, nilness. Also: a
+type declaration `type S[P *C, Q any]` parses as a type parameter list; related-information issues
+follow their check's setting; SA1019's deprecation data is v0.8.1's; SA9007 reads the environment.
+
+Each check's own testdata (staticcheck v0.8.1's, x/tools v0.50.0's for govet), each package a
+module linted with only that check by golangci-lint 2.14.0 and by vgolint, text compared exactly:
+158 of 173 identical. The 15 others: six whose testdata imports other testdata packages or
+missing modules (identical once made loadable), two where golangci-lint's unstable sort orders
+issues at one position differently, one that differs because golangci-lint loads darwin files on
+a Mac, one `//line` case, ST1000 and ST1003 (not ported), and buildtag/directive's excluded files.
+On the 2,981-package monorepo: its own config identical on three folders (`0 issues.`), the strict
+config and revive's defaults identical but for which of two revive rules on one line golangci-lint
+keeps (it changes between its runs).
+
+golangci-lint isn't deterministic where limits cut: with the default max-same-issues 3 and
+max-issues-per-linter 50, which of several identical messages it shows changes from run to run
+(three runs, two different selections). vgolint finds the same issues and always shows the same ones.
+
 ## lll, depguard, revive and four staticcheck checks (2026-11-23)
 
 Ported from the versions golangci-lint 2.14.0 pins (lll from golangci-lint itself, depguard v2.2.1,
-revive v1.17.0, staticcheck v0.8.1); the rest of vgolint still follows 2.5.0.
+revive v1.17.0, staticcheck v0.8.1); the rest of vgolint followed 2.5.0 until 0.6.0, which is
+compared against 2.14.0 throughout.
 
 - **lll**: line-length, tab-width; //go: lines and import blocks skipped.
 - **depguard**: rule lists, files globs (gobwas/glob), allow/deny with `$gostd`, the three list
@@ -219,7 +351,7 @@ it (`golangci-lint cache clean`) before comparing.
 | `run` | supported (see flags) |
 | `linters` | supported (same listing; vgolint warns on stderr about enabled linters it skips) |
 | `help`, `help linters`, `help formatters` | supported (golangci-lint's own text) |
-| `version`, `--version` | prints `golangci-lint has version 2.5.0 built with vgolint (Vu) ...` |
+| `version`, `--version` | prints `golangci-lint has version 2.14.0 built with vgolint (Vu) ...` |
 | `config path`, `config verify` | path: supported; verify: loads and validates the config (no JSON-schema check) |
 | `cache clean`, `cache status` | vgolint's own cache |
 | `fmt`, `migrate`, `custom`, `formatters` | not yet |
@@ -263,7 +395,7 @@ Bad usage gives golangci-lint's messages and exit code 3 (`unknown flag`, `inval
   disable|settings|exclusions` (`generated: strict|lax|disable`, `presets`, `rules` with
   `path/path-except/text/source/linters`, `paths`, `paths-except`, `warn-unused`),
   `issues.max-*|uniq-by-line|new*|whole-files|fix`, `severity.default|rules`, `formatters.enable|
-  settings|exclusions.paths`. Flags override the file; `-E/-D/--build-tags` append, as in golangci-lint.
+  settings|exclusions.paths` (gofmt's `simplify` and `rewrite-rules`). Flags override the file; `-E/-D/--build-tags` append, as in golangci-lint.
 - Validation with golangci-lint's messages: exclusion rules (two conditions, path vs path-except,
   regexps), presets, sort-order, path-mode, relative-path-mode, modules-download-mode, durations,
   severity rules, unknown linters and groups.
@@ -302,16 +434,16 @@ how often the 248 configs of the 500 most-starred Go repositories on GitHub (sta
 
 | linter | configs enabling it | vgolint |
 |---|---:|---|
-| govet | 216 | 22 of the 33 default analyzers; `enable/disable/enable-all/disable-all` |
+| govet | 216 | golangci-lint 2.14.0's default analyzers (`loopclosure` fires only before Go 1.22); not the non-default atomicalign, deepequalerrors, fieldalignment, findcall, httpmux, inline, nilness, reflectvaluecompare, shadow, sortslice, unusedwrite; `enable/disable/enable-all/disable-all` |
 | ineffassign | 210 | yes |
-| staticcheck | 206 | 72 checks, the IR-based SA4006/SA4009/SA4017/SA5011 among them; `checks` (globs, `-X`, golangci-lint's defaults), `dot-import-whitelist` |
+| staticcheck | 206 | all 161 of v0.8.1's checks, as staticcheck v0.8.1 has them; `checks` (globs, `-X`, golangci-lint's defaults), `dot-import-whitelist`, `initialisms` |
 | unused | 196 | yes |
 | errcheck | 168 | yes; `exclude-functions`, `disable-default-exclusions` |
 | misspell | 145 | yes (locale US/UK, ignore-rules, extra-words, mode) |
-| goimports | 132 | not yet |
+| goimports | 132 | yes (`local-prefixes`), as x/tools v0.50.0 on code that compiles |
 | unconvert | 132 | yes (fast-math) |
 | revive | 115 | its 23 default rules with their arguments (golangci-lint 2.14.0's revive v1.17.0); not the other 82 |
-| gofmt | 114 | not yet |
+| gofmt | 114 | yes (simplify, rewrite-rules), byte for byte as Go 1.27.3's gofmt |
 | bodyclose | 94 | not yet |
 | gocritic | 90 | not yet |
 | gosec | 86 | not yet |
@@ -409,13 +541,16 @@ command line, both tools, stdout/stderr/exit code), `tools/freq_fetch.sh` + `too
 
 ## Not done
 
-- Formatters (gofmt, goimports, gofumpt, gci, golines): need a go/printer port.
+- Formatters gofumpt, gci, golines (the printer, `printer.vu`, is the base for them).
 - revive's 82 non-default rules; gocritic, gosec, bodyclose, unparam and the rest of the long tail.
-- staticcheck: 88 of its checks (most never fire on the modules measured; SA4020 does once),
-  and the IR's alias resolution in SA4006/SA5011 above. govet's lostcancel, ifaceassert, loopclosure (pre-1.22), directive, slog, unsafeptr, stdversion,
-  buildtag, cgocall, asmdecl, framepointer.
-- Suggested fixes (`--fix`, json's `SuggestedFixes`).
+- govet's non-default analyzers listed under Coverage, and `loopclosure` before Go 1.22.
+- Facts from other packages' function bodies (imported packages are type-checked without them):
+  SA4018's purity, SA4023's nilness, SA5012's even-length arguments and lostcancel's no-return
+  functions are known for the standard library (generated tables) but not for the module's own
+  packages.
+- `//line` directives aren't followed (one S1006 case).
+- Suggested fixes (`--fix`; json's `SuggestedFixes` only for the formatters).
 - errcheck's `check-type-assertions` and `check-blank`; unused's settings; staticcheck's
-  `initialisms`/`http-status-code-whitelist`.
+  `http-status-code-whitelist`.
 - Parse errors are printed as vgolint's own `typechecking error` lines, not as golangci-lint's
   `typecheck` issues.

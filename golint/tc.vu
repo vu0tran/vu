@@ -106,6 +106,7 @@ type Pk:
   pkgdoc: [Str]          # lazy: each file's package doc comment text
   dpi: Int = -1          # its files in Prog.dps (an imported package), or -1
   flf: [Int] = []        # per file: which of its lazy files it is (an imported package's), or -1
+  etn: {Int: Int} = {}  # an embedded field's identifier -> the type name it names (use[] has the field)
 
 type Prog:
   pk: [Pk]
@@ -170,6 +171,9 @@ type Prog:
   # Go version and the build tags; read_dep)
   dcache: Str = ""
   dkey: Str = ""
+  env: {Str: Str} = {}  # TMPDIR, HOME, XDG_CACHE_HOME, XDG_CONFIG_HOME as vgolint sees them (SA9007)
+  xtest_of: Str = ""  # the package the target external test package tests: imported with its in-package test files
+  tp_depth: Int = 0   # inside a generic type's declared type (named_origin): its fields are typed while T is in scope
 
 fn empty_srcs() -> {Str: Str}:
   return {}
@@ -340,7 +344,10 @@ fn named_origin(var g: Prog, fs: Fs, o: Int) -> Int:
     return lu
   let saved = save_scopes(&g)
   push_tparams_scope(&g, o)
+  let generic = o in g.otp and g.otp[o].len > 0
+  if generic: g.tp_depth += 1
   let u = type_expr(&g, fs, pi, g.ofile[o], te)
+  if generic: g.tp_depth -= 1
   restore_scopes(&g, saved)
   if u > 0 and g.tk[u] == TY_NAMED: return under(&g, fs, u)
   if u > 0 and g.tk[u] == TY_IFACE:
@@ -651,6 +658,10 @@ fn new_pk(path: Str, dir: Str) -> Pk:
 fn load_pkg(var g: Prog, fs: Fs, path: Str, from_std: Bool) -> Int:
   var key = path + ""
   if from_std and path.find(".") >= 0: key = "vendor/" + path
+  # (an external test package's package, as go test compiles it: with its in-package _test.go files;
+  # a package of the test that imports it gets that variant too, as go test recompiles it)
+  let with_tests = g.xtest_of.len > 0 and path == g.xtest_of
+  if with_tests: key = path + " [test]"
   let found = g.bypath.get(key, -2)
   if found != -2: return found
   if path == "C":
@@ -676,7 +687,9 @@ fn load_pkg(var g: Prog, fs: Fs, path: Str, from_std: Bool) -> Int:
   var dc = ""
   if g.dcache.len > 0 and (dir.startswith(g.goroot + "/") or (g.modcache.len > 0 and dir.startswith(g.modcache + "/"))): dc = g.dcache + ""
   let dk = g.dkey + ""
-  let dp = g.dsrc.get(dir, fn(d) => read_dep(fs, d, tags, ms, mf, dc, dk))
+  var dkey = dir + ""
+  if with_tests: dkey = dir + "\n[test]"
+  let dp = g.dsrc.get(dkey, fn(d) => read_dep(fs, d, tags, ms, mf, dc, dk))
   for lf in 0..dp.value.ixs.len:
     if g.pk[pi].name.len == 0: g.pk[pi].name = dp.value.ixs[lf].pkgname + ""
     add_lazy(&g, pi, dp.value.ixs[lf])
@@ -688,11 +701,17 @@ fn load_pkg(var g: Prog, fs: Fs, path: Str, from_std: Bool) -> Int:
 
 # The files of the package in dir that build with tags: their sources (the module's from ms, read
 # already) and what each declares.
-fn read_dep(fs: Fs, dir: Str, tags: [Str], ms: Shared[{Str: Str}], mf: Memo[Str, Src], dc: Str, dk: Str) -> DepPkg:
+fn read_dep(fs: Fs, dir0: Str, tags: [Str], ms: Shared[{Str: Str}], mf: Memo[Str, Src], dc: Str, dk: Str) -> DepPkg:
   var out = DepPkg([], [], [])
   var cpath = ""
   var ckey = ""
-  if dc.len > 0:
+  # (a key ending in a line "[test]": the package with its in-package test files, load_pkg's with_tests)
+  var dir = dir0 + ""
+  var tests = false
+  if dir0.endswith("\n[test]"):
+    dir = dir0[0..dir0.len - 7]
+    tests = true
+  if dc.len > 0 and not tests:
     ckey = DEP_FMT + "\n" + dir + "\n" + dk + "\n" + "\n".join(tags)
     cpath = dc + "/" + key_hex(ckey)
     let blob = fs.read(cpath) else ""
@@ -705,8 +724,8 @@ fn read_dep(fs: Fs, dir: Str, tags: [Str], ms: Shared[{Str: Str}], mf: Memo[Str,
   var rel = dir + "/"
   if rel.startswith("./"): rel = rel[2..rel.len]
   for nm in names:
-    if not nm.endswith(".go") or nm.endswith("_test.go") or nm.startswith(".") or nm.startswith("_"): continue
-    if not load.good_name(nm): continue
+    if not nm.endswith(".go") or (nm.endswith("_test.go") and not tests) or nm.startswith(".") or nm.startswith("_"): continue
+    if not load.good_name(nm, tags): continue
     var src = ""
     let rp = rel + nm
     if rp in ms.value: src = ms.value[rp] + ""
@@ -717,7 +736,10 @@ fn read_dep(fs: Fs, dir: Str, tags: [Str], ms: Shared[{Str: Str}], mf: Memo[Str,
       src = sv.value.text + ""
     else: src = fs.read(dir + "/" + nm) else continue
     if not load.good_constraints(src, tags): continue
-    out.ixs.push(index_lines(src))
+    let ix = index_lines(src)
+    # (a test file of the external test package itself isn't the package's)
+    if nm.endswith("_test.go") and ix.pkgname.endswith("_test"): continue
+    out.ixs.push(ix)
     out.srcs.push(src)
     out.enc.push("")
     out.paths.push(dir + "/" + nm)
@@ -902,7 +924,8 @@ fn ensure_file(var g: Prog, fs: Fs, pi: Int, lf: Int):
   elif di >= 0:
     # (parsed once for the run: dast)
     let dp = g.dps[di].share()
-    let key = g.pk[pi].dir + "\n{lf}"
+    # (by the file's path: a package's variant with its test files numbers its files otherwise)
+    let key = dp.value.paths[lf] + ""
     let pf = g.dast.get(key, fn(k) => parse_dep(dp, lf))
     if g.trace: eprint("TP {g.pk[pi].dir} {lf} {src_of(dp.value, lf).len}")
     add_parsed(&g, pi, pf, dp, lf)
@@ -1582,11 +1605,26 @@ fn struct_type(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int) -> Int:
         g.oaux[o] = 7
         if g.pk[pi].target: g.pk[pi].use[id] = o
         fields.push(o)
+  if not g.pk[pi].target and g.tp_depth > 0:
+    # (an imported generic type's fields: typed now, while its type parameters are in scope; typed
+    # later, as other imported fields are, T would name nothing)
+    for o in fields:
+      if g.otype[o] < 0:
+        let te = g.pk[pi].t.b[g.odecl[o]]
+        if te > 0: g.otype[o] = type_expr(&g, fs, pi, fi, te)
   if g.pk[pi].target:
     # field types now, while the scopes that declare their names are open
     for f in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
       let te = g.pk[pi].t.b[f]
       if te > 0: type_expr(&g, fs, pi, fi, te)
+      # (an embedded field's name: the type name too, an alias's own, which unused counts as used)
+      if te > 0 and g.pk[pi].t.a[f] < 0:
+        var x = te
+        if g.pk[pi].t.k[x] == ast.N_STAR: x = g.pk[pi].t.a[x]
+        if g.pk[pi].t.k[x] == ast.N_INDEX: x = g.pk[pi].t.a[x]
+        if g.pk[pi].t.k[x] == ast.N_IDENT:
+          let tn = lookup(&g, fs, pi, fi, g.pk[pi].t.names[g.pk[pi].t.s[x]] + "")
+          if tn >= 0: g.pk[pi].etn[x] = tn
   return mk(&g, TY_STRUCT, 0, 0, 0, fields)
 
 fn iface_type(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int) -> Int:
@@ -1603,6 +1641,12 @@ fn iface_type(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int) -> Int:
     else:
       let te = g.pk[pi].t.b[f]
       embs.push(elem_type(&g, fs, pi, fi, te))
+  # (an imported generic interface's methods: typed now, while its type parameters are in scope)
+  if not g.pk[pi].target and g.tp_depth > 0:
+    for o in ms:
+      if g.otype[o] < 0:
+        let te = g.pk[pi].t.b[g.odecl[o]]
+        if te > 0: g.otype[o] = type_expr(&g, fs, pi, fi, te)
   var emb = 0
   if embs.len > 0: emb = tuple_of(&g, embs)
   if g.pk[pi].target:
@@ -2339,6 +2383,10 @@ fn stmt(var g: Prog, fs: Fs, pi: Int, fi: Int, n: Int):
         if nm != "_":
           let top = g.scopes.len - 1
           g.scopes[top][nm] = o
+        if g.pk[pi].t.f[sp] == 1 and g.pk[pi].t.b[sp] < 0:
+          # a local alias: its type in the function's scopes (obj_type would see only the package's)
+          g.otype[o] = 0
+          g.otype[o] = type_expr(&g, fs, pi, fi, g.pk[pi].t.c[sp])
         obj_type(&g, fs, o)
         if g.pk[pi].t.b[sp] >= 0:
           g.scopes.push({})
@@ -2570,6 +2618,8 @@ fn add_target(var g: Prog, fs: Fs, path: Str, dir: Str, srcs: [Str]) -> Int:
 # The same for a package already parsed (its tree moves in; take it back with swap).
 fn add_target_ast(var g: Prog, fs: Fs, path: Str, dir: Str, var t: ast.Ast, roots: [Int]) -> Int:
   g.locals = []
+  g.xtest_of = ""
+  if path.endswith("_test"): g.xtest_of = path[0..path.len - 5]
   g.fmcache = {}
   let pi = g.pk.len
   var p = new_pk(path, dir)

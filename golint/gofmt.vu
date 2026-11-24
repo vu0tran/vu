@@ -1,0 +1,834 @@
+# gofmt as golangci-lint 2.14.0 runs it (github.com/golangci/gofmt, cmd/gofmt of Go 1.27.3): parse,
+# the rewrite rules, ast.SortImports, simplify (-s), print; then the unified diff of
+# rogpeppe/go-internal and golangci-lint's ExtractDiagnosticFromPatch, which turn a file that
+# differs into "File is not properly formatted" changes.
+
+import fparse
+import printer
+import doccmt
+import pkg
+from fparse import FT, IDENT, BASIC, COMPOSITE, SLICE, CALL, STAR, UNARY, KEYVALUE, ARRAYTYPE, MAPTYPE, RANGE, GENDECL, IMPORTSPEC, FILE, GROUP, COMMENT, FIELD, FIELDLIST, BLOCK, FUNCTYPE
+from fparse import npos, nend, llen, at
+from scan import T_AND, K_IMPORT
+
+type Rule:
+  pattern: Str
+  replacement: Str
+
+# The file formatted; err set when it doesn't parse (or a rule doesn't).
+fn format(src: Str, simplify: Bool, rules: [Rule], var err: Str) -> Str:
+  var t = fparse.parse(src, &err)
+  if err.len > 0: return ""
+  for r in rules:
+    var e1 = ""
+    let pat = fparse.parse_expr_into(&t, r.pattern, &e1)
+    if e1.len > 0:
+      err = "parsing pattern {r.pattern}: " + e1
+      return ""
+    let rep = fparse.parse_expr_into(&t, r.replacement, &e1)
+    if e1.len > 0:
+      err = "parsing replacement {r.replacement}: " + e1
+      return ""
+    rewrite_file(&t, pat, rep)
+  sort_imports(&t)
+  if simplify: simplify_file(&t)
+  return printer.fprint(&t)
+
+# ---- match and subst (rewrite.go and simplify's amatch(nil, ...))
+
+fn is_wildcard(s: Str) -> Bool:
+  if s.len == 0: return false
+  var size = 0
+  let r = doccmt.rune_at(s, 0, &size)
+  if size != s.len: return false
+  if r < 128: return r >= 97 and r <= 122
+  return chr(r).is_lower()
+
+fn is_expr_kind(k: Int) -> Bool:
+  return k >= 1 and k <= 23
+
+type Binds:
+  names: [Str]
+  nodes: [Int]
+
+fn bound(b: Binds, name: Str) -> Int:
+  for i in 0..b.names.len:
+    if b.names[i] == name: return b.nodes[i]
+  return -1
+
+# amatch(m, pattern, val) for nodes of t; wild: m != nil
+fn amatch(t: FT, var b: Binds, wild: Bool, pat: Int, val: Int) -> Bool:
+  if wild and pat >= 0 and t.k[pat] == IDENT and is_wildcard(t.s[pat]) and val >= 0 and is_expr_kind(t.k[val]):
+    let old = bound(b, t.s[pat])
+    if old >= 0: return amatch(t, &b, false, old, val)
+    b.names.push(t.s[pat] + "")
+    b.nodes.push(val)
+    return true
+  if pat < 0 or val < 0: return pat < 0 and val < 0
+  let k = t.k[pat]
+  if k != t.k[val]: return false
+  if k == IDENT: return t.s[pat] == t.s[val]
+  if k == CALL and (t.p2[pat] > 0) != (t.p2[val] > 0): return false
+  if t.tok[pat] != t.tok[val] or t.s[pat] != t.s[val]: return false
+  for slot in 0..5:
+    let sp = slot_of(t, pat, slot)
+    let sv = slot_of(t, val, slot)
+    if is_list_slot(k, slot):
+      if sp < 0 or sv < 0:
+        if llen(t, sp) != llen(t, sv): return false
+        continue
+      if t.ls[sp].len != t.ls[sv].len: return false
+      for i in 0..t.ls[sp].len:
+        if not amatch(t, &b, wild, t.ls[sp][i], t.ls[sv][i]): return false
+    elif not amatch(t, &b, wild, sp, sv): return false
+  return true
+
+fn slot_of(t: FT, n: Int, slot: Int) -> Int:
+  if slot == 0: return t.a[n]
+  if slot == 1: return t.b[n]
+  if slot == 2: return t.c[n]
+  if slot == 3: return t.d[n]
+  return t.e[n]
+
+fn set_slot(var t: FT, n: Int, slot: Int, v: Int):
+  if slot == 0: t.a[n] = v
+  elif slot == 1: t.b[n] = v
+  elif slot == 2: t.c[n] = v
+  elif slot == 3: t.d[n] = v
+  else: t.e[n] = v
+
+# whether slot holds a list (in ls) for nodes of kind k
+fn is_list_slot(k: Int, slot: Int) -> Bool:
+  if slot == 0: return k == fparse.FIELDLIST or k == fparse.BLOCK or k == fparse.GROUP or k == fparse.ASSIGN or k == fparse.RETURN or k == fparse.CASE
+  if slot == 1: return k == fparse.COMPOSITE or k == fparse.INDEXLIST or k == fparse.CALL or k == fparse.FIELD or k == fparse.ASSIGN or k == fparse.CASE or k == fparse.COMM or k == fparse.VALUESPEC or k == fparse.GENDECL
+  if slot == 2: return k == fparse.FILE
+  if slot == 3: return k == fparse.VALUESPEC
+  return false
+
+# what a slot accepts: 0 any expression, -1 a statement or declaration or spec (not replaced), or the
+# kind it must be
+fn slot_type(k: Int, slot: Int) -> Int:
+  if k == fparse.SELECTOR and slot == 1: return IDENT
+  if (k == fparse.FUNCLIT and slot == 0) or (k == fparse.FUNCDECL and slot == 3): return FUNCTYPE
+  if (k == fparse.FUNCLIT and slot == 1) or (k == fparse.FUNCDECL and slot == 4): return BLOCK
+  if k == fparse.STRUCTTYPE or k == fparse.IFACETYPE: return FIELDLIST
+  if k == fparse.FUNCTYPE or (k == fparse.FUNCDECL and slot == 1) or (k == fparse.TYPESPEC and slot == 2): return FIELDLIST
+  if (k == fparse.FIELD and slot == 3) or (k == fparse.IMPORTSPEC and slot == 2): return BASIC
+  if (k == fparse.FIELD and (slot == 0 or slot == 4)) or (k == fparse.IMPORTSPEC and (slot == 0 or slot == 3)) or ((k == fparse.VALUESPEC or k == fparse.TYPESPEC) and (slot == 0 or slot == 4)) or ((k == fparse.GENDECL or k == fparse.FUNCDECL or k == fparse.FILE) and slot == 0): return GROUP
+  if k == fparse.FIELD and slot == 1: return IDENT
+  if (k == fparse.LABELED or k == fparse.BRANCH) and slot == 0: return IDENT
+  if (k == fparse.IMPORTSPEC and slot == 1) or (k == fparse.TYPESPEC and slot == 1) or (k == fparse.FUNCDECL and slot == 2) or (k == fparse.FILE and slot == 1) or (k == fparse.VALUESPEC and slot == 1): return IDENT
+  if (k == fparse.GO or k == fparse.DEFER) and slot == 0: return CALL
+  if k == fparse.IF and slot == 2: return BLOCK
+  if (k == fparse.SWITCH or k == fparse.TYPESWITCH) and slot == 2: return BLOCK
+  if (k == fparse.FOR or k == fparse.RANGE) and slot == 3: return BLOCK
+  if k == fparse.SELECT: return BLOCK
+  if k == fparse.DECLSTMT or k == fparse.LABELED or (k == fparse.IF and (slot == 0 or slot == 3)) or ((k == fparse.SWITCH or k == fparse.TYPESWITCH) and slot == 0) or (k == fparse.TYPESWITCH and slot == 1) or (k == fparse.COMM and slot == 0) or (k == fparse.FOR and (slot == 0 or slot == 2)): return -1
+  if k == fparse.BLOCK or (k == fparse.CASE and slot == 1) or (k == fparse.COMM and slot == 1) or k == fparse.FILE or k == fparse.GENDECL or k == fparse.GROUP: return -1
+  return 0
+
+fn accepts(t: FT, parent: Int, slot: Int, x: Int) -> Bool:
+  let st = slot_type(t.k[parent], slot)
+  if st == 0: return is_expr_kind(t.k[x])
+  if st < 0: return false
+  return t.k[x] == st
+
+# subst: a copy of pattern node pat with its valid positions set to pos (0: kept), wildcards
+# replaced by copies of what they matched
+fn subst(var t: FT, b: Binds, wild: Bool, pat: Int, pos: Int) -> Int:
+  if pat < 0: return -1
+  if wild and t.k[pat] == IDENT and is_wildcard(t.s[pat]):
+    let old = bound(b, t.s[pat])
+    if old >= 0: return subst(&t, b, false, old, 0)
+  let n = fparse.node(&t, t.k[pat])
+  t.tok[n] = t.tok[pat]
+  t.s[n] = t.s[pat] + ""
+  t.p0[n] = subst_pos(t.p0[pat], pos)
+  t.p1[n] = subst_pos(t.p1[pat], pos)
+  t.p2[n] = subst_pos(t.p2[pat], pos)
+  let k = t.k[pat]
+  for slot in 0..5:
+    let sp = slot_of(t, pat, slot)
+    if sp < 0: continue
+    if is_list_slot(k, slot):
+      var xs: [Int] = []
+      for i in 0..t.ls[sp].len:
+        let c = t.ls[sp][i]
+        xs.push(subst(&t, b, wild, c, pos))
+      let nl = fparse.newlist(&t, xs)
+      set_slot(&t, n, slot, nl)
+    else:
+      let c = subst(&t, b, wild, sp, pos)
+      set_slot(&t, n, slot, c)
+  return n
+
+fn subst_pos(old: Int, pos: Int) -> Int:
+  if pos <= 0 or old <= 0: return old
+  return pos
+
+# ---- the comment map (ast.NewCommentMap and Filter) for rewrites
+
+fn node_list(t: FT, n: Int, var out: [Int]):
+  let k = t.k[n]
+  if k == GROUP or k == COMMENT: return
+  out.push(n)
+  var kids: [Int] = []
+  printer.children(t, n, &kids)
+  for c in kids: node_list(t, c, &out)
+
+fn is_group_node(k: Int) -> Bool:
+  return k == FILE or k == FIELD or (k >= fparse.BADSTMT and k <= fparse.RANGE) or (k >= fparse.IMPORTSPEC and k <= fparse.FUNCDECL)
+
+# each comment group's node (the group's index in t.comments -> node)
+fn comment_map(t: FT) -> [Int]:
+  var assoc: [Int] = []
+  let ng = t.comments.len
+  if ng == 0: return assoc
+  var cs: [Int] = []
+  for g in t.comments: cs.push(g)
+  cs.sort(by: fn(a, b) => npos(t, a) < npos(t, b))
+  var order: {Int: Int} = {}
+  for i in 0..ng: order[t.comments[i]] = i
+  for _ in 0..ng: assoc.push(-1)
+  var nodes: [Int] = []
+  node_list(t, t.root, &nodes)
+  nodes.push(-1)
+  var ri = 0
+  var cur = cs[0]
+  var rpos = printer.pos_for(t, npos(t, cur))
+  var rend = printer.pos_for(t, nend(t, cur))
+  ri = 1
+  var p = -1
+  var pend = printer.Ps(0, 0, 0)
+  var pg = -1
+  var pgend = printer.Ps(0, 0, 0)
+  var stack: [Int] = []
+  for q in nodes:
+    var qpos = printer.Ps(1073741824, 1073741824, 0)
+    if q >= 0: qpos = printer.pos_for(t, npos(t, q))
+    while rend.off <= qpos.off:
+      # stack.pop(r.comment.Pos())
+      let cp = npos(t, cur)
+      var top = -1
+      var i = stack.len
+      while i > 0 and nend(t, stack[i - 1]) <= cp:
+        top = stack[i - 1]
+        i -= 1
+      stack.truncate(i)
+      if top >= 0:
+        pg = top
+        pgend = printer.pos_for(t, nend(t, pg))
+      var a = -1
+      if pg >= 0 and (pgend.line == rpos.line or (pgend.line + 1 == rpos.line and rend.line + 1 < qpos.line)): a = pg
+      elif p >= 0 and (pend.line == rpos.line or (pend.line + 1 == rpos.line and rend.line + 1 < qpos.line) or q < 0): a = p
+      else: a = q
+      assoc[order[cur]] = a
+      if ri >= ng: return assoc
+      cur = cs[ri]
+      ri += 1
+      rpos = printer.pos_for(t, npos(t, cur))
+      rend = printer.pos_for(t, nend(t, cur))
+    p = q
+    if p >= 0: pend = printer.pos_for(t, nend(t, p))
+    if q >= 0 and is_group_node(t.k[q]):
+      # stack.push(q): pop the nodes that end before q starts
+      let qp = npos(t, q)
+      var i = stack.len
+      while i > 0 and nend(t, stack[i - 1]) <= qp: i -= 1
+      stack.truncate(i)
+      stack.push(q)
+  return assoc
+
+fn reach(t: FT, n: Int, var seen: {Int: Bool}):
+  seen[n] = true
+  var kids: [Int] = []
+  printer.children(t, n, &kids)
+  for c in kids: reach(t, c, &seen)
+
+# rewriteFile: every match of pat (bottom up) replaced by rep, then the comments of the nodes that
+# are gone dropped
+fn rewrite_file(var t: FT, pat: Int, rep: Int):
+  var b = Binds([], [])
+  if not any_match(t, &b, t.root, pat): return
+  let assoc = comment_map(t)
+  rewrite_node(&t, t.root, pat, rep)
+  var seen: {Int: Bool} = {}
+  reach(t, t.root, &seen)
+  var keep: [Int] = []
+  for i in 0..t.comments.len:
+    let a = assoc[i]
+    if a >= 0 and a in seen: keep.push(t.comments[i])
+  keep.sort(by: fn(x, y) => npos(t, x) < npos(t, y))
+  t.comments = keep
+
+fn any_match(t: FT, var b: Binds, n: Int, pat: Int) -> Bool:
+  b.names = []
+  b.nodes = []
+  if amatch(t, &b, true, pat, n): return true
+  var kids: [Int] = []
+  printer.children(t, n, &kids)
+  for c in kids:
+    if any_match(t, &b, c, pat): return true
+  return false
+
+fn rewrite_node(var t: FT, n: Int, pat: Int, rep: Int):
+  let k = t.k[n]
+  for slot in 0..5:
+    let s = slot_of(t, n, slot)
+    if s < 0: continue
+    if is_list_slot(k, slot):
+      for i in 0..t.ls[s].len:
+        let c = t.ls[s][i]
+        let r = rewrite_val(&t, c, pat, rep)
+        if r != c and accepts(t, n, slot, r): t.ls[s][i] = r
+    else:
+      let r = rewrite_val(&t, s, pat, rep)
+      if r != s and accepts(t, n, slot, r): set_slot(&t, n, slot, r)
+
+fn rewrite_val(var t: FT, n: Int, pat: Int, rep: Int) -> Int:
+  rewrite_node(&t, n, pat, rep)
+  var b = Binds([], [])
+  if amatch(t, &b, true, pat, n): return subst(&t, b, true, rep, npos(t, n))
+  return n
+
+# ---- ast.SortImports
+
+fn unquote_path(v: Str) -> Str:
+  var ok = false
+  let s = printer.go_unquote(v, &ok)
+  if not ok: return ""
+  return s
+
+fn import_name(t: FT, s: Int) -> Str:
+  if t.b[s] < 0: return ""
+  return t.s[t.b[s]]
+
+fn group_text(t: FT, g: Int) -> Str:
+  if g < 0: return ""
+  var lines: [Str] = []
+  let l = t.a[g]
+  for i in 0..llen(t, l):
+    var c = t.s[at(t, l, i)]
+    if c[1] == '/':
+      c = c[2..c.len]
+      if c.len > 0 and c[0] == ' ': c = c[1..c.len]
+      elif c.len > 0 and doccmt.is_directive(c): continue
+    else: c = c[2..c.len - 2]
+    for ln in c.split("\n"): lines.push(ln.rstrip(" \t\n\r"))
+  var out: [Str] = []
+  for ln in lines:
+    if ln != "" or (out.len > 0 and out[out.len - 1] != ""): out.push(ln)
+  if out.len > 0 and out[out.len - 1] != "": out.push("")
+  return "\n".join(out)
+
+fn line_at(t: FT, pos: Int) -> Int:
+  return printer.line_for(t, pos)
+
+fn merge_line(var t: FT, line: Int):
+  t.lmap = []
+  if line < 1 or line >= t.lines.len: return
+  var nl: [Int] = []
+  for i in 0..t.lines.len:
+    if i != line: nl.push(t.lines[i])
+  t.lines = nl
+
+fn spec_less(t: FT, a: Int, b: Int) -> Bool:
+  let pa = unquote_path(t.s[t.c[a]])
+  let pb = unquote_path(t.s[t.c[b]])
+  if pa != pb: return pa < pb
+  let na = import_name(t, a)
+  let nb = import_name(t, b)
+  if na != nb: return na < nb
+  return group_text(t, t.d[a]) < group_text(t, t.d[b])
+
+fn sort_specs(var t: FT, d: Int, specs0: [Int]) -> [Int]:
+  var specs: [Int] = []
+  for s in specs0: specs.push(s)
+  if specs.len <= 1: return specs
+  var ps: [Int] = []
+  var pe: [Int] = []
+  for s in specs:
+    ps.push(npos(t, s))
+    pe.push(nend(t, s))
+  let beg_specs = ps[0]
+  let end_specs = pe[pe.len - 1]
+  let beg = t.lines[line_at(t, beg_specs) - 1] + 1
+  let end_line = line_at(t, end_specs)
+  var end = 0
+  if end_line == t.lines.len: end = end_specs
+  else: end = t.lines[end_line] + 1
+  var first = t.comments.len
+  var last = -1
+  for i in 0..t.comments.len:
+    let g = t.comments[i]
+    if nend(t, g) >= end: break
+    if beg <= npos(t, g):
+      if i < first: first = i
+      if i > last: last = i
+  # each comment's spec and side (comments_of[spec index] lists group index * 2 + left)
+  var cspec: [Int] = []
+  var cleft: [Bool] = []
+  var cgroup: [Int] = []
+  if last >= 0:
+    var si = 0
+    for gi in first..last + 1:
+      let g = t.comments[gi]
+      let gp = npos(t, g)
+      while si + 1 < specs.len and ps[si + 1] <= gp: si += 1
+      var left = false
+      if si == 0 and ps[si] > gp: left = true
+      elif si + 1 < specs.len and line_at(t, ps[si]) + 1 == line_at(t, gp):
+        si += 1
+        left = true
+      cspec.push(specs[si])
+      cleft.push(left)
+      cgroup.push(g)
+  specs.sort(by: fn(a, b) => spec_less(t, a, b))
+  var dedup: [Int] = []
+  for i in 0..specs.len:
+    let s = specs[i]
+    if i == specs.len - 1 or not collapse(t, s, specs[i + 1]): dedup.push(s)
+    else:
+      let p = npos(t, s)
+      let l = line_at(t, p)
+      if l != line_at(t, t.p2[d]): merge_line(&t, l)
+  for i in 0..dedup.len:
+    let s = dedup[i]
+    if t.b[s] >= 0: t.p0[t.b[s]] = ps[i]
+    let path = t.c[s]
+    let ln = nend(t, path) - npos(t, path)
+    t.p0[path] = ps[i]
+    if t.p1[path] > 0: t.p1[path] = ps[i] + ln
+    t.p0[s] = pe[i]
+    for j in 0..cspec.len:
+      if cspec[j] != s: continue
+      let gl = t.a[cgroup[j]]
+      for q in 0..llen(t, gl):
+        let c = at(t, gl, q)
+        if cleft[j]: t.p0[c] = ps[i] - 1
+        else: t.p0[c] = pe[i]
+  if last >= 0:
+    var part: [Int] = []
+    for gi in first..last + 1: part.push(t.comments[gi])
+    part.sort(by: fn(a, b) => npos(t, a) < npos(t, b))
+    for gi in first..last + 1: t.comments[gi] = part[gi - first]
+  return dedup
+
+fn collapse(t: FT, prev: Int, next: Int) -> Bool:
+  if unquote_path(t.s[t.c[next]]) != unquote_path(t.s[t.c[prev]]) or import_name(t, next) != import_name(t, prev): return false
+  return t.d[prev] < 0
+
+fn sort_imports(var t: FT):
+  let decls = t.c[t.root]
+  for di in 0..llen(t, decls):
+    let d = at(t, decls, di)
+    if t.k[d] != GENDECL or t.tok[d] != K_IMPORT: break
+    if t.p1[d] == 0: continue
+    let sl = t.b[d]
+    var cur: [Int] = []
+    for s in t.ls[sl]: cur.push(s)
+    var specs: [Int] = []
+    var i = 0
+    for j in 0..cur.len:
+      if j > i and line_at(t, npos(t, cur[j])) > 1 + line_at(t, nend(t, cur[j - 1])):
+        var part: [Int] = []
+        for q in i..j: part.push(cur[q])
+        for s in sort_specs(&t, d, part): specs.push(s)
+        i = j
+    var part: [Int] = []
+    for q in i..cur.len: part.push(cur[q])
+    for s in sort_specs(&t, d, part): specs.push(s)
+    let nspec = specs.len
+    var last_spec = -1
+    if nspec > 0: last_spec = specs[nspec - 1]
+    t.ls[sl] = specs
+    if nspec > 0:
+      let last_line = line_at(t, npos(t, last_spec))
+      var rline = line_at(t, t.p2[d])
+      while rline > last_line + 1:
+        rline -= 1
+        merge_line(&t, rline)
+
+# ---- simplify.go
+
+fn is_blank_ident(t: FT, x: Int) -> Bool:
+  return x >= 0 and t.k[x] == IDENT and t.s[x] == "_"
+
+fn simplify_file(var t: FT):
+  # removeEmptyDeclGroups
+  let decls = t.c[t.root]
+  var keep: [Int] = []
+  for d in t.ls[decls]:
+    if t.k[d] == GENDECL and t.a[d] < 0 and llen(t, t.b[d]) == 0:
+      let gp = npos(t, d)
+      let ge = nend(t, d)
+      var has = false
+      for g in t.comments:
+        if gp <= npos(t, g) and nend(t, g) <= ge: has = true
+      if not has: continue
+    keep.push(d)
+  t.ls[decls] = keep
+  simp(&t, t.root)
+
+fn simp(var t: FT, n: Int):
+  if n < 0: return
+  let k = t.k[n]
+  if k == COMPOSITE:
+    let typ = t.a[n]
+    var key_type = -1
+    var elt_type = -1
+    if typ >= 0 and t.k[typ] == ARRAYTYPE: elt_type = t.b[typ]
+    elif typ >= 0 and t.k[typ] == MAPTYPE:
+      key_type = t.a[typ]
+      elt_type = t.b[typ]
+    if elt_type >= 0:
+      let el = t.b[n]
+      for i in 0..llen(t, el):
+        let x = at(t, el, i)
+        if t.k[x] == KEYVALUE:
+          if key_type >= 0:
+            let nk = simplify_literal(&t, key_type, t.a[x])
+            t.a[x] = nk
+          let nv = simplify_literal(&t, elt_type, t.b[x])
+          t.b[x] = nv
+        else:
+          let nx = simplify_literal(&t, elt_type, x)
+          t.ls[el][i] = nx
+      return
+  elif k == SLICE:
+    if t.d[n] < 0:
+      let s = t.a[n]
+      let call = t.c[n]
+      if t.k[s] == IDENT and call >= 0 and t.k[call] == CALL and llen(t, t.b[call]) == 1 and t.p2[call] == 0:
+        let fun = t.a[call]
+        let arg = at(t, t.b[call], 0)
+        if t.k[fun] == IDENT and t.s[fun] == "len" and t.k[arg] == IDENT and t.s[arg] == t.s[s]: t.c[n] = -1
+  elif k == RANGE:
+    if is_blank_ident(t, t.b[n]): t.b[n] = -1
+    if is_blank_ident(t, t.a[n]) and t.b[n] < 0: t.a[n] = -1
+  var kids: [Int] = []
+  printer.children(t, n, &kids)
+  for c in kids: simp(&t, c)
+
+# simplifyLiteral: x (simplified) or what replaces it
+fn simplify_literal(var t: FT, ast_type: Int, x: Int) -> Int:
+  simp(&t, x)
+  var b = Binds([], [])
+  if t.k[x] == COMPOSITE:
+    if amatch(t, &b, false, ast_type, t.a[x]): t.a[x] = -1
+  if t.k[ast_type] == STAR and t.k[x] == UNARY and t.tok[x] == T_AND:
+    let inner = t.a[x]
+    if t.k[inner] == COMPOSITE and amatch(t, &b, false, t.a[ast_type], t.a[inner]):
+      t.a[inner] = -1
+      return inner
+  return x
+
+# ---- the diff (rogpeppe/go-internal/diff) and golangci-lint's changes
+
+fn split_lines(x: Str) -> [Str]:
+  var l: [Str] = []
+  var i = 0
+  while i < x.len:
+    var j = x.find("\n", i)
+    if j < 0:
+      l.push(x[i..x.len] + "\n\\ No newline at end of file\n")
+      return l
+    l.push(x[i..j + 1])
+    i = j + 1
+  return l
+
+# tgs: the anchors (pairs as x, y)
+fn tgs(x: [Str], y: [Str]) -> [Int]:
+  var m: {Str: Int} = {}
+  for s in x:
+    let c = m.get(s, 0)
+    if c > -2: m[s] = c - 1
+  for s in y:
+    let c = m.get(s, 0)
+    if c > -8: m[s] = c - 4
+  var xi: [Int] = []
+  var yi: [Int] = []
+  var inv: [Int] = []
+  for i in 0..y.len:
+    let s = y[i]
+    if m.get(s, 0) == -5:
+      m[s] = yi.len
+      yi.push(i)
+  for i in 0..x.len:
+    let s = x[i]
+    if s in m:
+      let j = m[s]
+      if j >= 0:
+        xi.push(i)
+        inv.push(j)
+  let n = xi.len
+  var tt: [Int] = []
+  var ll: [Int] = []
+  for _ in 0..n:
+    tt.push(n + 1)
+    ll.push(0)
+  for i in 0..n:
+    # sort.Search(n, T[k] >= J[i])
+    var lo = 0
+    var hi = n
+    while lo < hi:
+      let h = (lo + hi) / 2
+      if tt[h] >= inv[i]: hi = h
+      else: lo = h + 1
+    tt[lo] = inv[i]
+    ll[i] = lo + 1
+  var k = 0
+  for v in ll:
+    if k < v: k = v
+  var seq: [Int] = []
+  for _ in 0..2 * (2 + k): seq.push(0)
+  seq[2 * (1 + k)] = x.len
+  seq[2 * (1 + k) + 1] = y.len
+  var lastj = n
+  var i = n - 1
+  while i >= 0:
+    if ll[i] == k and inv[i] < lastj:
+      seq[2 * k] = xi[i]
+      seq[2 * k + 1] = yi[inv[i]]
+      k -= 1
+    i -= 1
+  return seq
+
+# diff.Diff's hunks: each "@@ -a,b +c,d @@" header, then its lines
+fn diff(old: Str, new: Str) -> Str:
+  if old == new: return ""
+  let x = split_lines(old)
+  let y = split_lines(new)
+  var out = ""
+  var done_x = 0
+  var done_y = 0
+  var chunk_x = 0
+  var chunk_y = 0
+  var count_x = 0
+  var count_y = 0
+  var ctext: [Str] = []
+  let seq = tgs(x, y)
+  var q = 0
+  while q < seq.len:
+    let mx = seq[q]
+    let my = seq[q + 1]
+    q += 2
+    if mx < done_x: continue
+    var sx = mx
+    var sy = my
+    while sx > done_x and sy > done_y and x[sx - 1] == y[sy - 1]:
+      sx -= 1
+      sy -= 1
+    var ex = mx
+    var ey = my
+    while ex < x.len and ey < y.len and x[ex] == y[ey]:
+      ex += 1
+      ey += 1
+    for s in x[done_x..sx]:
+      ctext.push("-" + s)
+      count_x += 1
+    for s in y[done_y..sy]:
+      ctext.push("+" + s)
+      count_y += 1
+    let C = 3
+    if (ex < x.len or ey < y.len) and (ex - sx < C or (ctext.len > 0 and ex - sx < 2 * C)):
+      for s in x[sx..ex]:
+        ctext.push(" " + s)
+        count_x += 1
+        count_y += 1
+      done_x = ex
+      done_y = ey
+      continue
+    if ctext.len > 0:
+      var nn = ex - sx
+      if nn > C: nn = C
+      for s in x[sx..sx + nn]:
+        ctext.push(" " + s)
+        count_x += 1
+        count_y += 1
+      done_x = sx + nn
+      done_y = sy + nn
+      if count_x > 0: chunk_x += 1
+      if count_y > 0: chunk_y += 1
+      out += "@@ -{chunk_x},{count_x} +{chunk_y},{count_y} @@\n"
+      for s in ctext: out += s
+      count_x = 0
+      count_y = 0
+      ctext = []
+    if ex >= x.len and ey >= y.len: break
+    chunk_x = ex - C
+    chunk_y = ey - C
+    for s in x[chunk_x..ex]:
+      ctext.push(" " + s)
+      count_x += 1
+      count_y += 1
+    done_x = ex
+    done_y = ey
+  return out
+
+type Change:
+  from: Int
+  to: Int
+  lines: [Str]
+
+# sourcegraph/go-diff's hunks (OrigStartLine, the body, OrigNoNewlineAt), then golangci-lint's
+# hunkChangesParser over each
+fn changes_of(patch: Str) -> [Change]:
+  var out: [Change] = []
+  var lines = patch.split("\n")
+  if lines.len > 0 and lines[lines.len - 1] == "": lines.pop()
+  var i = 0
+  while i < lines.len:
+    let h = lines[i]
+    if not h.startswith("@@ -"):
+      i += 1
+      continue
+    let comma = h.find(",")
+    let start = int(h[4..comma]) else 0
+    i += 1
+    var body: [Str] = []
+    var no_nl = 0
+    var last_orig = true
+    while i < lines.len and not lines[i].startswith("@@ -"):
+      let line = lines[i]
+      i += 1
+      if line == "\\ No newline at end of file":
+        if last_orig: no_nl = body.len + 1
+        else:
+          # (the newline of the body's last line is dropped: that line joins the next one)
+          if body.len > 0:
+            let lb = body.pop()
+            if i < lines.len and not lines[i].startswith("@@ -"):
+              let nxt = lines[i]
+              i += 1
+              body.push(lb + nxt)
+              if nxt.len > 0: last_orig = nxt[0] == '-'
+            else: body.push(lb + "\0")
+        continue
+      if line.len > 0: last_orig = line[0] == '-'
+      body.push(line)
+    hunk_changes(start, body, no_nl, &out)
+  return out
+
+fn hunk_changes(start: Int, body: [Str], no_nl: Int, var out: [Change]):
+  # parseDiffLines: kind 0 original, 1 deleted, 2 added
+  var kinds: [Int] = []
+  var nums: [Int] = []
+  var datas: [Str] = []
+  var cur = start
+  for b0 in body:
+    var b = b0
+    var tail = false
+    if b.endswith("\0"):
+      b = b[0..b.len - 1]
+      tail = true
+    if b.startswith("-"):
+      kinds.push(1)
+      datas.push(b[1..b.len])
+      nums.push(cur)
+      cur += 1
+    elif b.startswith("+"):
+      kinds.push(2)
+      datas.push(b[1..b.len])
+      nums.push(cur)
+    else:
+      kinds.push(0)
+      if b.startswith(" "): datas.push(b[1..b.len])
+      else: datas.push(b)
+      nums.push(cur)
+      cur += 1
+  if no_nl > 0:
+    kinds.push(2)
+    datas.push("")
+    nums.push(cur + 1)
+  var have_last = false
+  var last_num = 0
+  var last_data = ""
+  var prepend: [Str] = []
+  var i = 0
+  let n = kinds.len
+  var res: [Change] = []
+  while i < n:
+    if kinds[i] == 0:
+      if prepend.len == 0:
+        have_last = true
+        last_num = nums[i]
+        last_data = datas[i] + ""
+        i += 1
+        continue
+      let ln = nums[i]
+      let ld = datas[i] + ""
+      i += 1
+      var nl: [Str] = []
+      for s in prepend: nl.push(s + "")
+      nl.push(ld + "")
+      while i < n and kinds[i] == 2:
+        nl.push(datas[i] + "")
+        i += 1
+      res.push(Change(ln, ln, nl))
+      prepend = []
+      have_last = true
+      last_num = ln
+      last_data = ld
+      continue
+    var dfrom = -1
+    var dto = -1
+    while i < n and kinds[i] == 1:
+      if dfrom < 0: dfrom = nums[i]
+      dto = nums[i]
+      i += 1
+    var added: [Str] = []
+    while i < n and kinds[i] == 2:
+      added.push(datas[i] + "")
+      i += 1
+    if dfrom >= 0:
+      var nl: [Str] = []
+      if added.len > 0:
+        for s in prepend: nl.push(s + "")
+        for s in added: nl.push(s + "")
+        prepend = []
+      elif prepend.len > 0:
+        for s in prepend: nl.push(s + "")
+        prepend = []
+      res.push(Change(dfrom, dto, nl))
+      continue
+    if not have_last:
+      prepend = added
+      continue
+    var nl: [Str] = []
+    for s in prepend: nl.push(s + "")
+    nl.push(last_data + "")
+    for s in added: nl.push(s + "")
+    res.push(Change(last_num, last_num, nl))
+    prepend = []
+  if prepend.len > 0: return
+  for c in res:
+    var ls: [Str] = []
+    for l in c.lines: ls.push(l + "")
+    out.push(Change(c.from, c.to, ls))
+
+# ---- golangci-lint's issues
+
+# The file's issues (one per change, golangci-lint keeps the first) appended to out; an error
+# when gofmt fails on it.
+fn file_issues(src: Str, fi: Int, simplify: Bool, rules: [Rule], var out: [pkg.Issue]) -> Str:
+  var err = ""
+  let res = format(src, simplify, rules, &err)
+  if err.len > 0: return err
+  if res == src: return ""
+  let chs = changes_of(diff(src, res))
+  # token.File's lines (none starting at the end)
+  var starts: [Int] = [0]
+  for i in 0..src.len:
+    if src[i] == '\n' and i + 1 < src.len: starts.push(i + 1)
+  let lc = starts.len
+  for c in chs:
+    var from = c.from
+    if from > lc: from = lc
+    if from < 1: from = 1
+    let start = starts[from - 1]
+    var endo = src.len
+    if c.to < lc: endo = starts[c.to] - 1
+    let fix = ",\"SuggestedFixes\":[{{\"Message\":\"\",\"TextEdits\":[{{\"Pos\":{start},\"End\":{endo},\"NewText\":\"" + b64encode("\n".join(c.lines)) + "\"}}]}}]"
+    out.push(pkg.Issue(fi, start, "gofmt", "File is not properly formatted", 0, -1, "", false, fix))
+  return ""

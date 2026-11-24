@@ -65,7 +65,7 @@ case "$tool" in
     set -e
     diff "$fx/vgolint.expected" "$tmp/out" || { cat "$tmp/err" >&2; fail "output differs"; }
     [ "$rc" = 1 ] || { cat "$tmp/err" >&2; fail "exit code $rc, want 1 (issues found)"; }
-    "$bin" version | grep -q '^golangci-lint has version 2\.5\.0 built with vgolint' || fail "version: $("$bin" version)"
+    "$bin" version | grep -q '^golangci-lint has version 2\.14\.0 built with vgolint' || fail "version: $("$bin" version)"
     ;;
   vsc)
     cp -R "$fx/vsc" "$tmp/p"

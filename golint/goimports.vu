@@ -1,0 +1,639 @@
+# goimports as golangci-lint 2.14.0 runs it: golang.org/x/tools v0.50.0's imports.Process with the
+# default options (comments, tab indent, tab width 8, imports fixed) and LocalPrefix from the
+# local-prefixes setting. Process parses the file, fixes its imports (fix.go), merges the import
+# declarations into the first one, sorts them in runs by group (standard library, third party,
+# appengine, local) and path, removes duplicates (sortimports.go), prints it, puts a blank line
+# between groups (addImportSpaces) and formats the result again as format.Source does (gofmt
+# without -s). A file that differs becomes issues as gofmt's do.
+#
+# fix.go for code that compiles (the packages golangci-lint lints): every import is used, so none
+# is removed and none added; an unnamed import whose package name isn't the name goimports assumes
+# from its path (ImportPathToAssumedName) leaves a reference missing in the first two passes, so the
+# third one loads the real names and gives each such import its name (SetImportName).
+
+import fparse
+import printer
+import gofmt
+import doccmt
+import pkg
+from fparse import FT, GENDECL, IMPORTSPEC, IDENT, npos, nend, llen, at
+from scan import K_IMPORT
+
+# The file as goimports formats it; err set when it doesn't parse. names: the package name of each
+# import path (from the type checker), for fix.go's third pass.
+fn process(src: Str, local: Str, names: {Str: Str}, var err: Str) -> Str:
+  var t = fparse.parse(src, &err)
+  if err.len > 0: return ""
+  set_import_names(&t, names)
+  merge_imports(&t)
+  sort_imports(&t, local)
+  let breaks = spaces_before(t, local)
+  var out = printer.fprint(&t)
+  if breaks.len > 0: out = add_import_spaces(out, breaks)
+  var e2 = ""
+  let res = gofmt.format(out, false, [], &e2)
+  if e2.len > 0:
+    err = e2
+    return ""
+  return res
+
+# ---- fix.go
+
+# importToGroup's numbers: 0 standard library, 1 a first element with a dot, 2 appengine, 3 local
+fn import_group(local: Str, path: Str) -> Int:
+  if local.len > 0:
+    for p in local.split(","):
+      var q = p + ""
+      if q.endswith("/"): q = q[0..q.len - 1]
+      if path.startswith(p) or q == path: return 3
+  if path.startswith("appengine"): return 2
+  var first = path + ""
+  let sl = path.find("/")
+  if sl >= 0: first = path[0..sl]
+  if first.find(".") >= 0: return 1
+  return 0
+
+# path.Base and path.Dir (of clean slash-separated paths, as import paths are)
+fn path_base(p0: Str) -> Str:
+  if p0.len == 0: return "."
+  var p = p0 + ""
+  while p.len > 0 and p[p.len - 1] == '/': p = p[0..p.len - 1]
+  var j = p.len - 1
+  while j >= 0 and p[j] != '/': j -= 1
+  p = p[j + 1..p.len]
+  if p.len == 0: return "/"
+  return p
+
+fn path_dir(p: Str) -> Str:
+  var j = p.len - 1
+  while j >= 0 and p[j] != '/': j -= 1
+  var d = p[0..j + 1]
+  while d.len > 1 and d[d.len - 1] == '/': d = d[0..d.len - 1]
+  if d.len == 0: return "."
+  return d
+
+# whether strconv.Atoi accepts s
+fn atoi_ok(s: Str) -> Bool:
+  var i = 0
+  if s.len > 0 and (s[0] == '+' or s[0] == '-'): i = 1
+  if i >= s.len or s.len - i > 19: return false
+  for k in i..s.len:
+    if s[k] < '0' or s[k] > '9': return false
+  return true
+
+fn not_identifier(r: Int) -> Bool:
+  if (r >= 97 and r <= 122) or (r >= 65 and r <= 90) or (r >= 48 and r <= 57) or r == 95: return false
+  if r < 128: return true
+  return not (doccmt.is_letter(r) or doccmt.is_digit(r))
+
+fn assumed_name(path: Str) -> Str:
+  var base = path_base(path)
+  if base.startswith("v") and atoi_ok(base[1..base.len]):
+    let dir = path_dir(path)
+    if dir != ".": base = path_base(dir)
+  if base.startswith("go-"): base = base[3..base.len]
+  var i = 0
+  while i < base.len:
+    var size = 0
+    let r = doccmt.rune_at(base, i, &size)
+    if not_identifier(r): return base[0..i]
+    i += size
+  return base
+
+fn without_version(nm: Str) -> Str:
+  let v = path_base(nm)
+  if v.len > 0 and v[0] == 'v' and atoi_ok(v[1..v.len]) and v.len < nm.len:
+    return path_base(nm[0..nm.len - v.len - 1])
+  return nm
+
+# strings.Trim(s, `"`)
+fn trim_quotes(s: Str) -> Str:
+  var a = 0
+  var b = s.len
+  while a < b and s[a] == '"': a += 1
+  while b > a and s[b - 1] == '"': b -= 1
+  return s[a..b]
+
+# every import spec of the file (f.Imports)
+fn file_imports(t: FT) -> [Int]:
+  var out: [Int] = []
+  let dl = t.c[t.root]
+  for di in 0..llen(t, dl):
+    let d = at(t, dl, di)
+    if t.k[d] != GENDECL or t.tok[d] != K_IMPORT: continue
+    for i in 0..llen(t, t.b[d]): out.push(at(t, t.b[d], i))
+  return out
+
+# The third pass's SetImportName fixes, in sortFixes' order, applied.
+fn set_import_names(var t: FT, names: {Str: Str}):
+  if names.len == 0: return
+  let imps = file_imports(t)
+  var fix_path: [Str] = []
+  var fix_name: [Str] = []
+  for s in imps:
+    if t.b[s] >= 0: continue
+    let lit = t.s[t.c[s]]
+    if lit == "\"C\"": continue
+    let path = trim_quotes(lit)
+    if not (path in names) or names[path].len == 0: continue
+    let ident = without_version(names[path])
+    if ident == assumed_name(path): continue
+    var dup = false
+    for i in 0..fix_path.len:
+      if fix_path[i] == path and fix_name[i] == ident: dup = true
+    if dup: continue
+    fix_path.push(path)
+    fix_name.push(ident)
+  var ord: [Int] = []
+  for i in 0..fix_path.len: ord.push(i)
+  ord.sort(by: fn(a, b) => fix_path[a] < fix_path[b] or (fix_path[a] == fix_path[b] and fix_name[a] < fix_name[b]))
+  for i in ord:
+    for s in imps:
+      if trim_quotes(t.s[t.c[s]]) == fix_path[i]:
+        t.b[s] = fparse.ident_at(&t, npos(t, s), fix_name[i] + "")
+
+# ---- sortimports.go
+
+fn shift_lit(var t: FT, lit: Int, pos: Int):
+  # updateBasicLitPos: End moves by as much as Pos
+  let d = pos - t.p0[lit]
+  t.p0[lit] = pos
+  if t.p1[lit] > 0: t.p1[lit] = t.p1[lit] + d
+
+fn spec_path(t: FT, s: Int) -> Str:
+  return gofmt.unquote_path(t.s[t.c[s]])
+
+# mergeImports: every import declaration but those importing "C" into the first one
+fn merge_imports(var t: FT):
+  let dl = t.c[t.root]
+  if llen(t, dl) <= 1: return
+  var first = -1
+  var i = 0
+  while i < t.ls[dl].len:
+    let d = t.ls[dl][i]
+    var skip = t.k[d] != GENDECL or t.tok[d] != K_IMPORT
+    if not skip:
+      for q in 0..llen(t, t.b[d]):
+        if spec_path(t, at(t, t.b[d], q)) == "C": skip = true
+    if skip:
+      i += 1
+      continue
+    if first < 0:
+      first = d
+      i += 1
+      continue
+    t.p1[first] = npos(t, first)
+    var moved: [Int] = []
+    for q in 0..llen(t, t.b[d]): moved.push(at(t, t.b[d], q))
+    if t.b[first] < 0: t.b[first] = fparse.newlist(&t, [])
+    let fl = t.b[first]
+    for s in moved:
+      shift_lit(&t, t.c[s], npos(t, first))
+      t.ls[fl].push(s)
+    var rest: [Int] = []
+    for q in 0..t.ls[dl].len:
+      if q != i: rest.push(t.ls[dl][q])
+    t.ls[dl] = rest
+
+fn line_at(t: FT, pos: Int) -> Int:
+  return printer.line_for(t, pos)
+
+fn spec_comment(t: FT, s: Int) -> Str:
+  return gofmt.group_text(t, t.d[s])
+
+fn spec_less(t: FT, local: Str, a: Int, b: Int) -> Bool:
+  let pa = spec_path(t, a)
+  let pb = spec_path(t, b)
+  let ga = import_group(local, pa)
+  let gb = import_group(local, pb)
+  if ga != gb: return ga < gb
+  if pa != pb: return pa < pb
+  let na = gofmt.import_name(t, a)
+  let nb = gofmt.import_name(t, b)
+  if na != nb: return na < nb
+  return spec_comment(t, a) < spec_comment(t, b)
+
+fn sort_imports(var t: FT, local: Str):
+  let dl = t.c[t.root]
+  # (the range's array: slices.Delete shifts it under the loop and zeroes its last element)
+  var decls: [Int] = []
+  for x in t.ls[dl]: decls.push(x)
+  var n = decls.len
+  var i = 0
+  while i < decls.len:
+    let d = decls[i]
+    if d < 0 or t.k[d] != GENDECL or t.tok[d] != K_IMPORT: break
+    if llen(t, t.b[d]) == 0:
+      for q in i..n - 1: decls[q] = decls[q + 1]
+      decls[n - 1] = -1
+      n -= 1
+    if t.p1[d] == 0:
+      i += 1
+      continue
+    let sl = t.b[d]
+    var cur: [Int] = []
+    for q in 0..llen(t, sl): cur.push(at(t, sl, q))
+    var specs: [Int] = []
+    var st = 0
+    for j in 0..cur.len:
+      if j > st and line_at(t, npos(t, cur[j])) > 1 + line_at(t, nend(t, cur[j - 1])):
+        var part: [Int] = []
+        for q in st..j: part.push(cur[q])
+        for s in sort_specs(&t, local, part): specs.push(s)
+        st = j
+    var part: [Int] = []
+    for q in st..cur.len: part.push(cur[q])
+    for s in sort_specs(&t, local, part): specs.push(s)
+    var last_spec = -1
+    if specs.len > 0: last_spec = specs[specs.len - 1]
+    if sl >= 0: t.ls[sl] = specs
+    if last_spec >= 0:
+      let last_line = line_at(t, npos(t, last_spec))
+      let rline = line_at(t, t.p2[d])
+      if rline > last_line + 1: gofmt.merge_line(&t, rline - 1)
+    i += 1
+  var nd: [Int] = []
+  for q in 0..n: nd.push(decls[q])
+  t.ls[dl] = nd
+
+fn sort_specs(var t: FT, local: Str, specs0: [Int]) -> [Int]:
+  var specs: [Int] = []
+  for s in specs0: specs.push(s)
+  if specs.len <= 1: return specs
+  var ps: [Int] = []
+  var pe: [Int] = []
+  for s in specs:
+    ps.push(npos(t, s))
+    pe.push(nend(t, s))
+  let last_line = line_at(t, pe[pe.len - 1])
+  var cstart = t.comments.len
+  var cend = t.comments.len
+  for i in 0..t.comments.len:
+    let g = t.comments[i]
+    if npos(t, g) < ps[0]: continue
+    if i < cstart: cstart = i
+    if line_at(t, nend(t, g)) > last_line:
+      cend = i
+      break
+  # each comment to the spec before it
+  var cspec: [Int] = []
+  var si = 0
+  for ci in cstart..cend:
+    let g = t.comments[ci]
+    while si + 1 < specs.len and ps[si + 1] <= npos(t, g): si += 1
+    cspec.push(specs[si])
+  pdq_sort(&specs, fn(a, b) => spec_less(t, local, a, b))
+  var dedup: [Int] = []
+  for i in 0..specs.len:
+    let s = specs[i]
+    if i == specs.len - 1 or not gofmt.collapse(t, s, specs[i + 1]): dedup.push(s)
+    else: gofmt.merge_line(&t, line_at(t, npos(t, s)))
+  for i in 0..dedup.len:
+    let s = dedup[i]
+    if t.b[s] >= 0: t.p0[t.b[s]] = ps[i]
+    shift_lit(&t, t.c[s], ps[i])
+    t.p0[s] = pe[i]
+    var next = pe[i]
+    for j in 0..cspec.len:
+      if cspec[j] != s: continue
+      let gl = t.a[t.comments[cstart + j]]
+      for q in 0..llen(t, gl):
+        let c = at(t, gl, q)
+        t.p0[c] = pe[i]
+        next = nend(t, c)
+    if i < dedup.len - 1:
+      ps[i + 1] = next
+      pe[i + 1] = next
+  if cend > cstart:
+    var part: [Int] = []
+    for gi in cstart..cend: part.push(t.comments[gi])
+    pdq_sort(&part, fn(a, b) => npos(t, a) < npos(t, b))
+    for gi in cstart..cend: t.comments[gi] = part[gi - cstart]
+  # (blank lines between the specs merged away: each spec onto the first spec's line)
+  let first_line = line_at(t, npos(t, dedup[0]))
+  for k in 1..dedup.len:
+    let line = line_at(t, npos(t, dedup[k]))
+    var prev = line - 1
+    while prev >= first_line:
+      if prev > 0 and prev < t.lines.len:
+        gofmt.merge_line(&t, prev)
+        prev -= 1
+      else: break
+  return dedup
+
+# ---- imports.go: the blank lines between groups
+
+# astutil.Imports' sections; a blank line before each path whose group differs from the one before
+fn spaces_before(t: FT, local: Str) -> [Str]:
+  var out: [Str] = []
+  let dl = t.c[t.root]
+  for di in 0..llen(t, dl):
+    let d = at(t, dl, di)
+    if t.k[d] != GENDECL or t.tok[d] != K_IMPORT: break
+    var last_line = 0
+    var last_group = -1
+    for q in 0..llen(t, t.b[d]):
+      let s = at(t, t.b[d], q)
+      let pos = t.p0[t.c[s]]
+      let line = line_at(t, pos)
+      if last_line > 0 and pos > 0 and line - last_line > 1: last_group = -1
+      let path = spec_path(t, s)
+      let g = import_group(local, path)
+      if g != last_group and last_group != -1: out.push(path)
+      last_group = g
+      last_line = line
+  return out
+
+fn is_space(c: Byte) -> Bool:
+  return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0c
+
+fn is_word(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.'
+
+# impLine's first group (`^\s+(?:[\w\.]+\s+)?"(.+?)"`), or "" with ok false
+fn imp_line(s: Str, var ok: Bool) -> Str:
+  ok = false
+  var i = 0
+  while i < s.len and is_space(s[i]): i += 1
+  if i == 0 or i >= s.len: return ""
+  var q = -1
+  if s[i] == '"': q = i
+  elif is_word(s[i]):
+    var j = i
+    while j < s.len and is_word(s[j]): j += 1
+    var k = j
+    while k < s.len and is_space(s[k]): k += 1
+    if k > j and k < s.len and s[k] == '"': q = k
+  if q < 0 or q + 1 >= s.len or s[q + 1] == '\n': return ""
+  var e = q + 2
+  while e < s.len and s[e] != '"' and s[e] != '\n': e += 1
+  if e >= s.len or s[e] != '"': return ""
+  ok = true
+  return s[q + 1..e]
+
+fn add_import_spaces(src: Str, breaks0: [Str]) -> Str:
+  var out = ""
+  out.reserve(src.len + breaks0.len)
+  var bi = 0
+  var in_imports = false
+  var done = false
+  var st = 0
+  while st < src.len:
+    let nl = src.find("\n", st)
+    # (ReadString's last piece without a newline comes with io.EOF: dropped)
+    if nl < 0: break
+    let s = src[st..nl + 1]
+    st = nl + 1
+    if not in_imports and not done and s.startswith("import"): in_imports = true
+    if in_imports and (s.startswith("var") or s.startswith("func") or s.startswith("const") or s.startswith("type")):
+      done = true
+      in_imports = false
+    if in_imports and bi < breaks0.len:
+      var ok = false
+      let m = imp_line(s, &ok)
+      if ok and m == breaks0[bi]:
+        out = out + "\n"
+        bi += 1
+    out = out + s
+  return out
+
+# ---- sort.Sort (pdqsort, Go 1.27): not stable, so equal elements end up where Go puts them
+
+fn pdq_sort(var xs: [Int], less: fn(Int, Int) -> Bool):
+  let n = xs.len
+  if n <= 1: return
+  var limit = 0
+  var m = n
+  while m > 0:
+    limit += 1
+    m = m >> 1
+  pdq(&xs, less, 0, n, limit)
+
+fn sw(var xs: [Int], i: Int, j: Int):
+  let x = xs[i]
+  xs[i] = xs[j]
+  xs[j] = x
+
+fn lt(xs: [Int], less: fn(Int, Int) -> Bool, i: Int, j: Int) -> Bool:
+  return less(xs[i], xs[j])
+
+fn insertion_sort(var xs: [Int], less: fn(Int, Int) -> Bool, a: Int, b: Int):
+  for i in a + 1..b:
+    var j = i
+    while j > a and lt(xs, less, j, j - 1):
+      sw(&xs, j, j - 1)
+      j -= 1
+
+fn sift_down(var xs: [Int], less: fn(Int, Int) -> Bool, lo: Int, hi: Int, first: Int):
+  var root = lo
+  while true:
+    var child = 2 * root + 1
+    if child >= hi: return
+    if child + 1 < hi and lt(xs, less, first + child, first + child + 1): child += 1
+    if not lt(xs, less, first + root, first + child): return
+    sw(&xs, first + root, first + child)
+    root = child
+
+fn heap_sort(var xs: [Int], less: fn(Int, Int) -> Bool, a: Int, b: Int):
+  let first = a
+  let hi = b - a
+  var i = (hi - 1) / 2
+  while i >= 0:
+    sift_down(&xs, less, i, hi, first)
+    i -= 1
+  i = hi - 1
+  while i >= 0:
+    sw(&xs, first, first + i)
+    sift_down(&xs, less, 0, i, first)
+    i -= 1
+
+fn pdq(var xs: [Int], less: fn(Int, Int) -> Bool, a0: Int, b0: Int, limit0: Int):
+  var a = a0
+  var b = b0
+  var limit = limit0
+  var was_balanced = true
+  var was_partitioned = true
+  while true:
+    let length = b - a
+    if length <= 12:
+      insertion_sort(&xs, less, a, b)
+      return
+    if limit == 0:
+      heap_sort(&xs, less, a, b)
+      return
+    if not was_balanced:
+      break_patterns(&xs, a, b)
+      limit -= 1
+    var hint = 0
+    var pivot = choose_pivot(xs, less, a, b, &hint)
+    if hint == 2:
+      reverse_range(&xs, a, b)
+      pivot = (b - 1) - (pivot - a)
+      hint = 1
+    if was_balanced and was_partitioned and hint == 1:
+      if partial_insertion_sort(&xs, less, a, b): return
+    if a > 0 and not lt(xs, less, a - 1, pivot):
+      a = partition_equal(&xs, less, a, b, pivot)
+      continue
+    var already = false
+    let mid = partition(&xs, less, a, b, pivot, &already)
+    was_partitioned = already
+    let left_len = mid - a
+    let right_len = b - mid
+    let balance = length / 8
+    if left_len < right_len:
+      was_balanced = left_len >= balance
+      pdq(&xs, less, a, mid, limit)
+      a = mid + 1
+    else:
+      was_balanced = right_len >= balance
+      pdq(&xs, less, mid + 1, b, limit)
+      b = mid
+
+fn partition(var xs: [Int], less: fn(Int, Int) -> Bool, a: Int, b: Int, pivot: Int, var already: Bool) -> Int:
+  sw(&xs, a, pivot)
+  var i = a + 1
+  var j = b - 1
+  while i <= j and lt(xs, less, i, a): i += 1
+  while i <= j and not lt(xs, less, j, a): j -= 1
+  if i > j:
+    sw(&xs, j, a)
+    already = true
+    return j
+  sw(&xs, i, j)
+  i += 1
+  j -= 1
+  while true:
+    while i <= j and lt(xs, less, i, a): i += 1
+    while i <= j and not lt(xs, less, j, a): j -= 1
+    if i > j: break
+    sw(&xs, i, j)
+    i += 1
+    j -= 1
+  sw(&xs, j, a)
+  already = false
+  return j
+
+fn partition_equal(var xs: [Int], less: fn(Int, Int) -> Bool, a: Int, b: Int, pivot: Int) -> Int:
+  sw(&xs, a, pivot)
+  var i = a + 1
+  var j = b - 1
+  while true:
+    while i <= j and not lt(xs, less, a, i): i += 1
+    while i <= j and lt(xs, less, a, j): j -= 1
+    if i > j: break
+    sw(&xs, i, j)
+    i += 1
+    j -= 1
+  return i
+
+fn partial_insertion_sort(var xs: [Int], less: fn(Int, Int) -> Bool, a: Int, b: Int) -> Bool:
+  var i = a + 1
+  for step in 0..5:
+    while i < b and not lt(xs, less, i, i - 1): i += 1
+    if i == b: return true
+    if b - a < 50: return false
+    sw(&xs, i, i - 1)
+    if i - a >= 2:
+      var j = i - 1
+      while j >= 1:
+        if not lt(xs, less, j, j - 1): break
+        sw(&xs, j, j - 1)
+        j -= 1
+    if b - i >= 2:
+      var j = i + 1
+      while j < b:
+        if not lt(xs, less, j, j - 1): break
+        sw(&xs, j, j - 1)
+        j += 1
+  return false
+
+fn break_patterns(var xs: [Int], a: Int, b: Int):
+  let length = b - a
+  if length < 8: return
+  var r = length
+  var shift = 0
+  var m = length
+  while m > 0:
+    shift += 1
+    m = m >> 1
+  let modulus = 1 << shift
+  var idx = a + (length / 4) * 2 - 1
+  while idx <= a + (length / 4) * 2 + 1:
+    # xorshift on 64 bits
+    r = r ^ (r *% 8192)
+    r = r ^ (r >>> 7)
+    r = r ^ (r *% 131072)
+    var other = r & (modulus - 1)
+    if other >= length: other -= length
+    sw(&xs, idx, a + other)
+    idx += 1
+
+fn choose_pivot(xs: [Int], less: fn(Int, Int) -> Bool, a: Int, b: Int, var hint: Int) -> Int:
+  let l = b - a
+  var swaps = 0
+  var i = a + l / 4 * 1
+  var j = a + l / 4 * 2
+  var k = a + l / 4 * 3
+  if l >= 8:
+    if l >= 50:
+      i = median(xs, less, i - 1, i, i + 1, &swaps)
+      j = median(xs, less, j - 1, j, j + 1, &swaps)
+      k = median(xs, less, k - 1, k, k + 1, &swaps)
+    j = median(xs, less, i, j, k, &swaps)
+  if swaps == 0: hint = 1
+  elif swaps == 12: hint = 2
+  else: hint = 0
+  return j
+
+fn median(xs: [Int], less: fn(Int, Int) -> Bool, a0: Int, b0: Int, c0: Int, var swaps: Int) -> Int:
+  var a = a0
+  var b = b0
+  var c = c0
+  if lt(xs, less, b, a):
+    swaps += 1
+    let x = a
+    a = b
+    b = x
+  if lt(xs, less, c, b):
+    swaps += 1
+    let x = b
+    b = c
+    c = x
+  if lt(xs, less, b, a):
+    swaps += 1
+    let x = a
+    a = b
+    b = x
+  return b
+
+fn reverse_range(var xs: [Int], a: Int, b: Int):
+  var i = a
+  var j = b - 1
+  while i < j:
+    sw(&xs, i, j)
+    i += 1
+    j -= 1
+
+# ---- golangci-lint's issues (as gofmt's: one per change of the diff)
+
+fn file_issues(src: Str, fi: Int, local: Str, names: {Str: Str}, var out: [pkg.Issue]) -> Str:
+  var err = ""
+  let res = process(src, local, names, &err)
+  if err.len > 0: return err
+  if res == src: return ""
+  let chs = gofmt.changes_of(gofmt.diff(src, res))
+  var starts: [Int] = [0]
+  for i in 0..src.len:
+    if src[i] == '\n' and i + 1 < src.len: starts.push(i + 1)
+  let lc = starts.len
+  for c in chs:
+    var from = c.from
+    if from > lc: from = lc
+    if from < 1: from = 1
+    let start = starts[from - 1]
+    var endo = src.len
+    if c.to < lc: endo = starts[c.to] - 1
+    let fix = ",\"SuggestedFixes\":[{{\"Message\":\"\",\"TextEdits\":[{{\"Pos\":{start},\"End\":{endo},\"NewText\":\"" + b64encode("\n".join(c.lines)) + "\"}}]}}]"
+    out.push(pkg.Issue(fi, start, "goimports", "File is not properly formatted", 0, -1, "", false, fix))
+  return ""

@@ -1,0 +1,3574 @@
+# staticcheck checks (honnef.co/go/tools v0.8.1, as golangci-lint 2.14.0 runs them): SA1001 SA1002 SA1003 SA1005 SA1007 SA1008 SA1010 SA1011 SA1012 SA1013 SA1014 SA1015 SA1016 SA1018 SA1020 SA1021 SA1023 SA1024 SA1025 SA1026 SA1027 SA1028 SA1030 SA1031 SA1032
+# run() adds this package's issues for the checks in codes() (as sc.vu's report does, through an
+# sc.C); main.vu calls it after sc.run, with the package's non-generated nodes.
+#
+# Most of these are staticcheck's callcheck rules: a function's full name -> a check of the IR values
+# of its arguments. The IR isn't built: an argument's value is modelled on the syntax (V, val) as
+# the IR has it after lifting locals: a local assigned once (and not escaping) is the value it's
+# declared with, a conversion to an interface is a MakeInterface (which callcheck strips once).
+
+import ast
+import pkg
+import tc
+import vet
+import sc
+import errcheck
+from scan import T_AND, T_DEFINE, T_NOT, T_LAND, T_LOR, T_ARROW, T_SUB, T_ADD
+from scan import K_BREAK, K_CONTINUE, K_GOTO, K_FALLTHROUGH, K_VAR
+
+# The checks this file has (only the ones ported so far)
+fn codes() -> [Str]:
+  return ["SA1001", "SA1002", "SA1003", "SA1007", "SA1005", "SA1008", "SA1010", "SA1011", "SA1012", "SA1013", "SA1014", "SA1015", "SA1016", "SA1018", "SA1020", "SA1021", "SA1023", "SA1024", "SA1025", "SA1026", "SA1027", "SA1028", "SA1030", "SA1031", "SA1032"]
+
+# The package's state for these checks
+type X:
+  par: [Int]             # node -> parent (the non-generated files)
+  locals: {Int: Bool}    # objects declared in the package's functions
+  esc: {Int: Bool}       # locals the IR keeps in memory: address taken, captured, a part assigned
+  nodes: [Int]
+  gover: Int
+
+fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gover: Int, nodes: [Int]):
+  var c = sc.C(pi, [], {})
+  var x = new_x(g, pi, nodes, gover)
+  var calls: [Int] = []
+  var idx: [Int] = []
+  for n in nodes:
+    let kn = g.pk[pi].t.k[n]
+    if kn == ast.N_CALL: calls.push(n)
+    elif kn == ast.N_INDEX: idx.push(n)
+  callchecks(&g, fs, &c, &x, calls)
+  sa1001(&g, fs, &c, calls)
+  sa1005(&g, fs, &c, calls)
+  sa1008(&g, fs, &c, x, idx)
+  sa1012(&g, fs, &c, calls)
+  sa1013(&g, fs, &c, calls)
+  sa1016(&g, fs, &c, calls)
+  sa1023(&g, fs, &c, x, nodes)
+  sa1015(&g, fs, &c, x, p, calls)
+  sa1025(&g, fs, &c, &x, calls)
+  for is in c.out: issues.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
+
+fn new_x(g: tc.Prog, pi: Int, nodes: [Int], gover: Int) -> X:
+  let t = g.pk[pi].t
+  var par = [-1] * t.k.len
+  var kids: [Int] = []
+  for n in nodes:
+    kids.truncate(0)
+    vet.push_kids(t, n, &kids)
+    for ch in kids: par[ch] = n
+  var locals: {Int: Bool} = {}
+  for o in g.locals: locals[o] = true
+  var x = X(par, locals, {}, [], gover)
+  escapes(g, pi, &x, nodes)
+  for n in nodes: x.nodes.push(n)
+  return x
+
+fn k(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return sc.k(g, pi, n)
+
+fn up(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return sc.unparen(g, pi, n)
+
+fn args_of(g: tc.Prog, pi: Int, call: Int) -> [Int]:
+  return ast.items(g.pk[pi].t, g.pk[pi].t.b[call])
+
+fn is_iface(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  if t <= 0: return false
+  let u = tc.under(&g, fs, t)
+  return u > 0 and g.tk[u] == tc.TY_IFACE
+
+fn is_local_var(g: tc.Prog, x: X, o: Int) -> Bool:
+  return o >= 0 and g.ok[o] == tc.O_VAR and o in x.locals
+
+# The locals the IR doesn't lift: their address is taken (&x, x.f = v and x[i] = v on a struct or
+# array, x[:] of an array, a method with a pointer receiver), or a closure refers to them.
+fn escapes(g: tc.Prog, pi: Int, var x: X, nodes: [Int]):
+  let t = g.pk[pi].t
+  var lits: [Int] = []
+  for n in nodes:
+    let kn = t.k[n]
+    if kn == ast.N_UNARY and t.f[n] == T_AND:
+      let r = root_var(g, pi, t.a[n])
+      if r >= 0: x.esc[r] = true
+    elif kn == ast.N_ASSIGN or kn == ast.N_INCDEC:
+      var ls: [Int] = []
+      if kn == ast.N_ASSIGN: ls = ast.items(t, t.a[n])
+      else: ls.push(t.a[n])
+      for l in ls:
+        let l2 = up(g, pi, l)
+        if k(g, pi, l2) == ast.N_SELECTOR or k(g, pi, l2) == ast.N_INDEX:
+          let r = root_var(g, pi, l2)
+          if r >= 0: x.esc[r] = true
+    elif kn == ast.N_SLICE:
+      let r = root_var(g, pi, t.a[n])
+      if r >= 0 and r in x.locals:
+        let vt = vet.ty(g, pi, up(g, pi, t.a[n]))
+        if vt > 0 and g.tk[vt] == tc.TY_ARRAY: x.esc[r] = true
+    elif kn == ast.N_FUNCLIT: lits.push(n)
+  if lits.len > 0:
+    for n in nodes:
+      if t.k[n] != ast.N_IDENT: continue
+      let o = sc.obj_of(g, pi, n)
+      if o < 0 or g.ok[o] != tc.O_VAR or g.opkg[o] != pi or g.onode[o] == n: continue
+      let dp = t.pos[g.onode[o]]
+      for fl in lits:
+        if t.file[fl] != t.file[n]: continue
+        if t.pos[n] >= t.pos[fl] and t.pos[n] < t.end[fl] and not (dp >= t.pos[fl] and dp < t.end[fl]):
+          x.esc[o] = true
+          break
+
+# The variable at the root of x, x.f, x[i] (x a struct or an array, not through a pointer), or -1
+fn root_var(g: tc.Prog, pi: Int, n0: Int) -> Int:
+  let t = g.pk[pi].t
+  var n = up(g, pi, n0)
+  while true:
+    let kn = k(g, pi, n)
+    if kn == ast.N_IDENT:
+      let o = sc.obj_of(g, pi, n)
+      if o >= 0 and g.ok[o] == tc.O_VAR: return o
+      return -1
+    if kn == ast.N_SELECTOR:
+      if g.pk[pi].skind.get(n, 0) != tc.S_FIELD: return -1
+      let xt = vet.ty(g, pi, up(g, pi, t.a[n]))
+      if xt <= 0 or g.tk[xt] == tc.TY_PTR: return -1
+      n = up(g, pi, t.a[n])
+      continue
+    if kn == ast.N_INDEX:
+      let xt = vet.ty(g, pi, up(g, pi, t.a[n]))
+      if xt <= 0 or g.tk[xt] != tc.TY_ARRAY: return -1
+      n = up(g, pi, t.a[n])
+      continue
+    return -1
+  return -1
+
+# ---- IR values of expressions
+
+# A value: the expression it comes from (-1 for a local's zero value), its type, and when it's a
+# MakeInterface, the type of what it converts (it)
+type V:
+  n: Int
+  t: Int
+  mi: Bool
+  it: Int
+  key: Str     # which IR value it is: equal keys are the same value
+
+# The value a local the IR lifts to one value has: the expression it's declared with (-2: its zero
+# value), or -1 when it isn't such a local
+fn lifted(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, o: Int) -> Int:
+  if not is_local_var(g, x, o) or o in x.esc: return -1
+  let pi = c.pi
+  if not c.wk_done: sc.written_locals(g, &c, x.nodes)
+  if o in c.written: return -1
+  let d = g.odecl[o]
+  if d > 0 and k(g, pi, d) == ast.N_VALUESPEC and g.pk[pi].t.c[d] < 0: return -2
+  return sc.decl_value(g, pi, o)
+
+fn expr_type(var g: tc.Prog, pi: Int, n: Int) -> Int:
+  return tc.default_type(vet.ty(g, pi, n))
+
+fn val(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, e0: Int, depth: Int) -> V:
+  let pi = c.pi
+  let e = up(g, pi, e0)
+  let t = expr_type(&g, pi, e)
+  if k(g, pi, e) == ast.N_IDENT and depth < 20:
+    let o = sc.obj_of(g, pi, e)
+    if is_local_var(g, x, o):
+      let vt = tc.obj_type(&g, fs, o)
+      let d = lifted(&g, fs, &c, x, o)
+      if d == -2: return V(-1, vt, false, 0, "z{o}")
+      if d > 0:
+        let inner = val(&g, fs, &c, x, d, depth + 1)
+        if is_iface(&g, fs, vt) and not is_iface(&g, fs, inner.t): return V(inner.n, vt, true, inner.t, "mi" + inner.key)
+        return V(inner.n, vt, inner.mi, inner.it, inner.key)
+      if o in x.esc: return V(e, t, false, 0, "n{e}")
+      return V(e, vt, false, 0, "v{o}")
+  return V(e, t, false, 0, "n{e}")
+
+# The type of an argument's value as callcheck sees it: an interface conversion stripped once
+fn arg_type(var g: tc.Prog, fs: Fs, v: V, pt: Int) -> Int:
+  if v.t == tc.B_UNIL: return pt
+  if is_iface(&g, fs, pt) and not is_iface(&g, fs, v.t): return v.t
+  if v.mi: return v.it
+  return v.t
+
+# Whether the value is a constant (Flatten(v) is an *ir.Const, MakeInterface not stripped)
+fn is_const_v(var g: tc.Prog, fs: Fs, var c: sc.C, v: V) -> Bool:
+  if v.n == -1: return true
+  if v.mi: return false
+  let pi = c.pi
+  if is_nil(g, pi, v.n): return true
+  let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[v.n], v.n, -1, 0)
+  return cv.k != 0
+
+fn is_nil(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  let e = sc.unparen(g, pi, n)
+  if k(g, pi, e) != ast.N_IDENT: return false
+  let o = sc.obj_of(g, pi, e)
+  return o >= 0 and g.ok[o] == tc.O_NIL
+
+# ---- callcheck
+
+type Call:
+  n: Int             # the call
+  name: Str
+  args: [Int]        # each IR argument's expression (-1: a result of the one multi-value argument)
+  at: [Int]          # each IR argument's static type
+  pt: [Int]          # each parameter's type
+  ast: [Int]         # the call's arguments as written
+
+fn rule_names() -> {Str: Bool}:
+  var m: {Str: Bool} = {}
+  for s in ["net/url.Parse", "time.Parse", "encoding/binary.Write", "(*regexp.Regexp).FindAll", "(*regexp.Regexp).FindAllIndex", "(*regexp.Regexp).FindAllString", "(*regexp.Regexp).FindAllStringIndex", "(*regexp.Regexp).FindAllStringSubmatch", "(*regexp.Regexp).FindAllStringSubmatchIndex", "(*regexp.Regexp).FindAllSubmatch", "(*regexp.Regexp).FindAllSubmatchIndex", "strings.IndexAny", "strings.LastIndexAny", "strings.ContainsAny", "strings.Trim", "strings.TrimLeft", "strings.TrimRight", "encoding/xml.Unmarshal", "(*encoding/xml.Decoder).Decode", "(*encoding/xml.Decoder).DecodeElement", "encoding/json.Unmarshal", "(*encoding/json.Decoder).Decode", "strings.Replace", "bytes.Replace", "net/http.ListenAndServe", "net/http.ListenAndServeTLS", "bytes.Equal", "sort.Slice", "sort.SliceIsSorted", "sort.SliceStable", "strconv.ParseComplex", "strconv.ParseFloat", "strconv.ParseInt", "strconv.ParseUint", "strconv.FormatComplex", "strconv.FormatFloat", "strconv.FormatInt", "strconv.FormatUint", "strconv.AppendFloat", "strconv.AppendInt", "strconv.AppendUint", "encoding/ascii85.Encode", "(*encoding/base32.Encoding).Encode", "(*encoding/base64.Encoding).Encode", "encoding/hex.Encode", "errors.Is", "encoding/json.Marshal", "encoding/json.MarshalIndent", "encoding/xml.Marshal", "encoding/xml.MarshalIndent", "(*encoding/json.Encoder).Encode", "(*encoding/xml.Encoder).Encode"]:
+    m[s] = true
+  return m
+
+fn callchecks(var g: tc.Prog, fs: Fs, var c: sc.C, var x: X, calls: [Int]):
+  let pi = c.pi
+  let rules = rule_names()
+  for n in calls:
+    var fun = up(g, pi, g.pk[pi].t.a[n])
+    if k(g, pi, fun) == ast.N_INDEX: fun = up(g, pi, g.pk[pi].t.a[fun])
+    var name = sc.callee_name(&g, fs, &c, n)
+    if name == "" and k(g, pi, fun) == ast.N_IDENT:
+      # (a local holding a function or a bound method: the IR calls it statically)
+      let d = lifted(&g, fs, &c, x, sc.obj_of(g, pi, fun))
+      if d > 0:
+        var f2 = up(g, pi, d)
+        var o = -1
+        if k(g, pi, f2) == ast.N_IDENT: o = sc.obj_of(g, pi, f2)
+        elif k(g, pi, f2) == ast.N_SELECTOR and g.pk[pi].skind.get(f2, 0) != tc.S_MEXPR: o = g.pk[pi].sobj.get(f2, -1)
+        if o >= 0 and g.ok[o] == tc.O_FUNC and not iface_method(&g, fs, o): name = errcheck.full_name(&g, fs, g.oorig[o])
+    if not (name in rules): continue
+    # (staticcheck fails on a method expression's call: its thunk's arguments)
+    if k(g, pi, fun) == ast.N_SELECTOR and g.pk[pi].skind.get(fun, 0) == tc.S_MEXPR: continue
+    if dead(&g, fs, pi, x, n): continue
+    let ft = vet.ty(g, pi, fun)
+    if ft <= 0 or g.tk[ft] != tc.TY_FUNC: continue
+    let pt = tc.tlist(g, g.ta[ft])
+    let as = args_of(g, pi, n)
+    var args: [Int] = []
+    var at: [Int] = []
+    if as.len == 1 and pt.len > 1:
+      let tt = vet.ty(g, pi, as[0])
+      if tt <= 0 or g.tk[tt] != tc.TY_TUPLE: continue
+      for et in tc.tlist(g, tt):
+        args.push(-1)
+        at.push(et)
+    else:
+      for a in as:
+        args.push(a)
+        at.push(expr_type(&g, pi, a))
+    if args.len < pt.len: continue
+    let cl = Call(n, name, args, at, pt, as)
+    rule(&g, fs, &c, &x, cl)
+
+# Where callcheck reports a problem with IR argument i
+fn arg_at(cl: Call, i: Int) -> Int:
+  if i < cl.ast.len: return cl.ast[i]
+  return cl.ast[0]
+
+# Where it reports a problem with the call: its statement when deferred or started as a goroutine
+fn call_at(g: tc.Prog, pi: Int, x: X, n: Int) -> Int:
+  let p = x.par[n]
+  if p > 0 and (k(g, pi, p) == ast.N_DEFER or k(g, pi, p) == ast.N_GO): return p
+  return n
+
+fn arg_v(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, i: Int) -> V:
+  if cl.args[i] < 0: return V(-3, cl.at[i], false, 0, "t{cl.n}.{i}")
+  return val(&g, fs, &c, x, cl.args[i], 0)
+
+# The argument's constant (callcheck.ExtractConst), k 0 when it isn't one
+fn arg_const(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, i: Int) -> tc.Cv:
+  if cl.args[i] < 0: return tc.cv_none()
+  return sc.ir_const(&g, fs, &c, x.nodes, cl.args[i])
+
+fn rule(var g: tc.Prog, fs: Fs, var c: sc.C, var x: X, cl: Call):
+  let pi = c.pi
+  let name = cl.name
+  if name == "encoding/binary.Write":
+    sa1003(&g, fs, &c, x, cl)
+  elif name == "net/url.Parse":
+    let cv = arg_const(&g, fs, &c, x, cl, 0)
+    if cv.k == 2:
+      let err = url_parse(cv.s)
+      if err != "": sc.report(g, &c, arg_at(cl, 0), "SA1007", go_quote(cv.s) + " is not a valid URL: " + err)
+  elif name == "time.Parse":
+    let cv = arg_const(&g, fs, &c, x, cl, 0)
+    if cv.k == 2:
+      let lay = cv.s.replace("_", " ").replace("Z", "-")
+      let err = time_parse(lay, lay)
+      if err != "": sc.report(g, &c, arg_at(cl, 0), "SA1002", err)
+  elif name.startswith("(*regexp.Regexp).FindAll"):
+    let cv = arg_const(&g, fs, &c, x, cl, 1)
+    if cv.k == 1 and cv.i == 0: sc.report(g, &c, arg_at(cl, 1), "SA1010", "calling a FindAll method with n == 0 will return no results, did you mean -1?")
+  elif name == "strings.Replace" or name == "bytes.Replace":
+    let cv = arg_const(&g, fs, &c, x, cl, 3)
+    if cv.k == 1 and cv.i == 0: sc.report(g, &c, arg_at(cl, 3), "SA1018", "calling " + name + " with n == 0 will return no results, did you mean -1?")
+  elif name.startswith("strings."):
+    let cv = arg_const(&g, fs, &c, x, cl, 1)
+    if cv.k == 2:
+      if not utf8_valid(cv.s): sc.report(g, &c, arg_at(cl, 1), "SA1011", "argument is not a valid UTF-8 encoded string")
+      if name.startswith("strings.Trim") and not unique_cutset(cv.s): sc.report(g, &c, arg_at(cl, 1), "SA1024", "cutset contains duplicate characters")
+  elif name == "encoding/xml.Unmarshal" or name == "encoding/json.Unmarshal":
+    unmarshal_ptr(&g, fs, &c, x, cl, name[9..name.len], 1)
+  elif name.endswith(".Decode"):
+    unmarshal_ptr(&g, fs, &c, x, cl, "Decode", 0)
+  elif name.endswith(".DecodeElement"):
+    unmarshal_ptr(&g, fs, &c, x, cl, "DecodeElement", 0)
+  elif name.startswith("net/http.ListenAndServe"):
+    let cv = arg_const(&g, fs, &c, x, cl, 0)
+    if cv.k == 2 and not valid_host_port(cv.s): sc.report(g, &c, arg_at(cl, 0), "SA1020", "invalid port or service name in host:port pair")
+  elif name == "bytes.Equal":
+    if from_ip(&g, fs, &c, x, cl, 0) and from_ip(&g, fs, &c, x, cl, 1): sc.report(g, &c, call_at(g, pi, x, cl.n), "SA1021", "use net.IP.Equal to compare net.IPs, not bytes.Equal")
+  elif name.startswith("sort.Slice"):
+    sa1028(&g, fs, &c, x, cl)
+  elif name.startswith("strconv."):
+    sa1030(&g, fs, &c, x, cl)
+  elif name == "encoding/ascii85.Encode" or name == "(*encoding/base32.Encoding).Encode" or name == "(*encoding/base64.Encoding).Encode" or name == "encoding/hex.Encode":
+    sa1031(&g, fs, &c, x, cl)
+  elif name == "errors.Is":
+    sa1032(&g, fs, &c, x, cl)
+  elif name.endswith("Marshal") or name.endswith("MarshalIndent") or name.endswith(").Encode"):
+    sa1026(&g, fs, &c, x, cl)
+
+# ---- SA1003: binary.Write with a value it can't encode
+
+fn sa1003(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call):
+  let v = arg_v(&g, fs, &c, x, cl, 2)
+  let vt = arg_type(&g, fs, v, cl.pt[2])
+  if vt <= 0: return
+  var t = tc.under(&g, fs, vt)
+  if t > 0 and g.tk[t] == tc.TY_PTR: t = tc.under(&g, fs, g.ta[t])
+  if t > 0 and (g.tk[t] == tc.TY_SLICE or g.tk[t] == tc.TY_ARRAY or g.tk[t] == tc.TY_CHAN): t = g.ta[t]
+  elif t > 0 and g.tk[t] == tc.TY_MAP: t = g.tb[t]
+  if binary_ok(&g, fs, x, t, 0): return
+  let ts = tstr(&g, fs, vt, "")
+  sc.report(g, &c, arg_at(cl, 2), "SA1003", "value of type " + ts + " cannot be used with binary.Write")
+
+fn binary_ok(var g: tc.Prog, fs: Fs, x: X, t0: Int, depth: Int) -> Bool:
+  if t0 <= 0 or depth > 50: return true
+  let t = tc.under(&g, fs, t0)
+  if t <= 0: return true
+  let kt = g.tk[t]
+  if kt == tc.TY_BASIC:
+    if t == tc.B_BOOL: return x.gover >= 8
+    return (t >= tc.B_INT8 and t <= tc.B_INT64) or (t >= tc.B_UINT8 and t <= tc.B_UINT64) or (t >= tc.B_FLOAT32 and t <= tc.B_COMPLEX128)
+  if kt == tc.TY_STRUCT:
+    for f in tc.tlist(g, t):
+      let ft = tc.obj_type(&g, fs, f)
+      if not binary_ok(&g, fs, x, ft, depth + 1): return false
+    return true
+  if kt == tc.TY_ARRAY: return binary_ok(&g, fs, x, g.ta[t], depth + 1)
+  if kt == tc.TY_IFACE: return true
+  return false
+
+# ---- SA1005: exec.Command with a shell command line
+
+fn sa1005(var g: tc.Prog, fs: Fs, var c: sc.C, calls: [Int]):
+  let pi = c.pi
+  for n in calls:
+    if not sc.callee_is(&g, fs, &c, n, "os/exec.Command"): continue
+    let as = args_of(g, pi, n)
+    if as.len == 0: continue
+    let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[as[0]], as[0], -1, 0)
+    if cv.k != 2: continue
+    let s = cv.s
+    if s.find(" ") < 0 or s.find("\\") >= 0 or s.find("/") >= 0: continue
+    sc.report(g, &c, as[0], "SA1005", "first argument to exec.Command looks like a shell command, but a program name or path are expected")
+
+# ---- SA1008: non-canonical keys in http.Header
+
+fn is_named(var g: tc.Prog, fs: Fs, t: Int, name: Str) -> Bool:
+  if t <= 0 or g.tk[t] != tc.TY_NAMED: return false
+  return tc.type_str(&g, fs, t, "") == name
+
+fn header_lhs(var g: tc.Prog, fs: Fs, pi: Int, asg: Int) -> Bool:
+  for l in ast.items(g.pk[pi].t, g.pk[pi].t.a[asg]):
+    if k(g, pi, l) == ast.N_INDEX and is_named(&g, fs, vet.ty(g, pi, g.pk[pi].t.a[l]), "net/http.Header"): return true
+  return false
+
+fn sa1008(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, idx: [Int]):
+  let pi = c.pi
+  for n in idx:
+    if not is_named(&g, fs, vet.ty(g, pi, g.pk[pi].t.a[n]), "net/http.Header"): continue
+    # (an assignment to an http.Header's element isn't looked into at all)
+    var skip = false
+    var p = x.par[n]
+    while p > 0:
+      if g.pk[pi].t.k[p] == ast.N_ASSIGN and header_lhs(&g, fs, pi, p):
+        skip = true
+        break
+      p = x.par[p]
+    if skip: continue
+    let ix = ast.items(g.pk[pi].t, g.pk[pi].t.b[n])
+    if ix.len != 1: continue
+    let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], ix[0], -1, 0)
+    if cv.k != 2: continue
+    if canonical_key(cv.s) == cv.s: continue
+    sc.report(g, &c, n, "SA1008", "keys in http.Header are canonicalized, " + go_quote(cv.s) + " is not canonical; fix the constant or use http.CanonicalHeaderKey")
+
+fn header_byte(c: Byte) -> Bool:
+  if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9'): return true
+  return "!#$%&'*+-.^_`|~".find(chr(int(c))) >= 0 and c < 128
+
+# net/textproto.CanonicalMIMEHeaderKey
+fn canonical_key(s: Str) -> Str:
+  var upper = true
+  var need = false
+  for i in 0..s.len:
+    let ch = s[i]
+    if not header_byte(ch): return s
+    if upper and ch >= 'a' and ch <= 'z':
+      need = true
+      break
+    if not upper and ch >= 'A' and ch <= 'Z':
+      need = true
+      break
+    upper = ch == '-'
+  if not need: return s
+  for i in 0..s.len:
+    if not header_byte(s[i]): return s
+  var out: [Byte] = []
+  upper = true
+  for i in 0..s.len:
+    var ch = s[i]
+    if upper and ch >= 'a' and ch <= 'z': ch = byte(int(ch) - 32)
+    elif not upper and ch >= 'A' and ch <= 'Z': ch = byte(int(ch) + 32)
+    out.push(ch)
+    upper = ch == '-'
+  return str(out)
+
+# ---- SA1012: a nil Context
+
+fn sa1012(var g: tc.Prog, fs: Fs, var c: sc.C, calls: [Int]):
+  let pi = c.pi
+  for n in calls:
+    let as = args_of(g, pi, n)
+    if as.len == 0: continue
+    let a0 = as[0]
+    if k(g, pi, a0) != ast.N_IDENT or not is_nil(g, pi, a0): continue
+    var fun = g.pk[pi].t.a[n]
+    if k(g, pi, fun) == ast.N_INDEX: fun = g.pk[pi].t.a[fun]
+    var o = -1
+    if k(g, pi, fun) == ast.N_IDENT: o = sc.obj_of(g, pi, fun)
+    elif k(g, pi, fun) == ast.N_SELECTOR: o = g.pk[pi].sobj.get(fun, -1)
+    if o < 0 or g.ok[o] != tc.O_FUNC: continue
+    let ft = tc.obj_type(&g, fs, o)
+    if ft <= 0 or g.tk[ft] != tc.TY_FUNC: continue
+    let ps = tc.tlist(g, g.ta[ft])
+    if ps.len == 0: continue
+    if not is_named(&g, fs, ps[0], "context.Context"): continue
+    sc.report(g, &c, a0, "SA1012", "do not pass a nil Context, even if a function permits it; pass context.TODO if you are unsure about which Context to use")
+
+# ---- SA1013: io.Seeker.Seek with the whence first
+
+fn sa1013(var g: tc.Prog, fs: Fs, var c: sc.C, calls: [Int]):
+  let pi = c.pi
+  for n in calls:
+    let fun = g.pk[pi].t.a[n]
+    if k(g, pi, fun) != ast.N_SELECTOR or sc.nm(g, pi, g.pk[pi].t.b[fun]) != "Seek": continue
+    let as = args_of(g, pi, n)
+    if as.len != 2 or k(g, pi, as[0]) != ast.N_SELECTOR: continue
+    let so = g.pk[pi].sobj.get(as[0], -1)
+    if so < 0 or g.ok[so] != tc.O_CONST or g.opkg[so] < 0 or g.pk[g.opkg[so]].path != "io": continue
+    let sn = g.oname[so]
+    if not (sn == "SeekStart" or sn == "SeekCurrent" or sn == "SeekEnd"): continue
+    if g.pk[pi].skind.get(fun, 0) != tc.S_METHOD: continue
+    let ft = vet.ty(g, pi, fun)
+    if ft <= 0 or g.tk[ft] != tc.TY_FUNC: continue
+    if tc.sig_str(&g, fs, ft, "") != "(int64, int) (int64, error)" or tc.is_variadic(g, ft): continue
+    sc.report(g, &c, n, "SA1013", "the first argument of io.Seeker is the offset, but an io.Seek* constant is being used instead")
+
+# ---- SA1014: unmarshaling into a non-pointer
+
+fn unmarshal_ptr(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, what: Str, i: Int):
+  let v = arg_v(&g, fs, &c, x, cl, i)
+  let at = arg_type(&g, fs, v, cl.pt[i])
+  if at <= 0: return
+  let u = tc.under(&g, fs, at)
+  if u <= 0 or g.tk[u] == tc.TY_PTR or g.tk[u] == tc.TY_IFACE: return
+  sc.report(g, &c, arg_at(cl, i), "SA1014", what + " expects to unmarshal into a pointer, but the provided value is not a pointer")
+
+# ---- SA1016: signals that can't be trapped
+
+fn sel_name(var g: tc.Prog, pi: Int, e: Int) -> Str:
+  if k(g, pi, e) != ast.N_SELECTOR: return ""
+  let xx = g.pk[pi].t.a[e]
+  if k(g, pi, xx) != ast.N_IDENT: return ""
+  let o = sc.obj_of(g, pi, xx)
+  if o < 0 or g.ok[o] != tc.O_PKGNAME: return ""
+  let ip = g.pk[pi].sobj.get(e, -1)
+  if ip < 0 or g.opkg[ip] < 0: return ""
+  return g.pk[g.opkg[ip]].path + "." + sc.nm(g, pi, g.pk[pi].t.b[e])
+
+fn sa1016(var g: tc.Prog, fs: Fs, var c: sc.C, calls: [Int]):
+  let pi = c.pi
+  for n in calls:
+    let cn = sc.callee_name(&g, fs, &c, n)
+    if not (cn == "os/signal.Ignore" or cn == "os/signal.Notify" or cn == "os/signal.Reset"): continue
+    for a0 in args_of(g, pi, n):
+      var a = a0
+      if k(g, pi, a) == ast.N_CALL and sel_name(&g, pi, g.pk[pi].t.a[a]) == "os.Signal":
+        let ca = args_of(g, pi, a)
+        if ca.len > 0: a = ca[0]
+      let s = sel_name(&g, pi, a)
+      if s == "os.Kill" or s == "syscall.SIGKILL":
+        sc.report(g, &c, a, "SA1016", sc.fmt_expr(g, pi, a) + " cannot be trapped (did you mean syscall.SIGTERM?)")
+      if s == "syscall.SIGSTOP":
+        sc.report(g, &c, a, "SA1016", "syscall.SIGSTOP cannot be trapped")
+
+# ---- SA1020: invalid listen addresses
+
+fn valid_host_port(s: Str) -> Bool:
+  if s == "": return true
+  var i = s.len - 1
+  while i >= 0 and s[i] != ':': i -= 1
+  if i < 0: return false
+  var j = 0
+  var kk = 0
+  if s[0] == '[':
+    let e = s.find("]")
+    if e < 0: return false
+    if e + 1 == s.len: return false
+    if e + 1 != i: return false
+    j = 1
+    kk = e + 1
+  else:
+    if s[0..i].find(":") >= 0: return false
+  if s[j..s.len].find("[") >= 0: return false
+  if s[kk..s.len].find("]") >= 0: return false
+  return valid_port(s[i + 1..s.len])
+
+fn valid_port(s: Str) -> Bool:
+  # strconv.ParseInt(s, 10, 64)
+  var i = 0
+  if s.len > 0 and (s[0] == '+' or s[0] == '-'): i = 1
+  var ok = i < s.len
+  var n = 0
+  var big = false
+  for j in i..s.len:
+    if s[j] < '0' or s[j] > '9':
+      ok = false
+      break
+    if n > 100000000000: big = true
+    else: n = n * 10 + (int(s[j]) - 48)
+  if ok and big: ok = false
+  if not ok: return valid_service(s)
+  if s[0] == '-' and n != 0: return false
+  return n <= 65535
+
+fn valid_service(s: Str) -> Bool:
+  if s.len < 1 or s.len > 15: return false
+  if s[0] == '-' or s[s.len - 1] == '-': return false
+  if s.find("--") >= 0: return false
+  var letter = false
+  for i in 0..s.len:
+    let ch = s[i]
+    if (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z'):
+      letter = true
+      continue
+    if ch >= '0' and ch <= '9': continue
+    return false
+  return letter
+
+# ---- SA1021: bytes.Equal on net.IPs
+
+fn from_ip(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, i: Int) -> Bool:
+  let pi = c.pi
+  let v = arg_v(&g, fs, &c, x, cl, i)
+  if v.mi: return false
+  # (an implicit conversion to []byte)
+  if v.t != cl.pt[i] and tc.type_str(&g, fs, v.t, "") == "net.IP": return not is_iface(&g, fs, cl.pt[i])
+  # (an explicit one, []byte(ip))
+  if v.n > 0 and k(g, pi, v.n) == ast.N_CALL and g.pk[pi].emd[g.pk[pi].t.a[v.n]] == tc.M_TYPE:
+    let ca = args_of(g, pi, v.n)
+    if ca.len == 1:
+      let xt = vet.ty(g, pi, ca[0])
+      return xt != v.t and tc.type_str(&g, fs, xt, "") == "net.IP"
+  return false
+
+# ---- SA1027: 64-bit atomics on unaligned fields: only for 32-bit architectures (vgolint checks
+# linux/amd64, where uintptr has 8 bytes and staticcheck reports nothing)
+
+# ---- SA1028: sort.Slice on a non-slice
+
+fn sa1028(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call):
+  let v = arg_v(&g, fs, &c, x, cl, 0)
+  let at = arg_type(&g, fs, v, cl.pt[0])
+  if at <= 0: return
+  let u = tc.under(&g, fs, at)
+  if u <= 0: return
+  if g.tk[u] == tc.TY_IFACE:
+    let pi = c.pi
+    if (v.n == -1 and is_iface(&g, fs, v.t)) or (v.n > 0 and not v.mi and is_nil(g, pi, v.n)):
+      sc.report(g, &c, arg_at(cl, 0), "SA1028", "cannot call " + cl.name + " on nil literal")
+  elif g.tk[u] != tc.TY_SLICE:
+    let ts = tstr(&g, fs, u, "")
+    sc.report(g, &c, arg_at(cl, 0), "SA1028", cl.name + " must only be called on slices, was called on " + ts)
+
+# ---- SA1030: invalid arguments to strconv's functions
+
+fn sa1030(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call):
+  let name = cl.name[8..cl.name.len]
+  if name == "ParseComplex": bitsize2(&g, fs, &c, x, cl, 1, 64, 128)
+  elif name == "ParseFloat": bitsize2(&g, fs, &c, x, cl, 1, 32, 64)
+  elif name == "ParseInt" or name == "ParseUint":
+    bitsize_range(&g, fs, &c, x, cl, 2, 0, 64)
+    base0(&g, fs, &c, x, cl, 1)
+  elif name == "FormatComplex":
+    float_fmt(&g, fs, &c, x, cl, 1)
+    bitsize2(&g, fs, &c, x, cl, 3, 64, 128)
+  elif name == "FormatFloat":
+    float_fmt(&g, fs, &c, x, cl, 1)
+    bitsize2(&g, fs, &c, x, cl, 3, 32, 64)
+  elif name == "FormatInt" or name == "FormatUint": base2(&g, fs, &c, x, cl, 1)
+  elif name == "AppendFloat":
+    float_fmt(&g, fs, &c, x, cl, 2)
+    bitsize2(&g, fs, &c, x, cl, 4, 32, 64)
+  elif name == "AppendInt" or name == "AppendUint": base2(&g, fs, &c, x, cl, 2)
+
+fn bitsize2(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, i: Int, a: Int, b: Int):
+  let cv = arg_const(&g, fs, &c, x, cl, i)
+  if cv.k == 1 and cv.i != a and cv.i != b: sc.report(g, &c, arg_at(cl, i), "SA1030", "'bitSize' argument is invalid, must be either {a} or {b}")
+
+fn bitsize_range(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, i: Int, a: Int, b: Int):
+  let cv = arg_const(&g, fs, &c, x, cl, i)
+  if cv.k == 1 and (cv.i < a or cv.i > b): sc.report(g, &c, arg_at(cl, i), "SA1030", "'bitSize' argument is invalid, must be within {a} and {b}")
+
+fn base2(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, i: Int):
+  let cv = arg_const(&g, fs, &c, x, cl, i)
+  if cv.k != 1: return
+  if cv.i < 2: sc.report(g, &c, arg_at(cl, i), "SA1030", "'base' must not be smaller than 2")
+  if cv.i > 36: sc.report(g, &c, arg_at(cl, i), "SA1030", "'base' must not be larger than 36")
+
+fn base0(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, i: Int):
+  let cv = arg_const(&g, fs, &c, x, cl, i)
+  if cv.k != 1: return
+  if cv.i < 2 and cv.i != 0: sc.report(g, &c, arg_at(cl, i), "SA1030", "'base' must not be smaller than 2, unless it is 0")
+  if cv.i > 36: sc.report(g, &c, arg_at(cl, i), "SA1030", "'base' must not be larger than 36")
+
+fn float_fmt(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, i: Int):
+  let cv = arg_const(&g, fs, &c, x, cl, i)
+  if cv.k != 1: return
+  let v = cv.i
+  if v == 98 or v == 101 or v == 69 or v == 102 or v == 103 or v == 71 or v == 120 or v == 88: return
+  sc.report(g, &c, arg_at(cl, i), "SA1030", "'fmt' argument is invalid: unknown format " + quote_rune(v))
+
+# ---- SA1031: overlapping dst and src of an Encode
+
+fn sa1031(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call):
+  let pi = c.pi
+  if cl.args.len < 2: return
+  let dst = arg_v(&g, fs, &c, x, cl, 0)
+  let src = arg_v(&g, fs, &c, x, cl, 1)
+  if is_const_v(&g, fs, &c, dst) or is_const_v(&g, fs, &c, src): return
+  if dst.key == src.key:
+    sc.report(g, &c, arg_at(cl, 0), "SA1031", "overlapping dst and src")
+    return
+  if dst.mi or src.mi or dst.n <= 0 or src.n <= 0: return
+  if k(g, pi, dst.n) != ast.N_SLICE or k(g, pi, src.n) != ast.N_SLICE: return
+  if slice_base(&g, fs, &c, x, g.pk[pi].t.a[dst.n]) != slice_base(&g, fs, &c, x, g.pk[pi].t.a[src.n]): return
+  let l1 = g.pk[pi].t.b[dst.n]
+  let l2 = g.pk[pi].t.b[src.n]
+  var same = l1 < 0 and l2 < 0
+  if l1 > 0 and l2 > 0:
+    let c1 = sc.ir_const(&g, fs, &c, x.nodes, l1)
+    let c2 = sc.ir_const(&g, fs, &c, x.nodes, l2)
+    if c1.k == 1 and c2.k == 1: same = c1.i == c2.i
+    elif c1.k == 0 and c2.k == 0: same = val(&g, fs, &c, x, l1, 0).key == val(&g, fs, &c, x, l2, 0).key
+  if same: sc.report(g, &c, arg_at(cl, 0), "SA1031", "overlapping dst and src")
+
+# The IR value a slicing slices: an array variable's address, else the value
+fn slice_base(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, e0: Int) -> Str:
+  let pi = c.pi
+  let e = up(g, pi, e0)
+  if k(g, pi, e) == ast.N_IDENT:
+    let o = sc.obj_of(g, pi, e)
+    if o >= 0 and g.ok[o] == tc.O_VAR:
+      let vt = vet.ty(g, pi, e)
+      if vt > 0 and g.tk[vt] == tc.TY_ARRAY: return "a{o}"
+  return val(&g, fs, &c, x, e, 0).key
+
+# ---- SA1032: errors.Is with its arguments swapped
+
+# The package of the global variable an argument loads, "" when it isn't one
+fn global_pkg(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call, i: Int) -> Str:
+  let pi = c.pi
+  let v = arg_v(&g, fs, &c, x, cl, i)
+  if v.n <= 0: return ""
+  var o = -1
+  if k(g, pi, v.n) == ast.N_IDENT: o = sc.obj_of(g, pi, v.n)
+  elif k(g, pi, v.n) == ast.N_SELECTOR and g.pk[pi].skind.get(v.n, 0) == tc.S_PKG: o = g.pk[pi].sobj.get(v.n, -1)
+  if o < 0 or g.ok[o] != tc.O_VAR or o in x.locals or g.opkg[o] < 0: return ""
+  # (a struct field isn't a global)
+  if g.odecl[o] < 0 or k2(g, g.opkg[o], g.odecl[o]) != ast.N_VALUESPEC: return ""
+  return g.pk[g.opkg[o]].path + ""
+
+fn k2(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0: return 0
+  return g.pk[pi].t.k[n]
+
+fn sa1032(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call):
+  let pi = c.pi
+  if cl.args.len != 2: return
+  let px = global_pkg(&g, fs, &c, x, cl, 0)
+  if px == "" or px == g.pk[pi].path: return
+  let py = global_pkg(&g, fs, &c, x, cl, 1)
+  if py != "" and py != g.pk[pi].path: return
+  sc.report(g, &c, call_at(g, pi, x, cl.n), "SA1032", "arguments have the wrong order")
+
+# ---- text helpers
+
+# Go's UTF-8 decoding: each code point, U+FFFD (65533) for each byte of an invalid sequence
+fn utf8_runes(s: Str) -> [Int]:
+  var out: [Int] = []
+  var i = 0
+  while i < s.len:
+    let r = utf8_at(s, i)
+    out.push(r[0])
+    i += r[1]
+  return out
+
+# The code point at byte i and its length (U+FFFD, 1 when invalid)
+fn utf8_at(s: Str, i: Int) -> [Int]:
+  let b0 = int(s[i])
+  if b0 < 0x80: return [b0, 1]
+  var n = 0
+  var lo = 0x80
+  var hi = 0xBF
+  var r = 0
+  if b0 >= 0xC2 and b0 <= 0xDF:
+    n = 2
+    r = b0 & 0x1F
+  elif b0 >= 0xE0 and b0 <= 0xEF:
+    n = 3
+    r = b0 & 0x0F
+    if b0 == 0xE0: lo = 0xA0
+    if b0 == 0xED: hi = 0x9F
+  elif b0 >= 0xF0 and b0 <= 0xF4:
+    n = 4
+    r = b0 & 0x07
+    if b0 == 0xF0: lo = 0x90
+    if b0 == 0xF4: hi = 0x8F
+  else: return [65533, 1]
+  if i + n > s.len: return [65533, 1]
+  for j in 1..n:
+    let b = int(s[i + j])
+    if j == 1:
+      if b < lo or b > hi: return [65533, 1]
+    elif b < 0x80 or b > 0xBF: return [65533, 1]
+    r = (r << 6) | (b & 0x3F)
+  return [r, n]
+
+fn utf8_valid(s: Str) -> Bool:
+  var i = 0
+  while i < s.len:
+    let r = utf8_at(s, i)
+    if r[0] == 65533 and r[1] == 1 and int(s[i]) >= 0x80: return false
+    i += r[1]
+  return true
+
+fn unique_cutset(s: Str) -> Bool:
+  let rs = sorted(utf8_runes(s))
+  if rs.len < 2: return true
+  for i in 1..rs.len:
+    if rs[i] == rs[i - 1]: return false
+  return true
+
+fn hex2(v: Int) -> Str:
+  let d = "0123456789abcdef"
+  return d[(v >> 4) & 15..((v >> 4) & 15) + 1] + d[v & 15..(v & 15) + 1]
+
+# strconv.Quote's escapes for one code point inside quote q (34 or 39)
+fn quote_cp(r: Int, q: Int) -> Str:
+  if r == q or r == 92: return "\\" + chr(r)
+  if r == 7: return "\\a"
+  if r == 8: return "\\b"
+  if r == 12: return "\\f"
+  if r == 10: return "\\n"
+  if r == 13: return "\\r"
+  if r == 9: return "\\t"
+  if r == 11: return "\\v"
+  if r < 32 or r == 127: return "\\x" + hex2(r)
+  if r < 127: return chr(r)
+  if r > 0x10FFFF or (r >= 0xD800 and r <= 0xDFFF): return chr(65533)
+  if not is_print(r):
+    if r < 0x10000: return "\\u" + hex2(r >> 8) + hex2(r & 255)
+    return "\\U" + hex2(r >> 24) + hex2((r >> 16) & 255) + hex2((r >> 8) & 255) + hex2(r & 255)
+  return chr(r)
+
+# unicode.IsPrint, roughly: the C1 controls, the separators other than space, the format
+# characters, private use and noncharacters aren't
+fn is_print(r: Int) -> Bool:
+  if r >= 0x80 and r <= 0xA0: return false
+  if r == 0xAD: return false
+  if r >= 0x2000 and r <= 0x200F: return false
+  if r >= 0x2028 and r <= 0x202E: return false
+  if r >= 0x2060 and r <= 0x206F: return false
+  if r == 0xFEFF or r == 0xFFFE or r == 0xFFFF: return false
+  if r >= 0xE000 and r <= 0xF8FF: return false
+  if r >= 0xF0000: return false
+  return true
+
+# %q of a rune
+fn quote_rune(r0: Int) -> Str:
+  var r = r0
+  if r < 0 or r > 0x10FFFF or (r >= 0xD800 and r <= 0xDFFF): r = 65533
+  return "'" + quote_cp(r, 39) + "'"
+
+# strconv.Quote
+fn go_quote(s: Str) -> Str:
+  var out = "\""
+  var i = 0
+  while i < s.len:
+    let r = utf8_at(s, i)
+    if r[0] == 65533 and r[1] == 1 and int(s[i]) >= 0x80:
+      out += "\\x" + hex2(int(s[i]))
+    else: out += quote_cp(r[0], 34)
+    i += r[1]
+  return out + "\""
+
+# types.TypeString (qualified by package path, but for rel's own types): uint8 printed as byte, as
+# it's mostly written (go/types keeps which of the two names the source used)
+fn tstr(var g: tc.Prog, fs: Fs, t: Int, rel: Str) -> Str:
+  if t <= 0: return "invalid type"
+  let kt = g.tk[t]
+  if kt == tc.TY_BASIC:
+    if t == tc.B_UINT8: return "byte"
+    return tc.type_str(&g, fs, t, rel)
+  if kt == tc.TY_NAMED:
+    let o = g.ta[t]
+    var s = g.oname[o] + ""
+    let pi = g.opkg[o]
+    if pi >= 0 and g.pk[pi].path != rel: s = g.pk[pi].path + "." + s
+    let targs = tc.tlist(g, t)
+    if targs.len > 0:
+      s += "["
+      for i in 0..targs.len:
+        if i > 0: s += ", "
+        s += tstr(&g, fs, targs[i], rel)
+      s += "]"
+    return s
+  if kt == tc.TY_PTR: return "*" + tstr(&g, fs, g.ta[t], rel)
+  if kt == tc.TY_SLICE: return "[]" + tstr(&g, fs, g.ta[t], rel)
+  if kt == tc.TY_ARRAY: return "[{g.tb[t]}]" + tstr(&g, fs, g.ta[t], rel)
+  if kt == tc.TY_MAP:
+    let ks = tstr(&g, fs, g.ta[t], rel)
+    return "map[" + ks + "]" + tstr(&g, fs, g.tb[t], rel)
+  if kt == tc.TY_CHAN:
+    let e = tstr(&g, fs, g.ta[t], rel)
+    if g.tb[t] == 1: return "chan<- " + e
+    if g.tb[t] == 2: return "<-chan " + e
+    if g.tk[g.ta[t]] == tc.TY_CHAN and g.tb[g.ta[t]] == 2: return "chan (" + e + ")"
+    return "chan " + e
+  if kt == tc.TY_FUNC: return "func" + sig(&g, fs, t, rel, [])
+  if kt == tc.TY_STRUCT:
+    var s = "struct{{"
+    let fl = tc.tlist(g, t)
+    for i in 0..fl.len:
+      if i > 0: s += "; "
+      let ft = tc.obj_type(&g, fs, fl[i])
+      let fts = tstr(&g, fs, ft, rel)
+      if g.orecv[fl[i]] == 1: s += fts
+      else: s += g.oname[fl[i]] + " " + fts
+      let tg = field_tag(g, fl[i])
+      if tg != "": s += " " + go_quote(tg)
+    return s + "}}"
+  return tc.type_str(&g, fs, t, rel)
+
+# A signature as go/types prints it, with the parameters' names when given
+fn sig(var g: tc.Prog, fs: Fs, t: Int, rel: Str, names: [Str]) -> Str:
+  var s = "("
+  let ps = tc.tlist(g, g.ta[t])
+  let variadic = tc.is_variadic(g, t)
+  for i in 0..ps.len:
+    if i > 0: s += ", "
+    if i < names.len and names[i] != "": s += names[i] + " "
+    if variadic and i == ps.len - 1 and g.tk[ps[i]] == tc.TY_SLICE: s += "..." + tstr(&g, fs, g.ta[ps[i]], rel)
+    else: s += tstr(&g, fs, ps[i], rel)
+  s += ")"
+  let rs = tc.tlist(g, g.tb[t])
+  if rs.len == 1: s += " " + tstr(&g, fs, rs[0], rel)
+  elif rs.len > 1:
+    s += " ("
+    for i in 0..rs.len:
+      if i > 0: s += ", "
+      s += tstr(&g, fs, rs[i], rel)
+    s += ")"
+  return s
+
+fn iface_method(var g: tc.Prog, fs: Fs, o: Int) -> Bool:
+  return g.mowner.get(o, -1) >= 0
+
+# ---- reachability: code the IR drops (after a statement that never completes)
+
+fn is_stmt_list_parent(g: tc.Prog, pi: Int, p: Int) -> Bool:
+  let kp = k(g, pi, p)
+  return kp == ast.N_BLOCK or kp == ast.N_CASE or kp == ast.N_COMM
+
+# The statement list of a block, case or comm clause
+fn stmt_list(g: tc.Prog, pi: Int, p: Int) -> [Int]:
+  let t = g.pk[pi].t
+  if t.k[p] == ast.N_BLOCK: return ast.items(t, t.a[p])
+  return ast.items(t, t.b[p])
+
+# Whether node n is in code nothing reaches
+fn dead(var g: tc.Prog, fs: Fs, pi: Int, x: X, n: Int) -> Bool:
+  var a = n
+  while a > 0:
+    let ka = k(g, pi, a)
+    if ka == ast.N_FUNCDECL or ka == ast.N_FUNCLIT: return false
+    let p = x.par[a]
+    if p > 0 and is_stmt_list_parent(g, pi, p):
+      let ss = stmt_list(g, pi, p)
+      var i = 0
+      while i < ss.len and ss[i] != a: i += 1
+      if i < ss.len:
+        var j = i
+        while j > 0:
+          if k(g, pi, ss[j]) == ast.N_LABELED: break
+          if term(&g, fs, pi, ss[j - 1]): return true
+          j -= 1
+    a = p
+  return false
+
+# Whether a statement never completes: Go's terminating statements, and calls to panic or to a
+# standard library function that never returns
+fn term(var g: tc.Prog, fs: Fs, pi: Int, s: Int) -> Bool:
+  let ks = k(g, pi, s)
+  if ks == ast.N_RETURN: return true
+  if ks == ast.N_BRANCH: return g.pk[pi].t.f[s] == K_GOTO
+  if ks == ast.N_EXPRSTMT:
+    let e = up(g, pi, g.pk[pi].t.a[s])
+    if k(g, pi, e) != ast.N_CALL: return false
+    if vet.builtin_callee(g, pi, e) == "panic": return true
+    let o = vet.callee(g, pi, e)
+    if o < 0: return false
+    let pk = g.opkg[g.oorig[o]]
+    if pk < 0 or not g.pk[pk].std: return false
+    let fname = errcheck.full_name(&g, fs, g.oorig[o])
+    return fname in g.ssa_noret
+  if ks == ast.N_BLOCK:
+    let ss = ast.items(g.pk[pi].t, g.pk[pi].t.a[s])
+    return ss.len > 0 and term(&g, fs, pi, ss[ss.len - 1])
+  if ks == ast.N_IF:
+    if g.pk[pi].t.d[s] <= 0: return false
+    return term(&g, fs, pi, g.pk[pi].t.c[s]) and term(&g, fs, pi, g.pk[pi].t.d[s])
+  if ks == ast.N_LABELED: return term_l(&g, fs, pi, g.pk[pi].t.b[s], sc.nm(g, pi, g.pk[pi].t.a[s]))
+  return term_l(&g, fs, pi, s, "")
+
+fn term_l(var g: tc.Prog, fs: Fs, pi: Int, s: Int, label: Str) -> Bool:
+  let ks = k(g, pi, s)
+  if ks == ast.N_FOR:
+    if g.pk[pi].t.b[s] > 0: return false
+    return not has_break(g, pi, g.pk[pi].t.d[s], label, true)
+  if ks == ast.N_SWITCH or ks == ast.N_TYPESWITCH or ks == ast.N_SELECT:
+    var cl = g.pk[pi].t.c[s]
+    if ks == ast.N_SELECT: cl = g.pk[pi].t.a[s]
+    var dflt = ks == ast.N_SELECT
+    for cc in ast.items(g.pk[pi].t, cl):
+      if ks != ast.N_SELECT and g.pk[pi].t.a[cc] < 0: dflt = true
+      let body = ast.items(g.pk[pi].t, g.pk[pi].t.b[cc])
+      for b in body:
+        if has_break(g, pi, b, label, true): return false
+      if body.len == 0: return false
+      let last = body[body.len - 1]
+      if not term(&g, fs, pi, last) and not (k(g, pi, last) == ast.N_BRANCH and g.pk[pi].t.f[last] == K_FALLTHROUGH): return false
+    return dflt
+  return false
+
+# Whether a break in n leaves the statement labeled label (or the innermost one, when top)
+fn has_break(g: tc.Prog, pi: Int, n: Int, label: Str, top: Bool) -> Bool:
+  if n <= 0: return false
+  let t = g.pk[pi].t
+  let kn = k(g, pi, n)
+  if kn == ast.N_BRANCH and t.f[n] == K_BREAK:
+    if t.a[n] > 0: return label != "" and sc.nm(g, pi, t.a[n]) == label
+    return top
+  if kn == ast.N_FUNCLIT: return false
+  var inner = top
+  if kn == ast.N_FOR or kn == ast.N_RANGE or kn == ast.N_SWITCH or kn == ast.N_TYPESWITCH or kn == ast.N_SELECT: inner = false
+  var kids: [Int] = []
+  vet.push_kids(t, n, &kids)
+  for ch in kids:
+    if has_break(g, pi, ch, label, inner): return true
+  return false
+
+# The function (FuncDecl or FuncLit) a node is in, -1 for none
+fn func_of(g: tc.Prog, pi: Int, x: X, n: Int) -> Int:
+  var a = x.par[n]
+  while a > 0:
+    let ka = k(g, pi, a)
+    if ka == ast.N_FUNCDECL or ka == ast.N_FUNCLIT: return a
+    a = x.par[a]
+  return -1
+
+# The nodes of function f's own body (not those of the closures in it)
+fn own_nodes(g: tc.Prog, pi: Int, body: Int) -> [Int]:
+  var out: [Int] = []
+  var stack: [Int] = [body]
+  let t = g.pk[pi].t
+  while stack.len > 0:
+    let n = stack.pop()
+    out.push(n)
+    if t.k[n] == ast.N_FUNCLIT: continue
+    vet.push_kids(t, n, &stack)
+  return out
+
+fn loop_of(g: tc.Prog, pi: Int, x: X, n: Int, stop: Int) -> Int:
+  var a = x.par[n]
+  while a > 0 and a != stop:
+    let ka = k(g, pi, a)
+    if ka == ast.N_FOR or ka == ast.N_RANGE: return a
+    if ka == ast.N_FUNCLIT or ka == ast.N_FUNCDECL: return -1
+    a = x.par[a]
+  return -1
+
+fn inside(g: tc.Prog, pi: Int, x: X, n: Int, a: Int) -> Bool:
+  var p = n
+  while p > 0:
+    if p == a: return true
+    p = x.par[p]
+  return false
+
+# ---- SA1023: io.Writer.Write implementations that modify their buffer
+
+fn sa1023(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, nodes: [Int]):
+  let pi = c.pi
+  for d in nodes:
+    if k(g, pi, d) != ast.N_FUNCDECL or g.pk[pi].t.a[d] < 0 or g.pk[pi].t.d[d] <= 0: continue
+    if sc.nm(g, pi, g.pk[pi].t.b[d]) != "Write": continue
+    let fo = sc.obj_of(g, pi, g.pk[pi].t.b[d])
+    if fo < 0: continue
+    let ft = tc.obj_type(&g, fs, fo)
+    if ft <= 0 or g.tk[ft] != tc.TY_FUNC or tc.is_variadic(g, ft): continue
+    if sig(&g, fs, ft, "", []) != "([]byte) (int, error)": continue
+    # (the buffer parameter's object)
+    let pl = ast.items(g.pk[pi].t, g.pk[pi].t.b[g.pk[pi].t.c[d]])
+    if pl.len != 1 or g.pk[pi].t.a[pl[0]] < 0: continue
+    let pn = ast.items(g.pk[pi].t, g.pk[pi].t.a[pl[0]])
+    if pn.len != 1: continue
+    let b = sc.obj_of(g, pi, pn[0])
+    if b < 0 or b in x.esc: continue
+    let own = own_nodes(g, pi, g.pk[pi].t.d[d])
+    # (the statements assigning b)
+    var asg: [Int] = []
+    for n in own:
+      let kn = k(g, pi, n)
+      if kn == ast.N_ASSIGN:
+        for l in ast.items(g.pk[pi].t, g.pk[pi].t.a[n]):
+          if sc.obj_of(g, pi, up(g, pi, l)) == b: asg.push(n)
+      elif kn == ast.N_RANGE:
+        for l in [g.pk[pi].t.a[n], g.pk[pi].t.b[n]]:
+          if l > 0 and sc.obj_of(g, pi, up(g, pi, l)) == b: asg.push(n)
+    for n in own:
+      let kn = k(g, pi, n)
+      if kn == ast.N_ASSIGN or kn == ast.N_INCDEC:
+        var ls: [Int] = []
+        if kn == ast.N_ASSIGN: ls = ast.items(g.pk[pi].t, g.pk[pi].t.a[n])
+        else: ls.push(g.pk[pi].t.a[n])
+        for l0 in ls:
+          let l = up(g, pi, l0)
+          if k(g, pi, l) != ast.N_INDEX: continue
+          let xx = up(g, pi, g.pk[pi].t.a[l])
+          if k(g, pi, xx) != ast.N_IDENT or sc.obj_of(g, pi, xx) != b: continue
+          if not param_value(g, pi, x, xx, asg, d) or dead(&g, fs, pi, x, n): continue
+          sc.report(g, &c, n, "SA1023", "io.Writer.Write must not modify the provided buffer, not even temporarily")
+      elif kn == ast.N_CALL and vet.builtin_callee(g, pi, n) == "append":
+        let as = args_of(g, pi, n)
+        if as.len == 0: continue
+        let a0 = up(g, pi, as[0])
+        if k(g, pi, a0) != ast.N_IDENT or sc.obj_of(g, pi, a0) != b: continue
+        if not param_value(g, pi, x, a0, asg, d) or dead(&g, fs, pi, x, n): continue
+        sc.report(g, &c, n, "SA1023", "io.Writer.Write must not modify the provided buffer, not even temporarily")
+
+# Whether the read u of a parameter is still the parameter's own value: no assignment to it comes
+# before (or with it in a loop)
+fn param_value(g: tc.Prog, pi: Int, x: X, u: Int, asg: [Int], fnode: Int) -> Bool:
+  let t = g.pk[pi].t
+  for a in asg:
+    if t.file[a] != t.file[u]: continue
+    if t.end[a] <= t.pos[u]: return false
+    if k(g, pi, a) == ast.N_RANGE and inside(g, pi, x, u, a): return false
+    var l = loop_of(g, pi, x, a, fnode)
+    while l > 0:
+      if inside(g, pi, x, u, l): return false
+      l = loop_of(g, pi, x, l, fnode)
+  return true
+
+# ---- SA1015: time.Tick in functions that return
+
+fn main_like(g: tc.Prog, pi: Int) -> Bool:
+  if g.pk[pi].name == "main": return true
+  for fi in 0..g.pk[pi].imps.len:
+    for imp in g.pk[pi].imps[fi]:
+      let pl = g.pk[pi].t.b[imp]
+      if pl > 0 and sc.nm(g, pi, pl) == "\"github.com/spf13/cobra\"": return true
+  return false
+
+fn sa1015(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, p: pkg.Pkg, calls: [Int]):
+  let pi = c.pi
+  if x.gover >= 23 or main_like(g, pi): return
+  var memo: {Int: Bool} = {}
+  for n in calls:
+    if not sc.callee_is(&g, fs, &c, n, "time.Tick"): continue
+    let f = func_of(g, pi, x, n)
+    if f < 0 or p.test[g.pk[pi].t.file[f]]: continue
+    if dead(&g, fs, pi, x, n): continue
+    if not (f in memo):
+      let r = terminates(&g, fs, pi, x, f)
+      memo[f] = r
+    if memo[f]: sc.report(g, &c, n, "SA1015", "using time.Tick leaks the underlying ticker, consider using it only in endless functions, tests and the main package, and use time.NewTicker here")
+
+# irutil.Terminates: whether the IR's exit block is reached other than from a panic or from the end
+# of a range over time.Tick's channel. Each return (and the body's end, when it completes) leads
+# there; one right after such a range (nothing between) is reached from the range's exit. So is one
+# with only simple statements between when it's the exit's only way in (the blocks are fused then).
+# A function with a defer has a recover block, a return nothing jumps to.
+fn terminates(var g: tc.Prog, fs: Fs, pi: Int, x: X, f: Int) -> Bool:
+  var body = g.pk[pi].t.d[f]
+  if k(g, pi, f) == ast.N_FUNCLIT: body = g.pk[pi].t.b[f]
+  if body <= 0: return true
+  var rets: [Int] = []
+  for n in own_nodes(g, pi, body):
+    let kn = k(g, pi, n)
+    if kn == ast.N_RETURN and not dead(&g, fs, pi, x, n): rets.push(n)
+    elif kn == ast.N_DEFER and not dead(&g, fs, pi, x, n): return true
+  let ss = ast.items(g.pk[pi].t, g.pk[pi].t.a[body])
+  var ends = rets.len
+  var falls = false
+  if ss.len == 0: falls = true
+  else:
+    let last = ss[ss.len - 1]
+    let tick_end = k(g, pi, last) == ast.N_RANGE and tick_range(&g, fs, pi, x, last) and not has_break(g, pi, g.pk[pi].t.d[last], "", true)
+    falls = not dead(&g, fs, pi, x, last) and not term(&g, fs, pi, last) and not tick_end
+    if tick_end and not dead(&g, fs, pi, x, last): ends += 1
+  if falls: ends += 1
+  for r in rets:
+    let run = run_after_tick(&g, fs, pi, x, r, true)
+    if run < 0 or (run > 0 and ends >= 2): return true
+  if falls:
+    if ss.len == 0: return true
+    let run = run_after_tick(&g, fs, pi, x, ss[ss.len - 1], false)
+    if run < 0 or (run > 0 and ends >= 2): return true
+  return false
+
+# For a return (or the body's last statement, s itself included), how many simple statements come
+# between it and a range over time.Tick's channel without a break before it: -1 when there's none
+fn run_after_tick(var g: tc.Prog, fs: Fs, pi: Int, x: X, s: Int, is_ret: Bool) -> Int:
+  let p = x.par[s]
+  if p <= 0 or not is_stmt_list_parent(g, pi, p): return -1
+  let ss = stmt_list(g, pi, p)
+  var i = 0
+  while i < ss.len and ss[i] != s: i += 1
+  if i >= ss.len: return -1
+  var run = 0
+  if not is_ret:
+    if not simple_stmt(g, pi, s):
+      if k(g, pi, s) == ast.N_RANGE and tick_range(&g, fs, pi, x, s) and not has_break(g, pi, g.pk[pi].t.d[s], "", true): return 0
+      return -1
+    run = 1
+  var j = i - 1
+  while j >= 0:
+    let st = ss[j]
+    if k(g, pi, st) == ast.N_RANGE and tick_range(&g, fs, pi, x, st):
+      if has_break(g, pi, g.pk[pi].t.d[st], "", true): return -1
+      return run
+    if not simple_stmt(g, pi, st): return -1
+    run += 1
+    j -= 1
+  return -1
+
+fn simple_stmt(g: tc.Prog, pi: Int, s: Int) -> Bool:
+  let ks = k(g, pi, s)
+  return ks == ast.N_EXPRSTMT or ks == ast.N_ASSIGN or ks == ast.N_INCDEC or ks == ast.N_DECLSTMT or ks == ast.N_SEND or ks == ast.N_GO or ks == ast.N_DEFER or ks == ast.N_EMPTY
+
+fn tick_range(var g: tc.Prog, fs: Fs, pi: Int, x: X, r: Int) -> Bool:
+  var e = up(g, pi, g.pk[pi].t.c[r])
+  if k(g, pi, e) == ast.N_IDENT:
+    var c2 = sc.C(pi, [], {})
+    let d = lifted(&g, fs, &c2, x, sc.obj_of(g, pi, e))
+    if d <= 0: return false
+    e = up(g, pi, d)
+  if k(g, pi, e) != ast.N_CALL: return false
+  let o = vet.callee(g, pi, e)
+  if o < 0: return false
+  let fname = errcheck.full_name(&g, fs, g.oorig[o])
+  return fname == "time.Tick"
+
+# ---- SA1025: using (*time.Timer).Reset's result
+
+# The leaves of a condition (through parentheses, ! , && and ||), with the IR's branches: each leaf's
+# targets when true and when false (a leaf's index, or -1 the then branch, -2 the else branch)
+type Cond:
+  leaves: [Int]
+  tt: [Int]
+  ft: [Int]
+
+fn cond_graph(g: tc.Prog, pi: Int, var cg: Cond, e0: Int, tt: Int, ft: Int):
+  let e = up(g, pi, e0)
+  let t = g.pk[pi].t
+  let ke = k(g, pi, e)
+  if ke == ast.N_UNARY and t.f[e] == T_NOT:
+    cond_graph(g, pi, &cg, t.a[e], ft, tt)
+    return
+  if ke == ast.N_BINARY and (t.f[e] == T_LAND or t.f[e] == T_LOR):
+    # (b's first leaf is the next one after a's)
+    let i = cg.leaves.len
+    let na = count_leaves(g, pi, t.a[e])
+    let bstart = i + na
+    if t.f[e] == T_LAND: cond_graph(g, pi, &cg, t.a[e], bstart, ft)
+    else: cond_graph(g, pi, &cg, t.a[e], tt, bstart)
+    cond_graph(g, pi, &cg, t.b[e], tt, ft)
+    return
+  cg.leaves.push(e)
+  cg.tt.push(tt)
+  cg.ft.push(ft)
+
+fn count_leaves(g: tc.Prog, pi: Int, e0: Int) -> Int:
+  let e = up(g, pi, e0)
+  let t = g.pk[pi].t
+  let ke = k(g, pi, e)
+  if ke == ast.N_UNARY and t.f[e] == T_NOT: return count_leaves(g, pi, t.a[e])
+  if ke == ast.N_BINARY and (t.f[e] == T_LAND or t.f[e] == T_LOR): return count_leaves(g, pi, t.a[e]) + count_leaves(g, pi, t.b[e])
+  return 1
+
+fn sa1025(var g: tc.Prog, fs: Fs, var c: sc.C, var x: X, calls: [Int]):
+  let pi = c.pi
+  for n in calls:
+    if not sc.callee_is(&g, fs, &c, n, "(*time.Timer).Reset"): continue
+    if dead(&g, fs, pi, x, n): continue
+    # (the conditions using the call's value: the call itself, or a local holding it)
+    var uses: [Int] = [n]
+    let p = x.par[n]
+    var holder = -1
+    if p > 0 and k(g, pi, p) == ast.N_ASSIGN and g.pk[pi].t.f[p] == T_DEFINE:
+      let ls = ast.items(g.pk[pi].t, g.pk[pi].t.a[p])
+      let rs = ast.items(g.pk[pi].t, g.pk[pi].t.b[p])
+      if ls.len == rs.len:
+        for i in 0..rs.len:
+          if rs[i] == n: holder = sc.obj_of(g, pi, ls[i])
+    elif p > 0 and k(g, pi, p) == ast.N_VALUESPEC and g.pk[pi].t.c[p] > 0:
+      let ls = ast.items(g.pk[pi].t, g.pk[pi].t.a[p])
+      let rs = ast.items(g.pk[pi].t, g.pk[pi].t.c[p])
+      if ls.len == rs.len:
+        for i in 0..rs.len:
+          if rs[i] == n: holder = sc.obj_of(g, pi, ls[i])
+    if holder >= 0 and lifted(&g, fs, &c, x, holder) == n:
+      for m in x.nodes:
+        if k(g, pi, m) == ast.N_IDENT and sc.obj_of(g, pi, m) == holder and g.onode[holder] != m: uses.push(m)
+    var found = false
+    for u in uses:
+      if reset_if(&g, fs, pi, x, u): found = true
+    if found: sc.report(g, &c, n, "SA1025", "it is not possible to use Reset's return value correctly, as there is a race condition between draining the channel and the new timer expiring")
+
+# Whether u is a leaf of an if statement's condition, and a branch it takes leads (as the only way
+# in) to a receive from a <-chan time.Time
+fn reset_if(var g: tc.Prog, fs: Fs, pi: Int, x: X, u: Int) -> Bool:
+  # (up through the condition)
+  var e = u
+  var p = x.par[e]
+  while p > 0:
+    let kp = k(g, pi, p)
+    if kp == ast.N_PAREN or (kp == ast.N_UNARY and g.pk[pi].t.f[p] == T_NOT) or (kp == ast.N_BINARY and (g.pk[pi].t.f[p] == T_LAND or g.pk[pi].t.f[p] == T_LOR)):
+      e = p
+      p = x.par[p]
+      continue
+    break
+  if p <= 0 or k(g, pi, p) != ast.N_IF or g.pk[pi].t.b[p] != e: return false
+  let ifs = p
+  var cg = Cond([], [], [])
+  cond_graph(g, pi, &cg, e, -1, -2)
+  let m = cg.leaves.len
+  var li = -1
+  for i in 0..m:
+    if cg.leaves[i] == up(g, pi, u): li = i
+  if li < 0: return false
+  # (the graph: leaves 0..m-1, then m, else m+1, the join m+2; without an else, the else is the join)
+  let has_else = g.pk[pi].t.d[ifs] > 0
+  var succ: [[Int]] = []
+  for i in 0..m + 3: succ.push([])
+  for i in 0..m:
+    for tg in [cg.tt[i], cg.ft[i]]:
+      var to = tg
+      if tg == -1: to = m
+      elif tg == -2: to = m + 1
+      succ[i].push(to)
+  let then_falls = not term(&g, fs, pi, g.pk[pi].t.c[ifs])
+  if then_falls:
+    if has_else: succ[m].push(m + 2)
+    else: succ[m].push(m + 1)
+  if has_else and not term(&g, fs, pi, g.pk[pi].t.d[ifs]): succ[m + 1].push(m + 2)
+  var preds = [0] * (m + 3)
+  for i in 0..m + 3:
+    for j in succ[i]: preds[j] += 1
+  for sidx in 0..2:
+    let s = succ[li][sidx]
+    if preds[s] != 1: continue
+    for nd in 0..m + 3:
+      if not dominates(succ, s, nd): continue
+      if nd < m:
+        if recv_tick(&g, fs, pi, cg.leaves[nd]): return true
+      elif nd == m:
+        if recv_tick(&g, fs, pi, g.pk[pi].t.c[ifs]): return true
+      elif nd == m + 1 and has_else:
+        if recv_tick(&g, fs, pi, g.pk[pi].t.d[ifs]): return true
+      elif (nd == m + 1 and not has_else) or nd == m + 2:
+        for st in after(g, pi, x, ifs):
+          if recv_tick(&g, fs, pi, st): return true
+  return false
+
+# Whether d dominates n in the graph from node 0 (n reachable)
+fn dominates(succ: [[Int]], d: Int, n: Int) -> Bool:
+  if not reach(succ, -1, n): return false
+  if d == n: return true
+  return not reach(succ, d, n)
+
+fn reach(succ: [[Int]], avoid: Int, n: Int) -> Bool:
+  if avoid == 0: return false
+  var seen = [false] * succ.len
+  var stack: [Int] = [0]
+  seen[0] = true
+  while stack.len > 0:
+    let a = stack.pop()
+    if a == n: return true
+    for b in succ[a]:
+      if b != avoid and not seen[b]:
+        seen[b] = true
+        stack.push(b)
+  return false
+
+# The statements after s in its statement list
+fn after(g: tc.Prog, pi: Int, x: X, s: Int) -> [Int]:
+  var out: [Int] = []
+  let p = x.par[s]
+  if p <= 0 or not is_stmt_list_parent(g, pi, p): return out
+  var seen = false
+  for st in stmt_list(g, pi, p):
+    if seen: out.push(st)
+    if st == s: seen = true
+  return out
+
+# Whether n has a receive from a <-chan time.Time (not in a closure, not a select's case)
+fn recv_tick(var g: tc.Prog, fs: Fs, pi: Int, n: Int) -> Bool:
+  var stack: [Int] = [n]
+  while stack.len > 0:
+    let m = stack.pop()
+    let km = k(g, pi, m)
+    if km == ast.N_FUNCLIT: continue
+    if km == ast.N_COMM:
+      let bl = g.pk[pi].t.b[m]
+      if bl > 0:
+        for st in ast.items(g.pk[pi].t, bl): stack.push(st)
+      continue
+    vet.push_kids(g.pk[pi].t, m, &stack)
+    var ch = -1
+    if km == ast.N_UNARY and g.pk[pi].t.f[m] == T_ARROW: ch = g.pk[pi].t.a[m]
+    elif km == ast.N_RANGE: ch = g.pk[pi].t.c[m]
+    if ch <= 0: continue
+    let t = vet.ty(g, pi, up(g, pi, ch))
+    if t > 0 and g.tk[t] == tc.TY_CHAN and g.tb[t] == 2 and tstr(&g, fs, t, "") == "<-chan time.Time": return true
+  return false
+
+# ---- SA1026: marshaling types encoding/json or encoding/xml can't (staticcheck's fakejson and
+# fakexml: the encoders' walks over the types, with reflect's addressability)
+
+# An encoder's error: kind 0 none, 1 unsupported type, 2 cyclic type, 3 another error; the type and
+# the path to it
+type MErr:
+  kind: Int
+  t: Int
+  path: Str
+
+fn merr_none() -> MErr:
+  return MErr(0, 0, "")
+
+type Enc:
+  seen_ca: {Int: Bool}
+  seen_cn: {Int: Bool}
+
+fn sa1026(var g: tc.Prog, fs: Fs, var c: sc.C, x: X, cl: Call):
+  let pi = c.pi
+  let v = arg_v(&g, fs, &c, x, cl, 0)
+  let t = arg_type(&g, fs, v, cl.pt[0])
+  if t <= 0: return
+  var e = Enc({}, {})
+  var err = merr_none()
+  if cl.name.find("json") >= 0: err = json_enc(&g, fs, &e, t, false, "x", 0)
+  else: err = xml_value(&g, fs, &e, t, false, "x", 0)
+  if err.kind != 1 and err.kind != 2: return
+  let rel = g.pk[pi].path + ""
+  var ts = tstr(&g, fs, err.t, rel)
+  # (a function's own type: its signature with its parameters' names)
+  if err.t == t and v.n > 0 and not v.mi and g.tk[t] == tc.TY_FUNC:
+    let names = param_names(g, pi, v.n)
+    if names.len > 0: ts = "func" + sig(&g, fs, t, rel, names)
+  elif g.tk[err.t] == tc.TY_FUNC and err.path != "x":
+    # (a field's: the names its type is written with)
+    let names = names_via_path(&g, fs, t, err.path)
+    if names.len > 0: ts = "func" + sig(&g, fs, err.t, rel, names)
+  var what = "unsupported"
+  if err.kind == 2: what = "cyclic"
+  var msg = "trying to marshal " + what + " type " + ts
+  if err.path != "x": msg += ", via " + err.path
+  sc.report(g, &c, arg_at(cl, 0), "SA1026", msg)
+
+# The parameters' names of the function an expression names (declared in this package)
+fn param_names(g: tc.Prog, pi: Int, e0: Int) -> [Str]:
+  var out: [Str] = []
+  let e = up(g, pi, e0)
+  var o = -1
+  if k(g, pi, e) == ast.N_IDENT: o = sc.obj_of(g, pi, e)
+  if o < 0 or g.ok[o] != tc.O_FUNC or g.opkg[o] != pi: return out
+  let d = g.odecl[o]
+  if d <= 0 or k(g, pi, d) != ast.N_FUNCDECL: return out
+  let ft = g.pk[pi].t.c[d]
+  for f in ast.items(g.pk[pi].t, g.pk[pi].t.b[ft]):
+    if g.pk[pi].t.a[f] < 0: out.push("")
+    else:
+      for id in ast.items(g.pk[pi].t, g.pk[pi].t.a[f]): out.push(sc.nm(g, pi, id))
+  return out
+
+# The parameters' names of the function type of the field a path ends with ("x.A[0].F")
+fn names_via_path(var g: tc.Prog, fs: Fs, t0: Int, path: Str) -> [Str]:
+  var out: [Str] = []
+  var t = t0
+  var i = 1
+  var last = -1
+  while i < path.len:
+    if path[i] == '[':
+      let j = path.find("]", i)
+      if j < 0: return out
+      t = elem_t(&g, fs, t)
+      last = -1
+      i = j + 1
+      continue
+    if path[i] != '.': return out
+    var j = i + 1
+    while j < path.len and path[j] != '.' and path[j] != '[': j += 1
+    let name = path[i + 1..j]
+    while is_ptr_t(&g, fs, t): t = elem_t(&g, fs, t)
+    if not is_struct_t(&g, fs, t): return out
+    let u = tc.under(&g, fs, t)
+    var found = -1
+    for f in tc.tlist(g, u):
+      if g.oname[f] == name: found = f
+    if found < 0: return out
+    last = found
+    t = tc.obj_type(&g, fs, found)
+    i = j
+  if last < 0: return out
+  let pk = g.opkg[last]
+  let d = g.odecl[last]
+  if pk < 0 or d <= 0 or g.pk[pk].t.k[d] != ast.N_FIELD: return out
+  let te = g.pk[pk].t.b[d]
+  if te <= 0 or g.pk[pk].t.k[te] != ast.N_FUNCTYPE: return out
+  var named = false
+  for f in ast.items(g.pk[pk].t, g.pk[pk].t.b[te]):
+    if g.pk[pk].t.a[f] < 0: out.push("")
+    else:
+      named = true
+      for id in ast.items(g.pk[pk].t, g.pk[pk].t.a[f]): out.push(g.pk[pk].t.names[g.pk[pk].t.s[id]] + "")
+  if not named: return []
+  return out
+
+fn uk(var g: tc.Prog, fs: Fs, t: Int) -> Int:
+  if t <= 0: return 0
+  let u = tc.under(&g, fs, t)
+  if u <= 0: return 0
+  return g.tk[u]
+
+# fakereflect's Elem: a pointer's and a slice's element can be addressed, an array's as the array,
+# a map's not
+fn elem_ca(var g: tc.Prog, fs: Fs, t: Int, ca: Bool) -> Bool:
+  let kt = uk(&g, fs, t)
+  if kt == tc.TY_PTR or kt == tc.TY_SLICE: return true
+  if kt == tc.TY_ARRAY: return ca
+  return false
+
+fn elem_t(var g: tc.Prog, fs: Fs, t: Int) -> Int:
+  let u = tc.under(&g, fs, t)
+  if g.tk[u] == tc.TY_MAP: return g.tb[u]
+  return g.ta[u]
+
+fn implements_m(var g: tc.Prog, fs: Fs, t: Int, name: Str, want: Str) -> Bool:
+  if t <= 0: return false
+  let m = tc.method_in_set(&g, fs, t, name)
+  if m.len == 0 or m[1] <= 0 or g.tk[m[1]] != tc.TY_FUNC: return false
+  return sig(&g, fs, m[1], "", []) == want
+
+fn json_marshaler(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return implements_m(&g, fs, t, "MarshalJSON", "() ([]byte, error)")
+
+fn text_marshaler(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return implements_m(&g, fs, t, "MarshalText", "() ([]byte, error)")
+
+fn is_tparam(g: tc.Prog, t: Int) -> Bool:
+  return t > 0 and g.tk[t] == tc.TY_TPARAM
+
+fn json_enc(var g: tc.Prog, fs: Fs, var e: Enc, t: Int, ca: Bool, stack: Str, depth: Int) -> MErr:
+  if depth > 100: return merr_none()
+  if ca:
+    if t in e.seen_ca: return merr_none()
+    e.seen_ca[t] = true
+  else:
+    if t in e.seen_cn: return merr_none()
+    e.seen_cn[t] = true
+  let kt = uk(&g, fs, t)
+  if json_marshaler(&g, fs, t): return merr_none()
+  if kt != tc.TY_PTR and ca:
+    let pt = tc.ptr_to(&g, t)
+    if json_marshaler(&g, fs, pt): return merr_none()
+  if text_marshaler(&g, fs, t): return merr_none()
+  if kt != tc.TY_PTR and ca:
+    let pt = tc.ptr_to(&g, t)
+    if text_marshaler(&g, fs, pt): return merr_none()
+  if kt == tc.TY_BASIC or kt == tc.TY_IFACE or kt == tc.TY_TPARAM: return merr_none()
+  if kt == tc.TY_STRUCT: return json_fields(&g, fs, &e, t, ca, stack, depth)
+  if kt == tc.TY_MAP:
+    let u = tc.under(&g, fs, t)
+    let key = g.ta[u]
+    if not is_tparam(g, key):
+      if uk(&g, fs, key) != tc.TY_BASIC and not text_marshaler(&g, fs, key): return MErr(1, t, stack + "")
+    return json_enc(&g, fs, &e, g.tb[u], false, stack + "[k]", depth + 1)
+  if kt == tc.TY_SLICE:
+    let el = elem_t(&g, fs, t)
+    let eu = tc.under(&g, fs, el)
+    if eu == tc.B_UINT8:
+      let p = tc.ptr_to(&g, el)
+      if not json_marshaler(&g, fs, p) and not text_marshaler(&g, fs, p): return merr_none()
+    return json_enc(&g, fs, &e, el, true, stack + "[0]", depth + 1)
+  if kt == tc.TY_ARRAY:
+    let el = elem_t(&g, fs, t)
+    return json_enc(&g, fs, &e, el, ca, stack + "[0]", depth + 1)
+  if kt == tc.TY_PTR:
+    let el = elem_t(&g, fs, t)
+    return json_enc(&g, fs, &e, el, true, stack, depth + 1)
+  return MErr(1, t, stack + "")
+
+# A struct field as fakereflect has it
+type SF:
+  name: Str
+  anon: Bool
+  tag: Str
+  t: Int
+  ca: Bool
+
+fn sfield(var g: tc.Prog, fs: Fs, t: Int, ca: Bool, i: Int) -> SF:
+  let u = tc.under(&g, fs, t)
+  let fl = tc.tlist(g, u)
+  let f = fl[i]
+  let ft = tc.obj_type(&g, fs, f)
+  return SF(g.oname[f] + "", g.orecv[f] == 1, field_tag(g, f), ft, ca)
+
+fn num_fields(var g: tc.Prog, fs: Fs, t: Int) -> Int:
+  let u = tc.under(&g, fs, t)
+  if u <= 0 or g.tk[u] != tc.TY_STRUCT: return 0
+  return g.tlen[u]
+
+fn field_tag(g: tc.Prog, f: Int) -> Str:
+  let pk = g.opkg[f]
+  let d = g.odecl[f]
+  if pk < 0 or d <= 0 or g.pk[pk].t.k[d] != ast.N_FIELD: return ""
+  let tg = g.pk[pk].t.c[d]
+  if tg <= 0: return ""
+  return tc.unquote(g.pk[pk].t.names[g.pk[pk].t.s[tg]])
+
+# reflect.StructTag.Get
+fn tag_get(tag0: Str, key: Str) -> Str:
+  var tag = tag0
+  while tag != "":
+    var i = 0
+    while i < tag.len and tag[i] == ' ': i += 1
+    tag = tag[i..tag.len]
+    if tag == "": break
+    i = 0
+    while i < tag.len and tag[i] > ' ' and tag[i] != ':' and tag[i] != '"' and int(tag[i]) != 0x7f: i += 1
+    if i == 0 or i + 1 >= tag.len or tag[i] != ':' or tag[i + 1] != '"': break
+    let name = tag[0..i]
+    tag = tag[i + 1..tag.len]
+    i = 1
+    while i < tag.len and tag[i] != '"':
+      if tag[i] == '\\': i += 1
+      i += 1
+    if i >= tag.len: break
+    let qv = tag[0..i + 1]
+    tag = tag[i + 1..tag.len]
+    if key == name: return tc.unquote(qv)
+  return ""
+
+fn exported_name(s: Str) -> Bool:
+  if s.len == 0: return false
+  let r = utf8_at(s, 0)
+  return chr(r[0]).is_upper()
+
+fn is_struct_t(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return uk(&g, fs, t) == tc.TY_STRUCT
+
+fn is_ptr_t(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return uk(&g, fs, t) == tc.TY_PTR
+
+fn named_name(g: tc.Prog, t: Int) -> Str:
+  if t <= 0 or g.tk[t] != tc.TY_NAMED: return ""
+  return g.oname[g.ta[t]] + ""
+
+fn valid_json_tag(s: Str) -> Bool:
+  if s == "": return false
+  for ch in s.chars():
+    if "!#$%&()*+-./:;<=>?@[]^_{{|}}~ ".find(ch) >= 0: continue
+    if not ch.is_alpha() and not ch.is_decimal(): return false
+  return true
+
+type JF:
+  name: Str
+  tag: Bool
+  index: [Int]
+  t: Int
+  ca: Bool
+
+fn jf_key(f: JF) -> Int:
+  var k0 = f.t * 2
+  if f.ca: k0 += 1
+  return k0
+
+fn idx_less(a: [Int], b: [Int]) -> Bool:
+  for i in 0..a.len:
+    if i >= b.len: return false
+    if a[i] != b[i]: return a[i] < b[i]
+  return a.len < b.len
+
+fn copy_ints(a: [Int]) -> [Int]:
+  var out: [Int] = []
+  for v in a: out.push(v)
+  return out
+
+fn jf_copy(f: JF) -> JF:
+  return JF(f.name + "", f.tag, copy_ints(f.index), f.t, f.ca)
+
+fn json_fields(var g: tc.Prog, fs: Fs, var e: Enc, t: Int, ca: Bool, stack: Str, depth: Int) -> MErr:
+  var next: [JF] = [JF("", false, [], t, ca)]
+  var count: {Int: Int} = {}
+  var ncount: {Int: Int} = {}
+  var visited: {Int: Bool} = {}
+  var fields: [JF] = []
+  while next.len > 0:
+    var current: [JF] = []
+    swap(&current, &next)
+    swap(&count, &ncount)
+    ncount = {}
+    for f in current:
+      let fk = jf_key(f)
+      if fk in visited: continue
+      visited[fk] = true
+      for i in 0..num_fields(&g, fs, f.t):
+        let sf = sfield(&g, fs, f.t, f.ca, i)
+        if sf.anon:
+          var tt = sf.t
+          if is_ptr_t(&g, fs, tt): tt = elem_t(&g, fs, tt)
+          if not exported_name(sf.name) and not is_struct_t(&g, fs, tt): continue
+        elif not exported_name(sf.name): continue
+        let tag = tag_get(sf.tag, "json")
+        if tag == "-": continue
+        var name = tag
+        let ci = tag.find(",")
+        if ci >= 0: name = tag[0..ci]
+        if not valid_json_tag(name): name = ""
+        var index = copy_ints(f.index)
+        index.push(i)
+        var ft = sf.t
+        var fca = sf.ca
+        if named_name(g, ft) == "" and is_ptr_t(&g, fs, ft):
+          fca = elem_ca(&g, fs, ft, fca)
+          ft = elem_t(&g, fs, ft)
+        if name != "" or not sf.anon or not is_struct_t(&g, fs, ft):
+          let tagged = name != ""
+          if name == "": name = sf.name + ""
+          fields.push(JF(name, tagged, copy_ints(index), ft, fca))
+          if count.get(fk, 0) > 1: fields.push(jf_copy(fields[fields.len - 1]))
+          continue
+        let nk = JF("", false, [], ft, fca)
+        let nkk = jf_key(nk)
+        ncount[nkk] = ncount.get(nkk, 0) + 1
+        if ncount[nkk] == 1: next.push(JF(named_name(g, ft), false, index, ft, fca))
+  fields.sort(by: fn(a, b) => jf_less(a, b))
+  var out: [JF] = []
+  var i = 0
+  while i < fields.len:
+    var adv = 1
+    while i + adv < fields.len and fields[i + adv].name == fields[i].name: adv += 1
+    if adv == 1: out.push(jf_copy(fields[i]))
+    elif not (fields[i].index.len == fields[i + 1].index.len and fields[i].tag == fields[i + 1].tag): out.push(jf_copy(fields[i]))
+    i += adv
+  out.sort(by: fn(a, b) => idx_less(a.index, b.index))
+  for f in out:
+    let ty = type_by_index(&g, fs, t, ca, f.index)
+    let path = path_by_index(&g, fs, t, ca, f.index)
+    let err = json_enc(&g, fs, &e, ty.t, ty.ca, stack + path, depth + 1)
+    if err.kind != 0: return err
+  return merr_none()
+
+fn jf_less(a: JF, b: JF) -> Bool:
+  if a.name != b.name: return a.name < b.name
+  if a.index.len != b.index.len: return a.index.len < b.index.len
+  if a.tag != b.tag: return a.tag
+  return idx_less(a.index, b.index)
+
+type TC:
+  t: Int
+  ca: Bool
+
+fn type_by_index(var g: tc.Prog, fs: Fs, t0: Int, ca0: Bool, index: [Int]) -> TC:
+  var t = t0
+  var ca = ca0
+  for i in index:
+    if is_ptr_t(&g, fs, t):
+      ca = elem_ca(&g, fs, t, ca)
+      t = elem_t(&g, fs, t)
+    let sf = sfield(&g, fs, t, ca, i)
+    t = sf.t
+    ca = sf.ca
+  return TC(t, ca)
+
+fn path_by_index(var g: tc.Prog, fs: Fs, t0: Int, ca0: Bool, index: [Int]) -> Str:
+  var t = t0
+  var ca = ca0
+  var out = ""
+  for i in index:
+    if is_ptr_t(&g, fs, t):
+      ca = elem_ca(&g, fs, t, ca)
+      t = elem_t(&g, fs, t)
+    let sf = sfield(&g, fs, t, ca, i)
+    out += "." + sf.name
+    t = sf.t
+    ca = sf.ca
+  return out
+
+# ---- fakexml
+
+const F_ELEMENT = 1
+const F_ATTR = 2
+const F_CDATA = 4
+const F_CHARDATA = 8
+const F_INNERXML = 16
+const F_COMMENT = 32
+const F_ANY = 64
+const F_OMITEMPTY = 128
+const F_MODE = 127
+
+type FI:
+  idx: [Int]
+  name: Str
+  xmlns: Str
+  flags: Int
+  parents: [Str]
+
+type TI:
+  fields: [FI]
+  err: Bool     # getTypeInfo failed (an error staticcheck doesn't report)
+
+fn fi_copy(f: FI) -> FI:
+  var ps: [Str] = []
+  for p in f.parents: ps.push(p + "")
+  return FI(copy_ints(f.idx), f.name + "", f.xmlns + "", f.flags, ps)
+
+fn is_slice_t(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return uk(&g, fs, t) == tc.TY_SLICE
+
+fn byte_seq(var g: tc.Prog, fs: Fs, t: Int, kind: Int) -> Bool:
+  if uk(&g, fs, t) != kind: return false
+  let el = elem_t(&g, fs, t)
+  return tc.under(&g, fs, el) == tc.B_UINT8
+
+fn xml_marshaler(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return implements_m(&g, fs, t, "MarshalXML", "(*encoding/xml.Encoder, encoding/xml.StartElement) error")
+
+fn xml_attr_marshaler(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return implements_m(&g, fs, t, "MarshalXMLAttr", "(encoding/xml.Name) (encoding/xml.Attr, error)")
+
+fn xml_value(var g: tc.Prog, fs: Fs, var e: Enc, t0: Int, ca0: Bool, stack: Str, depth: Int) -> MErr:
+  if depth > 100: return merr_none()
+  if ca0:
+    if t0 in e.seen_ca: return merr_none()
+    e.seen_ca[t0] = true
+  else:
+    if t0 in e.seen_cn: return merr_none()
+    e.seen_cn[t0] = true
+  var t = t0
+  var ca = ca0
+  var seen: {Int: Bool} = {}
+  while uk(&g, fs, t) == tc.TY_IFACE or uk(&g, fs, t) == tc.TY_PTR:
+    if uk(&g, fs, t) == tc.TY_IFACE: return merr_none()
+    ca = elem_ca(&g, fs, t, ca)
+    t = elem_t(&g, fs, t)
+    var key = t * 2
+    if ca: key += 1
+    if key in seen: return MErr(2, t, stack + "")
+    seen[key] = true
+  if is_tparam(g, t): return merr_none()
+  if xml_marshaler(&g, fs, t): return merr_none()
+  if ca:
+    let pt = tc.ptr_to(&g, t)
+    if xml_marshaler(&g, fs, pt): return merr_none()
+  if text_marshaler(&g, fs, t): return merr_none()
+  if ca:
+    let pt = tc.ptr_to(&g, t)
+    if text_marshaler(&g, fs, pt): return merr_none()
+  let kt = uk(&g, fs, t)
+  if (kt == tc.TY_SLICE or kt == tc.TY_ARRAY) and not byte_seq(&g, fs, t, tc.TY_ARRAY) and not byte_seq(&g, fs, t, tc.TY_SLICE):
+    let el = elem_t(&g, fs, t)
+    let eca = elem_ca(&g, fs, t, ca)
+    return xml_value(&g, fs, &e, el, eca, stack + "[0]", depth + 1)
+  let ti = type_info(&g, fs, t, ca, 0)
+  if ti.err: return MErr(3, 0, "")
+  for f in ti.fields:
+    if f.flags & F_ATTR == 0: continue
+    let fv = fi_value(&g, fs, f, t, ca)
+    let path = path_by_index(&g, fs, t, ca, f.idx)
+    let err = xml_attr(&g, fs, fv.t, fv.ca, stack + path, 0)
+    if err.kind != 0: return err
+  if kt == tc.TY_STRUCT:
+    for f in ti.fields:
+      if f.flags & F_ATTR != 0: continue
+      var fv = fi_value(&g, fs, f, t, ca)
+      let mode = f.flags & F_MODE
+      if mode == F_CDATA or mode == F_CHARDATA: continue
+      if mode == F_COMMENT:
+        fv = indirect(&g, fs, fv)
+        if not (byte_seq(&g, fs, fv.t, tc.TY_SLICE) or byte_seq(&g, fs, fv.t, tc.TY_ARRAY)): return MErr(3, 0, "")
+        continue
+      if mode == F_INNERXML:
+        fv = indirect(&g, fs, fv)
+        if (g.tk[fv.t] == tc.TY_SLICE and g.ta[fv.t] == tc.B_UINT8) or fv.t == tc.B_STRING: continue
+      let path = path_by_index(&g, fs, t, ca, f.idx)
+      let err = xml_value(&g, fs, &e, fv.t, fv.ca, stack + path, depth + 1)
+      if err.kind != 0: return err
+    return merr_none()
+  return xml_simple(&g, fs, t, stack)
+
+fn indirect(var g: tc.Prog, fs: Fs, v: TC) -> TC:
+  var t = v.t
+  var ca = v.ca
+  var n = 0
+  while is_ptr_t(&g, fs, t) and n < 100:
+    ca = elem_ca(&g, fs, t, ca)
+    t = elem_t(&g, fs, t)
+    n += 1
+  return TC(t, ca)
+
+fn xml_simple(var g: tc.Prog, fs: Fs, t: Int, stack: Str) -> MErr:
+  let kt = uk(&g, fs, t)
+  if kt == tc.TY_BASIC or kt == tc.TY_IFACE or kt == tc.TY_TPARAM: return merr_none()
+  if kt == tc.TY_SLICE or kt == tc.TY_ARRAY:
+    let el = elem_t(&g, fs, t)
+    if tc.under(&g, fs, el) != tc.B_UINT8: return MErr(1, t, stack + "")
+    return merr_none()
+  return MErr(1, t, stack + "")
+
+fn xml_attr(var g: tc.Prog, fs: Fs, t0: Int, ca0: Bool, stack: Str, depth: Int) -> MErr:
+  if depth > 100: return merr_none()
+  var t = t0
+  var ca = ca0
+  if xml_attr_marshaler(&g, fs, t): return merr_none()
+  if ca:
+    let pt = tc.ptr_to(&g, t)
+    if xml_attr_marshaler(&g, fs, pt): return merr_none()
+  if text_marshaler(&g, fs, t): return merr_none()
+  if ca:
+    let pt = tc.ptr_to(&g, t)
+    if text_marshaler(&g, fs, pt): return merr_none()
+  if is_ptr_t(&g, fs, t):
+    ca = elem_ca(&g, fs, t, ca)
+    t = elem_t(&g, fs, t)
+  if is_slice_t(&g, fs, t) and not byte_seq(&g, fs, t, tc.TY_SLICE):
+    let el = elem_t(&g, fs, t)
+    return xml_attr(&g, fs, el, true, stack + "[0]", depth + 1)
+  if is_named(&g, fs, t, "encoding/xml.Attr"): return merr_none()
+  return xml_simple(&g, fs, t, stack)
+
+fn fi_value(var g: tc.Prog, fs: Fs, f: FI, t0: Int, ca0: Bool) -> TC:
+  var t = t0
+  var ca = ca0
+  for i in 0..f.idx.len:
+    if i > 0 and is_ptr_t(&g, fs, t):
+      let el = elem_t(&g, fs, t)
+      if is_struct_t(&g, fs, el):
+        ca = elem_ca(&g, fs, t, ca)
+        t = el
+    let sf = sfield(&g, fs, t, ca, f.idx[i])
+    t = sf.t
+    ca = sf.ca
+  return TC(t, ca)
+
+fn type_info(var g: tc.Prog, fs: Fs, t: Int, ca: Bool, depth: Int) -> TI:
+  var ti = TI([], false)
+  if depth > 50: return ti
+  if not is_struct_t(&g, fs, t) or is_named(&g, fs, t, "encoding/xml.Name"): return ti
+  for i in 0..num_fields(&g, fs, t):
+    let f = sfield(&g, fs, t, ca, i)
+    if (not exported_name(f.name) and not f.anon) or tag_get(f.tag, "xml") == "-": continue
+    if f.anon:
+      var tt = f.t
+      var tca = f.ca
+      if is_ptr_t(&g, fs, tt):
+        tca = elem_ca(&g, fs, tt, tca)
+        tt = elem_t(&g, fs, tt)
+      if is_struct_t(&g, fs, tt):
+        let inner = type_info(&g, fs, tt, tca, depth + 1)
+        if inner.err: return TI([], true)
+        for fi0 in inner.fields:
+          var fi = fi_copy(fi0)
+          var idx: [Int] = [i]
+          for v in fi0.idx: idx.push(v)
+          fi.idx = idx
+          if not add_field(&g, fs, &ti, fi): return TI([], true)
+        continue
+    var ok = true
+    let fi = field_info(&g, fs, f, &ok, i)
+    if not ok: return TI([], true)
+    if f.name == "XMLName": continue
+    if not add_field(&g, fs, &ti, fi): return TI([], true)
+  return ti
+
+# xml's StructFieldInfo; ok false on an error
+fn field_info(var g: tc.Prog, fs: Fs, f: SF, var ok: Bool, i: Int) -> FI:
+  var fi = FI([i], "", "", 0, [])
+  var tag = tag_get(f.tag, "xml")
+  let sp = tag.find(" ")
+  if sp >= 0:
+    fi.xmlns = tag[0..sp]
+    tag = tag[sp + 1..tag.len]
+  let tokens = tag.split(",")
+  if tokens.len == 1: fi.flags = F_ELEMENT
+  else:
+    tag = tokens[0] + ""
+    for j in 1..tokens.len:
+      let fl = tokens[j]
+      if fl == "attr": fi.flags = fi.flags | F_ATTR
+      elif fl == "cdata": fi.flags = fi.flags | F_CDATA
+      elif fl == "chardata": fi.flags = fi.flags | F_CHARDATA
+      elif fl == "innerxml": fi.flags = fi.flags | F_INNERXML
+      elif fl == "comment": fi.flags = fi.flags | F_COMMENT
+      elif fl == "any": fi.flags = fi.flags | F_ANY
+      elif fl == "omitempty": fi.flags = fi.flags | F_OMITEMPTY
+    let mode = fi.flags & F_MODE
+    if mode == 0: fi.flags = fi.flags | F_ELEMENT
+    elif mode == F_ATTR or mode == F_CDATA or mode == F_CHARDATA or mode == F_INNERXML or mode == F_COMMENT or mode == F_ANY or mode == F_ANY | F_ATTR:
+      if f.name == "XMLName" or (tag != "" and mode != F_ATTR):
+        ok = false
+        return fi
+    else:
+      ok = false
+      return fi
+    if fi.flags & F_MODE == F_ANY: fi.flags = fi.flags | F_ELEMENT
+    if fi.flags & F_OMITEMPTY != 0 and fi.flags & (F_ELEMENT | F_ATTR) == 0:
+      ok = false
+      return fi
+  if fi.xmlns != "" and tag == "":
+    ok = false
+    return fi
+  if f.name == "XMLName":
+    fi.name = tag
+    return fi
+  if tag == "":
+    let xn = lookup_xml_name(&g, fs, f.t, f.ca)
+    if xn.len > 0:
+      fi.xmlns = xn[0]
+      fi.name = xn[1]
+    else: fi.name = f.name + ""
+    return fi
+  var parents = tag.split(">")
+  if parents[0] == "": parents[0] = f.name + ""
+  if parents[parents.len - 1] == "":
+    ok = false
+    return fi
+  fi.name = parents[parents.len - 1] + ""
+  if parents.len > 1:
+    if fi.flags & F_ELEMENT == 0:
+      ok = false
+      return fi
+    for j in 0..parents.len - 1: fi.parents.push(parents[j] + "")
+  if fi.flags & F_ELEMENT != 0:
+    let xn = lookup_xml_name(&g, fs, f.t, f.ca)
+    if xn.len > 0 and xn[1] != fi.name:
+      ok = false
+      return fi
+  return fi
+
+# The xmlns and name an XMLName field gives a type, [] for none
+fn lookup_xml_name(var g: tc.Prog, fs: Fs, t0: Int, ca0: Bool) -> [Str]:
+  var t = t0
+  var ca = ca0
+  var seen: {Int: Bool} = {}
+  while is_ptr_t(&g, fs, t):
+    ca = elem_ca(&g, fs, t, ca)
+    t = elem_t(&g, fs, t)
+    var key = t * 2
+    if ca: key += 1
+    if key in seen: return []
+    seen[key] = true
+  if not is_struct_t(&g, fs, t): return []
+  for i in 0..num_fields(&g, fs, t):
+    let f = sfield(&g, fs, t, ca, i)
+    if f.name != "XMLName": continue
+    var ok = true
+    let fi = field_info(&g, fs, f, &ok, i)
+    if ok and fi.name != "": return [fi.xmlns + "", fi.name + ""]
+    break
+  return []
+
+# xml's addFieldInfo; false on a conflict error
+fn add_field(var g: tc.Prog, fs: Fs, var ti: TI, newf: FI) -> Bool:
+  var conflicts: [Int] = []
+  for i in 0..ti.fields.len:
+    let oldf = ti.fields[i]
+    if oldf.flags & F_MODE != newf.flags & F_MODE: continue
+    if oldf.xmlns != "" and newf.xmlns != "" and oldf.xmlns != newf.xmlns: continue
+    let minl = min(newf.parents.len, oldf.parents.len)
+    var differ = false
+    for p in 0..minl:
+      if oldf.parents[p] != newf.parents[p]:
+        differ = true
+        break
+    if differ: continue
+    if oldf.parents.len > newf.parents.len:
+      if oldf.parents[newf.parents.len] == newf.name: conflicts.push(i)
+    elif oldf.parents.len < newf.parents.len:
+      if newf.parents[oldf.parents.len] == oldf.name: conflicts.push(i)
+    elif newf.name == oldf.name: conflicts.push(i)
+  if conflicts.len == 0:
+    ti.fields.push(fi_copy(newf))
+    return true
+  for i in conflicts:
+    if ti.fields[i].idx.len < newf.idx.len: return true
+  for i in conflicts:
+    if ti.fields[i].idx.len == newf.idx.len: return false
+  var keep: [FI] = []
+  for i in 0..ti.fields.len:
+    if not (i in conflicts): keep.push(fi_copy(ti.fields[i]))
+  keep.push(fi_copy(newf))
+  ti.fields = keep
+  return true
+
+# ---- SA1002: time.Parse's layout parsed as a value (Go 1.27's time.Parse, its errors)
+
+const STD_NEED_DATE = 256
+const STD_NEED_YDAY = 512
+const STD_NEED_CLOCK = 1024
+const STD_LONG_MONTH = 257
+const STD_MONTH = 258
+const STD_NUM_MONTH = 259
+const STD_ZERO_MONTH = 260
+const STD_LONG_WEEKDAY = 261
+const STD_WEEKDAY = 262
+const STD_DAY = 263
+const STD_UNDER_DAY = 264
+const STD_ZERO_DAY = 265
+const STD_UNDER_YDAY = 522
+const STD_ZERO_YDAY = 523
+const STD_HOUR = 1036
+const STD_HOUR12 = 1037
+const STD_ZERO_HOUR12 = 1038
+const STD_MINUTE = 1039
+const STD_ZERO_MINUTE = 1040
+const STD_SECOND = 1041
+const STD_ZERO_SECOND = 1042
+const STD_LONG_YEAR = 275
+const STD_YEAR = 276
+const STD_PM = 1045
+const STD_PM_LOWER = 1046
+const STD_TZ = 23
+const STD_ISO_TZ = 24
+const STD_ISO_SECONDS_TZ = 25
+const STD_ISO_SHORT_TZ = 26
+const STD_ISO_COLON_TZ = 27
+const STD_ISO_COLON_SECONDS_TZ = 28
+const STD_NUM_TZ = 29
+const STD_NUM_SECONDS_TZ = 30
+const STD_NUM_SHORT_TZ = 31
+const STD_NUM_COLON_TZ = 32
+const STD_NUM_COLON_SECONDS_TZ = 33
+const STD_FRAC0 = 34
+const STD_FRAC9 = 35
+const STD_MASK = 65535
+
+# (prefix length, std, suffix start)
+fn next_std(l: Str) -> [Int]:
+  let n = l.len
+  var i = 0
+  while i < n:
+    let ch = l[i]
+    if ch == 'J':
+      if n >= i + 3 and l[i..i + 3] == "Jan":
+        if n >= i + 7 and l[i..i + 7] == "January": return [i, STD_LONG_MONTH, i + 7]
+        if not (i + 3 < n and l[i + 3] >= 'a' and l[i + 3] <= 'z'): return [i, STD_MONTH, i + 3]
+    elif ch == 'M':
+      if n >= i + 3:
+        if l[i..i + 3] == "Mon":
+          if n >= i + 6 and l[i..i + 6] == "Monday": return [i, STD_LONG_WEEKDAY, i + 6]
+          if not (i + 3 < n and l[i + 3] >= 'a' and l[i + 3] <= 'z'): return [i, STD_WEEKDAY, i + 3]
+        if l[i..i + 3] == "MST": return [i, STD_TZ, i + 3]
+    elif ch == '0':
+      if n >= i + 2 and l[i + 1] >= '1' and l[i + 1] <= '6':
+        let tab = [STD_ZERO_MONTH, STD_ZERO_DAY, STD_ZERO_HOUR12, STD_ZERO_MINUTE, STD_ZERO_SECOND, STD_YEAR]
+        return [i, tab[int(l[i + 1]) - 49], i + 2]
+      if n >= i + 3 and l[i + 1] == '0' and l[i + 2] == '2': return [i, STD_ZERO_YDAY, i + 3]
+    elif ch == '1':
+      if n >= i + 2 and l[i + 1] == '5': return [i, STD_HOUR, i + 2]
+      return [i, STD_NUM_MONTH, i + 1]
+    elif ch == '2':
+      if n >= i + 4 and l[i..i + 4] == "2006": return [i, STD_LONG_YEAR, i + 4]
+      return [i, STD_DAY, i + 1]
+    elif ch == '_':
+      if n >= i + 2 and l[i + 1] == '2':
+        if n >= i + 5 and l[i + 1..i + 5] == "2006": return [i + 1, STD_LONG_YEAR, i + 5]
+        return [i, STD_UNDER_DAY, i + 2]
+      if n >= i + 3 and l[i + 1] == '_' and l[i + 2] == '2': return [i, STD_UNDER_YDAY, i + 3]
+    elif ch == '3': return [i, STD_HOUR12, i + 1]
+    elif ch == '4': return [i, STD_MINUTE, i + 1]
+    elif ch == '5': return [i, STD_SECOND, i + 1]
+    elif ch == 'P':
+      if n >= i + 2 and l[i + 1] == 'M': return [i, STD_PM, i + 2]
+    elif ch == 'p':
+      if n >= i + 2 and l[i + 1] == 'm': return [i, STD_PM_LOWER, i + 2]
+    elif ch == '-' or ch == 'Z':
+      var base = 0
+      if ch == 'Z': base = -5
+      if n >= i + 7 and l[i + 1..i + 7] == "070000": return [i, STD_NUM_SECONDS_TZ + base, i + 7]
+      if n >= i + 9 and l[i + 1..i + 9] == "07:00:00": return [i, STD_NUM_COLON_SECONDS_TZ + base, i + 9]
+      if n >= i + 5 and l[i + 1..i + 5] == "0700":
+        if ch == 'Z': return [i, STD_ISO_TZ, i + 5]
+        return [i, STD_NUM_TZ, i + 5]
+      if n >= i + 6 and l[i + 1..i + 6] == "07:00": return [i, STD_NUM_COLON_TZ + base, i + 6]
+      if n >= i + 3 and l[i + 1..i + 3] == "07": return [i, STD_NUM_SHORT_TZ + base, i + 3]
+    elif ch == '.' or ch == ',':
+      if i + 1 < n and (l[i + 1] == '0' or l[i + 1] == '9'):
+        let c1 = l[i + 1]
+        var j = i + 1
+        while j < n and l[j] == c1: j += 1
+        if not (j < n and l[j] >= '0' and l[j] <= '9'):
+          var code = STD_FRAC0
+          if c1 == '9': code = STD_FRAC9
+          var std = code | (((j - (i + 1)) & 4095) << 16)
+          if ch == ',': std = std | (1 << 28)
+          return [i, std, j]
+    i += 1
+  return [n, 0, n]
+
+# time's quote
+fn time_quote(s: Str) -> Str:
+  var out = "\""
+  var i = 0
+  while i < s.len:
+    let r = utf8_at(s, i)
+    let c0 = int(s[i])
+    if c0 >= 0x80 or c0 < 32:
+      var w = r[1]
+      if r[0] == 65533 and r[1] == 1: w = 1
+      for j in 0..w: out += "\\x" + hex2(int(s[i + j]))
+      i += w
+      continue
+    if c0 == 34 or c0 == 92: out += "\\"
+    out += chr(c0)
+    i += 1
+  return out + "\""
+
+fn is_dig(s: Str, i: Int) -> Bool:
+  return i < s.len and s[i] >= '0' and s[i] <= '9'
+
+# (value, rest start, ok)
+fn getnum(s: Str, fixed: Bool) -> [Int]:
+  if not is_dig(s, 0): return [0, 0, 0]
+  if not is_dig(s, 1):
+    if fixed: return [0, 0, 0]
+    return [int(s[0]) - 48, 1, 1]
+  return [(int(s[0]) - 48) * 10 + int(s[1]) - 48, 2, 1]
+
+fn getnum3(s: Str, fixed: Bool) -> [Int]:
+  var n = 0
+  var i = 0
+  while i < 3 and is_dig(s, i):
+    n = n * 10 + int(s[i]) - 48
+    i += 1
+  if i == 0 or (fixed and i != 3): return [0, 0, 0]
+  return [n, i, 1]
+
+# leadingInt: (value, digits, ok)
+fn leading_int(s: Str) -> [Int]:
+  var x = 0
+  var i = 0
+  while i < s.len:
+    let ch = s[i]
+    if ch < '0' or ch > '9': break
+    if x > 922337203685477580: return [0, i, 0]
+    x = x * 10 + int(ch) - 48
+    if x < 0: return [0, i, 0]
+    i += 1
+  return [x, i, 1]
+
+# atoi: (value, ok)
+fn tatoi(s0: Str) -> [Int]:
+  var s = s0
+  var neg = false
+  if s.len > 0 and (s[0] == '-' or s[0] == '+'):
+    neg = s[0] == '-'
+    s = s[1..s.len]
+  let r = leading_int(s)
+  if r[2] == 0 or r[1] < s.len: return [0, 0]
+  if neg: return [0 - r[0], 1]
+  return [r[0], 1]
+
+fn lookup_name(tab: [Str], v: Str) -> [Int]:
+  for i in 0..tab.len:
+    let t = tab[i]
+    if v.len >= t.len and name_match(v[0..t.len], t): return [i, t.len]
+  return [-1, 0]
+
+fn name_match(a: Str, b: Str) -> Bool:
+  for i in 0..a.len:
+    var c1 = int(a[i])
+    var c2 = int(b[i])
+    if c1 != c2:
+      c1 = c1 | 32
+      c2 = c2 | 32
+      if c1 != c2 or c1 < 97 or c1 > 122: return false
+  return true
+
+fn time_skip(value: Str, prefix: Str, var ok: Bool) -> Str:
+  var v = value
+  var p = prefix
+  while p.len > 0:
+    if p[0] == ' ':
+      if v.len > 0 and v[0] != ' ':
+        ok = false
+        return v
+      p = p.lstrip(" ")
+      v = v.lstrip(" ")
+      continue
+    if v.len == 0 or v[0] != p[0]:
+      ok = false
+      return v
+    p = p[1..p.len]
+    v = v[1..v.len]
+  return v
+
+# (ns, range error, ok) for value[0..n]
+fn parse_nanos(value: Str, n0: Int, var rerr: Str) -> Bool:
+  var n = n0
+  if not (value[0] == '.' or value[0] == ','): return false
+  if n > 10: n = 10
+  let r = tatoi(value[1..n])
+  if r[1] == 0: return false
+  if r[0] < 0: rerr = "fractional second"
+  return true
+
+fn time_tz(value: Str) -> Int:
+  # parseTimeZone: the length, 0 when not ok
+  if value.len < 3: return 0
+  if value.len >= 4 and (value[0..4] == "ChST" or value[0..4] == "MeST"): return 4
+  if value[0..3] == "GMT":
+    let v = value[3..value.len]
+    if v.len == 0: return 3
+    return 3 + signed_offset(v)
+  if value[0] == '+' or value[0] == '-': return signed_offset(value)
+  var nu = 0
+  while nu < 6:
+    if nu >= value.len: break
+    let ch = value[nu]
+    if ch < 'A' or ch > 'Z': break
+    nu += 1
+  if nu == 5 and value[4] == 'T': return 5
+  if nu == 4 and (value[3] == 'T' or value[0..4] == "WITA"): return 4
+  if nu == 3: return 3
+  return 0
+
+fn signed_offset(value: Str) -> Int:
+  let sign = value[0]
+  if sign != '-' and sign != '+': return 0
+  let r = leading_int(value[1..value.len])
+  if r[2] == 0 or r[1] == 0: return 0
+  if r[0] > 23: return 0
+  return 1 + r[1]
+
+fn is_leap(y: Int) -> Bool:
+  var mask = 15
+  if y % 25 != 0: mask = 3
+  return y & mask == 0
+
+fn days_before(m: Int) -> Int:
+  var adj = 0
+  if m >= 3: adj = -2
+  return (214 * m - 211) / 7 + adj
+
+fn days_in(m: Int, y: Int) -> Int:
+  if m == 2:
+    if is_leap(y): return 29
+    return 28
+  return 30 + ((m + (m >> 3)) & 1)
+
+fn perr(lay: Str, val: Str, le: Str, ve: Str, msg: Str) -> Str:
+  if msg == "": return "parsing time " + time_quote(val) + " as " + time_quote(lay) + ": cannot parse " + time_quote(ve) + " as " + time_quote(le)
+  return "parsing time " + time_quote(val) + msg
+
+# time.Parse(layout, value)'s error text, "" when it parses
+fn time_parse(alayout: Str, avalue: Str) -> Str:
+  var layout = alayout + ""
+  var value = avalue + ""
+  var rerr = ""
+  var year = 0
+  var month = -1
+  var day = -1
+  var yday = -1
+  var hour = 0
+  let long_months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+  let short_months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+  let long_days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+  let short_days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+  while true:
+    let ch = next_std(layout)
+    let prefix = layout[0..ch[0]]
+    let std = ch[1]
+    let stdstr = layout[ch[0]..ch[2]]
+    let suffix = layout[ch[2]..layout.len]
+    var ok = true
+    value = time_skip(value, prefix, &ok)
+    if not ok: return perr(alayout, avalue, prefix, value, "")
+    if std == 0:
+      if value.len != 0: return perr(alayout, avalue, "", value, ": extra text: " + time_quote(value))
+      break
+    layout = suffix
+    let hold = value + ""
+    var bad = false
+    let sm = std & STD_MASK
+    if sm == STD_YEAR:
+      if value.len < 2: bad = true
+      else:
+        let r = tatoi(value[0..2])
+        value = value[2..value.len]
+        if r[1] == 0: bad = true
+        else:
+          year = r[0]
+          if year >= 69: year += 1900
+          else: year += 2000
+    elif sm == STD_LONG_YEAR:
+      if value.len < 4 or not is_dig(value, 0): bad = true
+      else:
+        let r = tatoi(value[0..4])
+        value = value[4..value.len]
+        if r[1] == 0: bad = true
+        else: year = r[0]
+    elif sm == STD_MONTH or sm == STD_LONG_MONTH:
+      var r = [0, 0]
+      if sm == STD_MONTH: r = lookup_name(short_months, value)
+      else: r = lookup_name(long_months, value)
+      if r[0] < 0: bad = true
+      else: value = value[r[1]..value.len]
+      month = r[0] + 1
+    elif sm == STD_NUM_MONTH or sm == STD_ZERO_MONTH:
+      let r = getnum(value, sm == STD_ZERO_MONTH)
+      if r[2] == 0: bad = true
+      else:
+        month = r[0]
+        value = value[r[1]..value.len]
+        if month <= 0 or month > 12: rerr = "month"
+    elif sm == STD_WEEKDAY or sm == STD_LONG_WEEKDAY:
+      var r = [0, 0]
+      if sm == STD_WEEKDAY: r = lookup_name(short_days, value)
+      else: r = lookup_name(long_days, value)
+      if r[0] < 0: bad = true
+      else: value = value[r[1]..value.len]
+    elif sm == STD_DAY or sm == STD_UNDER_DAY or sm == STD_ZERO_DAY:
+      if sm == STD_UNDER_DAY and value.len > 0 and value[0] == ' ': value = value[1..value.len]
+      let r = getnum(value, sm == STD_ZERO_DAY)
+      if r[2] == 0: bad = true
+      else:
+        day = r[0]
+        value = value[r[1]..value.len]
+    elif sm == STD_UNDER_YDAY or sm == STD_ZERO_YDAY:
+      for _ in 0..2:
+        if sm == STD_UNDER_YDAY and value.len > 0 and value[0] == ' ': value = value[1..value.len]
+      let r = getnum3(value, sm == STD_ZERO_YDAY)
+      if r[2] == 0: bad = true
+      else:
+        yday = r[0]
+        value = value[r[1]..value.len]
+    elif sm == STD_HOUR or sm == STD_HOUR12 or sm == STD_ZERO_HOUR12:
+      let r = getnum(value, sm == STD_ZERO_HOUR12)
+      hour = r[0]
+      if r[2] == 0: bad = true
+      else: value = value[r[1]..value.len]
+      if sm == STD_HOUR and hour >= 24: rerr = "hour"
+      if sm != STD_HOUR and hour > 12: rerr = "hour"
+    elif sm == STD_MINUTE or sm == STD_ZERO_MINUTE:
+      let r = getnum(value, sm == STD_ZERO_MINUTE)
+      if r[2] == 0: bad = true
+      else: value = value[r[1]..value.len]
+      if r[0] >= 60: rerr = "minute"
+    elif sm == STD_SECOND or sm == STD_ZERO_SECOND:
+      let r = getnum(value, sm == STD_ZERO_SECOND)
+      if r[2] == 0: bad = true
+      else:
+        value = value[r[1]..value.len]
+        if r[0] >= 60: rerr = "second"
+        elif value.len >= 2 and (value[0] == '.' or value[0] == ',') and is_dig(value, 1):
+          let nx = next_std(layout)
+          let s2 = nx[1] & STD_MASK
+          if not (s2 == STD_FRAC0 or s2 == STD_FRAC9):
+            var n = 2
+            while n < value.len and is_dig(value, n): n += 1
+            if not parse_nanos(value, n, &rerr): bad = true
+            value = value[n..value.len]
+    elif sm == STD_PM or sm == STD_PM_LOWER:
+      if value.len < 2: bad = true
+      else:
+        let pp = value[0..2]
+        value = value[2..value.len]
+        if sm == STD_PM and not (pp == "PM" or pp == "AM"): bad = true
+        if sm == STD_PM_LOWER and not (pp == "pm" or pp == "am"): bad = true
+    elif sm >= STD_ISO_TZ and sm <= STD_NUM_COLON_SECONDS_TZ:
+      if sm <= STD_ISO_COLON_SECONDS_TZ and value.len >= 1 and value[0] == 'Z':
+        value = value[1..value.len]
+      else:
+        var parts: [Str] = []
+        if sm == STD_ISO_COLON_TZ or sm == STD_NUM_COLON_TZ:
+          if value.len < 6 or value[3] != ':': bad = true
+          else:
+            parts = [value[0..1], value[1..3], value[4..6], "00"]
+            value = value[6..value.len]
+        elif sm == STD_NUM_SHORT_TZ or sm == STD_ISO_SHORT_TZ:
+          if value.len < 3: bad = true
+          else:
+            parts = [value[0..1], value[1..3], "00", "00"]
+            value = value[3..value.len]
+        elif sm == STD_ISO_COLON_SECONDS_TZ or sm == STD_NUM_COLON_SECONDS_TZ:
+          if value.len < 9 or value[3] != ':' or value[6] != ':': bad = true
+          else:
+            parts = [value[0..1], value[1..3], value[4..6], value[7..9]]
+            value = value[9..value.len]
+        elif sm == STD_ISO_SECONDS_TZ or sm == STD_NUM_SECONDS_TZ:
+          if value.len < 7: bad = true
+          else:
+            parts = [value[0..1], value[1..3], value[3..5], value[5..7]]
+            value = value[7..value.len]
+        else:
+          if value.len < 5: bad = true
+          else:
+            parts = [value[0..1], value[1..3], value[3..5], "00"]
+            value = value[5..value.len]
+        if not bad:
+          let hr = getnum(parts[1], true)
+          var mm = [0, 0, 1]
+          var ss = [0, 0, 1]
+          if hr[2] == 0: bad = true
+          else:
+            mm = getnum(parts[2], true)
+            if mm[2] == 0: bad = true
+            else:
+              ss = getnum(parts[3], true)
+              if ss[2] == 0: bad = true
+          if hr[0] > 24: rerr = "time zone offset hour"
+          if mm[0] > 60: rerr = "time zone offset minute"
+          if ss[0] > 60: rerr = "time zone offset second"
+          if parts[0] != "+" and parts[0] != "-": bad = true
+    elif sm == STD_TZ:
+      if value.len >= 3 and value[0..3] == "UTC": value = value[3..value.len]
+      else:
+        let n = time_tz(value)
+        if n == 0: bad = true
+        else: value = value[n..value.len]
+    elif sm == STD_FRAC0:
+      let nd = 1 + ((std >> 16) & 4095)
+      if value.len < nd: bad = true
+      else:
+        if not parse_nanos(value, nd, &rerr): bad = true
+        value = value[nd..value.len]
+    elif sm == STD_FRAC9:
+      if value.len >= 2 and (value[0] == '.' or value[0] == ',') and value[1] >= '0' and value[1] <= '9':
+        var i = 0
+        while i + 1 < value.len and value[i + 1] >= '0' and value[i + 1] <= '9': i += 1
+        if not parse_nanos(value, 1 + i, &rerr): bad = true
+        value = value[1 + i..value.len]
+    if rerr != "": return perr(alayout, avalue, stdstr, value, ": " + rerr + " out of range")
+    if bad: return perr(alayout, avalue, stdstr, hold, "")
+  if yday >= 0:
+    var d = 0
+    var m = 0
+    var yd = yday
+    if is_leap(year):
+      if yd == 60:
+        m = 2
+        d = 29
+      elif yd > 60: yd -= 1
+    if yd < 1 or yd > 365: return perr(alayout, avalue, "", value, ": day-of-year out of range")
+    if m == 0:
+      m = (yd - 1) / 31 + 1
+      if days_before(m + 1) < yd: m += 1
+      d = yd - days_before(m)
+    if month >= 0 and month != m: return perr(alayout, avalue, "", value, ": day-of-year does not match month")
+    month = m
+    if day >= 0 and day != d: return perr(alayout, avalue, "", value, ": day-of-year does not match day")
+    day = d
+  else:
+    if month < 0: month = 1
+    if day < 0: day = 1
+  if day < 1 or day > days_in(month, year): return perr(alayout, avalue, "", value, ": day out of range")
+  return ""
+
+# ---- SA1007: url.Parse's errors (Go 1.27's net/url; a bracketed host that isn't an IP address
+# isn't reported: netip.ParseAddr's messages aren't modelled)
+
+fn ishex(ch: Byte) -> Bool:
+  return (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F')
+
+fn unhex(ch: Byte) -> Int:
+  let v = int(ch)
+  return 9 * (v >> 6) + (v & 15)
+
+fn host_ok(ch: Byte) -> Bool:
+  if (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z'): return true
+  return int(ch) < 128 and "!\"$&'()*+,-.:;<=>[]_~".find(chr(int(ch))) >= 0
+
+# unescape's error, "" for none; mode 0 other, 1 host, 2 zone
+fn url_unescape(s: Str, mode: Int) -> Str:
+  var i = 0
+  while i < s.len:
+    let ch = s[i]
+    if ch == '%':
+      if i + 2 >= s.len or not ishex(s[i + 1]) or not ishex(s[i + 2]):
+        var r = s[i..s.len]
+        if r.len > 3: r = r[0..3]
+        return "invalid URL escape " + go_quote(r)
+      if mode == 1 and unhex(s[i + 1]) < 8 and s[i..i + 3] != "%25": return "invalid URL escape " + go_quote(s[i..i + 3])
+      if mode == 2:
+        let v = (unhex(s[i + 1]) << 4) | unhex(s[i + 2])
+        if s[i..i + 3] != "%25" and v != 32 and not host_ok(byte(v & 255)): return "invalid URL escape " + go_quote(s[i..i + 3])
+      i += 3
+    else:
+      if mode != 0 and int(ch) < 128 and not host_ok(ch): return "invalid character " + go_quote(s[i..i + 1]) + " in host name"
+      i += 1
+  return ""
+
+fn valid_opt_port(p: Str) -> Bool:
+  if p == "": return true
+  if p[0] != ':': return false
+  for i in 1..p.len:
+    if p[i] < '0' or p[i] > '9': return false
+  return true
+
+fn last_index(s: Str, sub: Str) -> Int:
+  var i = s.len - sub.len
+  while i >= 0:
+    if s[i..i + sub.len] == sub: return i
+    i -= 1
+  return -1
+
+fn url_userinfo_ok(s: Str) -> Bool:
+  for i in 0..s.len:
+    let ch = s[i]
+    if (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9'): continue
+    if int(ch) < 128 and "-._:~!$&'()*+,;=%@".find(chr(int(ch))) >= 0: continue
+    return false
+  return true
+
+# The error of url.Parse(raw), as its text, "" when it parses
+fn url_parse(raw: Str) -> Str:
+  var u = raw
+  var frag = ""
+  var has_frag = false
+  let h = raw.find("#")
+  if h >= 0:
+    u = raw[0..h]
+    frag = raw[h + 1..raw.len]
+    has_frag = true
+  let e = url_parse0(u)
+  if e != "": return "parse " + go_quote(u) + ": " + e
+  if has_frag and frag != "":
+    let fe = url_unescape(frag, 0)
+    if fe != "": return "parse " + go_quote(raw) + ": " + fe
+  return ""
+
+fn url_parse0(raw: Str) -> Str:
+  for i in 0..raw.len:
+    if int(raw[i]) < 32 or int(raw[i]) == 127: return "net/url: invalid control character in URL"
+  if raw == "*": return ""
+  # (getScheme)
+  var scheme = ""
+  var rest = raw
+  for i in 0..raw.len:
+    let ch = raw[i]
+    if (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z'): continue
+    if (ch >= '0' and ch <= '9') or ch == '+' or ch == '-' or ch == '.':
+      if i == 0: break
+      continue
+    if ch == ':':
+      if i == 0: return "missing protocol scheme"
+      scheme = raw[0..i].lower()
+      rest = raw[i + 1..rest.len]
+    break
+  if rest.endswith("?") and rest.count("?") == 1: rest = rest[0..rest.len - 1]
+  else:
+    let q = rest.find("?")
+    if q >= 0: rest = rest[0..q]
+  if not rest.startswith("/"):
+    if scheme != "": return ""
+    var seg = rest
+    let sl = rest.find("/")
+    if sl >= 0: seg = rest[0..sl]
+    if seg.find(":") >= 0: return "first path segment in URL cannot contain colon"
+  if (scheme != "" or not rest.startswith("///")) and rest.startswith("//"):
+    var auth = rest[2..rest.len]
+    rest = ""
+    let sl = auth.find("/")
+    if sl >= 0:
+      rest = auth[sl..auth.len]
+      auth = auth[0..sl]
+    let at = last_index(auth, "@")
+    var host = auth
+    if at >= 0: host = auth[at + 1..auth.len]
+    let he = url_host(scheme, host)
+    if he != "": return he
+    if at >= 0:
+      let ui = auth[0..at]
+      if not url_userinfo_ok(ui): return "net/url: invalid userinfo"
+      let c = ui.find(":")
+      if c < 0:
+        let ue = url_unescape(ui, 0)
+        if ue != "": return ue
+      else:
+        let ue = url_unescape(ui[0..c], 0)
+        if ue != "": return ue
+        let pe = url_unescape(ui[c + 1..ui.len], 0)
+        if pe != "": return pe
+  return url_unescape(rest, 0)
+
+fn url_host(scheme: Str, host: Str) -> Str:
+  let ob = last_index(host, "[")
+  if ob > 0: return "invalid IP-literal"
+  if ob == 0:
+    let cb = last_index(host, "]")
+    if cb < 0: return "missing ']' in host"
+    let cp = host[cb + 1..host.len]
+    if not valid_opt_port(cp): return "invalid port " + go_quote(cp) + " after host"
+    let ce = url_unescape(cp, 1)
+    if ce != "": return ce
+    let hn = host[1..cb]
+    let zi = hn.find("%25")
+    if zi >= 0:
+      let e1 = url_unescape(hn[0..zi], 1)
+      if e1 != "": return e1
+      let e2 = url_unescape(hn[zi..hn.len], 2)
+      if e2 != "": return e2
+    else:
+      let e1 = url_unescape(hn, 1)
+      if e1 != "": return e1
+    # (an IPv4 address in brackets)
+    var v4 = hn.len > 0
+    for i in 0..hn.len:
+      if not ((hn[i] >= '0' and hn[i] <= '9') or hn[i] == '.'): v4 = false
+    if v4 and hn.count(".") == 3: return "invalid IP-literal"
+    return ""
+  let i = host.find(":")
+  if i >= 0:
+    var j = i
+    let lc = last_index(host, ":")
+    if lc != i and not (scheme == "http" or scheme == "https"): j = lc
+    let cp = host[j..host.len]
+    if not valid_opt_port(cp): return "invalid port " + go_quote(cp) + " after host"
+  return url_unescape(host, 1)
+
+# ---- SA1001: invalid templates (Go 1.27's text/template/parse, its errors with "unexpected" or
+# "bad character" in them)
+
+fn sa1001(var g: tc.Prog, fs: Fs, var c: sc.C, calls: [Int]):
+  let pi = c.pi
+  for n in calls:
+    let cn = sc.callee_name(&g, fs, &c, n)
+    if not (cn == "(*text/template.Template).Parse" or cn == "(*html/template.Template).Parse"): continue
+    let fun = up(g, pi, g.pk[pi].t.a[n])
+    if k(g, pi, fun) != ast.N_SELECTOR: continue
+    let recv = up(g, pi, g.pk[pi].t.a[fun])
+    if k(g, pi, recv) != ast.N_CALL: continue
+    let rn = sc.callee_name(&g, fs, &c, recv)
+    if not (rn == "text/template.New" or rn == "html/template.New"): continue
+    let as = args_of(g, pi, n)
+    if as.len != 1: continue
+    let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[as[0]], as[0], -1, 0)
+    if cv.k != 2: continue
+    let err = tmpl_parse(cv.s)
+    if err.find("unexpected") >= 0 or err.find("bad character") >= 0: sc.report(g, &c, as[0], "SA1001", err)
+
+const IT_ERROR = 0
+const IT_BOOL = 1
+const IT_CHAR = 2
+const IT_CHARCONST = 3
+const IT_COMMENT = 4
+const IT_COMPLEX = 5
+const IT_ASSIGN = 6
+const IT_DECLARE = 7
+const IT_EOF = 8
+const IT_FIELD = 9
+const IT_IDENT = 10
+const IT_LDELIM = 11
+const IT_LPAREN = 12
+const IT_NUMBER = 13
+const IT_PIPE = 14
+const IT_RAWSTRING = 15
+const IT_RDELIM = 16
+const IT_RPAREN = 17
+const IT_SPACE = 18
+const IT_STRING = 19
+const IT_TEXT = 20
+const IT_VARIABLE = 21
+const IT_KEYWORD = 22
+const IT_BLOCK = 23
+const IT_BREAK = 24
+const IT_CONTINUE = 25
+const IT_DOT = 26
+const IT_DEFINE = 27
+const IT_ELSE = 28
+const IT_END = 29
+const IT_IF = 30
+const IT_NIL = 31
+const IT_RANGE = 32
+const IT_TEMPLATE = 33
+const IT_WITH = 34
+
+const LS_TEXT = 1
+const LS_LDELIM = 2
+const LS_COMMENT = 3
+const LS_RDELIM = 4
+const LS_INSIDE = 5
+const LS_SPACE = 6
+const LS_IDENT = 7
+const LS_FIELD = 8
+const LS_VARIABLE = 9
+const LS_CHAR = 10
+const LS_NUMBER = 11
+const LS_QUOTE = 12
+const LS_RAWQUOTE = 13
+
+type Tok:
+  typ: Int
+  pos: Int
+  val: Str
+  line: Int
+
+type Lx:
+  input: Str
+  pos: Int
+  start: Int
+  at_eof: Bool
+  paren: Int
+  line: Int
+  start_line: Int
+  inside: Bool
+  item: Tok
+  err: Str       # the parse's error, once there is one
+  trees: {Str: Bool}   # the templates defined: whether each is empty
+
+fn lx_next(var l: Lx) -> Int:
+  if l.pos >= l.input.len:
+    l.at_eof = true
+    return -1
+  let r = utf8_at(l.input, l.pos)
+  l.pos += r[1]
+  if r[0] == 10: l.line += 1
+  return r[0]
+
+fn lx_backup(var l: Lx):
+  if not l.at_eof and l.pos > 0:
+    var st = l.pos - 1
+    while st > 0 and st > l.pos - 4 and int(l.input[st]) >= 0x80 and int(l.input[st]) < 0xC0: st -= 1
+    let r = utf8_at(l.input, st)
+    var w = 1
+    var rr = 65533
+    if st + r[1] == l.pos:
+      w = r[1]
+      rr = r[0]
+    l.pos -= w
+    if rr == 10: l.line -= 1
+
+fn lx_peek(var l: Lx) -> Int:
+  let r = lx_next(&l)
+  lx_backup(&l)
+  return r
+
+fn lx_this(var l: Lx, typ: Int) -> Tok:
+  let it = Tok(typ, l.start, l.input[l.start..l.pos], l.start_line)
+  l.start = l.pos
+  l.start_line = l.line
+  return it
+
+fn lx_emit(var l: Lx, typ: Int) -> Int:
+  l.item = lx_this(&l, typ)
+  return 0
+
+fn lx_ignore(var l: Lx):
+  l.line += l.input[l.start..l.pos].count("\n")
+  l.start = l.pos
+  l.start_line = l.line
+
+fn lx_errorf(var l: Lx, msg: Str) -> Int:
+  l.item = Tok(IT_ERROR, l.start, msg, l.start_line)
+  l.start = 0
+  l.pos = 0
+  l.input = ""
+  return 0
+
+fn is_tspace(r: Int) -> Bool:
+  return r == 32 or r == 9 or r == 13 or r == 10
+
+fn is_alnum_r(r: Int) -> Bool:
+  if r == 95: return true
+  if r < 0: return false
+  if r < 128: return (r >= 48 and r <= 57) or (r >= 65 and r <= 90) or (r >= 97 and r <= 122)
+  if r > 0x10FFFF or (r >= 0xD800 and r <= 0xDFFF): return false
+  let ch = chr(r)
+  return ch.is_alpha() or ch.is_decimal()
+
+fn lx_accept(var l: Lx, valid: Str) -> Bool:
+  let r = lx_next(&l)
+  if r >= 0 and r < 128 and valid.find(chr(r)) >= 0: return true
+  lx_backup(&l)
+  return false
+
+fn lx_accept_run(var l: Lx, valid: Str):
+  while true:
+    let r = lx_next(&l)
+    if not (r >= 0 and r < 128 and valid.find(chr(r)) >= 0): break
+  lx_backup(&l)
+
+fn has_ltrim(s: Str, i: Int) -> Bool:
+  return s.len - i >= 2 and s[i] == '-' and is_tspace(int(s[i + 1]))
+
+fn has_rtrim(s: Str, i: Int) -> Bool:
+  return s.len - i >= 2 and is_tspace(int(s[i])) and s[i + 1] == '-'
+
+fn starts_at(s: Str, i: Int, p: Str) -> Bool:
+  return i >= 0 and i + p.len <= s.len and s[i..i + p.len] == p
+
+# (delim, trim)
+fn at_rdelim(l: Lx) -> [Bool]:
+  if has_rtrim(l.input, l.pos) and starts_at(l.input, l.pos + 2, "}}}}"): return [true, true]
+  if starts_at(l.input, l.pos, "}}}}"): return [true, false]
+  return [false, false]
+
+fn lx_at_term(var l: Lx) -> Bool:
+  let r = lx_peek(&l)
+  if is_tspace(r): return true
+  if r == -1 or r == 46 or r == 44 or r == 124 or r == 58 or r == 41 or r == 40: return true
+  return starts_at(l.input, l.pos, "}}}}")
+
+fn fmt_u(r: Int) -> Str:
+  let hx = "0123456789ABCDEF"
+  var h = ""
+  var v = r
+  while v > 0:
+    h = hx[v & 15..(v & 15) + 1] + h
+    v = v >> 4
+  while h.len < 4: h = "0" + h
+  var s = "U+" + h
+  if r >= 32 and r != 127 and r <= 0x10FFFF and not (r >= 0xD800 and r <= 0xDFFF) and (r < 128 or is_print(r)): s += " '" + chr(r) + "'"
+  return s
+
+fn lx_scan_number(var l: Lx) -> Bool:
+  lx_accept(&l, "+-")
+  var digits = "0123456789_"
+  if lx_accept(&l, "0"):
+    if lx_accept(&l, "xX"): digits = "0123456789abcdefABCDEF_"
+    elif lx_accept(&l, "oO"): digits = "01234567_"
+    elif lx_accept(&l, "bB"): digits = "01_"
+  lx_accept_run(&l, digits)
+  if lx_accept(&l, "."): lx_accept_run(&l, digits)
+  if digits.len == 11 and lx_accept(&l, "eE"):
+    lx_accept(&l, "+-")
+    lx_accept_run(&l, "0123456789_")
+  if digits.len == 23 and lx_accept(&l, "pP"):
+    lx_accept(&l, "+-")
+    lx_accept_run(&l, "0123456789_")
+  lx_accept(&l, "i")
+  if is_alnum_r(lx_peek(&l)):
+    lx_next(&l)
+    return false
+  return true
+
+fn keyword(w: Str) -> Int:
+  if w == ".": return IT_DOT
+  if w == "block": return IT_BLOCK
+  if w == "break": return IT_BREAK
+  if w == "continue": return IT_CONTINUE
+  if w == "define": return IT_DEFINE
+  if w == "else": return IT_ELSE
+  if w == "end": return IT_END
+  if w == "if": return IT_IF
+  if w == "range": return IT_RANGE
+  if w == "nil": return IT_NIL
+  if w == "template": return IT_TEMPLATE
+  if w == "with": return IT_WITH
+  return 0
+
+fn rtrim_len(s: Str) -> Int:
+  var i = s.len
+  while i > 0 and is_tspace(int(s[i - 1])): i -= 1
+  return s.len - i
+
+fn ltrim_len(s: Str, from: Int) -> Int:
+  var i = from
+  while i < s.len and is_tspace(int(s[i])): i += 1
+  return i - from
+
+# One state of the lexer: the next state, 0 when an item is ready
+fn lx_state(var l: Lx, st: Int) -> Int:
+  if st == LS_TEXT:
+    let x = l.input.find("{{{{", l.pos)
+    if x >= 0:
+      if x > l.pos:
+        l.pos = x
+        var trim = 0
+        if has_ltrim(l.input, l.pos + 2): trim = rtrim_len(l.input[l.start..l.pos])
+        l.pos -= trim
+        l.line += l.input[l.start..l.pos].count("\n")
+        let it = lx_this(&l, IT_TEXT)
+        l.pos += trim
+        lx_ignore(&l)
+        if it.val.len > 0:
+          l.item = it
+          return 0
+      return LS_LDELIM
+    l.pos = l.input.len
+    if l.pos > l.start:
+      l.line += l.input[l.start..l.pos].count("\n")
+      return lx_emit(&l, IT_TEXT)
+    return lx_emit(&l, IT_EOF)
+  if st == LS_LDELIM:
+    l.pos += 2
+    let trim = has_ltrim(l.input, l.pos)
+    var after = 0
+    if trim: after = 2
+    if starts_at(l.input, l.pos + after, "/*"):
+      l.pos += after
+      lx_ignore(&l)
+      return LS_COMMENT
+    let it = lx_this(&l, IT_LDELIM)
+    l.inside = true
+    l.pos += after
+    lx_ignore(&l)
+    l.paren = 0
+    l.item = it
+    return 0
+  if st == LS_COMMENT:
+    l.pos += 2
+    let x = l.input.find("*/", l.pos)
+    if x < 0: return lx_errorf(&l, "unclosed comment")
+    l.pos = x + 2
+    let d = at_rdelim(l)
+    if not d[0]: return lx_errorf(&l, "comment ends before closing delimiter")
+    l.line += l.input[l.start..l.pos].count("\n")
+    if d[1]: l.pos += 2
+    l.pos += 2
+    if d[1]: l.pos += ltrim_len(l.input, l.pos)
+    lx_ignore(&l)
+    return LS_TEXT
+  if st == LS_RDELIM:
+    let d = at_rdelim(l)
+    if d[1]:
+      l.pos += 2
+      lx_ignore(&l)
+    l.pos += 2
+    let it = lx_this(&l, IT_RDELIM)
+    if d[1]:
+      l.pos += ltrim_len(l.input, l.pos)
+      lx_ignore(&l)
+    l.inside = false
+    l.item = it
+    return 0
+  if st == LS_INSIDE:
+    let d = at_rdelim(l)
+    if d[0]:
+      if l.paren == 0: return LS_RDELIM
+      return lx_errorf(&l, "unclosed left paren")
+    let r = lx_next(&l)
+    if r == -1: return lx_errorf(&l, "unclosed action")
+    if is_tspace(r):
+      lx_backup(&l)
+      return LS_SPACE
+    if r == 61: return lx_emit(&l, IT_ASSIGN)
+    if r == 58:
+      if lx_next(&l) != 61: return lx_errorf(&l, "expected :=")
+      return lx_emit(&l, IT_DECLARE)
+    if r == 124: return lx_emit(&l, IT_PIPE)
+    if r == 34: return LS_QUOTE
+    if r == 96: return LS_RAWQUOTE
+    if r == 36: return LS_VARIABLE
+    if r == 39: return LS_CHAR
+    if r == 46:
+      if l.pos < l.input.len:
+        let r2 = l.input[l.pos]
+        if r2 < '0' or r2 > '9': return LS_FIELD
+      lx_backup(&l)
+      return LS_NUMBER
+    if r == 43 or r == 45 or (r >= 48 and r <= 57):
+      lx_backup(&l)
+      return LS_NUMBER
+    if is_alnum_r(r):
+      lx_backup(&l)
+      return LS_IDENT
+    if r == 40:
+      l.paren += 1
+      return lx_emit(&l, IT_LPAREN)
+    if r == 41:
+      l.paren -= 1
+      if l.paren < 0: return lx_errorf(&l, "unexpected right paren")
+      return lx_emit(&l, IT_RPAREN)
+    if r < 128 and r >= 32 and r != 127: return lx_emit(&l, IT_CHAR)
+    return lx_errorf(&l, "unrecognized character in action: " + fmt_u(r))
+  if st == LS_SPACE:
+    var ns = 0
+    while true:
+      let r = lx_peek(&l)
+      if not is_tspace(r): break
+      lx_next(&l)
+      ns += 1
+    if has_rtrim(l.input, l.pos - 1) and starts_at(l.input, l.pos - 1 + 2, "}}}}"):
+      lx_backup(&l)
+      if ns == 1: return LS_RDELIM
+    return lx_emit(&l, IT_SPACE)
+  if st == LS_IDENT:
+    while true:
+      let r = lx_next(&l)
+      if is_alnum_r(r): continue
+      lx_backup(&l)
+      let word = l.input[l.start..l.pos]
+      if not lx_at_term(&l): return lx_errorf(&l, "bad character " + fmt_u(r))
+      let kw = keyword(word)
+      if kw > IT_KEYWORD: return lx_emit(&l, kw)
+      if word[0] == '.': return lx_emit(&l, IT_FIELD)
+      if word == "true" or word == "false": return lx_emit(&l, IT_BOOL)
+      return lx_emit(&l, IT_IDENT)
+    return 0
+  if st == LS_FIELD or st == LS_VARIABLE:
+    var typ = IT_FIELD
+    if st == LS_VARIABLE: typ = IT_VARIABLE
+    if lx_at_term(&l):
+      if typ == IT_VARIABLE: return lx_emit(&l, IT_VARIABLE)
+      return lx_emit(&l, IT_DOT)
+    var r = 0
+    while true:
+      r = lx_next(&l)
+      if not is_alnum_r(r):
+        lx_backup(&l)
+        break
+    if not lx_at_term(&l): return lx_errorf(&l, "bad character " + fmt_u(r))
+    return lx_emit(&l, typ)
+  if st == LS_CHAR or st == LS_QUOTE:
+    var q = 39
+    var what = "unterminated character constant"
+    var typ = IT_CHARCONST
+    if st == LS_QUOTE:
+      q = 34
+      what = "unterminated quoted string"
+      typ = IT_STRING
+    while true:
+      var r = lx_next(&l)
+      if r == 92:
+        r = lx_next(&l)
+        if r != -1 and r != 10: continue
+        return lx_errorf(&l, what)
+      if r == -1 or r == 10: return lx_errorf(&l, what)
+      if r == q: break
+    return lx_emit(&l, typ)
+  if st == LS_RAWQUOTE:
+    while true:
+      let r = lx_next(&l)
+      if r == -1: return lx_errorf(&l, "unterminated raw quoted string")
+      if r == 96: break
+    return lx_emit(&l, IT_RAWSTRING)
+  if st == LS_NUMBER:
+    if not lx_scan_number(&l): return lx_errorf(&l, "bad number syntax: " + go_quote(l.input[l.start..l.pos]))
+    let sg = lx_peek(&l)
+    if sg == 43 or sg == 45:
+      if not lx_scan_number(&l) or l.input[l.pos - 1] != 'i': return lx_errorf(&l, "bad number syntax: " + go_quote(l.input[l.start..l.pos]))
+      return lx_emit(&l, IT_COMPLEX)
+    return lx_emit(&l, IT_NUMBER)
+  return 0
+
+fn lx_item(var l: Lx) -> Tok:
+  l.item = Tok(IT_EOF, l.pos, "EOF", l.start_line)
+  var st = LS_TEXT
+  if l.inside: st = LS_INSIDE
+  while st != 0: st = lx_state(&l, st)
+  return Tok(l.item.typ, l.item.pos, l.item.val + "", l.item.line)
+
+fn tok_str(t: Tok) -> Str:
+  if t.typ == IT_EOF: return "EOF"
+  if t.typ == IT_ERROR: return t.val + ""
+  if t.typ > IT_KEYWORD: return "<" + t.val + ">"
+  if t.val.len > 10:
+    var n = 0
+    var i = 0
+    while i < t.val.len and n < 10:
+      i += utf8_at(t.val, i)[1]
+      n += 1
+    return go_quote(t.val[0..i]) + "..."
+  return go_quote(t.val)
+
+# A parse tree's state (its own lookahead; the lexer is shared with the templates it defines)
+type Tr:
+  tok: [Tok]
+  peekc: Int
+  vars: [Str]
+  range_depth: Int
+  action_line: Int
+  name: Str
+  nonempty: Bool
+  depth: Int
+
+fn new_tr(name: Str) -> Tr:
+  return Tr([Tok(0, 0, "", 0), Tok(0, 0, "", 0), Tok(0, 0, "", 0)], 0, ["$"], 0, 0, name, false, 0)
+
+fn tok_copy(t: Tok) -> Tok:
+  return Tok(t.typ, t.pos, t.val + "", t.line)
+
+fn tp_errorf(var l: Lx, t: Tr, msg: Str):
+  if l.err != "": return
+  l.err = "template: :{t.tok[0].line}: " + msg
+
+fn tp_next(var l: Lx, var t: Tr) -> Tok:
+  if t.peekc > 0: t.peekc -= 1
+  else: t.tok[0] = lx_item(&l)
+  return tok_copy(t.tok[t.peekc])
+
+fn tp_backup(var t: Tr):
+  t.peekc += 1
+
+fn tp_backup2(var t: Tr, t1: Tok):
+  t.tok[1] = tok_copy(t1)
+  t.peekc = 2
+
+fn tp_backup3(var t: Tr, t2: Tok, t1: Tok):
+  t.tok[1] = tok_copy(t1)
+  t.tok[2] = tok_copy(t2)
+  t.peekc = 3
+
+fn tp_peek(var l: Lx, var t: Tr) -> Tok:
+  if t.peekc > 0: return tok_copy(t.tok[t.peekc - 1])
+  t.peekc = 1
+  t.tok[0] = lx_item(&l)
+  return tok_copy(t.tok[0])
+
+fn tp_next_ns(var l: Lx, var t: Tr) -> Tok:
+  while true:
+    let tk = tp_next(&l, &t)
+    if tk.typ != IT_SPACE: return tk
+  return Tok(0, 0, "", 0)
+
+fn tp_peek_ns(var l: Lx, var t: Tr) -> Tok:
+  let tk = tp_next_ns(&l, &t)
+  tp_backup(&t)
+  return tk
+
+fn tp_unexpected(var l: Lx, t: Tr, tk: Tok, ctx: Str):
+  if tk.typ == IT_ERROR:
+    var extra = ""
+    if t.action_line != 0 and t.action_line != tk.line:
+      extra = " in action started at :{t.action_line}"
+      if tk.val.endswith(" action"): extra = extra[10..extra.len]
+    tp_errorf(&l, t, tok_str(tk) + extra)
+    return
+  tp_errorf(&l, t, "unexpected " + tok_str(tk) + " in " + ctx)
+
+# Node kinds
+const ND_TEXT = 1
+const ND_ACTION = 2
+const ND_COMMENT = 3
+const ND_IF = 4
+const ND_RANGE = 5
+const ND_WITH = 6
+const ND_TEMPLATE = 7
+const ND_END = 8
+const ND_ELSE = 9
+const ND_BREAK = 10
+const ND_CONTINUE = 11
+const ND_BOOL = 12
+const ND_DOT = 13
+const ND_NIL = 14
+const ND_NUMBER = 15
+const ND_STRING = 16
+const ND_FIELD = 17
+const ND_VARIABLE = 18
+const ND_IDENT = 19
+const ND_PIPE = 20
+const ND_CHAIN = 21
+
+# The template's parse error text, "" when it parses
+fn tmpl_parse(text: Str) -> Str:
+  var l = Lx(text, 0, 0, false, 0, 1, 1, false, Tok(0, 0, "", 0), "", {})
+  var t = new_tr("")
+  tp_parse(&l, &t)
+  if l.err != "": return l.err
+  tp_add(&l, t)
+  return l.err
+
+fn tp_add(var l: Lx, t: Tr):
+  if not (t.name in l.trees) or not l.trees[t.name]:
+    l.trees[t.name] = t.nonempty
+    return
+  if t.nonempty: tp_errorf(&l, t, "template: multiple definition of template " + go_quote(t.name))
+
+fn text_nonempty(s: Str) -> Bool:
+  return s.strip() != ""
+
+fn tp_parse(var l: Lx, var t: Tr):
+  while l.err == "" and tp_peek(&l, &t).typ != IT_EOF:
+    if tp_peek(&l, &t).typ == IT_LDELIM:
+      let delim = tp_next(&l, &t)
+      if tp_next_ns(&l, &t).typ == IT_DEFINE:
+        var nt = new_tr("definition")
+        tp_definition(&l, &nt)
+        continue
+      tp_backup2(&t, delim)
+    var tn = ""
+    let nk = tp_text_or_action(&l, &t, &tn)
+    if l.err != "": return
+    if nk == ND_END or nk == ND_ELSE:
+      tp_errorf(&l, t, "unexpected " + tn)
+      return
+    if nk == ND_TEXT:
+      if text_nonempty(tn): t.nonempty = true
+    elif nk != ND_COMMENT: t.nonempty = true
+
+fn tp_definition(var l: Lx, var t: Tr):
+  let name = tp_next_ns(&l, &t)
+  if name.typ != IT_STRING and name.typ != IT_RAWSTRING:
+    tp_unexpected(&l, t, name, "define clause")
+    return
+  var ok = true
+  t.name = go_unquote(name.val, &ok)
+  if not ok:
+    tp_errorf(&l, t, "invalid syntax")
+    return
+  let rd = tp_next_ns(&l, &t)
+  if rd.typ != IT_RDELIM:
+    tp_unexpected(&l, t, rd, "define clause")
+    return
+  var en = ""
+  let end = tp_item_list(&l, &t, &en)
+  if l.err != "": return
+  if end != ND_END:
+    tp_errorf(&l, t, "unexpected " + en + " in define clause")
+    return
+  tp_add(&l, t)
+
+# itemList: the kind of the node that ended it (end or else), its String in en
+fn tp_item_list(var l: Lx, var t: Tr, var en: Str) -> Int:
+  while l.err == "" and tp_peek_ns(&l, &t).typ != IT_EOF:
+    var tn = ""
+    let nk = tp_text_or_action(&l, &t, &tn)
+    if l.err != "": return 0
+    if nk == ND_END or nk == ND_ELSE:
+      en = tn
+      return nk
+    if nk == ND_TEXT:
+      if text_nonempty(tn): t.nonempty = true
+    elif nk != ND_COMMENT: t.nonempty = true
+  if l.err == "": tp_errorf(&l, t, "unexpected EOF")
+  return 0
+
+fn tp_text_or_action(var l: Lx, var t: Tr, var tn: Str) -> Int:
+  let tk = tp_next_ns(&l, &t)
+  if tk.typ == IT_TEXT:
+    tn = tk.val + ""
+    return ND_TEXT
+  if tk.typ == IT_LDELIM:
+    t.action_line = tk.line
+    let r = tp_action(&l, &t, &tn)
+    t.action_line = 0
+    return r
+  if tk.typ == IT_COMMENT: return ND_COMMENT
+  tp_unexpected(&l, t, tk, "input")
+  return 0
+
+fn tp_action(var l: Lx, var t: Tr, var tn: Str) -> Int:
+  let tk = tp_next_ns(&l, &t)
+  let ty = tk.typ
+  if ty == IT_BLOCK: return tp_block(&l, &t)
+  if ty == IT_BREAK or ty == IT_CONTINUE:
+    var what = "{{{{break}}}}"
+    if ty == IT_CONTINUE: what = "{{{{continue}}}}"
+    let n2 = tp_next_ns(&l, &t)
+    if n2.typ != IT_RDELIM:
+      tp_unexpected(&l, t, n2, what)
+      return 0
+    if t.range_depth == 0: tp_errorf(&l, t, what + " outside {{{{range}}}}")
+    if ty == IT_BREAK: return ND_BREAK
+    return ND_CONTINUE
+  if ty == IT_ELSE:
+    let pk = tp_peek_ns(&l, &t)
+    tn = "{{{{else}}}}"
+    if pk.typ == IT_IF or pk.typ == IT_WITH: return ND_ELSE
+    let rd = tp_next_ns(&l, &t)
+    if rd.typ != IT_RDELIM: tp_unexpected(&l, t, rd, "else")
+    return ND_ELSE
+  if ty == IT_END:
+    tn = "{{{{end}}}}"
+    let rd = tp_next_ns(&l, &t)
+    if rd.typ != IT_RDELIM: tp_unexpected(&l, t, rd, "end")
+    return ND_END
+  if ty == IT_IF:
+    tp_control(&l, &t, "if")
+    return ND_IF
+  if ty == IT_RANGE:
+    tp_control(&l, &t, "range")
+    return ND_RANGE
+  if ty == IT_TEMPLATE:
+    let nm = tp_next_ns(&l, &t)
+    if not tp_template_name(&l, t, nm, "template clause"): return 0
+    if tp_next_ns(&l, &t).typ != IT_RDELIM:
+      tp_backup(&t)
+      tp_pipeline(&l, &t, "template clause", IT_RDELIM)
+    return ND_TEMPLATE
+  if ty == IT_WITH:
+    tp_control(&l, &t, "with")
+    return ND_WITH
+  tp_backup(&t)
+  tp_peek(&l, &t)
+  tp_pipeline(&l, &t, "command", IT_RDELIM)
+  return ND_ACTION
+
+fn tp_template_name(var l: Lx, t: Tr, tk: Tok, ctx: Str) -> Bool:
+  if tk.typ == IT_STRING or tk.typ == IT_RAWSTRING:
+    var ok = true
+    go_unquote(tk.val, &ok)
+    if not ok:
+      tp_errorf(&l, t, "invalid syntax")
+      return false
+    return true
+  tp_unexpected(&l, t, tk, ctx)
+  return false
+
+fn tp_block(var l: Lx, var t: Tr) -> Int:
+  let tk = tp_next_ns(&l, &t)
+  if not tp_template_name(&l, t, tk, "block clause"): return 0
+  tp_pipeline(&l, &t, "block clause", IT_RDELIM)
+  if l.err != "": return 0
+  var ok = true
+  var b = new_tr(go_unquote(tk.val, &ok))
+  var en = ""
+  let end = tp_item_list(&l, &b, &en)
+  if l.err != "": return 0
+  if end != ND_END:
+    tp_errorf(&l, t, "unexpected " + en + " in block clause")
+    return 0
+  tp_add(&l, b)
+  return ND_TEMPLATE
+
+fn tp_control(var l: Lx, var t: Tr, ctx: Str):
+  let nv = t.vars.len
+  tp_control0(&l, &t, ctx)
+  t.vars.truncate(nv)
+
+fn tp_control0(var l: Lx, var t: Tr, ctx: Str):
+  tp_pipeline(&l, &t, ctx, IT_RDELIM)
+  if l.err != "": return
+  if ctx == "range": t.range_depth += 1
+  var en = ""
+  let next = tp_item_list(&l, &t, &en)
+  if ctx == "range": t.range_depth -= 1
+  if l.err != "": return
+  if next == ND_ELSE:
+    if ctx == "if" and tp_peek(&l, &t).typ == IT_IF:
+      tp_next(&l, &t)
+      tp_control(&l, &t, "if")
+    elif ctx == "with" and tp_peek(&l, &t).typ == IT_WITH:
+      tp_next(&l, &t)
+      tp_control(&l, &t, "with")
+    else:
+      var en2 = ""
+      let n2 = tp_item_list(&l, &t, &en2)
+      if l.err != "": return
+      if n2 != ND_END: tp_errorf(&l, t, "expected end; found " + en2)
+
+# pipeline; the kind of its first command's first argument for checkPipeline
+fn tp_pipeline(var l: Lx, var t: Tr, ctx: Str, end: Int):
+  tp_peek_ns(&l, &t)
+  var ndecl = 0
+  while true:
+    let v = tp_peek_ns(&l, &t)
+    if v.typ != IT_VARIABLE: break
+    tp_next(&l, &t)
+    let after = tp_peek(&l, &t)
+    let nx = tp_peek_ns(&l, &t)
+    if nx.typ == IT_ASSIGN or nx.typ == IT_DECLARE:
+      tp_next_ns(&l, &t)
+      t.vars.push(v.val + "")
+      break
+    if nx.typ == IT_CHAR and nx.val == ",":
+      tp_next_ns(&l, &t)
+      t.vars.push(v.val + "")
+      ndecl += 1
+      if ctx == "range" and ndecl < 2:
+        let pt = tp_peek_ns(&l, &t).typ
+        if pt == IT_VARIABLE or pt == IT_RDELIM or pt == IT_RPAREN: continue
+        tp_errorf(&l, t, "range can only initialize variables")
+        return
+      tp_errorf(&l, t, "too many declarations in " + ctx)
+      return
+    if after.typ == IT_SPACE: tp_backup3(&t, v, after)
+    else: tp_backup2(&t, v)
+    break
+  var ncmds = 0
+  while l.err == "":
+    let tk = tp_next_ns(&l, &t)
+    if tk.typ == end:
+      if ncmds == 0: tp_errorf(&l, t, "missing value for " + ctx)
+      return
+    let ty = tk.typ
+    if ty == IT_BOOL or ty == IT_CHARCONST or ty == IT_COMPLEX or ty == IT_DOT or ty == IT_FIELD or ty == IT_IDENT or ty == IT_NUMBER or ty == IT_NIL or ty == IT_RAWSTRING or ty == IT_STRING or ty == IT_VARIABLE or ty == IT_LPAREN:
+      tp_backup(&t)
+      let first = tp_command(&l, &t)
+      if l.err != "": return
+      ncmds += 1
+      if ncmds > 1 and (first == ND_BOOL or first == ND_DOT or first == ND_NIL or first == ND_NUMBER or first == ND_STRING):
+        # (checkPipeline, once the pipeline ends; the errors before it come first)
+        var pend = ncmds
+        tp_pipeline_rest(&l, &t, ctx, end, pend)
+        return
+    else:
+      tp_unexpected(&l, t, tk, ctx)
+      return
+
+# The rest of a pipeline whose stage bad isn't executable: the error at its end
+fn tp_pipeline_rest(var l: Lx, var t: Tr, ctx: Str, end: Int, bad: Int):
+  while l.err == "":
+    let tk = tp_next_ns(&l, &t)
+    if tk.typ == end:
+      tp_errorf(&l, t, "non executable command in pipeline stage {bad}")
+      return
+    let ty = tk.typ
+    if ty == IT_BOOL or ty == IT_CHARCONST or ty == IT_COMPLEX or ty == IT_DOT or ty == IT_FIELD or ty == IT_IDENT or ty == IT_NUMBER or ty == IT_NIL or ty == IT_RAWSTRING or ty == IT_STRING or ty == IT_VARIABLE or ty == IT_LPAREN:
+      tp_backup(&t)
+      tp_command(&l, &t)
+    else:
+      tp_unexpected(&l, t, tk, ctx)
+      return
+
+# command: the kind of its first argument
+fn tp_command(var l: Lx, var t: Tr) -> Int:
+  tp_peek_ns(&l, &t)
+  var first = 0
+  var nargs = 0
+  while l.err == "":
+    tp_peek_ns(&l, &t)
+    let op = tp_operand(&l, &t)
+    if l.err != "": return 0
+    if op != 0:
+      if nargs == 0: first = op
+      nargs += 1
+    let tk = tp_next(&l, &t)
+    if tk.typ == IT_SPACE: continue
+    if tk.typ == IT_RDELIM or tk.typ == IT_RPAREN: tp_backup(&t)
+    elif tk.typ != IT_PIPE:
+      tp_unexpected(&l, t, tk, "operand")
+      return 0
+    break
+  if l.err == "" and nargs == 0: tp_errorf(&l, t, "empty command")
+  return first
+
+fn tp_operand(var l: Lx, var t: Tr) -> Int:
+  var ns = ""
+  var node = tp_term(&l, &t, &ns)
+  if node == 0 or l.err != "": return node
+  if tp_peek(&l, &t).typ == IT_FIELD:
+    while tp_peek(&l, &t).typ == IT_FIELD: tp_next(&l, &t)
+    if node == ND_BOOL or node == ND_STRING or node == ND_NUMBER or node == ND_NIL or node == ND_DOT:
+      tp_errorf(&l, t, "unexpected . after term " + go_quote(ns))
+      return 0
+    if node != ND_FIELD and node != ND_VARIABLE: node = ND_CHAIN
+  return node
+
+fn tmpl_builtin(name: Str) -> Bool:
+  for f in ["and", "call", "html", "index", "slice", "js", "len", "not", "or", "print", "printf", "println", "urlquery", "eq", "ge", "gt", "le", "lt", "ne"]:
+    if f == name: return true
+  return false
+
+fn tp_term(var l: Lx, var t: Tr, var ns: Str) -> Int:
+  let tk = tp_next_ns(&l, &t)
+  let ty = tk.typ
+  if ty == IT_IDENT:
+    if not tmpl_builtin(tk.val):
+      tp_errorf(&l, t, "function " + go_quote(tk.val) + " not defined")
+      return 0
+    return ND_IDENT
+  if ty == IT_DOT:
+    ns = "."
+    return ND_DOT
+  if ty == IT_NIL:
+    ns = "nil"
+    return ND_NIL
+  if ty == IT_VARIABLE:
+    var name = tk.val
+    let d = name.find(".")
+    if d >= 0: name = name[0..d]
+    var found = false
+    for v in t.vars:
+      if v == name: found = true
+    if not found:
+      tp_errorf(&l, t, "undefined variable " + go_quote(name))
+      return 0
+    return ND_VARIABLE
+  if ty == IT_FIELD: return ND_FIELD
+  if ty == IT_BOOL:
+    ns = tk.val + ""
+    return ND_BOOL
+  if ty == IT_CHARCONST or ty == IT_COMPLEX or ty == IT_NUMBER:
+    let e = tmpl_number(tk.val, ty)
+    if e != "":
+      tp_errorf(&l, t, e)
+      return 0
+    ns = tk.val + ""
+    return ND_NUMBER
+  if ty == IT_LPAREN:
+    t.depth += 1
+    if t.depth > 10000:
+      tp_errorf(&l, t, "max expression depth exceeded")
+      return 0
+    tp_pipeline(&l, &t, "parenthesized pipeline", IT_RPAREN)
+    t.depth -= 1
+    return ND_PIPE
+  if ty == IT_STRING or ty == IT_RAWSTRING:
+    var ok = true
+    go_unquote(tk.val, &ok)
+    if not ok:
+      tp_errorf(&l, t, "invalid syntax")
+      return 0
+    ns = tk.val + ""
+    return ND_STRING
+  tp_backup(&t)
+  return 0
+
+# newNumber's error, roughly: a number strconv can't read (underscores only between digits), a
+# decimal integer past uint64
+fn tmpl_number(s: Str, ty: Int) -> Str:
+  if ty != IT_NUMBER: return ""
+  var b = s
+  if b.len > 0 and (b[0] == '+' or b[0] == '-'): b = b[1..b.len]
+  if b.endswith("i"): return ""
+  if b.find("__") >= 0 or b.startswith("_") or b.endswith("_"): return "illegal number syntax: " + go_quote(s)
+  let lower = b.lower()
+  let hex = lower.startswith("0x")
+  if not hex and lower.find(".") < 0 and lower.find("e") < 0:
+    var digits = b.replace("_", "")
+    if lower.startswith("0b") or lower.startswith("0o"): return ""
+    if digits.len > 20 or (digits.len == 20 and digits > "18446744073709551615"): return "integer overflow: " + go_quote(s)
+  if b == "." or lower.endswith("e") or lower.endswith("e+") or lower.endswith("e-") or lower == "0x" or lower == "0b" or lower == "0o": return "illegal number syntax: " + go_quote(s)
+  return ""
+
+# strconv.Unquote, roughly (validity only matters)
+fn go_unquote(s: Str, var ok: Bool) -> Str:
+  if s.len < 2 or s[0] != s[s.len - 1]:
+    ok = false
+    return ""
+  if s[0] == '`':
+    if s[1..s.len - 1].find("`") >= 0: ok = false
+    return s[1..s.len - 1].replace("\r", "")
+  return tc.unquote(s)

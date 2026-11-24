@@ -1,0 +1,1962 @@
+# govet analyzers (golang.org/x/tools v0.50.0's go/analysis/passes, as golangci-lint 2.14.0 runs
+# them): asmdecl buildtag cgocall directive framepointer hostport ifaceassert lostcancel slog
+# stdversion unsafeptr waitgroup. run() adds this package's issues (as vet.vu's report does, through
+# a vet.V); main.vu calls it after vet.run, with the package's non-generated nodes. Which analyzers
+# are on is decided later (main.vu's check_on, vet_enabled).
+#
+# asmdecl and framepointer report only in assembly files, and golangci-lint drops every issue in a
+# file that isn't a .go file (its invalid_issue processor): they never show, so they have nothing
+# here. buildtag and directive also read the package's other files (.s and the files the build
+# constraints exclude): vgolint doesn't know those files, so only the package's own Go files are
+# checked here.
+
+import ast
+import pkg
+import tc
+import vet
+import scan
+import format
+import resolve
+import errcheck
+import ssadata
+from scan import T_ASSIGN, T_DEFINE, T_AND, T_ADD, T_SUB, T_ANDNOT, T_INT
+from scan import K_VAR, K_BREAK, K_CONTINUE, K_GOTO, K_FALLTHROUGH
+
+# The analyzers this file has (only the ones ported so far)
+fn names() -> [Str]:
+  return ["asmdecl", "buildtag", "cgocall", "directive", "framepointer", "hostport", "ifaceassert", "lostcancel", "slog", "stdversion", "unsafeptr", "waitgroup"]
+
+fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gover: Int, nodes: [Int], ip: pkg.Pkg):
+  var ranks: {Str: Int} = {}
+  let ns = vet.ANALYZERS.split()
+  for i in 0..ns.len: ranks[ns[i]] = i
+  var v = vet.V(pi, ranks, [])
+  var roots: [Int] = []
+  for fi in 0..g.pk[pi].roots.len:
+    if not p.gen[fi]: roots.push(g.pk[pi].roots[fi])
+  buildtag(&g, &v, p)
+  buildtag_ignored(g, &v, ip, p.paths.len)
+  cgocall(&g, fs, &v, nodes)
+  directive(&g, &v, p)
+  directive_ignored(g, &v, ip, p.paths.len)
+  hostport(&g, fs, &v, p, nodes)
+  ifaceassert(&g, fs, &v, nodes)
+  lostcancel(&g, fs, &v, p, nodes)
+  slog(&g, fs, &v, nodes)
+  stdversion(&g, fs, &v, p, roots)
+  unsafeptr(&g, fs, &v, nodes)
+  waitgroup(&g, &v, nodes)
+  for is in v.out: issues.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
+
+# ---- helpers
+
+fn k(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0: return 0
+  return g.pk[pi].t.k[n]
+
+fn nm(g: tc.Prog, pi: Int, n: Int) -> Str:
+  return g.pk[pi].t.names[g.pk[pi].t.s[n]] + ""
+
+fn its(g: tc.Prog, pi: Int, l: Int) -> [Int]:
+  return ast.items(g.pk[pi].t, l)
+
+fn cnt(g: tc.Prog, pi: Int, l: Int) -> Int:
+  return ast.count(g.pk[pi].t, l)
+
+fn uses(g: tc.Prog, pi: Int, n: Int) -> Int:
+  if n <= 0 or n >= g.pk[pi].use.len: return -1
+  return g.pk[pi].use[n]
+
+fn line_at(p: pkg.Pkg, fi: Int, pos: Int) -> Int:
+  return pkg.line_of(p.lines[fi], pos)
+
+# typeutil.StaticCallee: a function or a concrete method (not an interface's), -1 otherwise.
+fn static_callee(g: tc.Prog, pi: Int, call: Int) -> Int:
+  let o = vet.callee(g, pi, call)
+  if o < 0: return -1
+  if g.mowner.get(o, -1) >= 0: return -1
+  let opk = g.opkg[o]
+  if opk >= 0:
+    let d = g.odecl[o]
+    if d >= 0 and g.pk[opk].t.k[d] == ast.N_FIELD: return -1
+  return o
+
+# Each node's parent (lists skipped, as go/ast has none), for the nodes of a walk.
+fn parents(t: ast.Ast, nodes: [Int]) -> [Int]:
+  var par = [-1] * t.k.len
+  var stack: [Int] = []
+  for n in nodes:
+    stack.truncate(0)
+    vet.push_kids(t, n, &stack)
+    for c in stack: par[c] = n
+  return par
+
+# Whether the types are identical (types.Identical, near enough: types are mostly hash-consed).
+fn identical(var g: tc.Prog, fs: Fs, a: Int, b: Int, depth: Int) -> Bool:
+  if a == b: return true
+  if a <= 0 or b <= 0 or depth > 20: return false
+  let ka = g.tk[a]
+  if ka != g.tk[b]: return false
+  if ka == tc.TY_BASIC or ka == tc.TY_TPARAM: return false
+  if ka == tc.TY_NAMED:
+    if g.oorig[g.ta[a]] != g.oorig[g.ta[b]]: return false
+    let xa = tc.tlist(g, a)
+    let xb = tc.tlist(g, b)
+    if xa.len != xb.len or xa.len == 0: return false
+    for i in 0..xa.len:
+      if not identical(&g, fs, xa[i], xb[i], depth + 1): return false
+    return true
+  if ka == tc.TY_PTR or ka == tc.TY_SLICE: return identical(&g, fs, g.ta[a], g.ta[b], depth + 1)
+  if ka == tc.TY_ARRAY or ka == tc.TY_CHAN: return g.tb[a] == g.tb[b] and identical(&g, fs, g.ta[a], g.ta[b], depth + 1)
+  if ka == tc.TY_MAP: return identical(&g, fs, g.ta[a], g.ta[b], depth + 1) and identical(&g, fs, g.tb[a], g.tb[b], depth + 1)
+  if ka == tc.TY_TUPLE or ka == tc.TY_UNION:
+    let xa = tc.tlist(g, a)
+    let xb = tc.tlist(g, b)
+    if xa.len != xb.len: return false
+    for i in 0..xa.len:
+      if not identical(&g, fs, xa[i], xb[i], depth + 1): return false
+    return true
+  if ka == tc.TY_FUNC:
+    if g.tlen[a] != g.tlen[b]: return false
+    return identical(&g, fs, g.ta[a], g.ta[b], depth + 1) and identical(&g, fs, g.tb[a], g.tb[b], depth + 1)
+  if ka == tc.TY_STRUCT:
+    let xa = tc.tlist(g, a)
+    let xb = tc.tlist(g, b)
+    if xa.len != xb.len: return false
+    for i in 0..xa.len:
+      if g.oname[xa[i]] != g.oname[xb[i]] or g.orecv[xa[i]] != g.orecv[xb[i]]: return false
+      let ta = tc.obj_type(&g, fs, xa[i])
+      let tb = tc.obj_type(&g, fs, xb[i])
+      if not identical(&g, fs, ta, tb, depth + 1): return false
+    return true
+  if ka == tc.TY_IFACE:
+    let ma = iface_methods(&g, fs, a)
+    let mb = iface_methods(&g, fs, b)
+    if ma.len != mb.len: return false
+    for i in 0..ma.len:
+      if g.oname[ma[i]] != g.oname[mb[i]]: return false
+      let ta = tc.obj_type(&g, fs, ma[i])
+      let tb = tc.obj_type(&g, fs, mb[i])
+      if not identical(&g, fs, ta, tb, depth + 1): return false
+    return true
+  return false
+
+# All methods of an interface type (embedded ones too), sorted by name.
+fn iface_methods(var g: tc.Prog, fs: Fs, u: Int) -> [Int]:
+  var out: [Int] = []
+  var seen: {Str: Bool} = {}
+  collect_methods(&g, fs, u, &out, &seen, 0)
+  out.sort(by: fn(x, y) => g.oname[x] < g.oname[y])
+  return out
+
+fn collect_methods(var g: tc.Prog, fs: Fs, u: Int, var out: [Int], var seen: {Str: Bool}, depth: Int):
+  if u <= 0 or g.tk[u] != tc.TY_IFACE or depth > 10: return
+  for m in tc.tlist(g, u):
+    if not (g.oname[m] in seen):
+      seen[g.oname[m] + ""] = true
+      out.push(m)
+  let emb = g.tb[u]
+  if emb <= 0: return
+  for e in tc.tlist(g, emb):
+    let eu = tc.under(&g, fs, e)
+    collect_methods(&g, fs, eu, &out, &seen, depth + 1)
+
+# typeparams.Free.Has: whether t mentions a type parameter.
+fn has_tparam(var g: tc.Prog, fs: Fs, t: Int, depth: Int) -> Bool:
+  if t <= 0 or depth > 12: return false
+  let kt = g.tk[t]
+  if kt == tc.TY_TPARAM: return true
+  if kt == tc.TY_BASIC: return false
+  if kt == tc.TY_NAMED:
+    for x in tc.tlist(g, t):
+      if has_tparam(&g, fs, x, depth + 1): return true
+    return false
+  if kt == tc.TY_PTR or kt == tc.TY_SLICE or kt == tc.TY_ARRAY or kt == tc.TY_CHAN: return has_tparam(&g, fs, g.ta[t], depth + 1)
+  if kt == tc.TY_MAP: return has_tparam(&g, fs, g.ta[t], depth + 1) or has_tparam(&g, fs, g.tb[t], depth + 1)
+  if kt == tc.TY_TUPLE or kt == tc.TY_UNION:
+    for x in tc.tlist(g, t):
+      if has_tparam(&g, fs, x, depth + 1): return true
+    return false
+  if kt == tc.TY_FUNC: return has_tparam(&g, fs, g.ta[t], depth + 1) or has_tparam(&g, fs, g.tb[t], depth + 1)
+  if kt == tc.TY_STRUCT:
+    for f in tc.tlist(g, t):
+      let ft = tc.obj_type(&g, fs, f)
+      if has_tparam(&g, fs, ft, depth + 1): return true
+    return false
+  if kt == tc.TY_IFACE:
+    for m in tc.tlist(g, t):
+      let mt = tc.obj_type(&g, fs, m)
+      if has_tparam(&g, fs, mt, depth + 1): return true
+    if g.tb[t] > 0:
+      for e in tc.tlist(g, g.tb[t]):
+        if has_tparam(&g, fs, e, depth + 1): return true
+    return false
+  return false
+
+# types.TypeString (package paths in full): interface methods sorted and printed with their
+# parameter names, embedded types after them.
+fn tstr(var g: tc.Prog, fs: Fs, t: Int) -> Str:
+  if t > 0 and g.tk[t] == tc.TY_IFACE:
+    let ms = tc.tlist(g, t)
+    if ms.len == 0 and g.tb[t] <= 0: return tc.type_str(&g, fs, t, "")
+    var sorted: [Int] = []
+    for m in ms: sorted.push(m)
+    sorted.sort(by: fn(x, y) => g.oname[x] < g.oname[y])
+    var s = "interface{{"
+    var first = true
+    for m in sorted:
+      if not first: s += "; "
+      first = false
+      s += g.oname[m] + sig_named(&g, fs, m)
+    if g.tb[t] > 0:
+      for e in tc.tlist(g, g.tb[t]):
+        if not first: s += "; "
+        first = false
+        s += tstr(&g, fs, e)
+    return s + "}}"
+  if t > 0 and g.tk[t] == tc.TY_PTR: return "*" + tstr(&g, fs, g.ta[t])
+  if t > 0 and g.tk[t] == tc.TY_SLICE: return "[]" + tstr(&g, fs, g.ta[t])
+  return tc.type_str(&g, fs, t, "")
+
+# A method's signature with the parameter names of its declaration.
+fn sig_named(var g: tc.Prog, fs: Fs, m: Int) -> Str:
+  let mt = tc.obj_type(&g, fs, m)
+  let opk = g.opkg[m]
+  let d = g.odecl[m]
+  if mt <= 0 or g.tk[mt] != tc.TY_FUNC: return "()"
+  if opk < 0 or d < 0 or g.pk[opk].t.k[d] != ast.N_FIELD: return tc.sig_str(&g, fs, mt, "")
+  let ft = g.pk[opk].t.b[d]
+  if ft <= 0 or g.pk[opk].t.k[ft] != ast.N_FUNCTYPE: return tc.sig_str(&g, fs, mt, "")
+  let pnames = field_names(g, opk, g.pk[opk].t.b[ft])
+  let rnames = field_names(g, opk, g.pk[opk].t.c[ft])
+  let pexprs = field_types(g, opk, g.pk[opk].t.b[ft])
+  let rexprs = field_types(g, opk, g.pk[opk].t.c[ft])
+  let ps = tc.tlist(g, g.ta[mt])
+  let rs = tc.tlist(g, g.tb[mt])
+  let variadic = g.tlen[mt] > 0
+  var s = "("
+  for i in 0..ps.len:
+    if i > 0: s += ", "
+    if i < pnames.len and pnames[i] != "": s += pnames[i] + " "
+    var te = -1
+    if i < pexprs.len: te = pexprs[i]
+    if variadic and i == ps.len - 1 and g.tk[ps[i]] == tc.TY_SLICE:
+      if te > 0 and g.pk[opk].t.k[te] == ast.N_ELLIPSIS: te = g.pk[opk].t.a[te]
+      else: te = -1
+      s += "..." + tstr_ast(&g, fs, g.ta[ps[i]], opk, te)
+    else: s += tstr_ast(&g, fs, ps[i], opk, te)
+  s += ")"
+  var named = false
+  for x in rnames:
+    if x != "": named = true
+  if rs.len == 1 and not named:
+    var te = -1
+    if rexprs.len > 0: te = rexprs[0]
+    s += " " + tstr_ast(&g, fs, rs[0], opk, te)
+  elif rs.len > 0:
+    s += " ("
+    for i in 0..rs.len:
+      if i > 0: s += ", "
+      if i < rnames.len and rnames[i] != "": s += rnames[i] + " "
+      var te = -1
+      if i < rexprs.len: te = rexprs[i]
+      s += tstr_ast(&g, fs, rs[i], opk, te)
+    s += ")"
+  return s
+
+# tstr, spelling byte and rune as the type expression te (of package opk) does.
+fn tstr_ast(var g: tc.Prog, fs: Fs, t: Int, opk: Int, te0: Int) -> Str:
+  var te = te0
+  while te > 0 and g.pk[opk].t.k[te] == ast.N_PAREN: te = g.pk[opk].t.a[te]
+  if te <= 0 or t <= 0: return tstr(&g, fs, t)
+  let ke = g.pk[opk].t.k[te]
+  if ke == ast.N_IDENT and (t == tc.B_UINT8 or t == tc.B_INT32):
+    let n = g.pk[opk].t.names[g.pk[opk].t.s[te]] + ""
+    if n == "byte" or n == "rune": return n
+  if ke == ast.N_STAR and g.tk[t] == tc.TY_PTR: return "*" + tstr_ast(&g, fs, g.ta[t], opk, g.pk[opk].t.a[te])
+  if ke == ast.N_ARRAYTYPE and g.tk[t] == tc.TY_SLICE: return "[]" + tstr_ast(&g, fs, g.ta[t], opk, g.pk[opk].t.b[te])
+  if ke == ast.N_ARRAYTYPE and g.tk[t] == tc.TY_ARRAY: return "[{g.tb[t]}]" + tstr_ast(&g, fs, g.ta[t], opk, g.pk[opk].t.b[te])
+  if ke == ast.N_MAPTYPE and g.tk[t] == tc.TY_MAP: return "map[" + tstr_ast(&g, fs, g.ta[t], opk, g.pk[opk].t.a[te]) + "]" + tstr_ast(&g, fs, g.tb[t], opk, g.pk[opk].t.b[te])
+  if ke == ast.N_CHANTYPE and g.tk[t] == tc.TY_CHAN:
+    let e = tstr_ast(&g, fs, g.ta[t], opk, g.pk[opk].t.a[te])
+    if g.tb[t] == 1: return "chan<- " + e
+    if g.tb[t] == 2: return "<-chan " + e
+    return "chan " + e
+  return tstr(&g, fs, t)
+
+# The type expression of each value of a field list.
+fn field_types(g: tc.Prog, opk: Int, l: Int) -> [Int]:
+  var out: [Int] = []
+  if l < 0: return out
+  for f in ast.items(g.pk[opk].t, l):
+    let ns = g.pk[opk].t.a[f]
+    var n = 1
+    if ns >= 0: n = ast.count(g.pk[opk].t, ns)
+    for _ in 0..n: out.push(g.pk[opk].t.b[f])
+  return out
+
+# The names of a field list, one per value ("" for an unnamed one).
+fn field_names(g: tc.Prog, opk: Int, l: Int) -> [Str]:
+  var out: [Str] = []
+  if l < 0: return out
+  for f in ast.items(g.pk[opk].t, l):
+    let ns = g.pk[opk].t.a[f]
+    if ns < 0: out.push("")
+    else:
+      for id in ast.items(g.pk[opk].t, ns): out.push(g.pk[opk].t.names[g.pk[opk].t.s[id]] + "")
+  return out
+
+fn is_iface(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  let u = tc.under(&g, fs, t)
+  return u > 0 and (g.tk[u] == tc.TY_IFACE or g.tk[u] == tc.TY_TPARAM)
+
+# ---- ifaceassert
+
+# types.MissingMethod(V, T, false) for interfaces V and T, when the method has the wrong type.
+fn conflicting(var g: tc.Prog, fs: Fs, vt: Int, tt: Int) -> Int:
+  if vt <= 0 or tt <= 0: return -1
+  let vu = tc.under(&g, fs, vt)
+  let tu = tc.under(&g, fs, tt)
+  if vu <= 0 or tu <= 0 or g.tk[vu] != tc.TY_IFACE or g.tk[tu] != tc.TY_IFACE: return -1
+  if has_tparam(&g, fs, vu, 0) or has_tparam(&g, fs, tu, 0): return -1
+  let vms = iface_methods(&g, fs, vu)
+  for m in iface_methods(&g, fs, tu):
+    for f in vms:
+      if g.oname[f] != g.oname[m]: continue
+      let a = tc.obj_type(&g, fs, f)
+      let b = tc.obj_type(&g, fs, m)
+      if not identical(&g, fs, a, b, 0): return m
+  return -1
+
+fn ifaceassert(var g: tc.Prog, fs: Fs, var v: vet.V, nodes: [Int]):
+  let pi = v.pi
+  for n in nodes:
+    let kn = k(g, pi, n)
+    var x = -1
+    var targets: [Int] = []
+    if kn == ast.N_TYPEASSERT:
+      if g.pk[pi].t.b[n] < 0: continue
+      x = g.pk[pi].t.a[n]
+      targets.push(g.pk[pi].t.b[n])
+    elif kn == ast.N_TYPESWITCH:
+      let gd = g.pk[pi].t.b[n]
+      var asr = -1
+      if k(g, pi, gd) == ast.N_EXPRSTMT: asr = g.pk[pi].t.a[gd]
+      elif k(g, pi, gd) == ast.N_ASSIGN and cnt(g, pi, g.pk[pi].t.b[gd]) > 0: asr = ast.item(g.pk[pi].t, g.pk[pi].t.b[gd], 0)
+      if k(g, pi, asr) != ast.N_TYPEASSERT: continue
+      x = g.pk[pi].t.a[asr]
+      for c in its(g, pi, g.pk[pi].t.c[n]):
+        for e in its(g, pi, g.pk[pi].t.a[c]): targets.push(e)
+    else: continue
+    let vt = vet.ty(g, pi, x)
+    for tg in targets:
+      let tt = vet.ty(g, pi, tg)
+      let m = conflicting(&g, fs, vt, tt)
+      if m < 0: continue
+      let msg = "impossible type assertion: no type can implement both " + tstr(&g, fs, vt) + " and " + tstr(&g, fs, tt) + " (conflicting types for " + g.oname[m] + " method)"
+      vet.report(g, &v, tg, "ifaceassert", msg)
+
+# ---- unsafeptr
+
+fn basic_is(var g: tc.Prog, fs: Fs, pi: Int, x: Int, kind: Int) -> Bool:
+  let t = vet.ty(g, pi, x)
+  if t <= 0: return false
+  return tc.under(&g, fs, t) == kind
+
+fn is_reflect_header(g: tc.Prog, t: Int) -> Bool:
+  return vet.is_named_type(g, t, "reflect", "SliceHeader") or vet.is_named_type(g, t, "reflect", "StringHeader")
+
+fn safe_uintptr(var g: tc.Prog, fs: Fs, pi: Int, x0: Int) -> Bool:
+  let x = vet.unparen(g, pi, x0)
+  let kx = k(g, pi, x)
+  if kx == ast.N_SELECTOR and nm(g, pi, g.pk[pi].t.b[x]) == "Data":
+    let pt = vet.ty(g, pi, g.pk[pi].t.a[x])
+    if pt > 0 and g.tk[pt] == tc.TY_PTR and is_reflect_header(g, g.ta[pt]): return true
+  elif kx == ast.N_CALL and cnt(g, pi, g.pk[pi].t.b[x]) == 0:
+    let sel = g.pk[pi].t.a[x]
+    if k(g, pi, sel) == ast.N_SELECTOR:
+      let sn = nm(g, pi, g.pk[pi].t.b[sel])
+      if sn == "Pointer" or sn == "UnsafeAddr":
+        if vet.is_named_type(g, vet.ty(g, pi, g.pk[pi].t.a[sel]), "reflect", "Value"): return true
+  return safe_arith(&g, fs, pi, x)
+
+fn safe_arith(var g: tc.Prog, fs: Fs, pi: Int, x0: Int) -> Bool:
+  let x = vet.unparen(g, pi, x0)
+  let kx = k(g, pi, x)
+  if kx == ast.N_CALL:
+    let args = its(g, pi, g.pk[pi].t.b[x])
+    return args.len == 1 and basic_is(&g, fs, pi, g.pk[pi].t.a[x], tc.B_UINTPTR) and basic_is(&g, fs, pi, args[0], tc.B_UNSAFEPTR)
+  if kx == ast.N_BINARY:
+    let op = g.pk[pi].t.f[x]
+    if op == T_ADD or op == T_SUB or op == T_ANDNOT:
+      return safe_arith(&g, fs, pi, g.pk[pi].t.a[x]) and not safe_arith(&g, fs, pi, g.pk[pi].t.b[x])
+  return false
+
+fn unsafeptr(var g: tc.Prog, fs: Fs, var v: vet.V, nodes: [Int]):
+  let pi = v.pi
+  for n in nodes:
+    let kn = k(g, pi, n)
+    if kn == ast.N_CALL:
+      let args = its(g, pi, g.pk[pi].t.b[n])
+      if args.len == 1 and basic_is(&g, fs, pi, g.pk[pi].t.a[n], tc.B_UNSAFEPTR) and basic_is(&g, fs, pi, args[0], tc.B_UINTPTR) and not safe_uintptr(&g, fs, pi, args[0]):
+        vet.report(g, &v, n, "unsafeptr", "possible misuse of unsafe.Pointer")
+    elif kn == ast.N_STAR:
+      let t = vet.ty(g, pi, n)
+      if is_reflect_header(g, t):
+        let msg = "possible misuse of " + tc.type_str(&g, fs, t, "")
+        vet.report(g, &v, n, "unsafeptr", msg)
+    elif kn == ast.N_UNARY and g.pk[pi].t.f[n] == T_AND:
+      let t = vet.ty(g, pi, g.pk[pi].t.a[n])
+      if is_reflect_header(g, t):
+        let msg = "possible misuse of " + tc.type_str(&g, fs, t, "")
+        vet.report(g, &v, n, "unsafeptr", msg)
+
+# ---- waitgroup
+
+fn waitgroup(var g: tc.Prog, var v: vet.V, nodes: [Int]):
+  let pi = v.pi
+  if not vet.imports(g, pi, "sync"): return
+  for n in nodes:
+    if k(g, pi, n) != ast.N_GO: continue
+    let call = g.pk[pi].t.a[n]
+    if k(g, pi, call) != ast.N_CALL: continue
+    var lits: [Int] = []
+    if k(g, pi, g.pk[pi].t.a[call]) == ast.N_FUNCLIT: lits.push(g.pk[pi].t.a[call])
+    for a in its(g, pi, g.pk[pi].t.b[call]):
+      if k(g, pi, a) == ast.N_FUNCLIT: lits.push(a)
+    for lit in lits:
+      let body = g.pk[pi].t.b[lit]
+      if k(g, pi, body) != ast.N_BLOCK or cnt(g, pi, g.pk[pi].t.a[body]) == 0: continue
+      let st = ast.item(g.pk[pi].t, g.pk[pi].t.a[body], 0)
+      if k(g, pi, st) != ast.N_EXPRSTMT: continue
+      let c = g.pk[pi].t.a[st]
+      if k(g, pi, c) != ast.N_CALL: continue
+      if vet.is_method_named(g, vet.callee(g, pi, c), "sync", "WaitGroup", "Add"):
+        vet.report_at(g, &v, g.pk[pi].t.file[c], g.pk[pi].t.pos[g.pk[pi].t.b[c]], "waitgroup", "WaitGroup.Add called from inside new goroutine")
+
+# ---- hostport
+
+fn hostport_check(var g: tc.Prog, fs: Fs, var v: vet.V, p: pkg.Pkg, e: Int, dial: Int):
+  let pi = v.pi
+  if k(g, pi, e) != ast.N_CALL: return
+  let args = its(g, pi, g.pk[pi].t.b[e])
+  if args.len != 3: return
+  if not vet.is_func_named(g, vet.callee(g, pi, e), "fmt", "Sprintf"): return
+  let farg = args[0]
+  let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[farg], farg, -1, 0)
+  if cv.k != 2: return
+  if cv.s != "%s:%d" and cv.s != "%s:%s": return
+  var suffix = ""
+  if dial > 0:
+    let dfi = g.pk[pi].t.file[dial]
+    suffix = " (passed to net.Dial at L{line_at(p, dfi, g.pk[pi].t.pos[dial])})"
+  vet.report(g, &v, farg, "hostport", "address format " + vet.go_quote(cv.s) + " does not work with IPv6" + suffix)
+
+fn hostport(var g: tc.Prog, fs: Fs, var v: vet.V, p: pkg.Pkg, nodes: [Int]):
+  let pi = v.pi
+  var used = false
+  for n in nodes:
+    if k(g, pi, n) == ast.N_IDENT and vet.is_func_named(g, uses(g, pi, n), "fmt", "Sprintf"):
+      used = true
+      break
+  if not used: return
+  for which in 0..3:
+    for n in nodes:
+      if k(g, pi, n) != ast.N_CALL: continue
+      let o = vet.callee(g, pi, n)
+      if o < 0: continue
+      if which == 0 and not vet.is_func_named(g, o, "net", "Dial"): continue
+      if which == 1 and not vet.is_func_named(g, o, "net", "DialTimeout"): continue
+      if which == 2 and not vet.is_method_named(g, o, "net", "Dialer", "Dial"): continue
+      let args = its(g, pi, g.pk[pi].t.b[n])
+      if args.len < 2: continue
+      let a = args[1]
+      if k(g, pi, a) == ast.N_CALL:
+        if args.len == 2: hostport_check(&g, fs, &v, p, a, -1)
+      elif k(g, pi, a) == ast.N_IDENT:
+        let av = uses(g, pi, a)
+        if av < 0 or g.ok[av] != tc.O_VAR or g.opkg[av] != pi: continue
+        let d = g.odecl[av]
+        if d <= 0: continue
+        if k(g, pi, d) == ast.N_ASSIGN:
+          if cnt(g, pi, g.pk[pi].t.b[d]) == 1: hostport_check(&g, fs, &v, p, ast.item(g.pk[pi].t, g.pk[pi].t.b[d], 0), n)
+        elif k(g, pi, d) == ast.N_VALUESPEC:
+          if cnt(g, pi, g.pk[pi].t.c[d]) == 1: hostport_check(&g, fs, &v, p, ast.item(g.pk[pi].t, g.pk[pi].t.c[d], 0), n)
+
+# ---- slog
+
+fn slog_skip(g: tc.Prog, o: Int) -> Int:
+  if vet.obj_pkg_path(g, o) != "log/slog": return -1
+  var recv = ""
+  if vet.is_method(g, o):
+    recv = vet.recv_type_name(g, o)
+    if recv == "": return -1
+  let n = g.oname[o]
+  if recv == "" or recv == "Logger":
+    if n == "Debug" or n == "Info" or n == "Warn" or n == "Error": return 1
+    if n == "DebugContext" or n == "InfoContext" or n == "WarnContext" or n == "ErrorContext": return 2
+    if n == "Log": return 3
+    if recv == "" and n == "Group": return 1
+    if recv == "Logger" and n == "With": return 0
+    return -1
+  if recv == "Record" and n == "Add": return 0
+  return -1
+
+fn is_attr(g: tc.Prog, t: Int) -> Bool:
+  return vet.is_named_type(g, t, "log/slog", "Attr")
+
+# types.AssignableTo(string, t) for an interface t
+fn string_assignable(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  let u = tc.under(&g, fs, t)
+  # (string is a named type: not assignable to a type parameter)
+  if u > 0 and g.tk[u] == tc.TY_TPARAM: return false
+  return iface_methods(&g, fs, u).len == 0
+
+# types.AssignableTo(slog.Attr, t) for an interface t
+fn attr_assignable(var g: tc.Prog, fs: Fs, at: Int, t: Int) -> Bool:
+  let u = tc.under(&g, fs, t)
+  if u <= 0 or g.tk[u] != tc.TY_IFACE: return false
+  for m in iface_methods(&g, fs, u):
+    let mn = g.oname[m] + ""
+    if not tc.has_method(&g, fs, at, mn): return false
+    let r = tc.lookup_fm(&g, fs, at, mn)
+    if r.len < 2: return false
+    let mt = tc.obj_type(&g, fs, m)
+    if not identical(&g, fs, r[1], mt, 0): return false
+  return true
+
+fn slog(var g: tc.Prog, fs: Fs, var v: vet.V, nodes: [Int]):
+  let pi = v.pi
+  var attr_t = 0
+  for call in nodes:
+    if k(g, pi, call) != ast.N_CALL: continue
+    let o = static_callee(g, pi, call)
+    if o < 0: continue
+    if g.pk[pi].t.f[call] == 1: continue
+    var skip = slog_skip(g, o)
+    if skip < 0: continue
+    if attr_t == 0:
+      let ap = g.opkg[o]
+      let ao = tc.scope_get(&g, fs, ap, "Attr")
+      if ao >= 0: attr_t = tc.obj_type(&g, fs, ao)
+    let fun = g.pk[pi].t.a[call]
+    if k(g, pi, fun) == ast.N_SELECTOR and g.pk[pi].skind.get(fun, 0) == tc.S_MEXPR: skip += 1
+    let args = its(g, pi, g.pk[pi].t.b[call])
+    if args.len <= skip: continue
+    var short = "slog."
+    if vet.is_method(g, o): short += vet.recv_type_name(g, o) + "."
+    short += g.oname[o]
+    var pos = 0
+    var unknown = -1
+    var done = false
+    for ai in skip..args.len:
+      let arg = args[ai]
+      var t = vet.ty(g, pi, arg)
+      if tc.is_untyped(t) and t != tc.B_UNIL: t = tc.default_type(t)
+      if pos == 0:
+        if t == tc.B_STRING: pos = 1
+        elif is_attr(g, t): pos = 0
+        else:
+          if t > 0 and is_iface(&g, fs, t):
+            if string_assignable(&g, fs, t):
+              pos = 2
+              continue
+            if attr_t > 0 and attr_assignable(&g, fs, attr_t, t):
+              pos = 0
+              continue
+          if unknown < 0: vet.report(g, &v, arg, "slog", short + " arg " + vet.go_quote(format.expr(g.pk[pi].t, arg)) + " should be a string or a slog.Attr (possible missing key or value)")
+          else: vet.report(g, &v, arg, "slog", short + " arg " + vet.go_quote(format.expr(g.pk[pi].t, arg)) + " should probably be a string or a slog.Attr (previous arg " + vet.go_quote(format.expr(g.pk[pi].t, unknown)) + " cannot be a key)")
+          done = true
+          break
+      elif pos == 1: pos = 0
+      else:
+        unknown = arg
+        if t != tc.B_STRING and not is_attr(g, t) and not (t > 0 and is_iface(&g, fs, t)): pos = 0
+    if done: continue
+    if pos == 1:
+      if unknown < 0: vet.report(g, &v, call, "slog", "call to " + short + " missing a final value")
+      else: vet.report(g, &v, call, "slog", "call to " + short + " has a missing or misplaced value")
+
+
+
+
+
+
+# ---- lostcancel, on go/cfg's graph of a function body
+
+# go/cfg's builder: blocks with their nodes (statements, expressions, value specs; -2 is the
+# return statement added at the end of a body that falls off it) and successors.
+type CB:
+  pi: Int
+  bn: [[Int]]
+  bs: [[Int]]
+  br: [Bool]
+  live: [Bool]
+  cur: Int
+  lgoto: {Str: Int}
+  lbreak: {Str: Int}
+  lcont: {Str: Int}
+  tbrk: [Int]
+  tcnt: [Int]
+  tfall: [Int]
+  endpos: Int    # the position of the added return (the body's closing brace)
+
+fn new_cb(pi: Int) -> CB:
+  return CB(pi, [], [], [], [], -1, {}, {}, {}, [], [], [], -1)
+
+fn nblock(var b: CB) -> Int:
+  b.bn.push([])
+  b.bs.push([])
+  b.br.push(false)
+  return b.bn.len - 1
+
+fn badd(var b: CB, n: Int):
+  if b.cur >= 0: b.bn[b.cur].push(n)
+
+fn bjump(var b: CB, to: Int):
+  if b.cur >= 0: b.bs[b.cur].push(to)
+  b.cur = -1
+
+fn bifelse(var b: CB, t: Int, f: Int):
+  if b.cur >= 0:
+    b.bs[b.cur].push(t)
+    b.bs[b.cur].push(f)
+  b.cur = -1
+
+fn label_goto(var b: CB, l: Str) -> Int:
+  if l in b.lgoto: return b.lgoto[l]
+  let x = nblock(&b)
+  b.lgoto[l] = x
+  b.lbreak[l] = -1
+  b.lcont[l] = -1
+  return x
+
+fn push_t(var b: CB, brk: Int, cnt0: Int, fall: Int):
+  b.tbrk.push(brk)
+  b.tcnt.push(cnt0)
+  b.tfall.push(fall)
+
+fn pop_t(var b: CB):
+  b.tbrk.pop()
+  b.tcnt.pop()
+  b.tfall.pop()
+
+# The cfg of a function body (cfg.New, with ctrlflow's mayReturn).
+fn build_cfg(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, pi: Int, body: Int) -> CB:
+  var b = new_cb(pi)
+  b.cur = nblock(&b)
+  cstmt(&g, fs, &nr, &b, body)
+  var q = [0]
+  b.live = [false] * b.bn.len
+  while q.len > 0:
+    let x = q.pop()
+    if not b.live[x]:
+      b.live[x] = true
+      for y in b.bs[x]: q.push(y)
+  if b.cur >= 0 and b.live[b.cur]:
+    b.br[b.cur] = true
+    b.bn[b.cur].push(-2)
+    b.endpos = g.pk[pi].t.end[body] - 1
+  return b
+
+fn cfg_noreturn(b: CB) -> Bool:
+  for i in 0..b.bn.len:
+    if b.live[i] and b.br[i]: return false
+  return true
+
+# ctrlflow's knownIntrinsic: 1 never returns, 0 returns, -1 unknown.
+fn known_intrinsic(var g: tc.Prog, o: Int) -> Int:
+  let path = vet.obj_pkg_path(g, o)
+  let n = g.oname[o] + ""
+  if vet.is_method(g, o):
+    let r = vet.recv_type_name(g, o)
+    if path == "go.uber.org/zap":
+      if r == "Logger" and (n == "Fatal" or n == "Panic"): return 1
+      if r == "SugaredLogger" and n in ["Fatal", "Fatalw", "Fatalf", "Panic", "Panicw", "Panicf"]: return 1
+    if path == "github.com/sirupsen/logrus":
+      if r == "Logger" and n in ["Exit", "Panic", "Panicf", "Panicln"]: return 1
+      if r == "Entry" and n in ["Panicf", "Panicln"]: return 1
+    return -1
+  if path == "syscall" and n in ["Exit", "ExitProcess", "ExitThread"]: return 1
+  if path == "runtime" and n in ["Goexit", "fatalthrow", "fatalpanic", "exit"]: return 1
+  if (path == "k8s.io/klog" or path == "k8s.io/klog/v2") and n in ["Exit", "ExitDepth", "Exitf", "Exitln", "Fatal", "FatalDepth", "Fatalf", "Fatalln"]: return 1
+  if (path == "internal/abi" and n == "EscapeNonString") or (path == "hash/maphash" and n == "Comparable"): return 0
+  return -1
+
+# ctrlflow's callMayReturn (nr[-1] is the linted package).
+fn may_return(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, pi: Int, call: Int) -> Bool:
+  if k(g, pi, g.pk[pi].t.a[call]) == ast.N_IDENT:
+    let po = uses(g, pi, g.pk[pi].t.a[call])
+    if po >= 0 and g.ok[po] == tc.O_BUILTIN and g.oname[po] == "panic": return false
+  var o = static_callee(g, pi, call)
+  if o < 0: return true
+  return not obj_noreturn(&g, fs, &nr, g.oorig[o])
+
+# Whether a function never returns (ctrlflow's noReturn fact): computed from its body for the
+# linted package; for the standard library, staticcheck's table of its functions that never
+# return; for other imported packages only ctrlflow's known ones (vgolint doesn't read their
+# function bodies).
+fn obj_noreturn(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, o: Int) -> Bool:
+  let opk = g.opkg[o]
+  if opk < 0: return false
+  if o in nr: return nr[o] == 1
+  let ki = known_intrinsic(&g, o)
+  if opk != nr.get(-1, opk):
+    if ki >= 0: return ki == 1
+    if not g.pk[opk].std: return false
+    if g.ssa_noret.len == 0: g.ssa_noret = ssadata.std_noreturn()
+    let full = errcheck.full_name(&g, fs, o)
+    return full in g.ssa_noret
+  let d = g.odecl[o]
+  if d < 0 or g.pk[opk].t.k[d] != ast.N_FUNCDECL: return false
+  nr[o] = -1
+  var r = ki
+  if r < 0:
+    r = 0
+    let body = g.pk[opk].t.d[d]
+    if body > 0:
+      let cb = build_cfg(&g, fs, &nr, opk, body)
+      if cfg_noreturn(cb): r = 1
+  nr[o] = r
+  return r == 1
+
+fn cstmts(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, var b: CB, l: Int):
+  for s in its(g, b.pi, l): cstmt(&g, fs, &nr, &b, s)
+
+fn cstmt(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, var b: CB, s0: Int):
+  let pi = b.pi
+  var s = s0
+  var label = ""
+  while true:
+    let ks = k(g, pi, s)
+    if ks == ast.N_LABELED:
+      label = nm(g, pi, g.pk[pi].t.a[s])
+      let lg = label_goto(&b, label)
+      bjump(&b, lg)
+      b.cur = lg
+      s = g.pk[pi].t.b[s]
+      continue
+    if ks == ast.N_SEND or ks == ast.N_INCDEC or ks == ast.N_GO or ks == ast.N_EMPTY or ks == ast.N_ASSIGN or ks == ast.N_BAD:
+      badd(&b, s)
+    elif ks == ast.N_DEFER:
+      badd(&b, s)
+      if b.cur >= 0: b.br[b.cur] = true
+    elif ks == ast.N_EXPRSTMT:
+      badd(&b, s)
+      let x = g.pk[pi].t.a[s]
+      if k(g, pi, x) == ast.N_CALL and not may_return(&g, fs, &nr, pi, x): b.cur = nblock(&b)
+    elif ks == ast.N_DECLSTMT:
+      let d = g.pk[pi].t.a[s]
+      if k(g, pi, d) == ast.N_GENDECL and g.pk[pi].t.f[d] == K_VAR:
+        for sp in its(g, pi, g.pk[pi].t.a[d]):
+          if k(g, pi, sp) == ast.N_VALUESPEC: badd(&b, sp)
+    elif ks == ast.N_RETURN:
+      if b.cur >= 0: b.br[b.cur] = true
+      badd(&b, s)
+      b.cur = nblock(&b)
+    elif ks == ast.N_BRANCH: cbranch(g, &b, s)
+    elif ks == ast.N_BLOCK: cstmts(&g, fs, &nr, &b, g.pk[pi].t.a[s])
+    elif ks == ast.N_IF:
+      if g.pk[pi].t.a[s] > 0: cstmt(&g, fs, &nr, &b, g.pk[pi].t.a[s])
+      let th = nblock(&b)
+      let done = nblock(&b)
+      var el = done
+      let es = g.pk[pi].t.d[s]
+      if es > 0: el = nblock(&b)
+      badd(&b, g.pk[pi].t.b[s])
+      bifelse(&b, th, el)
+      b.cur = th
+      cstmt(&g, fs, &nr, &b, g.pk[pi].t.c[s])
+      bjump(&b, done)
+      if es > 0:
+        b.cur = el
+        cstmt(&g, fs, &nr, &b, es)
+        bjump(&b, done)
+      b.cur = done
+    elif ks == ast.N_SWITCH: cswitch(&g, fs, &nr, &b, s, label)
+    elif ks == ast.N_TYPESWITCH: ctypeswitch(&g, fs, &nr, &b, s, label)
+    elif ks == ast.N_SELECT: cselect(&g, fs, &nr, &b, s, label)
+    elif ks == ast.N_FOR: cfor(&g, fs, &nr, &b, s, label)
+    elif ks == ast.N_RANGE: crange(&g, fs, &nr, &b, s, label)
+    break
+
+fn cbranch(g: tc.Prog, var b: CB, s: Int):
+  let pi = b.pi
+  let tok = g.pk[pi].t.f[s]
+  let lid = g.pk[pi].t.a[s]
+  var l = ""
+  if lid > 0: l = nm(g, pi, lid)
+  var block = -1
+  if tok == K_BREAK:
+    if l != "":
+      label_goto(&b, l)
+      block = b.lbreak[l]
+    else:
+      var i = b.tbrk.len - 1
+      while i >= 0 and block < 0:
+        block = b.tbrk[i]
+        i -= 1
+  elif tok == K_CONTINUE:
+    if l != "":
+      label_goto(&b, l)
+      block = b.lcont[l]
+    else:
+      var i = b.tcnt.len - 1
+      while i >= 0 and block < 0:
+        block = b.tcnt[i]
+        i -= 1
+  elif tok == K_FALLTHROUGH:
+    var i = b.tfall.len - 1
+    while i >= 0 and block < 0:
+      block = b.tfall[i]
+      i -= 1
+  elif tok == K_GOTO:
+    if l != "": block = label_goto(&b, l)
+  if block < 0: block = nblock(&b)
+  bjump(&b, block)
+  b.cur = nblock(&b)
+
+fn cswitch(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, var b: CB, s: Int, label: Str):
+  let pi = b.pi
+  if g.pk[pi].t.a[s] > 0: cstmt(&g, fs, &nr, &b, g.pk[pi].t.a[s])
+  if g.pk[pi].t.b[s] > 0: badd(&b, g.pk[pi].t.b[s])
+  let done = nblock(&b)
+  if label != "": b.lbreak[label] = done
+  var dbody = -1
+  var dfall = -1
+  var dblock = -1
+  var fallthru = -1
+  let cl = its(g, pi, g.pk[pi].t.c[s])
+  for i in 0..cl.len:
+    let cc = cl[i]
+    var body = fallthru
+    if body < 0: body = nblock(&b)
+    fallthru = done
+    if i + 1 < cl.len: fallthru = nblock(&b)
+    if g.pk[pi].t.a[cc] < 0:
+      dbody = g.pk[pi].t.b[cc]
+      dfall = fallthru
+      dblock = body
+      continue
+    var next = -1
+    for cond in its(g, pi, g.pk[pi].t.a[cc]):
+      next = nblock(&b)
+      badd(&b, cond)
+      bifelse(&b, body, next)
+      b.cur = next
+    b.cur = body
+    push_t(&b, done, -1, fallthru)
+    cstmts(&g, fs, &nr, &b, g.pk[pi].t.b[cc])
+    pop_t(&b)
+    bjump(&b, done)
+    b.cur = next
+  if dblock >= 0:
+    bjump(&b, dblock)
+    b.cur = dblock
+    push_t(&b, done, -1, dfall)
+    cstmts(&g, fs, &nr, &b, dbody)
+    pop_t(&b)
+  bjump(&b, done)
+  b.cur = done
+
+fn ctypeswitch(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, var b: CB, s: Int, label: Str):
+  let pi = b.pi
+  if g.pk[pi].t.a[s] > 0: cstmt(&g, fs, &nr, &b, g.pk[pi].t.a[s])
+  if g.pk[pi].t.b[s] > 0: badd(&b, g.pk[pi].t.b[s])
+  let done = nblock(&b)
+  if label != "": b.lbreak[label] = done
+  var dflt = -1
+  for cc in its(g, pi, g.pk[pi].t.c[s]):
+    if g.pk[pi].t.a[cc] < 0:
+      dflt = cc
+      continue
+    let body = nblock(&b)
+    var next = -1
+    for _ in its(g, pi, g.pk[pi].t.a[cc]):
+      next = nblock(&b)
+      bifelse(&b, body, next)
+      b.cur = next
+    b.cur = body
+    push_t(&b, done, -1, -1)
+    cstmts(&g, fs, &nr, &b, g.pk[pi].t.b[cc])
+    pop_t(&b)
+    bjump(&b, done)
+    b.cur = next
+  if dflt >= 0:
+    push_t(&b, done, -1, -1)
+    cstmts(&g, fs, &nr, &b, g.pk[pi].t.b[dflt])
+    pop_t(&b)
+    bjump(&b, done)
+  else: bjump(&b, done)
+  b.cur = done
+
+fn cselect(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, var b: CB, s: Int, label: Str):
+  let pi = b.pi
+  let cl = its(g, pi, g.pk[pi].t.a[s])
+  for cc in cl:
+    if g.pk[pi].t.a[cc] > 0: cstmt(&g, fs, &nr, &b, g.pk[pi].t.a[cc])
+  let done = nblock(&b)
+  if label != "": b.lbreak[label] = done
+  var dbody = -1
+  var has_d = false
+  for cc in cl:
+    let comm = g.pk[pi].t.a[cc]
+    if comm <= 0:
+      dbody = g.pk[pi].t.b[cc]
+      has_d = true
+      continue
+    let body = nblock(&b)
+    let next = nblock(&b)
+    bifelse(&b, body, next)
+    b.cur = body
+    push_t(&b, done, -1, -1)
+    if k(g, pi, comm) == ast.N_ASSIGN and cnt(g, pi, g.pk[pi].t.a[comm]) > 0: badd(&b, ast.item(g.pk[pi].t, g.pk[pi].t.a[comm], 0))
+    cstmts(&g, fs, &nr, &b, g.pk[pi].t.b[cc])
+    pop_t(&b)
+    bjump(&b, done)
+    b.cur = next
+  if has_d:
+    push_t(&b, done, -1, -1)
+    cstmts(&g, fs, &nr, &b, dbody)
+    pop_t(&b)
+    bjump(&b, done)
+  b.cur = done
+
+fn cfor(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, var b: CB, s: Int, label: Str):
+  let pi = b.pi
+  if g.pk[pi].t.a[s] > 0: cstmt(&g, fs, &nr, &b, g.pk[pi].t.a[s])
+  let body = nblock(&b)
+  let done = nblock(&b)
+  var loop = body
+  if g.pk[pi].t.b[s] > 0: loop = nblock(&b)
+  var cont = loop
+  if g.pk[pi].t.c[s] > 0: cont = nblock(&b)
+  if label != "":
+    b.lbreak[label] = done
+    b.lcont[label] = cont
+  bjump(&b, loop)
+  b.cur = loop
+  if loop != body:
+    badd(&b, g.pk[pi].t.b[s])
+    bifelse(&b, body, done)
+    b.cur = body
+  push_t(&b, done, cont, -1)
+  cstmt(&g, fs, &nr, &b, g.pk[pi].t.d[s])
+  pop_t(&b)
+  bjump(&b, cont)
+  if g.pk[pi].t.c[s] > 0:
+    b.cur = cont
+    cstmt(&g, fs, &nr, &b, g.pk[pi].t.c[s])
+    bjump(&b, loop)
+  b.cur = done
+
+fn crange(var g: tc.Prog, fs: Fs, var nr: {Int: Int}, var b: CB, s: Int, label: Str):
+  let pi = b.pi
+  badd(&b, g.pk[pi].t.c[s])
+  if g.pk[pi].t.a[s] > 0: badd(&b, g.pk[pi].t.a[s])
+  if g.pk[pi].t.b[s] > 0: badd(&b, g.pk[pi].t.b[s])
+  let loop = nblock(&b)
+  bjump(&b, loop)
+  b.cur = loop
+  let body = nblock(&b)
+  let done = nblock(&b)
+  bifelse(&b, body, done)
+  b.cur = body
+  if label != "":
+    b.lbreak[label] = done
+    b.lcont[label] = loop
+  push_t(&b, done, loop, -1)
+  cstmt(&g, fs, &nr, &b, g.pk[pi].t.d[s])
+  pop_t(&b)
+  bjump(&b, loop)
+  b.cur = done
+
+fn is_with_cancel(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  if k(g, pi, n) != ast.N_SELECTOR: return false
+  let sn = nm(g, pi, g.pk[pi].t.b[n])
+  if not (sn in ["WithCancel", "WithCancelCause", "WithTimeout", "WithTimeoutCause", "WithDeadline", "WithDeadlineCause"]): return false
+  let x = g.pk[pi].t.a[n]
+  if k(g, pi, x) != ast.N_IDENT: return false
+  let o = uses(g, pi, x)
+  if o >= 0 and g.ok[o] == tc.O_PKGNAME: return g.pk[g.oaux[o]].path == "context"
+  return nm(g, pi, x) == "context"
+
+type LC:
+  fnode: Int
+  vars: {Int: Int}     # cancel var -> the statement defining it
+  order: [Int]
+
+fn lc_walk(g: tc.Prog, var v: vet.V, var lc: LC, n: Int, var stack: [Int]):
+  let pi = v.pi
+  let t = g.pk[pi].t
+  if k(g, pi, n) == ast.N_FUNCLIT and stack.len > 0: return
+  if is_with_cancel(g, pi, n) and stack.len >= 2 and k(g, pi, stack[stack.len - 1]) == ast.N_CALL:
+    let st = stack[stack.len - 2]
+    var id = -1
+    if k(g, pi, st) == ast.N_VALUESPEC:
+      if cnt(g, pi, t.a[st]) > 1: id = ast.item(t, t.a[st], 1)
+    elif k(g, pi, st) == ast.N_ASSIGN:
+      if cnt(g, pi, t.a[st]) > 1:
+        let x = ast.item(t, t.a[st], 1)
+        if k(g, pi, x) == ast.N_IDENT: id = x
+    if id > 0:
+      let o = uses(g, pi, id)
+      if nm(g, pi, id) == "_":
+        vet.report(g, &v, id, "lostcancel", "the cancel function returned by context." + nm(g, pi, t.b[n]) + " should be called, not discarded, to avoid a context leak")
+      elif o >= 0 and g.ok[o] == tc.O_VAR:
+        var take = false
+        if g.onode[o] == id: take = true
+        else:
+          let dn = g.onode[o]
+          if g.opkg[o] == pi and dn > 0 and t.file[dn] == t.file[lc.fnode] and t.pos[dn] >= t.pos[lc.fnode] and t.pos[dn] < t.end[lc.fnode]: take = true
+        if take:
+          if not (o in lc.vars): lc.order.push(o)
+          lc.vars[o] = st
+  stack.push(n)
+  for c in resolve.kids(t, n): lc_walk(g, &v, &lc, c, &stack)
+  stack.pop()
+
+# Whether the nodes use variable o (or return it, a named result, with a bare return).
+fn lc_uses(g: tc.Prog, pi: Int, o: Int, named: Bool, ns: [Int]) -> Bool:
+  for n in ns:
+    if n == -2:
+      if named: return true
+      continue
+    if lc_uses1(g, pi, o, named, n): return true
+  return false
+
+fn lc_uses1(g: tc.Prog, pi: Int, o: Int, named: Bool, n: Int) -> Bool:
+  if n <= 0: return false
+  let kn = g.pk[pi].t.k[n]
+  if kn == ast.N_IDENT: return uses(g, pi, n) == o and g.onode[o] != n
+  if kn == ast.N_RETURN and named and cnt(g, pi, g.pk[pi].t.a[n]) == 0: return true
+  for c in resolve.kids(g.pk[pi].t, n):
+    if lc_uses1(g, pi, o, named, c): return true
+  return false
+
+fn block_ret(b: CB, bi: Int) -> Int:
+  let ns = b.bn[bi]
+  if ns.len == 0: return -1
+  let last = ns[ns.len - 1]
+  return last
+
+fn is_ret(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  return n == -2 or (n > 0 and g.pk[pi].t.k[n] == ast.N_RETURN)
+
+fn lc_search(g: tc.Prog, pi: Int, b: CB, o: Int, named: Bool, blocks: [Int], var seen: [Bool]) -> Int:
+  for bi in blocks:
+    if seen[bi]: continue
+    seen[bi] = true
+    if lc_uses(g, pi, o, named, b.bn[bi]): continue
+    let last = block_ret(b, bi)
+    if is_ret(g, pi, last): return last
+    let r = lc_search(g, pi, b, o, named, b.bs[bi], &seen)
+    if r != -1: return r
+  return -1
+
+# lostCancelPath: the return statement reached without using o (-2 the added one), -1 none.
+fn lost_path(g: tc.Prog, pi: Int, b: CB, o: Int, st: Int, named: Bool) -> Int:
+  var defb = -1
+  var rest: [Int] = []
+  for bi in 0..b.bn.len:
+    let ns = b.bn[bi]
+    for i in 0..ns.len:
+      if ns[i] == st:
+        defb = bi
+        for j in i + 1..ns.len: rest.push(ns[j])
+        break
+    if defb >= 0: break
+  if defb < 0: return -1
+  if lc_uses(g, pi, o, named, rest): return -1
+  let last = block_ret(b, defb)
+  if is_ret(g, pi, last): return last
+  var seen = [false] * b.bn.len
+  return lc_search(g, pi, b, o, named, b.bs[defb], &seen)
+
+fn lostcancel(var g: tc.Prog, fs: Fs, var v: vet.V, p: pkg.Pkg, nodes: [Int]):
+  let pi = v.pi
+  if not vet.imports(g, pi, "context"): return
+  var nr: {Int: Int} = {}
+  nr[-1] = pi
+  for n in nodes:
+    let kn = k(g, pi, n)
+    if kn != ast.N_FUNCLIT and kn != ast.N_FUNCDECL: continue
+    var lc = LC(n, {}, [])
+    var stack: [Int] = []
+    lc_walk(g, &v, &lc, n, &stack)
+    if lc.order.len == 0: continue
+    var ft = -1
+    var body = -1
+    if kn == ast.N_FUNCDECL:
+      if g.pk[pi].t.a[n] < 0 and nm(g, pi, g.pk[pi].t.b[n]) == "main" and g.pk[pi].name == "main": continue
+      ft = g.pk[pi].t.c[n]
+      body = g.pk[pi].t.d[n]
+    else:
+      ft = g.pk[pi].t.a[n]
+      body = g.pk[pi].t.b[n]
+    if body <= 0: continue
+    if not (-2 in nr):
+      # (ctrlflow computes every function's fact first, in the order of the declarations)
+      nr[-2] = 1
+      var fos: [Int] = []
+      for r in g.pk[pi].roots:
+        for d in its(g, pi, g.pk[pi].t.c[r]):
+          if k(g, pi, d) != ast.N_FUNCDECL: continue
+          let fo = uses(g, pi, g.pk[pi].t.b[d])
+          if fo >= 0 and g.ok[fo] == tc.O_FUNC: fos.push(fo)
+      for fo in fos:
+        let _ = obj_noreturn(&g, fs, &nr, fo)
+    let results = its(g, pi, g.pk[pi].t.c[ft])
+    let cb = build_cfg(&g, fs, &nr, pi, body)
+    for o in lc.order:
+      let st = lc.vars[o]
+      let named = g.odecl[o] in results
+      let ret = lost_path(g, pi, cb, o, st, named)
+      if ret == -1: continue
+      let fi = g.pk[pi].t.file[st]
+      let line = line_at(p, fi, g.pk[pi].t.pos[st])
+      vet.report(g, &v, st, "lostcancel", "the " + g.oname[o] + " function is not used on all paths (possible context leak)")
+      var rp = cb.endpos
+      if ret > 0: rp = g.pk[pi].t.pos[ret]
+      vet.report_at(g, &v, fi, rp, "lostcancel", "this return statement may be reached without using the " + g.oname[o] + " var defined on line {line}")
+
+# ---- go/build/constraint: expressions, //go:build and // +build lines
+
+type CE:
+  k: [Int]      # 1 tag, 2 not, 3 and, 4 or
+  x: [Int]
+  y: [Int]
+  tag: [Str]
+
+fn new_ce() -> CE:
+  return CE([], [], [], [])
+
+fn ce_node(var e: CE, kind: Int, x: Int, y: Int, tag: Str) -> Int:
+  e.k.push(kind)
+  e.x.push(x)
+  e.y.push(y)
+  e.tag.push(tag)
+  return e.k.len - 1
+
+fn ce_str(e: CE, n: Int) -> Str:
+  let kn = e.k[n]
+  if kn == 1: return e.tag[n] + ""
+  if kn == 2:
+    let s = ce_str(e, e.x[n])
+    let kx = e.k[e.x[n]]
+    if kx == 3 or kx == 4: return "!(" + s + ")"
+    return "!" + s
+  if kn == 3: return ce_arg(e, e.x[n], 4) + " && " + ce_arg(e, e.y[n], 4)
+  return ce_arg(e, e.x[n], 3) + " || " + ce_arg(e, e.y[n], 3)
+
+fn ce_arg(e: CE, n: Int, paren: Int) -> Str:
+  let s = ce_str(e, n)
+  if e.k[n] == paren: return "(" + s + ")"
+  return s
+
+# constraint.GoVersion's minVersion
+fn ce_minver(e: CE, n: Int, sign: Int) -> Int:
+  let kn = e.k[n]
+  if kn == 3 or kn == 4:
+    let a = ce_minver(e, e.x[n], sign)
+    let b = ce_minver(e, e.y[n], sign)
+    if (kn == 3) == (sign > 0):
+      if a > b: return a
+      return b
+    if a < b: return a
+    return b
+  if kn == 2: return ce_minver(e, e.x[n], -sign)
+  if sign < 0: return -1
+  let t = e.tag[n]
+  if t == "go1": return 0
+  let i = t.find("go1.")
+  if i < 0: return -1
+  let rest = t[i + 4..t.len]
+  if rest.len == 0: return -1
+  var j = 0
+  if rest[0] == '+' or rest[0] == '-': j = 1
+  if j >= rest.len: return -1
+  for q in j..rest.len:
+    if rest[q] < '0' or rest[q] > '9': return -1
+  let v = int(rest) else -1
+  return v
+
+fn ce_goversion(e: CE, n: Int) -> Str:
+  let v = ce_minver(e, n, 1)
+  if v < 0: return ""
+  if v == 0: return "go1"
+  return "go1.{v}"
+
+fn tag_char(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.' or c >= 128
+
+fn valid_tag(w: Str) -> Bool:
+  if w.len == 0: return false
+  for i in 0..w.len:
+    if not tag_char(w[i]): return false
+  return true
+
+# splitGoBuild: the expression of a //go:build line, or ok false ("\0" is returned for no).
+fn split_go_build(line0: Str) -> Str:
+  var line = line0 + ""
+  if line.len > 0 and line[line.len - 1] == '\n': line = line[0..line.len - 1]
+  if "\n" in line: return "\0"
+  if not line.startswith("//go:build"): return "\0"
+  line = line.strip(" \t\r\n")
+  line = line[10..line.len]
+  let trim = line.strip(" \t\r\n")
+  if line.len == trim.len and line != "": return "\0"
+  return trim
+
+fn split_plus_build(line0: Str) -> Str:
+  var line = line0 + ""
+  if line.len > 0 and line[line.len - 1] == '\n': line = line[0..line.len - 1]
+  if "\n" in line: return "\0"
+  if not line.startswith("//"): return "\0"
+  line = line[2..line.len].strip(" \t\r\n")
+  if not line.startswith("+build"): return "\0"
+  line = line[6..line.len]
+  let trim = line.strip(" \t\r\n")
+  if line.len == trim.len and line != "": return "\0"
+  return trim
+
+type CP:
+  s: Str
+  i: Int
+  tok: Str
+  istag: Bool
+  pos: Int
+  size: Int
+  err: Str
+
+fn cp_lex(var p: CP):
+  p.istag = false
+  while p.i < p.s.len and (p.s[p.i] == ' ' or p.s[p.i] == '\t'): p.i += 1
+  if p.i >= p.s.len:
+    p.tok = ""
+    p.pos = p.i
+    return
+  let c = p.s[p.i]
+  if c == '(' or c == ')' or c == '!':
+    p.pos = p.i
+    p.i += 1
+    p.tok = p.s[p.pos..p.i]
+    return
+  if c == '&' or c == '|':
+    if p.i + 1 >= p.s.len or p.s[p.i + 1] != c:
+      if p.err == "": p.err = "invalid syntax at " + str([c])
+      p.tok = ""
+      return
+    p.pos = p.i
+    p.i += 2
+    p.tok = p.s[p.pos..p.i]
+    return
+  var j = p.i
+  while j < p.s.len and tag_char(p.s[j]): j += 1
+  if j == p.i:
+    if p.err == "":
+      var e = p.i + 1
+      if c >= 0xc0:
+        while e < p.s.len and p.s[e] >= 0x80 and p.s[e] < 0xc0: e += 1
+      p.err = "invalid syntax at " + p.s[p.i..e]
+    p.tok = ""
+    return
+  p.pos = p.i
+  p.i = j
+  p.tok = p.s[p.pos..p.i]
+  p.istag = true
+
+fn cp_or(var p: CP, var e: CE) -> Int:
+  var x = cp_and(&p, &e)
+  while p.err == "" and p.tok == "||":
+    let y = cp_and(&p, &e)
+    x = ce_node(&e, 4, x, y, "")
+  return x
+
+fn cp_and(var p: CP, var e: CE) -> Int:
+  var x = cp_not(&p, &e)
+  while p.err == "" and p.tok == "&&":
+    let y = cp_not(&p, &e)
+    x = ce_node(&e, 3, x, y, "")
+  return x
+
+fn cp_not(var p: CP, var e: CE) -> Int:
+  if p.err != "": return -1
+  p.size += 1
+  if p.size > 1000:
+    p.err = "build expression too large"
+    return -1
+  cp_lex(&p)
+  if p.err != "": return -1
+  if p.tok == "!":
+    cp_lex(&p)
+    if p.err != "": return -1
+    if p.tok == "!":
+      p.err = "double negation not allowed"
+      return -1
+    let a = cp_atom(&p, &e)
+    return ce_node(&e, 2, a, -1, "")
+  return cp_atom(&p, &e)
+
+fn cp_atom(var p: CP, var e: CE) -> Int:
+  if p.err != "": return -1
+  if p.tok == "(":
+    let x = cp_or(&p, &e)
+    if p.err == "unexpected end of expression": p.err = "missing close paren"
+    if p.err != "": return -1
+    if p.tok != ")":
+      p.err = "missing close paren"
+      return -1
+    cp_lex(&p)
+    return x
+  if not p.istag:
+    if p.tok == "": p.err = "unexpected end of expression"
+    else: p.err = "unexpected token " + p.tok
+    return -1
+  let tok = p.tok + ""
+  cp_lex(&p)
+  return ce_node(&e, 1, -1, -1, tok)
+
+# constraint.Parse: the root, or -1 with the error in err[0].
+fn ce_parse(var e: CE, line: Str, var err: Str) -> Int:
+  let gb = split_go_build(line)
+  if gb != "\0":
+    var p = CP(gb, 0, "", false, 0, 0, "")
+    let x = cp_or(&p, &e)
+    if p.err == "" and p.tok != "": p.err = "unexpected token " + p.tok
+    if p.err != "":
+      err = p.err + ""
+      return -1
+    return x
+  let pb = split_plus_build(line)
+  if pb != "\0": return parse_plus(&e, pb, &err)
+  err = "not a build constraint"
+  return -1
+
+fn parse_plus(var e: CE, text: Str, var err: Str) -> Int:
+  var size = 0
+  var x = -1
+  for clause in text.split():
+    var y = -1
+    for lit0 in clause.split(","):
+      var lit = lit0 + ""
+      var z = -1
+      if lit.startswith("!!") or lit == "!": z = ce_node(&e, 1, -1, -1, "ignore")
+      else:
+        var neg = false
+        if lit.startswith("!"):
+          neg = true
+          lit = lit[1..lit.len]
+        if valid_tag(lit): z = ce_node(&e, 1, -1, -1, lit)
+        else: z = ce_node(&e, 1, -1, -1, "ignore")
+        if neg: z = ce_node(&e, 2, z, -1, "")
+      if y < 0: y = z
+      else:
+        size += 1
+        if size > 100:
+          err = "expression too complex for // +build lines"
+          return -1
+        y = ce_node(&e, 3, y, z, "")
+    if x < 0: x = y
+    else:
+      size += 1
+      if size > 100:
+        err = "expression too complex for // +build lines"
+        return -1
+      x = ce_node(&e, 4, x, y, "")
+  if x < 0: x = ce_node(&e, 1, -1, -1, "ignore")
+  return x
+
+fn push_not(var e: CE, x: Int, neg: Bool) -> Int:
+  let kx = e.k[x]
+  if kx == 2:
+    if e.k[e.x[x]] == 1 and not neg: return x
+    return push_not(&e, e.x[x], not neg)
+  if kx == 1:
+    if neg: return ce_node(&e, 2, x, -1, "")
+    return x
+  let a = push_not(&e, e.x[x], neg)
+  let b = push_not(&e, e.y[x], neg)
+  if kx == 3:
+    if neg: return ce_node(&e, 4, a, b, "")
+    return ce_node(&e, 3, a, b, "")
+  if neg: return ce_node(&e, 3, a, b, "")
+  return ce_node(&e, 4, a, b, "")
+
+fn split_k(e: CE, x: Int, kind: Int, var out: [Int]):
+  if e.k[x] == kind:
+    split_k(e, e.x[x], kind, &out)
+    split_k(e, e.y[x], kind, &out)
+  else: out.push(x)
+
+# constraint.PlusBuildLines; err set when the expression is too complex.
+fn plus_build_lines(var e: CE, x0: Int, var err: Str) -> [Str]:
+  let x = push_not(&e, x0, false)
+  var split: [[[Int]]] = []
+  var ors: [Int] = []
+  split_k(e, x, 3, &ors)
+  for o in ors:
+    var ands: [[Int]] = []
+    var as: [Int] = []
+    split_k(e, o, 4, &as)
+    for a in as:
+      var lits: [Int] = []
+      var ls: [Int] = []
+      split_k(e, a, 3, &ls)
+      for l in ls:
+        if e.k[l] == 1 or e.k[l] == 2: lits.push(l)
+        else:
+          err = "expression too complex for // +build lines"
+          return []
+      ands.push(lits)
+    split.push(ands)
+  var maxor = 0
+  for o in split:
+    if o.len > maxor: maxor = o.len
+  var lines: [Str] = []
+  if maxor == 1:
+    var line = "// +build "
+    var first = true
+    for o in split:
+      for l in o[0]:
+        if not first: line += ","
+        first = false
+        line += ce_str(e, l)
+    lines.push(line)
+    return lines
+  for o in split:
+    var line = "// +build"
+    for a in o:
+      line += " "
+      for i in 0..a.len:
+        if i > 0: line += ","
+        line += ce_str(e, a[i])
+    lines.push(line)
+  return lines
+
+# ---- stdversion
+
+# The module's go directive as types.Config.GoVersion has it ("go1.21.3"), the toolchain's if none.
+fn module_go(fs: Fs, g: tc.Prog) -> Str:
+  let src = fs.read(g.mod_dir + "/go.mod") else ""
+  for line0 in src.split("\n"):
+    let line = line0.strip(" \t\r")
+    if line.startswith("go ") or line.startswith("go\t"):
+      var x = line[2..line.len].strip(" \t")
+      let c = x.find("//")
+      if c >= 0: x = x[0..c].strip(" \t")
+      if x.startswith("go"): x = x[2..x.len]
+      return "go" + x
+  return "go1.27.3"
+
+# The minor version of a "go1.N..." string, -1 if it isn't one.
+fn go_minor(v: Str) -> Int:
+  if not v.startswith("go1."): return -1
+  var j = 4
+  while j < v.len and v[j] >= '0' and v[j] <= '9': j += 1
+  if j == 4: return -1
+  return int(v[4..j]) else -1
+
+# The Go version of a file's //go:build line (the last one before the package clause), "" if none.
+fn file_build_version(p: pkg.Pkg, fi: Int, pkgpos: Int) -> Str:
+  let cm = p.comments[fi]
+  let src = p.srcs[fi]
+  var ver = ""
+  var i = 0
+  while i < cm.len:
+    if cm[i] >= pkgpos: break
+    let text = src[cm[i]..cm[i + 1]]
+    if text.startswith("//go:build"):
+      var e = new_ce()
+      var err = ""
+      let x = ce_parse(&e, text, &err)
+      if x >= 0: ver = ce_goversion(e, x)
+    i += 3
+  return ver
+
+fn std_symbols() -> {Str: [Str]}:
+  var m: {Str: [Str]} = {}
+  for ent in std_new_syms().split(";"):
+    let f = ent.split(" ")
+    if f.len != 3: continue
+    if f[0] in m: m[f[0]].push(f[1] + " " + f[2])
+    else: m[f[0] + ""] = [f[1] + " " + f[2]]
+  return m
+
+# typesinternal.TooNewStdSymbols: object -> "Name version" of package q's symbols newer than minor ver.
+fn too_new(var g: tc.Prog, fs: Fs, q: Int, ver: Int, syms: [Str]) -> {Int: Str}:
+  var out: {Int: Str} = {}
+  let path = g.pk[q].path + ""
+  if path == "testing/synctest" and ver >= 24: return out
+  if (path == "encoding/json/v2" or path == "encoding/json/jsontext") and ver >= 25: return out
+  var bad_types: {Str: Bool} = {}
+  for s in syms:
+    let sp = s.split(" ")
+    let name = sp[0] + ""
+    let sv = int(sp[1]) else 0
+    if ver >= sv: continue
+    if name.find(".") >= 0 or name.startswith("("): continue
+    let o = tc.scope_get(&g, fs, q, name)
+    bad_types[name] = true
+    if o >= 0: out[g.oorig[o]] = s + ""
+  var depth: {Int: Int} = {}
+  for s in syms:
+    let sp = s.split(" ")
+    let name = sp[0] + ""
+    let sv = int(sp[1]) else 0
+    if ver >= sv: continue
+    var tname = ""
+    var member = ""
+    var ptr = false
+    if name.startswith("("):
+      let close = name.find(")")
+      if close < 0: continue
+      tname = name[1..close]
+      if tname.startswith("*"):
+        ptr = true
+        tname = tname[1..tname.len]
+      member = name[close + 2..name.len]
+    else:
+      let dot = name.find(".")
+      if dot < 0: continue
+      tname = name[0..dot]
+      member = name[dot + 1..name.len]
+    if tname in bad_types: continue
+    let to = tc.scope_get(&g, fs, q, tname)
+    if to < 0: continue
+    var tt = tc.obj_type(&g, fs, to)
+    if ptr: tt = tc.ptr_to(&g, tt)
+    let r = tc.lookup_fm(&g, fs, tt, member)
+    if r.len < 3: continue
+    let o = g.oorig[r[0]]
+    let d = r.len - 3
+    if not (o in depth) or d < depth[o]:
+      depth[o] = d
+      out[o] = s + ""
+  return out
+
+fn stdversion(var g: tc.Prog, fs: Fs, var v: vet.V, p: pkg.Pkg, roots: [Int]):
+  let pi = v.pi
+  let pkgver = module_go(fs, g)
+  let pmin = go_minor(pkgver)
+  if pmin < 21: return
+  var syms: {Str: [Str]} = {}
+  var memo: {Str: {Int: Str}} = {}
+  for r in roots:
+    let fi = g.pk[pi].t.file[r]
+    if p.strict_gen[fi]: continue
+    var fver = pkgver + ""
+    let bv = file_build_version(p, fi, g.pk[pi].t.pos[r])
+    let bm = go_minor(bv)
+    if bm >= 0 or bv == "go1":
+      var m = bm
+      if m < 21: m = 21
+      fver = "go1.{m}"
+    let fmin = go_minor(fver)
+    let flang = "go1.{fmin}"
+    var where = "module"
+    if flang != pkgver: where = "file"
+    let fnodes = vet.preorder(g.pk[pi].t, [r])
+    for n in fnodes:
+      if g.pk[pi].t.k[n] != ast.N_IDENT: continue
+      let o0 = uses(g, pi, n)
+      if o0 < 0: continue
+      let o = g.oorig[o0]
+      let q = g.opkg[o]
+      if q < 0 or q == pi or not g.pk[q].std: continue
+      if syms.len == 0: syms = std_symbols()
+      let path = g.pk[q].path + ""
+      if not (path in syms): continue
+      let key = "{q}|{fmin}"
+      if not (key in memo):
+        let tn = too_new(&g, fs, q, fmin, syms[path])
+        memo[key] = tn
+      if not (o in memo[key]): continue
+      let sp = memo[key][o].split(" ")
+      vet.report(g, &v, n, "stdversion", g.pk[q].name + "." + sp[0] + " requires go1." + sp[1] + " or later (" + where + " is " + flang + ")")
+
+# ---- comment groups (go/parser's): each a list of comment indices into Pkg.comments[fi] / 3
+
+fn ctext(p: pkg.Pkg, fi: Int, ci: Int) -> Str:
+  let cm = p.comments[fi]
+  let src = p.srcs[fi]
+  var t = src[cm[ci * 3]..cm[ci * 3 + 1]]
+  if t.startswith("//") and "\r" in t: t = t.replace("\r", "")
+  return t
+
+fn cline(p: pkg.Pkg, fi: Int, pos: Int) -> Int:
+  return pkg.line_of(p.lines[fi], pos)
+
+# The line a comment ends on (consumeComment's endline).
+fn cend_line(p: pkg.Pkg, fi: Int, ci: Int) -> Int:
+  let cm = p.comments[fi]
+  let src = p.srcs[fi]
+  var l = cline(p, fi, cm[ci * 3])
+  if src[cm[ci * 3] + 1] == '*':
+    for i in cm[ci * 3]..cm[ci * 3 + 1]:
+      if src[i] == '\n': l += 1
+  return l
+
+fn comment_groups(p: pkg.Pkg, fi: Int) -> [[Int]]:
+  let cm = p.comments[fi]
+  let n = cm.len / 3
+  var out: [[Int]] = []
+  var i = 0
+  while i < n:
+    # a run of comments with no token between them
+    var j = i + 1
+    while j < n and cm[j * 3 + 2] == cm[i * 3 + 2]: j += 1
+    let tb = cm[i * 3 + 2]
+    var prevline = 0
+    if tb > 0: prevline = cline(p, fi, tb - 1)
+    var q = i
+    if cline(p, fi, cm[q * 3]) == prevline:
+      var grp: [Int] = []
+      var endline = cline(p, fi, cm[q * 3])
+      while q < j and cline(p, fi, cm[q * 3]) <= endline:
+        grp.push(q)
+        endline = cend_line(p, fi, q)
+        q += 1
+      out.push(grp)
+    while q < j:
+      var grp: [Int] = []
+      var endline = cline(p, fi, cm[q * 3])
+      while q < j and cline(p, fi, cm[q * 3]) <= endline + 1:
+        grp.push(q)
+        endline = cend_line(p, fi, q)
+        q += 1
+      out.push(grp)
+    i = j
+  return out
+
+# ---- buildtag (the package's Go files)
+
+type BT:
+  fi: Int
+  plus_ok: Bool
+  go_ok: Bool
+  cross: Bool
+  in_star: Bool
+  go_pos: Int
+  plus_pos: Int
+  e: CE
+  go_x: Int
+  plus_x: Int
+
+fn bt_report(g: tc.Prog, var v: vet.V, b: BT, pos: Int, msg: Str):
+  vet.report_at(g, &v, b.fi, pos, "buildtag", msg)
+
+fn bt_comment(g: tc.Prog, var v: vet.V, var b: BT, pos0: Int, text0: Str):
+  if text0.startswith("//"):
+    if "+build" in text0: bt_plus(g, &v, &b, pos0, text0)
+    if "//go:build" in text0: bt_go(g, &v, &b, pos0, text0)
+  if text0.startswith("/*"):
+    let i = text0.find("\n")
+    if i >= 0:
+      b.in_star = true
+      var pos = pos0 + i + 1
+      var text = text0[i + 1..text0.len]
+      while text.len > 0:
+        var j = text.find("\n")
+        if j < 0: j = text.len
+        else: j += 1
+        let line = text[0..j]
+        if line.startswith("//"): bt_comment(g, &v, &b, pos, line)
+        pos += j
+        text = text[j..text.len]
+      b.in_star = false
+
+fn trim_space(s: Str) -> Str:
+  return s.strip(" \t\r\n")
+
+fn bt_go(g: tc.Prog, var v: vet.V, var b: BT, pos: Int, line0: Str):
+  if split_go_build(line0) == "\0":
+    if not line0.startswith("//go:build") and split_go_build("//" + trim_space(line0[2..line0.len])) != "\0":
+      bt_report(g, &v, b, pos, "malformed //go:build line (space between // and go:build)")
+    return
+  if not b.go_ok or b.in_star:
+    bt_report(g, &v, b, pos, "misplaced //go:build comment")
+    b.cross = false
+    return
+  if b.go_pos < 0: b.go_pos = pos
+  else:
+    bt_report(g, &v, b, pos, "unexpected extra //go:build line")
+    b.cross = false
+  var line = line0 + ""
+  let ei = line.find(" // ERROR ")
+  if ei >= 0: line = line[0..ei]
+  var err = ""
+  let x = ce_parse(&b.e, line, &err)
+  if x < 0:
+    bt_report(g, &v, b, pos, err)
+    b.cross = false
+    return
+  bt_tags(g, &v, b, pos, x)
+  if b.go_x < 0: b.go_x = x
+
+fn is_letter_digit(c: Byte) -> Bool:
+  return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c >= 128
+
+fn bt_plus(g: tc.Prog, var v: vet.V, var b: BT, pos: Int, line0: Str):
+  var line = trim_space(line0)
+  if split_plus_build(line) == "\0":
+    if b.plus_ok and not line.startswith("// want"): bt_report(g, &v, b, pos, "possible malformed +build comment")
+    return
+  if not b.plus_ok:
+    bt_report(g, &v, b, pos, "misplaced +build comment")
+    b.cross = false
+  if b.plus_pos < 0: b.plus_pos = pos
+  let ei = line.find(" // ERROR ")
+  if ei >= 0: line = line[0..ei]
+  let fields = line[2..line.len].split()
+  for fx in 1..fields.len:
+    let arg = fields[fx] + ""
+    for elem0 in arg.split(","):
+      if elem0.startswith("!!"):
+        bt_report(g, &v, b, pos, "invalid double negative in build constraint: " + arg)
+        b.cross = false
+        continue
+      var elem = elem0 + ""
+      if elem.startswith("!"): elem = elem[1..elem.len]
+      for ci in 0..elem.len:
+        let c = elem[ci]
+        if not is_letter_digit(c) and c != '_' and c != '.':
+          bt_report(g, &v, b, pos, "invalid non-alphanumeric build constraint: " + arg)
+          b.cross = false
+          break
+  if b.cross:
+    var err = ""
+    let y = ce_parse(&b.e, line, &err)
+    if y < 0:
+      bt_report(g, &v, b, pos, err)
+      b.cross = false
+      return
+    bt_tags(g, &v, b, pos, y)
+    if b.plus_x < 0: b.plus_x = y
+    else: b.plus_x = ce_node(&b.e, 3, b.plus_x, y, "")
+
+fn ce_tags(e: CE, x: Int, var out: [Str]):
+  if e.k[x] == 1: out.push(e.tag[x] + "")
+  elif e.k[x] == 2: ce_tags(e, e.x[x], &out)
+  else:
+    ce_tags(e, e.x[x], &out)
+    ce_tags(e, e.y[x], &out)
+
+fn valid_go_version(tag: Str) -> Bool:
+  var e = new_ce()
+  let x = ce_node(&e, 1, -1, -1, tag)
+  return ce_goversion(e, x) != ""
+
+fn malformed_go_tag(tag: Str) -> Bool:
+  if not tag.startswith("go1"):
+    for pre in ["go.", "g1.", "go"]:
+      if tag.startswith(pre):
+        let suffix = tag[pre.len..tag.len]
+        if valid_go_version("go1." + suffix): return true
+    return false
+  return not valid_go_version(tag)
+
+fn bt_tags(g: tc.Prog, var v: vet.V, b: BT, pos: Int, x: Int):
+  var tags: [Str] = []
+  ce_tags(b.e, x, &tags)
+  for t in tags:
+    if malformed_go_tag(t): bt_report(g, &v, b, pos, "invalid go version " + vet.go_quote(t) + " in build constraint")
+
+fn bt_finish(g: tc.Prog, var v: vet.V, var b: BT):
+  if not b.cross or b.plus_pos < 0 or b.go_pos < 0: return
+  var err = ""
+  let lines = plus_build_lines(&b.e, b.go_x, &err)
+  if err != "":
+    bt_report(g, &v, b, b.go_pos, err)
+    return
+  var want = -1
+  for line in lines:
+    var e2 = ""
+    let y = ce_parse(&b.e, line, &e2)
+    if y < 0: return
+    if want < 0: want = y
+    else: want = ce_node(&b.e, 3, want, y, "")
+  if ce_str(b.e, want) != ce_str(b.e, b.plus_x): bt_report(g, &v, b, b.plus_pos, "+build lines do not match //go:build condition")
+
+fn buildtag(var g: tc.Prog, var v: vet.V, p: pkg.Pkg):
+  let pi = v.pi
+  for fi in 0..p.paths.len: buildtag_file(g, &v, p, fi, fi, g.pk[pi].t.pos[g.pk[pi].roots[fi]])
+
+# The files the build constraints leave out, as directive_ignored; the first that doesn't parse ends
+# the run (runBuildTag returns there)
+fn buildtag_ignored(g: tc.Prog, var v: vet.V, ip: pkg.Pkg, off: Int):
+  for fi in 0..ip.paths.len:
+    if ip.bad[fi]: return
+    buildtag_file(g, &v, ip, fi, off + fi, ip.t.pos[ip.roots[fi]])
+
+fn buildtag_file(g: tc.Prog, var v: vet.V, p: pkg.Pkg, fi: Int, rfi: Int, pkgpos: Int):
+  if true:
+    var b = BT(rfi, true, true, true, false, -1, -1, new_ce(), -1, -1)
+    let cm = p.comments[fi]
+    for grp in comment_groups(p, fi):
+      let gs = cm[grp[0] * 3]
+      let ge = cm[grp[grp.len - 1] * 3 + 1]
+      if ge + 1 >= pkgpos: b.plus_ok = false
+      if gs >= pkgpos: b.go_ok = false
+      for ci in grp:
+        let text = ctext(p, fi, ci)
+        if not text.startswith("//"): b.plus_ok = false
+        bt_comment(g, &v, &b, cm[ci * 3], text)
+    bt_finish(g, &v, &b)
+
+# ---- directive (the package's Go files)
+
+fn space_rune_quote(s: Str, i: Int) -> Str:
+  let c = s[i]
+  if c == '\r': return "'\\r'"
+  if c == 0x0b: return "'\\v'"
+  if c == 0x0c: return "'\\f'"
+  let cs = s[i..s.len].codes()
+  let r = cs[0]
+  let hx = "0123456789abcdef"
+  var h = ""
+  var x = r
+  for _ in 0..4:
+    h = hx[x % 16..x % 16 + 1] + h
+    x = x / 16
+  return "'\\u" + h + "'"
+
+# The byte index of the first unicode.IsSpace rune in s, -1 none.
+fn index_space(s: Str) -> Int:
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    if c == ' ' or c == '\t' or c == '\n' or c == 0x0b or c == 0x0c or c == '\r': return i
+    if c == 0xc2 and i + 1 < s.len and (s[i + 1] == 0x85 or s[i + 1] == 0xa0): return i
+    if c == 0xe1 and i + 2 < s.len and s[i + 1] == 0x9a and s[i + 2] == 0x80: return i
+    if c == 0xe2 and i + 2 < s.len:
+      let c1 = s[i + 1]
+      let c2 = s[i + 2]
+      if c1 == 0x80 and ((c2 >= 0x80 and c2 <= 0x8a) or c2 == 0xa8 or c2 == 0xa9 or c2 == 0xaf): return i
+      if c1 == 0x81 and c2 == 0x9f: return i
+    if c == 0xe3 and i + 2 < s.len and s[i + 1] == 0x80 and s[i + 2] == 0x80: return i
+    i += 1
+  return -1
+
+fn directive(var g: tc.Prog, var v: vet.V, p: pkg.Pkg):
+  let pi = v.pi
+  for fi in 0..p.paths.len:
+    let root = g.pk[pi].roots[fi]
+    directive_file(g, &v, p, fi, fi, g.pk[pi].t.pos[root], nm(g, pi, g.pk[pi].t.a[root]))
+
+# The files the build constraints leave out (pass.IgnoredFiles): each parsed on its own, ip; a file
+# that doesn't parse is skipped. Issues name file off + its index in ip.
+fn directive_ignored(g: tc.Prog, var v: vet.V, ip: pkg.Pkg, off: Int):
+  for fi in 0..ip.paths.len:
+    if ip.bad[fi]: continue
+    let root = ip.roots[fi]
+    directive_file(g, &v, ip, fi, off + fi, ip.t.pos[root], ip.t.names[ip.t.s[ip.t.a[root]]] + "")
+
+fn directive_file(g: tc.Prog, var v: vet.V, p: pkg.Pkg, fi: Int, rfi: Int, pkgpos: Int, pname: Str):
+  if true:
+    let test = p.paths[fi].endswith("_test.go")
+    var header = true
+    let cm = p.comments[fi]
+    for grp in comment_groups(p, fi):
+      if cm[grp[0] * 3] >= pkgpos: header = false
+      for ci in grp:
+        var line = ctext(p, fi, ci)
+        let pos = cm[ci * 3]
+        if not line.startswith("//go:"): continue
+        let ei = line.find(" // ERROR ")
+        if ei >= 0: line = line[0..ei]
+        var verb = line + ""
+        let si = index_space(verb)
+        if si >= 0:
+          verb = verb[0..si]
+          let c = line[si]
+          if c != ' ' and c != '\t' and c != '\n': vet.report_at(g, &v, rfi, pos, "directive", "invalid space " + space_rune_quote(line, si) + " in " + verb + " directive")
+        if verb == "//go:debug":
+          if pname != "main" and not test: vet.report_at(g, &v, rfi, pos, "directive", "//go:debug directive only valid in package main or test")
+          elif not header: vet.report_at(g, &v, rfi, pos, "directive", "//go:debug directive only valid before package declaration")
+
+# ---- cgocall
+
+fn file_imports(g: tc.Prog, pi: Int, fi: Int, path: Str) -> Bool:
+  let lit = "\"" + path + "\""
+  if fi >= g.pk[pi].imps.len: return false
+  for im in g.pk[pi].imps[fi]:
+    if nm(g, pi, g.pk[pi].t.b[im]) == lit: return true
+  return false
+
+fn ty_of(g: tc.Prog, pi: Int, n: Int) -> Int:
+  let t = vet.ty(g, pi, n)
+  if t > 0: return t
+  let u = vet.unparen(g, pi, n)
+  if u != n: return vet.ty(g, pi, u)
+  return 0
+
+fn is_unsafe_ptr(var g: tc.Prog, fs: Fs, pi: Int, e: Int) -> Bool:
+  let t = ty_of(g, pi, e)
+  return t > 0 and tc.under(&g, fs, t) == tc.B_UNSAFEPTR
+
+fn cgo_base_type(var g: tc.Prog, fs: Fs, pi: Int, arg: Int) -> Int:
+  let ka = k(g, pi, arg)
+  if ka == ast.N_CALL:
+    let args = its(g, pi, g.pk[pi].t.b[arg])
+    if args.len == 1 and is_unsafe_ptr(&g, fs, pi, g.pk[pi].t.a[arg]): return cgo_base_type(&g, fs, pi, args[0])
+  elif ka == ast.N_STAR:
+    let call = g.pk[pi].t.a[arg]
+    if k(g, pi, call) == ast.N_CALL and cnt(g, pi, g.pk[pi].t.b[call]) == 1:
+      let t = ty_of(g, pi, g.pk[pi].t.a[call])
+      if t > 0:
+        let pt = tc.under(&g, fs, t)
+        if pt > 0 and g.tk[pt] == tc.TY_PTR and tc.under(&g, fs, g.ta[pt]) == tc.B_UNSAFEPTR:
+          let c2 = ast.item(g.pk[pi].t, g.pk[pi].t.b[call], 0)
+          if k(g, pi, c2) == ast.N_CALL and cnt(g, pi, g.pk[pi].t.b[c2]) == 1 and is_unsafe_ptr(&g, fs, pi, g.pk[pi].t.a[c2]):
+            let u = ast.item(g.pk[pi].t, g.pk[pi].t.b[c2], 0)
+            if k(g, pi, u) == ast.N_UNARY and g.pk[pi].t.f[u] == T_AND: return cgo_base_type(&g, fs, pi, g.pk[pi].t.a[u])
+  return vet.ty(g, pi, arg)
+
+fn cgo_type_ok(var g: tc.Prog, fs: Fs, t: Int, var seen: {Int: Bool}) -> Bool:
+  if t <= 0 or t in seen: return true
+  seen[t] = true
+  let u = tc.under(&g, fs, t)
+  if u <= 0: return true
+  let ku = g.tk[u]
+  if ku == tc.TY_CHAN or ku == tc.TY_MAP or ku == tc.TY_FUNC or ku == tc.TY_SLICE: return false
+  if ku == tc.TY_PTR or ku == tc.TY_ARRAY: return cgo_type_ok(&g, fs, g.ta[u], &seen)
+  if ku == tc.TY_STRUCT:
+    for f in tc.tlist(g, u):
+      let ft = tc.obj_type(&g, fs, f)
+      if not cgo_type_ok(&g, fs, ft, &seen): return false
+  return true
+
+fn cgocall(var g: tc.Prog, fs: Fs, var v: vet.V, nodes: [Int]):
+  let pi = v.pi
+  var cfiles: {Int: Bool} = {}
+  for fi in 0..g.pk[pi].roots.len:
+    if file_imports(g, pi, fi, "C"): cfiles[fi] = true
+  if cfiles.len == 0: return
+  for call in nodes:
+    if k(g, pi, call) != ast.N_CALL: continue
+    if not (g.pk[pi].t.file[call] in cfiles): continue
+    let sel = vet.unparen(g, pi, g.pk[pi].t.a[call])
+    if k(g, pi, sel) != ast.N_SELECTOR: continue
+    let x = g.pk[pi].t.a[sel]
+    if k(g, pi, x) != ast.N_IDENT or nm(g, pi, x) != "C": continue
+    if nm(g, pi, g.pk[pi].t.b[sel]) == "CBytes": continue
+    for arg0 in its(g, pi, g.pk[pi].t.b[call]):
+      var seen: {Int: Bool} = {}
+      let bt = cgo_base_type(&g, fs, pi, arg0)
+      if not cgo_type_ok(&g, fs, bt, &seen):
+        vet.report(g, &v, arg0, "cgocall", "possibly passing Go type with embedded pointer to C")
+        break
+      var arg = arg0
+      if k(g, pi, arg) == ast.N_CALL and cnt(g, pi, g.pk[pi].t.b[arg]) == 1 and is_unsafe_ptr(&g, fs, pi, g.pk[pi].t.a[arg]): arg = ast.item(g.pk[pi].t, g.pk[pi].t.b[arg], 0)
+      if k(g, pi, arg) == ast.N_UNARY and g.pk[pi].t.f[arg] == T_AND:
+        var seen2: {Int: Bool} = {}
+        let bt2 = cgo_base_type(&g, fs, pi, g.pk[pi].t.a[arg])
+        if not cgo_type_ok(&g, fs, bt2, &seen2):
+          vet.report(g, &v, arg, "cgocall", "possibly passing Go type with embedded pointer to C")
+          break
+
+# Generated from x/tools v0.50.0 internal/stdlib manifest.go: "path symbol minor" of the symbols
+# added in go1.22 or later.
+fn std_new_syms() -> Str:
+  return "archive/tar (*Writer).AddFS 22;archive/tar (FileInfoNames).Gname 23;archive/tar (FileInfoNames).IsDir 23;archive/tar (FileInfoNames).ModTime 23;archive/tar (FileInfoNames).Mode 23;archive/tar (FileInfoNames).Name 23;archive/tar (FileInfoNames).Size 23;archive/tar (FileInfoNames).Sys 23;archive/tar (FileInfoNames).Uname 23;archive/tar FileInfoNames 23;archive/zip (*Writer).AddFS 22;bytes (*Buffer).Peek 26;bytes CutLast 27;bytes FieldsFuncSeq 24;bytes FieldsSeq 24;bytes Lines 24;bytes SplitAfterSeq 24;bytes SplitSeq 24;cmp Or 22;crypto (Decapsulator).Decapsulate 26;crypto (Decapsulator).Encapsulator 26;crypto (Encapsulator).Bytes 26;crypto (Encapsulator).Encapsulate 26;crypto (MessageSigner).Public 25;crypto (MessageSigner).Sign 25;crypto (MessageSigner).SignMessage 25;crypto Decapsulator 26;crypto Encapsulator 26;crypto MLDSAMu 27;crypto MessageSigner 25;crypto SignMessage 25;crypto/cipher NewGCMWithRandomNonce 24;crypto/ecdh (KeyExchanger).Curve 26;crypto/ecdh (KeyExchanger).ECDH 26;crypto/ecdh (KeyExchanger).PublicKey 26;crypto/ecdh KeyExchanger 26;crypto/ecdsa (*PrivateKey).Bytes 25;crypto/ecdsa (*PublicKey).Bytes 25;crypto/ecdsa ParseRawPrivateKey 25;crypto/ecdsa ParseUncompressedPublicKey 25;crypto/fips140 Enabled 24;crypto/fips140 Enforced 26;crypto/fips140 Version 26;crypto/fips140 WithoutEnforcement 26;crypto/hkdf Expand 24;crypto/hkdf Extract 24;crypto/hkdf Key 24;crypto/hpke (*Recipient).Export 26;crypto/hpke (*Recipient).Open 26;crypto/hpke (*Sender).Export 26;crypto/hpke (*Sender).Seal 26;crypto/hpke (AEAD).ID 26;crypto/hpke (KDF).ID 26;crypto/hpke (KEM).DeriveKeyPair 26;crypto/hpke (KEM).GenerateKey 26;crypto/hpke (KEM).ID 26;crypto/hpke (KEM).NewPrivateKey 26;crypto/hpke (KEM).NewPublicKey 26;crypto/hpke (PrivateKey).Bytes 26;crypto/hpke (PrivateKey).KEM 26;crypto/hpke (PrivateKey).PublicKey 26;crypto/hpke (PublicKey).Bytes 26;crypto/hpke (PublicKey).KEM 26;crypto/hpke AES128GCM 26;crypto/hpke AES256GCM 26;crypto/hpke ChaCha20Poly1305 26;crypto/hpke DHKEM 26;crypto/hpke ExportOnly 26;crypto/hpke HKDFSHA256 26;crypto/hpke HKDFSHA384 26;crypto/hpke HKDFSHA512 26;crypto/hpke MLKEM1024 26;crypto/hpke MLKEM1024P384 26;crypto/hpke MLKEM768 26;crypto/hpke MLKEM768P256 26;crypto/hpke MLKEM768X25519 26;crypto/hpke NewAEAD 26;crypto/hpke NewDHKEMPrivateKey 26;crypto/hpke NewDHKEMPublicKey 26;crypto/hpke NewHybridPrivateKey 26;crypto/hpke NewHybridPublicKey 26;crypto/hpke NewKDF 26;crypto/hpke NewKEM 26;crypto/hpke NewMLKEMPrivateKey 26;crypto/hpke NewMLKEMPublicKey 26;crypto/hpke NewRecipient 26;crypto/hpke NewSender 26;crypto/hpke Open 26;crypto/hpke Recipient 26;crypto/hpke SHAKE128 26;crypto/hpke SHAKE256 26;crypto/hpke Seal 26;crypto/hpke Sender 26;crypto/mldsa (*Options).HashFunc 27;crypto/mldsa (*PrivateKey).Bytes 27;crypto/mldsa (*PrivateKey).Equal 27;crypto/mldsa (*PrivateKey).Public 27;crypto/mldsa (*PrivateKey).PublicKey 27;crypto/mldsa (*PrivateKey).Sign 27;crypto/mldsa (*PrivateKey).SignDeterministic 27;crypto/mldsa (*PublicKey).Bytes 27;crypto/mldsa (*PublicKey).Equal 27;crypto/mldsa (*PublicKey).Parameters 27;crypto/mldsa (Parameters).PublicKeySize 27;crypto/mldsa (Parameters).SignatureSize 27;crypto/mldsa (Parameters).String 27;crypto/mldsa GenerateKey 27;crypto/mldsa MLDSA44 27;crypto/mldsa MLDSA44PublicKeySize 27;crypto/mldsa MLDSA44SignatureSize 27;crypto/mldsa MLDSA65 27;crypto/mldsa MLDSA65PublicKeySize 27;crypto/mldsa MLDSA65SignatureSize 27;crypto/mldsa MLDSA87 27;crypto/mldsa MLDSA87PublicKeySize 27;crypto/mldsa MLDSA87SignatureSize 27;crypto/mldsa NewPrivateKey 27;crypto/mldsa NewPublicKey 27;crypto/mldsa Options 27;crypto/mldsa Options.Context 27;crypto/mldsa Parameters 27;crypto/mldsa PrivateKey 27;crypto/mldsa PrivateKeySize 27;crypto/mldsa PublicKey 27;crypto/mldsa Verify 27;crypto/mlkem (*DecapsulationKey1024).Bytes 24;crypto/mlkem (*DecapsulationKey1024).Decapsulate 24;crypto/mlkem (*DecapsulationKey1024).EncapsulationKey 24;crypto/mlkem (*DecapsulationKey1024).Encapsulator 26;crypto/mlkem (*DecapsulationKey768).Bytes 24;crypto/mlkem (*DecapsulationKey768).Decapsulate 24;crypto/mlkem (*DecapsulationKey768).EncapsulationKey 24;crypto/mlkem (*DecapsulationKey768).Encapsulator 26;crypto/mlkem (*EncapsulationKey1024).Bytes 24;crypto/mlkem (*EncapsulationKey1024).Encapsulate 24;crypto/mlkem (*EncapsulationKey768).Bytes 24;crypto/mlkem (*EncapsulationKey768).Encapsulate 24;crypto/mlkem CiphertextSize1024 24;crypto/mlkem CiphertextSize768 24;crypto/mlkem DecapsulationKey1024 24;crypto/mlkem DecapsulationKey768 24;crypto/mlkem EncapsulationKey1024 24;crypto/mlkem EncapsulationKey768 24;crypto/mlkem EncapsulationKeySize1024 24;crypto/mlkem EncapsulationKeySize768 24;crypto/mlkem GenerateKey1024 24;crypto/mlkem GenerateKey768 24;crypto/mlkem NewDecapsulationKey1024 24;crypto/mlkem NewDecapsulationKey768 24;crypto/mlkem NewEncapsulationKey1024 24;crypto/mlkem NewEncapsulationKey768 24;crypto/mlkem SeedSize 24;crypto/mlkem SharedKeySize 24;crypto/mlkem/mlkemtest Encapsulate1024 26;crypto/mlkem/mlkemtest Encapsulate768 26;crypto/pbkdf2 Key 24;crypto/rand Text 24;crypto/rsa EncryptOAEPWithOptions 26;crypto/sha3 (*SHA3).AppendBinary 24;crypto/sha3 (*SHA3).BlockSize 24;crypto/sha3 (*SHA3).Clone 25;crypto/sha3 (*SHA3).MarshalBinary 24;crypto/sha3 (*SHA3).Reset 24;crypto/sha3 (*SHA3).Size 24;crypto/sha3 (*SHA3).Sum 24;crypto/sha3 (*SHA3).UnmarshalBinary 24;crypto/sha3 (*SHA3).Write 24;crypto/sha3 (*SHAKE).AppendBinary 24;crypto/sha3 (*SHAKE).BlockSize 24;crypto/sha3 (*SHAKE).MarshalBinary 24;crypto/sha3 (*SHAKE).Read 24;crypto/sha3 (*SHAKE).Reset 24;crypto/sha3 (*SHAKE).UnmarshalBinary 24;crypto/sha3 (*SHAKE).Write 24;crypto/sha3 New224 24;crypto/sha3 New256 24;crypto/sha3 New384 24;crypto/sha3 New512 24;crypto/sha3 NewCSHAKE128 24;crypto/sha3 NewCSHAKE256 24;crypto/sha3 NewSHAKE128 24;crypto/sha3 NewSHAKE256 24;crypto/sha3 SHA3 24;crypto/sha3 SHAKE 24;crypto/sha3 Sum224 24;crypto/sha3 Sum256 24;crypto/sha3 Sum384 24;crypto/sha3 Sum512 24;crypto/sha3 SumSHAKE128 24;crypto/sha3 SumSHAKE256 24;crypto/subtle WithDataIndependentTiming 24;crypto/tls (*ECHRejectionError).Error 23;crypto/tls (*QUICConn).StoreSession 23;crypto/tls ClientHelloInfo.Extensions 24;crypto/tls ClientHelloInfo.HelloRetryRequest 26;crypto/tls Config.EncryptedClientHelloConfigList 23;crypto/tls Config.EncryptedClientHelloKeys 24;crypto/tls Config.EncryptedClientHelloRejectionVerify 23;crypto/tls Config.GetEncryptedClientHelloKeys 25;crypto/tls ConnectionState.CurveID 25;crypto/tls ConnectionState.ECHAccepted 23;crypto/tls ConnectionState.HelloRetryRequest 26;crypto/tls ConnectionState.LocalCertificate 27;crypto/tls ECHRejectionError 23;crypto/tls ECHRejectionError.RetryConfigList 23;crypto/tls EncryptedClientHelloKey 24;crypto/tls EncryptedClientHelloKey.Config 24;crypto/tls EncryptedClientHelloKey.PrivateKey 24;crypto/tls EncryptedClientHelloKey.SendAsRetry 24;crypto/tls MLDSA44 27;crypto/tls MLDSA65 27;crypto/tls MLDSA87 27;crypto/tls MLKEM1024 27;crypto/tls QUICConfig.ClientHelloInfoConn 27;crypto/tls QUICConfig.EnableSessionEvents 23;crypto/tls QUICErrorEvent 26;crypto/tls QUICEvent.Err 26;crypto/tls QUICEvent.SessionState 23;crypto/tls QUICResumeSession 23;crypto/tls QUICSessionTicketOptions.Extra 23;crypto/tls QUICStoreSession 23;crypto/tls SecP256r1MLKEM768 26;crypto/tls SecP384r1MLKEM1024 26;crypto/tls X25519MLKEM768 24;crypto/x509 (*CertPool).AddCertWithConstraint 22;crypto/x509 (*OID).UnmarshalBinary 23;crypto/x509 (*OID).UnmarshalText 23;crypto/x509 (ExtKeyUsage).OID 26;crypto/x509 (ExtKeyUsage).String 26;crypto/x509 (KeyUsage).String 26;crypto/x509 (OID).AppendBinary 24;crypto/x509 (OID).AppendText 24;crypto/x509 (OID).Equal 22;crypto/x509 (OID).EqualASN1OID 22;crypto/x509 (OID).MarshalBinary 23;crypto/x509 (OID).MarshalText 23;crypto/x509 (OID).String 22;crypto/x509 Certificate.InhibitAnyPolicy 24;crypto/x509 Certificate.InhibitAnyPolicyZero 24;crypto/x509 Certificate.InhibitPolicyMapping 24;crypto/x509 Certificate.InhibitPolicyMappingZero 24;crypto/x509 Certificate.Policies 22;crypto/x509 Certificate.PolicyMappings 24;crypto/x509 Certificate.RawSignatureAlgorithm 27;crypto/x509 Certificate.RequireExplicitPolicy 24;crypto/x509 Certificate.RequireExplicitPolicyZero 24;crypto/x509 CertificateRequest.RawSignatureAlgorithm 27;crypto/x509 MLDSA 27;crypto/x509 MLDSA44 27;crypto/x509 MLDSA65 27;crypto/x509 MLDSA87 27;crypto/x509 NoValidChains 24;crypto/x509 OID 22;crypto/x509 OIDFromASN1OID 26;crypto/x509 OIDFromInts 22;crypto/x509 ParseOID 23;crypto/x509 PolicyMapping 24;crypto/x509 PolicyMapping.IssuerDomainPolicy 24;crypto/x509 PolicyMapping.SubjectDomainPolicy 24;crypto/x509 RevocationList.RawSignatureAlgorithm 27;crypto/x509 VerifyOptions.CertificatePolicies 24;database/sql (*Null).Scan 22;database/sql (Null).Value 22;database/sql ConvertAssign 27;database/sql Null 22;database/sql/driver (RowsColumnScanner).Close 27;database/sql/driver (RowsColumnScanner).Columns 27;database/sql/driver (RowsColumnScanner).Next 27;database/sql/driver (RowsColumnScanner).NextRow 27;database/sql/driver (RowsColumnScanner).ScanColumn 27;database/sql/driver RowsColumnScanner 27;database/sql/driver ScanContext 27;debug/elf (*File).DynamicVersionNeeds 24;debug/elf (*File).DynamicVersions 24;debug/elf (VersionIndex).Index 24;debug/elf (VersionIndex).IsHidden 24;debug/elf DynamicVersion 24;debug/elf DynamicVersion.Deps 24;debug/elf DynamicVersion.Flags 24;debug/elf DynamicVersion.Index 24;debug/elf DynamicVersion.Name 24;debug/elf DynamicVersionDep 24;debug/elf DynamicVersionDep.Dep 24;debug/elf DynamicVersionDep.Flags 24;debug/elf DynamicVersionDep.Index 24;debug/elf DynamicVersionFlag 24;debug/elf DynamicVersionNeed 24;debug/elf DynamicVersionNeed.Name 24;debug/elf DynamicVersionNeed.Needs 24;debug/elf PT_OPENBSD_NOBTCFI 23;debug/elf PT_RISCV_ATTRIBUTES 25;debug/elf R_LARCH_64_PCREL 22;debug/elf R_LARCH_ADD6 22;debug/elf R_LARCH_ADD_ULEB128 22;debug/elf R_LARCH_ALIGN 22;debug/elf R_LARCH_CALL36 26;debug/elf R_LARCH_CFA 22;debug/elf R_LARCH_DELETE 22;debug/elf R_LARCH_PCREL20_S2 22;debug/elf R_LARCH_SUB6 22;debug/elf R_LARCH_SUB_ULEB128 22;debug/elf R_LARCH_TLS_DESC32 26;debug/elf R_LARCH_TLS_DESC64 26;debug/elf R_LARCH_TLS_DESC64_HI12 26;debug/elf R_LARCH_TLS_DESC64_LO20 26;debug/elf R_LARCH_TLS_DESC64_PC_HI12 26;debug/elf R_LARCH_TLS_DESC64_PC_LO20 26;debug/elf R_LARCH_TLS_DESC_CALL 26;debug/elf R_LARCH_TLS_DESC_HI20 26;debug/elf R_LARCH_TLS_DESC_LD 26;debug/elf R_LARCH_TLS_DESC_LO12 26;debug/elf R_LARCH_TLS_DESC_PCREL20_S2 26;debug/elf R_LARCH_TLS_DESC_PC_HI20 26;debug/elf R_LARCH_TLS_DESC_PC_LO12 26;debug/elf R_LARCH_TLS_GD_PCREL20_S2 26;debug/elf R_LARCH_TLS_LD_PCREL20_S2 26;debug/elf R_LARCH_TLS_LE_ADD_R 26;debug/elf R_LARCH_TLS_LE_HI20_R 26;debug/elf R_LARCH_TLS_LE_LO12_R 26;debug/elf R_MIPS_PC32 22;debug/elf SHT_RISCV_ATTRIBUTES 25;debug/elf STT_GNU_IFUNC 23;debug/elf STT_RELC 23;debug/elf STT_SRELC 23;debug/elf Symbol.HasVersion 24;debug/elf Symbol.VersionIndex 24;debug/elf VER_FLG_BASE 24;debug/elf VER_FLG_INFO 24;debug/elf VER_FLG_WEAK 24;debug/elf VersionIndex 24;encoding (BinaryAppender).AppendBinary 24;encoding (TextAppender).AppendText 24;encoding BinaryAppender 24;encoding TextAppender 24;encoding/base32 (*Encoding).AppendDecode 22;encoding/base32 (*Encoding).AppendEncode 22;encoding/base64 (*Encoding).AppendDecode 22;encoding/base64 (*Encoding).AppendEncode 22;encoding/binary Append 23;encoding/binary Decode 23;encoding/binary Encode 23;encoding/hex AppendDecode 22;encoding/hex AppendEncode 22;encoding/json (*Number).UnmarshalJSONFrom 27;encoding/json (*UnmarshalTypeError).Unwrap 27;encoding/json (Number).MarshalJSONTo 27;encoding/json CallMethodsWithLegacySemantics 27;encoding/json DefaultOptionsV1 27;encoding/json FormatByteArrayAsArray 27;encoding/json FormatBytesWithLegacySemantics 27;encoding/json FormatDurationAsNano 27;encoding/json MatchCaseSensitiveDelimiter 27;encoding/json MergeWithLegacySemantics 27;encoding/json OmitEmptyWithLegacySemantics 27;encoding/json Options 27;encoding/json ParseBytesWithLooseRFC4648 27;encoding/json ParseTimeWithLooseRFC3339 27;encoding/json ReportErrorsWithLegacySemantics 27;encoding/json StringifyWithLegacySemantics 27;encoding/json UnmarshalArrayFromAnyLength 27;encoding/json UnmarshalTypeError.Err 27;encoding/json/jsontext (*Decoder).InputOffset 27;encoding/json/jsontext (*Decoder).Options 27;encoding/json/jsontext (*Decoder).PeekKind 27;encoding/json/jsontext (*Decoder).ReadToken 27;encoding/json/jsontext (*Decoder).ReadValue 27;encoding/json/jsontext (*Decoder).Reset 27;encoding/json/jsontext (*Decoder).SkipValue 27;encoding/json/jsontext (*Decoder).StackDepth 27;encoding/json/jsontext (*Decoder).StackIndex 27;encoding/json/jsontext (*Decoder).StackPointer 27;encoding/json/jsontext (*Decoder).UnreadBuffer 27;encoding/json/jsontext (*Encoder).AvailableBuffer 27;encoding/json/jsontext (*Encoder).Options 27;encoding/json/jsontext (*Encoder).OutputOffset 27;encoding/json/jsontext (*Encoder).Reset 27;encoding/json/jsontext (*Encoder).StackDepth 27;encoding/json/jsontext (*Encoder).StackIndex 27;encoding/json/jsontext (*Encoder).StackPointer 27;encoding/json/jsontext (*Encoder).WriteToken 27;encoding/json/jsontext (*Encoder).WriteValue 27;encoding/json/jsontext (*SyntacticError).Error 27;encoding/json/jsontext (*SyntacticError).Unwrap 27;encoding/json/jsontext (*Value).Canonicalize 27;encoding/json/jsontext (*Value).Compact 27;encoding/json/jsontext (*Value).Format 27;encoding/json/jsontext (*Value).Indent 27;encoding/json/jsontext (*Value).UnmarshalJSON 27;encoding/json/jsontext (Kind).String 27;encoding/json/jsontext (Pointer).AppendToken 27;encoding/json/jsontext (Pointer).Contains 27;encoding/json/jsontext (Pointer).IsValid 27;encoding/json/jsontext (Pointer).LastToken 27;encoding/json/jsontext (Pointer).Parent 27;encoding/json/jsontext (Pointer).Tokens 27;encoding/json/jsontext (Token).Bool 27;encoding/json/jsontext (Token).Clone 27;encoding/json/jsontext (Token).Float 27;encoding/json/jsontext (Token).Float32 27;encoding/json/jsontext (Token).Int 27;encoding/json/jsontext (Token).Kind 27;encoding/json/jsontext (Token).String 27;encoding/json/jsontext (Token).Uint 27;encoding/json/jsontext (Value).Clone 27;encoding/json/jsontext (Value).IsValid 27;encoding/json/jsontext (Value).Kind 27;encoding/json/jsontext (Value).MarshalJSON 27;encoding/json/jsontext (Value).String 27;encoding/json/jsontext AllowDuplicateNames 27;encoding/json/jsontext AllowInvalidUTF8 27;encoding/json/jsontext AppendFloat 27;encoding/json/jsontext AppendFormat 27;encoding/json/jsontext AppendQuote 27;encoding/json/jsontext AppendUnquote 27;encoding/json/jsontext BeginArray 27;encoding/json/jsontext BeginObject 27;encoding/json/jsontext Bool 27;encoding/json/jsontext CanonicalizeRawFloats 27;encoding/json/jsontext CanonicalizeRawInts 27;encoding/json/jsontext Decoder 27;encoding/json/jsontext Encoder 27;encoding/json/jsontext EndArray 27;encoding/json/jsontext EndObject 27;encoding/json/jsontext ErrDuplicateName 27;encoding/json/jsontext ErrNonStringName 27;encoding/json/jsontext EscapeForHTML 27;encoding/json/jsontext EscapeForJS 27;encoding/json/jsontext False 27;encoding/json/jsontext Float 27;encoding/json/jsontext Float32 27;encoding/json/jsontext Int 27;encoding/json/jsontext Internal 27;encoding/json/jsontext Kind 27;encoding/json/jsontext KindBeginArray 27;encoding/json/jsontext KindBeginObject 27;encoding/json/jsontext KindEndArray 27;encoding/json/jsontext KindEndObject 27;encoding/json/jsontext KindFalse 27;encoding/json/jsontext KindInvalid 27;encoding/json/jsontext KindNull 27;encoding/json/jsontext KindNumber 27;encoding/json/jsontext KindString 27;encoding/json/jsontext KindTrue 27;encoding/json/jsontext Multiline 27;encoding/json/jsontext NewDecoder 27;encoding/json/jsontext NewEncoder 27;encoding/json/jsontext Null 27;encoding/json/jsontext Options 27;encoding/json/jsontext Pointer 27;encoding/json/jsontext PreserveRawStrings 27;encoding/json/jsontext ReorderRawObjects 27;encoding/json/jsontext SpaceAfterColon 27;encoding/json/jsontext SpaceAfterComma 27;encoding/json/jsontext String 27;encoding/json/jsontext SyntacticError 27;encoding/json/jsontext SyntacticError.ByteOffset 27;encoding/json/jsontext SyntacticError.Err 27;encoding/json/jsontext SyntacticError.JSONPointer 27;encoding/json/jsontext Token 27;encoding/json/jsontext True 27;encoding/json/jsontext Uint 27;encoding/json/jsontext Value 27;encoding/json/jsontext WithIndent 27;encoding/json/jsontext WithIndentPrefix 27;encoding/json/v2 (*SemanticError).Error 27;encoding/json/v2 (*SemanticError).Unwrap 27;encoding/json/v2 (Marshaler).MarshalJSON 27;encoding/json/v2 (MarshalerTo).MarshalJSONTo 27;encoding/json/v2 (Unmarshaler).UnmarshalJSON 27;encoding/json/v2 (UnmarshalerFrom).UnmarshalJSONFrom 27;encoding/json/v2 DefaultOptionsV2 27;encoding/json/v2 Deterministic 27;encoding/json/v2 ErrUnknownName 27;encoding/json/v2 FormatNilMapAsNull 27;encoding/json/v2 FormatNilSliceAsNull 27;encoding/json/v2 GetOption 27;encoding/json/v2 JoinMarshalers 27;encoding/json/v2 JoinOptions 27;encoding/json/v2 JoinUnmarshalers 27;encoding/json/v2 Marshal 27;encoding/json/v2 MarshalEncode 27;encoding/json/v2 MarshalFunc 27;encoding/json/v2 MarshalToFunc 27;encoding/json/v2 MarshalWrite 27;encoding/json/v2 Marshaler 27;encoding/json/v2 MarshalerTo 27;encoding/json/v2 Marshalers 27;encoding/json/v2 MatchCaseInsensitiveNames 27;encoding/json/v2 OmitZeroStructFields 27;encoding/json/v2 Options 27;encoding/json/v2 RejectUnknownMembers 27;encoding/json/v2 SemanticError 27;encoding/json/v2 SemanticError.ByteOffset 27;encoding/json/v2 SemanticError.Err 27;encoding/json/v2 SemanticError.GoType 27;encoding/json/v2 SemanticError.JSONKind 27;encoding/json/v2 SemanticError.JSONPointer 27;encoding/json/v2 SemanticError.JSONValue 27;encoding/json/v2 StringifyNumbers 27;encoding/json/v2 Unmarshal 27;encoding/json/v2 UnmarshalDecode 27;encoding/json/v2 UnmarshalFromFunc 27;encoding/json/v2 UnmarshalFunc 27;encoding/json/v2 UnmarshalRead 27;encoding/json/v2 Unmarshaler 27;encoding/json/v2 UnmarshalerFrom 27;encoding/json/v2 Unmarshalers 27;encoding/json/v2 WithMarshalers 27;encoding/json/v2 WithUnmarshalers 27;errors AsType 26;go/ast (*Directive).End 26;go/ast (*Directive).ParseArgs 26;go/ast (*Directive).Pos 26;go/ast BasicLit.ValueEnd 26;go/ast Directive 26;go/ast Directive.Args 26;go/ast Directive.ArgsPos 26;go/ast Directive.Name 26;go/ast Directive.Slash 26;go/ast Directive.Tool 26;go/ast DirectiveArg 26;go/ast DirectiveArg.Arg 26;go/ast DirectiveArg.Pos 26;go/ast ParseDirective 26;go/ast Preorder 23;go/ast PreorderStack 25;go/ast Unparen 22;go/constant StringLen 27;go/scanner (*Scanner).End 27;go/token (*File).End 26;go/token (*File).String 27;go/token (*FileSet).AddExistingFiles 25;go/types (*Alias).Obj 22;go/types (*Alias).Origin 23;go/types (*Alias).Rhs 23;go/types (*Alias).SetTypeParams 23;go/types (*Alias).String 22;go/types (*Alias).TypeArgs 23;go/types (*Alias).TypeParams 23;go/types (*Alias).Underlying 22;go/types (*Func).Signature 23;go/types (*Info).PkgNameOf 22;go/types (*Interface).EmbeddedTypes 24;go/types (*Interface).ExplicitMethods 24;go/types (*Interface).Methods 24;go/types (*MethodSet).Methods 24;go/types (*Named).Methods 24;go/types (*Scope).Children 24;go/types (*Struct).Fields 24;go/types (*Tuple).Variables 24;go/types (*TypeList).String 27;go/types (*TypeList).Types 24;go/types (*TypeParamList).String 27;go/types (*TypeParamList).TypeParams 24;go/types (*Union).Terms 24;go/types (*Var).Kind 25;go/types (*Var).SetKind 25;go/types (Checker).PkgNameOf 22;go/types (Hasher).Equal 27;go/types (Hasher).Hash 27;go/types (HasherIgnoreTags).Equal 27;go/types (HasherIgnoreTags).Hash 27;go/types (Instance).String 27;go/types (VarKind).String 25;go/types Alias 22;go/types FieldVar 25;go/types Hasher 27;go/types HasherIgnoreTags 27;go/types Info.FileVersions 22;go/types LocalVar 25;go/types LookupSelection 25;go/types NewAlias 22;go/types PackageVar 25;go/types ParamVar 25;go/types RecvVar 25;go/types ResultVar 25;go/types Unalias 22;go/types VarKind 25;go/version Compare 22;go/version IsValid 22;go/version Lang 22;hash (Cloner).BlockSize 25;hash (Cloner).Clone 25;hash (Cloner).Reset 25;hash (Cloner).Size 25;hash (Cloner).Sum 25;hash (Cloner).Write 25;hash (XOF).BlockSize 25;hash (XOF).Read 25;hash (XOF).Reset 25;hash (XOF).Write 25;hash Cloner 25;hash XOF 25;hash/maphash (*Hash).Clone 25;hash/maphash (ComparableHasher).Equal 27;hash/maphash (ComparableHasher).Hash 27;hash/maphash Comparable 24;hash/maphash ComparableHasher 27;hash/maphash Hasher 27;hash/maphash WriteComparable 24;io (*SectionReader).Outer 22;io/fs (ReadLinkFS).Lstat 25;io/fs (ReadLinkFS).Open 25;io/fs (ReadLinkFS).ReadLink 25;io/fs Lstat 25;io/fs ReadLink 25;io/fs ReadLinkFS 25;iter Pull 23;iter Pull2 23;iter Seq 23;iter Seq2 23;log/slog (*LevelVar).AppendText 24;log/slog (*MultiHandler).Enabled 26;log/slog (*MultiHandler).Handle 26;log/slog (*MultiHandler).WithAttrs 26;log/slog (*MultiHandler).WithGroup 26;log/slog (Level).AppendText 24;log/slog (Record).Source 25;log/slog DiscardHandler 24;log/slog GroupAttrs 25;log/slog MultiHandler 26;log/slog NewMultiHandler 26;log/slog SetLogLoggerLevel 22;maps All 23;maps Collect 23;maps Insert 23;maps Keys 23;maps Values 23;math/big (*Float).AppendText 24;math/big (*Int).AppendText 24;math/big (*Int).Divide 27;math/big (*Rat).AppendText 24;math/big (*Rat).FloatPrec 22;math/big Ceil 27;math/big Floor 27;math/big Round 27;math/big Trunc 27;math/rand/v2 (*ChaCha8).AppendBinary 24;math/rand/v2 (*ChaCha8).MarshalBinary 22;math/rand/v2 (*ChaCha8).Read 23;math/rand/v2 (*ChaCha8).Seed 22;math/rand/v2 (*ChaCha8).Uint64 22;math/rand/v2 (*ChaCha8).UnmarshalBinary 22;math/rand/v2 (*PCG).AppendBinary 24;math/rand/v2 (*PCG).MarshalBinary 22;math/rand/v2 (*PCG).Seed 22;math/rand/v2 (*PCG).Uint64 22;math/rand/v2 (*PCG).UnmarshalBinary 22;math/rand/v2 (*Rand).ExpFloat64 22;math/rand/v2 (*Rand).Float32 22;math/rand/v2 (*Rand).Float64 22;math/rand/v2 (*Rand).Int 22;math/rand/v2 (*Rand).Int32 22;math/rand/v2 (*Rand).Int32N 22;math/rand/v2 (*Rand).Int64 22;math/rand/v2 (*Rand).Int64N 22;math/rand/v2 (*Rand).IntN 22;math/rand/v2 (*Rand).N 27;math/rand/v2 (*Rand).NormFloat64 22;math/rand/v2 (*Rand).Perm 22;math/rand/v2 (*Rand).Shuffle 22;math/rand/v2 (*Rand).Uint 23;math/rand/v2 (*Rand).Uint32 22;math/rand/v2 (*Rand).Uint32N 22;math/rand/v2 (*Rand).Uint64 22;math/rand/v2 (*Rand).Uint64N 22;math/rand/v2 (*Rand).UintN 22;math/rand/v2 (*Zipf).Uint64 22;math/rand/v2 (Source).Uint64 22;math/rand/v2 ChaCha8 22;math/rand/v2 ExpFloat64 22;math/rand/v2 Float32 22;math/rand/v2 Float64 22;math/rand/v2 Int 22;math/rand/v2 Int32 22;math/rand/v2 Int32N 22;math/rand/v2 Int64 22;math/rand/v2 Int64N 22;math/rand/v2 IntN 22;math/rand/v2 N 22;math/rand/v2 New 22;math/rand/v2 NewChaCha8 22;math/rand/v2 NewPCG 22;math/rand/v2 NewZipf 22;math/rand/v2 NormFloat64 22;math/rand/v2 PCG 22;math/rand/v2 Perm 22;math/rand/v2 Rand 22;math/rand/v2 Shuffle 22;math/rand/v2 Source 22;math/rand/v2 Uint 23;math/rand/v2 Uint32 22;math/rand/v2 Uint32N 22;math/rand/v2 Uint64 22;math/rand/v2 Uint64N 22;math/rand/v2 UintN 22;math/rand/v2 Zipf 22;mime/multipart FileContentDisposition 25;net (*DNSError).Unwrap 23;net (*Dialer).DialIP 26;net (*Dialer).DialTCP 26;net (*Dialer).DialUDP 26;net (*Dialer).DialUnix 26;net (*TCPConn).SetKeepAliveConfig 23;net (*TCPConn).WriteTo 22;net (IP).AppendText 24;net DNSError.UnwrapErr 23;net Dialer.KeepAliveConfig 23;net KeepAliveConfig 23;net KeepAliveConfig.Count 23;net KeepAliveConfig.Enable 23;net KeepAliveConfig.Idle 23;net KeepAliveConfig.Interval 23;net ListenConfig.KeepAliveConfig 23;net/http (*ClientConn).Available 26;net/http (*ClientConn).Close 26;net/http (*ClientConn).Err 26;net/http (*ClientConn).InFlight 26;net/http (*ClientConn).Release 26;net/http (*ClientConn).Reserve 26;net/http (*ClientConn).RoundTrip 26;net/http (*ClientConn).SetStateHook 26;net/http (*CrossOriginProtection).AddInsecureBypassPattern 25;net/http (*CrossOriginProtection).AddTrustedOrigin 25;net/http (*CrossOriginProtection).Check 25;net/http (*CrossOriginProtection).Handler 25;net/http (*CrossOriginProtection).SetDenyHandler 25;net/http (*Protocols).SetHTTP1 24;net/http (*Protocols).SetHTTP2 24;net/http (*Protocols).SetUnencryptedHTTP2 24;net/http (*Request).CookiesNamed 23;net/http (*Request).PathValue 22;net/http (*Request).SetPathValue 22;net/http (*Transport).NewClientConn 26;net/http (Protocols).HTTP1 24;net/http (Protocols).HTTP2 24;net/http (Protocols).String 24;net/http (Protocols).UnencryptedHTTP2 24;net/http ClientConn 26;net/http Cookie.Partitioned 23;net/http Cookie.Quoted 23;net/http CrossOriginProtection 25;net/http DefaultMaxHeaderValueCount 27;net/http FileServerFS 22;net/http HTTP2Config 24;net/http HTTP2Config.CountError 24;net/http HTTP2Config.MaxConcurrentStreams 24;net/http HTTP2Config.MaxDecoderHeaderTableSize 24;net/http HTTP2Config.MaxEncoderHeaderTableSize 24;net/http HTTP2Config.MaxReadFrameSize 24;net/http HTTP2Config.MaxReceiveBufferPerConnection 24;net/http HTTP2Config.MaxReceiveBufferPerStream 24;net/http HTTP2Config.PermitProhibitedCipherSuites 24;net/http HTTP2Config.PingTimeout 24;net/http HTTP2Config.SendPingTimeout 24;net/http HTTP2Config.StrictMaxConcurrentRequests 26;net/http HTTP2Config.WriteByteTimeout 24;net/http NewCrossOriginProtection 25;net/http NewFileTransportFS 22;net/http ParseCookie 23;net/http ParseSetCookie 23;net/http Protocols 24;net/http Request.Pattern 23;net/http ServeFileFS 22;net/http Server.DisableClientPriority 27;net/http Server.HTTP2 24;net/http Server.MaxHeaderValueCount 27;net/http Server.Protocols 24;net/http Transport.HTTP2 24;net/http Transport.Protocols 24;net/http/httptest NewRequestWithContext 23;net/http/httptest NewTestServer 27;net/netip (Addr).AppendBinary 24;net/netip (Addr).AppendText 24;net/netip (AddrPort).AppendBinary 24;net/netip (AddrPort).AppendText 24;net/netip (AddrPort).Compare 22;net/netip (Prefix).AppendBinary 24;net/netip (Prefix).AppendText 24;net/netip (Prefix).Compare 26;net/url (*URL).AppendBinary 24;net/url (*URL).Clone 27;net/url (Values).Clone 27;os (*File).WriteTo 22;os (*Process).WithHandle 26;os (*Root).Chmod 25;os (*Root).Chown 25;os (*Root).Chtimes 25;os (*Root).Close 24;os (*Root).Create 24;os (*Root).FS 24;os (*Root).Lchown 25;os (*Root).Link 25;os (*Root).Lstat 24;os (*Root).Mkdir 24;os (*Root).MkdirAll 25;os (*Root).Name 24;os (*Root).Open 24;os (*Root).OpenFile 24;os (*Root).OpenRoot 24;os (*Root).ReadFile 25;os (*Root).Readlink 25;os (*Root).Remove 24;os (*Root).RemoveAll 25;os (*Root).Rename 25;os (*Root).Stat 24;os (*Root).Symlink 25;os (*Root).WriteFile 25;os CopyFS 23;os ErrNoHandle 26;os OpenInRoot 24;os OpenRoot 24;os Root 24;path/filepath Localize 23;reflect (Type).CanSeq 23;reflect (Type).CanSeq2 23;reflect (Type).Fields 26;reflect (Type).Ins 26;reflect (Type).Methods 26;reflect (Type).Outs 26;reflect (Type).OverflowComplex 23;reflect (Type).OverflowFloat 23;reflect (Type).OverflowInt 23;reflect (Type).OverflowUint 23;reflect (Value).Fields 26;reflect (Value).Methods 26;reflect (Value).Seq 23;reflect (Value).Seq2 23;reflect SliceAt 23;reflect TypeAssert 25;reflect TypeFor 22;regexp (*Regexp).AppendText 24;runtime (Cleanup).Stop 24;runtime AddCleanup 24;runtime Cleanup 24;runtime SetDefaultGOMAXPROCS 25;runtime/debug CrashOptions 23;runtime/debug SetCrashOutput 23;runtime/trace (*FlightRecorder).Enabled 25;runtime/trace (*FlightRecorder).Start 25;runtime/trace (*FlightRecorder).Stop 25;runtime/trace (*FlightRecorder).WriteTo 25;runtime/trace FlightRecorder 25;runtime/trace FlightRecorderConfig 25;runtime/trace FlightRecorderConfig.MaxBytes 25;runtime/trace FlightRecorderConfig.MinAge 25;runtime/trace NewFlightRecorder 25;slices All 23;slices AppendSeq 23;slices Backward 23;slices Chunk 23;slices Collect 23;slices Concat 22;slices Repeat 23;slices Sorted 23;slices SortedFunc 23;slices SortedStableFunc 23;slices Values 23;strings CutLast 27;strings FieldsFuncSeq 24;strings FieldsSeq 24;strings Lines 24;strings SplitAfterSeq 24;strings SplitSeq 24;structs HostLayout 23;sync (*Map).Clear 23;sync (*WaitGroup).Go 25;sync/atomic (*Int32).And 23;sync/atomic (*Int32).Or 23;sync/atomic (*Int64).And 23;sync/atomic (*Int64).Or 23;sync/atomic (*Uint32).And 23;sync/atomic (*Uint32).Or 23;sync/atomic (*Uint64).And 23;sync/atomic (*Uint64).Or 23;sync/atomic (*Uintptr).And 23;sync/atomic (*Uintptr).Or 23;sync/atomic AndInt32 23;sync/atomic AndInt64 23;sync/atomic AndUint32 23;sync/atomic AndUint64 23;sync/atomic AndUintptr 23;sync/atomic OrInt32 23;sync/atomic OrInt64 23;sync/atomic OrUint32 23;sync/atomic OrUint64 23;sync/atomic OrUintptr 23;syscall SysProcAttr.PidFD 22;syscall WSAENOPROTOOPT 23;testing (*B).ArtifactDir 26;testing (*B).Attr 25;testing (*B).Chdir 24;testing (*B).Context 24;testing (*B).Loop 24;testing (*B).Output 25;testing (*F).ArtifactDir 26;testing (*F).Attr 25;testing (*F).Chdir 24;testing (*F).Context 24;testing (*F).Output 25;testing (*T).ArtifactDir 26;testing (*T).Attr 25;testing (*T).Chdir 24;testing (*T).Context 24;testing (*T).Output 25;testing (TB).ArtifactDir 26;testing (TB).Attr 25;testing (TB).Chdir 24;testing (TB).Context 24;testing (TB).Output 25;testing/cryptotest SetGlobalRandom 26;testing/fstest (MapFS).Lstat 25;testing/fstest (MapFS).ReadLink 25;testing/slogtest Run 22;testing/synctest Sleep 27;testing/synctest Test 25;testing/synctest Wait 25;time (Time).AppendBinary 24;time (Time).AppendText 24;unicode Beria_Erfe 27;unicode CategoryAliases 25;unicode Cn 25;unicode Garay 27;unicode Gurung_Khema 27;unicode IDS_Unary_Operator 27;unicode ID_Compat_Math_Continue 27;unicode ID_Compat_Math_Start 27;unicode Kirat_Rai 27;unicode LC 25;unicode Modifier_Combining_Mark 27;unicode Ol_Onal 27;unicode Sidetic 27;unicode Sunuwar 27;unicode Tai_Yo 27;unicode Todhri 27;unicode Tolong_Siki 27;unicode Tulu_Tigalari 27;unicode/utf16 RuneLen 23;unique (Handle).Value 23;unique Handle 23;unique Make 23;uuid (*UUID).UnmarshalText 27;uuid (UUID).AppendText 27;uuid (UUID).Compare 27;uuid (UUID).MarshalText 27;uuid (UUID).String 27;uuid Max 27;uuid MustParse 27;uuid New 27;uuid NewV4 27;uuid NewV7 27;uuid Nil 27;uuid Parse 27;uuid UUID 27;weak (Pointer).Value 24;weak Make 24;weak Pointer 24"

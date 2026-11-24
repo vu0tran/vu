@@ -24,6 +24,13 @@ import revive
 import resolve
 import vet
 import sc
+import sc_g1
+import sc_g2
+import sc_g3
+import sc_g4
+import sc_g5
+import sc_g7
+import vet_g6
 import cfg
 import proc
 import printers
@@ -31,6 +38,8 @@ import doc
 import lintersdb
 import lints
 import rx
+import gofmt
+import goimports
 
 extern "sys_glue.c":
   fn gl_getcwd(ffi: Ffi) -> Str
@@ -42,6 +51,7 @@ type Spec:
   dir: Str
   files: [Str]
   path: Str       # import path
+  ignored: [Str] = []  # the folder's .go files its build constraints leave out (go/packages' IgnoredFiles)
 
 type Res:
   idx: Int
@@ -77,6 +87,13 @@ fn sc_enabled(c: cfg.Cfg, code: Str) -> Bool:
   return on
 
 # staticcheck's dot-import-whitelist: the setting, else staticcheck's default (v0.8.1)
+# staticcheck's initialisms: the setting, else staticcheck's default (v0.8.1)
+fn sc_inits(c: cfg.Cfg) -> [Str]:
+  let s = cfg.lsettings(c, "staticcheck")
+  let v = doc.get(c.d, s, "initialisms")
+  if doc.is_set(c.d, v): return doc.strs_of(c.d, v)
+  return sc_g7.default_initialisms()
+
 fn sc_dotw(c: cfg.Cfg) -> [Str]:
   let s = cfg.lsettings(c, "staticcheck")
   let v = doc.get(c.d, s, "dot-import-whitelist")
@@ -84,7 +101,11 @@ fn sc_dotw(c: cfg.Cfg) -> [Str]:
   return ["simd/archsimd", "github.com/mmcloughlin/avo/build", "github.com/mmcloughlin/avo/operand", "github.com/mmcloughlin/avo/reg"]
 
 fn vet_default(name: Str) -> Bool:
-  return name in ["appends", "asmdecl", "assign", "atomic", "bools", "buildtag", "cgocall", "composites", "copylocks", "defers", "directive", "errorsas", "framepointer", "httpresponse", "ifaceassert", "loopclosure", "lostcancel", "nilfunc", "printf", "shift", "sigchanyzer", "slog", "stdmethods", "stdversion", "stringintconv", "structtag", "testinggoroutine", "tests", "timeformat", "unmarshal", "unreachable", "unsafeptr", "unusedresult"]
+  return name in ["appends", "asmdecl", "assign", "atomic", "bools", "buildtag", "cgocall", "composites", "copylocks", "defers", "directive", "errorsas", "framepointer", "httpresponse", "ifaceassert", "loopclosure", "lostcancel", "nilfunc", "printf", "shift", "sigchanyzer", "slog", "stdmethods", "stdversion", "stringintconv", "structtag", "testinggoroutine", "tests", "timeformat", "unmarshal", "unreachable", "unsafeptr", "unusedresult", "hostport", "waitgroup"]
+
+# golangci-lint's govet analyzers that vgolint doesn't have (none is on by default)
+fn vet_missing() -> [Str]:
+  return ["atomicalign", "deepequalerrors", "fieldalignment", "findcall", "httpmux", "inline", "nilness", "reflectvaluecompare", "shadow", "sortslice", "unusedwrite"]
 
 fn vet_enabled(c: cfg.Cfg, name: Str, gover: Int) -> Bool:
   if name == "loopclosure" and gover >= 22: return false
@@ -100,7 +121,10 @@ fn vet_enabled(c: cfg.Cfg, name: Str, gover: Int) -> Bool:
 # Whether an issue's check is on in the config (issues of linters that are off never get here).
 fn check_on(c: cfg.Cfg, is: pkg.Issue, gover: Int) -> Bool:
   if is.linter == "staticcheck":
-    let k = is.msg.find(":")
+    # (an issue's code; "SA4023(related information)" is SA4023's)
+    var k = is.msg.find(":")
+    let par = is.msg.find("(")
+    if par > 0 and par < k: k = par
     if k > 0: return sc_enabled(c, is.msg[0..k])
   elif is.linter == "govet":
     let k = is.msg.find(":")
@@ -121,12 +145,19 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
     pkg.add_file(&p, f, src, &kw)
   var cnt = proc.new_counts(c)
   var issues: [pkg.Issue] = []
+  # (the folder's files its build constraints leave out: govet's buildtag and directive read them)
+  var ip = pkg.new_pkg(sp.dir)
+  if cfg.is_enabled(c, "govet"):
+    for f in sp.ignored:
+      let isrc = fs.read(f) else continue
+      let _ = pkg.add_file(&ip, f, isrc, &kw)
   if p.errs.len > 0:
     var es: [Str] = []
     for e in p.errs: es.push(e + "")
     return Res(0, [], cnt, es)
   if c.gen_mode == "disable":
     for f in 0..p.gen.len: p.gen[f] = false
+  if cfg.is_enabled(c, "gofmt"): gofmt_issues(c, p, &issues)
   if cfg.is_enabled(c, "ineffassign"): ineff.run(&p, &issues)
   # (revive's rules read go/parser's object resolution, which ineffassign computes when it runs)
   if cfg.is_enabled(c, "revive") and p.pobj.len == 0:
@@ -138,6 +169,7 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
   var roots: [Int] = []
   for r in p.roots: roots.push(r)
   let pi = tc.add_target_ast(&g, fs, path, sp.dir, &p.t, roots)
+  if cfg.is_enabled(c, "goimports"): goimports_issues(c, &g, fs, pi, p, &issues)
   if cfg.is_enabled(c, "errcheck"):
     let es = cfg.lsettings(c, "errcheck")
     errcheck.run(&g, fs, pi, p, &issues, doc.strs_of(c.d, doc.get(c.d, es, "exclude-functions")), doc.bool_of(c.d, doc.get(c.d, es, "disable-default-exclusions"), false))
@@ -156,8 +188,17 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
       if not p.gen[fi]: roots2.push(g.pk[pi].roots[fi])
     w = vet.walk_pkg(g.pk[pi].t, roots2)
     have_w = true
-    if want_vet: vet.run(&g, fs, pi, p, &issues, gover, &w)
-    if want_sc: sc.run(&g, fs, pi, p, &issues, gover, &w, sc_dotw(c))
+    if want_vet:
+      vet.run(&g, fs, pi, p, &issues, gover, &w)
+      vet_g6.run(&g, fs, pi, p, &issues, gover, w.nodes, ip)
+    if want_sc:
+      sc.run(&g, fs, pi, p, &issues, gover, &w, sc_dotw(c))
+      sc_g1.run(&g, fs, pi, p, &issues, gover, w.nodes)
+      sc_g2.run(&g, fs, pi, p, &issues, gover, w.nodes)
+      sc_g3.run(&g, fs, pi, p, &issues, gover, w.nodes)
+      sc_g4.run(&g, fs, pi, p, &issues, gover, w.nodes)
+      sc_g5.run(&g, fs, pi, p, &issues, gover, w.nodes)
+      sc_g7.run(&g, fs, pi, p, &issues, gover, w.nodes, sc_inits(c))
   if any_lints(c):
     # (the same walk when no file is generated: vet and staticcheck give its lists back as they were)
     if have_w and no_gen: lints.run(&g, fs, pi, p, c, &dict, w.nodes, &issues)
@@ -169,19 +210,123 @@ fn lint_one(fs: Fs, sp: Spec, var g: tc.Prog, var kw: {Str: Int}, gover: Int, c:
   if cfg.is_enabled(c, "copyloopvar") and gover < 22: issues = drop_linter(issues, "copyloopvar")
   swap(&p.t, &g.pk[pi].t)
   tc.drop_target(&g, pi)
+  # (issues in left-out files: those files join the package for nolint, exclusions and printing)
+  let nreal = p.paths.len
+  var in_ign = false
+  for is in issues:
+    if is.file >= nreal: in_ign = true
+  if in_ign:
+    for k in 0..ip.paths.len:
+      let _ = pkg.add_file(&p, ip.paths[k], ip.srcs[k] + "", &kw)
   var kept: [pkg.Issue] = []
   var ord: [Int] = []
   for i in 0..issues.len: ord.push(i)
   ord.sort(by: fn(a, b) => errcheck_before(p, issues[a], issues[b]))
   for i in ord:
     let is = issues[i]
-    if check_on(c, is, gover): kept.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", rank_of(is), is.endp, is.lsev + "", is.zoff))
+    if check_on(c, is, gover): kept.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", rank_of(is), is.endp, is.lsev + "", is.zoff, is.fix + ""))
   # (the exclusion patterns are compiled when a package first has an issue, or nolint comments to check)
   if not rs_ready and (kept.len > 0 or cfg.is_enabled(c, "nolintlint")):
     rs = proc.compile_all(c, rs.cache.share())
     rs_ready = true
   let res = proc.process_pkg(c, &rs, p, kept, &cnt, diff, ch)
   return Res(0, res, cnt, [])
+
+fn fmt_debug(fs: Fs, argv: [Str]):
+  var simplify = false
+  var show_diff = false
+  var rules: [gofmt.Rule] = []
+  var i = 2
+  while i < argv.len - 1:
+    if argv[i] == "-s": simplify = true
+    elif argv[i] == "-d": show_diff = true
+    elif argv[i] == "-r" and i + 2 < argv.len:
+      let parts = argv[i + 1].split("->")
+      if parts.len == 2: rules.push(gofmt.Rule(parts[0].strip(), parts[1].strip()))
+      i += 1
+    i += 1
+  if argv.len < 3: return
+  let file = argv[argv.len - 1]
+  let src = fs.read(file) else ""
+  var err = ""
+  let out = gofmt.format(src, simplify, rules, &err)
+  if err.len > 0:
+    eprint(file + ": " + err)
+    exit(2)
+  if not show_diff:
+    write(out)
+    return
+  write(gofmt.diff(src, out))
+  for ch in gofmt.changes_of(gofmt.diff(src, out)): print("change {ch.from}-{ch.to}: " + "\n".join(ch.lines))
+
+# gofmt's issues for the package's files (not the generated ones whose issues are dropped anyway)
+fn gofmt_issues(c: cfg.Cfg, p: pkg.Pkg, var issues: [pkg.Issue]):
+  let gs = cfg.lsettings(c, "gofmt")
+  let simplify = doc.bool_of(c.d, doc.get(c.d, gs, "simplify"), true)
+  var rules: [gofmt.Rule] = []
+  let rr = doc.get(c.d, gs, "rewrite-rules")
+  if rr >= 0 and c.d.kind[rr] == doc.K_SEQ:
+    for it in c.d.kids[rr]: rules.push(gofmt.Rule(doc.str_of(c.d, doc.get(c.d, it, "pattern"), ""), doc.str_of(c.d, doc.get(c.d, it, "replacement"), "")))
+  for fi in 0..p.paths.len:
+    if c.gen_mode == "strict" and p.strict_gen[fi]: continue
+    if c.gen_mode == "lax" and (p.strict_gen[fi] or p.lax_gen[fi]): continue
+    if imports_c(p.t, p.roots[fi]): continue
+    gofmt.file_issues(p.srcs[fi], fi, simplify, rules, &issues)
+
+# Whether a file imports "C": golangci-lint's formatters see cgo's output for it (its position
+# isn't the .go file's), so they skip it.
+fn imports_c(t: ast.Ast, root: Int) -> Bool:
+  for im in ast.items(t, t.b[root]):
+    let pn = t.b[im]
+    if pn > 0 and t.names[t.s[pn]] == "\"C\"": return true
+  return false
+
+# goimports' issues for the package's files, with the package names of their unnamed imports as
+# the type checker found them (fix.go's third pass)
+fn goimports_issues(c: cfg.Cfg, var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue]):
+  let gs = cfg.lsettings(c, "goimports")
+  let local = ",".join(doc.strs_of(c.d, doc.get(c.d, gs, "local-prefixes")))
+  let std = g.pk[pi].std
+  for fi in 0..p.paths.len:
+    if c.gen_mode == "strict" and p.strict_gen[fi]: continue
+    if c.gen_mode == "lax" and (p.strict_gen[fi] or p.lax_gen[fi]): continue
+    if imports_c(g.pk[pi].t, g.pk[pi].roots[fi]): continue
+    var names: {Str: Str} = {}
+    if fi < g.pk[pi].imps.len:
+      var imps: [Int] = []
+      for x in g.pk[pi].imps[fi]: imps.push(x)
+      for im in imps:
+        let pnode = g.pk[pi].t.b[im]
+        if pnode <= 0 or g.pk[pi].t.a[im] > 0: continue
+        let lit = g.pk[pi].t.names[g.pk[pi].t.s[pnode]] + ""
+        if lit.len < 2: continue
+        let path = lit[1..lit.len - 1]
+        let q = tc.load_pkg(&g, fs, path, std)
+        if q >= 0: names[path] = g.pk[q].name + ""
+    goimports.file_issues(p.srcs[fi], fi, local, names, &issues)
+
+fn imp_debug(argv: [Str], fs: Fs):
+  var local = ""
+  var show_diff = false
+  var i = 2
+  while i < argv.len - 1:
+    if argv[i] == "-d": show_diff = true
+    elif argv[i] == "-l" and i + 2 < argv.len:
+      local = argv[i + 1] + ""
+      i += 1
+    i += 1
+  if argv.len < 3: return
+  let file = argv[argv.len - 1]
+  let src = fs.read(file) else ""
+  var err = ""
+  let out = goimports.process(src, local, {}, &err)
+  if err.len > 0:
+    eprint(file + ": " + err)
+    exit(2)
+  if not show_diff:
+    write(out)
+    return
+  write(gofmt.diff(src, out))
 
 # errcheck's issues come sorted by file name, then position; everything else keeps its order.
 fn errcheck_before(p: pkg.Pkg, a: pkg.Issue, b: pkg.Issue) -> Bool:
@@ -197,7 +342,7 @@ fn any_lints(c: cfg.Cfg) -> Bool:
 fn drop_linter(issues: [pkg.Issue], name: Str) -> [pkg.Issue]:
   var out: [pkg.Issue] = []
   for is in issues:
-    if is.linter != name: out.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank, is.endp, is.lsev + "", is.zoff))
+    if is.linter != name: out.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank, is.endp, is.lsev + "", is.zoff, is.fix + ""))
   return out
 
 # golangci-lint's order within a line: linters with their own issue reporters first (by name), then
@@ -218,6 +363,7 @@ fn rank_of(is: pkg.Issue) -> Int:
 fn worker(fs: Fs, os: Os, tm: Bool, own msrc: Shared[{Str: Str}], own dsrc: Memo[Str, tc.DepPkg], own dast: Memo[Str, tc.DepFile], own rxc: Memo[Str, rx.Rx], own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str, gover: Int):
   var kw = scan.keywords()
   var g = tc.new_prog(goroot, modcache)
+  for ev in ["TMPDIR", "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]: g.env[ev] = os.env(ev)
   g.msrc = msrc
   g.dsrc = dsrc
   g.dast = dast
@@ -277,15 +423,18 @@ type DRes:
 fn dir_specs(fs: Fs, d: load.Dir, c: cfg.Cfg, modpath: Str, var kw: {Str: Int}, mf: Memo[Str, tc.Src]) -> [Spec]:
   var main_files: [Str] = []
   var x_files: [Str] = []
+  var ignored: [Str] = []
   var pname = ""
   for nm in d.files:
-    if not load.good_name(nm): continue
+    if not load.good_name(nm, c.build_tags): continue
     if not c.tests and nm.endswith("_test.go"): continue
     var path = d.path + "/" + nm
     if d.path == ".": path = nm + ""
     let sv = mf.get(path, fn(p) => tc.read_src(fs, p))
     if not sv.value.ok: continue
-    if not load.good_constraints(sv.value.text, c.build_tags): continue
+    if not load.good_constraints(sv.value.text, c.build_tags):
+      ignored.push(path + "")
+      continue
     let name = package_name(sv.value.text, &kw)
     if nm.endswith("_test.go") and name.endswith("_test") and name != pname:
       x_files.push(path)
@@ -294,19 +443,23 @@ fn dir_specs(fs: Fs, d: load.Dir, c: cfg.Cfg, modpath: Str, var kw: {Str: Int}, 
       main_files.push(path)
   var ip = modpath + ""
   if d.path != ".": ip = modpath + "/" + d.path
+  # (the standard library's own module, std, and cmd's: their import paths are the folders')
+  if (modpath == "std" or modpath == "cmd") and d.path != ".": ip = d.path + ""
+  if modpath == "cmd" and d.path != ".": ip = "cmd/" + d.path
   var ordered: [Str] = []
   for f in main_files:
     if not f.endswith("_test.go"): ordered.push(f + "")
   for f in main_files:
     if f.endswith("_test.go"): ordered.push(f + "")
   var out: [Spec] = []
-  if main_files.len > 0: out.push(Spec(d.path + "", ordered, ip + ""))
+  if main_files.len > 0: out.push(Spec(d.path + "", ordered, ip + "", ignored))
   if x_files.len > 0: out.push(Spec(d.path + "", x_files, ip + "_test"))
   return out
 
 fn dworker(fs: Fs, os: Os, tm: Bool, own dirs: Shared[[load.Dir]], own modpath: Str, own mf: Memo[Str, tc.Src], own dsrc: Memo[Str, tc.DepPkg], own dast: Memo[Str, tc.DepFile], own rxc: Memo[Str, rx.Rx], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[DRes], own keep: Chan[tc.Prog], own goroot: Str, own modcache: Str, gover: Int):
   var kw = scan.keywords()
   var g = tc.new_prog(goroot, modcache)
+  for ev in ["TMPDIR", "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]: g.env[ev] = os.env(ev)
   g.mfile = mf.share()
   g.dsrc = dsrc
   g.dast = dast
@@ -734,7 +887,9 @@ fn golist_order(fs: Fs, own specs: [Spec], var kw: {Str: Int}, srcs: {Str: Str})
   for i in order:
     var fl: [Str] = []
     for f in specs[i].files: fl.push(f + "")
-    out.push(Spec(specs[i].dir + "", fl, specs[i].path + ""))
+    var ig: [Str] = []
+    for f in specs[i].ignored: ig.push(f + "")
+    out.push(Spec(specs[i].dir + "", fl, specs[i].path + "", ig))
   return out
 
 # The imports of a package's files other than its tests, sorted, each once.
@@ -1075,7 +1230,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     return
   let cmd = argv[1]
   if cmd == "version" or cmd == "--version":
-    print("golangci-lint has version 2.5.0 built with vgolint (Vu) from vu on 2026-11-01")
+    print("golangci-lint has version 2.14.0 built with vgolint (Vu) from vu on 2026-11-24")
     return
   if cmd == "help" or cmd == "--help" or cmd == "-h":
     if argv.len > 2 and argv[2] == "linters":
@@ -1085,6 +1240,16 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       for l in lintersdb.formatter_lines(): print(l)
       return
     print_help()
+    return
+  if cmd == "fmt-debug":
+    # (hidden: vgolint fmt-debug [-s] [-r 'pattern -> replacement'] [-d] FILE prints the file as
+    # gofmt formats it, or with -d the changes golangci-lint reports)
+    fmt_debug(fs, argv)
+    return
+  if cmd == "imp-debug":
+    # (hidden: vgolint imp-debug [-l LOCAL-PREFIXES] [-d] FILE prints the file as goimports formats
+    # it, without the package names fix.go loads)
+    imp_debug(argv, fs)
     return
   if cmd == "cache":
     var cdir = os.env("XDG_CACHE_HOME")
@@ -1143,17 +1308,51 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   elif rel_mode == "gomod":
     let r = os.output(["go", "env", "GOMOD"]) else ""
     if r.strip().len > 0 and r.strip() != "/dev/null": c.base = cfg.dir_of(r.strip())
+  # (what the config turns on that vgolint doesn't do: warned about, or with VGOLINT_REQUIRE_ALL set,
+  # an error before anything runs, so CI can't pass on a check that never ran)
+  let quiet = os.env("VGOLINT_QUIET").len > 0
+  let strict = os.env("VGOLINT_REQUIRE_ALL").len > 0
   var skipped: [Str] = []
   for n in c.enabled:
     if not (n in cfg.implemented()): skipped.push(n + "")
-  if skipped.len > 0 and os.env("VGOLINT_QUIET").len == 0:
-    eprint("level=warning msg=\"[vgolint] linters not implemented yet, skipped: " + ", ".join(skipped) + "\"")
-  if cfg.is_enabled(c, "revive") and os.env("VGOLINT_QUIET").len == 0:
+  var vskip: [Str] = []
+  if cfg.is_enabled(c, "govet"):
+    for a in vet_missing():
+      if vet_enabled(c, a, 99): vskip.push(a + "")
+  var rskip: [Str] = []
+  if cfg.is_enabled(c, "revive"):
     let rc = revive.conf_of(c)
-    var rskip: [Str] = []
     for nm in rc.order:
       if nm in rc.rules and not revive.implemented(nm): rskip.push(nm + "")
+  if strict and skipped.len + vskip.len + rskip.len > 0:
+    var all: [Str] = []
+    for n in skipped: all.push(n + "")
+    for n in vskip: all.push("govet " + n)
+    for n in rskip: all.push("revive " + n)
+    eprint("level=error msg=\"[vgolint] VGOLINT_REQUIRE_ALL: not implemented: " + ", ".join(all) + "\"")
+    exit(3)
+  if not quiet:
+    if skipped.len > 0: eprint("level=warning msg=\"[vgolint] linters not implemented yet, skipped: " + ", ".join(skipped) + "\"")
+    if vskip.len > 0: eprint("level=warning msg=\"[vgolint] govet analyzers not implemented yet, skipped: " + ", ".join(vskip) + "\"")
     if rskip.len > 0: eprint("level=warning msg=\"[vgolint] revive rules not implemented yet, skipped: " + ", ".join(rskip) + "\"")
+  # (the build context, as golangci-lint's loader gets it from the go command: GOOS, GOARCH, cgo, the
+  # tool tags (GOEXPERIMENT's, on by default or not, and the GOARCH level) and the release tags; the
+  # environment's GOOS and friends override as they do for go)
+  let bc = (os.output(["go", "list", "-e", "-f", "{{{{context.GOOS}}}} {{{{context.GOARCH}}}} {{{{context.CgoEnabled}}}} {{{{join context.ToolTags \",\"}}}} {{{{join context.ReleaseTags \",\"}}}}", "runtime"]) else "").strip().split(" ")
+  if bc.len >= 5 and bc[0].len > 0:
+    c.build_tags.push("@goos=" + bc[0])
+    c.build_tags.push("@goarch=" + bc[1])
+    var cg = "0"
+    if bc[2] == "true": cg = "1"
+    c.build_tags.push("@cgo=" + cg)
+    for t in bc[3].split(","):
+      if t.len > 0: c.build_tags.push(t + "")
+    var gmax = 0
+    for t in bc[4].split(","):
+      if t.startswith("go1."):
+        let v = int(t[4..t.len]) else 0
+        if v > gmax: gmax = v
+    if gmax > 0: c.build_tags.push("@gover={gmax}")
   let shc = share(c)
   run_lint(fs, os, ffi, o, shc)?
 
@@ -1184,6 +1383,26 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
       print("0 issues.")
       eprint("level=error msg=\"[linters_context] typechecking error: pattern " + r + "/...: lstat " + r + "/: no such file or directory\"")
       exit(7)
+  # (a folder named without /... is a package to go list even when nothing in it builds: no .go file
+  # at all fails the load; files that build constraints all leave out are that package's error)
+  var pre_errs: [Str] = []
+  for ri in 0..roots.len:
+    if recs[ri]: continue
+    var one: [load.Dir] = []
+    load.walk2(fs, roots[ri], true, false, &one)
+    if one.len == 0:
+      var arg = roots[ri] + ""
+      if ri < o.args.len: arg = o.args[ri] + ""
+      eprint("level=error msg=\"Running error: context loading failed: failed to load packages: failed to load packages: package " + arg + ": no go files to analyze\"")
+      exit(5)
+    var builds = false
+    for nm in one[0].files:
+      if builds or not load.good_name(nm, c.build_tags): continue
+      var path = roots[ri] + "/" + nm
+      if roots[ri] == ".": path = nm + ""
+      let src = fs.read(path) else ""
+      if load.good_constraints(src, c.build_tags): builds = true
+    if not builds: pre_errs.push("build constraints exclude all Go files in " + cfg.abs_path(c.cwd, roots[ri]))
   let diff = c.new or c.new_from_rev.len > 0 or c.new_from_merge_base.len > 0 or c.new_from_patch.len > 0
   var ch = proc.Changed([], [])
   if diff: ch = git_changes(os, c, fs)
@@ -1230,6 +1449,12 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
       swap(&d, &wparts[q][di])
       dirs.push(d)
   if tm: eprint("T walked: {os.clock() - t0}")
+  # (with tests off, a folder of tests alone is still a package go list loads, with nothing to lint)
+  var test_pkg = false
+  if not c.tests:
+    for d in dirs:
+      for nm in d.files:
+        if nm.endswith("_test.go") and load.good_name(nm, c.build_tags): test_pkg = true
   var kw = scan.keywords()
   var probe = tc.new_prog("", "")
   tc.read_gomod(fs, &probe, ".")
@@ -1251,12 +1476,15 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     hash_feed(&h, goroot + "\n" + modcache)
     let gv = fs.read(goroot + "/VERSION") else ""
     hash_feed(&h, gv)
+    # (the build context and tags: which files a package has)
+    hash_feed(&h, "\n".join(c.build_tags))
     let exe = fs.read(gl_self_exe(ffi)) else ""
     if exe.len == 0: use_cache = false
     hash_feed(&h, exe)
   var all: [proc.Iss] = []
   var warnings: [Str] = []     # tag, text pairs
   var perrs: [Str] = []
+  for e in pre_errs: perrs.push(e + "")
   var results: [[proc.Iss]] = []
   var tot = proc.new_counts(c)
   # (without the cache, the workers start before the files are read: stream_lint; VGOLINT_STREAM=0
@@ -1278,7 +1506,7 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     var rpaths: [Str] = []
     for d in dirs:
       for nm in d.files:
-        if not load.good_name(nm): continue
+        if not load.good_name(nm, c.build_tags): continue
         if not c.tests and nm.endswith("_test.go"): continue
         if d.path == ".": rpaths.push(nm + "")
         else: rpaths.push(d.path + "/" + nm)
@@ -1305,15 +1533,18 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     for d in dirs:
       var main_files: [Str] = []
       var x_files: [Str] = []
+      var ign2: [Str] = []
       var pname = ""
       for nm in d.files:
-        if not load.good_name(nm): continue
+        if not load.good_name(nm, c.build_tags): continue
         if not c.tests and nm.endswith("_test.go"): continue
         var path = d.path + "/" + nm
         if d.path == ".": path = nm + ""
         if not (path in rsrc): continue
         let src = rsrc[path]
-        if not load.good_constraints(src, c.build_tags): continue
+        if not load.good_constraints(src, c.build_tags):
+          ign2.push(path + "")
+          continue
         if use_cache: srcs[path] = src
         let name = package_name(src, &kw)
         if nm.endswith("_test.go") and name.endswith("_test") and name != pname:
@@ -1323,12 +1554,15 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
           main_files.push(path)
       var ip = modpath + ""
       if d.path != ".": ip = modpath + "/" + d.path
+      # (the standard library's own module, std, and cmd's: their import paths are the folders')
+      if (modpath == "std" or modpath == "cmd") and d.path != ".": ip = d.path + ""
+      if modpath == "cmd" and d.path != ".": ip = "cmd/" + d.path
       var ordered: [Str] = []
       for f in main_files:
         if not f.endswith("_test.go"): ordered.push(f + "")
       for f in main_files:
         if f.endswith("_test.go"): ordered.push(f + "")
-      if main_files.len > 0: specs.push(Spec(d.path + "", ordered, ip + ""))
+      if main_files.len > 0: specs.push(Spec(d.path + "", ordered, ip + "", ign2))
       if x_files.len > 0: specs.push(Spec(d.path + "", x_files, ip + "_test"))
     if tm: eprint("T specs: {os.clock() - t0}")
     specs = golist_order(fs, specs, &kw, rsrc)
@@ -1439,7 +1673,9 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
       for k in pending:
         var fl: [Str] = []
         for f in specs[k].files: fl.push(f + "")
-        lspecs.push(Spec(specs[k].dir + "", fl, specs[k].path + ""))
+        var ig: [Str] = []
+        for f in specs[k].ignored: ig.push(f + "")
+        lspecs.push(Spec(specs[k].dir + "", fl, specs[k].path + "", ig))
       let shared = share(lspecs)
       let sch = share(ch)
       let rc: Chan[Res] = chan(np + 1)
@@ -1500,6 +1736,11 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
     if tot.unknown.len > 0:
       warnings.push("runner/nolint_filter")
       warnings.push("Found unknown linters in //nolint directives: " + ", ".join(sorted(tot.unknown)))
+  # (no package at all, as when ./... meets only nested modules: golangci-lint's loader fails, and so
+  # does the run, with nothing on stdout)
+  if results.len == 0 and perrs.len == 0 and not test_pkg:
+    eprint("level=error msg=\"Running error: context loading failed: no go files to analyze: running `go mod tidy` may solve the problem\"")
+    exit(5)
   for e in perrs: eprint("level=error msg=\"[linters_context] typechecking error: " + e + "\"")
   var wi = 0
   while wi + 1 < warnings.len:

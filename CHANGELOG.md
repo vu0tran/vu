@@ -3125,3 +3125,49 @@ the rest (11 configs, 1,284 issues) match in text and JSON. revive's rules were 
 parallel groups; each group's first comparisons shared golangci-lint's cache, which doesn't notice a
 change of revive's settings, so every comparison was rerun with an empty cache. What's still
 missing for that config: the gofmt and goimports formatters (not ported: they need go/printer).
+
+**vgolint: the rest of staticcheck and govet (2026-11-24).** That monorepo's config runs staticcheck
+with all checks and govet's defaults, and vgolint had 72 of staticcheck v0.8.1's 161 checks, 25 of
+them as v0.6.1 had them, and 22 of govet's analyzers. Ported in parallel groups, each check against
+its own testdata through golangci-lint 2.14.0: the 87 missing staticcheck checks, the 25 updated to
+v0.8.1, and 12 govet analyzers; vgolint now lacks only ST1000, ST1003 (which that config turns off),
+govet's inline (also off there) and pre-1.22 loopclosure. 158 of the 173 testdata suites give
+identical output; the other 15 are harness limits (testdata importing other testdata), golangci-lint's
+unstable sort, darwin files, `//line`, the two unported checks, and constraint-excluded files for
+buildtag/directive. Found on the way: `type S[P *C, Q any]` didn't parse; related-information issues
+were dropped when `checks` was listed, and ranked ahead of their issue; a local alias of a local type
+was invalid in the type checker. golangci-lint itself changes which issues it shows where
+max-same-issues or max-issues-per-linter cut, and which of two revive rules on a line it keeps.
+
+**vgolint: a whole monorepo against golangci-lint, ST1000/ST1003, goimports (2026-11-24).** Every
+package of that monorepo (105 patterns; golangci-lint 2.14.0 on 4 cores, empty
+cache) compared with vgolint:
+- with the repo's own config, formatters included: 5 issues, byte-identical;
+- with a stricter config (staticcheck's `all` but ST1000/ST1003, govet's defaults, lll, revive's
+  defaults, depguard, misspell, gocyclo, no limits): 187,963 of 187,963 issues the same; the output
+  differs only by the order of issues at the same position, which golangci-lint's unstable sort
+  doesn't fix either;
+- ST1000 and ST1003 alone, with an initialisms setting: 8,687 issues, byte-identical (golangci-lint
+  98 s, vgolint 17 s).
+
+What the comparison found, all fixed: a panic when two packages' files shared a cache key
+(deprecated.vu), generic fields and methods of imported types typed too late (unused, SA4006),
+an alias of an embedded field not marked used, exported names starting with a non-ASCII capital, lll
+reporting a too-long last line one line late, cached issues losing their extra source lines, SA9007
+guessing HOME and the temporary folders instead of reading them. Packages are now matched for the go
+command's own build context (`go list`'s GOOS, GOARCH, cgo, tool and release tags) rather than always
+linux/amd64, and the standard library lints as the `std` and `cmd` modules (20,463 of golangci-lint's
+20,514 issues there; the rest are vendored packages and checks that skip their own package). govet's
+buildtag and directive also read the files build constraints leave out. The patterns load as go list
+loads them: no package at all, a named folder with no Go file, and a named folder whose files are all
+left out give golangci-lint's errors and exit codes (14 cases, cached and not).
+
+New: ST1000 and ST1003 (staticcheck's lintName, `initialisms`, its exceptions), so all 161 staticcheck
+checks are in; 162 of the 173 testdata suites now give identical output. goimports, on the printer
+port: x/tools' own import sorting and grouping with `local-prefixes`, Go's pdqsort for the ties, and
+the renames goimports makes on code that compiles; identical text and JSON on 33 hand-made cases,
+that monorepo's library scrambled seven ways (478 to 589 issues each), and scrambled copies of x/tools
+v0.50.0 (709) and x/net v0.59.0 (354). Files that import "C" are skipped by both formatters, as
+golangci-lint does. `VGOLINT_REQUIRE_ALL=1` makes a config that enables anything vgolint lacks (a
+linter, a govet analyzer, a revive rule) an error instead of a warning. `tools/shadow.sh` runs vgolint
+beside golangci-lint in CI and reports differences without failing the job.

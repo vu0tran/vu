@@ -1,5 +1,5 @@
 # staticcheck's IR-based checks SA4006 (a value never used), SA4009 (an argument overwritten before
-# its first use) and SA4017 (a pure call's result ignored), honnef.co/go/tools v0.6.1, without
+# its first use) and SA4017 (a pure call's result ignored), honnef.co/go/tools v0.8.1, without
 # building its IR: a block graph per function over the local variables the IR would lift into
 # registers, and liveness on it.
 #
@@ -11,8 +11,13 @@
 #   the exit block reads the named results, and is where returns, panics and calls that never return
 #   go (staticcheck's NoReturn facts: tables for the standard library, computed for the package);
 # - code nothing reaches is gone, so nothing in it is reported;
+# - jump threading: a branch on a variable alone (if x, if !x) whose two targets lead to one block
+#   through blocks that only jump becomes a jump, so x loses that use (if !ok { continue } at the
+#   end of a loop body);
+# - there are no sigma nodes (v0.8.1's IR dropped them);
 # - SA4006 skips constants (nil and conversions of constants too), right-hand sides that are another
-#   register's value, var declarations, op= assignments, range clauses and select cases;
+#   register's value, var declarations, range clauses and select cases; x op= v counts only when v is
+#   a constant (otherwise the IR value it looks at is v's), and x++ always;
 # - purity (SA4017): staticcheck's facts for the standard library (a table), and for the package's
 #   own functions its rules on the syntax: results, parameters of basic types, nothing but pure
 #   calls, no memory but the stack, no panics, sends, selects, goroutines or defers.
@@ -77,6 +82,11 @@ type F:
   jc: [Int]
   calls: [Int]          # calls as statements, and their blocks
   cblk: [Int]
+  busy: [Bool]          # the IR block holds more than a jump
+  dgb: [Int]            # branches on a variable alone: the block, the use, both targets
+  dgo: [Int]
+  dgt: [Int]
+  dgf: [Int]
 
 fn new_e(pi: Int, tests: [Bool]) -> E:
   var ts: [Bool] = []
@@ -131,6 +141,7 @@ fn nb(var f: F) -> Int:
   f.succ.push([])
   f.bops.push([])
   f.term.push(false)
+  f.busy.push(false)
   return f.succ.len - 1
 
 fn edge(var f: F, a: Int, b: Int):
@@ -311,8 +322,15 @@ fn cond(var g: tc.Prog, fs: Fs, var e: E, var f: F, n0: Int, t: Int, fl: Int):
       if o >= 0:
         op(&f, CHECK, o, n, -1, -1, -1)
         done = true
+  let mark = f.ok.len
   if not done: ex(&g, fs, &e, &f, n)
   let c = f.cur
+  f.busy[c] = true
+  if k == ast.N_IDENT and f.ok.len == mark + 1 and f.ok[mark] == USE:
+    f.dgb.push(c)
+    f.dgo.push(mark)
+    f.dgt.push(t)
+    f.dgf.push(fl)
   edge(&f, c, t)
   edge(&f, c, fl)
 
@@ -422,6 +440,9 @@ fn st(var g: tc.Prog, fs: Fs, var e: E, var f: F, n: Int):
   let pi = e.pi
   let k = kk(g, pi, n)
   let lbl = take_label(&f)
+  if not (k == ast.N_BRANCH or k == ast.N_LABELED or k == ast.N_BLOCK or k == ast.N_LIST or k == ast.N_EMPTY or k == ast.N_BAD or k == ast.N_FOR):
+    let cb = f.cur
+    f.busy[cb] = true
   if k == ast.N_LIST or k == ast.N_BLOCK:
     var l = n
     if k == ast.N_BLOCK: l = fa(g, pi, n)
@@ -455,7 +476,7 @@ fn st(var g: tc.Prog, fs: Fs, var e: E, var f: F, n: Int):
     let o = local(g, &e, f, x)
     if o >= 0:
       op(&f, USE, o, x, -1, -1, -1)
-      op(&f, DEF, o, x, -1, -1, -1)
+      op(&f, DEFC, o, x, n, -1, -1)
     else: ex(&g, fs, &e, &f, x)
   elif k == ast.N_SEND:
     ex(&g, fs, &e, &f, fa(g, pi, n))
@@ -539,6 +560,7 @@ fn st(var g: tc.Prog, fs: Fs, var e: E, var f: F, n: Int):
     if xk == tc.TY_ARRAY: root_esc(&g, fs, &e, &f, x)
     else: ex(&g, fs, &e, &f, x)
     let h = nb(&f)
+    f.busy[h] = true
     let c0 = f.cur
     edge(&f, c0, h)
     let body = nb(&f)
@@ -661,7 +683,9 @@ fn assign(var g: tc.Prog, fs: Fs, var e: E, var f: F, n: Int):
     let o = local(g, &e, f, x)
     if o >= 0:
       op(&f, USE, o, x, -1, -1, -1)
-      op(&f, DEF, o, x, -1, -1, -1)
+      # the IR value is the right-hand side's unless that's a constant (then the result's)
+      if rhs.len == 1 and is_const(&g, fs, pi, rhs[0]): op(&f, DEFC, o, x, n, -1, -1)
+      else: op(&f, DEF, o, x, -1, -1, -1)
     elif kk(g, pi, x) != ast.N_IDENT: ex(&g, fs, &e, &f, x)
     return
   var rstart: [Int] = []
@@ -702,7 +726,7 @@ fn assign(var g: tc.Prog, fs: Fs, var e: E, var f: F, n: Int):
 # Builds the function's graph (and reports, with rep); true when it never returns.
 fn func_body(var g: tc.Prog, fs: Fs, var e: E, fnode: Int, recv: Int, typ: Int, body: Int, rep: Bool) -> Bool:
   let pi = e.pi
-  var f = F(fnode, rep, [], [], [], [], [], [], [], [], [], 0, 0, [], false, {}, "", [], [], [], [], [])
+  var f = F(fnode, rep, [], [], [], [], [], [], [], [], [], 0, 0, [], false, {}, "", [], [], [], [], [], [], [], [], [], [])
   f.cur = nb(&f)
   f.exit = nb(&f)
   var fields: [Int] = []
@@ -724,6 +748,7 @@ fn func_body(var g: tc.Prog, fs: Fs, var e: E, fnode: Int, recv: Int, typ: Int, 
   let last = f.cur
   edge(&f, last, f.exit)
   f.cur = f.exit
+  degenerate(&f)
   var rl: [Int] = []
   for r in f.results: rl.push(r)
   for r in rl: op(&f, USE, r, -1, -1, -1, -1)
@@ -744,6 +769,26 @@ fn func_body(var g: tc.Prog, fs: Fs, var e: E, fnode: Int, recv: Int, typ: Int, 
     for s in f.succ[b]: stack.push(s)
   if rep: analyze(&g, fs, &e, f, typ, body)
   return not returns and not f.has_defer
+
+# Jump threading: a branch whose targets both lead, through blocks that only jump, to one block
+# becomes a jump, and the variable it tested has lost that use.
+fn degenerate(var f: F):
+  for i in 0..f.dgb.len:
+    if thread(f, f.dgt[i]) != thread(f, f.dgf[i]): continue
+    let b = f.dgb[i]
+    var kept: [Int] = []
+    for x in f.bops[b]:
+      if x != f.dgo[i]: kept.push(x)
+    f.bops[b] = kept
+
+fn thread(f: F, b0: Int) -> Int:
+  var b = b0
+  var steps = 0
+  while steps < 10000:
+    if b == 0 or f.busy[b] or f.term[b] or f.bops[b].len > 0 or f.succ[b].len != 1 or f.succ[b][0] == b: return b
+    b = f.succ[b][0]
+    steps += 1
+  return b
 
 fn param_types_b(var g: tc.Prog, fs: Fs, pi: Int, typ: Int) -> Bool:
   for fl in its(g, pi, fb(g, pi, typ)):
@@ -984,7 +1029,7 @@ fn analyze(var g: tc.Prog, fs: Fs, var e: E, f: F, typ: Int, body: Int):
           e.out.push(Rep(a, "SA4009(related information)", "assignment to " + name(g, pi, id)))
       let rc = w.orc[i]
       if rc > 0 and (kind == DEFC or kind == DEF) and not skip4017: sa4017(&g, fs, &e, rc)
-  sa5011(g, &e, f, w, reach)
+  # SA5011: staticcheck v0.8.1 disabled it (its run panics), and golangci-lint 2.14.0 never runs it
   if not skip4017:
     for ci in 0..f.calls.len:
       if f.cblk[ci] in reach: sa4017(&g, fs, &e, f.calls[ci])
@@ -1130,7 +1175,7 @@ fn run(var g: tc.Prog, fs: Fs, pi: Int, roots: [Int], tests: [Bool]) -> [Rep]:
   swap(&out, &e.out)
   return out
 
-# ---- SA5011: a pointer checked against nil and dereferenced as the same IR value
+# ---- The IR values of a variable (SA4006's x = y)
 #
 # The IR's values of a variable: its stores, phis at the iterated dominance frontier of its stores,
 # and sigmas on the edges out of the branches its uses are control dependent on (the post-dominance
@@ -1270,26 +1315,6 @@ fn values(gr: Gr, w: W, v: Int) -> V:
         if not (y in defb):
           defb[y] = true
           wl.push(y)
-    var w2: [Int] = []
-    for b, _ in useb: w2.push(b)
-    while w2.len > 0:
-      let x = w2.pop()
-      for y in gr.rdf[x]:
-        if y in asig: continue
-        asig[y] = true
-        var flags: [Bool] = []
-        var any = false
-        for s in succ[y]:
-          let live = s in rref
-          flags.push(live)
-          if live: any = true
-        if not any: continue
-        sig[y] = flags
-        for s in succ[y]: defb[s] = true
-        change = true
-        if not (y in useb):
-          useb[y] = true
-          w2.push(y)
   # renaming over the dominator tree
   var next = 1
   var opval: {Int: Int} = {}
@@ -1389,33 +1414,3 @@ fn value_used(gr: Gr, w: W, vi: V, v: Int, skip: Int) -> Bool:
     for sv, src in vi.sigsrc:
       if uf_find(vi.rp, src) == x: work.push(sv)
   return false
-
-fn sa5011(g: tc.Prog, var e: E, f: F, w: W, reach: {Int: Bool}):
-  let n = f.succ.len
-  var checked: [Int] = []
-  var seen_v: {Int: Bool} = {}
-  for b in 0..n:
-    if not (b in reach): continue
-    for i in w.bops[b]:
-      let o = w.oo[i]
-      if w.ok[i] == CHECK and not unlifted(e, w, o) and not (o in seen_v):
-        seen_v[o] = true
-        checked.push(o)
-  if checked.len == 0: return
-  let gr = graph(f, reach)
-  for v in checked:
-    let vi = values(gr, w, v)
-    # maybeNil: the last check of each value, in block order
-    var maybe: {Int: Int} = {}
-    for b in 0..n:
-      if gr.idom[b] < 0: continue
-      for i in w.bops[b]:
-        if w.oo[i] == v and w.ok[i] == CHECK and i in vi.opval: maybe[uf_find(vi.rp, vi.opval[i])] = w.on[i]
-    for b in 0..n:
-      if gr.idom[b] < 0: continue
-      for i in w.bops[b]:
-        if w.oo[i] != v or w.ok[i] != DEREF or not (i in vi.opval): continue
-        let val = uf_find(vi.rp, vi.opval[i])
-        if val > 0 and val in maybe:
-          e.out.push(Rep(w.on[i], "SA5011", "possible nil pointer dereference"))
-          e.out.push(Rep(maybe[val], "SA5011(related information)", "this check suggests that the pointer can be nil"))

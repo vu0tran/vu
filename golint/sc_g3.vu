@@ -1,0 +1,2867 @@
+# staticcheck checks (honnef.co/go/tools v0.8.1, as golangci-lint 2.14.0 runs them): SA4018 SA4019 SA4020 SA4021 SA4022 SA4023 SA4024 SA4025 SA4026 SA4027 SA4028 SA4029 SA4030 SA4031 SA4032
+# run() adds this package's issues for the checks in codes() (as sc.vu's report does, through an
+# sc.C); main.vu calls it after sc.run, with the package's non-generated nodes.
+
+import ast
+import pkg
+import tc
+import vet
+import sc
+import ssa
+import ssadata
+import deprecated
+import errcheck
+import scan
+from scan import T_ASSIGN, T_DEFINE, T_EQL, T_NEQ, T_LSS, T_GTR, T_SUB, T_ADD, T_QUO, T_REM, T_AND, T_ARROW, T_INT, T_FLOAT, T_STRING, T_NOT, T_LAND, T_LOR
+from scan import K_VAR, K_BREAK, K_CONTINUE, K_GOTO, K_FALLTHROUGH
+
+# The checks this file has (only the ones ported so far)
+fn codes() -> [Str]:
+  return ["SA4018", "SA4019", "SA4020", "SA4021", "SA4022", "SA4023", "SA4024", "SA4025", "SA4026", "SA4027", "SA4028", "SA4029", "SA4030", "SA4031", "SA4032"]
+
+fn run(var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue], gover: Int, nodes: [Int]):
+  var c = sc.C(pi, [], {})
+  var roots: [Int] = []
+  for fi in 0..g.pk[pi].roots.len:
+    if not p.gen[fi]: roots.push(g.pk[pi].roots[fi])
+  var assigns: [Int] = []
+  var binaries: [Int] = []
+  var calls: [Int] = []
+  var unaries: [Int] = []
+  var tswitches: [Int] = []
+  for n in nodes:
+    let nk = sc.k(g, pi, n)
+    if nk == ast.N_ASSIGN: assigns.push(n)
+    elif nk == ast.N_BINARY: binaries.push(n)
+    elif nk == ast.N_CALL: calls.push(n)
+    elif nk == ast.N_UNARY: unaries.push(n)
+    elif nk == ast.N_TYPESWITCH: tswitches.push(n)
+  sa4018(&g, fs, &c, p, assigns)
+  sa4019(&g, &c, p, roots)
+  sa4020(&g, fs, &c, tswitches)
+  sa4021(&g, &c, calls)
+  sa4022(&g, &c, binaries)
+  sa4024(&g, fs, &c, binaries)
+  sa4025(&g, fs, &c, binaries)
+  sa4026(&g, &c, nodes)
+  sa4027(&g, fs, &c, calls)
+  sa4028(&g, fs, &c, binaries)
+  sa4029(&g, fs, &c, assigns)
+  sa4030(&g, fs, &c, calls)
+  sa4023(&g, fs, &c, p, roots, nodes)
+  sa4031(&g, fs, &c, p, roots, nodes)
+  sa4032(&g, fs, &c, p, roots, binaries)
+  for is in c.out: issues.push(pkg.Issue(is.file, is.pos, is.linter + "", is.msg + "", is.rank))
+
+# ---- shared pattern pieces
+
+fn fa(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return g.pk[pi].t.a[n]
+
+fn fb(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return g.pk[pi].t.b[n]
+
+fn ul(g: tc.Prog, pi: Int, n: Int) -> Int:
+  return vet.unparen(g, pi, n)
+
+# (Builtin name): an identifier (parens around it allowed) for the universe's name
+fn is_univ(g: tc.Prog, pi: Int, n0: Int, name: Str) -> Bool:
+  let n = ul(g, pi, n0)
+  if sc.k(g, pi, n) != ast.N_IDENT or sc.nm(g, pi, n) != name: return false
+  let o = sc.obj_of(g, pi, n)
+  if o < 0: return false
+  return (g.ok[o] == tc.O_BUILTIN or g.ok[o] == tc.O_NIL or g.ok[o] == tc.O_TYPE or g.ok[o] == tc.O_CONST) and g.opkg[o] < 0
+
+# (IntegerLiteral _): a literal integer, or +/- one; its constant's value in decimal, "" if no match
+fn int_lit(var g: tc.Prog, fs: Fs, pi: Int, n0: Int) -> Str:
+  let n = ul(g, pi, n0)
+  let kk = sc.k(g, pi, n)
+  if kk == ast.N_BASICLIT:
+    if g.pk[pi].t.f[n] != T_INT: return ""
+  elif kk == ast.N_UNARY and (g.pk[pi].t.f[n] == T_SUB or g.pk[pi].t.f[n] == T_ADD):
+    if int_lit(&g, fs, pi, fa(g, pi, n)) == "": return ""
+  else: return ""
+  let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], n, -1, 0)
+  if cv.k != 1: return ""
+  return "{cv.i}"
+
+# The call's arguments
+fn args_of(g: tc.Prog, pi: Int, call: Int) -> [Int]:
+  return ast.items(g.pk[pi].t, fb(g, pi, call))
+
+# ---- SA4018: self-assignment
+
+# code.MayHaveSideEffects with the purity facts
+fn mse(var g: tc.Prog, fs: Fs, var e: ssa.E, pi: Int, n: Int) -> Bool:
+  if n <= 0: return false
+  let kk = sc.k(g, pi, n)
+  if kk == ast.N_BAD: return true
+  if kk == ast.N_FUNCLIT or kk == ast.N_BASICLIT or kk == ast.N_IDENT: return false
+  if kk == ast.N_ARRAYTYPE or kk == ast.N_STRUCTTYPE or kk == ast.N_FUNCTYPE or kk == ast.N_IFACETYPE or kk == ast.N_MAPTYPE or kk == ast.N_CHANTYPE: return false
+  if kk == ast.N_ELLIPSIS or kk == ast.N_SELECTOR or kk == ast.N_STAR or kk == ast.N_TYPEASSERT or kk == ast.N_PAREN: return mse(&g, fs, &e, pi, fa(g, pi, n))
+  if kk == ast.N_BINARY or kk == ast.N_KEYVALUE: return mse(&g, fs, &e, pi, fa(g, pi, n)) or mse(&g, fs, &e, pi, fb(g, pi, n))
+  if kk == ast.N_UNARY:
+    if mse(&g, fs, &e, pi, fa(g, pi, n)): return true
+    return g.pk[pi].t.f[n] == T_ARROW or g.pk[pi].t.f[n] == T_AND
+  if kk == ast.N_SLICE:
+    return mse(&g, fs, &e, pi, fa(g, pi, n)) or mse(&g, fs, &e, pi, fb(g, pi, n)) or mse(&g, fs, &e, pi, g.pk[pi].t.c[n]) or mse(&g, fs, &e, pi, g.pk[pi].t.d[n])
+  if kk == ast.N_INDEX:
+    if mse(&g, fs, &e, pi, fa(g, pi, n)): return true
+    for x in ast.items(g.pk[pi].t, fb(g, pi, n)):
+      if mse(&g, fs, &e, pi, x): return true
+    return false
+  if kk == ast.N_COMPOSITE:
+    if mse(&g, fs, &e, pi, fa(g, pi, n)): return true
+    for x in ast.items(g.pk[pi].t, fb(g, pi, n)):
+      if mse(&g, fs, &e, pi, x): return true
+    return false
+  if kk == ast.N_CALL:
+    let fun = ul(g, pi, fa(g, pi, n))
+    if is_univ(g, pi, fun, "len") or is_univ(g, pi, fun, "cap"):
+      if g.ok[sc.obj_of(g, pi, fun)] != tc.O_BUILTIN: return true
+    else:
+      var o = vet.callee(g, pi, n)
+      if o < 0: return true
+      o = g.oorig[o]
+      if not ssa.pure_fn(&g, fs, &e, o): return true
+    for x in ast.items(g.pk[pi].t, fb(g, pi, n)):
+      if mse(&g, fs, &e, pi, x): return true
+    return false
+  return true
+
+fn sa4018(var g: tc.Prog, fs: Fs, var c: sc.C, p: pkg.Pkg, nodes: [Int]):
+  let pi = c.pi
+  var e = ssa.new_e(pi, p.test)
+  var have = false
+  for n in nodes:
+    if g.pk[pi].t.f[n] != T_ASSIGN: continue
+    let ls = ast.items(g.pk[pi].t, fa(g, pi, n))
+    let rs = ast.items(g.pk[pi].t, fb(g, pi, n))
+    if ls.len != rs.len: continue
+    for i in 0..ls.len:
+      let l = ls[i]
+      let r = rs[i]
+      if sc.k(g, pi, l) != sc.k(g, pi, r): continue
+      if not have:
+        have = true
+        if g.ssa_noret.len == 0:
+          g.ssa_noret = ssadata.std_noreturn()
+          g.ssa_pure = ssadata.std_pure()
+        swap(&e.std_pure, &g.ssa_pure)
+        swap(&e.std_noret, &g.ssa_noret)
+      if mse(&g, fs, &e, pi, l) or mse(&g, fs, &e, pi, r): continue
+      let rl = sc.fmt_expr(g, pi, l)
+      let rr = sc.fmt_expr(g, pi, r)
+      if rl == rr: sc.report(g, &c, n, "SA4018", "self-assignment of " + rr + " to " + rl)
+  if have:
+    swap(&e.std_pure, &g.ssa_pure)
+    swap(&e.std_noret, &g.ssa_noret)
+
+# ---- SA4019: identical // +build lines
+
+fn sa4019(var g: tc.Prog, var c: sc.C, p: pkg.Pkg, roots: [Int]):
+  let pi = c.pi
+  for root in roots:
+    let fi = g.pk[pi].t.file[root]
+    let src = p.srcs[fi]
+    let cm = p.comments[fi]
+    # astutil.Preamble: the comments before the package doc comment (or the package clause)
+    let ppos = g.pk[pi].t.pos[root]
+    var cutoff = ppos
+    let dg = deprecated.doc_group(src, cm, ppos)
+    if dg.len > 0: cutoff = cm[dg[0]]
+    var cons: [[Str]] = []
+    var i = 0
+    while i < cm.len:
+      if cm[i] >= cutoff: break
+      let text = deprecated.group_text(src, cm, i, i + 3)
+      i += 3
+      for line in text.split("\n"):
+        if not line.startswith("+build "): continue
+        let fields = line[7..line.len].strip().split()
+        var fs2: [Str] = []
+        for f in fields:
+          if f.len > 0: fs2.push(f + "")
+        cons.push(fs2)
+    for a in 0..cons.len:
+      for b in a + 1..cons.len:
+        if cons[a].len != cons[b].len: continue
+        var x: [Str] = []
+        for s in cons[a]: x.push(s + "")
+        var y: [Str] = []
+        for s in cons[b]: y.push(s + "")
+        x.sort()
+        y.sort()
+        var same = true
+        for j in 0..x.len:
+          if x[j] != y[j]: same = false
+        if same:
+          let ja = " ".join(cons[a])
+          let jb = " ".join(cons[b])
+          sc.report(g, &c, root, "SA4019", "identical build constraints " + vet.go_quote(ja) + " and " + vet.go_quote(jb))
+
+# ---- SA4020: unreachable case clauses in a type switch
+
+fn iface_methods(var g: tc.Prog, fs: Fs, u: Int, depth: Int) -> [Int]:
+  var out: [Int] = []
+  if depth > 20: return out
+  for m in tc.tlist(g, u): out.push(m)
+  let emb = g.tb[u]
+  if emb > 0:
+    for e in tc.tlist(g, emb):
+      let eu = tc.under(&g, fs, e)
+      if eu > 0 and g.tk[eu] == tc.TY_IFACE and eu != u:
+        for m in iface_methods(&g, fs, eu, depth + 1): out.push(m)
+  return out
+
+fn exported_name(s: Str) -> Bool:
+  return s.len > 0 and s[0] >= 'A' and s[0] <= 'Z'
+
+# types.Implements(v, the interface tu)
+fn implements(var g: tc.Prog, fs: Fs, v: Int, tu: Int) -> Bool:
+  if v <= 0: return false
+  var vv = v
+  if g.tk[v] == tc.TY_TPARAM:
+    vv = g.tb[v]
+    if vv <= 0: vv = g.any_t
+  for m in iface_methods(&g, fs, tu, 0):
+    let mn = g.oname[m] + ""
+    let r = tc.method_in_set(&g, fs, vv, mn)
+    if r.len == 0: return false
+    if not exported_name(mn) and g.opkg[r[0]] != g.opkg[m]: return false
+    if r[1] != tc.obj_type(&g, fs, m): return false
+  return true
+
+fn subsumes(var g: tc.Prog, fs: Fs, t: Int, v: Int) -> Bool:
+  if t <= 0 or g.tk[t] == tc.TY_TPARAM: return false
+  let u = tc.under(&g, fs, t)
+  if u <= 0 or g.tk[u] != tc.TY_IFACE: return false
+  return implements(&g, fs, v, u)
+
+# types.Type.String of a case's type: an alias by its name, an interface literal's methods sorted
+fn case_type_str(var g: tc.Prog, fs: Fs, pi: Int, e0: Int, t: Int) -> Str:
+  if is_univ(g, pi, e0, "any"): return "any"
+  let e = ul(g, pi, e0)
+  var o = -1
+  if sc.k(g, pi, e) == ast.N_IDENT: o = sc.obj_of(g, pi, e)
+  elif sc.k(g, pi, e) == ast.N_SELECTOR: o = g.pk[pi].sobj.get(e, -1)
+  if o >= 0 and g.ok[o] == tc.O_TYPE and g.opkg[o] >= 0:
+    let op = g.opkg[o]
+    let d = g.odecl[o]
+    if d >= 0 and d < g.pk[op].t.k.len and g.pk[op].t.k[d] == ast.N_TYPESPEC and g.pk[op].t.f[d] == 1: return g.pk[op].path + "." + g.oname[o]
+  if t > 0 and g.tk[t] == tc.TY_IFACE and (tc.tlist(g, t).len > 0 or g.tb[t] > 0):
+    var ms: [Str] = []
+    for m in tc.tlist(g, t):
+      let mt = tc.obj_type(&g, fs, m)
+      ms.push(g.oname[m] + tc.sig_str(&g, fs, mt, ""))
+    ms.sort()
+    if g.tb[t] > 0:
+      for x in tc.tlist(g, g.tb[t]): ms.push(tc.type_str(&g, fs, x, ""))
+    return "interface{{" + "; ".join(ms) + "}}"
+  return tc.type_str(&g, fs, t, "")
+
+fn sa4020(var g: tc.Prog, fs: Fs, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    var ccs: [Int] = []
+    var tys: [[Int]] = []
+    var exs: [[Int]] = []
+    for cl in ast.items(g.pk[pi].t, g.pk[pi].t.c[n]):
+      let l = fa(g, pi, cl)
+      if l < 0 or ast.count(g.pk[pi].t, l) == 0: continue
+      var ts: [Int] = []
+      var es: [Int] = []
+      for x in ast.items(g.pk[pi].t, l):
+        let t = vet.ty(g, pi, x)
+        if t == tc.B_UNIL or is_univ(g, pi, x, "nil"): continue
+        ts.push(t)
+        es.push(x)
+      ccs.push(cl)
+      tys.push(ts)
+      exs.push(es)
+    if ccs.len <= 1: continue
+    for i in 0..ccs.len - 1:
+      for j in i + 1..ccs.len:
+        var hit = false
+        for a in 0..tys[i].len:
+          if hit: break
+          for b in 0..tys[j].len:
+            if subsumes(&g, fs, tys[i][a], tys[j][b]):
+              let ts = case_type_str(&g, fs, pi, exs[i][a], tys[i][a])
+              let vs = case_type_str(&g, fs, pi, exs[j][b], tys[j][b])
+              sc.report(g, &c, ccs[j], "SA4020", "unreachable case clause: " + ts + " will always match before " + vs)
+              hit = true
+              break
+
+# ---- SA4021: x = append(y)
+
+fn sa4021(var g: tc.Prog, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if not is_univ(g, pi, fa(g, pi, n), "append"): continue
+    if ast.count(g.pk[pi].t, fb(g, pi, n)) != 1: continue
+    sc.report(g, &c, n, "SA4021", "x = append(y) is equivalent to x = y")
+
+# ---- SA4022: &x == nil
+
+fn addr_nil(g: tc.Prog, pi: Int, n: Int) -> Bool:
+  let op = g.pk[pi].t.f[n]
+  if op != T_EQL and op != T_NEQ: return false
+  let x = ul(g, pi, fa(g, pi, n))
+  if sc.k(g, pi, x) != ast.N_UNARY or g.pk[pi].t.f[x] != T_AND: return false
+  return is_univ(g, pi, fb(g, pi, n), "nil")
+
+fn sa4022(var g: tc.Prog, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if addr_nil(g, pi, n): sc.report(g, &c, n, "SA4022", "the address of a variable cannot be nil")
+
+# ---- SA4024: len(x) < 0
+
+fn len_cap_call(g: tc.Prog, pi: Int, n0: Int) -> Str:
+  let n = ul(g, pi, n0)
+  if sc.k(g, pi, n) != ast.N_CALL: return ""
+  let f = ul(g, pi, fa(g, pi, n))
+  if is_univ(g, pi, f, "len") or is_univ(g, pi, f, "cap"):
+    if g.ok[sc.obj_of(g, pi, f)] == tc.O_BUILTIN: return sc.nm(g, pi, f)
+  return ""
+
+fn sa4024(var g: tc.Prog, fs: Fs, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    let op = g.pk[pi].t.f[n]
+    var b = ""
+    if op == T_GTR and int_lit(&g, fs, pi, fa(g, pi, n)) == "0": b = len_cap_call(g, pi, fb(g, pi, n))
+    elif op == T_LSS and int_lit(&g, fs, pi, fb(g, pi, n)) == "0": b = len_cap_call(g, pi, fa(g, pi, n))
+    if b.len > 0: sc.report(g, &c, n, "SA4024", "builtin function " + b + " does not return negative values")
+
+# ---- SA4025: integer division of literals that is zero
+
+fn sa4025(var g: tc.Prog, fs: Fs, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if g.pk[pi].t.f[n] != T_QUO: continue
+    if int_lit(&g, fs, pi, fa(g, pi, n)) == "" or int_lit(&g, fs, pi, fb(g, pi, n)) == "": continue
+    let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], n, -1, 0)
+    if cv.k != 1 or cv.i != 0: continue
+    sc.report(g, &c, n, "SA4025", "the integer division '" + sc.fmt_expr(g, pi, n) + "' results in zero")
+
+# ---- SA4026: -0.0
+
+fn lit_is(g: tc.Prog, pi: Int, n0: Int, kind: Int, text: Str) -> Bool:
+  let n = ul(g, pi, n0)
+  return sc.k(g, pi, n) == ast.N_BASICLIT and g.pk[pi].t.f[n] == kind and sc.nm(g, pi, n) == text
+
+# (Object (Or "float32" "float64")): an identifier of that name; its object
+fn float_conv(g: tc.Prog, pi: Int, n0: Int) -> Int:
+  let n = ul(g, pi, n0)
+  if sc.k(g, pi, n) != ast.N_IDENT: return -2
+  let s = sc.nm(g, pi, n)
+  if s != "float32" and s != "float64": return -2
+  return sc.obj_of(g, pi, n)
+
+fn sa4026(var g: tc.Prog, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  let generic = "in Go, the floating-point literal '-0.0' is the same as '0.0', it does not produce a negative zero"
+  for n in nodes:
+    let kk = sc.k(g, pi, n)
+    if kk == ast.N_UNARY:
+      if g.pk[pi].t.f[n] != T_SUB: continue
+      let x = ul(g, pi, fa(g, pi, n))
+      if lit_is(g, pi, x, T_FLOAT, "0.0"):
+        sc.report(g, &c, n, "SA4026", generic)
+        continue
+      if sc.k(g, pi, x) != ast.N_CALL: continue
+      let conv = float_conv(g, pi, fa(g, pi, x))
+      if conv == -2: continue
+      let as = args_of(g, pi, x)
+      if as.len != 1: continue
+      if not (lit_is(g, pi, as[0], T_INT, "0") or lit_is(g, pi, as[0], T_FLOAT, "0.0")): continue
+      sa4026_report(g, &c, n, conv, ul(g, pi, fa(g, pi, x)), ul(g, pi, as[0]))
+    elif kk == ast.N_CALL:
+      let conv = float_conv(g, pi, fa(g, pi, n))
+      if conv == -2: continue
+      let as = args_of(g, pi, n)
+      if as.len != 1: continue
+      let a = ul(g, pi, as[0])
+      if sc.k(g, pi, a) != ast.N_UNARY or g.pk[pi].t.f[a] != T_SUB: continue
+      if not lit_is(g, pi, fa(g, pi, a), T_INT, "0"): continue
+      sa4026_report(g, &c, n, conv, ul(g, pi, fa(g, pi, n)), ul(g, pi, fa(g, pi, a)))
+
+fn sa4026_report(g: tc.Prog, var c: sc.C, n: Int, conv: Int, id: Int, lit: Int):
+  let pi = c.pi
+  if conv >= 0 and g.ok[conv] == tc.O_TYPE:
+    sc.report(g, &c, n, "SA4026", "in Go, the floating-point expression '" + sc.fmt_expr(g, pi, n) + "' is the same as '" + sc.nm(g, pi, id) + "(" + sc.fmt_expr(g, pi, lit) + ")', it does not produce a negative zero")
+  else:
+    sc.report(g, &c, n, "SA4026", "in Go, the floating-point literal '-0.0' is the same as '0.0', it does not produce a negative zero")
+
+# ---- SA4027: u.Query().Add(...)
+
+fn sa4027(var g: tc.Prog, fs: Fs, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    let sel = ul(g, pi, fa(g, pi, n))
+    if sc.k(g, pi, sel) != ast.N_SELECTOR: continue
+    let meth = sc.nm(g, pi, fb(g, pi, sel))
+    if meth != "Add" and meth != "Del" and meth != "Set": continue
+    let inner = ul(g, pi, fa(g, pi, sel))
+    if sc.k(g, pi, inner) != ast.N_CALL or ast.count(g.pk[pi].t, fb(g, pi, inner)) != 0: continue
+    let qs = ul(g, pi, fa(g, pi, inner))
+    if sc.k(g, pi, qs) != ast.N_SELECTOR or sc.nm(g, pi, fb(g, pi, qs)) != "Query": continue
+    let rt = vet.ty(g, pi, fa(g, pi, qs))
+    if rt <= 0 or g.tk[rt] != tc.TY_PTR: continue
+    let et = g.ta[rt]
+    if et <= 0 or g.tk[et] != tc.TY_NAMED: continue
+    let o = g.ta[et]
+    if g.oname[o] != "URL" or g.opkg[o] < 0 or g.pk[g.opkg[o]].path != "net/url": continue
+    sc.report(g, &c, n, "SA4027", "(*net/url.URL).Query returns a copy, modifying it doesn't change the URL")
+
+# ---- SA4028: x % 1
+
+fn sa4028(var g: tc.Prog, fs: Fs, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if g.pk[pi].t.f[n] != T_REM: continue
+    if int_lit(&g, fs, pi, fb(g, pi, n)) != "1": continue
+    sc.report(g, &c, n, "SA4028", "x % 1 is always zero")
+
+# ---- SA4029: x = sort.StringSlice(x)
+
+fn sa4029(var g: tc.Prog, fs: Fs, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  for n in nodes:
+    if g.pk[pi].t.f[n] != T_ASSIGN: continue
+    let ls = ast.items(g.pk[pi].t, fa(g, pi, n))
+    let rs = ast.items(g.pk[pi].t, fb(g, pi, n))
+    if ls.len != 1 or rs.len != 1: continue
+    let target = ul(g, pi, ls[0])
+    if sc.k(g, pi, target) != ast.N_IDENT: continue
+    let call = ul(g, pi, rs[0])
+    if sc.k(g, pi, call) != ast.N_CALL: continue
+    let as = args_of(g, pi, call)
+    if as.len != 1: continue
+    let a = ul(g, pi, as[0])
+    if sc.k(g, pi, a) != ast.N_IDENT or sc.nm(g, pi, a) != sc.nm(g, pi, target): continue
+    var fun = ul(g, pi, fa(g, pi, call))
+    if sc.k(g, pi, fun) == ast.N_INDEX: fun = ul(g, pi, fa(g, pi, fun))
+    var o = -1
+    if sc.k(g, pi, fun) == ast.N_IDENT: o = sc.obj_of(g, pi, fun)
+    elif sc.k(g, pi, fun) == ast.N_SELECTOR: o = g.pk[pi].sobj.get(fun, -1)
+    if o < 0 or g.ok[o] != tc.O_TYPE: continue
+    let ft = tc.obj_type(&g, fs, o)
+    if ft <= 0 or g.tk[ft] != tc.TY_NAMED: continue
+    let to = g.ta[ft]
+    if g.opkg[to] < 0 or g.pk[g.opkg[to]].path != "sort": continue
+    let tn = g.oname[to]
+    var alt = ""
+    if tn == "Float64Slice": alt = "Float64s"
+    elif tn == "IntSlice": alt = "Ints"
+    elif tn == "StringSlice": alt = "Strings"
+    else: continue
+    let tt = vet.ty(g, pi, target)
+    if tt <= 0 or g.tk[tt] != tc.TY_SLICE: continue
+    sc.report(g, &c, n, "SA4029", "sort." + tn + " is a type, not a function, and " + sc.fmt_expr(g, pi, rs[0]) + " doesn't sort your values; consider using sort." + alt + " instead")
+
+# ---- SA4030: rand.Intn(1)
+
+fn sa4030(var g: tc.Prog, fs: Fs, var c: sc.C, nodes: [Int]):
+  let pi = c.pi
+  let names = ["math/rand.Int31n", "math/rand.Int63n", "math/rand.Intn", "(*math/rand.Rand).Int31n", "(*math/rand.Rand).Int63n", "(*math/rand.Rand).Intn", "math/rand/v2.Int32N", "math/rand/v2.Int64N", "math/rand/v2.IntN", "math/rand/v2.N", "math/rand/v2.Uint32N", "math/rand/v2.Uint64N", "math/rand/v2.UintN", "(*math/rand/v2.Rand).Int32N", "(*math/rand/v2.Rand).Int64N", "(*math/rand/v2.Rand).IntN", "(*math/rand/v2.Rand).Uint32N", "(*math/rand/v2.Rand).Uint64N", "(*math/rand/v2.Rand).UintN"]
+  for n in nodes:
+    let as = args_of(g, pi, n)
+    if as.len != 1 or int_lit(&g, fs, pi, as[0]) != "1": continue
+    let name = sc.callee_name(&g, fs, &c, n)
+    if not (name in names): continue
+    sc.report(g, &c, n, "SA4030", name + "(n) generates a random value 0 <= x < n; that is, the generated values don't include n; " + sc.fmt_expr(g, pi, n) + " therefore always returns 0")
+
+# ---- SA4032: runtime.GOOS / runtime.GOARCH compared with a value the build constraints rule out
+
+# A constraint expression as a tree: kinds 1 tag (s), 2 not (a), 3 and (a, b), 4 or (a, b)
+type Bx:
+  k: [Int]
+  a: [Int]
+  b: [Int]
+  s: [Str]
+  src: Str
+  i: Int
+  bad: Bool
+
+fn bx_node(var x: Bx, k: Int, a: Int, b: Int, s: Str) -> Int:
+  x.k.push(k)
+  x.a.push(a)
+  x.b.push(b)
+  x.s.push(s)
+  return x.k.len - 1
+
+fn bx_skip(var x: Bx):
+  while x.i < x.src.len and (x.src[x.i] == ' ' or x.src[x.i] == '\t'): x.i += 1
+
+fn bx_or(var x: Bx) -> Int:
+  var v = bx_and(&x)
+  while not x.bad:
+    bx_skip(&x)
+    if x.i + 1 < x.src.len and x.src[x.i] == '|' and x.src[x.i + 1] == '|':
+      x.i += 2
+      let w = bx_and(&x)
+      v = bx_node(&x, 4, v, w, "")
+    else: return v
+  return v
+
+fn bx_and(var x: Bx) -> Int:
+  var v = bx_not(&x)
+  while not x.bad:
+    bx_skip(&x)
+    if x.i + 1 < x.src.len and x.src[x.i] == '&' and x.src[x.i + 1] == '&':
+      x.i += 2
+      let w = bx_not(&x)
+      v = bx_node(&x, 3, v, w, "")
+    else: return v
+  return v
+
+fn bx_not(var x: Bx) -> Int:
+  bx_skip(&x)
+  if x.i < x.src.len and x.src[x.i] == '!':
+    x.i += 1
+    let v = bx_not(&x)
+    return bx_node(&x, 2, v, -1, "")
+  if x.i < x.src.len and x.src[x.i] == '(':
+    x.i += 1
+    let v = bx_or(&x)
+    bx_skip(&x)
+    if x.i < x.src.len and x.src[x.i] == ')': x.i += 1
+    else: x.bad = true
+    return v
+  let st = x.i
+  while x.i < x.src.len:
+    let ch = x.src[x.i]
+    if (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '.': x.i += 1
+    else: break
+  if x.i == st:
+    x.bad = true
+    return -1
+  return bx_node(&x, 1, -1, -1, x.src[st..x.i])
+
+fn known_goos(s: Str) -> Bool:
+  return s in ["aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios", "js", "linux", "netbsd", "openbsd", "plan9", "solaris", "wasip1", "windows"]
+
+fn known_goarch(s: Str) -> Bool:
+  return s in ["386", "amd64", "arm", "arm64", "loong64", "mips", "mipsle", "mips64", "mips64le", "ppc64", "ppc64le", "riscv64", "s390x", "sparc64", "wasm"]
+
+# A file's constraint (code.BuildConstraints): the root of x's tree, -1 for none
+fn file_constraint(var x: Bx, src: Str, cm: [Int], ppos: Int, name: Str) -> Int:
+  var root = -1
+  # each comment group's first //go:build line before the package clause; the last group's wins
+  var i = 0
+  var last_group = -1
+  while i < cm.len:
+    # the group of comment i: comments on adjacent lines with no token between
+    var j = i + 3
+    while j < cm.len and cm[j + 2] == cm[i + 2] and deprecated.count_nl(src, cm[j - 2], cm[j]) <= 1: j += 3
+    var k = i
+    while k < j:
+      if cm[k] > ppos: break
+      let text = src[cm[k]..cm[k + 1]]
+      if text.startswith("//go:build"):
+        root = -2
+        let rest = text[10..text.len]
+        if rest.len > 0 and rest[0] != ' ' and rest[0] != '\t': break
+        x.src = rest + ""
+        x.i = 0
+        x.bad = false
+        let r = bx_or(&x)
+        bx_skip(&x)
+        if not x.bad and x.i == x.src.len: root = r
+        break
+      k += 3
+    i = j
+  if root == -2: root = -1
+  # the file name's GOOS / GOARCH
+  var stem = name
+  let sl = rfind(stem, '/')
+  if sl >= 0: stem = stem[sl + 1..stem.len]
+  if stem.endswith(".go"): stem = stem[0..stem.len - 3]
+  if stem.endswith("_test"): stem = stem[0..stem.len - 5]
+  var goos = ""
+  var goarch = ""
+  let parts = stem.split("_")
+  if parts.len == 2:
+    let cc = stem[stem.find("_") + 1..stem.len]
+    if known_goos(cc): goos = cc
+    elif known_goarch(cc): goarch = cc
+  elif parts.len > 2:
+    let ln = rfind(stem, '_')
+    let last = stem[ln + 1..stem.len]
+    if known_goos(last): goos = last
+    elif known_goarch(last):
+      goarch = last
+      let head = stem[0..ln]
+      let cc = head[head.find("_") + 1..head.len]
+      if known_goos(cc): goos = cc
+  var oexpr = -1
+  if goos.len > 0: oexpr = bx_node(&x, 1, -1, -1, goos)
+  if goarch.len > 0:
+    let t = bx_node(&x, 1, -1, -1, goarch)
+    if oexpr < 0: oexpr = t
+    else: oexpr = bx_node(&x, 3, oexpr, t, "")
+  if oexpr >= 0:
+    if root < 0: root = oexpr
+    else: root = bx_node(&x, 3, root, oexpr, "")
+  return root
+
+# matchGoosTag / matchGoarchTag: [matched, special]
+fn special_tag(tag: Str, val: Str, os: Bool) -> [Bool]:
+  if os:
+    if tag in ["aix", "android", "dragonfly", "freebsd", "hurd", "illumos", "ios", "js", "netbsd", "openbsd", "plan9", "wasip1", "windows"]: return [val == tag, true]
+    if tag == "darwin": return [val == "darwin" or val == "ios", true]
+    if tag == "linux": return [val == "linux" or val == "android", true]
+    if tag == "solaris": return [val == "solaris" or val == "illumos", true]
+    if tag == "unix": return [val in ["aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios", "linux", "netbsd", "openbsd", "solaris"], true]
+    return [false, false]
+  if known_goarch(tag): return [val == tag, true]
+  return [false, false]
+
+fn bx_eval(x: Bx, n: Int, val: Str, os: Bool, others: {Str: Int}, bits: Int) -> Bool:
+  let kk = x.k[n]
+  if kk == 1:
+    let r = special_tag(x.s[n], val, os)
+    if r[1] or bits < 0: return r[0]
+    return (bits & (1 << others[x.s[n]])) != 0
+  if kk == 2: return not bx_eval(x, x.a[n], val, os, others, bits)
+  if kk == 3: return bx_eval(x, x.a[n], val, os, others, bits) and bx_eval(x, x.b[n], val, os, others, bits)
+  return bx_eval(x, x.a[n], val, os, others, bits) or bx_eval(x, x.b[n], val, os, others, bits)
+
+# The other tags in the order Eval meets them (go/build/constraint evaluates both sides of && and ||)
+fn bx_others(x: Bx, n: Int, val: Str, os: Bool, var others: {Str: Int}):
+  let kk = x.k[n]
+  if kk == 1:
+    let r = special_tag(x.s[n], val, os)
+    if not r[1] and not (x.s[n] in others): others[x.s[n]] = others.len
+    return
+  bx_others(x, x.a[n], val, os, &others)
+  if kk == 3 or kk == 4: bx_others(x, x.b[n], val, os, &others)
+
+# validateTagComparison: [sat, did check]
+fn validate(x: Bx, root: Int, val: Str, os: Bool) -> [Bool]:
+  var others: {Str: Int} = {}
+  bx_others(x, root, val, os, &others)
+  let b = bx_eval(x, root, val, os, others, -1)
+  if b or others.len == 0: return [b, true]
+  if others.len > 10: return [false, false]
+  for bits in 0..(1 << others.len):
+    if bx_eval(x, root, val, os, others, bits): return [true, true]
+  return [false, true]
+
+# (Symbol "runtime.GOOS"): the name the expression refers to, "" if not that kind
+fn runtime_sym(g: tc.Prog, pi: Int, n0: Int) -> Str:
+  var n = ul(g, pi, n0)
+  var o = -1
+  if sc.k(g, pi, n) == ast.N_IDENT: o = sc.obj_of(g, pi, n)
+  elif sc.k(g, pi, n) == ast.N_SELECTOR: o = g.pk[pi].sobj.get(n, -1)
+  if o < 0 or g.opkg[o] < 0 or g.pk[g.opkg[o]].path != "runtime": return ""
+  if g.ok[o] != tc.O_CONST and g.ok[o] != tc.O_VAR: return ""
+  return g.oname[o] + ""
+
+fn sa4032(var g: tc.Prog, fs: Fs, var c: sc.C, p: pkg.Pkg, roots: [Int], nodes: [Int]):
+  let pi = c.pi
+  var cand: [Int] = []
+  for n in nodes:
+    let op = g.pk[pi].t.f[n]
+    if op != T_EQL and op != T_NEQ: continue
+    let s = runtime_sym(g, pi, fa(g, pi, n))
+    if s != "GOOS" and s != "GOARCH": continue
+    let y = ul(g, pi, fb(g, pi, n))
+    if sc.k(g, pi, y) != ast.N_BASICLIT or g.pk[pi].t.f[y] != T_STRING: continue
+    cand.push(n)
+  if cand.len == 0: return
+  var byfile: {Int: Int} = {}
+  var x = Bx([], [], [], [], "", 0, false)
+  for root in roots:
+    let fi = g.pk[pi].t.file[root]
+    byfile[fi] = file_constraint(&x, p.srcs[fi], p.comments[fi], g.pk[pi].t.pos[root], p.paths[fi])
+  for n in cand:
+    let fi = g.pk[pi].t.file[n]
+    let r = byfile.get(fi, -1)
+    if r < 0: continue
+    let os = runtime_sym(g, pi, fa(g, pi, n)) == "GOOS"
+    let y = ul(g, pi, fb(g, pi, n))
+    let cv = tc.const_val(&g, fs, pi, fi, y, -1, 0)
+    if cv.k != 2: continue
+    let val = cv.s + ""
+    if os and not known_goos(val): continue
+    if not os and not known_goarch(val): continue
+    let v = validate(x, r, val, os)
+    if not v[1] or v[0]: continue
+    if os: sc.report(g, &c, n, "SA4032", "due to the file's build constraints, runtime.GOOS will never equal " + vet.go_quote(val))
+    else: sc.report(g, &c, n, "SA4032", "due to the file's build constraints, runtime.GOARCH will never equal " + vet.go_quote(val))
+
+fn rfind(s: Str, ch: Byte) -> Int:
+  var i = s.len - 1
+  while i >= 0:
+    if s[i] == ch: return i
+    i -= 1
+  return -1
+
+# ---- SA4031: a nil check of a value that is never nil (staticcheck's IR, as ssa.vu models it)
+
+# ssa.values, also giving each definition's value its operation (defop), and without sigmas
+# (staticcheck v0.8.1's IR has none)
+type V2:
+  opval: {Int: Int}
+  rp: {Int: Int}
+  phiops: {Int: [Int]}
+  sigsrc: {Int: Int}
+  defop: {Int: Int}
+  opdef: {Int: Int}     # a definition's operation -> its value
+  phiv: {Int: Int}      # block -> its phi's value
+  exitv: {Int: Int}     # block -> the value at its end
+
+fn values2(gr: ssa.Gr, w: ssa.W, v: Int) -> V2:
+  let n = gr.succ.len
+  let succ = gr.succ
+  let pred = gr.pred
+  var defb: {Int: Bool} = {}
+  var useb: {Int: Bool} = {}
+  for b in 0..n:
+    if gr.idom[b] < 0: continue
+    for i in w.bops[b]:
+      if w.oo[i] != v: continue
+      if ssa.is_use(w.ok[i]): useb[b] = true
+      else: defb[b] = true
+  var rref: {Int: Bool} = {}
+  var rload: {Int: Bool} = {}
+  for pass in 0..2:
+    var stack: [Int] = []
+    for b, _ in useb: stack.push(b)
+    if pass == 0:
+      for b, _ in defb: stack.push(b)
+    var got: {Int: Bool} = {}
+    while stack.len > 0:
+      let b = stack.pop()
+      if b in got: continue
+      got[b] = true
+      for p in pred[b]: stack.push(p)
+    if pass == 0: rref = got
+    else: rload = got
+  var aphi: {Int: Bool} = {}
+  var phi: {Int: Bool} = {}
+  var asig: {Int: Bool} = {}
+  var sig: {Int: [Bool]} = {}
+  var change = true
+  while change:
+    change = false
+    var wl: [Int] = []
+    for b, _ in defb: wl.push(b)
+    while wl.len > 0:
+      let x = wl.pop()
+      for y in gr.df[x]:
+        if y in aphi: continue
+        aphi[y] = true
+        if not (y in rload) or pred[y].len == 0: continue
+        phi[y] = true
+        for p in pred[y]: useb[p] = true
+        change = true
+        if not (y in defb):
+          defb[y] = true
+          wl.push(y)
+  var next = 1
+  var opval: {Int: Int} = {}
+  var defop: {Int: Int} = {}
+  var opdef: {Int: Int} = {}
+  var exitv: {Int: Int} = {}
+  var phiv: {Int: Int} = {}
+  var sigv: {Int: Int} = {}
+  var sigsrc: {Int: Int} = {}
+  var stack = [0]
+  var inval = [0]
+  while stack.len > 0:
+    let b = stack.pop()
+    var cur = inval.pop()
+    if b in phi:
+      cur = next
+      phiv[b] = next
+      next += 1
+    for i in w.bops[b]:
+      if w.oo[i] != v: continue
+      if ssa.is_use(w.ok[i]): opval[i] = cur
+      else:
+        cur = next
+        defop[cur] = i
+        opdef[i] = cur
+        next += 1
+    exitv[b] = cur
+    for c in gr.kids[b]:
+      var cv = cur
+      if b in sig:
+        for si in 0..succ[b].len:
+          if succ[b][si] == c and sig[b][si]:
+            let key = b * 64 + si
+            if not (key in sigv):
+              sigv[key] = next
+              sigsrc[next] = cur
+              next += 1
+            cv = sigv[key]
+            break
+      stack.push(c)
+      inval.push(cv)
+  var ops: {Int: [Int]} = {}
+  for y, _ in phi:
+    if not (y in phiv): continue
+    var l: [Int] = []
+    for p in pred[y]:
+      var val = exitv.get(p, 0)
+      if p in sig:
+        for si in 0..succ[p].len:
+          if succ[p][si] == y:
+            if sig[p][si]:
+              let key = p * 64 + si
+              if not (key in sigv):
+                sigv[key] = next
+                sigsrc[next] = val
+                next += 1
+              val = sigv[key]
+            break
+      l.push(val)
+    ops[phiv[y]] = l
+  var rp: {Int: Int} = {}
+  var ch2 = true
+  while ch2:
+    ch2 = false
+    for pv, l in ops:
+      if ssa.uf_find(rp, pv) != pv: continue
+      var v0 = -1
+      var useless = true
+      for x0 in l:
+        let x = ssa.uf_find(rp, x0)
+        if x == pv: continue
+        if v0 < 0: v0 = x
+        elif v0 != x: useless = false
+      if useless and v0 >= 0:
+        rp[pv] = v0
+        ch2 = true
+  return V2(opval, rp, ops, sigsrc, defop, opdef, phiv, exitv)
+
+# One function's lifted operations (ssa.func_body without the reports)
+fn build_f(var g: tc.Prog, fs: Fs, var e: ssa.E, fnode: Int, recv: Int, typ: Int, body: Int) -> ssa.F:
+  let pi = e.pi
+  var f = ssa.F(fnode, false, [], [], [], [], [], [], [], [], [], 0, 0, [], false, {}, "", [], [], [], [], [], [], [], [], [], [])
+  f.cur = ssa.nb(&f)
+  f.exit = ssa.nb(&f)
+  var fields: [Int] = []
+  if recv > 0:
+    for x in ast.items(g.pk[pi].t, recv): fields.push(x)
+  for x in ast.items(g.pk[pi].t, fb(g, pi, typ)): fields.push(x)
+  for fl in fields:
+    let ids = fa(g, pi, fl)
+    if ids < 0: continue
+    for id in ast.items(g.pk[pi].t, ids):
+      ssa.decl(g, &e, f, id)
+      let o = ssa.local(g, &e, f, id)
+      if o >= 0: ssa.op(&f, ssa.PARAM, o, id, -1, -1, -1)
+  let res = g.pk[pi].t.c[typ]
+  if res > 0:
+    for fl in ast.items(g.pk[pi].t, res):
+      let ids = fa(g, pi, fl)
+      if ids < 0: continue
+      for id in ast.items(g.pk[pi].t, ids):
+        ssa.decl(g, &e, f, id)
+        let o = ssa.local(g, &e, f, id)
+        if o >= 0:
+          f.results.push(o)
+          ssa.op(&f, ssa.DEF, o, id, -1, -1, -1)
+  ssa.st(&g, fs, &e, &f, body)
+  let last = f.cur
+  ssa.edge(&f, last, f.exit)
+  f.cur = f.exit
+  var rl: [Int] = []
+  for r in f.results: rl.push(r)
+  for r in rl: ssa.op(&f, ssa.USE, r, -1, -1, -1, -1)
+  if f.has_defer:
+    for r in f.results: e.esc[r] = true
+  return f
+
+# A value: kinds 0 other (maybe nil), 1 a function, 2 a closure, 3 an allocation (Alloc, MakeMap,
+# MakeChan, MakeSlice), 4 a slice of x, 5 a field address of x, 6 a phi. x (kinds 4, 5): xm 1 the
+# value of expression xn, 2 its address, 4 an allocation; pos: the node it's at
+type Dv:
+  kind: Int
+  key: Str
+  pos: Int
+  xm: Int
+  xn: Int
+  pok: Bool    # Parent() is the function checked
+  po: Int      # a phi: its variable and value
+  pv: Int
+
+type Nc:
+  fnode: Int
+  f: ssa.F
+  w: ssa.W
+  gr: ssa.Gr
+  vals: {Int: V2}
+  byid: {Int: Int}
+  rhs: {Int: Int}
+  encl: {Int: Int}
+  seen: {Str: Bool}
+  tracked: [Int]
+
+fn dv_other() -> Dv:
+  return Dv(0, "", -1, 0, -1, true, -1, -1)
+
+fn has_free_vars(g: tc.Prog, e: ssa.E, pi: Int, lit: Int) -> Bool:
+  let lo = g.pk[pi].t.pos[lit]
+  let hi = g.pk[pi].t.end[lit]
+  let file = g.pk[pi].t.file[lit]
+  for n in vet.preorder(g.pk[pi].t, [lit]):
+    if g.pk[pi].t.k[n] != ast.N_IDENT: continue
+    let o = sc.obj_of(g, pi, n)
+    if o < 0 or not (o in e.owner): continue
+    let dn = g.onode[o]
+    if dn < 0 or g.ofile[o] != file: return true
+    let dp = g.pk[pi].t.pos[dn]
+    if dp < lo or dp >= hi: return true
+  return false
+
+fn var_value(var g: tc.Prog, var nc: Nc, o: Int, i: Int) -> Int:
+  if not (o in nc.vals): nc.vals[o] = values2(nc.gr, nc.w, o)
+  if not (i in nc.vals[o].opval): return -1
+  return ssa.uf_find(nc.vals[o].rp, nc.vals[o].opval[i])
+
+fn canon_var(var g: tc.Prog, fs: Fs, var e: ssa.E, var nc: Nc, o: Int, vid: Int) -> Dv:
+  if vid <= 0: return dv_other()
+  if vid in nc.vals[o].sigsrc: return dv_other()
+  if vid in nc.vals[o].phiops: return Dv(6, "p{o}:{vid}", -1, 0, -1, true, o, vid)
+  if not (vid in nc.vals[o].defop): return dv_other()
+  let i = nc.vals[o].defop[vid]
+  let id = nc.f.on[i]
+  let r = nc.rhs.get(id, -1)
+  if r < 0: return dv_other()
+  return canon_expr(&g, fs, &e, &nc, r)
+
+fn func_dv(g: tc.Prog, pi: Int, o: Int) -> Dv:
+  # (a declared function is at its declaration's func keyword; -1: in another package)
+  var pos = g.odecl[o]
+  if pos < 0: pos = g.onode[o]
+  if g.opkg[o] != pi: pos = -1
+  return Dv(1, "f{o}", pos, 0, -1, false, -1, -1)
+
+fn canon_expr(var g: tc.Prog, fs: Fs, var e: ssa.E, var nc: Nc, n0: Int) -> Dv:
+  let pi = e.pi
+  let n = ul(g, pi, n0)
+  let kk = sc.k(g, pi, n)
+  if kk == ast.N_IDENT:
+    let o = sc.obj_of(g, pi, n)
+    if o < 0: return dv_other()
+    if g.ok[o] == tc.O_FUNC and g.opkg[o] >= 0: return func_dv(g, pi, o)
+    if g.ok[o] != tc.O_VAR: return dv_other()
+    let i = nc.byid.get(n, -1)
+    if i < 0 or not (i in nc.w.kept) or ssa.unlifted(e, nc.w, o): return dv_other()
+    let vid = var_value(&g, &nc, o, i)
+    return canon_var(&g, fs, &e, &nc, o, vid)
+  if kk == ast.N_FUNCLIT:
+    let pok = nc.encl.get(n, -1) == nc.fnode
+    if has_free_vars(g, e, pi, n): return Dv(2, "e{n}", n, 0, -1, true, -1, -1)
+    return Dv(1, "e{n}", n, 0, -1, pok, -1, -1)
+  if kk == ast.N_CALL:
+    let fun = ul(g, pi, fa(g, pi, n))
+    if is_univ(g, pi, fun, "new") or is_univ(g, pi, fun, "make"):
+      if g.ok[sc.obj_of(g, pi, fun)] == tc.O_BUILTIN: return Dv(3, "e{n}", n, 0, -1, true, -1, -1)
+    return dv_other()
+  if kk == ast.N_UNARY:
+    if g.pk[pi].t.f[n] != T_AND: return dv_other()
+    return canon_addr(&g, fs, &e, &nc, fa(g, pi, n))
+  if kk == ast.N_COMPOSITE:
+    let t = vet.ty(g, pi, n)
+    if t <= 0: return dv_other()
+    let u = tc.under(&g, fs, t)
+    if u > 0 and g.tk[u] == tc.TY_SLICE: return Dv(4, "e{n}", n, 4, n, true, -1, -1)
+    if u > 0 and g.tk[u] == tc.TY_MAP: return Dv(3, "e{n}", n, 0, -1, true, -1, -1)
+    return dv_other()
+  if kk == ast.N_SLICE:
+    let base = fa(g, pi, n)
+    let bt = vet.ty(g, pi, base)
+    if bt <= 0: return dv_other()
+    let u = tc.under(&g, fs, bt)
+    if u <= 0: return dv_other()
+    if g.tk[u] == tc.TY_ARRAY: return Dv(4, "e{n}", n, 2, base, true, -1, -1)
+    if g.tk[u] == tc.TY_SLICE or g.tk[u] == tc.TY_PTR: return Dv(4, "e{n}", n, 1, base, true, -1, -1)
+    return dv_other()
+  if kk == ast.N_SELECTOR:
+    let sk = g.pk[pi].skind.get(n, 0)
+    let o = g.pk[pi].sobj.get(n, -1)
+    if sk == tc.S_METHOD: return Dv(2, "e{n}", fb(g, pi, n), 0, -1, true, -1, -1)
+    if sk == tc.S_PKG and o >= 0 and g.ok[o] == tc.O_FUNC: return func_dv(g, pi, o)
+    if sk == tc.S_MEXPR: return Dv(1, "e{n}", n, 0, -1, false, -1, -1)
+    return dv_other()
+  return dv_other()
+
+# The address of expression n0 (b.addr)
+fn canon_addr(var g: tc.Prog, fs: Fs, var e: ssa.E, var nc: Nc, n0: Int) -> Dv:
+  let pi = e.pi
+  let n = ul(g, pi, n0)
+  let kk = sc.k(g, pi, n)
+  if kk == ast.N_COMPOSITE: return Dv(3, "e{n}", n, 0, -1, true, -1, -1)
+  if kk == ast.N_IDENT:
+    let o = sc.obj_of(g, pi, n)
+    if o < 0 or g.ok[o] != tc.O_VAR or not (o in e.owner): return dv_other()
+    return Dv(3, "a{o}", g.onode[o], 0, -1, true, -1, -1)
+  if kk == ast.N_SELECTOR and g.pk[pi].skind.get(n, 0) == tc.S_FIELD:
+    # (fields reached through embedded ones: only through embedded structs)
+    var path: [Int] = []
+    if n in g.pk[pi].spath:
+      for x in g.pk[pi].spath[n]: path.push(x)
+    for pf in path:
+      let ft = tc.obj_type(&g, fs, pf)
+      let fu = tc.under(&g, fs, ft)
+      if fu > 0 and g.tk[fu] == tc.TY_PTR: return dv_other()
+    let base = fa(g, pi, n)
+    let bt = vet.ty(g, pi, base)
+    if bt <= 0: return dv_other()
+    let u = tc.under(&g, fs, bt)
+    if u > 0 and g.tk[u] == tc.TY_PTR: return Dv(5, "e{n}", fb(g, pi, n), 1, base, true, -1, -1)
+    if u > 0 and g.tk[u] == tc.TY_STRUCT: return Dv(5, "e{n}", fb(g, pi, n), 2, base, true, -1, -1)
+    return dv_other()
+  return dv_other()
+
+fn never_nil(var g: tc.Prog, fs: Fs, var e: ssa.E, var nc: Nc, d: Dv, track: Bool) -> Bool:
+  if d.kind == 0: return false
+  if d.key in nc.seen: return true
+  nc.seen[d.key] = true
+  if d.kind == 1 or d.kind == 2 or d.kind == 3:
+    if track: nc.tracked.push(d.pos)
+    return true
+  if d.kind == 4 or d.kind == 5:
+    if track: nc.tracked.push(d.pos)
+    if d.xm == 4: return true
+    var x = dv_other()
+    if d.xm == 1: x = canon_expr(&g, fs, &e, &nc, d.xn)
+    else: x = canon_addr(&g, fs, &e, &nc, d.xn)
+    return never_nil(&g, fs, &e, &nc, x, false)
+  if d.kind == 6:
+    var edges: [Int] = []
+    for x in nc.vals[d.po].phiops[d.pv]: edges.push(x)
+    for x in edges:
+      let vid = ssa.uf_find(nc.vals[d.po].rp, x)
+      let dx = canon_var(&g, fs, &e, &nc, d.po, vid)
+      if not never_nil(&g, fs, &e, &nc, dx, true): return false
+    return true
+  return false
+
+fn sa4031(var g: tc.Prog, fs: Fs, var c: sc.C, p: pkg.Pkg, roots: [Int], nodes: [Int]):
+  let pi = c.pi
+  # the if statements to look at, and the function each is in
+  var cand: [Int] = []
+  var conds: {Int: Int} = {}
+  for n in nodes:
+    if sc.k(g, pi, n) != ast.N_IF: continue
+    let cd = ul(g, pi, g.pk[pi].t.b[n])
+    if sc.k(g, pi, cd) != ast.N_BINARY: continue
+    let op = g.pk[pi].t.f[cd]
+    if op != T_EQL and op != T_NEQ: continue
+    if not is_univ(g, pi, fb(g, pi, cd), "nil"): continue
+    if addr_nil(g, pi, cd): continue
+    cand.push(n)
+    conds[n] = cd
+  if cand.len == 0: return
+  var encl: {Int: Int} = {}
+  var outer: {Int: Int} = {}
+  for root in roots:
+    for d in ast.items(g.pk[pi].t, g.pk[pi].t.c[root]):
+      var stack: [Int] = [d]
+      var fstack: [Int] = [-1]
+      while stack.len > 0:
+        let x = stack.pop()
+        var fx = fstack.pop()
+        let xk = sc.k(g, pi, x)
+        if xk == ast.N_IF or xk == ast.N_FUNCLIT: encl[x] = fx
+        if xk == ast.N_FUNCDECL or xk == ast.N_FUNCLIT:
+          fx = x
+          if not (x in outer): outer[x] = d
+        if xk == ast.N_RANGE:
+          # (the body of a range over a function is a closure the IR makes: no value is found there)
+          let rt = vet.ty(g, pi, g.pk[pi].t.c[x])
+          if rt > 0:
+            let ru = tc.under(&g, fs, rt)
+            if ru > 0 and g.tk[ru] == tc.TY_FUNC: fx = -2
+        let before = stack.len
+        vet.push_kids(g.pk[pi].t, x, &stack)
+        for _ in before..stack.len: fstack.push(fx)
+  var rhs: {Int: Int} = {}
+  for n in nodes:
+    let nk = sc.k(g, pi, n)
+    if nk == ast.N_ASSIGN:
+      let tok = g.pk[pi].t.f[n]
+      if tok != T_ASSIGN and tok != scan.T_DEFINE: continue
+      let ls = ast.items(g.pk[pi].t, fa(g, pi, n))
+      let rs = ast.items(g.pk[pi].t, fb(g, pi, n))
+      if ls.len != rs.len: continue
+      for i in 0..ls.len: rhs[ul(g, pi, ls[i])] = rs[i]
+    elif nk == ast.N_VALUESPEC:
+      let ls = ast.items(g.pk[pi].t, fa(g, pi, n))
+      let vl = g.pk[pi].t.c[n]
+      if vl < 0: continue
+      let rs = ast.items(g.pk[pi].t, vl)
+      if ls.len != rs.len: continue
+      for i in 0..ls.len: rhs[ls[i]] = rs[i]
+  # (only checks whose value can be never nil: a variable with a definition that can be one)
+  var nnv: {Int: Bool} = {}
+  var copies: [Int] = []
+  for id, r in rhs:
+    let ru = ul(g, pi, r)
+    let ruo = sc.obj_of(g, pi, ru)
+    if sc.k(g, pi, ru) == ast.N_IDENT and ruo >= 0 and g.ok[ruo] == tc.O_VAR:
+      copies.push(id)
+      continue
+    if maybe_nn(g, pi, r):
+      let o = sc.obj_of(g, pi, id)
+      if o >= 0: nnv[o] = true
+  # (x := y copies y's value)
+  var more = true
+  while more:
+    more = false
+    for id in copies:
+      let o = sc.obj_of(g, pi, id)
+      let ro = sc.obj_of(g, pi, ul(g, pi, rhs[id]))
+      if o >= 0 and ro in nnv and not (o in nnv):
+        nnv[o] = true
+        more = true
+  var keep: [Int] = []
+  for n in cand:
+    let lhs = ul(g, pi, fa(g, pi, conds[n]))
+    if sc.k(g, pi, lhs) == ast.N_IDENT:
+      let o = sc.obj_of(g, pi, lhs)
+      if o >= 0 and (g.ok[o] == tc.O_FUNC or o in nnv): keep.push(n)
+    elif maybe_nn(g, pi, lhs): keep.push(n)
+  if keep.len == 0: return
+  cand = keep
+  var e = ssa.new_e(pi, p.test)
+  if g.ssa_noret.len == 0:
+    g.ssa_noret = ssadata.std_noreturn()
+    g.ssa_pure = ssadata.std_pure()
+  swap(&e.std_pure, &g.ssa_pure)
+  swap(&e.std_noret, &g.ssa_noret)
+  # group the candidates by function
+  var byfn: {Int: [Int]} = {}
+  var order: [Int] = []
+  for n in cand:
+    let fnode = encl.get(n, -1)
+    if fnode < 0: continue
+    if not (fnode in byfn):
+      byfn[fnode] = []
+      order.push(fnode)
+    byfn[fnode].push(n)
+  var built: {Int: Bool} = {}
+  for fnode in order:
+    # the outermost function first (its variables' owners)
+    let od = outer.get(fnode, fnode)
+    if od != fnode and not (od in built) and sc.k(g, pi, od) == ast.N_FUNCDECL and g.pk[pi].t.d[od] > 0:
+      built[od] = true
+      build_f(&g, fs, &e, od, fa(g, pi, od), g.pk[pi].t.c[od], g.pk[pi].t.d[od])
+    var f = ssa.F(fnode, false, [], [], [], [], [], [], [], [], [], 0, 0, [], false, {}, "", [], [], [], [], [], [], [], [], [], [])
+    if sc.k(g, pi, fnode) == ast.N_FUNCDECL:
+      if g.pk[pi].t.d[fnode] <= 0: continue
+      f = build_f(&g, fs, &e, fnode, fa(g, pi, fnode), g.pk[pi].t.c[fnode], g.pk[pi].t.d[fnode])
+    else: f = build_f(&g, fs, &e, fnode, -1, fa(g, pi, fnode), fb(g, pi, fnode))
+    built[fnode] = true
+    var reach: {Int: Bool} = {}
+    var stack = [0]
+    while stack.len > 0:
+      let b = stack.pop()
+      if b in reach: continue
+      reach[b] = true
+      for s in f.succ[b]: stack.push(s)
+    let w = ssa.lift(e, f, reach)
+    let gr = ssa.graph(f, reach)
+    var byid: {Int: Int} = {}
+    for i in 0..f.ok.len:
+      if ssa.is_use(f.ok[i]) and f.on[i] > 0 and not (f.on[i] in byid): byid[f.on[i]] = i
+    var nc = Nc(fnode, f, w, gr, {}, byid, {}, {}, {}, [])
+    swap(&nc.rhs, &rhs)
+    swap(&nc.encl, &encl)
+    for n in byfn[fnode]:
+      let cd = conds[n]
+      let lhs = ul(g, pi, fa(g, pi, cd))
+      nc.seen = {}
+      nc.tracked = []
+      var d = dv_other()
+      if sc.k(g, pi, lhs) == ast.N_IDENT and nc.byid.get(lhs, -1) < 0 and nc.byid.get(cd, -1) >= 0:
+        # (x == nil on a local pointer: its operation is the comparison's)
+        let o = sc.obj_of(g, pi, lhs)
+        let i = nc.byid[cd]
+        if o >= 0 and i in nc.w.kept and not ssa.unlifted(e, nc.w, o):
+          let vid = var_value(&g, &nc, o, i)
+          d = canon_var(&g, fs, &e, &nc, o, vid)
+      else: d = canon_expr(&g, fs, &e, &nc, lhs)
+      if not never_nil(&g, fs, &e, &nc, d, true): continue
+      var q = "always"
+      if g.pk[pi].t.f[cd] == T_EQL: q = "never"
+      let fallback = "this nil check is " + q + " true"
+      var tr: [Int] = []
+      for x in nc.tracked: tr.push(x)
+      tr.sort(by: fn(a, b) => (a < 0 and b >= 0) or (a >= 0 and b >= 0 and (g.pk[pi].t.file[a] < g.pk[pi].t.file[b] or (g.pk[pi].t.file[a] == g.pk[pi].t.file[b] and g.pk[pi].t.pos[a] < g.pk[pi].t.pos[b]))))
+      let lo = sc.obj_of(g, pi, lhs)
+      if sc.k(g, pi, lhs) == ast.N_IDENT and lo >= 0 and g.ok[lo] == tc.O_VAR:
+        let name = sc.nm(g, pi, lhs)
+        if d.kind == 1 or d.kind == 2: sc.report(g, &c, cd, "SA4031", "the checked variable contains a function and is never nil; did you mean to call it?")
+        else: sc.report(g, &c, cd, "SA4031", fallback)
+        if d.pok:
+          # (golangci-lint puts related information from another file at the issue)
+          var at: [Int] = []
+          for x in tr:
+            if x >= 0 and g.pk[pi].t.file[x] == g.pk[pi].t.file[cd]: at.push(x)
+            else: at.push(cd)
+          if at.len == 1: rel_report(g, &c, at[0], "SA4031", "this is the value of " + name)
+          else:
+            for x in at: rel_report(g, &c, x, "SA4031", "this is one of the value of " + name)
+      elif d.kind == 1: sc.report(g, &c, cd, "SA4031", "functions are never nil; did you mean to call it?")
+      else: sc.report(g, &c, cd, "SA4031", fallback)
+    swap(&nc.rhs, &rhs)
+    swap(&nc.encl, &encl)
+  swap(&e.std_pure, &g.ssa_pure)
+  swap(&e.std_noret, &g.ssa_noret)
+# ---- SA4023: the IR builder of ssa.vu (st, ex, cond, assign), copied with hooks: each return
+# statement's block and each condition's comparison and its block
+
+type Hk:
+  rets: [Int]
+  rblk: [Int]
+  leaves: [Int]
+  lblk: [Int]
+
+fn b_root_esc(var g: tc.Prog, fs: Fs, var e: ssa.E, var f: ssa.F, var hk: Hk, n0: Int):
+  let pi = e.pi
+  let n = ssa.unparen(g, pi, n0)
+  let k = ssa.kk(g, pi, n)
+  if k == ast.N_IDENT:
+    let o = ssa.obj(g, pi, n)
+    if o >= 0 and o in e.owner:
+      if e.owner[o] == f.fnode: ssa.op(&f, ssa.ESC, o, n, -1, -1, -1)
+      else: e.esc_log.push(o)
+    return
+  if k == ast.N_SELECTOR and g.pk[pi].skind.get(n, 0) == tc.S_FIELD and ssa.under_kind(&g, fs, pi, ssa.fa(g, pi, n)) == tc.TY_STRUCT:
+    b_root_esc(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    return
+  if k == ast.N_INDEX and ssa.under_kind(&g, fs, pi, ssa.fa(g, pi, n)) == tc.TY_ARRAY:
+    b_root_esc(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    b_ex(&g, fs, &e, &f, &hk, ssa.fb(g, pi, n))
+    return
+  b_ex(&g, fs, &e, &f, &hk, n)
+
+fn b_deref(var g: tc.Prog, fs: Fs, var e: ssa.E, var f: ssa.F, var hk: Hk, x0: Int, at: Int) -> Bool:
+  let pi = e.pi
+  let x = ssa.unparen(g, pi, x0)
+  if ssa.kk(g, pi, x) != ast.N_IDENT or ssa.under_kind(&g, fs, pi, x) != tc.TY_PTR: return false
+  let o = ssa.local(g, &e, f, x)
+  if o < 0: return false
+  ssa.op(&f, ssa.DEREF, o, at, -1, -1, -1)
+  return true
+
+fn b_cond(var g: tc.Prog, fs: Fs, var e: ssa.E, var f: ssa.F, var hk: Hk, n0: Int, t: Int, fl: Int):
+  let pi = e.pi
+  let n = ssa.unparen(g, pi, n0)
+  let k = ssa.kk(g, pi, n)
+  if k == ast.N_UNARY and ssa.ff(g, pi, n) == T_NOT:
+    b_cond(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n), fl, t)
+    return
+  if k == ast.N_BINARY and (ssa.ff(g, pi, n) == T_LAND or ssa.ff(g, pi, n) == T_LOR):
+    let m = ssa.nb(&f)
+    if ssa.ff(g, pi, n) == T_LAND: b_cond(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n), m, fl)
+    else: b_cond(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n), t, m)
+    f.cur = m
+    b_cond(&g, fs, &e, &f, &hk, ssa.fb(g, pi, n), t, fl)
+    return
+  var done = false
+  if k == ast.N_BINARY and (ssa.ff(g, pi, n) == T_EQL or ssa.ff(g, pi, n) == T_NEQ):
+    var x = ssa.unparen(g, pi, ssa.fa(g, pi, n))
+    var y = ssa.unparen(g, pi, ssa.fb(g, pi, n))
+    if ssa.is_nil(g, pi, x):
+      let tmp = x
+      x = y
+      y = tmp
+    if ssa.is_nil(g, pi, y) and ssa.kk(g, pi, x) == ast.N_IDENT and ssa.under_kind(&g, fs, pi, x) == tc.TY_PTR:
+      let o = ssa.local(g, &e, f, x)
+      if o >= 0:
+        ssa.op(&f, ssa.CHECK, o, n, -1, -1, -1)
+        done = true
+  if not done: b_ex(&g, fs, &e, &f, &hk, n)
+  let c = f.cur
+  if k == ast.N_BINARY and (ssa.ff(g, pi, n) == T_EQL or ssa.ff(g, pi, n) == T_NEQ):
+    hk.leaves.push(n)
+    hk.lblk.push(c)
+  ssa.edge(&f, c, t)
+  ssa.edge(&f, c, fl)
+
+fn b_ex(var g: tc.Prog, fs: Fs, var e: ssa.E, var f: ssa.F, var hk: Hk, n: Int):
+  if n <= 0: return
+  let pi = e.pi
+  let k = ssa.kk(g, pi, n)
+  if k == ast.N_LIST:
+    for x in ssa.its(g, pi, n): b_ex(&g, fs, &e, &f, &hk, x)
+    return
+  if k == ast.N_IDENT:
+    ssa.use_id(g, &e, &f, n)
+    return
+  if k == ast.N_BASICLIT: return
+  if k == ast.N_FUNCLIT:
+    let mark = e.esc_log.len
+    ssa.func_body(&g, fs, &e, n, -1, ssa.fa(g, pi, n), ssa.fb(g, pi, n), f.rep)
+    ssa.captures(&e, &f, mark, n)
+    return
+  if k == ast.N_UNARY and ssa.ff(g, pi, n) == T_AND:
+    b_root_esc(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    return
+  if k == ast.N_STAR:
+    if b_deref(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n), n): return
+    b_ex(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    return
+  if k == ast.N_SELECTOR:
+    let base = ssa.fa(g, pi, n)
+    let sk = g.pk[pi].skind.get(n, 0)
+    if sk == tc.S_PKG: return
+    if sk == tc.S_FIELD and b_deref(&g, fs, &e, &f, &hk, base, ssa.fb(g, pi, n)): return
+    if sk == tc.S_METHOD:
+      let m0 = g.pk[pi].sobj.get(n, -1)
+      if m0 >= 0 and not ssa.ptr_method(g, g.oorig[m0]) and b_deref(&g, fs, &e, &f, &hk, base, ssa.fb(g, pi, n)): return
+    if sk == tc.S_FIELD and ssa.under_kind(&g, fs, pi, base) == tc.TY_STRUCT:
+      b_root_esc(&g, fs, &e, &f, &hk, base)
+      return
+    if sk == tc.S_METHOD:
+      let bk = ssa.under_kind(&g, fs, pi, base)
+      let m = g.pk[pi].sobj.get(n, -1)
+      if bk != tc.TY_PTR and bk != tc.TY_IFACE and bk != tc.TY_TPARAM and (m < 0 or ssa.ptr_method(g, g.oorig[m])):
+        b_root_esc(&g, fs, &e, &f, &hk, base)
+        return
+    b_ex(&g, fs, &e, &f, &hk, base)
+    return
+  if k == ast.N_INDEX or k == ast.N_SLICE:
+    let base = ssa.fa(g, pi, n)
+    if ssa.under_kind(&g, fs, pi, base) == tc.TY_ARRAY: b_root_esc(&g, fs, &e, &f, &hk, base)
+    elif not (k == ast.N_INDEX and b_deref(&g, fs, &e, &f, &hk, base, n)): b_ex(&g, fs, &e, &f, &hk, base)
+    b_ex(&g, fs, &e, &f, &hk, ssa.fb(g, pi, n))
+    if k == ast.N_SLICE:
+      b_ex(&g, fs, &e, &f, &hk, ssa.fc(g, pi, n))
+      b_ex(&g, fs, &e, &f, &hk, ssa.fd(g, pi, n))
+    return
+  if k == ast.N_CALL:
+    b_ex(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    b_ex(&g, fs, &e, &f, &hk, ssa.fb(g, pi, n))
+    if ssa.noreturn_call(&g, fs, &e, n): ssa.terminate(&f)
+    return
+  if k == ast.N_COMPOSITE:
+    b_ex(&g, fs, &e, &f, &hk, ssa.fb(g, pi, n))
+    return
+  if k == ast.N_TYPEASSERT:
+    b_ex(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    return
+  if k >= ast.N_FIELD and k <= ast.N_ELLIPSIS: return
+  for c in [ssa.fa(g, pi, n), ssa.fb(g, pi, n), ssa.fc(g, pi, n), ssa.fd(g, pi, n)]:
+    if c > 0: b_ex(&g, fs, &e, &f, &hk, c)
+
+fn b_stmts(var g: tc.Prog, fs: Fs, var e: ssa.E, var f: ssa.F, var hk: Hk, l: Int):
+  for s in ssa.its(g, e.pi, l): b_st(&g, fs, &e, &f, &hk, s)
+
+fn b_st(var g: tc.Prog, fs: Fs, var e: ssa.E, var f: ssa.F, var hk: Hk, n: Int):
+  if n <= 0: return
+  let pi = e.pi
+  let k = ssa.kk(g, pi, n)
+  let lbl = ssa.take_label(&f)
+  if k == ast.N_LIST or k == ast.N_BLOCK:
+    var l = n
+    if k == ast.N_BLOCK: l = ssa.fa(g, pi, n)
+    b_stmts(&g, fs, &e, &f, &hk, l)
+  elif k == ast.N_EXPRSTMT:
+    let x = ssa.unparen(g, pi, ssa.fa(g, pi, n))
+    if ssa.kk(g, pi, x) == ast.N_CALL:
+      f.calls.push(x)
+      f.cblk.push(f.cur)
+    b_ex(&g, fs, &e, &f, &hk, x)
+  elif k == ast.N_DECLSTMT:
+    let gd = ssa.fa(g, pi, n)
+    if ssa.ff(g, pi, gd) == K_VAR:
+      for sp in ssa.its(g, pi, ssa.fa(g, pi, gd)):
+        let vals = ssa.its(g, pi, ssa.fc(g, pi, sp))
+        for v in vals: b_ex(&g, fs, &e, &f, &hk, v)
+        let ids = ssa.its(g, pi, ssa.fa(g, pi, sp))
+        for i in 0..ids.len:
+          ssa.decl(g, &e, f, ids[i])
+          let o = ssa.local(g, &e, f, ids[i])
+          if o < 0: continue
+          var rc = -1
+          if vals.len == ids.len:
+            let v = ssa.unparen(g, pi, vals[i])
+            if ssa.kk(g, pi, v) == ast.N_CALL: rc = v
+          ssa.op(&f, ssa.DEF, o, ids[i], -1, rc, -1)
+  elif k == ast.N_ASSIGN:
+    b_assign(&g, fs, &e, &f, &hk, n)
+  elif k == ast.N_INCDEC:
+    let x = ssa.unparen(g, pi, ssa.fa(g, pi, n))
+    let o = ssa.local(g, &e, f, x)
+    if o >= 0:
+      ssa.op(&f, ssa.USE, o, x, -1, -1, -1)
+      ssa.op(&f, ssa.DEF, o, x, -1, -1, -1)
+    else: b_ex(&g, fs, &e, &f, &hk, x)
+  elif k == ast.N_SEND:
+    b_ex(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    b_ex(&g, fs, &e, &f, &hk, ssa.fb(g, pi, n))
+  elif k == ast.N_GO or k == ast.N_DEFER:
+    if k == ast.N_DEFER: f.has_defer = true
+    let call = ssa.unparen(g, pi, ssa.fa(g, pi, n))
+    if ssa.kk(g, pi, call) == ast.N_CALL:
+      b_ex(&g, fs, &e, &f, &hk, ssa.fa(g, pi, call))
+      b_ex(&g, fs, &e, &f, &hk, ssa.fb(g, pi, call))
+    else: b_ex(&g, fs, &e, &f, &hk, call)
+  elif k == ast.N_RETURN:
+    let rs = ssa.its(g, pi, ssa.fa(g, pi, n))
+    for r in rs: b_ex(&g, fs, &e, &f, &hk, r)
+    hk.rets.push(n)
+    hk.rblk.push(f.cur)
+    if rs.len > 0:
+      var rl: [Int] = []
+      for r in f.results: rl.push(r)
+      for r in rl: ssa.op(&f, ssa.DEF, r, -1, -1, -1, -1)
+    ssa.jump(&f, f.exit)
+  elif k == ast.N_BRANCH:
+    let tok = ssa.ff(g, pi, n)
+    var l = ""
+    if ssa.fa(g, pi, n) > 0: l = ssa.name(g, pi, ssa.fa(g, pi, n))
+    if tok == K_BREAK or tok == K_CONTINUE:
+      let to = ssa.find_jump(f, l, tok == K_CONTINUE)
+      if to >= 0: ssa.jump(&f, to)
+      else: ssa.jump(&f, f.exit)
+    elif tok == K_GOTO:
+      let to = ssa.label_block(&f, l)
+      ssa.jump(&f, to)
+  elif k == ast.N_LABELED:
+    let lb = ssa.label_block(&f, ssa.name(g, pi, ssa.fa(g, pi, n)))
+    let c = f.cur
+    ssa.edge(&f, c, lb)
+    f.cur = lb
+    f.plabel = ssa.name(g, pi, ssa.fa(g, pi, n))
+    b_st(&g, fs, &e, &f, &hk, ssa.fb(g, pi, n))
+  elif k == ast.N_IF:
+    b_st(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    let tb = ssa.nb(&f)
+    let eb = ssa.nb(&f)
+    b_cond(&g, fs, &e, &f, &hk, ssa.fb(g, pi, n), tb, eb)
+    f.cur = tb
+    b_st(&g, fs, &e, &f, &hk, ssa.fc(g, pi, n))
+    let te = f.cur
+    var ee = eb
+    var j = eb
+    if ssa.fd(g, pi, n) > 0:
+      f.cur = eb
+      b_st(&g, fs, &e, &f, &hk, ssa.fd(g, pi, n))
+      ee = f.cur
+      j = ssa.nb(&f)
+      ssa.edge(&f, ee, j)
+    ssa.edge(&f, te, j)
+    f.cur = j
+  elif k == ast.N_FOR:
+    b_st(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    let h = ssa.nb(&f)
+    let c0 = f.cur
+    ssa.edge(&f, c0, h)
+    f.cur = h
+    let body = ssa.nb(&f)
+    let after = ssa.nb(&f)
+    if ssa.fb(g, pi, n) > 0: b_cond(&g, fs, &e, &f, &hk, ssa.fb(g, pi, n), body, after)
+    else: ssa.edge(&f, h, body)
+    let post = ssa.nb(&f)
+    ssa.push_jump(&f, lbl, after, post)
+    f.cur = body
+    b_st(&g, fs, &e, &f, &hk, ssa.fd(g, pi, n))
+    let be = f.cur
+    ssa.edge(&f, be, post)
+    f.cur = post
+    b_st(&g, fs, &e, &f, &hk, ssa.fc(g, pi, n))
+    let pe = f.cur
+    ssa.edge(&f, pe, h)
+    ssa.pop_jump(&f)
+    f.cur = after
+  elif k == ast.N_RANGE:
+    let x = ssa.fc(g, pi, n)
+    let xk = ssa.under_kind(&g, fs, pi, x)
+    if xk == tc.TY_ARRAY: b_root_esc(&g, fs, &e, &f, &hk, x)
+    else: b_ex(&g, fs, &e, &f, &hk, x)
+    let h = ssa.nb(&f)
+    let c0 = f.cur
+    ssa.edge(&f, c0, h)
+    let body = ssa.nb(&f)
+    ssa.edge(&f, h, body)
+    let after = ssa.nb(&f)
+    ssa.edge(&f, h, after)
+    f.cur = body
+    for kv in [ssa.fa(g, pi, n), ssa.fb(g, pi, n)]:
+      if kv <= 0: continue
+      if ssa.ff(g, pi, n) == T_DEFINE: ssa.decl(g, &e, f, kv)
+      let o = ssa.local(g, &e, f, kv)
+      if o >= 0: ssa.op(&f, ssa.DEF, o, kv, -1, -1, -1)
+      elif ssa.kk(g, pi, kv) != ast.N_IDENT: b_ex(&g, fs, &e, &f, &hk, kv)
+    ssa.push_jump(&f, lbl, after, h)
+    # the body of a range over a function is a closure in the IR
+    let saved = f.fnode
+    let mark = e.esc_log.len
+    if xk == tc.TY_FUNC: f.fnode = n
+    b_st(&g, fs, &e, &f, &hk, ssa.fd(g, pi, n))
+    f.fnode = saved
+    if xk == tc.TY_FUNC: ssa.captures(&e, &f, mark, n)
+    let be = f.cur
+    ssa.edge(&f, be, h)
+    ssa.pop_jump(&f)
+    f.cur = after
+  elif k == ast.N_SWITCH or k == ast.N_TYPESWITCH:
+    b_st(&g, fs, &e, &f, &hk, ssa.fa(g, pi, n))
+    let gu = ssa.fb(g, pi, n)
+    if k == ast.N_TYPESWITCH and ssa.kk(g, pi, gu) == ast.N_ASSIGN:
+      for r in ssa.its(g, pi, ssa.fb(g, pi, gu)):
+        let ru = ssa.unparen(g, pi, r)
+        if ssa.kk(g, pi, ru) == ast.N_TYPEASSERT: b_ex(&g, fs, &e, &f, &hk, ssa.fa(g, pi, ru))
+        else: b_ex(&g, fs, &e, &f, &hk, ru)
+    elif k == ast.N_TYPESWITCH: b_st(&g, fs, &e, &f, &hk, gu)
+    else: b_ex(&g, fs, &e, &f, &hk, gu)
+    let cases = ssa.its(g, pi, ssa.fc(g, pi, n))
+    let after = ssa.nb(&f)
+    var bl: [Int] = []
+    for c in cases: bl.push(ssa.nb(&f))
+    if k == ast.N_SWITCH and gu <= 0:
+      # switch { case c: ... }: a chain of branches, then the default
+      var dfi = -1
+      for i in 0..cases.len:
+        if ssa.fa(g, pi, cases[i]) < 0:
+          dfi = i
+          continue
+        for x in ssa.its(g, pi, ssa.fa(g, pi, cases[i])):
+          let next = ssa.nb(&f)
+          b_cond(&g, fs, &e, &f, &hk, x, bl[i], next)
+          f.cur = next
+      let last = f.cur
+      if dfi >= 0: ssa.edge(&f, last, bl[dfi])
+      else: ssa.edge(&f, last, after)
+    else:
+      var dflt = false
+      for c in cases:
+        if ssa.fa(g, pi, c) < 0: dflt = true
+        elif k == ast.N_SWITCH: b_ex(&g, fs, &e, &f, &hk, ssa.fa(g, pi, c))
+      let h = f.cur
+      if not dflt: ssa.edge(&f, h, after)
+      for b in bl: ssa.edge(&f, h, b)
+    ssa.push_jump(&f, lbl, after, -1)
+    for i in 0..cases.len:
+      f.cur = bl[i]
+      let body = ssa.its(g, pi, ssa.fb(g, pi, cases[i]))
+      b_stmts(&g, fs, &e, &f, &hk, ssa.fb(g, pi, cases[i]))
+      let ce = f.cur
+      var fall = false
+      if body.len > 0:
+        let last = body[body.len - 1]
+        if ssa.kk(g, pi, last) == ast.N_BRANCH and ssa.ff(g, pi, last) == K_FALLTHROUGH: fall = true
+      if fall and i + 1 < cases.len: ssa.edge(&f, ce, bl[i + 1])
+      else: ssa.edge(&f, ce, after)
+    ssa.pop_jump(&f)
+    f.cur = after
+  elif k == ast.N_SELECT:
+    let cases = ssa.its(g, pi, ssa.fa(g, pi, n))
+    for c in cases:
+      let comm = ssa.fa(g, pi, c)
+      if comm < 0: continue
+      let ck = ssa.kk(g, pi, comm)
+      if ck == ast.N_SEND:
+        b_ex(&g, fs, &e, &f, &hk, ssa.fa(g, pi, comm))
+        b_ex(&g, fs, &e, &f, &hk, ssa.fb(g, pi, comm))
+      elif ck == ast.N_EXPRSTMT: b_ex(&g, fs, &e, &f, &hk, ssa.fa(g, pi, comm))
+      elif ck == ast.N_ASSIGN: b_ex(&g, fs, &e, &f, &hk, ssa.fb(g, pi, comm))
+    if cases.len == 0:
+      ssa.terminate(&f)
+      return
+    let h = f.cur
+    let after = ssa.nb(&f)
+    ssa.push_jump(&f, lbl, after, -1)
+    for c in cases:
+      let b = ssa.nb(&f)
+      ssa.edge(&f, h, b)
+      f.cur = b
+      let comm = ssa.fa(g, pi, c)
+      if comm > 0 and ssa.kk(g, pi, comm) == ast.N_ASSIGN:
+        for x in ssa.its(g, pi, ssa.fa(g, pi, comm)):
+          if ssa.ff(g, pi, comm) == T_DEFINE: ssa.decl(g, &e, f, x)
+          let o = ssa.local(g, &e, f, x)
+          if o >= 0: ssa.op(&f, ssa.DEF, o, x, -1, -1, -1)
+          elif ssa.kk(g, pi, x) != ast.N_IDENT: b_ex(&g, fs, &e, &f, &hk, x)
+      b_stmts(&g, fs, &e, &f, &hk, ssa.fb(g, pi, c))
+      let ce = f.cur
+      ssa.edge(&f, ce, after)
+    ssa.pop_jump(&f)
+    f.cur = after
+  elif k == ast.N_EMPTY or k == ast.N_BAD: return
+  else: b_ex(&g, fs, &e, &f, &hk, n)
+
+fn b_assign(var g: tc.Prog, fs: Fs, var e: ssa.E, var f: ssa.F, var hk: Hk, n: Int):
+  let pi = e.pi
+  let lhs = ssa.its(g, pi, ssa.fa(g, pi, n))
+  let rhs = ssa.its(g, pi, ssa.fb(g, pi, n))
+  let tok = ssa.ff(g, pi, n)
+  if tok != T_ASSIGN and tok != T_DEFINE:
+    for r in rhs: b_ex(&g, fs, &e, &f, &hk, r)
+    let x = ssa.unparen(g, pi, lhs[0])
+    let o = ssa.local(g, &e, f, x)
+    if o >= 0:
+      ssa.op(&f, ssa.USE, o, x, -1, -1, -1)
+      ssa.op(&f, ssa.DEF, o, x, -1, -1, -1)
+    elif ssa.kk(g, pi, x) != ast.N_IDENT: b_ex(&g, fs, &e, &f, &hk, x)
+    return
+  var rstart: [Int] = []
+  for r in rhs:
+    rstart.push(f.ok.len)
+    b_ex(&g, fs, &e, &f, &hk, r)
+  for i in 0..lhs.len:
+    let x = ssa.unparen(g, pi, lhs[i])
+    if ssa.kk(g, pi, x) == ast.N_IDENT: continue
+    if ssa.kk(g, pi, x) == ast.N_STAR and i < rhs.len and b_deref(&g, fs, &e, &f, &hk, ssa.fa(g, pi, x), rhs[i]): continue
+    b_ex(&g, fs, &e, &f, &hk, x)
+  for i in 0..lhs.len:
+    let x = ssa.unparen(g, pi, lhs[i])
+    if ssa.kk(g, pi, x) != ast.N_IDENT or ssa.name(g, pi, x) == "_": continue
+    if tok == T_DEFINE: ssa.decl(g, &e, f, x)
+    let o = ssa.local(g, &e, f, x)
+    if o < 0: continue
+    if lhs.len > 1 and rhs.len == 1:
+      ssa.op(&f, ssa.DEFX, o, x, n, -1, -1)
+      continue
+    if i >= rhs.len: continue
+    let r = ssa.unparen(g, pi, rhs[i])
+    var kind = ssa.DEFC
+    var ro = -1
+    var rc = -1
+    let rk = ssa.kk(g, pi, r)
+    if rk == ast.N_FUNCLIT or ssa.is_const(&g, fs, pi, r): kind = ssa.DEF
+    if rk == ast.N_IDENT:
+      let o2 = ssa.obj(g, pi, r)
+      if o2 >= 0 and g.ok[o2] != tc.O_VAR: kind = ssa.DEF
+      # the operation reading it (its value is what's assigned)
+      if o2 >= 0 and o2 in e.owner and rstart[i] < f.ok.len and f.ok[rstart[i]] == ssa.USE and f.oo[rstart[i]] == o2: ro = rstart[i]
+    if rk == ast.N_CALL: rc = r
+    ssa.op(&f, kind, o, x, n, rc, ro)
+
+# staticcheck v0.8.1's nilness facts for the standard library's exported functions (go1.27.3,
+# linux/amd64), from a dumper built inside a copy of honnef.co/go/tools v0.8.1 (as tools/dumpfacts
+# is): name=each result's inner and outer nilness (0 none, 1 never, 2 always, 3 maybe through a
+# global, 4 maybe); functions with no fact aren't listed
+fn nil_std() -> Str:
+  return " (*archive/tar.Header).FileInfo=11 (*archive/zip.FileHeader).FileInfo=11 (*bufio.Reader).ReadBytes=41,44 (*bufio.Reader).UnreadByte=24 (*bufio.Reader).UnreadRune=24 (*bufio.Scanner).Err=24 (*bufio.Writer).Write=01,24 (*bufio.Writer).WriteByte=24 (*bufio.Writer).WriteRune=01,24 (*bufio.Writer).WriteString=01,24 (*bytes.Buffer).Peek=44,24 (*bytes.Buffer).Read=01,24 (*bytes.Buffer).ReadByte=01,24 (*bytes.Buffer).ReadBytes=44,24 (*bytes.Buffer).ReadRune=01,01,24 (*bytes.Buffer).ReadString=01,24 (*bytes.Buffer).UnreadByte=24 (*bytes.Buffer).Write=01,22 (*bytes.Buffer).WriteByte=22 (*bytes.Buffer).WriteRune=01,22 (*bytes.Buffer).WriteString=01,22 (*bytes.Reader).Read=01,24 (*bytes.Reader).ReadByte=01,24 (*bytes.Reader).ReadRune=01,01,24 (*compress/flate.Writer).Close=24 (*compress/gzip.Reader).Read=01,24 (*compress/gzip.Writer).Close=24 (*compress/gzip.Writer).Flush=24 (*compress/lzw.Reader).Close=22 (*compress/lzw.Reader).Read=01,24 (*container/list.List).Init=41 (*container/list.List).PushBack=41 (*container/list.List).PushFront=41 (*crypto/ecdh.PrivateKey).Bytes=41 (*crypto/ecdh.PrivateKey).Public=41 (*crypto/ecdh.PublicKey).Bytes=41 (*crypto/ecdsa.PrivateKey).Public=11 (*crypto/mldsa.PrivateKey).Bytes=41 (*crypto/mldsa.PrivateKey).Public=11 (*crypto/mldsa.PrivateKey).PublicKey=41 (*crypto/mlkem.DecapsulationKey1024).Bytes=41 (*crypto/mlkem.DecapsulationKey1024).EncapsulationKey=41 (*crypto/mlkem.DecapsulationKey1024).Encapsulator=11 (*crypto/mlkem.DecapsulationKey768).Bytes=41 (*crypto/mlkem.DecapsulationKey768).EncapsulationKey=41 (*crypto/mlkem.DecapsulationKey768).Encapsulator=11 (*crypto/mlkem.EncapsulationKey1024).Encapsulate=41,44 (*crypto/mlkem.EncapsulationKey768).Encapsulate=41,44 (*crypto/rsa.PrivateKey).Public=11 (*crypto/sha3.SHA3).AppendBinary=44,22 (*crypto/sha3.SHA3).Clone=11,22 (*crypto/sha3.SHA3).MarshalBinary=44,22 (*crypto/sha3.SHA3).Write=01,22 (*crypto/sha3.SHAKE).AppendBinary=44,24 (*crypto/sha3.SHAKE).MarshalBinary=44,24 (*crypto/sha3.SHAKE).Read=01,22 (*crypto/sha3.SHAKE).Write=01,22 (*crypto/tls.ClientSessionState).ResumptionState=44,44,22 (*crypto/tls.Config).DecryptTicket=44,22 (*crypto/tls.QUICConn).Close=24 (*crypto/tls.SessionState).Bytes=44,24 (*crypto/x509.CertPool).Clone=41 (*crypto/x509.CertPool).Subjects=41 (*crypto/x509.OID).UnmarshalBinary=24 (*crypto/x509.OID).UnmarshalText=24 (*database/sql.Conn).QueryContext=44,24 (*database/sql.Conn).QueryRowContext=41 (*database/sql.DB).Conn=44,24 (*database/sql.DB).QueryRow=41 (*database/sql.DB).QueryRowContext=41 (*database/sql.Stmt).QueryRow=41 (*database/sql.Stmt).QueryRowContext=41 (*database/sql.Tx).QueryRow=41 (*database/sql.Tx).QueryRowContext=41 (*database/sql.Valuer_P).Value=11,22 (*debug/dwarf.Data).AddSection=22 (*debug/dwarf.Data).AddTypes=24 (*debug/dwarf.Data).Reader=41 (*debug/dwarf.Entry).Val=24 (*debug/dwarf.LineReader).Next=24 (*debug/dwarf.LineReader).SeekPC=24 (*debug/dwarf.Reader).Next=44,24 (*debug/elf.Prog).Open=11 (*debug/elf.Section).Open=11 (*debug/macho.File).ImportedLibraries=44,22 (*debug/macho.Section).Open=11 (*debug/macho.Segment).Open=11 (*debug/pe.File).ImportedLibraries=42,22 (*debug/pe.Section).Open=11 (*debug/plan9obj.Section).Open=11 (*encoding/base32.Encoding).DecodeString=41,44 (*encoding/base64.Encoding).DecodeString=41,44 (*encoding/csv.Writer).Error=24 (*encoding/csv.Writer).Write=24 (*encoding/gob.ArrayStruct).GobEncode=41,22 (*encoding/gob.BinaryGobber).MarshalBinary=41,22 (*encoding/gob.ByteStruct).GobEncode=41,22 (*encoding/gob.Gobber).GobEncode=41,22 (*encoding/gob.StringStruct).GobEncode=41,22 (*encoding/gob.TextGobber).MarshalText=41,22 (*encoding/json.Decoder).Buffered=11 (*encoding/json.Ref).MarshalJSON=41,22 (*encoding/json.Ref).UnmarshalJSON=22 (*encoding/json.RefText).MarshalText=41,22 (*encoding/json.RefText).UnmarshalText=22 (*encoding/json.SS).UnmarshalJSON=11 (*encoding/json/jsontext.Decoder).Options=11 (*encoding/json/jsontext.Encoder).Options=11 (*encoding/json/jsontext.FaultyBuffer).Read=01,24 (*encoding/json/jsontext.FaultyBuffer).Write=01,24 (*encoding/xml.MyAttr).UnmarshalXMLAttr=22 (*encoding/xml.MyMarshalerAttrTest).MarshalXMLAttr=01,22 (*encoding/xml.MyMarshalerAttrTest).UnmarshalXMLAttr=22 (*encoding/xml.MyMarshalerTest).MarshalXML=22 (*flag.FlagSet).Bool=41 (*flag.FlagSet).Duration=41 (*flag.FlagSet).Float64=41 (*flag.FlagSet).Int=41 (*flag.FlagSet).Int64=41 (*flag.FlagSet).Output=34 (*flag.FlagSet).String=41 (*flag.FlagSet).Uint=41 (*flag.FlagSet).Uint64=41 (*go/doc.Package).Parser=41 (*go/doc.Package).Printer=41 (*go/types.Array).Underlying=41 (*go/types.Basic).Underlying=41 (*go/types.Chan).Underlying=41 (*go/types.Config).Check=41,44 (*go/types.Func).Signature=41 (*go/types.Interface).Complete=41 (*go/types.Interface).EmbeddedTypes=41 (*go/types.Interface).ExplicitMethods=41 (*go/types.Interface).Methods=41 (*go/types.Interface).Underlying=41 (*go/types.Map).Underlying=41 (*go/types.MethodSet).Methods=41 (*go/types.Named).Methods=41 (*go/types.Named).Underlying=24 (*go/types.Pointer).Underlying=41 (*go/types.Scope).Children=41 (*go/types.Scope).Names=41 (*go/types.Signature).Underlying=41 (*go/types.Slice).Underlying=41 (*go/types.StdSizes).Offsetsof=41 (*go/types.Struct).Fields=41 (*go/types.Struct).Underlying=41 (*go/types.Tuple).Underlying=41 (*go/types.Tuple).Variables=41 (*go/types.TypeList).Types=41 (*go/types.TypeParam).Underlying=11 (*go/types.TypeParamList).TypeParams=41 (*go/types.Union).Terms=41 (*go/types.Union).Underlying=41 (*hash/maphash.Hash).Clone=11,22 (*hash/maphash.Hash).Write=01,22 (*hash/maphash.Hash).WriteByte=22 (*hash/maphash.Hash).WriteString=01,22 (*html/template.T).Copy=41 (*html/template.T).MAdd=41 (*html/template.T).MyError=01,24 (*html/template.Template).Delims=41 (*html/template.Template).Funcs=41 (*html/template.Template).Option=41 (*image.Alpha).At=11 (*image.Alpha).ColorModel=43 (*image.Alpha).SubImage=11 (*image.Alpha16).At=11 (*image.Alpha16).ColorModel=43 (*image.Alpha16).SubImage=11 (*image.CMYK).At=11 (*image.CMYK).ColorModel=43 (*image.CMYK).SubImage=11 (*image.Gray).At=11 (*image.Gray).ColorModel=43 (*image.Gray).SubImage=11 (*image.Gray16).At=11 (*image.Gray16).ColorModel=43 (*image.Gray16).SubImage=11 (*image.NRGBA).At=11 (*image.NRGBA).ColorModel=43 (*image.NRGBA).SubImage=11 (*image.NRGBA64).At=11 (*image.NRGBA64).ColorModel=43 (*image.NRGBA64).SubImage=11 (*image.NYCbCrA).At=11 (*image.NYCbCrA).ColorModel=43 (*image.NYCbCrA).SubImage=11 (*image.Paletted).At=24 (*image.Paletted).ColorModel=41 (*image.Paletted).SubImage=11 (*image.RGBA).At=11 (*image.RGBA).ColorModel=43 (*image.RGBA).SubImage=11 (*image.RGBA64).At=11 (*image.RGBA64).ColorModel=43 (*image.RGBA64).SubImage=11 (*image.Uniform).ColorModel=41 (*image.YCbCr).At=11 (*image.YCbCr).ColorModel=43 (*image.YCbCr).SubImage=11 (*io.OffsetWriter).Seek=01,24 (*io.PipeReader).Close=22 (*io.PipeReader).CloseWithError=22 (*io.PipeWriter).Close=22 (*io.PipeWriter).CloseWithError=22 (*io.SectionReader).Seek=01,24 (*log/slog.JSONHandler).WithAttrs=11 (*log/slog.JSONHandler).WithGroup=11 (*log/slog.LevelVar).AppendText=44,22 (*log/slog.LevelVar).MarshalText=44,22 (*log/slog.MultiHandler).WithAttrs=11 (*log/slog.MultiHandler).WithGroup=11 (*log/slog.TextHandler).WithAttrs=11 (*log/slog.TextHandler).WithGroup=11 (*math/big.Float).Abs=41 (*math/big.Float).Add=41 (*math/big.Float).AppendText=44,22 (*math/big.Float).GobEncode=44,22 (*math/big.Float).MarshalText=44,22 (*math/big.Float).Mul=41 (*math/big.Float).Neg=41 (*math/big.Float).Quo=41 (*math/big.Float).Set=41 (*math/big.Float).SetFloat64=41 (*math/big.Float).SetInf=41 (*math/big.Float).SetInt=41 (*math/big.Float).SetInt64=41 (*math/big.Float).SetMantExp=41 (*math/big.Float).SetMode=41 (*math/big.Float).SetPrec=41 (*math/big.Float).SetRat=41 (*math/big.Float).SetUint64=41 (*math/big.Float).Sqrt=41 (*math/big.Float).Sub=41 (*math/big.Int).Abs=41 (*math/big.Int).Add=41 (*math/big.Int).And=41 (*math/big.Int).AndNot=41 (*math/big.Int).AppendText=44,22 (*math/big.Int).Bytes=41 (*math/big.Int).DivMod=44,41 (*math/big.Int).GobEncode=44,22 (*math/big.Int).Lsh=41 (*math/big.Int).MarshalJSON=44,22 (*math/big.Int).MarshalText=44,22 (*math/big.Int).Mod=41 (*math/big.Int).MulRange=41 (*math/big.Int).Neg=41 (*math/big.Int).Not=41 (*math/big.Int).Or=41 (*math/big.Int).Quo=41 (*math/big.Int).QuoRem=41,41 (*math/big.Int).Rand=41 (*math/big.Int).Rem=41 (*math/big.Int).Rsh=41 (*math/big.Int).SetBit=41 (*math/big.Int).SetBits=41 (*math/big.Int).SetBytes=41 (*math/big.Int).SetInt64=41 (*math/big.Int).SetUint64=41 (*math/big.Int).Sqrt=41 (*math/big.Int).Sub=41 (*math/big.Int).Xor=41 (*math/big.Rat).Abs=41 (*math/big.Rat).AppendText=44,22 (*math/big.Rat).Denom=41 (*math/big.Rat).Inv=41 (*math/big.Rat).MarshalText=44,22 (*math/big.Rat).Neg=41 (*math/big.Rat).Num=41 (*math/big.Rat).Set=41 (*math/big.Rat).SetInt=41 (*math/big.Rat).SetInt64=41 (*math/big.Rat).SetUint64=41 (*math/rand.Rand).Perm=41 (*math/rand.Rand).Read=01,22 (*math/rand/v2.ChaCha8).AppendBinary=44,22 (*math/rand/v2.ChaCha8).MarshalBinary=44,22 (*math/rand/v2.ChaCha8).Read=01,22 (*math/rand/v2.PCG).AppendBinary=44,22 (*math/rand/v2.PCG).MarshalBinary=44,22 (*math/rand/v2.PCG).UnmarshalBinary=24 (*mime/multipart.Part).Close=22 (*net.Buffers).Read=01,24 (*net/http.CrossOriginProtection).Check=24 (*net/http.CrossOriginProtection).Handler=11 (*net/http.Request).Clone=41 (*net/http.Request).Context=14 (*net/http.Request).Cookie=44,24 (*net/http.Request).Cookies=41 (*net/http.Request).CookiesNamed=41 (*net/http.Request).WithContext=41 (*net/http.Request).WithT=41 (*net/http.Response).Cookies=41 (*net/http.Transport).Clone=41 (*net/http/httptest.ResponseRecorder).Header=41 (*net/http/httptest.ResponseRecorder).Write=01,24 (*net/http/httptest.ResponseRecorder).WriteString=01,24 (*net/rpc.ArgNotPublic).ArgNotPublic=22 (*net/rpc.Arith).Add=22 (*net/rpc.Arith).Mul=22 (*net/rpc.Arith).SleepMilli=22 (*net/rpc.Arith).String=22 (*net/rpc.Client).Go=41 (*net/rpc.CodecEmulator).Close=22 (*net/rpc.CodecEmulator).ReadRequestBody=24 (*net/rpc.CodecEmulator).ReadRequestHeader=22 (*net/rpc.CodecEmulator).WriteResponse=22 (*net/rpc.NeedsPtrType).NeedsPtrType=22 (*net/rpc.ReplyNotPointer).ReplyNotPointer=22 (*net/rpc.ReplyNotPublic).ReplyNotPublic=22 (*net/rpc.S).Recv=22 (*net/rpc/jsonrpc.Arith).Add=22 (*net/rpc/jsonrpc.Arith).Mul=22 (*net/textproto.Reader).DotReader=41 (*net/textproto.Writer).DotWriter=41 (*net/url.URL).AppendBinary=44,22 (*net/url.URL).JoinPath=41 (*net/url.URL).MarshalBinary=44,22 (*net/url.URL).Query=41 (*net/url.URL).ResolveReference=41 (*os.File).SyscallConn=44,24 (*os.ProcessState).Sys=11 (*os.ProcessState).SysUsage=41 (*os.Root).FS=41 (*plugin.Plugin).Lookup=22,11 (*regexp.Regexp).AppendText=44,22 (*regexp.Regexp).Copy=41 (*regexp.Regexp).MarshalText=44,22 (*regexp/syntax.Regexp).CapNames=41 (*runtime.AddrRanges).Ranges=41 (*runtime.MemProfileRecord).Stack=41 (*runtime.PageAlloc).InUse=41 (*runtime.PallocData).PallocBits=41 (*runtime.PallocData).Scavenged=41 (*runtime.StackRecord).Stack=41 (*strings.Builder).Write=01,22 (*strings.Builder).WriteByte=22 (*strings.Builder).WriteRune=01,22 (*strings.Builder).WriteString=01,22 (*strings.Reader).Read=01,24 (*strings.Reader).ReadByte=01,24 (*strings.Reader).ReadRune=01,01,24 (*sync.RWMutex).RLocker=41 (*sync/atomic.Value).Load=24 (*sync/atomic.Value).Swap=24 (*text/scanner.Scanner).Init=41 (*text/scanner.StringReader).Read=01,24 (*text/tabwriter.Writer).Init=41 (*text/template.T).Copy=41 (*text/template.T).MAdd=41 (*text/template.T).MyError=01,24 (*text/template.Template).Delims=41 (*text/template.Template).New=41 (*text/template/parse.ActionNode).Copy=11 (*text/template/parse.BoolNode).Copy=11 (*text/template/parse.BranchNode).Copy=11 (*text/template/parse.BreakNode).Copy=11 (*text/template/parse.ChainNode).Copy=11 (*text/template/parse.CommandNode).Copy=41 (*text/template/parse.CommentNode).Copy=11 (*text/template/parse.ContinueNode).Copy=11 (*text/template/parse.DotNode).Copy=11 (*text/template/parse.FieldNode).Copy=11 (*text/template/parse.IdentifierNode).Copy=11 (*text/template/parse.IdentifierNode).SetPos=41 (*text/template/parse.IdentifierNode).SetTree=41 (*text/template/parse.IfNode).Copy=11 (*text/template/parse.ListNode).Copy=41 (*text/template/parse.NilNode).Copy=11 (*text/template/parse.NumberNode).Copy=11 (*text/template/parse.PipeNode).Copy=41 (*text/template/parse.RangeNode).Copy=11 (*text/template/parse.StringNode).Copy=11 (*text/template/parse.TemplateNode).Copy=11 (*text/template/parse.TextNode).Copy=11 (*text/template/parse.VariableNode).Copy=11 (*text/template/parse.WithNode).Copy=11 (*uuid.UUID).UnmarshalText=24 (crypto/ed25519.PrivateKey).Public=11 (crypto/ed25519.PrivateKey).Seed=41 (crypto/x509.OID).AppendBinary=44,22 (crypto/x509.OID).AppendText=44,22 (crypto/x509.OID).MarshalBinary=44,22 (crypto/x509.OID).MarshalText=44,22 (database/sql.NullBool).Value=44,22 (database/sql.NullByte).Value=44,22 (database/sql.NullFloat64).Value=44,22 (database/sql.NullInt16).Value=44,22 (database/sql.NullInt32).Value=44,22 (database/sql.NullInt64).Value=44,22 (database/sql.NullString).Value=44,22 (database/sql.NullTime).Value=44,22 (database/sql.Valuer_V).Value=11,22 (database/sql/driver.RowsAffected).LastInsertId=01,11 (database/sql/driver.RowsAffected).RowsAffected=01,22 (encoding/base32.Encoding).WithPadding=41 (encoding/base64.Encoding).Strict=41 (encoding/base64.Encoding).WithPadding=41 (encoding/gob.BinaryValueGobber).MarshalBinary=41,22 (encoding/gob.TextValueGobber).MarshalText=41,22 (encoding/gob.ValueGobber).GobEncode=41,22 (encoding/json.C).MarshalJSON=41,22 (encoding/json.CText).MarshalText=41,22 (encoding/json.MustNotUnmarshalJSON).UnmarshalJSON=11 (encoding/json.MustNotUnmarshalText).UnmarshalText=11 (encoding/json.Val).MarshalJSON=41,22 (encoding/json.ValText).MarshalText=41,22 (encoding/json/jsontext.Pointer).Tokens=41 (encoding/json/jsontext.Value).MarshalJSON=41,22 (encoding/xml.Failure).UnmarshalXML=22 (go/ast.CommentMap).Comments=41 (html/template.ErrorWriter).Write=01,43 (image.Rectangle).At=11 (image.Rectangle).ColorModel=43 (image/color.Palette).Convert=24 (log/slog.Level).AppendText=44,22 (log/slog.Level).MarshalJSON=44,22 (log/slog.Level).MarshalText=44,22 (log/slog.Value).AsAny=24,01 (log/slog.Value).LogValuer=41 (math/big.Bits).Float=41 (net.SRVWriter).AddSRV=24 (net/netip.Addr).AppendBinary=44,22 (net/netip.Addr).AppendText=44,22 (net/netip.Addr).MarshalBinary=44,22 (net/netip.Addr).MarshalText=44,22 (net/netip.AddrPort).AppendBinary=44,24 (net/netip.AddrPort).AppendText=44,22 (net/netip.AddrPort).MarshalBinary=44,24 (net/netip.AddrPort).MarshalText=44,22 (net/netip.Prefix).AppendBinary=44,24 (net/netip.Prefix).AppendText=44,22 (net/netip.Prefix).MarshalBinary=44,24 (net/netip.Prefix).MarshalText=44,22 (net/rpc.BuiltinTypes).Array=22 (net/rpc.BuiltinTypes).Map=22 (net/rpc.BuiltinTypes).Slice=22 (net/rpc.WriteFailCodec).Close=22 (net/rpc.WriteFailCodec).WriteRequest=11 (net/rpc/jsonrpc.BuiltinTypes).Array=22 (net/rpc/jsonrpc.BuiltinTypes).Map=22 (net/rpc/jsonrpc.BuiltinTypes).Slice=22 (reflect.Value).Fields=41 (reflect.Value).MapKeys=41 (reflect.Value).MapRange=41 (reflect.Value).Methods=41 (reflect.Value).Seq=41 (reflect.Value).Seq2=41 (reflect.Value).Type=41 (text/template.ErrorWriter).Write=01,43 (time.Time).Location=43 (uuid.UUID).AppendText=44,22 (uuid.UUID).MarshalText=44,22 archive/tar.NewReader=41 archive/tar.NewWriter=41 archive/zip.FileInfoHeader=41,22 archive/zip.NewWriter=41 bufio.NewReadWriter=41 bufio.NewReader=41 bufio.NewReaderSize=41 bufio.NewScanner=41 bufio.NewWriter=41 bufio.NewWriterSize=41 bufio.ScanBytes=01,44,22 bufio.ScanLines=01,44,22 bufio.ScanRunes=01,44,22 bufio.ScanWords=01,44,22 bytes.Fields=41 bytes.FieldsFunc=41 bytes.FieldsFuncSeq=41 bytes.FieldsSeq=41 bytes.Lines=41 bytes.NewBuffer=41 bytes.NewBufferString=41 bytes.NewReader=41 bytes.Runes=41 bytes.SplitAfterSeq=41 bytes.SplitSeq=41 bytes.ToValidUTF8=41 cmp.Or=24 compress/bzip2.NewReader=11 compress/flate.NewReader=11 compress/flate.NewReaderDict=11 compress/lzw.NewReader=11 compress/lzw.NewWriter=11 compress/zlib.NewReader=44,24 compress/zlib.NewReaderDict=44,24 container/list.New=41 context.AfterFunc=41 context.Background=11 context.TODO=11 context.WithCancel=11,41 context.WithCancelCause=11,41 context.WithValue=11 context.WithoutCancel=11 crypto/cipher.NewCFBDecrypter=11 crypto/cipher.NewCFBEncrypter=11 crypto/cipher.NewOFB=11 crypto/ecdh.P256=31 crypto/ecdh.P384=31 crypto/ecdh.P521=31 crypto/ecdh.X25519=31 crypto/ed25519.NewKeyFromSeed=41 crypto/ed25519.Sign=41 crypto/elliptic.GenerateKey=41,44,44,44 crypto/elliptic.Marshal=41 crypto/elliptic.MarshalCompressed=41 crypto/elliptic.P224=31 crypto/elliptic.P256=31 crypto/elliptic.P384=31 crypto/elliptic.P521=31 crypto/hmac.New=41 crypto/hpke.AES128GCM=31 crypto/hpke.AES256GCM=31 crypto/hpke.ChaCha20Poly1305=31 crypto/hpke.DHKEM=31 crypto/hpke.ExportOnly=11 crypto/hpke.HKDFSHA256=31 crypto/hpke.HKDFSHA384=31 crypto/hpke.HKDFSHA512=31 crypto/hpke.MLKEM1024=31 crypto/hpke.MLKEM1024P384=31 crypto/hpke.MLKEM768=31 crypto/hpke.MLKEM768P256=31 crypto/hpke.MLKEM768X25519=31 crypto/hpke.SHAKE128=31 crypto/hpke.SHAKE256=31 crypto/md5.New=11 crypto/mldsa.GenerateKey=44,24 crypto/mldsa.NewPrivateKey=44,24 crypto/mldsa.NewPublicKey=44,24 crypto/mlkem.GenerateKey1024=44,24 crypto/mlkem.GenerateKey768=44,24 crypto/rand.Read=01,22 crypto/sha3.New224=41 crypto/sha3.New256=41 crypto/sha3.New384=41 crypto/sha3.New512=41 crypto/sha3.NewCSHAKE128=41 crypto/sha3.NewCSHAKE256=41 crypto/sha3.NewSHAKE128=41 crypto/sha3.NewSHAKE256=41 crypto/sha512.New512_224=11 crypto/sha512.New512_256=11 crypto/tls.CipherSuites=41 crypto/tls.Client=41 crypto/tls.InsecureCipherSuites=41 crypto/tls.NewLRUClientSessionCache=11 crypto/tls.NewListener=11 crypto/tls.NewResumptionState=41,22 crypto/tls.QUICClient=41 crypto/tls.QUICServer=41 crypto/tls.Server=41 crypto/x509.NewCertPool=41 crypto/x509.OIDFromInts=01,24 crypto/x509.ParseOID=01,24 database/sql.OpenDB=41 debug/gosym.NewLineTable=41 encoding/ascii85.NewDecoder=11 encoding/ascii85.NewEncoder=11 encoding/base32.NewDecoder=11 encoding/base32.NewEncoder=11 encoding/base32.NewEncoding=41 encoding/base64.NewDecoder=11 encoding/base64.NewEncoder=11 encoding/base64.NewEncoding=41 encoding/csv.NewReader=41 encoding/csv.NewWriter=41 encoding/gob.NewDecoder=41 encoding/gob.NewEncoder=41 encoding/hex.DecodeString=41,44 encoding/hex.Dumper=11 encoding/hex.NewDecoder=11 encoding/hex.NewEncoder=11 encoding/json.CallMethodsWithLegacySemantics=11 encoding/json.DefaultOptionsV1=11 encoding/json.FormatByteArrayAsArray=11 encoding/json.FormatBytesWithLegacySemantics=11 encoding/json.FormatDurationAsNano=11 encoding/json.MatchCaseSensitiveDelimiter=11 encoding/json.MergeWithLegacySemantics=11 encoding/json.NewDecoder=41 encoding/json.NewEncoder=41 encoding/json.OmitEmptyWithLegacySemantics=11 encoding/json.ParseBytesWithLooseRFC4648=11 encoding/json.ParseTimeWithLooseRFC3339=11 encoding/json.ReportErrorsWithLegacySemantics=11 encoding/json.StringifyWithLegacySemantics=11 encoding/json.UnmarshalArrayFromAnyLength=11 encoding/json/jsontext.AllowDuplicateNames=11 encoding/json/jsontext.AllowInvalidUTF8=11 encoding/json/jsontext.CanonicalizeRawFloats=11 encoding/json/jsontext.CanonicalizeRawInts=11 encoding/json/jsontext.E=41 encoding/json/jsontext.EscapeForHTML=11 encoding/json/jsontext.EscapeForJS=11 encoding/json/jsontext.Multiline=11 encoding/json/jsontext.NewDecoder=41 encoding/json/jsontext.NewEncoder=41 encoding/json/jsontext.PreserveRawStrings=11 encoding/json/jsontext.ReorderRawObjects=11 encoding/json/jsontext.SpaceAfterColon=11 encoding/json/jsontext.SpaceAfterComma=11 encoding/json/jsontext.WithIndent=11 encoding/json/jsontext.WithIndentPrefix=11 encoding/json/v2.DefaultOptionsV2=11 encoding/json/v2.Deterministic=11 encoding/json/v2.EM=41 encoding/json/v2.EU=41 encoding/json/v2.FormatNilMapAsNull=11 encoding/json/v2.FormatNilSliceAsNull=11 encoding/json/v2.GetOption=24,01 encoding/json/v2.JoinOptions=11 encoding/json/v2.MarshalFunc=41 encoding/json/v2.MarshalToFunc=41 encoding/json/v2.MatchCaseInsensitiveNames=11 encoding/json/v2.OmitZeroStructFields=11 encoding/json/v2.RejectUnknownMembers=11 encoding/json/v2.StringifyNumbers=11 encoding/json/v2.T=41 encoding/json/v2.UnmarshalFromFunc=41 encoding/json/v2.UnmarshalFunc=41 encoding/json/v2.WithMarshalers=41 encoding/json/v2.WithUnmarshalers=41 encoding/xml.NewDecoder=41 encoding/xml.NewEncoder=41 errors.New=11 expvar.Handler=11 expvar.NewFloat=41 expvar.NewInt=41 expvar.NewString=41 flag.Bool=41 flag.Duration=41 flag.Float64=41 flag.Int=41 flag.Int64=41 flag.NewFlagSet=41 flag.String=41 flag.Uint=41 flag.Uint64=41 fmt.Errorf=41 go/ast.MergePackageFiles=41 go/ast.NewIdent=41 go/ast.NewObj=41 go/ast.NewPackage=41,44 go/ast.NewScope=41 go/ast.Preorder=41 go/build.ArchChar=01,11 go/build/constraint.PlusBuildLines=44,24 go/constant.BinaryOp=11 go/constant.Bytes=41 go/constant.Denom=11 go/constant.Imag=14 go/constant.Make=11 go/constant.MakeBool=11 go/constant.MakeFloat64=11 go/constant.MakeFromBytes=11 go/constant.MakeFromLiteral=41 go/constant.MakeInt64=11 go/constant.MakeString=11 go/constant.MakeUint64=11 go/constant.MakeUnknown=11 go/constant.Num=14 go/constant.Shift=11 go/constant.ToComplex=11 go/doc.New=41 go/token.NewFileSet=41 go/types.NewAlias=41 go/types.NewArray=41 go/types.NewChan=41 go/types.NewChecker=41 go/types.NewConst=41 go/types.NewContext=41 go/types.NewField=41 go/types.NewFunc=41 go/types.NewInterface=41 go/types.NewInterfaceType=41 go/types.NewLabel=41 go/types.NewMap=41 go/types.NewMethodSet=41 go/types.NewNamed=41 go/types.NewPackage=41 go/types.NewParam=41 go/types.NewPkgName=41 go/types.NewPointer=41 go/types.NewScope=41 go/types.NewSignature=41 go/types.NewSignatureType=41 go/types.NewSlice=41 go/types.NewStruct=41 go/types.NewTerm=41 go/types.NewTypeName=41 go/types.NewTypeParam=41 go/types.NewUnion=41 go/types.NewVar=41 hash/adler32.New=11 hash/crc32.MakeTable=43 hash/crc32.New=11 hash/crc32.NewIEEE=11 hash/crc64.MakeTable=41 hash/crc64.New=11 hash/fnv.New128=11 hash/fnv.New128a=11 hash/fnv.New32=11 hash/fnv.New32a=11 hash/fnv.New64=11 hash/fnv.New64a=11 html/template.New=41 image.NewAlpha=41 image.NewAlpha16=41 image.NewCMYK=41 image.NewGray=41 image.NewGray16=41 image.NewNRGBA=41 image.NewNRGBA64=41 image.NewNYCbCrA=41 image.NewPaletted=41 image.NewRGBA=41 image.NewRGBA64=41 image.NewUniform=41 image.NewYCbCr=41 image/color.ModelFunc=11 image/gif.Encode=14 image/gif.EncodeAll=14 image/jpeg.Encode=14 image/png.Decode=24,44 index/suffixarray.New=41 io.LimitReader=11 io.MultiReader=11 io.MultiWriter=11 io.NewOffsetWriter=41 io.NewSectionReader=41 io.NopCloser=11 io.Pipe=41,41 io.TeeReader=11 io/ioutil.NopCloser=11 iter.Pull=41,41 iter.Pull2=41,41 log.Default=43 log.New=41 log/slog.New=41 log/slog.NewJSONHandler=41 log/slog.NewLogLogger=41 log/slog.NewMultiHandler=41 log/slog.NewTextHandler=41 maps.All=41 maps.Clone=24 maps.Collect=41 maps.Keys=41 maps.Values=41 math/big.NewFloat=41 math/big.NewInt=41 math/rand.New=41 math/rand.NewSource=11 math/rand.Perm=41 math/rand.Read=01,22 math/rand/v2.New=41 math/rand/v2.NewChaCha8=41 math/rand/v2.NewPCG=41 mime.ExtensionsByType=44,24 mime.ParseMediaType=01,44,24 mime/multipart.NewReader=41 mime/multipart.NewWriter=41 mime/quotedprintable.NewReader=41 mime/quotedprintable.NewWriter=41 net.IPv4=41 net.IPv4Mask=41 net.Pipe=11,11 net.TCPAddrFromAddrPort=41 net.UDPAddrFromAddrPort=41 net/http.AllowQuerySemicolons=11 net/http.FS=11 net/http.FileServer=11 net/http.FileServerFS=11 net/http.MaxBytesHandler=11 net/http.MaxBytesReader=11 net/http.NewCrossOriginProtection=41 net/http.NewFileTransport=11 net/http.NewFileTransportFS=11 net/http.NewResponseController=41 net/http.NewServeMux=41 net/http.NewTestTimeoutHandler=11 net/http.NotFoundHandler=11 net/http.ParseSetCookie=44,24 net/http.ProxyURL=41 net/http.RedirectHandler=11 net/http.ResponseWriterConnForTesting=24,01 net/http.TimeoutHandler=11 net/http/cookiejar.New=41,22 net/http/httptest.NewRecorder=41 net/http/httptest.NewRequest=41 net/http/httptest.NewRequestWithContext=41 net/http/httptest.NewServer=41 net/http/httptest.NewTLSServer=41 net/http/httptest.NewUnstartedServer=41 net/http/httptrace.WithClientTrace=11 net/http/httputil.NewChunkedReader=11 net/http/httputil.NewChunkedWriter=11 net/http/httputil.NewClientConn=41 net/http/httputil.NewProxyClientConn=41 net/http/httputil.NewServerConn=41 net/http/httputil.NewSingleHostReverseProxy=41 net/http/pprof.Handler=11 net/rpc.NewClient=41 net/rpc.NewClientWithCodec=41 net/rpc.NewServer=41 net/rpc/jsonrpc.NewClient=41 net/rpc/jsonrpc.NewClientCodec=11 net/rpc/jsonrpc.NewServerCodec=11 net/smtp.CRAMMD5Auth=11 net/smtp.PlainAuth=11 net/textproto.NewConn=41 net/textproto.NewReader=41 net/textproto.NewWriter=41 net/url.ParseQuery=41,44 net/url.User=41 net/url.UserPassword=41 os.DirFS=11 os.FindProcess=41,22 os/exec.Command=41 os/signal.NotifyContext=41,41 os/user.Current=44,24 path.Match=01,24 path/filepath.Localize=01,24 path/filepath.Match=01,24 plugin.Open=42,11 reflect.ArrayOf=41 reflect.ChanOf=41 reflect.MapOf=41 reflect.PointerTo=41 reflect.PtrTo=41 reflect.SliceOf=41 reflect.Swapper=41 reflect.TypeFor=41 regexp/syntax.Compile=44,22 runtime.CallersFrames=41 runtime.Dlog=41 runtime.Envs=43 runtime.GetPinnerLeakPanic=43 runtime.NewGCCPULimiter=41 runtime.NewGCController=41 runtime.NewPIController=41 runtime.NewProfBuf=41 runtime.NewScavengeIndex=41 runtime.NewUserArena=41 runtime.SemRootLock=41 runtime.VDSOSymbolKeys=41 runtime/debug.Stack=41 runtime/metrics.All=43 runtime/pprof.WithLabels=11 runtime/trace.NewFlightRecorder=41 runtime/trace.NewTask=11,41 runtime/trace.StartRegion=43 slices.All=41 slices.Backward=41 slices.Chunk=41 slices.Clone=24 slices.Repeat=41 slices.Values=41 sort.Reverse=11 strconv.QuotedPrefix=01,24 strconv.Unquote=01,24 strconv.UnquoteChar=01,01,01,24 strings.DumpTables=41,44 strings.Fields=41 strings.FieldsFunc=41 strings.FieldsFuncSeq=41 strings.FieldsSeq=41 strings.Lines=41 strings.NewReader=41 strings.NewReplacer=41 strings.SplitAfterSeq=41 strings.SplitSeq=41 sync.NewCond=41 sync.NewPoolChain=11 sync.NewPoolDequeue=11 sync.OnceFunc=41 sync.OnceValue=41 sync.OnceValues=41 syscall.GetInternalOrigRlimitNofile=41 syscall.GetsockoptICMPv6Filter=41,44 syscall.GetsockoptIPMreq=41,44 syscall.GetsockoptIPMreqn=41,44 syscall.GetsockoptIPv6MTUInfo=41,44 syscall.GetsockoptIPv6Mreq=41,44 syscall.GetsockoptUcred=41,44 syscall.LsfJump=41 syscall.LsfStmt=41 syscall.StringBytePtr=41 syscall.StringSlicePtr=41 syscall.UnixCredentials=41 syscall.UnixRights=41 testing.MainStart=41 testing/iotest.DataErrReader=11 testing/iotest.ErrReader=11 testing/iotest.HalfReader=11 testing/iotest.NewReadLogger=11 testing/iotest.NewWriteLogger=11 testing/iotest.OneByteReader=11 testing/iotest.TimeoutReader=11 testing/iotest.TruncateWriter=11 text/tabwriter.NewWriter=41 text/template.New=41 text/template/parse.New=41 text/template/parse.NewIdentifier=41 text/template/parse.Parse=41,44 time.LoadLocationFromTZData=44,24 time.NewTicker=41 time.NewTimer=41 time.ZoneinfoForTesting=43 unicode/utf16.Encode=41 uuid.Parse=01,24 "
+
+# ---- SA4023: nilness of values (analysis/facts/nilness) over the modelled IR, and the check
+
+const NV_NEVER = 1
+const NV_ALWAYS = 2
+const NV_GLOBAL = 3
+const NV_MAYBE = 4
+
+# A value's nilness: inner * 8 + outer
+fn pr(i: Int, o: Int) -> Int:
+  return i * 8 + o
+
+fn nmerge(a: Int, b: Int) -> Int:
+  if a == 0: return b
+  if b == 0: return a
+  if a == b: return a
+  if a == NV_MAYBE or b == NV_MAYBE: return NV_MAYBE
+  if (a == NV_NEVER and b == NV_GLOBAL) or (a == NV_GLOBAL and b == NV_NEVER): return NV_GLOBAL
+  return NV_MAYBE
+
+fn pmerge(a: Int, b: Int) -> Int:
+  return pr(nmerge(a / 8, b / 8), nmerge(a % 8, b % 8))
+
+# typeparams.NormalTerms of a type parameter (near enough: its constraint's union and non-interface
+# elements)
+fn tparam_terms(var g: tc.Prog, fs: Fs, t: Int) -> [Int]:
+  var out: [Int] = []
+  let c = g.tb[t]
+  if c <= 0: return out
+  collect_terms(&g, fs, c, &out, 0)
+  return out
+
+fn collect_terms(var g: tc.Prog, fs: Fs, t: Int, var out: [Int], depth: Int):
+  if t <= 0 or depth > 10: return
+  if g.tk[t] == tc.TY_UNION:
+    for x in tc.tlist(g, t): out.push(x)
+    return
+  let u = tc.under(&g, fs, t)
+  if u <= 0: return
+  if g.tk[u] != tc.TY_IFACE:
+    out.push(t)
+    return
+  let emb = g.tb[u]
+  if emb <= 0: return
+  for x in tc.tlist(g, emb): collect_terms(&g, fs, x, &out, depth + 1)
+
+# typeutil.MaybePointerLike
+fn ptr_like(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  if t <= 0: return false
+  if g.tk[t] == tc.TY_TPARAM:
+    let terms = tparam_terms(&g, fs, t)
+    for x in terms:
+      if ptr_like(&g, fs, x): return true
+    return terms.len == 0
+  let u = tc.under(&g, fs, t)
+  if u <= 0: return false
+  let k = g.tk[u]
+  return k == tc.TY_IFACE or k == tc.TY_CHAN or k == tc.TY_MAP or k == tc.TY_FUNC or k == tc.TY_PTR or k == tc.TY_SLICE or u == tc.B_UNSAFEPTR
+
+fn is_iface(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  if t <= 0 or g.tk[t] == tc.TY_TPARAM: return false
+  let u = tc.under(&g, fs, t)
+  return u > 0 and g.tk[u] == tc.TY_IFACE
+
+fn normalize(var g: tc.Prog, fs: Fs, v: Int, t: Int) -> Int:
+  var i = v / 8
+  var o = v % 8
+  if i == 0 or not is_iface(&g, fs, t): i = NV_MAYBE
+  if o == 0: o = NV_MAYBE
+  return pr(i, o)
+
+# The package's nilness state
+type NS:
+  memo: {Int: [Int]}
+  inprog: {Int: Bool}
+  std: Str
+  std_ok: Bool
+  rhs: {Int: Int}        # lhs identifier -> its value (assignments and specs of equal length)
+  xrhs: {Int: Int}       # a, b := f(): lhs identifier -> f() * 16 + its index
+  xstmt: {Int: Int}      # ... and the statement
+  parent: [Int]
+  encl: {Int: Int}
+  outer: {Int: Int}
+  trivial: {Int: Int}
+  fxs: {Int: Int}        # function node -> its index in fx (built)
+  mayflag: {Int: Bool} = {}
+  stdc: {Int: Str} = {}    # (std_fact by object)
+  maynever: {Int: Bool} = {}
+  defs: {Int: [Int]} = {}  # variable -> the identifiers defining it (rhs, xrhs)
+
+# One function's operations as the IR has them
+type Fx:
+  fnode: Int
+  f: ssa.F
+  w: ssa.W
+  gr: ssa.Gr
+  vals: {Int: V2}
+  byid: {Int: Int}
+  hk: Hk
+  reach: {Int: Bool}
+
+fn b_build(var g: tc.Prog, fs: Fs, var e: ssa.E, fnode: Int, recv: Int, typ: Int, body: Int, var hk: Hk) -> ssa.F:
+  let pi = e.pi
+  var f = ssa.F(fnode, false, [], [], [], [], [], [], [], [], [], 0, 0, [], false, {}, "", [], [], [], [], [], [], [], [], [], [])
+  f.cur = ssa.nb(&f)
+  f.exit = ssa.nb(&f)
+  var fields: [Int] = []
+  if recv > 0:
+    for x in ast.items(g.pk[pi].t, recv): fields.push(x)
+  for x in ast.items(g.pk[pi].t, fb(g, pi, typ)): fields.push(x)
+  for fl in fields:
+    let ids = fa(g, pi, fl)
+    if ids < 0: continue
+    for id in ast.items(g.pk[pi].t, ids):
+      ssa.decl(g, &e, f, id)
+      let o = ssa.local(g, &e, f, id)
+      if o >= 0: ssa.op(&f, ssa.PARAM, o, id, -1, -1, -1)
+  let res = g.pk[pi].t.c[typ]
+  if res > 0:
+    for fl in ast.items(g.pk[pi].t, res):
+      let ids = fa(g, pi, fl)
+      if ids < 0: continue
+      for id in ast.items(g.pk[pi].t, ids):
+        ssa.decl(g, &e, f, id)
+        let o = ssa.local(g, &e, f, id)
+        if o >= 0:
+          f.results.push(o)
+          ssa.op(&f, ssa.DEF, o, id, -1, -1, -1)
+  b_st(&g, fs, &e, &f, &hk, body)
+  let last = f.cur
+  ssa.edge(&f, last, f.exit)
+  f.cur = f.exit
+  var rl: [Int] = []
+  for r in f.results: rl.push(r)
+  for r in rl: ssa.op(&f, ssa.USE, r, -1, -1, -1, -1)
+  if f.has_defer:
+    for r in f.results: e.esc[r] = true
+  return f
+
+fn build_fx(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, fnode: Int) -> Fx:
+  let pi = e.pi
+  # (the outermost function first: its variables' owners)
+  let od = ns.outer.get(fnode, fnode)
+  if od != fnode and sc.k(g, pi, od) == ast.N_FUNCDECL and g.pk[pi].t.d[od] > 0:
+    build_f(&g, fs, &e, od, fa(g, pi, od), g.pk[pi].t.c[od], g.pk[pi].t.d[od])
+  var hk = Hk([], [], [], [])
+  var f = ssa.F(fnode, false, [], [], [], [], [], [], [], [], [], 0, 0, [], false, {}, "", [], [], [], [], [], [], [], [], [], [])
+  if sc.k(g, pi, fnode) == ast.N_FUNCDECL: f = b_build(&g, fs, &e, fnode, fa(g, pi, fnode), g.pk[pi].t.c[fnode], g.pk[pi].t.d[fnode], &hk)
+  else: f = b_build(&g, fs, &e, fnode, -1, fa(g, pi, fnode), fb(g, pi, fnode), &hk)
+  var reach: {Int: Bool} = {}
+  var stack = [0]
+  while stack.len > 0:
+    let b = stack.pop()
+    if b in reach: continue
+    reach[b] = true
+    for s in f.succ[b]: stack.push(s)
+  let w = ssa.lift(e, f, reach)
+  let gr = ssa.graph(f, reach)
+  var byid: {Int: Int} = {}
+  for i in 0..f.ok.len:
+    if ssa.is_use(f.ok[i]) and f.on[i] > 0 and not (f.on[i] in byid): byid[f.on[i]] = i
+  return Fx(fnode, f, w, gr, {}, byid, hk, reach)
+
+fn fx_vals(var fx: Fx, o: Int):
+  if not (o in fx.vals): fx.vals[o] = values2(fx.gr, fx.w, o)
+
+fn fx_val(var fx: Fx, o: Int, i: Int) -> Int:
+  fx_vals(&fx, o)
+  if not (i in fx.vals[o].opval): return 0
+  return ssa.uf_find(fx.vals[o].rp, fx.vals[o].opval[i])
+
+# The lifted variable an identifier reads, and the operation: [o, i], or [] (not a lifted local)
+fn lifted_use(g: tc.Prog, e: ssa.E, fx: Fx, n: Int) -> [Int]:
+  let pi = e.pi
+  if sc.k(g, pi, n) != ast.N_IDENT: return []
+  let o = sc.obj_of(g, pi, n)
+  if o < 0 or g.ok[o] != tc.O_VAR: return []
+  let i = fx.byid.get(n, -1)
+  if i < 0 or not (i in fx.w.kept) or ssa.unlifted(e, fx.w, o): return []
+  return [o, i]
+
+# The IR value a variable's value is: a copy y := x is x's value. [o, vid]
+fn resolve(var g: tc.Prog, fs: Fs, e: ssa.E, ns: NS, var fx: Fx, o0: Int, vid0: Int) -> [Int]:
+  let pi = e.pi
+  var o = o0
+  var vid = vid0
+  var guard = 0
+  while guard < 100:
+    guard += 1
+    fx_vals(&fx, o)
+    vid = ssa.uf_find(fx.vals[o].rp, vid)
+    if not (vid in fx.vals[o].defop): break
+    let i = fx.vals[o].defop[vid]
+    let kind = fx.f.ok[i]
+    let id = fx.f.on[i]
+    if (kind != ssa.DEF and kind != ssa.DEFC) or id <= 0: break
+    let r = ns.rhs.get(id, -1)
+    if r <= 0: break
+    let ru = ul(g, pi, r)
+    let lu = lifted_use(g, e, fx, ru)
+    if lu.len == 0: break
+    if vet.ty(g, pi, ru) != tc.obj_type(&g, fs, o): break
+    let o2 = lu[0]
+    let v2 = fx_val(&fx, o2, lu[1])
+    o = o2
+    vid = v2
+  return [o, vid]
+
+fn vkey(var g: tc.Prog, fs: Fs, e: ssa.E, ns: NS, var fx: Fx, o: Int, vid: Int) -> Str:
+  let r = resolve(&g, fs, e, ns, &fx, o, vid)
+  return "{r[0]}:{r[1]}"
+
+fn st_set(var st: {Str: Int}, key: Str, v: Int):
+  if v == 0: return
+  st[key] = v
+
+fn st_outer(var st: {Str: Int}, key: Str, o: Int):
+  if o == 0: return
+  let cur = st.get(key, 0)
+  st[key] = pr(cur / 8, o)
+
+# A nonzero constant bound (checkBound)
+fn nonzero_bound(var g: tc.Prog, fs: Fs, pi: Int, n: Int) -> Bool:
+  if n <= 0: return false
+  if not tc.is_const(&g, fs, pi, n): return false
+  let cv = tc.const_val(&g, fs, pi, g.pk[pi].t.file[n], n, -1, 0)
+  return cv.k != 1 or cv.i != 0
+
+# Whether the IR instruction using identifier n0 tells that its value isn't nil
+fn use_refines(var g: tc.Prog, fs: Fs, pi: Int, ns: NS, n0: Int) -> Bool:
+  var n = n0
+  var p = ns.parent[n]
+  while p > 0 and sc.k(g, pi, p) == ast.N_PAREN:
+    n = p
+    p = ns.parent[n]
+  if p <= 0: return false
+  let pk = sc.k(g, pi, p)
+  if pk == ast.N_CALL: return fa(g, pi, p) == n and g.pk[pi].emd[n] != tc.M_TYPE
+  if pk == ast.N_SEND: return fa(g, pi, p) == n
+  if pk == ast.N_UNARY: return g.pk[pi].t.f[p] == T_ARROW
+  if pk == ast.N_INDEX:
+    if fa(g, pi, p) != n: return false
+    let t = vet.ty(g, pi, n)
+    let u = tc.under(&g, fs, t)
+    if u <= 0: return false
+    if g.tk[u] == tc.TY_SLICE: return true
+    if g.tk[u] == tc.TY_MAP:
+      # an assignment to m[k]: MapUpdate
+      let gp = ns.parent[p]
+      if gp > 0 and sc.k(g, pi, gp) == ast.N_ASSIGN:
+        for x in ast.items(g.pk[pi].t, fa(g, pi, gp)):
+          if ul(g, pi, x) == p: return true
+      if gp > 0 and sc.k(g, pi, gp) == ast.N_INCDEC: return true
+    return false
+  if pk == ast.N_TYPEASSERT:
+    if fa(g, pi, p) != n or fb(g, pi, p) < 0: return false
+    let gp = ns.parent[p]
+    if gp > 0 and sc.k(g, pi, gp) == ast.N_ASSIGN and ast.count(g.pk[pi].t, fa(g, pi, gp)) == 2 and ast.count(g.pk[pi].t, fb(g, pi, gp)) == 1: return false
+    if gp > 0 and sc.k(g, pi, gp) == ast.N_VALUESPEC and ast.count(g.pk[pi].t, fa(g, pi, gp)) == 2: return false
+    return true
+  if pk == ast.N_SLICE:
+    if fa(g, pi, p) != n: return false
+    return nonzero_bound(&g, fs, pi, fb(g, pi, p)) or nonzero_bound(&g, fs, pi, g.pk[pi].t.c[p]) or nonzero_bound(&g, fs, pi, g.pk[pi].t.d[p])
+  return false
+
+# MakeInterface and the other conversions of a value v of type src to type t
+fn conv(var g: tc.Prog, fs: Fs, v: Int, src: Int, t: Int) -> Int:
+  if not is_iface(&g, fs, t) or src <= 0 or is_iface(&g, fs, src): return v
+  if src == tc.B_UNIL: return pr(NV_ALWAYS, NV_ALWAYS)
+  if g.tk[src] == tc.TY_TPARAM and tparam_terms(&g, fs, src).len == 0: return v
+  var inner = v % 8
+  if not ptr_like(&g, fs, src): inner = NV_NEVER
+  return pr(inner, NV_NEVER)
+
+fn addressable(g: tc.Prog, pi: Int, n0: Int) -> Bool:
+  let n = ul(g, pi, n0)
+  let k = sc.k(g, pi, n)
+  if k == ast.N_CALL or k == ast.N_COMPOSITE or k == ast.N_BASICLIT or k == ast.N_FUNCLIT: return false
+  if k == ast.N_SELECTOR: return addressable(g, pi, fa(g, pi, n))
+  return true
+
+fn eval_conv(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, var fx: Fx, var st: {Str: Int}, r: Int, t: Int) -> Int:
+  let pi = e.pi
+  let v = eval(&g, fs, &e, &ns, &fx, &st, r)
+  var src = vet.ty(g, pi, r)
+  if is_univ(g, pi, r, "nil"): src = tc.B_UNIL
+  return conv(&g, fs, v, src, t)
+
+fn eval(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, var fx: Fx, var st: {Str: Int}, n0: Int) -> Int:
+  let pi = e.pi
+  let n = ul(g, pi, n0)
+  if is_univ(g, pi, n, "nil"): return pr(NV_ALWAYS, NV_ALWAYS)
+  let t = vet.ty(g, pi, n)
+  if t <= 0: return pr(NV_MAYBE, NV_MAYBE)
+  if not ptr_like(&g, fs, t): return pr(0, NV_NEVER)
+  let kk = sc.k(g, pi, n)
+  if kk == ast.N_IDENT:
+    let o = sc.obj_of(g, pi, n)
+    if o < 0: return pr(NV_MAYBE, NV_MAYBE)
+    if g.ok[o] == tc.O_FUNC: return pr(0, NV_NEVER)
+    if g.ok[o] != tc.O_VAR: return pr(NV_MAYBE, NV_MAYBE)
+    let lu = lifted_use(g, e, fx, n)
+    if lu.len > 0:
+      let vid = fx_val(&fx, lu[0], lu[1])
+      let key = vkey(&g, fs, e, ns, &fx, lu[0], vid)
+      return st.get(key, 0)
+    if o in e.owner: return pr(0, NV_MAYBE)
+    return pr(0, NV_GLOBAL)
+  if kk == ast.N_CALL:
+    let fun = ul(g, pi, fa(g, pi, n))
+    let as = args_of(g, pi, n)
+    if g.pk[pi].emd[fun] == tc.M_TYPE:
+      if as.len != 1: return pr(NV_MAYBE, NV_MAYBE)
+      return eval_conv(&g, fs, &e, &ns, &fx, &st, as[0], t)
+    let bo = sc.obj_of(g, pi, fun)
+    if sc.k(g, pi, fun) == ast.N_IDENT and bo >= 0 and g.ok[bo] == tc.O_BUILTIN:
+      let bn = g.oname[bo]
+      if bn == "new" or bn == "make": return pr(0, NV_NEVER)
+      if bn == "append" and as.len > 0:
+        var an = eval(&g, fs, &e, &ns, &fx, &st, as[0]) % 8
+        if an == NV_ALWAYS: an = NV_MAYBE
+        return pr(0, an)
+      if bn == "recover": return pr(0, NV_MAYBE)
+      return pr(NV_MAYBE, NV_MAYBE)
+    return handle_ret(&g, fs, &e, &ns, n, 0)
+  if kk == ast.N_UNARY:
+    if g.pk[pi].t.f[n] == T_AND: return pr(0, NV_NEVER)
+    return pr(NV_MAYBE, NV_MAYBE)
+  if kk == ast.N_STAR: return pr(0, NV_MAYBE)
+  if kk == ast.N_COMPOSITE or kk == ast.N_FUNCLIT: return pr(0, NV_NEVER)
+  if kk == ast.N_SELECTOR:
+    let sk = g.pk[pi].skind.get(n, 0)
+    let so = g.pk[pi].sobj.get(n, -1)
+    if sk == tc.S_FIELD:
+      let bt = vet.ty(g, pi, fa(g, pi, n))
+      let bu = tc.under(&g, fs, bt)
+      if (bu > 0 and g.tk[bu] == tc.TY_PTR) or addressable(g, pi, fa(g, pi, n)): return pr(0, NV_MAYBE)
+      return pr(NV_MAYBE, NV_MAYBE)
+    if sk == tc.S_METHOD or sk == tc.S_MEXPR: return pr(0, NV_NEVER)
+    if sk == tc.S_PKG and so >= 0:
+      if g.ok[so] == tc.O_FUNC: return pr(0, NV_NEVER)
+      if g.ok[so] == tc.O_VAR: return pr(0, NV_GLOBAL)
+    return pr(NV_MAYBE, NV_MAYBE)
+  if kk == ast.N_INDEX:
+    let bt = vet.ty(g, pi, fa(g, pi, n))
+    let bu = tc.under(&g, fs, bt)
+    if bu <= 0: return pr(NV_MAYBE, NV_MAYBE)
+    let bk = g.tk[bu]
+    if bk == tc.TY_MAP:
+      let m = eval(&g, fs, &e, &ns, &fx, &st, fa(g, pi, n))
+      if m % 8 == NV_ALWAYS: return pr(NV_ALWAYS, NV_ALWAYS)
+      return pr(NV_MAYBE, NV_MAYBE)
+    if bk == tc.TY_SLICE or bk == tc.TY_PTR: return pr(0, NV_MAYBE)
+    if bk == tc.TY_ARRAY:
+      if addressable(g, pi, fa(g, pi, n)): return pr(0, NV_MAYBE)
+      return pr(NV_MAYBE, NV_MAYBE)
+    if bk == tc.TY_FUNC: return pr(0, NV_NEVER)
+    return pr(NV_MAYBE, NV_MAYBE)
+  if kk == ast.N_SLICE:
+    let bt = vet.ty(g, pi, fa(g, pi, n))
+    let bu = tc.under(&g, fs, bt)
+    if bu > 0 and g.tk[bu] == tc.TY_ARRAY: return pr(0, NV_NEVER)
+    if nonzero_bound(&g, fs, pi, fb(g, pi, n)) or nonzero_bound(&g, fs, pi, g.pk[pi].t.c[n]) or nonzero_bound(&g, fs, pi, g.pk[pi].t.d[n]): return pr(0, NV_NEVER)
+    return eval(&g, fs, &e, &ns, &fx, &st, fa(g, pi, n))
+  if kk == ast.N_TYPEASSERT:
+    let x = eval(&g, fs, &e, &ns, &fx, &st, fa(g, pi, n))
+    if is_iface(&g, fs, t): return pr(x / 8, NV_NEVER)
+    return pr(0, x / 8)
+  return pr(NV_MAYBE, NV_MAYBE)
+
+# The static callee of a call (an object), -1 for none (a builtin, a function value, an interface method)
+fn static_callee(var g: tc.Prog, fs: Fs, pi: Int, call: Int) -> Int:
+  var fun = ul(g, pi, fa(g, pi, call))
+  if sc.k(g, pi, fun) == ast.N_INDEX: fun = ul(g, pi, fa(g, pi, fun))
+  let o = vet.callee(g, pi, call)
+  if o < 0 or g.ok[o] != tc.O_FUNC: return -1
+  if sc.k(g, pi, fun) == ast.N_SELECTOR and g.pk[pi].skind.get(fun, 0) == tc.S_METHOD:
+    let bt = vet.ty(g, pi, fa(g, pi, fun))
+    if bt <= 0 or g.tk[bt] == tc.TY_TPARAM: return -1
+    let u = tc.under(&g, fs, bt)
+    if u <= 0 or g.tk[u] == tc.TY_IFACE or g.tk[u] == tc.TY_TPARAM: return -1
+  return g.oorig[o]
+
+# The type of result idx of a call
+fn result_type(var g: tc.Prog, fs: Fs, pi: Int, call: Int, idx: Int) -> Int:
+  let t = vet.ty(g, pi, call)
+  if t > 0 and g.tk[t] == tc.TY_TUPLE:
+    let xs = tc.tlist(g, t)
+    if idx < xs.len: return xs[idx]
+    return 0
+  if idx == 0: return t
+  return 0
+
+# handleReturnValue: result idx of a call
+fn handle_ret(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, call: Int, idx: Int) -> Int:
+  let pi = e.pi
+  let typ = result_type(&g, fs, pi, call, idx)
+  if typ <= 0: return pr(NV_MAYBE, NV_MAYBE)
+  if not ptr_like(&g, fs, typ): return pr(0, NV_NEVER)
+  let o = static_callee(&g, fs, pi, call)
+  if o < 0: return pr(NV_MAYBE, NV_MAYBE)
+  let facts = fn_facts(&g, fs, &e, &ns, o)
+  if idx < facts.len: return normalize(&g, fs, facts[idx], typ)
+  return pr(NV_MAYBE, NV_MAYBE)
+
+# A function's nilness fact (one value per result), [] for none
+fn fn_facts(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, o: Int) -> [Int]:
+  let pk = g.opkg[o]
+  if pk == e.pi: return nil_func(&g, fs, &e, &ns, o)
+  if pk < 0 or not g.pk[pk].std: return []
+  if not (o in ns.stdc):
+    let name = errcheck.full_name(&g, fs, o)
+    ns.stdc[o] = std_fact(&ns, name)
+  let fact = ns.stdc[o] + ""
+  if fact.len == 0: return []
+  var out: [Int] = []
+  for x in fact.split(","):
+    if x.len == 2: out.push(pr(int(x[0]) - 48, int(x[1]) - 48))
+  return out
+
+fn states_eq(a: {Str: Int}, b: {Str: Int}) -> Bool:
+  if a.len != b.len: return false
+  for k, v in a:
+    if not (k in b) or b[k] != v: return false
+  return true
+
+# The operations of block b, on state st
+fn transfer(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, var fx: Fx, b: Int, var st: {Str: Int}):
+  let pi = e.pi
+  var ops: [Int] = []
+  for i in fx.w.bops[b]: ops.push(i)
+  for i in ops:
+    let o = fx.w.oo[i]
+    let kind = fx.w.ok[i]
+    if ssa.unlifted(e, fx.w, o): continue
+    let ot = tc.obj_type(&g, fs, o)
+    if not ptr_like(&g, fs, ot): continue
+    if ssa.is_use(kind):
+      if fx.w.on[i] <= 0: continue
+      var refine = kind == ssa.DEREF
+      if kind == ssa.USE: refine = use_refines(&g, fs, pi, ns, fx.w.on[i])
+      if refine:
+        let vid = fx_val(&fx, o, i)
+        let key = vkey(&g, fs, e, ns, &fx, o, vid)
+        st_outer(&st, key, NV_NEVER)
+      continue
+    fx_vals(&fx, o)
+    let vid = fx.vals[o].opdef.get(i, -1)
+    if vid < 0: continue
+    let key = "{o}:{vid}"
+    if vkey(&g, fs, e, ns, &fx, o, vid) != key: continue
+    let v = def_nil(&g, fs, &e, &ns, &fx, &st, o, i)
+    st_set(&st, key, v)
+
+fn def_nil(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, var fx: Fx, var st: {Str: Int}, o: Int, i: Int) -> Int:
+  let pi = e.pi
+  let kind = fx.f.ok[i]
+  let id = fx.f.on[i]
+  let t = tc.obj_type(&g, fs, o)
+  if kind == ssa.PARAM: return pr(NV_MAYBE, NV_MAYBE)
+  if id <= 0: return 0
+  if kind == ssa.DEFX:
+    let x = ns.xrhs.get(id, -1)
+    if x < 0: return pr(NV_MAYBE, NV_MAYBE)
+    let r = ul(g, pi, x / 16)
+    let idx = x % 16
+    if sc.k(g, pi, r) != ast.N_CALL:
+      let et = extract_type(&g, fs, pi, r, idx)
+      return conv(&g, fs, pr(NV_MAYBE, NV_MAYBE), et, t)
+    let v = handle_ret(&g, fs, &e, &ns, r, idx)
+    let rt = result_type(&g, fs, pi, r, idx)
+    return conv(&g, fs, v, rt, t)
+  let r = ns.rhs.get(id, -1)
+  if r > 0: return eval_conv(&g, fs, &e, &ns, &fx, &st, r, t)
+  let p = ns.parent[id]
+  if p > 0 and (sc.k(g, pi, p) == ast.N_VALUESPEC or sc.k(g, pi, p) == ast.N_FIELD): return pr(NV_ALWAYS, NV_ALWAYS)
+  return pr(NV_MAYBE, NV_MAYBE)
+
+# The type of value idx of a comma-ok expression (v, ok := m[k], x.(T), <-ch)
+fn extract_type(var g: tc.Prog, fs: Fs, pi: Int, r: Int, idx: Int) -> Int:
+  if idx != 0: return tc.B_BOOL
+  let k = sc.k(g, pi, r)
+  if k == ast.N_TYPEASSERT: return vet.ty(g, pi, fb(g, pi, r))
+  let t = vet.ty(g, pi, r)
+  if t > 0 and g.tk[t] == tc.TY_TUPLE:
+    let xs = tc.tlist(g, t)
+    if xs.len > 0: return xs[0]
+  return t
+
+# On the edge from b (its successor si): what b's condition tells, then s's phis
+fn edge_state(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, var fx: Fx, b: Int, si: Int, var st: {Str: Int}, leaf: Int):
+  let pi = e.pi
+  if leaf > 0:
+    var x = ul(g, pi, fa(g, pi, leaf))
+    var y = ul(g, pi, fb(g, pi, leaf))
+    if is_univ(g, pi, x, "nil"):
+      let tmp = x
+      x = y
+      y = tmp
+    if is_univ(g, pi, y, "nil") and sc.k(g, pi, x) == ast.N_IDENT:
+      var lu = lifted_use(g, e, fx, x)
+      if lu.len == 0:
+        let o = sc.obj_of(g, pi, x)
+        let j = fx.byid.get(leaf, -1)
+        if o >= 0 and j >= 0 and j in fx.w.kept and not ssa.unlifted(e, fx.w, o): lu = [o, j]
+      var lpt = false
+      if lu.len > 0:
+        let lt = tc.obj_type(&g, fs, lu[0])
+        lpt = ptr_like(&g, fs, lt)
+      if lpt:
+        let vid = fx_val(&fx, lu[0], lu[1])
+        let key = vkey(&g, fs, e, ns, &fx, lu[0], vid)
+        var eq = g.pk[pi].t.f[leaf] == T_EQL
+        if si == 1: eq = not eq
+        if eq: st_set(&st, key, pr(NV_ALWAYS, NV_ALWAYS))
+        else: st_outer(&st, key, NV_NEVER)
+  let s = fx.gr.succ[b][si]
+  var pidx = -1
+  for j in 0..fx.gr.pred[s].len:
+    if fx.gr.pred[s][j] == b and pidx < 0: pidx = j
+  if pidx < 0: return
+  var vs: [Int] = []
+  for o, _ in fx.vals: vs.push(o)
+  for o in vs:
+    let pv = fx.vals[o].phiv.get(s, -1)
+    if pv < 0 or ssa.uf_find(fx.vals[o].rp, pv) != pv or not (pv in fx.vals[o].phiops): continue
+    if pidx >= fx.vals[o].phiops[pv].len: continue
+    let opnd = fx.vals[o].phiops[pv][pidx]
+    let key = vkey(&g, fs, e, ns, &fx, o, opnd)
+    st_set(&st, "{o}:{pv}", st.get(key, 0))
+
+# impl: a package function's nilness fact
+fn nil_func(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, o: Int) -> [Int]:
+  let pi = e.pi
+  if o in ns.memo:
+    var out: [Int] = []
+    for x in ns.memo[o]: out.push(x)
+    return out
+  if o in ns.inprog: return []
+  let d = g.odecl[o]
+  if d < 0 or sc.k(g, pi, d) != ast.N_FUNCDECL or g.pk[pi].t.d[d] <= 0: return []
+  let sig = tc.obj_type(&g, fs, o)
+  if sig <= 0 or g.tk[sig] != tc.TY_FUNC: return []
+  let results = tc.tlist(g, g.tb[sig])
+  if results.len == 0: return []
+  var anyp = false
+  for r in results:
+    if ptr_like(&g, fs, r): anyp = true
+  if not anyp:
+    ns.memo[o] = []
+    return []
+  ns.inprog[o] = true
+  var fx = build_fx(&g, fs, &e, &ns, d)
+  # every pointer-like lifted variable's values (its phis)
+  var vars: {Int: Bool} = {}
+  for i in 0..fx.w.ok.len:
+    let v = fx.w.oo[i]
+    if v in vars or ssa.unlifted(e, fx.w, v): continue
+    vars[v] = true
+  for v, _ in vars:
+    let vt = tc.obj_type(&g, fs, v)
+    if ptr_like(&g, fs, vt): fx_vals(&fx, v)
+  var leaf: {Int: Int} = {}
+  for j in 0..fx.hk.leaves.len: leaf[fx.hk.lblk[j]] = fx.hk.leaves[j]
+  # the forward analysis: each edge's state; a block's in-state merges its predecessors'
+  var outs: {Int: {Str: Int}} = {}
+  var queue: [Int] = []
+  var queued: {Int: Bool} = {}
+  let nbk = fx.f.succ.len
+  for b in 0..nbk:
+    if b in fx.reach:
+      queue.push(b)
+      queued[b] = true
+  var qi = 0
+  var steps = 0
+  while qi < queue.len and steps < 20000:
+    steps += 1
+    let b = queue[qi]
+    qi += 1
+    queued.remove(b)
+    var st = in_state(fx, outs, b)
+    transfer(&g, fs, &e, &ns, &fx, b, &st)
+    let ns2 = fx.gr.succ[b].len
+    for si in 0..ns2:
+      var s2: {Str: Int} = {}
+      for k, v in st: s2[k] = v
+      edge_state(&g, fs, &e, &ns, &fx, b, si, &s2, leaf.get(b, -1))
+      let key = b * 1048576 + si
+      var same = false
+      if key in outs: same = states_eq(outs[key], s2)
+      if not same:
+        outs[key] = s2
+        let s = fx.gr.succ[b][si]
+        if not (s in queued):
+          queued[s] = true
+          queue.push(s)
+  var ret: [Int] = []
+  for _ in results: ret.push(0)
+  for j in 0..fx.hk.rets.len:
+    let rn = fx.hk.rets[j]
+    let blk = fx.hk.rblk[j]
+    if not (blk in fx.reach): continue
+    var st = in_state(fx, outs, blk)
+    transfer(&g, fs, &e, &ns, &fx, blk, &st)
+    let rs = ast.items(g.pk[pi].t, fa(g, pi, rn))
+    if rs.len == results.len:
+      for k in 0..rs.len:
+        let v = eval_conv(&g, fs, &e, &ns, &fx, &st, rs[k], results[k])
+        ret[k] = pmerge(ret[k], v)
+    elif rs.len == 1:
+      let c = ul(g, pi, rs[0])
+      for k in 0..results.len:
+        var v = pr(NV_MAYBE, NV_MAYBE)
+        if sc.k(g, pi, c) == ast.N_CALL:
+          let hv = handle_ret(&g, fs, &e, &ns, c, k)
+          let rt = result_type(&g, fs, pi, c, k)
+          v = conv(&g, fs, hv, rt, results[k])
+        ret[k] = pmerge(ret[k], v)
+    elif rs.len == 0 and fx.f.results.len == results.len:
+      for k in 0..results.len:
+        let ro = fx.f.results[k]
+        var v = pr(0, NV_MAYBE)
+        if not ssa.unlifted(e, fx.w, ro) and ptr_like(&g, fs, results[k]):
+          fx_vals(&fx, ro)
+          let vid = fx.vals[ro].exitv.get(blk, 0)
+          v = st.get(vkey(&g, fs, e, ns, &fx, ro, vid), 0)
+        ret[k] = pmerge(ret[k], v)
+  var interesting = false
+  for k in 0..results.len:
+    if not ptr_like(&g, fs, results[k]): ret[k] = pr(NV_NEVER, NV_NEVER)
+    else:
+      ret[k] = normalize(&g, fs, ret[k], results[k])
+      if ret[k] != pr(NV_MAYBE, NV_MAYBE): interesting = true
+  ns.inprog.remove(o)
+  if not interesting:
+    ns.memo[o] = []
+    return []
+  var keep: [Int] = []
+  for x in ret: keep.push(x)
+  ns.memo[o] = keep
+  return ret
+
+fn in_state(fx: Fx, outs: {Int: {Str: Int}}, b: Int) -> {Str: Int}:
+  var st: {Str: Int} = {}
+  var first = true
+  for p in fx.gr.pred[b]:
+    var si = -1
+    for j in 0..fx.gr.succ[p].len:
+      if fx.gr.succ[p][j] == b and si < 0: si = j
+    let key = p * 1048576 + si
+    if not (key in outs): continue
+    if first:
+      for k, v in outs[key]: st[k] = v
+      first = false
+    else:
+      var keys: {Str: Bool} = {}
+      for k, _ in st: keys[k] = true
+      for k, _ in outs[key]: keys[k] = true
+      for k, _ in keys:
+        st[k] = pmerge(st.get(k, 0), outs[key].get(k, 0))
+  return st
+
+# irutil.IsTrivial, on the syntax: only returns (and panics, and calls of trivial functions) of
+# constants, globals, empty allocations and their conversions
+fn is_trivial(var g: tc.Prog, fs: Fs, var ns: NS, pi: Int, o: Int) -> Bool:
+  if g.opkg[o] != pi: return false
+  if o in ns.trivial: return ns.trivial[o] == 1
+  let d = g.odecl[o]
+  if d < 0 or sc.k(g, pi, d) != ast.N_FUNCDECL or g.pk[pi].t.d[d] <= 0: return false
+  ns.trivial[o] = 0
+  var ok = true
+  for s in ast.items(g.pk[pi].t, fa(g, pi, g.pk[pi].t.d[d])):
+    if not ok: break
+    let sk = sc.k(g, pi, s)
+    if sk == ast.N_RETURN:
+      for r in ast.items(g.pk[pi].t, fa(g, pi, s)):
+        if not triv_expr(&g, fs, &ns, pi, r): ok = false
+    elif sk == ast.N_EXPRSTMT:
+      if not triv_expr(&g, fs, &ns, pi, fa(g, pi, s)): ok = false
+    elif sk == ast.N_DECLSTMT:
+      let gd = fa(g, pi, s)
+      if g.pk[pi].t.f[gd] != K_VAR: continue
+      for sp in ast.items(g.pk[pi].t, fa(g, pi, gd)):
+        let vl = g.pk[pi].t.c[sp]
+        if vl < 0: continue
+        for v in ast.items(g.pk[pi].t, vl):
+          if not triv_expr(&g, fs, &ns, pi, v): ok = false
+    elif sk != ast.N_EMPTY: ok = false
+  if ok: ns.trivial[o] = 1
+  return ok
+
+fn triv_expr(var g: tc.Prog, fs: Fs, var ns: NS, pi: Int, n0: Int) -> Bool:
+  let n = ul(g, pi, n0)
+  let kk = sc.k(g, pi, n)
+  if kk == ast.N_BASICLIT or kk == ast.N_IDENT: return true
+  if tc.is_const(&g, fs, pi, n): return true
+  if kk == ast.N_SELECTOR: return g.pk[pi].skind.get(n, 0) == tc.S_PKG
+  if kk == ast.N_UNARY and g.pk[pi].t.f[n] == T_AND:
+    let x = ul(g, pi, fa(g, pi, n))
+    if sc.k(g, pi, x) == ast.N_COMPOSITE: return ast.count(g.pk[pi].t, fb(g, pi, x)) == 0
+    return false
+  if kk == ast.N_CALL:
+    let fun = ul(g, pi, fa(g, pi, n))
+    let as = args_of(g, pi, n)
+    if g.pk[pi].emd[fun] == tc.M_TYPE:
+      if as.len != 1: return false
+      let t = vet.ty(g, pi, n)
+      if is_iface(&g, fs, t) or tc.is_const(&g, fs, pi, as[0]): return triv_expr(&g, fs, &ns, pi, as[0])
+      return false
+    if is_univ(g, pi, fun, "new"): return true
+    let c = static_callee(&g, fs, pi, n)
+    if c < 0 or not is_trivial(&g, fs, &ns, pi, c): return false
+    for a in as:
+      if not triv_expr(&g, fs, &ns, pi, a): return false
+    return true
+  return false
+
+fn ordinal(n: Int) -> Str:
+  var suf = "th"
+  if n % 100 < 11 or n % 100 > 13:
+    if n % 10 == 1: suf = "st"
+    elif n % 10 == 2: suf = "nd"
+    elif n % 10 == 3: suf = "rd"
+  return "{n}" + suf
+
+# What the comparison's lhs is in the IR (irutil.Flatten): [kind, node, index, related position,
+# callee]; kinds 0 other, 1 a call's result, 2 MakeInterface of a concrete value (position -1: none)
+fn xd_other() -> [Int]:
+  return [0, -1, 0, -1, -1]
+
+fn no_terms_tparam(var g: tc.Prog, fs: Fs, t: Int) -> Bool:
+  return t > 0 and g.tk[t] == tc.TY_TPARAM and tparam_terms(&g, fs, t).len == 0
+
+fn flat_var(var g: tc.Prog, fs: Fs, e: ssa.E, ns: NS, var fx: Fx, o: Int, vid: Int, var seen: {Str: Bool}, var outs: [Int]):
+  let r = resolve(&g, fs, e, ns, &fx, o, vid)
+  let key = "{r[0]}:{r[1]}"
+  if key in seen: return
+  seen[key] = true
+  let ro = r[0]
+  let rv = r[1]
+  if rv in fx.vals[ro].phiops and not (rv in fx.vals[ro].defop):
+    var l: [Int] = []
+    for x in fx.vals[ro].phiops[rv]: l.push(x)
+    for x in l: flat_var(&g, fs, e, ns, &fx, ro, x, &seen, &outs)
+    return
+  if outs.len > 0 and (outs[0] != ro or outs[1] != rv):
+    outs.push(-1)
+    outs.push(-1)
+    return
+  if outs.len == 0:
+    outs.push(ro)
+    outs.push(rv)
+
+fn xd_var(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, var fx: Fx, o: Int, vid: Int) -> [Int]:
+  let pi = e.pi
+  var seen: {Str: Bool} = {}
+  var outs: [Int] = []
+  flat_var(&g, fs, e, ns, &fx, o, vid, &seen, &outs)
+  if outs.len != 2: return xd_other()
+  let ro = outs[0]
+  let rv = outs[1]
+  if not (rv in fx.vals[ro].defop): return xd_other()
+  let i = fx.vals[ro].defop[rv]
+  let kind = fx.f.ok[i]
+  let id = fx.f.on[i]
+  if id <= 0 or kind == ssa.PARAM: return xd_other()
+  let t = tc.obj_type(&g, fs, ro)
+  if kind == ssa.DEFX:
+    let x = ns.xrhs.get(id, -1)
+    if x < 0: return xd_other()
+    let r = ul(g, pi, x / 16)
+    let idx = x % 16
+    var src = 0
+    if sc.k(g, pi, r) == ast.N_CALL: src = result_type(&g, fs, pi, r, idx)
+    else: src = extract_type(&g, fs, pi, r, idx)
+    if src <= 0 or t <= 0: return xd_other()
+    if is_iface(&g, fs, t) and not is_iface(&g, fs, src):
+      if no_terms_tparam(&g, fs, src): return xd_other()
+      return [2, r, idx, ns.xstmt.get(id, -1), -1]
+    if sc.k(g, pi, r) == ast.N_CALL and src == t:
+      let c = static_callee(&g, fs, pi, r)
+      if c < 0: return xd_other()
+      return [1, r, idx, ns.xstmt.get(id, -1), c]
+    return xd_other()
+  let r = ns.rhs.get(id, -1)
+  if r <= 0 or is_univ(g, pi, r, "nil"): return xd_other()
+  let src = vet.ty(g, pi, r)
+  if src <= 0 or t <= 0: return xd_other()
+  if is_iface(&g, fs, t) and not is_iface(&g, fs, src):
+    if no_terms_tparam(&g, fs, src) or src == tc.B_UNIL: return xd_other()
+    return [2, r, 0, xpos(&g, fs, &e, &ns, &fx, r), -1]
+  if src != t: return xd_other()
+  return xd_expr(&g, fs, &e, &ns, &fx, r)
+
+fn xd_expr(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, var fx: Fx, r: Int) -> [Int]:
+  let pi = e.pi
+  let n = ul(g, pi, r)
+  let kk = sc.k(g, pi, n)
+  if kk == ast.N_IDENT:
+    let lu = lifted_use(g, e, fx, n)
+    if lu.len == 0: return xd_other()
+    let vid = fx_val(&fx, lu[0], lu[1])
+    return xd_var(&g, fs, &e, &ns, &fx, lu[0], vid)
+  if kk != ast.N_CALL: return xd_other()
+  let fun = ul(g, pi, fa(g, pi, n))
+  let as = args_of(g, pi, n)
+  if g.pk[pi].emd[fun] == tc.M_TYPE:
+    if as.len != 1: return xd_other()
+    let t = vet.ty(g, pi, n)
+    let src = vet.ty(g, pi, as[0])
+    if src <= 0 or not is_iface(&g, fs, t) or is_iface(&g, fs, src) or is_univ(g, pi, as[0], "nil"): return xd_other()
+    if no_terms_tparam(&g, fs, src) or src == tc.B_UNIL: return xd_other()
+    return [2, as[0], 0, xpos(&g, fs, &e, &ns, &fx, as[0]), -1]
+  let rt = vet.ty(g, pi, n)
+  if rt > 0 and g.tk[rt] == tc.TY_TUPLE: return xd_other()
+  let c = static_callee(&g, fs, pi, n)
+  if c < 0: return xd_other()
+  return [1, n, 0, n, c]
+
+# Where a concrete value is (its IR value's source), -1 for none (a zero value, a phi)
+fn xpos(var g: tc.Prog, fs: Fs, var e: ssa.E, var ns: NS, var fx: Fx, a: Int) -> Int:
+  let pi = e.pi
+  let n = ul(g, pi, a)
+  let kk = sc.k(g, pi, n)
+  if kk == ast.N_IDENT:
+    let lu = lifted_use(g, e, fx, n)
+    if lu.len == 0: return n
+    let vid = fx_val(&fx, lu[0], lu[1])
+    let r = resolve(&g, fs, e, ns, &fx, lu[0], vid)
+    let ro = r[0]
+    let rv = r[1]
+    if not (rv in fx.vals[ro].defop): return -1
+    let i = fx.vals[ro].defop[rv]
+    let id = fx.f.on[i]
+    if id <= 0: return -1
+    if fx.f.ok[i] == ssa.PARAM: return id
+    if fx.f.ok[i] == ssa.DEFX: return ns.xstmt.get(id, -1)
+    let rr = ns.rhs.get(id, -1)
+    if rr <= 0:
+      # (a declared variable's zero value is at its name)
+      let pp = ns.parent[id]
+      if pp > 0 and (sc.k(g, pi, pp) == ast.N_VALUESPEC or sc.k(g, pi, pp) == ast.N_FIELD): return id
+      return -1
+    return xpos(&g, fs, &e, &ns, &fx, rr)
+  if kk == ast.N_UNARY and g.pk[pi].t.f[n] == T_AND:
+    let x = ul(g, pi, fa(g, pi, n))
+    if sc.k(g, pi, x) == ast.N_COMPOSITE: return x
+  return n
+
+fn sa4023(var g: tc.Prog, fs: Fs, var c: sc.C, p: pkg.Pkg, roots: [Int], nodes: [Int]):
+  let pi = c.pi
+  var cand: [Int] = []
+  for n in nodes:
+    if sc.k(g, pi, n) != ast.N_BINARY: continue
+    let op = g.pk[pi].t.f[n]
+    if op != T_EQL and op != T_NEQ: continue
+    if not is_univ(g, pi, fb(g, pi, n), "nil"): continue
+    let xt = vet.ty(g, pi, fa(g, pi, n))
+    if not is_iface(&g, fs, xt): continue
+    cand.push(n)
+  if cand.len == 0: return
+  var ns = NS({}, {}, "", false, {}, {}, {}, [], {}, {}, {}, {})
+  for n in nodes:
+    let nk = sc.k(g, pi, n)
+    if nk == ast.N_ASSIGN:
+      let tok = g.pk[pi].t.f[n]
+      if tok != T_ASSIGN and tok != T_DEFINE: continue
+      let ls = ast.items(g.pk[pi].t, fa(g, pi, n))
+      let rs = ast.items(g.pk[pi].t, fb(g, pi, n))
+      if ls.len == rs.len:
+        for i in 0..ls.len: ns.rhs[ul(g, pi, ls[i])] = rs[i]
+      elif rs.len == 1:
+        for i in 0..ls.len:
+          ns.xrhs[ul(g, pi, ls[i])] = rs[0] * 16 + i
+          ns.xstmt[ul(g, pi, ls[i])] = n
+    elif nk == ast.N_VALUESPEC:
+      let ls = ast.items(g.pk[pi].t, fa(g, pi, n))
+      let vl = g.pk[pi].t.c[n]
+      if vl < 0: continue
+      let rs = ast.items(g.pk[pi].t, vl)
+      if ls.len == rs.len:
+        for i in 0..ls.len: ns.rhs[ls[i]] = rs[i]
+      elif rs.len == 1:
+        for i in 0..ls.len:
+          ns.xrhs[ls[i]] = rs[0] * 16 + i
+          ns.xstmt[ls[i]] = n
+  var e = ssa.new_e(pi, p.test)
+  if g.ssa_noret.len == 0:
+    g.ssa_noret = ssadata.std_noreturn()
+    g.ssa_pure = ssadata.std_pure()
+  swap(&e.std_pure, &g.ssa_pure)
+  swap(&e.std_noret, &g.ssa_noret)
+  var defs: {Int: [Int]} = {}
+  for id, _ in ns.rhs:
+    let o = sc.obj_of(g, pi, id)
+    if o < 0: continue
+    if not (o in defs): defs[o] = []
+    defs[o].push(id)
+  for id, _ in ns.xrhs:
+    let o = sc.obj_of(g, pi, id)
+    if o < 0: continue
+    if not (o in defs): defs[o] = []
+    defs[o].push(id)
+  for o, l in defs:
+    var c2: [Int] = []
+    for x in l: c2.push(x)
+    ns.defs[o] = c2
+  var keep: [Int] = []
+  for cd in cand:
+    if x_may_flag(&g, fs, &ns, &e, false, pi, defs, fa(g, pi, cd)): keep.push(cd)
+  if keep.len == 0:
+    swap(&e.std_pure, &g.ssa_pure)
+    swap(&e.std_noret, &g.ssa_noret)
+    return
+  cand = keep
+  for _ in 0..g.pk[pi].t.k.len: ns.parent.push(-1)
+  for root in roots:
+    for d in ast.items(g.pk[pi].t, g.pk[pi].t.c[root]):
+      var stack: [Int] = [d]
+      var fstack: [Int] = [-1]
+      while stack.len > 0:
+        let x = stack.pop()
+        var fx0 = fstack.pop()
+        let xk = sc.k(g, pi, x)
+        if xk == ast.N_BINARY or xk == ast.N_FUNCLIT: ns.encl[x] = fx0
+        if xk == ast.N_FUNCDECL or xk == ast.N_FUNCLIT:
+          fx0 = x
+          if not (x in ns.outer): ns.outer[x] = d
+        if xk == ast.N_RANGE:
+          let rt = vet.ty(g, pi, g.pk[pi].t.c[x])
+          if rt > 0:
+            let ru = tc.under(&g, fs, rt)
+            if ru > 0 and g.tk[ru] == tc.TY_FUNC: fx0 = -2
+        let before = stack.len
+        vet.push_kids(g.pk[pi].t, x, &stack)
+        for j in before..stack.len:
+          fstack.push(fx0)
+          ns.parent[stack[j]] = x
+  var keep2: [Int] = []
+  for cd in cand:
+    if x_may_flag(&g, fs, &ns, &e, true, pi, defs, fa(g, pi, cd)): keep2.push(cd)
+  cand = keep2
+  var byfn: {Int: [Int]} = {}
+  var order: [Int] = []
+  for cd in cand:
+    let fnode = ns.encl.get(cd, -1)
+    if fnode < 0: continue
+    if sc.k(g, pi, fnode) == ast.N_FUNCDECL and g.pk[pi].t.d[fnode] <= 0: continue
+    if not (fnode in byfn):
+      byfn[fnode] = []
+      order.push(fnode)
+    byfn[fnode].push(cd)
+  for fnode in order:
+    var fx = build_fx(&g, fs, &e, &ns, fnode)
+    var cds: [Int] = []
+    for x in byfn[fnode]: cds.push(x)
+    for cd in cds:
+      sa4023_one(&g, fs, &c, p, &e, &ns, &fx, cd)
+  swap(&e.std_pure, &g.ssa_pure)
+  swap(&e.std_noret, &g.ssa_noret)
+
+fn sa4023_one(var g: tc.Prog, fs: Fs, var c: sc.C, p: pkg.Pkg, var e: ssa.E, var ns: NS, var fx: Fx, cd: Int):
+    let pi = c.pi
+    let xd = xd_expr(&g, fs, &e, &ns, &fx, fa(g, pi, cd))
+    if xd[0] == 0: return
+    var q = "always"
+    if g.pk[pi].t.f[cd] == T_EQL: q = "never"
+    if xd[0] == 2:
+      if xd[3] >= 0:
+        sc.report(g, &c, cd, "SA4023", "this comparison is " + q + " true")
+        rel_report(g, &c, xd[3], "SA4023", "the lhs of the comparison gets its value from here and has a concrete type")
+      else: sc.report(g, &c, cd, "SA4023", "this comparison is " + q + " true; the lhs of the comparison has been assigned a concretely typed value")
+      return
+    let obj = xd[4]
+    let idx = xd[2]
+    let sig = tc.obj_type(&g, fs, obj)
+    if sig <= 0 or g.tk[sig] != tc.TY_FUNC: return
+    let rts = tc.tlist(g, g.tb[sig])
+    if idx >= rts.len: return
+    let facts = fn_facts(&g, fs, &e, &ns, obj)
+    var nv = pr(NV_MAYBE, NV_MAYBE)
+    if not ptr_like(&g, fs, rts[idx]): nv = pr(0, NV_NEVER)
+    elif idx < facts.len: nv = normalize(&g, fs, facts[idx], rts[idx])
+    let inner = nv / 8
+    if nv % 8 != NV_NEVER or (inner != NV_MAYBE and inner != NV_ALWAYS): return
+    if p.test[g.pk[pi].t.file[cd]]: return
+    if is_trivial(&g, fs, &ns, pi, obj): return
+    sc.report(g, &c, cd, "SA4023", "this comparison is " + q + " true")
+    rel_report(g, &c, xd[3], "SA4023", "the lhs of the comparison is the " + ordinal(idx + 1) + " return value of this function call")
+    var at = cd
+    if g.opkg[obj] == pi and g.onode[obj] >= 0 and g.pk[pi].t.file[g.onode[obj]] == g.pk[pi].t.file[cd]: at = g.onode[obj]
+    let fname = errcheck.full_name(&g, fs, obj)
+    rel_report(g, &c, at, "SA4023", fname + " never returns a nil interface value")
+
+# Related information, ranked as its issue (golangci-lint keeps an issue's related information after
+# it, so uniq-by-line keeps the issue)
+fn rel_report(g: tc.Prog, var c: sc.C, n: Int, code: Str, msg: Str):
+  let pi = c.pi
+  c.out.push(pkg.Issue(g.pk[pi].t.file[n], g.pk[pi].t.pos[n], "staticcheck", code + "(related information): " + msg, sc.code_rank(code)))
+
+# Whether an expression's IR value can be one SA4031 knows is never nil (or a copy of a variable)
+fn maybe_nn(g: tc.Prog, pi: Int, r: Int) -> Bool:
+  let n = ul(g, pi, r)
+  let kk = sc.k(g, pi, n)
+  if kk == ast.N_CALL:
+    let f = ul(g, pi, fa(g, pi, n))
+    return is_univ(g, pi, f, "new") or is_univ(g, pi, f, "make")
+  if kk == ast.N_UNARY: return g.pk[pi].t.f[n] == T_AND
+  if kk == ast.N_COMPOSITE or kk == ast.N_FUNCLIT or kk == ast.N_SLICE: return true
+  if kk == ast.N_SELECTOR:
+    let sk = g.pk[pi].skind.get(n, 0)
+    if sk == tc.S_METHOD or sk == tc.S_MEXPR: return true
+    let o = g.pk[pi].sobj.get(n, -1)
+    return sk == tc.S_PKG and o >= 0 and g.ok[o] == tc.O_FUNC
+  if kk == ast.N_IDENT:
+    let o = sc.obj_of(g, pi, n)
+    return o >= 0 and (g.ok[o] == tc.O_FUNC or g.ok[o] == tc.O_VAR)
+  return false
+
+# Whether SA4023 could flag result idx of callee o: not when one of its returns gives nil there
+fn call_may_flag(var g: tc.Prog, fs: Fs, var ns: NS, pi: Int, o: Int, idx: Int) -> Bool:
+  let mk = o * 16 + idx
+  if mk in ns.mayflag: return ns.mayflag[mk]
+  let r = call_may_flag0(&g, fs, &ns, pi, o, idx)
+  ns.mayflag[mk] = r
+  return r
+
+fn call_may_flag0(var g: tc.Prog, fs: Fs, var ns: NS, pi: Int, o: Int, idx: Int) -> Bool:
+  let pk = g.opkg[o]
+  if pk == pi: return may_never(&g, fs, &ns, pi, o, idx, 0)
+  if pk < 0 or not g.pk[pk].std: return false
+  if not (o in ns.stdc):
+    let name = errcheck.full_name(&g, fs, o)
+    ns.stdc[o] = std_fact(&ns, name)
+  let fact = ns.stdc[o] + ""
+  if fact.len == 0: return false
+  let parts = fact.split(",")
+  if idx >= parts.len or parts[idx].len != 2: return false
+  let inner = int(parts[idx][0]) - 48
+  let outer = int(parts[idx][1]) - 48
+  return outer == NV_NEVER and (inner == NV_MAYBE or inner == NV_ALWAYS)
+
+# Whether SA4023's lhs x could be a MakeInterface or a flagged call's result
+fn x_may_flag(var g: tc.Prog, fs: Fs, var ns: NS, var e: ssa.E, deep: Bool, pi: Int, defs: {Int: [Int]}, x0: Int) -> Bool:
+  let x = ul(g, pi, x0)
+  let kk = sc.k(g, pi, x)
+  if kk == ast.N_CALL:
+    let fun = ul(g, pi, fa(g, pi, x))
+    if g.pk[pi].emd[fun] == tc.M_TYPE: return true
+    let c = static_callee(&g, fs, pi, x)
+    return c >= 0 and call_flagged(&g, fs, &ns, &e, deep, pi, c, 0)
+  if kk != ast.N_IDENT: return false
+  let o = sc.obj_of(g, pi, x)
+  if o < 0 or not (o in defs): return false
+  var ids: [Int] = []
+  for id in defs[o]: ids.push(id)
+  for id in ids:
+    if id in ns.rhs:
+      let r = ul(g, pi, ns.rhs[id])
+      let src = vet.ty(g, pi, r)
+      if src > 0 and not is_iface(&g, fs, src) and not is_univ(g, pi, r, "nil"): return true
+      let rk = sc.k(g, pi, r)
+      if rk == ast.N_IDENT: return true
+      if rk == ast.N_CALL:
+        let fun = ul(g, pi, fa(g, pi, r))
+        if g.pk[pi].emd[fun] == tc.M_TYPE: return true
+        let c = static_callee(&g, fs, pi, r)
+        if c >= 0 and call_flagged(&g, fs, &ns, &e, deep, pi, c, 0): return true
+    elif id in ns.xrhs:
+      let xr = ns.xrhs[id]
+      let r = ul(g, pi, xr / 16)
+      let idx = xr % 16
+      if sc.k(g, pi, r) != ast.N_CALL: return true
+      let src = result_type(&g, fs, pi, r, idx)
+      if src > 0 and not is_iface(&g, fs, src): return true
+      let c = static_callee(&g, fs, pi, r)
+      if c >= 0 and call_flagged(&g, fs, &ns, &e, deep, pi, c, idx): return true
+  return false
+
+# The standard library's fact for a function: "41,22" or ""
+fn std_fact(var ns: NS, name: Str) -> Str:
+  if not ns.std_ok:
+    ns.std = nil_std()
+    ns.std_ok = true
+  let k = ns.std.find(" " + name + "=")
+  if k < 0: return ""
+  let st = k + name.len + 2
+  var e = st
+  while e < ns.std.len and ns.std[e] != ' ': e += 1
+  return ns.std[st..e]
+
+# call_may_flag, then (deep) the callee's nilness fact
+fn call_flagged(var g: tc.Prog, fs: Fs, var ns: NS, var e: ssa.E, deep: Bool, pi: Int, c: Int, idx: Int) -> Bool:
+  if not call_may_flag(&g, fs, &ns, pi, c, idx): return false
+  if not deep: return true
+  let sig = tc.obj_type(&g, fs, c)
+  if sig <= 0 or g.tk[sig] != tc.TY_FUNC: return false
+  let rts = tc.tlist(g, g.tb[sig])
+  if idx >= rts.len or not ptr_like(&g, fs, rts[idx]): return false
+  let facts = fn_facts(&g, fs, &e, &ns, c)
+  if idx >= facts.len: return false
+  let nv = normalize(&g, fs, facts[idx], rts[idx])
+  let inner = nv / 8
+  return nv % 8 == NV_NEVER and (inner == NV_MAYBE or inner == NV_ALWAYS)
+
+# Whether result idx of a function can be never nil (its nilness fact's outer NeverNil), on the
+# syntax: false when a return gives nil, a value loaded from memory, or a call's result that can't be
+fn may_never(var g: tc.Prog, fs: Fs, var ns: NS, pi: Int, o: Int, idx: Int, depth: Int) -> Bool:
+  let pk = g.opkg[o]
+  if pk != pi:
+    if pk < 0 or not g.pk[pk].std: return false
+    if not (o in ns.stdc):
+      let name = errcheck.full_name(&g, fs, o)
+      ns.stdc[o] = std_fact(&ns, name)
+    let parts = ns.stdc[o].split(",")
+    if idx >= parts.len or parts[idx].len != 2: return false
+    return int(parts[idx][1]) - 48 == NV_NEVER
+  let key = o * 16 + idx
+  if key in ns.maynever: return ns.maynever[key]
+  if depth > 6: return true
+  ns.maynever[key] = true
+  let r = may_never0(&g, fs, &ns, pi, o, idx, depth)
+  ns.maynever[key] = r
+  return r
+
+fn may_never0(var g: tc.Prog, fs: Fs, var ns: NS, pi: Int, o: Int, idx: Int, depth: Int) -> Bool:
+  let d = g.odecl[o]
+  if d < 0 or sc.k(g, pi, d) != ast.N_FUNCDECL or g.pk[pi].t.d[d] <= 0: return false
+  let sig = tc.obj_type(&g, fs, o)
+  if sig <= 0 or g.tk[sig] != tc.TY_FUNC: return false
+  let rts = tc.tlist(g, g.tb[sig])
+  if idx >= rts.len: return false
+  var rets: [Int] = []
+  var refined: {Int: Bool} = {}
+  var stack = [g.pk[pi].t.d[d]]
+  while stack.len > 0:
+    let x = stack.pop()
+    let xk = sc.k(g, pi, x)
+    if xk == ast.N_FUNCLIT: continue
+    if xk == ast.N_RETURN: rets.push(x)
+    # (a type assertion or type switch on x tells it isn't nil)
+    if xk == ast.N_TYPEASSERT:
+      let y = ul(g, pi, fa(g, pi, x))
+      if sc.k(g, pi, y) == ast.N_IDENT:
+        let yo = sc.obj_of(g, pi, y)
+        if yo >= 0: refined[yo] = true
+    if xk == ast.N_BINARY and (g.pk[pi].t.f[x] == T_EQL or g.pk[pi].t.f[x] == T_NEQ):
+      for y in [ul(g, pi, fa(g, pi, x)), ul(g, pi, fb(g, pi, x))]:
+        if sc.k(g, pi, y) == ast.N_IDENT:
+          let yo = sc.obj_of(g, pi, y)
+          if yo >= 0: refined[yo] = true
+    vet.push_kids(g.pk[pi].t, x, &stack)
+  for rn in rets:
+    let rs = ast.items(g.pk[pi].t, fa(g, pi, rn))
+    if rs.len == 0: continue
+    var ok = false
+    if rs.len == rts.len: ok = ok_expr(&g, fs, &ns, pi, refined, rs[idx], rts[idx], depth)
+    elif rs.len == 1:
+      let c = ul(g, pi, rs[0])
+      if sc.k(g, pi, c) == ast.N_CALL:
+        let cc = static_callee(&g, fs, pi, c)
+        if cc >= 0: ok = may_never(&g, fs, &ns, pi, cc, idx, depth + 1)
+        if not ok and is_iface(&g, fs, rts[idx]):
+          let ct = result_type(&g, fs, pi, c, idx)
+          ok = ct > 0 and not is_iface(&g, fs, ct)
+    if not ok: return false
+  return true
+
+# Whether the value x (returned as type t) can be never nil
+fn ok_expr(var g: tc.Prog, fs: Fs, var ns: NS, pi: Int, refined: {Int: Bool}, x0: Int, t: Int, depth: Int) -> Bool:
+  if depth > 8: return true
+  let x = ul(g, pi, x0)
+  if is_univ(g, pi, x, "nil"): return false
+  let src = vet.ty(g, pi, x)
+  if src <= 0: return true
+  if is_iface(&g, fs, t) and not is_iface(&g, fs, src): return true
+  let kk = sc.k(g, pi, x)
+  if kk == ast.N_UNARY: return g.pk[pi].t.f[x] == T_AND
+  if kk == ast.N_COMPOSITE or kk == ast.N_FUNCLIT or kk == ast.N_TYPEASSERT or kk == ast.N_SLICE: return true
+  if kk == ast.N_CALL:
+    let fun = ul(g, pi, fa(g, pi, x))
+    let as = args_of(g, pi, x)
+    if g.pk[pi].emd[fun] == tc.M_TYPE:
+      if as.len != 1: return true
+      return ok_expr(&g, fs, &ns, pi, refined, as[0], src, depth + 1)
+    if is_univ(g, pi, fun, "new") or is_univ(g, pi, fun, "make") or is_univ(g, pi, fun, "append"): return true
+    let cc = static_callee(&g, fs, pi, x)
+    if cc < 0: return false
+    return may_never(&g, fs, &ns, pi, cc, 0, depth + 1)
+  if kk == ast.N_SELECTOR:
+    let sk = g.pk[pi].skind.get(x, 0)
+    return sk == tc.S_METHOD or sk == tc.S_MEXPR
+  if kk != ast.N_IDENT: return false
+  let o = sc.obj_of(g, pi, x)
+  if o < 0: return true
+  if g.ok[o] == tc.O_FUNC: return true
+  if g.ok[o] != tc.O_VAR: return false
+  if o in refined: return true
+  if not (o in ns.defs): return false
+  var ids: [Int] = []
+  for id in ns.defs[o]: ids.push(id)
+  let vt = tc.obj_type(&g, fs, o)
+  for id in ids:
+    if id in ns.rhs:
+      if ok_expr(&g, fs, &ns, pi, refined, ns.rhs[id], vt, depth + 1): return true
+    elif id in ns.xrhs:
+      let xr = ns.xrhs[id]
+      let r = ul(g, pi, xr / 16)
+      let ri = xr % 16
+      if sc.k(g, pi, r) == ast.N_CALL:
+        let rt = result_type(&g, fs, pi, r, ri)
+        if is_iface(&g, fs, vt) and rt > 0 and not is_iface(&g, fs, rt): return true
+        let cc = static_callee(&g, fs, pi, r)
+        if cc >= 0 and may_never(&g, fs, &ns, pi, cc, ri, depth + 1): return true
+      elif is_iface(&g, fs, vt):
+        let et = extract_type(&g, fs, pi, r, ri)
+        if et > 0 and not is_iface(&g, fs, et): return true
+  return false
