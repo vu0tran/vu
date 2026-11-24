@@ -268,6 +268,40 @@ Later the same day (the module record cache, lmod: `PkgC`, `parse_cached`, `save
 - the measurement harness must give absolute paths for XDG_CACHE_HOME: one run from the linted
   folder with a relative one wrote its caches there.
 
+## Checking one program on several workers (design notes, measured 2026-11-24)
+
+tsgolint checks a program on several checkers over one parsed and bound program, the files split
+between them: the parse and bind shared, each checker's type caches its own. vtsc's forked shards
+are the same model, the parse and bind shared copy-on-write. What a shard spends re-typing what
+the others type too (shard check times summed against one shard's, `VTSC_JOBS=1,2,4`):
+
+| program | 1 shard | 2 shards: sum, slowest | 4 shards: sum, slowest | re-typed by each extra shard |
+|---|---|---|---|---|
+| 79 files | 1,102 ms | 1,965, 1,092 | 2,395, 1,025 | about 430 ms (40%) |
+| 221 files | 1,217 | 1,821, 953 | 2,562, 713 | about 450 ms (37%) |
+| 1,127 files | 4,621 | 6,699, 3,419 | 9,133, 2,726 | about 1,500 ms (33%) |
+
+So a third or more of a shard's check is the lib's and packages' types the other shards type too.
+Threads instead of forks (the same model) would save only the fork's copy-on-write faults, not
+that. Sharing the type tables between threads isn't possible as the checker stands: every pass
+mutates one checker state (`var c: C`: its type, symbol and relation tables, and the bound tree's
+cached declared types), and Vu's tasks share only what a Memo or a channel carries, frozen. It
+would take splitting the checker into frozen bound data and per-thread overlays over a shared,
+deterministic type table: a redesign.
+
+Tried within the forked model, outputs identical each time, none kept:
+- declaring the program's own files once before forking (VTSC_PREDECLARE): 0-3 ms, the shards'
+  check sums 2-8% lower, the slowest shard no faster: the shared work isn't the own files'
+  declarations but the packages' types their bodies make.
+- a warm-up of the files that import the most packages' modules (5-20% of the work) before forking:
+  slower than forking cold (a 1,127-file program 3.6 s cold, 4.2-4.6 s warmed).
+- the read-ahead as joined C threads where the shards fork, with 200 or 100 files a worker: the job
+  76.9 and 73.3 s against 74.1 s without, within the run-to-run spread (about 3 s).
+
+With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
+cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
+against oxlint's 74-76 s, outputs identical; the run that fills them 81.6 s.
+
 ## Checks before committing
 
 - vtsc: `VTSC_LIB=.../typescript/lib ./vtest.sh NEW_BUILD` (the cases in `vtests/`); a slow run:
