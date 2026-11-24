@@ -3202,3 +3202,12 @@ program's check of its own files (the files nothing lints take 4-12 ms of 1-4.8 
 of reading and parsing declarations. Measured and not kept: a small warm-up before forking (less
 cpu, no faster), 120 files a worker, and read-ahead threads in forking programs (their read+parse
 2.0 -> 0.57 s, but the job 73.9 and 76.3 s with 14 s more sys time).
+
+**vlint: dependencies' module records kept between runs (2026-11-24).** no-barrel-file makes the
+module graph read and parse every file a package's imports reach in node_modules, about 10,000
+files a package, the same ones for every package of a monorepo. A record (before its requests are
+resolved) is now kept per package root under `$XDG_CACHE_HOME/vlint/modrec-BUILD` and used while
+the file's times, size and inode are unchanged. The CI job's pattern from an empty cache, alternated
+with oxlint 1.79: 71.3 and 70.4 s (451 and 455 cpu-s) against 74.8 and 74.8 s (471 and 469); 74.9 s
+and 475 cpu-s before; outputs identical, 63 MB of cache. Measured, not changed: vtsc instantiates no
+more than tsgo on the same program (554,000 against 791,000) and checks it as fast on one thread.

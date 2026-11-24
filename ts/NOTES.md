@@ -241,6 +241,23 @@ its own). JavaScript plugins are where vlint wins (a plugin-heavy package 7-8 s 
 VLINT_VTSC_DEBUG=3 shows a worker's stderr; VTSC_PHASES times read+parse, bind, check per shard,
 the worker, run_all and the fork.
 
+Later the same day (the module record cache, lmod: `PkgC`, `parse_cached`, `save_cache`): the job
+70.4-71.3 s and 451-455 cpu-s against oxlint's 74.8 (475 before it). What was measured on the way:
+- the plain lint, package by package alone: 202 cpu-s against oxlint's 116. no-barrel-file makes
+  the module graph follow all of node_modules (11,800 files, 32 MB for a 1,062-file package); the
+  record cache leaves its resolution (stat and realpath calls, about 19% of a package's main-process
+  cpu) and reading the cached records. The React Compiler is 40% of the largest package's
+  main-process cpu (9.5 s; infer_mutation_aliasing_effects 17%, enter_ssa 5%), spread over passes
+  with no single hot spot. A JavaScript plugin's own work (one runs React's compiler from
+  eslint-plugin-react-hooks on Babel's tree) is most of the node processes' cpu, the same for
+  both linters; vlint's host is 9% of it.
+- the checker against tsgo on one 221-file program (tsgo 7.0.2, single-threaded, a scratch
+  tsconfig extending the package's with noEmit): tsgo 791,000 instantiations and 1.22 s of check,
+  vtsc 554,000 (cache hits counted) and 1.29 s. No missing cache: vtsc checks a file as fast as
+  tsgo on one thread; tsgolint is faster by running four checkers over one parsed program.
+- the measurement harness must give absolute paths for XDG_CACHE_HOME: one run from the linted
+  folder with a relative one wrote its caches there.
+
 ## Checks before committing
 
 - vtsc: `VTSC_LIB=.../typescript/lib ./vtest.sh NEW_BUILD` (the cases in `vtests/`); a slow run:
