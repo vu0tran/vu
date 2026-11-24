@@ -3135,7 +3135,7 @@ found 4 more tags on one corpus, as oxlint does), counts only leading `/** */` c
 to its node as oxc does, and reports the once-per-file rules in iter_all's hash-map order.
 no-multiple-resolved walks oxc's control flow graph, so `rmore11.vu` builds a model of it (blocks
 and edges in the order oxc adds them) for files with a `new Promise(fn)`. Checked against oxlint
-1.94.0: the rules' own test cases (11 probe folders), hand-written attacks (5 more), 2,400 generated
+1.94.0: the rules' own test cases (10 probe folders), 6 more probes (attacks, one generated), 2,400 generated
 files of Promise executors (14,711 diagnostics), a 541-file corpus of package sources for the jsdoc rules
 (2,276 diagnostics, three settings variants), 9,598 files of a monorepo plus that corpus for
 no-restricted-properties (55,654), and 3,000 package files using `new Promise` (173): all identical
@@ -3145,7 +3145,7 @@ name's printing; decorators' expressions aren't in vlint's walk; directives aren
 1.90 parser's bracket rule; and a type-kind filter that dropped template expressions. Cost: on that
 3,000-file corpus (480 MB, every file with a `new Promise`), the rule adds about 3 s of CPU to 14.5;
 on the 38,000-file monorepo, under 1 s. The hash-map order is modeled with
-aarch64's 8-byte control groups (the oxlint binary measured); large tables are exercised (one file
+aarch64's 8-byte control groups (the oxlint measured is darwin-arm64); large tables are exercised (one file
 has 634 JSDoc comments, its order matches). Not checked: TypeScript-only corners of the CFG beyond
 the probes, and the order on an x86-64 oxlint (16-byte groups), which can differ in tables of more
 than 16 buckets.
