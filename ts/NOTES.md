@@ -103,6 +103,14 @@ finds `existing` in the table its kind belongs to, then:
   the first pair that prints the same but is two types, where they first differ (`TDIFF`: members,
   alias arguments, type arguments, mappers). Two copies of one type usually mean an instantiation
   tsc's caches make once: the copies are then compared structurally and reach what isn't modeled.
+- `VLINT_VTSC_DEBUG=2` says `NOLINT f` for a file vtsc checked but whose type-aware rules
+  didn't all run (a rule reached something not modeled, `unsup_here`): `VTSC_RULE_WHY=1` prints
+  what (`RULEWHY f: ...`). Such a file reports no type-aware diagnostics, so every directive in it
+  for a type-aware rule comes out as unused.
+- `base_sig` (getBaseSignature, used when inferring from a generic signature, `Parameters<F>` of
+  a generic F) keeps a constraint that names the signature's own type parameters (`E extends
+  Ev<C>`) and resolves it through the others' constraints as tsc does; `VTSC_BASE_OWN=0` turns
+  that back into unknown (what it was before; about 1% fewer instructions on one package).
 - vlint's output must not depend on scheduling: the dynamic work queue (the default) hands
   files to whichever worker is free, so each worker's caches see a different order, and the
   per-statement instantiation budget or an alias's display name can differ between runs (one

@@ -3194,19 +3194,6 @@ fn same_default(var c: C, dt: Int, at: Int) -> Bool:
     if da[i] != aa[i]: return false
   return true
 
-fn id_byte(ch: Int) -> Bool:
-  return (ch >= 48 and ch <= 57) or (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122) or ch == 95 or ch == 36 or ch >= 128
-
-fn word_in(src: Str, a: Int, b: Int, w: Str) -> Bool:
-  var i = a
-  while i + w.len <= b:
-    if src[i..i + w.len] == w:
-      let before = i == a or not id_byte(int(src[i - 1]))
-      let after = i + w.len >= b or not id_byte(int(src[i + w.len]))
-      if before and after: return true
-    i += 1
-  return false
-
 fn ctor_args_infer(var c: C, r: Run, n: Int, tps: [Int]) -> Bool:
   if c.t.nd[n].k != ast.N_NEW or call_args(c, n).len == 0: return false
   if not (n in c.call_sig): return false
@@ -3223,14 +3210,12 @@ fn ctor_args_infer(var c: C, r: Run, n: Int, tps: [Int]) -> Bool:
     if sn >= 0: pl = c.t.nd[sn].b
   else: pl = c.t.nd[d].b
   if pl < 0: return false
-  var names: [Str] = []
-  for tp in tps:
-    if c.t.nd[tp].s >= 0: names.push(c.t.names[c.t.nd[tp].s] + "")
+  # (the constructor may be declared in another file: its type nodes, by name)
   for p in ast.items(c.t, pl):
     let tn = c.t.nd[p].b
-    if tn < 0 or c.t.nd[tn].file != r.file: continue
-    for w in names:
-      if word_in(r.src, c.t.nd[tn].pos, c.t.nd[tn].end, w): return true
+    if tn < 0: continue
+    for tp in tps:
+      if c.t.nd[tp].s >= 0 and rel.mentions(c, tn, c.t.nd[tp].s): return true
   return false
 
 fn uta_check(var c: C, var r: Run, n: Int, argl: Int, tpl: Int):
@@ -5522,7 +5507,12 @@ fn unsafe_enum_assignment(var c: C, var r: Run, k: Int, n: Int):
   elif k == ast.N_ELEMACCESS:
     let o = skip_parens(c, c.t.nd[n].a)
     var s = -1
-    if c.t.nd[o].k == ast.N_ID: s = bind.lookup_value(&c, o, c.t.nd[o].s)
+    if c.t.nd[o].k == ast.N_ID:
+      # (an imported name: GetSymbolAtLocation is the import's own symbol, declared by the import
+      # specifier, which has no type annotation to read keys from)
+      let raw = bind.lookup_value_raw(&c, o, c.t.nd[o].s)
+      if raw >= 0 and bind.resolve_alias(&c, raw) != raw: return
+      s = bind.lookup_value(&c, o, c.t.nd[o].s)
     elif c.t.nd[o].k == ast.N_PROPACCESS: s = trules.symbol_at(&c, o)
     if s < 0: return
     var recv: [Int] = []
@@ -6484,6 +6474,23 @@ fn utp_bad_query(var c: C, n: Int, body: Int) -> Bool:
     if utp_bad_query(&c, x, body): return true
   return false
 
+# An overloaded function's or method's implementation: the type tsgolint visits (the declaration's
+# symbol's) has only the overloads' signatures, so its own type parameters are never counted.
+fn overload_impl(c: C, n: Int) -> Bool:
+  let k = c.t.nd[n].k
+  if (k != ast.N_FUNC and k != ast.N_METHOD) or fn_body(c, n) < 0: return false
+  let p = c.parent[n]
+  if p < 0 or c.t.nd[p].k != ast.N_LIST: return false
+  var prev = -1
+  for x in ast.items(c.t, p):
+    if x == n: break
+    prev = x
+  if prev < 0 or c.t.nd[prev].k != k or fn_body(c, prev) >= 0: return false
+  if k == ast.N_FUNC: return c.t.nd[prev].s >= 0 and c.t.nd[prev].s == c.t.nd[n].s
+  let a = c.t.nd[prev].a
+  let b = c.t.nd[n].a
+  return a >= 0 and b >= 0 and c.t.nd[a].k == ast.N_ID and c.t.nd[b].k == ast.N_ID and c.t.nd[a].s == c.t.nd[b].s
+
 fn unnecessary_type_params(var c: C, var r: Run, k: Int, n: Int):
   let tpl = decl_tparams(c, n)
   if tpl < 0: return
@@ -6504,7 +6511,7 @@ fn unnecessary_type_params(var c: C, var r: Run, k: Int, n: Int):
     cands.push(tp)
     csyms.push(sym)
     crefs.push(refs)
-  if cands.len == 0: return
+  if cands.len == 0 or overload_impl(c, n): return
   # (typeof x in a type the checker leaves unresolved)
   if utp_bad_query(&c, n, body): return
   var u = UtpCount({}, {}, cands.len, {}, {}, false, false, false)
@@ -6584,8 +6591,26 @@ fn sym_deprecation(c: C, s: Int) -> Str:
   if s in c.order_decl:
     let md = c.sdecl[s]
     let od = c.order_decl[s]
-    if od >= 0 and md >= 0 and c.t.nd[md].k == ast.N_TMAPPED and c.t.nd[md].b < 0: return node_deprecation(c, od)
+    if od >= 0 and md >= 0 and c.t.nd[md].k == ast.N_TMAPPED and (c.t.nd[md].b < 0 or filtering_as(c, c.t.nd[md].b, c.t.nd[c.t.nd[md].a].s)): return node_deprecation(c, od)
   return NO_DEP
+
+# (getMappedTypeNameTypeKind: an as clause whose type is assignable to the key type parameter,
+# P extends X ? never : P, only filters keys; tsc links such a property's declarations still.
+# Decided by the clause's shape: P itself, never, P & X, or a conditional of those.)
+fn filtering_as(c: C, n0: Int, tp: Int) -> Bool:
+  var n = n0
+  while n >= 0 and c.t.nd[n].k == ast.N_TPAREN: n = c.t.nd[n].a
+  if n < 0 or tp < 0: return false
+  let k = c.t.nd[n].k
+  if k == ast.N_TKW: return c.t.nd[n].f == scan.W_NEVER
+  if k == ast.N_TREF:
+    let nn = c.t.nd[n].a
+    return c.t.nd[n].b < 0 and nn >= 0 and c.t.nd[nn].k == ast.N_ID and c.t.nd[nn].s == tp
+  if k == ast.N_TCOND: return filtering_as(c, c.t.nd[n].c, tp) and filtering_as(c, c.t.nd[n].d, tp)
+  if k == ast.N_TINTER:
+    for x in ast.items(c.t, c.t.nd[n].a):
+      if filtering_as(c, x, tp): return true
+  return false
 
 fn union_read_partial(var c: C, t: Int, name: Int) -> Bool:
   if c.tk[t] != types.TK_UNION: return false

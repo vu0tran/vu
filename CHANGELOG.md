@@ -3125,3 +3125,26 @@ the rest (11 configs, 1,284 issues) match in text and JSON. revive's rules were 
 parallel groups; each group's first comparisons shared golangci-lint's cache, which doesn't notice a
 change of revive's settings, so every comparison was rerun with an empty cache. What's still
 missing for that config: the gofmt and goimports formatters (not ported: they need go/printer).
+
+**vlint: eight type-aware differences from tsgolint 7.0.2008 (2026-11-24).** Found on the React
+monorepo's per-package CI runs, each reduced to a probe in `ts/probes/` (it fails on 0.5.0):
+`no-unnecessary-type-arguments` read a constructor's parameters only when the class was in the file
+being linted (`type-args-ctor-other-file`); `no-unnecessary-type-parameters` reported an overloaded
+function's or method's implementation, whose type tsgolint visits is the overloads'
+(`type-params-overload-impl`); `no-deprecated` didn't follow a property through a mapped type whose
+`as` clause only filters keys (`P extends X ? never : P`, which tsc still links;
+`deprecated-filtering-as`); `no-unsafe-enum-assignment` read the keys of an imported receiver,
+where tsgolint's symbol is the import's and has no annotation (`enum-access-imported-receiver`).
+In vtsc: a rest element of a union of tuples (`...args: [A?, B?] | [B?]`) is spread into a union of
+tuples instead of leaving the file untyped (`tuple-rest-union-of-tuples`); an intersection with one
+iterable member is iterable (`spread-iterable-intersection`); an array literal's elements in an
+`A[] | B[]` context get the union of the element types, not the last member's
+(`array-ctx-union-of-arrays`); and inferring from a generic signature keeps a constraint naming the
+signature's own type parameters, as getBaseSignature does (`base-signature-own-constraints`; one
+package measured 0.9% more instructions). Over the 87 runs other than the largest package, 10
+diagnostics that differed from oxlint 1.94.0 now match and none that matched differs. Not fixed: a
+file narrowing a deferred conditional type with `in` (`'x' in mock`, vitest's `MaybeMocked<T>`)
+stays untyped; narrowing it as tsc does moves the stop to an assertion relating that conditional
+type to an intersection, which vtsc doesn't model. vtsc's 813 cases give the same output as
+before (byte for byte; 3 of them fail with the lib folder used here, before and after), and the
+116 saved probes all match.
