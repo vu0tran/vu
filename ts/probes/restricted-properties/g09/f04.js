@@ -1,0 +1,1 @@
+let {bar: {baz: qux}} = foo;

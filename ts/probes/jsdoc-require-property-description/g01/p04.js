@@ -1,0 +1,6 @@
+
+			          /**
+			           * @class
+			           * @property foo Foo.
+			           */
+			      

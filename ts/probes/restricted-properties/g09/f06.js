@@ -1,0 +1,1 @@
+let bar; ({bar: baz = 1} = foo);

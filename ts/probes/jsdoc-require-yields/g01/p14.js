@@ -1,0 +1,7 @@
+
+                              /**
+                               * @yields {undefined}
+                               */
+                              function * quux () {
+                              }
+                          

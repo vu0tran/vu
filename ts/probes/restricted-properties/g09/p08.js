@@ -1,0 +1,1 @@
+function qux({baz: bar} = foo) {}

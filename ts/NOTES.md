@@ -22,6 +22,9 @@ and how well; this file says where things are. Keep it current when you move thi
 | `vlint.vu` | vlint's driver: CLI, file walk, workers, tsgolint, output |
 | `rules.vu` | the `L` state, the walk, oxlint's default rules, semantic errors (below) |
 | `rmore.vu` … `rmore8.vu` | non-default rules ported in batches (each file's header lists its rules); `rmore.vu` has the `newr` scheme: setup says which node kinds a rule needs, `node()` runs them |
+| `rmore9.vu` | more non-default rules (its header lists them); it also runs the jsdoc rules (`jsdoc_rules`) and rmore11's |
+| `rjsdoc.vu` | the jsdoc plugin: oxc_jsdoc 1.94's parser (`parse_one`, a tag's parts in `tnc`), which comments are JSDoc and the token each is attached to (`leading_docs`: oxc's trivia rules), the node a function's JSDoc belongs to (`nearest_doc`), iter_all's FxHashMap order (`doc_order`, `hb_order`), settings, and its 9 rules |
+| `rmore11.vu` | eslint(no-restricted-properties); promise(no-multiple-resolved) on a model of oxc_cfg's graph (`build_cfg`/`cv`: blocks and edges as SemanticBuilder adds them; `mr_check`: the rule's walk) |
 | `ra11y.vu`, `ra11y2.vu` | jsx-a11y |
 | `rhooks.vu` | react-hooks(exhaustive-deps) |
 | `rimport.vu`, `lmod.vu`, `lresolve.vu` | import plugin rules on the module graph, module records, resolution |

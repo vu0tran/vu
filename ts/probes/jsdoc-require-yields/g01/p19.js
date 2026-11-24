@@ -1,0 +1,6 @@
+
+                              /**
+                               *
+                               */
+                              const quux = async function * () {}
+                          
