@@ -376,6 +376,103 @@ type GRes:
   rec: Rec
   more: [Rec]           # a partial file: its other sections (rec is the last), and each one's start
   sec: [Int]
+  croot: Str = ""       # (the record cache) a record parsed now that belongs in it: its package's
+  cline: Str = ""       # root and its line (state, then the record before resolution, as JSON)
+
+# ---- the record cache: a dependency's records (files under node_modules) kept between runs, in
+# $XDG_CACHE_HOME/vlint/modrec-VERSION/HASH (one file per package root, a line a file: path, its
+# stat_any, the record's JSON before its requests are resolved). A record is used when the file's
+# state is the same; one whose file changed in the 2 s before it was read isn't kept. Every package
+# a CI job lints walks much of the same node_modules (no-barrel-file follows all of it): the second
+# package on reads the records instead of the files.
+type PkgC:
+  ok: Bool = false
+  lines: {Str: Str} = {}    # path -> "state\tjson"
+
+fn pkg_root(p: Str) -> Str:
+  var i = -1
+  var at = p.find("/node_modules/")
+  while at >= 0:
+    i = at
+    at = p.find("/node_modules/", at + 1)
+  if i < 0: return ""
+  var j = i + 14
+  var k = p.find("/", j)
+  if k < 0: return ""
+  if p[j] == '@':
+    k = p.find("/", k + 1)
+    if k < 0: return ""
+  return p[0..k]
+
+fn lconf_slash(p: Str) -> Int:
+  var i = p.len - 1
+  while i > 0 and p[i] != '/': i -= 1
+  return i
+
+fn cache_file(cdir: Str, root: Str) -> Str:
+  return cdir + "/" + lcache.hex16(lcache.hash64(root))
+
+fn load_pkgc(fs: Fs, cdir: Str, root: Str) -> PkgC:
+  var pc = PkgC(ok: true)
+  let txt = fs.read(cache_file(cdir, root)) else ""
+  if txt == "": return pc
+  for l in txt.split("\n"):
+    let a = l.find("\t")
+    if a <= 0: continue
+    pc.lines[l[0..a]] = l[a + 1..l.len]
+  return pc
+
+# A dependency's record from the cache ("" ok false when it has none for the file as it is now)
+fn cached_rec(ffi: Ffi, pcm: Memo[Str, PkgC], fs: Fs, cdir: Str, root: Str, path: Str, var ok: Bool) -> Rec:
+  ok = false
+  let v = pcm.get(root, fn(k) => load_pkgc(fs, cdir, k))
+  let line = v.value.lines.get(path, "")
+  if line == "": return new_rec(path)
+  let b = line.find("\t")
+  if b <= 0: return new_rec(path)
+  let st = int(line[0..b]) else 0
+  if st == 0 or st != lcache.stat_any(ffi, path): return new_rec(path)
+  let r = from_json(line[b + 1..line.len], Rec) else return new_rec(path)
+  ok = true
+  return r
+
+# parse_one through the record cache (cdir "": none)
+fn parse_cached(fs: Fs, ffi: Ffi, path: Str, i: Int, var kw: {Str: Int}, var t: ast.Ast, cdir: Str, pcm: Memo[Str, PkgC]) -> GRes:
+  if cdir == "" or lpart.is_partial(path): return parse_one(fs, path, i, &kw, &t)
+  let root = pkg_root(path)
+  if root == "": return parse_one(fs, path, i, &kw, &t)
+  var hit = false
+  var r = cached_rec(ffi, pcm, fs, cdir, root, path, &hit)
+  if hit: return GRes(i, r, [], [])
+  let st = lcache.stat_any(ffi, path)
+  let t0 = lcache.now_ns(ffi)
+  var g = parse_one(fs, path, i, &kw, &t)
+  if st != 0 and g.rec.ok and not lcache.changed_since(ffi, path, t0 - 2000000000) and lcache.stat_any(ffi, path) == st:
+    g.croot = root
+    g.cline = "{st}\t" + to_json(g.rec)
+  return g
+
+# The records parsed now written to their packages' cache files, with the ones read (each file
+# written to a temporary name and renamed)
+fn save_cache(fs: Fs, ffi: Ffi, cdir: Str, pcm: Memo[Str, PkgC], fresh: {Str: [Str]}):
+  if cdir == "" or fresh.len == 0: return
+  let up = cdir[0..lconf_slash(cdir)]
+  fs.mkdir(up) else 0
+  fs.mkdir(cdir) else 0
+  for root, ls in fresh:
+    let v = pcm.get(root, fn(k) => load_pkgc(fs, cdir, k))
+    var lines: {Str: Str} = {}
+    for k, x in v.value.lines: lines[k + ""] = x + ""
+    for l in ls:
+      let a = l.find("\t")
+      if a > 0: lines[l[0..a]] = l[a + 1..l.len]
+    var out: [Str] = []
+    for k, x in lines: out.push(k + "\t" + x)
+    out.sort()
+    let f = cache_file(cdir, root)
+    let tmp = f + ".tmp{lcache.now_ns(ffi)}"
+    fs.write(tmp, "\n".join(out) + "\n") else continue
+    fs.rename(tmp, f) else 0
 
 # What each request of a record resolves to (its real path, "" none), into rq_path
 type Rs:
@@ -405,14 +502,14 @@ type Job:
   idx: Int
   path: Str
 
-fn gworker(fs: Fs, ffi: Ffi, own jobs: Chan[Job], own res: Chan[GRes], own kms: [Memo[Str, Int]]):
+fn gworker(fs: Fs, ffi: Ffi, own jobs: Chan[Job], own res: Chan[GRes], own kms: [Memo[Str, Int]], own cdir: Str, own pcm: Memo[Str, PkgC]):
   var kw = scan.keywords()
   var t = new_tree()
   var rs = new_rs()
   swap(&rs.rv.km, &kms)
   while true:
     let j = jobs.recv() else return
-    var g = parse_one(fs, j.path, j.idx, &kw, &t)
+    var g = parse_cached(fs, ffi, j.path, j.idx, &kw, &t, cdir, pcm)
     resolve_res(fs, ffi, &rs, &g, j.path)
     res.send(g)
 
@@ -466,7 +563,9 @@ fn place(var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
         r.rq_res[j] = g.at[target]
     swap(&g.recs[slots[si]], &r)
 
-fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool, var kw: {Str: Int}, var t: ast.Ast) -> Graph:
+fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool, var kw: {Str: Int}, var t: ast.Ast, cdir: Str) -> Graph:
+  let pcm: Memo[Str, PkgC] = memo()
+  var fresh: {Str: [Str]} = {}
   var g = new_graph()
   g.on = true
   g.full = full
@@ -490,9 +589,11 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
       let ji = todo[k].idx
       let jp = todo[k].path + ""
       k += 1
-      var gr = parse_one(fs, jp, ji, &kw, &t)
+      var gr = parse_cached(fs, ffi, jp, ji, &kw, &t, cdir, pcm)
+      if gr.croot != "": note_fresh(&fresh, gr)
       resolve_res(fs, ffi, &rs, &gr, jp)
       place(&g, &gr, pshown, &todo)
+    save_cache(fs, ffi, cdir, pcm, fresh)
     return g
   # workers that stay for the whole graph (their resolvers' caches with them); a record's new
   # requests are queued as soon as it's placed
@@ -508,7 +609,7 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
   for w in 0..threads:
     var mine: [Memo[Str, Int]] = []
     for m in kms: mine.push(m.share())
-    spawn gworker(fs, ffi, jc, rc, mine)
+    spawn gworker(fs, ffi, jc, rc, mine, cdir + "", pcm.share())
   var pending = 0
   var sent = 0
   while sent < todo.len:
@@ -518,13 +619,19 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
   while pending > 0:
     var gr = rc.recv() else break
     pending -= 1
+    if gr.croot != "": note_fresh(&fresh, gr)
     place(&g, &gr, pshown, &todo)
     while sent < todo.len:
       jc.send(Job(todo[sent].idx, todo[sent].path + ""))
       sent += 1
       pending += 1
   jc.close()
+  save_cache(fs, ffi, cdir, pcm, fresh)
   return g
+
+fn note_fresh(var fresh: {Str: [Str]}, gr: GRes):
+  if not (gr.croot in fresh): fresh[gr.croot + ""] = []
+  fresh[gr.croot].push(gr.rec.path + "\t" + gr.cline)
 
 # the record a request of record ri loads (-1 none, or not read)
 fn loaded(g: Graph, ri: Int, name: Str) -> Int:
