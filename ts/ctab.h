@@ -252,6 +252,93 @@ static inline bool cl_has(void *p, int64_t r, int64_t v) {
   return false;
 }
 
+// Attributes kept by a row's index (a type's alias, a symbol's further declarations), written for few
+// rows: a column (cx_*) or a list column (ckl_*) whose region is zero where nothing was written.
+// cx_ keeps a value + CX_OFF (0: none, so -1 and other negative markers can be kept); ckl_'s pool
+// starts at 1, so a row holding a list (even an empty one) has a nonzero offset. A value is written
+// with a release store after what it points to, so a reader that sees it sees the rest; written
+// again (a few sites still do: types.vu's CX notes), a reader may see either.
+#define CX_OFF ((int64_t)1 << 40)
+static inline bool cx_has(void *h, int64_t k) { return ct_get0(h, k) != 0; }
+static inline int64_t cx_get(void *h, int64_t k, int64_t d) {
+  const int64_t *p = h;
+  if ((uint64_t)k >= (uint64_t)ct_len0(p)) return d;
+  int64_t v = __atomic_load_n(&p[k], __ATOMIC_ACQUIRE);
+  return v == 0 ? d : v - CX_OFF;
+}
+static inline int64_t cx_at(void *h, int64_t k) {
+  int64_t v = ct_get0(h, k);
+  if (v == 0) vu_panic(0, "cx_at: no value for that row", 28);
+  return v - CX_OFF;
+}
+static inline void cx_put(void *h, int64_t k, int64_t v) {
+  int64_t *p = h;
+  if ((uint64_t)k >= (uint64_t)CT_MAX) vu_panic(0, "cx_put: index out of range", 26);
+  __atomic_store_n(&p[k], v + CX_OFF, __ATOMIC_RELEASE);
+  ct_cover(p, k + 1);
+}
+static inline void cx_del(void *h, int64_t k) {
+  int64_t *p = h;
+  if ((uint64_t)k < (uint64_t)ct_len0(p)) __atomic_store_n(&p[k], 0, __ATOMIC_RELEASE);
+}
+static inline void *ckl_new(void *st) {
+  cl_t *h = cl_new(st);
+  h->pool[-1] = 1;
+  return h;
+}
+// row k's (offset, length), NULL when it holds no list
+static inline const int64_t *ckl_rp(const cl_t *h, int64_t k) {
+  if ((uint64_t)k >= (uint64_t)(ct_len0(h->row) >> 1)) return NULL;
+  const int64_t *rp = &h->row[2 * k];
+  if (__atomic_load_n(&rp[0], __ATOMIC_ACQUIRE) == 0) return NULL;
+  return rp;
+}
+static inline bool ckl_has(void *p, int64_t k) { return ckl_rp(p, k) != NULL; }
+static inline int64_t ckl_len(void *p, int64_t k) {
+  const int64_t *rp = ckl_rp(p, k);
+  return rp ? rp[1] : 0;
+}
+static inline int64_t ckl_at(void *p, int64_t k, int64_t i) {
+  const cl_t *h = p;
+  const int64_t *rp = ckl_rp(h, k);
+  if (!rp || (uint64_t)i >= (uint64_t)rp[1]) vu_panic(0, "ckl_at: index out of range", 26);
+  return h->pool[rp[0] + i];
+}
+static inline void ckl_fill(void *p, int64_t k, int64_t *out, int64_t n) {
+  const cl_t *h = p;
+  const int64_t *rp = ckl_rp(h, k);
+  if (!rp) return;
+  if (n > rp[1]) n = rp[1];
+  for (int64_t i = 0; i < n; i++) out[i] = h->pool[rp[0] + i];
+}
+// row k's list set to xs (written at the pool's end, then published)
+static inline void ckl_set(void *p, int64_t k, const int64_t *xs, int64_t n) {
+  cl_t *h = p;
+  if ((uint64_t)k >= (uint64_t)(CT_MAX / 2)) vu_panic(0, "ckl_set: row out of range", 25);
+  int64_t at = cl_res(h, n);
+  for (int64_t i = 0; i < n; i++) h->pool[at + i] = xs[i];
+  int64_t *rp = &h->row[2 * k];
+  __atomic_store_n(&rp[1], n, __ATOMIC_RELAXED);
+  __atomic_store_n(&rp[0], at, __ATOMIC_RELEASE);
+  ct_cover(h->row, 2 * k + 2);
+}
+// v appended to row k's list (a list made when it has none)
+static inline void ckl_add(void *p, int64_t k, int64_t v) {
+  cl_t *h = p;
+  const int64_t *rp = ckl_rp(h, k);
+  if (!rp) {
+    ckl_set(p, k, &v, 1);
+    return;
+  }
+  cl_add(p, k, v);
+}
+static inline void ckl_del(void *p, int64_t k) {
+  cl_t *h = p;
+  if ((uint64_t)k >= (uint64_t)(ct_len0(h->row) >> 1)) return;
+  __atomic_store_n(&h->row[2 * k], 0, __ATOMIC_RELEASE);
+  h->row[2 * k + 1] = 0;
+}
+
 // Object types' properties by (object, name): the key object << 32 | name (both under 2^31). A fixed
 // array of bucket heads, each a chain of entries (next, key, symbol) in an append-only pool, linked in
 // by a compare-and-swap on the head as ik_* below, so nothing is ever moved under a reader and two
