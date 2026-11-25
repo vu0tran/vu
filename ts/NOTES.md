@@ -451,6 +451,19 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   133/133, the CI job's 88 outputs byte-identical, no panic; 18.64 / 16.85 / 55.18 G instructions
   (+0.9, +0.5, 0.0% on the pre-M3 base). For M4, binding must still be finished before the threads
   start (VTSC_EAGER_BIND's pass), or two workers naming one scope would make two symbols for it.
+- Step 3.3, `stype` set once (landed 2026-11-24): the column holds only final types, each
+  published once by `ct_publish` (ctab.h: a compare-and-swap from -1; it returns what was there).
+  What isn't final is the worker's own, in `c.st_tmp` (read first by `types.sty`, the only reader of
+  the column): the in-progress marker -2, the resets to -1 (types made while an alias is made,
+  `cyc_taint`; a deferred function's speculative declarations, `spec_reset`; a pattern's circular
+  binding, `pat_circ`), the early types set over a -2 (`as_early`, `fn_var_hook`), and any type made
+  while `c.spec > 0` or an alias is being made (`c.alias_busy`), since those are what the resets undo.
+  Writes: `sty_init` (a new symbol's type: published), `sty_put` (a lazily made one: published unless
+  it may be made again), `sty_tmp`. VTSC_SO_CHECK=1 panics when a published type would change or be
+  reset. Its first run found republishing of the same type inside a speculative check (now allowed);
+  after that, with the check on: vtests the same 3 failures byte for byte, probes 133/133, the CI
+  job's 88 outputs byte-identical with no panic (and again with the check off). 18.59 / 16.90 /
+  55.73 G instructions (+0.6, +0.8, +1.0% on the pre-M3 base): the markers are map entries now.
 - Then step 4: `var c: C` split into the shared tables and a per-worker state, and M4: N checker
   threads over the shared tables behind a switch, off by default. M4's gates: 1, 2, 4 and 8 threads,
   20 runs each, byte-identical on the 88 invocations and the probes; TSan with CC=clang and Archer as

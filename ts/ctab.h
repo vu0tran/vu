@@ -34,6 +34,15 @@ static inline void ct_set(void *h, int64_t i, int64_t v) {
   if ((uint64_t)i >= (uint64_t)p[-2]) vu_panic(0, "ct_set: index out of range", 26);
   p[i] = v;
 }
+// An entry set once: from -1 (unset) to v with a compare-and-swap; -1 when this call set it, else the
+// value that was there (which a second publisher must find equal to its own: types.sty_put).
+static inline int64_t ct_publish(void *h, int64_t i, int64_t v) {
+  int64_t *p = h;
+  if ((uint64_t)i >= (uint64_t)p[-2]) vu_panic(0, "ct_publish: index out of range", 30);
+  int64_t old = -1;
+  if (__atomic_compare_exchange_n(&p[i], &old, v, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) return -1;
+  return old;
+}
 static inline int64_t ct_len(void *h) { return __atomic_load_n(&((const int64_t *)h)[-2], __ATOMIC_ACQUIRE); }
 
 // A list column: a list of Ints per row, each row an (offset, length) pair into a pool of Ints, both
