@@ -507,9 +507,12 @@ Resolving a dependency that no-barrel-file follows whole in the workers (told so
 instead of by the main task: 0.25 G more on a package with 2,282 such records (four workers'
 caches miss what the main task's one cache has).
 
-Found, not fixed: lmod.build_record panics (`nm` of a node whose name is -1) on a file with some
-syntax errors (a node_modules test fixture; a linted file or a dependency like it would stop
-vlint). vlint doesn't report import(namespace) on a member of a namespace a dependency imports and
+Fixed since: lmod.build_record panicked (`nm` of a node whose name is -1) on a file with some
+syntax errors (a node_modules test fixture ending in a bare `import`; a linted file or a dependency
+like it stopped vlint). A file whose parse reports errors and left an identifier, string or
+specifier without its name now gets no record (lmod.unnamed), as oxlint has none for a file that
+doesn't parse: its imports aren't checked against it, and a star re-export of it adds no names
+(probe dep-syntax-error, which matches oxlint 1.79). Found, not fixed: vlint doesn't report import(namespace) on a member of a namespace a dependency imports and
 exports again (`import * as held from './held.js'; export { held }`, then `ns.held.nope`); oxlint
 does, before these changes too.
 
