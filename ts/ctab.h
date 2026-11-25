@@ -35,3 +35,104 @@ static inline void ct_set(void *h, int64_t i, int64_t v) {
   p[i] = v;
 }
 static inline int64_t ct_len(void *h) { return __atomic_load_n(&((const int64_t *)h)[-2], __ATOMIC_ACQUIRE); }
+
+// A list column: a list of Ints per row, each row an (offset, length) pair into a pool of Ints, both
+// append-only regions as above. A row is changed by writing its list again at the pool's end (or, when
+// it already ends the pool, by appending to it), so an entry once written is never moved or overwritten
+// by another row's list.
+typedef struct { int64_t *row; int64_t *pool; } cl_t;
+static inline void *cl_new(void) {
+  cl_t *h = malloc(sizeof *h);
+  if (!h) vu_panic(0, "cl_new: out of memory", 21);
+  h->row = ct_new();
+  h->pool = ct_new();
+  return h;
+}
+static inline void cl_free(void *p) {
+  cl_t *h = p;
+  ct_free(h->row);
+  ct_free(h->pool);
+  free(h);
+}
+static inline int64_t cl_rows(void *p) { return ct_len(((cl_t *)p)->row) >> 1; }
+// a new row holding an empty list; its index
+static inline int64_t cl_row(void *p) {
+  cl_t *h = p;
+  int64_t r = h->row[-2];
+  if (r + 2 > CT_MAX) vu_panic(0, "cl_row: a list column is full", 29);
+  h->row[r] = h->pool[-2];
+  h->row[r + 1] = 0;
+  __atomic_store_n(&h->row[-2], r + 2, __ATOMIC_RELEASE);
+  return r >> 1;
+}
+static inline int64_t *cl_rp(cl_t *h, int64_t r) {
+  if (__builtin_expect((uint64_t)r >= (uint64_t)(h->row[-2] >> 1), 0)) vu_panic(0, "cl: row out of range", 20);
+  return &h->row[2 * r];
+}
+static inline int64_t cl_len(void *p, int64_t r) { return cl_rp(p, r)[1]; }
+static inline int64_t cl_at(void *p, int64_t r, int64_t i) {
+  cl_t *h = p;
+  const int64_t *rp = cl_rp(h, r);
+  if (__builtin_expect((uint64_t)i >= (uint64_t)rp[1], 0)) vu_panic(0, "cl_at: index out of range", 25);
+  return h->pool[rp[0] + i];
+}
+static inline void cl_put(void *p, int64_t r, int64_t i, int64_t v) {
+  cl_t *h = p;
+  const int64_t *rp = cl_rp(h, r);
+  if ((uint64_t)i >= (uint64_t)rp[1]) vu_panic(0, "cl_put: index out of range", 26);
+  h->pool[rp[0] + i] = v;
+}
+static inline void cl_need(cl_t *h, int64_t n) {
+  if (h->pool[-2] + n > CT_MAX) vu_panic(0, "cl: a list pool is full", 23);
+}
+// the row's list moved to the pool's end (unless it is there already), so that it can grow there
+static inline int64_t *cl_tail(cl_t *h, int64_t r, int64_t extra) {
+  int64_t *rp = cl_rp(h, r);
+  int64_t off = rp[0], n = rp[1], end = h->pool[-2];
+  if (off + n != end || n == 0) {
+    cl_need(h, n + extra);
+    for (int64_t i = 0; i < n; i++) h->pool[end + i] = h->pool[off + i];
+    __atomic_store_n(&h->pool[-2], end + n, __ATOMIC_RELEASE);
+    rp[0] = end;
+  } else {
+    cl_need(h, extra);
+  }
+  return rp;
+}
+static inline void cl_add(void *p, int64_t r, int64_t v) {
+  cl_t *h = p;
+  int64_t *rp = cl_tail(h, r, 1);
+  int64_t end = h->pool[-2];
+  h->pool[end] = v;
+  __atomic_store_n(&h->pool[-2], end + 1, __ATOMIC_RELEASE);
+  rp[1] += 1;
+}
+static inline void cl_pop(void *p, int64_t r) {
+  int64_t *rp = cl_rp(p, r);
+  if (rp[1] == 0) vu_panic(0, "cl_pop: the list is empty", 25);
+  rp[1] -= 1;
+}
+static inline void cl_set(void *p, int64_t r, const int64_t *xs, int64_t n) {
+  cl_t *h = p;
+  int64_t *rp = cl_rp(h, r);
+  int64_t end = h->pool[-2];
+  cl_need(h, n);
+  for (int64_t i = 0; i < n; i++) h->pool[end + i] = xs[i];
+  __atomic_store_n(&h->pool[-2], end + n, __ATOMIC_RELEASE);
+  rp[0] = end;
+  rp[1] = n;
+}
+static inline void cl_fill(void *p, int64_t r, int64_t *out, int64_t n) {
+  cl_t *h = p;
+  const int64_t *rp = cl_rp(h, r);
+  if (n > rp[1]) n = rp[1];
+  for (int64_t i = 0; i < n; i++) out[i] = h->pool[rp[0] + i];
+}
+static inline bool cl_has(void *p, int64_t r, int64_t v) {
+  cl_t *h = p;
+  const int64_t *rp = cl_rp(h, r);
+  const int64_t *xs = &h->pool[rp[0]];
+  for (int64_t i = 0; i < rp[1]; i++)
+    if (xs[i] == v) return true;
+  return false;
+}

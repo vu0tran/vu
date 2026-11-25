@@ -377,11 +377,24 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   16.77 -> 17.21-17.44 (+2.6-4.0%), 1,127 files 55.20 -> 56.45 (+2.3%) (no par check at all would be
   +0.4%: the rest is the check at each function's start, which makes small leaf functions keep a
   frame). Probes 133/133, vtest the same 3 failures, the CI job's 88 outputs byte-identical.
-- Next (M3 step 2): Obj and Sig as columns, one struct kind at a time. The fields filled in place
-  after an object is made (`objs[o].args`/`.eflags`/`.sidx`/`.nidx`/`.resolved`, `sigs[s].tparams`/
-  `.ret`) become compute-once slots; the Int fields can use `ctab.h` as the flat tables do, the
-  list and map fields need a C layout of their own (an Int column of offsets into a shared Int pool
-  is the likely one: append-only, never moved).
+- M3 step 2a, signatures as columns (landed 2026-11-24): `Sig`'s Int fields (`ret min node this_t
+  pred_i pred_t`) are ctab columns `c.hs_*`; its lists (`tparams pnames ptypes pflags`) are list
+  columns (`types.Lst`, `cl_*` in ctab.h: each row an (offset, length) into an append-only pool of
+  Ints; a row is changed by writing its list again at the pool's end, or by appending when it ends
+  the pool already, so an entry once written never moves or changes under another row). A list read
+  whole is a copy (`types.cl_ints`); `types.Sig` stays as a value (`sig_copy`, changed, then
+  `sig_push`/`sig_put`). Rewritten by the session's scratch `m3s/sconv.py DIR TABLE HPFX SCALARS LISTS
+  [BOOLS]` (reads, writes, a list's `[i]`, `.len`, `.push`, `.pop`, `= list`, `ints(...)`,
+  `has_int(...)`) and `m3s/hoist2.py` (a write whose value changes `c`, 7 sites). With it, the
+  par-loop check made free (vu: `ffi_reach`, the functions no par loop can reach get `VU_FFI_OFF`; all
+  1,009 of vlint's functions that call C): 79 files 18.62 G instructions, 221 files 16.90, 1,127 files
+  55.19 (+0.8, +0.8, 0.0% on the pre-M3 base; 18.85, 17.24, 56.40 at step 1). Probes 133/133, vtest
+  the same 3 failures byte for byte, the CI job's 88 outputs byte-identical.
+- Next (M3 step 2b): Obj as columns. Its Int and Bool fields (`kind sym node sidx nidx target mapper
+  display sname nname mcons`, `resolved fresh ro`) as ctab columns, its lists (`calls ctors tparams
+  args eflags`) as list columns (`sconv.py . objs ho_ SCALARS LISTS BOOLS`, which writes a Bool as
+  `b2i`, reads it as `!= 0`); `props` (a map, iterated in insertion order in bind.vu 5722/5736) and
+  `order` can stay in a smaller Vu `Obj` for that step. Then the compute-once slots and step 3.
 
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
