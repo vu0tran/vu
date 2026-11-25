@@ -586,6 +586,24 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   root. With that, VTSC_SO_CHECK=1 panics on any scope named after checking starts, scripts' roots
   included. Probes 133/133, vtests' 3 failures byte for byte, the CI job's 88 outputs
   byte-identical, all with VTSC_SO_CHECK=1 and no panic; 18.60 / 16.55 / 54.45 G instructions.
+- Step 4.4, the tables' appends safe for several tasks (landed 2026-11-24): a list column's pool
+  is reserved by fetch-add (`cl_res`); `cl_add` grows a row in place only by a compare-and-swap of
+  the pool's end from the row's end, else writes the row again in a new reservation (single-threaded,
+  the same offsets as before). The property table (`ph_*`) is chained as `ik_*` (2^20 bucket heads,
+  entries in an append-only pool, linked by compare-and-swap), so nothing moves under a reader:
+  `ph_grow` is gone. A literal type and its fresh copy take two rows at once (`types.mk2`, ctab.h
+  `cg_rows`), so the fresh one is always the next row (`fresh_of`, `regular_of`). `sig_push` returns
+  the signature's id: the five chk.vu sites that took `ct_len(hs_node)` before pushing use it.
+  tyops' `tk0` watermark is left: it only feeds the debug counts (`c.debug_counts`). Bounds checks
+  read a column's length with a relaxed atomic load (`ct_len0`), which TSan wants. `ctab_stress.vu`:
+  8 tasks find-or-add 4,000 keys 80,000 times each in `ik_*`, `ns_*`, `ph_*`, `ct_publish`, with
+  `cg_rows` and `cl_add`/`cl_set` rows among them, then check every task got one id per key; under
+  TSan (`CC=clang ../vu build --tsan`) 10 runs clean, exit 0 (the first runs found the length
+  races above); a planted bug (ik_put/ns_put not walking the entries added after their first look)
+  is caught every run. Archer isn't installed on this Mac (only needed for par loops). Probes
+  133/133, vtests' 3 failures byte for byte, the CI job's 88 outputs byte-identical, each with and
+  without VTSC_SO_CHECK=1 (no panic); 18.55 / 16.50 / 54.32 G instructions (+0.4, -1.6, -1.6% on
+  the pre-M3 base).
 - Next (step 4.3's rest, in order): the other interning maps as `ik_*` keys (`strlits`,
   `numlits`/`nums`/`numtext`, `biglits`, `unions` (Str keys), `tmpls`/`tmpl_ids`,
   `mappers`/`mapper_ids` (and `c.mappers` itself: a list column of from and to), `inst_cache`,

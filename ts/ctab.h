@@ -60,6 +60,12 @@ static inline int64_t cg_row(void *g) {
   if (r >= CT_MAX / 2) vu_panic(0, "cg_row: a table group is full", 29);
   return r;
 }
+// n consecutive rows taken at once (a literal type and its fresh copy): the first
+static inline int64_t cg_rows(void *g, int64_t n) {
+  int64_t r = __atomic_fetch_add((int64_t *)g, n, __ATOMIC_RELAXED);
+  if (r + n > CT_MAX / 2) vu_panic(0, "cg_rows: a table group is full", 30);
+  return r;
+}
 static inline int64_t cg_len(void *g) { return __atomic_load_n((const int64_t *)g, __ATOMIC_ACQUIRE); }
 static inline void *ct_mk(void) {
   int64_t *r = mmap(NULL, (size_t)(CT_MAX + 2) * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
@@ -75,6 +81,8 @@ static inline void *ct_new(void *st) {
   cs_add(st, t, 0);
   return t;
 }
+// a column's length, as a bounds check reads it (relaxed: no order needed, see ct_at)
+static inline int64_t ct_len0(const int64_t *p) { return __atomic_load_n(&p[-2], __ATOMIC_RELAXED); }
 // the column's length raised to at least n (a row of its group written: ct_put, cl_init)
 static inline void ct_cover(int64_t *p, int64_t n) {
   int64_t l = __atomic_load_n(&p[-2], __ATOMIC_RELAXED);
@@ -99,20 +107,21 @@ static inline int64_t ct_run(void *h, const int64_t *xs, int64_t n) {
 }
 static inline int64_t ct_at(void *h, int64_t i) {
   const int64_t *p = h;
-  // (a plain load: a reader only asks for entries made before it was given their index)
-  if (__builtin_expect((uint64_t)i >= (uint64_t)p[-2], 0)) vu_panic(0, "ct_at: index out of range", 25);
+  // (the entry a plain load: a reader only asks for entries made before it was given their index;
+  // the length a relaxed one, since other tasks raise it meanwhile: the same instruction)
+  if (__builtin_expect((uint64_t)i >= (uint64_t)ct_len0(p), 0)) vu_panic(0, "ct_at: index out of range", 25);
   return p[i];
 }
 static inline void ct_set(void *h, int64_t i, int64_t v) {
   int64_t *p = h;
-  if ((uint64_t)i >= (uint64_t)p[-2]) vu_panic(0, "ct_set: index out of range", 26);
+  if ((uint64_t)i >= (uint64_t)ct_len0(p)) vu_panic(0, "ct_set: index out of range", 26);
   p[i] = v;
 }
 // An entry set once: from -1 (unset) to v with a compare-and-swap; -1 when this call set it, else the
 // value that was there (which a second publisher must find equal to its own: types.sty_put).
 static inline int64_t ct_publish(void *h, int64_t i, int64_t v) {
   int64_t *p = h;
-  if ((uint64_t)i >= (uint64_t)p[-2]) vu_panic(0, "ct_publish: index out of range", 30);
+  if ((uint64_t)i >= (uint64_t)ct_len0(p)) vu_panic(0, "ct_publish: index out of range", 30);
   int64_t old = -1;
   if (__atomic_compare_exchange_n(&p[i], &old, v, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) return -1;
   return old;
@@ -148,7 +157,7 @@ static inline void cl_init(void *p, int64_t r) {
   ct_cover(h->row, 2 * r + 2);
 }
 static inline int64_t *cl_rp(cl_t *h, int64_t r) {
-  if (__builtin_expect((uint64_t)r >= (uint64_t)(h->row[-2] >> 1), 0)) vu_panic(0, "cl: row out of range", 20);
+  if (__builtin_expect((uint64_t)r >= (uint64_t)(ct_len0(h->row) >> 1), 0)) vu_panic(0, "cl: row out of range", 20);
   return &h->row[2 * r];
 }
 static inline int64_t cl_len(void *p, int64_t r) { return cl_rp(p, r)[1]; }
@@ -164,30 +173,29 @@ static inline void cl_put(void *p, int64_t r, int64_t i, int64_t v) {
   if ((uint64_t)i >= (uint64_t)rp[1]) vu_panic(0, "cl_put: index out of range", 26);
   h->pool[rp[0] + i] = v;
 }
-static inline void cl_need(cl_t *h, int64_t n) {
-  if (h->pool[-2] + n > CT_MAX) vu_panic(0, "cl: a list pool is full", 23);
+// n entries of the pool reserved (a fetch-add on its reservation counter): where they start
+static inline int64_t cl_res(cl_t *h, int64_t n) {
+  int64_t at = __atomic_fetch_add(&h->pool[-1], n, __ATOMIC_RELAXED);
+  if (at + n > CT_MAX) vu_panic(0, "cl: a list pool is full", 23);
+  return at;
 }
-// the row's list moved to the pool's end (unless it is there already), so that it can grow there
-static inline int64_t *cl_tail(cl_t *h, int64_t r, int64_t extra) {
-  int64_t *rp = cl_rp(h, r);
-  int64_t off = rp[0], n = rp[1], end = h->pool[-2];
-  if (off + n != end || n == 0) {
-    cl_need(h, n + extra);
-    for (int64_t i = 0; i < n; i++) h->pool[end + i] = h->pool[off + i];
-    __atomic_store_n(&h->pool[-2], end + n, __ATOMIC_RELEASE);
-    rp[0] = end;
-  } else {
-    cl_need(h, extra);
-  }
-  return rp;
-}
+// v appended to row r's list: in place when the list ends the pool's reserved part (a
+// compare-and-swap moves the end past it, so no other task can take that entry), else the list
+// written again in a new reservation with v after it
 static inline void cl_add(void *p, int64_t r, int64_t v) {
   cl_t *h = p;
-  int64_t *rp = cl_tail(h, r, 1);
-  int64_t end = h->pool[-2];
-  h->pool[end] = v;
-  __atomic_store_n(&h->pool[-2], end + 1, __ATOMIC_RELEASE);
-  rp[1] += 1;
+  int64_t *rp = cl_rp(h, r);
+  int64_t off = rp[0], n = rp[1], end = off + n;
+  if (n > 0 && __atomic_compare_exchange_n(&h->pool[-1], &end, end + 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    if (end + 1 > CT_MAX) vu_panic(0, "cl: a list pool is full", 23);
+    h->pool[end] = v;
+  } else {
+    int64_t at = cl_res(h, n + 1);
+    for (int64_t i = 0; i < n; i++) h->pool[at + i] = h->pool[off + i];
+    h->pool[at + n] = v;
+    rp[0] = at;
+  }
+  rp[1] = n + 1;
 }
 static inline void cl_pop(void *p, int64_t r) {
   int64_t *rp = cl_rp(p, r);
@@ -197,11 +205,9 @@ static inline void cl_pop(void *p, int64_t r) {
 static inline void cl_set(void *p, int64_t r, const int64_t *xs, int64_t n) {
   cl_t *h = p;
   int64_t *rp = cl_rp(h, r);
-  int64_t end = h->pool[-2];
-  cl_need(h, n);
-  for (int64_t i = 0; i < n; i++) h->pool[end + i] = xs[i];
-  __atomic_store_n(&h->pool[-2], end + n, __ATOMIC_RELEASE);
-  rp[0] = end;
+  int64_t at = cl_res(h, n);
+  for (int64_t i = 0; i < n; i++) h->pool[at + i] = xs[i];
+  rp[0] = at;
   rp[1] = n;
 }
 static inline void cl_fill(void *p, int64_t r, int64_t *out, int64_t n) {
@@ -219,75 +225,74 @@ static inline bool cl_has(void *p, int64_t r, int64_t v) {
   return false;
 }
 
-// Object types' properties by (object, name): an open-addressed table of (key, symbol), the key
-// object << 32 | name (both under 2^31), linear probing, doubled at half full. The names in insertion
-// order are a list column beside it (types.add_prop).
-typedef struct { int64_t *slot; int64_t cap; int64_t n; } ph_t;
+// Object types' properties by (object, name): the key object << 32 | name (both under 2^31). A fixed
+// array of bucket heads, each a chain of entries (next, key, symbol) in an append-only pool, linked in
+// by a compare-and-swap on the head as ik_* below, so nothing is ever moved under a reader and two
+// tasks adding one key make one entry. The names in insertion order are a list column beside it
+// (types.add_prop).
+#define PH_BUCKETS ((int64_t)1 << 20)
+typedef struct { int64_t *head; int64_t *pool; } ph_t;
 static inline void *ph_new(void *st) {
   ph_t *h = malloc(sizeof *h);
   if (!h) vu_panic(0, "ph_new: out of memory", 21);
-  h->cap = 1 << 16;
-  h->n = 0;
-  h->slot = malloc((size_t)h->cap * 16);
-  if (!h->slot) vu_panic(0, "ph_new: out of memory", 21);
-  for (int64_t i = 0; i < h->cap; i++) h->slot[2 * i] = -1;
+  h->head = calloc((size_t)PH_BUCKETS, 8);
+  if (!h->head) vu_panic(0, "ph_new: out of memory", 21);
+  h->pool = ct_mk();
+  h->pool[-1] = 3;  // (offset 0 is "none")
   cs_add(st, h, 2);
   return h;
 }
 static inline void ph_free(void *p) {
   ph_t *h = p;
-  free(h->slot);
+  free(h->head);
+  ct_free(h->pool);
   free(h);
 }
 static inline uint64_t ph_hash(int64_t k) {
   uint64_t x = (uint64_t)k * 0x9E3779B97F4A7C15ull;
   return x ^ (x >> 31);
 }
+// the entry of key k in the chain from e to stop (0: its end), 0 none
+static inline int64_t ph_walk(const int64_t *p, int64_t e, int64_t stop, int64_t k) {
+  for (; e != stop; e = p[e])
+    if (p[e + 1] == k) return e;
+  return 0;
+}
 // the symbol of o's property name, -1 none
 static inline int64_t ph_get(void *p, int64_t o, int64_t name) {
   const ph_t *h = p;
-  int64_t k = o << 32 | name, m = h->cap - 1;
-  for (int64_t i = (int64_t)(ph_hash(k) & (uint64_t)m);; i = (i + 1) & m) {
-    int64_t s = h->slot[2 * i];
-    if (s == k) return h->slot[2 * i + 1];
-    if (s == -1) return -1;
-  }
-}
-static inline void ph_grow(ph_t *h) {
-  int64_t oc = h->cap, *os = h->slot;
-  h->cap = oc * 2;
-  h->slot = malloc((size_t)h->cap * 16);
-  if (!h->slot) vu_panic(0, "ph_grow: out of memory", 22);
-  for (int64_t i = 0; i < h->cap; i++) h->slot[2 * i] = -1;
-  int64_t m = h->cap - 1;
-  for (int64_t j = 0; j < oc; j++) {
-    int64_t k = os[2 * j];
-    if (k == -1) continue;
-    int64_t i = (int64_t)(ph_hash(k) & (uint64_t)m);
-    while (h->slot[2 * i] != -1) i = (i + 1) & m;
-    h->slot[2 * i] = k;
-    h->slot[2 * i + 1] = os[2 * j + 1];
-  }
-  free(os);
+  int64_t k = o << 32 | name;
+  int64_t e = __atomic_load_n(&h->head[ph_hash(k) & (PH_BUCKETS - 1)], __ATOMIC_ACQUIRE);
+  e = ph_walk(h->pool, e, 0, k);
+  if (e == 0) return -1;
+  return __atomic_load_n(&h->pool[e + 2], __ATOMIC_RELAXED);
 }
 // o's property name set to sym: true when it is a new property
 static inline bool ph_put(void *p, int64_t o, int64_t name, int64_t sym) {
   ph_t *h = p;
   if ((uint64_t)o >= ((uint64_t)1 << 31) || (uint64_t)name >= ((uint64_t)1 << 32) || sym < 0) vu_panic(0, "ph_put: out of range", 20);
-  if (2 * (h->n + 1) > h->cap) ph_grow(h);
-  int64_t k = o << 32 | name, m = h->cap - 1;
-  for (int64_t i = (int64_t)(ph_hash(k) & (uint64_t)m);; i = (i + 1) & m) {
-    int64_t s = h->slot[2 * i];
-    if (s == k) {
-      h->slot[2 * i + 1] = sym;
+  int64_t k = o << 32 | name, *pool = h->pool;
+  int64_t *hd = &h->head[ph_hash(k) & (PH_BUCKETS - 1)];
+  int64_t e0 = __atomic_load_n(hd, __ATOMIC_ACQUIRE);
+  int64_t w = ph_walk(pool, e0, 0, k);
+  if (w != 0) {
+    __atomic_store_n(&pool[w + 2], sym, __ATOMIC_RELAXED);
+    return false;
+  }
+  int64_t ne = __atomic_fetch_add(&pool[-1], 3, __ATOMIC_RELAXED);
+  if (ne + 3 > CT_MAX) vu_panic(0, "ph_put: the table is full", 25);
+  pool[ne + 1] = k;
+  pool[ne + 2] = sym;
+  for (;;) {
+    pool[ne] = e0;
+    int64_t seen = e0;
+    if (__atomic_compare_exchange_n(hd, &seen, ne, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) return true;
+    w = ph_walk(pool, seen, e0, k);
+    if (w != 0) {
+      __atomic_store_n(&pool[w + 2], sym, __ATOMIC_RELAXED);
       return false;
     }
-    if (s == -1) {
-      h->slot[2 * i + 1] = sym;
-      h->slot[2 * i] = k;
-      h->n += 1;
-      return true;
-    }
+    e0 = seen;
   }
 }
 
