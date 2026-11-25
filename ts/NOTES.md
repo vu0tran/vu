@@ -957,8 +957,10 @@ What it takes, decided:
      (A fills X and needs Y while B fills Y and needs X), so a fill is computed privately and
      published by compare-and-swap of a state word, the loser taking the winner's row, as the
      `tl_busy` placeholders do. What the loser made while filling (symbols, types) is left unused.
-     (Begun 2026-11-25: the identity caches, the declared types, the lazy members' records, the
-     aliases put on existing types; the objects' members not yet. The audit below has the list.)
+     (Done 2026-11-25, behind VTSC_PREDECL=1 and VTSC_OFILL=1 for the parts that change what a
+     run does: the identity caches, the declared types, the lazy members' records, the aliases put
+     on existing types, the objects' members, `nsym`. The audit below has what's converted, what's
+     private to its maker, and what's left.)
   4. `C` split as above, the workers as tasks behind a switch (VTSC_THREADS=N), the files taken
      from a channel as the forked shards' dynamic order takes them.
   5. Determinism: ids then depend on interleaving inside a file's check (M2 covered only the file
@@ -1052,26 +1054,97 @@ Shared, done (one checker still; every conversion kept the probes, vtests' 3 fai
     makes a shell again: rare, not handled).
   - `ctab_stress.vu` covers `cx_publish` and `ckl_publish` too (8 tasks, TSan clean).
 
-Written again after the row is made, left (a reader in another worker may see either value): the
-objects' members (below); `t_alias`/`t_alias_args` copied onto an instantiation in bind.instantiate
-(`r`, maybe a cached type: 2 sites, with the `ckl_del` of `ht_aargs`); `t_iorigin` copied onto an
-instantiation; `order_decl` set to -1 for a mapped object's properties; `tidx` changed in place
-(tyops.mapped_add_tidx's `ckl_put`) and removed (chk); `yidx` set on objects already made (chk, 10
-puts, 2 removals; most on object literal types still private to their maker); `smore` appended as
-declarations merge (binding); `noshow_t` marked on types already made (10 sites); `nsym_put` during
-the check (enum members, type parameters: the value is the same from every worker now, but `nsym`
-is a Vu map, unsafe to write from two tasks). Counts by handle: `grep -ohE
-"(cx_put|ckl_set|ckl_add|ckl_put|cx_del|ckl_del)\(c\.ffi, c\.\w+" *.vu | sort | uniq -c`.
+- Step 3, the objects' members (VTSC_OFILL=1, off by default): `ensure_resolved` of a declared
+  (OK_DECL) or anonymous (OK_ANON) object fills a row of the worker's own (`types.ofill_row`, with
+  what the object had already), which every access of the member columns reads meanwhile, then
+  publishes it with a compare-and-swap of the object's state word: `ho_resolved` is 0 (not
+  filled), 1 (its own row: made whole, or filled in place with the switch off) or row + 2 (a
+  published fill). Every access of `hph`, `ho_order`, `ho_calls`, `ho_ctors`, `ho_sidx`, `ho_nidx`,
+  `ho_sname`, `ho_nname`, `ho_yidx`, `ho_tidx` (353 sites, the session's scratch `m14/orow.py`, all
+  but `new_obj`'s and `ofill_row`'s) takes its row from `types.ct_orow(c.ffi, c.ho_resolved,
+  c.ho_mine, o)` (ctab.h; inline, since a Vu function isn't inlined across the build's parts: as a
+  Vu function it cost +3-4% instructions), which is `o` itself for every object but one being or
+  already filled this way; `ho_mine` is the worker's own column of the objects it is filling. A
+  circular read during a fill sees the fill so far, as in place; another worker filling the same
+  object meanwhile fills its own, the loser's row (and the member symbols in it) left unused. The
+  accessors (prop_count, prop_names, get_prop, sig_count, last_sig, index_type, symbol_index,
+  index_name) skip the call when `ho_resolved` is already set. An object made whole by its maker
+  (an anonymous one: class_static, base_ctor_type, object literals...) is marked resolved at the
+  end with a compare-and-swap from 0 (`ct_cas`, 45 sites, which were plain stores of 1), so a fill
+  someone started on it meanwhile stays published, the maker's later members going to that row
+  too through `ct_orow`. Chosen over a pre-pass resolving every
+  declared object before the workers start: that does work for interfaces no file reads (most of a
+  program's lib and packages), makes rows in another order, and would lose the `touch` of the file
+  that first reads an unsupported member; the redirect is the same in serial with the switch on, so
+  the gate with it on checks that no access was missed (a missed one reads an empty row). With
+  the switch on: the job's 176 outputs, the probes and vtests the same; idx 59/86/52/31 184.3 /
+  97.3 / 62.2 / 52.2 G instructions (+2.9, -0.4, -0.1, +0.3% against it off), 17,130 more object rows
+  for idx 31. Off (with this commit's other changes): 178.3 / 97.5 / 61.9 / 51.9 G (d7d1567f: 179.2 / 97.8 / 61.9 /
+  52.5).
+- Step 3, `nsym` (a declaration's symbol) is a column now (`types.nsym_put`, `nsym_has`, `nsym_at`,
+  `nsym_get`; cx_, a release store), no longer a Vu map two tasks can't write. 127 read sites
+  (`m14/nsym.py`). `tparam_sym` makes a type parameter's symbol and type and then publishes it
+  (`nsym_publish`, first wins, a loser takes the winner's); so does its write for the other merged
+  declarations' parameter at the same position (it wrote the map directly). Enum members' are the
+  same from every worker (`enum_msym`).
+- Step 3, an instantiation's alias (bind.instantiate, an aliased anonymous, instantiated or mapped
+  object's): `types.alias_pub`, the first alias wins (it overwrote, and took `ht_aargs` off when the
+  new one had none: that `ckl_del` is gone). `t_iorigin` onto an alias's copy (bind.declared_type1,
+  bind.instantiate): `cx_publish`, the first wins (one site already put it only when absent).
 
-Shared, left: the lazy fills of objects (the largest part of step 3): `ensure_resolved` sets an
-object's `ho_resolved` and then adds its members, call and construct signatures and index
-signatures to the shared row (resolve_decl, resolve_anon; `yidx`/`tidx` among them), so another
-worker may read a half-filled object. A private fill needs a per-worker redirect from the object to
-the worker's copy until published (about 330 sites read `hph`, `ho_order`, `ho_calls`, `ho_ctors`,
-`ho_sidx`, `ho_nidx` directly), or the declared objects resolved before the workers start, as the
-shells are (an object made while checking, a type literal's, would still be filled lazily).
-Also a deferred tuple's `args`/`eflags` filled in place, and symbols' types kept in `st_tmp` while
-an alias is made or `c.spec` is set, never flushed (each worker keeps its own copy).
+What else is written after its row is made, site by site (`grep -ohE "(cx_put|ckl_set|ckl_add|ckl_put|cx_del|ckl_del)\(c\.ffi, c\.\w+" *.vu | sort | uniq -c`):
+- Private to its maker, which hasn't returned or cached the row yet (nothing to do): `yidx` (10 puts,
+  2 removals: copy_index's copy, object_literal, inter_spread_obj, spread_into, const_type_ctx,
+  rel.unfresh's and clone_obj's copies, mapped_over1, add_members into the fill's row); `tidx`
+  (mapped_add_tidx's `ckl_put` on mapped_over1's object, published by `tl_cache` only when filled;
+  const_type_ctx's removal on its own literal); `order_decl` -1 on mapped_over1's own new properties;
+  a tuple literal's `ho_args`/`ho_eflags` rewritten (array_literal, const_type_ctx: 5 sites);
+  `smore` of a member a fill makes (add_members' overloads) and of chk's function-type expandos;
+  `noshow_t` on types made there (widen_union's 2, object_literal's member, spread_into's and
+  const_type_ctx's literals: 5 sites); `inter_origin`'s `t_iorigin` (before the union is interned).
+- The deferred tuple's (and array's, union's) shell in declared_type1: done before the workers with
+  VTSC_PREDECL=1 (above).
+- Left: `noshow_t` on interned unions and intersections (facts1x, object_literal's spread union,
+  flow_union, cond_default1, cond_of0: 5 sites). A flag only ever set, with a release store, so no
+  torn read; but whether a file prints the type before or after another file's check marks it
+  decides whether that file is checked, which with workers depends on timing (in serial on the
+  file order, as today). For step 5: a mark that is the type's own (made with it), or kept per
+  file. `smore` appended by binding (13 add_decl sites, while naming scopes: before the check with
+  VTSC_EAGER_BIND=1) and by tparam_sym onto the first declaration's type parameter (a list column
+  two workers may append to at once: `ckl_add` isn't safe for that). Members added to a published
+  object after its fill: none found among the sites looked at (type_of_sym's function or class
+  merged with a namespace gets a new object or its static side, still the worker's own;
+  ns_value_type makes its object each time); not checked site by site beyond those.
+
+Symbols' types in `st_tmp` (made while an alias is made or under `c.spec`, or not final: the -2/-1
+markers), decided: per worker, never flushed. Publishing them when the alias is done (as
+`dty_flush` does declared types) would change what a later final `sty_put` of the same symbol
+does in serial (the first published value wins, where now the later one is published), and a type
+made under `c.spec` may be the speculation's. Each worker that needs one makes its own, an
+equivalent type under other ids, printed the same. Left at the end of the serial check
+(VTSC_PHASES's "left private"): idx 59 5,766 symbols, idx 86 6,115, idx 52 3,732, idx 31 8,702;
+`dt_tmp` 0 in all four (`dty_flush` publishes them all).
+
+Diagnostics from fills, the merge rule: one copy of each diagnostic (file, position, end, code,
+message), which the program's merge already keeps (tsprog's sort by diag_less and `key == last`;
+vtsc.vu's the same), as tsc's sortAndDeduplicateDiagnostics does. A fill's diagnostic lands at the
+declaration's node, in the declaration's file, whoever fills it, so each worker that fills makes the
+same one. What step 4 must change: run_libs keeps a worker's diagnostic only when the worker owns
+the file (`mine[d.file]`, lib files on worker 0): with shared fills the owner may never fill (another
+worker did), so threaded workers keep every diagnostic of a file any worker checks, and the merge
+drops the copies. `c.unsupported` (file -> what stopped it) is merged by union, the reason the
+smallest of the workers' (serial keeps the first found). Not done: nothing merges yet. The `touch`
+of a file that reads an unsupported member during the fill (resolve_decl's intersection bases) is
+made only by the worker whose file started the fill, as in serial only the first file's: with
+workers, which file that is depends on timing (step 5, with `noshow_t`).
+
+What step 4 needs now, estimated from this audit (not tried): a worker's `C` made from the main
+one (the 190 positional handles shared as views, the SharedMaps by `share()`, `ho_mine` a fresh
+column each, the rest empty: the "Per worker" group below), the tree in a `Shared` value;
+VTSC_EAGER_BIND=1, VTSC_PREDECL=1 and VTSC_OFILL=1 on; tparam_sym's `smore` append made safe;
+the diagnostics' merge above (the `mine` filter relaxed, `unsupported`, `marks`, `kept` merged);
+the files from a channel; then a TSan run of the threaded checker (CC=clang `vu build --tsan`) to
+find what this audit, from comments and write sites, missed.
 
 Binding (shared; complete before checking only with VTSC_EAGER_BIND, else written as scopes are
 named): `globals`, `gtypes`, `locals`, `ltypes`, `nsym` (set once, `nsym_put`), `parent`, `mexports`,

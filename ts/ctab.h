@@ -127,6 +127,28 @@ static inline int64_t ct_publish(void *h, int64_t i, int64_t v) {
   if (__atomic_compare_exchange_n(&p[i], &old, v, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) return -1;
   return old;
 }
+// entry i with an acquire load: a state word another task may publish (ct_cas) after what it points to
+static inline int64_t ct_acq(void *h, int64_t i) {
+  const int64_t *p = h;
+  if (__builtin_expect((uint64_t)i >= (uint64_t)ct_len0(p), 0)) vu_panic(0, "ct_acq: index out of range", 26);
+  return __atomic_load_n(&p[i], __ATOMIC_ACQUIRE);
+}
+// The row object o's members are in (types.orow): res is ho_resolved (0 not filled, 1 its own row,
+// r >= 2 the row r - 2 a fill published), mine the worker's own column of the objects it is filling
+// (the row + 1). o is a row its group gave.
+static inline int64_t ct_orow(void *res, void *mine, int64_t o) {
+  int64_t r = __atomic_load_n(&((const int64_t *)res)[o], __ATOMIC_ACQUIRE);
+  if (__builtin_expect(r == 1, 1)) return o;
+  if (r >= 2) return r - 2;
+  int64_t m = ct_get0(mine, o);
+  return m != 0 ? m - 1 : o;
+}
+// entry i from old to v with a compare-and-swap (release): whether this call set it
+static inline bool ct_cas(void *h, int64_t i, int64_t old, int64_t v) {
+  int64_t *p = h;
+  if ((uint64_t)i >= (uint64_t)ct_len0(p)) vu_panic(0, "ct_cas: index out of range", 26);
+  return __atomic_compare_exchange_n(&p[i], &old, v, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
+}
 static inline int64_t ct_len(void *h) { return __atomic_load_n(&((const int64_t *)h)[-2], __ATOMIC_ACQUIRE); }
 // entry i, or 0 past the column's end: a column written only at some rows of a group (the region is
 // zero, so a row never written reads 0 too; such columns keep a value + 1)
