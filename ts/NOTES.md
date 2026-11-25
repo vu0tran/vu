@@ -440,6 +440,17 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   4. `props`/`order` to C: a per-object property list in insertion order (names and symbols, list
      columns) with a lookup by name (a per-object open-addressed index, or what measures best);
      iteration must stay exactly insertion order (bind.vu's class/function merging iterates it).
+- Step 3.2, `nsym` set once (landed 2026-11-24): every write goes through `types.nsym_put`, and
+  `VTSC_SO_CHECK=1` panics when one changes a declaration's symbol after checking starts, except a
+  move by the `scope_names` call that has just declared it (`c.naming`, `c.so_fresh`: the interface
+  and namespace merges, whose old value nothing has read). So the merges are part of binding a scope,
+  wherever it's bound. The one change while checking it found (vtests' global-this-ns): a `namespace
+  globalThis` in `declare global`, its members declared as globals by declare_global, then given
+  symbols of their own when check_stmt named its body; its body is now named as a global block's is
+  (`bind.global_this_body`). With the check on: vtests the same 3 failures byte for byte, probes
+  133/133, the CI job's 88 outputs byte-identical, no panic; 18.64 / 16.85 / 55.18 G instructions
+  (+0.9, +0.5, 0.0% on the pre-M3 base). For M4, binding must still be finished before the threads
+  start (VTSC_EAGER_BIND's pass), or two workers naming one scope would make two symbols for it.
 - Then step 4: `var c: C` split into the shared tables and a per-worker state, and M4: N checker
   threads over the shared tables behind a switch, off by default. M4's gates: 1, 2, 4 and 8 threads,
   20 runs each, byte-identical on the 88 invocations and the probes; TSan with CC=clang and Archer as
