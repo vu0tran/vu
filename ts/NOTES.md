@@ -28,7 +28,7 @@ and how well; this file says where things are. Keep it current when you move thi
 | `rmore11.vu` | eslint(no-restricted-properties); promise(no-multiple-resolved) on a model of oxc_cfg's graph (`build_cfg`/`cv`: blocks and edges as SemanticBuilder adds them; `mr_check`: the rule's walk) |
 | `ra11y.vu`, `ra11y2.vu` | jsx-a11y |
 | `rhooks.vu` | react-hooks(exhaustive-deps) |
-| `rimport.vu`, `lmod.vu`, `lresolve.vu` | import plugin rules on the module graph, module records, resolution |
+| `rimport.vu`, `lmod.vu`, `lresolve.vu` | import plugin rules on the module graph, module records (`dep_follow`: what's loaded of a dependency), resolution (the graph's workers answer kind_of from folders' listings kept in C, lcache_glue.c `vl_lkind`) |
 | `rjest.vu` | jest/vitest rules |
 | `scope.vu` | scopes, symbols, references, redeclarations (below) |
 | `lconf.vu`, `lglob.vu`, `lprint.vu`, `lsupp.vu` | config, globs, `--print-config`, bulk suppressions |
@@ -437,9 +437,89 @@ What's left, by size:
 - the HIR's blocks are a map `{Int: BasicBlock}`; block ids are the file's (shared by nested
   functions), so a list by id would be sparse; a per-function index would touch every pass.
 - the module graph: 18,377 records on the largest package (12,428 of them the linted files, parsed
-  again for their records; 4,023 in node_modules), about 18 G of the 28 G of phase 1, mostly
-  open/read/stat (`sample` shows the graph workers in `__open_nocancel`, `read` and `stat`).
+  again for their records; 4,023 in node_modules), about 18 G of the 28 G of phase 1. Done since:
+  see "The module graph on the CI job's pattern" below.
 - the React Compiler is still about 77 G of the largest package's 143 G.
+
+## The module graph on the CI job's pattern (measured 2026-11-25, later)
+
+How it was measured: instructions retired of vlint's process (as above), phase 1 by ablation (a
+scratch build with the graph off, with its records but no resolution, with no dependencies
+followed), and the system calls counted by a DYLD_INSERT_LIBRARIES library that wraps stat,
+lstat, fopen and opendir (the session's scratch `m9/cnt.c`). On this machine an open costs about
+200,000 instructions, a stat about 23,000 and listing a small folder about 300,000 (the kernel's
+part counts: a C loop of a million stats is 10.8 G).
+
+Before, the largest plain invocation (12,428 files): VLINT_PHASE 0 / 1 / 2 / 9 = 6.4 / 28.4 /
+29.1 / 142.1 G. Phase 1 without the graph was 10.5 (startup and reading 6.4, the linter's parse
+4.1); the graph 17.9: the linted files opened a second time (2.4), their records parsed again
+(3.8: TSX parsed whole, function bodies skipped only in TypeScript), their 62,000 requests
+resolved (5.0: 113,000 stats, 31,000 lstats), and 5,949 dependencies' records (5.7 cold: 4,023 in
+node_modules, 1,926 in other workspace packages). Job-wide (VLINT_T=1 on the plain-only job) the
+85 invocations with a graph made 281,892 records, 237,368 of them in node_modules: packages of 18
+to 221 files had 12,000 to 14,000 dependency records each, an icon package's index re-exporting
+10,000 icons by name loading every icon's file. The 18-file package's phase 1 was 10.2 G cold and
+4.0 warm (the record cache), nearly all of it the graph.
+
+What landed (phase 1, G instructions; the largest invocation cold, the 18-file one cold / warm):
+| change | largest | 18 files |
+|---|---|---|
+| before | 28.4 | 10.2 / 3.95 |
+| the linted files' text read once, by the graph, and handed to the linting (lint_one's `pre`) | 26.0 | |
+| JSX files' function bodies skipped too (scan.skip_jsx: an element's attributes, text and expressions; `<T,>`, `<T extends`, `<const T` are type parameters; a file that doesn't then parse cleanly is parsed whole); kind_of from folder listings | 24.2 | 11.4 / 5.1 |
+| the linted files sent to the workers in batches of up to 32 from one folder | 23.7 | |
+| the listings in C (lcache_glue.c vl_lkind, vl_llink: d_type, so a regular file needs no stat and realpath's link check no lstat); a node_modules record's requests resolved only as far as they're loaded (the rest by the main task, resolve_rest, when no-barrel-file follows it whole) | 22.3 | 11.9 / 5.6 |
+| a folder listed once it's been asked about four times, under its part's lock | 22.2 | 9.7 / 3.4 |
+| a dependency's named re-exports not loaded (dep_follow) | 20.0 (19.6 measured again) | 3.4 / 1.6 |
+| the main task's resolver (resolve_rest) with the listings too: only where no-barrel-file follows dependencies whole (the 107-file package below: 10.9 / 4.85 -> 10.5 / 4.3) | | |
+
+The records of 12,003 JSX-capable files of the monorepo and 24,235 JavaScript files of its
+node_modules are identical with the JSX skipping and without (the session's scratch `m9/tsb/cmprec.vu`).
+The stat calls of the largest invocation 113,000 -> 13,000, the lstat calls 31,000 -> 900.
+
+dep_follow: of a dependency's dependencies, the import rules read only its star exports (their
+names, rimport.star_names) and its namespace re-exports (`export * as ns from`, `export { ns }` of
+`import * as ns`: rimport.module_request_name); a named re-export puts its name in the record's
+own bindings, and no rule reads the module it names. no-cycle doesn't go through node_modules, and
+what no-barrel-file counts is followed whole as before. The probe dep-reexport-chains (named, star
+and namespace re-exports through node_modules, with import/named, namespace, default and the
+no-named-as-default rules) matches oxlint 1.79 and 1.94 with the builds before and after. Job-wide
+records 281,892 -> 72,537 (node_modules 237,368 -> 28,013).
+
+After: the largest invocation 6.4 / 19.6 / 20.5 / 133.7 G (whole process 142.1 -> 133.7). Other
+invocations, whole process, cold / warm record cache, G:
+| package | before | after |
+|---|---|---|
+| 155 files | 14.4 / 7.0 | 6.7 / 4.4 |
+| 211 files | 14.5 / 7.8 | 7.6 / 5.3 |
+| 18 files | 10.4 / 4.1 | 3.5 / 1.7 |
+| 1,435 files | 27.0 / 22.4 | 20.8 / 19.9 |
+| 5,104 files | 27.5 / 26.4 | 26.0 / 25.1 |
+| 107 files, 11,949 records followed whole (no-barrel-file) | 10.5 / 4.3 | 10.5 / 4.3 |
+The plain-only job, before and after alternated twice (load average about 25): 149.8 and 148.5
+cpu-s, 26.8 and 25.4 s -> 136.6 and 136.7 cpu-s, 23.6 and 23.6 s; every output identical. The cold
+job's outputs identical after each change.
+
+Not kept: listing every folder the first time it's asked about, by whichever worker asked (each
+listed outside the lock): four workers listed a 43,000-file package folder and the home folders
+above the monorepo at once, and the 18-file package's phase 1 went from 3.95 to 6.4 G warm.
+Resolving a dependency that no-barrel-file follows whole in the workers (told so with its job)
+instead of by the main task: 0.25 G more on a package with 2,282 such records (four workers'
+caches miss what the main task's one cache has).
+
+Found, not fixed: lmod.build_record panics (`nm` of a node whose name is -1) on a file with some
+syntax errors (a node_modules test fixture; a linted file or a dependency like it would stop
+vlint). vlint doesn't report import(namespace) on a member of a namespace a dependency imports and
+exports again (`import * as held from './held.js'; export { held }`, then `ns.held.nope`); oxlint
+does, before these changes too.
+
+What's left in phase 1 of the largest invocation (19.6 G): startup 4 G (the walk, the
+configuration, glob matching; phase 0 less the reads), reading the files 2.4, the linter's parse
+4.1, the graph 9.1: the linted files' records (the top level still parsed whole, types and all,
+about 2.4), their resolution (about 3: string building and maps per candidate path, the 2,900
+folder listings), the dependencies and the workspace files they reach (1,926 workspace records
+aren't in the record cache). A package where no-barrel-file follows the dependencies whole is as
+before.
 
 ## Checking one program on several workers (design notes, measured 2026-11-24)
 
