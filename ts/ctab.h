@@ -6,7 +6,61 @@
 #include <stdlib.h>
 #include <sys/mman.h>
 #define CT_MAX ((int64_t)1 << 28)  // entries a column can hold (2 GB of address space, reserved only)
-static inline void *ct_new(void) {
+
+// The tables a checker uses are made through one store (types.Store, the owner: the task that made
+// it keeps it until every task that reads the tables is done). What a checker's state holds are
+// views (types.Tab, Lst, Ph, Grp): their drop does nothing, and a view can be made again in another
+// task from its address as an Int (ct_addr, ct_view). The store's own bookkeeping is filled only
+// while the tables are made, by one task.
+typedef struct { void **p; uint8_t *k; int64_t n, cap; } cs_t;
+static inline void *cs_new(void) {
+  cs_t *s = calloc(1, sizeof *s);
+  if (!s) vu_panic(0, "cs_new: out of memory", 21);
+  return s;
+}
+static inline void cs_add(cs_t *s, void *p, uint8_t k) {
+  if (s->n == s->cap) {
+    s->cap = s->cap ? 2 * s->cap : 64;
+    s->p = realloc(s->p, (size_t)s->cap * sizeof *s->p);
+    s->k = realloc(s->k, (size_t)s->cap);
+    if (!s->p || !s->k) vu_panic(0, "cs_add: out of memory", 21);
+  }
+  s->p[s->n] = p;
+  s->k[s->n] = k;
+  s->n += 1;
+}
+static inline void ct_keep(void *h) { (void)h; }
+static inline void cl_keep(void *h) { (void)h; }
+static inline void ph_keep(void *h) { (void)h; }
+static inline void cg_keep(void *h) { (void)h; }
+static inline int64_t ct_addr(void *h) { return (int64_t)(intptr_t)h; }
+static inline void *ct_view(int64_t a) {
+  if (a == 0) vu_panic(0, "ct_view: no table", 17);
+  return (void *)(intptr_t)a;
+}
+static inline int64_t cl_addr(void *h) { return ct_addr(h); }
+static inline void *cl_view(int64_t a) { return ct_view(a); }
+static inline int64_t ph_addr(void *h) { return ct_addr(h); }
+static inline void *ph_view(int64_t a) { return ct_view(a); }
+static inline int64_t cg_addr(void *h) { return ct_addr(h); }
+static inline void *cg_view(int64_t a) { return ct_view(a); }
+
+// A table group: the row counter several columns share (a type's tk tf ta tb, an object's columns,
+// a signature's, a symbol's). A row is taken once (cg_row, a fetch-add), its entries written
+// (ct_put, cl_init), and the row's index handed to other tasks only after that.
+static inline void *cg_new(void *st) {
+  int64_t *g = calloc(1, 64);
+  if (!g) vu_panic(0, "cg_new: out of memory", 21);
+  cs_add(st, g, 3);
+  return g;
+}
+static inline int64_t cg_row(void *g) {
+  int64_t r = __atomic_fetch_add((int64_t *)g, 1, __ATOMIC_RELAXED);
+  if (r >= CT_MAX / 2) vu_panic(0, "cg_row: a table group is full", 29);
+  return r;
+}
+static inline int64_t cg_len(void *g) { return __atomic_load_n((const int64_t *)g, __ATOMIC_ACQUIRE); }
+static inline void *ct_mk(void) {
   int64_t *r = mmap(NULL, (size_t)(CT_MAX + 2) * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
   if (r == MAP_FAILED) {
     vu_panic(0, "ct_new: no address space for a column", 37);
@@ -15,13 +69,32 @@ static inline void *ct_new(void) {
   return r + 2;
 }
 static inline void ct_free(void *h) { munmap((int64_t *)h - 2, (size_t)(CT_MAX + 2) * 8); }
-static inline int64_t ct_push(void *h, int64_t v) {
+static inline void *ct_new(void *st) {
+  void *t = ct_mk();
+  cs_add(st, t, 0);
+  return t;
+}
+// the column's length raised to at least n (a row of its group written: ct_put, cl_init)
+static inline void ct_cover(int64_t *p, int64_t n) {
+  int64_t l = __atomic_load_n(&p[-2], __ATOMIC_RELAXED);
+  while (l < n && !__atomic_compare_exchange_n(&p[-2], &l, n, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+  }
+}
+// entry r of a row its group gave (cg_row) written
+static inline void ct_put(void *h, int64_t r, int64_t v) {
   int64_t *p = h;
-  int64_t n = p[-2];
-  if (n >= CT_MAX) vu_panic(0, "ct_push: a column is full", 25);
-  p[n] = v;
-  __atomic_store_n(&p[-2], n + 1, __ATOMIC_RELEASE);
-  return n;
+  if ((uint64_t)r >= (uint64_t)CT_MAX) vu_panic(0, "ct_put: index out of range", 26);
+  p[r] = v;
+  ct_cover(p, r + 1);
+}
+// xs appended as one run (a union's or intersection's members): where it starts
+static inline int64_t ct_run(void *h, const int64_t *xs, int64_t n) {
+  int64_t *p = h;
+  int64_t at = __atomic_fetch_add(&p[-1], n, __ATOMIC_RELAXED);
+  if (at + n > CT_MAX) vu_panic(0, "ct_run: a column is full", 24);
+  for (int64_t i = 0; i < n; i++) p[at + i] = xs[i];
+  ct_cover(p, at + n);
+  return at;
 }
 static inline int64_t ct_at(void *h, int64_t i) {
   const int64_t *p = h;
@@ -50,11 +123,12 @@ static inline int64_t ct_len(void *h) { return __atomic_load_n(&((const int64_t 
 // it already ends the pool, by appending to it), so an entry once written is never moved or overwritten
 // by another row's list.
 typedef struct { int64_t *row; int64_t *pool; } cl_t;
-static inline void *cl_new(void) {
+static inline void *cl_new(void *st) {
   cl_t *h = malloc(sizeof *h);
   if (!h) vu_panic(0, "cl_new: out of memory", 21);
-  h->row = ct_new();
-  h->pool = ct_new();
+  h->row = ct_mk();
+  h->pool = ct_mk();
+  cs_add(st, h, 1);
   return h;
 }
 static inline void cl_free(void *p) {
@@ -64,15 +138,13 @@ static inline void cl_free(void *p) {
   free(h);
 }
 static inline int64_t cl_rows(void *p) { return ct_len(((cl_t *)p)->row) >> 1; }
-// a new row holding an empty list; its index
-static inline int64_t cl_row(void *p) {
+// row r (from its group: cg_row) made, holding an empty list (the region is zero: (0, 0) already)
+static inline void cl_init(void *p, int64_t r) {
   cl_t *h = p;
-  int64_t r = h->row[-2];
-  if (r + 2 > CT_MAX) vu_panic(0, "cl_row: a list column is full", 29);
-  h->row[r] = h->pool[-2];
-  h->row[r + 1] = 0;
-  __atomic_store_n(&h->row[-2], r + 2, __ATOMIC_RELEASE);
-  return r >> 1;
+  if ((uint64_t)r >= (uint64_t)(CT_MAX / 2)) vu_panic(0, "cl_init: row out of range", 25);
+  h->row[2 * r] = 0;
+  h->row[2 * r + 1] = 0;
+  ct_cover(h->row, 2 * r + 2);
 }
 static inline int64_t *cl_rp(cl_t *h, int64_t r) {
   if (__builtin_expect((uint64_t)r >= (uint64_t)(h->row[-2] >> 1), 0)) vu_panic(0, "cl: row out of range", 20);
@@ -150,7 +222,7 @@ static inline bool cl_has(void *p, int64_t r, int64_t v) {
 // object << 32 | name (both under 2^31), linear probing, doubled at half full. The names in insertion
 // order are a list column beside it (types.add_prop).
 typedef struct { int64_t *slot; int64_t cap; int64_t n; } ph_t;
-static inline void *ph_new(void) {
+static inline void *ph_new(void *st) {
   ph_t *h = malloc(sizeof *h);
   if (!h) vu_panic(0, "ph_new: out of memory", 21);
   h->cap = 1 << 16;
@@ -158,6 +230,7 @@ static inline void *ph_new(void) {
   h->slot = malloc((size_t)h->cap * 16);
   if (!h->slot) vu_panic(0, "ph_new: out of memory", 21);
   for (int64_t i = 0; i < h->cap; i++) h->slot[2 * i] = -1;
+  cs_add(st, h, 2);
   return h;
 }
 static inline void ph_free(void *p) {
@@ -215,4 +288,20 @@ static inline bool ph_put(void *p, int64_t o, int64_t name, int64_t sym) {
       return true;
     }
   }
+}
+
+// every table the store made freed
+static inline void cs_free(void *p) {
+  cs_t *s = p;
+  for (int64_t i = 0; i < s->n; i++) {
+    switch (s->k[i]) {
+      case 0: ct_free(s->p[i]); break;
+      case 1: cl_free(s->p[i]); break;
+      case 2: ph_free(s->p[i]); break;
+      default: free(s->p[i]);
+    }
+  }
+  free(s->p);
+  free(s->k);
+  free(s);
 }

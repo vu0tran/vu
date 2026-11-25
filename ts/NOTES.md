@@ -507,6 +507,21 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   - Determinism with several workers: ids then depend on which worker makes a type first. M2
     showed nothing printed depends on the file order, but not on interleaving inside one file's
     check; the gates (1, 2, 4, 8 workers, 20 runs each, byte-identical) are what decides it.
+- Step 4.1, views and table groups (landed 2026-11-24): every table is made through one owner,
+  `types.Store` (ctab.h `cs_new`; tsprog keeps it, `tabs`, beside the checker until the checker is
+  done), and what `C` holds are views: `Tab`, `Lst`, `Ph` and `Grp` whose drop does nothing, each
+  made again in another task from its address as an Int (`ct_addr`/`ct_view`, `cl_`, `ph_`,
+  `cg_`). The columns come in groups that share one row counter (`c.gt`: `tk tf ta tb`; `c.go`: the
+  object columns; `c.gs`: the signatures'; `c.gy`: the symbols'): a row is taken once with a
+  fetch-add (`cg_row`), its entries written with `ct_put` / `cl_init` (each raises its column's
+  length to cover the row, a compare-and-swap max, so bounds checks still hold), and only then is
+  the index handed on. `tl` takes a union's or intersection's members as one run (`ct_run`: one
+  fetch-add for the run). What isn't thread-safe yet: a list column's pool (`cl_add`/`cl_set`
+  append without a reservation), `ph_put`/`ph_grow`, and the `ct_len(c.ffi, c.hs_node)` and
+  `ct_len(c.ffi, c.htk)` watermarks in chk.vu and tyops.vu ("the signatures made since"), which
+  another worker's rows would break. Probes 133/133, vtests the same 3 failures byte for byte, the
+  CI job's 88 outputs byte-identical; 18.55 / 16.54 / 54.64 G instructions (+0.4, -1.4, -1.0% on
+  the pre-M3 base).
 - Then step 4: `var c: C` split into the shared tables and a per-worker state, and M4: N checker
   threads over the shared tables behind a switch, off by default. M4's gates: 1, 2, 4 and 8 threads,
   20 runs each, byte-identical on the 88 invocations and the probes; TSan with CC=clang and Archer as
