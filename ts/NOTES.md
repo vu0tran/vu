@@ -17,6 +17,7 @@ and how well; this file says where things are. Keep it current when you move thi
 |---|---|
 | `scan.vu`, `parse.vu`, `ast.vu` | tokens, the parser, the flat tree (`nd[x].k/a/b/c/d/f/s/pos/end`; kinds `N_*`, modifiers `M_*` in ast.vu) |
 | `bind.vu`, `chk.vu`, `rel.vu`, `tyops.vu`, `types.vu`, `show.vu` | vtsc: symbols, checking, assignability, type operators, the type table, printing types |
+| `ctab.h` | vtsc: the flat type and symbol tables as C columns (`types.ct_at` and friends; see "Checking one program on several workers") |
 | `tsconf.vu` | vtsc: tsconfig.json (`read`: options through extends, root files, `unmodeled`; `path_targets`) |
 | `tsres.vu` | vtsc: where a package's types are (`resolve_types`, `auto_types`, `triple_slash`); `vtsc.run` loads them as package files (`c.pkg_files`: declared, never checked) |
 | `vlint.vu` | vlint's driver: CLI, file walk, workers, tsgolint, output |
@@ -359,6 +360,28 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   writes), `nsym` (32), `ntype` (22) are written lazily from everywhere. Each such fill would have to
   become compute-once (as a Memo is) and every checker function take a shared and a per-worker
   state instead of `var c: C` (1,222 functions). That is the rest of M3.
+- M3 step 1, the flat tables in C (landed 2026-11-24, the only path now): `tk tf ta tb tl` and the
+  symbols' `sk sname sdecl stype sdtype sflags sparent` are C columns (`ctab.h`: one reserved mmap
+  region each, 2^28 entries, the length before the first entry, published with a release store),
+  held as `types.Tab` handles `c.htk`... in `C`, with `c.ffi` beside them. Every use goes through
+  `ct_at`/`ct_set`/`ct_push`/`ct_len` (`types.ct_at(c.ffi, c.htk, t)` for `c.tk[t]`); the sites were
+  rewritten by a script (the session's scratch `m3w/conv.py FIELD...`: reads, writes and compound
+  writes, `.len`, `.push`, `.reserve`; `m3w/hoist.py` moves a written value that changes `c` into a
+  `let` first, 7 sites). The benchmark above was wrong for vlint: it was one small C file. In the
+  split release build an extern call was a call to part 0 plus `omp_in_parallel()` (the par-loop
+  check) and a stack protector: tk alone through it cost +23-35% instructions. Two compiler changes
+  made it free: a glue file named `.h` is included in every part and its wrappers are `static
+  inline` (always_inline), and the par-loop check asks OpenMP only while a par loop runs
+  (`vu_par_live`, counted around each one), once per function (`VU_FFI_ENTRY`), not per call. With
+  both, all twelve columns: 79 files 18.48 -> 18.86-18.93 G instructions (+2.1-2.4%), 221 files
+  16.77 -> 17.21-17.44 (+2.6-4.0%), 1,127 files 55.20 -> 56.45 (+2.3%) (no par check at all would be
+  +0.4%: the rest is the check at each function's start, which makes small leaf functions keep a
+  frame). Probes 133/133, vtest the same 3 failures, the CI job's 88 outputs byte-identical.
+- Next (M3 step 2): Obj and Sig as columns, one struct kind at a time. The fields filled in place
+  after an object is made (`objs[o].args`/`.eflags`/`.sidx`/`.nidx`/`.resolved`, `sigs[s].tparams`/
+  `.ret`) become compute-once slots; the Int fields can use `ctab.h` as the flat tables do, the
+  list and map fields need a C layout of their own (an Int column of offsets into a shared Int pool
+  is the likely one: append-only, never moved).
 
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
