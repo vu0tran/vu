@@ -604,6 +604,23 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   133/133, vtests' 3 failures byte for byte, the CI job's 88 outputs byte-identical, each with and
   without VTSC_SO_CHECK=1 (no panic); 18.55 / 16.50 / 54.32 G instructions (+0.4, -1.6, -1.6% on
   the pre-M3 base).
+- The payoff, estimated before more plumbing (2026-11-24, build at step 4.4; the session's scratch
+  `m5/pay.sh`, `m5/ph.sh`, `m5/crit_cold.sh`, `m5/model.py`). A threaded prototype with one global
+  lock around what isn't thread-safe can't be built in Vu as it stands: tasks share only frozen
+  values (no task can reach another's `var c: C`), and nearly every checker function writes a Vu
+  map in `C` (ntype, caches, diagnostics), so such a lock would cover the whole check. So this is a
+  model from measurements instead. Serial type-aware runs (plain rules off, one worker): plan idx
+  78 / 32 / 76 check 1.15 / 1.59 / 5.39 s of 1.85 / 2.11 / 6.24 s wall; the four largest
+  type-aware invocations 14.8, 5.9, 5.4, 4.7 s of check in 16.5, 7.0, 6.5, 5.8 s. Today's forked
+  shards (VTSC_JOBS 1/2/4/8, best of 2): idx 76 6.21 / 5.10 / 4.17 / 3.55 s wall, 6.6 / 9.1 / 12.0
+  / 17.7 cpu-s; idx 78 is fastest on one (1.84 s). Modeling each invocation's type-aware part as
+  (serial wall - check) + check / (1 + (N-1) * efficiency), never worse than today, its wall as the
+  later of that and the plain lint's end (each invocation run alone, cold: `crit_cold.sh`), and the
+  job as two at a time in plan order (that simulation gives 74.4 s for today's build, measured 78):
+  N=4 56.5 s at perfect scaling, 59.5 at 75%, 64.1 at 50%; N=8 51.8-55.3; with the type-aware
+  part free the job would still take 47.8 s, the plain lint's critical path. Against oxlint 1.79's
+  74-79 s: threads alone are worth about 15-25%, not a dramatic lead; the plain lint (228 cpu-s
+  against oxlint's 129, the largest package's plain lint 9.8 s alone) bounds the rest.
 - Next (step 4.3's rest, in order): the other interning maps as `ik_*` keys (`strlits`,
   `numlits`/`nums`/`numtext`, `biglits`, `unions` (Str keys), `tmpls`/`tmpl_ids`,
   `mappers`/`mapper_ids` (and `c.mappers` itself: a list column of from and to), `inst_cache`,
