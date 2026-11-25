@@ -892,6 +892,74 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   tests/run_mt.sh runs it (a TSan run that fails to start is a failure); the cold job.py table, two
   runs alternated with oxlint 1.79, the switch on and off.
 
+### Checking one program on threads: the payoff again, and the plan (2026-11-25)
+
+The payoff, re-measured on today's build (plain lint after the module graph and the free lists;
+the session's scratch `m11/crit.sh`, `m11/ph.sh`, `m11/model.py`: each of the 88 invocations alone
+and cold, twice, the lower of the two kept; the same model as on 2026-11-24, the job two at a time
+in plan order; load about 20 on 10 cores throughout):
+
+| checker threads | perfect scaling | 75% | 50% |
+|---|---|---|---|
+| today (forked shards) | 66.0 s | | |
+| 2 | 58.9 | 60.1 | 61.7 |
+| 4 | 48.3 | 51.4 | 56.1 |
+| 8 | 41.3 | 43.2 | 46.7 |
+| type-aware free (the floor) | 29.9 | | |
+
+The serial check of the four largest type-aware invocations (one checker, plain rules off,
+`m11/ins_ta.sh`): idx 59 (one 14,449-file program) 184.0 G instructions, 28.9 cpu-s, check 23.0 s;
+idx 86 (2,710 files) 102.5 G, 16.0 cpu-s, 13.6 s; idx 52 (5,108 files) 63.1 G, 8.6 cpu-s, 5.7 s;
+idx 31 (1,439 files) 53.8 G, 6.8 cpu-s, 5.3 s. Forked shards today take idx 59's type-aware part to
+14.1 s and idx 86's to 7.1 s. With plain lint cheaper, the type-aware part is now 36 of the job's 66 s
+above the floor: threads at 4-8 would take the job to 43-56 s against oxlint 1.79's 74-79 s (the model
+ignores the two invocations' threads competing for cores). Larger than the 15-25% of 2026-11-24, and
+the one lever left that size.
+
+What it takes, decided:
+- The language: `SharedMap[K, V]` (landed, SPEC "SharedMap"): a table every task reads without a lock
+  and adds to, the first add winning, scalar values only. Interning caches keyed by Int or Str become
+  one table for all workers with no per-site rewrite beyond `get`/`add` (a site that put a value and
+  returned it returns what `add` returns, so a loser of a race uses the winner's type). Converted:
+  `tl_cache`, `strlits`, `biglits`, `unres_names`, `inst_icache`, `inst_acache`, `alias_inst` (the
+  session's scratch `m11/smconv.py`): one checker still, the outputs the same; the four invocations
+  above 185.7 / 102.1 / 62.8 / 53.8 G instructions (+0.9, -0.4, -0.5, -0.1%). Single-threaded a
+  SharedMap read costs about what a Vu map's does (+15% instructions for Int keys in a 400,000-key
+  benchmark, +2% for Str). Two `tl_cache` users put a placeholder in the cache before
+  filling it (mapped_over, rel.inter_combined): the placeholder is now the worker's own (`tl_busy`)
+  until the type is filled, then published; another worker meeting the key meanwhile makes its own.
+  The sites that put side attributes after publishing (bind.vu's alias_tag paths: `t_alias`,
+  `t_alias_args`, `t_origin` written after `tl_cache[akey] = t2`) publish last now.
+- Each worker its own `C`: the C columns as views (step 4.1), the SharedMaps as handles (another
+  `share()` each), the frozen tree and binding's maps in one `Shared` value (`c.t.nd[x]` becomes a
+  read through it, one more load, not measured; checked in a probe, `m11/t/b.vu`, that a view into it
+  freezes the worker's `C` as a view into `c.t` does today, so code that compiles now still does),
+  and the rest per worker, empty at the start, as tsgo keeps node links per checker.
+- Not done, in order (each with the gates: probes, vtests' 3 failures, the 176 job outputs):
+  1. The rest of the interning maps: `numlits` with `nums`/`numtext`, `tmpl_ids` with `tmpls`,
+     `mapper_ids` with `mappers`, `unions`, `enum_type`/`enum_union`, `ref_cache`/`inst_cache`: each
+     key's side table (a Vu list of floats, strings or structs today) as C columns or names (ns_*)
+     first, written before the id is added.
+  2. Types' and symbols' attributes now in Vu maps keyed by a shared id, written once when the row
+     is made: `t_alias`, `t_iorigin`, `t_ctv` (Int) as columns of the type group; `t_alias_args`,
+     `t_origin`, `tuple_labels` as list columns; the symbols' `smore`, `lazy_icomb`, `lazy_inst`,
+     `wk_symbols`, `lazy_meth` likewise. A map written again later (`t_alias_args.remove`, the
+     resets) needs the publish-once rule first, as `stype` got (step 3.3).
+  3. The lazy fills of shared rows (an object's members, `resolved` with `calls ctors sidx nidx`, a
+     deferred tuple's `args`/`eflags`, a signature's `ret`): a worker can't wait on another's fill
+     (A fills X and needs Y while B fills Y and needs X), so a fill is computed privately and
+     published by compare-and-swap of a state word, the loser taking the winner's row, as the
+     `tl_busy` placeholders do. What the loser made while filling (symbols, types) is left unused.
+  4. `C` split as above, the workers as tasks behind a switch (VTSC_THREADS=N), the files taken
+     from a channel as the forked shards' dynamic order takes them.
+  5. Determinism: ids then depend on interleaving inside a file's check (M2 covered only the file
+     order); union members are ordered by compareTypes with the id as the last tie-break. The gate
+     is 1, 2, 4 and 8 threads, 20 runs each, byte-identical, and TSan (CC=clang `vu build --tsan`).
+- No program has been checked on several threads yet. Before steps 1-4, a threaded run would share
+  half the state (types made by one worker, their attributes in another's maps) and print wrong
+  types: a crash or a wrong answer, not a measurement. Steps 2 and 3 are the large ones (about 250
+  fill sites, step 3's table above, and some 40 attribute maps).
+
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
 against oxlint's 74-76 s, outputs identical; the run that fills them 81.6 s.
