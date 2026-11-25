@@ -957,6 +957,8 @@ What it takes, decided:
      (A fills X and needs Y while B fills Y and needs X), so a fill is computed privately and
      published by compare-and-swap of a state word, the loser taking the winner's row, as the
      `tl_busy` placeholders do. What the loser made while filling (symbols, types) is left unused.
+     (Begun 2026-11-25: the identity caches, the declared types, the lazy members' records, the
+     aliases put on existing types; the objects' members not yet. The audit below has the list.)
   4. `C` split as above, the workers as tasks behind a switch (VTSC_THREADS=N), the files taken
      from a channel as the forked shards' dynamic order takes them.
   5. Determinism: ids then depend on interleaving inside a file's check (M2 covered only the file
@@ -993,28 +995,83 @@ Shared, done (one checker still; every conversion kept the probes, vtests' 3 fai
   under VTSC_SHUFFLE 1-3 and idx 31, 52, 86 under seed 1 give the unshuffled output.
   `ctab_stress.vu` covers `cx_*`, `ckl_*` and `cl_row` (8 tasks, TSan clean).
 - Removed, unused: `unions`, `inst_cache`, `ref_cache`, `tvar_cache` still there (unused too).
+- Step 3, the identity caches (commit 571b3830): each value made by the worker that asks for it,
+  its in-progress marker in a per-worker busy set, published by a first-add-wins SharedMap or a
+  compare-and-swap, the loser taking the published value (what it made is left unused):
+  `var_cache`/`var_unrel` (`var_busy`), `imp_target` (`imp_busy`; -2 was the marker),
+  `cjs_exp_t`/`cjs_mod_t`/`cjs_xs_t` (`cjs_busy`, `cjs_xs_busy`), `enum_type` (`enum_busy`),
+  `fsig_pub` beside the per-worker `fsig`, `sigs_cache` as the list column `ht_sigs` published
+  with `ckl_publish`; `js_this`/`js_expando`/`js_this_base` as columns by symbol (`hy_jsthis`,
+  `hy_jsexp`, `hy_jsbase`, written before the symbol is reachable); `lib_unsup` removed (every
+  unsupported type carries its own message in `ht_umsg`, so nothing is taken off again). 13 fields.
+  Then `hy_thistp` (an owner's polymorphic this, `cx_publish`), `hsdtype` (below).
+  - Fills that make rows as they go, and how a loser's are made harmless: `enum_type` makes member
+    symbols and literals; each member's symbol is published by its node (`enum_msym`, made and
+    typed before it is added), so every worker that makes the enum gets the same members and
+    literals, and the enum's own union copy is published once (`enum_pre`) before the attributes
+    pointing to it (`hy_enumm` by `ckl_publish`, `ht_enumb` by `cx_publish`), each then the same
+    value from every worker. `fsig_pub` holds only signatures that are final when made: a declared
+    function's and a class's or interface's method or accessor's (`chk.fsig_final`); a function
+    expression's or object literal method's is made again in context (8 removal sites) and a
+    constructor's is rewritten by class_static, so those stay the worker's own (`fsig`), as does
+    one made under `c.spec`. A loser's signature is unused once it reads `fsig_pub`'s.
+  - Diagnostics: a fill that reports (resolve_alias's missing module or export, `unsupported`)
+    reports in every worker that makes it, so a threaded run must keep one copy of each (the same
+    file, position, code and message), or keep only the owner worker's for each file; not done.
+- Step 3, rows written after they were reachable (commits 571b3830, a1d43d59, and the declared
+  types'):
+  - `sty_put`/`sty_init` return the type the symbol has after (the winner's); the lazy fills in
+    type_of_sym return it.
+  - Lazy members (`hy_licomb`, `hy_lmeth`, `hy_linst`): the record is no longer removed when the
+    member is typed (and `cyc_lazy` put it back after a cycle); it is read while the symbol's type
+    is -1 (`sty`), the -2 of this worker's own fill being the circular case. 3 removals and 1
+    rewrite gone.
+  - `class_static`: the static side is the worker's own (`sty_tmp`) while its members are added,
+    published at the end (by the caller for a class merged with a namespace, after the
+    namespace's values).
+  - `t_alias`/`t_alias_args` on a type that already exists (an interned conditional's members, an
+    anonymous, mapped or instantiated object an alias names, Awaited<T>'s instantiation: 6 sites):
+    `types.alias_pub`, the first alias wins, its arguments published before it. Before, a later
+    alias overwrote; the outputs are the same.
+  - `tp_con` (an infer type parameter's constraint): `tpcon_busy` in place of the -1 placeholder
+    and its 3 removals; published once found (`cx_publish`), a failure not kept.
+  - `hsdtype`, a symbol's declared type: read with `types.dty`, which sees the worker's `dt_tmp`
+    first. An alias's -1/error placeholder, its shells and its type while another alias is being
+    made (a cycle may undo it: `cyc_aliases`), and an interface's or class's object while its type
+    parameters are made, are the worker's own; published (`ct_publish`, the loser taking the
+    winner's) when no alias is being made (`types.dty_flush`) or, for an interface, once its type
+    parameters are there. 9 write sites; 33 reads now through `dty`.
+  - Shells (bind.declared_type1: a union, tuple or array alias without type parameters, whose row
+    exists before its members and is filled in place, `ta`/`tb`/`hta` rewritten and its alias taken
+    off, `cx_del`): types made while it is filled, which hold the shell, reach shared caches
+    (`tcache`, interned unions), so the shell can't be made private. Restructured instead: with
+    VTSC_PREDECL=1 every such alias is declared before any file is checked (tsprog.predeclare_shells,
+    74 ms and 1,109 aliases for idx 52), so no shell is unfinished while workers run. Off by default;
+    with it on, the job's 176 outputs, the probes and vtests are the same, idx 59/86 +0.7/+0.6%
+    instructions. A threaded run needs it on (and an alias undone by a cycle and made again later
+    makes a shell again: rare, not handled).
+  - `ctab_stress.vu` covers `cx_publish` and `ckl_publish` too (8 tasks, TSan clean).
 
-Written again after the row is made (a reader in another worker may see either value: each needs
-the publish-once rule or a private copy until published, step 3): `t_alias`/`t_alias_args` put on
-an existing type by bind.alias_tag's callers (bind.vu, the `cx_put(c.ffi, c.ht_alias, t, a)` after
-union_of) and taken off a shell (`cx_del`, 2 sites; `ckl_del` of `ht_aargs`, 1); `t_iorigin` copied
-onto an instantiation; `lazy_inst`/`lazy_icomb`/`lazy_meth` removed when the member is typed (that
-fill is step 3's) and `lazy_inst` set again from `cyc_lazy`; `order_decl` set to -1 for a mapped
-object's properties; `tidx` changed in place (tyops.mapped_add_tidx's `ckl_put`) and removed (chk);
-`yidx` set on objects already made (chk, 10 puts, 2 removals); `tp_con`'s -1 placeholder and
-removals (rel.vu, the constraint's lazy fill); `smore` appended as declarations merge (binding);
-`noshow_t` marked on types already made (10 sites). Counts by handle: `grep -ohE
+Written again after the row is made, left (a reader in another worker may see either value): the
+objects' members (below); `t_alias`/`t_alias_args` copied onto an instantiation in bind.instantiate
+(`r`, maybe a cached type: 2 sites, with the `ckl_del` of `ht_aargs`); `t_iorigin` copied onto an
+instantiation; `order_decl` set to -1 for a mapped object's properties; `tidx` changed in place
+(tyops.mapped_add_tidx's `ckl_put`) and removed (chk); `yidx` set on objects already made (chk, 10
+puts, 2 removals; most on object literal types still private to their maker); `smore` appended as
+declarations merge (binding); `noshow_t` marked on types already made (10 sites); `nsym_put` during
+the check (enum members, type parameters: the value is the same from every worker now, but `nsym`
+is a Vu map, unsafe to write from two tasks). Counts by handle: `grep -ohE
 "(cx_put|ckl_set|ckl_add|ckl_put|cx_del|ckl_del)\(c\.ffi, c\.\w+" *.vu | sort | uniq -c`.
 
-Shared, left (identity: the value is a row made on demand, so two workers making their own would
-give one declaration two types, and a union of the two prints twice; most are lazy fills, step 3):
-`enum_type` (with its member symbols, `nsym_put`), `fsig` (a function's signature, removed and made
-again for contextual typing at 8 sites), `sigs_cache` (a list: first add wins needs a `ckl_publish`,
-a compare-and-swap of the row's offset with the length kept in the pool),
-`js_this`/`js_expando`/`js_this_base`, `imp_target` (-2 while resolving),
-`cjs_exp_t`/`cjs_mod_t`/`cjs_xs_t` (-3 while typed), `lib_unsup` (a lib node's message: a SharedMap
-of ids in `hsx`, but it is removed again at one site), `var_cache`/`var_unrel` (measured variance: a
-pure answer, but costly), and the symbols' types in `hstype` already publish once (`sty_put`).
+Shared, left: the lazy fills of objects (the largest part of step 3): `ensure_resolved` sets an
+object's `ho_resolved` and then adds its members, call and construct signatures and index
+signatures to the shared row (resolve_decl, resolve_anon; `yidx`/`tidx` among them), so another
+worker may read a half-filled object. A private fill needs a per-worker redirect from the object to
+the worker's copy until published (about 330 sites read `hph`, `ho_order`, `ho_calls`, `ho_ctors`,
+`ho_sidx`, `ho_nidx` directly), or the declared objects resolved before the workers start, as the
+shells are (an object made while checking, a type literal's, would still be filled lazily).
+Also a deferred tuple's `args`/`eflags` filled in place, and symbols' types kept in `st_tmp` while
+an alias is made or `c.spec` is set, never flushed (each worker keeps its own copy).
 
 Binding (shared; complete before checking only with VTSC_EAGER_BIND, else written as scopes are
 named): `globals`, `gtypes`, `locals`, `ltypes`, `nsym` (set once, `nsym_put`), `parent`, `mexports`,
