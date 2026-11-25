@@ -978,7 +978,9 @@ Shared, done (one checker still; every conversion kept the probes, vtests' 3 fai
 - SharedMaps (first add wins; a site returns what `add` returns): `tl_cache`, `strlits`, `biglits`,
   `unres_names`, `inst_icache`, `inst_acache`, `alias_inst` (commit e34cb684); `numlits`, `tmpl_ids`;
   `inst_gcache`, `cond_cache`, `fresh_sig` and `erased_sig` (the made signature's own entry added
-  first), `base_sigs`, `mapped_fresh_p`, `alias_clones`, `compose_cache`, `mtmpl`.
+  first), `base_sigs`, `mapped_fresh_p`, `alias_clones`, `compose_cache`, `mtmpl`, `tcache`;
+  `base_ctor` and `cinit_narrow`, whose placeholders (any, -1) are now the worker's own while it
+  finds the value (`base_busy`, `cinit_busy`, as `tl_busy`), then published.
 - Side tables as C columns: numeric literals (`hnx` texts, `hnv` values), template literal types
   (`htm_h`, `htm_t`, `htm_m`, texts in the Ns `hsx`), mappers (`hmp`, interned in `hik` tag 7).
 - Attributes kept by row (`cx_*`/`ckl_*`, `types.vu`'s `ht_*` types', `hy_*` symbols', `ho_*`
@@ -987,7 +989,7 @@ Shared, done (one checker still; every conversion kept the probes, vtests' 3 fai
   `enum_base`, `enum_members`, `spread_orig`, `order_decl`, `tidx`, `yidx`, `sig_outer`, `bare_opt`,
   `noshow_t`, `tp_con`, `this_of`, `assert_pred`, `this_pred`, `tquery_node`, `static_side`,
   `funions`, `freg`, `unfresh_of`, `mapped_m`, `tlen_sym`, `this_tp`, `noinfer_of_t`, `merged_ns`,
-  `spread_syms`, `unsup_msg` (an id in `hsx`: `types.umsg_*`). Also order-independent: the probes
+  `spread_syms`, `fail_ret`, `unsup_msg` (an id in `hsx`: `types.umsg_*`). Also order-independent: the probes
   under VTSC_SHUFFLE 1-3 and idx 31, 52, 86 under seed 1 give the unshuffled output.
   `ctab_stress.vu` covers `cx_*`, `ckl_*` and `cl_row` (8 tasks, TSan clean).
 - Removed, unused: `unions`, `inst_cache`, `ref_cache`, `tvar_cache` still there (unused too).
@@ -1006,12 +1008,13 @@ removals (rel.vu, the constraint's lazy fill); `smore` appended as declarations 
 
 Shared, left (identity: the value is a row made on demand, so two workers making their own would
 give one declaration two types, and a union of the two prints twice; most are lazy fills, step 3):
-`enum_type` (with its member symbols, `nsym_put`), `fsig` (a function's signature), `sigs_cache`
-(a list: a `ckl_` column by `t << 1 | ctor`), `tcache` (a type node's type), `base_ctor`,
-`cinit_narrow`, `js_this`/`js_expando`/`js_this_base`, `fail_ret`, `imp_target` (-2 while
-resolving), `cjs_exp_t`/`cjs_mod_t`/`cjs_xs_t` (-3 while typed), `lib_unsup` (a message: as
-`unsup_msg`), `var_cache`/`var_unrel` (measured variance: a pure answer, but costly), and the
-symbols' types in `hstype` already publish once (`sty_put`).
+`enum_type` (with its member symbols, `nsym_put`), `fsig` (a function's signature, removed and made
+again for contextual typing at 8 sites), `sigs_cache` (a list: first add wins needs a `ckl_publish`,
+a compare-and-swap of the row's offset with the length kept in the pool),
+`js_this`/`js_expando`/`js_this_base`, `imp_target` (-2 while resolving),
+`cjs_exp_t`/`cjs_mod_t`/`cjs_xs_t` (-3 while typed), `lib_unsup` (a lib node's message: a SharedMap
+of ids in `hsx`, but it is removed again at one site), `var_cache`/`var_unrel` (measured variance: a
+pure answer, but costly), and the symbols' types in `hstype` already publish once (`sty_put`).
 
 Binding (shared; complete before checking only with VTSC_EAGER_BIND, else written as scopes are
 named): `globals`, `gtypes`, `locals`, `ltypes`, `nsym` (set once, `nsym_put`), `parent`, `mexports`,
