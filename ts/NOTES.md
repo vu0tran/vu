@@ -406,9 +406,21 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   thread before its index is published (a new object or signature), and the lazily filled fields
   (`resolved` with `calls ctors sidx nidx sname nname`, `args`/`eflags` of a deferred tuple or
   reference, `sigs.ret`, `tparams`) need a set-once protocol (a state word per row: empty, being
-  filled by worker N, filled; a second filler waits or computes the same value). Step 3: the lazy
-  `stype`/`nsym`/`ntype` writes as set-once slots with a debug-build check that a second write gives
-  the same value.
+  filled by worker N, filled; a second filler waits or computes the same value).
+- Step 3 measured, not started (2026-11-24): how often a lazy write replaces a different value, over
+  vtests' 834 cases (each write counted by a throwaway instrumentation, the session's scratch
+  `m3s/soinst.py`): `stype` never goes from one type to another; it goes back to -1/-2 28 times in 12
+  cases (circular and deferred inferred returns, `this` literals), so it is set-once but for those
+  resets. `nsym` is rewritten 1,231 times, nearly all (1,206) in bind.vu's interface merging across
+  namespace blocks (`types.add_decl(&c, prev, d)`: a declaration moved to the symbol it merges
+  into), 25 per case that loads the lib: binding-time, so set-once once merging runs before checking
+  (M1's eager binding). `ntype` is rewritten 2,041 times, 1,882 at check_expr's own write
+  (`c.ntype[n] = t`): an expression checked again under another context gets another type (and
+  `nt_log` already rolls some back). So `ntype` isn't a compute-once cache but the last check's
+  answer: making it shared needs the speculative checks (a context, an inference pass) to write a
+  per-worker overlay and only the final check to write the shared slot. That, the resets of
+  `stype`, and the namespace merge's `nsym` are what step 3 has to settle before a set-once slot with
+  a debug check can replace those writes.
 
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
