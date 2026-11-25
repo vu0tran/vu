@@ -142,6 +142,9 @@ static inline void vu_leave_prof(vu_frame *f) { __asm__ volatile("" ::: "memory"
 #define VU_PAR_JOIN(t) ((void)0)
 #endif
 /* The report is built with write() only, so the stack-overflow signal handler can use it too. */
+/* par loops running in the process now (the C runtime's check that an extern call isn't inside one
+   asks OpenMP only while one is) */
+VU_G int64_t vu_par_live;
 VU_G char vu_pbuf[4096];
 VU_G size_t vu_plen;
 static void vu_pflush(void) {

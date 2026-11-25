@@ -868,6 +868,10 @@ fn main(ffi: Ffi) throws:
   `own` parameter gives the handle to C, which must free it.
 - An extern function can't be called inside a `par` loop (the program stops): C libraries
   aren't known to be thread-safe.
+- A glue header (`extern "cols.h":`) is C with no state of its own: a big program built in parts
+  includes it in every part, so its functions (`static inline`) are inlined into the Vu code that
+  calls them, as cheap as reading a list. A `.c` glue file is compiled once, so its calls stay
+  calls. Use a header for small, hot functions over memory the handles own.
 - `vu check` checks the Vu side; the C file is compiled by `vu build` and `vu run`.
 
 The C side. The glue file is included after Vu's runtime, so it can use these:

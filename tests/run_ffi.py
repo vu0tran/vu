@@ -90,5 +90,24 @@ check('the build cache keeps a program that calls C, and an edit to its C file b
 # vu check never runs the C compiler, so a broken C file is only found by build.
 rc, out, err = run(VU + ['check', 'main.vu'], cwd=os.path.join(D, '17_bad_signature'))
 check('check passes a program whose C file is broken (only build compiles C)', rc == 0, err)
+# A glue header in a split build: every part includes it and inlines its functions, and the parts
+# kept between builds are keyed by its text, so an edit to the header builds them again.
+hdir = os.path.join(work, 'hdr')
+shutil.copytree(os.path.join(D, '36_glue_header'), os.path.join(hdir, 'prog'))
+shutil.copytree(os.path.join(D, 'glue'), os.path.join(hdir, 'glue'))
+henv = {'VU_SPLIT': 'always', 'VU_SPLIT_LINES': '20', 'XDG_CACHE_HOME': os.path.join(work, 'hxdg'), 'VU_CACHE': ''}
+exe = os.path.join(work, 'hdr_exe')
+rc1, _, e1 = run(VU + ['build', '--release', 'main.vu', '-o', exe], cwd=os.path.join(hdir, 'prog'), env=henv)
+r1 = run([exe]) if rc1 == 0 else (rc1, '', e1)
+hfile = os.path.join(hdir, 'glue', 'cols.h')
+htxt = open(hfile).read()
+open(hfile, 'w').write(htxt.replace('#define COL_SCALE 1', '#define COL_SCALE 2'))
+rc2, _, e2 = run(VU + ['build', '--release', 'main.vu', '-o', exe], cwd=os.path.join(hdir, 'prog'), env=henv)
+r2 = run([exe]) if rc2 == 0 else (rc2, '', e2)
+parts = os.path.join(work, 'hxdg', 'vu', 'parts')
+nparts = sum(len(fs) for _, _, fs in os.walk(parts)) if os.path.isdir(parts) else 0
+check('a glue header in a split build: inlined in every part, and an edit to it builds the parts again',
+      r1[0] == 0 and r1[1].strip() == '10 45 285 9 3' and r2[0] == 0 and r2[1].strip() == '10 90 1140 18 3' and nparts > 4,
+      f'{r1} {r2} parts {nparts}')
 print(f'{passed} passed, {failed} failed')
 sys.exit(1 if failed else 0)

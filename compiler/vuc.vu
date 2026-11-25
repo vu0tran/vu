@@ -2054,6 +2054,8 @@ type G:
   has_extern: Bool = false
   exttypes: {Str: Str} = {} # extern handle type -> the C function that frees one
   extern_fns: {Str: Bool} = {}
+  ffi_ck: Int = 0  # the extern calls the function being generated makes (VU_FFI_CK)
+  extern_where: {Str: Str} = {} # extern function -> its C name and line, as the par-loop check reports them
   fn_err: {Str: Str} = {} # function -> the enum it fails with (throws E); others fail with messages
   err_enums: [Str] = []
   jtypes: [Str] = []    # types that to_json / from_json need code for
@@ -3112,6 +3114,7 @@ fn fn_sig(var g: G, it: Node, name: Str) -> Sig:
   if it.op == "extern":
     check_extern(g, it, params, ret)
     g.extern_fns[name] = true
+    g.extern_where[name] = cstr(it.v) + ", {it.line}"
   if it.op == "export": check_export(g, it, name, params, ret)
   if it.name2 != "":
     let et = resolve(&g, it.name2, it.line)
@@ -5116,6 +5119,8 @@ fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Boo
   g.is_main = false
   g.src_line = e.line
   g.lam_names.push(e.name + "")
+  let s_ffi = g.ffi_ck
+  g.ffi_ck = 0
   push_scope(&g, false)
   for i in 0..caps.len:
     let cname = g.vars[caps[i]].name + ""
@@ -5171,6 +5176,8 @@ fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Boo
   let rett = g.rett + ""
   var lines: [Str] = []
   swap(&lines, &g.lines)
+  if g.ffi_ck > 0: ffi_entry(&lines)
+  g.ffi_ck = s_ffi
   swap(&s_lines, &g.lines)
   swap(&s_scopes, &g.scopes)
   swap(&s_loops, &g.loops)
@@ -6299,6 +6306,14 @@ fn call_user_or_spawn(var g: G, e: Node, name: Str, allow_throw: Bool, spawn_lin
       g.vf_fns.push(name + "")
     codes.push(g.spec_flag + "")
     return wrap(&g, pre, "fn_" + name + "__vf(" + join(codes, ", ") + ")", post, ret)
+  if name in g.extern_fns:
+    # (C can't be called inside a par loop. Whether a frame runs inside one doesn't change while it
+    # runs, so a function asks once, at its start (VU_FFI_ENTRY, added by ffi_entry), and each call
+    # tests the answer; a call in a par loop's own body asks each time)
+    var ck = "VU_FFI_CK("
+    if g.par_on: ck = "vu_ffi_here("
+    else: g.ffi_ck += 1
+    return wrap(&g, pre, "(" + ck + g.extern_where[name] + "), fn_" + name + "(" + join(codes, ", ") + "))", post, ret)
   return wrap(&g, pre, "fn_" + name + "(" + join(codes, ", ") + ")", post, ret)
 
 # ---- built-ins
@@ -8429,6 +8444,7 @@ fn s_range(var g: G, n: Node) -> Bool:
     # backtrace to the frame of the function running the loop.
     let top = tmp(&g)
     emit(&g, "VU_PAR_TOP(" + top + ");")
+    emit(&g, "__atomic_add_fetch(&vu_par_live, 1, __ATOMIC_SEQ_CST);")
     emit(&g, "#pragma omp parallel")
     open(&g, "{{")
     emit(&g, "vu_thread_guard();")
@@ -8444,6 +8460,7 @@ fn s_range(var g: G, n: Node) -> Bool:
     for v in frozen: g.vars[v].frozen.pop()
     g.par_on = false
     close(&g)
+    emit(&g, "__atomic_sub_fetch(&vu_par_live, 1, __ATOMIC_SEQ_CST);")
   else:
     var header = ""
     if not n.flag and step == "1":
@@ -9384,9 +9401,14 @@ fn gen_extern(var g: G, items: [Node], name: Str):
       args.push("*" + v)
   var rett = ret + ""
   if g.fns[name].fails: rett = "!" + ret
-  g.sigs.push("static " + ct(g, rett) + " fn_" + name + "(" + join(cps, ", ") + ")")
+  # (a glue header's functions are in every part of a split build: their calls are inlined)
+  var jx = ii
+  while jx > 0 and items[jx].k != "extern": jx -= 1
+  var inl = ""
+  if items[jx].k == "extern" and items[jx].v.endswith(".h"): inl = "inline __attribute__((always_inline)) "
+  g.sigs.push("static " + inl + ct(g, rett) + " fn_" + name + "(" + join(cps, ", ") + ")")
   let where = cstr(cn) + ", {items[ii].line}"
-  var lines = ["    vu_ffi_here(" + where + ");"]
+  var lines = ["    /* vu-extern */"]
   let is_ext = tkind(g, ret) == "ext"
   if g.fns[name].fails:
     var all = copy_strs(args)
@@ -9599,6 +9621,8 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
   let params = copy_params(g.fns[name].params)
   let ret = g.fns[name].ret
   g.lines = []
+  let s_ffi = g.ffi_ck
+  g.ffi_ck = 0
   g.ind = 1
   g.src_line = node.line   # the function's own setup and cleanup belong to its 'fn' line
   # its module's prefix (geo__ for geo__area): a local named like one of the module's types is rejected
@@ -9655,6 +9679,8 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
   g.sigs.push(sig)
   var body: [Str] = []
   swap(&body, &g.lines)
+  if g.ffi_ck > 0: ffi_entry(&body)
+  g.ffi_ck = s_ffi
   if small_leaf(body):
     for bi in 0..body.len:
       let at = body[bi].find("VU_ENTER(")
@@ -9662,6 +9688,13 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
         body[bi] = body[bi][0..at] + "VU_ENTER_LEAF(" + body[bi][at + 9..body[bi].len]
         break
   g.bodies.push(join(body, "\n"))
+
+# A function whose body calls C (VU_FFI_CK) asks at its start whether it runs inside a par loop.
+fn ffi_entry(var lines: [Str]):
+  for i in 0..lines.len:
+    if lines[i].find("VU_ENTER(", 0) >= 0:
+      lines[i] = lines[i] + "\n    VU_FFI_ENTRY;"
+      return
 
 # Whether a function's C has no loop and calls none of the program's functions: in --profile builds it
 # then keeps no frame of its own (VU_ENTER_LEAF), whose cost would be counted as the function's.
@@ -9992,11 +10025,15 @@ fn build(var g: G, items: [Node]) -> Str:
       if fi.item >= 0 and items[fi.item].op == "extern": out.push(extern_proto(g, fi, items[fi.item].v))
     # (a split build includes the glue in part 0 only, with the functions that call it: the extern
     # functions' bodies (split_build moves them there) and the handles' drops, which the other parts
-    # call; the glue's own static state then exists once)
+    # call; the glue's own static state then exists once. A glue header, "x.h", has no state of its
+    # own: it is included in every part, and so are its functions' bodies, to be inlined)
     out.push("#if defined(VU_PART) || defined(VU_PART0)\n#define VU_XDROP\n#else\n#define VU_XDROP static\n#endif")
     for n, d in g.exttypes: out.push("VU_XDROP void drop_X_" + n + "(void **p);")
+    for p in g.ext_paths:
+      if p.endswith(".h"): out.push("#include " + cstr(p))
     out.push("#ifndef VU_PART")
-    for p in g.ext_paths: out.push("#include " + cstr(p))
+    for p in g.ext_paths:
+      if not p.endswith(".h"): out.push("#include " + cstr(p))
     for n, d in g.exttypes: out.push("VU_XDROP void drop_X_" + n + "(void **p) {{ if (*p) {{ " + d + "(*p); *p = NULL; }} }}")
     out.push("#endif")
   for c in consts: out.push(c)
@@ -11145,7 +11182,7 @@ fn glue_text(fs: Fs, csrc: Str) -> Str:
   while i >= 0 and i < lim:
     let e = csrc.find("\n", i + 1)
     let ln = csrc[i + 1..e]
-    if ln.endswith(".c\""):
+    if ln.endswith(".c\"") or ln.endswith(".h\""):
       let p = ln[10..ln.len - 1]
       let txt = fs.read(p) else ""
       out += p + "\n" + txt + "\n"
@@ -11195,7 +11232,7 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
     var rest = ""
     for f in p.split("\n/* vu-part */\n"):
       if f.startswith("VU_FNI "): head += f + "\n"
-      elif f.find("vu_ffi_here(", 0) >= 0: part0 += "\n/* vu-part */\n" + f
+      elif f.find("/* vu-extern */", 0) >= 0: part0 += "\n/* vu-part */\n" + f
       elif f != "": rest += "\n/* vu-part */\n" + f
     if rest != "": parts.push(rest)
   # (part 0's key holds the glue files it includes, which aren't in the C here)
@@ -11215,7 +11252,10 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
   fs.write(pdir + "/head.h", head) else 0
   var objs: [Str] = []
   var jobs = 0
-  let hkey = sha256(fkey + "\n" + head).hex() + "\n"   # (the header and options, hashed once)
+  # (the header and options, hashed once; with a glue header, which every part includes, its text)
+  var hglue = ""
+  if head.find(".h\"\n", 0) >= 0: hglue = glue
+  let hkey = sha256(fkey + "\n" + head + hglue).hex() + "\n"
   let tag = random_bytes(6).hex()
   # clang: the header compiled once (a precompiled header, kept with the parts) for every part but
   # part 0, instead of parsed by each
@@ -13205,6 +13245,9 @@ fn rt_runtime() -> Str:
   s += "#define VU_PAR_JOIN(t) ((void)0)\n"
   s += "#endif\n"
   s += "/* The report is built with write() only, so the stack-overflow signal handler can use it too. */\n"
+  s += "/* par loops running in the process now (the C runtime's check that an extern call isn't inside one\n"
+  s += "   asks OpenMP only while one is) */\n"
+  s += "VU_G int64_t vu_par_live;\n"
   s += "VU_G char vu_pbuf[4096];\n"
   s += "VU_G size_t vu_plen;\n"
   s += "static void vu_pflush(void) {{\n"
@@ -22450,13 +22493,23 @@ fn rt_ffi() -> Str:
   s += "    p[s->len] = 0;\n"
   s += "    return p;\n"
   s += "}}\n"
-  s += "static void vu_ffi_here(const char *fn, int line) {{\n"
-  s += "    if (vu_in_par()) {{\n"
-  s += "        char m[300];\n"
-  s += "        int n = snprintf(m, sizeof m, \"%.200s() is C code, which can't be called inside a par loop\", fn);\n"
-  s += "        vu_panic(line, m, n);\n"
-  s += "    }}\n"
+  s += "__attribute__((noreturn, cold, noinline)) static void vu_ffi_in_par(const char *fn, int line) {{\n"
+  s += "    char m[300];\n"
+  s += "    int n = snprintf(m, sizeof m, \"%.200s() is C code, which can't be called inside a par loop\", fn);\n"
+  s += "    vu_panic(line, m, n);\n"
   s += "}}\n"
+  s += "/* A call in a par loop's own body: asked each time. */\n"
+  s += "static inline void vu_ffi_here(const char *fn, int line) {{\n"
+  s += "    if (vu_in_par()) vu_ffi_in_par(fn, line);\n"
+  s += "}}\n"
+  s += "/* Any other call: its function asked once, at its start (OpenMP only while some par loop runs), since\n"
+  s += "   whether a frame runs inside a par loop doesn't change while it runs. */\n"
+  s += "__attribute__((noinline)) static bool vu_ffi_par_slow(void) {{ return vu_in_par(); }}\n"
+  s += "static inline bool vu_ffi_par_entry(void) {{\n"
+  s += "    return __atomic_load_n(&vu_par_live, __ATOMIC_RELAXED) != 0 && vu_ffi_par_slow();\n"
+  s += "}}\n"
+  s += "#define VU_FFI_ENTRY const bool vu_inpar = vu_ffi_par_entry()\n"
+  s += "#define VU_FFI_CK(fn, line) (vu_inpar ? vu_ffi_in_par(fn, line) : (void)0)\n"
   s += "__attribute__((noreturn)) static void vu_ffi_null(const char *fn, int line) {{\n"
   s += "    char m[300];\n"
   s += "    int n = snprintf(m, sizeof m, \"%.200s() returned no handle (NULL) without reporting an error\", fn);\n"

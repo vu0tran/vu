@@ -3211,3 +3211,28 @@ the file's times, size and inode are unchanged. The CI job's pattern from an emp
 with oxlint 1.79: 71.3 and 70.4 s (451 and 455 cpu-s) against 74.8 and 74.8 s (471 and 469); 74.9 s
 and 475 cpu-s before; outputs identical, 63 MB of cache. Measured, not changed: vtsc instantiates no
 more than tsgo on the same program (554,000 against 791,000) and checks it as fast on one thread.
+
+**Extern calls as cheap as a list read (2026-11-24).** vtsc's flat type and symbol tables are
+moving to C, so that several checker threads can share them; each read became an extern call, and
+in a split release build that cost far more than the small benchmark it was measured on: a call
+into part 0 (the only part that includes the glue), `omp_in_parallel()` on every call for the
+par-loop check, and a stack protector for the check's message buffer. Moving one table (`c.tk`,
+2,800 read sites) cost +23-35% instructions retired on three programs. Now:
+- a glue file named `.h` ("glue header", SPEC.md) has no state of its own: every part includes it,
+  and its wrappers are `static inline`, so the calls inline into the Vu code (`tests/ffi/36`, and a
+  generated check that a split build of it runs and that an edit to the header builds the parts
+  again);
+- the par-loop check asks OpenMP only while a par loop runs (`vu_par_live`, counted around each
+  loop), and asks once per function at its start rather than per call, since whether a frame runs
+  inside a par loop doesn't change while it runs; a call in a par loop's own body is still checked
+  each time. The panic is unchanged and still happens only when the call is reached
+  (`tests/ffi/37_header_par`, `38_par_unreached`, `39_closure_par`, and `09_par`).
+With twelve tables moved: +2.1-4.0% instructions on the three programs (+0.4% with no check at all;
+the rest is the check at each function's start). Measured on macOS (arm64, Apple clang); the FFI
+suite passes there with leak detection off (LeakSanitizer isn't supported on macOS), 75 targeted
+tests matching par, extern or ffi pass, run_split.sh 17 of 17, run_targeted.sh 776 of 776. The full
+gate can't pass on this Mac: its other failures are the machine's (no LeakSanitizer, Apple clang
+without -fopenmp for CC=clang builds, clang crashing on a 20,000-term expression, Python's Unicode
+and HTML versions, Linux tools for the network suites); run_tools, run_profile and run_norm fail the
+same way at the previous commit, and the par-loop programs give one output under -O3, --debug and
+--malloc (31 of 31). Not yet run on Linux.

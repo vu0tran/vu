@@ -28,9 +28,14 @@ fn gen_extern(var g: G, items: [Node], name: Str):
       args.push("*" + v)
   var rett = ret + ""
   if g.fns[name].fails: rett = "!" + ret
-  g.sigs.push("static " + ct(g, rett) + " fn_" + name + "(" + join(cps, ", ") + ")")
+  # (a glue header's functions are in every part of a split build: their calls are inlined)
+  var jx = ii
+  while jx > 0 and items[jx].k != "extern": jx -= 1
+  var inl = ""
+  if items[jx].k == "extern" and items[jx].v.endswith(".h"): inl = "inline __attribute__((always_inline)) "
+  g.sigs.push("static " + inl + ct(g, rett) + " fn_" + name + "(" + join(cps, ", ") + ")")
   let where = cstr(cn) + ", {items[ii].line}"
-  var lines = ["    vu_ffi_here(" + where + ");"]
+  var lines = ["    /* vu-extern */"]
   let is_ext = tkind(g, ret) == "ext"
   if g.fns[name].fails:
     var all = copy_strs(args)
@@ -243,6 +248,8 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
   let params = copy_params(g.fns[name].params)
   let ret = g.fns[name].ret
   g.lines = []
+  let s_ffi = g.ffi_ck
+  g.ffi_ck = 0
   g.ind = 1
   g.src_line = node.line   # the function's own setup and cleanup belong to its 'fn' line
   # its module's prefix (geo__ for geo__area): a local named like one of the module's types is rejected
@@ -299,6 +306,8 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
   g.sigs.push(sig)
   var body: [Str] = []
   swap(&body, &g.lines)
+  if g.ffi_ck > 0: ffi_entry(&body)
+  g.ffi_ck = s_ffi
   if small_leaf(body):
     for bi in 0..body.len:
       let at = body[bi].find("VU_ENTER(")
@@ -306,6 +315,13 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
         body[bi] = body[bi][0..at] + "VU_ENTER_LEAF(" + body[bi][at + 9..body[bi].len]
         break
   g.bodies.push(join(body, "\n"))
+
+# A function whose body calls C (VU_FFI_CK) asks at its start whether it runs inside a par loop.
+fn ffi_entry(var lines: [Str]):
+  for i in 0..lines.len:
+    if lines[i].find("VU_ENTER(", 0) >= 0:
+      lines[i] = lines[i] + "\n    VU_FFI_ENTRY;"
+      return
 
 # Whether a function's C has no loop and calls none of the program's functions: in --profile builds it
 # then keeps no frame of its own (VU_ENTER_LEAF), whose cost would be counted as the function's.
@@ -636,11 +652,15 @@ fn build(var g: G, items: [Node]) -> Str:
       if fi.item >= 0 and items[fi.item].op == "extern": out.push(extern_proto(g, fi, items[fi.item].v))
     # (a split build includes the glue in part 0 only, with the functions that call it: the extern
     # functions' bodies (split_build moves them there) and the handles' drops, which the other parts
-    # call; the glue's own static state then exists once)
+    # call; the glue's own static state then exists once. A glue header, "x.h", has no state of its
+    # own: it is included in every part, and so are its functions' bodies, to be inlined)
     out.push("#if defined(VU_PART) || defined(VU_PART0)\n#define VU_XDROP\n#else\n#define VU_XDROP static\n#endif")
     for n, d in g.exttypes: out.push("VU_XDROP void drop_X_" + n + "(void **p);")
+    for p in g.ext_paths:
+      if p.endswith(".h"): out.push("#include " + cstr(p))
     out.push("#ifndef VU_PART")
-    for p in g.ext_paths: out.push("#include " + cstr(p))
+    for p in g.ext_paths:
+      if not p.endswith(".h"): out.push("#include " + cstr(p))
     for n, d in g.exttypes: out.push("VU_XDROP void drop_X_" + n + "(void **p) {{ if (*p) {{ " + d + "(*p); *p = NULL; }} }}")
     out.push("#endif")
   for c in consts: out.push(c)
@@ -1789,7 +1809,7 @@ fn glue_text(fs: Fs, csrc: Str) -> Str:
   while i >= 0 and i < lim:
     let e = csrc.find("\n", i + 1)
     let ln = csrc[i + 1..e]
-    if ln.endswith(".c\""):
+    if ln.endswith(".c\"") or ln.endswith(".h\""):
       let p = ln[10..ln.len - 1]
       let txt = fs.read(p) else ""
       out += p + "\n" + txt + "\n"
@@ -1839,7 +1859,7 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
     var rest = ""
     for f in p.split("\n/* vu-part */\n"):
       if f.startswith("VU_FNI "): head += f + "\n"
-      elif f.find("vu_ffi_here(", 0) >= 0: part0 += "\n/* vu-part */\n" + f
+      elif f.find("/* vu-extern */", 0) >= 0: part0 += "\n/* vu-part */\n" + f
       elif f != "": rest += "\n/* vu-part */\n" + f
     if rest != "": parts.push(rest)
   # (part 0's key holds the glue files it includes, which aren't in the C here)
@@ -1859,7 +1879,10 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
   fs.write(pdir + "/head.h", head) else 0
   var objs: [Str] = []
   var jobs = 0
-  let hkey = sha256(fkey + "\n" + head).hex() + "\n"   # (the header and options, hashed once)
+  # (the header and options, hashed once; with a glue header, which every part includes, its text)
+  var hglue = ""
+  if head.find(".h\"\n", 0) >= 0: hglue = glue
+  let hkey = sha256(fkey + "\n" + head + hglue).hex() + "\n"
   let tag = random_bytes(6).hex()
   # clang: the header compiled once (a precompiled header, kept with the parts) for every part but
   # part 0, instead of parsed by each
