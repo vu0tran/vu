@@ -1,9 +1,10 @@
 # The React Compiler's shape and global registries (oxc_react_compiler react_compiler_hir
 # object_shape.rs, globals.rs, default_module_type_provider.rs, and the type lookups of
 # environment.rs). The data tables are in rc_gdefs (generated from globals.rs); this module builds
-# the registries from them, as build_builtin_shapes and build_default_globals do. A Registry is
-# built once per file and lent to each compile (Env.reg); shapes a compile adds (module types)
-# stay in it, under fresh ids, which is harmless.
+# the registries from them, as build_builtin_shapes and build_default_globals do. The built-in
+# shapes and globals are built once per process (shared_base) and shared read-only (Base); a file's
+# Registry, lent to each compile (Env.reg), holds the shapes its compiles add (module types) under
+# fresh ids, looked up before the base's.
 
 import rc_hir
 import rc_gdefs
@@ -33,12 +34,58 @@ type Shape:
   has_fn: Bool = false
   fsig: FnSig = FnSig()
 
-type Registry:
+# the built-in shapes and globals (base's), shared by every file's Registry
+type Base:
   shapes: {Str: Shape} = {}
   globals: {Str: Ty} = {}
   anon: Int = 0
   built: Bool = false
+
+type Registry:
+  b: [Shared[Base]] = []        # the base (none while base builds)
+  shapes: {Str: Shape} = {}     # (base builds every shape here; a file's: only those it adds)
+  globals: {Str: Ty} = {}       # (only while base builds)
+  anon: Int = 0
+  built: Bool = false
   modules: {Str: [Ty]} = {}     # resolve_module_type's cache
+
+# the base registry, built once to share
+fn shared_base() -> Shared[Base]:
+  var r = base()
+  var b = Base(anon: r.anon, built: true)
+  swap(&b.shapes, &r.shapes)
+  swap(&b.globals, &r.globals)
+  return share(b)
+
+# a file's registry on a shared base (built here when the base isn't)
+fn file_registry(b: [Shared[Base]]) -> Registry:
+  if b.len == 0: return file_registry([shared_base()])
+  return Registry(b: [b[0].share()], anon: b[0].value.anon, built: true)
+
+fn has_shape(r: Registry, sh: Str) -> Bool:
+  return (sh in r.shapes) or (r.b.len > 0 and (sh in r.b[0].value.shapes))
+
+fn has_global(r: Registry, n: Str) -> Bool:
+  return (n in r.globals) or (r.b.len > 0 and (n in r.b[0].value.globals))
+
+# a global's type ([] none)
+fn global_of(r: Registry, n: Str) -> [Ty]:
+  if (n in r.globals): return [rc_hir.cp_ty(r.globals[n])]
+  if (r.b.len > 0 and (n in r.b[0].value.globals)): return [rc_hir.cp_ty(r.b[0].value.globals[n])]
+  return []
+
+# a shape's property ([] none): prop, else "*" when star
+fn shape_prop(r: Registry, sh: Str, prop: Str, star: Bool) -> [Ty]:
+  if (sh in r.shapes):
+    let s = r.shapes[sh]
+    if prop != "" and (prop in s.props): return [rc_hir.cp_ty(s.props[prop])]
+    if star and ("*" in s.props): return [rc_hir.cp_ty(s.props["*"])]
+    return []
+  if (r.b.len > 0 and (sh in r.b[0].value.shapes)):
+    let s = r.b[0].value.shapes[sh]
+    if prop != "" and (prop in s.props): return [rc_hir.cp_ty(s.props[prop])]
+    if star and ("*" in s.props): return [rc_hir.cp_ty(s.props["*"])]
+  return []
 
 fn is_hook_name(s: Str) -> Bool:
   return s.len >= 4 and s[0] == 'u' and s[1] == 's' and s[2] == 'e' and ((s[3] >= 'A' and s[3] <= 'Z') or (s[3] >= '0' and s[3] <= '9'))
@@ -322,11 +369,8 @@ fn shape_of(t: Ty) -> Str:
 # get_property_type_from_shapes ([] none)
 fn property_type(r: Registry, t: Ty, prop: Str) -> [Ty]:
   let sh = shape_of(t)
-  if sh == "" or not (sh in r.shapes): return []
-  let s = r.shapes[sh]
-  if (prop in s.props): return [rc_hir.cp_ty(s.props[prop])]
-  if ("*" in s.props): return [rc_hir.cp_ty(s.props["*"])]
-  return []
+  if sh == "": return []
+  return shape_prop(r, sh, prop, true)
 
 fn is_known_react_module(m: Str) -> Bool:
   let l = m.lower()
@@ -346,12 +390,14 @@ fn global_declaration(var r: Registry, b: NonLocal) -> [Ty]:
     if is_hook_name(b.name): return [custom_hook_type()]
     return []
   if k == rc_hir.NL_GLOBAL:
-    if (b.name in r.globals): return [rc_hir.cp_ty(r.globals[b.name])]
+    let g = global_of(r, b.name)
+    if g.len > 0: return g
     if is_hook_name(b.name): return [custom_hook_type()]
     return []
   if k == rc_hir.NL_IMPORT_SPECIFIER:
     if is_known_react_module(b.module):
-      if (b.imported in r.globals): return [rc_hir.cp_ty(r.globals[b.imported])]
+      let g = global_of(r, b.imported)
+      if g.len > 0: return g
       if is_hook_name(b.imported) or is_hook_name(b.name): return [custom_hook_type()]
       return []
     let mt = resolve_module_type(&r, b.module)
@@ -362,7 +408,8 @@ fn global_declaration(var r: Registry, b: NonLocal) -> [Ty]:
     return []
   # import default / namespace
   if is_known_react_module(b.module):
-    if (b.name in r.globals): return [rc_hir.cp_ty(r.globals[b.name])]
+    let g = global_of(r, b.name)
+    if g.len > 0: return g
     if is_hook_name(b.name): return [custom_hook_type()]
     return []
   let mt = resolve_module_type(&r, b.module)
@@ -382,6 +429,9 @@ fn function_signature(r: Registry, t: Ty) -> [FnSig]:
     TFunction(sh, has, _, _):
       if has and (sh in r.shapes):
         let s = r.shapes[sh]
+        if s.has_fn: return [cp_fnsig(s.fsig)]
+      elif has and (r.b.len > 0 and (sh in r.b[0].value.shapes)):
+        let s = r.b[0].value.shapes[sh]
         if s.has_fn: return [cp_fnsig(s.fsig)]
     _: nop()
   return []
