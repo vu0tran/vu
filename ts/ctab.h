@@ -290,6 +290,87 @@ static inline bool ph_put(void *p, int64_t o, int64_t name, int64_t sym) {
   }
 }
 
+// Interned Int lists: (tag, prefix, list) -> a value (a type), found or added by several tasks at once
+// without a lock. A fixed array of bucket heads, each a chain of entries in an append-only pool (an
+// entry: next, hash, value, n, tag, prefix, the list); an entry is linked in by a compare-and-swap
+// on its bucket's head, so of two tasks adding one key, one wins and the other gets its value
+// (ik_put). An entry once linked never changes.
+#define IK_BUCKETS ((int64_t)1 << 18)
+typedef struct { int64_t *head; int64_t *pool; } ik_t;
+static inline void *ik_new(void *st) {
+  ik_t *h = malloc(sizeof *h);
+  if (!h) vu_panic(0, "ik_new: out of memory", 21);
+  h->head = calloc((size_t)IK_BUCKETS, 8);
+  if (!h->head) vu_panic(0, "ik_new: out of memory", 21);
+  h->pool = ct_mk();
+  h->pool[-1] = 1;  // (offset 0 is "none")
+  cs_add(st, h, 4);
+  return h;
+}
+static inline void ik_free(void *p) {
+  ik_t *h = p;
+  free(h->head);
+  ct_free(h->pool);
+  free(h);
+}
+static inline void ik_keep(void *h) { (void)h; }
+static inline uint64_t ik_hash(int64_t tag, int64_t pre, const int64_t *xs, int64_t n) {
+  uint64_t x = (uint64_t)tag * 0x9E3779B97F4A7C15ull ^ (uint64_t)pre * 0xC2B2AE3D27D4EB4Full ^ (uint64_t)n;
+  for (int64_t i = 0; i < n; i++) {
+    x ^= (uint64_t)xs[i];
+    x *= 0xFF51AFD7ED558CCDull;
+    x ^= x >> 29;
+  }
+  return x ^ (x >> 32);
+}
+// the value of a matching entry in the chain from e to stop (0: its end), -1 none
+static inline int64_t ik_walk(const ik_t *h, int64_t e, int64_t stop, uint64_t hs, int64_t tag, int64_t pre, const int64_t *xs, int64_t n) {
+  const int64_t *p = h->pool;
+  for (; e != stop; e = p[e]) {
+    if ((uint64_t)p[e + 1] != hs || p[e + 3] != n || p[e + 4] != tag || p[e + 5] != pre) continue;
+    const int64_t *ys = &p[e + 6];
+    int64_t i = 0;
+    while (i < n && ys[i] == xs[i]) i++;
+    if (i == n) return p[e + 2];
+  }
+  return -1;
+}
+static inline int64_t ik_get(void *ph, int64_t tag, int64_t pre, const int64_t *xs, int64_t n) {
+  const ik_t *h = ph;
+  uint64_t hs = ik_hash(tag, pre, xs, n);
+  int64_t e = __atomic_load_n(&h->head[hs & (IK_BUCKETS - 1)], __ATOMIC_ACQUIRE);
+  return ik_walk(h, e, 0, hs, tag, pre, xs, n);
+}
+// the key's value: v when this call added it, else the value another call added first
+static inline int64_t ik_put(void *ph, int64_t tag, int64_t pre, const int64_t *xs, int64_t n, int64_t v) {
+  ik_t *h = ph;
+  uint64_t hs = ik_hash(tag, pre, xs, n);
+  int64_t *hd = &h->head[hs & (IK_BUCKETS - 1)];
+  int64_t e0 = __atomic_load_n(hd, __ATOMIC_ACQUIRE);
+  int64_t w = ik_walk(h, e0, 0, hs, tag, pre, xs, n);
+  if (w >= 0) return w;
+  int64_t *p = h->pool;
+  int64_t ne = __atomic_fetch_add(&p[-1], n + 6, __ATOMIC_RELAXED);
+  if (ne + n + 6 > CT_MAX) vu_panic(0, "ik_put: the table is full", 25);
+  p[ne + 1] = (int64_t)hs;
+  p[ne + 2] = v;
+  p[ne + 3] = n;
+  p[ne + 4] = tag;
+  p[ne + 5] = pre;
+  for (int64_t i = 0; i < n; i++) p[ne + 6 + i] = xs[i];
+  for (;;) {
+    p[ne] = e0;
+    int64_t seen = e0;
+    if (__atomic_compare_exchange_n(hd, &seen, ne, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) return v;
+    // (another entry linked in first: is it this key?)
+    w = ik_walk(h, seen, e0, hs, tag, pre, xs, n);
+    if (w >= 0) return w;
+    e0 = seen;
+  }
+}
+static inline int64_t ik_addr(void *h) { return ct_addr(h); }
+static inline void *ik_view(int64_t a) { return ct_view(a); }
+
 // every table the store made freed
 static inline void cs_free(void *p) {
   cs_t *s = p;
@@ -298,6 +379,7 @@ static inline void cs_free(void *p) {
       case 0: ct_free(s->p[i]); break;
       case 1: cl_free(s->p[i]); break;
       case 2: ph_free(s->p[i]); break;
+      case 4: ik_free(s->p[i]); break;
       default: free(s->p[i]);
     }
   }

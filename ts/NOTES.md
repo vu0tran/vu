@@ -522,6 +522,48 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   another worker's rows would break. Probes 133/133, vtests the same 3 failures byte for byte, the
   CI job's 88 outputs byte-identical; 18.55 / 16.54 / 54.64 G instructions (+0.4, -1.4, -1.0% on
   the pre-M3 base).
+- Step 4.2, binding finished and the tree frozen before checking (landed 2026-11-24):
+  - VTSC_EAGER_BIND's pass is the path (`VTSC_EAGER_BIND=0` names scopes lazily, as before) and
+    names every kind of scope `scope_names` knows (`bind.scope_kind`: blocks, case clauses,
+    function-likes' parameters, for / for-in heads, catch bindings, class expressions), not just
+    blocks and module bodies: over vtests, the lazy path had named 5,771 scopes after checking
+    started (3,028 lib methods' parameter scopes, 1,482 functions', 707 arrows'...). With
+    VTSC_SO_CHECK=1, naming a scope after checking starts panics, except one case left: the root of
+    a file that isn't a module, named when something imports it (`root_exports`; job invocation 76
+    met it once, @types/node's test.d.ts). Naming every script's root eagerly is wrong (its
+    declarations get local symbols instead of the globals': tried, 86 vtests failed, Symbol.iterator
+    lost), and so is computing every file's exports eagerly (the same). What it needs: the files an
+    import resolves to, known before checking, and only those roots named.
+  - Each JSX element's object literal (chk.jsx_obj) is made in that pass, so no node is added while
+    checking (VTSC_SO_CHECK=1 panics if the tree grew, and if jsx_obj makes one late).
+  - bind.vu's change-and-restore of a `typeof a.b<T>` node is gone (`bind.tquery_flow` reads the
+    query without its type arguments).
+  - The names the checker asks for by a constant text are interned when the checker is made
+    (`c.kn[types.KN_...]`, 27 names, 46 sites); the rest (49 sites: "{i}", "arg{j}", numeric and
+    `[Symbol.x]` keys, JSX attribute names) go through `types.name_id`, the one place left that
+    adds to the names table while checking: step 3's concurrent names table goes there.
+- Step 4.3 started, interned lists in C (landed with 4.2): `intern_find`/`intern_put` (unions,
+  intersections, their origins, `union_plain`) and `bind.ref_of`'s references (tag 5, before a map
+  of hashes) are one lock-free table, ctab.h `ik_*`: 2^18 bucket heads, each a chain of entries in
+  an append-only pool, an entry linked by a compare-and-swap on its head; `ik_put` returns the value
+  already there when another worker added the key first, and every caller now returns what
+  `intern_put` returns (the side tables, `t_origin`, `t_ctv`, `t_iorigin`, written before it, so
+  before the id is published). Chosen over lock-striped open addressing: no resize to coordinate.
+  Not measured against it.
+  Gates for 4.2 and 4.3 together: probes 133/133 and vtests' 3 failures byte for byte (both with
+  VTSC_SO_CHECK=1 too), the CI job's 88 outputs byte-identical with VTSC_SO_CHECK=1 (no panic);
+  18.43 / 16.46 / 54.15 G instructions (-0.3, -1.8, -1.9% on the pre-M3 base).
+- Next (step 4.3, the rest): the other interning maps as `ik_*` keys (`strlits`, `numlits`,
+  `biglits`, `unions` (Str keys), `tmpls`/`tmpl_ids`, `mappers`/`mapper_ids`, `inst_cache`,
+  `t_alias`..., `tl_cache`, `alias_inst`, `inst_icache`/`inst_acache`, `enum_type`/`enum_union`,
+  `tuple_labels`): a Str key becomes its Ints (name ids, type ids), a key's side attributes C
+  columns written before `ik_put`. Then the names: `c.t.names` frozen when checking starts, and
+  `types.name_id` finding a name in it read-only (an `ast` find without insert) or in a C string
+  table (ids from the frozen length up, so single-threaded ids stay the same); the ~160 direct
+  `c.t.names[x]` reads in the checker's files (bind 33, chk 56, rel 36, show 17, types 9, tyops
+  4, trules 3+3) become `nm(c, x)`. Then a list column's pool reservation (`cl_add`/`cl_set`),
+  `ph_put` without moving slots, and the `ct_len` watermarks (chk.vu `cur_id`/`nsg`, tyops'
+  `tk0`).
 - Then step 4: `var c: C` split into the shared tables and a per-worker state, and M4: N checker
   threads over the shared tables behind a switch, off by default. M4's gates: 1, 2, 4 and 8 threads,
   20 runs each, byte-identical on the 88 invocations and the probes; TSan with CC=clang and Archer as
