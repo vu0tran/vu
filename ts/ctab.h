@@ -127,6 +127,25 @@ static inline int64_t ct_publish(void *h, int64_t i, int64_t v) {
   return old;
 }
 static inline int64_t ct_len(void *h) { return __atomic_load_n(&((const int64_t *)h)[-2], __ATOMIC_ACQUIRE); }
+// entry i, or 0 past the column's end: a column written only at some rows of a group (the region is
+// zero, so a row never written reads 0 too; such columns keep a value + 1)
+static inline int64_t ct_get0(void *h, int64_t i) {
+  const int64_t *p = h;
+  if ((uint64_t)i >= (uint64_t)ct_len0(p)) return 0;
+  return p[i];
+}
+// a Float kept in an Int column (its bits)
+static inline void ct_putf(void *h, int64_t r, double v) {
+  int64_t b;
+  memcpy(&b, &v, 8);
+  ct_put(h, r, b);
+}
+static inline double ct_atf(void *h, int64_t i) {
+  int64_t b = ct_at(h, i);
+  double v;
+  memcpy(&v, &b, 8);
+  return v;
+}
 
 // A list column: a list of Ints per row, each row an (offset, length) pair into a pool of Ints, both
 // append-only regions as above. A row is changed by writing its list again at the pool's end (or, when
@@ -161,6 +180,14 @@ static inline int64_t *cl_rp(cl_t *h, int64_t r) {
   return &h->row[2 * r];
 }
 static inline int64_t cl_len(void *p, int64_t r) { return cl_rp(p, r)[1]; }
+// a new row (an empty list) of a list column that numbers its own rows (a fetch-add on the row
+// region's reservation counter, which nothing else uses): its index
+static inline int64_t cl_row(void *p) {
+  cl_t *h = p;
+  int64_t r = __atomic_fetch_add(&h->row[-1], 1, __ATOMIC_RELAXED);
+  cl_init(p, r);
+  return r;
+}
 static inline int64_t cl_at(void *p, int64_t r, int64_t i) {
   cl_t *h = p;
   const int64_t *rp = cl_rp(h, r);

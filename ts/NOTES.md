@@ -936,10 +936,14 @@ What it takes, decided:
   freezes the worker's `C` as a view into `c.t` does today, so code that compiles now still does),
   and the rest per worker, empty at the start, as tsgo keeps node links per checker.
 - Not done, in order (each with the gates: probes, vtests' 3 failures, the 176 job outputs):
-  1. The rest of the interning maps: `numlits` with `nums`/`numtext`, `tmpl_ids` with `tmpls`,
-     `mapper_ids` with `mappers`, `unions`, `enum_type`/`enum_union`, `ref_cache`/`inst_cache`: each
-     key's side table (a Vu list of floats, strings or structs today) as C columns or names (ns_*)
-     first, written before the id is added.
+  1. (Done, 2026-11-25.) The rest of the interning maps: `numlits` (a SharedMap; the literal's
+     index is its text's id in `hnx`, an Ns, its value a Float's bits in `hnv`, written before the
+     type is added: `types.ntext`, `nval`), `tmpl_ids` (a SharedMap; `tmpls` as list columns
+     `htm_h` holes, `htm_t` texts as ids in the Ns `hsx`, `htm_m` the mapping's name: `types.tm_*`),
+     `mappers` (one list column `hmp`, from then to, a row each by `cl_row`; interned in `hik` with
+     tag 7 in place of `mapper_ids`: `types.mp_*`). `unions`, `ref_cache` and `inst_cache` were
+     unused (removed). `enum_type`/`enum_union` belong with step 3 (a fill that makes symbols).
+     The four invocations 184.5 / 101.8 / 63.0 / 53.9 G (-0.6, -0.3, +0.4, +0.1%).
   2. Types' and symbols' attributes now in Vu maps keyed by a shared id, written once when the row
      is made: `t_alias`, `t_iorigin`, `t_ctv` (Int) as columns of the type group; `t_alias_args`,
      `t_origin`, `tuple_labels` as list columns; the symbols' `smore`, `lazy_icomb`, `lazy_inst`,
