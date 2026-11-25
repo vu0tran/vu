@@ -477,6 +477,36 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   yet safe for threads: `ph_grow` moves the slots, so M4 needs a resize readers can't see torn (a
   new table published by pointer, the old one kept until no reader can hold it) or one reserved
   region sized from the program; and a row's `cl_add` must happen before the object is published.
+- Step 4, scoped (2026-11-24, not started; what the split has to settle, in order):
+  - How tasks reach the shared tables (tried in the session's scratch `m4/share/`): Vu tasks may
+    call C (only par loops may not), and `Ffi` passes to a task. A handle can't be shared, but the
+    owner can pass the table's address as an Int and each task make a view of it (an extern type
+    whose drop does nothing); four tasks appending by fetch-add and reading back ran clean under
+    TSan (CC=clang `vu build --tsan`, three runs; Archer isn't installed on this Mac, and is only
+    needed for par loops). So in `C`, every `Tab`/`Lst`/`Ph` field becomes a view, and the owners
+    live in a struct the main task keeps until every worker is done. Appends from several workers
+    need a row index taken once per table (one fetch-add for `tk tf ta tb tl` together, the row
+    written, then published), not one `ct_push` per column.
+  - What `C`'s 506 fields are (a regex count over the checker's files: reads and writes of `c.F`,
+    the session's scratch `m4/fields.tsv`): 43 are C tables already. Of the rest, about 220 are
+    written once or never after setup (the intrinsic types `any_t`..., options, switches): plain
+    copies in each worker. The AST, `c.t` (7,878 reads), is written while checking: 86 `ast.intern`
+    calls (58 with a constant string, which can be interned at setup), the JSX elements' object
+    literal nodes (`chk.jsx_obj`, new nodes per element) and one node changed and restored
+    (bind.vu, `c.t.nd[n].b = -1`). Binding's maps (`locals`, `ltypes`, `nsym`, `smore`, `merged_ns`,
+    `parent`, `globals`, `gtypes`) are filled lazily. Both need to be finished before the workers
+    start (VTSC_EAGER_BIND's pass, the constant names, the JSX nodes made in bind) and then shared
+    read-only: a `Shared[...]` can't hold a handle, so the tree goes into it on its own, or into C
+    columns as the types did. The interning maps that make types (`unions`, `strlits`, `numlits`,
+    `biglits`, `nums`, `tmpls`/`tmpl_ids`, `mappers`/`mapper_ids`, `intern_tbl`/`intern_at`,
+    `t_alias`/`t_alias_args`, `t_origin`, `tl_cache`, `alias_inst`, `inst_icache`/`inst_acache`,
+    `enum_type`/`enum_union`, `tuple_labels`) must be one table for all workers, in C, with a
+    find-or-add that two workers can't both win, or two equal types get two ids. The names table
+    (`c.t.names`) too, since a string literal type is its name's id. Everything else (about 200:
+    `ntype`, narrowing, contexts, the relation and inference caches, diagnostics) is per worker.
+  - Determinism with several workers: ids then depend on which worker makes a type first. M2
+    showed nothing printed depends on the file order, but not on interleaving inside one file's
+    check; the gates (1, 2, 4, 8 workers, 20 runs each, byte-identical) are what decides it.
 - Then step 4: `var c: C` split into the shared tables and a per-worker state, and M4: N checker
   threads over the shared tables behind a switch, off by default. M4's gates: 1, 2, 4 and 8 threads,
   20 runs each, byte-identical on the 88 invocations and the probes; TSan with CC=clang and Archer as
