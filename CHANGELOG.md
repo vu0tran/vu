@@ -3315,3 +3315,23 @@ second worktree): the same suites fail the same way in both (networking, JSON, m
 others that need Linux; the selfhost chain test's hash), run_targeted.sh 781 of 781 (776 of 776
 before), run_memory 4 of 4, run_split 17 of 17, run_differential one more "different" (the new par
 test, which Apple's clang can't build with OpenMP, as for every par program there); not run on Linux.
+
+**SharedMap: one table several threads add to (2026-11-25).** Tasks share only frozen values,
+channels and Memos, so a type checker's interning tables (a literal's type, an instantiation's id)
+couldn't be one table for several checking threads: a Memo hands out each value as a Shared handle,
+under one lock. `SharedMap[K, V]` (`shared_map()`, SPEC "SharedMap") keeps Int, Float, Bool or Byte
+values under Int, Byte, Bool or Str keys; `m.add(k, v)` adds v unless k has a value and returns the
+value k has (the first add wins, so two tasks interning one key get one id), `m.get(k, default)`
+reads without a lock. rt/smap.c: 64 shards by hash, each an open-addressed array whose slots are
+published by a release store of their hash word, written under the shard's spin lock; a full shard
+is copied into one twice the size and published by pointer, the old array kept until the map goes,
+so a reader is never left in freed memory. A struct field may default to `shared_map()`. Measured
+single-threaded against a Vu map (macOS arm64, 400,000 keys, 10 million reads): Int keys +15%
+instructions (0.49 -> 0.57 G), Str keys +2%. Attack round 1 (targeted 787-800: 8 tasks interning
+20,000 Str and Int keys at once while every shard grows, 4 readers during 200,000 adds, a par loop
+adding, SharedMaps in a Shared value, maps with grown Str keys dropped from tasks, the other key and
+value kinds, and the refusals: Str and list values, Float keys, no type, `m[k] = v`, a moved handle,
+a wrong value, `get` without a default) found nothing but two mistakes in the tests themselves;
+under TSan (`CC=clang vu build --tsan`, three runs of each spawn test) no reports, and a planted bug
+(a slot's hash word published before its key, or read relaxed) is reported (1 of 3 and 3 of 3
+runs). The par test runs under ASan only here: Archer isn't installed on this Mac.

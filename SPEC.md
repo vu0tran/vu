@@ -812,6 +812,32 @@ spawn worker(m, "b")
   `recv`, `send` that would wait, `os.sleep`, a select or a network call inside one stops the program
   (`spawn` is fine). It can run `par` loops; their threads can't ask for the key being computed.
 
+### SharedMap: one table several threads add to
+
+```
+type Tables:
+  ids: SharedMap[Str, Int] = shared_map()      # a field default makes a new one per value
+
+fn worker(own t: Tables, own names: [Str]):
+  for n in names:
+    let id = t.ids.add(n, fresh_id(n))         # the id n has: this one, or one another task added first
+    let old = t.ids.get(n + "!", -1)           # -1: no value (yet)
+
+let t = Tables()
+spawn worker(Tables(t.ids.share()), ["a", "b"])
+spawn worker(Tables(t.ids.share()), ["b", "c"])
+```
+
+- `m.add(key, value)` gives key `value` if it has none, and returns the value key has: `value`, or
+  the one another task (or `par` loop thread) added first. An entry never changes or goes once added,
+  so two tasks interning the same key get the same value. `m.get(key, default)` reads one, without
+  locks; a read racing another thread's add of that key may give the default.
+- Keys are Int, Byte, Bool or Str; values Int, Float, Bool or Byte (plain data: nothing another thread
+  would count references to). Share anything bigger as an Int id into a table only its owner writes.
+- `m.len()`, `m.share()` (another handle; passing one to an `own` parameter or `spawn` makes one too).
+  It's freed with its last handle. It can sit in a `Shared` value and still be added to through
+  `.value`. No iteration, `m[k]` or `in`: what a table several threads fill holds depends on timing.
+
 ### Signals and stopping
 
 `os.signals()` returns a `Chan[Str]` on which SIGTERM, SIGINT and SIGHUP arrive (as `"TERM"`,
