@@ -3236,3 +3236,30 @@ without -fopenmp for CC=clang builds, clang crashing on a 20,000-term expression
 and HTML versions, Linux tools for the network suites); run_tools, run_profile and run_norm fail the
 same way at the previous commit, and the par-loop programs give one output under -O3, --debug and
 --malloc (31 of 31). Not yet run on Linux.
+
+**The par-loop check only where a par loop can reach (2026-11-24).** The check at the start of each
+function that calls C (whether it runs inside a par loop) was the rest of an extern call's cost: 2-4%
+of vtsc's instructions once its tables moved to C, because it makes small leaf functions keep a
+frame. Now the compiler looks at which functions each function's C names (`ffi_reach` in
+c5_build.vu): a function keeps the check (`VU_FFI_ENTRY`) when a par loop's body reaches it through
+calls, or when the program has a par loop and the function is used as a value (closures, named
+functions passed around, interface tables, thunks: a value can be called from anywhere). Every other
+function gets `VU_FFI_OFF`, a constant false, and the check compiles to nothing. Not counted as
+reaching: main's caller and a spawned task's entry (a task runs on a thread of its own, never one of
+a par loop's, and a par loop's body can't spawn). The panic is unchanged where it can happen.
+Attack rounds: the first version counted a whole function with a par loop as reached, so a function
+called outside the loop kept its check (`tests/ffi/43`, imprecise, not unsound); replacing the
+marker text everywhere in a function's C also rewrote the compiler's own string literal naming it
+(the fixed-point build caught it: now only the marker's own line is replaced); and a string that reads
+like the par pragma with no block after it made the compiler index -1 (its own source hit it). New
+tests: a closure made where no par loop reaches and called in one (`40`), a named function passed as
+a value (`41`), an interface function through an interface value (`42`), a function no par loop
+reaches with a par loop, a task and a closure in the program (`43`, output, and the emitted C checked
+for `VU_FFI_OFF` there and `VU_FFI_ENTRY` in 40's closure), a method, a generic function and a closure
+in a par body (`44`), a closure made inside the body (`45`), braces and quotes in the body's strings
+and a string holding the pragma's text (`46`). In vlint all 1,009 functions that call C lose the
+check: with vtsc's signatures also moved to C, instructions on the three programs 18.62, 16.90 and
+55.19 G (18.48, 16.77, 55.20 before any table moved; 18.85, 17.24, 56.40 with the twelve flat tables
+and the check). Measured on macOS (arm64): run_ffi 52 of 52 with leak detection off (LeakSanitizer
+isn't supported there; with it, the same 18 fail on that alone as before), run_targeted.sh 776 of
+776, run_split.sh 17 of 17; the full gate not run (it can't pass on this Mac); not run on Linux.

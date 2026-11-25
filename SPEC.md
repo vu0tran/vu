@@ -867,7 +867,8 @@ fn main(ffi: Ffi) throws:
   Vu code can't make one (only extern functions return them), copy one, or compare two. An
   `own` parameter gives the handle to C, which must free it.
 - An extern function can't be called inside a `par` loop (the program stops): C libraries
-  aren't known to be thread-safe.
+  aren't known to be thread-safe. The check costs nothing in functions no par loop can reach (by
+  calls, or as a function value).
 - A glue header (`extern "cols.h":`) is C with no state of its own: a big program built in parts
   includes it in every part, so its functions (`static inline`) are inlined into the Vu code that
   calls them, as cheap as reading a list. A `.c` glue file is compiled once, so its calls stay

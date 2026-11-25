@@ -316,6 +316,127 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
         break
   g.bodies.push(join(body, "\n"))
 
+# The par-loop check of extern calls only where a par loop can reach (VU_FFI_OFF elsewhere: no check).
+# A function can run on a par loop's thread only if a par loop's function reaches it through the
+# functions its C names (called or used as values), or if it is used as a value anywhere (a function
+# value can be called from anywhere) or named by code outside the functions (thunks, interfaces),
+# while the program has a par loop. Not counted: main's caller, and a spawned task's entry, which
+# runs on a thread of its own, never one of a par loop's (and a par loop's body can't spawn).
+fn ffi_reach(var g: G, outside: [Str], nlam: Int):
+  # (the line ffi_entry adds: a string literal in C never holds a newline)
+  let mark = "\n    VU_FFI_ENTRY;"
+  let nf = g.sigs.len
+  var any = false
+  for b in g.bodies:
+    if mark in b: any = true
+  for k in 1..nlam + 1:
+    if k in g.lam_bodies and mark in g.lam_bodies[k]: any = true
+  if not any: return
+  var ids: {Str: Int} = {}
+  for i in 0..nf:
+    let nm = c_fn_name(g.sigs[i])
+    if nm != "": ids[nm] = i
+  for k in 1..nlam + 1:
+    if k in g.lam_sigs:
+      let nm = c_fn_name(g.lam_sigs[k])
+      if nm != "": ids[nm] = nf + k
+  let n = nf + nlam + 1
+  var edges: [[Int]] = []
+  var reached: [Bool] = []
+  for i in 0..n:
+    edges.push([])
+    reached.push(false)
+  var roots: [Int] = []
+  var vals: [Int] = []
+  var has_par = false
+  for i in 0..n:
+    var refs: [Int] = []
+    if i < nf:
+      c_refs(g.bodies[i], ids, &refs, &vals)
+      if par_roots(g.bodies[i], ids, &roots): has_par = true
+    elif i - nf in g.lam_bodies:
+      c_refs(g.lam_bodies[i - nf], ids, &refs, &vals)
+      if par_roots(g.lam_bodies[i - nf], ids, &roots): has_par = true
+    edges[i] = refs
+  if has_par:
+    for v in vals: roots.push(v)
+    for o in outside:
+      if "{{" in o and not o.startswith("static int vu_main(void)") and not o.startswith("static void vu_se_"):
+        var refs: [Int] = []
+        var vs: [Int] = []
+        c_refs(o, ids, &refs, &vs)
+        for r in refs: roots.push(r)
+  var todo = roots
+  while todo.len > 0:
+    let x = todo.pop()
+    if reached[x]: continue
+    reached[x] = true
+    for y in edges[x]:
+      if not reached[y]: todo.push(y)
+  for i in 0..nf:
+    if not reached[i] and mark in g.bodies[i]: g.bodies[i] = g.bodies[i].replace(mark, "\n    VU_FFI_OFF;")
+  for k in 1..nlam + 1:
+    if k in g.lam_bodies and not reached[nf + k] and mark in g.lam_bodies[k]: g.lam_bodies[k] = g.lam_bodies[k].replace(mark, "\n    VU_FFI_OFF;")
+
+# The functions a function's par loops' bodies name (the block after each "#pragma omp parallel"), and
+# whether it has one.
+fn par_roots(text: Str, ids: {Str: Int}, var roots: [Int]) -> Bool:
+  var at = text.find("#pragma omp parallel", 0)
+  if at < 0: return false
+  while at >= 0:
+    let a = text.find("{{", at)
+    if a < 0: break
+    let e = c_block_end(text, a)
+    var vs: [Int] = []
+    c_refs(text[a..e], ids, &roots, &vs)
+    at = text.find("#pragma omp parallel", e)
+  return true
+
+# Where the C block opened at text[a] ('{') ends: after its '}', string and character literals skipped.
+fn c_block_end(text: Str, a: Int) -> Int:
+  var dep = 0
+  var i = a
+  while i < text.len:
+    let ch = text[i]
+    if ch == '"' or ch == '\'':
+      var j = i + 1
+      while j < text.len and text[j] != ch:
+        if text[j] == '\\': j += 1
+        j += 1
+      i = j + 1
+      continue
+    if ch == '{': dep += 1
+    elif ch == '}':
+      dep -= 1
+      if dep == 0: return i + 1
+    i += 1
+  return text.len
+
+# The C name a definition's signature declares (fn_x, vu_lam3), or "".
+fn c_fn_name(sig: Str) -> Str:
+  let p = sig.find("(", 0)
+  if p <= 0: return ""
+  var a = p
+  while a > 0 and is_name_char(sig[a - 1]): a -= 1
+  return sig[a..p]
+
+# The program's functions a piece of C names (refs), and those of them it names other than to call
+# them (vals: used as values).
+fn c_refs(text: Str, ids: {Str: Int}, var refs: [Int], var vals: [Int]):
+  for pat in ["fn_", "vu_lam"]:
+    var i = text.find(pat, 0)
+    while i >= 0:
+      var j = i + pat.len
+      if i == 0 or not is_name_char(text[i - 1]):
+        while j < text.len and is_name_char(text[j]): j += 1
+        let nm = text[i..j]
+        if nm in ids:
+          refs.push(ids[nm])
+          var k = j
+          while k < text.len and text[k] == ' ': k += 1
+          if k >= text.len or text[k] != '(': vals.push(ids[nm])
+      i = text.find(pat, j)
+
 # A function whose body calls C (VU_FFI_CK) asks at its start whether it runs inside a par loop.
 fn ffi_entry(var lines: [Str]):
   for i in 0..lines.len:
@@ -907,6 +1028,7 @@ fn build(var g: G, items: [Node]) -> Str:
   out.push("#ifndef VU_PART")
   out.push("int main(int argc, char **argv) {{ return vu_start(argc, argv, vu_main, vu_file_names); }}")
   out.push("#endif")
+  ffi_reach(&g, out, nlam)
   # (a split build compiles what follows in parts: each function's definition starts with a marker)
   out.push("/* vu-parts */")
   for i in 0..g.sigs.len:

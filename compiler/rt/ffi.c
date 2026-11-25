@@ -38,6 +38,8 @@ static inline bool vu_ffi_par_entry(void) {
     return __atomic_load_n(&vu_par_live, __ATOMIC_RELAXED) != 0 && vu_ffi_par_slow();
 }
 #define VU_FFI_ENTRY const bool vu_inpar = vu_ffi_par_entry()
+/* A function no par loop can reach (ffi_reach in c5_build.vu): no check. */
+#define VU_FFI_OFF const bool vu_inpar = false
 #define VU_FFI_CK(fn, line) (vu_inpar ? vu_ffi_in_par(fn, line) : (void)0)
 __attribute__((noreturn)) static void vu_ffi_null(const char *fn, int line) {
     char m[300];

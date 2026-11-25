@@ -55,6 +55,23 @@ for case in sorted(os.listdir(D)):
         check(name, rc == 0 and got == want and 'ERROR' not in err and 'runtime error' not in err,
               f'exit {rc}, output [{got}], {err[:300]}')
 
+# The par-loop check is left out (VU_FFI_OFF) of a function no par loop can reach, and kept where one can.
+def ffi_marks(case):
+    cf = os.path.join(work, case + '.c')
+    rc, _, err = run(VU + ['build', '--emit-c', cf, 'main.vu', '-o', os.path.join(work, case + '_c')], cwd=os.path.join(D, case))
+    marks = {}
+    if rc == 0:
+        fn = None
+        for ln in open(cf).read().split('\n'):
+            if ln.lstrip().startswith('VU_ENTER("'): fn = ln.split('"')[1]
+            elif fn and ln.strip() in ('VU_FFI_ENTRY;', 'VU_FFI_OFF;'): marks[fn] = ln.strip()
+    return marks
+
+
+m43 = ffi_marks('43_par_unreachable_off')
+m40 = ffi_marks('40_par_made_elsewhere')
+check('a function that calls C and that no par loop reaches has no check; one a par loop can reach keeps it',
+      m43.get('fill') == 'VU_FFI_OFF;' and m40.get('closure') == 'VU_FFI_ENTRY;', f'{m43} {m40}')
 # From another directory: the C file is found next to the Vu file that names it.
 exe = os.path.join(work, 'from_elsewhere')
 rc, out, err = run(VU + ['build', 'ffi/01_sqlite/main.vu', '-o', exe], cwd=HERE)
