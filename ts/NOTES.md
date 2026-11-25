@@ -421,6 +421,30 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   per-worker overlay and only the final check to write the shared slot. That, the resets of
   `stype`, and the namespace merge's `nsym` are what step 3 has to settle before a set-once slot with
   a debug check can replace those writes.
+- Step 3, decided (2026-11-24), next to do in this order, each landing with the same gates (probes
+  133/133, vtest's 3 failures byte for byte, the 88 cold invocations byte-identical, ins.sh within
+  about 5% of the pre-M3 base: now 18.61 / 16.85 / 55.11 G):
+  1. `ntype` is per-worker state, as tsgo keeps node links per checker: it stays a Vu map in the
+     per-worker part, with every other context-dependent per-node cache (flow and narrowing caches,
+     `resolved_sig`/`call_sig` and the like). Nothing to convert now; it decides which side of the
+     step 4 split those fields go.
+  2. `nsym`: finish interface and namespace merging in bind before checking starts (where
+     `VTSC_EAGER_BIND`'s `scope_names` pass runs: the merge in bind.vu that calls
+     `types.add_decl(&c, prev, d)` across namespace blocks, 1,206 of the 1,231 rewrites), then make
+     `nsym` set-once and shared. Check it with a set-once assertion in a debug build over vtests and
+     the probes (`m3s/soinst.py` in the session's scratch shows how to count the rewrites by site).
+  3. `stype`: the -1/-2 values are in-progress markers (circular and deferred returns): keep them in
+     a per-worker map, and publish only the final type to the shared column, once, with a
+     compare-and-swap in ctab.h (a `ct_publish`: CAS from "unset" to the value; a second publish must
+     give the same value, asserted in debug builds). The 61 writes of `hstype` are the sites.
+  4. `props`/`order` to C: a per-object property list in insertion order (names and symbols, list
+     columns) with a lookup by name (a per-object open-addressed index, or what measures best);
+     iteration must stay exactly insertion order (bind.vu's class/function merging iterates it).
+- Then step 4: `var c: C` split into the shared tables and a per-worker state, and M4: N checker
+  threads over the shared tables behind a switch, off by default. M4's gates: 1, 2, 4 and 8 threads,
+  20 runs each, byte-identical on the 88 invocations and the probes; TSan with CC=clang and Archer as
+  tests/run_mt.sh runs it (a TSan run that fails to start is a failure); the cold job.py table, two
+  runs alternated with oxlint 1.79, the switch on and off.
 
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
